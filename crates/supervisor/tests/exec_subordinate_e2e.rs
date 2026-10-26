@@ -17,7 +17,7 @@
 //! - コンテナ内の pid1（`--container-probe`）: `/data/ready` へ `READY` を書き、親が terminate するまで待つ
 //!   （寿命の上限 60 秒を超えたら終了コード 8。取り残さない。REPAIR-5）
 //! - exec されるコマンド（`--exec-probe <出力先名>`）: コンテナ内の `/proc/self/status` から `Uid:`・`Gid:`・`Groups:`・
-//!   `NoNewPrivs:`・`Seccomp:` の行を `/data/<出力先名>` へ書く（exec したコマンドの stdio は `/dev/null` で、
+//!   `NoNewPrivs:`・`Seccomp:`・`CapInh:`・`CapPrm:`・`CapEff:`・`CapBnd:`・`CapAmb:` の行を `/data/<出力先名>` へ書く（exec したコマンドの stdio は `/dev/null` で、
 //!   `ExecOutcome` も出力を持たないため、観測値は bind mount したホストのディレクトリ経由で受ける）
 //!
 //! # 照合項目
@@ -25,7 +25,12 @@
 //!   コンテナを start し、Running の記録に cgroup の配置・`launch_isolation`・`rlimits` が載ることを確かめる。そのうえで
 //!   `run_command_with_pidfd` の `ExecOutcome` が、終了 `Command(Exited(0))`・補助グループ `Applied { count: 2 }`・seccomp
 //!   listener の受け渡し `Verified`・監査 0 件であること、exec したコマンドの `/proc/self/status` が `Uid` 1000 1000 1000 1000・
-//!   `Gid` 1000 1000 1000 1000・`Groups` 2000 3000（カーネルがソートする）・`NoNewPrivs` 1・`Seccomp` 2 であることを具体値で照合する
+//!   `Gid` 1000 1000 1000 1000・`Groups` 2000 3000（カーネルがソートする）・`NoNewPrivs` 1・`Seccomp` 2 であることを具体値で照合する。あわせて capability（SEC-1）として `CapInh`・`CapPrm`・
+//!   `CapEff`・`CapAmb` が 0、`CapBnd` が OCI 既定の `00000000a80425fb` であることを照合する（根拠: exec は launch と同じ
+//!   関数で bounding set を許可集合へ削り ambient・inheritable を空にし、非 root への uid 移行と execve で permitted・
+//!   effective が空になる〔`crates/core/src/exec/reapply.rs`〕。`process.capabilities` は無いので許可集合は OCI 既定。
+//!   core は空でない ambient の指定を拒否する〔#2666〕ため、ambient を与える場面は成り立たない）。期待値が core の定義と
+//!   ずれないよう、マスクを `CapabilitySet::oci_default()` から再計算して突き合わせる
 //! - シナリオ B（写像の外の拒否。fail-closed の対照）: 同じコンテナの bundle の `config.json` を、写像の外の uid へ書き換えて
 //!   （exec は呼び出しごとに bundle を読み直す）exec し、`InvalidArgument` で拒否されること・コマンドが起動していないこと
 //!   （出力ファイルが作られない）を照合する。照合後は config を元へ戻す
@@ -54,7 +59,7 @@
 //!
 //! # 既知の制約（REPAIR-3）
 //! - exec 要求ごとの user の上書き（CLI の `--user` #2712・CRI の Exec #680）・名前形式の User の解決・同じ user namespace
-//!   （`Shared`）での非 root と補助グループ（#2241 待ち）・非 root の user に対する capability の照合は範囲外
+//!   （`Shared`）での非 root と補助グループ（#2241 待ち）
 //! - 実機（root）での実行と記録は #1621（人間担当）
 
 #[cfg(not(target_os = "linux"))]
@@ -209,7 +214,18 @@ mod linux {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
             std::process::exit(3);
         };
-        let wanted = ["Uid:", "Gid:", "Groups:", "NoNewPrivs:", "Seccomp:"];
+        let wanted = [
+            "Uid:",
+            "Gid:",
+            "Groups:",
+            "NoNewPrivs:",
+            "Seccomp:",
+            "CapInh:",
+            "CapPrm:",
+            "CapEff:",
+            "CapBnd:",
+            "CapAmb:",
+        ];
         let mut out = String::new();
         for line in status.lines() {
             if wanted.iter().any(|k| line.starts_with(k)) {
@@ -440,7 +456,7 @@ mod linux {
         std::fs::create_dir(&hostdata).expect("create hostdata");
         std::fs::set_permissions(&hostdata, std::fs::Permissions::from_mode(0o777))
             .expect("chmod hostdata");
-        let ld = rootfs::make_rootfs(&bundle_dir.join("rootfs"));
+        let ld = rootfs::make_rootfs(&bundle_dir.join("rootfs"), rootfs::ProcDir::Create);
         let config_path = bundle_dir.join("config.json");
         let config_a = config_text(&ld, &hostdata, USER_UID, USER_GID, &ADDITIONAL_GIDS);
         std::fs::write(&config_path, &config_a).expect("write config.json");
@@ -499,6 +515,23 @@ mod linux {
         assert!(
             eventually(|| std::fs::read_to_string(&path).is_ok_and(|s| s == READY_CONTENT)),
             "the container probe must report READY"
+        );
+    }
+
+    /// OCI 既定の bounding set（moby の非 root コンテナの既定と同じ 14 個）の `/proc/<pid>/status` 表記。
+    const OCI_DEFAULT_BOUNDING: &str = "00000000a80425fb";
+    /// 空の capability 集合の表記。
+    const NO_CAPS: &str = "0000000000000000";
+
+    /// 期待値の定数が core の OCI 既定集合の定義とずれていないことを確かめる。
+    fn assert_oci_default_mask_matches_core() {
+        let mask = fandhe_container_core::capabilities::CapabilitySet::oci_default()
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.index()));
+        assert_eq!(
+            mask,
+            u64::from_str_radix(OCI_DEFAULT_BOUNDING, 16).expect("hex"),
+            "OCI_DEFAULT_BOUNDING must equal core's CapabilitySet::oci_default()"
         );
     }
 
@@ -601,6 +634,20 @@ mod linux {
             assert_eq!(status_value(&text, "Groups:"), "2000,3000", "{text:?}");
             assert_eq!(status_value(&text, "NoNewPrivs:"), "1", "{text:?}");
             assert_eq!(status_value(&text, "Seccomp:"), "2", "{text:?}");
+            // capability（SEC-1・SEC-5・CORE-6）。非 root で exec すると permitted / effective は空になり、
+            // bounding set だけが OCI 既定集合へ削られて残る。ambient は core が空でない指定を拒否する（#2666）ため常に空。
+            assert_oci_default_mask_matches_core();
+            for key in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+                assert_eq!(status_value(&text, key), NO_CAPS, "{key} in {text:?}");
+            }
+            assert_eq!(
+                status_value(&text, "CapBnd:"),
+                OCI_DEFAULT_BOUNDING,
+                "{text:?}"
+            );
+            println!(
+                "exec_subordinate_e2e: scenario=exec-user-capabilities CapInh=CapPrm=CapEff=CapAmb=0000000000000000 CapBnd=00000000a80425fb (non-root exec keeps only the OCI default bounding set)"
+            );
             println!(
                 "exec_subordinate_e2e: scenario=exec-user-applied uid=1000 gid=1000 groups=2000,3000 via ProductionLauncher create, start and run_command_with_pidfd"
             );

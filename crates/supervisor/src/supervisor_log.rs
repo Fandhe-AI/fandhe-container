@@ -27,7 +27,9 @@
 //!
 //! # 後始末
 //! [`remove`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
-//! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。
+//! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
+//! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
+//! plugin-cri の `RemoveContainer` は従来の [`remove_bounded`]（1 回だけ）のまま。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -146,6 +148,87 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
             ErrorCode::Internal,
             "supervisor log directory inspection failed",
         )),
+    }
+}
+
+/// [`remove`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2892・SUP-7・REPAIR-5）。
+///
+/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する。確認はロック保持中に行うため、待ちの間に
+/// 再作成された別インスタンスの supervisor ログを消さない。ディレクトリが無ければ 0 件で成功する。
+pub fn remove_guarded(
+    root: &Path,
+    id: &ContainerId,
+    guard: &dyn Fn() -> bool,
+) -> Result<RemovedLogs, TraitError> {
+    let dir = log_dir(root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => RotatingFileSink::remove_all_quiet_guarded(&dir, id, guard),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemovedLogs::default()),
+        Err(_) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "supervisor log directory inspection failed",
+        )),
+    }
+}
+
+/// [`remove_guarded`] を作業スレッドで `timeout` までだけ待って 1 回試す（#2892・REPAIR-5）。
+///
+/// 枠の満杯（何も実行していない）は `ResourceExhausted`、期限切れ・起動失敗・panic は `Timeout`（コンテナログの
+/// `remove_container_logs_guarded_bounded` と同じ分類）。
+pub fn remove_guarded_bounded(
+    root: &Path,
+    id: &ContainerId,
+    timeout: std::time::Duration,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> Result<RemovedLogs, TraitError> {
+    let root = root.to_path_buf();
+    let id = id.clone();
+    run_bounded_classified(move || remove_guarded(&root, &id, &guard), timeout).unwrap_or_else(
+        |f| {
+            Err(match f {
+                BoundedFailure::Busy => TraitError::new(
+                    ErrorCode::ResourceExhausted,
+                    "supervisor log removal workers are busy",
+                ),
+                BoundedFailure::Unfinished => TraitError::new(
+                    ErrorCode::Timeout,
+                    "supervisor log removal did not finish within the deadline",
+                ),
+            })
+        },
+    )
+}
+
+/// [`remove_guarded_bounded`] を、`FailedPrecondition`（同じ ID の supervisor がログのロックを保持中）のあいだ
+/// `lock_wait` まで試し直す版（CLI の `delete` 用。#2892・SUP-7・CLI-1・REPAIR-5）。
+///
+/// `stop` 直後は supervisor が `Stopped` の記録後も drain を続け、プロセス終了までロックを持つ。待ちは呼び出し元
+/// スレッドの sleep（[`crate::logs::CONTAINER_LOG_LOCK_POLL`] 刻み）だけで、同時実行枠は試行の間しか使わない。
+/// 試し直すのは `FailedPrecondition` だけで、他のエラーは即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
+/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri は従来の [`remove_bounded`]（1 回だけ）のまま。
+pub fn remove_guarded_bounded_waiting(
+    root: &Path,
+    id: &ContainerId,
+    lock_wait: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+    guard: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<RemovedLogs, TraitError> {
+    let started = std::time::Instant::now();
+    loop {
+        let g = Arc::clone(&guard);
+        let result = remove_guarded_bounded(root, id, attempt_timeout, move || g());
+        match &result {
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                let Some(remaining) = lock_wait
+                    .checked_sub(started.elapsed())
+                    .filter(|r| !r.is_zero())
+                else {
+                    return result;
+                };
+                std::thread::sleep(crate::logs::CONTAINER_LOG_LOCK_POLL.min(remaining));
+            }
+            _ => return result,
+        }
     }
 }
 
@@ -830,5 +913,96 @@ mod tests {
         assert_eq!(out, None);
         assert!(started.elapsed() < Duration::from_secs(10));
         drop(release_tx);
+    }
+
+    fn always() -> Arc<dyn Fn() -> bool + Send + Sync> {
+        Arc::new(|| true)
+    }
+
+    /// SUP-7・REPAIR-5・#2892: ロックを持ち続ける書き手がいると、待ちを使い切って `FailedPrecondition`。ログは残る。
+    #[test]
+    fn sup7_repair5_waiting_keeps_logs_when_lock_held() {
+        let t = TmpDir::new("waitheld");
+        let _w = open(&t.0, &id()).unwrap();
+        let started = Instant::now();
+        let e = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect_err("held");
+        let elapsed = started.elapsed();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let dir = t.0.join("@supervisor-logs");
+        assert!(dir.join("c1.log").exists());
+        assert!(dir.join("c1.log.lock").exists());
+    }
+
+    /// SUP-7・#2892: 書き手が待ちの途中で閉じれば、待ちが終わり次第すべて消える。
+    #[test]
+    fn sup7_waiting_removes_after_release() {
+        let t = TmpDir::new("waitrel");
+        let w = open(&t.0, &id()).unwrap();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(w);
+        });
+        let removed = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect("removed after release");
+        h.join().unwrap();
+        assert_eq!(removed.log_files(), 1);
+        assert_eq!(
+            fs::read_dir(t.0.join("@supervisor-logs")).unwrap().count(),
+            0
+        );
+    }
+
+    /// REPAIR-5・#2892: `lock_wait` が 0 なら 1 回だけ試して即座に返る。
+    #[test]
+    fn repair5_waiting_zero_wait_tries_once() {
+        let t = TmpDir::new("waitzero");
+        let _w = open(&t.0, &id()).unwrap();
+        let started = Instant::now();
+        let e = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::ZERO,
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect_err("held");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// SUP-7・#2892: guard が false（同じ ID が再作成済み）ならログ本体を消さず 0 件で成功する。
+    #[test]
+    fn sup7_waiting_guard_false_keeps_logs() {
+        let t = TmpDir::new("waitguard");
+        let mut w = open(&t.0, &id()).unwrap();
+        w.write_all(b"new\n").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let removed = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            Arc::new(|| false),
+        )
+        .expect("guard skip");
+        assert_eq!(removed.log_files(), 0);
+        let body = fs::read_to_string(t.0.join("@supervisor-logs/c1.log")).unwrap();
+        assert_eq!(body, "stderr new\n");
     }
 }

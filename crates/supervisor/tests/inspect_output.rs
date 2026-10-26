@@ -361,16 +361,8 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         Some(V::Null) => {}
         Some(V::Obj(fields)) => {
             let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-            assert_eq!(
-                keys,
-                [
-                    "bounding",
-                    "effective",
-                    "permitted",
-                    "inheritable",
-                    "ambient"
-                ]
-            );
+            // 実効集合（effective / permitted 等）は記録していないため出さない（SUP-11・REPAIR-4）。
+            assert_eq!(keys, ["bounding"]);
             for (_, v) in fields {
                 let V::Arr(items) = v else {
                     panic!("capabilities members must be arrays, got {v:?}");
@@ -507,8 +499,8 @@ fn sec4_2027_audit_coverage_is_reported() {
     );
 }
 
-/// CLI-1・SEC-1・#2775: 記録した capability 集合は番号順の `CAP_*` で出し、inheritable・ambient は `[]`、
-/// 記録が無ければ `null`。
+/// CLI-1・SEC-1・#2775: 記録した capability の許可上限は番号順の `CAP_*` の `bounding` だけで出し、
+/// effective / permitted は出さない（非 root・ambient 空でも既定 cap が残ると誤報しない）。記録が無ければ `null`。
 #[test]
 fn cli1_2775_capabilities_are_reported() {
     use fandhe_container_core::capabilities::{Capability, ContainerCapabilities, parse_drop_list};
@@ -550,13 +542,7 @@ fn cli1_2775_capabilities_are_reported() {
     };
     assert_eq!(
         m["capabilities"],
-        V::Obj(vec![
-            ("bounding".to_string(), mk(&expected)),
-            ("effective".to_string(), mk(&expected)),
-            ("permitted".to_string(), mk(&expected)),
-            ("inheritable".to_string(), V::Arr(vec![])),
-            ("ambient".to_string(), V::Arr(vec![])),
-        ])
+        V::Obj(vec![("bounding".to_string(), mk(&expected)),])
     );
     // 番号順（CAP_DAC_OVERRIDE が先頭、CAP_SETFCAP が末尾）。
     assert_eq!(expected.first(), Some(&s("CAP_DAC_OVERRIDE")));

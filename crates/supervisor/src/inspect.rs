@@ -25,10 +25,12 @@
 //! - `auditCoverage.record`（SEC-4・REPAIR-4・#2601）は縮退の監査記録を記録先へ書けなかったときだけ `"failed"`、
 //!   それ以外は `null`。`null` は「記録された」保証ではない（縮退なし・記録成功・#2468 より前の旧記録を区別しない）。
 //!   `auditCoverage` 自体が `null` のときは出ない。
-//! - `capabilities`（CLI-1・SEC-1・REPAIR-4・#2775）は launch が実際に適用した capability 集合（`create --cap-drop` で
-//!   狭めた後の値）。記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、OCI 既定とは推測しない。
-//!   あるときは `{"bounding":[..],"effective":[..],"permitted":[..],"inheritable":[],"ambient":[]}`。
-//!   前 3 つは同じ値（番号順の `CAP_*`）、後ろ 2 つは常に空（add・ambient の経路が無い）。出力は有界（最大 41 件 × 3）。
+//! - `capabilities`（CLI-1・SEC-1・REPAIR-4・#2775）は launcher が適用前に保存した capability の許可上限
+//!   （`create --cap-drop` で狭めた後の値）。記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）
+//!   `null` で、OCI 既定とは推測しない。あるときは `{"bounding":[..]}` だけ（番号順の `CAP_*`。最大 41 件）。
+//!   実際に適用・確認した effective / permitted / inheritable / ambient は記録していないため出さない（推測しない）。
+//!   非 root の `process.user` で ambient が空のまま exec すると実効集合は上限より小さく（空にも）なるため、
+//!   `bounding` を「コンテナのプロセスが今持つ集合」と読んではならない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
@@ -197,7 +199,7 @@ impl InspectReport {
 
     /// launch が実際に適用した capability 集合（CLI-1・SEC-1・REPAIR-4・#2775）。記録が無ければ `null`
     /// （OCI 既定とは推測しない）。値は固定語彙の `CAP_*` だけ（エスケープ不要）。
-    /// `inheritable`・`ambient` は型が空以外を表せないため常に `[]`。
+    /// 出すのは許可上限 `bounding` だけ。effective / permitted 等は適用結果を記録していないため出さない。
     fn push_capabilities(&self, s: &mut String) {
         let Some(caps) = self
             .record
@@ -221,11 +223,7 @@ impl InspectReport {
         };
         s.push_str("{\"bounding\":");
         list(s);
-        s.push_str(",\"effective\":");
-        list(s);
-        s.push_str(",\"permitted\":");
-        list(s);
-        s.push_str(",\"inheritable\":[],\"ambient\":[]}");
+        s.push('}');
     }
 
     /// 選ばれた ID 写像のモデルと範囲（CORE-6・SEC-5・REPAIR-4・#2388）。記録が無ければ `null`。値はすべて数値と

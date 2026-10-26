@@ -324,62 +324,6 @@ mod tests {
         println!("OWNED_MODE {mode:o}");
     }
 
-    /// 子の終了と stdout / stderr の収集に期限を設ける（REPAIR-5）。超過したら kill して回収し panic する。
-    /// `Command::output()` は子の終了と EOF を無期限に待つため試験では使わない。
-    fn output_bounded(cmd: &mut std::process::Command, limit: Duration) -> std::process::Output {
-        use std::io::Read as _;
-        use std::process::Stdio;
-        use std::sync::mpsc;
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
-        let out_pipe = child.stdout.take().unwrap();
-        let err_pipe = child.stderr.take().unwrap();
-        let t1 = tx.clone();
-        std::thread::spawn(move || {
-            let mut p = out_pipe;
-            let mut b = Vec::new();
-            let _ = p.read_to_end(&mut b);
-            let _ = t1.send((true, b));
-        });
-        std::thread::spawn(move || {
-            let mut p = err_pipe;
-            let mut b = Vec::new();
-            let _ = p.read_to_end(&mut b);
-            let _ = tx.send((false, b));
-        });
-        let deadline = std::time::Instant::now() + limit;
-        let status = loop {
-            if let Some(st) = child.try_wait().unwrap() {
-                break st;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not exit within {limit:?}; killed");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        for _ in 0..2 {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match rx.recv_timeout(left.max(Duration::from_secs(1))) {
-                Ok((true, b)) => stdout = b,
-                Ok((false, b)) => stderr = b,
-                Err(_) => panic!("child output not closed within {limit:?}"),
-            }
-        }
-        std::process::Output {
-            status,
-            stdout,
-            stderr,
-        }
-    }
-
     /// NET-1・REPAIR-3・#2824: umask 0777 / 0100 でも `.owned` は 0700 で作られ、EACCES で作れなくならない。
     #[test]
     fn net1_owned_dir_created_under_restrictive_umask() {
@@ -401,7 +345,7 @@ mod tests {
                 ))
                 .arg(std::env::current_exe().unwrap())
                 .env("FANDHE_OWNED_UMASK_BASE", &base);
-            let out = output_bounded(&mut cmd, Duration::from_secs(60));
+            let out = super::super::tests::output_bounded(&mut cmd, Duration::from_secs(60));
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "umask {umask}: {out:?}");
             assert!(stdout.contains("OWNED_MODE 700"), "umask {umask}: {stdout}");

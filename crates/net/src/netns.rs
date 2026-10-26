@@ -1962,63 +1962,61 @@ mod tests {
         println!("XPROC_IDENT {} {} {}", ident.dev, ident.ino, ident.serial);
     }
 
-    /// 子役を別プロセスで起動し、出力された識別子を返す。子が終了してから返る。
-    fn spawn_pin_creator(base: &Path, name: &str) -> PinIdentity {
+    /// 子の終了と stdout / stderr の収集に期限を設ける（REPAIR-5）。超過したら kill して回収し panic する。
+    /// `Command::output()` は子の終了と EOF を無期限に待つため試験では使わない。
+    pub(in crate::netns) fn output_bounded(
+        cmd: &mut std::process::Command,
+        limit: Duration,
+    ) -> std::process::Output {
+        // kill 後に子の回収（try_wait）を待つ猶予。超過したら回収を諦めて失敗にする（REPAIR-5）。
+        const REAP_GRACE: Duration = Duration::from_secs(5);
         use std::io::Read as _;
         use std::process::Stdio;
         use std::sync::mpsc;
-        // 子の終了と出力の収集に同じ期限を設ける（REPAIR-5）。超過したら kill して回収する。
-        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                "netns::tests::net1_xproc_child_create_pin",
-            ])
-            .env("FANDHE_NETNS_XPROC_BASE", base)
-            .env("FANDHE_NETNS_XPROC_NAME", name)
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
-        for (is_out, pipe) in [
-            (
-                true,
-                child
-                    .stdout
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            ),
-            (
-                false,
-                child
-                    .stderr
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            ),
-        ] {
-            let tx = tx.clone();
-            let mut pipe = pipe.unwrap();
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
-                let _ = tx.send((is_out, buf));
-            });
-        }
-        drop(tx);
-        let deadline = std::time::Instant::now() + CHILD_DEADLINE;
+        let out_pipe = child.stdout.take().unwrap();
+        let err_pipe = child.stderr.take().unwrap();
+        let t1 = tx.clone();
+        std::thread::spawn(move || {
+            let mut p = out_pipe;
+            let mut b = Vec::new();
+            let _ = p.read_to_end(&mut b);
+            let _ = t1.send((true, b));
+        });
+        std::thread::spawn(move || {
+            let mut p = err_pipe;
+            let mut b = Vec::new();
+            let _ = p.read_to_end(&mut b);
+            let _ = tx.send((false, b));
+        });
+        let deadline = std::time::Instant::now() + limit;
         let status = loop {
             if let Some(st) = child.try_wait().unwrap() {
                 break st;
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not exit within {CHILD_DEADLINE:?}; killed");
+                // SIGKILL は終了完了を保証しない（割り込み不能な I/O 待ち等）ため、回収にも期限を設ける。
+                let reap_deadline = std::time::Instant::now() + REAP_GRACE;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            panic!("child did not exit within {limit:?}; killed and reaped")
+                        }
+                        Ok(None) if std::time::Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => panic!(
+                            "child did not exit within {limit:?}; kill sent but not reaped within {REAP_GRACE:?}"
+                        ),
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -2028,14 +2026,30 @@ mod tests {
             match rx.recv_timeout(left.max(Duration::from_secs(1))) {
                 Ok((true, b)) => stdout = b,
                 Ok((false, b)) => stderr = b,
-                Err(_) => break,
+                Err(_) => panic!("child output not closed within {limit:?}"),
             }
         }
-        let out = std::process::Output {
+        std::process::Output {
             status,
             stdout,
             stderr,
-        };
+        }
+    }
+
+    /// 子役を別プロセスで起動し、出力された識別子を返す。子が終了してから返る。
+    /// 子の終了・出力の収集・強制終了後の回収にはすべて期限がある（REPAIR-5。`output_bounded`）。
+    fn spawn_pin_creator(base: &Path, name: &str) -> PinIdentity {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "netns::tests::net1_xproc_child_create_pin",
+        ])
+        .env("FANDHE_NETNS_XPROC_BASE", base)
+        .env("FANDHE_NETNS_XPROC_NAME", name);
+        let out = output_bounded(&mut cmd, Duration::from_secs(60));
         assert!(out.status.success(), "child failed: {out:?}");
         let text = String::from_utf8_lossy(&out.stdout);
         let line = text

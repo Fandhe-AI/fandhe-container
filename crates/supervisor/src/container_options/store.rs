@@ -406,13 +406,31 @@ pub fn remove_stale_bounded(
     let id = id.clone();
     crate::supervisor_log::run_bounded(
         move || -> Result<(), TraitError> {
-            // 文書が無ければ何もしない(ロックディレクトリ・ロックファイルを作らない。create のたびに状態ルートを汚さない)。
-            // 文書が後から現れうるのは同じ ID の `create` だけで、それは自分でロックを取って書く。
-            match std::fs::symlink_metadata(options_path(&root, &id)) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                _ => {}
+            // 文書もロックファイルも無ければ何もしない(ロックディレクトリを作らない。create のたびに状態ルートを汚さない)。
+            // 文書が無くてもロックファイルが残っていれば(CLI の create は空オプションでもロックを取って残す)、
+            // 下でロックを取って回収する。文書が後から現れうるのは同じ ID の `create` だけで、それは自分でロックを取って書く。
+            let doc_missing = matches!(
+                std::fs::symlink_metadata(options_path(&root, &id)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            if doc_missing {
+                let lock_path = options_dir(&root).join(LOCKS_DIR_NAME).join(id.as_str());
+                match std::fs::symlink_metadata(&lock_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    _ => {}
+                }
             }
             let lock = acquire_lock(&root, &id, lock_wait)?;
+            if doc_missing
+                && matches!(
+                    std::fs::symlink_metadata(options_path(&root, &id)),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                // ロック保持中も文書が無い: ロックファイルだけを回収する。
+                lock.remove_lock_file();
+                return Ok(());
+            }
             if !guard() {
                 return Ok(());
             }
@@ -685,6 +703,15 @@ mod tests {
         // 文書が無ければ何も作らない。
         remove_stale_bounded(&root, &id("none"), || true, wait, limit).expect("noop");
         assert!(!options_dir(&root).join(LOCKS_DIR_NAME).exists());
+
+        // 文書なしで残ったロックファイル(空オプションの create の残り)は、異なる ID を繰り返しても蓄積しない。
+        for n in ["l1", "l2", "l3"] {
+            drop(acquire_lock(&root, &id(n), wait).expect("lock"));
+            let lp = options_dir(&root).join(LOCKS_DIR_NAME).join(n);
+            assert!(lp.exists());
+            remove_stale_bounded(&root, &id(n), || true, wait, limit).expect("reclaim lock");
+            assert!(!lp.exists());
+        }
 
         write_new(&root, &id("keep"), &doc()).expect("write keep");
         let before = std::fs::read(options_path(&root, &id("keep"))).expect("read");

@@ -72,9 +72,10 @@
 //! （Linux のみ）を呼ぶと、host 側 veth と netns の pin を回収できる。veth は、別名が endpoint のトークン
 //! （`host_owner_token`）に一致し、master が所有を確かめた bridge（`owned_bridge_index`）の ifindex に一致する
 //! ときだけ、照会で得た ifindex で削除する。bridge が無い・不一致のときは veth の所属を証明できないため
-//! `Unknown` のまま触れない。netns の pin は `netns::unpin_path` で外し、このプロセスの所有記録に照合できない
-//! pin（再起動後のもの）は拒否されて取り残しになり、手動回収に回る（pin の実体の識別子を永続化して
-//! プロセスをまたいで外す設計は未実装。担当 Issue 未確定）。quarantine（アドレス・DNAT ルール・ポート予約）は
+//! `Unknown` のまま触れない。netns の pin は、請求書に控えた識別子を `netns::unpin_path_expecting` で
+//! 所有記録と照合して外す。再起動後の pin も、置き場の `.owned/<endpoint>` に永続化した所有記録と請求書と
+//! カーネルの実状態の三者が一致すれば外せる（#2824）。所有記録が無い・壊れている・一致しない pin
+//! （旧い請求書・手動回収後に作り直された別世代など）は拒否されて取り残しになり、手動回収に回る。quarantine（アドレス・DNAT ルール・ポート予約）は
 //! プロセス内の保持で、解放は `delete_network` が行う。pin の置き場 `netns_dir` は請求書ではなく呼び出し側の
 //! 固定設定から受ける。
 //!
@@ -101,8 +102,7 @@
 //! - テーブルの所有トークンは `NFTA_TABLE_USERDATA` を保持するカーネルを前提とする。保持しない
 //!   カーネルではトークンが読み戻せず、削除は拒否される（手動解放）
 //! - link の dump API が無いため、IPAM に記録されていない孤児 veth は回収しない。担当 Issue 未確定
-//! - コンテナ単体の切り離しと、プロセスをまたぐ残置 pin の清掃は未実装（attach の取り残しの veth は #2681 で回収できるが、
-//!   pin は同じプロセス内に限る）。担当 Issue 未確定
+//! - コンテナ単体の切り離しは未実装（attach の取り残しの veth は #2681、再起動後の pin は #2824 で回収できる）。担当 Issue 未確定
 //! - pin 置き場の記録は IPAM のメモリ上の状態で、永続化（IPAM 状態の永続化と同じく未実装・担当 Issue 未確定）
 //!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
 
@@ -855,8 +855,8 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
         }
     }
 
-    // 3. netns の pin。プロセスの所有記録に照合できる pin だけを外せる。再起動後の pin は拒否されて
-    //    取り残しになり、手動回収に回る（fail-closed）。
+    // 3. netns の pin。プロセス内または永続の所有記録（#2824）と請求書の識別子に照合できる pin だけを外せる。
+    //    照合できない pin は拒否されて取り残しになり、手動回収に回る（fail-closed）。
     //    解除は、請求書に控えた pin の実体の識別子（dev・ino・作成の連番）を解除の直前に所有記録と照合する
     //    `unpin_path` で行う。同じ endpoint・置き場に作り直された新しい pin は識別子が違うため、古い請求書では
     //    外れない（veth の不在は pin の世代の証明にならない。fail-closed。#2681）。識別子を控えていない請求書は
@@ -1214,8 +1214,8 @@ pub fn reclaim_failed_create(
 /// `claim` は `ContainerAttachError::reclaim_claim` か、plugin 自身が書いた記録の復号
 /// （`FailedAttachClaim::from_record`）で得る。host 側 veth は、別名が endpoint のトークンに一致し、
 /// master が所有を確かめた bridge に一致する場合だけ、照会で得た ifindex で削除する。不一致・判定不能は
-/// 触れずに `Unknown` で報告する（fail-closed）。netns の pin は、このプロセスが作ったものだけを外せる
-/// （再起動後の pin は `FailedPrecondition` で取り残しになる）。`netns_dir` は呼び出し側の固定設定で、
+/// 触れずに `Unknown` で報告する（fail-closed）。netns の pin は、請求書の識別子とプロセス内または永続の
+/// 所有記録（#2824）に一致するものだけを外せる（照合できない pin は `FailedPrecondition` で取り残しになる）。`netns_dir` は呼び出し側の固定設定で、
 /// 記録からは受けない。取り残しがあれば `Err` で、`report` に解放済みと取り残しを載せる。
 /// `CAP_NET_ADMIN`（と unpin の `CAP_SYS_ADMIN`）は呼び出し側の責務。`timeout` は各カーネル要求の期限（REPAIR-5）。
 #[cfg(target_os = "linux")]

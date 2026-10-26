@@ -81,7 +81,6 @@ table=<0|1>
 
 - IPAM 状態・`CreatedNetwork`・削除中の印の永続化（#1870 の設計の後）
 - write-ahead（作成前・attach 前の記録。net がトークンを先に発行する API が要る）。#1870 の後に再検討する（#2681 の判断）
-- netns の pin の実体の識別子を永続化してプロセスをまたいで解除する API（再起動後の pin は手動回収）
 - 再起動後に復元したネットワークの bridge・nft テーブルの自動回収（link の dump API か、#1870 の永続化の後）
 
 ## attach の取り残しの記録（#2681）
@@ -93,7 +92,7 @@ table=<0|1>
 - 書く時点: attach が取り残し付きで失敗し、請求書があるとき。書けなくてもメモリの記録は保持し、元のエラーに `the reclaim record could not be persisted` を足した `Internal` を返す
 - 消す時点: `detach` または `delete_network` が回収に成功した後、記録ファイルを中身が一致するときだけ消し（別プロセスが書いた新しい記録を消さない）、そのあとでメモリの記録を外す。回収に失敗したら記録・ファイルとも保持して再試行できる
 - 回収の順序: `delete_network` は bridge を解放する前に、attach の取り残しを先に回収する（veth の所有の証明は bridge への所属で、bridge を消すと証明を失うため）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動回収）
-- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は `netns::unpin_path` で外し、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
+- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は請求書の識別子を `netns::unpin_path_expecting` で所有記録と照合して外し（再起動後の扱いは次節）、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
 
 ### 再起動後に回収できるもの・できないもの
 
@@ -101,9 +100,25 @@ table=<0|1>
 
 - 回収できる: 所有を確かめた veth
 - 回収しない: bridge・nft テーブル（記録の無い健全なコンテナがまだ繋がっていないことを証明できず、消すと生きているコンテナの通信を断ち、veth の所有の証明も失うため）。復元したネットワークの `delete_network` は、取り残しを回収し終えたら記録を外し、固定の文言（`MSG_RECOVERED_NETWORK_UNTRACKED`）の `FailedPrecondition` を返して、ネットワーク本体が手動回収であることを知らせる。「ネットワークを丸ごと復旧できる」とは書かない
-- 回収できない: netns の pin。`netns::unpin_path` はプロセス内の所有記録に照合できる pin しか外さず、再起動後は `FailedPrecondition` で拒否される（fail-closed）。pin の実体の識別子を永続化してプロセスをまたいで外す設計は未実装（後続）
+- 回収できる（条件つき）: netns の pin。請求書の `pin=` と、置き場の永続の所有記録 `.owned/<endpoint>`（次節・#2824）と、カーネルの実状態の三者が一致するときだけ外す。所有記録が無い・壊れている・一致しない pin（旧い請求書・手動回収後に作り直された別世代・none モードの pin）は `FailedPrecondition` で拒否され、手動回収に残る（fail-closed）
 - 復元したネットワークへの `create_netns`・`attach` は拒否する
 - 壊れた記録（復号の失敗・ファイル名と記録の不一致・不正なファイル名）は、ファイルを消さず、登録もしない。件数は `net.reclaim_store_load` の失敗件数と stderr の 1 行に足す。同じコンテナの再 attach は、カーネルの `NLM_F_EXCL` による `AlreadyExists` で fail-closed になる。件数の上限を超える場合は起動を失敗させる
+
+## netns の pin の所有記録（#2824）
+
+プロセスをまたいで残った netns の pin を、永続的な所有記録と照合して外す。NET-1・REPAIR-3・REPAIR-5（あわせて REPAIR-4）。経緯: プロセス内の所有記録 `PINS` だけでは再起動後に照合できず、請求書の `pin=<dev>:<ino>:<serial>` も、連番が 0 から数え直しになるうえ、`dev:ino` が pin ファイル自身の inode（nsfs がマウントされている間は stat しても netns の inode しか見えない）で、nsfs の inum も ext4 の inode も再利用されうるため、単独では別世代の pin と区別できなかった。
+
+- 置き場: `<netns_dir>/.owned/<endpoint>`（1 pin につき 1 ファイル）。`.owned` は最初の `create_pinned` が 0700 で作り、固定した置き場の fd からの相対で `O_NOFOLLOW` で開く。symlink でない・ディレクトリである・実効 UID の所有・group / other に書き込み権限が無い、を fstat で検査し、違反なら何も作らずに拒否する（fail-closed）。`EndpointId` は `.` で始まらないため pin 名と衝突せず、置き場を列挙する箇所は無い（`pin_exists_in`・`pin_absent_in` は完全一致の名前で stat する）
+- 記録ファイル: 0600・実効 UID の所有の通常ファイル。読むときは `O_PATH|O_NOFOLLOW` で開いて fstat で種別・所有者・mode・長さ（256 バイト以下）を確かめてから読む
+- 形式（固定テキスト・LF・ASCII。`crates/net/src/netns/owner_record.rs`）: 版の行 `fandhe-net-pin-owner v1` の後に `endpoint=<EndpointId>`・`file=<dev>:<ino>`（pin ファイル自身）・`ns=<dev>:<ino>`（マウント後に見える netns。作成の途中は `-`）・`serial=<u64>` を固定順で書く。版・順序・重複・余分な行・CRLF・桁数（1〜20 桁の 10 進）・`endpoint` とファイル名の一致・長さを検証し、違反はすべて照合不能として扱う。入力値はエラーに載せない
+- 連番: 現在時刻（UNIX epoch からの ns）を下限にプロセス内で単調増加させる。再起動後の値は前のプロセスの値より大きく、古い請求書の連番と衝突しない。請求書の形式と版（`fandhe-net-attach-claim v1`）は変えない
+- 書く時点: `create_pinned` が pin ファイルを作って chmod した直後に `ns=-` で置き、netns の固定が成功したら `ns` つきの完全な記録へ置き換える。どちらも一時ファイル（`O_EXCL`・0600）→ rename で原子的に置き換える（前の世代の記録はここで上書きされる）。記録できなければ pin を作らずに（または固定した pin を解除して）失敗する。生きている pin の所有記録は常に完全である
+- 消す時点: pin の解除に成功した後（`unpin_in_dir` の成功・既に無かった場合、`create_pinned` の失敗時の後始末、期限切れ後にワーカーが行う回収）に、記録の中身が自分の世代（`file` と `serial`）と一致するときだけ消す。新しい世代の記録は消さない。消せなくても解除の成功は維持する。pin の無い古い記録は無害で、次の作成が上書きし、照合では pin の不存在が冪等な成功になる
+- 照合（`unpin_path_expecting` のメモリに記録が無い場合のみ）: 所有記録を読み（欠落・復号の失敗・属性違反は `netns pin has no valid ownership record` で拒否）、`file` と `serial` が請求書の識別子と一致することを確かめる（不一致は `netns pin is not the one this claim was issued for`）。そのうえで既存の判定へ渡す: 未マウントなら pin ファイルの inode が記録と一致し形（実効 UID 所有・0400・空）が合うこと、nsfs なら umount の前に netns の inode が記録の `ns` と一致すること（`ns=-` なら拒否）を確かめ、umount 後の実体が記録の `file` と一致して形が合ってから unlink する。それ以外のマウントは拒否する。識別子を取らない `unpin_path` は、連番で世代を固定できないため再起動後の pin を扱わない
+- fsync しない理由: 記録の欠落・壊れは拒否側に倒れるだけで安全性に影響せず、必要なのは原子的な置き換えだけである。クラッシュで rename が永続化されず古い中身に戻っても、マウントは再起動で消えており、照合に通りうるのは未マウントの空ファイルの削除だけで無害である。作成のたびの fsync を避け、NET-4 の所要時間への影響も小さく抑える
+- write-ahead との関係: 所有記録は「このモジュールが作った」という所有の表明で、回収の指示ではない。回収は引き続き attach の請求書と veth の所有の証明で制御されるため、次節で採らないとした「作成の途中で落ちたのか成功したのか」の曖昧さは生じない
+- 試験: 単体試験（非 root。`crates/net/src/netns.rs`・`netns/owner_record.rs`）で、記録と一致する pin を外すこと、記録の欠落・壊れ・symlink・mode 違反・識別子の 1 項目の不一致で拒否すること、作り直された新しい pin を古い請求書で外さないこと（AC3）を具体値で確かめる。実機（root）でのプロセスをまたぐ回収は未確認で、実機前提の試験は人間が実行する
+- 残余リスク: 同じ UID の利用者による手動操作（pin を消し、所有記録を残したまま inode を再利用した空ファイルを置く等）は排除できない（置き場は実効 UID の所有で group / other の書き込みを検査済み）。記録の比較から削除までの間に新しい世代の記録を消す競合は、拒否側（照合不能）に倒れる。時計が戻ると連番が衝突しうるが、照合は `dev:ino` の一致も要る。旧いバイナリの請求書と、記録の書き込みが無かった pin（期限切れ後に完了したワーカーの pin は `ns=-` のまま）は手動回収に残る
 
 ## write-ahead の判断（#2681）
 

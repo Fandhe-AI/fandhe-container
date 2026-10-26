@@ -54,7 +54,7 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 
 | 状況 | 理由 | 手順 |
 | ---- | ---- | ---- |
-| plugin の再起動後の netns の pin | `netns::unpin_path` はこのプロセスが作った pin しか外さない | 下の手順 |
+| 照合できない netns の pin（旧いバイナリの請求書、置き場の `.owned/<endpoint>` の欠落・破損・不一致、`ns=-` のままの pin、none モードの pin） | 請求書と永続の所有記録とカーネルの実状態の三者が一致する pin しか外さない（一致する pin は plugin の再起動後も自動回収される。#2824） | 下の手順 |
 | 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>/g/<32 桁の 16 進>` で終わるものだけが対象。`<32 桁の 16 進>` は接続ごとの世代で、同じ endpoint の再接続では変わる。請求書の `generation` と一致しない veth は別の接続のもので消さない） |
 | 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 下の「手順（所有トークンを持つ bridge）」 |
 | アドレス・DNAT ルール・ポート予約（quarantine）がカーネル側の回収後も残るとき | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される |
@@ -62,11 +62,11 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 
 復元したネットワークで `delete_network` が `attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim` の `FailedPrecondition` を返したら、取り残しの回収は済み、ネットワーク本体（bridge・nft テーブル）は手動回収が必要という意味である。
 
-再起動後の pin の手動回収:
+照合できない pin の手動回収:
 
 1. `<状態ルート>/.netns/<endpoint>` を確認する。`findmnt <パス>` で `nsfs` がマウントされているか見る
 2. 他のプロセスがその netns を使っていないことを確かめる（`lsns -t net`）
-3. `umount <パス>` でマウントを外し、空の通常ファイルになったことを確認して `rm <パス>`
+3. `umount <パス>` でマウントを外し、空の通常ファイルになったことを確認して `rm <パス>`。所有記録 `<状態ルート>/.netns/.owned/<endpoint>` が残っていれば `rm` してよい（残っていても次の作成が上書きし、無害）
 4. 請求書に veth も含まれる場合は、請求書を手で消さない。pin の削除後に `NetworkPlugin::detach`（同じコンテナ）または `delete_network` を再試行して、残りの veth を自動回収させる
 5. `ip -o link show` で、その endpoint の host veth（世代が請求書と一致するもの）と pin の両方が無いことを確認してから、`attach/<endpoint>.attach` を手で消す（請求書は全対象資源の回収を確認した後にだけ消す。veth が残ったまま消すと追跡できなくなり、再 attach が `AlreadyExists` になる）
 

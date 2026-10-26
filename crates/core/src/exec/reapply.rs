@@ -52,15 +52,18 @@
 //!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。ただし user namespace へ参加した
 //!   場合（下記）は、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ揃える。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
-//! - **補助グループは launch・exec とも空にする**（SEC-1・SEC-5・TASK-163 追補・#1457）: capability 削減の関数が
-//!   先頭で `setgroups(0)` を呼び、読み戻して確かめる（`exec/capabilities.rs` の `SupplementaryGroups`）。launch の
-//!   子は supervisor の、exec の子は exec を起動したプロセス（`sudo` 経由なら呼び出しユーザー）のホスト側の補助
-//!   グループを持ち越していたため、両者が一致しなかった。**exec は namespace へ参加する前にも消去する**
-//!   （[`prepare_exec_restrictions`] の最後。対象の user namespace へ `setns` した後は `deny` で消せなくなり、
-//!   起動者のグループを持ち込むため。参加前に消せば参加後の削減は「元から空」になり、結果には参加前の消去を
-//!   残す）。`config.json` の `process.user.additionalGids` は launch が
-//!   写像と照合して適用する（#2667）が、exec は非空を `process_ids_from_config` が拒否するので「空」が唯一の
-//!   指定で、exec のグループ付与は未実装。user
+//! - **補助グループは既定で空にし、`process.user.additionalGids` があればそれだけを持たせる**（SEC-1・SEC-5・
+//!   CORE-6・TASK-163 追補・#1457・#2667・#2770）: capability 削減の関数が先頭で、指定が空なら `setgroups(0)` で
+//!   消去して読み戻し、非空なら `setgroups(list)` で置き換えて読み戻す（`exec/capabilities.rs` の
+//!   `SupplementaryGroups`）。launch の子は supervisor の、exec の子は exec を起動したプロセス（`sudo` 経由なら
+//!   呼び出しユーザー）のホスト側の補助グループを持ち越していたため、消去が要る。**exec は namespace へ参加する
+//!   前にも消去する**（[`prepare_exec_restrictions`] の最後。対象の user namespace へ `setns` した後は `deny` で
+//!   消せなくなり、起動者のグループを持ち込むため。参加前に消せば参加後の削減は「元から空」になり、結果には
+//!   参加前の消去を残す。非空の指定を参加後に適用したときの結果は `Applied`）。`additionalGids` は exec でも対象の
+//!   user namespace の実際の写像（`/proc/<pid1>/gid_map`・`setgroups`）と **`setns` の前** に照合する
+//!   （`exec_user_from_config`）。写像の外は `InvalidArgument`、`setgroups` が `deny` の単一 ID 写像で非空なら
+//!   `FailedPrecondition` で、補助グループの消去（不可逆）より前に拒否する。確保（正規化）は
+//!   [`prepare_exec_restrictions`] で済み、参加後の段は読み戻し以外で確保しない。user
 //!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
 //!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
 //!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する
@@ -70,8 +73,10 @@
 //!   namespace より先に user namespace へ参加する（`exec/setns.rs`）。参加で参加先の全 capability を得るため、
 //!   参加後の処理は launch と同じ関数・同じ順序「補助グループ → gid・uid → capability 削減（bounding set・ambient・
 //!   permitted/effective/inheritable）→ `NO_NEW_PRIVS` → Landlock → seccomp」で省かない（SEC-5）。gid・uid は
-//!   `process.user`（`config.json`。launch と同じく root だけを許し、それ以外は `Unimplemented`）の値へ
-//!   `setresgid` → `setresuid` で揃えて読み戻す。非特権ユーザーが自分で作ったコンテナへの exec では名前空間内の
+//!   `process.user`（`config.json`。uid・gid は対象の写像の内側に限る。#2770）の値へ補助グループ → `setresgid` →
+//!   `setresuid` の順で揃えて読み戻す。非 root の uid で `execve` すると ambient が空のため permitted・effective も
+//!   空になり（launch の非 root と同じ。Docker と同等）、エントリポイントの解決も対象 user の権限で行われる。
+//!   非特権ユーザーが自分で作ったコンテナへの exec では名前空間内の
 //!   値が変わらないが、ホストの root から rootless のコンテナへ入ると名前空間内では写像されていない uid のまま
 //!   全 capability を持つため、コンテナの所有者の uid・gid へ揃えることが権限境界になる。同じ user namespace
 //!   （rootful 相当）では参加せず、uid / gid は呼び出しプロセスの値を引き継ぐ
@@ -174,8 +179,9 @@
 //!   restart で変わるため。必要なもの: 記録へ識別子を足す（トレイト契約 12 の拡張）・子が pivot 前段の識別子を状態 pipe で
 //!   親へ返す・親が記録し restart で更新する・`TargetBinding.proc_dir` から `fdinfo/N` を読む（`setns` の後は
 //!   `/proc/thread-self` が使えないため）
-//! - `process.user` が root 以外の場合のユーザー切り替え（launch・exec とも未実装。exec は別の user namespace へ
-//!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
+//! - 同じ user namespace（`Shared`。rootful 相当で本番では到達しない）での root 以外の `process.user` と
+//!   `additionalGids`（`Unimplemented` で拒否。`RootfulHostRoot` の判断待ち。#2241）。別の user namespace
+//!   （既定の rootless）では写像と照合して適用する（#2770）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - launch 時の分離の記録は、本番 launcher が適用する ruleset そのものから作り、start の Running 更新と restart の
 //!   Running(新 pid) 更新で `state.json` へ書く（結線済み・#2007）。記録を持たない launcher（偽の実装）では
@@ -191,7 +197,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
-use super::capabilities::{PreJoinGroups, ProcessIds};
+use super::capabilities::{NormalizedGroups, PreJoinGroups, ProcessIds};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::landlock::landlock_ruleset_from_record;
 #[cfg(feature = "exec-test-support")]
@@ -199,7 +205,8 @@ use super::landlock::{LandlockAccessProbe, run_probe};
 use super::rlimits::{apply_rlimits, widen_fsize_for_copy};
 use super::sealed_copy::SealPolicy;
 use super::setns::{
-    NsIdentity, UserNsRelation, cgroup_path_matches, read_bounded_from, status_effective_uid,
+    NsIdentity, TargetIdMaps, UserNsRelation, cgroup_path_matches, read_bounded_from,
+    status_effective_uid,
 };
 use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
@@ -254,6 +261,9 @@ pub struct ExecRestrictions {
     /// 参加後に呼び出しスレッドを揃える uid・gid（`process.user`）。対象が別の user namespace にいて参加する
     /// ときだけ `Some`（SUP-6・SEC-5・TASK-163.h2・#1462）。同じ user namespace・観測用の経路は `None`。
     ids: Option<ProcessIds>,
+    /// 参加後に適用する補助グループ（`process.user.additionalGids`。正規化済み。空なら消去。SEC-5・CORE-6・#2770）。
+    /// 確保は `prepare_exec_restrictions` で済ませ、再適用の段（fork 子ではない worker の中）では確保しない。
+    groups: NormalizedGroups,
     /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
     /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
     seal_policy: SealPolicy,
@@ -631,14 +641,17 @@ pub fn prepare_exec_restrictions(
         target_pid_ns,
         expected_cgroup: target.expected_cgroup_path().to_owned(),
     };
-    // 別の user namespace へ参加するときだけ、参加後に揃える uid・gid（`process.user`）を決める。root 以外は
-    // launch と同じく未実装として、副作用（補助グループの消去）の前に拒否する。
-    let ids = match relation {
+    // 別の user namespace へ参加するときだけ、参加後に揃える uid・gid と補助グループ（`process.user`）を決める。
+    // 対象の user namespace の実際の写像（`uid_map`・`gid_map`・`setgroups`）と副作用の前に照合し、写像の外・
+    // `setgroups` が `deny` の追加グループは補助グループの消去（不可逆）より前に拒否する（SEC-5・CORE-6・#2770）。
+    let maps = match relation {
         UserNsRelation::Shared { .. } => None,
-        UserNsRelation::Distinct { .. } => Some(process_ids_from_config(config)?),
+        UserNsRelation::Distinct { .. } => Some(target.user_id_maps()?),
     };
+    let user = exec_user_from_config(config, &relation, maps.as_ref())?;
     let mut restrictions = prepare_with_launch(launch, launch.root(), rlimits, binding)?;
-    restrictions.ids = ids;
+    restrictions.ids = user.ids;
+    restrictions.groups = user.groups;
     // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
     // namespace へ入った後では `setgroups` が `deny` で消せず、exec を起動したプロセスのホスト側の補助グループを
     // 持ち込んでしまうため（#1457）。不可逆で、以後このプロセスは exec 専用として使い捨てる。
@@ -660,13 +673,14 @@ pub fn prepare_exec_restrictions(
 /// SEC-5・TASK-163.h2・#1462）。
 ///
 /// 別の user namespace へ参加し（`Distinct`）、かつ呼び出し側の実効 uid（`own_euid`。読めなければ `None`）が対象の
-/// 実効 uid と一致する場合だけ真。一致しない呼び出し側（コンテナの所有者と別の uid、たとえば別ユーザーの
+/// user namespace の所有者 uid と一致する場合だけ真。pid1 の実効 uid とは比べない（`process.user` が非 root だと
+/// pid1 の uid は所有者と別の値になるため。#2770）。一致しない呼び出し側（コンテナの所有者と別の uid、たとえば別ユーザーの
 /// 補助グループを持つプロセス）は、参加後の消去が `deny` で現状維持になるとそのグループをコンテナへ持ち込むため、
 /// 従来どおり参加前の消去の失敗として拒否させる。
 fn defer_group_clearing(relation: &UserNsRelation, own_euid: Option<u32>) -> bool {
     match *relation {
         UserNsRelation::Shared { .. } => false,
-        UserNsRelation::Distinct { target_euid, .. } => own_euid == Some(target_euid),
+        UserNsRelation::Distinct { owner_uid, .. } => own_euid == Some(owner_uid),
     }
 }
 
@@ -681,12 +695,36 @@ fn own_effective_uid() -> Option<u32> {
 /// 自プロセスの `status` の読み取り上限（バイト）。
 const OWN_STATUS_READ_LIMIT: u64 = 64 * 1024;
 
-/// `config.json` の `process.user` から、参加後に揃える uid・gid を導く（SUP-6・SEC-5・TASK-163.h2・#1462）。
+/// exec が参加後に適用する資格情報（uid・gid と補助グループ。SUP-6・SEC-5・CORE-6・#2770）。
 ///
-/// launch（`oci_runtime/start.rs`）と同じ制約を検査する: uid・gid が 0 でない、または `additionalGids` が空でない
-/// 指定は、ユーザー切り替えが未実装のため `Unimplemented`（段 `Validate`）で拒否する。値は定数にせず config から
-/// 導き、将来 launch が root 以外を扱うときに exec も同じ値へ揃える。`process` が無い config は `InvalidArgument`。
-fn process_ids_from_config(config: &OciConfig) -> Result<ProcessIds, ExecError> {
+/// `config.json` の `process.user` を対象 user namespace の写像と照合した結果。将来 exec 要求ごとの user の上書き
+/// （CLI の `--user`・CRI の Exec。#2712・#680）を足すときは、同じ照合を通した値をここへ渡す拡張点になる
+/// （上書き自体は未実装）。
+#[derive(Debug, PartialEq, Eq)]
+struct ExecUser {
+    /// 参加後に揃える uid・gid。同じ user namespace（`Shared`）では `None`（呼び出し側の値を引き継ぐ）。
+    ids: Option<ProcessIds>,
+    /// 参加後に適用する補助グループ（空なら消去）。
+    groups: NormalizedGroups,
+}
+
+/// `config.json` の `process.user` から、参加後に適用する資格情報を導く（SUP-6・SEC-5・CORE-6・TASK-163.h2・
+/// #1462・#2770。副作用なしの純関数）。
+///
+/// - `Distinct`（別の user namespace。既定の rootless。本番はこちらだけ）: uid・gid・`additionalGids` を対象の
+///   写像（`maps`）と照合する。写像の外は `InvalidArgument`、`additionalGids` が非空で `setgroups` が `deny`
+///   （単一 ID 写像）なら `FailedPrecondition`（黙って落とさない）。通れば ids と正規化した補助グループを返す
+///   （launch と同じ順序 setgroups → setgid → setuid で適用される）。メッセージは固定文言で値を含めない（ERR-1）
+/// - `Shared`（同じ user namespace。rootful 相当。本番では到達しない）: root（0/0・追加グループなし）だけを従来
+///   どおり受け、それ以外は `Unimplemented`（`RootfulHostRoot` の判断待ち。#2241）
+///
+/// `process` が無い config は `InvalidArgument`。launch 側の写像外は `FailedPrecondition` のままで、exec は
+/// 要求の誤りとして `InvalidArgument` にする（#2770）。
+fn exec_user_from_config(
+    config: &OciConfig,
+    relation: &UserNsRelation,
+    maps: Option<&TargetIdMaps>,
+) -> Result<ExecUser, ExecError> {
     let stage = IsolationStage::Validate;
     let process = config.process().ok_or_else(|| {
         ExecError::new(
@@ -696,17 +734,78 @@ fn process_ids_from_config(config: &OciConfig) -> Result<ProcessIds, ExecError> 
         )
     })?;
     let user = process.user();
-    if user.uid() != 0 || user.gid() != 0 || !user.additional_gids().is_empty() {
+    let (uid, gid) = (user.uid(), user.gid());
+    let additional = user.additional_gids();
+    let maps = match (relation, maps) {
+        (UserNsRelation::Distinct { .. }, Some(maps)) => maps,
+        (UserNsRelation::Distinct { .. }, None) => {
+            return Err(ExecError::new(
+                ErrorCode::Internal,
+                stage,
+                "target id maps are missing for a distinct user namespace",
+            ));
+        }
+        (UserNsRelation::Shared { .. }, _) => {
+            if uid != 0 || gid != 0 || !additional.is_empty() {
+                return Err(ExecError::new(
+                    ErrorCode::Unimplemented,
+                    stage,
+                    "process.user other than root is not supported",
+                ));
+            }
+            return Ok(ExecUser {
+                ids: None,
+                groups: NormalizedGroups::empty(),
+            });
+        }
+    };
+    if maps.uid.host_id_of(uid).is_none() || maps.gid.host_id_of(gid).is_none() {
         return Err(ExecError::new(
-            ErrorCode::Unimplemented,
+            ErrorCode::InvalidArgument,
             stage,
-            "process.user other than root is not supported",
+            "process.user is not mapped in the container user namespace (SEC-5)",
         ));
     }
-    Ok(ProcessIds {
-        uid: user.uid(),
-        gid: user.gid(),
+    if additional.iter().any(|g| maps.gid.host_id_of(*g).is_none()) {
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            stage,
+            "process.user.additionalGids is not mapped in the container user namespace (SEC-5)",
+        ));
+    }
+    if !additional.is_empty() && !maps.setgroups_allowed {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            stage,
+            "process.user.additionalGids requires setgroups to be allowed in the container user namespace (SEC-5)",
+        ));
+    }
+    Ok(ExecUser {
+        ids: Some(ProcessIds { uid, gid }),
+        groups: NormalizedGroups::new(additional)?,
     })
+}
+
+/// 結合試験専用: 対象 pid1 の実際の写像に対する `process.user` の照合だけを通す（SEC-5・CORE-6・#2770）。
+///
+/// 本番の `prepare_exec_restrictions` と同じ関数（`Pid1Target::user_id_maps` と `exec_user_from_config`）を呼び、
+/// 受け入れ時は `(uid, gid, 正規化した補助グループ)`（同じ user namespace では `None`）を返す。副作用なし。
+/// `exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn exec_user_check_for_test(
+    target: &Pid1Target,
+    config: &OciConfig,
+) -> Result<Option<(u32, u32, Vec<u32>)>, ExecError> {
+    let relation = target.user_ns_relation();
+    let maps = match relation {
+        UserNsRelation::Shared { .. } => None,
+        UserNsRelation::Distinct { .. } => Some(target.user_id_maps()?),
+    };
+    let user = exec_user_from_config(config, &relation, maps.as_ref())?;
+    Ok(user
+        .ids
+        .map(|ids| (ids.uid, ids.gid, user.groups.as_slice().to_vec())))
 }
 
 /// 参加前の消去の結果 `before` と、参加後の capability 削減の中での結果 `after` から、報告する値を決める。
@@ -948,6 +1047,7 @@ fn prepare_with_launch(
         binding,
         groups_before_join: None,
         ids: None,
+        groups: NormalizedGroups::empty(),
         seal_policy,
         seccomp_listener: None,
         capabilities: launch
@@ -1071,6 +1171,7 @@ fn reapply_inner(
         binding,
         groups_before_join,
         ids,
+        groups,
         seal_policy,
         seccomp_listener,
         capabilities: allowed_capabilities,
@@ -1118,6 +1219,7 @@ fn reapply_inner(
                 &mut threads,
                 Some(binding.proc_dir.as_fd()),
                 ids,
+                &groups,
                 allowed_capabilities,
             )
             .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
@@ -1376,6 +1478,7 @@ mod tests {
             binding: own_binding(),
             groups_before_join: None,
             ids: None,
+            groups: NormalizedGroups::empty(),
             seal_policy: SealPolicy::unrestricted(),
             seccomp_listener: Some(test_listener_sender()),
             capabilities: ContainerCapabilities::oci_default(),
@@ -1889,7 +1992,7 @@ mod tests {
         let distinct = UserNsRelation::Distinct {
             target: (4, 11),
             own,
-            target_euid: 1000,
+            owner_uid: 1000,
         };
         assert!(!defer_group_clearing(&shared, Some(1000)));
         assert!(!defer_group_clearing(&shared, None));
@@ -1899,7 +2002,7 @@ mod tests {
         assert!(!defer_group_clearing(&distinct, None));
     }
 
-    /// `process.user` を指定した最小の config（`process_ids_from_config` の入力）。
+    /// `process.user` を指定した最小の config（`exec_user_from_config` の入力）。
     fn config_with_user(user: &str) -> OciConfig {
         let json = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"mounts":[],
@@ -1908,19 +2011,42 @@ mod tests {
         crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
     }
 
-    /// SUP-6・SEC-5・TASK-163.h2・#1462: 参加後に揃える uid・gid は `process.user` から導く。launch と同じく root
-    /// （uid 0・gid 0・追加グループなし）だけを許し、それ以外は `Unimplemented`（段 `Validate`）。`process` の無い
-    /// config は `InvalidArgument`。
+    /// 試験用: コンテナ内 0..65536 と 1000..1000+65536 を持つ（subuid 型の）対象の写像。
+    fn range_maps(setgroups: &str) -> TargetIdMaps {
+        TargetIdMaps::parse("0 100000 65536\n", "0 200000 65536\n", setgroups).expect("maps")
+    }
+
+    fn distinct() -> UserNsRelation {
+        UserNsRelation::Distinct {
+            target: (4, 11),
+            own: (4, 10),
+            owner_uid: 1000,
+        }
+    }
+
+    fn shared() -> UserNsRelation {
+        UserNsRelation::Shared { identity: (4, 10) }
+    }
+
+    /// SUP-6・SEC-5・CORE-6・#2770: `Shared`（本番では到達しない）は従来どおり root だけを受け、それ以外は
+    /// `Unimplemented`。`process` の無い config は `InvalidArgument`。
     #[test]
-    fn sup6_task163_h2_process_ids_come_from_process_user() {
-        let ok = process_ids_from_config(&config_with_user(r#"{"uid":0,"gid":0}"#)).expect("root");
-        assert_eq!(ok, ProcessIds { uid: 0, gid: 0 });
+    fn sup6_sec5_exec_user_shared_accepts_only_root() {
+        let ok = exec_user_from_config(&config_with_user(r#"{"uid":0,"gid":0}"#), &shared(), None)
+            .expect("root");
+        assert_eq!(
+            ok,
+            ExecUser {
+                ids: None,
+                groups: NormalizedGroups::empty()
+            }
+        );
         for user in [
             r#"{"uid":1000,"gid":0}"#,
             r#"{"uid":0,"gid":100}"#,
             r#"{"uid":0,"gid":0,"additionalGids":[5]}"#,
         ] {
-            let e = process_ids_from_config(&config_with_user(user)).unwrap_err();
+            let e = exec_user_from_config(&config_with_user(user), &shared(), None).unwrap_err();
             assert_eq!(
                 (e.code, e.stage),
                 (ErrorCode::Unimplemented, IsolationStage::Validate),
@@ -1929,11 +2055,156 @@ mod tests {
             assert_eq!(e.message, "process.user other than root is not supported");
             assert_eq!(e.violation, None);
         }
-        let e = process_ids_from_config(&config(false, "[]")).unwrap_err();
+        let e = exec_user_from_config(&config(false, "[]"), &shared(), None).unwrap_err();
         assert_eq!(
             (e.code, e.stage),
             (ErrorCode::InvalidArgument, IsolationStage::Validate)
         );
+    }
+
+    /// SUP-6・SEC-5・CORE-6・#2770: `Distinct` は写像の内側の非 root と `additionalGids` を受け、補助グループは
+    /// 正規化（昇順・重複除去）して返す。範囲の端（先頭・末尾）も通る。root（0/0）は従来どおり ids=0/0・空。
+    #[test]
+    fn sup6_sec5_exec_user_distinct_accepts_mapped_ids_and_groups() {
+        let maps = range_maps("allow\n");
+        let u = exec_user_from_config(
+            &config_with_user(r#"{"uid":1000,"gid":1000,"additionalGids":[3000,2000,3000]}"#),
+            &distinct(),
+            Some(&maps),
+        )
+        .expect("mapped");
+        assert_eq!(
+            u.ids,
+            Some(ProcessIds {
+                uid: 1000,
+                gid: 1000
+            })
+        );
+        assert_eq!(u.groups.as_slice(), &[2000, 3000]);
+        let edge = exec_user_from_config(
+            &config_with_user(r#"{"uid":65535,"gid":0,"additionalGids":[0,65535]}"#),
+            &distinct(),
+            Some(&maps),
+        )
+        .expect("edge");
+        assert_eq!(edge.ids, Some(ProcessIds { uid: 65535, gid: 0 }));
+        assert_eq!(edge.groups.as_slice(), &[0, 65535]);
+        let root = exec_user_from_config(
+            &config_with_user(r#"{"uid":0,"gid":0}"#),
+            &distinct(),
+            Some(&maps),
+        )
+        .expect("root");
+        assert_eq!(root.ids, Some(ProcessIds { uid: 0, gid: 0 }));
+        assert!(root.groups.is_empty());
+    }
+
+    /// SUP-6・SEC-5・CORE-6・#2770: 写像の外（末尾 + 1）の uid・gid・追加 gid は `InvalidArgument`（段 `Validate`）。
+    /// `setgroups` が `deny` で追加グループが非空なら `FailedPrecondition`、空なら通る。値はメッセージに含めない。
+    #[test]
+    fn sup6_sec5_exec_user_distinct_rejects_unmapped_and_setgroups_deny() {
+        let maps = range_maps("allow\n");
+        for (user, msg) in [
+            (
+                r#"{"uid":65536,"gid":0}"#,
+                "process.user is not mapped in the container user namespace (SEC-5)",
+            ),
+            (
+                r#"{"uid":0,"gid":65536}"#,
+                "process.user is not mapped in the container user namespace (SEC-5)",
+            ),
+            (
+                r#"{"uid":0,"gid":0,"additionalGids":[5,65536]}"#,
+                "process.user.additionalGids is not mapped in the container user namespace (SEC-5)",
+            ),
+        ] {
+            let e = exec_user_from_config(&config_with_user(user), &distinct(), Some(&maps))
+                .unwrap_err();
+            assert_eq!(
+                (e.code, e.stage),
+                (ErrorCode::InvalidArgument, IsolationStage::Validate),
+                "{user}"
+            );
+            assert_eq!(e.message, msg);
+            assert_eq!(e.violation, None);
+        }
+        let denied = range_maps("deny\n");
+        let e = exec_user_from_config(
+            &config_with_user(r#"{"uid":1000,"gid":1000,"additionalGids":[5]}"#),
+            &distinct(),
+            Some(&denied),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Validate)
+        );
+        assert_eq!(
+            e.message,
+            "process.user.additionalGids requires setgroups to be allowed in the container user namespace (SEC-5)"
+        );
+        // 追加グループが空なら `deny` でも通る（補助グループは消去のまま。`KeptSetgroupsDenied` に逃がす指定ではない）。
+        let ok = exec_user_from_config(
+            &config_with_user(r#"{"uid":1000,"gid":1000}"#),
+            &distinct(),
+            Some(&denied),
+        )
+        .expect("deny + empty groups");
+        assert!(ok.groups.is_empty());
+        // 単一 ID 写像（"0 1000 1"）では 0 以外は写像の外。
+        let single = TargetIdMaps::parse("0 1000 1\n", "0 1000 1\n", "deny\n").unwrap();
+        let e = exec_user_from_config(
+            &config_with_user(r#"{"uid":1000,"gid":1000}"#),
+            &distinct(),
+            Some(&single),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        // 写像が無い `Distinct` は内部エラー（fail-closed）。
+        let e = exec_user_from_config(&config_with_user(r#"{"uid":0,"gid":0}"#), &distinct(), None)
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+    }
+
+    /// SUP-6・SEC-5・#2770: 参加前の消去の結果が `Cleared`、参加後が `Applied` なら `Applied` を報告する。
+    #[test]
+    fn sup6_sec5_combine_group_outcomes_prefers_applied() {
+        assert_eq!(
+            combine_group_outcomes(
+                Some(SupplementaryGroups::Cleared { cleared: 2 }),
+                Some(SupplementaryGroups::Applied { count: 2 })
+            ),
+            Some(SupplementaryGroups::Applied { count: 2 })
+        );
+        assert_eq!(
+            combine_group_outcomes(
+                Some(SupplementaryGroups::Cleared { cleared: 2 }),
+                Some(SupplementaryGroups::AlreadyEmpty)
+            ),
+            Some(SupplementaryGroups::Cleared { cleared: 2 })
+        );
+    }
+
+    /// SUP-6・SEC-5・CORE-6・#2770: 準備で決めた補助グループは再適用で capability 段へ届き、結果は `Applied`。
+    #[test]
+    fn sup6_sec5_exec_groups_reach_capability_stage() {
+        use crate::exec::capabilities::testing::take_groups_seen;
+        let _ = take();
+        let _ = take_groups_seen();
+        let mut r = restrictions(std::process::id());
+        r.ids = Some(ProcessIds {
+            uid: 1000,
+            gid: 1000,
+        });
+        r.groups = NormalizedGroups::new(&[3000, 2000]).unwrap();
+        let report = reapply_restrictions(r).expect("ok");
+        assert_eq!(take_groups_seen(), Some(vec![2000, 3000]));
+        assert_eq!(
+            report.supplementary_groups,
+            Some(SupplementaryGroups::Applied { count: 2 })
+        );
+        let _ = take();
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・SEC-5・TASK-163.h2・#1462: 再適用は準備で決めた `ids` を capability 段へ渡す。別の user namespace へ

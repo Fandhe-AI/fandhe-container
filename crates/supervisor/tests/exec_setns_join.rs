@@ -42,6 +42,15 @@
 //!   `CAP_SETGID` を持っていても消去できない場合に「現状維持の記録」（`KeptSetgroupsDenied`）になること・
 //!   補助グループが実際に変わらないことを照合する
 //!
+//! #2770（SEC-5・CORE-6・SUP-6）で次を足した（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ。`newuidmap` / `newgidmap` と
+//! `/etc/subuid`・`/etc/subgid` の自ユーザー行を要する）。
+//!
+//! - **非 root の `process.user` と `additionalGids`（範囲写像）**: `unshare --map-users` / `--map-groups` で
+//!   コンテナ内 0.. を subuid / subgid の範囲へ写した pid1 に対し、joiner が本番と同じ照合（実際の
+//!   `uid_map`・`gid_map`・`setgroups` との照合）で 1000:1000・`additionalGids` [3000, 2000, 3000] を受け、写像の外
+//!   （65536）を `InvalidArgument` で拒否し、参加後に補助グループ → gid → uid の順で適用して、`Uid:` / `Gid:` が
+//!   1000、`Groups:` が `2000 3000` になることを具体値で照合する
+//!
 //! # 試験専用の入口（`exec-test-support` feature）
 //! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
 //! 呼び出し側から渡す `identify_pid1_in` を使う。この入口は `exec-test-support` feature を付けたビルドにだけ
@@ -117,6 +126,8 @@ fn main() {
             std::path::Path::new(rootfs),
             std::path::Path::new(identity),
         );
+    } else if let Some(pid) = pid_after(linux::JOINER_USER) {
+        linux::joiner_user(pid);
     } else if pid_after(linux::JOINER_GROUPS).is_some() {
         linux::joiner_groups();
     } else if let Some(i) = args.iter().position(|a| a == linux::PID1_PIVOT_TMPFS) {
@@ -202,6 +213,9 @@ mod linux {
     pub const JOINER_ROOTLESS: &str = "--joiner-rootless";
     /// `pivot_root` 済みの pid1 へ参加し、参加後の `/` を照合する joiner の再入フラグ（引数: pid・rootfs）。
     pub const JOINER_PIVOTED: &str = "--joiner-pivoted";
+    /// 範囲写像の対象へ、非 root の `process.user` と `additionalGids` を照合して適用する joiner の再入フラグ
+    /// （引数: pid。#2770）。
+    pub const JOINER_USER: &str = "--joiner-user";
     /// `setgroups` が `deny` の user namespace で補助グループの扱いを照合する joiner の再入フラグ（引数: pid。未使用）。
     pub const JOINER_GROUPS: &str = "--joiner-groups";
     /// launcher と同じ手順で `pivot_root` まで進んで待機する pid1 の再入フラグ（引数: rootfs）。
@@ -295,7 +309,45 @@ mod linux {
         println!(
             "exec_setns_join: supplementary groups kept and recorded where setgroups is denied"
         );
+        // #2770: 範囲写像の対象への非 root の `process.user` と `additionalGids`（実機前提の追加。前提が揃う時だけ）。
+        if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            let (uid_range, gid_range) = subordinate_ranges();
+            let map_users = format!("--map-users=0:{}:{}", uid_range.0, uid_range.1);
+            let map_groups = format!("--map-groups=0:{}:{}", gid_range.0, gid_range.1);
+            run_scenario_mapped(
+                &[map_users.as_str(), map_groups.as_str()],
+                &ALL_NS,
+                sleep(),
+                None,
+                false,
+                JOINER_USER,
+                &[],
+            );
+            println!(
+                "exec_setns_join: exec user 1000:1000 with groups 2000,3000 applied via subordinate ids"
+            );
+        } else {
+            println!(
+                "exec_setns_join: subordinate id case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
+            );
+        }
         println!("exec_setns_join: namespace join verified");
+    }
+
+    /// 自ユーザーの subuid・subgid の最初の範囲 `(先頭, 件数)`（件数は 65536 まで）。無ければ前提欠如として失敗させる。
+    fn subordinate_ranges() -> ((u32, u32), (u32, u32)) {
+        use fandhe_container_core::rootless::{SubIdOwner, load_subordinate_ids};
+        let uid = fs::metadata("/proc/self").expect("stat /proc/self").uid();
+        let owner = SubIdOwner::new(uid, std::env::var("USER").ok()).expect("owner");
+        let first = |file: &str| {
+            let ranges = load_subordinate_ids(Path::new(file), &owner)
+                .unwrap_or_else(|e| panic!("load {file}: {e}"));
+            let r = ranges
+                .first()
+                .unwrap_or_else(|| panic!("{file} has no range for the current user"));
+            (r.start(), r.count().min(65_536))
+        };
+        (first("/etc/subuid"), first("/etc/subgid"))
     }
 
     /// 使い捨てのファイル。drop で削除する。
@@ -349,10 +401,32 @@ mod linux {
         joiner_flag: &str,
         joiner_args: &[String],
     ) {
+        run_scenario_mapped(
+            &["--map-root-user"],
+            extra_ns,
+            pid1_command,
+            ready,
+            enter_user_ns,
+            joiner_flag,
+            joiner_args,
+        );
+    }
+
+    /// [`run_scenario`] の本体。`user_map` は `unshare` の user namespace の写像の指定（`--map-root-user` か、
+    /// 範囲写像の `--map-users` / `--map-groups`。#2770）。
+    fn run_scenario_mapped(
+        user_map: &[&str],
+        extra_ns: &[&str],
+        pid1_command: Vec<OsString>,
+        ready: Option<&Path>,
+        enter_user_ns: bool,
+        joiner_flag: &str,
+        joiner_args: &[String],
+    ) {
         let unshare = Command::new("unshare")
+            .args(["--user"])
+            .args(user_map)
             .args([
-                "--user",
-                "--map-root-user",
                 "--pid",
                 // `--kill-child` は `--fork` を含意する（util-linux）が、新しい PID namespace の PID 1 は
                 // fork した子であることを引数の上でも明示する。
@@ -576,6 +650,68 @@ mod linux {
         let after = status();
         assert_eq!(field(&after, "Uid:"), "0\t0\t0\t0");
         assert_eq!(field(&after, "Gid:"), "0\t0\t0\t0");
+    }
+
+    /// 範囲写像の user namespace（コンテナ内 0.. を subuid / subgid の範囲へ写す。`setgroups` は `allow`）の pid1 へ、
+    /// 対象の所有者として参加する単一スレッドで、非 root の `process.user` と `additionalGids` を本番と同じ照合
+    /// （実際の写像との照合）で受け、参加後に補助グループ → gid → uid の順で適用する（SEC-5・CORE-6・SUP-6・#2770）。
+    ///
+    /// 参加前に、写像の外の uid・追加 gid が `InvalidArgument` で拒否されることも照合する（副作用の前）。適用後は
+    /// 参加先の名前空間内から見た `Uid:` / `Gid:` が 1000、`Groups:` が昇順の `2000 3000` になる。
+    pub fn joiner_user(pid: u32) {
+        use fandhe_container_core::exec::{apply_join_user_for_test, exec_user_check_for_test};
+        let config = |user: &str| {
+            let json = format!(
+                r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"mounts":[],
+                "process":{{"terminal":false,"user":{user},"args":["/bin/true"],"cwd":"/"}}}}"#
+            );
+            fandhe_container_core::oci_runtime::parse_config_bytes(json.as_bytes())
+                .expect("parse config")
+        };
+        let (rec, path) = record_and_cgroup_path(pid, RootIdentity::new(44, 1234));
+        let target =
+            identify_pid1_in(&rec, &path).expect("identify pid1 in the subordinate user namespace");
+        // 写像の内側は受け、補助グループは昇順・重複なしに正規化される。
+        let accepted = exec_user_check_for_test(
+            target.pid1(),
+            &config(r#"{"uid":1000,"gid":1000,"additionalGids":[3000,2000,3000]}"#),
+        )
+        .expect("a mapped process.user must be accepted");
+        assert_eq!(accepted, Some((1000, 1000, vec![2000, 3000])));
+        // 写像の外（コンテナ内 65536 以上。写像は 0..65535）は副作用の前に拒否される。
+        for user in [
+            r#"{"uid":65536,"gid":1000}"#,
+            r#"{"uid":1000,"gid":65536}"#,
+            r#"{"uid":1000,"gid":1000,"additionalGids":[2000,65536]}"#,
+        ] {
+            let e = exec_user_check_for_test(target.pid1(), &config(user))
+                .expect_err("an unmapped process.user must be refused");
+            assert_eq!(e.code, ErrorCode::InvalidArgument, "{user}");
+        }
+
+        let report = enter_namespaces(&target).expect("enter namespaces including the user one");
+        assert!(report.user_namespace_joined);
+        assert_eq!(
+            fs::read_to_string("/proc/thread-self/setgroups").expect("read setgroups"),
+            "allow\n",
+            "setgroups must be allowed in the subordinate user namespace"
+        );
+        assert_eq!(
+            apply_join_user_for_test(1000, 1000, &[3000, 2000]).expect("apply the exec user"),
+            SupplementaryGroups::Applied { count: 2 }
+        );
+        let status = fs::read_to_string("/proc/thread-self/status").expect("read own status");
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} missing in status"))
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(field("Uid:"), "1000\t1000\t1000\t1000");
+        assert_eq!(field("Gid:"), "1000\t1000\t1000\t1000");
+        assert_eq!(field("Groups:"), "2000 3000");
     }
 
     /// 対象の user namespace（`unshare --map-root-user` が作る。`setgroups` は `deny`）に入った単一スレッドで、

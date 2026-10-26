@@ -685,6 +685,10 @@ fn launch_inner(
     if let Some(isolation) = process.launch_isolation() {
         running_update = running_update.with_launch_isolation(isolation.clone());
     }
+    // launch が適用した rlimit(16 種)も同じ update で書く。exec の再適用が launch と同じ制限を載せる(SUP-12・#2713)。
+    if let Some(rlimits) = process.launch_rlimits() {
+        running_update = running_update.with_rlimits(rlimits.clone());
+    }
     match store.update(&running_update) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
         Ok(record) => Ok(StartedContainer { record, process }),
@@ -1444,6 +1448,9 @@ mod tests {
             if let Some(l) = req.launch_isolation().or(cur.launch_isolation()) {
                 next = next.with_launch_isolation(l.clone());
             }
+            if let Some(r) = req.rlimits().or(cur.rlimits()) {
+                next = next.with_rlimits(r.clone());
+            }
             records.insert(req.status().id().clone(), next.clone());
             Ok(next)
         }
@@ -1538,6 +1545,8 @@ mod tests {
         audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
         /// launch が返すハンドルに持たせる分離の記録(未設定なら記録なし。#2007)。
         isolation: Mutex<Option<crate::launch_isolation::LaunchIsolationRecord>>,
+        /// launch が返すハンドルに持たせる rlimit 集合(未設定なら記録なし。#2713)。
+        rlimits: Mutex<Option<crate::rlimits::Rlimits>>,
         /// `confirm_no_process_recorded` に渡された配置（呼び出し順。#2011）。
         recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
     }
@@ -1559,6 +1568,7 @@ mod tests {
                 may_leave: AtomicBool::new(false),
                 audit: std::sync::OnceLock::new(),
                 isolation: Mutex::new(None),
+                rlimits: Mutex::new(None),
                 recorded: Mutex::new(Vec::new()),
             })
         }
@@ -1593,6 +1603,7 @@ mod tests {
         Arc<Gate>,
         NonZeroU32,
         Option<crate::launch_isolation::LaunchIsolationRecord>,
+        Option<crate::rlimits::Rlimits>,
     );
 
     impl LaunchedProcess for FakeProcess {
@@ -1602,6 +1613,10 @@ mod tests {
 
         fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
             self.4.as_ref()
+        }
+
+        fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+            self.5.as_ref()
         }
 
         /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
@@ -1699,6 +1714,10 @@ mod tests {
                 self.term_gate.clone(),
                 NonZeroU32::new(self.pid.load(Ordering::SeqCst)).expect("nonzero"),
                 self.isolation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                self.rlimits
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
@@ -2958,6 +2977,25 @@ mod tests {
             ))
             .expect("get");
         assert!(stored.launch_isolation() == Some(&iso_record(7, 11)));
+    }
+
+    /// SUP-12・CLI-1(#2713): ハンドルが持つ rlimit 集合は、Running の更新と同じ update で状態へ載る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup12_running_record_carries_launch_rlimits() {
+        use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
+        let (_b, store) = created("rl-carry");
+        let launcher = RecordingLauncher::new(false);
+        let set = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 1024, 2048).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        *launcher.rlimits.lock().unwrap() = Some(set.clone());
+        let record = run(&store, &launcher, "rl-carry").expect("start");
+        assert_eq!(record.rlimits(), Some(&set));
+        let (_b2, store2) = created("rl-none");
+        let none = run(&store2, &RecordingLauncher::new(false), "rl-none").expect("start");
+        assert!(none.rlimits().is_none());
     }
 
     /// SUP-6(#2007): 記録を持たないハンドルでは、従来どおり分離の記録は付かない。

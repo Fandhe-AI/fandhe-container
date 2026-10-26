@@ -109,7 +109,7 @@ pub(super) fn widen_fsize_for_copy(target: &Rlimit) -> Result<(), ExecError> {
 /// `StagePipeline::with_rlimits` と `StateRecord` の記録（`CreateStateRequest::with_rlimits`）の両方へ渡す。
 /// すると launch と exec（`prepare_exec_restrictions`）が、同じ入力を同じ `apply_rlimits` で適用することになり、
 /// pid1 が後から soft を上げ下げしても exec の rlimit は launch と一致する。読み取りの失敗・値の不整合は
-/// 縮退せず段 `Rlimits` のエラーで返す（fail-closed）。本番の launcher からの呼び出しの結線は後続作業（REPAIR-3）。
+/// 縮退せず段 `Rlimits` のエラーで返す（fail-closed）。本番 launcher の `launch_checked` が fork 前に 1 回呼ぶ（#2713）。
 pub fn launch_rlimits_from_self(specified: &Rlimits) -> Result<Rlimits, ExecError> {
     let stage = IsolationStage::Rlimits;
     specified.complete_with(

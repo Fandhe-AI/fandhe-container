@@ -13,6 +13,9 @@
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
+//!    2c. 起動オプション文書(状態ルート配下の `@container-options/<id>`。CLI の create が書く。形式は
+//!    [`crate::container_options::document`])を同じ期限つき作業スレッドで読む。無ければ既定値。読めない・壊れている
+//!    ときは手順 4 の [`StartDeps::check_launcher_available`] が cgroup にも launch にも触れずに止める。#2713・SUP-12／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
 //!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
@@ -142,6 +145,15 @@ pub trait StartDeps {
     /// seccomp の通知に応答するハブ（SEC-4・REPAIR-5・#2025）。`Some` を返す実装は、launcher を `UserNotif` 版の filter で
     /// 構築し、入口が起動・再起動のたびに listener を受け取ってハブへ渡す。既定は `None`（従来の ERRNO 版。通知なし）。
     fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
+        None
+    }
+
+    /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
+    ///
+    /// `Some` のとき入口は、手順 3 で観測した記録の世代がこれと一致しない start を拒否する。2c の読み取りの後に同じ ID が
+    /// 削除・再作成されても、前の世代の env・ulimit・`--ipc=host` 等で新しいコンテナを起動しない(SEC-1・SUP-12・#2713)。
+    /// 既定は `None`(照合しない。フェイクの [`StartDeps`] は上書きしなくてよい)。
+    fn expected_options_generation(&self) -> Option<Option<String>> {
         None
     }
 
@@ -1244,6 +1256,24 @@ fn prepare_start(
             Cleanup::Nothing,
         );
     }
+    // 2c で文書を照合した作成世代と、ここで観測した記録の世代が違えば、2c の後に同じ ID が削除・再作成されている。
+    // 観測した記録は後続の世代の照合(cgroup の instance)で予約時点の記録と結びつくため、ここで一致を確かめれば
+    // 前の世代のオプションを新しいコンテナへ適用しない(SEC-1・SUP-12・#2713)。
+    if let Some(expected) = deps.expected_options_generation() {
+        let actual = observed
+            .annotations()
+            .get(crate::container_options::store::GENERATION_ANNOTATION)
+            .map(str::to_owned);
+        if actual != expected {
+            return fail(
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the container was recreated after its options were read; retry start",
+                ),
+                Cleanup::Nothing,
+            );
+        }
+    }
     // 4: 副作用なしで launcher の可用性を確かめる。
     if let Err(e) = deps.check_launcher_available() {
         return fail(e, Cleanup::Nothing);
@@ -2102,6 +2132,11 @@ mod linux {
         /// 起動オプション（`with_container_options`。`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・#2625）。
         /// 既定（指定なし）は従来の動作と同じ。
         container_options: ContainerOptions,
+        /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
+        /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
+        container_options_error: Option<TraitError>,
+        /// 手順 2c で文書を照合した状態記録の作成世代(`with_options_generation`。`expected_options_generation`)。
+        options_generation: Option<Option<String>>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2214,7 +2249,24 @@ mod linux {
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
                 container_options: ContainerOptions::default(),
+                container_options_error: None,
+                options_generation: None,
             }
+        }
+
+        /// 起動オプション文書の読み込みに失敗したことを覚えさせる。手順 4 が cgroup の連鎖より前にそのエラーで止める
+        /// (手順 3 の中断起動の回復〔CORE-2〕は従来どおり先に走る。SUP-12・SEC-1・#2713)。
+        #[must_use]
+        pub fn with_container_options_error(mut self, error: TraitError) -> Self {
+            self.container_options_error = Some(error);
+            self
+        }
+
+        /// 手順 2c で文書を照合した作成世代を覚えさせる(手順 3 で観測した記録の世代と照合する。SEC-1・#2713)。
+        #[must_use]
+        pub fn with_options_generation(mut self, recorded: Option<String>) -> Self {
+            self.options_generation = Some(recorded);
+            self
         }
 
         /// 起動オプション（`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs）を設定する（SUP-12・CORE-5・#2625）。
@@ -2223,7 +2275,7 @@ mod linux {
         /// `build_launcher` が [`ContainerOptions::launch_options`] を本番 launcher へ渡す。restart の再 launch も同じ
         /// launcher を使うので同じ指定が効く。ホストの secrets のファイルは手順 7 で一度だけ読み、launcher が保持する
         /// （内容は core が封印 memfd に置くため、範囲写像の経路で holder が継承するメモリに載らない。#2628）。
-        /// CLI からの受け渡しは未実装（`run_main` は既定のまま。REPAIR-3）。
+        /// CLI からの受け渡しは状態ルート配下の 0600 の文書(`run_main` が手順 2c で読む。#2713)。
         #[must_use]
         pub fn with_container_options(mut self, options: ContainerOptions) -> Self {
             self.container_options = options;
@@ -2324,7 +2376,15 @@ mod linux {
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を
         /// fork の前に拒否するが、cgroup の連鎖（取り消せないスコープの追記）の前に止めるためここで前倒しする（CORE-5）。
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
+        fn expected_options_generation(&self) -> Option<Option<String>> {
+            self.options_generation.clone()
+        }
+
         fn check_launcher_available(&self) -> Result<(), TraitError> {
+            // 起動オプション文書が読めない・壊れているときは、cgroup にも launch にも触れずに止める(SUP-12・#2713)。
+            if let Some(e) = &self.container_options_error {
+                return Err(e.clone());
+            }
             self.privilege.clone()?;
             // 起動オプションの矛盾は cgroup の連鎖の前に拒否する（ファイルは読まない純粋な検証。手順 7 が変換の本体）。
             self.container_options.implicit_dev_mounts()?;
@@ -2607,6 +2667,82 @@ mod linux {
         }
     }
 
+    /// 手順 2c: 起動オプション文書を読んで検証済みの [`ContainerOptions`] にする(#2713)。文書が無ければ `Ok(None)`。
+    ///
+    /// ストアの `host_state_root()`(検査済み。CLI の create が文書を書いた場所と同じ)を優先する。読み取りは状態ルートの
+    /// I/O が止まりうるため作業スレッドで行い `until` まで待つ(REPAIR-5)。成功時は `join` でスレッドの終了まで確認してから
+    /// 返す。期限超過は `Timeout`(作業スレッドは残るが、呼び出し側は手順 4 で止まり launch しない)。
+    ///
+    /// 戻り値の 2 つ目は、文書を照合した状態記録の作成世代(記録が無い・世代なしは `None`)。呼び出し側が deps に覚えさせ、
+    /// 手順 3 の観測と照合する(SEC-1)。
+    fn prepare_container_options_with_generation(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+    ) -> Result<(Option<ContainerOptions>, Option<String>), TraitError> {
+        let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
+        let store = Arc::clone(store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("fandhe-supopt".into())
+            .spawn(move || {
+                let result =
+                    read_generation_checked_document(&store, &root, &id).and_then(|(doc, rec)| {
+                        doc.map(|d| d.to_container_options())
+                            .transpose()
+                            .map(|o| (o, rec))
+                    });
+                let _ = tx.send(result);
+            })
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to spawn the container options worker",
+                )
+            })?;
+        let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+        let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
+        match rx.recv_timeout(limit) {
+            Ok(result) => {
+                let _ = handle.join();
+                result
+            }
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "container options preparation timed out",
+            )),
+        }
+    }
+
+    /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
+    ///
+    /// 記録が無い(`NotFound`)ときは文書を採用しない(後続の手順が記録の不在を報告する)。ほかの取得失敗はそのまま返す。
+    fn read_generation_checked_document(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+    ) -> Result<
+        (
+            Option<crate::container_options::document::ContainerOptionsDocument>,
+            Option<String>,
+        ),
+        TraitError,
+    > {
+        use crate::container_options::store as options;
+        let doc = options::read(root, id)?;
+        let recorded = match store.get(&GetStateRequest::new(id.clone())) {
+            Ok(record) => record
+                .annotations()
+                .get(options::GENERATION_ANNOTATION)
+                .map(str::to_owned),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok((None, None)),
+            Err(e) => return Err(e),
+        };
+        let selected = options::select_document(doc, recorded.as_deref())?;
+        Ok((selected, recorded))
+    }
+
     /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
     fn open_supervisor_log(
         store: &Arc<dyn StateStore>,
@@ -2804,6 +2940,20 @@ mod linux {
         if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
             return fail(&mut out, op_err(e));
         }
+        // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
+        // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
+        // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
+        let deps =
+            match prepare_container_options_with_generation(&store, &args.root, &args.id, deadline)
+            {
+                // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
+                Ok((Some(options), recorded)) => Box::new(
+                    deps.with_container_options(options)
+                        .with_options_generation(recorded),
+                ),
+                Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
+                Err(e) => Box::new(deps.with_container_options_error(e)),
+            };
         let running = match run_start_until(
             deps,
             &store,
@@ -2853,6 +3003,17 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        /// 試験用の薄い入口(世代を捨てる)。本番部分の `#[cfg(test)]` 分割に依存する照合試験があるため、
+        /// 本番側ではなく tests モジュールに置く。
+        fn prepare_container_options(
+            store: &Arc<dyn StateStore>,
+            root: &std::path::Path,
+            id: &ContainerId,
+            until: Option<Instant>,
+        ) -> Result<Option<ContainerOptions>, TraitError> {
+            prepare_container_options_with_generation(store, root, id, until).map(|(o, _)| o)
+        }
+
         use super::*;
 
         /// 一時ディレクトリに passwd / subuid / subgid を置き、`resolve_launch_privilege` を呼ぶ。
@@ -3046,6 +3207,117 @@ mod linux {
             let sink: Arc<dyn AuditSink> = Arc::new(OkSink);
             let got = require_seccomp_audit_sink(Ok(Arc::clone(&sink))).expect("kept");
             assert!(Arc::ptr_eq(&sink, &got));
+        }
+
+        /// SUP-12・SEC-1(#2713): 起動オプション文書の読み込みエラーは手順 4 がそのまま返して止める(既定値で続けない)。
+        #[test]
+        fn sup12_2713_options_error_stops_at_step_4() {
+            let deps = ProductionStartDeps::new(std::env::temp_dir()).with_container_options_error(
+                TraitError::new(ErrorCode::InvalidArgument, "options document is too large"),
+            );
+            let err = deps.check_launcher_available().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "options document is too large");
+        }
+
+        /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sup12_2713_prepare_container_options_reads_document() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use crate::container_options::store;
+            let root = std::env::temp_dir().join(format!("fcopt-prep-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let store_dyn: Arc<dyn StateStore> = Arc::new(
+                fandhe_container_core::state_store::FileStateStore::open(
+                    fandhe_container_core::state_store::StateRoot::from_override(root.clone())
+                        .expect("root"),
+                )
+                .expect("store"),
+            );
+            let id = ContainerId::new("c1").expect("id");
+            let until = Some(Instant::now() + Duration::from_secs(30));
+            // 記録が無いときは文書を採用しない。
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("none")
+                    .is_none()
+            );
+            let bundle = root.join("bundle");
+            std::fs::create_dir_all(&bundle).expect("bundle");
+            let create_record = |generation: Option<&str>| {
+                let mut req = fandhe_container_core::traits::CreateStateRequest::new(
+                    fandhe_container_core::traits::ContainerStatus::created(id.clone(), None),
+                    bundle.clone(),
+                )
+                .expect("req");
+                if let Some(g) = generation {
+                    req = req.with_annotations(
+                        fandhe_container_core::traits::Annotations::new([(
+                            store::GENERATION_ANNOTATION.to_owned(),
+                            g.to_owned(),
+                        )])
+                        .expect("annotations"),
+                    );
+                }
+                store_dyn.create(&req).expect("create")
+            };
+            let doc = ContainerOptionsDocument::new(
+                vec!["nofile=1024:2048".into()],
+                vec!["A=1".into()],
+                None,
+                None,
+                vec![],
+            )
+            .expect("doc")
+            .with_generation("gen-1".into())
+            .expect("gen");
+            store::write_new(&root, &id, &doc).expect("write");
+            // 世代の無い記録(plugin-cri 経由・別の世代)では、残っていた文書を採用しない。
+            let rec = create_record(None);
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("stale is ignored")
+                    .is_none()
+            );
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が違う記録は、削除と作成の競合の疑いとして拒否する(旧文書で新記録を黙って既定値にしない)。
+            let rec = create_record(Some("gen-2"));
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が一致すれば採用する。
+            create_record(Some("gen-1"));
+            let got = prepare_container_options(&store_dyn, &root, &id, until)
+                .expect("read")
+                .expect("some");
+            assert_eq!(got.env().to_env_strings(), vec!["A=1"]);
+            assert_eq!(got.rlimits().len(), 1);
+            // 記録は世代を持つのに文書が無ければ、黙って既定値にせず拒否する。
+            store::remove(&root, &id).expect("remove");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            // 壊れた文書は拒否する。
+            let path = store::options_path(&root, &id);
+            std::fs::write(&path, b"junk").expect("corrupt");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("chmod");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。

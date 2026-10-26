@@ -344,6 +344,11 @@ impl LaunchedProcess for ControlledProcess {
         self.inner.launch_isolation()
     }
 
+    /// 内側の launch 時の rlimit 集合へ転送する(転送しないと restart の記録の置き換えが落ちる。SUP-12・#2713)。
+    fn launch_rlimits(&self) -> Option<&fandhe_container_core::rlimits::Rlimits> {
+        self.inner.launch_rlimits()
+    }
+
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
         self.drain(None);
         let result = self.inner.wait(timeout);

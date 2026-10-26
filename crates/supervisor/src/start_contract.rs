@@ -17,6 +17,9 @@
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
 //! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。CLI が渡す環境は `PATH`（固定値）と
 //!   `XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。supervisor は読まない）だけである。
+//! - 起動オプション（`--ulimit`・`--env` 等。#2713・SUP-12）は argv にも環境にも載せない。CLI の `create` が書いた
+//!   `<root>/@container-options/<id>`（0600）を、supervisor が手順 2c で読む（形式は
+//!   [`crate::container_options::document`]、置き場所と検査は [`crate::container_options::store`]）。argv は変えない。
 //! - 委譲スコープ（#2081・CORE-3・CORE-4）: `DelegatedCgroup::prepare` は親 cgroup に自分以外のプロセスがいると拒否するため、
 //!   CLI は supervisor を [`USER_SCOPE_WRAPPER_ARGS`] で包んで起動する（`systemd-run <引数> <supervisor の絶対パス> start ...`）。
 //!   systemd-run は scope の登録後に同じプロセスでコマンドを exec する（`man systemd-run` の scope の説明と systemd の

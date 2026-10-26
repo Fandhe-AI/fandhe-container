@@ -13,6 +13,7 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::state_store::Annotations;
 use super::types::{ContainerId, ErrorCode, TraitError};
 
 /// コンテナのライフサイクル（create/start/kill/stop/delete/state）を抽象化する拡張点。
@@ -115,6 +116,7 @@ impl Signal {
 pub struct CreateRequest {
     id: ContainerId,
     bundle: PathBuf,
+    annotations: Annotations,
 }
 
 impl CreateRequest {
@@ -131,7 +133,27 @@ impl CreateRequest {
                 "bundle path must be absolute",
             ));
         }
-        Ok(Self { id, bundle })
+        Ok(Self {
+            id,
+            bundle,
+            annotations: Annotations::default(),
+        })
+    }
+
+    /// `state.json` へ記録する label(`--label`。検証済みの [`Annotations`]。SUP-12・CLI-1・#2713)。既定は空。
+    ///
+    /// core の `create` が [`CreateStateRequest::with_annotations`](super::state_store::CreateStateRequest::with_annotations)
+    /// へそのまま渡す。plugin 境界のワイヤー(`CreateRequest` の符号化)は label を運ばないため、plugin 経由の
+    /// backend では無視される(REPAIR-3。Linux の CLI は core を直接呼ぶので影響しない)。
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    /// 記録する label を返す(未指定なら空)。
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
     }
 
     /// 対象コンテナの ID を返す。

@@ -28,7 +28,35 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`(未検証の文字列。意味検証は `create_options`。
+    /// SUP-12・CLI-1・#2713)。
+    pub(super) options: CreateOptionArgs,
 }
+
+/// `create` の起動オプションの指定(argv の生の値。件数の上限だけをここで見て、形式の検証は `create_options` が既存の
+/// パーサで行う。SUP-12・SEC-1・#2713)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct CreateOptionArgs {
+    /// `--ulimit <name>=<soft>[:<hard>]`(最大 [`MAX_CREATE_ULIMITS`] 件)。
+    pub(super) ulimits: Vec<String>,
+    /// `--env` / `-e` `<KEY=VALUE>`(最大 `ENV_MAX_ENTRIES` 件)。
+    pub(super) env: Vec<String>,
+    /// `--env-file <path>`(最大 [`MAX_CREATE_ENV_FILES`] 件。CLI が非特権のまま読む)。
+    pub(super) env_files: Vec<PathBuf>,
+    /// `--label <key>[=<value>]`(最大 `ANNOTATIONS_MAX_ENTRIES` − 1 件。世代の注釈の分を空ける)。
+    pub(super) labels: Vec<String>,
+    /// `--ipc <private|shareable|host>`(1 回まで)。
+    pub(super) ipc: Option<String>,
+    /// `--shm-size <size>`(1 回まで)。
+    pub(super) shm_size: Option<String>,
+    /// `--tmpfs <dest>[:<opts>]`(最大 `TMPFS_MAX_MOUNTS` 件)。
+    pub(super) tmpfs: Vec<String>,
+}
+
+/// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
+pub(super) const MAX_CREATE_ULIMITS: usize = 16;
+/// `create --env-file` の最大件数。
+pub(super) const MAX_CREATE_ENV_FILES: usize = 64;
 
 /// `create` のイメージ指定。意味検証（digest・タグ参照の形式、ストア root の存在）は呼び出し元が core / oci の型に委ねる。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,12 +217,27 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
     let mut bundle: Option<PathBuf> = None;
     let mut image_root: Option<PathBuf> = None;
     let mut reference: Option<String> = None;
+    let mut options = CreateOptionArgs::default();
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         if a == "--" {
             positional.extend(it.by_ref());
             break;
+        } else if let Some(kind) = repeatable_option(&a) {
+            let value = it.next().ok_or(UsageError)?;
+            push_option(&mut options, kind, value)?;
+        } else if a == "--ipc" || a == "--shm-size" {
+            let value = it.next().ok_or(UsageError)?;
+            let slot = if a == "--ipc" {
+                &mut options.ipc
+            } else {
+                &mut options.shm_size
+            };
+            if slot.is_some() {
+                return Err(UsageError);
+            }
+            *slot = Some(value.into_string().map_err(|_| UsageError)?);
         } else if a == "--bundle" {
             let value = it.next().ok_or(UsageError)?;
             if bundle.is_some() {
@@ -238,7 +281,82 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
         bundle: bundle.ok_or(UsageError)?,
         id,
         image,
+        options,
     })
+}
+
+/// 繰り返せる `create` のオプションの種類。
+#[derive(Clone, Copy)]
+enum RepeatableOption {
+    Ulimit,
+    Env,
+    EnvFile,
+    Label,
+    Tmpfs,
+}
+
+fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
+    if a == "--ulimit" {
+        Some(RepeatableOption::Ulimit)
+    } else if a == "--env" || a == "-e" {
+        Some(RepeatableOption::Env)
+    } else if a == "--env-file" {
+        Some(RepeatableOption::EnvFile)
+    } else if a == "--label" {
+        Some(RepeatableOption::Label)
+    } else if a == "--tmpfs" {
+        Some(RepeatableOption::Tmpfs)
+    } else {
+        None
+    }
+}
+
+/// 値を種類ごとの列へ足す。件数が上限を超えたら使い方エラー(確保の前に止める。値の形式はここでは見ない)。
+fn push_option(
+    options: &mut CreateOptionArgs,
+    kind: RepeatableOption,
+    value: OsString,
+) -> Result<(), UsageError> {
+    use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
+    use fandhe_container_core::traits::ANNOTATIONS_MAX_ENTRIES;
+    use fandhe_container_supervisor::container_options::env::ENV_MAX_ENTRIES;
+    fn text(value: OsString) -> Result<String, UsageError> {
+        value.into_string().map_err(|_| UsageError)
+    }
+    match kind {
+        RepeatableOption::Ulimit => {
+            if options.ulimits.len() >= MAX_CREATE_ULIMITS {
+                return Err(UsageError);
+            }
+            options.ulimits.push(text(value)?);
+        }
+        RepeatableOption::Env => {
+            if options.env.len() >= ENV_MAX_ENTRIES {
+                return Err(UsageError);
+            }
+            options.env.push(text(value)?);
+        }
+        RepeatableOption::EnvFile => {
+            if options.env_files.len() >= MAX_CREATE_ENV_FILES {
+                return Err(UsageError);
+            }
+            options.env_files.push(PathBuf::from(value));
+        }
+        RepeatableOption::Label => {
+            // 作成世代の注釈(CLI が足す 1 件)の分を確保する(#2713)。
+            if options.labels.len() >= ANNOTATIONS_MAX_ENTRIES - 1 {
+                return Err(UsageError);
+            }
+            options.labels.push(text(value)?);
+        }
+        RepeatableOption::Tmpfs => {
+            if options.tmpfs.len() >= TMPFS_MAX_MOUNTS {
+                return Err(UsageError);
+            }
+            options.tmpfs.push(text(value)?);
+        }
+    }
+    Ok(())
 }
 
 /// `start <id>` を解析する。
@@ -575,6 +693,7 @@ mod tests {
         let r = root.to_str().unwrap();
         let d = format!("sha256:{}", "a".repeat(64));
         let expect = Ok(CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
             image: Some(CreateImageArgs {
@@ -662,10 +781,85 @@ mod tests {
         }
     }
 
+    /// SUP-12・CLI-1(#2713): create の起動オプションは生の文字列のまま集め、繰り返しは指定順に保つ。
+    #[test]
+    fn sup12_parse_create_collects_options() {
+        let got = parse_create(v(&[
+            "--ulimit",
+            "nofile=1024:2048",
+            "--ulimit",
+            "nproc=64",
+            "-e",
+            "A=1",
+            "--env",
+            "B=2",
+            "--env-file",
+            "/e.env",
+            "--label",
+            "tier=web",
+            "--ipc",
+            "private",
+            "--shm-size",
+            "128m",
+            "--tmpfs",
+            "/run:rw",
+            "--bundle",
+            "/b",
+            "c1",
+        ]))
+        .expect("parsed");
+        assert_eq!(
+            got.options,
+            CreateOptionArgs {
+                ulimits: vec!["nofile=1024:2048".into(), "nproc=64".into()],
+                env: vec!["A=1".into(), "B=2".into()],
+                env_files: vec![PathBuf::from("/e.env")],
+                labels: vec!["tier=web".into()],
+                ipc: Some("private".into()),
+                shm_size: Some("128m".into()),
+                tmpfs: vec!["/run:rw".into()],
+            }
+        );
+    }
+
+    /// SUP-12・SEC-1(#2713): `--ipc` / `--shm-size` の重複、値の欠落、繰り返しの件数超過は使い方エラー。
+    #[test]
+    fn sup12_parse_create_rejects_bad_options() {
+        for bad in [
+            v(&["--ipc", "host", "--ipc", "private", "--bundle", "/b", "c1"]),
+            v(&[
+                "--shm-size",
+                "1m",
+                "--shm-size",
+                "2m",
+                "--bundle",
+                "/b",
+                "c1",
+            ]),
+            v(&["--bundle", "/b", "c1", "--ulimit"]),
+            v(&["--bundle", "/b", "c1", "--env"]),
+        ] {
+            assert_eq!(parse_create(bad), Err(UsageError));
+        }
+        let mut many = vec![];
+        for _ in 0..=MAX_CREATE_ULIMITS {
+            many.extend(v(&["--ulimit", "nofile=1"]));
+        }
+        many.extend(v(&["--bundle", "/b", "c1"]));
+        assert_eq!(parse_create(many), Err(UsageError));
+        let mut files = vec![];
+        for _ in 0..=MAX_CREATE_ENV_FILES {
+            files.extend(v(&["--env-file", "/e"]));
+        }
+        files.extend(v(&["--bundle", "/b", "c1"]));
+        assert_eq!(parse_create(files), Err(UsageError));
+    }
+
     /// CLI-1: create の正常系（順不同・`--` 以降は位置引数）。
     #[test]
     fn cli1_parse_create_ok() {
         let expect = CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
             image: None,

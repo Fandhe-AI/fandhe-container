@@ -56,8 +56,8 @@
 //!   macOS / Windows ではコンテナはゲスト VM（Linux）内で実行されるため、ホスト側から
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
-//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と supervisor（TASK-157）を想定し、fork 段は
-//!   [`spawn_container`]（#831）が担う
+//! - 製品コードの呼び出し元は本番 launcher（`ProductionLauncher`。`spawn_container_via_intermediate`）で、
+//!   fork 段の最小入口 [`spawn_container`]（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
@@ -205,6 +205,10 @@ pub(crate) use launch_status::LaunchAudit;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_entrypoint_violation_for_test;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・#2716。`R` の後の `execveat` の失敗の往復。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_exec_returned_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -521,8 +525,9 @@ pub fn record_launch_mount_rejection<E>(
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
 /// [`record_entrypoint_rejection`] を使う。本番 launcher の launch 経路は配線済み（#2624。`launch_intermediate` が
 /// 状態 pipe の exec 前の 2 行目〔`R`/`E`〕から違反を引き直し、親〔C〕でこの関数を呼んで 1 拒否 1 件を記録する）。
-/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。何も報告しない）と、`R` の後の `execveat`
-/// 自体の失敗（errno 由来で違反ではないため記録しない）。TASK-29 / TASK-157 系。
+/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。製品コードからの呼び出し元が無いため配線しない
+/// と決定〔#2716〕。製品の入口を足すときは状態 pipe 付きの経路を通すこと）。`R` の後の `execveat` 自体の失敗は
+/// `X` 行で起動失敗になるが、違反ではないため記録しない（#2716）。TASK-29 / TASK-157 系。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った

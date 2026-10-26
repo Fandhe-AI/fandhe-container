@@ -1179,6 +1179,7 @@ pub fn supervise_with_restart(
                     ContainerStatus::running(id, Some(new_pid)),
                     supervision,
                     new_process.launch_isolation().cloned(),
+                    new_process.launch_rlimits().cloned(),
                 )
                 .map(drop)
         } else {
@@ -1914,8 +1915,12 @@ mod tests {
                 .with_supervision(sup)
                 .with_explicit_stop(explicit);
                 // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
-                match req.launch_isolation().or(g.launch_isolation()) {
+                let next = match req.launch_isolation().or(g.launch_isolation()) {
                     Some(l) => next.with_launch_isolation(l.clone()),
+                    None => next,
+                };
+                match req.rlimits().or(g.rlimits()) {
+                    Some(r) => next.with_rlimits(r.clone()),
                     None => next,
                 }
             };

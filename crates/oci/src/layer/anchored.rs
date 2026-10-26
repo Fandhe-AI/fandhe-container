@@ -445,6 +445,16 @@ mod imp {
         remove_at(at::openat2, dir.as_fd(), name, 0, &mut buf)
     }
 
+    /// `dirfd` 直下の `name`（1 コンポーネント）を symlink を追従せず木ごと消す（存在しなければ成功）。
+    ///
+    /// イメージストアの staging（`image_management` の pull 回収・中止）が、root の fd 起点で開いた
+    /// pull ディレクトリの子を消すために使う（OCI-7・SEC-1・#2694）。下降は 1 コンポーネントずつ
+    /// `RESOLVE_NO_SYMLINKS` で開き、深さと走査回数に上限がある（`remove_at` を参照）。
+    pub(crate) fn remove_name_tree(dirfd: BorrowedFd<'_>, name: &OsStr) -> Result<(), OciError> {
+        let mut buf = vec![0u8; DIRENT_BUF_LEN];
+        remove_at(at::openat2, dirfd, name, 0, &mut buf)
+    }
+
     /// 所有者の rwx が欠けるディレクトリは権限を戻す（中身を消せるように）。
     fn make_removable(dir: &File) -> Result<(), OciError> {
         let mode = dir
@@ -758,6 +768,11 @@ mod imp {
     }
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) use imp::remove_name_tree;
 pub(super) use imp::{AnchorHooks, AnchoredRoot, map_at_err, remove_path_tree};
 #[cfg(all(
     test,

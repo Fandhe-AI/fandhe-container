@@ -43,8 +43,6 @@ const HOSTS_LOCK_POLL: Duration = Duration::from_millis(10);
 /// 同一プロセス内の追記を直列化する（flock はプロセス間用で、同一プロセスの別 fd 同士も
 /// 直列化するが、ロック待ちを持たずに済ませるため先にこのミューテックスで順序付ける）。
 static HOSTS_APPEND_GUARD: Mutex<()> = Mutex::new(());
-/// `/proc/self/fdinfo/<fd>` の読み込み上限（無制限確保の防止。通常は数百バイト）。
-const MAX_FDINFO_BYTES: u64 = 64 * 1024;
 
 fn io_err(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::Internal, msg)
@@ -249,26 +247,20 @@ fn verify_hosts_file(file: &File) -> Result<(), NetError> {
     Ok(())
 }
 
-/// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
-///
-/// 行が無い・数値でない場合は `None`（呼び出し側は fail-closed で拒否する）。`lock:` 等の他の行は無視する。
-fn parse_fdinfo_mnt_id(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
+/// fdinfo の読み取り失敗理由を従来の message の `INTERNAL` に写す（純粋関数）。
+fn fdinfo_error(e: crate::netns::FdinfoMountIdError) -> NetError {
+    use crate::netns::FdinfoMountIdError as E;
+    match e {
+        E::Read(_) => io_err("failed to read fdinfo"),
+        E::TooLarge => io_err("fdinfo is too large"),
+        E::MissingMountId => io_err("mount id is missing in fdinfo"),
+    }
 }
 
-/// 開いた fd が属するマウントの ID を `/proc/self/fdinfo/<fd>` から読む（Linux 3.15 以降）。
+/// 開いた fd が属するマウントの ID を読む（NET-12・REPAIR-1）。`crate::netns::read_fdinfo_mount_id` の
+/// 共通実装に委ね、失敗理由を `fdinfo_error` で従来の message の `INTERNAL` に写す。
 fn fd_mount_id(file: &File) -> Result<u64, NetError> {
-    use std::os::fd::AsRawFd as _;
-    let mut text = String::new();
-    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
-        .and_then(|f| f.take(MAX_FDINFO_BYTES + 1).read_to_string(&mut text))
-        .map_err(|_| io_err("failed to read fdinfo"))?;
-    if u64::try_from(text.len()).map_or(true, |n| n > MAX_FDINFO_BYTES) {
-        return Err(io_err("fdinfo is too large"));
-    }
-    parse_fdinfo_mnt_id(&text).ok_or_else(|| io_err("mount id is missing in fdinfo"))
+    crate::netns::read_fdinfo_mount_id(file).map_err(fdinfo_error)
 }
 
 /// 開いた hosts ファイルが管理ルートと同じマウント上にあることを確認する（rootfs / マウント境界の P0）。
@@ -619,16 +611,23 @@ mod tests {
         );
     }
 
-    /// NET-12・TASK-185.2（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は `None`。
+    /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の失敗理由が従来の code・message に写る。
     #[test]
-    fn fdinfo_mnt_id_is_parsed_strictly() {
-        let text = "pos:\t0\nflags:\t02102002\nmnt_id:\t39\nino:\t5\n\
-                    lock:\t1: FLOCK  ADVISORY  WRITE 1234 00:2a:5 0 EOF\n";
-        assert_eq!(parse_fdinfo_mnt_id(text), Some(39));
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nflags:\t0100000\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tabc\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\t-1\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(""), None);
+    fn fdinfo_error_maps_each_reason_to_internal_with_fixed_message() {
+        use crate::netns::FdinfoMountIdError as E;
+        let cases = [
+            (
+                E::Read(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                "failed to read fdinfo",
+            ),
+            (E::TooLarge, "fdinfo is too large"),
+            (E::MissingMountId, "mount id is missing in fdinfo"),
+        ];
+        for (reason, message) in cases {
+            let e = fdinfo_error(reason);
+            assert_eq!(e.code(), NetErrorCode::Internal);
+            assert_eq!(e.message(), message);
+        }
     }
 
     /// NET-12・P2: 生のパスの `.` 要素（先頭・途中・末尾）を検出し、通常の名前は誤検出しない。

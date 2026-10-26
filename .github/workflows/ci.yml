@@ -94,6 +94,12 @@ on:
           試験用。既定 false は 3 OS）
         type: boolean
         default: false
+      repeat-features:
+        description: >-
+          繰り返す試験に渡す cargo の feature 名（カンマ区切り。既定 feature で有効にならない lib 試験用。
+          例 grpc。REPAIR-12・#2711）
+        type: string
+        default: ''
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -519,6 +525,7 @@ jobs:
           TEST_BIN: ${{ inputs.repeat-test-bin }}
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
+          FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
@@ -1270,6 +1277,8 @@ jobs:
           for part in \
             'production_launcher: subordinate id mapping verified (uid extents=' \
             'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
+            'production_launcher: scenario=groups-applied gids=2000,3000 host_gids=' \
+            'production_launcher: scenario=groups-single-id-refused' \
             'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
             'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run' \
             'injected secret reached the container under subordinate id mapping (scenario=S-sub' \
@@ -1392,19 +1401,37 @@ jobs:
           log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
           USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
-          for scenario in a b c d e f; do
-            line="rootless_image_rootfs_remove: scenario ${scenario} verified"
-            if ! grep -Fxq "${line}" "${log}"; then
+          # 期待する成功行は試験ソースの println! から導出する（手書きの並びとシナリオ集合のずれで
+          # 実行されない成功行を見逃さない。#2699・REPAIR-12）。集合は双方向で一致させる。
+          src="crates/core/tests/rootless_image_rootfs_remove.rs"
+          min_scenarios=10
+          mapfile -t expected < <(
+            grep -oE 'println!\("rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified"\)' "${src}" \
+              | sed -E 's/^println!\("//; s/"\)$//' | LC_ALL=C sort -u
+          )
+          if [ "${#expected[@]}" -lt "${min_scenarios}" ]; then
+            echo "::error::rootless_image_rootfs_remove: expected at least ${min_scenarios}" \
+              "scenario lines in ${src}, found ${#expected[@]}" >&2
+            exit 1
+          fi
+          for line in "${expected[@]}"; do
+            if ! grep -Fxq -- "${line}" "${log}"; then
               echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2
               exit 1
             fi
             echo "${line}" >> "$GITHUB_STEP_SUMMARY"
           done
-          if grep -Fq 'rootless_image_rootfs_remove: ignored' "${log}"; then
-            echo "::error::rootless_image_rootfs_remove reported an unexpected line: ignored" >&2
+          while IFS= read -r actual; do
+            if ! printf '%s\n' "${expected[@]}" | grep -Fxq -- "${actual}"; then
+              echo "::error::rootless_image_rootfs_remove reported an unexpected line: ${actual}" >&2
+              exit 1
+            fi
+          done < <(grep -E '^rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified$' "${log}" | LC_ALL=C sort -u)
+          if grep -Eq 'rootless_image_rootfs_remove: (ignored|Linux only)' "${log}"; then
+            echo "::error::rootless_image_rootfs_remove reported an unexpected line: ignored or Linux only" >&2
             exit 1
           fi
-          echo "::notice::rootless_image_rootfs_remove verified"
+          echo "::notice::rootless_image_rootfs_remove verified (${#expected[@]} scenarios)"
 
       - name: seccomp のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

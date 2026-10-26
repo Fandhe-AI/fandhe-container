@@ -556,7 +556,7 @@ pub fn build_path_rules(
 /// `ImplicitDevMounts::for_tmpfs_set` で実際に載せる tmpfs 集合から選ぶ（#1672 事後監査 P2）。どの variant でも、
 /// 暗黙分のパスが実際に期待する fs の独立したマウントであることは適用時に確かめる（`apply` の `check_implicit_mount`）。
 ///
-/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。本番の launcher は `All` を使う）向けで、
+/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。配線しないと #2700 で決定。本番の launcher は `All` を使う）向けで、
 /// ルールが減るだけで権利は広がらない。このとき `mounts` は上限 +3 件まで通るが、`mounts[]` の件数は
 /// config のパース時に [`CONFIG_MAX_MOUNTS`] で制限済みのため確保量は抑えられる。
 ///
@@ -1254,6 +1254,88 @@ mod tests {
             ImplicitDevMounts::All,
         )
         .expect("mounts at limit plus tmpfs");
+    }
+
+    /// SUP-12・CORE-5・SEC-2(#2714): 読み取り専用 root では、利用者の rw tmpfs の宛先と暗黙の `/dev` 系だけが
+    /// 書き込み可能になり、`/` は READ のまま。`ro` の利用者 tmpfs はルールを作らない。
+    #[test]
+    fn sup12_readonly_root_user_tmpfs_is_the_only_extra_writable_path() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(true, json!([]));
+        let tmpfs = |dest: &str, opts: Value| {
+            parse_config_bytes(
+                json!({"ociVersion": "1.2.0", "root": {"path": "rootfs"},
+                       "mounts": [{"destination": dest, "type": "tmpfs", "options": opts}]})
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("valid config")
+            .mounts()[0]
+                .clone()
+        };
+        let rw = ["rw", "nosuid", "nodev", "noexec"];
+        let run = tmpfs("/run", json!(rw));
+        let dev = |m| RuleOrigin::Implicit { mount: m };
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            std::slice::from_ref(&run),
+            ImplicitDevMounts::All,
+        )
+        .expect("rules");
+        assert_eq!(
+            summary(&rs),
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/dev", dev(ImplicitDevMount::Dev), 0xF7BF),
+                ("/dev/pts", dev(ImplicitDevMount::DevPts), 0xF7BE),
+                ("/dev/shm", dev(ImplicitDevMount::DevShm), 0x77BE),
+                ("/run", RuleOrigin::UserTmpfs, 0x77BE),
+            ]
+        );
+        assert_eq!(
+            shadowed_summary(&rs),
+            vec![
+                ("/dev/pts", 0xF7BE, 0xF7BF),
+                ("/dev/shm", 0x77BE, 0xF7BF),
+                ("/run", 0x77BE, 0x77BF),
+            ]
+        );
+        // WRITE を 1 ビットでも持つ宛先は、暗黙の /dev 系と利用者 tmpfs だけ。
+        let writable: Vec<&str> = rs
+            .rules()
+            .iter()
+            .filter(|r| !r.allowed.intersection(AccessFs::WRITE).is_empty())
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(writable, vec!["/dev", "/dev/pts", "/dev/shm", "/run"]);
+        assert!(
+            rule(&rs, "/")
+                .allowed
+                .intersection(AccessFs::WRITE)
+                .is_empty()
+        );
+
+        // ro の利用者 tmpfs と、2 件目の rw tmpfs。
+        let ro = tmpfs("/ro", json!(["ro", "nosuid", "nodev"]));
+        let cache = tmpfs("/var/cache", json!(rw));
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            &[ro, run, cache],
+            ImplicitDevMounts::None,
+        )
+        .expect("rules");
+        assert_eq!(
+            summary(&rs),
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/run", RuleOrigin::UserTmpfs, 0x77BE),
+                ("/var/cache", RuleOrigin::UserTmpfs, 0x77BE),
+            ]
+        );
     }
 
     /// CORE-5（#1657）: 暗黙分を含めない版は root のみで、上限は暗黙分を含めた値のまま。

@@ -4,8 +4,8 @@
 //!
 //! `crate::exec` の最小実行フロー第 5 段。namespace 分離済み（`isolate` /
 //! `isolate_rootful_host_root` の後）の親から [`spawn_container`] で子を fork し、子（新しい PID
-//! namespace の PID 1）が次を順に行う。呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と
-//! supervisor（TASK-157）を想定する。
+//! namespace の PID 1）が次を順に行う。製品コードの呼び出し元は本番 launcher
+//! （`ProductionLauncher`）の `spawn_container_via_intermediate` で、最小入口 `spawn_container` は結合試験だけが呼ぶ（#2700）。
 //!
 //! ```text
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
@@ -55,9 +55,9 @@
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
-//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch への適用の追跡は #2687）。
+//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch に適用しない判断は `docs/design/launch-sealed-copy.md`・#2687）。
 //!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
-//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない）
+//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない。配線しない判断は #2700）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -115,8 +115,8 @@ use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{
-    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
-    report_ready,
+    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_exec_returned,
+    report_failure, report_ready,
 };
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
@@ -336,6 +336,15 @@ impl Entrypoint {
     pub fn path(&self) -> &Path {
         Path::new(OsStr::from_bytes(self.path.to_bytes()))
     }
+
+    /// 渡した env を `KEY=VALUE` の文字列で返す(試験専用。launcher が env の上書きを重ねた結果の照合に使う。#2713)。
+    #[cfg(test)]
+    pub(crate) fn env_for_test(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .map(|e| e.to_string_lossy().into_owned())
+            .collect()
+    }
 }
 
 /// 1 要素を検証して `CString` にする。`total` に NUL 込みのバイト数を加算する。
@@ -479,7 +488,7 @@ pub fn exec_entrypoint(
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。稼働中コンテナへの exec の子〔`EntrypointSource::Switchable`〕
 ///    は、封印した複製を使える環境なら照合した本体を封印した memfd に複製し〔`sealed_copy.rs`。#1531〕、以降の解析・照合・
 ///    実行を複製に対して行う〔使えない環境は現行方式で、理由を記録する。オーナー判断 2026-10-09〕。
-///    launch は複製しない〔常駐メモリの設計判断。追跡は #2687〕。ランタイム自身の封印複製の追跡は #2686）。シェバンの連鎖・
+///    launch は複製しない〔適用しない判断。`docs/design/launch-sealed-copy.md`・#2687〕。ランタイム自身の封印複製の判断記録は `docs/design/runtime-self-sealed-copy.md`〔#2686〕）。シェバンの連鎖・
 ///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
@@ -531,8 +540,8 @@ fn verify_pivot_root(pivot_mnt_id: u64) -> Result<(), ExecError> {
 ///
 /// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <CODE> <reason|->` を書いて失敗を返し、全手順が
 /// 通ったら `R` を書いてから `execveat` する（`R` を書けなければ `execveat` へ進まない。fail-closed）。`R` の後の
-/// `execveat` 自体の失敗は何も書かない（親が `R` を読んだ後に `E` が混ざらないようにするため。errno 由来で、
-/// PID 1 の終了として観測される）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
+/// `execveat` 自体が errno で失敗したら `X <CODE>`（errno の分類のみ）を書く（`E` は混ぜない。親は `R` の後も
+/// EOF まで読み、`X` を起動失敗として扱う。#2716）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
 /// （close-on-exec）。`status` が `None` なら [`exec_entrypoint_verified_with`] と同じ（何も書かない）。
 fn exec_entrypoint_verified_reporting(
     pivot_mnt_id: u64,
@@ -559,7 +568,17 @@ fn exec_entrypoint_verified_reporting(
         }
         Ok(exe) => {
             report_exec_ready(status)?;
-            Err(execve_checked(entry, &exe))
+            let err = execve_checked(entry, &exe);
+            // `execveat` が戻った（errno 由来の失敗）。親は `R` の後も EOF まで読むため、分類だけを `X` で伝える
+            // （#2716）。書けなくても元のエラーを返す（親は EOF を成功と取り違える窓があるが、書けない状況は
+            // pipe の破損のみで、PID 1 はこの後すぐ終了する）。
+            if report_exec_returned(status, err.code).is_err() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fandhe-container: the execveat failure could not be reported"
+                );
+            }
+            Err(err)
         }
     }
 }
@@ -732,7 +751,7 @@ impl ExecutableFd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntrypointSource {
     /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
-    /// 封印した複製の適用は未着手で、追跡は #2687）。
+    /// 封印した複製は適用しない判断で、理由は `docs/design/launch-sealed-copy.md`・#2687）。
     Pinned,
     /// 稼働中コンテナへの exec。値（`prepare_exec_restrictions` が `setns` の前に作る判定。#1531）の方式に従い、
     /// 封印した memfd に複製して `execveat` するか、照合した元の fd をそのまま `execveat` する（現行方式。#1478）。
@@ -3025,6 +3044,19 @@ where
 /// 戻り値の [`ContainerChild`] は [`ContainerChild::wait_timeout`] で回収する。`unshare(CLONE_NEWPID)`
 /// の最初の子だけが PID 1 になり、それが終わると namespace は以後 fork できないため、分離した親からの
 /// `spawn_container` は 1 回だけ成功する。
+///
+/// 専用の `/dev`（`create_default_devices`）は載せない（#2700・CORE-2・SEC-2・REPAIR-3。配線しないと決めた）。
+/// 製品コードにこの入口の呼び出し元は無く（結合試験だけ）、本番の起動は `ProductionLauncher` が
+/// `spawn_container_via_intermediate` を通す経路で、`PrePivotSetup.devices` から `/dev` を結線済み（#1816）。
+/// 配線しない理由は次のとおり。
+/// - 本番は常に `setup` を渡すため、ここへ配線しても本番の挙動は変わらない
+/// - `StagePipeline::new()`（Landlock 無し）では制限適用の証跡（`LaunchReady`。#1714）が作られず、exec は常に拒否される
+///   （fail-closed。`/dev` を足しても観測できる効果が無い）
+/// - 配線には `DevptsGidSource` の入力が要り、本番で使わない関数の公開シグネチャを変えることになる
+/// - `masked_paths` も適用しない最小構成に `/dev` だけを足すと部分適用になり、実装済みを装う（REPAIR-3）
+/// - `/dev` が要る試験には試験専用の入口 `spawn_container_with_stages_and_devices` がある
+///
+/// 本番の起動にこの入口を使ってはならない（分離が弱くなる）。
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
     spawn_container_with_stages(rootfs, entry, StagePipeline::new())
 }
@@ -3033,6 +3065,7 @@ pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChi
 ///
 /// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
 /// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。
+/// `/dev` は載せない（`spawn_container` と同じ。#2700）。
 /// 挙動の変更（#1714）: `stages` に `with_landlock` を載せて全段が成功したときだけ制限適用の証跡
 /// （`LaunchReady`）がそろい exec へ進む。Landlock 無し・独自の Landlock フック・ダミーフックだけでは
 /// 証跡にならず exec は拒否される（fail-closed）。
@@ -3152,7 +3185,7 @@ pub fn spawn_container_with_stages_reporting_for_test(
 ///
 /// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
 /// 実 exec（`execveat`）の成功で照合するための入口。本番の `/dev` は launcher 経路で結線済み（#1816）で、
-/// これは最小入口 `spawn_container` に `/dev` を足すための試験専用の入口。
+/// 最小入口 `spawn_container` へは `/dev` を配線しない（#2700）ため、`/dev` が要る試験だけが使う試験専用の入口。
 /// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
 /// 通常の利用者は呼ばない。
 #[doc(hidden)]

@@ -3371,13 +3371,36 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
-    /// CRI-1・TASK-57.2: Remove で記録と保持量の計上の両方が消える。
+    /// CRI-1・TASK-57.2・REPAIR-12: Remove で記録と保持量の計上の両方が消える。
+    ///
+    /// 保持量は metadata の name の長さに比例する。2 件の name の長さを意図的に変え
+    /// （`p9` と `p10`）、連番の桁上がりで 1 バイト差になる場合を決定的に覆う（#2723）。
+    /// 期待値は記録の読み返しではなく、config から式で独立に求める。
     #[test]
     fn task_57_2_remove_deletes_record_and_retained_bytes() {
         let svc = CriRuntimeService::new();
-        let a = run_id(&svc);
-        let b = run_id(&svc);
-        let per_sandbox = svc.retained_bytes() / 2;
+        let (cfg_a, cfg_b) = (config("p9"), config("p10"));
+        // config() は labels 1 件と annotations 1 件を持つので要素数は 2。
+        let expect = |c: &PodSandboxConfig| {
+            c.encoded_len() + 2 * RETAINED_BYTES_PER_ENTRY + RETAINED_BYTES_PER_RECORD
+        };
+        let (ra, rb) = (expect(&cfg_a), expect(&cfg_b));
+        assert_ne!(ra, rb);
+        let a = run(&svc, Some(cfg_a), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let b = run(&svc, Some(cfg_b), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        {
+            let reg = svc.registry.lock().unwrap();
+            assert_eq!(reg.records[&a].retained_bytes, ra);
+            assert_eq!(reg.records[&b].retained_bytes, rb);
+        }
+        assert_eq!(svc.sandbox_count(), 2);
+        assert_eq!(svc.retained_bytes(), ra + rb);
         remove(&svc, &a).unwrap();
         {
             let reg = svc.registry.lock().unwrap();
@@ -3386,7 +3409,7 @@ mod tests {
             assert_eq!(sum, reg.retained_bytes);
         }
         assert_eq!(svc.sandbox_count(), 1);
-        assert_eq!(svc.retained_bytes(), per_sandbox);
+        assert_eq!(svc.retained_bytes(), rb);
         remove(&svc, &b).unwrap();
         assert_eq!(svc.sandbox_count(), 0);
         assert_eq!(svc.retained_bytes(), 0);

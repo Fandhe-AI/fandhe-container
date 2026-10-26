@@ -73,6 +73,11 @@
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
 //!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
 //!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
+//! - シナリオ I・O の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）で
+//!   `process.user` 1000:1000・`additionalGids` [3000, 2000] を指定すると、コンテナ内の `Groups:` が `2000,3000`、ホストから見た
+//!   `/proc/<pid>/status` の `Groups:` が subgid 先頭 + 1999 / + 2999 になる（成功行 `scenario=groups-applied gids=2000,3000
+//!   host_gids=<a>,<b>`）。単一 ID 写像で 0/0 に `additionalGids` [0] を指定した start は fork の前に `FailedPrecondition` で
+//!   拒否され、状態は Created のまま子が残らない（成功行 `scenario=groups-single-id-refused`）
 //! - シナリオ W（pod の user・ipc namespace への join。#2674・CRI-2・CORE-3・SEC-1・SEC-5）: コンテナ A を start し、B の
 //!   `linux.namespaces` の `user`・`ipc` に `/proc/<A の pid>/ns/{user,ipc}` の path を入れて start する。ホストから読んだ B の
 //!   `ns/user`・`ns/ipc` が A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なることを照合する。否定として、試験プロセス自身の
@@ -388,6 +393,14 @@ mod linux {
                 field(key).split_whitespace().collect::<Vec<_>>().join(",")
             ));
         }
+        // シナリオ I の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: `Groups:` をカンマ区切りで出す（空なら空文字）。
+        emit(format!(
+            "GROUPS {}",
+            field("Groups:")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
         // シナリオ K（exec 後の seccomp の識別的な拒否。#2012）: 禁止 syscall を 1 件発行する。フィルタが効いていれば
         // SIGSYS で終了して戻らない。戻った場合（フィルタ欠落）は固定語彙の行を出して正常終了し、親が失敗にする。
         let args: Vec<String> = std::env::args().collect();
@@ -588,7 +601,20 @@ mod linux {
         extra_args: &[&str],
         mounts: serde_json::Value,
         cwd: &str,
+        user: (u32, u32),
+    ) {
+        write_config_groups(bundle, ld_library_path, extra_args, mounts, cwd, user, &[]);
+    }
+
+    /// `write_config_with` に `process.user.additionalGids` を指定できる版(OCI-1・SEC-5・CORE-6・#2667)。
+    fn write_config_groups(
+        bundle: &Bundle,
+        ld_library_path: &str,
+        extra_args: &[&str],
+        mounts: serde_json::Value,
+        cwd: &str,
         (uid, gid): (u32, u32),
+        additional_gids: &[u32],
     ) {
         let mut args = vec!["/probe", "--container-probe"];
         args.extend_from_slice(extra_args);
@@ -597,7 +623,7 @@ mod linux {
             "root": {"path": "rootfs", "readonly": false},
             "hostname": HOSTNAME,
             "process": {
-                "user": {"uid": uid, "gid": gid},
+                "user": {"uid": uid, "gid": gid, "additionalGids": additional_gids},
                 "args": args,
                 "env": [
                     "PATH=/",
@@ -841,6 +867,7 @@ mod linux {
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
+        scenario_o_groups_single_id_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
         scenario_s_entrypoint_violation_recorded(&env, container, tag);
@@ -1648,10 +1675,28 @@ mod linux {
         prepare: &dyn Fn(&Path),
         tag: u32,
     ) -> Vec<String> {
+        run_probe_groups(env, launcher, name, cwd, user, &[], prepare, tag)
+    }
+
+    /// `run_probe_with` に `additionalGids` を指定できる版。ホストから見た補助グループを `HOST_GROUPS` 行として足す
+    /// (OCI-1・SEC-5・CORE-6・#2667)。
+    // 既存の `run_probe_with` と同じ並びに `additionalGids` を足した試験用ヘルパーで、引数は呼び出し側の
+    // 試験ごとに全て異なる値を取る。構造体に束ねると 1 回限りの型が増えるため抑止する。
+    #[allow(clippy::too_many_arguments)]
+    fn run_probe_groups(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        name: &str,
+        cwd: &str,
+        user: (u32, u32),
+        additional_gids: &[u32],
+        prepare: &dyn Fn(&Path),
+        tag: u32,
+    ) -> Vec<String> {
         let bundle = Bundle::new(name);
         let ld = make_rootfs(&bundle.rootfs(), true);
         prepare(&bundle.rootfs());
-        write_config_with(&bundle, &ld, &[], json!([]), cwd, user);
+        write_config_groups(&bundle, &ld, &[], json!([]), cwd, user, additional_gids);
         let id = ContainerId::new(format!("pl{name}{tag}")).expect("id");
         do_create(env, &bundle, &id);
         wait_single_thread();
@@ -1678,6 +1723,12 @@ mod linux {
                 lines.push(format!(
                     "HOST_UIDS {}",
                     host.split_whitespace().collect::<Vec<_>>().join(",")
+                ));
+                let groups = status_field(&format!("/proc/{pid}/status"), "Groups:")
+                    .unwrap_or_else(|| "missing".to_string());
+                lines.push(format!(
+                    "HOST_GROUPS {}",
+                    groups.split_whitespace().collect::<Vec<_>>().join(",")
                 ));
             }
         }));
@@ -1777,6 +1828,43 @@ mod linux {
         );
     }
 
+    /// シナリオ O の拡張(OCI-1・SEC-5・CORE-6・#2667): 単一 ID 写像では `setgroups` が `deny` のため、
+    /// `additionalGids` の指定は fork の前に `FailedPrecondition` で拒否され、状態は Created のまま子が残らない。
+    fn scenario_o_groups_single_id_refused(env: &Env, tag: u32) {
+        let bundle = Bundle::new("og");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config_groups(&bundle, &ld, &[], json!([]), "/", (0, 0), &[0]);
+        let id = ContainerId::new(format!("plog{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("start must fail for additionalGids under a single id mapping"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.message(),
+            "process.user.additionalGids requires a subordinate id mapping (SEC-5)"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(children_of_self().is_empty());
+        println!(
+            "production_launcher: scenario=groups-single-id-refused code={:?} state=created children=0",
+            err.code()
+        );
+    }
+
     /// シナリオ I の拡張(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。OCI-1・SEC-5): 範囲写像で `process.user` 1000:1000 を
     /// 指定すると、コンテナ内の実・実効・保存・FS の uid / gid が 1000 になり、ホストから見た uid は
     /// 「subuid の先頭 + 999」になる(コンテナ 1 → subuid 先頭)。
@@ -1811,6 +1899,28 @@ mod linux {
             "{lines:?}"
         );
         println!("production_launcher: scenario=user-applied uid=gid=1000 host_uid={host_uid}");
+        // 補助グループ(#2667): additionalGids [3000, 2000] は gid 写像内(コンテナ 1 → subgid 先頭)なので適用され、
+        // コンテナ内の Groups: はカーネルがソートした 2000,3000、ホストからは subgid 先頭 + 1999 / + 2999 に見える。
+        let gowner = SubIdOwner::new(euid, std::env::var("USER").ok()).expect("gid owner");
+        let granges =
+            load_subordinate_ids(Path::new("/etc/subgid"), &gowner).expect("load /etc/subgid");
+        let gbase = granges.first().expect("a subgid range").start();
+        let lines = run_probe_groups(
+            &env,
+            &launcher,
+            "ig",
+            "/",
+            (1000, 1000),
+            &[3000, 2000],
+            &|_| (),
+            tag,
+        );
+        assert_eq!(value_of(&lines, "GROUPS"), "2000,3000", "{lines:?}");
+        let host_gids = format!("{},{}", gbase + 1999, gbase + 2999);
+        assert_eq!(value_of(&lines, "HOST_GROUPS"), host_gids, "{lines:?}");
+        println!(
+            "production_launcher: scenario=groups-applied gids=2000,3000 host_gids={host_gids}"
+        );
     }
 
     /// シナリオ E: 状態ルート自身、または状態ルートへの symlink 別名を bind mount の元にした start は、本番 launcher

@@ -219,7 +219,8 @@ fn create_state(
     image_rootfs: Option<ImageRootfsRecord>,
 ) -> Result<StateRecord, TraitError> {
     let status = ContainerStatus::created(req.id().clone(), None);
-    let mut state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
+    let mut state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?
+        .with_annotations(req.annotations().clone());
     if let Some(r) = image_rootfs {
         state_req = state_req.with_image_rootfs(r);
     }
@@ -460,11 +461,11 @@ fn unpack_rootfs(
     }
     // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
     // 印には状態ルートの識別子も載せる（孤児の回収が別の状態ルートの木を消さないため。OCI-5・#2635）。
-    if let Err(e) = created.seal(state_root_scope(store).as_deref()) {
+    if let Err(e) = created.seal_with(state_root_scope(store).as_deref(), privilege) {
         remove_created_rootfs(recorder, created, privilege);
         return Err(e);
     }
-    if let Err(e) = created.publish() {
+    if let Err(e) = created.publish_with(privilege) {
         // 改名前の失敗だけ非公開の木を消す。改名後の検証失敗は公開済みで、並行する create が使いうるため
         // 残す（OCI-7 の使用中 rootfs の保持。#854 の起動時照合・手動で回収する）。
         if !created.is_published() {
@@ -766,8 +767,11 @@ mod tests {
                 return Err(TraitError::new(ErrorCode::AlreadyExists, "exists"));
             }
             let revision = StateRevision::from_raw(records.len() as u64 + 1);
-            let record =
+            let mut record =
                 StateRecord::new(req.status().clone(), req.bundle().to_path_buf(), revision)?;
+            if let Some(a) = req.annotations() {
+                record = record.with_annotations(a.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -911,6 +915,23 @@ mod tests {
             .get(&GetStateRequest::new(req.id().clone()))
             .expect("stored");
         assert_eq!(got, record);
+    }
+
+    /// SUP-12・CLI-1（#2713）: `CreateRequest::with_annotations` の label が状態記録へ具体値で残る。
+    #[test]
+    fn sup12_create_records_annotations_from_request() {
+        let b = ready_bundle("annotations");
+        let store = MemStateStore::new();
+        let annotations = crate::traits::Annotations::new([
+            ("com.example.tier".to_owned(), "web".to_owned()),
+            ("owner".to_owned(), String::new()),
+        ])
+        .expect("annotations");
+        let req = b.request("c1").with_annotations(annotations);
+        let record = create(&store, &OpRecorder::new(), &req).expect("create succeeds");
+        assert_eq!(record.annotations().get("com.example.tier"), Some("web"));
+        assert_eq!(record.annotations().get("owner"), Some(""));
+        assert_eq!(record.annotations().get("missing"), None);
     }
 
     /// OCI-4: 構文エラーの config.json は InvalidArgument で、ストアに何も残らない。

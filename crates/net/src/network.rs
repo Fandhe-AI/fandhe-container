@@ -106,7 +106,7 @@
 //!   このため default route を張っても、コンテナ発の通信を host 外部へ届けるには masquerade と host の
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
-//!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
+//!   （ルールハンドルの取得経路が無い。公開は attach 後にも `publish_container_ports` で追加できる。#2676・NET-4）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
 //! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
 //!   同じプロセスで作った pin まで。再起動後の pin・ネットワーク本体は手動。write-ahead は #1870 の後に再検討）
@@ -1971,6 +1971,133 @@ fn configure_in_netns<O: AttachOps>(
     Ok(())
 }
 
+/// attach 後のポート公開の失敗（原因と、DNAT バッチの結果が不明かどうか）。
+///
+/// `rules_unknown` が真のとき、DNAT ルールが入っている可能性があるため受け口の予約を保持している
+/// （quarantine）。解放は `delete_network` がテーブルごと行う（NET-1・NET-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PublishPortsError {
+    /// 失敗の原因。
+    pub error: NetError,
+    /// DNAT バッチが適用されたか不明（`Aborted` / `NotSent` 以外）、または予約を戻せていない。
+    pub rules_unknown: bool,
+}
+
+impl fmt::Display for PublishPortsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for PublishPortsError {}
+
+/// 接続済みコンテナへ DNAT ルールを追加する本体（OS 非依存。呼び出し元は Linux 限定の
+/// `publish_container_ports` と試験）。plugin-cri の `publish_port`（NET-4）が attach 後に
+/// コンテナ単位で公開するための口。`publish` は `table`・コンテナのアドレス・受け口を受けて DNAT を投入する
+/// 操作（Linux では `send_dnat_batch`）。
+///
+/// 手順: 件数と重複の検証 → コンテナのアドレスがネットワークのサブネット内の IPv4 であることの
+/// 再確認（取り違えの多層防御）→ 受け口の予約（衝突は `AlreadyExists`。この時点では何も変えない）→
+/// DNAT の 1 バッチ投入。確定的な失敗（`Aborted` / `NotSent`）では今回の予約だけを戻し、結果不明では
+/// 予約を保持する。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn publish_ports_with(
+    publish: impl FnOnce(&NftName, Ipv4Addr, &[PortPublish]) -> Result<(), NftApplyFailure>,
+    network: &CreatedNetwork,
+    endpoint: &EndpointId,
+    container_addr: IpPrefix,
+    ports: &[PortPublish],
+    registry: &mut PortRegistry,
+) -> Result<(), PublishPortsError> {
+    let known = |error: NetError| PublishPortsError {
+        error,
+        rules_unknown: false,
+    };
+    if ports.is_empty() || ports.len() > MAX_PORT_PUBLISHES {
+        return Err(known(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "port publish count is out of range",
+        )));
+    }
+    for (i, p) in ports.iter().enumerate() {
+        if ports.iter().skip(i + 1).any(|q| p.same_listener(q)) {
+            return Err(known(NetError::new(
+                NetErrorCode::InvalidArgument,
+                "duplicate port publish listener",
+            )));
+        }
+    }
+    let (IpAddr::V4(container), IpAddr::V4(gateway)) =
+        (container_addr.addr(), network.gateway.addr())
+    else {
+        return Err(known(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "container address is not an IPv4 address",
+        )));
+    };
+    let prefix = u32::from(network.gateway.prefix_len().min(32));
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    if u32::from(container) & mask != u32::from(gateway) & mask {
+        return Err(known(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "container address is outside the network subnet",
+        )));
+    }
+    registry
+        .reserve(&network.name, endpoint, ports)
+        .map_err(known)?;
+    let Err(f) = publish(&network.table, container, ports) else {
+        return Ok(());
+    };
+    if !matches!(
+        f.outcome,
+        NftBatchOutcome::Aborted | NftBatchOutcome::NotSent
+    ) {
+        // DNAT ルールが入っている可能性がある。予約は保持する（quarantine）。
+        return Err(PublishPortsError {
+            error: f.error,
+            rules_unknown: true,
+        });
+    }
+    // 確定的に適用されていない。今回の予約だけを戻す。戻せなければ予約が残るため結果不明と同じ扱い
+    // （fail-closed。解放は delete_network）。
+    match registry.release_listeners(&network.name, endpoint, ports) {
+        Ok(_) => Err(known(f.error)),
+        Err(_) => Err(PublishPortsError {
+            error: f.error,
+            rules_unknown: true,
+        }),
+    }
+}
+
+/// 接続済みコンテナへ DNAT ルールを追加する（attach 後のポート公開。NET-4・NET-1）。
+///
+/// `ports` の受け口は `registry`（全ネットワークで共有する [`PortRegistry`]）へ予約してから
+/// 専用テーブルの `prerouting` / `output` へ 1 バッチで投入する。失敗時の扱いは [`PublishPortsError`]。
+/// `CAP_NET_ADMIN` が必要で、本 crate は権限を上げない。`timeout` は nft 要求の期限（REPAIR-5）。
+///
+/// # 未実装範囲（REPAIR-3）
+/// 公開の個別解除は無い（`delete_network` がテーブルごと解放する）。masquerade と host の
+/// `ip_forward` は別途必要。
+#[cfg(target_os = "linux")]
+pub fn publish_container_ports<N>(
+    nft: &NetlinkNetfilterSocket,
+    network: &CreatedNetwork,
+    container: &AttachedContainer<N>,
+    ports: &[PortPublish],
+    registry: &mut PortRegistry,
+    timeout: Duration,
+) -> Result<(), PublishPortsError> {
+    publish_ports_with(
+        |table, addr, ports| send_dnat_batch(nft, timeout, table, addr, ports),
+        network,
+        &container.endpoint,
+        container.address,
+        ports,
+        registry,
+    )
+}
 const VETH_COLLISION_MSG: &str =
     "container veth already exists (endpoint id collision or stale endpoint; delete it first)";
 
@@ -2126,28 +2253,40 @@ impl AttachOps for LinuxAttachOps<'_> {
         container: Ipv4Addr,
         ports: &[PortPublish],
     ) -> Result<(), NftApplyFailure> {
-        self.nft
-            .send_batch(self.timeout, |batch| {
-                for port in ports {
-                    // 外部から（prerouting）とホスト自身から（output）の両経路へ同じルールを入れる。
-                    for chain in ["prerouting", "output"] {
-                        let rule = RuleCreate::new(
-                            NftFamily::Ipv4,
-                            table.clone(),
-                            NftName::new(chain)?,
-                            port.dnat_rule_exprs(container)?,
-                        );
-                        batch.push_with(|seq| rule.build(seq))?;
-                    }
-                }
-                Ok(())
-            })
-            .map(|_| ())
-            .map_err(|e| NftApplyFailure {
-                outcome: e.outcome(),
-                error: e.into(),
-            })
+        send_dnat_batch(self.nft, self.timeout, table, container, ports)
     }
+}
+
+/// `table` の `prerouting` / `output` へ DNAT ルールを 1 バッチで投入する（attach 時と attach 後の
+/// 公開で共有）。
+#[cfg(target_os = "linux")]
+fn send_dnat_batch(
+    nft: &NetlinkNetfilterSocket,
+    timeout: Duration,
+    table: &NftName,
+    container: Ipv4Addr,
+    ports: &[PortPublish],
+) -> Result<(), NftApplyFailure> {
+    nft.send_batch(timeout, |batch| {
+        for port in ports {
+            // 外部から（prerouting）とホスト自身から（output）の両経路へ同じルールを入れる。
+            for chain in ["prerouting", "output"] {
+                let rule = RuleCreate::new(
+                    NftFamily::Ipv4,
+                    table.clone(),
+                    NftName::new(chain)?,
+                    port.dnat_rule_exprs(container)?,
+                );
+                batch.push_with(|seq| rule.build(seq))?;
+            }
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| NftApplyFailure {
+        outcome: e.outcome(),
+        error: e.into(),
+    })
 }
 
 /// コンテナをネットワークへ接続する（netns の作成と pin・veth ペアの作成・host 側の bridge 接続と up・
@@ -4412,5 +4551,102 @@ mod attach_tests {
             .with_port_publishes(vec![port(80), port(80)])
             .unwrap_err();
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+    }
+
+    /// attach 後の公開の試験用に、投入内容を記録して結果を注入するクロージャの状態。
+    fn publish_with(
+        outcome: Option<(NetErrorCode, NftBatchOutcome)>,
+        addr: IpPrefix,
+        ports: &[PortPublish],
+        reg: &mut PortRegistry,
+        calls: &RefCell<Vec<String>>,
+    ) -> Result<(), PublishPortsError> {
+        super::publish_ports_with(
+            |table, container, ports| {
+                calls.borrow_mut().push(format!(
+                    "publish {} {container} {}",
+                    table.as_str(),
+                    ports.len()
+                ));
+                match outcome {
+                    Some((c, o)) => Err(NftApplyFailure {
+                        error: NetError::new(c, "injected"),
+                        outcome: o,
+                    }),
+                    None => Ok(()),
+                }
+            },
+            &created(),
+            &eid("c1"),
+            addr,
+            ports,
+            reg,
+        )
+    }
+
+    /// NET-1・NET-4: attach 後の公開は予約してから 1 バッチで投入する。衝突はバッチを送らない。
+    #[test]
+    fn net4_publish_after_attach_reserves_then_sends_one_batch() {
+        let calls = RefCell::new(Vec::new());
+        let mut reg = PortRegistry::new();
+        publish_with(None, ip(2), &[port(8080)], &mut reg, &calls).unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(calls.borrow().len(), 1);
+        assert!(calls.borrow()[0].ends_with("10.89.0.2 1"));
+        let e = publish_with(None, ip(2), &[port(8080)], &mut reg, &calls).unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::AlreadyExists);
+        assert!(!e.rules_unknown);
+        assert_eq!(calls.borrow().len(), 1, "no batch on conflict");
+    }
+
+    /// NET-4: 確定的な失敗は今回の予約だけを戻し、先の公開は残す。結果不明は予約を保持する。
+    #[test]
+    fn net4_publish_after_attach_failure_releases_only_own_reservation() {
+        let calls = RefCell::new(Vec::new());
+        let mut reg = PortRegistry::new();
+        publish_with(None, ip(2), &[port(8081)], &mut reg, &calls).unwrap();
+        for outcome in [NftBatchOutcome::Aborted, NftBatchOutcome::NotSent] {
+            let e = publish_with(
+                Some((NetErrorCode::Timeout, outcome)),
+                ip(2),
+                &[port(8080)],
+                &mut reg,
+                &calls,
+            )
+            .unwrap_err();
+            assert_eq!(e.error.code(), NetErrorCode::Timeout);
+            assert!(!e.rules_unknown, "{outcome:?}");
+            assert_eq!(reg.len(), 1, "{outcome:?}");
+        }
+        let e = publish_with(
+            Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
+            ip(2),
+            &[port(8080)],
+            &mut reg,
+            &calls,
+        )
+        .unwrap_err();
+        assert!(e.rules_unknown);
+        assert_eq!(reg.len(), 2);
+    }
+
+    /// NET-4: サブネット外のアドレスは `FailedPrecondition`、65 件と重複は `InvalidArgument`。
+    #[test]
+    fn net4_publish_after_attach_validates_inputs() {
+        let calls = RefCell::new(Vec::new());
+        let mut reg = PortRegistry::new();
+        let outside = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 90, 0, 2)), 24).unwrap();
+        let e = publish_with(None, outside, &[port(8080)], &mut reg, &calls).unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        let many: Vec<PortPublish> = (0..=MAX_PORT_PUBLISHES as u16)
+            .map(|i| port(1000 + i))
+            .collect();
+        assert_eq!(many.len(), MAX_PORT_PUBLISHES + 1);
+        let e = publish_with(None, ip(2), &many, &mut reg, &calls).unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::InvalidArgument);
+        let e = publish_with(None, ip(2), &[port(80), port(80)], &mut reg, &calls).unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::InvalidArgument);
+        assert!(calls.borrow().is_empty());
+        assert_eq!(reg.len(), 0);
     }
 }

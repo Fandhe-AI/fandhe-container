@@ -549,6 +549,36 @@ impl PortRegistry {
         Ok(before - self.owners.len())
     }
 
+    /// `endpoint`（`network` 内）が持つ予約のうち、`ports` の受け口だけを解放し、解放した件数を返す。
+    ///
+    /// attach 後の追加公開（`publish_container_ports`）が確定的に失敗したとき、今回の予約だけを戻すために使う。
+    /// 同じ endpoint が先に公開した受け口は残す。失敗時の扱い（予約を残して `Err`）は [`PortRegistry::release`]
+    /// と同じで、DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。
+    pub(crate) fn release_listeners(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+        ports: &[PortPublish],
+    ) -> Result<usize, NetError> {
+        let keys: Vec<_> = ports.iter().map(Self::key).collect();
+        let keep = |k: &ListenerKey, (n, e): &mut ListenerOwner| {
+            !(n == network && e == endpoint && keys.contains(k))
+        };
+        if let Some(path) = &self.shared {
+            let _lock = open_locked(path)?;
+            let mut map = parse_shared(path)?;
+            let before = map.len();
+            map.retain(keep);
+            write_shared(path, &map)?;
+            let released = before - map.len();
+            self.owners = map;
+            return Ok(released);
+        }
+        let before = self.owners.len();
+        self.owners.retain(keep);
+        Ok(before - self.owners.len())
+    }
+
     /// `network` の予約をすべて解放し、解放した件数を返す（ネットワーク削除用。TASK-139.4・NET-1）。
     ///
     /// 結果が不明なバッチで quarantine 中の endpoint の予約も含む。手順・失敗時の扱い（予約を残して `Err`）は
@@ -578,6 +608,23 @@ mod tests {
 
     fn a(x: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(x)
+    }
+
+    /// NET-1・NET-4: `release_listeners` は指定した受け口だけを外し、同じ endpoint の他の予約を残す。
+    #[test]
+    fn net4_release_listeners_releases_only_given_ports() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let p1 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8080, 80).unwrap();
+        let p2 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8081, 81).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p1)).unwrap();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p2)).unwrap();
+        assert_eq!(reg.release_listeners(&net, &ep, &[p2]).unwrap(), 1);
+        assert_eq!(reg.len(), 1);
+        // p1 は残っているので再予約は衝突し、p2 は再予約できる。
+        assert!(reg.reserve(&net, &ep, std::slice::from_ref(&p1)).is_err());
+        reg.reserve(&net, &ep, &[p2]).unwrap();
     }
 
     /// NET-1・TASK-139.3: 非 loopback の unicast は受理し、未指定・loopback・broadcast・multicast・

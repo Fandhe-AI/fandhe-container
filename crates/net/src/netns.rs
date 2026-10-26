@@ -38,6 +38,8 @@
 //!   `MS_SHARED` の自己 bind にする処理は行わない。判定は置き場を開いた fd の mount ID（fdinfo の
 //!   `mnt_id`）で `/proc/self/mountinfo` の行を引いて行い（隠れたマウントを取り違えない。#2724）、
 //!   判定できなければ拒否する
+//! - 解除時の pin のマウント判定も、pin を開いた fd の mount ID で mountinfo の行を引いて行い、パス照合は
+//!   しない（行が引けなければ umount・unlink の前に拒否する。#2764）
 //! - 解除（`unpin`）が失敗したら `ContainerNetns` を呼び出し側へ返す（再試行可能）
 //! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
 //!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
@@ -53,7 +55,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -197,31 +199,6 @@ fn unshare_and_pin(target: &CStr) -> Result<(OwnedFd, FileId, OwnedFd), NetError
     Ok((OwnedFd::from(ns), ns_id, sock))
 }
 
-/// `/proc/self/mountinfo` の `mountpoint` 欄（8 進エスケープ `\040` 等）を元のバイト列へ戻す。
-fn unescape_mountinfo(field: &str) -> Vec<u8> {
-    let b = field.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == b'\\'
-            && let Some(oct) = b.get(i + 1..i + 4)
-            && oct.iter().all(|d| (b'0'..=b'7').contains(d))
-        {
-            let v = oct
-                .iter()
-                .fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
-            if let Ok(byte) = u8::try_from(v) {
-                out.push(byte);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
 /// [`mount_option_by_id`] の判定結果。option の有無と、判定できない理由を区別する（将来の理由追加に備え列挙型にする）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -278,7 +255,7 @@ pub enum MountLookupError {
 
 /// `mountinfo` の生バイト列から mount ID（1 番目の欄）が `mount_id` の行を空白区切りの欄で返す
 /// （OS 呼び出しを含まない純粋関数）。[`mount_option_by_id`]・[`mount_fstype_by_id`]・伝播検査
-/// （`check_propagation`）が共有する行の選び方で、パス欄を比べないため非 UTF-8 の名前も置換せずに扱える。
+/// （`check_propagation`）・pin のマウント判定（`pin_mount_state`）が共有する行の選び方で、パス欄を比べないため非 UTF-8 の名前も置換せずに扱える。
 /// 6 番目の欄より後に `-` 区切りが無い行・同じ ID の行が複数ある場合は `MalformedEntry`、行が無ければ
 /// `MountNotFound`（呼び出し側は fail-closed に扱う。#2724）。
 fn mount_entry_by_id(mountinfo: &[u8], mount_id: u64) -> Result<Vec<&[u8]>, MountLookupError> {
@@ -431,9 +408,17 @@ const MAX_MOUNTINFO_READ: u64 = 4 * 1024 * 1024;
 /// （lazy umount 等で mountinfo から外れていれば `MountNotFound` で拒否される）。
 /// mountinfo は上限つきで生バイトのまま読み、上限超過は拒否する。
 fn check_dir_propagation(dir: &PinDir) -> Result<(), NetError> {
-    use std::io::Read as _;
     let id =
         file_mount_id(&dir.file).map_err(|e| io_error("read fdinfo of netns directory", &e))?;
+    let raw = read_mountinfo()?;
+    check_propagation(&raw, id)
+}
+
+/// `/proc/self/mountinfo` を上限つき（[`MAX_MOUNTINFO_READ`]）で生バイトのまま読む。上限超過は拒否する。
+///
+/// 呼び出し元は [`check_dir_propagation`]（置き場の伝播検査）と [`unpin_in_dir`]（pin のマウント判定）。
+fn read_mountinfo() -> Result<Vec<u8>, NetError> {
+    use std::io::Read as _;
     let mut raw = Vec::new();
     fs::File::open("/proc/self/mountinfo")
         .and_then(|f| f.take(MAX_MOUNTINFO_READ + 1).read_to_end(&mut raw))
@@ -444,7 +429,7 @@ fn check_dir_propagation(dir: &PinDir) -> Result<(), NetError> {
             "mountinfo is too large",
         ));
     }
-    check_propagation(&raw, id)
+    Ok(raw)
 }
 
 /// 作った pin ファイルを消す（消せたら `PINS` の記録も外す）。失敗は `Present`（残っていると分かる）で報告する。
@@ -685,7 +670,7 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
 ///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は、永続的な所有記録と
 ///   照合する設計で扱う（未実装。担当 Issue 未確定。REPAIR-3）
-/// - `/proc/self/mountinfo` 上で、pin がマウントされていないか、`nsfs` としてマウントされている
+/// - pin を開いた fd の mount ID が置き場と同じ（未マウント）か、その ID の mountinfo の行が `nsfs` である
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
 /// - `create_pinned` の時間切れ後も裏で動作中のワーカーが居る pin ではない（ワーカーが完了するまで
@@ -753,20 +738,32 @@ fn unpin_in_dir(
     expected: Option<PinIdentity>,
 ) -> Result<(), NetError> {
     let via = dir.entry(name);
-    let real = dir.real.join(name);
     let euid = sys::effective_uid();
 
-    let current = match fs::symlink_metadata(&via) {
-        Ok(m) if m.file_type().is_file() => file_id(&m),
-        Ok(_) => {
-            return Err(NetError::new(
-                NetErrorCode::FailedPrecondition,
-                "netns pin path is not a regular file",
-            ));
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(io_error("stat netns pin", &e)),
+    // 固定済みの dirfd からの相対で pin を O_PATH|O_NOFOLLOW で開き、inode と mount ID を同じ fd から取る
+    // （パス文字列での照合をしない。#2764）。O_PATH のため FIFO・デバイスでも副作用が無い。
+    let c_name = CString::new(name.as_bytes())
+        .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "netns pin name contains NUL"))?;
+    let pin_file = match sys::open_path_nofollow_at(dir.file.as_fd(), &c_name) {
+        Ok(fd) => File::from(fd),
+        Err(SysError::Os(e)) if e == sys::ENOENT => return Ok(()),
+        Err(e) => return Err(sys_error("open netns pin", e)),
     };
+    let pin_meta = pin_file
+        .metadata()
+        .map_err(|e| io_error("stat netns pin", &e))?;
+    let current = if pin_meta.file_type().is_file() {
+        file_id(&pin_meta)
+    } else {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns pin path is not a regular file",
+        ));
+    };
+    let pin_mnt_id =
+        file_mount_id(&pin_file).map_err(|e| io_error("read fdinfo of netns pin", &e))?;
+    let dir_mnt_id =
+        file_mount_id(&dir.file).map_err(|e| io_error("read fdinfo of netns directory", &e))?;
     // 本プロセスの記録（所有の証明）を引く。nsfs マウントの解除は記録がある場合に限る（下記）。
     let record = lookup_pin(current);
     // 請求書に控えた識別子があれば、現在の pin が同じ作成のものでなければ何も解除しない（別世代の pin を守る）。
@@ -788,10 +785,19 @@ fn unpin_in_dir(
             "netns pin creation is still in progress; retry later",
         ));
     }
-    let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
+    let raw = read_mountinfo()?;
+    let state = pin_mount_state(&raw, pin_mnt_id, dir_mnt_id).map_err(|e| match e {
+        MountLookupError::MountNotFound => NetError::new(
+            NetErrorCode::Internal,
+            "mount of netns pin not found in mountinfo",
+        ),
+        _ => NetError::new(
+            NetErrorCode::Internal,
+            "mount of netns pin is malformed or duplicated in mountinfo",
+        ),
+    })?;
     // アンマウント後に現れるべき pin ファイルの識別子。
-    let expected_file: Option<FileId> = match pin_mount_state(&String::from_utf8_lossy(&raw), &real)
-    {
+    let expected_file: Option<FileId> = match state {
         PinMount::None => {
             // 記録の無いファイルは、形（実効 UID 所有・0o400・空）が pin と同じでも削除しない（fail-closed）。
             // 形だけでは本モジュールが作った pin と証明できず、呼び出し側が指定した任意の空ファイルを
@@ -941,8 +947,6 @@ fn lookup_pin(id: FileId) -> Option<PinRecord> {
 struct PinDir {
     /// 開いたままにして `/proc/self/fd/<n>` を有効に保つ。
     file: File,
-    /// 開いた時点の正規パス（`pin_mount_state` のパス照合用。伝播検査は fd の mount ID で行う）。
-    real: PathBuf,
     /// 開いた実体の識別子 (st_dev, st_ino)。
     id: FileId,
 }
@@ -975,11 +979,8 @@ fn open_pin_dir(parent: &Path) -> Result<PinDir, NetError> {
         opened.uid(),
         sys::effective_uid(),
     )?;
-    let real = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-        .map_err(|e| io_error("resolve netns directory", &e))?;
     Ok(PinDir {
         file,
-        real,
         id: file_id(&opened),
     })
 }
@@ -1043,40 +1044,37 @@ fn check_pin_file_attrs(
     }
 }
 
-/// `mountinfo` 上での pin パスのマウント状態。
+/// pin を開いた fd が属するマウントの状態。
 #[derive(Debug, PartialEq, Eq)]
 enum PinMount {
-    /// マウントされていない。
+    /// 置き場と同じマウントに属する（pin の上に何もマウントされていない）。
     None,
-    /// 最上位のマウントが `nsfs`（netns の bind マウント）。
+    /// pin を開いた fd のマウント（最上位）が `nsfs`（netns の bind マウント）。
     Nsfs,
-    /// 最上位のマウントが `nsfs` 以外。
+    /// pin を開いた fd のマウント（最上位）が `nsfs` 以外。
     Other,
 }
 
-/// `mountinfo` から `pin`（正規化済みの絶対パス）をマウントポイントとする最上位（最後の行）のマウントを探す。
-fn pin_mount_state(mountinfo: &str, pin: &Path) -> PinMount {
-    let target = pin.as_os_str().as_bytes();
-    let mut state = PinMount::None;
-    for line in mountinfo.lines() {
-        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-        let Some(mp_field) = fields.get(4) else {
-            continue;
-        };
-        if unescape_mountinfo(mp_field) != target {
-            continue;
-        }
-        let fstype = fields
-            .iter()
-            .position(|f| *f == "-")
-            .and_then(|i| fields.get(i + 1));
-        state = if fstype == Some(&"nsfs") {
-            PinMount::Nsfs
-        } else {
-            PinMount::Other
-        };
+/// pin を開いた fd の mount ID から pin のマウント状態を判定する（OS 呼び出しを含まない純粋関数）。
+///
+/// `unpin_in_dir` から呼ばれる（NET-1・SEC-1・#2764）。パス照合ではなく、fd の mount ID（`pin_mnt_id`）で
+/// mountinfo の行を引き、その fstype が `nsfs` かで決める。同じパスへ重ねたマウントや隠れた古いマウントが
+/// あっても、fd が実際に属するマウントだけを見る。`pin_mnt_id == dir_mnt_id`（置き場と同じマウント）なら
+/// 未マウントとして mountinfo を引かない。行が無い・壊れている・重複は `Err`（呼び出し側は umount・unlink
+/// の前に拒否する。fail-closed）。
+fn pin_mount_state(
+    mountinfo: &[u8],
+    pin_mnt_id: u64,
+    dir_mnt_id: u64,
+) -> Result<PinMount, MountLookupError> {
+    if pin_mnt_id == dir_mnt_id {
+        return Ok(PinMount::None);
     }
-    state
+    Ok(if mount_fstype_by_id(mountinfo, pin_mnt_id)? == "nsfs" {
+        PinMount::Nsfs
+    } else {
+        PinMount::Other
+    })
 }
 
 /// `create_pinned` の使い捨てスレッドが動作中の pin ファイルの識別子 (dev, ino)（時間切れ後も含む）。
@@ -1340,21 +1338,75 @@ mod tests {
         }
     }
 
-    /// NET-1: mountinfo 上の pin のマウント状態（最上位の fstype で判定）。
+    /// NET-1・#2764: pin を開いた fd の mount ID でマウント状態を判定する。
     #[test]
     fn net1_pin_mount_state_from_mountinfo() {
-        let info = "\
+        let info = b"\
 50 30 0:4 net:[4026531992] /run/ns/a rw shared:9 - nsfs nsfs rw
 51 30 0:30 / /run/ns/b rw - tmpfs tmpfs rw
-52 30 0:4 net:[4026531993] /run/ns/c rw - nsfs nsfs rw
-53 30 0:30 / /run/ns/c rw - tmpfs tmpfs rw
 ";
-        let st = |p: &str| pin_mount_state(info, Path::new(p));
-        assert_eq!(st("/run/ns/a"), PinMount::Nsfs);
-        assert_eq!(st("/run/ns/b"), PinMount::Other);
-        assert_eq!(st("/run/ns/c"), PinMount::Other);
-        assert_eq!(st("/run/ns/d"), PinMount::None);
+        assert_eq!(pin_mount_state(info, 50, 30), Ok(PinMount::Nsfs));
+        assert_eq!(pin_mount_state(info, 51, 30), Ok(PinMount::Other));
+        assert_eq!(pin_mount_state(info, 30, 30), Ok(PinMount::None));
+        assert_eq!(
+            pin_mount_state(info, 99, 30),
+            Err(MountLookupError::MountNotFound)
+        );
+        let dup = b"\
+50 30 0:4 net:[1] /run/ns/a rw - nsfs nsfs rw
+50 30 0:4 net:[1] /run/ns/a rw - nsfs nsfs rw
+";
+        assert_eq!(
+            pin_mount_state(dup, 50, 30),
+            Err(MountLookupError::MalformedEntry)
+        );
     }
+
+    /// NET-1・#2764: 同じパスに重ねたマウントでも fd の ID で引き、行の順序に依らない。
+    #[test]
+    fn net1_pin_mount_state_stacked_same_path() {
+        let nsfs = "52 30 0:4 net:[4026531993] /run/ns/c rw - nsfs nsfs rw\n";
+        let tmpfs = "53 52 0:30 / /run/ns/c rw - tmpfs tmpfs rw\n";
+        for info in [format!("{nsfs}{tmpfs}"), format!("{tmpfs}{nsfs}")] {
+            let b = info.as_bytes();
+            assert_eq!(pin_mount_state(b, 53, 30), Ok(PinMount::Other));
+            assert_eq!(pin_mount_state(b, 52, 30), Ok(PinMount::Nsfs));
+        }
+    }
+
+    /// NET-1・#2764: 隠れた古い nsfs マウントが同じパス文字列で残っていても取り違えない。
+    #[test]
+    fn net1_pin_mount_state_hidden_mount() {
+        let info = b"\
+30 22 0:25 / /run rw - tmpfs tmpfs rw
+41 30 0:4 net:[4026531992] /run/ns/a rw - nsfs nsfs rw
+60 22 0:50 / /run rw - tmpfs tmpfs rw
+61 60 0:51 / /run/ns/a rw - tmpfs tmpfs rw
+";
+        assert_eq!(pin_mount_state(info, 41, 30), Ok(PinMount::Nsfs));
+        assert_eq!(pin_mount_state(info, 61, 60), Ok(PinMount::Other));
+        assert_eq!(pin_mount_state(info, 60, 60), Ok(PinMount::None));
+    }
+
+    /// NET-1・#2764: 実 fd（O_PATH）から mount ID が読め、未マウントの通常ファイルは `None` になる。
+    #[test]
+    fn net1_pin_mount_state_real_fd_unmounted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("pinstate");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(base.join("p"), b"").unwrap();
+        let dir = open_pin_dir(&base).expect("open pin dir");
+        let c = CString::new("p").unwrap();
+        let fd = sys::open_path_nofollow_at(dir.file.as_fd(), &c).expect("open pin");
+        let pin = File::from(fd);
+        let pin_id = file_mount_id(&pin).expect("pin mount id");
+        let dir_id = file_mount_id(&dir.file).expect("dir mount id");
+        assert_eq!(pin_id, dir_id);
+        let info = read_mountinfo().expect("mountinfo");
+        assert_eq!(pin_mount_state(&info, pin_id, dir_id), Ok(PinMount::None));
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// NET-1: 相対パスは受け付けない。
     #[test]
     fn net1_relative_base_dir_is_rejected() {
@@ -1552,14 +1604,6 @@ mod tests {
         };
         assert_eq!(got, want);
         let _ = fs::remove_dir_all(&base);
-    }
-
-    /// 8 進エスケープの復号。
-    #[test]
-    fn mountinfo_octal_unescape() {
-        assert_eq!(unescape_mountinfo("/a\\040b\\134c"), b"/a b\\c");
-        assert_eq!(unescape_mountinfo("/plain"), b"/plain");
-        assert_eq!(unescape_mountinfo("/x\\4"), b"/x\\4");
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {

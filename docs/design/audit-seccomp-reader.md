@@ -24,6 +24,7 @@ Linux v6.12 タグの原文で確認した（2026-10-20）。行番号ではな�
 ### 2.2 記録されなくなる条件（`kernel/auditsc.c`・`kernel/audit.c`・`include/linux/audit.h`・`init/Kconfig`）
 
 - **`audit_enabled` には依存しない**: `audit_seccomp` の doc コメントは「`audit_enabled` と dummy context の状態に関係なく記録を強制する」と述べる。`audit-delivery.md` が「`audit_enabled` が無効なら出ない」としていた点は `AUDIT_SECCOMP` については誤りだった（本件で訂正）
+- 対比（#2498）: 代替経路が送る `NETLINK_AUDIT` のユーザーメッセージ（`AUDIT_TRUSTED_APP`）は逆に `audit_enabled` に依存する。v6.12 `kernel/audit.c` の `audit_receive_msg` は `audit_enabled` が無効だと `AUDIT_USER_AVC` 以外を記録せず ACK 0 を返す（例外は `AUDIT_USER_AVC` だけ）。詳細は `audit-delivery.md` の一次情報の表を参照
 - (a) `CONFIG_AUDITSYSCALL` が無い: `audit.h` は `audit_seccomp` を空のスタブにする。`AUDITSYSCALL` は `depends on AUDIT && HAVE_ARCH_AUDITSYSCALL` のため、`CONFIG_AUDIT=n` なら必ず無い（#2027 の `kernel_audit_not_built` と対応）
 - (b) 起動時の `audit=0`: `audit_enable` が `audit_initialized = AUDIT_DISABLED` にし、`audit_log_start` が NULL を返す（`kernel_audit_disabled_at_boot` と対応）
 - (c) `AUDIT_FILTER_EXCLUDE` の規則が msgtype 1326 に一致する（`audit_log_start`）。非特権では観測できない

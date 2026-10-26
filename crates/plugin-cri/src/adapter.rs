@@ -1180,7 +1180,6 @@ impl BundleProvider for UnimplementedBundleProvider {
 }
 #[cfg(test)]
 mod tests {
-
     //! 単体テスト（エラー変換のコード保持・cgroup 配置を持つ記録の delete の fail-closed・記録器の共有。
     //! CRI-2・REPAIR-4・REPAIR-5）。
 

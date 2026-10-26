@@ -1606,6 +1606,51 @@ mod tests {
     use super::*;
     use crate::error::CriErrorCode;
 
+    /// `ResolvedImage::new` の参照検証と image ID へのフォールバック（CRI-2・OCI-1・REPAIR-12。#2831）。
+    #[test]
+    fn resolved_image_ref_validation_and_fallback() {
+        let hex = "a".repeat(64);
+        let id_str = format!("sha256:{hex}");
+        let id = || fandhe_container_oci::reference::Digest::parse(&id_str).expect("digest");
+        let max = crate::image_service::MAX_IMAGE_FIELD_BYTES;
+        let pad = |n: usize| format!("{}@{id_str}", "r".repeat(n - 1 - id_str.len()));
+
+        // 正常: digest 参照がそのまま返る。
+        let good = format!("example.com/app@{id_str}");
+        let r = ResolvedImage::new(id(), Some(good.clone()));
+        assert_eq!(r.image_ref(), good);
+        assert_eq!(r.id_str(), id_str);
+
+        // 上限ちょうどは採る。
+        let at = pad(max);
+        assert_eq!(at.len(), max);
+        assert_eq!(ResolvedImage::new(id(), Some(at.clone())).image_ref(), at);
+
+        // 上限超過は image ID へ倒す。
+        let over = pad(max + 1);
+        assert_eq!(over.len(), max + 1);
+        assert_eq!(
+            ResolvedImage::new(id(), Some(over)).image_ref(),
+            id_str.as_str()
+        );
+
+        // 制御文字を含む参照は image ID へ倒す。
+        let ctl = format!("example.com/app\n@{id_str}");
+        assert_eq!(
+            ResolvedImage::new(id(), Some(ctl)).image_ref(),
+            id_str.as_str()
+        );
+
+        // '@' を含まない参照は image ID へ倒す。
+        assert_eq!(
+            ResolvedImage::new(id(), Some("example.com/app:latest".to_string())).image_ref(),
+            id_str.as_str()
+        );
+
+        // 参照なしは image ID。
+        assert_eq!(ResolvedImage::new(id(), None).image_ref(), id_str.as_str());
+    }
+
     #[test]
     fn accepts_canonical_pair() {
         for pid in ["4242", "1", "2147483647"] {

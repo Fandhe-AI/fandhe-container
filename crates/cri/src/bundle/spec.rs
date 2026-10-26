@@ -1116,13 +1116,26 @@ pub fn validate_config_with_pod_namespaces(
     container: &ContainerConfig,
     pod: Option<&PodNamespacePaths>,
 ) -> Result<(), CriError> {
+    validate_config_with_pods(sandbox, container, pod, None)
+}
+
+/// [`validate_config_with_pod_namespaces`] に pod の netns パス（`BundleRequest::pod_netns_path`）を足した版。
+///
+/// 生成時（[`build_runtime_config_with_files_and_pods`]）と同じ条件で `port_mappings` を判定する。
+/// 事前検証だけ netns を渡さないと、公開に成功した POD の CreateContainer が `UNIMPLEMENTED` になる（CRI-2・#2676）。
+pub fn validate_config_with_pods(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    pod: Option<&PodNamespacePaths>,
+    pod_netns: Option<&str>,
+) -> Result<(), CriError> {
     build_inner(
         sandbox,
         container,
         &ImageDefaults::default(),
         &BundleFiles::none(),
         pod,
-        None,
+        pod_netns,
         Stage::Validate,
     )
     .map(|_| ())

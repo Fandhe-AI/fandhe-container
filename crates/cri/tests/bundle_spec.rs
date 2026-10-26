@@ -11,6 +11,7 @@ use fandhe_container_cri::bundle::{
     BundleFiles, ImageDefaults, PodNamespacePaths, build_runtime_config,
     build_runtime_config_with_files, build_runtime_config_with_pod_namespaces,
     build_runtime_config_with_pod_netns, resolve_log_path, validate_config,
+    validate_config_with_pods,
 };
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
@@ -1813,6 +1814,17 @@ fn malformed_pod_netns_path_is_rejected() {
         .unwrap_err();
         assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad}");
     }
+}
+
+/// CRI-2・NET-3（#2676）: 事前検証も生成時と同じく pod の netns で `port_mappings` を判定する
+/// （provider 注入の POD で RunPodSandbox の後の CreateContainer が失敗しない）。
+#[test]
+fn validate_with_pod_netns_accepts_port_mappings_like_build() {
+    let mut p = pod();
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    let e = validate_config_with_pods(&p, &ctr(), None, None).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    validate_config_with_pods(&p, &ctr(), None, Some(POD_NETNS)).expect("validate");
 }
 
 /// CRI-2・NET-3（#2676）: 公開する port_mappings は pod の netns がある構成だけ受け、config.json には出さない。

@@ -8,7 +8,7 @@
 //!   境界を越えて届き成功することを具体値で固定する。バイナリが起動して作った状態ルートの `.cri/images` に、偽のレジストリクライアントで
 //!   pull 済みキャッシュを用意し、image ID（`sha256:<hex>`）で CreateContainer → Status → Remove まで通す。タグの解決は在庫が
 //!   プロセス内だけで、CI ではレジストリへ出られないため、ここでは「未知のタグは `NOT_FOUND`（半端な記録を残さない）」で照合し、
-//!   成功側は段 C に置く。
+//!   成功側は段 C に置く。あわせて `Version`・`UpdateRuntimeConfig`（#2896）の応答も境界越しに具体値で照合する。
 //! - 段 B: 同じ `server::serve`（実 UDS・peer UID 検証つき）にフェイクの実行層を注入した `CriRuntimeService` を載せ、
 //!   PodSandbox 作成からコンテナの作成・起動・停止・削除・サンドボックスの停止・削除までの一連が `connect_uds_channel` 越しに
 //!   成功することを確かめる。
@@ -528,6 +528,42 @@ async fn assert_status_runtime_ready_network_not_ready(c: &mut Client, verbose: 
     assert!(resp.info.is_empty());
 }
 
+/// `Version` と `UpdateRuntimeConfig` を UDS＋gRPC 越しに呼び、具体値で照合する（CRI-1・CRI-2・#2896・
+/// `docs/design/cri-status-rpc.md`）。kubelet は `version == "0.1.0"` でなければ起動しない。
+async fn assert_version_and_update_runtime_config(c: &mut Client) {
+    let v = call_with_deadline(
+        c.version(cri::VersionRequest {
+            version: "0.1.0".into(),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("version")
+    .into_inner();
+    assert_eq!(v.version, "0.1.0");
+    assert_eq!(v.runtime_name, "fandhe-container");
+    assert!(!v.runtime_version.is_empty());
+    assert_eq!(v.runtime_api_version, "v1");
+
+    let update = |cidr: &str| cri::UpdateRuntimeConfigRequest {
+        runtime_config: Some(cri::RuntimeConfig {
+            network_config: Some(cri::NetworkConfig {
+                pod_cidr: cidr.into(),
+            }),
+        }),
+    };
+    call_with_deadline(
+        c.update_runtime_config(update("10.244.0.0/24,fd00:10:244::/64")),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("update runtime config");
+    let err = call_with_deadline(c.update_runtime_config(update("10.0.0.0/33")), RPC_DEADLINE)
+        .await
+        .expect_err("invalid pod_cidr");
+    assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+}
+
 /// 段 A（PLUG-1・CRI-2・CRI-3・CRI-7）: 同じ UDS で ImageService がサーブされ、Container 系 RPC が実バイナリへ届いて
 /// 本番バックエンドの応答が境界を越えて返る。タグが未知の作成は `NOT_FOUND` で半端な記録を残さず、image ID の作成は成功する。
 #[tokio::test]
@@ -569,6 +605,7 @@ async fn container_rpcs_reach_the_plugin_binary() {
 
         assert_status_runtime_ready_network_not_ready(&mut c, false).await;
         assert_status_runtime_ready_network_not_ready(&mut c, true).await;
+        assert_version_and_update_runtime_config(&mut c).await;
 
         let sb = run_sandbox(&mut c, "pod-a").await;
 

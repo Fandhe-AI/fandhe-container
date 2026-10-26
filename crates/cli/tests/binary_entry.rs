@@ -3128,3 +3128,100 @@ fn oci7_2499_delete_rejects_mismatched_or_unopenable_image_root_on_linux() {
     assert!(root.join("c1").join("state.json").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+/// SEC-4・CLI-1・ERR-1（#2761）: `start --audit-policy` の不正な値は INVALID_ARGUMENT（2）で拒否され、入力値は文言に入らず、
+/// 状態ルートは作られない。値の欠落は使い方エラー。正しい値で存在しない ID を渡せば従来どおり NOT_FOUND（3）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_cli1_start_rejects_invalid_audit_policy() {
+    let tmp = TmpDir::new("auditpol");
+    let dir = isolated_cli_dir("auditpol");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(
+        &cli,
+        &["--root", root_s, "start", "--audit-policy", "Strict", "c1"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        code_json(
+            "start",
+            "INVALID_ARGUMENT",
+            "the audit policy must be best-effort or strict"
+        )
+    );
+    assert!(!root.exists(), "state root must not be created");
+
+    assert_failure(
+        &run_isolated(&cli, &["--root", root_s, "start", "--audit-policy"]),
+        2,
+        USAGE_JSON,
+    );
+
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "start",
+            "--audit-policy",
+            "best-effort",
+            "nope",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("start".into(), "NOT_FOUND".into()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SEC-4・SUP-1・CLI-1（#2761）: `start --audit-policy strict` は supervisor の argv に `--root <root>` の直後、ID の前として
+/// 渡る。未指定のときは載らない（supervisor の既定が効く）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_start_passes_audit_policy_to_supervisor_argv() {
+    let tmp = TmpDir::new("auditargv");
+    let dir = isolated_cli_dir("auditargv");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, &observing_body("supervisor"));
+    let scope = FakeScope::new(&dir, &tmp);
+    let sup = dir.join("fandhe-container-supervisor");
+    let sup = sup.to_str().expect("utf8");
+
+    let out = scope.run(
+        &cli,
+        &["--root", &root_s, "start", "--audit-policy", "strict", "c1"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        lines[6..],
+        [
+            sup,
+            "start",
+            "--root",
+            &root_s,
+            "--audit-policy",
+            "strict",
+            "c1"
+        ],
+        "{argv}"
+    );
+
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        lines[6..],
+        [sup, "start", "--root", &root_s, "c1"],
+        "{argv}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

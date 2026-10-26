@@ -124,6 +124,9 @@ case "$cmd" in
     while [ $# -gt 0 ]; do
       case "$1" in
         --bundle) [ $# -ge 2 ] || bad; [ -z "$bundle" ] || bad; bundle="$2"; shift 2 ;;
+        # 製品 CLI の --cap-drop は core の語彙で検証する。スタブは代表の名前だけを受ける（#2775）。
+        --cap-drop) [ $# -ge 2 ] || bad
+          [[ "$2" =~ ^(ALL|(CAP_)?(CHOWN|KILL|NET_RAW))$ ]] || bad; shift 2 ;;
         -*) bad ;;
         *) id="$1"; n=$((n + 1)); shift ;;
       esac
@@ -145,7 +148,24 @@ case "$cmd" in
       esac
     done
     [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
-  start | stop)
+  stop)
+    # 製品 CLI の --signal は Docker 表記（番号は 1..64 で 32・33 を除く）。スタブは代表の名前だけを受ける（#2775）。
+    sig_seen=0; n=0; id=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --signal) [ $# -ge 2 ] && [ "$sig_seen" = 0 ] || bad; sig_seen=1
+          if [[ "$2" =~ ^[0-9]{1,3}$ ]]; then
+            v=$((10#$2)); [ "$v" -ge 1 ] && [ "$v" -le 64 ] && [ "$v" -ne 32 ] && [ "$v" -ne 33 ] || bad
+          else
+            [[ "$2" =~ ^(SIG)?(TERM|KILL|INT|HUP)$ ]] || bad
+          fi
+          shift 2 ;;
+        -*) bad ;;
+        *) id="$1"; n=$((n + 1)); shift ;;
+      esac
+    done
+    [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
+  start | inspect)
     [ $# -eq 1 ] && valid_id "$1" && [ "${1#-}" = "$1" ] || bad; id="$1" ;;
   delete)
     force=0; n=0
@@ -183,6 +203,7 @@ case "$cmd" in
     ;;
   start) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND start; fail_op 8 UNIMPLEMENTED start ;;
   logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
+  inspect) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
   stop) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill; fail_op 5 FAILED_PRECONDITION kill ;;
   delete)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete
@@ -343,7 +364,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 40 cases" 40 "$count"
+expect_eq "capture records 48 cases" 48 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -362,8 +383,11 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 40 "$loc_n"
+expect_eq "lcall stub invocations" 48 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
+expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "B16 inspect of a missing container" ok "B16${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "B15 missing state root" ok "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "D01 tail without value" ok "D01${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "D03 tail over the limit" ok "D03${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -441,13 +465,13 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
-cmp_has "layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=15 mismatch=0 missing=0'
+cmp_has "layer A summary" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
-cmp_has "lcall layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=15 mismatch=0 missing=0'
+cmp_has "lcall layer A summary" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -456,8 +480,8 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
-cmp_has "non-linux layer A all match" 'layer A (syntax): match=18 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=14 missing=0'
+cmp_has "non-linux layer A all match" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=15 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -474,7 +498,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=14 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=15 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"

@@ -83,7 +83,7 @@ use std::num::NonZeroU32;
 
 use serde::Serialize;
 
-use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT_CAPABILITIES};
+use fandhe_container_core::capabilities::{Capability, OCI_DEFAULT_CAPABILITIES, parse_drop_list};
 use fandhe_container_core::path_masks::normalize_container_path;
 use fandhe_container_core::sysctl::{
     SYSCTL_MAX_ENTRIES, SysctlError, SysctlKey, SysctlNamespace, SysctlValue,
@@ -314,11 +314,6 @@ struct CapabilitiesOut {
     permitted: Vec<&'static str>,
 }
 
-/// `drop_capabilities` の件数の上限（既知の capability 数の 2 倍。重複を許す）。
-const MAX_DROP_CAPABILITIES: usize = 2 * Capability::ALL.len();
-/// `drop_capabilities` の名前 1 件の長さの上限（バイト）。
-const MAX_CAPABILITY_NAME_BYTES: usize = 32;
-
 /// CRI の `drop_capabilities` を OCI 既定集合から除いた集合へ変換する（CRI-2・SEC-1・#2666）。
 ///
 /// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意（containerd と同じ想定）。`ALL` は全 drop。
@@ -328,29 +323,8 @@ fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriErr
     if names.is_empty() {
         return Ok(None);
     }
-    if names.len() > MAX_DROP_CAPABILITIES {
-        return Err(invalid("drop_capabilities"));
-    }
-    let mut dropped = CapabilitySet::empty();
-    for name in names {
-        if name.is_empty() || name.len() > MAX_CAPABILITY_NAME_BYTES || !name.is_ascii() {
-            return Err(invalid("drop_capabilities"));
-        }
-        let upper = name.to_ascii_uppercase();
-        if upper == "ALL" {
-            dropped = OCI_DEFAULT_CAPABILITIES
-                .iter()
-                .fold(dropped, |set, c| set.with(*c));
-            continue;
-        }
-        let full = if upper.starts_with("CAP_") {
-            upper
-        } else {
-            format!("CAP_{upper}")
-        };
-        let cap = Capability::from_name(&full).ok_or_else(|| invalid("drop_capabilities"))?;
-        dropped = dropped.with(cap);
-    }
+    // 名前の正規化は CLI の `create --cap-drop` と共有する core の部品に委ねる（CLI-1・CRI-2）。
+    let dropped = parse_drop_list(names).map_err(|_| invalid("drop_capabilities"))?;
     let kept: Vec<&'static str> = OCI_DEFAULT_CAPABILITIES
         .iter()
         .copied()

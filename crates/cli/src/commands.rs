@@ -1,13 +1,15 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs / image / system）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs / inspect / image / system）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
 //! ただし `start` は core を呼ばず、CLI と同じディレクトリの supervisor の bin を起動して結果の 1 行を期限付きで受け取る
 //! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715・#1819）でコンテナのプロセスを起動する（rootless のみ。
 //! rootful は `UNIMPLEMENTED`（8）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
-//! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
+//! `stop` / `delete` は core の `oci_runtime::kill`（既定 SIGTERM。`--signal` で上書き。#2775）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
 //! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
+//! `inspect <id>` は supervisor の `inspect::inspect` が整形した 1 行 JSON（起動時に適用した capability 集合を含む。#2775）を
+//! stdout へ出す（`list_logs` module）。`create --cap-drop <CAP>` は起動オプション文書（`create_options`）経由で launch に届く。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は存在確認の後に supervisor の
 //! `logs::read_container_log_with` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
 //! （`--follow` / `--tail` / `--stream` / `--escape` つき。TASK-79.3・#640・#1543・#2447。`list_logs` module）。
@@ -66,8 +68,8 @@ mod stop_delete;
 mod supervisor_start;
 
 use args::{
-    parse_create, parse_delete, parse_doctor, parse_global, parse_image, parse_list, parse_logs,
-    parse_setup, parse_start, parse_stop, parse_system,
+    parse_create, parse_delete, parse_doctor, parse_global, parse_image, parse_inspect, parse_list,
+    parse_logs, parse_setup, parse_start, parse_stop, parse_system,
 };
 
 /// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
@@ -90,6 +92,9 @@ pub enum Command {
     Delete,
     List,
     Logs,
+    /// コンテナ状態の機械可読な出力(`inspect <id>`。supervisor の `inspect::InspectReport` を 1 行 JSON で出す。
+    /// 起動時に適用した capability 集合を含む。#2775・CLI-1・SUP-11・SEC-1)。
+    Inspect,
     /// イメージ管理（`image ls` / `image rm` / `image tag`。#2221・#2316・CLI-1・OCI-7。サブコマンドは `args::ImageArgs`）。
     Image,
     /// システム情報（`system df`。#2221・CLI-1・OCI-7。サブコマンドは `args::SystemArgs`）。
@@ -102,13 +107,14 @@ pub enum Command {
 
 impl Command {
     /// 全コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 11] = [
         Command::Create,
         Command::Start,
         Command::Stop,
         Command::Delete,
         Command::List,
         Command::Logs,
+        Command::Inspect,
         Command::Image,
         Command::System,
         Command::Setup,
@@ -116,13 +122,14 @@ impl Command {
     ];
 
     /// 日常操作コマンドのみ（`ALL` から `Setup` と `Doctor` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
-    pub const DAILY: [Command; 8] = [
+    pub const DAILY: [Command; 9] = [
         Command::Create,
         Command::Start,
         Command::Stop,
         Command::Delete,
         Command::List,
         Command::Logs,
+        Command::Inspect,
         Command::Image,
         Command::System,
     ];
@@ -136,6 +143,7 @@ impl Command {
             | Command::Delete
             | Command::List
             | Command::Logs
+            | Command::Inspect
             | Command::Image
             | Command::System => CommandKind::Daily,
             Command::Setup => CommandKind::Setup,
@@ -152,6 +160,7 @@ impl Command {
             Command::Delete => "delete",
             Command::List => "list",
             Command::Logs => "logs",
+            Command::Inspect => "inspect",
             Command::Image => "image",
             Command::System => "system",
             Command::Setup => "setup",
@@ -291,8 +300,7 @@ impl CliExit {
     }
 }
 
-const USAGE_MESSAGE: &str =
-    "usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>";
+const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
@@ -369,6 +377,10 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => list_logs::run_logs(&global, &a, stdout),
             Err(_) => usage(),
         },
+        Command::Inspect => match parse_inspect(tail) {
+            Ok(a) => list_logs::run_inspect(&global, &a, stdout),
+            Err(_) => usage(),
+        },
         Command::Image => match parse_image(tail) {
             Ok(a) => image::run_image(&global, &a, stdout),
             Err(_) => usage(),
@@ -424,13 +436,14 @@ mod tests {
         assert_eq!(Command::parse("delete"), Some(Command::Delete));
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
+        assert_eq!(Command::parse("inspect"), Some(Command::Inspect));
         assert_eq!(Command::parse("image"), Some(Command::Image));
         assert_eq!(Command::parse("system"), Some(Command::System));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
         assert_eq!(Command::parse("doctor"), Some(Command::Doctor));
     }
 
-    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 8 件は日常操作。
+    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 9 件は日常操作。
     #[test]
     fn cli2_command_kind_classification() {
         let daily: Vec<&str> = Command::ALL
@@ -441,7 +454,7 @@ mod tests {
         assert_eq!(
             daily,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system"
             ]
         );
         assert_eq!(Command::Setup.kind(), CommandKind::Setup);
@@ -455,7 +468,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system"
             ]
         );
         let rest: Vec<Command> = Command::ALL
@@ -472,8 +485,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system", "setup",
-                "doctor"
+                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system",
+                "setup", "doctor"
             ]
         );
     }
@@ -544,7 +557,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n";
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -555,6 +568,7 @@ mod tests {
                 Command::Delete => vec!["delete", "--x", "a"],
                 Command::List => vec!["list", "x"],
                 Command::Logs => vec!["logs"],
+                Command::Inspect => vec!["inspect"],
                 Command::Image => vec!["image", "bogus"],
                 Command::System => vec!["system", "bogus"],
                 Command::Setup => vec!["setup", "x"],
@@ -569,8 +583,8 @@ mod tests {
         assert_eq!(
             covered,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system", "setup",
-                "doctor"
+                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system",
+                "setup", "doctor"
             ]
         );
     }
@@ -632,7 +646,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
@@ -786,6 +800,34 @@ mod tests {
 
         fn failure(op: &str, code: &str) -> (String, String) {
             (op.to_owned(), code.to_owned())
+        }
+
+        /// CLI-1・SUP-11(#2775): created のコンテナの inspect は 1 行の JSON(末尾 LF)で、キー順は固定、
+        /// start 前なので capabilities は null。不在は NOT_FOUND(3)。
+        #[test]
+        fn cli1_inspect_prints_one_line_json_on_linux() {
+            let base = TmpDir::new("inspect");
+            let root = base.state_root();
+            create_ok(&base, "i1");
+            let o = invoke(&root, &["inspect", "i1"]);
+            assert_eq!((o.exit, o.stderr.as_str()), (0, ""), "{}", o.stderr);
+            assert!(o.stdout.ends_with("}\n"), "{:?}", o.stdout);
+            assert_eq!(o.stdout.matches('\n').count(), 1, "{:?}", o.stdout);
+            assert!(
+                o.stdout
+                    .starts_with("{\"id\":\"i1\",\"status\":\"created\",\"pid\":null,"),
+                "{:?}",
+                o.stdout
+            );
+            assert!(
+                o.stdout
+                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null}\n"),
+                "{:?}",
+                o.stdout
+            );
+            let o = invoke(&root, &["inspect", "none"]);
+            assert_eq!((o.exit, o.code), (3, Some("NOT_FOUND")));
+            assert_eq!(o.stdout, "");
         }
 
         /// CLI-1・OCI-4・ERR-2: create は成功で無出力、重複は ALREADY_EXISTS（4）、不正 ID は使い方エラー（2）。
@@ -1163,6 +1205,7 @@ mod tests {
                     Command::Delete => (vec!["delete", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
                     Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Inspect => (vec!["inspect", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Image => (
                         vec!["image", "ls", "--image-root", &ir],
                         0,
@@ -1201,8 +1244,8 @@ mod tests {
             assert_eq!(
                 covered,
                 [
-                    "create", "start", "stop", "delete", "list", "logs", "image", "system",
-                    "setup", "doctor"
+                    "create", "start", "stop", "delete", "list", "logs", "inspect", "image",
+                    "system", "setup", "doctor"
                 ]
             );
         }

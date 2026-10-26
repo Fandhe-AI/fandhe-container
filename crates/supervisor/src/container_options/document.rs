@@ -2,7 +2,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! CLI の `create` が検証した `--ulimit`・`--env`(`--env-file` の展開後)・`--ipc`・`--shm-size`・`--tmpfs` を、
+//! CLI の `create` が検証した `--ulimit`・`--env`(`--env-file` の展開後)・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop` を、
 //! 状態ルート配下の 0600 のファイル([`store`](super::store))経由で supervisor の `start` へ渡すためのバイト列の形。
 //! argv・環境変数・継承 fd は supervisor の起動契約([`crate::start_contract`])で使えず(入口と特権ランチャーが
 //! fd 3 以降を閉じ、env を契約に含めない)、制御チャネルは launch の後に作られるため間に合わない。このため
@@ -18,16 +18,20 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
+//!
+//! `cap-drop` は #2775(CLI-1・SEC-1)で足した kind で、版(`FCOPT1`)は上げない。CLI と supervisor は同じディレクトリから
+//! 配布され、未知の kind は旧 supervisor が拒否する(fail-closed)ため、版を上げる利点が無い。
 //!
 //! # 外部入力の扱い
 //!
 //! ファイル全体・レコード数・1 レコードの長さを、確保の前に上限と照合する。エラーは固定の英語文言で、値を含めない。
 //! `Debug` は env の値を伏せる(秘密情報を含み得る)。
 
+use fandhe_container_core::capabilities::{MAX_DROP_NAME_BYTES, MAX_DROP_NAMES, parse_drop_list};
 use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
@@ -48,6 +52,7 @@ const ULIMIT_RECORD_MAX: usize = 64;
 const IPC_RECORD_MAX: usize = 32;
 const SHM_RECORD_MAX: usize = 64;
 const TMPFS_RECORD_MAX: usize = 4096;
+const CAP_DROP_RECORD_MAX: usize = MAX_DROP_NAME_BYTES;
 /// 作成世代の識別子の最大バイト数(#2713)。
 pub const GENERATION_MAX: usize = 64;
 /// 作成世代の記録(`gen <len>\n<値>\n`)の最大バイト数(後から足す分を、全体の上限の検査で確保する)。
@@ -69,6 +74,8 @@ pub struct ContainerOptionsDocument {
     ipc: Option<String>,
     shm_size: Option<String>,
     tmpfs: Vec<String>,
+    /// `--cap-drop` の生の名前(構築時に core の `parse_drop_list` で検証済み。#2775)。
+    cap_drop: Vec<String>,
     /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
     generation: Option<String>,
 }
@@ -87,6 +94,7 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("ipc", &self.ipc)
             .field("shm_size", &self.shm_size)
             .field("tmpfs", &self.tmpfs)
+            .field("cap_drop", &self.cap_drop)
             .field("generation", &self.generation)
             .finish()
     }
@@ -117,6 +125,7 @@ impl ContainerOptionsDocument {
             ipc,
             shm_size,
             tmpfs,
+            cap_drop: Vec::new(),
             generation: None,
         };
         doc.check_record_lengths()?;
@@ -144,6 +153,28 @@ impl ContainerOptionsDocument {
             return Err(too_long());
         }
         Ok(())
+    }
+
+    /// `--cap-drop` の名前を持たせる(CLI-1・SEC-1・#2775)。件数・1 件の長さの上限と名前の語彙を core の
+    /// `parse_drop_list` で検証する(復号でも同じ関門を通る)。文書全体の上限も再検査する。
+    pub fn with_cap_drop(mut self, cap_drop: Vec<String>) -> Result<Self, TraitError> {
+        if cap_drop.len() > MAX_DROP_NAMES {
+            return Err(invalid("too many cap-drop records"));
+        }
+        if cap_drop.iter().any(|s| s.len() > CAP_DROP_RECORD_MAX) {
+            return Err(invalid("an options record is too long"));
+        }
+        parse_drop_list(&cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
+        self.cap_drop = cap_drop;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
+    /// `--cap-drop` の生の名前。
+    pub fn cap_drop(&self) -> &[String] {
+        &self.cap_drop
     }
 
     /// 作成世代の識別子を持たせる(英数字・`-`・`_` のみ、1〜[`GENERATION_MAX`] バイト。#2713)。
@@ -175,6 +206,7 @@ impl ContainerOptionsDocument {
             && self.ipc.is_none()
             && self.shm_size.is_none()
             && self.tmpfs.is_empty()
+            && self.cap_drop.is_empty()
     }
 
     /// 検証済みの [`ContainerOptions`] へ変換する(label・secrets・configs は含まない)。
@@ -205,6 +237,9 @@ impl ContainerOptionsDocument {
         if let Some(ipc) = &self.ipc {
             options = options.with_ipc_mode(IpcMode::parse(ipc)?);
         }
+        let cap_drop =
+            parse_drop_list(&self.cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
+        options = options.with_cap_drop(cap_drop);
         // 矛盾する指定(ファイルを読まない検査)をここで拒否する。
         options.tmpfs_set()?;
         Ok(options)
@@ -246,6 +281,9 @@ impl ContainerOptionsDocument {
         for s in &self.tmpfs {
             put("tmpfs", s);
         }
+        for s in &self.cap_drop {
+            put("cap-drop", s);
+        }
         if let Some(s) = &self.generation {
             put("gen", s);
         }
@@ -262,6 +300,7 @@ impl ContainerOptionsDocument {
             .strip_prefix(OPTIONS_DOC_MAGIC)
             .ok_or_else(|| invalid("options document has an unknown header"))?;
         let (mut ulimits, mut env, mut tmpfs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut cap_drop: Vec<String> = Vec::new();
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
         let mut generation: Option<String> = None;
         // 全体の上限があるため、レコード数は `new` の件数検査と合わせて有限。
@@ -294,6 +333,7 @@ impl ContainerOptionsDocument {
                 "ipc" => IPC_RECORD_MAX,
                 "shm-size" => SHM_RECORD_MAX,
                 "tmpfs" => TMPFS_RECORD_MAX,
+                "cap-drop" => CAP_DROP_RECORD_MAX,
                 "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
@@ -307,6 +347,7 @@ impl ContainerOptionsDocument {
                 "ulimit" => ulimits.push(text),
                 "env" => env.push(text),
                 "tmpfs" => tmpfs.push(text),
+                "cap-drop" => cap_drop.push(text),
                 "gen" => {
                     if generation.replace(text).is_some() {
                         return Err(invalid("an options record is duplicated"));
@@ -328,11 +369,12 @@ impl ContainerOptionsDocument {
             if ulimits.len() > OPTIONS_MAX_ULIMITS
                 || env.len() > ENV_MAX_ENTRIES
                 || tmpfs.len() > TMPFS_MAX_MOUNTS
+                || cap_drop.len() > MAX_DROP_NAMES
             {
                 return Err(invalid("too many options records"));
             }
         }
-        let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?;
+        let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?.with_cap_drop(cap_drop)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
@@ -411,6 +453,61 @@ tmpfs 14\n/run:rw,noexec\n";
         assert_eq!(nofile, vec![("RLIMIT_NOFILE", 1024, 2048)]);
         assert_eq!(o.env().to_env_strings(), vec!["A=1", "MULTI=line1\nline2"]);
         assert_eq!(o.mounts().shm_size().map(|s| s.bytes()), Some(128 << 20));
+    }
+
+    /// CLI-1・SEC-1(#2775): `cap-drop` は符号化の具体値・往復・変換後の集合が一致し、旧形式(kind なし)も読める。
+    #[test]
+    fn cli1_cap_drop_record_round_trips_and_converts() {
+        use fandhe_container_core::capabilities::{Capability, CapabilitySet};
+        let d = ContainerOptionsDocument::default()
+            .with_cap_drop(vec!["chown".into(), "CAP_NET_RAW".into()])
+            .expect("cap-drop");
+        assert!(!d.is_empty());
+        let bytes = d.encode();
+        assert_eq!(
+            bytes,
+            b"FCOPT1\ncap-drop 5\nchown\ncap-drop 11\nCAP_NET_RAW\n".to_vec()
+        );
+        let back = ContainerOptionsDocument::decode(&bytes).expect("decode");
+        assert_eq!(back, d);
+        let want = CapabilitySet::empty()
+            .with(Capability::Chown)
+            .with(Capability::NetRaw);
+        let opts = back.to_container_options().expect("opts");
+        assert_eq!(opts.cap_drop(), want);
+        assert_eq!(
+            opts.launch_options().expect("launch").capability_drop(),
+            want
+        );
+        // 旧形式(cap-drop なし)は従来どおり読め、集合は空。
+        let old = ContainerOptionsDocument::decode(b"FCOPT1\nipc 7\nprivate\n").expect("old");
+        assert!(old.cap_drop().is_empty());
+        assert_eq!(
+            old.to_container_options().expect("opts").cap_drop(),
+            CapabilitySet::empty()
+        );
+    }
+
+    /// CLI-1・SEC-1(#2775): 未知名・空・長すぎる名前・件数超過を含む文書は復号・構築とも固定文言で拒否する。
+    #[test]
+    fn cli1_cap_drop_record_rejects_invalid() {
+        let bad = ContainerOptionsDocument::decode(b"FCOPT1\ncap-drop 9\nCAP_BOGUS\n")
+            .expect_err("unknown name");
+        assert_eq!(bad.code(), ErrorCode::InvalidArgument);
+        assert_eq!(bad.message(), "a cap-drop record is invalid");
+        assert!(ContainerOptionsDocument::decode(b"FCOPT1\ncap-drop 0\n\n").is_err());
+        let long = "A".repeat(33);
+        assert!(
+            ContainerOptionsDocument::default()
+                .with_cap_drop(vec![long])
+                .is_err()
+        );
+        let many = vec!["chown".to_owned(); MAX_DROP_NAMES + 1];
+        assert!(
+            ContainerOptionsDocument::default()
+                .with_cap_drop(many)
+                .is_err()
+        );
     }
 
     fn decode_err(bytes: &[u8]) -> TraitError {

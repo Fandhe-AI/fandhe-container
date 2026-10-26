@@ -317,6 +317,21 @@ fn stop(env: &Env) -> (u8, String, String) {
     )
 }
 
+fn stop_with_signal(env: &Env, signal: &str) -> (u8, String, String) {
+    let mut out = Vec::new();
+    let ex = run_to(
+        argv(&env.root, &["stop", "--signal", signal, env.id.as_str()]),
+        &mut out,
+    );
+    let mut err = Vec::new();
+    ex.write_stderr(&mut err).unwrap();
+    (
+        ex.exit_code(),
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
 fn err_line(code: &str, message: &str) -> String {
     format!("{{\"op\":\"kill\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
 }
@@ -335,6 +350,34 @@ fn cli1_sec1_stop_delivers_sigterm_via_supervisor() {
         ExplicitStopState::Requested
     );
     assert!(!sup.intent.is_stop_requested());
+}
+
+/// CLI-1・SEC-1(#2775): `--signal SIGKILL` は番号 9 が supervisor の起動ハンドルへ 1 回だけ届く(意図の記録は SIGTERM と同じ)。
+#[test]
+fn cli1_stop_signal_delivers_the_requested_number_via_supervisor() {
+    let env = running_container("stopsig", 4243);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4243, true);
+    let (code, out, err) = stop_with_signal(&env, "SIGKILL");
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(sup.recorded(), vec![9]);
+}
+
+/// CLI-1・ERR-1(#2775): 不正な `--signal` は INVALID_ARGUMENT(2)で、supervisor には何も届かない。
+#[test]
+fn cli1_stop_invalid_signal_is_rejected_before_any_delivery() {
+    let env = running_container("stopbadsig", 4244);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4244, true);
+    for bad in ["BOGUS", "65", "32", ""] {
+        let (code, out, err) = stop_with_signal(&env, bad);
+        assert_eq!(code, 2, "{bad}");
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            err_line("INVALID_ARGUMENT", "signal is invalid"),
+            "{bad}"
+        );
+    }
+    assert_eq!(sup.recorded(), Vec::<u8>::new());
 }
 
 /// SUP-9・ERR-2: 意図を記録できない supervisor には SIGTERM を送らず、FAILED_PRECONDITION（5）で失敗する。

@@ -1,4 +1,4 @@
-//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`)の
+//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`)の
 //! 意味検証と、supervisor へ渡す文書・状態記録へ書く label の組み立て(SUP-12・CLI-1・SEC-1・#2713)。
 //!
 //! # 役割と呼び出し文脈
@@ -7,7 +7,8 @@
 //! 形式の判定は supervisor の既存パーサ(`Ulimit`・`EnvVar`・`IpcMode`・`ShmSize`・`TmpfsOption`・`Label`)を
 //! 唯一の判定とし、CLI は二重実装しない。
 //!
-//! - [`document_of`]: ulimit・env・ipc・shm-size・tmpfs を [`ContainerOptionsDocument`] にする。`--env-file` は
+//! - [`document_of`]: ulimit・env・ipc・shm-size・tmpfs・cap-drop(名前は core の `parse_drop_list` で検証。CRI と共有。
+//!   CLI-1・SEC-1・#2775)を [`ContainerOptionsDocument`] にする。`--env-file` は
 //!   **CLI が利用者の権限で**読み(非ブロッキング・上限つき。FIFO で止まらない)、`-e` との優先順位(`-e` が後勝ち)で
 //!   統合した `KEY=VALUE` 列を文書の `env` にする。特権の supervisor に利用者指定のホストのパスを読ませない
 //!   (confused deputy の回避。SEC-1)。
@@ -44,7 +45,8 @@ pub(super) fn document_of(
         options.ipc.clone(),
         options.shm_size.clone(),
         options.tmpfs.clone(),
-    )
+    )?
+    .with_cap_drop(options.cap_drop.clone())
 }
 
 /// `--env-file` を読む待ちの上限(REPAIR-5)。
@@ -132,6 +134,20 @@ mod tests {
         assert_eq!(doc.env(), ["A=file", "B=flag", "C=3"]);
         assert_eq!(doc.ulimits(), ["nofile=1024:2048"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CLI-1・SEC-1(#2775): `--cap-drop` は文書の cap-drop になり、未知名は固定文言の `InvalidArgument` で拒否する。
+    #[test]
+    fn cli1_create_options_cap_drop() {
+        let mut a = args();
+        a.cap_drop = vec!["ALL".into(), "chown".into()];
+        let doc = document_of(&a).expect("doc");
+        assert_eq!(doc.cap_drop(), ["ALL", "chown"]);
+        assert!(!doc.is_empty());
+        a.cap_drop = vec!["CAP_BOGUS".into()];
+        let e = document_of(&a).expect_err("unknown");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "a cap-drop record is invalid");
     }
 
     /// SUP-12・SEC-1: 不正な値・矛盾は固定文言の `InvalidArgument` で拒否する(値を出さない)。

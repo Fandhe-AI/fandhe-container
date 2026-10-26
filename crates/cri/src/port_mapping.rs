@@ -97,10 +97,6 @@ fn parse_item(m: &PortMapping) -> Result<Item, CriError> {
     let Some(host_port) = NonZeroU16::new(host_port) else {
         return Ok(Item::Skip);
     };
-    let Some(protocol) = proto else {
-        // SCTP の公開は net の nft ルールが対応しない。
-        return Ok(Item::Unsupported);
-    };
     if m.host_ip.is_empty() {
         return Ok(Item::Unsupported);
     }
@@ -119,6 +115,11 @@ fn parse_item(m: &PortMapping) -> Result<Item, CriError> {
     if o[0] == 0 || host_ip.is_multicast() || o[0] >= 240 {
         return Err(invalid());
     }
+    // SCTP の公開は net の nft ルールが対応しない。値の不正（host_ip の形式・禁止範囲）を先に見るため、
+    // 未対応の判定は host_ip の検証の後に置く。
+    let Some(protocol) = proto else {
+        return Ok(Item::Unsupported);
+    };
     Ok(Item::Publish(PodPortPublish {
         protocol,
         host_ip,
@@ -180,6 +181,22 @@ mod tests {
 
     fn code(r: Result<Vec<PodPortPublish>, CriError>) -> CriErrorCode {
         r.expect_err("must be rejected").code()
+    }
+
+    /// CRI-2・NET-3: SCTP でも host_ip の不正（形式・禁止範囲）は未対応より先に `INVALID_ARGUMENT`。
+    #[test]
+    fn cri2_sctp_invalid_host_ip_is_invalid_argument() {
+        for ip in ["abc", "224.0.0.1", "240.0.0.1", "0.1.2.3"] {
+            assert_eq!(
+                code(parse_port_mappings(&[m(2, 8080, 80, ip)])),
+                CriErrorCode::InvalidArgument,
+                "host_ip={ip}"
+            );
+        }
+        assert_eq!(
+            code(parse_port_mappings(&[m(2, 8080, 80, "192.0.2.10")])),
+            CriErrorCode::Unimplemented
+        );
     }
 
     /// CRI-2・NET-3: TCP / UDP の明示 IPv4 は具体値で変換し、`host_port == 0` は結果に含めない。

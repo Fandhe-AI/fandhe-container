@@ -151,12 +151,15 @@ mod violation_scan;
 #[doc(hidden)]
 pub use bind_mounts::mount_binds_with_attach_hook;
 pub use bind_mounts::{BindMountOutcome, BindMountReport, BindSourceType, mount_binds};
+pub(crate) use capabilities::NormalizedGroups;
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
-pub use capabilities::{apply_join_credentials_for_test, clear_supplementary_groups_for_test};
+pub use capabilities::{
+    apply_join_credentials_for_test, apply_join_user_for_test, clear_supplementary_groups_for_test,
+};
 pub use cgroup_join::{
     ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
     ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
@@ -259,6 +262,10 @@ pub use process::{
     spawn_container_probe_with_devices, spawn_container_probe_with_seccomp_listener,
     spawn_container_probe_with_sysfs, spawn_container_probe_with_tmpfs_and_config_paths,
 };
+/// 結合試験 `tests/exec_setns_join.rs` 専用の再公開（SEC-5・CORE-6・#2770。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use reapply::exec_user_check_for_test;
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]

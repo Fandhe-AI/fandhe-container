@@ -210,6 +210,53 @@ impl JoinNamespace {
     }
 }
 
+/// 対象 user namespace の写像と `setgroups` の設定（SEC-5・CORE-6・#2770）。[`Pid1Target::user_id_maps`] が
+/// 読み、exec の `process.user` の照合（`exec::reapply`）が使う。値は呼び出し側の user namespace から見たもの。
+#[derive(Debug, Clone)]
+pub(super) struct TargetIdMaps {
+    pub(super) uid: crate::rootless::IdMapSet,
+    pub(super) gid: crate::rootless::IdMapSet,
+    /// `/proc/<pid>/setgroups` が `allow` か（`deny` なら補助グループを持たせられない）。
+    pub(super) setgroups_allowed: bool,
+}
+
+impl TargetIdMaps {
+    /// procfs の 3 ファイルの内容から作る。解釈できない・検証に通らない内容は `Internal` / 元の分類で拒否する
+    /// （fail-closed。`setgroups` は `allow` / `deny` 以外を認めない）。
+    pub(super) fn parse(uid_map: &str, gid_map: &str, setgroups: &str) -> Result<Self, ExecError> {
+        let stage = IsolationStage::Validate;
+        let to_err = |e: crate::rootless::RootlessError| {
+            ExecError::new(
+                e.code,
+                stage,
+                "target user namespace id map is not acceptable",
+            )
+        };
+        let uid = crate::rootless::parse_id_map(uid_map.as_bytes())
+            .and_then(crate::rootless::IdMapSet::new)
+            .map_err(to_err)?;
+        let gid = crate::rootless::parse_id_map(gid_map.as_bytes())
+            .and_then(crate::rootless::IdMapSet::new)
+            .map_err(to_err)?;
+        let setgroups_allowed = match setgroups.trim() {
+            "allow" => true,
+            "deny" => false,
+            _ => {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    stage,
+                    "target user namespace setgroups setting is not recognized",
+                ));
+            }
+        };
+        Ok(Self {
+            uid,
+            gid,
+            setgroups_allowed,
+        })
+    }
+}
+
 /// 対象と呼び出し側の user namespace の関係（SUP-6・SEC-5・TASK-163.h2・#1462）。`open` が副作用の前に判定して
 /// 対象に記録し、[`join_namespaces`] が参加する集合を決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,9 +272,11 @@ pub(super) enum UserNsRelation {
         target: NsIdentity,
         /// 呼び出し側の識別子。
         own: NsIdentity,
-        /// 対象の実効 uid（呼び出し側の user namespace から見た値。`/proc/<pid>/status` の `Uid:`）。参加前の
-        /// 補助グループの消去を参加後へ回してよいか（呼び出し側がコンテナの所有者と同じ uid か）の判定に使う。
-        target_euid: u32,
+        /// 対象の user namespace の所有者 uid（作成者の実効 uid。呼び出し側の user namespace から見た値で、
+        /// `NS_GET_OWNER_UID`）。参加前の補助グループの消去を参加後へ回してよいか（呼び出し側がコンテナの
+        /// 所有者と同じ uid か）の判定に使う。pid1 の実効 uid ではない: `process.user` が非 root のとき pid1 の
+        /// uid は所有者と別の値（subuid の範囲内）になるため、所有者で判定する（#2770）。
+        owner_uid: u32,
     },
 }
 
@@ -247,29 +296,29 @@ impl UserNsRelation {
 }
 
 /// 対象と呼び出し側の識別子から関係を決める（副作用の前に判定するテスト可能な純関数）。同じ識別子なら
-/// `Shared`、異なれば `Distinct`（`target_euid` は呼び出し側が先に読む）。inode 番号が同じでも dev が違えば別の
+/// `Shared`、異なれば `Distinct`（`owner_uid` は呼び出し側が先に読む）。inode 番号が同じでも dev が違えば別の
 /// namespace として扱う。
 fn classify_user_namespace(
     target: NsIdentity,
     own: NsIdentity,
-    target_euid: Option<u32>,
+    owner_uid: Option<u32>,
 ) -> Result<UserNsRelation, ExecError> {
     if target == own {
         return Ok(UserNsRelation::Shared { identity: own });
     }
-    // 別の user namespace に参加するのに、補助グループの扱いの判断材料（対象の実効 uid）を読めないなら
-    // 判断できない。fail-closed で拒否する。
-    let target_euid = target_euid.ok_or_else(|| {
+    // 別の user namespace に参加するのに、補助グループの扱いの判断材料（対象の user namespace の所有者 uid）を
+    // 読めないなら判断できない。fail-closed で拒否する。
+    let owner_uid = owner_uid.ok_or_else(|| {
         ExecError::new(
             ErrorCode::Internal,
             IsolationStage::SetNs,
-            "failed to read the effective uid of the exec target",
+            "failed to read the owner uid of the exec target user namespace",
         )
     })?;
     Ok(UserNsRelation::Distinct {
         target,
         own,
-        target_euid,
+        owner_uid,
     })
 }
 
@@ -322,6 +371,29 @@ impl Pid1Target {
             .map_err(|e| target_proc_error(&e, "read target mount namespace"))?;
         ensure_not_exited(self, "refusing to bind restrictions to it")?;
         Ok(id)
+    }
+
+    /// 対象 user namespace の `uid_map`・`gid_map` と `setgroups` の設定を読む（SEC-5・CORE-6・#2770）。
+    ///
+    /// exec の `process.user` と `additionalGids` を、`setns` の前（副作用の前）に実際の写像と照合するための材料。
+    /// `LaunchIsolationRecord` の写像は観測専用で権限判断に使わないため、カーネルが持つ実値を読む。読み取りは
+    /// 上限つきで、読んだ後に pidfd の未終了を確認する（pid の再利用で別のプロセスの値を読んでいないことの保証）。
+    /// 写像は write-once で、参加後の再照合（user namespace の識別子）が同じ namespace であることを保つ。
+    /// 失敗はすべて段 `Validate` の固定文言で、値を含めない（ERR-1）。
+    pub(super) fn user_id_maps(&self) -> Result<TargetIdMaps, ExecError> {
+        let stage = IsolationStage::Validate;
+        let read = |name: &str| -> Result<String, ExecError> {
+            read_bounded(&format!("/proc/{}/{name}", self.pid)).map_err(|e| {
+                let mut err = target_proc_error(&e, "read target id map");
+                err.stage = stage;
+                err
+            })
+        };
+        let uid_text = read("uid_map")?;
+        let gid_text = read("gid_map")?;
+        let setgroups_text = read("setgroups")?;
+        ensure_not_exited(self, "refusing to read its id maps")?;
+        TargetIdMaps::parse(&uid_text, &gid_text, &setgroups_text)
     }
 
     /// 対象と呼び出し側の user namespace の関係（`open` で判定済み）。
@@ -502,7 +574,7 @@ impl Pid1Target {
         if let Some(reason) = shared_namespace_violation(&identities) {
             return Err(ExecError::from_violation(reason, None));
         }
-        let user_ns = read_user_ns_relation(pid, &status)?;
+        let user_ns = read_user_ns_relation(pid)?;
         let target = Self {
             pid,
             pidfd,
@@ -538,15 +610,28 @@ fn shared_namespace_violation(
 
 /// 対象 `pid` と呼び出し側の user namespace の関係を読んで決める（SUP-6・SEC-5・SEC-1・TASK-163.h2・#1462）。
 ///
-/// `status` は同じ対象の `/proc/<pid>/status`（`open` が `NSpid:` の検査に読んだもの）。`ns/user` を読めない場合
-/// （user namespace 無効のカーネルを含む）は関係を決められないためエラーにする（fail-closed）。読んだ内容が
-/// pidfd の指すプロセスのものであることは、呼び出し側がこの後に pidfd の未終了を確認することで保証する。
-fn read_user_ns_relation(pid: NonZeroU32, status: &str) -> Result<UserNsRelation, ExecError> {
-    let target = ns_identity(&format!("/proc/{pid}/ns/user"))
-        .map_err(|e| target_proc_error(&e, "read target user namespace"))?;
+/// `ns/user` を読めない場合（user namespace 無効のカーネルを含む）は関係を決められないためエラーにする
+/// （fail-closed）。別の user namespace なら、所有者 uid を同じ `ns/user` の fd から `NS_GET_OWNER_UID` で読む
+/// （#2770）。読んだ内容が pidfd の指すプロセスのものであることは、呼び出し側がこの後に pidfd の未終了を確認する
+/// ことで保証する。
+fn read_user_ns_relation(pid: NonZeroU32) -> Result<UserNsRelation, ExecError> {
+    let path = format!("/proc/{pid}/ns/user");
+    let target =
+        ns_identity(&path).map_err(|e| target_proc_error(&e, "read target user namespace"))?;
     let own = ns_identity("/proc/self/ns/user")
         .map_err(|e| ExecError::from_io(&e, IsolationStage::SetNs, "read own user namespace"))?;
-    classify_user_namespace(target, own, status_effective_uid(status))
+    let owner_uid = if target == own {
+        None
+    } else {
+        read_target_owner_uid(&path)
+    };
+    classify_user_namespace(target, own, owner_uid)
+}
+
+/// 対象の user namespace の所有者 uid を読む。読めなければ `None`（呼び出し側が fail-closed で拒否する）。
+fn read_target_owner_uid(path: &str) -> Option<u32> {
+    let file = fs::File::open(path).ok()?;
+    sys::ns_owner_uid(file.as_fd()).ok()
 }
 
 /// 委譲スコープ（`"/"` または `"/a/b"`）とコンテナ用 cgroup 名から、cgroup v2 ルート起点の絶対パスを作る。
@@ -1320,7 +1405,7 @@ mod tests {
             UserNsRelation::Distinct {
                 target: other,
                 own,
-                target_euid: 1000
+                owner_uid: 1000
             }
         );
         assert_eq!(
@@ -1328,13 +1413,53 @@ mod tests {
             UserNsRelation::Distinct {
                 target: (5, own.1),
                 own,
-                target_euid: 0
+                owner_uid: 0
             }
         );
         let err = classify_user_namespace(other, own, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
         assert_eq!(err.stage, IsolationStage::SetNs);
         assert_eq!(err.violation, None);
+    }
+
+    /// SEC-5・CORE-6・#2770: 対象の写像と `setgroups` の解釈。`allow` / `deny`（末尾の改行は許す）以外・
+    /// 解釈できない写像・ホスト ID 0 を含む写像は拒否する（fail-closed）。
+    #[test]
+    fn sec5_target_id_maps_parse_concrete_values() {
+        let m = TargetIdMaps::parse("0 100000 65536\n", "0 200000 65536\n", "allow\n").unwrap();
+        assert!(m.setgroups_allowed);
+        assert_eq!(m.uid.host_id_of(1000), Some(100_000 + 1000));
+        assert_eq!(m.gid.host_id_of(65_536), None);
+        let d = TargetIdMaps::parse("0 1000 1\n", "0 1000 1\n", "deny").unwrap();
+        assert!(!d.setgroups_allowed);
+        assert_eq!(d.uid.host_id_of(1), None);
+        for bad in ["", "Allow", "allow deny", "1"] {
+            let e = TargetIdMaps::parse("0 1000 1\n", "0 1000 1\n", bad).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Internal, "{bad:?}");
+            assert_eq!(e.stage, IsolationStage::Validate);
+        }
+        let e = TargetIdMaps::parse("garbage", "0 1000 1\n", "allow").unwrap_err();
+        assert_eq!(e.stage, IsolationStage::Validate);
+        let e = TargetIdMaps::parse("0 0 1\n", "0 1000 1\n", "allow").unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(e.message, "target user namespace id map is not acceptable");
+    }
+
+    /// SEC-5・CORE-6・#2770: 自プロセスの実値（`/proc/<pid>/{uid,gid}_map`・`setgroups`）を読む。初期 user
+    /// namespace の `0 0 4294967295` はホスト ID 0 の写像のため拒否される（fail-closed）。非特権の user namespace 内
+    /// では写像が通るため、どちらの結果でも読み取り自体は成功し、誤った値を返さないことだけを確かめる。
+    #[test]
+    fn sec5_user_id_maps_reads_real_proc_files() {
+        let target = Pid1Target {
+            pid: me(),
+            pidfd: sys::pidfd_open(me().get()).unwrap(),
+            expected_cgroup_path: "/fc-x@1".to_owned(),
+            user_ns: own_shared(),
+        };
+        match target.user_id_maps() {
+            Ok(m) => assert!(m.uid.host_id_of(0).is_some()),
+            Err(e) => assert_eq!(e.stage, IsolationStage::Validate),
+        }
     }
 
     /// SUP-6・SEC-5・TASK-163.h2・#1462: `/proc/<pid>/status` の `Uid:` から実効 uid（2 番目）を取る。行なし・
@@ -1364,7 +1489,7 @@ mod tests {
         let distinct = UserNsRelation::Distinct {
             target: (4, 11),
             own,
-            target_euid: 1000,
+            owner_uid: 1000,
         };
         assert_eq!(join_order(&shared), vec![Pid, Mount, Uts, Ipc, Net]);
         assert_eq!(
@@ -1393,7 +1518,7 @@ mod tests {
         let distinct = UserNsRelation::Distinct {
             target: t,
             own,
-            target_euid: 1,
+            owner_uid: 1,
         };
         assert!(user_namespace_unchanged(&shared, own, own));
         assert!(!user_namespace_unchanged(&shared, t, own));
@@ -1418,13 +1543,12 @@ mod tests {
     /// 再照合も通る。
     #[test]
     fn sup6_task163_h2_read_user_ns_relation_with_real_identities() {
-        let status = read_bounded(&format!("/proc/{}/status", me())).unwrap();
         let own = ns_identity("/proc/self/ns/user").unwrap();
         assert_eq!(
-            read_user_ns_relation(me(), &status).unwrap(),
+            read_user_ns_relation(me()).unwrap(),
             UserNsRelation::Shared { identity: own }
         );
-        let err = read_user_ns_relation(NonZeroU32::new(4_194_305).unwrap(), &status).unwrap_err();
+        let err = read_user_ns_relation(NonZeroU32::new(4_194_305).unwrap()).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::SetNs);
         assert_eq!(err.violation, None);
@@ -1443,7 +1567,7 @@ mod tests {
             user_ns: UserNsRelation::Distinct {
                 target: (1, 1),
                 own,
-                target_euid: 0,
+                owner_uid: 0,
             },
         };
         let err = recheck_user_namespace(&stale).unwrap_err();

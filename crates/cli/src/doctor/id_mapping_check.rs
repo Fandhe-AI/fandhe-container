@@ -30,6 +30,14 @@
 //! - 名前を引けず（`getent` が無い）、subuid / subgid に名前の行しか無い構成は `SUBID_OWNER_UNDETERMINED`（Warning。
 //!   `start` も拒否する）。数値 uid の行だけなら従来どおり `SUBID_OWNER_LOOKUP_UNAVAILABLE`（通知）。
 //!
+//! # helper のカーネル要件（#2715）
+//! helper 経由の範囲写像は、`start` が helper を起動する前に pidfd のプロセスグループ送信（Linux 6.9 以降）を確かめ、
+//! 使えなければ `FAILED_PRECONDITION` で拒否する（#2644）。本モジュールは同じ判定（core の
+//! `rootless::probe_group_kill_support`）を、範囲写像になる設定のときだけ `start` の前に示す。判定の根拠は probe の
+//! 結果で、カーネルの版（`/proc/sys/kernel/osrelease`）は説明を選ぶ補助に限る（6.9 未満でも probe が通れば何も出さない）。
+//! probe は自分の pidfd へシグナル 0 を送るだけで何も配送せず、doctor の読み取り専用の契約を崩さない。
+//! 版の文字列・errno はホスト固有の値として載せない。
+//!
 //! # 行わないこと（#2636）
 //! - 状態ストアの inspect の `idMapping`（`RecordedIdModel`）と、現在のホスト設定で選ばれるモデルの突き合わせは
 //!   行わない。1 つのコンテナの写像は一生変わらず利用者の取れる行動が無いうえ、doctor の読み取り専用の契約
@@ -133,6 +141,53 @@ pub enum HelperState {
     NotChecked,
 }
 
+/// カーネルの版が helper 経由の範囲写像の要件（Linux 6.9 以降）を満たすか（説明を選ぶ補助。#2715）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelReleaseState {
+    /// 6.9 以上。
+    AtLeastRequired,
+    /// 6.9 未満。
+    BelowRequired,
+    /// 版を読めない・解釈できない。
+    Unknown,
+    /// 検査しなかった。
+    NotChecked,
+}
+
+/// pidfd のプロセスグループ送信の対応状況（core の `GroupKillSupport` の写し。#2715）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKillState {
+    /// 対応（`start` は helper を起動する）。
+    Supported,
+    /// 自プロセスの pidfd を開けない。
+    PidfdUnavailable,
+    /// グループ送信が受理されない（`start` は helper の前で拒否する）。
+    GroupSignalUnsupported,
+    /// 検査しなかった（範囲写像でない場合を含む）。
+    NotChecked,
+}
+
+/// helper 経由の範囲写像に要る最小のカーネル版（major, minor）。pidfd のプロセスグループ送信（#2644）。
+pub const HELPER_GROUP_KILL_MIN_KERNEL: (u32, u32) = (6, 9);
+
+/// `osrelease` の本文から (major, minor) を取る。解釈できなければ `None`。
+#[cfg(any(target_os = "linux", test))]
+fn parse_kernel_release(text: &str) -> Option<(u32, u32)> {
+    let (major, rest) = text.trim().split_once('.')?;
+    let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// 版の本文から状態を得る。
+#[cfg(any(target_os = "linux", test))]
+fn kernel_release_state(text: Option<&str>) -> KernelReleaseState {
+    match text.and_then(parse_kernel_release) {
+        None => KernelReleaseState::Unknown,
+        Some(v) if v >= HELPER_GROUP_KILL_MIN_KERNEL => KernelReleaseState::AtLeastRequired,
+        Some(_) => KernelReleaseState::BelowRequired,
+    }
+}
+
 /// 収集した事実。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdMappingFindings {
@@ -154,6 +209,10 @@ pub struct IdMappingFindings {
     pub newuidmap: HelperState,
     /// `newgidmap` の検証。
     pub newgidmap: HelperState,
+    /// カーネルの版（説明の補助。範囲写像のときだけ検査する）。
+    pub kernel: KernelReleaseState,
+    /// pidfd のグループ送信（範囲写像のときだけ検査する）。
+    pub group_kill: GroupKillState,
 }
 
 impl IdMappingFindings {
@@ -169,6 +228,8 @@ impl IdMappingFindings {
             subid_source: NsswitchState::NotChecked,
             newuidmap: HelperState::NotChecked,
             newgidmap: HelperState::NotChecked,
+            kernel: KernelReleaseState::NotChecked,
+            group_kill: GroupKillState::NotChecked,
         }
     }
 }
@@ -197,7 +258,7 @@ pub struct IdMappingDiagnostic {
     pub message: &'static str,
     /// 対処の案内。
     pub remediation: Vec<&'static str>,
-    /// どの検査か（`privilege` / `passwd` / `nsswitch` / `subuid` / `subgid` / `id_model` / `id_map_helpers`）。
+    /// どの検査か（`privilege` / `passwd` / `nsswitch` / `subuid` / `subgid` / `id_model` / `id_map_helpers` / `id_map_kernel`）。
     pub check: &'static str,
     /// 状態のトークン。
     pub state: &'static str,
@@ -466,6 +527,42 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
             HelperState::Trusted | HelperState::NotChecked => {}
         }
     }
+    // helper 経由の範囲写像のカーネル要件。判定は `start` と同じ probe を正とし、版は説明の補助（#2715）。
+    match (f.group_kill, f.kernel) {
+        (GroupKillState::GroupSignalUnsupported, KernelReleaseState::BelowRequired) => {
+            diagnostics.push(diag(
+                Warning,
+                "ID_MAP_HELPER_KERNEL_UNSUPPORTED",
+                "the kernel is older than Linux 6.9 and lacks pidfd process-group signals; a subordinate id mapping through newuidmap and newgidmap requires them, so starting a container fails closed",
+                vec![
+                    "Update the kernel to Linux 6.9 or later (the production launcher also requires Landlock ABI 6, which needs Linux 6.12 or later)",
+                ],
+                "id_map_kernel",
+                "kernel_below_6_9",
+            ));
+        }
+        (GroupKillState::GroupSignalUnsupported, _) => diagnostics.push(diag(
+            Warning,
+            "ID_MAP_HELPER_KERNEL_UNSUPPORTED",
+            "pidfd process-group signals are not available to this process; a subordinate id mapping through newuidmap and newgidmap requires them, so starting a container fails closed",
+            vec![
+                "Check that no seccomp filter or sandbox blocks pidfd_send_signal, and that the kernel is Linux 6.9 or later",
+            ],
+            "id_map_kernel",
+            "group_signal_unavailable",
+        )),
+        (GroupKillState::PidfdUnavailable, _) => diagnostics.push(diag(
+            Warning,
+            "ID_MAP_HELPER_PIDFD_UNAVAILABLE",
+            "a pidfd for this process could not be opened; a subordinate id mapping through newuidmap and newgidmap requires it, so starting a container fails closed",
+            vec![
+                "Check that no seccomp filter or sandbox blocks pidfd_open, that the process is not out of file descriptors, and that the kernel is Linux 5.3 or later",
+            ],
+            "id_map_kernel",
+            "pidfd_unavailable",
+        )),
+        (GroupKillState::Supported | GroupKillState::NotChecked, _) => {}
+    }
     let outcome = if diagnostics.iter().any(|d| d.severity == Warning) {
         IdMappingOutcome::Warning
     } else {
@@ -523,6 +620,10 @@ pub struct IdMappingSources {
     pub helpers: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// NSS（`getent`）の参照設定。本番は `UserDbLookup::system()`。
     pub lookup: fandhe_container_supervisor::user_db::UserDbLookup,
+    /// カーネルの版の位置（`/proc/sys/kernel/osrelease`。#2715）。
+    pub kernel_release: std::path::PathBuf,
+    /// pidfd のグループ送信の検査（本番は core の `probe_group_kill_support`。試験が差し替える継ぎ目。#2715）。
+    pub group_kill: fn() -> fandhe_container_core::rootless::GroupKillSupport,
 }
 
 #[cfg(target_os = "linux")]
@@ -536,6 +637,8 @@ impl IdMappingSources {
             subgid: SYSTEM_SUBGID.into(),
             helpers: None,
             lookup: fandhe_container_supervisor::user_db::UserDbLookup::system(),
+            kernel_release: "/proc/sys/kernel/osrelease".into(),
+            group_kill: fandhe_container_core::rootless::probe_group_kill_support,
         }
     }
 }
@@ -554,8 +657,8 @@ pub fn collect() -> IdMappingFindings {
 #[cfg(target_os = "linux")]
 pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> IdMappingFindings {
     use fandhe_container_core::rootless::{
-        SYSTEM_NEWGIDMAP, SYSTEM_NEWUIDMAP, SubIdOwner, SubordinateRange, load_subordinate_ids,
-        rootless_mapping, verify_helper_path,
+        GroupKillSupport, SYSTEM_NEWGIDMAP, SYSTEM_NEWUIDMAP, SubIdOwner, SubordinateRange,
+        load_subordinate_ids, rootless_mapping, verify_helper_path,
     };
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::id_model::{
@@ -679,6 +782,18 @@ pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> Id
     };
     f.newuidmap = helper_state(&uid_path);
     f.newgidmap = helper_state(&gid_path);
+    // helper 経由の範囲写像のカーネル要件（#2715）。`start` と同じ probe を正とし、版は説明の補助。
+    f.kernel = kernel_release_state(
+        super::read_limited(&sources.kernel_release, super::MAX_PROC_READ)
+            .ok()
+            .as_deref(),
+    );
+    f.group_kill = match (sources.group_kill)() {
+        GroupKillSupport::Supported => GroupKillState::Supported,
+        GroupKillSupport::PidfdUnavailable => GroupKillState::PidfdUnavailable,
+        // `GroupSignalUnsupported` と将来の値は fail-closed で未対応に寄せる。
+        _ => GroupKillState::GroupSignalUnsupported,
+    };
     f
 }
 
@@ -703,6 +818,8 @@ mod tests {
             subid_source: NsswitchState::Files,
             newuidmap: HelperState::Trusted,
             newgidmap: HelperState::Trusted,
+            kernel: KernelReleaseState::AtLeastRequired,
+            group_kill: GroupKillState::Supported,
         }
     }
 
@@ -950,6 +1067,114 @@ mod tests {
         assert!(text.contains("\"remediation\":[\""));
     }
 
+    fn kernel_case(group_kill: GroupKillState, kernel: KernelReleaseState) -> IdMappingReport {
+        evaluate(&IdMappingFindings {
+            kernel,
+            group_kill,
+            ..base()
+        })
+    }
+
+    /// CORE-6・SEC-5(#2715): 6.9 未満で probe が拒否されるなら Warning（3）。
+    #[test]
+    fn core6_kernel_below_6_9_warns() {
+        let r = kernel_case(
+            GroupKillState::GroupSignalUnsupported,
+            KernelReleaseState::BelowRequired,
+        );
+        assert_eq!(codes(&r), ["ID_MAP_HELPER_KERNEL_UNSUPPORTED"]);
+        let d = &r.diagnostics[0];
+        assert_eq!(d.severity, DoctorSeverity::Warning);
+        assert_eq!(d.check, "id_map_kernel");
+        assert_eq!(d.state, "kernel_below_6_9");
+        assert_eq!(r.exit_status().code(), 3);
+    }
+
+    /// CORE-6・SEC-5(#2715): 6.9 以上で probe が通れば何も出さず 0。
+    #[test]
+    fn core6_kernel_at_least_6_9_is_silent() {
+        let r = kernel_case(
+            GroupKillState::Supported,
+            KernelReleaseState::AtLeastRequired,
+        );
+        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.exit_status().code(), 0);
+    }
+
+    /// CORE-6・SEC-5(#2715): 判定は probe が正。版が足りても送れなければ別の state、版が未満でも通れば無言。
+    #[test]
+    fn core6_kernel_probe_is_authoritative() {
+        for k in [
+            KernelReleaseState::AtLeastRequired,
+            KernelReleaseState::Unknown,
+        ] {
+            let r = kernel_case(GroupKillState::GroupSignalUnsupported, k);
+            assert_eq!(codes(&r), ["ID_MAP_HELPER_KERNEL_UNSUPPORTED"]);
+            assert_eq!(r.diagnostics[0].state, "group_signal_unavailable");
+        }
+        for k in [
+            KernelReleaseState::BelowRequired,
+            KernelReleaseState::Unknown,
+        ] {
+            assert!(
+                kernel_case(GroupKillState::Supported, k)
+                    .diagnostics
+                    .is_empty()
+            );
+        }
+        let r = kernel_case(
+            GroupKillState::PidfdUnavailable,
+            KernelReleaseState::Unknown,
+        );
+        assert_eq!(codes(&r), ["ID_MAP_HELPER_PIDFD_UNAVAILABLE"]);
+        assert_eq!(r.diagnostics[0].state, "pidfd_unavailable");
+        assert_eq!(r.exit_status().code(), 3);
+        assert!(
+            kernel_case(GroupKillState::NotChecked, KernelReleaseState::NotChecked)
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    /// REPAIR-4・SEC-5(#2715): 新しい行も既存の 6 キーだけで、版の文字列を含まない。
+    #[test]
+    fn sec5_kernel_diagnostic_json_has_no_release_string() {
+        let r = kernel_case(
+            GroupKillState::GroupSignalUnsupported,
+            KernelReleaseState::BelowRequired,
+        );
+        let mut buf = Vec::new();
+        r.write_json_lines(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.trim_end()
+                .ends_with("\"check\":\"id_map_kernel\",\"state\":\"kernel_below_6_9\"}")
+        );
+        assert!(!text.contains("6.8"));
+    }
+
+    /// CORE-6(#2715): osrelease の parse と閾値判定の具体値。
+    #[test]
+    fn core6_parse_kernel_release_cases() {
+        use KernelReleaseState::{AtLeastRequired as Ok9, BelowRequired as Low, Unknown};
+        for (text, parsed, state) in [
+            ("6.8.0-45-generic\n", Some((6, 8)), Low),
+            ("6.9.0", Some((6, 9)), Ok9),
+            ("6.9", Some((6, 9)), Ok9),
+            ("6.12.3-arch1-1", Some((6, 12)), Ok9),
+            ("5.15.146.1-microsoft-standard-WSL2", Some((5, 15)), Low),
+            ("10.0.0", Some((10, 0)), Ok9),
+            ("", None, Unknown),
+            ("garbage", None, Unknown),
+            ("6", None, Unknown),
+        ] {
+            assert_eq!(parse_kernel_release(text), parsed, "{text:?}");
+            assert_eq!(kernel_release_state(Some(text)), state, "{text:?}");
+        }
+        assert_eq!(kernel_release_state(None), Unknown);
+    }
+
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
@@ -1007,6 +1232,8 @@ mod tests {
                 helpers: Some((d.write("newuidmap", ""), d.write("newgidmap", ""))),
                 // 既定は候補なし（実機の NSS を引かない）。
                 lookup: UserDbLookup::custom(Vec::new(), Duration::from_secs(5), None, d.0.clone()),
+                kernel_release: d.write("osrelease", "6.12.0\n"),
+                group_kill: || fandhe_container_core::rootless::GroupKillSupport::Supported,
             }
         }
 
@@ -1271,6 +1498,63 @@ mod tests {
             assert_eq!(r.exit_status().code(), 4);
             let f = collect_with(None, &s);
             assert_eq!(f.privilege, PrivilegeState::Unreadable);
+        }
+
+        /// CORE-6・SEC-5(#2715): 範囲写像のとき版と probe を事実に写す（6.9 未満・以上・pidfd 不可）。
+        #[test]
+        fn core6_collect_kernel_requirement() {
+            use fandhe_container_core::rootless::GroupKillSupport as G;
+            let d = Dir::new("kern");
+            let mut s = sources(&d, PASSWD, Some(GOOD), Some(GOOD));
+            s.kernel_release = d.write("osr-low", "6.8.0\n");
+            s.group_kill = || G::GroupSignalUnsupported;
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.kernel, KernelReleaseState::BelowRequired);
+            assert_eq!(f.group_kill, GroupKillState::GroupSignalUnsupported);
+            assert_eq!(codes(&r).last(), Some(&"ID_MAP_HELPER_KERNEL_UNSUPPORTED"));
+            s.kernel_release = d.write("osr-high", "6.9.0\n");
+            s.group_kill = || G::Supported;
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.kernel, KernelReleaseState::AtLeastRequired);
+            assert!(
+                !codes(&r)
+                    .iter()
+                    .any(|c| c.starts_with("ID_MAP_HELPER_KERNEL"))
+            );
+            s.group_kill = || G::PidfdUnavailable;
+            let (_, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(codes(&r).last(), Some(&"ID_MAP_HELPER_PIDFD_UNAVAILABLE"));
+            s.kernel_release = d.0.join("missing");
+            let (f, _) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.kernel, KernelReleaseState::Unknown);
+        }
+
+        /// CORE-6(#2715): 1 対 1 写像・rootful では probe を呼ばない。
+        #[test]
+        fn core6_collect_skips_kernel_check_unless_subordinate() {
+            let d = Dir::new("kskip");
+            let mut s = sources(&d, PASSWD, None, None);
+            s.group_kill = || panic!("probe must not run");
+            let (f, _) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.model, ModelState::Single);
+            assert_eq!(f.kernel, KernelReleaseState::NotChecked);
+            assert_eq!(f.group_kill, GroupKillState::NotChecked);
+            let (f, _) = run(&d, &status(0, 0), &s);
+            assert_eq!(f.group_kill, GroupKillState::NotChecked);
+        }
+
+        /// CORE-6・SEC-5(#2715): 既定の入力元の probe は実カーネルの版(6.9 以上か)と一致する。
+        #[test]
+        fn core6_system_probe_matches_kernel_release() {
+            use fandhe_container_core::rootless::GroupKillSupport as G;
+            let text = std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("osrelease");
+            let v = parse_kernel_release(&text).expect("parse osrelease");
+            let expected = if v >= HELPER_GROUP_KILL_MIN_KERNEL {
+                G::Supported
+            } else {
+                G::GroupSignalUnsupported
+            };
+            assert_eq!((IdMappingSources::system().group_kill)(), expected);
         }
 
         /// REPAIR-4・SEC-5: 出力にユーザー名・範囲の値・パスを載せない。

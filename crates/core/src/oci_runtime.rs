@@ -45,6 +45,7 @@ mod launch_options;
 mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
+mod namespace_join;
 mod resources;
 mod start;
 mod sysfs_mount;
@@ -53,7 +54,8 @@ mod working_dir;
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
-    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
+    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, BindPropagation,
+    audit_bind_mount_error,
 };
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,
@@ -105,6 +107,7 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
+pub use namespace_join::NamespaceJoin;
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

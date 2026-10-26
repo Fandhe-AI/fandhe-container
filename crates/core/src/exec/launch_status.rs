@@ -26,13 +26,28 @@
 //! ```text
 //! R\n                                  検証の全手順が通り、`execveat` を呼ぶ直前
 //! E <CODE> <reason|->\n                `execveat` の前の手順が失敗（<reason> は entrypoint 系の理由コードか -）
+//! X <CODE>\n                           `R` の後の `execveat` が戻った（errno 由来の失敗。#2716）
 //! ```
 //!
 //! 1 行目と 2 行目は先頭のトークン（`P`/`F` と `R`/`E`）で字句上も分かれ、取り違えは `Malformed` になる。
 //! 2 行目は C が `P` を読み終え、listener を受け取って ACK を返した**後**にしか書かれない（PID 1 は ACK を待ってから
 //! 検証へ進み、C は `P` の判定より前に listener を受け取らない）ため、2 行が 1 回の `read` に混ざらない。
 //! 復号は 1 行目と同じく厳格で、理由は `ViolationReason::from_entrypoint_token`（固定語彙の走査）で静的な値へ
-//! 引き直す。`R` の後の `execveat` 自体の失敗（errno 由来）は 2 行目に載らず、PID 1 の終了として観測される。
+//! 引き直す。
+//!
+//! # `R` の後の `execveat` の失敗（`X`。SEC-4・CORE-5・ERR-1・#2716）
+//!
+//! `R` の後に `execveat` が errno で失敗したら、子は `R` に続けて `X <CODE>` を書く。`<CODE>` は
+//! `process::exec_errno_to_code` による errno の分類（`ErrorCode` の名前のみ。errno の生値・文字列は運ばない）。
+//! 親は `R` の後も書き込み側が全て閉じる（EOF）まで読む（[`read_exec_phase_until_close`]）。EOF だけなら
+//! `execveat` の成功（状態 pipe は close-on-exec）、`X` が届けば起動失敗で、PID 1 は回収する。
+//! 完成した失敗報告（`E` 行、`R` に続く `X` 行）は EOF を待たずに判定する（子が stderr で詰まっても `Timeout` に置き換えない。REPAIR-5）。
+//! 受理する形は `R\n`・`R\nX <CODE>\n`・`E ...\n` の 3 つだけで、それ以外は `Malformed`（fail-closed）。
+//! **`X` は監査に記録しない**: ENOENT・ENOEXEC 等は設定の誤りで違反ではなく、EACCES・EPERM は DAC・noexec・
+//! Landlock・LSM のどれによるかをユーザー空間から区別できず、Landlock / LSM の拒否はカーネル側の監査が担うため
+//! （誤記録と二重記録を避ける。この判断はオーナーが見直し得るもので、承認済みではない）。既知の限界:
+//! `R` から `execveat` の完了までの間にシグナルで死ぬと EOF になり成功と判定される（EOF の後の生存確認は、
+//! すぐ終わる正当なプログラムを誤って失敗にするため入れない）。
 //!
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
 //! 復号は厳格（単一スペース区切り・フィールド数固定・全トークンが許可リスト内・末尾に余分なバイト無し）で、
@@ -157,21 +172,6 @@ impl PrePivotStep {
     }
 }
 
-/// `ErrorCode` の全 variant（`as_str` の逆引き用。`ErrorCode` に `from_str` が無いため）。
-/// 足し忘れは `error_code_ordinal` を使う単体テストが検出する。
-pub(super) const ALL_ERROR_CODES: [ErrorCode; 10] = [
-    ErrorCode::InvalidArgument,
-    ErrorCode::NotFound,
-    ErrorCode::AlreadyExists,
-    ErrorCode::FailedPrecondition,
-    ErrorCode::Unimplemented,
-    ErrorCode::Internal,
-    ErrorCode::PermissionDenied,
-    ErrorCode::Timeout,
-    ErrorCode::Unavailable,
-    ErrorCode::ResourceExhausted,
-];
-
 /// 段つきの許可リスト照合（子の符号化と親の復号で共有する唯一の規則。#2072）。
 ///
 /// `ViolationReason::from_launch_token` が通す理由に加え、段 `MountBinds` に限って user namespace 由来の 2 理由
@@ -295,10 +295,7 @@ impl PrePivotStatus {
             ["P"] => Ok(Self::Ready),
             ["F", step, code, reason] => {
                 let step = PrePivotStep::from_token(step).ok_or(PrePivotStatusError::Malformed)?;
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let violation = if *reason == "-" {
                     None
                 } else {
@@ -457,6 +454,9 @@ pub(super) enum ExecPhaseStatus {
         /// entrypoint 系の違反理由（`ENTRYPOINT_REASONS` のものだけ。それ以外は `None`）。
         violation: Option<ViolationReason>,
     },
+    /// `R` を書いた後の `execveat` 自体が戻った（errno 由来の失敗。#2716）。`code` は errno の分類
+    /// （`process::exec_errno_to_code`）。errno の生値・文字列は運ばない。
+    Returned { code: ErrorCode },
 }
 
 impl ExecPhaseStatus {
@@ -486,6 +486,7 @@ impl ExecPhaseStatus {
                     && out.push(violation.map_or("-", ViolationReason::as_str))
                     && out.push("\n")
             }
+            Self::Returned { code } => out.push("X ") && out.push(code.as_str()) && out.push("\n"),
         };
         if !ok {
             // 到達しない想定。成功行に落とさず、理由なしの失敗へ倒す。
@@ -504,11 +505,11 @@ impl ExecPhaseStatus {
         let parts: Vec<&str> = text.split(' ').collect();
         match parts.as_slice() {
             ["R"] => Ok(Self::Ready),
+            ["X", code] => Ok(Self::Returned {
+                code: ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?,
+            }),
             ["E", code, reason] => {
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let violation = if *reason == "-" {
                     None
                 } else {
@@ -537,27 +538,139 @@ pub(super) fn report_exec_failure(
     write_status(status, &ExecPhaseStatus::failed_from(error).encode())
 }
 
-/// 親側: 状態 pipe から 2 行目を期限つきで読んで復号する（REPAIR-5）。1 行目を読み終えた後にだけ呼ぶこと。
-pub(super) fn read_exec_phase_status(
+/// 子側: `R` の後の `execveat` が戻ったことを `X <CODE>` として書く（best-effort。#2716）。
+///
+/// 書けなくても元のエラーを返すのは呼び出し側の責務で、親は `R` だけを読んで EOF になり成功と判定する
+/// （書けない状況は pipe の破損のみで、その場合 PID 1 はすぐ終了する）。
+pub(super) fn report_exec_returned(
     status: &std::fs::File,
-    timeout: Duration,
-) -> Result<ExecPhaseStatus, PrePivotStatusError> {
-    let (buf, end) = read_line_bounded::<PRE_PIVOT_STATUS_MAX_BYTES>(status, timeout)?;
-    ExecPhaseStatus::decode(buf.get(..end).unwrap_or(&[]))
+    code: ErrorCode,
+) -> Result<(), ExecError> {
+    write_status(status, &ExecPhaseStatus::Returned { code }.encode())
 }
 
-/// 2 行目の読み取り結果を起動の成否へ判定し、entrypoint 系の違反を親で記録する（SEC-4・#2624）。
+/// 親側が EOF まで読む 2 行目以降の最大バイト数（`R\n` と `X <CODE>\n` の 2 行ぶん）。
+const EXEC_PHASE_TAIL_MAX_BYTES: usize = 2 * PRE_PIVOT_STATUS_MAX_BYTES;
+
+/// exec 前後の状態（2 行目以降を EOF まで読んだ結果。#2716）。
 ///
-/// `Ready` だけが `Ok`。違反ありの失敗は [`audit_entrypoint_violation`] が層 `entrypoint` のレコードを 1 件書く
-/// （パスなし。時刻と PID は記録を行った親のもの）。理由なしの失敗と読み取り失敗は記録せず `NotApplicable`
-/// （fail-closed。記録の失敗で拒否は覆らない）。
+/// [`ExecPhaseStatus`]（1 行の型）と別にして、「`R` を読んだ」ことと「`execveat` が成功した」ことを取り違えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExecPhaseOutcome {
+    /// `R` の後に何も届かず EOF になった。状態 pipe は close-on-exec のため、`execveat` の成功を意味する。
+    Executed,
+    /// `R` の後に `X <CODE>` が届いた。`execveat` が errno で失敗した。
+    ExecReturned { code: ErrorCode },
+    /// `execveat` の前の手順が失敗した（`E`）。
+    Failed {
+        code: ErrorCode,
+        violation: Option<ViolationReason>,
+    },
+}
+
+impl ExecPhaseOutcome {
+    /// EOF まで読んだバイト列を厳格に復号する（純関数）。
+    ///
+    /// 受理するのは `R\n`・`R\nX <CODE>\n`・`E ...\n` の 3 形だけ。空は `ClosedBeforeReport`、LF なしは
+    /// `Truncated`、それ以外（`R` の後の `E`、`X` の単独、余分なバイト、許可リスト外の CODE）は `Malformed`。
+    pub(super) fn decode_tail(bytes: &[u8]) -> Result<Self, PrePivotStatusError> {
+        if bytes.is_empty() {
+            return Err(PrePivotStatusError::ClosedBeforeReport);
+        }
+        let pos = bytes
+            .iter()
+            .position(|c| *c == b'\n')
+            .ok_or(PrePivotStatusError::Truncated)?;
+        let (first, rest) = bytes.split_at(pos + 1);
+        match ExecPhaseStatus::decode(first)? {
+            ExecPhaseStatus::Ready if rest.is_empty() => Ok(Self::Executed),
+            ExecPhaseStatus::Ready => match ExecPhaseStatus::decode(rest)? {
+                ExecPhaseStatus::Returned { code } => Ok(Self::ExecReturned { code }),
+                _ => Err(PrePivotStatusError::Malformed),
+            },
+            ExecPhaseStatus::Failed { code, violation } if rest.is_empty() => {
+                Ok(Self::Failed { code, violation })
+            }
+            _ => Err(PrePivotStatusError::Malformed),
+        }
+    }
+}
+
+/// 親側: 状態 pipe の 2 行目以降を、書き込み側が全て閉じる（EOF）まで期限つきで読んで復号する（REPAIR-5・#2716）。
+///
+/// 1 行目を読み終えた後にだけ呼ぶこと。期限は全体で `timeout`（1 バイトずつ滴下されても延びない）、バッファは
+/// 固定長で、超えたら `TooLong`。`R` の後は `execveat` の成功（close-on-exec による EOF）か `X` を待つ。
+///
+/// 既知の限界: `R` を書いてから `execveat` が完了するまでの間（syscall 1 回ぶん）にシグナルで PID 1 が死ぬと、
+/// EOF になり `Executed` と判定される。EOF の後の生存確認は、すぐ終わる正当なプログラムを誤って失敗にするため
+/// 入れない（`exec_command` が受け入れている限界と同じ）。
+pub(super) fn read_exec_phase_until_close(
+    status: &std::fs::File,
+    timeout: Duration,
+) -> Result<ExecPhaseOutcome, PrePivotStatusError> {
+    let deadline = Instant::now() + timeout.min(READ_TIMEOUT_MAX);
+    // 1 バイト余分に持ち、上限ちょうどで EOF になる正常系と、上限超過を区別する。
+    let mut buf = [0u8; EXEC_PHASE_TAIL_MAX_BYTES + 1];
+    let mut filled = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        let millis = i32::try_from(millis).unwrap_or(i32::MAX);
+        match sys::poll_readable(status.as_fd(), millis) {
+            Ok(true) => {}
+            Ok(false) => {
+                if Instant::now() >= deadline {
+                    return Err(PrePivotStatusError::Timeout);
+                }
+                continue;
+            }
+            Err(SysError::Os(errno)) if errno == sys::EINTR => continue,
+            Err(_) => return Err(PrePivotStatusError::Io),
+        }
+        let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) else {
+            return Err(PrePivotStatusError::TooLong);
+        };
+        match (&*status).read(rest) {
+            Ok(0) => break,
+            Ok(n) => filled = filled.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(PrePivotStatusError::Io),
+        }
+        if filled > EXEC_PHASE_TAIL_MAX_BYTES {
+            return Err(PrePivotStatusError::TooLong);
+        }
+        // 完成した失敗報告（`E` 行、または `R` に続く `X` 行）は EOF を待たずに判定する。子は失敗報告の後に
+        // stderr へ同期書き込みしてから終了するため、stderr が詰まると状態 pipe が閉じず、届いた失敗コードが
+        // `Timeout` に置き換わる（REPAIR-5・CORE-5。EOF 待ちは成功候補の `R` だけの場合に限る）。
+        let got = buf.get(..filled).unwrap_or(&[]);
+        let lines = got.iter().filter(|c| **c == b'\n').count();
+        let complete_failure = match got.first() {
+            Some(b'E') => lines >= 1,
+            Some(b'R') => lines >= 2,
+            _ => false,
+        };
+        if complete_failure {
+            return ExecPhaseOutcome::decode_tail(got);
+        }
+    }
+    ExecPhaseOutcome::decode_tail(buf.get(..filled).unwrap_or(&[]))
+}
+
+/// 2 行目以降の読み取り結果を起動の成否へ判定し、entrypoint 系の違反を親で記録する（SEC-4・#2624・#2716）。
+///
+/// `Executed` だけが `Ok`。違反ありの失敗は [`audit_entrypoint_violation`] が層 `entrypoint` のレコードを 1 件書く
+/// （パスなし。時刻と PID は記録を行った親のもの）。理由なしの失敗・`ExecReturned`（`R` の後の `execveat` の
+/// errno 由来の失敗。設定の誤りか DAC / LSM の拒否で、ユーザー空間からは違反と区別できないため記録しない。
+/// カーネル側の監査が担う）・読み取り失敗は記録せず `NotApplicable`（fail-closed。記録の失敗で拒否は覆らない）。
 pub(super) fn resolve_exec_phase_status(
-    result: Result<ExecPhaseStatus, PrePivotStatusError>,
+    result: Result<ExecPhaseOutcome, PrePivotStatusError>,
     audit: LaunchAudit<'_>,
 ) -> Result<(), Box<AuditedRejection<ExecError>>> {
     match result {
-        Ok(ExecPhaseStatus::Ready) => Ok(()),
-        Ok(ExecPhaseStatus::Failed {
+        Ok(ExecPhaseOutcome::Executed) => Ok(()),
+        Ok(ExecPhaseOutcome::Failed {
             violation: Some(reason),
             ..
         }) => Err(Box::new(audit_entrypoint_violation(
@@ -565,7 +678,7 @@ pub(super) fn resolve_exec_phase_status(
             audit.container,
             audit.sink,
         ))),
-        Ok(ExecPhaseStatus::Failed {
+        Ok(ExecPhaseOutcome::Failed {
             code,
             violation: None,
         }) => Err(Box::new(AuditedRejection::not_applicable(ExecError::new(
@@ -573,12 +686,43 @@ pub(super) fn resolve_exec_phase_status(
             IsolationStage::Exec,
             "the entrypoint could not be prepared in the container child",
         )))),
+        Ok(ExecPhaseOutcome::ExecReturned { code }) => {
+            Err(Box::new(AuditedRejection::not_applicable(ExecError::new(
+                code,
+                IsolationStage::Exec,
+                "the entrypoint execveat failed in the container child",
+            ))))
+        }
         Err(e) => Err(Box::new(AuditedRejection::not_applicable(
             e.to_exec_error(),
         ))),
     }
 }
 
+/// 結合試験専用: `R` の後の `execveat` の失敗 `code` を、子の符号化（`R` と `X`）・状態 pipe・親の復号まで本番と
+/// 同じ関数で往復させる（SEC-4・#2716）。記録は発生しない（`NotApplicable`）ことの照合に使う。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn relay_exec_returned_for_test(
+    code: ErrorCode,
+    sink: &dyn AuditSink,
+    container: Option<&ContainerId>,
+) -> Result<(), Box<AuditedRejection<ExecError>>> {
+    let (r, w) = std::io::pipe().map_err(|e| {
+        Box::new(AuditedRejection::not_applicable(ExecError::from_io(
+            &e,
+            IsolationStage::Spawn,
+            "create the test pipe",
+        )))
+    })?;
+    let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+    let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+    report_exec_ready(&w).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    report_exec_returned(&w, code).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    drop(w);
+    let status = read_exec_phase_until_close(&r, Duration::from_secs(5));
+    resolve_exec_phase_status(status, LaunchAudit { sink, container })
+}
 /// 結合試験専用: entrypoint 系の違反 `reason` を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
 /// 往復させる（SEC-4・#2624）。通常の利用者は呼ばない。
 #[doc(hidden)]
@@ -600,7 +744,7 @@ pub fn relay_entrypoint_violation_for_test(
     let error = ExecError::from_violation_at(reason, None, IsolationStage::Exec);
     report_exec_failure(&w, &error).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
     drop(w);
-    let status = read_exec_phase_status(&r, Duration::from_secs(5));
+    let status = read_exec_phase_until_close(&r, Duration::from_secs(5));
     resolve_exec_phase_status(status, LaunchAudit { sink, container })
 }
 
@@ -698,22 +842,6 @@ pub(super) fn resolve_pre_pivot_status(
 }
 
 #[cfg(test)]
-fn error_code_ordinal(code: ErrorCode) -> usize {
-    match code {
-        ErrorCode::InvalidArgument => 0,
-        ErrorCode::NotFound => 1,
-        ErrorCode::AlreadyExists => 2,
-        ErrorCode::FailedPrecondition => 3,
-        ErrorCode::Unimplemented => 4,
-        ErrorCode::Internal => 5,
-        ErrorCode::PermissionDenied => 6,
-        ErrorCode::Timeout => 7,
-        ErrorCode::Unavailable => 8,
-        ErrorCode::ResourceExhausted => 9,
-    }
-}
-
-#[cfg(test)]
 fn step_ordinal(step: PrePivotStep) -> usize {
     match step {
         PrePivotStep::Establish => 0,
@@ -784,13 +912,9 @@ mod tests {
         std::fs::File::from(std::os::fd::OwnedFd::from(r))
     }
 
-    /// `ErrorCode`・段の一覧は全 variant を網羅する（足し忘れの検出。REPAIR-2）。
+    /// 段の一覧は全 variant を網羅する（`ErrorCode` は types.rs の試験）（足し忘れの検出。REPAIR-2）。
     #[test]
     fn sec4_1815_tables_cover_every_variant() {
-        for (i, c) in ALL_ERROR_CODES.into_iter().enumerate() {
-            assert_eq!(error_code_ordinal(c), i);
-        }
-        assert_eq!(ALL_ERROR_CODES.len(), 10);
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
@@ -828,7 +952,7 @@ mod tests {
     fn sec4_1815_roundtrip_every_step_code_and_reason() {
         let mut longest = 0;
         for step in PrePivotStep::ALL {
-            for code in ALL_ERROR_CODES {
+            for code in ErrorCode::ALL {
                 let mut reasons: Vec<Option<ViolationReason>> = vec![None];
                 reasons.extend(
                     ViolationReason::ALL
@@ -1299,8 +1423,9 @@ mod tests {
             let status = ExecPhaseStatus::failed_from(&error);
             let decoded = ExecPhaseStatus::decode(status.encode().as_bytes()).unwrap();
             assert_eq!(decoded, status);
+            let outcome = ExecPhaseOutcome::decode_tail(status.encode().as_bytes()).unwrap();
             let sink = VecSink::new(false);
-            let r = resolve_exec_phase_status(Ok(decoded), audit(&sink, Some(&id))).unwrap_err();
+            let r = resolve_exec_phase_status(Ok(outcome), audit(&sink, Some(&id))).unwrap_err();
             let token = reason.as_str();
             assert_eq!(r.delivery, AuditDelivery::Recorded, "{token}");
             assert_eq!(r.error.stage, IsolationStage::Exec);
@@ -1317,9 +1442,11 @@ mod tests {
     #[test]
     fn sec4_2624_resolve_exec_phase_other_outcomes() {
         let sink = VecSink::new(false);
-        assert!(resolve_exec_phase_status(Ok(ExecPhaseStatus::Ready), audit(&sink, None)).is_ok());
+        assert!(
+            resolve_exec_phase_status(Ok(ExecPhaseOutcome::Executed), audit(&sink, None)).is_ok()
+        );
         let r = resolve_exec_phase_status(
-            Ok(ExecPhaseStatus::Failed {
+            Ok(ExecPhaseOutcome::Failed {
                 code: ErrorCode::NotFound,
                 violation: None,
             }),
@@ -1383,8 +1510,199 @@ mod tests {
         // 実際の pipe 越しの往復（読み取りは期限つき）。
         let file = pipe_with(status.encode().as_bytes());
         assert_eq!(
-            read_exec_phase_status(&file, Duration::from_secs(5)),
-            Ok(status)
+            read_exec_phase_until_close(&file, Duration::from_secs(5)),
+            Ok(ExecPhaseOutcome::Failed {
+                code: ErrorCode::FailedPrecondition,
+                violation: None
+            })
         );
+    }
+
+    /// 完成した失敗報告は、状態 pipe が閉じなくても `Timeout` にならず失敗コードで返る
+    /// （子が stderr で詰まる状況の模擬。REPAIR-5・CORE-5・#2716）。
+    #[test]
+    fn repair5_2716_complete_failure_report_is_decided_without_eof() {
+        for (bytes, expected) in [
+            (
+                &b"R\nX PERMISSION_DENIED\n"[..],
+                ExecPhaseOutcome::ExecReturned {
+                    code: ErrorCode::PermissionDenied,
+                },
+            ),
+            (
+                b"E NOT_FOUND -\n",
+                ExecPhaseOutcome::Failed {
+                    code: ErrorCode::NotFound,
+                    violation: None,
+                },
+            ),
+        ] {
+            let (r, w) = std::io::pipe().unwrap();
+            let mut w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+            w.write_all(bytes).unwrap();
+            // 書き込み側は閉じない（EOF にならない）。
+            let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+            assert_eq!(
+                read_exec_phase_until_close(&r, Duration::from_secs(5)),
+                Ok(expected),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            drop(w);
+        }
+        // 成功候補の `R` だけなら EOF を待つ（閉じなければ期限で `Timeout`）。
+        let (r, w) = std::io::pipe().unwrap();
+        let mut w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+        w.write_all(b"R\n").unwrap();
+        let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        assert_eq!(
+            read_exec_phase_until_close(&r, Duration::from_millis(200)),
+            Err(PrePivotStatusError::Timeout)
+        );
+        drop(w);
+    }
+
+    /// `X` 行の具体値の符号化（ワイヤー形式の固定。SEC-4・#2716）。
+    #[test]
+    fn sec4_2716_encode_concrete_exec_returned_lines() {
+        for (code, line) in [
+            (ErrorCode::NotFound, &b"X NOT_FOUND\n"[..]),
+            (ErrorCode::PermissionDenied, b"X PERMISSION_DENIED\n"),
+            (ErrorCode::InvalidArgument, b"X INVALID_ARGUMENT\n"),
+        ] {
+            assert_eq!(ExecPhaseStatus::Returned { code }.encode().as_bytes(), line);
+            assert_eq!(
+                ExecPhaseStatus::decode(line),
+                Ok(ExecPhaseStatus::Returned { code })
+            );
+        }
+    }
+
+    /// 末尾の復号: 受理する 3 形と、拒否する形（SEC-4・#2716）。
+    #[test]
+    fn sec4_2716_decode_tail_accepts_three_shapes_and_rejects_the_rest() {
+        assert_eq!(
+            ExecPhaseOutcome::decode_tail(b"R\n"),
+            Ok(ExecPhaseOutcome::Executed)
+        );
+        assert_eq!(
+            ExecPhaseOutcome::decode_tail(b"R\nX NOT_FOUND\n"),
+            Ok(ExecPhaseOutcome::ExecReturned {
+                code: ErrorCode::NotFound
+            })
+        );
+        assert_eq!(
+            ExecPhaseOutcome::decode_tail(b"E NOT_FOUND -\n"),
+            Ok(ExecPhaseOutcome::Failed {
+                code: ErrorCode::NotFound,
+                violation: None
+            })
+        );
+        assert_eq!(
+            ExecPhaseOutcome::decode_tail(b""),
+            Err(PrePivotStatusError::ClosedBeforeReport)
+        );
+        assert_eq!(
+            ExecPhaseOutcome::decode_tail(b"R"),
+            Err(PrePivotStatusError::Truncated)
+        );
+        for bytes in [
+            &b"X NOT_FOUND\n"[..],
+            b"R\nE NOT_FOUND -\n",
+            b"R\nX FOO\n",
+            b"R\nX NOT_FOUND\nZ",
+            b"R\nX NOT_FOUND\nX NOT_FOUND\n",
+            b"R\nR\n",
+            b"E NOT_FOUND -\nX NOT_FOUND\n",
+            b"E NOT_FOUND -\nR\n",
+        ] {
+            assert!(
+                ExecPhaseOutcome::decode_tail(bytes).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    /// `ErrorCode` の全値が `X` 行として上限内に収まり、往復する（SEC-4・#2716）。
+    #[test]
+    fn sec4_2716_every_error_code_fits_and_roundtrips_as_exec_returned() {
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+            ErrorCode::Internal,
+            ErrorCode::Timeout,
+            ErrorCode::FailedPrecondition,
+        ] {
+            let mut bytes = b"R\n".to_vec();
+            bytes.extend_from_slice(ExecPhaseStatus::Returned { code }.encode().as_bytes());
+            assert!(bytes.len() <= EXEC_PHASE_TAIL_MAX_BYTES);
+            assert_eq!(
+                ExecPhaseOutcome::decode_tail(&bytes),
+                Ok(ExecPhaseOutcome::ExecReturned { code })
+            );
+        }
+    }
+
+    /// `R` と `X` が 1 回の `read` に入っても正しく復号される。EOF が無ければ期限切れ（SEC-4・REPAIR-5・#2716）。
+    #[test]
+    fn sec4_2716_read_until_close_handles_coalesced_lines_and_timeout() {
+        let file = pipe_with(b"R\nX PERMISSION_DENIED\n");
+        assert_eq!(
+            read_exec_phase_until_close(&file, Duration::from_secs(5)),
+            Ok(ExecPhaseOutcome::ExecReturned {
+                code: ErrorCode::PermissionDenied
+            })
+        );
+        let file = pipe_with(b"R\n");
+        assert_eq!(
+            read_exec_phase_until_close(&file, Duration::from_secs(5)),
+            Ok(ExecPhaseOutcome::Executed)
+        );
+        // 書き込み側を保持したまま `R` だけ書く: EOF が来ないので期限切れ。
+        let (r, w) = std::io::pipe().unwrap();
+        let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+        report_exec_ready(&w).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            read_exec_phase_until_close(&r, Duration::from_millis(200)),
+            Err(PrePivotStatusError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(w);
+    }
+
+    /// 上限を超える入力は `TooLong`（無制限に読まない。SEC-4・#2716）。
+    #[test]
+    fn sec4_2716_read_until_close_rejects_oversized_input() {
+        let big = vec![b'X'; EXEC_PHASE_TAIL_MAX_BYTES + 1];
+        let file = pipe_with(&big);
+        assert_eq!(
+            read_exec_phase_until_close(&file, Duration::from_secs(5)),
+            Err(PrePivotStatusError::TooLong)
+        );
+    }
+
+    /// `ExecReturned` は起動失敗で、記録は 0 件・分類は errno 由来のコードのまま（SEC-4・#2716）。
+    #[test]
+    fn sec4_2716_exec_returned_is_a_launch_failure_without_audit_record() {
+        let sink = VecSink::new(false);
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+        ] {
+            let r = resolve_exec_phase_status(
+                Ok(ExecPhaseOutcome::ExecReturned { code }),
+                audit(&sink, None),
+            )
+            .unwrap_err();
+            assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+            assert_eq!(r.error.code, code);
+            assert_eq!(r.error.stage, IsolationStage::Exec);
+        }
+        assert!(sink.snapshot().is_empty());
     }
 }

@@ -6,7 +6,9 @@
 //! `run_pre_pivot` が `verify_pinned` の直後（`mount_sysfs` の前）に `rootfs/proc/sys` 配下へ書く。`readonly_paths` が
 //! `/proc/sys` を読み取り専用にする前でなければ書けないため、pivot 前の段に置く。IPC 系の sysctl は書き込むプロセスの
 //! IPC namespace（`current->nsproxy`）に効くので、子が新しい IPC namespace に入った後なら、書かれるのはコンテナ側の値で
-//! ホストの値は変わらない。
+//! ホストの値は変わらない。pod の user・ipc namespace へ join する起動（`oci_runtime::NamespaceJoin`。#2674）では、
+//! 中間プロセスが join した後に子がこの段を通るため、書かれるのは共有された pod の IPC namespace の値になる（join 先は
+//! 自身の子の user namespace が所有するものに限られ、ホストの IPC namespace ではない）。
 //!
 //! ```text
 //! prepare_rootfs -> verify_pinned -> apply_sysctls(&isolation, &prepared, &plan) -> mount_sysfs
@@ -57,7 +59,8 @@ pub(crate) struct SysctlPlan<'a> {
 }
 
 impl<'a> SysctlPlan<'a> {
-    /// `set` が要る名前空間がすべて `effective`（子が実際に新しく作る名前空間）にあるときだけ計画を作る。
+    /// `set` が要る名前空間がすべて `effective`（子が新しく作るか、pod の namespace へ join する名前空間。ホストの
+    /// 名前空間のまま残すものは含まない）にあるときだけ計画を作る。
     ///
     /// 空集合は `Ok(None)`（何も適用しない）。足りない名前空間があれば、その種別を `Err` で返す
     /// （IPC 系は IPC namespace、`net.*` は network namespace が要る。network namespace は launcher が未対応のため

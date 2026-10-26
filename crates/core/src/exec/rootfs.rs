@@ -950,6 +950,7 @@ mod tests {
         MountIsolation {
             mnt_ns: thread_ns_link("mnt").unwrap(),
             pid_ns: thread_ns_link("pid").unwrap(),
+            host_slave_clones: Default::default(),
             _not_send: std::marker::PhantomData,
         }
     }

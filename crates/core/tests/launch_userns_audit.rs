@@ -95,6 +95,33 @@ fn sec4_2624_every_entrypoint_reason_reaches_parent_audit() {
     }
 }
 
+/// SEC-4・#2716: `R` の後の `execveat` の errno 由来の失敗（`X` 行）は、親で起動失敗になるが、違反ではないため
+/// 監査には記録されない（`NotApplicable`・記録 0 件）。errno の分類（`ErrorCode`）はそのまま届く。
+#[test]
+fn sec4_2716_execveat_failure_after_ready_is_a_failure_without_audit_record() {
+    use fandhe_container_core::exec::relay_exec_returned_for_test;
+    use fandhe_container_core::traits::ContainerId;
+    use fandhe_container_core::traits::types::ErrorCode;
+
+    let id = ContainerId::new("c2716").unwrap();
+    for code in [
+        ErrorCode::NotFound,
+        ErrorCode::PermissionDenied,
+        ErrorCode::InvalidArgument,
+        ErrorCode::Internal,
+    ] {
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let r = relay_exec_returned_for_test(code, &sink, Some(&id)).unwrap_err();
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable, "{code:?}");
+        assert_eq!(r.error.code, code);
+        assert_eq!(
+            r.error.message,
+            "the entrypoint execveat failed in the container child"
+        );
+        assert!(sink.0.lock().unwrap().is_empty(), "{code:?}");
+    }
+}
+
 /// SEC-4・#2624: entrypoint 系ではない理由（マウント層の `NoNamespaces`）は子の符号化で落ち、記録されない。
 #[test]
 fn sec4_2624_non_entrypoint_reason_is_not_recorded() {

@@ -10,17 +10,19 @@
 | 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔#1917・状態ルート配下の source の拒否〕で現状は拒否される。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
-| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（start.rs で拒否。SEC-5） → cri | core → cri | #2667 |
+| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み | core → cri | #2667 |
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み | core → cri | #2668 |
-| 7 | mount の propagation（rslave / rshared） | core の `bind_mounts.rs` が拒否・`linux.rootfsPropagation` | core → cri | #2669 |
+| 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
 | 8 | sysctls（namespaced のみ） | core の `linux.sysctl` の適用 → cri。IPC 系は本変更で実装済み。`net.*` は順 13 まで `UNIMPLEMENTED` | core → cri | #2670 |
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671 |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
-| 12 | pod の pid / ipc の共有（join） | core の `linux.namespaces[].path` の拒否 | core → cri | #2674 |
+| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未決のため本番では常に新しい namespace。pid の共有は未対応 | core → cri | #2674 |
 | 13 | pod netns の作成・結線 | core の network namespace の拒否・plugin-cri `netsetup` の `create_netns` | net・core・cri | #2675 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`。順 13 が前提 | net・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
+
+受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
 本表の外の項目（tty / stdin・readonly_rootfs・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
 
@@ -70,8 +72,28 @@ CRI の `LinuxContainerSecurityContext.run_as_username` は、`ImageRootfsSource
 既知の差:
 
 - 数字だけの `run_as_username` は拒否する（containerd は uid 扱いだが、CRI の「passwd に存在すること」を満たさない。数値は `run_as_user` を使う）
-- `/etc/group` の所属から補助グループは作らない（core が `additionalGids` を未受理のため。権限は弱い側に倒れる。順 5）
+- 実効 uid が 0 のコンテナにはイメージの `/etc/group` 由来の補助グループを付けない。主 gid を `additionalGids` へ足さない（containerd の `ensureAdditionalGids` との差。いずれも権限が弱い側に倒れる。#2667）
+- passwd を安全に読めず実効ユーザーの名前を決められないときも、イメージ由来のグループは付けない（権限が弱い側。明示した `run_as_user` の起動を passwd の不備で止めない）
 - uid のみで gid 0 に落とす挙動は runc / containerd の `GetExecUser` に合わせたもので、実装時に一次情報との再照合は行っていない（食い違いが見つかれば未解決へ倒す）
+
+## supplemental_groups の受け入れ方式（CRI-2・SEC-5・CORE-6。#2667）
+
+コンテナ側の `supplemental_groups` と `supplemental_groups_policy` を受け入れ、`process.user.additionalGids` へ写す。core の launcher が fork の前に user namespace の gid 写像と照合し、子の capability 削減段が `setgroups(list)` で適用して `getgroups` で読み戻す。
+
+| 要求 | 結果 |
+| ---- | ---- |
+| 値が負・`4294967295`（`u32::MAX`）・範囲外 | `INVALID_ARGUMENT`（`validate_config` でも拒否） |
+| ポリシーが `Merge`(0)・`Strict`(1) 以外 | `INVALID_ARGUMENT` |
+| `Merge`（既定） | イメージの `/etc/group` 由来 → CRI の一覧の順。重複は最初のものを残す |
+| `Strict` | CRI の一覧だけ |
+| 実効 uid が 0 | イメージ由来は付けない。CRI の明示した一覧は付ける |
+| 合計が 65,536 超 | `FAILED_PRECONDITION` |
+| sandbox 側の `supplemental_groups` | 値を検証して受け入れ、適用先が無いため出力しない |
+| 範囲写像で gid が写像外 | start で `FAILED_PRECONDITION`（fork 前） |
+| 単一 ID 写像で非空 | start で `FAILED_PRECONDITION`（`setgroups` が `deny` のため。黙って落とさない） |
+| `/etc/group` が symlink・FIFO・上限超過（uid 非 0 で名前が決まったとき） | `FAILED_PRECONDITION`。不在は空 |
+
+exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPLEMENTED` で拒否する。`ContainerStatus.user` の報告と `RuntimeHandlerFeatures` の `supplemental_groups_policy` は未対応。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 
@@ -155,5 +177,39 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 - 適用は pivot 前段 `apply_sysctls`（`verify_pinned` の直後。`readonly_paths` が `/proc/sys` を ro にする前）で、`rootfs/proc/sys` へ fd 起点・`O_NOFOLLOW`・procfs の `f_type` 照合つきで 1 回の `write` で書く。存在しないキー・不正な値は起動を止める。
 - 既知の差: runc は `/` 区切りのキーも受けるが、許可リストのすり抜けを防ぐため本実装は `.` 区切りだけ。
-- pod の名前空間共有は未実装のため、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似（#2674）。
-- rootless で IPC 系 sysctl に書けるかは、その IPC namespace を所有する user namespace を、書き込む側のプロセスが持っているかに依存する。本実装は新しい user namespace と IPC namespace を同時に作るため、コンテナの root が所有者となり書ける。書けない環境では `PermissionDenied` で起動が失敗する(fail-closed。黙って無視しない)。確認済み: `production_launcher` のシナリオ U(`kernel.shmmax`)が `platform-ci` の ubuntu-latest(非 root・委譲 cgroup)で成功行を出す(PR #2733 の CI で合格)。他のカーネル・配布物・LSM(AppArmor 等)の構成での確認は未実施で、そうした環境で `PermissionDenied` となる場合は、シナリオ U と `ci.yml` の成功行の照合が失敗する(環境の前提不足として扱い、照合は緩めない)。
+- pod の ipc 共有（下記「pod の ipc 共有の受け入れ方式」。#2674）で join する起動では、共有された pod の IPC namespace へ書く（同じ pod の各コンテナが同じ pod の値を書く）。cri の供給元（保持役）がまだ無い間は、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似になる。
+- rootless で IPC 系 sysctl に書けるかは、その IPC namespace を所有する user namespace を、書き込む側のプロセスが持っているかに依存する。新しい namespace を作る起動では user namespace と IPC namespace を同時に作るため、コンテナの root が所有者となり書ける。pod の user・ipc namespace へ join する起動でも、join 先の IPC namespace を所有するのは同時に join する pod の user namespace（core が照合する）のため同じ条件になるが、join と sysctl を併用した実機確認は未実施。書けない環境では `PermissionDenied` で起動が失敗する(fail-closed。黙って無視しない)。確認済み: `production_launcher` のシナリオ V(`kernel.shmmax`)が `platform-ci` の ubuntu-latest(非 root・委譲 cgroup)で成功行を出す(PR #2733 の CI で合格)。他のカーネル・配布物・LSM(AppArmor 等)の構成での確認は未実施で、そうした環境で `PermissionDenied` となる場合は、シナリオ U と `ci.yml` の成功行の照合が失敗する(環境の前提不足として扱い、照合は緩めない)。
+
+## pod の ipc 共有の受け入れ方式（CRI-2・CORE-3。#2674）
+
+### core の検査（`oci_runtime::NamespaceJoin`。すべて fork・予約の前）
+
+`linux.namespaces[].path` は `user` と `ipc` を組で指す場合だけ受ける。非特権では ipc namespace への `setns` が、参加先を所有する user namespace と現在の user namespace の両方で `CAP_SYS_ADMIN` を要するため、pod の user namespace に先に参加する形でしか成立しない（k8s の pod 単位の userns と同じ形）。
+
+| 検査 | 不合格 |
+| ---- | ------ |
+| 絶対パス・`..` なし・4096 バイト以内 | `InvalidArgument` |
+| 開けない | `FailedPrecondition`（権限不足は `PermissionDenied`） |
+| nsfs でない・`NS_GET_NSTYPE` が宣言と違う | `InvalidArgument` |
+| user: 自身の namespace・親が自身の namespace でない・作成者 uid が euid と違う | `PermissionDenied` |
+| ipc: 所有する user namespace が join 先と違う | `PermissionDenied` |
+| pid / mount / uts 等の path、片方だけの path | `Unimplemented` |
+
+path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod へ入る TOCTOU を閉じる）。中間プロセスは `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を権限モデルの期待値と完全一致で照合（SEC-5）→ pid・mount・uts を `unshare` する。`--ipc=host` との併用は `InvalidArgument`。
+
+### cri の出力
+
+| 要求 | 供給元 | 出力 |
+| ---- | ------ | ---- |
+| ipc `POD` | あり | ipc と user を `path` つき（join） |
+| ipc `POD` | 無し | 新しい namespace |
+| ipc `CONTAINER` | 問わない | 新しい namespace |
+| ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
+| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`） |
+
+`/proc/<pid>` を Create の時点で書く方式は pid の再利用で別 pod の namespace に入り得るため採らない。
+
+### 既知の差と残り
+
+- `/dev/shm`（POSIX shm）は共有されない（コンテナごとの tmpfs）。SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
+- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、`NamespaceMode::TARGET`。

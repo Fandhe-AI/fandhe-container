@@ -47,6 +47,15 @@ const TRAIT_CODES: [(ErrorCode, Code); 10] = [
     (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
 ];
 
+/// REPAIR-1・ERR-3: 区分表が `ErrorCode::ALL` の全 variant を過不足なく持つ（足し忘れの検出）。
+#[test]
+fn err3_trait_codes_table_covers_every_error_code() {
+    assert_eq!(TRAIT_CODES.len(), ErrorCode::ALL.len());
+    for c in ErrorCode::ALL {
+        assert!(TRAIT_CODES.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+    }
+}
+
 /// 操作ごとに失敗コードを注入できるフェイクの実行層。
 #[derive(Default)]
 struct FakeRuntime {

@@ -56,8 +56,8 @@
 //!   macOS / Windows ではコンテナはゲスト VM（Linux）内で実行されるため、ホスト側から
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
-//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と supervisor（TASK-157）を想定し、fork 段は
-//!   [`spawn_container`]（#831）が担う
+//! - 製品コードの呼び出し元は本番 launcher（`ProductionLauncher`。`spawn_container_via_intermediate`）で、
+//!   fork 段の最小入口 [`spawn_container`]（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
@@ -206,6 +206,10 @@ pub(crate) use launch_status::LaunchAudit;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_entrypoint_violation_for_test;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・#2716。`R` の後の `execveat` の失敗の往復。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_exec_returned_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -523,8 +527,9 @@ pub fn record_launch_mount_rejection<E>(
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
 /// [`record_entrypoint_rejection`] を使う。本番 launcher の launch 経路は配線済み（#2624。`launch_intermediate` が
 /// 状態 pipe の exec 前の 2 行目〔`R`/`E`〕から違反を引き直し、親〔C〕でこの関数を呼んで 1 拒否 1 件を記録する）。
-/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。何も報告しない）と、`R` の後の `execveat`
-/// 自体の失敗（errno 由来で違反ではないため記録しない）。TASK-29 / TASK-157 系。
+/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。製品コードからの呼び出し元が無いため配線しない
+/// と決定〔#2716〕。製品の入口を足すときは状態 pipe 付きの経路を通すこと）。`R` の後の `execveat` 自体の失敗は
+/// `X` 行で起動失敗になるが、違反ではないため記録しない（#2716）。TASK-29 / TASK-157 系。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
@@ -1045,6 +1050,9 @@ pub struct MountIsolation {
     /// プロセス自身の PID namespace（`ns/pid`）を映すため、子向けの `pid_for_children`
     /// ではなくこちらを束縛する。
     pid_ns: String,
+    /// `rslave` の bind について、`/` の再帰 private 化の前に複製した元（`establish_with` が作り、`mount_binds` が取り出す。
+    /// 無ければ空。#2669・OCI-4・CRI-2）。
+    host_slave_clones: bind_mounts::HostSlaveClones,
     /// `!Send`・`!Sync` にするための印（生ポインタは Send / Sync でない）。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1204,7 +1212,8 @@ impl MountIsolation {
     ///    （判定は `check_establish_preconditions`）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
-    ///    外へ伝播させない）
+    ///    外へ伝播させない）。ただし `establish_with` に `rslave` の bind があれば、private 化の前に
+    ///    その元を複製する（#2669）
     /// 3. `unshare` の前後で `/proc/thread-self/ns/mnt` が変わったことを確かめ、作成直後の
     ///    mount namespace と PID namespace を証跡に記録する
     ///
@@ -1226,6 +1235,19 @@ impl MountIsolation {
     /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
     /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
+        Self::establish_with(None)
+    }
+
+    /// [`Self::establish`] の本体。`binds` に `rslave` の bind があれば、`unshare(CLONE_NEWNS)` の直後・`/` の再帰 private 化の前に、
+    /// その元を固定してホスト側が shared か slave であることを確かめ、複製する（#2669・OCI-4・CRI-2・SEC-1）。
+    ///
+    /// 再帰 private 化は接続済みの木の `master` 関係をすべて消すため、`rslave` は private 化の前に複製しておかないと表現できない
+    /// （複製は匿名 namespace にあり、private 化の対象にならない）。`/` 自体は従来どおり再帰 private のままで、複製を `mount_binds` が
+    /// 付け替えるまでの間も、ホストへの伝播は起きない（slave は受けるだけ）。元がホスト側で private なら、rootfs に触れる前に
+    /// `FAILED_PRECONDITION` で失敗する。`binds` が `None` か `rslave` を含まなければ [`Self::establish`] と同じ。
+    pub(crate) fn establish_with(
+        binds: Option<&crate::oci_runtime::BindMountSet>,
+    ) -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -1251,6 +1273,10 @@ impl MountIsolation {
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare(CLONE_NEWNS)"))?;
+        let host_slave_clones = match binds {
+            Some(set) if set.has_host_slave() => bind_mounts::clone_host_slave_sources(set)?,
+            _ => bind_mounts::HostSlaveClones::default(),
+        };
         sys::mount_root_private_recursive().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
         })?;
@@ -1262,8 +1288,14 @@ impl MountIsolation {
         Ok(Self {
             mnt_ns,
             pid_ns,
+            host_slave_clones,
             _not_send: std::marker::PhantomData,
         })
+    }
+
+    /// `establish_with` が複製した `rslave` の元の置き場（`mount_binds` が取り出す）。
+    fn host_slave_clones(&self) -> &bind_mounts::HostSlaveClones {
+        &self.host_slave_clones
     }
 
     /// 呼び出し元の現在の状態（PID・スレッドの mount / PID namespace）が証跡と一致するか。
@@ -1303,6 +1335,28 @@ pub struct IsolationPlan {
     hostname: Option<Hostname>,
     uid_mapping: IdMapping,
     gid_mapping: IdMapping,
+    /// `Mount` を含むときの `/` の再帰的な伝播（既定は private。`rslave` の bind を求める起動だけ slave。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl IsolationPlan {
+    /// `rslave` の bind mount を求める起動のとき、`/` を `MS_REC|MS_SLAVE` にする（既定は `MS_REC|MS_PRIVATE`）。
+    ///
+    /// ホストの peer group との master 関係を、PID 1 側の `MountIsolation::establish_with` が元を複製するまで残すための
+    /// 選択で、外へは伝播しない（slave は受けるだけ）。launcher が `BindMountSet::has_host_slave` で決める（OCI-4・CRI-2・SEC-1）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
+}
+
+/// `rslave` を求めるかから `/` の伝播を決める。
+const fn root_propagation_of(host_slave: bool) -> sys::RootPropagation {
+    if host_slave {
+        sys::RootPropagation::Slave
+    } else {
+        sys::RootPropagation::Private
+    }
 }
 
 /// rootful 経路の検証済み計画。[`plan_rootful_host_root`] だけが作り、
@@ -1365,6 +1419,7 @@ fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationP
         hostname: config.hostname.clone(),
         uid_mapping: IdMapping::single(euid),
         gid_mapping: IdMapping::single(egid),
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1433,6 +1488,7 @@ pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
         plan.namespaces,
         plan.hostname.as_ref(),
         Some((plan.uid_mapping, plan.gid_mapping)),
+        plan.root_propagation,
     )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootlessSingleId,
@@ -1455,7 +1511,12 @@ pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<Isolation
             None,
         ));
     }
-    unshare_and_configure(plan.namespaces, plan.hostname.as_ref(), None)?;
+    unshare_and_configure(
+        plan.namespaces,
+        plan.hostname.as_ref(),
+        None,
+        sys::RootPropagation::Private,
+    )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootfulHostRoot,
         namespaces: plan.namespaces,
@@ -1481,6 +1542,16 @@ pub struct SubordinateIsolationPlan {
     timeout: Duration,
     euid: u32,
     egid: u32,
+    /// `Mount` を含むときの `/` の再帰的な伝播（[`IsolationPlan`] の同名の項目と同じ。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl SubordinateIsolationPlan {
+    /// [`IsolationPlan::with_host_slave_root`] と同じ（範囲写像の経路）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
 }
 
 /// [`isolate_rootless_subordinate`] の成功結果。[`IsolationReport`] は拡張できない型のため、
@@ -1551,6 +1622,7 @@ fn plan_subordinate_for(
         timeout,
         euid,
         egid,
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1576,6 +1648,109 @@ pub fn plan_rootless_subordinate(
         sys::effective_uid(),
         sys::effective_gid(),
     )
+}
+
+/// 中間プロセス I が、pod の user・ipc namespace へ join して残りを分離する(CRI-2・CORE-3・SEC-1・SEC-5。#2674)。
+///
+/// 本番 launcher の中間プロセス(`launch_intermediate`)だけが、`NamespaceJoin` があるときに [`isolate`] /
+/// [`isolate_rootless_subordinate`] の代わりに呼ぶ。`plan` は通常どおり検証済みの計画(`User`・`Ipc` を含む。
+/// 権限モデルの写像と hostname を持つ)で、join では `User`・`Ipc` を作らず参加する。
+///
+/// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
+/// 写像と **完全一致** することを確かめる(不一致は `FailedPrecondition`。コンテナ内 root をホストの非特権 UID へ
+/// 写す SEC-5 と `process.user` の照合の前提を、参加先の userns でも保つ) → 残りの namespace(pid・mount・uts)を
+/// `unshare` → `/` を再帰 private 化 → hostname。
+///
+/// 前提: 単一スレッドで `fs_struct` を共有しない fork 子から呼ぶ(`setns(CLONE_NEWUSER)` の条件。満たさなければ
+/// カーネルが `EINVAL`)。mapper・holder・`newuidmap` は使わない(写像は参加先に書き込み済み)。失敗したら
+/// プロセスを破棄すること([`isolate`] と同じ)。
+pub(crate) fn isolate_join(
+    plan: IntermediatePlan<'_>,
+    join: &crate::oci_runtime::NamespaceJoin,
+) -> Result<(), ExecError> {
+    let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+    let (identity_ok, namespaces, hostname, uid, gid, root_propagation): (
+        _,
+        _,
+        _,
+        Vec<IdMapping>,
+        Vec<IdMapping>,
+        _,
+    ) = match plan {
+        IntermediatePlan::SingleId(p) => (
+            euid == p.uid_mapping.host_id && egid == p.gid_mapping.host_id,
+            p.namespaces,
+            p.hostname.as_ref(),
+            vec![p.uid_mapping],
+            vec![p.gid_mapping],
+            p.root_propagation,
+        ),
+        IntermediatePlan::Subordinate(p) => (
+            euid == p.euid && egid == p.egid,
+            p.namespaces,
+            p.hostname.as_ref(),
+            p.uid.entries().to_vec(),
+            p.gid.entries().to_vec(),
+            p.root_propagation,
+        ),
+    };
+    if !identity_ok {
+        return Err(ExecError::from_violation(
+            ViolationReason::IdentityChanged,
+            None,
+        ));
+    }
+    // 呼び出し元が non-dumpable だった場合は、参加後も保つ(範囲写像の経路と同じ。資格情報の更新で dumpable が変わる環境でも
+    // 戻す方向にだけ動かす。同じ uid のホスト側プロセスが ptrace・`/proc/<pid>/fd` で触れる窓を作らない)。
+    let was_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    sys::setns_fd(join.user_fd(), NsFlag::User)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(user)"))?;
+    if was_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
+    sys::setns_fd(join.ipc_fd(), NsFlag::Ipc)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(ipc)"))?;
+    verify_joined_id_maps(
+        |kind| {
+            let target = rootless::TargetPid::new(std::process::id())?;
+            rootless::read_id_map_of(&rootless::ProcHandle::open(target)?, kind)
+        },
+        &uid,
+        &gid,
+    )?;
+    let rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
+    if !rest.is_empty() {
+        unshare_and_configure(rest, hostname, None, root_propagation)?;
+    }
+    Ok(())
+}
+
+/// 参加した user namespace の写像(`read` が返す `/proc/self/{uid,gid}_map` の内容)が、計画の期待値と完全一致する
+/// ことを確かめる(SEC-5。pod の userns が別の権限モデル・別の範囲で作られていれば起動しない)。
+fn verify_joined_id_maps(
+    read: impl Fn(rootless::IdKind) -> Result<Vec<IdMapping>, RootlessError>,
+    uid: &[IdMapping],
+    gid: &[IdMapping],
+) -> Result<(), ExecError> {
+    for (kind, expected) in [(rootless::IdKind::Uid, uid), (rootless::IdKind::Gid, gid)] {
+        let got = read(kind).map_err(|e| {
+            ExecError::new(
+                e.code,
+                IsolationStage::UserNamespaceMap,
+                "read the joined id map",
+            )
+        })?;
+        if got != expected {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::UserNamespaceMap,
+                "the pod user namespace id mapping does not match the expected mapping",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 呼び出し元が `sys::fork_single_threaded` で fork した子 `pid` を、期限つきで待って回収する(REPAIR-5)。
@@ -1774,7 +1949,7 @@ fn isolate_rootless_subordinate_with(
 
     let rest = plan.namespaces.without(Namespace::User);
     if !rest.is_empty() {
-        unshare_and_configure(rest, plan.hostname.as_ref(), None)?;
+        unshare_and_configure(rest, plan.hostname.as_ref(), None, plan.root_propagation)?;
     }
     let container_root = |host_id| IdMapping {
         container_id: 0,
@@ -2088,6 +2263,7 @@ fn unshare_and_configure(
     namespaces: NamespaceSet,
     hostname: Option<&Hostname>,
     mappings: Option<(IdMapping, IdMapping)>,
+    root_propagation: sys::RootPropagation,
 ) -> Result<(), ExecError> {
     sys::unshare_namespaces(&namespaces.flags())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare"))?;
@@ -2100,8 +2276,12 @@ fn unshare_and_configure(
     }
 
     if namespaces.contains(Namespace::Mount) {
-        sys::mount_root_private_recursive().map_err(|e| {
-            ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
+        sys::mount_root_recursive(root_propagation).map_err(|e| {
+            let what = match root_propagation {
+                sys::RootPropagation::Private => "mount(MS_PRIVATE)",
+                sys::RootPropagation::Slave => "mount(MS_SLAVE)",
+            };
+            ExecError::from_sys(e, IsolationStage::MountPrivate, what)
         })?;
     }
 
@@ -2561,6 +2741,59 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// SEC-5・CORE-3（#2674）: 参加した user namespace の写像は、計画の期待値と完全一致するときだけ受ける。
+    #[test]
+    fn sec5_joined_id_maps_must_match_the_plan_exactly() {
+        let single = |host| IdMapping {
+            container_id: 0,
+            host_id: host,
+            count: 1,
+        };
+        let read_ok = |kind: rootless::IdKind| {
+            rootless::parse_id_map(match kind {
+                rootless::IdKind::Uid => b"         0       1000          1\n",
+                rootless::IdKind::Gid => b"         0       1001          1\n",
+            })
+        };
+        verify_joined_id_maps(read_ok, &[single(1000)], &[single(1001)]).expect("exact match");
+        // uid が違う・gid が違う・行が足りない / 余る はいずれも FailedPrecondition。
+        for (uid, gid) in [
+            (vec![single(1002)], vec![single(1001)]),
+            (vec![single(1000)], vec![single(1000)]),
+            (
+                vec![
+                    single(1000),
+                    IdMapping {
+                        container_id: 1,
+                        host_id: 100_000,
+                        count: 65_536,
+                    },
+                ],
+                vec![single(1001)],
+            ),
+            (vec![], vec![single(1001)]),
+        ] {
+            let err = verify_joined_id_maps(read_ok, &uid, &gid).expect_err("mismatch");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::UserNamespaceMap);
+        }
+        // 範囲写像(subuid)の複数行も順序つきで一致を要する。
+        let range = [
+            single(1000),
+            IdMapping {
+                container_id: 1,
+                host_id: 100_000,
+                count: 65_536,
+            },
+        ];
+        let read_range =
+            |_: rootless::IdKind| rootless::parse_id_map(b"0 1000 1\n1 100000 65536\n");
+        verify_joined_id_maps(read_range, &range, &range).expect("range match");
+        // 読み取りの失敗はそのままエラー(通過させない)。
+        let failing = |_: rootless::IdKind| rootless::parse_id_map(b"x y z");
+        assert!(verify_joined_id_maps(failing, &range, &range).is_err());
+    }
+
     fn cfg(namespaces: NamespaceSet, hostname: Option<&str>) -> IsolationConfig {
         IsolationConfig {
             namespaces,
@@ -2897,6 +3130,21 @@ mod tests {
         );
     }
 
+    /// OCI-4・CRI-2（#2669）: `/` の伝播は既定が private で、`rslave` の bind を求める起動だけ slave にできる。
+    #[test]
+    fn oci4_plan_root_propagation_defaults_to_private_and_opts_into_slave() {
+        let p = plan_for(&cfg(NamespaceSet::all(), None), 4242, 4242).unwrap();
+        assert_eq!(p.root_propagation, sys::RootPropagation::Private);
+        let slave = p.clone().with_host_slave_root(true);
+        assert_eq!(slave.root_propagation, sys::RootPropagation::Slave);
+        assert_eq!(
+            slave.with_host_slave_root(false).root_propagation,
+            sys::RootPropagation::Private
+        );
+        assert_eq!(root_propagation_of(true), sys::RootPropagation::Slave);
+        assert_eq!(root_propagation_of(false), sys::RootPropagation::Private);
+    }
+
     const STATUS_PID1: &str = "Name:\tx\nNSpid:\t4321\t1\nThreads:\t1\n";
 
     /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
@@ -3085,6 +3333,7 @@ mod tests {
         MountIsolation {
             mnt_ns: mnt_ns.to_string(),
             pid_ns: pid_ns.to_string(),
+            host_slave_clones: Default::default(),
             _not_send: std::marker::PhantomData,
         }
     }

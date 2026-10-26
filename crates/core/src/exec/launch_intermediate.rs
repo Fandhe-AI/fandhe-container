@@ -78,7 +78,7 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    ALL_ERROR_CODES, LaunchAudit, PrePivotStatusError, read_exec_phase_status, read_line_bounded,
+    LaunchAudit, PrePivotStatusError, read_exec_phase_until_close, read_line_bounded,
     read_pre_pivot_status, resolve_exec_phase_status, resolve_pre_pivot_status,
 };
 use super::process::{
@@ -226,10 +226,7 @@ impl IntermediateReport {
         match parts.as_slice() {
             ["K", pid] => Ok(Self::Pid1(parse_pid(pid)?)),
             ["R", code, phase] => {
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let phase =
                     IntermediatePhase::from_token(phase).ok_or(PrePivotStatusError::Malformed)?;
                 Ok(Self::Failed { code, phase })
@@ -410,6 +407,8 @@ fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), Pre
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
     plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(あれば `isolate` は作成ではなく参加する。#2674)。
+    join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -431,6 +430,10 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         // 作らずに失敗させる(fail-closed)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
+        // pod の namespace へ join する起動は mapper・holder を使わず、参加先の写像を計画と照合する(#2674)。
+        if let Some(join) = self.join {
+            return super::isolate_join(self.plan, join);
+        }
         match self.plan {
             IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
             // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。
@@ -506,6 +509,8 @@ pub(crate) enum IntermediatePlan<'a> {
 pub(crate) struct IntermediateSpec<'a> {
     /// 検証済みの分離計画(euid 0 の写像は計画の段階で拒否済み。SEC-5)。
     pub(crate) plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(`None` なら新しく作る。CRI-2・CORE-3。#2674)。
+    pub(crate) join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。
@@ -525,8 +530,8 @@ pub(crate) struct IntermediateSpec<'a> {
 /// (`P`)の後は seccomp の listener を受け取り、さらに PID 1 が `execveat` の直前に書く 2 行目(`R`)まで読んで成功とする。
 /// エントリポイントの検証の失敗(`E`。entrypoint 系の違反 8 理由。`launch_status` の「exec 前の 2 行目」)は起動失敗として
 /// 返り、違反ありなら C が `audit_entrypoint_violation` で層 `entrypoint` に 1 件記録する(SEC-4・#2624)。
-/// 本入口が返った後の失敗は、`R` の後の `execveat` 自体の errno 由来の失敗で、PID 1 の終了として観測される
-/// (違反ではないため記録の対象外)。
+/// `R` の後の `execveat` 自体の errno 由来の失敗は、PID 1 が `X <CODE>` を書き、C が `R` の後も EOF まで読んで
+/// 起動失敗にする(違反ではないため記録の対象外。#2716)。EOF が来なければ期限切れで失敗にして PID 1 を回収する。
 ///
 /// `dev.tty.legacy_tiocsti` の警告(CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739・#2008): 中間プロセスの fork に成功した
 /// 後、C の側で 1 回だけ、host の値が `1` のときに固定の 1 行を C の stderr へ出す(従来経路
@@ -545,6 +550,7 @@ pub(crate) fn spawn_container_via_intermediate(
 ) -> Result<LaunchedChild, Box<PreparedLaunchFailure>> {
     let IntermediateSpec {
         plan,
+        join,
         rootfs,
         entry,
         setup,
@@ -555,6 +561,7 @@ pub(crate) fn spawn_container_via_intermediate(
         |status, report, gate_r, listener_end| {
             let mut ops = RealIntermediateOps {
                 plan,
+                join,
                 rootfs,
                 entry,
                 stages: Some(stages),
@@ -755,7 +762,7 @@ fn launch_via_intermediate(
             // 順序の根拠: PID 1 は ACK を待ってからエントリポイントの検証へ進み、C は上の `P` の判定より前に listener を
             // 受け取らない。したがって 2 行目は `P` を読み終えた後にしか書かれず、2 行が 1 回の `read` に混ざらない。
             Ok(listener) => {
-                let exec_phase = read_exec_phase_status(&status_r, remaining());
+                let exec_phase = read_exec_phase_until_close(&status_r, remaining());
                 match resolve_exec_phase_status(exec_phase, audit) {
                     Ok(()) => Ok(LaunchedChild {
                         child,
@@ -1365,8 +1372,8 @@ mod tests {
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
     use crate::exec::launch_status::{
-        PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
-        report_ready,
+        PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
+        report_exec_returned, report_failure, report_ready,
     };
     use crate::exec::process::ChildExit;
     use crate::traits::{ContainerId, TraitError};
@@ -1425,7 +1432,7 @@ mod tests {
     /// REPAIR-2: 全 `ErrorCode` と全段が往復でき、最長の行が上限に収まる。
     #[test]
     fn repair2_every_code_and_phase_fits_and_roundtrips() {
-        for code in ALL_ERROR_CODES {
+        for code in ErrorCode::ALL {
             for phase in IntermediatePhase::ALL {
                 let report = IntermediateReport::Failed { code, phase };
                 let encoded = report.encode();
@@ -1871,16 +1878,20 @@ mod tests {
     enum Handoff {
         /// 実 listener を載せて送り、ACK を待って exec 前の `R` を書き、0 で終了する(正常)。
         Good,
-        /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて眠る(SEC-4・#2624)。
+        /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて終了する(SEC-4・#2624)。
         ExecViolation,
-        /// ACK の後に理由なしの失敗 `E NOT_FOUND -` を書いて眠る(記録されない)。
+        /// ACK の後に理由なしの失敗 `E NOT_FOUND -` を書いて終了する(記録されない)。
         ExecFailureWithoutReason,
-        /// ACK の後に許可リスト外の理由(`E PERMISSION_DENIED target_moved`)を書いて眠る(`Malformed`)。
+        /// ACK の後に許可リスト外の理由(`E PERMISSION_DENIED target_moved`)を書いて終了する(`Malformed`)。
         ExecForeignReason,
         /// ACK の後に 2 行目を書かずに終了する(EOF)。
         ExecSilentExit,
         /// ACK の後に 2 行目を書かずに眠る(期限切れ)。
         ExecSilentSleep,
+        /// ACK の後に `R` と `X NOT_FOUND` を書いて終了する(`execveat` が errno で失敗。起動失敗・記録なし。#2716)。
+        ExecReturned,
+        /// ACK の後に `R` を書き、書き込み側を持ったまま眠る(EOF が来ない。期限切れで失敗・回収。#2716)。
+        ExecReadyThenSleep,
         /// `P` を報告して何も送らずに終了する(EOF で即時に失敗するはず)。
         NoSend,
         /// listener ではない fd(pipe)を送る(種別の不一致)。
@@ -1957,7 +1968,9 @@ mod tests {
                         | Handoff::ExecFailureWithoutReason
                         | Handoff::ExecForeignReason
                         | Handoff::ExecSilentExit
-                        | Handoff::ExecSilentSleep => {
+                        | Handoff::ExecSilentSleep
+                        | Handoff::ExecReturned
+                        | Handoff::ExecReadyThenSleep => {
                             if sender
                                 .hand_over(child_listener(), Duration::from_secs(10))
                                 .is_err()
@@ -1986,17 +1999,26 @@ mod tests {
                                         ),
                                     );
                                 }
+                                Handoff::ExecReturned => {
+                                    let _ = report_exec_ready(s);
+                                    let _ = report_exec_returned(s, ErrorCode::NotFound);
+                                }
+                                Handoff::ExecReadyThenSleep => {
+                                    let _ = report_exec_ready(s);
+                                }
                                 Handoff::ExecForeignReason => {
                                     let _ = w.write_all(b"E PERMISSION_DENIED target_moved\n");
                                 }
                                 _ => {}
                             }
-                            if mode == Handoff::ExecSilentExit {
-                                0
-                            } else {
+                            // 実際の子は `E` を書いた後に終了する(親は EOF まで読む。#2716)。眠るのは無報告の試験だけ。
+                            if matches!(
+                                mode,
+                                Handoff::ExecSilentSleep | Handoff::ExecReadyThenSleep
+                            ) {
                                 std::thread::sleep(Duration::from_secs(120));
-                                0
                             }
+                            0
                         }
                         Handoff::NoSend | Handoff::WrongSender => 0,
                         Handoff::ReportBusy => {
@@ -2131,6 +2153,43 @@ mod tests {
             assert!(records.is_empty());
             assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
         }
+    }
+
+    /// SEC-4・#2716: `R` の後の `execveat` の失敗(`X`)は、記録なしの起動失敗で PID 1 を回収する。`R` の後に EOF が
+    /// 来なければ(書き込み側を保持したまま停止)期限切れで失敗にして回収する(REPAIR-5)。
+    #[test]
+    fn sec4_2716_launch_fails_on_execveat_failure_after_ready_and_on_silence_after_ready() {
+        let _serial = serialize_forks();
+        let (result, elapsed, pid1, records) =
+            run_handoff_audited(Handoff::ExecReturned, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::NotFound);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure.rejection.error.message,
+            "the entrypoint execveat failed in the container child"
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+
+        let (result, elapsed, pid1, records) =
+            run_handoff_audited(Handoff::ExecReadyThenSleep, Duration::from_secs(4));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(
+            failure.rejection.error.message,
+            "timed out waiting for the pre-pivot status"
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
     }
 
     /// SEC-4・#2024: PID 1 が載せた実 listener を C が受け取り、種別・close-on-exec を満たす。PID 1 は ACK を

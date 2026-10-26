@@ -16,7 +16,20 @@ mkdir -p "${work}/bin"
 cat >"${work}/bin/cargo" <<'STUB'
 #!/usr/bin/env bash
 [ -z "${STUB_ARGS_LOG:-}" ] || echo "$*" >>"${STUB_ARGS_LOG}"
+case " $* " in
+  *" --message-format=json "*)
+    # 委譲スコープモードのバイナリ特定用（#2886）。STUB_JSON_MODE: one（既定）/ none / two / null
+    j() { printf '{"profile":{"test":true},"target":{"name":"exec_x"},"executable":%s}\n' "$1"; }
+    case "${STUB_JSON_MODE:-one}" in
+      one) j "\"${STUB_BIN}\"" ;;
+      two) j "\"${STUB_BIN}\""; j "\"${STUB_BIN}.other\"" ;;
+      null) j null ;;
+      none) : ;;
+    esac
+    exit 0 ;;
+esac
 case " $* " in *" --no-run "*) exit 0 ;; esac
+[ -z "${STUB_ENV_LOG:-}" ] || echo "cargo-env: ${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}" >>"${STUB_ENV_LOG}"
 n=0
 [ ! -f "${STUB_COUNTER}" ] || n="$(cat "${STUB_COUNTER}")"
 n=$((n + 1))
@@ -41,6 +54,29 @@ case "${STUB_MODE}" in
 esac
 STUB
 chmod +x "${work}/bin/cargo"
+# スタブ systemd-run: 引数を記録し、`--` 以降をそのまま実行する（委譲スコープモード。#2886）。
+cat >"${work}/bin/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+[ -z "${STUB_SD_LOG:-}" ] || echo "$*" >>"${STUB_SD_LOG}"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+STUB
+chmod +x "${work}/bin/systemd-run"
+# スタブ試験バイナリ: 成功行と、受け取った環境変数（false-green 検出用）を出す。
+FINAL_LINE='production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)'
+cat >"${work}/bin/exec_x_bin" <<STUB
+#!/usr/bin/env bash
+echo "args: \$*"
+echo "env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=\${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}"
+echo "user-seen: \${USER:-unset}"
+case "\${STUB_MODE}" in
+  scope-ok) echo '${FINAL_LINE}' ;;
+  scope-prefix) echo 'xx ${FINAL_LINE} yy' ;;
+  scope-fail) exit 1 ;;
+esac
+STUB
+chmod +x "${work}/bin/exec_x_bin"
 
 # check <名前> <期待rc> <期待する出力の部分文字列> <STUB_MODE> <環境変数...>
 check() {
@@ -97,10 +133,12 @@ check bin-without-success-line 2 "usage:" bin-ok "${P}" "${B}"
 check success-line-in-lib-mode 2 "usage:" ok "${P}" "${T}" "${S}"
 check bin-flag-injection 2 "usage:" bin-ok "${P}" TEST_BIN=--help "${S}"
 check bin-slash 2 "usage:" bin-ok "${P}" TEST_BIN=a/b "${S}"
-check success-line-semicolon 2 "usage:" bin-ok "${P}" "${B}" "SUCCESS_LINE=a;b"
+check success-line-semicolon-accepted 1 "passed=0 failed=1 count=1" bin-ok "${P}" "${B}" "SUCCESS_LINE=a;b" COUNT=1
+check success-line-bad-char 2 "usage:" bin-ok "${P}" "${B}" "SUCCESS_LINE=a|b"
 # shellcheck disable=SC2016
 check success-line-dollar 2 "usage:" bin-ok "${P}" "${B}" 'SUCCESS_LINE=a$b'
-check success-line-too-long 2 "usage:" bin-ok "${P}" "${B}" "SUCCESS_LINE=$(printf 'a%.0s' $(seq 1 201))"
+check success-line-too-long 2 "usage:" bin-ok "${P}" "${B}" "SUCCESS_LINE=$(printf 'a%.0s' $(seq 1 513))"
+check success-line-512-accepted 1 "passed=0 failed=1 count=1" bin-ok "${P}" "${B}" "SUCCESS_LINE=$(printf 'a%.0s' $(seq 1 512))" COUNT=1
 check ignored-invalid 2 "usage:" bin-ok "${P}" "${B}" "${S}" TEST_IGNORED=yes
 check missing-test 2 "usage:" ok "${P}"
 check bad-package 2 "usage:" ok PACKAGE=other "${T}"
@@ -126,6 +164,78 @@ if ! grep -qF -- "--features" "${work}/args"; then
   echo "OK: no-features-args"
 else
   echo "NG: no-features-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
+
+# --- 委譲スコープモード（USER_SCOPE=1）と TEST_ENV（#2886）---
+SB="STUB_BIN=${work}/bin/exec_x_bin"
+FL="SUCCESS_LINE=${FINAL_LINE}"
+ENVH="TEST_ENV=FANDHE_CONTAINER_TEST_ID_HELPER=1"
+[ "${#FINAL_LINE}" -gt 200 ] || { echo "NG: FINAL_LINE should exceed 200 chars" >&2; fails=$((fails + 1)); }
+check scope-final-line-exact 0 "passed=2 failed=0 count=2 test_bin=exec_x" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 "${ENVH}" COUNT=2
+check scope-info-names-only 0 "info: user_scope=1 test_env_names=FANDHE_CONTAINER_TEST_ID_HELPER" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 "${ENVH}" COUNT=1
+check scope-partial-line-is-failure 1 "passed=0 failed=2 count=2" scope-prefix "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 "${ENVH}" COUNT=2
+check scope-child-failure 1 "reason=exit" scope-fail "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 COUNT=1
+check scope-env-reaches-child 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=1" "${SB}" USER_SCOPE=1 "${ENVH}" COUNT=1
+check scope-env-absent-without-test-env 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=unset" "${SB}" USER_SCOPE=1 COUNT=1
+check scope-user-passed 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=user-seen: stubuser" "${SB}" USER_SCOPE=1 USER=stubuser COUNT=1
+rm -f "${work}/args" "${work}/sd" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=scope-ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" STUB_SD_LOG="${work}/sd" \
+  "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 COUNT=3 "${target}" >/dev/null 2>&1
+if [ "$(grep -c -- "--message-format=json" "${work}/args")" -eq 1 ] && [ "$(wc -l <"${work}/args" | tr -d ' ')" -eq 1 ] \
+  && [ "$(wc -l <"${work}/sd" | tr -d ' ')" -eq 3 ] \
+  && grep -qE -- "^--user --scope --quiet -p Delegate=yes --unit=fandhe-repeat-[0-9]+-1 -- ${work}/bin/exec_x_bin --ignored$" "${work}/sd"; then
+  echo "OK: scope-args"
+else
+  echo "NG: scope-args" >&2; cat "${work}/args" "${work}/sd" >&2; fails=$((fails + 1))
+fi
+check scope-binary-none 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=none
+check scope-binary-two 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=two
+check scope-binary-null 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=null
+check scope-with-lib 2 "usage:" ok "${P}" "${T}" USER_SCOPE=1
+check scope-without-bin 2 "usage:" ok "${P}" USER_SCOPE=1
+check scope-invalid-value 2 "usage:" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=yes
+# systemd-run が PATH に無いときは skip せず失敗にする（require_cmd の失敗）。ホストの systemd-run の有無に依らず、
+# 必要なツールだけを symlink した PATH で検証する。
+mkdir -p "${work}/nosd"
+for t in bash env jq cat mktemp rm dirname cut tr grep sort wc sed id uname head sleep kill ps date mkdir ls cargo; do
+  src="$(command -v "${t}" 2>/dev/null || true)"
+  case "${t}" in cargo) src="${work}/bin/cargo" ;; esac
+  [ -z "${src}" ] || ln -sf "${src}" "${work}/nosd/${t}"
+done
+rc=0
+out="$(env -i PATH="${work}/nosd" STUB_MODE=scope-ok STUB_COUNTER="${work}/counter" STUB_BIN="${work}/bin/exec_x_bin" \
+  PACKAGE=fandhe-container-x TEST_BIN=exec_x "${FL}" USER_SCOPE=1 "${work}/nosd/bash" "${target}" 2>&1)" || rc=$?
+if [ "${rc}" -ne 0 ] && ! printf '%s' "${out}" | grep -q '^skip:' && printf '%s' "${out}" | grep -q 'systemd-run'; then
+  echo "OK: scope-missing-systemd-run"
+else
+  echo "NG: scope-missing-systemd-run rc=${rc}" >&2; printf '%s\n' "${out}" >&2; fails=$((fails + 1))
+fi
+check test-env-bad-key-path 2 "usage:" ok "${P}" "${T}" TEST_ENV=PATH=/x
+check test-env-bad-key-ld 2 "usage:" ok "${P}" "${T}" TEST_ENV=LD_PRELOAD=x
+check test-env-bad-key-user 2 "usage:" ok "${P}" "${T}" TEST_ENV=USER=x
+check test-env-bad-key-lower 2 "usage:" ok "${P}" "${T}" TEST_ENV=FANDHE_CONTAINER_a=1
+check test-env-no-equal 2 "usage:" ok "${P}" "${T}" TEST_ENV=FANDHE_CONTAINER_A
+# shellcheck disable=SC2016
+check test-env-bad-value-dollar 2 "usage:" ok "${P}" "${T}" 'TEST_ENV=FANDHE_CONTAINER_A=$x'
+check test-env-bad-value-semicolon 2 "usage:" ok "${P}" "${T}" 'TEST_ENV=FANDHE_CONTAINER_A=a;b'
+check test-env-value-too-long 2 "usage:" ok "${P}" "${T}" "TEST_ENV=FANDHE_CONTAINER_A=$(printf 'a%.0s' $(seq 1 129))"
+check test-env-too-many 2 "usage:" ok "${P}" "${T}" "TEST_ENV=FANDHE_CONTAINER_A=1 FANDHE_CONTAINER_B=1 FANDHE_CONTAINER_C=1 FANDHE_CONTAINER_D=1 FANDHE_CONTAINER_E=1 FANDHE_CONTAINER_F=1 FANDHE_CONTAINER_G=1 FANDHE_CONTAINER_H=1 FANDHE_CONTAINER_I=1"
+# 非 scope の結合試験モードでも、TEST_ENV の値は cargo の子にだけ届く。
+rm -f "${work}/envlog" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=bin-ok STUB_COUNTER="${work}/counter" STUB_ENV_LOG="${work}/envlog" \
+  "${P}" "${B}" "${S}" "${ENVH}" COUNT=2 "${target}" >/dev/null 2>&1
+if [ "$(grep -cxF 'cargo-env: 1' "${work}/envlog")" -eq 2 ]; then
+  echo "OK: test-env-non-scope"
+else
+  echo "NG: test-env-non-scope" >&2; cat "${work}/envlog" >&2; fails=$((fails + 1))
+fi
+rm -f "${work}/envlog" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=bin-ok STUB_COUNTER="${work}/counter" STUB_ENV_LOG="${work}/envlog" \
+  "${P}" "${B}" "${S}" COUNT=1 "${target}" >/dev/null 2>&1
+if grep -qxF 'cargo-env: unset' "${work}/envlog"; then
+  echo "OK: test-env-absent"
+else
+  echo "NG: test-env-absent" >&2; cat "${work}/envlog" >&2; fails=$((fails + 1))
 fi
 check count-zero 2 "usage:" ok "${P}" "${T}" COUNT=0
 check count-over 2 "usage:" ok "${P}" "${T}" COUNT=1001

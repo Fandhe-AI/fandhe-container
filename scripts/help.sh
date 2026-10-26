@@ -132,7 +132,7 @@ cat <<'EOF'
   docker-hub-ratelimit-probe-selftest scripts/cri/docker-hub-ratelimit-probe-selftest.sh
                                         Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
-                                        repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
+                                        repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合・委譲スコープモード・TEST_ENV の検証をスタブで確認。#2886）
   check-success-lines-selftest        scripts/check-success-lines-selftest.sh
                                         check-success-lines.sh の自己テスト（REPAIR-7・REPAIR-12・PLUG-12。ソース導出の期待行の照合・双方向照合・forbid の矛盾検査・fail-closed を fixture で確認）
   deny                                scripts/targets/deny.sh
@@ -196,7 +196,7 @@ cat <<'EOF'
   docker-hub-ratelimit-probe          scripts/cri/docker-hub-ratelimit-probe.sh
                                         Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS=]。CRI-3・#2818）
   repeat-test                         scripts/targets/repeat-test.sh
-                                        指定した試験を N 回繰り返して間欠失敗を検出する（REPAIR-12。1 回ごとに timeout・成功行 `1 passed` を照合）
+                                        指定した試験を N 回繰り返して間欠失敗を検出する（REPAIR-12。1 回ごとに timeout・成功行 `1 passed` を照合。USER_SCOPE=1 で委譲スコープ実行・TEST_ENV で子への環境変数。#2886）
   docker-build                        docker compose build
                                         開発コンテナイメージをビルドする
   docker-shell                        docker compose run --rm dev

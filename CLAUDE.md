@@ -77,7 +77,8 @@ fandhe-container/
 │   │   ├── measurements/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
-│   │   │   └── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
+│   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
+│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録（#2840・CORE-2・CORE-5・REPAIR-12）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── macos-shared-vm.md     # macOS 既定方式（常駐 VM 共用）の未決事項の設計案（保持役・bind mount・ゲスト内実行・計測対象。TASK-191・#1905・MAC-4。承認待ち #1906）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）

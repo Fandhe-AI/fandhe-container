@@ -3018,3 +3018,113 @@ fn sup14_doctor_reports_launcher_mount_state() {
     assert_eq!(out.status.code(), Some(3), "{stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `c1` の状態記録へ、create が残すイメージストア root の記録（予約 annotations）を足す。
+/// イメージつきの create は取得済みイメージを要するため、記録だけを状態に直接書いて delete 側を実バイナリで確かめる。
+#[cfg(target_os = "linux")]
+fn record_image_root(state_root: &std::path::Path, image_root: &std::path::Path) {
+    let path = state_root.join("c1").join("state.json");
+    let text = std::fs::read_to_string(&path).expect("read state");
+    let body = text.strip_prefix('{').expect("json object");
+    let patched = format!(
+        "{{\"annotations\":{{\"io.fandhe.container.image-root\":\"{}\"}},{body}",
+        image_root.to_str().expect("utf8")
+    );
+    std::fs::write(&path, patched).expect("write state");
+}
+
+/// 0700 の空のイメージストア root を作り、正規パスを返す。
+#[cfg(target_os = "linux")]
+fn empty_image_root(tmp: &TmpDir, name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp.0.join(name);
+    std::fs::create_dir(&root).expect("mkdir image root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    std::fs::canonicalize(&root).expect("canonical")
+}
+
+/// OCI-7・OCI-5・CLI-1（#2499）: 状態記録のストア root が開ければ、`--image-root` を省いた delete は成功して状態を消す。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_uses_recorded_image_root_on_linux() {
+    let tmp = TmpDir::new("del-rec");
+    let dir = isolated_cli_dir("del-rec");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(&cli, &["--root", &root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+    assert!(!root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// OCI-7・CLI-1（#2499）: 記録の root と同じ `--image-root` を渡した delete も成功する。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_with_matching_image_root_succeeds_on_linux() {
+    let tmp = TmpDir::new("del-same");
+    let dir = isolated_cli_dir("del-same");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "delete",
+            "--image-root",
+            images.to_str().expect("utf8"),
+            "c1",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(!root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// OCI-7・CLI-1（#2499）: 記録と異なる `--image-root` は FAILED_PRECONDITION（5）で拒否し、状態を消さない。
+/// 記録の root を開けない delete も状態を消さずに失敗する。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_rejects_mismatched_or_unopenable_image_root_on_linux() {
+    let tmp = TmpDir::new("del-mis");
+    let dir = isolated_cli_dir("del-mis");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    let other = empty_image_root(&tmp, "other");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "delete",
+            "--image-root",
+            other.to_str().expect("utf8"),
+            "c1",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(5), "{:?}", out.stderr);
+    assert_eq!(
+        op_and_code(&out),
+        ("delete".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(out.stdout.is_empty());
+    assert!(root.join("c1").join("state.json").exists());
+
+    // 記録の root が消えている場合も、状態を残して失敗する。
+    std::fs::remove_dir(&images).expect("rm image root");
+    let out = run_isolated(&cli, &["--root", &root_s, "delete", "c1"]);
+    assert_ne!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

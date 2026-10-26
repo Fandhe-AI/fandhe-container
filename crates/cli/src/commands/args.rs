@@ -85,7 +85,8 @@ pub(super) struct DeleteArgs {
     pub(super) id: String,
     /// `--force`（core の `DeleteRequest::with_force` へ素通しする。生存中コンテナへは core が拒否する）。
     pub(super) force: bool,
-    /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は解除しない。OCI-7・#2315）。
+    /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は create 時に状態記録へ残した root を使い、
+    /// 指定が記録と食い違えば拒否する。記録の無いコンテナでは解除しない。OCI-7・#2315・#2499）。
     pub(super) image_root: Option<PathBuf>,
 }
 

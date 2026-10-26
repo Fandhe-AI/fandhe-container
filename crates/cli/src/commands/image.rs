@@ -83,11 +83,10 @@ use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 use super::CliExit;
 use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
-use super::image_refs::{is_bare_digest_form, ref_key, state_scope};
+use super::image_refs::{is_bare_digest_form, legacy_scope, ref_key, state_scope};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
 use super::ref_reconcile::reconcile_for_image_rm;
 use crate::error::CliError;
-use fandhe_container_core::state_store::StateRoot;
 
 /// `image ls` の固定ヘッダ行（LF 終端）。
 const IMAGE_LS_HEADER: &str = "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n";
@@ -497,23 +496,28 @@ fn stopped_snapshot(global: &GlobalArgs) -> Result<StoppedContainers, CliExit> {
     let store = open_store(global).map_err(|e| store_open_failure(&e))?;
     // 参照キーは create / delete と同じ状態ルートの scope を含める（含めないと `plan_image_rm_with` の完全一致で
     // 停止中と判定されず `image rm --force` が拒否される。OCI-7）。
-    let scope = state_scope(
-        &StateRoot::resolve(global.root.clone()).map_err(|e| CliExit::failed(e.code()))?,
-    );
-    snapshot_from(&store, &scope).map_err(|e| CliExit::failed(e.code()))
+    let scope = state_scope(&store).map_err(|e| CliExit::failed(e.code()))?;
+    // 旧版の scope（`--root` の字面から決めたもの）のキーで残った参照も停止中として扱う（#2499・OCI-7）。
+    let legacy = legacy_scope(global.root.clone(), &scope);
+    let scopes: Vec<&str> = std::iter::once(scope.as_str())
+        .chain(legacy.as_deref())
+        .collect();
+    snapshot_from(&store, &scopes).map_err(|e| CliExit::failed(e.code()))
 }
 
-fn snapshot_from(store: &dyn StateStore, scope: &str) -> Result<StoppedContainers, TraitError> {
+fn snapshot_from(store: &dyn StateStore, scopes: &[&str]) -> Result<StoppedContainers, TraitError> {
     let page_size = NonZeroU32::new(MAX_PAGE_SIZE).unwrap_or(NonZeroU32::MIN);
     let mut req = ListStateRequest::new(page_size)?;
     let mut stopped = StoppedContainers::new();
     for _ in 0..MAX_LIST_PAGES {
         let page = store.list(&req)?;
         for record in page.records() {
-            if record.status().state() == ContainerState::Stopped
-                && let Ok(id) = ContainerRefId::new(&ref_key(scope, record.id().as_str()))
-            {
-                stopped.insert(id);
+            if record.status().state() == ContainerState::Stopped {
+                for scope in scopes {
+                    if let Ok(id) = ContainerRefId::new(&ref_key(scope, record.id().as_str())) {
+                        stopped.insert(id);
+                    }
+                }
             }
         }
         match page.next_cursor() {
@@ -914,7 +918,7 @@ mod tests {
     #[test]
     fn oci7_image_rm_reclaims_stale_ref_then_deletes() {
         use super::super::ref_reconcile::reconcile_in_use;
-        use fandhe_container_core::state_store::FileStateStore;
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
         let scope = "0123456789abcdef0123456789abcdef";
         let other = "fedcba9876543210fedcba9876543210";
         let state_tmp = Tmp::new();

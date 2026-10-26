@@ -19,7 +19,7 @@
 //!
 //! # 回収の契機と create ゲート（#854・#2495）
 //!
-//! 状態作成まで進まず未確定のまま残った参照、`--image-root` を省いた delete が残した確定済み参照の回収は、
+//! 状態作成まで進まず未確定のまま残った参照、delete が解除できずに残した確定済み参照（記録を持たない古いコンテナを含む）の後追いの回収は、
 //! `ref_reconcile` module が担う（契機 A: イメージつき create の core 呼び出し前に同じキー 1 件、契機 B: `image rm` が
 //! 使用中で拒否したとき）。未確定参照の回収の前提「進行中の create が無いこと」は、oci の create ゲート
 //! （`ImageStore::quiesce_container_creates`）で保証する。イメージつき create は `create_with_image` の呼び出し全体を
@@ -66,8 +66,9 @@ use fandhe_container_core::oci_runtime::{
     ContainerImageRefs, ImageManifestDigest, ImageRefGeneration, ImageRefRegistration,
     ImageRefRelease,
 };
-use fandhe_container_core::state_store::StateRoot;
-use fandhe_container_core::traits::{ContainerId, TraitError};
+use fandhe_container_core::traits::{
+    Annotations, ContainerId, CreateRequest, StateStore, TraitError,
+};
 use fandhe_container_oci::error::OciError;
 use fandhe_container_oci::image_management::{
     ContainerRefGeneration, ContainerRefId, ContainerRefRegistration, ContainerRefRelease,
@@ -151,8 +152,71 @@ pub(super) fn resolve_create_image(
 /// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスの SHA-256 の先頭 32 桁（128 bit の
 /// 小文字 hex）を作り、キーを `<hex>.<id>` にする。入力は利用者が選ぶパスで、脅威は他人の scope への
 /// 第 2 原像のため 128 bit で足りる（core の `scope_of` と同じ切り詰め。#2500・REPAIR-12）。
-pub(super) fn state_scope(root: &StateRoot) -> String {
-    let bytes = root.path().as_os_str().as_encoded_bytes();
+///
+/// 入力は「開いた状態ストアの `host_state_root()`」（`FileStateStore::open` が親の symlink を解決して固定した
+/// 正規パス）で、`--root` の表記（`//`・末尾 `/`・祖先の symlink）が create と delete で違っても同じ scope になる
+/// （#2499 P2-2）。字面だけを畳んで存在しないパスを許す経路は作らない。大文字小文字を区別しない FS の同一視は
+/// 範囲外（ローカル経路は Linux のみ）。
+pub(super) fn state_scope(store: &dyn StateStore) -> Result<String, TraitError> {
+    let root = store
+        .host_state_root()
+        .ok_or_else(|| TraitError::new(ErrorCode::FailedPrecondition, MSG_NO_STATE_ROOT))?;
+    Ok(state_hash(root.as_os_str().as_encoded_bytes()))
+}
+
+/// 旧版の scope（`--root` の字面から決めた状態ルートのハッシュ）を、新しい scope と違うときだけ返す（#2499・OCI-7）。
+///
+/// 旧版は `StateRoot::resolve(--root)` の字面をハッシュしていた。現行は開いたストアの `host_state_root()`
+/// （祖先の symlink を解決した正規パス）を使うため、`--root` に symlink を含む表記で作ったコンテナの参照は旧 scope の
+/// キーで残っている。旧 scope のキーは新規には作らず、delete の解除・create 前の回収・`image rm` の照合・停止中の判定だけで
+/// 読み戻す（既存の参照が回収不能になる退行を避ける互換処理）。解決できない・新 scope と同じなら `None`。
+pub(super) fn legacy_scope(
+    override_root: Option<std::path::PathBuf>,
+    current: &str,
+) -> Option<String> {
+    let root = fandhe_container_core::state_store::StateRoot::resolve(override_root).ok()?;
+    let legacy = state_hash(root.path().as_os_str().as_encoded_bytes());
+    (legacy != current).then_some(legacy)
+}
+
+const MSG_NO_STATE_ROOT: &str = "the state store does not expose a host state root";
+
+/// create 時のイメージストア root を状態記録の annotations に残す予約キー（#2499・OCI-7・CLI-1）。
+///
+/// 値は `ImageStore::root()`（検査済みの正規パス）。`--image-root` を省いた delete が、この記録のストアを開いて
+/// 参照を解除する。利用者の `--label` では書けない（`create_options::labels_of` が拒否する）。分離・権限の
+/// 判断には使わず、delete 側も値を信頼せず `ImageStore::open` の検査と開いた root との一致で確かめる。
+pub(super) const IMAGE_ROOT_ANNOTATION: &str = "io.fandhe.container.image-root";
+
+const MSG_IMAGE_ROOT_NOT_UTF8: &str = "image store root must be valid UTF-8";
+
+/// `req` の annotations に [`IMAGE_ROOT_ANNOTATION`] を足した要求を返す（同じキーの既存値は置き換える）。
+///
+/// UTF-8 にできない root と、annotations の上限（`Annotations::new` の判定）を超える場合は
+/// `INVALID_ARGUMENT` で失敗し、状態は作られない（fail-closed）。
+pub(super) fn attach_image_root(
+    req: &CreateRequest,
+    store: &ImageStore,
+) -> Result<CreateRequest, TraitError> {
+    let root = store
+        .root()
+        .to_str()
+        .ok_or_else(|| TraitError::new(ErrorCode::InvalidArgument, MSG_IMAGE_ROOT_NOT_UTF8))?;
+    let entries = req
+        .annotations()
+        .iter()
+        .filter(|(k, _)| *k != IMAGE_ROOT_ANNOTATION)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .chain(std::iter::once((
+            IMAGE_ROOT_ANNOTATION.to_owned(),
+            root.to_owned(),
+        )));
+    let annotations = Annotations::new(entries)?;
+    Ok(req.clone().with_annotations(annotations))
+}
+
+/// パスのバイト列から scope の 32 桁 hex を作る（[`state_scope`]・[`legacy_scope`] で共有）。
+fn state_hash(bytes: &[u8]) -> String {
     let full = sha256_hex(bytes);
     full.get(..32).map_or_else(|| full.clone(), str::to_owned)
 }
@@ -198,7 +262,7 @@ pub(super) fn ref_key(scope: &str, id: &str) -> String {
     format!("{scope}-{}", sha256_hex(id.as_bytes()))
 }
 
-fn fail(e: OciError) -> TraitError {
+pub(super) fn fail(e: OciError) -> TraitError {
     trait_failure(&e, Stage::Refs)
 }
 
@@ -467,14 +531,151 @@ mod tests {
         );
     }
 
-    /// OCI-7: 状態ルートの識別子は決定的で、パスが違えば変わり、キー全体が ID の上限に収まる。
+    /// OCI-7: 状態ルートの識別子は決定的で、ルートが違えば変わり、キー全体が ID の上限に収まる。
+    #[cfg(unix)]
     #[test]
     fn oci7_state_scope_is_deterministic_and_distinct() {
-        let r1 = StateRoot::from_override(std::env::temp_dir().join("a")).expect("r1");
-        let r2 = StateRoot::from_override(std::env::temp_dir().join("b")).expect("r2");
-        assert_eq!(state_scope(&r1), state_scope(&r1));
-        assert_ne!(state_scope(&r1), state_scope(&r2));
-        assert_eq!(state_scope(&r1).len(), 32);
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        let tmp = Tmp::new("scope-distinct");
+        let open = |name: &str| {
+            FileStateStore::open(StateRoot::from_override(tmp.path().join(name)).expect("root"))
+                .expect("open")
+        };
+        let (a, b) = (open("a"), open("b"));
+        assert_eq!(state_scope(&a).expect("a"), state_scope(&a).expect("a"));
+        assert_ne!(state_scope(&a).expect("a"), state_scope(&b).expect("b"));
+        assert_eq!(state_scope(&a).expect("a").len(), 32);
+    }
+
+    /// OCI-7・#2499（P2-2）: `//`・末尾 `/`・祖先の symlink のどの表記で開いても scope は同じになる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_is_stable_across_root_spellings() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        let tmp = Tmp::new("scope-spellings");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).expect("symlink");
+        let scope = |root: std::path::PathBuf| {
+            let store =
+                FileStateStore::open(StateRoot::from_override(root).expect("root")).expect("open");
+            state_scope(&store).expect("scope")
+        };
+        let via_link = scope(tmp.path().join("link").join("state"));
+        let double_slash = scope(std::path::PathBuf::from(format!(
+            "{}//state",
+            real.display()
+        )));
+        let trailing = scope(std::path::PathBuf::from(format!(
+            "{}/state/",
+            real.display()
+        )));
+        assert_eq!(via_link, double_slash);
+        assert_eq!(via_link, trailing);
+        assert_eq!(via_link.len(), 32);
+    }
+
+    /// OCI-7・#2499: 状態ルートを示せないストアの scope は固定文言の `FAILED_PRECONDITION`。
+    #[test]
+    fn oci7_state_scope_without_host_root_fails_closed() {
+        struct NoRoot;
+        impl StateStore for NoRoot {
+            fn create(
+                &self,
+                _: &fandhe_container_core::traits::CreateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn get(
+                &self,
+                _: &fandhe_container_core::traits::GetStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn update(
+                &self,
+                _: &fandhe_container_core::traits::UpdateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn list(
+                &self,
+                _: &fandhe_container_core::traits::ListStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn delete(
+                &self,
+                _: &fandhe_container_core::traits::DeleteStateRequest,
+            ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError>
+            {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+        }
+        let e = state_scope(&NoRoot).expect_err("no root");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_NO_STATE_ROOT);
+    }
+
+    /// OCI-7・#2499: create の要求にイメージストア root の記録が足され、既存の label は残り、同じキーは置き換わる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_attach_image_root_adds_the_recorded_root() {
+        let tmp = Tmp::new("attach-root");
+        let store = ImageStore::open(tmp.path()).expect("open");
+        let base = CreateRequest::new(
+            ContainerId::new("c1").expect("id"),
+            std::env::temp_dir().join("bundle"),
+        )
+        .expect("req")
+        .with_annotations(
+            Annotations::new([
+                ("k".to_string(), "v".to_string()),
+                (IMAGE_ROOT_ANNOTATION.to_string(), "/stale".to_string()),
+            ])
+            .expect("ann"),
+        );
+        let req = attach_image_root(&base, &store).expect("attach");
+        assert_eq!(req.annotations().get("k"), Some("v"));
+        assert_eq!(
+            req.annotations().get(IMAGE_ROOT_ANNOTATION),
+            store.root().to_str()
+        );
+    }
+
+    /// OCI-7・#2499: annotations の合計上限を超える長さの root は `INVALID_ARGUMENT` で、状態を作る前に失敗する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_attach_image_root_rejects_oversized_root() {
+        // annotations の合計上限（4096 バイト。キーを含む）を超え、PATH_MAX（4096）には収まる長さの root。
+        let tmp = Tmp::new("attach-long");
+        let mut deep = tmp.path().to_path_buf();
+        while deep.as_os_str().len() + 201 < 4080 {
+            deep.push("d".repeat(200));
+        }
+        let rest = 4080 - deep.as_os_str().len() - 1;
+        deep.push("e".repeat(rest));
+        assert_eq!(deep.as_os_str().len(), 4080);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&deep)
+                .expect("deep");
+        }
+        let store = ImageStore::open(&deep).expect("open");
+        let base = CreateRequest::new(
+            ContainerId::new("c1").expect("id"),
+            std::env::temp_dir().join("bundle"),
+        )
+        .expect("req");
+        let e = attach_image_root(&base, &store).expect_err("too large");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 
     /// OCI-7・REPAIR-12（#2500）: 畳んだ参照キーは SHA-256 の具体値と一致する。
@@ -495,13 +696,10 @@ mod tests {
     #[test]
     fn oci7_state_scope_is_sha256_prefix() {
         let tmp = Tmp::new("scope");
-        let root = StateRoot::from_override(tmp.path().join("state")).expect("root");
-        let path = root.path().as_os_str().as_encoded_bytes().to_vec();
-        assert_eq!(state_scope(&root), sha256_hex(&path)[..32]);
-        let fixed = StateRoot::from_override("/x/state".into()).expect("fixed");
-        if fixed.path() == std::path::Path::new("/x/state") {
-            assert_eq!(state_scope(&fixed), "165fe1065cc95b4bb8e93c5a50ba3276");
-        }
+        let path = tmp.path().join("state");
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert_eq!(state_hash(bytes), sha256_hex(bytes)[..32]);
+        assert_eq!(state_hash(b"/x/state"), "165fe1065cc95b4bb8e93c5a50ba3276");
     }
 
     /// OCI-7・REPAIR-12（#2500）: キーは常に `[A-Za-z0-9._-]` かつ 255 バイト以下。

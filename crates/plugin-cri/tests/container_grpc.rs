@@ -480,6 +480,54 @@ async fn pull_image(
     .map(|r| r.into_inner().image_ref)
 }
 
+/// `Status` を UDS＋gRPC 越しに呼び、実行層ありで pod network 無しの構成の応答を具体値で照合する
+/// （`RuntimeReady`=true・`NetworkReady`=false〔`NetworkPluginNotReady`〕・既定ハンドラ 1 件・features・空の `info`）。
+/// 本番は core の network namespace の join が未実装で `with_pod_network` を差さないため、段 A も同じ値になる
+/// （CRI-1・CRI-2・#2830・`docs/design/cri-status-rpc.md`）。
+async fn assert_status_runtime_ready_network_not_ready(c: &mut Client, verbose: bool) {
+    let resp = call_with_deadline(c.status(cri::StatusRequest { verbose }), RPC_DEADLINE)
+        .await
+        .expect("status")
+        .into_inner();
+    let cond = |t: &str, status: bool, reason: &str, message: &str| cri::RuntimeCondition {
+        r#type: t.into(),
+        status,
+        reason: reason.into(),
+        message: message.into(),
+    };
+    assert_eq!(
+        resp.status.expect("runtime status").conditions,
+        vec![
+            cond("RuntimeReady", true, "", ""),
+            cond(
+                "NetworkReady",
+                false,
+                "NetworkPluginNotReady",
+                "pod network provider is not configured"
+            ),
+        ]
+    );
+    assert_eq!(
+        resp.runtime_handlers,
+        vec![cri::RuntimeHandler {
+            name: String::new(),
+            features: Some(cri::RuntimeHandlerFeatures {
+                recursive_read_only_mounts: false,
+                user_namespaces: false,
+            }),
+        }]
+    );
+    assert_eq!(
+        resp.features,
+        Some(cri::RuntimeFeatures {
+            supplemental_groups_policy: true,
+            user_namespaces_host_network: false,
+            mount_options: false,
+        })
+    );
+    assert!(resp.info.is_empty());
+}
+
 /// 段 A（PLUG-1・CRI-2・CRI-3・CRI-7）: 同じ UDS で ImageService がサーブされ、Container 系 RPC が実バイナリへ届いて
 /// 本番バックエンドの応答が境界を越えて返る。タグが未知の作成は `NOT_FOUND` で半端な記録を残さず、image ID の作成は成功する。
 #[tokio::test]
@@ -519,6 +567,9 @@ async fn container_rpcs_reach_the_plugin_binary() {
             .expect_err("empty reference");
         assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
 
+        assert_status_runtime_ready_network_not_ready(&mut c, false).await;
+        assert_status_runtime_ready_network_not_ready(&mut c, true).await;
+
         let sb = run_sandbox(&mut c, "pod-a").await;
 
         // 在庫に無いタグは NOT_FOUND で、半端な記録は残さない。
@@ -540,6 +591,9 @@ async fn container_rpcs_reach_the_plugin_binary() {
         assert_eq!(id.len(), 64);
         let st = container_status(&mut c, &id).await.expect("status");
         assert_eq!(st.state, cri::ContainerState::ContainerCreated as i32);
+        // 在庫に無い image ID の指定なので digest 参照は無く、image_ref も image ID（#2831・CRI-2・OCI-1）。
+        assert_eq!(st.image_id, image_id);
+        assert_eq!(st.image_ref, image_id);
         assert_eq!(list_containers_len(&mut c).await, 1);
         remove_container(&mut c, &id).await.expect("remove");
         assert_eq!(list_containers_len(&mut c).await, 0);
@@ -733,6 +787,8 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
         }));
         let ch = connect_when_ready(&sock, None).await;
         let mut c = RuntimeServiceClient::new(ch);
+
+        assert_status_runtime_ready_network_not_ready(&mut c, false).await;
 
         let sb = run_sandbox(&mut c, "pod-b").await;
         assert_eq!(
@@ -932,6 +988,14 @@ async fn production_binary_full_lifecycle_real() {
         .expect("start");
         let st = container_status(&mut c, &id).await.expect("status");
         assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
+        // 解決結果の報告（#2831）: image_id は PullImage の image_ref と同じ（proto の MUST）、image_ref は digest 参照。
+        assert_eq!(st.image_id, image_ref);
+        let repo = IMAGE.rsplit_once(':').map_or(IMAGE, |(r, _)| r);
+        assert!(
+            st.image_ref.contains(&format!("{}@sha256:", repo.rsplit('/').next().unwrap_or(repo))),
+            "image_ref: {}",
+            st.image_ref
+        );
 
         call_with_deadline(
             c.stop_container(cri::StopContainerRequest {

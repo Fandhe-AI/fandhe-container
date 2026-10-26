@@ -49,6 +49,14 @@
 //! `R` から `execveat` の完了までの間にシグナルで死ぬと EOF になり成功と判定される（EOF の後の生存確認は、
 //! すぐ終わる正当なプログラムを誤って失敗にするため入れない）。
 //!
+//! # 稼働中コンテナへの exec の失敗の行との対応（SUP-6・REPAIR-3・#2822）
+//!
+//! exec の子は同じ考え方（段・`ErrorCode`・理由コードだけを運ぶ）で、`<終了コード> <step> <CODE> <reason|->` の 4 語の
+//! 行を別の状態 pipe に書く。語彙 `process::ExecChildStep` は `F <step>` の `PrePivotStep` とは別で、対応は
+//! `ExecChildStep` の doc の表を正とする（要点: exec の `execveat` は本モジュールの `X`、`report_ready` は `R` を書けない
+//! 場合、`close_fds` から `stdio_null` は本モジュールの `E` と同じ `prepare_exec_child` の手順で、`E` 行は段を運ばない
+//! ままとする。`F <step>` の 14 段に対応する exec の段は無い）。
+//!
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
 //! 復号は厳格（単一スペース区切り・フィールド数固定・全トークンが許可リスト内・末尾に余分なバイト無し）で、
 //! 親は固定語彙の許可リストで引き直した静的トークンだけを監査レコードに入れる。`CODE` と `reason` の整合
@@ -925,6 +933,16 @@ mod tests {
             assert_eq!(step_ordinal(s), i);
         }
         assert_eq!(PrePivotStep::ALL.len(), 14);
+    }
+
+    /// exec の子の段（`ExecChildStep`）と launch の段のトークンは重ならない（取り違えの検出。SUP-6・#2822）。
+    #[test]
+    fn sup6_2822_exec_child_tokens_do_not_overlap_pre_pivot_tokens() {
+        for exec_step in super::super::ExecChildStep::ALL {
+            for step in PrePivotStep::ALL {
+                assert_ne!(exec_step.as_str(), step.as_str());
+            }
+        }
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。

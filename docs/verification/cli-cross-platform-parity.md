@@ -1,4 +1,4 @@
-# CLI 基本 6 コマンド（と inspect・stop --signal・create --cap-drop）の 3 OS 同一構文・挙動 確認記録（雛形）
+# CLI 基本 6 コマンド（と inspect・stop --signal・create --cap-drop・create --read-only）の 3 OS 同一構文・挙動 確認記録（雛形）
 
 TASK-125（共同タスク）の確認記録の雛形。実機での実行・結果の記入・CLI-1 の合否判定は #661（TASK-125.h1・人間担当）が行う。本ファイルと `scripts/cli-parity-check.sh` は Agent 担当分（TASK-125.1・#660）の準備物で、結果欄に Agent が実測値を埋めてはならない。
 
@@ -97,6 +97,8 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | A23 | `create --cap-drop CAP_BOGUS ...`（未知の capability 名） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2775 で追加） | |
 | A24 | `inspect`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2775 で追加） | |
 | A25 | `inspect <id> <id>`（余剰引数） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2775 で追加） | |
+| A26 | `create --read-only --read-only ...`（重複） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2828 で追加） | |
+| A27 | `create --read-only true ...`（値つき。`true` が余剰の位置引数になる） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2828 で追加） | |
 
 ## B 層: 挙動（macOS / Windows は plugin 発見機構経由）
 
@@ -136,7 +138,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B16 | `inspect nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 
-**手動確認（自動収集しない）**: Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。成功時の stdout は新しい stdout 種別が要るため `cli-parity-check.sh` では収集しない（#2775・CLI-1）。
+**手動確認（自動収集しない）**: Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。`create --read-only` で作って start した後の `inspect` は末尾が `"capabilities":{...},"rootReadonly":true` になり、`--read-only` なしで config が `readonly:false` なら `"rootReadonly":false`、start 前・旧記録は `"rootReadonly":null`（#2828）。成功時の stdout は新しい stdout 種別が要るため `cli-parity-check.sh` では収集しない（#2775・#2828・CLI-1）。
 
 ## C 層: イメージ管理（`image ls`・`system df`・`image rm`・`image tag`。#2221・#2316・CLI-1・OCI-7）
 

@@ -217,9 +217,6 @@ pub use launch_status::relay_exec_returned_for_test;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_mount_binds_failure_for_test;
-/// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
-#[doc(hidden)]
-pub use process::exec_child_violation_reasons;
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -231,8 +228,8 @@ pub use process::spawn_container_with_stages_reporting_for_test;
 pub use process::{
     ChildExit, ChildStdio, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, LaunchPidfdUnavailable,
-    SignalDelivery, exec_entrypoint,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecChildStep, ExecExit,
+    LaunchPidfdUnavailable, SignalDelivery, exec_entrypoint,
 };
 pub(crate) use process::{ConfigPaths, PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
@@ -249,6 +246,9 @@ pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
+#[doc(hidden)]
+pub use process::{exec_child_steps, exec_child_violation_reasons};
 /// 最小入口の再公開（結合試験専用。製品コードの呼び出し元は無く、本番の起動は launcher の `spawn_container_via_intermediate`。
 /// release ビルドでは `exec-test-support` を有効にできないため製品バイナリからは呼べない。REPAIR-3・CORE-2・#2762）。
 #[cfg(feature = "exec-test-support")]

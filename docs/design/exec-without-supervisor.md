@@ -28,7 +28,7 @@ pidfd をあとから開いても、それ自体では何も証明されない�
 | (i) 拒否を保つ | re-adopt まで exec を拒否し、exec 側に縮退経路を持たない | 現状。安全。孤児の間は exec と healthcheck が使えない |
 | (ii) cgroup パスでの同一性（`Pid1Target::open`）を本番で使う | 記録 pid から開き `<scope>/fc-<id>@<instance>` との一致で照合する | cgroupfs に書けない前提に頼る。前提を崩す変更（cgroupfs のマウント・cgroup namespace・`/sys/fs/cgroup` の rw bind）で壊れる。#1461 が恒久策を入れた理由そのもの。不採用を推奨 |
 | (iii) 起動時の同一性の証跡を `state.json` に記録して照合する | 起動時にコンテナが偽れない証跡を記録する。候補は (a) pidfd の inode 番号（pidfd の `fstat` の `st_ino`）、(b) `/proc/<pid>/stat` の starttime と `boot_id` の組。取り直しのとき `pidfd_open(記録 pid)` → 証跡の照合 → pidfd の未終了の確認、の順に固定する | cgroupfs の前提に頼らない。`state.json` のスキーマ追加が要る（現状の exec は instance を使ってスキーマを変えない方針）。カーネル版数の要件（(a) は 6.9 以上の 64 bit、起動をまたぐ照合には `boot_id` が要る。下記「カーネルの事実」）と、満たさない環境の扱いを決める必要がある |
-| (iv) supervisor の外で pidfd を持ち続ける | systemd の fd store・常駐の holder など | supervisor は `systemd-run --user --scope` で包んで起動される（`crates/cli` の start）。fd store は service 単位の機能で scope では使えない見込み（要確認）。常駐の holder は CORE-1（中央の常駐デーモンを持たない）と衝突する。不採用を推奨 |
+| (iv) supervisor の外で pidfd を持ち続ける | systemd の fd store・常駐の holder など | supervisor は `systemd-run --user --scope` で包んで起動される（`crates/cli` の start）。fd store は service 単位の機能で、scope では使えない（systemd v262.1 のソースと man で照合済み。下記「systemd の事実」）。常駐の holder は CORE-1（中央の常駐デーモンを持たない）と衝突する。不採用を推奨 |
 
 誰が取り直すかも分けて考える。
 
@@ -73,6 +73,20 @@ re-adopt (#514) が満たすべき契約（案）:
 - 候補 (a) の pidfd の `st_ino` は 6.9 以上かつ 64 bit で成立する。ただし起動をまたぐと番号が戻るので、**`boot_id` を併せて記録して照合する**（`boot_id` の一致 → `st_ino` の一致）。単独の (a) は、再起動後に同じ pid・同じ番号が偶然そろう場合を排除できない
 - 候補 (b) は 6.9 未満でも使えるが、starttime は clock tick の粒度で、time namespace の影響を受ける。照合側は初期 time namespace（記録時と同じ読み手）で読む前提を契約に入れる
 - 6.9 未満・32 bit の環境の扱い（(b) に切り替えるか、拒否するか）は、引き続きオーナー判断として残す
+
+## systemd の事実（版・commit 固定の一次情報で照合済み。#2837）
+
+確認日は 2026-10-26。取得時点の最新の安定版 tag `v262.1`（annotated tag `f85dfc5dd463f37b67ce589e511be36f527b19f6` が指す commit `73612ea502d53baf9b0df4336cfc296a7ee0d524`）の systemd で、案 (iv) の「fd store は scope では使えない」を確かめた。
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| `FDSTORE=1` を受けて fd を保存するのは service unit の処理 | [`src/core/service.c` L662](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/src/core/service.c#L662)（`service_add_fd_store`）、[L5604](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/src/core/service.c#L5604)（`service_notify_message`）、[L6741](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/src/core/service.c#L6741)（service の vtable の `.notify_message`） | 確認 |
+| notify メッセージは unit の vtable の `notify_message` に振り分けられる | [`src/core/manager.c` L3028-L3029](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/src/core/manager.c#L3028-L3029)（`if (UNIT_VTABLE(u)->notify_message)` のときだけ呼ぶ） | 確認 |
+| scope の vtable に `notify_message` が無く、fd store の処理も無い | [`src/core/scope.c` L730-L781](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/src/core/scope.c#L730-L781)（`scope_vtable`。通知系は `.notify_cgroup_empty`・`.notify_cgroup_oom` のみ）。`scope.c` に `FDSTORE`・`FileDescriptorStore` の文字列は無い | 確認。scope のプロセスが `FDSTORE=1` を送っても受ける側の処理が無い |
+| fd store の設定は service の設定で、scope の man に無い | [`man/systemd.service.xml` L1246](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/man/systemd.service.xml#L1246)（`FileDescriptorStoreMax=`）、[`man/sd_notify.xml` L396-L412](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/man/sd_notify.xml#L396-L412)（`FDSTORE=1` は service の `FileDescriptorStoreMax=` が 0 でない場合のみ受け、保存した fd は service の次の start / restart で返す）。[`man/systemd.scope.xml`](https://github.com/systemd/systemd/blob/73612ea502d53baf9b0df4336cfc296a7ee0d524/man/systemd.scope.xml) に該当する設定は無い | 確認。scope には fd store の設定も、fd を返す「次の start」もない |
+| 本番の supervisor は scope で包まれる | リポ内: `crates/cli/src/doctor/user_scope_check.rs` の冒頭の doc（「`start` は supervisor を `systemd-run --user --scope` で包む」） | リポの記述どおり |
+
+結論: 案 (iv) のうち systemd の fd store は、`systemd-run --user --scope` で包む現状の本番の構成では使えない（食い違いなし。見込みが確定した）。`systemd-run --user`（service unit 側）へ変える場合は fd store の対象になりうるが、それは supervisor の起動方式の変更で、本件の範囲外（確かめていない）。推奨（(iv) は不採用）は変わらない。常駐の holder が CORE-1 と衝突する点は、設計上の論点でソースでの照合の対象ではない。
 
 ## 確認が必要な点（オーナー判断）
 

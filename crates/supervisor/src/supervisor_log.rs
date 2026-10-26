@@ -225,6 +225,15 @@ fn run_bounded_inner<T: Send + 'static>(
     let Some(slot) = InflightSlot::acquire() else {
         return BoundedOutcome::Busy;
     };
+    run_bounded_with_slot(slot, job, timeout)
+}
+
+/// 確保済みの枠で `job` を作業スレッドへ渡し、`timeout` までだけ待つ（枠は作業の実終了まで保持する）。
+fn run_bounded_with_slot<T: Send + 'static>(
+    slot: InflightSlot,
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> BoundedOutcome<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("supervisor-log-remove".to_string())
@@ -304,6 +313,46 @@ pub fn run_bounded_classified<T: Send + 'static>(
     timeout: std::time::Duration,
 ) -> Result<T, BoundedFailure> {
     match run_bounded_inner(job, timeout) {
+        BoundedOutcome::Done(v) => Ok(v),
+        BoundedOutcome::Busy => Err(BoundedFailure::Busy),
+        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),
+    }
+}
+
+/// 枠が空くのを待つときの再試行間隔（枠の返却は作業スレッドの終了で、短い作業なら数 ms で空くため短くてよい）。
+const SLOT_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// [`run_bounded_classified`] の、枠の満杯を `timeout` の範囲で待つ版（#2834・REPAIR-5）。
+///
+/// 枠が満杯でも即座に `Busy` にせず、`timeout` を上限に `SLOT_WAIT_POLL` 間隔で空きを待つ。待った時間は `timeout` から
+/// 引かれるので、全体の待ちは `timeout` を超えない（期限を延ばさない）。待っても空かなければ job を実行せず `Busy`
+/// （期限切れ `Unfinished` とは区別する）。CLI の `create` が 1 プロセスの中で複数の作業を同時に走らせる場面
+/// （並列の結合試験・止まった作業が枠を占めた後）で、一時的な満杯を `TIMEOUT` に誤分類しないために使う。
+/// 常駐の plugin-cri が使う即時 `Busy` の [`run_bounded_classified`]（#2760）は変えない。
+pub fn run_bounded_waiting<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<T, BoundedFailure> {
+    let started = std::time::Instant::now();
+    // 枠の確保の前後に毎回残り時間を確認する。期限が尽きていれば（最後の sleep 中に過ぎた場合を含む）
+    // 作業スレッドを生成せず `Busy` を返す（期限切れ後に job の副作用を走らせない。REPAIR-5）。
+    let (slot, remaining) = loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(BoundedFailure::Busy);
+        }
+        if let Some(slot) = InflightSlot::acquire() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // 確保後に期限が尽きた: 枠を返して job を起動しない。
+                drop(slot);
+                return Err(BoundedFailure::Busy);
+            }
+            break (slot, remaining);
+        }
+        std::thread::sleep(SLOT_WAIT_POLL.min(remaining));
+    };
+    match run_bounded_with_slot(slot, job, remaining) {
         BoundedOutcome::Done(v) => Ok(v),
         BoundedOutcome::Busy => Err(BoundedFailure::Busy),
         BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),

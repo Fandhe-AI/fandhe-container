@@ -120,9 +120,11 @@ case "$cmd" in
     fi
     bad ;;
   create)
-    bundle=""; id=""; n=0
+    bundle=""; id=""; n=0; ro=0
     while [ $# -gt 0 ]; do
       case "$1" in
+        # 製品 CLI の --read-only は値を取らず 1 回まで（値つきは余剰の位置引数になる。#2828）。
+        --read-only) [ "$ro" = 0 ] || bad; ro=1; shift ;;
         --bundle) [ $# -ge 2 ] || bad; [ -z "$bundle" ] || bad; bundle="$2"; shift 2 ;;
         # 製品 CLI の --cap-drop は core の語彙で検証する。スタブは代表の名前だけを受ける（#2775）。
         --cap-drop) [ $# -ge 2 ] || bad
@@ -364,7 +366,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 48 cases" 48 "$count"
+expect_eq "capture records 50 cases" 50 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -383,10 +385,12 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 48 "$loc_n"
+expect_eq "lcall stub invocations" 50 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "A26 duplicate read-only" ok "A26${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "A27 read-only with a value" ok "A27${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B16 inspect of a missing container" ok "B16${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "B15 missing state root" ok "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "D01 tail without value" ok "D01${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -465,12 +469,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
-cmp_has "layer A summary" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
 cmp_has "layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
-cmp_has "lcall layer A summary" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "lcall layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
 cmp_has "lcall layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
 
 compare ok diff
@@ -480,7 +484,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
-cmp_has "non-linux layer A all match" 'layer A (syntax): match=25 mismatch=0 missing=0'
+cmp_has "non-linux layer A all match" 'layer A (syntax): match=27 mismatch=0 missing=0'
 cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=15 missing=0'
 
 # ケース欠落は MISSING

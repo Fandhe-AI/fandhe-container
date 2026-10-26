@@ -67,7 +67,7 @@
 //!   `additionalGids` の写像外・単一 ID 写像での指定は launcher が fork の前に拒否する
 //! - （適用済み）`root.readonly=true` は pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足して適用する
 //!   （`mount_setattr`。`nodev` 等の既存属性を落とさず rootless でも成り立つ。`/proc`・`/dev` 系・tmpfs・bind は自分の属性のまま。
-//!   Landlock の規則も同じ config の値から決まる。CORE-5・SEC-1・SUP-12・#2767）
+//!   Landlock の規則も同じ実効値から決まる。実効値は config の値と起動オプション `--read-only` の OR で、狭める方向のみ。CLI-1・CORE-5・SEC-1・SUP-12・#2767・#2828）
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は、root が書き込み可能な間は未対応で、`root.readonly=true` なら `ro` で適用する）

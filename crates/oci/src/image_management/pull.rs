@@ -11,7 +11,8 @@
 //!
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
 //! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡す。
-//! cri の `image_pull` からの配線は後続で扱う（本モジュールは oci 内で完結する）。
+//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
+//! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
 //! - (C) 公開: 取得と digest 検証が済んだら、排他区間の下で「ステージングから `blobs/sha256` への
 //!   移動」「manifest（在庫と構成）とタグの登録」「自分のリースの解放」を行う（[`PullSession::publish`]）。
@@ -21,7 +22,8 @@
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
 //! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡し、
 //! 取得後に [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
-//! cri の `image_pull` からの配線は後続で扱う（本モジュールは oci 内で完結する）。
+//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
+//! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
 //! ロックの規律: ガードを持ったまま digest 検証（再ハッシュ）・通信をしない。公開直前の完全性は、
 //! 検証時に控えたファイルの指紋（サイズ・時刻・inode 等）の照合で保つ。既存宛先の内容検証は
@@ -62,7 +64,6 @@
 //!   （#2380・`inventory_persist`）。保存の順序は「リース解放の保存 → ステージング削除」で、保存に失敗
 //!   したらテーブルを戻してステージングを消さずに返す。公開の保存に失敗しても公開済みの blob は消さない。
 //!   `system df` のステージング容量の集計は `usage` で実装済み（#2222）。
-//! - cri の `image_pull` からの配線。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -382,6 +383,25 @@ impl ImageStore {
                 return Err(e);
             }
         };
+        // リースの永続化（root の fsync を伴う）より前に `staging/<id>` のエントリを永続化する。これを怠ると、
+        // 永続化済みのリースが残ったまま電源断で `staging/<id>` だけが失われ、不在を確認できない孤児リースが
+        // 生じうる（#2539・OCI-7）。`staging` 自身と、新規作成されたかもしれない `staging` の親（root）の両方を
+        // fsync する。失敗したら作成直後の pull ディレクトリを消して返す（他者は未使用）。
+        // 回収判定（`probe_pull`）は `@pull.lock` の有無で「非空だがロックなし」を `Undetermined` にするため、
+        // `@pull.lock` 自体と、そのエントリを持つ `staging/<id>` を先に永続化する。順序は
+        // lock → pull_dir → staging → root。
+        if pull_lock.sync_all().is_err()
+            || pull_dir.sync().is_err()
+            || staging.sync().is_err()
+            || self.handle().sync().is_err()
+        {
+            drop(pull_lock);
+            let _ = super::pull_recovery::reclaim_dir(&staging, &id);
+            return Err(err(
+                OciErrorCode::Internal,
+                "failed to sync pull staging directory",
+            ));
+        }
         let dir = self.root().join(STAGING_DIR_NAME).join(id.as_str());
         Ok(PullSession {
             store: self,
@@ -1028,6 +1048,19 @@ impl PullSession<'_> {
                                     continue;
                                 }
                             }
+                            // symlink・FIFO 等の通常ファイルでない宛先（ディレクトリを除く）は、検証済みの
+                            // ステージングで原子的に置き換える。rename は名前を置き換えるだけで、symlink の先
+                            // には書き込まない（cri の従来の公開と同じ。#2539・OCI-1・SEC）。
+                            Ok(Some(m)) if !m.is_dir() => {
+                                bd.rename_from(&self.pull_dir, hex, hex).map_err(|_| {
+                                    err(
+                                        OciErrorCode::Internal,
+                                        "failed to replace blob destination",
+                                    )
+                                })?;
+                                moved.push(b.clone());
+                                continue;
+                            }
                             _ => {
                                 return Err(err(
                                     OciErrorCode::FailedPrecondition,
@@ -1612,6 +1645,17 @@ mod tests {
             );
             assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         }
+    }
+
+    /// OCI-7・#2539: begin 直後に `staging/<id>/@pull.lock` があり、begin が staging を fsync しても
+    /// 正常系は成功する（孤児リースの窓を塞ぐ fsync の配線の回帰確認）。
+    #[test]
+    fn oci7_begin_pull_creates_lock_in_synced_staging() {
+        let root = Root::new("begin-sync");
+        let store = ImageStore::open(&root.0).unwrap();
+        let s = store.begin_pull(pid("p1")).unwrap();
+        assert!(s.staging_dir().join(PULL_LOCK_FILE_NAME).is_file());
+        assert_eq!(fs::read_dir(root.0.join("staging")).unwrap().count(), 1);
     }
 
     /// OCI-7: 1 セッションの blob 件数に上限があり、超過してもテーブルは変わらない。

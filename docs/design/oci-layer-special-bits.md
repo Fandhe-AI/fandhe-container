@@ -245,3 +245,12 @@ PullImage の読み取り（#2534）: cri の `image_pull.rs` の `oci1_sec_conf
 `oci1_repair5_pull_rejects_fifo_unpack_record_without_hanging`・`oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs`・
 `oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published`。blob の信頼判定は oci の `check_blob_trust` に
 一本化し、`layer.rs` の `oci1_sec_blob_trust_*` で照合する。
+
+pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監査 P3・SEC-5・CORE-6）: 展開結果は pull 時の所有者写像に
+依存する（rootfs の所有者は pull 時の `ExtractOptions` で決まる）。pull の後に subuid / subgid の割り当てが変わると、start 時の
+写像と展開済み rootfs の所有者が食い違う。検出は、公開済みエントリの展開設定の記録（`unpack-record` の設定行。
+`encode_extract_options` が id map の行を含む）を正とする。pull と create は `ImageExtractConfig` の 1 か所から同じ値を受け、
+食い違えば既存の `check_unpack_record` が `FAILED_PRECONDITION` で拒否する。start 時の写像（`image_ownership` の解決結果）と
+記録の照合の口は、`ChownMapped` / `ChownInUserNamespace` を本番へ配線するとき（#2592・#2377・#2241・#2315・#482）に足す。
+本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、今は検出は効かない（実装済みを装わない。REPAIR-3）。
+詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。

@@ -486,6 +486,8 @@ mod tests {
                 let mut m =
                     NlMsgBuilder::new(newrule, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
                 NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0).put_into(&mut m)?;
+                m.put_attr(1, b"t\0")?;
+                m.put_attr(2, b"c\0")?;
                 Ok(m)
             })
             .expect("push");
@@ -496,6 +498,8 @@ mod tests {
             NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0)
                 .put_into(&mut m)
                 .expect("nfg");
+            m.put_attr(1, b"t\0").expect("table");
+            m.put_attr(2, b"c\0").expect("chain");
             m.put_attr(3, &handle.to_be_bytes()).expect("handle");
             m.finish().expect("finish")
         };

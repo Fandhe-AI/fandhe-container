@@ -490,7 +490,8 @@ impl VerifiedLayerBlob {
     /// ストア（ステージング）の所有者の uid で、省略できない（fail-closed）。
     /// エラー: 存在しなければ `NotFound`、通常ファイルでなければ（symlink を含む）`InvalidArgument`、開く間の差し替えと
     /// 信頼条件の違反は `FailedPrecondition`。
-    /// 非 Unix: ハンドルの同一性と所有者を標準ライブラリで確かめられないため、開かずに `Unimplemented` で拒否する。
+    /// 非 Unix: ハンドルの同一性と所有者を標準ライブラリで確かめられないため、開かずに `Unimplemented` で拒否する
+    /// （`from_file` / `from_file_with` も同様に `Unimplemented`）。
     pub fn open_with(
         recorder: &dyn OciOpRecorder,
         path: &Path,
@@ -538,6 +539,14 @@ impl VerifiedLayerBlob {
         size: u64,
         owner: u32,
     ) -> Result<Self, OciError> {
+        // 非 Unix: 所有者・権限・ハードリンク数を確かめられないため、ハンドルからの構築も拒否する（fail-closed）。
+        // 信頼条件を検証できる方式が入るまで `open_with` と同じく `Unimplemented`（OCI-7・SEC-1）。
+        if cfg!(not(unix)) {
+            return Err(OciError::new(
+                OciErrorCode::Unimplemented,
+                "blob trust check from a handle is not supported on this platform",
+            ));
+        }
         let meta = file.metadata().map_err(map_io_error)?;
         if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
             return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
@@ -1160,6 +1169,18 @@ mod tests {
         assert_eq!(v[0].outcome(), OciOpOutcome::Success);
         assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-7・SEC-1・CRI-3・#2893: 非 Unix では信頼条件を確かめられないため、ハンドルからの構築も `Unimplemented`。
+    #[cfg(not(unix))]
+    #[test]
+    fn oci7_verified_layer_blob_from_file_is_unimplemented_on_non_unix() {
+        let d = tmp_dir("from-file-nonunix");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let abc = Digest::parse(ABC).unwrap();
+        let e = VerifiedLayerBlob::from_file(File::open(&p).unwrap(), &abc, 3, 0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
     }
 
     /// OCI-7・SEC-1・CRI-3・#2893: `from_file` は渡されたハンドルの digest・サイズ・信頼条件を確かめて構築する。

@@ -387,7 +387,14 @@ impl ImageStore {
         // 永続化済みのリースが残ったまま電源断で `staging/<id>` だけが失われ、不在を確認できない孤児リースが
         // 生じうる（#2539・OCI-7）。`staging` 自身と、新規作成されたかもしれない `staging` の親（root）の両方を
         // fsync する。失敗したら作成直後の pull ディレクトリを消して返す（他者は未使用）。
-        if staging.sync().is_err() || self.handle().sync().is_err() {
+        // 回収判定（`probe_pull`）は `@pull.lock` の有無で「非空だがロックなし」を `Undetermined` にするため、
+        // `@pull.lock` 自体と、そのエントリを持つ `staging/<id>` を先に永続化する。順序は
+        // lock → pull_dir → staging → root。
+        if pull_lock.sync_all().is_err()
+            || pull_dir.sync().is_err()
+            || staging.sync().is_err()
+            || self.handle().sync().is_err()
+        {
             drop(pull_lock);
             let _ = super::pull_recovery::reclaim_dir(&staging, &id);
             return Err(err(

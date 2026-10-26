@@ -220,6 +220,11 @@ mod imp {
             .map(File::from)
         }
 
+        /// `<root>/staging/<id>` 自身を fsync する（直下の `@pull.lock` のエントリを永続化する。OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            File::from(self.0.try_clone()?).sync_all()
+        }
+
         /// 生存確認のために `@pull.lock` を開く（作成しない・symlink は辿らない・FIFO で止まらない）。
         pub(crate) fn open_lock_for_probe(&self, name: &str) -> io::Result<File> {
             open_in(
@@ -438,6 +443,18 @@ mod imp {
                 opts.mode(0o600);
             }
             opts.open(self.0.join(name))
+        }
+
+        /// `<root>/staging/<id>` 自身を fsync する（Windows は std で開けないため何もしない。OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                File::open(&self.0)?.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(())
+            }
         }
 
         /// 生存確認のために `@pull.lock` を開く（作成しない。Windows の `LockFileEx` は読み書き権限が要る）。

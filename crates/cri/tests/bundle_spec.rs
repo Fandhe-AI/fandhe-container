@@ -1840,6 +1840,17 @@ fn port_mappings_are_accepted_only_with_pod_netns() {
         network_entry(&v).unwrap(),
         &serde_json::json!({"type": "network", "path": POD_NETNS})
     );
+    // コンテナ側の network が POD 以外だと DNAT の宛先と netns が食い違うため UNIMPLEMENTED。
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    for bad in [NamespaceMode::Node, NamespaceMode::Container] {
+        let c = with_sc(|sc| {
+            sc.namespace_options = Some(ns(bad, NamespaceMode::Pod, NamespaceMode::Pod));
+        });
+        let e =
+            build_runtime_config_with_pod_netns(&p, &c, &ImageDefaults::default(), Some(POD_NETNS))
+                .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    }
     // host_port 0（公開しない）は netns が無くても受ける。
     p.port_mappings = vec![port_mapping(0, 0, 80, "")];
     assert!(build_runtime_config(&p, &ctr(), &ImageDefaults::default()).is_ok());

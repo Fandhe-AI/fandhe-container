@@ -1220,9 +1220,8 @@ fn build_inner(
     }
     // port_mappings は検証し、公開する要素があるときは pod の netns（公開先）が無ければ拒否する。
     // 公開そのものは RunPodSandbox の結線（`publish_port`）が行い、config.json には何も出さない（#2676）。
-    if !crate::port_mapping::parse_port_mappings(&sandbox.port_mappings)?.is_empty()
-        && pod_netns.is_none()
-    {
+    let has_publish = !crate::port_mapping::parse_port_mappings(&sandbox.port_mappings)?.is_empty();
+    if has_publish && pod_netns.is_none() {
         return Err(unsupported("port_mappings"));
     }
     let hostname = check_hostname(&sandbox.hostname)?;
@@ -1404,6 +1403,16 @@ fn build_inner(
             .and_then(|l| l.security_context.as_ref())
             .and_then(|s| s.namespace_options.as_ref())
     });
+    // 公開（DNAT）の宛先は pod の netns。コンテナの network が POD 以外だと宛先とコンテナの netns が食い違うため拒否する。
+    if has_publish {
+        let mode = resolve_mode(
+            "namespace_options.network",
+            ns_opts.map_or(0, |o| o.network),
+        )?;
+        if !matches!(mode, NamespaceMode::Pod) {
+            return Err(unsupported("port_mappings"));
+        }
+    }
     let namespaces = namespaces(ns_opts, pod, pod_netns)?;
 
     let resources = match linux.and_then(|l| l.resources.as_ref()) {

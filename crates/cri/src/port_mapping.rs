@@ -149,13 +149,14 @@ pub fn parse_port_mappings(mappings: &[PortMapping]) -> Result<Vec<PodPortPublis
                     }
                     has_unsupported = true;
                 } else {
+                    // 確保前に上限を検証する（公開 API。呼び出し元の件数制限を前提にしない）。
+                    if out.len() >= MAX_PORT_PUBLISHES {
+                        return Err(invalid());
+                    }
                     out.push(p);
                 }
             }
         }
-    }
-    if out.len() > MAX_PORT_PUBLISHES {
-        return Err(invalid());
     }
     if has_unsupported {
         return Err(unsupported());
@@ -276,6 +277,18 @@ mod tests {
         assert_eq!(parse_port_mappings(&many(64)).expect("64").len(), 64);
         assert_eq!(
             code(parse_port_mappings(&many(65))),
+            CriErrorCode::InvalidArgument
+        );
+    }
+
+    /// CRI-2: 65 件目で打ち切る（大量の入力でも確保量・重複判定の走査が上限で止まる）。
+    #[test]
+    fn cri2_rejects_at_65th_before_scanning_the_rest() {
+        let many: Vec<PortMapping> = (0..5000)
+            .map(|i| m(0, 1000 + (i % 60000), 80, "192.0.2.10"))
+            .collect();
+        assert_eq!(
+            code(parse_port_mappings(&many)),
             CriErrorCode::InvalidArgument
         );
     }

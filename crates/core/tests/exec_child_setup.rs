@@ -410,6 +410,7 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                    code: ViolationReason::EntrypointInterpreterIsRuntimeBinary.error_code(),
                 },
                 "{name}"
             );
@@ -506,6 +507,7 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointCopyTooLarge),
+                code: ViolationReason::EntrypointCopyTooLarge.error_code(),
             }
         );
         assert_eq!(observation.report, None);
@@ -527,6 +529,7 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
                 }
             );
             assert_eq!(observation.report, None);
@@ -552,6 +555,7 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
             }
         );
         assert_eq!(observation.report, None);
@@ -593,6 +597,7 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
             }
         );
         assert_eq!(observation.report, None);
@@ -705,6 +710,7 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(125),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
                 }
             );
             assert_eq!(observation.report, None);
@@ -828,6 +834,7 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
             }
         );
         assert_eq!(observation.report, None);
@@ -857,6 +864,7 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(127),
                 violation: None,
+                code: ErrorCode::NotFound,
             }
         );
         assert!(!observation.exit.command_started());
@@ -869,6 +877,7 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
+                code: ViolationReason::EntrypointIsRuntimeBinary.error_code(),
             }
         );
         // 対照: 手順を通った子は「起動した」側に分類される。
@@ -1071,6 +1080,7 @@ exec "$2" "$3" "$1""#;
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
                 },
                 "{name}"
             );

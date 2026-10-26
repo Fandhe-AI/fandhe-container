@@ -1104,6 +1104,7 @@ impl CriRuntimeService {
     ///
     /// kubelet が約 5 秒ごとに呼ぶため待ちを持たない: I/O・スレッド生成・実行層の呼び出し・レジストリのロック取得を
     /// 一切せず、持っている構成だけで判定する（REPAIR-5 の期限は構造上いらない）。
+    /// 死活確認は足さない（#2897。判断と再評価条件は `docs/design/cri-status-rpc.md`）。
     ///
     /// - `RuntimeReady`: 実行層を注入済み（`with_runtime`）かつレジストリが poisoned でないとき真。未接続は
     ///   `RuntimeNotConnected`、poisoned は `RuntimeStateUnavailable` で偽（記録だけの構成を ready と装わない）。

@@ -375,10 +375,27 @@ pub fn sweep_leftover_container_logs(
     Some(report)
 }
 
+/// supervisor ログの期限つき削除の結果を `container_delete_cleanup` の結果へ写す（#2894・ERR-1）。
+///
+/// 枠の満杯（`Busy`。何も実行していない）は期限切れ（`Timeout`）と区別して `ResourceExhausted` にする。
+/// `Finished` は期限内に作業を終えた best effort（個々の失敗は削除関数が握る）。
+pub(crate) fn supervisor_log_cleanup_outcome(outcome: &LogRemoval) -> CleanupOutcome {
+    match outcome {
+        LogRemoval::Finished => CleanupOutcome::Removed,
+        LogRemoval::TimedOut => CleanupOutcome::Kept {
+            code: ErrorCode::Timeout,
+        },
+        LogRemoval::Busy => CleanupOutcome::Kept {
+            code: ErrorCode::ResourceExhausted,
+        },
+    }
+}
+
 /// 起動時の走査の結果の構造化ログ 1 行（`event: container_log_sweep`。#2760・REPAIR-4）。件数だけで、パス・ID は含めない。
+/// `workers_busy` は枠の満杯で打ち切ったことを示し、期限切れの `timed_out` とは別（#2894）。
 pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) -> String {
     format!(
-        "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{}}}",
+        "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{},\"workers_busy\":{}}}",
         r.scanned,
         r.reclaimed_ids,
         r.removed_files,
@@ -386,7 +403,8 @@ pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) ->
         r.skipped_present,
         r.skipped_undecodable,
         r.failed,
-        r.timed_out
+        r.timed_out,
+        r.workers_busy
     )
 }
 
@@ -782,17 +800,11 @@ impl CoreLifecycleRuntime {
         if let Ok(name) = OpName::new("supervisor_log_remove") {
             let result = match outcome {
                 LogRemoval::Finished => OpOutcome::Success,
-                LogRemoval::TimedOut => OpOutcome::Failure,
+                LogRemoval::TimedOut | LogRemoval::Busy => OpOutcome::Failure,
             };
             let _ = self.recorder.record(&name, result, started.elapsed());
         }
-        // `Finished` は期限内に作業を終えた best effort（個々の失敗は削除関数が握る）。
-        match outcome {
-            LogRemoval::Finished => CleanupOutcome::Removed,
-            LogRemoval::TimedOut => CleanupOutcome::Kept {
-                code: ErrorCode::Timeout,
-            },
-        }
+        supervisor_log_cleanup_outcome(&outcome)
     }
 
     /// コンテナログ（現在ログ・全世代・ロック）を消す。core の `delete` が成功した後にだけ呼ぶ（失敗した delete で
@@ -807,7 +819,7 @@ impl CoreLifecycleRuntime {
     ///
     /// # Errors
     /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（待ちの期限まで同じ ID の sink が閉じなかった）・
-    /// `Timeout`（期限切れか枠の満杯）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
+    /// `Timeout`（期限切れ）・`ResourceExhausted`（枠の満杯。何も実行していない。#2894）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
     pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
         let Some(root) = self.store.host_state_root() else {
             return Ok(RemovedLogs::default());
@@ -1434,6 +1446,53 @@ mod tests {
         assert_eq!(
             options_cleanup_warning_line(&id, ErrorCode::Timeout),
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+    }
+
+    /// #2894・ERR-1: 枠の満杯（`Busy`）は期限切れ（`Timeout`）と別のコード（`RESOURCE_EXHAUSTED`）で警告行に出る。
+    #[test]
+    fn err1_2894_supervisor_log_busy_is_not_timeout() {
+        assert_eq!(
+            supervisor_log_cleanup_outcome(&LogRemoval::Busy),
+            CleanupOutcome::Kept {
+                code: ErrorCode::ResourceExhausted
+            }
+        );
+        assert_eq!(
+            supervisor_log_cleanup_outcome(&LogRemoval::TimedOut),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Timeout
+            }
+        );
+        assert_eq!(
+            supervisor_log_cleanup_outcome(&LogRemoval::Finished),
+            CleanupOutcome::Removed
+        );
+        let id = cid("c1");
+        assert_eq!(
+            cleanup_warning_line(
+                &id,
+                CleanupTarget::SupervisorLog,
+                ErrorCode::ResourceExhausted
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            options_cleanup_warning_line(&id, ErrorCode::ResourceExhausted),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+    }
+
+    /// #2894: 走査の要約行は `workers_busy` を `timed_out` と別に出す。
+    #[test]
+    fn err1_2894_sweep_summary_line_has_workers_busy() {
+        let r = fandhe_container_supervisor::logs::SweepReport {
+            workers_busy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sweep_summary_line(&r),
+            "{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":0,\"reclaimed_ids\":0,\"removed_files\":0,\"skipped_live\":0,\"skipped_present\":0,\"skipped_undecodable\":0,\"failed\":0,\"timed_out\":false,\"workers_busy\":true}"
         );
     }
 

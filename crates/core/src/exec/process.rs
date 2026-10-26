@@ -121,8 +121,8 @@ use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{
-    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_exec_returned,
-    report_failure, report_ready,
+    ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
+    report_exec_returned, report_failure, report_ready,
 };
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
@@ -545,7 +545,7 @@ fn verify_pivot_root(pivot_mnt_id: u64) -> Result<(), ExecError> {
 /// launch の PID 1 の終端（`run_child`）。[`exec_entrypoint_verified_with`] の手順に、状態 pipe `status` への
 /// 2 行目の報告を足したもの（SEC-4・#2624。ワイヤー形式は `launch_status` の「exec 前の 2 行目」）。
 ///
-/// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <CODE> <reason|->` を書いて失敗を返し、全手順が
+/// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <step> <CODE> <reason|->`（`step` は失敗した手順の固定語彙。#2895）を書いて失敗を返し、全手順が
 /// 通ったら `R` を書いてから `execveat` する（`R` を書けなければ `execveat` へ進まない。fail-closed）。`R` の後の
 /// `execveat` 自体が errno で失敗したら `X <CODE>`（errno の分類のみ）を書く（`E` は混ぜない。親は `R` の後も
 /// EOF まで読み、`X` を起動失敗として扱う。#2716）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
@@ -559,20 +559,23 @@ fn exec_entrypoint_verified_reporting(
     let Some(status) = status else {
         return exec_entrypoint_verified_with(pivot_mnt_id, entry, nulling);
     };
-    let prepared = verify_pivot_root(pivot_mnt_id).and_then(|()| {
-        prepare_exec_child(
-            entry,
-            Some(status.as_fd()),
-            EntrypointSource::Pinned,
-            None,
-            nulling,
-        )
-        .map_err(|f| *f.error)
-    });
+    // 失敗した手順を `E <step> ...` の段として運ぶ（#2895）。`prepare_exec_child` の段は共有語彙のまま写す。
+    let prepared = verify_pivot_root(pivot_mnt_id)
+        .map_err(|e| (ExecPhaseStep::VerifyRoot, Box::new(e)))
+        .and_then(|()| {
+            prepare_exec_child(
+                entry,
+                Some(status.as_fd()),
+                EntrypointSource::Pinned,
+                None,
+                nulling,
+            )
+            .map_err(|f| (ExecPhaseStep::Child(f.step), f.error))
+        });
     match prepared {
-        Err(err) => {
-            report_exec_failure_best_effort(status, &err);
-            Err(err)
+        Err((step, err)) => {
+            report_exec_failure_best_effort(status, step, &err);
+            Err(*err)
         }
         Ok(exe) => {
             report_exec_ready(status)?;
@@ -592,8 +595,8 @@ fn exec_entrypoint_verified_reporting(
 }
 
 /// `execveat` 前の失敗を状態 pipe へ書く。書けなくても元のエラーを返す（親は EOF を起動失敗として扱う）。
-fn report_exec_failure_best_effort(status: &std::fs::File, err: &ExecError) {
-    if report_exec_failure(status, err).is_err() {
+fn report_exec_failure_best_effort(status: &std::fs::File, step: ExecPhaseStep, err: &ExecError) {
+    if report_exec_failure(status, step, err).is_err() {
         let _ = writeln!(
             std::io::stderr(),
             "fandhe-container: the exec phase status could not be reported"
@@ -1372,14 +1375,16 @@ fn do_execve(entry: &Entrypoint, _exe: &ExecutableFd) -> SysError {
 /// | --------- | --------------- |
 /// | `parent_lifetime` | 対応なし（launch の PID 1 は親死亡シグナルで縛らない） |
 /// | `cgroup_join` | 対応なし（launch の cgroup 参加は `StagePipeline` の段で、状態 pipe の対象外） |
-/// | `close_fds` から `stdio_null` | 同じ `prepare_exec_child` の手順。launch では `E <CODE> <reason>` の行（段は運ばない） |
+/// | `close_fds` から `stdio_null` | 同じ `prepare_exec_child` の手順。launch では `E <step> <CODE> <reason>` の行で同じトークンを運ぶ（#2895。`deferred_rlimit` は launch が持ち越しの `RLIMIT_FSIZE` を持たないため実際には届かない） |
 /// | `report_ready` | `R` を書けない場合（専用の行は無い。書けなければ `execveat` へ進まない） |
 /// | `execveat` | `X <CODE>`（`R` の後だけ。errno の写像は同じ `exec_errno_to_code`） |
 ///
 /// launch の `F <step>`（`PrePivotStep` の 14 段）に対応する exec の段は無い（exec は pivot しない）。
 /// worker 側の段（`SetNs`・`CgroupJoin`・`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Landlock`・`Seccomp`。fork の前）の
 /// 失敗は supervisor の `err` 行の `TraitError`（`exec stage {:?}: <message>`）で届き、`SetupFailed` には載らない。
-/// launch の `E` 行に段を足すことは範囲外。
+/// launch の `E` 行は、この語彙のうち上表の `close_fds` から `stdio_null` の 11 段だけを受け（それ以外は親が
+/// `Malformed` にする）、加えて launch だけの段 `verify_caller`・`restriction_evidence`・`verify_root` を運ぶ
+/// （`launch_status::ExecPhaseStep`。#2895）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExecChildStep {
@@ -2435,14 +2440,19 @@ fn run_child(
     let status = setup.and_then(|s| s.status);
     run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
+        // 失敗した検証を `E <step> ...` の段として運ぶ（#2895）。
         let checked = isolation
             .verify_caller(IsolationStage::Exec)
-            .and_then(|()| require_restriction_evidence(evidence));
-        if let Err(err) = checked {
+            .map_err(|e| (ExecPhaseStep::VerifyCaller, Box::new(e)))
+            .and_then(|()| {
+                require_restriction_evidence(evidence)
+                    .map_err(|e| (ExecPhaseStep::RestrictionEvidence, Box::new(e)))
+            });
+        if let Err((step, err)) = checked {
             if let Some(status) = status {
-                report_exec_failure_best_effort(status, &err);
+                report_exec_failure_best_effort(status, step, &err);
             }
-            return Err(err);
+            return Err(*err);
         }
         exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status)
     })
@@ -5193,6 +5203,44 @@ mod tests {
                 step: Some(ExecChildStep::CgroupJoin),
             }
         );
+    }
+
+    /// 段 `parent_lifetime` の CODE は親の消失なら `FAILED_PRECONDITION`、syscall の予期しない失敗なら
+    /// `INTERNAL` で、行と復号の具体値が一致する（SUP-6・REPAIR-4・#2895）。
+    #[test]
+    fn sup6_2895_parent_lifetime_code_roundtrips() {
+        let exit = ChildExit::Exited(EXIT_SETUP_FAILED);
+        for (code, line) in [
+            (
+                ErrorCode::Internal,
+                &b"125 parent_lifetime INTERNAL -\n"[..],
+            ),
+            (
+                ErrorCode::FailedPrecondition,
+                b"125 parent_lifetime FAILED_PRECONDITION -\n",
+            ),
+        ] {
+            // 他スレッドの fork による読み取り失敗に備え、毎回 pipe の作成から再試行する（REPAIR-12）。
+            let result = (0..200)
+                .find_map(|_| {
+                    let (reader, writer) = exec_status_pipe().unwrap();
+                    report_exec_child_failure(&writer, ExecChildStep::ParentLifetime, code);
+                    drop(writer);
+                    read_exec_status(&reader, exit).ok()
+                })
+                .expect("readable");
+            assert_eq!(
+                result,
+                ExecExit::SetupFailed {
+                    exit,
+                    violation: None,
+                    code,
+                    step: Some(ExecChildStep::ParentLifetime),
+                },
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
     }
 
     /// 不正な段・長すぎる語・語数の過不足・`execveat` と `R` の不整合は、すべて段なし・`Internal` の未起動に落ちる

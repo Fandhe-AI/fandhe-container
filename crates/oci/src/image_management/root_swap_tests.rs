@@ -265,10 +265,90 @@ fn open_store(root: &Path) -> ImageStore {
         .with_timeout(Duration::from_millis(500))
 }
 
+/// `open_verified_staged_blob` で開いたハンドルの全内容を読む。
+fn read_verified(s: &super::pull::PullSession<'_>, d: &Digest) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    s.open_verified_staged_blob(d)
+        .expect("open verified")
+        .read_to_end(&mut body)
+        .expect("read");
+    body
+}
+
+/// 検証済みの 1 blob を持つ pull を作る（`staging/p1/<hex>` に `layer-bytes`）。
+fn verified_pull(store: &ImageStore) -> (super::pull::PullSession<'_>, Digest, String) {
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    let layer = sha_of(b"layer-bytes");
+    let mut w = s.open_staged_blob(&layer).expect("writer");
+    w.write_all(b"layer-bytes").expect("write");
+    w.commit().expect("commit");
+    s.verify_staged_blob(&layer, 1 << 20).expect("verify");
+    let hex = layer.to_string().replace("sha256:", "");
+    (s, layer, hex)
+}
+
+/// OCI-7・SEC-1・CRI-3・#2893: 検証後に `<root>/staging` を別名へ移して同名のおとりを置いても、
+/// 検証後の読み取りは検証済みの blob を返し、おとりは読まれず無傷である。
+#[test]
+fn oci7_sec1_staging_swapped_after_verify_reads_verified_blob() {
+    let root = temp_root("stg-swap");
+    let store = open_store(&root);
+    let (s, layer, hex) = verified_pull(&store);
+    let moved = root.join("staging-moved");
+    fs::rename(root.join("staging"), &moved).expect("move staging");
+    let decoy = root.join("staging").join("p1");
+    fs::create_dir_all(&decoy).expect("decoy");
+    fs::write(decoy.join(&hex), b"decoy-bytes").expect("decoy blob");
+    assert_eq!(read_verified(&s, &layer), b"layer-bytes");
+    assert_eq!(fs::read(decoy.join(&hex)).expect("intact"), b"decoy-bytes");
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// OCI-7・SEC-1・CRI-3・#2893: 検証後に pull ディレクトリ（`staging/p1`）を別名へ移して同名のおとりを置いても、
+/// 検証後の読み取りは検証済みの blob を返し、おとりは無傷である。
+#[test]
+fn oci7_sec1_pull_dir_swapped_after_verify_reads_verified_blob() {
+    let root = temp_root("pd-swap");
+    let store = open_store(&root);
+    let (s, layer, hex) = verified_pull(&store);
+    let staging = root.join("staging");
+    fs::rename(staging.join("p1"), staging.join("p1-moved")).expect("move pull dir");
+    fs::create_dir(staging.join("p1")).expect("decoy");
+    fs::write(staging.join("p1").join(&hex), b"decoy-bytes").expect("decoy blob");
+    assert_eq!(read_verified(&s, &layer), b"layer-bytes");
+    assert_eq!(
+        fs::read(staging.join("p1").join(&hex)).expect("intact"),
+        b"decoy-bytes"
+    );
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// OCI-7・SEC-1・CRI-3・#2893: 取得の途中で `staging/p1` がおとりへ差し替わると、パス起点の副作用へ進む前の
+/// `check_staging_dir_current` が `Internal` で拒否し、差し替え前は通る。
+#[test]
+fn oci7_sec1_check_staging_dir_current_rejects_swapped_pull_dir() {
+    let root = temp_root("chk-cur");
+    let store = open_store(&root);
+    let (s, _layer, _hex) = verified_pull(&store);
+    s.check_staging_dir_current().expect("unswapped");
+    let staging = root.join("staging");
+    fs::rename(staging.join("p1"), staging.join("p1-moved")).expect("move pull dir");
+    fs::create_dir(staging.join("p1")).expect("decoy");
+    let e = s.check_staging_dir_current().unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::Internal);
+    assert_eq!(e.message(), "image store root changed after open");
+    assert!(names(&staging.join("p1")).is_empty());
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// OCI-7・SEC-1・#2694: `begin_pull` の排他区間の直後に root が差し替わっても、staging・pull ディレクトリ・
 /// `@pull.lock` は検査済みの root にだけ作られ、おとりは空のまま。`open_staged_blob` の書き込み先も検査済みの
-/// root の pull ディレクトリ（#2765）で、検証後のパス API `staged_blob_read_path` は差し替えを検出して
-/// `Internal` で拒否し、次の `lock` も入口の再検査で `Internal` になる。
+/// root の pull ディレクトリ（#2765）で、検証後の読み取り（`open_verified_staged_blob`。#2893）は検査済みの
+/// root の検証済み blob を返し（同名のおとりは読まない）、次の `lock` は入口の再検査で `Internal` になる。
 #[test]
 fn oci7_sec1_root_swapped_during_begin_pull_keeps_staging_in_verified_root() {
     let root = temp_root("bp");
@@ -294,9 +374,14 @@ fn oci7_sec1_root_swapped_during_begin_pull_keeps_staging_in_verified_root() {
     );
     assert_eq!(names(&root), Vec::<String>::new());
     s.verify_staged_blob(&layer, 1 << 20).expect("verify");
-    let e = s.staged_blob_read_path(&layer).expect_err("swapped root");
-    assert_eq!(e.code(), OciErrorCode::Internal);
-    assert_eq!(e.message(), "image store root changed after open");
+    let decoy_dir = root.join("staging").join("p1");
+    fs::create_dir_all(&decoy_dir).expect("decoy pull dir");
+    fs::write(decoy_dir.join(&hex), b"decoy-bytes").expect("decoy blob");
+    assert_eq!(read_verified(&s, &layer), b"layer-bytes");
+    assert_eq!(
+        fs::read(decoy_dir.join(&hex)).expect("decoy intact"),
+        b"decoy-bytes"
+    );
     let Err(e) = store.lock() else {
         panic!("a swapped root must be rejected at the entrance")
     };

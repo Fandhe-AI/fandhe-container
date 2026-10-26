@@ -25,9 +25,12 @@
 //!
 //! fetcher（`RegistryClient::fetch_blob`）の書き込み先も、`PullSession::open_staged_blob` が返す
 //! `StagedBlobWriter` が `PullDir` の fd 起点（`create_new_file` で `<hex>.part` を排他作成し、`link_name` で
-//! `<hex>` へ確定、`unlink` で `.part` を消す）で行う。パスは渡さない。`PullDir::matches_path` は、読み取り用に
-//! 返すパス（`PullSession::staged_blob_read_path`）が保持している pull ディレクトリと同じ実体を指すことを確かめる
-//! 用途に限って使う。
+//! `<hex>` へ確定、`unlink` で `.part` を消す）で行う。パスは渡さない。
+//!
+//! # 検証後の読み取り（#2893）
+//!
+//! 検証後の読み取りも、`PullSession::open_verified_staged_blob` が `PullDir::open_nofollow` で開いたハンドルを
+//! 渡す。パスは返さず、パスで辿った pull ディレクトリの照合も要らない。
 
 pub(crate) use imp::{PullDir, StagingDir};
 
@@ -299,7 +302,7 @@ mod imp {
                 .map_err(|e| io::Error::other(e.message().to_owned()))
         }
 
-        /// `p`（パスで辿った pull ディレクトリ）が、この fd と同じ実体か（dev / ino の照合）。
+        /// `p`（パスで辿った pull ディレクトリ）が、この fd と同じ実体か（dev / ino の照合。OCI-7・SEC-1・#2893）。
         pub(crate) fn matches_path(&self, p: &Path) -> bool {
             let Ok(mine) = self.dir_meta() else {
                 return false;

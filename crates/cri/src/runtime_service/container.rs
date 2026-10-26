@@ -6,7 +6,7 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`message`・`info` は空のスタブ（`image_ref`・`image_id` は CreateContainer 時の解決結果を返し、報告の無い経路は空。#2831）（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`message`・`info` は方針として常に空（#2901。`image_ref`・`image_id` は CreateContainer 時の解決結果を返し、報告の無い経路は空。#2831。`image` は在庫のタグ）（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの扱いは `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
@@ -225,20 +225,27 @@ impl ContainerRecord {
     /// 応答項目に無く（秘密値が入り得る）、返さない。`exit_code` は実行層が報告した値（不明は 0）、
     /// `reason` は `exit_reason` で導く（`Completed`・`Error`・`OOMKilled`）。
     ///
-    /// **スタブの明示（REPAIR-3・CRI-2）**: 次の項目は返せる情報源が無く、空・`None` のまま。
+    /// - `image`（#2901）: CreateContainer 時に在庫から得た `repo_tags[0]` があれば、containerd と同じく新しい `ImageSpec`
+    ///   （`image` のみ。annotations・`user_specified_image` は落ちる）に置き換える。タグが無い・報告の無い経路は `config.image` のまま。
+    ///   containerd b7a2526 の `container_status.go` L65 は Status のたびに在庫を引くが、本実装は create 時のスナップショット。
+    ///   `to_summary`（ListContainers）は containerd の `toCRIContainer` と同じく置き換えず `config.image` を返す。
+    ///
+    /// **方針として空の項目と未実装の明示（REPAIR-3・CRI-2）**:
     /// - `image_ref`・`image_id`（#2831）: `BundleProvider` が報告した CreateContainer 時の解決結果を返す。
     ///   `image_id` は image ID（`sha256:<config digest>`。`PullImageResponse.image_ref` と同じ）、`image_ref` は在庫の
     ///   `repo_digests[0]`（無ければ image ID）。報告の無い経路（スタブ・外部 bundle）は両方空（digest を推測しない。
-    ///   containerd は空を返さない本リポ固有の挙動）。containerd main cfb18c4 は Status の時点で在庫を引き直すが、
+    ///   containerd は空を返さない本リポ固有の挙動）。containerd b7a2526 は Status の時点で在庫を引き直すが、
     ///   本実装は create 時のスナップショットを返し続ける（既知の差。`docs/design/cri-config-acceptance.md`）。
     /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。
     ///   `applied_user`）を返す。報告の無い経路（スタブ等）と、補助グループが空で実プロセスのグループと一致を保証できない場合は `None`。`supplemental_groups` は重複除去後の最終の
     ///   集合で、主 gid は自動では含めない（containerd は含めることがある既知の差）。`stop_signal` は実際に
     ///   stop で使う解決済みの値（#2771）。
-    /// - `message`: 実行層の応答文字列を外へ出さない方針のため固定文字列のみ許す。OOM でも空。
-    /// - `info`（verbose）: 固定キーの診断情報を将来返す。現状は空。
+    /// - `message`: 常に空（決定。#2901）。containerd が書くのは start 失敗の `retErr.Error()` だけで、実行層の応答文字列を
+    ///   外へ出さない方針に合わない。OOM でも空。
+    /// - `info`（verbose）: 常に空（決定。#2901）。containerd の `info` は config（envs）・OCI spec（ホストパス）等で、
+    ///   内部のパス・構成を出さない方針に合わない。将来値を入れる場合も、キーは `"info"` の 1 つで値は JSON 文字列とする。
     ///
-    /// これらの実装は TASK-59 追補（#2322）の分割 issue で追う。
+    /// 差の詳細は `docs/design/cri-config-acceptance.md`。
     pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
         let linux = self
             .config
@@ -263,7 +270,15 @@ impl ContainerRecord {
             started_at: self.started_at_nanos,
             finished_at: self.finished_at_nanos,
             exit_code: self.exit_code.unwrap_or(0),
-            image: self.config.image.clone(),
+            image: self
+                .resolved_image
+                .as_ref()
+                .and_then(ResolvedImage::tag)
+                .map(|tag| v1::ImageSpec {
+                    image: tag.to_owned(),
+                    ..Default::default()
+                })
+                .or_else(|| self.config.image.clone()),
             image_ref: self
                 .resolved_image
                 .as_ref()
@@ -308,7 +323,7 @@ impl ContainerRecord {
 
     /// ListContainers 応答用の変換（Status の部分集合）。
     ///
-    /// `image_ref`・`image_id` はどちらも image ID（containerd main cfb18c4 の `toCRIContainer` と同じ）。
+    /// `image_ref`・`image_id` はどちらも image ID（containerd b7a2526 の `toCRIContainer` と同じ）。
     /// 報告の無い経路は空（#2831）。
     pub(super) fn to_summary(&self, id: &str) -> v1::Container {
         v1::Container {

@@ -290,7 +290,7 @@ bench-baseline: ## ベンチを実行し baseline.json を再生成する（TASK
 # 実機前提の計測・突き合わせ（make ci には含めない。必須変数は各スクリプト冒頭を参照）
 # --------------------------------------------------
 
-cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT。任意で TIMEOUT=1〜600 秒）または compare（BASELINE/CANDIDATE）を実行する
 	@scripts/targets/cli-parity.sh
 
 fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）

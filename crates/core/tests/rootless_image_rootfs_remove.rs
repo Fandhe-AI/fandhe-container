@@ -24,6 +24,12 @@
 //!   ラッパーは権限ありの回収が消す（#2690。暗黙に userns へ昇格しない）
 //! - `h`: 同じ構成で権限あり（`SubordinateIds`）の create は、印の書き込みと最終の名前への改名を userns の中で
 //!   行って成功し、最上位の mode が元（0700）に戻っている。delete が木を消す（#2690）
+//! - `i2`: 公開済みで状態の無い、最上位が subuid 所有・mode 0700 の木（公開後・状態作成前のクラッシュの跡を、
+//!   状態の削除で再現）を、確かめられない場合は残して `AlreadyExists` で拒否する（#2769。fail-closed）。
+//!   権限なし（`HostEffectiveIds`）は昇格せず残し、別の状態ルートのストアは `ForeignStateRoot` として残し、
+//!   印の無い 0700・subuid 所有のディレクトリも残す
+//! - `i`: 同じ残骸を、元のストアと権限あり（`SubordinateIds`）の次の create が userns の中で孤児と確かめて
+//!   回収し、`AlreadyExists` で止まらずに新しい木を公開する（#2769。`image_rootfs_orphan_reap` 成功 1 件）
 //! - `h2`: 同じ構成で最上位が mode 0555 のとき、mode が 0555 に戻り、ホストから読める印が実効 uid 所有・
 //!   0400・nlink 1 で残る（孤児の回収の厳格照合と整合。#2690）
 //!
@@ -49,6 +55,9 @@ fn main() {
                 .expect("octal mode after --chown-root")
         });
         linux::populate(dir, root_mode);
+    } else if let Some(i) = args.iter().position(|a| a == "--purge") {
+        let dir = args.get(i + 1).expect("directory after --purge");
+        linux::purge(dir);
     } else if args.iter().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -81,7 +90,8 @@ mod linux {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
         CgroupScope, CleanupOutcome, ContainerId, CreateRequest, DeleteRequest, DeleteResponse,
-        ErrorCode, ImageRootfsOwnership, StateRevision, StateStore, TraitError,
+        DeleteStateRequest, ErrorCode, GetStateRequest, ImageRootfsOwnership, StateRevision,
+        StateStore, TraitError,
     };
     use serde_json::json;
 
@@ -109,6 +119,43 @@ mod linux {
     pub fn populate(dir: &str, root_mode: Option<u32>) {
         // userns に入る前にディレクトリを開く（入った後は親の `/proc/<pid>/fd` に頼らない）。
         let root = std::fs::File::open(dir).expect("open target dir");
+        enter_userns();
+        let base = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+        let sub = base.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir sub");
+        std::fs::write(sub.join("f"), b"owned by a subordinate id").expect("write f");
+        std::fs::set_permissions(sub.join("f"), std::fs::Permissions::from_mode(0o444))
+            .expect("chmod f");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("chmod sub");
+        std::os::unix::fs::chown(sub.join("f"), Some(1), Some(1)).expect("chown f");
+        std::os::unix::fs::chown(&sub, Some(1), Some(1)).expect("chown sub");
+        if let Some(mode) = root_mode {
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode))
+                .expect("chmod root");
+            std::os::unix::fs::chown(&base, Some(1), Some(1)).expect("chown root");
+        }
+    }
+
+    /// 後始末の役の子: userns の中で `dir` を中身ごと消す（最上位が subuid 所有・0700 でホストからは開けないため）。
+    /// 印の無い subuid 所有の木のように、core の回収が（意図して）消さない残骸の掃除に使う。
+    pub fn purge(dir: &str) {
+        // 最上位が subuid 所有・0700 のため、ホストの uid では開けない。userns に入ってから経路で開く。
+        enter_userns();
+        let base = PathBuf::from(dir);
+        for entry in std::fs::read_dir(&base).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).expect("remove dir");
+            } else {
+                std::fs::remove_file(&path).expect("remove file");
+            }
+        }
+        // 親（bundle）はホストの実効 uid 所有で userns の中では uid 0 の所有なので、空の `dir` 自身も消せる。
+        std::fs::remove_dir(&base).expect("remove dir itself");
+    }
+
+    /// 子の user namespace に入る（コンテナ 0 → 自 euid、1.. → subuid 範囲）。
+    fn enter_userns() {
         let (euid, egid) = (euid(), std::fs::metadata("/proc/self").expect("stat").gid());
         let maps = source().resolve_id_maps(euid, egid).expect("id maps");
         let helper =
@@ -126,20 +173,51 @@ mod linux {
         )
         .expect("plan");
         isolate_rootless_subordinate(&plan).expect("enter user namespace");
-        let base = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
-        let sub = base.join("sub");
-        std::fs::create_dir(&sub).expect("mkdir sub");
-        std::fs::write(sub.join("f"), b"owned by a subordinate id").expect("write f");
-        std::fs::set_permissions(sub.join("f"), std::fs::Permissions::from_mode(0o444))
-            .expect("chmod f");
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("chmod sub");
-        std::os::unix::fs::chown(sub.join("f"), Some(1), Some(1)).expect("chown f");
-        std::os::unix::fs::chown(&sub, Some(1), Some(1)).expect("chown sub");
-        if let Some(mode) = root_mode {
-            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode))
-                .expect("chmod root");
-            std::os::unix::fs::chown(&base, Some(1), Some(1)).expect("chown root");
+    }
+
+    /// `--purge` の子を期限つきで実行し、`dir` の中身を userns の中で消す（REPAIR-5）。
+    fn purge_via_child(dir: &Path) {
+        let exe = std::env::current_exe().expect("current exe");
+        let mut child = Command::new(exe)
+            .arg("--purge")
+            .arg(dir)
+            .spawn()
+            .expect("spawn purge child");
+        let deadline = Instant::now() + CHILD_DEADLINE;
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert!(status.success(), "purge child failed: {status}");
+                    return;
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("purge child timed out");
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
         }
+    }
+
+    /// 公開後・状態作成前のクラッシュの跡を作る: 権限ありで最上位が subuid 所有・0700 の木を公開して状態を
+    /// 作らせ、その状態だけを消す（木と v3 の印は残る）。残った木の (dev, ino) を返す。
+    fn make_published_orphan(
+        sb: &Sandbox,
+        store: &dyn StateStore,
+        sub: &ImageRootfsPrivilege,
+    ) -> (u64, u64) {
+        create_rooted(sb, store, &OpRecorder::new(), sub, false, Some(0o700))
+            .expect("create (0700 top)");
+        let id = ContainerId::new("c1").expect("id");
+        let record = store.get(&GetStateRequest::new(id.clone())).expect("state");
+        store
+            .delete(&DeleteStateRequest::new(id, record.revision()))
+            .expect("drop only the state record");
+        let meta = std::fs::metadata(sb.rootfs()).expect("stat orphan");
+        assert_ne!(meta.uid(), euid(), "orphan top must be subordinate-owned");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        (meta.dev(), meta.ino())
     }
 
     /// 本試験バイナリを `--populate` で再実行して、`dir`（親のプロセスが保持する fd を指す経路でも可）に
@@ -586,6 +664,68 @@ mod linux {
         let resp = delete(&store, &OpRecorder::new(), sub.clone()).expect("delete");
         assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
         println!("rootless_image_rootfs_remove: scenario h2 verified");
+        drop(store);
+        drop(sb);
+
+        // i2: 公開済みで状態の無い 0700・subuid 所有の木。確かめられないものは残して AlreadyExists で拒否する。
+        let sb = Sandbox::new("i");
+        let store = sb.store();
+        let tree = make_published_orphan(&sb, &store, &sub);
+        let same_tree = |tag: &str| {
+            let m = std::fs::metadata(sb.rootfs()).expect("stat kept tree");
+            assert_eq!((m.dev(), m.ino()), tree, "tree must be kept ({tag})");
+        };
+        // (1) 権限なしは userns へ昇格せず、残して拒否する。
+        let rec = OpRecorder::new();
+        let err = create_rooted(&sb, &store, &rec, &host, false, Some(0o700))
+            .expect_err("host privilege must not reclaim");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists, "{err:?}");
+        assert_eq!(counts(&rec, "image_rootfs_orphan_reap"), (0, 1));
+        same_tree("host");
+        // (2) 別の状態ルートのストアからは、印の状態ルートの識別子が合わず残す。
+        let other =
+            FileStateStore::open(StateRoot::from_override(sb.dir.join("state2")).expect("root2"))
+                .expect("open store2");
+        let rec = OpRecorder::new();
+        let err = create_rooted(&sb, &other, &rec, &sub, false, Some(0o700))
+            .expect_err("foreign state root must not reclaim");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists, "{err:?}");
+        assert_eq!(counts(&rec, "image_rootfs_orphan_reap"), (0, 1));
+        same_tree("foreign state root");
+        // (3) 印の無い 0700・subuid 所有のディレクトリ（利用者のデータかもしれない）は残す。
+        let sb2 = Sandbox::new("i2b");
+        let store2 = sb2.store();
+        std::fs::create_dir(sb2.rootfs()).expect("mkdir rootfs");
+        std::fs::set_permissions(sb2.rootfs(), std::fs::Permissions::from_mode(0o700))
+            .expect("mode");
+        populate_child(&sb2.rootfs(), Some(0o700));
+        let rec = OpRecorder::new();
+        let err = create_rooted(&sb2, &store2, &rec, &sub, false, Some(0o700))
+            .expect_err("markerless tree must not be reclaimed");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists, "{err:?}");
+        assert_eq!(counts(&rec, "image_rootfs_orphan_reap"), (0, 1));
+        assert!(
+            std::fs::metadata(sb2.rootfs()).is_ok(),
+            "markerless tree must be kept"
+        );
+        purge_via_child(&sb2.rootfs());
+        drop(store2);
+        drop(sb2);
+        println!("rootless_image_rootfs_remove: scenario i2 verified");
+
+        // i: 同じ残骸を、元のストアと権限ありの次の create が孤児と確かめて回収し、新しい木を公開する。
+        let rec = OpRecorder::new();
+        create_rooted(&sb, &store, &rec, &sub, false, Some(0o700))
+            .expect("create reclaims the 0700 orphan");
+        assert_eq!(counts(&rec, "image_rootfs_orphan_reap"), (1, 0));
+        let meta = std::fs::metadata(sb.rootfs()).expect("stat new rootfs");
+        assert_ne!(meta.uid(), euid, "new rootfs must stay subordinate-owned");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        let resp = delete(&store, &OpRecorder::new(), sub.clone()).expect("delete");
+        assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+        assert!(!sb.rootfs().exists());
+        println!("rootless_image_rootfs_remove: scenario i verified");
+        drop(other);
         drop(store);
         drop(sb);
 

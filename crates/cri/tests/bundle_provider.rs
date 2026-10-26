@@ -117,6 +117,7 @@ fn setup(tag: &str) -> (TempDir, Arc<FakeRootfs>, SpecBundleProvider) {
 fn prepare(p: &SpecBundleProvider, id: &str, c: &ContainerConfig) -> Result<PathBuf, CriError> {
     let pod = PodSandboxConfig::default();
     p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+        .map(|b| b.path().to_path_buf())
 }
 
 fn mode(p: &Path) -> u32 {
@@ -203,6 +204,47 @@ fn supplemental_groups_request_and_merge_reach_the_config() {
         Some((Some(1000), false))
     );
     assert_eq!(gids(&dir), serde_json::json!([70, 60]));
+}
+
+/// CRI-2・OCI-1・SEC-5（#2771）: prepare の結果が、config.json に書いた識別情報と解決済みの stop signal を報告する。
+#[test]
+fn prepared_bundle_reports_the_applied_user_and_resolved_stop_signal() {
+    use fandhe_container_cri::adapter::PreparedBundle;
+    use fandhe_container_cri::runtime::v1::Signal;
+    let full = |p: &SpecBundleProvider, id: &str, c: &ContainerConfig| -> PreparedBundle {
+        let pod = PodSandboxConfig::default();
+        p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+            .expect("prepare")
+    };
+    let (_tmp, rootfs, p) = setup("report");
+    *rootfs.defaults.lock().unwrap() = ImageDefaults {
+        supplementary_gids: vec![50, 60],
+        stop_signal: Some(Signal::Sigint),
+        ..Default::default()
+    };
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_user: Some(Int64Value { value: 1000 }),
+            run_as_group: Some(Int64Value { value: 2000 }),
+            supplemental_groups: vec![70, 60],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    // CRI が RUNTIME_DEFAULT ならイメージの StopSignal。
+    let r = full(&p, "ctr1", &c);
+    let u = r.user().expect("user reported");
+    assert_eq!((u.uid(), u.gid()), (1000, 2000));
+    assert_eq!(u.additional_gids(), [50, 60, 70]);
+    assert_eq!(r.stop_signal(), Some(Signal::Sigint));
+    // CRI の明示値が優先される。
+    c.stop_signal = Signal::Sigkill as i32;
+    assert_eq!(full(&p, "ctr2", &c).stop_signal(), Some(Signal::Sigkill));
+    // イメージに値が無ければ SIGTERM。
+    *rootfs.defaults.lock().unwrap() = ImageDefaults::default();
+    c.stop_signal = 0;
+    assert_eq!(full(&p, "ctr3", &c).stop_signal(), Some(Signal::Sigterm));
 }
 
 /// CRI-2・SEC-5（#2664）: 解決要求を無視する実装では UNIMPLEMENTED で拒否し、bundle を残さない。
@@ -455,6 +497,7 @@ fn dns_pod() -> PodSandboxConfig {
 fn prepare_dns(p: &SpecBundleProvider, id: &str) -> Result<PathBuf, CriError> {
     let pod = dns_pod();
     p.prepare(&BundleRequest::new(id, "sb", &pod, &container()))
+        .map(|b| b.path().to_path_buf())
 }
 
 /// CRI-2・NET-5（#2665）: resolv.conf が 0644 で生成され、config.json の bind の source になる。

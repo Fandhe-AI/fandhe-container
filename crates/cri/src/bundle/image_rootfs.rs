@@ -41,8 +41,9 @@
 //!   rootfs の `/etc/passwd`・`/etc/group` を [`fandhe_container_oci::layer::read_rootfs_file`]（fd 起点・symlink を
 //!   辿らない・1 MiB 上限）で読んで解決する（#2606・SEC-1・SEC-5。解決表は `docs/design/cri-config-acceptance.md`）。
 //!   読めない・見つからない場合は [`ImageDefaults::user_unresolved`] のまま返し、`build_runtime_config` に拒否させる
-//!   （root へ黙ってフォールバックしない）。`/etc/group` の所属から補助グループは作らない（core が
-//!   `additionalGids` を未受理のため。権限は弱い側に倒れる）
+//!   （root へ黙ってフォールバックしない）。イメージの `User` 単独（`/etc/group` の所属）
+//!   からは補助グループを作らない。Merge のときの所属グループは [`ImageDefaults::supplementary_gids`]（#2667）で別に求める。
+//!   `StopSignal` は [`ImageDefaults::stop_signal`] へ解釈する（解釈できない値は `INVALID_ARGUMENT`。#2771）
 //! - **run_as_username**（CRI）: 展開後の rootfs の `/etc/passwd` を同じ読み口で読み、名前の完全一致で `(uid, gid)` を
 //!   [`ImageDefaults::resolved_run_as_username`] へ返す（#2664・CRI-2・SEC-5）。見つからない・passwd が無い場合は
 //!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
@@ -359,6 +360,7 @@ fn defaults_from(process: &ImageProcessConfig) -> Result<ImageDefaults, CriError
         user_unresolved,
         resolved_run_as_username: None,
         supplementary_gids: Vec::new(),
+        stop_signal: crate::stop_signal::parse_image_stop_signal(process.stop_signal())?,
     })
 }
 
@@ -803,6 +805,29 @@ mod tests {
             crate::error::CriErrorCode::InvalidArgument
         );
         assert_eq!(get("4294967295:1").unwrap(), (Some((u32::MAX, 1)), false));
+    }
+
+    /// OCI-1・CRI-2（#2771）: StopSignal が `ImageDefaults.stop_signal` へ写り、不正な値は INVALID_ARGUMENT。
+    #[test]
+    fn oci1_image_stop_signal_conversion() {
+        use crate::runtime::v1::Signal;
+        let get = |sig: &str| {
+            let body = format!(r#"{{"config":{{"StopSignal":"{sig}"}}}}"#);
+            let p =
+                fandhe_container_oci::config::parse_image_config_process(body.as_bytes()).unwrap();
+            defaults_from(&p).map(|d| d.stop_signal)
+        };
+        assert_eq!(get("").unwrap(), None);
+        assert_eq!(get("SIGINT").unwrap(), Some(Signal::Sigint));
+        assert_eq!(get("37").unwrap(), Some(Signal::Sigrtminplus3));
+        assert_eq!(
+            get("SIGFOO").unwrap_err().code(),
+            crate::error::CriErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            get("32").unwrap_err().code(),
+            crate::error::CriErrorCode::InvalidArgument
+        );
     }
 
     /// CRI-2: WorkingDir は末尾の `/` を 1 つ除く。ルートと空は別扱い。

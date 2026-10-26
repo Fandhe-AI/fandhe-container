@@ -14,7 +14,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -207,6 +209,10 @@ struct FakeBundles {
     sandbox_hostnames: Mutex<Vec<String>>,
     fail: AtomicBool,
     fail_release: AtomicBool,
+    /// 設定されていれば prepare が報告する識別情報（#2771）。
+    report_user: Mutex<Option<fandhe_container_cri::bundle::AppliedUser>>,
+    /// 設定されていれば prepare が報告する解決済みの stop signal（#2771）。
+    report_stop_signal: Mutex<Option<v1::Signal>>,
 }
 
 fn bundle_root() -> PathBuf {
@@ -218,7 +224,7 @@ fn bundle_root() -> PathBuf {
 }
 
 impl BundleProvider for FakeBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map(|m| m.name.as_str());
         self.sandbox_hostnames
@@ -232,7 +238,14 @@ impl BundleProvider for FakeBundles {
         if self.fail.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("no space"));
         }
-        Ok(bundle_root().join(container_id))
+        let mut prepared = PreparedBundle::new(bundle_root().join(container_id));
+        if let Some(u) = self.report_user.lock().unwrap().clone() {
+            prepared = prepared.with_user(u);
+        }
+        if let Some(sig) = *self.report_stop_signal.lock().unwrap() {
+            prepared = prepared.with_stop_signal(sig);
+        }
+        Ok(prepared)
     }
     fn release(&self, container_id: &str) -> Result<(), CriError> {
         self.calls
@@ -1757,4 +1770,99 @@ async fn cri2_stop_pod_sandbox_uses_each_container_stop_signal() {
     let mut got = h.runtime.stop_signals.lock().unwrap().clone();
     got.sort_unstable();
     assert_eq!(got, vec![2, 10]);
+}
+
+/// CRI-2・OCI-1・SEC-5（#2771）: 報告された識別情報と解決済みの stop signal が ContainerStatus と stop に反映される。
+#[tokio::test]
+async fn cri2_status_reports_applied_user_and_resolved_stop_signal() {
+    let h = harness();
+    *h.bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        vec![3000],
+    ));
+    *h.bundles.report_stop_signal.lock().unwrap() = Some(v1::Signal::Sigint);
+    let sb = run_sandbox(&h.service).await;
+    // config は RUNTIME_DEFAULT。
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.stop_signal, v1::Signal::Sigint as i32);
+    let linux = st.user.expect("user").linux.expect("linux");
+    assert_eq!(
+        (linux.uid, linux.gid, linux.supplemental_groups),
+        (1000, 2000, vec![3000])
+    );
+    start(&h.service, &id).await.expect("start");
+    stop_c(&h.service, &id).await.expect("stop");
+    assert_eq!(h.runtime.stop_signals.lock().unwrap().clone(), vec![2]);
+}
+
+/// CRI-2・SEC-5（#2771）: 補助グループが空の識別情報は、core が起動元のグループを現状維持し得る
+/// （`KeptSetgroupsDenied`）ため実プロセスとの一致を保証できず、user は未報告になる。
+#[tokio::test]
+async fn cri2_status_omits_user_when_supplemental_groups_empty() {
+    let h = harness();
+    *h.bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        Vec::new(),
+    ));
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert!(st.user.is_none());
+}
+
+/// CRI-2（#2771）: 報告の無い bundle 供給元では user は未報告で、RUNTIME_DEFAULT は SIGTERM（23）と報告される。
+#[tokio::test]
+async fn cri2_status_without_report_has_no_user_and_defaults_to_sigterm() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert!(st.user.is_none());
+    assert_eq!(st.stop_signal, v1::Signal::Sigterm as i32);
+}
+
+/// CRI-2・REPAIR-5（#2771）: 報告された識別情報が保持量の上限を超えたら FAILED_PRECONDITION で、記録と bundle を残さない。
+#[tokio::test]
+async fn cri2_applied_user_over_retained_limit_is_rejected_and_rolled_back() {
+    let runtime = Arc::new(FakeRuntime::default());
+    let bundles = Arc::new(FakeBundles::default());
+    let service = CriRuntimeService::new()
+        .with_container_limits(
+            fandhe_container_cri::runtime_service::ContainerLimits::default()
+                .with_max_retained_bytes(8 * 1024),
+        )
+        .with_runtime(
+            RuntimeAdapter::new(Arc::new(Shared(runtime.clone()))),
+            bundles.clone(),
+        );
+    *bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        (1..=4000).collect(),
+    ));
+    let sb = run_sandbox(&service).await;
+    let err = create(&service, &sb, "a").await.expect_err("over limit");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(list_count(&service).await, 0);
+    assert!(
+        bundles
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("release "))
+    );
+    assert_eq!(runtime.calls().len(), 0);
+}
+
+/// OCI-1・CRI-2（#2771）: runtime_features は supplemental_groups_policy だけを真にする。
+#[test]
+fn cri2_runtime_features_enable_supplemental_groups_policy() {
+    let f = fandhe_container_cri::runtime_service::runtime_features();
+    assert!(f.supplemental_groups_policy);
+    assert!(!f.user_namespaces_host_network);
+    assert!(!f.mount_options);
 }

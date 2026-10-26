@@ -30,9 +30,10 @@ use super::resolv_conf;
 use super::spec::{
     BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods, validate_config_with_pods,
 };
-use crate::adapter::{BundleProvider, BundleRequest};
+use crate::adapter::{BundleProvider, BundleRequest, PreparedBundle};
 use crate::error::CriError;
 use crate::runtime::v1::{ImageSpec, SupplementalGroupsPolicy};
+use crate::stop_signal::resolve_stop_signal;
 
 /// `RootfsSource::prepare` へ渡す、rootfs の passwd 等で解決してほしい User 関連の要求（#2664・CRI-2・SEC-5）。
 ///
@@ -315,7 +316,7 @@ fn write_new_file(
 }
 
 impl BundleProvider for SpecBundleProvider {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let dir = self.bundle_dir(req.container_id)?;
         // 事前検証の失敗でも、同 ID の既存実体はこの provider が作っていない。直後の release（呼び出し元の
         // 巻き戻し）で消さないよう、bundle を作成できるまで ID を拒否扱いにしておく。
@@ -362,7 +363,7 @@ impl BundleProvider for SpecBundleProvider {
             run_as_user,
             image_groups: merge,
         };
-        let built = (|| {
+        let built = (|| -> Result<_, CriError> {
             let defaults = self.rootfs.prepare(image, &rootfs, &user)?;
             // dns_config: 検証済みの resolv.conf を bundle に書き、そのパスを config.json の bind の source にする。
             // mode は 0644（mount の root がファイル自身になり bundle の 0700 が効かないため、写像された
@@ -398,17 +399,25 @@ impl BundleProvider for SpecBundleProvider {
                 json.as_bytes(),
                 0o600,
                 "config.json",
-            )
+            )?;
+            // CRI が RUNTIME_DEFAULT のときだけイメージの StopSignal を使う（#2771・CRI-2・OCI-1）。
+            let stop = resolve_stop_signal(req.config.stop_signal, defaults.stop_signal)?;
+            Ok((json.process_user().clone(), stop))
         })();
-        if let Err(e) = built {
-            // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
-            // 順序: rootfs 解放 → bundle 削除）、再試行は呼び出し元の release が担う。元のエラーを返す。
-            if self.rootfs.release(&rootfs).is_ok() {
-                let _ = fs::remove_dir_all(&dir);
+        let (applied, stop) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
+                // 順序: rootfs 解放 → bundle 削除）、再試行は呼び出し元の release が担う。元のエラーを返す。
+                if self.rootfs.release(&rootfs).is_ok() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        Ok(dir)
+        };
+        Ok(PreparedBundle::new(dir)
+            .with_user(applied)
+            .with_stop_signal(stop))
     }
 
     fn release(&self, container_id: &str) -> Result<(), CriError> {

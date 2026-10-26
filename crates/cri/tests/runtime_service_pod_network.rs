@@ -14,7 +14,8 @@ use fandhe_container_core::traits::{
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{
-    BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, RuntimeAdapter,
+    BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
+    RuntimeAdapter,
 };
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1::{
@@ -103,7 +104,7 @@ impl PodNetworkProvider for FakeNetwork {
 struct RecordingBundles(Mutex<Vec<Option<PathBuf>>>);
 
 impl BundleProvider for RecordingBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         self.0
             .lock()
             .unwrap()
@@ -114,7 +115,7 @@ impl BundleProvider for RecordingBundles {
         } else {
             PathBuf::from("/bundles")
         };
-        Ok(root.join(req.container_id))
+        Ok(PreparedBundle::new(root.join(req.container_id)))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())

@@ -489,6 +489,45 @@ fn run_as_username_acceptance() {
     assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
 }
 
+/// CRI-2・SEC-5（#2771）: `process_user()` は config.json の `process.user` と一致する（Strict と Merge の両方）。
+#[test]
+fn cri2_process_user_matches_the_written_config() {
+    use fandhe_container_cri::runtime::v1::SupplementalGroupsPolicy;
+    let check = |policy: SupplementalGroupsPolicy, image_groups: Vec<u32>, want: Vec<u32>| {
+        let c = with_sc(|sc| {
+            sc.run_as_user = Some(Int64Value { value: 1000 });
+            sc.run_as_group = Some(Int64Value { value: 2000 });
+            sc.supplemental_groups = vec![10, 20, 10];
+            sc.supplemental_groups_policy = policy as i32;
+        });
+        let image = ImageDefaults {
+            supplementary_gids: image_groups,
+            ..Default::default()
+        };
+        let json = build_runtime_config(&pod(), &c, &image).expect("build");
+        let user = json.process_user();
+        assert_eq!((user.uid(), user.gid()), (1000, 2000));
+        assert_eq!(user.additional_gids(), want.as_slice());
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(v["process"]["user"]["uid"], 1000);
+        assert_eq!(v["process"]["user"]["gid"], 2000);
+        assert_eq!(
+            v["process"]["user"]["additionalGids"],
+            serde_json::json!(want)
+        );
+    };
+    check(SupplementalGroupsPolicy::Strict, vec![50], vec![10, 20]);
+    check(
+        SupplementalGroupsPolicy::Merge,
+        vec![50, 10],
+        vec![50, 10, 20],
+    );
+    // 指定なしは root で補助グループなし（config.json と同じ値をそのまま報告する）。
+    let json = build_runtime_config(&pod(), &ctr(), &ImageDefaults::default()).expect("build");
+    assert_eq!(json.process_user().uid(), 0);
+    assert!(json.process_user().additional_gids().is_empty());
+}
+
 /// CRI-2・SEC-5（#2667）: supplemental_groups とポリシー、イメージ由来のグループの合成を具体値で確かめる。
 #[test]
 fn cri2_supplemental_groups_acceptance() {

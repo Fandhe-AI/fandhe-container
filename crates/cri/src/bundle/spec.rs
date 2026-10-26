@@ -28,7 +28,7 @@
 //!   （#442）の pod.json（`scripts/testdata/cri/pod.json`）は `namespace_options.network = NODE` を明示して揃えてある（#2592）。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
 //!   uid の写像は core の launcher が権限モデルから導く。SEC-5）。`uids` / `gids` の指定は未実装（#2240）。
-//! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は [`super::ImageRootfsSource`]（#2433）が行い、
+//! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User・StopSignal）の解析は [`super::ImageRootfsSource`]（#2433）が行い、
 //!   ここでは [`ImageDefaults`] で受ける。イメージの User が名前・uid のみ（`/etc/passwd` の解決が要る形）のときは、
 //!   `ImageRootfsSource` が展開後の rootfs の passwd / group を fd 起点で読んで解決する（#2606）。解決できなかった
 //!   ときは [`ImageDefaults::user_unresolved`] で受け、CRI の `run_as_user` が無ければ `UNIMPLEMENTED` で拒否する
@@ -150,6 +150,10 @@ pub struct ImageDefaults {
     /// `ImageRootfsSource` が [`super::UserResolveRequest::image_groups`] が真で実効 uid が 0 でないときだけ埋める
     /// （既定は空 = イメージ由来のグループは付かない。付かない方向は権限が弱くなる側）。
     pub supplementary_gids: Vec<u32>,
+    /// イメージ config の `StopSignal` を CRI のシグナルへ解釈した値（空・欠落は `None`。#2771・CRI-2・OCI-1）。
+    /// CRI の `stop_signal` が `RUNTIME_DEFAULT` のときだけ使われる（`crate::stop_signal::resolve_stop_signal`）。
+    /// 解釈できない値は `ImageRootfsSource` が `INVALID_ARGUMENT` で拒否するため、ここには入らない。
+    pub stop_signal: Option<crate::runtime::v1::Signal>,
 }
 
 /// `build_inner` の段階。`Validate` は rootfs を触る前の形式検証、`Build` は `config.json` の確定。
@@ -215,12 +219,58 @@ pub(crate) fn check_username(name: &str) -> Result<Option<&str>, CriError> {
 ///
 /// [`build_runtime_config`] 以外からは作れない。生の JSON 文字列を手で組んで書き出さないための型。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeConfigJson(Vec<u8>);
+pub struct RuntimeConfigJson {
+    bytes: Vec<u8>,
+    user: AppliedUser,
+}
 
 impl RuntimeConfigJson {
     /// 直列化済みのバイト列。
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
+    }
+
+    /// `process.user` に書いた uid・gid・補助グループ（`ContainerStatus.user` の報告に使う。#2771・CRI-2・SEC-5）。
+    ///
+    /// バイト列に書いたのと同じ値で、推測や既定値で補わない。
+    pub fn process_user(&self) -> &AppliedUser {
+        &self.user
+    }
+}
+
+/// 起動時に適用する識別情報（config.json の `process.user` に書いた値。#2771・CRI-2・SEC-5）。
+///
+/// `SpecBundleProvider` が `PreparedBundle` に載せて `CriRuntimeService` へ返し、`ContainerStatus.user.linux`
+/// （KEP-3619）として報告される。補助グループは重複除去後の最終の集合で、主 gid は自動では含めない
+/// （core の launcher が `setgroups(list)` でそのまま適用するため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AppliedUser {
+    uid: u32,
+    gid: u32,
+    additional_gids: Vec<u32>,
+}
+
+impl AppliedUser {
+    /// 組み立てる（報告する provider 実装と試験用）。
+    pub fn new(uid: u32, gid: u32, additional_gids: Vec<u32>) -> Self {
+        Self {
+            uid,
+            gid,
+            additional_gids,
+        }
+    }
+    /// 適用する uid。
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    /// 適用する主 gid。
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    /// 補助グループ（config.json の `additionalGids` と同じ順序・同じ集合）。
+    pub fn additional_gids(&self) -> &[u32] {
+        &self.additional_gids
     }
 }
 
@@ -1414,7 +1464,7 @@ fn build_inner(
             user: UserOut {
                 uid,
                 gid,
-                additional_gids,
+                additional_gids: additional_gids.clone(),
             },
             capabilities,
         },
@@ -1436,5 +1486,8 @@ fn build_inner(
             CriError::internal("failed to encode config")
         }
     })?;
-    Ok(RuntimeConfigJson(w.buf))
+    Ok(RuntimeConfigJson {
+        bytes: w.buf,
+        user: AppliedUser::new(uid, gid, additional_gids),
+    })
 }

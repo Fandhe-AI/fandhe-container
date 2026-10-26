@@ -74,6 +74,7 @@ fn sup7_cri2_sweep_removes_only_closed_unrecorded_logs() {
             skipped_undecodable: 1,
             failed: 0,
             timed_out: false,
+            workers_busy: false,
         }
     );
     assert_eq!(

@@ -320,24 +320,52 @@ pub fn mount_option_by_id(mountinfo: &[u8], mount_id: u64, option: &str) -> Moun
     }
 }
 
+/// fdinfo から mount ID を読めなかった理由（[`read_fdinfo_mount_id`] の失敗）。
+///
+/// 呼び出し側（`add_host_dns::hosts_file` は理由ごとの message に写す）が理由を型で区別できるように
+/// する。io::Error の文字列から理由を読み戻さない（REPAIR-1）。
+#[derive(Debug)]
+pub(crate) enum FdinfoMountIdError {
+    /// `/proc/self/fdinfo/<fd>` を開けない・読めない（元の io::Error を保つ）。
+    Read(io::Error),
+    /// 読み込み上限（`MAX_FDINFO_READ`）を超えた。
+    TooLarge,
+    /// `mnt_id:` 行が無い、または数値でない。
+    MissingMountId,
+}
+
+/// fdinfo の `mnt_id:` 行を読む crate 内で唯一の実装（REPAIR-1）。
+///
+/// 呼び出し元は [`file_mount_id`]（cli の `doctor`・SUP-14）と
+/// `add_host_dns::hosts_file::verify_same_mount`（NET-12・P0）。読めない・上限超過・行が無い・
+/// 数値でない場合はすべてエラーで、呼び出し側は fail-closed で扱う。読み込みは上限つき。
+pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdError> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .and_then(|f| f.take(MAX_FDINFO_READ + 1).read_to_end(&mut buf))
+        .map_err(FdinfoMountIdError::Read)?;
+    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
+        return Err(FdinfoMountIdError::TooLarge);
+    }
+    parse_fdinfo_mnt_id(&buf).ok_or(FdinfoMountIdError::MissingMountId)
+}
+
 /// 開いたファイルが属するマウントの ID（mountinfo の 1 番目の欄と同じ値）を `/proc/self/fdinfo/<fd>` の
 /// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・数値でない場合はエラー。
 ///
 /// cli の `doctor` が [`mount_option_by_id`] に渡す ID を得るために呼ぶ（SUP-14・#2661）。
+/// 実体は [`read_fdinfo_mount_id`] で、ここは `io::Error` に写す薄い包み。
 pub fn file_mount_id(file: &File) -> io::Result<u64> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?
-        .take(MAX_FDINFO_READ + 1)
-        .read_to_end(&mut buf)?;
-    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fdinfo is too large",
-        ));
-    }
-    parse_fdinfo_mnt_id(&buf)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo"))
+    read_fdinfo_mount_id(file).map_err(|e| match e {
+        FdinfoMountIdError::Read(e) => e,
+        FdinfoMountIdError::TooLarge => {
+            io::Error::new(io::ErrorKind::InvalidData, "fdinfo is too large")
+        }
+        FdinfoMountIdError::MissingMountId => {
+            io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo")
+        }
+    })
 }
 
 /// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
@@ -1326,6 +1354,18 @@ mod tests {
             ),
             MountOptionState::Present
         );
+    }
+
+    /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は `None`。
+    #[test]
+    fn net12_parse_fdinfo_mnt_id_ignores_other_lines_and_rejects_invalid() {
+        let text = b"pos:\t0\nflags:\t02102002\nmnt_id:\t39\nino:\t5\n\
+                    lock:\t1: FLOCK  ADVISORY  WRITE 1234 00:2a:5 0 EOF\n";
+        assert_eq!(parse_fdinfo_mnt_id(text), Some(39));
+        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0100000\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\tabc\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t-1\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b""), None);
     }
 
     /// SUP-14・#2661: fdinfo の `mnt_id:` 行の取り出し。

@@ -10,11 +10,21 @@
 # 使い方:
 #   check-success-lines.sh --name <test> --src <file.rs>... --log <file> --select <ERE>
 #     [--subst key=v1,v2]... [--subst-pos <v>]... [--subst-re key=<ERE>]... [--min N]
+#     [--subst-pos-re <ERE>]... [--require <fixed>]... [--libtest-ignored]
 #     [--forbid <fixed>]... [--summary]
 #   --select       導出元テンプレート（プレースホルダ込みのリテラル）とログの各行の両方に適用する ERE
 #   --subst        名前つきプレースホルダ {key} の置換値（複数値は直積）
 #   --subst-pos    位置プレースホルダ {} の置換値（出現順。テンプレートの {} の数と一致が必要）
+#   --subst-pos-re 位置プレースホルダ {} の値の ERE。--subst-pos と混在でき、i 番目の {} は i 番目の指定（種別問わず）を使う。
+#                  1 つでも使うテンプレートは行全体 ^...$ の正規表現で照合する
 #   --subst-re     実行時に決まる値の ERE（このテンプレートは行全体 ^...$ の正規表現で照合する）
+#   プレースホルダは {} {name} に加えて Debug 書式の {:?} {name:?} も受ける（値は Debug 表現のまま渡す。
+#   {:#?}・{:x} 等その他の書式指定は fail-closed で拒否する）
+#   --require      ログに無ければ失敗する固定文字列（導出では表せない組の値・二者択一の分岐の到達の照合。--forbid の対）
+#   --libtest-ignored  各 --src の `#[ignore]` / `#[ignore = "..."]` つきトップレベル関数から libtest の成功行
+#                  `test <名前> ... ok` を導出して合併し、`test result: ok. N passed; 0 failed;` も必須にする。
+#                  `... ignored` / `... FAILED` は失敗。対象外: mod 内の試験（`test m::f` と出るため (b)(c) で検出される）・
+#                  `#[cfg_attr(.., ignore)]`。ignore 関数が 0 件なら失敗。--select は `^test [A-Za-z0-9_]+ \.\.\. ` を推奨
 #   --min          期待行の下限（既定 1。0 件は常に失敗）
 #   --forbid       ログに出たら失敗する固定文字列（ignored・not applicable 等）
 # 照合: (a) 期待行数 >= min (b) 期待行がすべてログにある (c) ログの選別行がすべて期待行 (d) forbid が無い。
@@ -23,7 +33,8 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 --name <test> --src <file.rs>... --log <file> --select <ERE> [--subst k=v1,v2]..." \
-    "[--subst-pos v]... [--subst-re k=ERE]... [--min N] [--forbid str]... [--summary]" >&2
+    "[--subst-pos v]... [--subst-pos-re ERE]... [--subst-re k=ERE]... [--min N] [--forbid str]..." \
+    "[--require str]... [--libtest-ignored] [--summary]" >&2
   exit 2
 }
 
@@ -34,6 +45,8 @@ min=1
 summary=0
 srcs=()
 forbids=()
+requires=()
+libtest=0
 substs=""
 subst_pos=""
 subst_re=""
@@ -44,7 +57,10 @@ while [ $# -gt 0 ]; do
     --log) [ $# -ge 2 ] || usage; log="$2"; shift 2 ;;
     --select) [ $# -ge 2 ] || usage; select_re="$2"; shift 2 ;;
     --subst) [ $# -ge 2 ] || usage; substs="${substs}$2"$'\n'; shift 2 ;;
-    --subst-pos) [ $# -ge 2 ] || usage; subst_pos="${subst_pos}$2"$'\n'; shift 2 ;;
+    --subst-pos) [ $# -ge 2 ] && [ -n "$2" ] || usage; subst_pos="${subst_pos}L"$'\t'"$2"$'\n'; shift 2 ;;
+    --subst-pos-re) [ $# -ge 2 ] && [ -n "$2" ] || usage; subst_pos="${subst_pos}R"$'\t'"$2"$'\n'; shift 2 ;;
+    --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; requires+=("$2"); shift 2 ;;
+    --libtest-ignored) libtest=1; shift ;;
     --subst-re) [ $# -ge 2 ] || usage; subst_re="${subst_re}$2"$'\n'; shift 2 ;;
     --min) [ $# -ge 2 ] || usage; min="$2"; shift 2 ;;
     --forbid) [ $# -ge 2 ] || usage; forbids+=("$2"); shift 2 ;;
@@ -96,6 +112,7 @@ function parse(t,   i, c, n, key, j, lit) {
       if (j == 0) die("unclosed placeholder in: " t)
       key = substr(t, i + 1, j - 2)
       if (lit != "") { np++; kind[np] = "L"; val[np] = lit; lit = "" }
+      if (length(key) >= 2 && substr(key, length(key) - 1) == ":?") key = substr(key, 1, length(key) - 2)
       if (key == "") { np++; kind[np] = "P"; val[np] = ""; npos++ }
       else if (key ~ /^[A-Za-z0-9_]+$/) { np++; kind[np] = "N"; val[np] = key }
       else die("unsupported placeholder {" key "} in: " t)
@@ -112,7 +129,8 @@ function expand(from, exact, rx, hasre, pidx,   i, k, vs, nv, v) {
     if (kind[i] == "L") { exact = exact val[i]; rx = rx esc(val[i]) }
     else if (kind[i] == "P") {
       pidx++
-      exact = exact posv[pidx]; rx = rx esc(posv[pidx])
+      if (posk[pidx] == "R") { rx = rx "(" posv[pidx] ")"; hasre = 1 }
+      else { exact = exact posv[pidx]; rx = rx esc(posv[pidx]) }
     } else {
       k = val[i]
       if (k in rev) { rx = rx "(" rev[k] ")"; hasre = 1 }
@@ -134,7 +152,8 @@ BEGIN {
   for (i = 1; i <= n; i++) if (a[i] != "") { p = index(a[i], "="); rev[substr(a[i], 1, p - 1)] = substr(a[i], p + 1) }
   nposv = 0
   n = split(ENVIRON["SUBSTPOS"], tmpv, "\n")
-  for (i = 1; i <= n; i++) if (tmpv[i] != "") { nposv++; posv[nposv] = tmpv[i] }
+  for (i = 1; i <= n; i++) if (tmpv[i] != "") { nposv++; posk[nposv] = substr(tmpv[i], 1, 1); posv[nposv] = substr(tmpv[i], 3) }
+  libt = (ENVIRON["LIBTEST"] == "1"); pend = 0
   src = ""
   while ((getline line) > 0) src = src line "\n"
   n = length(src); i = 1
@@ -147,6 +166,17 @@ BEGIN {
         if (substr(src, i, 2) == "/*") { d++; i += 2 } else if (substr(src, i, 2) == "*/") { d--; i += 2 } else i++
       }
       continue
+    }
+    if (libt && c == "#" && substr(src, i, 8) == "#[ignore" && substr(src, i + 8, 1) ~ /[] =]/) { pend = 1; i += 8; continue }
+    if (pend && c == "f" && substr(src, i, 3) == "fn " && (i == 1 || substr(src, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+      j = i + 3
+      while (substr(src, j, 1) ~ /[ \t\n]/) j++
+      fname = ""
+      while (substr(src, j, 1) ~ /[A-Za-z0-9_]/) { fname = fname substr(src, j, 1); j++ }
+      if (fname == "" || fname !~ /^[A-Za-z_][A-Za-z0-9_]*$/) die("cannot read fn name after #[ignore]")
+      print "I\t" fname
+      print "L\ttest " fname " ... ok"
+      pend = 0; i = j; continue
     }
     if (c == "'") {
       if (c2 == "\\") { j = index(substr(src, i + 2), "'"); i += (j == 0 ? 2 : j + 2); continue }
@@ -196,12 +226,16 @@ AWK
 
 : > "${tmp}/derived"
 for f in "${srcs[@]}"; do
-  if ! SEL="${select_re}" SUBST="${substs}" SUBSTPOS="${subst_pos}" SUBSTRE="${subst_re}" \
+  if ! LIBTEST="${libtest}" SEL="${select_re}" SUBST="${substs}" SUBSTPOS="${subst_pos}" SUBSTRE="${subst_re}" \
     awk -f "${tmp}/derive.awk" "${f}" >> "${tmp}/derived" 2> "${tmp}/awk.err" < /dev/null; then
     fail "could not derive expected lines from ${f}: $(tr '\n' ' ' < "${tmp}/awk.err")"
   fi
 done
-LC_ALL=C sort -u "${tmp}/derived" > "${tmp}/expected"
+grep -v '^I' "${tmp}/derived" | LC_ALL=C sort -u > "${tmp}/expected" || true
+nignore="$( (grep '^I' "${tmp}/derived" || true) | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+if [ "${libtest}" -eq 1 ] && [ "${nignore}" -eq 0 ]; then
+  fail "--libtest-ignored found no #[ignore] functions in the sources (fail-closed)"
+fi
 count="$(wc -l < "${tmp}/expected" | tr -d ' ')"
 if [ "${count}" -eq 0 ]; then
   fail "no expected success lines were derived from the sources (fail-closed)"
@@ -209,6 +243,16 @@ fi
 if [ "${count}" -lt "${min}" ]; then
   fail "expected at least ${min} success lines, derived ${count}"
 fi
+
+# require と forbid の重複は設定ミスで usage 扱い
+for bad in ${requires[@]+"${requires[@]}"}; do
+  for f in ${forbids[@]+"${forbids[@]}"}; do
+    if [ "${bad}" = "${f}" ]; then
+      echo "::error::${name} --require and --forbid both given: ${bad}" >&2
+      exit 2
+    fi
+  done
+done
 
 # forbid が期待行と矛盾する設定ミスは usage 扱い
 for bad in ${forbids[@]+"${forbids[@]}"}; do
@@ -246,6 +290,18 @@ while IFS= read -r actual; do
   done < "${tmp}/regex"
   [ "${matched}" -eq 1 ] || fail "reported an unexpected line: ${actual}"
 done < "${tmp}/actual"
+
+for need in ${requires[@]+"${requires[@]}"}; do
+  grep -Fq -- "${need}" "${tmp}/log" || fail "log lacks a required string: ${need}"
+done
+
+if [ "${libtest}" -eq 1 ]; then
+  if grep -Eq '^test .* \.\.\. (ignored|FAILED)' "${tmp}/log"; then
+    fail "libtest reported an ignored or failed test"
+  fi
+  grep -Fq -- "test result: ok. ${nignore} passed; 0 failed;" "${tmp}/log" \
+    || fail "libtest result line 'test result: ok. ${nignore} passed; 0 failed;' not found"
+fi
 
 for bad in ${forbids[@]+"${forbids[@]}"}; do
   if grep -Fq -- "${bad}" "${tmp}/log"; then

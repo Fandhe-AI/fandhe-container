@@ -5376,7 +5376,10 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().expect("current exe");
+        use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("unshare")
+            // 専用のプロセスグループで起動し、期限超過時に内側の `mount` などの子孫も含めて回収する（REPAIR-5）。
+            .process_group(0)
             .args([
                 "--user",
                 "--map-root-user",
@@ -5402,7 +5405,11 @@ mod tests {
                 break st;
             }
             if std::time::Instant::now() >= deadline {
-                child.kill().expect("kill timed-out inner overlay test");
+                // グループ全体（pgid = 子の pid）へ SIGKILL を送り、孤児の `mount` を残さない。
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .status();
+                let _ = child.kill();
                 reap_within(&mut child, std::time::Duration::from_secs(5));
                 panic!("inner overlay test timed out after 60s");
             }
@@ -5529,9 +5536,23 @@ mod tests {
                 assert_rejected_before_target(&fx, &log, what);
             }
             // (e) rootfs・bundle が overlay 上にあるときは `BindSourceContainsRootfs`。
-            // `pinned` は dev 9:9 の保護対象を足し、実 mountinfo に無いため使わない。状態ルートを並べて固定の条件を満たす。
+            // 状態ルートは overlay と重ならない非 overlay の実在 FS（tmpfs 上の別ディレクトリ）にする。同じ overlay を渡すと
+            // 状態ルート由来の層が先に判定され `BindSourceReachesStateRoot` になり、rootfs の照合に到達しない。
+            // `pinned` は dev 9:9 の保護対象を足し、実 mountinfo に無いため使わない。
+            let other_state = mkdir(&base.join(format!("state-{case}")));
+            let other_mnt = path_mount_id(&other_state).expect("mount id of other state");
+            let other_id = fs_identity(&rows, other_mnt, &other_state).expect("other identity");
+            assert_ne!(
+                other_id.dev, identity.dev,
+                "{case}: state root must not be on the overlay"
+            );
+            let other_chain = dir_identity_chain(&other_state).expect("other chain");
+            let other_state_root = || {
+                ProtectedFsRoot::new(other_id.dev.clone(), other_id.path.clone(), false)
+                    .with_inode_chain(other_state.clone(), other_chain.clone())
+            };
             let contained = vec![
-                state_root(),
+                other_state_root(),
                 ProtectedFsRoot::contained(identity.dev.clone(), identity.path.clone()),
             ];
             let set = one("/mnt/d", &upper, &[]).with_protected_roots(contained);
@@ -5544,7 +5565,7 @@ mod tests {
             assert_rejected_before_target(&fx, &log, "contained");
             // (f) mountinfo に存在しない dev は fail-closed。
             let ghost = vec![
-                state_root(),
+                other_state_root(),
                 ProtectedFsRoot::contained("4095:1048575".to_owned(), "/".to_owned()),
             ];
             let set = one("/mnt/d", &upper, &[]).with_protected_roots(ghost);

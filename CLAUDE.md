@@ -108,6 +108,7 @@ fandhe-container/
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
 │   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み。IPAM 等は #1870 の後続。#2604・NET-1・NET-6・REPAIR-3・REPAIR-4）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
+│   │   ├── container-options-delivery.md  # 起動オプション（ulimit・env・label ほか）の CLI から supervisor への受け渡し（状態ルート配下の 0600 の文書 `FCOPT1`・経路・却下案・残余。#2713・SUP-12・CLI-1・SEC-1）
 │   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測（#2634・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）

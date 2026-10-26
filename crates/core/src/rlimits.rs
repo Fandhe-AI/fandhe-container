@@ -12,8 +12,8 @@
 //! # 未結線の箇所（REPAIR-3）
 //!
 //! OCI `config.json` の `process.rlimits` はパーサがまだ型付きで解釈せず、`create` / `start` は
-//! `Unimplemented` で拒否する（fail-closed）。config → `LaunchSpec` → `with_rlimits` の結線と
-//! 本番 launcher は後続作業で、本モジュールの型はそのまま再利用できる。
+//! `Unimplemented` で拒否する（fail-closed）。config → `LaunchSpec` → `with_rlimits` の結線は後続作業。
+//! `--ulimit` の指定は起動オプション（`LaunchOptions::with_rlimits`。#2713）経由で本番 launcher が 16 種へ補完して適用する。
 
 use crate::traits::types::{ErrorCode, TraitError};
 

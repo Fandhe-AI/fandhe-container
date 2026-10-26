@@ -336,6 +336,15 @@ impl Entrypoint {
     pub fn path(&self) -> &Path {
         Path::new(OsStr::from_bytes(self.path.to_bytes()))
     }
+
+    /// 渡した env を `KEY=VALUE` の文字列で返す(試験専用。launcher が env の上書きを重ねた結果の照合に使う。#2713)。
+    #[cfg(test)]
+    pub(crate) fn env_for_test(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .map(|e| e.to_string_lossy().into_owned())
+            .collect()
+    }
 }
 
 /// 1 要素を検証して `CString` にする。`total` に NUL 込みのバイト数を加算する。

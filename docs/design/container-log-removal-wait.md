@@ -106,6 +106,24 @@ CLI の `prepare_options_file`・`rollback_options`・`read_env_files` は `supe
 呼び出し側の期限の範囲で待つ（期限は延ばさない。待った時間は期限から引く）。待っても空かなければ job を実行せず
 `RESOURCE_EXHAUSTED`、期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。plugin-cri が使う `run_bounded_classified` の即時 `Busy` は変えない。
 
+### 繰り返し実行の記録（#2890・CLI-1・REPAIR-12）
+
+Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel`（libtest ハーネスの 10 試験。プロセス内で並列）を
+`make repeat-test PACKAGE=fandhe-container-cli TEST_BIN=stop_control_channel SUCCESS_LINE='test sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill ... ok' COUNT=100`
+で繰り返した（ローカル。`nproc`=10・カーネル 7.0.0-34-generic）。いずれかの試験が失敗すると終了コードが非 0 になり、回が失敗として数えられる。
+
+| 条件 | 回数 | passed | failed |
+| ---- | ---- | ------ | ------ |
+| A1: 既定の並列度（10 スレッド）・追加負荷なし（100 回 × 3 バッチ） | 300 | 300 | 0 |
+| A2: `RUST_TEST_THREADS=32`・`yes` を 10 本走らせた CPU 負荷（100 回 × 3 バッチ） | 300 | 300 | 0 |
+
+- 報告元の `sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill`・`sup9_sup3_stop_in_backoff_cancels_pending_restart` は、
+  #2868 の後の 600 回で一度も失敗しなかった。報告元 PR（#2861・#2864）は #2868 のマージ前のブランチで、#2868 が直した枠満杯の誤分類で説明できる。したがって製品・試験コードは変えていない
+- 計測の注意: 最初に成功行を `sup9_sup3_stop_in_backoff_cancels_pending_restart ... ok` にした試行は 300 回中 1 回が `missing-success-line` と数えられた。
+  出力は 10 試験とも ok・終了コード 0 で、並列試験の supervisor の JSON ログがその `... ok` の行の途中へ割り込み、行全体の完全一致に外れただけだった（試験の失敗ではない）。
+  supervisor を起動しない `sec1_err2_...` の行へ変えると割り込まない。libtest の並列出力を行照合する場合は、標準出力に何も書かない試験の行を選ぶ
+- 範囲外: `run_bounded` の他の呼び出し元の即時 `Busy` は #2894、`binary_entry.rs` の間欠失敗は #2766 で追跡する
+
 ## `run_bounded` 系の枠の満杯の分類（#2894・CLI-1・SUP-7・REPAIR-4・REPAIR-5・ERR-1）
 
 `run_bounded`（`Option`）と `run_log_removal_bounded` は、枠の満杯（何も実行していない）を期限切れと同じ値（`None`・`LogRemoval::TimedOut`）に潰していた。
@@ -147,10 +165,29 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 - terminate は最大 600 秒まで設定できる。既定を超えて窓が 10 秒を超えたときは待ち切れず、`FailedPrecondition`（`reason: sink_open_after_wait`）として計上してログを残す
   （1 ID あたり世代数 × 上限に収まる）。残りは CLI の同じ ID の `create`、plugin-cri の `CreateContainer`（同じ ID）、plugin-cri の次の起動時の走査で回収される
 - CLI の `delete` も同じ待ち（`remove_container_logs_guarded_bounded_waiting`）を使い、結果を `DeleteResponse` の
-  `supervisor_log` / `container_log` に載せる（#2698）。CLI の後始末の最悪は supervisor ログ 5 秒 + 待ち 10 秒 + 最後の試行 5 秒 = 20 秒
-  （`repair5_cli_delete_cleanup_budget_fits_20s`）
+  `supervisor_log` / `container_log` に載せる（#2698）。CLI の後始末の最悪は、待ち 10 秒（2 つのログで共有。下記）+ supervisor ログの最後の試行 5 秒 +
+  コンテナログの最後の試行 5 秒 = 20 秒（`repair5_cli_delete_cleanup_budget_fits_20s`）
 - 同じ ID の `create` 前の回収（#2698・#2760）: core を呼ぶ前に、待たずに 1 回だけ（上限 5 秒）消す。本体は
   `fandhe_container_supervisor::logs::reclaim_stale_container_logs` で、CLI（`reclaim_stale_container_log`）と plugin-cri
   （`CoreLifecycleRuntime::reclaim_before_create`）が共有する。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。
   best effort で create の成否は変えない（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる。CRI 層は `state` が `NotFound` であることを確かめて資源を解放する）。観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
 - 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）
+
+## supervisor ログ側の待ち（#2892・SUP-7・CLI-1・REPAIR-5）
+
+- 窓: supervisor ログの flock は supervisor プロセスの終了で外れる。コンテナログの sink は drain の終わりに閉じるので、
+  supervisor ログの解放はそれより後になる。`stop` 直後の `delete` は、従来は supervisor ログを 1 回しか試さず、
+  `FailedPrecondition` の警告でログを残していた（PR #2865 の CI で `start_stop_delete_real` が 2 回失敗）
+- 方式: `supervisor_log::remove_guarded_bounded_waiting`。`FailedPrecondition` の間だけ 50 ms 間隔（`CONTAINER_LOG_LOCK_POLL`）で
+  試し直し、他のエラーは即座に返す。guard（`id_is_still_deleted`）は試行ごとにロック保持中に評価し、待つ間に同じ ID が
+  再作成されていても新しいインスタンスのログを消さない。1 回の試行の分類はコンテナログと同じ
+  （枠の満杯 `RESOURCE_EXHAUSTED`・期限切れ `TIMEOUT`）
+- 予算: CLI の `finish_delete` が 10 秒の期限（`CONTAINER_LOG_LOCK_WAIT`）を 2 つのログで共有し、コンテナログには
+  supervisor ログの待ちの残りを渡す。最悪は 10 + 5 + 5 = 20 秒で従来と同じ。
+  supervisor ログが解放されればコンテナログの sink は既に閉じており、ほぼ即座に消せる。
+  supervisor が止まっていて待ち切れない場合は、コンテナログも同じ理由で取れない可能性が高く、1 回の試行で警告にする
+- 不採用: 2 つのログで 10 秒ずつ独立に待つ案。最悪が 30 秒になり、`start_stop_delete_real` の `CLI_TIMEOUT`（30 秒）に並び、
+  上の 20 秒の予算の記述と試験が崩れる
+- 失敗の扱い: 待ち切れなければ `Kept { FailedPrecondition }` と、コンテナログと同じ語彙の `reason: "sink_open_after_wait"` つきの警告
+- 対象外: plugin-cri の `RemoveContainer` は従来の `remove_bounded`（1 回だけ）のまま。入れる場合は force delete の最悪値と
+  `PLUGIN_RUNTIME_TIMEOUT` の不等式の見直しが要る。待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る

@@ -48,6 +48,9 @@ expect_eq() {
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
 #   nostart  = ok と同じだが、起動用 bundle の start も失敗する（supervisor 未配置など start の前提が無い環境。#2891）
 #   stuck    = ok と同じだが、stop しても running のまま（B23 の終了待ちが期限切れになる。#2891）
+#   delfail  = ok と同じだが、c2 の delete が失敗し c2 が残る（後始末の inspect は成功する。#2891）
+#   delgone  = c2 の delete は失敗するが c2 は消える（後始末の inspect は NOT_FOUND。#2891）
+#   deldeny  = c2 の delete が失敗し、以後の c2 の inspect が PERMISSION_DENIED で失敗する（#2891）
 # 環境変数で出力を差し替える（fixture 表。カウンタはそのディレクトリの count に置く）:
 #   STUB_ERR_DIR = 使い方エラーの n 回目に err.<n> があれば、その内容をそのまま stderr へ流す。
 #                  A 層 18 ケースは全て使い方エラーで順に呼ばれるため、n 回目 = ケース A<n>。
@@ -220,6 +223,7 @@ case "$cmd" in
   logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
   inspect)
     [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND
+    [ "$mode" = "deldeny" ] && [ -e "$root/$id.denied" ] && fail_with 6 PERMISSION_DENIED
     caps13='"CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP","CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"'
     read -r sb ro <"$root/$id.c"
     rojson=false; [ "$ro" = "1" ] && rojson=true
@@ -242,6 +246,13 @@ case "$cmd" in
     [ "$mode" = "stuck" ] || mv "$root/$id.started" "$root/$id.stopped" ;;
   delete)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete
+    if [ "$id" = "c2" ]; then
+      case "$mode" in
+        delfail) fail_op 6 INTERNAL delete ;;
+        delgone) rm -f "$root/$id.c" "$root/$id.started" "$root/$id.stopped"; fail_op 6 INTERNAL delete ;;
+        deldeny) : >"$root/$id.denied"; fail_op 6 INTERNAL delete ;;
+      esac
+    fi
     rm -f "$root/$id.c" "$root/$id.started" "$root/$id.stopped"
     out_override || true
     ;;
@@ -426,6 +437,11 @@ start_capture nonlinux nonlinux
 start_capture nostart nostart
 start_capture stuck stuck --timeout 1
 TMPDIR="$work/tmpdir" start_capture diff diff
+# c2 の delete 失敗後の後始末（#2891・REPAIR-5）。TMPDIR を専用にして状態ルートの残存を数える。
+for m in delfail delgone deldeny; do
+  mkdir -p "$work/tmp-$m"
+  TMPDIR="$work/tmp-$m" start_capture "$m" "$m"
+done
 start_capture noisy noisy
 STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
@@ -855,6 +871,19 @@ for cid in B01 B02 B03 B06 B09 B10; do
 done
 compare outtable outtable
 expect_rc "unexpected-stdout captures pass format validation (rc 1, not 2)" 1 $?
+
+# --- c2 の delete 失敗後は不在を確認できたときだけ状態ルートを消す（#2891・REPAIR-5） ---
+count_left() { # <ディレクトリ>
+  local n=0 f
+  for f in "$1"/* "$1"/.[!.]*; do [ -e "$f" ] && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+expect_eq "delete failed and c2 remains (inspect ok): state root is kept" 1 "$(count_left "$work/tmp-delfail")"
+expect_eq "delete failed and inspect is PERMISSION_DENIED: state root is kept" 1 "$(count_left "$work/tmp-deldeny")"
+expect_eq "delete failed but inspect is NOT_FOUND: state root is removed" 0 "$(count_left "$work/tmp-delgone")"
+if grep -q 'could not be reclaimed' "$work/delfail.err"; then pass "delfail warns about manual cleanup"; else fail "delfail warns about manual cleanup"; fi
+if grep -q 'could not be reclaimed' "$work/deldeny.err"; then pass "deldeny warns about manual cleanup"; else fail "deldeny warns about manual cleanup"; fi
+if grep -q 'could not be reclaimed' "$work/delgone.err"; then fail "delgone must not warn"; else pass "delgone does not warn"; fi
 
 # --- 後始末: capture 自身の mktemp -d が残らない（diff の capture は TMPDIR を専用ディレクトリにしている） ---
 leftover=0

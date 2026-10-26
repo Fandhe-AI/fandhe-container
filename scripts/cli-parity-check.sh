@@ -243,14 +243,19 @@ cleanup() {
     run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL c2 || true
     sleep 0.5
     run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
-    # delete が成功しなかった（状態が残る）なら、手動回収に必要な状態ルートを消さずに残す。
-    # ただし c2 が作られていない実行（非 Linux や create / start の失敗）では delete が失敗しても回収対象が
-    # 無いので、inspect が期限内に非 0 で終わる（c2 が存在しない）なら状態ルートを消してよい。
+    # delete が成功しなかった（状態が残る可能性がある）なら、手動回収に必要な状態ルートを消さずに残す。
+    # 消してよいのは、delete が成功したとき、または inspect が構造化エラー code=NOT_FOUND で終わり
+    # c2 の不在を確認できたときだけである。inspect が成功（c2 が残存）・NOT_FOUND 以外の失敗・期限切れ・
+    # 取得不能は、不在を確認できていないので inspect の結果で delete の失敗を上書きせず状態ルートを保持する
+    # （REPAIR-5）。
     if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
       run_cli "$chain_cli" 10 --root "$chain_state" inspect c2 || true
-      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" != "0" ]; then
+      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" != "0" ] && [ "$run_exit" != "" ] \
+        && grep -q '"code":"NOT_FOUND"' "$tmp_dir/err" 2>/dev/null; then
         run_exit=0
         run_timed_out=0
+      else
+        run_exit=1
       fi
     fi
     if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then

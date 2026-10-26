@@ -45,7 +45,12 @@
 //! - uid を照合しない理由: C が受け取る uid は C の user namespace へ写された値で、権限モデル（単一 ID 写像・
 //!   範囲写像）と送信時点で子が uid を切り替え済みかの両方に依存し、固定の期待値を導けない。また、新しい user
 //!   namespace 内で capability を持つ PID 1 は `SCM_CREDENTIALS` の値を明示指定できうるため、uid を足しても
-//!   送信者の偽装に対する強さは増えない
+//!   送信者の偽装に対する強さは増えない。条件は Linux v6.12（タグ commit `adc218676eef…`。2026-10-26 に原文で
+//!   確認。#2498）`net/core/scm.c` の `scm_check_creds`（L47–66）にある:
+//!   pid は自分の tgid 以外を、その PID namespace を所有する user namespace の `CAP_SYS_ADMIN` で指定できる。
+//!   uid は uid / euid / suid 以外を `CAP_SETUID`、gid は `CAP_SETGID`（いずれも自分の user namespace）で指定できる。
+//!   指定した pid は `__scm_send`（`SCM_CREDENTIALS` の case は L180–200）が送信側の名前空間から `find_get_pid`
+//!   で引くため、実在する pid に限る（無ければ `ESRCH`）。つまり pid 照合は偽装を防がない
 //! - 受信できる fd は `MAX_RECV_FDS`（制御バッファの容量で実際に制限）までで、受信は `MSG_DONTWAIT`
 //! - PID namespace をまたぐ pid の変換の実機確認は `production_launcher` のシナリオ A で行い、結果は #1621 に記録する
 //!   （人間担当）

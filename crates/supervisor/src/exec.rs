@@ -77,7 +77,11 @@
 //!   コンテナの所有者自身の場合に限り、参加前の消去は参加後へ回る（初期 user namespace で `CAP_SETGID` を持たないため。
 //!   core の `exec/reapply.rs`。#1462）。別の user namespace へ参加したときは、補助グループの後・capability 削減の
 //!   前に gid → uid を `process.user` の値へ揃えて読み戻す（rootless の exec。同じ user namespace では uid / gid を
-//!   変更しない。launch は `uid_map` の結果として既に root）
+//!   変更しない。launch は `uid_map` の結果として既に root）。`process.user` の非 root と `additionalGids` は
+//!   対象の写像と照合して受け（core の `exec_user_from_config`。写像の外は `InvalidArgument`。#2770）、指定した
+//!   補助グループを持たせた場合は結果が `applied`。`process.user` の非 root と `additionalGids` は
+//!   対象の写像と照合して受け（core の `exec_user_from_config`。写像の外は `InvalidArgument`。#2770）、指定した
+//!   補助グループを持たせた場合は結果が `applied`
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: [`ExecOutcome`] の `exit` は
 //!   core の `ExecExit` で、`Command`（コマンドが起動して終了した）と `SetupFailed`（コマンドは起動していない。
 //!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
@@ -226,9 +230,9 @@
 //!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（#1621）で
 //!   行う（記録が済むまで rootless での通しは未確認）
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
-//!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
-//!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
-//!   常に空）
+//!   同じく `/dev/null` へ固定し、cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
+//!   `process.user`（非 root と `additionalGids` を含む）を対象の写像と照合して受ける（#2770）。exec 要求ごとの
+//!   ユーザーの上書き（CLI の `--user`・CRI の Exec。#2712・#680）は未対応
 //! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
 //!   （`ExecExit::Command(Signaled(31))`）と worker が回収して結果行で返したとき、親プロセスが層 `exit_signal` の
 //!   レコードを 1 件記録し、結果を [`AuditedOutcome::exit_audit`] で返す（`audit` とは別の欄。結果は覆らない）。
@@ -702,8 +706,8 @@ pub struct ExecOutcome {
     pub landlock_rules: usize,
     /// 適用した seccomp の BPF 命令数。
     pub seccomp_instructions: usize,
-    /// 補助グループの扱いの結果（launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
-    /// 記録する。TASK-163 追補・#1457）。
+    /// 補助グループの扱いの結果（既定は launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
+    /// 記録する。TASK-163 追補・#1457。`process.user.additionalGids` が非空なら適用して `Applied`。#2770）。
     pub supplementary_groups: SupplementaryGroups,
     /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
     /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す
@@ -1983,6 +1987,8 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "already_empty" if groups == 0 => SupplementaryGroups::AlreadyEmpty,
         "cleared" => SupplementaryGroups::Cleared { cleared: groups },
         "kept_setgroups_denied" => SupplementaryGroups::KeptSetgroupsDenied { kept: groups },
+        // `process.user.additionalGids` を適用した（写像と照合済みの非空指定。#2770）。件数は 1 以上。
+        "applied" if groups > 0 => SupplementaryGroups::Applied { count: groups },
         _ => return Err(malformed()),
     };
     let mode = it.next().ok_or_else(malformed)?;
@@ -2929,13 +2935,14 @@ mod tests {
             b"ok command - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
         );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
-        // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
+        // 補助グループの扱いは 4 通りとも往復する（TASK-163 追補・#1457）。
         for (groups, text) in [
             (SupplementaryGroups::AlreadyEmpty, "already_empty 0"),
             (
                 SupplementaryGroups::KeptSetgroupsDenied { kept: 7 },
                 "kept_setgroups_denied 7",
             ),
+            (SupplementaryGroups::Applied { count: 2 }, "applied 2"),
         ] {
             let outcome = ExecOutcome {
                 supplementary_groups: groups,

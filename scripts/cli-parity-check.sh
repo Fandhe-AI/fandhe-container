@@ -24,7 +24,9 @@
 #
 # 記録の内容（情報漏えい防止）: 正規化済みの固定語彙だけを書く。生の stderr 文言・パス・ホスト名・
 # ユーザー名・環境変数は書かない。list の PID 列は <pid> に置換し、想定外の出力は内容を写さず
-# <unexpected>:行数 とする。
+# <unexpected>:行数 とする。inspect の 1 行 JSON は bundle（絶対パス）を記録せず、PID は <pid>、
+# cgroup は <set>、idMapping は model と extent 件数、auditCoverage は reason を落とし、capabilities は
+# 件数だけにする（CLI-1・#2826）。
 #
 # 使い方:
 #   cli-parity-check.sh capture --cli <絶対パス> --output <新規ファイル> [--timeout SECS（既定 20。1〜600）]
@@ -78,7 +80,8 @@ usage() {
 
 # --------------------------------------------------
 # ケース表: ID|層|種別|argv（空白区切り。@R@ = 状態ルート、@B@ = バンドル、@M@ = 存在しない状態ルート）
-# 種別 l = stdout が list 形式、n = 成功時の stdout は空であるべき。
+# 種別 l = stdout が list 形式、n = 成功時の stdout は空であるべき、
+# i = stdout が inspect の 1 行 JSON（固定語彙の 1 欄へ正規化して記録する。norm_inspect）。
 # B 層は上から順に実行する（状態遷移を観測する）。ID・層はドキュメントのチェックリストと一致させる。
 # --------------------------------------------------
 CASES=(
@@ -110,6 +113,7 @@ CASES=(
   'B01|B|l|--root @R@ list'
   'B02|B|n|--root @R@ create --bundle @B@ c1'
   'B03|B|l|--root @R@ list'
+  'B17|B|i|--root @R@ inspect c1'
   'B04|B|n|--root @R@ create --bundle @B@ c1'
   'B05|B|n|--root @R@ start c1'
   'B06|B|l|--root @R@ list'
@@ -343,6 +347,103 @@ norm_code() {
   return 0
 }
 
+# inspect の 1 行 JSON（supervisor::inspect::InspectReport::to_json。キー順固定・LF 終端 1 行）を固定語彙の
+# 1 欄へ畳む（種別 i。CLI-1・#2826）。OS・実行ごとに変わる値（PID・cgroup・bundle のパス・hostId）は記録しない。
+# 合わない形は 1 を返す（呼び出し側が <unexpected>:行数 にする。一致扱いにしない）。結果は norm_stdout_out。
+# 値はコマンド・パスへ連結せず、bash の組み込みの正規表現と文字列操作だけで扱う（eval を使わない）。
+readonly MAX_INSPECT_BYTES=65536
+norm_inspect() {
+  local e size rest id status pid exitc rev cg sup health restarts audit idmap stop caps
+  local pol skm llm rec model ul gl un gn cl tmp
+  local str='"'"$JSON_STR_BODY"'"'
+  size=$(($(wc -c <"$tmp_dir/out")))
+  [ "$size" -le "$MAX_INSPECT_BYTES" ] || return 1
+  e=""
+  IFS= read -r e <"$tmp_dir/out" || return 1
+  [ $((${#e} + 1)) -eq "$size" ] || return 1
+  if [ -n "${e//[ -~]/}" ]; then
+    case "$e" in
+      *[$'\001'-$'\037']*) return 1 ;;
+    esac
+    command -v iconv >/dev/null 2>&1 || return 1
+    iconv -f UTF-8 -t UTF-8 <"$tmp_dir/out" >/dev/null 2>&1 || return 1
+    e="${e//[! -~]/~}"
+  fi
+  # 先頭: id〜revision。bundle は検証だけして記録しない（絶対パス・ユーザー名の漏えい防止）。
+  [[ $e =~ ^\{\"id\":\"([A-Za-z0-9_-]{1,64})\",\"status\":\"([a-z_]{1,16})\",\"pid\":([0-9]{1,10}|null),\"exitCode\":(-?[0-9]{1,10}|null),\"bundle\":$str,\"revision\":([0-9]{1,10}),(.*)$ ]] || return 1
+  id="${BASH_REMATCH[1]}"
+  status="${BASH_REMATCH[2]}"
+  pid="${BASH_REMATCH[3]}"
+  exitc="${BASH_REMATCH[4]}"
+  rev="${BASH_REMATCH[6]}"
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+  if [ "$pid" = "null" ]; then pid='-'; else pid='<pid>'; fi
+  if [ "$exitc" = "null" ]; then exitc='-'; fi
+  # cgroup・supervisorPid・health・restartCount
+  [[ $rest =~ ^\"cgroupScope\":(null|$str),\"cgroupInstance\":(null|[0-9]{1,10}),\"supervisorPid\":(null|[0-9]{1,10}),\"health\":(null|\"[a-z_]{1,16}\"),\"restartCount\":([0-9]{1,10}),(.*)$ ]] || return 1
+  cg='<set>'
+  if [ "${BASH_REMATCH[1]}" = "null" ] && [ "${BASH_REMATCH[3]}" = "null" ]; then cg='-'; fi
+  sup="${BASH_REMATCH[4]}"
+  if [ "$sup" = "null" ]; then sup='-'; else sup='<pid>'; fi
+  health="${BASH_REMATCH[5]}"
+  health="${health//\"/}"
+  if [ "$health" = "null" ]; then health='-'; fi
+  restarts="${BASH_REMATCH[6]}"
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+  # auditCoverage: policy・両 layer の mode・record だけ。reason（カーネル版数に依る詳細）は落とす。
+  if [[ $rest =~ ^\"auditCoverage\":null,(.*)$ ]]; then
+    audit='-'
+  elif [[ $rest =~ ^\"auditCoverage\":\{\"policy\":\"([a-z_]{1,24})\",\"seccompKill\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"landlock\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"record\":(null|\"[a-z_]{1,16}\")\},(.*)$ ]]; then
+    pol="${BASH_REMATCH[1]}"
+    skm="${BASH_REMATCH[2]}"
+    llm="${BASH_REMATCH[4]}"
+    rec="${BASH_REMATCH[6]}"
+    rec="${rec//\"/}"
+    if [ "$rec" = "null" ]; then rec='-'; fi
+    audit="${pol}/${skm}/${llm}/${rec}"
+  else
+    return 1
+  fi
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+  # idMapping: model と extent 件数だけ（hostId はホストの subuid 設定のため記録しない）。
+  local ext='\{"containerId":[0-9]{1,10},"hostId":[0-9]{1,10},"size":[0-9]{1,10}\}'
+  local idm_re='^"idMapping":\{"model":"([a-z_]{1,24})","uid":\[([^]]*)\],"gid":\[([^]]*)\]\},(.*)$'
+  if [[ $rest =~ ^\"idMapping\":null,(.*)$ ]]; then
+    idmap='-'
+  elif [[ $rest =~ $idm_re ]]; then
+    model="${BASH_REMATCH[1]}"
+    ul="${BASH_REMATCH[2]}"
+    gl="${BASH_REMATCH[3]}"
+    rest="${BASH_REMATCH[4]}"
+    [[ $ul =~ ^($ext(,$ext)*)?$ ]] || return 1
+    [[ $gl =~ ^($ext(,$ext)*)?$ ]] || return 1
+    tmp="${ul//\"containerId\"/}"
+    un=$(((${#ul} - ${#tmp}) / 13))
+    tmp="${gl//\"containerId\"/}"
+    gn=$(((${#gl} - ${#tmp}) / 13))
+    idmap="${model}:${un}:${gn}"
+  else
+    return 1
+  fi
+  if [ "$idmap" = "-" ]; then
+    rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+  fi
+  # explicitStop と capabilities。capability の名前は検証して件数だけ記録する（最大 41 件の名前は 1 欄の上限を超える）。
+  [[ $rest =~ ^\"explicitStop\":\"([a-z_]{1,16})\",\"capabilities\":(null|\{\"bounding\":\[([^]]*)\]\})\}$ ]] || return 1
+  stop="${BASH_REMATCH[1]}"
+  if [ "${BASH_REMATCH[2]}" = "null" ]; then
+    caps='-'
+  else
+    cl="${BASH_REMATCH[3]}"
+    local cap='"CAP_[A-Z_]{1,32}"'
+    [[ $cl =~ ^($cap(,$cap)*)?$ ]] || return 1
+    tmp="${cl//\"CAP_/}"
+    caps=$(((${#cl} - ${#tmp}) / 5))
+  fi
+  norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps}"
+  return 0
+}
+
 # stdout を正規化する。種別 l は list 形式（ヘッダ + 行）を厳格に検査し PID 列を <pid> へ置換する。
 # 結果は norm_stdout_out に入れる。
 norm_stdout_out=""
@@ -363,6 +464,13 @@ norm_stdout() {
   # 検査上限を超える出力は先頭が正常でも後続を検査できないため、一致扱いにせず異常として記録する。
   if [ "$raw" -gt 65536 ]; then
     norm_stdout_out='<unexpected>:big'
+    return 0
+  fi
+  if [ "$kind" = "i" ]; then
+    if norm_inspect; then
+      return 0
+    fi
+    norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
     return 0
   fi
   ok=0
@@ -524,6 +632,8 @@ load_capture() {
   local id_re='^[ABD][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
+  # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
+  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3})$'
   local k entry_id so_ok
   line=""
   while IFS= read -r line; do
@@ -560,7 +670,9 @@ load_capture() {
         if [ "${#so}" -le 300 ]; then
           if [ "$so" = "-" ] || [ "$so" = "<timeout>" ] || [[ $so =~ $so_unexp_re ]]; then
             so_ok=1
-          elif [ "$k" != "n" ] && [[ $so =~ $so_list_re ]]; then
+          elif [ "$k" = "l" ] && [[ $so =~ $so_list_re ]]; then
+            so_ok=1
+          elif [ "$k" = "i" ] && [[ $so =~ $so_inspect_re ]]; then
             so_ok=1
           fi
         fi

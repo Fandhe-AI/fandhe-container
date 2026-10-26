@@ -37,6 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
+use super::namespace_join::NamespaceJoin;
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
@@ -481,6 +482,12 @@ pub struct LaunchSpec {
     working_dir: ContainerWorkingDir,
     /// `process.user` の (uid, gid)（名前空間内の値。写像との整合は launcher が fork 前に検査する。OCI-1・SEC-5）。
     user: (u32, u32),
+    /// `process.user.additionalGids`（start が件数の上限を検証済み。写像との照合と適用は launcher。
+    /// OCI-1・SEC-5・CORE-6・#2667）。
+    additional_gids: Vec<u32>,
+    /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
+    /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+    namespace_join: Option<NamespaceJoin>,
 }
 
 impl LaunchSpec {
@@ -515,7 +522,37 @@ impl LaunchSpec {
             sysfs: None,
             working_dir,
             user,
+            additional_gids: Vec::new(),
+            namespace_join: None,
         }
+    }
+
+    /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。
+    pub(super) fn with_additional_gids(mut self, gids: Vec<u32>) -> Self {
+        self.additional_gids = gids;
+        self
+    }
+
+    /// `process.user.additionalGids`（名前空間内の値。OCI-1・SEC-5・CORE-6・#2667）。
+    ///
+    /// 本番 launcher が fork の前に gid の写像と照合し、子の capability 削減段が `setgroups(list)` で適用する。
+    /// 空なら補助グループを持たせない（持ち越しもしない）。
+    pub fn additional_gids(&self) -> &[u32] {
+        &self.additional_gids
+    }
+
+    /// 検証済みの pod の namespace への join を載せる（`start` と launcher の試験が呼ぶ。#2674）。
+    pub(super) fn with_namespace_join(mut self, join: Option<NamespaceJoin>) -> Self {
+        self.namespace_join = join;
+        self
+    }
+
+    /// pod の user・ipc namespace への join（無ければ `None`。CRI-2・CORE-3。#2674）。
+    ///
+    /// 本番 launcher が中間プロセスの分離で `setns` に使う。`namespaces()` には `User`・`Ipc` が含まれ（新規作成ではなく
+    /// join する）、restart の再 launch でも同じ fd を使う。
+    pub fn namespace_join(&self) -> Option<&NamespaceJoin> {
+        self.namespace_join.as_ref()
     }
 
     /// 検証済みの sysfs の指定を載せる（`start` だけが呼ぶ。#2020）。
@@ -736,6 +773,14 @@ pub trait LaunchedProcess: Send {
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         None
     }
+
+    /// launch が `Rlimits` 段へ渡した全 16 種の rlimit 集合(`--ulimit` の指定値と継承値の補完。SUP-12・#2713)。
+    /// start / restart が Running の更新と同じ `update` で `state.json` へ書き、exec の再適用が launch と同じ制限を
+    /// 載せる根拠になる。`LaunchedProcess` を包み直す実装は内側へ転送すること(`launch_isolation` と同じ注意)。
+    /// 持たない実装は `None`(既定。前の記録が引き継がれる)。
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -759,6 +804,8 @@ pub struct ContainerChildProcess {
     reap_notice: Option<ReapNotice>,
     /// launch が確定した分離の記録（本番 launcher が付ける。[`LaunchedProcess::launch_isolation`]）。
     launch_isolation: Option<crate::launch_isolation::LaunchIsolationRecord>,
+    /// launch が `Rlimits` 段へ渡した全 16 種の集合(本番 launcher が付ける。[`LaunchedProcess::launch_rlimits`])。
+    launch_rlimits: Option<crate::rlimits::Rlimits>,
     /// SIGSYS 終了の補助記録（SEC-4・ESC-06・#2004）。本番 launcher だけが付ける。
     exit_audit: Option<ExitAudit>,
 }
@@ -814,6 +861,7 @@ impl ContainerChildProcess {
             seccomp_listener: std::sync::Mutex::new(None),
             reap_notice: None,
             launch_isolation: None,
+            launch_rlimits: None,
             exit_audit: None,
         })
     }
@@ -825,6 +873,13 @@ impl ContainerChildProcess {
         record: crate::launch_isolation::LaunchIsolationRecord,
     ) -> Self {
         self.launch_isolation = Some(record);
+        self
+    }
+
+    /// launch が適用した全 16 種の rlimit 集合を持たせる([`LaunchedProcess::launch_rlimits`] で返る。#2713)。
+    #[must_use]
+    pub(crate) fn with_launch_rlimits(mut self, rlimits: crate::rlimits::Rlimits) -> Self {
+        self.launch_rlimits = Some(rlimits);
         self
     }
 
@@ -936,6 +991,10 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         self.launch_isolation.as_ref()
+    }
+
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        self.launch_rlimits.as_ref()
     }
 
     fn take_output(&self) -> Option<ContainerOutput> {

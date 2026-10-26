@@ -62,12 +62,15 @@
 //! `Unimplemented` で拒否する（指定より強い権限・弱い分離での起動を防ぐ）。後続タスクが適用を
 //! 実装した時点で該当検査を外す。
 //!
-//! - `process.user.additionalGids` が空でない（補助グループの適用は未実装。`process.cwd` は pivot 直後に fd 起点で適用し、
-//!   `process.user` の uid・gid は launcher が user namespace の写像と照合して適用する。OCI-1・SEC-5）
+//! - （適用済み）`process.cwd` は pivot 直後に fd 起点で適用し、`process.user` の uid・gid と
+//!   `additionalGids` は launcher が user namespace の写像と照合して適用する（OCI-1・SEC-5・CORE-6・#2667）。
+//!   `additionalGids` の写像外・単一 ID 写像での指定は launcher が fork の前に拒否する
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
-//! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
+//! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
+//!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
+//!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
@@ -134,6 +137,7 @@ use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
+use super::namespace_join::NamespaceJoin;
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
@@ -681,6 +685,10 @@ fn launch_inner(
     if let Some(isolation) = process.launch_isolation() {
         running_update = running_update.with_launch_isolation(isolation.clone());
     }
+    // launch が適用した rlimit(16 種)も同じ update で書く。exec の再適用が launch と同じ制限を載せる(SUP-12・#2713)。
+    if let Some(rlimits) = process.launch_rlimits() {
+        running_update = running_update.with_rlimits(rlimits.clone());
+    }
     match store.update(&running_update) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
         Ok(record) => Ok(StartedContainer { record, process }),
@@ -851,6 +859,7 @@ fn build_spec_with_swap(
     validate_entrypoint_limits(process.args(), process.env())?;
     let user = process.user();
     let ids = (user.uid(), user.gid());
+    let additional_gids = user.additional_gids().to_vec();
     // cwd は字句検証だけここで行い、適用は子が pivot 直後に fd 起点で行う（不在・非ディレクトリは launch 側の拒否。OCI-1）。
     let working_dir = ContainerWorkingDir::parse(process.cwd()).ok_or_else(|| {
         TraitError::new(
@@ -858,10 +867,7 @@ fn build_spec_with_swap(
             "process.cwd must be a normalized absolute path without .. components",
         )
     })?;
-    // uid・gid は launcher が写像と照合して適用する（SEC-5）。補助グループは未実装のため拒否する（REPAIR-3）。
-    if !user.additional_gids().is_empty() {
-        return Err(unsupported("process.user.additionalGids"));
-    }
+    // uid・gid・補助グループは launcher が写像と照合して適用する（SEC-5・#2667）。
     if process.terminal() {
         return Err(unsupported("process.terminal"));
     }
@@ -922,6 +928,9 @@ fn build_spec_with_swap(
     }
     // 違反の理由（`RootfsPinError::violation`）は launcher の拒否の記録先へ記録する（#2623・#1702）。
     let rootfs_dir = pin_rootfs_audited(bundle, &rootfs, id, launcher)?;
+    // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
+    // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
+    let namespace_join = pin_namespace_join_audited(&config, id, launcher)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -936,7 +945,39 @@ fn build_spec_with_swap(
         working_dir,
         ids,
     )
-    .with_sysfs(sysfs))
+    .with_sysfs(sysfs)
+    .with_additional_gids(additional_gids)
+    .with_namespace_join(namespace_join))
+}
+
+/// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・
+/// パスの形の不正。`PermissionDenied` / `InvalidArgument`）なら launcher の拒否の記録先へ記録する
+/// （SEC-4・SEC-1・CORE-3・#2674）。
+///
+/// 記録は層 `mount`・理由なし（中継が運ぶ閉じた理由表に join 用の語彙がまだ無いため。REPAIR-3）で、参加先の
+/// user namespace のパスとコンテナ ID を載せる。記録の成否で拒否は覆さない。I/O の失敗（`Internal` 等）と
+/// 非 Linux の `Unimplemented` は検証による拒否ではないため記録しない。
+fn pin_namespace_join_audited(
+    config: &OciConfig,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<Option<NamespaceJoin>, TraitError> {
+    let Some((user, ipc)) = NamespaceJoin::paths_of(config)? else {
+        return Ok(None);
+    };
+    NamespaceJoin::pin(user, ipc).map(Some).inspect_err(|err| {
+        if matches!(
+            err.code(),
+            ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
+        ) && let Some(sink) = launcher.rejection_audit_sink()
+        {
+            let event = crate::audit_log::AuditEvent::Mount {
+                path: Some(crate::audit_log::AuditPath::new(user)),
+                reason: None,
+            };
+            let _ = crate::audit_log::mount::deliver(event, Some(id), sink);
+        }
+    })
 }
 
 /// rootfs を固定し、検証後の差し替えによる違反（`RootfsPinError::violation`）なら launcher の拒否の記録先
@@ -1261,10 +1302,10 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
         return Err(unsupported("root.readonly"));
     }
     reject_config_id_mappings(config)?;
+    // path は user と ipc の組だけを受ける（pod の join。形の検査だけここで行い、開いて固定するのは rootfs の
+    // 固定の段。他の種別の path・片方だけの path は `Unimplemented`。#2674）。
+    NamespaceJoin::paths_of(config)?;
     for ns in config.namespaces() {
-        if ns.path().is_some() {
-            return Err(unsupported("linux.namespaces[].path"));
-        }
         if matches!(
             ns.kind(),
             NamespaceKind::Network | NamespaceKind::Cgroup | NamespaceKind::Time
@@ -1407,6 +1448,9 @@ mod tests {
             if let Some(l) = req.launch_isolation().or(cur.launch_isolation()) {
                 next = next.with_launch_isolation(l.clone());
             }
+            if let Some(r) = req.rlimits().or(cur.rlimits()) {
+                next = next.with_rlimits(r.clone());
+            }
             records.insert(req.status().id().clone(), next.clone());
             Ok(next)
         }
@@ -1501,6 +1545,8 @@ mod tests {
         audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
         /// launch が返すハンドルに持たせる分離の記録(未設定なら記録なし。#2007)。
         isolation: Mutex<Option<crate::launch_isolation::LaunchIsolationRecord>>,
+        /// launch が返すハンドルに持たせる rlimit 集合(未設定なら記録なし。#2713)。
+        rlimits: Mutex<Option<crate::rlimits::Rlimits>>,
         /// `confirm_no_process_recorded` に渡された配置（呼び出し順。#2011）。
         recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
     }
@@ -1522,6 +1568,7 @@ mod tests {
                 may_leave: AtomicBool::new(false),
                 audit: std::sync::OnceLock::new(),
                 isolation: Mutex::new(None),
+                rlimits: Mutex::new(None),
                 recorded: Mutex::new(Vec::new()),
             })
         }
@@ -1556,6 +1603,7 @@ mod tests {
         Arc<Gate>,
         NonZeroU32,
         Option<crate::launch_isolation::LaunchIsolationRecord>,
+        Option<crate::rlimits::Rlimits>,
     );
 
     impl LaunchedProcess for FakeProcess {
@@ -1565,6 +1613,10 @@ mod tests {
 
         fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
             self.4.as_ref()
+        }
+
+        fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+            self.5.as_ref()
         }
 
         /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
@@ -1662,6 +1714,10 @@ mod tests {
                 self.term_gate.clone(),
                 NonZeroU32::new(self.pid.load(Ordering::SeqCst)).expect("nonzero"),
                 self.isolation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                self.rlimits
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
@@ -2064,19 +2120,92 @@ mod tests {
         assert_eq!(err.message(), "process.args[0] must not be empty");
     }
 
+    /// CRI-2・CORE-3・SEC-1（#2674）: user と ipc の path が呼び出し側自身の namespace を指す config は、
+    /// 予約・launch の前に `PermissionDenied` で拒否し、状態は Created のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_start_rejects_pod_join_to_own_namespaces() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-own", &cfg);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        // 開けない path は FailedPrecondition。
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/2147483647/ns/ipc"},
+            {"type": "user", "path": "/proc/2147483647/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-gone", &cfg);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
+    /// SEC-4・CORE-3（#2674）: pod の namespace join の検証による拒否は、launcher の拒否の記録先へ mount 層で
+    /// コンテナ ID つき 1 件記録される。開けない path（`FailedPrecondition`）は検証による拒否ではなく記録しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_start_records_pod_join_rejection_to_launcher_audit_sink() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let (b, store) = created("rej-join-audit");
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, "rej-join-audit").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(launcher.calls(), 0);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        let line = format!("{:?}", recs[0]);
+        assert!(line.contains("rej-join-audit"), "{line}");
+        assert!(line.contains("/proc/self/ns/user"), "{line}");
+    }
+
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。
     #[test]
     fn sec1_start_rejects_unsupported_fields() {
         let cases: Vec<Case> = vec![
-            (
-                "addgid",
-                Box::new(|c| c["process"]["user"]["additionalGids"] = json!([5])),
-            ),
             ("tty", Box::new(|c| c["process"]["terminal"] = json!(true))),
             (
                 "nspath",
                 Box::new(|c| {
                     c["linux"]["namespaces"] = json!([{"type": "pid", "path": "/proc/1/ns/pid"}])
+                }),
+            ),
+            // #2674: path は user と ipc の組だけを受ける。mount・uts への path と片方だけの path は未実装。
+            (
+                "nspath-mount",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount", "path": "/proc/1/ns/mnt"},
+                        {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-ipc-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                        {"type": "ipc", "path": "/proc/1/ns/ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-user-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"},
+                        {"type": "user", "path": "/proc/1/ns/user"}
+                    ])
                 }),
             ),
             (
@@ -2160,6 +2289,22 @@ mod tests {
             err.message(),
             "process.cwd must be a normalized absolute path without .. components"
         );
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: `process.user.additionalGids` は start で拒否せず、検証済みの値として
+    /// launcher へ渡る（写像との照合と適用は launcher と子）。指定が無ければ空。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci1_start_passes_additional_gids_to_launcher() {
+        let mut cfg = valid_config();
+        cfg["process"]["user"]["uid"] = json!(1000);
+        cfg["process"]["user"]["gid"] = json!(1000);
+        cfg["process"]["user"]["additionalGids"] = json!([5, 6]);
+        let spec = build_spec_with_state_root("addgids", &cfg, None).expect("spec");
+        assert_eq!(spec.additional_gids(), [5, 6]);
+
+        let spec = build_spec_with_state_root("no-addgids", &valid_config(), None).expect("spec");
+        assert_eq!(spec.additional_gids(), [] as [u32; 0]);
     }
 
     /// bind mount つきの config（宛先・元・オプションを指定）。
@@ -2832,6 +2977,25 @@ mod tests {
             ))
             .expect("get");
         assert!(stored.launch_isolation() == Some(&iso_record(7, 11)));
+    }
+
+    /// SUP-12・CLI-1(#2713): ハンドルが持つ rlimit 集合は、Running の更新と同じ update で状態へ載る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup12_running_record_carries_launch_rlimits() {
+        use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
+        let (_b, store) = created("rl-carry");
+        let launcher = RecordingLauncher::new(false);
+        let set = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 1024, 2048).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        *launcher.rlimits.lock().unwrap() = Some(set.clone());
+        let record = run(&store, &launcher, "rl-carry").expect("start");
+        assert_eq!(record.rlimits(), Some(&set));
+        let (_b2, store2) = created("rl-none");
+        let none = run(&store2, &RecordingLauncher::new(false), "rl-none").expect("start");
+        assert!(none.rlimits().is_none());
     }
 
     /// SUP-6(#2007): 記録を持たないハンドルでは、従来どおり分離の記録は付かない。

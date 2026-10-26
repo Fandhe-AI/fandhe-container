@@ -1582,6 +1582,32 @@ mod uds_peer_auth_tests {
         crate::sys::effective_uid().wrapping_add(1)
     }
 
+    /// nonblocking の client stream が切断（EOF または reset 系）を観測するまで期限つきで待つ。
+    /// 拒否側 server の close を待つ試験用の補助で、`set_read_timeout` が macOS で EINVAL になる
+    /// 競合を避ける（`crates/io` の `is_peer_shutdown_einval` と同じ事情。#2711・PLUG-12・REPAIR-5）。
+    /// 期限内に切断を観測できなければ panic する（期限切れを EOF 扱いにして通さない。REPAIR-12）。
+    fn read_until_disconnect(c: &mut StdStream, deadline: std::time::Instant) -> usize {
+        let mut buf = [0u8; 8];
+        loop {
+            match c.read(&mut buf) {
+                Ok(n) => return n,
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe => return 0,
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no disconnect observed from the rejecting server within the deadline"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => panic!("unexpected read error: {e:?}"),
+                },
+            }
+        }
+    }
+
     /// サーバー側: 不一致の接続は切断され、Accept 拒否が 1 件通知され、
     /// incoming は終了せず継続する（PLUG-12・SEC-4）。
     #[tokio::test]
@@ -1598,11 +1624,13 @@ mod uds_peer_auth_tests {
         let path = incoming.path().to_path_buf();
         let client = std::thread::spawn(move || {
             let mut c = StdStream::connect(path).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // macOS では相手が先に閉じた socket への setsockopt(SO_RCVTIMEO) が EINVAL になる
+            // （サーバーの拒否・close と競合する。#2711）。set_read_timeout は使わず、
+            // setsockopt を伴わない set_nonblocking（FIONBIO）と期限つきの待ちで期限を保つ。
+            c.set_nonblocking(true).unwrap();
             // 先送りしたバイトは読まれない。切断されると EOF（Ok(0)）か reset になる。
             let _ = c.write_all(b"early");
-            let mut buf = [0u8; 8];
-            c.read(&mut buf).unwrap_or(0)
+            read_until_disconnect(&mut c, std::time::Instant::now() + Duration::from_secs(5))
         });
         // 拒否されるので stream は yield されず、Pending のまま（終了も Err もしない）。
         let polled = tokio::time::timeout(

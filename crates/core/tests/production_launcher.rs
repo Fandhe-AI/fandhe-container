@@ -73,6 +73,16 @@
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
 //!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
 //!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
+//! - シナリオ I・O の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）で
+//!   `process.user` 1000:1000・`additionalGids` [3000, 2000] を指定すると、コンテナ内の `Groups:` が `2000,3000`、ホストから見た
+//!   `/proc/<pid>/status` の `Groups:` が subgid 先頭 + 1999 / + 2999 になる（成功行 `scenario=groups-applied gids=2000,3000
+//!   host_gids=<a>,<b>`）。単一 ID 写像で 0/0 に `additionalGids` [0] を指定した start は fork の前に `FailedPrecondition` で
+//!   拒否され、状態は Created のまま子が残らない（成功行 `scenario=groups-single-id-refused`）
+//! - シナリオ W（pod の user・ipc namespace への join。#2674・CRI-2・CORE-3・SEC-1・SEC-5）: コンテナ A を start し、B の
+//!   `linux.namespaces` の `user`・`ipc` に `/proc/<A の pid>/ns/{user,ipc}` の path を入れて start する。ホストから読んだ B の
+//!   `ns/user`・`ns/ipc` が A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なることを照合する。否定として、試験プロセス自身の
+//!   namespace を指す path は fork の前に `PermissionDenied` で拒否され、状態は Created のまま子が残らない。成功行の前に
+//!   `production_launcher: pod ipc namespace joined (scenario=W ...)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -383,6 +393,14 @@ mod linux {
                 field(key).split_whitespace().collect::<Vec<_>>().join(",")
             ));
         }
+        // シナリオ I の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: `Groups:` をカンマ区切りで出す（空なら空文字）。
+        emit(format!(
+            "GROUPS {}",
+            field("Groups:")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
         // シナリオ K（exec 後の seccomp の識別的な拒否。#2012）: 禁止 syscall を 1 件発行する。フィルタが効いていれば
         // SIGSYS で終了して戻らない。戻った場合（フィルタ欠落）は固定語彙の行を出して正常終了し、親が失敗にする。
         let args: Vec<String> = std::env::args().collect();
@@ -583,7 +601,20 @@ mod linux {
         extra_args: &[&str],
         mounts: serde_json::Value,
         cwd: &str,
+        user: (u32, u32),
+    ) {
+        write_config_groups(bundle, ld_library_path, extra_args, mounts, cwd, user, &[]);
+    }
+
+    /// `write_config_with` に `process.user.additionalGids` を指定できる版(OCI-1・SEC-5・CORE-6・#2667)。
+    fn write_config_groups(
+        bundle: &Bundle,
+        ld_library_path: &str,
+        extra_args: &[&str],
+        mounts: serde_json::Value,
+        cwd: &str,
         (uid, gid): (u32, u32),
+        additional_gids: &[u32],
     ) {
         let mut args = vec!["/probe", "--container-probe"];
         args.extend_from_slice(extra_args);
@@ -592,7 +623,7 @@ mod linux {
             "root": {"path": "rootfs", "readonly": false},
             "hostname": HOSTNAME,
             "process": {
-                "user": {"uid": uid, "gid": gid},
+                "user": {"uid": uid, "gid": gid, "additionalGids": additional_gids},
                 "args": args,
                 "env": [
                     "PATH=/",
@@ -832,9 +863,11 @@ mod linux {
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
         scenario_t_capabilities_drop(&env, tag);
+        scenario_w_pod_ipc_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
+        scenario_o_groups_single_id_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
         scenario_s_entrypoint_violation_recorded(&env, container, tag);
@@ -1642,10 +1675,28 @@ mod linux {
         prepare: &dyn Fn(&Path),
         tag: u32,
     ) -> Vec<String> {
+        run_probe_groups(env, launcher, name, cwd, user, &[], prepare, tag)
+    }
+
+    /// `run_probe_with` に `additionalGids` を指定できる版。ホストから見た補助グループを `HOST_GROUPS` 行として足す
+    /// (OCI-1・SEC-5・CORE-6・#2667)。
+    // 既存の `run_probe_with` と同じ並びに `additionalGids` を足した試験用ヘルパーで、引数は呼び出し側の
+    // 試験ごとに全て異なる値を取る。構造体に束ねると 1 回限りの型が増えるため抑止する。
+    #[allow(clippy::too_many_arguments)]
+    fn run_probe_groups(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        name: &str,
+        cwd: &str,
+        user: (u32, u32),
+        additional_gids: &[u32],
+        prepare: &dyn Fn(&Path),
+        tag: u32,
+    ) -> Vec<String> {
         let bundle = Bundle::new(name);
         let ld = make_rootfs(&bundle.rootfs(), true);
         prepare(&bundle.rootfs());
-        write_config_with(&bundle, &ld, &[], json!([]), cwd, user);
+        write_config_groups(&bundle, &ld, &[], json!([]), cwd, user, additional_gids);
         let id = ContainerId::new(format!("pl{name}{tag}")).expect("id");
         do_create(env, &bundle, &id);
         wait_single_thread();
@@ -1672,6 +1723,12 @@ mod linux {
                 lines.push(format!(
                     "HOST_UIDS {}",
                     host.split_whitespace().collect::<Vec<_>>().join(",")
+                ));
+                let groups = status_field(&format!("/proc/{pid}/status"), "Groups:")
+                    .unwrap_or_else(|| "missing".to_string());
+                lines.push(format!(
+                    "HOST_GROUPS {}",
+                    groups.split_whitespace().collect::<Vec<_>>().join(",")
                 ));
             }
         }));
@@ -1771,6 +1828,43 @@ mod linux {
         );
     }
 
+    /// シナリオ O の拡張(OCI-1・SEC-5・CORE-6・#2667): 単一 ID 写像では `setgroups` が `deny` のため、
+    /// `additionalGids` の指定は fork の前に `FailedPrecondition` で拒否され、状態は Created のまま子が残らない。
+    fn scenario_o_groups_single_id_refused(env: &Env, tag: u32) {
+        let bundle = Bundle::new("og");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config_groups(&bundle, &ld, &[], json!([]), "/", (0, 0), &[0]);
+        let id = ContainerId::new(format!("plog{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("start must fail for additionalGids under a single id mapping"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.message(),
+            "process.user.additionalGids requires a subordinate id mapping (SEC-5)"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(children_of_self().is_empty());
+        println!(
+            "production_launcher: scenario=groups-single-id-refused code={:?} state=created children=0",
+            err.code()
+        );
+    }
+
     /// シナリオ I の拡張(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。OCI-1・SEC-5): 範囲写像で `process.user` 1000:1000 を
     /// 指定すると、コンテナ内の実・実効・保存・FS の uid / gid が 1000 になり、ホストから見た uid は
     /// 「subuid の先頭 + 999」になる(コンテナ 1 → subuid 先頭)。
@@ -1805,6 +1899,28 @@ mod linux {
             "{lines:?}"
         );
         println!("production_launcher: scenario=user-applied uid=gid=1000 host_uid={host_uid}");
+        // 補助グループ(#2667): additionalGids [3000, 2000] は gid 写像内(コンテナ 1 → subgid 先頭)なので適用され、
+        // コンテナ内の Groups: はカーネルがソートした 2000,3000、ホストからは subgid 先頭 + 1999 / + 2999 に見える。
+        let gowner = SubIdOwner::new(euid, std::env::var("USER").ok()).expect("gid owner");
+        let granges =
+            load_subordinate_ids(Path::new("/etc/subgid"), &gowner).expect("load /etc/subgid");
+        let gbase = granges.first().expect("a subgid range").start();
+        let lines = run_probe_groups(
+            &env,
+            &launcher,
+            "ig",
+            "/",
+            (1000, 1000),
+            &[3000, 2000],
+            &|_| (),
+            tag,
+        );
+        assert_eq!(value_of(&lines, "GROUPS"), "2000,3000", "{lines:?}");
+        let host_gids = format!("{},{}", gbase + 1999, gbase + 2999);
+        assert_eq!(value_of(&lines, "HOST_GROUPS"), host_gids, "{lines:?}");
+        println!(
+            "production_launcher: scenario=groups-applied gids=2000,3000 host_gids={host_gids}"
+        );
     }
 
     /// シナリオ E: 状態ルート自身、または状態ルートへの symlink 別名を bind mount の元にした start は、本番 launcher
@@ -2274,6 +2390,157 @@ mod linux {
             children_of_self().is_empty(),
             "no child may remain after terminate"
         );
+    }
+
+    /// 起動済みコンテナの標準出力を読み、プローブの `READY` までを回収する（exec 後の状態を観測するため）。
+    ///
+    /// リーダースレッドは `READY` を送った時点で終了し、ここで join する。スレッドを残すと次の launch の前提
+    /// （`wait_single_thread` の `Threads: 1`）に戻れないため（REPAIR-12）。`READY` の後のプローブは出力せず待つだけ。
+    fn wait_probe_ready(started: &fandhe_container_core::oci_runtime::StartedContainer) {
+        let output = started.process().take_output().expect("container output");
+        let stdout = output.stdout.expect("container stdout");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            for _ in 0..LINES_MAX {
+                let mut line = String::new();
+                match (&mut reader).take(LINE_MAX).read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let line = line.trim_end().to_string();
+                        let ready = line == PROBE_READY;
+                        if tx.send(line).is_err() || ready {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let _ = collect_probe(&rx);
+        handle.join().expect("join reader");
+    }
+
+    /// 名前空間の識別子（`/proc/<pid>/ns/<name>` のリンク先。例 `ipc:[4026531839]`）。
+    fn ns_link(pid: impl std::fmt::Display, name: &str) -> String {
+        std::fs::read_link(format!("/proc/{pid}/ns/{name}"))
+            .unwrap_or_else(|e| panic!("read_link /proc/{pid}/ns/{name}: {e}"))
+            .display()
+            .to_string()
+    }
+
+    /// シナリオ W: pod の user・ipc namespace への join（#2674・CRI-2・CORE-3・SEC-1・SEC-5）。
+    fn scenario_w_pod_ipc_join(env: &Env, tag: u32) {
+        // 否定: 試験プロセス自身の namespace を指す path は、fork の前に PermissionDenied で拒否される。
+        {
+            let bundle = Bundle::new("w-own");
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            write_config(&bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": "/proc/self/ns/ipc"},
+                    {"type": "user", "path": "/proc/self/ns/user"}
+                ]),
+            );
+            let id = ContainerId::new(format!("plwn{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let Err(err) = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) else {
+                panic!("joining the caller's own namespaces must be refused");
+            };
+            assert_eq!(err.code(), ErrorCode::PermissionDenied);
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(children_of_self().is_empty(), "no child may remain");
+        }
+
+        // 正常: A の user・ipc namespace に B が join する。
+        let a_bundle = Bundle::new("w-a");
+        let ld = make_rootfs(&a_bundle.rootfs(), true);
+        write_config(&a_bundle, &ld, &[], json!([]));
+        let a_id = ContainerId::new(format!("plwa{tag}")).expect("id");
+        do_create(env, &a_bundle, &a_id);
+        wait_single_thread();
+        let a = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(a_id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start A failed: {:?} {}", e.code(), e.message()));
+        let a_pid = a.process().pid();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_probe_ready(&a);
+            let b_bundle = Bundle::new("w-b");
+            let ld = make_rootfs(&b_bundle.rootfs(), true);
+            write_config(&b_bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &b_bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": format!("/proc/{a_pid}/ns/ipc")},
+                    {"type": "user", "path": format!("/proc/{a_pid}/ns/user")}
+                ]),
+            );
+            let b_id = ContainerId::new(format!("plwb{tag}")).expect("id");
+            do_create(env, &b_bundle, &b_id);
+            wait_single_thread();
+            let b = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(b_id.clone()),
+                &timeouts(),
+            )
+            .unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
+            let b_pid = b.process().pid();
+            let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_probe_ready(&b);
+                for shared in ["user", "ipc"] {
+                    assert_eq!(
+                        ns_link(b_pid, shared),
+                        ns_link(a_pid, shared),
+                        "B must share A's {shared} namespace"
+                    );
+                }
+                for own in ["pid", "mnt", "uts"] {
+                    assert_ne!(
+                        ns_link(b_pid, own),
+                        ns_link(a_pid, own),
+                        "B must have its own {own} namespace"
+                    );
+                }
+                // B の PID 1 は自分の pid namespace の PID 1(共有しない)。
+                let nspid =
+                    status_field(&format!("/proc/{b_pid}/status"), "NSpid:").expect("host NSpid");
+                assert_eq!(nspid.split_whitespace().last(), Some("1"));
+                println!(
+                    "production_launcher: pod ipc namespace joined (scenario=W user and ipc shared, pid/mnt/uts separate, join of own namespaces refused)"
+                );
+            }));
+            finish_started(b, b_verified);
+        }));
+        finish_started(a, verified);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 書き出した `config.json` の `linux.namespaces` を差し替える（シナリオ W）。
+    fn patch_namespaces(bundle: &Bundle, namespaces: serde_json::Value) {
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["linux"]["namespaces"] = namespaces;
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
     }
 
     /// シナリオ K: exec 後の seccomp が禁止 syscall を SIGSYS で拒否する（#2012・SEC-2・CORE-5）。

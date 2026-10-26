@@ -63,6 +63,9 @@ case "$4" in
   c-hang) exec sleep 3;;
   c-reported-timeout) printf 'FCSUP1 ERR TIMEOUT 7 launch timed out\n'; sleep 1; touch "$3/cleanup-done"; exit 0;;
   c-quick) printf 'FCSUP1 OK 4242\n'; exit 0;;
+  c-exec-notfound) printf 'FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n'; exit 0;;
+  c-exec-denied) printf 'FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n'; exit 0;;
+  c-exec-invalid) printf 'FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n'; exit 0;;
   *) printf 'FCSUP1 ERR INTERNAL 1 unexpected id\n'; exit 0;;
 esac
 "#;
@@ -331,6 +334,42 @@ fn cri2_start_maps_supervisor_err_code() {
             .expect_err("err report");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     assert_eq!(e.message(), "container is not created");
+}
+
+/// SEC-4・CORE-5・CRI-2・ERR-1（#2716）: launch の `Exec` 段の失敗（`R` の後の `execveat` の errno 分類）は、
+/// `TraitError` の code と固定文言のまま届き、CRI の gRPC Status は NotFound / PermissionDenied / InvalidArgument
+/// と同じ固定文言になる（パス・errno は載らない）。
+#[test]
+fn sec4_2716_start_exec_stage_failure_maps_to_grpc_status() {
+    use fandhe_container_cri::error::CriError;
+    use tonic::Code;
+
+    for (id, code, grpc) in [
+        ("c-exec-notfound", ErrorCode::NotFound, Code::NotFound),
+        (
+            "c-exec-denied",
+            ErrorCode::PermissionDenied,
+            Code::PermissionDenied,
+        ),
+        (
+            "c-exec-invalid",
+            ErrorCode::InvalidArgument,
+            Code::InvalidArgument,
+        ),
+    ] {
+        let h = harness(running(id, 1), LONG);
+        let e =
+            h.rt.start(&StartRequest::new(cid(id)))
+                .expect_err("exec stage failure");
+        assert_eq!(e.code(), code, "{id}");
+        assert_eq!(e.message(), "container launch failed in the Exec stage");
+        let status = tonic::Status::from(CriError::from(&e));
+        assert_eq!(status.code(), grpc, "{id}");
+        assert_eq!(
+            status.message(),
+            "container launch failed in the Exec stage"
+        );
+    }
 }
 
 /// REPAIR-5: 報告が期限内に来なければ TIMEOUT（結果不明）で、supervisor は kill しない。

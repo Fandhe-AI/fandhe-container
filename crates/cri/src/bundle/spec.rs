@@ -13,8 +13,13 @@
 //! （cri は core の `traits` だけを参照する境界のため。CRI-7）。一致は試験で core の定数と照合する。
 //!
 //! **未実装・簡易実装（REPAIR-3）**:
-//! - namespace の共有（POD の pid / ipc を pod 内で共有する）は未実装で、`POD` もコンテナごとの新しい
-//!   namespace にする（共有の欠落であり、要求より分離が弱くなる方向ではない）。
+//! - namespace の共有: pid の `POD` は未実装で、コンテナごとの新しい namespace にする（共有の欠落であり、
+//!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
+//!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
+//!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
+//!   供給元（保持役）はまだ無く、`CriRuntimeService` は当面 `None` を渡すため、本番では共有されず新しい
+//!   namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
+//!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。core の start は network namespace を
 //!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系。`docs/design/cri-config-acceptance.md` の順 13〕まで）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
@@ -43,11 +48,17 @@
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
 //! - `log_path`（コンテナ）と `log_directory`（サンドボックス）は [`resolve_log_path`] で検証して結合し、受け入れる
 //!   （CRI-2・SUP-4・#2671）。結合結果は config.json には出さず、StartContainer が supervisor へ渡す。
+//! - `supplemental_groups` は受け入れ、`process.user.additionalGids` へ写す（core が launch の fork の前に user namespace の
+//!   gid 写像と照合して `setgroups` で適用する。#2667・CRI-2・SEC-5・CORE-6）。各値は 0〜4294967294（負の値と
+//!   `u32::MAX` は `INVALID_ARGUMENT`）。`supplemental_groups_policy` は `Merge`（既定。イメージの `/etc/group` の所属グループ
+//!   〔[`ImageDefaults::supplementary_gids`]〕に続けて CRI の一覧を並べる）か `Strict`（CRI の一覧だけ）。実効 uid が 0 の
+//!   コンテナにはイメージ由来のグループを付けない（単一 ID 写像で使える uid が 0 だけのため。CRI の明示した一覧は付ける）。
+//!   主 gid は足さない。合計は [`MAX_ADDITIONAL_GIDS`] まで。sandbox 側の指定は検証だけして適用先が無いため出力しない。
 //! - `mounts[].propagation` は PRIVATE を `rprivate`、HOST_TO_CONTAINER を `rslave` で `config.json` の `mounts[].options` へ書く
 //!   （core が `rslave` の bind をホストの slave として載せる。BIDIRECTIONAL と未知の値は `UNIMPLEMENTED`。
 //!   `linux.rootfsPropagation` は出力しない。#2669・CRI-2・OCI-4）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（port_mappings・cgroup_parent・sysctls・
-//!   devices・capabilities の add / ambient・supplemental_groups・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
+//!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -66,7 +77,8 @@ use super::resolv_conf;
 use crate::error::CriError;
 use crate::runtime::v1::{
     ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
-    NamespaceOption, PodSandboxConfig, SecurityProfile, security_profile::ProfileType,
+    NamespaceOption, PodSandboxConfig, SecurityProfile, SupplementalGroupsPolicy,
+    security_profile::ProfileType,
 };
 
 /// `config.json` 全体の上限（core の `CONFIG_MAX_BYTES` と同値）。
@@ -85,6 +97,8 @@ pub const MAX_MOUNTS: usize = 1024;
 pub const MAX_PROTECTED_PATHS: usize = 256;
 /// hostname の長さ上限（core の `CONFIG_MAX_HOSTNAME_BYTES` と同値）。
 pub const MAX_HOSTNAME_BYTES: usize = 64;
+/// `process.user.additionalGids` の件数上限（core の `CONFIG_MAX_ADDITIONAL_GIDS` と同値。`NGROUPS_MAX`。#2667）。
+pub const MAX_ADDITIONAL_GIDS: usize = 65_536;
 
 /// 生成する `ociVersion`（core は `1.x` 系だけを受ける）。
 /// mount 1 件あたりの JSON 構造の概算オーバーヘッド（キー名・options 等）。
@@ -117,6 +131,10 @@ pub struct ImageDefaults {
     /// `ImageRootfsSource` が [`super::UserResolveRequest`] を受けて埋める。要求があるのに `None` の
     /// ままなら `build_runtime_config` は `UNIMPLEMENTED` で拒否する（root へ黙って落とさない）。
     pub resolved_run_as_username: Option<(u32, u32)>,
+    /// 実効ユーザーのイメージの `/etc/group` での所属グループ（`/etc/group` の行順。#2667・CRI-2・SEC-5）。
+    /// `ImageRootfsSource` が [`super::UserResolveRequest::image_groups`] が真で実効 uid が 0 でないときだけ埋める
+    /// （既定は空 = イメージ由来のグループは付かない。付かない方向は権限が弱くなる側）。
+    pub supplementary_gids: Vec<u32>,
 }
 
 /// `build_inner` の段階。`Validate` は rootfs を触る前の形式検証、`Build` は `config.json` の確定。
@@ -289,6 +307,9 @@ fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriErr
 struct UserOut {
     uid: u32,
     gid: u32,
+    /// 補助グループ。空なら出力しない（core は省略を空として扱う）。
+    #[serde(rename = "additionalGids", skip_serializing_if = "Vec::is_empty")]
+    additional_gids: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -303,7 +324,7 @@ struct MountOut<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LinuxOut<'a> {
-    namespaces: Vec<NamespaceOut>,
+    namespaces: Vec<NamespaceOut<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resources: Option<ResourcesOut>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -313,9 +334,46 @@ struct LinuxOut<'a> {
 }
 
 #[derive(Serialize)]
-struct NamespaceOut {
+struct NamespaceOut<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// 既存 namespace へ join するパス（pod の ipc 共有のとき user と ipc だけ。#2674）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+}
+
+/// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。
+///
+/// `SpecBundleProvider::prepare` が `BundleRequest` 経由で受け、ipc の `POD` を join に変える。
+/// 供給元（pod の保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。パスは core が start で
+/// fd に固定して所有者・種別を照合する（cri は形式だけを見る）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodNamespacePaths {
+    user: String,
+    ipc: String,
+}
+
+impl PodNamespacePaths {
+    /// 絶対パスで `MAX_PATH_BYTES` 以内・NUL なしのものだけを受ける。違反は供給元の誤りなので `INTERNAL`。
+    pub fn new(user: impl Into<String>, ipc: impl Into<String>) -> Result<Self, CriError> {
+        let (user, ipc) = (user.into(), ipc.into());
+        for p in [&user, &ipc] {
+            if !p.starts_with('/') || p.len() > MAX_PATH_BYTES || p.contains('\0') {
+                return Err(CriError::internal("invalid pod namespace path"));
+            }
+        }
+        Ok(Self { user, ipc })
+    }
+
+    /// user namespace のパス。
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// ipc namespace のパス。
+    pub fn ipc(&self) -> &str {
+        &self.ipc
+    }
 }
 
 #[derive(Serialize)]
@@ -348,6 +406,36 @@ fn unsupported(field: &'static str) -> CriError {
 
 fn invalid(field: &'static str) -> CriError {
     CriError::invalid_argument(format!("{field} is invalid"))
+}
+
+/// `additionalGids` 1 件あたりの JSON の大きさの見積もり（10 桁 + 区切り）。
+const ADDITIONAL_GID_JSON_BYTES: usize = 11;
+
+/// 補助グループを方針に従って並べる（重複は最初のものを残す。件数は [`MAX_ADDITIONAL_GIDS`] まで。#2667）。
+///
+/// `Strict` は `image` を使わない。上限超過は黙って切り詰めず `FAILED_PRECONDITION`（core が拒否する件数と同じ）。
+fn merge_additional_gids(
+    policy: SupplementalGroupsPolicy,
+    image: &[u32],
+    cri: &[u32],
+) -> Result<Vec<u32>, CriError> {
+    let image = match policy {
+        SupplementalGroupsPolicy::Merge => image,
+        SupplementalGroupsPolicy::Strict => &[],
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for g in image.iter().chain(cri) {
+        if seen.insert(*g) {
+            if out.len() >= MAX_ADDITIONAL_GIDS {
+                return Err(CriError::failed_precondition(
+                    "supplemental groups exceed the limit",
+                ));
+            }
+            out.push(*g);
+        }
+    }
+    Ok(out)
 }
 
 /// 文字列 1 要素の長さと NUL を検証する。
@@ -487,6 +575,43 @@ fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
     check_canonical_path(field, p)
 }
 
+/// `supplemental_groups` の各値を検証して `u32` にする（0〜4294967294。`u32::MAX` はカーネルの無効 gid
+/// `(gid_t)-1` でどの写像にも入らないため拒否する。#2667）。
+fn supplemental_gids(field: &'static str, v: &[i64]) -> Result<Vec<u32>, CriError> {
+    check_supplemental_gid_count(v)?;
+    v.iter().map(|g| supplemental_gid(field, *g)).collect()
+}
+
+/// `supplemental_groups` の件数を確保の前に検証する（重複を畳む前の入力件数。無制限確保を防ぐ。#2667）。
+fn check_supplemental_gid_count(v: &[i64]) -> Result<(), CriError> {
+    if v.len() > MAX_ADDITIONAL_GIDS {
+        return Err(CriError::failed_precondition(
+            "supplemental groups exceed the limit",
+        ));
+    }
+    Ok(())
+}
+
+/// `supplemental_groups` の 1 値を検証する。
+fn supplemental_gid(field: &'static str, g: i64) -> Result<u32, CriError> {
+    u32::try_from(g)
+        .ok()
+        .filter(|g| *g != u32::MAX)
+        .ok_or_else(|| invalid(field))
+}
+
+/// 値の検証だけを行い、一覧は確保しない（適用先が無い sandbox 側用。#2667）。
+fn validate_supplemental_gids(field: &'static str, v: &[i64]) -> Result<(), CriError> {
+    check_supplemental_gid_count(v)?;
+    v.iter()
+        .try_for_each(|g| supplemental_gid(field, *g).map(|_| ()))
+}
+
+/// `supplemental_groups_policy` を検証する（`Merge` か `Strict`。それ以外は `INVALID_ARGUMENT`）。
+fn supplemental_policy(field: &'static str, v: i32) -> Result<SupplementalGroupsPolicy, CriError> {
+    SupplementalGroupsPolicy::try_from(v).map_err(|_| invalid(field))
+}
+
 fn nonneg_u32(field: &'static str, v: &Option<Int64Value>) -> Result<Option<u32>, CriError> {
     match v {
         None => Ok(None),
@@ -517,28 +642,58 @@ fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> 
 }
 
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
-fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriError> {
+///
+/// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。
+fn namespaces<'a>(
+    opts: Option<&NamespaceOption>,
+    pod: Option<&'a PodNamespacePaths>,
+) -> Result<Vec<NamespaceOut<'a>>, CriError> {
     let default = NamespaceOption::default();
     let o = opts.unwrap_or(&default);
     let mut out = Vec::with_capacity(6);
-    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace（共有は未実装。REPAIR-3）。
+    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace。ipc の POD だけは供給元があれば join。
     // NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
+    let mut join: Option<&PodNamespacePaths> = None;
     for (kind, field, v) in [
         ("pid", "namespace_options.pid", o.pid),
         ("ipc", "namespace_options.ipc", o.ipc),
     ] {
         match resolve_mode(field, v)? {
-            NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind }),
+            NamespaceMode::Pod if kind == "ipc" && pod.is_some() => {
+                join = pod;
+                out.push(NamespaceOut {
+                    kind,
+                    path: pod.map(PodNamespacePaths::ipc),
+                });
+            }
+            NamespaceMode::Pod | NamespaceMode::Container => {
+                out.push(NamespaceOut { kind, path: None })
+            }
             NamespaceMode::Node | NamespaceMode::Target => return Err(unsupported(field)),
         }
     }
-    out.push(NamespaceOut { kind: "mount" });
-    out.push(NamespaceOut { kind: "uts" });
-    // user: 常に新しい namespace（SEC-5）。写像の指定は未実装（#2240）。
-    out.push(NamespaceOut { kind: "user" });
+    out.push(NamespaceOut {
+        kind: "mount",
+        path: None,
+    });
+    out.push(NamespaceOut {
+        kind: "uts",
+        path: None,
+    });
+    // user: 常に新しい namespace（SEC-5）。ipc を join するときは pod の user namespace に入る
+    // （非特権では所有する user namespace ごとでなければ ipc に入れない）。写像の指定は未実装（#2240）。
+    out.push(NamespaceOut {
+        kind: "user",
+        path: join.map(PodNamespacePaths::user),
+    });
     if let Some(u) = &o.userns_options {
         match resolve_mode("namespace_options.userns_options.mode", u.mode)? {
-            NamespaceMode::Pod | NamespaceMode::Container | NamespaceMode::Node => {}
+            NamespaceMode::Pod | NamespaceMode::Node => {}
+            // コンテナ単位の userns と pod の ipc 共有は両立しない。
+            NamespaceMode::Container if join.is_some() => {
+                return Err(unsupported("namespace_options.userns_options.mode"));
+            }
+            NamespaceMode::Container => {}
             NamespaceMode::Target => {
                 return Err(unsupported("namespace_options.userns_options.mode"));
             }
@@ -548,7 +703,10 @@ fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriEr
         }
     }
     match resolve_mode("namespace_options.network", o.network)? {
-        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind: "network" }),
+        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut {
+            kind: "network",
+            path: None,
+        }),
         NamespaceMode::Node => {}
         NamespaceMode::Target => return Err(unsupported("namespace_options.network")),
     }
@@ -781,7 +939,13 @@ pub fn build_runtime_config(
     container: &ContainerConfig,
     image: &ImageDefaults,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_runtime_config_with_files(sandbox, container, image, &BundleFiles::none())
+    build_runtime_config_with_files_and_pod_namespaces(
+        sandbox,
+        container,
+        image,
+        &BundleFiles::none(),
+        None,
+    )
 }
 
 /// [`build_runtime_config`] に、provider が bundle に生成したファイルのパス（[`BundleFiles`]）を渡す版。
@@ -793,7 +957,36 @@ pub fn build_runtime_config_with_files(
     image: &ImageDefaults,
     files: &BundleFiles<'_>,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_inner(sandbox, container, image, files, Stage::Build)
+    build_runtime_config_with_files_and_pod_namespaces(sandbox, container, image, files, None)
+}
+
+/// [`build_runtime_config`] に pod の user・ipc namespace のパスを足した版（CRI-2・CORE-3。#2674）。
+///
+/// `pod` が `Some` で ipc が `POD` のとき、`linux.namespaces` の ipc と user を join（`path` 付き）にする。
+pub fn build_runtime_config_with_pod_namespaces(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    pod: Option<&PodNamespacePaths>,
+) -> Result<RuntimeConfigJson, CriError> {
+    build_runtime_config_with_files_and_pod_namespaces(
+        sandbox,
+        container,
+        image,
+        &BundleFiles::none(),
+        pod,
+    )
+}
+
+/// ファイル（#2665）と pod の namespace のパス（#2674）の両方を渡す版。provider が使う。
+pub fn build_runtime_config_with_files_and_pod_namespaces(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    files: &BundleFiles<'_>,
+    pod: Option<&PodNamespacePaths>,
+) -> Result<RuntimeConfigJson, CriError> {
+    build_inner(sandbox, container, image, files, pod, Stage::Build)
 }
 
 /// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
@@ -803,11 +996,21 @@ pub fn validate_config(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
 ) -> Result<(), CriError> {
+    validate_config_with_pod_namespaces(sandbox, container, None)
+}
+
+/// [`validate_config`] に pod の namespace のパスを足した版（#2674）。
+pub fn validate_config_with_pod_namespaces(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    pod: Option<&PodNamespacePaths>,
+) -> Result<(), CriError> {
     build_inner(
         sandbox,
         container,
         &ImageDefaults::default(),
         &BundleFiles::none(),
+        pod,
         Stage::Validate,
     )
     .map(|_| ())
@@ -864,6 +1067,7 @@ fn build_inner(
     container: &ContainerConfig,
     image: &ImageDefaults,
     files: &BundleFiles<'_>,
+    pod: Option<&PodNamespacePaths>,
     stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
     // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
@@ -915,9 +1119,9 @@ fn build_inner(
             if sc.selinux_options.is_some() {
                 return Err(unsupported("selinux_options"));
             }
-            if !sc.supplemental_groups.is_empty() {
-                return Err(unsupported("supplemental_groups"));
-            }
+            // 適用先が無い（sandbox にプロセスは無い）ため検証だけして出力しない（#2667）。
+            validate_supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
+            supplemental_policy("supplemental_groups_policy", sc.supplemental_groups_policy)?;
             check_profile("seccomp", &sc.seccomp)?;
             check_apparmor("apparmor", &sc.apparmor)?;
             // 非推奨の文字列欄も、指定されたまま黙って落とさない（プロファイルの無効化を見逃さない）。
@@ -931,7 +1135,11 @@ fn build_inner(
     let linux = container.linux.as_ref();
     let sc = linux.and_then(|l| l.security_context.as_ref());
     let mut capabilities = None;
+    let mut cri_groups = Vec::new();
+    let mut policy = SupplementalGroupsPolicy::Merge;
     if let Some(sc) = sc {
+        cri_groups = supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
+        policy = supplemental_policy("supplemental_groups_policy", sc.supplemental_groups_policy)?;
         if sc.privileged {
             return Err(unsupported("privileged"));
         }
@@ -944,9 +1152,6 @@ fn build_inner(
         }
         if sc.readonly_rootfs {
             return Err(unsupported("readonly_rootfs"));
-        }
-        if !sc.supplemental_groups.is_empty() {
-            return Err(unsupported("supplemental_groups"));
         }
         if sc.selinux_options.is_some() {
             return Err(unsupported("selinux_options"));
@@ -1007,6 +1212,22 @@ fn build_inner(
         .or_else(|| (!explicit_user).then(|| image.user.map(|u| u.1)).flatten())
         .unwrap_or(0);
 
+    // 補助グループ: Merge はイメージ由来（uid 0 には付けない）→ CRI の順、Strict は CRI だけ。最初に出たものを残す。
+    let additional_gids = merge_additional_gids(
+        policy,
+        if uid == 0 {
+            &[]
+        } else {
+            &image.supplementary_gids
+        },
+        &cri_groups,
+    )?;
+    budget.spend(
+        additional_gids
+            .len()
+            .saturating_mul(ADDITIONAL_GID_JSON_BYTES),
+    )?;
+
     if container.mounts.len() > MAX_MOUNTS {
         return Err(invalid("mounts"));
     }
@@ -1052,7 +1273,7 @@ fn build_inner(
             .and_then(|l| l.security_context.as_ref())
             .and_then(|s| s.namespace_options.as_ref())
     });
-    let namespaces = namespaces(ns_opts)?;
+    let namespaces = namespaces(ns_opts, pod)?;
 
     let resources = match linux.and_then(|l| l.resources.as_ref()) {
         Some(r) => resources(r)?,
@@ -1076,7 +1297,11 @@ fn build_inner(
             args,
             env,
             cwd,
-            user: UserOut { uid, gid },
+            user: UserOut {
+                uid,
+                gid,
+                additional_gids,
+            },
             capabilities,
         },
         mounts,

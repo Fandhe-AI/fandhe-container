@@ -258,6 +258,13 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
+    // （`_IO(0xb7, 1..4)`・`_IO(0xb7, 4)` は `_IOR` ではなく `_IO`。方向・大きさのビットを持たないため
+    // x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。#2674・CORE-3）。
+    pub const NS_GET_USERNS: u64 = 0xb701;
+    pub const NS_GET_PARENT: u64 = 0xb702;
+    pub const NS_GET_NSTYPE: u64 = 0xb703;
+    pub const NS_GET_OWNER_UID: u64 = 0xb704;
     pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
@@ -602,6 +609,13 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
+    // （`_IO(0xb7, 1..4)`・`_IO(0xb7, 4)` は `_IOR` ではなく `_IO`。方向・大きさのビットを持たないため
+    // x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。#2674・CORE-3）。
+    pub const NS_GET_USERNS: u64 = 0xb701;
+    pub const NS_GET_PARENT: u64 = 0xb702;
+    pub const NS_GET_NSTYPE: u64 = 0xb703;
+    pub const NS_GET_OWNER_UID: u64 = 0xb704;
     pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
@@ -955,6 +969,10 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
     pub const CLONE_NEWNET: i32 = 0;
+    pub const NS_GET_USERNS: u64 = 0;
+    pub const NS_GET_PARENT: u64 = 0;
+    pub const NS_GET_NSTYPE: u64 = 0;
+    pub const NS_GET_OWNER_UID: u64 = 0;
     pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
@@ -1596,6 +1614,100 @@ pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(),
     // 確認済み。失敗時（-1）はカーネルが namespace を変更しない。
     let rc = unsafe { setns(pidfd.as_raw_fd(), bits) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 開いた namespace の fd へ `setns(2)` で参加する（`flag` は fd の種別と一致していること。不一致はカーネルが
+/// `EINVAL`）。pod の user・ipc namespace の join 専用（CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+///
+/// 呼び出しは `crate::exec` の join 分離のみで、`Threads: 1` の中間プロセス（fork 子）から呼ぶ。
+/// `NsFlag::User` は単一スレッドで `fs_struct` を共有しないことを要する（満たさなければ `EINVAL`）。
+pub(crate) fn setns_fd(fd: BorrowedFd<'_>, flag: NsFlag) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない。`fd` は呼び出しの間有効な `BorrowedFd`。副作用は
+    // 呼び出しスレッドの namespace 所属の変更で、呼び出し側が単一スレッドであることを確認済み。失敗時（-1）は
+    // カーネルが namespace を変更しない。
+    let rc = unsafe { setns(fd.as_raw_fd(), flag.bits()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// namespace の fd の種別（`NS_GET_NSTYPE`。`CLONE_NEW*` のビット値）を返す。
+pub(crate) fn ns_type(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`NS_GET_NSTYPE` は追加引数を取らず、種別を戻り値で返すだけで
+    // 呼び出し側のメモリに書かない。
+    let rc = unsafe { ioctl(fd.as_raw_fd(), consts::NS_GET_NSTYPE) };
+    if rc < 0 { Err(last_error()) } else { Ok(rc) }
+}
+
+/// namespace `fd` を所有する user namespace の fd（`NS_GET_USERNS`）を返す。
+///
+/// 自分の user namespace の外（祖先の外側）の所有者は `EPERM`。戻りの fd は新規で `OwnedFd` が唯一の所有者。
+pub(crate) fn ns_owner_userns(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    ns_fd_ioctl(fd, consts::NS_GET_USERNS)
+}
+
+/// user namespace `fd` の親 user namespace の fd（`NS_GET_PARENT`）を返す。
+///
+/// 呼び出し側の user namespace の祖先でない（親が見えない）ときは `EPERM`、初期 user namespace は `EPERM`。
+pub(crate) fn ns_parent(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    ns_fd_ioctl(fd, consts::NS_GET_PARENT)
+}
+
+/// fd を返す nsfs の ioctl（追加引数なし）の共通部。
+fn ns_fd_ioctl(fd: BorrowedFd<'_>, request: u64) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`request` は呼び出し元の 2 関数が渡す `NS_GET_USERNS` /
+    // `NS_GET_PARENT` だけで、どちらも追加引数を取らず、成功時は新しい fd を戻り値で返し、呼び出し側のメモリには
+    // 書かない。
+    let rc = unsafe { ioctl(fd.as_raw_fd(), request) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `rc` は上で成功した ioctl が返した新規 fd で、他に所有者がいない（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(rc) })
+}
+
+/// user namespace `fd` の作成者の euid（`NS_GET_OWNER_UID`）を返す。user namespace 以外は `EINVAL`。
+pub(crate) fn ns_owner_uid(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut uid: u32 = 0;
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`NS_GET_OWNER_UID` はスタック上の `uid_t`（u32）を指す書き込み可能な
+    // ポインタを取り、カーネルはそこへ 4 バイトだけを書く（`uid` は呼び出しの間生存する）。
+    let rc = unsafe {
+        ioctl(
+            fd.as_raw_fd(),
+            consts::NS_GET_OWNER_UID,
+            std::ptr::from_mut(&mut uid),
+        )
+    };
+    if rc < 0 { Err(last_error()) } else { Ok(uid) }
+}
+
+/// namespace ファイル（`/proc/<pid>/ns/*` 等。最終要素の magic link は辿る）を `O_RDONLY|O_NONBLOCK|O_NOCTTY|
+/// O_CLOEXEC` で開く。nsfs 以外（FIFO・tty 等）を指されても open で止まらず、制御端末にもならない
+/// （種別は呼び出し側が `fs_type` と `ns_type` で確かめる。CRI-2・CORE-3・SEC-1。#2674）。
+pub(crate) fn open_ns_file(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY | consts::O_CLOEXEC;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。dirfd は `AT_FDCWD`。flags に
+    // O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
@@ -4387,6 +4499,65 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 補助グループの件数の上限（`NGROUPS_MAX` = 65536。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// `set_supplementary_groups` / `read_supplementary_groups` が syscall の前に件数を検査する上限で、
+/// `oci_runtime/config.rs` の `process.user.additionalGids` の上限と同値。
+pub(crate) const SUPPLEMENTARY_GROUPS_MAX: usize = 65_536;
+
+/// 呼び出しスレッドの補助グループを `gids` に置き換える（`setgroups(len, list)`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// launch の子の capability 削減段が、`process.user.additionalGids` を適用するために呼ぶ（launcher が fork の前に
+/// user namespace の gid 写像と照合済み）。`CAP_SETGID` を要し、`setgroups` が `deny` の user namespace では
+/// `EPERM`、写像されていない gid は `EINVAL`。件数が [`SUPPLEMENTARY_GROUPS_MAX`] を超える場合は syscall の前に
+/// `EINVAL`。生の syscall のため効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_supplementary_groups(gids: &[u32]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if gids.len() > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    let nr = consts::SYS_SETGROUPS.get()?;
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に `gids.len()` と `gids.as_ptr()` を渡す。ポインタは
+    // `len` 個の `u32`（gid_t と同幅）の有効な領域を指し、カーネルはそこを読むだけで書き込まない。呼び出しの間
+    // `gids` は借用されたまま生きている。効果は呼び出しスレッドの資格情報の変更のみ。
+    let rc = unsafe { syscall(nr, gids.len() as i64, gids.as_ptr()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの補助グループを読み戻す（`getgroups`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// 件数を `getgroups(0, NULL)` で取り、[`SUPPLEMENTARY_GROUPS_MAX`] 以下を確かめてから確保して読む。
+/// 読んだ件数が最初の件数と食い違えば `EINVAL`（呼び出しの間に変わった = 単一スレッドの前提違反）。
+// テストビルドでは capability 削減段が偽のカーネルを使うため、本関数は sys の試験からだけ呼ばれる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn read_supplementary_groups() -> Result<Vec<u32>, SysError> {
+    let n = supplementary_group_count()?;
+    if n > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let nr = consts::SYS_GETGROUPS.get()?;
+    let mut buf = vec![0u32; n];
+    // SAFETY: `getgroups(int size, gid_t *list)` に `n` と、`n` 個の `u32`（gid_t と同幅）を持つ `buf` の
+    // 先頭ポインタを渡す。カーネルは最大 `n` 個を書き込み、それ以上は書かない（足りなければ `EINVAL`）。
+    // `buf` は呼び出しの間可変借用されたまま生きている。
+    let got = unsafe { syscall(nr, n as i64, buf.as_mut_ptr()) };
+    if got < 0 {
+        return Err(last_error());
+    }
+    if usize::try_from(got) != Ok(n) {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(buf)
+}
+
 /// 呼び出しスレッドの実効 gid・実 gid・保存 gid を `gid` に揃える（`setresgid(gid, gid, gid)`。SUP-6・SEC-5・
 /// TASK-163 追補・#1462）。
 ///
@@ -6081,6 +6252,29 @@ mod tests {
             .split_whitespace()
             .count();
         assert_eq!(supplementary_group_count(), Ok(groups));
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: 補助グループの読み戻しが実スレッドの `Groups:` と一致し、
+    /// 上限超過の `setgroups` は syscall の前に `EINVAL` になること（資格情報は変えない）。
+    #[test]
+    fn oci1_sec5_supplementary_groups_readback_matches_status_and_limit_is_enforced() {
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let mut expected: Vec<u32> = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .map(|g| g.parse().unwrap())
+            .collect();
+        let mut got = read_supplementary_groups().unwrap();
+        expected.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        let too_many = vec![1u32; SUPPLEMENTARY_GROUPS_MAX + 1];
+        assert_eq!(
+            set_supplementary_groups(&too_many),
+            Err(SysError::Os(EINVAL))
+        );
     }
 
     /// SUP-6・SEC-5・TASK-163 追補（#1462）: `setresuid` / `getresuid` / `setresgid` / `getresgid` の syscall
@@ -8514,6 +8708,56 @@ mod tests {
         umount_detach_at(&target_c).expect("detach attached mount");
         std::fs::remove_dir_all(&dir).expect("remove temp dir after detach");
         assert!(!dir.exists(), "temp dir must be removed");
+    }
+
+    /// CRI-2・CORE-3（#2674）: nsfs の ioctl 番号の固定値（`_IO(0xb7, n)`。x86_64・aarch64 とも同じ）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_nsfs_ioctl_consts_are_exact() {
+        assert_eq!(consts::NS_GET_USERNS, 0xb701);
+        assert_eq!(consts::NS_GET_PARENT, 0xb702);
+        assert_eq!(consts::NS_GET_NSTYPE, 0xb703);
+        assert_eq!(consts::NS_GET_OWNER_UID, 0xb704);
+    }
+
+    /// CRI-2・CORE-3（#2674）: 自分の namespace の fd の種別・nsfs の判定・所有者の取得が非特権で動く。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_ns_type_and_owner_of_own_namespaces() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let ipc = std::fs::File::open("/proc/self/ns/ipc").expect("open ipc ns");
+        let user = std::fs::File::open("/proc/self/ns/user").expect("open user ns");
+        assert_eq!(fs_type(ipc.as_fd()).expect("fstatfs"), NSFS_MAGIC);
+        assert_eq!(ns_type(ipc.as_fd()).expect("ns type"), consts::CLONE_NEWIPC);
+        assert_eq!(
+            ns_type(user.as_fd()).expect("ns type"),
+            consts::CLONE_NEWUSER
+        );
+        // 所有する user namespace は、自分のものか祖先のもの(祖先は `EPERM`)。自分のものなら user namespace と同一。
+        match ns_owner_userns(ipc.as_fd()) {
+            Ok(owner) => {
+                let owner = std::fs::File::from(owner).metadata().expect("owner stat");
+                let mine = user.metadata().expect("user stat");
+                assert_eq!((owner.dev(), owner.ino()), (mine.dev(), mine.ino()));
+            }
+            Err(SysError::Os(e)) => assert_eq!(e, EPERM),
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+        // user namespace 以外への `NS_GET_OWNER_UID` は `EINVAL`。
+        assert_eq!(
+            ns_owner_uid(ipc.as_fd()).expect_err("not a user ns"),
+            SysError::Os(EINVAL)
+        );
+        // 通常ファイルは nsfs ではない。
+        let f = std::fs::File::open("/proc/self/status").expect("open status");
+        assert_ne!(fs_type(f.as_fd()).expect("fstatfs"), NSFS_MAGIC);
     }
 
     /// SEC-1・TASK-32 追補（#1681）: pty の ioctl 番号の固定値（x86_64・aarch64 とも asm-generic の値）。

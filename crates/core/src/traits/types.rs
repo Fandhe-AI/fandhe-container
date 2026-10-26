@@ -138,6 +138,31 @@ impl ErrorCode {
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
         }
     }
+
+    /// 全 variant の一覧（宣言順）。`from_name` と、各 crate の一覧の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら `err1_error_code_all_covers_every_variant` が検出する。
+    pub const ALL: [ErrorCode; 10] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::FailedPrecondition,
+        Self::Unimplemented,
+        Self::Internal,
+        Self::PermissionDenied,
+        Self::Timeout,
+        Self::Unavailable,
+        Self::ResourceExhausted,
+    ];
+
+    /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None` を返す。
+    ///
+    /// 大文字小文字の畳み込みも前後の空白の除去もしない。子プロセス・worker・supervisor・CLI
+    /// の報告行など untrusted な入力の経路で使う。既定の variant へは倒さず、
+    /// 失敗時の扱いは呼び出し側が決める（REPAIR-1・ERR-1）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 /// 拡張点トレイト（`ContainerRuntime` 等）が返す構造化エラー。
@@ -217,6 +242,56 @@ impl Error for TraitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: ErrorCode) -> usize {
+        match code {
+            ErrorCode::InvalidArgument => 0,
+            ErrorCode::NotFound => 1,
+            ErrorCode::AlreadyExists => 2,
+            ErrorCode::FailedPrecondition => 3,
+            ErrorCode::Unimplemented => 4,
+            ErrorCode::Internal => 5,
+            ErrorCode::PermissionDenied => 6,
+            ErrorCode::Timeout => 7,
+            ErrorCode::Unavailable => 8,
+            ErrorCode::ResourceExhausted => 9,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err1_error_code_all_covers_every_variant() {
+        for (i, c) in ErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(ErrorCode::ALL.len(), 10);
+        let set: std::collections::HashSet<_> = ErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 10);
+    }
+
+    /// REPAIR-1・ERR-1: `from_name` は `as_str` の完全一致の逆写像。
+    #[test]
+    fn err1_error_code_from_name_roundtrips() {
+        for c in ErrorCode::ALL {
+            assert_eq!(ErrorCode::from_name(c.as_str()), Some(c));
+        }
+        assert_eq!(
+            ErrorCode::from_name("RESOURCE_EXHAUSTED"),
+            Some(ErrorCode::ResourceExhausted)
+        );
+        assert_eq!(ErrorCode::from_name("INTERNAL"), Some(ErrorCode::Internal));
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(ErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
 
     /// CRI-7: 受理される ContainerId の例（英数字・区切り記号・境界長）。
     #[test]

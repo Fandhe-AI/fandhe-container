@@ -19,6 +19,9 @@
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
 //! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。CLI が渡す環境は `PATH`（固定値）と
 //!   `XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。supervisor は読まない）だけである。
+//! - 起動オプション（`--ulimit`・`--env` 等。#2713・SUP-12）は argv にも環境にも載せない。CLI の `create` が書いた
+//!   `<root>/@container-options/<id>`（0600）を、supervisor が手順 2c で読む（形式は
+//!   [`crate::container_options::document`]、置き場所と検査は [`crate::container_options::store`]）。argv は変えない。
 //! - 委譲スコープ（#2081・CORE-3・CORE-4）: `DelegatedCgroup::prepare` は親 cgroup に自分以外のプロセスがいると拒否するため、
 //!   CLI は supervisor を [`USER_SCOPE_WRAPPER_ARGS`] で包んで起動する（`systemd-run <引数> <supervisor の絶対パス> start ...`）。
 //!   systemd-run は scope の登録後に同じプロセスでコマンドを exec する（`man systemd-run` の scope の説明と systemd の
@@ -75,7 +78,7 @@ pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
     ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"];
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 ///
-/// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `parse_error_code` が
+/// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `ErrorCode::from_name` が
 /// `None` にして fail-closed で失敗し、CLI と supervisor は同じ版を一組で配置する前提のため。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
@@ -137,23 +140,6 @@ pub enum StartReport {
 
 fn invalid(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::InvalidArgument, message)
-}
-
-/// `ErrorCode::as_str` の逆写像（完全一致のみ）。未知の文字列は `None`（`Internal` に写さない）。
-pub fn parse_error_code(s: &str) -> Option<ErrorCode> {
-    Some(match s {
-        "INVALID_ARGUMENT" => ErrorCode::InvalidArgument,
-        "NOT_FOUND" => ErrorCode::NotFound,
-        "ALREADY_EXISTS" => ErrorCode::AlreadyExists,
-        "FAILED_PRECONDITION" => ErrorCode::FailedPrecondition,
-        "UNIMPLEMENTED" => ErrorCode::Unimplemented,
-        "INTERNAL" => ErrorCode::Internal,
-        "PERMISSION_DENIED" => ErrorCode::PermissionDenied,
-        "TIMEOUT" => ErrorCode::Timeout,
-        "UNAVAILABLE" => ErrorCode::Unavailable,
-        "RESOURCE_EXHAUSTED" => ErrorCode::ResourceExhausted,
-        _ => return None,
-    })
 }
 
 /// 10 進数字だけ・先頭 0 なしの文字列を `u32` へ `checked` で変換する（`+`・空・空白を拒否）。
@@ -229,7 +215,7 @@ impl StartReport {
                 else {
                     return Err(invalid("report has the wrong number of fields"));
                 };
-                let code = parse_error_code(code)
+                let code = ErrorCode::from_name(code)
                     .ok_or_else(|| invalid("report error code is unknown"))?;
                 let exit_code = parse_decimal_u32(exit)
                     .and_then(|v| u8::try_from(v).ok())
@@ -422,19 +408,6 @@ mod tests {
     #[cfg(not(windows))]
     const ROOT2: &str = "/s";
 
-    const ALL_CODES: [ErrorCode; 10] = [
-        ErrorCode::InvalidArgument,
-        ErrorCode::NotFound,
-        ErrorCode::AlreadyExists,
-        ErrorCode::FailedPrecondition,
-        ErrorCode::Unimplemented,
-        ErrorCode::Internal,
-        ErrorCode::PermissionDenied,
-        ErrorCode::Timeout,
-        ErrorCode::Unavailable,
-        ErrorCode::ResourceExhausted,
-    ];
-
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
     }
@@ -468,10 +441,39 @@ mod tests {
         assert_eq!(StartReport::decode(r.encode().as_bytes()).unwrap(), r);
     }
 
+    /// SEC-4・CORE-5・ERR-1・SUP-1（#2716）: launch の `Exec` 段の失敗（`R` の後の `execveat` の errno 分類）の報告行は、
+    /// 分類ごとの具体的な `CODE`・終了コードと固定文言になる。
+    #[test]
+    fn sec4_2716_exec_stage_failure_report_lines() {
+        for (code, line) in [
+            (
+                ErrorCode::NotFound,
+                "FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::PermissionDenied,
+                "FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::InvalidArgument,
+                "FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n",
+            ),
+        ] {
+            let err = OciRuntimeError::new(
+                fandhe_container_core::oci_runtime::LifecycleOp::Start,
+                code,
+                "container launch failed in the Exec stage",
+            );
+            let r = StartReport::failed(&err);
+            assert_eq!(r.encode(), line);
+            assert_eq!(StartReport::decode(line.as_bytes()).unwrap(), r);
+        }
+    }
+
     /// REPAIR-2・ERR-2: `exit_code` が `exit_code_for(CODE)` と食い違う報告は拒否し、一致すれば受理する。
     #[test]
     fn repair2_report_decode_rejects_exit_code_mismatch() {
-        for code in ALL_CODES {
+        for code in ErrorCode::ALL {
             let expected = exit_code_for(code).get();
             let ok = format!("FCSUP1 ERR {} {expected} m\n", code.as_str());
             let decoded = StartReport::decode(ok.as_bytes()).expect("matching exit code");
@@ -538,14 +540,14 @@ mod tests {
         assert_eq!(ReportMessage::new("").as_str(), "unspecified");
     }
 
-    /// ERR-1: 既知の全 ErrorCode で as_str と parse_error_code が往復する。
+    /// ERR-1: 既知の全 ErrorCode で as_str と from_name が往復する。
     #[test]
     fn err2_error_code_strings_roundtrip() {
-        for c in ALL_CODES {
-            assert_eq!(parse_error_code(c.as_str()), Some(c));
+        for c in ErrorCode::ALL {
+            assert_eq!(ErrorCode::from_name(c.as_str()), Some(c));
         }
-        assert_eq!(parse_error_code("internal"), None);
-        assert_eq!(parse_error_code(""), None);
+        assert_eq!(ErrorCode::from_name("internal"), None);
+        assert_eq!(ErrorCode::from_name(""), None);
     }
 
     /// SUP-1: 正しい argv の解析。

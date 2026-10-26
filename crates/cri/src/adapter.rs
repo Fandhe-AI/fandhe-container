@@ -223,6 +223,9 @@ pub struct BundleRequest<'a> {
     pub sandbox_config: &'a PodSandboxConfig,
     /// 作成するコンテナの設定。
     pub config: &'a ContainerConfig,
+    /// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。`Some` で ipc が `POD` のとき
+    /// だけ ipc を join にする。供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
+    pub pod_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
 }
 
 impl<'a> BundleRequest<'a> {
@@ -238,7 +241,18 @@ impl<'a> BundleRequest<'a> {
             sandbox_id,
             sandbox_config,
             config,
+            pod_namespaces: None,
         }
+    }
+
+    /// pod の user・ipc namespace のパスを足す（#2674）。
+    #[must_use]
+    pub fn with_pod_namespaces(
+        mut self,
+        pod_namespaces: &'a crate::bundle::PodNamespacePaths,
+    ) -> Self {
+        self.pod_namespaces = Some(pod_namespaces);
+        self
     }
 }
 

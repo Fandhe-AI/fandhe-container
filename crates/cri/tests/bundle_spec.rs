@@ -4,12 +4,13 @@
 
 use fandhe_container_core::oci_runtime::{self, NamespaceKind};
 use fandhe_container_cri::bundle::spec::{
-    MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS, MAX_PATH_BYTES,
-    MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
+    MAX_ADDITIONAL_GIDS, MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS,
+    MAX_PATH_BYTES, MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
 };
 use fandhe_container_cri::bundle::{
-    BundleFiles, ImageDefaults, build_runtime_config, build_runtime_config_with_files,
-    resolve_log_path, validate_config,
+    BundleFiles, ImageDefaults, PodNamespacePaths, build_runtime_config,
+    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces, resolve_log_path,
+    validate_config,
 };
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
@@ -119,6 +120,7 @@ fn limits_match_core_constants() {
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_MASKED_PATHS);
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_READONLY_PATHS);
     assert_eq!(MAX_HOSTNAME_BYTES, oci_runtime::CONFIG_MAX_HOSTNAME_BYTES);
+    assert_eq!(MAX_ADDITIONAL_GIDS, oci_runtime::CONFIG_MAX_ADDITIONAL_GIDS);
 }
 
 #[test]
@@ -479,6 +481,124 @@ fn run_as_username_acceptance() {
     // run_as_group 単独は従来どおり INVALID_ARGUMENT。
     let c = with_sc(|sc| sc.run_as_group = u(44));
     assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+}
+
+/// CRI-2・SEC-5（#2667）: supplemental_groups とポリシー、イメージ由来のグループの合成を具体値で確かめる。
+#[test]
+fn cri2_supplemental_groups_acceptance() {
+    use fandhe_container_cri::runtime::v1::SupplementalGroupsPolicy;
+    let gids = |c: &ContainerConfig, img: &ImageDefaults| -> Option<Vec<u64>> {
+        let json = build_runtime_config(&pod(), c, img).expect("build");
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        v["process"]["user"].get("additionalGids").map(|a| {
+            a.as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g.as_u64().unwrap())
+                .collect()
+        })
+    };
+    let image = |uid: u32, groups: Vec<u32>| ImageDefaults {
+        user: Some((uid, uid)),
+        supplementary_gids: groups,
+        ..Default::default()
+    };
+    // 指定なしは additionalGids を出さない。
+    assert_eq!(gids(&ctr(), &ImageDefaults::default()), None);
+    // CRI の一覧は重複を除いて順序を保つ。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![10, 20, 10]);
+    assert_eq!(gids(&c, &ImageDefaults::default()), Some(vec![10, 20]));
+    // Merge（既定）: イメージ由来 → CRI の順で、重複は最初のものを残す。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![60, 70]);
+    assert_eq!(gids(&c, &image(1000, vec![50, 60])), Some(vec![50, 60, 70]));
+    // Strict: CRI の一覧だけ。
+    let c = with_sc(|sc| {
+        sc.supplemental_groups = vec![60, 70];
+        sc.supplemental_groups_policy = SupplementalGroupsPolicy::Strict as i32;
+    });
+    assert_eq!(gids(&c, &image(1000, vec![50, 60])), Some(vec![60, 70]));
+    // 実効 uid 0 にはイメージ由来を付けない。CRI の明示した一覧は付ける。
+    assert_eq!(gids(&ctr(), &image(0, vec![1, 10])), None);
+    let c = with_sc(|sc| sc.supplemental_groups = vec![5]);
+    assert_eq!(gids(&c, &image(0, vec![1, 10])), Some(vec![5]));
+    // 値域: 0 と u32::MAX - 1 は受け、負の値・u32::MAX・範囲外は INVALID_ARGUMENT（両段）。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![0, 4_294_967_294]);
+    assert_eq!(
+        gids(&c, &ImageDefaults::default()),
+        Some(vec![0, 4_294_967_294])
+    );
+    for bad in [-1, 4_294_967_295, 4_294_967_296] {
+        let c = with_sc(|sc| sc.supplemental_groups = vec![bad]);
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad}");
+        assert_eq!(
+            validate_config(&pod(), &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{bad}"
+        );
+    }
+    let c = with_sc(|sc| sc.supplemental_groups_policy = 7);
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+    assert_eq!(
+        validate_config(&pod(), &c).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    // sandbox 側: 受け入れて、出力には現れない。不正な値は INVALID_ARGUMENT。
+    let sandbox = |g: Vec<i64>| {
+        let mut p = pod();
+        p.linux = Some(LinuxPodSandboxConfig {
+            security_context: Some(LinuxSandboxSecurityContext {
+                supplemental_groups: g,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        p
+    };
+    let v = build(&sandbox(vec![1000]), &ctr());
+    assert!(v["process"]["user"].get("additionalGids").is_none());
+    assert_eq!(
+        validate_config(&sandbox(vec![-1]), &ctr())
+            .unwrap_err()
+            .code(),
+        CriErrorCode::InvalidArgument
+    );
+    // 合計の上限: ちょうどは受け、超えると FAILED_PRECONDITION。
+    let many: Vec<u32> = (0..u32::try_from(MAX_ADDITIONAL_GIDS).unwrap()).collect();
+    assert_eq!(
+        gids(&ctr(), &image(1000, many.clone())).map(|v| v.len()),
+        Some(MAX_ADDITIONAL_GIDS)
+    );
+    let c = with_sc(|sc| sc.supplemental_groups = vec![i64::from(u32::MAX) - 1]);
+    assert_eq!(
+        build_runtime_config(&pod(), &c, &image(1000, many))
+            .unwrap_err()
+            .code(),
+        CriErrorCode::FailedPrecondition
+    );
+    // 入力件数の上限: 重複で畳めても、件数が上限を超える要求は確保の前に拒否する（コンテナ側・sandbox 側とも）。
+    let dup = vec![1000_i64; MAX_ADDITIONAL_GIDS + 1];
+    let c = with_sc(|sc| sc.supplemental_groups = dup.clone());
+    assert_eq!(
+        build_runtime_config(&pod(), &c, &ImageDefaults::default())
+            .unwrap_err()
+            .code(),
+        CriErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        validate_config(&sandbox(dup), &ctr()).unwrap_err().code(),
+        CriErrorCode::FailedPrecondition
+    );
+    // 上限ちょうどの重複は受け、1 件に畳まれる。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![1000_i64; MAX_ADDITIONAL_GIDS]);
+    assert_eq!(gids(&c, &ImageDefaults::default()), Some(vec![1000]));
+    // core で読み戻せる（additionalGids が launch の入力になる）。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![3000, 2000]);
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses");
+    assert_eq!(
+        cfg.process().unwrap().user().additional_gids(),
+        [3000, 2000]
+    );
 }
 
 #[test]
@@ -898,6 +1018,123 @@ fn userns_mappings_are_rejected_but_node_mode_still_gets_a_user_namespace() {
     assert_eq!(code(&pod(), &c), CriErrorCode::Unimplemented);
 }
 
+fn pod_paths() -> PodNamespacePaths {
+    PodNamespacePaths::new("/proc/4242/ns/user", "/proc/4242/ns/ipc").expect("paths")
+}
+
+fn build_with_pod(c: &ContainerConfig, paths: &PodNamespacePaths) -> Value {
+    let json =
+        build_runtime_config_with_pod_namespaces(&pod(), c, &ImageDefaults::default(), Some(paths))
+            .expect("build");
+    serde_json::from_slice(json.as_bytes()).expect("json")
+}
+
+/// CRI-2・CORE-3（#2674）: 供給元があり ipc が POD のとき、ipc と user だけが path つきの join になる。
+#[test]
+fn pod_ipc_is_joined_when_paths_are_supplied() {
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"},
+            {"type": "ipc", "path": "/proc/4242/ns/ipc"},
+            {"type": "mount"},
+            {"type": "uts"},
+            {"type": "user", "path": "/proc/4242/ns/user"},
+            {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn container_ipc_and_pid_never_join() {
+    // ipc CONTAINER は供給元があっても新しい namespace。
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(ns(
+            NamespaceMode::Pod,
+            NamespaceMode::Pod,
+            NamespaceMode::Container,
+        ));
+    });
+    let v = build_with_pod(&c, &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+    // pid POD も新しい namespace のまま（path なし）。
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"][0],
+        serde_json::json!({"type": "pid"})
+    );
+}
+
+#[test]
+fn without_supplier_output_is_unchanged() {
+    let plain = build(&pod(), &ctr());
+    let none = serde_json::from_slice::<Value>(
+        build_runtime_config_with_pod_namespaces(&pod(), &ctr(), &ImageDefaults::default(), None)
+            .expect("build")
+            .as_bytes(),
+    )
+    .expect("json");
+    assert_eq!(plain, none);
+    assert_eq!(
+        plain["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn pod_ipc_join_conflicts_with_container_userns() {
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(NamespaceOption {
+            userns_options: Some(UserNamespace {
+                mode: NamespaceMode::Container as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    });
+    let err = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &c,
+        &ImageDefaults::default(),
+        Some(&pod_paths()),
+    )
+    .expect_err("must be rejected");
+    assert_eq!(err.code(), CriErrorCode::Unimplemented);
+    // 供給元が無ければ従来どおり受ける。
+    build(&pod(), &c);
+}
+
+#[test]
+fn pod_namespace_paths_are_validated() {
+    for (u, i) in [
+        ("proc/1/ns/user", "/proc/1/ns/ipc"),
+        ("/proc/1/ns/user", "ns/ipc"),
+        ("/proc/1/ns/user", "/proc/1/ns/ipc\0x"),
+    ] {
+        let e = PodNamespacePaths::new(u, i).expect_err("invalid");
+        assert_eq!(e.code(), CriErrorCode::Internal);
+    }
+    let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
+    assert_eq!(
+        PodNamespacePaths::new(long, "/proc/1/ns/ipc")
+            .expect_err("too long")
+            .code(),
+        CriErrorCode::Internal
+    );
+    let at_limit = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
+    PodNamespacePaths::new(at_limit, "/proc/1/ns/ipc").expect("at the limit");
+}
+
 fn profile(t: ProfileType) -> Option<SecurityProfile> {
     Some(SecurityProfile {
         profile_type: t as i32,
@@ -1002,10 +1239,6 @@ fn rejection_table_is_unimplemented() {
             }),
         ),
         ("readonly_rootfs", Box::new(|sc| sc.readonly_rootfs = true)),
-        (
-            "supplemental",
-            Box::new(|sc| sc.supplemental_groups = vec![10]),
-        ),
         (
             "selinux",
             Box::new(|sc| sc.selinux_options = Some(Default::default())),
@@ -1115,16 +1348,17 @@ fn validate_config_does_not_require_a_command() {
 fn issue_2554_review_rejections() {
     // sandbox の supplemental_groups・cpu_quota の不正な負値・swap の不整合・保護パスの `/`（CRI-1・SEC-1）。
     let mut p = pod();
+    // （#2667 で sandbox 側の supplemental_groups は受け入れに変わった。値の不正だけを拒否する。）
     p.linux = Some(LinuxPodSandboxConfig {
         security_context: Some(LinuxSandboxSecurityContext {
-            supplemental_groups: vec![1000],
+            supplemental_groups: vec![-1],
             ..Default::default()
         }),
         ..Default::default()
     });
     assert_eq!(
         validate_config(&p, &ctr()).unwrap_err().code(),
-        CriErrorCode::Unimplemented
+        CriErrorCode::InvalidArgument
     );
     let res = |f: fn(&mut LinuxContainerResources)| {
         let mut r = LinuxContainerResources::default();

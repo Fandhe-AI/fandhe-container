@@ -96,6 +96,90 @@ expect 0 "lifetime line with its own call" -- --name n --src "${work}/n.rs" --lo
 expect 1 "missing scenario in log (migrated shape)" -- --name n --src "${work}/n.rs" --log "${work}/n2.log" \
   --select '^n: scenario ' --subst name=direct,helper,extra --subst-pos 5 --subst-pos 6
 
+# --- 拡張（#2884）: {:?}・--subst-pos-re・--require・--libtest-ignored ---
+cat > "${work}/d.rs" <<'EOF3'
+fn main() {
+    println!("d: failure code={:?} phase={phase:?}", 1);
+    println!("d: pair {} then {}", 1, 2);
+    eprintln!("d: bad {:#?}", 1);
+    eprintln!("d: hex {flags:#x}", 1);
+}
+EOF3
+printf 'd: failure code=NotFound phase=prepare\n' > "${work}/d.log"
+expect 0 "debug placeholders accepted" -- --name d --src "${work}/d.rs" --log "${work}/d.log" \
+  --select '^d: failure' --subst-pos NotFound --subst phase=prepare
+expect 1 "debug placeholder wrong value" -- --name d --src "${work}/d.rs" --log "${work}/d.log" \
+  --select '^d: failure' --subst-pos Other --subst phase=prepare
+expect 0 "debug named placeholder via subst-re" -- --name d --src "${work}/d.rs" --log "${work}/d.log" \
+  --select '^d: failure' --subst-pos-re '[A-Za-z]+' --subst-re 'phase=[a-z]+'
+expect 1 "debug placeholder without value" -- --name d --src "${work}/d.rs" --log "${work}/d.log" \
+  --select '^d: failure' --subst-pos NotFound
+expect 1 "pretty debug rejected" -- --name d --src "${work}/d.rs" --log "${work}/d.log" --select '^d: bad' --subst-pos 1
+expect 1 "hex spec rejected" -- --name d --src "${work}/d.rs" --log "${work}/d.log" --select '^d: hex' --subst flags=1
+
+printf 'd: pair 7 then 8\n' > "${work}/p.log"
+expect 0 "subst-pos-re matches" -- --name d --src "${work}/d.rs" --log "${work}/p.log" --select '^d: pair' \
+  --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+'
+expect 0 "subst-pos and subst-pos-re mixed in order" -- --name d --src "${work}/d.rs" --log "${work}/p.log" \
+  --select '^d: pair' --subst-pos 7 --subst-pos-re '[0-9]+'
+expect 1 "mixed order swapped fails" -- --name d --src "${work}/d.rs" --log "${work}/p.log" \
+  --select '^d: pair' --subst-pos-re '[0-9]+' --subst-pos 7
+expect 1 "subst-pos-re mismatch" -- --name d --src "${work}/d.rs" --log "${work}/p.log" \
+  --select '^d: pair' --subst-pos-re '[a-z]+' --subst-pos-re '[0-9]+'
+expect 1 "subst-pos-re count mismatch" -- --name d --src "${work}/d.rs" --log "${work}/p.log" \
+  --select '^d: pair' --subst-pos-re '[0-9]+'
+expect 2 "empty subst-pos-re is usage error" -- --name d --src "${work}/d.rs" --log "${work}/p.log" \
+  --select '^d: pair' --subst-pos-re ''
+
+expect 0 "require present" -- --name d --src "${work}/d.rs" --log "${work}/p.log" --select '^d: pair' \
+  --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' --require 'pair 7 then 8'
+expect 1 "require missing" -- --name d --src "${work}/d.rs" --log "${work}/p.log" --select '^d: pair' \
+  --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' --require 'pair 9 then 9'
+expect 2 "require conflicts with forbid" -- --name d --src "${work}/d.rs" --log "${work}/p.log" --select '^d: pair' \
+  --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' --require 'x' --forbid 'x'
+
+cat > "${work}/lt.rs" <<'EOF4'
+// #[ignore] in a comment does not count
+#[tokio::test]
+#[ignore = "needs real machine"]
+async fn first_case() {}
+
+#[test]
+#[ignore]
+fn second_case() {}
+
+#[test]
+fn plain_case() {}
+EOF4
+printf 'test first_case ... ok\ntest second_case ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' > "${work}/lt.log"
+lt=(--name lt --src "${work}/lt.rs" --select '^test [A-Za-z0-9_]+ \.\.\. ' --libtest-ignored)
+expect 0 "libtest ignored derived" -- "${lt[@]}" --log "${work}/lt.log" --min 2
+printf 'test first_case ... ok\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lt2.log"
+expect 1 "libtest one ok line missing" -- "${lt[@]}" --log "${work}/lt2.log"
+printf 'test first_case ... ok\ntest second_case ... ignored\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lt3.log"
+expect 1 "libtest ignored line fails" -- "${lt[@]}" --log "${work}/lt3.log"
+printf 'test first_case ... ok\ntest second_case ... ok\ntest result: ok. 1 passed; 0 failed;\n' > "${work}/lt4.log"
+expect 1 "libtest result count differs" -- "${lt[@]}" --log "${work}/lt4.log"
+printf 'test first_case ... ok\ntest second_case ... ok\ntest plain_case ... ok\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lt5.log"
+expect 1 "libtest unexpected extra test line" -- "${lt[@]}" --log "${work}/lt5.log"
+printf '// #[ignore]\nfn plain() {}\n' > "${work}/lt0.rs"
+expect 1 "libtest zero ignored functions" -- --name lt --src "${work}/lt0.rs" --log "${work}/lt.log" \
+  --select '^test [A-Za-z0-9_]+ \.\.\. ' --libtest-ignored
+
+# 移行後の形: 組の値は --subst-re + --require（直積は全組み合わせを要求して失敗する）
+cat > "${work}/g.rs" <<'EOF5'
+fn main() { println!("g: case={case} code={:?} phase={phase}", 1); }
+EOF5
+printf 'g: case=a code=NotFound phase=prepare\ng: case=b code=Denied phase=exec\n' > "${work}/g.log"
+expect 0 "paired values via subst-re and require" -- --name g --src "${work}/g.rs" --log "${work}/g.log" \
+  --select '^g: ' --subst-re 'case=[a-z]' --subst-re 'phase=[a-z]+' --subst-pos-re '[A-Za-z]+' \
+  --require 'case=a code=NotFound phase=prepare' --require 'case=b code=Denied phase=exec'
+expect 1 "cartesian subst needs every pair" -- --name g --src "${work}/g.rs" --log "${work}/g.log" \
+  --select '^g: ' --subst case=a,b --subst phase=prepare,exec --subst-pos NotFound
+expect 1 "paired value require catches swapped pair" -- --name g --src "${work}/g.rs" --log "${work}/g.log" \
+  --select '^g: ' --subst-re 'case=[a-z]' --subst-re 'phase=[a-z]+' --subst-pos-re '[A-Za-z]+' \
+  --require 'case=a code=Denied phase=prepare'
+
 if [ "${fails}" -ne 0 ]; then
   echo "check-success-lines-selftest: ${fails} case(s) failed" >&2
   exit 1

@@ -122,6 +122,10 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/production_launcher-XXXX> --ignored
 //! ```
 //!
+//! 前提（委譲 cgroup・範囲写像の `USER`・`uidmap`・subuid / subgid の自ユーザー行）の欠如は、1 行目
+//! `production_launcher: PRECONDITION FAILED (test environment, not a cgroup delegation regression)` /
+//! `(... not a subordinate id mapping regression)` で失敗する（分類は `tests/support/precondition.rs`。#2888・REPAIR-12）。
+//!
 //! シナリオ I（範囲写像）は `uidmap` パッケージ（`/usr/bin/newuidmap`・`/usr/bin/newgidmap`）と `/etc/subuid`・
 //! `/etc/subgid` の自ユーザー行が要るため、`FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けた時だけ実行する。実行時は成功行の前に
 //! `production_launcher: subordinate id mapping verified (uid extents=N, gid extents=M)` を出す。
@@ -170,6 +174,7 @@ fn main() {
     }
     // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
     linux::self_check_precondition();
+    real_entry::precondition::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -196,6 +201,10 @@ mod real_entry;
 #[path = "support/proc_status.rs"]
 mod proc_status;
 
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -204,7 +213,7 @@ mod proc_status;
     )
 ))]
 mod linux {
-    use super::real_entry;
+    use super::{real_entry, scratch_root};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -216,7 +225,7 @@ mod linux {
         AUDIT_LOG_FILE_NAME, AuditLayer, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
     };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
-    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup};
     use fandhe_container_core::exec::{
         EscapeSyscallProbe, IsolationPrivilege, ProbeOutcome, SeccompProbeRecord,
         escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
@@ -711,43 +720,9 @@ mod linux {
         dir: PathBuf,
     }
 
-    /// 試験の一時領域の親ディレクトリ（`fandhe-prodlaunch-<pid>-<nanos>`。#2840）と、その共有 flock の保持 fd。
-    ///
-    /// `systemd-tmpfiles-clean`（Ubuntu の `/tmp` は 30d の aging 対象）は走査中、サブディレクトリごとに
-    /// `flock(LOCK_EX|LOCK_NB)` を取る。製品の `BundleLock` は待たずに bundle の flock を取るため、走査と重なると
-    /// create が `container start is in progress in another process` で失敗した（main の CI で間欠）。
-    /// tmpfiles は LOCK_EX を取れないディレクトリを丸ごと飛ばす（tmpfiles.d(5)）ので、親に共有ロックを持ち続けて
-    /// bundle を親の下へ置く。製品側のロックは子の inode に対するもので、親とは干渉しない。
-    static SCRATCH_ROOT: std::sync::OnceLock<(PathBuf, std::fs::File)> = std::sync::OnceLock::new();
-
-    /// 保護済みの親ディレクトリを返す（初回に排他作成して共有ロックを取る。期限内に取れなければ panic。REPAIR-5）。
+    /// 保護済みの親ディレクトリ（共通補助 `scratch_root`。tmpfiles の掃除と flock 競合の回避。#2840・#2887）。
     fn scratch_root() -> &'static Path {
-        let (dir, _guard) = SCRATCH_ROOT.get_or_init(|| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
-                .join(format!("fandhe-prodlaunch-{}-{nanos}", std::process::id()));
-            std::fs::create_dir(&dir).expect("exclusively create scratch root");
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod scratch root");
-            let file = std::fs::File::open(&dir).expect("open scratch root");
-            assert!(
-                eventually(|| file.try_lock_shared().is_ok()),
-                "could not take a shared flock on the scratch root within the deadline"
-            );
-            (dir, file)
-        });
-        dir
-    }
-
-    /// 親ディレクトリを消す（`run` の後始末。成否に関わらず呼ぶ）。
-    fn remove_scratch_root() {
-        if let Some((dir, _)) = SCRATCH_ROOT.get() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        scratch_root::scratch_root("fandhe-prodlaunch", timeout())
     }
 
     impl Bundle {
@@ -1026,7 +1001,12 @@ mod linux {
 
     pub fn run() {
         let root = is_root();
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup v2");
+        // 前提（委譲 cgroup・範囲写像の helper ケースの `uidmap`・subuid / subgid・`USER`）の欠如は、回帰と見分けられる
+        // `PRECONDITION FAILED` の 1 行目で失敗させる（#2888・REPAIR-12）。失敗の範囲は変えない。
+        let delegated = real_entry::precondition::delegated_cgroup();
+        if subordinate_requested() && !root {
+            real_entry::precondition::require_subordinate_ids(own_ids().0);
+        }
         let tag = std::process::id();
         let cg_id = ContainerId::new(format!("pl{tag}")).expect("container id");
         let cg_name = CgroupName::new(&cg_id).expect("cgroup name");
@@ -1046,7 +1026,7 @@ mod linux {
             scenarios(root, &container, &expected_cgroup, tag);
         }));
         let removed = delegated.remove_child(&container);
-        remove_scratch_root();
+        scratch_root::remove_scratch_root();
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }

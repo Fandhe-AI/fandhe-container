@@ -112,6 +112,16 @@ mod rootfs;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod linux {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -228,8 +238,7 @@ mod linux {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
+            let dir = super::scratch_root::scratch_root("fandhe-exsub-scratch", timeout())
                 .join(format!("fandhe-exsub-{tag}-{}-{nanos}", std::process::id()));
             std::fs::create_dir(&dir).expect("exclusively create the work dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
@@ -413,6 +422,8 @@ mod linux {
             ),
         };
 
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let tag = std::process::id();
         let work = TempDir::new("e2e");
         let store = FileStateStore::open(

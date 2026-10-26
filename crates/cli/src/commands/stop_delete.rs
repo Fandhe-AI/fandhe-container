@@ -100,9 +100,9 @@ use super::create_start::{
 };
 use super::image::open_image_store_for_lifecycle;
 use super::image_refs::{
-    IMAGE_ROOT_ANNOTATION, StoreImageRefs, legacy_scope, ref_key, state_scope,
+    IMAGE_ROOT_ANNOTATION, StoreImageRefs, fail, legacy_scope, ref_key, state_scope,
 };
-use fandhe_container_oci::image_management::{ContainerRefId, ImageStore};
+use fandhe_container_oci::image_management::{ContainerRefId, ContainerRefRelease, ImageStore};
 
 // 本番の signaler・cgroup remover は supervisor crate にある（plugin-cri の `kill`・`stop`・`delete` と共有するため
 // CLI の private 実装から移した。#2434・REPAIR-1）。`production_signaler` は `kill` コマンド（#1902）が入るまで試験だけが使う。
@@ -400,22 +400,51 @@ pub(super) fn delete_with_recorded_image_root(
             let result =
                 delete_container_releasing_image_ref(store, recorder, cgroups, images, &scope, req);
             // 旧 scope のキーで残った参照も外す（旧版で作ったコンテナの互換。コンテナは消えた後なので無条件に外してよく、
-            // 旧 scope のキーは新規に作られない。失敗は残すだけで、契機 A / B の回収に任せる）。
-            if result.is_ok()
-                && let Some(legacy) = legacy_scope
-            {
-                release_legacy_ref(images, legacy, req.id());
+            // 旧 scope のキーは新規に作られない）。結果は応答へ反映し、失敗は `Kept` として警告と計測に渡す（REPAIR-4）。
+            match (result, legacy_scope) {
+                (Ok(resp), Some(legacy)) => {
+                    let merged = merge_legacy_outcome(
+                        resp.image_ref(),
+                        release_legacy_ref(images, legacy, req.id()),
+                    );
+                    Ok(resp.with_image_ref(merged))
+                }
+                (result, _) => result,
             }
-            result
         }
         None => delete_container(store, recorder, cgroups, req),
     }
 }
 
-/// 旧 scope の参照キー 1 件を外す（見つからない・失敗は無視。#2499・OCI-7）。
-fn release_legacy_ref(images: &ImageStore, legacy_scope: &str, id: &ContainerId) {
-    if let Ok(key) = ContainerRefId::new(&ref_key(legacy_scope, id.as_str())) {
-        let _ = images.release_container_ref(&key);
+/// 旧 scope の参照キー 1 件を外した結果（#2499・OCI-7・REPAIR-4）。
+fn release_legacy_ref(images: &ImageStore, legacy_scope: &str, id: &ContainerId) -> CleanupOutcome {
+    let key = match ContainerRefId::new(&ref_key(legacy_scope, id.as_str())) {
+        Ok(k) => k,
+        Err(_) => {
+            return CleanupOutcome::Kept {
+                code: ErrorCode::Internal,
+            };
+        }
+    };
+    match images.release_container_ref(&key) {
+        Ok(ContainerRefRelease::Released(_)) => CleanupOutcome::Removed,
+        Ok(_) => CleanupOutcome::AlreadyAbsent,
+        Err(e) => CleanupOutcome::Kept {
+            code: fail(e).code(),
+        },
+    }
+}
+
+/// 現行 scope の解除結果と旧 scope の解除結果を 1 つにまとめる。失敗（`Kept`）を最優先し、
+/// 次に実際に外した（`Removed`）を採り、それ以外は現行 scope の結果を保つ。
+fn merge_legacy_outcome(current: CleanupOutcome, legacy: CleanupOutcome) -> CleanupOutcome {
+    match (current, legacy) {
+        (CleanupOutcome::Kept { code }, _) | (_, CleanupOutcome::Kept { code }) => {
+            CleanupOutcome::Kept { code }
+        }
+        (CleanupOutcome::NotApplicable, _) => CleanupOutcome::NotApplicable,
+        (_, CleanupOutcome::Removed) => CleanupOutcome::Removed,
+        (c, _) => c,
     }
 }
 
@@ -822,6 +851,31 @@ mod tests {
         assert!(
             lines[2].contains("\"code\":\"FAILED_PRECONDITION\"")
                 && lines[2].contains("container log")
+        );
+    }
+
+    /// REPAIR-4・OCI-7・#2499: 旧 scope の解除の失敗は応答を `Kept` にする（`AlreadyAbsent` に埋もれさせない）。
+    #[test]
+    fn repair4_legacy_release_outcome_is_merged_into_response() {
+        let kept = CleanupOutcome::Kept {
+            code: ErrorCode::Timeout,
+        };
+        assert_eq!(
+            merge_legacy_outcome(CleanupOutcome::AlreadyAbsent, kept),
+            kept
+        );
+        assert_eq!(merge_legacy_outcome(CleanupOutcome::Removed, kept), kept);
+        assert_eq!(
+            merge_legacy_outcome(CleanupOutcome::AlreadyAbsent, CleanupOutcome::Removed),
+            CleanupOutcome::Removed
+        );
+        assert_eq!(
+            merge_legacy_outcome(CleanupOutcome::Removed, CleanupOutcome::AlreadyAbsent),
+            CleanupOutcome::Removed
+        );
+        assert_eq!(
+            merge_legacy_outcome(CleanupOutcome::NotApplicable, CleanupOutcome::Removed),
+            CleanupOutcome::NotApplicable
         );
     }
 

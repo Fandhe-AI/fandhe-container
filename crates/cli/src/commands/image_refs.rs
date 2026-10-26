@@ -262,7 +262,7 @@ pub(super) fn ref_key(scope: &str, id: &str) -> String {
     format!("{scope}-{}", sha256_hex(id.as_bytes()))
 }
 
-fn fail(e: OciError) -> TraitError {
+pub(super) fn fail(e: OciError) -> TraitError {
     trait_failure(&e, Stage::Refs)
 }
 

@@ -467,7 +467,7 @@ mod store_backed {
         assert_eq!(
             lines,
             vec![
-                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"cleanup after delete left resources behind\"}"
+                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
                     .to_owned()
             ]
         );

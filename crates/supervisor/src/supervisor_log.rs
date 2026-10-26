@@ -204,7 +204,7 @@ pub fn run_log_removal_bounded(
 ) -> LogRemoval {
     // 起動失敗は従来どおり `Finished` 扱い（結果を持ち帰る `run_bounded` では区別できないため、起動失敗を別に判定する）。
     match run_bounded_inner(job, timeout) {
-        BoundedOutcome::TimedOut => LogRemoval::TimedOut,
+        BoundedOutcome::TimedOut | BoundedOutcome::Busy => LogRemoval::TimedOut,
         BoundedOutcome::NoResult | BoundedOutcome::Done(()) => LogRemoval::Finished,
     }
 }
@@ -213,6 +213,8 @@ pub fn run_log_removal_bounded(
 enum BoundedOutcome<T> {
     Done(T),
     TimedOut,
+    /// 同時実行枠が満杯でスレッドを起動しなかった（期限切れではない。#2760）。
+    Busy,
     NoResult,
 }
 
@@ -221,7 +223,7 @@ fn run_bounded_inner<T: Send + 'static>(
     timeout: std::time::Duration,
 ) -> BoundedOutcome<T> {
     let Some(slot) = InflightSlot::acquire() else {
-        return BoundedOutcome::TimedOut;
+        return BoundedOutcome::Busy;
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -280,7 +282,31 @@ pub fn run_bounded<T: Send + 'static>(
 ) -> Option<T> {
     match run_bounded_inner(job, timeout) {
         BoundedOutcome::Done(v) => Some(v),
-        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => None,
+        BoundedOutcome::TimedOut | BoundedOutcome::Busy | BoundedOutcome::NoResult => None,
+    }
+}
+
+/// [`run_bounded_classified`] が結果を得られなかった理由（#2760・REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedFailure {
+    /// 同時実行枠が満杯で、作業スレッドを起動しなかった（何も実行していない）。
+    Busy,
+    /// 期限切れ、スレッド起動失敗、または job の panic（作業スレッドが残り得る）。
+    Unfinished,
+}
+
+/// [`run_bounded`] の、枠の満杯とそれ以外の失敗を区別する版（#2760）。
+///
+/// 枠が満杯なら job は実行されず `Busy`。長寿命の plugin-cri で、止まった作業が枠を埋めたことと、この job 自身の
+/// 期限切れを同じ失敗として扱わないために使う。
+pub fn run_bounded_classified<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<T, BoundedFailure> {
+    match run_bounded_inner(job, timeout) {
+        BoundedOutcome::Done(v) => Ok(v),
+        BoundedOutcome::Busy => Err(BoundedFailure::Busy),
+        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),
     }
 }
 

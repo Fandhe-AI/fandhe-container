@@ -48,7 +48,7 @@
 //!    `sha256:<小文字 hex 64 桁>` だけを受け、それ以外は `INVALID_ARGUMENT`（oci の `ImageReference::parse` が
 //!    `sha256:AAAA…` を repository `sha256` のタグと誤読するため、先にここで拒否する）。
 //!    この規則 1 は `image rm` / `image tag`（`image::parse_ref`）と [`is_bare_digest_form`] で共有する。`name@digest` の扱いだけは
-//!    意図して異なり、rm / tag は既存契約（#2221・#2316）の digest 優先で受ける（理由は `image` module doc）。
+//!    意図して異なり、rm / tag は既存契約（#2221・#2316）の digest 優先で受ける（理由と #2659 の再判断〔受け続ける〕は `image` module doc）。
 //! 2. それ以外は oci の `ImageReference::parse`（Docker 互換の正規化。ホスト省略は `registry-1.docker.io`、単一成分は `library/`、
 //!    タグ省略は `latest`）でタグ参照にする。repository 名が `sha256` のイメージは `docker.io/library/sha256:tag` と書けばよい。
 //! 3. 解析に失敗する入力と `name@digest`・`name:tag@digest` は `INVALID_ARGUMENT`（素の digest で指定する。将来広げる余地はある）。

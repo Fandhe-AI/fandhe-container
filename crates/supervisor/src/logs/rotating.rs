@@ -270,6 +270,101 @@ fn is_reserved_device_name(s: &str) -> bool {
     }
 }
 
+/// [`encode_file_stem`] の逆変換。ファイル名の stem から ID の文字列を復元する（#2760・SUP-7・CRI-2）。
+///
+/// 起動時の走査（[`list_stale_log_ids`]）が、ディレクトリ内の名前から「どの ID のログか」を求めるために使う。
+/// 復元した文字列を `encode_file_stem` で符号化し直して元の stem と一致すること、`ContainerId` として妥当なことを
+/// 照合する。どれかに失敗した名前は `None`（帰属を確定できない名前は呼び出し側が消さない。fail-closed）。
+fn decode_file_stem(stem: &str) -> Option<ContainerId> {
+    // 先頭の `_0` は予約デバイス名の印。照合（往復）が予約名かどうかを確かめるので、ここでは機械的に外す。
+    let body = stem.strip_prefix("_0").unwrap_or(stem);
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '_' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '_' => out.push('_'),
+            x if x.is_ascii_lowercase() => out.push(x.to_ascii_uppercase()),
+            _ => return None,
+        }
+    }
+    let id = ContainerId::new(out.as_str()).ok()?;
+    (encode_file_stem(id.as_str()) == stem).then_some(id)
+}
+
+/// ディレクトリ内のファイル名（`<stem>.log`・`<stem>.log.lock`・`<stem>.log.<n>`）から stem を取り出す。
+/// 3 形式のどれでもなければ `None`。ID は `.` を含み得るため、右端の接尾辞から判定する。
+fn stem_of_log_name(name: &str) -> Option<&str> {
+    if let Some(s) = name.strip_suffix(".log.lock") {
+        return Some(s);
+    }
+    if let Some(s) = name.strip_suffix(".log") {
+        return Some(s);
+    }
+    let (head, num) = name.rsplit_once('.')?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    head.strip_suffix(".log")
+}
+
+/// [`list_stale_log_ids`] の結果。
+#[derive(Debug, Default)]
+pub(crate) struct StaleLogScan {
+    /// 走査したエントリ数。
+    pub(crate) scanned: usize,
+    /// 帰属を確定できた ID（重複なし・出現順）。
+    pub(crate) ids: Vec<ContainerId>,
+    /// ログらしい名前だが ID に戻せなかった（または非 UTF-8 の）名前の数。消さずに見送る。
+    pub(crate) undecodable: usize,
+    /// `max_ids` に達して打ち切った。
+    pub(crate) truncated: bool,
+}
+
+/// コンテナログのディレクトリ内の名前を走査し、ログを持つ ID を列挙する（起動時の残りログの走査用。#2760・SUP-7・CRI-2）。
+///
+/// 列挙だけで、何も消さない（削除は ID ごとに既存の `remove_all_quiet_guarded` が、ロックと名前空間の検査の下で行う）。
+/// `dir` は [`check_dir`] を通す（祖先の symlink・他者書き込み可を拒否）。エントリ数は [`MAX_SCAN_ENTRIES`] で、
+/// ID 数は `max_ids` で打ち切る。ログの形式でない名前（無関係なファイル）は数えない。
+pub(crate) fn list_stale_log_ids(dir: &Path, max_ids: usize) -> Result<StaleLogScan, TraitError> {
+    let dir = check_dir(dir)?;
+    let rd = fs::read_dir(&dir).map_err(|_| internal("log directory scan failed"))?;
+    let mut scan = StaleLogScan::default();
+    let mut seen = std::collections::HashSet::new();
+    for entry in rd {
+        scan.scanned = scan.scanned.saturating_add(1);
+        if scan.scanned > MAX_SCAN_ENTRIES {
+            scan.truncated = true;
+            break;
+        }
+        let entry = entry.map_err(|_| internal("log directory scan failed"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            scan.undecodable = scan.undecodable.saturating_add(1);
+            continue;
+        };
+        let Some(stem) = stem_of_log_name(name) else {
+            continue;
+        };
+        let Some(id) = decode_file_stem(stem) else {
+            scan.undecodable = scan.undecodable.saturating_add(1);
+            continue;
+        };
+        if !seen.insert(id.as_str().to_owned()) {
+            continue;
+        }
+        if scan.ids.len() >= max_ids {
+            scan.truncated = true;
+            break;
+        }
+        scan.ids.push(id);
+    }
+    Ok(scan)
+}
+
 /// 名前空間の別名検査用に、名前を ASCII 小文字へ畳み込む（IO-5）。
 ///
 /// sink が作る名前は小文字・数字・`.`・`-`・`_` の ASCII だけなので、別名になり得るのは「大文字小文字の畳み込みや
@@ -1375,3 +1470,6 @@ fn sync_dir(_dir: &Path) -> Result<(), TraitError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stem_tests;

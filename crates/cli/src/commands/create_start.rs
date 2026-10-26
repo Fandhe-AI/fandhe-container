@@ -52,7 +52,9 @@ use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
 use super::create_options;
 use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
-use super::image_refs::{StoreImageRefs, classify_create_image, resolve_create_image, state_scope};
+use super::image_refs::{
+    StoreImageRefs, attach_image_root, classify_create_image, resolve_create_image, state_scope,
+};
 use super::ref_reconcile::reclaim_stale_ref_recorded;
 use super::stop_delete::{
     WARNING_WRITE_TIMEOUT, emit_warning_bounded, options_removal_warning, write_warning_to_stderr,
@@ -86,6 +88,27 @@ pub(super) struct CreateImage {
     pub(super) scope: String,
 }
 
+/// 状態ストアを開く前の段階のイメージつき create の入力（`scope` が未確定）。
+///
+/// 参照キーの接頭辞 `scope` は「開いた状態ストアの `host_state_root()`」から求める（`--root` の表記ゆれ・祖先の
+/// symlink を畳んだ正規パスにするため。#2499 P2-2）。ストアを開く前の `build_create` はこの型を返し、
+/// `run_create` がストアを開いた後に [`PendingImage::bind`] で [`CreateImage`] にする。
+pub(super) struct PendingImage {
+    pub(super) store: ImageStore,
+    pub(super) manifest: ImageManifestDigest,
+}
+
+impl PendingImage {
+    /// 開いた状態ストアから scope を求めて [`CreateImage`] にする。ストアが状態ルートを示せなければ失敗する。
+    pub(super) fn bind(self, state: &dyn StateStore) -> Result<CreateImage, TraitError> {
+        Ok(CreateImage {
+            scope: state_scope(state)?,
+            store: self.store,
+            manifest: self.manifest,
+        })
+    }
+}
+
 /// 構築済みの要求で core の `create_with_image` を呼ぶ（OCI-7・#2315）。
 ///
 /// 参照の登録・確定・失敗時の巻き戻しは core が行う。展開器は付けない（本番の展開器は #2377 で、
@@ -117,6 +140,16 @@ pub(super) fn create_container_with_image_reclaiming(
     image: &CreateImage,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
+    // create 時のイメージストア root を状態記録へ残す。`--image-root` を省いた delete が、この記録から参照を解除する
+    // （#2499・OCI-7・CLI-1）。状態を作る前に付けるので、状態の作成と同時に原子的に永続化される。
+    let started = Instant::now();
+    let req = &match attach_image_root(req, &image.store) {
+        Ok(r) => r,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
     reclaim_stale_ref_recorded(
         &image.store,
         rt.store.as_ref(),
@@ -140,7 +173,7 @@ pub(super) fn create_container_with_image_reclaiming(
 fn build_create(
     global: &GlobalArgs,
     args: &CreateArgs,
-) -> Result<(CreateRequest, Option<CreateImage>), TraitError> {
+) -> Result<(CreateRequest, Option<PendingImage>), TraitError> {
     let req = build_create_request(args)?;
     let image = match &args.image {
         None => None,
@@ -151,14 +184,7 @@ fn build_create(
             require_local_backend(global)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
             let manifest = resolve_create_image(&store, classified)?;
-            let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
-                global.root.clone(),
-            )?);
-            Some(CreateImage {
-                store,
-                manifest,
-                scope,
-            })
+            Some(PendingImage { store, manifest })
         }
     };
     Ok((req, image))
@@ -238,7 +264,7 @@ pub(super) fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitErr
 
 /// core に到達する前の失敗を操作名 `op_name` の失敗として記録する（REPAIR-4）。
 /// core に到達した操作は core 自身が記録するため、ここで二重には記録しない。
-fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instant) {
+pub(super) fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instant) {
     if let Ok(name) = OpName::new(op_name) {
         let _ = recorder.record(&name, OpOutcome::Failure, started.elapsed());
     }
@@ -817,7 +843,16 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         Ok((req, image, document))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
-    .and_then(|(rt, (req, image, document))| {
+    .and_then(|(rt, (req, pending, document))| {
+        // 参照キーの scope は開いた状態ストアから求める（表記ゆれを畳んだ正規パス。#2499）。
+        let image = match pending.map(|p| p.bind(rt.store.as_ref())).transpose() {
+            Ok(i) => i,
+            Err(e) => {
+                record_pre_core_failure(&rt.recorder, "create", started);
+                export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+                return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+            }
+        };
         let r = match reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder) {
             // 回収の期限切れは core を呼ばずに create の失敗として計測する（REPAIR-4）。
             Err(e) => {
@@ -1958,8 +1993,8 @@ mod tests {
             global.root = Some(base.0.join("state"));
             let (_req, image) =
                 build_create(&global, &image_args(root.clone(), tag)).expect("build");
-            let image = image.expect("image");
-            assert_eq!(image.manifest.as_str(), IMG_DIGEST);
+            let pending = image.expect("image");
+            assert_eq!(pending.manifest.as_str(), IMG_DIGEST);
             // 解決のあとに別のストアのインスタンスで付け替える。
             let other = ImageStore::open(&root).expect("other");
             let key: TagKey =
@@ -1978,6 +2013,7 @@ mod tests {
                 fandhe_container_oci::image_management::ImageTagChange::Moved { .. }
             ));
             let rt = runtime(&base);
+            let image = pending.bind(rt.store.as_ref()).expect("bind");
             let req = build_create_request(&CreateArgs {
                 options: CreateOptionArgs::default(),
                 bundle,

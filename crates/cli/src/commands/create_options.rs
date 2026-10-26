@@ -84,9 +84,13 @@ pub(super) fn labels_of(options: &CreateOptionArgs) -> Result<Annotations, Trait
         .collect::<Result<Vec<_>, _>>()?;
     let annotations = Labels::resolve(labels)?.annotations().clone();
     // 予約キー(作成世代)は CLI が足す。利用者の指定を受けると、文書が無いのに世代だけが記録され start が拒否される(#2713)。
+    // イメージストア root の記録(`IMAGE_ROOT_ANNOTATION`)も同じ予約キー。偽装すると delete が別のストアを開く(#2499)。
     if annotations
         .get(fandhe_container_supervisor::container_options::store::GENERATION_ANNOTATION)
         .is_some()
+        || annotations
+            .get(super::image_refs::IMAGE_ROOT_ANNOTATION)
+            .is_some()
     {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
@@ -200,5 +204,17 @@ mod tests {
         };
         let e = labels_of(&a).expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// OCI-7・SEC-1(#2499): イメージストア root の記録の予約キーも利用者の label として受けない。
+    #[test]
+    fn oci7_create_options_rejects_reserved_image_root_label() {
+        let a = CreateOptionArgs {
+            labels: vec!["io.fandhe.container.image-root=/x".into()],
+            ..args()
+        };
+        let e = labels_of(&a).expect_err("reserved");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "the label key is reserved");
     }
 }

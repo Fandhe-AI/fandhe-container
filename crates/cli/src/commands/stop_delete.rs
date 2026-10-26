@@ -41,10 +41,14 @@
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - `delete --image-root <abs>` は core の `delete_releasing_image_ref` で OCI-7 のイメージ参照を外す（#2315）。ストアは core に入る前に
-//!   開き、開けなければ状態を消さずに失敗する。`--image-root` を省いた delete では確定済みの参照が残り、回収は次の契機で行う
-//!   （同じ ID の `create --image-root` の core 呼び出し前、または `image rm` が使用中で拒否したとき。`ref_reconcile` の module doc・#2495。
-//!   安全側でデータは消えない）。
+//! - `delete` は core の `delete_releasing_image_ref` で OCI-7 のイメージ参照を外す（#2315）。ストアは create が状態記録の
+//!   annotations（`io.fandhe.container.image-root`）に残した root を使い、`--image-root` は任意（#2499。判断表は
+//!   [`delete_with_recorded_image_root`]）。ストアは core に入る前に開き、開けない・記録と食い違うときは状態を消さずに失敗する。
+//!   記録の root を消したり移したりしたコンテナは delete できない。元のパスにストアを戻すか、同じパスに空の 0700 ディレクトリを
+//!   作れば delete は通る（参照が無ければ解除は空振り）。逃げ道（`--force` 等）の要否は未決。解除に失敗した場合は
+//!   `DeleteResponse::image_ref` の `Kept` と stderr の警告で伝え、終了コードは 0 のまま。照合（#2495）は、記録を持たない
+//!   古いコンテナや core 到達後に失敗した解除の残りを後追いで回収する役（同じ ID の `create --image-root` の core 呼び出し前、
+//!   または `image rm` が使用中で拒否したとき。`ref_reconcile` の module doc）。
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
 //! - stop の SIGTERM は意図つき（StopRequest）で送る。supervisor は意図を記録してから送るので、stop による終了は
@@ -91,9 +95,11 @@ use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, StateRevision}
 
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
-use super::create_start::{OP_LOG_ENV, export_ops, production_runtime, require_local_backend};
+use super::create_start::{
+    OP_LOG_ENV, export_ops, production_runtime, record_pre_core_failure, require_local_backend,
+};
 use super::image::open_image_store_for_lifecycle;
-use super::image_refs::{StoreImageRefs, state_scope};
+use super::image_refs::{IMAGE_ROOT_ANNOTATION, StoreImageRefs, state_scope};
 use fandhe_container_oci::image_management::ImageStore;
 
 // 本番の signaler・cgroup remover は supervisor crate にある（plugin-cri の `kill`・`stop`・`delete` と共有するため
@@ -289,12 +295,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
             .map(|root| {
                 // 非 Linux はローカルストアを開かず、バックエンド（plugin）解決の拒否へそのまま渡す（OCI-7・CLI-1）。
                 require_local_backend(global)?;
-                let store = open_image_store_for_lifecycle(root)?;
-                // 参照キーに状態ルートを含め、別の状態ルートの同名コンテナの参照を外さない（OCI-7）。
-                let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
-                    global.root.clone(),
-                )?);
-                Ok::<_, TraitError>((store, scope))
+                open_image_store_for_lifecycle(root)
             })
             .transpose()?;
         Ok((req, images))
@@ -305,17 +306,14 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
         Err(e) => return CliExit::Runtime(e),
     };
     let remover = production_cgroup_remover();
-    let result = match &images {
-        Some((images, scope)) => delete_container_releasing_image_ref(
-            rt.store.as_ref(),
-            &rt.recorder,
-            &remover,
-            images,
-            scope,
-            &req,
-        ),
-        None => delete_container(rt.store.as_ref(), &rt.recorder, &remover, &req),
-    };
+    let result = delete_with_recorded_image_root(
+        rt.store.as_ref(),
+        &rt.recorder,
+        &remover,
+        images.as_ref(),
+        &req,
+        started,
+    );
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
         Ok(resp) => {
@@ -330,12 +328,132 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     }
 }
 
+const MSG_IMAGE_ROOT_MISMATCH: &str = "image root does not match the image root recorded at create";
+const MSG_RECORDED_IMAGE_ROOT_INVALID: &str = "the recorded image root is invalid";
+
+/// create 時に記録したイメージストア root（[`IMAGE_ROOT_ANNOTATION`]）と `--image-root` から、解除に使うストアを決めて
+/// delete する（#2499・OCI-7・OCI-5・CLI-1）。
+///
+/// 判断表（`get` で読んだ記録の有無 × `explicit`）:
+/// - 記録あり・`explicit` なし: 記録の root を `ImageStore::open`（所有者・権限・祖先・symlink の検査）で開き、開いた `root()` が
+///   記録と一致すれば解除つきで delete する。開けない・食い違う・絶対パスでないときは core に入らず失敗し、状態も参照も残す。
+/// - 記録あり・`explicit` あり: `explicit.root()` が記録と一致すれば解除つき、違えば `FAILED_PRECONDITION`（状態も参照も残す）。
+/// - 記録なし・`explicit` あり: 従来どおり `explicit` で解除つき（記録を持たない古いコンテナとの互換）。
+/// - 記録なし・`explicit` なし、または `get` の失敗: 従来どおり通常の delete（`get` の失敗は core が同じエラーを返す）。
+///
+/// 記録の値は信頼しない入力として扱う。`get` から core の delete までの間に別の delete と同じ ID の再 create が
+/// 割り込むと新しいコンテナの参照が残りうるが、余分に持つ安全側で、次の同じ ID の create（契機 A）が回収する。
+/// 参照の解除結果は `DeleteResponse::image_ref` に載る（失敗は `Kept` で、警告になる）。
+/// 判断で core に入る前に失敗した場合は `delete` の失敗として 1 回記録する（REPAIR-4）。`started` はその所要時間の起点。
+pub(super) fn delete_with_recorded_image_root(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    cgroups: &dyn ContainerCgroupRemover,
+    explicit: Option<&ImageStore>,
+    req: &DeleteRequest,
+    started: Instant,
+) -> Result<DeleteResponse, OciRuntimeError> {
+    let recorded = store
+        .get(&GetStateRequest::new(req.id().clone()))
+        .ok()
+        .and_then(|r| {
+            r.annotations()
+                .get(IMAGE_ROOT_ANNOTATION)
+                .map(str::to_owned)
+        });
+    let opened;
+    let images = match decide_release_store(recorded.as_deref(), explicit) {
+        Ok(ReleaseStore::Explicit(i)) => Some(i),
+        Ok(ReleaseStore::Open(root)) => match open_image_store_for_lifecycle(&root) {
+            Ok(i) if i.root() == root.as_path() => {
+                opened = i;
+                Some(&opened)
+            }
+            Ok(_) => {
+                return Err(pre_core_delete_failure(
+                    recorder,
+                    started,
+                    TraitError::new(ErrorCode::FailedPrecondition, MSG_IMAGE_ROOT_MISMATCH),
+                ));
+            }
+            Err(e) => return Err(pre_core_delete_failure(recorder, started, e)),
+        },
+        Ok(ReleaseStore::None) => None,
+        Err(e) => return Err(pre_core_delete_failure(recorder, started, e)),
+    };
+    match images {
+        Some(images) => {
+            let scope = match state_scope(store) {
+                Ok(s) => s,
+                Err(e) => return Err(pre_core_delete_failure(recorder, started, e)),
+            };
+            delete_container_releasing_image_ref(store, recorder, cgroups, images, &scope, req)
+        }
+        None => delete_container(store, recorder, cgroups, req),
+    }
+}
+
+/// 解除に使うイメージストアの決め方（[`decide_release_store`] の結果）。
+enum ReleaseStore<'a> {
+    /// 利用者が渡して開いた済みのストア（記録と一致を確認済み、または記録なし）。
+    Explicit(&'a ImageStore),
+    /// 記録の root を開く（開いた後に `root()` と記録の一致を確かめる）。
+    Open(std::path::PathBuf),
+    /// 解除しない（イメージつきでないコンテナ）。
+    None,
+}
+
+/// 記録の値と `--image-root` から解除に使うストアを決める（ストアに触れない純関数）。
+fn decide_release_store<'a>(
+    recorded: Option<&str>,
+    explicit: Option<&'a ImageStore>,
+) -> Result<ReleaseStore<'a>, TraitError> {
+    let Some(recorded) = recorded else {
+        return Ok(explicit.map_or(ReleaseStore::None, ReleaseStore::Explicit));
+    };
+    let root = std::path::Path::new(recorded);
+    if recorded.is_empty() || !root.is_absolute() {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            MSG_RECORDED_IMAGE_ROOT_INVALID,
+        ));
+    }
+    match explicit {
+        Some(e) if e.root() == root => Ok(ReleaseStore::Explicit(e)),
+        Some(_) => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_IMAGE_ROOT_MISMATCH,
+        )),
+        None => Ok(ReleaseStore::Open(root.to_path_buf())),
+    }
+}
+
+/// core に入る前の delete の失敗を 1 回記録して `OciRuntimeError` にする（REPAIR-4）。
+fn pre_core_delete_failure(
+    recorder: &OpRecorder,
+    started: Instant,
+    e: TraitError,
+) -> OciRuntimeError {
+    record_pre_core_failure(recorder, "delete", started);
+    OciRuntimeError::from_trait_error(LifecycleOp::Delete, e)
+}
+
 /// イメージ由来 rootfs を残した場合の警告（stderr に 1 行の JSON。ERR-1・OCI-7・#2633）。
 ///
 /// パス・errno・ID は含めず、`code` で理由を見分ける。残った木は手動で消す（`docs/design/image-rootfs-lifetime.md`）。
 fn image_rootfs_removal_warning(code: ErrorCode) -> String {
     format!(
         "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}}",
+        code.as_str()
+    )
+}
+
+/// イメージ参照の解除に失敗した場合の警告（stderr に 1 行の JSON。ERR-1・OCI-7・#2499）。
+///
+/// パス・ID・errno は含めない。参照が残ったイメージは使用中のままになりうる（回収は次の同じ ID の create か `image rm`）。
+fn image_ref_release_warning(code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image reference release failed; the image may stay in use\"}}",
         code.as_str()
     )
 }
@@ -360,13 +478,14 @@ fn finish_delete(
         .with_container_log(remove_container_log(store, req, lock_wait))
 }
 
-/// 残った後始末の警告行（固定の順序: rootfs → supervisor ログ → コンテナログ）。消せた・対象外は含まない。
+/// 残った後始末の警告行（固定の順序: rootfs → supervisor ログ → コンテナログ → イメージ参照）。消せた・対象外は含まない。
 fn cleanup_warnings(resp: &DeleteResponse) -> Vec<String> {
     resp.kept()
         .filter_map(|(target, code)| match target {
             CleanupTarget::ImageRootfs => Some(image_rootfs_removal_warning(code)),
             CleanupTarget::SupervisorLog => Some(supervisor_log_removal_warning(code)),
             CleanupTarget::ContainerLog => Some(container_log_removal_warning(code)),
+            CleanupTarget::ImageRef => Some(image_ref_release_warning(code)),
             // 将来追加される対象は、警告の文言が決まるまで出さない（`DeleteResponse` の欄には残る）。
             _ => None,
         })
@@ -677,6 +796,25 @@ mod tests {
         assert!(
             lines[2].contains("\"code\":\"FAILED_PRECONDITION\"")
                 && lines[2].contains("container log")
+        );
+    }
+
+    /// ERR-1・OCI-7・#2499: イメージ参照の解除の失敗は完全一致する 1 行 JSON の警告になり、rootfs の後ろに並ぶ。
+    #[test]
+    fn err1_image_ref_release_warning_is_exact_and_last() {
+        let resp = DeleteResponse::new()
+            .with_image_ref(CleanupOutcome::Kept {
+                code: ErrorCode::Internal,
+            })
+            .with_image_rootfs(CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            });
+        let lines = cleanup_warnings(&resp);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("image rootfs removal failed"));
+        assert_eq!(
+            lines[1],
+            "{\"level\":\"warn\",\"code\":\"INTERNAL\",\"message\":\"image reference release failed; the image may stay in use\"}"
         );
     }
 
@@ -1577,9 +1715,7 @@ mod tests {
             "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 
         fn scope_of(base: &TmpDir) -> String {
-            crate::commands::image_refs::state_scope(
-                &StateRoot::from_override(state_root(base)).expect("root"),
-            )
+            crate::commands::image_refs::state_scope(&store(base)).expect("scope")
         }
 
         fn ref_digest() -> fandhe_container_core::oci_runtime::ImageManifestDigest {
@@ -1689,22 +1825,178 @@ mod tests {
             assert_eq!(container_refs(&image.store), Vec::<String>::new());
         }
 
-        /// OCI-7・#2315: `--image-root` なしの delete は確定済みの参照を残す（安全側。回収は照合を待つ）。
+        /// 解除つき delete を、記録の root を使う本番と同じ入口で呼ぶ。
+        fn delete_recorded(
+            rt: &crate::commands::create_start::Runtime,
+            explicit: Option<&fandhe_container_oci::image_management::ImageStore>,
+            name: &str,
+        ) -> Result<DeleteResponse, OciRuntimeError> {
+            let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
+            let req = build_delete_request(&delete_args(name, false)).expect("req");
+            delete_with_recorded_image_root(
+                rt.store.as_ref(),
+                &rt.recorder,
+                &remover,
+                explicit,
+                &req,
+                Instant::now(),
+            )
+        }
+
+        /// 別インスタンスで開き直したストアから見た参照（永続化された状態）。
+        fn persisted_refs(base: &TmpDir) -> Vec<String> {
+            let fresh =
+                fandhe_container_oci::image_management::ImageStore::open(&base.0.join("images"))
+                    .expect("reopen");
+            container_refs(&fresh)
+        }
+
+        /// OCI-7・OCI-5・CLI-1・#2499（条件 1）: create が状態記録へ残したストア root で、`--image-root` なしの delete が
+        /// 参照を解除する（状態だけが消えて参照が残る経路を作らない）。
         #[test]
-        fn oci7_delete_without_image_root_keeps_reference() {
+        fn oci7_delete_without_image_root_releases_recorded_reference() {
             let base = TmpDir::new("img-keep");
             let rt = runtime_with(store(&base));
             let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
-            delete_with(&store(&base), &OpRecorder::new(), "c1", false).expect("delete");
+            let recorded = rt
+                .store
+                .get(&GetStateRequest::new(id("c1")))
+                .expect("record")
+                .annotations()
+                .get(IMAGE_ROOT_ANNOTATION)
+                .map(str::to_owned);
+            let canonical = std::fs::canonicalize(base.0.join("images")).expect("canonical");
+            assert_eq!(recorded.as_deref(), canonical.to_str());
             assert_eq!(
                 container_refs(&image.store),
                 vec![format!("{}.c1", scope_of(&base))]
             );
-            let gone = rt
-                .store
-                .get(&GetStateRequest::new(id("c1")))
-                .expect_err("gone");
-            assert_eq!(gone.code(), ErrorCode::NotFound);
+            let resp = delete_recorded(&rt, None, "c1").expect("delete");
+            assert_eq!(resp.image_ref(), CleanupOutcome::Removed);
+            assert_eq!(
+                rt.store
+                    .get(&GetStateRequest::new(id("c1")))
+                    .expect_err("gone")
+                    .code(),
+                ErrorCode::NotFound
+            );
+            assert_eq!(persisted_refs(&base), Vec::<String>::new());
+        }
+
+        /// OCI-7・#2499（条件 2）: 記録で解除した delete の後は、同じ ID・同じ digest の再 create が成功する。
+        #[test]
+        fn oci7_recreate_after_delete_without_image_root_succeeds() {
+            let base = TmpDir::new("img-recreate");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            delete_recorded(&rt, None, "c1").expect("delete");
+            recreate(&rt, &image, &base, "c1").expect("recreate");
+            assert_eq!(
+                persisted_refs(&base),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
+        }
+
+        /// OCI-7・#2499（条件 3）: 記録と違うストアを `--image-root` に渡した delete は `FAILED_PRECONDITION` で拒否し、
+        /// 状態も参照も残す。記録と同じストアなら成功する。
+        #[test]
+        fn oci7_delete_with_other_image_root_is_rejected() {
+            use fandhe_container_oci::image_management::ImageStore;
+            let base = TmpDir::new("img-other-image-root");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            let other = base.0.join("images-b");
+            std::fs::create_dir_all(&other).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            let store_b = ImageStore::open(&other).expect("open b");
+            let e = delete_recorded(&rt, Some(&store_b), "c1").expect_err("mismatch");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.exit_code().get(), 5);
+            assert!(rt.store.get(&GetStateRequest::new(id("c1"))).is_ok());
+            assert_eq!(
+                persisted_refs(&base),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
+            let resp = delete_recorded(&rt, Some(&image.store), "c1").expect("same root");
+            assert_eq!(resp.image_ref(), CleanupOutcome::Removed);
+            assert_eq!(persisted_refs(&base), Vec::<String>::new());
+        }
+
+        /// OCI-7・#2499（条件 4）: 在庫が空で `@container-refs.json` だけが残るストア（別プロセスが永続化した状態）でも、
+        /// 記録の root から開き直して参照を解除できる。
+        #[test]
+        fn oci7_delete_releases_reference_persisted_without_inventory() {
+            let base = TmpDir::new("img-no-inventory");
+            let rt = runtime_with(store(&base));
+            let _image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            let inventory = base.0.join("images").join("@image-inventory.json");
+            let _ = std::fs::remove_file(&inventory);
+            assert!(!inventory.exists());
+            let resp = delete_recorded(&rt, None, "c1").expect("delete");
+            assert_eq!(resp.image_ref(), CleanupOutcome::Removed);
+            // 開き直したストアで、登録そのものが無いこと（在庫に依らない確認）。
+            use fandhe_container_oci::image_management::ContainerRefId;
+            let fresh =
+                fandhe_container_oci::image_management::ImageStore::open(&base.0.join("images"))
+                    .expect("reopen");
+            let key = ContainerRefId::new(&crate::commands::image_refs::ref_key(
+                &scope_of(&base),
+                "c1",
+            ))
+            .expect("key");
+            assert_eq!(
+                fresh.container_ref_registration(&key).expect("lookup"),
+                None
+            );
+        }
+
+        /// OCI-7・#2499: 記録を持たない（イメージ無し・古い）コンテナは従来どおり。`--image-root` なしは通常の delete で
+        /// `image_ref` は対象外、ありなら解除を試みる（登録が無ければ `AlreadyAbsent`）。
+        #[test]
+        fn oci7_delete_without_record_keeps_legacy_behavior() {
+            let base = TmpDir::new("img-legacy");
+            let rt = runtime_with(store(&base));
+            do_create(&base, &store(&base), &OpRecorder::new(), "c1");
+            do_create(&base, &store(&base), &OpRecorder::new(), "c2");
+            let resp = delete_recorded(&rt, None, "c1").expect("plain");
+            assert_eq!(resp.image_ref(), CleanupOutcome::NotApplicable);
+            let images = images_store(&base, true);
+            let resp = delete_recorded(&rt, Some(&images), "c2").expect("explicit");
+            assert_eq!(resp.image_ref(), CleanupOutcome::AlreadyAbsent);
+        }
+
+        /// OCI-7・#2499: 記録の値は信頼しない。絶対パスでない値は `INTERNAL`、存在しない root は `NOT_FOUND` で拒否し、
+        /// どちらも状態を残す。
+        #[test]
+        fn oci7_delete_rejects_invalid_recorded_image_root() {
+            use fandhe_container_core::traits::{Annotations, CreateStateRequest};
+            let base = TmpDir::new("img-bad-record");
+            let rt = runtime_with(store(&base));
+            let missing = base.0.join("no-such-images");
+            for (name, value, code) in [
+                ("c1", "relative/path".to_string(), ErrorCode::Internal),
+                (
+                    "c2",
+                    missing.to_string_lossy().into_owned(),
+                    ErrorCode::NotFound,
+                ),
+            ] {
+                let status = ContainerStatus::created(id(name), None);
+                let req = CreateStateRequest::new(status, make_bundle(&base))
+                    .expect("req")
+                    .with_annotations(
+                        Annotations::new([(IMAGE_ROOT_ANNOTATION.to_string(), value)])
+                            .expect("ann"),
+                    );
+                rt.store.create(&req).expect("create state");
+                let e = delete_recorded(&rt, None, name).expect_err("rejected");
+                assert_eq!(e.code(), code, "{name}");
+                assert!(rt.store.get(&GetStateRequest::new(id(name))).is_ok());
+            }
         }
 
         /// OCI-7・#2315: 別の状態ルートの同名コンテナの `--image-root` つき delete は、状態ルート A の参照を外さない。
@@ -1723,7 +2015,7 @@ mod tests {
                 &OpRecorder::new(),
                 &remover,
                 &image.store,
-                &crate::commands::image_refs::state_scope(&root_b),
+                &crate::commands::image_refs::state_scope(&store_b).expect("scope b"),
                 &req,
             )
             .expect("delete in b");

@@ -31,7 +31,6 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use fandhe_container_core::observability::OpRecorder;
-use fandhe_container_core::state_store::StateRoot;
 use fandhe_container_core::traits::{
     ContainerId, ErrorCode, GetStateRequest, StateRecord, StateStore, TraitError,
 };
@@ -219,7 +218,7 @@ pub(super) fn reconcile_for_image_rm(
     let recorder = OpRecorder::new();
     let ok = (|| {
         let state = open_store(global).ok()?;
-        let scope = state_scope(&StateRoot::resolve(global.root.clone()).ok()?);
+        let scope = state_scope(&state).ok()?;
         reconcile_in_use(images, &state, &scope, candidates)
     })()
     .is_some();

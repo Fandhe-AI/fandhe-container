@@ -44,8 +44,15 @@ fn main() {
     println!("rootless_image_rootfs_remove: Linux only, not applicable on this OS");
 }
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 fn main() {
+    // 分類の自己照合（既定のテスト集合でも常に走る。出力はしない）。
+    precondition::self_check();
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--populate") {
         let dir = args.get(i + 1).expect("directory after --populate");
@@ -452,6 +459,8 @@ mod linux {
     pub fn run() {
         let euid = euid();
         assert_ne!(euid, 0, "this test must run as a non-root user");
+        // 前提（`USER`・`uidmap`・subuid / subgid の自ユーザー行）の欠如は回帰と見分けられる 1 行目で失敗させる（#2888）。
+        crate::precondition::require_subordinate_ids(euid);
         let sub = ImageRootfsPrivilege::SubordinateIds(source());
         let host = ImageRootfsPrivilege::HostEffectiveIds;
 

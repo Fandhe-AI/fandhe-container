@@ -58,6 +58,8 @@ mod real_entry;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。出力はしない。#2888）。
+    real_entry::precondition::self_check();
     if std::env::args().any(|a| a == "--entry") {
         linux::entry();
     } else if std::env::args().any(|a| a == "--ignored") {

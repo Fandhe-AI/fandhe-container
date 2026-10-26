@@ -41,9 +41,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::exec::{Entrypoint, IsolationPrivilege};
-use fandhe_container_core::landlock::{
-    LandlockRuleset, build_path_rules_with_dev, detect_landlock_abi,
-};
+use fandhe_container_core::landlock::{LandlockRuleset, build_path_rules_with_dev};
 use fandhe_container_core::oci_runtime::{
     ProcessLauncher, ProductionLauncher, SubordinateIdSource, parse_config_bytes,
 };
@@ -51,6 +49,12 @@ use fandhe_container_core::rootless::{
     IdMapSet, SubIdOwner, load_subordinate_ids, rootless_mapping,
 };
 use fandhe_container_core::traits::TraitError;
+
+/// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・REPAIR-12）。本モジュールを取り込む試験が
+/// `real_entry::precondition` として使う（`production_launcher` の委譲 cgroup・範囲写像の検査と各 `main` の自己照合）。
+#[allow(dead_code)] // 取り込み元によって使う関数が異なる
+#[path = "precondition.rs"]
+pub mod precondition;
 
 /// コンテナ内のエントリポイントのパス（rootfs の `/entry`）。
 pub const ENTRY_PATH: &str = "/entry";
@@ -253,8 +257,7 @@ pub fn entrypoint_from(args: &[String], env: &[String]) -> Entrypoint {
 pub fn landlock_ruleset() -> LandlockRuleset {
     let json = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},"mounts":[]}"#;
     let config = parse_config_bytes(json.as_bytes()).expect("valid config");
-    let support = detect_landlock_abi()
-        .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
+    let support = precondition::landlock_support();
     build_path_rules_with_dev(
         &support,
         config.root(),
@@ -425,6 +428,8 @@ pub fn wait_single_thread() {
 /// shadow-utils の subgid の第 1 欄はユーザー名か uid で、gid ではない）。
 #[allow(dead_code)] // 取り込み元によっては使わない
 pub fn helper_mappings(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
+    // 前提（USER・helper・自ユーザーの行）の欠如は、回帰と見分けられる 1 行目で失敗させる（#2888）。
+    precondition::require_subordinate_ids(euid);
     let name = std::env::var("USER").ok();
     let owner = SubIdOwner::new(euid, name).expect("subid owner");
     let uranges = load_subordinate_ids(Path::new("/etc/subuid"), &owner).expect("load /etc/subuid");

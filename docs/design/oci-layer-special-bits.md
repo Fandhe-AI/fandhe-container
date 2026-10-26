@@ -13,7 +13,7 @@ setuid / setgid / sticky を常に落とし、件数を `ExtractedLayer::files_w
 
 `SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid }`（opt-in）を渡した呼び出しだけが、下表の条件を満たすビットを
 tar の値のまま適用する。満たさないものは落とす（fail-closed）。既存の入口は `Strip` のままで挙動を変えない。
-新しい入口は `extract_layers_with_policy` / `extract_layer_blobs_with_policy`。
+新しい入口は `extract_layers_with_policy` / `extract_image_layers_with_policy`（パスで開く旧入口 `extract_layer_blobs_with_*` は #2535 で廃止した）。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
@@ -66,7 +66,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 ## 所有者の適用（chown。#2225・SEC-5）
 
 `ExtractOptions { ownership, special_bits }` を受ける入口 `extract_layers_with_options` /
-`extract_layer_blobs_with_options` を足した（既存の `*_with_policy` はこれへ委譲し、挙動は変えない）。
+`extract_image_layers_with_options`（当時はパス版の `extract_layer_blobs_with_options`。#2535 で廃止）を足した（既存の `*_with_policy` はこれへ委譲し、挙動は変えない）。
 `OwnershipPolicy::ChownMapped { uid, gid }`（複数行の写像 `IdMap`。core の `IdMapSet::new` と同じ検証規則で、
 `tests/idmap_core_parity.rs` が同じ入力の表で照合する）を渡すと、tar の uid / gid を写像してホストの ID へ `chown` する。
 既定は `Keep`（`chown` しない）。

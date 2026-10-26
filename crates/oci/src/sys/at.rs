@@ -228,7 +228,8 @@ pub(crate) fn renameat_names(
 ) -> io::Result<()> {
     let o = component_cstring(old_name)?;
     let n = component_cstring(new_name)?;
-    // SAFETY: `o` と `n` は NUL 終端で呼び出しの間生きる。2 つの fd は借用の間有効。
+    // SAFETY: `o` と `n` は `component_cstring` で「空・`.`・`..`・`/`・NUL を含まない 1 コンポーネント」と検証済みで、
+    // 名前解決が dirfd の外へ出ない。どちらも NUL 終端で呼び出しの間生きる。2 つの fd は借用の間有効。
     check(unsafe { renameat(raw(old_dir), o.as_ptr(), raw(new_dir), n.as_ptr()) })
 }
 
@@ -249,7 +250,8 @@ pub(crate) fn linkat_names(
 ) -> io::Result<()> {
     let o = component_cstring(old_name)?;
     let n = component_cstring(new_name)?;
-    // SAFETY: `o` と `n` は NUL 終端で呼び出しの間生きる。2 つの fd は借用の間有効。
+    // SAFETY: `o` と `n` は `component_cstring` で「空・`.`・`..`・`/`・NUL を含まない 1 コンポーネント」と検証済みで、
+    // 名前解決が dirfd の外へ出ない。どちらも NUL 終端で呼び出しの間生きる。2 つの fd は借用の間有効。
     check(unsafe { linkat(raw(old_dir), o.as_ptr(), raw(new_dir), n.as_ptr(), 0) })
 }
 

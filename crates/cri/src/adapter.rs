@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_core::traits::{
-    CleanupOutcome, ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
-    DeleteRequest, DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
-    TerminationReason, TraitError,
+    CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
+    ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
+    StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
 use tonic::Status;
 
@@ -395,7 +395,19 @@ impl RuntimeAdapter {
 
     /// `created` 状態のコンテナを開始する。
     pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
-        let req = StartRequest::new(Self::id(id)?);
+        self.start_with_log_path(id, None)
+    }
+
+    /// CRI ログの書き先つきで開始する（CRI-2・SUP-4・#2671）。`None` は [`Self::start`] と同じ。
+    pub fn start_with_log_path(
+        &self,
+        id: &str,
+        log_path: Option<ContainerLogPath>,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let mut req = StartRequest::new(Self::id(id)?);
+        if let Some(log_path) = log_path {
+            req = req.with_log_path(log_path);
+        }
         Self::finish(id, self.runtime.start(&req))
     }
 

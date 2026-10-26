@@ -56,3 +56,10 @@ harness = false
 name = "userns_extract"
 path = "tests/userns_extract.rs"
 harness = false
+
+# root 配下の別マウント（実マウント）がイメージストアで FailedPrecondition になることの実機前提試験（#2701・OCI-7・SEC-1・ERR-1）。
+# `unshare` で子を user / mount namespace へ入れる単一スレッドの独自 main。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "image_store_xdev"
+path = "tests/image_store_xdev.rs"
+harness = false

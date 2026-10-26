@@ -25,6 +25,6 @@ pub use spec::{
     BundleFiles, ImageDefaults, PodNamespacePaths, RuntimeConfigJson, build_runtime_config,
     build_runtime_config_with_files, build_runtime_config_with_files_and_pod_namespaces,
     build_runtime_config_with_files_and_pod_netns, build_runtime_config_with_files_and_pods,
-    build_runtime_config_with_pod_namespaces, build_runtime_config_with_pod_netns, validate_config,
-    validate_config_with_pod_namespaces,
+    build_runtime_config_with_pod_namespaces, build_runtime_config_with_pod_netns,
+    resolve_log_path, validate_config, validate_config_with_pod_namespaces,
 };

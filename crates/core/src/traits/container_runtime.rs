@@ -172,17 +172,83 @@ impl CreateRequest {
 #[non_exhaustive]
 pub struct StartRequest {
     id: ContainerId,
+    log_path: Option<ContainerLogPath>,
 }
 
 impl StartRequest {
-    /// 対象コンテナの ID から要求を作る。
+    /// 対象コンテナの ID から要求を作る（CRI ログの書き先なし）。
     pub fn new(id: ContainerId) -> Self {
-        Self { id }
+        Self { id, log_path: None }
+    }
+
+    /// CRI ログの書き先（`log_directory/log_path` を結合・検証済みの絶対パス）を付ける
+    /// （CRI-2・SUP-4・#2671）。supervisor はコンテナ出力を CRI ログ形式でこのパスへ書く。
+    #[must_use]
+    pub fn with_log_path(mut self, log_path: ContainerLogPath) -> Self {
+        self.log_path = Some(log_path);
+        self
     }
 
     /// 対象コンテナの ID を返す。
     pub fn id(&self) -> &ContainerId {
         &self.id
+    }
+
+    /// CRI ログの書き先を返す。`None` は CRI ログなし（従来どおり）。
+    pub fn log_path(&self) -> Option<&ContainerLogPath> {
+        self.log_path.as_ref()
+    }
+}
+
+/// [`ContainerLogPath::new`] が受理するバイト長の上限（argv の 1 要素の上限と同じ 4096）。
+pub const CONTAINER_LOG_PATH_MAX_BYTES: usize = 4096;
+
+/// CRI ログの書き先パス（検証済みの絶対 POSIX パス。CRI-2・SUP-4・#2671）。
+///
+/// CRI の `log_directory` と `log_path` を cri crate が結合した結果を、
+/// [`StartRequest`] 経由で plugin-cri → supervisor の argv（`--cri-log-path`）へ運ぶ。
+/// supervisor 側でも外部入力として同じ検証を再度通す。
+///
+/// ログのパスは Linux の supervisor ホスト上のパスであり、[`Signal`] が Linux の番号体系を使うのと
+/// 同じ理由で、ホストの `Path` の意味（Windows の `is_absolute` 等）に依らない POSIX 文字列として
+/// 検証する（3 OS で同じ結果になる）。
+///
+/// 不変条件: 先頭が `/`、`/` 区切りの各要素が空でなく `.`・`..` でもない（連続する `/`・末尾の `/` は拒否）、
+/// NUL と制御文字を含まない、2〜[`CONTAINER_LOG_PATH_MAX_BYTES`] バイト。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContainerLogPath(String);
+
+impl ContainerLogPath {
+    /// 文字列を検証して作る。違反は [`ErrorCode::InvalidArgument`]（メッセージに値を含めない）。
+    pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
+        let value = value.into();
+        let invalid = || {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "container log path must be a normalized absolute path",
+            )
+        };
+        if value.len() < 2 || value.len() > CONTAINER_LOG_PATH_MAX_BYTES {
+            return Err(invalid());
+        }
+        let Some(rest) = value.strip_prefix('/') else {
+            return Err(invalid());
+        };
+        if value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        if rest
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(invalid());
+        }
+        Ok(Self(value))
+    }
+
+    /// 検証済みのパス文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -623,6 +689,42 @@ impl DeleteResponse {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// CRI-2・SUP-4（#2671）: `ContainerLogPath` の受理と拒否。
+    #[test]
+    fn container_log_path_validation() {
+        let ok = ContainerLogPath::new("/var/log/pods/ns_p_uid/c/0.log").expect("ok");
+        assert_eq!(ok.as_str(), "/var/log/pods/ns_p_uid/c/0.log");
+        let long_ok = format!("/{}", "a".repeat(CONTAINER_LOG_PATH_MAX_BYTES - 1));
+        assert!(ContainerLogPath::new(long_ok).is_ok());
+        let too_long = format!("/{}", "a".repeat(CONTAINER_LOG_PATH_MAX_BYTES));
+        for bad in [
+            "",
+            "/",
+            "rel/x.log",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/b/",
+            "/a/\0b",
+            "/a/\nb",
+            "/a/\rb",
+            too_long.as_str(),
+        ] {
+            let e = ContainerLogPath::new(bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad:?}");
+        }
+    }
+
+    /// CRI-2・SUP-4（#2671）: `StartRequest` は既定で書き先なし、付けると返す。
+    #[test]
+    fn start_request_log_path_roundtrip() {
+        let id = sample_id();
+        assert!(StartRequest::new(id.clone()).log_path().is_none());
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("ok");
+        let req = StartRequest::new(id).with_log_path(lp.clone());
+        assert_eq!(req.log_path(), Some(&lp));
+    }
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
     struct StubRuntime;

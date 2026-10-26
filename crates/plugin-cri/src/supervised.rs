@@ -43,12 +43,12 @@ use fandhe_container_core::oci_runtime::{
     KillTimeout, LifecycleOp, OciRuntimeError, ProcessSignaler, kill,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, KillRequest, Signal,
-    StateStore, StopRequest, TraitError,
+    ContainerId, ContainerLogPath, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
+    KillRequest, Signal, StateStore, StopRequest, TraitError,
 };
 use fandhe_container_supervisor::control::{production_signaler, production_stop_signaler};
 use fandhe_container_supervisor::start_client::{
-    SupervisorLaunch, production_deadline, start_with,
+    SupervisorLaunch, production_deadline, start_with_cri_log,
 };
 
 /// 追跡する supervisor の子プロセスの上限。超えたら（回収しても空きが無ければ）新しい起動を拒否する（無制限の蓄積を防ぐ）。
@@ -71,9 +71,12 @@ pub const MSG_STOP_DEADLINE: &str = "container did not stop within the deadline"
 /// [`SupervisedLifecycle::start`] だけが呼ぶ。戻りの `Child` は呼び出し側が回収する（wait も kill もこの口では行わない）。
 pub trait SupervisorStarter: Send + Sync {
     /// `root`（状態ルートの絶対パス）の `id` を起動し、pid か構造化エラーを期限つきで受け取る。
+    ///
+    /// `log_path` は CRI ログの書き先（supervisor の `--cri-log-path`。CRI-2・SUP-4・#2671）。`None` は従来どおり。
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>);
 }
@@ -87,6 +90,7 @@ impl SupervisorStarter for ProductionStarter {
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
         let exe = match std::env::current_exe() {
@@ -103,7 +107,7 @@ impl SupervisorStarter for ProductionStarter {
             }
         };
         match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => start_with(&launch, root, id, production_deadline()),
+            Ok(launch) => start_with_cri_log(&launch, root, log_path, id, production_deadline()),
             Err(e) => (Err(e), None),
         }
     }
@@ -129,9 +133,10 @@ impl SupervisorStarter for FixedLaunchStarter {
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        start_with(&self.launch, root, id, self.within)
+        start_with_cri_log(&self.launch, root, log_path, id, self.within)
     }
 }
 
@@ -215,10 +220,14 @@ impl SupervisedLifecycle {
     }
 
     /// supervisor を起動して Running を返す（D6）。
+    ///
+    /// `log_path` は CRI ログの書き先（`StartRequest::log_path`。CRI-2・SUP-4・#2671）。supervisor へ `--cri-log-path` で渡し、
+    /// supervisor が再検証して CRI 形式で追記する（特権ランチャー経由では supervisor が拒否する）。
     pub fn start(
         &self,
         store: &dyn StateStore,
         id: &ContainerId,
+        log_path: Option<&ContainerLogPath>,
     ) -> Result<ContainerStatus, TraitError> {
         self.reap();
         let Some(root) = store.host_state_root() else {
@@ -238,7 +247,7 @@ impl SupervisedLifecycle {
             }
             self.reserved.fetch_add(1, Ordering::SeqCst);
         }
-        let (result, child) = self.starter.start(root, id);
+        let (result, child) = self.starter.start(root, log_path, id);
         {
             // 予約を解放し、Child を得たなら同じロックの下で追跡枠へ移す。
             let mut children = self.lock_children();

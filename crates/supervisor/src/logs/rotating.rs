@@ -760,6 +760,22 @@ const LOCK_SUFFIX: &str = ".lock";
 /// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
 /// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
 fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
+    acquire_lock_with(dir, base, LOCK_RETRY, || {
+        std::thread::sleep(LOCK_RETRY.interval)
+    })
+}
+
+/// [`acquire_lock`] の本体。再試行方針 `retry` と、再試行の待ち `sleep` を差し込めるようにしたもの。
+///
+/// 本番は [`acquire_lock`] が [`LOCK_RETRY`] と実時間の sleep を渡す（待ちの総量は従来どおり有界。REPAIR-5）。
+/// 注入口は、共有ロックの解放を「1 回目の `WouldBlock` の直後」に同期させて試験を実時間の競争に
+/// 依存させないために設けた（macOS の間欠失敗の是正。#2911・CLI-1・SUP-7・REPAIR-12）。
+fn acquire_lock_with(
+    dir: &Path,
+    base: &str,
+    retry: RenameRetry,
+    mut sleep: impl FnMut(),
+) -> Result<File, TraitError> {
     let path = lock_path(dir, base);
     let mut create = OpenOptions::new();
     create.write(true).create_new(true);
@@ -789,12 +805,12 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
     };
     // 読み手の稼働検査（[`sink_is_active`]）が一瞬だけ共有ロックを持つことがあるため、`WouldBlock` は
     // 有界で再試行して吸収する（合計 40ms 程度。REPAIR-5）。本物の sink が使用中なら、尽きたあと従来どおり拒否する。
-    let mut sleeps_left = LOCK_RETRY.max_sleeps;
+    let mut sleeps_left = retry.max_sleeps;
     let locked = loop {
         match file.try_lock() {
             Err(std::fs::TryLockError::WouldBlock) if sleeps_left > 0 => {
                 sleeps_left -= 1;
-                std::thread::sleep(LOCK_RETRY.interval);
+                sleep();
             }
             r => break r,
         }

@@ -1591,7 +1591,12 @@ fn cli1_sink_is_active_rejects_symlinked_lock() {
     assert_ne!(e.code(), ErrorCode::NotFound);
 }
 
-/// 検査が共有ロックを短時間持っている間の open は、有界の再試行で成功する。本物の sink が使用中なら拒否のまま。
+/// 検査が共有ロックを短時間持っている間の open は、有界の再試行で成功する。本物の sink が使用中なら
+/// 再試行が尽きたあと拒否のまま（CLI-1・SUP-7・REPAIR-12）。
+///
+/// 実時間の競争を避けるため、共有ロックの解放は `acquire_lock_with` に注入した sleep の中
+/// （1 回目の `WouldBlock` の直後）で行う。flock は open file description 単位なので、同一プロセス内の
+/// 別 fd でも競合し、順序はスレッドも待ち時間も使わずに確定する（#2911）。
 #[cfg(unix)]
 #[test]
 fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
@@ -1599,14 +1604,23 @@ fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
     let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
     let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    // 使用中の sink がある間は、再試行がちょうど尽きてから拒否される。
+    let mut calls = 0u32;
+    let e = acquire_lock_with(&t.0, "c1.log", LOCK_RETRY, || calls += 1).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(calls, LOCK_RETRY.max_sleeps);
     drop(s);
+
+    // 共有ロックが 1 回目の待ちの中で解放されれば、2 回目の試行で取れる。
     let probe = fs::File::open(t.0.join("c1.log.lock")).unwrap();
     probe.lock_shared().unwrap();
-    let h = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(15));
+    let mut calls = 0u32;
+    let r = acquire_lock_with(&t.0, "c1.log", LOCK_RETRY, || {
+        calls += 1;
         probe.unlock().unwrap();
     });
-    let s2 = RotatingFileSink::open(&t.0, &id(), small());
-    h.join().unwrap();
-    assert!(s2.is_ok());
+    assert!(r.is_ok());
+    assert_eq!(calls, 1);
+    drop(r);
+    assert!(RotatingFileSink::open(&t.0, &id(), small()).is_ok());
 }

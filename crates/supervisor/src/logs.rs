@@ -137,7 +137,7 @@ pub const CONTAINER_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duratio
 
 /// [`remove_container_logs`] を作業スレッドで `timeout` までだけ待って実行する（REPAIR-5）。
 ///
-/// 期限切れ・同時実行枠の満杯・スレッド起動失敗のときは `Timeout` のエラーを返す（作業スレッドは残り得る）。
+/// 期限切れ・スレッド起動失敗のときは `Timeout`、同時実行枠の満杯（何も実行していない）のときは `ResourceExhausted` のエラーを返す（`Timeout` では作業スレッドは残り得る）。
 /// 同時実行枠は supervisor ログの削除と共有する。core の `delete` より前には呼ばない。
 pub fn remove_container_logs_bounded(
     root: &std::path::Path,
@@ -157,18 +157,26 @@ pub fn remove_container_logs_guarded_bounded(
     timeout: std::time::Duration,
     guard: impl Fn() -> bool + Send + 'static,
 ) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    use crate::supervisor_log::BoundedFailure;
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     let root = root.to_path_buf();
     let id = id.clone();
-    crate::supervisor_log::run_bounded(
+    crate::supervisor_log::run_bounded_classified(
         move || remove_container_logs_guarded(&root, &id, &guard),
         timeout,
     )
-    .unwrap_or_else(|| {
-        Err(TraitError::new(
-            ErrorCode::Timeout,
-            "container log removal did not finish within the deadline",
-        ))
+    .unwrap_or_else(|f| {
+        Err(match f {
+            // 枠が満杯（何も実行していない）。この削除自身の期限切れと区別する（#2760）。
+            BoundedFailure::Busy => TraitError::new(
+                ErrorCode::ResourceExhausted,
+                "container log removal workers are busy",
+            ),
+            BoundedFailure::Unfinished => TraitError::new(
+                ErrorCode::Timeout,
+                "container log removal did not finish within the deadline",
+            ),
+        })
     })
 }
 
@@ -301,18 +309,40 @@ pub fn sweep_stale_container_logs(
     let started = Instant::now();
     let mut report = SweepReport::default();
     let dir = container_log_dir(root);
-    match std::fs::symlink_metadata(&dir) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => return report,
-        Err(_) => {
+    // 初期検査と列挙も無期限に止まり得る（応答しない FUSE 等）ため、残り予算で期限つきの作業スレッドに包む（REPAIR-5）。
+    enum Initial {
+        Missing,
+        Failed,
+        Scan(rotating::StaleLogScan),
+    }
+    let Some(first) = budget
+        .checked_sub(started.elapsed())
+        .filter(|r| !r.is_zero())
+    else {
+        report.timed_out = true;
+        return report;
+    };
+    let initial = crate::supervisor_log::run_bounded(
+        move || match std::fs::symlink_metadata(&dir) {
+            Ok(_) => match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
+                Ok(s) => Initial::Scan(s),
+                Err(_) => Initial::Failed,
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => Initial::Missing,
+            Err(_) => Initial::Failed,
+        },
+        first,
+    );
+    let scan = match initial {
+        Some(Initial::Scan(s)) => s,
+        Some(Initial::Missing) => return report,
+        Some(Initial::Failed) => {
             report.failed = 1;
             return report;
         }
-    }
-    let scan = match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
-        Ok(s) => s,
-        Err(_) => {
-            report.failed = 1;
+        // 期限切れ・枠の満杯・起動失敗。作業スレッドは残り得るので打ち切る。
+        None => {
+            report.timed_out = true;
             return report;
         }
     };
@@ -356,8 +386,8 @@ pub fn sweep_stale_container_logs(
             Err(e) if e.code() == ErrorCode::FailedPrecondition => {
                 report.skipped_live = report.skipped_live.saturating_add(1);
             }
-            Err(e) if e.code() == ErrorCode::Timeout => {
-                // 作業スレッドが残り得る。これ以上の試行を重ねず打ち切る。
+            Err(e) if matches!(e.code(), ErrorCode::Timeout | ErrorCode::ResourceExhausted) => {
+                // 作業スレッドが残り得る、または枠が満杯。これ以上の試行を重ねず打ち切る。
                 report.timed_out = true;
                 break;
             }

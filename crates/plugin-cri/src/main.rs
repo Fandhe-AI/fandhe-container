@@ -122,7 +122,10 @@ fn serve(socket: &std::path::Path) -> ExitCode {
                 &sweep_recorder,
                 adapter::STARTUP_LOG_SWEEP_BUDGET,
             ) {
-                let _ = telemetry::stderr_sink().submit(adapter::sweep_summary_line(&report));
+                // 走査に何も無かった（空の状態ルート等）ときは出さない。起動の失敗時の stderr を静かに保つ。
+                if report != Default::default() {
+                    let _ = telemetry::stderr_sink().submit(adapter::sweep_summary_line(&report));
+                }
             }
         }));
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。

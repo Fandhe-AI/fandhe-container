@@ -1131,6 +1131,8 @@ mod tests {
             StaleLogReclaim::Removed(2),
             StaleLogReclaim::Nothing,
             StaleLogReclaim::Failed(ErrorCode::FailedPrecondition),
+            // 作業スレッドの枠が満杯（何も実行していない）。create を恒久的に失敗させない（#2760）。
+            StaleLogReclaim::Failed(ErrorCode::ResourceExhausted),
         ] {
             assert!(reclaim_timeout_result(ok).is_ok());
         }

@@ -140,7 +140,17 @@ fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
 }
 
 /// socket の出現と接続の成功を、全体の期限内で待つ。`guard` があり子が先に終了したら診断つきで失敗する。
-async fn connect_when_ready(sock: &Path, mut guard: Option<&mut ChildGuard>) -> Channel {
+async fn connect_when_ready(sock: &Path, guard: Option<&mut ChildGuard>) -> Channel {
+    connect_when_ready_with(sock, guard, GrpcClientConfig::new()).await
+}
+
+/// `connect_when_ready` の設定指定版。Channel の request timeout（既定 10 秒）が
+/// `call_with_deadline` の長い期限（PullImage 300 秒等）より先に効かないよう、実機経路で使う（REPAIR-5）。
+async fn connect_when_ready_with(
+    sock: &Path,
+    mut guard: Option<&mut ChildGuard>,
+    config: GrpcClientConfig,
+) -> Channel {
     let start = Instant::now();
     loop {
         if let Some(guard) = guard.as_deref_mut()
@@ -154,12 +164,8 @@ async fn connect_when_ready(sock: &Path, mut guard: Option<&mut ChildGuard>) -> 
             panic!("plugin binary exited early: {status:?}: {err}");
         }
         if sock.exists() {
-            match connect_uds_channel(
-                sock,
-                &GrpcClientConfig::new(),
-                Box::new(JsonLinesPeerAuthObserver::new()),
-            )
-            .await
+            match connect_uds_channel(sock, &config, Box::new(JsonLinesPeerAuthObserver::new()))
+                .await
             {
                 Ok(ch) => return ch,
                 Err(e)
@@ -812,7 +818,12 @@ async fn production_binary_full_lifecycle_real() {
         let dir = TempDir::new("sock-real");
         let sock = dir.0.join("s.sock");
         let mut guard = spawn_server_inherit_env(&sock);
-        let ch = connect_when_ready(&sock, Some(&mut guard)).await;
+        // Channel の request timeout を pull の期限（300 秒）以上にする。既定の 10 秒だと
+        // call_with_deadline の長い期限より先に打ち切られる（REPAIR-5・REPAIR-12）。
+        let config = GrpcClientConfig::new()
+            .with_request_timeout(Duration::from_secs(600))
+            .expect("request timeout");
+        let ch = connect_when_ready_with(&sock, Some(&mut guard), config).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
         let mut images = ImageServiceClient::new(ch.clone());
 

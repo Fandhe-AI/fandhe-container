@@ -795,7 +795,7 @@ pub fn bundle_provider_in(
 /// [`bundle_provider_in`] に、タグ・digest 参照を image ID へ解決する在庫 `store` を足した形（CRI-2・CRI-3。#2592）。
 ///
 /// `store` は `ImageService` と同じものを渡す。`None` なら image ID（`sha256:<hex>`）だけを受ける。展開設定は
-/// [`production_pull_config`]（`ImageService` の pull と同じ値）から `ImageExtractConfig::from_pull_config` で作る。
+/// `production_pull_config`（`ImageService` の pull と同じ値）から `ImageExtractConfig::from_pull_config` で作る。
 #[cfg(unix)]
 pub fn bundle_provider_with(
     state_root: &std::path::Path,

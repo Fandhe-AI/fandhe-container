@@ -31,6 +31,7 @@ use fandhe_container_core::traits::{
 use tonic::Status;
 
 use crate::error::{CriError, CriErrorCode};
+use crate::port_mapping::PodPortPublish;
 use crate::runtime::v1::ContainerState as CriContainerState;
 use crate::runtime::v1::{ContainerConfig, PodSandboxConfig};
 
@@ -292,14 +293,32 @@ pub trait PodNetworkProvider: Send + Sync {
 pub struct PodNetworkRequest<'a> {
     /// サンドボックス ID（`RunPodSandbox` が採番した値）。
     pub sandbox_id: &'a str,
-    /// サンドボックスの設定（port_mappings・dns_config 等。現状の実装は読まない）。
+    /// サンドボックスの設定（dns_config 等。現状の実装は読まない）。公開指定は [`Self::port_publishes`] を使い、
+    /// `config.port_mappings` を直接読まない（検証済みの値だけを下流へ流すため）。
     pub config: &'a PodSandboxConfig,
+    /// 検証済みの公開指定（`port_mappings` のうち `host_port > 0` のもの。#2676・CRI-2・NET-3）。
+    port_publishes: &'a [PodPortPublish],
 }
 
 impl<'a> PodNetworkRequest<'a> {
-    /// 各項目から入力を作る。
+    /// 各項目から入力を作る。公開指定は空（[`Self::with_port_publishes`] で足す）。
     pub fn new(sandbox_id: &'a str, config: &'a PodSandboxConfig) -> Self {
-        Self { sandbox_id, config }
+        Self {
+            sandbox_id,
+            config,
+            port_publishes: &[],
+        }
+    }
+
+    /// 検証済みの公開指定を足す。
+    pub fn with_port_publishes(mut self, port_publishes: &'a [PodPortPublish]) -> Self {
+        self.port_publishes = port_publishes;
+        self
+    }
+
+    /// 検証済みの公開指定。`set_up` はこれをすべて公開するか、失敗して資源を残さない。
+    pub fn port_publishes(&self) -> &'a [PodPortPublish] {
+        self.port_publishes
     }
 }
 

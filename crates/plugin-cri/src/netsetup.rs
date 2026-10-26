@@ -14,7 +14,7 @@
 //! | `net-create` | `create_network` | `network::create_network` と `StaticIpam::for_network` |
 //! | `netns-create` | `create_netns` | `network::create_container_netns`（netns の作成と pin。#2675） |
 //! | `veth-attach` | `attach` | `network::attach_prepared_container`（事前作成の netns へ接続） |
-//! | `publish-port` | `publish_port` | 未実装（`Unimplemented`） |
+//! | `publish-port` | `publish_port` | `network::publish_container_ports`（attach 済みコンテナへ DNAT を追加。#2676） |
 //! | （なし） | `detach` | 未 attach の記録の取り消しと事前作成 netns の解放（`network::release_container_netns`）、attach の取り残しの回収（`network::reclaim_failed_attach`）。attach 済みは `Unimplemented` |
 //! | `net-delete` | `delete_network` | `network::delete_network` |
 //!
@@ -51,8 +51,10 @@
 //!   [`ReclaimStore`]（`<状態ルート>/.cri/net/pending-reclaim/<名前>.claim`）に永続化し、plugin の再起動後に
 //!   読み込んで `delete_network` で回収する（#2604。`docs/design/network-reclaim-persistence.md`、手動の手順は
 //!   `docs/setup/network-reclaim-recovery.md`）。置き場を差さない構成（`new`・`with_recorder`）はメモリだけ
-//! - `publish_port`: net はポート公開を attach 時の `ContainerAttachSpec::with_port_publishes` でしか受けず、
-//!   コンテナ単位の公開・解除が未実装のため `Unimplemented`（NET-4）
+//! - `publish_port`（#2676・NET-4）: attach 済みコンテナへ DNAT を追加する。ホスト側 bind IP（`host_ip`）は
+//!   明示した IPv4 だけ受け、未指定・IPv6 は `Unimplemented`（全アドレスへの公開を黙って作らない）。契約 11 は
+//!   全ネットワーク共通の `(host_port, protocol)` で本層が判定する（net の予約表はネットワークごとのため）。
+//!   公開の個別解除は無く、`delete_network` が一括で解放する。他プロセスとの受け口の衝突は検出しない
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
 //!   併用できないため `Unimplemented`（契約 10。カーネル操作の前に判定する）
@@ -89,21 +91,28 @@ use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
     DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, DetachResponse, ErrorCode, IpCidr,
-    NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping,
+    NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol,
     PublishPortRequest, TraitError,
 };
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::netlink_route::IpPrefix;
-use fandhe_container_net::network::{EndpointId, NetworkName as NetName};
+use fandhe_container_net::network::{
+    EndpointId, MAX_PORT_PUBLISHES, NetworkName as NetName, PortProtocol, PortPublish,
+};
 
 /// 1 つの plugin プロセスが保持するネットワークの上限（信頼できない入力で状態が増え続けないようにする）。
 pub const MAX_NETWORKS: usize = 128;
 /// 1 つのネットワークが保持するコンテナの上限。
 pub const MAX_CONTAINERS_PER_NETWORK: usize = 256;
 
-/// 未実装文言（固定。入力を含めない）。
-pub const MSG_PUBLISH_PORT_UNAVAILABLE: &str =
-    "publish_port is not available yet: net accepts port publishes only at attach time";
+/// `publish_port` にホスト側 bind IP が無いときの未実装文言（固定。入力を含めない）。
+pub const MSG_PUBLISH_PORT_HOST_IP_REQUIRED: &str =
+    "publish_port requires an explicit IPv4 host_ip: publishing on all addresses is not supported";
+/// `publish_port` の IPv6 のホスト側 bind IP の未実装文言。
+pub const MSG_PUBLISH_PORT_IPV6_UNSUPPORTED: &str =
+    "publish_port supports IPv4 host_ip only: IPv6 publishing is not supported";
+/// `publish_port` の SCTP 等の未対応プロトコルの文言。
+pub const MSG_PUBLISH_PORT_PROTOCOL_UNSUPPORTED: &str = "publish_port supports tcp and udp only";
 /// attach 済みコンテナの切り離しの未実装文言。
 pub const MSG_DETACH_UNAVAILABLE: &str =
     "detach of an attached container is not available yet: net has no per-container teardown";
@@ -197,6 +206,15 @@ fn gateway_for(subnet: IpCidr) -> Result<IpPrefix, TraitError> {
 pub trait NetsetupContainer {
     /// エンドポイント ID（`ContainerId` と同じ文字列）。
     fn endpoint_id(&self) -> &str;
+}
+
+/// [`NetsetupBackend::publish_port`] の失敗。
+#[derive(Debug)]
+pub struct PublishFailure {
+    /// 失敗の原因。
+    pub error: TraitError,
+    /// DNAT ルールが入っている可能性がある（結果不明）。真のとき受け口の記録を保持する。
+    pub rules_unknown: bool,
 }
 
 /// [`NetsetupBackend::attach`] の成功結果。
@@ -401,6 +419,26 @@ pub trait NetsetupBackend: Send + Sync {
         endpoint: &EndpointId,
     ) -> Result<AttachOutcome<Self::Container>, AttachFailure<Self::FailedAttach>>;
 
+    /// attach 済みコンテナへ DNAT で受け口を 1 件公開する（NET-4・#2676）。既定は `Unimplemented`
+    /// （未対応のバックエンドが成功を装わないため）。
+    ///
+    /// 結果が不明（DNAT ルールが入っている可能性がある）なら `rules_unknown` を立てて返す。呼び出し側は
+    /// 契約 11 の記録を保持し、解放は `delete_network` に任せる。
+    fn publish_port(
+        &self,
+        _network: &mut Self::Network,
+        _container: &Self::Container,
+        _publish: &PortPublish,
+    ) -> Result<(), PublishFailure> {
+        Err(PublishFailure {
+            error: TraitError::new(
+                ErrorCode::Unimplemented,
+                "publish_port is not supported by this backend",
+            ),
+            rules_unknown: false,
+        })
+    }
+
     /// ネットワークと、渡した attach 済みコンテナを解放する（契約 9）。
     fn delete_network(
         &self,
@@ -429,6 +467,9 @@ struct ContainerEntry<C, A> {
     quarantine_held: bool,
     /// 取り残しを所有確認つきで回収するための請求書。`None` は所有を証明できない取り残しで、手動回収。
     claim: Option<A>,
+    /// このコンテナが公開した受け口（契約 11 の判定キー。結果不明の公開を含む）。コンテナの記録と一緒に消える
+    /// （`delete_network` の成功で記録ごと外れ、受け口は再公開できる）。件数は `MAX_PORT_PUBLISHES` で有界。
+    published: Vec<(u16, Protocol)>,
 }
 
 /// 作成済みネットワーク 1 件の記録。
@@ -449,6 +490,9 @@ struct NetworkEntry<N, F> {
     /// ネットワークの記録（`CreatedNetwork`・IPAM）は永続化されていない（#1870）ため `handle` は無く、bridge・nft
     /// テーブルは自動回収しない。取り残した veth・pin の回収に使い、回収し終えたら外す。
     recovered: bool,
+    /// delete_network の部分失敗でコンテナの記録を外したあとも、専用 nft テーブル（DNAT）が残りうる受け口。
+    /// テーブルの削除を確認してネットワークの記録ごと外れるまで契約 11 の衝突判定に使う（fail-closed）。
+    orphan_published: Vec<(u16, Protocol)>,
 }
 
 /// 作成失敗で取り残した資源の回収待ちの記録。
@@ -532,6 +576,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     handle: None,
                     leaked: Some(LeakedCreate { claim }),
                     recovered: false,
+                    orphan_published: Vec::new(),
                 },
             );
         }
@@ -565,6 +610,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                         handle: None,
                         leaked: None,
                         recovered: true,
+                        orphan_published: Vec::new(),
                     },
                 );
             }
@@ -587,6 +633,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     claim: Some(claim),
                     // 再起動前のハンドルはプロセスと一緒に失われている（pin は手動回収。#2675）。
                     netns_retained: false,
+                    published: Vec::new(),
                 },
             );
         }
@@ -741,6 +788,10 @@ fn network_deleting() -> TraitError {
     )
 }
 
+fn not_attached() -> TraitError {
+    TraitError::new(ErrorCode::NotFound, "container is not attached")
+}
+
 fn network_mismatch() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -802,6 +853,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 handle,
                 leaked,
                 recovered: false,
+                orphan_published: Vec::new(),
             },
         );
         result?;
@@ -862,6 +914,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                         // create_netns の取り残しは net の請求書の対象外（attach の取り残しだけ。#2681）。
                         quarantine_held: false,
                         claim: None,
+                        published: Vec::new(),
                     },
                 );
             }
@@ -877,6 +930,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 netns_retained: false,
                 quarantine_held: false,
                 claim: None,
+                published: Vec::new(),
             },
         );
         Ok(NetnsStatus::new(req.container().clone(), netns))
@@ -972,6 +1026,118 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             address,
             network.gateway.map(|g| g.addr()),
         ))
+    }
+
+    fn publish_port_impl(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
+        // 入力の検証（バックエンドを呼ぶ前）。ホスト側 bind IP は明示した IPv4 だけ受ける。
+        let host_ip = match req.host_ip() {
+            Some(IpAddr::V4(ip)) => ip,
+            Some(IpAddr::V6(_)) => {
+                return Err(TraitError::new(
+                    ErrorCode::Unimplemented,
+                    MSG_PUBLISH_PORT_IPV6_UNSUPPORTED,
+                ));
+            }
+            None => {
+                return Err(TraitError::new(
+                    ErrorCode::Unimplemented,
+                    MSG_PUBLISH_PORT_HOST_IP_REQUIRED,
+                ));
+            }
+        };
+        let protocol = match req.protocol() {
+            Protocol::Tcp => PortProtocol::Tcp,
+            Protocol::Udp => PortProtocol::Udp,
+            _ => {
+                return Err(TraitError::new(
+                    ErrorCode::Unimplemented,
+                    MSG_PUBLISH_PORT_PROTOCOL_UNSUPPORTED,
+                ));
+            }
+        };
+        let publish = PortPublish::new(
+            protocol,
+            host_ip,
+            req.host_port().get(),
+            req.container_port().get(),
+        )
+        .map_err(|e| net_error_to_trait(&e))?;
+
+        let mut guard = self.lock()?;
+        let reg = &mut *guard;
+        let orphan_key = (req.host_port().get(), req.protocol());
+        let orphan_conflict = reg
+            .networks
+            .values()
+            .any(|n| n.orphan_published.contains(&orphan_key));
+        let network = reg
+            .networks
+            .get_mut(req.network().as_str())
+            .ok_or_else(not_found_network)?;
+        if network.leaked.is_some() {
+            return Err(leaked_network());
+        }
+        if network.recovered {
+            return Err(recovered_network());
+        }
+        if network.deleting {
+            return Err(network_deleting());
+        }
+        let container = reg
+            .containers
+            .get(req.container().as_str())
+            .ok_or_else(not_found_netns)?;
+        if container.unreclaimed {
+            return Err(unreclaimed());
+        }
+        if container.attached.is_none() {
+            return Err(not_attached());
+        }
+        if container.network != req.network().as_str() {
+            return Err(network_mismatch());
+        }
+        // 契約 11: 全ネットワーク・全コンテナで `(host_port, protocol)` の重複を拒否する。
+        let key = (req.host_port().get(), req.protocol());
+        if orphan_conflict || reg.containers.values().any(|c| c.published.contains(&key)) {
+            return Err(TraitError::new(
+                ErrorCode::AlreadyExists,
+                "host port is already published",
+            ));
+        }
+        if container.published.len() >= MAX_PORT_PUBLISHES {
+            return Err(TraitError::new(
+                ErrorCode::ResourceExhausted,
+                "too many published ports for the container",
+            ));
+        }
+        let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
+        let attached = container.attached.as_ref().ok_or_else(not_attached)?;
+        let result = self.backend.publish_port(handle, attached, &publish);
+        let record = |reg: &mut BackendRegistry<B>| {
+            if let Some(c) = reg.containers.get_mut(req.container().as_str()) {
+                c.published.push(key);
+            }
+        };
+        match result {
+            Ok(()) => {
+                record(reg);
+                Ok(PortMapping::new(
+                    req.network().clone(),
+                    req.container().clone(),
+                    req.host_port(),
+                    req.container_port(),
+                    req.protocol(),
+                )
+                .with_host_ip(IpAddr::V4(host_ip)))
+            }
+            Err(f) if f.rules_unknown => {
+                // DNAT ルールが残っている可能性がある。受け口の記録を保持し（別のコンテナへ同じ受け口を
+                // 渡さない）、解放は delete_network に任せる。残りの件数を載せて成功を装わない。
+                record(reg);
+                Err(with_leftover(f.error, 1))
+            }
+            Err(f) => Err(f.error),
+        }
     }
 
     fn detach_impl(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
@@ -1196,7 +1362,16 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     }
                 }
                 for id in attached_ids.iter().filter(|id| !kept.contains(id)) {
-                    reg.containers.remove(id);
+                    // テーブルの削除が確認できていないため、公開した受け口はネットワークに引き継ぐ（契約 11）。
+                    if let Some(c) = reg.containers.remove(id)
+                        && let Some(n) = reg.networks.get_mut(name)
+                    {
+                        for k in c.published {
+                            if !n.orphan_published.contains(&k) {
+                                n.orphan_published.push(k);
+                            }
+                        }
+                    }
                 }
                 Err(first_error.unwrap_or(failure.error))
             }
@@ -1342,13 +1517,8 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
         self.timed("net.attach", || self.attach_impl(req))
     }
 
-    fn publish_port(&self, _req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
-        self.timed("net.publish_port", || {
-            Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                MSG_PUBLISH_PORT_UNAVAILABLE,
-            ))
-        })
+    fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
+        self.timed("net.publish_port", || self.publish_port_impl(req))
     }
 
     fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
@@ -1381,7 +1551,8 @@ mod linux {
         AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedAttachClaim,
         FailedCreateClaim, NetworkCreateSpec, PortRegistry, PreparedNetns, StaticIpam,
         attach_prepared_container, create_container_netns, create_network, delete_network,
-        reclaim_failed_attach, reclaim_failed_create, release_container_netns,
+        publish_container_ports, reclaim_failed_attach, reclaim_failed_create,
+        release_container_netns,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -1711,6 +1882,31 @@ mod linux {
             Ok(AttachOutcome {
                 address: attached.address,
                 container: attached,
+            })
+        }
+
+        fn publish_port(
+            &self,
+            network: &mut Self::Network,
+            container: &Self::Container,
+            publish: &PortPublish,
+        ) -> Result<(), PublishFailure> {
+            let nft = NetlinkNetfilterSocket::open_with_recorder(Arc::clone(&self.recorder))
+                .map_err(|e| PublishFailure {
+                    error: net_error_to_trait(&e),
+                    rules_unknown: false,
+                })?;
+            publish_container_ports(
+                &nft,
+                &network.created,
+                container,
+                std::slice::from_ref(publish),
+                &mut network.ports,
+                NETSETUP_REQUEST_TIMEOUT,
+            )
+            .map_err(|e| PublishFailure {
+                error: net_error_to_trait(&e.error),
+                rules_unknown: e.rules_unknown,
             })
         }
 

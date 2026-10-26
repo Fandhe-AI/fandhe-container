@@ -28,8 +28,7 @@ use fandhe_container_core::traits::ContainerId;
 
 use super::resolv_conf;
 use super::spec::{
-    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods,
-    validate_config_with_pod_namespaces,
+    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods, validate_config_with_pods,
 };
 use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
@@ -323,7 +322,12 @@ impl BundleProvider for SpecBundleProvider {
         self.lock_refused().insert(req.container_id.to_owned());
         self.verify_root()?;
         // ファイルシステムに触れる前に、設定だけで判定できる拒否を済ませる。
-        validate_config_with_pod_namespaces(req.sandbox_config, req.config, req.pod_namespaces)?;
+        validate_config_with_pods(
+            req.sandbox_config,
+            req.config,
+            req.pod_namespaces,
+            req.pod_netns_path.and_then(|p| p.to_str()),
+        )?;
         let image = req
             .config
             .image

@@ -42,6 +42,8 @@ struct FakeNetwork {
     calls: Mutex<Vec<String>>,
     set_up: Mutex<SetUp>,
     tear_down_fails: Mutex<bool>,
+    /// `set_up` が受けた公開指定（`protocol host_ip:host_port->container_port`）。
+    publishes: Mutex<Vec<String>>,
 }
 
 impl FakeNetwork {
@@ -50,6 +52,7 @@ impl FakeNetwork {
             calls: Mutex::new(Vec::new()),
             set_up: Mutex::new(set_up),
             tear_down_fails: Mutex::new(false),
+            publishes: Mutex::new(Vec::new()),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -63,6 +66,15 @@ impl PodNetworkProvider for FakeNetwork {
             .lock()
             .unwrap()
             .push(format!("set_up {}", req.sandbox_id));
+        for p in req.port_publishes() {
+            self.publishes.lock().unwrap().push(format!(
+                "{} {}:{}->{}",
+                p.protocol().as_str(),
+                p.host_ip(),
+                p.host_port(),
+                p.container_port()
+            ));
+        }
         match *self.set_up.lock().unwrap() {
             SetUp::Ok => PodNetns::new(netns_path(req.sandbox_id)),
             SetUp::Fail => Err(CriError::failed_precondition("network unavailable")),
@@ -461,4 +473,93 @@ async fn create_container_gets_no_path_without_provider_or_in_node_mode() {
     let id = run(&svc, Some(NamespaceMode::Node)).await.unwrap();
     create_container(&svc, &id).await.unwrap();
     assert_eq!(*bundles.0.lock().unwrap(), vec![None]);
+}
+
+fn port(protocol: i32, host_port: i32, container_port: i32, host_ip: &str) -> v1::PortMapping {
+    v1::PortMapping {
+        protocol,
+        container_port,
+        host_port,
+        host_ip: host_ip.into(),
+    }
+}
+
+async fn run_with_ports(
+    svc: &CriRuntimeService,
+    network: Option<NamespaceMode>,
+    ports: Vec<v1::PortMapping>,
+) -> Result<String, tonic::Status> {
+    let mut config = sandbox_config(network);
+    config.port_mappings = ports;
+    RuntimeService::run_pod_sandbox(
+        svc,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(config),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().pod_sandbox_id)
+}
+
+/// CRI-2・NET-3・NET-4（#2676）: POD の公開指定は検証済みの値で provider の `set_up` へ渡る（host_port 0 は除く）。
+#[tokio::test]
+async fn pod_mode_passes_validated_port_publishes_to_set_up() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    let svc = service(&net);
+    run_with_ports(
+        &svc,
+        None,
+        vec![
+            port(0, 8080, 80, "192.0.2.10"),
+            port(1, 5353, 53, "192.0.2.11"),
+            port(0, 0, 9090, ""),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *net.publishes.lock().unwrap(),
+        vec![
+            "tcp 192.0.2.10:8080->80".to_owned(),
+            "udp 192.0.2.11:5353->53".to_owned()
+        ]
+    );
+}
+
+/// 未対応・不正な指定は資源を作る前に拒否し、`set_up` を呼ばず記録も残さない。
+#[tokio::test]
+async fn unsupported_or_invalid_port_mappings_do_not_touch_the_network() {
+    let net = FakeNetwork::new(SetUp::Ok);
+    let svc = service(&net);
+    for (ports, code) in [
+        (vec![port(0, 8080, 80, "")], Code::Unimplemented),
+        (vec![port(2, 8080, 80, "192.0.2.10")], Code::Unimplemented),
+        (vec![port(0, 8080, 0, "192.0.2.10")], Code::InvalidArgument),
+    ] {
+        let e = run_with_ports(&svc, None, ports).await.unwrap_err();
+        assert_eq!(e.code(), code);
+    }
+    assert!(net.calls().is_empty());
+    assert!(list_ids(&svc).await.is_empty());
+}
+
+/// provider なし（本番）と NODE では、公開する要素があれば `UNIMPLEMENTED`。host_port 0 だけなら受ける。
+#[tokio::test]
+async fn port_publishes_without_pod_network_are_unimplemented() {
+    let publish = || vec![port(0, 8080, 80, "192.0.2.10")];
+    let svc = CriRuntimeService::new();
+    let e = run_with_ports(&svc, None, publish()).await.unwrap_err();
+    assert_eq!(e.code(), Code::Unimplemented);
+    run_with_ports(&svc, None, vec![port(0, 0, 80, "")])
+        .await
+        .unwrap();
+
+    let net = FakeNetwork::new(SetUp::Ok);
+    let svc = service(&net);
+    let e = run_with_ports(&svc, Some(NamespaceMode::Node), publish())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::Unimplemented);
+    assert!(net.calls().is_empty());
 }

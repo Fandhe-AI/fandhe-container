@@ -42,7 +42,7 @@
 //! - NET-6 の host / none モード（netsetup の操作を経由しない経路の扱いは #19 で確定する）
 //! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、
 //!   `--add-host` / `--dns`（NET-12）、rootless ネットワーク（NET-9・検討中）、
-//!   ホスト側 bind IP の指定
+//!   ホスト側 bind IP の解釈（運ぶ口は任意指定の `host_ip` として足した。#2676）
 //! - 実装（TASK-114・G7 の net crate）と proxy（G8・TASK-107/114）
 //!
 //! シグネチャは人間のアーキテクチャレビュー（#19・TASK-4.h1）前の暫定版であり、
@@ -127,8 +127,9 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     のアドレス」全般に適用される帰結である。
 /// 11. **ホストポートの二重公開の拒否**: [`Self::publish_port`] は、同じホスト側ポート
 ///     番号とプロトコルの組が、ネットワーク・コンテナに関わらず既に公開済みであれば
-///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP の指定はスコープ外（#19）の
-///     ままであるため、判定キーは `(host_port, protocol)` のみとする。[`Self::detach`]
+///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP（任意の
+///     [`PublishPortRequest::host_ip`]）の有無にかかわらず、判定キーは
+///     `(host_port, protocol)` のみとする（緩めない）。[`Self::detach`]
 ///     または [`Self::delete_network`] で解放されたポートは再公開できる。
 /// 12. **二重 attach の拒否**: 既に [`Self::attach`] 済みのコンテナへの再度の
 ///     [`Self::attach`] は、対象ネットワークが同一か別かを問わず
@@ -208,9 +209,10 @@ pub trait NetworkPlugin: Send + Sync {
     /// 任意ホストへ DNAT させる経路をトレイト境界で作らないための設計である
     /// （#19 で確認する）。加えて、同じホスト側ポートとプロトコルの組がネットワーク・
     /// コンテナに関わらず既に公開済みであれば [`ErrorCode::AlreadyExists`] を返す
-    /// （契約 11。ホスト bind IP の指定はスコープ外〔#19〕のため判定キーは
-    /// `(host_port, protocol)` のみ）。[`Self::detach`] / [`Self::delete_network`] で
-    /// 解放されたポートは再公開できる。DNAT ルール追加後に失敗した場合は追加済みの
+    /// （契約 11。ホスト bind IP は任意指定で、判定キーは常に
+    /// `(host_port, protocol)` のみ）。`host_ip` が `None` のときの意味は実装が決め、
+    /// 明示を要する実装は [`ErrorCode::Unimplemented`] を返してよい。
+    /// [`Self::detach`] / [`Self::delete_network`] で解放されたポートは再公開できる。DNAT ルール追加後に失敗した場合は追加済みの
     /// ルールを撤回してから `Err` を返し、撤回にも失敗すれば [`ErrorCode::Internal`] を
     /// 返す（契約 6）。対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
@@ -759,6 +761,7 @@ pub struct PublishPortRequest {
     host_port: NonZeroU16,
     container_port: NonZeroU16,
     protocol: Protocol,
+    host_ip: Option<IpAddr>,
 }
 
 impl PublishPortRequest {
@@ -777,7 +780,22 @@ impl PublishPortRequest {
             host_port,
             container_port,
             protocol,
+            host_ip: None,
         }
+    }
+
+    /// ホスト側の bind IP を指定する（任意。PLUG-1・NET-4）。
+    ///
+    /// 指定が無い（`None`）ときの意味は実装が決める。明示したアドレスを要する実装は
+    /// [`ErrorCode::Unimplemented`] を返してよい（成功を装わない）。
+    pub fn with_host_ip(mut self, host_ip: IpAddr) -> Self {
+        self.host_ip = Some(host_ip);
+        self
+    }
+
+    /// 指定されたホスト側 bind IP を返す。未指定なら `None`。
+    pub fn host_ip(&self) -> Option<IpAddr> {
+        self.host_ip
     }
 
     /// 対象ネットワーク名を返す。
@@ -815,6 +833,7 @@ pub struct PortMapping {
     host_port: NonZeroU16,
     container_port: NonZeroU16,
     protocol: Protocol,
+    host_ip: Option<IpAddr>,
 }
 
 impl PortMapping {
@@ -833,7 +852,22 @@ impl PortMapping {
             host_port,
             container_port,
             protocol,
+            host_ip: None,
         }
+    }
+
+    /// ホスト側の bind IP を指定する（任意。PLUG-1・NET-4）。
+    ///
+    /// 指定が無い（`None`）ときの意味は実装が決める。明示したアドレスを要する実装は
+    /// [`ErrorCode::Unimplemented`] を返してよい（成功を装わない）。
+    pub fn with_host_ip(mut self, host_ip: IpAddr) -> Self {
+        self.host_ip = Some(host_ip);
+        self
+    }
+
+    /// 指定されたホスト側 bind IP を返す。未指定なら `None`。
+    pub fn host_ip(&self) -> Option<IpAddr> {
+        self.host_ip
     }
 
     /// 対象ネットワーク名を返す。
@@ -1385,13 +1419,16 @@ mod tests {
                     "host port is already published",
                 ));
             }
-            let mapping = PortMapping::new(
+            let mut mapping = PortMapping::new(
                 req.network().clone(),
                 req.container().clone(),
                 req.host_port(),
                 req.container_port(),
                 req.protocol(),
             );
+            if let Some(ip) = req.host_ip() {
+                mapping = mapping.with_host_ip(ip);
+            }
             // 契約 6: DNAT ルール追加後に失敗した場合は追加済みのルールを撤回してから
             // `Err` を返し、撤回にも失敗すれば `Internal` を返して message に残存資源を
             // 含める。このスタブは `set_fail_publish_port` が立っている間、まず
@@ -3261,6 +3298,30 @@ mod tests {
                 Protocol::Tcp,
             )
         );
+    }
+
+    /// PLUG-1・NET-4: `host_ip` は任意の欄で、未指定なら `None`、指定すれば往復する。
+    #[test]
+    fn plug1_publish_port_host_ip_is_optional_and_round_trips() {
+        let ip: IpAddr = "192.0.2.10".parse().expect("ip");
+        let base = PublishPortRequest::new(
+            sample_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Tcp,
+        );
+        assert_eq!(base.host_ip(), None);
+        assert_eq!(base.clone().with_host_ip(ip).host_ip(), Some(ip));
+        let mapping = PortMapping::new(
+            sample_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Tcp,
+        );
+        assert_eq!(mapping.host_ip(), None);
+        assert_eq!(mapping.with_host_ip(ip).host_ip(), Some(ip));
     }
 
     /// 契約 6 の前段: `publish_port` は DNAT ルール追加後に失敗しても、撤回に成功

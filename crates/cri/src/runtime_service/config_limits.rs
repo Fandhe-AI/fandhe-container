@@ -114,6 +114,11 @@ impl BoundedConfig {
         self.config.metadata.as_ref()
     }
 
+    /// 検証済みの `port_mappings`（件数は上限内。値の検証は `crate::port_mapping`。#2676）。
+    pub(super) fn port_mappings(&self) -> &[crate::runtime::v1::PortMapping] {
+        &self.config.port_mappings
+    }
+
     /// 検証済みの `config` を取り出す。
     pub(super) fn into_config(self) -> PodSandboxConfig {
         self.config

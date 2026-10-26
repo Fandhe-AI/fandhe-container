@@ -20,6 +20,7 @@ pub mod error;
 pub mod image_pull;
 pub mod image_service;
 pub mod instrument;
+pub mod port_mapping;
 pub mod runtime_service;
 pub mod stop_signal;
 

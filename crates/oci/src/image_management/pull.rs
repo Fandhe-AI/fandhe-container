@@ -1041,6 +1041,19 @@ impl PullSession<'_> {
                                     continue;
                                 }
                             }
+                            // symlink・FIFO 等の通常ファイルでない宛先（ディレクトリを除く）は、検証済みの
+                            // ステージングで原子的に置き換える。rename は名前を置き換えるだけで、symlink の先
+                            // には書き込まない（cri の従来の公開と同じ。#2539・OCI-1・SEC）。
+                            Ok(Some(m)) if !m.is_dir() => {
+                                bd.rename_from(&self.pull_dir, hex, hex).map_err(|_| {
+                                    err(
+                                        OciErrorCode::Internal,
+                                        "failed to replace blob destination",
+                                    )
+                                })?;
+                                moved.push(b.clone());
+                                continue;
+                            }
                             _ => {
                                 return Err(err(
                                     OciErrorCode::FailedPrecondition,

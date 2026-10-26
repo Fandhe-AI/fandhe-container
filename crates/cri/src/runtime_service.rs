@@ -76,8 +76,10 @@
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
 //! （常駐デーモンを前提にしない CORE-1 とは、置換後の状態管理で整合させる）。
 //! リスナー（UDS・peer credential 検証。PLUG-12）や gRPC のメッセージ長上限の設定は TASK-108 の責務で、
-//! ここでは作らない。`config` のパス類（`log_directory` 等）は保持するだけで検証していない。
-//! 実際にファイルへ触れる TASK-58 / TASK-59 で検証する。
+//! ここでは作らない。`config` のパス類は保持するだけで検証していない（実際にファイルへ触れる TASK-58 / TASK-59 で検証する）。
+//! 例外として `log_directory` と `log_path` は実行層接続時の CreateContainer で結合・検証して保持し、
+//! StartContainer が `StartRequest` で supervisor へ渡す（`resolve_log_path`。CRI-2・SUP-4・#2671）。
+//! `ReopenContainerLog` は `UNIMPLEMENTED` のまま（kubelet のログ回転は後続 issue）。
 //!
 //! **保持量の上限**: レジストリは件数（[`MAX_SANDBOXES`]）と、保持する `config` の量
 //! （1 件の符号化長 [`MAX_CONFIG_ENCODED_BYTES`]・可変長要素の件数と長さ・合計の見積もり
@@ -105,7 +107,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
+use crate::bundle::resolve_log_path;
 use crate::error::{CriError, CriErrorCode};
+use fandhe_container_core::traits::ContainerLogPath;
 
 use crate::adapter::{
     BundleProvider, BundleRequest, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
@@ -1098,7 +1102,7 @@ impl CriRuntimeService {
             attempt,
             config,
         } = validate_create_request(req)?;
-        let retained_bytes = config.retained_bytes();
+        let mut retained_bytes = config.retained_bytes();
         let created_at_nanos = now_nanos()?;
 
         let mut registry = self
@@ -1111,6 +1115,17 @@ impl CriRuntimeService {
             .ok_or_else(|| CriError::not_found("sandbox not found"))?;
         if sandbox.state != SandboxState::Ready {
             return Err(CriError::failed_precondition("sandbox is not ready"));
+        }
+        // CRI ログの書き先は実行層接続時だけ結合して保持する（検証は bundle の供給元と同じ関数。#2671）。
+        let resolved_log_path = if in_flight {
+            resolve_log_path(&sandbox.config, config.config())?
+        } else {
+            None
+        };
+        if let Some(path) = &resolved_log_path {
+            retained_bytes = retained_bytes
+                .checked_add(path.as_str().len())
+                .ok_or_else(|| CriError::invalid_argument("config is too large"))?;
         }
         // 要求由来の String は余分な capacity を持ちうる。照合に成功した ID（最大 64 文字）と名前は、
         // 内容長ちょうどの新しい String へ複製して保持し、要求側の確保領域を削除まで残さない
@@ -1158,6 +1173,7 @@ impl CriRuntimeService {
                 exit_code: None,
                 termination: None,
                 retained_bytes,
+                resolved_log_path,
                 in_flight,
                 runtime_owned: false,
             },
@@ -1298,6 +1314,18 @@ impl CriRuntimeService {
         Ok(())
     }
 
+    /// 記録に保持した CRI ログの書き先を取り出す（無ければ `None`）。保持時に検証済みで、ここで失敗しない想定。
+    fn start_log_path(&self, id: &str) -> Result<Option<ContainerLogPath>, CriError> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        Ok(registry
+            .containers
+            .get(id)
+            .and_then(|r| r.resolved_log_path.clone()))
+    }
+
     /// 実行層接続時の `StartContainer`（TASK-59.2・CRI-2）。
     ///
     /// 前提検査と `in_flight` 化をロック下で行い、ロックを外して `ContainerRuntime::start`
@@ -1312,6 +1340,8 @@ impl CriRuntimeService {
         self.begin_start(req, true)?;
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
+        // 書き先の取得に失敗しても、実行層を呼ぶ前なので guard の破棄で created へ戻る。
+        let log_path = self.start_log_path(&id)?;
         let adapter = binding.adapter.clone();
         let timeout = self.runtime_timeout;
         // 結果の確定と巻き戻しは worker が所有する。期限超過・中断では結果不明のまま worker が終わるのを待ち、
@@ -1319,7 +1349,7 @@ impl CriRuntimeService {
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
-            let status = match adapter.start(&id) {
+            let status = match adapter.start_with_log_path(&id, log_path) {
                 Ok(status) => status,
                 Err(status) => {
                     // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
@@ -2238,6 +2268,8 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::UpdateContainerResourcesResponse>, Status> {
         Err(CriError::unimplemented("update_container_resources").into())
     }
+    /// 未実装（kubelet のログ回転に要る。CRI-2・SUP-7。#2671 の後続 issue）。CRI ログの書き出し自体は実装済みで、
+    /// 回転が無い間は総量に上限が無い（`docs/design/cri-config-acceptance.md`）。
     async fn reopen_container_log(
         &self,
         _request: Request<v1::ReopenContainerLogRequest>,

@@ -108,7 +108,7 @@ use std::time::Duration;
 
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
 use fandhe_container_core::plugin_trust::{PluginTrustErrorKind, check_owner_and_mode};
-use fandhe_container_core::traits::{ContainerId, ErrorCode};
+use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode};
 
 use crate::launcher::{LAUNCHER_FILE_NAME, SUPERVISOR_FILE_NAME};
 use crate::start_contract::{
@@ -227,11 +227,18 @@ fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
 
 /// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
 /// プロセスグループは設定しない（直接経路は [`configure`]、ランチャー経路は付けない。#2442）。
-fn configure_common(cmd: &mut Command, root: &Path, id: &ContainerId) {
-    cmd.arg("start")
-        .arg("--root")
-        .arg(root)
-        .arg(id.as_str())
+fn configure_common(
+    cmd: &mut Command,
+    root: &Path,
+    cri_log_path: Option<&ContainerLogPath>,
+    id: &ContainerId,
+) {
+    cmd.arg("start").arg("--root").arg(root);
+    // CRI ログの書き先は位置引数（ID）の前に置く（CRI-2・SUP-4・#2671）。値は検証済みの型で、argv の 1 要素として渡す。
+    if let Some(path) = cri_log_path {
+        cmd.arg("--cri-log-path").arg(path.as_str());
+    }
+    cmd.arg(id.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -241,8 +248,13 @@ fn configure_common(cmd: &mut Command, root: &Path, id: &ContainerId) {
 }
 
 /// 直接経路（rootless）の設定: [`configure_common`] に `process_group(0)` を足す。
-fn configure(cmd: &mut Command, root: &Path, id: &ContainerId) {
-    configure_common(cmd, root, id);
+fn configure(
+    cmd: &mut Command,
+    root: &Path,
+    cri_log_path: Option<&ContainerLogPath>,
+    id: &ContainerId,
+) {
+    configure_common(cmd, root, cri_log_path, id);
     cmd.process_group(0);
 }
 
@@ -475,6 +487,7 @@ fn scoped_command(
     launcher: Option<&Path>,
     supervisor: &Path,
     root: &Path,
+    cri_log_path: Option<&ContainerLogPath>,
     id: &ContainerId,
     xdg: &OsStr,
 ) -> Command {
@@ -483,11 +496,11 @@ fn scoped_command(
     match launcher {
         Some(launcher) => {
             cmd.arg(launcher);
-            configure_common(&mut cmd, root, id);
+            configure_common(&mut cmd, root, cri_log_path, id);
         }
         None => {
             cmd.arg(supervisor);
-            configure(&mut cmd, root, id);
+            configure(&mut cmd, root, cri_log_path, id);
         }
     }
     cmd.env("XDG_RUNTIME_DIR", xdg);
@@ -597,11 +610,26 @@ pub fn start_with(
     id: &ContainerId,
     within: Duration,
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    start_with_cri_log(launch, root, None, id, within)
+}
+
+/// [`start_with`] に CRI ログの書き先（`--cri-log-path`。CRI-2・SUP-4・#2671）を足したもの。`None` は同じ挙動。
+///
+/// 常駐する plugin-cri の StartContainer が、cri が結合・検証した `log_directory/log_path` を渡す。supervisor 側で
+/// 再検証され、特権ランチャー経由（ambient capability あり）では fail-closed で拒否される（`crate::start_entry` の doc）。
+pub fn start_with_cri_log(
+    launch: &SupervisorLaunch,
+    root: &Path,
+    cri_log_path: Option<&ContainerLogPath>,
+    id: &ContainerId,
+    within: Duration,
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
     let cmd = scoped_command(
         &launch.systemd_run,
         launch.launcher.as_deref(),
         &launch.supervisor,
         root,
+        cri_log_path,
         id,
         &launch.xdg_runtime_dir,
     );
@@ -695,7 +723,7 @@ mod tests {
         fn fake(&self, script: &str) -> Command {
             let mut cmd = Command::new("/bin/sh");
             cmd.arg("-c").arg(script).arg("fake-supervisor");
-            configure(&mut cmd, &self.root, &self.id);
+            configure(&mut cmd, &self.root, None, &self.id);
             cmd
         }
     }
@@ -842,7 +870,7 @@ mod tests {
     fn err2_cli_spawn_not_installed() {
         let fx = Fixture::new("noexe");
         let mut cmd = Command::new(fx.root.join("no-such-supervisor"));
-        configure(&mut cmd, &fx.root, &fx.id);
+        configure(&mut cmd, &fx.root, None, &fx.id);
         let (result, child) = launch_and_receive(cmd, Duration::from_secs(10));
         assert!(child.is_none());
         let e = result.expect_err("not installed");
@@ -880,7 +908,7 @@ mod tests {
     fn sup1_configure_follows_contract() {
         let id = ContainerId::new("c1").expect("id");
         let mut cmd = Command::new("/bin/true");
-        configure(&mut cmd, Path::new("/r"), &id);
+        configure(&mut cmd, Path::new("/r"), None, &id);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -946,6 +974,7 @@ mod tests {
             Some(Path::new("/opt/x/fandhe-container-launcher")),
             Path::new("/opt/x/fandhe-container-supervisor"),
             Path::new("/r"),
+            None,
             &id,
             OsStr::new("/run/user/1000"),
         );
@@ -1059,6 +1088,39 @@ mod tests {
         );
     }
 
+    /// CRI-2・SUP-4・#2671: CRI ログの書き先は `--cri-log-path <絶対パス>` として ID の前に載り、直接経路でもランチャー経路でも同じ。
+    #[test]
+    fn cri2_scoped_command_carries_cri_log_path() {
+        let id = ContainerId::new("c1").expect("id");
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("log path");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let cmd = scoped_command(
+                Path::new("/usr/bin/systemd-run"),
+                launcher,
+                Path::new("/opt/x/fandhe-container-supervisor"),
+                Path::new("/r"),
+                Some(&lp),
+                &id,
+                OsStr::new("/run/user/1000"),
+            );
+            let args: Vec<_> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--cri-log-path",
+                    "/l/c/0.log",
+                    "c1"
+                ]
+            );
+        }
+    }
+
     /// CORE-3・SUP-1: systemd-run で包んだ argv・環境・cwd は固定（環境は PATH と XDG_RUNTIME_DIR だけ）。
     #[test]
     fn core3_sup1_scoped_command_argv_env_cwd() {
@@ -1068,6 +1130,7 @@ mod tests {
             None,
             Path::new("/opt/x/fandhe-container-supervisor"),
             Path::new("/r"),
+            None,
             &id,
             OsStr::new("/run/user/1000"),
         );

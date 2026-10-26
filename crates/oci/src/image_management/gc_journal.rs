@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use super::container_ref_persist::CONTAINER_REFS_TMP_PREFIX;
 use super::inventory_persist::IMAGE_INVENTORY_TMP_PREFIX;
-use super::root_handle::{BlobDir, RootHandle};
+use super::root_handle::{BlobDir, RootHandle, is_mount_crossing, map_root_io, mount_crossing};
 #[cfg(test)]
 use super::usage::blob_dir;
 use super::{MAX_CACHE_SCAN_ENTRIES, ReferenceTable, TagKey};
@@ -317,8 +317,21 @@ pub(super) fn journal_exists(root: &RootHandle) -> bool {
     !matches!(root.stat_name(GC_JOURNAL_FILE_NAME), Ok(None))
 }
 
+/// [`journal_exists`] の `Result` 版。root 配下の別マウント（`EXDEV`）だけを `mount_crossing()` として返す。
+///
+/// stat の失敗は従来どおり存在とみなす（fail-closed）が、`EXDEV` は「ジャーナルがある」ではなく対応外の
+/// 構成なので、"pending deletion" という誤った原因を出さずに原因を示す（OCI-7・SEC-1・ERR-1・#2701）。
+pub(super) fn journal_state(root: &RootHandle) -> Result<bool, OciError> {
+    match root.stat_name(GC_JOURNAL_FILE_NAME) {
+        Ok(None) => Ok(false),
+        Ok(Some(_)) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => Err(mount_crossing()),
+        Err(_) => Ok(true),
+    }
+}
+
 pub(super) fn ensure_no_pending_journal(root: &RootHandle) -> Result<(), OciError> {
-    if journal_exists(root) {
+    if journal_state(root)? {
         return Err(err(
             OciErrorCode::FailedPrecondition,
             "a previous image deletion is still pending; retry after the store lock recovers it",
@@ -511,7 +524,11 @@ pub(super) fn read_journal(root: &RootHandle) -> Result<Option<GcJournal>, OciEr
     let pre = match root.stat_name(GC_JOURNAL_FILE_NAME) {
         Ok(Some(m)) => m,
         Ok(None) => return Ok(None),
-        Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat gc journal")),
+        Err(e) => {
+            return Err(map_root_io(&e, || {
+                err(OciErrorCode::Internal, "failed to stat gc journal")
+            }));
+        }
     };
     if !pre.is_file() {
         return Err(untrusted("gc journal is not a regular file"));
@@ -532,7 +549,7 @@ pub(super) fn read_journal(root: &RootHandle) -> Result<Option<GcJournal>, OciEr
     let open_failed = || err(OciErrorCode::Internal, "failed to open gc journal");
     let file = root
         .open_read(GC_JOURNAL_FILE_NAME)
-        .map_err(|_| open_failed())?
+        .map_err(|e| map_root_io(&e, open_failed))?
         .ok_or_else(open_failed)?;
     let post = file
         .metadata()
@@ -714,14 +731,31 @@ pub struct PendingDeletionRecovery {
 }
 
 impl super::JournalRoot {
-    /// `root_handle_for` の本体。`ExpandedSizePlan::measure`（ガードの外で、plan が持つハンドルと照合する）も
-    /// 同じ規則で解決する（#2695）。
+    /// `root_handle_for` の本体（削除系の入口用）。排他区間のハンドルが無い単体テーブルは、本番ビルドでは
+    /// `FailedPrecondition` で拒否する（#2701）。
     pub(super) fn resolve(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.resolve_with(root, true)
+    }
+
+    /// 読み取り専用 API（`list_images`・`disk_usage`・`ExpandedSizePlan::measure`）用。排他区間のハンドルが
+    /// あれば同じ規則で照合し、無い単体テーブルは従来どおり `root` を検査なしで開く（読み取りのみで、
+    /// 永続化操作は行わないため拒否しない。#2701）。
+    pub(super) fn resolve_read(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.resolve_with(root, false)
+    }
+
+    fn resolve_with(&self, root: &Path, require_guard: bool) -> Result<Arc<RootHandle>, OciError> {
         match &self.0 {
             Some(h) if h.matches(root) => Ok(Arc::clone(h)),
             Some(_) => Err(err(
                 OciErrorCode::InvalidArgument,
                 "root does not match the image store root of this exclusive section",
+            )),
+            // 削除系は本番ビルドでは拒否する。信頼検査なしの root とジャーナルの検査抜きで永続化操作が動く
+            // 経路を公開 API から閉じる（`ImageStore::lock` のガード経由のみ。OCI-7・SEC-1・#2701）。
+            None if require_guard && !cfg!(test) => Err(err(
+                OciErrorCode::FailedPrecondition,
+                "image store operation requires the exclusive section of an opened ImageStore",
             )),
             None => RootHandle::open_unchecked(root).map(Arc::new),
         }
@@ -744,9 +778,15 @@ impl ReferenceTable {
     /// 操作の起点にする root のハンドルを決める（公開 API が受け取るパスと排他区間の root の対応）。
     ///
     /// - 排他区間で設定済み: `root` が同じディレクトリならそのハンドル。違えば `InvalidArgument`（fail-closed）
-    /// - 未設定の単体テーブル: `root` を検査なしで開く（従来どおり信頼検査をしない）
+    /// - 未設定の単体テーブル: `cfg(test)` では `root` を検査なしで開く（信頼検査をしない）。本番ビルドでは
+    ///   `FailedPrecondition` で拒否する（`ImageStore::lock` のガードの中で呼ぶこと。#2701）
     pub(super) fn root_handle_for(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
         self.journal_root.resolve(root)
+    }
+
+    /// 読み取り専用 API 用の [`Self::root_handle_for`]。ガードの外の単体テーブルでも拒否しない（#2701）。
+    pub(super) fn root_handle_for_read(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.journal_root.resolve_read(root)
     }
 
     /// 削除ジャーナル（墓標を含む）がディスクに見えていれば
@@ -759,7 +799,7 @@ impl ReferenceTable {
     /// `*_unchecked` を除く）。root が未設定の単体テーブルでは何もしない。
     pub(super) fn ensure_no_pending_deletion(&self) -> Result<(), OciError> {
         match &self.journal_root.0 {
-            Some(root) if journal_exists(root) => Err(err(
+            Some(root) if journal_state(root)? => Err(err(
                 OciErrorCode::FailedPrecondition,
                 "a pending image deletion has not been completed; the store is read-only until it is recovered",
             )),
@@ -790,7 +830,9 @@ impl ReferenceTable {
     ///
     /// ストアの排他区間の内側で呼ぶ（[`super::ImageStore::lock`] が取得直後に呼ぶ）。無ければ
     /// `Ok(None)`（費用は stat 1 回）。ジャーナルが信頼できない・壊れているときはファイルに触らず
-    /// エラーを返す（fail-closed）。冪等で、片づいた後の 2 回目は `Ok(None)`。
+    /// エラーを返す（fail-closed）。冪等で、片づいた後の 2 回目は `Ok(None)`。`blobs/sha256` が root 配下の
+    /// 別マウントなら、ジャーナルに触れず `FailedPrecondition` で止まる（#2701）。ガードの外の単体テーブルでは、
+    /// 本番ビルドは `FailedPrecondition` で拒否する。
     pub fn resume_pending_deletion(
         &mut self,
         root: &Path,
@@ -807,6 +849,14 @@ impl ReferenceTable {
         let Some(journal) = read_journal(root)? else {
             return Ok(None);
         };
+        // blob 置き場が root 配下の別マウントなら、ジャーナルにも attempts にも触れずに止まる。構成の誤りは
+        // 一時的な障害ではなく、再試行回数を消費すると MAX_GC_RETRY_ATTEMPTS でジャーナルが断念されて
+        // blob が黙って孤児になるため（墓標も root の fsync に blob 置き場が絡むので同じ。#2701）。
+        if let Err(e) = root.check_blob_dirs()
+            && is_mount_crossing(&e)
+        {
+            return Err(e);
+        }
         // untag・manifest 除去を保存するための複製。保存に失敗したら戻し、ジャーナルを残して失敗させる。
         let before = self.inventory_portion();
         let mut out = PendingDeletionRecovery::default();

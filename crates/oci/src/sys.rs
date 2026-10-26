@@ -38,7 +38,7 @@ pub(crate) fn effective_uid() -> u32 {
 
 // ディレクトリ fd 起点の操作（`openat2` 系。#2437・OCI-1・SEC-5）。Linux の x86_64 / aarch64 限定。
 // 他のアーキテクチャ・OS ではコンパイルせず、呼び出し側（`layer::anchored`）が fail-closed にし、
-// `image_management::root_handle` はパス起点の実装に切り替える（#2638）。
+// `image_management::root_handle` も同じく `Unimplemented` で拒否する（パス起点へは縮退しない。#2638・#2701）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

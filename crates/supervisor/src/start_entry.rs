@@ -2031,6 +2031,7 @@ mod linux {
         LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
         load_resource_limits, load_resource_limits_audited,
     };
+    use fandhe_container_core::traits::ContainerLogPath;
 
     use super::*;
     use crate::container_options::ContainerOptions;
@@ -2132,6 +2133,9 @@ mod linux {
         /// 起動オプション（`with_container_options`。`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・#2625）。
         /// 既定（指定なし）は従来の動作と同じ。
         container_options: ContainerOptions,
+        /// CRI ログの書き先（`with_cri_log_path`。`--cri-log-path`。CRI-2・SUP-4・#2671）。指定があれば `open_log_sink` が
+        /// `@container-logs` に加えて CRI 形式でここへも追記する。
+        cri_log_path: Option<ContainerLogPath>,
         /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
         /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
         container_options_error: Option<TraitError>,
@@ -2249,6 +2253,7 @@ mod linux {
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
                 container_options: ContainerOptions::default(),
+                cri_log_path: None,
                 container_options_error: None,
                 options_generation: None,
             }
@@ -2266,6 +2271,17 @@ mod linux {
         #[must_use]
         pub fn with_options_generation(mut self, recorded: Option<String>) -> Self {
             self.options_generation = Some(recorded);
+            self
+        }
+
+        /// CRI ログの書き先（`--cri-log-path`）を設定する（CRI-2・SUP-4・#2671）。
+        ///
+        /// `open_log_sink` が手順 6 で開く。特権ランチャー経由（effective / permitted の capability あり）では
+        /// `Unimplemented` で拒否する（`CAP_DAC_OVERRIDE` で任意のパスへ追記できてしまうため。
+        /// [`crate::logs::cri::deny_elevated_capabilities`]）。
+        #[must_use]
+        pub fn with_cri_log_path(mut self, path: Option<ContainerLogPath>) -> Self {
+            self.cri_log_path = path;
             self
         }
 
@@ -2503,7 +2519,16 @@ mod linux {
             }
             let config = crate::logs::container_log_rotation_config();
             let sink = crate::logs::RotatingFileSink::open(&dir, id, config)?;
-            Ok(Some(Arc::new(sink)))
+            let Some(cri_path) = &self.cri_log_path else {
+                return Ok(Some(Arc::new(sink)));
+            };
+            // 権限の確認は CRI ログを開く直前に行う（ambient capability つきで利用者指定のパスを開かない。fail-closed）。
+            crate::logs::cri::deny_elevated_capabilities(&read_self_status()?)?;
+            let cri_sink = crate::logs::cri::CriFileSink::open(cri_path)?;
+            Ok(Some(Arc::new(crate::logs::cri::TeeLogSink::new(
+                Arc::new(sink),
+                Arc::new(cri_sink),
+            ))))
         }
 
         /// 権限モデル・監査 sink・cgroup の参加フックの源を渡して `ProductionLauncher` を作る
@@ -2921,7 +2946,8 @@ mod linux {
         // 触れない。
         let deps = ProductionStartDeps::new(args.root.clone())
             .with_companions(companions)
-            .with_audit_policy(args.audit_policy);
+            .with_audit_policy(args.audit_policy)
+            .with_cri_log_path(args.cri_log_path.clone());
         let deps = Box::new(match &audit {
             // relay は launcher の回収点（複数スレッド）の `exit_signal` 監査の記録先にも渡す（#2236）。
             // start の検証（bind・sysfs）の拒否も作業スレッド（複数スレッド）で出るため relay へ渡す（#2481）。

@@ -341,7 +341,9 @@ impl ReferenceTable {
     ///
     /// ストアのガードを保持したまま呼ぶ前提（排他はかけない）。拒否のときはテーブルもディスクも変えない。
     /// 完全削除は、`blobs` / `blobs/sha256` が symlink・非ディレクトリなら何も変えずに
-    /// `FailedPrecondition` とする。blob のファイル削除の失敗はエラーにせず `undeleted_blobs` に載せる
+    /// `FailedPrecondition` とする（`blobs` / `blobs/sha256` が root 配下の別マウントのときも同じ code で、
+    /// メッセージはマウント越え。#2701）。`ImageStore::lock` のガードの外の単体テーブルでは、本番ビルドは
+    /// `FailedPrecondition` で拒否する。blob のファイル削除の失敗はエラーにせず `undeleted_blobs` に載せる
     /// （テーブルは更新済みで、`Err` は「何も起きていない」と誤読させるため）。
     pub fn execute_image_rm_with(
         &mut self,

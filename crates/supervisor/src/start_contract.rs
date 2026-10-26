@@ -11,7 +11,9 @@
 //! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] [--audit-policy <best-effort|strict>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
 //!   `--restart` は任意で既定は `no`。`--audit-policy` は任意で既定は `best-effort`（カーネル監査頼みの層が縮退した
-//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI からの受け渡しは未実装）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI からの受け渡しは未実装）。`--cri-log-path` は任意で、CRI の `log_directory/log_path` を結合・検証した絶対パス
+//!   （POSIX 形式。`ContainerLogPath` が再検証する）。指定があれば `@container-logs` に加えて CRI ログ形式で追記する
+//!   （CRI-2・SUP-4・#2671。plugin-cri の StartContainer が渡す。CLI は渡さない）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
@@ -61,7 +63,7 @@ use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
 use fandhe_container_core::oci_runtime::{
     LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts, exit_code_for,
 };
-use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
+use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
 use fandhe_container_core::audit_log::AuditCoveragePolicy;
@@ -84,7 +86,7 @@ pub const MAX_REPORT_LEN: usize = 640;
 /// 報告に載せる `message` の最大バイト数。
 pub const MAX_REPORT_MESSAGE_LEN: usize = 512;
 /// argv の最大要素数（プログラム名を除く）。
-pub const MAX_ARGS: usize = 8;
+pub const MAX_ARGS: usize = 10;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
@@ -249,6 +251,10 @@ pub struct StartArgs {
     pub restart: RestartPolicy,
     /// 監査の網羅を満たせない環境への方針（既定 `best-effort`。SEC-4・#2027）。
     pub audit_policy: AuditCoveragePolicy,
+    /// CRI ログの書き先（`--cri-log-path`。CRI の `log_directory/log_path` を結合・検証済みの絶対パス。
+    /// CRI-2・SUP-4・#2671）。指定があれば `@container-logs` への書き出しに加えて、コンテナ出力を CRI ログ形式で
+    /// このパスへ追記する。未指定は従来どおり。
+    pub cri_log_path: Option<ContainerLogPath>,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
 }
@@ -278,16 +284,18 @@ impl StartArgs {
         let mut root: Option<String> = None;
         let mut restart: Option<String> = None;
         let mut audit_policy: Option<String> = None;
+        let mut cri_log_path: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
-                "--root" | "--restart" | "--audit-policy" => {
+                "--root" | "--restart" | "--audit-policy" | "--cri-log-path" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
                     let slot = match tok.as_str() {
                         "--root" => &mut root,
                         "--restart" => &mut restart,
+                        "--cri-log-path" => &mut cri_log_path,
                         _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
@@ -314,12 +322,15 @@ impl StartArgs {
             Some(p) => p.parse::<AuditCoveragePolicy>()?,
             None => AuditCoveragePolicy::default(),
         };
+        // 外部入力（argv）なので cri 側で検証済みでもここで再検証する（SEC-1）。
+        let cri_log_path = cri_log_path.map(ContainerLogPath::new).transpose()?;
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
         Ok(Self {
             root,
             restart,
             audit_policy,
+            cri_log_path,
             id,
         })
     }
@@ -607,11 +618,51 @@ mod tests {
         }
     }
 
+    /// CRI-2・SUP-4・#2671: `--cri-log-path` の受理（全オプション同時の 10 要素を含む）と拒否。
+    #[test]
+    fn cri2_cri_log_path_parse() {
+        let none = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(none.cri_log_path, None);
+        let all = StartArgs::parse(os(&[
+            "start",
+            "--root",
+            ROOT,
+            "--restart",
+            "always",
+            "--audit-policy",
+            "strict",
+            "--cri-log-path",
+            "/l/c/0.log",
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(all.cri_log_path.as_ref().unwrap().as_str(), "/l/c/0.log");
+        for bad in [
+            vec!["start", "--root", ROOT, "--cri-log-path", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--cri-log-path"],
+            vec!["start", "--root", ROOT, "--cri-log-path", "rel/x.log", "c1"],
+            vec!["start", "--root", ROOT, "--cri-log-path", "/a/../x", "c1"],
+            vec![
+                "start",
+                "--root",
+                ROOT,
+                "--cri-log-path",
+                "/a/x.log",
+                "--cri-log-path",
+                "/a/y.log",
+                "c1",
+            ],
+        ] {
+            let e = StartArgs::parse(os(&bad)).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad:?}");
+        }
+    }
+
     /// SUP-1: 不正な argv はすべて InvalidArgument。
     #[test]
     fn sup1_args_parse_rejects_invalid() {
         let long = "a".repeat(MAX_ARG_LEN + 1);
-        let nine: Vec<&str> = vec!["start"; 9];
+        let eleven: Vec<&str> = vec!["start"; 11];
         let cases: Vec<Vec<&str>> = vec![
             vec![],
             vec!["run", "--root", ROOT, "c1"],
@@ -634,7 +685,7 @@ mod tests {
             vec!["start", "--root", ROOT, "--restart", "sometimes", "c1"],
             vec!["start", "c1"],
             vec!["start", "--root", ROOT, "bad/id"],
-            nine,
+            eleven,
             vec!["start", "--root", ROOT, long.as_str()],
         ];
         for c in cases {

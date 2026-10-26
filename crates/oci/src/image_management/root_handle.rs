@@ -20,13 +20,16 @@
 //! `cfg` は本モジュールの中だけに置き、永続化モジュールには `cfg(target_os)` / `cfg(target_arch)` を書かない。
 //!
 //! - Linux の x86_64 / aarch64: root の fd を `OwnedFd` で持つ。名前の解決は
-//!   `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` 付きの `openat2` で、
+//!   `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` 付きの `openat2` で行い、
 //!   最後の要素も `O_NOFOLLOW` で辿らない。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による
 //!   `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。
-//! - その他の unix（macOS・Linux の他アーキテクチャ）と Windows: 正規パスを持つ従来のパス起点の実装で、
-//!   差し替えは入口の再検査だけで検出する。macOS は本番経路が `ImageStore::open` に届かず（cli の
-//!   `non_linux_failure`）、`openat` 系の定数・FFI・libc 照合を足す根拠が無い。Windows の ACL は #2428 の
-//!   方式判断待ち。Linux の他アーキテクチャは `sys::at` の定数・番号を確かめていない。
+//!   root 配下の別マウントは `RESOLVE_NO_XDEV` の `EXDEV` で拒否し、`FailedPrecondition` と固定メッセージ
+//!   （[`MOUNT_CROSSING_MESSAGE`]）に写す（対応外。#2701・`docs/design/image-store-root-trust.md` 3-d）。
+//! - macOS と Windows: 正規パスを持つ従来のパス起点の実装で、差し替えは入口の再検査だけで検出する。
+//!   macOS は本番経路が `ImageStore::open` に届かず（cli の `non_linux_failure`）、`openat` 系の定数・FFI・
+//!   libc 照合を足す根拠が無い。Windows の ACL は #2428 の方式判断待ち。
+//! - Linux の他アーキテクチャ: `sys::at` の定数・番号を確かめていないため、パス起点へ縮退せず
+//!   `Unimplemented` で拒否する（`layer::anchored` と同じ fail-closed。#2701）。
 //!
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
@@ -49,6 +52,56 @@ use crate::error::{OciError, OciErrorCode};
 
 fn root_inaccessible() -> OciError {
     OciError::new(OciErrorCode::Internal, "image store root is not accessible")
+}
+
+/// root 配下の別マウント（`RESOLVE_NO_XDEV` の `EXDEV`）を示す固定メッセージ（OCI-7・SEC-1・ERR-1・#2701）。
+pub(crate) const MOUNT_CROSSING_MESSAGE: &str =
+    "image store path crosses a mount point; unsupported (RESOLVE_NO_XDEV)";
+
+/// root 配下の別マウントで拒否したことを表す `FailedPrecondition`。
+///
+/// 永続化モジュールは errno を書かず、`map_root_io` 経由で本関数へ届く。対応外の構成であり、
+/// 再試行しても直らない（呼び出し側は再試行回数を消費しない）。
+pub(crate) fn mount_crossing() -> OciError {
+    OciError::new(OciErrorCode::FailedPrecondition, MOUNT_CROSSING_MESSAGE)
+}
+
+/// fd 起点の I/O の失敗を OCI のエラーへ写す。`EXDEV`（`CrossesDevices`）は `mount_crossing()`、
+/// それ以外は `fallback()`（各呼び出し元の従来の code・文言）。
+///
+/// `EXDEV` は fd 起点の `openat2`（`RESOLVE_NO_XDEV`）以外では通常 `rename` の別デバイスでも起きるが、
+/// 本ストアの rename は同一ディレクトリ内に限るため、どちらでも「root 配下の別マウント」を意味する。
+pub(crate) fn map_root_io(e: &std::io::Error, fallback: impl FnOnce() -> OciError) -> OciError {
+    if e.kind() == std::io::ErrorKind::CrossesDevices {
+        mount_crossing()
+    } else {
+        fallback()
+    }
+}
+
+/// `e` が `mount_crossing()` か（復旧が再試行回数を消費せずに止まる判定に使う）。
+pub(crate) fn is_mount_crossing(e: &OciError) -> bool {
+    e.code() == OciErrorCode::FailedPrecondition && e.message() == MOUNT_CROSSING_MESSAGE
+}
+
+/// `openat2` が root を開けなかった理由を、利用者が原因を切り分けられる固定メッセージにする。
+///
+/// code はどちらも `Unimplemented`（呼び出し側の分類を変えない）。`EPERM` は古い Docker の既定 seccomp
+/// プロファイルなど、外側のコンテナランタイムによる拒否を示す（#2701）。
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn openat2_unavailable(is_enosys: bool) -> OciError {
+    let msg = if is_enosys {
+        "openat2 is not available (ENOSYS): the image store requires Linux 5.6 or later, or a seccomp profile that allows openat2"
+    } else {
+        "openat2 was denied (EPERM), likely by a seccomp profile of the enclosing container runtime; the image store requires openat2"
+    };
+    OciError::new(OciErrorCode::Unimplemented, msg)
 }
 
 /// `open_subdir` の失敗。呼び出し側（usage）が既存の code・文言へ写す（文言はここに固定しない）。
@@ -125,8 +178,9 @@ impl RootHandle {
 
     /// 信頼検査をしない単体テーブル用に、パスから開く（検査は `ImageStore::open` の担当）。
     ///
-    /// 末尾が symlink・非ディレクトリなら拒否する。
-    pub(crate) fn open_unchecked(path: &Path) -> Result<Self, OciError> {
+    /// 試験と、ガードの外の単体テーブルの読み取り専用 API で使う（削除系の `gc_journal::root_handle_for` は
+    /// 本番ビルドでこの経路を拒否する。#2701）。末尾が symlink・非ディレクトリなら拒否する。
+    pub(super) fn open_unchecked(path: &Path) -> Result<Self, OciError> {
         let path: PathBuf = path.components().collect();
         let meta = std::fs::symlink_metadata(&path).map_err(|e| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
@@ -210,10 +264,8 @@ mod imp {
                 0,
             )
             .map_err(|e| match errno(&e) {
-                Some(ENOSYS | EPERM) => OciError::new(
-                    OciErrorCode::Unimplemented,
-                    "image store requires openat2 (Linux 5.6 or later)",
-                ),
+                Some(ENOSYS) => super::openat2_unavailable(true),
+                Some(EPERM) => super::openat2_unavailable(false),
                 _ => root_inaccessible(),
             })?;
             let meta = File::from(fd.try_clone().map_err(|_| root_inaccessible())?)
@@ -239,6 +291,10 @@ mod imp {
             flags: u64,
             mode: u64,
         ) -> io::Result<OwnedFd> {
+            #[cfg(test)]
+            if test_hook::is_xdev(rel) {
+                return Err(io::Error::from_raw_os_error(at::EXDEV));
+            }
             at::openat2(
                 Some(self.inner.as_fd()),
                 rel,
@@ -350,6 +406,7 @@ mod imp {
                 Ok(fd) => Ok(Some(SubDir(fd))),
                 Err(e) => match errno(&e) {
                     Some(ELOOP | ENOTDIR) => Err(blob_dir_not_plain()),
+                    _ if e.kind() == io::ErrorKind::CrossesDevices => Err(super::mount_crossing()),
                     _ if e.kind() == io::ErrorKind::NotFound => Ok(None),
                     _ => Err(blob_dir_stat_failed()),
                 },
@@ -363,6 +420,39 @@ mod imp {
         ) -> Result<Option<SubDir>, SubDirError> {
             let n = Self::name_cstr(name.as_ref()).map_err(|_| SubDirError::Io)?;
             open_dir_at(self.inner.as_fd(), &n)
+        }
+    }
+
+    /// 試験用: 指定した相対名（`@lock`・`blobs/sha256` 等）の `openat2` を `EXDEV` で失敗させる。
+    ///
+    /// root 配下の別マウント（bind mount・別ボリューム）が `RESOLVE_NO_XDEV` で拒否される状況を、
+    /// 実マウントなしで決定的に再現する（実マウントでの確認は `tests/image_store_xdev.rs`。#2701）。
+    #[cfg(test)]
+    pub(crate) mod test_hook {
+        use std::cell::RefCell;
+        use std::ffi::CStr;
+
+        thread_local! {
+            static XDEV: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+
+        /// 解除用ガード（drop で全解除）。
+        pub(crate) struct XdevGuard;
+
+        impl Drop for XdevGuard {
+            fn drop(&mut self) {
+                XDEV.with(|x| x.borrow_mut().clear());
+            }
+        }
+
+        /// 以降このスレッドで、`names` の相対名の解決を `EXDEV` にする。
+        pub(crate) fn fail_xdev(names: &[&str]) -> XdevGuard {
+            XDEV.with(|x| *x.borrow_mut() = names.iter().map(|n| (*n).to_owned()).collect());
+            XdevGuard
+        }
+
+        pub(super) fn is_xdev(rel: &CStr) -> bool {
+            XDEV.with(|x| x.borrow().iter().any(|n| n.as_bytes() == rel.to_bytes()))
         }
     }
 
@@ -669,6 +759,14 @@ mod imp {
             path: PathBuf,
             expected: Option<(u64, u64)>,
         ) -> Result<Self, OciError> {
+            // Linux の他アーキテクチャは fd 起点の定数・番号を確かめていないため、パス起点へ縮退せず拒否する
+            // （`layer::anchored` と同じ fail-closed。OCI-7・SEC-1・#2701）。
+            if cfg!(target_os = "linux") {
+                return Err(OciError::new(
+                    OciErrorCode::Unimplemented,
+                    "image store requires directory-fd based access, which is not supported on this architecture",
+                ));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -676,7 +774,7 @@ mod imp {
                 let id = (m.dev(), m.ino());
                 if expected.is_some_and(|x| x != id) {
                     return Err(OciError::new(
-                        super::OciErrorCode::Internal,
+                        OciErrorCode::Internal,
                         "image store root changed while opening",
                     ));
                 }
@@ -979,6 +1077,12 @@ mod imp {
 pub(crate) use imp::BlobDir;
 #[cfg(all(test, unix))]
 pub(crate) use imp::SubDir;
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) use imp::test_hook;
 
 impl RootHandle {
     /// 正規化済みのパスと検査時の (dev, ino) から開く（`ImageStore::open` が信頼検査の後に呼ぶ）。
@@ -1106,7 +1210,14 @@ mod tests {
     }
 
     /// OCI-7・SEC-1・#2696: root を rmdir した後は `ensure_linked` が `Internal` で拒否する（移動では拒否しない）。
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            not(target_os = "linux"),
+            target_arch = "x86_64",
+            target_arch = "aarch64"
+        )
+    ))]
     #[test]
     fn oci7_ensure_linked_rejects_removed_root() {
         let r = temp_root("unlinked");
@@ -1115,7 +1226,7 @@ mod tests {
         std::fs::remove_dir_all(&r).expect("remove");
         let e = h.ensure_linked().expect_err("removed");
         assert_eq!(e.code(), OciErrorCode::Internal);
-        // fd 起点は `st_nlink == 0` を検出する。パス起点の unix（macOS・他アーキの Linux）は
+        // fd 起点は `st_nlink == 0` を検出する。パス起点の unix（macOS）は
         // root_meta が lstat のため、削除後は到達不能として扱われる。
         #[cfg(all(
             target_os = "linux",
@@ -1127,6 +1238,38 @@ mod tests {
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
         assert_eq!(e.message(), "image store root is not accessible");
+    }
+
+    /// OCI-7・SEC-1・#2701: Linux の他アーキテクチャはパス起点へ縮退せず、open の時点で `Unimplemented`
+    /// （`layer::anchored` と同じ fail-closed）。CI に該当アーキテクチャの実行環境は無く、型検査のみ。
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    #[test]
+    fn oci7_other_linux_arch_is_rejected() {
+        let r = temp_root("other-arch");
+        let e = RootHandle::open_unchecked(&r).expect_err("unsupported arch");
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "image store requires directory-fd based access, which is not supported on this architecture"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// OCI-7・SEC-1・ERR-1・#2701: `is_mount_crossing` は固定メッセージの `FailedPrecondition` だけを真にする。
+    #[test]
+    fn oci7_is_mount_crossing_matches_only_the_fixed_error() {
+        assert!(is_mount_crossing(&mount_crossing()));
+        assert!(!is_mount_crossing(&OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob directory is not a plain directory"
+        )));
+        assert!(!is_mount_crossing(&OciError::new(
+            OciErrorCode::Internal,
+            MOUNT_CROSSING_MESSAGE
+        )));
     }
 
     /// OCI-7・SEC-1・#2695: `entries` は何度呼んでも同じ名前の集合を返し、`open_subdir` は symlink・通常ファイルを

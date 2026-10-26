@@ -1241,6 +1241,40 @@ jobs:
           done
           echo "::notice::userns_extract verified"
 
+      # image_store_xdev（`crates/oci/tests/image_store_xdev.rs`。OCI-7・SEC-1・ERR-1・#2701）: イメージストア root 配下の
+      # 別マウント（`blobs/sha256` と `@lock` の bind mount）が rm・prune・lock で `FailedPrecondition` になることを、
+      # 非特権の user / mount namespace の中の実マウントで照合する実機前提テスト（harness = false）。
+      # 新しい check-run・sudo・permissions は追加しない。成功行は行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
+      - name: image_store_xdev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test image_store_xdev --no-run
+
+      - name: image_store_xdev の実行（実機前提テスト・--ignored。OCI-7・SEC-1・ERR-1・#2701）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/image_store_xdev.log"
+          cargo test -p fandhe-container-oci --test image_store_xdev -- --ignored 2>&1 | tee "${log}"
+          if grep -Fq 'image_store_xdev: ignored' "${log}"; then
+            echo "::error::image_store_xdev was skipped (--ignored did not reach the test)" >&2
+            exit 1
+          fi
+          for line in \
+            'ok: xdev_rm' \
+            'ok: xdev_prune' \
+            'ok: xdev_lock_pending_journal' \
+            'ok: xdev_lock_file_bind' \
+            'test image_store_xdev ... ok'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::image_store_xdev did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "::notice::image_store_xdev verified"
+
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10

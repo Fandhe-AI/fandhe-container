@@ -26,7 +26,7 @@
 # ユーザー名・環境変数は書かない。list の PID 列は <pid> に置換し、想定外の出力は内容を写さず
 # <unexpected>:行数 とする。inspect の 1 行 JSON は bundle（絶対パス）を記録せず、PID は <pid>、
 # cgroup は <set>、idMapping は model と extent 件数、auditCoverage は reason を落とし、capabilities は
-# 件数だけにする（CLI-1・#2826）。
+# 件数だけ、rootReadonly は true / false / - にする（CLI-1・#2826）。
 #
 # 使い方:
 #   cli-parity-check.sh capture --cli <絶対パス> --output <新規ファイル> [--timeout SECS（既定 20。1〜600）]
@@ -433,9 +433,10 @@ norm_inspect() {
   if [ "$idmap" = "-" ]; then
     rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
   fi
-  # explicitStop と capabilities。capability の名前は検証して件数だけ記録する（最大 41 件の名前は 1 欄の上限を超える）。
-  [[ $rest =~ ^\"explicitStop\":\"([a-z_]{1,16})\",\"capabilities\":(null|\{\"bounding\":\[([^]]*)\]\})\}$ ]] || return 1
+  # explicitStop・capabilities・rootReadonly（true / false / null。末尾に必ず出る。#2828）。capability の名前は検証して件数だけ記録する（最大 41 件の名前は 1 欄の上限を超える）。
+  [[ $rest =~ ^\"explicitStop\":\"([a-z_]{1,16})\",\"capabilities\":(null|\{\"bounding\":\[([^]]*)\]\}),\"rootReadonly\":(null|true|false)\}$ ]] || return 1
   stop="${BASH_REMATCH[1]}"
+  ro="${BASH_REMATCH[4]}"
   if [ "${BASH_REMATCH[2]}" = "null" ]; then
     caps='-'
   else
@@ -445,7 +446,8 @@ norm_inspect() {
     tmp="${cl//\"CAP_/}"
     caps=$(((${#cl} - ${#tmp}) / 5))
   fi
-  norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps}"
+  [ "$ro" = "null" ] && ro='-'
+  norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps},ro=${ro}"
   return 0
 }
 
@@ -640,7 +642,7 @@ load_capture() {
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
-  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3})$'
+  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
   local k entry_id so_ok
   line=""
   while IFS= read -r line; do

@@ -214,7 +214,7 @@ case "$cmd" in
       cat "$STUB_INSPECT_DIR/out"
     else
       # 製品の InspectReport::to_json と同じキー順。bundle にはパス風の文字列を入れ、漏えいしないことを照合する。
-      printf '{"id":"%s","status":"created","pid":null,"exitCode":null,"bundle":"/home/secret-user/bundle","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n' "$id"
+      printf '{"id":"%s","status":"created","pid":null,"exitCode":null,"bundle":"/home/secret-user/bundle","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n' "$id"
     fi
     ;;
   stop) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill; fail_op 5 FAILED_PRECONDITION kill ;;
@@ -331,21 +331,25 @@ cap_names='"CAP_CHOWN","CAP_KILL","CAP_NET_RAW"'
 ext1='{"containerId":0,"hostId":100000,"size":65536}'
 ext2='{"containerId":65536,"hostId":300000,"size":10}'
 head_ok='{"id":"web-1","status":"running","pid":42,"exitCode":-9,"bundle":"/home/secret-user/b\\"q\\" \303\251","revision":5,'
-mkinsp full "${head_ok//%/%%}"'"cgroupScope":"/user/secret-slice","cgroupInstance":2,"supervisorPid":7,"health":"healthy","restartCount":2,"auditCoverage":{"policy":"evaluated","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":"kernel 6.12 secret"},"record":"failed"},"idMapping":{"model":"subordinate","uid":['"$ext1,$ext2"'],"gid":['"$ext1"']},"explicitStop":"recorded","capabilities":{"bounding":['"$cap_names"']}}\n'
-tail_ok='"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}'
+mkinsp full "${head_ok//%/%%}"'"cgroupScope":"/user/secret-slice","cgroupInstance":2,"supervisorPid":7,"health":"healthy","restartCount":2,"auditCoverage":{"policy":"evaluated","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":"kernel 6.12 secret"},"record":"failed"},"idMapping":{"model":"subordinate","uid":['"$ext1,$ext2"'],"gid":['"$ext1"']},"explicitStop":"recorded","capabilities":{"bounding":['"$cap_names"']},"rootReadonly":true}\n'
+tail_ok='"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}'
 base_head='{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"/b","revision":1,'
 mkinsp order '{"status":"created","id":"c1","pid":null,"exitCode":null,"bundle":"/b","revision":1,'"$tail_ok"'\n'
 mkinsp extra "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"extra":1}\n'
-mkinsp missing '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"/b","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"capabilities":null}\n'
+mkinsp rofalse "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":false}\n'
+mkinsp noro "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp badro "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":"yes"}\n'
+mkinsp extrarw "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":true,"extra":1}\n'
+mkinsp missing '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"/b","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"capabilities":null,"rootReadonly":null}\n'
 mkinsp nolf "$base_head$tail_ok"
 mkinsp crlf "$base_head$tail_ok"'\r\n'
 mkinsp twolines "$base_head$tail_ok"'\n'"$base_head$tail_ok"'\n'
-mkinsp badcap "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":{"bounding":["cap_chown"]}}\n'
+mkinsp badcap "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":{"bounding":["cap_chown"]},"rootReadonly":null}\n'
 mkinsp badstr '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"a"b","revision":1,'"$tail_ok"'\n'
 mkinsp lead0pid '{"id":"c1","status":"running","pid":042,"exitCode":null,"bundle":"/b","revision":1,'"$tail_ok"'\n'
-mkinsp lead0ext "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":{"model":"subordinate","uid":[{"containerId":00,"hostId":100000,"size":1}],"gid":[]},"explicitStop":"not_recorded","capabilities":null}\n'
-mkinsp lead0cg "$base_head"'"cgroupScope":null,"cgroupInstance":01,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
-mkinsp besteffort "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":{"policy":"best-effort","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":null},"record":null},"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp lead0ext "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":{"model":"subordinate","uid":[{"containerId":00,"hostId":100000,"size":1}],"gid":[]},"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
+mkinsp lead0cg "$base_head"'"cgroupScope":null,"cgroupInstance":01,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
+mkinsp besteffort "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":{"policy":"best-effort","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":null},"record":null},"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
 mkinsp empty ''
 mkdir -p "$inspdir/big"
 {
@@ -403,7 +407,7 @@ STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
 STUB_OUT_DIR="$outdir" start_capture outtable ok
-insp_names="full order extra missing nolf crlf twolines badcap badstr big lead0pid lead0ext lead0cg besteffort empty"
+insp_names="full rofalse noro badro extrarw order extra missing nolf crlf twolines badcap badstr big lead0pid lead0ext lead0cg besteffort empty"
 for n in $insp_names; do
   STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
 done
@@ -641,15 +645,16 @@ compare g3 g3
 expect_rc "list form on a non-list case is rejected" 2 $?
 
 # --- inspect の 1 行 JSON（種別 i。B17）---
-expect_line "B17 inspect of a created container" ok "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-"
-expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3"
-for n in order extra missing nolf crlf twolines badcap badstr; do
+expect_line "B17 inspect of a created container" ok "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
+expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3,ro=true"
+for n in order extra noro badro extrarw missing nolf crlf twolines badcap badstr; do
   expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:$(case $n in nolf) echo 0 ;; twolines) echo 2 ;; *) echo 1 ;; esac)"
 done
 for n in lead0pid lead0ext lead0cg; do
   expect_line "B17 leading-zero number ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:1"
 done
-expect_line "B17 hyphenated audit policy is accepted" insp_besteffort "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-"
+expect_line "B17 rootReadonly false is accepted" insp_rofalse "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=false"
+expect_line "B17 hyphenated audit policy is accepted" insp_besteffort "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-,ro=-"
 expect_line "B17 empty stdout on success is unexpected" insp_empty "B17${tab}B${tab}0${tab}-${tab}<unexpected>:0"
 expect_line "B17 oversized inspect is unexpected" insp_big "B17${tab}B${tab}0${tab}-${tab}<unexpected>:big"
 # 漏えい検査: bundle のパス・cgroup 名・ホストの id・reason は capture に現れない
@@ -669,7 +674,7 @@ cmp_has_prefix "B17 different values reported as MISMATCH" "B17 MISMATCH"
 compare ok nonlinux
 cmp_has_prefix "B17 non-linux is MISMATCH" "B17 MISMATCH"
 # load_capture: 種別ごとに受理する形式を限定する
-sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=x,caps=-/" "$work/ok.txt" >"$work/i1.txt"
+sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/i1.txt"
 compare i1 i1
 expect_rc "inspect form on a non-inspect case is rejected" 2 $?
 sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/i2.txt"

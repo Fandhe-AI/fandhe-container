@@ -120,7 +120,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 
 結果欄は 終了コード / `code` / stdout 要約（`-` = 空、`list:H;<id>,<status>,<pid|->` = list 形式、`inspect:...` = inspect の 1 行 JSON の正規化形式）。
 
-`inspect:<id>,<status>,pid=<pid|->,exit=<整数|->,rev=<整数>,cg=<set|->,sup=<pid|->,health=<語彙|->,rst=<整数>,audit=<policy/seccompKill/landlock/record|->,idmap=<model:uid件数:gid件数|->,stop=<語彙>,caps=<件数|->` の固定語彙の 1 欄に畳んで記録する（`scripts/cli-parity-check.sh` の `norm_inspect`。CLI-1・#2826）。値を記録する項目は id・status・health・exitCode・revision・restartCount・explicitStop で、PID（pid・supervisorPid）は `<pid>`、cgroup（cgroupScope・cgroupInstance）は `<set>` に置換する。記録しない項目は bundle（絶対パス）・auditCoverage の reason（カーネル版数に依る詳細）・idMapping の hostId（ホストの subuid 設定）・capabilities の名前（件数だけ記録）。キー順や形が製品の出力契約（`crates/supervisor/src/inspect.rs`）と違う出力は `<unexpected>:<行数>` になり、一致扱いにならない。
+`inspect:<id>,<status>,pid=<pid|->,exit=<整数|->,rev=<整数>,cg=<set|->,sup=<pid|->,health=<語彙|->,rst=<整数>,audit=<policy/seccompKill/landlock/record|->,idmap=<model:uid件数:gid件数|->,stop=<語彙>,caps=<件数|->,ro=<true|false|->` の固定語彙の 1 欄に畳んで記録する（`scripts/cli-parity-check.sh` の `norm_inspect`。CLI-1・#2826）。値を記録する項目は id・status・health・exitCode・revision・restartCount・explicitStop で、PID（pid・supervisorPid）は `<pid>`、cgroup（cgroupScope・cgroupInstance）は `<set>` に置換する。記録しない項目は bundle（絶対パス）・auditCoverage の reason（カーネル版数に依る詳細）・idMapping の hostId（ホストの subuid 設定）・capabilities の名前（件数だけ記録）。キー順や形が製品の出力契約（`crates/supervisor/src/inspect.rs`）と違う出力は `<unexpected>:<行数>` になり、一致扱いにならない。
 
 | ID | コマンドと前提 | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
 | -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |

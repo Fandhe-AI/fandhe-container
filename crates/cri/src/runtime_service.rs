@@ -101,7 +101,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -592,6 +592,48 @@ impl<T> std::future::Future for BoundedWait<T> {
     }
 }
 
+/// `RunPodSandbox` の `set_up` の結果を、worker と呼び出し側のどちらが先に確定したか（#2675・CRI-2・NET-1）。
+///
+/// どちらも registry のロック下で 1 度だけ遷移を試み、先に遷移した側だけが確定する。期限超過の判定から
+/// 呼び出し側がロックを取るまでの間に worker が完了しても、worker が確定したなら呼び出し側は結果不明として
+/// 失敗を返さず（Ready を公開したまま失敗を返す食い違いを防ぐ）、呼び出し側が先に手放したなら worker は
+/// Ready を公開しない。
+struct SetUpSettlement(AtomicU8);
+
+impl SetUpSettlement {
+    const PENDING: u8 = 0;
+    const BY_WORKER: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::PENDING))
+    }
+
+    /// worker が結果を確定する。呼び出し側が先に結果不明として手放していたら偽（Ready を公開しない）。
+    fn settle_by_worker(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::BY_WORKER,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// 呼び出し側が結果不明として手放す。worker が先に確定していたら偽（記録は worker の確定どおり）。
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
 /// `set_up` の worker が正常に確定できないまま終わった（panic・起動されないままの破棄）とき、
 /// `network_pending` を解除して資源が残りうる印（`network_owned`・notready）へ倒す guard（#2675・CRI-2・NET-1）。
 ///
@@ -1075,6 +1117,7 @@ impl CriRuntimeService {
     /// （期限つき。REPAIR-5）→ 成功なら記録へ netns を入れて確定、の順。失敗した場合は `tear_down` で回収を試み、
     /// 回収できたら記録を除去して元のエラーを返す。回収に失敗した・期限超過で結果が不明な場合は、資源が
     /// 残りうるため記録を notready で残し（`network_owned`）、Stop・Remove の `tear_down` で回収できるようにする。
+    /// 期限超過の判定から記録を取るまでの間に worker が成功を確定した場合は成功として返す（[`SetUpSettlement`]）。
     async fn run_sandbox_networked(
         &self,
         provider: &Arc<dyn PodNetworkProvider>,
@@ -1101,11 +1144,11 @@ impl CriRuntimeService {
         // 追跡させる（完了前の Stop・Remove の tear_down との競合で資源が漏れるのを防ぐ。CRI-2・NET-1）。
         let ran = Arc::new(AtomicBool::new(false));
         let worker_ran = Arc::clone(&ran);
-        // 呼び出し側が期限超過・待ち受け失敗で結果不明として返した印。ロック下で立て、worker が
-        // ロック下で読む。立っていれば遅れて成功しても Ready へは戻さず NotReady のまま資源だけ記録する
+        // 結果の確定権。worker と呼び出し側（期限超過・待ち受け失敗で結果不明として返す側）がロック下で
+        // 奪い合い、呼び出し側が先なら遅れて成功しても Ready へは戻さず NotReady のまま資源だけ記録する
         // （失敗扱いで返した sandbox を Ready として公開しない。CRI-2・NET-1）。
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let worker_abandoned = Arc::clone(&abandoned);
+        let settlement = Arc::new(SetUpSettlement::new());
+        let worker_settlement = Arc::clone(&settlement);
         let guard = NetworkSetUpGuard {
             registry: Arc::clone(&self.registry),
             id: id.clone(),
@@ -1125,7 +1168,8 @@ impl CriRuntimeService {
                 // 失敗時は notready を worker がロック下で確定する（Ready のまま CreateContainer が通らないように）。
                 record.network_owned = true;
                 record.network_pending = false;
-                record.state = if outcome.is_ok() && !worker_abandoned.load(Ordering::SeqCst) {
+                let settled = worker_settlement.settle_by_worker();
+                record.state = if outcome.is_ok() && settled {
                     SandboxState::Ready
                 } else {
                     SandboxState::NotReady
@@ -1175,8 +1219,10 @@ impl CriRuntimeService {
                 } else if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.records.get_mut(&id)
                 {
-                    if unknown {
-                        abandoned.store(true, Ordering::SeqCst);
+                    // 期限超過の判定の後、ロックを取るまでに worker が成功を確定して Ready を公開していたら、
+                    // set_up は完了しているので成功として返す（公開済みの Ready と失敗の応答を食い違わせない）。
+                    if unknown && !settlement.abandon() && record.state == SandboxState::Ready {
+                        return Ok(resp);
                     }
                     record.state = SandboxState::NotReady;
                     record.network_owned = true;
@@ -2775,6 +2821,21 @@ impl RuntimeService for CriRuntimeService {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// CRI-2・NET-1（#2675）: set_up の結果の確定権は先に遷移した側だけが得る。worker が先なら呼び出し側は
+    /// 手放せず（成功として返す）、呼び出し側が先なら worker は確定できない（Ready を公開しない）。
+    #[test]
+    fn set_up_settlement_is_won_by_exactly_one_side() {
+        let worker_first = SetUpSettlement::new();
+        assert!(worker_first.settle_by_worker());
+        assert!(!worker_first.abandon());
+        assert!(!worker_first.settle_by_worker());
+
+        let caller_first = SetUpSettlement::new();
+        assert!(caller_first.abandon());
+        assert!(!caller_first.settle_by_worker());
+        assert!(!caller_first.abandon());
+    }
 
     thread_local! {
         /// 現スレッドの N 回目（0 起点）のスレッド生成を失敗させる（`None` で無効）。

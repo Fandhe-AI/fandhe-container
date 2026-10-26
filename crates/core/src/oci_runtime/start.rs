@@ -4096,6 +4096,139 @@ mod tests {
         );
     }
 
+    /// SEC-1・CORE-2（#2823）の本番経路: 実際の fd の mount ID 照合（`child_is_visible`）を通す。
+    /// 実在するディレクトリは自分の mount ID と一致して「見える」、食い違う ID は「見えない」と判定される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2823_child_is_visible_matches_real_mount_id() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-vis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let point = base.to_str().expect("utf8").to_owned();
+        let mnt = path_mount_id(&point).expect("mount id");
+        assert!(child_is_visible(&point, mnt));
+        assert!(!child_is_visible(&point, mnt + 1));
+        assert!(!child_is_visible(&format!("{point}/missing"), mnt));
+        // 本番の判定を build_protected_roots へ渡すと、ID が食い違う子は走査根を持たず「リンクあり」に固定される。
+        let state_id = FsIdentity {
+            dev: "A".to_owned(),
+            path: "/".to_owned(),
+        };
+        let child = |id: u64| {
+            vec![(
+                FsIdentity {
+                    dev: "B".to_owned(),
+                    path: "/".to_owned(),
+                },
+                point.clone(),
+                id,
+            )]
+        };
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt), &child_is_visible);
+        assert!(!roots[1].has_hard_linked_files());
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt + 1), &child_is_visible);
+        assert!(roots[1].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CORE-2（#2823）の実マウント結合試験（実機前提・`--ignored`）。非特権 user / mount namespace
+    /// （util-linux の `unshare`）の中で、子マウント Y（ハードリンクを持つ tmpfs）を祖先の overmount で隠し、
+    /// 本番経路（mountinfo の解釈・`path_mount_id`・`child_is_visible`・`build_protected_roots`）で隠れた子が
+    /// 「リンクあり」に固定されることを具体値で照合する。成功行は `ok: sec1_2823_overmount`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires unprivileged user namespaces and util-linux unshare/mount (SEC-1, CORE-2, #2823)"]
+    fn sec1_2823_overmount_hides_child_in_real_namespace() {
+        const NAME: &str =
+            "oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace";
+        if std::env::var_os("FANDHE_2823_INNER").is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let out = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .arg(exe)
+                .args([
+                    "--exact",
+                    NAME,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("FANDHE_2823_INNER", "1")
+                .output()
+                .expect("spawn unshare");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "inner failed: {text}");
+            assert!(
+                text.contains("ok: sec1_2823_overmount"),
+                "no success line: {text}"
+            );
+            println!("ok: sec1_2823_overmount");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("fandhe-oci-2823-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mount_tmpfs = |dir: &Path| {
+            let st = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(dir)
+                .status()
+                .expect("mount");
+            assert!(st.success(), "mount tmpfs on {}", dir.display());
+        };
+        let x = base.join("x");
+        let y = x.join("y");
+        std::fs::create_dir_all(&y).expect("mkdir");
+        // 状態ルート = base(tmpfs A)。その下の x/y に tmpfs Y を置き、Y にハードリンクを作る。
+        mount_tmpfs(&base);
+        std::fs::create_dir_all(&y).expect("mkdir y");
+        mount_tmpfs(&y);
+        std::fs::write(y.join("f"), b"x").expect("write");
+        std::fs::hard_link(y.join("f"), y.join("g")).expect("link");
+        // 祖先 x を別の tmpfs で覆う。Y は mountinfo に残るが x/y のパスからは辿れなくなる。
+        mount_tmpfs(&x);
+        std::fs::create_dir_all(&y).expect("mkdir y over");
+        let base_s = base.to_str().expect("utf8").to_owned();
+        let mountinfo = read_mountinfo_bounded("/proc/thread-self/mountinfo").expect("mountinfo");
+        let mounts = parse_mountinfo(&mountinfo).expect("parse");
+        let state_mnt = path_mount_id(&base_s).expect("state mnt");
+        let state_id = fs_identity(&mounts, state_mnt, &base_s).expect("state id");
+        let children = mounts_under(&mounts, &base_s);
+        assert_eq!(children.len(), 2);
+        // 覆われた Y（x/y の位置の行）は見えず、覆っている tmpfs（x の位置の行）は見える。
+        let hidden = children
+            .iter()
+            .find(|(_, p, _)| {
+                p.ends_with("/x/y") && !child_is_visible(p, children_id(&children, p))
+            })
+            .expect("hidden child");
+        let roots = build_protected_roots(&state_id, &base_s, &children, &child_is_visible);
+        let idx = children.iter().position(|c| c.2 == hidden.2).expect("pos") + 1;
+        assert!(
+            roots[idx].has_hard_linked_files(),
+            "hidden child must be fixed to linked"
+        );
+        // 覆っている x は見えていて、走査してもリンクは無い。
+        let xi = children
+            .iter()
+            .position(|c| c.1.ends_with("/x"))
+            .expect("x")
+            + 1;
+        assert!(!roots[xi].has_hard_linked_files());
+        println!("ok: sec1_2823_overmount");
+        let _ = std::fs::remove_dir_all(&base);
+
+        fn children_id(children: &[(FsIdentity, String, u64)], p: &str) -> u64 {
+            children.iter().find(|c| c.1 == p).map_or(0, |c| c.2)
+        }
+    }
+
     /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。
     /// bundle の配下だけを指す子マウントや無関係な FS の元は拒否しない。
     #[test]

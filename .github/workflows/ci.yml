@@ -1296,6 +1296,34 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::sec1_2536_protected_root_on_real_overlay verified"
 
+      # sec1_2823_overmount_hides_child_in_real_namespace（`crates/core/src/oci_runtime/start.rs` の lib 内試験。SEC-1・CORE-2・
+      # NET-1・#2823）: 祖先の overmount で隠れた子マウントを、本番の fd の mount ID 照合（`child_is_visible`）から
+      # `build_protected_roots` まで通し、隠れた子が「リンクあり」に固定されることを非特権 user + mount namespace の実マウントで
+      # 確かめる実機前提テスト。上で緩和した sysctl を使い回す。ビルドは sec1_2536 のステップが済ませた lib を使い回す。
+      # 結果行（`ok`）に加え、内側の成功行 `ok: sec1_2823_overmount` も完全一致で照合する。
+      - name: sec1_2823_overmount_hides_child_in_real_namespace の実行（実機前提テスト・--ignored。SEC-1・CORE-2・#2823）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sec1_2823_overmount.log"
+          cargo test -p fandhe-container-core --lib \
+            -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --nocapture 2>&1 | tee "${log}"
+          name='oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace'
+          if grep -Fxq "test ${name} ... ignored" "${log}"; then
+            echo "::error::${name} was ignored (--ignored did not reach the test)" >&2
+            exit 1
+          fi
+          if ! grep -Fxq "test ${name} ... ok" "${log}"; then
+            echo "::error::${name} did not report ok (possibly not executed)" >&2
+            exit 1
+          fi
+          if ! grep -Fxq "ok: sec1_2823_overmount" "${log}"; then
+            echo "::error::sec1_2823_overmount success line is missing" >&2
+            exit 1
+          fi
+          echo "::notice::sec1_2823_overmount_hides_child_in_real_namespace verified"
+
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の

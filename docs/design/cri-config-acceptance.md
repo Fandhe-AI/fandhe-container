@@ -101,7 +101,7 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 - 主 gid は補助グループへ自動では足さない（core の launcher が `setgroups(list)` でそのまま適用するため）。containerd は `additionalGids` に主 gid を含めることがあり、ここが既知の差
 - 報告は `BundleProvider::prepare` の戻り値 `PreparedBundle`（`user()`）で `CriRuntimeService` へ届き、`ContainerRecord.applied_user` に保持する。置き場所はプロセス内メモリのレジストリで、寿命は `exit_code`・`resolved_log_path` と同じ（plugin-cri の再起動で消える）。config の annotations には書かず（CRI は書き換えを禁じる）、core の `StateStore` にも書かない（PLUG-1 の境界）。報告の無い経路（スタブ・報告しない provider）は `user` が `None` のまま（root を作り出さない）
 - 補助グループの保持量（最大 65,536 件）は `container_retained_bytes` の累積上限に入れ、超えたら `FAILED_PRECONDITION`（黙って切り詰めない）
-- 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。Status RPC が未実装（`UNIMPLEMENTED`）のため現状は応答に乗らない。Status RPC の実装時にこの関数を使う（REPAIR-3）
+- 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。`Status` RPC の応答の `features` にそのまま乗る（#2830。[cri-status-rpc.md](cri-status-rpc.md)）
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

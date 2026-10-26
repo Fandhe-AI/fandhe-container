@@ -27,6 +27,10 @@
 //! - 自前のローテーションはしない（kubelet が rename して `ReopenContainerLog` を呼ぶ方式。未実装は後続 issue）。代わりに CRI ログ 1 本の
 //!   総量に上限を設ける（[`CRI_LOG_MAX_BYTES`]。既存サイズも数える）。超えると書き出しを止め（`ResourceExhausted`）、[`TeeLogSink`] が
 //!   構造化ログで通知する。`@container-logs` は `RotatingFileSink` の上限どおり続く。
+//! - 上限を書き手ごとに数えるため、書き手は 1 ファイルにつき 1 つに限る。開いたファイルに排他ロック（`flock(2)`）を
+//!   sink の生存中（supervisor プロセスの生存中）保持し、別の supervisor が同じパスを開こうとすると `FailedPrecondition` で
+//!   start を拒否する（kubelet は `<containerName>/<restartCount>.log` を使い回さないため、正規の経路では起きない）。
+//!   ロックは協調的で、ロックを取らない別プロセスの追記は防げない（kubelet 以外が書かない前提）。
 
 #[cfg(unix)]
 use std::io::Write as _;
@@ -236,9 +240,38 @@ fn ensure_parent_dir(
     super::rotating::check_dir(parent)
 }
 
+/// 排他ロック（`flock(2)`。open file description 単位）を試みる。`WouldBlock` なら短い猶予の中で数回やり直し、
+/// それでも取れなければ `WouldBlock` を返す（`fandhe-container-platform-macos` の `console_log` と同じ方式。MAC-1・#2138）。
+///
+/// 猶予の理由: fd を `close` しても、他スレッドの `fork` が複製した fd が子の `exec` で閉じられるまで description が
+/// 生き続け、直前に同じプロセスが解放したロックが一瞬「使用中」に見える（supervisor はコンテナのプロセスを起動する）。
+/// 実際に書き手が生きていれば猶予を超えて保持し続けるため、二重の書き手を拒否する fail-closed の挙動は変わらない
+/// （拒否が最大 [`LOCK_GRACE`] 遅れるだけ。REPAIR-5）。
+#[cfg(unix)]
+fn try_lock_with_grace(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// [`try_lock_with_grace`] が `WouldBlock` を再試行する合計時間（fork と exec の間の窓を覆う長さ）。
+#[cfg(unix)]
+const LOCK_GRACE: Duration = Duration::from_millis(250);
+
+/// [`try_lock_with_grace`] の再試行間隔。
+#[cfg(unix)]
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 impl CriFileSink {
     /// `path`（cri が結合・検証した絶対パス）を追記で開く。親ディレクトリが安全でない・最終要素が symlink / 通常ファイル
-    /// 以外のときは開かない。親ディレクトリが無ければ検査済みの祖先の直下に 1 階層だけ作る（`ensure_parent_dir`）。開けない場合は `FailedPrecondition`（launch の前の確定失敗）。
+    /// 以外のときは開かない。親ディレクトリが無ければ検査済みの祖先の直下に 1 階層だけ作る（`ensure_parent_dir`）。開けない場合と、別の書き手が排他ロックを
+    /// 保持している場合は `FailedPrecondition`（launch の前の確定失敗）。
     #[cfg(unix)]
     pub fn open(
         path: &fandhe_container_core::traits::ContainerLogPath,
@@ -277,6 +310,18 @@ impl CriFileSink {
             )
             .open(dir.join(name))
             .map_err(|_| unopenable())?;
+        // 書き手は 1 ファイルにつき 1 つ（総量の上限を書き手ごとに数えるため。別の supervisor が同じパスを開いていれば
+        // 上限が書き手の数だけ増える）。サイズは排他ロックを取ってから読む（先に読むと、解放直後の相手の書き込みを数え損ねる）。
+        match try_lock_with_grace(&file) {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "cri log file is already in use by another writer",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(_)) => return Err(unopenable()),
+        }
         let Ok(meta) = file.metadata() else {
             return Err(unopenable());
         };
@@ -666,6 +711,28 @@ mod tests {
             let sink = CriFileSink::open_with_limit(&path, 84).expect("reopen");
             let e = sink.append(StreamKind::Stdout, b"w").expect_err("full");
             assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        }
+
+        /// CRI-2・SUP-4: 同じファイルの 2 つ目の書き手は `FailedPrecondition` で拒否し（上限を書き手の数だけ増やさない）、
+        /// 1 つ目を閉じた後は開ける。
+        #[test]
+        fn cri2_file_sink_rejects_second_writer() {
+            let t = Tmp::new("lock");
+            let path = t.log("0.log");
+            let first = CriFileSink::open(&path).expect("open");
+            let e = CriFileSink::open(&path).err().expect("second writer");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "cri log file is already in use by another writer"
+            );
+            // 別のパスは影響を受けない。
+            CriFileSink::open(&t.log("1.log")).expect("other path");
+            drop(first);
+            let again = CriFileSink::open(&path).expect("reopen after close");
+            again.append(StreamKind::Stdout, b"ok").expect("append");
+            again.flush().expect("flush");
+            assert!(read(Path::new(path.as_str())).ends_with(" stdout F ok\n"));
         }
 
         /// CRI-2・SUP-4: 書いた行が CRI 形式でファイルに残り、開き直しても上書きせず追記する。

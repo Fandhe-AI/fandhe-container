@@ -162,4 +162,5 @@ CRI の `log_path`（コンテナ）と `log_directory`（サンドボックス�
 - 特権ランチャー経由（ambient capability あり）は `UNIMPLEMENTED` で拒否する。`CAP_DAC_OVERRIDE` のまま利用者指定のパスを開くと任意のファイルへ追記できてしまうため（`CapEff` / `CapPrm` が 0 でなければ拒否）。cri は `UNIMPLEMENTED` を確定失敗として created へ戻す
 - 既知の制約: rootless の supervisor は root 所有 0755 の `/var/log/pods` に書けず、標準配置の kubelet では start が失敗する。動くのは rootless の kubelet や、利用者が所有する `log_directory` の場合。`log_directory` に `/tmp`（1777）は使えない（group / other 書き込み可のため拒否）
 - 総量の上限: CRI ログ1本は 50 MiB（`CRI_LOG_MAX_BYTES`。既存サイズも数える）。超えると CRI ログへの書き出しを止め（`RESOURCE_EXHAUSTED`）、`@container-logs` は続ける。出力先ごとの最初の失敗は構造化ログ 1 行（`component=supervisor.logs`・`result=destination_failed`・`destination`・`code`。パス・行の内容は含めない。REPAIR-4）で stderr に出す
+- 書き手は 1 ファイルにつき 1 つ: 上限を書き手ごとに数えるため、開いたファイルに排他ロック（`flock(2)`）を supervisor の生存中保持し、同じ書き先を別の supervisor が開こうとすると start を `FAILED_PRECONDITION` で拒否する（kubelet は `<containerName>/<restartCount>.log` を使い回さない。ロックは協調的で、ロックを取らない別プロセスの追記は防げない）
 - 未対応（後続 issue）: `ReopenContainerLog`（kubelet のログ回転。未実装のため上限到達後は CRI ログが止まる）、ランチャー経由での CRI ログ（open の間だけ DAC 系 capability を落とす等）、64 KiB を超える行の P 断片化

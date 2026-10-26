@@ -922,6 +922,13 @@ fn repair5_create_worker_residual_is_bounded() {
         Duration::from_millis(642_900)
     );
     assert!(PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
+    // #2899: RPC の期限切れの後、dispatch 前の worker は取り消しで止まる。dispatch 後は打ち切れず、
+    // core の create（42.9 秒）+ 失敗時の削除確認（confirm_removed は PLUGIN_RUNTIME_TIMEOUT まで）で有限になる。
+    assert_eq!(
+        core_create + PLUGIN_RUNTIME_TIMEOUT,
+        Duration::from_millis(103_800)
+    );
+    assert!(core_create + PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
     assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 16 * 1024 * 1024 * 1024);
     assert_eq!(DEFAULT_MAX_LAYER_ENTRIES, 1_000_000);
     assert_eq!(DEFAULT_MAX_EXTRACTED_BYTES, 8 * 1024 * 1024 * 1024);

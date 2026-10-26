@@ -57,6 +57,10 @@ mod leftover_children;
 mod real_entry;
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 fn main() {
     // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。出力はしない。#2888）。
     real_entry::precondition::self_check();
@@ -161,6 +165,8 @@ mod linux {
     }
 
     pub fn run() {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         dispatcher();
     }
 
@@ -180,9 +186,8 @@ mod linux {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!(
+        let base =
+            super::scratch_root::scratch_root("fandhe-rootless-scratch", timeout()).join(format!(
                 "fandhe-rootless-owner-{label}-{}-{nanos}",
                 std::process::id()
             ));

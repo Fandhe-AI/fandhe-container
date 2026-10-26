@@ -319,6 +319,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
             }
             remove_supervisor_log(rt.store.as_ref(), &req);
             remove_container_log(rt.store.as_ref(), &req);
+            remove_container_options(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -363,6 +364,34 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
     if outcome == LogRemoval::TimedOut {
         emit_warning_bounded(
             log_removal_timeout_warning().to_string(),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
+    }
+}
+
+/// 起動オプション文書の削除の失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・内容は含めない。
+pub(super) fn options_removal_warning(e: &TraitError) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container options file removal failed; a leftover file may remain\"}}",
+        e.code().as_str()
+    )
+}
+
+/// core の `delete` が成功した後に、起動オプション文書(`<root>/@container-options/<id>`。#2713・SUP-12)を消す。
+///
+/// ログの削除と同じく、失敗しても delete の結果は変えず警告を 1 行だけ出す。削除の直前に、同じ ID が再作成されていない
+/// ことを確かめる(新しいインスタンスの文書を消さない。`id_is_still_deleted`)。
+fn remove_container_options(store: &dyn StateStore, req: &DeleteRequest) {
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    if !id_is_still_deleted(root, req.id()) {
+        return;
+    }
+    if let Err(e) = fandhe_container_supervisor::container_options::store::remove(root, req.id()) {
+        emit_warning_bounded(
+            options_removal_warning(&e),
             write_warning_to_stderr,
             WARNING_WRITE_TIMEOUT,
         );
@@ -424,10 +453,10 @@ fn id_is_still_deleted(
 }
 
 /// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
-const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 本番の警告出力。`eprintln!` は書き込み失敗で panic するため使わず、エラーは捨てる（delete の成功を保つ）。
-fn write_warning_to_stderr(line: &str) {
+pub(super) fn write_warning_to_stderr(line: &str) {
     use std::io::Write as _;
     let mut err = std::io::stderr();
     let _ = err.write_all(line.as_bytes());
@@ -439,7 +468,7 @@ fn write_warning_to_stderr(line: &str) {
 /// stderr が満杯の pipe / socket だと書き込みは無期限に止まり得るため、呼び出し元スレッドでは書かない。
 /// 期限切れ・書き込み側の panic・スレッド起動失敗のいずれでも何も伝播せず戻り、delete の結果は変えない
 /// （`main.rs` の `report_deferred` と同じ流儀。止まった書き込みのスレッドは置き去りにする）。
-fn emit_warning_bounded(
+pub(super) fn emit_warning_bounded(
     line: String,
     write: impl FnOnce(&str) + Send + 'static,
     timeout: Duration,
@@ -450,6 +479,30 @@ fn emit_warning_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-12(#2713): delete の後、状態の無い ID の起動オプション文書を消す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup12_delete_removes_options_document() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+        use fandhe_container_supervisor::container_options::store;
+        let dir = std::env::temp_dir().join(format!("fc-cli-del-opt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        let root = StateRoot::from_override(dir.join("state")).expect("root");
+        let fs_store = FileStateStore::open(root).expect("open");
+        let state_root = fs_store.host_state_root().expect("root").to_path_buf();
+        let id = ContainerId::new("c1").expect("id");
+        let doc = ContainerOptionsDocument::new(vec![], vec!["A=1".into()], None, None, vec![])
+            .expect("doc");
+        store::write_new(&state_root, &id, &doc).expect("write");
+        remove_container_options(&fs_store, &DeleteRequest::new(id.clone()));
+        assert!(!store::options_path(&state_root, &id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// REPAIR-5: 警告の書き込みが止まっても期限で戻り、書き込みが panic しても呼び出し元へ伝播しない。
     #[test]

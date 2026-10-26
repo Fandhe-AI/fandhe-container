@@ -41,15 +41,21 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{
-    ContainerId, CreateRequest, StartRequest, StateRecord, StateStore, TraitError,
+    ContainerId, CreateRequest, GetStateRequest, StartRequest, StateRecord, StateStore, TraitError,
 };
 
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
+use super::create_options;
 use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
 use super::image_refs::{StoreImageRefs, classify_create_image, resolve_create_image, state_scope};
 use super::ref_reconcile::reclaim_stale_ref_recorded;
+use super::stop_delete::{
+    WARNING_WRITE_TIMEOUT, emit_warning_bounded, options_removal_warning, write_warning_to_stderr,
+};
 use fandhe_container_oci::image_management::{ContainerCreatePass, ImageStore};
+use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+use fandhe_container_supervisor::container_options::store as options_store;
 
 /// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
 pub(super) struct Runtime {
@@ -157,7 +163,9 @@ fn build_create(
 /// ID の文字種と bundle の絶対パスを core の型で検証する（相対パスの解決・canonicalize はしない。SEC-1）。
 fn build_create_request(args: &CreateArgs) -> Result<CreateRequest, TraitError> {
     let id = ContainerId::new(args.id.as_str())?;
-    CreateRequest::new(id, args.bundle.clone())
+    // `--label` は検証して状態記録の annotations へ直接書く(supervisor を通らない。#2713)。
+    let annotations = create_options::labels_of(&args.options)?;
+    Ok(CreateRequest::new(id, args.bundle.clone())?.with_annotations(annotations))
 }
 
 fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
@@ -616,6 +624,69 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
     let _ = write_ops_once(recorder, &mut f);
 }
 
+/// 起動オプション文書を書く前の整理と書き込み(#2713・SUP-12)。書いた文書の識別(巻き戻し用)を返す。
+///
+/// - 同じ ID の状態が既にあれば何もしない(core の create が `ALREADY_EXISTS` で拒否し、既存コンテナの文書は触らない)
+/// - 状態が無いのに文書が残っている(前のコンテナの残骸)なら先に消す。CLI が作るコンテナに前の残骸が効かないように、
+///   指定が空でもこの掃除は行う
+/// - 指定が空なら書かない(文書が無ければ supervisor は既定値で動く)
+/// - 状態ルートを持たない backend(非 Linux の plugin 経路)で指定があれば `UNIMPLEMENTED`(黙って捨てない)
+fn prepare_options_file(
+    rt: &Runtime,
+    id: &ContainerId,
+    document: &ContainerOptionsDocument,
+) -> Result<Option<(std::path::PathBuf, options_store::WrittenOptions)>, TraitError> {
+    let Some(root) = rt.store.host_state_root() else {
+        if document.is_empty() {
+            return Ok(None);
+        }
+        return Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "container options are not supported by this backend",
+        ));
+    };
+    match rt.store.get(&GetStateRequest::new(id.clone())) {
+        Ok(_) => return Ok(None),
+        Err(e) if e.code() == fandhe_container_core::traits::ErrorCode::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    options_store::remove(root, id)?;
+    if document.is_empty() {
+        return Ok(None);
+    }
+    let written = options_store::write_new(root, id, document)?;
+    Ok(Some((root.to_path_buf(), written)))
+}
+
+/// 起動オプション文書を core の create の前に書き、create が失敗したら自分が作った inode だけを消す(#2713・SUP-12)。
+///
+/// 文書の書き込みに失敗したら core の create に入らない(オプションを黙って落とした状態を作らない。fail-closed)。
+/// 巻き戻しの失敗は警告 1 行だけ出し、create の元のエラーを返す。
+fn create_with_options(
+    rt: &Runtime,
+    req: &CreateRequest,
+    image: Option<&CreateImage>,
+    document: &ContainerOptionsDocument,
+) -> Result<StateRecord, OciRuntimeError> {
+    let written = prepare_options_file(rt, req.id(), document)
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))?;
+    let r = match image {
+        Some(image) => create_container_with_image_reclaiming(rt, image, req),
+        None => create_container(rt, req),
+    };
+    if r.is_err()
+        && let Some((root, written)) = &written
+        && let Err(e) = options_store::remove_if_same(root, req.id(), written)
+    {
+        emit_warning_bounded(
+            options_removal_warning(&e),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
+    }
+    r
+}
+
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。
 ///
 /// 要求構築・状態ストア初期化の失敗も操作名 `create` の失敗として計測する（REPAIR-4）。
@@ -623,14 +694,14 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
     let result = production_runtime(global, recorder, "create", started, || {
-        build_create(global, args)
+        let (req, image) = build_create(global, args)?;
+        // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
+        let document = create_options::document_of(&args.options)?;
+        Ok((req, image, document))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
-    .and_then(|(rt, (req, image))| {
-        let r = match &image {
-            Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
-            None => create_container(&rt, &req),
-        };
+    .and_then(|(rt, (req, image, document))| {
+        let r = create_with_options(&rt, &req, image.as_ref(), &document);
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r
     });
@@ -711,8 +782,11 @@ fn record_start_outcome(recorder: &OpRecorder, started: Instant, ok: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::args::CreateOptionArgs;
     use super::*;
     use fandhe_container_core::traits::ErrorCode;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
     use std::path::PathBuf;
     #[cfg(target_os = "linux")]
     use std::sync::Arc;
@@ -720,6 +794,7 @@ mod tests {
 
     fn create_args(bundle: &str, id: &str) -> CreateArgs {
         CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from(bundle),
             id: id.to_string(),
             image: None,
@@ -741,6 +816,7 @@ mod tests {
     fn err2_build_requests_reject_invalid_id() {
         for id in ["a/b", "..", "", "a b"] {
             let e = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle: std::env::temp_dir(),
                 id: id.to_string(),
                 image: None,
@@ -758,6 +834,7 @@ mod tests {
         // OS ごとに絶対パスの形が違う（Windows は `/abs/b` を絶対と見なさない）ため temp_dir 由来にする。
         let bundle = std::env::temp_dir().join("abs-b");
         let req = build_create_request(&CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: bundle.clone(),
             id: "c1".to_string(),
             image: None,
@@ -1361,6 +1438,7 @@ mod tests {
 
     fn image_args(root: PathBuf, manifest: &str) -> CreateArgs {
         CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: std::env::temp_dir(),
             id: "c1".into(),
             image: Some(crate::commands::args::CreateImageArgs {
@@ -1485,6 +1563,7 @@ mod tests {
             let bundle = make_bundle(&base);
             let rt = runtime(&base);
             let args = CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle: bundle.clone(),
                 id: "c1".into(),
                 image: None,
@@ -1498,6 +1577,89 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
+        }
+
+        fn options_args(bundle: &Path, id: &str) -> CreateArgs {
+            CreateArgs {
+                options: CreateOptionArgs {
+                    ulimits: vec!["nofile=1024:2048".into()],
+                    env: vec!["A=1".into()],
+                    labels: vec!["tier=web".into()],
+                    ..CreateOptionArgs::default()
+                },
+                bundle: bundle.to_path_buf(),
+                id: id.into(),
+                image: None,
+            }
+        }
+
+        /// SUP-12・CLI-1・SEC-1(#2713): create は label を状態記録へ書き、起動オプション文書を 0600 で
+        /// 状態ルート配下へ書く。同じ ID の再 create は `ALREADY_EXISTS` で、既存の文書は壊れない。
+        #[test]
+        fn sup12_create_writes_options_document_and_labels() {
+            use std::os::unix::fs::MetadataExt as _;
+            let base = TmpDir::new("opts");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let args = options_args(&bundle, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options).expect("doc");
+            let rec = create_with_options(&rt, &req, None, &doc).expect("create");
+            assert_eq!(rec.annotations().get("tier"), Some("web"));
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let path = options_store::options_path(&root, &id);
+            assert_eq!(
+                std::fs::metadata(&path).expect("meta").mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read(&path).expect("bytes"), doc.encode());
+            let before = std::fs::read(&path).expect("bytes");
+            let e = create_with_options(&rt, &req, None, &doc).expect_err("dup");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            assert_eq!(std::fs::read(&path).expect("bytes"), before);
+        }
+
+        /// SUP-12・CLI-1(#2713): core の create が失敗したら、書いた文書を残さない。
+        #[test]
+        fn sup12_create_failure_rolls_back_options_document() {
+            let base = TmpDir::new("optsfail");
+            let missing = base.0.join("no-such-bundle");
+            let rt = runtime(&base);
+            let args = options_args(&missing, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options).expect("doc");
+            let e = create_with_options(&rt, &req, None, &doc).expect_err("must fail");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let path = options_store::options_path(&root, req.id());
+            assert!(!path.exists(), "the document must be rolled back");
+        }
+
+        /// SUP-12(#2713): 指定が空でも、状態の無い残骸の文書は create が掃除する(前のコンテナの設定が効かない)。
+        #[test]
+        fn sup12_create_clears_stale_options_document() {
+            let base = TmpDir::new("optsstale");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let stale = create_options::document_of(&CreateOptionArgs {
+                env: vec!["OLD=1".into()],
+                ..CreateOptionArgs::default()
+            })
+            .expect("doc");
+            options_store::write_new(&root, &id, &stale).expect("stale");
+            let args = CreateArgs {
+                options: CreateOptionArgs::default(),
+                bundle,
+                id: "c1".into(),
+                image: None,
+            };
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options).expect("doc");
+            create_with_options(&rt, &req, None, &doc).expect("create");
+            assert!(!options_store::options_path(&root, &id).exists());
         }
 
         const IMG_DIGEST_2: &str =
@@ -1594,6 +1756,7 @@ mod tests {
             ));
             let rt = runtime(&base);
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1644,6 +1807,7 @@ mod tests {
                 .expect("q")
                 .expect("some");
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1673,6 +1837,7 @@ mod tests {
             )
             .expect("gate dir");
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1712,6 +1877,7 @@ mod tests {
             let rec = create_container(
                 &rt,
                 &build_create_request(&CreateArgs {
+                    options: CreateOptionArgs::default(),
                     bundle,
                     id: "c1".into(),
                     image: None,

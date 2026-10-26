@@ -51,6 +51,7 @@ use crate::doctor::DoctorExitStatus;
 use crate::error::CliError;
 
 mod args;
+mod create_options;
 mod create_start;
 mod image;
 mod image_refs;

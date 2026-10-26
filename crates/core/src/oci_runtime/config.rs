@@ -82,6 +82,10 @@ use super::mount_destination::MountDestination;
 use super::resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::path_masks::ProtectedPath;
+use crate::sysctl::{
+    SYSCTL_MAX_ENTRIES, SYSCTL_MAX_KEY_BYTES, SYSCTL_MAX_VALUE_BYTES, SysctlError, SysctlKey,
+    SysctlSet, SysctlValue,
+};
 use crate::traits::ErrorCode;
 
 /// `config.json` 全体の最大バイト長（4 MiB）。`args` / `env` の合計上限（1 MiB。
@@ -371,6 +375,9 @@ limits! {
     ReadonlyPathsLimit => ("linux.readonlyPaths", CONFIG_MAX_READONLY_PATHS),
     ReadonlyPathLimit => ("linux.readonlyPaths[]", CONFIG_MAX_PATH_BYTES),
     CgroupsPathLimit => ("linux.cgroupsPath", CONFIG_MAX_PATH_BYTES),
+    SysctlsLimit => ("linux.sysctl", SYSCTL_MAX_ENTRIES),
+    SysctlKeyLimit => ("linux.sysctl{key}", SYSCTL_MAX_KEY_BYTES),
+    SysctlValueLimit => ("linux.sysctl{value}", SYSCTL_MAX_VALUE_BYTES),
     ThrottleReadBpsLimit => (
         "linux.resources.blockIO.throttleReadBpsDevice",
         CONFIG_MAX_THROTTLE_DEVICES
@@ -463,6 +470,72 @@ impl<'de, L: Limit> Deserialize<'de> for BoundedStr<L> {
         }
 
         deserializer.deserialize_str(StrVisitor(PhantomData))
+    }
+}
+
+/// 件数・キー長・値長に上限を持つ `linux.sysctl`（キー順は入力順。重複の検出は `SysctlSet` への変換で行う）。
+///
+/// 件数は次の要素を `IgnoredAny` で読み飛ばして判定し、上限超過の要素を確保しない（`Bounded` と同じ流儀。
+/// 入力由来の値で事前確保しない）。値は文字列のみ受け、`null`・数値は型不一致で拒否する。
+struct RawSysctls(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for RawSysctls {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MapVisitor;
+
+        impl<'de> Visitor<'de> for MapVisitor {
+            type Value = RawSysctls;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object of strings")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                loop {
+                    if items.len() >= SysctlsLimit::MAX {
+                        return match map.next_key::<de::IgnoredAny>()? {
+                            Some(_) => Err(limit_error::<SysctlsLimit, A::Error>()),
+                            None => Ok(RawSysctls(items)),
+                        };
+                    }
+                    match map.next_key::<BoundedStr<SysctlKeyLimit>>()? {
+                        Some(key) => {
+                            let value = map.next_value::<BoundedStr<SysctlValueLimit>>()?;
+                            items.push((key.0, value.0));
+                        }
+                        None => return Ok(RawSysctls(items)),
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor)
+    }
+}
+
+/// `linux.sysctl` を検証済みの [`SysctlSet`] へ変える。文法違反・重複・名前空間を持たないキーは
+/// `InvalidArgument`、UTS 系は `Unimplemented`（hostname 欄との競合と domainname の未適用。fail-closed）。
+fn convert_sysctls(raw: Option<RawSysctls>) -> Result<SysctlSet, OciConfigError> {
+    let mut set = SysctlSet::new();
+    for (key, value) in raw.map(|r| r.0).unwrap_or_default() {
+        let key = SysctlKey::parse(&key).map_err(sysctl_error)?;
+        let value = SysctlValue::parse(&value).map_err(sysctl_error)?;
+        set.insert(key, value).map_err(sysctl_error)?;
+    }
+    Ok(set)
+}
+
+fn sysctl_error(err: SysctlError) -> OciConfigError {
+    match err {
+        SysctlError::Uts => OciConfigError::new(
+            ErrorCode::Unimplemented,
+            OciConfigErrorKind::Invalid {
+                field: "linux.sysctl",
+            },
+            "config.json linux.sysctl names a UTS namespace key, which is not supported",
+        ),
+        _ => OciConfigError::invalid("linux.sysctl"),
     }
 }
 
@@ -598,7 +671,6 @@ unapplied_fields! {
     LinuxResourcesDevices => "linux.resources.devices",
     LinuxRootfsPropagation => "linux.rootfsPropagation",
     LinuxSeccomp => "linux.seccomp",
-    LinuxSysctl => "linux.sysctl",
     LinuxMountLabel => "linux.mountLabel",
     LinuxIntelRdt => "linux.intelRdt",
     LinuxMemoryPolicy => "linux.memoryPolicy",
@@ -804,8 +876,8 @@ struct RawLinux {
     rootfs_propagation: Seen,
     #[serde(default)]
     seccomp: Seen,
-    #[serde(default)]
-    sysctl: Seen,
+    #[serde(default, deserialize_with = "present")]
+    sysctl: Option<RawSysctls>,
     #[serde(default, deserialize_with = "present")]
     masked_paths: Option<Bounded<BoundedStr<MaskedPathLimit>, MaskedPathsLimit>>,
     #[serde(default, deserialize_with = "present")]
@@ -1305,6 +1377,7 @@ pub struct OciConfig {
     gid_mappings: Vec<OciIdMapping>,
     masked_paths: Vec<ProtectedPath>,
     readonly_paths: Vec<ProtectedPath>,
+    sysctls: SysctlSet,
     resources: Option<LinuxResourceLimits>,
     cgroups_path: Option<CgroupsPath>,
     capabilities: ContainerCapabilities,
@@ -1337,6 +1410,12 @@ impl OciConfig {
     /// SEC-2・TASK-29 追補・#1852）。
     pub fn readonly_paths(&self) -> &[ProtectedPath] {
         &self.readonly_paths
+    }
+
+    /// `linux.sysctl`（検証済み。namespaced のキー〔IPC 系・net 系〕だけ。適用は pivot 前の `apply_sysctls` 段で、
+    /// 要る名前空間との整合は start と launcher が確かめる。CRI-2・CORE-3・SEC-1・#2670）。
+    pub fn sysctls(&self) -> &SysctlSet {
+        &self.sysctls
     }
 
     /// `linux.resources`（解釈済みの項目のみ。キーが無ければ `None`、`{}` は全項目 `None` の `Some`。
@@ -1689,7 +1768,6 @@ impl RawConfig {
             }
             mark(l.rootfs_propagation, UnappliedField::LinuxRootfsPropagation);
             mark(l.seccomp, UnappliedField::LinuxSeccomp);
-            mark(l.sysctl, UnappliedField::LinuxSysctl);
             mark(l.mount_label, UnappliedField::LinuxMountLabel);
             mark(l.intel_rdt, UnappliedField::LinuxIntelRdt);
             mark(l.memory_policy, UnappliedField::LinuxMemoryPolicy);
@@ -1712,6 +1790,7 @@ impl RawConfig {
         let (mut namespaces, mut uid_mappings, mut gid_mappings) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut masked_paths, mut readonly_paths) = (Vec::new(), Vec::new());
+        let mut sysctls = SysctlSet::new();
         let (mut resources, mut cgroups_path) = (None, None);
         if let Some(Obj(linux)) = self.linux {
             for Obj(ns) in linux.namespaces.map(|b| b.0).unwrap_or_default() {
@@ -1741,6 +1820,7 @@ impl RawConfig {
             masked_paths = convert_protected_paths(linux.masked_paths, "linux.maskedPaths[]")?;
             readonly_paths =
                 convert_protected_paths(linux.readonly_paths, "linux.readonlyPaths[]")?;
+            sysctls = convert_sysctls(linux.sysctl)?;
         }
 
         Ok(OciConfig {
@@ -1754,6 +1834,7 @@ impl RawConfig {
             gid_mappings,
             masked_paths,
             readonly_paths,
+            sysctls,
             resources,
             cgroups_path,
             capabilities,
@@ -2329,7 +2410,7 @@ mod tests {
     /// 値が `null` でも「指定あり」とみなす（fail-closed 側。型付きで解釈する `process.capabilities` を除く）。未指定なら空。
     #[test]
     fn sec1_each_unapplied_field_is_reported() {
-        assert_eq!(UNAPPLIED_FIELDS.len(), 54);
+        assert_eq!(UNAPPLIED_FIELDS.len(), 53);
         let none: [UnappliedField; 0] = [];
         assert_eq!(parse(&base()).expect("valid").unapplied_fields(), none);
         for &field in UNAPPLIED_FIELDS {
@@ -2801,6 +2882,102 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// CRI-2・CORE-3（#2670）: namespaced な `linux.sysctl` は解釈済みで、未適用に残らない。
+    #[test]
+    fn cri2_sysctl_namespaced_keys_are_interpreted() {
+        let mut v = base();
+        v["linux"] = json!({"sysctl": {
+            "kernel.shmmax": "68719476736",
+            "kernel.sem": "250 32000 32 128",
+            "fs.mqueue.msg_max": "20"
+        }});
+        let cfg = parse(&v).expect("valid");
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(cfg.unapplied_fields(), none);
+        let got: Vec<(&str, &str)> = cfg
+            .sysctls()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("fs.mqueue.msg_max", "20"),
+                ("kernel.sem", "250 32000 32 128"),
+                ("kernel.shmmax", "68719476736"),
+            ]
+        );
+        assert!(parse(&base()).expect("valid").sysctls().is_empty());
+    }
+
+    /// CRI-2・SEC-1（#2670）: 名前空間を持たない・文法違反・値の型不一致は `InvalidArgument`、UTS 系は `Unimplemented`。
+    #[test]
+    fn cri2_sysctl_rejections() {
+        for (sysctl, code) in [
+            (json!({"kernel.panic": "1"}), ErrorCode::InvalidArgument),
+            (json!({"kernel/shmmax": "1"}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": ""}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": "1\n2"}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": 1}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": null}), ErrorCode::InvalidArgument),
+            (json!(["kernel.shmmax"]), ErrorCode::InvalidArgument),
+            (json!({"kernel.hostname": "x"}), ErrorCode::Unimplemented),
+            (json!({"kernel.domainname": "x"}), ErrorCode::Unimplemented),
+        ] {
+            let mut v = base();
+            v["linux"] = json!({"sysctl": sysctl.clone()});
+            let err = err_of(&v);
+            assert_eq!(err.code(), code, "{sysctl}: {err:?}");
+            assert!(!err.message().contains("shmmax"), "{}", err.message());
+        }
+        // null は省略として受理しない。
+        let mut v = base();
+        v["linux"] = json!({"sysctl": null});
+        assert!(parse(&v).is_err());
+    }
+
+    /// CRI-2（#2670）: 重複キーは拒否し、件数・キー長・値長の上限はちょうどが受理、超過は `LimitExceeded`。
+    #[test]
+    fn cri2_sysctl_duplicates_and_limits() {
+        let dup = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"linux":{"sysctl":{"kernel.shmmax":"1","kernel.shmmax":"2"}}}"#;
+        assert!(parse_config_bytes(dup).is_err());
+
+        let entries = |n: usize| {
+            (0..n)
+                .map(|i| (format!("net.k{i}"), json!("1")))
+                .collect::<serde_json::Map<_, _>>()
+        };
+        let mut v = base();
+        v["linux"] = json!({"sysctl": entries(SYSCTL_MAX_ENTRIES)});
+        // net.* の文法は通る（start が名前空間の整合を検査する）。
+        assert_eq!(
+            parse(&v).expect("at limit").sysctls().len(),
+            SYSCTL_MAX_ENTRIES
+        );
+        v["linux"] = json!({"sysctl": entries(SYSCTL_MAX_ENTRIES + 1)});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                if *field == "linux.sysctl" && *limit == SYSCTL_MAX_ENTRIES),
+            "{err:?}"
+        );
+        v["linux"] = json!({"sysctl": {"net.a": "1".repeat(SYSCTL_MAX_VALUE_BYTES + 1)}});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                if *field == "linux.sysctl{value}" && *limit == SYSCTL_MAX_VALUE_BYTES),
+            "{err:?}"
+        );
+        let long_key = format!("net.{}", "a".repeat(SYSCTL_MAX_KEY_BYTES));
+        v["linux"] = json!({"sysctl": {long_key: "1"}});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, .. }
+                if *field == "linux.sysctl{key}"),
+            "{err:?}"
+        );
     }
 
     /// `as_str` は JSON 上のパスで、種別ごとに一意（SEC-1）。

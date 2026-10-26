@@ -141,6 +141,7 @@ use super::namespace_join::NamespaceJoin;
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
+use crate::sysctl::SysctlNamespace;
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
     StateRecord, StateStore, TraitError, UpdateStateRequest,
@@ -872,6 +873,7 @@ fn build_spec_with_swap(
         return Err(unsupported("process.terminal"));
     }
     reject_unsupported_linux(&config)?;
+    reject_net_sysctls_without_network_namespace(&config)?;
     reject_protected_paths_over_implicit_dev(&config)?;
     // user namespace が無いと process.user がホストの uid として働いてしまう（SEC-5）。
     if !config
@@ -1312,6 +1314,26 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
         ) {
             return Err(unsupported("network / cgroup / time namespace"));
         }
+    }
+    Ok(())
+}
+
+/// `net.*` の sysctl は network namespace が無いとホストの値を書き換えるため拒否する（CRI-2・CORE-3・SEC-1・#2670）。
+///
+/// network namespace を伴う構成は `reject_unsupported_linux` が先に `Unimplemented` で拒否する（コンテナ自身の
+/// network namespace は未実装。pod の netns の結線は #2675）ため、現状 `net.*` を受けて起動できる経路は無い。
+/// IPC 系は IPC namespace の必須検査（本関数の呼び出し側）と、launcher の実効の名前空間との照合
+/// （`--ipc=host` との組み合わせの拒否）が担う。
+fn reject_net_sysctls_without_network_namespace(config: &OciConfig) -> Result<(), TraitError> {
+    let has_network_ns = config
+        .namespaces()
+        .iter()
+        .any(|n| n.kind() == NamespaceKind::Network);
+    if config.sysctls().has_namespace(SysctlNamespace::Net) && !has_network_ns {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "linux.sysctl net.* requires a network namespace",
+        ));
     }
     Ok(())
 }
@@ -3214,6 +3236,60 @@ mod tests {
         let err = start_rejected_after_rewrite("ns-no-uts-no-hostname", &cfg);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "the UTS namespace is required");
+    }
+
+    /// CRI-2・CORE-3（#2670）: IPC 系の `linux.sysctl` は start を通り、launcher の `spec.config()` に検証済みで渡る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_start_passes_ipc_sysctls_to_launcher() {
+        let name = "sysctl-ipc";
+        let b = Bundle::new(name);
+        let mut cfg = valid_config();
+        cfg["linux"]["sysctl"] =
+            json!({"kernel.shmmax": "68719476736", "kernel.sem": "250 32000 32 128"});
+        b.write_config(&cfg);
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, name).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let got: Vec<(&str, &str)> = specs
+            .first()
+            .expect("spec")
+            .config()
+            .sysctls()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("kernel.sem", "250 32000 32 128"),
+                ("kernel.shmmax", "68719476736")
+            ]
+        );
+    }
+
+    /// CRI-2・CORE-3・SEC-1（#2670）: network namespace の無い `net.*` は host の値を書き換えるため `InvalidArgument`、
+    /// network namespace ありは未実装の名前空間として従来どおり `Unimplemented`。launcher は呼ばれない。
+    #[test]
+    fn cri2_start_rejects_net_sysctls_without_usable_network_namespace() {
+        let mut cfg = valid_config();
+        cfg["linux"]["sysctl"] = json!({"net.ipv4.ip_unprivileged_port_start": "0"});
+        let err = start_rejected_after_rewrite("sysctl-net-host", &cfg);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl net.* requires a network namespace"
+        );
+
+        cfg["linux"]["namespaces"]
+            .as_array_mut()
+            .expect("array")
+            .push(json!({"type": "network"}));
+        let err = start_rejected_after_rewrite("sysctl-net-own", &cfg);
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
     }
 
     /// CORE-2: 中断された予約（Running・pid なし）は識別でき、回復後に start できる。

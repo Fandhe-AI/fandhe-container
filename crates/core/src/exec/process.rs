@@ -11,6 +11,7 @@
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
+//!       -> (apply_sysctls)  // `linux.sysctl` の指定時のみ。verify_pinned の直後・mount_sysfs の前（CRI-2・CORE-3・#2670）
 //!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
@@ -125,6 +126,7 @@ use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
 use super::stages::{LaunchNotReady, LaunchReady};
+use super::sysctls::{self, SysctlPlan};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
     StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir, fd_mount_id,
@@ -2181,6 +2183,9 @@ pub(crate) struct PrePivotSetup<'a> {
     /// #2020・SEC-2・OCI-4）。procfs を `prepare_rootfs` が載せるのと対の位置で、`readonly_paths` より前に
     /// 載せて、その再帰 bind と読み取り専用化が上に載るようにする。
     pub(crate) sysfs: Option<&'a SysfsMountSpec>,
+    /// `verify_pinned` の直後（`mount_sysfs` の前）に適用する namespaced な sysctl（無ければ書かない。`readonly_paths` が
+    /// `/proc/sys` を読み取り専用にする前でなければ書けない。実効の名前空間と照合済みの計画だけを渡せる。CRI-2・CORE-3・#2670）。
+    pub(crate) sysctls: Option<&'a SysctlPlan<'a>>,
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
@@ -2233,6 +2238,13 @@ trait PrePivotOps {
         &self,
         prepared: &Self::Prepared,
         pinned: BorrowedFd<'_>,
+    ) -> Result<(), ExecError>;
+    /// namespaced な sysctl の適用（#2670）。`verify_pinned` の直後・`mount_sysfs` の前（`/proc/sys` が読み取り専用になる前）。
+    fn apply_sysctls(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        plan: &SysctlPlan<'_>,
     ) -> Result<(), ExecError>;
     /// `/sys` への読み取り専用の sysfs の供給（#2020）。procfs と対の位置で、`readonly_paths` より前に載せる。
     fn mount_sysfs(
@@ -2383,6 +2395,15 @@ impl PrePivotOps for RealPrePivotOps {
             Ok((meta.dev(), meta.ino()))
         };
         check_rootfs_identity(identity(pinned)?, identity(prepared.new_root())?)
+    }
+
+    fn apply_sysctls(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        plan: &SysctlPlan<'_>,
+    ) -> Result<(), ExecError> {
+        sysctls::apply_sysctls(isolation, prepared, plan)
     }
 
     fn mount_sysfs(
@@ -2546,7 +2567,7 @@ fn check_bind_overlaps(
 
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
-/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `mount_sysfs`（指定時）→ `create_default_devices` →
+/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `apply_sysctls`（指定時。#2670）→ `mount_sysfs`（指定時）→ `create_default_devices` →
 /// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
 /// `masked_paths`（`setup` 指定時）→ `pivot_root`。
 ///
@@ -2611,6 +2632,10 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(pinned) = setup.pinned_rootfs {
             ops.verify_pinned(&prepared, pinned)
                 .map_err(StepError::at(S::VerifyPinned))?;
+        }
+        if let Some(plan) = setup.sysctls {
+            ops.apply_sysctls(&isolation, &prepared, plan)
+                .map_err(StepError::at(S::ApplySysctls))?;
         }
         if let Some(spec) = setup.sysfs {
             sysfs = Some(
@@ -2946,6 +2971,7 @@ where
     let pid = sys::fork_single_threaded(
         move || {
             let setup = PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs,
                 inject: None,
@@ -3002,6 +3028,7 @@ where
     let pid = sys::fork_single_threaded(
         move || {
             let setup = PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs: None,
                 inject: None,
@@ -3202,6 +3229,7 @@ pub fn spawn_container_with_stages_and_devices(
             entry,
             stages,
             Some(PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs: None,
                 inject: None,
@@ -5861,6 +5889,11 @@ mod tests {
                 IsolationStage::WorkingDir,
                 "injected failure",
             ),
+            "apply_sysctls" => ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::ApplySysctls,
+                "injected failure",
+            ),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -5898,6 +5931,9 @@ mod tests {
         }
         fn verify_pinned(&self, _: &(), _: BorrowedFd<'_>) -> Result<(), ExecError> {
             self.step("verify_pinned")
+        }
+        fn apply_sysctls(&self, _: &(), _: &(), _: &SysctlPlan<'_>) -> Result<(), ExecError> {
+            self.step("apply_sysctls")
         }
         fn mount_sysfs(&self, _: &(), _: &(), _: &SysfsMountSpec) -> Result<(), ExecError> {
             self.step("mount_sysfs")
@@ -5982,12 +6018,17 @@ mod tests {
         let inject = InjectedFileSet::new();
         let binds = test_binds("/mnt/data");
         let sysfs = test_sysfs();
+        let sysctl_set = test_sysctl_set();
+        let sysctl_plan = SysctlPlan::new(&sysctl_set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
         let pinned = std::fs::File::open("/").unwrap();
         let _ = take_calls();
         run_pre_pivot(
             &RecordingOps { fail_at: None },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: Some(&sysctl_plan),
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
@@ -6006,6 +6047,7 @@ mod tests {
                 "establish",
                 "prepare_rootfs",
                 "verify_pinned",
+                "apply_sysctls",
                 "mount_sysfs",
                 "create_default_devices",
                 "mount_tmpfs",
@@ -6018,6 +6060,60 @@ mod tests {
         );
     }
 
+    /// CRI-2・CORE-3（#2670）: sysctl の適用が失敗したら、`readonly_paths` 以降（特に `pivot_root`）へ進まない。
+    /// 失敗の段は `ApplySysctls`、符号化した状態行は段名つきで往復する。
+    #[test]
+    fn cri2_run_pre_pivot_sysctl_failure_stops_before_later_steps() {
+        let sysctl_set = test_sysctl_set();
+        let plan = SysctlPlan::new(&sysctl_set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
+        let pinned = std::fs::File::open("/").unwrap();
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("apply_sysctls"),
+            },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                sysctls: Some(&plan),
+                devices: DevptsGidSource::Rootful,
+                tmpfs: None,
+                inject: None,
+                binds: None,
+                sysfs: None,
+                pinned_rootfs: Some(pinned.as_fd()),
+                config_paths: ConfigPaths::NONE,
+                status: None,
+                working_dir: None,
+            }),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.step, PrePivotStep::ApplySysctls);
+        assert_eq!(err.error.stage, IsolationStage::ApplySysctls);
+        assert_eq!(err.error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "verify_pinned",
+                "apply_sysctls"
+            ]
+        );
+    }
+
+    fn test_sysctl_set() -> crate::sysctl::SysctlSet {
+        let mut set = crate::sysctl::SysctlSet::new();
+        set.insert(
+            crate::sysctl::SysctlKey::parse("kernel.shmmax").unwrap(),
+            crate::sysctl::SysctlValue::parse("16384").unwrap(),
+        )
+        .unwrap();
+        set
+    }
+
     /// SEC-2（#2014）: `masked_paths` 段へは `mount_sysfs` の証跡が、sysfs の指定があるときだけ渡る。
     #[test]
     fn sec2_2014_run_pre_pivot_passes_sysfs_proof_only_when_mounted() {
@@ -6028,6 +6124,7 @@ mod tests {
                 &RecordingOps { fail_at: None },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: None,
                     inject: None,
@@ -6053,6 +6150,7 @@ mod tests {
             &RecordingOps { fail_at: None },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
@@ -6092,6 +6190,7 @@ mod tests {
     #[test]
     fn oci1_run_pre_pivot_enters_working_dir_after_pivot() {
         let setup = |wd: Option<&'static ContainerWorkingDir>| PrePivotSetup {
+            sysctls: None,
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
@@ -6170,6 +6269,7 @@ mod tests {
     #[test]
     fn sec2_run_pre_pivot_masked_paths_failure_stops_before_pivot() {
         let setup = || PrePivotSetup {
+            sysctls: None,
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
@@ -6235,6 +6335,7 @@ mod tests {
             },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: None,
@@ -6267,6 +6368,7 @@ mod tests {
             },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
@@ -6341,6 +6443,7 @@ mod tests {
                 &RecordingOps { fail_at: None },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
@@ -6436,6 +6539,7 @@ mod tests {
                 },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),

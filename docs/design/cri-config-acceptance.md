@@ -13,7 +13,7 @@
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み | core → cri | #2667 |
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み | core → cri | #2668 |
 | 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
-| 8 | sysctls（namespaced のみ） | core の `linux.sysctl`（UnappliedField） | core → cri | #2670 |
+| 8 | sysctls（namespaced のみ） | core の `linux.sysctl` の適用 → cri。IPC 系は本変更で実装済み。`net.*` は順 13 まで `UNIMPLEMENTED` | core → cri | #2670 |
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671（実装済み。下の節。ランチャー経由と ReopenContainerLog は未対応。総量は上限つき） |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
@@ -161,6 +161,24 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 - 名前の正規化（大文字化・`CAP_` 接頭辞の補完・`ALL`）は containerd に合わせた想定で、実装時に一次情報（commit 指定）との再照合は行っていない。食い違いが見つかれば厳しい側（拒否）へ倒す
 - 集合ごとに別の値を指定する細かい制御は未対応（未適用として拒否）
+
+## sysctls の受け入れ方式（CRI-2・CORE-3・SEC-1。#2670）
+
+- 分類・文法は core の `sysctl` モジュール（`SysctlKey::parse`）が唯一の定義で、cri はそれを再利用する。
+- 許可集合の出典: runc `libcontainer/configs/validate/validator.go` の `sysctl`（tag v1.3.0、commit `4ca628d1d4c974f92d24daccb901aa078aad748e`、Apache-2.0）。写したのはキー名と接頭辞だけ。runc の NOTICE（Docker, Inc. の帰属行と輸出規制の注記）を一次情報で確認し、帰属行をルート `NOTICE` に追記した。輸出規制の注記も、省略の可否がオーナー判断待ちのため（licensing 規約）、判断が出るまでルート `NOTICE` に原文のまま保持する。
+- 判定:
+
+| 種別 | キー | CRI の結果 | core（config.json 直指定）の結果 |
+| ---- | ---- | ---------- | ------------------------------- |
+| IPC | `kernel.msgmax`・`msgmnb`・`msgmni`・`sem`・`shmall`・`shmmax`・`shmmni`・`shm_rmid_forced`、`fs.mqueue.*` | 受け入れ | 受け入れ。IPC namespace が要る（`--ipc=host` と併用は fork 前に `InvalidArgument`） |
+| net | `net.*` | `UNIMPLEMENTED`（pod の netns の結線 #2675 が前提） | network namespace なしは `InvalidArgument`、ありは未実装の名前空間として `Unimplemented` |
+| UTS | `kernel.hostname`・`kernel.domainname` | `UNIMPLEMENTED` | `Unimplemented` |
+| その他 | 名前空間を持たないキー、文法違反（`/` 区切り・空要素・非 ASCII 等） | `INVALID_ARGUMENT` | `InvalidArgument` |
+
+- 適用は pivot 前段 `apply_sysctls`（`verify_pinned` の直後。`readonly_paths` が `/proc/sys` を ro にする前）で、`rootfs/proc/sys` へ fd 起点・`O_NOFOLLOW`・procfs の `f_type` 照合つきで 1 回の `write` で書く。存在しないキー・不正な値は起動を止める。
+- 既知の差: runc は `/` 区切りのキーも受けるが、許可リストのすり抜けを防ぐため本実装は `.` 区切りだけ。
+- pod の ipc 共有（下記「pod の ipc 共有の受け入れ方式」。#2674）で join する起動では、共有された pod の IPC namespace へ書く（同じ pod の各コンテナが同じ pod の値を書く）。cri の供給元（保持役）がまだ無い間は、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似になる。
+- rootless で IPC 系 sysctl に書けるかは、その IPC namespace を所有する user namespace を、書き込む側のプロセスが持っているかに依存する。新しい namespace を作る起動では user namespace と IPC namespace を同時に作るため、コンテナの root が所有者となり書ける。pod の user・ipc namespace へ join する起動でも、join 先の IPC namespace を所有するのは同時に join する pod の user namespace（core が照合する）のため同じ条件になるが、join と sysctl を併用した実機確認は未実施。書けない環境では `PermissionDenied` で起動が失敗する(fail-closed。黙って無視しない)。確認済み: `production_launcher` のシナリオ V(`kernel.shmmax`)が `platform-ci` の ubuntu-latest(非 root・委譲 cgroup)で成功行を出す(PR #2733 の CI で合格)。他のカーネル・配布物・LSM(AppArmor 等)の構成での確認は未実施で、そうした環境で `PermissionDenied` となる場合は、シナリオ V と `ci.yml` の成功行の照合が失敗する(環境の前提不足として扱い、照合は緩めない)。
 
 ## log_path / log_directory の受け入れ方式（CRI-2・SUP-4。#2671）
 

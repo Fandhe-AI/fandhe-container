@@ -57,7 +57,14 @@
 //! - `mounts[].propagation` は PRIVATE を `rprivate`、HOST_TO_CONTAINER を `rslave` で `config.json` の `mounts[].options` へ書く
 //!   （core が `rslave` の bind をホストの slave として載せる。BIDIRECTIONAL と未知の値は `UNIMPLEMENTED`。
 //!   `linux.rootfsPropagation` は出力しない。#2669・CRI-2・OCI-4）。
-//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（port_mappings・cgroup_parent・sysctls・
+//! - `sandbox.linux.sysctls`（pod 単位）は、IPC 系（`kernel.shmmax` 等・`fs.mqueue.*`）だけ受け入れ、各コンテナの
+//!   `config.json` の `linux.sysctl` へ写す（core が pivot 前に `rootfs/proc/sys` へ適用する。#2670・CRI-2・CORE-3）。
+//!   ipc の `POD` で [`PodNamespacePaths`] へ join するときは共有された pod の IPC namespace へ書く（各コンテナが同じ
+//!   pod の値を書く）。供給元（保持役）がまだ無い間は、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似になる
+//!   （containerd も pod の sysctls を各コンテナへ写す）。分類は core の `sysctl::SysctlKey` を使い、規則を二重に持たない:
+//!   `net.*`（pod の netns の結線 #2675 が前提）と UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
+//!   文法違反・名前空間を持たないキー（`kernel.panic`・`vm.*` 等）・不正な値は `INVALID_ARGUMENT`。
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（port_mappings・cgroup_parent・
 //!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
@@ -65,12 +72,15 @@
 //! - `devices`・`cdi_devices` の受け入れ方針（オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-devices-cdi.md`（#2673・CRI-2・GPU-1）にまとめている。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
 use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT_CAPABILITIES};
 use fandhe_container_core::path_masks::normalize_container_path;
+use fandhe_container_core::sysctl::{
+    SYSCTL_MAX_ENTRIES, SysctlError, SysctlKey, SysctlNamespace, SysctlValue,
+};
 use fandhe_container_core::traits::ContainerLogPath;
 
 use super::resolv_conf;
@@ -331,6 +341,8 @@ struct LinuxOut<'a> {
     masked_paths: Vec<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     readonly_paths: Vec<&'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    sysctl: BTreeMap<&'a str, &'a str>,
 }
 
 #[derive(Serialize)]
@@ -398,6 +410,36 @@ struct CpuOut {
     period: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quota: Option<i64>,
+}
+
+/// pod の `sysctls` を core の分類で検証する（#2670）。キー昇順に走査して、複数の不正があっても結果を決定的にする。
+/// 受理した組は予算に計上し、`config.json` の `linux.sysctl` へ写す。
+fn check_sysctls<'a>(
+    sysctls: &'a HashMap<String, String>,
+    budget: &mut Budget,
+) -> Result<BTreeMap<&'a str, &'a str>, CriError> {
+    if sysctls.len() > SYSCTL_MAX_ENTRIES {
+        return Err(invalid("linux.sysctls"));
+    }
+    let sorted: BTreeMap<&str, &str> = sysctls
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    for (key, value) in &sorted {
+        match SysctlKey::parse(key) {
+            Ok(k) if k.namespace() == SysctlNamespace::Ipc => {}
+            // net.* は pod の netns の結線（#2675）が前提で未実装。
+            Ok(_) | Err(SysctlError::Uts) => return Err(unsupported("linux.sysctls")),
+            Err(_) => return Err(invalid("linux.sysctls")),
+        }
+        SysctlValue::parse(value).map_err(|_| invalid("linux.sysctls"))?;
+        budget.spend(
+            key.len()
+                .saturating_add(value.len())
+                .saturating_add(ITEM_OVERHEAD),
+        )?;
+    }
+    Ok(sorted)
 }
 
 fn unsupported(field: &'static str) -> CriError {
@@ -1099,15 +1141,16 @@ fn build_inner(
     let mut budget = Budget::new();
 
     let sandbox_linux = sandbox.linux.as_ref();
+    let sysctls = match sandbox_linux {
+        Some(l) => check_sysctls(&l.sysctls, &mut budget)?,
+        None => BTreeMap::new(),
+    };
     if let Some(l) = sandbox_linux {
         // core は `linux.cgroupsPath` を #2010 の方針で値に関わらず拒否し、コンテナの cgroup を常に委譲スコープ配下の
         // `fc-<id>@<n>` に置く（値を配置に使えない）。受けて値を捨てると kubelet の pod 単位の資源制限が黙って効かない
         // fail-open になるため、判断（docs/design/cri-cgroup-parent.md・#2672）が出るまで拒否する（CRI-2・CORE-4）。
         if !l.cgroup_parent.is_empty() {
             return Err(unsupported("linux.cgroup_parent"));
-        }
-        if !l.sysctls.is_empty() {
-            return Err(unsupported("linux.sysctls"));
         }
         if l.overhead.is_some() || l.resources.is_some() {
             return Err(unsupported("linux.resources"));
@@ -1310,6 +1353,7 @@ fn build_inner(
             resources,
             masked_paths: masked,
             readonly_paths: readonly,
+            sysctl: sysctls,
         },
     };
     // 上限付き writer へ直列化し、JSON 全体の確保を上限で止める。

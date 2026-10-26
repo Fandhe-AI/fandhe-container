@@ -566,10 +566,7 @@ pub(crate) fn spawn_container_via_intermediate(
                 entry,
                 stages: Some(stages),
                 stdio: Some(stdio),
-                setup: PrePivotSetup {
-                    status: Some(status),
-                    ..setup
-                },
+                setup: with_status(setup, status),
                 report,
                 tag,
                 gate_r,
@@ -587,6 +584,15 @@ pub(crate) fn spawn_container_via_intermediate(
             std::io::stderr().as_fd(),
         ),
     )
+}
+
+/// 呼び出し側の `setup` に状態 pipe の書き込み側だけを足す。`sysctls` を含むほかの段は必ず引き継ぐ
+/// (捨てると config の `linux.sysctl` が受理されたのに適用されない。CRI-2・CORE-3・SEC-1・#2670)。
+fn with_status<'a>(setup: PrePivotSetup<'a>, status: &'a std::fs::File) -> PrePivotSetup<'a> {
+    PrePivotSetup {
+        status: Some(status),
+        ..setup
+    }
 }
 
 /// 起動に成功した PID 1 のハンドルと、PID 1 から受け取った seccomp の listener(SEC-4・#2024)。
@@ -1332,6 +1338,37 @@ mod tests {
     // (`fork_single_threaded_with_no_flush`)を使う。fork 子は他スレッドが握っていた stdout / stderr の
     // ロックを引き継ぐため、flush する版だと子の中で永久に止まり得る(本番の spawn_pid1・mapper も flush しない)。
     use super::*;
+
+    /// 中間プロセス経路の setup 組み直しが sysctls を落とさない(CRI-2・CORE-3・SEC-1・#2670)。
+    #[test]
+    fn with_status_keeps_sysctl_plan() {
+        let mut set = crate::sysctl::SysctlSet::new();
+        set.insert(
+            crate::sysctl::SysctlKey::parse("kernel.shmmax").unwrap(),
+            crate::sysctl::SysctlValue::parse("16384").unwrap(),
+        )
+        .unwrap();
+        let plan = crate::exec::sysctls::SysctlPlan::new(&set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
+        let file = std::fs::File::open("/").unwrap();
+        let setup = PrePivotSetup {
+            config_paths: crate::exec::ConfigPaths::NONE,
+            devices: crate::exec::DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            binds: None,
+            sysfs: None,
+            sysctls: Some(&plan),
+            pinned_rootfs: None,
+            status: None,
+            working_dir: None,
+        };
+        let out = with_status(setup, &file);
+        assert!(out.sysctls.is_some());
+        assert!(out.status.is_some());
+    }
+
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
     use crate::exec::launch_status::{

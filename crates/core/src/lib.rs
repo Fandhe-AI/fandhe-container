@@ -39,7 +39,7 @@
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、制限適用の証跡は `LaunchReady`（#1714）で配線済み。本番 launcher（`oci_runtime::ProductionLauncher`）からの呼び出しは実装済み（#1816。実プロセスでの確認は `tests/production_launcher.rs`・#1818）。
-//! - `legacy_tiocsti`: 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告の構造化ログを 1 行出す（観測のみで起動は止めない。CORE-5・SEC-1・REPAIR-4・#1658 の案 A・#1739。OS 非依存。呼び出し元は `exec::spawn_container_with_stages` と本番 launcher の入口 `exec::spawn_container_via_intermediate`〔#2008〕）
+//! - `legacy_tiocsti`: 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告の構造化ログを 1 行出す（観測のみで起動は止めない。CORE-5・SEC-1・REPAIR-4・#1658 の案 A・#1739。OS 非依存。呼び出し元は `exec::spawn_container_with_stages`〔結合試験専用・`exec-test-support`〕と本番 launcher の入口 `exec::spawn_container_via_intermediate`〔#2008〕）
 //! - `logging`: JSON Lines 共通ログ型 `LogLine` 等と書き出し口（TASK-98.1・ERR-4。OS 非依存）。既存出力の移行は TASK-98.2（#653）で未実装（REPAIR-3）
 //! - `rlimits`: rlimit（`process.rlimits`・`--ulimit`）の検証済み型 `Rlimit`・`Rlimits`（SUP-12・TASK-169.1・#526。OS 非依存）。適用は `exec::StagePipeline::with_rlimits`（Linux 限定）で、OCI config からの結線は未実装（REPAIR-3）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・

@@ -206,8 +206,8 @@ use std::path::{Path, PathBuf};
 use crate::oci_runtime::ProtectedFsRoot;
 use crate::oci_runtime::mountinfo_identity::{
     FsIdentity, MOUNTINFO_MAX_LINES, MountRow, dir_identity_chain, dir_identity_chain_with_mnt_id,
-    exposed_devs, fs_identity, mounts_under, parse_fdinfo_mnt_id, parse_mountinfo, path_mount_id,
-    source_contains, source_reaches,
+    exposed_devs, fs_identity, mounts_under, parse_mountinfo, path_mount_id, source_contains,
+    source_reaches,
 };
 use crate::oci_runtime::{BindMountSet, BindMountSpec, BindPropagation};
 use crate::rootless::parse_id_map;
@@ -1384,13 +1384,13 @@ fn fresh_state_identity(p: &ProtectedFsRoot, mounts: &[MountRow]) -> Option<FsId
 
 /// 固定した元の属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。
 fn pinned_source_mnt_id(src: &VerifiedBindSourceFd) -> Result<u64, ExecError> {
-    let fdinfo = std::fs::read_to_string(format!(
-        "/proc/thread-self/fdinfo/{}",
-        src.as_fd().as_raw_fd()
-    ))
-    .map_err(|_| mountinfo_failed("cannot read fdinfo of the pinned bind mount source"))?;
-    parse_fdinfo_mnt_id(&fdinfo)
-        .ok_or_else(|| mountinfo_failed("no mnt_id in fdinfo of the pinned bind mount source"))
+    use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
+    read_fd_mnt_id(src.as_fd()).map_err(|e| match e {
+        FdinfoMountIdError::Read(_) | FdinfoMountIdError::TooLarge => {
+            mountinfo_failed("cannot read fdinfo of the pinned bind mount source")
+        }
+        _ => mountinfo_failed("no mnt_id in fdinfo of the pinned bind mount source"),
+    })
 }
 
 /// 固定した元の現在のパス（`/proc/thread-self/fd/N` のリンク先）。削除済み・絶対パスでないものは拒否する。

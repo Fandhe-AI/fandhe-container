@@ -10,6 +10,9 @@
 //! みなしてランチャー経由で起動する（`process_group(0)` なし・pty なし）。無ければ従来の直接経路（rootless）。uid 0 はランチャーの
 //! 前提（呼び出し元は非 root）に反し、`RootfulHostRoot`（#2241）の判断待ちのため `UNIMPLEMENTED` のまま。規則は共有クライアント側にある。
 //!
+//! `--audit-policy`(SEC-4・#2761): CLI の `start --audit-policy <best-effort|strict>` を検証した値を、指定されたときだけ
+//! supervisor の argv へ渡す(未指定は supervisor の既定 best-effort)。restart の再 launch は supervisor が start で受けた値を使う。
+//!
 //! CLI に残す責務:
 //! - 実行ファイルの基準: CLI 自身の実体パス（`current_exe()`）と同じディレクトリの固定名 `fandhe-container-supervisor`
 //!   （`PATH` 探索・環境変数・引数による上書きは作らない。#2068・SUP-14）。
@@ -21,10 +24,11 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use fandhe_container_core::audit_log::AuditCoveragePolicy;
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError};
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
 use fandhe_container_supervisor::start_client::{
-    SupervisorLaunch, locate_systemd_run, production_deadline, start_with,
+    StartOptions, SupervisorLaunch, locate_systemd_run, production_deadline, start_with_options,
 };
 
 /// 試験専用: systemd-run の解決を差し替える環境変数（feature `start-test-support` のときだけ読む）。
@@ -50,6 +54,7 @@ fn locate(euid: u32) -> Result<PathBuf, OciRuntimeError> {
 pub(super) fn start_via_supervisor(
     root: &Path,
     id: &ContainerId,
+    audit_policy: Option<AuditCoveragePolicy>,
 ) -> Result<NonZeroU32, OciRuntimeError> {
     let cli_exe = std::env::current_exe().map_err(|_| {
         OciRuntimeError::new(
@@ -59,7 +64,8 @@ pub(super) fn start_via_supervisor(
         )
     })?;
     let launch = SupervisorLaunch::resolve_beside_with(&cli_exe, locate)?;
-    let (result, child) = start_with(&launch, root, id, production_deadline());
+    let opts = StartOptions::new().with_audit_policy(audit_policy);
+    let (result, child) = start_with_options(&launch, root, &opts, id, production_deadline());
     // supervisor は CLI より長く生きる。wait も kill もせずに手放す。
     drop(child);
     result

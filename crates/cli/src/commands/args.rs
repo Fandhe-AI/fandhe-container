@@ -3,7 +3,7 @@
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -71,6 +71,8 @@ pub(super) struct CreateImageArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StartArgs {
     pub(super) id: String,
+    /// `--audit-policy` の生の値(未検証。語彙の検証は `create_start` が core の `AuditCoveragePolicy` に委ねる。SEC-4・#2761)。
+    pub(super) audit_policy: Option<String>,
 }
 
 /// `stop` の引数。
@@ -360,10 +362,31 @@ fn push_option(
     Ok(())
 }
 
-/// `start <id>` を解析する。
+/// `start [--audit-policy <値>] <id>` を解析する(オプションは 1 回だけ・順不同・`--` 以降は位置引数。SEC-4・#2761)。
+/// 値の意味の検証はここでは行わない(core の型に委ねる)。
 pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> {
+    let mut audit_policy: Option<String> = None;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--audit-policy" {
+            let value = it.next().ok_or(UsageError)?;
+            if audit_policy.is_some() {
+                return Err(UsageError);
+            }
+            audit_policy = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
     Ok(StartArgs {
-        id: single_positional(args)?,
+        id: single_id(positional)?,
+        audit_policy,
     })
 }
 
@@ -899,12 +922,52 @@ mod tests {
     /// CLI-1: start の正常系と異常系。
     #[test]
     fn cli1_parse_start() {
-        assert_eq!(parse_start(v(&["c1"])), Ok(StartArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_start(v(&["c1"])),
+            Ok(StartArgs {
+                id: "c1".into(),
+                audit_policy: None
+            })
+        );
         assert_eq!(
             parse_start(v(&["--", "-c"])),
-            Ok(StartArgs { id: "-c".into() })
+            Ok(StartArgs {
+                id: "-c".into(),
+                audit_policy: None
+            })
         );
         for a in [v(&[]), v(&["a", "b"]), v(&["--all", "a"]), v(&["-a"])] {
+            assert_eq!(parse_start(a), Err(UsageError));
+        }
+    }
+
+    /// SEC-4・#2761: `--audit-policy` は値つきで 1 回だけ・順不同。生の値をそのまま保持する。
+    #[test]
+    fn sec4_cli1_parse_start_audit_policy() {
+        let ok = |id: &str, p: &str| {
+            Ok(StartArgs {
+                id: id.into(),
+                audit_policy: Some(p.into()),
+            })
+        };
+        assert_eq!(
+            parse_start(v(&["--audit-policy", "strict", "c1"])),
+            ok("c1", "strict")
+        );
+        assert_eq!(
+            parse_start(v(&["c1", "--audit-policy", "best-effort"])),
+            ok("c1", "best-effort")
+        );
+        assert_eq!(
+            parse_start(v(&["--audit-policy", "x", "--", "-c"])),
+            ok("-c", "x")
+        );
+        for a in [
+            v(&["--audit-policy"]),
+            v(&["--audit-policy", "strict"]),
+            v(&["--audit-policy", "strict", "--audit-policy", "strict", "c1"]),
+            v(&["--audit-policy", "strict", "a", "b"]),
+        ] {
             assert_eq!(parse_start(a), Err(UsageError));
         }
     }

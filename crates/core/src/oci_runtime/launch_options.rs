@@ -182,17 +182,22 @@ impl LaunchOptions {
     /// `process.env`(`base`)へ上書きを重ねた env。既存のキーはその位置で値を置き換え、新しいキーは末尾へ足す
     /// (`--env` の後勝ち・初出位置の保持。`base` 側に同じキーが複数あれば最初の位置を置き換え、残りは落とす)。
     pub fn merged_env(&self, base: &[String]) -> Vec<String> {
-        let key = |s: &str| s.split_once('=').map_or(s.len(), |(k, _)| k.len());
+        // キー部分(`=` より前。`=` が無ければ全体)。スライスの添字は使わない。
+        fn key_of(s: &str) -> &str {
+            s.split_once('=').map_or(s, |(k, _)| k)
+        }
         let mut out: Vec<String> = base.to_vec();
         for over in &self.env {
-            let k = &over[..key(over)];
-            match out.iter().position(|e| &e[..key(e)] == k) {
+            let k = key_of(over);
+            match out.iter().position(|e| key_of(e) == k) {
                 Some(i) => {
-                    out[i] = over.clone();
+                    if let Some(slot) = out.get_mut(i) {
+                        *slot = over.clone();
+                    }
                     // 同じキーの後続の重複は落とす(先頭の位置に 1 つだけ残す)。
                     let mut seen = false;
                     out.retain(|e| {
-                        if &e[..key(e)] == k {
+                        if key_of(e) == k {
                             let keep = !seen;
                             seen = true;
                             keep

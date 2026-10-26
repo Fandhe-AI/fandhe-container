@@ -2638,11 +2638,12 @@ mod linux {
         until: Option<Instant>,
     ) -> Result<Option<ContainerOptions>, TraitError> {
         let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
+        let store = Arc::clone(store);
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("fandhe-supopt".into())
             .spawn(move || {
-                let result = crate::container_options::store::read(&root, &id)
+                let result = read_generation_checked_document(&store, &root, &id)
                     .and_then(|doc| doc.map(|d| d.to_container_options()).transpose());
                 let _ = tx.send(result);
             })
@@ -2664,6 +2665,28 @@ mod linux {
                 "container options preparation timed out",
             )),
         }
+    }
+
+    /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
+    ///
+    /// 記録が無い(`NotFound`)ときは文書を採用しない(後続の手順が記録の不在を報告する)。ほかの取得失敗はそのまま返す。
+    fn read_generation_checked_document(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+    ) -> Result<Option<crate::container_options::document::ContainerOptionsDocument>, TraitError>
+    {
+        use crate::container_options::store as options;
+        let doc = options::read(root, id)?;
+        let recorded = match store.get(&GetStateRequest::new(id.clone())) {
+            Ok(record) => record
+                .annotations()
+                .get(options::GENERATION_ANNOTATION)
+                .map(str::to_owned),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        options::select_document(doc, recorded.as_deref())
     }
 
     /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
@@ -3146,11 +3169,31 @@ mod linux {
             );
             let id = ContainerId::new("c1").expect("id");
             let until = Some(Instant::now() + Duration::from_secs(30));
+            // 記録が無いときは文書を採用しない。
             assert!(
                 prepare_container_options(&store_dyn, &root, &id, until)
                     .expect("none")
                     .is_none()
             );
+            let bundle = root.join("bundle");
+            std::fs::create_dir_all(&bundle).expect("bundle");
+            let create_record = |generation: Option<&str>| {
+                let mut req = fandhe_container_core::traits::CreateStateRequest::new(
+                    fandhe_container_core::traits::ContainerStatus::created(id.clone(), None),
+                    bundle.clone(),
+                )
+                .expect("req");
+                if let Some(g) = generation {
+                    req = req.with_annotations(
+                        fandhe_container_core::traits::Annotations::new([(
+                            store::GENERATION_ANNOTATION.to_owned(),
+                            g.to_owned(),
+                        )])
+                        .expect("annotations"),
+                    );
+                }
+                store_dyn.create(&req).expect("create")
+            };
             let doc = ContainerOptionsDocument::new(
                 vec!["nofile=1024:2048".into()],
                 vec!["A=1".into()],
@@ -3158,14 +3201,52 @@ mod linux {
                 None,
                 vec![],
             )
-            .expect("doc");
+            .expect("doc")
+            .with_generation("gen-1".into())
+            .expect("gen");
             store::write_new(&root, &id, &doc).expect("write");
+            // 世代の無い記録(plugin-cri 経由・別の世代)では、残っていた文書を採用しない。
+            let rec = create_record(None);
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("stale is ignored")
+                    .is_none()
+            );
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が違う記録でも採用しない。
+            let rec = create_record(Some("gen-2"));
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("other generation is ignored")
+                    .is_none()
+            );
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が一致すれば採用する。
+            create_record(Some("gen-1"));
             let got = prepare_container_options(&store_dyn, &root, &id, until)
                 .expect("read")
                 .expect("some");
             assert_eq!(got.env().to_env_strings(), vec!["A=1"]);
             assert_eq!(got.rlimits().len(), 1);
-            std::fs::write(store::options_path(&root, &id), b"junk").expect("corrupt");
+            // 記録は世代を持つのに文書が無ければ、黙って既定値にせず拒否する。
+            store::remove(&root, &id).expect("remove");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            // 壊れた文書は拒否する。
+            let path = store::options_path(&root, &id);
+            std::fs::write(&path, b"junk").expect("corrupt");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("chmod");
             let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
             assert_eq!(err.code(), ErrorCode::InvalidArgument);
             let _ = std::fs::remove_dir_all(&root);

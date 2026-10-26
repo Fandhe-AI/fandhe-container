@@ -19,7 +19,9 @@
 //!
 //! 同じ ID の `create` と `delete` は ID 単位のロック(`@container-options/@lock-<id>`。[`acquire_lock`])で直列化する
 //! (並行 create で成功した側の文書を消さない)。plugin-cri の create は残骸を掃除しない
-//! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が効きうる(後続)。
+//! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が残りうるが、文書は作成世代
+//! (`gen` レコード)を持ち、状態記録の annotations([`GENERATION_ANNOTATION`])と一致しない文書は採用しない
+//! ([`select_document`]。#2713・SEC-1)。
 //! Linux 以外では `Unimplemented` で拒否する(CLI の create は Linux のローカル実行のみ)。
 
 use std::path::{Path, PathBuf};
@@ -285,6 +287,15 @@ mod imp {
         }
     }
 
+    /// 作成世代の識別子(`/dev/urandom` の 16 バイトを 16 進にした 32 文字)を作る。
+    pub fn new_generation() -> Result<String, TraitError> {
+        let mut bytes = [0u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .map_err(io_failed)?;
+        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     /// 文書を消す(無ければ成功)。delete と、record の無い残骸の掃除に使う。
     pub fn remove(root: &Path, id: &ContainerId) -> Result<(), TraitError> {
         match std::fs::remove_file(options_path(root, id)) {
@@ -333,6 +344,10 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn new_generation() -> Result<String, TraitError> {
+        Err(unsupported())
+    }
+
     /// ID 単位のロック(Linux 以外では取得できない)。
     #[derive(Debug)]
     pub struct OptionsLock;
@@ -350,7 +365,52 @@ mod imp {
     }
 }
 
-pub use imp::{OptionsLock, acquire_lock, read, remove, remove_if_same, write_new};
+pub use imp::{OptionsLock, acquire_lock, new_generation, read, remove, remove_if_same, write_new};
+
+/// 作成世代の識別子を載せる状態記録の annotations のキー(#2713・SEC-1)。
+///
+/// CLI の create が文書(`gen` レコード)と状態記録の両方へ同じ値を書く。非秘密の識別子で、利用者の label とは
+/// 名前空間で分ける。
+pub const GENERATION_ANNOTATION: &str = "io.fandhe.container.options-generation";
+
+/// 読んだ文書を、状態記録が持つ作成世代と照合して採否を決める(純関数。SUP-12・SEC-1・#2713)。
+///
+/// - 文書あり・世代が記録と一致: 採用する
+/// - 文書あり・世代が無い、または記録の値と違う: 別のコンテナ(同じ ID の前の世代・plugin-cri 経由で作られた記録)の
+///   残骸なので採用しない(`None`。前の世代の env・ulimit・`--ipc=host` を次のコンテナへ適用しない)
+/// - 文書なし・記録が世代を持つ: 文書が失われているため `FailedPrecondition`(オプションを黙って落とさない)
+/// - 文書なし・記録も世代なし: 既定値(`None`)
+pub fn select_document(
+    doc: Option<ContainerOptionsDocument>,
+    recorded: Option<&str>,
+) -> Result<Option<ContainerOptionsDocument>, TraitError> {
+    match (doc, recorded) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(err(
+            ErrorCode::FailedPrecondition,
+            "the container options file is missing",
+        )),
+        (Some(d), recorded) => match (d.generation(), recorded) {
+            (Some(g), Some(r)) if g == r => Ok(Some(d)),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// 状態記録と照合した、launch 時の env 上書き(`KEY=VALUE`)を返す。無い・別世代の文書なら空(#2713・SUP-12)。
+///
+/// exec(healthcheck を含む)が launch と同じ env を使うための入口(`exec::run_command_with_pidfd_env` の
+/// `launch_env`)。文書の I/O は止まりうるため、呼び出し側は期限つきの作業スレッドで包む(REPAIR-5)。
+pub fn launch_env_for(
+    root: &Path,
+    record: &fandhe_container_core::traits::StateRecord,
+) -> Result<Vec<String>, TraitError> {
+    let recorded = record.annotations().get(GENERATION_ANNOTATION);
+    let doc = read(root, record.status().id())?;
+    Ok(select_document(doc, recorded)?
+        .map(|d| d.env().to_vec())
+        .unwrap_or_default())
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -502,5 +562,27 @@ mod tests {
                 .code(),
             ErrorCode::PermissionDenied
         );
+    }
+
+    /// SUP-12・SEC-1(#2713): 文書は状態記録の作成世代と一致したときだけ採用する。
+    #[test]
+    fn sup12_select_document_checks_generation() {
+        let doc = ContainerOptionsDocument::new(vec![], vec!["A=1".into()], None, None, vec![])
+            .expect("doc");
+        let with_gen = doc.clone().with_generation("g1".into()).expect("gen");
+        assert_eq!(
+            select_document(Some(with_gen.clone()), Some("g1")).expect("match"),
+            Some(with_gen.clone())
+        );
+        // 別世代・記録に世代なし・文書に世代なしは、残骸として採用しない。
+        assert_eq!(
+            select_document(Some(with_gen.clone()), Some("g2")).expect("x"),
+            None
+        );
+        assert_eq!(select_document(Some(with_gen), None).expect("x"), None);
+        assert_eq!(select_document(Some(doc), Some("g1")).expect("x"), None);
+        assert_eq!(select_document(None, None).expect("none"), None);
+        let e = select_document(None, Some("g1")).expect_err("missing");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     }
 }

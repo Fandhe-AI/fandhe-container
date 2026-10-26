@@ -702,6 +702,35 @@ fn prepare_options_file(
     }))
 }
 
+/// 空でない文書に作成世代を付け、同じ値を `req` の annotations(`GENERATION_ANNOTATION`)にも足す(#2713・SEC-1)。
+///
+/// 文書が空、または状態ルートを持たない backend(文書を書かない経路)では何も変えない。利用者の label が予約キーを
+/// 持っていても、ここで足す値が後勝ちで置き換える。
+fn bind_generation(
+    rt: &Runtime,
+    req: &CreateRequest,
+    document: &ContainerOptionsDocument,
+) -> Result<(CreateRequest, ContainerOptionsDocument), TraitError> {
+    if document.is_empty() || rt.store.host_state_root().is_none() {
+        return Ok((req.clone(), document.clone()));
+    }
+    let generation = options_store::new_generation()?;
+    let entries = req
+        .annotations()
+        .iter()
+        .filter(|(k, _)| *k != options_store::GENERATION_ANNOTATION)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .chain(std::iter::once((
+            options_store::GENERATION_ANNOTATION.to_owned(),
+            generation.clone(),
+        )));
+    let annotations = fandhe_container_core::traits::Annotations::new(entries)?;
+    Ok((
+        req.clone().with_annotations(annotations),
+        document.clone().with_generation(generation)?,
+    ))
+}
+
 /// create が失敗したときの巻き戻し。自分が作った inode だけを消し、ロックファイルも消す(期限つき)。
 fn rollback_options(prepared: PreparedOptions, id: &ContainerId) -> Result<(), TraitError> {
     let PreparedOptions {
@@ -736,6 +765,16 @@ fn create_with_options(
     document: &ContainerOptionsDocument,
 ) -> Result<StateRecord, OciRuntimeError> {
     let started = Instant::now();
+    // 文書を書くときは、作成世代を文書と状態記録の annotations の両方へ同じ値で入れる(supervisor が照合し、同じ ID の
+    // 前のコンテナの残骸を適用しない。#2713・SEC-1)。
+    let (req, document) = match bind_generation(rt, req, document) {
+        Ok(pair) => pair,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
+    let (req, document) = (&req, &document);
     let prepared = match prepare_options_file(rt, req.id(), document) {
         Ok(p) => p,
         Err(e) => {
@@ -1755,7 +1794,17 @@ mod tests {
                 std::fs::metadata(&path).expect("meta").mode() & 0o777,
                 0o600
             );
-            assert_eq!(std::fs::read(&path).expect("bytes"), doc.encode());
+            // 文書と状態記録の annotations は同じ作成世代を持つ(supervisor が照合する。#2713・SEC-1)。
+            let written = options_store::read(&root, &id)
+                .expect("read")
+                .expect("document");
+            let generation = rec
+                .annotations()
+                .get(options_store::GENERATION_ANNOTATION)
+                .expect("generation annotation");
+            assert_eq!(generation.len(), 32);
+            assert_eq!(written.generation(), Some(generation));
+            assert_eq!(written.env(), doc.env());
             let before = std::fs::read(&path).expect("bytes");
             let e = create_with_options(&rt, &req, None, &doc).expect_err("dup");
             assert_eq!(e.code(), ErrorCode::AlreadyExists);

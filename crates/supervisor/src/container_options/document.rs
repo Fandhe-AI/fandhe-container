@@ -48,6 +48,8 @@ const ULIMIT_RECORD_MAX: usize = 64;
 const IPC_RECORD_MAX: usize = 32;
 const SHM_RECORD_MAX: usize = 64;
 const TMPFS_RECORD_MAX: usize = 4096;
+/// 作成世代の識別子の最大バイト数(#2713)。
+pub const GENERATION_MAX: usize = 64;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
 const HEADER_LINE_MAX: usize = 24;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
@@ -65,6 +67,8 @@ pub struct ContainerOptionsDocument {
     ipc: Option<String>,
     shm_size: Option<String>,
     tmpfs: Vec<String>,
+    /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
+    generation: Option<String>,
 }
 
 impl std::fmt::Debug for ContainerOptionsDocument {
@@ -81,6 +85,7 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("ipc", &self.ipc)
             .field("shm_size", &self.shm_size)
             .field("tmpfs", &self.tmpfs)
+            .field("generation", &self.generation)
             .finish()
     }
 }
@@ -110,6 +115,7 @@ impl ContainerOptionsDocument {
             ipc,
             shm_size,
             tmpfs,
+            generation: None,
         };
         doc.check_record_lengths()?;
         // 変換に通して検証する(変換結果は捨てる。保持するのは生の文字列)。
@@ -131,6 +137,28 @@ impl ContainerOptionsDocument {
             return Err(too_long());
         }
         Ok(())
+    }
+
+    /// 作成世代の識別子を持たせる(英数字・`-`・`_` のみ、1〜[`GENERATION_MAX`] バイト。#2713)。
+    ///
+    /// CLI の create が、同じ値を状態記録の annotations(`store::GENERATION_ANNOTATION`)にも書く。supervisor は両者が
+    /// 一致する文書だけを適用する(同じ ID の前のコンテナの残骸を、次のコンテナに適用しない。fail-closed)。
+    pub fn with_generation(mut self, generation: String) -> Result<Self, TraitError> {
+        let ok = !generation.is_empty()
+            && generation.len() <= GENERATION_MAX
+            && generation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !ok {
+            return Err(invalid("the options generation is invalid"));
+        }
+        self.generation = Some(generation);
+        Ok(self)
+    }
+
+    /// 作成世代の識別子。
+    pub fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
     }
 
     /// 何も指定していない文書か(空なら CLI は文書を書かない)。
@@ -211,6 +239,9 @@ impl ContainerOptionsDocument {
         for s in &self.tmpfs {
             put("tmpfs", s);
         }
+        if let Some(s) = &self.generation {
+            put("gen", s);
+        }
         out
     }
 
@@ -225,6 +256,7 @@ impl ContainerOptionsDocument {
             .ok_or_else(|| invalid("options document has an unknown header"))?;
         let (mut ulimits, mut env, mut tmpfs) = (Vec::new(), Vec::new(), Vec::new());
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
+        let mut generation: Option<String> = None;
         // 全体の上限があるため、レコード数は `new` の件数検査と合わせて有限。
         while !rest.is_empty() {
             let line_end = rest
@@ -255,6 +287,7 @@ impl ContainerOptionsDocument {
                 "ipc" => IPC_RECORD_MAX,
                 "shm-size" => SHM_RECORD_MAX,
                 "tmpfs" => TMPFS_RECORD_MAX,
+                "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
             if len > max {
@@ -267,6 +300,11 @@ impl ContainerOptionsDocument {
                 "ulimit" => ulimits.push(text),
                 "env" => env.push(text),
                 "tmpfs" => tmpfs.push(text),
+                "gen" => {
+                    if generation.replace(text).is_some() {
+                        return Err(invalid("an options record is duplicated"));
+                    }
+                }
                 "ipc" | "shm-size" => {
                     let slot = if kind == "ipc" {
                         &mut ipc
@@ -287,7 +325,11 @@ impl ContainerOptionsDocument {
                 return Err(invalid("too many options records"));
             }
         }
-        Self::new(ulimits, env, ipc, shm_size, tmpfs)
+        let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?;
+        match generation {
+            Some(g) => doc.with_generation(g),
+            None => Ok(doc),
+        }
     }
 }
 
@@ -467,5 +509,24 @@ tmpfs 14\n/run:rw,noexec\n";
         let text = format!("{d:?}");
         assert!(!text.contains("TOPSECRETVALUE"), "{text}");
         assert!(text.contains("TOKEN"), "{text}");
+    }
+
+    /// SUP-12・SEC-1(#2713): 作成世代は符号化・復号で保たれ、不正な値と重複は拒否する。
+    #[test]
+    fn sup12_options_document_generation_round_trip_and_rejects() {
+        let d = doc().with_generation("abc-123_X".into()).expect("gen");
+        let back = ContainerOptionsDocument::decode(&d.encode()).expect("decode");
+        assert_eq!(back.generation(), Some("abc-123_X"));
+        assert_eq!(back, d);
+        assert!(doc().with_generation(String::new()).is_err());
+        assert!(doc().with_generation("a b".into()).is_err());
+        assert!(
+            doc()
+                .with_generation("x".repeat(GENERATION_MAX + 1))
+                .is_err()
+        );
+        let mut bytes = d.encode();
+        bytes.extend_from_slice(b"gen 1\nz\n");
+        assert!(ContainerOptionsDocument::decode(&bytes).is_err());
     }
 }

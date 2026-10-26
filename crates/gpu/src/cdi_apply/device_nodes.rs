@@ -108,7 +108,7 @@ pub(crate) fn decode_dev(dev: u64) -> (u64, u64) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum HostKind {
     Char,
     Block,
@@ -243,6 +243,21 @@ fn check_minor(v: Option<i64>) -> Result<Option<u32>, CdiApplyError> {
     }
 }
 
+/// ホストの `st_rdev` を major/minor へ分解する。復号は Linux のビット配置に限るため、
+/// 他 OS では誤った値を返さず `Unimplemented`（`RealHost` も他 OS では常に拒否する）。
+#[cfg(any(target_os = "linux", test))]
+fn host_dev_numbers(rdev: u64) -> Result<(u64, u64), CdiApplyError> {
+    Ok(decode_dev(rdev))
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn host_dev_numbers(_rdev: u64) -> Result<(u64, u64), CdiApplyError> {
+    Err(err(
+        Code::Unimplemented,
+        "host device number decoding is not supported on this OS",
+    ))
+}
+
 fn host_kind_to_kind(k: HostKind) -> Option<DeviceNodeKind> {
     match k {
         HostKind::Char => Some(DeviceNodeKind::Char),
@@ -359,7 +374,7 @@ fn resolve_one(
                 Some(_) => {}
             }
             if hk != DeviceNodeKind::Fifo {
-                let (hma, hmi) = decode_dev(h.rdev);
+                let (hma, hmi) = host_dev_numbers(h.rdev)?;
                 if major.unwrap_or(0) == 0 {
                     major = u32::try_from(hma).ok();
                     minor = u32::try_from(hmi).ok();
@@ -427,7 +442,10 @@ pub fn resolve_device_nodes(
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{DeviceNodeOutcome, DeviceNodeReport, DeviceNodeStatus, create_device_nodes};
+pub use linux::{
+    DeviceNodeCreateRecorder, DeviceNodeCreateSample, DeviceNodeOutcome, DeviceNodeReport,
+    DeviceNodeStatus, create_device_nodes, create_device_nodes_with_recorder,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -438,6 +456,7 @@ mod linux {
     use std::fs::File;
     use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::time::{Duration, Instant};
 
     /// ノード 1 件の結果。
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,7 +556,8 @@ mod linux {
         pub(super) static FAIL_OBSERVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
-    fn observe(fd: &OwnedFd) -> Result<Observed, CdiApplyError> {
+    /// fd を複製せずに fstat する（FD 枯渇下の回収でも追加の FD を要しない）。fd は結果と一緒に返す。
+    fn observe(fd: OwnedFd) -> Result<(Observed, OwnedFd), CdiApplyError> {
         #[cfg(test)]
         {
             let hit = FAIL_OBSERVE_AT.with(|c| match c.get() {
@@ -555,18 +575,21 @@ mod linux {
                 return Err(CdiApplyError::new(Code::ResourceExhausted, "injected").with_errno(24));
             }
         }
-        let f = File::from(clone_fd(fd.as_fd())?);
+        let f = File::from(fd);
         let md = f
             .metadata()
             .map_err(|e| io_err(&e, "failed to stat the created node"))?;
-        Ok(Observed {
-            mode: md.mode(),
-            rdev: md.rdev(),
-            uid: md.uid(),
-            gid: md.gid(),
-            dev: md.dev(),
-            ino: md.ino(),
-        })
+        Ok((
+            Observed {
+                mode: md.mode(),
+                rdev: md.rdev(),
+                uid: md.uid(),
+                gid: md.gid(),
+                dev: md.dev(),
+                ino: md.ino(),
+            },
+            OwnedFd::from(f),
+        ))
     }
 
     fn type_bits(kind: DeviceNodeKind) -> u32 {
@@ -605,8 +628,8 @@ mod linux {
                 // 識別が未確定でも、種別と rdev が作ったものと一致する場合だけ消す。
                 let same = sys::open_path_nofollow_at(n.parent.as_fd(), &n.name)
                     .ok()
-                    .and_then(|fd| observe(&fd).ok())
-                    .is_some_and(|o| {
+                    .and_then(|fd| observe(fd).ok())
+                    .is_some_and(|(o, _fd)| {
                         o.mode & S_IFMT == n.type_bits
                             && o.rdev == n.rdev
                             && n.ident.is_none_or(|(d, i)| o.dev == d && o.ino == i)
@@ -704,7 +727,7 @@ mod linux {
         };
         let fd = sys::open_path_nofollow_at(parent.as_fd(), &name)
             .map_err(|e| map_sys(e, "failed to reopen the device node"))?;
-        let obs = observe(&fd)?;
+        let (obs, fd) = observe(fd)?;
         if status == DeviceNodeStatus::Created {
             // 開き直した inode の識別を記録してから検証する（差し替えられても他人の inode は消さない）。
             if let Some(last) = created.nodes.last_mut() {
@@ -723,7 +746,7 @@ mod linux {
                 std::os::unix::fs::chown(&p, n.uid, n.gid)
                     .map_err(|e| io_err(&e, "failed to change the device node owner"))?;
             }
-            let after = observe(&fd)?;
+            let (after, _fd) = observe(fd)?;
             if !matches_exact(&after, n, dev) {
                 return Err(precondition("created node attributes differ after fixup"));
             }
@@ -764,12 +787,96 @@ mod linux {
         dev_root: BorrowedFd<'_>,
         nodes: &[ResolvedDeviceNode],
     ) -> Result<DeviceNodeReport, CdiApplyError> {
+        create_device_nodes_with_recorder(dev_root, nodes, &NoopRecorder)
+    }
+
+    /// 1 回の作成の計測結果（REPAIR-4）。path・デバイス番号は持たない。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct DeviceNodeCreateSample {
+        error_code: Option<Code>,
+        latency: Duration,
+        requested: usize,
+        created: usize,
+    }
+
+    impl DeviceNodeCreateSample {
+        /// 成功したか。
+        pub fn is_success(&self) -> bool {
+            self.error_code.is_none()
+        }
+        /// 失敗時の分類（成功なら `None`）。
+        pub fn error_code(&self) -> Option<Code> {
+            self.error_code
+        }
+        /// 所要時間（後始末を含む）。
+        pub fn latency(&self) -> Duration {
+            self.latency
+        }
+        /// 要求されたノード数。
+        pub fn requested(&self) -> usize {
+            self.requested
+        }
+        /// 新規に作ったノード数（失敗時は回収前に作っていた数）。
+        pub fn created(&self) -> usize {
+            self.created
+        }
+    }
+
+    /// [`create_device_nodes_with_recorder`] の計測先。成功・失敗（件数上限超過を含む）の全経路で 1 回呼ぶ。
+    pub trait DeviceNodeCreateRecorder {
+        /// 1 回の結果を記録する。
+        fn record(&self, sample: DeviceNodeCreateSample);
+    }
+
+    struct NoopRecorder;
+
+    impl DeviceNodeCreateRecorder for NoopRecorder {
+        fn record(&self, _sample: DeviceNodeCreateSample) {}
+    }
+
+    /// [`create_device_nodes`] に計測（REPAIR-4）を付けたもの。
+    pub fn create_device_nodes_with_recorder(
+        dev_root: BorrowedFd<'_>,
+        nodes: &[ResolvedDeviceNode],
+        recorder: &dyn DeviceNodeCreateRecorder,
+    ) -> Result<DeviceNodeReport, CdiApplyError> {
+        let start = Instant::now();
+        let mut created_count = 0;
+        let result = create_inner(dev_root, nodes, &mut created_count);
+        recorder.record(DeviceNodeCreateSample {
+            error_code: result.as_ref().err().map(CdiApplyError::code),
+            latency: start.elapsed(),
+            requested: nodes.len(),
+            created: created_count,
+        });
+        result
+    }
+
+    fn create_inner(
+        dev_root: BorrowedFd<'_>,
+        nodes: &[ResolvedDeviceNode],
+        created_count: &mut usize,
+    ) -> Result<DeviceNodeReport, CdiApplyError> {
+        // 公開入口でも件数を先に検証する（確保・作成の前。無制限確保の防止）。
+        if nodes.len() > super::CDI_APPLY_MAX_DEVICE_NODES {
+            return Err(CdiApplyError::new(
+                Code::ResourceExhausted,
+                "too many device nodes",
+            ));
+        }
         let mut created = Created::default();
         let mut report = DeviceNodeReport::default();
         for n in nodes {
             match create_one(dev_root, n, &mut created) {
-                Ok(o) => report.outcomes.push(o),
+                Ok(o) => {
+                    if o.status == DeviceNodeStatus::Created {
+                        *created_count += 1;
+                    }
+                    report.outcomes.push(o);
+                }
                 Err(e) => {
+                    *created_count = created.nodes.len();
                     created.rollback();
                     return Err(e);
                 }
@@ -1063,6 +1170,57 @@ mod tests {
                 .file_type()
                 .is_fifo()
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GPU-2・REPAIR-5: 公開の作成入口も件数上限を作成前に検証する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_rejects_too_many_nodes_before_touching_dev() {
+        use std::os::fd::AsFd as _;
+        let d = std::env::temp_dir().join(format!("fc-gpu-ut-max-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::File::open(&d).unwrap();
+        let mut n = node("/dev/q0");
+        n.r#type = Some("p".into());
+        let one = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        let many = vec![one[0].clone(); CDI_APPLY_MAX_DEVICE_NODES + 1];
+        let e = create_device_nodes(root.as_fd(), &many).unwrap_err();
+        assert_eq!(e.code(), Code::ResourceExhausted);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GPU-2・REPAIR-4: 成功と失敗の両経路で結果と所要時間を 1 回ずつ記録する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorder_sees_success_and_failure() {
+        use std::cell::RefCell;
+        use std::os::fd::AsFd as _;
+        struct Rec(RefCell<Vec<linux::DeviceNodeCreateSample>>);
+        impl linux::DeviceNodeCreateRecorder for Rec {
+            fn record(&self, s: linux::DeviceNodeCreateSample) {
+                self.0.borrow_mut().push(s);
+            }
+        }
+        let d = std::env::temp_dir().join(format!("fc-gpu-ut-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::File::open(&d).unwrap();
+        let mut n = node("/dev/q1");
+        n.r#type = Some("p".into());
+        let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        let rec = Rec(RefCell::new(Vec::new()));
+        linux::create_device_nodes_with_recorder(root.as_fd(), &resolved, &rec).unwrap();
+        let many = vec![resolved[0].clone(); CDI_APPLY_MAX_DEVICE_NODES + 1];
+        linux::create_device_nodes_with_recorder(root.as_fd(), &many, &rec).unwrap_err();
+        let v = rec.0.borrow();
+        assert_eq!(v.len(), 2);
+        assert!(v[0].is_success());
+        assert_eq!((v[0].requested(), v[0].created()), (1, 1));
+        assert_eq!(v[1].error_code(), Some(Code::ResourceExhausted));
+        assert_eq!(v[1].requested(), CDI_APPLY_MAX_DEVICE_NODES + 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 

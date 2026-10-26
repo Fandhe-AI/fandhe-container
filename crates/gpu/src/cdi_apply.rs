@@ -20,7 +20,8 @@ pub use device_nodes::{
 };
 #[cfg(target_os = "linux")]
 pub use device_nodes::{
-    DeviceNodeOutcome, DeviceNodeReport, DeviceNodeStatus, create_device_nodes,
+    DeviceNodeCreateRecorder, DeviceNodeCreateSample, DeviceNodeOutcome, DeviceNodeReport,
+    DeviceNodeStatus, create_device_nodes, create_device_nodes_with_recorder,
 };
 
 use std::fmt;

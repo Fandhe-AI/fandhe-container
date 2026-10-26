@@ -48,3 +48,48 @@ ci.yml の `TMPDIR` 指定（CI でしか効かない）。
 `BundleLock` は待たない設計（#1316・#1854・#2378 で確定）のため、aging 対象の場所に bundle を置く利用者でも
 create・start・delete が稀に同じ文言で失敗しうる。`launch.rs` の doc に既知の制約として記した。
 待たない取得を期限つきの再試行にする案・文言の改善などはオーナー判断として追跡する。
+
+## 他の実機前提試験への展開（#2887・CORE-5・REPAIR-12）
+
+`production_launcher` の保護（排他作成した 0700 の親ディレクトリ＋その親への共有 flock の保持）を共通補助
+`crates/core/tests/support/scratch_root.rs` にまとめ、同じ競合を受ける他の `--ignored` 実機試験へ広げた。
+`production_launcher` 自身の挙動（名前 `fandhe-prodlaunch-<pid>-<nanos>`・0700・期限・削除位置）は変えていない。
+
+### 判定基準
+
+失敗は「製品がディレクトリに待たない flock を取る経路」でだけ起きる（tmpfiles はディレクトリだけを flock する。
+状態ストアの `@lock` はファイルで無関係）。該当は `oci_runtime::{create,start,delete,create_with_image}` の
+`BundleLock` と image rootfs の `try_lock` で、これらを通る試験だけを対象にした。通らない試験は、作成直後の木を
+aging（30d）が消さないため対象外。
+
+### 適用した試験
+
+| 試験 | crate | CI |
+| ---- | ----- | -- |
+| `production_launcher`（共通補助へ移行） | core | platform-ci |
+| `rootless`・`rootless_uid_mapping`・`rootless_file_owner`・`rootless_image_rootfs_remove` | core | platform-ci |
+| `exec_subordinate_e2e`・`supervisor_bin_real` | supervisor | platform-ci |
+| `start_stop_delete_real` | cli | platform-ci |
+| `start_scope_real`・`delete_cgroup_real`・`start_recover_real` | cli | CI 外（人手の実機） |
+
+### 対象外
+
+- `rootless_launch`・`seccomp`・`exec_setns_join`・`sysfs_mount`・`config_paths_implicit_dev`・`inject_files`・`tmpfs_mount`・
+  `readonly_paths`・`landlock_implicit_dev`・`unshare_isolation`・`container_options_ipc`・`rootless_holder_*`:
+  `ProcessLauncher::launch` 等を直接呼び、製品のディレクトリ flock を通らない
+- `userns_extract`・`image_store_xdev`（oci）: image store の `@lock` はファイルで、ディレクトリ flock を通らない
+- plugin-cri の `production_binary_full_lifecycle_real`・cri の `runtime_service_namespaces`: bundle を temp_dir 直下に実体で置かない
+
+### 置き場所の決定
+
+正本は core の試験補助（`crates/core/tests/support/scratch_root.rs`）で、supervisor・cli の試験は
+`#[path = "../../core/tests/support/scratch_root.rs"]` で同じファイルを取り込む（複製しない。保護条件の修正を
+1 箇所に保つため。試験専用で製品コード・rlib に影響しない）。代替は、各 crate の `tests/support/` へ複製し
+正本を指すヘッダを付ける方式（`crates/supervisor/tests/support/rootfs.rs` の前例）。
+
+### 残余
+
+- 既定のテスト集合（`--ignored` 不要）で temp_dir 直下に bundle を作り fake launcher で create/start/delete を通す試験も
+  同じ競合を受けうる（本 issue の対象外）
+- `linux-env-probe.yml` への tmpfiles 設定・timer の観測ステップ（任意項目）は未実施
+- CI 外の 3 件（cli）はビルドと clippy までの確認で、実機実行は人手

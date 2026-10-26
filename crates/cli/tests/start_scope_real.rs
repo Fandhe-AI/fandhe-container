@@ -43,6 +43,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::io::Read;
     use std::path::{Path, PathBuf};
@@ -183,7 +187,8 @@ mod linux {
 
     fn work_dir(tag: &str) -> Result<PathBuf, String> {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fc-scope-real-{tag}-{}", std::process::id()));
+        let dir = super::scratch_root::scratch_root("fc-scope-real-scratch", WAIT)
+            .join(format!("fc-scope-real-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
@@ -192,6 +197,8 @@ mod linux {
     }
 
     fn scenarios() -> Result<(), String> {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を終了時に消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         let own_cgroup = cgroup_of("self")?;
         scenario_a(&me, &own_cgroup)?;

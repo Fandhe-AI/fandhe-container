@@ -54,7 +54,7 @@
 
 ## 書く時点・消す時点
 
-- sandbox: `RunPodSandbox` が副作用（保持役の起動・`set_up`）の前に `pending` 付きで書き、成功後に確定版へ置き換える。`StopPodSandbox` で状態・フラグを更新し、`RemovePodSandbox` の完了後に削除する
+- sandbox: `RunPodSandbox` が副作用（保持役の起動・`set_up`）の前に `pending` 付きで書き、成功後に確定版へ置き換える。`StopPodSandbox` で状態・フラグを更新し、`RemovePodSandbox` の完了後に削除する。`pending` は「副作用が起きたかもしれない」印であり、確定版が書かれる前にクラッシュすると、保持役の素性・`pod_netns` を持たない古い記録のまま残り得る。そのため `pending` の記録は、副作用が無かったと確認できた場合に限って破棄する（次節）
 - コンテナ: `CreateContainer` が core の `create` を呼ぶ前に `in_flight=create` 付きで書き（`reserve_container` の後）、`commit_in_flight` で確定版へ、`rollback_in_flight` で、削除してよい場合に限り削除する。削除してよいのは、未作成、または core の削除完了と bundle の解放成功を確認できた Create の巻き戻しだけである。Create の結果が不明な場合や bundle の解放に失敗した場合は、既存の `rollback_in_flight` と同じく記録を `CONTAINER_UNKNOWN` として保持する（消すと core に資源が残っても所有情報を失い、再起動後に回収できなくなる。CRI-2 の fail-closed）。Start / Stop / Remove の巻き戻しでは記録を削除せず、`in_flight` を戻すか unknown で保持する。Start/Stop の遷移で状態と時刻を更新し、`RemoveContainer`（core の delete と bundle の release の成功後）で削除する
 - write-ahead を採る理由: #2681 で net が write-ahead を採らなかった理由（成功後か途中かを見分けられない）は、ここでは core の状態（Present/Absent）で見分けられる。逆に後書きにすると「core にコンテナがあるのに CRI 記録が無い」状態が生じ、状態ルートを CLI と共有するため plugin-cri 由来かを証明できず回収できない
 - 書けなかった場合: 副作用の前なら RPC を `Internal` で失敗させる（成功を装わない）。確定・更新の書き込み失敗はメモリの記録を保持して `Internal` を返し、次の起動では古い記録と core の状態で照合される（次節の表で安全側に倒れる）
@@ -84,11 +84,11 @@
 - sandbox の状態は再採用時に必ず `SANDBOX_NOTREADY` にする（保持役は再起動で終了しているため。要確認事項 1 の (b)）。`network_owned`・`network_pending` は保持し、Stop/Remove で回収を試みる。ただし `pending` の sandbox 記録は次の規則で先に解決する
 - `pending` の sandbox 記録（`RunPodSandbox` が保持役の起動と `set_up` の前に書いたまま確定しなかったもの）: sandbox には core の `StateStore` の行が無く、Present/Absent では副作用の前に落ちたのか `set_up` の後に落ちたのかを見分けられない。そこで起動時の読み込みの一部として次の順で扱う（Stop/Remove の入口ではなく受付前に 1 回だけ。CORE-1）
   1. 記録に保持役の素性（pid・starttime・ns の dev:ino）と `pod_netns` が書かれていれば、実在を所有確認で調べる。pid からパスやシグナル先を作らない（前節）。確認の対象は、固定の置き場から導いた netns と、所有記録と照合できる資源だけ
-  2. 所有確認で資源の実在を証明できなければ（副作用の前に落ちたとみなせる）、記録を破棄する（`pending` の記録ファイルを消し、登録しない）。`network_pending` も一緒に消える
-  3. 資源の実在を証明できた場合は、`ready` へは昇格させない（保持役が再起動で終了しており、再採用後は常に `SANDBOX_NOTREADY`）。`NOTREADY` で登録し、`network_pending` を解除した上で `network_owned` を保持する。Stop/Remove が `tear_down` と取り残しの回収（ネットワーク資源の節）を試みる。これが、`set_up` の worker が既に無いのに `network_pending` が残って Stop/Remove が永久にブロックされる事態を防ぐ
-  4. 判定不能（所有確認が期限内に終わらない・I/O エラー・素性が部分的にしか読めない）は fail-closed: 記録を消さず、`network_pending` を解除して `NOTREADY` で登録し、Stop/Remove で回収を試みる。回収できない分は固定文言の `FailedPrecondition` で手動回収と知らせる（何も勝手に消さない）
+  2. 副作用が無かったと確認できた場合だけ記録を破棄する（`pending` の記録ファイルを消し、登録しない）。確認できるのは、副作用の前に書いた `pending` の時点で、固定の置き場の netns・所有記録と照合できる資源・保持役の痕跡のいずれも存在しないと、期限内に I/O エラーなく走査し終えた場合に限る。所有を証明できないこと（素性や `pod_netns` が記録に無い、所有確認で一致しない）は資源が無いことを意味しない。この場合は判定不能（4）として扱い、記録を破棄しない
+  3. 資源の実在を証明できた場合は、`ready` へは昇格させない（保持役が再起動で終了しており、再採用後は常に `SANDBOX_NOTREADY`）。`NOTREADY` で登録し、`network_pending` を解除した上で `network_owned=true` に復元する。予約時（`RunPodSandbox` の副作用前）の記録は `network_owned=false` であり、`set_up` の実行中や成功後の確定保存前にクラッシュすると false のまま残る。これをそのまま保持すると、Stop/Remove が `!network_owned` として `tear_down` を省略してしまい、資源が回収不能になる。Stop/Remove が `tear_down` と取り残しの回収（ネットワーク資源の節）を試みる。これが、`set_up` の worker が既に無いのに `network_pending` が残って Stop/Remove が永久にブロックされる事態を防ぐ
+  4. 判定不能（所有確認が期限内に終わらない・I/O エラー・素性が部分的にしか読めない・所有情報が不足して副作用が無かったと確認できない）は fail-closed（CRI-2）: 記録を消さず、`network_pending` を解除して `NOTREADY` で登録し、資源があり結果が不明なものとして 3 と同じく `network_owned=true` 相当の回収待ちを復元する。Stop/Remove で回収を試み、回収できない分は記録を残したまま固定文言の `FailedPrecondition` で手動回収と知らせる（何も勝手に消さない）
   - どの分岐でも、再採用後に `network_pending` を持つ sandbox を残さない（`set_up` の担い手が再起動で失われるため、解除の主体は読み込み時の照合だけ）
-  - 試験で、`pending` ＋資源なし→破棄、`pending` ＋資源あり→`NOTREADY` で `network_pending` なし、判定不能→`NOTREADY` で保持、のそれぞれの後に Stop/Remove が完了または固定文言の失敗で返りブロックしないことを固定する
+  - 試験で、`pending` ＋副作用なしと確認できた→破棄、`pending` ＋資源あり→`NOTREADY` で `network_pending` なし・`network_owned=true`、`pending` ＋所有情報不足（素性・`pod_netns` なし）→記録を保持、判定不能→`NOTREADY` で保持・`network_owned=true`、のそれぞれの後に Stop/Remove が `tear_down` を省略せず、完了または固定文言の失敗で返りブロックしないことを固定する
 - 壊れた記録（復号失敗・ファイル名と ID の不一致・上限超過・親 sandbox なし）は、ファイルを消さず登録もしない。失敗件数を記録器（`cri.record_store_load`）と固定語彙の stderr 1 行に出す（ID・パスは出さない）。手動回収の手順は `docs/setup/cri-record-recovery.md`（実装単位 R10）に置く
 - core に状態があるが CRI 記録の無いコンテナは触らない（CLI と状態ルートを共有するため所有を証明できない）
 - 孤児 bundle（`.cri/bundles/<id>` で CRI 記録が無く core が Absent〔`NotFound` だけ〕）は、インスタンスロックの下でだけ回収する。Undetermined は残す

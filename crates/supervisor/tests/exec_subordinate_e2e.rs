@@ -501,6 +501,9 @@ mod linux {
             .join(",")
     }
 
+    // 理由: 試験の各シナリオが共有する固定の環境（状態ストア・記録器・ID・cgroup・ホスト側ディレクトリ・
+    // config のパスと内容）を、1 回きりの試験専用の関数へそのまま渡す。まとめるだけの構造体は
+    // 読み手に余計な間接を足すため、引数を並べたまま clippy の引数数の警告だけを抑止する。
     #[allow(clippy::too_many_arguments)]
     fn scenarios(
         store: &FileStateStore,

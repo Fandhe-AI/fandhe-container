@@ -872,6 +872,27 @@ fn backend_to_plugin(e: &BackendError) -> PluginError {
     }
 }
 
+/// `VirtiofsIoError::Protocol` の `virtiofs_io.*` コードから `PluginErrorCode` への写像表（ERR-1・REPAIR-1）。
+///
+/// `IoErrorCode` の全 variant を明示する（`virtiofs_io.internal` も含む）。`resource_exhausted` は既存の
+/// ワイヤー互換のため `FailedPrecondition` へ据え置く。表に無い将来分は `Internal`（fail-closed）。
+const VIRTIOFS_IO_TO_PLUGIN: [(&str, PluginErrorCode); 8] = [
+    (
+        "virtiofs_io.invalid_argument",
+        PluginErrorCode::InvalidArgument,
+    ),
+    ("virtiofs_io.timeout", PluginErrorCode::Timeout),
+    ("virtiofs_io.unavailable", PluginErrorCode::Unavailable),
+    ("virtiofs_io.unimplemented", PluginErrorCode::Unimplemented),
+    ("virtiofs_io.internal", PluginErrorCode::Internal),
+    ("virtiofs_io.data_loss", PluginErrorCode::DataLoss),
+    (
+        "virtiofs_io.resource_exhausted",
+        PluginErrorCode::FailedPrecondition,
+    ),
+    ("virtiofs_io.already_exists", PluginErrorCode::AlreadyExists),
+];
+
 /// platform-macos のエラーを plugin のエラーフレーム用へ変換する唯一の箇所（モジュール doc の対応表）。
 pub fn to_plugin_error(e: &PlatformError) -> PluginError {
     use PluginErrorCode as C;
@@ -934,16 +955,10 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
         }
         PlatformError::VirtiofsIo(v) => {
             let code = match v {
-                VirtiofsIoError::Protocol { .. } => match e.code() {
-                    "virtiofs_io.invalid_argument" => C::InvalidArgument,
-                    "virtiofs_io.timeout" => C::Timeout,
-                    "virtiofs_io.unavailable" => C::Unavailable,
-                    "virtiofs_io.unimplemented" => C::Unimplemented,
-                    "virtiofs_io.data_loss" => C::DataLoss,
-                    "virtiofs_io.already_exists" => C::AlreadyExists,
-                    "virtiofs_io.resource_exhausted" => C::FailedPrecondition,
-                    _ => C::Internal,
-                },
+                VirtiofsIoError::Protocol { .. } => VIRTIOFS_IO_TO_PLUGIN
+                    .iter()
+                    .find(|(name, _)| *name == e.code())
+                    .map_or(C::Internal, |(_, pc)| *pc),
                 VirtiofsIoError::ReadOnlyShare { .. } => C::FailedPrecondition,
                 VirtiofsIoError::InFlightLimitTooSmall { .. }
                 | VirtiofsIoError::InvalidReconnectPolicy { .. } => C::InvalidArgument,
@@ -2162,6 +2177,33 @@ mod tests {
             pe(gm(GuestMountError::InvalidReport { reason: "r".into() })).0,
             C::Internal
         );
+    }
+
+    /// REPAIR-1・ERR-1: `IoErrorCode::ALL` の各要素が表の期待どおりの `PluginErrorCode` へ写る
+    /// （期待表の件数が `ALL` と一致し、`Internal` も表から引かれる）。
+    #[test]
+    fn err1_virtiofs_io_table_covers_io_error_code_all() {
+        use PluginErrorCode as C;
+        let expected = [
+            (IoErrorCode::InvalidArgument, C::InvalidArgument),
+            (IoErrorCode::Timeout, C::Timeout),
+            (IoErrorCode::Unavailable, C::Unavailable),
+            (IoErrorCode::Unimplemented, C::Unimplemented),
+            (IoErrorCode::Internal, C::Internal),
+            (IoErrorCode::DataLoss, C::DataLoss),
+            (IoErrorCode::ResourceExhausted, C::FailedPrecondition),
+            (IoErrorCode::AlreadyExists, C::AlreadyExists),
+        ];
+        assert_eq!(expected.len(), IoErrorCode::ALL.len());
+        assert_eq!(VIRTIOFS_IO_TO_PLUGIN.len(), IoErrorCode::ALL.len());
+        for (i, (io_code, plugin_code)) in expected.into_iter().enumerate() {
+            assert_eq!(IoErrorCode::ALL[i], io_code);
+            let e = PlatformError::VirtiofsIo(VirtiofsIoError::Protocol {
+                op: VirtiofsIoOp::Write,
+                source: IoError::new(io_code, "x"),
+            });
+            assert_eq!(pe(e).0, plugin_code, "{io_code:?}");
+        }
     }
 
     /// TASK-115.3・ERR-1・IO-2: virtiofs I/O エラーの対応（データ喪失の可能性を区別する）。

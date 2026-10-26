@@ -274,7 +274,7 @@ impl ReferenceTable {
     }
 
     fn list_images_inner(&self, root: &Path) -> Result<ImageList, OciError> {
-        let handle = self.root_handle_for(root)?;
+        let handle = self.root_handle_for_read(root)?;
         self.list_images_at(&handle)
     }
 
@@ -344,7 +344,7 @@ impl ReferenceTable {
     }
 
     fn disk_usage_inner(&self, root: &Path) -> Result<DiskUsage, OciError> {
-        let handle = self.root_handle_for(root)?;
+        let handle = self.root_handle_for_read(root)?;
         self.disk_usage_at(&handle)
     }
 

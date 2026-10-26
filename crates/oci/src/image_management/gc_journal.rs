@@ -731,24 +731,33 @@ pub struct PendingDeletionRecovery {
 }
 
 impl super::JournalRoot {
-    /// `root_handle_for` の本体。`ExpandedSizePlan::measure`（ガードの外で、plan が持つハンドルと照合する）も
-    /// 同じ規則で解決する（#2695）。
+    /// `root_handle_for` の本体（削除系の入口用）。排他区間のハンドルが無い単体テーブルは、本番ビルドでは
+    /// `FailedPrecondition` で拒否する（#2701）。
     pub(super) fn resolve(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.resolve_with(root, true)
+    }
+
+    /// 読み取り専用 API（`list_images`・`disk_usage`・`ExpandedSizePlan::measure`）用。排他区間のハンドルが
+    /// あれば同じ規則で照合し、無い単体テーブルは従来どおり `root` を検査なしで開く（読み取りのみで、
+    /// 永続化操作は行わないため拒否しない。#2701）。
+    pub(super) fn resolve_read(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.resolve_with(root, false)
+    }
+
+    fn resolve_with(&self, root: &Path, require_guard: bool) -> Result<Arc<RootHandle>, OciError> {
         match &self.0 {
             Some(h) if h.matches(root) => Ok(Arc::clone(h)),
             Some(_) => Err(err(
                 OciErrorCode::InvalidArgument,
                 "root does not match the image store root of this exclusive section",
             )),
-            // 本番ビルドでは拒否する。信頼検査なしの root とジャーナルの検査抜きで永続化操作が動く
+            // 削除系は本番ビルドでは拒否する。信頼検査なしの root とジャーナルの検査抜きで永続化操作が動く
             // 経路を公開 API から閉じる（`ImageStore::lock` のガード経由のみ。OCI-7・SEC-1・#2701）。
-            #[cfg(test)]
-            None => RootHandle::open_unchecked(root).map(Arc::new),
-            #[cfg(not(test))]
-            None => Err(err(
+            None if require_guard && !cfg!(test) => Err(err(
                 OciErrorCode::FailedPrecondition,
                 "image store operation requires the exclusive section of an opened ImageStore",
             )),
+            None => RootHandle::open_unchecked(root).map(Arc::new),
         }
     }
 }
@@ -773,6 +782,11 @@ impl ReferenceTable {
     ///   `FailedPrecondition` で拒否する（`ImageStore::lock` のガードの中で呼ぶこと。#2701）
     pub(super) fn root_handle_for(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
         self.journal_root.resolve(root)
+    }
+
+    /// 読み取り専用 API 用の [`Self::root_handle_for`]。ガードの外の単体テーブルでも拒否しない（#2701）。
+    pub(super) fn root_handle_for_read(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        self.journal_root.resolve_read(root)
     }
 
     /// 削除ジャーナル（墓標を含む）がディスクに見えていれば

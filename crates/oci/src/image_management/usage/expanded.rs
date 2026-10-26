@@ -92,7 +92,7 @@ impl ExpandedSizePlan {
     /// 読み取りは検査済み root の fd 起点（#2695）。計画を排他区間で取った場合、`root` がその区間の root と
     /// 別のディレクトリなら `InvalidArgument`（ガードを手放した後に差し替えられたパスを読まない）。
     pub fn measure(&self, root: &Path) -> Result<ExpandedUsage, OciError> {
-        let handle = self.root.resolve(root)?;
+        let handle = self.root.resolve_read(root)?;
         let blobs = handle.open_blob_dir()?;
         let mut usage = ExpandedUsage::default();
         // 成功・失敗を問わず実際に展開した量の累計（報告用の `expanded_bytes` とは別に予算を管理する）。

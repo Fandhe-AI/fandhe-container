@@ -167,9 +167,8 @@ impl RootHandle {
 
     /// 信頼検査をしない単体テーブル用に、パスから開く（検査は `ImageStore::open` の担当）。
     ///
-    /// 試験と `cfg(test)` の単体テーブルの経路だけで使う（本番ビルドの `gc_journal::root_handle_for` は
-    /// この経路を拒否する。#2701）。末尾が symlink・非ディレクトリなら拒否する。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 試験と、ガードの外の単体テーブルの読み取り専用 API で使う（削除系の `gc_journal::root_handle_for` は
+    /// 本番ビルドでこの経路を拒否する。#2701）。末尾が symlink・非ディレクトリなら拒否する。
     pub(super) fn open_unchecked(path: &Path) -> Result<Self, OciError> {
         let path: PathBuf = path.components().collect();
         let meta = std::fs::symlink_metadata(&path).map_err(|e| {

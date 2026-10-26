@@ -87,3 +87,13 @@ fn unguarded_table_rejects_rm_prune_and_recovery() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// OCI-7・#2701: 読み取り専用の `disk_usage`・`list_images` は単体テーブルでも拒否されない。
+#[test]
+fn unguarded_table_still_serves_read_only_usage() {
+    let root = root("readonly");
+    let (t, _tag) = table();
+    t.disk_usage(&root).expect("disk_usage");
+    t.list_images(&root).expect("list_images");
+    let _ = fs::remove_dir_all(&root);
+}

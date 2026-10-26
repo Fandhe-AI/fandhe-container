@@ -1286,6 +1286,10 @@ impl Inner {
             .capabilities()
             .without(options.capability_drop());
         let isolation_record = isolation_record.with_capabilities(capabilities);
+        // rootfs の読み取り専用の有無を記録へ添える(SUP-6・CORE-5・SEC-1・#2829)。子の `root_readonly` 段
+        // (`PrePivotSetup::root_readonly`)と同じ `root.readonly` が出所。段は失敗で launch を失敗させる
+        // (fail-closed)ため、記録が残るなら `true` は実際に ro で起動した事実と一致する。観測専用。
+        let isolation_record = isolation_record.with_root_readonly(spec.config().root().readonly());
         let (uid, gid) = spec.user();
         // 補助グループの正規化(確保・整列・重複除去)は fork の前に済ませる(#2770)。
         let additional_gids =
@@ -2603,7 +2607,8 @@ mod tests {
             .with_id_mapping(
                 recorded_id_mapping(rootless(), None, FAKE_EUID, FAKE_EGID).expect("id mapping"),
             )
-            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default());
+            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default())
+            .with_root_readonly(false);
         assert!(
             record == expected,
             "record must come from the applied ruleset"
@@ -2614,6 +2619,7 @@ mod tests {
             .iter()
             .map(|r| r.target().as_str())
             .collect();
+        assert_eq!(record.root_readonly(), Some(false));
         assert_eq!(targets.first().copied(), Some("/"));
         assert!(matches!(
             record.landlock().rules().first().map(|r| r.target()),
@@ -2624,6 +2630,27 @@ mod tests {
         assert!(pos("landlock") < pos("root_identity"));
         assert!(pos("root_identity") < pos("spawn"));
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-6・CORE-5(#2829): `root.readonly=true` の start では分離の記録の `root_readonly` が `Some(true)`、
+    /// 既定（書き込み可能）では `Some(false)` になる。
+    #[test]
+    fn sup6_core5_2829_readonly_root_is_recorded() {
+        for (ro, want) in [(true, Some(true)), (false, Some(false))] {
+            let spec = spec_with_root_readonly(
+                "iso-record-ro",
+                ro,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let l = launcher(FakeOps::new(&events()), rootless(), None);
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            assert_eq!(p.launch_isolation().expect("record").root_readonly(), want);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
     }
 
     /// SUP-6・OCI-4(#2007・#1915): bind mount の分も同じ ruleset から記録に入る。

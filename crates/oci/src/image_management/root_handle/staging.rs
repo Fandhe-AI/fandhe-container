@@ -21,11 +21,13 @@
 //! x86_64 / aarch64 は root の fd からの `openat2`（`RESOLVE_IN_ROOT | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV`、
 //! 最後の要素も `O_NOFOLLOW`）と `*at`。それ以外はパス起点の従来実装で、差し替えは入口の再検査だけで検出する。
 //!
-//! # 移していないもの
+//! # fetcher の書き込み先（#2765）
 //!
-//! fetcher（`RegistryClient::fetch_blob`）が書く先は `PullSession::staged_blob_path` が返すパスである
-//! （fetcher の API がパスを受け取るため）。`PullDir::matches_path` で、そのパスが保持している pull ディレクトリと
-//! 同じ実体を指すことを確かめる用途に限って使う。
+//! fetcher（`RegistryClient::fetch_blob`）の書き込み先も、`PullSession::open_staged_blob` が返す
+//! `StagedBlobWriter` が `PullDir` の fd 起点（`create_new_file` で `<hex>.part` を排他作成し、`link_name` で
+//! `<hex>` へ確定、`unlink` で `.part` を消す）で行う。パスは渡さない。`PullDir::matches_path` は、読み取り用に
+//! 返すパス（`PullSession::staged_blob_read_path`）が保持している pull ディレクトリと同じ実体を指すことを確かめる
+//! 用途に限って使う。
 
 pub(crate) use imp::{PullDir, StagingDir};
 
@@ -211,6 +213,12 @@ mod imp {
 
         /// `@pull.lock` を 0600 で排他作成する（既存なら `AlreadyExists`。symlink は辿らない）。
         pub(crate) fn create_lock(&self, name: &str) -> io::Result<File> {
+            self.create_new_file(name)
+        }
+
+        /// 直下に 0600 で排他作成して書き込みで開く（既存なら `AlreadyExists`。symlink は辿らない）。
+        /// `@pull.lock` と fetcher の `<hex>.part`（#2765）の共通の口。
+        pub(crate) fn create_new_file(&self, name: &str) -> io::Result<File> {
             open_in(
                 &self.0,
                 OsStr::new(name),
@@ -218,6 +226,21 @@ mod imp {
                 0o600,
             )
             .map(File::from)
+        }
+
+        /// 直下の `from` を `to` へハードリンクする（宛先があれば `AlreadyExists`。置き換えない）。
+        pub(crate) fn link_name(&self, from: &str, to: &str) -> io::Result<()> {
+            at::linkat_names(
+                self.0.as_fd(),
+                OsStr::new(from),
+                self.0.as_fd(),
+                OsStr::new(to),
+            )
+        }
+
+        /// 同じディレクトリを指すハンドルを複製する（`StagedBlobWriter` が所有値で持つため）。
+        pub(crate) fn try_clone(&self) -> io::Result<PullDir> {
+            self.0.try_clone().map(PullDir)
         }
 
         /// `<root>/staging/<id>` 自身を fsync する（直下の `@pull.lock` のエントリを永続化する。OCI-7）。
@@ -435,6 +458,11 @@ mod imp {
 
         /// `@pull.lock` を 0600 で排他作成する。
         pub(crate) fn create_lock(&self, name: &str) -> io::Result<File> {
+            self.create_new_file(name)
+        }
+
+        /// 直下に 0600 で排他作成して書き込みで開く（既存なら `AlreadyExists`）。
+        pub(crate) fn create_new_file(&self, name: &str) -> io::Result<File> {
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]
@@ -443,6 +471,16 @@ mod imp {
                 opts.mode(0o600);
             }
             opts.open(self.0.join(name))
+        }
+
+        /// 直下の `from` を `to` へハードリンクする（宛先があれば `AlreadyExists`。置き換えない）。
+        pub(crate) fn link_name(&self, from: &str, to: &str) -> io::Result<()> {
+            fs::hard_link(self.0.join(from), self.0.join(to))
+        }
+
+        /// 同じパスを指すハンドルを複製する。
+        pub(crate) fn try_clone(&self) -> io::Result<PullDir> {
+            Ok(PullDir(self.0.clone()))
         }
 
         /// `<root>/staging/<id>` 自身を fsync する（Windows は std で開けないため何もしない。OCI-7）。

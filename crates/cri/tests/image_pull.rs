@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample}
 use fandhe_container_cri::runtime::v1::{self, image_service_server::ImageService};
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::layer::extract::ExtractLimits;
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
@@ -180,8 +182,11 @@ struct FakeClient {
     /// 先頭から数えてこの回数だけ blob 取得を PermissionDenied にする（token 失効の模擬）。
     deny_blob_fetches: AtomicUsize,
     auth_calls: AtomicUsize,
-    /// 指定すると、blob を書かずに `dest` をこのパスへの symlink として作る（不正な取得結果の模擬）。
-    staged_symlink_target: Option<PathBuf>,
+    /// 指定すると `(キャッシュの staging ディレクトリ, symlink の向き先)`。取得中（writer を開いた後・commit の前）に
+    /// pull ディレクトリの `<hex>` へこの向き先への symlink を置く（fetcher の外からの差し替えの模擬。#2765）。
+    staged_symlink_target: Option<(PathBuf, PathBuf)>,
+    /// 指定すると、最初の取得だけ本文の一部を書いてから PermissionDenied を返す（部分書きの後の再認証・再試行の模擬）。
+    partial_then_denied: AtomicUsize,
 }
 
 impl FakeClient {
@@ -200,6 +205,7 @@ impl FakeClient {
             deny_blob_fetches: AtomicUsize::new(0),
             auth_calls: AtomicUsize::new(0),
             staged_symlink_target: None,
+            partial_then_denied: AtomicUsize::new(0),
         }
     }
 }
@@ -257,7 +263,7 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         descriptor: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
         if self.deny_blob_fetches.load(Ordering::SeqCst) > 0 {
@@ -268,16 +274,31 @@ impl RegistryPullClient for FakeClient {
             ));
         }
         std::thread::sleep(self.blob_delay);
-        if let Some(target) = &self.staged_symlink_target {
-            return std::os::unix::fs::symlink(target, dest)
-                .map_err(|_| OciError::new(OciErrorCode::Internal, "symlink"));
-        }
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         let mut body = blob_body(hex);
         if self.corrupt_digest == Some(hex) {
             body = b"WORLD".to_vec();
         }
-        fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        let write = |dest: &mut StagedBlobWriter, b: &[u8]| {
+            dest.write_all(b)
+                .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        };
+        if self.partial_then_denied.load(Ordering::SeqCst) > 0 {
+            self.partial_then_denied.fetch_sub(1, Ordering::SeqCst);
+            write(dest, b"partial")?;
+            return Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry token has expired",
+            ));
+        }
+        if let Some((staging, target)) = &self.staged_symlink_target {
+            // writer は開いた後。pull ディレクトリ（staging 直下の唯一のエントリ）の `<hex>` へ symlink を置く。
+            for entry in fs::read_dir(staging).expect("staging").flatten() {
+                std::os::unix::fs::symlink(target, entry.path().join(hex))
+                    .map_err(|_| OciError::new(OciErrorCode::Internal, "symlink"))?;
+            }
+        }
+        write(dest, &body)
     }
 }
 
@@ -983,6 +1004,24 @@ fn oci3_pull_reauthenticates_when_blob_fetch_is_denied() {
     assert!(staging_is_empty(&dir));
 }
 
+/// OCI-3・OCI-1・OCI-7（#2765）: 本文の一部を書いた後に PermissionDenied になっても、再試行は書き込み先を開き直す
+/// ため部分書きは持ち越されず、公開された blob は完全な内容（`partial` が混ざらない）になる。
+#[test]
+fn oci3_retry_after_partial_write_publishes_complete_blob() {
+    let dir = TempDir::new("reauth-partial");
+    let mut fake = FakeClient::new(two_layer_manifest());
+    fake.partial_then_denied = AtomicUsize::new(1);
+    let client = Arc::new(fake);
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    assert_eq!(client.auth_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(blob_path(&dir, SHA_CONFIG)).expect("published config"),
+        blob_body(SHA_CONFIG)
+    );
+    assert!(staging_is_empty(&dir));
+}
+
 /// OCI-3: 再認証の再試行は有限回（2 回）で、超えたら PermissionDenied を返す。
 #[test]
 fn oci3_reauthentication_is_bounded() {
@@ -1162,14 +1201,16 @@ fn sec_pull_replaces_symlinked_cached_blob_without_touching_the_target() {
     assert_eq!(fs::read(&outside).expect("outside"), layer1_body());
 }
 
-/// SEC・OCI-1: 取得結果が symlink のステージング blob は公開しない（先が正しい内容でも辿らない）。
+/// SEC・OCI-1・OCI-7（#2765）: 取得の途中で pull ディレクトリの `<hex>` に symlink が置かれても、確定（`linkat`）は
+/// 宛先を置き換えず拒否し、symlink の先は無傷のまま何も公開しない（先が正しい内容でも辿らない）。取得は 1 回で、
+/// 書き込み先は検査済み root の fd 起点の writer のため、symlink の差し替えでは外へ書けない。
 #[test]
 fn sec_pull_does_not_publish_symlinked_staged_blob() {
     let dir = TempDir::new("stagedsymlink");
     let outside = dir.0.join("outside-blob");
     fs::write(&outside, blob_body(SHA_CONFIG)).expect("write");
     let mut client = FakeClient::new(two_layer_manifest());
-    client.staged_symlink_target = Some(outside.clone());
+    client.staged_symlink_target = Some((dir.0.join("cache").join("staging"), outside.clone()));
     let client = Arc::new(client);
     let puller = OciImagePuller::new(client.clone(), config(&dir));
     let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");

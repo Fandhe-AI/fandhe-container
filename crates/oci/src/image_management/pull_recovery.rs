@@ -480,9 +480,8 @@ mod tests {
         let dir = {
             let mut s = store.begin_pull(pid("p1")).unwrap();
             let _t = s.lease_existing_blob(&dg).unwrap();
-            let staged =
-                s.staged_blob_path(&Digest::parse(&format!("sha256:{}", sha_hex(3))).unwrap());
-            fs::write(staged.unwrap(), b"partial").unwrap();
+            let staged = s.staging_dir().join(sha_hex(3));
+            fs::write(staged, b"partial").unwrap();
             s.staging_dir().to_path_buf()
         };
         assert!(dir.exists());

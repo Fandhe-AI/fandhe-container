@@ -18,7 +18,8 @@
 //! `RegistryClient::fetch_manifest`）。取得した manifest は本文 digest 未検証（突合は未実装）。
 //!
 //! 実装済み: blob のストリーミング取得（TASK-51.4・OCI-1・MS-4・#403。`RegistryClient::fetch_blob`。
-//! サイズ上限・`Content-Length` 検証・CDN リダイレクトの手動追従）。取得した blob は `fetch_blob` 自体では digest 未検証。
+//! サイズ上限・`Content-Length` 検証・CDN リダイレクトの手動追従）。書き込み先は `PullSession::open_staged_blob` が検査済み
+//! root の fd 起点で開いた `StagedBlobWriter` で、パスは受け取らない（#2765）。取得した blob は `fetch_blob` 自体では digest 未検証。
 //!
 //! 実装済み: 取得済み blob の sha256 digest 検証（TASK-52.1・OCI-1・MS-4・#405。`layer::verify_blob_digest`）。
 //! `fetch_blob` への組み込みと manifest 本文の digest 突合は未実装。

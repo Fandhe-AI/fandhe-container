@@ -12,7 +12,7 @@
 //!    `@pull.lock`。`cache_dir` は `ImageStore` の root と同一）
 //! 6. config と各 layer の blob を確保する。既存 blob は先にリースを登録（`lease_existing_blob`）してから、開いた
 //!    ハンドルで所有者・権限・ハードリンク数・digest を確かめて再利用する。それ以外はセッションのステージングへ
-//!    取得し（`staged_blob_path`）、`verify_staged_blob` で信頼条件と sha256 digest を検証する
+//!    取得し（`open_staged_blob` の writer へ書いて `commit`。#2765）、`verify_staged_blob` で信頼条件と sha256 digest を検証する
 //! 7. config blob を symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめ、同じハンドルから上限つきで
 //!    読んで `rootfs.diff_ids` を解析（`read_verified_config`）
 //! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、セッションのステージングの `unpack/` 配下の
@@ -140,7 +140,8 @@ use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    BlobReuse, ImageStore, ManifestComposition, PullPublishRequest, PullSession, TagKey,
+    BlobReuse, ImageStore, ManifestComposition, PullPublishRequest, PullSession, StagedBlobWriter,
+    TagKey,
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
@@ -345,16 +346,16 @@ pub trait RegistryPullClient: Send + Sync {
         platform: &Platform,
     ) -> Result<PulledManifest, OciError>;
 
-    /// blob を `dest` へ保存する。`dest` は未存在であること。digest 検証は呼び出し側が行う。
-    /// `dest` は通常ファイルとして新規作成すること（呼び出し側は symlink・ハードリンクされたファイルを公開せず、
-    /// 公開前に権限を 0600 へ狭める）。
+    /// blob の本文を `dest` へ書く。`dest` は `PullSession::open_staged_blob` が検査済み root の fd 起点で開いた
+    /// 書き込み先で、パスは渡さない（OCI-7・SEC-1・#2765）。確定（`StagedBlobWriter::commit`）と digest 検証は
+    /// 呼び出し側が行う（成功しても未検証。公開前に oci が信頼条件の確認と権限の 0600 化を行う）。
     fn fetch_blob(
         &self,
         endpoint: &RegistryEndpoint,
         repository: &Repository,
         descriptor: &Descriptor,
         auth: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError>;
 }
 
@@ -387,7 +388,7 @@ impl<T: RegistryPullClient + ?Sized> RegistryPullClient for std::sync::Arc<T> {
         repository: &Repository,
         descriptor: &Descriptor,
         auth: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         (**self).fetch_blob(endpoint, repository, descriptor, auth, dest)
     }
@@ -445,7 +446,7 @@ impl RegistryPullClient for OciRegistryClient {
         repository: &Repository,
         descriptor: &Descriptor,
         auth: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         self.inner
             .fetch_blob(endpoint, repository, descriptor, auth, dest)
@@ -707,9 +708,6 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 .release_leased(token)
                 .map_err(|e| PullError::from_store(&e))?;
         }
-        let staged = session
-            .staged_blob_path(&descriptor.digest)
-            .map_err(|e| PullError::from_store(&e))?;
         // 長時間の pull では Bearer token が途中で失効する。取得前に失効を確認して再認証し、
         // 取得が PermissionDenied なら有限回（MAX_REAUTH_RETRIES）だけ再認証して再試行する（OCI-3）。
         let mut retries = 0u32;
@@ -717,21 +715,28 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             if matches!(&*auth, RegistryAuth::Bearer(t) if t.is_expired(Instant::now())) {
                 *auth = self.reauthenticate(request)?;
             }
+            // 試行ごとに書き込み先を開き直す（検査済み root の fd 起点の `<hex>.part`。#2765）。失敗した試行の
+            // writer は drop で自分の `.part` を消すため、部分ファイルを次の試行へ持ち越さない。
+            let mut writer = session
+                .open_staged_blob(&descriptor.digest)
+                .map_err(|e| PullError::from_store(&e))?;
             match self.client.fetch_blob(
                 request.endpoint,
                 request.repository,
                 descriptor,
                 auth,
-                &staged,
+                &mut writer,
             ) {
-                Ok(()) => break,
+                Ok(()) => {
+                    writer.commit().map_err(|e| PullError::from_store(&e))?;
+                    break;
+                }
                 Err(e)
                     if e.code() == OciErrorCode::PermissionDenied
                         && retries < MAX_REAUTH_RETRIES =>
                 {
                     retries += 1;
-                    // fetch_blob は dest が未存在であることを要求する。部分ファイルを残さない。
-                    let _ = fs::remove_file(&staged);
+                    drop(writer);
                     *auth = self.reauthenticate(request)?;
                 }
                 Err(e) => return Err(PullError::from_oci(&e)),
@@ -748,7 +753,10 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 "blob size does not match the descriptor",
             ));
         }
-        Ok(staged)
+        // 読み取り用のパスは検証に成功した後にだけ得る（config の読み取りと展開の入力用。書き込みには使わない）。
+        session
+            .staged_blob_read_path(&descriptor.digest)
+            .map_err(|e| PullError::from_store(&e))
     }
 
     /// 全 blob を確保し、config を検証して layer を展開する（公開の直前まで。#2539）。

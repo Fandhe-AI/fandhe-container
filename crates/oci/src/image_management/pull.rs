@@ -6,11 +6,10 @@
 //! - (A) 既存 blob の再利用: 使う前に、排他区間（[`ImageStore::lock`]）の下で自分の [`PullId`] の
 //!   リースを登録する（[`PullSession::lease_existing_blob`]）。各 pull は自分の ID のリースだけに触れる。
 //! - (B) 新規取得 blob: GC の走査対象外のステージング領域 `<root>/staging/<pull-id>/` へ書く
-//!   （[`PullSession::staged_blob_path`]）。`blobs/sha256` には公開するまで何も置かないため、
+//!   （[`PullSession::open_staged_blob`] が返す [`StagedBlobWriter`]）。`blobs/sha256` には公開するまで何も置かないため、
 //!   書き込み中のファイルは `image ls` にも参照テーブルの走査にも現れない。
 //!
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
-//! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡す。
 //! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
 //! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
@@ -20,8 +19,8 @@
 //!   ステージングを削除する（[`PullSession::abort`]。publish の失敗時にも内部で同じ手順を行う）。
 //!
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
-//! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡し、
-//! 取得後に [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
+//! `RegistryClient::fetch_blob` の `dest` には [`PullSession::open_staged_blob`] の writer を渡し、成功後に
+//! [`StagedBlobWriter::commit`] → [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
 //! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
 //! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
@@ -36,9 +35,9 @@
 //! root の fd 起点（OCI-7・SEC-1・#2694）: staging の作成・`@pull.lock`・ステージングした blob の検証・
 //! `blobs/sha256` への公開・fsync・中止の削除は、`ImageStore::open` が検査した root を保持する `RootHandle` の
 //! fd 起点（`root_handle::StagingDir` / `PullDir` / `BlobDir`）で行い、入口の再検査の後に root が差し替え
-//! られてもおとりへ書き込み・削除が届かない。パスのままなのは fetcher の書き込み先（`staged_blob_path` の
-//! 戻り値。`fetch_blob` の API がパスを受け取るため）だけで、おとりへ書かれた内容は検証が NotFound になり
-//! 公開されない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
+//! られてもおとりへ書き込み・削除が届かない。fetcher の書き込み先も [`StagedBlobWriter`] が同じ fd 起点で開く
+//! （#2765）。パスで返すのは読み取り用の [`PullSession::staged_blob_read_path`] だけで、検証済みの digest に限り
+//! fd と照合する。根拠は `docs/design/image-store-root-trust.md` の論点 3。
 //!
 //! 公開する blob の信頼条件（OCI-1・SEC。cri の `check_blob_trust` と同じ条件）: 通常ファイル・
 //! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
@@ -53,7 +52,8 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - fetcher の書き込み先を root の fd 起点にすること（fetch の API と cri の fetch トレイトの変更を伴う後続）。
+//! - cri の読み取り側（config の読み取りと展開）はパス（[`PullSession::staged_blob_read_path`]）で開く。fd 起点へ
+//!   揃えるのは後続。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -316,6 +316,114 @@ pub struct PullAbortOutcome {
     pub staging: StagingCleanup,
 }
 
+/// fetcher（`RegistryClient::fetch_blob`）の書き込み先。pull ディレクトリの fd 起点で開いた `<hex>.part`
+/// （OCI-7・SEC-1・#2765）。
+///
+/// 作れるのは [`PullSession::open_staged_blob`] だけで、パスから作る口は無い（root・`staging` の差し替えの後でも
+/// 書き込みが検査済みの実体にだけ届く）。fetcher は [`std::io::Write`] で本文を流し、成功したら呼び出し側が
+/// [`StagedBlobWriter::commit`] で `<hex>` へ確定する（宛先を置き換えない `linkat`）。commit しないまま drop すると
+/// 自分が作った `.part` だけを消す。確定後の内容は未検証で、公開の前に必ず [`PullSession::verify_staged_blob`] を通る。
+#[derive(Debug)]
+pub struct StagedBlobWriter {
+    dir: PullDir,
+    /// 書き込み中のハンドル。commit で閉じる（`None` なら書き込み不可）。
+    file: Option<File>,
+    hex: String,
+    part_name: String,
+    digest: Digest,
+    written: u64,
+    /// 自分が作った `.part` がまだ残っている可能性。drop が消す対象を自分の作ったものに限る。
+    part_exists: bool,
+}
+
+impl StagedBlobWriter {
+    /// この writer が確定する blob の digest（`fetch_blob` が descriptor と照合する）。
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    /// これまでに書いたバイト数（`fetch_blob` は 0 でなければ再利用として拒否する）。
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    /// 永続化して閉じ、`<hex>` へ宛先を置き換えずに確定して `.part` を消す。
+    ///
+    /// 宛先が既にあれば `FailedPrecondition`（`blob destination already exists`。他者の `<hex>` には触れない）。
+    /// `.part` の削除に失敗したら成功を返さない（リンク数 2 は検証が拒否するため fail-closed）。
+    pub fn commit(mut self) -> Result<(), OciError> {
+        let file = self.file.take().ok_or_else(|| {
+            err(
+                OciErrorCode::FailedPrecondition,
+                "blob writer is already committed",
+            )
+        })?;
+        file.sync_all().map_err(|e| map_write_err(&e))?;
+        // Windows は開いたハンドルがリンク・削除を妨げるため、先に閉じる。
+        drop(file);
+        self.dir
+            .link_name(&self.part_name, &self.hex)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    err(
+                        OciErrorCode::FailedPrecondition,
+                        "blob destination already exists",
+                    )
+                } else {
+                    map_write_err(&e)
+                }
+            })?;
+        self.dir
+            .unlink(&self.part_name)
+            .map_err(|_| err(OciErrorCode::Internal, "failed to remove staging part file"))?;
+        self.part_exists = false;
+        Ok(())
+    }
+}
+
+impl std::io::Write for StagedBlobWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("blob writer is already committed"))?;
+        let n = f.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 自分が作った `.part` だけを消す（失敗・中断・commit の途中失敗）。他者の `<hex>` や既存の `.part` には触れない。
+impl Drop for StagedBlobWriter {
+    fn drop(&mut self) {
+        self.file = None;
+        if self.part_exists {
+            let _ = self.dir.unlink(&self.part_name);
+        }
+    }
+}
+
+/// ローカルへの書き込み失敗の分類（message は固定文。パスは載せない）。
+fn map_write_err(e: &std::io::Error) -> OciError {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => err(
+            OciErrorCode::ResourceExhausted,
+            "no space left for the blob",
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            err(OciErrorCode::PermissionDenied, "cannot write the blob file")
+        }
+        _ => err(OciErrorCode::Internal, "cannot write the blob file"),
+    }
+}
+
 fn hex_of(digest: &Digest) -> Result<&str, OciError> {
     digest
         .as_str()
@@ -507,7 +615,7 @@ impl PullSession<'_> {
             None => {
                 // 返すパスは文字列で組み立てるため、fd で確かめた実体と同じ `blobs/sha256` を指すことを照合する。
                 // root が差し替わっていれば存在しない・おとりの path を `Leased` に載せず fail-closed で拒否する
-                // （OCI-7・SEC-1・#2694。`staged_blob_path` と同じ照合）。リースは戻す。root が差し替わった
+                // （OCI-7・SEC-1・#2694。`staged_blob_read_path` と同じ照合）。リースは戻す。root が差し替わった
                 // 後は排他区間の再検査が拒否するため戻せないことがあるが、その場合も拒否は変えない。
                 let dir_ok = blob_dir
                     .as_ref()
@@ -564,18 +672,70 @@ impl PullSession<'_> {
         guard.persist_inventory(before)
     }
 
-    /// 新規取得 blob の書き込み先 `<root>/staging/<pull-id>/<hex>` を返す。
+    /// 新規取得 blob の書き込み先を、pull ディレクトリの fd 起点で開いて返す（OCI-7・SEC-1・#2765）。
     ///
-    /// `RegistryClient::fetch_blob` の `dest` に渡す。参照テーブルには何も登録しない
-    /// （GC の走査にも `image ls` にも出さない）。公開は [`PullSession::publish`]。
+    /// `RegistryClient::fetch_blob` の `dest` に渡す [`StagedBlobWriter`] を作る唯一の口である。`<hex>.part` を
+    /// 保持している pull ディレクトリの fd 起点で 0600・`O_EXCL`・`O_NOFOLLOW` で作るため、`begin_pull` の後に
+    /// root・`staging`・pull ディレクトリが差し替えられても、書き込みは検査済みの実体にだけ届く。取得の成功後に
+    /// [`StagedBlobWriter::commit`] で `<hex>` へ確定し、[`PullSession::verify_staged_blob`] →
+    /// [`PullSession::publish`] の順に進む。参照テーブルには何も登録しない（GC の走査にも `image ls` にも出さない）。
     ///
-    /// 戻り値はパスである（`fetch_blob` の API がパスを受け取るため）。パスで辿った pull ディレクトリが、保持している
-    /// fd と同じ実体であることを確かめ、root が差し替えられていれば `Internal` で拒否する。確認から書き込みまでの
-    /// 間の差し替えは残るが、おとりへ書かれた内容は [`PullSession::verify_staged_blob`] が保持する fd 起点で開き直す
-    /// ため `NotFound` になり、公開されない（fail-closed。OCI-7・SEC-1・#2694）。
-    pub fn staged_blob_path(&mut self, digest: &Digest) -> Result<PathBuf, OciError> {
+    /// 通信前の事前検査: `<hex>` が既にあれば `FailedPrecondition`（`blob destination already exists`）、
+    /// `<hex>.part` が既にあれば `FailedPrecondition`（`blob staging file already exists`。既存の `.part` は消さない）。
+    pub fn open_staged_blob(&mut self, digest: &Digest) -> Result<StagedBlobWriter, OciError> {
         self.note_blob(digest)?;
         let hex = hex_of(digest)?;
+        match self.pull_dir.stat_name(hex) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "blob destination already exists",
+                ));
+            }
+            Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
+        }
+        // ディレクトリの複製は .part の作成より前に行う。作成後に失敗すると Drop が走らず .part が残り、
+        // 同じ digest の再オープンが "already exists" で塞がるため。
+        let dir = self
+            .pull_dir
+            .try_clone()
+            .map_err(|e| io_err(&e, "failed to open staging directory"))?;
+        let part_name = format!("{hex}.part");
+        let file = self.pull_dir.create_new_file(&part_name).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "blob staging file already exists",
+                )
+            } else {
+                map_write_err(&e)
+            }
+        })?;
+        Ok(StagedBlobWriter {
+            dir,
+            file: Some(file),
+            hex: hex.to_owned(),
+            part_name,
+            digest: digest.clone(),
+            written: 0,
+            part_exists: true,
+        })
+    }
+
+    /// [`PullSession::verify_staged_blob`] を通した blob の読み取り用パス `<root>/staging/<pull-id>/<hex>` を返す。
+    ///
+    /// config の読み取りと展開の入力用で、書き込みには使わない（書き込み先は [`PullSession::open_staged_blob`]）。
+    /// このセッションで検証に成功した digest に限る（それ以外は `FailedPrecondition`）。パスで辿った pull ディレクトリが
+    /// 保持している fd と同じ実体であることを確かめ、違えば `Internal`（`image store root changed after open`）で拒否する。
+    pub fn staged_blob_read_path(&self, digest: &Digest) -> Result<PathBuf, OciError> {
+        let hex = hex_of(digest)?;
+        if !self.verified.contains_key(digest) {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "blob is not verified by this pull",
+            ));
+        }
         if !self.pull_dir.matches_path(&self.staging_dir) {
             return Err(err(
                 OciErrorCode::Internal,
@@ -1591,14 +1751,124 @@ mod tests {
         assert_eq!(leases(&store, &d(1)), vec![]);
     }
 
+    /// OCI-7・SEC-1・OCI-1（#2765）: `<hex>` が既にあれば writer を開けず `FailedPrecondition`。既存の内容は無傷。
+    #[test]
+    fn oci7_open_staged_blob_rejects_existing_dest() {
+        let root = Root::new("w-dest");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = d(1);
+        fs::write(tpath(&s, &dg), b"other").unwrap();
+        let e = s.open_staged_blob(&dg).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob destination already exists");
+        assert_eq!(fs::read(tpath(&s, &dg)).unwrap(), b"other");
+        assert!(!tpath(&s, &dg).with_extension("part").exists());
+    }
+
+    /// OCI-7・SEC-1（#2765）: `<hex>.part` が既にあれば `FailedPrecondition` で、既存の `.part` は消さない。
+    /// `.part` の位置の symlink も辿らず（外の target は無傷）、同じ分類になる。
+    #[test]
+    fn oci7_open_staged_blob_rejects_existing_part_and_symlink() {
+        let root = Root::new("w-part");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let part = tpath(&s, &d(1)).with_extension("part");
+        fs::write(&part, b"foreign").unwrap();
+        let e = s.open_staged_blob(&d(1)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob staging file already exists");
+        assert_eq!(fs::read(&part).unwrap(), b"foreign");
+
+        #[cfg(unix)]
+        {
+            let target = root.0.join("outside");
+            fs::write(&target, b"keep").unwrap();
+            let part2 = tpath(&s, &d(2)).with_extension("part");
+            std::os::unix::fs::symlink(&target, &part2).unwrap();
+            let e = s.open_staged_blob(&d(2)).unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+            assert!(
+                fs::symlink_metadata(&part2)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    /// OCI-7・OCI-1（#2765）: commit 後は `<hex>` だけが残り（内容一致・リンク数 1・0600）、`.part` は無い。
+    /// 確定後の書き込みは失敗し、二重の commit は消費済みで型として書けない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_staged_writer_commit_leaves_only_final_name() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = Root::new("w-commit");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"hello world");
+        let mut w = s.open_staged_blob(&dg).unwrap();
+        assert_eq!(w.digest(), &dg);
+        w.write_all(b"hello ").unwrap();
+        w.write_all(b"world").unwrap();
+        assert_eq!(w.bytes_written(), 11);
+        assert!(tpath(&s, &dg).with_extension("part").exists());
+        assert!(!tpath(&s, &dg).exists());
+        w.commit().unwrap();
+        let m = fs::metadata(tpath(&s, &dg)).unwrap();
+        assert_eq!(fs::read(tpath(&s, &dg)).unwrap(), b"hello world");
+        assert_eq!((m.nlink(), m.permissions().mode() & 0o777), (1, 0o600));
+        assert!(!tpath(&s, &dg).with_extension("part").exists());
+        s.verify_staged_blob(&dg, 1 << 20).unwrap();
+    }
+
+    /// OCI-7（#2765）: commit せずに drop すると自分の `.part` だけが消える。commit 前に他者が `<hex>` を置いたら
+    /// commit は `FailedPrecondition` で、他者の `<hex>` は無傷・`.part` は消える。
+    #[test]
+    fn oci7_staged_writer_drop_and_dest_race_clean_up_only_own_part() {
+        use std::io::Write as _;
+        let root = Root::new("w-drop");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let mut w = s.open_staged_blob(&d(1)).unwrap();
+        w.write_all(b"abc").unwrap();
+        assert!(tpath(&s, &d(1)).with_extension("part").exists());
+        drop(w);
+        assert!(!tpath(&s, &d(1)).with_extension("part").exists());
+
+        let mut w = s.open_staged_blob(&d(2)).unwrap();
+        w.write_all(b"abc").unwrap();
+        fs::write(tpath(&s, &d(2)), b"other").unwrap();
+        let e = w.commit().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob destination already exists");
+        assert_eq!(fs::read(tpath(&s, &d(2))).unwrap(), b"other");
+        assert!(!tpath(&s, &d(2)).with_extension("part").exists());
+    }
+
+    /// OCI-7（#2765）: `staged_blob_read_path` は、このセッションで検証に成功した digest にしか返さない。
+    #[test]
+    fn oci7_staged_blob_read_path_requires_verification() {
+        let root = Root::new("w-read");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let e = s.staged_blob_read_path(&d(1)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob is not verified by this pull");
+        let dg = stage(&mut s, b"config-body");
+        assert_eq!(s.staged_blob_read_path(&dg).unwrap(), tpath(&s, &dg));
+    }
+
     /// OCI-7: ステージングへ書き込み中の blob は `image ls` にも GC 走査にも現れない。
     #[test]
     fn oci7_staged_blob_is_invisible_to_image_ls_and_gc_scan() {
         let root = Root::new("staged");
         root.put(&d(9), 7);
         let store = ImageStore::open(&root.0).unwrap();
-        let mut s = store.begin_pull(pid("p1")).unwrap();
-        let path = s.staged_blob_path(&d(1)).unwrap();
+        let s = store.begin_pull(pid("p1")).unwrap();
+        let path = tpath(&s, &d(1));
         fs::write(&path, vec![1u8; 100]).unwrap();
         fs::write(path.with_extension("part"), vec![1u8; 50]).unwrap();
         assert!(path.starts_with(root.0.join("staging").join("p1")));
@@ -1666,7 +1936,7 @@ mod tests {
         let mut s = store.begin_pull(pid("p1")).unwrap();
         for i in 0..MAX_SESSION_BLOBS {
             let dg = Digest::parse(&format!("sha256:{i:064x}")).unwrap();
-            s.staged_blob_path(&dg).unwrap();
+            drop(s.open_staged_blob(&dg).unwrap());
         }
         let extra = Digest::parse(&format!("sha256:{:064x}", MAX_SESSION_BLOBS)).unwrap();
         assert_eq!(
@@ -1715,10 +1985,17 @@ mod tests {
     /// ステージングへ書いて検証まで済ませ、digest を返す。
     fn stage(s: &mut PullSession<'_>, data: &[u8]) -> Digest {
         let dg = sha_of(data);
-        let path = s.staged_blob_path(&dg).unwrap();
-        fs::write(&path, data).unwrap();
+        let mut w = s.open_staged_blob(&dg).unwrap();
+        std::io::Write::write_all(&mut w, data).unwrap();
+        w.commit().unwrap();
         s.verify_staged_blob(&dg, 1 << 20).unwrap();
         dg
+    }
+
+    /// 試験用: ステージングの blob のパス（攻撃的な状態を作る試験が直接使う。書き込み先の API ではない）。
+    fn tpath(s: &PullSession<'_>, dg: &Digest) -> PathBuf {
+        s.staging_dir()
+            .join(dg.as_str().trim_start_matches("sha256:"))
     }
 
     /// 試験用: 公開済み相当の宛先（0600）を置く。umask に依らず信頼条件を満たす。
@@ -1854,9 +2131,9 @@ mod tests {
     fn oci7_publish_rejects_unverified_or_unleased_blob() {
         let root = Root::new("pub-unverified");
         let store = ImageStore::open(&root.0).unwrap();
-        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let s = store.begin_pull(pid("p1")).unwrap();
         let dg = sha_of(b"never-verified");
-        let path = s.staged_blob_path(&dg).unwrap();
+        let path = tpath(&s, &dg);
         fs::write(&path, b"never-verified").unwrap();
         let staged = s.staging_dir().to_path_buf();
         let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
@@ -1892,7 +2169,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let cfg = stage(&mut s, b"config-body");
-        let path = s.staged_blob_path(&cfg).unwrap();
+        let path = tpath(&s, &cfg);
         fs::write(&path, b"evil-body").unwrap();
         let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
         let err = s
@@ -1909,7 +2186,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let cfg = stage(&mut s, b"config-body");
-        let path = s.staged_blob_path(&cfg).unwrap();
+        let path = tpath(&s, &cfg);
         let tmp = path.with_extension("evil");
         fs::write(&tmp, b"evil--body!").unwrap();
         fs::rename(&tmp, &path).unwrap();
@@ -1930,7 +2207,7 @@ mod tests {
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let data = vec![7u8; 64 << 20];
         let dg = sha_of(&data);
-        fs::write(s.staged_blob_path(&dg).unwrap(), &data).unwrap();
+        fs::write(tpath(&s, &dg), &data).unwrap();
         s.verify_staged_blob(&dg, 1 << 30).unwrap();
         // 既存の宛先にも同内容を置く（ガード外で検証され、ガード内では指紋照合のみ）。
         place_trusted(&root.blob(&dg), &data);
@@ -1968,7 +2245,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let cfg = stage(&mut s, b"config-body");
-        let path = s.staged_blob_path(&cfg).unwrap();
+        let path = tpath(&s, &cfg);
         fs::write(&path, b"evil-body").unwrap();
         let e = s.verify_staged_blob(&cfg, 1 << 20).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::DataLoss);
@@ -2028,7 +2305,7 @@ mod tests {
         let target = root.0.join("outside");
         fs::write(&target, b"config-body").unwrap();
         let dg = sha_of(b"config-body");
-        let path = s.staged_blob_path(&dg).unwrap();
+        let path = tpath(&s, &dg);
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert_eq!(
             s.verify_staged_blob(&dg, 1 << 20).unwrap_err().code(),
@@ -2052,7 +2329,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let dg = sha_of(b"config-body");
-        let path = s.staged_blob_path(&dg).unwrap();
+        let path = tpath(&s, &dg);
         fs::write(&path, b"config-body").unwrap();
         let outside = root.0.join("outside");
         fs::hard_link(&path, &outside).unwrap();
@@ -2071,7 +2348,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let dg = sha_of(b"config-body");
-        let path = s.staged_blob_path(&dg).unwrap();
+        let path = tpath(&s, &dg);
         fs::write(&path, b"config-body").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         let outside = root.0.join("outside");
@@ -2093,7 +2370,7 @@ mod tests {
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let dg = stage(&mut s, b"config-body");
         let outside = root.0.join("outside");
-        fs::hard_link(s.staged_blob_path(&dg).unwrap(), &outside).unwrap();
+        fs::hard_link(tpath(&s, &dg), &outside).unwrap();
         let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
         assert!(
             s.publish(PullPublishRequest::new(manifest_digest(), comp))
@@ -2157,7 +2434,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let dg = sha_of(b"config-body");
-        let path = s.staged_blob_path(&dg).unwrap();
+        let path = tpath(&s, &dg);
         fs::write(&path, b"config-body").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         s.verify_staged_blob(&dg, 1 << 20).unwrap();
@@ -2177,11 +2454,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let dg = stage(&mut s, b"config-body");
-        fs::set_permissions(
-            s.staged_blob_path(&dg).unwrap(),
-            fs::Permissions::from_mode(0o666),
-        )
-        .unwrap();
+        fs::set_permissions(tpath(&s, &dg), fs::Permissions::from_mode(0o666)).unwrap();
         let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
         assert!(
             s.publish(PullPublishRequest::new(manifest_digest(), comp))

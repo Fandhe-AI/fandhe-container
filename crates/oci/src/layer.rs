@@ -457,7 +457,7 @@ fn sha256_hex_of_reader<R: Read>(mut r: R, max_bytes: u64) -> Result<(String, u6
 }
 
 /// I/O エラーを構造化エラーへ写す（パス・OS メッセージは載せない）。
-fn map_io_error(e: std::io::Error) -> OciError {
+pub(crate) fn map_io_error(e: std::io::Error) -> OciError {
     match e.kind() {
         ErrorKind::NotFound => OciError::new(OciErrorCode::NotFound, "blob file not found"),
         ErrorKind::PermissionDenied => {

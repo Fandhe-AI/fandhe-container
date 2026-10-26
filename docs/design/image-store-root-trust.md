@@ -49,12 +49,11 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 | ジャーナル | `gc_journal` の存在確認・読み・公開・削除・root の fsync | `@gc-pending.json`（墓標・一時ファイルを含む） | 移した |
 | 残骸回収 | `gc_journal::reap_stale_tmp` | root 直下の `*.tmp-*` | 移した（走査は新しい open file description で行う） |
 | blob の削除 | `gc_journal::remove_blob_durable`・`sweep_blobs`・`settle` の `blobs/sha256` の fsync、`remove` / `prune` の事前検査 | `blobs/sha256/<hex>` | 移した（`blobs/sha256` は root の fd から開き直す） |
-| 読み取りのみ | `usage*`（`blob_size`・`scan_cache`・`expanded`・`staging`） | `blobs/`・`staging/` | 移していない（#2695） |
+| 読み取りのみ | `usage*`（`blob_size`・`scan_cache`・`expanded`・`staging`） | `blobs/`・`staging/` | 移した（#2695。`blobs/sha256` と `staging/<pull-id>` は root の fd から開いたディレクトリの fd 起点で stat・列挙し、`disk_usage` は開いた `blobs/sha256` を images 側と cache 側で共有する。排他区間の中で区間の root と別のパスは `InvalidArgument`。`ExpandedSizePlan` は区間のハンドルを持ち、ガードの外の `measure` も同じ照合を通す） |
 | pull | `pull::PullSession`・`pull_recovery` | `staging/<pull-id>/`・`blobs/sha256` | 移していない（#2694） |
 
-移していない根拠:
+移していない根拠（`usage*` は #2695 で移したため残るのは pull だけ）:
 
-- `usage*`: 読み取り専用で書き込みも削除もしない。差し替えの影響は表示する値の誤りにとどまり、root の外へは書き込まない。入口の再検査で差し替えは検出される。追跡は #2695
 - `pull` / `pull_recovery`: 公開 API が fetcher へパスを渡す形（`staged_blob_path` -> `RegistryClient::fetch_blob(dest: &Path)`）で、fd 起点にはその API と Windows の一時名による固定の設計を変える必要がある。本番の配線（cri の `image_pull` -> `PullSession`）も未実装（REPAIR-3）。staging の操作は `lock` の再検査の内側にあり、残る隙間は所有者自身による差し替え（信頼境界の内側）だけ。追跡は #2694
 
 ### 3-b. `cfg` の局所化と OS ごとの扱い
@@ -68,10 +67,10 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 
 ### 3-c. 残る隙間
 
-- 読み取り専用の集計と pull がパス起点のまま（#2694・#2695）
+- pull がパス起点のまま（#2694）。読み取り専用の集計（`usage*`）は #2695 で fd 起点へ移した
 - fd を開いた後に、所有者自身が root を信頼できない場所へ移す操作は信頼境界の内側。入口の再検査で検出される
 - 試験: `xdev_tests.rs`（3-d の拒否を `EXDEV` の注入で決定的に再現。既定のテスト集合）・`tests/image_store_xdev.rs`（実マウントでの確認。実機前提・`--ignored`）
-- 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する）
+- 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する。#2695 で `disk_usage` / `list_images` / `ExpandedSizePlan::measure` の読み取りが検査済みの実体の値だけを返すことも加えた）
 
 ### 3-d. マウント越え（EXDEV）と openat2 の拒否（#2701・OCI-7・SEC-1・ERR-1）
 

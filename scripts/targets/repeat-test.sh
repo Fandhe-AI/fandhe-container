@@ -18,6 +18,8 @@
 #   TEST_BIN 結合試験モード。`[[test]]` の name（`cargo test --test` に渡す。`[A-Za-z0-9_-]`、先頭 - 不可）。TEST と排他
 #   SUCCESS_LINE  TEST_BIN の必須。成功行（CR 除去後に行全体が一致。cargo の引数には使わず grep -F -x のオペランドのみ）
 #   TEST_IGNORED  TEST_BIN のみ任意。1 で `-- --ignored` を付ける
+#   FEATURES 任意。`--features` に渡す feature 名（カンマ区切り。`[a-z0-9_,-]`、先頭 - 不可、128 文字以下）。
+#            既定 feature で有効にならない試験（例: crates/plugin の `grpc` 配下）を回すのに使う（#2711）
 #   COUNT    繰り返し回数（既定 300、1..=1000）
 #   RUN_TIMEOUT  1 回あたりの上限秒（既定 120。REPAIR-5）
 # 出力: 最終行（stdout）は lib が `passed=N failed=M count=C test=<TEST>`、結合試験が
@@ -30,8 +32,8 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${DIR}/../lib.sh"
 
 usage() {
-  echo "usage: make repeat-test PACKAGE=fandhe-container-<name> TEST=<module::path::test> [COUNT=300] [RUN_TIMEOUT=120]" >&2
-  echo "       make repeat-test PACKAGE=fandhe-container-<name> TEST_BIN=<name> SUCCESS_LINE=<line> [TEST_IGNORED=1] [COUNT=300] [RUN_TIMEOUT=120]" >&2
+  echo "usage: make repeat-test PACKAGE=fandhe-container-<name> TEST=<module::path::test> [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
+  echo "       make repeat-test PACKAGE=fandhe-container-<name> TEST_BIN=<name> SUCCESS_LINE=<line> [TEST_IGNORED=1] [FEATURES=<a,b>] [COUNT=300] [RUN_TIMEOUT=120]" >&2
   exit 2
 }
 
@@ -40,6 +42,7 @@ TEST="${TEST:-}"
 TEST_BIN="${TEST_BIN:-}"
 SUCCESS_LINE="${SUCCESS_LINE:-}"
 TEST_IGNORED="${TEST_IGNORED:-}"
+FEATURES="${FEATURES:-}"
 COUNT="${COUNT:-300}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 [ -n "${PACKAGE}" ] || usage
@@ -62,6 +65,11 @@ else
   case "${SUCCESS_LINE}" in *[!A-Za-z0-9\ _:.,\(\)=/+-]*) usage ;; esac
   case "${TEST_IGNORED}" in '' | 1) ;; *) usage ;; esac
 fi
+# FEATURES は cargo の --features の値にだけ使う。許可する文字を絞り、フラグ（先頭 -）の混入も防ぐ。
+if [ -n "${FEATURES}" ]; then
+  case "${FEATURES}" in -* | *[!a-z0-9_,-]*) usage ;; esac
+  [ "${#FEATURES}" -le 128 ] || usage
+fi
 int_in_range "${COUNT}" 1 1000 || usage
 int_in_range "${RUN_TIMEOUT}" 1 3600 || usage
 
@@ -78,19 +86,19 @@ out="${RUN_LIMITED_DIR}/out.txt"
 
 # ビルドは 1 回だけ（以降は同じバイナリを繰り返す）。結合試験の名前誤り・required-features 不足もここで落ちる。
 if [ -n "${TEST}" ]; then
-  run cargo test -p "${PACKAGE}" --lib --no-run
+  run cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} --no-run
 else
-  run cargo test -p "${PACKAGE}" --test "${TEST_BIN}" --no-run
+  run cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} --no-run
 fi
 
 # 1 回分の実行。出力は照合のためファイルへ溜める（run_limited はシェル関数も子として受ける）。
 one_run() {
   if [ -n "${TEST}" ]; then
-    cargo test -p "${PACKAGE}" --lib -- --exact "${TEST}" >"${out}" 2>&1
+    cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- --exact "${TEST}" >"${out}" 2>&1
   elif [ "${TEST_IGNORED}" = 1 ]; then
-    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" -- --ignored >"${out}" 2>&1
+    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} -- --ignored >"${out}" 2>&1
   else
-    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" >"${out}" 2>&1
+    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} >"${out}" 2>&1
   fi
 }
 

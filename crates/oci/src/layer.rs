@@ -326,33 +326,140 @@ pub fn verify_fetched_blob_with(
     verify_blob_digest_with(recorder, &blob.path, &blob.digest, max_bytes)
 }
 
-/// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
+/// blob ファイルの信頼条件の判定材料（OCI-1・SEC。[`check_blob_trust`] の入力）。
 ///
-/// 条件は通常ファイル・所有者が `owner`・ハードリンク数 1（ストア外の名前から同じ inode を書き換えられない）・
-/// group / other 書き込み不可。非 unix は所有者・リンク数を標準ライブラリで取得できないため通常ファイルかだけを見る。
+/// 開いたハンドルの fstat（[`BlobFileFacts::from_file`]）またはメタデータ（unix の `from_metadata`）から
+/// 得た値で、パスからは読まない。判定を OS 呼び出しから分け、他ユーザー所有のように root なしでは作れない
+/// 状態も具体値で試験できるようにする（REPAIR-12）。oci の公開前確認と cri の config・展開記録の確認が
+/// 同じ判定（[`check_blob_trust`]）を使い、信頼条件の食い違いを作らない（#2534）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BlobFileFacts {
+    /// 通常ファイルか（ディレクトリ・FIFO・デバイス等でない）。
+    pub is_regular_file: bool,
+    /// 所有者の UID。
+    pub owner_uid: u32,
+    /// `st_mode`（判定には権限ビットだけを使う）。
+    pub mode: u32,
+    /// ハードリンク数（`st_nlink`）。
+    pub hard_links: u64,
+}
+
+impl BlobFileFacts {
+    /// 判定材料を値から組む（試験用の入口を兼ねる）。
+    #[must_use]
+    pub fn new(is_regular_file: bool, owner_uid: u32, mode: u32, hard_links: u64) -> Self {
+        Self {
+            is_regular_file,
+            owner_uid,
+            mode,
+            hard_links,
+        }
+    }
+
+    /// メタデータから判定材料を作る（unix のみ）。
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_metadata(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            is_regular_file: m.file_type().is_file(),
+            owner_uid: m.uid(),
+            mode: m.mode(),
+            hard_links: m.nlink(),
+        }
+    }
+
+    /// 開いたハンドルの fstat から判定材料を読む（パスは引かない）。読めなければ `None`。
+    /// 非 unix は所有者・権限・ハードリンク数を標準ライブラリで取得できないため常に `None`
+    /// （呼び出し側は再利用も公開もしない。fail-closed）。
+    #[must_use]
+    pub fn from_file(file: &File) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            file.metadata().ok().map(|m| Self::from_metadata(&m))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            None
+        }
+    }
+}
+
+/// blob ファイルが信頼条件を満たさない理由（[`check_blob_trust`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlobTrustViolation {
+    /// 通常ファイルでない。
+    NotRegularFile,
+    /// 所有者が期待と異なる（所有者は後から権限を変えて書き換えられる）。
+    UnexpectedOwner,
+    /// ハードリンク数が 1 でない（ストア外の名前から同じ inode を書き換えられる）。
+    UnexpectedLinkCount,
+    /// group / other に書き込み権限がある。
+    WritableByOthers,
+}
+
+impl BlobTrustViolation {
+    /// 固定の英語文言（oci のエラー文言と共通。パス・OS メッセージを含まない）。
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotRegularFile => "blob is not a regular file",
+            Self::UnexpectedOwner => "blob has an unexpected owner",
+            Self::UnexpectedLinkCount => "blob has extra hard links",
+            Self::WritableByOthers => "blob is writable by group or others",
+        }
+    }
+}
+
+/// blob ファイルを再利用・公開してよいか判定する（OCI-1・SEC。OS 呼び出しを含まない純粋関数）。
+///
+/// 条件は「通常ファイル」「所有者が `owner`（`None` なら確認しない）」「ハードリンク数が 1」
+/// 「group / other 書き込み不可」。違反が複数あれば、この順で最初の 1 つを返す（順序は契約。
+/// cri のステージング blob の確認は `WritableByOthers` を「それ以外の条件は満たしている」と読む）。
+///
+/// # Errors
+/// 条件を満たさないとき、最初の違反を返す。
+pub fn check_blob_trust(
+    facts: &BlobFileFacts,
+    owner: Option<u32>,
+) -> Result<(), BlobTrustViolation> {
+    if !facts.is_regular_file {
+        return Err(BlobTrustViolation::NotRegularFile);
+    }
+    if owner.is_some_and(|o| facts.owner_uid != o) {
+        return Err(BlobTrustViolation::UnexpectedOwner);
+    }
+    if facts.hard_links != 1 {
+        return Err(BlobTrustViolation::UnexpectedLinkCount);
+    }
+    if facts.mode & 0o022 != 0 {
+        return Err(BlobTrustViolation::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。違反なしは `None`）。
+///
+/// unix は [`check_blob_trust`] への薄いラッパー（判定は 1 か所）。非 unix は所有者・リンク数を標準ライブラリで
+/// 取得できないため、従来どおり通常ファイルかだけを見る（意味論は変えない）。
 pub(crate) fn blob_trust_violation(
     m: &std::fs::Metadata,
     owner: Option<u32>,
 ) -> Option<&'static str> {
-    if !m.is_file() {
-        return Some("blob is not a regular file");
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if owner.is_some_and(|o| m.uid() != o) {
-            return Some("blob has an unexpected owner");
-        }
-        if m.nlink() != 1 {
-            return Some("blob has extra hard links");
-        }
-        if m.mode() & 0o022 != 0 {
-            return Some("blob is writable by group or others");
-        }
+        check_blob_trust(&BlobFileFacts::from_metadata(m), owner)
+            .err()
+            .map(BlobTrustViolation::message)
     }
     #[cfg(not(unix))]
-    let _ = owner;
-    None
+    {
+        let _ = owner;
+        (!m.is_file()).then_some(BlobTrustViolation::NotRegularFile.message())
+    }
 }
 
 /// 信頼条件と digest を同じハンドルで確かめたレイヤー blob（OCI-1・#2309）。イメージ展開の入口
@@ -1588,6 +1695,226 @@ mod tests {
         std::fs::write(&p, b"abc").unwrap();
         let e = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, 0).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// 信頼条件をすべて満たす判定材料（所有者 1000・0600・リンク数 1 の通常ファイル）。
+    fn trusted_facts() -> BlobFileFacts {
+        BlobFileFacts {
+            is_regular_file: true,
+            owner_uid: 1000,
+            mode: 0o100_600,
+            hard_links: 1,
+        }
+    }
+
+    /// OCI-1・SEC: 所有者一致・group / other 書き込み不可・リンク数 1 の通常ファイルだけを信頼する。
+    #[test]
+    fn oci1_sec_blob_trust_accepts_only_private_single_link_regular_files() {
+        assert_eq!(check_blob_trust(&trusted_facts(), Some(1000)), Ok(()));
+        // 読み取りだけの共有（0644・0444）は書き換え経路にならないため許す。
+        for mode in [0o100_644, 0o100_444, 0o100_640, 0o100_400] {
+            let facts = BlobFileFacts {
+                mode,
+                ..trusted_facts()
+            };
+            assert_eq!(
+                check_blob_trust(&facts, Some(1000)),
+                Ok(()),
+                "mode {mode:o}"
+            );
+        }
+        // root で動く場合の基準は 0。
+        let root_owned = BlobFileFacts {
+            owner_uid: 0,
+            ..trusted_facts()
+        };
+        assert_eq!(check_blob_trust(&root_owned, Some(0)), Ok(()));
+    }
+
+    /// OCI-1・SEC: 他ユーザー所有・group / other 書き込み可・ハードリンクあり・通常ファイル以外を拒否する
+    /// （他ユーザー所有は root なしでは実ファイルで作れないため、判定材料を直接与えて照合する）。
+    #[test]
+    fn oci1_sec_blob_trust_rejects_untrusted_metadata() {
+        let other_owner = BlobFileFacts {
+            owner_uid: 1001,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&other_owner, Some(1000)),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        // root 所有でも、呼び出しプロセスが root でなければ基準と異なる所有者として拒否する。
+        let root_owned = BlobFileFacts {
+            owner_uid: 0,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&root_owned, Some(1000)),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        assert_eq!(
+            check_blob_trust(&trusted_facts(), Some(0)),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+
+        for mode in [
+            0o100_620, 0o100_602, 0o100_622, 0o100_664, 0o100_666, 0o100_646,
+        ] {
+            let facts = BlobFileFacts {
+                mode,
+                ..trusted_facts()
+            };
+            assert_eq!(
+                check_blob_trust(&facts, Some(1000)),
+                Err(BlobTrustViolation::WritableByOthers),
+                "mode {mode:o}"
+            );
+        }
+
+        for hard_links in [0, 2, 3, u64::MAX] {
+            let facts = BlobFileFacts {
+                hard_links,
+                ..trusted_facts()
+            };
+            assert_eq!(
+                check_blob_trust(&facts, Some(1000)),
+                Err(BlobTrustViolation::UnexpectedLinkCount),
+                "links {hard_links}"
+            );
+        }
+
+        let directory = BlobFileFacts {
+            is_regular_file: false,
+            mode: 0o040_700,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&directory, Some(1000)),
+            Err(BlobTrustViolation::NotRegularFile)
+        );
+    }
+
+    /// OCI-1・SEC: 違反が複数あるときは「種別 → 所有者 → リンク数 → 権限」の順で最初の 1 つを返す
+    /// （`open_staged_blob` は `WritableByOthers` を「権限以外は満たす」と読むため、順序は契約）。
+    #[test]
+    fn oci1_sec_blob_trust_reports_the_first_violation_in_contract_order() {
+        let all_bad = BlobFileFacts {
+            is_regular_file: false,
+            owner_uid: 1001,
+            mode: 0o100_666,
+            hard_links: 2,
+        };
+        assert_eq!(
+            check_blob_trust(&all_bad, Some(1000)),
+            Err(BlobTrustViolation::NotRegularFile)
+        );
+        let regular = BlobFileFacts {
+            is_regular_file: true,
+            ..all_bad
+        };
+        assert_eq!(
+            check_blob_trust(&regular, Some(1000)),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        let owned = BlobFileFacts {
+            owner_uid: 1000,
+            ..regular
+        };
+        assert_eq!(
+            check_blob_trust(&owned, Some(1000)),
+            Err(BlobTrustViolation::UnexpectedLinkCount)
+        );
+        let single = BlobFileFacts {
+            hard_links: 1,
+            ..owned
+        };
+        assert_eq!(
+            check_blob_trust(&single, Some(1000)),
+            Err(BlobTrustViolation::WritableByOthers)
+        );
+    }
+
+    /// OCI-1・SEC: 所有者に `None` を渡すと所有者の確認だけを省き、他の条件は同じ順で見る。
+    #[test]
+    fn oci1_sec_blob_trust_skips_owner_check_for_none() {
+        let other = BlobFileFacts {
+            owner_uid: 4242,
+            ..trusted_facts()
+        };
+        assert_eq!(check_blob_trust(&other, None), Ok(()));
+        let linked = BlobFileFacts {
+            hard_links: 2,
+            ..other
+        };
+        assert_eq!(
+            check_blob_trust(&linked, None),
+            Err(BlobTrustViolation::UnexpectedLinkCount)
+        );
+    }
+
+    /// OCI-1・SEC: 違反ごとの固定文言（既存の oci のエラー文言と同じ）。
+    #[test]
+    fn oci1_sec_blob_trust_violation_messages_are_stable() {
+        assert_eq!(
+            BlobTrustViolation::NotRegularFile.message(),
+            "blob is not a regular file"
+        );
+        assert_eq!(
+            BlobTrustViolation::UnexpectedOwner.message(),
+            "blob has an unexpected owner"
+        );
+        assert_eq!(
+            BlobTrustViolation::UnexpectedLinkCount.message(),
+            "blob has extra hard links"
+        );
+        assert_eq!(
+            BlobTrustViolation::WritableByOthers.message(),
+            "blob is writable by group or others"
+        );
+    }
+
+    /// OCI-1・SEC: 実ファイルで `blob_trust_violation`（oci 内部の入口）と `check_blob_trust` の結果が一致する
+    /// （#2534: 判定を 1 か所にした）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_sec_blob_trust_violation_agrees_with_check_blob_trust_on_real_files() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let d = tmp_dir("trust-agree");
+        let p = d.join("b");
+        std::fs::write(&p, b"x").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = std::fs::metadata(&p).unwrap().uid();
+        let agree = |m: &std::fs::Metadata, owner: Option<u32>, want: Option<&str>| {
+            let via_wrapper = blob_trust_violation(m, owner);
+            let via_check = check_blob_trust(&BlobFileFacts::from_metadata(m), owner)
+                .err()
+                .map(BlobTrustViolation::message);
+            assert_eq!(via_wrapper, via_check);
+            assert_eq!(via_wrapper, want);
+        };
+        let m = std::fs::metadata(&p).unwrap();
+        agree(&m, None, None);
+        agree(&m, Some(uid), None);
+        agree(
+            &m,
+            Some(uid.wrapping_add(1)),
+            Some("blob has an unexpected owner"),
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        agree(&m, Some(uid), Some("blob is writable by group or others"));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&p, d.join("b2")).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        agree(&m, Some(uid), Some("blob has extra hard links"));
+        let dm = std::fs::metadata(&d).unwrap();
+        agree(&dm, Some(uid), Some("blob is not a regular file"));
+        let f = std::fs::File::open(&p).unwrap();
+        assert_eq!(
+            BlobFileFacts::from_file(&f),
+            Some(BlobFileFacts::new(true, uid, m.mode(), 2))
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

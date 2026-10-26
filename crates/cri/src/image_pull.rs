@@ -82,13 +82,22 @@
 //!
 //! - レイヤーの展開と diff_id の突合は配線済み（#2323）。残りは次のとおり。
 //!   - 所有者・特殊ビットの選択肢は [`PullConfig::extract_options`] の受け口までで、既定は安全側（`Keep` + `Strip`）。
-//!     rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped`。`CAP_CHOWN` と subuid の写像・user namespace
-//!     の範囲が要る）を決めて渡すのは呼び出し元（plugin-cri・create 経路）の担当（SEC-5・SEC-1。
-//!     `docs/design/oci-layer-special-bits.md`）
+//!     本番の呼び出し元が渡す値も現状は既定の `Keep` + `Strip` で、rootless / rootful ごとの値（`ChownMapped`・
+//!     `PreserveIfOwnerMapped`・`ChownInUserNamespace`）の配線は次の前提が済んでからになる（#2534・SEC-5・SEC-1。
+//!     `docs/design/oci-layer-special-bits.md`）。`ChownMapped` は初期 user namespace の `CAP_CHOWN` が要り、
+//!     rootful の可否が未決（#2241）。`ChownInUserNamespace` は core が user namespace へ入る配線が要る（#2315・#482）。
+//!     本モジュールの `PullConfig` を組む本番の呼び出し元（plugin-cri の ImageService）は #2592 の担当。
+//!     所有者の解決の部品（#2389 の `image_ownership`）は cli crate にあり、置き場所の判断も要る。
+//!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
+//!     `FAILED_PRECONDITION` になる）
 //!   - 展開済み rootfs の GC と `image rm` / `image prune` への接続は TASK-183（OCI-7）の担当。それまで削除しても
 //!     `<cache_dir>/rootfs/sha256/<hex>` は残る
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
-//!   - 展開中の処理は gRPC のキャンセルで打ち切れず、期限（[`PullConfig::pull_deadline`]）は展開の前後で確認する
+//!   - 展開中の処理は gRPC のキャンセルで打ち切れず、期限（[`PullConfig::pull_deadline`]）は展開の前後で確認する。
+//!     展開中は外部の応答を待たず（検証済みのローカル blob だけを読む）、所要時間は `ExtractLimits` と
+//!     `max_uncompressed_layer_bytes` で有界になる。展開の直後に期限を超えていれば公開も記録の書き込みもせず
+//!     `Timeout` を返す（ステージングは `Drop` で消える。#2534・REPAIR-5）。展開中に打ち切る協調キャンセルが要る場合は
+//!     oci の展開 API の変更として別に扱う
 //! - 永続イメージストアと展開後サイズの算出は TASK-183（OCI-7。展開後サイズは #2222）の担当。本モジュールが返す
 //!   `size` は config と全 layer の**圧縮サイズの合計**で、展開後サイズではない
 //! - `AuthConfig.identity_token`（OAuth2）・`registry_token` は未対応で `UNIMPLEMENTED`（oci の OAuth2 POST フロー待ち。OCI-3）
@@ -98,7 +107,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,8 +122,8 @@ use fandhe_container_oci::layer::extract::{
     image_layers_from, remove_extracted_tree,
 };
 use fandhe_container_oci::layer::{
-    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob, open_blob_nofollow,
-    verify_blob_file_digest,
+    BlobFileFacts, BlobTrustViolation, DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob,
+    check_blob_trust, open_blob_nofollow, verify_blob_file_digest, verify_bytes_digest,
 };
 use fandhe_container_oci::manifest::{Descriptor, ImageManifest, Platform};
 use fandhe_container_oci::reference::{
@@ -413,7 +422,8 @@ pub struct PullConfig {
     pub max_image_bytes: u64,
     /// config blob の上限。
     pub max_config_bytes: u64,
-    /// pull 全体の期限（ステップ間で確認し、超過なら `Timeout`）。
+    /// pull 全体の期限（ステップ間と、展開の前後で確認し、超過なら `Timeout`。展開中は打ち切らず、`extract_limits` で
+    /// 有界にする。#2534・REPAIR-5）。
     pub pull_deadline: Duration,
     /// 資格情報を送ってよい token realm の追加ホスト（既定は空。接続先と同一ホスト・oci の組み込み既知対は常に許可）。
     pub trusted_realm_hosts: Vec<RegistryHost>,
@@ -422,8 +432,9 @@ pub struct PullConfig {
     /// レイヤー展開の上限（エントリ数・展開バイト数・入力バイト数・索引件数。全レイヤーで共有して累積する）。
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
-    /// rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped` 等）は呼び出し元（plugin-cri・create 経路）が
-    /// 決める。条件は `docs/design/oci-layer-special-bits.md`（SEC-5・SEC-1。#2323 では既定のまま）。
+    /// rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped` 等）は呼び出し元が決めるが、本番の値は
+    /// 現状も既定のまま（配線の前提は #2241・#2315・#482・#2592。モジュール doc「未実装範囲」と
+    /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }
 
@@ -946,80 +957,6 @@ pub(crate) struct TrustedDir {
     pub(crate) owner: u32,
 }
 
-/// blob ファイルの信頼条件の判定材料。開いたハンドルの fstat から得た値で、パスからは読まない
-/// （[`blob_file_facts`]）。判定（[`check_blob_trust`]）を OS 呼び出しから分け、他ユーザー所有のように
-/// root なしでは作れない状態も具体値で試験できるようにする（REPAIR-12）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BlobFileFacts {
-    /// 通常ファイルか（ディレクトリ・FIFO・デバイス等でない）。
-    is_regular_file: bool,
-    /// 所有者の UID。
-    owner_uid: u32,
-    /// `st_mode`（判定には権限ビットだけを使う）。
-    mode: u32,
-    /// ハードリンク数（`st_nlink`）。
-    hard_links: u64,
-}
-
-/// blob ファイルが信頼条件を満たさない理由（[`check_blob_trust`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlobTrustViolation {
-    /// 通常ファイルでない。
-    NotRegularFile,
-    /// 所有者が呼び出しプロセスと異なる（所有者は後から権限を変えて書き換えられる）。
-    UnexpectedOwner,
-    /// ハードリンク数が 1 でない（キャッシュ外の名前から同じ inode を書き換えられる）。
-    UnexpectedLinkCount,
-    /// group / other に書き込み権限がある。
-    WritableByOthers,
-}
-
-/// blob ファイルを再利用・公開してよいか判定する（OCI-1・SEC。OS 呼び出しを含まない純粋関数）。
-///
-/// 条件は「通常ファイル」「所有者が `owner`」「ハードリンク数が 1」「group / other 書き込み不可」。
-/// 違反が複数あれば、この順で最初の 1 つを返す（順序は契約。[`open_staged_blob`] は
-/// `WritableByOthers` を「それ以外の条件は満たしている」と読む）。同種の確認は net の hosts ファイル追記・
-/// plugin の UDS 検証にもある（crate をまたぐ共有はしていない）。
-pub(crate) fn check_blob_trust(
-    facts: &BlobFileFacts,
-    owner: u32,
-) -> Result<(), BlobTrustViolation> {
-    if !facts.is_regular_file {
-        return Err(BlobTrustViolation::NotRegularFile);
-    }
-    if facts.owner_uid != owner {
-        return Err(BlobTrustViolation::UnexpectedOwner);
-    }
-    if facts.hard_links != 1 {
-        return Err(BlobTrustViolation::UnexpectedLinkCount);
-    }
-    if facts.mode & 0o022 != 0 {
-        return Err(BlobTrustViolation::WritableByOthers);
-    }
-    Ok(())
-}
-
-/// 開いたハンドルから判定材料を読む（fstat。パスは引かない）。読めなければ `None`。
-#[cfg(unix)]
-pub(crate) fn blob_file_facts(file: &fs::File) -> Option<BlobFileFacts> {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = file.metadata().ok()?;
-    Some(BlobFileFacts {
-        is_regular_file: meta.file_type().is_file(),
-        owner_uid: meta.uid(),
-        mode: meta.mode(),
-        hard_links: meta.nlink(),
-    })
-}
-
-/// 非 Unix では所有者・権限・ハードリンク数を標準ライブラリで取得できないため、常に `None`
-/// （呼び出し側は再利用も公開もしない。fail-closed）。キャッシュ準備（`owner_probe`）が先に
-/// `Unimplemented` で拒否するため、現状は到達しない。
-#[cfg(not(unix))]
-pub(crate) fn blob_file_facts(_file: &fs::File) -> Option<BlobFileFacts> {
-    None
-}
-
 /// 既存 blob を再利用しない理由（[`inspect_cached_blob`]）。いずれの場合も呼び出し側は取得し直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedBlobRejection {
@@ -1045,8 +982,8 @@ fn inspect_cached_blob(
     owner: u32,
 ) -> Result<(), CachedBlobRejection> {
     let file = open_blob_nofollow(path).map_err(|_| CachedBlobRejection::Unopenable)?;
-    let facts = blob_file_facts(&file).ok_or(CachedBlobRejection::Unverifiable)?;
-    check_blob_trust(&facts, owner).map_err(CachedBlobRejection::Untrusted)?;
+    let facts = BlobFileFacts::from_file(&file).ok_or(CachedBlobRejection::Unverifiable)?;
+    check_blob_trust(&facts, Some(owner)).map_err(CachedBlobRejection::Untrusted)?;
     // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
     match verify_blob_file_digest(&file, digest, size) {
         Ok(verified) if verified.size == size => Ok(()),
@@ -1054,16 +991,31 @@ fn inspect_cached_blob(
     }
 }
 
-/// config blob を信頼条件と digest の確認つきで 1 つのハンドルから読み、rootfs 部だけ解析する（#2323・OCI-1）。
+/// config blob を信頼条件の確認つきで 1 回だけ読み、読んだ本文そのもののハッシュを digest と照合してから
+/// rootfs 部だけ解析する（#2323・#2534・OCI-1）。
 ///
-/// 手順: symlink を辿らず開く → 同じハンドルで所有者・権限・ハードリンク数と digest・サイズを確認 → 同じハンドルを
-/// 先頭から上限つきで読む → `parse_image_config_rootfs`。パスは開き直さない。上限は `max_bytes` と oci の
+/// 手順: symlink を辿らず開く → 同じハンドルで所有者・権限・ハードリンク数を確認 → 同じハンドルを先頭から上限つきで
+/// 1 回だけ読む → 長さと [`verify_bytes_digest`] で本文を照合 → `parse_image_config_rootfs`。ハッシュ計算と解析の
+/// 読み取りを分けない（別々に読むと、その間に同じ inode を書き換えられて、検証していない `rootfs.diff_ids` を
+/// 解析しうる。#2309 でレイヤーに対して塞いだのと同じ型の穴）。パスは開き直さない。上限は `max_bytes` と oci の
 /// `MAX_CONFIG_BYTES` の小さい方で、`max_bytes` を大きくしても oci 側の 1 MiB で拒否される（fail-closed）。
 fn read_verified_config(
     path: &Path,
     descriptor: &Descriptor,
     owner: u32,
     max_bytes: u64,
+) -> Result<ImageRootFs, PullError> {
+    read_verified_config_inner(path, descriptor, owner, max_bytes, &|| {})
+}
+
+/// [`read_verified_config`] の本体。`before_body_read` は信頼確認の後・本文を読む直前に呼ばれる試験用の差し込み口
+/// （本番は空。確認後に同じ inode を書き換える競合を再現する。oci の `open_blob_nofollow_inner` と同じ形）。
+fn read_verified_config_inner(
+    path: &Path,
+    descriptor: &Descriptor,
+    owner: u32,
+    max_bytes: u64,
+    before_body_read: &dyn Fn(),
 ) -> Result<ImageRootFs, PullError> {
     let mut file = open_blob_nofollow(path).map_err(|e| PullError::from_config(&e))?;
     let untrusted = || {
@@ -1072,19 +1024,10 @@ fn read_verified_config(
             "cached image config is not trusted",
         )
     };
-    let facts = blob_file_facts(&file).ok_or_else(untrusted)?;
-    check_blob_trust(&facts, owner).map_err(|_| untrusted())?;
-    let verified = verify_blob_file_digest(&file, &descriptor.digest, descriptor.size)
-        .map_err(|e| PullError::from_config(&e))?;
-    if verified.size != descriptor.size {
-        return Err(PullError::new(
-            OciErrorCode::DataLoss,
-            "image config failed validation",
-        ));
-    }
+    let facts = BlobFileFacts::from_file(&file).ok_or_else(untrusted)?;
+    check_blob_trust(&facts, Some(owner)).map_err(|_| untrusted())?;
     let limit = max_bytes.min(MAX_CONFIG_BYTES);
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| PullError::new(OciErrorCode::DataLoss, "image config could not be read"))?;
+    before_body_read();
     let mut body = Vec::new();
     (&mut file)
         .take(limit.saturating_add(1))
@@ -1096,12 +1039,11 @@ fn read_verified_config(
             "image config exceeds the size limit",
         ));
     }
+    let invalid = || PullError::new(OciErrorCode::DataLoss, "image config failed validation");
     if body.len() as u64 != descriptor.size {
-        return Err(PullError::new(
-            OciErrorCode::DataLoss,
-            "image config failed validation",
-        ));
+        return Err(invalid());
     }
+    verify_bytes_digest(&body, &descriptor.digest).map_err(|_| invalid())?;
     parse_image_config_rootfs(&body).map_err(|e| PullError::from_config(&e))
 }
 
@@ -1225,35 +1167,61 @@ pub(crate) fn inspect_published_rootfs(
 /// 照合用の記録の読み取り上限。
 pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
-/// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・設定が食い違う場合は再利用せず拒否する
-/// （既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。
+/// 展開記録を、種別の確認と同じハンドルから非ブロッキングで読む（#2534・OCI-1・SEC-5・REPAIR-5）。
+///
+/// pull の再利用判定（`check_unpack_record`）と create の `read_layers`（`bundle/image_rootfs.rs`）が共有する入口。
+/// `open_blob_nofollow` は lstat で種別を確かめ、`O_NONBLOCK` で開き、fstat と lstat の dev / ino を照合する。
+/// このため、lstat の後に FIFO へ差し替えられても open が無期限に止まらない。続けて同じハンドルの fstat で
+/// 「通常ファイル・所有者が `owner`・ハードリンク数 1・group / other 書き込み不可」を確認する
+/// （[`check_blob_trust`]）。上限は [`MAX_RECORD_BYTES`] で、超えたら黙って切り詰めず `ResourceExhausted` で
+/// 拒否する（切り詰めると `SameImageOtherLayers` に化けて再展開になる）。
+/// 失敗はいずれも固定文言で、パス・OS メッセージを含めない。
+pub(crate) fn read_unpack_record_body(path: &Path, owner: u32) -> Result<Vec<u8>, PullError> {
+    let mut file = open_blob_nofollow(path).map_err(|_| {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "image rootfs cache entry has no unpack record",
+        )
+    })?;
+    let untrusted = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "image rootfs unpack record is not trusted",
+        )
+    };
+    let facts = BlobFileFacts::from_file(&file).ok_or_else(untrusted)?;
+    check_blob_trust(&facts, Some(owner)).map_err(|_| untrusted())?;
+    let mut body = Vec::new();
+    (&mut file)
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| {
+            PullError::new(
+                OciErrorCode::DataLoss,
+                "image rootfs unpack record could not be read",
+            )
+        })?;
+    if body.len() as u64 > MAX_RECORD_BYTES {
+        return Err(PullError::new(
+            OciErrorCode::ResourceExhausted,
+            "image rootfs unpack record exceeds the size limit",
+        ));
+    }
+    Ok(body)
+}
+
+/// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・上限超過・設定が食い違う場合は再利用せず
+/// 拒否する（既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。読み取りは
+/// [`read_unpack_record_body`]（非ブロッキング・同じハンドル）。
 fn check_unpack_record(
     path: &Path,
     expected: &UnpackRecord,
     owner: u32,
 ) -> Result<RecordMatch, PullError> {
-    use std::io::Read as _;
-    let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
-    let meta = fs::symlink_metadata(path)
-        .map_err(|_| reject("image rootfs cache entry has no unpack record"))?;
-    if !meta.file_type().is_file() {
-        return Err(reject("image rootfs unpack record is not trusted"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if meta.uid() != owner || meta.permissions().mode() & 0o022 != 0 {
-            return Err(reject("image rootfs unpack record is not trusted"));
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = owner;
-    let mut body = Vec::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(MAX_RECORD_BYTES).read_to_end(&mut body))
-        .map_err(|_| reject("failed to read the image rootfs unpack record"))?;
+    let body = read_unpack_record_body(path, owner)?;
     let Some(rest) = body.strip_prefix(expected.settings.as_bytes()) else {
-        return Err(reject(
+        return Err(PullError::new(
+            OciErrorCode::FailedPrecondition,
             "image rootfs cache entry was unpacked with different settings",
         ));
     };
@@ -1273,6 +1241,13 @@ fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullErr
             "failed to record the image rootfs unpack settings",
         )
     };
+    // 読み取り側が拒否する大きさの記録は公開しない（読めない記録を残すと、以後その entry は再利用できない）。
+    if (record.settings.len() + record.layers.len()) as u64 > MAX_RECORD_BYTES {
+        return Err(PullError::new(
+            OciErrorCode::ResourceExhausted,
+            "image rootfs unpack record exceeds the size limit",
+        ));
+    }
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1327,15 +1302,15 @@ fn open_staged_blob(path: &Path, owner: u32) -> Result<fs::File, PullError> {
         )
     };
     let file = open_blob_nofollow(path).map_err(|_| unsafe_blob())?;
-    let facts = blob_file_facts(&file).ok_or_else(unsafe_blob)?;
-    match check_blob_trust(&facts, owner) {
+    let facts = BlobFileFacts::from_file(&file).ok_or_else(unsafe_blob)?;
+    match check_blob_trust(&facts, Some(owner)) {
         Ok(()) | Err(BlobTrustViolation::WritableByOthers) => {}
         Err(_) => return Err(unsafe_blob()),
     }
     file.set_permissions(fs::Permissions::from_mode(PUBLISHED_BLOB_MODE))
         .map_err(|_| unsafe_blob())?;
-    let facts = blob_file_facts(&file).ok_or_else(unsafe_blob)?;
-    if check_blob_trust(&facts, owner).is_err() || facts.mode & 0o777 != PUBLISHED_BLOB_MODE {
+    let facts = BlobFileFacts::from_file(&file).ok_or_else(unsafe_blob)?;
+    if check_blob_trust(&facts, Some(owner)).is_err() || facts.mode & 0o777 != PUBLISHED_BLOB_MODE {
         return Err(unsafe_blob());
     }
     Ok(file)
@@ -1791,139 +1766,6 @@ mod tests {
         }
     }
 
-    /// 信頼条件をすべて満たす判定材料（所有者 1000・0600・リンク数 1 の通常ファイル）。
-    fn trusted_facts() -> BlobFileFacts {
-        BlobFileFacts {
-            is_regular_file: true,
-            owner_uid: 1000,
-            mode: 0o100_600,
-            hard_links: 1,
-        }
-    }
-
-    /// OCI-1・SEC: 所有者一致・group / other 書き込み不可・リンク数 1 の通常ファイルだけを信頼する。
-    #[test]
-    fn sec_blob_trust_accepts_only_private_single_link_regular_files() {
-        assert_eq!(check_blob_trust(&trusted_facts(), 1000), Ok(()));
-        // 読み取りだけの共有（0644・0444）は書き換え経路にならないため許す。
-        for mode in [0o100_644, 0o100_444, 0o100_640, 0o100_400] {
-            let facts = BlobFileFacts {
-                mode,
-                ..trusted_facts()
-            };
-            assert_eq!(check_blob_trust(&facts, 1000), Ok(()), "mode {mode:o}");
-        }
-        // root で動く場合の基準は 0。
-        let root_owned = BlobFileFacts {
-            owner_uid: 0,
-            ..trusted_facts()
-        };
-        assert_eq!(check_blob_trust(&root_owned, 0), Ok(()));
-    }
-
-    /// OCI-1・SEC: 他ユーザー所有・group / other 書き込み可・ハードリンクあり・通常ファイル以外を拒否する
-    /// （他ユーザー所有は root なしでは実ファイルで作れないため、判定材料を直接与えて照合する）。
-    #[test]
-    fn sec_blob_trust_rejects_untrusted_metadata() {
-        let other_owner = BlobFileFacts {
-            owner_uid: 1001,
-            ..trusted_facts()
-        };
-        assert_eq!(
-            check_blob_trust(&other_owner, 1000),
-            Err(BlobTrustViolation::UnexpectedOwner)
-        );
-        // root 所有でも、呼び出しプロセスが root でなければ基準と異なる所有者として拒否する。
-        let root_owned = BlobFileFacts {
-            owner_uid: 0,
-            ..trusted_facts()
-        };
-        assert_eq!(
-            check_blob_trust(&root_owned, 1000),
-            Err(BlobTrustViolation::UnexpectedOwner)
-        );
-        assert_eq!(
-            check_blob_trust(&trusted_facts(), 0),
-            Err(BlobTrustViolation::UnexpectedOwner)
-        );
-
-        for mode in [
-            0o100_620, 0o100_602, 0o100_622, 0o100_664, 0o100_666, 0o100_646,
-        ] {
-            let facts = BlobFileFacts {
-                mode,
-                ..trusted_facts()
-            };
-            assert_eq!(
-                check_blob_trust(&facts, 1000),
-                Err(BlobTrustViolation::WritableByOthers),
-                "mode {mode:o}"
-            );
-        }
-
-        for hard_links in [0, 2, 3, u64::MAX] {
-            let facts = BlobFileFacts {
-                hard_links,
-                ..trusted_facts()
-            };
-            assert_eq!(
-                check_blob_trust(&facts, 1000),
-                Err(BlobTrustViolation::UnexpectedLinkCount),
-                "links {hard_links}"
-            );
-        }
-
-        let directory = BlobFileFacts {
-            is_regular_file: false,
-            mode: 0o040_700,
-            ..trusted_facts()
-        };
-        assert_eq!(
-            check_blob_trust(&directory, 1000),
-            Err(BlobTrustViolation::NotRegularFile)
-        );
-    }
-
-    /// OCI-1・SEC: 違反が複数あるときは「種別 → 所有者 → リンク数 → 権限」の順で最初の 1 つを返す
-    /// （`open_staged_blob` は `WritableByOthers` を「権限以外は満たす」と読むため、順序は契約）。
-    #[test]
-    fn sec_blob_trust_reports_the_first_violation_in_contract_order() {
-        let all_bad = BlobFileFacts {
-            is_regular_file: false,
-            owner_uid: 1001,
-            mode: 0o100_666,
-            hard_links: 2,
-        };
-        assert_eq!(
-            check_blob_trust(&all_bad, 1000),
-            Err(BlobTrustViolation::NotRegularFile)
-        );
-        let regular = BlobFileFacts {
-            is_regular_file: true,
-            ..all_bad
-        };
-        assert_eq!(
-            check_blob_trust(&regular, 1000),
-            Err(BlobTrustViolation::UnexpectedOwner)
-        );
-        let owned = BlobFileFacts {
-            owner_uid: 1000,
-            ..regular
-        };
-        assert_eq!(
-            check_blob_trust(&owned, 1000),
-            Err(BlobTrustViolation::UnexpectedLinkCount)
-        );
-        let single = BlobFileFacts {
-            hard_links: 1,
-            ..owned
-        };
-        assert_eq!(
-            check_blob_trust(&single, 1000),
-            Err(BlobTrustViolation::WritableByOthers)
-        );
-    }
-
     /// CRI-4: 正規化名は Docker Hub を `docker.io` へ戻し、他レジストリはホストを保つ。
     #[test]
     fn cri4_display_name_normalization() {
@@ -1937,6 +1779,87 @@ mod tests {
             display_name(other.registry(), other.repository()),
             "registry.example.com:5000/team/app"
         );
+    }
+
+    /// OCI-1・SEC-5・#2534: 記録の最悪値（`ChownMapped` の写像が上限行数・全桁最大に近く、特殊ビットも保持、layer が
+    /// 上限数・最長の mediaType）でも `MAX_RECORD_BYTES` に収まる。上限を超えた記録は読み取り側が明示エラーで拒否する
+    /// ため、書き込める最大の記録が必ず読めることをここで固定する。
+    #[test]
+    fn oci1_unpack_record_worst_case_fits_within_the_limit() {
+        use fandhe_container_oci::layer::LAYER_MEDIA_TYPES;
+        use fandhe_container_oci::layer::extract::{IdMap, IdRange, SpecialBitsPolicy};
+        use fandhe_container_oci::manifest::MAX_LAYERS;
+        // container 側は 0 から 9_000_000 刻み、host 側は 1_000_000_000 から同じ刻み（範囲は重ならず u32 に収まる）。
+        // 桁数を最大に近づけるため count は 7 桁にする。
+        const MAX_ID_MAP_LINES_340: usize = 340; // oci の `MAX_ID_MAP_LINES`（非公開のため値を写す）
+        let lines = |host_base: u32| -> Vec<IdRange> {
+            (0..u32::try_from(MAX_ID_MAP_LINES_340).expect("lines"))
+                .map(|i| IdRange {
+                    container_id: i * 9_000_000,
+                    host_id: host_base + i * 9_000_000,
+                    count: 9_000_000 - 1,
+                })
+                .collect()
+        };
+        let uid = IdMap::new(lines(1_000_000_000)).expect("uid map");
+        let gid = IdMap::new(lines(1_000_000_001)).expect("gid map");
+        assert_eq!(uid.lines().len(), MAX_ID_MAP_LINES_340);
+        let options = ExtractOptions::new()
+            .with_ownership(OwnershipPolicy::ChownMapped { uid, gid })
+            .with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+                uid: IdRange {
+                    container_id: 4_000_000_000,
+                    host_id: 4_000_000_000,
+                    count: 294_967_295,
+                },
+                gid: IdRange {
+                    container_id: 4_000_000_000,
+                    host_id: 4_000_000_000,
+                    count: 294_967_295,
+                },
+            });
+        let config = Digest::parse(&format!("sha256:{}", "f".repeat(64))).expect("config digest");
+        let settings = record_settings(&config, &options).expect("settings");
+        let longest = LAYER_MEDIA_TYPES
+            .iter()
+            .map(|e| e.media_type.len())
+            .max()
+            .expect("media types");
+        // `layer=` + `sha256:<64>` + ' ' + mediaType + '\n'
+        let layers_len = MAX_LAYERS * (6 + 71 + 1 + longest + 1);
+        let total = settings.len() + layers_len;
+        assert!(
+            (total as u64) <= MAX_RECORD_BYTES,
+            "worst-case record is {total} bytes (limit {MAX_RECORD_BYTES})"
+        );
+        // 具体値での余裕の確認: 設定だけで 40 KiB を超えない見積もり（上限 64 KiB の 2/3 以下）。
+        assert!(total < 44_000, "worst-case record is {total} bytes");
+    }
+
+    /// OCI-1・#2534: 書き込み側は上限を超える記録を、ファイルを作る前に `ResourceExhausted` で拒否する。
+    #[test]
+    fn oci1_write_unpack_record_rejects_oversized_record_before_creating_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-cri-record-size-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(RECORD_FILE);
+        let record = UnpackRecord {
+            settings: "s".repeat(MAX_RECORD_BYTES as usize),
+            layers: "l".to_owned(),
+        };
+        let err = write_unpack_record(&path, &record).expect_err("oversized");
+        assert_eq!(
+            err,
+            PullError::new(
+                OciErrorCode::ResourceExhausted,
+                "image rootfs unpack record exceeds the size limit"
+            )
+        );
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -2131,6 +2054,94 @@ mod blob_trust_fs_tests {
         let err = open_staged_blob(&dir.0.join("missing"), uid).expect_err("missing");
         assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     }
+
+    /// `{"rootfs":{"type":"layers","diff_ids":["sha256:<'a' x 64>"]}}`（115 バイト）。
+    fn config_body(fill: char) -> Vec<u8> {
+        let hex: String = std::iter::repeat_n(fill, 64).collect();
+        format!(r#"{{"rootfs":{{"type":"layers","diff_ids":["sha256:{hex}"]}}}}"#).into_bytes()
+    }
+
+    /// `config_body('a')` の sha256（本文を書き出して `sha256sum` で求めた値）。
+    const CONFIG_A_SHA256: &str =
+        "sha256:92f01abd265e7d9faebfd85bfe110b4679fe209dec7826de52ae830cdcb0be6d";
+
+    /// config の descriptor を manifest の解析経由で作る（`Descriptor` は外部 crate から直接組めない）。
+    fn config_descriptor(digest: &str, size: usize) -> Descriptor {
+        let layer = "1".repeat(64);
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{digest}","size":{size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{layer}","size":1}}]}}"#
+        );
+        match fandhe_container_oci::manifest::parse_manifest(manifest.as_bytes(), None)
+            .expect("manifest")
+        {
+            fandhe_container_oci::manifest::ParsedManifest::Image(m) => m.config,
+            _ => panic!("expected an image manifest"),
+        }
+    }
+
+    /// OCI-1・SEC-5・#2534: 検証済みの config は 1 回の読み取りで解析され、`diff_ids` が具体値で返る。
+    #[test]
+    fn oci1_sec_config_is_parsed_from_the_hashed_bytes() {
+        let dir = TempDir::new("cfg-ok");
+        let path = dir.0.join("config");
+        fs::write(&path, config_body('a')).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let uid = fs::metadata(&path).expect("stat").uid();
+        let descriptor = config_descriptor(CONFIG_A_SHA256, 115);
+        let root = read_verified_config(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES)
+            .expect("config");
+        let ids: Vec<&str> = root.diff_ids().iter().map(Digest::as_str).collect();
+        assert_eq!(ids, [format!("sha256:{}", "a".repeat(64))]);
+    }
+
+    /// OCI-1・SEC-5・#2534: 信頼確認の後・本文を読む直前に同じ inode を書き換えられても、読んだ本文のハッシュが
+    /// descriptor と合わず `DataLoss` になる（書き換え後の `diff_ids` を解析しない）。ハッシュ後に読み直す実装へ
+    /// 戻すと、この試験が書き換え後の値を `Ok` で返して落ちる。
+    #[test]
+    fn oci1_sec_config_rewritten_in_place_after_trust_check_is_rejected() {
+        use std::io::Write as _;
+        let dir = TempDir::new("cfg-rewrite");
+        let path = dir.0.join("config");
+        fs::write(&path, config_body('a')).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let meta = fs::metadata(&path).expect("stat");
+        let (uid, ino) = (meta.uid(), meta.ino());
+        let descriptor = config_descriptor(CONFIG_A_SHA256, 115);
+        let rewrite = || {
+            // 同じ inode を 0 から書き直す（rename ではなく in-place の上書き）。長さは同じ 115 バイト。
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("reopen");
+            f.write_all(&config_body('b')).expect("rewrite");
+            assert_eq!(fs::metadata(&path).expect("stat").ino(), ino);
+        };
+        let err =
+            read_verified_config_inner(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES, &rewrite)
+                .expect_err("rewritten config must be rejected");
+        assert_eq!(
+            err,
+            PullError::new(OciErrorCode::DataLoss, "image config failed validation")
+        );
+    }
+
+    /// OCI-1・#2534: 長さが descriptor の size と違う config は、ハッシュ以前に `DataLoss` で拒否する。
+    #[test]
+    fn oci1_config_with_wrong_length_is_rejected() {
+        let dir = TempDir::new("cfg-len");
+        let path = dir.0.join("config");
+        fs::write(&path, config_body('a')).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let uid = fs::metadata(&path).expect("stat").uid();
+        let descriptor = config_descriptor(CONFIG_A_SHA256, 114);
+        let err = read_verified_config(&path, &descriptor, uid, DEFAULT_MAX_CONFIG_BYTES)
+            .expect_err("length mismatch");
+        assert_eq!(
+            err,
+            PullError::new(OciErrorCode::DataLoss, "image config failed validation")
+        );
+    }
 }
 
 /// 展開の後始末とエラー写像の単体試験（#2323・OCI-1・ERR-3）。
@@ -2252,7 +2263,7 @@ mod non_unix_tests {
             Err(CachedBlobRejection::Unopenable)
         );
         let file = fs::File::open(&path).expect("open");
-        assert_eq!(blob_file_facts(&file), None);
+        assert_eq!(BlobFileFacts::from_file(&file), None);
         let err = open_staged_blob(&path, 0).expect_err("rejected");
         assert_eq!(err.code(), OciErrorCode::Unimplemented);
         let _ = fs::remove_dir_all(&dir);

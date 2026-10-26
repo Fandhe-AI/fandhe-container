@@ -233,12 +233,15 @@ impl ImageRootfsSource {
             // image ID の形をしているものは、形が不正なら INVALID_ARGUMENT（素の hex も受けない）。
             let id = Digest::parse(&spec.image).map_err(|_| bad())?;
             // 在庫があれば digest 参照も拾う（在庫に無い・照会できない場合は image ID だけ。#2831）。
-            let reference = self
+            let record = self
                 .store
                 .as_ref()
-                .and_then(|store| store.get(id.as_str()).ok().flatten())
+                .and_then(|store| store.get(id.as_str()).ok().flatten());
+            let reference = record
+                .as_ref()
                 .and_then(|r| r.repo_digests().first().cloned());
-            return Ok(ResolvedImage::new(id, reference));
+            let tag = record.as_ref().and_then(|r| r.repo_tags().first().cloned());
+            return Ok(ResolvedImage::new(id, reference).with_tag(tag));
         }
         if self.store.is_some() {
             // 解決は実行済みで参照が未知なだけなので、機能欠如ではなく NOT_FOUND を返す。
@@ -269,10 +272,10 @@ impl ImageRootfsSource {
 /// 在庫の記録から image ID と digest 参照（`repo_digests[0]`）を取る（#2831・CRI-2・OCI-1）。
 fn resolved_from_record(record: &crate::image_service::ImageRecord) -> Option<ResolvedImage> {
     let id = Digest::parse(record.id()).ok()?;
-    Some(ResolvedImage::new(
-        id,
-        record.repo_digests().first().cloned(),
-    ))
+    Some(
+        ResolvedImage::new(id, record.repo_digests().first().cloned())
+            .with_tag(record.repo_tags().first().cloned()),
+    )
 }
 
 /// 展開成功後に rootfs 自体へ検索権限（0755）を付ける（CRI-2・SEC-1）。

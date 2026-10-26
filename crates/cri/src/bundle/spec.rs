@@ -174,11 +174,13 @@ pub struct ImageDefaults {
 ///
 /// `ImageRootfsSource` が在庫（`ImageStore`）で解決した結果を `ImageDefaults` → `PreparedBundle` 経由で
 /// `CriRuntimeService` の `ContainerRecord` へ運ぶ。値は create 時のスナップショットで、Status の時点で在庫を引き直さない。
+/// タグ（`repo_tags[0]`）は `ContainerStatus.image` の元（#2901）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedImage {
     id: fandhe_container_oci::reference::Digest,
     reference: Option<String>,
+    tag: Option<String>,
 }
 
 impl ResolvedImage {
@@ -190,7 +192,27 @@ impl ResolvedImage {
                 && r.contains('@')
                 && !r.chars().any(char::is_control)
         });
-        Self { id, reference }
+        Self {
+            id,
+            reference,
+            tag: None,
+        }
+    }
+    /// 在庫の `repo_tags[0]` を足す（#2901・CRI-2・OCI-1。ContainerStatus の `image` の元）。
+    /// 長さ上限・制御文字なし・`@` を含まない・空でないことを再検証し、満たさなければ `None`（config の値を返す側）にする。
+    #[must_use]
+    pub fn with_tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag.filter(|t| {
+            !t.is_empty()
+                && t.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
+                && !t.contains('@')
+                && !t.chars().any(char::is_control)
+        });
+        self
+    }
+    /// 在庫のタグ（create 時のスナップショット）。
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
     }
     /// image ID（`sha256:<config digest>`）。`PullImageResponse.image_ref` と同じ形式。
     pub fn id_str(&self) -> &str {
@@ -1605,6 +1627,26 @@ mod tests {
 
     use super::*;
     use crate::error::CriErrorCode;
+
+    /// `ResolvedImage::with_tag` の再検証（CRI-2・OCI-1・REPAIR-12。#2901）。
+    #[test]
+    fn resolved_image_tag_validation() {
+        let id =
+            fandhe_container_oci::reference::Digest::parse(&format!("sha256:{}", "a".repeat(64)))
+                .expect("digest");
+        let mk = |t: &str| ResolvedImage::new(id.clone(), None).with_tag(Some(t.to_owned()));
+        assert_eq!(
+            mk("docker.io/library/busybox:1.36").tag(),
+            Some("docker.io/library/busybox:1.36")
+        );
+        assert_eq!(mk("").tag(), None);
+        assert_eq!(mk("repo:t\u{7}ag").tag(), None);
+        assert_eq!(mk("repo@sha256:abc").tag(), None);
+        let max = crate::image_service::MAX_IMAGE_FIELD_BYTES;
+        assert_eq!(mk(&"r".repeat(max + 1)).tag(), None);
+        assert!(mk(&"r".repeat(max)).tag().is_some());
+        assert_eq!(ResolvedImage::new(id, None).tag(), None);
+    }
 
     /// `ResolvedImage::new` の参照検証と image ID へのフォールバック（CRI-2・OCI-1・REPAIR-12。#2831）。
     #[test]

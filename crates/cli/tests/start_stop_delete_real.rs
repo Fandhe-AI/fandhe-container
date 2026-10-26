@@ -42,7 +42,16 @@
 //! （CI の runner は監査が縮退している可能性があり、拒否されうるため）。best-effort で実際の supervisor が argv を受理して
 //! 起動まで通ることを確かめる（strict の argv の組み立ては supervisor の `start_client` の単体試験が照合する）。
 //!
-//! create には `--read-only` も付ける（#2828・CLI-1・SUP-12・CORE-5）。プローブは rootfs 直下への新規作成の errno を
+//! # create の `--cap-drop` の観測（#2833・SEC-1・CLI-1）
+//! 1 つ目のコンテナの create に `--cap-drop NET_RAW` を付け、プローブが `/proc/self/status` の `CapInh`・`CapPrm`・`CapEff`・`CapBnd`・`CapAmb` を
+//! `OPT_CAP <キー> <16 桁 16 進>` として出す。親は `logs` の完全一致と、ホスト側の `/proc/<pid>/status` の数値で、
+//! `CapPrm`・`CapEff`・`CapBnd` が OCI 既定から NET_RAW（bit 13）だけ落ちた `00000000a80405fb`、`CapInh`・`CapAmb` が 0 であることを照合し、
+//! `inspect` の `capabilities.bounding` が NET_RAW を除いた 13 個であることも照合する（コンテナ内とホストの 2 つの視点）。
+//! 2 つ目のコンテナは `--cap-drop ALL` で短い一連（create → start → 観測 → stop → delete）を通し、5 集合すべてが 0・`bounding` が `[]` であることを照合する。
+//! `production_launcher` のシナリオ T は config の `process.capabilities` を直接書く経路で、本節は CLI の `create --cap-drop` → `start` 経路の担当（分担）。
+//!
+//! # create の `--read-only` の観測（#2828・CLI-1・SUP-12・CORE-5）
+//! 1 つ目のコンテナの create には `--read-only` も付ける（#2828・CLI-1・SUP-12・CORE-5）。プローブは rootfs 直下への新規作成の errno を
 //! `OPT_ROOT_RO <errno>` として出し、親が `logs` で `stdout OPT_ROOT_RO 30`（`EROFS`。Landlock の `EACCES` = 13 ではなく
 //! mount の RDONLY が効いたことの観測）を完全一致で照合する。あわせて `inspect` の出力に `"rootReadonly":true` が出ることも照合する。
 //!
@@ -96,6 +105,7 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::capabilities::{Capability, OCI_DEFAULT_CAPABILITIES};
     use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
     use fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -122,6 +132,18 @@ mod linux {
     /// create に渡す `--env` と、コンテナ内で観測されるべき行(ダミー値。秘密情報ではない)。
     const OPT_ENV: &str = "FANDHE_OPT_PROBE=observed-2761";
     const OPT_ENV_LINE: &str = "stdout OPT_ENV observed-2761";
+    /// create に渡す `--cap-drop`（Docker 互換の接頭辞なし表記。正規化は core の `parse_drop_list` が担う。#2833・SEC-1・CLI-1）。
+    const OPT_CAP_DROP: &str = "NET_RAW";
+    /// OCI 既定 14 個のビットマスク（`CapBnd` 等。bit 番号は Linux の capability 番号。#2833・SEC-1）。
+    const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
+    /// OCI 既定から NET_RAW（bit 13）だけを落としたマスク。`production_launcher` のシナリオ T（0xa00405fb）とは別の値。
+    const NET_RAW_DROPPED_MASK: u64 = 0x0000_0000_a804_05fb;
+    /// `/proc/self/status` から読む capability 5 集合のキー（プローブの出力順）。
+    const CAP_KEYS: [&str; 5] = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
+    /// NET_RAW を落としたときの `inspect` の `capabilities` の観測（番号順の 13 個）。
+    const NET_RAW_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[\"CAP_CHOWN\",\"CAP_DAC_OVERRIDE\",\"CAP_FOWNER\",\"CAP_FSETID\",\"CAP_KILL\",\"CAP_SETGID\",\"CAP_SETUID\",\"CAP_SETPCAP\",\"CAP_NET_BIND_SERVICE\",\"CAP_SYS_CHROOT\",\"CAP_MKNOD\",\"CAP_AUDIT_WRITE\",\"CAP_SETFCAP\"]}";
+    /// `--cap-drop ALL` のときの `inspect` の `capabilities` の観測。
+    const ALL_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[]}";
     /// `create --read-only` のコンテナ内で、rootfs 直下への新規作成が返すべき errno(`EROFS` = 30。#2828)。
     /// mount の RDONLY が Landlock の拒否(`EACCES` = 13)より先に効くため 30 になる。13 や 0 は失敗として扱う。
     const OPT_ROOT_RO_LINE: &str = "stdout OPT_ROOT_RO 30";
@@ -138,6 +160,9 @@ mod linux {
         }
         let _ = writeln!(out, "OPT_NOFILE {}", read_nofile());
         let _ = writeln!(out, "OPT_ENV {}", read_probe_env());
+        for key in CAP_KEYS {
+            let _ = writeln!(out, "OPT_CAP {key} {}", read_cap(key));
+        }
         let _ = writeln!(out, "OPT_ROOT_RO {}", probe_root_write_errno());
         let _ = writeln!(out, "READY_TERM");
         let _ = out.flush();
@@ -181,6 +206,20 @@ mod linux {
             .unwrap_or_else(|| "unreadable".to_string())
     }
 
+    /// `/proc/self/status` の capability 集合 `key` の値（16 桁 16 進。読めなければ `unreadable`）。読み取りには上限を付ける（#2833）。
+    fn read_cap(key: &str) -> String {
+        let mut text = String::new();
+        let read = fs::File::open("/proc/self/status")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_string(&mut text));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        let prefix = format!("{key}:");
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map_or_else(|| "unreadable".to_string(), |v| v.trim().to_string())
+    }
+
     /// `/proc/self/environ`(NUL 区切り)の `FANDHE_OPT_PROBE` の値(無ければ `missing`、読めなければ `unreadable`)。
     fn read_probe_env() -> String {
         let mut buf = Vec::new();
@@ -210,6 +249,12 @@ mod linux {
                     "start_stop_delete_real: create options observed in the container: /proc/self/limits nofile soft=256 hard=512; environ FANDHE_OPT_PROBE=observed-2761; start passed --audit-policy best-effort"
                 );
                 println!(
+                    "start_stop_delete_real: create --cap-drop NET_RAW observed in the container: CapPrm=CapEff=CapBnd=00000000a80405fb CapInh=CapAmb=0000000000000000; inspect bounding lists 13 capabilities without CAP_NET_RAW"
+                );
+                println!(
+                    "start_stop_delete_real: create --cap-drop ALL observed in the container: CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty; stop recorded Stopped(43); delete left no state dir"
+                );
+                println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
                 );
                 println!(
@@ -226,6 +271,77 @@ mod linux {
 
     fn expect(cond: bool, what: &str) -> Result<(), String> {
         if cond { Ok(()) } else { Err(what.to_string()) }
+    }
+
+    /// `caps` から作るビットマスク（bit 番号は capability 番号）。
+    fn mask_of(caps: &[Capability]) -> u64 {
+        caps.iter().fold(0u64, |m, c| m | (1u64 << c.index()))
+    }
+
+    /// 期待マスクのリテラルを core の公開 API（`OCI_DEFAULT_CAPABILITIES`）から導出した値と突き合わせる（#2833・SEC-1・CLI-1）。
+    /// リテラルの打ち間違いで試験が弱まるのを防ぐ二重照合。
+    fn check_expected_masks() -> Result<(), String> {
+        let default = mask_of(&OCI_DEFAULT_CAPABILITIES);
+        expect(
+            default == OCI_DEFAULT_MASK,
+            &format!("OCI default mask: literal {OCI_DEFAULT_MASK:#x}, derived {default:#x}"),
+        )?;
+        let dropped = default & !(1u64 << Capability::NetRaw.index());
+        expect(
+            dropped == NET_RAW_DROPPED_MASK,
+            &format!(
+                "NET_RAW dropped mask: literal {NET_RAW_DROPPED_MASK:#x}, derived {dropped:#x}"
+            ),
+        )
+    }
+
+    /// プローブの `OPT_CAP` 5 行（`stdout OPT_CAP <キー> <値>` の完全一致）が期待どおりか。
+    /// `CapInh`・`CapAmb` は 0、`CapPrm`・`CapEff`・`CapBnd` は `expected`（`check_host_caps` と同じ期待。launch 後の `CapInh`・`CapAmb` は常に 0）。
+    fn has_cap_lines(logs: &str, expected: u64) -> bool {
+        CAP_KEYS.iter().all(|key| {
+            let value = if *key == "CapInh" || *key == "CapAmb" {
+                0
+            } else {
+                expected
+            };
+            let want = format!("stdout OPT_CAP {key} {value:016x}");
+            logs.lines().any(|l| l == want)
+        })
+    }
+
+    /// ホストから見た `/proc/<pid>/status` の 5 集合が、`CapInh`・`CapAmb` は 0、`CapPrm`・`CapEff`・`CapBnd` は `expected` であること。
+    fn check_host_caps(pid: u32, expected: u64) -> Result<(), String> {
+        let text = fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|e| format!("read /proc/{pid}/status: {e}"))?;
+        for key in CAP_KEYS {
+            let prefix = format!("{key}:");
+            let got = text
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                .ok_or_else(|| format!("{key} missing in /proc/{pid}/status"))?;
+            let want = if key == "CapInh" || key == "CapAmb" {
+                0
+            } else {
+                expected
+            };
+            if got != want {
+                return Err(format!(
+                    "host /proc/{pid}/status {key}: want {want:016x}, got {got:016x}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `inspect` の終了コード 0 と、`capabilities` の部分文字列（他のフィールドに依存しない）を照合する。
+    fn check_inspect_caps(cli: &Path, root_s: &str, id_s: &str, want: &str) -> Result<(), String> {
+        let out = run_cli(cli, &["--root", root_s, "inspect", id_s], CLI_TIMEOUT)?;
+        expect_ok_code(&out, "inspect")?;
+        expect(
+            out.stdout.contains(want),
+            &format!("inspect lacks {want}: {:?}", out.stdout),
+        )
     }
 
     /// 子を kill し、`REAP_TIMEOUT` 内に `try_wait` で回収する（無期限の `wait` を避ける。REPAIR-5）。
@@ -339,6 +455,7 @@ mod linux {
     /// 戻り値は削除前に記録のスコープのディレクトリが存在したか。
     fn scenario() -> Result<bool, String> {
         check_prerequisites()?;
+        check_expected_masks()?;
         let cli_src = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-container"));
         let sup_src = cli_src
             .parent()
@@ -407,6 +524,8 @@ mod linux {
                 OPT_ULIMIT,
                 "--env",
                 OPT_ENV,
+                "--cap-drop",
+                OPT_CAP_DROP,
                 "--bundle",
                 bundle_s,
                 &id_s,
@@ -480,14 +599,15 @@ mod linux {
         let mut last_logs = String::new();
         let logs_ok = wait_until(
             STATE_TIMEOUT,
-            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV, OPT_ROOT_RO)",
+            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV, OPT_ROOT_RO, OPT_CAP)",
             || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
                 Ok(o) if o.code == Some(0) => {
                     let has = |want: &str| o.stdout.lines().any(|l| l == want);
                     let found = has("stdout READY_TERM")
                         && has(OPT_NOFILE_LINE)
                         && has(OPT_ENV_LINE)
-                        && has(OPT_ROOT_RO_LINE);
+                        && has(OPT_ROOT_RO_LINE)
+                        && has_cap_lines(&o.stdout, NET_RAW_DROPPED_MASK);
                     last_logs = o.stdout;
                     found
                 }
@@ -502,6 +622,9 @@ mod linux {
             },
         );
         logs_ok.map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
+        // create --cap-drop NET_RAW: ホスト側の /proc と inspect でも照合する（#2833・SEC-1・CLI-1）
+        check_host_caps(pid, NET_RAW_DROPPED_MASK)?;
+        check_inspect_caps(&cli, &root_s, &id_s, NET_RAW_DROPPED_INSPECT)?;
         // `--read-only` の実効値は分離の記録として `inspect` にも出る(CLI-1・SUP-12・#2828)。
         let out = run_cli(&cli, &["--root", &root_s, "inspect", &id_s], CLI_TIMEOUT)?;
         expect_ok_code(&out, "inspect")?;
@@ -639,6 +762,104 @@ mod linux {
                 "second delete: want op=delete code=NOT_FOUND, got op={op} code={code}"
             ));
         }
+
+        // 13. create --cap-drop ALL の短い一連（#2833・SEC-1・CLI-1）。guard は 1 つのまま id を差し替える。
+        let all_id_s = format!("ssd{}all", std::process::id());
+        cleanup.id = all_id_s.clone();
+        let out = run_cli(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "create",
+                "--cap-drop",
+                "ALL",
+                "--bundle",
+                bundle_s,
+                &all_id_s,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create --cap-drop ALL")?;
+        cleanup.armed = true;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &all_id_s],
+            START_TIMEOUT,
+        )?;
+        expect_ok(&out, "start (cap-drop ALL)")?;
+        let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
+        let all_pid = parse_running_list(&out, &all_id_s)?;
+        wait_until(STATE_TIMEOUT, "SIGTERM handler registration (ALL)", || {
+            fs::read_to_string(format!("/proc/{all_pid}/status"))
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.strip_prefix("SigCgt:"))
+                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                })
+                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
+        })?;
+        let mut last_logs = String::new();
+        wait_until(
+            STATE_TIMEOUT,
+            "logs to contain READY_TERM and zero OPT_CAP lines (ALL)",
+            || match run_cli(&cli, &["--root", &root_s, "logs", &all_id_s], CLI_TIMEOUT) {
+                Ok(o) if o.code == Some(0) => {
+                    let found = o.stdout.lines().any(|l| l == "stdout READY_TERM")
+                        && has_cap_lines(&o.stdout, 0);
+                    last_logs = o.stdout;
+                    found
+                }
+                Ok(o) => {
+                    last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                    false
+                }
+                Err(e) => {
+                    last_logs = e;
+                    false
+                }
+            },
+        )
+        .map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
+        check_host_caps(all_pid, 0)?;
+        check_inspect_caps(&cli, &root_s, &all_id_s, ALL_DROPPED_INSPECT)?;
+        let out = run_cli(&cli, &["--root", &root_s, "stop", &all_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "stop (cap-drop ALL)")?;
+        let want = format!("ID\tSTATUS\tPID\n{all_id_s}\tstopped\t-\n");
+        wait_until(STATE_TIMEOUT, "list to report stopped (ALL)", || {
+            run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
+                .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
+        })?;
+        let all_cid = ContainerId::new(all_id_s.clone()).map_err(|e| format!("id (ALL): {e:?}"))?;
+        let store = open_store(&root)?;
+        let rec = get_record(&store, &all_cid)?;
+        if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
+            return Err(format!(
+                "exit code after stop (ALL): want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
+                rec.status().exit_code()
+            ));
+        }
+        drop(store);
+        wait_until(REAP_TIMEOUT, "the ALL container process to vanish", || {
+            !Path::new(&format!("/proc/{all_pid}")).exists()
+        })?;
+        // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
+        // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
+        wait_until(REAP_TIMEOUT, "the ALL supervisor to exit", || {
+            count_processes(|dir| {
+                fs::read(dir.join("cmdline")).is_ok_and(|c| {
+                    c.starts_with(&sup_needle)
+                        && c.windows(root_needle.len()).any(|w| w == root_needle)
+                })
+            }) == 0
+        })?;
+        let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "delete (cap-drop ALL)")?;
+        expect(
+            !root.join(&all_id_s).exists(),
+            "state dir remains after delete (ALL)",
+        )?;
         cleanup.armed = false;
         Ok(scope_present)
     }

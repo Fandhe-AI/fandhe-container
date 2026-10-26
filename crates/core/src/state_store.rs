@@ -3604,7 +3604,7 @@ mod tests {
     }
 
     /// CLI-1・SUP-12・#2828: `root.readonly` の実効値の記録が bool で往復し、キーの無い旧記録は `None`、
-    /// `null`・文字列は破損として拒否される。
+    /// `null`・文字列・数値は破損として拒否される。
     #[test]
     fn cli1_sup12_state_root_readonly_roundtrip_and_rejects_corruption() {
         for ro in [true, false] {
@@ -3618,7 +3618,11 @@ mod tests {
         assert!(legacy.get("root_readonly").is_none());
         let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.into_record().unwrap().root_readonly(), None);
-        for bad in [serde_json::Value::Null, serde_json::json!("true")] {
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
             let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
             v["root_readonly"] = bad;
             assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());

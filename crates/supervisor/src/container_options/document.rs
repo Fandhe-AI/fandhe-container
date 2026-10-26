@@ -543,7 +543,7 @@ tmpfs 14\n/run:rw,noexec\n";
             d.read_only = true;
             d.encode().len() + GENERATION_RECORD_RESERVE
         };
-        let mut n = OPTIONS_DOC_MAX_BYTES - 64;
+        let mut n = OPTIONS_DOC_MAX_BYTES - 1024;
         while total(n) < OPTIONS_DOC_MAX_BYTES {
             n += 1;
         }

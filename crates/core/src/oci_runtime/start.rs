@@ -2258,6 +2258,8 @@ mod tests {
 
     /// CORE-5・SEC-1・SUP-12（#2767）: `root.readonly=true` は start が受け、launcher へ届く `LaunchSpec` の
     /// config が同じ値を持つ（本番の launcher はここから `PrePivotSetup::root_readonly` と Landlock の規則を作る）。
+    /// 成功する start は rootfs の固定（Linux 限定）を要するため Linux 限定（#2817）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn core5_sec1_start_accepts_root_readonly() {
         let name = "ro-root";

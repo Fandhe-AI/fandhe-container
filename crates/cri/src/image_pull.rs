@@ -1341,8 +1341,25 @@ fn check_unpack_record(
 }
 
 /// 記録を 0600 で `path`（ステージングのエントリ内）へ書く。公開は親ごとの rename で行うため、単体の rename はしない。
+///
+/// 失敗したら作ったファイルを消して何も残さない（#2796・OCI-1・REPAIR-5。ENOSPC 等の途中失敗で不完全な記録を
+/// 残さない関数単体の契約）。現行の呼び出し元ではステージングごと片付けるため公開先には届かないが、再利用に備えて保証する。
+/// 消す対象はこの関数が `create_new` で作ったファイルだけで、`remove_file` は最終要素の symlink を辿らない。
 fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullError> {
     use std::io::Write as _;
+    write_unpack_record_with(path, record, &|f, r| {
+        f.write_all(r.settings.as_bytes())?;
+        f.write_all(r.layers.as_bytes())?;
+        f.sync_all()
+    })
+}
+
+/// [`write_unpack_record`] の本体。本文の書き込み（`write_body`）を差し替えられる（失敗の注入用）。
+fn write_unpack_record_with(
+    path: &Path,
+    record: &UnpackRecord,
+    write_body: &dyn Fn(&mut fs::File, &UnpackRecord) -> std::io::Result<()>,
+) -> Result<(), PullError> {
     let fail = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -1364,10 +1381,13 @@ fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullErr
         opts.mode(0o600);
     }
     let mut f = opts.open(path).map_err(|_| fail())?;
-    f.write_all(record.settings.as_bytes())
-        .map_err(|_| fail())?;
-    f.write_all(record.layers.as_bytes()).map_err(|_| fail())?;
-    f.sync_all().map_err(|_| fail())
+    if write_body(&mut f, record).is_err() {
+        // Windows は開いたファイルを消せないため、先にハンドルを閉じる。後始末の失敗は元のエラーを隠さない。
+        drop(f);
+        let _ = fs::remove_file(path);
+        return Err(fail());
+    }
+    Ok(())
 }
 
 /// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。
@@ -1875,6 +1895,83 @@ mod tests {
             )
         );
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn record_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-cri-record-{tag}-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// OCI-1・REPAIR-5・#2796: 本文の書き込みが途中で失敗（ENOSPC 相当）したら作ったファイルを消す。
+    #[test]
+    fn oci1_repair5_write_unpack_record_removes_partial_file_on_write_failure() {
+        use std::io::Write as _;
+        let dir = record_test_dir("partial");
+        let path = dir.join(RECORD_FILE);
+        let record = UnpackRecord {
+            settings: "settings".to_owned(),
+            layers: "layers".to_owned(),
+        };
+        let err = write_unpack_record_with(&path, &record, &|f, r| {
+            f.write_all(&r.settings.as_bytes()[..3])?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .expect_err("write failure");
+        assert_eq!(
+            err,
+            PullError::new(
+                OciErrorCode::FailedPrecondition,
+                "failed to record the image rootfs unpack settings"
+            )
+        );
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// OCI-1・REPAIR-5・#2796: 全部書いた後の `sync_all` 相当の失敗でもファイルを残さない。
+    #[test]
+    fn oci1_repair5_write_unpack_record_removes_file_on_sync_failure() {
+        use std::io::Write as _;
+        let dir = record_test_dir("sync");
+        let path = dir.join(RECORD_FILE);
+        let record = UnpackRecord {
+            settings: "settings".to_owned(),
+            layers: "layers".to_owned(),
+        };
+        let err = write_unpack_record_with(&path, &record, &|f, r| {
+            f.write_all(r.settings.as_bytes())?;
+            f.write_all(r.layers.as_bytes())?;
+            Err(std::io::Error::from(std::io::ErrorKind::Other))
+        })
+        .expect_err("sync failure");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// OCI-1・#2796: 成功時は settings + layers をその順で書き、unix では 0600 になる。
+    #[test]
+    fn oci1_write_unpack_record_writes_settings_then_layers() {
+        let dir = record_test_dir("ok");
+        let path = dir.join(RECORD_FILE);
+        let record = UnpackRecord {
+            settings: "settings".to_owned(),
+            layers: "layers".to_owned(),
+        };
+        write_unpack_record(&path, &record).expect("write");
+        assert_eq!(fs::read(&path).expect("read"), b"settingslayers");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

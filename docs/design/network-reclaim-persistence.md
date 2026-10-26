@@ -1,6 +1,6 @@
 # 作成失敗の回収待ちの記録の永続化
 
-`create_network` の失敗で残った bridge・nft テーブルを、plugin（plugin-cri）の再起動をまたいで回収できるようにする設計。NET-1・NET-6・REPAIR-3・REPAIR-4（あわせて REPAIR-5・CORE-1）、TASK-139・TASK-185 追補、#2604（前提は #2467 の所有トークン回収）。
+`create_network` の失敗で残った bridge・nft テーブルと、`attach` の巻き戻しで取り残した veth・pin を、plugin（plugin-cri）の再起動をまたいで回収できるようにする設計。NET-1・NET-6・REPAIR-3・REPAIR-4（あわせて REPAIR-5・CORE-1）、TASK-139・TASK-185 追補、#2604（前提は #2467 の所有トークン回収）・#2681（attach の取り残しと write-ahead の判断）。
 
 ## 背景
 
@@ -12,7 +12,9 @@
 | 対象 | 本設計での扱い |
 | ---- | -------------- |
 | 作成失敗の回収待ちの記録（請求書） | 決定し、実装する（#2604） |
-| IPAM 状態（`StaticIpam`・`NetnsDirRecord`）、作成に成功したネットワーク（`CreatedNetwork`）、削除中の印、attach の取り残しの印 | 置き場所と形式の方針だけを決め、実装は後続（#1870 の network 結線の設計と一緒に決める。CLI の経路と共有しうるため） |
+| attach の取り残しの記録（請求書） | 決定し、実装する（#2681。下の「attach の取り残しの記録」） |
+| write-ahead（作成前・attach 前の記録） | 採らないと判断した（#2681。下の「write-ahead の判断」） |
+| IPAM 状態（`StaticIpam`・`NetnsDirRecord`）、作成に成功したネットワーク（`CreatedNetwork`）、削除中の印 | 置き場所と形式の方針だけを決め、実装は後続（#1870 の network 結線の設計と一緒に決める。CLI の経路と共有しうるため） |
 
 後続で実装するときの置き場は、同じ階層の `<状態ルート>/.cri/net/networks/<名前>/`（`ipam`・`netns-dir` の記録）とする。#1870 で CLI と共有する置き場に決まった場合は、そちらへ移す手順を後続 issue に書く。
 
@@ -77,5 +79,37 @@ table=<0|1>
 
 ## 未対応（後続）
 
-- IPAM 状態・`CreatedNetwork`・削除中の印・attach の取り残しの永続化（#1870 の設計の後）
-- 作成の途中でプロセスが落ちた場合に備え、作成前に記録を書く（write-ahead。net がトークンを先に発行する API が要る）
+- IPAM 状態・`CreatedNetwork`・削除中の印の永続化（#1870 の設計の後）
+- write-ahead（作成前・attach 前の記録。net がトークンを先に発行する API が要る）。#1870 の後に再検討する（#2681 の判断）
+- netns の pin の実体の識別子を永続化してプロセスをまたいで解除する API（再起動後の pin は手動回収）
+- 再起動後に復元したネットワークの bridge・nft テーブルの自動回収（link の dump API か、#1870 の永続化の後）
+
+## attach の取り残しの記録（#2681）
+
+`attach_container` の巻き戻しで取り残した host 側 veth・netns の pin も、作成失敗の請求書と同じ置き場と形式で永続化する。NET-1・REPAIR-5（あわせて REPAIR-3・REPAIR-4・NET-6・CORE-1）。
+
+- 置き場: `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach`。`attach/` は `open` が 0700 で作り、親と同じ検査（symlink でない・状態ルートと同じ所有者・group / other の権限なし）にかける。排他は親の `.lock` を共有する。一時ファイル（`O_EXCL`・0600）→ fsync → rename → ディレクトリの fsync、長さの上限 1024 バイト、読み込み時の件数の上限（`MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK`）は作成失敗の記録と同じ
+- 形式（net の `FailedAttachClaim::to_record` / `from_record`）: 版の行 `fandhe-net-attach-claim v1` の後に `network` / `endpoint` / `token` / `generation` / `veth` / `netns` / `pin` / `quarantine` を固定順で書く。`pin` は取り残した netns の pin の実体の識別子（`dev:ino:作成の連番` または `-`）で、同じ endpoint・置き場に作り直された新しい pin を古い請求書で解除しないために、解除の直前に所有記録と照合する（不一致は解除せず fail-closed）。保存済みの記録の更新（quarantine だけへの置き換え）は、プロセス間ロックの下で現在の中身が元の請求書と一致するときだけ行う（比較交換。別世代の請求書を上書きしない）。現在の中身が既に置き換え先と一致するときは、前回の置き換えが `rename` 後のディレクトリの同期だけで失敗した再試行とみなし、同期だけをやり直して成功する（REPAIR-5）。`generation` は接続ごとの世代（小文字 16 進 32 桁）で、host 側 veth の別名 `<token>/ep/<endpoint>/g/<generation>` に含まれる。同じ endpoint の再接続で別の値になるため、古い請求書は新しい接続の veth の所有を証明できず、正常な veth を消さない。版・順序・LF・余分な行・名前の規則・トークンの形式（そのネットワークの発行形式で 256 バイト以下の可視 ASCII）・フラグ（`0` か `1`。すべて `0` は拒否）を厳密に検証し、違反は `InvalidArgument`（入力値は載せない）。所有の最終判定は記録ではなく、カーネル側の別名（`host_owner_token`）と master の一致で行う
+- 書く時点: attach が取り残し付きで失敗し、請求書があるとき。書けなくてもメモリの記録は保持し、元のエラーに `the reclaim record could not be persisted` を足した `Internal` を返す
+- 消す時点: `detach` または `delete_network` が回収に成功した後、記録ファイルを中身が一致するときだけ消し（別プロセスが書いた新しい記録を消さない）、そのあとでメモリの記録を外す。回収に失敗したら記録・ファイルとも保持して再試行できる
+- 回収の順序: `delete_network` は bridge を解放する前に、attach の取り残しを先に回収する（veth の所有の証明は bridge への所属で、bridge を消すと証明を失うため）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動回収）
+- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は `netns::unpin_path` で外し、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
+
+### 再起動後に回収できるもの・できないもの
+
+作成に成功したネットワーク（`CreatedNetwork`・IPAM）は永続化されていない（#1870 の後続）ため、再起動後は attach の記録だけから「復元したネットワーク」を作る。
+
+- 回収できる: 所有を確かめた veth
+- 回収しない: bridge・nft テーブル（記録の無い健全なコンテナがまだ繋がっていないことを証明できず、消すと生きているコンテナの通信を断ち、veth の所有の証明も失うため）。復元したネットワークの `delete_network` は、取り残しを回収し終えたら記録を外し、固定の文言（`MSG_RECOVERED_NETWORK_UNTRACKED`）の `FailedPrecondition` を返して、ネットワーク本体が手動回収であることを知らせる。「ネットワークを丸ごと復旧できる」とは書かない
+- 回収できない: netns の pin。`netns::unpin_path` はプロセス内の所有記録に照合できる pin しか外さず、再起動後は `FailedPrecondition` で拒否される（fail-closed）。pin の実体の識別子を永続化してプロセスをまたいで外す設計は未実装（後続）
+- 復元したネットワークへの `create_netns`・`attach` は拒否する
+- 壊れた記録（復号の失敗・ファイル名と記録の不一致・不正なファイル名）は、ファイルを消さず、登録もしない。件数は `net.reclaim_store_load` の失敗件数と stderr の 1 行に足す。同じコンテナの再 attach は、カーネルの `NLM_F_EXCL` による `AlreadyExists` で fail-closed になる。件数の上限を超える場合は起動を失敗させる
+
+## write-ahead の判断（#2681）
+
+作成前・attach 前に記録を書く方式（write-ahead）は、今回は採らない。#1870 でネットワークの作成結果と IPAM を永続化した後に再検討する。
+
+- 理由: `CreatedNetwork` が永続化されていないと、再起動後に残った作成前の記録が「作成の途中で落ちた」のか「作成に成功した後、記録を消す前に落ちた」のかを見分けられない。後者を自動回収すると、繋がっている veth の所有の証明（bridge）を消し、生きているコンテナの通信も断ちうる
+- 2 段の記録（作成前に手動のみの記録を置く）も検討した。自動回収できないなら、今の挙動（カーネルの `AlreadyExists` による再作成の拒否と手動回収）に比べて得るものが小さく、作成のたびに fsync が 2 回増える（NET-4 の所要時間に響く）ため採らない
+- 再検討の条件: #1870 で作成に成功したネットワークの記録を永続化した後。「成功の記録がある」と「作成前の記録しかない」を見分けられるようになり、トークンを先に発行する net の API（例: `OwnerToken::issue(&NetworkName)` と、それを受ける `create_network`）と一緒に入れられる
+- attach の途中でのクラッシュも、`AttachedContainer` と IPAM が永続化されていないため同じ理由で採らない

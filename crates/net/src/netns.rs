@@ -57,6 +57,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -64,6 +65,7 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::NetOpRecorder;
 use crate::netlink_route::{NetlinkRouteSocket, classify_errno};
+use crate::network::attach_claim::PinIdentity;
 use crate::network::delete::PinCheckError;
 use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
@@ -606,7 +608,7 @@ pub(crate) fn create_pinned(
                     drop(fd);
                     drop(guard);
                     // `base` を再解決せず、固定済みの `dir` 経由で所有照合・解除する。
-                    let leftover = match unpin_in_dir(&dir, name) {
+                    let leftover = match unpin_in_dir(&dir, name, None) {
                         Ok(()) => None,
                         Err(_) => Some(ResourceState::Present),
                     };
@@ -693,6 +695,32 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 /// 残る隙間: 親ディレクトリ内の最終要素の差し替えは、同ディレクトリへ書ける実効 UID 本人（検証で他者の
 /// 書き込みは排除済み）にしかできず、stat から umount / unlink までの数命令の間に限られる。
 pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
+    unpin_path_checked(pin, None)
+}
+
+/// 現在の pin の識別子（本プロセスの作成記録）を返す。記録が無い・pin が無いときは `None`。何も変更しない。
+/// attach の取り残しの請求書が、どの接続世代の pin を指すかを固定するために使う（NET-1・#2681）。
+pub(crate) fn pin_identity(pin: &Path) -> Result<Option<PinIdentity>, NetError> {
+    let m = match fs::symlink_metadata(pin) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error("stat netns pin", &e)),
+    };
+    Ok(lookup_pin(file_id(&m)).map(|r| PinIdentity {
+        dev: r.file.0,
+        ino: r.file.1,
+        serial: r.serial,
+    }))
+}
+
+/// [`unpin_path`] に加え、現在の pin が `expected`（請求書に控えた識別子）と同じ作成のものであることを、
+/// 解除の直前に所有記録と照合する。別世代の pin（同じ名前に作り直されたもの）は `FailedPrecondition` で
+/// 拒否し何も解除しない（NET-1・#2681）。pin が既に無ければ成功（冪等）。
+pub(crate) fn unpin_path_expecting(pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+    unpin_path_checked(pin, Some(expected))
+}
+
+fn unpin_path_checked(pin: &Path, expected: Option<PinIdentity>) -> Result<(), NetError> {
     if !pin.is_absolute() {
         return Err(NetError::new(
             NetErrorCode::InvalidArgument,
@@ -711,7 +739,7 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
         Err(e) => return Err(io_error("stat netns pin", &e)),
     }
     let dir = open_pin_dir(parent)?;
-    unpin_in_dir(&dir, name)
+    unpin_in_dir(&dir, name, expected)
 }
 
 /// 固定済みの置き場ディレクトリ `dir` 配下の `name` の pin を解除する（[`unpin_path`] の本体）。
@@ -719,7 +747,11 @@ pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
 /// `create_pinned` の失敗時後始末は、パスを再解決せず自分が固定した `dir` を渡してここへ来る
 /// （検査後に `base` やその祖先が差し替えられても、検査していない場所の pin を扱わない）。
 /// 所有照合・解除の条件は [`unpin_path`] と同じ。
-fn unpin_in_dir(dir: &PinDir, name: &std::ffi::OsStr) -> Result<(), NetError> {
+fn unpin_in_dir(
+    dir: &PinDir,
+    name: &std::ffi::OsStr,
+    expected: Option<PinIdentity>,
+) -> Result<(), NetError> {
     let via = dir.entry(name);
     let real = dir.real.join(name);
     let euid = sys::effective_uid();
@@ -737,6 +769,18 @@ fn unpin_in_dir(dir: &PinDir, name: &std::ffi::OsStr) -> Result<(), NetError> {
     };
     // 本プロセスの記録（所有の証明）を引く。nsfs マウントの解除は記録がある場合に限る（下記）。
     let record = lookup_pin(current);
+    // 請求書に控えた識別子があれば、現在の pin が同じ作成のものでなければ何も解除しない（別世代の pin を守る）。
+    if let Some(want) = expected {
+        let same = record.is_some_and(|r| {
+            r.file.0 == want.dev && r.file.1 == want.ino && r.serial == want.serial
+        });
+        if !same {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "netns pin is not the one this claim was issued for",
+            ));
+        }
+    }
     // 動作中ワーカーの pin は、どの経路のパスで指定されても実体（作成時の識別子）で判定して拒否する。
     if inflight_contains(current) || record.is_some_and(|r| inflight_contains(r.file)) {
         return Err(NetError::new(
@@ -850,7 +894,13 @@ fn file_id(m: &fs::Metadata) -> FileId {
 struct PinRecord {
     file: FileId,
     ns: Option<FileId>,
+    /// 作成ごとに払い出す連番（プロセス内で単調増加）。inode 番号は解除後に再利用されうるため、
+    /// 同じ名前に作り直された別世代の pin を区別する（請求書の `PinIdentity`。NET-1・#2681）。
+    serial: u64,
 }
+
+/// pin の作成の連番の払い出し元。
+static PIN_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// 本プロセスが作成して未解除の pin。`unpin_path` が所有の証明に使う（形の検査だけでは足りないため）。
 static PINS: Mutex<Vec<PinRecord>> = Mutex::new(Vec::new());
@@ -858,7 +908,12 @@ static PINS: Mutex<Vec<PinRecord>> = Mutex::new(Vec::new());
 fn register_pin(file: FileId) {
     let mut v = PINS.lock().unwrap_or_else(PoisonError::into_inner);
     v.retain(|r| r.file != file);
-    v.push(PinRecord { file, ns: None });
+    let serial = PIN_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    v.push(PinRecord {
+        file,
+        ns: None,
+        serial,
+    });
 }
 
 fn set_pin_ns(file: FileId, ns: FileId) {
@@ -955,6 +1010,20 @@ pub(crate) fn pin_exists_in(
         Err(e) => Err(PinCheckError::Pin(io_error("stat netns pin", &e))),
     }
 }
+/// 固定設定の置き場 `dir` の直下に `id` 名の pin が無いことを確かめる（attach の取り残しの回収用。#2681）。
+///
+/// 置き場は作成時と同じ検査（[`open_pin_dir`]）を通して fd で固定し、固定した fd 経由で `lstat` する。
+/// 不存在（`NotFound`）だけが `Ok(true)`、存在すれば `Ok(false)`、置き場を検査できない・判定できない場合は
+/// `Err`（不存在を証明できないので呼び出し側は何も変更しない）。何も変更しない。
+pub(crate) fn pin_absent_in(dir: &Path, id: &EndpointId) -> Result<bool, NetError> {
+    let pinned = open_pin_dir(dir)?;
+    match fs::symlink_metadata(pinned.entry(std::ffi::OsStr::new(id.as_str()))) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(io_error("stat netns pin", &e)),
+    }
+}
+
 /// pin ファイルの実体検査（OS 呼び出しを含まない純粋関数）。`create_pinned` が作る形
 /// （通常ファイル・実効 UID 所有・mode `0o400`・空）だけを許す。
 fn check_pin_file_attrs(

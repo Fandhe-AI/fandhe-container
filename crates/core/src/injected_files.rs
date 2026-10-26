@@ -105,7 +105,18 @@ impl InjectedContent {
     /// コピー・封印の失敗はどれもエラーで、ユーザーバッファへ縮退しない（fail-closed）。上限は
     /// `INJECTED_FILE_MAX_BYTES + 1` バイトでコピーを止めて判定する（無制限コピーの防止）。ファイルの現在位置は
     /// 使わず先頭から読む。非 Linux には holder が無いため、上限まで読んだ `Bytes` を返す。
+    ///
+    /// 通常ファイル以外（FIFO・デバイス・ディレクトリ・socket）は、開いた fd の `fstat` で判定して `InvalidArgument`
+    /// で拒否する（パスでなく fd で見るので差し替えの窓は無い）。FIFO などでは `sendfile` / `read` が止まりうるし、
+    /// `/dev/null` のような文字デバイスは空の secret として黙って通ってしまうため。検査は memfd の作成より前に置き、
+    /// 拒否時に副作用を残さない（#2759・#2728 P2-2・CORE-6・SEC-5）。
     pub fn from_file(file: &std::fs::File) -> Result<Self, TraitError> {
+        let meta = file
+            .metadata()
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to inspect injected file"))?;
+        if !meta.file_type().is_file() {
+            return Err(invalid("injected file source must be a regular file"));
+        }
         #[cfg(target_os = "linux")]
         {
             sealed_from_file(file)
@@ -208,6 +219,7 @@ fn sys_io_error(e: crate::sys::SysError) -> std::io::Error {
 }
 
 /// ホストのファイル `file` を封印 memfd へ `sendfile` で置く（[`InjectedContent::from_file`] の Linux 実装）。
+/// 通常ファイルであることは入口の `from_file` が確かめ済み。
 #[cfg(target_os = "linux")]
 fn sealed_from_file(file: &std::fs::File) -> Result<InjectedContent, TraitError> {
     use std::os::fd::{AsFd as _, AsRawFd as _};
@@ -800,6 +812,21 @@ mod tests {
         for d in [d1, d2, d3] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// CORE-6・SEC-5(#2759・#2728 P2-2): `from_file` は通常ファイル以外（文字デバイス `/dev/null`・ディレクトリ・
+    /// FIFO の読み端）を `InvalidArgument` で拒否する（空の secret として通らない・止まらない）。
+    #[cfg(unix)]
+    #[test]
+    fn core6_sec5_injected_content_from_file_rejects_non_regular() {
+        let expected = invalid_msg("injected file source must be a regular file");
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert_eq!(err_of(InjectedContent::from_file(&null)), expected);
+        let dir = std::fs::File::open(std::env::temp_dir()).expect("open dir");
+        assert_eq!(err_of(InjectedContent::from_file(&dir)), expected);
+        let (r, _w) = std::io::pipe().expect("pipe");
+        let fifo = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        assert_eq!(err_of(InjectedContent::from_file(&fifo)), expected);
     }
 
     /// CORE-6・SEC-5(#2628): `from_file` は現在位置が先頭でない File でも先頭から読み、同じ File を

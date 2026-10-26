@@ -84,8 +84,23 @@ impl TryFrom<String> for ContainerId {
 
 /// 拡張点トレイトの応答が返す機械可読なエラー分類（ERR-1・ERR-3・ERR-5 の体系）。
 ///
-/// `#[non_exhaustive]` により、呼び出し側の `match` は将来のバリアント追加に備えて
+/// `#[non_exhaustive]` により、core の外の `match` は将来のバリアント追加に備えて
 /// `_` 分岐を持つ必要がある。
+///
+/// # code ごとの表の書き方（REPAIR-1・ERR-1）
+///
+/// 外部 crate で「code ごとの文言・写像」の表が要るときは、`_` 腕に `Internal` 等を吸収させず、
+/// 全 variant（`Internal` を含む）を明示した `const` の表（`[(ErrorCode, X); N]`）と `find` で書き、
+/// 表の外（将来の variant）の倒し先を別に決める。試験で `表.len() == ErrorCode::ALL.len()`・
+/// `ALL` の全要素が表にあること・キーに重複が無いことを照合すると、variant の追加を検出できる。
+///
+/// # 未知の code の扱い（fail-closed）
+///
+/// 文字列から code へ戻すのは [`ErrorCode::from_name`] だけとし、`None`（未知）を受けたら、
+/// それを含む行・報告・メッセージ全体を不正（malformed）として固定文言の構造化エラーで拒否する。
+/// 既知の variant（`Internal` 等）へ黙って置き換えて復号を続けない。未知の文字列そのものと、
+/// 同じ行に付いた untrusted な message は出力へ反射しない。plugin 等の他 crate の enum
+/// （`PluginErrorCode` ほか）の逆写像も同じ方針に従う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -158,8 +173,9 @@ impl ErrorCode {
     /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None` を返す。
     ///
     /// 大文字小文字の畳み込みも前後の空白の除去もしない。子プロセス・worker・supervisor・CLI
-    /// の報告行など untrusted な入力の経路で使う。既定の variant へは倒さず、
-    /// 失敗時の扱いは呼び出し側が決める（REPAIR-1・ERR-1）。
+    /// の報告行など untrusted な入力の経路で使う。`None`（未知）を受けた呼び出し側は、
+    /// 既定の variant へ倒さず、行・報告全体を malformed として固定文言で拒否する
+    /// （fail-closed。方針は [`ErrorCode`] の doc。REPAIR-1・ERR-1）。
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.as_str() == name)
     }
@@ -291,6 +307,45 @@ mod tests {
         ] {
             assert_eq!(ErrorCode::from_name(bad), None, "{bad:?}");
         }
+    }
+
+    /// ERR-1: ワイヤーへ出す英語の code 名は `ALL` の順で固定（変えると互換が壊れる）。
+    #[test]
+    fn err1_error_code_wire_names_are_fixed() {
+        let names: Vec<&str> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "INVALID_ARGUMENT",
+                "NOT_FOUND",
+                "ALREADY_EXISTS",
+                "FAILED_PRECONDITION",
+                "UNIMPLEMENTED",
+                "INTERNAL",
+                "PERMISSION_DENIED",
+                "TIMEOUT",
+                "UNAVAILABLE",
+                "RESOURCE_EXHAUSTED",
+            ]
+        );
+    }
+
+    /// PLUG-1・ERR-1: core と plugin の code 名の対応。plugin にだけある名前は `DATA_LOSS`、
+    /// core にだけある名前は無く、core の全 code が plugin へ無損失に写る。
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn err1_plugin_error_code_names_correspond_to_core() {
+        use fandhe_container_plugin::PluginErrorCode;
+        for c in ErrorCode::ALL {
+            let p = PluginErrorCode::from_code_str(c.as_str());
+            assert_eq!(p.map(|p| p.as_str()), Some(c.as_str()), "{c:?}");
+        }
+        let plugin_only: Vec<&str> = PluginErrorCode::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .filter(|n| ErrorCode::from_name(n).is_none())
+            .collect();
+        assert_eq!(plugin_only, ["DATA_LOSS"]);
     }
 
     /// CRI-7: 受理される ContainerId の例（英数字・区切り記号・境界長）。

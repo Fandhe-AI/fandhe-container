@@ -70,6 +70,28 @@ impl OciErrorCode {
             Self::Internal => "INTERNAL",
         }
     }
+
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験が検出する。
+    pub const ALL: [OciErrorCode; 11] = [
+        Self::InvalidArgument,
+        Self::Unimplemented,
+        Self::Unavailable,
+        Self::Timeout,
+        Self::PermissionDenied,
+        Self::NotFound,
+        Self::DataLoss,
+        Self::ResourceExhausted,
+        Self::FailedPrecondition,
+        Self::AlreadyExists,
+        Self::Internal,
+    ];
+
+    /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None`（呼び出し側は fail-closed で扱う）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 /// `fandhe-container-oci` 共通のエラー（`code` と `message`、任意の HTTP ステータス）。
@@ -156,6 +178,68 @@ impl Error for OciError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: OciErrorCode) -> usize {
+        match code {
+            OciErrorCode::InvalidArgument => 0,
+            OciErrorCode::Unimplemented => 1,
+            OciErrorCode::Unavailable => 2,
+            OciErrorCode::Timeout => 3,
+            OciErrorCode::PermissionDenied => 4,
+            OciErrorCode::NotFound => 5,
+            OciErrorCode::DataLoss => 6,
+            OciErrorCode::ResourceExhausted => 7,
+            OciErrorCode::FailedPrecondition => 8,
+            OciErrorCode::AlreadyExists => 9,
+            OciErrorCode::Internal => 10,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err1_oci_error_code_all_covers_every_variant() {
+        for (i, c) in OciErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(OciErrorCode::ALL.len(), 11);
+        let set: std::collections::HashSet<_> = OciErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 11);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err1_oci_error_code_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (OciErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (OciErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (OciErrorCode::Unavailable, "UNAVAILABLE"),
+            (OciErrorCode::Timeout, "TIMEOUT"),
+            (OciErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (OciErrorCode::NotFound, "NOT_FOUND"),
+            (OciErrorCode::DataLoss, "DATA_LOSS"),
+            (OciErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (OciErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (OciErrorCode::AlreadyExists, "ALREADY_EXISTS"),
+            (OciErrorCode::Internal, "INTERNAL"),
+        ];
+        assert_eq!(table.len(), OciErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(OciErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(OciErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(OciErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
 
     /// OCI-1・ERR-1: code 文字列と Display の具体値。
     #[test]

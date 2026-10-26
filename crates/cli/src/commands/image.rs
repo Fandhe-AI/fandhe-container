@@ -144,7 +144,8 @@ pub(super) enum Stage {
     Resolve,
 }
 
-/// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` は `#[non_exhaustive]` ではないが、将来の追加に備え未知は `Internal`。
+/// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` も `#[non_exhaustive]` で `_` 腕が要り、
+/// `DataLoss`（core に対応が無い）と未知は `Internal` に畳む。全件の対応は試験が `OciErrorCode::ALL` から照合する。
 pub(super) fn map_code(code: OciErrorCode) -> ErrorCode {
     match code {
         OciErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
@@ -643,6 +644,22 @@ pub(super) fn run_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-1・ERR-1: `OciErrorCode::ALL` の全件を照合する。`Internal` へ畳まれるのは
+    /// `Internal` と `DataLoss` だけで、それ以外は同名の core の code に写る。
+    #[test]
+    fn err1_map_code_covers_all_oci_codes() {
+        let mut folded = Vec::new();
+        for oc in OciErrorCode::ALL {
+            let mapped = map_code(oc);
+            if mapped == ErrorCode::Internal {
+                folded.push(oc);
+            } else {
+                assert_eq!(mapped.as_str(), oc.as_str(), "{oc:?}");
+            }
+        }
+        assert_eq!(folded, [OciErrorCode::DataLoss, OciErrorCode::Internal]);
+    }
     use fandhe_container_oci::image_management::{ManifestComposition, ReferenceTable};
     use fandhe_container_oci::reference::{RegistryHost, Repository, Tag};
     use std::cell::Cell;

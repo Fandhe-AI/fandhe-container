@@ -417,7 +417,8 @@ pub const ANNOTATIONS_MAX_TOTAL_BYTES: usize = 4 * 1024;
 /// 文字列 → 文字列の順序付き map（出力順を決定的にするため `BTreeMap`）。件数・長さ・キー形式を
 /// 構築時に検証し、壊れた値を表現させない。supervisor の `--label` 解析結果が
 /// [`CreateStateRequest::with_annotations`] 経由で [`StateRecord`] に載り、`FileStateStore` が
-/// `state.json` へ永続化する。純粋なメタデータで、分離・権限の判断には使わない。
+/// `state.json` へ永続化する。純粋なメタデータで、分離・権限の判断には使わない。CLI が書く予約キー
+/// （`io.fandhe.container.*`）も後始末の対象を示す制御用で、分離・権限の判断には使わない（OCI-7）。
 /// 値は利用者入力だが秘密情報の置き場ではないため、`Debug` は伏せない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Annotations(std::collections::BTreeMap<String, String>);

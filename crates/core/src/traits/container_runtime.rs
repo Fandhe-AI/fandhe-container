@@ -601,6 +601,8 @@ pub enum CleanupTarget {
     SupervisorLog,
     /// コンテナログ（CRI-2）。
     ContainerLog,
+    /// イメージストア側のコンテナ参照（OCI-7。使用中イメージの保護）。
+    ImageRef,
 }
 
 impl CleanupTarget {
@@ -610,6 +612,7 @@ impl CleanupTarget {
             Self::ImageRootfs => "image_rootfs",
             Self::SupervisorLog => "supervisor_log",
             Self::ContainerLog => "container_log",
+            Self::ImageRef => "image_ref",
         }
     }
 }
@@ -619,6 +622,7 @@ impl CleanupTarget {
 ///
 /// 各欄は既定で [`CleanupOutcome::NotApplicable`]。埋める層は欄ごとに異なる:
 /// - `image_rootfs`: core の delete（記録の無い rootfs は `NotApplicable`）
+/// - `image_ref`: イメージ参照の解除つき delete（`delete_releasing_image_ref`。OCI-7。通常の delete は `NotApplicable`）
 /// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`・CLI の `delete`）。
 ///   CLI も `finish_delete` で埋める（警告の 1 行 JSON は CLI 自前の形式。#2698）
 ///
@@ -629,6 +633,7 @@ pub struct DeleteResponse {
     image_rootfs: CleanupOutcome,
     supervisor_log: CleanupOutcome,
     container_log: CleanupOutcome,
+    image_ref: CleanupOutcome,
 }
 
 impl DeleteResponse {
@@ -655,6 +660,12 @@ impl DeleteResponse {
         self
     }
 
+    /// イメージストア側のコンテナ参照の解除の結果を設定する（OCI-7・REPAIR-4）。
+    pub fn with_image_ref(mut self, outcome: CleanupOutcome) -> Self {
+        self.image_ref = outcome;
+        self
+    }
+
     /// イメージ由来 rootfs の後始末の結果。
     pub fn image_rootfs(&self) -> CleanupOutcome {
         self.image_rootfs
@@ -670,12 +681,18 @@ impl DeleteResponse {
         self.container_log
     }
 
-    /// 残した資源を固定順（rootfs・supervisor ログ・コンテナログ）で返す。
+    /// イメージストア側のコンテナ参照の解除の結果。解除つき delete だけが埋める。
+    pub fn image_ref(&self) -> CleanupOutcome {
+        self.image_ref
+    }
+
+    /// 残した資源を固定順（rootfs・supervisor ログ・コンテナログ・イメージ参照）で返す。
     pub fn kept(&self) -> impl Iterator<Item = (CleanupTarget, ErrorCode)> {
         [
             (CleanupTarget::ImageRootfs, self.image_rootfs),
             (CleanupTarget::SupervisorLog, self.supervisor_log),
             (CleanupTarget::ContainerLog, self.container_log),
+            (CleanupTarget::ImageRef, self.image_ref),
         ]
         .into_iter()
         .filter_map(|(t, o)| match o {
@@ -981,6 +998,7 @@ mod tests {
         assert_eq!(r.image_rootfs(), CleanupOutcome::NotApplicable);
         assert_eq!(r.supervisor_log(), CleanupOutcome::NotApplicable);
         assert_eq!(r.container_log(), CleanupOutcome::NotApplicable);
+        assert_eq!(r.image_ref(), CleanupOutcome::NotApplicable);
         assert_eq!(r.kept().count(), 0);
     }
 
@@ -992,6 +1010,9 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
             })
             .with_supervisor_log(CleanupOutcome::Removed)
+            .with_image_ref(CleanupOutcome::Kept {
+                code: ErrorCode::Internal,
+            })
             .with_image_rootfs(CleanupOutcome::Kept {
                 code: ErrorCode::Unimplemented,
             });
@@ -1002,6 +1023,7 @@ mod tests {
             vec![
                 (CleanupTarget::ImageRootfs, ErrorCode::Unimplemented),
                 (CleanupTarget::ContainerLog, ErrorCode::FailedPrecondition),
+                (CleanupTarget::ImageRef, ErrorCode::Internal),
             ]
         );
     }
@@ -1012,5 +1034,6 @@ mod tests {
         assert_eq!(CleanupTarget::ImageRootfs.as_str(), "image_rootfs");
         assert_eq!(CleanupTarget::SupervisorLog.as_str(), "supervisor_log");
         assert_eq!(CleanupTarget::ContainerLog.as_str(), "container_log");
+        assert_eq!(CleanupTarget::ImageRef.as_str(), "image_ref");
     }
 }

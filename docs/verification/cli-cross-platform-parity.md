@@ -175,6 +175,8 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | C24 | `image ls --image-root <通常ファイル>` | 5 / `FAILED_PRECONDITION` | | 前提未達 | 前提未達 | | |
 | C25 | `image tag --image-root <dir> busybox:latest busybox:v2` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路が未実装のため常にこの値 |
 | C26 | `create --image-root <dir> --image sha256:<64 hex> または name[:tag] --bundle <bundle> <id>`（OCI-7・#2315） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路（pull → `ImageStore` の配線）が入るまで常にこの値。状態は作られない。`--image` だけ・`--image-root` だけは 2 / `INVALID_ARGUMENT` |
+| C27 | `image rm --image-root <dir> nginx@sha256:<64 hex>`（空のストア。#2659） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | `name@digest` は digest 優先で受ける（`INVALID_ARGUMENT` にならない） |
+| C28 | `image tag --image-root <dir> nginx@sha256:<64 hex> busybox:v2`（空のストア。#2659） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 同上 |
 
 ## D 層: logs のオプション（`--follow`・`--tail`・`--stream`・`--escape`。#2447・CLI-1・SUP-7）
 

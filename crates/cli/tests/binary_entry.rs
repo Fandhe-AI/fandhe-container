@@ -1196,7 +1196,7 @@ fn sup7_delete_warns_when_container_log_is_locked() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
+        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
     );
     assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
     let listed = run(&["--root", root_s, "list"]);

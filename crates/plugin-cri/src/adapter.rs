@@ -42,8 +42,8 @@
 //!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
 //!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
-//!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。既知の制約として、既定を超える terminate で窓が 10 秒を超えると
-//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、CLI の同じ ID の `create` は残りを回収するが、CRI は ID を再利用しないため手動で消す。docs/setup/container-log-recovery.md）
+//!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。待ち切れなかった失敗（`FailedPrecondition`）は警告行に `reason: sink_open_after_wait` を足して他の失敗と区別する（#2760。terminate を設定する経路が無く、待ちを伸ばさない判断は `docs/design/container-log-removal-wait.md`）。待ちを超えて残ったログは、plugin の起動時の走査（[`sweep_leftover_container_logs`]）と同じ ID の `create` の前の回収（`reclaim_before_create`）で消える（生きている sink・状態がある ID・帰属できない名前は残り、手動で消す。docs/setup/container-log-recovery.md）。
+//!   core の `delete` の成功後には起動オプション文書（`<root>/@container-options/<id>`）の残骸も、記録の無い ID に限りロックの下で期限つきに消す（失敗は `container_options_remove` の Failure と `target: container_options` の警告行。`create` の前にも同じ掃除をする。SUP-12・#2760）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` は同じ UDS でサーブし（`CriPluginBackends::image_service`。#2592）、
 //!   `PullImage` が登録したタグ・digest・image ID を同じ在庫から解決する（未知の参照は `NOT_FOUND`）。
@@ -92,7 +92,8 @@ use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_oci::registry::RegistryClientConfig;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::logs::{
-    CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs,
+    CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs, StaleLogReclaim,
+    container_log_removal_reason, reclaim_stale_container_logs,
     remove_container_logs_guarded_bounded_waiting,
 };
 use fandhe_container_supervisor::supervisor_log::{
@@ -291,7 +292,62 @@ impl CriPluginBackends {
 ///
 /// supervisor の起動結果の受信期限（`start_contract::cli_receive_deadline`）に 2 秒の余裕を足した値。CRI の既定
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
+///
+/// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
+/// running への force `delete` の最悪: stop 17 秒 + supervisor ログ 5 秒 + コンテナログ 15 秒 + 起動オプション文書 10 秒 = 47 秒。
+/// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
+/// bundle の用意と core の create のファイル I/O 自体の上限は、この内訳の外にある（既存の残余）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// 起動時の残りログの走査の全体の期限（#2760・REPAIR-5。サーブの開始は待たせず、別スレッドで走る）。
+pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// plugin の起動時に 1 回、状態の記録が無い ID の残りコンテナログを回収する（#2760・CRI-2・SUP-7・REPAIR-4）。
+///
+/// CRI は ID を使い回さないため、delete の待ちを超えて残ったログは同じ ID の `create` では回収されない。ここで
+/// `@container-logs` を走査し、状態ストアに記録が無く、sink も生きていない ID のログだけを消す
+/// （`fandhe_container_supervisor::logs::sweep_stale_container_logs`。生きている sink・記録のある ID・帰属できない名前は残す。
+/// 読み取りに失敗した ID も消さない）。状態ルートを持たないストアでは `None`。消せた ID ごとに記録器の
+/// `container_log_reclaim` へ Success を計上する。呼び出し元は `main.rs` の `serve`（ブロッキングスレッド）。
+/// 走査はこの時点で存在する残りだけを対象にし、稼働中に発生した残りは次の起動まで残る（設計: `docs/design/container-log-removal-wait.md`）。
+pub fn sweep_leftover_container_logs(
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    budget: Duration,
+) -> Option<fandhe_container_supervisor::logs::SweepReport> {
+    let root = store.host_state_root()?;
+    let started = Instant::now();
+    let guard_store = Arc::clone(store);
+    let report = fandhe_container_supervisor::logs::sweep_stale_container_logs(
+        root,
+        Arc::new(move |id| CoreLifecycleRuntime::id_is_absent(&guard_store, id)),
+        budget,
+    );
+    if report.reclaimed_ids > 0
+        && let Ok(name) = OpName::new("container_log_reclaim")
+    {
+        let each = started.elapsed() / u32::try_from(report.reclaimed_ids).unwrap_or(u32::MAX);
+        for _ in 0..report.reclaimed_ids {
+            let _ = recorder.record(&name, OpOutcome::Success, each);
+        }
+    }
+    Some(report)
+}
+
+/// 起動時の走査の結果の構造化ログ 1 行（`event: container_log_sweep`。#2760・REPAIR-4）。件数だけで、パス・ID は含めない。
+pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) -> String {
+    format!(
+        "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{}}}",
+        r.scanned,
+        r.reclaimed_ids,
+        r.removed_files,
+        r.skipped_live,
+        r.skipped_present,
+        r.skipped_undecodable,
+        r.failed,
+        r.timed_out
+    )
+}
 
 /// gRPC サーバーが 1 リクエストを待つ上限（REPAIR-5・#2592）。`GrpcServerConfig` の既定（10 秒）では `PullImage`
 /// （ネットワーク越し）も `StartContainer`（[`PLUGIN_RUNTIME_TIMEOUT`]）も途中で切れるため、`GRPC_TIMEOUT_MAX`（600 秒）以下で
@@ -345,10 +401,29 @@ pub struct CoreLifecycleRuntime {
 /// 値は `ContainerId`（検証済みの文字種）・`CleanupTarget::as_str`・`ErrorCode::as_str` の固定語彙だけで組み、
 /// パス・errno・外部入力の文字列を含めない（ERR-1・ERR-2）。
 fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode) -> String {
+    // コンテナログが「待ちを使い切っても sink が閉じなかった」ときだけ `reason` を足す（他の失敗と見分ける。#2760・REPAIR-4）。
+    let reason = match target {
+        CleanupTarget::ContainerLog => container_log_removal_reason(code),
+        _ => None,
+    }
+    .map(|r| format!(",\"reason\":\"{r}\""))
+    .unwrap_or_default();
     format!(
-        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}",
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\"{reason},\"message\":\"cleanup after delete left resources behind\"}}",
         id.as_str(),
         target.as_str(),
+        code.as_str()
+    )
+}
+
+/// `delete` の後の起動オプション文書の掃除に失敗した旨の構造化ログ 1 行（#2760・SUP-12・REPAIR-4）。
+///
+/// `CleanupTarget`（plugin 境界の型）には語彙を足さないため、`target` はこの module の固定文字列 `container_options` を使う。
+/// 値は `ContainerId`・`ErrorCode::as_str` の固定語彙だけで、パス・errno・文書の中身（env の値）を含めない（ERR-1・ERR-2）。
+fn options_cleanup_warning_line(id: &ContainerId, code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"container_options\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}",
+        id.as_str(),
         code.as_str()
     )
 }
@@ -610,6 +685,100 @@ impl CoreLifecycleRuntime {
     }
 }
 
+impl CoreLifecycleRuntime {
+    /// 状態ストアに `id` の記録が無い（`NotFound`）ときだけ `true`。読み取りに失敗したら `false`（fail-closed）。
+    ///
+    /// ログ・起動オプション文書の回収の guard（ロック保持中に評価される）。記録のある ID の資源は消さない。
+    fn id_is_absent(store: &Arc<dyn StateStore>, id: &ContainerId) -> bool {
+        matches!(
+            store.get(&GetStateRequest::new(id.clone())),
+            Err(e) if e.code() == ErrorCode::NotFound
+        )
+    }
+
+    /// core の `create` の前に、同じ ID の前のインスタンスが残したコンテナログを回収し、起動オプション文書の残骸を掃除する
+    /// （CLI の `create` と同じ契約。#2760・CRI-2・SUP-7・SUP-12・REPAIR-4・REPAIR-5）。
+    ///
+    /// CRI は ID を使い回さないため通常は何も無いが、`CreateContainer` が失敗した後の再試行や、手動で ID を指定した再作成で
+    /// 残りが新しい sink に混ざるのを防ぐ。待たずに 1 回だけ試し（ログ 5 秒・文書 10 秒が上限）、生きている sink・状態が既にある
+    /// ID には触れない。ログ回収が期限切れなら、作業スレッドが残り得るため core を呼ばずに `Timeout` で失敗させる
+    /// （後続の監査記録は単一スレッド前提の fork を要する。SEC-4）。それ以外の失敗は best effort で create を続ける。
+    /// 状態ルートを持たないストアでは何もしない。
+    ///
+    /// # Errors
+    /// ログ回収が期限切れのとき `Timeout`。
+    fn reclaim_before_create(&self, id: &ContainerId) -> Result<(), TraitError> {
+        let Some(root) = self.store.host_state_root() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let reclaim =
+            reclaim_stale_container_logs(root, id, move || Self::id_is_absent(&store, &guard_id));
+        let result = reclaim_timeout_result(reclaim);
+        let outcome = match reclaim {
+            StaleLogReclaim::Removed(_) => Some(OpOutcome::Success),
+            StaleLogReclaim::Nothing => None,
+            StaleLogReclaim::Failed(_) | StaleLogReclaim::TimedOut => Some(OpOutcome::Failure),
+        };
+        if let Some(outcome) = outcome
+            && let Ok(name) = OpName::new("container_log_reclaim")
+        {
+            let _ = self.recorder.record(&name, outcome, started.elapsed());
+        }
+        result?;
+        // 起動オプション文書の残骸（best effort。失敗しても create は続ける。文書は世代の照合で採用されない）。
+        let _ = self.remove_stale_options(id);
+        Ok(())
+    }
+
+    /// 状態の記録が無い ID の起動オプション文書を、ID 単位のロックの下で期限つきに消す（#2760・SUP-12・REPAIR-5）。
+    ///
+    /// 同じ ID の記録がある（作り直された新しいインスタンスかもしれない）ときは消さない。文書が無ければロックも作らない。
+    /// 失敗は記録器の `container_options_remove` の Failure として計上する。Linux 以外は文書を書く経路が無く
+    /// （`Unimplemented`）、対象外として `Ok` を返し何も計上しない。戻り値は呼び出し元が警告行を出すかの判断に使う。
+    fn remove_stale_options(&self, id: &ContainerId) -> Result<(), ErrorCode> {
+        use fandhe_container_supervisor::container_options::store as options_store;
+        let Some(root) = self.store.host_state_root() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let removed = options_store::remove_stale_bounded(
+            root,
+            id,
+            move || Self::id_is_absent(&store, &guard_id),
+            options_store::OPTIONS_LOCK_WAIT,
+            options_store::OPTIONS_REMOVE_TIMEOUT,
+        );
+        match removed {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == ErrorCode::Unimplemented => Ok(()),
+            Err(e) => {
+                if let Ok(name) = OpName::new("container_options_remove") {
+                    let _ = self
+                        .recorder
+                        .record(&name, OpOutcome::Failure, started.elapsed());
+                }
+                Err(e.code())
+            }
+        }
+    }
+}
+
+/// create 前のログ回収の結果を、core を呼ぶかの判断へ写す（期限切れだけが失敗。#2760・SEC-4・REPAIR-5）。
+fn reclaim_timeout_result(reclaim: StaleLogReclaim) -> Result<(), TraitError> {
+    match reclaim {
+        StaleLogReclaim::TimedOut => Err(TraitError::new(
+            ErrorCode::Timeout,
+            "stale container log reclaim did not finish within the deadline",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// コンテナログ削除の失敗をコード別に計上する操作名（固定語彙 5 種。ID・パス・errno は入れない。ERR-1・REPAIR-4・#2634）。
 ///
 /// 記録器の名前の種類には上限（`MAX_TRACKED_OPS`）があるため、語彙を絞り、失敗したときだけ作る。
@@ -660,6 +829,7 @@ fn launch_unavailable() -> TraitError {
 
 impl ContainerRuntime for CoreLifecycleRuntime {
     fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        self.reclaim_before_create(req.id())?;
         let created = match &self.create_audit {
             Some(sink) => {
                 oci_runtime::create_audited(&*self.store, &self.recorder, req, sink.as_ref())
@@ -714,6 +884,10 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             .map_err(to_trait_error)?;
         let supervisor_log = self.remove_supervisor_log(req.id());
         let container_log = self.record_container_log_removal(req.id());
+        // 起動オプション文書の残骸（記録の無くなった ID の分。失敗は応答に載せず、計上と構造化ログで知らせる。#2760）。
+        if let Err(code) = self.remove_stale_options(req.id()) {
+            (self.cleanup_warn)(options_cleanup_warning_line(req.id(), code));
+        }
         let response = response
             .with_supervisor_log(supervisor_log)
             .with_container_log(container_log);
@@ -1035,6 +1209,52 @@ mod tests {
             .expect_err("fake store delete fails");
         assert_eq!(e.message(), "unused");
         assert_eq!(*store.deletes.lock().expect("lock"), 1);
+    }
+
+    /// #2760・SEC-4: create 前のログ回収は期限切れのときだけ create を失敗（`Timeout`）させ、それ以外は続ける。
+    #[test]
+    fn repair5_cri2_reclaim_timeout_fails_create_only_on_timeout() {
+        let e = reclaim_timeout_result(StaleLogReclaim::TimedOut).expect_err("timeout");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        for ok in [
+            StaleLogReclaim::Removed(2),
+            StaleLogReclaim::Nothing,
+            StaleLogReclaim::Failed(ErrorCode::FailedPrecondition),
+            // 作業スレッドの枠が満杯（何も実行していない）。create を恒久的に失敗させない（#2760）。
+            StaleLogReclaim::Failed(ErrorCode::ResourceExhausted),
+        ] {
+            assert!(reclaim_timeout_result(ok).is_ok());
+        }
+    }
+
+    /// #2760・REPAIR-4: 警告行の `reason` は、コンテナログが待ち切れなかった失敗にだけ付く。options 用の行は固定語彙。
+    #[test]
+    fn repair4_cri2_cleanup_warning_reason_only_for_sink_open() {
+        let id = cid("c1");
+        assert_eq!(
+            cleanup_warning_line(
+                &id,
+                CleanupTarget::ContainerLog,
+                ErrorCode::FailedPrecondition
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert!(
+            !cleanup_warning_line(&id, CleanupTarget::ContainerLog, ErrorCode::Timeout)
+                .contains("reason")
+        );
+        assert!(
+            !cleanup_warning_line(
+                &id,
+                CleanupTarget::SupervisorLog,
+                ErrorCode::FailedPrecondition
+            )
+            .contains("reason")
+        );
+        assert_eq!(
+            options_cleanup_warning_line(&id, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
     }
 
     /// 注入した記録器が CRI 計測の橋渡しにも使われ、`op_recorder` から件数を読める（REPAIR-4）。

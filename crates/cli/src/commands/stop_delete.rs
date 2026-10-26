@@ -612,11 +612,6 @@ pub(super) fn options_removal_warning(e: &TraitError) -> String {
     )
 }
 
-/// 起動オプション文書の削除を作業スレッドで待つ上限(REPAIR-5)。
-const OPTIONS_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
-/// ID 単位のロックの取得を待つ上限(`OPTIONS_REMOVE_TIMEOUT` より短くする)。
-const OPTIONS_LOCK_WAIT: Duration = Duration::from_secs(8);
-
 /// core の `delete` が成功した後に、起動オプション文書(`<root>/@container-options/<id>`。#2713・SUP-12)を消す。
 ///
 /// ログの削除と同じく、失敗しても delete の結果は変えず警告を 1 行だけ出す。ID 単位のロックを取った上で、同じ ID が
@@ -628,26 +623,16 @@ fn remove_container_options(store: &dyn StateStore, req: &DeleteRequest) {
     let Some(root) = store.host_state_root() else {
         return;
     };
-    let root = root.to_path_buf();
-    let id = req.id().clone();
-    let result = fandhe_container_supervisor::supervisor_log::run_bounded(
-        move || -> Result<(), TraitError> {
-            let lock = options_store::acquire_lock(&root, &id, OPTIONS_LOCK_WAIT)?;
-            if !id_is_still_deleted(&root, &id) {
-                return Ok(());
-            }
-            let removed = options_store::remove(&root, &id);
-            lock.remove_lock_file();
-            removed
-        },
-        OPTIONS_REMOVE_TIMEOUT,
-    )
-    .unwrap_or_else(|| {
-        Err(TraitError::new(
-            ErrorCode::Timeout,
-            "container options file removal did not finish within the deadline",
-        ))
-    });
+    let guard_root = root.to_path_buf();
+    let guard_id = req.id().clone();
+    // 本体は plugin-cri の create / delete と共有する（#2760・REPAIR-1）。
+    let result = options_store::remove_stale_bounded(
+        root,
+        req.id(),
+        move || id_is_still_deleted(&guard_root, &guard_id),
+        options_store::OPTIONS_LOCK_WAIT,
+        options_store::OPTIONS_REMOVE_TIMEOUT,
+    );
     if let Err(e) = result {
         emit_warning_bounded(
             options_removal_warning(&e),
@@ -669,10 +654,15 @@ fn supervisor_log_removal_warning(code: ErrorCode) -> String {
 }
 
 /// コンテナログ削除失敗の警告（stderr に 1 行の JSON。ERR-1）。パス・errno・ID・内容は含めない。
-/// 期限切れ（`TIMEOUT`）も同じ文言で、`code` で見分ける。
+/// 期限切れ（`TIMEOUT`）も同じ文言で、`code` で見分ける。待ちを使い切っても sink が閉じなかった失敗
+/// （`FAILED_PRECONDITION`）だけは `reason: "sink_open_after_wait"` を足して、他の失敗と区別する（#2760・REPAIR-4。
+/// 閉じた語彙は supervisor の `container_log_removal_reason`）。
 fn container_log_removal_warning(code: ErrorCode) -> String {
+    let reason = fandhe_container_supervisor::logs::container_log_removal_reason(code)
+        .map(|r| format!(",\"reason\":\"{r}\""))
+        .unwrap_or_default();
     format!(
-        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container log removal failed; leftover logs may remain\"}}",
+        "{{\"level\":\"warn\",\"code\":\"{}\"{reason},\"message\":\"container log removal failed; leftover logs may remain\"}}",
         code.as_str()
     )
 }
@@ -848,9 +838,10 @@ mod tests {
         let w = container_log_removal_warning(ErrorCode::FailedPrecondition);
         assert_eq!(
             w,
-            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}"
         );
         let w = container_log_removal_warning(ErrorCode::Timeout);
+        assert!(!w.contains("reason"));
         assert!(w.contains("\"code\":\"TIMEOUT\"") && !w.contains('\n') && !w.contains('/'));
     }
 
@@ -1354,7 +1345,10 @@ mod tests {
             assert!(!log_names(&base).is_empty());
             let w = cleanup_warnings(&resp);
             assert_eq!(w.len(), 1);
-            assert!(w[0].contains("\"code\":\"FAILED_PRECONDITION\""));
+            assert_eq!(
+                w[0],
+                "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+            );
         }
 
         /// CLI-1・#2698: ログが無くても Removed（0 件で成功）、core の image_rootfs は保たれ、状態ルートが無いストアは NotApplicable。

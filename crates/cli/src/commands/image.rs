@@ -10,8 +10,22 @@
 //! （`MSG_BAD_DIGEST`）で拒否する。repository 名が `sha256` のイメージは `docker.io/library/sha256:<tag>` と書く。
 //!
 //! `name@digest` は `create --image` と違い受ける（digest 優先。#2221・#2316 以来の契約）。rm / tag は manifest digest 自体を
-//! 対象にする管理操作で、name は構文検証だけ通して捨て、digest 部は `Digest::parse` で厳格に検証するため取り違えは起きない。
-//! name と manifest の対応を検証できない制約は create と同じで、在庫が repository を持つ（pull の配線後）時点で揃えるかを再判断する。
+//! 対象にする管理操作で、name は構文検証だけ通して捨て、digest 部は `Digest::parse` で厳格に検証するため、操作の範囲は
+//! 素の digest を渡した場合と同じで広がらない。
+//!
+//! ## `name@digest` を受け続ける判断（#2659・OCI-7・CLI-1・TASK-183。pull の配線 #2539・#2800 の後の再判断）
+//!
+//! 現時点の決定は (a) 受け続ける（挙動を変えない）。理由は次のとおり。
+//!
+//! - 配線の後も在庫は manifest ごとの repository を持たない。repository を持つのはタグ（`TagKey`）だけで、digest 指定で
+//!   pull した manifest には名前が残らない。このため「name と在庫の repository の一致を要求する」(b) は、正確には実装できない。
+//!   実装できる形は「その manifest に付いたタグの host / repository と照合する」だけで、タグの無い manifest では常に不一致になり (c) と同じになる。
+//! - (b) を正しく実装するには、在庫のスキーマへ manifest ごとの repository を記録する必要がある（oci の永続化形式の変更）。
+//! - (c)（`create --image` と同じ拒否）は既存契約（#2221・#2316）の破壊になる。
+//!
+//! (b)・(c) への切り替えはオーナーの判断待ちで、見直しの契機は「在庫が manifest ごとの repository を持ったとき」
+//! または「オーナーが (b)・(c) を選んだとき」。残余リスク: 食い違う name を黙って捨てるため、別 repository のタグごと
+//! 削除・タグ付けしうる（素の digest でも同じ範囲）。この決定は `cli1_oci7_image_rm_name_at_digest_*` などの試験で固定している。
 //!
 //! # 構文
 //!
@@ -871,6 +885,52 @@ mod tests {
         assert!(!tmp.has_blob('a'));
     }
 
+    /// OCI-7・#2659: `name@digest` は name が一致しても digest で解決し、素の digest と同じ出力で削除する。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_digest_matching_name_deletes_by_digest() {
+        let tmp = Tmp::new();
+        tmp.put_blob('a', 1);
+        tmp.put_blob('b', 1);
+        let store = rm_store(&tmp, &[]);
+        let d = format!("busybox@sha256:{}", "1".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 0);
+        let h1 = "1".repeat(64);
+        assert!(out.starts_with("untagged\tregistry-1.docker.io/library/busybox:latest\n"));
+        assert!(out.contains(&format!("deleted\tsha256:{h1}\n")));
+        assert!(out.contains(&format!("deleted-blob\tsha256:{}\n", "a".repeat(64))));
+        assert!(out.contains(&format!("deleted-blob\tsha256:{}\n", "b".repeat(64))));
+        assert!(!tmp.has_blob('a') && !tmp.has_blob('b'));
+    }
+
+    /// OCI-7・#2659: name が食い違っても digest 優先で削除する（(a) の残余リスクを固定。切り替え時は意図した試験の変更になる）。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_digest_mismatched_name_is_digest_first() {
+        let tmp = Tmp::new();
+        tmp.put_blob('a', 1);
+        tmp.put_blob('b', 1);
+        let store = rm_store(&tmp, &[]);
+        let d = format!("nginx@sha256:{}", "1".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 0);
+        assert!(out.starts_with("untagged\tregistry-1.docker.io/library/busybox:latest\n"));
+        assert!(out.contains(&format!("deleted\tsha256:{}\n", "1".repeat(64))));
+        assert!(!tmp.has_blob('a') && !tmp.has_blob('b'));
+    }
+
+    /// OCI-7・#2659: 在庫に無い digest の `name@digest` は INVALID_ARGUMENT ではなく 3 / NOT_FOUND。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_unknown_digest_is_not_found() {
+        let tmp = Tmp::new();
+        let store = rm_store(&tmp, &[]);
+        let d = format!("nginx@sha256:{}", "9".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(e.code(), Some("NOT_FOUND"));
+        assert!(stderr_of(&e).contains(MSG_IMAGE_NOT_FOUND));
+        assert_eq!(out, "");
+    }
+
     /// OCI-7: コンテナ参照ありで --force なしは 5。文言は固定でコンテナ ID を含まない。ファイルは不変。
     #[test]
     fn cli1_oci7_image_rm_in_use_refuses_without_leaking_container_id() {
@@ -1168,6 +1228,20 @@ mod tests {
                 "1".repeat(64)
             )
         );
+    }
+
+    /// CLI-1・OCI-7・#2659: tag の source が `name@digest` なら name の一致・不一致によらず digest で解決する。
+    #[test]
+    fn cli1_oci7_image_tag_name_at_digest_source_match_and_mismatch() {
+        let h = "1".repeat(64);
+        let want = format!("tagged\tregistry-1.docker.io/library/busybox:v1\tsha256:{h}\n");
+        for name in ["busybox", "nginx"] {
+            let tmp = Tmp::new();
+            let store = tag_store(&tmp, &[]);
+            let (e, out) = run_tag(&store, &format!("{name}@sha256:{h}"), "busybox:v1");
+            assert_eq!(e.exit_code(), 0, "{name}");
+            assert_eq!(out, want, "{name}");
+        }
     }
 
     /// CLI-1・OCI-7: 別 manifest を指すタグの付け替えは retagged 行（付け替え前 → 後）。

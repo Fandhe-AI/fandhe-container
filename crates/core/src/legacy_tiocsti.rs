@@ -29,7 +29,7 @@
 //!
 //! # 呼び出し元
 //!
-//! `exec::spawn_container_with_stages`（`spawn_container` を含む従来経路）と、本番 launcher の入口
+//! `exec::spawn_container_with_stages`（`spawn_container` を含む従来経路。結合試験専用・`exec-test-support`）と、本番 launcher の入口
 //! `exec::spawn_container_via_intermediate`（#2008）が、fork に成功した後、親の側で 1 回呼ぶ。
 //! 出力は core の診断ログの共通経路（`exec::emit_diagnostic_line_to`。AF_UNIX の socket 以外へは書かず、満杯でも
 //! 待たない。REPAIR-5）で、`exec::report_legacy_tiocsti_to` が行い、結果を `exec::LegacyTiocstiReport` で返す。

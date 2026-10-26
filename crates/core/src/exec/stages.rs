@@ -593,7 +593,8 @@ impl StagePipeline {
     /// - 変更内容: `pub fn run_then` から `pub(crate) fn run_then` へ縮小した。crate 外から
     ///   `StagePipeline::run_then` を直接呼ぶことはできなくなった。
     /// - 理由: 組み込みの `NO_NEW_PRIVS` 段が不可逆のため、親プロセスからの誤呼び出しを型で防ぐ。
-    /// - 移行方法: 外部 crate は `StagePipeline` を `spawn_container_with_stages` に渡す。
+    /// - 移行方法: 本番は `ProductionLauncher`（`spawn_container_via_intermediate`）が `StagePipeline` を渡す。
+    ///   `spawn_container_with_stages` は結合試験専用（`exec-test-support`）。
     ///   `run_then` は fork 後の子（`process.rs::run_child`）内で core が呼ぶ。`run_then` を
     ///   単体で呼んでいた利用者は、ステージ列の順序・失敗時の挙動の確認を
     ///   `spawn_container_with_stages` 経由の結合試験（`fork_exec_isolation` の `stages-order`）へ移す。

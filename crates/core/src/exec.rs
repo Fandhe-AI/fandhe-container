@@ -3,7 +3,7 @@
 //! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
 //! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）、基本デバイスノード作成
 //! （[`create_default_devices`]。#834・TASK-27.6）、fork / exec による子プロセス
-//! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
+//! 起動（`spawn_container`・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
@@ -42,10 +42,10 @@
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
-//! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
+//! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。`spawn_container` が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
-//!    Landlock を載せない**この最小構成（[`spawn_container`]）は `LaunchReady` が作られず exec を許可せず、
+//!    Landlock を載せない**この最小構成（`spawn_container`）は `LaunchReady` が作られず exec を許可せず、
 //!    ステージ列を通さない [`exec_entrypoint`] は rootful・rootless を問わず常に `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
@@ -57,7 +57,7 @@
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
 //! - 製品コードの呼び出し元は本番 launcher（`ProductionLauncher`。`spawn_container_via_intermediate`）で、
-//!   fork 段の最小入口 [`spawn_container`]（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
+//!   fork 段の最小入口 `spawn_container`（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
@@ -229,8 +229,7 @@ pub use process::{
     ChildExit, ChildStdio, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
     EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, LaunchPidfdUnavailable,
-    SignalDelivery, exec_entrypoint, spawn_container, spawn_container_with_stages,
-    spawn_container_with_stages_and_stdio,
+    SignalDelivery, exec_entrypoint,
 };
 pub(crate) use process::{ConfigPaths, PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
@@ -247,6 +246,11 @@ pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// 最小入口の再公開（結合試験専用。製品コードの呼び出し元は無く、本番の起動は launcher の `spawn_container_via_intermediate`。
+/// release ビルドでは `exec-test-support` を有効にできないため製品バイナリからは呼べない。REPAIR-3・CORE-2・#2762）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use process::{spawn_container, spawn_container_with_stages};
 /// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]

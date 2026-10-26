@@ -38,6 +38,8 @@ escape-probe = []
 # TASK-163 追補・#1456）と、標準 fd を閉じた呼び出し側を作る `exec::close_standard_fds_for_test`（tests/exec_child_setup.rs・
 # tests/fork_exec_isolation.rs。#1299）も同じ feature の下に置く。core 自身のテストでは下の dev-dependency（自己参照）で有効にし、
 # `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする。
+# 最小入口 `exec::spawn_container` / `spawn_container_with_stages` も結合試験専用としてこの feature の下に置く
+# （製品コードの呼び出し元が無いため。REPAIR-3・CORE-2・#2762）。
 exec-test-support = []
 
 # default-features = false は、`--no-default-features` のテスト時に自己参照経由で default が

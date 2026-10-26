@@ -534,6 +534,11 @@ pub(super) enum OrphanReap {
 /// 6. `store` の全レコードに、印のトークンを持つものも、同じ bundle を指すものも無い（一覧の失敗・打ち切りは
 ///    確かめられないので残す）
 ///
+/// 最上位が subuid 所有・0700 でホストの実効 uid から開けない木（`flock` 用の open が `EACCES`）は、権限が
+/// `SubordinateIds` のときだけ、3.〜6. を userns の子の中で評価する（親は先にストアを走査して結果だけを渡し、
+/// 子はロックを保持したまま照合から削除まで行う。#2769・`docs/design/image-rootfs-lifetime.md` 決定 H）。
+/// `HostEffectiveIds` では昇格せず `Unverified` で残す。
+///
 /// 別の状態ルート（`--root` 違い）のコンテナが同じ bundle の rootfs を共有する構成は支援しない。core 製の木に
 /// ついては 5. で消さずに残す。通常の create が core 製の木を `root.path` で採用した構成は検出できない
 /// （`docs/design/image-rootfs-lifetime.md`）。Linux 以外は常に `NotPresent`（作成が `Unimplemented`）。
@@ -943,18 +948,43 @@ mod imp {
         }
     }
 
+    /// [`spawn_in_userns`] の失敗（どの段で失敗したかを区別する。呼び出し側が自分の文言・語彙へ写す）。
+    ///
+    /// `Inputs` / `Plan` / `MultiThreaded` / `ForkOther` は fork の前（子は作られず、木に触れていない）。
+    /// `Timeout` / `WaitOther` は fork の後（子が木に触れた可能性がある）。
+    #[derive(Debug)]
+    enum UsernsSpawnError {
+        /// 写像の入力（subuid / subgid の解決）の失敗。
+        Inputs(TraitError),
+        /// 補助の user namespace の計画の失敗。
+        Plan(ErrorCode),
+        /// 呼び出しプロセスがマルチスレッド（fork の検査が拒否）。
+        MultiThreaded,
+        /// マルチスレッド以外の fork の失敗。
+        ForkOther,
+        /// 期限内に子が終わらなかった（kill して回収済み）。
+        Timeout,
+        /// シグナル終了・Timeout 以外の待ちの失敗。
+        WaitOther,
+    }
+
     /// 子プロセスの user namespace（User のみ・holder / mapper 方式。#2374）の中で `child` を実行し、終了コードを返す。
     ///
-    /// seal / publish（#2690）が使う。親は期限つきで待ち、超えたら kill して回収する（REPAIR-5）。呼び出しプロセスが
-    /// マルチスレッドなら fork の検査が拒否する（CRI / tokio 経路の子プロセス方式の配線は #2315 の範囲）。
-    fn run_in_userns(
+    /// seal / publish（#2690）の `run_in_userns`、削除の `userns_run`、孤児の回収の
+    /// `orphan_reap_in_userns`（#2769）が共有する骨格である（REPAIR-1）: 写像の入力の解決 → 計画 →
+    /// 単一スレッドの fork → 子で `isolate_rootless_subordinate`（失敗なら `CHILD_SETUP_FAILED`）→ `child()` →
+    /// 期限つきの待ち。親は期限（写像の書き込みの最大 3 × 期限 + 5 秒 + `work_budget`）を超えたら kill して回収する
+    /// （REPAIR-5）。呼び出しプロセスがマルチスレッドなら fork の検査が拒否する（CRI / tokio 経路の子プロセス方式の
+    /// 配線は #2315 の範囲）。子から親へは終了コードだけを運ぶ。
+    fn spawn_in_userns(
         source: &SubordinateIdSource,
+        work_budget: std::time::Duration,
         child: impl FnOnce() -> i32,
-    ) -> Result<i32, UsernsRunError> {
+    ) -> Result<i32, UsernsSpawnError> {
         let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
         let inputs = source
             .removal_inputs(euid, egid)
-            .map_err(|e| UsernsRunError::Other(e.code()))?;
+            .map_err(UsernsSpawnError::Inputs)?;
         let config = IsolationConfig {
             namespaces: NamespaceSet::empty().with(Namespace::User),
             hostname: None,
@@ -967,7 +997,7 @@ mod imp {
             inputs.writer,
             helper_timeout,
         )
-        .map_err(|e| UsernsRunError::Other(e.code))?;
+        .map_err(|e| UsernsSpawnError::Plan(e.code))?;
         let pid = sys::fork_single_threaded(
             || {
                 if isolate_rootless_subordinate(&plan).is_err() {
@@ -978,18 +1008,32 @@ mod imp {
             CHILD_SETUP_FAILED,
         )
         .map_err(|e| match e {
-            SysError::MultiThreaded => UsernsRunError::MultiThreaded,
-            _ => UsernsRunError::Other(ErrorCode::Internal),
+            SysError::MultiThreaded => UsernsSpawnError::MultiThreaded,
+            _ => UsernsSpawnError::ForkOther,
         })?;
-        let budget =
-            helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_FINALIZE_BUDGET;
+        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
         match wait_forked_child(pid, budget) {
             Ok(ChildExit::Exited(code)) => Ok(code),
-            Err(e) if e.code == ErrorCode::Timeout => Err(UsernsRunError::Timeout),
-            _ => Err(UsernsRunError::Other(ErrorCode::Internal)),
+            Err(e) if e.code == ErrorCode::Timeout => Err(UsernsSpawnError::Timeout),
+            _ => Err(UsernsSpawnError::WaitOther),
         }
     }
 
+    /// seal / publish 用の [`spawn_in_userns`]（失敗を [`UsernsRunError`] の固定語彙へ写す）。
+    fn run_in_userns(
+        source: &SubordinateIdSource,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsRunError> {
+        spawn_in_userns(source, USERNS_FINALIZE_BUDGET, child).map_err(|e| match e {
+            UsernsSpawnError::Inputs(e) => UsernsRunError::Other(e.code()),
+            UsernsSpawnError::Plan(c) => UsernsRunError::Other(c),
+            UsernsSpawnError::MultiThreaded => UsernsRunError::MultiThreaded,
+            UsernsSpawnError::Timeout => UsernsRunError::Timeout,
+            UsernsSpawnError::ForkOther | UsernsSpawnError::WaitOther => {
+                UsernsRunError::Other(ErrorCode::Internal)
+            }
+        })
+    }
     /// userns の中の seal の結果を親の結果へ写す（純関数）。
     fn seal_outcome(run: Result<i32, UsernsRunError>) -> Result<(), TraitError> {
         match run {
@@ -1584,6 +1628,9 @@ mod imp {
         Unverified,
         /// 印の状態ルートの識別子が現在のストアと一致しない・無い（#2635）。
         ForeignStateRoot,
+        /// ホストの実効 uid ではツリーを開けず（EACCES。subuid 所有・0700）ロックを取れなかった。木の
+        /// (dev, ino) を持つ。権限が `SubordinateIds` なら userns の子の中で続きを行う（#2769・SEC-5）。
+        LockDenied((u64, u64)),
         Orphan(Orphan),
     }
 
@@ -1592,6 +1639,38 @@ mod imp {
         identity: (u64, u64),
         token: String,
         _lock: File,
+    }
+
+    /// [`check_marker`] が証拠として認めなかった理由。
+    enum MarkerVerdict {
+        /// 印が無い・形式や所有者・mode が合わない・木の実体と一致しない。
+        Unverified,
+        /// 印の状態ルートの識別子が現在のストアと一致しない・無い（#2635）。
+        ForeignStateRoot,
+    }
+
+    /// 固定した木の fd の印を孤児の証拠として照合する（ホストの `inspect_published` と、userns の子の
+    /// 孤児の回収〔#2769〕が共有する）。
+    ///
+    /// 印は v2 以降（同一性つき）で、木の実体 `identity` と一致するものだけを証拠にする（v1 や複製された印は
+    /// 残す）。状態ルートの識別子が `expected_scope` と一致する木だけを候補にする（別の状態ルートのコンテナが
+    /// 使う rootfs は、このストアの一覧に見えないだけで孤児ではない。v2・識別子の無いストアも残す。#2635）。
+    /// userns の子の中でも「所有者が実効 uid」の厳格照合は同じ意味を保つ: 補助の userns はコンテナ 0 を
+    /// ホストの実効 uid に写すので、ホストの実効 uid 所有の印は uid 0 に見え、`geteuid` も 0 を返す。
+    /// subuid 所有の偽の印は 1 以上（写像外なら overflowuid）に見えて拒否される。
+    fn check_marker(
+        dir: BorrowedFd<'_>,
+        identity: (u64, u64),
+        expected_scope: Option<&str>,
+    ) -> Result<Marker, MarkerVerdict> {
+        let marker = read_marker(dir, true).ok_or(MarkerVerdict::Unverified)?;
+        if marker.identity != Some(identity) {
+            return Err(MarkerVerdict::Unverified);
+        }
+        if !matches!((marker.scope.as_deref(), expected_scope), (Some(m), Some(e)) if m == e) {
+            return Err(MarkerVerdict::ForeignStateRoot);
+        }
+        Ok(marker)
     }
 
     /// 親 `cur`（固定済みの fd）の下の最終の名前 `cname` が、孤児の条件（[`super::reap_published_orphan`] の
@@ -1617,8 +1696,11 @@ mod imp {
         if mount_id(cur) != Some(mnt) {
             return Probe::Unverified;
         }
-        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-            return Probe::Unverified;
+        let lock = match File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+            Ok(lock) => lock,
+            // 最上位が subuid 所有・0700 の木はホストの uid では開けない。続きは呼び出し側が判断する。
+            Err(e) if e.raw_os_error() == Some(sys::EACCES) => return Probe::LockDenied(identity),
+            Err(_) => return Probe::Unverified,
         };
         match lock.try_lock() {
             Ok(()) => {}
@@ -1633,18 +1715,11 @@ mod imp {
             Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
             Err(_) => return Probe::Unverified,
         }
-        // 印は v2 以降（同一性つき）で、木の実体と一致するものだけを証拠にする。v1 や複製された印は残す。
-        let Some(marker) = read_marker(fd.as_fd(), true) else {
-            return Probe::Unverified;
+        let marker = match check_marker(fd.as_fd(), identity, expected_scope) {
+            Ok(m) => m,
+            Err(MarkerVerdict::Unverified) => return Probe::Unverified,
+            Err(MarkerVerdict::ForeignStateRoot) => return Probe::ForeignStateRoot,
         };
-        if marker.identity != Some(identity) {
-            return Probe::Unverified;
-        }
-        // 状態ルートの識別子が現在のストアと一致する木だけを孤児の候補にする（別の状態ルートのコンテナが
-        // 使う rootfs は、このストアの一覧に見えないだけで孤児ではない。v2・識別子の無いストアも残す。#2635）。
-        if !matches!((marker.scope.as_deref(), expected_scope), (Some(m), Some(e)) if m == e) {
-            return Probe::ForeignStateRoot;
-        }
         Probe::Orphan(Orphan {
             identity,
             token: marker.token,
@@ -1652,11 +1727,33 @@ mod imp {
         })
     }
 
-    /// `store` の全レコードを調べ、印のトークンを持つもの・同じ bundle を指すものがあるか。
+    /// `store` の走査結果（孤児の判定の材料）。
+    struct StoreRefs {
+        /// 同じ bundle（同じ実体を含む）を指すレコードがある。
+        bundle_referenced: bool,
+        /// 全レコードの rootfs の印のトークン（`bundle_referenced` で打ち切ったときは途中まで）。
+        /// 件数は `ORPHAN_SCAN_MAX_PAGES × ORPHAN_SCAN_PAGE_SIZE` 件（10 万）が上限で、トークンは 32 文字。
+        tokens: Vec<String>,
+    }
+
+    impl StoreRefs {
+        fn references(&self, token: &str) -> bool {
+            self.bundle_referenced || self.tokens.iter().any(|t| t == token)
+        }
+    }
+
+    /// `store` の全レコードを調べ、同じ bundle を指すものと印のトークンの一覧を集める。
     /// 一覧の失敗・ページ数の上限超過・bundle の同一性を確かめられない場合は `None`（不明。呼び出し側は残す）。
-    fn store_references(store: &dyn StateStore, bundle: &Path, token: &str) -> Option<bool> {
+    ///
+    /// userns の子は `store` に触れない（`@lock` を持つファイルストアや plugin 実装に子の触れる範囲を
+    /// 広げない）ため、親がこの関数で先に走査し、結果だけを子へ渡す（#2769）。
+    fn scan_store_refs(store: &dyn StateStore, bundle: &Path) -> Option<StoreRefs> {
         let bundle_meta = std::fs::metadata(bundle).ok()?;
         let page_size = std::num::NonZeroU32::new(ORPHAN_SCAN_PAGE_SIZE)?;
+        let mut refs = StoreRefs {
+            bundle_referenced: false,
+            tokens: Vec::new(),
+        };
         let mut cursor = None;
         for _ in 0..ORPHAN_SCAN_MAX_PAGES {
             let mut req = ListStateRequest::new(page_size).ok()?;
@@ -1665,15 +1762,17 @@ mod imp {
             }
             let page = store.list(&req).ok()?;
             for rec in page.records() {
-                if rec.image_rootfs().and_then(ImageRootfsRecord::token) == Some(token) {
-                    return Some(true);
+                if let Some(t) = rec.image_rootfs().and_then(ImageRootfsRecord::token) {
+                    refs.tokens.push(t.to_owned());
                 }
                 if rec.bundle() == bundle {
-                    return Some(true);
+                    refs.bundle_referenced = true;
+                    return Some(refs);
                 }
                 match std::fs::metadata(rec.bundle()) {
                     Ok(m) if (m.dev(), m.ino()) == (bundle_meta.dev(), bundle_meta.ino()) => {
-                        return Some(true);
+                        refs.bundle_referenced = true;
+                        return Some(refs);
                     }
                     Ok(_) => {}
                     // 相手の bundle が無ければ別物。それ以外の失敗は判定不能として残す。
@@ -1682,13 +1781,87 @@ mod imp {
                 }
             }
             match page.next_cursor() {
-                None => return Some(false),
+                None => return Some(refs),
                 Some(c) => cursor = Some(c.clone()),
             }
         }
         None
     }
 
+    // userns の子（孤児の回収）の終了コード。削除 10〜16・publish 20〜24・seal 30〜34 と重ねない。
+    const CHILD_MARKER_UNVERIFIED: i32 = 17;
+    const CHILD_FOREIGN_STATE_ROOT: i32 = 18;
+    const CHILD_REFERENCED: i32 = 19;
+
+    /// 孤児の回収の子の終了コードを [`OrphanReap`] へ写す（純関数）。
+    ///
+    /// fork の前の失敗（木に触れていない）は `Unverified`、fork の後の失敗（子が削除の途中まで進んだ可能性が
+    /// ある）は `Failed`。確かめられないものはすべて残す側（OCI-7）。
+    fn orphan_outcome(run: Result<i32, UsernsSpawnError>) -> OrphanReap {
+        match run {
+            Ok(CHILD_REMOVED) => OrphanReap::Reclaimed,
+            Ok(CHILD_NOT_PRESENT) => OrphanReap::NotPresent,
+            Ok(CHILD_ALIVE) => OrphanReap::Alive,
+            Ok(CHILD_LOCK_ERROR | CHILD_IDENTITY | CHILD_MARKER_UNVERIFIED | CHILD_REFERENCED) => {
+                OrphanReap::Unverified
+            }
+            Ok(CHILD_FOREIGN_STATE_ROOT) => OrphanReap::ForeignStateRoot,
+            Ok(_) => OrphanReap::Failed,
+            Err(
+                UsernsSpawnError::Inputs(_)
+                | UsernsSpawnError::Plan(_)
+                | UsernsSpawnError::MultiThreaded
+                | UsernsSpawnError::ForkOther,
+            ) => OrphanReap::Unverified,
+            Err(UsernsSpawnError::Timeout | UsernsSpawnError::WaitOther) => OrphanReap::Failed,
+        }
+    }
+
+    /// ホストの実効 uid ではロックを取れない subuid 所有・0700 の公開済みの木を、userns の子の中で
+    /// 孤児と確かめて回収する（#2769・OCI-7・SEC-5）。
+    ///
+    /// 呼び出し元は `BundleLock` を保持している。親は先に `store` を走査して結果だけを子へ渡し、参照が
+    /// ある・走査できないなら fork せずに残す。子は `lock_and_recheck` でロックを取り、そのまま保持して
+    /// 印の照合（`check_marker`）→ トークンの参照確認 → 削除（`remove_tree_at` が印を再照合）まで行う。
+    /// 子から親へは終了コードだけを運ぶ。
+    fn orphan_reap_in_userns(
+        source: &SubordinateIdSource,
+        store: &dyn StateStore,
+        bundle: &Path,
+        cur: BorrowedFd<'_>,
+        cname: &CString,
+        identity: (u64, u64),
+        expected_scope: Option<&str>,
+    ) -> OrphanReap {
+        let Some(refs) = scan_store_refs(store, bundle) else {
+            return OrphanReap::Unverified;
+        };
+        if refs.bundle_referenced {
+            return OrphanReap::Unverified;
+        }
+        let run = spawn_in_userns(source, USERNS_REMOVE_BUDGET, || {
+            let locked = match lock_and_recheck(cur, cname, identity) {
+                Ok(l) => l,
+                Err(f) => return f.code(),
+            };
+            let marker = match check_marker(locked.dir.as_fd(), identity, expected_scope) {
+                Ok(m) => m,
+                Err(MarkerVerdict::Unverified) => return CHILD_MARKER_UNVERIFIED,
+                Err(MarkerVerdict::ForeignStateRoot) => return CHILD_FOREIGN_STATE_ROOT,
+            };
+            if refs.references(&marker.token) {
+                return CHILD_REFERENCED;
+            }
+            // ロック（`locked`）は削除が終わるまで保持する。
+            remove_exit_code(remove_tree_at(
+                cur,
+                cname,
+                identity,
+                Owner::Token(Some(&marker.token)),
+            ))
+        });
+        orphan_outcome(run)
+    }
     pub(super) fn reap_published_orphan(
         store: &dyn StateStore,
         bundle: &Path,
@@ -1726,10 +1899,26 @@ mod imp {
             Probe::Alive => return OrphanReap::Alive,
             Probe::Unverified => return OrphanReap::Unverified,
             Probe::ForeignStateRoot => return OrphanReap::ForeignStateRoot,
+            // 暗黙に昇格しない: 権限が `SubordinateIds` のときだけ userns の子で続ける（#2769）。
+            Probe::LockDenied(identity) => {
+                return match privilege {
+                    ImageRootfsPrivilege::SubordinateIds(source) => orphan_reap_in_userns(
+                        source,
+                        store,
+                        bundle,
+                        cur.as_fd(),
+                        &cname,
+                        identity,
+                        expected_scope.as_deref(),
+                    ),
+                    _ => OrphanReap::Unverified,
+                };
+            }
             Probe::Orphan(o) => o,
         };
-        if store_references(store, bundle, &orphan.token) != Some(false) {
-            return OrphanReap::Unverified;
+        match scan_store_refs(store, bundle) {
+            Some(refs) if !refs.references(&orphan.token) => {}
+            _ => return OrphanReap::Unverified,
         }
         match remove_tree_priv(
             privilege,
@@ -1990,6 +2179,108 @@ mod imp {
         }
     }
 
+    /// 子の中でロックを取り直した結果の失敗（終了コードへ写す）。
+    enum ChildLockFail {
+        Alive,
+        LockError,
+        Identity,
+        Gone,
+    }
+
+    impl ChildLockFail {
+        fn code(self) -> i32 {
+            match self {
+                Self::Alive => CHILD_ALIVE,
+                Self::LockError => CHILD_LOCK_ERROR,
+                Self::Identity => CHILD_IDENTITY,
+                Self::Gone => CHILD_NOT_PRESENT,
+            }
+        }
+    }
+
+    /// 子が保持するロックと、同一性を再確認した木の fd（ロックは保持している間だけ有効）。
+    struct ChildLocked {
+        _lock: File,
+        dir: OwnedFd,
+    }
+
+    /// userns の子の中で、`name` の木に `flock` を取り、名前から開き直した実体の (dev, ino) が `identity` と
+    /// 一致することを確かめる（ホストの uid では開けない 0700 の木用。#2540・#2769）。
+    ///
+    /// 削除の `lock_in_child` と孤児の回収の子が共有する。ホスト側の `reap_one` / `inspect_published` の
+    /// ロック処理とは別に保つ（挙動の差があるため）。
+    fn lock_and_recheck(
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+    ) -> Result<ChildLocked, ChildLockFail> {
+        let fd = sys::open_dir_path_nofollow(Some(parent), name)
+            .map_err(|_| ChildLockFail::LockError)?;
+        let lock = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .map_err(|_| ChildLockFail::LockError)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(ChildLockFail::Alive),
+            Err(_) => return Err(ChildLockFail::LockError),
+        }
+        match sys::open_dir_path_nofollow(Some(parent), name) {
+            Ok(again) => match fstat(again.as_fd()) {
+                Ok((dev, ino, true, _)) if (dev, ino) == identity => Ok(ChildLocked {
+                    _lock: lock,
+                    dir: again,
+                }),
+                _ => Err(ChildLockFail::Identity),
+            },
+            Err(SysError::Os(n)) if n == sys::ENOENT => Err(ChildLockFail::Gone),
+            Err(_) => Err(ChildLockFail::Identity),
+        }
+    }
+
+    /// `remove_tree_at` の結果を userns の子の終了コードへ写す。
+    fn remove_exit_code(result: Result<RecordedRootfsRemoval, TraitError>) -> i32 {
+        match result {
+            Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
+            Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
+            Err(_) => CHILD_FAILED,
+        }
+    }
+
+    /// 削除側の [`spawn_in_userns`] の失敗を、従来の文言・コードの [`TraitError`] へ写す（純関数）。
+    fn removal_spawn_error(e: UsernsSpawnError) -> TraitError {
+        let unavailable = |code: ErrorCode| {
+            TraitError::new(
+                code,
+                "cannot remove a subordinate-owned rootfs in a user namespace",
+            )
+        };
+        match e {
+            UsernsSpawnError::Inputs(e) => e,
+            UsernsSpawnError::Plan(c) => unavailable(c),
+            UsernsSpawnError::MultiThreaded => unavailable(ErrorCode::FailedPrecondition),
+            UsernsSpawnError::ForkOther => unavailable(ErrorCode::Internal),
+            UsernsSpawnError::Timeout => TraitError::new(
+                ErrorCode::Timeout,
+                "removing a subordinate-owned rootfs timed out",
+            ),
+            UsernsSpawnError::WaitOther => remove_failed(),
+        }
+    }
+
+    /// 削除側の子の終了コードを結果へ写す（純関数）。`lock_in_child` のときだけ
+    /// `Alive` / `LockError` / `Identity` が出る。
+    fn removal_outcome(code: i32, lock_in_child: bool) -> Result<UsernsOutcome, TraitError> {
+        match code {
+            CHILD_REMOVED => Ok(UsernsOutcome::Removed),
+            CHILD_NOT_PRESENT => Ok(UsernsOutcome::NotPresent),
+            CHILD_ALIVE if lock_in_child => Ok(UsernsOutcome::Alive),
+            CHILD_LOCK_ERROR if lock_in_child => Ok(UsernsOutcome::LockError),
+            CHILD_IDENTITY if lock_in_child => Ok(UsernsOutcome::Identity),
+            CHILD_REFUSED => Err(refuse()),
+            _ => Err(remove_failed()),
+        }
+    }
+
     /// [`remove_tree_in_userns`] の本体。`lock_in_child` なら、子が userns に入った後で木に `flock` を取り、
     /// 名前から開き直した実体の同一性を再確認してから削除する（ホストの uid では開けない 0700 の木用）。
     fn userns_run(
@@ -2000,88 +2291,20 @@ mod imp {
         owner: Owner<'_>,
         lock_in_child: bool,
     ) -> Result<UsernsOutcome, TraitError> {
-        let unavailable = |code: ErrorCode| {
-            TraitError::new(
-                code,
-                "cannot remove a subordinate-owned rootfs in a user namespace",
-            )
-        };
-        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
-        let inputs = source.removal_inputs(euid, egid)?;
-        let config = IsolationConfig {
-            namespaces: NamespaceSet::empty().with(Namespace::User),
-            hostname: None,
-        };
-        let helper_timeout = inputs.timeout;
-        let plan = plan_rootless_subordinate(
-            &config,
-            inputs.uid,
-            inputs.gid,
-            inputs.writer,
-            helper_timeout,
-        )
-        .map_err(|e| unavailable(e.code))?;
-        let pid = sys::fork_single_threaded(
-            || {
-                if isolate_rootless_subordinate(&plan).is_err() {
-                    return CHILD_SETUP_FAILED;
+        let code = spawn_in_userns(source, USERNS_REMOVE_BUDGET, || {
+            // ロックは子の終了（`_exit`）まで保持する。
+            let _locked;
+            if lock_in_child {
+                match lock_and_recheck(parent, name, identity) {
+                    Ok(l) => _locked = l,
+                    Err(f) => return f.code(),
                 }
-                // ロックは子の終了（`_exit`）まで保持する。
-                let _lock;
-                if lock_in_child {
-                    let Ok(fd) = sys::open_dir_path_nofollow(Some(parent), name) else {
-                        return CHILD_LOCK_ERROR;
-                    };
-                    let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-                        return CHILD_LOCK_ERROR;
-                    };
-                    match lock.try_lock() {
-                        Ok(()) => {}
-                        Err(std::fs::TryLockError::WouldBlock) => return CHILD_ALIVE,
-                        Err(_) => return CHILD_LOCK_ERROR,
-                    }
-                    _lock = lock;
-                    match sys::open_dir_path_nofollow(Some(parent), name) {
-                        Ok(again) => match fstat(again.as_fd()) {
-                            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
-                            _ => return CHILD_IDENTITY,
-                        },
-                        Err(SysError::Os(n)) if n == sys::ENOENT => return CHILD_NOT_PRESENT,
-                        Err(_) => return CHILD_IDENTITY,
-                    }
-                }
-                match remove_tree_at(parent, name, identity, owner) {
-                    Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
-                    Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
-                    Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
-                    Err(_) => CHILD_FAILED,
-                }
-            },
-            CHILD_SETUP_FAILED,
-        )
-        .map_err(|e| match e {
-            SysError::MultiThreaded => unavailable(ErrorCode::FailedPrecondition),
-            _ => unavailable(ErrorCode::Internal),
-        })?;
-        // 写像の書き込み（holder の待ちを含む最大 3 × 期限 + 5 秒）と削除の予算を合わせた期限。
-        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_REMOVE_BUDGET;
-        match wait_forked_child(pid, budget) {
-            Ok(ChildExit::Exited(CHILD_REMOVED)) => Ok(UsernsOutcome::Removed),
-            Ok(ChildExit::Exited(CHILD_NOT_PRESENT)) => Ok(UsernsOutcome::NotPresent),
-            Ok(ChildExit::Exited(CHILD_ALIVE)) if lock_in_child => Ok(UsernsOutcome::Alive),
-            Ok(ChildExit::Exited(CHILD_LOCK_ERROR)) if lock_in_child => {
-                Ok(UsernsOutcome::LockError)
             }
-            Ok(ChildExit::Exited(CHILD_IDENTITY)) if lock_in_child => Ok(UsernsOutcome::Identity),
-            Ok(ChildExit::Exited(CHILD_REFUSED)) => Err(refuse()),
-            Err(e) if e.code == ErrorCode::Timeout => Err(TraitError::new(
-                ErrorCode::Timeout,
-                "removing a subordinate-owned rootfs timed out",
-            )),
-            _ => Err(remove_failed()),
-        }
+            remove_exit_code(remove_tree_at(parent, name, identity, owner))
+        })
+        .map_err(removal_spawn_error)?;
+        removal_outcome(code, lock_in_child)
     }
-
     /// 展開途中の木の所有者として受ける uid（実効 uid。権限が `SubordinateIds` なら subuid の範囲も）。
     struct OwnerPolicy {
         euid: u32,
@@ -2424,6 +2647,147 @@ mod imp {
             assert_eq!(r.expect_err("unknown").code(), ErrorCode::Internal);
             let (_, r) = publish_outcome(Err(UsernsRunError::MultiThreaded), false);
             assert_eq!(r.expect_err("mt").code(), ErrorCode::FailedPrecondition);
+        }
+    }
+
+    /// OCI-7・SEC-5・REPAIR-1・#2769: userns 実行の骨格の共通化後も、削除側の文言・終了コードの写し方が
+    /// 変わらないこと、孤児の回収の子の終了コードの写し方。
+    #[cfg(test)]
+    mod userns_tests {
+        use super::*;
+
+        fn err(code: ErrorCode, message: &str) -> TraitError {
+            TraitError::new(code, message)
+        }
+
+        #[test]
+        fn remove_outcome_maps_every_exit_code() {
+            assert!(matches!(
+                removal_outcome(CHILD_REMOVED, false),
+                Ok(UsernsOutcome::Removed)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_NOT_PRESENT, false),
+                Ok(UsernsOutcome::NotPresent)
+            ));
+            for lock in [false, true] {
+                assert_eq!(
+                    removal_outcome(CHILD_REFUSED, lock).err(),
+                    Some(err(
+                        ErrorCode::FailedPrecondition,
+                        "rootfs was replaced; refusing to remove"
+                    ))
+                );
+                for code in [CHILD_FAILED, CHILD_SETUP_FAILED, 99, 125] {
+                    assert_eq!(
+                        removal_outcome(code, lock).err(),
+                        Some(err(ErrorCode::Internal, "failed to remove rootfs"))
+                    );
+                }
+            }
+            assert!(matches!(
+                removal_outcome(CHILD_ALIVE, true),
+                Ok(UsernsOutcome::Alive)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_LOCK_ERROR, true),
+                Ok(UsernsOutcome::LockError)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_IDENTITY, true),
+                Ok(UsernsOutcome::Identity)
+            ));
+            // lock_in_child でないときのロック系の終了コードは削除の失敗として扱う。
+            for code in [CHILD_ALIVE, CHILD_LOCK_ERROR, CHILD_IDENTITY] {
+                assert_eq!(
+                    removal_outcome(code, false).err(),
+                    Some(err(ErrorCode::Internal, "failed to remove rootfs"))
+                );
+            }
+        }
+
+        #[test]
+        fn remove_spawn_error_keeps_wording() {
+            let unavailable = "cannot remove a subordinate-owned rootfs in a user namespace";
+            let inputs = err(ErrorCode::NotFound, "no subordinate ids");
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Inputs(inputs.clone())),
+                inputs
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Plan(ErrorCode::Unavailable)),
+                err(ErrorCode::Unavailable, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::MultiThreaded),
+                err(ErrorCode::FailedPrecondition, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::ForkOther),
+                err(ErrorCode::Internal, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Timeout),
+                err(
+                    ErrorCode::Timeout,
+                    "removing a subordinate-owned rootfs timed out"
+                )
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::WaitOther),
+                err(ErrorCode::Internal, "failed to remove rootfs")
+            );
+        }
+
+        #[test]
+        fn orphan_outcome_maps_every_exit_code() {
+            assert_eq!(orphan_outcome(Ok(CHILD_REMOVED)), OrphanReap::Reclaimed);
+            assert_eq!(
+                orphan_outcome(Ok(CHILD_NOT_PRESENT)),
+                OrphanReap::NotPresent
+            );
+            assert_eq!(orphan_outcome(Ok(CHILD_ALIVE)), OrphanReap::Alive);
+            for code in [
+                CHILD_LOCK_ERROR,
+                CHILD_IDENTITY,
+                CHILD_MARKER_UNVERIFIED,
+                CHILD_REFERENCED,
+            ] {
+                assert_eq!(orphan_outcome(Ok(code)), OrphanReap::Unverified);
+            }
+            assert_eq!(
+                orphan_outcome(Ok(CHILD_FOREIGN_STATE_ROOT)),
+                OrphanReap::ForeignStateRoot
+            );
+            for code in [CHILD_REFUSED, CHILD_FAILED, CHILD_SETUP_FAILED, 99] {
+                assert_eq!(orphan_outcome(Ok(code)), OrphanReap::Failed);
+            }
+            // fork の前の失敗は木に触れていないので Unverified、後の失敗は Failed。
+            for e in [
+                UsernsSpawnError::Inputs(err(ErrorCode::NotFound, "x")),
+                UsernsSpawnError::Plan(ErrorCode::Internal),
+                UsernsSpawnError::MultiThreaded,
+                UsernsSpawnError::ForkOther,
+            ] {
+                assert_eq!(orphan_outcome(Err(e)), OrphanReap::Unverified);
+            }
+            for e in [UsernsSpawnError::Timeout, UsernsSpawnError::WaitOther] {
+                assert_eq!(orphan_outcome(Err(e)), OrphanReap::Failed);
+            }
+        }
+
+        #[test]
+        fn orphan_child_exit_codes_do_not_overlap_existing_ones() {
+            let orphan = [
+                CHILD_MARKER_UNVERIFIED,
+                CHILD_FOREIGN_STATE_ROOT,
+                CHILD_REFERENCED,
+            ];
+            assert_eq!(orphan, [17, 18, 19]);
+            for code in orphan {
+                assert!(![CHILD_REMOVED, 10, 11, 12, 13, 14, 15, 16].contains(&code));
+                assert!(!(20..=24).contains(&code) && !(30..=34).contains(&code));
+            }
         }
     }
 }

@@ -171,6 +171,7 @@ pub enum GroupKillState {
 pub const HELPER_GROUP_KILL_MIN_KERNEL: (u32, u32) = (6, 9);
 
 /// `osrelease` の本文から (major, minor) を取る。解釈できなければ `None`。
+#[cfg(any(target_os = "linux", test))]
 fn parse_kernel_release(text: &str) -> Option<(u32, u32)> {
     let (major, rest) = text.trim().split_once('.')?;
     let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -178,6 +179,7 @@ fn parse_kernel_release(text: &str) -> Option<(u32, u32)> {
 }
 
 /// 版の本文から状態を得る。
+#[cfg(any(target_os = "linux", test))]
 fn kernel_release_state(text: Option<&str>) -> KernelReleaseState {
     match text.and_then(parse_kernel_release) {
         None => KernelReleaseState::Unknown,

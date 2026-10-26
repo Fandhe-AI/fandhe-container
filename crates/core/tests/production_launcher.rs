@@ -122,6 +122,10 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/production_launcher-XXXX> --ignored
 //! ```
 //!
+//! 前提（委譲 cgroup・範囲写像の `USER`・`uidmap`・subuid / subgid の自ユーザー行）の欠如は、1 行目
+//! `production_launcher: PRECONDITION FAILED (test environment, not a cgroup delegation regression)` /
+//! `(... not a subordinate id mapping regression)` で失敗する（分類は `tests/support/precondition.rs`。#2888・REPAIR-12）。
+//!
 //! シナリオ I（範囲写像）は `uidmap` パッケージ（`/usr/bin/newuidmap`・`/usr/bin/newgidmap`）と `/etc/subuid`・
 //! `/etc/subgid` の自ユーザー行が要るため、`FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けた時だけ実行する。実行時は成功行の前に
 //! `production_launcher: subordinate id mapping verified (uid extents=N, gid extents=M)` を出す。
@@ -170,6 +174,7 @@ fn main() {
     }
     // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
     linux::self_check_precondition();
+    real_entry::precondition::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -216,7 +221,7 @@ mod linux {
         AUDIT_LOG_FILE_NAME, AuditLayer, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
     };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
-    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup};
     use fandhe_container_core::exec::{
         EscapeSyscallProbe, IsolationPrivilege, ProbeOutcome, SeccompProbeRecord,
         escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
@@ -1026,7 +1031,12 @@ mod linux {
 
     pub fn run() {
         let root = is_root();
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup v2");
+        // 前提（委譲 cgroup・範囲写像の helper ケースの `uidmap`・subuid / subgid・`USER`）の欠如は、回帰と見分けられる
+        // `PRECONDITION FAILED` の 1 行目で失敗させる（#2888・REPAIR-12）。失敗の範囲は変えない。
+        let delegated = real_entry::precondition::delegated_cgroup();
+        if subordinate_requested() && !root {
+            real_entry::precondition::require_subordinate_ids(own_ids().0);
+        }
         let tag = std::process::id();
         let cg_id = ContainerId::new(format!("pl{tag}")).expect("container id");
         let cg_name = CgroupName::new(&cg_id).expect("cgroup name");

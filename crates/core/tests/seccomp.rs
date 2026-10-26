@@ -292,6 +292,8 @@ fn main() {
     if std::env::args().any(|a| a == "--entry") {
         linux::entry_main();
     }
+    // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。出力はしない。#2888）。
+    real_entry::precondition::self_check();
     // シナリオ再入時は常に走る部分を繰り返さない。
     if std::env::args().any(|a| a == "--scenario") {
         linux::run();

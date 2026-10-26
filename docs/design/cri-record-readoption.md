@@ -71,12 +71,24 @@
 | 確定（Created/Running/Exited） | Present | core の status へ写す（Running→running、Stopped→exited、Created→created）。終了コードは記録の値、無ければ不明（reason 空） |
 | 確定 | Absent | exited＋unknown 扱い（記録は保持。Remove で解放。bundle の release は Remove 時） |
 | `in_flight=create` | Absent | create は完了していない。記録を削除し、自分が作った bundle（`.cri/bundles/<id>`）を release |
-| `in_flight=create` | Present | `CONTAINER_UNKNOWN` で保持（Remove が core の delete 経由で回収。再 Start は拒否） |
+| `in_flight=create` | Present | `CONTAINER_UNKNOWN` で保持し `runtime_owned=true` に復元する（Remove が core の delete 経由で回収。再 Start は拒否） |
 | `in_flight=start/stop` | Present | core の status へ写す。Running なら running |
 | `in_flight=remove` | Present/Absent | Remove の続き待ちとして unknown で保持（kubelet の再試行で完了） |
 | 任意 | Undetermined | `CONTAINER_UNKNOWN` で保持（fail-closed。何も消さない） |
 
-- sandbox の状態は再採用時に必ず `SANDBOX_NOTREADY` にする（保持役は再起動で終了しているため。要確認事項 1 の (b)）。`network_owned`・`network_pending` は保持し、Stop/Remove で回収を試みる
+- `runtime_owned`（Stop/Remove が core の呼び出しに進むかを決める既存のフラグ。true のときだけ core の `stop`/`delete` を呼ぶ）は記録に書かず、再採用時に次の規則で導く。`in_flight=create` の記録は core の `create` より前に書かれるため、復元した値をそのまま使うと false になり、kubelet の Remove が core の `delete` を呼ばずに CRI の記録だけを消して core の資源が回収不能になる
+  - core が Present: 状態や `in_flight` の種別を問わず true（`in_flight=create` を含む）。Stop/Remove は core の `stop`/`delete` に進む
+  - core が Absent: `in_flight=create` は上表のとおり記録を破棄するので登録しない。確定の記録は exited＋unknown で保持し false（core に呼ぶ先が無い。Remove は CRI の記録と bundle の解放だけを行う）
+  - core が Undetermined: true（fail-closed。Stop/Remove は core 側の応答に委ね、CRI の記録だけを先に消さない）
+  - 試験で、`in_flight=create` かつ Present の復元後に Remove が core の `delete` を 1 回呼ぶこと、Absent では呼ばないことを固定する
+- sandbox の状態は再採用時に必ず `SANDBOX_NOTREADY` にする（保持役は再起動で終了しているため。要確認事項 1 の (b)）。`network_owned`・`network_pending` は保持し、Stop/Remove で回収を試みる。ただし `pending` の sandbox 記録は次の規則で先に解決する
+- `pending` の sandbox 記録（`RunPodSandbox` が保持役の起動と `set_up` の前に書いたまま確定しなかったもの）: sandbox には core の `StateStore` の行が無く、Present/Absent では副作用の前に落ちたのか `set_up` の後に落ちたのかを見分けられない。そこで起動時の読み込みの一部として次の順で扱う（Stop/Remove の入口ではなく受付前に 1 回だけ。CORE-1）
+  1. 記録に保持役の素性（pid・starttime・ns の dev:ino）と `pod_netns` が書かれていれば、実在を所有確認で調べる。pid からパスやシグナル先を作らない（前節）。確認の対象は、固定の置き場から導いた netns と、所有記録と照合できる資源だけ
+  2. 所有確認で資源の実在を証明できなければ（副作用の前に落ちたとみなせる）、記録を破棄する（`pending` の記録ファイルを消し、登録しない）。`network_pending` も一緒に消える
+  3. 資源の実在を証明できた場合は、`ready` へは昇格させない（保持役が再起動で終了しており、再採用後は常に `SANDBOX_NOTREADY`）。`NOTREADY` で登録し、`network_pending` を解除した上で `network_owned` を保持する。Stop/Remove が `tear_down` と取り残しの回収（ネットワーク資源の節）を試みる。これが、`set_up` の worker が既に無いのに `network_pending` が残って Stop/Remove が永久にブロックされる事態を防ぐ
+  4. 判定不能（所有確認が期限内に終わらない・I/O エラー・素性が部分的にしか読めない）は fail-closed: 記録を消さず、`network_pending` を解除して `NOTREADY` で登録し、Stop/Remove で回収を試みる。回収できない分は固定文言の `FailedPrecondition` で手動回収と知らせる（何も勝手に消さない）
+  - どの分岐でも、再採用後に `network_pending` を持つ sandbox を残さない（`set_up` の担い手が再起動で失われるため、解除の主体は読み込み時の照合だけ）
+  - 試験で、`pending` ＋資源なし→破棄、`pending` ＋資源あり→`NOTREADY` で `network_pending` なし、判定不能→`NOTREADY` で保持、のそれぞれの後に Stop/Remove が完了または固定文言の失敗で返りブロックしないことを固定する
 - 壊れた記録（復号失敗・ファイル名と ID の不一致・上限超過・親 sandbox なし）は、ファイルを消さず登録もしない。失敗件数を記録器（`cri.record_store_load`）と固定語彙の stderr 1 行に出す（ID・パスは出さない）。手動回収の手順は `docs/setup/cri-record-recovery.md`（実装単位 R10）に置く
 - core に状態があるが CRI 記録の無いコンテナは触らない（CLI と状態ルートを共有するため所有を証明できない）
 - 孤児 bundle（`.cri/bundles/<id>` で CRI 記録が無く core が Absent〔`NotFound` だけ〕）は、インスタンスロックの下でだけ回収する。Undetermined は残す

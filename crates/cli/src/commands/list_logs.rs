@@ -111,7 +111,7 @@ use fandhe_container_supervisor::logs::{
 };
 
 use super::CliExit;
-use super::args::{GlobalArgs, ListArgs, LogStreamArg, LogsArgs};
+use super::args::{GlobalArgs, InspectArgs, ListArgs, LogStreamArg, LogsArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime};
 
 /// list の固定ヘッダ行（LF 終端）。
@@ -346,6 +346,40 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Wr
     record_op(
         &rt.recorder,
         "logs",
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
+}
+
+/// `inspect` の本体(CLI-1・SUP-11・#2775)。supervisor の `inspect::inspect` が整形した 1 行の JSON(末尾 LF)を
+/// stdout へそのまま書く(2 つ目の整形を持たない。REPAIR-1)。状態は書き換えない。
+///
+/// 失敗は構造化エラー(不在は `NOT_FOUND`、書き込み失敗は `INTERNAL`)。出力は部分的に作らない(整形は書き込み前に完了する)。
+pub(super) fn run_inspect(
+    global: &GlobalArgs,
+    args: &InspectArgs,
+    stdout: &mut dyn Write,
+) -> CliExit {
+    let started = Instant::now();
+    let prepared = production_runtime(global, OpRecorder::new(), "inspect", started, || {
+        ContainerId::new(args.id.as_str())
+    });
+    let (rt, id) = match prepared {
+        Ok(v) => v,
+        Err(e) => return store_open_failure(&e),
+    };
+    let exit = match fandhe_container_supervisor::inspect::inspect(rt.store.as_ref(), &id) {
+        Err(e) => CliExit::failed(e.code()),
+        Ok(report) => match report.write_json(stdout).and_then(|()| stdout.flush()) {
+            Ok(()) => CliExit::Success,
+            Err(_) => CliExit::failed(ErrorCode::Internal),
+        },
+    };
+    record_op(
+        &rt.recorder,
+        "inspect",
         matches!(exit, CliExit::Success),
         started,
     );

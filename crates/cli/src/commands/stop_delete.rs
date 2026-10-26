@@ -6,7 +6,10 @@
 //! `create_start::production_runtime` を共用する。
 //!
 //! 設計判断（fail-closed）:
-//! - `stop` は core の `kill` に `SIGTERM` で写像する。core に stop（猶予 → SIGKILL）は無い。
+//! - `stop` は core の `kill` に写像する。シグナルは既定 `SIGTERM`、`--signal <名前|番号>`(Docker の表記。core の
+//!   `Signal::parse_notation` で解釈。CRI と共有する語彙。不正値・範囲外は `INVALID_ARGUMENT`。CLI-1・ERR-1・#2775)で
+//!   上書きできる。core に stop（猶予 → SIGKILL）は無い(#1545)。残余(REPAIR-3): `SIGSTOP`・`SIGCONT`・`SIGCHLD`・`SIGWINCH`
+//!   など終了させないシグナルでも明示 stop の意図は記録され、後の自然終了で再起動されない。
 //! - 本番の [`ProcessSignaler`] は [`production_stop_signaler`] が返す supervisor の `ControlSignaler`
 //!   （`<state_root>/<id>/supervisor.sock` の制御チャネル。#2059）で、supervisor が保持する起動ハンドルへ
 //!   シグナルを渡す。supervisor に届かない・期限切れ・接続元の検証で拒否・pid 不一致のときは ERR-2 の構造化エラー
@@ -123,11 +126,18 @@ use fandhe_container_supervisor::supervisor_log::{
     SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
 };
 
-/// ID を core の型で検証し、`SIGTERM` の kill 要求を作る。
+/// ID とシグナルを core の型で検証し、kill 要求を作る(`--signal` 未指定は `SIGTERM`)。
+///
+/// シグナルの解釈は core の `Signal::parse_notation`(CRI と共有する語彙)に委ね、不正値は `INVALID_ARGUMENT`
+/// (固定文言・値を含めない)。状態ルートを開く前に終わるので、非 Linux でも同じ結果になる。
 fn build_stop_request(args: &StopArgs) -> Result<KillRequest, TraitError> {
+    let signal = match args.signal.as_deref() {
+        Some(text) => Signal::parse_notation(text)?,
+        None => Signal::SIGTERM,
+    };
     Ok(KillRequest::new(
         ContainerId::new(args.id.as_str())?,
-        Signal::SIGTERM,
+        signal,
     ))
 }
 
@@ -931,7 +941,10 @@ mod tests {
     }
 
     fn stop_args(id: &str) -> StopArgs {
-        StopArgs { id: id.into() }
+        StopArgs {
+            id: id.into(),
+            signal: None,
+        }
     }
 
     fn delete_args(id: &str, force: bool) -> DeleteArgs {
@@ -950,6 +963,28 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
             let e = build_delete_request(&delete_args(id, false)).expect_err("delete");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    /// CLI-1・ERR-1・#2775: `--signal` は Docker 表記を解釈して kill 要求に載せ、不正値は固定文言の `INVALID_ARGUMENT`。
+    #[test]
+    fn cli1_build_stop_request_parses_signal() {
+        for (text, want) in [("SIGKILL", 9), ("kill", 9), ("10", 10), ("RTMIN+1", 35)] {
+            let args = StopArgs {
+                id: "c1".into(),
+                signal: Some(text.into()),
+            };
+            let k = build_stop_request(&args).expect("stop");
+            assert_eq!(k.signal().as_u8(), want, "{text}");
+        }
+        for text in ["", "0", "32", "65", "BOGUS", "SIGNAL_SIGTERM"] {
+            let args = StopArgs {
+                id: "c1".into(),
+                signal: Some(text.into()),
+            };
+            let e = build_stop_request(&args).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{text}");
+            assert_eq!(e.message(), "signal is invalid", "{text}");
         }
     }
 

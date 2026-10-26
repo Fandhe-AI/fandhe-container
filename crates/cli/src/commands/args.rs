@@ -1,9 +1,9 @@
-//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `inspect` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... inspect <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -28,7 +28,7 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
-    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`(未検証の文字列。意味検証は `create_options`。
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`(未検証の文字列。意味検証は `create_options`。
     /// SUP-12・CLI-1・#2713)。
     pub(super) options: CreateOptionArgs,
 }
@@ -51,6 +51,8 @@ pub(super) struct CreateOptionArgs {
     pub(super) shm_size: Option<String>,
     /// `--tmpfs <dest>[:<opts>]`(最大 `TMPFS_MAX_MOUNTS` 件)。
     pub(super) tmpfs: Vec<String>,
+    /// `--cap-drop <CAP>`(最大 core の `MAX_DROP_NAMES` 件。`ALL` を含む。CLI-1・SEC-1・#2775)。
+    pub(super) cap_drop: Vec<String>,
 }
 
 /// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
@@ -78,6 +80,15 @@ pub(super) struct StartArgs {
 /// `stop` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StopArgs {
+    pub(super) id: String,
+    /// `--signal <名前|番号>` の生の値(未検証。Docker 表記の解釈は `stop_delete` が core の `Signal::parse_notation` に
+    /// 委ねる。未指定は SIGTERM。CLI-1・ERR-1・#2775)。
+    pub(super) signal: Option<String>,
+}
+
+/// `inspect` の引数(CLI-1・SUP-11・#2775)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InspectArgs {
     pub(super) id: String,
 }
 
@@ -296,6 +307,7 @@ enum RepeatableOption {
     EnvFile,
     Label,
     Tmpfs,
+    CapDrop,
 }
 
 fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
@@ -309,6 +321,8 @@ fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
         Some(RepeatableOption::Label)
     } else if a == "--tmpfs" {
         Some(RepeatableOption::Tmpfs)
+    } else if a == "--cap-drop" {
+        Some(RepeatableOption::CapDrop)
     } else {
         None
     }
@@ -320,6 +334,7 @@ fn push_option(
     kind: RepeatableOption,
     value: OsString,
 ) -> Result<(), UsageError> {
+    use fandhe_container_core::capabilities::MAX_DROP_NAMES;
     use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
     use fandhe_container_core::traits::ANNOTATIONS_MAX_ENTRIES;
     use fandhe_container_supervisor::container_options::env::ENV_MAX_ENTRIES;
@@ -358,6 +373,12 @@ fn push_option(
             }
             options.tmpfs.push(text(value)?);
         }
+        RepeatableOption::CapDrop => {
+            if options.cap_drop.len() >= MAX_DROP_NAMES {
+                return Err(UsageError);
+            }
+            options.cap_drop.push(text(value)?);
+        }
     }
     Ok(())
 }
@@ -390,9 +411,37 @@ pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> 
     })
 }
 
-/// `stop <id>` を解析する（オプションは受け付けない）。
+/// `stop [--signal <名前|番号>] <id>` を解析する(`--signal` は 1 回まで・`--` 以降は位置引数)。
+/// Docker の `-s` は受けない(`logs -f` と同じく長い形だけ。D06)。値の意味はここでは見ない(core の型に委ねる)。
 pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
+    let mut signal: Option<String> = None;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--signal" {
+            let value = it.next().ok_or(UsageError)?;
+            if signal.is_some() {
+                return Err(UsageError);
+            }
+            signal = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
     Ok(StopArgs {
+        id: single_id(positional)?,
+        signal,
+    })
+}
+
+/// `inspect <id>` を解析する(オプションは受け付けない)。
+pub(super) fn parse_inspect(args: Vec<OsString>) -> Result<InspectArgs, UsageError> {
+    Ok(InspectArgs {
         id: single_positional(args)?,
     })
 }
@@ -842,6 +891,7 @@ mod tests {
                 ipc: Some("private".into()),
                 shm_size: Some("128m".into()),
                 tmpfs: vec!["/run:rw".into()],
+                cap_drop: Vec::new(),
             }
         );
     }
@@ -986,14 +1036,85 @@ mod tests {
     /// CLI-1: stop は位置引数 1 個のみ。
     #[test]
     fn cli1_parse_stop() {
-        assert_eq!(parse_stop(v(&["c1"])), Ok(StopArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_stop(v(&["c1"])),
+            Ok(StopArgs {
+                id: "c1".into(),
+                signal: None
+            })
+        );
         assert_eq!(
             parse_stop(v(&["--", "-c"])),
-            Ok(StopArgs { id: "-c".into() })
+            Ok(StopArgs {
+                id: "-c".into(),
+                signal: None
+            })
         );
         for a in [v(&[]), v(&["a", "b"]), v(&["--force", "a"]), v(&["-a"])] {
             assert_eq!(parse_stop(a), Err(UsageError));
         }
+    }
+
+    /// CLI-1・#2775: `stop --signal` は前後どちらでも受け、値の欠落・重複・`-s` は使い方エラー。値の意味は見ない。
+    #[test]
+    fn cli1_parse_stop_signal() {
+        let want = Ok(StopArgs {
+            id: "c1".into(),
+            signal: Some("SIGKILL".into()),
+        });
+        assert_eq!(parse_stop(v(&["--signal", "SIGKILL", "c1"])), want);
+        assert_eq!(parse_stop(v(&["c1", "--signal", "SIGKILL"])), want);
+        assert_eq!(
+            parse_stop(v(&["--signal", "BOGUS", "c1"])).map(|a| a.signal),
+            Ok(Some("BOGUS".into()))
+        );
+        for a in [
+            v(&["--signal"]),
+            v(&["c1", "--signal"]),
+            v(&["--signal", "9", "--signal", "15", "c1"]),
+            v(&["-s", "9", "c1"]),
+            v(&["--signal", "9"]),
+        ] {
+            assert_eq!(parse_stop(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・#2775: `inspect` は ID をちょうど 1 つ受け、オプション・余分な引数は使い方エラー。
+    #[test]
+    fn cli1_parse_inspect() {
+        assert_eq!(
+            parse_inspect(v(&["c1"])),
+            Ok(InspectArgs { id: "c1".into() })
+        );
+        for a in [v(&[]), v(&["a", "b"]), v(&["--format", "a"]), v(&["-a"])] {
+            assert_eq!(parse_inspect(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・#2775: `create --cap-drop` は繰り返し指定でき、値の欠落と件数超過は使い方エラー。値の意味は見ない。
+    #[test]
+    fn cli1_parse_create_cap_drop() {
+        let a = parse_create(v(&[
+            "--bundle",
+            "/b",
+            "--cap-drop",
+            "ALL",
+            "--cap-drop",
+            "chown",
+            "c1",
+        ]))
+        .expect("parse");
+        assert_eq!(a.options.cap_drop, vec!["ALL".to_string(), "chown".into()]);
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--cap-drop"])),
+            Err(UsageError)
+        );
+        let mut many = vec!["--bundle", "/b"];
+        for _ in 0..=fandhe_container_core::capabilities::MAX_DROP_NAMES {
+            many.extend(["--cap-drop", "chown"]);
+        }
+        many.push("c1");
+        assert_eq!(parse_create(v(&many)), Err(UsageError));
     }
 
     /// CLI-1: delete の正常系（`--force` は前後どちらでも・`--` 以降は位置引数）。

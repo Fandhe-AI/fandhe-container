@@ -591,6 +591,8 @@ mod tests {
                     },
                 ),
                 Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
+                // 不在 ID の inspect は Linux で NOT_FOUND(3)、非 Linux は plugin 解決の失敗(5)。出力は無い。
+                Command::Inspect => (vec!["inspect", "none"], if linux { 3 } else { 5 }, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },
@@ -627,7 +629,7 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

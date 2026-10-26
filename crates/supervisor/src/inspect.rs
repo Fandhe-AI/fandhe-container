@@ -299,7 +299,7 @@ impl InspectReport {
     }
 
     /// [`Self::to_json`] に LF を 1 個付けて書き出す。
-    pub fn write_json(&self, w: &mut impl io::Write) -> io::Result<()> {
+    pub fn write_json(&self, w: &mut (impl io::Write + ?Sized)) -> io::Result<()> {
         let mut line = self.to_json();
         line.push('\n');
         w.write_all(line.as_bytes())

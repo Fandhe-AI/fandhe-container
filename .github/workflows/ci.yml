@@ -123,6 +123,13 @@ on:
           例 FANDHE_CONTAINER_TEST_ID_HELPER=1。#2886）
         type: string
         default: ''
+      repeat-run-timeout:
+        description: >-
+          repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
+          CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
+          ステップ全体は 55 分で打ち切られる（ジョブ上限 60 分）ため、遅い試験は repeat-count を分けて dispatch する
+        type: string
+        default: '600'
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -1410,7 +1417,7 @@ jobs:
           runner.os == 'Linux' && env.HANG_PROBE != 'true' &&
           (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
         shell: bash
-        timeout-minutes: 30
+        timeout-minutes: 55
         env:
           PACKAGE: ${{ inputs.repeat-package }}
           TEST_BIN: ${{ inputs.repeat-test-bin }}
@@ -1419,6 +1426,7 @@ jobs:
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
           TEST_ENV: ${{ inputs.repeat-env }}
+          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout }}
           USER_SCOPE: '1'
         run: make repeat-test
 

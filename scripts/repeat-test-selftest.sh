@@ -74,6 +74,8 @@ case "\${STUB_MODE}" in
   scope-ok) echo '${FINAL_LINE}' ;;
   scope-prefix) echo 'xx ${FINAL_LINE} yy' ;;
   scope-fail) exit 1 ;;
+  scope-hang) sleep 30 ;;
+  scope-slow) sleep 3; echo '${FINAL_LINE}' ;;
 esac
 STUB
 chmod +x "${work}/bin/exec_x_bin"
@@ -178,6 +180,10 @@ check scope-child-failure 1 "reason=exit" scope-fail "${P}" "${B}" "${FL}" "${SB
 check scope-env-reaches-child 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=1" "${SB}" USER_SCOPE=1 "${ENVH}" COUNT=1
 check scope-env-absent-without-test-env 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=unset" "${SB}" USER_SCOPE=1 COUNT=1
 check scope-user-passed 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=user-seen: stubuser" "${SB}" USER_SCOPE=1 USER=stubuser COUNT=1
+# RUN_TIMEOUT の受け渡し（#2886）: 遅い 1 回は短い上限なら timeout、十分な上限なら合格。ハングは timeout で打ち切る。
+check scope-timeout 1 "reason=timeout" scope-hang "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 COUNT=1 RUN_TIMEOUT=1
+check scope-slow-short-timeout 1 "reason=timeout" scope-slow "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 COUNT=1 RUN_TIMEOUT=1
+check scope-slow-long-timeout 0 "passed=1 failed=0" scope-slow "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 COUNT=1 RUN_TIMEOUT=30
 rm -f "${work}/args" "${work}/sd" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=scope-ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" STUB_SD_LOG="${work}/sd" \
   "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 COUNT=3 "${target}" >/dev/null 2>&1

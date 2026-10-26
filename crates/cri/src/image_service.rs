@@ -135,6 +135,11 @@ impl ImageRecord {
         })
     }
 
+    /// digest 参照（`<repo>@sha256:<manifest digest>`）の一覧（#2831。ContainerStatus の `image_ref` の元）。
+    pub fn repo_digests(&self) -> &[String] {
+        &self.repo_digests
+    }
+
     /// 既定ユーザー（uid / username）を設定する。username が長すぎる場合、および
     /// uid と非空 username の同時指定（proto で mutually exclusive）は拒否する。
     pub fn with_user(mut self, uid: Option<i64>, username: &str) -> Result<Self, ImageStoreError> {

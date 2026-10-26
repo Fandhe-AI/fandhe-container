@@ -31,10 +31,9 @@
 //!   実際に適用・確認した effective / permitted / inheritable / ambient は記録していないため出さない（推測しない）。
 //!   非 root の `process.user` で ambient が空のまま exec すると実効集合は上限より小さく（空にも）なるため、
 //!   `bounding` を「コンテナのプロセスが今持つ集合」と読んではならない。
-//! - `rootReadonly`（SUP-6・CORE-5・SEC-1・REPAIR-4・#2829）は launch が rootfs を読み取り専用で起動したか
-//!   （`true` / `false`）。launcher が fork 前に `root.readonly` から作った記録で、子の `root_readonly` 段が
-//!   失敗時に launch を失敗させるため、記録があれば実際の起動と一致する。記録が無ければ（未 start・導入前の
-//!   `state.json`・`launchIsolation` なし）`null` で、`false`（書き込み可能）とは推測しない。観測専用。
+//! - `rootReadonly`（CLI-1・SUP-12・REPAIR-4・#2828）は launcher が実際に適用した `root.readonly` の実効値
+//!   （config の値と `create --read-only` の OR。mount の RDONLY・Landlock の root 規則と同じ値）で、`true` / `false`。
+//!   記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、書き込み可能とは推測しない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、

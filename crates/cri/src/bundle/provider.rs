@@ -402,9 +402,13 @@ impl BundleProvider for SpecBundleProvider {
             )?;
             // CRI が RUNTIME_DEFAULT のときだけイメージの StopSignal を使う（#2771・CRI-2・OCI-1）。
             let stop = resolve_stop_signal(req.config.stop_signal, defaults.stop_signal)?;
-            Ok((json.process_user().clone(), stop))
+            Ok((
+                json.process_user().clone(),
+                stop,
+                defaults.resolved_image.clone(),
+            ))
         })();
-        let (applied, stop) = match built {
+        let (applied, stop, image) = match built {
             Ok(v) => v,
             Err(e) => {
                 // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
@@ -415,9 +419,13 @@ impl BundleProvider for SpecBundleProvider {
                 return Err(e);
             }
         };
-        Ok(PreparedBundle::new(dir)
+        let prepared = PreparedBundle::new(dir)
             .with_user(applied)
-            .with_stop_signal(stop))
+            .with_stop_signal(stop);
+        Ok(match image {
+            Some(image) => prepared.with_image(image),
+            None => prepared,
+        })
     }
 
     fn release(&self, container_id: &str) -> Result<(), CriError> {

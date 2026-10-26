@@ -125,26 +125,52 @@ const MSG_BAD_ID: &str = "invalid container id";
 
 // ---- エラー変換（受け入れ基準 2）----
 
+/// `WinErrorCode` から plugin のエラーフレームの code への写像表（ERR-1・REPAIR-1）。
+///
+/// 3 列目は元の分類名を message 先頭に残すか。`WinErrorCode` は `#[non_exhaustive]` で `_` に黙って
+/// 吸収されやすいため、`WinErrorCode::ALL` と同じ件数の表にして試験で網羅を照合する。
+const WIN_TO_PLUGIN: [(WinErrorCode, PluginErrorCode, bool); 9] = [
+    (
+        WinErrorCode::InvalidArgument,
+        PluginErrorCode::InvalidArgument,
+        false,
+    ),
+    (WinErrorCode::NotFound, PluginErrorCode::NotFound, false),
+    (
+        WinErrorCode::PermissionDenied,
+        PluginErrorCode::PermissionDenied,
+        false,
+    ),
+    (
+        WinErrorCode::ResourceExhausted,
+        PluginErrorCode::FailedPrecondition,
+        true,
+    ),
+    (
+        WinErrorCode::Unimplemented,
+        PluginErrorCode::Unimplemented,
+        false,
+    ),
+    (
+        WinErrorCode::FailedPrecondition,
+        PluginErrorCode::FailedPrecondition,
+        false,
+    ),
+    (WinErrorCode::Timeout, PluginErrorCode::Timeout, false),
+    (WinErrorCode::DataLoss, PluginErrorCode::DataLoss, false),
+    (WinErrorCode::Internal, PluginErrorCode::Internal, false),
+];
+
 /// platform-windows のエラー分類を plugin のエラーフレームへ変換する唯一の箇所（ERR-1）。
 ///
-/// plugin 側に `RESOURCE_EXHAUSTED` が無いため `FAILED_PRECONDITION` へ写し、message 先頭に元の分類を残す。
-/// `#[non_exhaustive]` の将来追加分は `Internal`（fail-closed）。長さ上限は `PluginError::new` が担う。
+/// `ResourceExhausted` は既存のワイヤー互換のため `FAILED_PRECONDITION` へ写し、message 先頭に元の分類を
+/// 残す（`PluginErrorCode` に `RESOURCE_EXHAUSTED` はあるが、写し先の変更はワイヤーが変わるため据え置き）。
+/// 表に無い将来追加分は `Internal`（fail-closed）。長さ上限は `PluginError::new` が担う。
 pub fn to_plugin_error(code: WinErrorCode, message: &str) -> PluginError {
-    let plain = |c| PluginError::new(c, message);
-    match code {
-        WinErrorCode::InvalidArgument => plain(PluginErrorCode::InvalidArgument),
-        WinErrorCode::NotFound => plain(PluginErrorCode::NotFound),
-        WinErrorCode::PermissionDenied => plain(PluginErrorCode::PermissionDenied),
-        WinErrorCode::Unimplemented => plain(PluginErrorCode::Unimplemented),
-        WinErrorCode::FailedPrecondition => plain(PluginErrorCode::FailedPrecondition),
-        WinErrorCode::Timeout => plain(PluginErrorCode::Timeout),
-        WinErrorCode::DataLoss => plain(PluginErrorCode::DataLoss),
-        WinErrorCode::Internal => plain(PluginErrorCode::Internal),
-        WinErrorCode::ResourceExhausted => PluginError::new(
-            PluginErrorCode::FailedPrecondition,
-            format!("{}: {message}", code.as_str()),
-        ),
-        _ => plain(PluginErrorCode::Internal),
+    match WIN_TO_PLUGIN.iter().find(|(c, _, _)| *c == code) {
+        Some((_, pc, true)) => PluginError::new(*pc, format!("{}: {message}", code.as_str())),
+        Some((_, pc, false)) => PluginError::new(*pc, message),
+        None => PluginError::new(PluginErrorCode::Internal, message),
     }
 }
 
@@ -977,6 +1003,16 @@ mod tests {
             let e = to_plugin_error(w, "m");
             assert_eq!(e.code().as_str(), code);
             assert_eq!(e.message(), msg);
+        }
+    }
+
+    /// REPAIR-1・ERR-1: 写像表が `WinErrorCode::ALL` を過不足なく覆い、キーに重複がない。
+    #[test]
+    fn err1_win_to_plugin_table_covers_win_error_code_all() {
+        assert_eq!(WIN_TO_PLUGIN.len(), WinErrorCode::ALL.len());
+        for w in WinErrorCode::ALL {
+            let n = WIN_TO_PLUGIN.iter().filter(|(c, _, _)| *c == w).count();
+            assert_eq!(n, 1, "{w:?}");
         }
     }
 

@@ -71,7 +71,7 @@
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
-//! 無改変で返し、`envs` は返さない。`image_ref`・`image_id`・`user`・`info`・`message` は空・0 のスタブ
+//! 無改変で返し、`envs` は返さない。`image_ref`・`image_id` は CreateContainer 時の解決結果（報告の無い経路は空。#2831）を返し、`info`・`message` は空のスタブ
 //! （REPAIR-3。項目ごとの将来仕様は `container::ContainerRecord::to_status` の doc、追跡は TASK-59 追補 #2322 の分割 issue）。
 //! `exit_code` は実行層が報告した値を反映し、`reason` は実行層の報告から導く（OOM の報告があれば `OOMKilled`、
 //! 0 は `Completed`、非 0 は `Error`、不明は空）。
@@ -880,6 +880,8 @@ fn rollback_in_flight(
 const APPLIED_GID_RETAINED_BYTES: usize = 4;
 /// `AppliedUser` 1 件の保持量の固定分の見積もり（uid・gid・Vec の管理領域）。
 const APPLIED_USER_RETAINED_BASE_BYTES: usize = 64;
+/// `ResolvedImage` 1 件の保持量の固定分の見積もり（String の管理領域・Digest の管理領域。#2831）。
+const RESOLVED_IMAGE_RETAINED_BASE_BYTES: usize = 64;
 
 /// `BundleProvider::prepare` が報告した識別情報と stop signal を、実行層へ渡す前に記録へ反映する（#2771・CRI-2）。
 ///
@@ -892,12 +894,20 @@ fn attach_prepared(
     prepared: &PreparedBundle,
     max_retained_bytes: usize,
 ) -> Result<(), CriError> {
-    let extra = prepared.user().map_or(0, |u| {
+    let user_extra = prepared.user().map_or(0, |u| {
         u.additional_gids()
             .len()
             .saturating_mul(APPLIED_GID_RETAINED_BYTES)
             .saturating_add(APPLIED_USER_RETAINED_BASE_BYTES)
     });
+    // image の報告分（参照文字列と image ID。長さは `ResolvedImage` が上限内に保つ。#2831）。
+    let image_extra = prepared.image().map_or(0, |i| {
+        i.image_ref()
+            .len()
+            .saturating_add(i.id_str().len())
+            .saturating_add(RESOLVED_IMAGE_RETAINED_BASE_BYTES)
+    });
+    let extra = user_extra.saturating_add(image_extra);
     let mut registry = registry
         .lock()
         .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
@@ -916,6 +926,7 @@ fn attach_prepared(
         .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
     record.retained_bytes = retained;
     record.applied_user = prepared.user().cloned();
+    record.resolved_image = prepared.image().cloned();
     if let Some(signal) = prepared.stop_signal() {
         record.stop_signal = signal as i32;
     }
@@ -1774,6 +1785,7 @@ impl CriRuntimeService {
                 runtime_owned: false,
                 stop_signal,
                 applied_user: None,
+                resolved_image: None,
             },
         );
         registry.container_keys.insert(key);

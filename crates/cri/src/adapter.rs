@@ -365,6 +365,7 @@ pub struct PreparedBundle {
     path: PathBuf,
     user: Option<crate::bundle::AppliedUser>,
     stop_signal: Option<crate::runtime::v1::Signal>,
+    image: Option<crate::bundle::ResolvedImage>,
 }
 
 impl PreparedBundle {
@@ -374,7 +375,17 @@ impl PreparedBundle {
             path,
             user: None,
             stop_signal: None,
+            image: None,
         }
+    }
+    /// create 時に解決したイメージ（image ID と digest 参照）の報告を足す（#2831。`image_ref`・`image_id` の元）。
+    pub fn with_image(mut self, image: crate::bundle::ResolvedImage) -> Self {
+        self.image = Some(image);
+        self
+    }
+    /// 解決したイメージ（報告が無ければ `None`。`image_ref`・`image_id` は空になる）。
+    pub fn image(&self) -> Option<&crate::bundle::ResolvedImage> {
+        self.image.as_ref()
     }
     /// 起動時に適用する uid・gid・補助グループの報告を足す。
     pub fn with_user(mut self, user: crate::bundle::AppliedUser) -> Self {
@@ -409,7 +420,7 @@ impl PreparedBundle {
 /// 汎用の実装として `crate::bundle::SpecBundleProvider`（config 変換と bundle ディレクトリの寿命。#2395）がある。
 ///
 /// 本番の rootfs 供給は `crate::bundle::ImageRootfsSource`（pull 済みイメージの再展開と既定値の読み取り。#2433）で、
-/// plugin-cri が `SpecBundleProvider` と組んで差す。タグの解決は未実装（REPAIR-3。image ID のみ受ける）。
+/// plugin-cri が `SpecBundleProvider` と組んで差す。`ImageStore` を注入するとタグ・digest 参照も image ID へ解決し、解決結果を `PreparedBundle::image` で報告する（#2592・#2831）。未注入では image ID のみ受ける（REPAIR-3）。
 /// `config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
 pub trait BundleProvider: Send + Sync {
     /// コンテナ用の bundle を用意し、その絶対パスと実際に適用する値の報告を返す。失敗は ERR-3 の gRPC ステータスで返す。

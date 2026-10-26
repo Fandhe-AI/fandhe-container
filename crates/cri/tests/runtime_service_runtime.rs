@@ -5,6 +5,7 @@
 //! plugin-cri（TASK-108）と同じ立場で生成された `RuntimeService` トレイト経由で呼ぶ。実際の namespace
 //! 分離プロセスの確認は実機前提の `runtime_service_namespaces.rs`（`#[ignore]`）で行う。
 
+use fandhe_container_oci::reference::Digest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -213,6 +214,8 @@ struct FakeBundles {
     report_user: Mutex<Option<fandhe_container_cri::bundle::AppliedUser>>,
     /// 設定されていれば prepare が報告する解決済みの stop signal（#2771）。
     report_stop_signal: Mutex<Option<v1::Signal>>,
+    /// 設定されていれば prepare が報告する解決済みイメージ（#2831）。
+    report_image: Mutex<Option<fandhe_container_cri::bundle::ResolvedImage>>,
 }
 
 fn bundle_root() -> PathBuf {
@@ -244,6 +247,9 @@ impl BundleProvider for FakeBundles {
         }
         if let Some(sig) = *self.report_stop_signal.lock().unwrap() {
             prepared = prepared.with_stop_signal(sig);
+        }
+        if let Some(i) = self.report_image.lock().unwrap().clone() {
+            prepared = prepared.with_image(i);
         }
         Ok(prepared)
     }
@@ -1546,7 +1552,7 @@ async fn task_59_3_stop_exit_code_is_reflected_in_status() {
     );
 }
 
-/// CRI-2・CORE-4: 実行層が OOM の停止を報告したら reason は `OOMKilled`（Stop・StopPodSandbox の経路。終了コード 0 でも OOMKilled）。message・image_ref・image_id・user は REPAIR-3 のスタブで空。
+/// CRI-2・CORE-4: 実行層が OOM の停止を報告したら reason は `OOMKilled`（Stop・StopPodSandbox の経路。終了コード 0 でも OOMKilled）。message は REPAIR-3 のスタブで空。image_ref・image_id・user は報告の無い経路では空（#2831）。
 #[tokio::test]
 async fn cri_2_oom_killed_is_reflected_in_reason() {
     let h = harness();
@@ -1811,6 +1817,62 @@ async fn cri2_status_omits_user_when_supplemental_groups_empty() {
     let id = create(&h.service, &sb, "a").await.expect("create");
     let st = status(&h.service, &id).await;
     assert!(st.user.is_none());
+}
+
+/// CRI-2・OCI-1（#2831）: 報告された解決結果が ContainerStatus と ListContainers の image_ref・image_id になる。
+/// Status の image_ref は digest 参照、image_id と List の両項目は image ID（containerd main cfb18c4）。
+#[tokio::test]
+async fn cri2_status_and_list_report_resolved_image() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let hex = "a".repeat(64);
+    let id = Digest::parse(&format!("sha256:{hex}")).unwrap();
+    let digest_ref = format!("docker.io/library/alpine@sha256:{}", "b".repeat(64));
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() =
+        Some(ResolvedImage::new(id, Some(digest_ref.clone())));
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(st.image_ref, digest_ref);
+    assert_eq!(st.image_id, format!("sha256:{hex}"));
+    let list = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].image_ref, format!("sha256:{hex}"));
+    assert_eq!(list[0].image_id, format!("sha256:{hex}"));
+}
+
+/// CRI-2・OCI-1（#2831）: digest 参照が無い解決結果は image_ref も image ID。報告が無い経路は空。
+#[tokio::test]
+async fn cri2_status_image_without_digest_ref_and_without_report() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let hex = "c".repeat(64);
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() = Some(ResolvedImage::new(
+        Digest::parse(&format!("sha256:{hex}")).unwrap(),
+        None,
+    ));
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(
+        (st.image_ref.as_str(), st.image_id.as_str()),
+        (
+            format!("sha256:{hex}").as_str(),
+            format!("sha256:{hex}").as_str()
+        )
+    );
+    let h2 = harness();
+    let sb2 = run_sandbox(&h2.service).await;
+    let cid2 = create(&h2.service, &sb2, "a").await.expect("create");
+    let st2 = status(&h2.service, &cid2).await;
+    assert_eq!((st2.image_ref.as_str(), st2.image_id.as_str()), ("", ""));
 }
 
 /// CRI-2（#2771）: 報告の無い bundle 供給元では user は未報告で、RUNTIME_DEFAULT は SIGTERM（23）と報告される。

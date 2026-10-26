@@ -402,6 +402,11 @@ fn is_hex64(name: &str) -> bool {
 }
 
 /// ディレクトリが実在の通常ディレクトリか。存在しなければ `Ok(false)`、symlink 等は拒否。
+/// パス起点の実装（root_handle の非 Linux 分岐）だけが使う。
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 fn checked_dir(path: &Path) -> Result<bool, OciError> {
     use std::fs;
     use std::io::ErrorKind;
@@ -418,6 +423,11 @@ fn checked_dir(path: &Path) -> Result<bool, OciError> {
 
 /// `blobs` と `blobs/sha256` を検証する。両方が通常ディレクトリなら `Ok(true)`、
 /// どちらかが存在しなければ `Ok(false)`、symlink・非ディレクトリは `FailedPrecondition`。
+/// パス起点の実装（root_handle の非 Linux 分岐）だけが使う。
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 pub(super) fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
     Ok(checked_dir(&root.join("blobs"))? && checked_dir(&blob_dir(root))?)
 }

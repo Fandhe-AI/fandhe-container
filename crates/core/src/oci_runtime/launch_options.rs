@@ -52,7 +52,7 @@ pub enum LaunchIpcMode {
 }
 
 /// 検証済みの起動オプション(モジュール doc)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
     tmpfs: TmpfsMountSet,
     inject: InjectedFileSet,
@@ -61,6 +61,19 @@ pub struct LaunchOptions {
     rlimits: Rlimits,
     /// `--env` の上書き(`KEY=VALUE`。`with_env` で検証済み)。
     env: Vec<String>,
+}
+
+/// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
+impl std::fmt::Debug for LaunchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchOptions")
+            .field("tmpfs", &self.tmpfs)
+            .field("inject", &self.inject)
+            .field("ipc", &self.ipc)
+            .field("rlimits", &self.rlimits)
+            .field("env_count", &self.env.len())
+            .finish()
+    }
 }
 
 fn invalid(message: &'static str) -> TraitError {
@@ -362,6 +375,23 @@ mod tests {
         .expect("options");
         assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::WithoutShm);
         assert_eq!(o.inject().files().len(), 1);
+    }
+
+    /// SEC-1: Debug に env の値が出ない(件数だけ)。
+    #[test]
+    fn sec1_debug_does_not_leak_env_values() {
+        let o = LaunchOptions::new(
+            set_of(&["/run"]),
+            secret("/etc/token", b"x"),
+            LaunchIpcMode::Host,
+        )
+        .expect("options")
+        .with_env(vec!["API_KEY=ENVSECRETVALUE".to_string()])
+        .expect("env");
+        let text = format!("{o:?}");
+        assert!(!text.contains("ENVSECRETVALUE"), "{text}");
+        assert!(!text.contains("API_KEY"), "{text}");
+        assert!(text.contains("env_count: 1"), "{text}");
     }
 
     /// SEC-1: Debug に secret の内容が出ない。

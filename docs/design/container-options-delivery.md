@@ -75,7 +75,7 @@ core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数
 - **secrets / configs の CLI フラグ**: 文書の kind も未定義。ホストのパスを特権の supervisor が読む方式は confused deputy に
   なりうるため、fd の所有者照合か、CLI が非特権のまま開いて渡す方式を別に設計する（core の `launch_options.rs` の
   「未設計」と同じ課題）
-- **同じ ID の並行 create**: 同じ利用者が同じ ID で `create` を並行に実行すると、片方の文書が消えうる（受容）
+- **同じ ID の並行 create / delete**: ID 単位のロック（`@container-options/@lock-<id>`、期限つき）を create の間と delete の削除の間に保持して直列化する。文書の I/O（ロック取得・掃除・書き込み・fsync・巻き戻し・`--env-file` の読み取り）は作業スレッドで期限つきに待つ（REPAIR-5）。期限切れで残った文書は状態が無いので次の create / delete が掃除する。文書の書き込みは親ディレクトリも fsync してから成功を返す（OCI-5）
 - **plugin-cri の create は残骸を掃除しない**: CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと、残骸が効きうる
 - **stack**: `Service::create_option_args` が env・env_files・labels を create の引数列へ写すところまで。`up`
   からの結線は TASK-155、ulimit・tmpfs のスキーマは #586・#862

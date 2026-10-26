@@ -553,8 +553,8 @@ impl CleanupTarget {
 ///
 /// 各欄は既定で [`CleanupOutcome::NotApplicable`]。埋める層は欄ごとに異なる:
 /// - `image_rootfs`: core の delete（記録の無い rootfs は `NotApplicable`）
-/// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`）。CLI は
-///   トレイトを通らず、自前の警告で出すため欄を使わない
+/// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`・CLI の `delete`）。
+///   CLI も `finish_delete` で埋める（警告の 1 行 JSON は CLI 自前の形式。#2698）
 ///
 /// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869）の DTO への追加は未実装。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

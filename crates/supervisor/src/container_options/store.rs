@@ -17,7 +17,8 @@
 //!
 //! # 残余(REPAIR-3)
 //!
-//! 同じ利用者が同じ ID で `create` を並行に実行すると片方の文書が消えうる。plugin-cri の create は残骸を掃除しない
+//! 同じ ID の `create` と `delete` は ID 単位のロック(`@container-options/@lock-<id>`。[`acquire_lock`])で直列化する
+//! (並行 create で成功した側の文書を消さない)。plugin-cri の create は残骸を掃除しない
 //! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が効きうる(後続)。
 //! Linux 以外では `Unimplemented` で拒否する(CLI の create は Linux のローカル実行のみ)。
 
@@ -94,7 +95,8 @@ mod imp {
     fn ensure_dir(root: &Path, uid: u32) -> Result<PathBuf, TraitError> {
         let dir = options_dir(root);
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
+            // 新しく作ったディレクトリのエントリ(状態ルート側)も永続化する。
+            Ok(()) => sync_dir(root)?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(io_failed(e)),
         }
@@ -137,13 +139,92 @@ mod imp {
         let result = file
             .write_all(&doc.encode())
             .and_then(|()| file.sync_all())
-            .map_err(io_failed);
+            .map_err(io_failed)
+            // 文書の中身に加えて、親ディレクトリのエントリも永続化してから成功を返す。
+            .and_then(|()| sync_dir(&dir));
         if let Err(e) = result {
             // 書きかけを残さない(自分が作った inode だけを消す)。
             let _ = remove_if_same(root, id, &written);
             return Err(e);
         }
         Ok(written)
+    }
+
+    /// ID 単位の排他ロック(`<dir>/@lock-<id>`。`@` は ID に使えないので文書名と衝突しない)。
+    /// drop で解放する。ロックファイルは [`OptionsLock::remove_lock_file`] で消す(消さなければ残る)。
+    #[derive(Debug)]
+    pub struct OptionsLock {
+        /// 保持するだけ(drop で flock が解放される)。
+        _file: File,
+        path: PathBuf,
+    }
+
+    impl OptionsLock {
+        /// ロックを保持したままロックファイルを消す(取得側は取得後に実体の一致を確かめるので、孤立 inode を掴んだ側は再取得する)。
+        pub fn remove_lock_file(self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// 取得の再試行間隔。
+    const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    /// ID 単位のロックを `timeout` まで待って取る(期限切れは `Timeout`)。
+    ///
+    /// `try_lock` と短い sleep の繰り返しで、他者が保持し続けても無期限に待たない(REPAIR-5)。
+    /// 取れたあと、パスの実体が掴んだ fd と同じ(dev・ino)であることを確かめ、違えば(他者がロックファイルを消した)取り直す。
+    /// open 自体が止まる(FUSE 等)場合は呼び出し側が作業スレッドで包む。
+    pub fn acquire_lock(
+        root: &Path,
+        id: &ContainerId,
+        timeout: std::time::Duration,
+    ) -> Result<OptionsLock, TraitError> {
+        let uid = effective_uid()?;
+        let dir = ensure_dir(root, uid)?;
+        let path = dir.join(format!("@lock-{}", id.as_str()));
+        if path.file_name().is_none_or(|n| n.len() > 255) {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "the container id is too long for the options lock",
+            ));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(crate::container_options::env::O_NOCTTY | no_follow())
+                .open(&path)
+                .map_err(io_failed)?;
+            match file.try_lock() {
+                Ok(()) => {
+                    let current = std::fs::symlink_metadata(&path).ok();
+                    let held = file.metadata().map_err(io_failed)?;
+                    if current.is_some_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
+                        return Ok(OptionsLock { _file: file, path });
+                    }
+                    // 孤立した inode を掴んだ。取り直す。
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(io_failed(e)),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(err(
+                    ErrorCode::Timeout,
+                    "the container options lock was not acquired in time",
+                ));
+            }
+            std::thread::sleep(LOCK_POLL);
+        }
+    }
+
+    /// 親ディレクトリのエントリを永続化する(クラッシュ後に文書が消えて既定値に戻るのを防ぐ。OCI-5・SUP-12)。
+    fn sync_dir(dir: &Path) -> Result<(), TraitError> {
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io_failed)
     }
 
     /// `O_NOFOLLOW`(`logs::rotating` と同じ値の取り方に揃える)。
@@ -251,9 +332,25 @@ mod imp {
     pub fn remove(_root: &Path, _id: &ContainerId) -> Result<(), TraitError> {
         Err(unsupported())
     }
+
+    /// ID 単位のロック(Linux 以外では取得できない)。
+    #[derive(Debug)]
+    pub struct OptionsLock;
+
+    impl OptionsLock {
+        pub fn remove_lock_file(self) {}
+    }
+
+    pub fn acquire_lock(
+        _root: &Path,
+        _id: &ContainerId,
+        _timeout: std::time::Duration,
+    ) -> Result<OptionsLock, TraitError> {
+        Err(unsupported())
+    }
 }
 
-pub use imp::{read, remove, remove_if_same, write_new};
+pub use imp::{OptionsLock, acquire_lock, read, remove, remove_if_same, write_new};
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -358,6 +455,8 @@ mod tests {
         let root = tmp("same");
         let written = write_new(&root, &id("c1"), &doc()).expect("write");
         let path = options_path(&root, &id("c1"));
+        // 元の inode を別名で生かしたまま差し替える(解放された inode 番号の再利用で同一と見なされないようにする)。
+        std::fs::hard_link(&path, root.join("keep-old-inode")).expect("link");
         std::fs::remove_file(&path).expect("unlink");
         write_new(&root, &id("c1"), &doc()).expect("rewrite");
         remove_if_same(&root, &id("c1"), &written).expect("noop");
@@ -369,6 +468,21 @@ mod tests {
         };
         remove_if_same(&root, &id("c1"), &same).expect("remove");
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SUP-12・REPAIR-5: ID 単位のロックは同じ ID の二重取得を期限で諦め、別 ID とは干渉せず、解放後は取れる。
+    #[test]
+    fn sup12_options_lock_is_per_id_and_bounded() {
+        let root = tmp("lock");
+        let short = std::time::Duration::from_millis(50);
+        let first = acquire_lock(&root, &id("c1"), short).expect("lock");
+        let e = acquire_lock(&root, &id("c1"), short).expect_err("held");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        acquire_lock(&root, &id("c2"), short).expect("other id");
+        first.remove_lock_file();
+        assert!(!options_dir(&root).join("@lock-c1").exists());
+        acquire_lock(&root, &id("c1"), short).expect("after release");
         let _ = std::fs::remove_dir_all(&root);
     }
 

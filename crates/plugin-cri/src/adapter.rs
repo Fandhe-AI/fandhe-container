@@ -43,7 +43,7 @@
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
 //!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
 //!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。既知の制約として、既定を超える terminate で窓が 10 秒を超えると
-//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、回収の経路は無い）
+//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、CLI の同じ ID の `create` は残りを回収するが、CRI は ID を再利用しないため手動で消す。docs/setup/container-log-recovery.md）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。

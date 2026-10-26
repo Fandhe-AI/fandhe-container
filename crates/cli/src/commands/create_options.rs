@@ -16,8 +16,11 @@
 //!
 //! エラーは固定の英語文言の `InvalidArgument` で、値・パスを含めない。secrets / configs のフラグは未提供(後続。REPAIR-3)。
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use fandhe_container_core::traits::Annotations;
-use fandhe_container_core::traits::types::TraitError;
+use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
 use fandhe_container_supervisor::container_options::env::{EnvFile, EnvSet, EnvVar};
 use fandhe_container_supervisor::container_options::{Label, Labels};
@@ -33,11 +36,7 @@ pub(super) fn document_of(
         .iter()
         .map(|s| EnvVar::parse(s))
         .collect::<Result<Vec<_>, _>>()?;
-    let files = options
-        .env_files
-        .iter()
-        .map(|p| EnvFile::read(p))
-        .collect::<Result<Vec<_>, _>>()?;
+    let files = read_env_files(&options.env_files)?;
     let env = EnvSet::resolve(&[], &files, &vars)?.to_env_strings();
     ContainerOptionsDocument::new(
         options.ulimits.clone(),
@@ -46,6 +45,34 @@ pub(super) fn document_of(
         options.shm_size.clone(),
         options.tmpfs.clone(),
     )
+}
+
+/// `--env-file` を読む待ちの上限(REPAIR-5)。
+const ENV_FILE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `--env-file` を作業スレッドで期限つきに読む(応答しない FUSE・ネットワーク FS で create が止まらない。REPAIR-5)。
+///
+/// 期限切れは `TIMEOUT`(作業スレッドは CLI の終了で消える。読み取りだけなので他の世代へ影響しない)。
+fn read_env_files(paths: &[PathBuf]) -> Result<Vec<EnvFile>, TraitError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let paths = paths.to_vec();
+    fandhe_container_supervisor::supervisor_log::run_bounded(
+        move || {
+            paths
+                .iter()
+                .map(|p| EnvFile::read(p))
+                .collect::<Result<Vec<_>, _>>()
+        },
+        ENV_FILE_READ_TIMEOUT,
+    )
+    .unwrap_or_else(|| {
+        Err(TraitError::new(
+            ErrorCode::Timeout,
+            "reading the env file did not finish within the deadline",
+        ))
+    })
 }
 
 /// `--label` を状態記録へ書く `Annotations` にする(件数・長さ・キー形式の上限は core の型が唯一の真実源)。

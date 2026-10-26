@@ -12,6 +12,10 @@
 //! （core の `create_audited` / `create_with_image_audited`。SEC-4・OCI-4・#2480。Linux のみ。非 Linux は
 //! `open_store` が先に失敗するため到達しない）。
 //!
+//! `create` は core を呼ぶ前に、同じ ID の前のインスタンスが残したコンテナログを best effort で回収する
+//! （`reclaim_stale_container_log`。`delete` の待ちを超えて残った分。#2698・SUP-7・CLI-1）。ID を再利用しない場合の
+//! 残りは手動で消す（`docs/setup/container-log-recovery.md`）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
@@ -41,7 +45,7 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{
-    ContainerId, CreateRequest, GetStateRequest, StartRequest, StateRecord, StateStore, TraitError,
+    ContainerId, CreateRequest, StartRequest, StateRecord, StateStore, TraitError,
 };
 
 use super::CliExit;
@@ -624,18 +628,43 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
     let _ = write_ops_once(recorder, &mut f);
 }
 
-/// 起動オプション文書を書く前の整理と書き込み(#2713・SUP-12)。書いた文書の識別(巻き戻し用)を返す。
+/// 起動オプション文書の I/O(ロック取得・書き込み・巻き戻し)を作業スレッドで待つ上限(REPAIR-5)。
+const OPTIONS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// ID 単位のロックの取得を待つ上限(`OPTIONS_IO_TIMEOUT` より短くし、期限切れを作業スレッド側でも検知する)。
+const OPTIONS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 書いた起動オプション文書と、create の間保持する ID 単位のロック(#2713・SUP-12)。
+struct PreparedOptions {
+    lock: options_store::OptionsLock,
+    root: std::path::PathBuf,
+    /// 書かなかった(指定が空・既存の状態がある)ときは `None`。
+    written: Option<options_store::WrittenOptions>,
+}
+
+fn options_timeout() -> TraitError {
+    TraitError::new(
+        fandhe_container_core::traits::ErrorCode::Timeout,
+        "container options file I/O did not finish within the deadline",
+    )
+}
+
+/// 起動オプション文書を書く前の整理と書き込み(#2713・SUP-12)。ロックと書いた文書の識別(巻き戻し用)を返す。
 ///
-/// - 同じ ID の状態が既にあれば何もしない(core の create が `ALREADY_EXISTS` で拒否し、既存コンテナの文書は触らない)
-/// - 状態が無いのに文書が残っている(前のコンテナの残骸)なら先に消す。CLI が作るコンテナに前の残骸が効かないように、
-///   指定が空でもこの掃除は行う
+/// ID 単位のロック(`options_store::acquire_lock`)を取り、core の create が終わるまで保持する。同じ ID の並行 `create` /
+/// `delete` が、状態の不在確認と文書の掃除・書き込みの間に割り込んで他方の文書を消すのを防ぐ。
+/// ロック取得・掃除・書き込み(fsync を含む)は作業スレッドで期限つきに待つ(REPAIR-5。応答しない FUSE・ネットワーク FS
+/// で create が止まらない)。期限切れの作業スレッドは CLI の終了で消え、後から文書が残っても状態が無いので次の create /
+/// delete が掃除する(別の世代の文書は、掃除がロックと状態の不在確認の下で行われるため消えない)。
+///
+/// - 同じ ID の状態が既にある(または確認できない)なら何もしない(core の create が拒否し、既存コンテナの文書は触らない)
+/// - 状態が無いのに文書が残っている(前のコンテナの残骸)なら先に消す。指定が空でもこの掃除は行う
 /// - 指定が空なら書かない(文書が無ければ supervisor は既定値で動く)
 /// - 状態ルートを持たない backend(非 Linux の plugin 経路)で指定があれば `UNIMPLEMENTED`(黙って捨てない)
 fn prepare_options_file(
     rt: &Runtime,
     id: &ContainerId,
     document: &ContainerOptionsDocument,
-) -> Result<Option<(std::path::PathBuf, options_store::WrittenOptions)>, TraitError> {
+) -> Result<Option<PreparedOptions>, TraitError> {
     let Some(root) = rt.store.host_state_root() else {
         if document.is_empty() {
             return Ok(None);
@@ -645,22 +674,60 @@ fn prepare_options_file(
             "container options are not supported by this backend",
         ));
     };
-    match rt.store.get(&GetStateRequest::new(id.clone())) {
-        Ok(_) => return Ok(None),
-        Err(e) if e.code() == fandhe_container_core::traits::ErrorCode::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    options_store::remove(root, id)?;
-    if document.is_empty() {
-        return Ok(None);
-    }
-    let written = options_store::write_new(root, id, document)?;
-    Ok(Some((root.to_path_buf(), written)))
+    let root = root.to_path_buf();
+    let job_root = root.clone();
+    let id = id.clone();
+    let document = document.clone();
+    let prepared = fandhe_container_supervisor::supervisor_log::run_bounded(
+        move || -> Result<_, TraitError> {
+            let lock = options_store::acquire_lock(&job_root, &id, OPTIONS_LOCK_WAIT)?;
+            if !super::stop_delete::id_is_still_deleted(&job_root, &id) {
+                return Ok((lock, None));
+            }
+            options_store::remove(&job_root, &id)?;
+            if document.is_empty() {
+                return Ok((lock, None));
+            }
+            let written = options_store::write_new(&job_root, &id, &document)?;
+            Ok((lock, Some(written)))
+        },
+        OPTIONS_IO_TIMEOUT,
+    )
+    .unwrap_or_else(|| Err(options_timeout()))?;
+    let (lock, written) = prepared;
+    Ok(Some(PreparedOptions {
+        lock,
+        root,
+        written,
+    }))
+}
+
+/// create が失敗したときの巻き戻し。自分が作った inode だけを消し、ロックファイルも消す(期限つき)。
+fn rollback_options(prepared: PreparedOptions, id: &ContainerId) -> Result<(), TraitError> {
+    let PreparedOptions {
+        lock,
+        root,
+        written,
+    } = prepared;
+    let id = id.clone();
+    fandhe_container_supervisor::supervisor_log::run_bounded(
+        move || -> Result<(), TraitError> {
+            let result = match &written {
+                Some(w) => options_store::remove_if_same(&root, &id, w),
+                None => Ok(()),
+            };
+            lock.remove_lock_file();
+            result
+        },
+        OPTIONS_IO_TIMEOUT,
+    )
+    .unwrap_or_else(|| Err(options_timeout()))
 }
 
 /// 起動オプション文書を core の create の前に書き、create が失敗したら自分が作った inode だけを消す(#2713・SUP-12)。
 ///
-/// 文書の書き込みに失敗したら core の create に入らない(オプションを黙って落とした状態を作らない。fail-closed)。
+/// 文書の準備に失敗したら core の create に入らない(オプションを黙って落とした状態を作らない。fail-closed)。
+/// core に到達しないので、この失敗は create の失敗として 1 回だけ計測する(REPAIR-4)。
 /// 巻き戻しの失敗は警告 1 行だけ出し、create の元のエラーを返す。
 fn create_with_options(
     rt: &Runtime,
@@ -668,15 +735,21 @@ fn create_with_options(
     image: Option<&CreateImage>,
     document: &ContainerOptionsDocument,
 ) -> Result<StateRecord, OciRuntimeError> {
-    let written = prepare_options_file(rt, req.id(), document)
-        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))?;
+    let started = Instant::now();
+    let prepared = match prepare_options_file(rt, req.id(), document) {
+        Ok(p) => p,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
     let r = match image {
         Some(image) => create_container_with_image_reclaiming(rt, image, req),
         None => create_container(rt, req),
     };
-    if r.is_err()
-        && let Some((root, written)) = &written
-        && let Err(e) = options_store::remove_if_same(root, req.id(), written)
+    if let Some(prepared) = prepared
+        && r.is_err()
+        && let Err(e) = rollback_options(prepared, req.id())
     {
         emit_warning_bounded(
             options_removal_warning(&e),
@@ -686,7 +759,6 @@ fn create_with_options(
     }
     r
 }
-
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。
 ///
 /// 要求構築・状態ストア初期化の失敗も操作名 `create` の失敗として計測する（REPAIR-4）。
@@ -701,7 +773,18 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
     .and_then(|(rt, (req, image, document))| {
-        let r = create_with_options(&rt, &req, image.as_ref(), &document);
+        let r = match reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder) {
+            // 回収の期限切れは core を呼ばずに create の失敗として計測する（REPAIR-4）。
+            Err(e) => {
+                if let Ok(name) = OpName::new("create") {
+                    let _ = rt
+                        .recorder
+                        .record(&name, OpOutcome::Failure, started.elapsed());
+                }
+                Err(e)
+            }
+            Ok(()) => create_with_options(&rt, &req, image.as_ref(), &document),
+        };
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r
     });
@@ -709,6 +792,65 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
     }
+}
+
+/// 同じ ID の前のインスタンスが残したコンテナログを、core の create の前に回収する（#2698・SUP-7・CLI-1・REPAIR-4）。
+///
+/// `delete` はコンテナログの sink 閉鎖を最大 10 秒しか待たないため、supervisor の terminate がそれを超えるとログが残る。
+/// 残りは同じ ID の `create` で消す（そうしないと新しいインスタンスの sink が既存の `<id>.log` を世代へ退避し、
+/// 古い出力が新しい世代に混ざる）。待たずに 1 回だけ試す（create を遅らせない。上限は
+/// `CONTAINER_LOG_REMOVE_TIMEOUT`）。古い supervisor がまだ sink を持つ（ロックが取れない）ときは何も消さない。
+/// 回収が期限切れ（`Timeout`。I/O 停止等で作業スレッドが残り得る）のときは、残った作業スレッドを抱えたまま
+/// 後続の監査記録（`FileAuditSink` は単一スレッド前提の fork を要する。SEC-4）へ進まないよう、core を呼ばずに
+/// `TIMEOUT` で create を失敗させる（fail-closed。分離違反の監査記録を失わない）。作業スレッドは CLI の終了で消え、
+/// guard は削除直前にロック保持中で評価されるため、後から別インスタンスのログを消すことはない。
+/// guard は `stop_delete::id_is_still_deleted`（ロック保持中に状態の不在を確認）で、同じ ID が既にあるときは消さず、
+/// 続く core の create が `ALREADY_EXISTS` を返す。best effort で create の成否・stderr は変えない。
+/// 観測は op 名 `container_log_reclaim`（1 件以上消した Success、エラーの Failure）。0 件は記録しない。
+fn reclaim_stale_container_log(
+    store: &dyn StateStore,
+    id: &fandhe_container_core::traits::ContainerId,
+    recorder: &OpRecorder,
+) -> Result<(), OciRuntimeError> {
+    use fandhe_container_supervisor::logs::{
+        CONTAINER_LOG_REMOVE_TIMEOUT, remove_container_logs_guarded_bounded,
+    };
+    let Some(root) = store.host_state_root() else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let guard_root = root.to_path_buf();
+    let guard_id = id.clone();
+    let mut timed_out = false;
+    let outcome = match remove_container_logs_guarded_bounded(
+        root,
+        id,
+        CONTAINER_LOG_REMOVE_TIMEOUT,
+        move || super::stop_delete::id_is_still_deleted(&guard_root, &guard_id),
+    ) {
+        Ok(removed) if removed.log_files() > 0 => OpOutcome::Success,
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            timed_out = e.code() == fandhe_container_core::traits::ErrorCode::Timeout;
+            OpOutcome::Failure
+        }
+    };
+    if let Ok(name) = OpName::new("container_log_reclaim") {
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+    reclaim_timeout_result(timed_out)
+}
+
+/// 回収の期限切れを create の失敗へ写す（残った作業スレッドを抱えたまま監査記録へ進まない。SEC-4・#2698）。
+fn reclaim_timeout_result(timed_out: bool) -> Result<(), OciRuntimeError> {
+    if timed_out {
+        return Err(OciRuntimeError::new(
+            LifecycleOp::Create,
+            fandhe_container_core::traits::ErrorCode::Timeout,
+            "stale container log reclaim did not finish within the deadline",
+        ));
+    }
+    Ok(())
 }
 
 /// 本番入口の `start`。成功時は何も出さない（OCI の start 互換）。
@@ -1636,6 +1778,32 @@ mod tests {
             assert!(!path.exists(), "the document must be rolled back");
         }
 
+        /// SUP-12・REPAIR-4(#2713): 文書の準備が失敗したら core に入らず、失敗を 1 回だけ計測し、状態を作らない。
+        #[test]
+        fn repair4_options_prepare_failure_is_recorded_once_and_creates_no_state() {
+            let base = TmpDir::new("optsprep");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            // 文書ディレクトリの位置に通常ファイルを置いて、準備(ディレクトリの検証)を失敗させる。
+            std::fs::write(options_store::options_dir(&root), b"x").expect("blocker");
+            let args = options_args(&bundle, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options).expect("doc");
+            create_with_options(&rt, &req, None, &doc).expect_err("must fail");
+            let name = OpName::new("create").expect("name");
+            let stats = rt.recorder.snapshot_op(&name).expect("recorded");
+            assert_eq!((stats.success(), stats.failure()), (0, 1));
+            assert!(
+                rt.store
+                    .get(&fandhe_container_core::traits::GetStateRequest::new(
+                        req.id().clone()
+                    ))
+                    .is_err(),
+                "core create must not have run"
+            );
+        }
+
         /// SUP-12(#2713): 指定が空でも、状態の無い残骸の文書は create が掃除する(前のコンテナの設定が効かない)。
         #[test]
         fn sup12_create_clears_stale_options_document() {
@@ -1911,5 +2079,123 @@ mod tests {
                 .expect("snap");
             assert_eq!((snap.success(), snap.failure()), (1, 1));
         }
+    }
+}
+/// 同じ ID の create 前の残りログ回収（#2698・SUP-7・CLI-1・REPAIR-4）の試験。ディレクトリ 0700 を前提にするため Linux のみ。
+#[cfg(all(test, target_os = "linux"))]
+mod reclaim_tests {
+    use super::*;
+    use fandhe_container_core::state_store::StateRoot;
+    use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest};
+    use fandhe_container_supervisor::logs::{RotatingFileSink, container_log_rotation_config};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("fc-cli-rc-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("mkdir");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            Self(p)
+        }
+        fn root(&self) -> PathBuf {
+            self.0.join("state")
+        }
+        fn store(&self) -> FileStateStore {
+            FileStateStore::open(StateRoot::from_override(self.root()).expect("root"))
+                .expect("open")
+        }
+        /// ロックファイルを除いたログファイルの数（ロックは guard が false でも片付く）。
+        fn names(&self) -> usize {
+            std::fs::read_dir(self.root().join("@container-logs"))
+                .map(|d| {
+                    d.filter(|e| {
+                        !e.as_ref()
+                            .expect("e")
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".lock")
+                    })
+                    .count()
+                })
+                .unwrap_or(0)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn id(s: &str) -> ContainerId {
+        ContainerId::new(s).expect("id")
+    }
+
+    fn open_sink(t: &Tmp, name: &str) -> RotatingFileSink {
+        let dir = t.root().join("@container-logs");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        RotatingFileSink::open(&dir, &id(name), container_log_rotation_config()).expect("sink")
+    }
+
+    fn stats(rec: &OpRecorder) -> Option<(u64, u64)> {
+        let n = OpName::new("container_log_reclaim").expect("name");
+        rec.snapshot_op(&n).map(|s| (s.success(), s.failure()))
+    }
+
+    /// 残ったログ（sink は閉じ済み）は消え、Success が 1 件記録される。0 件のときは何も記録しない。
+    #[test]
+    fn sup7_cli1_create_reclaims_leftover_logs_for_same_id() {
+        let t = Tmp::new("leftover");
+        let st = t.store();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
+        assert_eq!(stats(&rec), None);
+        drop(open_sink(&t, "a1"));
+        assert!(t.names() > 0);
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
+        assert_eq!(t.names(), 0);
+        assert_eq!(stats(&rec), Some((1, 0)));
+    }
+
+    /// 同じ ID の状態が既にあるときは消さず、何も記録しない（続く core の create が ALREADY_EXISTS を返す）。
+    #[test]
+    fn sup7_cli1_create_reclaim_keeps_logs_when_state_present() {
+        let t = Tmp::new("present");
+        let st = t.store();
+        drop(open_sink(&t, "p1"));
+        let bundle = t.0.join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        let req =
+            CreateStateRequest::new(ContainerStatus::created(id("p1"), None), bundle).expect("req");
+        st.create(&req).expect("create");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("p1"), &rec).expect("ok");
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), None);
+    }
+
+    /// 回収が期限切れなら create は core を呼ばず TIMEOUT で失敗する（SEC-4・SUP-7・#2698）。
+    #[test]
+    fn sup7_cli1_create_reclaim_timeout_fails_create_before_core() {
+        assert!(reclaim_timeout_result(false).is_ok());
+        let e = reclaim_timeout_result(true).expect_err("timeout");
+        assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
+    }
+
+    /// 古い supervisor の sink が生きている（ロック保持）ときは消さず、Failure が 1 件記録される。
+    #[test]
+    fn sup7_cli1_create_reclaim_records_failure_when_sink_alive() {
+        let t = Tmp::new("alive");
+        let st = t.store();
+        let _sink = open_sink(&t, "l1");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("l1"), &rec).expect("ok");
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), Some((0, 1)));
     }
 }

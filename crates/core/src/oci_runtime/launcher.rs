@@ -2288,6 +2288,20 @@ mod tests {
         env: &[&str],
         user: (u32, u32),
     ) -> LaunchSpec {
+        spec_with_root_readonly(name, false, linux_extra, mounts, args, env, user)
+    }
+
+    /// `root.readonly` を選べる組み立て(#2714)。`LaunchSpec::new` を直接使うため、`start` の `root.readonly` 拒否
+    /// (`Unimplemented`)は通らない。Landlock のルールが読み取り専用 root でどうなるかの単体照合専用。
+    fn spec_with_root_readonly(
+        name: &str,
+        root_readonly: bool,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+        args: &[&str],
+        env: &[&str],
+        user: (u32, u32),
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
@@ -2305,7 +2319,7 @@ mod tests {
         }
         let cfg = serde_json::json!({
             "ociVersion": "1.2.0",
-            "root": {"path": "rootfs"},
+            "root": {"path": "rootfs", "readonly": root_readonly},
             "hostname": "box",
             "process": {"user": {"uid": user.0, "gid": user.1}, "args": ["/bin/echo", "hi"],
                         "env": ["PATH=/bin"], "cwd": "/"},
@@ -3975,6 +3989,58 @@ mod tests {
         assert_eq!(run.1 & write, write);
         assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12・CORE-5・SEC-2(#2714): 読み取り専用 root では、分離の記録で WRITE を持つ宛先が利用者 tmpfs(`/run`)と
+    /// 暗黙の `/dev` 系だけになり、root は READ(0x000D)のまま。`--ipc=host` では `/dev/shm` が外れる。
+    #[test]
+    fn sup12_readonly_root_user_tmpfs_is_writable_only_at_destination() {
+        use crate::launch_isolation::RecordedTarget;
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        for (shm, ipc, want) in [
+            (
+                true,
+                LaunchIpcMode::Private,
+                vec!["/dev", "/dev/pts", "/dev/shm", "/run"],
+            ),
+            (false, LaunchIpcMode::Host, vec!["/dev", "/dev/pts", "/run"]),
+        ] {
+            let spec = spec_with_root_readonly(
+                "opts-ro-root-tmpfs",
+                true,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&["/run"], shm, &[], ipc));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            let record = p.launch_isolation().expect("record");
+            let rules = record.landlock().rules();
+            let root = rules
+                .iter()
+                .find(|r| matches!(r.target(), RecordedTarget::Root))
+                .expect("root rule");
+            assert_eq!(root.allowed(), 0x000D);
+            let run = rules
+                .iter()
+                .find(|r| {
+                    matches!(r.target(), RecordedTarget::Tmpfs { destination }
+                        if destination.as_str() == "/run")
+                })
+                .expect("/run rule");
+            assert_eq!(run.allowed() & write, write);
+            let mut writable: Vec<&str> = rules
+                .iter()
+                .filter(|r| r.allowed() & write != 0)
+                .map(|r| r.target().as_str())
+                .collect();
+            writable.sort();
+            assert_eq!(writable, want);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
     }
 
     /// SUP-12・CORE-5(#2625): `ro` の利用者 tmpfs は書き込み可能な root の下でも起動でき、Landlock のルールには載らない。

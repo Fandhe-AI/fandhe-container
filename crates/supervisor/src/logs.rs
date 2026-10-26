@@ -325,6 +325,8 @@ pub struct SweepReport {
     pub failed: usize,
     /// 期限切れまたは上限に達して打ち切った。
     pub timed_out: bool,
+    /// 同時実行枠が満杯で打ち切った（期限切れの `timed_out` とは区別する。#2894・ERR-1）。
+    pub workers_busy: bool,
 }
 
 /// 状態ルートの `@container-logs` を走査し、状態の記録が無い ID の残りログを回収する（起動時に 1 回。#2760・SUP-7・CRI-2・REPAIR-4）。
@@ -356,7 +358,7 @@ pub fn sweep_stale_container_logs(
         report.timed_out = true;
         return report;
     };
-    let initial = crate::supervisor_log::run_bounded(
+    let initial = crate::supervisor_log::run_bounded_classified(
         move || match std::fs::symlink_metadata(&dir) {
             Ok(_) => match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
                 Ok(s) => Initial::Scan(s),
@@ -368,14 +370,19 @@ pub fn sweep_stale_container_logs(
         first,
     );
     let scan = match initial {
-        Some(Initial::Scan(s)) => s,
-        Some(Initial::Missing) => return report,
-        Some(Initial::Failed) => {
+        Ok(Initial::Scan(s)) => s,
+        Ok(Initial::Missing) => return report,
+        Ok(Initial::Failed) => {
             report.failed = 1;
             return report;
         }
-        // 期限切れ・枠の満杯・起動失敗。作業スレッドは残り得るので打ち切る。
-        None => {
+        // 枠の満杯（何も実行していない。期限切れとは区別する。#2894）。
+        Err(crate::supervisor_log::BoundedFailure::Busy) => {
+            report.workers_busy = true;
+            return report;
+        }
+        // 期限切れ・起動失敗。作業スレッドは残り得るので打ち切る。
+        Err(crate::supervisor_log::BoundedFailure::Unfinished) => {
             report.timed_out = true;
             return report;
         }
@@ -420,8 +427,13 @@ pub fn sweep_stale_container_logs(
             Err(e) if e.code() == ErrorCode::FailedPrecondition => {
                 report.skipped_live = report.skipped_live.saturating_add(1);
             }
-            Err(e) if matches!(e.code(), ErrorCode::Timeout | ErrorCode::ResourceExhausted) => {
-                // 作業スレッドが残り得る、または枠が満杯。これ以上の試行を重ねず打ち切る。
+            Err(e) if e.code() == ErrorCode::ResourceExhausted => {
+                // 枠が満杯。期限切れとは区別し、これ以上の試行を重ねず打ち切る（#2894）。
+                report.workers_busy = true;
+                break;
+            }
+            Err(e) if e.code() == ErrorCode::Timeout => {
+                // 作業スレッドが残り得る。これ以上の試行を重ねず打ち切る。
                 report.timed_out = true;
                 break;
             }

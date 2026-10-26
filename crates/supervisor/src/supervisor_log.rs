@@ -243,6 +243,8 @@ pub enum LogRemoval {
     Finished,
     /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
     TimedOut,
+    /// 同時実行枠が満杯で、作業スレッドを起動しなかった（削除は試していない。期限切れではない。#2894・ERR-1）。
+    Busy,
 }
 
 /// 同時に走らせる削除作業スレッドの上限。枠は期限切れではなく作業の実終了まで保持する（REPAIR-5）。
@@ -278,7 +280,7 @@ impl Drop for InflightSlot {
 ///
 /// 期限切れのとき作業スレッドは join せず残す（止まった I/O を中断する手段は無く、待てば呼び出し元が無期限に戻らなく
 /// なるため）。残るスレッドは `MAX_INFLIGHT_LOG_REMOVALS` 個までで、枠は作業の実終了まで保持する。枠が埋まっている
-/// ときは best effort として削除を諦め、スレッドを起動せず `TimedOut` を返す（REPAIR-5）。
+/// ときは best effort として削除を諦め、スレッドを起動せず `Busy` を返す（期限切れの `TimedOut` とは区別する。#2894・REPAIR-5）。
 /// スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
 /// CLI の `delete` の警告出力の期限（`emit_warning_bounded`）も同じ仕組みを使う（#2434 で CLI から移設）。
 pub fn run_log_removal_bounded(
@@ -287,7 +289,8 @@ pub fn run_log_removal_bounded(
 ) -> LogRemoval {
     // 起動失敗は従来どおり `Finished` 扱い（結果を持ち帰る `run_bounded` では区別できないため、起動失敗を別に判定する）。
     match run_bounded_inner(job, timeout) {
-        BoundedOutcome::TimedOut | BoundedOutcome::Busy => LogRemoval::TimedOut,
+        BoundedOutcome::TimedOut => LogRemoval::TimedOut,
+        BoundedOutcome::Busy => LogRemoval::Busy,
         BoundedOutcome::NoResult | BoundedOutcome::Done(()) => LogRemoval::Finished,
     }
 }
@@ -368,6 +371,9 @@ fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
 /// 結果が得られなかったとき（期限切れ・同時実行枠の満杯・スレッド起動失敗・job の panic）は `None` を返す。
 /// 枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。呼び出し元は `None` を「結果が無い」として扱う
 /// （コンテナログの削除は `logs::remove_container_logs_bounded` が `Timeout` のエラーにする）。
+///
+/// 枠の満杯（何も実行していない）と期限切れを同じ `None` に潰すため、新しい呼び出し元は
+/// [`run_bounded_classified`] か `run_bounded_waiting` を使う（#2894）。
 pub fn run_bounded<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
     timeout: std::time::Duration,
@@ -607,7 +613,7 @@ mod tests {
     }
 
     /// REPAIR-4: remove は全ファイルを消し冪等。生存中は FailedPrecondition で何も消さない。
-    /// REPAIR-5: 枠が埋まっているとスレッドを起動せず TimedOut を返し、実終了で枠が戻る。
+    /// REPAIR-5: 枠が埋まっているとスレッドを起動せず Busy を返し(期限切れの TimedOut とは別。#2894)、実終了で枠が戻る。
     #[test]
     fn repair5_inflight_cap_gives_up_and_releases_on_finish() {
         let slots: Vec<_> = std::iter::from_fn(InflightSlot::acquire).collect();
@@ -618,7 +624,7 @@ mod tests {
             move || r.store(true, Ordering::SeqCst),
             Duration::from_millis(50),
         );
-        assert_eq!(out, LogRemoval::TimedOut);
+        assert_eq!(out, LogRemoval::Busy);
         assert!(!ran.load(Ordering::SeqCst));
         drop(slots);
         assert_eq!(

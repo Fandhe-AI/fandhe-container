@@ -394,6 +394,7 @@ pub const OPTIONS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// ロック取得・`guard` の評価・削除は作業スレッドで `timeout` まで待つ。`guard` はロック保持中に評価され、`false`
 /// (状態に記録がある = 作り直された新しいインスタンスの文書かもしれない)なら何も消さず `Ok`。期限切れは `Timeout`
 /// (作業スレッドは残り得るが、guard はロック保持中に評価されるので後から新しい文書を消すことはない)。
+/// 作業枠が満杯で何も実行しなかったときは `ResourceExhausted`(待たない。#2894)。
 /// Linux 以外では `Unimplemented`(文書を書く経路が無いため、呼び出し側は対象外として扱う)。
 pub fn remove_stale_bounded(
     root: &Path,
@@ -404,7 +405,7 @@ pub fn remove_stale_bounded(
 ) -> Result<(), TraitError> {
     let root = root.to_path_buf();
     let id = id.clone();
-    crate::supervisor_log::run_bounded(
+    crate::supervisor_log::run_bounded_classified(
         move || -> Result<(), TraitError> {
             // 文書もロックファイルも無ければ何もしない(ロックディレクトリを作らない。create のたびに状態ルートを汚さない)。
             // 文書が無くてもロックファイルが残っていれば(CLI の create は空オプションでもロックを取って残す)、
@@ -440,11 +441,19 @@ pub fn remove_stale_bounded(
         },
         timeout,
     )
-    .unwrap_or_else(|| {
-        Err(err(
-            ErrorCode::Timeout,
-            "container options file removal did not finish within the deadline",
-        ))
+    .unwrap_or_else(|failure| {
+        use crate::supervisor_log::BoundedFailure;
+        // 枠の満杯は何も実行していないので、期限切れ（`Timeout`）と区別する（#2894・ERR-1）。
+        Err(match failure {
+            BoundedFailure::Busy => err(
+                ErrorCode::ResourceExhausted,
+                "container options file removal workers are busy",
+            ),
+            BoundedFailure::Unfinished => err(
+                ErrorCode::Timeout,
+                "container options file removal did not finish within the deadline",
+            ),
+        })
     })
 }
 

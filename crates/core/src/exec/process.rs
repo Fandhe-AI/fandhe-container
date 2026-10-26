@@ -115,8 +115,8 @@ use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{
-    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
-    report_ready,
+    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_exec_returned,
+    report_failure, report_ready,
 };
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
@@ -540,8 +540,8 @@ fn verify_pivot_root(pivot_mnt_id: u64) -> Result<(), ExecError> {
 ///
 /// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <CODE> <reason|->` を書いて失敗を返し、全手順が
 /// 通ったら `R` を書いてから `execveat` する（`R` を書けなければ `execveat` へ進まない。fail-closed）。`R` の後の
-/// `execveat` 自体の失敗は何も書かない（親が `R` を読んだ後に `E` が混ざらないようにするため。errno 由来で、
-/// PID 1 の終了として観測される）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
+/// `execveat` 自体が errno で失敗したら `X <CODE>`（errno の分類のみ）を書く（`E` は混ぜない。親は `R` の後も
+/// EOF まで読み、`X` を起動失敗として扱う。#2716）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
 /// （close-on-exec）。`status` が `None` なら [`exec_entrypoint_verified_with`] と同じ（何も書かない）。
 fn exec_entrypoint_verified_reporting(
     pivot_mnt_id: u64,
@@ -568,7 +568,17 @@ fn exec_entrypoint_verified_reporting(
         }
         Ok(exe) => {
             report_exec_ready(status)?;
-            Err(execve_checked(entry, &exe))
+            let err = execve_checked(entry, &exe);
+            // `execveat` が戻った（errno 由来の失敗）。親は `R` の後も EOF まで読むため、分類だけを `X` で伝える
+            // （#2716）。書けなくても元のエラーを返す（親は EOF を成功と取り違える窓があるが、書けない状況は
+            // pipe の破損のみで、PID 1 はこの後すぐ終了する）。
+            if report_exec_returned(status, err.code).is_err() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fandhe-container: the execveat failure could not be reported"
+                );
+            }
+            Err(err)
         }
     }
 }

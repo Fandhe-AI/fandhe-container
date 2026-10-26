@@ -74,6 +74,11 @@
 //! - `port_mappings` は検証し（`crate::port_mapping`）、公開する要素（`host_port > 0`）があるときは pod の
 //!   netns（`pod_netns`）がある構成だけ受ける（なければ `UNIMPLEMENTED`）。公開そのものは RunPodSandbox の結線
 //!   （plugin-cri の `publish_port`）が行い、config.json には何も出さない（#2676・CRI-2・NET-3）。
+//! - コンテナの `readonly_rootfs` は `root.readonly=true` へ写す（偽は出力しない。core は rootfs の mount top だけを
+//!   ro にし、`/dev/shm`・tmpfs・rw の bind は書き込める。`/etc/resolv.conf` の bind は readonly_rootfs に関わらず常に ro。
+//!   利用者の `ro` の bind は readonly root のときだけ core が受理する〔#1917〕。readonly root では `/proc` への書き込みを
+//!   Landlock が落とす差がある）。sandbox 側の `readonly_rootfs` は適用先のプロセスが無いため出力しない
+//!   （CRI-2・CORE-5・SEC-1。#2767・#2827。`docs/design/cri-config-acceptance.md`）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（cgroup_parent・
 //!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
@@ -293,9 +298,15 @@ struct SpecOut<'a> {
     linux: LinuxOut<'a>,
 }
 
+/// `"readonly":true,` の長さ（JSON の大きさの会計）。
+const ROOT_READONLY_BYTES: usize = 16;
+
 #[derive(Serialize)]
 struct RootOut {
     path: &'static str,
+    /// 真のときだけ出す（偽は従来の出力とバイト単位で同じ）。core の start が rootfs の mount top を ro にする。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    readonly: bool,
 }
 
 #[derive(Serialize)]
@@ -1357,9 +1368,7 @@ fn build_inner(
             }
             capabilities = drop_capabilities(&c.drop_capabilities)?;
         }
-        if sc.readonly_rootfs {
-            return Err(unsupported("readonly_rootfs"));
-        }
+        // readonly_rootfs は root.readonly へ写す（下の SpecOut）。黙って落とさない（SEC-1）。
         if sc.selinux_options.is_some() {
             return Err(unsupported("selinux_options"));
         }
@@ -1506,9 +1515,17 @@ fn build_inner(
 
     check_mount_set(&mounts, &masked, &readonly)?;
 
+    let readonly_root = sc.is_some_and(|s| s.readonly_rootfs);
+    if readonly_root {
+        budget.spend(ROOT_READONLY_BYTES)?;
+    }
+
     let out = SpecOut {
         oci_version: OCI_VERSION,
-        root: RootOut { path: "rootfs" },
+        root: RootOut {
+            path: "rootfs",
+            readonly: readonly_root,
+        },
         hostname,
         process: ProcessOut {
             args,

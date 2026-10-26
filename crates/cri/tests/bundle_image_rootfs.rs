@@ -747,6 +747,11 @@ fn oci1_extract_limits_are_enforced_and_leave_no_bundle() {
     let p = env.provider_with(ImageRootfsSource::new(cfg));
     let e = prepare(&p, "c3", &container(&env.image_id)).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Timeout);
+    // blob の検証前に期限を確かめ、固定文言で返す（REPAIR-5・ERR-1・#2821）。
+    assert_eq!(
+        e.message(),
+        "image rootfs preparation exceeded its deadline"
+    );
     assert_eq!(bundle_count(&env), 0);
     // 上限内なら成功する（上の失敗が環境起因でないことの対）。
     let dir = prepare(&env.provider(), "c4", &container(&env.image_id)).expect("ok");

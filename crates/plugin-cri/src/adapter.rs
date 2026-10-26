@@ -317,8 +317,28 @@ impl CriPluginBackends {
 /// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
 /// running への force `delete` の最悪: stop 17 秒 + supervisor ログ 5 秒 + コンテナログ 15 秒 + 起動オプション文書 10 秒 = 47 秒。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
-/// bundle の用意と core の create のファイル I/O 自体の上限は、この内訳の外にある（既存の残余）。
+/// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
+/// この値で打ち切られ（DEADLINE_EXCEEDED）、worker の残存は [`PLUGIN_ROOTFS_DEADLINE`] + 分割できない区間 1 つ分 + 42.9 秒で有限になる
+/// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
+///
+/// `CreateContainer` の worker が `prepare` に使える時間の上限で、blob 1 本ごとと展開の前後で確かめる。RPC の応答は
+/// [`PLUGIN_RUNTIME_TIMEOUT`] で先に打ち切られるが、worker は打ち切れず、記録と件数枠はその終了まで残る。
+/// 値は既定（600 秒）のまま。変更はオーナー判断（本 issue では変えない）。
+pub const PLUGIN_ROOTFS_DEADLINE: Duration = fandhe_container_cri::bundle::DEFAULT_ROOTFS_DEADLINE;
+
+/// 本番の rootfs 展開設定（`ImageService` の pull と同じ値 + [`PLUGIN_ROOTFS_DEADLINE`] の明示）。
+#[cfg(unix)]
+fn production_extract_config(
+    state_root: &std::path::Path,
+) -> Result<fandhe_container_cri::bundle::ImageExtractConfig, CriError> {
+    let pull = production_pull_config(state_root)?;
+    let mut cfg = fandhe_container_cri::bundle::ImageExtractConfig::from_pull_config(&pull);
+    cfg.deadline = PLUGIN_ROOTFS_DEADLINE;
+    Ok(cfg)
+}
 
 /// 起動時の残りログの走査の全体の期限（#2760・REPAIR-5。サーブの開始は待たせず、別スレッドで走る）。
 pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
@@ -1126,7 +1146,7 @@ pub fn bundle_provider_with(
     state_root: &std::path::Path,
     store: Option<Arc<dyn ImageStore>>,
 ) -> Result<Arc<dyn BundleProvider>, CriError> {
-    use fandhe_container_cri::bundle::{ImageExtractConfig, ImageRootfsSource, SpecBundleProvider};
+    use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
     let fail = || CriError::failed_precondition("failed to prepare the bundle store");
@@ -1153,8 +1173,7 @@ pub fn bundle_provider_with(
     let [bundles, _images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
-    let pull = production_pull_config(state_root)?;
-    let mut source = ImageRootfsSource::new(ImageExtractConfig::from_pull_config(&pull));
+    let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
     if let Some(store) = store {
         source = source.with_image_store(store);
     }
@@ -1193,6 +1212,16 @@ mod tests {
     use fandhe_container_cri::instrument::{CriOpKind, CriOpTimer};
 
     use super::*;
+
+    /// REPAIR-5・#2821: 本番の rootfs 展開設定は `PLUGIN_ROOTFS_DEADLINE`（600 秒）を明示して使う。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_production_extract_config_uses_plugin_rootfs_deadline() {
+        let dir = std::env::temp_dir().join(format!("fcpc-extract-cfg-{}", std::process::id()));
+        let cfg = production_extract_config(&dir).expect("config");
+        assert_eq!(cfg.deadline, PLUGIN_ROOTFS_DEADLINE);
+        assert_eq!(cfg.deadline, Duration::from_secs(600));
+    }
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).expect("valid id")

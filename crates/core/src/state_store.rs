@@ -1750,9 +1750,8 @@ struct LaunchIsolationDto {
         deserialize_with = "capabilities_array"
     )]
     capabilities: Option<Vec<String>>,
-    /// launch が rootfs を読み取り専用で起動したか（SUP-6・CORE-5・SEC-1・#2829）。無ければ記録なし
-    /// （導入前の記録。「書き込み可能」とは推測しない）。`launchIsolation` に版番号は無く、キーの有無で世代を
-    /// 区別する。キー欠落だけを旧記録として許し、`null` や bool 以外は破損として拒否する（fail-closed）。
+    /// launch が適用した `root.readonly` の実効値（CLI-1・SUP-12・#2828）。キー欠落だけを旧記録（`None`）と
+    /// 読み、`null` や bool 以外は破損として拒否する（fail-closed）。
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -3604,10 +3603,10 @@ mod tests {
         assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
     }
 
-    /// SUP-6・CORE-5・#2829: rootfs 読み取り専用の記録が bool で往復し、キーの無い旧記録は `None`、
+    /// CLI-1・SUP-12・#2828: `root.readonly` の実効値の記録が bool で往復し、キーの無い旧記録は `None`、
     /// `null`・文字列・数値は破損として拒否される。
     #[test]
-    fn sup6_core5_2829_state_root_readonly_roundtrip_and_rejects_corruption() {
+    fn cli1_sup12_state_root_readonly_roundtrip_and_rejects_corruption() {
         for ro in [true, false] {
             let rec = iso(100).with_root_readonly(ro);
             let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();

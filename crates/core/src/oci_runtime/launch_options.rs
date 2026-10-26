@@ -15,6 +15,7 @@
 //! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
+//! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約
 //!
@@ -65,6 +66,8 @@ pub struct LaunchOptions {
     env: Vec<String>,
     /// `--cap-drop` の集合(config.json 由来の許可集合から除く。空なら何もしない)。
     capability_drop: CapabilitySet,
+    /// `--read-only`(true なら config の値によらず root を読み取り専用にする。false なら config に従う)。
+    root_readonly: bool,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -77,6 +80,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("rlimits", &self.rlimits)
             .field("env_count", &self.env.len())
             .field("capability_drop", &self.capability_drop)
+            .field("root_readonly", &self.root_readonly)
             .finish()
     }
 }
@@ -128,6 +132,7 @@ impl LaunchOptions {
             rlimits: Rlimits::default(),
             env: Vec::new(),
             capability_drop: CapabilitySet::empty(),
+            root_readonly: false,
         })
     }
 
@@ -143,6 +148,14 @@ impl LaunchOptions {
     #[must_use]
     pub fn with_capability_drop(mut self, drop: CapabilitySet) -> Self {
         self.capability_drop = drop;
+        self
+    }
+
+    /// `--read-only` を持たせる(CLI-1・SUP-12・#2828)。true は config の `root.readonly` と OR で効き、
+    /// `readonly:true` の config を書き込み可能に戻す経路は無い(false は「config に従う」)。
+    #[must_use]
+    pub fn with_root_readonly(mut self, root_readonly: bool) -> Self {
+        self.root_readonly = root_readonly;
         self
     }
 
@@ -191,6 +204,11 @@ impl LaunchOptions {
     /// `--ulimit` で指定された rlimit(指定した種別だけ)。
     pub fn rlimits(&self) -> &Rlimits {
         &self.rlimits
+    }
+
+    /// `--read-only` が指定されたか(config の値との OR は launcher が取る)。
+    pub fn root_readonly(&self) -> bool {
+        self.root_readonly
     }
 
     /// `--cap-drop` で除く capability の集合。

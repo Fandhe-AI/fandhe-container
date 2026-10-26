@@ -519,22 +519,15 @@ impl LaunchIsolationRecord {
         }
     }
 
-    /// launch が rootfs を読み取り専用（`MOUNT_ATTR_RDONLY`）で起動したかを添える（SUP-6・CORE-5・SEC-1・#2829）。
-    ///
-    /// 値は launcher が fork 前に config の `root.readonly` から作る（`mount_setattr` 後の観測値ではない）。
-    /// 子の `root_readonly` 段は失敗で launch 全体を失敗させる（fail-closed）ため、記録が書かれた
-    /// コンテナについては `true` ⇒ 実際に ro で起動した、が成り立つ。この段を縮退可能にする変更は
-    /// 記録の意味を壊すので、同時に本記録の作り方を見直すこと。観測専用で、exec の制限の緩和には使わない
-    /// （ro root は mount namespace の属性で、exec は `setns` で同じ namespace に入るため再適用すべきものは無い）。
-    ///
-    /// 版と後方互換: 導入前の記録は持たないので `None`（「書き込み可能」とは推測しない）。
+    /// launch が実際に適用した `root.readonly` の実効値(config と `--read-only` の OR。mount の RDONLY・Landlock の
+    /// root 規則と同じ値。CLI-1・SUP-12・CORE-5・#2828)を添える。添えなければ `None`(旧記録。推測しない)。
     #[must_use]
-    pub fn with_root_readonly(mut self, readonly: bool) -> Self {
-        self.root_readonly = Some(readonly);
+    pub fn with_root_readonly(mut self, root_readonly: bool) -> Self {
+        self.root_readonly = Some(root_readonly);
         self
     }
 
-    /// 記録された rootfs の読み取り専用の有無（記録が無ければ `None`）。
+    /// 添えられた `root.readonly` の実効値(無ければ `None`)。
     pub fn root_readonly(&self) -> Option<bool> {
         self.root_readonly
     }

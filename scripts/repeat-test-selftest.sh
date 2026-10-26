@@ -214,7 +214,10 @@ if command -v systemd-run >/dev/null 2>&1; then
   nosd_path="${work}/nosd"
   nosd_bash="${work}/nosd/bash"
 else
-  nosd_path="${work}/bin:${PATH}"
+  # work/bin には systemd-run のスタブがあるため PATH に入れない。cargo のスタブだけを別ディレクトリへ写す（symlink にしない）。
+  mkdir -p "${work}/nosd"
+  cp "${work}/bin/cargo" "${work}/nosd/cargo"
+  nosd_path="${work}/nosd:${PATH}"
   nosd_bash="$(command -v bash)"
 fi
 rc=0

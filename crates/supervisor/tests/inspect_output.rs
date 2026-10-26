@@ -57,24 +57,24 @@ fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
             b'"' => V::Str(parse_str(b, i)?),
             b'{' => V::Obj(parse_object(b, i)?),
             b'[' => V::Arr(parse_array(b, i)?),
-            b'n' => {
-                if b.get(*i..*i + 4) != Some(b"null".as_slice()) {
-                    return Err(format!("invalid literal at {}", *i));
-                }
-                *i += 4;
-                V::Null
-            }
             b't' | b'f' => {
-                let (lit, val) = if peek(b, *i)? == b't' {
-                    (b"true".as_slice(), true)
+                let (lit, val): (&[u8], bool) = if peek(b, *i)? == b't' {
+                    (b"true", true)
                 } else {
-                    (b"false".as_slice(), false)
+                    (b"false", false)
                 };
                 if b.get(*i..*i + lit.len()) != Some(lit) {
                     return Err(format!("invalid literal at {}", *i));
                 }
                 *i += lit.len();
                 V::Bool(val)
+            }
+            b'n' => {
+                if b.get(*i..*i + 4) != Some(b"null".as_slice()) {
+                    return Err(format!("invalid literal at {}", *i));
+                }
+                *i += 4;
+                V::Null
             }
             _ => V::Num(parse_int(b, i)?),
         };

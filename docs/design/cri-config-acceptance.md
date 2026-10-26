@@ -21,10 +21,11 @@
 | 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続 | net・core・cri | #2675 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
+| 16 | readonly_rootfs | core の `root.readonly`（#2767 で実装済み）→ cri が写す（実装済み。下記「readonly_rootfs の受け入れ方式」） | core → cri | #2827 |
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
-本表の外の項目（tty / stdin・readonly_rootfs・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
+本表の外の項目（tty / stdin・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
 
 ## イメージ User の解決方式（SEC-1・SEC-5・REPAIR-5）
 
@@ -102,6 +103,34 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 - 報告は `BundleProvider::prepare` の戻り値 `PreparedBundle`（`user()`）で `CriRuntimeService` へ届き、`ContainerRecord.applied_user` に保持する。置き場所はプロセス内メモリのレジストリで、寿命は `exit_code`・`resolved_log_path` と同じ（plugin-cri の再起動で消える）。config の annotations には書かず（CRI は書き換えを禁じる）、core の `StateStore` にも書かない（PLUG-1 の境界）。報告の無い経路（スタブ・報告しない provider）は `user` が `None` のまま（root を作り出さない）
 - 補助グループの保持量（最大 65,536 件）は `container_retained_bytes` の累積上限に入れ、超えたら `FAILED_PRECONDITION`（黙って切り詰めない）
 - 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。Status RPC が未実装（`UNIMPLEMENTED`）のため現状は応答に乗らない。Status RPC の実装時にこの関数を使う（REPAIR-3）
+
+## readonly_rootfs の受け入れ方式（CRI-2・CORE-5・SEC-1。#2827）
+
+コンテナの `LinuxContainerSecurityContext.readonly_rootfs=true` は、`config.json` の `root.readonly=true` へ写す（`crates/cri/src/bundle/spec.rs`）。`false`・security context なしは `readonly` キーを出さず、従来の出力とバイト単位で同じである。core の start は pivot_root の直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足し、Landlock の root 権利も同じ値から決める（#2767）。変換は Build 段と Validate 段で同じ関数を通る。
+
+sandbox 側（`LinuxSandboxSecurityContext.readonly_rootfs`）は出力しない。適用先のプロセス（pause コンテナ）が無く、無視しても分離が弱くなる方向ではないため（`supplemental_groups` の sandbox 側と同じ扱い）。
+
+### 書き込み可否の整理（本実装の挙動。`docs/api/bind-mounts.md`・`production_launcher` のシナリオ Y）
+
+| 対象 | readonly_rootfs=true のときの本実装 |
+| ---- | ---- |
+| rootfs | 読み取り専用（`EROFS`） |
+| `/dev/shm`・tmpfs・rw の bind | 書き込める（自分の mount 属性のまま） |
+| `/etc/resolv.conf`（`dns_config`） | 常に ro の bind（readonly_rootfs に依らない） |
+| `/etc/hosts`・`/etc/hostname` | bind を供給しない（イメージ内のファイルが root とともに ro になる） |
+| 利用者の `mounts[]` | `Mount.readonly` に従う。`ro` の bind は readonly root のときだけ core が受理する（#1917） |
+| `/proc` | Landlock が書き込みを落とす（`EACCES`） |
+
+### 既知の差（containerd との比較。未検証）
+
+containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`・`/etc/hosts`・`/etc/resolv.conf`）の bind を readonly_rootfs に従わせ、`/dev/shm` は rw と記憶しているが、本変更では一次情報（commit 指定）を再確認していない。以下は未検証の見込みとして扱う。
+
+- `/etc/resolv.conf` は readonly_rootfs=false でも本実装は常に ro（containerd は rw の見込み）。既存の差
+- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込み）。追跡 issue は [#2859](https://github.com/Fandhe-AI/fandhe-container/issues/2859)
+- `/etc/hosts`・`/etc/hostname` の供給を足すときは readonly_rootfs に従わせる
+- `process.cwd` が rootfs に無いとき、runc は作るが core は作らず失敗する（readonly とは独立した既存の差）
+
+照合は `crates/cri/tests/bundle_spec.rs` の `cri2_core5_readonly_rootfs_maps_to_root_readonly`・`cri2_readonly_rootfs_false_keeps_output_unchanged`。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

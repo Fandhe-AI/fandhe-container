@@ -65,7 +65,7 @@ impl ReferenceTable {
         }
         ExpandedSizePlan {
             layers,
-            root: self.journal_root.clone(),
+            root: self.journal_root.share(),
         }
     }
 }

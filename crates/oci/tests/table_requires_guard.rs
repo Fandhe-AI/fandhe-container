@@ -97,3 +97,46 @@ fn unguarded_table_still_serves_read_only_usage() {
     t.list_images(&root).expect("list_images");
     let _ = fs::remove_dir_all(&root);
 }
+
+/// OCI-7・SEC-1・#2701: ガードを drop した後に複製で取り出した単体テーブルも、rm・prune・復旧を拒否される。
+#[test]
+fn detached_clone_of_guarded_table_rejects_persisting_ops() {
+    use fandhe_container_oci::image_management::ImageStore;
+
+    let root = root("detached");
+    // 所有者・権限の検査を通すため root を 0700 にする。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    let store = ImageStore::open(&root).expect("open");
+    let (src, tag) = table();
+    let mut detached = {
+        let mut guard = store.lock().expect("lock");
+        let (d0, comp) = src
+            .manifests()
+            .next()
+            .map(|(d, c)| (d.clone(), c.clone()))
+            .expect("m");
+        guard.register_manifest(d0.clone(), comp).expect("manifest");
+        guard.register_tag(tag.clone(), &d0).expect("tag");
+        (*guard).clone()
+    };
+
+    let e = detached
+        .execute_image_rm(
+            &root,
+            &ImageRmTarget::Tag(tag),
+            &ImageRmOptions::default(),
+            &StoppedContainers::new(),
+        )
+        .expect_err("rm");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), MESSAGE);
+    let e = detached.execute_image_prune(&root).expect_err("prune");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    let e = detached.resume_pending_deletion(&root).expect_err("resume");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    let _ = fs::remove_dir_all(&root);
+}

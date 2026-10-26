@@ -370,9 +370,27 @@ pub struct ReferenceTable {
     journal_root: JournalRoot,
 }
 
-/// `ReferenceTable` に載せる検査用の root。等価比較・複製には影響しない（テーブルの内容ではないため）。
-#[derive(Debug, Clone, Default)]
+/// `ReferenceTable` に載せる検査用の root。等価比較には影響しない（テーブルの内容ではないため）。
+///
+/// 複製しても root は引き継がない（常に未設定）。排他区間のガードを drop した後に `(*guard).clone()` で
+/// 取り出した単体テーブルが、排他取得も在庫の読み直しもなしに rm・prune・復旧の永続化操作へ届く経路を
+/// 閉じるため（OCI-7・SEC-1・#2701）。
+#[derive(Debug, Default)]
 pub(crate) struct JournalRoot(Option<std::sync::Arc<root_handle::RootHandle>>);
+
+impl JournalRoot {
+    /// 同じ root のハンドルを共有する複製。読み取り専用の計画（`ExpandedSizePlan`）が検査済み root を持ち
+    /// 回るための明示的な経路で、`ReferenceTable` の複製には使わない。
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Clone for JournalRoot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
 
 impl PartialEq for JournalRoot {
     fn eq(&self, _: &Self) -> bool {

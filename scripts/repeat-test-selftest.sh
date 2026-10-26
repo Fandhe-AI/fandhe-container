@@ -200,17 +200,26 @@ check scope-binary-null 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL
 check scope-with-lib 2 "usage:" ok "${P}" "${T}" USER_SCOPE=1
 check scope-without-bin 2 "usage:" ok "${P}" USER_SCOPE=1
 check scope-invalid-value 2 "usage:" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=yes
-# systemd-run が PATH に無いときは skip せず失敗にする（require_cmd の失敗）。ホストの systemd-run の有無に依らず、
-# 必要なツールだけを symlink した PATH で検証する。
-mkdir -p "${work}/nosd"
-for t in bash env jq cat mktemp rm dirname cut tr grep sort wc sed id uname head sleep kill ps date mkdir ls cargo; do
-  src="$(command -v "${t}" 2>/dev/null || true)"
-  case "${t}" in cargo) src="${work}/bin/cargo" ;; esac
-  [ -z "${src}" ] || ln -sf "${src}" "${work}/nosd/${t}"
-done
+# systemd-run が PATH に無いときは skip せず失敗にする（require_cmd の失敗）。
+# systemd-run を持たないホスト（macOS・Windows の Git Bash）では通常の PATH がすでにその状態なので、そのまま使う。
+# Git Bash は `ln -sf` で symlink を作れず、`kill` 等の組み込みも解決先が無いため、PATH の組み立てを避ける（#2955）。
+# systemd-run を持つホスト（Linux）では、必要なツールだけを symlink した PATH で検証する。
+if command -v systemd-run >/dev/null 2>&1; then
+  mkdir -p "${work}/nosd"
+  for t in bash env jq cat mktemp rm dirname cut tr grep sort wc sed id uname head sleep kill ps date mkdir ls cargo; do
+    src="$(command -v "${t}" 2>/dev/null || true)"
+    case "${t}" in cargo) src="${work}/bin/cargo" ;; esac
+    case "${src}" in /*) ln -sf "${src}" "${work}/nosd/${t}" ;; esac
+  done
+  nosd_path="${work}/nosd"
+  nosd_bash="${work}/nosd/bash"
+else
+  nosd_path="${work}/bin:${PATH}"
+  nosd_bash="$(command -v bash)"
+fi
 rc=0
-out="$(env -i PATH="${work}/nosd" STUB_MODE=scope-ok STUB_COUNTER="${work}/counter" STUB_BIN="${work}/bin/exec_x_bin" \
-  PACKAGE=fandhe-container-x TEST_BIN=exec_x "${FL}" USER_SCOPE=1 "${work}/nosd/bash" "${target}" 2>&1)" || rc=$?
+out="$(env -i PATH="${nosd_path}" STUB_MODE=scope-ok STUB_COUNTER="${work}/counter" STUB_BIN="${work}/bin/exec_x_bin" \
+  PACKAGE=fandhe-container-x TEST_BIN=exec_x "${FL}" USER_SCOPE=1 "${nosd_bash}" "${target}" 2>&1)" || rc=$?
 if [ "${rc}" -ne 0 ] && ! printf '%s' "${out}" | grep -q '^skip:' && printf '%s' "${out}" | grep -q 'systemd-run'; then
   echo "OK: scope-missing-systemd-run"
 else

@@ -268,6 +268,35 @@ fn open_rootfs_for_search(rootfs: &Path) -> Result<(), CriError> {
     }
 }
 
+/// 展開後の rootfs に、core の起動が前提とするマウント先ディレクトリ（`proc`）が無ければ作る
+/// （CRI-2・OCI-4・SEC-1。#2818）。
+///
+/// busybox 等のイメージは `/proc` を持たず、core の rootfs 用意（`prepare_rootfs`）は `proc` が無いと
+/// `path_missing` で拒否するため、実イメージの起動が `PrepareRootfs` 段で失敗していた。ここは bundle が
+/// 今作ったばかりの私有の木（0700 の外側 bundle 配下）に対してだけ呼ばれる。既存のエントリは種別を問わず
+/// 触らない（symlink や通常ファイルは core 側の検査が拒否する。fail-closed）。
+fn ensure_mountpoints(rootfs: &Path) -> Result<(), CriError> {
+    let proc_path = rootfs.join("proc");
+    match std::fs::symlink_metadata(&proc_path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&proc_path).map_err(|_| {
+                CriError::internal("failed to create the proc mount point in the rootfs")
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&proc_path, std::fs::Permissions::from_mode(0o555))
+                    .map_err(|_| CriError::internal("failed to set the proc mount point mode"))?;
+            }
+            Ok(())
+        }
+        Err(_) => Err(CriError::internal(
+            "failed to inspect the proc mount point in the rootfs",
+        )),
+    }
+}
+
 fn untrusted(message: &'static str) -> CriError {
     CriError::failed_precondition(message)
 }
@@ -736,6 +765,7 @@ impl RootfsSource for ImageRootfsSource {
         .map_err(|e| CriError::from(PullError::from_extract(&e)))
         .and_then(|_| self.check_deadline(started))
         .and_then(|()| open_rootfs_for_search(rootfs))
+        .and_then(|()| ensure_mountpoints(rootfs))
         .and_then(|()| {
             // CRI の run_as_username は展開後の私有 rootfs の passwd で解決する（失敗は拒否。#2664）。
             if let Some(name) = user.run_as_username {
@@ -889,6 +919,28 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     const GROUP: &str = "root:x:0:\nstaff:x:50:app\nbad:x:q:\n";
+
+    /// CRI-2・SEC-1（#2818）: `proc` が無ければ作り、あれば（symlink でも）触らない。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_ensure_mountpoints_creates_proc_only_when_absent() {
+        let r = lookup_rootfs(None, None);
+        ensure_mountpoints(&r).unwrap();
+        assert!(r.join("proc").is_dir());
+        std::fs::remove_dir(r.join("proc")).unwrap();
+        std::os::unix::fs::symlink("/proc", r.join("proc")).unwrap();
+        ensure_mountpoints(&r).unwrap();
+        assert!(
+            std::fs::symlink_metadata(r.join("proc"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
 
     /// CRI-2・SEC-5: 名前・uid のみ・名前つきの組の解決表（具体値）。
     #[cfg(all(

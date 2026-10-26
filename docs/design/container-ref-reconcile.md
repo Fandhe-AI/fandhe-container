@@ -10,7 +10,7 @@ OCI-7・OCI-5・CLI-1・CORE-1（常駐デーモンを置かない）・REPAIR-3
 
 - `register` 成功後・状態作成前のクラッシュや `bind` 失敗で、未確定の参照が残る。同じ ID の再 create が `ALREADY_EXISTS` になり続け、
   manifest が GC・`image rm` から守られ続ける
-- `delete` で `--image-root` を省くと、確定済みの参照が残る
+- 記録を持たない古いコンテナや、core 到達後に解除が失敗した delete は、確定済みの参照を残す（`delete` 自身は create 時のストア root の記録から解除する。#2499 で実装済み。下の「delete 自身の解除」）
 
 ## 根本の危険
 
@@ -52,7 +52,7 @@ CLI の表面・3 OS の parity スクリプトへの波及を避けるため。
 | A: `create --image-root --image` の core 呼び出し前 | 同じ参照キー 1 件 | 状態 `Absent` のときだけ回収する。確定済みはゲート不要。未確定はゲート排他の下。`Present`・`Undetermined`・排他の期限切れは何もせず core に進む（core が `ALREADY_EXISTS` を返す。再試行で解ける） |
 | B: `image rm` が使用中で拒否したとき | 拒否に載った参照のうち現在の状態ルートのもの（上限 256 件） | ガードを手放した状態でゲート排他 → `reconcile_container_refs_quiesced`。その後に同じ判定をやり直す。排他が取れない・状態ストアが開けないときは照合を飛ばし従来どおり拒否 |
 
-契機 A が「同じ ID の恒久的な `ALREADY_EXISTS`」と「`--image-root` を省いた delete が残した確定済み参照」を解く。
+契機 A が「同じ ID の恒久的な `ALREADY_EXISTS`」と「delete が解除できずに残した確定済み参照」を解く（照合は後追いの回収役）。
 契機 B が「manifest が使用中のまま GC から守られ続ける」を解く。`image prune` の CLI は未配線（#2384）で、配線時に同じヘルパー
 （`ref_reconcile::reconcile_in_use`）を呼ぶ。
 
@@ -94,7 +94,17 @@ bundle の意図の記録（journal）を入れても、それを読んで掃引
 - 畳んだ参照キー（223 バイト以上の ID の `<scope>-<hash>`）は元の ID を復元できないため、契機 B では回収しない。契機 A は元の ID を知っているので回収できる（キー形式は #2500）
 - 契機 B はゲート排他を取れない（進行中の create がある）間は何もしない。次の `image rm` の再実行で回収される
 - ゲートを使わない `create_with_image` の呼び出し元（plugin 経由の配線等）を新設するときは、同じ規約（共有を保持して包む）を守る
-- `image prune` の CLI 配線は #2384。`delete` 自身の解除は #2499
+- `image prune` の CLI 配線は #2384
+
+## delete 自身の解除（#2499・OCI-7・OCI-5・CLI-1）
+
+常駐デーモンの無い CLI（CORE-1）では、照合は後追いにしかならない。そこで create はイメージストア root（`ImageStore::root()` の正規パス）を
+状態記録の annotations（予約キー `io.fandhe.container.image-root`。利用者の `--label` では書けない）へ残し、`--image-root` を省いた
+`delete` もその記録のストアを開いて参照を解除する。`--image-root` を渡した場合は記録と一致を確かめ、食い違えば `FAILED_PRECONDITION` で
+状態も参照も残す。記録の値は信頼せず、`ImageStore::open` の検査と開いた `root()` との一致を求める（開けなければ状態を消さずに失敗する）。
+解除の結果は `DeleteResponse::image_ref` に載り、失敗は stderr の警告（`image reference release failed`）で伝える（終了コードは 0）。
+参照キーの scope は開いた状態ストアの `host_state_root()`（正規パス）から求め、`--root` の表記ゆれで create と delete の scope がずれない。
+記録の root を消したり移したりしたコンテナは delete できない（元のパスにストアを戻すか、空の 0700 ディレクトリを作れば通る）。
 
 ## 不採用案
 

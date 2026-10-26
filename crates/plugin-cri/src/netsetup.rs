@@ -29,7 +29,7 @@
 //! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻し、
 //!   ネットワークを削除中として印を残す（完了まで `create_netns`・`attach` は `FailedPrecondition`。再試行の `delete_network` は可）。
 //!   attach の巻き戻しで取り残したコンテナに請求書（net の `FailedAttachClaim`）があれば、bridge を解放する前に
-//!   `reclaim_failed_attach`（別名と master の一致を確かめた veth と、このプロセスが作った pin だけを消す）で回収し、
+//!   `reclaim_failed_attach`（別名と master の一致を確かめた veth と、請求書・永続の所有記録に一致する pin だけを消す）で回収し、
 //!   成功したものから記録ファイルと記録を外す（`detach` も同じ回収をする。#2681）。請求書が無い・回収に失敗した取り残しは
 //!   記録を保持して `delete_network` を拒否し、取り残しのあるネットワークへの `create_netns`・`attach` は
 //!   `FailedPrecondition`
@@ -61,7 +61,8 @@
 //! - attach の取り残しの回収（#2681）: 請求書は [`ReclaimStore`] の `attach/<endpoint>.attach` に永続化し、再起動後に
 //!   読み込む。作成に成功したネットワークの記録（`CreatedNetwork`・IPAM）は永続化されていないため、再起動後は
 //!   「attach の記録だけから復元したネットワーク」となり、回収できるのは veth（所有確認つき）だけで、bridge・nft テーブルは
-//!   自動回収しない。netns の pin は同じプロセスで作ったものに限って解除でき、再起動後の pin は手動回収に残る。
+//!   自動回収しない。netns の pin は、請求書の識別子と置き場の永続の所有記録（`.owned/<endpoint>`。#2824）に
+//!   一致するものだけ再起動後も解除でき、照合できない pin（旧い請求書など）は手動回収に残る。
 //!   復元したネットワークの `delete_network` は取り残しを回収し終えたら記録を外し、ネットワーク本体は手動回収と
 //!   [`MSG_RECOVERED_NETWORK_UNTRACKED`] の `FailedPrecondition` で知らせる（成功を装わない）。壊れた記録はファイルを残して
 //!   登録せず、同じコンテナの再 attach はカーネルの `AlreadyExists` で拒否される。write-ahead（作成・attach 前の記録）は
@@ -369,7 +370,7 @@ pub trait NetsetupBackend: Send + Sync {
     /// attach の巻き戻しで取り残した資源を、所有を確認したうえで回収する。成功は回収の確認済み。
     ///
     /// 既定は回収せず `FailedPrecondition`（成功を装わない）。Linux バックエンドは net の
-    /// `network::reclaim_failed_attach` で、別名と master の一致を確かめた veth と、このプロセスが作った pin だけを消す。
+    /// `network::reclaim_failed_attach` で、別名と master の一致を確かめた veth と、請求書・永続の所有記録に一致する pin だけを消す。
     /// 所有を証明できない資源は残り、手動回収になる（REPAIR-3）。
     fn reclaim_failed_attach(&self, _claim: &Self::FailedAttach) -> Result<(), TraitError> {
         Err(TraitError::new(

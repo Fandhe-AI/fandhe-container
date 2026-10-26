@@ -108,7 +108,7 @@ CLI の `prepare_options_file`・`rollback_options`・`read_env_files` は `supe
 
 ### 繰り返し実行の記録（#2890・CLI-1・REPAIR-12）
 
-#2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel`（libtest ハーネスの 10 試験。プロセス内で並列）を
+Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel`（libtest ハーネスの 10 試験。プロセス内で並列）を
 `make repeat-test PACKAGE=fandhe-container-cli TEST_BIN=stop_control_channel SUCCESS_LINE='test sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill ... ok' COUNT=100`
 で繰り返した（ローカル。`nproc`=10・カーネル 7.0.0-34-generic）。いずれかの試験が失敗すると終了コードが非 0 になり、回が失敗として数えられる。
 

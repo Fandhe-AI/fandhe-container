@@ -695,6 +695,12 @@ impl PullSession<'_> {
             }
             Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
         }
+        // ディレクトリの複製は .part の作成より前に行う。作成後に失敗すると Drop が走らず .part が残り、
+        // 同じ digest の再オープンが "already exists" で塞がるため。
+        let dir = self
+            .pull_dir
+            .try_clone()
+            .map_err(|e| io_err(&e, "failed to open staging directory"))?;
         let part_name = format!("{hex}.part");
         let file = self.pull_dir.create_new_file(&part_name).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -706,10 +712,6 @@ impl PullSession<'_> {
                 map_write_err(&e)
             }
         })?;
-        let dir = self
-            .pull_dir
-            .try_clone()
-            .map_err(|e| io_err(&e, "failed to open staging directory"))?;
         Ok(StagedBlobWriter {
             dir,
             file: Some(file),

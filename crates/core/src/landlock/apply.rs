@@ -444,17 +444,14 @@ impl MountIdentity {
     /// `(st_dev, st_ino)` は `fstat`。pivot 前段の記録と適用時の照合が同じ関数を使い、出どころを揃える
     /// （#2071）。fdinfo は上限つきで読む。
     pub(crate) fn of_fd(fd: &OwnedFd) -> Result<Self, SysError> {
-        use std::io::Read as _;
-        use std::os::fd::AsRawFd as _;
+        use std::os::fd::AsFd as _;
         use std::os::unix::fs::MetadataExt as _;
         let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
-        let mut text = String::new();
-        std::fs::File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
-            .map_err(io)?
-            .take(FDINFO_MAX_BYTES)
-            .read_to_string(&mut text)
-            .map_err(io)?;
-        let mnt_id = crate::exec::parse_fdinfo_mnt_id(&text).ok_or(SysError::Os(sys::EINVAL))?;
+        use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
+        let mnt_id = read_fd_mnt_id(fd.as_fd()).map_err(|e| match e {
+            FdinfoMountIdError::Read(e) => io(e),
+            _ => SysError::Os(sys::EINVAL),
+        })?;
         let meta = std::fs::File::from(fd.try_clone().map_err(io)?)
             .metadata()
             .map_err(io)?;
@@ -465,9 +462,6 @@ impl MountIdentity {
         })
     }
 }
-
-/// fdinfo を読む上限（バイト。実際は数行）。
-const FDINFO_MAX_BYTES: u64 = 4096;
 
 /// Mount 由来のルール対象が、pivot 前段が載せたマウントのルートであることの判定（純粋関数。#2071・CORE-5・SEC-1）。
 ///

@@ -477,7 +477,8 @@ mod linux {
             &pin_value,
         )?;
         let create_claim = FailedCreateClaim::from_created(&net).to_record();
-        println!(
+        // pin のパスは空白を含みうる（TMPDIR 由来）ため hex で符号化して空白区切りの行に載せる。
+        let line = format!(
             "{ATTACH_CHILD_PREFIX}attach_claim={} create_claim={} host={} bridge={} bridge_index={} table={} pin={}",
             hex_encode(attach_claim.as_bytes()),
             hex_encode(create_claim.as_bytes()),
@@ -485,8 +486,16 @@ mod linux {
             net.bridge.as_str(),
             net.bridge_index.get(),
             net.table.as_str(),
-            attached.netns_path.display(),
+            hex_encode(attached.netns_path.display().to_string().as_bytes()),
         );
+        // SIGKILL で捨てられないよう、書いた直後に明示 flush する（バッファ挙動に依存しない）。
+        {
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{line}").map_err(|e| fail(format!("write claim line: {e}")))?;
+            out.flush()
+                .map_err(|e| fail(format!("flush claim line: {e}")))?;
+        }
         // inner の SIGKILL を待つ（ハンドルは手放さない）。来なければ期限で自分から失敗終了する。
         let deadline = Instant::now() + timeout() * 3;
         while Instant::now() < deadline {
@@ -929,7 +938,7 @@ mod linux {
             .parse()
             .map_err(|_| fail("bridge_index is not a number"))?;
         let table8 = field(&line, "table")?.to_owned();
-        let pin8 = PathBuf::from(field(&line, "pin")?);
+        let pin8 = PathBuf::from(hex_decode(field(&line, "pin")?)?);
         let c8 = EndpointId::new("c8")?;
         if pin8 != base.join("c8") {
             return Err(fail(format!("unexpected pin path {}", pin8.display())));

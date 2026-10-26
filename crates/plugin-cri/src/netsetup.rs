@@ -55,12 +55,11 @@
 //! - `publish_port`（#2676・NET-4）: attach 済みコンテナへ DNAT を追加する。ホスト側 bind IP（`host_ip`）は
 //!   明示した IPv4 だけ受け、未指定・IPv6 は `Unimplemented`（全アドレスへの公開を黙って作らない）。契約 11 は
 //!   全ネットワーク共通の `(host_port, protocol)` で本層が判定する（net の予約表はネットワークごとのため）。
-//!   公開 1 件の個別解除は `unpublish_port`（#2839・NET-3。net の `unpublish_container_port`）で行える。ただし
-//!   **CRI の経路は個別解除を呼ばない**: `port_mappings` は sandbox 単位で RunPodSandbox 以降変わらず、
-//!   `StopPodSandbox` / `RemovePodSandbox` は pod 専用ネットワークを `delete_network` で一括解放するため、
-//!   `delete_network` 以外の解除の契機は現状要らない。将来の候補は `set_up_sandbox` の公開途中の失敗の巻き戻しと、
-//!   attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）で、いずれも `NetworkPlugin` トレイトへの
-//!   `unpublish_port` 追加（PLUG-1 の拡張点の変更）を伴うため main の設計を経る後続事項とする。保持したハンドルは
+//!   公開 1 件の個別解除は `NetworkPlugin::unpublish_port`（#2904・NET-3・契約 13。net の
+//!   `unpublish_container_port`）で行う。CRI の経路で使うのは `set_up_sandbox` の公開途中の失敗の巻き戻しだけで、
+//!   通常の `StopPodSandbox` / `RemovePodSandbox` は pod 専用ネットワークを `delete_network` で一括解放する。
+//!   結果不明で記録した公開（ハンドルを持たない）は個別に解除できず `FailedPrecondition` で、`delete_network` が
+//!   解放する。attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）は後続事項。保持したハンドルは
 //!   プロセスのメモリ上だけで、再起動後は `delete_network` の一括解放に頼る。他プロセスとの受け口の衝突は検出しない
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
@@ -100,7 +99,7 @@ use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
     DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, DetachResponse, ErrorCode, IpCidr,
     NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol,
-    PublishPortRequest, TraitError,
+    PublishPortRequest, TraitError, UnpublishPortRequest, UnpublishPortResponse,
 };
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::netlink_route::IpPrefix;
@@ -121,6 +120,11 @@ pub const MSG_PUBLISH_PORT_IPV6_UNSUPPORTED: &str =
     "publish_port supports IPv4 host_ip only: IPv6 publishing is not supported";
 /// `publish_port` の SCTP 等の未対応プロトコルの文言。
 pub const MSG_PUBLISH_PORT_PROTOCOL_UNSUPPORTED: &str = "publish_port supports tcp and udp only";
+/// 結果不明で記録した公開は個別に解除できない（ハンドルを持たない）ことの文言。解放は `delete_network` だけ。
+pub const MSG_UNPUBLISH_PORT_RESULT_UNKNOWN: &str =
+    "published port has an unknown result and is released only by delete_network";
+/// 記録に無い公開の個別解除の文言。
+const MSG_UNPUBLISH_PORT_NOT_RECORDED: &str = "published port is not recorded";
 /// attach 済みコンテナの切り離しの未実装文言。
 pub const MSG_DETACH_UNAVAILABLE: &str =
     "detach of an attached container is not available yet: net has no per-container teardown";
@@ -170,6 +174,43 @@ fn with_leftover(base: TraitError, leftover: usize) -> TraitError {
             base.code().as_str()
         ),
     )
+}
+
+/// 公開・解除の要求値を検証して `PortPublish` にする（`publish_port` と `unpublish_port` で共通。バックエンドを
+/// 呼ぶ前の検証）。ホスト側 bind IP は明示した IPv4 だけ受け、tcp / udp 以外は `Unimplemented`。
+fn port_publish_from(
+    host_ip: Option<IpAddr>,
+    protocol: Protocol,
+    host_port: u16,
+    container_port: u16,
+) -> Result<PortPublish, TraitError> {
+    let host_ip = match host_ip {
+        Some(IpAddr::V4(ip)) => ip,
+        Some(IpAddr::V6(_)) => {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                MSG_PUBLISH_PORT_IPV6_UNSUPPORTED,
+            ));
+        }
+        None => {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                MSG_PUBLISH_PORT_HOST_IP_REQUIRED,
+            ));
+        }
+    };
+    let protocol = match protocol {
+        Protocol::Tcp => PortProtocol::Tcp,
+        Protocol::Udp => PortProtocol::Udp,
+        _ => {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                MSG_PUBLISH_PORT_PROTOCOL_UNSUPPORTED,
+            ));
+        }
+    };
+    PortPublish::new(protocol, host_ip, host_port, container_port)
+        .map_err(|e| net_error_to_trait(&e))
 }
 
 /// トレイトのネットワーク名を net の名前へ変換する（違反は `InvalidArgument`）。
@@ -451,7 +492,7 @@ pub trait NetsetupBackend: Send + Sync {
     /// 既定は `Unimplemented`（未対応のバックエンドが成功を装わないため）。
     ///
     /// 結果が不明なら `rules_unknown` を立てて返す。呼び出し側は受け口の記録を保持し、解放は `delete_network` に
-    /// 任せる（`publish_port` と同じ）。`NetworkPlugin` トレイトには出していない（PLUG-1 の拡張は後続事項）。
+    /// 任せる（`publish_port` と同じ）。`NetworkPlugin::unpublish_port`（#2904）の実装が呼ぶ。
     fn unpublish_port(
         &self,
         _network: &mut Self::Network,
@@ -498,6 +539,10 @@ struct ContainerEntry<C, A> {
     /// このコンテナが公開した受け口（契約 11 の判定キー。結果不明の公開を含む）。コンテナの記録と一緒に消える
     /// （`delete_network` の成功で記録ごと外れ、受け口は再公開できる）。件数は `MAX_PORT_PUBLISHES` で有界。
     published: Vec<(u16, Protocol)>,
+    /// `published` のうち、結果不明（DNAT ルールが入っている可能性がある）で記録したもの。ハンドルを持たない
+    /// ため `unpublish_port` では解除できず、`delete_network` だけが解放する（NET-3・#2904）。
+    /// 件数は `MAX_PORT_PUBLISHES` で有界。
+    unknown_published: Vec<(u16, Protocol)>,
 }
 
 /// 作成済みネットワーク 1 件の記録。
@@ -662,6 +707,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     // 再起動前のハンドルはプロセスと一緒に失われている（pin は手動回収。#2675）。
                     netns_retained: false,
                     published: Vec::new(),
+                    unknown_published: Vec::new(),
                 },
             );
         }
@@ -943,6 +989,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                         quarantine_held: false,
                         claim: None,
                         published: Vec::new(),
+                        unknown_published: Vec::new(),
                     },
                 );
             }
@@ -959,6 +1006,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 quarantine_held: false,
                 claim: None,
                 published: Vec::new(),
+                unknown_published: Vec::new(),
             },
         );
         Ok(NetnsStatus::new(req.container().clone(), netns))
@@ -1057,39 +1105,14 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
     }
 
     fn publish_port_impl(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
-        // 入力の検証（バックエンドを呼ぶ前）。ホスト側 bind IP は明示した IPv4 だけ受ける。
-        let host_ip = match req.host_ip() {
-            Some(IpAddr::V4(ip)) => ip,
-            Some(IpAddr::V6(_)) => {
-                return Err(TraitError::new(
-                    ErrorCode::Unimplemented,
-                    MSG_PUBLISH_PORT_IPV6_UNSUPPORTED,
-                ));
-            }
-            None => {
-                return Err(TraitError::new(
-                    ErrorCode::Unimplemented,
-                    MSG_PUBLISH_PORT_HOST_IP_REQUIRED,
-                ));
-            }
-        };
-        let protocol = match req.protocol() {
-            Protocol::Tcp => PortProtocol::Tcp,
-            Protocol::Udp => PortProtocol::Udp,
-            _ => {
-                return Err(TraitError::new(
-                    ErrorCode::Unimplemented,
-                    MSG_PUBLISH_PORT_PROTOCOL_UNSUPPORTED,
-                ));
-            }
-        };
-        let publish = PortPublish::new(
-            protocol,
-            host_ip,
+        // 入力の検証（バックエンドを呼ぶ前）。
+        let publish = port_publish_from(
+            req.host_ip(),
+            req.protocol(),
             req.host_port().get(),
             req.container_port().get(),
-        )
-        .map_err(|e| net_error_to_trait(&e))?;
+        )?;
+        let host_ip = publish.host_addr();
 
         let mut guard = self.lock()?;
         let reg = &mut *guard;
@@ -1161,9 +1184,86 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             Err(f) if f.rules_unknown => {
                 // DNAT ルールが残っている可能性がある。受け口の記録を保持し（別のコンテナへ同じ受け口を
                 // 渡さない）、解放は delete_network に任せる。残りの件数を載せて成功を装わない。
+                // ハンドルを持たないため、個別解除（unpublish_port）の対象外として印を付ける（#2904）。
                 record(reg);
+                if let Some(c) = reg.containers.get_mut(req.container().as_str()) {
+                    c.unknown_published.push(key);
+                }
                 Err(with_leftover(f.error, 1))
             }
+            Err(f) => Err(f.error),
+        }
+    }
+
+    /// 公開 1 件の個別解除（NET-3・CRI-2・#2904）。前提の判定順は契約 13。記録を外すのはバックエンドの
+    /// 解除が成功したときだけで、確定的な失敗・結果不明のどちらでも記録を保持する（fail-closed）。
+    fn unpublish_port_impl(
+        &self,
+        req: &UnpublishPortRequest,
+    ) -> Result<UnpublishPortResponse, TraitError> {
+        // 入力の検証（バックエンドを呼ぶ前）。
+        let publish = port_publish_from(
+            req.host_ip(),
+            req.protocol(),
+            req.host_port().get(),
+            req.container_port().get(),
+        )?;
+
+        let mut guard = self.lock()?;
+        let reg = &mut *guard;
+        let network = reg
+            .networks
+            .get_mut(req.network().as_str())
+            .ok_or_else(not_found_network)?;
+        if network.leaked.is_some() {
+            return Err(leaked_network());
+        }
+        if network.recovered {
+            return Err(recovered_network());
+        }
+        if network.deleting {
+            return Err(network_deleting());
+        }
+        let container = reg
+            .containers
+            .get(req.container().as_str())
+            .ok_or_else(not_found_netns)?;
+        if container.unreclaimed {
+            return Err(unreclaimed());
+        }
+        if container.attached.is_none() {
+            return Err(not_attached());
+        }
+        if container.network != req.network().as_str() {
+            return Err(network_mismatch());
+        }
+        let key = (req.host_port().get(), req.protocol());
+        if !container.published.contains(&key) {
+            return Err(TraitError::new(
+                ErrorCode::NotFound,
+                MSG_UNPUBLISH_PORT_NOT_RECORDED,
+            ));
+        }
+        if container.unknown_published.contains(&key) {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                MSG_UNPUBLISH_PORT_RESULT_UNKNOWN,
+            ));
+        }
+        let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
+        let attached = container.attached.as_ref().ok_or_else(not_attached)?;
+        match self.backend.unpublish_port(handle, attached, &publish) {
+            Ok(()) => {
+                if let Some(c) = reg.containers.get_mut(req.container().as_str())
+                    && let Some(pos) = c.published.iter().position(|k| *k == key)
+                {
+                    c.published.remove(pos);
+                }
+                Ok(UnpublishPortResponse::new())
+            }
+            // 結果不明: 記録（受け口の予約）を保持し、解放は delete_network に任せる。
+            Err(f) if f.rules_unknown => Err(with_leftover(f.error, 1)),
+            // 確定的な失敗（ルールが残っている・予約の解放に失敗・未対応等）: 記録を保持して再試行できる。
             Err(f) => Err(f.error),
         }
     }
@@ -1547,6 +1647,13 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
 
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
         self.timed("net.publish_port", || self.publish_port_impl(req))
+    }
+
+    fn unpublish_port(
+        &self,
+        req: &UnpublishPortRequest,
+    ) -> Result<UnpublishPortResponse, TraitError> {
+        self.timed("net.unpublish_port", || self.unpublish_port_impl(req))
     }
 
     fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_core::traits::{
     AttachRequest, ContainerId, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,
     DetachRequest, ErrorCode, IpCidr, NetworkName, NetworkPlugin, Protocol, PublishPortRequest,
-    TraitError,
+    TraitError, UnpublishPortRequest,
 };
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName, PortPublish};
@@ -72,6 +72,10 @@ struct Script {
     fail_publish_port: u16,
     /// 失敗させる publish_port の結果を不明（DNAT ルールが入った可能性）にするか。
     publish_unknown: bool,
+    /// このホストポートの unpublish_port を失敗させる（0 は失敗させない）。
+    fail_unpublish_port: u16,
+    /// 失敗させる unpublish_port の結果を不明（ルールが残った可能性）にするか。
+    unpublish_unknown: bool,
 }
 
 #[derive(Clone, Default)]
@@ -252,6 +256,29 @@ impl NetsetupBackend for Fake {
             return Err(PublishFailure {
                 error: TraitError::new(ErrorCode::Internal, "publish failed"),
                 rules_unknown: s.publish_unknown,
+            });
+        }
+        Ok(())
+    }
+
+    fn unpublish_port(
+        &self,
+        network: &mut String,
+        container: &FakeContainer,
+        publish: &PortPublish,
+    ) -> Result<(), PublishFailure> {
+        let mut s = self.0.lock().expect("lock");
+        s.calls.push(format!(
+            "unpublish_port {network} {} {}:{}->{}",
+            container.0,
+            publish.host_addr(),
+            publish.host_port(),
+            publish.container_port()
+        ));
+        if s.fail_unpublish_port == publish.host_port() {
+            return Err(PublishFailure {
+                error: TraitError::new(ErrorCode::Internal, "unpublish failed"),
+                rules_unknown: s.unpublish_unknown,
             });
         }
         Ok(())
@@ -640,38 +667,40 @@ fn net4_publish_port_unknown_result_keeps_the_listener_until_network_deleted() {
         .expect("republish");
 }
 
+/// publish_port・unpublish_port を実装しない（既定のままの）バックエンド。
+#[derive(Clone, Default)]
+struct NoPublish(Fake);
+impl NetsetupBackend for NoPublish {
+    type Network = String;
+    type Container = FakeContainer;
+    type FailedCreate = String;
+    type FailedAttach = (String, String);
+    fn create_network(
+        &self,
+        name: &NetName,
+        gateway: IpPrefix,
+    ) -> Result<String, CreateFailure<String>> {
+        self.0.create_network(name, gateway)
+    }
+    fn attach(
+        &self,
+        network: &mut String,
+        endpoint: &EndpointId,
+    ) -> Result<AttachOutcome<FakeContainer>, AttachFailure<(String, String)>> {
+        self.0.attach(network, endpoint)
+    }
+    fn delete_network(
+        &self,
+        network: &mut String,
+        containers: Vec<FakeContainer>,
+    ) -> Result<(), DeleteFailure<FakeContainer>> {
+        self.0.delete_network(network, containers)
+    }
+}
+
 /// REPAIR-3: publish_port を実装しないバックエンドは既定で Unimplemented を返し、成功を装わない。
 #[test]
 fn repair3_backend_without_publish_support_is_unimplemented() {
-    #[derive(Clone, Default)]
-    struct NoPublish(Fake);
-    impl NetsetupBackend for NoPublish {
-        type Network = String;
-        type Container = FakeContainer;
-        type FailedCreate = String;
-        type FailedAttach = (String, String);
-        fn create_network(
-            &self,
-            name: &NetName,
-            gateway: IpPrefix,
-        ) -> Result<String, CreateFailure<String>> {
-            self.0.create_network(name, gateway)
-        }
-        fn attach(
-            &self,
-            network: &mut String,
-            endpoint: &EndpointId,
-        ) -> Result<AttachOutcome<FakeContainer>, AttachFailure<(String, String)>> {
-            self.0.attach(network, endpoint)
-        }
-        fn delete_network(
-            &self,
-            network: &mut String,
-            containers: Vec<FakeContainer>,
-        ) -> Result<(), DeleteFailure<FakeContainer>> {
-            self.0.delete_network(network, containers)
-        }
-    }
     let net = NetsetupNetwork::new(NoPublish::default());
     pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("pod");
     pod_network::set_up_container(&net, &nname("a"), &cid("c1")).expect("container");
@@ -826,6 +855,21 @@ fn repair4_public_ops_are_recorded() {
         .find(|s| s.name().as_str() == "net.create_network")
         .expect("stats");
     assert_eq!((s.success(), s.failure()), (1, 1));
+    // 個別解除も計測される（未 attach の解除は NotFound で失敗として記録される。NET-3・#2904）。
+    net.unpublish_port(&UnpublishPortRequest::new(
+        nname("pod1"),
+        cid("c1"),
+        NonZeroU16::new(8080).expect("port"),
+        NonZeroU16::new(80).expect("port"),
+        Protocol::Tcp,
+    ))
+    .expect_err("not attached");
+    let snap = rec.snapshot();
+    let s = snap
+        .iter()
+        .find(|s| s.name().as_str() == "net.unpublish_port")
+        .expect("unpublish stats");
+    assert_eq!((s.success(), s.failure()), (0, 1));
 }
 
 /// 契約 6・後始末: attach の巻き戻しで資源を取り残したら、記録を残し detach・再 attach・ネットワーク削除を拒否する。
@@ -1788,6 +1832,12 @@ impl NetworkPlugin for GatedNetwork {
     ) -> Result<fandhe_container_core::traits::PortMapping, TraitError> {
         self.inner.publish_port(req)
     }
+    fn unpublish_port(
+        &self,
+        req: &UnpublishPortRequest,
+    ) -> Result<fandhe_container_core::traits::UnpublishPortResponse, TraitError> {
+        self.inner.unpublish_port(req)
+    }
     fn detach(
         &self,
         req: &DetachRequest,
@@ -2190,9 +2240,10 @@ fn set_up_sandbox_publishes_ports_after_attach() {
     );
 }
 
-/// 2 件目の公開が失敗したら delete_network だけで戻す（attach 済みの detach は呼ばない）。
+/// 2 件目の公開が失敗したら、公開済みの 1 件を個別に解除してから delete_network で戻す
+/// （attach 済みの detach は呼ばない。NET-3・CRI-2・#2904）。
 #[test]
-fn set_up_sandbox_rolls_back_with_delete_network_only_when_publish_fails() {
+fn cri2_set_up_sandbox_unpublishes_then_deletes_network_when_publish_fails() {
     let (net, fake) = plugin();
     fake.0.lock().expect("lock").fail_publish_port = 8081;
     let ports = [
@@ -2204,8 +2255,13 @@ fn set_up_sandbox_rolls_back_with_delete_network_only_when_publish_fails() {
     assert_eq!(f.error.message(), "publish failed");
     let calls = fake.calls();
     assert_eq!(
-        calls.last().unwrap(),
-        &format!("delete_network {SB} [{SB}]")
+        calls[calls.len() - 4..],
+        [
+            format!("publish_port {SB} {SB} 192.0.2.10:8080->80"),
+            format!("publish_port {SB} {SB} 192.0.2.10:8081->80"),
+            format!("unpublish_port {SB} {SB} 192.0.2.10:8080->80"),
+            format!("delete_network {SB} [{SB}]"),
+        ]
     );
     assert_eq!(
         calls
@@ -2240,7 +2296,7 @@ fn set_up_sandbox_publish_rollback_failure_is_not_rolled_back() {
 /// NET-3・#2839: `unpublish_port` を実装しないバックエンドは成功を装わず `Unimplemented`（結果不明ではない）。
 #[test]
 fn net3_unpublish_port_defaults_to_unimplemented() {
-    let (_, fake) = plugin();
+    let fake = NoPublish::default();
     let publish = PortPublish::new(
         fandhe_container_net::network::PortProtocol::Tcp,
         "192.0.2.10".parse().expect("addr"),
@@ -2254,4 +2310,219 @@ fn net3_unpublish_port_defaults_to_unimplemented() {
         .expect_err("unimplemented");
     assert_eq!(e.error.code(), ErrorCode::Unimplemented);
     assert!(!e.rules_unknown);
+}
+/// 個別解除で受け口が解放され、別ネットワークのコンテナが同じ受け口を公開できる（契約 11・13）。
+#[test]
+fn net3_unpublish_port_releases_listener_for_republish() {
+    let (net, fake) = plugin();
+    attached(&net, "a", "c1");
+    attached(&net, "b", "c2");
+    let m = net
+        .publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("publish");
+    net.unpublish_port(&UnpublishPortRequest::from(&m))
+        .expect("unpublish");
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        "unpublish_port a c1 192.0.2.10:8080->80"
+    );
+    net.publish_port(&publish_req("b", "c2", 8080, ip4()))
+        .expect("republish elsewhere");
+}
+
+fn unpublish_req(network: &str, container: &str, host_port: u16) -> UnpublishPortRequest {
+    UnpublishPortRequest::new(
+        nname(network),
+        cid(container),
+        NonZeroU16::new(host_port).expect("port"),
+        NonZeroU16::new(80).expect("port"),
+        Protocol::Tcp,
+    )
+    .with_host_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+}
+
+/// 契約 13 の判定順: ネットワーク未作成 → 未 attach → 越境 → 未公開。いずれもバックエンドを呼ばない。
+#[test]
+fn net3_unpublish_port_precondition_order() {
+    let (net, fake) = plugin();
+    let code = |net: &NetsetupNetwork<Fake>, network: &str| {
+        net.unpublish_port(&unpublish_req(network, "c1", 8080))
+            .expect_err("rejected")
+            .code()
+    };
+    assert_eq!(code(&net, "a"), ErrorCode::NotFound);
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("pod");
+    assert_eq!(code(&net, "a"), ErrorCode::NotFound);
+    pod_network::set_up_container(&net, &nname("a"), &cid("c1")).expect("container");
+    pod_network::set_up_pod(&net, &nname("b"), subnet()).expect("pod b");
+    assert_eq!(code(&net, "b"), ErrorCode::FailedPrecondition);
+    assert_eq!(code(&net, "a"), ErrorCode::NotFound);
+    assert!(!fake.calls().iter().any(|c| c.starts_with("unpublish_port")));
+}
+
+/// 成功後の同じ要求は NotFound（Ok を返さない）。
+#[test]
+fn net3_unpublish_port_twice_is_not_found() {
+    let (net, _) = plugin();
+    attached(&net, "a", "c1");
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("publish");
+    net.unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect("first");
+    let e = net
+        .unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect_err("second");
+    assert_eq!(e.code(), ErrorCode::NotFound);
+    assert_eq!(e.message(), "published port is not recorded");
+}
+
+/// 確定的な失敗は記録を保持し、同じ要求で再試行できる。
+#[test]
+fn net3_unpublish_port_definite_failure_keeps_record_and_retries() {
+    let (net, fake) = plugin();
+    attached(&net, "a", "c1");
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("publish");
+    fake.0.lock().expect("lock").fail_unpublish_port = 8080;
+    let e = net
+        .unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect_err("definite failure");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert_eq!(e.message(), "unpublish failed");
+    assert_eq!(
+        net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+            .expect_err("still published")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
+    fake.0.lock().expect("lock").fail_unpublish_port = 0;
+    net.unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect("retry");
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("republish");
+}
+
+/// 結果不明の解除は Internal（left behind）で記録を保持し、delete_network の後に再公開できる。
+#[test]
+fn net3_unpublish_port_unknown_result_quarantines_until_delete_network() {
+    let (net, fake) = plugin();
+    attached(&net, "a", "c1");
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("publish");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_unpublish_port = 8080;
+        s.unpublish_unknown = true;
+    }
+    let e = net
+        .unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect_err("unknown");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert!(e.message().contains("left behind"), "{}", e.message());
+    assert_eq!(
+        net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+            .expect_err("quarantined")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
+    net.delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect("delete");
+    attached(&net, "a", "c1");
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect("republish after delete");
+}
+
+/// 結果不明で記録した公開は個別に解除できない（FailedPrecondition・固定文言）。バックエンドを呼ばない。
+#[test]
+fn net3_unpublish_port_of_unknown_publish_is_failed_precondition() {
+    let (net, fake) = plugin();
+    attached(&net, "a", "c1");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_publish_port = 8080;
+        s.publish_unknown = true;
+    }
+    net.publish_port(&publish_req("a", "c1", 8080, ip4()))
+        .expect_err("unknown publish");
+    let e = net
+        .unpublish_port(&unpublish_req("a", "c1", 8080))
+        .expect_err("not individually releasable");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        e.message(),
+        "published port has an unknown result and is released only by delete_network"
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("unpublish_port")));
+}
+
+/// 個別解除が失敗しても、残りの解除と delete_network を続け、rolled_back は偽。
+#[test]
+fn cri2_set_up_sandbox_unpublish_failure_still_deletes_network() {
+    let (net, fake) = plugin();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_publish_port = 8082;
+        s.fail_unpublish_port = 8080;
+    }
+    let ports = [
+        pod_publish(8080, "192.0.2.10"),
+        pod_publish(8081, "192.0.2.10"),
+        pod_publish(8082, "192.0.2.10"),
+    ];
+    let f = pod_network::set_up_sandbox(&net, SB, subnet(), &ports).expect_err("fail");
+    assert!(!f.rolled_back);
+    assert_eq!(f.error.code(), ErrorCode::Internal);
+    assert!(f.error.message().contains("publish failed"), "{}", f.error);
+    assert!(
+        f.error.message().contains("rollback unpublish_port failed"),
+        "{}",
+        f.error
+    );
+    let calls = fake.calls();
+    assert_eq!(
+        calls[calls.len() - 3..],
+        [
+            format!("unpublish_port {SB} {SB} 192.0.2.10:8081->80"),
+            format!("unpublish_port {SB} {SB} 192.0.2.10:8080->80"),
+            format!("delete_network {SB} [{SB}]"),
+        ]
+    );
+}
+
+/// attach の失敗では公開が無いので個別解除を呼ばず、detach → delete_network の順のまま。
+#[test]
+fn cri2_set_up_sandbox_attach_failure_never_unpublishes() {
+    let (net, fake) = plugin();
+    fake.0.lock().expect("lock").fail_attach = true;
+    let ports = [pod_publish(8080, "192.0.2.10")];
+    let f = pod_network::set_up_sandbox(&net, SB, subnet(), &ports).expect_err("fail");
+    assert!(f.rolled_back);
+    let calls = fake.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("unpublish_port")));
+    assert!(!calls.iter().any(|c| c.starts_with("publish_port")));
+    assert_eq!(
+        fake.netns_calls(),
+        vec![format!("create_netns {SB}"), format!("release_netns {SB}")]
+    );
+    assert_eq!(calls.last().unwrap(), &format!("delete_network {SB} []"));
+}
+
+/// 個別解除できた受け口は、delete_network が失敗しても記録から外れ、別ネットワークで再公開できる。
+#[test]
+fn cri2_set_up_sandbox_unpublished_ports_are_republishable_after_failed_delete() {
+    let (net, fake) = plugin();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_publish_port = 8081;
+        s.fail_delete = 1;
+    }
+    let ports = [
+        pod_publish(8080, "192.0.2.10"),
+        pod_publish(8081, "192.0.2.10"),
+    ];
+    let f = pod_network::set_up_sandbox(&net, SB, subnet(), &ports).expect_err("fail");
+    assert!(!f.rolled_back);
+    attached(&net, "other", "c9");
+    net.publish_port(&publish_req("other", "c9", 8080, ip4()))
+        .expect("8080 was released individually");
 }

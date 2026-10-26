@@ -132,6 +132,19 @@ containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`�
 
 照合は `crates/cri/tests/bundle_spec.rs` の `cri2_core5_readonly_rootfs_maps_to_root_readonly`・`cri2_readonly_rootfs_false_keeps_output_unchanged`。
 
+### カーネルの事実（EROFS と Landlock の順序。CORE-5・SEC-1。#2837）
+
+`production_launcher` のシナリオ Y（#2767）は、読み取り専用 rootfs への書き込みが Landlock の `EACCES`（13）ではなく VFS の `EROFS`（30）で返ることを条件にしている。Landlock は個別の `security_*` フックで拒否するため、フックより前に VFS が「mount が読み取り専用」で止めることが前提になる。この順序を Linux `v6.12`（commit `adc218676eef25575469234709c2d87185ca223a`。リポの参照版。tag と commit は [exec-without-supervisor.md](exec-without-supervisor.md) の版表と同じ）のソースで確かめた。確認日は 2026-10-26。
+
+| 操作（シナリオ Y のプローブ） | 出典（v6.12） | 結果 |
+| ----------------------------- | ------------- | ---- |
+| 新規作成（`open(O_WRONLY\|O_CREAT\|O_EXCL)`。`RO_CREATE`） | [`fs/namei.c` L3683](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3683)（`open_last_lookups` が `got_write = !mnt_want_write(...)`）、[L3550-L3558](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3550-L3558)（`lookup_open` は `got_write` が偽なら `create_error = -EROFS` とし、`may_o_create` を呼ばない）、[L3600-L3603](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3600-L3603)（負の dentry なら `create_error` を返す）。Landlock の `security_path_mknod` は `may_o_create` の中（[L3414](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3414)）にあり、`got_write` が真のときだけ呼ばれる | 一致。mount が ro なら Landlock のフックに到達する前に `EROFS`。条件: 対象の dentry がまだ無いこと（あれば `EEXIST` 等の別の結果になりうる。プローブは `/ro-probe-new` で存在しない名前を使う） |
+| 既存ファイルへの書き込み open（`open(O_WRONLY)`。`RO_WRITE`） | [`fs/open.c` L929](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L929)（`do_dentry_open` が `file_get_write_access`）→ [L883-L895](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L883-L895)（`mnt_get_write_access`）→ [`fs/namespace.c` L492-L494](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namespace.c#L492-L494)（`mnt_is_readonly` で `-EROFS`）が、[`fs/open.c` L945](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L945) の `security_file_open`（Landlock の `hook_file_open`）より先 | 一致。書き込み open は `EROFS`。その前の `may_open`（`fs/namei.c` L3328）の `inode_permission` は Landlock にフックが無い（下の行）。`sb_permission`（L486）が見るのは superblock の ro で、per-mount の `MOUNT_ATTR_RDONLY` は上の `mnt_get_write_access` が見る |
+| mkdir（`create_dir`。`RO_MKDIR`） | [`fs/namei.c` L4019](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4019)（`filename_create` が `err2 = mnt_want_write`）、[L4044-L4047](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4044-L4047)（`err2` を返して失敗）が、[L4277](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4277) の `do_mkdirat` の `security_path_mkdir` より先 | 一致。mkdir は `EROFS`。条件: 同名が無いこと（あれば L4033 の `EEXIST` が先） |
+| Landlock の登録フック | [`security/landlock/fs.c` L1660-L1675](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/security/landlock/fs.c#L1660-L1675)（`path_mkdir`・`path_mknod`・`file_open` 等。`inode_permission` 相当のフックは無い） | 一致。Landlock は上の 3 操作の `security_*` の位置でだけ拒否し、それらは `EROFS` の判定より後ろ |
+
+結論: シナリオ Y の「`EACCES`（13）なら Landlock だけが止めていて VFS の読み取り専用化が効いていない」という判別は、v6.12 のソースの順序に裏付けられた（食い違いなし）。`production_launcher.rs` のドキュメントコメントが挙げる `lookup_open`・`filename_create`・`do_dentry_open` の順序とも一致する。範囲: 上の 3 操作に限る。`truncate`・`unlink`・`rename` など他の書き込み系の操作の順序は確かめていない。カーネル版は 6.12 のみで、他の版での順序の変化は確かめていない。
+
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 
 `PodSandboxConfig.dns_config` は、cri の変換（`config.json` の生成）で受け入れる。内容は `crates/cri/src/bundle/resolv_conf.rs` が検証して resolv.conf を作り、`SpecBundleProvider::prepare` が `<bundle>/resolv.conf` に mode 0644 で排他作成する。`config.json` には次の bind を `mounts[]` の末尾へ出す。
@@ -337,13 +350,30 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 
 ### 既知の差と残る制約（REPAIR-3）
 
-- **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）だが、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
-- `host_port == 0` を読み飛ばす扱いと、hostNetwork で port_mappings を使わない扱いは kubelet・containerd の挙動に合わせた想定だが、一次情報（tag と commit 指定）での照合は本変更では行っていない（未照合）。食い違えば厳しい側（`UNIMPLEMENTED`）に倒す
+- **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）で、containerd・CNI portmap も空と `0.0.0.0` を「全アドレス」として扱う（下記で照合済み）。一方、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
+- `host_port == 0` を読み飛ばす扱いは kubelet・containerd と一致する（下記「外部の事実の照合（port_mappings）」で 2026-10-26 に照合済み。kubelet は `host_port == 0` の要素もそのまま CRI へ送り、containerd が `HostPort <= 0` を読み飛ばす）。hostNetwork の扱いは**挙動が食い違う**: kubelet は hostNetwork の pod の ports に `host_port = container_port` を入れて送り、containerd は `NODE` でネットワークの setup を行わず port_mappings を使わない（黙って無視する）。本実装は公開する要素がある `NODE` を `UNIMPLEMENTED` にするため、ports を宣言した hostNetwork の pod は本実装では起動できない（厳しい側の差）。無視に合わせるかはオーナー判断の事項で、コードは変えていない
 - masquerade 未実装と host の `ip_forward` が前提で、外部からの到達は保証しない
 - 他プロセスとの受け口の衝突は検出しない（`LinuxNetwork` が共有ファイルなしの `PortRegistry` をネットワークごとに持つ。ネットワークをまたぐ契約 11 は `NetsetupNetwork` のプロセス内の記録で担保する）
 - 公開の個別解除は無い（`delete_network` が一括で解放する）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
 - `NODE`（hostNetwork）の hostPort・IPv6・SCTP・loopback への公開は `UNIMPLEMENTED`
 - 実機（root）での DNAT 到達確認は本変更では未実行
+
+### 外部の事実の照合（port_mappings。kubelet・containerd・CNI portmap。CRI-2・NET-3。#2837）
+
+確認日は 2026-10-26。版は下記「外部の事実の照合」の版表の kubernetes `v1.37.1`（`f78e722310e50bcaca9276be22276d9e91d91308`）と containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）。CNI portmap は containerd `v2.4.2` の `go.mod`（L34）が固定する `github.com/containernetworking/plugins v1.9.1`（commit `adc3e6b5b581638afbd194cf2e9319ecbb0151a1`）。コードは変えていない。
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| kubelet は `host_port == 0` の要素を読み飛ばさず CRI へ送る | [kubernetes `kuberuntime_sandbox.go` L119-L139](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go#L119-L139)（`generatePodSandboxConfig` が全コンテナの `MakePortMappings` の結果をそのまま積む）、[`container/helpers.go` L449-L484](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/container/helpers.go#L449-L484)（`HostPort`・`HostIP` を無加工で写し、`HostPort` で絞らない）。検証側も [`validation.go` L2818](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/validation/validation.go#L2818) で `HostPort != 0` のときだけ範囲を見る（0 は未指定として許す） | 確認。宣言した ports は `host_port == 0` のまま届くので、読み飛ばす側（runtime）の責務になる |
+| containerd は `HostPort <= 0` を読み飛ばす | [containerd `sandbox_run.go` L601-L615](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/sandbox_run.go#L601-L615)（`toCNIPortMappings` の `if mapping.HostPort <= 0 { continue }`。呼び出しは L536） | 一致。本実装の「`host_port == 0` は公開しない（どのモードでも受ける）」と同じ。負の値は CRI の型（int32）では来うるが、本実装は `host_port` を 0..=65535 に限り範囲外を `INVALID_ARGUMENT` にする（containerd は負も黙って読み飛ばす。厳しい側の差） |
+| 空の `host_ip` は「全アドレス」 | kubelet は `HostIP` を空のまま渡す（[`helpers.go` L456](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/container/helpers.go#L456)）。containerd は `HostIP: mapping.HostIp` を無加工で CNI へ渡す（`sandbox_run.go` L611）。portmap は `HostIP` が空のときは宛先指定（`-d`）を付けず、指定があっても `IsUnspecified()` なら付けない（[iptables 実装 L221-L246](https://github.com/containernetworking/plugins/blob/adc3e6b5b581638afbd194cf2e9319ecbb0151a1/plugins/meta/portmap/portmap_iptables.go#L221-L246)、[nftables 実装 L189-L200](https://github.com/containernetworking/plugins/blob/adc3e6b5b581638afbd194cf2e9319ecbb0151a1/plugins/meta/portmap/portmap_nftables.go#L189-L200)） | 確認。空と `0.0.0.0`（・`::`）はどちらも全アドレス。本実装は空・`0.0.0.0` を `UNIMPLEMENTED` にしているため、kubelet が既定で送る空の `host_ip` の hostPort は通らない（既知の差の 1 点目。net の拒否を見直すかはオーナー判断の候補） |
+| containerd は hostNetwork（`NamespaceMode_NODE`）でネットワークの setup を行わず、port_mappings を使わない | [`sandbox_run.go` L196](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/sandbox_run.go#L196)（`if !hostNetwork(config)` の中で netns を作り、`setupPodNetwork` を呼ぶ L266。CNI の port map の組み立て `cniNamespaceOpts` は `setupPodNetwork` 内の L492）、[`helpers.go` L428-L443](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/helpers.go#L428-L443)（Linux は `NetworkNamespace == NODE` を hostNetwork とする） | 確認。hostNetwork では公開の処理そのものが走らず、エラーにもならない（無視）。本実装の `NODE` を `UNIMPLEMENTED` にする扱いとは**食い違う**（containerd は受けて無視、本実装は拒否） |
+| kubelet は hostNetwork の pod でも ports を送り、`host_port` を `container_port` へ既定化する | [`kuberuntime_sandbox.go` L119-L139](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go#L119-L139)（`HostNetwork` による分岐なし）、[`defaults.go` L214-L216・L440-L448](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/v1/defaults.go#L214-L216)（`defaultHostNetworkPorts`）、[`validation.go` L4328-L4353](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/validation/validation.go#L4328-L4353)（hostNetwork の Pod は `hostPort == containerPort` を要求） | 確認。ports を宣言した hostNetwork の pod は `NODE` かつ `host_port > 0` で届く。これは本実装では `UNIMPLEMENTED` になるため、kubelet から見るとその pod の起動が失敗する（挙動の差。上の「既知の差」で扱う） |
+
+食い違いの扱い:
+
+- `host_port == 0`・空の `host_ip` の意味は、本実装の記述と一致した（空の `host_ip` の拒否は、意味は合っていて、安全側に倒した差である）
+- hostNetwork（`NODE`）は食い違った。containerd は受けて無視し、本実装は `UNIMPLEMENTED` で拒否する。「無視」に合わせると、公開されないのに成功を返すため、利用者が到達できると誤解する余地がある。現状の拒否のまま保つか、containerd に合わせて無視するか、明示のエラー文言を整えるかは**オーナー判断**の事項とする（コードは変えない。追跡: 起票の承認待ちとして PR 本文に記載）
 
 ## 外部の事実の照合（CRI-2・SEC-1・NET-5・CORE-4。#2772）
 

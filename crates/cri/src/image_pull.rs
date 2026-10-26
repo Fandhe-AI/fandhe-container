@@ -1091,7 +1091,7 @@ fn inspect_cached_blob(
 ) -> Result<(), CachedBlobRejection> {
     let file = open_blob_nofollow(path).map_err(|_| CachedBlobRejection::Unopenable)?;
     let facts = BlobFileFacts::from_file(&file).ok_or(CachedBlobRejection::Unverifiable)?;
-    check_blob_trust(&facts, Some(owner)).map_err(CachedBlobRejection::Untrusted)?;
+    check_blob_trust(&facts, owner).map_err(CachedBlobRejection::Untrusted)?;
     // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
     match verify_blob_file_digest(&file, digest, size) {
         Ok(verified) if verified.size == size => Ok(()),
@@ -1133,7 +1133,7 @@ fn read_verified_config_inner(
         )
     };
     let facts = BlobFileFacts::from_file(&file).ok_or_else(untrusted)?;
-    check_blob_trust(&facts, Some(owner)).map_err(|_| untrusted())?;
+    check_blob_trust(&facts, owner).map_err(|_| untrusted())?;
     let limit = max_bytes.min(MAX_CONFIG_BYTES);
     before_body_read();
     let mut body = Vec::new();
@@ -1298,7 +1298,7 @@ pub(crate) fn read_unpack_record_body(path: &Path, owner: u32) -> Result<Vec<u8>
         )
     };
     let facts = BlobFileFacts::from_file(&file).ok_or_else(untrusted)?;
-    check_blob_trust(&facts, Some(owner)).map_err(|_| untrusted())?;
+    check_blob_trust(&facts, owner).map_err(|_| untrusted())?;
     let mut body = Vec::new();
     (&mut file)
         .take(MAX_RECORD_BYTES + 1)

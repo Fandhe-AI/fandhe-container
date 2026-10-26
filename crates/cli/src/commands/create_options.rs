@@ -60,7 +60,8 @@ fn read_env_files(paths: &[PathBuf]) -> Result<Vec<EnvFile>, TraitError> {
         return Ok(Vec::new());
     }
     let paths = paths.to_vec();
-    fandhe_container_supervisor::supervisor_log::run_bounded(
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    match run_bounded_waiting(
         move || {
             paths
                 .iter()
@@ -68,13 +69,18 @@ fn read_env_files(paths: &[PathBuf]) -> Result<Vec<EnvFile>, TraitError> {
                 .collect::<Result<Vec<_>, _>>()
         },
         ENV_FILE_READ_TIMEOUT,
-    )
-    .unwrap_or_else(|| {
-        Err(TraitError::new(
+    ) {
+        Ok(result) => result,
+        // 同時実行枠が期限まで空かなかった（何も読んでいない）。期限切れの TIMEOUT と区別する（#2834・ERR-2）。
+        Err(BoundedFailure::Busy) => Err(TraitError::new(
+            ErrorCode::ResourceExhausted,
+            "env file workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(TraitError::new(
             ErrorCode::Timeout,
             "reading the env file did not finish within the deadline",
-        ))
-    })
+        )),
+    }
 }
 
 /// `--label` を状態記録へ書く `Annotations` にする(件数・長さ・キー形式の上限は core の型が唯一の真実源)。

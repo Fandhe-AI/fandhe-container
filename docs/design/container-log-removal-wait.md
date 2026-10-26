@@ -98,6 +98,14 @@ CRI は ID を使い回さないため、delete の待ちを超えて残った�
 
 範囲外（残余。REPAIR-3）: plugin-cri が動いている間に発生した残りは次の起動まで残る。CLI の `--root` が plugin-cri と異なる状態ルートは走査しない。
 
+## CLI の起動オプション I/O の枠待ち（#2834・CLI-1・REPAIR-5・ERR-2）
+
+作業枠（上限 8）はプロセス共有のため、同一プロセスで `create` を並行して呼ぶと（libtest の並列試験など）起動オプション文書の
+I/O が一時的に満杯になり、即時 `Busy` を「結果なし」として `TIMEOUT` に誤分類していた（`stop_control_channel` の間欠失敗の原因）。
+CLI の `prepare_options_file`・`rollback_options`・`read_env_files` は `supervisor_log::run_bounded_waiting` を使い、枠の空きを
+呼び出し側の期限の範囲で待つ（期限は延ばさない。待った時間は期限から引く）。待っても空かなければ job を実行せず
+`RESOURCE_EXHAUSTED`、期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。plugin-cri が使う `run_bounded_classified` の即時 `Busy` は変えない。
+
 ## 観測（REPAIR-4）
 
 失敗時は従来の `container_log_remove`（成否）に加えて、コード別の操作名にも Failure を 1 件計上する。語彙は固定の 5 種:

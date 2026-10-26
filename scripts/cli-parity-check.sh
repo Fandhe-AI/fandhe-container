@@ -244,6 +244,15 @@ cleanup() {
     sleep 0.5
     run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
     # delete が成功しなかった（状態が残る）なら、手動回収に必要な状態ルートを消さずに残す。
+    # ただし c2 が作られていない実行（非 Linux や create / start の失敗）では delete が失敗しても回収対象が
+    # 無いので、inspect が期限内に非 0 で終わる（c2 が存在しない）なら状態ルートを消してよい。
+    if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
+      run_cli "$chain_cli" 10 --root "$chain_state" inspect c2 || true
+      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" != "0" ]; then
+        run_exit=0
+        run_timed_out=0
+      fi
+    fi
     if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
       err warning "container c2 could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
       keep_state=1

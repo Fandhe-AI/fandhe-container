@@ -19,7 +19,7 @@
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
 | 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未決のため本番では常に新しい namespace。pid の共有は未対応 | core → cri | #2674 |
 | 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続 | net・core・cri | #2675 |
-| 14 | port_mappings | plugin-cri `netsetup` の `publish_port`。順 13 が前提 | net・cri | #2676 |
+| 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
@@ -264,5 +264,33 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
-- `port_mappings` は順 14（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま
+- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
+
+## port_mappings の受け入れ方式（CRI-2・NET-3・NET-4・PLUG-1。#2676）
+
+pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPlugin::publish_port`（nft の DNAT）で公開する。
+
+流れ: cri の `parse_port_mappings`（`crates/cri/src/port_mapping.rs`。検証と型への変換）→ `PodNetworkRequest::port_publishes` → plugin-cri `set_up_sandbox`（`attach` の後に公開指定ごとに `publish_port`）→ `NetsetupNetwork::publish_port`（契約 11 の判定）→ net の `publish_container_ports`（受け口の予約 → 専用テーブルの `prerouting` / `output` へ 1 バッチで DNAT）。core の `PublishPortRequest` / `PortMapping` には後方互換の任意欄 `host_ip` を足した（判定キーは従来どおり `(host_port, protocol)`）。
+
+### 結果表
+
+| port_mappings の要素 | 結果 |
+| -------------------- | ---- |
+| protocol が TCP・UDP・SCTP 以外、container_port が 1..=65535 の外、host_port が 0..=65535 の外、host_ip が 64 バイト超・IP でない・multicast・`240/4`・`0/8`（`0.0.0.0` を除く）、完全に同じ受け口の重複、公開する要素が 64 件超 | `INVALID_ARGUMENT` |
+| `host_port == 0` | 公開しない（どのモードでも受ける） |
+| `host_port > 0` で SCTP、host_ip が空・`0.0.0.0`・`127.0.0.0/8`・IPv6、host_ip だけ違う同じ `(protocol, host_port)` | `UNIMPLEMENTED` |
+| 公開する要素があり、provider なし（本番）・`NODE`・`CONTAINER`・`TARGET` | `UNIMPLEMENTED`（RunPodSandbox で資源を作る前に返す。bundle も最終の防壁として同じ判定） |
+| 公開する要素があり、provider ありの `POD` | `set_up` の中で公開。失敗は `delete_network` で一括して戻す |
+
+エラーメッセージは固定文言で、入力値を含めない（REPAIR-4）。
+
+### 既知の差と残る制約（REPAIR-3）
+
+- **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）だが、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
+- `host_port == 0` を読み飛ばす扱いと、hostNetwork で port_mappings を使わない扱いは kubelet・containerd の挙動に合わせた想定だが、一次情報（tag と commit 指定）での照合は本変更では行っていない（未照合）。食い違えば厳しい側（`UNIMPLEMENTED`）に倒す
+- masquerade 未実装と host の `ip_forward` が前提で、外部からの到達は保証しない
+- 他プロセスとの受け口の衝突は検出しない（`LinuxNetwork` が共有ファイルなしの `PortRegistry` をネットワークごとに持つ。ネットワークをまたぐ契約 11 は `NetsetupNetwork` のプロセス内の記録で担保する）
+- 公開の個別解除は無い（`delete_network` が一括で解放する）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
+- `NODE`（hostNetwork）の hostPort・IPv6・SCTP・loopback への公開は `UNIMPLEMENTED`
+- 実機（root）での DNAT 到達確認は本変更では未実行

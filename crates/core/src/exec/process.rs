@@ -87,9 +87,11 @@
 //!   （`reapply_restrictions`）とも同じ関数が空にする（`setgroups(0)`。`exec/capabilities.rs` の
 //!   `SupplementaryGroups`）。本モジュールの子の手順は資格情報を変更しない（uid / gid は呼び出しプロセスのもの）
 //! - **`execve` 前の失敗を親へ知らせる**（REPAIR-3・TASK-163 追補・#1460）: 稼働中コンテナへの exec の子は、
-//!   close-on-exec の pipe で「手順を終えた」「失敗した（終了コードと違反の理由）」を親へ返し、親は
-//!   「コマンドが起動して終了した」のか「起動していない」のかを [`ExecExit`] で区別する（終了コード 125〜127 は
-//!   コマンド自身も返し得るため）。launch 経路は従来どおり終了コードと stderr のみ（下記）
+//!   close-on-exec の pipe で「手順を終えた」「失敗した（終了コード・ERR-1 コード・違反の理由）」を親へ返し、
+//!   親は「コマンドが起動して終了した」のか「起動していない」のかを [`ExecExit`] で区別する（終了コード
+//!   125〜127 はコマンド自身も返し得るため）。`R` の後の `execveat` の失敗も同じ形式の失敗の行で返り、
+//!   ERR-1 コードは launch の `X <CODE>` と同じ errno の写像になる（#2763）。launch 経路の状態 pipe は
+//!   `launch_status.rs`（`R` / `X`）
 //!
 //! # 単体テストの安全策
 //!
@@ -610,11 +612,18 @@ fn exec_checked_entrypoint(
 
 /// 検査済みの fd を `execveat` する。成功すると戻らず、戻ったら失敗（errno を `Exec` 段のエラーへ写す）。
 fn execve_checked(entry: &Entrypoint, exe: &ExecutableFd) -> ExecError {
-    let err = do_execve(entry, exe);
+    execve_error(entry.path(), do_execve(entry, exe))
+}
+
+/// `execveat` が戻した errno を `Exec` 段のエラーへ写す（純関数。分類は [`exec_errno_to_code`]）。
+///
+/// launch の `X <CODE>` と稼働中コンテナへの exec の失敗行（[`exec_failure_line`]）が、同じ写像で
+/// `R` の後の失敗を分類するための 1 か所（SEC-4・CORE-5・SUP-6。#2763）。
+fn execve_error(path: &Path, err: SysError) -> ExecError {
     ExecError::new(
         exec_errno_to_code(err),
         IsolationStage::Exec,
-        format!("execve({:?}) failed: {}", entry.path(), describe(err)),
+        format!("execve({:?}) failed: {}", path, describe(err)),
     )
 }
 
@@ -1355,6 +1364,11 @@ pub enum ExecExit {
         /// 分離違反による拒否だった場合の理由（SEC-4。ランタイム自身のバイナリ・インタープリタ経由・
         /// `/dev/null` の差し替え）。違反でない失敗・理由を受け取れなかった場合は `None`。
         violation: Option<ViolationReason>,
+        /// 子が報告した失敗の分類（errno 由来。`R` の後の `execveat` の失敗は launch の `X <CODE>` と同じ
+        /// 写像: `ENOENT`/`ENOTDIR` → `NotFound`、`EACCES`/`EPERM` → `PermissionDenied`、`ENOEXEC`/`E2BIG` →
+        /// `InvalidArgument`、その他 → `Internal`。#2763）。子が何も書かずに終わった場合と解釈できない内容
+        /// のときは `Internal`（起動していない扱いを保つ fail-closed）。
+        code: ErrorCode,
     },
 }
 
@@ -1375,7 +1389,7 @@ impl ExecExit {
 /// 子が「手順を終えて `execveat` を呼ぶ直前」に書く 1 行（[`read_exec_status`] のプロトコル）。
 const EXEC_STATUS_READY: &[u8] = b"R\n";
 
-/// 子が親へ返す状態の読み取り上限（バイト。1 行 2 件ぶんより十分大きい）。
+/// 子が親へ返す状態の読み取り上限（バイト。`R` の行と失敗の行 1 件ぶんより十分大きい）。
 const EXEC_STATUS_MAX: usize = 256;
 
 /// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
@@ -1432,7 +1446,8 @@ pub fn exec_child_violation_reasons() -> &'static [ViolationReason] {
 /// 1. `execveat` より前の全手順（`prepare_exec_child`）が通ったら [`EXEC_STATUS_READY`] を書く
 /// 2. `terminal`（本番は `execveat`）を呼ぶ。`execveat` が成功すれば pipe は close-on-exec で閉じ、親は
 ///    「`R` の 1 行だけ」を読む = コマンドは起動した
-/// 3. 手順か `terminal` が失敗したら `<終了コード> <違反の理由コードまたは ->` の 1 行を書く
+/// 3. 手順か `terminal` が失敗したら `<終了コード> <ERR-1 コード> <違反の理由コードまたは ->` の 1 行を書く
+///    （`R` の後の `execveat` の失敗も同じ形式で、ERR-1 コードは launch と同じ errno の写像。#2763）
 ///
 /// 親（[`read_exec_status`]）は、`R` だけなら起動、失敗の行があれば未起動、何も無ければ「手順の途中で子が
 /// 終了した」= 未起動と判定する。`R` を書けなければ `execveat` へ進まない（親へ知らせられない状態で実行しない）。
@@ -1459,12 +1474,11 @@ fn run_exec_child(
         Err(err) => {
             let code = exit_code_for(&err);
             let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
-            let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
             // 失敗の行を書けなかった場合（`R` を書いた後の `execveat` の失敗で起き得る）、親は「起動した」と
             // 誤判定する。書き込みは fd を複製せず 1 回の `write` で行い（複製の失敗という要因を持たない）、
             // それでも書けなければ stderr に残す（stderr は既に `/dev/null` の場合がある。限界は
             // `exec/exec_command.rs`）。
-            if write_exec_status(status, format!("{code} {reason}\n").as_bytes()).is_err() {
+            if write_exec_status(status, exec_failure_line(&err).as_bytes()).is_err() {
                 let _ = writeln!(
                     std::io::stderr(),
                     "fandhe-container: the exec status could not be reported"
@@ -1473,6 +1487,13 @@ fn run_exec_child(
             code
         }
     }
+}
+
+/// 失敗の行 `<終了コード> <ERR-1 コード> <違反の理由コードまたは ->\n`（純関数。親の
+/// [`classify_exec_status`] が復号する唯一の形式。errno の生値・文字列・パスは運ばない。#2763）。
+fn exec_failure_line(err: &ExecError) -> String {
+    let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
+    format!("{} {} {reason}\n", exit_code_for(err), err.code.as_str())
 }
 
 /// 子が状態を返す pipe を作る。戻り値は `(読み取り側, 書き込み側)`（両端とも close-on-exec）。
@@ -1547,19 +1568,46 @@ fn classify_exec_status(status: &[u8], exit: ChildExit) -> ExecExit {
     if status == EXEC_STATUS_READY {
         return ExecExit::Command(exit);
     }
-    // 失敗の行（`R` の後、または単独）の 2 つ目の語が違反の理由コード。
-    let violation = status
-        .strip_prefix(EXEC_STATUS_READY)
-        .unwrap_or(status)
-        .split(|b| *b == b'\n')
-        .next()
-        .and_then(|line| line.split(|b| *b == b' ').nth(1))
-        .and_then(|name| {
-            EXEC_CHILD_VIOLATIONS
-                .into_iter()
-                .find(|reason| reason.as_str().as_bytes() == name)
-        });
-    ExecExit::SetupFailed { exit, violation }
+    // 解釈できない内容（空・切れた行・旧形式・未知の語・余分なバイト）は、起動していない扱いで
+    // 理由なし・`Internal`（fail-closed）。
+    let unparsed = ExecExit::SetupFailed {
+        exit,
+        violation: None,
+        code: ErrorCode::Internal,
+    };
+    // 失敗の行（`R` の後、または単独）は `<終了コード> <ERR-1 コード> <理由|->\n` の 3 語ちょうど。
+    let line = status.strip_prefix(EXEC_STATUS_READY).unwrap_or(status);
+    let Some(line) = line.strip_suffix(b"\n") else {
+        return unparsed;
+    };
+    let mut words = line.split(|b| *b == b' ');
+    let (Some(_exit), Some(code), Some(reason), None) =
+        (words.next(), words.next(), words.next(), words.next())
+    else {
+        return unparsed;
+    };
+    let Some(code) = std::str::from_utf8(code)
+        .ok()
+        .and_then(ErrorCode::from_name)
+    else {
+        return unparsed;
+    };
+    let violation = if reason == b"-" {
+        None
+    } else {
+        match EXEC_CHILD_VIOLATIONS
+            .into_iter()
+            .find(|v| v.as_str().as_bytes() == reason)
+        {
+            Some(v) => Some(v),
+            None => return unparsed,
+        }
+    };
+    ExecExit::SetupFailed {
+        exit,
+        violation,
+        code,
+    }
 }
 
 /// [`observe_exec_child_setup`] の観測結果（結合試験専用。SUP-6・SEC-1・TASK-163 追補・#1456）。
@@ -4587,7 +4635,16 @@ mod tests {
     /// 無ければ起動していない。違反の理由コードは `execveat` 前の手順が返すものだけを引き直す。
     #[test]
     fn sup6_task163_classify_exec_status_is_exact() {
-        let failed = |exit, violation| ExecExit::SetupFailed { exit, violation };
+        let failed = |exit, violation| ExecExit::SetupFailed {
+            exit,
+            violation,
+            code: ErrorCode::Internal,
+        };
+        let failed_with = |exit, violation, code| ExecExit::SetupFailed {
+            exit,
+            violation,
+            code,
+        };
         for code in [0, 1, 125, 126, 127] {
             let exit = ChildExit::Exited(code);
             assert_eq!(classify_exec_status(b"R\n", exit), ExecExit::Command(exit));
@@ -4602,43 +4659,67 @@ mod tests {
         assert_eq!(classify_exec_status(b"", signaled), failed(signaled, None));
 
         let exit = ChildExit::Exited(126);
-        assert_eq!(classify_exec_status(b"126 -\n", exit), failed(exit, None));
-        // `execveat` 自体の失敗（`R` の後に失敗の行）。
         assert_eq!(
-            classify_exec_status(b"R\n126 -\n", exit),
+            classify_exec_status(b"126 INTERNAL -\n", exit),
             failed(exit, None)
         );
+        // `execveat` 自体の失敗（`R` の後に失敗の行）。ERR-1 コードが運ばれる（#2763）。
+        for (line, code) in [
+            (&b"R\n127 NOT_FOUND -\n"[..], ErrorCode::NotFound),
+            (
+                &b"R\n126 PERMISSION_DENIED -\n"[..],
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                &b"R\n126 INVALID_ARGUMENT -\n"[..],
+                ErrorCode::InvalidArgument,
+            ),
+            (&b"R\n126 INTERNAL -\n"[..], ErrorCode::Internal),
+        ] {
+            assert_eq!(
+                classify_exec_status(line, exit),
+                failed_with(exit, None, code),
+                "{line:?}"
+            );
+        }
         for reason in EXEC_CHILD_VIOLATIONS {
-            let line = format!("126 {}\n", reason.as_str());
+            let line = format!("126 PERMISSION_DENIED {}\n", reason.as_str());
             assert_eq!(
                 classify_exec_status(line.as_bytes(), exit),
-                failed(exit, Some(reason))
+                failed_with(exit, Some(reason), ErrorCode::PermissionDenied)
             );
             assert_eq!(reason.kind().as_str(), "entrypoint");
         }
         assert_eq!(
-            classify_exec_status(b"126 entrypoint_interpreter_is_runtime_binary\n", exit),
-            failed(
+            classify_exec_status(
+                b"126 PERMISSION_DENIED entrypoint_interpreter_is_runtime_binary\n",
+                exit
+            ),
+            failed_with(
                 exit,
-                Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary)
+                Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                ErrorCode::PermissionDenied
             )
         );
         // 封印した複製の拒否（#1531）の理由コードは、子から親へ違反として運ばれる。
         for (line, reason) in [
             (
-                &b"126 entrypoint_copy_too_large\n"[..],
+                &b"126 PERMISSION_DENIED entrypoint_copy_too_large\n"[..],
                 ViolationReason::EntrypointCopyTooLarge,
             ),
             (
-                &b"126 entrypoint_copy_seal_unverified\n"[..],
+                &b"126 PERMISSION_DENIED entrypoint_copy_seal_unverified\n"[..],
                 ViolationReason::EntrypointCopySealUnverified,
             ),
             (
-                &b"126 entrypoint_on_noexec_mount\n"[..],
+                &b"126 PERMISSION_DENIED entrypoint_on_noexec_mount\n"[..],
                 ViolationReason::EntrypointOnNoexecMount,
             ),
         ] {
-            assert_eq!(classify_exec_status(line, exit), failed(exit, Some(reason)));
+            assert_eq!(
+                classify_exec_status(line, exit),
+                failed_with(exit, Some(reason), ErrorCode::PermissionDenied)
+            );
         }
         // 解釈できない内容・子が返さないはずの理由コード・切れた行は、起動していない扱い（理由なし）。
         for garbage in [
@@ -4649,6 +4730,18 @@ mod tests {
             b"126 rootfs_is_host_root\n",
             b"126",
             b"R\nR\n",
+            // 旧形式（2 語）・未知の ERR-1 コード・未知の理由・語数の過不足・改行なし・余分な行。
+            b"R\n126 -\n",
+            b"126 entrypoint_is_runtime_binary\n",
+            b"126 BOGUS -\n",
+            b"126 not_found -\n",
+            b"126 NOT_FOUND bogus_reason\n",
+            b"126 NOT_FOUND - extra\n",
+            b"126 NOT_FOUND\n",
+            b"126 NOT_FOUND -",
+            b"126 NOT_FOUND -\nx",
+            b"R\n126 NOT_FOUND -\n126 NOT_FOUND -\n",
+            b"126  NOT_FOUND -\n",
         ] {
             assert_eq!(
                 classify_exec_status(garbage, exit),
@@ -4660,6 +4753,55 @@ mod tests {
         assert!(!failed(exit, None).command_started());
         assert_eq!(failed(exit, None).child_exit(), exit);
         assert_eq!(ExecExit::Command(signaled).child_exit(), signaled);
+    }
+
+    /// SEC-4・CORE-5・SUP-6・REPAIR-12（#2763）: `R` の後の `execveat` の errno は、launch と同じ写像で
+    /// ERR-1 コードの失敗行になり（`NOT_FOUND` は 127、他は 126）、親の復号が同じ値に戻す。errno の生値・
+    /// 文字列・パスは行に載らない。
+    #[test]
+    fn sec4_2763_execveat_errno_roundtrips_as_code_line() {
+        let path = Path::new("/secret/dir/app");
+        let exit_of = |n| ChildExit::Exited(n);
+        for (errno, line, code, exit) in [
+            (sys::ENOENT, "127 NOT_FOUND -\n", ErrorCode::NotFound, 127),
+            (
+                sys::EACCES,
+                "126 PERMISSION_DENIED -\n",
+                ErrorCode::PermissionDenied,
+                126,
+            ),
+            (
+                sys::ENOEXEC,
+                "126 INVALID_ARGUMENT -\n",
+                ErrorCode::InvalidArgument,
+                126,
+            ),
+            (sys::EINTR, "126 INTERNAL -\n", ErrorCode::Internal, 126),
+        ] {
+            let err = execve_error(path, SysError::Os(errno));
+            assert_eq!((err.code, err.stage), (code, IsolationStage::Exec));
+            let written = exec_failure_line(&err);
+            assert_eq!(written, line, "errno {errno}");
+            assert!(!written.contains("secret"), "{written}");
+            let status = format!("R\n{written}");
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit_of(exit)),
+                ExecExit::SetupFailed {
+                    exit: exit_of(exit),
+                    violation: None,
+                    code
+                }
+            );
+        }
+        // 違反を伴う失敗は理由コードも載る。
+        let violation = ExecError::from_violation(ViolationReason::EntrypointIsRuntimeBinary, None);
+        assert_eq!(
+            exec_failure_line(&violation),
+            format!(
+                "126 {} entrypoint_is_runtime_binary\n",
+                violation.code.as_str()
+            )
+        );
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 実 pipe からの読み取り。書き込み側が閉じていれば内容（または
@@ -4686,21 +4828,33 @@ mod tests {
             read(b""),
             ExecExit::SetupFailed {
                 exit,
-                violation: None
+                violation: None,
+                code: ErrorCode::Internal
             }
         );
         assert_eq!(
-            read(b"127 stdio_null_not_null_device\n"),
+            read(b"127 PERMISSION_DENIED stdio_null_not_null_device\n"),
             ExecExit::SetupFailed {
                 exit,
-                violation: Some(ViolationReason::StdioNullNotNullDevice)
+                violation: Some(ViolationReason::StdioNullNotNullDevice),
+                code: ErrorCode::PermissionDenied
+            }
+        );
+        // `R` の後の `execveat` の失敗（#2763）。
+        assert_eq!(
+            read(b"R\n127 NOT_FOUND -\n"),
+            ExecExit::SetupFailed {
+                exit,
+                violation: None,
+                code: ErrorCode::NotFound
             }
         );
         assert_eq!(
             read(&[b'R'; 4096]),
             ExecExit::SetupFailed {
                 exit,
-                violation: None
+                violation: None,
+                code: ErrorCode::Internal
             }
         );
 

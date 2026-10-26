@@ -154,6 +154,7 @@ mod linux {
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
     use fandhe_container_core::rootless::single_id_mapping;
     use fandhe_container_core::tmpfs::TmpfsMountSet;
+    use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
         TraitError,
@@ -1532,6 +1533,7 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                    code: ErrorCode::PermissionDenied,
                 }
             )),
             "the exec child must refuse the runtime-interpreted script: {out}"
@@ -1595,6 +1597,7 @@ mod linux {
                     ExecExit::SetupFailed {
                         exit: ChildExit::Exited(126),
                         violation: Some(ViolationReason::StdioNullNotNullDevice),
+                        code: ErrorCode::PermissionDenied,
                     }
                 )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"
@@ -1654,6 +1657,7 @@ mod linux {
                     ExecExit::SetupFailed {
                         exit: ChildExit::Exited(126),
                         violation: Some(ViolationReason::StdioNullNotNullDevice),
+                        code: ErrorCode::PermissionDenied,
                     }
                 )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"

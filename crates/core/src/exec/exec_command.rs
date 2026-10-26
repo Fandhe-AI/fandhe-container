@@ -73,8 +73,10 @@
 //!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: 子の終了コード 125 / 126 /
 //!   127 は実行されたコマンド自身も返し得るため、終了コードでは区別できない。親は fork の前に close-on-exec の
-//!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コードと
-//!   違反の理由）」を 1 行で書く。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
+//!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コード・
+//!   ERR-1 コード・違反の理由）」を 1 行で書く。`R` の後の `execveat` の失敗（`ENOENT` → `NotFound`・`EACCES` →
+//!   `PermissionDenied`・`ENOEXEC` → `InvalidArgument` 等。launch の `X <CODE>` と同じ写像）も同じ失敗の行で、
+//!   `SetupFailed { code }` として「起動していない」と ErrorCode つきで返る（#2763）。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
 //!   起動した、「失敗の行」または「何も無い」= 起動していない、と判定する（[`ExecExit`]）。**限界**: `R` を
 //!   書いた後・`execveat` の完了前にシグナルで終了した子は「起動した」と判定される（窓は syscall 1 回ぶん）。
 //!   pipe の書き込み側はコンテナ内の PID namespace から見える子が持つが、子は non-dumpable で、`execveat` の後は
@@ -87,7 +89,7 @@
 //! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定（launch の `process.cwd` は pivot 直後に適用済みだが、exec 経路は未対応 = REPAIR-3）。環境変数は
 //!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
 //!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
-//! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
+//! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・ERR-1 コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 

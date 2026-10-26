@@ -51,6 +51,7 @@
 //!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
 //!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
 //!   （#2241・#2315・#482 が前提）。展開の計装（`OciOpRecorder`）は未配線で何も記録しない。
+//!   起動時の残り pull の回収 GC（`ImageStore::recover_stale_pulls`）は `CriPluginBackends::recover_stale_image_pulls` で配線済み（#2819）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
 //!   記録先を注入したときだけ行う（[`CriPluginBackends::production_with_audit_sink`]。Linux の本番はこちら）。プロセスが常に複数
@@ -249,6 +250,24 @@ impl CriPluginBackends {
         .with_puller(Arc::new(OciImagePuller::new(client, pull))))
     }
 
+    /// 起動時に 1 回、`<state_root>/.cri/images` に残った pull のステージングとリースを回収する（OCI-7・OCI-1。#2819）。
+    ///
+    /// `image_service` の成功後、RPC を受け付ける前に `main.rs` の `serve` が呼ぶ。期限は [`STARTUP_PULL_RECOVERY_BUDGET`]。
+    /// 結果の扱い（どれで起動を止めるか）は `main.rs` と `docs/design/pull-inventory-wiring.md`。注入で組んだ場合は
+    /// `Failed("FAILED_PRECONDITION")`。
+    #[cfg(unix)]
+    pub fn recover_stale_image_pulls(&self, budget: Duration) -> StartupPullRecovery {
+        let Some(root) = &self.state_root else {
+            return StartupPullRecovery::Failed("FAILED_PRECONDITION");
+        };
+        let images_root = root.join(IMAGES_DIR);
+        let recorder = Arc::clone(&self.recorder);
+        run_startup_pull_recovery(
+            move || recover_stale_image_pulls_in(&images_root, &recorder),
+            budget,
+        )
+    }
+
     /// `ImageService` と bundle 供給が共有する在庫。
     pub fn images(&self) -> &Arc<dyn ImageStore> {
         &self.images
@@ -349,6 +368,136 @@ pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) ->
         r.failed,
         r.timed_out
     )
+}
+
+/// 起動時の pull 回収 GC の全体の期限（#2819・REPAIR-5）。超えたら起動しない（取り残した worker が `@lock` を握ったまま受け付けないため）。
+#[cfg(unix)]
+pub const STARTUP_PULL_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// 起動時の pull 回収 GC の結果の件数（パス・pull ID は含めない。REPAIR-4）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullRecoveryCounts {
+    /// ステージングを消した pull の数。
+    pub reclaimed: usize,
+    /// 解放したリースの合計。
+    pub released_leases: usize,
+    /// 生きている pull のため残した数。
+    pub kept_live: usize,
+    /// 不在を確認できず残した数。
+    pub kept_undetermined: usize,
+    /// 削除に失敗した数（1 以上なら warn）。
+    pub failed: usize,
+    /// 触らなかったエントリ数。
+    pub foreign_entries: usize,
+}
+
+#[cfg(unix)]
+impl PullRecoveryCounts {
+    /// oci の回収結果から件数だけを写す（リースの和は飽和加算）。
+    pub fn from_recovery(r: &fandhe_container_oci::image_management::StalePullRecovery) -> Self {
+        Self {
+            reclaimed: r.reclaimed().len(),
+            released_leases: r
+                .released_leases()
+                .iter()
+                .fold(0usize, |acc, (_, n)| acc.saturating_add(*n)),
+            kept_live: r.kept_live().len(),
+            kept_undetermined: r.kept_undetermined().len(),
+            failed: r.failed().len(),
+            foreign_entries: r.foreign_entries(),
+        }
+    }
+
+    /// 構造化ログ 1 行（`event: image_pull_recovery`）。`failed` が 1 以上なら `warn`。
+    pub fn summary_line(&self) -> String {
+        format!(
+            "{{\"level\":\"{}\",\"event\":\"image_pull_recovery\",\"reclaimed\":{},\"released_leases\":{},\"kept_live\":{},\"kept_undetermined\":{},\"failed\":{},\"foreign_entries\":{}}}",
+            if self.failed > 0 { "warn" } else { "info" },
+            self.reclaimed,
+            self.released_leases,
+            self.kept_live,
+            self.kept_undetermined,
+            self.failed,
+            self.foreign_entries
+        )
+    }
+}
+
+/// 起動時の結果の構造化ログ 1 行（`event: image_pull_recovery`。#2819・REPAIR-4）。件数だけで、パス・ID は含めない。
+#[cfg(unix)]
+pub fn pull_recovery_summary_line(
+    r: &fandhe_container_oci::image_management::StalePullRecovery,
+) -> String {
+    PullRecoveryCounts::from_recovery(r).summary_line()
+}
+
+/// 起動時の pull 回収 GC の結末（#2819。`main.rs` の `serve` が分岐する）。
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupPullRecovery {
+    /// 回収を終えた（一部失敗は `failed` 件数に出る。起動は続ける）。
+    Completed(PullRecoveryCounts),
+    /// 開けない・排他を取れない等（エラーコード文字列）。起動しない。
+    Failed(&'static str),
+    /// 期限内に終わらなかった。起動しない。
+    TimedOut,
+    /// worker を作れなかった。起動しない。
+    SpawnFailed,
+}
+
+/// `images_root` の在庫を開いて `recover_stale_pulls` を 1 回呼び、`image_pull_recovery` を記録器へ計上する
+/// （OCI-7・OCI-1・REPAIR-4。#2819）。生存判定は `@pull.lock` の OS ロックで、生きている pull は回収しない。
+/// root は呼び出し側が状態ルート配下の固定位置を渡す（外部入力から受けない）。
+#[cfg(unix)]
+pub fn recover_stale_image_pulls_in(
+    images_root: &std::path::Path,
+    recorder: &OpRecorder,
+) -> Result<
+    fandhe_container_oci::image_management::StalePullRecovery,
+    fandhe_container_oci::error::OciError,
+> {
+    let started = Instant::now();
+    let r = fandhe_container_oci::image_management::ImageStore::open(images_root)
+        .and_then(|store| store.recover_stale_pulls());
+    if let Ok(name) = OpName::new("image_pull_recovery") {
+        let ok = matches!(&r, Ok(v) if v.failed().is_empty());
+        let outcome = if ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+    r
+}
+
+/// `f` を別スレッドで走らせ、`budget` 内の結果を待つ（REPAIR-5）。超えたら `TimedOut`（worker は取り残すため、
+/// 呼び出し側は起動を中止してプロセスを終える。ロックは終了時に OS が解放する）。
+#[cfg(unix)]
+pub fn run_startup_pull_recovery<F>(f: F, budget: Duration) -> StartupPullRecovery
+where
+    F: FnOnce() -> Result<
+            fandhe_container_oci::image_management::StalePullRecovery,
+            fandhe_container_oci::error::OciError,
+        > + Send
+        + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("pull-recovery".to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return StartupPullRecovery::SpawnFailed;
+    }
+    match rx.recv_timeout(budget) {
+        Ok(Ok(r)) => StartupPullRecovery::Completed(PullRecoveryCounts::from_recovery(&r)),
+        Ok(Err(e)) => StartupPullRecovery::Failed(e.code().as_str()),
+        Err(_) => StartupPullRecovery::TimedOut,
+    }
 }
 
 /// gRPC サーバーが 1 リクエストを待つ上限（REPAIR-5・#2592）。`GrpcServerConfig` の既定（10 秒）では `PullImage`
@@ -1031,6 +1180,7 @@ impl BundleProvider for UnimplementedBundleProvider {
 }
 #[cfg(test)]
 mod tests {
+
     //! 単体テスト（エラー変換のコード保持・cgroup 配置を持つ記録の delete の fail-closed・記録器の共有。
     //! CRI-2・REPAIR-4・REPAIR-5）。
 
@@ -1430,5 +1580,59 @@ mod tests {
             names.insert(name);
         }
         assert_eq!(names.len(), 5);
+    }
+
+    /// REPAIR-5: 期限を超えたら待たずに `TimedOut`（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_startup_pull_recovery_times_out() {
+        let r = run_startup_pull_recovery(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(Default::default())
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, StartupPullRecovery::TimedOut);
+    }
+
+    /// OCI-7: 結果は `Completed` / `Failed(code)` に写る（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_startup_pull_recovery_maps_outcomes() {
+        let ok = run_startup_pull_recovery(|| Ok(Default::default()), Duration::from_secs(5));
+        assert_eq!(
+            ok,
+            StartupPullRecovery::Completed(PullRecoveryCounts::default())
+        );
+        let ng = run_startup_pull_recovery(
+            || {
+                Err(fandhe_container_oci::error::OciError::new(
+                    fandhe_container_oci::error::OciErrorCode::Timeout,
+                    "x",
+                ))
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(ng, StartupPullRecovery::Failed("TIMEOUT"));
+    }
+
+    /// REPAIR-4: `failed` が 1 以上なら warn、0 なら info（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_pull_recovery_summary_level_follows_failed() {
+        let warn = PullRecoveryCounts {
+            failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            warn.summary_line(),
+            "{\"level\":\"warn\",\"event\":\"image_pull_recovery\",\"reclaimed\":0,\"released_leases\":0,\"kept_live\":0,\"kept_undetermined\":0,\"failed\":1,\"foreign_entries\":0}"
+        );
+        assert!(
+            PullRecoveryCounts::default()
+                .summary_line()
+                .starts_with("{\"level\":\"info\"")
+        );
     }
 }

@@ -57,7 +57,7 @@
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
-//! - 回収 GC の起動時の呼び出しの配線（#2315 のアダプタ側）。回収 GC 本体は
+//! - （配線済み）回収 GC の起動時の呼び出しは plugin-cri の `serve` が行う（#2819）。CLI は呼ばない。回収 GC 本体は
 //!   `ImageStore::recover_stale_pulls`（#852）で実装済みで、drop またはクラッシュでステージングの
 //!   `@pull.lock` のロックが外れたものを回収する。
 //! - リースの取得・解放と公開は、在庫・タグ・リースを `@image-inventory.json` へ排他の中で保存する

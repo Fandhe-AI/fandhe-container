@@ -24,7 +24,14 @@ pub const OCI_ERROR_MESSAGE_MAX_BYTES: usize = 1024;
 pub enum OciErrorCode {
     /// イメージ参照・URL 部品の構文違反。
     InvalidArgument,
-    /// CPU 機能の不足・対応外のアーキテクチャ（fail-closed）。
+    /// 対応外・未実装の入力、機能、実行環境を、推測で処理せずに拒否する（fail-closed）。再試行しても成功しない。
+    ///
+    /// 例: CPU 機能の不足・platform に対応が無いアーキテクチャ・OS、未対応の manifest の `schemaVersion` /
+    /// `mediaType`、未対応のレイヤー `mediaType`（zstd 等）、sha256 以外の diff_id、`openat2` が無いカーネルや
+    /// ディレクトリ fd 起点・symlink を辿らない open が使えない環境での展開と blob の open（`VerifiedLayerBlob` の
+    /// 非 Unix を含む）、非 Linux での所有者適用・user namespace の検査、symlink エントリを作れないホスト、
+    /// AUFS メタデータ（`.wh..wh.plnk` 等）への hardlink（#2312）、bearer 認証や資格情報を要する registry。
+    /// ビヘイビア: OCI-1・OCI-2・OCI-3・REPAIR-3。
     Unimplemented,
     /// 接続失敗（#401 以降で使う）。
     Unavailable,

@@ -65,9 +65,9 @@
 //!   開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと。tar 展開の実体は
 //!   `fandhe_container_oci::layer::extract` にあり（TASK-52.3・TASK-52.4・TASK-53）、本モジュールは oci の契約を満たす
 //!   入口 `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめた値）と
-//!   `extract_image_layers_with_options` だけを使う（#2309・#2323）。パスを受け取る旧入口
-//!   （`extract_layer_blob` / `extract_layer_blobs` 系）は内部でパスを開き直し、最終要素の symlink を辿り、所有者・
-//!   権限・ハードリンク数も確かめないため使わない
+//!   `extract_image_layers_with_options` だけを使う（#2309・#2323）。パスを受け取って開き直す旧入口
+//!   （`extract_layer_blob` / `extract_layer_blobs` 系）は、最終要素の symlink を辿り所有者・権限・ハードリンク数も
+//!   確かめないため #2535 で oci から廃止した
 //! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::open`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
 //!   結果で、最適化していない）。開いておく fd の数は layer 数と同じで、oci の `MAX_LAYERS` が上限になる
 //! - 同一 UID の別プロセスと root による書き換えは対象外（キャッシュの所有者自身のため防げない）。所有者または

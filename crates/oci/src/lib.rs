@@ -39,7 +39,7 @@
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
 //! 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、変更操作の前に
 //! `AlreadyExists` で拒否する（IO-5）。
-//! 複数レイヤーは `layer::extract::extract_layers` / `extract_layer_blobs` で下位から同一ルートへ重ねて展開する
+//! 複数レイヤーは `layer::extract::extract_layers` / `extract_image_layers` で下位から同一ルートへ重ねて展開する
 //! （TASK-52.4・OCI-1・#410）。
 //! whiteout（`.wh.<name>`）と不透明ディレクトリ（`.wh..wh..opq`）は展開パイプラインへ統合済みで、上位レイヤーが
 //! 下位レイヤーの実体だけを消す（レイヤーごとに収集・適用・展開の 3 パスで、tar 内の並び順に依らない。既存パスは

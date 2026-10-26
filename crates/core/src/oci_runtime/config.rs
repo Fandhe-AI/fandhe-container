@@ -1389,6 +1389,7 @@ impl OciConfig {
     ///
     /// 呼び出し元は launcher の `Inner::launch`。起動オプションの `--read-only`(CLI-1・SUP-12・#2828)があるとき、
     /// Landlock の root 規則・分離の記録・mount の RDONLY が同じ実効値になるよう、この複製を Landlock 側へ渡す。
+    #[cfg(target_os = "linux")]
     pub(crate) fn with_root_readonly_forced(&self) -> Self {
         let mut forced = self.clone();
         forced.root.readonly = true;

@@ -37,10 +37,9 @@
 //! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは次の 1 つである。根拠と追跡 issue は
 //! `docs/design/image-store-root-trust.md` の論点 3 を参照。
 //!
-//! - fetcher（`RegistryClient::fetch_blob`）が書く先は `PullSession::staged_blob_path` が返すパスである。
-//!   fetcher の API がパスを受け取るためで、handle 起点にするには cri の fetch トレイトを含む crate をまたぐ
-//!   変更が要る。差し替えが起きてもおとりへ書かれた内容は公開されない（公開は pull ディレクトリ fd 起点で
-//!   開き直して検証した実体に限る）。
+//! - fetcher（`RegistryClient::fetch_blob`）の書き込み先も fd 起点である（#2765）。`PullSession::open_staged_blob`
+//!   が pull ディレクトリの fd から `<hex>.part` を開いた `StagedBlobWriter` を返し、パスは受け取らない。
+//!   パスで返すのは検証後の読み取り用 `PullSession::staged_blob_read_path` だけである。
 
 mod staging;
 

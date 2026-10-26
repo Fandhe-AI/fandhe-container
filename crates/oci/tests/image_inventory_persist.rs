@@ -73,8 +73,9 @@ fn oci7_inventory_child_publishes() {
     let mut digests = Vec::new();
     for data in [&b"child-config"[..], &b"child-layer"[..]] {
         let dg = sha_of(data);
-        let path = session.staged_blob_path(&dg).expect("staged path");
-        fs::write(&path, data).expect("write");
+        let mut w = session.open_staged_blob(&dg).expect("writer");
+        std::io::Write::write_all(&mut w, data).expect("write");
+        w.commit().expect("commit");
         session.verify_staged_blob(&dg, 1 << 20).expect("verify");
         digests.push(dg);
     }

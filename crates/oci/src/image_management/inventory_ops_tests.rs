@@ -336,8 +336,9 @@ fn oci7_recovery_save_failure_keeps_journal_and_blobs() {
 
 fn stage(s: &mut super::PullSession<'_>, data: &[u8]) -> Digest {
     let dg = sha_of(data);
-    let path = s.staged_blob_path(&dg).expect("staged path");
-    fs::write(&path, data).expect("write");
+    let mut w = s.open_staged_blob(&dg).expect("writer");
+    std::io::Write::write_all(&mut w, data).expect("write");
+    w.commit().expect("commit");
     s.verify_staged_blob(&dg, 1 << 20).expect("verify");
     dg
 }

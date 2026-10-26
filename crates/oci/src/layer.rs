@@ -7,7 +7,7 @@
 //! 呼び出し契約: layer 展開（TASK-52.x）やキャッシュ公開の前に、呼び出し側が本検証を通すこと。
 //! イメージの展開へ渡す blob は、検証済みを型で表す `VerifiedLayerBlob`（下記）で作る（#2309）。
 //! 検証対象は呼び出し側が管理するステージング領域のファイル（pull では `PullSession` の `<root>/staging/<pull-id>/`。#474）とし、パスはエラー文言に載せない。
-//! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合。tar 展開は子モジュール `extract` に実装済みで、キャッシュ格納と展開の配線は cri の `image_pull` が担う（#2323）。
+//! 未実装（後続 issue）: `fetch_blob` 内への組み込み（`fetch_blob` の戻り値はパスを持たない。確定後に `PullSession::verify_staged_blob` で検証する。#2765）、manifest 本文の digest 突合。tar 展開は子モジュール `extract` に実装済みで、キャッシュ格納と展開の配線は cri の `image_pull` が担う（#2323）。
 //!
 //! 開いたハンドルでの検証（OCI-1・#446）: 呼び出し側が blob の所有者・権限・ハードリンク数を確認してから
 //! 内容を検証する場合（`fandhe-container-cri` の `PullImage` のキャッシュ再利用・公開）は、
@@ -16,7 +16,7 @@
 //! 別のファイルへ差し替えられない。個別の関数（`open_blob_nofollow`・`verify_blob_file_digest`）は信頼条件を判定しない。
 //! 信頼条件・digest・サイズを同じハンドルで確かめる入口が `VerifiedLayerBlob::open` で、イメージ展開
 //! （`extract::extract_image_layers`）はこの値だけを受ける（#2309）。パスを受ける `verify_blob_digest(_with)`・
-//! `verify_fetched_blob(_with)`・`open_gzip_layer`・`decompress_layer_to_writer(_with)` は、呼び出し側が排他的に所有する
+//! `open_gzip_layer`・`decompress_layer_to_writer(_with)` は、呼び出し側が排他的に所有する
 //! 0700 のステージングにある blob に限る部品で、キャッシュの再利用と展開には使わない。
 //!
 //! gzip 展開（TASK-52.2・OCI-1・#407）: digest 検証済みの圧縮 blob を `GzipLayerReader` で逐次展開し、
@@ -62,7 +62,6 @@ use crate::manifest::{
     MEDIA_TYPE_OCI_LAYER_NONDIST_GZIP, MEDIA_TYPE_OCI_LAYER_NONDIST_TAR, MEDIA_TYPE_OCI_LAYER_TAR,
 };
 use crate::reference::Digest;
-use crate::registry::FetchedBlob;
 
 /// 読み込みバッファ長（メモリ使用量を入力サイズに依存させない）。
 const HASH_BUF_LEN: usize = 64 * 1024;
@@ -310,20 +309,6 @@ pub fn verify_bytes_digest(bytes: &[u8], expected: &Digest) -> Result<(), OciErr
         ));
     }
     Ok(())
-}
-
-/// `fetch_blob` の戻り値を、要求した digest に対して検証する薄いラッパー。
-pub fn verify_fetched_blob(blob: &FetchedBlob, max_bytes: u64) -> Result<VerifiedBlob, OciError> {
-    verify_blob_digest(&blob.path, &blob.digest, max_bytes)
-}
-
-/// 計装つきの `verify_fetched_blob`。
-pub fn verify_fetched_blob_with(
-    recorder: &dyn OciOpRecorder,
-    blob: &FetchedBlob,
-    max_bytes: u64,
-) -> Result<VerifiedBlob, OciError> {
-    verify_blob_digest_with(recorder, &blob.path, &blob.digest, max_bytes)
 }
 
 /// blob ファイルの信頼条件の判定材料（OCI-1・SEC。[`check_blob_trust`] の入力）。
@@ -1030,18 +1015,17 @@ mod tests {
     }
 
     #[test]
-    fn oci1_verify_fetched_blob() {
+    fn oci1_verify_blob_digest_match_and_mismatch() {
         let d = tmp_dir("fetched");
         let p = d.join("b");
         std::fs::write(&p, b"abc").unwrap();
-        let mut blob = FetchedBlob {
-            path: p.clone(),
-            size: 3,
-            digest: Digest::parse(ABC).unwrap(),
-        };
-        assert_eq!(verify_fetched_blob(&blob, 10).unwrap().size, 3);
-        blob.digest = Digest::parse(EMPTY).unwrap();
-        let e = verify_fetched_blob(&blob, 10).unwrap_err();
+        assert_eq!(
+            verify_blob_digest(&p, &Digest::parse(ABC).unwrap(), 10)
+                .unwrap()
+                .size,
+            3
+        );
+        let e = verify_blob_digest(&p, &Digest::parse(EMPTY).unwrap(), 10).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         std::fs::remove_dir_all(&d).unwrap();
     }

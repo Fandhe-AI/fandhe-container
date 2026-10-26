@@ -16,7 +16,8 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 
 1. `blobs/sha256` を 0700 で用意し（既存の祖先検証）、`ImageStore::open` → `begin_pull_generated`（`staging/<id>` と `@pull.lock`）
 2. blob ごとに、既存ならリース登録 → 信頼条件・digest の検査（合格で再利用、不合格はリース解放して取得）。無ければ
-   `staged_blob_path` へ取得し `verify_staged_blob`（サイズは宣言値と完全一致）
+   `open_staged_blob` の writer（検査済み root の fd 起点の `<hex>.part`）へ取得して `commit`、`verify_staged_blob`
+   （サイズは宣言値と完全一致。#2765）
 3. config を読み、layer を `staging/<id>/unpack/entry/rootfs` へ展開（diff_id 突合）
 4. rootfs のエントリを `rootfs/sha256/<config-hex>` へ rename（記録と一緒に原子的）
 5. `publish`（blob の公開・manifest とタグの登録・リース解放を排他の下で 1 回の保存）

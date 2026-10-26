@@ -51,6 +51,7 @@ use fandhe_container_cri::runtime::v1::runtime_service_client::RuntimeServiceCli
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
 };
@@ -61,6 +62,7 @@ use fandhe_container_plugin::grpc::{
 };
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode};
 use fandhe_container_plugin_cri::server;
+use std::io::Write as _;
 use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
@@ -396,14 +398,15 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         d: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         let hex = d.digest.as_str().trim_start_matches("sha256:");
         let body = self
             .blobs
             .get(hex)
             .ok_or_else(|| OciError::new(OciErrorCode::NotFound, "blob"))?;
-        std::fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(body)
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 

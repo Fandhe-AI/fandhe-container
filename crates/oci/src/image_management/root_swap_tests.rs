@@ -12,6 +12,7 @@
 ))]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -30,6 +31,7 @@ use super::{
 };
 use crate::error::OciErrorCode;
 use crate::reference::{Digest, RegistryHost, Repository, Tag};
+use crate::registry::test_support::fetch_blob_with_hook;
 
 fn d(n: u8) -> Digest {
     Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).expect("digest")
@@ -264,7 +266,8 @@ fn open_store(root: &Path) -> ImageStore {
 }
 
 /// OCI-7・SEC-1・#2694: `begin_pull` の排他区間の直後に root が差し替わっても、staging・pull ディレクトリ・
-/// `@pull.lock` は検査済みの root にだけ作られ、おとりは空のまま。`staged_blob_path` は差し替えを検出して
+/// `@pull.lock` は検査済みの root にだけ作られ、おとりは空のまま。`open_staged_blob` の書き込み先も検査済みの
+/// root の pull ディレクトリ（#2765）で、検証後のパス API `staged_blob_read_path` は差し替えを検出して
 /// `Internal` で拒否し、次の `lock` も入口の再検査で `Internal` になる。
 #[test]
 fn oci7_sec1_root_swapped_during_begin_pull_keeps_staging_in_verified_root() {
@@ -279,7 +282,19 @@ fn oci7_sec1_root_swapped_during_begin_pull_keeps_staging_in_verified_root() {
     assert_eq!(names(&moved), vec!["@lock", "staging"]);
     assert_eq!(names(&moved.join("staging")), vec!["p1"]);
     assert_eq!(names(&moved.join("staging").join("p1")), vec!["@pull.lock"]);
-    let e = s.staged_blob_path(&d(0x11)).expect_err("swapped root");
+    let data = b"layer-bytes";
+    let layer = sha_of(data);
+    let mut w = s.open_staged_blob(&layer).expect("writer");
+    w.write_all(data).expect("write");
+    w.commit().expect("commit");
+    let hex = layer.to_string().replace("sha256:", "");
+    assert_eq!(
+        fs::read(moved.join("staging").join("p1").join(&hex)).expect("written to verified"),
+        data
+    );
+    assert_eq!(names(&root), Vec::<String>::new());
+    s.verify_staged_blob(&layer, 1 << 20).expect("verify");
+    let e = s.staged_blob_read_path(&layer).expect_err("swapped root");
     assert_eq!(e.code(), OciErrorCode::Internal);
     assert_eq!(e.message(), "image store root changed after open");
     let Err(e) = store.lock() else {
@@ -304,8 +319,9 @@ fn oci7_sec1_root_swapped_during_publish_links_blob_into_verified_root() {
     let (cfg_data, layer_data) = (b"config-bytes".as_slice(), b"layer-bytes".as_slice());
     let (cfg, layer) = (sha_of(cfg_data), sha_of(layer_data));
     for (dg, data) in [(&cfg, cfg_data), (&layer, layer_data)] {
-        let path = s.staged_blob_path(dg).expect("path");
-        fs::write(&path, data).expect("write");
+        let mut w = s.open_staged_blob(dg).expect("writer");
+        w.write_all(data).expect("write");
+        w.commit().expect("commit");
         s.verify_staged_blob(dg, 1 << 20).expect("verify");
     }
     let (r, m) = (root.clone(), moved.clone());
@@ -411,40 +427,104 @@ fn oci7_sec1_lease_rejects_root_swapped_after_reverify() {
     let _ = fs::remove_dir_all(&moved);
 }
 
-/// OCI-7・SEC-1・#2694: `staged_blob_path` で得たパスへ fetcher が書く前に root が差し替わると、書かれた先は
-/// おとりになる。検証は保持している pull ディレクトリ fd 起点で開き直すため `NotFound` になり、公開もされない
-/// （fetcher の書き込み先がパスである残りの隙間の fail-closed を機械照合する）。
-#[test]
-fn oci7_sec1_fetch_into_swapped_root_is_not_published() {
-    let root = temp_root("fetch");
-    let moved = root.with_extension("moved");
+/// 取得の途中で差し替える試験の共通の準備: 本物のストアの pull `p1` と、digest・本文・writer を返す。
+fn fetch_setup(label: &str) -> (PathBuf, ImageStore, Vec<u8>) {
+    let root = temp_root(label);
     let store = open_store(&root);
-    let mut s = store.begin_pull(pid("p1")).expect("begin");
-    let data = b"layer-bytes";
-    let layer = sha_of(data);
-    let path = s.staged_blob_path(&layer).expect("path");
-    swap_root(&root, &moved);
-    fs::create_dir_all(path.parent().expect("parent")).expect("decoy staging");
-    fs::write(&path, data).expect("fetcher writes into decoy");
+    (root, store, b"layer-bytes-for-fetch".to_vec())
+}
 
-    let e = s
-        .verify_staged_blob(&layer, 1 << 20)
-        .expect_err("not found");
-    assert_eq!(e.code(), OciErrorCode::NotFound);
-    assert_eq!(e.message(), "staged blob not found");
-    let comp = ManifestComposition::new(layer.clone(), Vec::new()).expect("comp");
-    let e = s
-        .publish(PullPublishRequest::new(d(0xa0), comp))
-        .expect_err("unverified");
-    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+/// OCI-7・SEC-1・OCI-1（#2765）: root 全体が `begin_pull` の後・書き込みの前に差し替わっても、fetcher の書き込みは
+/// 保持している検査済みの pull ディレクトリへ届く。おとりの root は空のまま、完全な内容が `moved` 側に確定し、
+/// 検証・公開も `moved` 側の `blobs/sha256` へ通る（#2694 で残っていた隙間が閉じたことの機械照合）。
+#[test]
+fn oci7_sec1_fetch_after_root_swap_writes_into_verified_root() {
+    use std::os::unix::fs::MetadataExt;
+    let (root, store, data) = fetch_setup("fetch");
+    let moved = root.with_extension("moved");
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    let layer = sha_of(&data);
+    swap_root(&root, &moved);
+    let mut w = s.open_staged_blob(&layer).expect("writer");
+    fetch_blob_with_hook(&mut w, &data, || {}).expect("fetch");
+    w.commit().expect("commit");
+
+    assert_eq!(names(&root), Vec::<String>::new());
+    let hex = layer.to_string().replace("sha256:", "");
+    let staged = moved.join("staging").join("p1").join(&hex);
+    assert_eq!(fs::read(&staged).expect("staged"), data);
+    assert_eq!(fs::metadata(&staged).expect("meta").nlink(), 1);
     assert_eq!(
-        e.message(),
-        "blob is neither leased nor verified by this pull"
+        names(&moved.join("staging").join("p1")),
+        vec!["@pull.lock".to_string(), hex.clone()]
     );
-    assert!(fs::symlink_metadata(moved.join("blobs")).is_err());
-    assert_eq!(fs::read(&path).expect("decoy kept"), data.as_slice());
+    s.verify_staged_blob(&layer, 1 << 20).expect("verify");
+    let comp = ManifestComposition::new(layer.clone(), Vec::new()).expect("comp");
+    // 公開の入口の再検査は差し替えを検出して拒否する（fail-closed）。おとりへは何も作られない。
+    let _ = s.publish(PullPublishRequest::new(d(0xa0), comp));
+    assert_eq!(names(&root), Vec::<String>::new());
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1（#2765）: 取得の途中（本文の前半を書いた後）に `<root>/staging/<id>` が symlink へ差し替わっても、
+/// 書き込みは開いたままの検査済みの実体へ届く。symlink の向こうの外部ディレクトリは空のまま、確定した blob は
+/// 完全な内容（リンク数 1）で、`.part` は残らない。
+#[test]
+fn oci7_sec1_pull_dir_swapped_to_symlink_during_fetch_writes_into_verified_root() {
+    use std::os::unix::fs::MetadataExt;
+    let (root, store, data) = fetch_setup("fetch-pd");
+    let outside = temp_root("fetch-pd-out");
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    let layer = sha_of(&data);
+    let mut w = s.open_staged_blob(&layer).expect("writer");
+    let (r, o) = (root.clone(), outside.clone());
+    fetch_blob_with_hook(&mut w, &data, move || {
+        let pd = r.join("staging").join("p1");
+        fs::rename(&pd, r.join("staging").join("p1.moved")).expect("move pull dir");
+        std::os::unix::fs::symlink(&o, &pd).expect("symlink");
+    })
+    .expect("fetch");
+    w.commit().expect("commit");
+
+    assert_eq!(names(&outside), Vec::<String>::new());
+    let hex = layer.to_string().replace("sha256:", "");
+    let real = root.join("staging").join("p1.moved");
+    assert_eq!(fs::read(real.join(&hex)).expect("staged"), data);
+    assert_eq!(fs::metadata(real.join(&hex)).expect("meta").nlink(), 1);
+    assert_eq!(names(&real), vec!["@pull.lock".to_string(), hex]);
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+/// OCI-7・SEC-1（#2765）: 取得の途中で `<root>/staging` 自身が、おとり（`p1/` を持つ外部ディレクトリ）への
+/// symlink に差し替わっても、書き込みは検査済みの実体へ届き、おとりの `p1/` は空のまま。
+#[test]
+fn oci7_sec1_staging_swapped_to_symlink_during_fetch_writes_into_verified_root() {
+    let (root, store, data) = fetch_setup("fetch-st");
+    let outside = temp_root("fetch-st-out");
+    fs::create_dir(outside.join("p1")).expect("decoy pull dir");
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    let layer = sha_of(&data);
+    let mut w = s.open_staged_blob(&layer).expect("writer");
+    let (r, o) = (root.clone(), outside.clone());
+    fetch_blob_with_hook(&mut w, &data, move || {
+        fs::rename(r.join("staging"), r.join("staging.moved")).expect("move staging");
+        std::os::unix::fs::symlink(&o, r.join("staging")).expect("symlink");
+    })
+    .expect("fetch");
+    w.commit().expect("commit");
+
+    assert_eq!(names(&outside.join("p1")), Vec::<String>::new());
+    let hex = layer.to_string().replace("sha256:", "");
+    assert_eq!(
+        fs::read(root.join("staging.moved").join("p1").join(&hex)).expect("staged"),
+        data
+    );
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
 }
 
 /// `root` に `blobs/sha256/<hex>` を `len` バイトで置く（`blobs/sha256` が無ければ作る）。

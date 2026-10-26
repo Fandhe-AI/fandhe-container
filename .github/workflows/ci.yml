@@ -505,6 +505,7 @@ jobs:
       # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
       # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
+        if: env.HANG_PROBE != 'true'
         shell: bash
         timeout-minutes: 10
         run: make doc
@@ -528,13 +529,17 @@ jobs:
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test
+      # 上の cargo doc と下の 2 ステップは、hang-probe 時にハング検出のステップへ早く着くよう check-launch-target・
+      # 自己テスト群と同じく HANG_PROBE で飛ばす（ステージ 1・2 の build / clippy / test は従来どおり無条件。#2533）。
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
       # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
       - name: core plugin 無効構成の検証
+        if: env.HANG_PROBE != 'true'
         shell: bash
         run: make test-core-no-plugin
       # CLI がバックエンド実装 crate へ直接依存しない（CLI-1・PLUG-4・TASK-79.4）。既存ジョブへのステップ追加
       - name: cli のバックエンド直接依存なしの検証
+        if: env.HANG_PROBE != 'true'
         shell: bash
         run: make check-cli-backend-deps
       # plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけであることの
@@ -1078,6 +1083,51 @@ jobs:
           grep -F 'observed:' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
           echo "config_paths_implicit_dev: 6 overlaps observed (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::config_paths_implicit_dev verified"
+
+      # sysfs_mount（`crates/core/tests/sysfs_mount.rs`。SEC-2・SEC-1・OCI-4・#2020・#2305・#2533）:
+      # rootless の user namespace 内で rbind した /sys が読み取り専用 sysfs になること、覆いの件数、
+      # および user namespace の root から /sys の最上位の ro を外せるか（シナリオ ro-clear。#2305 の問い）を
+      # 観測する実機前提テスト（harness = false。--ignored の dispatcher がシナリオ default / ro-clear を再 exec する）。
+      # 上で緩和した sysctl を再利用し、sudo・permissions・check-run は増やさない（rootless 経路のみ。
+      # rootful は #1621）。escape-probe は dev-dependency の自己参照で有効なので --features は不要。
+      # ro-clear の防御なしの errno は測定値のため assert しない（防御ありの EPERM と測定成立は試験自身が assert する）。
+      # --ignored が届かないと exit 0 になるため、成功行 3 本を行頭・行末固定で照合して false-green を防ぐ。
+      - name: sysfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test sysfs_mount --no-run
+
+      - name: sysfs_mount の実行（実機前提テスト・--ignored。SEC-2・SEC-1・#2305・#2533）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sysfs_mount.log"
+          cargo test -p fandhe-container-core --test sysfs_mount -- --ignored 2>&1 | tee "${log}"
+          default_line='sysfs_mount: /sys is a read-only sysfs (nosuid,nodev,noexec), '
+          default_line+='writes refused, reads allowed (root=false)'
+          if ! grep -Fq "${default_line}" "${log}"; then
+            echo "::error::sysfs_mount default scenario did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          mask_re='^sysfs_mount: [0-9]+ /sys entries masked \(firmware=(true|false), '
+          mask_re+='powercap=(true|false), thermal_throttle=[0-9]+\) \(root=false\)$'
+          if ! grep -Eq "${mask_re}" "${log}"; then
+            echo "::error::sysfs_mount did not report the masked entries line" >&2
+            exit 1
+          fi
+          clear_re='^sysfs_mount: ro-clear on /sys top mount \(stack=[0-9]+\): '
+          clear_re+='undefended=[0-9]+, defended errno=1 \(root=false\)$'
+          if ! grep -Eq "${clear_re}" "${log}"; then
+            echo "::error::sysfs_mount ro-clear scenario did not report verification" >&2
+            exit 1
+          fi
+          {
+            echo "kernel: $(uname -r)"
+            grep -E '^sysfs_mount: host /sys read-only=' "${log}" || true
+            grep -F 'sysfs_mount: ro-clear observation:' "${log}" || true
+            grep -E "${clear_re}" "${log}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::sysfs_mount verified"
 
       # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
       # secrets / configs の専用 tmpfs への注入・`mount_setattr(2)` による読み取り専用化

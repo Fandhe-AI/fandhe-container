@@ -671,6 +671,14 @@ fn delete_incomplete(count: usize) -> TraitError {
     )
 }
 
+/// 保持中の netns の解放が済んでいないコンテナへの操作の拒否（#2675）。
+fn netns_pending_release() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "container netns is pending release after a failed create; detach it first",
+    )
+}
+
 /// attach の巻き戻しで取り残した資源が残っているコンテナへの操作の拒否（記録を消して成功を装わない）。
 fn quarantine_held() -> TraitError {
     TraitError::new(
@@ -926,10 +934,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             ));
         }
         if container.netns_retained {
-            return Err(TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "container netns is pending release after a failed create; detach it first",
-            ));
+            return Err(netns_pending_release());
         }
         let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
         let outcome = match self.backend.attach(handle, &container.endpoint) {
@@ -998,6 +1003,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 AttachReclaim::Removed => {}
                 // カーネル側は回収済みだが、アドレス・ポート予約はネットワークごとの解放まで残る。成功を装わない。
                 AttachReclaim::QuarantineHeld => return Err(quarantine_held()),
+                // detach は回収の前に保持中の netns を解放する（失敗なら上で返る）ため通常は届かない。届いたら記録を
+                // 保持したまま成功を装わない（#2675）。
+                AttachReclaim::NetnsPending => return Err(netns_pending_release()),
             }
             forget_recovered_if_empty(reg, req.network().as_str());
             return Ok(DetachResponse::new());
@@ -1107,13 +1115,17 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let mut first_error = early_error;
         let mut release_failed: Vec<String> = Vec::new();
         for id in &linked {
-            if let Some(c) = reg.containers.get(id)
+            if let Some(c) = reg.containers.get_mut(id)
                 && c.attached.is_none()
                 && !c.unreclaimed
-                && let Err(e) = self.backend.release_netns(&c.endpoint)
             {
-                first_error.get_or_insert(e);
-                release_failed.push(id.clone());
+                match self.backend.release_netns(&c.endpoint) {
+                    Ok(()) => c.netns_retained = false,
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                        release_failed.push(id.clone());
+                    }
+                }
             }
         }
         let mut handles = Vec::new();
@@ -1140,7 +1152,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     if c.unreclaimed && !c.quarantine_held {
                         continue;
                     }
-                    if release_failed.contains(id) {
+                    // 解放できていない netns を持つ記録は外さない（quarantine だけの保持で取り残しの解放に失敗したものを
+                    // 含む。`first_error` が立っているため成功は返らない。#2675）。
+                    if release_failed.contains(id) || c.netns_retained {
                         continue;
                     }
                     // quarantine だけの保持は、ネットワークの解放で片付いた。記録ファイルも外す（失敗なら保持して再試行）。
@@ -1222,6 +1236,9 @@ enum AttachReclaim {
     Removed,
     /// カーネル側は回収したが、quarantine が生きたネットワークに残るため記録を保持した。
     QuarantineHeld,
+    /// カーネル側の取り残しは回収したが、バックエンドが保持する netns（`netns_retained`）の解放が済んでいないため、
+    /// 請求書だけ外して記録を保持した（`release_netns` の成功まで追跡を失わない。#2675・NET-1）。
+    NetnsPending,
 }
 
 /// 復元したネットワーク（`recovered`）で、コンテナの記録が無くなったら外す（#2681）。
@@ -1271,6 +1288,15 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         if let (Some(store), Some(record)) = (&self.store, self.backend.encode_attach_claim(claim))
         {
             store.remove_attach_if_matches(entry.endpoint.as_str(), &record)?;
+        }
+        if entry.netns_retained {
+            // 保持中の netns は請求書の回収の対象外。記録を外すと `release_netns` に届かなくなるため、取り残しの印と
+            // 請求書だけ外して未 attach の記録として残す（detach・delete_network の解放で記録ごと外れる）。
+            let entry = containers.get_mut(id).ok_or_else(not_found_netns)?;
+            entry.unreclaimed = false;
+            entry.quarantine_held = false;
+            entry.claim = None;
+            return Ok(AttachReclaim::NetnsPending);
         }
         containers.remove(id);
         Ok(AttachReclaim::Removed)

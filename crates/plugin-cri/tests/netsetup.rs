@@ -1179,6 +1179,57 @@ fn net1_attach_leftover_with_claim_releases_retained_netns_before_reclaim() {
     );
 }
 
+/// 請求書による回収が成功しても、保持中の netns の解放に失敗している間はコンテナの記録を外さない。
+/// delete_network は失敗を返し、再試行で解放してから記録ごと消える（pin・fd への回収経路を失わない。#2675・NET-1）。
+#[test]
+fn net1_reclaimed_attach_leftover_keeps_record_until_netns_released() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("netns");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+        s.attach_retained = true;
+        s.attach_claim = true;
+        s.reclaim_attach_ok = true;
+        // 回収前の解放と、回収後の未 attach の解放の両方を失敗させる。
+        s.fail_release = 2;
+    }
+    net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+        .expect_err("attach fails");
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("release fails");
+    assert_eq!(e.message(), "release failed");
+    // 記録は残り、保持中の netns があるので attach は拒否される。
+    assert_eq!(
+        net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+            .expect_err("pending release")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    net.delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect("released on retry");
+    assert_eq!(
+        fake.netns_calls(),
+        vec![
+            "create_netns c1",
+            "release_netns c1",
+            "release_netns c1",
+            "release_netns c1"
+        ]
+    );
+    // 記録ごと消えている。
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("a")))
+            .expect_err("gone")
+            .code(),
+        ErrorCode::NotFound
+    );
+}
+
 /// create_netns の失敗では記録を作らない。
 #[test]
 fn net1_failed_create_netns_leaves_no_record() {

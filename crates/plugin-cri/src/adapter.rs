@@ -45,8 +45,12 @@
 //!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。既知の制約として、既定を超える terminate で窓が 10 秒を超えると
 //!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、CLI の同じ ID の `create` は残りを回収するが、CRI は ID を再利用しないため手動で消す。docs/setup/container-log-recovery.md）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
-//!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
-//!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
+//!   ContainerConfig → config.json 変換。#2433）。`ImageService` は同じ UDS でサーブし（`CriPluginBackends::image_service`。#2592）、
+//!   `PullImage` が登録したタグ・digest・image ID を同じ在庫から解決する（未知の参照は `NOT_FOUND`）。
+//!   在庫は cri の `InMemoryImageStore`（プロセス内だけ）で、plugin-cri の再起動でタグの対応は失われる
+//!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
+//!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
+//!   （#2241・#2315・#482 が前提）。展開の計装（`OciOpRecorder`）は未配線で何も記録しない。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
 //!   記録先を注入したときだけ行う（[`CriPluginBackends::production_with_audit_sink`]。Linux の本番はこちら）。プロセスが常に複数
@@ -77,8 +81,15 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
+#[cfg(unix)]
+use fandhe_container_cri::image_pull::PullConfig;
+#[cfg(unix)]
+use fandhe_container_cri::image_service::CriImageService;
+use fandhe_container_cri::image_service::{ImageStore, InMemoryImageStore};
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
+#[cfg(unix)]
+use fandhe_container_oci::registry::RegistryClientConfig;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::logs::{
     CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs,
@@ -108,6 +119,9 @@ pub struct CriPluginBackends {
     recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
+    /// `ImageService`（`PullImage` の登録先）と本番の `BundleProvider`（`CreateContainer` のタグ解決）が共有する在庫。
+    /// プロセス内だけで永続化しない（再起動でタグの対応は失われる。モジュール doc の REPAIR-3）。
+    images: Arc<dyn ImageStore>,
 }
 
 impl fmt::Debug for CriPluginBackends {
@@ -140,6 +154,7 @@ impl CriPluginBackends {
             network,
             recorder,
             state_root: None,
+            images: Arc::new(InMemoryImageStore::new()),
         }
     }
 
@@ -199,11 +214,41 @@ impl CriPluginBackends {
     #[cfg(unix)]
     pub fn production_bundle_provider(&self) -> Result<Arc<dyn BundleProvider>, CriError> {
         match &self.state_root {
-            Some(root) => bundle_provider_in(root),
+            Some(root) => bundle_provider_with(root, Some(Arc::clone(&self.images))),
             None => Err(CriError::failed_precondition(
                 "state root is not configured",
             )),
         }
+    }
+
+    /// 本番の `ImageService`（`PullImage`・`ImageStatus`・`ListImages`・`RemoveImage`・`ImageFsInfo`）を作る（CRI-3・CRI-4・PLUG-1。#2592）。
+    ///
+    /// `production_bundle_provider` と同じ在庫（[`Self::images`]）と、同じ `PullConfig`（キャッシュは
+    /// `<state_root>/.cri/images`）を共有するため、`PullImage` で登録したタグを `CreateContainer` が解決でき、
+    /// pull と create の展開設定が食い違わない。`production()` で組んだときだけ使え、注入で組んだときは
+    /// `FAILED_PRECONDITION`。レジストリクライアント（OS のルート証明書の読み込み）を作れなければエラーを返す。
+    /// 呼び出しは `production_bundle_provider` の後にする（置き場の作成と検証を先に済ませるため）。
+    #[cfg(unix)]
+    pub fn image_service(&self) -> Result<CriImageService, CriError> {
+        use fandhe_container_cri::image_pull::{OciImagePuller, OciRegistryClient};
+        let Some(root) = &self.state_root else {
+            return Err(CriError::failed_precondition(
+                "state root is not configured",
+            ));
+        };
+        let pull = production_pull_config(root)?;
+        let client = OciRegistryClient::new(&production_registry_config())
+            .map_err(|_| CriError::failed_precondition("failed to prepare the registry client"))?;
+        Ok(CriImageService::with_store_and_recorder(
+            Arc::clone(&self.images),
+            Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))),
+        )
+        .with_puller(Arc::new(OciImagePuller::new(client, pull))))
+    }
+
+    /// `ImageService` と bundle 供給が共有する在庫。
+    pub fn images(&self) -> &Arc<dyn ImageStore> {
+        &self.images
     }
 
     /// `ContainerRuntime` の実装。
@@ -247,6 +292,34 @@ impl CriPluginBackends {
 /// supervisor の起動結果の受信期限（`start_contract::cli_receive_deadline`）に 2 秒の余裕を足した値。CRI の既定
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// gRPC サーバーが 1 リクエストを待つ上限（REPAIR-5・#2592）。`GrpcServerConfig` の既定（10 秒）では `PullImage`
+/// （ネットワーク越し）も `StartContainer`（[`PLUGIN_RUNTIME_TIMEOUT`]）も途中で切れるため、`GRPC_TIMEOUT_MAX`（600 秒）以下で
+/// 引き上げる。クライアントが付ける `grpc-timeout` はこれより短ければそちらが効く。
+pub const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `PullImage` 全体の期限（[`PLUGIN_REQUEST_TIMEOUT`] より短くする）。gRPC 側が先に切れても、裏の `spawn_blocking` の取り込みが
+/// 有界時間で終わるようにするため（oci の既定は pull 1 時間・blob 30 分で、request timeout より長い）。
+pub const PLUGIN_PULL_DEADLINE: Duration = Duration::from_secs(540);
+
+/// 本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`。pull と create の展開設定の単一の出所）。
+///
+/// 所有者・特殊ビットは既定の `Keep` + `Strip` のまま（`ChownMapped` 等の本番値は #2241・#2315・#482 が前提。REPAIR-3）。
+#[cfg(unix)]
+fn production_pull_config(state_root: &std::path::Path) -> Result<PullConfig, CriError> {
+    let mut pull = PullConfig::new(state_root.join(IMAGES_DIR))?;
+    pull.pull_deadline = PLUGIN_PULL_DEADLINE;
+    Ok(pull)
+}
+
+/// 本番のレジストリクライアント設定。blob 1 本の期限を [`PLUGIN_PULL_DEADLINE`] に揃える。
+#[cfg(unix)]
+fn production_registry_config() -> RegistryClientConfig {
+    RegistryClientConfig {
+        blob_request_timeout: PLUGIN_PULL_DEADLINE,
+        ..RegistryClientConfig::default()
+    }
+}
 
 /// core の `oci_runtime` のライブラリ関数へ委ねる plugin 側の `ContainerRuntime`（CRI-2）。
 ///
@@ -709,12 +782,24 @@ const IMAGES_DIR: &str = ".cri/images";
 /// 状態ルートと同じ所有者で、group / other の権限が無いことを確かめ、反すれば消さずに拒否する（fail-closed）。
 /// 失敗の文言は固定で、パスや OS の文字列を含めない。
 ///
-/// 展開設定（所有者・特殊ビット）は `ImageExtractConfig` の既定（`Keep` + `Strip`）のままで、`ChownMapped` 等の
-/// 本番の値は渡さない。配線の前提は #2241・#2315・#482・#2592（#2534・SEC-5。`fandhe_container_cri::image_pull` の
+/// 展開設定（所有者・特殊ビット）は既定（`Keep` + `Strip`）のままで、`ChownMapped` 等の
+/// 本番の値は渡さない。配線の前提は #2241・#2315・#482（#2534・SEC-5。`fandhe_container_cri::image_pull` の
 /// 「未実装範囲」を参照）。
 #[cfg(unix)]
 pub fn bundle_provider_in(
     state_root: &std::path::Path,
+) -> Result<Arc<dyn BundleProvider>, CriError> {
+    bundle_provider_with(state_root, None)
+}
+
+/// [`bundle_provider_in`] に、タグ・digest 参照を image ID へ解決する在庫 `store` を足した形（CRI-2・CRI-3。#2592）。
+///
+/// `store` は `ImageService` と同じものを渡す。`None` なら image ID（`sha256:<hex>`）だけを受ける。展開設定は
+/// `production_pull_config`（`ImageService` の pull と同じ値）から `ImageExtractConfig::from_pull_config` で作る。
+#[cfg(unix)]
+pub fn bundle_provider_with(
+    state_root: &std::path::Path,
+    store: Option<Arc<dyn ImageStore>>,
 ) -> Result<Arc<dyn BundleProvider>, CriError> {
     use fandhe_container_cri::bundle::{ImageExtractConfig, ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
@@ -740,10 +825,14 @@ pub fn bundle_provider_in(
         }
         dirs.push(cur);
     }
-    let [bundles, images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
+    let [bundles, _images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
-    let source = ImageRootfsSource::new(ImageExtractConfig::new(images)?);
+    let pull = production_pull_config(state_root)?;
+    let mut source = ImageRootfsSource::new(ImageExtractConfig::from_pull_config(&pull));
+    if let Some(store) = store {
+        source = source.with_image_store(store);
+    }
     Ok(Arc::new(SpecBundleProvider::new(
         bundles,
         Arc::new(source),

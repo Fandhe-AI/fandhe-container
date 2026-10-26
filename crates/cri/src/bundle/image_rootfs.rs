@@ -32,9 +32,11 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
-//! - **タグ・digest 参照の解決**: plugin-cri は `ImageService` をサーブしておらず、プロセス内でタグを解決できない。
-//!   [`ImageRootfsSource::with_image_store`] で `ImageStore` を注入したときだけタグを解決し、無ければ
-//!   `sha256:<64 桁小文字 hex>` の image ID だけを受ける（それ以外は `UNIMPLEMENTED`。注入済みで未知の参照は `NOT_FOUND`）
+//! - **タグ・digest 参照の解決**: [`ImageRootfsSource::with_image_store`] で `ImageStore` を注入したときだけタグを解決し
+//!   （短縮名は `canonical_reference` で正規化して再照会する）、無ければ `sha256:<64 桁小文字 hex>` の image ID だけを受ける
+//!   （それ以外は `UNIMPLEMENTED`。注入済みで未知の参照は `NOT_FOUND`）。plugin-cri は `ImageService` と同じプロセス内の在庫を
+//!   注入する（#2592）。在庫は永続化されないため、plugin-cri の再起動でタグの対応は失われる（`PullImage` をやり直せば、
+//!   キャッシュ済みの blob を再利用できる。永続の在庫への配線は TASK-183・#2315・#2380。REPAIR-3）
 //! - **イメージの User**: 数値の `uid:gid` は rootfs を読まずに解決する。名前・uid のみ・名前つきの組は、展開後の
 //!   rootfs の `/etc/passwd`・`/etc/group` を [`fandhe_container_oci::layer::read_rootfs_file`]（fd 起点・symlink を
 //!   辿らない・1 MiB 上限）で読んで解決する（#2606・SEC-1・SEC-5。解決表は `docs/design/cri-config-acceptance.md`）。
@@ -46,7 +48,7 @@
 //!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
 //!   数字だけの名前は拒否する（数値は `run_as_user`。containerd は uid 扱いの既知の差）
 //! - **展開設定**: 所有者・特殊ビットの本番の値は現状も既定の `Keep` + `Strip`。`ChownMapped` 等の配線は #2241
-//!   （rootful の可否）・#2315・#482（core の user namespace 配線）・#2592（pull の呼び出し元）が前提で、
+//!   （rootful の可否）・#2315・#482（core の user namespace 配線）が前提で（pull の呼び出し元の配線は #2592 で済み）、
 //!   それまで据え置く（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開中の処理は打ち切れない。期限は展開の前後で確認し、展開中の所要時間は展開の上限で有界にする
@@ -77,9 +79,9 @@ use super::provider::{RootfsSource, UserResolveRequest};
 use super::spec::ImageDefaults;
 use crate::error::CriError;
 use crate::image_pull::{
-    DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, create_private_dir, digest_hex,
-    expected_root_owner_for, inspect_published_rootfs, prepare_private_dir,
-    read_unpack_record_body, record_settings,
+    DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, canonical_reference,
+    create_private_dir, digest_hex, expected_root_owner_for, inspect_published_rootfs,
+    prepare_private_dir, read_unpack_record_body, record_settings,
 };
 use crate::image_service::{ImageStore, MAX_IMAGE_FIELD_BYTES};
 use crate::runtime::v1::ImageSpec;
@@ -207,6 +209,18 @@ impl ImageRootfsSource {
                 .map_err(|_| CriError::internal("image store is unavailable"))?;
             if let Some(id) = found.and_then(|r| Digest::parse(r.id()).ok()) {
                 return Ok(id);
+            }
+            // 短縮名（`alpine:3.20` 等）は PullImage と同じ規則で正規化して再照会する（`ImageStatus` と同じ。CRI-3・CRI-4）。
+            // 長さ・NUL の検証は上で済ませてあり、正規化した文字列は在庫の照会にしか使わない（パス要素にしない）。
+            if let Some(canonical) = canonical_reference(&spec.image)
+                && canonical != spec.image
+            {
+                let found = store
+                    .get(&canonical)
+                    .map_err(|_| CriError::internal("image store is unavailable"))?;
+                if let Some(id) = found.and_then(|r| Digest::parse(r.id()).ok()) {
+                    return Ok(id);
+                }
             }
         }
         let is_bare_hex =

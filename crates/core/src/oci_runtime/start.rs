@@ -4143,25 +4143,26 @@ mod tests {
             "oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace";
         if std::env::var_os("FANDHE_2823_INNER").is_none() {
             let exe = std::env::current_exe().expect("current_exe");
-            let out = std::process::Command::new("unshare")
-                .args([
-                    "--user",
-                    "--map-root-user",
-                    "--mount",
-                    "--propagation",
-                    "private",
-                ])
-                .arg(exe)
-                .args([
-                    "--exact",
-                    NAME,
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("FANDHE_2823_INNER", "1")
-                .output()
-                .expect("spawn unshare");
+            let mut cmd = std::process::Command::new("unshare");
+            cmd.args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                NAME,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FANDHE_2823_INNER", "1");
+            // 外側の待機は期限つき（REPAIR-5）。内側の mount 3 回分より長く 30 秒とする。
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(30))
+                .expect("unshare must finish before the deadline");
             let text = String::from_utf8_lossy(&out.stdout).into_owned()
                 + &String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "inner failed: {text}");
@@ -4175,12 +4176,16 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fandhe-oci-2823-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mount_tmpfs = |dir: &Path| {
-            let st = std::process::Command::new("mount")
-                .args(["-t", "tmpfs", "tmpfs"])
-                .arg(dir)
-                .status()
-                .expect("mount");
-            assert!(st.success(), "mount tmpfs on {}", dir.display());
+            let mut cmd = std::process::Command::new("mount");
+            cmd.args(["-t", "tmpfs", "tmpfs"]).arg(dir);
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(5))
+                .expect("mount must finish before the deadline");
+            assert!(
+                out.status.success(),
+                "mount tmpfs on {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         let x = base.join("x");
         let y = x.join("y");

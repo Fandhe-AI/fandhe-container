@@ -99,6 +99,8 @@ mod real_entry;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。出力はしない。#2888）。
+    real_entry::precondition::self_check();
     let args: Vec<String> = std::env::args().collect();
     if is_entry_mode(&args) {
         linux::entry_init();

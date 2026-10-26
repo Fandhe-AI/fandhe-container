@@ -476,3 +476,33 @@ mod imp {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::RootHandle;
+    use crate::image_management::PullId;
+
+    /// OCI-7・SEC-1・#2694: pull ディレクトリ直下の名前が symlink でも `stat_name` は `ELOOP` にせず、
+    /// symlink 自身を返す（呼び出し側が通常ファイルでないものとして拒否・再取得できる）。
+    #[test]
+    fn oci7_stat_name_returns_symlink_itself_not_error() {
+        let r = std::env::temp_dir().join(format!("fc-oci-staging-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(&r).expect("mkdir");
+        let h = RootHandle::open_unchecked(&r).expect("open");
+        let staging = h.ensure_staging_dir().expect("staging");
+        let id = PullId::new("1-2-3").expect("id");
+        let pd = staging.create_pull_dir(&id).expect("pull dir");
+        let dir = r.join("staging").join("1-2-3");
+        std::fs::write(r.join("target"), b"x").expect("target");
+        std::os::unix::fs::symlink(r.join("target"), dir.join("abc")).expect("link");
+        std::fs::write(dir.join("reg"), b"y").expect("reg");
+
+        let m = pd.stat_name("abc").expect("no error").expect("some");
+        assert!(m.file_type().is_symlink());
+        assert!(!m.is_file());
+        assert!(pd.stat_name("reg").expect("ok").expect("some").is_file());
+        assert!(pd.stat_name("none").expect("ok").is_none());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+}

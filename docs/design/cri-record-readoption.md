@@ -30,7 +30,7 @@
 | コンテナ記録（CRI 層の項目一式・`image_ref`・`image_id`） | 決定し実装単位へ |
 | 保持役の pid と素性 | 記録の形を決定。再採用の可否は要確認事項 1 |
 | ネットワーク資源（`network_owned`・`pod_netns`） | フラグの永続は決定。再起動後の `tear_down` は #1870 の後 |
-| plugin-cri の在庫（`InMemoryImageStore`）の永続在庫への配線 | 範囲外。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない。追跡する open の issue は確認できなかった（起票は未実施） |
+| plugin-cri の在庫（`InMemoryImageStore`）の永続在庫への配線 | 範囲外。記録の `image_ref`・`image_id` は create 時のスナップショットとして独立に永続化するため依存しない。追跡 issue は #2945 |
 
 ## 置き場所
 
@@ -55,7 +55,7 @@
 ## 書く時点・消す時点
 
 - sandbox: `RunPodSandbox` が副作用（保持役の起動・`set_up`）の前に `pending` 付きで書き、成功後に確定版へ置き換える。`StopPodSandbox` で状態・フラグを更新し、`RemovePodSandbox` の完了後に削除する
-- コンテナ: `CreateContainer` が core の `create` を呼ぶ前に `in_flight=create` 付きで書き（`reserve_container` の後）、`commit_in_flight` で確定版へ、`rollback_in_flight` で削除する。Start/Stop の遷移で状態と時刻を更新し、`RemoveContainer`（core の delete と bundle の release の成功後）で削除する
+- コンテナ: `CreateContainer` が core の `create` を呼ぶ前に `in_flight=create` 付きで書き（`reserve_container` の後）、`commit_in_flight` で確定版へ、`rollback_in_flight` で、削除してよい場合に限り削除する。削除してよいのは、未作成、または core の削除完了と bundle の解放成功を確認できた Create の巻き戻しだけである。Create の結果が不明な場合や bundle の解放に失敗した場合は、既存の `rollback_in_flight` と同じく記録を `CONTAINER_UNKNOWN` として保持する（消すと core に資源が残っても所有情報を失い、再起動後に回収できなくなる。CRI-2 の fail-closed）。Start / Stop / Remove の巻き戻しでは記録を削除せず、`in_flight` を戻すか unknown で保持する。Start/Stop の遷移で状態と時刻を更新し、`RemoveContainer`（core の delete と bundle の release の成功後）で削除する
 - write-ahead を採る理由: #2681 で net が write-ahead を採らなかった理由（成功後か途中かを見分けられない）は、ここでは core の状態（Present/Absent）で見分けられる。逆に後書きにすると「core にコンテナがあるのに CRI 記録が無い」状態が生じ、状態ルートを CLI と共有するため plugin-cri 由来かを証明できず回収できない
 - 書けなかった場合: 副作用の前なら RPC を `Internal` で失敗させる（成功を装わない）。確定・更新の書き込み失敗はメモリの記録を保持して `Internal` を返し、次の起動では古い記録と core の状態で照合される（次節の表で安全側に倒れる）
 - 性能: RPC ごとに fsync が 1〜2 回増える。CORE-10 の起動 p95 への影響は実装単位の試験で計測項目に挙げる

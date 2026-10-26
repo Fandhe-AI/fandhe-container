@@ -2715,17 +2715,6 @@ mod linux {
         }
     }
 
-    /// 試験用の薄い入口(世代を捨てる)。
-    #[cfg(test)]
-    fn prepare_container_options(
-        store: &Arc<dyn StateStore>,
-        root: &std::path::Path,
-        id: &ContainerId,
-        until: Option<Instant>,
-    ) -> Result<Option<ContainerOptions>, TraitError> {
-        prepare_container_options_with_generation(store, root, id, until).map(|(o, _)| o)
-    }
-
     /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
     ///
     /// 記録が無い(`NotFound`)ときは文書を採用しない(後続の手順が記録の不在を報告する)。ほかの取得失敗はそのまま返す。
@@ -3014,6 +3003,17 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        /// 試験用の薄い入口(世代を捨てる)。本番部分の `#[cfg(test)]` 分割に依存する照合試験があるため、
+        /// 本番側ではなく tests モジュールに置く。
+        fn prepare_container_options(
+            store: &Arc<dyn StateStore>,
+            root: &std::path::Path,
+            id: &ContainerId,
+            until: Option<Instant>,
+        ) -> Result<Option<ContainerOptions>, TraitError> {
+            prepare_container_options_with_generation(store, root, id, until).map(|(o, _)| o)
+        }
+
         use super::*;
 
         /// 一時ディレクトリに passwd / subuid / subgid を置き、`resolve_launch_privilege` を呼ぶ。
@@ -3289,13 +3289,10 @@ mod linux {
                     rec.revision(),
                 ))
                 .expect("delete");
-            // 世代が違う記録でも採用しない。
+            // 世代が違う記録は、削除と作成の競合の疑いとして拒否する(旧文書で新記録を黙って既定値にしない)。
             let rec = create_record(Some("gen-2"));
-            assert!(
-                prepare_container_options(&store_dyn, &root, &id, until)
-                    .expect("other generation is ignored")
-                    .is_none()
-            );
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
             store_dyn
                 .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
                     id.clone(),

@@ -390,8 +390,10 @@ pub const GENERATION_ANNOTATION: &str = "io.fandhe.container.options-generation"
 /// 読んだ文書を、状態記録が持つ作成世代と照合して採否を決める(純関数。SUP-12・SEC-1・#2713)。
 ///
 /// - 文書あり・世代が記録と一致: 採用する
-/// - 文書あり・世代が無い、または記録の値と違う: 別のコンテナ(同じ ID の前の世代・plugin-cri 経由で作られた記録)の
-///   残骸なので採用しない(`None`。前の世代の env・ulimit・`--ipc=host` を次のコンテナへ適用しない)
+/// - 文書あり・記録が世代を持たない: 前のコンテナ(同じ ID の前の世代・plugin-cri 経由で作られた記録)の残骸なので
+///   採用しない(`None`。前の世代の env・ulimit・`--ipc=host` を次のコンテナへ適用しない)
+/// - 文書あり・記録が世代を持つが文書の世代が無い、または違う: `FailedPrecondition`(削除と作成の競合で旧文書を
+///   新記録に当てて env・ulimit を落とさないための fail-closed)
 /// - 文書なし・記録が世代を持つ: 文書が失われているため `FailedPrecondition`(オプションを黙って落とさない)
 /// - 文書なし・記録も世代なし: 既定値(`None`)
 pub fn select_document(
@@ -404,10 +406,17 @@ pub fn select_document(
             ErrorCode::FailedPrecondition,
             "the container options file is missing",
         )),
-        (Some(d), recorded) => match (d.generation(), recorded) {
-            (Some(g), Some(r)) if g == r => Ok(Some(d)),
-            _ => Ok(None),
+        (Some(d), Some(r)) => match d.generation() {
+            Some(g) if g == r => Ok(Some(d)),
+            // 記録が世代を持つのに文書の世代が違う・無い: 文書の読みと記録の取得の間に同じ ID の delete / create が
+            // 挟まった等で、新しい記録の世代を旧文書と取り違えうる。オプションを黙って落とさず拒否する(fail-closed)。
+            _ => Err(err(
+                ErrorCode::FailedPrecondition,
+                "the container options file does not match the recorded generation",
+            )),
         },
+        // 記録が世代を持たない(plugin-cri 経由等)ときの文書は前のコンテナの残骸なので採用しない。
+        (Some(_), None) => Ok(None),
     }
 }
 
@@ -601,13 +610,16 @@ mod tests {
             select_document(Some(with_gen.clone()), Some("g1")).expect("match"),
             Some(with_gen.clone())
         );
-        // 別世代・記録に世代なし・文書に世代なしは、残骸として採用しない。
+        // 記録に世代なしの文書は残骸として採用しない。
         assert_eq!(
-            select_document(Some(with_gen.clone()), Some("g2")).expect("x"),
+            select_document(Some(with_gen.clone()), None).expect("x"),
             None
         );
-        assert_eq!(select_document(Some(with_gen), None).expect("x"), None);
-        assert_eq!(select_document(Some(doc), Some("g1")).expect("x"), None);
+        // 記録が世代を持つのに別世代・文書に世代なしは、競合の疑いとして拒否する(fail-closed)。
+        for (d, r) in [(with_gen, "g2"), (doc, "g1")] {
+            let e = select_document(Some(d), Some(r)).expect_err("mismatch");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        }
         assert_eq!(select_document(None, None).expect("none"), None);
         let e = select_document(None, Some("g1")).expect_err("missing");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);

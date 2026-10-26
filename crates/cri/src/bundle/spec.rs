@@ -165,6 +165,43 @@ pub struct ImageDefaults {
     /// CRI の `stop_signal` が `RUNTIME_DEFAULT` のときだけ使われる（`crate::stop_signal::resolve_stop_signal`）。
     /// 解釈できない値は `ImageRootfsSource` が `INVALID_ARGUMENT` で拒否するため、ここには入らない。
     pub stop_signal: Option<crate::runtime::v1::Signal>,
+    /// rootfs 用意の過程で解決したイメージ（image ID と digest 参照）。`ContainerStatus`・`ListContainers` の
+    /// `image_ref`・`image_id` の元（#2831・CRI-2・OCI-1）。報告できない `RootfsSource` は `None`（空を返す。推測しない）。
+    pub resolved_image: Option<ResolvedImage>,
+}
+
+/// CreateContainer 時に解決したイメージ（#2831・CRI-2・OCI-1）。
+///
+/// `ImageRootfsSource` が在庫（`ImageStore`）で解決した結果を `ImageDefaults` → `PreparedBundle` 経由で
+/// `CriRuntimeService` の `ContainerRecord` へ運ぶ。値は create 時のスナップショットで、Status の時点で在庫を引き直さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedImage {
+    id: fandhe_container_oci::reference::Digest,
+    reference: Option<String>,
+}
+
+impl ResolvedImage {
+    /// 組み立てる。`reference`（`repo_digests[0]`）は長さ上限・制御文字なし・`@` を含むことを再検証し、
+    /// 満たさなければ `None` に倒して image ID を返す側にする（在庫は検証済みなので通常は起きない。多層防御）。
+    pub fn new(id: fandhe_container_oci::reference::Digest, reference: Option<String>) -> Self {
+        let reference = reference.filter(|r| {
+            r.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
+                && r.contains('@')
+                && !r.chars().any(char::is_control)
+        });
+        Self { id, reference }
+    }
+    /// image ID（`sha256:<config digest>`）。`PullImageResponse.image_ref` と同じ形式。
+    pub fn id_str(&self) -> &str {
+        self.id.as_str()
+    }
+    /// digest 参照があればそれ、無ければ image ID（containerd の ContainerStatus.image_ref と同じ）。
+    pub fn image_ref(&self) -> &str {
+        self.reference
+            .as_deref()
+            .unwrap_or_else(|| self.id.as_str())
+    }
 }
 
 /// `build_inner` の段階。`Validate` は rootfs を触る前の形式検証、`Build` は `config.json` の確定。

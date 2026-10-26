@@ -13,7 +13,7 @@
 //!
 //! | CRI の操作 | 関数 | `NetworkPlugin` の呼び出し |
 //! | ---------- | ---- | -------------------------- |
-//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach`（失敗は逆順に戻す） |
+//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach` → `publish_port`（`port_mappings` の公開指定ごと。#2676）。失敗は逆順に戻す |
 //! | `StopPodSandbox` / `RemovePodSandbox` | [`tear_down_pod`] | `delete_network`（pod のネットワークごと一括解放） |
 //! | （試験のみ） | [`set_up_pod`]・[`set_up_container`] | `create_network`・`create_netns` → `attach` |
 
@@ -25,10 +25,11 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
     DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, ErrorCode, IpCidr, NetnsName,
-    NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, TraitError,
+    NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PublishPortRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{PodNetns, PodNetworkProvider, PodNetworkRequest};
 use fandhe_container_cri::error::CriError;
+use fandhe_container_cri::port_mapping::PodPortPublish;
 
 /// PodSandbox のネットワークを作る（`net-create`）。
 pub fn set_up_pod(
@@ -128,15 +129,21 @@ fn with_rollback_errors(orig: TraitError, rollback: &[(&str, TraitError)]) -> Tr
     TraitError::new(ErrorCode::Internal, message)
 }
 
-/// sandbox 単位のネットワークと netns を作って接続する（`net-create` → `netns-create` → `veth-attach`）。
+/// sandbox 単位のネットワークと netns を作って接続し、公開指定があれば公開する
+/// （`net-create` → `netns-create` → `veth-attach` → `publish-port`）。
 ///
 /// ネットワーク名・コンテナ ID・netns 名は `sandbox_id` を使う。途中で失敗したら逆順に戻す: `attach` の失敗は
-/// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。戻しも失敗
-/// したら、元のエラーと戻しのエラーを載せた `Internal` を返し、[`SandboxSetUpError::rolled_back`] を偽にする。
+/// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。
+/// `publish_port` の失敗は `delete_network` だけで戻す（attach 済みのコンテナの `detach` は未対応で、専用テーブルの
+/// 削除で DNAT ルールと受け口の予約がまとめて消えるため。#2676・NET-4）。戻しも失敗したら、元のエラーと戻しの
+/// エラーを載せた `Internal` を返し、[`SandboxSetUpError::rolled_back`] を偽にする。
+///
+/// `ports` は cri が検証した公開指定（`host_port > 0` で明示した IPv4）。空なら公開しない。
 pub fn set_up_sandbox(
     net: &dyn NetworkPlugin,
     sandbox_id: &str,
     subnet: IpCidr,
+    ports: &[PodPortPublish],
 ) -> Result<NetnsStatus, SandboxSetUpError> {
     let plain = |error| SandboxSetUpError {
         error,
@@ -157,7 +164,11 @@ pub fn set_up_sandbox(
     {
         Err(e) => e,
         Ok(status) => match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
-            Ok(_) => return Ok(status),
+            Ok(_) => match publish_all(net, &name, &container, ports) {
+                Ok(()) => return Ok(status),
+                // attach 済みのため detach は呼ばない（未対応）。delete_network だけで戻す。
+                Err(e) => e,
+            },
             Err(e) => {
                 if let Err(d) = net.detach(&DetachRequest::new(name.clone(), container.clone())) {
                     rollback.push(("detach", d));
@@ -173,6 +184,28 @@ pub fn set_up_sandbox(
         rolled_back: rollback.is_empty(),
         error: with_rollback_errors(failure, &rollback),
     })
+}
+
+/// 公開指定を `publish_port` で順に公開する。最初の失敗で止めて返す（残りは公開しない）。
+fn publish_all(
+    net: &dyn NetworkPlugin,
+    name: &NetworkName,
+    container: &ContainerId,
+    ports: &[PodPortPublish],
+) -> Result<(), TraitError> {
+    for p in ports {
+        net.publish_port(
+            &PublishPortRequest::new(
+                name.clone(),
+                container.clone(),
+                p.host_port(),
+                p.container_port(),
+                p.protocol(),
+            )
+            .with_host_ip(IpAddr::V4(p.host_ip())),
+        )?;
+    }
+    Ok(())
 }
 
 /// pod 用サブネットを払い出す上限件数（親サブネットと pod の prefix 長の差で決まる枠数の上限）。
@@ -381,7 +414,12 @@ impl PodNetworkProvider for NetsetupPodNetwork {
         let netns = PodNetns::new(self.netns_path(&netns_name)?)?;
         let _op = self.begin(req.sandbox_id)?;
         let lease = self.pool.lease(req.sandbox_id).map_err(to_cri)?;
-        match set_up_sandbox(self.net.as_ref(), req.sandbox_id, lease.subnet) {
+        match set_up_sandbox(
+            self.net.as_ref(),
+            req.sandbox_id,
+            lease.subnet,
+            req.port_publishes(),
+        ) {
             Ok(_) => Ok(netns),
             Err(f) => {
                 // 今回新しく払い出した枠で、資源が残らないと確認できたときだけ返す。既存の予約（同じ sandbox の

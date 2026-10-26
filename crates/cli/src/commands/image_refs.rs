@@ -29,15 +29,15 @@
 //! # 参照キーの形式と旧形式の扱い（#2500）
 //!
 //! `state_scope` と `ref_key` の畳み込みは SHA-256 にした（旧: 非暗号の FNV-1a 64 を 2 本）。旧形式のキーは移行しない。
-//! 本番では在庫を埋める経路が無く `register` が常に `NOT_FOUND` のため、本番のストアにコンテナ参照は無い。
+//! 本番の `PullImage` は plugin-cri の ImageService（#2592）から在庫へ登録するが、CLI が `--image-root` に渡さない限り CLI のストアの在庫は空で `register` が `NOT_FOUND` のため、そのストアにコンテナ参照は無い。
 //! 開発・試験環境に旧キーが残った場合、新コードから見て別の状態ルートのキーになり、delete は外さず契機 B は回収しない
 //! （守りすぎの側に倒れる）。回復は、そのストアの `@container-refs.json` を消すかストアを作り直す。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
 //! - レイヤーの展開（本番の展開器）は #2377。展開器なしの `ContainerImage` を使うため、bundle の rootfs は展開済みの前提
-//! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。ただし本番で在庫を埋める経路
-//!   （pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、`register` は常に `NOT_FOUND`
+//! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。在庫を埋める経路は cri の
+//!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` へも plugin-cri の ImageService（#2592）から届く。pull していない root では在庫が空で、`register` は `NOT_FOUND`
 //! - `name@digest` 形式は受けない（在庫は manifest と repository を対応づけず、name を検証できないため fail-closed。#2496）
 //!
 //! # `create --image` の判別規則と解決（#2496・OCI-7・CLI-1）

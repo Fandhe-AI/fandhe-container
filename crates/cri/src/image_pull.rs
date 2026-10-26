@@ -8,28 +8,43 @@
 //! 2. 認証（`RegistryClient::authenticate`。匿名・Basic・Bearer を oci が自動選択）
 //! 3. manifest 取得と platform 解決（`fetch_manifest`）
 //! 4. 通信前のサイズ検証（descriptor の合計が [`PullConfig::max_image_bytes`] 以下）
-//! 5. config と各 layer の blob を一意なステージング領域へ取得し、開いたハンドルで所有者・権限・ハードリンク数を
-//!    確認してから、同じハンドルの内容の sha256 digest を検証（`verify_blob_file_digest`）
-//! 6. 検証済み blob をコンテンツアドレスのパス `<cache_dir>/blobs/sha256/<hex>` へ公開
+//! 5. oci の `ImageStore::begin_pull_generated` で pull セッションを始める（`<cache_dir>/staging/<id>` と生存確認用の
+//!    `@pull.lock`。`cache_dir` は `ImageStore` の root と同一）
+//! 6. config と各 layer の blob を確保する。既存 blob は先にリースを登録（`lease_existing_blob`）してから、開いた
+//!    ハンドルで所有者・権限・ハードリンク数・digest を確かめて再利用する。それ以外はセッションのステージングへ
+//!    取得し（`staged_blob_path`）、`verify_staged_blob` で信頼条件と sha256 digest を検証する
 //! 7. config blob を symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめ、同じハンドルから上限つきで
 //!    読んで `rootfs.diff_ids` を解析（`read_verified_config`）
-//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、pull ごとのステージングの `rootfs/` へ
-//!    `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
-//! 9. 展開に成功したときだけ、ステージングで組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の
-//!    `rename` で `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
+//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、セッションのステージングの `unpack/` 配下の
+//!    `rootfs/` へ `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
+//! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
+//!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
 //!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
 //!    mediaType）だけ違うときは今回の descriptor で展開を検証し直す（公開はしない）。件数の照合は命中時も行い、
 //!    設定が違えば FailedPrecondition で拒否する（既存の展開物は消さない）。所有者写像では root の期待所有者を
 //!    写像先で照合する（冪等。[`OciImagePuller::unpacked_rootfs_dir`]）
+//! 10. `PullSession::publish` で、検証済みの blob の `blobs/sha256` への公開・manifest（在庫）とタグの登録・
+//!     リース解放を排他の下で行い、`@image-inventory.json` へ永続化する（#2539・OCI-1・OCI-7）。タグ参照の
+//!     ときだけタグを付け、digest 参照にはタグを付けない。在庫のキーは選択された platform manifest の digest
+//!     （index の digest ではない）。順序は「rootfs の公開（9）→ 在庫への公開（10）」で、10 が失敗して rootfs だけが
+//!     残っても余分に残す側で無害（rootfs は config digest をキーにした冪等なキャッシュ）
 //!
-//! キャッシュに同じ digest の blob が既にあれば 5 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
-//! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える。
+//! 在庫への登録は、本モジュールの [`OciImagePuller::pull`]（CRI の `PullImage` から呼ばれる唯一の pull 実装）が
+//! 担う。CLI に `pull` サブコマンドは無く、同じ root を `--image-root` に渡した CLI の `image ls` / `create --image`
+//! から見える。本番の `PullImage` へは plugin-cri の ImageService（#2592。`CriPluginBackends::image_service` が
+//! 本番の `PullConfig` と本型を組む）から届く。判断の記録は `docs/design/pull-inventory-wiring.md`。
+//!
+//! キャッシュに同じ digest の blob が既にあれば 6 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
+//! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える
+//! （公開が既存のエントリを置き換える。symlink の先には書き込まない）。
 //!
 //! # 契約
 //!
 //! - 検証前のファイルをキャッシュへ公開しない。公開先のパスは検証済み `Digest` の 16 進部のみから組み立て、
 //!   レジストリ・リクエスト由来の文字列をパス要素に使わない（パストラバーサル対策）
-//! - ステージング領域は成否に関わらず後始末する（ステージング領域の `Drop` で削除）
+//! - 失敗経路は必ず `PullSession::abort` を通してリースとステージングを片づける。本モジュールは `staging/<id>` を
+//!   自分では消さない（消すのは `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを
+//!   作らないため）。消してよいのは自分の作業領域 `unpack/` の子だけ（oci の `remove_extracted_tree`）
 //! - 作りかけの rootfs を公開しない。展開はステージングの中だけで行い、diff_id の不一致・上限超過・未対応の
 //!   mediaType などで失敗したらステージングごと消す（先行レイヤーの展開物も残らない）。展開後に中断した root が
 //!   持つ 0555 等のディレクトリは、oci の `remove_extracted_tree` が権限を戻して消す
@@ -54,8 +69,8 @@
 //!
 //! 検査と利用の間の差し替え（TOCTOU）への対処: メタデータは開いたハンドルの fstat から読み、digest も同じ
 //! ハンドルから計算する（パスを再解決しない）。条件を満たさない・開けない・読めない場合は再利用せず、
-//! ステージングの所有者専用（0700）ディレクトリへ取得して同じ手順で検証したファイルを rename で公開する
-//! （rename は既存のエントリを置き換えるだけで、symlink の先・ハードリンクされた元の inode には書き込まない）。
+//! ステージングの所有者専用（0700）ディレクトリへ取得して同じ手順で検証したファイルを、oci の公開で置き換える
+//! （置き換えは名前の差し替えだけで、symlink の先・ハードリンクされた元の inode には書き込まない）。
 //! 公開するファイルは 0600 に揃えるため、次回の pull で上記の条件を満たす。
 //!
 //! 限界:
@@ -93,11 +108,14 @@
 //!     `FAILED_PRECONDITION` になる）
 //!   - 展開済み rootfs の GC と `image rm` / `image prune` への接続は TASK-183（OCI-7）の担当。それまで削除しても
 //!     `<cache_dir>/rootfs/sha256/<hex>` は残る
+//!   - pull 時と start 時の subuid / subgid のずれは、展開時の所有者写像の記録（`unpack-record`）で検出する方針
+//!     （`docs/design/pull-inventory-wiring.md`）。本番の値が `Keep` + `Strip` の間は写像が空で効かず、
+//!     `ChownMapped` 等の配線時に start 側の写像との照合を足す（#2592・#2377・#2241・#482）
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
 //!   - 展開中の処理は gRPC のキャンセルで打ち切れず、期限（[`PullConfig::pull_deadline`]）は展開の前後で確認する。
 //!     展開中は外部の応答を待たず（検証済みのローカル blob だけを読む）、所要時間は `ExtractLimits` と
 //!     `max_uncompressed_layer_bytes` で有界になる。展開の直後に期限を超えていれば公開も記録の書き込みもせず
-//!     `Timeout` を返す（ステージングは `Drop` で消える。#2534・REPAIR-5）。展開中に打ち切る協調キャンセルが要る場合は
+//!     `Timeout` を返す（ステージングは `abort` が消す。#2534・REPAIR-5）。展開中に打ち切る協調キャンセルが要る場合は
 //!     oci の展開 API の変更として別に扱う
 //! - 永続イメージストアと展開後サイズの算出は TASK-183（OCI-7。展開後サイズは #2222）の担当。本モジュールが返す
 //!   `size` は config と全 layer の**圧縮サイズの合計**で、展開後サイズではない
@@ -106,17 +124,24 @@
 //!   oci の各リクエスト期限で有界化される。全体 timeout は plugin-cri（TASK-108・TASK-114）の責務
 //! - UDS の権限・peer credential 検証（PLUG-12）は plugin-cri の責務
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::{
+    BlobReuse, ImageStore, ManifestComposition, PullPublishRequest, PullSession, TagKey,
+};
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_with_options,
@@ -172,6 +197,22 @@ impl PullError {
             OciErrorCode::ResourceExhausted => "image exceeds the size limit",
             OciErrorCode::FailedPrecondition => "image cache precondition failed",
             _ => "image pull failed",
+        };
+        Self::new(err.code(), message)
+    }
+
+    /// ローカルのイメージストア（`ImageStore` / `PullSession`）の失敗を写す。レジストリ由来ではないため
+    /// `from_oci` の「registry ...」文言を使わず、ストア用の固定文言にする（OCI-7）。
+    pub fn from_store(err: &OciError) -> Self {
+        let message = match err.code() {
+            OciErrorCode::Timeout => "image store lock wait timed out",
+            OciErrorCode::NotFound => "image store entry not found",
+            OciErrorCode::DataLoss => "image store data failed validation",
+            OciErrorCode::PermissionDenied => "image store access denied",
+            OciErrorCode::Unavailable => "image store is unavailable",
+            OciErrorCode::ResourceExhausted => "image store resource limit exceeded",
+            OciErrorCode::FailedPrecondition => "image cache precondition failed",
+            _ => "image store operation failed",
         };
         Self::new(err.code(), message)
     }
@@ -529,11 +570,12 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
 
     /// 展開済み rootfs があれば省き、無ければステージングで展開して成功時だけ公開する（#2323・OCI-1）。
     ///
-    /// 作りかけの rootfs は公開先に現れない。失敗時の root はステージングごと呼び出し側の `Drop` が消す。
+    /// 作りかけの rootfs は公開先に現れない。失敗時の root は呼び出し側が `unpack/` ごと消し、ステージングは `abort` が消す。
     fn ensure_rootfs(
         &self,
-        blobs: &TrustedDir,
-        staging: &StagingDir,
+        paths: &BTreeMap<Digest, PathBuf>,
+        blob_owner: u32,
+        unpack_dir: &Path,
         manifest: &ImageManifest,
         rootfs_cfg: &ImageRootFs,
         started: Instant,
@@ -564,20 +606,19 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .layers
             .iter()
             .map(|d| {
-                VerifiedLayerBlob::open(
-                    &blobs.path.join(digest_hex(&d.digest)),
-                    &d.digest,
-                    d.size,
-                    blobs.owner,
-                )
-                .map_err(|e| PullError::from_extract(&e))
+                let path = paths.get(&d.digest).ok_or_else(|| {
+                    PullError::new(OciErrorCode::Internal, "image layer blob path is missing")
+                })?;
+                VerifiedLayerBlob::open(path, &d.digest, d.size, blob_owner)
+                    .map_err(|e| PullError::from_extract(&e))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<&VerifiedLayerBlob> = verified.iter().collect();
         let layers = image_layers_from(&manifest.layers, &refs, rootfs_cfg)
             .map_err(|e| PullError::from_extract(&e))?;
         // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
-        let staged_entry = staging.path().join("entry");
+        create_private_dir(unpack_dir)?;
+        let staged_entry = unpack_dir.join("entry");
         create_private_dir(&staged_entry)?;
         let root = staged_entry.join(ROOTFS_SUBDIR);
         create_private_dir(&root)?;
@@ -638,32 +679,37 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         expected_root_owner_for(&self.config.extract_options, owner)
     }
 
-    /// 信頼できる検証済みの既存 blob があれば取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
+    /// blob を「リース済みの信頼できる既存 blob」または「ステージングへ取得して検証した blob」として確保し、
+    /// 以降の読み取り元のパスを返す（#2539・OCI-1・OCI-7）。公開（`blobs/sha256` への移動）は行わず、
+    /// [`PullSession::publish`] が構成の blob をまとめて公開する。
+    ///
+    /// 既存 blob は、先にリースを登録してから信頼条件と内容を確かめる（確かめた後に GC に消されない順序）。
+    /// 条件を満たさなければリースを外して取得し直す。
     fn ensure_blob(
         &self,
         request: &PullContext<'_>,
         auth: &mut RegistryAuth,
-        staging: &StagingDir,
-        blobs: &TrustedDir,
+        session: &mut PullSession<'_>,
+        blob_owner: u32,
         descriptor: &Descriptor,
-    ) -> Result<(), PullError> {
-        let hex = digest_hex(&descriptor.digest);
-        let final_path = blobs.path.join(hex);
-        // キャッシュ命中: 所有者・権限・ハードリンク数と内容の検証（モジュール冒頭「既存 blob の再利用条件」）に
-        // 合格した既存 blob だけ再取得を省く。
-        // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
-        // 取得・検証に成功した場合に限り、下の rename で置き換える。
-        if inspect_cached_blob(
-            &final_path,
-            &descriptor.digest,
-            descriptor.size,
-            blobs.owner,
-        )
-        .is_ok()
+    ) -> Result<PathBuf, PullError> {
+        if let BlobReuse::Leased(token) = session
+            .lease_existing_blob(&descriptor.digest)
+            .map_err(|e| PullError::from_store(&e))?
         {
-            return Ok(());
+            let path = token.path().to_path_buf();
+            // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
+            // 取得・検証に成功した場合に限り、公開が置き換える。
+            if inspect_cached_blob(&path, &descriptor.digest, descriptor.size, blob_owner).is_ok() {
+                return Ok(path);
+            }
+            session
+                .release_leased(token)
+                .map_err(|e| PullError::from_store(&e))?;
         }
-        let staged = staging.path().join(hex);
+        let staged = session
+            .staged_blob_path(&descriptor.digest)
+            .map_err(|e| PullError::from_store(&e))?;
         // 長時間の pull では Bearer token が途中で失効する。取得前に失効を確認して再認証し、
         // 取得が PermissionDenied なら有限回（MAX_REAUTH_RETRIES）だけ再認証して再試行する（OCI-3）。
         let mut retries = 0u32;
@@ -691,28 +737,78 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 Err(e) => return Err(PullError::from_oci(&e)),
             }
         }
-        // 公開するファイルも既存 blob と同じ条件で確認する。ハンドルを保持したまま権限を狭めて内容を検証し、
-        // 確認したファイルと公開するファイルが食い違わないようにする（ステージングは pull ごとの 0700 で、
-        // 他ユーザーはエントリを差し替えられない）。
-        let staged_file = open_staged_blob(&staged, blobs.owner)?;
-        let verified = verify_blob_file_digest(&staged_file, &descriptor.digest, descriptor.size)
-            .map_err(|e| PullError::from_oci(&e))?;
-        // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
+        // 信頼条件の確認・権限の 0600 化・digest の検証は oci が root の fd 起点で行う。サイズは読み取り上限
+        // ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
+        let verified = session
+            .verify_staged_blob(&descriptor.digest, descriptor.size)
+            .map_err(|e| PullError::from_store(&e))?;
         if verified.size != descriptor.size {
             return Err(PullError::new(
                 OciErrorCode::DataLoss,
                 "blob size does not match the descriptor",
             ));
         }
-        drop(staged_file);
-        // rename は既存のエントリ（信頼できない blob・symlink を含む）を置き換える。symlink の先や、
-        // ハードリンクされた元の inode へは書き込まない。
-        fs::rename(&staged, &final_path).map_err(|_| {
-            PullError::new(
-                OciErrorCode::FailedPrecondition,
-                "failed to publish blob to the image cache",
-            )
-        })
+        Ok(staged)
+    }
+
+    /// 全 blob を確保し、config を検証して layer を展開する（公開の直前まで。#2539）。
+    /// 失敗時の `abort` は呼び出し側が行う（本関数は `staging/<id>` を消さない）。
+    fn stage_and_unpack(
+        &self,
+        session: &mut PullSession<'_>,
+        ctx: &PullContext<'_>,
+        auth: &mut RegistryAuth,
+        blobs: &TrustedDir,
+        manifest: &ImageManifest,
+        started: Instant,
+    ) -> Result<ManifestComposition, PullError> {
+        // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
+        // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
+        let mut paths: BTreeMap<Digest, PathBuf> = BTreeMap::new();
+        let mut seen: Vec<(&Digest, u64)> = Vec::new();
+        for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+            if let Some((_, size)) = seen.iter().find(|(d, _)| **d == descriptor.digest) {
+                if *size != descriptor.size {
+                    return Err(PullError::new(
+                        OciErrorCode::DataLoss,
+                        "duplicate blob descriptors declare different sizes",
+                    ));
+                }
+                continue;
+            }
+            self.check_deadline(started)?;
+            let path = self.ensure_blob(ctx, auth, session, blobs.owner, descriptor)?;
+            paths.insert(descriptor.digest.clone(), path);
+            seen.push((&descriptor.digest, descriptor.size));
+        }
+        // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
+        self.check_deadline(started)?;
+
+        // config を検証してから解析し、検証済みハンドルでレイヤーを展開する（#2323・OCI-1・OCI-2）。
+        let config_path = paths.get(&manifest.config.digest).ok_or_else(|| {
+            PullError::new(OciErrorCode::Internal, "image config blob path is missing")
+        })?;
+        let rootfs_cfg = read_verified_config(
+            config_path,
+            &manifest.config,
+            blobs.owner,
+            self.config.max_config_bytes,
+        )?;
+        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
+        self.ensure_rootfs(
+            &paths,
+            blobs.owner,
+            &unpack_dir,
+            manifest,
+            &rootfs_cfg,
+            started,
+        )?;
+        self.check_deadline(started)?;
+        ManifestComposition::new(
+            manifest.config.digest.clone(),
+            manifest.layers.iter().map(|d| d.digest.clone()).collect(),
+        )
+        .map_err(|e| PullError::from_oci(&e))
     }
 }
 
@@ -785,43 +881,54 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             ));
         }
 
+        // 在庫（`@image-inventory.json`）への登録は oci の `ImageStore` を通す（#2539・OCI-1・OCI-7）。
+        // 取得・検証した blob は `PullSession` のステージングに置き、`publish` が `blobs/sha256` への公開・
+        // manifest とタグの登録・リース解放を排他の下でまとめて行う。cri 自身は `blobs/sha256` へ置かない。
         let blobs = self.blobs_dir()?;
-        let staging = StagingDir::create(&self.config.cache_dir)?;
+        let store = ImageStore::open(&self.config.cache_dir)
+            .map_err(|e| PullError::from_store(&e))?
+            .with_recorder(Arc::clone(&self.recorder));
+        let mut session = store
+            .begin_pull_generated()
+            .map_err(|e| PullError::from_store(&e))?;
         let ctx = PullContext {
             endpoint: &endpoint,
             repository,
             credentials: request.credentials.as_ref(),
         };
-        // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
-        // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
-        let mut seen: Vec<(&Digest, u64)> = Vec::new();
-        for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-            if let Some((_, size)) = seen.iter().find(|(d, _)| **d == descriptor.digest) {
-                if *size != descriptor.size {
-                    return Err(PullError::new(
-                        OciErrorCode::DataLoss,
-                        "duplicate blob descriptors declare different sizes",
-                    ));
-                }
-                continue;
-            }
-            self.check_deadline(started)?;
-            self.ensure_blob(&ctx, &mut auth, &staging, &blobs, descriptor)?;
-            seen.push((&descriptor.digest, descriptor.size));
+        let prepared =
+            self.stage_and_unpack(&mut session, &ctx, &mut auth, &blobs, manifest, started);
+        // 展開の作業領域は `staging/<id>` を消さずに自分の子だけ消す（`staging/<id>` を消してよいのは
+        // `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを作らないため）。
+        // 検証だけの経路や失敗経路に残る展開物は 0555 等を含むため、oci の削除で消す。
+        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
+        if fs::symlink_metadata(&unpack_dir).is_ok() {
+            let _ = remove_extracted_tree(&unpack_dir);
         }
-        // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
-        self.check_deadline(started)?;
-
-        // config を検証してから解析し、検証済みハンドルでレイヤーを展開する（#2323・OCI-1・OCI-2）。
-        let rootfs_cfg = read_verified_config(
-            &blobs.path.join(digest_hex(&manifest.config.digest)),
-            &manifest.config,
-            blobs.owner,
-            self.config.max_config_bytes,
-        )?;
-        self.ensure_rootfs(&blobs, &staging, manifest, &rootfs_cfg, started)?;
-        drop(staging);
-        self.check_deadline(started)?;
+        let composition = match prepared.and_then(|c| self.check_deadline(started).map(|()| c)) {
+            Ok(c) => c,
+            Err(e) => {
+                // abort の失敗は元のエラーを優先する（残骸は回収 GC が拾う）。
+                let _ = session.abort();
+                return Err(e);
+            }
+        };
+        let mut publish = PullPublishRequest::new(resolved.manifest_digest.clone(), composition);
+        // タグ参照のときだけタグを付ける。digest 参照にはタグを付けず、index の digest は在庫のキーにしない
+        // （在庫のキーは選択された platform manifest の digest）。
+        if let Reference::Tag(tag) = image_ref.reference() {
+            publish = publish.with_tag(TagKey::new(
+                image_ref.registry().clone(),
+                repository.clone(),
+                tag.clone(),
+            ));
+        }
+        // 失敗時の abort は publish が内部で行う。
+        // publish が確定した後は期限超過でも成功を返す。ここで Timeout を返すと永続在庫に登録済みなのに
+        // 呼び出し側（CriImageService）が自身の表示を更新せず食い違う（OCI-7）。期限は publish の前に確認済み。
+        session
+            .publish(publish)
+            .map_err(|e| PullError::from_store(&e))?;
 
         let name = display_name(image_ref.registry(), repository);
         let mut repo_tags = Vec::new();
@@ -1282,51 +1389,6 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), PullError> {
     })
 }
 
-/// 公開する blob の権限（所有者のみ読み書き）。oci の `fetch_blob` が作る `.part` と同じ値。
-#[cfg(unix)]
-const PUBLISHED_BLOB_MODE: u32 = 0o600;
-
-/// ステージングへ取得した blob を公開してよい状態にし、検証用のハンドルを返す（OCI-1・SEC）。
-///
-/// symlink を辿らずに開き、ハンドルの fstat で「通常ファイル」「所有者が `owner`」「ハードリンク数が 1」を
-/// 確認してから、同じハンドルで権限を 0600 へ狭め（fchmod）、狭めた後の状態を [`check_blob_trust`] で
-/// 確認し直す。所有者・種別・リンク数は変えられないので拒否し、権限だけをここで揃える（取得側の umask に
-/// 依らず、公開した blob が次回の pull で再利用条件を満たすようにする）。呼び出し側は返ったハンドルから
-/// digest を検証する。失敗は固定文言の `FailedPrecondition`。
-#[cfg(unix)]
-fn open_staged_blob(path: &Path, owner: u32) -> Result<fs::File, PullError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let unsafe_blob = || {
-        PullError::new(
-            OciErrorCode::FailedPrecondition,
-            "staged blob is not safe to publish",
-        )
-    };
-    let file = open_blob_nofollow(path).map_err(|_| unsafe_blob())?;
-    let facts = BlobFileFacts::from_file(&file).ok_or_else(unsafe_blob)?;
-    match check_blob_trust(&facts, Some(owner)) {
-        Ok(()) | Err(BlobTrustViolation::WritableByOthers) => {}
-        Err(_) => return Err(unsafe_blob()),
-    }
-    file.set_permissions(fs::Permissions::from_mode(PUBLISHED_BLOB_MODE))
-        .map_err(|_| unsafe_blob())?;
-    let facts = BlobFileFacts::from_file(&file).ok_or_else(unsafe_blob)?;
-    if check_blob_trust(&facts, Some(owner)).is_err() || facts.mode & 0o777 != PUBLISHED_BLOB_MODE {
-        return Err(unsafe_blob());
-    }
-    Ok(file)
-}
-
-/// 非 Unix では所有者・権限を確認できないため公開しない（fail-closed）。キャッシュ準備（`owner_probe`）が
-/// 先に `Unimplemented` で拒否するため、現状は到達しない。
-#[cfg(not(unix))]
-fn open_staged_blob(_path: &Path, _owner: u32) -> Result<fs::File, PullError> {
-    Err(PullError::new(
-        OciErrorCode::Unimplemented,
-        "image cache access control is not supported on this platform",
-    ))
-}
-
 /// `cache_dir` を絶対化し、実在する最も深い祖先（またはパス自身）と、その下の未作成要素に分ける。
 ///
 /// 辿る途中で `..` と利用者所有（root 以外）の symlink を拒否する（Unix）。何も作成しない。未作成要素が
@@ -1534,59 +1596,12 @@ fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
     Ok(())
 }
 
-/// pull ごとに一意なステージング領域。`Drop` で成否に関わらず削除する（部分ファイルを残さない）。
-#[derive(Debug)]
-struct StagingDir {
-    path: PathBuf,
-}
-
+/// 一時名の衝突回避用カウンタ（Unix の所有者検査とテストだけが使う）。
+#[cfg(any(unix, test))]
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-impl StagingDir {
-    fn create(cache_dir: &Path) -> Result<Self, PullError> {
-        let root = prepare_private_dir(cache_dir, &["staging"])?.path;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let name = format!(
-            "{}-{nanos}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = root.join(name);
-        // 非再帰の create は既存（symlink を含む）を辿らず失敗する。
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt as _;
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder
-        };
-        #[cfg(not(unix))]
-        let builder = fs::DirBuilder::new();
-        builder.create(&path).map_err(|_| {
-            PullError::new(
-                OciErrorCode::FailedPrecondition,
-                "failed to create the staging directory",
-            )
-        })?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        // 展開後に中断した root は 0555 等のディレクトリを含みうる。権限を戻して消せる oci の削除を先に試す。
-        if remove_extracted_tree(&self.path).is_err() {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
+/// 展開の作業領域の名前（`staging/<id>/unpack`。中に `entry/{rootfs,unpack-record}`）。
+const UNPACK_SUBDIR: &str = "unpack";
 
 /// `AuthConfig` を oci の資格情報へ変換する（CRI-4・OCI-3）。
 ///
@@ -2014,48 +2029,6 @@ mod blob_trust_fs_tests {
         );
     }
 
-    /// OCI-1・SEC: 公開前のステージング blob は、取得側の権限（0666）に依らず 0600 へ狭める。
-    /// 返ったハンドルは狭めたファイル自身で、内容を検証できる。
-    #[test]
-    fn sec_staged_blob_is_restricted_to_owner_before_publish() {
-        let dir = TempDir::new("staged");
-        for mode in [0o666, 0o664, 0o644, 0o600] {
-            let (path, uid) = blob_with_mode(&dir, &format!("blob-{mode:o}"), mode);
-            let file = open_staged_blob(&path, uid).expect("open");
-            assert_eq!(mode_of(&path), 0o600, "mode {mode:o}");
-            let verified = verify_blob_file_digest(&file, &abc(), 3).expect("verify");
-            assert_eq!(verified.size, 3);
-            assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
-        }
-    }
-
-    /// OCI-1・SEC: 所有者が異なる・ハードリンクされた・symlink のステージング blob は公開せず、
-    /// 権限も変更しない（所有者を確認する前に chmod しない）。
-    #[test]
-    fn sec_staged_blob_with_untrusted_identity_is_rejected_unchanged() {
-        let dir = TempDir::new("staged-bad");
-        let (path, uid) = blob_with_mode(&dir, "blob", 0o666);
-        let err = open_staged_blob(&path, uid.wrapping_add(1)).expect_err("owner");
-        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(err.message(), "staged blob is not safe to publish");
-        assert_eq!(mode_of(&path), 0o666);
-
-        fs::hard_link(&path, dir.0.join("alias")).expect("link");
-        let err = open_staged_blob(&path, uid).expect_err("hard link");
-        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(mode_of(&path), 0o666);
-
-        let (target, _) = blob_with_mode(&dir, "target", 0o644);
-        let link = dir.0.join("link");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        let err = open_staged_blob(&link, uid).expect_err("symlink");
-        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(mode_of(&target), 0o644);
-
-        let err = open_staged_blob(&dir.0.join("missing"), uid).expect_err("missing");
-        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
-    }
-
     /// `{"rootfs":{"type":"layers","diff_ids":["sha256:<'a' x 64>"]}}`（115 バイト）。
     fn config_body(fill: char) -> Vec<u8> {
         let hex: String = std::iter::repeat_n(fill, 64).collect();
@@ -2145,38 +2118,10 @@ mod blob_trust_fs_tests {
     }
 }
 
-/// 展開の後始末とエラー写像の単体試験（#2323・OCI-1・ERR-3）。
+/// エラー写像の単体試験（#2323・OCI-1・ERR-3）。
 #[cfg(test)]
 mod extract_cleanup_tests {
     use super::*;
-
-    /// OCI-1: 展開後に中断した root（0555 のディレクトリを含む）もステージングの `Drop` で消える。
-    #[cfg(unix)]
-    #[test]
-    fn oci1_staging_drop_removes_readonly_extracted_tree() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let cache = std::env::temp_dir().join(format!(
-            "fandhe-cri-staging-drop-{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&cache).expect("mkdir");
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("chmod");
-        let staging = StagingDir::create(&cache).expect("staging");
-        let staging_path = staging.path().to_path_buf();
-        let deep = staging_path.join("rootfs").join("etc").join("sub");
-        fs::create_dir_all(&deep).expect("mkdir");
-        fs::write(deep.join("f"), b"x").expect("write");
-        fs::set_permissions(&deep, fs::Permissions::from_mode(0o555)).expect("chmod");
-        fs::set_permissions(
-            staging_path.join("rootfs").join("etc"),
-            fs::Permissions::from_mode(0o555),
-        )
-        .expect("chmod");
-        drop(staging);
-        assert!(fs::symlink_metadata(&staging_path).is_err());
-        let _ = fs::remove_dir_all(&cache);
-    }
 
     /// ERR-3: 展開・config の失敗は分類を引き継ぎ、文言は分類ごとの固定の英語になる。
     #[test]
@@ -2265,8 +2210,6 @@ mod non_unix_tests {
         );
         let file = fs::File::open(&path).expect("open");
         assert_eq!(BlobFileFacts::from_file(&file), None);
-        let err = open_staged_blob(&path, 0).expect_err("rejected");
-        assert_eq!(err.code(), OciErrorCode::Unimplemented);
         let _ = fs::remove_dir_all(&dir);
     }
 }

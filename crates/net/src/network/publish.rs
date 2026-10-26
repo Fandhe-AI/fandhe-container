@@ -509,6 +509,19 @@ impl PortRegistry {
                 return Err(conflict());
             }
         }
+        // コンテナ単位の上限（MAX_PORT_PUBLISHES）は既存の予約（attach 時の公開分・結果不明の予約を含む）と
+        // 今回の件数の合計で検査する。予約・DNAT 投入の前に拒否する（繰り返し公開による無制限増加の防止）。
+        let held = self
+            .owners
+            .values()
+            .filter(|(n, e)| n == network && e == endpoint)
+            .count();
+        if held.saturating_add(ports.len()) > MAX_PORT_PUBLISHES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many published ports for the container",
+            ));
+        }
         let mut next = self.owners.clone();
         for p in ports {
             next.insert(Self::key(p), (network.clone(), endpoint.clone()));
@@ -535,6 +548,36 @@ impl PortRegistry {
         let keep = |_: &ListenerKey, (n, e): &mut ListenerOwner| !(n == network && e == endpoint);
         if let Some(path) = &self.shared {
             // 共有ファイルから先に外す。失敗時は予約を残してエラーを返す。
+            let _lock = open_locked(path)?;
+            let mut map = parse_shared(path)?;
+            let before = map.len();
+            map.retain(keep);
+            write_shared(path, &map)?;
+            let released = before - map.len();
+            self.owners = map;
+            return Ok(released);
+        }
+        let before = self.owners.len();
+        self.owners.retain(keep);
+        Ok(before - self.owners.len())
+    }
+
+    /// `endpoint`（`network` 内）が持つ予約のうち、`ports` の受け口だけを解放し、解放した件数を返す。
+    ///
+    /// attach 後の追加公開（`publish_container_ports`）が確定的に失敗したとき、今回の予約だけを戻すために使う。
+    /// 同じ endpoint が先に公開した受け口は残す。失敗時の扱い（予約を残して `Err`）は [`PortRegistry::release`]
+    /// と同じで、DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。
+    pub(crate) fn release_listeners(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+        ports: &[PortPublish],
+    ) -> Result<usize, NetError> {
+        let keys: Vec<_> = ports.iter().map(Self::key).collect();
+        let keep = |k: &ListenerKey, (n, e): &mut ListenerOwner| {
+            !(n == network && e == endpoint && keys.contains(k))
+        };
+        if let Some(path) = &self.shared {
             let _lock = open_locked(path)?;
             let mut map = parse_shared(path)?;
             let before = map.len();
@@ -578,6 +621,46 @@ mod tests {
 
     fn a(x: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(x)
+    }
+
+    /// NET-4・NET-1: 同じ endpoint への繰り返し予約でも、累積が MAX_PORT_PUBLISHES を超えたら
+    /// 何も増やさず `ResourceExhausted` で拒否する。
+    #[test]
+    fn net4_reserve_rejects_cumulative_over_limit() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let mk = |range: std::ops::Range<u16>| -> Vec<PortPublish> {
+            range
+                .map(|i| {
+                    PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 10_000 + i, 80).unwrap()
+                })
+                .collect()
+        };
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, &mk(0..MAX_PORT_PUBLISHES as u16 - 1))
+            .unwrap();
+        let err = reg.reserve(&net, &ep, &mk(1000..1002)).unwrap_err();
+        assert_eq!(err.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES - 1);
+        reg.reserve(&net, &ep, &mk(1000..1001)).unwrap();
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES);
+    }
+
+    /// NET-1・NET-4: `release_listeners` は指定した受け口だけを外し、同じ endpoint の他の予約を残す。
+    #[test]
+    fn net4_release_listeners_releases_only_given_ports() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let p1 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8080, 80).unwrap();
+        let p2 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8081, 81).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p1)).unwrap();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p2)).unwrap();
+        assert_eq!(reg.release_listeners(&net, &ep, &[p2]).unwrap(), 1);
+        assert_eq!(reg.len(), 1);
+        // p1 は残っているので再予約は衝突し、p2 は再予約できる。
+        assert!(reg.reserve(&net, &ep, std::slice::from_ref(&p1)).is_err());
+        reg.reserve(&net, &ep, &[p2]).unwrap();
     }
 
     /// NET-1・TASK-139.3: 非 loopback の unicast は受理し、未指定・loopback・broadcast・multicast・

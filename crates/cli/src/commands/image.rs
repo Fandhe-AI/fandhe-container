@@ -54,10 +54,11 @@
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
 //! - コンテナ参照（`@container-refs.json`）は永続化済み（#2341・#2352）で、manifest の在庫・タグ・リース（`@image-inventory.json`）も
-//!   oci 側で永続化済み（#2380。`ImageStore::lock` が排他取得のたびに読み直すので、CLI 側の配線は要らない）。ただし本番で在庫を埋める
-//!   経路（pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、
-//!   現状は `image ls` が常にヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
-//!   `image rm` と `image tag` が常に `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
+//!   oci 側で永続化済み（#2380。`ImageStore::lock` が排他取得のたびに読み直すので、CLI 側の配線は要らない）。在庫を埋める経路は cri の
+//!   `OciImagePuller::pull`（`PullImage`）に配線済み（#2539）。CLI に `pull` サブコマンドは無く、同じ root を `--image-root` に渡せば
+//!   その在庫が見える。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。pull していない root の在庫は
+//!   空のため、その root では `image ls` がヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
+//!   `image rm` と `image tag` が `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
 //! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。

@@ -702,13 +702,14 @@ async fn cri4_tag_moves_and_tags_merge() {
     );
 
     // 別イメージ（config が違う）が alpine:1 を奪う。
-    let second = OciImagePuller::new(
-        Arc::new(FakeClient::new(manifest_json(
-            SHA_CONFIG,
-            &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
-        ))),
-        cfg,
-    );
+    // 別イメージなら manifest の本文ハッシュも別になる（同じ digest で別構成は在庫が拒否する。#2539・OCI-7）。
+    let mut second_client = FakeClient::new(manifest_json(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    ));
+    second_client.manifest_digest =
+        Digest::parse(&format!("sha256:{}", "b".repeat(64))).expect("digest");
+    let second = OciImagePuller::new(Arc::new(second_client), cfg);
     let svc2 = CriImageService::with_store(store.clone()).with_puller(Arc::new(second));
     ImageService::pull_image(&svc2, Request::new(pull_req("alpine:1")))
         .await
@@ -1173,7 +1174,7 @@ fn sec_pull_does_not_publish_symlinked_staged_blob() {
     let puller = OciImagePuller::new(client.clone(), config(&dir));
     let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
-    assert_eq!(err.message(), "staged blob is not safe to publish");
+    assert_eq!(err.message(), "image cache precondition failed");
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 1);
     assert!(
         fs::symlink_metadata(blob_path(&dir, SHA_CONFIG)).is_err(),
@@ -1442,10 +1443,24 @@ fn repair4_pull_reports_extraction_to_the_injected_recorder() {
     .with_recorder(rec.clone());
     puller.pull(&req("alpine:3.20")).expect("pull");
     let got = rec.0.lock().expect("lock").clone();
+    let extract: Vec<_> = got
+        .iter()
+        .filter(|(k, _)| *k == OciOpKind::ExtractLayer)
+        .cloned()
+        .collect();
     assert_eq!(
-        got,
+        extract,
         vec![(OciOpKind::ExtractLayer, OciOpOutcome::Success); 2]
     );
+    // ImageStore の操作（開始・公開）も同じ記録先へ届く（#2539・REPAIR-4）。
+    for kind in [OciOpKind::BeginPull, OciOpKind::PublishPull] {
+        assert_eq!(
+            got.iter().filter(|(k, _)| *k == kind).count(),
+            1,
+            "{kind:?}"
+        );
+        assert!(got.contains(&(kind, OciOpOutcome::Success)));
+    }
 }
 
 /// OCI-1・SEC: 公開先に通常ファイルや symlink があれば、消さずに FailedPrecondition で拒否する。

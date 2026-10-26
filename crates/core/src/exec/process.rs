@@ -5169,16 +5169,20 @@ mod tests {
     /// 親が段つきで復号する（#2822）。
     #[test]
     fn sup6_2822_pre_step_failure_is_reported_with_its_step() {
-        let (reader, writer) = exec_status_pipe().unwrap();
-        report_exec_child_failure(
-            &writer,
-            ExecChildStep::CgroupJoin,
-            ErrorCode::PermissionDenied,
-        );
-        drop(writer);
         let exit = ChildExit::Exited(EXIT_SETUP_FAILED);
+        // 他のテストスレッドの fork が pipe の書き込み側の複製を持つと読み取りが `Err` になる。報告行は一度読むと
+        // 消費されるため、再試行ごとに pipe の作成と報告行の書き込みからやり直す（REPAIR-12）。
         let result = (0..200)
-            .find_map(|_| read_exec_status(&reader, exit).ok())
+            .find_map(|_| {
+                let (reader, writer) = exec_status_pipe().unwrap();
+                report_exec_child_failure(
+                    &writer,
+                    ExecChildStep::CgroupJoin,
+                    ErrorCode::PermissionDenied,
+                );
+                drop(writer);
+                read_exec_status(&reader, exit).ok()
+            })
             .expect("readable");
         assert_eq!(
             result,

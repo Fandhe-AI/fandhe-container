@@ -31,8 +31,8 @@
 //!
 //! 在庫への登録は、本モジュールの [`OciImagePuller::pull`]（CRI の `PullImage` から呼ばれる唯一の pull 実装）が
 //! 担う。CLI に `pull` サブコマンドは無く、同じ root を `--image-root` に渡した CLI の `image ls` / `create --image`
-//! から見える。本番の `PullImage` へ届く経路は plugin-cri の ImageService（#2592）待ちで、それまで本番の呼び出し元は
-//! 無い。判断の記録は `docs/design/pull-inventory-wiring.md`。
+//! から見える。本番の `PullImage` へは plugin-cri の ImageService（#2592。`CriPluginBackends::image_service` が
+//! 本番の `PullConfig` と本型を組む）から届く。判断の記録は `docs/design/pull-inventory-wiring.md`。
 //!
 //! キャッシュに同じ digest の blob が既にあれば 6 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
 //! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える

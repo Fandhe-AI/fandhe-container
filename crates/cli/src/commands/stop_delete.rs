@@ -2376,7 +2376,7 @@ mod tests {
         }
 
         /// OCI-7・#2315: 在庫に無い manifest の create は NOT_FOUND で、状態も参照も残らない
-        /// （本番の現行値。在庫の永続化は #2380 で済みだが、在庫を埋める cri の pull は #2539 で配線済みだが、本番の `PullImage` への到達 #2592 までは空）。
+        /// （本番の現行値。在庫の永続化は #2380 で済みだが、在庫を埋める cri の pull は #2539 で配線済みで、本番の `PullImage` へも #2592 で届く。pull していない root では空）。
         #[test]
         fn oci7_create_with_empty_inventory_is_not_found() {
             let base = TmpDir::new("img-empty");

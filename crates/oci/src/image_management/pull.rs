@@ -11,8 +11,8 @@
 //!
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
 //! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡す。
-//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の到達は plugin-cri の
-//! ImageService 待ち・#2592。`docs/design/pull-inventory-wiring.md`）。
+//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
+//! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
 //! - (C) 公開: 取得と digest 検証が済んだら、排他区間の下で「ステージングから `blobs/sha256` への
 //!   移動」「manifest（在庫と構成）とタグの登録」「自分のリースの解放」を行う（[`PullSession::publish`]）。
@@ -22,8 +22,8 @@
 //! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
 //! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡し、
 //! 取得後に [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
-//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の到達は plugin-cri の
-//! ImageService 待ち・#2592。`docs/design/pull-inventory-wiring.md`）。
+//! cri の `OciImagePuller::pull` が唯一の呼び出し元として配線済み（#2539。本番の `PullImage` へは plugin-cri の
+//! ImageService（#2592）から到達する。`docs/design/pull-inventory-wiring.md`）。
 //!
 //! ロックの規律: ガードを持ったまま digest 検証（再ハッシュ）・通信をしない。公開直前の完全性は、
 //! 検証時に控えたファイルの指紋（サイズ・時刻・inode 等）の照合で保つ。既存宛先の内容検証は

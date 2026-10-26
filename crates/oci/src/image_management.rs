@@ -19,8 +19,8 @@
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - 在庫・タグ・リースの永続化は #2380 で実装済み（ひとまとまりの操作の入口が排他の中で保存する。ガードから
 //!   下位メソッドを直接呼んだ変更は保存されない）。在庫を埋める経路（pull → `ImageStore` の配線）は cri の
-//!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` への到達（plugin-cri の ImageService・#2592）までは
-//!   本番のストアの在庫は空のまま。削除の永続化完了確認と再試行
+//!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。
+//!   削除の永続化完了確認と再試行
 //!   （削除ジャーナル `gc_journal`。fsync と取得時のロールフォワード）は実装済み（#851）だが、保証するのは
 //!   ジャーナルと blob ファイルの unlink の範囲だけ。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
@@ -29,7 +29,7 @@
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
-//!   （#475・TASK-183.10）は `pull` で実装済み（cri の `OciImagePuller::pull` から配線済み・#2539。本番の到達は #2592）。クラッシュで残った pull の
+//!   （#475・TASK-183.10）は `pull` で実装済み（cri の `OciImagePuller::pull` から配線済み・#2539。本番の `PullImage` へは #2592 で到達済み）。クラッシュで残った pull の
 //!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
 //!   実装済み（起動時の呼び出しの配線は未実装・#2315）
 //! - 件数の上限: コンテナ参照は `MAX_CONTAINER_REFS`、manifest は `MAX_IMAGE_MANIFESTS`、タグは

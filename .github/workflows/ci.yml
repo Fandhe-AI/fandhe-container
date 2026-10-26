@@ -943,6 +943,12 @@ jobs:
         timeout-minutes: 5
         run: make check-success-lines-selftest
 
+      # Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818）。スタブの curl のみ。既存ジョブのステップ
+      - name: Docker Hub 残量プローブの自己テスト（#2818・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make docker-hub-ratelimit-probe-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
@@ -1777,6 +1783,86 @@ jobs:
           echo "${final}" >> "$GITHUB_STEP_SUMMARY"
           echo "${opts}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::start_stop_delete_real verified"
+
+      # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
+      # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、
+      # 実レジストリ（docker.io/library/busybox:1.36）からの PullImage →
+      # ImageStatus / ListImages → RunPodSandbox → タグで CreateContainer → Start → Stop → Remove → StopPodSandbox →
+      # RemovePodSandbox の一連を通す。前提（user namespace・委譲 cgroup・user manager の private ソケット・Landlock ABI 6 以上）は
+      # 上の前提確認ステップが fail-closed で確かめる（本試験の前提は同じ）。root の分岐は無い。新しいジョブ・check-run・sudo・
+      # permissions は追加しない。
+      # - launcher 回避: `target/debug/` には前段のビルドで fandhe-container-launcher が置かれる。plugin の隣にあると
+      #   ProductionStarter が rootful 経路（file capability 前提）へ入って失敗するため、試験本体が plugin と supervisor だけを
+      #   専用ディレクトリへ複製し、launcher が無いことを assert してから起動する（start_stop_delete_real と同じ扱い）。
+      # - 成功行の照合: scripts/check-success-lines.sh は試験ソースの文字列リテラルから期待行を導くが、libtest の結果行
+      #   （`test <名前> ... ok`）はソースにリテラルが無いため使えない。runtime_service_namespaces と同じく完全一致 grep で照合し、
+      #   加えて `1 passed` の行（0 件実行の排除）と `ignored` 行の不在を確かめる。
+      # - rate limit の方式: 試験 1 回で pull は 1 回（小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
+      #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
+      #   pull を消費する前に fail-closed にする。CRI の境界では 429 が gRPC の UNAVAILABLE に潰れて他の失敗と区別できないため、
+      #   試験が失敗したときも同じプローブを事後診断として再実行し、rate limit が原因なら文言で分かるようにする。
+      # - 実行頻度: 他の `--ignored` 試験と揃えて PR と main の両方（ubuntu のみ）で回す。rate limit で頻繁に赤になる場合は
+      #   main と workflow_dispatch のみへ絞る判断をオーナーへ上げる（Docker Hub のミラー切替は試験定数の変更が要るため別 issue）。
+      # - timeout: 試験の watchdog が 900 秒・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 20 分にする
+      #   （watchdog より先に step timeout が切れると試験側の診断が失われる）。
+      - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          line="$(make --no-print-directory docker-hub-ratelimit-probe)"
+          echo "${line}"
+          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: production_binary_full_lifecycle_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/pcri-build.json"
+          cargo test -p fandhe-container-plugin-cri --test container_grpc --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "container_grpc") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::container_grpc test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "PCRI_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: production_binary_full_lifecycle_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/production_binary_full_lifecycle_real.log"
+          rc=0
+          USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${PCRI_TEST_BIN}" \
+            --ignored --exact production_binary_full_lifecycle_real --test-threads=1 2>&1 | tee "${log}" || rc=$?
+          if [ "${rc}" -ne 0 ]; then
+            # 事後診断: rate limit が原因ならここで識別文言が出る（CRI の境界では 429 が UNAVAILABLE に潰れるため）。
+            make --no-print-directory docker-hub-ratelimit-probe || true
+            msg="production_binary_full_lifecycle_real failed"
+            msg+=" (see above; a docker hub rate limit is reported explicitly)"
+            echo "::error::${msg}" >&2
+            exit 1
+          fi
+          line='test production_binary_full_lifecycle_real ... ok'
+          if ! grep -Fxq "${line}" "${log}"; then
+            echo "::error::production_binary_full_lifecycle_real did not report: ${line} (possibly not executed)" >&2
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 1 passed;' "${log}"; then
+            echo "::error::production_binary_full_lifecycle_real did not report '1 passed' (possibly not executed)" >&2
+            exit 1
+          fi
+          if grep -Fq 'production_binary_full_lifecycle_real ... ignored' "${log}"; then
+            echo "::error::production_binary_full_lifecycle_real was reported as ignored" >&2
+            exit 1
+          fi
+          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::production_binary_full_lifecycle_real verified"
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

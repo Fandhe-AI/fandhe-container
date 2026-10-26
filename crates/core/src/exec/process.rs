@@ -67,8 +67,9 @@
 //! - **子の失敗の通知は終了コードと stderr**: 段の失敗は stderr に英語 1 行を出し、
 //!   [`EXIT_SETUP_FAILED`]（125: exec 前までの失敗・子の panic）・[`EXIT_EXEC_NOT_EXECUTABLE`]
 //!   （126: exec の失敗のうち不在以外）・[`EXIT_EXEC_NOT_FOUND`]（127: エントリポイント不在）で
-//!   分類する（docker / runc の慣例）。親子間の同期・構造化エラーパイプ（子の [`ExecError`] を構造の
-//!   まま親へ返す）は未実装で、TASK-29/30（OCI `create` / `start` の分離）で扱う
+//!   分類する（docker / runc の慣例）。稼働中コンテナへの exec の子は、失敗した手順の段（[`ExecChildStep`]）・ERR-1 コード・
+//!   違反の理由を状態 pipe の 1 行で親へ返す（#2822）。launch の PID 1 は `launch_status.rs` の `F`/`E`/`X` で返す。
+//!   子の [`ExecError`] の自由文メッセージ（パス・errno 文字列を含み得る）は untrusted 扱いのため運ばない
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: [`ContainerChild::wait_timeout`] のみを
 //!   提供する。`Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）ため、
 //!   回収の責任は呼び出し元にある
@@ -566,6 +567,7 @@ fn exec_entrypoint_verified_reporting(
             None,
             nulling,
         )
+        .map_err(|f| *f.error)
     });
     match prepared {
         Err(err) => {
@@ -607,7 +609,8 @@ fn exec_checked_entrypoint(
     entry: &Entrypoint,
     nulling: StdioNulling,
 ) -> Result<Infallible, ExecError> {
-    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None, nulling)?;
+    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None, nulling)
+        .map_err(|f| *f.error)?;
     Err(execve_checked(entry, &exe))
 }
 
@@ -644,30 +647,36 @@ fn prepare_exec_child(
     source: EntrypointSource,
     deferred_fsize: Option<Rlimit>,
     nulling: StdioNulling,
-) -> Result<ExecutableFd, ExecError> {
+) -> Result<ExecutableFd, ExecChildFailure> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
-    close_inherited_fds(keep)?;
+    close_inherited_fds(keep).map_err(at(ExecChildStep::CloseFds))?;
     // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
-    detach_session()?;
+    detach_session().map_err(at(ExecChildStep::Setsid))?;
     // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
     // 子の cwd も同じディレクトリ）と、その procfs。ランタイムの同一性の基準・固定した fd の開き直しの起点にする。
     // どちらも標準入出力の置換まで保持するため、番号を 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると
     // `openat` はその番号を返し、置換（`dup2`）した `/dev/null` を、この関数の終わりの close が閉じてしまう）。
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))
-        .and_then(keep_above_stdio)?;
-    let procfs = open_root_procfs(root.as_fd()).and_then(keep_above_stdio)?;
+        .and_then(keep_above_stdio)
+        .map_err(at(ExecChildStep::OpenRoot))?;
+    let procfs = open_root_procfs(root.as_fd())
+        .and_then(keep_above_stdio)
+        .map_err(at(ExecChildStep::OpenRoot))?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     // 種別（通常ファイル・標準入出力と別の実体）は開く前に確かめる（`setsid` の後は、端末を開くと制御端末に
     // なるため。#1456）。
-    let (file, meta, resolved) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())?;
-    let runtime = runtime_identity(procfs.as_fd())?;
+    let (file, meta, resolved) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())
+        .map_err(at(ExecChildStep::OpenEntrypoint))?;
+    let runtime = runtime_identity(procfs.as_fd()).map_err(at(ExecChildStep::RuntimeIdentity))?;
     if (meta.dev(), meta.ino()) == runtime {
-        return Err(ExecError::from_violation_at(
-            ViolationReason::EntrypointIsRuntimeBinary,
-            Some(resolved.as_path()),
-            STAGE,
+        return Err(at(ExecChildStep::RuntimeIdentity)(
+            ExecError::from_violation_at(
+                ViolationReason::EntrypointIsRuntimeBinary,
+                Some(resolved.as_path()),
+                STAGE,
+            ),
         ));
     }
     // 稼働中コンテナへの exec は、判定した方式（`SealPolicy::mode`。オーナー判断 2026-10-09「条件付き切り替え」。
@@ -680,13 +689,9 @@ fn prepare_exec_child(
         EntrypointSource::Pinned => (ExecutableFd::Pinned(file), meta),
         EntrypointSource::Switchable(policy) => match policy.mode() {
             EntrypointExecMode::SealedCopy => {
-                let copy = seal_entrypoint_copy(
-                    &file,
-                    &meta,
-                    procfs.as_fd(),
-                    resolved.as_path(),
-                    &policy,
-                )?;
+                let copy =
+                    seal_entrypoint_copy(&file, &meta, procfs.as_fd(), resolved.as_path(), &policy)
+                        .map_err(at(ExecChildStep::SelectExecutable))?;
                 drop(file);
                 let meta = copy.metadata().clone();
                 (ExecutableFd::Sealed(copy), meta)
@@ -695,7 +700,8 @@ fn prepare_exec_child(
             // 直後の `execveat` が同じ fd・同じ domain で同じ検査（`noexec`・`MAY_EXEC`・Landlock・LSM）を必ず行うため、
             // 事前判定は保証を増やさず、AppArmor 等の拒否の監査イベントを二重にするだけになる。
             EntrypointExecMode::PinnedInode { .. } => {
-                check_not_on_noexec_mount(&file, resolved.as_path())?;
+                check_not_on_noexec_mount(&file, resolved.as_path())
+                    .map_err(at(ExecChildStep::SelectExecutable))?;
                 (ExecutableFd::Pinned(file), meta)
             }
         },
@@ -706,35 +712,39 @@ fn prepare_exec_child(
     // メモリ制限は維持される。capability 削減後でも、rlimit を下げる `prlimit` は特権を要さない。
     if let Some(fsize) = deferred_fsize {
         let set = Rlimits::new(vec![fsize]).map_err(|_| {
-            ExecError::new(
+            at(ExecChildStep::DeferredRlimit)(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Rlimits,
                 "failed to build the deferred RLIMIT_FSIZE",
-            )
+            ))
         })?;
-        apply_rlimits(&set)?;
+        apply_rlimits(&set).map_err(at(ExecChildStep::DeferredRlimit))?;
     }
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
-    reject_runtime_interpreter(file, resolved.as_path(), runtime, procfs.as_fd())?;
+    reject_runtime_interpreter(file, resolved.as_path(), runtime, procfs.as_fd())
+        .map_err(at(ExecChildStep::Interpreter))?;
     // シェバン付きスクリプトは fd が CLOEXEC だと execveat が ENOENT になるため、その場合だけ
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
     let is_script = matches!(file.read_at(&mut magic, 0), Ok(2)) && &magic == b"#!";
     if is_script {
         // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
-        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, &resolved)?;
+        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, &resolved)
+            .map_err(at(ExecChildStep::ScriptFd))?;
     }
 
-    mark_fds_cloexec()?;
-    reset_sigpipe(!nulling.stdout || !nulling.stderr)?;
+    mark_fds_cloexec().map_err(at(ExecChildStep::PrepareFds))?;
+    reset_sigpipe(!nulling.stdout || !nulling.stderr).map_err(at(ExecChildStep::PrepareFds))?;
     if is_script {
         sys::set_cloexec(file.as_fd(), false)
-            .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))
+            .map_err(at(ExecChildStep::PrepareFds))?;
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
     // stdout / stderr をログ用パイプへ付け替え済みの番号は置換しない（`nulling` が外す。#1471）。
-    redirect_stdio_to_null(root.as_fd(), procfs.as_fd(), nulling)?;
+    redirect_stdio_to_null(root.as_fd(), procfs.as_fd(), nulling)
+        .map_err(at(ExecChildStep::StdioNull))?;
     Ok(exe)
 }
 
@@ -1347,6 +1357,165 @@ fn do_execve(entry: &Entrypoint, _exe: &ExecutableFd) -> SysError {
     SysError::Os(sys::EINTR)
 }
 
+/// 稼働中コンテナへの exec の子が `execveat` までに通る手順の段（失敗の行で親へ返す固定語彙。
+/// SUP-6・REPAIR-3・REPAIR-4・SEC-4・CORE-5。#2822）。
+///
+/// [`IsolationStage`] は子の手順のほぼすべてが `Exec` で区別がつかないため、子の中の手順を 1 対 1 で表す。
+/// 形は `launch_status::PrePivotStep` と同じ（`ALL`・snake_case のトークン・`ALL` を走査する `from_token`）。
+/// 子は untrusted 扱いなので、運ぶのはこのトークンだけで、親は `from_token` で静的な値に引き直す
+/// （未知・長すぎるトークンは `SetupFailed { step: None }`）。メッセージは子の `ExecError.message`
+/// （コンテナ内の解決後パス・errno 文字列を含み得る）を運ばず、親が [`ExecChildStep::message`] で固定の英文を引く。
+///
+/// # launch の状態 pipe（`launch_status.rs` の `F <step>`・`E`・`X`）との対応
+///
+/// | exec の段 | launch での対応 |
+/// | --------- | --------------- |
+/// | `parent_lifetime` | 対応なし（launch の PID 1 は親死亡シグナルで縛らない） |
+/// | `cgroup_join` | 対応なし（launch の cgroup 参加は `StagePipeline` の段で、状態 pipe の対象外） |
+/// | `close_fds` から `stdio_null` | 同じ `prepare_exec_child` の手順。launch では `E <CODE> <reason>` の行（段は運ばない） |
+/// | `report_ready` | `R` を書けない場合（専用の行は無い。書けなければ `execveat` へ進まない） |
+/// | `execveat` | `X <CODE>`（`R` の後だけ。errno の写像は同じ `exec_errno_to_code`） |
+///
+/// launch の `F <step>`（`PrePivotStep` の 14 段）に対応する exec の段は無い（exec は pivot しない）。
+/// worker 側の段（`SetNs`・`CgroupJoin`・`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Landlock`・`Seccomp`。fork の前）の
+/// 失敗は supervisor の `err` 行の `TraitError`（`exec stage {:?}: <message>`）で届き、`SetupFailed` には載らない。
+/// launch の `E` 行に段を足すことは範囲外。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecChildStep {
+    /// 親の生存への結び付け（親死亡シグナルと pidfd の確認。`exec_command::bind_to_parent_lifetime`）。
+    ParentLifetime,
+    /// exec 用の子 cgroup への参加（`exec_command::join_exec_cgroup`）。
+    CgroupJoin,
+    /// 継承した fd 3 以上の close（`close_range`）。
+    CloseFds,
+    /// セッション・制御端末の切り離し（`setsid`）。
+    Setsid,
+    /// 照合済みの `/` と procfs を開く手順。
+    OpenRoot,
+    /// エントリポイントを開いて種別を確かめる手順。
+    OpenEntrypoint,
+    /// ランタイム自身のバイナリとの同一性の照合。
+    RuntimeIdentity,
+    /// 実行に使う fd の選択（封印した複製の作成・`noexec` マウントの判定）。
+    SelectExecutable,
+    /// 持ち越した `RLIMIT_FSIZE` の適用。
+    DeferredRlimit,
+    /// シェバン・`PT_INTERP` の解決先の照合。
+    Interpreter,
+    /// シェバン付きスクリプトの `/dev/fd/N` の照合。
+    ScriptFd,
+    /// 継承 fd の close-on-exec 化・`SIGPIPE` の復元・スクリプトの fd の継承設定。
+    PrepareFds,
+    /// 標準入出力の `/dev/null` への置換。
+    StdioNull,
+    /// 準備完了の報告（`R`）の書き込み。
+    ReportReady,
+    /// `execveat` 自体（`R` の後だけ）。
+    Execveat,
+}
+
+impl ExecChildStep {
+    /// 全段（子の実行順）。
+    pub const ALL: [Self; 15] = [
+        Self::ParentLifetime,
+        Self::CgroupJoin,
+        Self::CloseFds,
+        Self::Setsid,
+        Self::OpenRoot,
+        Self::OpenEntrypoint,
+        Self::RuntimeIdentity,
+        Self::SelectExecutable,
+        Self::DeferredRlimit,
+        Self::Interpreter,
+        Self::ScriptFd,
+        Self::PrepareFds,
+        Self::StdioNull,
+        Self::ReportReady,
+        Self::Execveat,
+    ];
+
+    /// ワイヤー上のトークン（snake_case の ASCII。`PrePivotStep` のトークンと重ならない）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentLifetime => "parent_lifetime",
+            Self::CgroupJoin => "cgroup_join",
+            Self::CloseFds => "close_fds",
+            Self::Setsid => "setsid",
+            Self::OpenRoot => "open_root",
+            Self::OpenEntrypoint => "open_entrypoint",
+            Self::RuntimeIdentity => "runtime_identity",
+            Self::SelectExecutable => "select_executable",
+            Self::DeferredRlimit => "deferred_rlimit",
+            Self::Interpreter => "interpreter",
+            Self::ScriptFd => "script_fd",
+            Self::PrepareFds => "prepare_fds",
+            Self::StdioNull => "stdio_null",
+            Self::ReportReady => "report_ready",
+            Self::Execveat => "execveat",
+        }
+    }
+
+    /// トークンから静的な値へ引き直す（`ALL` の走査。未知のトークンは `None`）。
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == token)
+    }
+
+    /// 対応する [`IsolationStage`]（監査・ログで既存の段の語彙に写すとき用）。
+    pub fn stage(self) -> IsolationStage {
+        match self {
+            Self::ParentLifetime => IsolationStage::Spawn,
+            Self::CgroupJoin => IsolationStage::CgroupJoin,
+            Self::DeferredRlimit => IsolationStage::Rlimits,
+            _ => IsolationStage::Exec,
+        }
+    }
+
+    /// 段ごとの固定の英文（親が引くメッセージ。子の自由文・パス・errno 文字列は含まない）。
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ParentLifetime => "the exec child could not bind to the lifetime of its parent",
+            Self::CgroupJoin => "the exec child could not join its child cgroup",
+            Self::CloseFds => "the exec child could not close the inherited file descriptors",
+            Self::Setsid => "the exec child could not detach from the caller session",
+            Self::OpenRoot => "the exec child could not open the container root",
+            Self::OpenEntrypoint => "the exec child could not open the entrypoint",
+            Self::RuntimeIdentity => "the exec child refused the entrypoint identity",
+            Self::SelectExecutable => "the exec child could not select the executable file",
+            Self::DeferredRlimit => "the exec child could not apply the deferred file size limit",
+            Self::Interpreter => "the exec child refused the entrypoint interpreter",
+            Self::ScriptFd => "the exec child could not verify the script file descriptor path",
+            Self::PrepareFds => "the exec child could not prepare its file descriptors",
+            Self::StdioNull => "the exec child could not redirect its standard streams",
+            Self::ReportReady => "the exec child could not report that it is ready",
+            Self::Execveat => "the exec child could not execute the entrypoint",
+        }
+    }
+}
+
+/// 子の全段（[`ExecChildStep::ALL`] の読み取り専用の参照）。supervisor の単体試験が全段の往復を確かめるために
+/// 公開する（通常の利用者は呼ばない。`exec_child_violation_reasons` と同じ流儀。#2822）。
+#[doc(hidden)]
+pub fn exec_child_steps() -> &'static [ExecChildStep] {
+    &ExecChildStep::ALL
+}
+
+/// 子の手順の失敗（段つき。[`prepare_exec_child`] の戻り値。ワイヤーへは段・ERR-1 コード・違反の理由だけを写す）。
+#[derive(Debug)]
+struct ExecChildFailure {
+    step: ExecChildStep,
+    /// `Err` の大きさを抑えるため箱に入れる（`result_large_err`）。
+    error: Box<ExecError>,
+}
+
+/// 手順の `ExecError` に段を付ける（`map_err(at(ExecChildStep::X))`）。
+fn at(step: ExecChildStep) -> impl FnOnce(ExecError) -> ExecChildFailure {
+    move |error| ExecChildFailure {
+        step,
+        error: Box::new(error),
+    }
+}
+
 /// 稼働中コンテナへの exec の結果（SUP-6・REPAIR-3・TASK-163 追補・#1460）。
 ///
 /// `execve` より前に子が失敗した場合の終了コード（125 / 126 / 127）は、実行されたコマンド自身も返し得る値で、
@@ -1370,10 +1539,22 @@ pub enum ExecExit {
         /// `InvalidArgument`、その他 → `Internal`。#2763）。子が何も書かずに終わった場合と解釈できない内容
         /// のときは `Internal`（起動していない扱いを保つ fail-closed）。
         code: ErrorCode,
+        /// 子が失敗した手順の段（固定語彙 [`ExecChildStep`]。SUP-6・REPAIR-3・#2822）。子が何も書かずに終わった
+        /// 場合（手順の途中でシグナルを受けた等）と、解釈できない内容・未知の段のときは `None`。メッセージが
+        /// 要るときは [`ExecChildStep::message`] で段から固定の英文を引く（子の自由文は運ばない）。
+        step: Option<ExecChildStep>,
     },
 }
 
 impl ExecExit {
+    /// 失敗した手順の段（`SetupFailed` のときだけ。`Command` と、段を受け取れなかった場合は `None`）。
+    pub fn failure_step(self) -> Option<ExecChildStep> {
+        match self {
+            Self::Command(_) => None,
+            Self::SetupFailed { step, .. } => step,
+        }
+    }
+
     /// 子プロセスの終了状態（コマンドが起動したかどうかによらない）。
     pub fn child_exit(self) -> ChildExit {
         match self {
@@ -1392,6 +1573,12 @@ const EXEC_STATUS_READY: &[u8] = b"R\n";
 
 /// 子が親へ返す状態の読み取り上限（バイト。`R` の行と失敗の行 1 件ぶんより十分大きい）。
 const EXEC_STATUS_MAX: usize = 256;
+
+/// 失敗の行の 1 語あたりの上限（バイト。語彙を引く前に確かめる。#2822）。
+const EXEC_FAILURE_TOKEN_MAX: usize = 48;
+
+/// 失敗の行 1 件の上限（バイト。改行を含む。#2822）。
+const EXEC_FAILURE_LINE_MAX: usize = 128;
 
 /// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
 ///
@@ -1412,8 +1599,8 @@ const EXEC_STATUS_MAX: usize = 256;
 ///   開き直しの間の競合による拒否で、分離境界の突破試行とは断定できない
 /// - `FailedPrecondition`（`/dev/null`・`/proc`・`/dev/fd` の不在や準備不足）: 差し替えではなく前提不足
 /// - `execveat` 自体の失敗（`R` の後）と状態書き込みの失敗: errno 由来のシステムエラー
-/// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。何も書かずに終了）: 親の生存確認と
-///   cgroup 参加のシステムエラー
+/// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。理由 `-` の失敗の行を best-effort で
+///   書いて終了。段は `parent_lifetime` / `cgroup_join`。#2822）: 親の生存確認と cgroup 参加のシステムエラー
 ///
 /// 照合の限界: 対象は `process.rs`・`interpreter.rs`・`sealed_copy.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
 /// ヘルパを呼ぶようになったら、そのファイルを照合対象に加えること（`rootfs.rs`・`setns.rs` 等は子の経路の外の
@@ -1467,19 +1654,20 @@ fn run_exec_child(
         StdioNulling::ALL,
     )
     .and_then(|exe| {
-        write_exec_status(status, EXEC_STATUS_READY)?;
-        terminal(entry, &exe)
+        write_exec_status(status, EXEC_STATUS_READY).map_err(at(ExecChildStep::ReportReady))?;
+        terminal(entry, &exe).map_err(at(ExecChildStep::Execveat))
     });
     match result {
         Ok(code) => code,
-        Err(err) => {
+        Err(ExecChildFailure { step, error }) => {
+            let err = *error;
             let code = exit_code_for(&err);
             let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
             // 失敗の行を書けなかった場合（`R` を書いた後の `execveat` の失敗で起き得る）、親は「起動した」と
             // 誤判定する。書き込みは fd を複製せず 1 回の `write` で行い（複製の失敗という要因を持たない）、
             // それでも書けなければ stderr に残す（stderr は既に `/dev/null` の場合がある。限界は
             // `exec/exec_command.rs`）。
-            if write_exec_status(status, exec_failure_line(&err).as_bytes()).is_err() {
+            if write_exec_status(status, exec_failure_line(step, &err).as_bytes()).is_err() {
                 let _ = writeln!(
                     std::io::stderr(),
                     "fandhe-container: the exec status could not be reported"
@@ -1490,11 +1678,32 @@ fn run_exec_child(
     }
 }
 
-/// 失敗の行 `<終了コード> <ERR-1 コード> <違反の理由コードまたは ->\n`（純関数。親の
-/// [`classify_exec_status`] が復号する唯一の形式。errno の生値・文字列・パスは運ばない。#2763）。
-fn exec_failure_line(err: &ExecError) -> String {
+/// 失敗の行 `<終了コード> <step> <ERR-1 コード> <違反の理由コードまたは ->\n`（純関数。親の
+/// [`classify_exec_status`] が復号する唯一の形式。errno の生値・文字列・パスは運ばない。#2763・#2822）。
+fn exec_failure_line(step: ExecChildStep, err: &ExecError) -> String {
     let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
-    format!("{} {} {reason}\n", exit_code_for(err), err.code.as_str())
+    format!(
+        "{} {} {} {reason}\n",
+        exit_code_for(err),
+        step.as_str(),
+        err.code.as_str()
+    )
+}
+
+/// 子の前段（`bind_to_parent_lifetime`・`join_exec_cgroup`。`exec_command.rs`）の失敗を状態 pipe へ書く
+/// （best-effort。書けなければ従来どおり何も届かず、親は `step: None` の `SetupFailed` と判定する。#2822）。
+/// 違反ではない失敗なので理由は `-`、終了コードは [`EXIT_SETUP_FAILED`]。
+pub(super) fn report_exec_child_failure(
+    status: &std::fs::File,
+    step: ExecChildStep,
+    code: ErrorCode,
+) {
+    let line = format!(
+        "{EXIT_SETUP_FAILED} {} {} -\n",
+        step.as_str(),
+        code.as_str()
+    );
+    let _ = write_exec_status(status, line.as_bytes());
 }
 
 /// 子が状態を返す pipe を作る。戻り値は `(読み取り側, 書き込み側)`（両端とも close-on-exec）。
@@ -1565,28 +1774,56 @@ pub(super) fn read_exec_status(
 }
 
 /// pipe の内容 `status` と子の終了状態から結果を決める（純関数。規則は [`run_exec_child`]）。
+///
+/// 失敗の行は `<終了コード> <step> <ERR-1 コード> <理由|->\n` の 4 語ちょうど（単一スペース区切り）。行・語の
+/// 長さを語彙を引く前に上限検証し、段・コード・理由は静的な値に引き直す。`execveat` の段は `R` の後だけ受ける
+/// （launch の `X` と同じ形）。どれかに外れたら起動していない扱いで `Internal`・段なし（fail-closed。#2822）。
 fn classify_exec_status(status: &[u8], exit: ChildExit) -> ExecExit {
     if status == EXEC_STATUS_READY {
         return ExecExit::Command(exit);
     }
     // 解釈できない内容（空・切れた行・旧形式・未知の語・余分なバイト）は、起動していない扱いで
-    // 理由なし・`Internal`（fail-closed）。
+    // 理由なし・段なし・`Internal`（fail-closed）。
     let unparsed = ExecExit::SetupFailed {
         exit,
         violation: None,
         code: ErrorCode::Internal,
+        step: None,
     };
-    // 失敗の行（`R` の後、または単独）は `<終了コード> <ERR-1 コード> <理由|->\n` の 3 語ちょうど。
+    let after_ready = status.starts_with(EXEC_STATUS_READY);
     let line = status.strip_prefix(EXEC_STATUS_READY).unwrap_or(status);
+    if line.len() > EXEC_FAILURE_LINE_MAX {
+        return unparsed;
+    }
     let Some(line) = line.strip_suffix(b"\n") else {
         return unparsed;
     };
     let mut words = line.split(|b| *b == b' ');
-    let (Some(_exit), Some(code), Some(reason), None) =
-        (words.next(), words.next(), words.next(), words.next())
+    let (Some(_exit), Some(step), Some(code), Some(reason), None) = (
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+    ) else {
+        return unparsed;
+    };
+    if [step, code, reason]
+        .iter()
+        .any(|w| w.len() > EXEC_FAILURE_TOKEN_MAX)
+    {
+        return unparsed;
+    }
+    let Some(step) = std::str::from_utf8(step)
+        .ok()
+        .and_then(ExecChildStep::from_token)
     else {
         return unparsed;
     };
+    // `execveat` の失敗は `R` の後にしか起き得ない（`R` が無い `execveat` は不整合）。
+    if (step == ExecChildStep::Execveat) != after_ready {
+        return unparsed;
+    }
     let Some(code) = std::str::from_utf8(code)
         .ok()
         .and_then(ErrorCode::from_name)
@@ -1608,6 +1845,7 @@ fn classify_exec_status(status: &[u8], exit: ChildExit) -> ExecExit {
         exit,
         violation,
         code,
+        step: Some(step),
     }
 }
 
@@ -4663,12 +4901,15 @@ mod tests {
             exit,
             violation,
             code: ErrorCode::Internal,
+            step: None,
         };
-        let failed_with = |exit, violation, code| ExecExit::SetupFailed {
+        let failed_with = |exit, violation, code, step| ExecExit::SetupFailed {
             exit,
             violation,
             code,
+            step: Some(step),
         };
+        let at_open = ExecChildStep::OpenEntrypoint;
         for code in [0, 1, 125, 126, 127] {
             let exit = ChildExit::Exited(code);
             assert_eq!(classify_exec_status(b"R\n", exit), ExecExit::Command(exit));
@@ -4685,64 +4926,74 @@ mod tests {
         let exit = ChildExit::Exited(126);
         assert_eq!(
             classify_exec_status(b"126 INTERNAL -\n", exit),
-            failed(exit, None)
+            failed(exit, None),
+            "the old 3-word line is no longer accepted"
         );
         // `execveat` 自体の失敗（`R` の後に失敗の行）。ERR-1 コードが運ばれる（#2763）。
         for (line, code) in [
-            (&b"R\n127 NOT_FOUND -\n"[..], ErrorCode::NotFound),
+            (&b"R\n127 execveat NOT_FOUND -\n"[..], ErrorCode::NotFound),
             (
-                &b"R\n126 PERMISSION_DENIED -\n"[..],
+                &b"R\n126 execveat PERMISSION_DENIED -\n"[..],
                 ErrorCode::PermissionDenied,
             ),
             (
-                &b"R\n126 INVALID_ARGUMENT -\n"[..],
+                &b"R\n126 execveat INVALID_ARGUMENT -\n"[..],
                 ErrorCode::InvalidArgument,
             ),
-            (&b"R\n126 INTERNAL -\n"[..], ErrorCode::Internal),
+            (&b"R\n126 execveat INTERNAL -\n"[..], ErrorCode::Internal),
         ] {
             assert_eq!(
                 classify_exec_status(line, exit),
-                failed_with(exit, None, code),
+                failed_with(exit, None, code, ExecChildStep::Execveat),
                 "{line:?}"
             );
         }
         for reason in EXEC_CHILD_VIOLATIONS {
-            let line = format!("126 PERMISSION_DENIED {}\n", reason.as_str());
+            let line = format!(
+                "126 open_entrypoint PERMISSION_DENIED {}\n",
+                reason.as_str()
+            );
             assert_eq!(
                 classify_exec_status(line.as_bytes(), exit),
-                failed_with(exit, Some(reason), ErrorCode::PermissionDenied)
+                failed_with(exit, Some(reason), ErrorCode::PermissionDenied, at_open)
             );
             assert_eq!(reason.kind().as_str(), "entrypoint");
         }
         assert_eq!(
             classify_exec_status(
-                b"126 PERMISSION_DENIED entrypoint_interpreter_is_runtime_binary\n",
+                b"126 interpreter PERMISSION_DENIED entrypoint_interpreter_is_runtime_binary\n",
                 exit
             ),
             failed_with(
                 exit,
                 Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
-                ErrorCode::PermissionDenied
+                ErrorCode::PermissionDenied,
+                ExecChildStep::Interpreter
             )
         );
         // 封印した複製の拒否（#1531）の理由コードは、子から親へ違反として運ばれる。
         for (line, reason) in [
             (
-                &b"126 PERMISSION_DENIED entrypoint_copy_too_large\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_copy_too_large\n"[..],
                 ViolationReason::EntrypointCopyTooLarge,
             ),
             (
-                &b"126 PERMISSION_DENIED entrypoint_copy_seal_unverified\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_copy_seal_unverified\n"[..],
                 ViolationReason::EntrypointCopySealUnverified,
             ),
             (
-                &b"126 PERMISSION_DENIED entrypoint_on_noexec_mount\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_on_noexec_mount\n"[..],
                 ViolationReason::EntrypointOnNoexecMount,
             ),
         ] {
             assert_eq!(
                 classify_exec_status(line, exit),
-                failed_with(exit, Some(reason), ErrorCode::PermissionDenied)
+                failed_with(
+                    exit,
+                    Some(reason),
+                    ErrorCode::PermissionDenied,
+                    ExecChildStep::SelectExecutable
+                )
             );
         }
         // 解釈できない内容・子が返さないはずの理由コード・切れた行は、起動していない扱い（理由なし）。
@@ -4766,6 +5017,18 @@ mod tests {
             b"126 NOT_FOUND -\nx",
             b"R\n126 NOT_FOUND -\n126 NOT_FOUND -\n",
             b"126  NOT_FOUND -\n",
+            // 新形式の不正: 未知の段・段の欠落・語数の過不足・二重スペース・長すぎる語。
+            b"126 bogus_step NOT_FOUND -\n",
+            b"126 NOT_FOUND - -\n",
+            b"126 open_entrypoint NOT_FOUND\n",
+            b"126 open_entrypoint NOT_FOUND - extra\n",
+            b"126  open_entrypoint NOT_FOUND -\n",
+            b"126 open_entrypoint  NOT_FOUND -\n",
+            b"126 OPEN_ENTRYPOINT NOT_FOUND -\n",
+            // `execveat` は `R` の後だけ。`R` の後は `execveat` だけ。
+            b"126 execveat NOT_FOUND -\n",
+            b"R\n126 open_entrypoint NOT_FOUND -\n",
+            b"R\n126 report_ready INTERNAL -\n",
         ] {
             assert_eq!(
                 classify_exec_status(garbage, exit),
@@ -4787,24 +5050,34 @@ mod tests {
         let path = Path::new("/secret/dir/app");
         let exit_of = |n| ChildExit::Exited(n);
         for (errno, line, code, exit) in [
-            (sys::ENOENT, "127 NOT_FOUND -\n", ErrorCode::NotFound, 127),
+            (
+                sys::ENOENT,
+                "127 execveat NOT_FOUND -\n",
+                ErrorCode::NotFound,
+                127,
+            ),
             (
                 sys::EACCES,
-                "126 PERMISSION_DENIED -\n",
+                "126 execveat PERMISSION_DENIED -\n",
                 ErrorCode::PermissionDenied,
                 126,
             ),
             (
                 sys::ENOEXEC,
-                "126 INVALID_ARGUMENT -\n",
+                "126 execveat INVALID_ARGUMENT -\n",
                 ErrorCode::InvalidArgument,
                 126,
             ),
-            (sys::EINTR, "126 INTERNAL -\n", ErrorCode::Internal, 126),
+            (
+                sys::EINTR,
+                "126 execveat INTERNAL -\n",
+                ErrorCode::Internal,
+                126,
+            ),
         ] {
             let err = execve_error(path, SysError::Os(errno));
             assert_eq!((err.code, err.stage), (code, IsolationStage::Exec));
-            let written = exec_failure_line(&err);
+            let written = exec_failure_line(ExecChildStep::Execveat, &err);
             assert_eq!(written, line, "errno {errno}");
             assert!(!written.contains("secret"), "{written}");
             let status = format!("R\n{written}");
@@ -4813,18 +5086,176 @@ mod tests {
                 ExecExit::SetupFailed {
                     exit: exit_of(exit),
                     violation: None,
-                    code
+                    code,
+                    step: Some(ExecChildStep::Execveat),
                 }
             );
         }
         // 違反を伴う失敗は理由コードも載る。
         let violation = ExecError::from_violation(ViolationReason::EntrypointIsRuntimeBinary, None);
         assert_eq!(
-            exec_failure_line(&violation),
+            exec_failure_line(ExecChildStep::RuntimeIdentity, &violation),
             format!(
-                "126 {} entrypoint_is_runtime_binary\n",
+                "126 runtime_identity {} entrypoint_is_runtime_binary\n",
                 violation.code.as_str()
             )
+        );
+    }
+
+    /// SUP-6・REPAIR-3・REPAIR-4・SEC-4（#2822）: 全段で失敗の行が往復し、行の文字列・復号結果を具体値で照合する。
+    /// `execveat` は `R` の後だけ。メッセージは段から引く固定の英文で、パス・errno 文字列を含まない。
+    #[test]
+    fn sup6_2822_failure_line_roundtrips_every_step() {
+        let exit = ChildExit::Exited(126);
+        let err = ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::Exec,
+            "secret /host/path errno 13",
+        );
+        assert_eq!(ExecChildStep::ALL.len(), 15);
+        for step in ExecChildStep::ALL {
+            let line = exec_failure_line(step, &err);
+            assert_eq!(line, format!("126 {} PERMISSION_DENIED -\n", step.as_str()));
+            assert!(!line.contains("secret"), "{line}");
+            let status = if step == ExecChildStep::Execveat {
+                format!("R\n{line}")
+            } else {
+                line.clone()
+            };
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit),
+                ExecExit::SetupFailed {
+                    exit,
+                    violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(step),
+                },
+                "{step:?}"
+            );
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit).failure_step(),
+                Some(step)
+            );
+            assert_eq!(ExecChildStep::from_token(step.as_str()), Some(step));
+            assert!(step.message().starts_with("the exec child "), "{step:?}");
+            assert!(!step.message().contains('/'), "{step:?}");
+        }
+        assert_eq!(ExecChildStep::from_token("bogus"), None);
+        assert_eq!(ExecChildStep::from_token(""), None);
+        assert_eq!(
+            ExecExit::Command(exit).failure_step(),
+            None,
+            "a started command has no failed step"
+        );
+        // 段の写像（既存の `IsolationStage` の語彙）。
+        assert_eq!(ExecChildStep::ParentLifetime.stage(), IsolationStage::Spawn);
+        assert_eq!(
+            ExecChildStep::CgroupJoin.stage(),
+            IsolationStage::CgroupJoin
+        );
+        assert_eq!(
+            ExecChildStep::DeferredRlimit.stage(),
+            IsolationStage::Rlimits
+        );
+        assert_eq!(ExecChildStep::Execveat.stage(), IsolationStage::Exec);
+        // トークンは互いに異なる。
+        let tokens: std::collections::HashSet<_> =
+            ExecChildStep::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(tokens.len(), ExecChildStep::ALL.len());
+        assert_eq!(exec_child_steps(), &ExecChildStep::ALL[..]);
+    }
+
+    /// 前段（`parent_lifetime`・`cgroup_join`）の失敗の行は、違反ではない（理由 `-`）終了コード 125 の 4 語で、
+    /// 親が段つきで復号する（#2822）。
+    #[test]
+    fn sup6_2822_pre_step_failure_is_reported_with_its_step() {
+        let exit = ChildExit::Exited(EXIT_SETUP_FAILED);
+        // 他のテストスレッドの fork が pipe の書き込み側の複製を持つと読み取りが `Err` になる。報告行は一度読むと
+        // 消費されるため、再試行ごとに pipe の作成と報告行の書き込みからやり直す（REPAIR-12）。
+        let result = (0..200)
+            .find_map(|_| {
+                let (reader, writer) = exec_status_pipe().unwrap();
+                report_exec_child_failure(
+                    &writer,
+                    ExecChildStep::CgroupJoin,
+                    ErrorCode::PermissionDenied,
+                );
+                drop(writer);
+                read_exec_status(&reader, exit).ok()
+            })
+            .expect("readable");
+        assert_eq!(
+            result,
+            ExecExit::SetupFailed {
+                exit,
+                violation: None,
+                code: ErrorCode::PermissionDenied,
+                step: Some(ExecChildStep::CgroupJoin),
+            }
+        );
+    }
+
+    /// 不正な段・長すぎる語・語数の過不足・`execveat` と `R` の不整合は、すべて段なし・`Internal` の未起動に落ちる
+    /// （子は untrusted。語彙を引く前に長さを検証する。#2822）。
+    #[test]
+    fn sup6_2822_rejects_unknown_or_oversized_step() {
+        let exit = ChildExit::Exited(126);
+        let unparsed = ExecExit::SetupFailed {
+            exit,
+            violation: None,
+            code: ErrorCode::Internal,
+            step: None,
+        };
+        let long_step = format!(
+            "126 {} NOT_FOUND -\n",
+            "s".repeat(EXEC_FAILURE_TOKEN_MAX + 1)
+        );
+        let long_line = format!(
+            "126 setsid NOT_FOUND {}\n",
+            "a".repeat(EXEC_FAILURE_LINE_MAX)
+        );
+        for bad in [
+            "126 unknown_step NOT_FOUND -\n".to_string(),
+            "126 setsid NOT_FOUND\n".to_string(),
+            "126 setsid NOT_FOUND - x\n".to_string(),
+            "126  setsid NOT_FOUND -\n".to_string(),
+            "126 execveat NOT_FOUND -\n".to_string(),
+            "R\n126 setsid NOT_FOUND -\n".to_string(),
+            long_step,
+            long_line,
+        ] {
+            assert_eq!(
+                classify_exec_status(bad.as_bytes(), exit),
+                unparsed,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// 全段 x 全 ERR-1 コード x 全理由の最長の行が上限（行・読み取り）に収まる（#2822）。
+    #[test]
+    fn sup6_2822_longest_failure_line_fits() {
+        let mut longest = 0usize;
+        for step in ExecChildStep::ALL {
+            assert!(step.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+            for code in ErrorCode::ALL {
+                assert!(code.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+                for reason in EXEC_CHILD_VIOLATIONS {
+                    assert!(reason.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+                    let line = format!(
+                        "126 {} {} {}\n",
+                        step.as_str(),
+                        code.as_str(),
+                        reason.as_str()
+                    );
+                    longest = longest.max(line.len());
+                }
+            }
+        }
+        assert!(longest <= EXEC_FAILURE_LINE_MAX, "{longest}");
+        assert!(
+            longest + EXEC_STATUS_READY.len() <= EXEC_STATUS_MAX,
+            "{longest}"
         );
     }
 
@@ -4853,24 +5284,27 @@ mod tests {
             ExecExit::SetupFailed {
                 exit,
                 violation: None,
-                code: ErrorCode::Internal
+                code: ErrorCode::Internal,
+                step: None,
             }
         );
         assert_eq!(
-            read(b"127 PERMISSION_DENIED stdio_null_not_null_device\n"),
+            read(b"127 stdio_null PERMISSION_DENIED stdio_null_not_null_device\n"),
             ExecExit::SetupFailed {
                 exit,
                 violation: Some(ViolationReason::StdioNullNotNullDevice),
-                code: ErrorCode::PermissionDenied
+                code: ErrorCode::PermissionDenied,
+                step: Some(ExecChildStep::StdioNull),
             }
         );
         // `R` の後の `execveat` の失敗（#2763）。
         assert_eq!(
-            read(b"R\n127 NOT_FOUND -\n"),
+            read(b"R\n127 execveat NOT_FOUND -\n"),
             ExecExit::SetupFailed {
                 exit,
                 violation: None,
-                code: ErrorCode::NotFound
+                code: ErrorCode::NotFound,
+                step: Some(ExecChildStep::Execveat),
             }
         );
         assert_eq!(
@@ -4878,7 +5312,8 @@ mod tests {
             ExecExit::SetupFailed {
                 exit,
                 violation: None,
-                code: ErrorCode::Internal
+                code: ErrorCode::Internal,
+                step: None,
             }
         );
 

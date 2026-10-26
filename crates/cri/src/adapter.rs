@@ -230,6 +230,7 @@ pub struct BundleRequest<'a> {
     pub pod_netns_path: Option<&'a Path>,
     /// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。`Some` で ipc が `POD` のとき
     /// だけ ipc を join にする。供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
+    /// パスは sandbox の記録の保持役の pid から `crate::bundle::PodNamespacePaths::for_holder_pid` で作る（#2776）。
     pub pod_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
 }
 

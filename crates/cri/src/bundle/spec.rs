@@ -17,6 +17,7 @@
 //!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
 //!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
 //!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
+//!   [`PodNamespacePaths`] は保持役の pid から `/proc/<pid>/ns/{user,ipc}` だけを組み立てる（#2776）。
 //!   供給元（保持役）はまだ無く、`CriRuntimeService` は当面 `None` を渡すため、本番では共有されず新しい
 //!   namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
 //!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
@@ -78,6 +79,7 @@
 //!   `docs/design/cri-devices-cdi.md`（#2673・CRI-2・GPU-1）にまとめている。
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 
 use serde::Serialize;
 
@@ -359,27 +361,71 @@ struct NamespaceOut<'a> {
     path: Option<&'a str>,
 }
 
-/// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。
+/// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3・SEC-5。#2674・#2776）。
 ///
 /// `SpecBundleProvider::prepare` が `BundleRequest` 経由で受け、ipc の `POD` を join に変える。
-/// 供給元（pod の保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。パスは core が start で
-/// fd に固定して所有者・種別を照合する（cri は形式だけを見る）。
+/// 公開の構築口は [`PodNamespacePaths::for_holder_pid`] だけで、`/proc/<pid>/ns/user` と
+/// `/proc/<同じ pid>/ns/ipc` しか作れない。任意の文字列から作る口は crate の外へ出さない。
+///
+/// # 保持役を配線するときの契約（#2776）
+///
+/// - パスは、その sandbox（同じ `sandbox_id`）の記録が持つ保持役の pid からだけ導く。CRI リクエストの値
+///   （`ContainerConfig`・annotations・`PodSandboxConfig` の文字列）からは作らない
+/// - 別 pod の sandbox の pid を使わない。rootless で supervisor が初期 userns にいると、同じユーザーの別 pod の
+///   userns も core の認可（親＝呼び出し側・作成者 uid＝euid）を満たしてしまうため（SEC-5）
+/// - 配線の PR は、pod A のコンテナの config に pod B の pid のパスが出ないことと、出たパスの pid が自 sandbox
+///   の記録の値と一致することを結合試験で足す
+/// - 保持役は Create から Start の間生きている必要がある。pid の再利用の窓は core が start で 1 回だけ開いて
+///   fd に固定し、所有者・親子・種別を照合して閉じる。cri の検査は形式だけの二次防御で、認可の正は core
+///
+/// 供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodNamespacePaths {
     user: String,
     ipc: String,
 }
 
+/// `/proc/<pid>/ns/<kind>` と完全一致するパスから pid を取り出す。pid は 1 以上 `i32::MAX` 以下の正準な
+/// 10 進（先頭ゼロ・符号・空白なし）に限る。`self`・`..`・二重スラッシュ・末尾スラッシュは `None`。
+fn holder_pid_of(path: &str, kind: &str) -> Option<u32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (seg, tail) = rest.split_once('/')?;
+    let mut parts = tail.split('/');
+    if parts.next() != Some("ns") || parts.next() != Some(kind) || parts.next().is_some() {
+        return None;
+    }
+    if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = seg.parse().ok()?;
+    // 往復一致で先頭ゼロを除く。
+    if pid == 0 || pid > i32::MAX as u32 || pid.to_string() != seg {
+        return None;
+    }
+    Some(pid)
+}
+
 impl PodNamespacePaths {
-    /// 絶対パスで `MAX_PATH_BYTES` 以内・NUL なしのものだけを受ける。違反は供給元の誤りなので `INTERNAL`。
-    pub fn new(user: impl Into<String>, ipc: impl Into<String>) -> Result<Self, CriError> {
-        let (user, ipc) = (user.into(), ipc.into());
-        for p in [&user, &ipc] {
-            if !p.starts_with('/') || p.len() > MAX_PATH_BYTES || p.contains('\0') {
-                return Err(CriError::internal("invalid pod namespace path"));
-            }
+    /// 保持役の pid から `/proc/<pid>/ns/user` と `/proc/<同じ pid>/ns/ipc` を組み立てる（#2776）。
+    /// `pid_t` の正の上限（`i32::MAX`）を超える値は供給元の誤りなので `INTERNAL`。
+    pub fn for_holder_pid(pid: NonZeroU32) -> Result<Self, CriError> {
+        let pid = pid.get();
+        Self::from_paths(
+            &format!("/proc/{pid}/ns/user"),
+            &format!("/proc/{pid}/ns/ipc"),
+        )
+    }
+
+    /// 形式（`/proc/<pid>/ns/{user,ipc}` の完全一致・user と ipc で同じ pid）を検査して作る。不変条件の定義は
+    /// ここ 1 か所に置く。違反は供給元の誤りなので、値を含まない固定文言の `INTERNAL`。
+    pub(crate) fn from_paths(user: &str, ipc: &str) -> Result<Self, CriError> {
+        match (holder_pid_of(user, "user"), holder_pid_of(ipc, "ipc")) {
+            (Some(u), Some(i)) if u == i => Ok(Self {
+                user: user.to_owned(),
+                ipc: ipc.to_owned(),
+            }),
+            _ => Err(CriError::internal("invalid pod namespace path")),
         }
-        Ok(Self { user, ipc })
     }
 
     /// user namespace のパス。
@@ -1463,4 +1509,66 @@ fn build_inner(
         }
     })?;
     Ok(RuntimeConfigJson(w.buf))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `PodNamespacePaths` の形式検査（CRI-2・CORE-3・SEC-5。#2776）。
+
+    use super::*;
+    use crate::error::CriErrorCode;
+
+    #[test]
+    fn accepts_canonical_pair() {
+        for pid in ["4242", "1", "2147483647"] {
+            let (u, i) = (
+                format!("/proc/{pid}/ns/user"),
+                format!("/proc/{pid}/ns/ipc"),
+            );
+            let p = PodNamespacePaths::from_paths(&u, &i).expect("canonical");
+            assert_eq!((p.user(), p.ipc()), (u.as_str(), i.as_str()));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_paths_with_internal() {
+        let cases: &[(&str, &str)] = &[
+            ("/proc/self/ns/user", "/proc/self/ns/ipc"),
+            ("/proc/thread-self/ns/user", "/proc/thread-self/ns/ipc"),
+            ("/proc/1/ns/../ns/user", "/proc/1/ns/ipc"),
+            ("/proc/1/ns/user", "/proc/2/ns/ipc"),
+            ("/run/netns/x", "/run/netns/x"),
+            ("/proc/1/ns/ipc", "/proc/1/ns/user"),
+            ("/proc/0/ns/user", "/proc/0/ns/ipc"),
+            ("/proc/042/ns/user", "/proc/042/ns/ipc"),
+            ("/proc/+1/ns/user", "/proc/+1/ns/ipc"),
+            ("/proc/2147483648/ns/user", "/proc/2147483648/ns/ipc"),
+            ("/proc/99999999999/ns/user", "/proc/99999999999/ns/ipc"),
+            ("/proc/1/ns/user/", "/proc/1/ns/ipc"),
+            ("/proc//1/ns/user", "/proc//1/ns/ipc"),
+            ("/proc/1//ns/user", "/proc/1//ns/ipc"),
+            ("/proc/1/ns/user\0", "/proc/1/ns/ipc"),
+            ("", ""),
+            ("/proc/1/ns/mnt", "/proc/1/ns/ipc"),
+            ("proc/1/ns/user", "proc/1/ns/ipc"),
+        ];
+        for (u, i) in cases {
+            let e = PodNamespacePaths::from_paths(u, i).expect_err(u);
+            assert_eq!(e.code(), CriErrorCode::Internal, "{u} {i}");
+        }
+    }
+
+    #[test]
+    fn for_holder_pid_builds_proc_paths_and_bounds_pid() {
+        let p = PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nz")).expect("ok");
+        assert_eq!(p.user(), "/proc/4242/ns/user");
+        assert_eq!(p.ipc(), "/proc/4242/ns/ipc");
+        let max = i32::MAX as u32;
+        PodNamespacePaths::for_holder_pid(NonZeroU32::new(max).expect("nz")).expect("max");
+        for over in [max + 1, u32::MAX] {
+            let e = PodNamespacePaths::for_holder_pid(NonZeroU32::new(over).expect("nz"))
+                .expect_err("over");
+            assert_eq!(e.code(), CriErrorCode::Internal);
+        }
+    }
 }

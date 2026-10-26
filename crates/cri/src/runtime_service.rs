@@ -1675,6 +1675,7 @@ impl CriRuntimeService {
             guard.arm_bundles(Arc::clone(&bundles));
             // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
             // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
+            // 結線するときは sandbox の記録の保持役の pid から PodNamespacePaths::for_holder_pid で作る（#2776）。
             let bundle = bundles.prepare(
                 &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
                     .with_pod_netns_path(pod_netns.as_deref()),

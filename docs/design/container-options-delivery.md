@@ -42,7 +42,7 @@ FCOPT1\n
 <kind> <len>\n<len バイトの UTF-8>\n     （繰り返し）
 ```
 
-- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
+- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
 - 値の改行を許すため行区切りではなく長さ接頭辞にする
 - 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ（`Ulimit::parse` 等）へ通し直す（未信頼の入力として検証）
 - 上限は確保の前に検証する: 全体 `ENV_MAX_TOTAL_BYTES + 256 KiB`、件数（ulimit 16・env `ENV_MAX_ENTRIES`・tmpfs
@@ -56,7 +56,10 @@ FCOPT1\n
 | `--ulimit` | 文書 → `LaunchOptions::with_rlimits` → launcher が 16 種へ補完して `Rlimits` 段へ渡し、同じ集合を Running の状態記録（`state.json` の `rlimits`）にも書く。exec の再適用が launch と同じ制限を載せる |
 | `--env` / `--env-file` | CLI が `--env-file` を利用者の権限で読み、`-e` が後勝ちで統合した `KEY=VALUE` を文書へ → `LaunchOptions::with_env` → `process.env` へ位置を保って重ねる（新しいキーは末尾）。PATH 解決もマージ後の env で行う |
 | `--ipc` / `--shm-size` / `--tmpfs` | 文書 → 既存の `ContainerOptions::launch_options`（#2625） |
+| `--cap-drop` | 文書の `cap-drop` kind（名前の生の文字列。1 件 32 バイト・最大 `MAX_DROP_NAMES` 件）→ 復号のたびに core の `parse_drop_list` で再検証（CRI の `drop_capabilities` と同じ正規化）→ `LaunchOptions::with_capability_drop` → launcher が config.json 由来の許可集合から除き、**狭めた同じ値**を launch の段と分離の記録（`launchIsolation.capabilities`。exec の再適用・inspect が見る）へ渡す。狭める方向のみで add の経路は無い（SEC-1・#2775） |
 | `--label` | 文書を通さず、create 時に `CreateRequest::with_annotations` → `CreateStateRequest::with_annotations` で `state.json` の `annotations` へ |
+
+`cap-drop` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
 
 core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数・長さ・形式を再検証する。
 

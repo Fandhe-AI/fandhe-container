@@ -41,6 +41,8 @@
 //!   内容とモードがコンテナ内で具体値で一致することを照合する（呼び出し元のメモリ由来の内容は launcher が拒否する。
 //!   holder のメモリに secret が無いことは `rootless_holder_memory` が照合する）。成功時は
 //!   `production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)` を出す
+//! - シナリオ V（sysctls。CRI-2・CORE-3・#2670）: `linux.sysctl` の `kernel.shmmax` がコンテナ内の IPC namespace で指定値になり、
+//!   ホスト側の値が変わらないことを照合する。成功時は `production_launcher: sysctls applied (scenario=V` を出す
 //! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
 //!   `/proc/self/status` が `CapInh`・`CapAmb` = 0、`CapPrm`・`CapEff`・`CapBnd` = `0x0000_0000_a804_25fb`（OCI 既定の 14 個。
 //!   公開 API の `OCI_DEFAULT_CAPABILITIES` から組んだマスクとリテラルの両方と照合）で、ホストから見た同プロセスの
@@ -439,6 +441,14 @@ mod linux {
                 "SECCOMP_CONTROL {}",
                 control.map_or_else(|e| format!("error:{:?}", e.kind()), |_| "ok".to_string())
             ));
+        }
+        // シナリオ V(sysctls の適用。#2670・CRI-2・CORE-3): コンテナ内の IPC namespace の `kernel.shmmax` を出す。
+        if args.iter().any(|a| a == "--with-sysctl") {
+            let v = std::fs::read_to_string("/proc/sys/kernel/shmmax").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |s| s.trim().to_string(),
+            );
+            emit(format!("SYSCTL_SHMMAX {v}"));
         }
         // シナリオ D（bind mount。#1915）: bind 先へ固定の内容を書き、mountinfo 上のマウントオプションを出す。
         if std::env::args().any(|a| a == "--with-bind") {
@@ -863,6 +873,7 @@ mod linux {
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
         scenario_t_capabilities_drop(&env, tag);
+        scenario_v_sysctls(&env, tag);
         scenario_w_pod_ipc_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
@@ -2380,6 +2391,69 @@ mod linux {
             }
             println!(
                 "production_launcher: capabilities drop applied (scenario=T pid={pid} cap_eff=0xa00405fb)"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ V: `linux.sysctl` の namespaced キー(IPC 系 `kernel.shmmax`)が実際の IPC namespace と procfs を通って
+    /// コンテナ内で指定どおりの値になり、ホスト側の値が変わらないことを照合する(CRI-2・CORE-3・SEC-1・REPAIR-12・#2670)。
+    fn scenario_v_sysctls(env: &Env, tag: u32) {
+        const WANT: &str = "4194304";
+        const HOST_FILE: &str = "/proc/sys/kernel/shmmax";
+        let host_before = std::fs::read_to_string(HOST_FILE)
+            .expect("read host shmmax")
+            .trim()
+            .to_string();
+        assert_ne!(
+            host_before, WANT,
+            "host shmmax must differ from the value under test"
+        );
+        let bundle = Bundle::new("sysctl");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-sysctl"], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["linux"]["sysctl"] = json!({"kernel.shmmax": WANT});
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        let id = ContainerId::new(format!("plsy{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "SYSCTL_SHMMAX"),
+                WANT,
+                "in-container shmmax"
+            );
+            let host_after = std::fs::read_to_string(HOST_FILE)
+                .expect("read host shmmax")
+                .trim()
+                .to_string();
+            assert_eq!(host_after, host_before, "host shmmax must be unchanged");
+            println!(
+                "production_launcher: sysctls applied (scenario=V shmmax={WANT} host_unchanged={host_before})"
             );
         }));
         finish_started(started, verified);

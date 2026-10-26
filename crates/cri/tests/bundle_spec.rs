@@ -120,6 +120,11 @@ fn limits_match_core_constants() {
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_MASKED_PATHS);
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_READONLY_PATHS);
     assert_eq!(MAX_HOSTNAME_BYTES, oci_runtime::CONFIG_MAX_HOSTNAME_BYTES);
+    // pod の sysctls の件数上限は CRI の集合の上限と core の `linux.sysctl` の上限が同値（#2670）。
+    assert_eq!(
+        fandhe_container_cri::runtime_service::MAX_CONFIG_COLLECTION_ENTRIES,
+        fandhe_container_core::sysctl::SYSCTL_MAX_ENTRIES
+    );
     assert_eq!(MAX_ADDITIONAL_GIDS, oci_runtime::CONFIG_MAX_ADDITIONAL_GIDS);
 }
 
@@ -1437,6 +1442,105 @@ fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
         });
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
     }
+}
+
+fn pod_with_sysctls(entries: &[(&str, &str)]) -> PodSandboxConfig {
+    let mut l = LinuxPodSandboxConfig::default();
+    for (k, v) in entries {
+        l.sysctls.insert((*k).into(), (*v).into());
+    }
+    let mut p = pod();
+    p.linux = Some(l);
+    p
+}
+
+/// CRI-2・CORE-3（#2670）: IPC 系の pod sysctls は `linux.sysctl` へキー順で写り、core の parser が解釈済みとして読む。
+#[test]
+fn cri2_pod_ipc_sysctls_are_accepted() {
+    let p = pod_with_sysctls(&[
+        ("kernel.shmmax", "68719476736"),
+        ("kernel.sem", "250 32000 32 128"),
+        ("fs.mqueue.msg_max", "20"),
+    ]);
+    let json = build_runtime_config(&p, &ctr(), &ImageDefaults::default()).expect("build");
+    assert!(
+        std::str::from_utf8(json.as_bytes())
+            .expect("utf8")
+            .contains(
+                r#""sysctl":{"fs.mqueue.msg_max":"20","kernel.sem":"250 32000 32 128","kernel.shmmax":"68719476736"}"#
+            )
+    );
+    let v: Value = serde_json::from_slice(json.as_bytes()).expect("json");
+    assert_eq!(s(&v["linux"]["sysctl"]["kernel.shmmax"]), "68719476736");
+    assert_eq!(s(&v["linux"]["sysctl"]["kernel.sem"]), "250 32000 32 128");
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.unapplied_fields().is_empty());
+    let got: Vec<(&str, &str)> = cfg
+        .sysctls()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("fs.mqueue.msg_max", "20"),
+            ("kernel.sem", "250 32000 32 128"),
+            ("kernel.shmmax", "68719476736"),
+        ]
+    );
+    validate_config(&p, &ctr()).expect("validate accepts it too");
+    // 指定が無ければ出力に `sysctl` を含めない。
+    let v = build(&pod(), &ctr());
+    assert!(v["linux"].get("sysctl").is_none());
+}
+
+/// CRI-2（#2670）: `net.*` と UTS 系は `UNIMPLEMENTED`、名前空間を持たないキー・文法違反・不正な値は
+/// `INVALID_ARGUMENT`（SEC-1。ホストの値を書き換える経路を作らない）。
+#[test]
+fn cri2_pod_sysctls_rejections() {
+    for (k, v) in [
+        ("net.ipv4.ping_group_range", "0 0"),
+        ("net.ipv4.ip_unprivileged_port_start", "0"),
+        ("kernel.hostname", "x"),
+        ("kernel.domainname", "x"),
+    ] {
+        let p = pod_with_sysctls(&[(k, v)]);
+        assert_eq!(code(&p, &ctr()), CriErrorCode::Unimplemented, "{k}");
+    }
+    for (k, v) in [
+        ("kernel.panic", "1"),
+        ("vm.swappiness", "1"),
+        ("kernel/shmmax", "1"),
+        ("kernel..shmmax", "1"),
+        ("", "1"),
+        ("kernel.shmmax", ""),
+        ("kernel.shmmax", "1\n"),
+    ] {
+        let p = pod_with_sysctls(&[(k, v)]);
+        assert_eq!(
+            code(&p, &ctr()),
+            CriErrorCode::InvalidArgument,
+            "{k:?}={v:?}"
+        );
+    }
+    // エラーメッセージにキー・値を含めない。
+    let err = build_runtime_config(
+        &pod_with_sysctls(&[("kernel.panic", "secret-value")]),
+        &ctr(),
+        &ImageDefaults::default(),
+    )
+    .expect_err("rejected");
+    assert!(!err.to_string().contains("secret-value"), "{err}");
+    assert!(!err.to_string().contains("kernel.panic"), "{err}");
+    // 件数の上限を超えたら拒否する。
+    let many: Vec<(String, String)> = (0..=fandhe_container_core::sysctl::SYSCTL_MAX_ENTRIES)
+        .map(|i| (format!("fs.mqueue.k{i}"), "1".to_owned()))
+        .collect();
+    let refs: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        code(&pod_with_sysctls(&refs), &ctr()),
+        CriErrorCode::InvalidArgument
+    );
 }
 
 fn dns_pod(servers: &[&str]) -> PodSandboxConfig {

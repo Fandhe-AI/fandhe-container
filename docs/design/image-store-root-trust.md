@@ -50,15 +50,17 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 | 残骸回収 | `gc_journal::reap_stale_tmp` | root 直下の `*.tmp-*` | 移した（走査は新しい open file description で行う） |
 | blob の削除 | `gc_journal::remove_blob_durable`・`sweep_blobs`・`settle` の `blobs/sha256` の fsync、`remove` / `prune` の事前検査 | `blobs/sha256/<hex>` | 移した（`blobs/sha256` は root の fd から開き直す） |
 | 読み取りのみ | `usage*`（`blob_size`・`scan_cache`・`expanded`・`staging`） | `blobs/`・`staging/` | 移した（#2695。`blobs/sha256` と `staging/<pull-id>` は root の fd から開いたディレクトリの fd 起点で stat・列挙し、`disk_usage` は開いた `blobs/sha256` を images 側と cache 側で共有する。排他区間の中で区間の root と別のパスは `InvalidArgument`。`ExpandedSizePlan` は区間のハンドルを持ち、ガードの外の `measure` も同じ照合を通す） |
-| pull | `pull::PullSession`・`pull_recovery` | `staging/<pull-id>/`・`blobs/sha256` | 移していない（#2694） |
+| pull | `pull::PullSession`・`pull_recovery` の staging の作成・`@pull.lock`・blob の検証・公開（`link` / `rename` / `unlink`）・fsync・中止・回収の削除 | `staging/<pull-id>/`・`blobs/sha256` | 移した（#2694。`root_handle/staging.rs` の `StagingDir` / `PullDir` と `BlobDir`）。fetcher の書き込み先だけ移していない |
 
 移していない根拠（`usage*` は #2695 で移したため残るのは pull だけ）:
 
-- `pull` / `pull_recovery`: 公開 API が fetcher へパスを渡す形（`staged_blob_path` -> `RegistryClient::fetch_blob(dest: &Path)`）で、fd 起点にはその API と Windows の一時名による固定の設計を変える必要がある。本番の配線（cri の `image_pull` -> `PullSession`）も未実装（REPAIR-3）。staging の操作は `lock` の再検査の内側にあり、残る隙間は所有者自身による差し替え（信頼境界の内側）だけ。追跡は #2694
+- fetcher の書き込み先（`PullSession::staged_blob_path` -> `RegistryClient::fetch_blob(dest: &Path)`）: fetch の API と cri の fetch トレイトがパスを受け取る形のため、handle 起点にするには crate をまたぐ API 変更が要り、#2694 の範囲を超える。本番の配線（cri の `image_pull` -> `PullSession`）も未実装（REPAIR-3）。残る隙間: `begin_pull` から fetch までの間に root が差し替えられると、fetcher の書き込みがおとりの `staging/<id>/` へ届きうる。公開は fail-closed のまま: `verify_staged_blob` は保持している pull ディレクトリ fd 起点で開き直すため `NotFound`（`staged blob not found`）になり、おとりへ書かれた内容は検証済みの集合に入らず `blobs/sha256` へ公開されない。隙間を狭める処置として、`staged_blob_path` はパスで辿った `<root>/staging/<id>` が保持している fd と同じ実体であることを (dev, ino) で確かめ、違えば `Internal`（`image store root changed after open`）で拒否する（確認から書き込みまでの間の差し替えは残る）。後続: fetch の API を handle 起点（fd またはディレクトリ handle を受け取る形）へ変える変更（追跡 issue は PR 本文の「対象外」に記載）
+- Windows の一時名による固定（`pin_staged_blobs`）: Windows の `RootHandle` はパス起点（3-b）のため、設計は変えず `pull.rs` の `cfg(windows)` に残した。`hard_link` / `rename` / `remove_file` のうち公開側は `BlobDir` / `PullDir` のパス起点の実装を通る
+- 退けた案: `staged_blob_path` が `/proc/self/fd/<fd>/<hex>` を返す案。procfs に依存し（コンテナ内・seccomp の構成で使えないことがある）、パスがプロセス内でしか有効でなく、`staging_dir()` の表示・照合の意味が崩れるため
 
 ### 3-b. `cfg` の局所化と OS ごとの扱い
 
-`cfg` は `root_handle.rs` の中だけに置き、永続化モジュールには `cfg(target_os)` / `cfg(target_arch)` を書かない。
+`cfg` は `root_handle.rs` と `root_handle/staging.rs` の中だけに置き、永続化モジュールには `cfg(target_os)` / `cfg(target_arch)` を書かない。
 
 - Linux の x86_64 / aarch64: fd 起点（`sys::at` の `openat2`・`renameat`・`unlinkat`・`getdents64`）。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。Linux 5.6 未満ではストアを開けなくなる
 - macOS: 本番経路が `ImageStore::open` に届かない（cli の `non_linux_failure`）。fd 起点の `openat` 系には macOS 用の定数・FFI・libc 照合が要り、足す根拠が無いため、パス起点＋入口の再検査の現行を保つ。再検討の契機は論点 2 と同じ
@@ -67,10 +69,10 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 
 ### 3-c. 残る隙間
 
-- pull がパス起点のまま（#2694）。読み取り専用の集計（`usage*`）は #2695 で fd 起点へ移した
+- fetcher の書き込み先がパスのまま（3-a のとおり公開は fail-closed）
 - fd を開いた後に、所有者自身が root を信頼できない場所へ移す操作は信頼境界の内側。入口の再検査で検出される
 - 試験: `xdev_tests.rs`（3-d の拒否を `EXDEV` の注入で決定的に再現。既定のテスト集合）・`tests/image_store_xdev.rs`（実マウントでの確認。実機前提・`--ignored`）
-- 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する。#2695 で `disk_usage` / `list_images` / `ExpandedSizePlan::measure` の読み取りが検査済みの実体の値だけを返すことも加えた）
+- 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する。#2695 で `disk_usage` / `list_images` / `ExpandedSizePlan::measure` の読み取りが検査済みの実体の値だけを返すことも加えた）。pull は `begin_pull`・`publish`・`abort`・`recover_stale_pulls` の各排他区間の直後に差し替えた場合と、fetcher がおとりへ書いた場合（公開されない）を `oci7_sec1_root_swapped_during_*`・`oci7_sec1_fetch_into_swapped_root_is_not_published` で照合する（#2694）
 
 ### 3-d. マウント越え（EXDEV）と openat2 の拒否（#2701・OCI-7・SEC-1・ERR-1）
 

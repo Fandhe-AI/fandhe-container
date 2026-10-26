@@ -1461,6 +1461,44 @@ pub(crate) fn group_kill_support(probe: Result<(), SysError>) -> Result<(), Root
     }
 }
 
+/// helper 経由の範囲写像に要る pidfd のグループ送信(Linux 6.9 以降)の対応状況(#2715・CORE-6・SEC-5)。
+///
+/// `start` の事前検査(helper 起動前の拒否。#2644)と同じ判定を、`doctor` が読み取り専用で事前に示すための型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupKillSupport {
+    /// 対応(`start` は helper を起動する)。
+    Supported,
+    /// 自プロセスの pidfd を開けない(seccomp・サンドボックス・資源枯渇・Linux 5.3 未満など)。
+    PidfdUnavailable,
+    /// pidfd は開けたが、グループ送信のフラグが受理されない(Linux 6.9 未満は `EINVAL`)。
+    GroupSignalUnsupported,
+}
+
+/// pidfd の open 結果と probe から対応状況を分類する(`Ok`・`ESRCH` は対応という規則は [`group_kill_support`] に一本化)。
+fn classify_group_kill<Fd>(
+    open: Result<Fd, SysError>,
+    probe: impl FnOnce(Fd) -> Result<(), SysError>,
+) -> GroupKillSupport {
+    match open {
+        Err(_) => GroupKillSupport::PidfdUnavailable,
+        Ok(fd) => match group_kill_support(probe(fd)) {
+            Ok(()) => GroupKillSupport::Supported,
+            Err(_) => GroupKillSupport::GroupSignalUnsupported,
+        },
+    }
+}
+
+/// 自プロセスの pidfd でグループ送信の対応を調べる(`start` の事前検査と同じ手順・同じ判定。#2715)。
+///
+/// `doctor` の rootless ID 写像の診断が呼ぶ。副作用は無い: 自分の pidfd へシグナル 0 を送る検査だけで何も配送せず、
+/// fd は関数内で閉じる。
+pub fn probe_group_kill_support() -> GroupKillSupport {
+    classify_group_kill(sys::pidfd_open(std::process::id()), |pidfd| {
+        sys::pidfd_group_signal_probe(std::os::fd::AsFd::as_fd(&pidfd))
+    })
+}
+
 /// `uses_held_pid_helper`(`matches!(writer, IdMapWriter::Helper(_))`)のときだけ `probe` を呼び、
 /// [`group_kill_support`] で判定する。Direct は pid を数値で持つ helper が居ないため検査しない(#2644)。
 pub(crate) fn require_group_kill_for_helper(
@@ -3033,5 +3071,39 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(require_group_kill_for_helper(true, probe(Ok(()))).is_ok());
         assert_eq!(calls.get(), 2);
+    }
+
+    /// CORE-6・SEC-5(#2715): pidfd のグループ送信の対応状況の分類。
+    #[test]
+    fn sec5_classify_group_kill_maps_open_and_probe() {
+        for e in [sys::EPERM, sys::ENOSYS, sys::EMFILE] {
+            assert_eq!(
+                classify_group_kill::<()>(Err(SysError::Os(e)), |_| panic!("not probed")),
+                GroupKillSupport::PidfdUnavailable
+            );
+        }
+        for r in [Ok(()), Err(SysError::Os(sys::ESRCH))] {
+            assert_eq!(
+                classify_group_kill(Ok(()), |_| r),
+                GroupKillSupport::Supported
+            );
+        }
+        for e in [sys::EINVAL, sys::ENOSYS, sys::EPERM] {
+            assert_eq!(
+                classify_group_kill(Ok(()), |_| Err(SysError::Os(e))),
+                GroupKillSupport::GroupSignalUnsupported
+            );
+        }
+    }
+
+    /// CORE-6・SEC-5(#2715): 実カーネルの対応状況は版(6.9 以上)と一致する。
+    #[test]
+    fn sec5_probe_group_kill_support_matches_kernel() {
+        let expected = if crate::test_support::kernel_at_least(6, 9) {
+            GroupKillSupport::Supported
+        } else {
+            GroupKillSupport::GroupSignalUnsupported
+        };
+        assert_eq!(probe_group_kill_support(), expected);
     }
 }

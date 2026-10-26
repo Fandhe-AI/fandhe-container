@@ -178,6 +178,21 @@ impl Digest {
         Ok(Self(s.to_string()))
     }
 
+    /// 任意のバイト列の SHA-256 から content digest（`sha256:<小文字 hex 64 桁>`）を計算する。
+    ///
+    /// OCI の content digest を求める入口。cli の参照キーの畳み込み・状態ルート識別子の導出
+    /// （#2500・OCI-7）でも暗号学的ハッシュとして使う。失敗しない。
+    pub fn sha256_of(bytes: &[u8]) -> Self {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+        let mut s = String::from("sha256:");
+        for b in Sha256::digest(bytes) {
+            // String への書き込みは失敗しない。
+            let _ = write!(s, "{b:02x}");
+        }
+        Self(s)
+    }
+
     /// `sha256:<hex>` 形式の文字列を返す。
     pub fn as_str(&self) -> &str {
         &self.0
@@ -331,6 +346,22 @@ impl ImageReference {
 
 #[cfg(test)]
 mod tests {
+    /// OCI-7・REPAIR-12（#2500）: `Digest::sha256_of` が既知ベクタと一致し、`parse` を通る。
+    #[test]
+    fn oci7_digest_sha256_of_known_vectors() {
+        let empty = Digest::sha256_of(b"");
+        assert_eq!(
+            empty.as_str(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let abc = Digest::sha256_of(b"abc");
+        assert_eq!(
+            abc.as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(Digest::parse(abc.as_str()).unwrap(), abc);
+    }
+
     use super::*;
 
     const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

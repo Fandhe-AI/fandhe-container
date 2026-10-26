@@ -273,6 +273,11 @@ impl ReclaimStore {
     /// quarantine だけの記録へ更新しようとしても、その間に別プロセスが同じ endpoint の新しい世代の請求書を
     /// 保存していれば、上書きせず `FailedPrecondition` で失敗する（NET-1。成功扱いにして追跡を外させない）。
     /// 記録が無いときは `record` を書く。読めない記録は失敗する。
+    ///
+    /// 現在の中身が既に `record` のときは、前回の更新で `rename` まで済みディレクトリの `fsync` だけが失敗した
+    /// 再試行とみなし、書き直さずにディレクトリの同期だけをやり直して成功する。呼び出し側はその失敗でメモリ上の
+    /// 請求書を元のまま保持しているため、ここで別の請求書として拒否すると、I/O 障害が解消しても回収と削除を
+    /// 拒否し続ける（REPAIR-5 の再試行可能な回収契約。NET-1・#2681）。
     pub fn update_attach_if_matches(
         &self,
         endpoint: &str,
@@ -287,6 +292,10 @@ impl ReclaimStore {
         let _lock = self.lock()?;
         match read_record(&file) {
             ReadOutcome::Record(current) if current == expected => {}
+            // 前回の更新が `rename` 後のディレクトリの同期だけで失敗した再試行。同期だけをやり直す。
+            ReadOutcome::Record(current) if current == record => {
+                return sync_dir(&self.attach_dir);
+            }
             // 記録が無い: 追跡している quarantine を持つのは自分だけなので、quarantine の記録を書き戻す。
             ReadOutcome::Missing => {}
             // 別世代の請求書に置き換わっている。成功扱いにすると呼び出し側が追跡を外し、新しい世代の資源が
@@ -731,6 +740,25 @@ mod tests {
         // 一致すれば置き換わる。
         s.update_attach_if_matches("c1", "gen-2\n", "gen-2-quarantine\n")
             .expect("matching update");
+        assert_eq!(
+            fs::read_to_string(&file).expect("read"),
+            "gen-2-quarantine\n"
+        );
+        // REPAIR-5: `rename` 後にディレクトリの同期だけが失敗した再試行では、ディスクは更新先の記録、
+        // 呼び出し側のメモリは元の請求書のまま同じ更新が再び来る。自分の更新済み記録として受理する。
+        s.update_attach_if_matches("c1", "gen-2\n", "gen-2-quarantine\n")
+            .expect("retry after a failed directory sync is accepted");
+        assert_eq!(
+            fs::read_to_string(&file).expect("read"),
+            "gen-2-quarantine\n"
+        );
+        // 別世代の更新先とは一致しないので、旧世代の更新は引き続き拒否する。
+        assert_eq!(
+            s.update_attach_if_matches("c1", "gen-1\n", "gen-1-quarantine\n")
+                .expect_err("stale update stays refused")
+                .code(),
+            ErrorCode::FailedPrecondition
+        );
         assert_eq!(
             fs::read_to_string(&file).expect("read"),
             "gen-2-quarantine\n"

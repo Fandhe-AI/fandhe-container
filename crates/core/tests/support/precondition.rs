@@ -4,7 +4,7 @@
 //! # 役割と呼び出し元
 //! `production_launcher` と rootless 系の結合試験（`rootless_launch`・`rootless`・`rootless_file_owner`・
 //! `rootless_uid_mapping`・`rootless_image_rootfs_remove`）が、委譲 cgroup・範囲写像の前提（`uidmap`・
-//! `/etc/subuid`・`/etc/subgid`・`USER`）・Landlock の前提が欠けたとき、`expect` の文言ではなく
+//! `/etc/subuid`・`/etc/subgid`）・Landlock の前提が欠けたとき、`expect` の文言ではなく
 //! `<試験名>: PRECONDITION FAILED (test environment, not a <X> regression): ...` の 1 行目で失敗させる。
 //! kcmp の前提欠如（#2788）と同じ接頭辞で、`AGENTS.md` の見分け方と一致する。
 //!
@@ -30,7 +30,7 @@ use fandhe_container_core::traits::ErrorCode;
 pub enum Kind {
     /// 委譲された cgroup v2 の部分木が無い。
     DelegatedCgroup,
-    /// 範囲写像（`uidmap`・`/etc/subuid`・`/etc/subgid`・`USER`）の前提が無い。
+    /// 範囲写像（`uidmap`・`/etc/subuid`・`/etc/subgid`）の前提が無い。
     SubordinateIds,
     /// Landlock ABI 6 以上が無い。
     Landlock,
@@ -51,7 +51,7 @@ impl Kind {
                 "run it inside a delegated cgroup v2 scope, e.g. systemd-run --user --scope -p Delegate=yes <binary> --ignored"
             }
             Self::SubordinateIds => {
-                "the helper case needs USER, setuid newuidmap/newgidmap and subuid/subgid entries for the current user (uidmap package)"
+                "the helper case needs setuid newuidmap/newgidmap and subuid/subgid entries for the current user (uidmap package)"
             }
             Self::Landlock => "Landlock ABI 6 or newer (Linux 6.12 or newer) is required",
         }
@@ -130,17 +130,15 @@ pub fn classify_subid_code(code: ErrorCode) -> bool {
     matches!(code, ErrorCode::NotFound | ErrorCode::PermissionDenied)
 }
 
-/// 範囲写像の helper ケースの前提（`USER`・`newuidmap` / `newgidmap`・subuid / subgid の自ユーザー行）を確かめる。
+/// 範囲写像の helper ケースの前提（`newuidmap` / `newgidmap`・subuid / subgid の自ユーザー行）を確かめる。
 /// 欠けていれば PRECONDITION FAILED で失敗する。失敗の文言を変えるためだけの検査で、検証を省く経路は作らない。
 #[allow(dead_code)] // 取り込み元によっては使わない
 pub fn require_subordinate_ids(euid: u32) {
     use fandhe_container_core::rootless::{HelperPaths, SubIdOwner, load_subordinate_ids};
     use std::path::Path;
 
+    // `USER` は任意。未設定でも数値 uid だけで所有者を作れ、一致する行が無ければ下で前提欠如にする。
     let name = std::env::var("USER").ok().filter(|n| !n.is_empty());
-    if name.is_none() {
-        failed(Kind::SubordinateIds, "USER is not set");
-    }
     if let Err(e) = HelperPaths::system_default() {
         if classify_subid_code(e.code) {
             failed(
@@ -205,9 +203,12 @@ pub fn self_check() {
         ))
     );
     assert_eq!(
-        first(Kind::SubordinateIds, "USER is not set"),
+        first(
+            Kind::SubordinateIds,
+            "no subuid entry exists for the current user"
+        ),
         Some(format!(
-            "{name}: PRECONDITION FAILED (test environment, not a subordinate id mapping regression): USER is not set."
+            "{name}: PRECONDITION FAILED (test environment, not a subordinate id mapping regression): no subuid entry exists for the current user."
         ))
     );
     assert_eq!(

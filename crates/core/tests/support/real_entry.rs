@@ -52,7 +52,6 @@ use fandhe_container_core::traits::TraitError;
 
 /// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・REPAIR-12）。本モジュールを取り込む試験が
 /// `real_entry::precondition` として使う（`production_launcher` の委譲 cgroup・範囲写像の検査と各 `main` の自己照合）。
-#[allow(dead_code)] // 取り込み元によって使う関数が異なる
 #[path = "precondition.rs"]
 pub mod precondition;
 

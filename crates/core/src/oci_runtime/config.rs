@@ -1385,6 +1385,16 @@ pub struct OciConfig {
 }
 
 impl OciConfig {
+    /// `root.readonly` を true にした複製を返す(狭める方向だけ。`readonly:true` を false に戻す経路は無い)。
+    ///
+    /// 呼び出し元は launcher の `Inner::launch`。起動オプションの `--read-only`(CLI-1・SUP-12・#2828)があるとき、
+    /// Landlock の root 規則・分離の記録・mount の RDONLY が同じ実効値になるよう、この複製を Landlock 側へ渡す。
+    pub(crate) fn with_root_readonly_forced(&self) -> Self {
+        let mut forced = self.clone();
+        forced.root.readonly = true;
+        forced
+    }
+
     /// 指定されているが本パーサが解釈・適用しないプロパティ（[`UnappliedField`] の宣言順・重複なし）。
     ///
     /// 空でない場合、その指定は `OciConfig` のどのアクセサにも反映されていない。create（TASK-29.2）は

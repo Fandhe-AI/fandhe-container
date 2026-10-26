@@ -107,7 +107,7 @@
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
-//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625・#2713)の tmpfs・注入ファイル・IPC・rlimit(16 種へ補完して `Rlimits` 段と状態記録へ)・env の上書きは載せる。
+//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625・#2713)の tmpfs・注入ファイル・IPC・rlimit(16 種へ補完して `Rlimits` 段と状態記録へ)・env の上書きは載せる。`--read-only`(`root_readonly`)は config の `root.readonly` と OR を 1 回だけ取り、mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(#2828)。
 //!   未指定なら既定の `/dev/shm`(64 MiB)のみ・注入なし・専用 IPC namespace。`Host` は IPC namespace を作らず `/dev/shm` を載せず、
 //!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
@@ -864,6 +864,8 @@ struct SpawnInput<'a> {
     sysctls: Option<&'a SysctlPlan<'a>>,
     /// 範囲写像で起動するときの解決済み写像(`None` なら単一 ID 写像。CORE-6・#2009)。
     subordinate: Option<&'a SubordinateIds>,
+    /// `root.readonly` の実効値（config と `--read-only` の OR。Landlock・分離の記録と同じ値。#2828）。
+    root_readonly: bool,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -1256,9 +1258,19 @@ impl Inner {
             .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
             .map(super::config::OciMount::from_user_tmpfs)
             .collect();
+        // `root.readonly` の実効値は config と `--read-only` の OR を 1 回だけ計算し、Landlock の root 規則・分離の記録・
+        // pivot 後の mount の RDONLY の 3 つへ同じ値を渡す(食い違うと mount だけ ro で Landlock が rw のままになる。
+        // 狭める方向のみ。CLI-1・SUP-12・CORE-5・SEC-1・#2828)。
+        let effective_root_readonly = spec.config().root().readonly() || options.root_readonly();
+        let landlock_config: std::borrow::Cow<'_, super::config::OciConfig> =
+            if effective_root_readonly && !spec.config().root().readonly() {
+                std::borrow::Cow::Owned(spec.config().with_root_readonly_forced())
+            } else {
+                std::borrow::Cow::Borrowed(spec.config())
+            };
         let ruleset = self
             .ops
-            .landlock_ruleset(spec.config(), &user_tmpfs, options.implicit_dev_mounts())
+            .landlock_ruleset(&landlock_config, &user_tmpfs, options.implicit_dev_mounts())
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -1285,7 +1297,9 @@ impl Inner {
             .config()
             .capabilities()
             .without(options.capability_drop());
-        let isolation_record = isolation_record.with_capabilities(capabilities);
+        let isolation_record = isolation_record
+            .with_capabilities(capabilities)
+            .with_root_readonly(effective_root_readonly);
         let (uid, gid) = spec.user();
         // 補助グループの正規化(確保・整列・重複除去)は fork の前に済ませる(#2770)。
         let additional_gids =
@@ -1377,6 +1391,7 @@ impl Inner {
                 sysfs: spec.sysfs_mount(),
                 sysctls: sysctls.as_ref(),
                 subordinate: self.subordinate.as_ref(),
+                root_readonly: effective_root_readonly,
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -1917,8 +1932,9 @@ impl LaunchOps for RealOps {
             },
             status: None,
             working_dir: Some(input.spec.working_dir()),
-            // config の `root.readonly` そのもの（外す・緩める入口ではない。#2767）。
-            root_readonly: input.spec.config().root().readonly(),
+            // config の `root.readonly` と `--read-only` の OR（launcher が 1 回だけ計算した実効値。外す・緩める入口ではない。
+            // #2767・#2828）。
+            root_readonly: input.root_readonly,
         };
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {
@@ -2603,7 +2619,8 @@ mod tests {
             .with_id_mapping(
                 recorded_id_mapping(rootless(), None, FAKE_EUID, FAKE_EGID).expect("id mapping"),
             )
-            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default());
+            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default())
+            .with_root_readonly(false);
         assert!(
             record == expected,
             "record must come from the applied ruleset"
@@ -4012,6 +4029,50 @@ mod tests {
         assert!(!caps.bounding().contains(Capability::NetRaw));
         assert!(caps.bounding().contains(Capability::Kill));
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CLI-1・SUP-12・CORE-5・SEC-1(#2828): `--read-only` は config の `root.readonly` と OR で効き、Landlock の root 規則
+    /// (書き込みビットなし)と分離の記録の実効値へ同じ値が載る。option が無ければ config に従い、config が true なら
+    /// option が無くても true のまま(緩める経路は無い)。
+    #[test]
+    fn cli1_core5_read_only_option_makes_recorded_root_rule_read_only() {
+        use crate::launch_isolation::RecordedTarget;
+        // (config の readonly, option, 期待する実効値)
+        for (cfg_ro, opt, want) in [
+            (false, true, true),
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let spec = spec_with_root_readonly(
+                "opts-read-only",
+                cfg_ro,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options =
+                Some(options_with(&[], true, &[], LaunchIpcMode::Private).with_root_readonly(opt));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            let record = p.launch_isolation().expect("record");
+            assert_eq!(record.root_readonly(), Some(want));
+            let root = record
+                .landlock()
+                .rules()
+                .iter()
+                .find(|r| matches!(r.target(), RecordedTarget::Root))
+                .expect("root rule");
+            let write = crate::landlock::AccessFs::WRITE.bits();
+            if want {
+                assert_eq!(root.allowed(), 0x000D);
+            } else {
+                assert_eq!(root.allowed() & write, write);
+            }
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
     }
 
     /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に

@@ -4,7 +4,7 @@
 //! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
 //! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）・
 //! `StopContainer`・`RemoveContainer`（TASK-58.2・#434）・`ListContainers`・`ContainerStatus`
-//! （TASK-58.3・#435）と `Status`（#2830。待ちのない準備状態の報告。`docs/design/cri-status-rpc.md`）で、他の RPC は `Unimplemented` を返す。
+//! （TASK-58.3・#435）と `Status`（#2830。待ちのない準備状態の報告。`docs/design/cri-status-rpc.md`）・`Version`・`UpdateRuntimeConfig`（#2896。同 doc）で、他の RPC は `Unimplemented` を返す。
 //!
 //! **Create/Start の扱い（CRI-1・ERR-3・TASK-58.1）**: cri-api の `CreateContainerRequest` にクライアント指定の
 //! ID はなく、ID はサービスが採番する。proto は `(metadata.name, metadata.attempt)` を sandbox 内で一意と
@@ -98,6 +98,7 @@
 
 mod config_limits;
 mod container;
+mod runtime_config;
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -130,6 +131,9 @@ use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
     initial_stop_signal, validate_create_request,
 };
+use runtime_config::parse_pod_cidrs;
+
+pub use runtime_config::{MAX_POD_CIDR_BYTES, MAX_POD_CIDRS, PodCidr, PodCidrs};
 
 pub use container::{ContainerLimits, MAX_CONTAINERS, MAX_RETAINED_CONTAINER_CONFIG_BYTES};
 
@@ -290,6 +294,34 @@ pub struct CriRuntimeService {
     runtime_timeout: Duration,
     /// pod の netns を作って結線する注入点（#2675・CRI-2・NET-1）。`None` のときは従来どおり何も呼ばない。
     pod_network: Option<Arc<dyn PodNetworkProvider>>,
+    /// `UpdateRuntimeConfig` で最後に受け入れた pod CIDR（#2896）。レジストリとは別のロックで、保持は一瞬。
+    /// 読む利用者はまだ無い（REPAIR-3。結線は後続）。
+    pod_cidrs: Mutex<Option<PodCidrs>>,
+}
+
+/// kubelet の `kubeRuntimeAPIVersion`。`Version` の応答の `version` はこれと完全一致が必須
+/// （違うと kubelet の runtime manager が作れず起動に失敗する。kubernetes v1.37.1
+/// `pkg/kubelet/kuberuntime/kuberuntime_manager.go` 82・307〜311 行。CRI-1・#2896）。
+pub const CRI_KUBE_API_VERSION: &str = "0.1.0";
+
+/// `Version` の `runtime_name`（node の `ContainerRuntimeVersion` が `fandhe-container://<版>` になる）。
+pub const RUNTIME_NAME: &str = "fandhe-container";
+
+/// `Version` の `runtime_version`。`fandhe-container-cri` の crate 版（現状 `0.0.0`。版数方針の決定に自動で追随する）。
+pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `Version` の `runtime_api_version`。containerd v2.1.4 `internal/cri/constants` の `CRIVersion` と同値
+/// （proto のコメントは semver 互換だが、kubelet は `ParseGeneric` で解釈する）。
+pub const RUNTIME_API_VERSION: &str = "v1";
+
+/// `Version` の応答（定数のみ。要求は読まない。CRI-1・#2896）。
+pub fn version_response() -> v1::VersionResponse {
+    v1::VersionResponse {
+        version: CRI_KUBE_API_VERSION.to_string(),
+        runtime_name: RUNTIME_NAME.to_string(),
+        runtime_version: RUNTIME_VERSION.to_string(),
+        runtime_api_version: RUNTIME_API_VERSION.to_string(),
+    }
 }
 
 /// 実行層への接続（アダプタと bundle の供給元。CRI-2・CRI-7）。
@@ -1072,7 +1104,15 @@ impl CriRuntimeService {
             runtime: None,
             runtime_timeout: DEFAULT_RUNTIME_TIMEOUT,
             pod_network: None,
+            pod_cidrs: Mutex::new(None),
         }
+    }
+
+    /// `UpdateRuntimeConfig` で最後に受け入れた pod CIDR（未受信・空のみなら `None`）。
+    ///
+    /// 未実装（REPAIR-3）: 読む利用者はまだ無く、`PodSubnetPool` への結線は pod network の本番注入と一緒に後続で行う。
+    pub fn pod_cidrs(&self) -> Option<PodCidrs> {
+        self.pod_cidrs.lock().ok().and_then(|g| g.clone())
     }
 
     /// `RunPodSandbox`（`namespace_options.network` が `POD`）で pod の netns を `NetworkPlugin` 経由で
@@ -2725,7 +2765,11 @@ impl RuntimeService for CriRuntimeService {
         &self,
         _request: Request<v1::VersionRequest>,
     ) -> Result<Response<v1::VersionResponse>, Status> {
-        Err(CriError::unimplemented("version").into())
+        // 要求の `version` は読まない（containerd と同じ。値を反射せず、拒否もしない）。待ちは持たない。
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::Version);
+        let result: Result<v1::VersionResponse, Status> = Ok(version_response());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     /// サンドボックスを notready にする（冪等。未知 ID は `NOT_FOUND`。CRI-1・ERR-3・TASK-57.2）。
     async fn stop_pod_sandbox(
@@ -2956,11 +3000,36 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<Self::StreamPodSandboxStatsStream>, Status> {
         Err(CriError::unimplemented("stream_pod_sandbox_stats").into())
     }
+    /// kubelet が渡す pod CIDR を検証して記録する（CRI-1・CRI-2・#2896）。
+    ///
+    /// 未指定・空は何もせず `OK`。不正は `INVALID_ARGUMENT` で、記録は直前のまま（all-or-nothing）。
+    /// 記録を読む利用者はまだ無い（REPAIR-3）。待ち・I/O・実行層の呼び出しは無い。
     async fn update_runtime_config(
         &self,
-        _request: Request<v1::UpdateRuntimeConfigRequest>,
+        request: Request<v1::UpdateRuntimeConfigRequest>,
     ) -> Result<Response<v1::UpdateRuntimeConfigResponse>, Status> {
-        Err(CriError::unimplemented("update_runtime_config").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::UpdateRuntimeConfig);
+        let req = request.into_inner();
+        let raw = req
+            .runtime_config
+            .and_then(|c| c.network_config)
+            .map(|n| n.pod_cidr)
+            .unwrap_or_default();
+        let result = parse_pod_cidrs(&raw)
+            .and_then(|parsed| match parsed {
+                None => Ok(()),
+                Some(cidrs) => match self.pod_cidrs.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(cidrs);
+                        Ok(())
+                    }
+                    Err(_) => Err(CriError::internal("runtime config state is unavailable")),
+                },
+            })
+            .map(|()| v1::UpdateRuntimeConfigResponse {})
+            .map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn status(
         &self,

@@ -324,7 +324,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 既知の差:
 
 - **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）だけを受け、`network` の path は `UNIMPLEMENTED` で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項で、保持役の userns が所有する netns への join は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838。実装は #2872）。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
-- **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決
+- **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決（kubelet の `UpdateRuntimeConfig` の pod CIDR は検証して `CriRuntimeService::pod_cidrs` に記録するようになったが、読む利用者は無く、`PodSubnetPool` への結線は順 13 の本番注入と一緒に後続で行う。#2896・`docs/design/cri-status-rpc.md`）
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる

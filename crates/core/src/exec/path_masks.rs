@@ -401,7 +401,7 @@ const SUBTREE_RW: &str = "a mount under the target has no ro option";
 
 /// `top_mnt_id` のマウントとそのマウントポイント以下の全マウントに `ro` があるかの判定（純関数。fail-closed）。
 ///
-/// 書式に反する行・top の不在・mount ID の重複は拒否する。前方一致だけの兄弟（`/sysx`）は数えない。
+/// 書式に反する行・top の不在・mount ID の重複は拒否する。配下は parent ID で辿るため、前方一致だけの兄弟（`/sysx`）や隠れた行は数えない（#2823・SEC-1・CORE-2）。
 /// 返す文字列は固定の英文で mountinfo の値を含めない。
 fn check_subtree_read_only(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
     let mut entries = Vec::new();
@@ -411,16 +411,10 @@ fn check_subtree_read_only(info: &str, top_mnt_id: u64) -> Result<(), &'static s
                 .ok_or("malformed line in /proc/thread-self/mountinfo")?,
         );
     }
-    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
-    let top = tops.next().ok_or("no mount entry found for the mount")?;
-    if tops.next().is_some() {
-        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
-    }
-    let prefix = format!("{}/", top.mount_point.trim_end_matches('/'));
-    for e in &entries {
-        if (e.mount_point == top.mount_point || e.mount_point.starts_with(&prefix))
-            && !e.options.split(',').any(|o| o == "ro")
-        {
+    let members =
+        super::sysfs::subtree_entries(&entries, top_mnt_id, "no mount entry found for the mount")?;
+    for e in members {
+        if !e.options.split(',').any(|o| o == "ro") {
             return Err(SUBTREE_RW);
         }
     }
@@ -801,15 +795,24 @@ mod tests {
 
     /// mountinfo の 1 行（id parent dev root mp opts - fstype src super）。
     fn mi(id: u64, mp: &str, opts: &str) -> String {
-        format!("{id} 1 0:1 / {mp} {opts} - sysfs sysfs rw\n")
+        mip(id, 1, mp, opts)
+    }
+
+    /// 親 mount ID を指定できる `mi`。
+    fn mip(id: u64, parent: u64, mp: &str, opts: &str) -> String {
+        format!("{id} {parent} 0:1 / {mp} {opts} - sysfs sysfs rw\n")
     }
 
     /// SEC-2・#2233: top だけ ro で子が rw の部分木は拒否し、全部 ro なら通す。
     #[test]
     fn sec2_subtree_read_only_check() {
-        let all_ro = [mi(10, "/sys", "ro,nosuid"), mi(11, "/sys/fs/cgroup", "ro")].concat();
+        let all_ro = [
+            mi(10, "/sys", "ro,nosuid"),
+            mip(11, 10, "/sys/fs/cgroup", "ro"),
+        ]
+        .concat();
         assert_eq!(check_subtree_read_only(&all_ro, 10), Ok(()));
-        let child_rw = [mi(10, "/sys", "ro"), mi(11, "/sys/x", "rw,nosuid")].concat();
+        let child_rw = [mi(10, "/sys", "ro"), mip(11, 10, "/sys/x", "rw,nosuid")].concat();
         assert_eq!(check_subtree_read_only(&child_rw, 10), Err(SUBTREE_RW));
         // 前方一致だけの兄弟 /sysx は部分木に数えない。
         let sibling = [mi(10, "/sys", "ro"), mi(11, "/sysx", "rw")].concat();
@@ -827,5 +830,25 @@ mod tests {
             check_subtree_read_only("garbage\n", 10),
             Err("malformed line in /proc/thread-self/mountinfo")
         );
+    }
+
+    /// SEC-1・CORE-2（#2823）: 隠れた下側の行・別の木の同接頭辞の行は数えず、子孫の rw は拒否する。
+    #[test]
+    fn sec2_2823_subtree_read_only_follows_parent_ids() {
+        let hidden = [
+            mip(5, 1, "/sys", "rw"),
+            mip(10, 5, "/sys", "ro"),
+            mip(11, 10, "/sys/a", "ro"),
+            mip(20, 2, "/sys/other", "rw"),
+        ]
+        .concat();
+        assert_eq!(check_subtree_read_only(&hidden, 10), Ok(()));
+        let grand = [
+            mip(10, 1, "/sys", "ro"),
+            mip(11, 10, "/sys/a", "ro"),
+            mip(12, 11, "/sys/a/b", "rw"),
+        ]
+        .concat();
+        assert_eq!(check_subtree_read_only(&grand, 10), Err(SUBTREE_RW));
     }
 }

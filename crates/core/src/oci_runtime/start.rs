@@ -1110,7 +1110,7 @@ fn validate_bind_mounts(
     };
     // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
     let children = mounts_under(&mounts, &state_real);
-    let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    let mut roots = build_protected_roots(&state_id, &state_real, &children, &child_is_visible);
     // 状態ルートの実体（dev, ino）の鎖を fd で固定する。適用の段（restart を含む毎回）が、mountinfo の文字列に依らず
     // 元との同一・祖先・子孫を inode で照合する（SEC-1・SEC-4・#2066）。固定できなければ fail-closed（パスは載せない）。
     let Some(chain) = dir_identity_chain(&state_real) else {
@@ -1175,10 +1175,10 @@ fn source_reaches_protected(
     src_real: &str,
     recursive: bool,
     state_id: &FsIdentity,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
 ) -> bool {
     std::iter::once(state_id)
-        .chain(children.iter().map(|(id, _)| id))
+        .chain(children.iter().map(|(id, _, _)| id))
         .any(|protected| {
             source_reaches(mounts, src_mnt_id, src_real, recursive, protected).unwrap_or(true)
         })
@@ -1189,37 +1189,62 @@ fn source_reaches_protected(
 /// 状態ファイルのハードリンクは、適用の段が毎回走査し直す。走査は保護対象ごとに自分のマウントの木に限り、別の FS の
 /// マウントポイントへは降りない（他の FS 上のリンクのせいで無関係な FS 上のディレクトリ元を誤って拒否しない）。
 /// 子マウントは自分のマウントポイントを走査根にする。同じマウントポイントに複数のマウントが重なるなど、走査で
-/// 実体を確定できないものは「リンクあり」に固定する（fail-closed）。
+/// 実体を確定できないもの（祖先の overmount で隠れた子を含む。#2823）は「リンクあり」に固定する（fail-closed）。
 fn build_protected_roots(
     state_id: &FsIdentity,
     state_real: &str,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
+    is_visible: &dyn Fn(&str, u64) -> bool,
 ) -> Vec<ProtectedFsRoot> {
+    // 見えているか（point を `/` から辿った先の mount ID が子の ID と一致するか）。祖先の overmount で隠れた子は
+    // 見えていない。見えていない子の中身を point のパスで歩くと覆っている別のマウントの中身を取り違えるため、
+    // 走査せず「リンクあり」に固定し、他の走査の枝刈りからも外す（走査範囲が広がる向きだけに倒す）。
+    let visible: Vec<bool> = children
+        .iter()
+        .map(|(_, point, id)| is_visible(point, *id))
+        .collect();
     let prune_for = |dev: &str, scan_root: &str| -> Vec<String> {
         children
             .iter()
-            .filter(|(id, point)| {
-                id.dev != dev
+            .zip(&visible)
+            .filter(|((id, point, _), vis)| {
+                **vis
+                    && id.dev != dev
                     && point != scan_root
                     && Path::new(point).starts_with(Path::new(scan_root))
             })
-            .map(|(_, point)| point.clone())
+            .map(|((_, point, _), _)| point.clone())
             .collect()
     };
     let mut roots = vec![
         ProtectedFsRoot::new(state_id.dev.clone(), state_id.path.clone(), true)
             .with_scan_root(state_real.to_owned(), prune_for(&state_id.dev, state_real)),
     ];
-    for (id, point) in children {
-        let shared = children.iter().filter(|(_, p)| p == point).count() > 1;
+    for ((id, point, _), vis) in children.iter().zip(&visible) {
+        let shared = children.iter().filter(|(_, p, _)| p == point).count() > 1;
         let root = ProtectedFsRoot::new(id.dev.clone(), id.path.clone(), true);
-        roots.push(if shared {
+        roots.push(if shared || !vis {
             root
         } else {
             root.with_scan_root(point.clone(), prune_for(&id.dev, point))
         });
     }
     roots
+}
+
+/// 状態ルート配下の子マウントが、いま見えている（point を `/` から辿った先の mount ID が一致する）か（#2823・SEC-1・CORE-2）。
+///
+/// 辿れない（symlink・ディレクトリでない・深すぎる）ときも見えていないものとして扱い、呼び出し側が fail-closed にする。
+/// start と同じ mount namespace・同じスレッドで呼ぶこと（mount ID は namespace ごとに振られる）。
+#[cfg(target_os = "linux")]
+fn child_is_visible(point: &str, id: u64) -> bool {
+    super::mountinfo_identity::dir_identity_chain_with_mnt_id(point).is_some_and(|(_, m)| m == id)
+}
+
+/// Linux 以外では fd の mount ID を取れないため、見えていないものとして扱う（bind mount は Linux 限定。fail-closed）。
+#[cfg(not(target_os = "linux"))]
+fn child_is_visible(_point: &str, _id: u64) -> bool {
+    false
 }
 
 /// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
@@ -3968,8 +3993,9 @@ mod tests {
                 path: "/c1".to_owned(),
             },
             sub_s.clone(),
+            30,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &children);
+        let roots = build_protected_roots(&state_id, &state_s, &children, &|_, _| true);
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].dev(), "8:1");
         assert!(
@@ -3985,8 +4011,9 @@ mod tests {
                 path: "/srv/state/sub".to_owned(),
             },
             sub_s,
+            31,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &same);
+        let roots = build_protected_roots(&state_id, &state_s, &same, &|_, _| true);
         assert!(roots[0].has_hard_linked_files());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4012,12 +4039,60 @@ mod tests {
                     path: "/".to_owned(),
                 },
                 sub_s.clone(),
+                40,
             )
         };
-        let roots = build_protected_roots(&state_id, &state_s, &[child("8:2"), child("8:3")]);
+        let roots = build_protected_roots(
+            &state_id,
+            &state_s,
+            &[child("8:2"), child("8:3")],
+            &|_, _| true,
+        );
         assert!(roots[1].has_hard_linked_files());
         assert!(roots[2].has_hard_linked_files());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子は走査せず「リンクあり」に固定し、他の走査の枝刈りから外す。
+    /// 状態ルート `/state`(dev A・ID 20)、X(dev C・ID 30・`/state/x/y`・隠れている)、Y(dev A・ID 35・`/state/x`)。
+    #[test]
+    fn sec1_2823_hidden_child_is_fixed_to_linked_and_not_pruned() {
+        let id = |dev: &str| FsIdentity {
+            dev: dev.to_owned(),
+            path: "/".to_owned(),
+        };
+        let state_id = id("A");
+        let children = vec![
+            (id("C"), "/state/x/y".to_owned(), 30),
+            (id("A"), "/state/x".to_owned(), 35),
+        ];
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, mnt| mnt != 30);
+        assert_eq!(roots.len(), 3);
+        // 隠れた X の point は状態ルートの枝刈りに入らない（Y の中の `/y` 配下も走査する）。
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec![])
+        );
+        // X は走査根を持たず固定で「リンクあり」。
+        assert_eq!(
+            roots[1],
+            ProtectedFsRoot::new("C".to_owned(), "/".to_owned(), true)
+        );
+        assert!(roots[1].has_hard_linked_files());
+        // Y は自分の point を走査根にする。
+        assert_eq!(
+            roots[2],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state/x".to_owned(), vec![])
+        );
+        // 対照: すべて見えているなら、別 FS の X の point は Y(同 dev)の枝刈りに入らず、状態ルート（同 dev A）の枝刈りには入る。
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, _| true);
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec!["/state/x/y".to_owned()])
+        );
     }
 
     /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。

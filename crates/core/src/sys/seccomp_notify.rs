@@ -19,13 +19,23 @@
 //! - `SO_PASSCRED` が受信側にあると、送信側が `SCM_CREDENTIALS` を付けなくても、カーネルが送信側の
 //!   資格情報（pid は受信側の PID namespace へ変換される）を付ける
 //!
-//! # 受信の fd 数の制限（SEC-4・REPAIR-5・#2372。Linux v6.12 `net/core/scm.c`・`net/unix/af_unix.c`）
+//! # 受信の fd 数の制限（SEC-4・REPAIR-5・#2372・#2498。Linux v6.12 `include/net/scm.h`・`net/core/scm.c`・`net/unix/af_unix.c`）
 //!
-//! - `SO_PASSCRED` の受信では `SCM_CREDENTIALS` が先、`SCM_RIGHTS` が後に制御バッファへ書かれる。`SCM_RIGHTS` は
-//!   残り容量から入る fd 本数を決め、入らない fd は受信側に割り当てずに解放して `MSG_CTRUNC` を立てる
+//! 版はタグ v6.12（commit `adc218676eef25575469234709c2d87185ca223a`）、行は 2026-10-26 に原文で確認したもの。
+//!
+//! - `SO_PASSCRED` の受信では `SCM_CREDENTIALS` が先、`SCM_RIGHTS` が後に制御バッファへ書かれる
+//!   （`scm.h` の `__scm_recv_common` L172–200: `put_cmsg` → `scm_passec` → `scm_detach_fds`）。
+//!   送信元の pid は送信時に `scm_set_cred`（`scm.h` L69–74）が `pid_vnr` で変換して持ち、uid / gid は受信時に
+//!   `from_kuid_munged` / `from_kgid_munged` で受信側の user namespace へ写される
+//! - `scm_detach_fds`（`scm.c` L320–370）は `fdmax = min(scm_max_fds, fd 数)`（`scm_max_fds` は L313 で
+//!   `(msg_controllen - sizeof(cmsghdr)) / sizeof(int)`）本だけ受信側に割り当て、入らない fd は割り当てずに解放して
+//!   `MSG_CTRUNC` を立てる（L361–362）
 //! - `SO_PASSSEC`・`SO_PASSPIDFD` は設定しないため他の cmsg は付かない。制御バッファ（`CONTROL_CAP`）は
 //!   `MAX_RECV_FDS` 本＋資格情報ちょうどの容量にし、超過は実際に `MSG_CTRUNC` になる（試験で固定する）
-//! - 受信は `MSG_DONTWAIT`（`SOCK_SEQPACKET` の待機中メッセージ無しは `EAGAIN`）。poll を省いても無期限に待たない
+//! - 受信は `MSG_DONTWAIT`。`unix_seqpacket_recvmsg` は `__unix_dgram_recvmsg`（`af_unix.c` L2414）へ進み、
+//!   `sock_rcvtimeo(sk, flags & MSG_DONTWAIT)` が待ち時間 0（L2429）になって、待機中メッセージ無しは `EAGAIN` のまま
+//!   戻る。poll を省いても無期限に待たない。`SOCK_SEQPACKET` で `EAGAIN` かつ `RCV_SHUTDOWN`（相手が閉じた）の
+//!   ときだけ `err = 0`（EOF。受信長 0）になる（L2453–2457）。`ReceiveFailure::SenderClosed` の根拠
 //!
 //! `SO_PEERCRED` は socketpair では作成者（呼び出し元自身）を両端で返し検証の意味が無いため使わない。
 

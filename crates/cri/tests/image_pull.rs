@@ -1621,3 +1621,91 @@ async fn err3_pull_image_maps_extraction_failures() {
         assert!(store.list().expect("list").is_empty());
     }
 }
+/// 公開済みエントリを作って返す（以後の pull は記録の照合に入る）。
+fn pulled_entry(tag: &str) -> (TempDir, Arc<OciImagePuller<Arc<FakeClient>>>) {
+    let dir = TempDir::new(tag);
+    let puller = Arc::new(OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    ));
+    puller.pull(&req("alpine:3.20")).expect("first pull");
+    (dir, puller)
+}
+
+/// OCI-1・SEC-5・REPAIR-5・#2534: 展開記録の位置が FIFO に差し替わっていても、pull は open で止まらず期限内に拒否する
+/// （種別の確認と同じハンドルを非ブロッキングで開く）。既存の展開物は消さない。
+#[test]
+fn oci1_repair5_pull_rejects_fifo_unpack_record_without_hanging() {
+    let (dir, puller) = pulled_entry("fifo-record");
+    let record = entry_path(&dir, SHA_CONFIG).join("unpack-record");
+    fs::remove_file(&record).expect("rm record");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&record)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(puller.pull(&req("alpine:3.20")));
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("pull must not hang on a FIFO record");
+    let err = result.expect_err("fifo record");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "image rootfs cache entry has no unpack record"
+    );
+    worker.join().expect("join");
+    assert!(rootfs_path(&dir, SHA_CONFIG).is_dir());
+}
+
+/// OCI-1・SEC-5・#2534: 上限を超えた記録は黙って切り詰めず `ResourceExhausted` で拒否し、既存の展開物を消さない
+/// （切り詰めると別 layer 扱いに化けて再展開になる）。
+#[test]
+fn oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (dir, puller) = pulled_entry("big-record");
+    let record = entry_path(&dir, SHA_CONFIG).join("unpack-record");
+    let mut body = fs::read(&record).expect("read record");
+    body.resize(64 * 1024 + 1, b'x');
+    fs::write(&record, &body).expect("rewrite");
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
+    fs::write(&marker, b"m").expect("marker");
+    let err = puller
+        .pull(&req("alpine:3.20"))
+        .expect_err("oversized record");
+    assert_eq!(err.code(), OciErrorCode::ResourceExhausted);
+    assert_eq!(
+        err.message(),
+        "image rootfs unpack record exceeds the size limit"
+    );
+    assert_eq!(fs::read(&marker).expect("kept"), b"m");
+}
+
+/// OCI-1・REPAIR-5・#2534: 展開中に期限を過ぎたら、展開の直後の確認で `Timeout` にし、公開も記録の書き込みもしない
+/// （展開中の打ち切りは行わず、上限で有界にして前後で確認する方針）。
+#[test]
+fn oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published() {
+    use fandhe_container_oci::instrument::{OciOpKind, OciOpRecorder, OciOpSample};
+    #[derive(Debug)]
+    struct SlowExtract;
+    impl OciOpRecorder for SlowExtract {
+        fn record_oci_op(&self, sample: &OciOpSample) {
+            if sample.kind() == OciOpKind::ExtractLayer {
+                std::thread::sleep(Duration::from_millis(1300));
+            }
+        }
+    }
+    let dir = TempDir::new("deadline-extract");
+    let mut cfg = config(&dir);
+    cfg.pull_deadline = Duration::from_secs(1);
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(two_layer_manifest())), cfg)
+        .with_recorder(Arc::new(SlowExtract));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert!(!rootfs_exists(&dir, SHA_CONFIG));
+    assert!(staging_is_empty(&dir));
+}

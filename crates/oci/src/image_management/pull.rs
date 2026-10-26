@@ -2168,6 +2168,119 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    /// 試験用: ステージングの blob の名前側のパス（`staged_blob_path` の API に依らず組み立てる）。
+    #[cfg(unix)]
+    fn staged_path_of(s: &PullSession<'_>, dg: &Digest) -> PathBuf {
+        s.staging_dir().join(hex_of(dg).unwrap())
+    }
+
+    /// 試験用: 名前側（symlink を辿らない）のモードの下位 12 bit。
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// verify の直後に、公開前のステージングの blob そのものが 0600 へ狭まっている（OCI-7・SEC-1・OCI-1・
+    /// REPAIR-12。#2820・#2800）。`secure_staged_blob` は `cfg(unix)` で、非 Unix の `verify_staged_blob` は
+    /// digest を検証するだけで権限を変えない（std ではモードビットと所有者を扱えない）ため、本試験は unix 限定。
+    /// umask はプロセス全体の状態で並列試験を巻き込むので変えず、`set_permissions` で先に緩めたファイルを使う。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_verify_narrows_staged_blob_mode_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("sec1-narrow");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        for before in [0o666u32, 0o644, 0o777, 0o4755, 0o400, 0o600] {
+            let data = format!("staged-{before:o}").into_bytes();
+            let dg = sha_of(&data);
+            let path = staged_path_of(&s, &dg);
+            fs::write(&path, &data).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(before)).unwrap();
+            assert_eq!(mode_of(&path), before, "precondition for {before:o}");
+            let v = s.verify_staged_blob(&dg, 1 << 20).unwrap();
+            assert_eq!(v.size, data.len() as u64);
+            assert_eq!(mode_of(&path), 0o600, "mode after verify from {before:o}");
+        }
+    }
+
+    /// `secure_staged_blob` を直接呼ぶと、返ったハンドルも名前側も 0600 で、同一の実体（dev / inode）を指す
+    /// （OCI-7・SEC-1・OCI-1・REPAIR-12。#2820）。unix 限定の理由は上の試験と同じ。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_secure_staged_blob_returns_handle_restricted_to_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = Root::new("sec1-secure");
+        let store = ImageStore::open(&root.0).unwrap();
+        let s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"secure-body");
+        let path = staged_path_of(&s, &dg);
+        fs::write(&path, b"secure-body").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let file = s.secure_staged_blob(hex_of(&dg).unwrap()).unwrap();
+        let hm = file.metadata().unwrap();
+        assert_eq!(hm.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(mode_of(&path), 0o600);
+        let nm = fs::symlink_metadata(&path).unwrap();
+        assert_eq!((nm.dev(), nm.ino()), (hm.dev(), hm.ino()));
+    }
+
+    /// 通常ファイルでないもの・symlink は、権限を変える前に拒否する（OCI-7・SEC-1・OCI-1・REPAIR-12。#2820）。
+    /// 所有者違反は root / CAP_CHOWN が無いと FS 上に作れないため、`layer.rs` の
+    /// `oci1_sec_blob_trust_rejects_untrusted_metadata`（`UnexpectedOwner`）で照合済み（同じ `blob_trust_violation`
+    /// を使う）。ハードリンクは `oci1_verify_does_not_chmod_hard_linked_blob` で照合済み。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_staged_blob_rejects_non_regular_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("sec1-nonreg");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+
+        // ディレクトリ: verify は stat で拒否し、モードは 0777 のまま。
+        let dg_dir = sha_of(b"as-dir");
+        let dir = staged_path_of(&s, &dg_dir);
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let e = s.verify_staged_blob(&dg_dir, 1 << 20).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "staged blob is not a regular file");
+        assert_eq!(mode_of(&dir), 0o777);
+
+        // symlink: secure_staged_blob 直接でも拒否し、リンク先（ストア外）の権限と中身を変えない。
+        let outside = root.0.join("outside");
+        fs::write(&outside, b"outside-body").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o666)).unwrap();
+        let dg_link = sha_of(b"as-symlink");
+        let link = staged_path_of(&s, &dg_link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let e = s.secure_staged_blob(hex_of(&dg_link).unwrap()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "staged blob is not a regular file");
+        assert_eq!(mode_of(&outside), 0o666);
+        assert_eq!(fs::read(&outside).unwrap(), b"outside-body");
+
+        // ディレクトリを直接渡す: 文言は実装（open が成功するか）で 2 通りになるため両方を列挙する。
+        let e = s.secure_staged_blob(hex_of(&dg_dir).unwrap()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(
+            matches!(
+                e.message(),
+                "blob is not a regular file" | "staged blob is not a regular file"
+            ),
+            "unexpected message: {}",
+            e.message()
+        );
+        assert_eq!(mode_of(&dir), 0o777);
+
+        // 名前が無ければ NotFound。
+        let missing = sha_of(b"missing");
+        let e = s.secure_staged_blob(hex_of(&missing).unwrap()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::NotFound);
+        assert_eq!(e.message(), "staged blob not found");
+    }
+
     /// 検証後に group 書き込み権限が付いたら公開を拒否する。
     #[cfg(unix)]
     #[test]

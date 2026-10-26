@@ -45,9 +45,12 @@
 //!   [`ImageDefaults::resolved_run_as_username`] へ返す（#2664・CRI-2・SEC-5）。見つからない・passwd が無い場合は
 //!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
 //!   数字だけの名前は拒否する（数値は `run_as_user`。containerd は uid 扱いの既知の差）
-//! - **展開設定**: 所有者・特殊ビットの本番の値（`ChownMapped` 等）の決定は #2534 の担当。既定は pull と同じ
-//!   `Keep` + `Strip`。pull と create の設定は [`ImageExtractConfig`] で 1 か所にまとめる
-//! - 展開中の処理は打ち切れない。期限は展開の前後で確認する（REPAIR-5。pull と同じ制約）
+//! - **展開設定**: 所有者・特殊ビットの本番の値は現状も既定の `Keep` + `Strip`。`ChownMapped` 等の配線は #2241
+//!   （rootful の可否）・#2315・#482（core の user namespace 配線）・#2592（pull の呼び出し元）が前提で、
+//!   それまで据え置く（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
+//!   [`ImageExtractConfig`] で 1 か所にまとめる
+//! - 展開中の処理は打ち切れない。期限は展開の前後で確認し、展開中の所要時間は展開の上限で有界にする
+//!   （REPAIR-5。pull と同じ方針。#2534）
 //! - 展開済み rootfs・blob の GC は TASK-183（OCI-7）の担当
 
 use std::io::Read as _;
@@ -64,7 +67,9 @@ use fandhe_container_oci::layer::extract::{
     ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_with_options,
     remove_extracted_tree,
 };
-use fandhe_container_oci::layer::{VerifiedLayerBlob, open_blob_nofollow, read_rootfs_file};
+use fandhe_container_oci::layer::{
+    BlobFileFacts, VerifiedLayerBlob, check_blob_trust, open_blob_nofollow, read_rootfs_file,
+};
 use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
 
@@ -72,9 +77,9 @@ use super::provider::{RootfsSource, UserResolveRequest};
 use super::spec::ImageDefaults;
 use crate::error::CriError;
 use crate::image_pull::{
-    DEFAULT_MAX_IMAGE_BYTES, MAX_RECORD_BYTES, PullConfig, PullError, RECORD_FILE, blob_file_facts,
-    check_blob_trust, create_private_dir, digest_hex, expected_root_owner_for,
-    inspect_published_rootfs, prepare_private_dir, record_settings,
+    DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, create_private_dir, digest_hex,
+    expected_root_owner_for, inspect_published_rootfs, prepare_private_dir,
+    read_unpack_record_body, record_settings,
 };
 use crate::image_service::{ImageStore, MAX_IMAGE_FIELD_BYTES};
 use crate::runtime::v1::ImageSpec;
@@ -93,7 +98,7 @@ const MAX_ETC_LINES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 256;
 
 /// 展開に使う設定の束。`PullConfig` の対応する項目と同じ値を渡せる（pull と create で展開設定が食い違うと、
-/// 記録の照合で `FAILED_PRECONDITION` になるため、1 か所から配る。#2534 が両方を配線する）。
+/// 記録の照合で `FAILED_PRECONDITION` になるため、1 か所から配る。本番の値の配線の前提は #2534 の記述を参照）。
 #[derive(Debug, Clone)]
 pub struct ImageExtractConfig {
     /// キャッシュのルート（`PullConfig::cache_dir` と同じ。`blobs/sha256` と `rootfs/sha256` を持つ）。
@@ -258,27 +263,7 @@ fn read_layers(
     expected_settings: &str,
     owner: u32,
 ) -> Result<Vec<RecordedLayer>, CriError> {
-    let mut file = open_blob_nofollow(path)
-        .map_err(|_| untrusted("image rootfs cache entry has no unpack record"))?;
-    let facts = blob_file_facts(&file)
-        .ok_or_else(|| untrusted("image rootfs unpack record is not trusted"))?;
-    check_blob_trust(&facts, owner)
-        .map_err(|_| untrusted("image rootfs unpack record is not trusted"))?;
-    let mut body = Vec::new();
-    (&mut file)
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| {
-            CriError::new(
-                crate::error::CriErrorCode::DataLoss,
-                "image rootfs unpack record could not be read",
-            )
-        })?;
-    if body.len() as u64 > MAX_RECORD_BYTES {
-        return Err(CriError::resource_exhausted(
-            "image rootfs unpack record exceeds the size limit",
-        ));
-    }
+    let body = read_unpack_record_body(path, owner).map_err(CriError::from)?;
     let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) else {
         return Err(untrusted(
             "image rootfs cache entry was unpacked with different settings",
@@ -317,9 +302,10 @@ fn read_config(
 ) -> Result<(Vec<Digest>, ImageProcessConfig), CriError> {
     let mut file = open_blob_nofollow(&blobs.join(digest_hex(id)))
         .map_err(|e| CriError::from(PullError::from_config(&e)))?;
-    let facts =
-        blob_file_facts(&file).ok_or_else(|| untrusted("cached image config is not trusted"))?;
-    check_blob_trust(&facts, owner).map_err(|_| untrusted("cached image config is not trusted"))?;
+    let facts = BlobFileFacts::from_file(&file)
+        .ok_or_else(|| untrusted("cached image config is not trusted"))?;
+    check_blob_trust(&facts, Some(owner))
+        .map_err(|_| untrusted("cached image config is not trusted"))?;
     let mut body = Vec::new();
     (&mut file)
         .take(MAX_CONFIG_BYTES + 1)

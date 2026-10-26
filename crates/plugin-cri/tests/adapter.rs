@@ -96,6 +96,33 @@ fn plug1_backends_hold_injected_trait_objects() {
     let _svc = backends.runtime_service(Arc::new(UnimplementedBundleProvider));
 }
 
+/// 注入で組んだ backends には状態ルートが無く、`ImageService` は `FAILED_PRECONDITION`（CRI-3・PLUG-1。#2592）。
+#[cfg(unix)]
+#[test]
+fn cri3_image_service_requires_production_backends() {
+    let state: Arc<dyn fandhe_container_core::traits::StateStore> = Arc::new(NoState);
+    let backends = CriPluginBackends::new(Arc::new(Fake), state, Arc::new(UnimplementedNetwork));
+    let e = backends.image_service().expect_err("no state root");
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "state root is not configured");
+}
+
+/// 期限の大小関係（REPAIR-5・#2592）: pull の期限 < gRPC の 1 リクエストの期限 <= `GRPC_TIMEOUT_MAX`。
+/// 実行層の待ち（start）も 1 リクエストの期限に収まる。
+#[test]
+fn repair5_pull_deadline_fits_inside_request_timeout() {
+    use fandhe_container_plugin::grpc::GRPC_TIMEOUT_MAX;
+    use fandhe_container_plugin_cri::adapter::{
+        PLUGIN_PULL_DEADLINE, PLUGIN_REQUEST_TIMEOUT, PLUGIN_RUNTIME_TIMEOUT,
+    };
+    use std::time::Duration;
+    assert_eq!(PLUGIN_PULL_DEADLINE, Duration::from_secs(540));
+    assert_eq!(PLUGIN_REQUEST_TIMEOUT, Duration::from_secs(600));
+    assert!(PLUGIN_PULL_DEADLINE < PLUGIN_REQUEST_TIMEOUT);
+    assert!(PLUGIN_REQUEST_TIMEOUT <= GRPC_TIMEOUT_MAX);
+    assert!(PLUGIN_RUNTIME_TIMEOUT < PLUGIN_REQUEST_TIMEOUT);
+}
+
 /// 何も保持しない `StateStore`（全操作 Unimplemented）。
 struct NoState;
 

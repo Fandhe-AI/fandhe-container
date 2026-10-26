@@ -587,6 +587,40 @@ fn cri2_image_store_resolves_tags() {
     assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
 }
 
+/// 短縮名（`alpine:3.20`）は PullImage と同じ規則で正規化したタグ（`docker.io/library/alpine:3.20`）として登録された
+/// 記録へ解決される（CRI-2・CRI-3・CRI-4。#2592）。
+#[test]
+fn cri2_image_store_resolves_short_name_via_canonical() {
+    let env = pulled_env("store-short", CONFIG_SECTION);
+    let store = Arc::new(InMemoryImageStore::new());
+    store
+        .upsert(
+            ImageRecord::new(
+                env.image_id.clone(),
+                vec!["docker.io/library/alpine:3.20".to_owned()],
+                vec![],
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let dir = prepare(&p, "ctr1", &container("alpine:3.20")).expect("prepare");
+    assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
+}
+
+/// 正規化しても在庫に無い短縮名は NOT_FOUND で、bundle は残らない（CRI-2・CRI-3。#2592）。
+#[test]
+fn cri2_image_store_short_name_miss_is_not_found() {
+    let env = pulled_env("store-short-miss", CONFIG_SECTION);
+    let store = Arc::new(InMemoryImageStore::new());
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let e = prepare(&p, "ctr1", &container("alpine:3.20")).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::NotFound);
+    assert_eq!(e.message(), "image reference is not found");
+    assert_eq!(bundle_count(&env), 0);
+}
+
 /// 解決器を注入済みで参照が未知のときは UNIMPLEMENTED ではなく NOT_FOUND（CRI-2）。
 #[test]
 fn cri2_image_store_miss_is_not_found() {

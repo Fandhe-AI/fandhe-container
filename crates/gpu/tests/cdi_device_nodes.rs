@@ -11,12 +11,44 @@ use fandhe_container_gpu::cdi_spec::DeviceNode;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("fc-gpu-it-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// 子プロセスを期限つきで待つ（REPAIR-5）。超過時は kill して wait で回収し、失敗として返す。
+fn run_with_deadline(cmd: &mut std::process::Command, limit: Duration) -> bool {
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// REPAIR-5: 期限を超えた子プロセスは kill され、失敗として返る。
+#[test]
+fn run_with_deadline_kills_a_hung_child() {
+    let start = Instant::now();
+    let ok = run_with_deadline(
+        std::process::Command::new("sleep").arg("60"),
+        Duration::from_millis(200),
+    );
+    assert!(!ok);
+    assert!(start.elapsed() < Duration::from_secs(10));
 }
 
 fn node(path: &str, ty: Option<&str>) -> DeviceNode {
@@ -62,12 +94,12 @@ fn gpu2_whiteout_matches_host_major_minor() {
     let host = tmp("wo-host");
     let dev = tmp("wo-dev");
     // ホスト役の whiteout を作る（CAP_MKNOD 不要）。作れない環境は skip せず原因を明示して失敗させる。
-    let ok = std::process::Command::new("mknod")
-        .arg(host.join("wo"))
-        .args(["c", "0", "0"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = run_with_deadline(
+        std::process::Command::new("mknod")
+            .arg(host.join("wo"))
+            .args(["c", "0", "0"]),
+        Duration::from_secs(10),
+    );
     assert!(ok, "failed to create a whiteout device on the host side");
     let host_md = std::fs::symlink_metadata(host.join("wo")).unwrap();
     assert!(host_md.file_type().is_char_device());

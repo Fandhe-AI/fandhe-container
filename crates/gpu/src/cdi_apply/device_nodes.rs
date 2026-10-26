@@ -307,9 +307,11 @@ fn resolve_one(
         }
     };
 
-    // 上流の minimal: type が指定され、かつ (major != 0 または type == p)。
+    // 上流の minimal に近いが、minor の省略は完全指定とみなさない（上流は type と major だけで真になり、
+    // minor 省略のとき後段で補完できず拒否される。ここではホストから補完する側へ倒す）。
     let is_fifo_spec = matches!(spec_kind, Some(DeviceNodeKind::Fifo));
-    let minimal = spec_kind.is_some() && (spec_major.unwrap_or(0) != 0 || is_fifo_spec);
+    let minimal = spec_kind.is_some()
+        && (is_fifo_spec || (spec_major.unwrap_or(0) != 0 && spec_minor.is_some()));
 
     let host = match lookup.lstat(host_path) {
         Ok(h) => Some(h),
@@ -340,10 +342,21 @@ fn resolve_one(
                 }
                 Some(_) => {}
             }
-            if hk != DeviceNodeKind::Fifo && major.unwrap_or(0) == 0 {
+            if hk != DeviceNodeKind::Fifo {
                 let (hma, hmi) = decode_dev(h.rdev);
-                major = u32::try_from(hma).ok();
-                minor = u32::try_from(hmi).ok();
+                if major.unwrap_or(0) == 0 {
+                    major = u32::try_from(hma).ok();
+                    minor = u32::try_from(hmi).ok();
+                } else if minor.is_none() {
+                    // major だけ指定された場合は、ホストの major が一致するときに限り minor を補う。
+                    if u32::try_from(hma).ok() != major {
+                        return Err(err(
+                            Code::InvalidArgument,
+                            "device node major does not match the host device",
+                        ));
+                    }
+                    minor = u32::try_from(hmi).ok();
+                }
             }
         }
     }
@@ -502,7 +515,30 @@ mod linux {
         ino: u64,
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// 試験用: `observe` を n 回目（0 起点）に失敗させる（EMFILE 等の模擬）。
+        pub(super) static FAIL_OBSERVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
     fn observe(fd: &OwnedFd) -> Result<Observed, CdiApplyError> {
+        #[cfg(test)]
+        {
+            let hit = FAIL_OBSERVE_AT.with(|c| match c.get() {
+                Some(0) => {
+                    c.set(None);
+                    true
+                }
+                Some(n) => {
+                    c.set(Some(n - 1));
+                    false
+                }
+                None => false,
+            });
+            if hit {
+                return Err(CdiApplyError::new(Code::ResourceExhausted, "injected").with_errno(24));
+            }
+        }
         let f = File::from(clone_fd(fd.as_fd())?);
         let md = f
             .metadata()
@@ -531,19 +567,36 @@ mod linux {
     #[derive(Default)]
     struct Created {
         dirs: Vec<(OwnedFd, CString)>,
-        nodes: Vec<(OwnedFd, CString, u64, u64)>,
+        nodes: Vec<CreatedNode>,
+    }
+
+    /// 作成したノード 1 件。`mknodat` の直前に親 fd を複製しておき、成功した直後に登録する
+    /// （再オープン・観測・複製の失敗でも回収できるようにする。特権操作の後始末）。
+    struct CreatedNode {
+        parent: OwnedFd,
+        name: CString,
+        /// 作成した種別ビット（`S_IFCHR` 等）と rdev。識別が未確定の間の照合に使う。
+        type_bits: u32,
+        rdev: u64,
+        /// 再オープンして観測できた後に埋める `(dev, ino)`。
+        ident: Option<(u64, u64)>,
     }
 
     impl Created {
         /// 最善努力の後始末。失敗しても元のエラーを優先するため結果は捨てる。
         fn rollback(self) {
-            for (parent, name, dev, ino) in self.nodes.into_iter().rev() {
-                let same = sys::open_path_nofollow_at(parent.as_fd(), &name)
+            for n in self.nodes.into_iter().rev() {
+                // 識別が未確定でも、種別と rdev が作ったものと一致する場合だけ消す。
+                let same = sys::open_path_nofollow_at(n.parent.as_fd(), &n.name)
                     .ok()
                     .and_then(|fd| observe(&fd).ok())
-                    .is_some_and(|o| o.dev == dev && o.ino == ino);
+                    .is_some_and(|o| {
+                        o.mode & S_IFMT == n.type_bits
+                            && o.rdev == n.rdev
+                            && n.ident.is_none_or(|(d, i)| o.dev == d && o.ino == i)
+                    });
                 if same {
-                    let _ = sys::unlink_at(parent.as_fd(), &name, false);
+                    let _ = sys::unlink_at(n.parent.as_fd(), &n.name, false);
                 }
             }
             for (parent, name) in self.dirs.into_iter().rev() {
@@ -564,8 +617,10 @@ mod linux {
             let next = match sys::open_dir_nofollow_at(cur.as_fd(), &name) {
                 Ok(fd) => fd,
                 Err(SysError::Os(2)) => {
+                    // 複製は作成の前に済ませる（作成後に失敗して取り残さない）。
+                    let rec_parent = clone_fd(cur.as_fd())?;
                     match sys::mkdir_at(cur.as_fd(), &name, 0o755) {
-                        Ok(()) => created.dirs.push((clone_fd(cur.as_fd())?, name.clone())),
+                        Ok(()) => created.dirs.push((rec_parent, name.clone())),
                         Err(SysError::Os(17)) => {}
                         Err(e) => return Err(map_sys(e, "failed to create a /dev subdirectory")),
                     }
@@ -614,8 +669,20 @@ mod linux {
         } else {
             encode_dev(n.major, n.minor)
         };
+        // 回収用の親 fd は mknodat の前に確保する（作成後の複製失敗で取り残さない）。
+        let rec_parent = clone_fd(parent.as_fd())?;
         let status = match sys::mknod_at(parent.as_fd(), &name, type_bits(n.kind) | n.mode, dev) {
-            Ok(()) => DeviceNodeStatus::Created,
+            Ok(()) => {
+                // 作成直後に登録する。以降のどの失敗でも rollback が回収できる。
+                created.nodes.push(CreatedNode {
+                    parent: rec_parent,
+                    name: name.clone(),
+                    type_bits: type_bits(n.kind),
+                    rdev: dev,
+                    ident: None,
+                });
+                DeviceNodeStatus::Created
+            }
             Err(SysError::Os(17)) => DeviceNodeStatus::AlreadyPresent,
             Err(e) => return Err(map_sys(e, "mknod failed")),
         };
@@ -624,9 +691,9 @@ mod linux {
         let obs = observe(&fd)?;
         if status == DeviceNodeStatus::Created {
             // 開き直した inode の識別を記録してから検証する（差し替えられても他人の inode は消さない）。
-            created
-                .nodes
-                .push((clone_fd(parent.as_fd())?, name.clone(), obs.dev, obs.ino));
+            if let Some(last) = created.nodes.last_mut() {
+                last.ident = Some((obs.dev, obs.ino));
+            }
             if obs.mode & S_IFMT != type_bits(n.kind) || obs.rdev != dev {
                 return Err(precondition(
                     "created node does not match the requested type or rdev",
@@ -905,6 +972,62 @@ mod tests {
         let mut n = node("/dev/x");
         n.host_path = Some("relative".into());
         assert_eq!(one(n, &f).unwrap_err().code(), Code::InvalidArgument);
+    }
+
+    /// GPU-2: minor 省略は完全指定とみなさず、ホストの minor で補う（major が一致するとき）。
+    #[test]
+    fn omitted_minor_is_filled_from_host() {
+        let f = Fake(HashMap::from([(
+            "/dev/nvidia0",
+            host(HostKind::Char, 195, 7, 0o020_660),
+        )]));
+        let mut n = node("/dev/nvidia0");
+        n.r#type = Some("c".into());
+        n.major = Some(195);
+        let r = one(n.clone(), &f).unwrap();
+        assert_eq!((r.major(), r.minor(), r.mode()), (195, 7, 0o660));
+        // major が食い違うホストは拒否し、ホストが無ければ補完できず拒否する。
+        n.major = Some(10);
+        assert_eq!(
+            one(n.clone(), &f).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            one(n, &Fake(HashMap::new())).unwrap_err().code(),
+            Code::NotFound
+        );
+    }
+
+    /// GPU-2・REPAIR-3: 作成直後の観測失敗（EMFILE 相当）でも作ったノードと親ディレクトリを回収する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_after_observe_failure_removes_created_node_and_dir() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        let d = std::env::temp_dir().join(format!("fc-gpu-ut-obs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::File::open(&d).unwrap();
+        let mut n = node("/dev/sub/q");
+        n.r#type = Some("p".into());
+        let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        // 観測の 1 回目（作成直後の観測）を失敗させる。
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(0)));
+        let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(None));
+        assert_eq!(e.code(), Code::ResourceExhausted);
+        assert_eq!(e.errno(), Some(24));
+        assert!(!d.join("sub").exists(), "dir must be rolled back");
+        // 再試行は FailedPrecondition にならず成功する。
+        let rep = create_device_nodes(root.as_fd(), &resolved).unwrap();
+        assert_eq!(rep.outcomes.len(), 1);
+        assert!(
+            std::fs::symlink_metadata(d.join("sub/q"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2 受け入れ条件 1 の純粋版: 本物の lookup で /dev/null を補完し、rdev がホストと一致する。ノードは作らない。

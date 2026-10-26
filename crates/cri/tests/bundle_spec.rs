@@ -9,8 +9,8 @@ use fandhe_container_cri::bundle::spec::{
 };
 use fandhe_container_cri::bundle::{
     BundleFiles, ImageDefaults, PodNamespacePaths, build_runtime_config,
-    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces, resolve_log_path,
-    validate_config,
+    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces,
+    build_runtime_config_with_pod_netns, resolve_log_path, validate_config,
 };
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
@@ -1716,5 +1716,87 @@ fn cri2_stop_signal_unknown_value_is_invalid_argument() {
         let mut c = ctr();
         c.stop_signal = v;
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+    }
+}
+const POD_NETNS: &str =
+    "/state/.netns/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn build_with_netns(p: &PodSandboxConfig, c: &ContainerConfig, netns: Option<&str>) -> Value {
+    let json =
+        build_runtime_config_with_pod_netns(p, c, &ImageDefaults::default(), netns).expect("build");
+    serde_json::from_slice(json.as_bytes()).expect("json")
+}
+
+fn network_entry(v: &Value) -> Option<&Value> {
+    v["linux"]["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["type"] == "network")
+}
+
+/// CRI-2・NET-1（#2675）: POD でパスを受けたときだけ network に `path` を出す。
+#[test]
+fn pod_netns_path_is_emitted_for_pod_mode() {
+    let v = build_with_netns(&pod(), &ctr(), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network", "path": POD_NETNS})
+    );
+    // 他の種別には path を付けない。
+    for n in v["linux"]["namespaces"].as_array().unwrap() {
+        if n["type"] != "network" {
+            assert!(n.get("path").is_none(), "{n}");
+        }
+    }
+}
+
+/// パスが無ければ従来どおり path なし（core の start が `UNIMPLEMENTED` で拒否する）。
+#[test]
+fn pod_mode_without_netns_path_keeps_pathless_network_entry() {
+    let v = build_with_netns(&pod(), &ctr(), None);
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network"})
+    );
+}
+
+/// NODE ではパスを渡されても network を出さない。CONTAINER は path なしのまま。TARGET は拒否のまま。
+#[test]
+fn pod_netns_path_is_ignored_for_other_modes() {
+    let mode = |m| {
+        with_sc(|sc| {
+            sc.namespace_options = Some(ns(m, NamespaceMode::Pod, NamespaceMode::Pod));
+        })
+    };
+    let v = build_with_netns(&pod(), &mode(NamespaceMode::Node), Some(POD_NETNS));
+    assert!(network_entry(&v).is_none());
+    let v = build_with_netns(&pod(), &mode(NamespaceMode::Container), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network"})
+    );
+    let e = build_runtime_config_with_pod_netns(
+        &pod(),
+        &mode(NamespaceMode::Target),
+        &ImageDefaults::default(),
+        Some(POD_NETNS),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}
+
+/// 壊れたパス（相対・`..`・空要素）は bundle へ流さない。
+#[test]
+fn malformed_pod_netns_path_is_rejected() {
+    for bad in ["relative/ns", "/a/../b", "/a//b", "/", "/a/./b", "/a\\b"] {
+        let e = build_runtime_config_with_pod_netns(
+            &pod(),
+            &ctr(),
+            &ImageDefaults::default(),
+            Some(bad),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad}");
     }
 }

@@ -28,7 +28,7 @@ use fandhe_container_core::traits::ContainerId;
 
 use super::resolv_conf;
 use super::spec::{
-    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pod_namespaces,
+    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods,
     validate_config_with_pod_namespaces,
 };
 use crate::adapter::{BundleProvider, BundleRequest};
@@ -381,12 +381,13 @@ impl BundleProvider for SpecBundleProvider {
                 }
                 None => BundleFiles::none(),
             };
-            let json = build_runtime_config_with_files_and_pod_namespaces(
+            let json = build_runtime_config_with_files_and_pods(
                 req.sandbox_config,
                 req.config,
                 &defaults,
                 &files,
                 req.pod_namespaces,
+                req.pod_netns_path.and_then(|p| p.to_str()),
             )?;
             write_new_file(
                 &dir.join("config.json"),

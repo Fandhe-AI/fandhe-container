@@ -216,7 +216,9 @@ impl CriPluginBackends {
         &self.state
     }
 
-    /// `NetworkPlugin` の実装（CRI の RPC からの呼び出しは #459 以降。写像は [`crate::pod_network`]。現状は呼び出し元が無い）。
+    /// `NetworkPlugin` の実装。写像は [`crate::pod_network`]（`NetsetupPodNetwork` が cri の `PodNetworkProvider` を実装）。
+    /// 本番の RPC からはまだ呼ばれない: core の network namespace の join が入るまで `with_pod_network` を差さない
+    /// （差すと RunPodSandbox が bridge・netns・veth を作るのに start が `UNIMPLEMENTED` で失敗する。#2675・REPAIR-3）。
     pub fn network(&self) -> &Arc<dyn NetworkPlugin> {
         &self.network
     }

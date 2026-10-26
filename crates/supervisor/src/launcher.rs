@@ -1163,20 +1163,25 @@ mod tests {
     #[test]
     fn cri2_launcher_validates_cri_log_path_argument() {
         use std::ffi::OsString;
+        // 絶対パスの fixture（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。
+        #[cfg(windows)]
+        const ROOT: &str = r"C:\r";
+        #[cfg(not(windows))]
+        const ROOT: &str = "/r";
         let parse = |argv: &[&str]| {
             crate::start_contract::StartArgs::parse(argv.iter().map(OsString::from))
         };
         let ok = parse(&[
             "start",
             "--root",
-            "/r",
+            ROOT,
             "--cri-log-path",
             "/l/c/0.log",
             "c1",
         ])
         .expect("accepted");
         assert_eq!(ok.cri_log_path.expect("path").as_str(), "/l/c/0.log");
-        let e = parse(&["start", "--root", "/r", "--cri-log-path", "../x", "c1"])
+        let e = parse(&["start", "--root", ROOT, "--cri-log-path", "../x", "c1"])
             .expect_err("rejected");
         let le = LauncherError::from(e);
         assert_eq!(le.code, ErrorCode::InvalidArgument);

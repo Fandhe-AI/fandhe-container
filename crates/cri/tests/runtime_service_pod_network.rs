@@ -96,7 +96,13 @@ impl BundleProvider for RecordingBundles {
             .lock()
             .unwrap()
             .push(req.pod_netns_path.map(|p| p.to_path_buf()));
-        Ok(PathBuf::from("/bundles").join(req.container_id))
+        // bundle のパスは絶対パスで返す（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\bundles")
+        } else {
+            PathBuf::from("/bundles")
+        };
+        Ok(root.join(req.container_id))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())

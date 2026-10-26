@@ -658,13 +658,27 @@ mod linux {
                 Err(SysError::Os(2)) => {
                     // 複製は作成の前に済ませる（作成後に失敗して取り残さない）。
                     let rec_parent = clone_fd(cur.as_fd())?;
+                    let mut made = false;
                     match sys::mkdir_at(cur.as_fd(), &name, 0o755) {
-                        Ok(()) => created.dirs.push((rec_parent, name.clone())),
+                        Ok(()) => {
+                            created.dirs.push((rec_parent, name.clone()));
+                            made = true;
+                        }
                         Err(SysError::Os(17)) => {}
                         Err(e) => return Err(map_sys(e, "failed to create a /dev subdirectory")),
                     }
-                    sys::open_dir_nofollow_at(cur.as_fd(), &name)
-                        .map_err(|e| map_sys(e, "failed to open a /dev subdirectory"))?
+                    let fd = sys::open_dir_nofollow_at(cur.as_fd(), &name)
+                        .map_err(|e| map_sys(e, "failed to open a /dev subdirectory"))?;
+                    if made {
+                        // umask で削られた権限を、開き直した検証済み fd に対してだけ 0755 へ補正する
+                        // （プロセス全体の umask は変えない。GPU-2）。
+                        std::fs::set_permissions(
+                            proc_fd_path(&fd),
+                            std::fs::Permissions::from_mode(0o755),
+                        )
+                        .map_err(|e| io_err(&e, "failed to set the /dev subdirectory mode"))?;
+                    }
+                    fd
                 }
                 Err(SysError::Os(20 | 40)) => {
                     return Err(precondition(
@@ -1170,6 +1184,41 @@ mod tests {
                 .file_type()
                 .is_fifo()
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GPU-2: umask 077 でも、この呼び出しが作った中間ディレクトリは 0755 に補正される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn intermediate_dirs_are_0755_under_restrictive_umask() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        // プロセス全体の umask を試験内で変えない（unsafe 回避）。umask 077 の子プロセスで自身を再実行する。
+        if std::env::var_os("FC_GPU_UMASK_CHILD").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let st = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("umask 077; exec \"$0\" --exact cdi_apply::device_nodes::tests::intermediate_dirs_are_0755_under_restrictive_umask")
+                .arg(exe)
+                .env("FC_GPU_UMASK_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("fc-gpu-ut-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::File::open(&d).unwrap();
+        let mut n = node("/dev/dri/q1");
+        n.r#type = Some("p".into());
+        let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        create_device_nodes(root.as_fd(), &resolved).unwrap();
+        let mode = std::fs::metadata(d.join("dri"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
         let _ = std::fs::remove_dir_all(&d);
     }
 

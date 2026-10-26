@@ -240,6 +240,11 @@ cleanup() {
     run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL c2 || true
     sleep 0.5
     run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
+    # delete が成功しなかった（状態が残る）なら、手動回収に必要な状態ルートを消さずに残す。
+    if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
+      err warning "container c2 could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
+      return 0
+    fi
   fi
   if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
     rm -rf -- "$tmp_dir"
@@ -697,6 +702,9 @@ do_capture() {
       esac
       argv+=("$mapped")
     done
+    # B20 の start は結果が返る前に supervisor が別プロセスグループで起動を続けるため、呼び出しの前から
+    # 後始末の対象にする（待機中の TERM / HUP でコンテナを残さない。起動結果が不明なため）。
+    if [ "$id" = "B20" ]; then chain_live=1; fi
     run_cli "$cli" "$limit" "${argv[@]}"
     # w は状態が running でなくなるまで期限つきで繰り返す（stop 直後の delete が Running で失敗する競合を避ける）。
     # start が成功していなければ待っても変わらないので 1 回で済ませる。
@@ -717,7 +725,8 @@ do_capture() {
         if [ "$run_timed_out" -eq 1 ]; then last_start_exit=1; else last_start_exit="$run_exit"; fi
         ;;
     esac
-    if [ "$id" = "B20" ] && [ "$last_start_exit" = "0" ]; then chain_live=1; fi
+    # start が期限切れ以外で失敗を返したなら起動していない。期限切れは結果不明なので対象に残す。
+    if [ "$id" = "B20" ] && [ "$last_start_exit" != "0" ] && [ "$run_timed_out" -eq 0 ]; then chain_live=0; fi
     if [ "$run_timed_out" -eq 1 ]; then
       any_timeout=1
       lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}<timeout>${TAB}<timeout>")

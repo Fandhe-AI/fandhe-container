@@ -15,8 +15,6 @@
 //! 修正を 1 箇所に保つため。試験専用で製品コード・rlib には影響しない）。`remove_scratch_root` は作成した
 //! プロセスでだけ削除する。成功行の照合を乱さないよう標準出力へは何も出さず、失敗は panic（英語）で表す。
 
-#![allow(dead_code)] // 取り込む試験ごとに使う関数が異なるため。
-
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -27,6 +25,7 @@ static ROOT: OnceLock<(PathBuf, std::fs::File, u32)> = OnceLock::new();
 
 /// 保護済みの親ディレクトリを返す。初回に `<prefix>-<pid>-<nanos>` を排他作成（既存パスは採用も削除もしない）して
 /// 0700 にし、共有 flock を `deadline` まで再試行して取る。取れなければ panic（REPAIR-5）。
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なり、未使用の取り込み先があるため。
 pub fn scratch_root(prefix: &str, deadline: Duration) -> &'static Path {
     let (dir, _guard, _pid) = ROOT.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
@@ -54,6 +53,7 @@ pub fn scratch_root(prefix: &str, deadline: Duration) -> &'static Path {
 }
 
 /// 親ディレクトリを消す（best-effort。作成したプロセスでだけ削除し、fork・re-exec した子は何もしない）。
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なり、未使用の取り込み先があるため。
 pub fn remove_scratch_root() {
     if let Some((dir, _, pid)) = ROOT.get()
         && *pid == std::process::id()
@@ -63,6 +63,7 @@ pub fn remove_scratch_root() {
 }
 
 /// drop で `remove_scratch_root` を呼ぶガード（panic の unwind 経路用）。
+#[allow(dead_code)] // 取り込む試験ごとに使う項目が異なり、未使用の取り込み先があるため。
 pub struct ScratchRootCleanup;
 
 impl Drop for ScratchRootCleanup {

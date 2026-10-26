@@ -480,6 +480,54 @@ async fn pull_image(
     .map(|r| r.into_inner().image_ref)
 }
 
+/// `Status` を UDS＋gRPC 越しに呼び、実行層ありで pod network 無しの構成の応答を具体値で照合する
+/// （`RuntimeReady`=true・`NetworkReady`=false〔`NetworkPluginNotReady`〕・既定ハンドラ 1 件・features・空の `info`）。
+/// 本番は core の network namespace の join が未実装で `with_pod_network` を差さないため、段 A も同じ値になる
+/// （CRI-1・CRI-2・#2830・`docs/design/cri-status-rpc.md`）。
+async fn assert_status_runtime_ready_network_not_ready(c: &mut Client, verbose: bool) {
+    let resp = call_with_deadline(c.status(cri::StatusRequest { verbose }), RPC_DEADLINE)
+        .await
+        .expect("status")
+        .into_inner();
+    let cond = |t: &str, status: bool, reason: &str, message: &str| cri::RuntimeCondition {
+        r#type: t.into(),
+        status,
+        reason: reason.into(),
+        message: message.into(),
+    };
+    assert_eq!(
+        resp.status.expect("runtime status").conditions,
+        vec![
+            cond("RuntimeReady", true, "", ""),
+            cond(
+                "NetworkReady",
+                false,
+                "NetworkPluginNotReady",
+                "pod network provider is not configured"
+            ),
+        ]
+    );
+    assert_eq!(
+        resp.runtime_handlers,
+        vec![cri::RuntimeHandler {
+            name: String::new(),
+            features: Some(cri::RuntimeHandlerFeatures {
+                recursive_read_only_mounts: false,
+                user_namespaces: false,
+            }),
+        }]
+    );
+    assert_eq!(
+        resp.features,
+        Some(cri::RuntimeFeatures {
+            supplemental_groups_policy: true,
+            user_namespaces_host_network: false,
+            mount_options: false,
+        })
+    );
+    assert!(resp.info.is_empty());
+}
+
 /// 段 A（PLUG-1・CRI-2・CRI-3・CRI-7）: 同じ UDS で ImageService がサーブされ、Container 系 RPC が実バイナリへ届いて
 /// 本番バックエンドの応答が境界を越えて返る。タグが未知の作成は `NOT_FOUND` で半端な記録を残さず、image ID の作成は成功する。
 #[tokio::test]
@@ -518,6 +566,9 @@ async fn container_rpcs_reach_the_plugin_binary() {
             .await
             .expect_err("empty reference");
         assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+
+        assert_status_runtime_ready_network_not_ready(&mut c, false).await;
+        assert_status_runtime_ready_network_not_ready(&mut c, true).await;
 
         let sb = run_sandbox(&mut c, "pod-a").await;
 
@@ -736,6 +787,8 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
         }));
         let ch = connect_when_ready(&sock, None).await;
         let mut c = RuntimeServiceClient::new(ch);
+
+        assert_status_runtime_ready_network_not_ready(&mut c, false).await;
 
         let sb = run_sandbox(&mut c, "pod-b").await;
         assert_eq!(

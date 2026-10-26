@@ -831,7 +831,7 @@ mod tests {
             );
             assert!(
                 o.stdout
-                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null}\n"),
+                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}\n"),
                 "{:?}",
                 o.stdout
             );

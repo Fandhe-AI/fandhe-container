@@ -13,9 +13,10 @@
 //! 6. config と各 layer の blob を確保する。既存 blob は先にリースを登録（`lease_existing_blob`）してから、開いた
 //!    ハンドルで所有者・権限・ハードリンク数・digest を確かめて再利用する。それ以外はセッションのステージングへ
 //!    取得し（`open_staged_blob` の writer へ書いて `commit`。#2765）、`verify_staged_blob` で信頼条件と sha256 digest を検証する
-//! 7. config blob を symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめ、同じハンドルから上限つきで
-//!    読んで `rootfs.diff_ids` を解析（`read_verified_config`）
-//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、セッションのステージングの `unpack/` 配下の
+//! 7. config blob を開き（ステージングの blob は `PullSession::open_verified_staged_blob` が pull ディレクトリの
+//!    fd 起点で開いたハンドル。リース済みの既存 blob は symlink を辿らずパスで開く。#2893）、同じハンドルで信頼条件と
+//!    digest を確かめ、同じハンドルから上限つきで読んで `rootfs.diff_ids` を解析（`read_verified_config_file`）
+//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。ステージングの blob は `from_file`、既存 blob は `open`）で開き直し、セッションのステージングの `unpack/` 配下の
 //!    `rootfs/` へ `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
 //!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
@@ -126,7 +127,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -574,9 +575,9 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     /// 作りかけの rootfs は公開先に現れない。失敗時の root は呼び出し側が `unpack/` ごと消し、ステージングは `abort` が消す。
     fn ensure_rootfs(
         &self,
-        paths: &BTreeMap<Digest, PathBuf>,
+        session: &PullSession<'_>,
+        paths: &BTreeMap<Digest, BlobSource>,
         blob_owner: u32,
-        unpack_dir: &Path,
         manifest: &ImageManifest,
         rootfs_cfg: &ImageRootFs,
         started: Instant,
@@ -607,18 +608,32 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .layers
             .iter()
             .map(|d| {
-                let path = paths.get(&d.digest).ok_or_else(|| {
+                let source = paths.get(&d.digest).ok_or_else(|| {
                     PullError::new(OciErrorCode::Internal, "image layer blob path is missing")
                 })?;
-                VerifiedLayerBlob::open(path, &d.digest, d.size, blob_owner)
-                    .map_err(|e| PullError::from_extract(&e))
+                match source {
+                    // ステージングの blob は pull ディレクトリの fd 起点のハンドルから構築する（#2893）。
+                    BlobSource::Staged => {
+                        let file = session
+                            .open_verified_staged_blob(&d.digest)
+                            .map_err(|e| PullError::from_store(&e))?;
+                        VerifiedLayerBlob::from_file(file, &d.digest, d.size, blob_owner)
+                            .map_err(|e| PullError::from_extract(&e))
+                    }
+                    BlobSource::Cached(path) => {
+                        VerifiedLayerBlob::open(path, &d.digest, d.size, blob_owner)
+                            .map_err(|e| PullError::from_extract(&e))
+                    }
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<&VerifiedLayerBlob> = verified.iter().collect();
         let layers = image_layers_from(&manifest.layers, &refs, rootfs_cfg)
             .map_err(|e| PullError::from_extract(&e))?;
         // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
-        create_private_dir(unpack_dir)?;
+        // 展開先の作業領域はセッションのステージング配下（パス起点。fd 起点化は #2893 の対象外）。
+        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
+        create_private_dir(&unpack_dir)?;
         let staged_entry = unpack_dir.join("entry");
         create_private_dir(&staged_entry)?;
         let root = staged_entry.join(ROOTFS_SUBDIR);
@@ -693,7 +708,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         session: &mut PullSession<'_>,
         blob_owner: u32,
         descriptor: &Descriptor,
-    ) -> Result<PathBuf, PullError> {
+    ) -> Result<BlobSource, PullError> {
         if let BlobReuse::Leased(token) = session
             .lease_existing_blob(&descriptor.digest)
             .map_err(|e| PullError::from_store(&e))?
@@ -702,7 +717,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
             // 取得・検証に成功した場合に限り、公開が置き換える。
             if inspect_cached_blob(&path, &descriptor.digest, descriptor.size, blob_owner).is_ok() {
-                return Ok(path);
+                return Ok(BlobSource::Cached(path));
             }
             session
                 .release_leased(token)
@@ -753,10 +768,9 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 "blob size does not match the descriptor",
             ));
         }
-        // 読み取り用のパスは検証に成功した後にだけ得る（config の読み取りと展開の入力用。書き込みには使わない）。
-        session
-            .staged_blob_read_path(&descriptor.digest)
-            .map_err(|e| PullError::from_store(&e))
+        // 読み取りは検証に成功した後に、`PullSession::open_verified_staged_blob` が fd 起点で開いたハンドルで行う
+        // （config の読み取りと展開の入力用。パスは持ち回らない。#2893）。
+        Ok(BlobSource::Staged)
     }
 
     /// 全 blob を確保し、config を検証して layer を展開する（公開の直前まで。#2539）。
@@ -772,7 +786,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     ) -> Result<ManifestComposition, PullError> {
         // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
         // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
-        let mut paths: BTreeMap<Digest, PathBuf> = BTreeMap::new();
+        let mut paths: BTreeMap<Digest, BlobSource> = BTreeMap::new();
         let mut seen: Vec<(&Digest, u64)> = Vec::new();
         for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
             if let Some((_, size)) = seen.iter().find(|(d, _)| **d == descriptor.digest) {
@@ -793,24 +807,29 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         self.check_deadline(started)?;
 
         // config を検証してから解析し、検証済みハンドルでレイヤーを展開する（#2323・OCI-1・OCI-2）。
-        let config_path = paths.get(&manifest.config.digest).ok_or_else(|| {
+        let config_source = paths.get(&manifest.config.digest).ok_or_else(|| {
             PullError::new(OciErrorCode::Internal, "image config blob path is missing")
         })?;
-        let rootfs_cfg = read_verified_config(
-            config_path,
-            &manifest.config,
-            blobs.owner,
-            self.config.max_config_bytes,
-        )?;
-        let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
-        self.ensure_rootfs(
-            &paths,
-            blobs.owner,
-            &unpack_dir,
-            manifest,
-            &rootfs_cfg,
-            started,
-        )?;
+        let rootfs_cfg = match config_source {
+            BlobSource::Staged => {
+                let file = session
+                    .open_verified_staged_blob(&manifest.config.digest)
+                    .map_err(|e| PullError::from_store(&e))?;
+                read_verified_config_file(
+                    file,
+                    &manifest.config,
+                    blobs.owner,
+                    self.config.max_config_bytes,
+                )?
+            }
+            BlobSource::Cached(path) => read_verified_config(
+                path,
+                &manifest.config,
+                blobs.owner,
+                self.config.max_config_bytes,
+            )?,
+        };
+        self.ensure_rootfs(session, &paths, blobs.owner, manifest, &rootfs_cfg, started)?;
         self.check_deadline(started)?;
         ManifestComposition::new(
             manifest.config.digest.clone(),
@@ -818,6 +837,16 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         )
         .map_err(|e| PullError::from_oci(&e))
     }
+}
+
+/// 確保した blob の読み取り元（#2893）。
+enum BlobSource {
+    /// このセッションのステージングで検証済み。読むときに `PullSession::open_verified_staged_blob` で
+    /// pull ディレクトリの fd 起点に開く。
+    Staged,
+    /// リース済みの既存 blob（`blobs/sha256/<hex>`）。従来どおりパスを `open_blob_nofollow` で開く
+    /// （fd 起点化は #2893 の対象外）。
+    Cached(PathBuf),
 }
 
 /// 1 回の pull の間で共有する借用（引数の数を抑える）。
@@ -1124,6 +1153,17 @@ fn read_verified_config(
     read_verified_config_inner(path, descriptor, owner, max_bytes, &|| {})
 }
 
+/// [`read_verified_config`] のハンドル版。`PullSession::open_verified_staged_blob` が fd 起点で開いたハンドルを受け、
+/// 開く手順以外（信頼条件の確認・上限つきの 1 回読み・digest 照合・解析）は同じ（#2893）。
+fn read_verified_config_file(
+    file: File,
+    descriptor: &Descriptor,
+    owner: u32,
+    max_bytes: u64,
+) -> Result<ImageRootFs, PullError> {
+    read_verified_config_file_inner(file, descriptor, owner, max_bytes, &|| {})
+}
+
 /// [`read_verified_config`] の本体。`before_body_read` は信頼確認の後・本文を読む直前に呼ばれる試験用の差し込み口
 /// （本番は空。確認後に同じ inode を書き換える競合を再現する。oci の `open_blob_nofollow_inner` と同じ形）。
 fn read_verified_config_inner(
@@ -1133,7 +1173,18 @@ fn read_verified_config_inner(
     max_bytes: u64,
     before_body_read: &dyn Fn(),
 ) -> Result<ImageRootFs, PullError> {
-    let mut file = open_blob_nofollow(path).map_err(|e| PullError::from_config(&e))?;
+    let file = open_blob_nofollow(path).map_err(|e| PullError::from_config(&e))?;
+    read_verified_config_file_inner(file, descriptor, owner, max_bytes, before_body_read)
+}
+
+/// [`read_verified_config_file`] の本体（開いたハンドルから読む部分。path 版も開いた後はここへ委ねる）。
+fn read_verified_config_file_inner(
+    mut file: File,
+    descriptor: &Descriptor,
+    owner: u32,
+    max_bytes: u64,
+    before_body_read: &dyn Fn(),
+) -> Result<ImageRootFs, PullError> {
     let untrusted = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -2171,6 +2222,49 @@ mod blob_trust_fs_tests {
             .expect("config");
         let ids: Vec<&str> = root.diff_ids().iter().map(Digest::as_str).collect();
         assert_eq!(ids, [format!("sha256:{}", "a".repeat(64))]);
+    }
+
+    /// OCI-1・OCI-7・CRI-3・#2893: 開いたハンドルから読む版も、1 回の読み取りで `diff_ids` が具体値で返り、
+    /// 信頼確認の後に同じ inode を書き換えられたら `DataLoss` になる。
+    #[test]
+    fn oci7_config_read_from_handle_is_parsed_and_rewrite_is_rejected() {
+        use std::io::Write as _;
+        let dir = TempDir::new("cfg-file");
+        let path = dir.0.join("config");
+        fs::write(&path, config_body('a')).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let uid = fs::metadata(&path).expect("stat").uid();
+        let descriptor = config_descriptor(CONFIG_A_SHA256, 115);
+        let root = read_verified_config_file(
+            File::open(&path).expect("open"),
+            &descriptor,
+            uid,
+            DEFAULT_MAX_CONFIG_BYTES,
+        )
+        .expect("config");
+        let ids: Vec<&str> = root.diff_ids().iter().map(Digest::as_str).collect();
+        assert_eq!(ids, [format!("sha256:{}", "a".repeat(64))]);
+
+        let rewrite = || {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("reopen");
+            f.write_all(&config_body('b')).expect("rewrite");
+        };
+        let err = read_verified_config_file_inner(
+            File::open(&path).expect("open"),
+            &descriptor,
+            uid,
+            DEFAULT_MAX_CONFIG_BYTES,
+            &rewrite,
+        )
+        .expect_err("rewritten config must be rejected");
+        assert_eq!(
+            err,
+            PullError::new(OciErrorCode::DataLoss, "image config failed validation")
+        );
     }
 
     /// OCI-1・SEC-5・#2534: 信頼確認の後・本文を読む直前に同じ inode を書き換えられても、読んだ本文のハッシュが

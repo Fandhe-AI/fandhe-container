@@ -36,8 +36,8 @@
 //! `blobs/sha256` への公開・fsync・中止の削除は、`ImageStore::open` が検査した root を保持する `RootHandle` の
 //! fd 起点（`root_handle::StagingDir` / `PullDir` / `BlobDir`）で行い、入口の再検査の後に root が差し替え
 //! られてもおとりへ書き込み・削除が届かない。fetcher の書き込み先も [`StagedBlobWriter`] が同じ fd 起点で開く
-//! （#2765）。パスで返すのは読み取り用の [`PullSession::staged_blob_read_path`] だけで、検証済みの digest に限り
-//! fd と照合する。根拠は `docs/design/image-store-root-trust.md` の論点 3。
+//! （#2765）。検証後の読み取りも [`PullSession::open_verified_staged_blob`] が同じ fd 起点で開いたハンドルを渡し
+//! （#2893）、パスは返さない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
 //!
 //! 公開する blob の信頼条件（OCI-1・SEC。cri の `check_blob_trust` と同じ条件）: 通常ファイル・
 //! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
@@ -52,8 +52,9 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - cri の読み取り側（config の読み取りと展開）はパス（[`PullSession::staged_blob_read_path`]）で開く。fd 起点へ
-//!   揃えるのは後続。
+//! - リース済みの既存 blob（`LeasedBlob::path`）の cri での読み取りと、展開先 `unpack/` の作成はパス起点のまま
+//!   （#2893 の対象外）。Windows の `PullDir` もパス起点で、[`PullSession::open_verified_staged_blob`] は
+//!   `Unimplemented`（#2428 の判断待ち）。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -615,7 +616,7 @@ impl PullSession<'_> {
             None => {
                 // 返すパスは文字列で組み立てるため、fd で確かめた実体と同じ `blobs/sha256` を指すことを照合する。
                 // root が差し替わっていれば存在しない・おとりの path を `Leased` に載せず fail-closed で拒否する
-                // （OCI-7・SEC-1・#2694。`staged_blob_read_path` と同じ照合）。リースは戻す。root が差し替わった
+                // （OCI-7・SEC-1・#2694。pull ディレクトリの照合と同じ考え方）。リースは戻す。root が差し替わった
                 // 後は排他区間の再検査が拒否するため戻せないことがあるが、その場合も拒否は変えない。
                 let dir_ok = blob_dir
                     .as_ref()
@@ -723,26 +724,62 @@ impl PullSession<'_> {
         })
     }
 
-    /// [`PullSession::verify_staged_blob`] を通した blob の読み取り用パス `<root>/staging/<pull-id>/<hex>` を返す。
+    /// [`PullSession::verify_staged_blob`] を通した blob を、pull ディレクトリの fd 起点で開いて返す（OCI-7・SEC-1・CRI-3・#2893）。
     ///
-    /// config の読み取りと展開の入力用で、書き込みには使わない（書き込み先は [`PullSession::open_staged_blob`]）。
-    /// このセッションで検証に成功した digest に限る（それ以外は `FailedPrecondition`）。パスで辿った pull ディレクトリが
-    /// 保持している fd と同じ実体であることを確かめ、違えば `Internal`（`image store root changed after open`）で拒否する。
-    pub fn staged_blob_read_path(&self, digest: &Digest) -> Result<PathBuf, OciError> {
+    /// cri の config の読み取りと layer の展開（`VerifiedLayerBlob::from_file`）の入力用で、書き込みには使わない
+    /// （書き込み先は [`PullSession::open_staged_blob`]）。パスを返さないため、`begin_pull` の後に root・`staging`・
+    /// pull ディレクトリが差し替えられても、検査済みの実体の外（おとり）は開かない。呼ぶたびに独立したハンドル
+    /// （別の open file description。読み取り位置を共有しない）を返す。
+    ///
+    /// このセッションで検証に成功した digest に限る（それ以外は `FailedPrecondition`。全 OS 共通）。開いたハンドルの指紋
+    /// （dev・ino・ctime・mtime・長さ）を検証時の値と照合し、違えば `DataLoss`（`staged blob changed after verification`）。
+    ///
+    /// `cfg` ごとの扱い:
+    /// - Linux x86_64 / aarch64: 検査済み root の fd からの `openat2`（`NO_SYMLINKS`・`O_NOFOLLOW`）。
+    /// - その他の unix（macOS 等）: `PullDir` がパス起点のため、差し替えは指紋の照合で `DataLoss` として検出する。
+    /// - 非 unix（Windows。#2428 の判断待ち）: 検証手段が無いため `Unimplemented` で拒否し、パス起点へ縮退しない。
+    pub fn open_verified_staged_blob(&self, digest: &Digest) -> Result<File, OciError> {
         let hex = hex_of(digest)?;
-        if !self.verified.contains_key(digest) {
+        let Some(entry) = self.verified.get(digest) else {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
                 "blob is not verified by this pull",
             ));
+        };
+        #[cfg(unix)]
+        {
+            let file = self
+                .pull_dir
+                .open_nofollow(hex)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        err(OciErrorCode::NotFound, "staged blob not found")
+                    }
+                    std::io::ErrorKind::InvalidInput => err(
+                        OciErrorCode::FailedPrecondition,
+                        "staged blob is not a regular file",
+                    ),
+                    _ => io_err(&e, "failed to open staged blob"),
+                })?;
+            let meta = file
+                .metadata()
+                .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+            if FileIdent::of(&meta) != entry.ident {
+                return Err(err(
+                    OciErrorCode::DataLoss,
+                    "staged blob changed after verification",
+                ));
+            }
+            Ok(file)
         }
-        if !self.pull_dir.matches_path(&self.staging_dir) {
-            return Err(err(
-                OciErrorCode::Internal,
-                "image store root changed after open",
-            ));
+        #[cfg(not(unix))]
+        {
+            let _ = (hex, entry);
+            Err(err(
+                OciErrorCode::Unimplemented,
+                "symlink-safe blob open is not supported on this platform",
+            ))
         }
-        Ok(self.staging_dir.join(hex))
     }
 
     /// ステージング済みの blob の sha256 を検証し、成功したらこのセッションの「公開できる」集合へ入れる。
@@ -1848,17 +1885,48 @@ mod tests {
         assert!(!tpath(&s, &d(2)).with_extension("part").exists());
     }
 
-    /// OCI-7（#2765）: `staged_blob_read_path` は、このセッションで検証に成功した digest にしか返さない。
+    /// OCI-7（#2893）: `open_verified_staged_blob` は、このセッションで検証に成功した digest にしか開かない。
     #[test]
-    fn oci7_staged_blob_read_path_requires_verification() {
+    fn oci7_open_verified_staged_blob_requires_verification() {
         let root = Root::new("w-read");
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
-        let e = s.staged_blob_read_path(&d(1)).unwrap_err();
+        let e = s.open_verified_staged_blob(&d(1)).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         assert_eq!(e.message(), "blob is not verified by this pull");
         let dg = stage(&mut s, b"config-body");
-        assert_eq!(s.staged_blob_read_path(&dg).unwrap(), tpath(&s, &dg));
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            let mut body = Vec::new();
+            s.open_verified_staged_blob(&dg)
+                .unwrap()
+                .read_to_end(&mut body)
+                .unwrap();
+            assert_eq!(body, b"config-body");
+        }
+        #[cfg(not(unix))]
+        {
+            let e = s.open_verified_staged_blob(&dg).unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        }
+    }
+
+    /// OCI-7・SEC-1（#2893）: 検証後に同名の別実体へ差し替えられたら `DataLoss` で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_verified_staged_blob_rejects_entry_replaced_after_verification() {
+        let root = Root::new("w-read-swap");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = stage(&mut s, b"config-body");
+        let p = tpath(&s, &dg);
+        let other = p.with_extension("other");
+        fs::write(&other, b"decoy-body!").unwrap();
+        fs::rename(&other, &p).unwrap();
+        let e = s.open_verified_staged_blob(&dg).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(e.message(), "staged blob changed after verification");
     }
 
     /// OCI-7: ステージングへ書き込み中の blob は `image ls` にも GC 走査にも現れない。

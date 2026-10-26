@@ -5,7 +5,7 @@
 //! （REPAIR-4。トークン・URL は出さない）と要約行で報告する。1 件でも失敗すれば非 0 で終了する（fail-closed）。
 //!
 //! 1. 匿名認証 → manifest 取得（image index は host の linux platform へ解決）→ config と全レイヤーの取得
-//! 2. 全 blob の digest 検証（config は `PullSession::verify_staged_blob`、レイヤーは `layer::VerifiedLayerBlob::open` で
+//! 2. 全 blob の digest 検証（`PullSession::verify_staged_blob` の後、`open_verified_staged_blob` が fd 起点で開いたハンドルを、レイヤーは `layer::VerifiedLayerBlob::from_file` で
 //!    信頼条件と digest を同じハンドルで確かめる。検証前のファイルは展開・パースしない）
 //! 3. レイヤーの展開（`layer::extract::extract_image_layers`。検証済みハンドルだけを受け、展開後 tar の sha256 を
 //!    image config の `rootfs.diff_ids` と突合する。whiteout 統合済み。パス検証・hardlink 制限は
@@ -996,11 +996,12 @@ mod linux {
             .verify_staged_blob(&config_desc.digest, config_desc.size)
             .map_err(|e| Failure::oci("verify", &e))?;
         r.verify_ms += ms(t.elapsed());
-        let config_path = session
-            .staged_blob_read_path(&config_desc.digest)
+        let config_file = session
+            .open_verified_staged_blob(&config_desc.digest)
             .map_err(|e| Failure::oci("verify", &e))?;
         r.config_bytes = config_desc.size;
-        // レイヤーは取得後に `VerifiedLayerBlob::open` で信頼条件（通常ファイル・自分の uid・リンク数 1・0600）と
+        // レイヤーは取得後に `verify_staged_blob` で検証し、`open_verified_staged_blob`（pull ディレクトリの fd 起点。
+        // #2893）で開いたハンドルを `VerifiedLayerBlob::from_file` で信頼条件（通常ファイル・自分の uid・リンク数 1・0600）と
         // digest を同じハンドルで確かめる。同じ digest のレイヤーは 1 回だけ取得する（writer は同名の宛先を拒否する）。
         let owner = {
             use std::os::unix::fs::MetadataExt as _;
@@ -1012,15 +1013,24 @@ mod linux {
         let mut fetched_layers = std::collections::HashSet::new();
         for d in resolved.manifest.layers.iter() {
             let hex = d.digest.as_str().trim_start_matches("sha256:");
-            let dest = session.staging_dir().join(hex);
             let t = Instant::now();
-            if !fetched_layers.contains(hex) {
+            let first = !fetched_layers.contains(hex);
+            if first {
                 fetch_staged(d, &mut session)?;
                 fetched_layers.insert(hex.to_string());
             }
             r.blobs_ms += ms(t.elapsed());
             let t = Instant::now();
-            let blob = VerifiedLayerBlob::open(&dest, &d.digest, d.size, owner)
+            if first {
+                session
+                    .verify_staged_blob(&d.digest, d.size)
+                    .map_err(|e| Failure::oci("verify", &e))?;
+            }
+            // 重複 digest でも呼ぶたびに別のハンドルを開く（読み取り位置を共有しない）。
+            let file = session
+                .open_verified_staged_blob(&d.digest)
+                .map_err(|e| Failure::oci("verify", &e))?;
+            let blob = VerifiedLayerBlob::from_file(file, &d.digest, d.size, owner)
                 .map_err(|e| Failure::oci("verify", &e))?;
             r.verify_ms += ms(t.elapsed());
             verified_layers.push(blob);
@@ -1029,8 +1039,9 @@ mod linux {
         drop(client);
 
         let mut config_bytes = Vec::new();
-        std::fs::File::open(&config_path)
-            .and_then(|f| f.take(CONFIG_MAX_BYTES + 1).read_to_end(&mut config_bytes))
+        config_file
+            .take(CONFIG_MAX_BYTES + 1)
+            .read_to_end(&mut config_bytes)
             .map_err(|_| Failure::new("config", "INTERNAL"))?;
         let cfg = parse_image_config(&config_bytes)?;
         let process = derive_process(&cfg, spec.cmd_override.as_deref())?;

@@ -460,10 +460,12 @@ pub(crate) fn blob_trust_violation(
 /// 信頼条件と digest を同じハンドルで確かめたレイヤー blob（OCI-1・#2309）。イメージ展開の入口
 /// （`extract::extract_image_layers` ほか）はこの値だけを受ける。
 ///
-/// 「digest 検証済みの blob」という呼び出し契約を型で表す。構築経路は [`VerifiedLayerBlob::open`] の 1 本だけで、
-/// `File` から直接作る経路は無い。構築では (1) [`open_blob_nofollow`] で symlink を辿らずに開き、(2) 同じハンドルの
-/// fstat で信頼条件（通常ファイル・所有者・ハードリンク数 1・group / other 書き込み不可）を確かめ、(3) 同じハンドルを
-/// [`verify_blob_file_digest`] で検証する。以後の展開はこのハンドルから読み、パスを開き直さないため、
+/// 「digest 検証済みの blob」という呼び出し契約を型で表す。構築経路は 2 本で、(a) [`VerifiedLayerBlob::open`] は
+/// パスを [`open_blob_nofollow`] で symlink を辿らずに開く。(b) [`VerifiedLayerBlob::from_file`] は呼び出し側が開いた
+/// ハンドルを受ける（本番の入力は `PullSession::open_verified_staged_blob` が pull ディレクトリの fd 起点で開いたもの。
+/// OCI-7・SEC-1・CRI-3・#2893）。どちらも (1) 同じハンドルの
+/// fstat で信頼条件（通常ファイル・所有者・ハードリンク数 1・group / other 書き込み不可）を確かめ、(2) 同じハンドルを
+/// [`verify_blob_file_digest`] で検証する。不変条件は「検証したハンドルから展開する」で、以後の展開はこのハンドルから読み、パスを開き直さないため、
 /// 検証と展開の間にパスのエントリを別のファイルへ差し替えられても展開物は変わらない。
 /// 同じ inode への上書きは展開側がパス 3 で diff_id を再計算して検出する（`DataLoss`）。
 #[derive(Debug)]
@@ -498,22 +500,59 @@ impl VerifiedLayerBlob {
     ) -> Result<Self, OciError> {
         record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
             let file = open_blob_nofollow(path)?;
-            let meta = file.metadata().map_err(map_io_error)?;
-            if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
-                return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
-            }
-            let verified = verify_blob_file_digest_inner(&file, expected, size)?;
-            if verified.size != size {
-                return Err(OciError::new(
-                    OciErrorCode::DataLoss,
-                    "layer blob size does not match the descriptor",
-                ));
-            }
-            Ok(Self {
-                file,
-                digest: verified.digest,
-                size: verified.size,
-            })
+            Self::check_handle(file, expected, size, owner)
+        })
+    }
+
+    /// 計装なしの [`VerifiedLayerBlob::from_file_with`]（`NoopOciOpRecorder`）。
+    pub fn from_file(
+        file: File,
+        expected: &Digest,
+        size: u64,
+        owner: u32,
+    ) -> Result<Self, OciError> {
+        Self::from_file_with(&NoopOciOpRecorder, file, expected, size, owner)
+    }
+
+    /// 呼び出し側が開いたハンドルの信頼条件と digest を確かめる（OCI-7・SEC-1・CRI-3・#2893）。
+    ///
+    /// cri の `ensure_rootfs` が `PullSession::open_verified_staged_blob` の返す fd 起点のハンドルを渡す口。
+    /// 検査と記録は [`VerifiedLayerBlob::open_with`] と同じ（`VerifyBlobDigest` を一度だけ記録）で、開く手順だけが無い。
+    /// 渡す `file` は先頭から読める新しいハンドルであること（読み取り位置は 0 から使う）。
+    pub fn from_file_with(
+        recorder: &dyn OciOpRecorder,
+        file: File,
+        expected: &Digest,
+        size: u64,
+        owner: u32,
+    ) -> Result<Self, OciError> {
+        record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
+            Self::check_handle(file, expected, size, owner)
+        })
+    }
+
+    /// 開いたハンドルの信頼条件・digest・サイズを確かめて構築する（`open_with` と `from_file_with` の共通部）。
+    fn check_handle(
+        file: File,
+        expected: &Digest,
+        size: u64,
+        owner: u32,
+    ) -> Result<Self, OciError> {
+        let meta = file.metadata().map_err(map_io_error)?;
+        if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
+            return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
+        }
+        let verified = verify_blob_file_digest_inner(&file, expected, size)?;
+        if verified.size != size {
+            return Err(OciError::new(
+                OciErrorCode::DataLoss,
+                "layer blob size does not match the descriptor",
+            ));
+        }
+        Ok(Self {
+            file,
+            digest: verified.digest,
+            size: verified.size,
         })
     }
 
@@ -1120,6 +1159,37 @@ mod tests {
         assert!(v.iter().all(|s| s.kind() == OciOpKind::VerifyBlobDigest));
         assert_eq!(v[0].outcome(), OciOpOutcome::Success);
         assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-7・SEC-1・CRI-3・#2893: `from_file` は渡されたハンドルの digest・サイズ・信頼条件を確かめて構築する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_verified_layer_blob_from_file_checks_handle() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let d = tmp_dir("vlb-from-file");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = std::fs::metadata(&p).unwrap().uid();
+        let abc = Digest::parse(ABC).unwrap();
+
+        let v = VerifiedLayerBlob::from_file(File::open(&p).unwrap(), &abc, 3, uid).unwrap();
+        assert_eq!(v.size(), 3);
+        assert_eq!(v.digest(), &abc);
+        let e = VerifiedLayerBlob::from_file(File::open(&p).unwrap(), &abc, 10, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        let e = VerifiedLayerBlob::from_file(
+            File::open(&p).unwrap(),
+            &Digest::parse(EMPTY).unwrap(),
+            3,
+            uid,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let e = VerifiedLayerBlob::from_file(File::open(&p).unwrap(), &abc, 3, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

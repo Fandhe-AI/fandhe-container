@@ -25,9 +25,12 @@
 //!
 //! fetcher（`RegistryClient::fetch_blob`）の書き込み先も、`PullSession::open_staged_blob` が返す
 //! `StagedBlobWriter` が `PullDir` の fd 起点（`create_new_file` で `<hex>.part` を排他作成し、`link_name` で
-//! `<hex>` へ確定、`unlink` で `.part` を消す）で行う。パスは渡さない。`PullDir::matches_path` は、読み取り用に
-//! 返すパス（`PullSession::staged_blob_read_path`）が保持している pull ディレクトリと同じ実体を指すことを確かめる
-//! 用途に限って使う。
+//! `<hex>` へ確定、`unlink` で `.part` を消す）で行う。パスは渡さない。
+//!
+//! # 検証後の読み取り（#2893）
+//!
+//! 検証後の読み取りも、`PullSession::open_verified_staged_blob` が `PullDir::open_nofollow` で開いたハンドルを
+//! 渡す。パスは返さず、パスで辿った pull ディレクトリの照合も要らない。
 
 pub(crate) use imp::{PullDir, StagingDir};
 
@@ -41,8 +44,6 @@ mod imp {
     use std::io;
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-    use std::path::Path;
 
     use super::super::imp::RESOLVE;
     use crate::error::{OciError, OciErrorCode};
@@ -298,14 +299,6 @@ mod imp {
             crate::layer::remove_name_tree(self.0.as_fd(), name)
                 .map_err(|e| io::Error::other(e.message().to_owned()))
         }
-
-        /// `p`（パスで辿った pull ディレクトリ）が、この fd と同じ実体か（dev / ino の照合）。
-        pub(crate) fn matches_path(&self, p: &Path) -> bool {
-            let Ok(mine) = self.dir_meta() else {
-                return false;
-            };
-            std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
-        }
     }
 }
 
@@ -540,11 +533,6 @@ mod imp {
             } else {
                 fs::remove_file(&p)
             }
-        }
-
-        /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
-        pub(crate) fn matches_path(&self, _p: &Path) -> bool {
-            true
         }
     }
 }

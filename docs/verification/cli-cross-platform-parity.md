@@ -136,7 +136,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B16 | `inspect nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 
-**手動確認（自動収集しない）**: Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...],"effective":[...],"permitted":[...],"inheritable":[],"ambient":[]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が 3 集合から消える）。start 前・旧記録は `"capabilities":null`。成功時の stdout は新しい stdout 種別が要るため `cli-parity-check.sh` では収集しない（#2775・CLI-1）。
+**手動確認（自動収集しない）**: Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。成功時の stdout は新しい stdout 種別が要るため `cli-parity-check.sh` では収集しない（#2775・CLI-1）。
 
 ## C 層: イメージ管理（`image ls`・`system df`・`image rm`・`image tag`。#2221・#2316・CLI-1・OCI-7）
 

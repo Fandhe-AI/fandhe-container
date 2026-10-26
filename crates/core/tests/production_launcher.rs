@@ -711,18 +711,55 @@ mod linux {
         dir: PathBuf,
     }
 
-    impl Bundle {
-        fn new(tag: &str) -> Self {
+    /// 試験の一時領域の親ディレクトリ（`fandhe-prodlaunch-<pid>-<nanos>`。#2840）と、その共有 flock の保持 fd。
+    ///
+    /// `systemd-tmpfiles-clean`（Ubuntu の `/tmp` は 30d の aging 対象）は走査中、サブディレクトリごとに
+    /// `flock(LOCK_EX|LOCK_NB)` を取る。製品の `BundleLock` は待たずに bundle の flock を取るため、走査と重なると
+    /// create が `container start is in progress in another process` で失敗した（main の CI で間欠）。
+    /// tmpfiles は LOCK_EX を取れないディレクトリを丸ごと飛ばす（tmpfiles.d(5)）ので、親に共有ロックを持ち続けて
+    /// bundle を親の下へ置く。製品側のロックは子の inode に対するもので、親とは干渉しない。
+    static SCRATCH_ROOT: std::sync::OnceLock<(PathBuf, std::fs::File)> = std::sync::OnceLock::new();
+
+    /// 保護済みの親ディレクトリを返す（初回に排他作成して共有ロックを取る。期限内に取れなければ panic。REPAIR-5）。
+    fn scratch_root() -> &'static Path {
+        let (dir, _guard) = SCRATCH_ROOT.get_or_init(|| {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
             let dir = std::fs::canonicalize(std::env::temp_dir())
                 .expect("canonicalize temp_dir")
-                .join(format!(
-                    "fandhe-prodlaunch-{tag}-{}-{nanos}",
-                    std::process::id()
-                ));
+                .join(format!("fandhe-prodlaunch-{}-{nanos}", std::process::id()));
+            std::fs::create_dir(&dir).expect("exclusively create scratch root");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod scratch root");
+            let file = std::fs::File::open(&dir).expect("open scratch root");
+            assert!(
+                eventually(|| file.try_lock_shared().is_ok()),
+                "could not take a shared flock on the scratch root within the deadline"
+            );
+            (dir, file)
+        });
+        dir
+    }
+
+    /// 親ディレクトリを消す（`run` の後始末。成否に関わらず呼ぶ）。
+    fn remove_scratch_root() {
+        if let Some((dir, _)) = SCRATCH_ROOT.get() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    impl Bundle {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let dir = scratch_root().join(format!(
+                "fandhe-prodlaunch-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
             std::fs::create_dir(&dir).expect("exclusively create bundle dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod bundle dir");
@@ -947,7 +984,44 @@ mod linux {
 
     fn do_create(env: &Env, bundle: &Bundle, id: &ContainerId) {
         let req = CreateRequest::new(id.clone(), bundle.dir.clone()).expect("absolute bundle");
-        create(&env.store, &env.recorder, &req).expect("create");
+        if let Err(e) = create(&env.store, &env.recorder, &req) {
+            // 間欠失敗（#2840）の再発時に 1 回でロック保持者を特定できるよう、bundle の flock の保持者を出す（判定は変えない）。
+            eprintln!(
+                "create failed for {}: lock holders: {}",
+                bundle.dir.display(),
+                lock_holders(&bundle.dir)
+            );
+            panic!("create: {e:?}");
+        }
+    }
+
+    /// `/proc/locks` から `path` の inode を持つ行と保持者の `comm` を文字列化する（診断専用。取れなければ "unknown"）。
+    fn lock_holders(path: &Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(md) = std::fs::metadata(path) else {
+            return "unknown".to_owned();
+        };
+        let needle = format!(":{}", md.ino());
+        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+            return "unknown".to_owned();
+        };
+        let rows: Vec<String> = locks
+            .lines()
+            .filter(|l| l.split_whitespace().any(|f| f.ends_with(&needle)))
+            .map(|l| {
+                let comm = l
+                    .split_whitespace()
+                    .nth(4)
+                    .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+                    .unwrap_or_default();
+                format!("[{l}] comm={}", comm.trim())
+            })
+            .collect();
+        if rows.is_empty() {
+            "none".to_owned()
+        } else {
+            rows.join("; ")
+        }
     }
 
     pub fn run() {
@@ -972,6 +1046,7 @@ mod linux {
             scenarios(root, &container, &expected_cgroup, tag);
         }));
         let removed = delegated.remove_child(&container);
+        remove_scratch_root();
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
@@ -1846,8 +1921,7 @@ mod linux {
     /// 内容とモードが具体値でコンテナへ届くことを照合する。呼び出し元のメモリの内容(`from_bytes`)は start の前に
     /// 拒否されることも照合する。
     fn scenario_s_subordinate_sealed_inject(env: &Env, tag: u32) {
-        let host_dir =
-            std::env::temp_dir().join(format!("fandhe-plt-sealed-{}", std::process::id()));
+        let host_dir = scratch_root().join(format!("fandhe-plt-sealed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&host_dir);
         std::fs::create_dir_all(&host_dir).expect("host dir");
         let host_file = host_dir.join("secret");

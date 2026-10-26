@@ -35,7 +35,7 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest check-success-lines-selftest denydeny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing small-files-compare dns-helper-measure idle-memory \

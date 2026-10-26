@@ -2587,9 +2587,9 @@ mod tests {
     }
 
     /// 通常ファイルでないもの・symlink は、権限を変える前に拒否する（OCI-7・SEC-1・OCI-1・REPAIR-12。#2820）。
-    /// 所有者違反は root / CAP_CHOWN が無いと FS 上に作れないため、`layer.rs` の
-    /// `oci1_sec_blob_trust_rejects_untrusted_metadata`（`UnexpectedOwner`）で照合済み（同じ `blob_trust_violation`
-    /// を使う）。ハードリンクは `oci1_verify_does_not_chmod_hard_linked_blob` で照合済み。
+    /// 所有者違反は、実ファイルでは `tests/staged_blob_owner.rs`（範囲写像の subuid 所有・`--ignored`・#2907）が
+    /// 照合し、純粋関数の判定は `layer.rs` の `oci1_sec_blob_trust_rejects_untrusted_metadata`（`UnexpectedOwner`）が
+    /// 照合する（同じ `blob_trust_violation` を使う）。ハードリンクは `oci1_verify_does_not_chmod_hard_linked_blob` で照合済み。
     #[cfg(unix)]
     #[test]
     fn oci7_sec1_staged_blob_rejects_non_regular_without_chmod() {

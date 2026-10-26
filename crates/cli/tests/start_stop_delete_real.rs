@@ -844,6 +844,16 @@ mod linux {
         wait_until(REAP_TIMEOUT, "the ALL container process to vanish", || {
             !Path::new(&format!("/proc/{all_pid}")).exists()
         })?;
+        // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
+        // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
+        wait_until(REAP_TIMEOUT, "the ALL supervisor to exit", || {
+            count_processes(|dir| {
+                fs::read(dir.join("cmdline")).is_ok_and(|c| {
+                    c.starts_with(&sup_needle)
+                        && c.windows(root_needle.len()).any(|w| w == root_needle)
+                })
+            }) == 0
+        })?;
         let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
         expect_ok(&out, "delete (cap-drop ALL)")?;
         expect(

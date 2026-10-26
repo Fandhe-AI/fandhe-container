@@ -192,6 +192,11 @@ mod imp {
         pub(crate) fn remove_pull_dir(&self, id: &PullId) -> io::Result<()> {
             at::unlinkat_name(self.0.as_fd(), OsStr::new(id.as_str()), true)
         }
+
+        /// `<root>/staging` 自身を fsync する（直下の `<id>` のエントリを永続化する。#2539・OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            File::from(self.0.try_clone()?).sync_all()
+        }
     }
 
     /// 開いた `<root>/staging/<pull-id>`。
@@ -397,6 +402,18 @@ mod imp {
         /// 空の `<id>` ディレクトリを消す。
         pub(crate) fn remove_pull_dir(&self, id: &PullId) -> io::Result<()> {
             fs::remove_dir(self.0.join(id.as_str()))
+        }
+
+        /// `<root>/staging` 自身を fsync する（Windows は std で開けないため何もしない。#2539・OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                File::open(&self.0)?.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(())
+            }
         }
     }
 

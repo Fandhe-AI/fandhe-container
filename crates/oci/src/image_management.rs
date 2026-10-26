@@ -28,7 +28,7 @@
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
-//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）。クラッシュで残った pull の
+//!   （#475・TASK-183.10）は `pull` で実装済み（cri の `OciImagePuller::pull` から配線済み・#2539。本番の到達は #2592）。クラッシュで残った pull の
 //!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
 //!   実装済み（起動時の呼び出しの配線は未実装・#2315）
 //! - 件数の上限: コンテナ参照は `MAX_CONTAINER_REFS`、manifest は `MAX_IMAGE_MANIFESTS`、タグは

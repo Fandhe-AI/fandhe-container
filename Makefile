@@ -35,12 +35,12 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest check-success-lines-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing small-files-compare dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
-	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-build docker-shell \
+	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-hub-ratelimit-probe docker-build docker-shell \
 	docker-ci
 
 # --------------------------------------------------
@@ -239,6 +239,9 @@ check-success-lines-selftest: ## 実機前提テストの成功行照合スク�
 crictl-smoke-selftest: ## crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
 	@scripts/with-tools.sh python3 scripts/cri/crictl-smoke-selftest.sh
 
+docker-hub-ratelimit-probe-selftest: ## Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
+	@scripts/cri/docker-hub-ratelimit-probe-selftest.sh
+
 # --------------------------------------------------
 # 依存監査・ライセンス表記
 # --------------------------------------------------
@@ -343,6 +346,9 @@ repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<
 
 crictl-smoke: ## crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
 	@scripts/targets/crictl-smoke.sh
+
+docker-hub-ratelimit-probe: ## Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS=]。CRI-3・#2818）
+	@scripts/cri/docker-hub-ratelimit-probe.sh
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

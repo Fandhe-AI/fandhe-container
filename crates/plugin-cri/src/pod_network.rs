@@ -278,7 +278,13 @@ pub struct PodSubnetLease {
 ///
 /// `set_up` は pod 用サブネットを払い出し、[`set_up_sandbox`] で netns を作って接続し、netns の pin のパス
 /// （`<netns 置き場>/<netns 名>`）を返す。`tear_down` は [`tear_down_pod`] で pod のネットワークごと解放する
-/// （冪等。未知は成功）。パスは検証済みの名前（`/`・`.` を含まない）と固定の置き場からだけ組む。
+/// （冪等。未知は成功）。パスは検証済みの名前（`/`・`.` を含まない）と固定の置き場からだけ組み、bundle の
+/// `linux.namespaces[].path` へ載る Linux 側のパスなので、ホスト OS によらず `/` で連結する（`PodNetns::new` の契約）。
+///
+/// 同じ sandbox への `set_up`・`tear_down` は、`NetworkPlugin` の操作とサブネット枠の払い出し・返却をまとめて
+/// 直列化する（sandbox 単位の使用中の印。重なった呼び出しは待たずに `FAILED_PRECONDITION`）。`tear_down` の
+/// `delete_network` の成功から枠の返却までの間に `set_up` が既存の枠でネットワークを作り直し、その後の返却で
+/// 稼働中のネットワークの枠が別 sandbox へ渡るのを防ぐ（NET-1）。別の sandbox どうしは並行できる。
 ///
 /// **未実装・簡易実装（REPAIR-3）**: 本番へは注入されない（モジュール doc）。サブネットのプールの出どころは未決で、
 /// 構築時の引数として受けるだけ。
@@ -286,6 +292,25 @@ pub struct NetsetupPodNetwork {
     net: Arc<dyn NetworkPlugin>,
     netns_dir: PathBuf,
     pool: PodSubnetPool,
+    /// `set_up`・`tear_down` を実行中の sandbox ID（件数は同時に走る呼び出しの数で有界）。
+    busy: Mutex<BTreeSet<String>>,
+}
+
+/// [`NetsetupPodNetwork`] の sandbox 単位の使用中の印。drop で外す（panic でも外れる）。
+struct SandboxOpGuard<'a> {
+    busy: &'a Mutex<BTreeSet<String>>,
+    sandbox_id: String,
+}
+
+impl Drop for SandboxOpGuard<'_> {
+    fn drop(&mut self) {
+        // poison でも中身は BTreeSet の挿入・削除だけで壊れないため、取り出して外す（印を残すと恒久的に塞ぐ）。
+        let mut busy = match self.busy.lock() {
+            Ok(b) => b,
+            Err(p) => p.into_inner(),
+        };
+        busy.remove(&self.sandbox_id);
+    }
 }
 
 impl NetsetupPodNetwork {
@@ -295,7 +320,39 @@ impl NetsetupPodNetwork {
             net,
             netns_dir,
             pool,
+            busy: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// `sandbox_id` の使用中の印を付ける。既に別の呼び出しが使用中なら `FAILED_PRECONDITION`。
+    fn begin(&self, sandbox_id: &str) -> Result<SandboxOpGuard<'_>, CriError> {
+        // poison でも中身（BTreeSet の挿入・削除だけ）は壊れないため取り出す（drop 側と揃える）。
+        let mut busy = match self.busy.lock() {
+            Ok(b) => b,
+            Err(p) => p.into_inner(),
+        };
+        if !busy.insert(sandbox_id.to_owned()) {
+            return Err(CriError::failed_precondition(
+                "pod network setup or teardown is in progress",
+            ));
+        }
+        Ok(SandboxOpGuard {
+            busy: &self.busy,
+            sandbox_id: sandbox_id.to_owned(),
+        })
+    }
+
+    /// netns の pin のパス（Linux 側の表記。`<netns 置き場>/<netns 名>` を `/` で連結）。
+    fn netns_path(&self, netns_name: &NetnsName) -> Result<PathBuf, CriError> {
+        let dir = self
+            .netns_dir
+            .to_str()
+            .ok_or_else(|| CriError::internal("invalid pod network namespace directory"))?;
+        Ok(PathBuf::from(format!(
+            "{}/{}",
+            dir.trim_end_matches('/'),
+            netns_name.as_str()
+        )))
     }
 }
 
@@ -303,9 +360,12 @@ impl PodNetworkProvider for NetsetupPodNetwork {
     fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
         let to_cri = |e: TraitError| CriError::from(&e);
         let (_, _, netns_name) = sandbox_names(req.sandbox_id).map_err(to_cri)?;
+        // 資源を作る前にパスを検証する（作った後で拒否して残骸を作らない）。
+        let netns = PodNetns::new(self.netns_path(&netns_name)?)?;
+        let _op = self.begin(req.sandbox_id)?;
         let lease = self.pool.lease(req.sandbox_id).map_err(to_cri)?;
         match set_up_sandbox(self.net.as_ref(), req.sandbox_id, lease.subnet) {
-            Ok(_) => PodNetns::new(self.netns_dir.join(netns_name.as_str())),
+            Ok(_) => Ok(netns),
             Err(f) => {
                 // 今回新しく払い出した枠で、資源が残らないと確認できたときだけ返す。既存の予約（同じ sandbox の
                 // 稼働中のネットワーク・回収待ちの残骸）の枠は tear_down の成功まで保持する（NET-1）。
@@ -320,6 +380,7 @@ impl PodNetworkProvider for NetsetupPodNetwork {
     fn tear_down(&self, sandbox_id: &str) -> Result<(), CriError> {
         let to_cri = |e: TraitError| CriError::from(&e);
         let (name, _, _) = sandbox_names(sandbox_id).map_err(to_cri)?;
+        let _op = self.begin(sandbox_id)?;
         match tear_down_pod(self.net.as_ref(), &name) {
             Ok(_) => {}
             // 未作成・解放済みは成功（冪等）。

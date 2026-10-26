@@ -313,31 +313,14 @@ pub struct PodNetns {
 }
 
 impl PodNetns {
-    /// netns の絶対パスから作る。絶対パスで、`..`・`.`・空要素を含まず、長さが上限内であることを検証する
-    /// （壊れた値を bundle へ流さない多層防御。違反は `INTERNAL`）。
+    /// Linux 側の netns の絶対パスから作る。bundle の `linux.namespaces[].path` へ載せる値なので、ホスト OS に
+    /// よらず `SpecBundleProvider` と同じ規則（`crate::bundle::spec` の `check_host_source`: `/` 始まり・`\` 無し・
+    /// `.`・`..`・空要素無し・4096 バイト以内・NUL 無し）で検証する（provider が受けたパスを bundle が拒否する
+    /// 食い違いを作らない。壊れた値を bundle へ流さない多層防御。違反は `INTERNAL`）。
     pub fn new(path: PathBuf) -> Result<Self, CriError> {
-        use std::path::Component;
-        let ok = path.is_absolute()
-            && path.as_os_str().len() <= POD_NETNS_PATH_MAX_BYTES
-            && path.to_str().is_some_and(|s| !s.contains('\0'))
-            // Windows の絶対パスは先頭が `Prefix`（`C:` 等）になるため許可する（3 OS で検証する）。
-            && path.components().all(|c| {
-                matches!(
-                    c,
-                    Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-                )
-            })
-            && path.components().count() > 1
-            // `Path::components` は `.` と連続する `/` を黙って正規化するため、文字列でも検査する。
-            && path.to_str().is_some_and(|s| {
-                // 先頭の区切りを 1 つ除き（添字を使わない）、残りの要素に空・`.`・`..` が無いこと。
-                let rest = s
-                    .strip_prefix('/')
-                    .or_else(|| s.strip_prefix('\\'))
-                    .or_else(|| s.split_once(':').and_then(|(_, r)| r.strip_prefix(['/', '\\'])))
-                    .unwrap_or(s);
-                rest.split(['/', '\\']).all(|e| !matches!(e, "" | "." | ".."))
-            });
+        let ok = path
+            .to_str()
+            .is_some_and(|s| crate::bundle::spec::check_host_source("pod netns path", s).is_ok());
         if ok {
             Ok(Self { path })
         } else {
@@ -350,9 +333,6 @@ impl PodNetns {
         &self.path
     }
 }
-
-/// pod network namespace のパスの長さの上限（バイト。Linux の `PATH_MAX` と同じ）。
-const POD_NETNS_PATH_MAX_BYTES: usize = 4096;
 
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
 ///

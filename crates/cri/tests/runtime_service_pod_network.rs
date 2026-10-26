@@ -25,12 +25,9 @@ use fandhe_container_cri::runtime::v1::{
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use tonic::{Code, Request};
 
+/// Linux 側の netns のパス（ホスト OS によらず `/` 区切り。`PodNetns::new` の契約）。
 fn netns_path(id: &str) -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(r"C:\state\.netns").join(id)
-    } else {
-        PathBuf::from("/state/.netns").join(id)
-    }
+    PathBuf::from(format!("/state/.netns/{id}"))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -301,15 +298,26 @@ async fn malformed_netns_path_from_provider_is_rejected() {
 
 #[test]
 fn pod_netns_new_validates_the_path() {
-    for bad in ["", "rel/ns", "/", "/a/../b", "/a/./b"] {
+    // ホスト OS のネイティブ表記（`C:\`・`\` 区切り）も、bundle の `linux.namespaces[].path` で受けないため拒否する
+    // （provider と bundle の検証規則を揃える。3 OS で同じ結果）。
+    for bad in [
+        "",
+        "rel/ns",
+        "/",
+        "/a/../b",
+        "/a/./b",
+        "/a//b",
+        "/a/b/",
+        r"C:\state\.netns\abc",
+        r"\state\.netns\abc",
+        r"/state/.netns\abc",
+    ] {
         assert!(PodNetns::new(PathBuf::from(bad)).is_err(), "{bad}");
     }
     let long = format!("/{}", "a".repeat(4096));
     assert!(PodNetns::new(PathBuf::from(long)).is_err());
-    if !cfg!(windows) {
-        let ok = PodNetns::new(PathBuf::from("/state/.netns/abc")).unwrap();
-        assert_eq!(ok.path(), std::path::Path::new("/state/.netns/abc"));
-    }
+    let ok = PodNetns::new(PathBuf::from("/state/.netns/abc")).unwrap();
+    assert_eq!(ok.path(), std::path::Path::new("/state/.netns/abc"));
 }
 
 #[tokio::test]

@@ -1271,11 +1271,8 @@ fn provider_with(fake: &Fake) -> fandhe_container_plugin_cri::pod_network::Netse
     let net: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::new(fake.clone()));
     NetsetupPodNetwork::new(
         net,
-        std::path::PathBuf::from(if cfg!(windows) {
-            r"C:\state\.netns"
-        } else {
-            "/state/.netns"
-        }),
+        // Linux 側の置き場（PodNetns の契約により 3 OS とも `/` 区切り）。
+        std::path::PathBuf::from("/state/.netns"),
         PodSubnetPool::new(parent(), 24).expect("pool"),
     )
 }
@@ -1291,12 +1288,7 @@ fn pod_network_provider_set_up_and_tear_down() {
     let netns = provider
         .set_up(&PodNetworkRequest::new(SB, &cfg))
         .expect("set up");
-    let expected = std::path::PathBuf::from(if cfg!(windows) {
-        r"C:\state\.netns"
-    } else {
-        "/state/.netns"
-    })
-    .join(SB);
+    let expected = std::path::PathBuf::from(format!("/state/.netns/{SB}"));
     assert_eq!(netns.path(), expected);
     assert_eq!(fake.calls()[0], format!("create_network {SB} 10.90.0.1/24"));
     provider.tear_down(SB).expect("tear down");
@@ -1408,5 +1400,117 @@ fn pod_network_provider_duplicate_set_up_keeps_the_subnet_in_use() {
             // SB の tear_down で返った枠が再利用される。
             format!("create_network {third} 10.90.0.1/24"),
         ]
+    );
+}
+
+/// `create_network` で指定の名前だけ止める NetworkPlugin（他は内側へ委譲）。並行試験用。
+struct GatedNetwork {
+    inner: NetsetupNetwork<Fake>,
+    gated: String,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl NetworkPlugin for GatedNetwork {
+    fn create_network(
+        &self,
+        req: &CreateNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::NetworkStatus, TraitError> {
+        if req.name().as_str() == self.gated {
+            if let Some(tx) = self.entered.lock().expect("lock").take() {
+                tx.send(()).expect("entered");
+            }
+            if let Some(rx) = self.release.lock().expect("lock").take() {
+                rx.recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("release");
+            }
+        }
+        self.inner.create_network(req)
+    }
+    fn create_netns(
+        &self,
+        req: &CreateNetnsRequest,
+    ) -> Result<fandhe_container_core::traits::NetnsStatus, TraitError> {
+        self.inner.create_netns(req)
+    }
+    fn attach(
+        &self,
+        req: &AttachRequest,
+    ) -> Result<fandhe_container_core::traits::AttachResponse, TraitError> {
+        self.inner.attach(req)
+    }
+    fn publish_port(
+        &self,
+        req: &PublishPortRequest,
+    ) -> Result<fandhe_container_core::traits::PortMapping, TraitError> {
+        self.inner.publish_port(req)
+    }
+    fn detach(
+        &self,
+        req: &DetachRequest,
+    ) -> Result<fandhe_container_core::traits::DetachResponse, TraitError> {
+        self.inner.detach(req)
+    }
+    fn delete_network(
+        &self,
+        req: &DeleteNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteNetworkResponse, TraitError> {
+        self.inner.delete_network(req)
+    }
+}
+
+/// provider: 同じ sandbox の set_up 実行中の tear_down・set_up は FAILED_PRECONDITION で拒否し
+/// （delete_network と枠の返却の間に作り直されて稼働中の枠を返すのを防ぐ）、別の sandbox は並行できる（NET-1）。
+#[test]
+fn pod_network_provider_serializes_operations_on_the_same_sandbox() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    use fandhe_container_plugin_cri::pod_network::{NetsetupPodNetwork, PodSubnetPool};
+    let fake = Fake::default();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let net: Arc<dyn NetworkPlugin> = Arc::new(GatedNetwork {
+        inner: NetsetupNetwork::new(fake.clone()),
+        gated: SB.to_owned(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let provider = Arc::new(NetsetupPodNetwork::new(
+        net,
+        std::path::PathBuf::from("/state/.netns"),
+        PodSubnetPool::new(parent(), 24).expect("pool"),
+    ));
+    let worker = {
+        let provider = Arc::clone(&provider);
+        std::thread::spawn(move || {
+            let cfg = PodSandboxConfig::default();
+            provider.set_up(&PodNetworkRequest::new(SB, &cfg))
+        })
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("set_up entered create_network");
+    let cfg = PodSandboxConfig::default();
+    let busy = provider.tear_down(SB).expect_err("busy tear_down");
+    assert_eq!(busy.code().as_str(), "FAILED_PRECONDITION");
+    let busy = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect_err("busy set_up");
+    assert_eq!(busy.code().as_str(), "FAILED_PRECONDITION");
+    // 別の sandbox は止まらない。
+    let other = "d".repeat(64);
+    provider
+        .set_up(&PodNetworkRequest::new(&other, &cfg))
+        .expect("other");
+    release_tx.send(()).expect("release");
+    worker.join().expect("join").expect("set up");
+    // 完了後は印が外れて tear_down できる。
+    provider.tear_down(SB).expect("tear down");
+    assert_eq!(
+        fake.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("delete_network"))
+            .collect::<Vec<_>>(),
+        vec![format!("delete_network {SB} [{SB}]")]
     );
 }

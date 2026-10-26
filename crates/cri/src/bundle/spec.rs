@@ -475,7 +475,7 @@ fn check_canonical_path(field: &'static str, p: &str) -> Result<(), CriError> {
 }
 
 /// ホスト側のマウント元を core の `validate_source` と同じ規則で検証する（絶対・`\` 無し・`.`・`..`・空要素無し・`/` 不可）。
-fn check_host_source(field: &'static str, p: &str) -> Result<(), CriError> {
+pub(crate) fn check_host_source(field: &'static str, p: &str) -> Result<(), CriError> {
     if p.len() > MAX_PATH_BYTES || p.contains('\0') || p.contains('\\') {
         return Err(invalid(field));
     }

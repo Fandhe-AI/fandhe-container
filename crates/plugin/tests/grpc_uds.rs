@@ -538,7 +538,7 @@ async fn plug2_uds_cri_unimplemented_and_error_mapping() {
         let ch = connect(&sock, &GrpcClientConfig::new()).await;
         let mut rt = RuntimeServiceClient::new(ch.clone());
         let st = rt
-            .version(cri::VersionRequest::default())
+            .container_stats(cri::ContainerStatsRequest::default())
             .await
             .unwrap_err();
         assert_eq!(st.code(), tonic::Code::Unimplemented);

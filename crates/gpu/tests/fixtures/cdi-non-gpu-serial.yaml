@@ -1,0 +1,21 @@
+---
+# 非 GPU デバイス（USB シリアル変換器）を想定した自作の CDI spec（TASK-132・GPU-9〔検討中〕）。
+# major 188 は Linux の devices.txt の USB シリアル（ttyUSB）の固定割り当て。
+cdiVersion: 0.7.0
+kind: example.com/serial
+devices:
+  - name: ttyusb0
+    containerEdits:
+      deviceNodes:
+        - path: /dev/ttyUSB0
+          type: c
+          major: 188
+          minor: 0
+          permissions: rw
+          fileMode: 432
+          gid: 20
+      additionalGids:
+        - 20
+containerEdits:
+  env:
+    - EXAMPLE_SERIAL_BAUD=115200

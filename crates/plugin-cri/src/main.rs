@@ -76,6 +76,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         }
     };
     let recorder = std::sync::Arc::clone(backends.op_recorder());
+    let oci_recorder = std::sync::Arc::clone(backends.oci_op_recorder());
     let sweep_store = std::sync::Arc::clone(backends.state());
     let sweep_recorder = std::sync::Arc::clone(&recorder);
     // bundle の供給は fail-closed。置き場を用意できなければ（fixed 文言のみ出して）起動しない。
@@ -171,8 +172,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             }
         }));
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
-        let stats = tokio::spawn(telemetry::op_stats_export_loop(
-            recorder,
+        let stats = tokio::spawn(telemetry::op_stats_export_loop_many(
+            vec![recorder, oci_recorder],
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
         let r = server::serve_with_audit(

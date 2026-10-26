@@ -54,16 +54,32 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 | `load_config`・`/etc/passwd`・`/etc/group`・image config の読み取り | 大きさの上限で有界（config 4 MiB・1 MiB・65,536 行）。通常ファイル以外は開く前に拒否 |
 | `write_new_file`（config.json・resolv.conf）・状態ストアの書き込みと fsync | 小さなファイル数個。デバイス停止以外は有限 |
 | blob の sha256 検証（`VerifiedLayerBlob::open`） | 合計 16 GiB（`DEFAULT_MAX_IMAGE_BYTES`）・層は最大 128。**1 本ごとに期限を確かめる**（今回の変更） |
-| レイヤー展開（`extract_image_layers_with_options`） | 100 万エントリ・8 GiB で有界。途中では打ち切れず、前後でだけ期限を確かめる |
+| レイヤー展開（`extract_image_layers_bounded`） | 100 万エントリ・8 GiB で有界。**エントリ単位で期限と取り消しを確かめる**（#2899）。分割できないのは 1 エントリの書き込みと tar 終端後の読み捨て |
 | 失敗時の後始末 | 展開した量に比例（展開の上限で有界） |
 
 - RPC 側: 応答は `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）で打ち切られ DEADLINE_EXCEEDED になる。worker は打ち切れないが、記録・件数枠・bundle は
   worker の終了まで保持され、期限超過の失敗は bundle を残さない（`InFlightGuard`）
 - worker 側: 残存は `PLUGIN_ROOTFS_DEADLINE`（600 秒。plugin-cri が明示。値は既定のまま）+ 分割できない区間 1 つ分の超過 + core の create の
   42.9 秒。同時に残る worker は `MAX_CONTAINERS` の件数枠で有界。照合は `repair5_create_worker_residual_is_bounded`
-- 上限づけない理由: 展開のエントリ単位の打ち切りは oci の公開 API の変更を要する。期限の数値の見直しはオーナー判断。どちらも大きさの上限で有限
-- 範囲外: core の `create_with_image*`（CRI の経路では呼ばれない）・RPC 超過後の dispatch 前の打ち切り・デバイス停止による I/O の停止
-- 残る制約: 展開中は打ち切れない（REPAIR-3）
+- 期限の数値の見直しはオーナー判断（値は変えない）
+- 範囲外: core の `create_with_image*`（CRI の経路では呼ばれない）・デバイス停止による I/O の停止・`PullImage` の展開への期限の配線
+- 残る制約: 1 エントリの本体の書き込み（最大 `max_total_bytes`）・blob 1 本の sha256 検証・失敗時の削除は途中で止められない（REPAIR-3）
+
+### RPC の期限切れの後の worker（#2899・CRI-2・REPAIR-5・REPAIR-3）
+
+- 打ち切り: `CreateContainer` の RPC 側は `AbandonOnDrop` を持ち、期限切れ（`Timeout`）と future の破棄（kubelet の取り消し・grpc-timeout）の
+  どちらでも、worker との共有の決着（`SetUpSettlement`）を「手放し」へ進めて取り消しの旗を立てる（atomic の store だけ。RPC スレッドで外部処理をしない）
+- worker の確認点: bundle 用意の前（手放し済みなら `prepare` もしない）→ 展開のエントリごと（旗で `Timeout`、rootfs は消す）→ **dispatch の直前**
+  （`settle_by_worker` の compare_exchange。負けたら `outcome_unknown` は偽のまま `release` と記録の除去）。dispatch の可否は 1 回の
+  compare_exchange で決まるため、呼び出し側と worker が同時に「確定」することはない
+- dispatch 後は打ち切らない: core の create は外部プロセス（supervisor）とファイル I/O を伴い、途中で止める口が無く、止めても実行層に資源が
+  残りうる。この区間は既存の `outcome_unknown`・`confirm_removed` で扱う。最悪は core の create 42.9 秒 + 失敗時の削除確認 60.9 秒（103.8 秒）で、
+  `PLUGIN_ROOTFS_DEADLINE` に収まる（`repair5_create_worker_residual_is_bounded`）
+- 取り消し後の worker の残存: 次の確認点までの分割できない区間（blob 1 本の検証・1 エントリの書き込み）+ 展開物の削除。いずれも大きさの上限で有界
+- 残余（REPAIR-3）: 手放した worker が止まるまで記録・名前キーは残るため、kubelet が即座に再試行すると名前の衝突になりうる。
+  `PLUGIN_ROOTFS_DEADLINE` の 600 秒は、取り消しが届かない場合の上限として残る
+- 照合: `repair5_extract_*`（oci の単体）・`repair5_cancel_during_extraction_*`（cri の rootfs）・`repair5_create_timeout_during_prepare_*`・
+  `repair5_create_future_drop_during_prepare_*`（cri の worker）・`err3_bundle_prepare_timeout_maps_to_deadline_exceeded_and_releases`（prepare の Timeout → DEADLINE_EXCEEDED → `release`）
 
 ## 待ち切れなかったことの区別（#2760）
 

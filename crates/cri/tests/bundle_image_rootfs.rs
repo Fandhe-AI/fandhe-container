@@ -29,6 +29,7 @@ use fandhe_container_cri::runtime::v1::{
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::StagedBlobWriter;
+use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
 use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractOptions, SpecialBitsPolicy};
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
@@ -802,6 +803,62 @@ fn oci1_extract_limits_are_enforced_and_leave_no_bundle() {
     // 上限内なら成功する（上の失敗が環境起因でないことの対）。
     let dir = prepare(&env.provider(), "c4", &container(&env.image_id)).expect("ok");
     assert!(dir.join("rootfs/world").exists());
+}
+
+/// 最初の `ExtractLayer` の記録を見たら取り消しの旗を立てる記録先（展開の途中を決定的に作る。#2899）。
+#[derive(Debug)]
+struct CancelAfterFirstLayer {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    samples: std::sync::Mutex<Vec<(OciOpKind, OciOpOutcome, Option<OciErrorCode>)>>,
+}
+
+impl OciOpRecorder for CancelAfterFirstLayer {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        self.samples
+            .lock()
+            .unwrap()
+            .push((sample.kind(), sample.outcome(), sample.error_code()));
+        if sample.kind() == OciOpKind::ExtractLayer {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// REPAIR-5・CRI-2（#2899）: 展開の途中（1 層目の後）で取り消しの旗が立つと、2 層目の前で止まり、
+/// `DEADLINE_EXCEEDED` に写る固定文言で返り、rootfs・bundle が残らない。計装には 2 層目が TIMEOUT で残る。
+#[test]
+fn repair5_cancel_during_extraction_stops_at_next_layer_and_leaves_no_bundle() {
+    let env = pulled_env("cancel", CONFIG_SECTION);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rec = Arc::new(CancelAfterFirstLayer {
+        flag: Arc::clone(&flag),
+        samples: std::sync::Mutex::new(Vec::new()),
+    });
+    let source = ImageRootfsSource::new(env.extract_config()).with_recorder(rec.clone());
+    let p = env.provider_with(source);
+    let pod = PodSandboxConfig::default();
+    let c = container(&env.image_id);
+    let e = p
+        .prepare(&BundleRequest::new("c1", "sb", &pod, &c).with_cancel(&flag))
+        .map(|b| b.path().to_path_buf())
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    assert_eq!(
+        e.message(),
+        "image rootfs preparation exceeded its deadline"
+    );
+    assert_eq!(bundle_count(&env), 0);
+    assert_eq!(
+        rec.samples.lock().unwrap().clone(),
+        vec![
+            (OciOpKind::ExtractLayer, OciOpOutcome::Success, None),
+            (
+                OciOpKind::ExtractLayer,
+                OciOpOutcome::Failure,
+                Some(OciErrorCode::Timeout)
+            ),
+        ]
+    );
 }
 
 /// release: 0555 を含む rootfs を含む bundle を消せ、不在は成功で冪等。

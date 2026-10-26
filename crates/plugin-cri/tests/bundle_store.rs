@@ -131,8 +131,8 @@ fn cri3_provider_with_store_resolves_tags() {
 
     let tmp = TempDir::new("store");
     let store = Arc::new(InMemoryImageStore::new());
-    let p =
-        bundle_provider_with(&tmp.0, Some(store.clone() as Arc<dyn ImageStore>)).expect("provider");
+    let p = bundle_provider_with(&tmp.0, Some(store.clone() as Arc<dyn ImageStore>), None)
+        .expect("provider");
     let pod = PodSandboxConfig::default();
 
     let c = container("alpine:3.20");

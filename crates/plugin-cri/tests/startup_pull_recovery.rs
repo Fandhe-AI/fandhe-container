@@ -13,16 +13,37 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::{ImageStore, PullId};
+use fandhe_container_oci::instrument::{
+    NoopOciOpRecorder, OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample,
+};
 use fandhe_container_oci::reference::Digest;
 use fandhe_container_plugin_cri::adapter::{
     pull_recovery_summary_line, recover_stale_image_pulls_in,
 };
+use std::sync::{Arc, Mutex};
 
 const ENV_ROOT: &str = "FC_CRI_PULLREC_ROOT";
 const ENV_READY: &str = "FC_CRI_PULLREC_READY";
 const ENV_DONE: &str = "FC_CRI_PULLREC_DONE";
 const CHILD_TEST: &str = "oci7_child_holds_live_pull";
 const WAIT: Duration = Duration::from_secs(30);
+
+fn noop() -> Arc<dyn OciOpRecorder> {
+    Arc::new(NoopOciOpRecorder)
+}
+
+/// oci 側の計装を集める試験用の記録先。
+#[derive(Debug, Default)]
+struct Collect(Mutex<Vec<(OciOpKind, OciOpOutcome)>>);
+
+impl OciOpRecorder for Collect {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        self.0
+            .lock()
+            .expect("lock")
+            .push((sample.kind(), sample.outcome()));
+    }
+}
 
 fn digest() -> Digest {
     Digest::parse(&format!("sha256:{}", "ab".repeat(32))).expect("digest")
@@ -130,7 +151,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
     }
 
     let recorder = OpRecorder::new();
-    let r = recover_stale_image_pulls_in(&root, &recorder).expect("recover");
+    let r = recover_stale_image_pulls_in(&root, &recorder, noop()).expect("recover");
     assert_eq!(r.reclaimed(), &[pid("deadpull")]);
     assert_eq!(r.released_leases(), &[(pid("deadpull"), 1)]);
     assert_eq!(r.kept_live(), &[pid("livepull")]);
@@ -161,7 +182,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
     fs::write(&done, b"1").expect("done");
     let status = child.wait().expect("wait child");
     assert!(status.success());
-    let r2 = recover_stale_image_pulls_in(&root, &recorder).expect("recover again");
+    let r2 = recover_stale_image_pulls_in(&root, &recorder, noop()).expect("recover again");
     assert_eq!(r2.reclaimed(), &[pid("livepull")]);
     assert_eq!(r2.released_leases(), &[(pid("livepull"), 1)]);
     let leases = ImageStore::open(&root)
@@ -178,7 +199,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
 fn oci7_startup_recovery_on_empty_images_root_is_noop() {
     let tmp = Tmp::new("empty");
     let root = tmp.images();
-    let r = recover_stale_image_pulls_in(&root, &OpRecorder::new()).expect("recover");
+    let r = recover_stale_image_pulls_in(&root, &OpRecorder::new(), noop()).expect("recover");
     assert_eq!(r, Default::default());
 }
 
@@ -188,6 +209,28 @@ fn oci7_startup_recovery_rejects_untrusted_root() {
     let tmp = Tmp::new("untrusted");
     let root = tmp.images();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).expect("chmod");
-    let e = recover_stale_image_pulls_in(&root, &OpRecorder::new()).expect_err("untrusted");
+    let e = recover_stale_image_pulls_in(&root, &OpRecorder::new(), noop()).expect_err("untrusted");
     assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+}
+
+/// REPAIR-4・OCI-1・OCI-7（#2900）: 起動時の回収は共有記録器へ `image_pull_recovery` を、oci の記録先へ
+/// `RecoverStalePulls` の成功を 1 件ずつ渡す。
+#[test]
+fn repair4_startup_recovery_records_oci_ops_in_oci_recorder() {
+    let tmp = Tmp::new("ocirec");
+    let root = tmp.images();
+    let shared = OpRecorder::new();
+    let oci = Arc::new(Collect::default());
+    recover_stale_image_pulls_in(&root, &shared, oci.clone()).expect("recover");
+    let stat = shared
+        .snapshot()
+        .into_iter()
+        .find(|s| s.name().as_str() == "image_pull_recovery")
+        .expect("recorded");
+    assert_eq!(stat.success(), 1);
+    let got = oci.0.lock().expect("lock").clone();
+    assert!(
+        got.contains(&(OciOpKind::RecoverStalePulls, OciOpOutcome::Success)),
+        "{got:?}"
+    );
 }

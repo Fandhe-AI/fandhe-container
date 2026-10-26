@@ -130,6 +130,7 @@ cat <<'EOF'
   crictl-smoke-selftest               scripts/cri/crictl-smoke-selftest.sh
                                         crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
+  check-success-lines-selftest        scripts/check-success-lines-selftest.sh
                                         repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
   deny                                scripts/targets/deny.sh
                                         cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）

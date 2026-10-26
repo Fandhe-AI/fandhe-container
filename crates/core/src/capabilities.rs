@@ -505,6 +505,31 @@ impl ContainerCapabilities {
 mod tests {
     use super::*;
 
+    /// SEC-2・SEC-1（#2789）: `exec/sysfs.rs` の rbind 最上位の ro を保つ前提（`CAP_SYS_ADMIN` が許可集合に無い）の固定。
+    /// 既定集合に無く、add の経路が無く、drop の後にも現れないことを具体値で照合する。
+    #[test]
+    fn sec2_sysfs_ro_premise_default_caps_lack_sys_admin() {
+        assert_eq!(Capability::SysAdmin.index(), 21);
+        let words = CapabilitySet::oci_default().to_cap_words();
+        assert_eq!(words, [0xA804_25FB, 0]);
+        assert_eq!(words[0] & (1 << 21), 0);
+
+        let default = ContainerCapabilities::oci_default();
+        assert!(!default.bounding().contains(Capability::SysAdmin));
+
+        let err = ContainerCapabilities::restrict(
+            CapabilitySet::oci_default().with(Capability::SysAdmin),
+        )
+        .unwrap_err();
+        assert_eq!(err.rejected(), &[Capability::SysAdmin]);
+
+        let dropped_all = default.without(parse_drop_list(&["ALL"]).unwrap());
+        let dropped_chown = default.without(parse_drop_list(&["CHOWN"]).unwrap());
+        for c in [dropped_all, dropped_chown] {
+            assert!(!c.bounding().contains(Capability::SysAdmin));
+        }
+    }
+
     /// SEC-1: 名前の逆写像は `as_str` と往復し、接頭辞なし・小文字・未知名は `None`。
     #[test]
     fn sec1_from_name_round_trips() {

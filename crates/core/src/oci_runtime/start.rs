@@ -1110,7 +1110,7 @@ fn validate_bind_mounts(
     };
     // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
     let children = mounts_under(&mounts, &state_real);
-    let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    let mut roots = build_protected_roots(&state_id, &state_real, &children, &child_is_visible);
     // 状態ルートの実体（dev, ino）の鎖を fd で固定する。適用の段（restart を含む毎回）が、mountinfo の文字列に依らず
     // 元との同一・祖先・子孫を inode で照合する（SEC-1・SEC-4・#2066）。固定できなければ fail-closed（パスは載せない）。
     let Some(chain) = dir_identity_chain(&state_real) else {
@@ -1175,10 +1175,10 @@ fn source_reaches_protected(
     src_real: &str,
     recursive: bool,
     state_id: &FsIdentity,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
 ) -> bool {
     std::iter::once(state_id)
-        .chain(children.iter().map(|(id, _)| id))
+        .chain(children.iter().map(|(id, _, _)| id))
         .any(|protected| {
             source_reaches(mounts, src_mnt_id, src_real, recursive, protected).unwrap_or(true)
         })
@@ -1189,37 +1189,62 @@ fn source_reaches_protected(
 /// 状態ファイルのハードリンクは、適用の段が毎回走査し直す。走査は保護対象ごとに自分のマウントの木に限り、別の FS の
 /// マウントポイントへは降りない（他の FS 上のリンクのせいで無関係な FS 上のディレクトリ元を誤って拒否しない）。
 /// 子マウントは自分のマウントポイントを走査根にする。同じマウントポイントに複数のマウントが重なるなど、走査で
-/// 実体を確定できないものは「リンクあり」に固定する（fail-closed）。
+/// 実体を確定できないもの（祖先の overmount で隠れた子を含む。#2823）は「リンクあり」に固定する（fail-closed）。
 fn build_protected_roots(
     state_id: &FsIdentity,
     state_real: &str,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
+    is_visible: &dyn Fn(&str, u64) -> bool,
 ) -> Vec<ProtectedFsRoot> {
+    // 見えているか（point を `/` から辿った先の mount ID が子の ID と一致するか）。祖先の overmount で隠れた子は
+    // 見えていない。見えていない子の中身を point のパスで歩くと覆っている別のマウントの中身を取り違えるため、
+    // 走査せず「リンクあり」に固定し、他の走査の枝刈りからも外す（走査範囲が広がる向きだけに倒す）。
+    let visible: Vec<bool> = children
+        .iter()
+        .map(|(_, point, id)| is_visible(point, *id))
+        .collect();
     let prune_for = |dev: &str, scan_root: &str| -> Vec<String> {
         children
             .iter()
-            .filter(|(id, point)| {
-                id.dev != dev
+            .zip(&visible)
+            .filter(|((id, point, _), vis)| {
+                **vis
+                    && id.dev != dev
                     && point != scan_root
                     && Path::new(point).starts_with(Path::new(scan_root))
             })
-            .map(|(_, point)| point.clone())
+            .map(|((_, point, _), _)| point.clone())
             .collect()
     };
     let mut roots = vec![
         ProtectedFsRoot::new(state_id.dev.clone(), state_id.path.clone(), true)
             .with_scan_root(state_real.to_owned(), prune_for(&state_id.dev, state_real)),
     ];
-    for (id, point) in children {
-        let shared = children.iter().filter(|(_, p)| p == point).count() > 1;
+    for ((id, point, _), vis) in children.iter().zip(&visible) {
+        let shared = children.iter().filter(|(_, p, _)| p == point).count() > 1;
         let root = ProtectedFsRoot::new(id.dev.clone(), id.path.clone(), true);
-        roots.push(if shared {
+        roots.push(if shared || !vis {
             root
         } else {
             root.with_scan_root(point.clone(), prune_for(&id.dev, point))
         });
     }
     roots
+}
+
+/// 状態ルート配下の子マウントが、いま見えている（point を `/` から辿った先の mount ID が一致する）か（#2823・SEC-1・CORE-2）。
+///
+/// 辿れない（symlink・ディレクトリでない・深すぎる）ときも見えていないものとして扱い、呼び出し側が fail-closed にする。
+/// start と同じ mount namespace・同じスレッドで呼ぶこと（mount ID は namespace ごとに振られる）。
+#[cfg(target_os = "linux")]
+fn child_is_visible(point: &str, id: u64) -> bool {
+    super::mountinfo_identity::dir_identity_chain_with_mnt_id(point).is_some_and(|(_, m)| m == id)
+}
+
+/// Linux 以外では fd の mount ID を取れないため、見えていないものとして扱う（bind mount は Linux 限定。fail-closed）。
+#[cfg(not(target_os = "linux"))]
+fn child_is_visible(_point: &str, _id: u64) -> bool {
+    false
 }
 
 /// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
@@ -3968,8 +3993,9 @@ mod tests {
                 path: "/c1".to_owned(),
             },
             sub_s.clone(),
+            30,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &children);
+        let roots = build_protected_roots(&state_id, &state_s, &children, &|_, _| true);
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].dev(), "8:1");
         assert!(
@@ -3985,8 +4011,9 @@ mod tests {
                 path: "/srv/state/sub".to_owned(),
             },
             sub_s,
+            31,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &same);
+        let roots = build_protected_roots(&state_id, &state_s, &same, &|_, _| true);
         assert!(roots[0].has_hard_linked_files());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4012,12 +4039,199 @@ mod tests {
                     path: "/".to_owned(),
                 },
                 sub_s.clone(),
+                40,
             )
         };
-        let roots = build_protected_roots(&state_id, &state_s, &[child("8:2"), child("8:3")]);
+        let roots = build_protected_roots(
+            &state_id,
+            &state_s,
+            &[child("8:2"), child("8:3")],
+            &|_, _| true,
+        );
         assert!(roots[1].has_hard_linked_files());
         assert!(roots[2].has_hard_linked_files());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子は走査せず「リンクあり」に固定し、他の走査の枝刈りから外す。
+    /// 状態ルート `/state`(dev A・ID 20)、X(dev C・ID 30・`/state/x/y`・隠れている)、Y(dev A・ID 35・`/state/x`)。
+    #[test]
+    fn sec1_2823_hidden_child_is_fixed_to_linked_and_not_pruned() {
+        let id = |dev: &str| FsIdentity {
+            dev: dev.to_owned(),
+            path: "/".to_owned(),
+        };
+        let state_id = id("A");
+        let children = vec![
+            (id("C"), "/state/x/y".to_owned(), 30),
+            (id("A"), "/state/x".to_owned(), 35),
+        ];
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, mnt| mnt != 30);
+        assert_eq!(roots.len(), 3);
+        // 隠れた X の point は状態ルートの枝刈りに入らない（Y の中の `/y` 配下も走査する）。
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec![])
+        );
+        // X は走査根を持たず固定で「リンクあり」。
+        assert_eq!(
+            roots[1],
+            ProtectedFsRoot::new("C".to_owned(), "/".to_owned(), true)
+        );
+        #[cfg(target_os = "linux")]
+        assert!(roots[1].has_hard_linked_files());
+        // Y は自分の point を走査根にする。
+        assert_eq!(
+            roots[2],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state/x".to_owned(), vec![])
+        );
+        // 対照: すべて見えているなら、別 FS の X の point は Y(同 dev)の枝刈りに入らず、状態ルート（同 dev A）の枝刈りには入る。
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, _| true);
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec!["/state/x/y".to_owned()])
+        );
+    }
+
+    /// SEC-1・CORE-2（#2823）の本番経路: 実際の fd の mount ID 照合（`child_is_visible`）を通す。
+    /// 実在するディレクトリは自分の mount ID と一致して「見える」、食い違う ID は「見えない」と判定される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2823_child_is_visible_matches_real_mount_id() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-vis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let point = base.to_str().expect("utf8").to_owned();
+        let mnt = path_mount_id(&point).expect("mount id");
+        assert!(child_is_visible(&point, mnt));
+        assert!(!child_is_visible(&point, mnt + 1));
+        assert!(!child_is_visible(&format!("{point}/missing"), mnt));
+        // 本番の判定を build_protected_roots へ渡すと、ID が食い違う子は走査根を持たず「リンクあり」に固定される。
+        let state_id = FsIdentity {
+            dev: "A".to_owned(),
+            path: "/".to_owned(),
+        };
+        let child = |id: u64| {
+            vec![(
+                FsIdentity {
+                    dev: "B".to_owned(),
+                    path: "/".to_owned(),
+                },
+                point.clone(),
+                id,
+            )]
+        };
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt), &child_is_visible);
+        assert!(!roots[1].has_hard_linked_files());
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt + 1), &child_is_visible);
+        assert!(roots[1].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CORE-2（#2823）の実マウント結合試験（実機前提・`--ignored`）。非特権 user / mount namespace
+    /// （util-linux の `unshare`）の中で、子マウント Y（ハードリンクを持つ tmpfs）を祖先の overmount で隠し、
+    /// 本番経路（mountinfo の解釈・`path_mount_id`・`child_is_visible`・`build_protected_roots`）で隠れた子が
+    /// 「リンクあり」に固定されることを具体値で照合する。成功行は `ok: sec1_2823_overmount`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires unprivileged user namespaces and util-linux unshare/mount (SEC-1, CORE-2, #2823)"]
+    fn sec1_2823_overmount_hides_child_in_real_namespace() {
+        const NAME: &str =
+            "oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace";
+        if std::env::var_os("FANDHE_2823_INNER").is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let mut cmd = std::process::Command::new("unshare");
+            cmd.args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                NAME,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FANDHE_2823_INNER", "1");
+            // 外側の待機は期限つき（REPAIR-5）。内側の mount 3 回分より長く 30 秒とする。
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(30))
+                .expect("unshare must finish before the deadline");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "inner failed: {text}");
+            assert!(
+                text.contains("ok: sec1_2823_overmount"),
+                "no success line: {text}"
+            );
+            println!("ok: sec1_2823_overmount");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("fandhe-oci-2823-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mount_tmpfs = |dir: &Path| {
+            let mut cmd = std::process::Command::new("mount");
+            cmd.args(["-t", "tmpfs", "tmpfs"]).arg(dir);
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(5))
+                .expect("mount must finish before the deadline");
+            assert!(
+                out.status.success(),
+                "mount tmpfs on {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let x = base.join("x");
+        let y = x.join("y");
+        std::fs::create_dir_all(&y).expect("mkdir");
+        // 状態ルート = base(tmpfs A)。その下の x/y に tmpfs Y を置き、Y にハードリンクを作る。
+        mount_tmpfs(&base);
+        std::fs::create_dir_all(&y).expect("mkdir y");
+        mount_tmpfs(&y);
+        std::fs::write(y.join("f"), b"x").expect("write");
+        std::fs::hard_link(y.join("f"), y.join("g")).expect("link");
+        // 祖先 x を別の tmpfs で覆う。Y は mountinfo に残るが x/y のパスからは辿れなくなる。
+        mount_tmpfs(&x);
+        std::fs::create_dir_all(&y).expect("mkdir y over");
+        let base_s = base.to_str().expect("utf8").to_owned();
+        let mountinfo = read_mountinfo_bounded("/proc/thread-self/mountinfo").expect("mountinfo");
+        let mounts = parse_mountinfo(&mountinfo).expect("parse");
+        let state_mnt = path_mount_id(&base_s).expect("state mnt");
+        let state_id = fs_identity(&mounts, state_mnt, &base_s).expect("state id");
+        let children = mounts_under(&mounts, &base_s);
+        assert_eq!(children.len(), 2);
+        // 覆われた Y（x/y の位置の行）は見えず、覆っている tmpfs（x の位置の行）は見える。
+        let hidden = children
+            .iter()
+            .find(|(_, p, _)| {
+                p.ends_with("/x/y") && !child_is_visible(p, children_id(&children, p))
+            })
+            .expect("hidden child");
+        let roots = build_protected_roots(&state_id, &base_s, &children, &child_is_visible);
+        let idx = children.iter().position(|c| c.2 == hidden.2).expect("pos") + 1;
+        assert!(
+            roots[idx].has_hard_linked_files(),
+            "hidden child must be fixed to linked"
+        );
+        // 覆っている x は見えていて、走査してもリンクは無い。
+        let xi = children
+            .iter()
+            .position(|c| c.1.ends_with("/x"))
+            .expect("x")
+            + 1;
+        assert!(!roots[xi].has_hard_linked_files());
+        println!("ok: sec1_2823_overmount");
+        let _ = std::fs::remove_dir_all(&base);
+
+        fn children_id(children: &[(FsIdentity, String, u64)], p: &str) -> u64 {
+            children.iter().find(|c| c.1 == p).map_or(0, |c| c.2)
+        }
     }
 
     /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。

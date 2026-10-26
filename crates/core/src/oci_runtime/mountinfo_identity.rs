@@ -8,6 +8,28 @@
 //!
 //! mountinfo の読み取りは [`read_mountinfo_bounded`] が上限つきで行い、解析は [`parse_mountinfo`] が行数を制限する
 //! （無制限確保による DoS を防ぐ）。
+//!
+//! # mountinfo のパス文字列による行選択の点検（#2823・SEC-1・CORE-2・NET-1）
+//!
+//! 同じパスに別のマウントが重なる・祖先の overmount で隠れるマウントがあると、mount point や root の文字列で
+//! 行を選ぶ判定は取り違える（crates/net の `unpin_in_dir` は #2764 で fd の `mnt_id` 照合へ変更済み）。
+//! crates/core の箇所ごとの判定は次のとおり。
+//!
+//! | 箇所 | 判定 |
+//! | ---- | ---- |
+//! | `fs_identity`・`reaches_by`・`exposed_devs`・`mounts_under` の降り方 | 変更不要。`mnt_id` で行を引き、配下は parent ID で降りる。文字列は引いた後の絞り込みか、隠れた行も含める保守側のみ |
+//! | `exec` の `mount_is_shared_in`・`mount_is_read_only_in`、`masked_paths`・`inject`・`devices`・`tmpfs` の before / after 照合 | 変更不要。`mnt_id` のみで判定 |
+//! | `exec/bind_mounts` の `subtree_members`・`check_bind_subtree_with`・overlay 層・`fresh_state_identity` | 変更不要。ID・parent ID・dev で引く |
+//! | `exec/rootfs` の `check_no_submounts`・`bind_lineage_ok`・pivot 後の検査 | 変更不要。ID の親子関係 |
+//! | `landlock/apply`・`image_rootfs`・`start` の状態ルート / rootfs / bundle | 変更不要。fd の `mnt_id` で照合 |
+//! | `exec/sysfs::check_sysfs_tree`・`exec/path_masks::check_subtree_read_only`（部分木の事後検証） | 変更済み。配下を前方一致で集めると隠れた行まで数え誤拒否していたため、top の `mnt_id` から parent ID で降りる |
+//! | `start::build_protected_roots`（状態ルートの子マウントのハードリンク走査） | 変更済み。隠れた子を見えているマウントの中身に帰属させ、走査の枝刈りで同じ FS の一部を走査し損ねうるため、start の時点で point を fd で辿った `mnt_id` と子の ID を照合し、見えていない子は「リンクあり」に固定して枝刈りから外す |
+//! | `sys.rs` 試験の devpts 実機試験 | 変更済み。返された fd の `mnt_id` で行を引く |
+//! | `sys.rs` 試験の `is_mount_point`・`mount_options_of`、`sealed_copy` 試験の `/proc` 検索、`bind_mounts` 試験の `point == merged` | 据え置き。自作の一時マウントを引く実機前提の試験で、重なりの有無で意味が変わらない |
+//!
+//! 残余: 子マウントの可視判定は start の時点のトポロジーに基づく。restart までの間に構成が変わった場合は、従来の
+//! 走査根・枝刈りと同じく start の時点の値を使う。別 crate（platform-macos・platform-windows・cli の `doctor`）の
+//! 独自のパス照合は本点検の範囲外。
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -421,8 +443,12 @@ pub(crate) fn exposed_devs(
 
 /// `state_root`（正規化済みの絶対パス）の配下に載るマウントの実体（状態ルート自身のマウントは含まない）。
 /// 状態ルート配下の子 bind mount 経由でも状態ファイルを公開させないため、保護対象に加える（SEC-1・#1915）。
-/// 覆い隠されたマウントも保守的に含める。各要素は FS 内の実体と、ホスト側のマウントポイント（走査・枝刈りに使う）。
-pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<(FsIdentity, String)> {
+/// 覆い隠されたマウントも保守的に含める。各要素は FS 内の実体と、ホスト側のマウントポイント（走査・枝刈りに使う）と mount ID
+/// （そのマウントが見えているかの fd 照合に使う。#2823）。
+pub(crate) fn mounts_under(
+    mounts: &[MountRow],
+    state_root: &str,
+) -> Vec<(FsIdentity, String, u64)> {
     mounts
         .iter()
         .filter(|m| m.point != state_root && under(state_root, &m.point).is_some())
@@ -433,6 +459,7 @@ pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<(FsIden
                     path: m.root.clone(),
                 },
                 m.point.clone(),
+                m.id,
             )
         })
         .collect()
@@ -610,6 +637,26 @@ mod tests {
         assert_eq!(v[0].0.dev, "8:2");
         assert_eq!(v[0].0.path, "/container-state");
         assert_eq!(v[0].1, "/state/c1");
+        assert_eq!(v[0].2, 30);
+    }
+
+    /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子も、mount ID つきで保守的に含める（見えているかは呼び出し側が fd で判定）。
+    #[test]
+    fn sec1_2823_mounts_under_includes_hidden_children_with_ids() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
+                    30 20 8:3 / /state/x/y rw - ext4 /dev/sda3 rw\n\
+                    35 20 8:1 /srv/state/x /state/x rw - ext4 /dev/sda1 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let v = mounts_under(&mounts, "/state");
+        let got: Vec<(&str, &str, u64)> = v
+            .iter()
+            .map(|(i, p, id)| (i.dev.as_str(), p.as_str(), *id))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("8:3", "/state/x/y", 30), ("8:1", "/state/x", 35)]
+        );
     }
 
     /// REPAIR-1・CORE-2（#2762）: fdinfo の `mnt_id` 解析の正常系と、欠落・重複・非数値・上限超えの拒否。

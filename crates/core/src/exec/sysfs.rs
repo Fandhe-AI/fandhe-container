@@ -336,7 +336,8 @@ fn open_sys_dir(new_root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
 /// mountinfo の 1 行の必要な部分。
 pub(super) struct Entry<'a> {
     pub(super) id: u64,
-    pub(super) mount_point: &'a str,
+    /// 親マウントの mount ID（2 列目）。部分木を親子関係で辿るために使う（#2823）。
+    pub(super) parent: u64,
     pub(super) options: &'a str,
     pub(super) fstype: &'a str,
 }
@@ -354,15 +355,47 @@ pub(super) fn parse_entry(line: &str) -> Option<Entry<'_>> {
         .checked_add(FIXED_FIELDS)?;
     Some(Entry {
         id: fields.first()?.parse().ok()?,
-        mount_point: fields.get(4)?,
+        parent: fields.get(1)?.parse().ok()?,
         options: fields.get(5)?,
         fstype: fields.get(sep.checked_add(1)?)?,
     })
 }
 
+/// `top_mnt_id` のマウントとその子孫（parent ID で辿る）を、先頭に top を置いて返す（純関数。fail-closed。#2823・SEC-1・CORE-2）。
+///
+/// マウントポイントのパス文字列の前方一致では、top の下に隠れた同じ点の下側の行や、
+/// 隠れた別の木の同じ接頭辞の行まで含めて取り違える。`bind_mounts::subtree_members` と同じく親子関係で降りる。
+/// top の不在は `missing`、mount ID の重複は固定の英文で拒否する。反復は行数で頭打ちにし、循環した親 ID でも終わる。
+pub(super) fn subtree_entries<'a>(
+    entries: &'a [Entry<'a>],
+    top_mnt_id: u64,
+    missing: &'static str,
+) -> Result<Vec<&'a Entry<'a>>, &'static str> {
+    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
+    let top = tops.next().ok_or(missing)?;
+    if tops.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
+    }
+    let mut members: Vec<&Entry<'_>> = vec![top];
+    let mut ids = vec![top.id];
+    for _ in 0..entries.len() {
+        let before = ids.len();
+        for e in entries {
+            if !ids.contains(&e.id) && ids.contains(&e.parent) {
+                ids.push(e.id);
+                members.push(e);
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    Ok(members)
+}
+
 /// 載せた `/sys` の事後条件（純関数。fail-closed）。
 ///
-/// `top_mnt_id` のマウントが sysfs で、同じマウントポイント以下（配下を含む）のすべてのマウントの per-mount options が
+/// `top_mnt_id` のマウントが sysfs で、その子孫（parent ID で辿る。#2823）を含むすべてのマウントの per-mount options が
 /// `ro,nosuid,nodev,noexec` を持つことを確かめる。書式に反する行・該当行なし・同じ mount ID の重複は拒否する。
 /// 返す文字列は固定の英文で、mountinfo の値（パス・オプション）を含めない。
 fn check_sysfs_tree(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
@@ -371,22 +404,18 @@ fn check_sysfs_tree(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
     for line in info.lines() {
         entries.push(parse_entry(line).ok_or(MALFORMED)?);
     }
-    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
-    let top = tops
-        .next()
+    let members = subtree_entries(
+        &entries,
+        top_mnt_id,
+        "no mount entry found for the sysfs mount",
+    )?;
+    let top = members
+        .first()
         .ok_or("no mount entry found for the sysfs mount")?;
-    if tops.next().is_some() {
-        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
-    }
     if top.fstype != "sysfs" {
         return Err("the /sys mount is not a sysfs");
     }
-    let prefix = format!("{}/", top.mount_point.trim_end_matches('/'));
-    for e in &entries {
-        let under = e.mount_point == top.mount_point || e.mount_point.starts_with(&prefix);
-        if !under {
-            continue;
-        }
+    for e in &members {
         let has = |flag: &str| e.options.split(',').any(|o| o == flag);
         if !(has("ro") && has("nosuid") && has("nodev") && has("noexec")) {
             return Err("a mount under /sys is not ro,nosuid,nodev,noexec");
@@ -635,7 +664,11 @@ mod tests {
     }
 
     fn line(id: u64, mp: &str, opts: &str, fstype: &str) -> String {
-        format!("{id} 1 0:5 / {mp} {opts} master:1 - {fstype} {fstype} rw")
+        linep(id, 1, mp, opts, fstype)
+    }
+
+    fn linep(id: u64, parent: u64, mp: &str, opts: &str, fstype: &str) -> String {
+        format!("{id} {parent} 0:5 / {mp} {opts} master:1 - {fstype} {fstype} rw")
     }
 
     /// SEC-2: 事後条件の判定。配下の 1 件でも rw なら拒否し、最上位が sysfs でなければ拒否する。
@@ -644,7 +677,7 @@ mod tests {
         let ro = "ro,nosuid,nodev,noexec,relatime";
         let ok = [
             line(10, "/r/sys", ro, "sysfs"),
-            line(11, "/r/sys/fs/cgroup", ro, "cgroup2"),
+            linep(11, 10, "/r/sys/fs/cgroup", ro, "cgroup2"),
             line(12, "/r/sysx", "rw,relatime", "tmpfs"),
             line(13, "/r/proc", "rw,nosuid", "proc"),
         ]
@@ -653,7 +686,13 @@ mod tests {
         // 配下の rw は拒否（`/r/sysx` は配下ではないので影響しない）。
         let child_rw = [
             line(10, "/r/sys", ro, "sysfs"),
-            line(11, "/r/sys/fs/cgroup", "rw,nosuid,nodev,noexec", "cgroup2"),
+            linep(
+                11,
+                10,
+                "/r/sys/fs/cgroup",
+                "rw,nosuid,nodev,noexec",
+                "cgroup2",
+            ),
         ]
         .join("\n");
         assert_eq!(
@@ -696,5 +735,38 @@ mod tests {
             check_sysfs_tree("garbage line", 10),
             Err("malformed line in /proc/thread-self/mountinfo")
         );
+    }
+
+    /// SEC-1・CORE-2（#2823）: 隠れた行・別の木の同接頭辞の行は数えず、top の子孫だけを判定する。
+    #[test]
+    fn sec1_2823_check_sysfs_tree_follows_parent_ids_not_path_prefix() {
+        let ro = "ro,nosuid,nodev,noexec";
+        let rw = "rw,relatime";
+        let hidden = [
+            linep(5, 1, "/r/sys", rw, "tmpfs"),
+            linep(10, 5, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/fs/cgroup", ro, "cgroup2"),
+            linep(20, 2, "/r/sys/other", rw, "tmpfs"),
+            linep(21, 2, "/r/sysx", rw, "tmpfs"),
+        ]
+        .join("\n");
+        assert_eq!(check_sysfs_tree(&hidden, 10), Ok(()));
+        let grand = [
+            linep(10, 1, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/a", ro, "cgroup2"),
+            linep(12, 11, "/r/sys/a/b", rw, "tmpfs"),
+        ]
+        .join("\n");
+        assert_eq!(
+            check_sysfs_tree(&grand, 10),
+            Err("a mount under /sys is not ro,nosuid,nodev,noexec")
+        );
+        let cyc = [
+            linep(10, 12, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/a", ro, "cgroup2"),
+            linep(12, 11, "/r/sys/b", ro, "cgroup2"),
+        ]
+        .join("\n");
+        assert_eq!(check_sysfs_tree(&cyc, 10), Ok(()));
     }
 }

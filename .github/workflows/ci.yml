@@ -1254,6 +1254,42 @@ jobs:
           done
           echo "::notice::runtime_service_namespaces verified"
 
+      # sec1_2536_protected_root_on_real_overlay（`crates/core/src/exec/bind_mounts.rs` の lib 内試験。SEC-1・OCI-4・SEC-5・
+      # TASK-29 追補・#2536・#2793）: 保護対象（状態ルート・rootfs・bundle）が実機の overlayfs の上にあるときの逆方向の照合を、
+      # 非特権 user + mount namespace の中の実 overlay と実 mountinfo で確かめる実機前提テスト（Linux 6.8 以降・util-linux の
+      # unshare / mount）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（ホストのマウントは
+      # 変えない）。libtest のため自前の成功行が無く、結果行を完全一致で照合する（`--ignored` が届かないと `ignored` となり
+      # `ok` の行が出ないので fail-closed）。外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ
+      # `ok` 行が 2 回出る。grep は試験に届いたことの確認で、外側の成否は pipefail で cargo の終了コードが担う。
+      # 外側に `--test-threads=1` は付けない（結果行が子の出力と混ざりうるため）。
+      - name: sec1_2536_protected_root_on_real_overlay のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --lib --no-run
+
+      - name: sec1_2536_protected_root_on_real_overlay の実行（実機前提テスト・--ignored。SEC-1・OCI-4・SEC-5・#2536）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sec1_2536_real_overlay.log"
+          cargo test -p fandhe-container-core --lib \
+            -- --ignored sec1_2536_protected_root_on_real_overlay 2>&1 | tee "${log}"
+          name='exec::bind_mounts::tests::sec1_2536_protected_root_on_real_overlay'
+          if grep -Fxq "test ${name} ... ignored" "${log}"; then
+            echo "::error::${name} was ignored (--ignored did not reach the test)" >&2
+            exit 1
+          fi
+          if ! grep -Fxq "test ${name} ... ok" "${log}"; then
+            echo "::error::${name} did not report ok (possibly not executed)" >&2
+            exit 1
+          fi
+          {
+            echo "kernel: $(uname -r)"
+            echo "test ${name} ... ok"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::sec1_2536_protected_root_on_real_overlay verified"
+
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の

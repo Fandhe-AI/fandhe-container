@@ -5,7 +5,7 @@
 //! （REPAIR-4。トークン・URL は出さない）と要約行で報告する。1 件でも失敗すれば非 0 で終了する（fail-closed）。
 //!
 //! 1. 匿名認証 → manifest 取得（image index は host の linux platform へ解決）→ config と全レイヤーの取得
-//! 2. 全 blob の digest 検証（config は `layer::verify_fetched_blob`、レイヤーは `layer::VerifiedLayerBlob::open` で
+//! 2. 全 blob の digest 検証（config は `PullSession::verify_staged_blob`、レイヤーは `layer::VerifiedLayerBlob::open` で
 //!    信頼条件と digest を同じハンドルで確かめる。検証前のファイルは展開・パースしない）
 //! 3. レイヤーの展開（`layer::extract::extract_image_layers`。検証済みハンドルだけを受け、展開後 tar の sha256 を
 //!    image config の `rootfs.diff_ids` と突合する。whiteout 統合済み。パス検証・hardlink 制限は
@@ -124,12 +124,12 @@ mod linux {
     use fandhe_container_core::traits::{ContainerId, CreateRequest, StartRequest, TraitError};
     use fandhe_container_oci::config::parse_image_config_rootfs;
     use fandhe_container_oci::error::{OciError, OciErrorCode};
+    use fandhe_container_oci::image_management::{ImageStore, PullSession};
     use fandhe_container_oci::layer::extract::{
         ExtractLimits, ImageLayer, extract_image_layers, image_layers_from,
     };
     use fandhe_container_oci::layer::{
-        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, VerifiedLayerBlob,
-        verify_blob_digest, verify_fetched_blob,
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, VerifiedLayerBlob, verify_blob_digest,
     };
     use fandhe_container_oci::manifest::Platform;
     use fandhe_container_oci::reference::ImageReference;
@@ -927,6 +927,13 @@ mod linux {
             .map_err(|e| Failure::oci("auth", &e))?;
         let endpoint = RegistryEndpoint::new(reference.registry().clone());
 
+        // 取得先は検査済み root の fd 起点の writer（`PullSession::open_staged_blob`。#2765）。root は blobs_dir
+        // （このハーネスが 0700 で作った自分の領域）。パスで書き込み先を渡す入口は無い。
+        let store = ImageStore::open(blobs_dir).map_err(|e| Failure::oci("blobs", &e))?;
+        let mut session = store
+            .begin_pull_generated()
+            .map_err(|e| Failure::oci("blobs", &e))?;
+
         let t = Instant::now();
         let auth = client
             .authenticate_anonymous(&endpoint, reference.repository())
@@ -969,26 +976,32 @@ mod linux {
             ));
         }
 
-        // config → 各レイヤーの順に取得し、取得ごとに digest を検証する（検証前のファイルは読まない）。
-        let fetch_verify = |desc: &fandhe_container_oci::manifest::Descriptor,
-                            name: String,
-                            r: &mut Report|
-         -> Result<PathBuf, Failure> {
-            let dest = blobs_dir.join(name);
-            let t = Instant::now();
-            let blob = client
-                .fetch_blob(&endpoint, reference.repository(), desc, &auth, &dest)
+        // config → 各レイヤーの順に取得し、config は取得ごとに digest を検証する（検証前のファイルは読まない）。
+        let fetch_staged = |desc: &fandhe_container_oci::manifest::Descriptor,
+                            session: &mut PullSession<'_>|
+         -> Result<(), Failure> {
+            let mut w = session
+                .open_staged_blob(&desc.digest)
                 .map_err(|e| Failure::oci("blobs", &e))?;
-            r.blobs_ms += ms(t.elapsed());
-            let t = Instant::now();
-            verify_fetched_blob(&blob, desc.size).map_err(|e| Failure::oci("verify", &e))?;
-            r.verify_ms += ms(t.elapsed());
-            Ok(dest)
+            client
+                .fetch_blob(&endpoint, reference.repository(), desc, &auth, &mut w)
+                .map_err(|e| Failure::oci("blobs", &e))?;
+            w.commit().map_err(|e| Failure::oci("blobs", &e))
         };
-        let config_path = fetch_verify(config_desc, "config.json".to_string(), r)?;
+        let t = Instant::now();
+        fetch_staged(config_desc, &mut session)?;
+        r.blobs_ms += ms(t.elapsed());
+        let t = Instant::now();
+        session
+            .verify_staged_blob(&config_desc.digest, config_desc.size)
+            .map_err(|e| Failure::oci("verify", &e))?;
+        r.verify_ms += ms(t.elapsed());
+        let config_path = session
+            .staged_blob_read_path(&config_desc.digest)
+            .map_err(|e| Failure::oci("verify", &e))?;
         r.config_bytes = config_desc.size;
         // レイヤーは取得後に `VerifiedLayerBlob::open` で信頼条件（通常ファイル・自分の uid・リンク数 1・0600）と
-        // digest を同じハンドルで確かめる。blobs_dir はこのハーネスが 0700 で作った自分の領域で、fetch_blob は 0600 で作る。
+        // digest を同じハンドルで確かめる。同じ digest のレイヤーは 1 回だけ取得する（writer は同名の宛先を拒否する）。
         let owner = {
             use std::os::unix::fs::MetadataExt as _;
             std::fs::metadata(blobs_dir)
@@ -996,12 +1009,15 @@ mod linux {
                 .uid()
         };
         let mut verified_layers = Vec::new();
-        for (i, d) in resolved.manifest.layers.iter().enumerate() {
-            let dest = blobs_dir.join(format!("layer-{i}.tar.gz"));
+        let mut fetched_layers = std::collections::HashSet::new();
+        for d in resolved.manifest.layers.iter() {
+            let hex = d.digest.as_str().trim_start_matches("sha256:");
+            let dest = session.staging_dir().join(hex);
             let t = Instant::now();
-            client
-                .fetch_blob(&endpoint, reference.repository(), d, &auth, &dest)
-                .map_err(|e| Failure::oci("blobs", &e))?;
+            if !fetched_layers.contains(hex) {
+                fetch_staged(d, &mut session)?;
+                fetched_layers.insert(hex.to_string());
+            }
             r.blobs_ms += ms(t.elapsed());
             let t = Instant::now();
             let blob = VerifiedLayerBlob::open(&dest, &d.digest, d.size, owner)
@@ -1027,6 +1043,7 @@ mod linux {
         let (took, stripped) = extract_and_finalize(&image_layers, bundle, &process)?;
         r.extract_ms = ms(took);
         r.stripped = stripped;
+        let _ = session.abort();
         Ok(())
     }
 

@@ -10,7 +10,8 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +23,7 @@ use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample}
 use fandhe_container_cri::runtime::v1::{self, image_service_server::ImageService};
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
 };
@@ -200,7 +202,7 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         descriptor: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
@@ -208,7 +210,8 @@ impl RegistryPullClient for FakeClient {
         if self.corrupt_digest == Some(hex) {
             body = b"WORLD".to_vec();
         }
-        fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(&body)
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 

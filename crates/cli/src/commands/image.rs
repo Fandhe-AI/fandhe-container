@@ -73,6 +73,7 @@
 //!   その在庫が見える。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。pull していない root の在庫は
 //!   空のため、その root では `image ls` がヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
 //!   `image rm` と `image tag` が `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
+//! - `--image-root` の経路では `recover_stale_pulls`（残った pull の回収 GC）を呼ばない。CLI は pull を持たず短命のため、同じ root を使う plugin-cri の起動時に回収される（#2819・OCI-7）。
 //! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。

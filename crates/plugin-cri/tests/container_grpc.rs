@@ -51,6 +51,7 @@ use fandhe_container_cri::runtime::v1::runtime_service_client::RuntimeServiceCli
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
 };
@@ -61,6 +62,7 @@ use fandhe_container_plugin::grpc::{
 };
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode};
 use fandhe_container_plugin_cri::server;
+use std::io::Write as _;
 use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
@@ -396,14 +398,15 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         d: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         let hex = d.digest.as_str().trim_start_matches("sha256:");
         let body = self
             .blobs
             .get(hex)
             .ok_or_else(|| OciError::new(OciErrorCode::NotFound, "blob"))?;
-        std::fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(body)
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 
@@ -787,10 +790,10 @@ async fn container_lifecycle_crosses_the_uds_grpc_boundary() {
     .expect("watchdog");
 }
 
-/// 環境を引き継いで本番バイナリを spawn する（段 C 用。`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` 等を
+/// 環境を引き継いで `bin` の本番バイナリを spawn する（段 C 用。`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` 等を
 /// systemd --user の委譲 scope・user manager の private ソケットへ届けるため `env_clear` しない）。
-fn spawn_server_inherit_env(sock: &Path) -> ChildGuard {
-    let child = Command::new(BIN)
+fn spawn_server_inherit_env(bin: &Path, sock: &Path) -> ChildGuard {
+    let child = Command::new(bin)
         .arg("--socket")
         .arg(sock)
         .stdin(Stdio::null())
@@ -808,10 +811,12 @@ fn spawn_server_inherit_env(sock: &Path) -> ChildGuard {
 ///
 /// `#[ignore]` の理由（既定の集合から分ける）: (1) StartContainer は supervisor 経由の本番経路で、`systemd --user` の委譲 cgroup scope の
 /// 中で動かす必要がある（Landlock ABI・user manager の private ソケット・`XDG_RUNTIME_DIR` も要る）、(2) 外向き HTTPS で実レジストリ
-/// （Docker Hub）から取得する、(3) supervisor の bin をこの試験バイナリと同じ `target/<profile>/` に先にビルドしておく
-/// （`cargo build -p fandhe-container-supervisor --bins`）。前提が欠けていれば skip せず失敗させる（`start_stop_delete_real` と同じ扱い）。
-/// 実行は人間担当の実機確認（結果は #442）。実行例:
-/// `systemd-run --user --scope -p Delegate=yes cargo test -p fandhe-container-plugin-cri --test container_grpc -- --ignored production_binary_full_lifecycle_real`
+/// （Docker Hub）から取得する、(3) supervisor の bin を plugin の bin と同じ `target/<profile>/` に先にビルドしておく
+/// （`cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor`）。試験は plugin と supervisor だけを
+/// 専用ディレクトリへ複製し、隣に特権ランチャー（`fandhe-container-launcher`）が無い構成（SUP-14 の rootful 経路に入らない）で
+/// 実行する。前提が欠けていれば skip せず失敗させる（`start_stop_delete_real` と同じ扱い）。
+/// CI では `platform-ci`（ubuntu）が委譲スコープの中で実行する（#2818）。実機確認は人間担当（結果は #442）。実行例:
+/// `systemd-run --user --scope -p Delegate=yes cargo test -p fandhe-container-plugin-cri --test container_grpc -- --ignored --exact production_binary_full_lifecycle_real`
 #[tokio::test]
 #[ignore = "requires systemd --user delegated scope, supervisor bin, and outbound HTTPS to a registry (CRI-1/CRI-2/CRI-3, #2592)"]
 async fn production_binary_full_lifecycle_real() {
@@ -821,7 +826,27 @@ async fn production_binary_full_lifecycle_real() {
     tokio::time::timeout(Duration::from_secs(900), async {
         let dir = TempDir::new("sock-real");
         let sock = dir.0.join("s.sock");
-        let mut guard = spawn_server_inherit_env(&sock);
+        // plugin と supervisor だけを専用ディレクトリへ複製する。`target/<profile>/` の隣に launcher があると
+        // ProductionStarter が信頼できるランチャーとみなし、file capability の無い rootful 経路に入るため（SUP-14）。
+        let bin_dir = TempDir::new("bin-real");
+        let plugin_src = Path::new(BIN);
+        let sup_name = "fandhe-container-supervisor";
+        let sup_src = plugin_src
+            .parent()
+            .expect("plugin binary parent")
+            .join(sup_name);
+        assert!(
+            sup_src.is_file(),
+            "supervisor binary is not built next to the plugin binary; run cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor"
+        );
+        let plugin_bin = bin_dir.0.join("fandhe-container-plugin-cri");
+        std::fs::copy(plugin_src, &plugin_bin).expect("copy plugin binary");
+        std::fs::copy(&sup_src, bin_dir.0.join(sup_name)).expect("copy supervisor binary");
+        assert!(
+            !bin_dir.0.join("fandhe-container-launcher").exists(),
+            "a privileged launcher must not sit next to the plugin binary"
+        );
+        let mut guard = spawn_server_inherit_env(&plugin_bin, &sock);
         // Channel の request timeout を pull の期限（300 秒）以上にする。既定の 10 秒だと
         // call_with_deadline の長い期限より先に打ち切られる（REPAIR-5・REPAIR-12）。
         let config = GrpcClientConfig::new()

@@ -25,6 +25,7 @@ use crate::auth::{
     parse_www_authenticate, realm_may_receive_credentials,
 };
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
+use crate::image_management::StagedBlobWriter;
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::manifest::{
     Descriptor, ImageManifest, MANIFEST_MAX_BYTES, MEDIA_TYPE_DOCKER_LIST,
@@ -35,10 +36,8 @@ use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use ureq::Agent;
@@ -347,22 +346,24 @@ impl RegistryClient {
         })
     }
 
-    /// blob（レイヤー・config）を `dest` へストリーミング保存する（TASK-51.4・OCI-1）。
+    /// blob（レイヤー・config）を `dest` へストリーミング保存する（TASK-51.4・OCI-1・#2765）。
     ///
     /// `descriptor.size` を期待サイズの正とし、`max_blob_bytes` 超過は通信前に `ResourceExhausted`。応答の
     /// `Content-Length` が期待サイズと食い違えば本文に触れず `DataLoss`。本文は固定長バッファで流し、
-    /// `Content-Length` の値でアロケーションしない。書き込みは `dest` + `.part` へ行い、サイズ一致を確認して
-    /// 宛先を置き換えない方式（hard_link）で公開する（失敗時は自分が作った `.part` だけを削除し、部分ファイルを
-    /// `dest` に公開しない）。`dest` が既に存在すれば（転送中に作られた場合も）`FailedPrecondition`。親ディレクトリは呼び出し側（ステージング領域）が用意する。
-    /// pull では `dest` に `PullSession::staged_blob_path`（`<root>/staging/<pull-id>/<hex>`）を渡し、
-    /// `blobs/sha256` へ直接書かない（OCI-7・#474）。取得後は `PullSession::verify_staged_blob` →
-    /// `PullSession::publish` で公開する（#475）。
+    /// `Content-Length` の値でアロケーションしない。本文のバイト数が期待サイズと一致することを確認して成功を返す。
+    ///
+    /// `dest` は `PullSession::open_staged_blob` が検証済み root の fd 起点で開いた書き込み先で、パスは受け取らない
+    /// （OCI-7・SEC-1。root が差し替えられても書き込みは検査済みの実体にだけ届く）。`dest` の digest が
+    /// `descriptor.digest` と違えば `InvalidArgument`、既に書き込み済み（失敗後の再利用）なら `FailedPrecondition` を
+    /// 通信前に返す。再試行は writer を開き直す契約である。**確定（`StagedBlobWriter::commit`）は呼び出し側が行う**:
+    /// この関数は本文を流してサイズを照合するだけで、失敗時の `.part` は writer の drop が消す。
+    /// pull では成功後に `commit` → `PullSession::verify_staged_blob` → `PullSession::publish` の順に呼ぶ（#475）。
     ///
     /// CDN へのリダイレクト（301/302/303/307/308）は `max_redirects` 回まで手動で追従する。遷移先は絶対 https
     /// URL のみ許可し、`Authorization` を送らず公開 IP のみへ接続する（SSRF・資格情報漏えい対策）。Location は
     /// 署名付きで秘密を含みうるためエラー・記録に載せない。相対 Location は未対応（拒否）。
     ///
-    /// 戻り値は digest 未検証（`layer::verify_fetched_blob` で別途検証する。#405・TASK-52.1）。Range による再開は未対応。トークンの期限検査は開始時のみ。
+    /// 戻り値は digest 未検証（確定後に `PullSession::verify_staged_blob` で検証する。#405・TASK-52.1）。Range による再開は未対応。トークンの期限検査は開始時のみ。
     /// 成功・失敗とエラー code・所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
     pub fn fetch_blob(
         &self,
@@ -370,7 +371,7 @@ impl RegistryClient {
         repository: &Repository,
         descriptor: &Descriptor,
         auth: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<FetchedBlob, OciError> {
         record_oci_op(self.recorder.as_ref(), OciOpKind::FetchBlob, || {
             fetch_blob_flow(
@@ -718,11 +719,9 @@ fn fetch_manifest_flow(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FetchedBlob {
-    /// 保存先（呼び出し側が指定した `dest`）。
-    pub path: PathBuf,
     /// 書き込んだバイト数（`Descriptor::size` と一致を確認済み）。
     pub size: u64,
-    /// 要求した digest。**本文のハッシュとは未突合**（`layer::verify_fetched_blob` で検証する。検証前のファイルを信頼しない。#405・TASK-52.1）。
+    /// 要求した digest。**本文のハッシュとは未突合**（確定後に `PullSession::verify_staged_blob` で検証する。検証前のファイルを信頼しない。#405・TASK-52.1）。
     pub digest: Digest,
 }
 
@@ -752,79 +751,8 @@ fn validate_redirect_location(location: &str) -> Result<(), OciError> {
     Ok(())
 }
 
-/// `.part` への書き込みを最初の書き込み時に遅延作成する `Write`。リダイレクト応答で空ファイルを作らず、
-/// `create_new`（O_EXCL）で既存ファイル・シンボリックリンクを辿らない。Unix では 0600。
-struct LazyPartFile {
-    path: PathBuf,
-    file: Option<File>,
-    /// `create_new` が成功した（= このインスタンスが `.part` を所有する）ときだけ true。
-    /// 後始末の対象を自分が作ったファイルに限る（既存の `.part` や並行取得のファイルは消さない）。
-    created: bool,
-}
-
-impl LazyPartFile {
-    fn open(&mut self) -> std::io::Result<&mut File> {
-        if self.file.is_none() {
-            let mut o = OpenOptions::new();
-            o.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                o.mode(0o600);
-            }
-            self.file = Some(o.open(&self.path)?);
-            self.created = true;
-        }
-        self.file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("part file is not open"))
-    }
-
-    /// 書き込みが無かった（サイズ 0 の blob）場合も含めてファイルを作り、永続化して閉じる。
-    fn finish(&mut self) -> std::io::Result<()> {
-        let f = self.open()?;
-        f.sync_all()?;
-        self.file = None;
-        Ok(())
-    }
-}
-
-impl Write for LazyPartFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.open()?.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self.file.as_mut() {
-            Some(f) => f.flush(),
-            None => Ok(()),
-        }
-    }
-}
-
-/// 自分が作った `.part` だけを drop（失敗・panic・公開後）で消す。`create_new` が失敗した経路
-/// （既存の `.part` が AlreadyExists・通信失敗でファイル未作成）では何も削除しない。
-impl Drop for LazyPartFile {
-    fn drop(&mut self) {
-        if self.created {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// `part` を `dest` へ「宛先が存在すれば失敗」する形で公開する（hard_link は 3 OS とも宛先があれば
-/// AlreadyExists で原子的に失敗する。`rename` は既存を置き換えるため使わない）。公開後の `.part` は
-/// 呼び出し側の drop が消す。宛先の競合は `FailedPrecondition`。
-fn publish_no_replace(part: &Path, dest: &Path) -> Result<(), OciError> {
-    std::fs::hard_link(part, dest).map_err(|e| match e.kind() {
-        std::io::ErrorKind::AlreadyExists => OciError::new(
-            OciErrorCode::FailedPrecondition,
-            "blob destination already exists",
-        ),
-        _ => map_sink_error(e),
-    })
-}
-
-/// blob 取得の手順（通信は `transport` に委ねる。テストでは差し替える）。
+/// blob 取得の手順（通信は `transport` に委ねる。テストでは差し替える）。`dest` の検査（digest の一致・未書き込み）を
+/// 通信前に行い、本文は [`stream_blob`] で流す。確定は呼び出し側（`StagedBlobWriter::commit`）。
 fn fetch_blob_flow(
     transport: &dyn RegistryTransport,
     config: &RegistryClientConfig,
@@ -832,8 +760,39 @@ fn fetch_blob_flow(
     repository: &Repository,
     descriptor: &Descriptor,
     auth: &RegistryAuth,
-    dest: &Path,
+    dest: &mut StagedBlobWriter,
 ) -> Result<FetchedBlob, OciError> {
+    if dest.digest() != &descriptor.digest {
+        return Err(OciError::new(
+            OciErrorCode::InvalidArgument,
+            "blob destination does not match the descriptor",
+        ));
+    }
+    if dest.bytes_written() != 0 {
+        return Err(OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob destination is already written",
+        ));
+    }
+    let written = stream_blob(
+        transport, config, endpoint, repository, descriptor, auth, dest,
+    )?;
+    Ok(FetchedBlob {
+        size: written,
+        digest: descriptor.digest.clone(),
+    })
+}
+
+/// blob 本文を `sink` へ流してバイト数を返す（サイズ上限・リダイレクト追従・サイズ照合）。
+fn stream_blob(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    repository: &Repository,
+    descriptor: &Descriptor,
+    auth: &RegistryAuth,
+    sink: &mut dyn Write,
+) -> Result<u64, OciError> {
     if descriptor.size > config.max_blob_bytes {
         return Err(OciError::new(
             OciErrorCode::ResourceExhausted,
@@ -841,27 +800,6 @@ fn fetch_blob_flow(
         ));
     }
     let authorization = auth.authorization_header(Instant::now())?;
-    if dest.exists() {
-        return Err(OciError::new(
-            OciErrorCode::FailedPrecondition,
-            "blob destination already exists",
-        ));
-    }
-    let file_name = dest.file_name().ok_or_else(|| {
-        OciError::new(
-            OciErrorCode::InvalidArgument,
-            "blob destination has no file name",
-        )
-    })?;
-    let mut part_name = file_name.to_os_string();
-    part_name.push(".part");
-    let part_path = dest.with_file_name(part_name);
-
-    let mut sink = LazyPartFile {
-        path: part_path,
-        file: None,
-        created: false,
-    };
 
     let mut url = endpoint.blob_url(repository, &descriptor.digest);
     let mut hop: u32 = 0;
@@ -880,7 +818,7 @@ fn fetch_blob_flow(
                 timeout: config.blob_request_timeout,
                 expected_len: descriptor.size,
             },
-            &mut sink,
+            &mut *sink,
         )?;
         if resp.status == 200 {
             break resp.bytes_written;
@@ -908,13 +846,7 @@ fn fetch_blob_flow(
             "blob size does not match the descriptor",
         ));
     }
-    sink.finish().map_err(map_sink_error)?;
-    publish_no_replace(&sink.path, dest)?;
-    Ok(FetchedBlob {
-        path: dest.to_path_buf(),
-        size: written,
-        digest: descriptor.digest.clone(),
-    })
+    Ok(written)
 }
 
 /// ローカルファイル書き込み失敗の分類（message は固定文。パスは載せない）。
@@ -1318,6 +1250,7 @@ mod tests {
     use crate::manifest::MEDIA_TYPE_OCI_LAYER_GZIP;
     use crate::reference::ImageReference;
     use rustls_native_certs::CertificateResult;
+    use std::path::PathBuf;
 
     /// OCI-1: manifest / blob URL の具体値。
     #[test]
@@ -2650,7 +2583,7 @@ mod tests {
         }
     }
 
-    /// 一意な一時ディレクトリ（drop で削除）。
+    /// 一意な一時ストア root（0700。drop で削除）。`PullSession::open_staged_blob` の writer を得る土台。
     struct TmpDir(PathBuf);
 
     impl TmpDir {
@@ -2662,13 +2595,36 @@ mod tests {
                 N.fetch_add(1, Ordering::SeqCst)
             ));
             std::fs::create_dir_all(&p).expect("mkdir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             Self(p)
         }
-        fn dest(&self) -> PathBuf {
-            self.0.join("blob.bin")
+        fn store(&self) -> crate::image_management::ImageStore {
+            crate::image_management::ImageStore::open(&self.0).expect("open store")
         }
-        fn part(&self) -> PathBuf {
-            self.0.join("blob.bin.part")
+        /// ステージング配下の pull ディレクトリ内の名前の一覧（`@pull.lock` を除く。pull が 1 件の試験用）。
+        fn staged_names(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            let Ok(rd) = std::fs::read_dir(self.0.join("staging")) else {
+                return out;
+            };
+            for e in rd.flatten() {
+                for f in std::fs::read_dir(e.path())
+                    .expect("read pull dir")
+                    .flatten()
+                {
+                    let n = f.file_name().to_string_lossy().into_owned();
+                    if n != crate::image_management::PULL_LOCK_FILE_NAME {
+                        out.push(n);
+                    }
+                }
+            }
+            out.sort();
+            out
         }
     }
 
@@ -2687,22 +2643,24 @@ mod tests {
         }
     }
 
+    /// 本文を `Vec` へ流して `(書いたバイト数, 本文)` を返す（確定は `StagedBlobWriter` の試験が担う）。
     fn blob(
         t: &FakeStream,
         auth: &RegistryAuth,
         d: &Descriptor,
-        dest: &Path,
-    ) -> Result<FetchedBlob, OciError> {
+    ) -> Result<(u64, Vec<u8>), OciError> {
         let (ep, repo) = alpine();
-        fetch_blob_flow(
+        let mut sink: Vec<u8> = Vec::new();
+        let n = stream_blob(
             t,
             &RegistryClientConfig::default(),
             &ep,
             &repo,
             d,
             auth,
-            dest,
-        )
+            &mut sink,
+        )?;
+        Ok((n, sink))
     }
 
     const CDN: &str = "https://cdn.example.com/signed/abc?sig=1";
@@ -2710,18 +2668,14 @@ mod tests {
     /// OCI-1: 200 の本文がファイルへ書かれ、`.part` は残らず、固定の URL・ヘッダで 1 回だけ要求する。
     #[test]
     fn blob_direct_200_writes_file() {
-        let tmp = TmpDir::new("direct");
         let t = FakeStream::new(vec![step(
             200,
             None,
             vec![b"hello ".to_vec(), b"world".to_vec()],
         )]);
-        let got = blob(&t, &bearer(300), &desc(11), &tmp.dest()).expect("blob");
-        assert_eq!(got.size, 11);
-        assert_eq!(got.path, tmp.dest());
-        assert_eq!(got.digest.as_str(), format!("sha256:{HX}"));
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"hello world");
-        assert!(!tmp.part().exists());
+        let (n, body) = blob(&t, &bearer(300), &desc(11)).expect("blob");
+        assert_eq!(n, 11);
+        assert_eq!(body, b"hello world");
         let seen = t.seen.lock().expect("lock");
         assert_eq!(seen.len(), 1);
         assert_eq!(
@@ -2739,12 +2693,11 @@ mod tests {
     /// OCI-1・SEC: CDN へのリダイレクトでは Authorization を送らず、公開 IP のみの経路を使う。
     #[test]
     fn blob_redirect_drops_authorization_and_uses_public_only() {
-        let tmp = TmpDir::new("redirect");
         let t = FakeStream::new(vec![
             step(307, Some(CDN), vec![]),
             step(200, None, vec![b"abc".to_vec()]),
         ]);
-        blob(&t, &bearer(300), &desc(3), &tmp.dest()).expect("blob");
+        let (_, body) = blob(&t, &bearer(300), &desc(3)).expect("blob");
         let seen = t.seen.lock().expect("lock");
         assert_eq!(seen.len(), 2);
         assert!(!seen[0].1 && seen[0].2.len() == 1);
@@ -2754,13 +2707,12 @@ mod tests {
             seen[1].2.is_empty(),
             "no Authorization to the redirect target"
         );
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"abc");
+        assert_eq!(body, b"abc");
     }
 
     /// OCI-3・SEC: Basic でも最初のホップだけに Authorization を付け、CDN 側へは送らない。
     #[test]
     fn blob_redirect_drops_basic_authorization() {
-        let tmp = TmpDir::new("basic-redirect");
         let t = FakeStream::new(vec![
             step(307, Some(CDN), vec![]),
             step(200, None, vec![b"abc".to_vec()]),
@@ -2768,7 +2720,7 @@ mod tests {
         let auth = RegistryAuth::Basic(
             BasicCredentials::new("Aladdin", "open sesame").expect("credentials"),
         );
-        blob(&t, &auth, &desc(3), &tmp.dest()).expect("blob");
+        blob(&t, &auth, &desc(3)).expect("blob");
         let seen = t.seen.lock().expect("lock");
         assert_eq!(seen.len(), 2);
         assert_eq!(
@@ -2793,45 +2745,41 @@ mod tests {
             "https://cdn.example.com/x\r\nHost: evil",
             "https:///x",
         ] {
-            let tmp = TmpDir::new("badloc");
             let t = FakeStream::new(vec![step(302, Some(loc), vec![])]);
-            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err(loc);
+            let e = blob(&t, &RegistryAuth::None, &desc(3)).expect_err(loc);
             assert_eq!(e.code(), OciErrorCode::DataLoss, "{loc:?}");
             assert_eq!(t.seen.lock().expect("lock").len(), 1);
-            assert!(!tmp.dest().exists() && !tmp.part().exists());
         }
-        let tmp = TmpDir::new("noloc");
         let t = FakeStream::new(vec![step(302, None, vec![])]);
-        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("no location");
+        let e = blob(&t, &RegistryAuth::None, &desc(3)).expect_err("no location");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
     }
 
     /// OCI-1・REPAIR-5: リダイレクト回数が上限を超えたら DataLoss。
     #[test]
     fn blob_redirect_limit() {
-        let tmp = TmpDir::new("loop");
         let n = RegistryClientConfig::default().max_redirects as usize + 1;
         let t = FakeStream::new((0..n).map(|_| step(302, Some(CDN), vec![])).collect());
-        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("loop");
+        let e = blob(&t, &RegistryAuth::None, &desc(3)).expect_err("loop");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         assert_eq!(t.seen.lock().expect("lock").len(), n);
     }
 
-    /// OCI-1・REPAIR-5: 事前検査（サイズ上限・期限切れトークン・dest 既存）は通信 0 回で失敗する。
+    /// OCI-1・REPAIR-5: 事前検査（サイズ上限・期限切れトークン）は通信 0 回で失敗する。
     #[test]
     fn blob_precondition_failures_make_no_request() {
-        let tmp = TmpDir::new("pre");
         let (ep, repo) = alpine();
         let cfg = RegistryClientConfig::default();
         let t = FakeStream::new(vec![]);
-        let e = fetch_blob_flow(
+        let mut sink: Vec<u8> = Vec::new();
+        let e = stream_blob(
             &t,
             &cfg,
             &ep,
             &repo,
             &desc(cfg.max_blob_bytes + 1),
             &RegistryAuth::None,
-            &tmp.dest(),
+            &mut sink,
         )
         .expect_err("too big");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
@@ -2847,75 +2795,47 @@ mod tests {
             ]);
             run(&t).expect("auth")
         };
-        let e = blob(&t, &expired, &desc(3), &tmp.dest()).expect_err("expired");
+        let e = blob(&t, &expired, &desc(3)).expect_err("expired");
         assert_eq!(e.code(), OciErrorCode::PermissionDenied);
-
-        std::fs::write(tmp.dest(), b"x").expect("write");
-        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("exists");
-        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"x");
         assert!(t.seen.lock().expect("lock").is_empty());
     }
 
-    /// 転送中に別処理が dest を作る競合を再現する通信（本文を流した後に dest を作る）。
-    #[derive(Debug)]
-    struct RaceStream {
-        inner: FakeStream,
-        dest: PathBuf,
-    }
-
-    impl RegistryTransport for RaceStream {
-        fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
-            self.inner.get(req)
-        }
-        fn get_stream(
-            &self,
-            req: &StreamRequest<'_>,
-            sink: &mut dyn Write,
-        ) -> Result<StreamResponse, OciError> {
-            let r = self.inner.get_stream(req, sink)?;
-            std::fs::write(&self.dest, b"other").expect("race write");
-            Ok(r)
-        }
-    }
-
-    /// OCI-1: 転送中に dest が作られたら上書きせず FailedPrecondition。他者の dest は無傷で `.part` は残らない。
+    /// OCI-1・OCI-7・SEC-1（#2765）: `dest` の digest が descriptor と違えば `InvalidArgument`、書き込み済みの writer の
+    /// 再利用は `FailedPrecondition`。どちらも通信 0 回で、writer の中身は変わらない。
     #[test]
-    fn blob_dest_created_during_transfer_is_not_replaced() {
-        let tmp = TmpDir::new("race");
-        let t = RaceStream {
-            inner: FakeStream::new(vec![step(200, None, vec![b"abc".to_vec()])]),
-            dest: tmp.dest(),
-        };
+    fn blob_dest_mismatch_and_reuse_make_no_request() {
+        let tmp = TmpDir::new("dest-checks");
+        let store = tmp.store();
+        let mut session = store.begin_pull_generated().expect("begin");
         let (ep, repo) = alpine();
-        let e = fetch_blob_flow(
-            &t,
-            &RegistryClientConfig::default(),
-            &ep,
-            &repo,
-            &desc(3),
-            &RegistryAuth::None,
-            &tmp.dest(),
-        )
-        .expect_err("race");
+        let cfg = RegistryClientConfig::default();
+        let t = FakeStream::new(vec![]);
+
+        let other = Digest::parse(&format!("sha256:{}", "b".repeat(64))).expect("digest");
+        let mut w = session.open_staged_blob(&other).expect("writer");
+        let e = fetch_blob_flow(&t, &cfg, &ep, &repo, &desc(3), &RegistryAuth::None, &mut w)
+            .expect_err("digest mismatch");
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "blob destination does not match the descriptor"
+        );
+        assert_eq!(w.bytes_written(), 0);
+        drop(w);
+
+        let d = desc(3);
+        let mut w = session.open_staged_blob(&d.digest).expect("writer");
+        w.write_all(b"x").expect("write");
+        let e = fetch_blob_flow(&t, &cfg, &ep, &repo, &d, &RegistryAuth::None, &mut w)
+            .expect_err("already written");
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"other");
-        assert!(!tmp.part().exists());
+        assert_eq!(w.bytes_written(), 1);
+        assert!(t.seen.lock().expect("lock").is_empty());
+        drop(w);
+        let _ = session.abort();
     }
 
-    /// OCI-1: 既存の `.part`（他者・並行取得）は失敗しても削除されず、FailedPrecondition になる。
-    #[test]
-    fn blob_existing_part_is_not_deleted() {
-        let tmp = TmpDir::new("foreign-part");
-        std::fs::write(tmp.part(), b"foreign").expect("write");
-        let t = FakeStream::new(vec![step(200, None, vec![b"abc".to_vec()])]);
-        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("part exists");
-        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
-        assert_eq!(std::fs::read(tmp.part()).expect("read"), b"foreign");
-        assert!(!tmp.dest().exists());
-    }
-
-    /// OCI-1: 401 / 403 / 404 は分類つきのエラー。ファイルは作られない。
+    /// OCI-1: 401 / 403 / 404 は分類つきのエラー。
     #[test]
     fn blob_status_errors() {
         for (status, code) in [
@@ -2924,43 +2844,39 @@ mod tests {
             (404, OciErrorCode::NotFound),
             (500, OciErrorCode::Unavailable),
         ] {
-            let tmp = TmpDir::new("status");
             let t = FakeStream::new(vec![step(status, None, vec![])]);
-            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("status");
+            let e = blob(&t, &RegistryAuth::None, &desc(3)).expect_err("status");
             assert_eq!((e.code(), e.http_status()), (code, Some(status)));
-            assert!(!tmp.dest().exists() && !tmp.part().exists());
         }
     }
 
-    /// OCI-1: 書いたサイズが descriptor と違えば DataLoss で、`.part` も dest も残らない。
+    /// OCI-1: 書いたサイズが descriptor と違えば DataLoss。
     #[test]
-    fn blob_size_mismatch_leaves_nothing() {
+    fn blob_size_mismatch_is_data_loss() {
         for body in [b"toolong!".to_vec(), b"ab".to_vec()] {
-            let tmp = TmpDir::new("mismatch");
             let t = FakeStream::new(vec![step(200, None, vec![body])]);
-            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("mismatch");
+            let e = blob(&t, &RegistryAuth::None, &desc(3)).expect_err("mismatch");
             assert_eq!(e.code(), OciErrorCode::DataLoss);
-            assert!(!tmp.dest().exists() && !tmp.part().exists());
         }
     }
 
-    /// OCI-1: サイズ 0 の blob でも空ファイルが作られる。
+    /// OCI-1: サイズ 0 の blob は空の本文で成功する。
     #[test]
-    fn blob_zero_length_creates_empty_file() {
-        let tmp = TmpDir::new("zero");
+    fn blob_zero_length_succeeds_with_empty_body() {
         let t = FakeStream::new(vec![step(200, None, vec![])]);
-        let got = blob(&t, &RegistryAuth::None, &desc(0), &tmp.dest()).expect("blob");
-        assert_eq!(got.size, 0);
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"");
-        assert!(!tmp.part().exists());
+        let (n, body) = blob(&t, &RegistryAuth::None, &desc(0)).expect("blob");
+        assert_eq!((n, body), (0, Vec::new()));
     }
 
-    /// OCI-1・REPAIR-4: 公開メソッド `fetch_blob` の成功と失敗が `oci.blob.fetch` として 1 件ずつ記録される。
+    /// OCI-1・OCI-7（#2765）: 公開メソッド `fetch_blob` が検査済み root の fd 起点の writer へ書き、`commit` の後に
+    /// `<hex>` だけが残る（`.part` なし）。失敗した取得は `.part` を残さない。成功と失敗は 1 件ずつ記録される。
     #[test]
-    fn fetch_blob_public_api_records_outcomes() {
+    fn fetch_blob_public_api_writes_through_writer_and_records_outcomes() {
         use crate::instrument::{OciOpKind, OciOpOutcome};
         let (ep, repo) = alpine();
         let tmp = TmpDir::new("record");
+        let store = tmp.store();
+        let mut session = store.begin_pull_generated().expect("begin");
         let rec = Arc::new(crate::instrument::testing::Collect::default());
         let mk = |t: FakeStream| RegistryClient {
             agent: Agent::new_with_config(Config::default()),
@@ -2968,17 +2884,30 @@ mod tests {
             config: RegistryClientConfig::default(),
             recorder: rec.clone(),
         };
-        mk(FakeStream::new(vec![step(
+        let d = desc(3);
+        let mut w = session.open_staged_blob(&d.digest).expect("writer");
+        let got = mk(FakeStream::new(vec![step(
             200,
             None,
             vec![b"abc".to_vec()],
         )]))
-        .fetch_blob(&ep, &repo, &desc(3), &RegistryAuth::None, &tmp.dest())
+        .fetch_blob(&ep, &repo, &d, &RegistryAuth::None, &mut w)
         .expect("ok");
-        let other = tmp.0.join("other.bin");
+        assert_eq!(got.size, 3);
+        assert_eq!(got.digest, d.digest);
+        assert_eq!(tmp.staged_names(), vec![format!("{HX}.part")]);
+        w.commit().expect("commit");
+        assert_eq!(tmp.staged_names(), vec![HX.to_string()]);
+        let _ = session.abort();
+
+        let mut session = store.begin_pull_generated().expect("begin");
+        let mut w = session.open_staged_blob(&d.digest).expect("writer");
         mk(FakeStream::new(vec![step(404, None, vec![])]))
-            .fetch_blob(&ep, &repo, &desc(3), &RegistryAuth::None, &other)
+            .fetch_blob(&ep, &repo, &d, &RegistryAuth::None, &mut w)
             .expect_err("404");
+        drop(w);
+        assert_eq!(tmp.staged_names(), Vec::<String>::new());
+        let _ = session.abort();
         let items = rec.items();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].kind(), OciOpKind::FetchBlob);
@@ -3313,6 +3242,8 @@ mod tests {
     #[test]
     fn full_pull_with_bearer_registry() {
         let tmp = TmpDir::new("pull-bearer");
+        let store = tmp.store();
+        let mut session = store.begin_pull_generated().expect("begin");
         let pull = Arc::new(FakePull {
             get: FakeTransport::new(vec![
                 resp(401, &[HUB_CHALLENGE], ""),
@@ -3332,11 +3263,17 @@ mod tests {
         client
             .fetch_manifest(&ep, &repo, &reference, &auth, &platform)
             .expect("manifest");
+        let mut w = session.open_staged_blob(&desc(6).digest).expect("writer");
         let got = client
-            .fetch_blob(&ep, &repo, &desc(6), &auth, &tmp.dest())
+            .fetch_blob(&ep, &repo, &desc(6), &auth, &mut w)
             .expect("blob");
         assert_eq!(got.size, 6);
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"layer!");
+        w.commit().expect("commit");
+        assert_eq!(
+            std::fs::read(tmp.0.join("staging").join(session.id().as_str()).join(HX))
+                .expect("read"),
+            b"layer!"
+        );
         let h = pull.get.seen_headers.lock().expect("lock");
         assert_eq!(h.len(), 3);
         assert!(h[0].is_empty());
@@ -3371,6 +3308,8 @@ mod tests {
     #[test]
     fn full_pull_with_basic_registry_does_not_leak_to_redirect() {
         let tmp = TmpDir::new("pull-basic");
+        let store = tmp.store();
+        let mut session = store.begin_pull_generated().expect("begin");
         let pull = Arc::new(FakePull {
             get: FakeTransport::new(vec![
                 resp(401, &[BASIC_CHALLENGE], ""),
@@ -3394,10 +3333,16 @@ mod tests {
         client
             .fetch_manifest(&ep, &repo, &reference, &auth, &platform)
             .expect("manifest");
+        let mut w = session.open_staged_blob(&desc(6).digest).expect("writer");
         client
-            .fetch_blob(&ep, &repo, &desc(6), &auth, &tmp.dest())
+            .fetch_blob(&ep, &repo, &desc(6), &auth, &mut w)
             .expect("blob");
-        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"layer!");
+        w.commit().expect("commit");
+        assert_eq!(
+            std::fs::read(tmp.0.join("staging").join(session.id().as_str()).join(HX))
+                .expect("read"),
+            b"layer!"
+        );
         let h = pull.get.seen_headers.lock().expect("lock");
         assert!(h[2].contains(&("Authorization".to_string(), ALADDIN.to_string())));
         let s = pull.stream.seen.lock().expect("lock");
@@ -3430,5 +3375,90 @@ mod tests {
         assert_eq!(items[1].kind(), OciOpKind::Authenticate);
         assert_eq!(items[1].outcome(), AuthOutcome::Failure);
         assert_eq!(items[1].error_code(), Some(OciErrorCode::Unavailable));
+    }
+}
+/// 取得の途中で割り込む試験用の通信（`root_swap_tests` が、本文の途中で staging を差し替える状況を再現する。
+/// OCI-7・SEC-1・#2765）。fd 起点の試験（`root_swap_tests`）と同じ cfg に限る。
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// 本文の前半を書き、`mid` を呼び、後半を書く通信（常に 200）。
+    struct HookStream {
+        body: Vec<u8>,
+        mid: Mutex<Option<Hook>>,
+    }
+
+    impl Debug for HookStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HookStream").finish_non_exhaustive()
+        }
+    }
+
+    impl RegistryTransport for HookStream {
+        fn get(&self, _req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
+            Err(OciError::new(OciErrorCode::Unimplemented, "not used"))
+        }
+
+        fn get_stream(
+            &self,
+            _req: &StreamRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<StreamResponse, OciError> {
+            let (first, second) = self.body.split_at(self.body.len() / 2);
+            sink.write_all(first).map_err(map_sink_error)?;
+            let hook = self
+                .mid
+                .lock()
+                .map_err(|_| OciError::new(OciErrorCode::Internal, "poisoned test hook"))?
+                .take();
+            if let Some(f) = hook {
+                f();
+            }
+            sink.write_all(second).map_err(map_sink_error)?;
+            Ok(StreamResponse {
+                status: 200,
+                location: None,
+                bytes_written: self.body.len() as u64,
+            })
+        }
+    }
+
+    /// `fetch_blob` と同じ事前検査・本文の流し込みを通し、本文の途中で `mid` を呼ぶ。
+    pub(crate) fn fetch_blob_with_hook(
+        dest: &mut StagedBlobWriter,
+        body: &[u8],
+        mid: impl FnOnce() + Send + 'static,
+    ) -> Result<FetchedBlob, OciError> {
+        let ep = RegistryEndpoint::new(
+            crate::reference::RegistryHost::parse("registry.example").expect("host"),
+        );
+        let repo = Repository::parse("lib/app").expect("repo");
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            digest: dest.digest().clone(),
+            size: body.len() as u64,
+            platform: None,
+        };
+        let transport = HookStream {
+            body: body.to_vec(),
+            mid: Mutex::new(Some(Box::new(mid))),
+        };
+        fetch_blob_flow(
+            &transport,
+            &RegistryClientConfig::default(),
+            &ep,
+            &repo,
+            &descriptor,
+            &RegistryAuth::None,
+            dest,
+        )
     }
 }

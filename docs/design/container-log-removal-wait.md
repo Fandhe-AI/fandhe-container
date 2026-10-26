@@ -41,8 +41,29 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
   `repair5_force_delete_worst_case_fits_runtime_timeout` で機械照合する
 - `CreateContainer` の最悪（plugin-cri。#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック `STATE_LOCK_TIMEOUT` 5 秒 +
   create の監査記録 2 回（`2 × RECORD_WAIT_LIMIT` 11.45 秒 = 22.9 秒）= 42.9 秒で、同じく 60.9 秒に収まる
-  （`repair5_create_worst_case_fits_runtime_timeout`）。bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O 自体の上限は
-  従来どおりこの内訳の外にある（既存の残余。今回は直さない）
+  （`repair5_create_worst_case_fits_runtime_timeout`）。bundle の用意と core の create の残りのファイル I/O は次節で扱う
+
+## `CreateContainer` の bundle の用意と core の create（#2821・CRI-2・REPAIR-5・ERR-1・OCI-1）
+
+待ちが無制限になり得る箇所を列挙し、2 段で上限づける。
+
+| 箇所 | 扱い |
+| ---- | ---- |
+| `BundleLock::acquire_resolved`（core） | 待たない（`try_lock`。取れなければ即 `FailedPrecondition`） |
+| `StateStore::create` の `@lock`・監査記録 2 回・ログ回収・起動オプション文書の掃除 | 上の 42.9 秒の内訳に入っている |
+| `load_config`・`/etc/passwd`・`/etc/group`・image config の読み取り | 大きさの上限で有界（config 4 MiB・1 MiB・65,536 行）。通常ファイル以外は開く前に拒否 |
+| `write_new_file`（config.json・resolv.conf）・状態ストアの書き込みと fsync | 小さなファイル数個。デバイス停止以外は有限 |
+| blob の sha256 検証（`VerifiedLayerBlob::open`） | 合計 16 GiB（`DEFAULT_MAX_IMAGE_BYTES`）・層は最大 128。**1 本ごとに期限を確かめる**（今回の変更） |
+| レイヤー展開（`extract_image_layers_with_options`） | 100 万エントリ・8 GiB で有界。途中では打ち切れず、前後でだけ期限を確かめる |
+| 失敗時の後始末 | 展開した量に比例（展開の上限で有界） |
+
+- RPC 側: 応答は `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）で打ち切られ DEADLINE_EXCEEDED になる。worker は打ち切れないが、記録・件数枠・bundle は
+  worker の終了まで保持され、期限超過の失敗は bundle を残さない（`InFlightGuard`）
+- worker 側: 残存は `PLUGIN_ROOTFS_DEADLINE`（600 秒。plugin-cri が明示。値は既定のまま）+ 分割できない区間 1 つ分の超過 + core の create の
+  42.9 秒。同時に残る worker は `MAX_CONTAINERS` の件数枠で有界。照合は `repair5_create_worker_residual_is_bounded`
+- 上限づけない理由: 展開のエントリ単位の打ち切りは oci の公開 API の変更を要する。期限の数値の見直しはオーナー判断。どちらも大きさの上限で有限
+- 範囲外: core の `create_with_image*`（CRI の経路では呼ばれない）・RPC 超過後の dispatch 前の打ち切り・デバイス停止による I/O の停止
+- 残る制約: 展開中は打ち切れない（REPAIR-3）
 
 ## 待ち切れなかったことの区別（#2760）
 

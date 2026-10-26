@@ -26,16 +26,33 @@ fn fetch_all(image: &str) -> usize {
         image.replace(['/', ':'], "_")
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let mut descriptors = vec![resolved.manifest.config.clone()];
     descriptors.extend(resolved.manifest.layers.iter().cloned());
-    for (i, d) in descriptors.iter().enumerate() {
-        let dest = dir.join(format!("blob-{i}"));
+    // 書き込み先は検査済み root の fd 起点の writer（#2765）。同じ digest は 1 回だけ取得する。
+    let store = fandhe_container_oci::image_management::ImageStore::open(&dir).expect("store");
+    let mut session = store.begin_pull_generated().expect("begin pull");
+    let mut seen = std::collections::HashSet::new();
+    for d in descriptors.iter() {
+        if !seen.insert(d.digest.clone()) {
+            continue;
+        }
+        let mut w = session.open_staged_blob(&d.digest).expect("writer");
         let got = client
-            .fetch_blob(&ep, r.repository(), d, &auth, &dest)
+            .fetch_blob(&ep, r.repository(), d, &auth, &mut w)
             .expect("blob");
         assert_eq!(got.size, d.size);
-        assert_eq!(std::fs::metadata(&dest).expect("meta").len(), d.size);
+        w.commit().expect("commit");
+        let v = session
+            .verify_staged_blob(&d.digest, d.size)
+            .expect("verify");
+        assert_eq!(v.size, d.size);
     }
+    session.abort().expect("abort");
     let _ = std::fs::remove_dir_all(&dir);
     resolved.manifest.layers.len()
 }

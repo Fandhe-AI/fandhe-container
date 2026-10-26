@@ -355,7 +355,7 @@ fn is_definite_failure(code: CriErrorCode) -> bool {
 /// 実行層の呼び出し中に立てた `in_flight` を、確定されないまま破棄されたら巻き戻す番人（TASK-59.2）。
 ///
 /// worker（専用スレッド上のクロージャ）が所有する。RPC の future が中断・タイムアウトしても
-/// worker は最後まで走り、その終了時（失敗・panic を含む）に `Drop` で巻き戻すため、実行層が処理中の間に
+/// worker は走り続け（Create は dispatch 前なら `AbandonOnDrop` で打ち切られ、dispatch 後は最後まで走る。#2899）、その終了時（失敗・panic を含む）に `Drop` で巻き戻すため、実行層が処理中の間に
 /// 記録・件数枠・bundle だけが先に解放されることはない。確定は [`InFlightGuard::commit`]。
 struct InFlightGuard {
     registry: Arc<Mutex<SandboxRegistry>>,
@@ -626,6 +626,11 @@ impl SetUpSettlement {
             .is_ok()
     }
 
+    /// 呼び出し側が手放し済みか（`CreateContainer` の worker が bundle 用意の前に見る。#2899）。
+    fn is_abandoned(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::ABANDONED
+    }
+
     /// 呼び出し側が結果不明として手放す。worker が先に確定していたら偽（記録は worker の確定どおり）。
     fn abandon(&self) -> bool {
         self.0
@@ -636,6 +641,34 @@ impl SetUpSettlement {
                 Ordering::SeqCst,
             )
             .is_ok()
+    }
+}
+
+/// `CreateContainer` の RPC 側が、worker を手放したことを伝える番人（REPAIR-5・CRI-2・#2899）。
+///
+/// 期限切れ（`run_bounded` の `Timeout`）と future の破棄（kubelet の取り消し・grpc-timeout）の両方で、
+/// 実行層への dispatch より前の worker を打ち切る。`Drop` は atomic の store だけで外部処理を持たない
+/// （RPC スレッドで走るため。`spawn_runtime_thread` の注意）。worker が dispatch 済み（先に確定済み）なら
+/// 手放しは負けて何も起きず、worker は従来どおり最後まで走る。結果を受け取れた経路は `disarm` する。
+struct AbandonOnDrop {
+    settlement: Arc<SetUpSettlement>,
+    cancel: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl AbandonOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            // dispatch 前の worker だけが負ける。取り消しの旗は rootfs 展開をエントリ単位で止める。
+            self.settlement.abandon();
+            self.cancel.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -683,7 +716,8 @@ impl Drop for NetworkTearDownGuard {
 
 /// 実行層の呼び出しを専用スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
 ///
-/// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker は打ち切れない。worker は自分の
+/// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker はここからは打ち切れない（`CreateContainer` だけは
+/// 呼び出し側が `AbandonOnDrop` で dispatch 前の worker を打ち切る。#2899）。worker は自分の
 /// [`InFlightGuard`] で記録を最後まで確定・巻き戻すため、呼び出し側は結果不明として扱ってよい。
 /// worker も期限の監視も tokio の blocking pool を使わない。実行層のハングで pool が埋まっても、
 /// 期限の監視は開始され、`timeout` で応答を返す。
@@ -1832,19 +1866,38 @@ impl CriRuntimeService {
         let timeout = self.runtime_timeout;
         let registry = Arc::clone(&self.registry);
         let max_retained_bytes = self.container_limits.max_retained_bytes();
-        run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
+        // RPC の期限切れ・future の破棄で、dispatch 前の worker を打ち切る（#2899）。dispatch 後は打ち切らない
+        // （core の create は外部プロセスとファイル I/O を伴い、途中で止める口が無い。docs/design/container-log-removal-wait.md）。
+        let settlement = Arc::new(SetUpSettlement::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut abandon_on_drop = AbandonOnDrop {
+            settlement: Arc::clone(&settlement),
+            cancel: Arc::clone(&cancel),
+            armed: true,
+        };
+        let outcome = run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
+            // 起動前に手放されていたら prepare もしない（guard の Drop が release と記録の巻き戻しを行う）。
+            if settlement.is_abandoned() {
+                return Err(CriError::timeout("runtime operation timed out"));
+            }
             // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
             // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
             // 結線するときは sandbox の記録の保持役の pid から PodNamespacePaths::for_holder_pid で作る（#2776）。
             let bundle = bundles.prepare(
                 &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
-                    .with_pod_netns_path(pod_netns.as_deref()),
+                    .with_pod_netns_path(pod_netns.as_deref())
+                    .with_cancel(&cancel),
             )?;
             // 実行層へ渡す前に、報告された識別情報と解決済みの stop signal を記録へ反映する。保持量の上限を
             // 超えたらここで失敗し、guard が bundle の解放と記録の巻き戻しを行う（#2771）。
             attach_prepared(&registry, &id, &bundle, max_retained_bytes)?;
+            // dispatch の可否は呼び出し側との compare_exchange 1 回で決める。負けたら（手放し済み）まだ何も
+            // 実行層へ渡していないため、`outcome_unknown` は偽のまま guard が bundle を解放し記録を除去する。
+            if !settlement.settle_by_worker() {
+                return Err(CriError::timeout("runtime operation timed out"));
+            }
             // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
             guard.mark_dispatched();
             let status = match adapter.create(&id, bundle.path().to_path_buf()) {
@@ -1873,7 +1926,12 @@ impl CriRuntimeService {
             }
             Ok(())
         })
-        .await??;
+        .await;
+        // 結果を受け取れた（worker が最後まで走った）ときだけ手放さない。期限切れ・worker の失敗は手放す。
+        if outcome.is_ok() {
+            abandon_on_drop.disarm();
+        }
+        outcome??;
         Ok(v1::CreateContainerResponse { container_id })
     }
 

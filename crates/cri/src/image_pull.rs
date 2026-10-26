@@ -230,6 +230,7 @@ impl PullError {
             OciErrorCode::NotFound => "image layer references a missing entry",
             OciErrorCode::FailedPrecondition => "image rootfs precondition failed",
             OciErrorCode::AlreadyExists => "image layer has conflicting entries",
+            OciErrorCode::Timeout => "image layer extraction exceeded its deadline",
             _ => "image layer extraction failed",
         };
         Self::new(err.code(), message)

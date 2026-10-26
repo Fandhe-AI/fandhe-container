@@ -7,7 +7,8 @@
 //!
 //! 役割分担: 写像表そのものの単体照合は `src/error.rs`、状態遷移と巻き戻しは
 //! `runtime_service_runtime.rs`、本物の pull 経路は `image_pull.rs`（unix 限定）が担う。
-//! 本ファイルは「区分×メッセージの素通し」だけを 3 OS で見て、状態の副作用は再照合しない。
+//! 本ファイルは「区分×メッセージの素通し」だけを 3 OS で見て、状態の副作用は再照合しない
+//! （例外: `err3_bundle_prepare_timeout_*` は #2899 の受け入れ条件のため、`release` と記録の除去も照合する）。
 //!
 //! `ErrorCode`・`OciErrorCode` は `#[non_exhaustive]` のため、下の表は現時点の区分の列挙であり網羅保証ではない。
 //! 未知の区分を `Internal` へ倒す fail-closed は `src/error.rs` 側の責務である。
@@ -118,11 +119,20 @@ impl ContainerRuntime for Shared {
 #[derive(Default)]
 struct FakeBundles {
     fail_prepare: AtomicBool,
+    /// true のとき prepare は rootfs 用意の期限切れ（`Timeout`）で失敗する（#2899・A3）。
+    timeout_prepare: AtomicBool,
+    /// `release` の呼び出し回数（#2899・A3）。
+    releases: AtomicUsize,
 }
 
 impl BundleProvider for FakeBundles {
     fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let container_id = req.container_id;
+        if self.timeout_prepare.load(Ordering::SeqCst) {
+            return Err(CriError::timeout(
+                "image rootfs preparation exceeded its deadline",
+            ));
+        }
         if self.fail_prepare.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("bundle storage is full"));
         }
@@ -134,6 +144,7 @@ impl BundleProvider for FakeBundles {
         Ok(PreparedBundle::new(root.join(container_id)))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -352,6 +363,53 @@ async fn err3_bundle_prepare_resource_exhausted_reaches_status() {
         recorded,
         vec![(CriOpKind::CreateContainer, "RESOURCE_EXHAUSTED")]
     );
+}
+
+/// ERR-3・REPAIR-5・CRI-2（#2899）: rootfs 用意の `Timeout` が `DEADLINE_EXCEEDED` とメッセージのまま届き、
+/// dispatch 前の失敗として `release` が 1 回呼ばれ、記録（名前キー）が残らない。実行層の `create` も呼ばれない。
+#[tokio::test]
+async fn err3_bundle_prepare_timeout_maps_to_deadline_exceeded_and_releases() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.bundles.timeout_prepare.store(true, Ordering::SeqCst);
+    let err = create(&h.service, &sb)
+        .await
+        .expect_err("prepare must time out");
+    assert_eq!(
+        pair(&err),
+        (
+            Code::DeadlineExceeded,
+            "image rootfs preparation exceeded its deadline".to_string()
+        )
+    );
+    assert!(h.runtime.calls.lock().unwrap().is_empty());
+    assert_eq!(h.bundles.releases.load(Ordering::SeqCst), 1);
+    let listed = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers
+    .len();
+    assert_eq!(listed, 0);
+    let recorded: Vec<(CriOpKind, &str)> = h
+        .recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.kind() == CriOpKind::CreateContainer)
+        .map(|s| (s.kind(), code_name(s.code())))
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![(CriOpKind::CreateContainer, "DEADLINE_EXCEEDED")]
+    );
+    // 名前キーが解放されているので、同じ名前で作り直せる。
+    h.bundles.timeout_prepare.store(false, Ordering::SeqCst);
+    create(&h.service, &sb).await.expect("re-create");
 }
 
 /// ERR-3・ERR-2: 実行層の長いメッセージ（6000 バイト）が RPC 経由でも 4095 バイト（4096 は文字の途中）に

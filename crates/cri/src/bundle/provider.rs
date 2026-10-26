@@ -95,6 +95,20 @@ pub trait RootfsSource: Send + Sync {
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError>;
 
+    /// `prepare` に取り消しの旗を足した版（REPAIR-5・CRI-2・#2899）。`cancel` が立ったら、実装は分割できない区間の
+    /// 合間で止まり `Timeout` を返してよい。既定は旗を無視して `prepare` を呼ぶ（取り消しに対応しない実装向け）。
+    /// `Err` のとき rootfs を残さない契約は `prepare` と同じ。
+    fn prepare_cancellable(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<ImageDefaults, CriError> {
+        let _ = cancel;
+        self.prepare(image, rootfs, user)
+    }
+
     /// `prepare` で作った rootfs を解放する（不在は `Ok`）。
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
 }
@@ -364,7 +378,9 @@ impl BundleProvider for SpecBundleProvider {
             image_groups: merge,
         };
         let built = (|| -> Result<_, CriError> {
-            let defaults = self.rootfs.prepare(image, &rootfs, &user)?;
+            let defaults = self
+                .rootfs
+                .prepare_cancellable(image, &rootfs, &user, req.cancel)?;
             // dns_config: 検証済みの resolv.conf を bundle に書き、そのパスを config.json の bind の source にする。
             // mode は 0644（mount の root がファイル自身になり bundle の 0700 が効かないため、写像された
             // 非 root の uid で動く process が読めるようにする。DNS 設定だけで秘密値は含まない）。

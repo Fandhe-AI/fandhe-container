@@ -232,6 +232,9 @@ pub struct BundleRequest<'a> {
     /// だけ ipc を join にする。供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
     /// パスは sandbox の記録の保持役の pid から `crate::bundle::PodNamespacePaths::for_holder_pid` で作る（#2776）。
     pub pod_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
+    /// 立ったら rootfs の用意（レイヤー展開）をエントリ単位で打ち切る取り消しの旗（REPAIR-5・CRI-2・#2899）。
+    /// `CreateContainer` の RPC が期限切れで worker を手放したときに立つ。`None` は取り消しなし。
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> BundleRequest<'a> {
@@ -249,7 +252,15 @@ impl<'a> BundleRequest<'a> {
             config,
             pod_netns_path: None,
             pod_namespaces: None,
+            cancel: None,
         }
+    }
+
+    /// rootfs の用意を打ち切る取り消しの旗を足す（#2899）。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a std::sync::atomic::AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// pod network namespace のパスを足す（#2675）。

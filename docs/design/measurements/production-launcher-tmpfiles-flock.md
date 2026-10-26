@@ -39,9 +39,11 @@ ci.yml の `TMPDIR` 指定（CI でしか効かない）。
 
 未実施の項目を含む。この記録の作成環境（Unshare 段が `PermissionDenied` になる AppArmor 制限下）では本番試験を最後まで
 回せなかったため、修正前後の繰り返し（注入あり・なし）の件数は未取得である。PR の CI（ubuntu）での通過を確認し、
-再現頻度と修正後の失敗 0 の確認は人手で追記する。なお `make repeat-test` は最終成功行が 200 文字を超え `;` を含むこと、
-委譲 scope（`systemd-run --user --scope -p Delegate=yes`）と `FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けないことから、
-この試験にはそのまま使えない。
+再現頻度と修正後の失敗 0 の確認は人手で追記する。なお `make repeat-test` は #2886 で `USER_SCOPE=1`（委譲 scope での直接実行）・`TEST_ENV`
+（`FANDHE_CONTAINER_TEST_ID_HELPER=1` 等）・512 文字までで `;` を含む成功行の完全一致に対応し、この試験に使えるようになった。
+実行例は `AGENTS.md` の repeat-test の項を参照。dispatch（ubuntu・`repeat-user-scope=true`。1 回の上限は `repeat-run-timeout`〔既定 600 秒〕、ステップ全体は 55 分で打ち切られるため、遅ければ `repeat-count` を分けて複数回 dispatch する）での 300 回の結果
+（run ID・commit・passed / failed・有効だった環境変数・tmpfiles の走査時刻との関係）は、PR の push 後に追記する（未実施）。
+修正前の再現頻度は、boot から約 15 分の走査との重なりに依存するため繰り返しでは再測定できない。
 
 ## 残余（製品側）
 

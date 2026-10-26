@@ -53,7 +53,7 @@ pub fn set_up_container(
     match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
         Ok(resp) => Ok(resp),
         Err(e) => match net.detach(&DetachRequest::new(name.clone(), container.clone())) {
-            Ok(_) => Err(e),
+            Ok(_) => Err(reclaimed_error(e)),
             Err(d) => Err(TraitError::new(
                 ErrorCode::Internal,
                 format!(
@@ -67,6 +67,23 @@ pub fn set_up_container(
             )),
         },
     }
+}
+
+/// 巻き戻しの `detach` が成功したときの attach エラーを整える。
+///
+/// attach のエラーが「資源が残った」と報告していても、`detach` が請求書で回収済みなら残骸は無い。
+/// veth 名は endpoint から決まり再試行で同名の live veth が作られるため、「残っている」と読める文言を
+/// 転送すると、運用者や後始末が新しい live veth を消しかねない（NET-1・#2681）。
+fn reclaimed_error(e: TraitError) -> TraitError {
+    const LEFT: &str = "resource(s) left behind";
+    if !e.message().contains(LEFT) {
+        return e;
+    }
+    TraitError::new(
+        e.code(),
+        e.message()
+            .replace(LEFT, "resource(s) reclaimed by the rollback detach"),
+    )
 }
 
 /// PodSandbox のネットワークを削除する（`net-delete`）。`NetworkPlugin` の応答をそのまま返す。

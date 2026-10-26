@@ -63,6 +63,9 @@
 //! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
 //! ため `NLM_F_EXCL` 作成 + 直後の ifindex 確保 + ifindex 指定の削除で運用する（`attach_container_with` の doc）。
 //!
+//! 失敗して取り残した veth・pin は `ContainerAttachError::reclaim_claim` の請求書（[`FailedAttachClaim`]）で
+//! `reclaim_failed_attach`（Linux のみ。#2681）から回収できる（`delete` モジュール doc「attach の取り残しの回収」）。
+//!
 //! 接続の最後に [`StaticIpam`]（`ipam`。TASK-139.2.2・#848）で重複しない IPv4 アドレスを払い出す。
 //! 払い出しに失敗（枯渇 `ResourceExhausted` 等）したら veth と netns を戻す。IPAM の状態は呼び出し側が
 //! 所有し、接続失敗時は変更されない。
@@ -104,12 +107,15 @@
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み）
+//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
+//!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
+//!   同じプロセスで作った pin まで。再起動後の pin・ネットワーク本体は手動。write-ahead は #1870 の後に再検討）
 //! - netns の事前作成（`create_container_netns`・`attach_prepared_container`・`release_container_netns`。#2675）は
 //!   作成と pin だけを切り出した入口で、コンテナがその netns へ入る側（core）は未実装。未 attach の
 //!   `PreparedNetns` は呼び出し側が必ず解放する（Drop では unpin しない）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
+pub mod attach_claim;
 pub mod delete;
 pub mod ipam;
 pub mod publish;
@@ -120,8 +126,11 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+pub use attach_claim::FailedAttachClaim;
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
+#[cfg(target_os = "linux")]
+pub use delete::reclaim_failed_attach;
 #[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_create;
 pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
@@ -1201,6 +1210,14 @@ pub struct AttachedContainer<N> {
     pub netns: N,
 }
 
+impl<N> AttachedContainer<N> {
+    /// 請求書の記録の `pin=` 行の値（この接続の pin の識別子。特定できなければ `-`）。成功した接続の請求書の
+    /// 記録を試験で組むための口で、記録を信頼する根拠にはならない（回収側が所有記録と照合する。NET-1・#2681）。
+    pub fn netns_pin_record_value(&self) -> String {
+        attach_claim::pin_record_value(&self.netns_path)
+    }
+}
+
 /// 失敗した手順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1269,6 +1286,17 @@ pub struct AttachRollbackReport {
     pub leftover: Vec<(AttachResource, ResourceState)>,
 }
 
+/// 回収用の請求書の元になる、接続の所有情報（[`ContainerAttachError`] の非公開フィールド）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachOwner {
+    network: NetworkName,
+    token: String,
+    endpoint: EndpointId,
+    generation: String,
+    /// 失敗の時点で控えた取り残し pin の実体の識別子（請求書の生成時に採り直さない）。
+    pin: Option<attach_claim::PinIdentity>,
+}
+
 /// コンテナ接続の失敗（元のエラー・失敗手順・ロールバック結果。ERR-1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1279,9 +1307,27 @@ pub struct ContainerAttachError {
     pub step: AttachStep,
     /// ロールバックの結果。
     pub rollback: AttachRollbackReport,
+    /// この接続のネットワーク名・bridge の所有トークン・endpoint。回収用の請求書
+    /// （[`FailedAttachClaim`]）の元になるためだけに保持し、公開しない（#2681）。
+    /// `Err` の型を大きくしないため Box にする。
+    owner: Option<Box<AttachOwner>>,
 }
 
 impl ContainerAttachError {
+    /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無ければ `None`。
+    /// quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、カーネル側の回収対象ではない。
+    pub fn reclaim_claim(&self) -> Option<FailedAttachClaim> {
+        let o = &**self.owner.as_ref()?;
+        FailedAttachClaim::from_error(
+            &o.network,
+            &o.token,
+            &o.endpoint,
+            &o.generation,
+            o.pin,
+            self,
+        )
+    }
+
     /// 機械可読な分類。
     pub fn code(&self) -> NetErrorCode {
         self.error.code()
@@ -1321,13 +1367,56 @@ pub(crate) struct UnpinFailure<N> {
     pub(crate) netns: N,
 }
 
-/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークンと endpoint から導出する。
+/// 接続ごとの世代識別子の長さ（小文字 16 進。128 bit）。
+pub(crate) const GENERATION_LEN: usize = 32;
+
+/// 接続ごとの世代識別子を作る（時刻 ns・PID・プロセス内連番。各 16 進 16・8・8 桁）。
 ///
-/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が再導出して照合する
-/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。形式
-/// （`<bridge_token>/ep/<endpoint>`）は既存 veth の照合に関わる契約で、変更すると削除で所有を証明できなくなる。
-pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> String {
-    format!("{bridge_token}/ep/{}", endpoint.as_str())
+/// 同じ endpoint を再接続しても別の値になり、host 側 veth の所有トークンと取り残しの請求書に載せて
+/// 「どの接続の資源か」を区別する（古い請求書を新しい接続の veth へ適用して正常な veth を消さないため。
+/// NET-1・#2681）。暗号論的な乱数ではない（敵対者への耐性ではなく、並行する回収との取り違えの防止が目的）。
+pub(crate) fn new_generation() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{nanos:016x}{:08x}{:08x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// 世代識別子の形式（小文字 16 進のちょうど [`GENERATION_LEN`] 桁）を満たすか。
+pub(crate) fn is_valid_generation(g: &str) -> bool {
+    g.len() == GENERATION_LEN && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークン・endpoint・接続の世代から導出する。
+///
+/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が形式を再検証して照合する
+/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。世代を含めるのは、
+/// 同じ endpoint の再接続で同じトークンになると、古い請求書が新しい正常な veth に一致してしまうため（#2681）。
+/// 形式は `<bridge_token>/ep/<endpoint>/g/<世代>`。
+pub(crate) fn host_owner_token(
+    bridge_token: &str,
+    endpoint: &EndpointId,
+    generation: &str,
+) -> String {
+    format!("{bridge_token}/ep/{}/g/{generation}", endpoint.as_str())
+}
+
+/// `token` が、このネットワーク・endpoint の発行形式（世代が正しい形式）か。世代の値そのものは問わない。
+/// `delete_network` が呼び出し側の渡した `host_token` の出自を検査するのに使う。
+pub(crate) fn host_token_is_for(bridge_token: &str, endpoint: &EndpointId, token: &str) -> bool {
+    token
+        .strip_prefix(bridge_token)
+        .and_then(|r| r.strip_prefix("/ep/"))
+        .and_then(|r| r.strip_prefix(endpoint.as_str()))
+        .and_then(|r| r.strip_prefix("/g/"))
+        .is_some_and(is_valid_generation)
 }
 
 /// attach の前に作って pin した netns（#2675・NET-1・CRI-2・PLUG-1）。
@@ -1519,14 +1608,29 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
-    attach_with_source(ops, spec, None, ipam, ports).map_err(|failure| failure.0)
+    attach_container_with_generation(ops, spec, ipam, ports, &new_generation())
+}
+
+/// [`attach_container_with`] の本体。接続の世代識別子を呼び出し側から受ける（attach の試行ごとに発行するため
+/// spec には持たせない。テストでは固定値を渡す）。世代は veth の所有トークンと取り残しの請求書に載る
+/// （NET-1・#2681）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn attach_container_with_generation<O: AttachOps>(
+    ops: &O,
+    spec: &ContainerAttachSpec,
+    ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
+    generation: &str,
+) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+    attach_with_source(ops, spec, None, ipam, ports, generation).map_err(|failure| failure.0)
 }
 
 /// 事前に作って pin した netns へ接続する版の手順本体（#2675・NET-1・CRI-2）。
 ///
 /// [`attach_container_with`] との違いは netns を作らず `prepared` を使うことだけで、後半（veth・アドレス・
 /// route・DNAT）は同じ。失敗時は veth・IPAM の払い出し・受け口の予約を同じ規則で戻すが、**netns は unpin せず**
-/// 呼び出し側へ返す（netns の寿命は事前に作った側が持つ。`PreparedNetns` の doc）。
+/// 呼び出し側へ返す（netns の寿命は事前に作った側が持つ。`PreparedNetns` の doc）。世代は試行ごとに呼び出し側が
+/// 発行する（[`attach_container_with_generation`] と同じ。#2681）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn attach_prepared_with<O: AttachOps>(
     ops: &O,
@@ -1534,12 +1638,13 @@ pub(crate) fn attach_prepared_with<O: AttachOps>(
     prepared: PreparedNetns<O::Netns>,
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
+    generation: &str,
 ) -> Result<AttachedContainer<O::Netns>, AttachFailure<O::Netns>> {
-    attach_with_source(ops, spec, Some(prepared), ipam, ports)
+    attach_with_source(ops, spec, Some(prepared), ipam, ports, generation)
 }
 
 /// [`attach_container_with`]・[`attach_prepared_with`] の共通本体。`source` が `Some` なら netns を作らず、
-/// 失敗時はその netns を unpin せずに返す。
+/// 失敗時はその netns を unpin せずに返す。世代は veth の所有トークンと取り残しの請求書に載る（#2681）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn attach_with_source<O: AttachOps>(
     ops: &O,
@@ -1547,11 +1652,30 @@ fn attach_with_source<O: AttachOps>(
     source: Option<PreparedNetns<O::Netns>>,
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
+    generation: &str,
 ) -> Result<AttachedContainer<O::Netns>, AttachFailure<O::Netns>> {
-    let fail = |error, step, rollback| ContainerAttachError {
-        error,
-        step,
-        rollback,
+    let fail = |error, step, rollback: AttachRollbackReport| {
+        // 取り残した pin の識別子は、この失敗の時点で控える（請求書の生成時に採り直さない。NET-1）。
+        let pin = rollback
+            .leftover
+            .iter()
+            .find_map(|(r, _)| match r {
+                AttachResource::Netns(path) => Some(path.as_path()),
+                _ => None,
+            })
+            .and_then(attach_claim::pin_identity_of);
+        ContainerAttachError {
+            error,
+            step,
+            rollback,
+            owner: Some(Box::new(AttachOwner {
+                network: spec.network.clone(),
+                token: spec.bridge_token.clone(),
+                endpoint: spec.endpoint.clone(),
+                generation: generation.to_owned(),
+                pin,
+            })),
+        }
     };
     // 事前作成の netns が別のエンドポイント・置き場のものなら、何も作らず拒否して返す。
     if let Some(p) = &source
@@ -1686,7 +1810,7 @@ fn attach_with_source<O: AttachOps>(
     };
 
     // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
-    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint);
+    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint, generation);
     let attach = || {
         ops.set_owner_token(host_index, &host_token)
             .map_err(|e| (e, AttachStep::SetOwnerToken))?;
@@ -2207,6 +2331,7 @@ pub fn attach_prepared_container(
         prepared,
         ipam,
         ports,
+        &new_generation(),
     )
     .map_err(|failure| {
         let (error, netns) = *failure;
@@ -3220,6 +3345,16 @@ mod attach_tests {
         ContainerAttachSpec::new(eid(id), &created(), netns_dir()).unwrap()
     }
 
+    /// 世代を固定して接続する（本番は試行ごとに発行。fake の呼び出し列を決定的にするため）。
+    fn attach_container_with<O: AttachOps>(
+        ops: &O,
+        spec: &ContainerAttachSpec,
+        ipam: &mut StaticIpam,
+        ports: &mut PortRegistry,
+    ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+        super::attach_container_with_generation(ops, spec, ipam, ports, TEST_GEN)
+    }
+
     /// 呼び出しを記録し、指定手順で失敗を注入する fake。link の ifindex は名前の接頭辞で決める。
     #[derive(Default)]
     struct Fake {
@@ -3461,6 +3596,40 @@ mod attach_tests {
         }
     }
 
+    /// テストで固定する接続の世代識別子。
+    const TEST_GEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// NET-1・#2681: 世代識別子は発行ごとに別の値で、形式を満たす。
+    #[test]
+    fn net1_generation_is_unique_per_attempt() {
+        let a = new_generation();
+        let b = new_generation();
+        assert_ne!(a, b);
+        assert!(is_valid_generation(&a));
+        assert_eq!(a.len(), GENERATION_LEN);
+    }
+
+    /// NET-1・#2681: 同じ spec での 2 回の試行は別の世代の所有トークンを刻む（再接続が古い請求書と重ならない）。
+    #[test]
+    fn net1_same_spec_attempts_get_distinct_tokens() {
+        let sp = spec("c1");
+        let a = super::attach_container_with(
+            &Fake::default(),
+            &sp,
+            &mut ipam(),
+            &mut PortRegistry::new(),
+        )
+        .unwrap();
+        let b = super::attach_container_with(
+            &Fake::default(),
+            &sp,
+            &mut ipam(),
+            &mut PortRegistry::new(),
+        )
+        .unwrap();
+        assert_ne!(a.host_token, b.host_token);
+    }
+
     /// NET-1: netns 置き場は絶対パスのみ。pin 先は置き場直下の ID 名。
     #[test]
     fn net1_spec_requires_absolute_netns_dir() {
@@ -3486,7 +3655,7 @@ mod attach_tests {
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),
-                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1/g/0123456789abcdef0123456789abcdef".to_owned(),
                 "set_master 21 7".to_owned(),
                 "set_up 21".to_owned(),
                 "move_to_netns 22".to_owned(),
@@ -3661,6 +3830,42 @@ mod attach_tests {
         assert!(e.rollback.removed.is_empty());
     }
 
+    /// NET-1・#2681: 取り残しの種類ごとに請求書のフラグが決まる。取り残しが無ければ請求書は無い。
+    #[test]
+    fn net1_attach_error_reclaim_claim_flags() {
+        let f = Fake {
+            fail_netns: Some((NetErrorCode::Timeout, Some(ResourceState::Unknown))),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert_eq!(claim.endpoint().as_str(), "c1");
+        assert_eq!(claim.network().as_str(), "web");
+        assert!(!claim.includes_veth() && claim.includes_netns() && !claim.includes_quarantine());
+        assert_eq!(
+            FailedAttachClaim::from_record(&claim.to_record()),
+            Ok(claim)
+        );
+
+        let mut e = e;
+        e.rollback.leftover = vec![
+            (
+                AttachResource::Veth(VethNames::derive(&eid("c1")).unwrap().host().clone()),
+                ResourceState::Present,
+            ),
+            (
+                AttachResource::PortReservation(NetworkName::new("web").unwrap(), eid("c1")),
+                ResourceState::Present,
+            ),
+        ];
+        let claim = e.reclaim_claim().unwrap();
+        assert!(claim.includes_veth() && !claim.includes_netns() && claim.includes_quarantine());
+
+        e.rollback.leftover.clear();
+        assert_eq!(e.reclaim_claim(), None);
+    }
+
     /// NET-1: veth の AlreadyExists は他者のリソースなので削除せず、netns だけ戻す。
     #[test]
     fn net1_attach_veth_exists_is_not_deleted() {
@@ -3791,6 +3996,7 @@ mod attach_tests {
             prepared("web-1", netns_dir()),
             &mut pool,
             &mut PortRegistry::new(),
+            TEST_GEN,
         )
         .unwrap();
         let calls = f.calls();
@@ -3804,7 +4010,7 @@ mod attach_tests {
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),
-                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1/g/0123456789abcdef0123456789abcdef".to_owned(),
                 "set_master 21 7".to_owned(),
                 "set_up 21".to_owned(),
                 "move_to_netns 22".to_owned(),
@@ -3859,6 +4065,7 @@ mod attach_tests {
                 prepared("c1", netns_dir()),
                 &mut ipam(),
                 &mut PortRegistry::new(),
+                TEST_GEN,
             )
             .unwrap_err();
             assert_eq!(e.step, step);
@@ -3883,9 +4090,15 @@ mod attach_tests {
             prepared("c1", PathBuf::from("/elsewhere")),
         ] {
             let f = Fake::default();
-            let (e, back) =
-                *attach_prepared_with(&f, &spec("c1"), p, &mut ipam(), &mut PortRegistry::new())
-                    .unwrap_err();
+            let (e, back) = *attach_prepared_with(
+                &f,
+                &spec("c1"),
+                p,
+                &mut ipam(),
+                &mut PortRegistry::new(),
+                TEST_GEN,
+            )
+            .unwrap_err();
             assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
             assert!(f.calls().is_empty(), "{:?}", f.calls());
             assert!(back.is_some());
@@ -3905,6 +4118,7 @@ mod attach_tests {
             prepared("c1", netns_dir()),
             &mut ipam(),
             &mut PortRegistry::new(),
+            TEST_GEN,
         )
         .unwrap_err();
         assert_eq!(e.step, AttachStep::VerifyBridge);

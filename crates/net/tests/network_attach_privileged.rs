@@ -17,7 +17,14 @@
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
-//! 最後に `delete_network`（TASK-139.4・#317）で c1 と c3 を渡してネットワークを削除し、bridge・host 側 veth が
+//! `delete_network` の前に、attach の取り残しの回収（`reclaim_failed_attach`。#2681）を確かめる。c4 を接続し、
+//! 請求書の記録の復号から回収して veth が `NotFound`・pin が消えること（2 回目も成功する冪等性）と、別名のない他者の veth は
+//! 請求書に載っても消えないことを具体値で照合する。
+//!
+//! 続けて netns の事前作成（`create_container_netns`。#2675・CRI-2）→ 接続（`attach_prepared_container`。c6）と、
+//! 作成 → 解放（`release_container_netns`。c7。pin が消える）を確かめる。
+//!
+//! 最後に `delete_network`（TASK-139.4・#317）で c1・c3・c6 を渡してネットワークを削除し、bridge・host 側 veth が
 //! `NotFound`、`nft list table` の失敗、pin ファイルの消滅、IPAM・ポート予約が空であることを具体値で照合する
 //! （渡していない c2 の事前作成 veth は IPAM に無く、削除の対象外）。続けて空の `containers` での再実行が成功する（冪等）。
 //!
@@ -63,17 +70,16 @@ mod linux {
         NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK,
     };
     use fandhe_container_net::network::{
-        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
-        NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
-        attach_container, attach_prepared_container, create_container_netns, create_network,
-        delete_network, release_container_netns,
+        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, DeleteStep, EndpointId,
+        FailedAttachClaim, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish, PortRegistry,
+        StaticIpam, VethNames, attach_container, attach_prepared_container, create_container_netns,
+        create_network, delete_network, reclaim_failed_attach, release_container_netns,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
     const LAUNCHER_PID_ENV: &str = "FANDHE_ATTACH_TEST_LAUNCHER_PID";
     const DIR_ENV: &str = "FANDHE_ATTACH_TEST_DIR";
-    const OK_LINE: &str =
-        "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -498,49 +504,115 @@ mod linux {
             )));
         }
 
+        // --- attach の取り残しの回収（NET-1・#2681）: 請求書の記録から、所有を確かめて veth と pin を回収する ---
+        let c4 = EndpointId::new("c4")?;
+        let spec4 = ContainerAttachSpec::new(c4.clone(), &net, base.clone())?;
+        let attached4 = attach_container(&route, &nft, &spec4, &mut ipam, &mut ports, t)
+            .map_err(|e| fail(format!("attach c4 failed at {:?}: {e}", e.step)))?;
+        let host4 = attached4.host_veth.clone();
+        let pin4 = attached4.netns_path.clone();
+        // 世代は attach の試行ごとに発行されるため、成功ハンドルの所有トークン（`<..>/g/<世代>`）から取る。
+        let generation4 = attached4
+            .host_token
+            .rsplit_once("/g/")
+            .map(|(_, g)| g.to_owned())
+            .ok_or_else(|| fail("host_token has no generation"))?;
+        let pin4_value = attached4.netns_pin_record_value();
+        let record = format!(
+            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\ngeneration={generation4}\nveth=1\nnetns=1\npin={}\nquarantine=0\n",
+            net.bridge_token, pin4_value
+        );
+        let claim4 = FailedAttachClaim::from_record(&record)?;
+        for round in 0..2 {
+            // 2 回目は何も残っていない状態での再実行で、冪等に成功する。
+            reclaim_failed_attach(&route, &nft, &claim4, &base, t).map_err(|e| {
+                fail(format!(
+                    "reclaim_failed_attach (round {round}) failed at {:?}: {e}; report: {:?}",
+                    e.step, e.report
+                ))
+            })?;
+        }
+        if !matches!(
+            route.link_index(&host4, t),
+            Err(ref e) if e.code() == NetErrorCode::NotFound
+        ) {
+            return Err(fail("reclaimed veth still exists"));
+        }
+        if pin4.exists() {
+            return Err(fail("reclaimed pin still exists"));
+        }
+        ipam.release(&c4)?;
+        drop(attached4);
+        // 別名のない（他者の）veth は、請求書に載っていても消さない。
+        let c5 = EndpointId::new("c5")?;
+        let names5 = VethNames::derive(&c5)?;
+        route.create_link(
+            &LinkCreate::veth(names5.host().clone(), IfName::new("fxpre1")?)?,
+            t,
+        )?;
+        let record5 = record
+            .replace("endpoint=c4", "endpoint=c5")
+            .replace("netns=1", "netns=0")
+            .replace(&format!("pin={pin4_value}"), "pin=-");
+        let e = match reclaim_failed_attach(
+            &route,
+            &nft,
+            &FailedAttachClaim::from_record(&record5)?,
+            &base,
+            t,
+        ) {
+            Err(e) => e,
+            Ok(_) => return Err(fail("reclaim of a foreign veth unexpectedly succeeded")),
+        };
+        if e.step != DeleteStep::DeleteVeth {
+            return Err(fail(format!("unexpected reclaim step {:?}", e.step)));
+        }
+        link_state(&route, names5.host().as_str())
+            .map_err(|_| fail("a foreign veth must not be deleted by the reclaim"))?;
+
         // --- 事前作成の netns（#2675・CRI-2）: 作成 → 接続 と、作成 → 解放 ---
         // 準備済みの試験で、実機（root）での実行結果は PR に記録する（未実行のまま成功とは書かない）。
-        let ep4 = EndpointId::new("c4")?;
-        let prepared4 = create_container_netns(&route, &base, &ep4, t)
+        let ep6 = EndpointId::new("c6")?;
+        let prepared6 = create_container_netns(&route, &base, &ep6, t)
             .map_err(|e| fail(format!("create_container_netns failed: {e:?}")))?;
-        let pin4 = prepared4.pin_path();
-        if !pin4.exists() {
+        let pin6 = prepared6.pin_path();
+        if !pin6.exists() {
             return Err(fail("prepared netns pin does not exist"));
         }
-        let pin4_ino = fs::metadata(&pin4)
+        let pin6_ino = fs::metadata(&pin6)
             .map_err(|e| fail(format!("stat prepared pin: {e}")))?
             .ino();
-        let own_ino4 = fs::metadata("/proc/self/ns/net")
+        let own_ino6 = fs::metadata("/proc/self/ns/net")
             .map_err(|e| fail(format!("stat own netns: {e}")))?
             .ino();
-        if pin4_ino == own_ino4 {
+        if pin6_ino == own_ino6 {
             return Err(fail("prepared netns is the same as the current netns"));
         }
-        let spec4 = ContainerAttachSpec::new(ep4.clone(), &net, base.clone())?;
-        let attached4 =
-            attach_prepared_container(&route, &nft, &spec4, prepared4, &mut ipam, &mut ports, t)
+        let spec6 = ContainerAttachSpec::new(ep6.clone(), &net, base.clone())?;
+        let attached6 =
+            attach_prepared_container(&route, &nft, &spec6, prepared6, &mut ipam, &mut ports, t)
                 .map_err(|e| {
                     fail(format!(
                         "attach_prepared_container failed at {:?}: {}",
                         e.error.step, e.error
                     ))
                 })?;
-        if attached4.netns_path != pin4 {
+        if attached6.netns_path != pin6 {
             return Err(fail("attached netns path differs from the prepared pin"));
         }
-        let (_, flags4, master4) = link_state(&route, attached4.host_veth.as_str())?;
-        if master4 != Some(net.bridge_index.get()) || flags4 & IFF_UP == 0 {
+        let (_, flags6, master6) = link_state(&route, attached6.host_veth.as_str())?;
+        if master6 != Some(net.bridge_index.get()) || flags6 & IFF_UP == 0 {
             return Err(fail(
                 "host veth of the prepared netns is not up on the bridge",
             ));
         }
-        let ep5 = EndpointId::new("c5")?;
-        let prepared5 = create_container_netns(&route, &base, &ep5, t)
-            .map_err(|e| fail(format!("create_container_netns (c5) failed: {e:?}")))?;
-        let pin5 = prepared5.pin_path();
-        release_container_netns(&route, &nft, prepared5, t)
+        let ep7 = EndpointId::new("c7")?;
+        let prepared7 = create_container_netns(&route, &base, &ep7, t)
+            .map_err(|e| fail(format!("create_container_netns (c7) failed: {e:?}")))?;
+        let pin7 = prepared7.pin_path();
+        release_container_netns(&route, &nft, prepared7, t)
             .map_err(|e| fail(format!("release_container_netns failed: {}", e.error)))?;
-        if pin5.exists() {
+        if pin7.exists() {
             return Err(fail("released netns pin still exists"));
         }
 
@@ -548,18 +620,18 @@ mod linux {
         let hosts = [
             attached.host_veth.clone(),
             attached3.host_veth.clone(),
-            attached4.host_veth.clone(),
+            attached6.host_veth.clone(),
         ];
         let pins = [
             attached.netns_path.clone(),
             attached3.netns_path.clone(),
-            attached4.netns_path.clone(),
+            attached6.netns_path.clone(),
         ];
         let deleted = delete_network(
             &route,
             &nft,
             &net,
-            vec![attached, attached3, attached4],
+            vec![attached, attached3, attached6],
             &mut ipam,
             &mut ports,
             t,

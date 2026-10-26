@@ -107,7 +107,8 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 
 - 出力は固定順: 見出しコメント → `nameserver <IP>`（servers の順に 1 行ずつ）→ `search ...`（空なら省く）→ `options ...`（空なら省く）。重複は畳まず、改行は LF
 - servers は `IpAddr` に parse できたものの表記だけを書く。search は英数字・`-`・`_`・`.`（ラベルは 1〜63 バイト、末尾の `.` は不可）、option は英数字・`-`・`_`・`.`・`:` に限る。空白・改行・NUL・`#` は届かない（行の注入の防止）
-- 上限: servers 32 件・searches 32 件（1 件 253 バイト、合計 2048 バイト）・options 32 件（1 件 64 バイト）・生成物 8 KiB。超過・不正は `INVALID_ARGUMENT`（all-or-nothing。エラー文言に値を含めない）。glibc が使う先頭 3 件への切り詰めはしない
+- 上限: servers 32 件・searches 32 件（1 件 253 バイト、空白区切りで連結した長さが 2048 バイト）・options 32 件（1 件 64 バイト）・生成物 8 KiB。超過・不正は `INVALID_ARGUMENT`（all-or-nothing。エラー文言に値を含めない）。glibc が使う先頭 3 件への切り詰めはしない
+- 値の出どころ（kubernetes `v1.37.1` で照合済み。下記「外部の事実の照合」）: searches の 32 件・2048 バイト・1 件 253 バイトは kubelet と同じ値。servers の 32 件、options の 32 件・64 バイト、生成物の 8 KiB は本実装独自の上限で、kubelet の値ではない（kubelet の servers は 3 件）
 
 ### 結果表
 
@@ -124,6 +125,7 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 - 空の指定で、ホストの `/etc/resolv.conf` を写す縮退はしない（ホストの設定の露出を避ける。network 未結線のため）
 - 利用者の mount が `/etc/resolv.conf` と重なるとき、containerd は利用者を優先して自分の mount を省くが、本実装は拒否する（fail-closed）
 - zone つきの IPv6 は受けない
+- kubelet は CRI へ渡す前に nameserver を 3 件へ、search を 32 件・2048 バイト・1 件 253 バイト以下へ切り詰める（超えた分を黙って落とし、イベントを出す）。options には件数・長さの上限が無く、名前が空でないことだけを検査する。本実装は servers 32 件まで受け、超過は切り詰めずに拒否する。kubelet 経由の要求は 3 件以下に収まって届くため、実際には差が出ない
 
 ### 残る制約（REPAIR-3）
 
@@ -135,7 +137,7 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 ## stop_signal の受け入れ方式（CRI-2・PLUG-1。#2668）
 
 - core の `StopRequest` に `signal`（既定 SIGTERM）を足した（`with_signal` / `signal()`）。実装は `signal()` を停止の意図つきで 1 回送り、`grace` を過ぎても止まらなければ、シグナルが何であっても無条件に SIGKILL へ切り替える。全体の待ちは有界のまま（REPAIR-5）。wire の形式は変わらない
-- CRI の enum `Signal` の値は Linux の番号ではない（例: `SIGTERM = 23`、`SIGKILL = 13`）。`crates/cri/src/stop_signal.rs` の表で Linux の番号へ写す。`RUNTIME_DEFAULT`（0）は SIGTERM。実時間シグナルは glibc / moby の慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64）
+- CRI の enum `Signal` の値は Linux の番号ではない（例: `SIGTERM = 23`、`SIGKILL = 13`）。`crates/cri/src/stop_signal.rs` の表で Linux の番号へ写す。`RUNTIME_DEFAULT`（0）は SIGTERM。実時間シグナルは glibc / moby の慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64。containerd・moby の表と一致することを照合済み。下記「外部の事実の照合」）
 - 未知の値は CreateContainer の検証で `INVALID_ARGUMENT`。StopContainer は記録した config から、StopPodSandbox はコンテナごとに値を求めて渡す（写像に失敗したら SIGTERM へ落とさず `INTERNAL`）
 - 既知の差: イメージ config の `StopSignal` は読まないため、`RUNTIME_DEFAULT` は常に SIGTERM になる。ContainerStatus の `stop_signal` は config の値をそのまま返す（後続で扱う）
 
@@ -151,7 +153,7 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 | CRI の要求 | 結果 |
 | ---------- | ---- |
 | drop `NET_RAW` | 既定 13 個（`CAP_NET_RAW` が無い） |
-| drop `cap_net_raw`・`CAP_MKNOD` | 既定 12 個（大文字小文字・`CAP_` 接頭辞は区別しない） |
+| drop `cap_net_raw`・`CAP_MKNOD` | 既定 12 個（大文字小文字・`CAP_` 接頭辞は区別しない。containerd では `CAP_MKNOD` は無効になる。下の既知の差） |
 | drop `ALL` | 空集合 |
 | drop `SYS_ADMIN`（既定に無い） | 既定 14 個のまま（no-op） |
 | 未知名・空・33 バイト以上・非 ASCII | `INVALID_ARGUMENT`（固定文言。名前は載せない） |
@@ -159,7 +161,7 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 既知の差:
 
-- 名前の正規化（大文字化・`CAP_` 接頭辞の補完・`ALL`）は containerd に合わせた想定で、実装時に一次情報（commit 指定）との再照合は行っていない。食い違いが見つかれば厳しい側（拒否）へ倒す
+- 名前の正規化は containerd と**一部食い違う**（containerd `v2.4.2` で照合済み。下記「外部の事実の照合」）。大文字小文字を区別しない点と `ALL` は一致する。食い違いは 2 点で、(1) containerd は名前へ無条件に `CAP_` を前置するため、`CAP_MKNOD` のように接頭辞つきで渡すと `CAP_CAP_MKNOD` になり何も drop されない（エラーにもならない）が、本実装は接頭辞を受けて drop する。(2) containerd は未知の名前を拒否せず無視するが、本実装は `INVALID_ARGUMENT` にする。どちらも本実装のほうが drop する範囲は狭くならない（厳しい側）。挙動を containerd に合わせるか、接頭辞つきを拒否するかは判断事項で、コードは変えていない（追跡: 末尾の表）
 - 集合ごとに別の値を指定する細かい制御は未対応（未適用として拒否）
 
 ## sysctls の受け入れ方式（CRI-2・CORE-3・SEC-1。#2670）
@@ -294,3 +296,49 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 - 公開の個別解除は無い（`delete_network` が一括で解放する）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
 - `NODE`（hostNetwork）の hostPort・IPv6・SCTP・loopback への公開は `UNIMPLEMENTED`
 - 実機（root）での DNAT 到達確認は本変更では未実行
+
+## 外部の事実の照合（CRI-2・SEC-1・NET-5・CORE-4。#2772）
+
+上の「既知の差」が containerd・kubelet・moby の挙動を前提にしている箇所を、版・commit を固定した一次情報で確かめた。確認日は 2026-10-26。コードは変えていない。
+
+照合に使った版（取得時点の最新の安定版）:
+
+| 対象 | tag | commit |
+| ---- | --- | ------ |
+| kubernetes | `v1.37.1`（`crates/cri/proto` の cri-api `v0.37.1` と同期した版） | `f78e722310e50bcaca9276be22276d9e91d91308` |
+| containerd | `v2.4.2`（`go.mod` が `k8s.io/cri-api v0.37.0`・`github.com/moby/sys/signal v0.7.1` を使う） | `b7a25261e029d68978bbf290df0a62fc819b3c51` |
+| moby/sys | `signal/v0.7.1`（containerd `v2.4.2` が参照する版） | `cafbe42351600ca9b363e220722f66d96f6e71f4` |
+
+### dns_config の上限（kubelet）
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| nameserver・search の上限値 | [`pkg/apis/core/validation/validation.go`](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/validation/validation.go#L4244-L4253)（`MaxDNSNameservers = 3`・`MaxDNSSearchPaths = 32`・`MaxDNSSearchListChars = 2048`。コメントは glibc の制限に由来すると述べる）と、`validatePodDNSConfig`（L4290-L4312。search を空白区切りで連結した長さを検査し、1 件ごとに DNS サブドメインとして検証する） | 一致（search）。**食い違い（nameserver）**: 文書の servers 32 件は kubelet の 3 件と違う。本実装独自の上限と明記した |
+| options の上限 | 同 L4313-L4318。名前が空でないことだけを検査し、件数・長さの上限は無い | 文書の options 32 件・64 バイトは kubelet に無い独自の上限。明記した |
+| 超過時の扱い | [`pkg/kubelet/network/dns/dns.go`](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/network/dns/dns.go#L102-L157)（`formDNSSearchFitsLimits`・`formDNSNameserversFitsLimits`）。nameserver は 3 件へ、search は 32 件・1 件 253 バイト以下・合計 2048 バイト以下へ切り詰めて CRI へ渡す | 本実装は拒否（`INVALID_ARGUMENT`）。差を「既知の差」に追記した。kubelet 経由では上限内で届くため実害は無い |
+| 1 件 253 バイト | 同 L114-L122（`DNS1123SubdomainMaxLength` を超える search を除く。コメントは glibc 2.28 が abort する例を挙げる） | 一致 |
+
+### 実時間シグナル（containerd・moby）
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| `SIGRTMIN` = 34・`SIGRTMAX` = 64 | [moby/sys `signal/signal_linux.go`](https://github.com/moby/sys/blob/cafbe42351600ca9b363e220722f66d96f6e71f4/signal/signal_linux.go#L13-L14)（`sigrtmin = 34`・`sigrtmax = 64`）と、`RTMIN+0..15`・`RTMAX-14..0` の表（L53-L83）。カーネルは 32〜64 の 33 個を持ち、glibc の NPTL が 2 個を使って `SIGRTMIN` を 34 にする（[man-pages `signal(7)`](https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man/man7/signal.7?h=man-pages-6.20)。tag `man-pages-6.20`） | 一致。本実装の表（`stop_signal.rs`）の 34〜64 と同じ |
+| containerd が CRI の enum から名前・番号へ写す方法 | [`internal/cri/server/container_stop_signal.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_stop_signal.go#L27-L43)（enum 名から `SIGNAL_` を外し、`PLUS`・`MINUS` を `+`・`-` へ置換）→ [`container_stop.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_stop.go#L167-L199) が `signal.ParseSignal`（moby/sys の `signal.go` L38-L51。`SIG` を外して `SignalMap` を引く）で番号にする | 一致。`SIGRTMINPLUS1` は `RTMIN+1` = 35、`SIGRTMAXMINUS1` は `RTMAX-1` = 63。containerd は stop_signal を消費している（未対応ではない） |
+| イメージ config の `StopSignal` の扱い | [`container_create.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_create.go#L332-L339)（要求が `RUNTIME_DEFAULT` ならイメージの `StopSignal` を記録に使う） | 一致する差（本実装は読まない）。「既知の差」はそのまま |
+
+### cgroup_parent（containerd・kubelet）
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| containerd の変換 | [`getCgroupsPath`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/helpers.go#L447-L455)（`podsandbox/helpers_linux.go` L62-L70 にも同じ実装）。親の末尾要素が `.slice` なら `<末尾要素>:cri-containerd:<id>`、そうでなければ `<親>/<id>`。`container_create.go` L836-L838 と `podsandbox/sandbox_run_linux.go` L63-L66 が使う | 照合済み。詳細は `cri-cgroup-parent.md` |
+| kubelet が送る値 | [`kuberuntime_sandbox.go`](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go#L167-L170)（`CgroupParent` を常に設定）→ [`kubelet_pods.go`](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kubelet_pods.go#L636-L641)（`GetPodCgroupParent`）→ `pkg/kubelet/cm/pod_container_manager_linux.go`（QoS 別の pod の cgroup 名。systemd ドライバなら `*.slice` 形式、cgroupfs なら `/` 始まりのパス。L123-L144）。cgroupsPerQOS を無効にした構成は空文字（L343-L349） | 一致。`cri-cgroup-parent.md` の「kubelet は既定で送る」は正しい |
+
+### drop_capabilities（containerd）
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| `ALL` の判定 | [`internal/cri/opts/spec_opts.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/opts/spec_opts.go#L198-L235)（`WithCapabilities`。L212 で `util.InStringSlice(drop, "ALL")`、`internal/cri/util/strings.go` L27-L34 は `strings.EqualFold`） | 一致（大文字小文字を区別しない） |
+| 名前の正規化 | 同 L227-L231。`"CAP_" + strings.ToUpper(c)` を無条件に前置する | 一致（大文字化）。**食い違い（接頭辞）**: `CAP_` つきの名前は `CAP_CAP_...` になる |
+| 未知名の扱い | [`pkg/oci/spec_opts.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/pkg/oci/spec_opts.go#L1124-L1139)（`WithDroppedCapabilities`）と `removeCap`（L1083-L1092）。完全一致で取り除くだけで、名前の検証をしない。対象は bounding・effective・permitted・inheritable | **食い違い**: containerd は未知名・接頭辞つきを黙って無視する。本実装は `INVALID_ARGUMENT`（未知名）と drop（接頭辞つき）にする |
+
+食い違い（drop_capabilities の 2 点）のコード側の扱いは #2812 で追跡する（`spec.rs` のドキュメントコメントの訂正と、挙動を containerd に合わせるかのオーナー判断。コードは本変更で変えていない）。

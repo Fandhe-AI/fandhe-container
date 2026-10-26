@@ -48,12 +48,25 @@ PID 1・exec worker・コマンドの子は supervisor を fork しただけな�
 | -- | ---- | ---- |
 | L | supervisor を封印 memfd から exec する | 下記のコスト。組み込み先は launcher の `execveat_fd` と CLI の supervisor 起動（`start_client`）。supervisor 内で自分の exe パスに依存する箇所は、本書時点の `git grep` で `launcher.rs` の `read_link("/proc/self/exe")`（launcher 側）と試験コードの `current_exe()` だけ。CLI 側の `current_exe()`（`supervisor_start.rs`・`doctor/launcher_check.rs`）は supervisor の置き場所の解決用で、L では supervisor の exe だけが変わる |
 | C | fork した子が自分を memfd から再実行する | 再入プロトコル（引数・fd・pidfd・証跡 `ExecReady`・`LaunchReady` の受け渡し）の新設が要る。`setns` の後は `/proc/self` を使えないため exe の fd は `setns` の前に確保する。証跡設計（#1532・#1714）を作り直す規模 |
-| D | 小さな静的 shim を経由する（runc の dmz 型） | **未確認**。runc の現行版での採否は、commit を固定した一次情報（`libcontainer/exeseal/`・`CHANGELOG.md`）で確かめられていない。確認前は設計の根拠にしない |
-| O | overlayfs 等で読み取り専用に見せる（runc 1.2 系の zero-copy 方式） | **未確認**（同上）。マウント権限（mount namespace と user namespace 内の `CAP_SYS_ADMIN`）を要するため、rootless で成立するかが論点 |
+| D | 小さな静的 shim を経由する（runc の dmz 型） | 照合済み（下の「runc の照合」）。runc は dmz を v1.2.1 で削除しており、v1.3.0・v1.5.2 のどちらにも無い。採用の先例としては使えず、独自に設計する案になる |
+| O | overlayfs 等で読み取り専用に見せる（runc 1.2 系の zero-copy 方式） | 照合済み（同上）。runc の実装は特権ユーザーかつ `fsopen` が使えるカーネルでだけ動き、失敗すると複製（memfd → `O_TMPFILE`）へ縮退する。user namespace 内（rootless）では成立しない（コード中の注記）。rootless が主な残余リスクなので、O はそこを塞がない |
 | E | 複製せず、インストールを root 所有（0755）にする | rootless でも DAC で書き込みを止められる。`doctor` が利用者の書ける supervisor を通知すればコスト 0 の補強になる。実装は別 issue の候補 |
 | N | 見送り（見直し条件つき） | **推奨** |
 
 LSM との関係: B' の `SealPolicy` は、許可リスト外の LSM（apparmor・selinux・ima・evm 等）が有効なら複製を使わない。memfd から実行するとパスに結び付いたプロファイル・ドメイン遷移・IMA の計測が元のファイルについて働かない、という論点は B も同じである。同じゲートを掛けると、Ubuntu の既定（AppArmor）や Fedora（SELinux）では B は働かない。ゲートを外せば AppArmor・SELinux・IMA の拘束を自分で外すことになる。
+
+## runc の照合（#2772）
+
+確認日は 2026-10-26。照合に使った版は、runc `v1.3.0`（commit `4ca628d1d4c974f92d24daccb901aa078aad748e`）と、取得時点の最新リリース `v1.5.2`（commit `29dd3dc2b13b4123162e5fe132504bb4b15569f1`）。
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| dmz 型 shim の導入・削除 | [v1.3.0 `CHANGELOG.md`](https://github.com/opencontainers/runc/blob/4ca628d1d4c974f92d24daccb901aa078aad748e/CHANGELOG.md) の 1.2.0-rc.1 の項（L400-409。`runc-dmz` は約 8K の追加の execve 段で、`RUNC_DMZ=true` の opt-in）と 1.2.1 の「Removed」（L212-215。`runc-dmz` を削除。1.2.0 のリリースだけに含まれ、opt-in だった） | 結果: 現行版では採っていない。dmz は導入後に削除された。v1.3.0 と v1.5.2 のどちらにも `libcontainer/dmz/` が無い（contents API が 404） |
+| 現行の保護の構成 | v1.3.0 の [`libcontainer/exeseal/`](https://github.com/opencontainers/runc/tree/4ca628d1d4c974f92d24daccb901aa078aad748e/libcontainer/exeseal)（`cloned_binary_linux.go`・`overlayfs_linux.go`）。v1.5.2 も同じ 2 ファイルに `doc.go` を足した構成。`CloneSelfExe`（v1.3.0 `cloned_binary_linux.go` L218-L248）は先に `sealedOverlayfs` を試し、失敗したら `CloneBinary` で複製する。複製の取得は `getSealableFile`（L124-L173。memfd → `O_TMPFILE` → `mktemp`） | 一致。文書が挙げたパス `libcontainer/exeseal/` は正しい。現行の主方式は overlayfs（特権時）と、封印した複製（memfd）の縮退 |
+| overlayfs 方式の導入版 | v1.3.0 `CHANGELOG.md` の 1.2.0 の「Added」（L226-L232）。「十分な権限があり、カーネルが対応しているときに使う」と書かれ、性能・メモリの上乗せはほぼ無い | 一致（導入は 1.2.0） |
+| overlayfs 方式の成立条件 | [v1.3.0 `overlayfs_linux.go`](https://github.com/opencontainers/runc/blob/4ca628d1d4c974f92d24daccb901aa078aad748e/libcontainer/exeseal/overlayfs_linux.go) の `sealedOverlayfs` の注記（L42-L47。「特権ユーザーと、overlayfs・`fsopen()` を有効にしたカーネルでだけ動く」）と、user namespace 内での overlayfs（Linux 5.11 以降）を使う旨の TODO（L49 付近）。v1.5.2 も同じ注記（L42-L47） | 一致（rootless では不成立）。最新版でも user namespace 内の対応は TODO のまま |
+
+含意（判断はオーナー）: D は上流が捨てた方式で、採否の根拠にならない。O は特権時の最適化で、rootless（CORE-6 の既定）の残余リスクを減らさない。本書の推奨 N（見送り）は、この照合で変わらない。見直しの条件にある「O が rootless で成立すると分かったとき」は、上流が user namespace 対応を入れたときに再確認する。
 
 ## コストの見積り
 
@@ -92,7 +105,7 @@ CLI のサイズと、PSS・複製時間は未計測。以下の式はモデル�
 
 | ID | 論点 | 選択肢 | 推奨 | 状態 |
 | -- | ---- | ------ | ---- | ---- |
-| D1 | 方式 B を採るか | L / C / D・O（一次情報の確認後） / N | N | 未決 |
+| D1 | 方式 B を採るか | L / C / D・O（一次情報で確認済み。D は先例なし、O は rootless で不成立） / N | N | 未決 |
 | D2 | E（root 所有インストールの推奨と doctor の通知）を別 issue で進めるか | 進める / 進めない | 進める | 未決 |
 | D3 | 見直しの条件を上のとおりとするか | 承認 / 修正 | 承認 | 未決 |
 | D4 | #2241 との順序の拘束（先に本件を再判断）を受け入れるか | 受け入れる / 受け入れない | 受け入れる | 未決 |

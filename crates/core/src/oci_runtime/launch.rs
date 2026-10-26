@@ -349,6 +349,14 @@ impl Eq for RootfsDir {}
 /// 立つ（その者は config.json と rootfs を丸ごと差し替えて起動内容を制御できるため、新たな能力にはならない）。
 /// bundle とその祖先を書き換えられない者に対する排他である。
 ///
+/// # 既知の制約（待たない取得と tmpfiles の aging 走査。#2840・CORE-2・REPAIR-5）
+///
+/// 取得は待たない（`try_lock`）。bundle の inode を読み取りで開ける者が一時的に `flock` を持つと、create・start・
+/// delete が `FailedPrecondition`（`container start is in progress in another process`）で失敗しうる。
+/// 例は `systemd-tmpfiles-clean` で、aging 対象のディレクトリ（Ubuntu の `/tmp`・`/var/tmp`）の走査中は
+/// サブディレクトリごとに `flock(LOCK_EX|LOCK_NB)` を取る。そこに bundle を置くと、走査と重なった 1 回だけ
+/// 誤って失敗する。挙動は変えていない（方式の見直しは追跡 issue で判断する）。
+///
 /// # 設計判断（起動権の排他方式。#1316・2026-10-12 確定、#1854。CORE-2・OCI-5・PLUG-1・SEC-1）
 ///
 /// 起動権は、revision 照合つきの `StateStore::update`（Created から Running・pid なし）と、この

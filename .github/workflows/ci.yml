@@ -1457,16 +1457,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::production_launcher verified"
 
-      # exec_subordinate_e2e（`crates/supervisor/tests/exec_subordinate_e2e.rs`。SEC-5・CORE-6・SUP-6・#2835）: 範囲写像の
-      # rootless コンテナへ ProductionLauncher の create → start と本番の exec 入口（run_command_with_pidfd）だけで exec を通す。
-      # 前提（uidmap・subuid / subgid・委譲 cgroup）は試験自身が fail-closed に確認する。cargo を経由せず委譲スコープで直接実行する。
+      # exec_subordinate_e2e（`crates/supervisor/tests/exec_subordinate_e2e.rs`。
+      # SEC-5・CORE-6・SUP-6・#2835）: 範囲写像の rootless コンテナへ、
+      # ProductionLauncher の create → start と本番の exec 入口（run_command_with_pidfd）だけで exec を通す。
+      # 前提（uidmap・subuid / subgid・委譲 cgroup）は試験自身が fail-closed に確認する。
+      # cargo を経由せず委譲スコープで直接実行する。
       - name: exec_subordinate_e2e のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
           json="${RUNNER_TEMP}/ese-build.json"
-          cargo test -p fandhe-container-supervisor --test exec_subordinate_e2e --no-run --message-format=json > "${json}"
+          cargo test -p fandhe-container-supervisor --test exec_subordinate_e2e --no-run \
+            --message-format=json > "${json}"
           sel='select(.profile.test == true and .target.name == "exec_subordinate_e2e") | .executable'
           bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
           if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then

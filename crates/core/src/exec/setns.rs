@@ -340,6 +340,32 @@ fn join_order(relation: &UserNsRelation) -> Vec<JoinNamespace> {
     order
 }
 
+/// 対象が別の user namespace にいるとき、呼び出し側と同じ UTS・IPC・network namespace を参加の集合から外す
+/// （副作用の前に判定するテスト可能な純関数。`shared` は「呼び出し側と同じ namespace か」を返す。SUP-6・SEC-5・CORE-6）。
+///
+/// config が network 等の namespace を持たないコンテナでは、pid1 はホストの namespace（初期 user namespace の所有）に
+/// 残る。別の user namespace へ移った後は、その所有 namespace へ `setns` する権限（`CAP_SYS_ADMIN`）が無く `EPERM` に
+/// なる。呼び出し側と同一の namespace への参加は何も変えないため外しても exec 先の所属は変わらない。
+/// pid・mnt は `open` が呼び出し側と異なることを要求済みのため対象外で、`User` も外さない。
+fn omit_shared_namespaces(
+    order: Vec<JoinNamespace>,
+    relation: &UserNsRelation,
+    shared: impl Fn(JoinNamespace) -> bool,
+) -> Vec<JoinNamespace> {
+    if !relation.is_distinct() {
+        return order;
+    }
+    order
+        .into_iter()
+        .filter(|n| {
+            !matches!(
+                n,
+                JoinNamespace::Uts | JoinNamespace::Ipc | JoinNamespace::Net
+            ) || !shared(*n)
+        })
+        .collect()
+}
+
 /// 検証済みの参加対象（pid1）。pidfd でプロセス同一性を固定している。
 #[derive(Debug)]
 pub struct Pid1Target {
@@ -789,7 +815,19 @@ pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecE
     // 所属 cgroup・user namespace の再照合は `setns` の直前に置く（残る窓を最小にする）。
     recheck_cgroup_membership(target)?;
     recheck_user_namespace(target)?;
-    let joined = join_order(&target.user_ns);
+    // 呼び出し側と同じ namespace かは、対象の `ns/<name>` と自分の `ns/<name>` の識別子（dev, ino）で判定する。
+    // 読めない場合は「同じでない」として参加の集合に残す（fail-closed。参加に失敗すればそのまま拒否される）。
+    let joined = omit_shared_namespaces(join_order(&target.user_ns), &target.user_ns, |n| {
+        let name = n.proc_name();
+        match (
+            ns_identity(&format!("/proc/{}/ns/{name}", target.pid)),
+            ns_identity(&format!("/proc/self/ns/{name}")),
+        ) {
+            (Ok(t), Ok(o)) => t == o,
+            _ => false,
+        }
+    });
+    ensure_not_exited(target, "refusing to setns")?;
     let flags: Vec<NsFlag> = joined.iter().map(|n| n.flag()).collect();
     sys::setns_pidfd(target.pidfd.as_fd(), &flags).map_err(|e| setns_error(e, "setns"))?;
     Ok(NamespaceJoinReport {
@@ -1505,6 +1543,37 @@ mod tests {
         assert_eq!(bits(&distinct), 0x7C02_0000);
         assert!(!shared.is_distinct());
         assert!(distinct.is_distinct());
+    }
+
+    /// SUP-6・SEC-5・CORE-6・#2835: 別の user namespace の対象では、呼び出し側と同じ UTS・IPC・network namespace を
+    /// 参加の集合から外す（pid・mnt・user は外さない）。同じ user namespace（`Shared`）では何も外さない。
+    #[test]
+    fn sup6_omit_shared_namespaces_concrete_values() {
+        use JoinNamespace::{Ipc, Mount, Net, Pid, User, Uts};
+        let own: NsIdentity = (4, 10);
+        let shared = UserNsRelation::Shared { identity: own };
+        let distinct = UserNsRelation::Distinct {
+            target: (4, 11),
+            own,
+            owner_uid: 1,
+        };
+        let all = |_: JoinNamespace| true;
+        assert_eq!(
+            omit_shared_namespaces(join_order(&distinct), &distinct, all),
+            vec![User, Pid, Mount]
+        );
+        assert_eq!(
+            omit_shared_namespaces(join_order(&distinct), &distinct, |n| n == Net),
+            vec![User, Pid, Mount, Uts, Ipc]
+        );
+        assert_eq!(
+            omit_shared_namespaces(join_order(&distinct), &distinct, |_| false),
+            vec![User, Pid, Mount, Uts, Ipc, Net]
+        );
+        assert_eq!(
+            omit_shared_namespaces(join_order(&shared), &shared, all),
+            vec![Pid, Mount, Uts, Ipc, Net]
+        );
     }
 
     /// SUP-6・SEC-5・SEC-4・TASK-163.h2・#1462: 再照合は、対象・呼び出し側の識別子が `open` 時の記録と同じときだけ

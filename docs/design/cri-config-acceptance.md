@@ -324,7 +324,7 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 既知の差:
 
 - **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）だけを受け、`network` の path は `UNIMPLEMENTED` で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項で、保持役の userns が所有する netns への join は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838。実装は #2872）。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
-- **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決
+- **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決（kubelet の `UpdateRuntimeConfig` の pod CIDR は検証して `CriRuntimeService::pod_cidrs` に記録するようになったが、読む利用者は無く、`PodSubnetPool` への結線は順 13 の本番注入と一緒に後続で行う。#2896・`docs/design/cri-status-rpc.md`）
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
@@ -436,6 +436,25 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 
 - 報告が無いときに digest を推測しない（`config.image.image` を流用しない。REPAIR-3）。containerd は空を返さないので、空は本リポ固有の挙動
 - `image_id` は `PullImageResponse.image_ref`（= image ID）と一致させる（`crates/cri/proto/api.proto` の `ContainerStatus.image_id`・`Container.image_id` の MUST）。`image_ref` は同 proto の「Digested reference to the image in use」
-- containerd との照合（一次情報）: main `cfb18c48f865669d497115c1734e94fedc338153` の `internal/cri/server/container_status.go` は `imageID = container.ImageRef`（create 時の config digest）、`imageRef` は在庫の `repoDigests[0]`（無ければ config digest）。`container_list.go` の `toCRIContainer` は `ImageRef`・`ImageId` とも config digest で在庫を引かない。v2.1.4（`75cb2b7193e4e490e9fbdc236c0e811ccaba3376`）は `ImageId` を設定しない
-- 既知の差: containerd は Status の時点で在庫を引き直すが、本実装は create 時のスナップショットを返し続ける。本実装の `repo_digests[0]` はタグ pull ではプラットフォームの manifest digest になる（containerd は multi-arch で index digest）。Status の `image`（ImageSpec）は containerd のように `repoTags[0]` へ置き換えず config の値のまま
-- `message`・`info` は引き続きスタブ（空）
+- containerd との照合（一次情報。#2901 で `b7a2526` を確認し同内容）: main `cfb18c48f865669d497115c1734e94fedc338153` の `internal/cri/server/container_status.go` は `imageID = container.ImageRef`（create 時の config digest）、`imageRef` は在庫の `repoDigests[0]`（無ければ config digest）。`container_list.go` の `toCRIContainer` は `ImageRef`・`ImageId` とも config digest で在庫を引かない。v2.1.4（`75cb2b7193e4e490e9fbdc236c0e811ccaba3376`）は `ImageId` を設定しない
+- 既知の差の詳細は次の小節（#2901）に移した
+
+### ContainerStatus の image・message・info と在庫の扱い（CRI-2・OCI-1・REPAIR-3。#2901）
+
+確認日 2026-10-26。containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）の `internal/cri/server/container_status.go`・`container_start.go`・`internal/cri/store/image/image.go` と、kubelet v1.37.1 の `kuberuntime_container.go` を照合した。
+
+| 主張 | 一次情報 | 本実装との関係 |
+| ---- | ---- | ---- |
+| Status の `image` は、在庫に `repoTags` があれば `&ImageSpec{Image: repoTags[0]}` へ置き換える（新しい ImageSpec。annotations・`user_specified_image`・`runtime_handler` は落ちる） | `container_status.go` L42-L43（コメント）・L61-L65 | **一致**: create 時に在庫から得た `repo_tags[0]` があれば同じ形で返す。タグが無い・報告の無い経路は `config.image` のまま（containerd も在庫に無ければ config の値） |
+| `ListContainers` の `image` は置き換えない | `container_list.go` の `toCRIContainer`（`container.Config.GetImage()`） | 一致（`to_summary` は `config.image`） |
+| kubelet は create に image ID を渡し、Status の `Image.Image` を Pod status の `image` に使う。`user_specified_image` は読まない | kubelet `kuberuntime_container.go` L373・L716-L747 | 置き換えないと image ID が表示されるため寄せる。`runtime_handler` は create 時に拒否するので常に空で、落としても失うものは無い |
+| `message` を書くのは start 失敗（`status.Message = retErr.Error()`）だけ。start 失敗は `StartError`・`errorStartExitCode` の exited にする | `container_start.go` L73-L75 | **方針として空**: 実行層のエラー文字列を外へ出さない方針に合わない。本実装は確定した start 失敗で created に戻すため、message を付ける exited の記録も無い |
+| verbose の `info` は `{"info": <JSON 文字列>}` の 1 キー。JSON は sandboxID・pid・snapshotKey・snapshotter・runtimeType・config（envs を含む CRI の ContainerConfig）・runtimeSpec（OCI spec。ホストパスを含む） | `container_status.go` L219 ほか | **方針として空**: envs（秘密値）・ホストパス・snapshot のキーは「内部のパス・構成を出さない」方針に合わない。pid は cri が持たない。将来値を入れる場合もキーは `"info"` の 1 つで値は crictl が解釈する JSON 文字列にする |
+| 在庫の references は `docker.Sort(MergeStringSlices(...))` で整列する。pull 時に記録する digest 参照は top-level の digest 1 件（multi-arch では index） | `image.go` L258 | **差として残す**（下記） |
+
+本実装の残る差（コードは変えない）。
+
+- タグはスナップショット: containerd は Status のたびに在庫を引き直し、create 後の retag・タグ削除・イメージ削除が `image`・`image_ref` に反映される。本実装は create 時の値を返し続ける（`to_status` はレジストリのロック下で呼ばれ、在庫への参照を持たない。引き直しには構造の変更が要る）
+- `repo_digests` の並び: 本実装は検証済みのプラットフォーム manifest digest を先頭、index digest を 2 番目に入れる（`image_ref` はタグ pull でプラットフォームの manifest digest になる。containerd は multi-arch で index digest）。並びを変えると ImageStatus・ListImages・`image_ref` が変わり、`merged_with` の和集合や永続在庫との整合にも手が要るため、本 issue では変えない。追跡が要る場合は別 issue で扱う
+- start 失敗の記録: containerd は `StartError`・非 0 の exit code・message つきの exited にし、restart 復旧時の不明は reason `Unknown` にする。本実装は created に戻すか、reason 空の exited
+- `message`・`info` は上記のとおり方針として空（スタブではない）

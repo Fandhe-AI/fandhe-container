@@ -13,7 +13,7 @@
 //!
 //! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
 //!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -56,6 +56,10 @@ pub enum CriOpKind {
     ContainerStatus,
     /// `RuntimeService.Status` 1 回（待ちのない準備状態の報告。CRI-1・CRI-2・#2830）。
     Status,
+    /// `RuntimeService.Version` 1 回（定数の応答。CRI-1・#2896）。
+    Version,
+    /// `RuntimeService.UpdateRuntimeConfig` 1 回（pod CIDR の検証と記録。CRI-1・CRI-2・#2896）。
+    UpdateRuntimeConfig,
     /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
     ListImages,
     /// `ImageService.ImageStatus` 1 回（ローカルキャッシュの単一参照解決。CRI-4・TASK-61.2）。
@@ -80,6 +84,8 @@ impl CriOpKind {
             CriOpKind::ListContainers => "cri.list_containers",
             CriOpKind::ContainerStatus => "cri.container_status",
             CriOpKind::Status => "cri.status",
+            CriOpKind::Version => "cri.version",
+            CriOpKind::UpdateRuntimeConfig => "cri.update_runtime_config",
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
@@ -287,7 +293,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 15] = [
+    const ALL_KINDS: [CriOpKind; 17] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -300,6 +306,8 @@ mod tests {
         CriOpKind::ListContainers,
         CriOpKind::ContainerStatus,
         CriOpKind::Status,
+        CriOpKind::Version,
+        CriOpKind::UpdateRuntimeConfig,
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
@@ -326,6 +334,11 @@ mod tests {
         assert_eq!(CriOpKind::ListContainers.as_str(), "cri.list_containers");
         assert_eq!(CriOpKind::ContainerStatus.as_str(), "cri.container_status");
         assert_eq!(CriOpKind::Status.as_str(), "cri.status");
+        assert_eq!(CriOpKind::Version.as_str(), "cri.version");
+        assert_eq!(
+            CriOpKind::UpdateRuntimeConfig.as_str(),
+            "cri.update_runtime_config"
+        );
         assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
         assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
         assert_eq!(CriOpKind::PullImage.as_str(), "cri.pull_image");

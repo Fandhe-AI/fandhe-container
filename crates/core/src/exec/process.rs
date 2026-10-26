@@ -17,6 +17,7 @@
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
+//!       -> make_root_read_only(&report)                // `root.readonly=true` のときだけ（pivot 直後。CORE-5・SEC-1・#2767）
 //!       -> enter_working_dir(&report, &cwd)            // process.cwd が `/` 以外のときだけ（pivot 直後・ステージ列の前。OCI-1・TASK-29）
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
@@ -2247,6 +2248,10 @@ pub(crate) struct PrePivotSetup<'a> {
     /// pivot 後に移る作業ディレクトリ（`process.cwd`。`None` または `Root` なら移らない。OCI-1・TASK-29）。
     /// 違反は状態 pipe の段 `working_dir` で親へ返る。
     pub(crate) working_dir: Option<&'a ContainerWorkingDir>,
+    /// 真なら `pivot_root` の直後（`working_dir` の前）に rootfs の mount top を読み取り専用にする
+    /// （config の `root.readonly`。CORE-5・SEC-1・SUP-12・#2767）。値は config そのもので、外す・緩める入口ではない。
+    /// 失敗は状態 pipe の段 `root_readonly` で親へ返る（fail-closed。縮退しない）。
+    pub(crate) root_readonly: bool,
 }
 
 /// config の `linux.readonlyPaths` / `maskedPaths`（検証済み）。固定集合に**追加**されるだけで、外す・緩める
@@ -2348,6 +2353,8 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: Self::Prepared,
     ) -> Result<Self::Pivoted, ExecError>;
+    /// pivot 直後に rootfs の mount top を読み取り専用にする（`root.readonly`。#2767）。`enter_working_dir` の前。
+    fn make_root_read_only(&self, pivoted: &Self::Pivoted) -> Result<(), ExecError>;
     /// pivot 直後に `process.cwd` へ移る（OCI-1）。
     fn enter_working_dir(
         &self,
@@ -2570,6 +2577,10 @@ impl PrePivotOps for RealPrePivotOps {
         pivot_root(isolation, prepared)
     }
 
+    fn make_root_read_only(&self, pivoted: &PivotReport) -> Result<(), ExecError> {
+        crate::exec::make_root_read_only(pivoted).map(|_| ())
+    }
+
     fn enter_working_dir(
         &self,
         pivoted: &PivotReport,
@@ -2662,6 +2673,10 @@ fn check_bind_overlaps(
 /// `mounts[]` の sysfs（`mount_sysfs`。#2020）は `verify_pinned` の直後（`create_default_devices` の前）に載せ、
 /// `readonly_paths` の再帰 bind と読み取り専用化がその上に載るようにする。順序は単体テスト
 /// `core1_run_pre_pivot_order_is_fixed` が、積み方は結合試験 `readonly_paths`・`masked_paths` が検査する。
+///
+/// `root.readonly=true`（`setup.root_readonly`。#2767）は `pivot_root` → `root_readonly` → `working_dir` の順で、
+/// pivot 前の段が rootfs へ書き込み終えた後に `/` の mount top へ読み取り専用の属性を足す（非再帰・属性の追加のみ。
+/// ステージ列の seccomp が `mount_setattr` を拒否する前に済ませる）。`false` または `setup` なしでは呼ばない。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
@@ -2727,6 +2742,12 @@ fn run_pre_pivot<O: PrePivotOps>(
     let pivoted = ops
         .pivot_root(&isolation, prepared)
         .map_err(StepError::at(S::PivotRoot))?;
+    // pivot 直後に rootfs を読み取り専用にする（`root.readonly`。#2767）。pivot 前の段は rootfs へ書き込むため
+    // これより前に済ませ、既定の seccomp が拒否する `mount_setattr(2)` を使うためステージ列より前に走らせる。
+    if setup.is_some_and(|s| s.root_readonly) {
+        ops.make_root_read_only(&pivoted)
+            .map_err(StepError::at(S::RootReadOnly))?;
+    }
     // pivot 直後・ステージ列の前に作業ディレクトリへ移る（OCI-1）。根は pivot_root 済みのため省く。
     if let Some(wd) = setup.and_then(|s| s.working_dir).filter(|w| !w.is_root()) {
         ops.enter_working_dir(&pivoted, wd)
@@ -3033,6 +3054,7 @@ where
                 },
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             };
             let result = run_child_then(
                 rootfs,
@@ -3084,6 +3106,7 @@ where
                 binds: None,
                 sysfs: Some(sysfs),
                 working_dir: None,
+                root_readonly: false,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -3261,6 +3284,7 @@ pub fn spawn_container_with_stages_and_devices(
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
             StdioNulling::ALL,
         ) {
@@ -6012,6 +6036,11 @@ mod tests {
                 "injected failure",
             )
             .or_violation(ViolationReason::MaskedPathApplyFailed, None),
+            "root_readonly" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::RootReadOnly,
+                "injected failure",
+            ),
             "working_dir" => ExecError::new(
                 ErrorCode::NotFound,
                 IsolationStage::WorkingDir,
@@ -6105,6 +6134,9 @@ mod tests {
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
             self.step("pivot_root")
         }
+        fn make_root_read_only(&self, _: &()) -> Result<(), ExecError> {
+            self.step("root_readonly")
+        }
         fn enter_working_dir(&self, _: &(), _: &ContainerWorkingDir) -> Result<(), ExecError> {
             self.step("working_dir")
         }
@@ -6166,6 +6198,7 @@ mod tests {
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .unwrap();
@@ -6214,6 +6247,7 @@ mod tests {
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .map(|_| ())
@@ -6262,6 +6296,7 @@ mod tests {
                     config_paths: ConfigPaths::NONE,
                     status: None,
                     working_dir: None,
+                    root_readonly: false,
                 }),
             )
             .unwrap();
@@ -6288,6 +6323,7 @@ mod tests {
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .unwrap();
@@ -6328,6 +6364,7 @@ mod tests {
             config_paths: ConfigPaths::NONE,
             status: None,
             working_dir: wd,
+            root_readonly: false,
         };
         let app: &'static ContainerWorkingDir = Box::leak(Box::new(
             ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
@@ -6369,6 +6406,63 @@ mod tests {
         assert_eq!(err.error.code, ErrorCode::NotFound);
     }
 
+    /// CORE-5・SEC-1（#2767）: `root_readonly` は `pivot_root` の直後・`working_dir` の前に 1 回だけ呼ばれ、
+    /// `false` と `setup` なしでは呼ばれない。失敗は段 `RootReadOnly` で返り、後段へ進まない。
+    #[test]
+    fn core5_run_pre_pivot_root_readonly_after_pivot_before_working_dir() {
+        let app: &'static ContainerWorkingDir = Box::leak(Box::new(
+            ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
+        ));
+        let setup = |ro: bool| PrePivotSetup {
+            sysctls: None,
+            devices: DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            binds: None,
+            sysfs: None,
+            pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
+            status: None,
+            working_dir: Some(app),
+            root_readonly: ro,
+        };
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .unwrap();
+        let calls = take_calls();
+        assert_eq!(
+            calls.iter().rev().take(3).cloned().collect::<Vec<_>>(),
+            ["working_dir", "root_readonly", "pivot_root"]
+        );
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(false)),
+        )
+        .unwrap();
+        assert!(!take_calls().iter().any(|c| c == "root_readonly"));
+        run_pre_pivot(&RecordingOps { fail_at: None }, Path::new("/rootfs"), None).unwrap();
+        assert!(!take_calls().iter().any(|c| c == "root_readonly"));
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("root_readonly"),
+            },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::RootReadOnly);
+        assert_eq!(err.error.stage, IsolationStage::RootReadOnly);
+        let calls = take_calls();
+        assert_eq!(calls.last().map(String::as_str), Some("root_readonly"));
+        assert!(!calls.iter().any(|c| c == "working_dir"));
+    }
+
     /// SEC-2（#1850）: 読み取り専用パスの適用が失敗したら `pivot_root` へ進まない。`setup` が `None` の最小構成でも
     /// 適用され、失敗の段は `ReadonlyPaths`・段のエラーは `MountReadonlyPaths`。
     #[test]
@@ -6407,6 +6501,7 @@ mod tests {
             config_paths: ConfigPaths::NONE,
             status: None,
             working_dir: None,
+            root_readonly: false,
         };
         let _ = take_calls();
         let err = run_pre_pivot(
@@ -6473,6 +6568,7 @@ mod tests {
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .err()
@@ -6506,6 +6602,7 @@ mod tests {
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .err()
@@ -6584,6 +6681,7 @@ mod tests {
                     },
                     status: None,
                     working_dir: None,
+                    root_readonly: false,
                 }),
             )
             .err()
@@ -6677,6 +6775,7 @@ mod tests {
                     config_paths: ConfigPaths::NONE,
                     status: None,
                     working_dir: Some(&wd),
+                    root_readonly: false,
                 }),
             )
             .err()

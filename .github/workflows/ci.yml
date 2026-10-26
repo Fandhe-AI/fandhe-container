@@ -1414,6 +1414,7 @@ jobs:
             'injected secret reached the container under subordinate id mapping (scenario=S-sub' \
             'production_launcher: capabilities drop applied (scenario=T pid=' \
             'production_launcher: sysctls applied (scenario=V shmmax=' \
+            'production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y' \
             'production_launcher: pod ipc namespace joined (scenario=W' \
             'production_launcher: scenario=rslave-bind host=' \
             "${ef} case=loader-missing code=NotFound phase=prepare ${ef_tail}" \

@@ -109,12 +109,14 @@ pub(super) enum PrePivotStep {
     MaskedPaths,
     /// `pivot_root`。
     PivotRoot,
+    /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true` のときだけ。違反記録は運ばない。CORE-5・SEC-1・#2767）。
+    RootReadOnly,
     /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。OCI-1・TASK-29。違反記録は運ばない）。
     WorkingDir,
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -127,6 +129,7 @@ impl PrePivotStep {
         Self::ReadonlyPaths,
         Self::MaskedPaths,
         Self::PivotRoot,
+        Self::RootReadOnly,
         Self::WorkingDir,
     ];
 
@@ -145,6 +148,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
             Self::PivotRoot => "pivot_root",
+            Self::RootReadOnly => "root_readonly",
             Self::WorkingDir => "working_dir",
         }
     }
@@ -167,6 +171,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
             Self::PivotRoot => IsolationStage::PivotRoot,
+            Self::RootReadOnly => IsolationStage::RootReadOnly,
             Self::WorkingDir => IsolationStage::WorkingDir,
         }
     }
@@ -856,7 +861,8 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::ReadonlyPaths => 9,
         PrePivotStep::MaskedPaths => 10,
         PrePivotStep::PivotRoot => 11,
-        PrePivotStep::WorkingDir => 12,
+        PrePivotStep::RootReadOnly => 12,
+        PrePivotStep::WorkingDir => 13,
     }
 }
 
@@ -918,7 +924,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 13);
+        assert_eq!(PrePivotStep::ALL.len(), 14);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。

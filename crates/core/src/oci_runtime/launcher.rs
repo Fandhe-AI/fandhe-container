@@ -101,8 +101,9 @@
 //!   `unshare` する。`--ipc=host` との併用は `InvalidArgument`。pid の共有・`/dev/shm` の共有・片方だけの join は未対応
 //!   (pid は init が PID 1 であることを制限適用の証跡の前提にしているため。保持役〔供給元〕の設計は後続 issue)
 //! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
-//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
-//!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
+//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は、root が書き込み可能なら
+//!   Landlock の `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）。
+//!   `root.readonly=true`（#2767）なら root に書き込み権が無いため拒否に当たらず、`ro` で適用される
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
@@ -1909,6 +1910,8 @@ impl LaunchOps for RealOps {
             },
             status: None,
             working_dir: Some(input.spec.working_dir()),
+            // config の `root.readonly` そのもの（外す・緩める入口ではない。#2767）。
+            root_readonly: input.spec.config().root().readonly(),
         };
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {
@@ -2324,8 +2327,8 @@ mod tests {
         spec_with_root_readonly(name, false, linux_extra, mounts, args, env, user)
     }
 
-    /// `root.readonly` を選べる組み立て(#2714)。`LaunchSpec::new` を直接使うため、`start` の `root.readonly` 拒否
-    /// (`Unimplemented`)は通らない。Landlock のルールが読み取り専用 root でどうなるかの単体照合専用。
+    /// `root.readonly` を選べる組み立て(#2714)。`start` は #2767 から `root.readonly=true` を受けるため、
+    /// `start` を通しても同じ spec になる。Landlock のルールが読み取り専用 root でどうなるかの単体照合に使う。
     fn spec_with_root_readonly(
         name: &str,
         root_readonly: bool,

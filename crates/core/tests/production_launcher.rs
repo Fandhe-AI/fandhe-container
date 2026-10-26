@@ -1556,6 +1556,8 @@ mod linux {
         tmpfs
             .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
             .expect("push tmpfs");
+        // Private IPC では専用の `/dev/shm` が要る(`LaunchOptions::new` の検査)。ここで既定の 1 件を足す。
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
         let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
             .expect("launch options");
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(

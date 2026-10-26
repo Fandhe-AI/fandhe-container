@@ -1126,31 +1126,20 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/sysfs_mount.log"
           cargo test -p fandhe-container-core --test sysfs_mount -- --ignored 2>&1 | tee "${log}"
-          default_line='sysfs_mount: /sys is a read-only sysfs (nosuid,nodev,noexec), '
-          default_line+='writes refused, reads allowed (root=false)'
-          if ! grep -Fq "${default_line}" "${log}"; then
-            echo "::error::sysfs_mount default scenario did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
-          mask_re='^sysfs_mount: [0-9]+ /sys entries masked \(firmware=(true|false), '
-          mask_re+='powercap=(true|false), thermal_throttle=[0-9]+\) \(root=false\)$'
-          if ! grep -Eq "${mask_re}" "${log}"; then
-            echo "::error::sysfs_mount did not report the masked entries line" >&2
-            exit 1
-          fi
-          clear_re='^sysfs_mount: ro-clear on /sys top mount \(stack=[0-9]+\): '
-          clear_re+='undefended=[0-9]+, defended errno=1 \(root=false\)$'
-          if ! grep -Eq "${clear_re}" "${log}"; then
-            echo "::error::sysfs_mount ro-clear scenario did not report verification" >&2
-            exit 1
-          fi
+          check() {
+            scripts/check-success-lines.sh --name sysfs_mount --src crates/core/tests/sysfs_mount.rs --log "${log}" \
+              --subst root=false --forbid 'ro-clear not applicable' --forbid 'root=true' \
+              --forbid 'sysfs_mount: ignored' --forbid 'Linux only' "$@"
+          }
+          check --select '^sysfs_mount: /sys is a read-only sysfs'
+          check --select '/sys entries masked' --subst-pos-re '[0-9]+' --subst-pos-re '(true|false)' \
+            --subst-pos-re '(true|false)' --subst-pos-re '[0-9]+'
+          check --select 'ro-clear on /sys top mount' --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' --summary
           {
             echo "kernel: $(uname -r)"
             grep -E '^sysfs_mount: host /sys read-only=' "${log}" || true
             grep -F 'sysfs_mount: ro-clear observation:' "${log}" || true
-            grep -E "${clear_re}" "${log}"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::sysfs_mount verified"
 
       # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
       # secrets / configs の専用 tmpfs への注入・`mount_setattr(2)` による読み取り専用化
@@ -1201,9 +1190,10 @@ jobs:
       # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する
       # 実機前提テスト。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない。
       # テスト側の `ContainerRuntime`（`unshare(1)` で起動）を注入しているため、core の分離実装そのものは照合しない。
-      # 他のステップと違い `harness = false` ではなく libtest で、試験が自分で出す成功行が無い。そのため libtest の
-      # 結果行（`test <名前> ... ok`）を 1 行ずつ完全一致 grep する（`--ignored` が届かなければ `ignored` となり
-      # `ok` の行が出ないので fail-closed）。`--test-threads=1` は、解放された namespace の inode 番号を並行して走る
+      # 他のステップと違い `harness = false` ではなく libtest で、試験が自分で出す成功行が無い。そのため
+      # `check-success-lines.sh --libtest-ignored` が `#[ignore]` 関数から `test <名前> ... ok` を導出して照合し、
+      # `test result: ok. N passed; 0 failed;` も必須にする（`--ignored` が届かなければ `ignored` となり fail-closed。#2884）。
+      # `--test-threads=1` は、解放された namespace の inode 番号を並行して走る
       # 別の試験の新しい namespace が再利用し「参照者 0 件」の判定が誤って失敗するのを避けるため（判定は緩めない）。
       - name: runtime_service_namespaces のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1218,16 +1208,9 @@ jobs:
           log="${RUNNER_TEMP}/runtime_service_namespaces.log"
           cargo test -p fandhe-container-cri --test runtime_service_namespaces \
             -- --ignored --test-threads=1 2>&1 | tee "${log}"
-          for line in \
-            'test task_59_2_started_process_is_namespace_isolated ... ok' \
-            'test task_59_3_remove_container_releases_namespaces ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::runtime_service_namespaces did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::runtime_service_namespaces verified"
+          scripts/check-success-lines.sh --name runtime_service_namespaces \
+            --src crates/cri/tests/runtime_service_namespaces.rs --log "${log}" --libtest-ignored \
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --min 2 --summary
 
       # sec1_2536_protected_root_on_real_overlay（`crates/core/src/exec/bind_mounts.rs` の lib 内試験。SEC-1・OCI-4・SEC-5・
       # TASK-29 追補・#2536・#2793）: 保護対象（状態ルート・rootfs・bundle）が実機の overlayfs の上にあるときの逆方向の照合を、
@@ -1350,26 +1333,13 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/userns_extract.log"
           USER="$(id -un)" cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
-          if grep -Fq 'userns_extract: ignored' "${log}"; then
-            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          for line in \
-            'ok: extract_ok' \
-            'ok: outside_map' \
-            'ok: map_mismatch' \
-            'ok: subordinate_extract_ok' \
-            'ok: subordinate_outside_map' \
-            'ok: subordinate_map_mismatch' \
-            'ok: subordinate_cleanup' \
-            'test userns_extract ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::userns_extract verified"
+          cases=extract_ok,outside_map,map_mismatch,subordinate_extract_ok
+          cases+=,subordinate_outside_map,subordinate_map_mismatch,subordinate_cleanup
+          # case の集合は実行条件として手で宣言する（試験の match の腕と食い違えば導出との照合で失敗する）
+          scripts/check-success-lines.sh --name userns_extract --src crates/oci/tests/userns_extract.rs --log "${log}" \
+            --select '^(ok: |test userns_extract \.\.\. )' \
+            --subst "case=${cases}" \
+            --min 8 --forbid 'userns_extract: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
 
       # image_store_xdev（`crates/oci/tests/image_store_xdev.rs`。OCI-7・SEC-1・ERR-1・#2701）: イメージストア root 配下の
       # 別マウント（`blobs/sha256` と `@lock` の bind mount）が rm・prune・lock で `FailedPrecondition` になることを、
@@ -1533,21 +1503,10 @@ jobs:
           log="${RUNNER_TEMP}/rootless_file_owner.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored 2>&1 | tee "${log}"
-          for scenario in direct helper; do
-            line="rootless_file_owner: scenario ${scenario} verified (host uid=$(id -u), gid=$(id -g))"
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless_file_owner did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'helper case not requested' 'root=true' 'rootless_file_owner: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_file_owner reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless_file_owner verified"
+          scripts/check-success-lines.sh --name rootless_file_owner --src crates/core/tests/rootless_file_owner.rs \
+            --log "${log}" --select '^rootless_file_owner: scenario ' --subst name=direct,helper \
+            --subst-pos "$(id -u)" --subst-pos "$(id -g)" --min 2 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_file_owner: ignored' --summary
 
       - name: rootless_holder_expiry のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1563,16 +1522,10 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_holder_expiry.log"
           cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored 2>&1 | tee "${log}"
-          line='rootless_holder_expiry: holder outlived the stopped helper until expiry, then killed its session ('
-          if ! grep -Fq "${line}" "${log}"; then
-            echo "::error::rootless_holder_expiry did not report: ${line} (possibly not executed)" >&2
-            exit 1
-          fi
-          if grep -Fq 'rootless_holder_expiry: ignored' "${log}"; then
-            echo "::error::rootless_holder_expiry reported an unexpected line: ignored" >&2
-            exit 1
-          fi
-          echo "::notice::rootless_holder_expiry verified"
+          scripts/check-success-lines.sh --name rootless_holder_expiry \
+            --src crates/core/tests/rootless_holder_expiry.rs \
+            --log "${log}" --select '^rootless_holder_expiry: holder outlived' --subst-pos-re '[0-9]+' \
+            --forbid 'rootless_holder_expiry: ignored' --forbid 'not applicable'
 
       - name: rootless_holder_memory のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1589,16 +1542,11 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_holder_memory.log"
           cargo test -p fandhe-container-core --test rootless_holder_memory -- --ignored 2>&1 | tee "${log}"
-          line='rootless_holder_memory: holder memory has no injected secret ('
-          if ! grep -Fq "${line}" "${log}"; then
-            echo "::error::rootless_holder_memory did not report: ${line} (possibly not executed)" >&2
-            exit 1
-          fi
-          if grep -Fq 'rootless_holder_memory: ignored' "${log}"; then
-            echo "::error::rootless_holder_memory reported an unexpected line: ignored" >&2
-            exit 1
-          fi
-          echo "::notice::rootless_holder_memory verified"
+          scripts/check-success-lines.sh --name rootless_holder_memory \
+            --src crates/core/tests/rootless_holder_memory.rs \
+            --log "${log}" --select '^rootless_holder_memory: holder memory has no injected secret' \
+            --subst-pos-re '[1-9][0-9]*' --subst-pos 0 --subst-pos-re '[0-9]+' \
+            --forbid 'rootless_holder_memory: ignored' --forbid 'not applicable'
 
       - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1673,27 +1621,12 @@ jobs:
           euid="$(id -u)"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless -- --ignored 2>&1 | tee "${log}"
-          for mode in direct helper; do
-            line="rootless: scenario ${mode} lifecycle verified with the real entrypoint as PID 1"
-            line+=" (create/start/kill/delete-rejected; host uid=${euid}; via ProductionLauncher)"
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          part='rootless: abandoned launch handle: PID 1 exited by its lifetime bound and left nothing behind ('
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::rootless did not report: ${part} (possibly not executed)" >&2
-            exit 1
-          fi
-          for bad in 'helper case not requested' 'root=true' 'rootless: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless verified"
+          # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。
+          # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED（変われば導出との照合で失敗する）
+          scripts/check-success-lines.sh --name rootless --src crates/core/tests/rootless.rs --log "${log}" \
+            --select '^rootless: (scenario |abandoned launch handle)' --subst mode=direct,helper \
+            --subst EXIT_ENTRY_LIFETIME_EXPIRED=75 --subst euid="${euid}" --subst egid="$(id -g)" --min 3 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless: ignored' --summary
 
       - name: rootless_uid_mapping の実行（実機前提テスト・--ignored。CORE-6・SEC-5・ESC-09・#2596）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1703,33 +1636,19 @@ jobs:
           log="${RUNNER_TEMP}/rootless_uid_mapping.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored 2>&1 | tee "${log}"
-          for mode in direct helper; do
-            for part in \
-              "rootless_uid_mapping: scenario ${mode} verified (host uid=" \
-              "rootless_uid_mapping: RESULT scenario=${mode} behavior=SEC-5,CORE-6,ESC-09 "; do
-              if ! grep -Fq "${part}" "${log}"; then
-                echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
-                exit 1
-              fi
-            done
-            if ! grep -F "RESULT scenario=${mode} " "${log}" | grep -Fq ' verdict=pass'; then
-              echo "::error::rootless_uid_mapping scenario ${mode} did not report verdict=pass" >&2
-              exit 1
-            fi
-          done
-          part='rootless_uid_mapping: hung entrypoint exited by its lifetime bound ('
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
-            exit 1
-          fi
-          for bad in 'helper case not requested' 'root=true' 'rootless_uid_mapping: ignored' 'verdict=fail'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_uid_mapping reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          grep -F 'rootless_uid_mapping: RESULT' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
-          echo "::notice::rootless_uid_mapping verified"
+          # host uid / gid は helper の case で subuid になるため正規表現で受け、verdict=pass は行のリテラルで照合する。
+          # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED
+          check() {
+            scripts/check-success-lines.sh --name rootless_uid_mapping \
+              --src crates/core/tests/rootless_uid_mapping.rs --log "${log}" \
+              --forbid 'helper case not requested' --forbid 'root=true' \
+              --forbid 'rootless_uid_mapping: ignored' --forbid 'verdict=fail' "$@"
+          }
+          check --select '^rootless_uid_mapping: (scenario |RESULT )' --subst name=direct,helper \
+            --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' \
+            --subst-re want_uid='[0-9]+' --subst-re want_gid='[0-9]+' --min 4 --summary
+          check --select '^rootless_uid_mapping: hung entrypoint' --subst-pos 75 \
+            --subst-re euid='[0-9]+' --subst-re egid='[0-9]+'
 
       # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
       # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
@@ -1817,52 +1736,13 @@ jobs:
           log="${RUNNER_TEMP}/start_stop_delete_real.log"
           USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
-          final='start_stop_delete_real: cli start ran the container under the production launcher;'
-          final+=' stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report the final line (possibly not executed)" >&2
-            exit 1
-          fi
-          # create の起動オプションの観測（#2761・SUP-12・SEC-4）: コンテナ内の /proc/self/limits と environ の値、
-          # start --audit-policy が supervisor に受理されたことを示す行。
-          opts='start_stop_delete_real: create options observed in the container:'
-          opts+=' /proc/self/limits nofile soft=256 hard=512; environ FANDHE_OPT_PROBE=observed-2761;'
-          opts+=' start passed --audit-policy best-effort'
-          if ! grep -Fxq "${opts}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report the create options line (possibly not executed)" >&2
-            exit 1
-          fi
-          # create --cap-drop の観測（#2833・SEC-1・CLI-1）: NET_RAW（CapPrm=CapEff=CapBnd=00000000a80405fb）と ALL（すべて 0）。
-          capdrop='start_stop_delete_real: create --cap-drop NET_RAW observed in the container:'
-          capdrop+=' CapPrm=CapEff=CapBnd=00000000a80405fb CapInh=CapAmb=0000000000000000;'
-          capdrop+=' inspect bounding lists 13 capabilities without CAP_NET_RAW'
-          if ! grep -Fxq "${capdrop}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report the cap-drop NET_RAW line (possibly not executed)" >&2
-            exit 1
-          fi
-          capall='start_stop_delete_real: create --cap-drop ALL observed in the container:'
-          capall+=' CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty;'
-          capall+=' stop recorded Stopped(43); delete left no state dir'
-          if ! grep -Fxq "${capall}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report the cap-drop ALL line (possibly not executed)" >&2
-            exit 1
-          fi
-          part='start_stop_delete_real: scenario ok scope_present_before_delete='
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report: ${part} (possibly not executed)" >&2
-            exit 1
-          fi
-          for bad in 'start_stop_delete_real: skipped' 'start_stop_delete_real: FAILED'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::start_stop_delete_real reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "${final}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${opts}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${capdrop}" >> "$GITHUB_STEP_SUMMARY"
-          echo "${capall}" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::start_stop_delete_real verified"
+          # create の起動オプション（#2761）・--cap-drop NET_RAW / ALL（#2833）・最終行を、ソースの文字列リテラルから導出して照合する
+          scripts/check-success-lines.sh --name start_stop_delete_real \
+            --src crates/cli/tests/start_stop_delete_real.rs \
+            --log "${log}" --select '^start_stop_delete_real: (create |scenario ok |cli start )' \
+            --subst-re scope_present='(true|false)' --min 5 \
+            --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
+            --forbid 'not applicable' --summary
 
       # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
       # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、

@@ -1,0 +1,1 @@
+{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},"process":{"user":{"uid":0,"gid":0},"args":["/bin/sleep","300"],"env":["PATH=/bin","LD_LIBRARY_PATH=@LD@"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}

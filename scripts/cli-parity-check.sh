@@ -28,6 +28,18 @@
 # cgroup は <set>、idMapping は model と extent 件数、auditCoverage は reason を落とし、capabilities は
 # 件数だけ、rootReadonly は true / false / - にする（CLI-1・#2826）。
 #
+# start 済みの inspect（B18〜B25・種別 s / w。#2891・SEC-1・CLI-1）: B18 で `--read-only --cap-drop NET_RAW` つきの
+# コンテナ c2 を起動用 bundle（Linux だけホストの sleep と依存ライブラリを集めた最小 rootfs を持つ）で作り、
+# start → inspect → stop --signal KILL → 終了待ちの inspect → delete → list と連鎖する。start が成功した
+# ときだけ `started:<id>,<status>,pid,sup,cg,health,audit,idmap,stop,caps=<件数>,ro=` を記録する
+# （revision・exitCode・restartCount は時機で変わるため、audit・idmap はホスト・カーネルで中身が変わるため
+# 有無だけにする）。start が成功しない環境（supervisor 未配置・委譲 scope が作れない・非 Linux 等）では
+# `<start-failed>` の印だけを残し、compare は NOT_STARTED として扱って終了コードを 1 にする（合格に見せない）。
+# start を通すには、操作者が capture 全体を `systemd-run --user --scope -p Delegate=yes` で包み、CLI と同じ
+# ディレクトリに fandhe-container-supervisor を置く（特権ランチャーは置かない）。本スクリプトは sudo も
+# systemd-run も呼ばない。連鎖の途中で中断・期限切れになったときは stop --signal KILL と delete を best effort で
+# 試みるが、回収できない supervisor・委譲 scope は残りうる（手順書の「後始末の限界」を参照）。
+#
 # 使い方:
 #   cli-parity-check.sh capture --cli <絶対パス> --output <新規ファイル> [--timeout SECS（既定 20。1〜600）]
 #   cli-parity-check.sh compare --baseline <capture> --candidate <capture>
@@ -79,9 +91,11 @@ usage() {
 }
 
 # --------------------------------------------------
-# ケース表: ID|層|種別|argv（空白区切り。@R@ = 状態ルート、@B@ = バンドル、@M@ = 存在しない状態ルート）
+# ケース表: ID|層|種別|argv（空白区切り。@R@ = 状態ルート、@B@ = バンドル、@S@ = 起動用バンドル、@M@ = 存在しない状態ルート）
 # 種別 l = stdout が list 形式、n = 成功時の stdout は空であるべき、
-# i = stdout が inspect の 1 行 JSON（固定語彙の 1 欄へ正規化して記録する。norm_inspect）。
+# i = stdout が inspect の 1 行 JSON（固定語彙の 1 欄へ正規化して記録する。norm_inspect）、
+# s = start 済みコンテナの inspect（直前の start が成功したときだけ中身を記録し、失敗したときは
+#     <start-failed> の印にする。#2891）、w = s と同じ形で、状態が running でなくなるまで期限つきで繰り返す。
 # B 層は上から順に実行する（状態遷移を観測する）。ID・層はドキュメントのチェックリストと一致させる。
 # --------------------------------------------------
 CASES=(
@@ -129,6 +143,14 @@ CASES=(
   'B14|B|n|--root @R@ logs nonexist'
   'B15|B|l|--root @M@ list'
   'B16|B|n|--root @R@ inspect nonexist'
+  'B18|B|n|--root @R@ create --read-only --cap-drop NET_RAW --bundle @S@ c2'
+  'B19|B|i|--root @R@ inspect c2'
+  'B20|B|n|--root @R@ start c2'
+  'B21|B|s|--root @R@ inspect c2'
+  'B22|B|n|--root @R@ stop --signal KILL c2'
+  'B23|B|w|--root @R@ inspect c2'
+  'B24|B|n|--root @R@ delete c2'
+  'B25|B|l|--root @R@ list'
   'D01|D|n|--root @R@ logs --tail'
   'D02|D|n|--root @R@ logs --tail x c1'
   'D03|D|n|--root @R@ logs --tail 1000001 c1'
@@ -191,6 +213,12 @@ kill_unreaped_child() {
   fi
 }
 
+# start 済みの連鎖（B20〜B24）の後始末に使う CLI と状態ルート、連鎖が生きているか（1 = start 成功後で
+# delete 前）。中断・タイムアウトで連鎖の途中に居るときに、コンテナを残さないために使う（#2891・REPAIR-5）。
+chain_cli=""
+chain_state=""
+chain_live=0
+
 cleanup() {
   if [ -n "$watchdog_pid" ]; then
     kill -KILL "$watchdog_pid" 2>/dev/null || true
@@ -204,6 +232,14 @@ cleanup() {
     kill_unreaped_child "$run_pid"
     wait "$run_pid" 2>/dev/null || true
     run_pid=""
+  fi
+  # start 済みのコンテナを best effort で止めて消す（各呼び出しは 10 秒の期限つき。失敗は握る）。
+  # supervisor・委譲 scope が残る場合の限界は docs/verification/cli-cross-platform-parity.md に書く。
+  if [ "$chain_live" -eq 1 ] && [ -n "$chain_cli" ] && [ -d "$tmp_dir" ]; then
+    chain_live=0
+    run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL c2 || true
+    sleep 0.5
+    run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
   fi
   if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
     rm -rf -- "$tmp_dir"
@@ -354,9 +390,10 @@ norm_code() {
 # 合わない形は 1 を返す（呼び出し側が <unexpected>:行数 にする。一致扱いにしない）。結果は norm_stdout_out。
 # 値はコマンド・パスへ連結せず、bash の組み込みの正規表現と文字列操作だけで扱う（eval を使わない）。
 readonly MAX_INSPECT_BYTES=65536
+norm_started_out=""
 norm_inspect() {
   local e size rest id status pid exitc rev cg sup health restarts audit idmap stop caps
-  local pol skm llm rec model ul gl un gn cl tmp
+  local pol skm llm rec model ul gl un gn cl tmp audit_set idmap_set
   local str='"'"$JSON_STR_BODY"'"'
   # JSON の整数構文（先頭ゼロ不可。042 のような不正な数値を受理して正規化で潰さない）。括弧なしの選択肢で群番号を変えない。
   local ji='0|[1-9][0-9]{0,9}'
@@ -447,6 +484,11 @@ norm_inspect() {
     caps=$(((${#cl} - ${#tmp}) / 5))
   fi
   [ "$ro" = "null" ] && ro='-'
+  # start 済みの比較（種別 s / w）用の形。時機で変わる値（revision・exitCode・restartCount）は落とし、
+  # ホスト・カーネルで変わる audit と idMapping は有無だけにする（#2891）。
+  if [ "$audit" = "-" ]; then audit_set='-'; else audit_set='<set>'; fi
+  if [ "$idmap" = "-" ]; then idmap_set='-'; else idmap_set='<set>'; fi
+  norm_started_out="started:${id},${status},pid=${pid},sup=${sup},cg=${cg},health=${health},audit=${audit_set},idmap=${idmap_set},stop=${stop},caps=${caps},ro=${ro}"
   norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps},ro=${ro}"
   return 0
 }
@@ -454,14 +496,22 @@ norm_inspect() {
 # stdout を正規化する。種別 l は list 形式（ヘッダ + 行）を厳格に検査し PID 列を <pid> へ置換する。
 # 結果は norm_stdout_out に入れる。
 norm_stdout_out=""
+# 直前の start の終了コード。1 = まだ成功していない（種別 s / w の判定に使う。#2891）。
+last_start_exit=1
 norm_stdout() {
   local kind="$1" line header_expected row_re joined first ok raw stripped pidcol
+  # start が成功していない環境では inspect の中身を比べる意味が無い。出力を解析せず固定の印を残し、
+  # compare が NOT_STARTED として扱う（合格に見せない）。
+  if { [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$last_start_exit" != "0" ]; then
+    norm_stdout_out='<start-failed>'
+    return 0
+  fi
   # 空判定は元ファイルのバイト数で行う（改行のみ・NUL 含みの出力が空出力と同じ '-' になるのを防ぐ）。
   # 内容は写さず異常として記録する。
   if [ ! -s "$tmp_dir/out" ]; then
     norm_stdout_out='-'
     # 成功（終了コード 0）した inspect が何も出さないのは異常。失敗時の空出力は従来どおり許容する。
-    if [ "$kind" = "i" ] && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
+    if { [ "$kind" = "i" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
     return 0
   fi
   raw=$(($(wc -c <"$tmp_dir/out")))
@@ -475,8 +525,9 @@ norm_stdout() {
     norm_stdout_out='<unexpected>:big'
     return 0
   fi
-  if [ "$kind" = "i" ]; then
+  if [ "$kind" = "i" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; then
     if norm_inspect; then
+      if [ "$kind" != "i" ]; then norm_stdout_out="$norm_started_out"; fi
       return 0
     fi
     norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
@@ -520,6 +571,50 @@ norm_stdout() {
   else
     norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
   fi
+  return 0
+}
+
+# 直前の inspect の出力（$tmp_dir/out）の status が running か。種別 w の繰り返しの判定に使う。
+inspect_is_running() {
+  local e=""
+  IFS= read -r e <"$tmp_dir/out" || true
+  [[ $e == *'"status":"running"'* ]]
+}
+
+# start 済みのケース（B18〜B24）用の最小 rootfs を $1 に組み立てる（Linux のみ。#2891）。
+# crates/cli/tests/start_stop_delete_real.rs の make_bundle と同じ方式で、ホストの sleep・ELF インタプリタ・
+# 依存ライブラリを rootfs 内の同じ絶対パスへコピーする。実行ファイルは固定の候補だけを使い PATH を探索しない。
+# 依存は ldd の出力のうち絶対パスの正規表現に合う語だけを使い、eval しない。成功すると標準の変数
+# build_ld にライブラリのディレクトリ（: 区切り）を入れる。失敗は 1 を返す（呼び出し側は注意を出して続行し、
+# start が失敗して B21 / B23 が <start-failed> になる）。
+build_ld=""
+build_start_rootfs() {
+  local rootfs="$1" exe="" cand w lib dir line
+  local path_re='^/[A-Za-z0-9._/+-]+$'
+  build_ld=""
+  for cand in /bin/sleep /usr/bin/sleep; do
+    if [ -f "$cand" ] && [ -x "$cand" ]; then
+      exe="$cand"
+      break
+    fi
+  done
+  [ -n "$exe" ] || return 1
+  command -v ldd >/dev/null 2>&1 || return 1
+  mkdir -p -- "$rootfs/bin" "$rootfs/proc" "$rootfs/dev" "$rootfs/tmp" "$rootfs/etc" || return 1
+  cp -- "$exe" "$rootfs/bin/sleep" || return 1
+  chmod 755 "$rootfs/bin/sleep" || return 1
+  while IFS= read -r line; do
+    for w in $line; do
+      [[ $w =~ $path_re ]] || continue
+      lib="$w"
+      [ -f "$lib" ] || continue
+      dir="${lib%/*}"
+      mkdir -p -- "$rootfs$dir" || return 1
+      cp -- "$lib" "$rootfs$lib" || return 1
+      chmod 755 "$rootfs$lib" || return 1
+      case ":$build_ld:" in *":$dir:"*) ;; *) build_ld="${build_ld:+$build_ld:}$dir" ;; esac
+    done
+  done < <(ldd "$exe" 2>/dev/null)
   return 0
 }
 
@@ -570,8 +665,24 @@ do_capture() {
   fixture="$(cd "$(dirname -- "$0")" && pwd)/testdata/cli-parity/config.json"
   [ -f "$fixture" ] || { err missing-prerequisite "fixture config.json not found"; exit 3; }
   cp -- "$fixture" "$bundle/config.json"
+  # 起動用 bundle（B18〜B24）。長寿命の sleep を動かす config と、Linux だけ最小 rootfs を持つ。非 Linux は
+  # plugin の解決が bundle を読む前に失敗するため rootfs は空のまま（結果は変わらない）。組み立てに失敗しても
+  # capture は止めず、start が失敗して B21 / B23 が <start-failed> になる（合格に見せない）。
+  local sbundle="$tmp_dir/sbundle" sfixture cfg
+  mkdir -p -- "$sbundle/rootfs"
+  sfixture="$(cd "$(dirname -- "$0")" && pwd)/testdata/cli-parity/config-start.json"
+  [ -f "$sfixture" ] || { err missing-prerequisite "fixture config-start.json not found"; exit 3; }
+  build_ld=""
+  if [ "$os_kind" = "linux" ]; then
+    build_start_rootfs "$sbundle/rootfs" || err warning "start rootfs was not assembled; start cases will be recorded as not started"
+  fi
+  cfg="$(cat -- "$sfixture")"
+  cfg="${cfg//@LD@/$build_ld}"
+  printf '%s\n' "$cfg" >"$sbundle/config.json"
+  chain_cli="$cli"
+  chain_state="$state"
 
-  local lines=() entry id layer kind argstr tok mapped any_timeout=0
+  local lines=() entry id layer kind argstr tok mapped any_timeout=0 deadline
   lines+=("$FORMAT_HEADER" "# os=${os_kind}" "$COLUMNS_LINE")
   for entry in "${CASES[@]}"; do
     IFS='|' read -r id layer kind argstr <<<"$entry"
@@ -580,12 +691,33 @@ do_capture() {
       case "$tok" in
         @R@) mapped="$state" ;;
         @B@) mapped="$bundle" ;;
+        @S@) mapped="$sbundle" ;;
         @M@) mapped="$missing" ;;
         *) mapped="$tok" ;;
       esac
       argv+=("$mapped")
     done
     run_cli "$cli" "$limit" "${argv[@]}"
+    # w は状態が running でなくなるまで期限つきで繰り返す（stop 直後の delete が Running で失敗する競合を避ける）。
+    # start が成功していなければ待っても変わらないので 1 回で済ませる。
+    if [ "$kind" = "w" ] && [ "$last_start_exit" = "0" ] && [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ]; then
+      deadline=$((SECONDS + limit))
+      while inspect_is_running && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 0.2
+        run_cli "$cli" "$limit" "${argv[@]}"
+        [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ] || break
+      done
+      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ] && inspect_is_running; then
+        run_timed_out=1
+      fi
+    fi
+    # start の結果を種別 s / w の判定に使う。連鎖（成功後〜delete まで）の間は中断時の後始末の対象にする。
+    case " $argstr " in
+      *" start "*)
+        if [ "$run_timed_out" -eq 1 ]; then last_start_exit=1; else last_start_exit="$run_exit"; fi
+        ;;
+    esac
+    if [ "$id" = "B20" ] && [ "$last_start_exit" = "0" ]; then chain_live=1; fi
     if [ "$run_timed_out" -eq 1 ]; then
       any_timeout=1
       lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}<timeout>${TAB}<timeout>")
@@ -593,6 +725,7 @@ do_capture() {
     fi
     norm_code
     norm_stdout "$kind"
+    if [ "$id" = "B24" ] && [ "$run_exit" = "0" ]; then chain_live=0; fi
     lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}${norm_code_out}${TAB}${norm_stdout_out}")
   done
 
@@ -640,6 +773,7 @@ load_capture() {
   [ "$(($(LC_ALL=C tr -d '\000' <"$file" | wc -c)))" -eq "$size" ] || { err invalid-input "capture file contains NUL"; exit 2; }
   local id_re='^[ABD][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
+  local so_started_re='^started:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),sup=(<pid>|-),cg=(<set>|-),health=([a-z_]{1,16}|-),audit=(<set>|-),idmap=(<set>|-),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
   local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
@@ -683,6 +817,8 @@ load_capture() {
             so_ok=1
           elif [ "$k" = "i" ] && [[ $so =~ $so_inspect_re ]]; then
             so_ok=1
+          elif { [ "$k" = "s" ] || [ "$k" = "w" ]; } && { [ "$so" = "<start-failed>" ] || [[ $so =~ $so_started_re ]]; }; then
+            so_ok=1
           fi
         fi
         [ "$so_ok" -eq 1 ] || { err invalid-input "malformed case line $n"; exit 2; }
@@ -724,7 +860,7 @@ do_compare() {
   fi
 
   local all_ids id bv cv bvar cvar layer entry
-  local a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0 d_match=0 d_mis=0 d_miss=0
+  local ns_count=0 a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0 d_match=0 d_mis=0 d_miss=0
   # 比較対象は CASES から作る期待 ID 集合（固定ケース表）を基準とし、双方に無いケースも MISSING にする。
   # 入力にだけある想定外 ID は末尾に足す（こちらも片側欠落として MISSING になる）。
   all_ids=""
@@ -753,6 +889,11 @@ do_compare() {
       # 解析不能マーカーは内容を記録しないため、同形でも同一性を確認できていない。一致扱いにしない。
       verdict="MISMATCH"
       printf '%s UNVERIFIED (baseline=%s candidate=%s)\n' "$id" "$bv" "$cv"
+    elif [[ $bv == *'<start-failed>'* || $cv == *'<start-failed>'* ]]; then
+      # start が成功しなかった側がある。start 済みの inspect を比べられていないので一致扱いにしない（#2891）。
+      verdict="NOTSTART"
+      ns_count=$((ns_count + 1))
+      printf '%s NOT_STARTED (baseline=%s candidate=%s)\n' "$id" "$bv" "$cv"
     elif [ "$bv" = "$cv" ]; then
       verdict="MATCH"
       printf '%s MATCH\n' "$id"
@@ -775,7 +916,8 @@ do_compare() {
   printf 'layer A (syntax): match=%s mismatch=%s missing=%s\n' "$a_match" "$a_mis" "$a_miss"
   printf 'layer B (behavior): match=%s mismatch=%s missing=%s\n' "$b_match" "$b_mis" "$b_miss"
   printf 'layer D (logs options): match=%s mismatch=%s missing=%s\n' "$d_match" "$d_mis" "$d_miss"
-  if [ $((a_mis + a_miss + b_mis + b_miss + d_mis + d_miss)) -eq 0 ]; then
+  printf 'not started (start precondition unmet): %s\n' "$ns_count"
+  if [ $((a_mis + a_miss + b_mis + b_miss + d_mis + d_miss + ns_count)) -eq 0 ]; then
     exit 0
   fi
   exit 1

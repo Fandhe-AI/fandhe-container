@@ -9,7 +9,7 @@
 # ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）。make ci には含めない。
 # 失敗は `FAIL:` 行を出し、最後に非 0 で終了する。bash 3.2 以上で動く。
 #
-# 構成: capture は 18 本を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
+# 構成: capture は 30 本近くを同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
 # CI の時間枠を圧迫するため。同時実行の負荷は、CLI が即座に終わるときの監視サブシェル停止の競合
 # （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない。
 set -uo pipefail
@@ -46,6 +46,8 @@ expect_eq() {
 #   diff     = ok と同じだが create 後の list の終了コードだけ変える
 #   noisy    = ok と同じ終了コードで、stderr / stdout にパス風文字列・制御文字を流す
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
+#   nostart  = ok と同じだが、起動用 bundle の start も失敗する（supervisor 未配置など start の前提が無い環境。#2891）
+#   stuck    = ok と同じだが、stop しても running のまま（B23 の終了待ちが期限切れになる。#2891）
 # 環境変数で出力を差し替える（fixture 表。カウンタはそのディレクトリの count に置く）:
 #   STUB_ERR_DIR = 使い方エラーの n 回目に err.<n> があれば、その内容をそのまま stderr へ流す。
 #                  A 層 18 ケースは全て使い方エラーで順に呼ばれるため、n 回目 = ケース A<n>。
@@ -54,6 +56,7 @@ expect_eq() {
 #   STUB_INSPECT_DIR = 存在する ID の inspect（B17。成功は 1 回だけ）の stdout を、そのディレクトリの
 #                  out ファイルの内容で差し替える（無ければ製品と同じ形の created の 1 行 JSON）。
 #                  STUB_OUT_DIR とはカウンタを共有しない（既存の fixture の番号をずらさないため）。
+#                  差し替えるのは c1 の inspect だけ（起動用の c2 の inspect〔B19・B21・B23〕には波及させない）。
 #
 # stderr の形は製品 CLI に合わせる（crates/cli/src/commands.rs の CliExit::write_stderr）:
 #   固定文言（使い方エラー・list の状態ルート不在・logs）= {"code":..,"message":..}
@@ -136,7 +139,9 @@ case "$cmd" in
         *) id="$1"; n=$((n + 1)); shift ;;
       esac
     done
-    [ -n "$bundle" ] && [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
+    [ -n "$bundle" ] && [ "$n" -eq 1 ] && valid_id "$id" || bad
+    # 起動用 bundle（ディレクトリ名 sbundle）と --read-only の有無を、コンテナの記録（<id>.c）へ残す。
+    sb=plain; [ "${bundle##*/}" = "sbundle" ] && sb=sbundle ;;
   logs)
     # 製品 CLI の logs の引数規則（--tail は 0..1000000 の整数・--stream は stdout|stderr・--follow と --escape（短縮形は無い） は 1 回まで）。
     follow=0; escape=0; tail_seen=0; stream_seen=0; n=0; id=""
@@ -203,24 +208,41 @@ case "$cmd" in
   create)
     [ -d "$root" ] || fail_op 3 NOT_FOUND create
     [ -e "$root/$id.c" ] && fail_op 4 ALREADY_EXISTS create
-    : >"$root/$id.c"
+    printf '%s %s\n' "$sb" "$ro" >"$root/$id.c"
     out_override || { [ "$mode" = "noisy" ] && printf '/home/secret-user/out\n'; }
     ;;
-  start) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND start; fail_op 8 UNIMPLEMENTED start ;;
+  start)
+    [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND start
+    # 通常の bundle（rootfs が空）は supervisor 未配置と同じ FAILED_PRECONDITION。起動用 bundle だけ成功する。
+    read -r sb ro <"$root/$id.c"
+    { [ "$sb" = "sbundle" ] && [ "$mode" != "nostart" ]; } || fail_op 5 FAILED_PRECONDITION start
+    : >"$root/$id.started" ;;
   logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
   inspect)
     [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND
-    if [ -n "${STUB_INSPECT_DIR:-}" ] && [ -f "$STUB_INSPECT_DIR/out" ]; then
+    caps13='"CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP","CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"'
+    read -r sb ro <"$root/$id.c"
+    rojson=false; [ "$ro" = "1" ] && rojson=true
+    if [ -e "$root/$id.started" ] || [ -e "$root/$id.stopped" ]; then
+      # start 済み / 停止後の inspect。bundle・cgroup・hostId・reason にはパス風の文字列を入れ、漏えいしないことを照合する。
+      if [ -e "$root/$id.started" ]; then st='"status":"running","pid":4242,"exitCode":null'; ex=not_recorded
+      else st='"status":"stopped","pid":null,"exitCode":-9'; ex=recorded; fi
+      printf '{"id":"%s",%s,"bundle":"/home/secret-user/sbundle","revision":3,"cgroupScope":"/user/secret-slice","cgroupInstance":2,"supervisorPid":4141,"health":null,"restartCount":0,"auditCoverage":{"policy":"evaluated","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":"kernel 6.12 secret"},"record":null},"idMapping":{"model":"single","uid":[{"containerId":0,"hostId":100000,"size":1}],"gid":[{"containerId":0,"hostId":100000,"size":1}]},"explicitStop":"%s","capabilities":{"bounding":[%s]},"rootReadonly":%s}\n' "$id" "$st" "$ex" "$caps13" "$rojson"
+    elif [ "$id" = "c1" ] && [ -n "${STUB_INSPECT_DIR:-}" ] && [ -f "$STUB_INSPECT_DIR/out" ]; then
       cat "$STUB_INSPECT_DIR/out"
     else
       # 製品の InspectReport::to_json と同じキー順。bundle にはパス風の文字列を入れ、漏えいしないことを照合する。
       printf '{"id":"%s","status":"created","pid":null,"exitCode":null,"bundle":"/home/secret-user/bundle","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n' "$id"
     fi
     ;;
-  stop) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill; fail_op 5 FAILED_PRECONDITION kill ;;
+  stop)
+    [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill
+    [ -e "$root/$id.started" ] || fail_op 5 FAILED_PRECONDITION kill
+    # stuck は stop を受けても running のまま。
+    [ "$mode" = "stuck" ] || mv "$root/$id.started" "$root/$id.stopped" ;;
   delete)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete
-    rm -f "$root/$id.c"
+    rm -f "$root/$id.c" "$root/$id.started" "$root/$id.stopped"
     out_override || true
     ;;
 esac
@@ -401,6 +423,8 @@ start_capture ok ok
 # 無効な LC_ALL（#1548・CLI-1）。bash 製スタブの setlocale 警告が stderr に混ざらず、CLI へは C が渡る。
 LC_ALL=xx_XX.UTF-8 STUB_LOCALE_FILE="$work/locale.txt" start_capture lcall ok
 start_capture nonlinux nonlinux
+start_capture nostart nostart
+start_capture stuck stuck --timeout 1
 TMPDIR="$work/tmpdir" start_capture diff diff
 start_capture noisy noisy
 STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
@@ -413,7 +437,7 @@ for n in $insp_names; do
 done
 wait
 
-all_caps="ok lcall nonlinux diff noisy errtable errmax outtable"
+all_caps="ok lcall nonlinux nostart diff noisy errtable errmax outtable"
 for n in $insp_names; do all_caps="$all_caps insp_$n"; done
 for name in $all_caps; do
   expect_rc "capture $name exits 0" 0 "$(rc_of "$name")"
@@ -428,7 +452,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 51 cases" 51 "$count"
+expect_eq "capture records 59 cases" 59 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -447,7 +471,7 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 51 "$loc_n"
+expect_eq "lcall stub invocations" 59 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -532,12 +556,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=17 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=25 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
 cmp_has "lcall layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=17 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=25 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -547,7 +571,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
 cmp_has "non-linux layer A all match" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=16 missing=0'
+cmp_has "non-linux layer B mismatches (B05 and B08 coincide at 5; B21 and B23 are not started)" 'layer B (behavior): match=2 mismatch=21 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -564,7 +588,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=16 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=24 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"
@@ -690,6 +714,70 @@ sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}inspect:g
 compare i3 i3
 expect_rc "inspect:garbage stdout field is rejected" 2 $?
 
+# --- start 済みの inspect（種別 s / w。B18〜B25。#2891・SEC-1・CLI-1） ---
+expect_line "B18 create with --read-only --cap-drop on the start bundle" ok "B18${tab}B${tab}0${tab}-${tab}-"
+expect_line "B19 inspect before start records nothing" ok "B19${tab}B${tab}0${tab}-${tab}inspect:c2,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
+expect_line "B20 start of the start bundle" ok "B20${tab}B${tab}0${tab}-${tab}-"
+expect_line "B21 inspect after start (caps=13, ro=true)" ok "B21${tab}B${tab}0${tab}-${tab}started:c2,running,pid=<pid>,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=not_recorded,caps=13,ro=true"
+expect_line "B22 stop --signal KILL" ok "B22${tab}B${tab}0${tab}-${tab}-"
+expect_line "B23 inspect after the stop" ok "B23${tab}B${tab}0${tab}-${tab}started:c2,stopped,pid=-,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=recorded,caps=13,ro=true"
+expect_line "B24 delete" ok "B24${tab}B${tab}0${tab}-${tab}-"
+expect_line "B25 list after the chain" ok "B25${tab}B${tab}0${tab}-${tab}list:H"
+expect_line "B05 start of the empty rootfs bundle fails" ok "B05${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+# start が成功しない環境（nostart）は印だけを残す。
+expect_line "nostart B20 start fails" nostart "B20${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "nostart B21 is start-failed" nostart "B21${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B23 is start-failed" nostart "B23${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B24 delete of the created container" nostart "B24${tab}B${tab}0${tab}-${tab}-"
+expect_line "nostart B25 list is empty again" nostart "B25${tab}B${tab}0${tab}-${tab}list:H"
+compare ok nostart
+expect_rc "compare with a not started side is rc 1" 1 $?
+cmp_has_prefix "B21 reported as NOT_STARTED" 'B21 NOT_STARTED'
+cmp_has_prefix "B23 reported as NOT_STARTED" 'B23 NOT_STARTED'
+cmp_has "not started count" 'not started (start precondition unmet): 2'
+compare nostart nostart
+expect_rc "matching <start-failed> records are rc 1" 1 $?
+cmp_has_prefix "B21 not started on both sides is NOT_STARTED" 'B21 NOT_STARTED'
+compare ok ok
+cmp_has "not started count is 0 when started" 'not started (start precondition unmet): 0'
+compare ok nonlinux
+cmp_has_prefix "B21 non-linux is NOT_STARTED" 'B21 NOT_STARTED'
+# 終了待ちが期限切れ（stop しても running のまま）
+expect_rc "stuck capture is rc 1" 1 "$(rc_of stuck)"
+case "$(line_of stuck B23)" in
+  "B23${tab}B${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>") pass "B23 recorded as timeout" ;;
+  *) fail "B23 recorded as timeout (got '$(line_of stuck B23)')" ;;
+esac
+expect_line "stuck B24 still deletes" stuck "B24${tab}B${tab}0${tab}-${tab}-"
+# 漏えい検査: bundle・cgroup・hostId・reason は started の記録に現れない
+leak=0
+for n in nostart stuck; do
+  [ -f "$work/$n.txt" ] || continue
+  while IFS= read -r l; do
+    case "$l" in *secret*|*100000*|*kernel*|*sbundle*|*rootfs*) leak=$((leak + 1)) ;; esac
+  done <"$work/$n.txt"
+done
+while IFS= read -r l; do
+  case "$l" in *secret*|*100000*|*kernel*|*sbundle*|*rootfs*) leak=$((leak + 1)) ;; esac
+done <"$work/ok.txt"
+expect_eq "started capture leaks no path / cgroup / hostId / reason" 0 "$leak"
+# load_capture: started 形式・<start-failed> は種別 s / w にだけ置ける
+sed "s/^B19${tab}B${tab}0${tab}-${tab}.*/B19${tab}B${tab}0${tab}-${tab}started:c2,running,pid=-,sup=-,cg=-,health=-,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/s1.txt"
+compare s1 s1
+expect_rc "started form on an inspect case is rejected" 2 $?
+sed "s/^B21${tab}B${tab}0${tab}-${tab}.*/B21${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/s2.txt"
+compare s2 s2
+expect_rc "list form on a started case is rejected" 2 $?
+sed "s/^B21${tab}B${tab}0${tab}-${tab}.*/B21${tab}B${tab}0${tab}-${tab}started:garbage/" "$work/ok.txt" >"$work/s3.txt"
+compare s3 s3
+expect_rc "started:garbage stdout field is rejected" 2 $?
+sed "s/^B20${tab}B${tab}0${tab}-${tab}.*/B20${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/s4.txt"
+compare s4 s4
+expect_rc "<start-failed> on a non-start-inspect case is rejected" 2 $?
+sed "s/^B21${tab}B${tab}0${tab}-${tab}.*/B21${tab}B${tab}0${tab}-${tab}inspect:c2,running,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/s5.txt"
+compare s5 s5
+expect_rc "inspect form on a started case is rejected" 2 $?
+
 # 元のバイト列で検証する: 余分なタブ（空欄）・NUL・LF 終端なしは、read が畳んだ後の値が正常でも拒否する。
 # 両側に同じ壊れたファイルを渡し、MATCH（rc 0）にならないことを確かめる。
 sed "s/^A02${tab}A${tab}2${tab}/A02${tab}A${tab}${tab}2${tab}/" "$work/ok.txt" >"$work/t1.txt"
@@ -726,7 +814,7 @@ expect_line "op form (start) yields code" ok "B11${tab}B${tab}3${tab}NOT_FOUND${
 expect_line "op form (stop = kill) yields code" ok "B12${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "op form (delete) yields code" ok "B13${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "fixed form (logs) yields code" ok "B14${tab}B${tab}3${tab}NOT_FOUND${tab}-"
-if grep -qE '"op"|kill|start|delete' "$work/ok.txt"; then fail "op leaked into capture"; else pass "op is not recorded"; fi
+if grep -qE '"op"|kill|delete|start[^e]' "$work/ok.txt"; then fail "op leaked into capture"; else pass "op is not recorded"; fi
 
 i=0
 for want in "${want_codes[@]}"; do

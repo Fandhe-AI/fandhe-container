@@ -33,8 +33,9 @@ pub use container_runtime::{
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,
-    DeleteNetworkResponse, DetachRequest, DetachResponse, IpCidr, NetnsName, NetnsStatus,
-    NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol, PublishPortRequest,
+    DeleteNetworkResponse, DetachRequest, DetachResponse, IpCidr, MSG_UNPUBLISH_PORT_UNSUPPORTED,
+    NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol,
+    PublishPortRequest, UnpublishPortRequest, UnpublishPortResponse,
 };
 pub use state_store::{
     ANNOTATION_MAX_KEY_BYTES, ANNOTATIONS_MAX_ENTRIES, ANNOTATIONS_MAX_TOTAL_BYTES, Annotations,

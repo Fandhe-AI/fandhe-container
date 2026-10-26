@@ -98,6 +98,10 @@ mod leftover_children;
 mod real_entry;
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if is_entry_mode(&args) {
@@ -215,6 +219,8 @@ mod linux {
     }
 
     pub fn run() {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         // ディスパッチャの argv は entry モードと判定されず、PID 1 の argv は判定される（判定の回帰検出）。
         let dispatcher_argv: Vec<String> =
             ["x", "--ignored"].iter().map(|s| s.to_string()).collect();
@@ -335,9 +341,8 @@ mod linux {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!(
+        let base =
+            super::scratch_root::scratch_root("fandhe-rootless-scratch", timeout()).join(format!(
                 "fandhe-rootless-lifecycle-{label}-{}-{nanos}",
                 std::process::id()
             ));

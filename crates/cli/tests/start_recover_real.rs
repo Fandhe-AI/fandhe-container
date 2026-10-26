@@ -37,6 +37,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Read;
@@ -122,6 +126,8 @@ mod linux {
     }
 
     fn scenario() -> Result<(), String> {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を終了時に消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         if effective_uid()? == 0 {
             return Err("must run as a non-root user: owner checks are skipped for root".into());
         }
@@ -145,7 +151,8 @@ mod linux {
 
         let id =
             ContainerId::new(format!("sr{}", std::process::id())).map_err(|e| format!("{e:?}"))?;
-        let root = std::env::temp_dir().join(format!("fandhe-start-recover-{}", id.as_str()));
+        let root = super::scratch_root::scratch_root("fandhe-start-recover-scratch", CHILD_TIMEOUT)
+            .join(format!("fandhe-start-recover-{}", id.as_str()));
         let _ = fs::remove_dir_all(&root);
         let mut cleanup = Cleanup {
             sleeper: None,

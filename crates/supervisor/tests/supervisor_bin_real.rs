@@ -121,6 +121,16 @@ fn main() {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod linux {
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
@@ -465,12 +475,12 @@ mod linux {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
-                .join(format!(
-                    "fandhe-supbinreal-{tag}-{}-{nanos}",
-                    std::process::id()
-                ));
+            let dir =
+                super::scratch_root::scratch_root("fandhe-supbinreal-scratch", REPORT_TIMEOUT)
+                    .join(format!(
+                        "fandhe-supbinreal-{tag}-{}-{nanos}",
+                        std::process::id()
+                    ));
             std::fs::create_dir(&dir).expect("exclusively create the work dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod work dir");
@@ -622,6 +632,8 @@ mod linux {
     }
 
     pub fn run() {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let status = std::fs::read_to_string("/proc/self/status").ok();
         match classify_euid(status.as_deref()) {
             EuidCheck::NonRoot => {}

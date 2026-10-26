@@ -68,6 +68,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -334,7 +338,10 @@ mod linux {
 
     impl Sandbox {
         fn new(tag: &str) -> Self {
-            let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
+            let tmp = super::scratch_root::scratch_root(
+                "fandhe-rootless-rootfs-scratch",
+                std::time::Duration::from_secs(10),
+            );
             let dir = tmp.join(format!(
                 "fandhe-rootless-rootfs-remove-{tag}-{}",
                 std::process::id()
@@ -450,6 +457,8 @@ mod linux {
     }
 
     pub fn run() {
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let euid = euid();
         assert_ne!(euid, 0, "this test must run as a non-root user");
         let sub = ImageRootfsPrivilege::SubordinateIds(source());

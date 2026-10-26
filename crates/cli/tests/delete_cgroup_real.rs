@@ -52,6 +52,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Read;
@@ -83,6 +87,8 @@ mod linux {
             );
             return ExitCode::SUCCESS;
         }
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を終了時に消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         match scenarios() {
             Ok(()) => {
                 println!(
@@ -137,7 +143,11 @@ mod linux {
         fn new(tag: &str, recorded: &str, scope_dir: &Path) -> Result<(Self, PathBuf), String> {
             let pid = std::process::id();
             let id = ContainerId::new(format!("{tag}{pid}")).map_err(|e| format!("id: {e:?}"))?;
-            let root = std::env::temp_dir().join(format!("fandhe-delete-real-{}", id.as_str()));
+            let root = super::scratch_root::scratch_root(
+                "fandhe-delete-real-scratch",
+                Duration::from_secs(10),
+            )
+            .join(format!("fandhe-delete-real-{}", id.as_str()));
             let _ = fs::remove_dir_all(&root);
             // 以降のどこで失敗しても Drop が状態ルートを片付けるよう、作成前に Fixture を組む。
             let fixture = Self {

@@ -694,6 +694,8 @@ impl RootfsSource for ImageRootfsSource {
         let mut total: u64 = 0;
         let mut verified = Vec::with_capacity(layers.len());
         for l in &layers {
+            // blob の sha256 検証は大きさに比例して長いため、1 本ごとに期限を確かめる（REPAIR-5・#2821）。
+            self.check_deadline(started)?;
             let path = blobs.path.join(digest_hex(&l.digest));
             let size = open_blob_nofollow(&path)
                 .and_then(|f| {

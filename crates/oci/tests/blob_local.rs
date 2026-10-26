@@ -8,6 +8,7 @@
 
 use fandhe_container_oci::auth::RegistryAuth;
 use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::image_management::ImageStore;
 use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
 use fandhe_container_oci::manifest::Descriptor;
 use fandhe_container_oci::reference::{RegistryHost, Repository};
@@ -76,20 +77,37 @@ fn non_tls_registry_is_rejected_and_recorded() {
         RegistryEndpoint::new(RegistryHost::parse(&format!("localhost:{port}")).expect("host"));
     let repo = Repository::parse("library/alpine").expect("repo");
     let dir = std::env::temp_dir().join(format!("fandhe-oci-blob-local-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let dest = dir.join("blob.bin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    // 書き込み先は検査済み root の fd 起点の writer（#2765。パスは渡せない）。
+    let store = ImageStore::open(&dir).expect("open store");
+    let mut session = store.begin_pull_generated().expect("begin pull");
     let d = descriptor(3);
+    let mut writer = session.open_staged_blob(&d.digest).expect("writer");
     let e = client
-        .fetch_blob(&ep, &repo, &d, &RegistryAuth::None, &dest)
+        .fetch_blob(&ep, &repo, &d, &RegistryAuth::None, &mut writer)
         .expect_err("plain http must not be accepted as a registry");
+    drop(writer);
     let items = rec.0.lock().expect("lock").clone();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].kind(), OciOpKind::FetchBlob);
     assert_eq!(items[0].outcome(), OciOpOutcome::Failure);
     assert_eq!(items[0].error_code(), Some(e.code()));
     assert_ne!(e.code(), OciErrorCode::Unimplemented);
-    assert!(!dest.exists());
-    assert!(!dir.join("blob.bin.part").exists());
+    // 失敗した取得は `<hex>` も `<hex>.part` も残さない（`@pull.lock` だけ）。
+    let pull_dir = session.staging_dir().to_path_buf();
+    let mut left: Vec<String> = std::fs::read_dir(&pull_dir)
+        .expect("read pull dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["@pull.lock".to_string()]);
+    session.abort().expect("abort");
     let _ = std::fs::remove_dir_all(&dir);
     server.join().expect("server thread");
 }

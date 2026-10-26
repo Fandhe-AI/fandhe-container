@@ -51,6 +51,7 @@
 //!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
 //!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
 //!   （#2241・#2315・#482 が前提）。展開の計装（`OciOpRecorder`）は未配線で何も記録しない。
+//!   起動時の残り pull の回収 GC（`ImageStore::recover_stale_pulls`）は `CriPluginBackends::recover_stale_image_pulls` で配線済み（#2819）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
 //!   記録先を注入したときだけ行う（[`CriPluginBackends::production_with_audit_sink`]。Linux の本番はこちら）。プロセスが常に複数
@@ -249,6 +250,24 @@ impl CriPluginBackends {
         .with_puller(Arc::new(OciImagePuller::new(client, pull))))
     }
 
+    /// 起動時に 1 回、`<state_root>/.cri/images` に残った pull のステージングとリースを回収する（OCI-7・OCI-1。#2819）。
+    ///
+    /// `image_service` の成功後、RPC を受け付ける前に `main.rs` の `serve` が呼ぶ。期限は [`STARTUP_PULL_RECOVERY_BUDGET`]。
+    /// 結果の扱い（どれで起動を止めるか）は `main.rs` と `docs/design/pull-inventory-wiring.md`。注入で組んだ場合は
+    /// `Failed("FAILED_PRECONDITION")`。
+    #[cfg(unix)]
+    pub fn recover_stale_image_pulls(&self, budget: Duration) -> StartupPullRecovery {
+        let Some(root) = &self.state_root else {
+            return StartupPullRecovery::Failed("FAILED_PRECONDITION");
+        };
+        let images_root = root.join(IMAGES_DIR);
+        let recorder = Arc::clone(&self.recorder);
+        run_startup_pull_recovery(
+            move || recover_stale_image_pulls_in(&images_root, &recorder),
+            budget,
+        )
+    }
+
     /// `ImageService` と bundle 供給が共有する在庫。
     pub fn images(&self) -> &Arc<dyn ImageStore> {
         &self.images
@@ -298,8 +317,28 @@ impl CriPluginBackends {
 /// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
 /// running への force `delete` の最悪: stop 17 秒 + supervisor ログ 5 秒 + コンテナログ 15 秒 + 起動オプション文書 10 秒 = 47 秒。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
-/// bundle の用意と core の create のファイル I/O 自体の上限は、この内訳の外にある（既存の残余）。
+/// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
+/// この値で打ち切られ（DEADLINE_EXCEEDED）、worker の残存は [`PLUGIN_ROOTFS_DEADLINE`] + 分割できない区間 1 つ分 + 42.9 秒で有限になる
+/// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
+///
+/// `CreateContainer` の worker が `prepare` に使える時間の上限で、blob 1 本ごとと展開の前後で確かめる。RPC の応答は
+/// [`PLUGIN_RUNTIME_TIMEOUT`] で先に打ち切られるが、worker は打ち切れず、記録と件数枠はその終了まで残る。
+/// 値は既定（600 秒）のまま。変更はオーナー判断（本 issue では変えない）。
+pub const PLUGIN_ROOTFS_DEADLINE: Duration = fandhe_container_cri::bundle::DEFAULT_ROOTFS_DEADLINE;
+
+/// 本番の rootfs 展開設定（`ImageService` の pull と同じ値 + [`PLUGIN_ROOTFS_DEADLINE`] の明示）。
+#[cfg(unix)]
+fn production_extract_config(
+    state_root: &std::path::Path,
+) -> Result<fandhe_container_cri::bundle::ImageExtractConfig, CriError> {
+    let pull = production_pull_config(state_root)?;
+    let mut cfg = fandhe_container_cri::bundle::ImageExtractConfig::from_pull_config(&pull);
+    cfg.deadline = PLUGIN_ROOTFS_DEADLINE;
+    Ok(cfg)
+}
 
 /// 起動時の残りログの走査の全体の期限（#2760・REPAIR-5。サーブの開始は待たせず、別スレッドで走る）。
 pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
@@ -349,6 +388,136 @@ pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) ->
         r.failed,
         r.timed_out
     )
+}
+
+/// 起動時の pull 回収 GC の全体の期限（#2819・REPAIR-5）。超えたら起動しない（取り残した worker が `@lock` を握ったまま受け付けないため）。
+#[cfg(unix)]
+pub const STARTUP_PULL_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// 起動時の pull 回収 GC の結果の件数（パス・pull ID は含めない。REPAIR-4）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullRecoveryCounts {
+    /// ステージングを消した pull の数。
+    pub reclaimed: usize,
+    /// 解放したリースの合計。
+    pub released_leases: usize,
+    /// 生きている pull のため残した数。
+    pub kept_live: usize,
+    /// 不在を確認できず残した数。
+    pub kept_undetermined: usize,
+    /// 削除に失敗した数（1 以上なら warn）。
+    pub failed: usize,
+    /// 触らなかったエントリ数。
+    pub foreign_entries: usize,
+}
+
+#[cfg(unix)]
+impl PullRecoveryCounts {
+    /// oci の回収結果から件数だけを写す（リースの和は飽和加算）。
+    pub fn from_recovery(r: &fandhe_container_oci::image_management::StalePullRecovery) -> Self {
+        Self {
+            reclaimed: r.reclaimed().len(),
+            released_leases: r
+                .released_leases()
+                .iter()
+                .fold(0usize, |acc, (_, n)| acc.saturating_add(*n)),
+            kept_live: r.kept_live().len(),
+            kept_undetermined: r.kept_undetermined().len(),
+            failed: r.failed().len(),
+            foreign_entries: r.foreign_entries(),
+        }
+    }
+
+    /// 構造化ログ 1 行（`event: image_pull_recovery`）。`failed` が 1 以上なら `warn`。
+    pub fn summary_line(&self) -> String {
+        format!(
+            "{{\"level\":\"{}\",\"event\":\"image_pull_recovery\",\"reclaimed\":{},\"released_leases\":{},\"kept_live\":{},\"kept_undetermined\":{},\"failed\":{},\"foreign_entries\":{}}}",
+            if self.failed > 0 { "warn" } else { "info" },
+            self.reclaimed,
+            self.released_leases,
+            self.kept_live,
+            self.kept_undetermined,
+            self.failed,
+            self.foreign_entries
+        )
+    }
+}
+
+/// 起動時の結果の構造化ログ 1 行（`event: image_pull_recovery`。#2819・REPAIR-4）。件数だけで、パス・ID は含めない。
+#[cfg(unix)]
+pub fn pull_recovery_summary_line(
+    r: &fandhe_container_oci::image_management::StalePullRecovery,
+) -> String {
+    PullRecoveryCounts::from_recovery(r).summary_line()
+}
+
+/// 起動時の pull 回収 GC の結末（#2819。`main.rs` の `serve` が分岐する）。
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupPullRecovery {
+    /// 回収を終えた（一部失敗は `failed` 件数に出る。起動は続ける）。
+    Completed(PullRecoveryCounts),
+    /// 開けない・排他を取れない等（エラーコード文字列）。起動しない。
+    Failed(&'static str),
+    /// 期限内に終わらなかった。起動しない。
+    TimedOut,
+    /// worker を作れなかった。起動しない。
+    SpawnFailed,
+}
+
+/// `images_root` の在庫を開いて `recover_stale_pulls` を 1 回呼び、`image_pull_recovery` を記録器へ計上する
+/// （OCI-7・OCI-1・REPAIR-4。#2819）。生存判定は `@pull.lock` の OS ロックで、生きている pull は回収しない。
+/// root は呼び出し側が状態ルート配下の固定位置を渡す（外部入力から受けない）。
+#[cfg(unix)]
+pub fn recover_stale_image_pulls_in(
+    images_root: &std::path::Path,
+    recorder: &OpRecorder,
+) -> Result<
+    fandhe_container_oci::image_management::StalePullRecovery,
+    fandhe_container_oci::error::OciError,
+> {
+    let started = Instant::now();
+    let r = fandhe_container_oci::image_management::ImageStore::open(images_root)
+        .and_then(|store| store.recover_stale_pulls());
+    if let Ok(name) = OpName::new("image_pull_recovery") {
+        let ok = matches!(&r, Ok(v) if v.failed().is_empty());
+        let outcome = if ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+    r
+}
+
+/// `f` を別スレッドで走らせ、`budget` 内の結果を待つ（REPAIR-5）。超えたら `TimedOut`（worker は取り残すため、
+/// 呼び出し側は起動を中止してプロセスを終える。ロックは終了時に OS が解放する）。
+#[cfg(unix)]
+pub fn run_startup_pull_recovery<F>(f: F, budget: Duration) -> StartupPullRecovery
+where
+    F: FnOnce() -> Result<
+            fandhe_container_oci::image_management::StalePullRecovery,
+            fandhe_container_oci::error::OciError,
+        > + Send
+        + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("pull-recovery".to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return StartupPullRecovery::SpawnFailed;
+    }
+    match rx.recv_timeout(budget) {
+        Ok(Ok(r)) => StartupPullRecovery::Completed(PullRecoveryCounts::from_recovery(&r)),
+        Ok(Err(e)) => StartupPullRecovery::Failed(e.code().as_str()),
+        Err(_) => StartupPullRecovery::TimedOut,
+    }
 }
 
 /// gRPC サーバーが 1 リクエストを待つ上限（REPAIR-5・#2592）。`GrpcServerConfig` の既定（10 秒）では `PullImage`
@@ -977,7 +1146,7 @@ pub fn bundle_provider_with(
     state_root: &std::path::Path,
     store: Option<Arc<dyn ImageStore>>,
 ) -> Result<Arc<dyn BundleProvider>, CriError> {
-    use fandhe_container_cri::bundle::{ImageExtractConfig, ImageRootfsSource, SpecBundleProvider};
+    use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
     let fail = || CriError::failed_precondition("failed to prepare the bundle store");
@@ -1004,8 +1173,7 @@ pub fn bundle_provider_with(
     let [bundles, _images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
-    let pull = production_pull_config(state_root)?;
-    let mut source = ImageRootfsSource::new(ImageExtractConfig::from_pull_config(&pull));
+    let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
     if let Some(store) = store {
         source = source.with_image_store(store);
     }
@@ -1044,6 +1212,16 @@ mod tests {
     use fandhe_container_cri::instrument::{CriOpKind, CriOpTimer};
 
     use super::*;
+
+    /// REPAIR-5・#2821: 本番の rootfs 展開設定は `PLUGIN_ROOTFS_DEADLINE`（600 秒）を明示して使う。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_production_extract_config_uses_plugin_rootfs_deadline() {
+        let dir = std::env::temp_dir().join(format!("fcpc-extract-cfg-{}", std::process::id()));
+        let cfg = production_extract_config(&dir).expect("config");
+        assert_eq!(cfg.deadline, PLUGIN_ROOTFS_DEADLINE);
+        assert_eq!(cfg.deadline, Duration::from_secs(600));
+    }
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).expect("valid id")
@@ -1430,5 +1608,59 @@ mod tests {
             names.insert(name);
         }
         assert_eq!(names.len(), 5);
+    }
+
+    /// REPAIR-5: 期限を超えたら待たずに `TimedOut`（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_startup_pull_recovery_times_out() {
+        let r = run_startup_pull_recovery(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(Default::default())
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, StartupPullRecovery::TimedOut);
+    }
+
+    /// OCI-7: 結果は `Completed` / `Failed(code)` に写る（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_startup_pull_recovery_maps_outcomes() {
+        let ok = run_startup_pull_recovery(|| Ok(Default::default()), Duration::from_secs(5));
+        assert_eq!(
+            ok,
+            StartupPullRecovery::Completed(PullRecoveryCounts::default())
+        );
+        let ng = run_startup_pull_recovery(
+            || {
+                Err(fandhe_container_oci::error::OciError::new(
+                    fandhe_container_oci::error::OciErrorCode::Timeout,
+                    "x",
+                ))
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(ng, StartupPullRecovery::Failed("TIMEOUT"));
+    }
+
+    /// REPAIR-4: `failed` が 1 以上なら warn、0 なら info（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_pull_recovery_summary_level_follows_failed() {
+        let warn = PullRecoveryCounts {
+            failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            warn.summary_line(),
+            "{\"level\":\"warn\",\"event\":\"image_pull_recovery\",\"reclaimed\":0,\"released_leases\":0,\"kept_live\":0,\"kept_undetermined\":0,\"failed\":1,\"foreign_entries\":0}"
+        );
+        assert!(
+            PullRecoveryCounts::default()
+                .summary_line()
+                .starts_with("{\"level\":\"info\"")
+        );
     }
 }

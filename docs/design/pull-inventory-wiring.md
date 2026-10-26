@@ -16,7 +16,8 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 
 1. `blobs/sha256` を 0700 で用意し（既存の祖先検証）、`ImageStore::open` → `begin_pull_generated`（`staging/<id>` と `@pull.lock`）
 2. blob ごとに、既存ならリース登録 → 信頼条件・digest の検査（合格で再利用、不合格はリース解放して取得）。無ければ
-   `staged_blob_path` へ取得し `verify_staged_blob`（サイズは宣言値と完全一致）
+   `open_staged_blob` の writer（検査済み root の fd 起点の `<hex>.part`）へ取得して `commit`、`verify_staged_blob`
+   （サイズは宣言値と完全一致。#2765）
 3. config を読み、layer を `staging/<id>/unpack/entry/rootfs` へ展開（diff_id 突合）
 4. rootfs のエントリを `rootfs/sha256/<config-hex>` へ rename（記録と一緒に原子的）
 5. `publish`（blob の公開・manifest とタグの登録・リース解放を排他の下で 1 回の保存）
@@ -57,4 +58,23 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 - CLI の `pull` サブコマンド（crate 境界の判断。起票の要否はオーナー確認）
 - `InMemoryImageStore` の置き換え（TASK-183）。plugin-cri の ImageService と本番の `PullConfig` は #2592 で配線済み
 - #2377（本番の `ImageRootfsUnpacker`）には、在庫に layer の mediaType・`diff_ids` が要る。`@image-inventory.json` のスキーマは広げていない
-- 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続、起動時の `recover_stale_pulls` の配線（#2315）
+- 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続（#2315・#471）
+
+## 起動時の pull 回収 GC の配線（#2819・OCI-7・OCI-1・REPAIR-3・REPAIR-4・REPAIR-5）
+
+plugin-cri の `serve`（`main.rs`）が、`image_service()` の成功後・RPC の受け付け前に、`ImageStore::open(<state_root>/.cri/images)` を
+開いて `recover_stale_pulls` を 1 回呼ぶ（`adapter::CriPluginBackends::recover_stale_image_pulls`）。root は状態ルート配下の固定位置で、
+外部入力から受けない。生存判定は `@pull.lock` の OS ロックで、生きている別プロセスの pull は回収しない（誤るのは「余分に残す」側だけ）。
+
+| 結果 | 扱い | 理由 |
+| --- | --- | --- |
+| `ImageStore::open` の失敗（root の所有者・権限の検査違反） | 起動しない | root を信頼できない状態で ImageService を広告しない（fail-closed） |
+| `recover_stale_pulls` の `Err`（排他の `Timeout` 等） | 起動しない | この状態では `PullImage` も失敗する |
+| 期限 `STARTUP_PULL_RECOVERY_BUDGET`（60 秒）超過・worker を作れない | 起動しない | 取り残した worker が `@lock` を握ったまま受け付けると `PullImage` が全て `Timeout` になる。プロセスの終了で OS がロックを解放する |
+| `Ok` で `failed` が 1 以上 | 警告ログを出して続行 | 余分に残す側で、次回の起動で再試行される |
+| `Ok` で `kept_live` / `kept_undetermined` | ログを出して続行 | 生存中・確認できないものは残す（OCI-7） |
+
+- ログ: 結果が全 0 でなければ `event: image_pull_recovery` を 1 行出す（件数だけ。パス・pull ID は含めない）。記録器には `image_pull_recovery` を計上する
+- 挙動の変化: root の検査がプロセスの起動の可否を左右する（RuntimeService も同じプロセスで巻き込まれる）
+- CLI（`--image-root`）は `recover_stale_pulls` を呼ばない。pull を持たず、短命の各コマンドに `@lock` の保持を足さないため。同じ root を使う plugin-cri の次回の起動で回収される
+- 残る範囲: plugin-cri を再起動しない限り、稼働中に別プロセスが残した残骸は残る（余分に残す側）。oci 内の計装（`OciOpRecorder`）の橋渡しは未配線

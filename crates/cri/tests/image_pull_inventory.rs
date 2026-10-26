@@ -13,6 +13,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use fandhe_container_cri::image_pull::{
 };
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::image_management::{
     ContainerRefId, ContainerRefRegistration, ImageStore,
 };
@@ -182,14 +184,15 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         descriptor: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         if self.fail_hex == Some(hex) {
             return Err(OciError::new(OciErrorCode::Unavailable, "injected failure"));
         }
-        fs::write(dest, blob_body(hex)).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(&blob_body(hex))
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 

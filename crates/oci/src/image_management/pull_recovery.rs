@@ -57,8 +57,8 @@
 //! `docs/design/pull-inventory-wiring.md`）。`@pull.lock` を持たない（#852 より前に作られた）空でないステージングは
 //! 回収されない。
 //!
-//! 未実装（REPAIR-3）: 起動時の呼び出しの配線と結果のログ出力は、cri・core と oci の両方に依存するアダプタの
-//! 担当（#2315）。ここでは新しい操作種別を増やさず、結果を構造化された戻り値で返す。
+//! 起動時の呼び出しは plugin-cri の `serve` が配線済み（`adapter::recover_stale_image_pulls_in`。#2819）。CLI は呼ばない
+//! （同じ root を使う plugin-cri の次回の起動で回収される）。結果は構造化された戻り値で返し、新しい操作種別は増やさない。
 
 use std::ffi::OsStr;
 use std::fs::{File, TryLockError};
@@ -480,9 +480,8 @@ mod tests {
         let dir = {
             let mut s = store.begin_pull(pid("p1")).unwrap();
             let _t = s.lease_existing_blob(&dg).unwrap();
-            let staged =
-                s.staged_blob_path(&Digest::parse(&format!("sha256:{}", sha_hex(3))).unwrap());
-            fs::write(staged.unwrap(), b"partial").unwrap();
+            let staged = s.staging_dir().join(sha_hex(3));
+            fs::write(staged, b"partial").unwrap();
             s.staging_dir().to_path_buf()
         };
         assert!(dir.exists());

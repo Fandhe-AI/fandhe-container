@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use fandhe_container_cri::runtime::v1::{
 };
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
 use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractOptions, SpecialBitsPolicy};
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
@@ -209,14 +211,15 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         d: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         let hex = d.digest.as_str().trim_start_matches("sha256:");
         let body = self
             .blobs
             .get(hex)
             .ok_or_else(|| OciError::new(OciErrorCode::NotFound, "blob"))?;
-        fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(body)
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 
@@ -747,6 +750,11 @@ fn oci1_extract_limits_are_enforced_and_leave_no_bundle() {
     let p = env.provider_with(ImageRootfsSource::new(cfg));
     let e = prepare(&p, "c3", &container(&env.image_id)).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Timeout);
+    // blob の検証前に期限を確かめ、固定文言で返す（REPAIR-5・ERR-1・#2821）。
+    assert_eq!(
+        e.message(),
+        "image rootfs preparation exceeded its deadline"
+    );
     assert_eq!(bundle_count(&env), 0);
     // 上限内なら成功する（上の失敗が環境起因でないことの対）。
     let dir = prepare(&env.provider(), "c4", &container(&env.image_id)).expect("ok");

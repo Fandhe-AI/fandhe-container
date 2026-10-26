@@ -69,8 +69,9 @@ fn oci7_image_appears_only_after_publish() {
     let cfg = sha_of(b"config");
     let layer = sha_of(b"layer");
     for (d, data) in [(&cfg, &b"config"[..]), (&layer, &b"layer"[..])] {
-        let path = s.staged_blob_path(d).expect("path");
-        fs::write(&path, data).expect("write");
+        let mut w = s.open_staged_blob(d).expect("writer");
+        std::io::Write::write_all(&mut w, data).expect("write");
+        w.commit().expect("commit");
         s.verify_staged_blob(d, 1024).expect("verify");
     }
     let staged = s.staging_dir().to_path_buf();
@@ -107,8 +108,9 @@ fn oci7_failed_publish_rolls_back_lease_and_staging() {
         panic!("expected Leased");
     };
     let cfg = sha_of(b"config");
-    let path = s.staged_blob_path(&cfg).expect("path");
-    fs::write(&path, b"config").expect("write");
+    let mut w = s.open_staged_blob(&cfg).expect("writer");
+    std::io::Write::write_all(&mut w, b"config").expect("write");
+    w.commit().expect("commit");
     s.verify_staged_blob(&cfg, 1024).expect("verify");
     let staged = s.staging_dir().to_path_buf();
     // 宛先をディレクトリにして移動を失敗させる。

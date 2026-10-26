@@ -310,21 +310,28 @@ const CONTAINER_LOG_ROTATING_MESSAGE: &str = "container log is rotating; retry";
 const CONTAINER_LOG_LIMIT_MESSAGE: &str = "container log exceeds the read limit";
 const CONTAINER_LOG_OUTRAN_MESSAGE: &str = "container log rotated faster than it could be followed";
 
-/// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
-/// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。
+/// [`CliExit::failed`] の固定文言表（`ErrorCode::ALL` と同数。`Internal` も明示。試験が網羅と
+/// 重複なしを照合する。REPAIR-1・ERR-1）。引用符・バックスラッシュ・制御文字を含まない定数のみ。
+const FAILURE_MESSAGES: [(ErrorCode, &str); 10] = [
+    (ErrorCode::InvalidArgument, "invalid argument"),
+    (ErrorCode::NotFound, "container not found"),
+    (ErrorCode::AlreadyExists, "already exists"),
+    (ErrorCode::FailedPrecondition, "failed precondition"),
+    (ErrorCode::Unimplemented, "not implemented on this platform"),
+    (ErrorCode::Internal, "operation failed"),
+    (ErrorCode::PermissionDenied, "permission denied"),
+    (ErrorCode::Timeout, "operation timed out"),
+    (ErrorCode::Unavailable, "unavailable"),
+    (ErrorCode::ResourceExhausted, "resource exhausted"),
+];
+
+/// [`CliExit::failed`] の固定文言を表から引く。`ErrorCode` は `#[non_exhaustive]` のため、
+/// 表に無い将来の code は汎用文言（`Internal` と同じ）に落とす。
 fn failure_message(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "invalid argument",
-        ErrorCode::NotFound => "container not found",
-        ErrorCode::AlreadyExists => "already exists",
-        ErrorCode::FailedPrecondition => "failed precondition",
-        ErrorCode::Unimplemented => "not implemented on this platform",
-        ErrorCode::PermissionDenied => "permission denied",
-        ErrorCode::Timeout => "operation timed out",
-        ErrorCode::Unavailable => "unavailable",
-        ErrorCode::ResourceExhausted => "resource exhausted",
-        _ => "operation failed",
-    }
+    FAILURE_MESSAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or("operation failed", |(_, m)| m)
 }
 
 fn usage() -> CliExit {
@@ -615,8 +622,11 @@ mod tests {
             (ErrorCode::ResourceExhausted, 10),
         ];
         assert_eq!(codes.len(), ErrorCode::ALL.len());
+        assert_eq!(FAILURE_MESSAGES.len(), ErrorCode::ALL.len());
         for c in ErrorCode::ALL {
             assert!(codes.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+            let hits = FAILURE_MESSAGES.iter().filter(|(k, _)| *k == c).count();
+            assert_eq!(hits, 1, "{}", c.as_str());
         }
         for (code, exit) in codes {
             let m = failure_message(code);

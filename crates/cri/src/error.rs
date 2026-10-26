@@ -79,6 +79,28 @@ impl CriErrorCode {
     pub fn as_str(self) -> &'static str {
         code_name(self.grpc_code())
     }
+
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験が検出する。
+    pub const ALL: [CriErrorCode; 11] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::FailedPrecondition,
+        Self::Unimplemented,
+        Self::DataLoss,
+        Self::Timeout,
+        Self::Unavailable,
+        Self::PermissionDenied,
+        Self::ResourceExhausted,
+        Self::Internal,
+    ];
+
+    /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None`（呼び出し側は fail-closed で扱う）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 /// CRI の失敗（区分とメッセージ）。`tonic::Status` へは [`From`] で変換する。
@@ -172,21 +194,35 @@ impl From<CriError> for Status {
     }
 }
 
-/// core の `ContainerRuntime` のエラーを写す。未知の区分（`#[non_exhaustive]`）は fail-closed で `Internal`。
+/// core の `ErrorCode` から `CriErrorCode` への表（`ErrorCode::ALL` と同数。`Internal` も明示。
+/// 試験が網羅と重複なしを照合する。REPAIR-1・ERR-3）。
+const TRAIT_ERROR_TABLE: [(ErrorCode, CriErrorCode); 10] = [
+    (ErrorCode::InvalidArgument, CriErrorCode::InvalidArgument),
+    (ErrorCode::NotFound, CriErrorCode::NotFound),
+    (ErrorCode::AlreadyExists, CriErrorCode::AlreadyExists),
+    (
+        ErrorCode::FailedPrecondition,
+        CriErrorCode::FailedPrecondition,
+    ),
+    (ErrorCode::Unimplemented, CriErrorCode::Unimplemented),
+    (ErrorCode::Internal, CriErrorCode::Internal),
+    (ErrorCode::PermissionDenied, CriErrorCode::PermissionDenied),
+    (ErrorCode::Timeout, CriErrorCode::Timeout),
+    (ErrorCode::Unavailable, CriErrorCode::Unavailable),
+    (
+        ErrorCode::ResourceExhausted,
+        CriErrorCode::ResourceExhausted,
+    ),
+];
+
+/// core の `ContainerRuntime` のエラーを写す。表に無い区分（`#[non_exhaustive]` の将来の variant）は
+/// fail-closed で `Internal`。
 impl From<&TraitError> for CriError {
     fn from(err: &TraitError) -> Self {
-        let code = match err.code() {
-            ErrorCode::InvalidArgument => CriErrorCode::InvalidArgument,
-            ErrorCode::NotFound => CriErrorCode::NotFound,
-            ErrorCode::AlreadyExists => CriErrorCode::AlreadyExists,
-            ErrorCode::FailedPrecondition => CriErrorCode::FailedPrecondition,
-            ErrorCode::Unimplemented => CriErrorCode::Unimplemented,
-            ErrorCode::PermissionDenied => CriErrorCode::PermissionDenied,
-            ErrorCode::Timeout => CriErrorCode::Timeout,
-            ErrorCode::Unavailable => CriErrorCode::Unavailable,
-            ErrorCode::ResourceExhausted => CriErrorCode::ResourceExhausted,
-            _ => CriErrorCode::Internal,
-        };
+        let code = TRAIT_ERROR_TABLE
+            .iter()
+            .find(|(c, _)| *c == err.code())
+            .map_or(CriErrorCode::Internal, |(_, cri)| *cri);
         Self::new(code, err.message())
     }
 }
@@ -224,6 +260,68 @@ impl From<PullError> for CriError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: CriErrorCode) -> usize {
+        match code {
+            CriErrorCode::InvalidArgument => 0,
+            CriErrorCode::NotFound => 1,
+            CriErrorCode::AlreadyExists => 2,
+            CriErrorCode::FailedPrecondition => 3,
+            CriErrorCode::Unimplemented => 4,
+            CriErrorCode::DataLoss => 5,
+            CriErrorCode::Timeout => 6,
+            CriErrorCode::Unavailable => 7,
+            CriErrorCode::PermissionDenied => 8,
+            CriErrorCode::ResourceExhausted => 9,
+            CriErrorCode::Internal => 10,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err3_cri_error_code_all_covers_every_variant() {
+        for (i, c) in CriErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(CriErrorCode::ALL.len(), 11);
+        let set: std::collections::HashSet<_> = CriErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 11);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err3_cri_error_code_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (CriErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (CriErrorCode::NotFound, "NOT_FOUND"),
+            (CriErrorCode::AlreadyExists, "ALREADY_EXISTS"),
+            (CriErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (CriErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (CriErrorCode::DataLoss, "DATA_LOSS"),
+            (CriErrorCode::Timeout, "DEADLINE_EXCEEDED"),
+            (CriErrorCode::Unavailable, "UNAVAILABLE"),
+            (CriErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (CriErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (CriErrorCode::Internal, "INTERNAL"),
+        ];
+        assert_eq!(table.len(), CriErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(CriErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(CriErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(CriErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
     use crate::adapter::trait_error_to_status;
 
     fn code_of(e: CriError) -> Code {
@@ -376,6 +474,7 @@ mod tests {
             (OciErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (OciErrorCode::FailedPrecondition, Code::FailedPrecondition),
             (OciErrorCode::AlreadyExists, Code::Internal),
+            (OciErrorCode::Internal, Code::Internal),
         ];
         for (oc, expected) in cases {
             let pe = PullError::new(oc, "msg");
@@ -383,6 +482,55 @@ mod tests {
             assert_eq!(st.code(), expected);
             assert_eq!(st.message(), "msg");
             assert_eq!(st.code(), Status::from(pe).code());
+        }
+    }
+
+    /// REPAIR-1・ERR-3: core の `ErrorCode::ALL` の全件が表にあり、同名の区分へ写る
+    /// （名前が食い違うのは `Timeout` の gRPC 名だけ）。core の像に入らない区分は `DataLoss` だけ。
+    #[test]
+    fn err3_trait_error_table_covers_all() {
+        assert_eq!(TRAIT_ERROR_TABLE.len(), ErrorCode::ALL.len());
+        let mut image = Vec::new();
+        for (i, code) in ErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(TRAIT_ERROR_TABLE[i].0, code);
+            let cri = CriError::from(&TraitError::new(code, "m")).code();
+            assert_eq!(cri, TRAIT_ERROR_TABLE[i].1);
+            if code == ErrorCode::Timeout {
+                assert_eq!(
+                    (code.as_str(), cri.as_str()),
+                    ("TIMEOUT", "DEADLINE_EXCEEDED")
+                );
+            } else {
+                assert_eq!(cri.as_str(), code.as_str());
+            }
+            image.push(cri);
+        }
+        let outside: Vec<_> = CriErrorCode::ALL
+            .into_iter()
+            .filter(|c| !image.contains(c))
+            .collect();
+        assert_eq!(outside, [CriErrorCode::DataLoss]);
+    }
+
+    /// REPAIR-1・ERR-3: `OciErrorCode::ALL` の全件が写り、`AlreadyExists` と `Internal` だけが
+    /// `Internal`（#2321）。それ以外は同名の gRPC 区分。
+    #[test]
+    fn err3_pull_error_mapping_covers_all_oci_codes() {
+        for oc in OciErrorCode::ALL {
+            let cri = CriError::from(PullError::new(oc, "m")).code();
+            match oc {
+                OciErrorCode::AlreadyExists | OciErrorCode::Internal => {
+                    assert_eq!(cri, CriErrorCode::Internal, "{oc:?}")
+                }
+                _ => {
+                    let expected = if oc == OciErrorCode::Timeout {
+                        "DEADLINE_EXCEEDED"
+                    } else {
+                        oc.as_str()
+                    };
+                    assert_eq!(cri.as_str(), expected, "{oc:?}");
+                }
+            }
         }
     }
 }

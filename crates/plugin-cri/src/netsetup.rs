@@ -1951,6 +1951,32 @@ mod linux {
 mod tests {
     use super::*;
 
+    /// REPAIR-1・ERR-1: `NetErrorCode::ALL` の全件を照合する。net にだけある名前は `DATA_LOSS`
+    /// （`Internal` に写り message の先頭へ残る）、core にだけある名前は `UNAVAILABLE`。
+    #[test]
+    fn err1_net_error_to_trait_covers_all_net_codes() {
+        for nc in NetErrorCode::ALL {
+            let t = net_error_to_trait(&NetError::new(nc, "m"));
+            match ErrorCode::from_name(nc.as_str()) {
+                Some(ec) => {
+                    assert_eq!(t.code(), ec, "{nc:?}");
+                    assert_eq!(t.message(), "m");
+                }
+                None => {
+                    assert_eq!(nc, NetErrorCode::DataLoss);
+                    assert_eq!(t.code(), ErrorCode::Internal);
+                    assert_eq!(t.message(), "DATA_LOSS: m");
+                }
+            }
+        }
+        let core_only: Vec<&str> = ErrorCode::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .filter(|n| !NetErrorCode::ALL.iter().any(|nc| nc.as_str() == *n))
+            .collect();
+        assert_eq!(core_only, ["UNAVAILABLE"]);
+    }
+
     fn cidr(a: [u8; 4], len: u8) -> IpCidr {
         IpCidr::new(IpAddr::V4(Ipv4Addr::from(a)), len).expect("cidr")
     }

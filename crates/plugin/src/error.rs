@@ -17,7 +17,7 @@ pub const PLUGIN_ERROR_MESSAGE_MAX_BYTES: usize = 4096;
 
 /// `PluginError` の機械可読な分類（ERR-1）。
 ///
-/// 文字列表現は、core の `ErrorCode::as_str` と共通する 9 コードでは同一（変換を無損失にする契約）。
+/// 文字列表現は、core の `ErrorCode::as_str` と共通するコード（`DATA_LOSS` 以外の全件）では同一（変換を無損失にする契約）。
 /// `DataLoss`（`DATA_LOSS`）はフレーム層固有で core 側には無く、`TraitError` への写像は
 /// core 側 proxy 実装（#1869 の設計）の責務とする。
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
@@ -51,6 +51,23 @@ pub enum PluginErrorCode {
 }
 
 impl PluginErrorCode {
+    /// 全 variant の一覧（宣言順）。`from_code_str` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら `plug2_error_code_all_covers_every_variant` が検出する。
+    pub const ALL: [PluginErrorCode; 11] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::FailedPrecondition,
+        Self::Unimplemented,
+        Self::Internal,
+        Self::PermissionDenied,
+        Self::Timeout,
+        Self::Unavailable,
+        Self::DataLoss,
+        Self::ResourceExhausted,
+    ];
+
     /// 機械可読な `code` 文字列を返す（ERR-1）。
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -74,20 +91,7 @@ impl PluginErrorCode {
     ///
     /// `message` モジュールが相手 plugin 由来のエラー code を復号する際に使う（PLUG-2・ERR-1）。
     pub fn from_code_str(s: &str) -> Option<Self> {
-        Some(match s {
-            "INVALID_ARGUMENT" => Self::InvalidArgument,
-            "NOT_FOUND" => Self::NotFound,
-            "ALREADY_EXISTS" => Self::AlreadyExists,
-            "FAILED_PRECONDITION" => Self::FailedPrecondition,
-            "UNIMPLEMENTED" => Self::Unimplemented,
-            "INTERNAL" => Self::Internal,
-            "PERMISSION_DENIED" => Self::PermissionDenied,
-            "TIMEOUT" => Self::Timeout,
-            "UNAVAILABLE" => Self::Unavailable,
-            "DATA_LOSS" => Self::DataLoss,
-            "RESOURCE_EXHAUSTED" => Self::ResourceExhausted,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
 }
 
@@ -169,27 +173,42 @@ mod tests {
         }
     }
 
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: PluginErrorCode) -> usize {
+        match code {
+            PluginErrorCode::InvalidArgument => 0,
+            PluginErrorCode::NotFound => 1,
+            PluginErrorCode::AlreadyExists => 2,
+            PluginErrorCode::FailedPrecondition => 3,
+            PluginErrorCode::Unimplemented => 4,
+            PluginErrorCode::Internal => 5,
+            PluginErrorCode::PermissionDenied => 6,
+            PluginErrorCode::Timeout => 7,
+            PluginErrorCode::Unavailable => 8,
+            PluginErrorCode::DataLoss => 9,
+            PluginErrorCode::ResourceExhausted => 10,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn plug2_error_code_all_covers_every_variant() {
+        for (i, c) in PluginErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(PluginErrorCode::ALL.len(), 11);
+        let set: std::collections::HashSet<_> = PluginErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 11);
+    }
+
     #[test]
     fn plug2_error_code_from_code_str_roundtrips_all_variants() {
-        let all = [
-            PluginErrorCode::InvalidArgument,
-            PluginErrorCode::NotFound,
-            PluginErrorCode::AlreadyExists,
-            PluginErrorCode::FailedPrecondition,
-            PluginErrorCode::Unimplemented,
-            PluginErrorCode::Internal,
-            PluginErrorCode::PermissionDenied,
-            PluginErrorCode::Timeout,
-            PluginErrorCode::Unavailable,
-            PluginErrorCode::DataLoss,
-            PluginErrorCode::ResourceExhausted,
-        ];
-        for code in all {
+        for code in PluginErrorCode::ALL {
             assert_eq!(PluginErrorCode::from_code_str(code.as_str()), Some(code));
         }
-        assert_eq!(PluginErrorCode::from_code_str("NOPE"), None);
-        assert_eq!(PluginErrorCode::from_code_str("not_found"), None);
-        assert_eq!(PluginErrorCode::from_code_str(""), None);
+        for bad in ["NOPE", "not_found", "", " NOT_FOUND", "NOT_FOUND\n"] {
+            assert_eq!(PluginErrorCode::from_code_str(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

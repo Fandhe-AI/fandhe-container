@@ -52,13 +52,16 @@
 //!   （rootful の可否）・#2315・#482（core の user namespace 配線）が前提で（pull の呼び出し元の配線は #2592 で済み）、
 //!   それまで据え置く（#2534・SEC-5。`docs/design/oci-layer-special-bits.md`）。pull と create の設定は
 //!   [`ImageExtractConfig`] で 1 か所にまとめる
-//! - 展開中の処理は打ち切れない。期限は展開の前後で確認し、展開中の所要時間は展開の上限で有界にする
-//!   （REPAIR-5。pull と同じ方針。#2534）
+//! - 展開は `extract_image_layers_bounded` でエントリ単位に期限（この `prepare` の開始からの `deadline`）と取り消しの
+//!   旗（`prepare_cancellable`）を確かめ、超過・取り消しは `Timeout`（`DEADLINE_EXCEEDED`）で止めて rootfs を消す
+//!   （REPAIR-5・#2899）。分割できない区間は blob 1 本の sha256 検証・1 エントリの書き込み・失敗時の削除で、いずれも
+//!   展開の上限で有界。`Timeout` は dispatch より前（bundle 用意）でしか起きないため、確定失敗の分類に入れない
 //! - 展開済み rootfs・blob の GC は TASK-183（OCI-7）の担当
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_oci::config::{
@@ -67,7 +70,7 @@ use fandhe_container_oci::config::{
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
-    ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_with_options,
+    ExtractBudget, ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_bounded,
     remove_extracted_tree,
 };
 use fandhe_container_oci::layer::{
@@ -250,7 +253,14 @@ impl ImageRootfsSource {
     }
 
     fn check_deadline(&self, started: Instant) -> Result<(), CriError> {
-        if started.elapsed() >= self.config.deadline {
+        self.check_budget(started, None)
+    }
+
+    /// 期限に加えて取り消しの旗も確かめる（RPC が期限切れで worker を手放したとき。REPAIR-5・#2899）。
+    fn check_budget(&self, started: Instant, cancel: Option<&AtomicBool>) -> Result<(), CriError> {
+        if started.elapsed() >= self.config.deadline
+            || cancel.is_some_and(|c| c.load(Ordering::Acquire))
+        {
             return Err(CriError::timeout(
                 "image rootfs preparation exceeded its deadline",
             ));
@@ -716,6 +726,16 @@ impl RootfsSource for ImageRootfsSource {
         rootfs: &Path,
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError> {
+        self.prepare_cancellable(image, rootfs, user, None)
+    }
+
+    fn prepare_cancellable(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ImageDefaults, CriError> {
         let started = Instant::now();
         let resolved = self.resolve_image(image)?;
         let id = Digest::parse(resolved.id_str())
@@ -747,7 +767,7 @@ impl RootfsSource for ImageRootfsSource {
         let mut verified = Vec::with_capacity(layers.len());
         for l in &layers {
             // blob の sha256 検証は大きさに比例して長いため、1 本ごとに期限を確かめる（REPAIR-5・#2821）。
-            self.check_deadline(started)?;
+            self.check_budget(started, cancel)?;
             let path = blobs.path.join(digest_hex(&l.digest));
             let size = open_blob_nofollow(&path)
                 .and_then(|f| {
@@ -776,19 +796,35 @@ impl RootfsSource for ImageRootfsSource {
             .zip(&diff_ids)
             .map(|((b, l), d)| ImageLayer::new(b, &l.media_type, d))
             .collect();
-        self.check_deadline(started)?;
+        self.check_budget(started, cancel)?;
         // 呼び出し元（SpecBundleProvider）が渡す不在のパスを 0700 で作る。作れなければ他人の実体の可能性があり消さない。
         create_private_dir(rootfs).map_err(CriError::from)?;
-        let extracted = extract_image_layers_with_options(
+        // 展開はエントリ単位で期限（この prepare の開始からの deadline）と取り消しを確かめる。1 エントリの書き込みは分割しない。
+        let mut budget = ExtractBudget::new();
+        if let Some(d) = started.checked_add(self.config.deadline) {
+            budget = budget.with_deadline(d);
+        }
+        if let Some(c) = cancel {
+            budget = budget.with_cancel(c);
+        }
+        let extracted = extract_image_layers_bounded(
             self.recorder.as_ref(),
             &image_layers,
             rootfs,
             self.config.max_uncompressed_layer_bytes,
             self.config.extract_limits,
             opts,
+            &budget,
         )
-        .map_err(|e| CriError::from(PullError::from_extract(&e)))
-        .and_then(|_| self.check_deadline(started))
+        .map_err(|e| {
+            // CreateContainer から見える期限切れの文言を 1 つにそろえる（check_budget と同じ）。
+            if e.code() == OciErrorCode::Timeout {
+                CriError::timeout("image rootfs preparation exceeded its deadline")
+            } else {
+                CriError::from(PullError::from_extract(&e))
+            }
+        })
+        .and_then(|_| self.check_budget(started, cancel))
         .and_then(|()| open_rootfs_for_search(rootfs))
         .and_then(|()| ensure_mountpoints(rootfs))
         .and_then(|()| {

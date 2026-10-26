@@ -206,6 +206,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use tar::{Archive, EntryType};
 
@@ -391,6 +393,75 @@ pub enum OwnershipPolicy {
         /// gid の写像。
         gid: IdMap,
     },
+}
+
+/// 展開の期限と取り消し（REPAIR-5・CRI-2・#2899）。
+///
+/// cri の `ImageRootfsSource::prepare`（CreateContainer の rootfs 用意）が `extract_image_layers_bounded` /
+/// `extract_layers_bounded` へ渡す。展開の結果を決める設定ではないため `ExtractOptions`（展開記録の `settings` に
+/// 直列化して pull と create の間で照合する）には入れない。既定（`new()`）は期限も取り消しも無く、従来の入口と同じ。
+///
+/// 確認はレイヤーの前・パス 1 のエントリごと・パス 2 のマーカーごと・パス 3 のエントリごと（書き込みの前）・
+/// 遅延ディレクトリ mode の適用の前に行い、期限超過か取り消しなら `OciErrorCode::Timeout` で止まる。分割できない区間は
+/// 1 エントリの本体の書き込み（最大 `max_total_bytes`）と 1 本の tar の終端後の読み捨て（入力上限で有界）。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ExtractBudget<'a> {
+    /// この時刻以降は `Timeout`（`None` は期限なし）。
+    deadline: Option<Instant>,
+    /// 立ったら `Timeout`（RPC の期限切れで worker を手放したとき等。`None` は取り消しなし）。
+    cancel: Option<&'a AtomicBool>,
+    /// 現在時刻の取得口（試験だけが差し替える）。
+    now: fn() -> Instant,
+}
+
+impl Default for ExtractBudget<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> ExtractBudget<'a> {
+    /// 期限も取り消しも無い予算（従来の入口と同じ）。
+    pub fn new() -> Self {
+        Self {
+            deadline: None,
+            cancel: None,
+            now: Instant::now,
+        }
+    }
+
+    /// 期限（絶対時刻）を足す。
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// 取り消しの旗を足す。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 期限超過か取り消しなら `Timeout`。メッセージにエントリ名・パスは含めない（ERR-3）。
+    fn check(&self) -> Result<(), OciError> {
+        if let Some(c) = self.cancel
+            && c.load(AtomicOrdering::Acquire)
+        {
+            return Err(err(OciErrorCode::Timeout, "layer extraction was cancelled"));
+        }
+        if let Some(d) = self.deadline
+            && (self.now)() >= d
+        {
+            return Err(err(
+                OciErrorCode::Timeout,
+                "layer extraction exceeded its deadline",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// 展開の選択肢（所有者・特殊ビット）。将来の項目追加に備え `non_exhaustive`。
@@ -617,6 +688,27 @@ pub fn extract_layers_with_options<R: Read + Seek>(
     )
 }
 
+/// `extract_layers_with_options` に期限と取り消しの `budget` を足した版（REPAIR-5・#2899）。契約は
+/// `extract_image_layers_bounded` と同じ（`Err` のとき `root` は呼び出し側が破棄する）。
+pub fn extract_layers_bounded<R: Read + Seek>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_stack_bounded(
+        recorder,
+        layers.into_iter().map(Rewind::new),
+        root,
+        limits,
+        host_lstat,
+        SpecialSetup::from_options(options),
+        *budget,
+    )
+}
+
 /// 1 レイヤー分の tar バイトストリームを、走査のたびに先頭から開き直す入力。
 ///
 /// `extract_one_layer` がパス 1（収集・検証）とパス 3（展開）の前に 1 回ずつ `open` を呼ぶ。
@@ -831,7 +923,33 @@ pub fn extract_image_layers_with_options(
     limits: ExtractLimits,
     options: &ExtractOptions,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_bounded(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        options,
+        &ExtractBudget::new(),
+    )
+}
+
+/// `extract_image_layers_with_options` に期限と取り消しの `budget` を足した版（REPAIR-5・CRI-2・#2899）。
+///
+/// 空の `budget` なら既存の入口と同一。`budget` はエントリ単位で確かめ、超過・取り消しなら `OciErrorCode::Timeout`。
+/// `Err` のときは先行の展開物が `root` に残りうるため、呼び出し側が `root` ごと破棄すること
+/// （cri の `ImageRootfsSource::prepare` は `remove_extracted_tree` で消す）。
+pub fn extract_image_layers_bounded(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     let setup = SpecialSetup::from_options(options);
+    budget.check()?;
     // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
     // `extract_stack` は空入力を拒否するため、ここで選択肢の組み合わせと root の前提だけ確かめて空の結果を返す。
     if layers.is_empty() {
@@ -848,7 +966,7 @@ pub fn extract_image_layers_with_options(
             })
         })
         .collect::<Result<Vec<_>, OciError>>()?;
-    extract_stack(recorder, sources, root, limits, host_lstat, setup)
+    extract_stack_bounded(recorder, sources, root, limits, host_lstat, setup, *budget)
 }
 
 /// レイヤー 0 のイメージの展開（選択肢と root の前提を確かめ、`ChownMapped` なら root だけ写像先へ `chown` する）。
@@ -1146,6 +1264,8 @@ struct Extractor<'a> {
     /// `ExtractLimits::max_tracked_paths` を超えない。パス 3 の前後で空にする。
     layer_nodes: HashSet<u64>,
     lstat: Lstat,
+    /// 期限と取り消し（既定は無制限）。
+    budget: ExtractBudget<'a>,
 }
 
 pub(crate) fn err(code: OciErrorCode, msg: &'static str) -> OciError {
@@ -2608,6 +2728,7 @@ impl Extractor<'_> {
     fn apply_markers(&mut self, markers: &[Marker]) -> Result<(), OciError> {
         let mut plan = Vec::new();
         for m in markers {
+            self.budget.check()?;
             match m {
                 Marker::Whiteout { parent, target } => {
                     let Some(dir) = self.resolve_marker_parent(parent)? else {
@@ -2634,6 +2755,7 @@ impl Extractor<'_> {
             }
         }
         for r in plan {
+            self.budget.check()?;
             match r {
                 Removal::Tree {
                     parent_comps,
@@ -2939,6 +3061,7 @@ fn collect_markers<R: Read>(
                     "layer exceeds the entry count limit",
                 ));
             }
+            x.budget.check()?;
             if entry.header().entry_type() == EntryType::XGlobalHeader {
                 if x.own.is_some() {
                     global_owner.absorb(&mut entry)?;
@@ -3027,6 +3150,8 @@ fn extract_one_layer<S: LayerSource>(
                     "layer exceeds the entry count limit",
                 ));
             }
+            // 書き込みの前に期限・取り消しを確かめる（REPAIR-5・#2899）。
+            x.budget.check()?;
             if ty == EntryType::XGlobalHeader {
                 global_owner.absorb(&mut entry)?;
                 continue;
@@ -3118,6 +3243,27 @@ fn extract_stack<S: LayerSource>(
     lstat: Lstat,
     setup: SpecialSetup,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_stack_bounded(
+        recorder,
+        layers,
+        root,
+        limits,
+        lstat,
+        setup,
+        ExtractBudget::new(),
+    )
+}
+
+/// `extract_stack` の期限つき版。`stop` は各レイヤーの前に確かめ、`Extractor` に持たせて内側の走査でも確かめる。
+fn extract_stack_bounded<'a, S: LayerSource>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = S>,
+    root: &'a Path,
+    limits: ExtractLimits,
+    lstat: Lstat,
+    setup: SpecialSetup,
+    stop: ExtractBudget<'a>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     let mut x: Option<Extractor<'_>> = None;
     let mut input_used = 0u64;
     let mut out = Vec::new();
@@ -3132,6 +3278,7 @@ fn extract_stack<S: LayerSource>(
         }
         let is_last = layers.peek().is_none();
         let res = record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+            stop.check()?;
             if x.is_none() {
                 // 選択肢の不正な組み合わせ・非 Linux の `chown` は、`root` に触れる前に拒否する。
                 let own = setup.owner_ctx()?;
@@ -3157,6 +3304,7 @@ fn extract_stack<S: LayerSource>(
                     names: NameIndex::new(limits.max_tracked_paths),
                     layer_nodes: HashSet::new(),
                     lstat,
+                    budget: stop,
                 });
             }
             let Some(ex) = x.as_mut() else {
@@ -3169,6 +3317,7 @@ fn extract_stack<S: LayerSource>(
             let mut layer = layer;
             if is_last {
                 let chowned0 = ex.chowned;
+                stop.check()?;
                 ex.finish_dirs()?;
                 // `chown_root` は `root` の所有者を正当に変えるため、その前に確かめる。
                 ex.verify_root_after_special_bits()?;
@@ -5603,6 +5752,7 @@ mod tests {
             names: NameIndex::new(limits.max_tracked_paths),
             layer_nodes: HashSet::new(),
             lstat,
+            budget: ExtractBudget::new(),
         }
     }
 
@@ -7866,5 +8016,104 @@ mod tests {
             assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
             assert_eq!(e.message(), "an extraction path changed during extraction");
         }
+    }
+
+    // ---- 期限と取り消し（REPAIR-5・CRI-2・#2899） ----
+
+    thread_local! {
+        static CLOCK_BASE: Instant = Instant::now();
+        static CLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 呼ぶたびに 1 秒進む試験用の時計（`ExtractBudget::now` へ注入する）。
+    fn tick_clock() -> Instant {
+        let n = CLOCK_CALLS.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(n)
+    }
+
+    fn bounded(
+        sb: &Sandbox,
+        entries: &[Vec<u8>],
+        budget: &ExtractBudget<'_>,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        extract_layers_bounded(
+            &NoopOciOpRecorder,
+            [Cursor::new(archive(entries))],
+            &sb.root,
+            LIM(),
+            &ExtractOptions::new(),
+            budget,
+        )
+    }
+
+    /// REPAIR-5: 期限がすでに過ぎていれば、最初のエントリより前に止まり rootfs を変えない。
+    #[test]
+    fn repair5_extract_deadline_elapsed_before_first_entry() {
+        let sb = Sandbox::new();
+        let budget = ExtractBudget::new().with_deadline(Instant::now());
+        let e = bounded(&sb, &[file("a", 0o644, b"A")], &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction exceeded its deadline");
+        assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+        sb.assert_outside_untouched();
+    }
+
+    /// REPAIR-5: 期限はパス 3 のエントリごとに確かめる。3 件目の書き込みの前で止まり、先の 2 件は残る
+    /// （契約: 呼び出し側が root ごと破棄する）。`remove_extracted_tree` で消えることも確かめる。
+    #[test]
+    fn repair5_extract_deadline_checked_per_entry() {
+        let sb = Sandbox::new();
+        CLOCK_CALLS.with(|c| c.set(0));
+        // 呼び出し 0 = レイヤー前、1..=5 = パス 1 の 5 エントリ、6.. = パス 3。8 回目の呼び出し（3 件目）で期限。
+        let mut budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(8));
+        budget.now = tick_clock;
+        let entries = [
+            file("a", 0o644, b"A"),
+            file("b", 0o644, b"B"),
+            file("c", 0o644, b"C"),
+            file("d", 0o644, b"D"),
+            file("e", 0o644, b"E"),
+        ];
+        let e = bounded(&sb, &entries, &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction exceeded its deadline");
+        let mut names: Vec<_> = fs::read_dir(&sb.root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        remove_extracted_tree(&sb.root).unwrap();
+        assert!(!sb.root.exists());
+    }
+
+    /// REPAIR-5: 取り消しの旗が立っていれば最初の確認で止まる。
+    #[test]
+    fn repair5_extract_cancel_flag_stops_at_first_check() {
+        let sb = Sandbox::new();
+        let flag = AtomicBool::new(true);
+        let budget = ExtractBudget::new().with_cancel(&flag);
+        let e = bounded(&sb, &[file("a", 0o644, b"A")], &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction was cancelled");
+        assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+    }
+
+    /// REPAIR-5: 空の予算は従来の入口と同じ結果になる。
+    #[test]
+    fn repair5_extract_empty_budget_matches_unbounded() {
+        let sb1 = Sandbox::new();
+        let sb2 = Sandbox::new();
+        let entries = [dir("d", 0o755), file("d/f", 0o644, b"F")];
+        let a = bounded(&sb1, &entries, &ExtractBudget::new()).unwrap();
+        let b = extract_layers([Cursor::new(archive(&entries))], &sb2.root, LIM()).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].entries, b[0].entries);
+        assert_eq!(fs::read(sb1.root.join("d/f")).unwrap(), b"F");
     }
 }

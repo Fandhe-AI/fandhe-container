@@ -318,14 +318,16 @@ impl CriPluginBackends {
 /// running への force `delete` の最悪: stop 17 秒 + supervisor ログ 5 秒 + コンテナログ 15 秒 + 起動オプション文書 10 秒 = 47 秒。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
 /// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
-/// この値で打ち切られ（DEADLINE_EXCEEDED）、worker の残存は [`PLUGIN_ROOTFS_DEADLINE`] + 分割できない区間 1 つ分 + 42.9 秒で有限になる
+/// この値で打ち切られ（DEADLINE_EXCEEDED）、実行層への dispatch より前の worker は取り消しの旗で打ち切られる（展開は
+/// エントリ単位。#2899）。dispatch 後の worker は打ち切れず、core の create 42.9 秒 + 失敗時の削除確認（この値）で有限になる
 /// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
 
 /// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
 ///
-/// `CreateContainer` の worker が `prepare` に使える時間の上限で、blob 1 本ごとと展開の前後で確かめる。RPC の応答は
-/// [`PLUGIN_RUNTIME_TIMEOUT`] で先に打ち切られるが、worker は打ち切れず、記録と件数枠はその終了まで残る。
+/// `CreateContainer` の worker が `prepare` に使える時間の上限で、blob 1 本ごと・展開のエントリごと・展開の前後で確かめる。
+/// RPC の応答は [`PLUGIN_RUNTIME_TIMEOUT`] で先に打ち切られ、そのとき worker には取り消しの旗が立つ（dispatch 前なら次の確認で
+/// 止まる。#2899）。この値は取り消しが届かない場合の上限として残る。
 /// 値は既定（600 秒）のまま。変更はオーナー判断（本 issue では変えない）。
 pub const PLUGIN_ROOTFS_DEADLINE: Duration = fandhe_container_cri::bundle::DEFAULT_ROOTFS_DEADLINE;
 

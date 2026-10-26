@@ -216,6 +216,10 @@ struct FakeBundles {
     report_stop_signal: Mutex<Option<v1::Signal>>,
     /// 設定されていれば prepare が報告する解決済みイメージ（#2831）。
     report_image: Mutex<Option<fandhe_container_cri::bundle::ResolvedImage>>,
+    /// true の間、prepare は保留する（RPC の期限切れ後の worker の打ち切りの検証用。#2899）。
+    hold_prepare: AtomicBool,
+    /// 保留明けの prepare が見た取り消しの旗の値（#2899）。
+    cancel_seen: Mutex<Vec<bool>>,
 }
 
 fn bundle_root() -> PathBuf {
@@ -238,6 +242,15 @@ impl BundleProvider for FakeBundles {
             "prepare {container_id} {sandbox_id} {}",
             name.unwrap_or("")
         ));
+        while self.hold_prepare.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if req.cancel.is_some() {
+            self.cancel_seen
+                .lock()
+                .unwrap()
+                .push(req.cancel.is_some_and(|c| c.load(Ordering::SeqCst)));
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("no space"));
         }
@@ -843,6 +856,64 @@ async fn task_59_2_create_timeout_defers_release_until_worker_finishes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("worker did not roll back");
+}
+
+/// REPAIR-5・CRI-2（#2899）: bundle 用意の途中で RPC が期限切れになると、worker は後続の create へ進まず、
+/// bundle を解放して記録を除去する。prepare は取り消しの旗が立った状態を観測する。
+#[tokio::test]
+async fn repair5_create_timeout_during_prepare_stops_worker_before_dispatch() {
+    let h = harness();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(50));
+    let sb = run_sandbox(&service).await;
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    h.bundles.hold_prepare.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if released(&h.bundles) == 1 && list_count(&service).await == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(released(&h.bundles), 1);
+    assert_eq!(list_count(&service).await, 0);
+    assert_eq!(h.bundles.cancel_seen.lock().unwrap().clone(), vec![true]);
+    assert_eq!(
+        h.runtime.calls(),
+        Vec::<String>::new(),
+        "the runtime layer must never be reached"
+    );
+}
+
+/// REPAIR-5・CRI-2（#2899）: RPC の future が破棄されても（kubelet の取り消し）、dispatch 前の worker は
+/// 後続へ進まない。
+#[tokio::test]
+async fn repair5_create_future_drop_during_prepare_stops_worker_before_dispatch() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    let fut = create(&h.service, &sb, "c");
+    let timed = tokio::time::timeout(Duration::from_millis(50), fut).await;
+    assert!(timed.is_err(), "the create future must still be pending");
+    h.bundles.hold_prepare.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if released(&h.bundles) == 1 && list_count(&h.service).await == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(released(&h.bundles), 1);
+    assert_eq!(list_count(&h.service).await, 0);
+    assert_eq!(h.runtime.calls(), Vec::<String>::new());
+}
+
+fn released(b: &FakeBundles) -> usize {
+    b.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("release "))
+        .count()
 }
 
 fn release_count(h: &Harness) -> usize {

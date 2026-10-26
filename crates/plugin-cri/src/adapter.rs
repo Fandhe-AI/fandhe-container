@@ -708,6 +708,10 @@ const IMAGES_DIR: &str = ".cri/images";
 /// 置き場は `<state_root>/.cri/{bundles,images}` の固定位置で、各ディレクトリは 0700 で作る。既存のものは symlink でなく、
 /// 状態ルートと同じ所有者で、group / other の権限が無いことを確かめ、反すれば消さずに拒否する（fail-closed）。
 /// 失敗の文言は固定で、パスや OS の文字列を含めない。
+///
+/// 展開設定（所有者・特殊ビット）は `ImageExtractConfig` の既定（`Keep` + `Strip`）のままで、`ChownMapped` 等の
+/// 本番の値は渡さない。配線の前提は #2241・#2315・#482・#2592（#2534・SEC-5。`fandhe_container_cri::image_pull` の
+/// 「未実装範囲」を参照）。
 #[cfg(unix)]
 pub fn bundle_provider_in(
     state_root: &std::path::Path,

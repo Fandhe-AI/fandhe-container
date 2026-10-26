@@ -193,7 +193,13 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   fail-closed にしホストでの展開に届かない／Linux の他アーキテクチャは展開が `Unimplemented` で展開物が無く、削除も空の木を
   消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
-- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
+- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線（#2534）。現状、本番の値は pull・create とも
+  既定の `Keep` + `Strip` で、plugin-cri の `bundle_provider_in` は `ImageExtractConfig::new` の既定を使う。配線の前提:
+  rootful の `ChownMapped` の可否（#2241）、core が user namespace へ入る配線による `ChownInUserNamespace`（#2315・#482。
+  記録の符号化も現状は受けない）、`PullConfig` を組む本番の呼び出し元（plugin-cri の ImageService。#2592）、所有者の解決の
+  部品 `image_ownership`（#2389。cli crate にあり、置き場所の判断が要る）。pull と create は `ImageExtractConfig` の 1 か所から
+  同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
+  0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
 ## 試験との対応
@@ -232,3 +238,10 @@ rootless の user namespace の中での展開（#2382）: `extract.rs` の `cho
 `idmap.rs` の `sec5_parse_proc_id_map`・`sec5_same_lines_as`、`tests/idmap_core_parity.rs` の
 `oci2_parse_proc_id_map_matches_core`。実機前提の `tests/userns_extract.rs`（`harness = false`。`unshare --user --map-root-user`
 で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。AGENTS.md「実機前提テスト」）。
+
+PullImage の読み取り（#2534）: cri の `image_pull.rs` の `oci1_sec_config_rewritten_in_place_after_trust_check_is_rejected`
+（config は読んだ本文そのもののハッシュで照合する）・`oci1_unpack_record_worst_case_fits_within_the_limit`・
+`oci1_write_unpack_record_rejects_oversized_record_before_creating_it`、`tests/image_pull.rs` の
+`oci1_repair5_pull_rejects_fifo_unpack_record_without_hanging`・`oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs`・
+`oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published`。blob の信頼判定は oci の `check_blob_trust` に
+一本化し、`layer.rs` の `oci1_sec_blob_trust_*` で照合する。

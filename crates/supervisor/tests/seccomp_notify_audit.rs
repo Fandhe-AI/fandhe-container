@@ -14,7 +14,9 @@
 //! - シナリオ 3: 応答者（ハブ）が終了して listener が閉じた後は、拒否が `ENOSYS`(38) のまま保たれる（許可に倒れない）
 //!
 //! 前提の対照: 呼び出しスレッド自身が seccomp の下にない（`Seccomp: 0`）。外側の filter があると結果を取り違えるため、
-//! 満たさないときは skip せず非ゼロで失敗する。待ちはすべて期限つき（REPAIR-5）。
+//! 満たさないときは skip せず、1 行目 `seccomp_notify_audit: PRECONDITION FAILED (test environment, ...)` の
+//! panic で非ゼロ終了する（#2235・#2497・CORE-5・SEC-4・REPAIR-12）。分類は純関数で、冒頭で自己照合する。
+//! 判定できないときは前提欠如とは表示せず汎用の失敗にする（fail-closed）。待ちはすべて期限つき（REPAIR-5）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -56,7 +58,8 @@ mod linux {
     const AUDIT_ARCH: u32 = 0xC000_00B7;
 
     pub fn run() {
-        assert_no_outer_seccomp();
+        self_check_classifier();
+        check_no_outer_seccomp();
         let root = TempRoot::new();
         let id = ContainerId::new(CONTAINER).expect("container id");
         std::fs::DirBuilder::new()
@@ -72,18 +75,109 @@ mod linux {
         println!("seccomp_notify_audit: all scenarios passed");
     }
 
-    /// 前提の対照: 外側の seccomp がない。
-    fn assert_no_outer_seccomp() {
-        let status = std::fs::read_to_string("/proc/self/status").expect("read status");
-        let mode = status
+    /// `/proc/self/status` の `Seccomp:` 行の分類（REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum Precondition {
+        /// `Seccomp: 0`。前提を満たす。
+        Ok,
+        /// `Seccomp:` が 0 以外の数値。外側の filter の下にある（試験環境の前提欠如）。
+        OuterSeccomp { mode: String },
+        /// status が読めない・`Seccomp:` 行が無い・数値でない。前提欠如とは断定しない（fail-closed）。
+        Unknown,
+    }
+
+    /// status の本文を「前提を満たす / 外側の seccomp / 判定不能」へ分類する。
+    /// `Seccomp_filters:` 行は `Seccomp:`（コロン付き）に一致しないので取り違えない。
+    fn classify_seccomp_status(status: Option<&str>) -> Precondition {
+        let Some(status) = status else {
+            return Precondition::Unknown;
+        };
+        let Some(mode) = status
             .lines()
             .find_map(|l| l.strip_prefix("Seccomp:"))
-            .map(str::trim);
+            .map(str::trim)
+        else {
+            return Precondition::Unknown;
+        };
+        match mode.parse::<u32>() {
+            Ok(0) => Precondition::Ok,
+            Ok(_) => Precondition::OuterSeccomp {
+                mode: mode.to_owned(),
+            },
+            Err(_) => Precondition::Unknown,
+        }
+    }
+
+    /// 前提欠如の失敗メッセージ。1 行目で試験環境の前提欠如と分かる形式（#2235・#2497。
+    /// core の `seccomp_enforcement` と同形）。
+    fn precondition_message(mode: &str) -> String {
+        let hint = match mode {
+            "2" => {
+                "an outer seccomp filter is active (e.g. Docker's default seccomp profile under make docker-ci)"
+            }
+            "1" => "the process is in seccomp strict mode",
+            _ => "the environment applies seccomp to this process",
+        };
+        format!(
+            "seccomp_notify_audit: PRECONDITION FAILED (test environment, not a seccomp notify regression): \
+             this process is already under an outer seccomp filter (Seccomp: {mode}) before the probe's filter is installed.\n\
+             hint: {hint}.\n\
+             By policy (#2235) the dev container keeps Docker's seccomp and this test stays failing there; \
+             run it on the host (cargo test -p fandhe-container-supervisor --test seccomp_notify_audit) or rely on CI. \
+             See AGENTS.md \"make docker-ci\"."
+        )
+    }
+
+    /// 分類と文言の自己照合。実環境の判定より前に常に走らせ、前提欠如と回帰を取り違えないことを確かめる。
+    fn self_check_classifier() {
+        let outer = |m: &str| Precondition::OuterSeccomp { mode: m.to_owned() };
         assert_eq!(
-            mode,
-            Some("0"),
-            "prerequisite: this process must not be under an outer seccomp filter (Seccomp: {mode:?})"
+            classify_seccomp_status(Some("Name:\tx\nSeccomp:\t0\nSeccomp_filters:\t0\n")),
+            Precondition::Ok
         );
+        assert_eq!(
+            classify_seccomp_status(Some("Seccomp:\t2\nSeccomp_filters:\t1\n")),
+            outer("2")
+        );
+        assert_eq!(classify_seccomp_status(Some("Seccomp:\t1\n")), outer("1"));
+        assert_eq!(
+            classify_seccomp_status(Some("Seccomp_filters:\t1\n")),
+            Precondition::Unknown
+        );
+        assert_eq!(
+            classify_seccomp_status(Some("Name:\tx\n")),
+            Precondition::Unknown
+        );
+        assert_eq!(classify_seccomp_status(None), Precondition::Unknown);
+        assert_eq!(
+            classify_seccomp_status(Some("Seccomp:\tx\n")),
+            Precondition::Unknown
+        );
+        let msg = precondition_message("2");
+        assert_eq!(
+            msg.lines().next(),
+            Some(
+                "seccomp_notify_audit: PRECONDITION FAILED (test environment, not a seccomp notify regression): this process is already under an outer seccomp filter (Seccomp: 2) before the probe's filter is installed."
+            )
+        );
+        assert!(msg.contains("make docker-ci"), "{msg}");
+        assert!(
+            msg.contains("cargo test -p fandhe-container-supervisor --test seccomp_notify_audit"),
+            "{msg}"
+        );
+    }
+
+    /// 前提の対照: 外側の seccomp がない。満たさないときは skip せず panic（非ゼロ終了）する。
+    fn check_no_outer_seccomp() {
+        let status = std::fs::read_to_string("/proc/self/status");
+        match classify_seccomp_status(status.as_deref().ok()) {
+            Precondition::Ok => {}
+            Precondition::OuterSeccomp { mode } => panic!("{}", precondition_message(&mode)),
+            Precondition::Unknown => panic!(
+                "seccomp_notify_audit: could not determine the Seccomp mode from /proc/self/status (read: {:?})",
+                status.as_ref().map(|_| "ok").map_err(|e| e.kind())
+            ),
+        }
     }
 
     /// 0700 の排他作成で作る一時ディレクトリ（drop で削除）。

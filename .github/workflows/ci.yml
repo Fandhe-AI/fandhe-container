@@ -94,6 +94,17 @@ on:
           試験用。既定 false は 3 OS）
         type: boolean
         default: false
+      repeat-os:
+        description: >-
+          繰り返しのステップを回す OS（既定 all は 3 OS）。cfg で Windows が対象外の試験は Windows 以外を選ぶ
+          （0 件実行で赤になるため。REPAIR-12・PLUG-12・#2768）。PR・push では存在しない
+        type: choice
+        options:
+          - all
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        default: all
       repeat-features:
         description: >-
           繰り返す試験に渡す cargo の feature 名（カンマ区切り。既定 feature で有効にならない lib 試験用。
@@ -513,11 +524,29 @@ jobs:
       # repeat-test は lib 試験、repeat-test-bin + repeat-success-line は harness = false の結合試験。
       # repeat-linux-only=true のときは Linux だけで回す（非 Linux で not applicable になる試験用）。
       # 入力は env 経由で渡し、run 内で式を展開しない（スクリプトインジェクション対策）。既存ジョブのステップ
+      # repeat-os で OS を 1 つに選べる（既定 all）。repeat-linux-only=true と Linux 以外の repeat-os の組は
+      # どの leg でも何も走らず緑になるため、直前のステップで矛盾を検出して失敗させる（#2768）。
+      - name: 繰り返し入力の整合確認（workflow_dispatch のみ）
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          matrix.os == 'ubuntu-latest'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          LINUX_ONLY: ${{ inputs.repeat-linux-only && '1' || '' }}
+          REPEAT_OS: ${{ inputs.repeat-os }}
+        run: |
+          if [ -n "${LINUX_ONLY}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
+            echo "::error::repeat-linux-only=true conflicts with repeat-os=${REPEAT_OS} (nothing would run)" >&2
+            exit 1
+          fi
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
           (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
-          (!inputs.repeat-linux-only || runner.os == 'Linux')
+          (!inputs.repeat-linux-only || runner.os == 'Linux') &&
+          (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
         shell: bash
         timeout-minutes: 30
         env:
@@ -906,6 +935,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make repeat-test-selftest
+
+      # 実機前提テストの成功行照合スクリプト（試験ソースから期待行を導出してログと双方向照合。#2768・REPAIR-12）の
+      # 自己テスト。fixture のみ。既存ジョブのステップ（check-run 件数は不変）
+      - name: 成功行照合スクリプトの自己テスト（#2768・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-success-lines-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1307,23 +1343,31 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/image_store_xdev.log"
           cargo test -p fandhe-container-oci --test image_store_xdev -- --ignored 2>&1 | tee "${log}"
-          if grep -Fq 'image_store_xdev: ignored' "${log}"; then
-            echo "::error::image_store_xdev was skipped (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          for line in \
-            'ok: xdev_rm' \
-            'ok: xdev_prune' \
-            'ok: xdev_lock_pending_journal' \
-            'ok: xdev_lock_file_bind' \
-            'test image_store_xdev ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::image_store_xdev did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::image_store_xdev verified"
+          # 成功行は試験ソースの println! から導出して双方向に照合する（#2768・REPAIR-12）
+          scripts/check-success-lines.sh --name image_store_xdev --src crates/oci/tests/image_store_xdev.rs \
+            --log "${log}" --select '^(ok: xdev_[a-z_]+|test image_store_xdev [.][.][.] ok)$' --min 5 \
+            --forbid 'image_store_xdev: ignored' --summary
+
+      # landlock_implicit_dev（`crates/core/tests/landlock_implicit_dev.rs`。CORE-5・SEC-4・#1657・#2768）: 暗黙の /dev 系の
+      # Landlock 許可（/dev/null 書き込み・/dev/shm 作成・/dev/ptmx open）と mknod・外側書き込みの拒否を非特権 user namespace で
+      # 照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock ABI 6 以上の fail-closed 確認は上のステップを
+      # 再利用する（複製しない）。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: landlock_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test landlock_implicit_dev --no-run
+
+      - name: landlock_implicit_dev の実行（実機前提テスト・--ignored。CORE-5・SEC-4・#1657・#2768）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/landlock_implicit_dev.log"
+          cargo test -p fandhe-container-core --test landlock_implicit_dev -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name landlock_implicit_dev \
+            --src crates/core/tests/landlock_implicit_dev.rs --log "${log}" \
+            --select '^landlock_implicit_dev: /dev/null write' --subst root=false \
+            --forbid 'root=true' --forbid 'landlock_implicit_dev: ignored' --forbid 'not applicable' --summary
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1493,35 +1537,12 @@ jobs:
             cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
           # 期待する成功行は試験ソースの println! から導出する（手書きの並びとシナリオ集合のずれで
           # 実行されない成功行を見逃さない。#2699・REPAIR-12）。集合は双方向で一致させる。
-          src="crates/core/tests/rootless_image_rootfs_remove.rs"
-          min_scenarios=10
-          mapfile -t expected < <(
-            grep -oE 'println!\("rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified"\)' "${src}" \
-              | sed -E 's/^println!\("//; s/"\)$//' | LC_ALL=C sort -u
-          )
-          if [ "${#expected[@]}" -lt "${min_scenarios}" ]; then
-            echo "::error::rootless_image_rootfs_remove: expected at least ${min_scenarios}" \
-              "scenario lines in ${src}, found ${#expected[@]}" >&2
-            exit 1
-          fi
-          for line in "${expected[@]}"; do
-            if ! grep -Fxq -- "${line}" "${log}"; then
-              echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          while IFS= read -r actual; do
-            if ! printf '%s\n' "${expected[@]}" | grep -Fxq -- "${actual}"; then
-              echo "::error::rootless_image_rootfs_remove reported an unexpected line: ${actual}" >&2
-              exit 1
-            fi
-          done < <(grep -E '^rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified$' "${log}" | LC_ALL=C sort -u)
-          if grep -Eq 'rootless_image_rootfs_remove: (ignored|Linux only)' "${log}"; then
-            echo "::error::rootless_image_rootfs_remove reported an unexpected line: ignored or Linux only" >&2
-            exit 1
-          fi
-          echo "::notice::rootless_image_rootfs_remove verified (${#expected[@]} scenarios)"
+          # 共通スクリプトへ移した（#2768）。下限 10 件・ignored / Linux only の出現は失敗は従来どおり
+          scripts/check-success-lines.sh --name rootless_image_rootfs_remove \
+            --src crates/core/tests/rootless_image_rootfs_remove.rs --log "${log}" \
+            --select '^rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified$' --min 10 \
+            --forbid 'rootless_image_rootfs_remove: ignored' --forbid 'rootless_image_rootfs_remove: Linux only' \
+            --summary
 
       - name: seccomp のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1535,22 +1556,10 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/seccomp.log"
           cargo test -p fandhe-container-core --test seccomp -- --ignored 2>&1 | tee "${log}"
-          for line in \
-            'seccomp: CORE-5 probe table and record parser verified' \
-            'seccomp: CORE-5 denied syscalls blocked inside the container (root=false)'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::seccomp did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'root=true' 'seccomp: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::seccomp reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::seccomp verified"
+          # 成功行は試験ソースから導出する（`(root={})` は is_root() の実行時の値で、CI は非 root なので false。#2768）
+          scripts/check-success-lines.sh --name seccomp --src crates/core/tests/seccomp.rs --log "${log}" \
+            --select '^seccomp: CORE-5 ' --subst-pos false --min 2 \
+            --forbid 'root=true' --forbid 'seccomp: ignored' --summary
 
       # rootless_launch・rootless・rootless_uid_mapping（`crates/core/tests/`。CORE-6・SEC-1・SEC-5・REPAIR-7・#2596）:
       # 非特権 user namespace で動く `--ignored` の試験（harness = false）。cargo 経由で直接実行する（委譲スコープは要らない）。helper ケース
@@ -1570,22 +1579,10 @@ jobs:
           log="${RUNNER_TEMP}/rootless_launch.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_launch -- --ignored 2>&1 | tee "${log}"
-          for line in \
-            'rootless_launch: scenario direct verified (reached the exec stage)' \
-            'rootless_launch: scenario helper verified (reached the exec stage)'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless_launch did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'helper case not requested' 'root=true' 'rootless_launch: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_launch reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless_launch verified"
+          # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。文言はソースから導出（#2768）
+          scripts/check-success-lines.sh --name rootless_launch --src crates/core/tests/rootless_launch.rs \
+            --log "${log}" --select '^rootless_launch: scenario ' --subst name=direct,helper --min 2 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_launch: ignored' --summary
 
       - name: rootless の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

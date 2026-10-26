@@ -863,12 +863,13 @@ fn sup7_cri2_force_delete_running_keeps_logs_after_wait_deadline() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// REPAIR-5・#2634: running への force 削除の最悪所要（stop + supervisor ログ + コンテナログの待ち）は
-/// `PLUGIN_RUNTIME_TIMEOUT` に収まる。
+/// REPAIR-5・#2634・#2760: running への force 削除の最悪所要（stop + supervisor ログ + コンテナログの待ち + 起動オプション
+/// 文書の掃除）は `PLUGIN_RUNTIME_TIMEOUT` に収まる。
 #[test]
 fn repair5_force_delete_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::oci_runtime::KillTimeout;
     use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
+    use fandhe_container_supervisor::container_options::store::OPTIONS_REMOVE_TIMEOUT;
     use fandhe_container_supervisor::logs::{
         CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT,
     };
@@ -878,6 +879,27 @@ fn repair5_force_delete_worst_case_fits_runtime_timeout() {
     let logs =
         SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_LOCK_WAIT + CONTAINER_LOG_REMOVE_TIMEOUT;
     assert_eq!(logs, Duration::from_secs(20));
-    assert_eq!(stop + logs, Duration::from_secs(37));
-    assert!(stop + logs < PLUGIN_RUNTIME_TIMEOUT);
+    assert_eq!(OPTIONS_REMOVE_TIMEOUT, Duration::from_secs(10));
+    assert_eq!(
+        stop + logs + OPTIONS_REMOVE_TIMEOUT,
+        Duration::from_secs(47)
+    );
+    assert!(stop + logs + OPTIONS_REMOVE_TIMEOUT < PLUGIN_RUNTIME_TIMEOUT);
+}
+
+/// REPAIR-5・#2760: `create` の最悪所要（ログ回収 + 起動オプション文書の掃除 + 状態ロック + 監査記録 2 回）は
+/// `PLUGIN_RUNTIME_TIMEOUT` に収まる。bundle の用意と core の create の I/O 自体は含めない（既存の残余）。
+#[test]
+fn repair5_create_worst_case_fits_runtime_timeout() {
+    use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
+    use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
+    use fandhe_container_supervisor::container_options::store::OPTIONS_REMOVE_TIMEOUT;
+    use fandhe_container_supervisor::logs::CONTAINER_LOG_REMOVE_TIMEOUT;
+    let reclaim = CONTAINER_LOG_REMOVE_TIMEOUT + OPTIONS_REMOVE_TIMEOUT;
+    assert_eq!(reclaim, Duration::from_secs(15));
+    let audit = RECORD_WAIT_LIMIT * 2;
+    assert_eq!(audit, Duration::from_millis(22_900));
+    let total = reclaim + STATE_LOCK_TIMEOUT + audit;
+    assert_eq!(total, Duration::from_millis(42_900));
+    assert!(total < PLUGIN_RUNTIME_TIMEOUT);
 }

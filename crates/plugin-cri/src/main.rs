@@ -40,7 +40,7 @@ fn fail_err(e: &PluginError) -> ExitCode {
 #[cfg(unix)]
 fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
-    use fandhe_container_plugin_cri::adapter::{CriPluginBackends, PLUGIN_REQUEST_TIMEOUT};
+    use fandhe_container_plugin_cri::adapter::{self, CriPluginBackends, PLUGIN_REQUEST_TIMEOUT};
     use fandhe_container_plugin_cri::{server, telemetry};
 
     // 監査の記録経路（Linux）は、スレッド・listener・ランタイムを作る前に用意する（SEC-4・PLUG-12・#2484）。
@@ -73,6 +73,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         }
     };
     let recorder = std::sync::Arc::clone(backends.op_recorder());
+    let sweep_store = std::sync::Arc::clone(backends.state());
+    let sweep_recorder = std::sync::Arc::clone(&recorder);
     // bundle の供給は fail-closed。置き場を用意できなければ（fixed 文言のみ出して）起動しない。
     let bundles = match backends.production_bundle_provider() {
         Ok(b) => b,
@@ -130,6 +132,19 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     let audit = None;
     let result = rt.block_on(async {
+        // 前回までに残ったコンテナログを 1 回だけ回収する（サーブの開始は待たせない。監査 relay は作成済みで、単一スレッド前提を壊さない。#2760）。
+        drop(tokio::task::spawn_blocking(move || {
+            if let Some(report) = adapter::sweep_leftover_container_logs(
+                &sweep_store,
+                &sweep_recorder,
+                adapter::STARTUP_LOG_SWEEP_BUDGET,
+            ) {
+                // 走査に何も無かった（空の状態ルート等）ときは出さない。起動の失敗時の stderr を静かに保つ。
+                if report != Default::default() {
+                    let _ = telemetry::stderr_sink().submit(adapter::sweep_summary_line(&report));
+                }
+            }
+        }));
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
         let stats = tokio::spawn(telemetry::op_stats_export_loop(
             recorder,

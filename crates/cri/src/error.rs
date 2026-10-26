@@ -12,6 +12,18 @@
 //! `PermissionDenied`・`ResourceExhausted` は既存の CRI 実装が返しているが ERR-3 の表に無い拡張で、
 //! spec への反映要否は報告事項とする。
 //!
+//! ## レジストリの HTTP 状態の運び方（#2898・CRI-3・OCI-1・REPAIR-4・ERR-1）
+//!
+//! 1. gRPC コードは oci の分類（`code_for_http_status`）を `From<PullError>` の表で写して決まる。
+//!    401/403 は `PERMISSION_DENIED`、404 は `NOT_FOUND`、408 は `DEADLINE_EXCEEDED`、
+//!    429 と 5xx は `UNAVAILABLE`、その他の 4xx は `INVALID_ARGUMENT`。
+//! 2. HTTP 状態は message に入れず、トレーラーのメタデータ [`REGISTRY_HTTP_STATUS_METADATA_KEY`]
+//!    （10 進。範囲は 100..=599）でだけ運ぶ。範囲外は付けない。
+//! 3. message は分類ごとの固定の英語文言（URL・応答本文・資格情報を含めない）。429 だけが専用の固定文言
+//!    `registry rate limit exceeded` を持つ（メタデータを捨てる経路でも見分けるため）。
+//! 4. 付けるのはレジストリ由来の失敗（`PullError::from_oci`）だけで、ストア・展開・config 由来には付けない。
+//! 5. plugin 境界の `PluginError` はメタデータを運ばない（対象外）。`ErrorInfo`（details）は新規依存が要るため採らない。
+//!
 //! `PullError` の `AlreadyExists` は意図して `INTERNAL` に写す（`ALREADY_EXISTS` にしない。
 //! 理由は `From<PullError> for CriError` の doc。ERR-3・TASK-97・#2321）。
 
@@ -19,10 +31,14 @@ use std::fmt;
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 use fandhe_container_oci::error::OciErrorCode;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Status};
 
 use crate::image_pull::PullError;
 use crate::instrument::code_name;
+
+/// レジストリの HTTP 状態を運ぶトレーラーメタデータのキー（値は 10 進の ASCII。例: `429`）。
+pub const REGISTRY_HTTP_STATUS_METADATA_KEY: &str = "fandhe-registry-http-status";
 
 /// `Status` のメッセージ上限（バイト）。plugin・レジストリ由来の文字列で応答が肥大化するのを防ぐ。
 pub(crate) const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
@@ -108,6 +124,7 @@ impl CriErrorCode {
 pub struct CriError {
     code: CriErrorCode,
     message: String,
+    registry_http_status: Option<u16>,
 }
 
 impl CriError {
@@ -121,7 +138,16 @@ impl CriError {
             }
             message.truncate(end);
         }
-        Self { code, message }
+        Self {
+            code,
+            message,
+            registry_http_status: None,
+        }
+    }
+
+    /// レジストリ由来の HTTP 状態（`PullError` 経由のときだけ入る）。
+    pub fn registry_http_status(&self) -> Option<u16> {
+        self.registry_http_status
     }
 
     /// `INVALID_ARGUMENT` のエラーを作る。
@@ -190,7 +216,17 @@ impl std::error::Error for CriError {}
 
 impl From<CriError> for Status {
     fn from(err: CriError) -> Self {
-        Status::new(err.code.grpc_code(), err.message)
+        match err.registry_http_status {
+            Some(status) => {
+                let mut metadata = MetadataMap::new();
+                metadata.insert(
+                    REGISTRY_HTTP_STATUS_METADATA_KEY,
+                    MetadataValue::from(status),
+                );
+                Status::with_metadata(err.code.grpc_code(), err.message, metadata)
+            }
+            None => Status::new(err.code.grpc_code(), err.message),
+        }
     }
 }
 
@@ -253,13 +289,16 @@ impl From<PullError> for CriError {
             OciErrorCode::AlreadyExists => CriErrorCode::Internal,
             _ => CriErrorCode::Internal,
         };
-        Self::new(code, err.message())
+        let mut out = Self::new(code, err.message());
+        out.registry_http_status = err.http_status();
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_oci::error::OciError;
 
     /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
     fn ordinal(code: CriErrorCode) -> usize {
@@ -457,6 +496,77 @@ mod tests {
             assert_eq!(st.code(), expected);
             assert_eq!(st.message(), "msg");
             assert_eq!(st.code(), trait_error_to_status(&te).code());
+        }
+    }
+
+    /// CRI-3・OCI-1・ERR-3: 429・503・状態なしは同じ `UNAVAILABLE` のまま、メタデータ（と 429 の固定文言）で区別できる。
+    #[test]
+    fn cri3_registry_http_status_is_carried_in_metadata() {
+        let to_status = |http: Option<u16>| {
+            let mut e = OciError::new(OciErrorCode::Unavailable, "upstream detail token=dummy");
+            if let Some(h) = http {
+                e = e.with_http_status(h);
+            }
+            let ce = CriError::from(PullError::from_oci(&e));
+            assert_eq!(ce.registry_http_status(), http);
+            Status::from(ce)
+        };
+        let st = to_status(Some(429));
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry rate limit exceeded");
+        assert_eq!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .map(|v| v.to_str().unwrap()),
+            Some("429")
+        );
+        for leaked in ["429", "token=", "upstream"] {
+            assert!(!st.message().contains(leaked));
+        }
+        let st = to_status(Some(503));
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry is unavailable");
+        assert_eq!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .map(|v| v.to_str().unwrap()),
+            Some("503")
+        );
+        let st = to_status(None);
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry is unavailable");
+        assert!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    /// CRI-3・OCI-1: HTTP 状態ごとの gRPC コードとメタデータ値（余計なキーは付かない）。
+    #[test]
+    fn cri3_registry_http_status_table() {
+        let cases = [
+            (
+                401u16,
+                OciErrorCode::PermissionDenied,
+                Code::PermissionDenied,
+            ),
+            (403, OciErrorCode::PermissionDenied, Code::PermissionDenied),
+            (404, OciErrorCode::NotFound, Code::NotFound),
+            (408, OciErrorCode::Timeout, Code::DeadlineExceeded),
+            (500, OciErrorCode::Unavailable, Code::Unavailable),
+            (400, OciErrorCode::InvalidArgument, Code::InvalidArgument),
+        ];
+        for (http, oci, want) in cases {
+            let e = OciError::new(oci, "m").with_http_status(http);
+            let st = Status::from(CriError::from(PullError::from_oci(&e)));
+            assert_eq!(st.code(), want, "{http}");
+            assert_eq!(st.metadata().len(), 1, "{http}");
+            let v = st
+                .metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .unwrap();
+            assert_eq!(v.to_str().unwrap(), http.to_string());
         }
     }
 

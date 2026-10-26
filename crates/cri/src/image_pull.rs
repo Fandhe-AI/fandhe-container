@@ -178,12 +178,36 @@ const MAX_AUTH_FIELD_BYTES: usize = 8 * 1024;
 pub struct PullError {
     code: OciErrorCode,
     message: &'static str,
+    /// レジストリ由来の HTTP 状態（100..=599 のみ）。message には入れず別持ちする（#2898・CRI-3・OCI-1）。
+    http_status: Option<u16>,
+}
+
+/// レジストリ応答由来の HTTP 状態を妥当な範囲（100..=599）に限る。範囲外は捨てる（fail-closed）。
+fn registry_http_status(status: u16) -> Option<u16> {
+    (100..=599).contains(&status).then_some(status)
 }
 
 impl PullError {
     /// 分類と固定文言からエラーを作る。
     pub fn new(code: OciErrorCode, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            http_status: None,
+        }
+    }
+
+    /// レジストリ由来の HTTP 状態を付ける。100..=599 の外は捨てて `None` のままにする。
+    /// 値は `PullImage` の gRPC エラーのメタデータへだけ載り、message には入らない
+    /// （契約は `crate::error` のモジュール doc。#2898・CRI-3・OCI-1・REPAIR-4）。
+    pub fn with_http_status(mut self, status: u16) -> Self {
+        self.http_status = registry_http_status(status);
+        self
+    }
+
+    /// レジストリ由来の HTTP 状態（`from_oci` 経由のときだけ入る）。
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
     }
 
     /// oci のエラーを写す。oci の message はレジストリ由来の情報を含みうるため捨て、分類ごとの固定文言にする。
@@ -200,7 +224,18 @@ impl PullError {
             OciErrorCode::FailedPrecondition => "image cache precondition failed",
             _ => "image pull failed",
         };
-        Self::new(err.code(), message)
+        // 429 だけは専用の固定文言にする（値は含めない）。メタデータを捨てる経路でも、
+        // ログ上で他の UNAVAILABLE と見分けられるようにするため（#2898）。
+        let message = if err.http_status() == Some(429) {
+            "registry rate limit exceeded"
+        } else {
+            message
+        };
+        let mut out = Self::new(err.code(), message);
+        if let Some(status) = err.http_status() {
+            out = out.with_http_status(status);
+        }
+        out
     }
 
     /// ローカルのイメージストア（`ImageStore` / `PullSession`）の失敗を写す。レジストリ由来ではないため
@@ -1757,6 +1792,21 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRI-3・OCI-1: HTTP 状態を運ぶのは `from_oci` だけで、範囲外（100..=599 の外）は捨てる。
+    #[test]
+    fn cri3_only_registry_errors_carry_http_status() {
+        let e = OciError::new(OciErrorCode::Unavailable, "x").with_http_status(500);
+        assert_eq!(PullError::from_oci(&e).http_status(), Some(500));
+        assert_eq!(PullError::from_store(&e).http_status(), None);
+        assert_eq!(PullError::from_extract(&e).http_status(), None);
+        assert_eq!(PullError::from_config(&e).http_status(), None);
+        let n = PullError::new(OciErrorCode::Unavailable, "m");
+        assert_eq!(n.with_http_status(99).http_status(), None);
+        assert_eq!(n.with_http_status(600).http_status(), None);
+        assert_eq!(n.with_http_status(599).http_status(), Some(599));
+        assert_eq!(n.with_http_status(100).http_status(), Some(100));
+    }
 
     /// OCI-3: base64 デコーダの正常系・不正系。
     #[test]

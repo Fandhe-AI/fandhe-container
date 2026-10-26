@@ -111,6 +111,25 @@ on:
           例 grpc。REPAIR-12・#2711）
         type: string
         default: ''
+      repeat-user-scope:
+        description: >-
+          true にすると repeat-test-bin を委譲スコープ（systemd-run --user --scope -p Delegate=yes）の中で直接
+          実行する（Linux 限定。cargo を cgroup に入れると失敗する production_launcher 等用。#2886）
+        type: boolean
+        default: false
+      repeat-env:
+        description: >-
+          繰り返す試験の子プロセスにだけ渡す環境変数（FANDHE_CONTAINER_* の NAME=VALUE の空白区切り。
+          例 FANDHE_CONTAINER_TEST_ID_HELPER=1。#2886）
+        type: string
+        default: ''
+      repeat-run-timeout:
+        description: >-
+          repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
+          CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
+          ステップ全体は 55 分で打ち切られる（ジョブ上限 60 分）ため、遅い試験は repeat-count を分けて dispatch する
+        type: string
+        default: '600'
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -529,27 +548,46 @@ jobs:
       - name: 繰り返し入力の整合確認（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope) &&
           matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 2
         env:
           LINUX_ONLY: ${{ inputs.repeat-linux-only && '1' || '' }}
           REPEAT_OS: ${{ inputs.repeat-os }}
+          USER_SCOPE: ${{ inputs.repeat-user-scope && '1' || '' }}
+          LIB_TEST: ${{ inputs.repeat-test }}
+          TEST_BIN_IN: ${{ inputs.repeat-test-bin }}
         run: |
           if [ -n "${LINUX_ONLY}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
             echo "::error::repeat-linux-only=true conflicts with repeat-os=${REPEAT_OS} (nothing would run)" >&2
+            exit 1
+          fi
+          # repeat-user-scope は Linux の結合試験（repeat-test-bin）専用。lib 試験との併用、Linux 以外の OS だけの指定は
+          # どの leg でも走らず緑になるため失敗にする（#2886）。
+          if [ -n "${USER_SCOPE}" ] && [ -n "${LIB_TEST}" ]; then
+            echo "::error::repeat-user-scope=true cannot be combined with repeat-test (use repeat-test-bin)" >&2
+            exit 1
+          fi
+          if [ -n "${USER_SCOPE}" ] && [ -z "${TEST_BIN_IN}" ]; then
+            echo "::error::repeat-user-scope=true requires repeat-test-bin (nothing would run)" >&2
+            exit 1
+          fi
+          if [ -n "${USER_SCOPE}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
+            echo "::error::repeat-user-scope=true conflicts with repeat-os=${REPEAT_OS} (Linux only)" >&2
             exit 1
           fi
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
           (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          !inputs.repeat-user-scope &&
           (!inputs.repeat-linux-only || runner.os == 'Linux') &&
           (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
         shell: bash
         timeout-minutes: 30
         env:
+          TEST_ENV: ${{ inputs.repeat-env }}
           PACKAGE: ${{ inputs.repeat-package }}
           TEST: ${{ inputs.repeat-test }}
           TEST_BIN: ${{ inputs.repeat-test-bin }}
@@ -1347,6 +1385,33 @@ jobs:
             echo "systemd user manager private socket: present"
             echo "Landlock ABI: ${abi}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 委譲スコープでの試験の繰り返し（workflow_dispatch の repeat-user-scope=true のときだけ。#2886・CORE-5・REPAIR-12）。
+      # production_launcher のように cargo を同じ cgroup に入れると prepare が失敗する試験を、`make repeat-test` の
+      # USER_SCOPE=1 で（ビルド 1 回・毎回 `systemd-run --user --scope` の中で直接実行）繰り返す。
+      # この位置にある理由: 上の AppArmor の緩和ステップと前提確認の後でないと ubuntu の Unshare 段で失敗するため
+      # （通常の「指定した試験の繰り返し」ステップはそれより前にあり、repeat-user-scope のときは飛ばす）。Linux 限定。
+      # 入力は env 経由（run 内で式を展開しない）。新しいジョブ・check-run は追加しない。
+      - name: 委譲スコープでの試験の繰り返し（workflow_dispatch のみ。#2886）
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.repeat-user-scope &&
+          inputs.repeat-test-bin != '' &&
+          runner.os == 'Linux' && env.HANG_PROBE != 'true' &&
+          (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
+        shell: bash
+        timeout-minutes: 55
+        env:
+          PACKAGE: ${{ inputs.repeat-package }}
+          TEST_BIN: ${{ inputs.repeat-test-bin }}
+          SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
+          FEATURES: ${{ inputs.repeat-features }}
+          COUNT: ${{ inputs.repeat-count }}
+          TEST_ENV: ${{ inputs.repeat-env }}
+          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout }}
+          USER_SCOPE: '1'
+        run: make repeat-test
 
       # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・CORE-6・REPAIR-7・#2542・#2642）: rootless の
       # user namespace 内でのレイヤー展開（所有者・setuid・写像外 ID の拒否）を照合する実機前提テスト（harness = false）。

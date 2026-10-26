@@ -6,8 +6,12 @@
 
 - Linux 実機。`sudo` はスクリプトが呼ばない。root で実行するかどうかは操作者が決める
 - `crictl` は版を固定し、取得元と sha256 を下の結果レポートに記録する。導入は人間が行う
-- CRI サーバーが UDS（`unix:///<絶対パス>`）で待ち受けていること。現時点（2026-10-19）では plugin-cri のバイナリ（UDS の gRPC リスナー）が未実装（TASK-108・TASK-114）で、`runtime_service.rs` は bundle の生成の本体も未提供のため、それらが揃うまで実機では最後まで通らない
+- CRI サーバーが UDS（`unix:///<絶対パス>`）で待ち受けていること。plugin-cri のバイナリ（`fandhe-container-plugin-cri --socket <PATH>`。TASK-114）は同じ UDS で `RuntimeService` と `ImageService` をサーブする（#2592）。`crictl pull` が登録したタグを `crictl create` が同じプロセス内の在庫から image ID へ解決する。在庫はプロセス内だけで、バイナリを再起動するとタグの対応は失われる（もう一度 `crictl pull` する。キャッシュ済みの blob は再取得されない）。start は supervisor 経由の本番経路のため、`systemd --user` の委譲 cgroup scope の中で動かす（前提は `docs/setup/linux.md`）
 - レジストリの資格情報を含む設定で実行しない（crictl の stderr をそのままログへ転記するため）。実機のホスト名・アドレスは記録しない
+
+## pod.json のネットワーク名前空間
+
+`scripts/testdata/cri/pod.json` は `linux.security_context.namespace_options.network` を NODE（enum の数値 `2`）にしている。既定の POD だと RunPodSandbox が pod 用の network namespace を要求するが、core の start はまだ network namespace の join を受けず拒否するため、start（手順 `start`）で止まる（`crates/cri/src/bundle/spec.rs`。#2675・#2592）。NODE は **ホストの network namespace** でコンテナを動かす指定で、分離を弱める。この smoke 専用の fixture であり、本番の既定ではない。利用者が明示したときだけ使う。pid / ipc を NODE にすると今も拒否される。crictl が enum を数値で読むかは実機で確かめる（自己テストはスタブの crictl のため検出できない）。
 
 ## イメージの扱い
 

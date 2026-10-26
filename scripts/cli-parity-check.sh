@@ -218,6 +218,9 @@ kill_unreaped_child() {
 chain_cli=""
 chain_state=""
 chain_live=0
+# 回収に失敗して状態ルートを残すと決めたか。シグナル trap の cleanup の後に EXIT trap が cleanup を再実行しても
+# 保持の判断を維持する（再入で rm -rf に到達させない。REPAIR-5）。
+keep_state=0
 
 cleanup() {
   if [ -n "$watchdog_pid" ]; then
@@ -243,8 +246,12 @@ cleanup() {
     # delete が成功しなかった（状態が残る）なら、手動回収に必要な状態ルートを消さずに残す。
     if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
       err warning "container c2 could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
+      keep_state=1
       return 0
     fi
+  fi
+  if [ "$keep_state" -eq 1 ]; then
+    return 0
   fi
   if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
     rm -rf -- "$tmp_dir"
@@ -725,8 +732,8 @@ do_capture() {
         if [ "$run_timed_out" -eq 1 ]; then last_start_exit=1; else last_start_exit="$run_exit"; fi
         ;;
     esac
-    # start が期限切れ以外で失敗を返したなら起動していない。期限切れは結果不明なので対象に残す。
-    if [ "$id" = "B20" ] && [ "$last_start_exit" != "0" ] && [ "$run_timed_out" -eq 0 ]; then chain_live=0; fi
+    # start が失敗・期限切れでも対象は維持する。CLI 自身の受信期限切れ（非 0 終了）は結果不明で supervisor は
+    # 止まらないため、起動していないと断定しない。解除は B24 の delete 成功の確認後だけにする（REPAIR-5）。
     if [ "$run_timed_out" -eq 1 ]; then
       any_timeout=1
       lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}<timeout>${TAB}<timeout>")

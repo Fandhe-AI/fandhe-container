@@ -23,7 +23,12 @@ kubelet は既定（cgroupsPerQOS）で cgroup_parent を送るため、kubelet 
 - cgroupfs 形式（例: `/kubepods/burstable/pod<uid>`）
 - systemd 形式（例: `kubepods-burstable-pod<uid>.slice`）。CORE-4（systemd cgroup driver を持たない）により、どの選択肢でも受け入れない
 
-containerd 等の変換（parent と id の結合など）は一次情報（commit 指定）との照合が未実施で、本書では断定しない。
+containerd の変換は一次情報で照合済み（確認日 2026-10-26。#2772。containerd `v2.4.2`・commit `b7a25261e029d68978bbf290df0a62fc819b3c51`。出典の一覧は `cri-config-acceptance.md`「外部の事実の照合」）。
+
+- `getCgroupsPath`（[`internal/cri/server/helpers.go` L447-L455](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/helpers.go#L447-L455)）: 親の末尾の要素が `.slice` なら `<末尾の要素>:cri-containerd:<コンテナ id>`（runc の systemd 形式）、そうでなければ `<親>/<コンテナ id>`（cgroupfs 形式）。親の形で形式が決まり、containerd 側の設定で選ぶものではない
+- kubelet（`v1.37.1`・commit `f78e722310e50bcaca9276be22276d9e91d91308`）は `kuberuntime_sandbox.go` L167-L170 で `CgroupParent` を常に設定する。値は `pkg/kubelet/cm/pod_container_manager_linux.go` の QoS 別の pod の cgroup 名で、cgroupsPerQOS を無効にした構成だけ空になる（同 L343-L349）。下の「実務への影響」はこれと一致する
+
+本実装が受け入れないという判断（CORE-4）は変わらない。
 
 ## 選択肢
 

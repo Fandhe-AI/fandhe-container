@@ -541,7 +541,7 @@ jobs:
       - name: 繰り返し入力の整合確認（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope) &&
           matrix.os == 'ubuntu-latest'
         shell: bash
         timeout-minutes: 2
@@ -550,6 +550,7 @@ jobs:
           REPEAT_OS: ${{ inputs.repeat-os }}
           USER_SCOPE: ${{ inputs.repeat-user-scope && '1' || '' }}
           LIB_TEST: ${{ inputs.repeat-test }}
+          TEST_BIN_IN: ${{ inputs.repeat-test-bin }}
         run: |
           if [ -n "${LINUX_ONLY}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
             echo "::error::repeat-linux-only=true conflicts with repeat-os=${REPEAT_OS} (nothing would run)" >&2
@@ -559,6 +560,10 @@ jobs:
           # どの leg でも走らず緑になるため失敗にする（#2886）。
           if [ -n "${USER_SCOPE}" ] && [ -n "${LIB_TEST}" ]; then
             echo "::error::repeat-user-scope=true cannot be combined with repeat-test (use repeat-test-bin)" >&2
+            exit 1
+          fi
+          if [ -n "${USER_SCOPE}" ] && [ -z "${TEST_BIN_IN}" ]; then
+            echo "::error::repeat-user-scope=true requires repeat-test-bin (nothing would run)" >&2
             exit 1
           fi
           if [ -n "${USER_SCOPE}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then

@@ -1707,8 +1707,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::supervisor_bin_real verified"
 
-      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・CORE-3・CORE-4・OCI-6・#2596）: CLI は同じディレクトリの
-      # supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
+      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・SUP-12・SEC-4・CORE-3・OCI-6・#2596・#2761）: CLI は同じ
+      # ディレクトリの supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
       # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
       # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
       - name: start_stop_delete_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
@@ -1741,6 +1741,15 @@ jobs:
             echo "::error::start_stop_delete_real did not report the final line (possibly not executed)" >&2
             exit 1
           fi
+          # create の起動オプションの観測（#2761・SUP-12・SEC-4）: コンテナ内の /proc/self/limits と environ の値、
+          # start --audit-policy が supervisor に受理されたことを示す行。
+          opts='start_stop_delete_real: create options observed in the container:'
+          opts+=' /proc/self/limits nofile soft=256 hard=512; environ FANDHE_OPT_PROBE=observed-2761;'
+          opts+=' start passed --audit-policy best-effort'
+          if ! grep -Fxq "${opts}" "${log}"; then
+            echo "::error::start_stop_delete_real did not report the create options line (possibly not executed)" >&2
+            exit 1
+          fi
           part='start_stop_delete_real: scenario ok scope_present_before_delete='
           if ! grep -Fq "${part}" "${log}"; then
             echo "::error::start_stop_delete_real did not report: ${part} (possibly not executed)" >&2
@@ -1753,6 +1762,7 @@ jobs:
             fi
           done
           echo "${final}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${opts}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::start_stop_delete_real verified"
 
   # --------------------------------------------------

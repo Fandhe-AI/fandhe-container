@@ -45,7 +45,7 @@
 //!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
 //!   （fail-closed）
 //! - 作成プロセスの終了後・再起動後の残置 pin は、置き場の `.owned/<endpoint>` に永続化した所有記録
-//!   （[`owner_record`]。#2824）と、attach の取り残しの請求書に控えた識別子（`unpin_path_expecting`）の
+//!   （`owner_record`。#2824）と、attach の取り残しの請求書に控えた識別子（`unpin_path_expecting`）の
 //!   両方に一致し、さらにカーネルの実状態（nsfs の inode は umount の前、pin ファイルの inode と形は
 //!   unlink の前）も一致したときだけ解除できる。識別子を持たない `unpin_path` は再起動後の pin を扱わない
 //!
@@ -738,7 +738,7 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   マウントの有無に関わらず umount・削除の前に `FailedPrecondition` で拒否する。形（mode `0o400`・
 ///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
 ///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は
-///   [`unpin_path_expecting`]（請求書の識別子と、置き場の `.owned/<名前>` に永続化した所有記録の
+///   `unpin_path_expecting`（請求書の識別子と、置き場の `.owned/<名前>` に永続化した所有記録の
 ///   三者照合。#2824）だけが扱い、識別子を持たない本関数は扱わない（連番で世代を固定できないため）
 /// - pin を開いた fd の mount ID が置き場と同じ（未マウント）か、その ID の mountinfo の行が `nsfs` である
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
@@ -1933,6 +1933,94 @@ mod tests {
         };
         assert_eq!(got, want);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 実機前提（root）の別プロセス試験の子役: 環境変数で指定された置き場に実 netns を pin し、識別子を
+    /// 標準出力へ出して終了する（pin は解除しない）。環境変数が無ければ何もしない（親役から起動されたときだけ働く）。
+    #[test]
+    #[ignore = "real-machine child role of net1_xproc_nsfs_pin_cleanup (needs root)"]
+    fn net1_xproc_child_create_pin() {
+        let (Ok(base), Ok(name)) = (
+            std::env::var("FANDHE_NETNS_XPROC_BASE"),
+            std::env::var("FANDHE_NETNS_XPROC_NAME"),
+        ) else {
+            return;
+        };
+        let id = EndpointId::new(&name).unwrap();
+        let (_ns, fid) = create_pinned(
+            Path::new(&base),
+            &id,
+            Duration::from_secs(10),
+            &noop_recorder(),
+        )
+        .unwrap_or_else(|f| panic!("create_pinned failed: {}", f.error.message()));
+        let serial = lookup_pin(fid).unwrap().serial;
+        println!("XPROC_IDENT {} {} {}", fid.0, fid.1, serial);
+    }
+
+    /// 子役を別プロセスで起動し、出力された識別子を返す。子が終了してから返る。
+    fn spawn_pin_creator(base: &Path, name: &str) -> PinIdentity {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "netns::tests::net1_xproc_child_create_pin",
+            ])
+            .env("FANDHE_NETNS_XPROC_BASE", base)
+            .env("FANDHE_NETNS_XPROC_NAME", name)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "child failed: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("XPROC_IDENT "))
+            .expect("child must print XPROC_IDENT");
+        let v: Vec<u64> = line.split(' ').map(|x| x.parse().unwrap()).collect();
+        PinIdentity {
+            dev: v[0],
+            ino: v[1],
+            serial: v[2],
+        }
+    }
+
+    /// NET-1・REPAIR-3・#2824（実機前提・root）: pin を作ったプロセスが終了した後、別プロセス（本プロセス）が
+    /// 永続の所有記録を読み、nsfs の識別子・umount 後のファイルを照合して回収できる。別世代の識別子では
+    /// 何も解除しない。実行: `cargo test -p fandhe-container-net --lib -- --ignored net1_xproc_nsfs_pin_cleanup`
+    #[test]
+    #[ignore = "needs root (mount of nsfs); NET-1・#2824. See AGENTS.md real-machine tests"]
+    fn net1_xproc_nsfs_pin_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-nsfs");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = base.join("web-1");
+        let base_mnt = file_mount_id(&File::open(&base).unwrap()).unwrap();
+
+        // 1 世代目: 作成プロセスは終了済み。本プロセスのメモリには記録が無い。
+        let old = spawn_pin_creator(&base, "web-1");
+        assert!(lookup_pin((old.dev, old.ino)).is_none());
+        assert_ne!(file_mount_id(&File::open(&pin).unwrap()).unwrap(), base_mnt);
+        assert!(ledger_path(&base, "web-1").exists());
+        // 識別子なしの unpin_path は再起動後の pin を扱わない。
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        unpin_path_expecting(&pin, old).unwrap();
+        assert!(!pin.exists());
+        assert!(!ledger_path(&base, "web-1").exists());
+
+        // 2 世代目: 同じ名前の別世代。古い識別子では解除せず、正しい識別子なら解除する。
+        let new = spawn_pin_creator(&base, "web-1");
+        assert_ne!(new.serial, old.serial);
+        let e = unpin_path_expecting(&pin, old).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        assert_ne!(file_mount_id(&File::open(&pin).unwrap()).unwrap(), base_mnt);
+        unpin_path_expecting(&pin, new).unwrap();
+        assert!(!pin.exists());
+        cleanup_scratch(&base);
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {

@@ -127,12 +127,13 @@ impl OwnedDir {
     /// `.owned` を開く。無ければ（`create` のとき）0700 で作る。symlink・非ディレクトリ・実効 UID 以外の所有・
     /// group / other 書き込み可は拒否する（fail-closed）。
     pub(super) fn open(dir: &PinDir, create: bool) -> Result<Self, NetError> {
+        let mut created = false;
         let fd = match sys::open_dir_nofollow_at(dir.file.as_fd(), OWNED_DIR_NAME) {
             Ok(fd) => fd,
             Err(SysError::Os(e)) if e == sys::ENOENT && create => {
                 let path = dir.entry(std::ffi::OsStr::new(".owned"));
                 match fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => {}
+                    Ok(()) => created = true,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(io_error("create netns owner directory", &e)),
                 }
@@ -143,6 +144,12 @@ impl OwnedDir {
             Err(e) => return Err(sys_error("open netns owner directory", e)),
         };
         let file = File::from(fd);
+        if created {
+            // `DirBuilder::mode` は umask の影響を受ける（umask 0200 なら 0500 になり記録を作れない）。
+            // 開いた fd で固定した実体に対して明示的に 0700 へ揃える（fchmod）。
+            file.set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| io_error("chmod netns owner directory", &e))?;
+        }
         let meta = file
             .metadata()
             .map_err(|e| io_error("stat netns owner directory", &e))?;

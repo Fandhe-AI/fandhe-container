@@ -73,6 +73,29 @@ expect 1 "subst-re mismatch" -- --name r --src "${work}/re.rs" --log "${work}/re
 printf 'r: samples=1 done extra\n' > "${work}/re3.log"
 expect 1 "subst-re no prefix match" -- --name r --src "${work}/re.rs" --log "${work}/re3.log" --select '^r: ' --subst-re 'n=[0-9]+'
 
+# 移行後の形（#2825）: 同じ接頭辞の診断リテラルと書式指定つき eprintln があっても、狭い選別なら成功する。
+cat > "${work}/n.rs" <<'EOF2'
+fn main() {
+    println!("n: ignored (real-machine test)");
+    eprintln!("n: flags before up = {flags:#x}");
+    println!("n: delivered verified (root={root})");
+    println!("n: scenario {name} ok (uid={}, gid={})", 1, 2);
+    println!("n: lifetime expired (exit={}, euid={euid})", 1);
+}
+EOF2
+printf 'n: flags before up = 0x1\nn: delivered verified (root=false)\n' > "${work}/n.log"
+expect 0 "narrow select ignores diagnostic literals" -- --name n --src "${work}/n.rs" --log "${work}/n.log" \
+  --select '^n: delivered verified' --subst root=false --forbid 'n: ignored'
+expect 1 "wide select hits unsupported format spec" -- --name n --src "${work}/n.rs" --log "${work}/n.log" \
+  --select '^n: (delivered|flags)' --subst root=false
+printf 'n: scenario direct ok (uid=5, gid=6)\nn: scenario helper ok (uid=5, gid=6)\nn: lifetime expired (exit=75, euid=5)\n' > "${work}/n2.log"
+expect 0 "fixed positional values in separate calls" -- --name n --src "${work}/n.rs" --log "${work}/n2.log" \
+  --select '^n: scenario ' --subst name=direct,helper --subst-pos 5 --subst-pos 6
+expect 0 "lifetime line with its own call" -- --name n --src "${work}/n.rs" --log "${work}/n2.log" \
+  --select '^n: lifetime expired' --subst-pos 75 --subst euid=5
+expect 1 "missing scenario in log (migrated shape)" -- --name n --src "${work}/n.rs" --log "${work}/n2.log" \
+  --select '^n: scenario ' --subst name=direct,helper,extra --subst-pos 5 --subst-pos 6
+
 if [ "${fails}" -ne 0 ]; then
   echo "check-success-lines-selftest: ${fails} case(s) failed" >&2
   exit 1

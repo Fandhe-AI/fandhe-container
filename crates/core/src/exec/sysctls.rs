@@ -236,7 +236,7 @@ mod tests {
         sys::fs_type(root.as_fd()).unwrap()
     }
 
-    /// CORE-3: 値を 1 回の書き込みで該当ファイルへ書く。
+    /// CRI-2・CORE-3: 値を 1 回の書き込みで該当ファイルへ書く。
     #[test]
     fn writes_each_value_to_its_file() {
         let root = FakeRoot::new("write");
@@ -258,7 +258,7 @@ mod tests {
         );
     }
 
-    /// 存在しないキーは読み飛ばさず `InvalidArgument` で止める。
+    /// CRI-2・CORE-3: 存在しないキーは読み飛ばさず `InvalidArgument` で止める。
     #[test]
     fn missing_key_stops_with_invalid_argument() {
         let root = FakeRoot::new("missing");
@@ -274,7 +274,7 @@ mod tests {
         assert!(!err.message.contains("shmmax"), "{}", err.message);
     }
 
-    /// procfs でなければ（偽の種別を期待させて）書かずに拒否する。
+    /// CORE-3・SEC-1: procfs でなければ（偽の種別を期待させて）書かずに拒否する。
     #[test]
     fn non_procfs_is_rejected_before_any_write() {
         let root = FakeRoot::new("magic");
@@ -293,7 +293,7 @@ mod tests {
         );
     }
 
-    /// 葉が symlink なら辿らず拒否する（`O_NOFOLLOW`）。
+    /// SEC-1: 葉が symlink なら辿らず拒否する（`O_NOFOLLOW`。rootfs の外へ書かせない）。
     #[test]
     fn leaf_symlink_is_not_followed() {
         let root = FakeRoot::new("symlink");
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
     }
 
-    /// 途中のディレクトリが symlink なら辿らず拒否する。
+    /// SEC-1: 途中のディレクトリが symlink なら辿らず拒否する（rootfs の外へ書かせない）。
     #[test]
     fn intermediate_symlink_is_not_followed() {
         let root = FakeRoot::new("dirlink");
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(outside.join("msgmax")).unwrap(), "");
     }
 
-    /// 計画は必要な名前空間が実効の集合にあるときだけ作れる（ホストの名前空間へ書かせない）。
+    /// CORE-3・SEC-1: 計画は必要な名前空間が実効の集合にあるときだけ作れる（ホストの名前空間へ書かせない）。
     #[test]
     fn plan_requires_effective_namespaces() {
         let ipc = set_of(&[("kernel.shmmax", "1")]);

@@ -239,7 +239,7 @@ mod tests {
         }
     }
 
-    /// 文法違反（許可リストのすり抜けを含む）は `Malformed`。
+    /// CRI-2・CORE-3・SEC-1: 文法違反（許可リストのすり抜けを含む）は `Malformed`。
     #[test]
     fn rejects_malformed_keys() {
         let long = format!("net.{}", "a".repeat(SYSCTL_MAX_KEY_BYTES));
@@ -269,7 +269,7 @@ mod tests {
         assert!(SysctlKey::parse(&ok).is_ok());
     }
 
-    /// 値の文法。
+    /// CRI-2・CORE-3・SEC-1: 値の文法（不正な値は受け入れない）。
     #[test]
     fn value_grammar() {
         assert_eq!(
@@ -287,7 +287,7 @@ mod tests {
         );
     }
 
-    /// 集合は昇順・重複拒否・名前空間の問い合わせができる。
+    /// CRI-2・CORE-3: 集合は昇順・重複拒否・名前空間の問い合わせができる。
     #[test]
     fn set_is_ordered_and_rejects_duplicates() {
         let mut set = SysctlSet::new();
@@ -309,7 +309,7 @@ mod tests {
         );
     }
 
-    /// 件数の上限。
+    /// CRI-2・CORE-3・SEC-1: 件数の上限（無制限の確保をさせない）。
     #[test]
     fn set_entry_limit() {
         let mut set = SysctlSet::new();

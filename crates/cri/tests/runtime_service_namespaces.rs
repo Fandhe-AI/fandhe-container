@@ -28,7 +28,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
@@ -139,8 +141,10 @@ impl ContainerRuntime for UnshareRuntime {
 struct FixedBundle;
 
 impl BundleProvider for FixedBundle {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
-        Ok(PathBuf::from("/tmp/unused-bundle").join(req.container_id))
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
+        Ok(PreparedBundle::new(
+            PathBuf::from("/tmp/unused-bundle").join(req.container_id),
+        ))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())

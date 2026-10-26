@@ -6,7 +6,7 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`image_id`・`user`・`message`・`info` は空のスタブ（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`image_id`・`message`・`info` は空のスタブ（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use crate::adapter::RuntimeTerminationReason;
+use crate::bundle::AppliedUser;
 use crate::error::CriError;
 use fandhe_container_core::traits::ContainerLogPath;
 use prost::Message;
@@ -154,6 +155,27 @@ pub(super) struct ContainerRecord {
     /// 真の間、Stop・Remove は記録上の遷移ではなく実行層の stop・delete を経由する（TASK-59.3）。
     /// 意味は「実行層が所有する」。
     pub(super) runtime_owned: bool,
+    /// 実際に stop で使うシグナル（CRI の `Signal` の i32。`RUNTIME_DEFAULT`（0）は入れない。#2771・CRI-2・OCI-1）。
+    ///
+    /// 作成時は config の値（`RUNTIME_DEFAULT` なら `SIGTERM`）で、`BundleProvider` が解決済みの値を報告したら
+    /// イメージ config の `StopSignal` を反映した値で上書きされる。`ContainerStatus.stop_signal` と
+    /// StopContainer / StopPodSandbox が使う。プロセス内メモリにあるだけで、plugin-cri の再起動で失われる
+    /// （`exit_code`・`resolved_log_path` と同じ寿命。config の annotations には書かない）。
+    pub(super) stop_signal: i32,
+    /// 起動時に適用する識別情報（`ContainerStatus.user.linux` の元。#2771・CRI-2・SEC-5・KEP-3619）。
+    ///
+    /// 実行層の経路で `SpecBundleProvider` が config.json に書いた値だけが入る。報告の無い経路は `None`
+    /// （root を作り出さない）。寿命は `stop_signal` と同じ。
+    pub(super) applied_user: Option<AppliedUser>,
+}
+
+/// 新しい記録の `stop_signal` の初期値（config の値。`RUNTIME_DEFAULT` は `SIGTERM`）。
+pub(super) fn initial_stop_signal(configured: i32) -> i32 {
+    if configured == v1::Signal::RuntimeDefault as i32 {
+        v1::Signal::Sigterm as i32
+    } else {
+        configured
+    }
 }
 
 /// 終了コード 0 の `ContainerStatus.reason`（containerd・kubelet の慣例に合わせた CamelCase。CRI-2）。
@@ -201,8 +223,10 @@ impl ContainerRecord {
     /// **スタブの明示（REPAIR-3・CRI-2）**: 次の項目は返せる情報源が無く、空・`None` のまま。
     /// - `image_ref`・`image_id`: `CriRuntimeService` が `ImageStore` を持たない。将来は CreateContainer 時に
     ///   `ImageStore` で解決して記録へ保持した digest 等を返す（未注入・未解決は空のまま）。
-    /// - `user`: 実プロセスの uid / gid / 補助 group が必要。将来は `BundleProvider` の本番実装
-    ///   （TASK-114）が作った bundle の `process.user` から返す。
+    /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。
+    ///   `applied_user`）を返す。報告の無い経路（スタブ等）と、補助グループが空で実プロセスのグループと一致を保証できない場合は `None`。`supplemental_groups` は重複除去後の最終の
+    ///   集合で、主 gid は自動では含めない（containerd は含めることがある既知の差）。`stop_signal` は実際に
+    ///   stop で使う解決済みの値（#2771）。
     /// - `message`: 実行層の応答文字列を外へ出さない方針のため固定文字列のみ許す。OOM でも空。
     /// - `info`（verbose）: 固定キーの診断情報を将来返す。現状は空。
     ///
@@ -244,8 +268,27 @@ impl ContainerRecord {
                 .map_or_else(|| self.config.log_path.clone(), |p| p.as_str().to_owned()),
             resources,
             image_id: String::new(),
-            user: None,
-            stop_signal: self.config.stop_signal,
+            // 補助グループが明示（非空）のときだけ報告する。空の指定は core が `setgroups(0)` で消去するが、
+            // `RootlessSingleId` のように user namespace が `setgroups` を禁じる構成では起動元の補助グループを
+            // 現状維持して起動を続ける（`KeptSetgroupsDenied`）。cri 側では実際に残るグループを知り得ず、
+            // 空を報告すると実プロセスと食い違うため、その場合は user を未報告にする（CRI-2・SEC-5。
+            // 実行層が確定した初期グループを記録へ返す経路は未実装）。非空は適用できなければ起動が失敗する。
+            user: self
+                .applied_user
+                .as_ref()
+                .filter(|u| !u.additional_gids().is_empty())
+                .map(|u| v1::ContainerUser {
+                    linux: Some(v1::LinuxContainerUser {
+                        uid: i64::from(u.uid()),
+                        gid: i64::from(u.gid()),
+                        supplemental_groups: u
+                            .additional_gids()
+                            .iter()
+                            .map(|g| i64::from(*g))
+                            .collect(),
+                    }),
+                }),
+            stop_signal: self.stop_signal,
         }
     }
 

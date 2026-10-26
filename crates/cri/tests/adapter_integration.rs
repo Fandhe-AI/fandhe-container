@@ -18,7 +18,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
     DeleteResponse, ErrorCode, KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -161,14 +163,14 @@ fn bundle_root() -> PathBuf {
 struct RecordingBundles(Mutex<Vec<String>>);
 
 impl BundleProvider for RecordingBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map_or("", |m| m.name.as_str());
         self.0
             .lock()
             .unwrap()
             .push(format!("prepare {container_id} {sandbox_id} {name}"));
-        Ok(bundle_root().join(container_id))
+        Ok(PreparedBundle::new(bundle_root().join(container_id)))
     }
     fn release(&self, container_id: &str) -> Result<(), CriError> {
         self.0

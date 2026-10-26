@@ -116,8 +116,8 @@ use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::ContainerLogPath;
 
 use crate::adapter::{
-    BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, RuntimeAdapter,
-    RuntimeContainerStatus, RuntimeLifecycle,
+    BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
+    RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
 };
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::port_mapping::{PodPortPublish, parse_port_mappings};
@@ -128,7 +128,7 @@ use crate::runtime::v1::{
 use config_limits::BoundedConfig;
 use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
-    validate_create_request,
+    initial_stop_signal, validate_create_request,
 };
 
 pub use container::{ContainerLimits, MAX_CONTAINERS, MAX_RETAINED_CONTAINER_CONFIG_BYTES};
@@ -876,6 +876,66 @@ fn rollback_in_flight(
     }
 }
 
+/// 報告された補助グループ 1 件あたりの保持量の見積もり（u32 の大きさ）。
+const APPLIED_GID_RETAINED_BYTES: usize = 4;
+/// `AppliedUser` 1 件の保持量の固定分の見積もり（uid・gid・Vec の管理領域）。
+const APPLIED_USER_RETAINED_BASE_BYTES: usize = 64;
+
+/// `BundleProvider::prepare` が報告した識別情報と stop signal を、実行層へ渡す前に記録へ反映する（#2771・CRI-2）。
+///
+/// `create_container_runtime` の worker から呼ぶ。識別情報の保持量（補助グループは最大 65,536 件）を
+/// `container_retained_bytes` と記録の `retained_bytes` の両方へ足す（`drop_container_in` が同じ量を引き戻すため
+/// 枠は漏れない）。累積が上限を超えたら `FAILED_PRECONDITION`（黙って切り詰めない）。記録が無い・矛盾は `INTERNAL`。
+fn attach_prepared(
+    registry: &Mutex<SandboxRegistry>,
+    container_id: &str,
+    prepared: &PreparedBundle,
+    max_retained_bytes: usize,
+) -> Result<(), CriError> {
+    let extra = prepared.user().map_or(0, |u| {
+        u.additional_gids()
+            .len()
+            .saturating_mul(APPLIED_GID_RETAINED_BYTES)
+            .saturating_add(APPLIED_USER_RETAINED_BASE_BYTES)
+    });
+    let mut registry = registry
+        .lock()
+        .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+    let total = registry
+        .container_retained_bytes
+        .checked_add(extra)
+        .filter(|total| *total <= max_retained_bytes)
+        .ok_or_else(|| CriError::failed_precondition("container config storage is full"))?;
+    let record = registry
+        .containers
+        .get_mut(container_id)
+        .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
+    let retained = record
+        .retained_bytes
+        .checked_add(extra)
+        .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
+    record.retained_bytes = retained;
+    record.applied_user = prepared.user().cloned();
+    if let Some(signal) = prepared.stop_signal() {
+        record.stop_signal = signal as i32;
+    }
+    registry.container_retained_bytes = total;
+    Ok(())
+}
+
+/// kubelet に伝える実行時の機能フラグ（`StatusResponse.features`。KEP-3619 等。#2771・CRI-2）。
+///
+/// `supplemental_groups_policy` は、`supplemental_groups` と `supplemental_groups_policy`（Merge / Strict）の受け入れ、
+/// `ContainerStatus.user.linux` の報告、イメージ config の StopSignal の解釈が揃ったため真にする。
+/// **スタブの明示（REPAIR-3）**: Status RPC は未実装（`UNIMPLEMENTED`）のため、現状この値は応答に乗らない。
+/// Status RPC を実装するときにこの関数の結果を `StatusResponse.features` に使う（CRI-1・CRI-2）。
+pub fn runtime_features() -> v1::RuntimeFeatures {
+    v1::RuntimeFeatures {
+        supplemental_groups_policy: true,
+        ..Default::default()
+    }
+}
+
 /// コンテナ記録の除去（件数・保持量の枠と名前キーの解放）。worker からも呼ぶため registry を直接受ける。
 fn drop_container_in(
     registry: &Mutex<SandboxRegistry>,
@@ -1606,6 +1666,7 @@ impl CriRuntimeService {
         let container_id =
             container_id.ok_or_else(|| CriError::internal("failed to allocate container id"))?;
         let config = config.into_config();
+        let stop_signal = initial_stop_signal(config.stop_signal);
         let provider_config = in_flight.then(|| config.clone());
         let provider_sandbox_config = in_flight.then(|| sandbox.config.clone());
         let provider_pod_netns = in_flight
@@ -1627,6 +1688,8 @@ impl CriRuntimeService {
                 resolved_log_path,
                 in_flight,
                 runtime_owned: false,
+                stop_signal,
+                applied_user: None,
             },
         );
         registry.container_keys.insert(key);
@@ -1670,6 +1733,8 @@ impl CriRuntimeService {
         let bundles = Arc::clone(&binding.bundles);
         let id = container_id.clone();
         let timeout = self.runtime_timeout;
+        let registry = Arc::clone(&self.registry);
+        let max_retained_bytes = self.container_limits.max_retained_bytes();
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
@@ -1679,9 +1744,12 @@ impl CriRuntimeService {
                 &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
                     .with_pod_netns_path(pod_netns.as_deref()),
             )?;
+            // 実行層へ渡す前に、報告された識別情報と解決済みの stop signal を記録へ反映する。保持量の上限を
+            // 超えたらここで失敗し、guard が bundle の解放と記録の巻き戻しを行う（#2771）。
+            attach_prepared(&registry, &id, &bundle, max_retained_bytes)?;
             // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
             guard.mark_dispatched();
-            let status = match adapter.create(&id, bundle) {
+            let status = match adapter.create(&id, bundle.path().to_path_buf()) {
                 Ok(status) => status,
                 Err(status) => {
                     if is_definite_failure(status.code()) || confirm_removed(&adapter, &id, timeout)
@@ -1886,7 +1954,7 @@ impl CriRuntimeService {
                 ContainerState::Running | ContainerState::Unknown => {}
             }
             // 写像に失敗したら in_flight を立てる前に失敗する（SIGTERM へ黙って落とさない。fail-closed）。
-            let signal = crate::stop_signal::linux_stop_signal(record.config.stop_signal)
+            let signal = crate::stop_signal::linux_stop_signal(record.stop_signal)
                 .map_err(|_| CriError::internal("stop_signal could not be resolved"))?;
             record.in_flight = true;
             (
@@ -2074,9 +2142,9 @@ impl CriRuntimeService {
                         ids.push(id.clone());
                         signals.insert(
                             id.clone(),
-                            crate::stop_signal::linux_stop_signal(c.config.stop_signal).map_err(
-                                |_| CriError::internal("stop_signal could not be resolved"),
-                            ),
+                            crate::stop_signal::linux_stop_signal(c.stop_signal).map_err(|_| {
+                                CriError::internal("stop_signal could not be resolved")
+                            }),
                         );
                     }
                     (false, ContainerState::Running) => {
@@ -3005,10 +3073,10 @@ mod tests {
     }
 
     impl BundleProvider for HangingRelease {
-        fn prepare(&self, _: &BundleRequest<'_>) -> Result<std::path::PathBuf, CriError> {
+        fn prepare(&self, _: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
             self.prepares
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(std::path::PathBuf::from("/bundles/x"))
+            Ok(PreparedBundle::new(std::path::PathBuf::from("/bundles/x")))
         }
         fn release(&self, _: &str) -> Result<(), CriError> {
             self.releases

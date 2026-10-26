@@ -718,6 +718,7 @@ mod tests {
         let e = health_from_exec_exit(ExecExit::SetupFailed {
             exit: ChildExit::Exited(127),
             violation: None,
+            code: ErrorCode::NotFound,
         })
         .unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);

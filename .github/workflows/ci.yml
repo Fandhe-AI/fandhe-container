@@ -1358,6 +1358,8 @@ jobs:
             echo "::error::production_launcher did not report the final line (possibly not executed)" >&2
             exit 1
           fi
+          ef='production_launcher: scenario=exec-failure'
+          ef_tail='state=created audit=0 children=0'
           for part in \
             'production_launcher: subordinate id mapping verified (uid extents=' \
             'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
@@ -1370,7 +1372,10 @@ jobs:
             'production_launcher: sysctls applied (scenario=V shmmax=' \
             'production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y' \
             'production_launcher: pod ipc namespace joined (scenario=W' \
-            'production_launcher: scenario=rslave-bind host='; do
+            'production_launcher: scenario=rslave-bind host=' \
+            "${ef} case=loader-missing code=NotFound phase=prepare ${ef_tail}" \
+            "${ef} case=not-executable code=PermissionDenied phase=execveat ${ef_tail}" \
+            "${ef} case=garbage code=InvalidArgument phase=execveat ${ef_tail}"; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
               exit 1

@@ -50,6 +50,7 @@ expect_eq() {
 #   stuck    = ok と同じだが、stop しても running のまま（B23 の終了待ちが期限切れになる。#2891）
 #   delfail  = ok と同じだが、c2 の delete が失敗し c2 が残る（後始末の inspect は成功する。#2891）
 #   delgone  = c2 の delete は失敗するが c2 は消える（後始末の inspect は NOT_FOUND。#2891）
+#   sigdel   = c2 の delete が止まる（1 回目 = 連鎖中、2 回目 = 後始末中。印は STUB_SIGDEL_DIR の m1 / m2。#2891 の再入）
 #   deldeny  = c2 の delete が失敗し、以後の c2 の inspect が PERMISSION_DENIED で失敗する（#2891）
 # 環境変数で出力を差し替える（fixture 表。カウンタはそのディレクトリの count に置く）:
 #   STUB_ERR_DIR = 使い方エラーの n 回目に err.<n> があれば、その内容をそのまま stderr へ流す。
@@ -248,6 +249,10 @@ case "$cmd" in
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete
     if [ "$id" = "c2" ]; then
       case "$mode" in
+        sigdel)
+          echo "$PPID" >"$STUB_SIGDEL_DIR/ppid"
+          if [ -e "$STUB_SIGDEL_DIR/m1" ]; then : >"$STUB_SIGDEL_DIR/m2"; else : >"$STUB_SIGDEL_DIR/m1"; fi
+          sleep 30 ;;
         delfail) fail_op 6 INTERNAL delete ;;
         delgone) rm -f "$root/$id.c" "$root/$id.started" "$root/$id.stopped"; fail_op 6 INTERNAL delete ;;
         deldeny) : >"$root/$id.denied"; fail_op 6 INTERNAL delete ;;
@@ -443,6 +448,9 @@ for m in delfail delgone deldeny; do
   TMPDIR="$work/tmp-$m" start_capture "$m" "$m"
 done
 start_capture noisy noisy
+# 後始末（stop / delete）の最中に TERM を再度受けても状態ルートを消さない（#2891・REPAIR-5）。
+mkdir -p "$work/tmp-sigdel" "$work/sigdel"
+STUB_SIGDEL_DIR="$work/sigdel" TMPDIR="$work/tmp-sigdel" start_capture sigdel sigdel
 STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
@@ -451,6 +459,23 @@ insp_names="full rofalse noro badro extrarw order extra missing nolf crlf twolin
 for n in $insp_names; do
   STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
 done
+# sigdel: 連鎖中の delete（m1）で 1 回目の TERM、後始末中の delete（m2）で 2 回目の TERM を送る。
+wait_for_file() { # <パス>。最大 60 秒
+  local n=0
+  while [ ! -e "$1" ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
+  [ -e "$1" ]
+}
+if wait_for_file "$work/sigdel/m1"; then
+  IFS= read -r sigdel_pid <"$work/sigdel/ppid"
+  kill -TERM "$sigdel_pid" 2>/dev/null || true
+  if wait_for_file "$work/sigdel/m2"; then
+    kill -TERM "$sigdel_pid" 2>/dev/null || true
+  else
+    fail "sigdel: cleanup reached delete"
+  fi
+else
+  fail "sigdel: chain reached delete"
+fi
 wait
 
 all_caps="ok lcall nonlinux nostart diff noisy errtable errmax outtable"
@@ -881,6 +906,8 @@ count_left() { # <ディレクトリ>
 expect_eq "delete failed and c2 remains (inspect ok): state root is kept" 1 "$(count_left "$work/tmp-delfail")"
 expect_eq "delete failed and inspect is PERMISSION_DENIED: state root is kept" 1 "$(count_left "$work/tmp-deldeny")"
 expect_eq "delete failed but inspect is NOT_FOUND: state root is removed" 0 "$(count_left "$work/tmp-delgone")"
+expect_eq "signal re-entry during cleanup delete: state root is kept" 1 "$(count_left "$work/tmp-sigdel")"
+expect_eq "signal re-entry during cleanup delete: exit 143" 143 "$(rc_of sigdel)"
 if grep -q 'could not be reclaimed' "$work/delfail.err"; then pass "delfail warns about manual cleanup"; else fail "delfail warns about manual cleanup"; fi
 if grep -q 'could not be reclaimed' "$work/deldeny.err"; then pass "deldeny warns about manual cleanup"; else fail "deldeny warns about manual cleanup"; fi
 if grep -q 'could not be reclaimed' "$work/delgone.err"; then fail "delgone must not warn"; else pass "delgone does not warn"; fi

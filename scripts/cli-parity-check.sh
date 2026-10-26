@@ -240,6 +240,9 @@ cleanup() {
   # supervisor・委譲 scope が残る場合の限界は docs/verification/cli-cross-platform-parity.md に書く。
   if [ "$chain_live" -eq 1 ] && [ -n "$chain_cli" ] && [ -d "$tmp_dir" ]; then
     chain_live=0
+    # 回収の開始前に保持を立てる。stop / delete / 不在確認の途中で TERM・INT・HUP を受けて trap から再入しても、
+    # chain_live=0 かつ keep_state=0 で rm -rf に到達しないようにする。不在を確認できた後だけ下で解除する（REPAIR-5）。
+    keep_state=1
     run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL c2 || true
     sleep 0.5
     run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
@@ -260,9 +263,9 @@ cleanup() {
     fi
     if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
       err warning "container c2 could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
-      keep_state=1
       return 0
     fi
+    keep_state=0
   fi
   if [ "$keep_state" -eq 1 ]; then
     return 0

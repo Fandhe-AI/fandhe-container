@@ -10,8 +10,8 @@
 | 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔#1917・状態ルート配下の source の拒否〕で現状は拒否される。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
-| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み | core → cri | #2667 |
-| 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み | core → cri | #2668 |
+| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み。`ContainerStatus.user` の報告と機能フラグは #2771 で追加 | core → cri | #2667・#2771 |
+| 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み。イメージ config の `StopSignal` と ContainerStatus の報告は #2771 で追加 | core → cri | #2668・#2771 |
 | 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
 | 8 | sysctls（namespaced のみ） | core の `linux.sysctl` の適用 → cri。IPC 系は本変更で実装済み。`net.*` は順 13 まで `UNIMPLEMENTED` | core → cri | #2670 |
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671（実装済み。下の節。ランチャー経由と ReopenContainerLog は未対応。総量は上限つき） |
@@ -93,7 +93,15 @@ CRI の `LinuxContainerSecurityContext.run_as_username` は、`ImageRootfsSource
 | 単一 ID 写像で非空 | start で `FAILED_PRECONDITION`（`setgroups` が `deny` のため。黙って落とさない） |
 | `/etc/group` が symlink・FIFO・上限超過（uid 非 0 で名前が決まったとき） | `FAILED_PRECONDITION`。不在は空 |
 
-exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPLEMENTED` で拒否する。`ContainerStatus.user` の報告と `RuntimeHandlerFeatures` の `supplemental_groups_policy` は未対応。
+exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPLEMENTED` で拒否する。
+
+### ContainerStatus.user の報告と機能フラグ（#2771。KEP-3619）
+
+- `ContainerStatus.user.linux` に、起動時に適用する uid・gid・補助グループを返す。値は `SpecBundleProvider` が書いた `config.json` の `process.user` と同じもの（`RuntimeConfigJson::process_user()`）で、推測や既定値で補わない。補助グループは重複除去後の最終の集合で、順序は `additionalGids` と同じ
+- 主 gid は補助グループへ自動では足さない（core の launcher が `setgroups(list)` でそのまま適用するため）。containerd は `additionalGids` に主 gid を含めることがあり、ここが既知の差
+- 報告は `BundleProvider::prepare` の戻り値 `PreparedBundle`（`user()`）で `CriRuntimeService` へ届き、`ContainerRecord.applied_user` に保持する。置き場所はプロセス内メモリのレジストリで、寿命は `exit_code`・`resolved_log_path` と同じ（plugin-cri の再起動で消える）。config の annotations には書かず（CRI は書き換えを禁じる）、core の `StateStore` にも書かない（PLUG-1 の境界）。報告の無い経路（スタブ・報告しない provider）は `user` が `None` のまま（root を作り出さない）
+- 補助グループの保持量（最大 65,536 件）は `container_retained_bytes` の累積上限に入れ、超えたら `FAILED_PRECONDITION`（黙って切り詰めない）
+- 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。Status RPC が未実装（`UNIMPLEMENTED`）のため現状は応答に乗らない。Status RPC の実装時にこの関数を使う（REPAIR-3）
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 
@@ -137,7 +145,18 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 - core の `StopRequest` に `signal`（既定 SIGTERM）を足した（`with_signal` / `signal()`）。実装は `signal()` を停止の意図つきで 1 回送り、`grace` を過ぎても止まらなければ、シグナルが何であっても無条件に SIGKILL へ切り替える。全体の待ちは有界のまま（REPAIR-5）。wire の形式は変わらない
 - CRI の enum `Signal` の値は Linux の番号ではない（例: `SIGTERM = 23`、`SIGKILL = 13`）。`crates/cri/src/stop_signal.rs` の表で Linux の番号へ写す。`RUNTIME_DEFAULT`（0）は SIGTERM。実時間シグナルは glibc / moby の慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64）
 - 未知の値は CreateContainer の検証で `INVALID_ARGUMENT`。StopContainer は記録した config から、StopPodSandbox はコンテナごとに値を求めて渡す（写像に失敗したら SIGTERM へ落とさず `INTERNAL`）
-- 既知の差: イメージ config の `StopSignal` は読まないため、`RUNTIME_DEFAULT` は常に SIGTERM になる。ContainerStatus の `stop_signal` は config の値をそのまま返す（後続で扱う）
+- イメージ config の `StopSignal` を読む（#2771・OCI-1）。`ImageDefaults.stop_signal` へ解釈し、CRI の `stop_signal` が `RUNTIME_DEFAULT` のときだけ使う（無ければ SIGTERM）。CRI の明示値が優先される。解釈できない値は、CRI 側が既定以外でも CreateContainer を `INVALID_ARGUMENT` で拒否する（fail-closed。レイヤー展開の前に判定）
+- StopSignal で受ける形式（`parse_image_stop_signal`）:
+
+  | 入力 | 結果 |
+  | ---- | ---- |
+  | 空・欠落 | 未指定 |
+  | 数字だけ（1〜64。32・33 を除く） | その Linux 番号 |
+  | `SIGTERM`・`TERM`・`sigterm`（`SIG` 接頭辞は任意・ASCII の大文字小文字を区別しない） | 名前の表との照合 |
+  | `SIGRTMIN`・`SIGRTMIN+1`〜`+15`・`SIGRTMAX`・`SIGRTMAX-1`〜`-14` | 実時間シグナル |
+  | 上記以外（空白・非 ASCII・範囲外・未知の名前・64 バイト超） | `INVALID_ARGUMENT`（固定文言。値は含めない） |
+
+- `ContainerStatus.stop_signal` は実際に stop で使う解決済みの値を返す（`ContainerRecord.stop_signal`。`RUNTIME_DEFAULT` は入れない）。`RUNTIME_DEFAULT` の config は SIGTERM（23）と報告され、別名の明示値（例: 15 = SIGPOLL）はそのまま返る。StopContainer・StopPodSandbox も同じ値を使う。置き場所と寿命は `applied_user` と同じ
 
 ## capabilities の受け入れ方式（CRI-2・SEC-1。#2666）
 

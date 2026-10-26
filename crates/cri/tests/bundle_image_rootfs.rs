@@ -373,6 +373,7 @@ fn container(image: &str) -> ContainerConfig {
 fn prepare(p: &SpecBundleProvider, id: &str, c: &ContainerConfig) -> Result<PathBuf, CriError> {
     let pod = PodSandboxConfig::default();
     p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+        .map(|b| b.path().to_path_buf())
 }
 
 /// 木の（相対パス, 種別, mode, 内容）の一覧。symlink は辿らない。

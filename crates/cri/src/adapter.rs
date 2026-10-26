@@ -353,6 +353,52 @@ impl PodNetns {
     }
 }
 
+/// [`BundleProvider::prepare`] の結果（bundle のパスと、実際に適用する値の報告。#2771・CRI-2・OCI-1・SEC-5）。
+///
+/// 将来の報告項目の追加に備えて `#[non_exhaustive]` とし、[`PreparedBundle::new`] と `with_*` で作る。
+/// `CriRuntimeService` が受け取って `ContainerRecord` に記録し、`ContainerStatus` の `user`・`stop_signal` と
+/// StopContainer が使うシグナルに反映する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PreparedBundle {
+    path: PathBuf,
+    user: Option<crate::bundle::AppliedUser>,
+    stop_signal: Option<crate::runtime::v1::Signal>,
+}
+
+impl PreparedBundle {
+    /// 報告なしで bundle のパスだけを返す。
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            user: None,
+            stop_signal: None,
+        }
+    }
+    /// 起動時に適用する uid・gid・補助グループの報告を足す。
+    pub fn with_user(mut self, user: crate::bundle::AppliedUser) -> Self {
+        self.user = Some(user);
+        self
+    }
+    /// 実際に stop で使うシグナル（解決済み。`RUNTIME_DEFAULT` ではない）の報告を足す。
+    pub fn with_stop_signal(mut self, signal: crate::runtime::v1::Signal) -> Self {
+        self.stop_signal = Some(signal);
+        self
+    }
+    /// bundle の絶対パス。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// 適用する識別情報（報告が無ければ `None`。root を作り出さない）。
+    pub fn user(&self) -> Option<&crate::bundle::AppliedUser> {
+        self.user.as_ref()
+    }
+    /// 解決済みの stop signal（報告が無ければ `None`）。
+    pub fn stop_signal(&self) -> Option<crate::runtime::v1::Signal> {
+        self.stop_signal
+    }
+}
+
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
 ///
 /// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
@@ -365,8 +411,11 @@ impl PodNetns {
 /// plugin-cri が `SpecBundleProvider` と組んで差す。タグの解決は未実装（REPAIR-3。image ID のみ受ける）。
 /// `config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
 pub trait BundleProvider: Send + Sync {
-    /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError>;
+    /// コンテナ用の bundle を用意し、その絶対パスと実際に適用する値の報告を返す。失敗は ERR-3 の gRPC ステータスで返す。
+    ///
+    /// 報告（[`PreparedBundle::user`]・[`PreparedBundle::stop_signal`]）の無い実装は [`PreparedBundle::new`] だけを返す。
+    /// その場合 `ContainerStatus.user` は未報告（`None`）、stop signal は CRI の config の値だけで解決する。
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError>;
 
     /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete は TASK-59.3 で接続済み）。
     ///

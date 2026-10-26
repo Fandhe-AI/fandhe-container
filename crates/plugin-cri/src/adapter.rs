@@ -79,7 +79,9 @@ use fandhe_container_core::traits::{
     GetStateRequest, KillRequest, NetnsStatus, NetworkPlugin, NetworkStatus, PortMapping,
     PublishPortRequest, StartRequest, StateRequest, StateStore, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 #[cfg(unix)]
 use fandhe_container_cri::image_pull::PullConfig;
@@ -845,7 +847,7 @@ pub fn bundle_provider_with(
 pub struct UnimplementedBundleProvider;
 
 impl BundleProvider for UnimplementedBundleProvider {
-    fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         Err(CriError::unimplemented(MSG_BUNDLE_UNAVAILABLE))
     }
 

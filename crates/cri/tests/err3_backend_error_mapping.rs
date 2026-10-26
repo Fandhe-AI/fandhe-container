@@ -20,7 +20,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::image_pull::{ImagePuller, PullError, PullRequest, PulledImage};
 use fandhe_container_cri::image_service::{CriImageService, InMemoryImageStore};
@@ -119,7 +121,7 @@ struct FakeBundles {
 }
 
 impl BundleProvider for FakeBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let container_id = req.container_id;
         if self.fail_prepare.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("bundle storage is full"));
@@ -129,7 +131,7 @@ impl BundleProvider for FakeBundles {
         } else {
             PathBuf::from("/bundles")
         };
-        Ok(root.join(container_id))
+        Ok(PreparedBundle::new(root.join(container_id)))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())

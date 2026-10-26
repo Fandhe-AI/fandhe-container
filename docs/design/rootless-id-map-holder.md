@@ -114,7 +114,7 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 
 ## 6. 実機で確かめる事項（人間担当）
 
-- Linux 6.9 未満の実機で、Helper の範囲写像が `FailedPrecondition`（`kernel lacks pidfd process-group signals`）で拒否され、holder・helper が起動されないこと（#2644）。
+- Linux 6.9 未満の実機で、Helper の範囲写像が `FailedPrecondition`（`kernel lacks pidfd process-group signals`）で拒否され、holder・helper が起動されないこと（#2644）。 `doctor` も同じ実機で `ID_MAP_HELPER_KERNEL_UNSUPPORTED`（state `kernel_below_6_9`）を出すこと（#2715）。
 - AppArmor の `restrict_unprivileged_userns` の下で、`setns` で参加した I の挙動。
 - `FANDHE_CONTAINER_TEST_ID_HELPER=1` の `rootless_launch` の helper シナリオと `production_launcher` のシナリオ I（`newuidmap` 経由の範囲写像が holder に対して成功し、PID 1 の `uid_map` が従来と一致すること）。
 

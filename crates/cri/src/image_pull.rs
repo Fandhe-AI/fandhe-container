@@ -101,7 +101,8 @@
 //!     `PreserveIfOwnerMapped`・`ChownInUserNamespace`）の配線は次の前提が済んでからになる（#2534・SEC-5・SEC-1。
 //!     `docs/design/oci-layer-special-bits.md`）。`ChownMapped` は初期 user namespace の `CAP_CHOWN` が要り、
 //!     rootful の可否が未決（#2241）。`ChownInUserNamespace` は core が user namespace へ入る配線が要る（#2315・#482）。
-//!     本モジュールの `PullConfig` を組む本番の呼び出し元（plugin-cri の ImageService）は #2592 の担当。
+//!     本モジュールの `PullConfig` を組む本番の呼び出し元は plugin-cri の `CriPluginBackends`（#2592）で、既定値（`Keep` + `Strip`）を
+//!     pull と create の両方へ同じ値で渡す（本番の値への切り替えは上記の前提待ち）。
 //!     所有者の解決の部品（#2389 の `image_ownership`）は cli crate にあり、置き場所の判断も要る。
 //!     pull と create は [`crate::bundle::ImageExtractConfig`] の 1 か所から同じ値を配る（食い違うと記録の照合で
 //!     `FAILED_PRECONDITION` になる）
@@ -474,7 +475,7 @@ pub struct PullConfig {
     pub extract_limits: ExtractLimits,
     /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
     /// rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped` 等）は呼び出し元が決めるが、本番の値は
-    /// 現状も既定のまま（配線の前提は #2241・#2315・#482・#2592。モジュール doc「未実装範囲」と
+    /// 現状も既定のまま（配線の前提は #2241・#2315・#482。呼び出し元の配線は #2592 で済み。モジュール doc「未実装範囲」と
     /// `docs/design/oci-layer-special-bits.md`。#2534・SEC-5・SEC-1）。
     pub extract_options: ExtractOptions,
 }

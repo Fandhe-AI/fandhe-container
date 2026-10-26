@@ -47,11 +47,28 @@
 //!   `FailedPrecondition`。rbind はホストの `/sys` 配下のマウント（cgroup2・securityfs・bpf 等）を持ち込むため、
 //!   その一つでも rw なら起動しない。`exec::setns` の「コンテナの中から cgroupfs に書けない」前提はこの再帰 ro と
 //!   `CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否に支えられる
-//! - **rbind の最上位の ro はロックされない可能性がある（未実測の読み。#2305）**: unshare の時点でホストの `/sys` が rw なら、
-//!   複製に後から付けた ro には `MNT_LOCK_READONLY` が立たず、user namespace の root が `mount_setattr` で外せる見込みがある。
-//!   その場合にコンテナ内から外されるのを防ぐのは CapabilityDrop（`CAP_SYS_ADMIN` の削減）と seccomp による
-//!   `mount_setattr` の拒否（`EPERM`）だけになる。実機での測定は `tests/sysfs_mount.rs` の `ro-clear` シナリオ
-//!   （手順は `docs/verification/rootless-sysfs-readonly.md`）で行い、結果が出るまで確定事項として扱わない
+//! - **rbind の最上位の ro は user namespace の root から外せる（ホステッド runner での観測。#2305・#2789）**:
+//!   `platform-ci`（ubuntu-latest。GitHub ホステッド runner、イメージ ubuntu-24.04・20261012.334.1、カーネルは同イメージの
+//!   リリースノートの `6.17.0-1022-azure`。一次の記録は CI の step summary の `kernel:` 行）の初回（PR #2781・run 40271388345）で、
+//!   ホストの `/sys` が rw のとき、防御なし（全 capability・seccomp なし）の `mount_setattr(attr_clr=MOUNT_ATTR_RDONLY)` は
+//!   最上位の ro を外せた（`ro_clear_errno=0`・`top_ro_after_clear=false`）。複製に後から付けた ro には `MNT_LOCK_READONLY` が立たない。
+//!   子マウント 19 件は ro のまま（`children_ro_after_clear=true`。再帰では外していない）。外した後の書き込み用 `open` は
+//!   観測した 4 パスで `EACCES` だったが、これはホストの root 所有ファイルの DAC によるもので、ro の代わりになる保証ではない。
+//!   防御あり（組み込みの `CapabilityDrop`・`Seccomp` 段の通過後）は `EPERM` で拒否された（`ro_clear_defended_errno=1`）。
+//!   観測はホステッド runner の 1 回分で、一般化しない。rootful 経路と別カーネルの実測は #2305・#1621（人間担当）に残る。
+//!   ro をロックさせる緩和策は別判断で、ここでは行わない
+//! - **/sys の ro を保つ前提**: コンテナ内から最上位の ro が外されないことは次の 2 つだけに依存する。(1) CapabilityDrop の
+//!   許可集合に `CAP_SYS_ADMIN` が無いこと（`ContainerCapabilities` は OCI 既定の部分集合だけを表し add の経路が無い）、
+//!   (2) 既定の seccomp が `mount_setattr` と mount 系（`mount`・`umount2`・`open_tree`・`move_mount`・`fsopen`・`fsconfig`・
+//!   `fsmount`・`fspick`）を `ERRNO(EPERM)`（supervisor 経路は `USER_NOTIF` で `-EPERM`）で拒否すること。両段は
+//!   `StagePipeline` の組み込みの固定段でフックでは差し替えられない。前提を固定する試験（名前のみ記す）:
+//!   `seccomp` の `bpf_tests::sec2_sysfs_ro_premise_native_filter_denies_mount_family_with_eperm`、
+//!   `capabilities` の `tests::sec2_sysfs_ro_premise_default_caps_lack_sys_admin`・`tests::sec1_oci_default_mask_matches_docker_capeff`・
+//!   `tests::sec1_container_capabilities_restrict_only_subsets`、`exec/stages.rs` の `core1_empty_pipeline_applies_builtin_stages`
+//! - **前提の崩れの検出（CI）**: `tests/sysfs_mount.rs` の `ro-clear` シナリオは `platform-ci`（ubuntu）で成功行
+//!   `… defended errno=1 (root=false)` を照合する。防御ありの試行が `EPERM` 以外になれば試験自身と CI の成功行の照合が失敗し、
+//!   capability 集合や seccomp の変更・段の順序の崩れを実カーネルで検出する。防御なしの値は測定値のため assert しない
+//!   （手順は `docs/verification/rootless-sysfs-readonly.md`）
 //! - **失敗時**: 後始末の umount はしない。呼び出し側はプロセスを破棄する（`crate::exec` のモジュール doc の契約）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
@@ -135,7 +152,9 @@ fn clear_probe_precondition(pid: u32, user_ns_inode: Option<u64>) -> bool {
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。
+/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。ただし `platform-ci` の `ro-clear` 照合
+/// （`defended errno=1`）が /sys の ro を保つ前提（`CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否）の継続検出に
+/// 使われている（#2533・#2789）。廃止・置き換えは、その検出役を別の試験へ移してから行う。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_clear_sysfs_readonly_for_test() -> Result<super::seccomp::ProbeOutcome, ExecError> {

@@ -319,8 +319,7 @@ fn read_config(
         .map_err(|e| CriError::from(PullError::from_config(&e)))?;
     let facts = BlobFileFacts::from_file(&file)
         .ok_or_else(|| untrusted("cached image config is not trusted"))?;
-    check_blob_trust(&facts, Some(owner))
-        .map_err(|_| untrusted("cached image config is not trusted"))?;
+    check_blob_trust(&facts, owner).map_err(|_| untrusted("cached image config is not trusted"))?;
     let mut body = Vec::new();
     (&mut file)
         .take(MAX_CONFIG_BYTES + 1)

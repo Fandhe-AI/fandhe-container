@@ -360,4 +360,4 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 | 名前の正規化 | 同 L227-L231。`"CAP_" + strings.ToUpper(c)` を無条件に前置する | 一致（大文字化）。**食い違い（接頭辞）**: `CAP_` つきの名前は `CAP_CAP_...` になる |
 | 未知名の扱い | [`pkg/oci/spec_opts.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/pkg/oci/spec_opts.go#L1124-L1139)（`WithDroppedCapabilities`）と `removeCap`（L1083-L1092）。完全一致で取り除くだけで、名前の検証をしない。対象は bounding・effective・permitted・inheritable | **食い違い**: containerd は未知名・接頭辞つきを黙って無視する。本実装は `INVALID_ARGUMENT`（未知名）と drop（接頭辞つき）にする |
 
-食い違い（drop_capabilities の 2 点）のコード側の扱いは #2812 で追跡する（`spec.rs` のドキュメントコメントの訂正と、挙動を containerd に合わせるかのオーナー判断。コードは本変更で変えていない）。
+食い違い（drop_capabilities の 2 点）は #2812 で追跡する。`spec.rs` のドキュメントコメントは訂正済み。挙動を containerd に合わせるかはオーナー判断待ち（コードは変えていない）。

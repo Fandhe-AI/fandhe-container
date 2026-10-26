@@ -1709,7 +1709,7 @@ jobs:
               exit 1
             fi
           done
-          for bad in 'supervisor_bin_real: ignored' 'precondition failed' 'model=single'; do
+          for bad in 'supervisor_bin_real: ignored' 'supervisor_bin_real: PRECONDITION FAILED' 'model=single'; do
             if grep -Fq "${bad}" "${log}"; then
               echo "::error::supervisor_bin_real reported an unexpected line: ${bad}" >&2
               exit 1

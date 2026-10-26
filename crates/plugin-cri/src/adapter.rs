@@ -44,7 +44,6 @@
 //!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
 //!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。待ち切れなかった失敗（`FailedPrecondition`）は警告行に `reason: sink_open_after_wait` を足して他の失敗と区別する（#2760。terminate を設定する経路が無く、待ちを伸ばさない判断は `docs/design/container-log-removal-wait.md`）。待ちを超えて残ったログは、plugin の起動時の走査（[`sweep_leftover_container_logs`]）と同じ ID の `create` の前の回収（`reclaim_before_create`）で消える（生きている sink・状態がある ID・帰属できない名前は残り、手動で消す。docs/setup/container-log-recovery.md）。
 //!   core の `delete` の成功後には起動オプション文書（`<root>/@container-options/<id>`）の残骸も、記録の無い ID に限りロックの下で期限つきに消す（失敗は `container_options_remove` の Failure と `target: container_options` の警告行。`create` の前にも同じ掃除をする。SUP-12・#2760）
-//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、CLI の同じ ID の `create` は残りを回収するが、CRI は ID を再利用しないため手動で消す。docs/setup/container-log-recovery.md）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
@@ -1123,7 +1122,6 @@ mod tests {
         assert_eq!(*store.deletes.lock().expect("lock"), 1);
     }
 
-    /// 注入した記録器が CRI 計測の橋渡しにも使われ、`op_recorder` から件数を読める（REPAIR-4）。
     /// #2760・SEC-4: create 前のログ回収は期限切れのときだけ create を失敗（`Timeout`）させ、それ以外は続ける。
     #[test]
     fn repair5_cri2_reclaim_timeout_fails_create_only_on_timeout() {
@@ -1168,6 +1166,7 @@ mod tests {
         );
     }
 
+    /// 注入した記録器が CRI 計測の橋渡しにも使われ、`op_recorder` から件数を読める（REPAIR-4）。
     #[test]
     fn cri_recorder_bridge_writes_to_shared_recorder() {
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));

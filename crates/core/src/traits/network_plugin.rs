@@ -19,6 +19,7 @@
 //! | `netns-create` | [`NetworkPlugin::create_netns`] | コンテナ | 専用 netns の作成（lo の up を含む）。所属ネットワークを受け取り `net-delete` の追跡対象に加える | `SetUpPod` の一部 |
 //! | `veth-attach` | [`NetworkPlugin::attach`] | コンテナ | veth ペアの作成、bridge / netns への接続、アドレス・default route の設定 | `SetUpPod` の一部 |
 //! | `publish-port` | [`NetworkPlugin::publish_port`] | コンテナ | ポート公開（nft DNAT） | PortMapping |
+//! | （なし） | [`NetworkPlugin::unpublish_port`] | コンテナ | ポート公開 1 件の解除（DNAT の個別削除） | PortMapping の巻き戻し |
 //! | `net-delete` | [`NetworkPlugin::delete_network`] | ネットワーク | bridge・nft テーブル・関連 netns の一括削除 | `TearDownPod` 相当 |
 //!
 //! [`NetworkPlugin::detach`] は PoC-15 の `netsetup` には対応する操作粒度がない
@@ -53,6 +54,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 
 use super::types::{ContainerId, ErrorCode, TraitError};
+
+/// [`NetworkPlugin::unpublish_port`] の既定実装が返す固定文言（NET-3・PLUG-1）。
+///
+/// 個別解除に対応しない plugin が成功を装わないための印（REPAIR-3）。呼び出し側
+/// （plugin-cri の `set_up_sandbox` の巻き戻し等）は、この `Unimplemented` を受けても
+/// `delete_network` のテーブル単位の解放へ倒れる。
+pub const MSG_UNPUBLISH_PORT_UNSUPPORTED: &str =
+    "unpublish_port is not supported by this network plugin";
 
 /// ネットワーク設定の制御面（bridge・veth・netns・ポート公開）を抽象化する拡張点。
 ///
@@ -129,8 +138,9 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     番号とプロトコルの組が、ネットワーク・コンテナに関わらず既に公開済みであれば
 ///     [`ErrorCode::AlreadyExists`] を返す。ホスト bind IP（任意の
 ///     [`PublishPortRequest::host_ip`]）の有無にかかわらず、判定キーは
-///     `(host_port, protocol)` のみとする（緩めない）。[`Self::detach`]
-///     または [`Self::delete_network`] で解放されたポートは再公開できる。
+///     `(host_port, protocol)` のみとする（緩めない）。[`Self::detach`]、
+///     [`Self::unpublish_port`]、または [`Self::delete_network`] で解放されたポートは
+///     再公開できる。
 /// 12. **二重 attach の拒否**: 既に [`Self::attach`] 済みのコンテナへの再度の
 ///     [`Self::attach`] は、対象ネットワークが同一か別かを問わず
 ///     [`ErrorCode::AlreadyExists`] を返し、状態（割り当て済みアドレス・attach
@@ -144,6 +154,20 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///     `AlreadyExists` を返すことで、再 attach 時に前回のアドレスが割り当て済みの
 ///     まま残る不整合を防ぐ。[`Self::detach`] 後の再 attach は前回のアドレスが
 ///     解放されているため `Ok` になる（契約 9）。
+/// 13. **ポート公開の個別解除**（[`Self::unpublish_port`]。NET-3・CRI-2・PLUG-1）:
+///     前提違反は次の順で判定する。ネットワーク未作成は [`ErrorCode::NotFound`]、
+///     コンテナが未 attach なら [`ErrorCode::NotFound`]、attach 済みのネットワークと
+///     `req.network()` が違えば [`ErrorCode::FailedPrecondition`]（契約 8 と同じ越境の
+///     拒否）、一致する公開が記録されていなければ [`ErrorCode::NotFound`]。成功したら
+///     その公開の DNAT ルールと受け口の予約を解放し、解放した `(host_port, protocol)`
+///     は再公開できる（契約 11）。成功後の同じ要求は [`ErrorCode::NotFound`] になる
+///     （`Ok` を返さない。二重の [`Self::detach`] と同じ形で、「既に無い」と「今消した」を
+///     呼び出し側が区別できる）。ルールが残っていると確定している失敗はエラーを返し、
+///     公開の記録を保持する（同じ要求で再試行できる）。結果が不明な失敗（所有を証明
+///     できない場合を含む）は [`ErrorCode::Internal`] を返し、`message` に残った件数
+///     （"left behind"）を載せ、記録と受け口の予約を保持する（quarantine。解放は
+///     [`Self::delete_network`] だけが行う）。既定実装は [`ErrorCode::Unimplemented`]
+///     を返し、個別解除に対応しない plugin はそのままでよい。
 ///
 /// メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 /// dyn 互換（object safety）を保ち、async ランタイムへの依存を追加しない
@@ -216,6 +240,28 @@ pub trait NetworkPlugin: Send + Sync {
     /// ルールを撤回してから `Err` を返し、撤回にも失敗すれば [`ErrorCode::Internal`] を
     /// 返す（契約 6）。対応: NET-4。
     fn publish_port(&self, req: &PublishPortRequest) -> Result<PortMapping, TraitError>;
+
+    /// ポート公開 1 件を個別に解除する（DNAT ルールと受け口の予約の解放）。
+    ///
+    /// [`Self::publish_port`] と対になる操作。呼び出し側は、公開の途中で失敗した
+    /// 操作（例: plugin-cri の `set_up_sandbox`）が、公開済みのポートをテーブル単位の
+    /// [`Self::delete_network`] に頼らず 1 件ずつ戻すために使う。前提・冪等性・失敗時の
+    /// 記録の扱いは契約 13。既定実装は [`ErrorCode::Unimplemented`]（固定文言
+    /// [`MSG_UNPUBLISH_PORT_UNSUPPORTED`]）を返し、成功を装わない（REPAIR-3）。
+    ///
+    /// PLUG-4 との関係: これは拡張点（PLUG-1）の 1 回限りの拡張で、plugin を足すために
+    /// core を書き換える変更ではない。nft のハンドル等の知識は plugin 側に閉じ、core には
+    /// 入らない。対応: NET-3・CRI-2。
+    fn unpublish_port(
+        &self,
+        req: &UnpublishPortRequest,
+    ) -> Result<UnpublishPortResponse, TraitError> {
+        let _ = req;
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            MSG_UNPUBLISH_PORT_UNSUPPORTED,
+        ))
+    }
 
     /// コンテナのネットワーク接続を解放する（ポート公開 → veth → netns の逆順）。
     ///
@@ -896,6 +942,108 @@ impl PortMapping {
     }
 }
 
+/// [`NetworkPlugin::unpublish_port`] の要求（NET-3）。
+///
+/// [`PublishPortRequest`] と同じ形にする。plugin は記録した公開を host_ip・
+/// container_port を含む完全一致で探すため、公開したときと同じ値を全項目載せる。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct UnpublishPortRequest {
+    network: NetworkName,
+    container: ContainerId,
+    host_port: NonZeroU16,
+    container_port: NonZeroU16,
+    protocol: Protocol,
+    host_ip: Option<IpAddr>,
+}
+
+impl UnpublishPortRequest {
+    /// ネットワーク名・対象コンテナ・ホスト側ポート・コンテナ側ポート・プロトコルから
+    /// 要求を作る。
+    pub fn new(
+        network: NetworkName,
+        container: ContainerId,
+        host_port: NonZeroU16,
+        container_port: NonZeroU16,
+        protocol: Protocol,
+    ) -> Self {
+        Self {
+            network,
+            container,
+            host_port,
+            container_port,
+            protocol,
+            host_ip: None,
+        }
+    }
+
+    /// ホスト側の bind IP を指定する（公開時に指定した場合は同じ値を渡す）。
+    pub fn with_host_ip(mut self, host_ip: IpAddr) -> Self {
+        self.host_ip = Some(host_ip);
+        self
+    }
+
+    /// 指定されたホスト側 bind IP を返す。未指定なら `None`。
+    pub fn host_ip(&self) -> Option<IpAddr> {
+        self.host_ip
+    }
+
+    /// 対象ネットワーク名を返す。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    /// ホスト側の公開ポートを返す。
+    pub fn host_port(&self) -> NonZeroU16 {
+        self.host_port
+    }
+
+    /// コンテナ側の待受ポートを返す。
+    pub fn container_port(&self) -> NonZeroU16 {
+        self.container_port
+    }
+
+    /// トランスポートプロトコルを返す。
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+}
+
+impl From<&PortMapping> for UnpublishPortRequest {
+    /// [`NetworkPlugin::publish_port`] の応答（受領証）から、同じ値の解除要求を作る。
+    fn from(mapping: &PortMapping) -> Self {
+        let mut req = Self::new(
+            mapping.network().clone(),
+            mapping.container().clone(),
+            mapping.host_port(),
+            mapping.container_port(),
+            mapping.protocol(),
+        );
+        if let Some(ip) = mapping.host_ip() {
+            req = req.with_host_ip(ip);
+        }
+        req
+    }
+}
+
+/// [`NetworkPlugin::unpublish_port`] の応答。当面は空だが、将来の拡張に備えて
+/// 構造体にする（[`DetachResponse`] と同じ形）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnpublishPortResponse {}
+
+impl UnpublishPortResponse {
+    /// 空の応答を作る。
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 /// [`NetworkPlugin::detach`] の要求。
 ///
 /// コンテナのネットワーク接続（ポート公開・veth・netns）を解放する対象を指定する。
@@ -1481,6 +1629,52 @@ mod tests {
                 .or_default()
                 .push(mapping.clone());
             Ok(mapping)
+        }
+
+        fn unpublish_port(
+            &self,
+            req: &UnpublishPortRequest,
+        ) -> Result<UnpublishPortResponse, TraitError> {
+            // 契約 13: 前提の判定順は network → attach → 越境 → 記録の有無。
+            if !self
+                .networks
+                .lock()
+                .expect("lock networks")
+                .contains_key(req.network())
+            {
+                return Err(TraitError::new(ErrorCode::NotFound, "network not found"));
+            }
+            let attached = self.attached.lock().expect("lock attached");
+            let bound_network = attached
+                .get(req.container())
+                .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "container not attached"))?;
+            if bound_network != req.network() {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container is attached to a different network",
+                ));
+            }
+            drop(attached);
+            let mut published = self.published.lock().expect("lock published");
+            let list = published.get_mut(req.container()).ok_or_else(|| {
+                TraitError::new(ErrorCode::NotFound, "published port is not recorded")
+            })?;
+            let pos = list
+                .iter()
+                .position(|m| {
+                    m.host_port() == req.host_port()
+                        && m.container_port() == req.container_port()
+                        && m.protocol() == req.protocol()
+                        && m.host_ip() == req.host_ip()
+                })
+                .ok_or_else(|| {
+                    TraitError::new(ErrorCode::NotFound, "published port is not recorded")
+                })?;
+            list.remove(pos);
+            if list.is_empty() {
+                published.remove(req.container());
+            }
+            Ok(UnpublishPortResponse::new())
         }
 
         fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
@@ -3698,5 +3892,135 @@ mod tests {
                 .get(&sample_container_id()),
             None
         );
+    }
+
+    /// 既定実装だけを持つ最小の実装（`unpublish_port` を上書きしない）。
+    struct DefaultOnly;
+
+    impl NetworkPlugin for DefaultOnly {
+        fn create_network(&self, _: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+        fn create_netns(&self, _: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+        fn attach(&self, _: &AttachRequest) -> Result<AttachResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+        fn publish_port(&self, _: &PublishPortRequest) -> Result<PortMapping, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+        fn detach(&self, _: &DetachRequest) -> Result<DetachResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+        fn delete_network(
+            &self,
+            _: &DeleteNetworkRequest,
+        ) -> Result<DeleteNetworkResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "x"))
+        }
+    }
+
+    /// NET-3・REPAIR-3: 既定の `unpublish_port` は `Unimplemented` と固定文言を返す。
+    #[test]
+    fn net3_unpublish_port_default_is_unimplemented() {
+        let plugin: Box<dyn NetworkPlugin> = Box::new(DefaultOnly);
+        let req = UnpublishPortRequest::new(
+            sample_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Tcp,
+        );
+        let err = plugin.unpublish_port(&req).expect_err("default rejects");
+        assert_eq!(err.code().as_str(), "UNIMPLEMENTED");
+        assert_eq!(err.message(), MSG_UNPUBLISH_PORT_UNSUPPORTED);
+    }
+
+    /// NET-3: `PortMapping` から作った解除要求は全項目（host_ip を含む）を写す。
+    #[test]
+    fn net3_unpublish_request_from_port_mapping_copies_all_fields() {
+        let mapping = PortMapping::new(
+            sample_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Udp,
+        )
+        .with_host_ip(IpAddr::from([192, 0, 2, 10]));
+        let req = UnpublishPortRequest::from(&mapping);
+        assert_eq!(req.network(), &sample_network_name());
+        assert_eq!(req.container(), &sample_container_id());
+        assert_eq!(req.host_port().get(), 8080);
+        assert_eq!(req.container_port().get(), 80);
+        assert_eq!(req.protocol(), Protocol::Udp);
+        assert_eq!(req.host_ip(), Some(IpAddr::from([192, 0, 2, 10])));
+    }
+
+    /// 契約 13 / 契約 11: 解除で受け口が解放されて再公開でき、二重解除は `NotFound`、
+    /// 別ネットワークの指定は `FailedPrecondition`。
+    #[test]
+    fn contract13_stub_unpublish_releases_and_rejects_double() {
+        let plugin = StubNetworkPlugin::new();
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                sample_network_name(),
+                sample_subnet(),
+            ))
+            .expect("create network");
+        plugin
+            .create_netns(&CreateNetnsRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("create netns");
+        plugin
+            .attach(&AttachRequest::new(
+                sample_network_name(),
+                sample_container_id(),
+            ))
+            .expect("attach");
+        let publish = PublishPortRequest::new(
+            sample_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Tcp,
+        );
+        let mapping = plugin.publish_port(&publish).expect("publish");
+        let unpublish = UnpublishPortRequest::from(&mapping);
+        let wrong = UnpublishPortRequest::new(
+            other_network_name(),
+            sample_container_id(),
+            NonZeroU16::new(8080).expect("nonzero"),
+            NonZeroU16::new(80).expect("nonzero"),
+            Protocol::Tcp,
+        );
+        plugin
+            .create_network(&CreateNetworkRequest::new(
+                other_network_name(),
+                IpCidr::new(IpAddr::from([10, 250, 12, 1]), 24).expect("valid cidr"),
+            ))
+            .expect("create other network");
+        assert_eq!(
+            plugin
+                .unpublish_port(&wrong)
+                .expect_err("cross network")
+                .code()
+                .as_str(),
+            "FAILED_PRECONDITION"
+        );
+        plugin.unpublish_port(&unpublish).expect("first unpublish");
+        assert_eq!(
+            plugin
+                .unpublish_port(&unpublish)
+                .expect_err("second unpublish")
+                .code()
+                .as_str(),
+            "NOT_FOUND"
+        );
+        plugin
+            .publish_port(&publish)
+            .expect("republish after release");
     }
 }

@@ -1749,6 +1749,13 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
 /// `mountinfo`（`/proc/self/mountinfo` の内容）上で、`dir` の真の配下にあるマウントポイントを返す
 /// （OS 呼び出しを含まない純粋関数）。`dir` 自身がマウントポイントなのは対象外。比較は要素単位
 /// （`/x/share2` を `/x/share` の配下と誤判定しない）。欄が欠けた行は読み飛ばす。
+///
+/// 点検（#2908・SEC-1・IO-5・MAC-1。core の #2853 と同じ観点）: パス文字列で行を選ぶが、結果は「拒否」にだけ使う。
+/// `dir` は実体パスへ正規化済みで、mountinfo のマウントポイントもカーネルの実体パスなので、到達できる配下の
+/// マウントは必ず前方一致に入り、見逃し（誤受理）は起きない。祖先の overmount で隠れた行や、同じパスに積まれた
+/// マウントの下の行も数えるため、結果は誤拒否側（fail-closed）に倒れる。残余は、共有の祖先が overmount されて
+/// いる場合の誤拒否（可用性のみ・受け入れる）。実行されるのは Linux の CI・開発環境だけで、macOS の本番経路は
+/// この関数を通らず、`sys::mount_identity`（`statfs`）と `st_dev` の比較で走査中の各ディレクトリを実体照合する。
 #[cfg(target_os = "linux")]
 fn mount_point_under(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
@@ -3537,6 +3544,39 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// #2908・SEC-1・IO-5: 重なった・隠れたマウントの fixture でも、配下の行を見逃さず取り違えない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2908_mount_point_under_with_stacked_and_hidden_mounts() {
+        // `/x` に overmount（50 の上に 60）があり、50 の下で隠れた子 51 がある。隠れていても拒否側に倒れる。
+        let hidden = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+50 22 8:1 /a /x rw - ext4 /dev/sda1 rw
+60 50 8:1 /b /x rw - tmpfs tmpfs rw
+51 50 8:1 /c /x/share/sub rw - ext4 /dev/sda1 rw
+";
+        assert_eq!(
+            mount_point_under(hidden, Path::new("/x/share")),
+            Some(PathBuf::from("/x/share/sub"))
+        );
+        // 共有ルート自身に積まれたマウントだけで配下が無ければ対象外。
+        let only_self = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+50 22 8:1 /a /x/share rw - ext4 /dev/sda1 rw
+60 50 8:1 /b /x/share rw - tmpfs tmpfs rw
+";
+        assert_eq!(mount_point_under(only_self, Path::new("/x/share")), None);
+        // 兄弟は要素単位で対象外。
+        let sibling = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n51 22 8:1 /c /x/share2/sub rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(mount_point_under(sibling, Path::new("/x/share")), None);
+        // 8 進エスケープを含む隠れた子。
+        let esc = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n51 50 8:1 /c /x/share/my\\040dir rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            mount_point_under(esc, Path::new("/x/share")),
+            Some(PathBuf::from("/x/share/my dir"))
+        );
     }
 
     /// MAC-1・TASK-65.1: 同一デバイスの bind mount（`st_dev` が同じ）もマウント表から検出する。

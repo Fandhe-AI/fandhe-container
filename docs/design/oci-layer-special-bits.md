@@ -244,7 +244,11 @@ PullImage の読み取り（#2534）: cri の `image_pull.rs` の `oci1_sec_conf
 `oci1_write_unpack_record_rejects_oversized_record_before_creating_it`、`tests/image_pull.rs` の
 `oci1_repair5_pull_rejects_fifo_unpack_record_without_hanging`・`oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs`・
 `oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published`。blob の信頼判定は oci の `check_blob_trust` に
-一本化し、`layer.rs` の `oci1_sec_blob_trust_*` で照合する。
+一本化し、`layer.rs` の `oci1_sec_blob_trust_*` で照合する。公開入口 `check_blob_trust(facts, owner: u32)` は所有者の
+照合が必須で、省略口を持たない（#2796・SEC-5）。所有者に `None` を受ける `check_blob_trust_with_owner` は `pub(crate)` で、
+oci 内部の非 unix 経路（`dir_owner` が `None` を返す場合）専用である。他 uid 所有の staged blob を `verify_staged_blob`
+が chmod せずに拒否し、検証済みに登録しないことは、実ファイルで `crates/oci/tests/staged_blob_owner.rs`
+（範囲写像の subuid 所有・`-- --ignored`・#2907・OCI-7・SEC-1）が照合する。
 
 pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監査 P3・SEC-5・CORE-6）: 展開結果は pull 時の所有者写像に
 依存する（rootfs の所有者は pull 時の `ExtractOptions` で決まる）。pull の後に subuid / subgid の割り当てが変わると、start 時の

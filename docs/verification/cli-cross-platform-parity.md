@@ -11,7 +11,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | 項目 | 内容 |
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
-| Linux 経路の未実装 | `start` の本番 launcher、cgroup 配置つき `delete` は未実装（REPAIR-3）。pid ありの `stop` は Linux では supervisor の制御チャネル経由で結線済み（#2059。supervisor に届かなければ `UNAVAILABLE`（9））。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
+| Linux 経路の `start` | `start` は supervisor 経由で本番 launcher まで配線済み（#2048・#1718・#1715・#1819・#2442。CLI は実体と同じディレクトリの `fandhe-container-supervisor` を `systemd-run --user --scope -p Delegate=yes` で包んで起動する）。cgroup 配置つき `delete` も実装済み（#2096。ただし Running のコンテナへの `delete --force` は 8 になる）。pid ありの `stop` は supervisor の制御チャネル経由（#2059。届かなければ `UNAVAILABLE`（9））。restart の再 launch は fail-closed（#2043）。**`start` の終了コードは環境（前提）で変わる**: supervisor が CLI の隣に無ければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`（`RootfulHostRoot`・#2241 の判断待ち）、`systemd-run` や user マネージャが無ければ 5 / `FAILED_PRECONDITION`。成功には非 root・supervisor を CLI の隣に置く・特権ランチャー `fandhe-container-launcher` を置かない（置くと rootful のインストールとみなされる）・user マネージャと委譲 cgroup・Landlock ABI 6 以上が要る。Linux 側の値は環境で変わる参考値で、固定の合格基準にしない（REPAIR-3）。B05 の bundle は rootfs が空なので、前提が揃っていても起動に失敗する |
 | イメージ管理の現状（C 層） | コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みで、在庫は plugin-cri の `PullImage`（cri の `OciImagePuller::pull`）が登録する。plugin-cri のキャッシュは「plugin-cri が解決する既定の状態ルート（`StateRoot::resolve(None)`）の `.cri/images`」（#2539・#2800・#2592）。CLI に `pull` サブコマンドは無い（`docs/design/pull-inventory-wiring.md`）。同じ root を `--image-root` に渡せば、pull 済みの在庫に対して `image ls`・`image rm`・`image tag`・`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から解決。#2496）が成功する。未 pull の root（空のストア）では従来どおり `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image` は `NOT_FOUND`（3）で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する。pull 済み root の手順は C 層の節の「pull 済みの root の用意」 |
 | Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
@@ -32,9 +32,17 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
    make cli-parity BASELINE=<linux の capture> CANDIDATE=<他 OS の capture>
    ```
 
-   終了コード 0 = 全ケース一致 / 1 = 不一致・欠落・タイムアウト / 2 = 引数・入力エラー / 3 = 前提欠如。1 は機械照合の事実報告で、合否は人間が判定する。`BASELINE` は Linux で取った capture、`CANDIDATE` は別 OS で取った capture でなければならず、それ以外（非 Linux 基準・同じ OS 同士）は比較せず終了コード 3 で止まる
+   終了コード 0 = 全ケース一致 / 1 = 不一致・欠落・タイムアウト・start 前提未達（`NOT_STARTED`） / 2 = 引数・入力エラー / 3 = 前提欠如。1 は機械照合の事実報告で、合否は人間が判定する。`BASELINE` は Linux で取った capture、`CANDIDATE` は別 OS で取った capture でなければならず、それ以外（非 Linux 基準・同じ OS 同士）は比較せず終了コード 3 で止まる
 4. 下のチェックリストの結果欄を記入する（A 層は capture の値を転記。B 層の非 Linux は前提が整うまで「前提未達」のまま）
-5. Windows でスクリプトが動かない場合の手動手順: 下のケース表の引数を PowerShell 等で 1 件ずつ実行し、終了コードと stderr 1 行 JSON の `code` を転記する。状態ルートは `--root` に専用の一時ディレクトリを指定し、既定の状態ルートに触れない。B 層は表の順（上から）に実行する
+5. Windows でスクリプトが動かない場合の手動手順: 下のケース表の引数を PowerShell 等で 1 件ずつ実行し、終了コードと stderr 1 行 JSON の `code` を転記する。状態ルートは `--root` に専用の一時ディレクトリを指定し、既定の状態ルートに触れない。B 層は表の順（上から。B18〜B25 も同じ連鎖として順に）に実行する
+
+**Linux で start の連鎖（B18〜B25）を通す前提（#2891）**: 次を満たさないと B21・B23 は `<start-failed>` になり、compare は `NOT_STARTED` を出して終了コード 1 になる（合格に見せない）。
+
+- ビルド: `cargo build -p fandhe-container-cli -p fandhe-container-supervisor`。`fandhe-container-supervisor` を CLI と同じディレクトリに置く。`fandhe-container-launcher` は置かない
+- 非 root で実行し、capture 全体を操作者が `systemd-run --user --scope -p Delegate=yes -- make cli-parity CLI=... OUTPUT=...` のように包む（`delete` は自分の cgroup から委譲を検出するため。スクリプト自身は systemd-run も sudo も呼ばない）
+- 受信期限（supervisor の start 結果は 58.9 秒）に合わせ、`make cli-parity` に `TIMEOUT=90` を付けることを勧める（既定は 1 呼び出し 20 秒）
+- 起動用 bundle の最小 rootfs（ホストの `sleep` とその ELF インタプリタ・依存ライブラリのコピー）は Linux だけスクリプトが一時ディレクトリに組み立てる。`ldd` が無い・`sleep` が見つからないなど組み立てに失敗したときは注意を stderr に出して続行し、start が失敗する。macOS / Windows は rootfs を空のままにする（plugin の解決が bundle を読む前に失敗するため結果は変わらない）
+- 後始末の限界: 連鎖の途中で中断・期限切れになったときは `stop --signal KILL` と `delete` を best effort（各 10 秒）で試みる（B20 の start の呼び出し前から対象にする。delete まで成功しなければ状態ルートを消さずに残し、警告にそのパスを出す）。supervisor や委譲 scope が残ることがありうるので、中断した後は `systemctl --user list-units --type=scope` と `pgrep -f fandhe-container-supervisor` で残骸を確かめ、手動で止める
 
 スクリプトは全ケースで `--root` を一時ディレクトリに向け、sudo を呼ばず、各 CLI 呼び出しにタイムアウトを持つ。タイムアウト・中断時の回収は CLI を起動したプロセスグループ単位で行うため、CLI の子孫が `setsid` 等で別セッションへ出た場合は回収できない。Windows（Git Bash）のネイティブ exe の子は POSIX の pgid を持たないため、未回収の CLI に限り `taskkill /T` でもツリーごと回収する（#1548・REPAIR-5）。CLI の正常終了後に残った子孫と、期限前に親が死んで孤児になった子孫は辿れない。CI の `platform-ci`（Windows を含む 3 OS は main への push と `workflow_dispatch`。PR は ubuntu のみ）が `make cli-parity-native-reclaim-check` で回収を実測し、ログの `cli-parity native reclaim:` 行（`descendant_alive`・`winpid_available`・`baseline_group_kill_descendant_alive`）に結果を出す。このスクリプトは全体の期限（既定 150 秒）を持ち、超えると子孫を回収して `deadline_exceeded` の行つきで失敗する（#1688）。Windows の実測値は PR の CI ログで確認する。
 スクリプトは判定・CLI の実行ともに `LC_ALL=C` に固定する（#1548・CLI-1）。製品 CLI は setlocale を呼ばず出力は英語固定のため比較の情報は減らず、無効な `LC_ALL` による bash 製スタブの警告で `code` の判定が壊れるのを防ぐ。
@@ -129,7 +137,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B03 | `list`（create 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B17 | `inspect c1`（B03 の直後。created のコンテナ） | 0 / `-` / `inspect:c1,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-` | | 前提未達 | 前提未達 | | `rev` は参考値で固定の合格基準にしない。macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#2826 で追加 |
 | B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | 4 / `ALREADY_EXISTS` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
-| B05 | `start c1` | 8 / `UNIMPLEMENTED` / `-`（本番 launcher 未提供） | 8 / `UNIMPLEMENTED` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B05 | `start c1` | 5 / `FAILED_PRECONDITION` / `-`（supervisor が CLI の隣に無い場合。uid 0 は 8 / `UNIMPLEMENTED`。c1 の rootfs は空のため supervisor があっても起動に失敗する。環境で変わる参考値） | 8 / `UNIMPLEMENTED` / `-`（#2048 より前の実測。参考期待値は #2891 で更新） | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B07 | `logs c1` | 0 / `-` / `-`（ログ無しは成功。#1543） | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B08 | `stop c1` | 5 / `FAILED_PRECONDITION` / `-`（未起動） | 5 / `FAILED_PRECONDITION` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。値は Linux と同じだが、未起動の判定ではなくバックエンド解決の失敗 |
@@ -141,8 +149,18 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B14 | `logs nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B16 | `inspect nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B18 | `create --read-only --cap-drop NET_RAW --bundle <起動用 bundle> c2` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | 起動用 bundle は長寿命の `sleep` を動かす config を持つ（#2891） |
+| B19 | `inspect c2`（create 直後） | 0 / `-` / `inspect:c2,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-` | | 前提未達 | 前提未達 | | capabilities・rootReadonly は launcher が適用した値の記録で、create だけでは `caps=-`・`ro=-`（start 前は null）であることを固定する |
+| B20 | `start c2` | 0 / `-` / `-`（前提が揃った場合。揃わなければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`） | | 前提未達 | 前提未達 | | 環境で変わる値。B21・B23 の前提 |
+| B21 | `inspect c2`（start 後。種別 `s`） | 0 / `-` / `started:c2,running,pid=<pid>,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=not_recorded,caps=13,ro=true` | | 前提未達 | 前提未達 | | start が成功しなかったときは `<start-failed>`（compare は `NOT_STARTED`）。`caps=13` は OCI 既定 14 件から NET_RAW を引いた件数 |
+| B22 | `stop --signal KILL c2` | 0 / `-` / `-`（B20 が成功した場合） | | 前提未達 | 前提未達 | | PID 1 は SIGTERM の既定動作を受けないため KILL で決定的に止める。B20 が失敗していれば 5 / `FAILED_PRECONDITION` |
+| B23 | `inspect c2`（状態が running でなくなるまで期限つきで繰り返し、最後の出力を記録。種別 `w`） | 0 / `-` / `started:c2,stopped,pid=-,sup=<値>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=<語彙>,caps=13,ro=true` | | 前提未達 | 前提未達 | | stop の直後の delete が Running で 5 になる競合を避けるための待ち。期限切れは `<timeout>`。`sup=`・`stop=` は supervisor の記録経路に依る参考値 |
+| B24 | `delete c2` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | `delete --force` は Running で 8 になるため使わない |
+| B25 | `list`（連鎖の後） | 0 / `-` / `list:H` | | 前提未達 | 前提未達 | | 片付いたことの確認 |
 
-**手動確認（自動収集しない）**: created の `inspect <id>` は B17 で自動収集する。Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。`create --read-only` で作って start した後の `inspect` は末尾が `"capabilities":{...},"rootReadonly":true` になり、`--read-only` なしで config が `readonly:false` なら `"rootReadonly":false`、start 前・旧記録は `"rootReadonly":null`（#2828）。capture の環境では B05 の `start` が成功しない（本番 launcher が無い）ため、start 済みの capability 集合の中身は自動収集できず手動のままにする（B17 の `caps=` は件数だけ。中身の照合は crates/cli・crates/supervisor の試験が担う。#2775・#2826・CLI-1）。
+**start 済みの inspect の自動収集（#2891）**: created の `inspect <id>` は B17・B19、start 済みの `inspect <id>` は B21（start 直後）・B23（停止後）で自動収集する。種別 `s` / `w` の記録は `started:<id>,<status>,pid=<pid|->,sup=<pid|->,cg=<set|->,health=<語彙|->,audit=<set|->,idmap=<set|->,stop=<語彙>,caps=<件数|->,ro=<true|false|->` で、`norm_inspect` と同じ検証を通した値だけを書く。記録しない値は revision・exitCode・restartCount（状態の書き込み回数・時機で変わる）、中身を落として有無だけにする値は audit（policy・mode はカーネルの seccomp・Landlock の版数で変わる）・idmap（model と件数はホストの subuid 設定で変わる）。`create --read-only` の後の `rootReadonly` は `ro=true`、`--cap-drop NET_RAW` の反映は `caps=13` で照合する。start が成功しない環境では出力を解析せず `<start-failed>` を記録し、compare は `NOT_STARTED`（基準と候補の値を表示）として扱って終了コードを 1 にする。MATCH にも MISMATCH にも数えず、集計に `not started (start precondition unmet): N` の行が出る。
+
+**手動確認（自動収集しない）**: capability の名前の中身（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える等）は capture に記録せず（件数だけ）、`crates/cli/tests/start_stop_delete_real.rs` の実機前提試験（#2833・#2828）が照合する。`--cap-drop ALL` の連鎖は実行時間を抑えるため B 層に足さず、同試験が担う（#2775・#2826・CLI-1）。
 
 ## C 層: イメージ管理（`image ls`・`system df`・`image rm`・`image tag`。#2221・#2316・CLI-1・OCI-7）
 

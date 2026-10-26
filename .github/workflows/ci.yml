@@ -1461,6 +1461,27 @@ jobs:
             --log "${log}" --select '^(ok: xdev_[a-z_]+|test image_store_xdev [.][.][.] ok)$' --min 5 \
             --forbid 'image_store_xdev: ignored' --summary
 
+      # staged_blob_owner（`crates/oci/tests/staged_blob_owner.rs`。OCI-7・SEC-1・SEC-5・#2907）: `newuidmap` の範囲写像で
+      # 他 uid（subuid）所有にした staged blob を `verify_staged_blob` が chmod せずに拒否し、検証済みに登録しないことを
+      # 実ファイルで照合する実機前提テスト（harness = false）。範囲写像の前提確認ステップ（uidmap・subuid / subgid の行）に
+      # 依存するためその後に置く。`USER` を渡す。新しい check-run・sudo・permissions は追加しない。成功行は試験ソースから導出して
+      # 双方向に照合し、`ignored` 行の出現は失敗にする。root で走る分岐は CI では回さない（#1621）。
+      - name: staged_blob_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test staged_blob_owner --no-run
+
+      - name: staged_blob_owner の実行（実機前提テスト・--ignored。OCI-7・SEC-1・SEC-5・#2907）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/staged_blob_owner.log"
+          USER="$(id -un)" cargo test -p fandhe-container-oci --test staged_blob_owner -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name staged_blob_owner --src crates/oci/tests/staged_blob_owner.rs \
+            --log "${log}" --select '^(ok: [a-z_0-9]+|test staged_blob_owner [.][.][.] ok)$' --min 6 \
+            --forbid 'staged_blob_owner: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
+
       # landlock_implicit_dev（`crates/core/tests/landlock_implicit_dev.rs`。CORE-5・SEC-4・#1657・#2768）: 暗黙の /dev 系の
       # Landlock 許可（/dev/null 書き込み・/dev/shm 作成・/dev/ptmx open）と mknod・外側書き込みの拒否を非特権 user namespace で
       # 照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock ABI 6 以上の fail-closed 確認は上のステップを

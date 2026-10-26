@@ -28,8 +28,8 @@
 //! | `sys.rs` 試験の `is_mount_point`・`mount_options_of`、`sealed_copy` 試験の `/proc` 検索、`bind_mounts` 試験の `point == merged` | 据え置き。自作の一時マウントを引く実機前提の試験で、重なりの有無で意味が変わらない |
 //!
 //! 残余: 子マウントの可視判定は start の時点のトポロジーに基づく。restart までの間に構成が変わった場合は、従来の
-//! 走査根・枝刈りと同じく start の時点の値を使う。別 crate（platform-macos・platform-windows・cli の `doctor`）の
-//! 独自のパス照合は本点検の範囲外。
+//! 走査根・枝刈りと同じく start の時点の値を使う。別 crate（platform-macos・platform-windows）の
+//! 独自のパス照合は本点検の範囲外。cli の `doctor` は #2909 で点検済み（`crates/cli/src/doctor.rs` のモジュール doc 参照）。
 
 use std::collections::HashMap;
 use std::io::Read as _;

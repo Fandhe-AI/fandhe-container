@@ -13,7 +13,7 @@
 //!
 //! | CRI の操作 | 関数 | `NetworkPlugin` の呼び出し |
 //! | ---------- | ---- | -------------------------- |
-//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach` → `publish_port`（`port_mappings` の公開指定ごと。#2676）。失敗は逆順に戻す |
+//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach` → `publish_port`（`port_mappings` の公開指定ごと。#2676）。失敗は逆順に戻す（公開途中の失敗は公開済みを `unpublish_port` で個別に解除してから `delete_network`。#2904） |
 //! | `StopPodSandbox` / `RemovePodSandbox` | [`tear_down_pod`] | `delete_network`（pod のネットワークごと一括解放） |
 //! | （試験のみ） | [`set_up_pod`]・[`set_up_container`] | `create_network`・`create_netns` → `attach` |
 
@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
     DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, ErrorCode, IpCidr, NetnsName,
-    NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PublishPortRequest, TraitError,
+    NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, PublishPortRequest,
+    TraitError, UnpublishPortRequest,
 };
 use fandhe_container_cri::adapter::{PodNetns, PodNetworkProvider, PodNetworkRequest};
 use fandhe_container_cri::error::CriError;
@@ -134,11 +135,12 @@ fn with_rollback_errors(orig: TraitError, rollback: &[(&str, TraitError)]) -> Tr
 ///
 /// ネットワーク名・コンテナ ID・netns 名は `sandbox_id` を使う。途中で失敗したら逆順に戻す: `attach` の失敗は
 /// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。
-/// `publish_port` の失敗は `delete_network` だけで戻す（attach 済みのコンテナの `detach` は未対応で、専用テーブルの
-/// 削除で DNAT ルールと受け口の予約がまとめて消えるため。#2676・NET-4）。
-/// `port_mappings` は sandbox 単位で変わらず、`StopPodSandbox` / `RemovePodSandbox` も `delete_network` で一括解放する
-/// ため、`delete_network` 以外の公開の個別解除（`NetsetupBackend::unpublish_port`）の契機は現状要らない
-/// （将来の候補は公開途中の失敗の巻き戻しだけで、`NetworkPlugin` の拡張を伴う後続事項。#2839・NET-3）。戻しも失敗したら、元のエラーと戻しの
+/// `publish_port` の失敗は、公開済みの分を逆順に `unpublish_port` で個別に解除してから、必ず `delete_network` を
+/// 呼ぶ（attach 済みのコンテナの `detach` は未対応。専用テーブルの削除が DNAT ルールと受け口の予約をまとめて消し、
+/// 結果不明で残った受け口の予約もここで回収される。#2676・#2904・NET-3・NET-4）。個別解除の失敗は残りの解除と
+/// `delete_network` を止めず、`rolled_back` を偽にする。`Unimplemented`（個別解除に対応しない plugin）は
+/// `delete_network` が覆うため失敗に数えない。`attach` の失敗時は公開が無い（公開は最後の段）ので解除しない。
+/// 通常の `StopPodSandbox` / `RemovePodSandbox` は `delete_network` で一括解放する。戻しも失敗したら、元のエラーと戻しの
 /// エラーを載せた `Internal` を返し、[`SandboxSetUpError::rolled_back`] を偽にする。
 ///
 /// `ports` は cri が検証した公開指定（`host_port > 0` で明示した IPv4）。空なら公開しない。
@@ -169,8 +171,19 @@ pub fn set_up_sandbox(
         Ok(status) => match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
             Ok(_) => match publish_all(net, &name, &container, ports) {
                 Ok(()) => return Ok(status),
-                // attach 済みのため detach は呼ばない（未対応）。delete_network だけで戻す。
-                Err(e) => e,
+                // attach 済みのため detach は呼ばない（未対応）。公開済みを逆順に個別解除し、
+                // delete_network は必ず呼ぶ（テーブル単位の解放。結果不明の受け口の予約もここで回収する）。
+                Err((e, published)) => {
+                    for mapping in published.iter().rev() {
+                        match net.unpublish_port(&UnpublishPortRequest::from(mapping)) {
+                            Ok(_) => {}
+                            // 個別解除に対応しない plugin: delete_network が覆う。
+                            Err(u) if u.code() == ErrorCode::Unimplemented => {}
+                            Err(u) => rollback.push(("unpublish_port", u)),
+                        }
+                    }
+                    e
+                }
             },
             Err(e) => {
                 if let Err(d) = net.detach(&DetachRequest::new(name.clone(), container.clone())) {
@@ -189,15 +202,17 @@ pub fn set_up_sandbox(
     })
 }
 
-/// 公開指定を `publish_port` で順に公開する。最初の失敗で止めて返す（残りは公開しない）。
+/// 公開指定を `publish_port` で順に公開する。最初の失敗で止めて返す（残りは公開しない）。失敗時は、それまでに
+/// 公開できた分の受領証を一緒に返す（巻き戻しで個別に解除する。件数は `ports` の長さで有界。#2904）。
 fn publish_all(
     net: &dyn NetworkPlugin,
     name: &NetworkName,
     container: &ContainerId,
     ports: &[PodPortPublish],
-) -> Result<(), TraitError> {
+) -> Result<(), (TraitError, Vec<PortMapping>)> {
+    let mut published = Vec::new();
     for p in ports {
-        net.publish_port(
+        let result = net.publish_port(
             &PublishPortRequest::new(
                 name.clone(),
                 container.clone(),
@@ -206,7 +221,11 @@ fn publish_all(
                 p.protocol(),
             )
             .with_host_ip(IpAddr::V4(p.host_ip())),
-        )?;
+        );
+        match result {
+            Ok(mapping) => published.push(mapping),
+            Err(e) => return Err((e, published)),
+        }
     }
     Ok(())
 }

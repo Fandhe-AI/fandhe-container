@@ -30,19 +30,56 @@
 //!   処理された要求への応答なので読み切りの印になる。失敗を集めていれば `Aborted`、なければ適用状態を
 //!   確認できないので `Unknown` にする
 //!
-//! # NEWRULE の echo 応答（ルールハンドルの取得。NET-3・CRI-2・#2839）
+//! # NEWRULE の echo 応答（ルールハンドルの取得。NET-3・CRI-2・SEC-1・#2839・#2905）
 //!
 //! `NLM_F_ECHO` 付きで積んだ NEWRULE（`NftBatchBytes::body_echo` が真の本体）には、ACK とは別に
 //! 追加したルールそのものが NEWRULE メッセージとして送り元へ返り（echo。`nlmsg_seq` は要求の seq）、
-//! ペイロードの `NFTA_RULE_HANDLE`（`__be64`）にカーネルが採番したハンドルが入る。echo と ACK の到着順は
-//! 固定とみなさず（一次情報での順序確定は未実施）どちらの順でも受け付ける。どちらも同期点（GETGEN）への
-//! 応答より前に届く（FIFO）ため、読み切り判定は変えない。echo は外部入力として次を fail-closed（`DataLoss`・
-//! `Unknown`）にする: echo を要求していない本体への NEWRULE・同じ本体への重複・nfgenmsg より短い
-//! ペイロード・ハンドル属性の欠落 / 重複 / 8 バイト以外 / 0（`NftRuleHandle::from_rule_attrs`）・
-//! BEGIN / END の seq への NEWRULE。echo を要求した本体のハンドルが同期点までに揃わない場合と、
-//! 失敗を集めたのに echo を受けていた（矛盾する応答）場合も `Unknown`（コミット済みかもしれないが
-//! ハンドルが不明。上位は quarantine に倒す）。echo のテーブル名・チェイン名・family の照合は行わない
-//! （seq の一致のみ。`nftables_batch` の組み立て側が要求を固定しているため。多層防御の追加は未実装）。
+//! ペイロードの `NFTA_RULE_HANDLE`（`__be64`）にカーネルが採番したハンドルが入る。
+//!
+//! ## 到着順と送信条件（一次情報。Linux v6.12 = commit `adc218676eef25575469234709c2d87185ca223a`）
+//!
+//! URL は `https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/<path>#L<行>`。
+//!
+//! - 到着順は **echo → 各 ACK → 同期点の応答**。`net/netfilter/nfnetlink.c` の `nfnetlink_rcv_batch` は
+//!   BEGIN / 本体の ACK・エラーを `err_list` に積むだけで（L430-433・L535-560。L536-539 のコメント
+//!   「Errors are delivered once the full batch has been processed」）、`ss->commit`（L574）の後、最後の
+//!   `nfnl_err_deliver`（L603）で送る。echo は `net/netfilter/nf_tables_api.c` の `nf_tables_commit`
+//!   （L10300〜。`nf_tables_rule_notify` の呼び出しは L10465 / L10475）が作り、末尾の `nft_commit_notify`
+//!   （L10173-10210・呼び出し L10623）が `nfnetlink_send`（nfnetlink.c L176-183）→ `nlmsg_notify`
+//!   （`net/netlink/af_netlink.c` L2564〜）で要求元へ unicast する。同じソケットの受信キュー（FIFO）に
+//!   入るため、成功したバッチでは echo（本体の順。複数件が 1 データグラムにまとまることがある）→ ACK の順
+//!   になる。それでも本実装は **両方の順を受理する**（判定の決め手は「同期点までに要求した echo が揃う
+//!   こと」で順序に依存しない。順序を厳格にしても安全性は増えず、別版のカーネルの差で `Unknown` になる
+//!   危険だけが増えるため）。
+//! - 送信条件: `nft_ctx_init`（nf_tables_api.c L130-148）が要求の `NLM_F_ECHO` を `ctx->report`
+//!   （L146。`include/net/netlink.h` L916-919 の `nlmsg_report`）に写し、`nf_tables_rule_notify`
+//!   （L3513-3554）は `NLM_F_ECHO` 付きなら必ず通知を作る（L3523-3525）。echo の flags は
+//!   `NLM_F_APPEND` / `NLM_F_CREATE` / `NLM_F_EXCL` だけで `NLM_F_REQUEST` は付かない（L3537-3540）。
+//!   `nf_tables_fill_rule_info`（L3454〜）の nfgenmsg は `family = ctx->family`・`res_id = nft_base_seq(net)`
+//!   （L3467-3468。**世代番号で 0 ではない**）で、`NFTA_RULE_TABLE` / `NFTA_RULE_CHAIN`（NUL 込みの文字列。
+//!   L3471・L3473）・`NFTA_RULE_HANDLE`（L3475）、条件つきで POSITION / EXPRESSIONS / USERDATA が続く。
+//! - echo が届かない場合: (1) 通知用 skb の確保・組み立ての失敗は `nfnetlink_set_err`（L3553）だが、
+//!   `do_one_set_err`（af_netlink.c L1561〜）は要求元のソケットを飛ばすため要求元には何の知らせも無く echo
+//!   が欠ける、(2) 受信キューのあふれは `nlmsg_unicast`（`MSG_DONTWAIT`）の `netlink_overrun`
+//!   （af_netlink.c L350-360）で要求元に `ENOBUFS`（`socket` が `ResourceExhausted`・`Unknown` にする）、
+//!   (3) バッチの失敗（本体のエラー・commit の失敗）は abort で echo が出ない（`-EAGAIN` の replay では
+//!   最後の 1 回分だけ届く。nfnetlink.c L567-572）。(1) が黙って起きるため、「同期点までに要求した echo が
+//!   揃わなければ `Unknown`」が必須の守りになる。
+//! - BEGIN には `NLM_F_ECHO` を付けない前提: commit 後の `nf_tables_gen_notify(NEWGEN)`（L10624）は BEGIN
+//!   の `NLM_F_ECHO` を見るため、付けると BEGIN の seq に NEWGEN が届き `DataLoss` になる。
+//!
+//! ## 検証の規則
+//!
+//! echo と ACK はどちらも同期点（GETGEN）への応答より前に届くため、読み切り判定は変えない。echo は外部入力
+//! として次を fail-closed（`DataLoss`・`Unknown`）にする: echo を要求していない本体への NEWRULE・同じ本体
+//! への重複・nfgenmsg より短いペイロード・BEGIN / END の seq への NEWRULE・**nfgenmsg の family、
+//! `NFTA_RULE_TABLE`、`NFTA_RULE_CHAIN` が要求（`NftBatch::push_with` が積んだバイト列から取った期待値。
+//! `RuleEchoExpect`）とバイト単位で一致しないもの**（欠落・重複・ネスト・NUL の不正を含む。seq が合っていても
+//! 別のルールのハンドルを採ると、後の DELRULE が別のルールを消しうるため。SEC-1）・ハンドル属性の
+//! 欠落 / 重複 / 8 バイト以外 / 0（`NftRuleHandle::from_rule_attrs`）。比べるのは family の 1 バイトと 2 つの
+//! 名前だけで、`res_id`（世代番号）・version・flags・他の属性は見ない。エラーメッセージに名前や受信バイト列は
+//! 載せない。echo を要求した本体のハンドルが同期点までに揃わない場合と、失敗を集めたのに echo を受けていた
+//! （矛盾する応答）場合も `Unknown`（コミット済みかもしれないがハンドルが不明。上位は quarantine に倒す）。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -56,9 +93,9 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
 use crate::nftables_batch::{
-    NFGENMSG_LEN, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, nfnl_msg_type,
+    NFGENMSG_LEN, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, RuleEchoExpect, nfnl_msg_type,
 };
-use crate::nftables_rules::{NFT_MSG_NEWRULE, NftRuleHandle};
+use crate::nftables_rules::{NFT_MSG_NEWRULE, NftRuleHandle, rule_table_chain_attrs};
 
 /// nf_tables の世代番号の照会（`linux/netfilter/nf_tables.h` の `NFT_MSG_GETGEN`）。同期点に使う。
 pub(crate) const NFT_MSG_GETGEN: u8 = 16;
@@ -247,7 +284,7 @@ pub(crate) struct NftBatchAckCollector {
     seen: Vec<bool>,
     pending: usize,
     /// 本体ごとの echo 要求（`NftBatchBytes::body_echo`）と、受理した echo のルールハンドル。
-    echo_expected: Vec<bool>,
+    echo_expected: Vec<Option<RuleEchoExpect>>,
     rule_handles: Vec<Option<NftRuleHandle>>,
     failures: Vec<NftMessageFailure>,
     /// BEGIN / END の非 0 errno を受けたか（本体の判定を待たずに判定済みにする）。
@@ -272,7 +309,9 @@ impl NftBatchAckCollector {
             end_seq: batch.end_seq(),
             seen: vec![false; body_seqs.len()],
             pending: body_seqs.len(),
-            echo_expected: (0..body_seqs.len()).map(|i| batch.body_echo(i)).collect(),
+            echo_expected: (0..body_seqs.len())
+                .map(|i| batch.body_echo_expect(i).cloned())
+                .collect(),
             rule_handles: vec![None; body_seqs.len()],
             body_seqs,
             failures: Vec::new(),
@@ -443,7 +482,7 @@ impl NftBatchAckCollector {
             .echo_expected
             .iter()
             .zip(&self.rule_handles)
-            .filter(|(want, got)| **want && got.is_none())
+            .filter(|(want, got)| want.is_some() && got.is_none())
             .count();
         if missing > 0 {
             return Err(self.unknown(data_loss(format!(
@@ -469,17 +508,35 @@ impl NftBatchAckCollector {
         let NftBatchPosition::Body { index } = position else {
             return Err(self.unknown(data_loss(format!("rule echo for non-body batch seq {seq}"))));
         };
-        if !self.echo_expected.get(index).copied().unwrap_or(false) {
+        let Some(expect) = self.echo_expected.get(index).and_then(Option::as_ref) else {
             return Err(self.unknown(data_loss(format!(
                 "unrequested rule echo for batch seq {seq}"
             ))));
-        }
+        };
         if self.rule_handles.get(index).copied().flatten().is_some() {
             return Err(self.unknown(data_loss(format!(
                 "duplicate rule echo for batch seq {seq}"
             ))));
         }
-        NfGenMsg::decode(msg.payload()).map_err(|e| self.unknown(e))?;
+        let nfg = NfGenMsg::decode(msg.payload()).map_err(|e| self.unknown(e))?;
+        // 応答の中身が要求と同じルールのものかを、family・テーブル名・チェイン名で照合する（SEC-1・#2905）。
+        // seq が合っていても別のルールのハンドルを採ると、後の DELRULE が別のルールを消しうる。
+        // メッセージには名前の値や受信バイト列を載せない。res_id（世代番号）と version は比べない。
+        let family_ok = nfg.family() == expect.family();
+        let attrs = msg.attrs(NFGENMSG_LEN).map_err(|e| self.unknown(e))?;
+        let identity = rule_table_chain_attrs(attrs);
+        let rejected = match &identity {
+            _ if !family_ok => Some("family"),
+            Err(_) => Some("table or chain attribute"),
+            Ok((t, _)) if t.as_slice() != expect.table() => Some("table"),
+            Ok((_, c)) if c.as_slice() != expect.chain() => Some("chain"),
+            Ok(_) => None,
+        };
+        if let Some(what) = rejected {
+            return Err(self.unknown(data_loss(format!(
+                "rule echo for batch seq {seq} does not match the requested {what}"
+            ))));
+        }
         let attrs = msg.attrs(NFGENMSG_LEN).map_err(|e| self.unknown(e))?;
         let handle = NftRuleHandle::from_rule_attrs(attrs).map_err(|e| self.unknown(e))?;
         if let Some(slot) = self.rule_handles.get_mut(index) {
@@ -1056,6 +1113,11 @@ mod tests {
                 };
                 let mut m = NlMsgBuilder::new(ty, flags, seq, 0);
                 NfGenMsg::new(NFPROTO_IPV4, 0).put_into(&mut m)?;
+                if want {
+                    // 要求のテーブル名・チェイン名（echo の照合の期待値になる。SEC-1・#2905）。
+                    m.put_attr(1, b"t\0")?;
+                    m.put_attr(2, b"c\0")?;
+                }
                 Ok(m)
             })
             .expect("push");
@@ -1065,12 +1127,26 @@ mod tests {
 
     /// echo 応答（NEWRULE。nfgenmsg + TABLE + CHAIN + HANDLE）。`handle` は属性の生バイト列。
     fn rule_echo_raw(seq: u32, handle: Option<&[u8]>) -> Vec<u8> {
+        rule_echo_with(seq, NFPROTO_IPV4, Some(b"t\0"), Some(b"c\0"), handle)
+    }
+
+    /// echo 応答の family・テーブル名・チェイン名を指定して組み立てる（`None` は属性を出さない）。
+    /// res_id は実カーネルと同様に非 0（世代番号）にする。
+    fn rule_echo_with(
+        seq: u32,
+        family: u8,
+        table: Option<&[u8]>,
+        chain: Option<&[u8]>,
+        handle: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut b = NlMsgBuilder::new(NEWRULE_TYPE, 0, seq, 0);
-        NfGenMsg::new(NFPROTO_IPV4, 0)
-            .put_into(&mut b)
-            .expect("nfg");
-        b.put_attr(1, b"t\0").expect("table");
-        b.put_attr(2, b"c\0").expect("chain");
+        NfGenMsg::new(family, 0x0102).put_into(&mut b).expect("nfg");
+        if let Some(t) = table {
+            b.put_attr(1, t).expect("table");
+        }
+        if let Some(c) = chain {
+            b.put_attr(2, c).expect("chain");
+        }
         if let Some(h) = handle {
             b.put_attr(3, h).expect("handle");
         }
@@ -1189,5 +1265,145 @@ mod tests {
         reach_barrier(&mut c, 104, 0);
         let e = c.conclude().expect_err("aborted");
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+    }
+
+    /// NET-3・SEC-1・#2905: echo の family・テーブル名・チェイン名が要求（IPv4・`t`・`c`）と違えば、
+    /// seq が合っていても DataLoss・Unknown とし、ハンドルを記録しない。
+    #[test]
+    fn net3_sec1_echo_identity_mismatch_is_data_loss() {
+        let h = 2u64.to_be_bytes();
+        let ok_t: Option<&[u8]> = Some(b"t\0");
+        let ok_c: Option<&[u8]> = Some(b"c\0");
+        let mut nested = NlMsgBuilder::new(NEWRULE_TYPE, 0, 101, 0);
+        NfGenMsg::new(NFPROTO_IPV4, 0)
+            .put_into(&mut nested)
+            .expect("nfg");
+        nested
+            .put_nested(1, |b| b.put_attr(1, b"t\0"))
+            .expect("nested table");
+        nested.put_attr(2, b"c\0").expect("chain");
+        nested.put_attr(3, &h).expect("handle");
+        let mut dup_t = NlMsgBuilder::new(NEWRULE_TYPE, 0, 101, 0);
+        NfGenMsg::new(NFPROTO_IPV4, 0)
+            .put_into(&mut dup_t)
+            .expect("nfg");
+        for _ in 0..2 {
+            dup_t.put_attr(1, b"t\0").expect("table");
+        }
+        dup_t.put_attr(2, b"c\0").expect("chain");
+        dup_t.put_attr(3, &h).expect("handle");
+        let mut dup_c = NlMsgBuilder::new(NEWRULE_TYPE, 0, 101, 0);
+        NfGenMsg::new(NFPROTO_IPV4, 0)
+            .put_into(&mut dup_c)
+            .expect("nfg");
+        dup_c.put_attr(1, b"t\0").expect("table");
+        for _ in 0..2 {
+            dup_c.put_attr(2, b"c\0").expect("chain");
+        }
+        dup_c.put_attr(3, &h).expect("handle");
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "table x",
+                rule_echo_with(101, NFPROTO_IPV4, Some(b"x\0"), ok_c, Some(&h)),
+            ),
+            (
+                "chain d",
+                rule_echo_with(101, NFPROTO_IPV4, ok_t, Some(b"d\0"), Some(&h)),
+            ),
+            (
+                "family inet",
+                rule_echo_with(101, NFPROTO_INET, ok_t, ok_c, Some(&h)),
+            ),
+            (
+                "table without NUL",
+                rule_echo_with(101, NFPROTO_IPV4, Some(b"t"), ok_c, Some(&h)),
+            ),
+            (
+                "table with inner NUL",
+                rule_echo_with(101, NFPROTO_IPV4, Some(b"t\0x\0"), ok_c, Some(&h)),
+            ),
+            (
+                "table missing",
+                rule_echo_with(101, NFPROTO_IPV4, None, ok_c, Some(&h)),
+            ),
+            (
+                "chain missing",
+                rule_echo_with(101, NFPROTO_IPV4, ok_t, None, Some(&h)),
+            ),
+            ("table nested", nested.finish().expect("nested")),
+            ("table duplicated", dup_t.finish().expect("dup_t")),
+            ("chain duplicated", dup_c.finish().expect("dup_c")),
+        ];
+        for (desc, dgram) in cases {
+            let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+            let e = c.feed(&dgram).expect_err(desc);
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{desc}");
+            assert_eq!(e.outcome(), NftBatchOutcome::Unknown, "{desc}");
+            assert_eq!(c.rule_handles[0], None, "{desc}");
+        }
+    }
+
+    /// NET-3・SEC-1: seq が合っていても、別のルール（別チェイン）の echo を取り違えて採らない。
+    #[test]
+    fn net3_sec1_swapped_chain_echo_is_rejected() {
+        let mut b = NftBatch::new(100).expect("new");
+        for chain in [&b"c\0"[..], &b"d\0"[..]] {
+            b.push_with(|seq| {
+                let mut m =
+                    NlMsgBuilder::new(NEWRULE_TYPE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
+                NfGenMsg::new(NFPROTO_IPV4, 0).put_into(&mut m)?;
+                m.put_attr(1, b"t\0")?;
+                m.put_attr(2, chain)?;
+                Ok(m)
+            })
+            .expect("push");
+        }
+        let batch = b.finish().expect("finish");
+        let h = 2u64.to_be_bytes();
+        let mut c = NftBatchAckCollector::new(&batch);
+        let e = c
+            .feed(&rule_echo_with(
+                101,
+                NFPROTO_IPV4,
+                Some(b"t\0"),
+                Some(b"d\0"),
+                Some(&h),
+            ))
+            .expect_err("swapped");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        let mut c = NftBatchAckCollector::new(&batch);
+        c.feed(&rule_echo_with(
+            102,
+            NFPROTO_IPV4,
+            Some(b"t\0"),
+            Some(b"d\0"),
+            Some(&h),
+        ))
+        .expect("matching echo");
+        assert_eq!(c.rule_handles[1], handle(2));
+    }
+
+    /// NET-3・#2905: 実カーネルの echo の形（res_id は世代番号で非 0・flags は CREATE|APPEND・
+    /// POSITION とネストした EXPRESSIONS つき）は受理する。
+    #[test]
+    fn net3_echo_with_nonzero_res_id_and_extra_attrs_is_accepted() {
+        let mut b = NlMsgBuilder::new(
+            NEWRULE_TYPE,
+            crate::netlink::NLM_F_CREATE | crate::netlink::NLM_F_APPEND,
+            101,
+            0,
+        );
+        NfGenMsg::new(NFPROTO_IPV4, 0x0102)
+            .put_into(&mut b)
+            .expect("nfg");
+        b.put_attr(1, b"t\0").expect("table");
+        b.put_attr(2, b"c\0").expect("chain");
+        b.put_attr(3, &2u64.to_be_bytes()).expect("handle");
+        b.put_attr(7, &1u64.to_be_bytes()).expect("position");
+        b.put_nested(4, |n| n.put_attr(1, b"x")).expect("exprs");
+        let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+        c.feed(&b.finish().expect("finish")).expect("accepted");
+        assert_eq!(c.rule_handles[0], handle(2));
     }
 }

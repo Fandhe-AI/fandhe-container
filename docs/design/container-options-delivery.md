@@ -80,5 +80,5 @@ core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数
 - **exec・healthcheck の env**: launch の env 上書きは `exec::run_command_with_pidfd_env` の `launch_env`（`store::launch_env_for` が世代を照合して返す）で `process.env` の上、exec 固有の指定の下に重ねる。呼び出し元の配線は healthcheck #2441・CLI の exec #2626（未実装）
 - **stack**: `Service::create_option_args` が env・env_files・labels を create の引数列へ写すところまで。`up`
   からの結線は TASK-155、ulimit・tmpfs のスキーマは #586・#862
-- **`--audit-policy` の CLI からの受け渡し**: 対象外（`start_contract` の doc に未実装とある）
-- **実機での観測**: `--ulimit`・`--env` を付けたコンテナ内の `/proc/self/limits`・environ の観測は未実施（実機前提テストは未追加）
+- **`--audit-policy` の CLI からの受け渡し**: CLI の `start --audit-policy <best-effort|strict>` が、指定時だけ supervisor の argv へ渡す（`start_client::StartOptions`。未指定は supervisor の既定 best-effort。plugin-cri は渡さない。SEC-4・#2761）
+- **実機での観測**: `crates/cli/tests/start_stop_delete_real.rs` が、`--ulimit nofile=256:512`・`--env` を付けたコンテナ内の `/proc/self/limits`・environ の値を照合する（実機前提。CI の `platform-ci` ubuntu が成功行を照合。SUP-12・#2761）

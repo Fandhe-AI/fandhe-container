@@ -11,7 +11,7 @@
 //! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] [--audit-policy <best-effort|strict>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
 //!   `--restart` は任意で既定は `no`。`--audit-policy` は任意で既定は `best-effort`（カーネル監査頼みの層が縮退した
-//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI からの受け渡しは未実装）。`--cri-log-path` は任意で、CRI の `log_directory/log_path` を結合・検証した絶対パス
+//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI の `start --audit-policy` が指定時だけ渡し、plugin-cri は渡さない。#2761）。`--cri-log-path` は任意で、CRI の `log_directory/log_path` を結合・検証した絶対パス
 //!   （POSIX 形式。`ContainerLogPath` が再検証する）。指定があれば `@container-logs` に加えて CRI ログ形式で追記する
 //!   （CRI-2・SUP-4・#2671。plugin-cri の StartContainer が渡す。CLI は渡さない）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる

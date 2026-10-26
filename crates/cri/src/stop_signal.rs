@@ -5,14 +5,17 @@
 //! （CreateContainer の検証）と `runtime_service`（StopContainer / StopPodSandbox が `RuntimeAdapter::stop_with_signal`
 //! へ渡す番号を求める）。結果は core の `StopRequest::with_signal` で運ばれる（core は CRI の型を知らない）。
 //!
-//! イメージ config の `StopSignal`（名前・番号）の解釈と、CRI の値との解決（`RUNTIME_DEFAULT` のときだけイメージの値）も
-//! 本モジュールが持つ（#2771・OCI-1。受ける形式は `docs/design/cri-config-acceptance.md`）。
+//! イメージ config の `StopSignal` は、語彙の解釈を core の `Signal::parse_notation`（CLI の `stop --signal` と共有）へ
+//! 委ね、本モジュールは空・長さ・`RUNTIME_DEFAULT` 除外・`CriError` 写像と CRI enum への写像、および CRI の値との
+//! 解決（`RUNTIME_DEFAULT` のときだけイメージの値）を持つ（#2771・#2832・OCI-1。受ける形式は
+//! `docs/design/cri-config-acceptance.md`）。
 //!
 //! 番号体系は x86_64 と aarch64 で 1..=31 が一致する Linux のもの。実時間シグナルは glibc / moby の
 //! 慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64。カーネルの 32・33 は glibc が予約する）に合わせる。
 
 use crate::error::CriError;
 use crate::runtime::v1::Signal;
+use fandhe_container_core::traits::Signal as CoreSignal;
 
 /// CRI の `Signal` の i32 を Linux のシグナル番号（1..=64）へ写す。
 ///
@@ -168,35 +171,25 @@ fn image_stop_signal_invalid() -> CriError {
 }
 
 /// イメージ config の `StopSignal`（OCI image-spec。`SIGTERM`・`TERM`・`sigint`・`9`・`SIGRTMIN+3` 等）を CRI の
-/// `Signal` へ解釈する（OCI-1・CRI-2。#2771）。空は `Ok(None)`（未指定）。
+/// `Signal` へ解釈する（OCI-1・CRI-2。#2771・#2832）。空は `Ok(None)`（未指定）。
 ///
-/// 数字だけなら Linux の番号（1..=64。32・33 を除く）、それ以外は ASCII の大文字小文字を区別しない名前で、
-/// `SIG` 接頭辞は任意。`RTMIN+1..=15`・`RTMAX-1..=14` も受ける（moby の `ParseSignal` と同じ語彙）。
-/// 空白・非 ASCII・範囲外・未知の名前は `INVALID_ARGUMENT`（固定文言。値は含めない。ERR-2）。
-/// イメージ由来の信頼できない入力のため、長さを先に検証し、表との照合だけで解釈する。
+/// 語彙の解釈は core の `Signal::parse_notation`（CLI の `stop --signal` と共有。CLI-1）へ委ね、本関数は
+/// 空の扱い・長さ上限・`RUNTIME_DEFAULT` の除外・`CriError`（固定文言。値は含めない。ERR-2）への写像だけを持つ。
+/// 受ける名前の集合は moby の `ParseSignal` と同じで、数字の扱いは moby より厳しい
+/// （差は `docs/design/cri-config-acceptance.md`）。別名（`IOT`・`CLD`・`POLL`）は番号経由で正規の名前
+/// （`Sigabrt`・`Sigchld`・`Sigio`）に寄る。
 pub fn parse_image_stop_signal(raw: &str) -> Result<Option<Signal>, CriError> {
     if raw.is_empty() {
         return Ok(None);
     }
+    // core も同じ上限を検査するが、イメージ由来の信頼できない入力を他 crate へ渡す前に cri 側でも検査する。
     if raw.len() > MAX_IMAGE_STOP_SIGNAL_BYTES {
         return Err(image_stop_signal_invalid());
     }
-    if raw.bytes().all(|b| b.is_ascii_digit()) {
-        let n: u8 = raw.parse().map_err(|_| image_stop_signal_invalid())?;
-        return linux_to_cri_signal(n)
-            .map(Some)
-            .ok_or_else(image_stop_signal_invalid);
-    }
-    if !raw
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-')
-    {
-        return Err(image_stop_signal_invalid());
-    }
-    let upper = raw.to_ascii_uppercase();
-    let body = upper.strip_prefix("SIG").unwrap_or(&upper);
-    let body = body.replace('+', "PLUS").replace('-', "MINUS");
-    Signal::from_str_name(&format!("SIGNAL_SIG{body}"))
+    // core のエラー文言は使わず、cri の固定文言へ写す（`?` の From 変換を使わない）。
+    let n = CoreSignal::parse_notation(raw).map_err(|_| image_stop_signal_invalid())?;
+    linux_to_cri_signal(n.as_u8())
+        // 番号の写像は 0（RUNTIME_DEFAULT）を返さないが、イメージの値としては受けない防御として残す。
         .filter(|s| *s != Signal::RuntimeDefault)
         .map(Some)
         .ok_or_else(image_stop_signal_invalid)
@@ -218,7 +211,6 @@ pub fn resolve_stop_signal(cri: i32, image: Option<Signal>) -> Result<Signal, Cr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fandhe_container_core::traits::Signal as CoreSignal;
 
     /// CRI-2: 代表的な値が Linux の番号へ写る（CRI の値そのものではない）。
     #[test]
@@ -288,6 +280,13 @@ mod tests {
             ("SIGRTMAX", Signal::Sigrtmax),
             ("SIGRTMIN", Signal::Sigrtmin),
             ("34", Signal::Sigrtmin),
+            ("SIGIOT", Signal::Sigabrt),
+            ("CLD", Signal::Sigchld),
+            ("poll", Signal::Sigio),
+            ("rtmax-14", Signal::Sigrtmaxminus14),
+            ("1", Signal::Sighup),
+            ("64", Signal::Sigrtmax),
+            ("kill", Signal::Sigkill),
         ];
         for (raw, want) in cases {
             assert_eq!(parse_image_stop_signal(raw).unwrap(), Some(want), "{raw}");
@@ -314,6 +313,17 @@ mod tests {
             "RUNTIME_DEFAULT",
             "SIGTÉRM",
             "SIG",
+            "RTMINPLUS3",
+            "SIGRTMAXMINUS1",
+            "RTMIN+01",
+            "RTMAX-01",
+            "33",
+            "+15",
+            "-1",
+            "99999999999",
+            "RTMIN+",
+            "RTMAX-0",
+            "ＳＩＧＫＩＬＬ",
             long.as_str(),
         ] {
             let err = parse_image_stop_signal(raw).expect_err(raw);
@@ -323,6 +333,81 @@ mod tests {
                 "{raw}"
             );
             assert_eq!(err.message(), "image stop signal is invalid");
+        }
+    }
+
+    /// CRI-2・CLI-1・OCI-1: core の `parse_notation` と受ける語彙・拒否する語彙が同じ（#2832）。
+    #[test]
+    fn cri2_parse_image_stop_signal_matches_core_notation() {
+        for (text, want) in [
+            ("SIGKILL", 9u8),
+            ("kill", 9),
+            ("TERM", 15),
+            ("sigusr1", 10),
+            ("SIGRTMIN", 34),
+            ("rtmin+1", 35),
+            ("RTMIN+15", 49),
+            ("SIGRTMAX-1", 63),
+            ("RTMAX-14", 50),
+            ("SIGRTMAX", 64),
+            ("IOT", 6),
+            ("CLD", 17),
+            ("POLL", 29),
+            ("10", 10),
+            ("1", 1),
+            ("64", 64),
+        ] {
+            let got = parse_image_stop_signal(text).unwrap().expect(text);
+            assert_eq!(linux_stop_signal(got as i32).unwrap(), want, "{text}");
+            assert_eq!(CoreSignal::parse_notation(text).unwrap().as_u8(), want);
+        }
+        assert_eq!(parse_image_stop_signal("").unwrap(), None);
+        assert!(CoreSignal::parse_notation("").is_err());
+        for text in [
+            "0",
+            "32",
+            "33",
+            "65",
+            "256",
+            "99999999999",
+            "+15",
+            "-1",
+            " SIGTERM",
+            "SIGTERM ",
+            "SIGFOO",
+            "SIG",
+            "RTMIN+0",
+            "RTMIN+16",
+            "RTMAX-15",
+            "RTMAX-0",
+            "RTMIN+01",
+            "RTMAX-01",
+            "RTMIN+",
+            "SIGNAL_SIGTERM",
+            "ＳＩＧＫＩＬＬ",
+        ] {
+            assert!(CoreSignal::parse_notation(text).is_err(), "{text}");
+            let err = parse_image_stop_signal(text).expect_err(text);
+            assert_eq!(err.message(), "image stop signal is invalid", "{text}");
+        }
+    }
+
+    /// CRI-2・REPAIR-12: CRI enum の全名（containerd の写し方）が受理され、同じ Linux 番号になる。
+    #[test]
+    fn cri2_parse_image_stop_signal_covers_cri_enum_names() {
+        for v in 1..=65 {
+            let sig = Signal::try_from(v).expect("known");
+            let name = sig
+                .as_str_name()
+                .trim_start_matches("SIGNAL_")
+                .replace("PLUS", "+")
+                .replace("MINUS", "-");
+            let got = parse_image_stop_signal(&name).unwrap().expect(&name);
+            assert_eq!(
+                linux_stop_signal(got as i32).unwrap(),
+                linux_stop_signal(v).unwrap(),
+                "{name}"
+            );
         }
     }
 

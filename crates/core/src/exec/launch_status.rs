@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! R\n                                  検証の全手順が通り、`execveat` を呼ぶ直前
-//! E <CODE> <reason|->\n                `execveat` の前の手順が失敗（<reason> は entrypoint 系の理由コードか -）
+//! E <step> <CODE> <reason|->\n        `execveat` の前の手順が失敗（<step> は [`ExecPhaseStep`] の段、<reason> は entrypoint 系の理由コードか -。#2895）
 //! X <CODE>\n                           `R` の後の `execveat` が戻った（errno 由来の失敗。#2716）
 //! ```
 //!
@@ -33,7 +33,9 @@
 //! 2 行目は C が `P` を読み終え、listener を受け取って ACK を返した**後**にしか書かれない（PID 1 は ACK を待ってから
 //! 検証へ進み、C は `P` の判定より前に listener を受け取らない）ため、2 行が 1 回の `read` に混ざらない。
 //! 復号は 1 行目と同じく厳格で、理由は `ViolationReason::from_entrypoint_token`（固定語彙の走査）で静的な値へ
-//! 引き直す。
+//! 引き直す。`E` 行の `<step>` も同じく固定語彙 [`ExecPhaseStep`] の許可リストで引き直し、未知の語・上限
+//! （1 語 48 バイト）を超える語・旧 3 語形式は `Malformed` にする（状態 pipe の両端は同じランタイムのバイナリなので
+//! 旧形式との互換は持たない。fail-closed）。
 //!
 //! # `R` の後の `execveat` の失敗（`X`。SEC-4・CORE-5・ERR-1・#2716）
 //!
@@ -54,8 +56,10 @@
 //! exec の子は同じ考え方（段・`ErrorCode`・理由コードだけを運ぶ）で、`<終了コード> <step> <CODE> <reason|->` の 4 語の
 //! 行を別の状態 pipe に書く。語彙 `process::ExecChildStep` は `F <step>` の `PrePivotStep` とは別で、対応は
 //! `ExecChildStep` の doc の表を正とする（要点: exec の `execveat` は本モジュールの `X`、`report_ready` は `R` を書けない
-//! 場合、`close_fds` から `stdio_null` は本モジュールの `E` と同じ `prepare_exec_child` の手順で、`E` 行は段を運ばない
-//! ままとする。`F <step>` の 14 段に対応する exec の段は無い）。
+//! 場合、`close_fds` から `stdio_null` の 11 段は本モジュールの `E` 行と同じトークンで運ぶ共有の段
+//! （[`LAUNCH_SHARED_EXEC_CHILD_STEPS`]。#2895）。`parent_lifetime`・`cgroup_join`・`report_ready`・`execveat` は
+//! `E` 行では受けない。launch だけの段は `verify_caller`・`restriction_evidence`・`verify_root` の 3 つ。
+//! `F <step>` の 14 段に対応する exec の段は無い）。
 //!
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
 //! 復号は厳格（単一スペース区切り・フィールド数固定・全トークンが許可リスト内・末尾に余分なバイト無し）で、
@@ -76,8 +80,8 @@ use crate::traits::ContainerId;
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, ViolationKind, ViolationReason, audit_entrypoint_violation,
-    record_launch_mount_rejection,
+    ExecChildStep, ExecError, IsolationStage, ViolationKind, ViolationReason,
+    audit_entrypoint_violation, record_launch_mount_rejection,
 };
 
 /// 状態行の最大バイト数（LF を含む）。最長の行は約 85 バイトで、それより十分大きい固定上限。
@@ -454,6 +458,84 @@ pub(super) fn read_line_bounded<const N: usize>(
     }
 }
 
+/// `E` 行の語（段・CODE・理由）1 つの最大バイト数（語彙を引く前の長さの上限。exec の失敗の行
+/// `process::EXEC_FAILURE_TOKEN_MAX` と同じ値。#2895）。
+const EXEC_PHASE_TOKEN_MAX: usize = 48;
+
+/// launch の `E` 行が受ける、exec と共有する `ExecChildStep`（`prepare_exec_child` の 11 段。#2895）。
+///
+/// `parent_lifetime`・`cgroup_join`（launch の PID 1 には無い）・`report_ready`（`R` を書けなければ行を書かない）・
+/// `execveat`（`X` が担う）は `E` 行では受けない。`ExecChildStep::from_token` が通るだけでは受理しない
+/// （取り違えた行を fail-closed に落とすため）。launch は `deferred_fsize = None` なので `deferred_rlimit` は
+/// 実際には届かないが、`prepare_exec_child` の段なので語彙には含める。
+pub(super) const LAUNCH_SHARED_EXEC_CHILD_STEPS: [ExecChildStep; 11] = [
+    ExecChildStep::CloseFds,
+    ExecChildStep::Setsid,
+    ExecChildStep::OpenRoot,
+    ExecChildStep::OpenEntrypoint,
+    ExecChildStep::RuntimeIdentity,
+    ExecChildStep::SelectExecutable,
+    ExecChildStep::DeferredRlimit,
+    ExecChildStep::Interpreter,
+    ExecChildStep::ScriptFd,
+    ExecChildStep::PrepareFds,
+    ExecChildStep::StdioNull,
+];
+
+/// launch の `E` 行が運ぶ、`execveat` 前の手順の段（固定語彙。SUP-6・REPAIR-3・REPAIR-4・#2895）。
+///
+/// 子（PID 1）は untrusted 扱いなので、運ぶのはこのトークンだけで、親は [`ExecPhaseStep::from_token`] で
+/// 静的な値へ引き直す（未知の語は `Malformed`）。段は情報用で、`reason` との整合は検査しない
+/// （監査の記録の有無は従来どおり `reason` だけで決まる）。
+/// - launch だけの段: `verify_caller`・`restriction_evidence`（`run_child` の検証）、`verify_root`（pivot 後の
+///   `/` の mount ID 照合。`PrePivotStep` の `pivot_root` と重ならない名前）
+/// - exec と共有する段: [`LAUNCH_SHARED_EXEC_CHILD_STEPS`] の 11 段（`prepare_exec_child` の手順）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum ExecPhaseStep {
+    /// `isolation.verify_caller(Exec)` の失敗（launch だけ）。
+    VerifyCaller,
+    /// 制限適用の証跡の要求 `require_restriction_evidence` の失敗（launch だけ）。
+    RestrictionEvidence,
+    /// pivot 後の `/` の mount ID 照合 `verify_pivot_root` の失敗（launch だけ）。
+    VerifyRoot,
+    /// exec と共有する `prepare_exec_child` の段。
+    Child(ExecChildStep),
+}
+
+impl ExecPhaseStep {
+    /// launch だけの段（3 段）。
+    pub(super) const LAUNCH_ONLY: [Self; 3] = [
+        Self::VerifyCaller,
+        Self::RestrictionEvidence,
+        Self::VerifyRoot,
+    ];
+
+    /// ワイヤー上のトークン。
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifyCaller => "verify_caller",
+            Self::RestrictionEvidence => "restriction_evidence",
+            Self::VerifyRoot => "verify_root",
+            Self::Child(step) => step.as_str(),
+        }
+    }
+
+    /// トークンから静的な値へ引き直す（launch だけの段と [`LAUNCH_SHARED_EXEC_CHILD_STEPS`] の走査。共有外の
+    /// exec の段・未知のトークンは `None`）。
+    pub(super) fn from_token(token: &str) -> Option<Self> {
+        Self::LAUNCH_ONLY
+            .into_iter()
+            .find(|s| s.as_str() == token)
+            .or_else(|| {
+                LAUNCH_SHARED_EXEC_CHILD_STEPS
+                    .into_iter()
+                    .find(|s| s.as_str() == token)
+                    .map(Self::Child)
+            })
+    }
+}
+
 /// exec 前の 2 行目（モジュール doc の「exec 前の 2 行目」）の復号結果。
 ///
 /// 1 行目（[`PrePivotStatus`]）と別の型にして、`P`/`F` と `R`/`E` の取り違えを型で防ぐ。
@@ -463,6 +545,8 @@ pub(super) enum ExecPhaseStatus {
     Ready,
     /// `execveat` の前の手順が失敗した。
     Failed {
+        /// 失敗した手順（#2895）。
+        step: ExecPhaseStep,
         code: ErrorCode,
         /// entrypoint 系の違反理由（`ENTRYPOINT_REASONS` のものだけ。それ以外は `None`）。
         violation: Option<ViolationReason>,
@@ -474,8 +558,9 @@ pub(super) enum ExecPhaseStatus {
 
 impl ExecPhaseStatus {
     /// 子側の唯一の作成入口。entrypoint 系以外の理由は落とす（失敗として報告する点は変わらない）。
-    pub(super) fn failed_from(error: &ExecError) -> Self {
+    pub(super) fn failed_from(step: ExecPhaseStep, error: &ExecError) -> Self {
         Self::Failed {
+            step,
             code: error.code,
             violation: error
                 .violation
@@ -492,8 +577,14 @@ impl ExecPhaseStatus {
         };
         let ok = match self {
             Self::Ready => out.push("R\n"),
-            Self::Failed { code, violation } => {
+            Self::Failed {
+                step,
+                code,
+                violation,
+            } => {
                 out.push("E ")
+                    && out.push(step.as_str())
+                    && out.push(" ")
                     && out.push(code.as_str())
                     && out.push(" ")
                     && out.push(violation.map_or("-", ViolationReason::as_str))
@@ -504,7 +595,8 @@ impl ExecPhaseStatus {
         if !ok {
             // 到達しない想定。成功行に落とさず、理由なしの失敗へ倒す。
             out.len = 0;
-            let _ = out.push("E INTERNAL -\n");
+            // 段は固定の `verify_caller` を使う（到達しない想定の代替行で、段は情報用のため）。
+            let _ = out.push("E verify_caller INTERNAL -\n");
         }
         out
     }
@@ -516,12 +608,17 @@ impl ExecPhaseStatus {
             .ok_or(PrePivotStatusError::Malformed)?;
         let text = std::str::from_utf8(body).map_err(|_| PrePivotStatusError::Malformed)?;
         let parts: Vec<&str> = text.split(' ').collect();
+        // 語彙を引く前に各語の長さを抑える（untrusted な子の入力。#2895）。
+        if parts.iter().any(|w| w.len() > EXEC_PHASE_TOKEN_MAX) {
+            return Err(PrePivotStatusError::Malformed);
+        }
         match parts.as_slice() {
             ["R"] => Ok(Self::Ready),
             ["X", code] => Ok(Self::Returned {
                 code: ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?,
             }),
-            ["E", code, reason] => {
+            ["E", step, code, reason] => {
+                let step = ExecPhaseStep::from_token(step).ok_or(PrePivotStatusError::Malformed)?;
                 let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let violation = if *reason == "-" {
                     None
@@ -531,7 +628,11 @@ impl ExecPhaseStatus {
                             .ok_or(PrePivotStatusError::Malformed)?,
                     )
                 };
-                Ok(Self::Failed { code, violation })
+                Ok(Self::Failed {
+                    step,
+                    code,
+                    violation,
+                })
             }
             _ => Err(PrePivotStatusError::Malformed),
         }
@@ -543,12 +644,13 @@ pub(super) fn report_exec_ready(status: &std::fs::File) -> Result<(), ExecError>
     write_status(status, &ExecPhaseStatus::Ready.encode())
 }
 
-/// 子側: `execveat` の前の手順の失敗 `error` を `E ...` として書く。
+/// 子側: `execveat` の前の手順 `step` の失敗 `error` を `E <step> ...` として書く。
 pub(super) fn report_exec_failure(
     status: &std::fs::File,
+    step: ExecPhaseStep,
     error: &ExecError,
 ) -> Result<(), ExecError> {
-    write_status(status, &ExecPhaseStatus::failed_from(error).encode())
+    write_status(status, &ExecPhaseStatus::failed_from(step, error).encode())
 }
 
 /// 子側: `R` の後の `execveat` が戻ったことを `X <CODE>` として書く（best-effort。#2716）。
@@ -576,6 +678,7 @@ pub(super) enum ExecPhaseOutcome {
     ExecReturned { code: ErrorCode },
     /// `execveat` の前の手順が失敗した（`E`）。
     Failed {
+        step: ExecPhaseStep,
         code: ErrorCode,
         violation: Option<ViolationReason>,
     },
@@ -601,9 +704,15 @@ impl ExecPhaseOutcome {
                 ExecPhaseStatus::Returned { code } => Ok(Self::ExecReturned { code }),
                 _ => Err(PrePivotStatusError::Malformed),
             },
-            ExecPhaseStatus::Failed { code, violation } if rest.is_empty() => {
-                Ok(Self::Failed { code, violation })
-            }
+            ExecPhaseStatus::Failed {
+                step,
+                code,
+                violation,
+            } if rest.is_empty() => Ok(Self::Failed {
+                step,
+                code,
+                violation,
+            }),
             _ => Err(PrePivotStatusError::Malformed),
         }
     }
@@ -692,12 +801,17 @@ pub(super) fn resolve_exec_phase_status(
             audit.sink,
         ))),
         Ok(ExecPhaseOutcome::Failed {
+            step,
             code,
             violation: None,
         }) => Err(Box::new(AuditedRejection::not_applicable(ExecError::new(
             code,
             IsolationStage::Exec,
-            "the entrypoint could not be prepared in the container child",
+            // 静的な段のトークンだけを入れる（子の自由文は運ばない。`PrePivotStep` の文言と同じ形）。
+            format!(
+                "exec phase step '{}' failed in the container child",
+                step.as_str()
+            ),
         )))),
         Ok(ExecPhaseOutcome::ExecReturned { code }) => {
             Err(Box::new(AuditedRejection::not_applicable(ExecError::new(
@@ -755,7 +869,13 @@ pub fn relay_entrypoint_violation_for_test(
     let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
     let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
     let error = ExecError::from_violation_at(reason, None, IsolationStage::Exec);
-    report_exec_failure(&w, &error).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    // 段は違反の出どころとして自然な共有の段に固定する（段は情報用で記録の有無には影響しない）。
+    report_exec_failure(
+        &w,
+        ExecPhaseStep::Child(ExecChildStep::OpenEntrypoint),
+        &error,
+    )
+    .map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
     drop(w);
     let status = read_exec_phase_until_close(&r, Duration::from_secs(5));
     resolve_exec_phase_status(status, LaunchAudit { sink, container })
@@ -1423,18 +1543,20 @@ mod tests {
     fn sec4_2624_encode_concrete_exec_phase_lines() {
         assert_eq!(ExecPhaseStatus::Ready.encode().as_bytes(), b"R\n");
         let e = ExecPhaseStatus::Failed {
+            step: ExecPhaseStep::Child(ExecChildStep::OpenEntrypoint),
             code: ErrorCode::PermissionDenied,
             violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
         };
         assert_eq!(
             e.encode().as_bytes(),
-            b"E PERMISSION_DENIED entrypoint_is_runtime_binary\n"
+            b"E open_entrypoint PERMISSION_DENIED entrypoint_is_runtime_binary\n"
         );
         let n = ExecPhaseStatus::Failed {
+            step: ExecPhaseStep::VerifyRoot,
             code: ErrorCode::NotFound,
             violation: None,
         };
-        assert_eq!(n.encode().as_bytes(), b"E NOT_FOUND -\n");
+        assert_eq!(n.encode().as_bytes(), b"E verify_root NOT_FOUND -\n");
     }
 
     /// 8 理由すべてが符号化・復号で往復し、親の記録は層 `entrypoint` に理由コードだけ・パスなしで 1 件（SEC-4・#2624）。
@@ -1444,7 +1566,10 @@ mod tests {
         let id = ContainerId::new("c2624").unwrap();
         for reason in ViolationReason::ENTRYPOINT_REASONS {
             let error = ExecError::from_violation_at(reason, None, IsolationStage::Exec);
-            let status = ExecPhaseStatus::failed_from(&error);
+            let status = ExecPhaseStatus::failed_from(
+                ExecPhaseStep::Child(ExecChildStep::OpenEntrypoint),
+                &error,
+            );
             let decoded = ExecPhaseStatus::decode(status.encode().as_bytes()).unwrap();
             assert_eq!(decoded, status);
             let outcome = ExecPhaseOutcome::decode_tail(status.encode().as_bytes()).unwrap();
@@ -1471,6 +1596,7 @@ mod tests {
         );
         let r = resolve_exec_phase_status(
             Ok(ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::VerifyRoot,
                 code: ErrorCode::NotFound,
                 violation: None,
             }),
@@ -1480,6 +1606,10 @@ mod tests {
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(r.error.code, ErrorCode::NotFound);
         assert_eq!(r.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            r.error.message,
+            "exec phase step 'verify_root' failed in the container child"
+        );
         let r = resolve_exec_phase_status(Err(PrePivotStatusError::Timeout), audit(&sink, None))
             .unwrap_err();
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
@@ -1491,10 +1621,10 @@ mod tests {
     #[test]
     fn sec4_2624_decode_rejects_malformed_exec_phase_lines() {
         for line in [
-            &b"E PERMISSION_DENIED target_moved\n"[..],
-            b"E PERMISSION_DENIED  entrypoint_is_runtime_binary\n",
-            b"E PERMISSION_DENIED\n",
-            b"E BOGUS -\n",
+            &b"E open_entrypoint PERMISSION_DENIED target_moved\n"[..],
+            b"E open_entrypoint PERMISSION_DENIED  entrypoint_is_runtime_binary\n",
+            b"E open_entrypoint PERMISSION_DENIED\n",
+            b"E open_entrypoint BOGUS -\n",
             b"R extra\n",
             b"P\n",
             b"F pivot_root INTERNAL -\n",
@@ -1523,10 +1653,11 @@ mod tests {
             None,
             IsolationStage::Exec,
         );
-        let status = ExecPhaseStatus::failed_from(&error);
+        let status = ExecPhaseStatus::failed_from(ExecPhaseStep::VerifyCaller, &error);
         assert!(matches!(
             status,
             ExecPhaseStatus::Failed {
+                step: ExecPhaseStep::VerifyCaller,
                 violation: None,
                 ..
             }
@@ -1536,6 +1667,7 @@ mod tests {
         assert_eq!(
             read_exec_phase_until_close(&file, Duration::from_secs(5)),
             Ok(ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::VerifyCaller,
                 code: ErrorCode::FailedPrecondition,
                 violation: None
             })
@@ -1554,8 +1686,9 @@ mod tests {
                 },
             ),
             (
-                b"E NOT_FOUND -\n",
+                b"E setsid NOT_FOUND -\n",
                 ExecPhaseOutcome::Failed {
+                    step: ExecPhaseStep::Child(ExecChildStep::Setsid),
                     code: ErrorCode::NotFound,
                     violation: None,
                 },
@@ -1616,8 +1749,9 @@ mod tests {
             })
         );
         assert_eq!(
-            ExecPhaseOutcome::decode_tail(b"E NOT_FOUND -\n"),
+            ExecPhaseOutcome::decode_tail(b"E restriction_evidence NOT_FOUND -\n"),
             Ok(ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::RestrictionEvidence,
                 code: ErrorCode::NotFound,
                 violation: None
             })
@@ -1632,13 +1766,13 @@ mod tests {
         );
         for bytes in [
             &b"X NOT_FOUND\n"[..],
-            b"R\nE NOT_FOUND -\n",
+            b"R\nE setsid NOT_FOUND -\n",
             b"R\nX FOO\n",
             b"R\nX NOT_FOUND\nZ",
             b"R\nX NOT_FOUND\nX NOT_FOUND\n",
             b"R\nR\n",
-            b"E NOT_FOUND -\nX NOT_FOUND\n",
-            b"E NOT_FOUND -\nR\n",
+            b"E setsid NOT_FOUND -\nX NOT_FOUND\n",
+            b"E setsid NOT_FOUND -\nR\n",
         ] {
             assert!(
                 ExecPhaseOutcome::decode_tail(bytes).is_err(),
@@ -1728,5 +1862,173 @@ mod tests {
             assert_eq!(r.error.stage, IsolationStage::Exec);
         }
         assert!(sink.snapshot().is_empty());
+    }
+
+    /// 全 `ExecPhaseStep`（launch だけの 3 段と共有の 11 段）。
+    fn all_phase_steps() -> Vec<ExecPhaseStep> {
+        let mut v = ExecPhaseStep::LAUNCH_ONLY.to_vec();
+        v.extend(LAUNCH_SHARED_EXEC_CHILD_STEPS.map(ExecPhaseStep::Child));
+        v
+    }
+
+    /// SUP-6・REPAIR-3・#2895: `E` 行は段つきの具体値へ符号化される。
+    #[test]
+    fn sup6_2895_encode_concrete_exec_phase_lines() {
+        let line = |step, code, violation| {
+            ExecPhaseStatus::Failed {
+                step,
+                code,
+                violation,
+            }
+            .encode()
+        };
+        assert_eq!(
+            line(
+                ExecPhaseStep::VerifyCaller,
+                ErrorCode::PermissionDenied,
+                None
+            )
+            .as_bytes(),
+            b"E verify_caller PERMISSION_DENIED -\n"
+        );
+        assert_eq!(
+            line(
+                ExecPhaseStep::RestrictionEvidence,
+                ErrorCode::FailedPrecondition,
+                None
+            )
+            .as_bytes(),
+            b"E restriction_evidence FAILED_PRECONDITION -\n"
+        );
+        assert_eq!(
+            line(
+                ExecPhaseStep::VerifyRoot,
+                ErrorCode::FailedPrecondition,
+                None
+            )
+            .as_bytes(),
+            b"E verify_root FAILED_PRECONDITION -\n"
+        );
+        assert_eq!(
+            line(
+                ExecPhaseStep::Child(ExecChildStep::StdioNull),
+                ErrorCode::Internal,
+                Some(ViolationReason::EntrypointIsRuntimeBinary)
+            )
+            .as_bytes(),
+            b"E stdio_null INTERNAL entrypoint_is_runtime_binary\n"
+        );
+    }
+
+    /// SUP-6・#2895: 全段 x 全 `ErrorCode` x 全 entrypoint 理由が往復し、最長の行も上限内に収まる。
+    #[test]
+    fn sup6_2895_roundtrip_every_step_code_and_reason() {
+        let steps = all_phase_steps();
+        assert_eq!(steps.len(), 14);
+        let mut longest = 0;
+        for step in steps {
+            for code in ErrorCode::ALL {
+                let reasons = std::iter::once(None)
+                    .chain(ViolationReason::ENTRYPOINT_REASONS.into_iter().map(Some));
+                for violation in reasons {
+                    let status = ExecPhaseStatus::Failed {
+                        step,
+                        code,
+                        violation,
+                    };
+                    let enc = status.encode();
+                    longest = longest.max(enc.as_bytes().len());
+                    assert_eq!(ExecPhaseStatus::decode(enc.as_bytes()), Ok(status));
+                    assert_eq!(
+                        ExecPhaseOutcome::decode_tail(enc.as_bytes()),
+                        Ok(ExecPhaseOutcome::Failed {
+                            step,
+                            code,
+                            violation
+                        })
+                    );
+                }
+            }
+        }
+        assert!(longest <= PRE_PIVOT_STATUS_MAX_BYTES, "{longest}");
+    }
+
+    /// SUP-6・#2895: 旧 3 語形式・共有外の exec の段・語彙外・長すぎる語・空の段は `Malformed`。
+    #[test]
+    fn sup6_2895_decode_rejects_bad_steps() {
+        let long = format!("E {} NOT_FOUND -\n", "s".repeat(EXEC_PHASE_TOKEN_MAX + 1));
+        let lines: Vec<&[u8]> = vec![
+            b"E NOT_FOUND -\n",
+            b"E parent_lifetime NOT_FOUND -\n",
+            b"E cgroup_join NOT_FOUND -\n",
+            b"E report_ready NOT_FOUND -\n",
+            b"E execveat NOT_FOUND -\n",
+            b"E bogus NOT_FOUND -\n",
+            b"E pivot_root NOT_FOUND -\n",
+            b"E  NOT_FOUND -\n",
+            b"E setsid  NOT_FOUND -\n",
+            long.as_bytes(),
+        ];
+        for line in lines {
+            assert_eq!(
+                ExecPhaseStatus::decode(line),
+                Err(PrePivotStatusError::Malformed),
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    /// SUP-6・REPAIR-3・#2895: 共有の許可リストは `prepare_exec_child` の 11 段と一致し、launch だけの 3 語は
+    /// exec の全段・pivot 前段のどちらとも重ならない。
+    #[test]
+    fn sup6_2895_step_tokens_do_not_overlap() {
+        let shared: Vec<&str> = LAUNCH_SHARED_EXEC_CHILD_STEPS
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            shared,
+            [
+                "close_fds",
+                "setsid",
+                "open_root",
+                "open_entrypoint",
+                "runtime_identity",
+                "select_executable",
+                "deferred_rlimit",
+                "interpreter",
+                "script_fd",
+                "prepare_fds",
+                "stdio_null"
+            ]
+        );
+        let only: Vec<&str> = ExecPhaseStep::LAUNCH_ONLY
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            only,
+            ["verify_caller", "restriction_evidence", "verify_root"]
+        );
+        for token in &only {
+            assert!(ExecChildStep::from_token(token).is_none(), "{token}");
+            assert!(PrePivotStep::from_token(token).is_none(), "{token}");
+        }
+        // exec の全段のうち、共有でないものは `E` 行で受けない。
+        for step in ExecChildStep::ALL {
+            let accepted = ExecPhaseStep::from_token(step.as_str()).is_some();
+            assert_eq!(
+                accepted,
+                LAUNCH_SHARED_EXEC_CHILD_STEPS.contains(&step),
+                "{}",
+                step.as_str()
+            );
+        }
+        // 全トークンが一意。
+        let mut all: Vec<&str> = all_phase_steps().into_iter().map(|s| s.as_str()).collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 14);
     }
 }

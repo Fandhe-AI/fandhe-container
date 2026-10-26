@@ -4079,6 +4079,7 @@ mod tests {
             roots[1],
             ProtectedFsRoot::new("C".to_owned(), "/".to_owned(), true)
         );
+        #[cfg(target_os = "linux")]
         assert!(roots[1].has_hard_linked_files());
         // Y は自分の point を走査根にする。
         assert_eq!(

@@ -106,6 +106,24 @@ CLI の `prepare_options_file`・`rollback_options`・`read_env_files` は `supe
 呼び出し側の期限の範囲で待つ（期限は延ばさない。待った時間は期限から引く）。待っても空かなければ job を実行せず
 `RESOURCE_EXHAUSTED`、期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。plugin-cri が使う `run_bounded_classified` の即時 `Busy` は変えない。
 
+### 繰り返し実行の記録（#2890・CLI-1・REPAIR-12）
+
+Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel`（libtest ハーネスの 10 試験。プロセス内で並列）を
+`make repeat-test PACKAGE=fandhe-container-cli TEST_BIN=stop_control_channel SUCCESS_LINE='test sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill ... ok' COUNT=100`
+で繰り返した（ローカル。`nproc`=10・カーネル 7.0.0-34-generic）。いずれかの試験が失敗すると終了コードが非 0 になり、回が失敗として数えられる。
+
+| 条件 | 回数 | passed | failed |
+| ---- | ---- | ------ | ------ |
+| A1: 既定の並列度（10 スレッド）・追加負荷なし（100 回 × 3 バッチ） | 300 | 300 | 0 |
+| A2: `RUST_TEST_THREADS=32`・`yes` を 10 本走らせた CPU 負荷（100 回 × 3 バッチ） | 300 | 300 | 0 |
+
+- 報告元の `sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill`・`sup9_sup3_stop_in_backoff_cancels_pending_restart` は、
+  #2868 の後の 600 回で一度も失敗しなかった。報告元 PR（#2861・#2864）は #2868 のマージ前のブランチで、#2868 が直した枠満杯の誤分類で説明できる。したがって製品・試験コードは変えていない
+- 計測の注意: 最初に成功行を `sup9_sup3_stop_in_backoff_cancels_pending_restart ... ok` にした試行は 300 回中 1 回が `missing-success-line` と数えられた。
+  出力は 10 試験とも ok・終了コード 0 で、並列試験の supervisor の JSON ログがその `... ok` の行の途中へ割り込み、行全体の完全一致に外れただけだった（試験の失敗ではない）。
+  supervisor を起動しない `sec1_err2_...` の行へ変えると割り込まない。libtest の並列出力を行照合する場合は、標準出力に何も書かない試験の行を選ぶ
+- 範囲外: `run_bounded` の他の呼び出し元の即時 `Busy` は #2894、`binary_entry.rs` の間欠失敗は #2766 で追跡する
+
 ## 観測（REPAIR-4）
 
 失敗時は従来の `container_log_remove`（成否）に加えて、コード別の操作名にも Failure を 1 件計上する。語彙は固定の 5 種:

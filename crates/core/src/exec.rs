@@ -829,6 +829,8 @@ pub enum IsolationStage {
     WorkingDir,
     /// namespaced な sysctl の適用（`linux.sysctl`。`rootfs/proc/sys` へ fd 起点で書く。CRI-2・CORE-3・SEC-1・#2670）。
     ApplySysctls,
+    /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true`。`mount_setattr(MOUNT_ATTR_RDONLY)`。CORE-5・SEC-1・#2767）。
+    RootReadOnly,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -2506,6 +2508,109 @@ pub(crate) fn enter_working_dir(
     sys::change_dir_fd(cur.as_fd()).map_err(|e| map_err(e, "cannot change to process.cwd"))
 }
 
+/// [`make_root_read_only`] の結果。将来の拡張（ステージ列・監査ログ）に備えて非網羅の構造体にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct RootReadOnlyReport {
+    /// `/` のマウントが `ST_RDONLY` であることを `fstatfs(2)` で事後検証済みか。成功時は常に真。
+    pub(crate) verified_read_only: bool,
+    /// 属性を足しただけで `nodev`（#1676）が落ちていないことを同じ `fstatfs(2)` で確認済みか。成功時は常に真。
+    pub(crate) nodev_kept: bool,
+}
+
+/// `root.readonly=true` の適用: pivot 直後の `/`（新 root の mount top）を読み取り専用にする
+/// （OCI の `root.readonly`。CORE-5・SEC-1・SUP-12・#2767）。
+///
+/// `process::run_pre_pivot` が `pivot_root` の直後・`enter_working_dir` の前に、`PrePivotSetup::root_readonly`
+/// が真のときだけ呼ぶ（pivot 前の段は rootfs へ書き込むため、これらより後でなければならない）。ステージ列
+/// （capability 削減・Landlock・seccomp）より前に走るので、既定の seccomp が拒否する `mount_setattr(2)` を
+/// 許可する必要はない。手順:
+///
+/// 1. `/` を `O_PATH|O_NOFOLLOW` で開き、マウント ID が `report.new_root_mnt_id` と一致することを確かめる
+/// 2. その fd へ `mount_setattr(MOUNT_ATTR_RDONLY)` を非再帰で足す。`MS_REMOUNT|MS_BIND` ではなく属性の
+///    追加だけにするのは、`nodev`（#1676）を言い直さずに済み、user namespace 内でロックされた
+///    `nosuid`/`nodev`/`noexec` を落とそうとして `EPERM` になる事態を避けるため（rootless でも成り立つ）
+/// 3. `fstatfs(2)` で `ST_RDONLY` と `ST_NODEV` の両方が立っていることを事後検証する
+///
+/// 非再帰のため `/proc`・`/dev` 系・tmpfs・注入・bind・保護パスの各マウントは自分の属性のまま（OCI の意味論）。
+/// `ENOSYS`（5.12 未満）を含むあらゆる失敗は fail-closed で起動を失敗させ、`mount(2)` への縮退や
+/// 「ro なしで起動」の分岐は作らない。エラーの message は固定文言でパス・errno を含めない。
+pub(crate) fn make_root_read_only(report: &PivotReport) -> Result<RootReadOnlyReport, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::RootReadOnly;
+    let root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
+    if fd_mount_id(&root, STAGE)? != report.new_root_mnt_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "/ is not the root prepared by pivot_root",
+        ));
+    }
+    root_read_only_syscall(root.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "mount_setattr(MOUNT_ATTR_RDONLY)"))?;
+    // dry-run（`cfg(test)`）では実マウントが無く、ホストの `/` の属性で結果が揺れるため検証しない。
+    if !cfg!(test) {
+        let flags = sys::mount_flags(root.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(/)"))?;
+        check_root_read_only_flags(flags)?;
+    }
+    Ok(RootReadOnlyReport {
+        verified_read_only: true,
+        nodev_kept: true,
+    })
+}
+
+/// 読み取り専用化の事後検証（純関数。fail-closed）。`ST_RDONLY` と `ST_NODEV` の両方が要る
+/// （`ST_VALID` が無い値は判定不能として拒否）。
+fn check_root_read_only_flags(flags: sys::MountFlags) -> Result<(), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::RootReadOnly;
+    if !flags.is_valid() {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            STAGE,
+            "cannot verify the root mount flags",
+        ));
+    }
+    if !flags.is_read_only() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "the root mount is not read-only after mount_setattr",
+        ));
+    }
+    if !flags.is_nodev() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "the root mount lost nodev while becoming read-only",
+        ));
+    }
+    Ok(())
+}
+
+/// `/` の mount top を fd 起点で読み取り専用にする。本番ビルドでは [`sys::set_mount_read_only`]。
+#[cfg(not(test))]
+fn root_read_only_syscall(root: std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> {
+    sys::set_mount_read_only(root)
+}
+
+/// dry-run: `mount_setattr(2)` を呼ばず、呼ばれた回数と本番と同じ引数の組を記録する。
+#[cfg(test)]
+fn root_read_only_syscall(_root: std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> {
+    ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().push(sys::read_only_call_params()));
+    Ok(())
+}
+
+/// dry-run が記録する `mount_setattr(2)` の引数の組（[`sys::read_only_call_params`] と同形）。
+#[cfg(test)]
+type ReadOnlyCallParams = (u64, u64, u64, u64, u32, usize);
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_READ_ONLY_CALLS: std::cell::RefCell<Vec<ReadOnlyCallParams>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// [`pin_rootfs`] の結果。
 struct PinnedRootfs {
     /// rootfs の親ディレクトリの fd（rootfs が `/` のときは `None`）。bind mount 後に同じ
@@ -2742,6 +2847,65 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn pivot_report_with(mnt_id: u64) -> PivotReport {
+        PivotReport {
+            new_root_mnt_id: mnt_id,
+            old_root_detached: true,
+            proc_mounted: true,
+            rootfs_nodev: true,
+        }
+    }
+
+    /// CORE-5・SEC-1（#2767）: `/` のマウント ID が pivot の結果と食い違えば、属性を足す前に拒否する。
+    #[test]
+    fn core5_sec1_make_root_read_only_rejects_foreign_root_before_syscall() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let real = fd_mount_id(&root, IsolationStage::RootReadOnly).expect("mnt_id");
+        ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().clear());
+        let err = make_root_read_only(&pivot_report_with(real.wrapping_add(1))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::RootReadOnly);
+        assert_eq!(err.message, "/ is not the root prepared by pivot_root");
+        assert!(ROOT_READ_ONLY_CALLS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// CORE-5・SEC-1（#2767）: 一致すれば `mount_setattr` を属性の追加のみ（`attr_clr=0`・非再帰）で 1 回だけ呼ぶ。
+    #[test]
+    fn core5_sec1_make_root_read_only_adds_the_attribute_once() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let real = fd_mount_id(&root, IsolationStage::RootReadOnly).expect("mnt_id");
+        ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().clear());
+        let report = make_root_read_only(&pivot_report_with(real)).expect("read-only");
+        assert!(report.verified_read_only && report.nodev_kept);
+        let calls = ROOT_READ_ONLY_CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, [sys::read_only_call_params()]);
+        let (attr_set, attr_clr, ..) = calls[0];
+        assert_eq!((attr_set, attr_clr), (1, 0));
+    }
+
+    /// SEC-1（#2767）: 事後検証は `ST_VALID`・`ST_RDONLY`・`ST_NODEV` の全部を要求する（fail-closed）。
+    #[test]
+    fn sec1_root_read_only_flags_require_rdonly_and_nodev() {
+        const VALID: i64 = 0x20;
+        const RDONLY: i64 = 0x1;
+        const NODEV: i64 = 0x4;
+        let check = |bits| check_root_read_only_flags(sys::MountFlags::from_bits(bits));
+        assert!(check(VALID | RDONLY | NODEV).is_ok());
+        let no_ro = check(VALID | NODEV).unwrap_err();
+        assert_eq!(no_ro.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            no_ro.message,
+            "the root mount is not read-only after mount_setattr"
+        );
+        let no_dev = check(VALID | RDONLY).unwrap_err();
+        assert_eq!(
+            no_dev.message,
+            "the root mount lost nodev while becoming read-only"
+        );
+        let invalid = check(RDONLY | NODEV).unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::Internal);
+    }
 
     /// SEC-5・CORE-3（#2674）: 参加した user namespace の写像は、計画の期待値と完全一致するときだけ受ける。
     #[test]

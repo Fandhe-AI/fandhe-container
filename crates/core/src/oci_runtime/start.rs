@@ -65,9 +65,12 @@
 //! - （適用済み）`process.cwd` は pivot 直後に fd 起点で適用し、`process.user` の uid・gid と
 //!   `additionalGids` は launcher が user namespace の写像と照合して適用する（OCI-1・SEC-5・CORE-6・#2667）。
 //!   `additionalGids` の写像外・単一 ID 写像での指定は launcher が fork の前に拒否する
+//! - （適用済み）`root.readonly=true` は pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足して適用する
+//!   （`mount_setattr`。`nodev` 等の既存属性を落とさず rootless でも成り立つ。`/proc`・`/dev` 系・tmpfs・bind は自分の属性のまま。
+//!   Landlock の規則も同じ config の値から決まる。CORE-5・SEC-1・SUP-12・#2767）
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
-//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
+//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は、root が書き込み可能な間は未対応で、`root.readonly=true` なら `ro` で適用する）
 //! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
 //!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
 //!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
@@ -88,7 +91,6 @@
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
 //!   写像は launcher が権限モデルから導く。受けるかはオーナー判断待ちで #2240 と
 //!   `docs/design/config-id-mappings.md` に判断材料があり、決まるまで拒否のまま）
-//! - `root.readonly` が true（読み取り専用 rootfs 未実装）
 //! - `linux.readonlyPaths` / `maskedPaths` が暗黙の `/dev`・`/dev/pts`・`/dev/shm` と同じか祖先を指す
 //!   （`InvalidArgument`。fork・予約より前。SEC-2・CORE-5・#2015。子孫は受ける）
 //!
@@ -1300,9 +1302,8 @@ fn reject_config_id_mappings(config: &OciConfig) -> Result<(), TraitError> {
 }
 
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
-    if config.root().readonly() {
-        return Err(unsupported("root.readonly"));
-    }
+    // `root.readonly=true` は受ける: launcher が pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を足し、
+    // Landlock の規則（`root_rights`）も同じ config から決まる（CORE-5・SEC-1・SUP-12・#2767）。
     reject_config_id_mappings(config)?;
     // path は user と ipc の組だけを受ける（pod の join。形の検査だけここで行い、開いて固定するのは rootfs の
     // 固定の段。他の種別の path・片方だけの path は `Unimplemented`。#2674）。
@@ -2241,7 +2242,6 @@ mod tests {
                         json!([{"containerID": 0, "hostID": 1000, "size": 1}])
                 }),
             ),
-            ("ro", Box::new(|c| c["root"]["readonly"] = json!(true))),
         ];
         for (name, mutate) in cases {
             let mut cfg = valid_config();
@@ -2254,6 +2254,24 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// CORE-5・SEC-1・SUP-12（#2767）: `root.readonly=true` は start が受け、launcher へ届く `LaunchSpec` の
+    /// config が同じ値を持つ（本番の launcher はここから `PrePivotSetup::root_readonly` と Landlock の規則を作る）。
+    #[test]
+    fn core5_sec1_start_accepts_root_readonly() {
+        let name = "ro-root";
+        let (b, store) = created(name);
+        let mut cfg = valid_config();
+        cfg["root"]["readonly"] = json!(true);
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, name).expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(launcher.calls(), 1);
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert!(spec.config().root().readonly());
     }
 
     /// SEC-5・CORE-6・TASK-40（#2240）: config 指定の ID 写像は uid のみ・gid のみ・両方のどれでも

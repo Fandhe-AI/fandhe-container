@@ -41,6 +41,11 @@
 //!   内容とモードがコンテナ内で具体値で一致することを照合する（呼び出し元のメモリ由来の内容は launcher が拒否する。
 //!   holder のメモリに secret が無いことは `rootless_holder_memory` が照合する）。成功時は
 //!   `production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)` を出す
+//! - シナリオ Y（読み取り専用 rootfs。非 root。CORE-5・SEC-1・SUP-12・#2767）: `root.readonly=true` を start し、rootfs への新規作成・
+//!   既存ファイルへの書き込み・mkdir がすべて `EROFS`（30。Landlock だけが止めた `EACCES` は失敗）、`/` の per-mount オプションに
+//!   `ro` と `nodev`、`/proc` に `ro` が無い（非再帰）こと、`--tmpfs`（`/run`）・`/dev/shm`・`/dev/null`・rw の bind への書き込みが
+//!   成功しホスト側に内容が現れることを照合する。成功時は
+//!   `production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y` を出す
 //! - シナリオ V（sysctls。CRI-2・CORE-3・#2670）: `linux.sysctl` の `kernel.shmmax` がコンテナ内の IPC namespace で指定値になり、
 //!   ホスト側の値が変わらないことを照合する。成功時は `production_launcher: sysctls applied (scenario=V` を出す
 //! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
@@ -237,6 +242,11 @@ mod linux {
     const LO_SECRET_MODE: u32 = 0o440;
     /// シナリオ S で指定する tmpfs のコンテナ内パス。
     const LO_TMPFS_DEST: &str = "/run";
+    /// シナリオ Y（読み取り専用 rootfs。#2767）: 試験が rootfs に先に置く既存ファイル・内容と、rw の bind に書く内容。
+    const RO_MARKER_FILE: &str = "ro-marker";
+    const RO_MARKER_CONTENT: &str = "ro-marker-original\n";
+    const RO_DATA_FILE: &str = "y";
+    const RO_DATA_CONTENT: &str = "written-to-rw-bind-under-readonly-root\n";
     /// 1 行の長さの上限（無制限確保を避ける。REPAIR-5 と同趣旨）。
     const LINE_MAX: u64 = 4096;
     /// 受け取る行数の上限。
@@ -495,6 +505,74 @@ mod linux {
             );
             emit(format!("RSLAVE_OPTIONAL {optional}"));
         }
+        // シナリオ Y（読み取り専用 rootfs。#2767）: rootfs への書き込みの errno（VFS の EROFS=30 か、Landlock だけが止めた
+        // EACCES=13 かを区別する）・`/` と `/proc` の per-mount オプション・書き込み可能であるべきマウントへの書き込み。
+        if std::env::args().any(|a| a == "--with-readonly-root") {
+            let errno = |r: std::io::Result<()>| {
+                r.map_or_else(
+                    |e| {
+                        e.raw_os_error()
+                            .map_or("none".to_string(), |n| n.to_string())
+                    },
+                    |()| "ok".to_string(),
+                )
+            };
+            emit(format!(
+                "RO_CREATE {}",
+                errno(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open("/ro-probe-new")
+                        .map(|_| ())
+                )
+            ));
+            emit(format!(
+                "RO_WRITE {}",
+                errno(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(format!("/{RO_MARKER_FILE}"))
+                        .map(|_| ())
+                )
+            ));
+            emit(format!(
+                "RO_MKDIR {}",
+                errno(std::fs::create_dir("/ro-dir"))
+            ));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            let opts_of = |dest: &str| -> String {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(5).copied().unwrap_or("").to_string())
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| "not-mounted".to_string())
+            };
+            emit(format!("RO_ROOT_OPTS {}", opts_of("/")));
+            emit(format!("RO_PROC_OPTS {}", opts_of("/proc")));
+            emit(format!(
+                "RO_RUN {}",
+                errno(std::fs::write("/run/y", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_SHM {}",
+                errno(std::fs::write("/dev/shm/y", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_DEVNULL {}",
+                errno(std::fs::write("/dev/null", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_DATA {}",
+                errno(std::fs::write(
+                    format!("{BIND_DEST}/{RO_DATA_FILE}"),
+                    RO_DATA_CONTENT
+                ))
+            ));
+        }
         // シナリオ S（起動オプション。#2625）: IPC namespace の識別子・指定 tmpfs の種別・`/dev/shm` の有無・注入ファイル。
         if std::env::args().any(|a| a == "--with-launch-options") {
             let ipc = std::fs::read_link("/proc/self/ns/ipc").map_or_else(
@@ -649,6 +727,20 @@ mod linux {
         });
         std::fs::write(
             bundle.dir.join("config.json"),
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config.json");
+    }
+
+    /// 書き出し済みの `config.json` の `root.readonly` を真にする（シナリオ Y。#2767）。
+    fn set_root_readonly(bundle: &Bundle) {
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config.json"))
+                .expect("parse config.json");
+        config["root"]["readonly"] = json!(true);
+        std::fs::write(
+            &path,
             serde_json::to_vec(&config).expect("serialize config"),
         )
         .expect("write config.json");
@@ -862,6 +954,7 @@ mod linux {
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
         scenario_s_launch_options(&env, tag);
+        scenario_y_readonly_root(&env, tag);
         if subordinate_requested() {
             scenario_i_subordinate_ids(&env, tag);
             scenario_s_subordinate_sealed_inject(&env, tag);
@@ -1410,6 +1503,110 @@ mod linux {
             assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
             println!(
                 "production_launcher: launch options reached the container (scenario=S ipc=host tmpfs={LO_TMPFS_DEST} secret mode=440)"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ Y（読み取り専用 rootfs。CORE-5・SEC-1・SUP-12・#2767）: `root.readonly=true` の config を start し、
+    /// rootfs への新規作成・既存ファイルへの書き込み・mkdir が **`EROFS`（30）** で拒否されることを照合する。
+    /// Landlock だけが止めている場合は `EACCES`（13）になるため、これを失敗として扱う（VFS の読み取り専用化が効いていることの
+    /// 判別条件。カーネルは `got_write` が無いとき Landlock のフックより先に `EROFS` を返す: `fs/namei.c` の `lookup_open`・
+    /// `filename_create` と `fs/open.c` の `do_dentry_open` で書き込みアクセスの取得が `security_*` より先）。
+    /// あわせて `/` の per-mount オプションに `ro` と `nodev` が含まれる（属性の追加だけで `nodev` が落ちない）こと、
+    /// `/proc` に `ro` が付かない（非再帰）こと、`--tmpfs`（`/run`）・専用 `/dev`（`/dev/shm`・`/dev/null`）・rw の bind
+    /// （`/data`）への書き込みが成功し、bind はホスト側に内容が現れることを照合する。非 root の経路だけで回す。
+    fn scenario_y_readonly_root(env: &Env, tag: u32) {
+        let _ = env;
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+            .expect("push tmpfs");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for readonly root"),
+        );
+        let src = Bundle::new("y-src");
+        let bundle = Bundle::new("y");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        std::fs::write(bundle.rootfs().join(RO_MARKER_FILE), RO_MARKER_CONTENT).expect("marker");
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["bind", "rw"]
+        }]);
+        write_config(&bundle, &ld, &["--with-readonly-root"], mounts);
+        set_root_readonly(&bundle);
+        let id = ContainerId::new(format!("ply{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            // EROFS = 30。13（EACCES）なら Landlock だけが止めていて、VFS の読み取り専用化が効いていない。
+            for key in ["RO_CREATE", "RO_WRITE", "RO_MKDIR"] {
+                assert_eq!(value_of(&lines, key), "30", "{key}: {lines:?}");
+            }
+            let root_opts: Vec<&str> = value_of(&lines, "RO_ROOT_OPTS").split(',').collect();
+            assert!(root_opts.contains(&"ro"), "{root_opts:?}");
+            assert!(root_opts.contains(&"nodev"), "{root_opts:?}");
+            let proc_opts: Vec<&str> = value_of(&lines, "RO_PROC_OPTS").split(',').collect();
+            assert!(!proc_opts.contains(&"ro"), "{proc_opts:?}");
+            for key in ["RO_RUN", "RO_SHM", "RO_DEVNULL", "RO_DATA"] {
+                assert_eq!(value_of(&lines, key), "ok", "{key}: {lines:?}");
+            }
+            let on_host = std::fs::read_to_string(src.dir.join(RO_DATA_FILE)).expect("host file");
+            assert_eq!(on_host, RO_DATA_CONTENT);
+            assert!(!bundle.rootfs().join("ro-probe-new").exists());
+            assert!(!bundle.rootfs().join("ro-dir").exists());
+            assert_eq!(
+                std::fs::read_to_string(bundle.rootfs().join(RO_MARKER_FILE)).expect("marker"),
+                RO_MARKER_CONTENT
+            );
+            println!(
+                "production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y root=ro nodev=kept tmpfs={LO_TMPFS_DEST})"
             );
         }));
         let (_record, process) = started.into_parts();

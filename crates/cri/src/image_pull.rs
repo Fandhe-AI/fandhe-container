@@ -129,8 +129,11 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
@@ -193,6 +196,22 @@ impl PullError {
             OciErrorCode::ResourceExhausted => "image exceeds the size limit",
             OciErrorCode::FailedPrecondition => "image cache precondition failed",
             _ => "image pull failed",
+        };
+        Self::new(err.code(), message)
+    }
+
+    /// ローカルのイメージストア（`ImageStore` / `PullSession`）の失敗を写す。レジストリ由来ではないため
+    /// `from_oci` の「registry ...」文言を使わず、ストア用の固定文言にする（OCI-7）。
+    pub fn from_store(err: &OciError) -> Self {
+        let message = match err.code() {
+            OciErrorCode::Timeout => "image store lock wait timed out",
+            OciErrorCode::NotFound => "image store entry not found",
+            OciErrorCode::DataLoss => "image store data failed validation",
+            OciErrorCode::PermissionDenied => "image store access denied",
+            OciErrorCode::Unavailable => "image store is unavailable",
+            OciErrorCode::ResourceExhausted => "image store resource limit exceeded",
+            OciErrorCode::FailedPrecondition => "image cache precondition failed",
+            _ => "image store operation failed",
         };
         Self::new(err.code(), message)
     }
@@ -675,7 +694,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     ) -> Result<PathBuf, PullError> {
         if let BlobReuse::Leased(token) = session
             .lease_existing_blob(&descriptor.digest)
-            .map_err(|e| PullError::from_oci(&e))?
+            .map_err(|e| PullError::from_store(&e))?
         {
             let path = token.path().to_path_buf();
             // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
@@ -685,11 +704,11 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             }
             session
                 .release_leased(token)
-                .map_err(|e| PullError::from_oci(&e))?;
+                .map_err(|e| PullError::from_store(&e))?;
         }
         let staged = session
             .staged_blob_path(&descriptor.digest)
-            .map_err(|e| PullError::from_oci(&e))?;
+            .map_err(|e| PullError::from_store(&e))?;
         // 長時間の pull では Bearer token が途中で失効する。取得前に失効を確認して再認証し、
         // 取得が PermissionDenied なら有限回（MAX_REAUTH_RETRIES）だけ再認証して再試行する（OCI-3）。
         let mut retries = 0u32;
@@ -721,7 +740,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
         let verified = session
             .verify_staged_blob(&descriptor.digest, descriptor.size)
-            .map_err(|e| PullError::from_oci(&e))?;
+            .map_err(|e| PullError::from_store(&e))?;
         if verified.size != descriptor.size {
             return Err(PullError::new(
                 OciErrorCode::DataLoss,
@@ -866,11 +885,11 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
         // manifest とタグの登録・リース解放を排他の下でまとめて行う。cri 自身は `blobs/sha256` へ置かない。
         let blobs = self.blobs_dir()?;
         let store = ImageStore::open(&self.config.cache_dir)
-            .map_err(|e| PullError::from_oci(&e))?
+            .map_err(|e| PullError::from_store(&e))?
             .with_recorder(Arc::clone(&self.recorder));
         let mut session = store
             .begin_pull_generated()
-            .map_err(|e| PullError::from_oci(&e))?;
+            .map_err(|e| PullError::from_store(&e))?;
         let ctx = PullContext {
             endpoint: &endpoint,
             repository,
@@ -904,10 +923,11 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             ));
         }
         // 失敗時の abort は publish が内部で行う。
+        // publish が確定した後は期限超過でも成功を返す。ここで Timeout を返すと永続在庫に登録済みなのに
+        // 呼び出し側（CriImageService）が自身の表示を更新せず食い違う（OCI-7）。期限は publish の前に確認済み。
         session
             .publish(publish)
-            .map_err(|e| PullError::from_oci(&e))?;
-        self.check_deadline(started)?;
+            .map_err(|e| PullError::from_store(&e))?;
 
         let name = display_name(image_ref.registry(), repository);
         let mut repo_tags = Vec::new();
@@ -1575,6 +1595,8 @@ fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
     Ok(())
 }
 
+/// 一時名の衝突回避用カウンタ（Unix の所有者検査とテストだけが使う）。
+#[cfg(any(unix, test))]
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 展開の作業領域の名前（`staging/<id>/unpack`。中に `entry/{rootfs,unpack-record}`）。

@@ -128,8 +128,9 @@ cat <<'EOF'
   install-launcher-selftest           scripts/install-privileged-launcher-selftest.sh
                                         特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
   crictl-smoke-selftest               scripts/cri/crictl-smoke-selftest.sh
-  docker-hub-ratelimit-probe-selftest scripts/cri/docker-hub-ratelimit-probe-selftest.sh
                                         crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
+  docker-hub-ratelimit-probe-selftest scripts/cri/docker-hub-ratelimit-probe-selftest.sh
+                                        Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
                                         repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
   check-success-lines-selftest        scripts/check-success-lines-selftest.sh
@@ -191,8 +192,9 @@ cat <<'EOF'
   restart-latency                     scripts/targets/restart-latency.sh
                                         restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
   crictl-smoke                        scripts/targets/crictl-smoke.sh
-  docker-hub-ratelimit-probe          scripts/cri/docker-hub-ratelimit-probe.sh
                                         crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
+  docker-hub-ratelimit-probe          scripts/cri/docker-hub-ratelimit-probe.sh
+                                        Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS=]。CRI-3・#2818）
   repeat-test                         scripts/targets/repeat-test.sh
                                         指定した試験を N 回繰り返して間欠失敗を検出する（REPAIR-12。1 回ごとに timeout・成功行 `1 passed` を照合）
   docker-build                        docker compose build

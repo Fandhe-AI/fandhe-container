@@ -67,7 +67,7 @@ code="$(curl --proto '=https' --max-time "${tmo}" -sS -I -o /dev/null -D "${work
 # ヘッダ値の先頭の数値（`<n>;w=<秒>` の n）。無ければ空。
 hdr() { # <name>
   [ -f "${work}/hdr.txt" ] || return 0
-  tr -d '\r' < "${work}/hdr.txt" | sed -n "s/^$1:[[:space:]]*\([0-9][0-9]*\).*/\1/Ip" | head -n 1
+  tr -d '\r' < "${work}/hdr.txt" | tr 'A-Z' 'a-z' | sed -n "s/^$1:[[:space:]]*\([0-9][0-9]*\).*/\1/p" | head -n 1
 }
 remaining="$(hdr ratelimit-remaining)"
 limit="$(hdr ratelimit-limit)"

@@ -158,7 +158,7 @@ cat <<'EOF'
   bench-baseline                      scripts/targets/bench-baseline.sh
                                         ベンチを実行し baseline.json を再生成する（TASK-88.1・REPAIR-8）
   cli-parity                          scripts/targets/cli-parity.sh
-                                        CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+                                        CLI 3 OS 比較の capture（CLI/OUTPUT。任意で TIMEOUT=1〜600 秒）または compare（BASELINE/CANDIDATE）を実行する
   fio-bench                           scripts/targets/fio-bench.sh
                                         fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）
   fio-baseline-ratio                  scripts/targets/fio-baseline-ratio.sh

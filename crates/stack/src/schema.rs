@@ -214,13 +214,21 @@ mod tests {
             .into_iter()
             .map(|a| a.into_string().expect("utf-8"))
             .collect();
+        // 期待値の env ファイルのパスも `Path::join` で組み立てる（Windows では区切りが `\` になるため。CLI-1）。
+        let joined = |file: &str| {
+            Path::new("/proj")
+                .join(file)
+                .into_os_string()
+                .into_string()
+                .expect("utf-8")
+        };
         assert_eq!(
             args,
             [
                 "--env-file",
-                "/proj/.env",
+                joined(".env").as_str(),
                 "--env-file",
-                "/abs/other.env",
+                joined("/abs/other.env").as_str(),
                 "--env",
                 "A=x=y",
                 "--env",

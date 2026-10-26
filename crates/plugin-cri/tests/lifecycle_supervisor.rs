@@ -25,7 +25,9 @@ use fandhe_container_core::traits::{
     ErrorCode, GetStateRequest, KillRequest, ListStateRequest, Signal, StartRequest, StateList,
     StateRecord, StateRevision, StateStore, StopRequest, TraitError, UpdateStateRequest,
 };
-use fandhe_container_plugin_cri::adapter::{CoreLifecycleRuntime, PLUGIN_RUNTIME_TIMEOUT};
+use fandhe_container_plugin_cri::adapter::{
+    CoreLifecycleRuntime, PLUGIN_ROOTFS_DEADLINE, PLUGIN_RUNTIME_TIMEOUT,
+};
 use fandhe_container_plugin_cri::supervised::{
     FixedLaunchStarter, MSG_START_REPORT_MISMATCH, MSG_STOP_DEADLINE, MSG_TOO_MANY_SUPERVISORS,
     SignalerSource, SupervisedLifecycle,
@@ -888,7 +890,8 @@ fn repair5_force_delete_worst_case_fits_runtime_timeout() {
 }
 
 /// REPAIR-5・#2760: `create` の最悪所要（ログ回収 + 起動オプション文書の掃除 + 状態ロック + 監査記録 2 回）は
-/// `PLUGIN_RUNTIME_TIMEOUT` に収まる。bundle の用意と core の create の I/O 自体は含めない（既存の残余）。
+/// `PLUGIN_RUNTIME_TIMEOUT` に収まる（RPC 側の内訳）。bundle の用意は worker 側の上限
+/// （`repair5_create_worker_residual_is_bounded`）で別に示す。
 #[test]
 fn repair5_create_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
@@ -902,4 +905,24 @@ fn repair5_create_worst_case_fits_runtime_timeout() {
     let total = reclaim + STATE_LOCK_TIMEOUT + audit;
     assert_eq!(total, Duration::from_millis(42_900));
     assert!(total < PLUGIN_RUNTIME_TIMEOUT);
+}
+
+/// REPAIR-5・#2821: `create` の worker の残存は rootfs の期限 + core の create の 42.9 秒で有限になり、RPC の応答は
+/// worker を待たず `PLUGIN_RUNTIME_TIMEOUT` で打ち切られる。分割できない区間（blob 1 本の検証・展開全体）は大きさの上限で有界。
+#[test]
+fn repair5_create_worker_residual_is_bounded() {
+    use fandhe_container_cri::image_pull::DEFAULT_MAX_IMAGE_BYTES;
+    use fandhe_container_oci::layer::extract::{
+        DEFAULT_MAX_EXTRACTED_BYTES, DEFAULT_MAX_LAYER_ENTRIES,
+    };
+    assert_eq!(PLUGIN_ROOTFS_DEADLINE, Duration::from_secs(600));
+    let core_create = Duration::from_millis(42_900);
+    assert_eq!(
+        PLUGIN_ROOTFS_DEADLINE + core_create,
+        Duration::from_millis(642_900)
+    );
+    assert!(PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
+    assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 16 * 1024 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_LAYER_ENTRIES, 1_000_000);
+    assert_eq!(DEFAULT_MAX_EXTRACTED_BYTES, 8 * 1024 * 1024 * 1024);
 }

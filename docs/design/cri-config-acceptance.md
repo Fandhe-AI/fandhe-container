@@ -390,3 +390,19 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 | 未知名の扱い | [`pkg/oci/spec_opts.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/pkg/oci/spec_opts.go#L1124-L1139)（`WithDroppedCapabilities`）と `removeCap`（L1083-L1092）。完全一致で取り除くだけで、名前の検証をしない。対象は bounding・effective・permitted・inheritable | **食い違い**: containerd は未知名・接頭辞つきを黙って無視する。本実装は `INVALID_ARGUMENT`（未知名）と drop（接頭辞つき）にする |
 
 食い違い（drop_capabilities の 2 点）は #2812 で追跡する。`spec.rs` のドキュメントコメントは訂正済み。挙動を containerd に合わせるかはオーナー判断待ち（コードは変えていない）。
+
+### ContainerStatus・ListContainers の image_ref・image_id（CRI-2・OCI-1。#2831）
+
+CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で解決した結果を記録へ残し、両 RPC で返す。経路は `ImageRootfsSource::prepare`（`ImageDefaults::resolved_image`）→ `SpecBundleProvider::prepare`（`PreparedBundle::with_image`）→ `CriRuntimeService::attach_prepared` → `ContainerRecord::resolved_image`。置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも `StateStore` にも書かない）。保持量は `container_retained_bytes` の上限に計上する。
+
+| 経路 | ContainerStatus.image_ref | ContainerStatus.image_id | ListContainers の image_ref・image_id |
+| ---- | ---- | ---- | ---- |
+| 在庫の記録に `repo_digests` がある | `repo_digests[0]` | image ID（`sha256:<config digest>`） | image ID |
+| 記録に digest が無い・在庫なしで image ID 指定 | image ID | image ID | image ID |
+| 報告の無い経路（スタブ・外部 bundle・報告しない provider） | 空 | 空 | 空 |
+
+- 報告が無いときに digest を推測しない（`config.image.image` を流用しない。REPAIR-3）。containerd は空を返さないので、空は本リポ固有の挙動
+- `image_id` は `PullImageResponse.image_ref`（= image ID）と一致させる（`crates/cri/proto/api.proto` の `ContainerStatus.image_id`・`Container.image_id` の MUST）。`image_ref` は同 proto の「Digested reference to the image in use」
+- containerd との照合（一次情報）: main `cfb18c48f865669d497115c1734e94fedc338153` の `internal/cri/server/container_status.go` は `imageID = container.ImageRef`（create 時の config digest）、`imageRef` は在庫の `repoDigests[0]`（無ければ config digest）。`container_list.go` の `toCRIContainer` は `ImageRef`・`ImageId` とも config digest で在庫を引かない。v2.1.4（`75cb2b7193e4e490e9fbdc236c0e811ccaba3376`）は `ImageId` を設定しない
+- 既知の差: containerd は Status の時点で在庫を引き直すが、本実装は create 時のスナップショットを返し続ける。本実装の `repo_digests[0]` はタグ pull ではプラットフォームの manifest digest になる（containerd は multi-arch で index digest）。Status の `image`（ImageSpec）は containerd のように `repoTags[0]` へ置き換えず config の値のまま
+- `message`・`info` は引き続きスタブ（空）

@@ -416,13 +416,23 @@ impl BlobTrustViolation {
 
 /// blob ファイルを再利用・公開してよいか判定する（OCI-1・SEC。OS 呼び出しを含まない純粋関数）。
 ///
-/// 条件は「通常ファイル」「所有者が `owner`（`None` なら確認しない）」「ハードリンク数が 1」
-/// 「group / other 書き込み不可」。違反が複数あれば、この順で最初の 1 つを返す（順序は契約。
-/// cri のステージング blob の確認は `WritableByOthers` を「それ以外の条件は満たしている」と読む）。
+/// 条件は「通常ファイル」「所有者が `owner`（必ず確認する。省略口は持たない。#2796）」
+/// 「ハードリンク数が 1」「group / other 書き込み不可」。違反が複数あれば、この順で最初の 1 つを返す
+/// （順序は契約。cri のステージング blob の確認は `WritableByOthers` を「それ以外の条件は満たしている」と読む）。
+/// cri の blob 再利用・ステージング確認から呼ばれる crate 外向けの入口で、判定の実体は
+/// `check_blob_trust_with_owner` の 1 か所。
 ///
 /// # Errors
 /// 条件を満たさないとき、最初の違反を返す。
-pub fn check_blob_trust(
+pub fn check_blob_trust(facts: &BlobFileFacts, owner: u32) -> Result<(), BlobTrustViolation> {
+    check_blob_trust_with_owner(facts, Some(owner))
+}
+
+/// [`check_blob_trust`] の本体。`owner` が `None` のとき所有者を確認しない。
+///
+/// `None` は oci 内部の非 unix 経路専用（`dir_owner` が `None` を返すのは非 unix だけ）。
+/// 所有者確認を黙って省く fail-open の口を公開 API に残さないため crate の外へは出さない（#2796・SEC-5）。
+pub(crate) fn check_blob_trust_with_owner(
     facts: &BlobFileFacts,
     owner: Option<u32>,
 ) -> Result<(), BlobTrustViolation> {
@@ -443,7 +453,7 @@ pub fn check_blob_trust(
 
 /// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。違反なしは `None`）。
 ///
-/// unix は [`check_blob_trust`] への薄いラッパー（判定は 1 か所）。非 unix は所有者・リンク数を標準ライブラリで
+/// unix は `check_blob_trust_with_owner` への薄いラッパー（判定は 1 か所）。非 unix は所有者・リンク数を標準ライブラリで
 /// 取得できないため、従来どおり通常ファイルかだけを見る（意味論は変えない）。
 pub(crate) fn blob_trust_violation(
     m: &std::fs::Metadata,
@@ -451,7 +461,7 @@ pub(crate) fn blob_trust_violation(
 ) -> Option<&'static str> {
     #[cfg(unix)]
     {
-        check_blob_trust(&BlobFileFacts::from_metadata(m), owner)
+        check_blob_trust_with_owner(&BlobFileFacts::from_metadata(m), owner)
             .err()
             .map(BlobTrustViolation::message)
     }
@@ -1711,25 +1721,21 @@ mod tests {
     /// OCI-1・SEC: 所有者一致・group / other 書き込み不可・リンク数 1 の通常ファイルだけを信頼する。
     #[test]
     fn oci1_sec_blob_trust_accepts_only_private_single_link_regular_files() {
-        assert_eq!(check_blob_trust(&trusted_facts(), Some(1000)), Ok(()));
+        assert_eq!(check_blob_trust(&trusted_facts(), 1000), Ok(()));
         // 読み取りだけの共有（0644・0444）は書き換え経路にならないため許す。
         for mode in [0o100_644, 0o100_444, 0o100_640, 0o100_400] {
             let facts = BlobFileFacts {
                 mode,
                 ..trusted_facts()
             };
-            assert_eq!(
-                check_blob_trust(&facts, Some(1000)),
-                Ok(()),
-                "mode {mode:o}"
-            );
+            assert_eq!(check_blob_trust(&facts, 1000), Ok(()), "mode {mode:o}");
         }
         // root で動く場合の基準は 0。
         let root_owned = BlobFileFacts {
             owner_uid: 0,
             ..trusted_facts()
         };
-        assert_eq!(check_blob_trust(&root_owned, Some(0)), Ok(()));
+        assert_eq!(check_blob_trust(&root_owned, 0), Ok(()));
     }
 
     /// OCI-1・SEC: 他ユーザー所有・group / other 書き込み可・ハードリンクあり・通常ファイル以外を拒否する
@@ -1741,7 +1747,7 @@ mod tests {
             ..trusted_facts()
         };
         assert_eq!(
-            check_blob_trust(&other_owner, Some(1000)),
+            check_blob_trust(&other_owner, 1000),
             Err(BlobTrustViolation::UnexpectedOwner)
         );
         // root 所有でも、呼び出しプロセスが root でなければ基準と異なる所有者として拒否する。
@@ -1750,11 +1756,11 @@ mod tests {
             ..trusted_facts()
         };
         assert_eq!(
-            check_blob_trust(&root_owned, Some(1000)),
+            check_blob_trust(&root_owned, 1000),
             Err(BlobTrustViolation::UnexpectedOwner)
         );
         assert_eq!(
-            check_blob_trust(&trusted_facts(), Some(0)),
+            check_blob_trust(&trusted_facts(), 0),
             Err(BlobTrustViolation::UnexpectedOwner)
         );
 
@@ -1766,7 +1772,7 @@ mod tests {
                 ..trusted_facts()
             };
             assert_eq!(
-                check_blob_trust(&facts, Some(1000)),
+                check_blob_trust(&facts, 1000),
                 Err(BlobTrustViolation::WritableByOthers),
                 "mode {mode:o}"
             );
@@ -1778,7 +1784,7 @@ mod tests {
                 ..trusted_facts()
             };
             assert_eq!(
-                check_blob_trust(&facts, Some(1000)),
+                check_blob_trust(&facts, 1000),
                 Err(BlobTrustViolation::UnexpectedLinkCount),
                 "links {hard_links}"
             );
@@ -1790,7 +1796,7 @@ mod tests {
             ..trusted_facts()
         };
         assert_eq!(
-            check_blob_trust(&directory, Some(1000)),
+            check_blob_trust(&directory, 1000),
             Err(BlobTrustViolation::NotRegularFile)
         );
     }
@@ -1806,7 +1812,7 @@ mod tests {
             hard_links: 2,
         };
         assert_eq!(
-            check_blob_trust(&all_bad, Some(1000)),
+            check_blob_trust(&all_bad, 1000),
             Err(BlobTrustViolation::NotRegularFile)
         );
         let regular = BlobFileFacts {
@@ -1814,7 +1820,7 @@ mod tests {
             ..all_bad
         };
         assert_eq!(
-            check_blob_trust(&regular, Some(1000)),
+            check_blob_trust(&regular, 1000),
             Err(BlobTrustViolation::UnexpectedOwner)
         );
         let owned = BlobFileFacts {
@@ -1822,7 +1828,7 @@ mod tests {
             ..regular
         };
         assert_eq!(
-            check_blob_trust(&owned, Some(1000)),
+            check_blob_trust(&owned, 1000),
             Err(BlobTrustViolation::UnexpectedLinkCount)
         );
         let single = BlobFileFacts {
@@ -1830,7 +1836,7 @@ mod tests {
             ..owned
         };
         assert_eq!(
-            check_blob_trust(&single, Some(1000)),
+            check_blob_trust(&single, 1000),
             Err(BlobTrustViolation::WritableByOthers)
         );
     }
@@ -1842,15 +1848,29 @@ mod tests {
             owner_uid: 4242,
             ..trusted_facts()
         };
-        assert_eq!(check_blob_trust(&other, None), Ok(()));
+        assert_eq!(check_blob_trust_with_owner(&other, None), Ok(()));
         let linked = BlobFileFacts {
             hard_links: 2,
             ..other
         };
         assert_eq!(
-            check_blob_trust(&linked, None),
+            check_blob_trust_with_owner(&linked, None),
             Err(BlobTrustViolation::UnexpectedLinkCount)
         );
+    }
+
+    /// OCI-1・SEC-5: crate 外向けの入口は所有者を必ず照合する（#2796。省略口を持たない）。
+    #[test]
+    fn oci1_sec_blob_trust_public_entry_always_checks_owner() {
+        let other = BlobFileFacts {
+            owner_uid: 4242,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&other, 1000),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        assert_eq!(check_blob_trust(&other, 4242), Ok(()));
     }
 
     /// OCI-1・SEC: 違反ごとの固定文言（既存の oci のエラー文言と同じ）。
@@ -1887,7 +1907,7 @@ mod tests {
         let uid = std::fs::metadata(&p).unwrap().uid();
         let agree = |m: &std::fs::Metadata, owner: Option<u32>, want: Option<&str>| {
             let via_wrapper = blob_trust_violation(m, owner);
-            let via_check = check_blob_trust(&BlobFileFacts::from_metadata(m), owner)
+            let via_check = check_blob_trust_with_owner(&BlobFileFacts::from_metadata(m), owner)
                 .err()
                 .map(BlobTrustViolation::message);
             assert_eq!(via_wrapper, via_check);

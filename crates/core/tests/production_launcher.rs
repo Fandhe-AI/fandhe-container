@@ -134,7 +134,7 @@
 //!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）。
 //!   capability と seccomp の実効はシナリオ J・K が exec 後のプロセスで直接照合する
 //! - seccomp の識別は、シナリオ J の exec 後の `kcmp` の `EPERM`（test 限定の入口 `probe_denied_syscalls_for_test`。
-//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
+//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗（1 行目 `production_launcher: PRECONDITION FAILED (test environment ...)`・#2788）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
 //! - bind 以外の `mounts[]` の種類、`ro` の bind（#1917）、段ごとの個別観測（#1916）、`linux.resources`、
 //!   supervisor 経由の起動（#1819）は対象外
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
@@ -166,7 +166,11 @@ fn main() {
     // 子（コンテナ内）は同じバイナリを `--container-probe` で再実行したもの。
     if std::env::args().any(|a| a == "--container-probe") {
         linux::probe();
-    } else if std::env::args().any(|a| a == "--ignored") {
+        return;
+    }
+    // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
+    linux::self_check_precondition();
+    if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
         println!(
@@ -285,6 +289,73 @@ mod linux {
             .and_then(|v| v.split_whitespace().nth(1).map(str::to_string))
             .as_deref()
             == Some("0")
+    }
+
+    /// 適用前の kcmp 対照の分類（#2788・CORE-5・SEC-4・REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum KcmpPrecondition {
+        Ok,
+        /// 外側の環境が kcmp を errno で拒否している（試験環境の問題で、フィルタの回帰ではない）。
+        Denied {
+            errno: i32,
+        },
+        /// 判定不能（`Unsupported`・`Failed`）。前提欠如とは断定しない。
+        Unknown,
+    }
+
+    fn classify_kcmp_before(outcome: ProbeOutcome) -> KcmpPrecondition {
+        match outcome {
+            ProbeOutcome::Ok => KcmpPrecondition::Ok,
+            ProbeOutcome::Errno(errno) => KcmpPrecondition::Denied { errno },
+            ProbeOutcome::Unsupported | ProbeOutcome::Failed => KcmpPrecondition::Unknown,
+        }
+    }
+
+    /// 前提欠如の panic メッセージ（1 行目で前提欠如と回帰を判別でき、値から決まるヒントだけを添える）。
+    fn precondition_message(errno: i32, seccomp_before: &str) -> String {
+        let hint = match (errno, seccomp_before) {
+            (1, "0") => "kcmp is denied by something other than seccomp (e.g. an LSM)",
+            (1, _) => {
+                "an outer seccomp filter denies kcmp (e.g. Docker's default seccomp profile under make docker-ci)"
+            }
+            (38, _) => "the kernel does not provide kcmp (CONFIG_KCMP)",
+            _ => "the environment denies kcmp",
+        };
+        format!(
+            "production_launcher: PRECONDITION FAILED (test environment, not a seccomp filter regression): \
+             kcmp(self, self, KCMP_VM) was denied with errno {errno} before the built-in seccomp stage \
+             (Seccomp: {seccomp_before}).\n\
+             hint: {hint}.\n\
+             Run it on the host: cargo test -p fandhe-container-core --test production_launcher --no-run, then \
+             systemd-run --user --scope -p Delegate=yes <binary> --ignored. See AGENTS.md production_launcher."
+        )
+    }
+
+    /// 分類とメッセージの自己照合（`main` から既定集合でも毎回走らせる。#2788）。
+    pub fn self_check_precondition() {
+        assert_eq!(classify_kcmp_before(ProbeOutcome::Ok), KcmpPrecondition::Ok);
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Errno(1)),
+            KcmpPrecondition::Denied { errno: 1 }
+        );
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Unsupported),
+            KcmpPrecondition::Unknown
+        );
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Failed),
+            KcmpPrecondition::Unknown
+        );
+        let msg = precondition_message(1, "2");
+        assert_eq!(
+            msg.lines().next(),
+            Some(
+                "production_launcher: PRECONDITION FAILED (test environment, not a seccomp filter regression): kcmp(self, self, KCMP_VM) was denied with errno 1 before the built-in seccomp stage (Seccomp: 2)."
+            )
+        );
+        assert!(msg.contains("--ignored"), "{msg}");
+        assert!(msg.contains("make docker-ci"), "{msg}");
+        assert!(precondition_message(38, "0").contains("CONFIG_KCMP"));
     }
 
     /// `/proc/<x>/status` 形式のファイルから、`key` で始まる行の値（key の後ろ）を返す。
@@ -2454,12 +2525,18 @@ mod linux {
 
         // 適用前の kcmp 対照（親は組み込みフィルタを載せていない）。外側が拒否する環境は前提欠如として失敗させる（#2234）。
         let kcmp_before = probe_kcmp_self_for_test();
-        assert_eq!(
-            kcmp_before,
-            ProbeOutcome::Ok,
-            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp, so EPERM inside the container cannot be attributed to the built-in filter",
-            status_field("/proc/self/status", "Seccomp:").unwrap_or_default()
-        );
+        let seccomp_before =
+            status_field("/proc/self/status", "Seccomp:").unwrap_or_else(|| "unknown".to_string());
+        match classify_kcmp_before(kcmp_before) {
+            KcmpPrecondition::Ok => {}
+            KcmpPrecondition::Denied { errno } => {
+                panic!("{}", precondition_message(errno, &seccomp_before))
+            }
+            // 判定不能は前提欠如と表示せず、汎用の失敗にする（fail-closed）。
+            KcmpPrecondition::Unknown => panic!(
+                "production_launcher: kcmp control probe could not be evaluated (got {kcmp_before:?})"
+            ),
+        }
 
         let bundle = Bundle::new("j");
         let ld = make_rootfs(&bundle.rootfs(), true);

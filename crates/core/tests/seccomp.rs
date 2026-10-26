@@ -18,7 +18,10 @@
 //!   （フィルタが無ければ成功）・`/proc/thread-self/status` の `Seccomp: 2`。
 //!   禁止対象外の対照（`/proc` の読み出し）が動くことも確認する。適用前の対照として、組み込み段を載せる前に
 //!   `kcmp(自 pid, 自 pid)` が成功することも要求する（`Seccomp: 0` の検査では見分けられない、seccomp 以外の理由で
-//!   kcmp が通らない環境〔kcmp 非対応のカーネル・LSM〕と外側の拒否を検出する。満たさなければ skip せず前提欠如として失敗。#2234）
+//!   kcmp が通らない環境〔kcmp 非対応のカーネル・LSM〕と外側の拒否を検出する。満たさなければ skip せず前提欠如として失敗。
+//!   子はマーカー行 `precondition-failed` と専用の終了コード 3 で報告し、親が分類して 1 行目
+//!   `seccomp: PRECONDITION FAILED (test environment, not a seccomp filter regression)` で失敗させる。分類は既定の
+//!   テスト集合でも自己照合する。#2234・#2788・SEC-4・REPAIR-12）
 //! - 網羅確認: `mount`・`pivot_root`・`umount2` が `EPERM`。capability 不足でも
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
 //! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別のコンテナのエントリポイントで SIGSYS 終了
@@ -113,10 +116,146 @@ fn core5_record_parser_selftest() {
     );
 }
 
+/// 前提欠如を親へ報告するシナリオ（子）の専用終了コード（panic の 101・汎用失敗の 1 と区別する。#2788）。
+const SCENARIO_PRECONDITION_EXIT: i32 = 3;
+/// 前提欠如を報告するシナリオの stderr のマーカー行の接頭辞（`seccomp_enforcement` と同じ方式。#2788）。
+const SCENARIO_MARKER: &str = "seccomp scenario: precondition-failed ";
+
+/// シナリオ（`--scenario` で再入した子）の結果の分類。ディスパッチャが子の終了コードと stderr から決める
+/// （CORE-5・SEC-4・REPAIR-12。純関数で自己照合する）。
+#[derive(Debug, PartialEq)]
+enum ScenarioOutcome {
+    Ok,
+    /// 組み込み段の前の観測が前提を満たさない（試験環境の問題で、フィルタの回帰ではない）。
+    PreconditionFailed {
+        kcmp_before: String,
+        seccomp_before: String,
+    },
+    /// 前提欠如と断定できない失敗（終了コードとマーカーの片方だけ・値の欠落を含む。fail-closed）。
+    Failed,
+}
+
+/// 終了コードと stderr からシナリオの結果を分類する。解析に失敗したら `Failed`（fail-closed）。
+fn classify_scenario(code: Option<i32>, stderr: &str) -> ScenarioOutcome {
+    if code == Some(0) {
+        return ScenarioOutcome::Ok;
+    }
+    if code != Some(SCENARIO_PRECONDITION_EXIT) {
+        return ScenarioOutcome::Failed;
+    }
+    let Some(rest) = stderr.lines().find_map(|l| l.strip_prefix(SCENARIO_MARKER)) else {
+        return ScenarioOutcome::Failed;
+    };
+    let mut kcmp = None;
+    let mut mode = None;
+    for kv in rest.split_whitespace() {
+        if let Some(v) = kv.strip_prefix("kcmp_before=") {
+            kcmp = Some(v.to_string());
+        } else if let Some(v) = kv.strip_prefix("seccomp_before=") {
+            mode = Some(v.to_string());
+        }
+    }
+    match (kcmp, mode) {
+        (Some(kcmp_before), Some(seccomp_before))
+            if !kcmp_before.is_empty() && !seccomp_before.is_empty() =>
+        {
+            ScenarioOutcome::PreconditionFailed {
+                kcmp_before,
+                seccomp_before,
+            }
+        }
+        _ => ScenarioOutcome::Failed,
+    }
+}
+
+/// 前提欠如の panic メッセージ（1 行目で前提欠如と回帰を判別でき、値から決まるヒントだけを添える。#2788）。
+fn scenario_precondition_message(kcmp_before: &str, seccomp_before: &str) -> String {
+    let hint = match (kcmp_before, seccomp_before) {
+        ("errno=1", "0") => "kcmp is denied by something other than seccomp (e.g. an LSM)",
+        ("errno=1", _) => {
+            "an outer seccomp filter denies kcmp (e.g. Docker's default seccomp profile under make docker-ci)"
+        }
+        ("errno=38", _) => "the kernel does not provide kcmp (CONFIG_KCMP)",
+        ("ok", _) => "the test process inherited a seccomp filter from its environment",
+        _ => "the environment does not satisfy the precondition",
+    };
+    format!(
+        "seccomp: PRECONDITION FAILED (test environment, not a seccomp filter regression): \
+         kcmp(self, self, KCMP_VM) before the runtime's filter was applied: {kcmp_before} \
+         (Seccomp: {seccomp_before} before apply); EPERM inside the container cannot be attributed \
+         to the built-in filter.\n\
+         hint: {hint}.\n\
+         By policy (#2235) the dev container keeps Docker's seccomp and this test stays failing there; \
+         run it on the host (cargo test -p fandhe-container-core --test seccomp -- --ignored) or rely on CI. \
+         See AGENTS.md seccomp."
+    )
+}
+
+/// 前提欠如の分類とメッセージの自己照合（常に走る。CORE-5・SEC-4・REPAIR-12・#2788）。
+fn core5_precondition_classifier_selftest() {
+    let marker =
+        |k: &str, m: &str| format!("noise\n{SCENARIO_MARKER}kcmp_before={k} seccomp_before={m}\n");
+    assert_eq!(classify_scenario(Some(0), ""), ScenarioOutcome::Ok);
+    assert_eq!(
+        classify_scenario(Some(SCENARIO_PRECONDITION_EXIT), &marker("errno=1", "2")),
+        ScenarioOutcome::PreconditionFailed {
+            kcmp_before: "errno=1".into(),
+            seccomp_before: "2".into()
+        }
+    );
+    assert_eq!(
+        classify_scenario(Some(SCENARIO_PRECONDITION_EXIT), &marker("ok", "2")),
+        ScenarioOutcome::PreconditionFailed {
+            kcmp_before: "ok".into(),
+            seccomp_before: "2".into()
+        }
+    );
+    assert_eq!(
+        classify_scenario(Some(SCENARIO_PRECONDITION_EXIT), "no marker\n"),
+        ScenarioOutcome::Failed
+    );
+    assert_eq!(
+        classify_scenario(Some(101), &marker("errno=1", "2")),
+        ScenarioOutcome::Failed
+    );
+    assert_eq!(
+        classify_scenario(None, &marker("errno=1", "2")),
+        ScenarioOutcome::Failed
+    );
+    assert_eq!(
+        classify_scenario(
+            Some(SCENARIO_PRECONDITION_EXIT),
+            &format!("{SCENARIO_MARKER}kcmp_before=errno=1\n")
+        ),
+        ScenarioOutcome::Failed
+    );
+    assert_eq!(
+        classify_scenario(
+            Some(SCENARIO_PRECONDITION_EXIT),
+            &format!("{SCENARIO_MARKER}kcmp_before= seccomp_before=2\n")
+        ),
+        ScenarioOutcome::Failed
+    );
+    let msg = scenario_precondition_message("errno=1", "2");
+    assert_eq!(
+        msg.lines().next(),
+        Some(
+            "seccomp: PRECONDITION FAILED (test environment, not a seccomp filter regression): kcmp(self, self, KCMP_VM) before the runtime's filter was applied: errno=1 (Seccomp: 2 before apply); EPERM inside the container cannot be attributed to the built-in filter."
+        )
+    );
+    assert!(msg.contains("make docker-ci"), "{msg}");
+    assert!(msg.contains("--test seccomp -- --ignored"), "{msg}");
+    assert!(
+        scenario_precondition_message("errno=38", "0").contains("CONFIG_KCMP"),
+        "errno 38 hint"
+    );
+}
+
 fn always() {
     core5_probed_names_are_in_deny_table();
     #[cfg(target_os = "linux")]
     core5_record_parser_selftest();
+    core5_precondition_classifier_selftest();
     println!("seccomp: CORE-5 probe table and record parser verified");
 }
 
@@ -301,10 +440,10 @@ mod linux {
     /// 自プロセスの `Seccomp:` 行の値（`/proc/self/status`）。
     fn seccomp_mode_of_self() -> String {
         std::fs::read_to_string("/proc/self/status")
-            .expect("read status")
+            .unwrap_or_default()
             .lines()
             .find_map(|l| l.strip_prefix("Seccomp:").map(|v| v.trim().to_string()))
-            .expect("Seccomp line in /proc/self/status")
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// シナリオを自身の再実行で起動し、期限付きで待つ。終了状態と stderr を返す。
@@ -330,21 +469,31 @@ mod linux {
         (status, stderr)
     }
 
+    /// シナリオの結果を分類し、前提欠如なら 1 行目で判別できる文言で、それ以外は従来の文言で失敗させる。
+    fn expect_scenario_ok(label: &str, status: &ExitStatus, stderr: &str) {
+        match super::classify_scenario(status.code(), stderr) {
+            super::ScenarioOutcome::Ok => {}
+            super::ScenarioOutcome::PreconditionFailed {
+                kcmp_before,
+                seccomp_before,
+            } => panic!(
+                "{}",
+                super::scenario_precondition_message(&kcmp_before, &seccomp_before)
+            ),
+            super::ScenarioOutcome::Failed => panic!(
+                "{label} scenario must exit with 0 (got {:?}); stderr:\n{stderr}",
+                status.code()
+            ),
+        }
+    }
+
     fn dispatcher() {
         let (status, stderr) = run_scenario("seccomp");
-        assert_eq!(
-            status.code(),
-            Some(0),
-            "seccomp scenario must exit with 0; stderr:\n{stderr}"
-        );
+        expect_scenario_ok("seccomp", &status, &stderr);
         // 強制終了対象は戻らないため、シナリオ（親）は子の SIGSYS 終了を確認して 0 で終わる。
         for (name, _) in KILLED {
             let (status, stderr) = run_scenario(&format!("kill-{name}"));
-            assert_eq!(
-                status.code(),
-                Some(0),
-                "kill-{name} scenario must exit with 0; stderr:\n{stderr}"
-            );
+            expect_scenario_ok(&format!("kill-{name}"), &status, &stderr);
         }
         println!(
             "seccomp: CORE-5 denied syscalls blocked inside the container (root={})",
@@ -360,18 +509,26 @@ mod linux {
         // `Seccomp: 2` や `EPERM` は組み込みフィルタの成果と区別できないため、失敗として扱う（CORE-5・REPAIR-12）。
         // 適用前の kcmp 対照: 組み込み段の前で kcmp が成功すること。外側の拒否（seccomp・LSM・kcmp 非対応）は
         // `Seccomp: 0` の検査では見分けられないため、skip せず前提欠如として失敗させる（CORE-5・ESC-06・#2234）。
+        // 前提を満たさない場合は、親（dispatcher）が 1 行目で判別できるよう、マーカー行と専用の終了コードで報告する（#2788）。
         let kcmp_before = probe_kcmp_self_for_test();
-        assert_eq!(
-            kcmp_before,
-            ProbeOutcome::Ok,
-            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp (e.g. Docker's default seccomp profile, a kernel without kcmp, or an LSM), so EPERM inside the container cannot be attributed to the built-in filter",
-            seccomp_mode_of_self()
-        );
-        assert_eq!(
-            seccomp_mode_of_self(),
-            "0",
-            "precondition: the test process must not inherit a seccomp filter (cannot attribute the denial to the built-in stage)"
-        );
+        let seccomp_before = seccomp_mode_of_self();
+        let kcmp_text = match kcmp_before {
+            ProbeOutcome::Ok => "ok".to_string(),
+            ProbeOutcome::Errno(n) => format!("errno={n}"),
+            // 判定不能は前提欠如と表示せず、汎用の失敗にする（fail-closed）。
+            other => panic!("kcmp control probe could not be evaluated (got {other:?})"),
+        };
+        let seccomp_known = seccomp_before.parse::<u32>().is_ok();
+        if !seccomp_known {
+            panic!("Seccomp: value is not numeric (got {seccomp_before:?})");
+        }
+        if kcmp_before != ProbeOutcome::Ok || seccomp_before != "0" {
+            eprintln!(
+                "{}kcmp_before={kcmp_text} seccomp_before={seccomp_before}",
+                super::SCENARIO_MARKER
+            );
+            std::process::exit(super::SCENARIO_PRECONDITION_EXIT);
+        }
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)

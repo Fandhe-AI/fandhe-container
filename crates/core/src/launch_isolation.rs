@@ -502,6 +502,7 @@ pub struct LaunchIsolationRecord {
     audit_coverage_record: AuditCoverageRecordOutcome,
     id_mapping: Option<RecordedIdMapping>,
     capabilities: Option<ContainerCapabilities>,
+    root_readonly: Option<bool>,
 }
 
 impl LaunchIsolationRecord {
@@ -514,7 +515,21 @@ impl LaunchIsolationRecord {
             audit_coverage_record: AuditCoverageRecordOutcome::NotFailed,
             id_mapping: None,
             capabilities: None,
+            root_readonly: None,
         }
+    }
+
+    /// launch が実際に適用した `root.readonly` の実効値(config と `--read-only` の OR。mount の RDONLY・Landlock の
+    /// root 規則と同じ値。CLI-1・SUP-12・CORE-5・#2828)を添える。添えなければ `None`(旧記録。推測しない)。
+    #[must_use]
+    pub fn with_root_readonly(mut self, root_readonly: bool) -> Self {
+        self.root_readonly = Some(root_readonly);
+        self
+    }
+
+    /// 添えられた `root.readonly` の実効値(無ければ `None`)。
+    pub fn root_readonly(&self) -> Option<bool> {
+        self.root_readonly
     }
 
     /// launch が適用した capability の許可集合を添える（SEC-1・CRI-2・#2666）。exec の再適用がこの集合を使い、

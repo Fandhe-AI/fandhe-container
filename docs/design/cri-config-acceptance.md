@@ -17,14 +17,15 @@
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671（実装済み。下の節。ランチャー経由と ReopenContainerLog は未対応。総量は上限つき） |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用（判断材料は [cri-devices-cdi.md](cri-devices-cdi.md)。gpu の TASK-127・128・129 の完了とオーナー判断まで `UNIMPLEMENTED`。一般デバイスは GPU-9 が検討中） | gpu・core → cri | #2673 |
-| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未決のため本番では常に新しい namespace。pid の共有は未対応 | core → cri | #2674 |
-| 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続 | net・core・cri | #2675 |
+| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未実装のため本番では常に新しい namespace。構築口は #2776 で保持役の pid からの `PodNamespacePaths::for_holder_pid`（`/proc/<pid>/ns/{user,ipc}`）に限った。保持役の設計は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838）で、実装は #2870〜#2880（保持役の配線は #2871・#2876・#2877）。pid の共有は未対応 | core → cri | #2674・#2776・#2838 |
+| 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続（設計は [pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2872・#2878・#2879） | net・core・cri | #2675・#2838 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`（本変更で実装済み。provider を注入した構成の `POD` だけ。本番は順 13 と同じく未注入のため `UNIMPLEMENTED`。下記「port_mappings の受け入れ方式」） | net・plugin-cri・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
+| 16 | readonly_rootfs | core の `root.readonly`（#2767 で実装済み）→ cri が写す（実装済み。下記「readonly_rootfs の受け入れ方式」） | core → cri | #2827 |
 
 受け入れない項目（順 7 の Bidirectional を含む）の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残し、受け入れた HostToContainer は同じ試験で `config.json` の `mounts[].options`（`rslave`）を具体値で照合する（#2669・CRI-2・OCI-4）。
 
-本表の外の項目（tty / stdin・readonly_rootfs・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
+本表の外の項目（tty / stdin・SELinux・AppArmor・privileged・resources の一部）は #2606 の列挙の対象外である。受け入れない項目の `UNIMPLEMENTED` の照合は `crates/cri/tests/bundle_spec.rs` に残している。
 
 ## イメージ User の解決方式（SEC-1・SEC-5・REPAIR-5）
 
@@ -101,7 +102,48 @@ exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPL
 - 主 gid は補助グループへ自動では足さない（core の launcher が `setgroups(list)` でそのまま適用するため）。containerd は `additionalGids` に主 gid を含めることがあり、ここが既知の差
 - 報告は `BundleProvider::prepare` の戻り値 `PreparedBundle`（`user()`）で `CriRuntimeService` へ届き、`ContainerRecord.applied_user` に保持する。置き場所はプロセス内メモリのレジストリで、寿命は `exit_code`・`resolved_log_path` と同じ（plugin-cri の再起動で消える）。config の annotations には書かず（CRI は書き換えを禁じる）、core の `StateStore` にも書かない（PLUG-1 の境界）。報告の無い経路（スタブ・報告しない provider）は `user` が `None` のまま（root を作り出さない）
 - 補助グループの保持量（最大 65,536 件）は `container_retained_bytes` の累積上限に入れ、超えたら `FAILED_PRECONDITION`（黙って切り詰めない）
-- 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。Status RPC が未実装（`UNIMPLEMENTED`）のため現状は応答に乗らない。Status RPC の実装時にこの関数を使う（REPAIR-3）
+- 機能フラグ: `runtime_service::runtime_features()` が `RuntimeFeatures.supplemental_groups_policy = true` を返す（cri-api v0.37.1 では `RuntimeHandlerFeatures` ではなく `StatusResponse.features` の `RuntimeFeatures`）。`Status` RPC の応答の `features` にそのまま乗る（#2830。[cri-status-rpc.md](cri-status-rpc.md)）
+
+## readonly_rootfs の受け入れ方式（CRI-2・CORE-5・SEC-1。#2827）
+
+コンテナの `LinuxContainerSecurityContext.readonly_rootfs=true` は、`config.json` の `root.readonly=true` へ写す（`crates/cri/src/bundle/spec.rs`）。`false`・security context なしは `readonly` キーを出さず、従来の出力とバイト単位で同じである。core の start は pivot_root の直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足し、Landlock の root 権利も同じ値から決める（#2767）。変換は Build 段と Validate 段で同じ関数を通る。
+
+sandbox 側（`LinuxSandboxSecurityContext.readonly_rootfs`）は出力しない。適用先のプロセス（pause コンテナ）が無く、無視しても分離が弱くなる方向ではないため（`supplemental_groups` の sandbox 側と同じ扱い）。
+
+### 書き込み可否の整理（本実装の挙動。`docs/api/bind-mounts.md`・`production_launcher` のシナリオ Y）
+
+| 対象 | readonly_rootfs=true のときの本実装 |
+| ---- | ---- |
+| rootfs | 読み取り専用（`EROFS`） |
+| `/dev/shm`・tmpfs・rw の bind | 書き込める（自分の mount 属性のまま） |
+| `/etc/resolv.conf`（`dns_config`） | 常に ro の bind（readonly_rootfs に依らない） |
+| `/etc/hosts`・`/etc/hostname` | bind を供給しない（イメージ内のファイルが root とともに ro になる） |
+| 利用者の `mounts[]` | `Mount.readonly` に従う。`ro` の bind は readonly root のときだけ core が受理する（#1917） |
+| `/proc` | Landlock が書き込みを落とす（`EACCES`） |
+
+### 既知の差（containerd との比較。未検証）
+
+containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`・`/etc/hosts`・`/etc/resolv.conf`）の bind を readonly_rootfs に従わせ、`/dev/shm` は rw と記憶しているが、本変更では一次情報（commit 指定）を再確認していない。以下は未検証の見込みとして扱う。
+
+- `/etc/resolv.conf` は readonly_rootfs=false でも本実装は常に ro（containerd は rw の見込み）。既存の差
+- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込み）。追跡 issue は [#2859](https://github.com/Fandhe-AI/fandhe-container/issues/2859)
+- `/etc/hosts`・`/etc/hostname` の供給を足すときは readonly_rootfs に従わせる
+- `process.cwd` が rootfs に無いとき、runc は作るが core は作らず失敗する（readonly とは独立した既存の差）
+
+照合は `crates/cri/tests/bundle_spec.rs` の `cri2_core5_readonly_rootfs_maps_to_root_readonly`・`cri2_readonly_rootfs_false_keeps_output_unchanged`。
+
+### カーネルの事実（EROFS と Landlock の順序。CORE-5・SEC-1。#2837）
+
+`production_launcher` のシナリオ Y（#2767）は、読み取り専用 rootfs への書き込みが Landlock の `EACCES`（13）ではなく VFS の `EROFS`（30）で返ることを条件にしている。Landlock は個別の `security_*` フックで拒否するため、フックより前に VFS が「mount が読み取り専用」で止めることが前提になる。この順序を Linux `v6.12`（commit `adc218676eef25575469234709c2d87185ca223a`。リポの参照版。tag と commit は [exec-without-supervisor.md](exec-without-supervisor.md) の版表と同じ）のソースで確かめた。確認日は 2026-10-26。
+
+| 操作（シナリオ Y のプローブ） | 出典（v6.12） | 結果 |
+| ----------------------------- | ------------- | ---- |
+| 新規作成（`open(O_WRONLY\|O_CREAT\|O_EXCL)`。`RO_CREATE`） | [`fs/namei.c` L3683](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3683)（`open_last_lookups` が `got_write = !mnt_want_write(...)`）、[L3550-L3558](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3550-L3558)（`lookup_open` は `got_write` が偽なら `create_error = -EROFS` とし、`may_o_create` を呼ばない）、[L3600-L3603](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3600-L3603)（負の dentry なら `create_error` を返す）。Landlock の `security_path_mknod` は `may_o_create` の中（[L3414](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L3414)）にあり、`got_write` が真のときだけ呼ばれる | 一致。mount が ro なら Landlock のフックに到達する前に `EROFS`。条件: 対象の dentry がまだ無いこと（あれば `EEXIST` 等の別の結果になりうる。プローブは `/ro-probe-new` で存在しない名前を使う） |
+| 既存ファイルへの書き込み open（`open(O_WRONLY)`。`RO_WRITE`） | [`fs/open.c` L929](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L929)（`do_dentry_open` が `file_get_write_access`）→ [L883-L895](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L883-L895)（`mnt_get_write_access`）→ [`fs/namespace.c` L492-L494](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namespace.c#L492-L494)（`mnt_is_readonly` で `-EROFS`）が、[`fs/open.c` L945](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/open.c#L945) の `security_file_open`（Landlock の `hook_file_open`）より先 | 一致。書き込み open は `EROFS`。その前の `may_open`（`fs/namei.c` L3328）の `inode_permission` は Landlock にフックが無い（下の行）。`sb_permission`（L486）が見るのは superblock の ro で、per-mount の `MOUNT_ATTR_RDONLY` は上の `mnt_get_write_access` が見る |
+| mkdir（`create_dir`。`RO_MKDIR`） | [`fs/namei.c` L4019](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4019)（`filename_create` が `err2 = mnt_want_write`）、[L4044-L4047](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4044-L4047)（`err2` を返して失敗）が、[L4277](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/namei.c#L4277) の `do_mkdirat` の `security_path_mkdir` より先 | 一致。mkdir は `EROFS`。条件: 同名が無いこと（あれば L4033 の `EEXIST` が先） |
+| Landlock の登録フック | [`security/landlock/fs.c` L1660-L1675](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/security/landlock/fs.c#L1660-L1675)（`path_mkdir`・`path_mknod`・`file_open` 等。`inode_permission` 相当のフックは無い） | 一致。Landlock は上の 3 操作の `security_*` の位置でだけ拒否し、それらは `EROFS` の判定より後ろ |
+
+結論: シナリオ Y の「`EACCES`（13）なら Landlock だけが止めていて VFS の読み取り専用化が効いていない」という判別は、v6.12 のソースの順序に裏付けられた（食い違いなし）。`production_launcher.rs` のドキュメントコメントが挙げる `lookup_open`・`filename_create`・`do_dentry_open` の順序とも一致する。範囲: 上の 3 操作に限る。`truncate`・`unlink`・`rename` など他の書き込み系の操作の順序は確かめていない。カーネル版は 6.12 のみで、他の版での順序の変化は確かめていない。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 
@@ -256,7 +298,7 @@ path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod �
 ### 既知の差と残り
 
 - `/dev/shm`（POSIX shm）は共有されない（コンテナごとの tmpfs）。SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
-- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、`NamespaceMode::TARGET`。
+- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計。[pod-namespace-holder.md](pod-namespace-holder.md)・#2838。実装は #2870・#2871・#2874・#2876・#2877）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、`NamespaceMode::TARGET`。
 
 ## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
 
@@ -280,12 +322,12 @@ CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox �
 
 既知の差:
 
-- **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）だけを受け、`network` の path は `UNIMPLEMENTED` で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
+- **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` のうち `user` と `ipc` の組（順 12。#2674）だけを受け、`network` の path は `UNIMPLEMENTED` で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項で、保持役の userns が所有する netns への join は [pod-namespace-holder.md](pod-namespace-holder.md)（#2838。実装は #2872）。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
 - **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決
 - 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
 - net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
 - 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
-- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま
+- `port_mappings` は下記「port_mappings の受け入れ方式」（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま（実装は #2873）
 - 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行
 
 ## port_mappings の受け入れ方式（CRI-2・NET-3・NET-4・PLUG-1。#2676）
@@ -308,13 +350,30 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 
 ### 既知の差と残る制約（REPAIR-3）
 
-- **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）だが、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
-- `host_port == 0` を読み飛ばす扱いと、hostNetwork で port_mappings を使わない扱いは kubelet・containerd の挙動に合わせた想定だが、一次情報（tag と commit 指定）での照合は本変更では行っていない（未照合）。食い違えば厳しい側（`UNIMPLEMENTED`）に倒す
+- **空の host_ip は `UNIMPLEMENTED`**: kubelet の既定は空（全アドレス）で、containerd・CNI portmap も空と `0.0.0.0` を「全アドレス」として扱う（下記で照合済み）。一方、net は意図しない全アドレス公開を避けるため明示した非 loopback の unicast を必須にしており、黙って特定アドレスに置き換えない。このため実際の hostPort の大半はまだ通らない（net の拒否を見直すかはオーナー判断の候補）
+- `host_port == 0` を読み飛ばす扱いは kubelet・containerd と一致する（下記「外部の事実の照合（port_mappings）」で 2026-10-26 に照合済み。kubelet は `host_port == 0` の要素もそのまま CRI へ送り、containerd が `HostPort <= 0` を読み飛ばす）。hostNetwork の扱いは**挙動が食い違う**: kubelet は hostNetwork の pod の ports に `host_port = container_port` を入れて送り、containerd は `NODE` でネットワークの setup を行わず port_mappings を使わない（黙って無視する）。本実装は公開する要素がある `NODE` を `UNIMPLEMENTED` にするため、ports を宣言した hostNetwork の pod は本実装では起動できない（厳しい側の差）。無視に合わせるかはオーナー判断の事項で、コードは変えていない
 - masquerade 未実装と host の `ip_forward` が前提で、外部からの到達は保証しない
 - 他プロセスとの受け口の衝突は検出しない（`LinuxNetwork` が共有ファイルなしの `PortRegistry` をネットワークごとに持つ。ネットワークをまたぐ契約 11 は `NetsetupNetwork` のプロセス内の記録で担保する）
-- 公開の個別解除は無い（`delete_network` が一括で解放する）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
+- 公開の個別解除は net の `unpublish_container_port` と `NetsetupBackend::unpublish_port`（#2839・NET-3）で可能だが、CRI の経路は呼ばない（`port_mappings` は sandbox 単位で、`delete_network` が一括で解放する。`NetworkPlugin` への追加は後続事項）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
 - `NODE`（hostNetwork）の hostPort・IPv6・SCTP・loopback への公開は `UNIMPLEMENTED`
 - 実機（root）での DNAT 到達確認は本変更では未実行
+
+### 外部の事実の照合（port_mappings。kubelet・containerd・CNI portmap。CRI-2・NET-3。#2837）
+
+確認日は 2026-10-26。版は下記「外部の事実の照合」の版表の kubernetes `v1.37.1`（`f78e722310e50bcaca9276be22276d9e91d91308`）と containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）。CNI portmap は containerd `v2.4.2` の `go.mod`（L34）が固定する `github.com/containernetworking/plugins v1.9.1`（commit `adc3e6b5b581638afbd194cf2e9319ecbb0151a1`）。コードは変えていない。
+
+| 事実 | 出典 | 結果 |
+| ---- | ---- | ---- |
+| kubelet は `host_port == 0` の要素を読み飛ばさず CRI へ送る | [kubernetes `kuberuntime_sandbox.go` L119-L139](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go#L119-L139)（`generatePodSandboxConfig` が全コンテナの `MakePortMappings` の結果をそのまま積む）、[`container/helpers.go` L449-L484](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/container/helpers.go#L449-L484)（`HostPort`・`HostIP` を無加工で写し、`HostPort` で絞らない）。検証側も [`validation.go` L2818](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/validation/validation.go#L2818) で `HostPort != 0` のときだけ範囲を見る（0 は未指定として許す） | 確認。宣言した ports は `host_port == 0` のまま届くので、読み飛ばす側（runtime）の責務になる |
+| containerd は `HostPort <= 0` を読み飛ばす | [containerd `sandbox_run.go` L601-L615](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/sandbox_run.go#L601-L615)（`toCNIPortMappings` の `if mapping.HostPort <= 0 { continue }`。呼び出しは L536） | 一致。本実装の「`host_port == 0` は公開しない（どのモードでも受ける）」と同じ。負の値は CRI の型（int32）では来うるが、本実装は `host_port` を 0..=65535 に限り範囲外を `INVALID_ARGUMENT` にする（containerd は負も黙って読み飛ばす。厳しい側の差） |
+| 空の `host_ip` は「全アドレス」 | kubelet は `HostIP` を空のまま渡す（[`helpers.go` L456](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/container/helpers.go#L456)）。containerd は `HostIP: mapping.HostIp` を無加工で CNI へ渡す（`sandbox_run.go` L611）。portmap は `HostIP` が空のときは宛先指定（`-d`）を付けず、指定があっても `IsUnspecified()` なら付けない（[iptables 実装 L221-L246](https://github.com/containernetworking/plugins/blob/adc3e6b5b581638afbd194cf2e9319ecbb0151a1/plugins/meta/portmap/portmap_iptables.go#L221-L246)、[nftables 実装 L189-L200](https://github.com/containernetworking/plugins/blob/adc3e6b5b581638afbd194cf2e9319ecbb0151a1/plugins/meta/portmap/portmap_nftables.go#L189-L200)） | 確認。空と `0.0.0.0`（・`::`）はどちらも全アドレス。本実装は空・`0.0.0.0` を `UNIMPLEMENTED` にしているため、kubelet が既定で送る空の `host_ip` の hostPort は通らない（既知の差の 1 点目。net の拒否を見直すかはオーナー判断の候補） |
+| containerd は hostNetwork（`NamespaceMode_NODE`）でネットワークの setup を行わず、port_mappings を使わない | [`sandbox_run.go` L196](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/sandbox_run.go#L196)（`if !hostNetwork(config)` の中で netns を作り、`setupPodNetwork` を呼ぶ L266。CNI の port map の組み立て `cniNamespaceOpts` は `setupPodNetwork` 内の L492）、[`helpers.go` L428-L443](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/helpers.go#L428-L443)（Linux は `NetworkNamespace == NODE` を hostNetwork とする） | 確認。hostNetwork では公開の処理そのものが走らず、エラーにもならない（無視）。本実装の `NODE` を `UNIMPLEMENTED` にする扱いとは**食い違う**（containerd は受けて無視、本実装は拒否） |
+| kubelet は hostNetwork の pod でも ports を送り、`host_port` を `container_port` へ既定化する | [`kuberuntime_sandbox.go` L119-L139](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go#L119-L139)（`HostNetwork` による分岐なし）、[`defaults.go` L214-L216・L440-L448](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/v1/defaults.go#L214-L216)（`defaultHostNetworkPorts`）、[`validation.go` L4328-L4353](https://github.com/kubernetes/kubernetes/blob/f78e722310e50bcaca9276be22276d9e91d91308/pkg/apis/core/validation/validation.go#L4328-L4353)（hostNetwork の Pod は `hostPort == containerPort` を要求） | 確認。ports を宣言した hostNetwork の pod は `NODE` かつ `host_port > 0` で届く。これは本実装では `UNIMPLEMENTED` になるため、kubelet から見るとその pod の起動が失敗する（挙動の差。上の「既知の差」で扱う） |
+
+食い違いの扱い:
+
+- `host_port == 0`・空の `host_ip` の意味は、本実装の記述と一致した（空の `host_ip` の拒否は、意味は合っていて、安全側に倒した差である）
+- hostNetwork（`NODE`）は食い違った。containerd は受けて無視し、本実装は `UNIMPLEMENTED` で拒否する。「無視」に合わせると、公開されないのに成功を返すため、利用者が到達できると誤解する余地がある。現状の拒否のまま保つか、containerd に合わせて無視するか、明示のエラー文言を整えるかは**オーナー判断**の事項とする（コードは変えない。追跡: 起票の承認待ちとして PR 本文に記載）
 
 ## 外部の事実の照合（CRI-2・SEC-1・NET-5・CORE-4。#2772）
 
@@ -361,3 +420,19 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 | 未知名の扱い | [`pkg/oci/spec_opts.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/pkg/oci/spec_opts.go#L1124-L1139)（`WithDroppedCapabilities`）と `removeCap`（L1083-L1092）。完全一致で取り除くだけで、名前の検証をしない。対象は bounding・effective・permitted・inheritable | **食い違い**: containerd は未知名・接頭辞つきを黙って無視する。本実装は `INVALID_ARGUMENT`（未知名）と drop（接頭辞つき）にする |
 
 食い違い（drop_capabilities の 2 点）は #2812 で追跡する。`spec.rs` のドキュメントコメントは訂正済み。挙動を containerd に合わせるかはオーナー判断待ち（コードは変えていない）。
+
+### ContainerStatus・ListContainers の image_ref・image_id（CRI-2・OCI-1。#2831）
+
+CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で解決した結果を記録へ残し、両 RPC で返す。経路は `ImageRootfsSource::prepare`（`ImageDefaults::resolved_image`）→ `SpecBundleProvider::prepare`（`PreparedBundle::with_image`）→ `CriRuntimeService::attach_prepared` → `ContainerRecord::resolved_image`。置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも `StateStore` にも書かない）。保持量は `container_retained_bytes` の上限に計上する。
+
+| 経路 | ContainerStatus.image_ref | ContainerStatus.image_id | ListContainers の image_ref・image_id |
+| ---- | ---- | ---- | ---- |
+| 在庫の記録に `repo_digests` がある | `repo_digests[0]` | image ID（`sha256:<config digest>`） | image ID |
+| 記録に digest が無い・在庫なしで image ID 指定 | image ID | image ID | image ID |
+| 報告の無い経路（スタブ・外部 bundle・報告しない provider） | 空 | 空 | 空 |
+
+- 報告が無いときに digest を推測しない（`config.image.image` を流用しない。REPAIR-3）。containerd は空を返さないので、空は本リポ固有の挙動
+- `image_id` は `PullImageResponse.image_ref`（= image ID）と一致させる（`crates/cri/proto/api.proto` の `ContainerStatus.image_id`・`Container.image_id` の MUST）。`image_ref` は同 proto の「Digested reference to the image in use」
+- containerd との照合（一次情報）: main `cfb18c48f865669d497115c1734e94fedc338153` の `internal/cri/server/container_status.go` は `imageID = container.ImageRef`（create 時の config digest）、`imageRef` は在庫の `repoDigests[0]`（無ければ config digest）。`container_list.go` の `toCRIContainer` は `ImageRef`・`ImageId` とも config digest で在庫を引かない。v2.1.4（`75cb2b7193e4e490e9fbdc236c0e811ccaba3376`）は `ImageId` を設定しない
+- 既知の差: containerd は Status の時点で在庫を引き直すが、本実装は create 時のスナップショットを返し続ける。本実装の `repo_digests[0]` はタグ pull ではプラットフォームの manifest digest になる（containerd は multi-arch で index digest）。Status の `image`（ImageSpec）は containerd のように `repoTags[0]` へ置き換えず config の値のまま
+- `message`・`info` は引き続きスタブ（空）

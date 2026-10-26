@@ -18,13 +18,15 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
 //!
 //! `cap-drop` は #2775(CLI-1・SEC-1)で足した kind で、版(`FCOPT1`)は上げない。CLI と supervisor は同じディレクトリから
 //! 配布され、未知の kind は旧 supervisor が拒否する(fail-closed)ため、版を上げる利点が無い。
+//! `read-only` も #2828(CLI-1・SUP-12)で足した kind で、本体は固定値 `true` だけを受ける(`false` や空は拒否。
+//! `--read-only` は狭める方向だけで、書き込み可能へ戻す表現を持たない)。重複は拒否する。版は同じ理由で上げない。
 //!
 //! # 外部入力の扱い
 //!
@@ -57,6 +59,8 @@ const CAP_DROP_RECORD_MAX: usize = MAX_DROP_NAME_BYTES;
 pub const GENERATION_MAX: usize = 64;
 /// 作成世代の記録(`gen <len>\n<値>\n`)の最大バイト数(後から足す分を、全体の上限の検査で確保する)。
 const GENERATION_RECORD_RESERVE: usize = 4 + 1 + 2 + 1 + GENERATION_MAX + 1;
+/// `read-only` の本文の最大バイト数(固定値 `true` の 4)。
+const READ_ONLY_RECORD_MAX: usize = 4;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
 const HEADER_LINE_MAX: usize = 24;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
@@ -76,6 +80,8 @@ pub struct ContainerOptionsDocument {
     tmpfs: Vec<String>,
     /// `--cap-drop` の生の名前(構築時に core の `parse_drop_list` で検証済み。#2775)。
     cap_drop: Vec<String>,
+    /// `--read-only`(true のとき `root.readonly` を実効的に true にする。#2828)。
+    read_only: bool,
     /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
     generation: Option<String>,
 }
@@ -95,6 +101,7 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("shm_size", &self.shm_size)
             .field("tmpfs", &self.tmpfs)
             .field("cap_drop", &self.cap_drop)
+            .field("read_only", &self.read_only)
             .field("generation", &self.generation)
             .finish()
     }
@@ -126,6 +133,7 @@ impl ContainerOptionsDocument {
             shm_size,
             tmpfs,
             cap_drop: Vec::new(),
+            read_only: false,
             generation: None,
         };
         doc.check_record_lengths()?;
@@ -172,6 +180,22 @@ impl ContainerOptionsDocument {
         Ok(self)
     }
 
+    /// `--read-only` を持たせる(CLI-1・SUP-12・#2828)。false は「指定なし」で、config の値に従う。
+    /// `read-only` の記録を足した後の文書全体の上限を、`new` / `with_cap_drop` と同じ基準(作成世代の記録の分を
+    /// 含む)で再検査する。create が書けても start の読み取りが拒否する文書を作らない(REPAIR-2)。
+    pub fn with_read_only(mut self, read_only: bool) -> Result<Self, TraitError> {
+        self.read_only = read_only;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
+    /// `--read-only` が指定されたか。
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// `--cap-drop` の生の名前。
     pub fn cap_drop(&self) -> &[String] {
         &self.cap_drop
@@ -207,6 +231,7 @@ impl ContainerOptionsDocument {
             && self.shm_size.is_none()
             && self.tmpfs.is_empty()
             && self.cap_drop.is_empty()
+            && !self.read_only
     }
 
     /// 検証済みの [`ContainerOptions`] へ変換する(label・secrets・configs は含まない)。
@@ -239,7 +264,9 @@ impl ContainerOptionsDocument {
         }
         let cap_drop =
             parse_drop_list(&self.cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
-        options = options.with_cap_drop(cap_drop);
+        options = options
+            .with_cap_drop(cap_drop)
+            .with_read_only(self.read_only);
         // 矛盾する指定(ファイルを読まない検査)をここで拒否する。
         options.tmpfs_set()?;
         Ok(options)
@@ -284,6 +311,9 @@ impl ContainerOptionsDocument {
         for s in &self.cap_drop {
             put("cap-drop", s);
         }
+        if self.read_only {
+            put("read-only", "true");
+        }
         if let Some(s) = &self.generation {
             put("gen", s);
         }
@@ -301,6 +331,7 @@ impl ContainerOptionsDocument {
             .ok_or_else(|| invalid("options document has an unknown header"))?;
         let (mut ulimits, mut env, mut tmpfs) = (Vec::new(), Vec::new(), Vec::new());
         let mut cap_drop: Vec<String> = Vec::new();
+        let mut read_only = false;
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
         let mut generation: Option<String> = None;
         // 全体の上限があるため、レコード数は `new` の件数検査と合わせて有限。
@@ -334,6 +365,7 @@ impl ContainerOptionsDocument {
                 "shm-size" => SHM_RECORD_MAX,
                 "tmpfs" => TMPFS_RECORD_MAX,
                 "cap-drop" => CAP_DROP_RECORD_MAX,
+                "read-only" => READ_ONLY_RECORD_MAX,
                 "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
@@ -348,6 +380,14 @@ impl ContainerOptionsDocument {
                 "env" => env.push(text),
                 "tmpfs" => tmpfs.push(text),
                 "cap-drop" => cap_drop.push(text),
+                "read-only" => {
+                    if text != "true" {
+                        return Err(invalid("a read-only record is invalid"));
+                    }
+                    if std::mem::replace(&mut read_only, true) {
+                        return Err(invalid("an options record is duplicated"));
+                    }
+                }
                 "gen" => {
                     if generation.replace(text).is_some() {
                         return Err(invalid("an options record is duplicated"));
@@ -374,7 +414,9 @@ impl ContainerOptionsDocument {
                 return Err(invalid("too many options records"));
             }
         }
-        let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?.with_cap_drop(cap_drop)?;
+        let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
+            .with_cap_drop(cap_drop)?
+            .with_read_only(read_only)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
@@ -488,6 +530,32 @@ tmpfs 14\n/run:rw,noexec\n";
         );
     }
 
+    /// CLI-1・SUP-12(#2828): `with_read_only(true)` は記録を足した後の文書が上限(作成世代の記録の分を含む)に
+    /// ちょうど収まれば成功し、1 バイト超えれば固定文言で拒否する。
+    #[test]
+    fn sup12_options_document_read_only_checks_size_boundary() {
+        let with_ipc = |n: usize| ContainerOptionsDocument {
+            ipc: Some("x".repeat(n)),
+            ..ContainerOptionsDocument::default()
+        };
+        let total = |n: usize| {
+            let mut d = with_ipc(n);
+            d.read_only = true;
+            d.encode().len() + GENERATION_RECORD_RESERVE
+        };
+        let mut n = OPTIONS_DOC_MAX_BYTES - 1024;
+        while total(n) < OPTIONS_DOC_MAX_BYTES {
+            n += 1;
+        }
+        assert_eq!(total(n), OPTIONS_DOC_MAX_BYTES);
+        assert!(with_ipc(n).with_read_only(true).is_ok());
+        let err = with_ipc(n + 1)
+            .with_read_only(true)
+            .expect_err("over the limit");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "options document is too large");
+    }
+
     /// CLI-1・SEC-1(#2775): 未知名・空・長すぎる名前・件数超過を含む文書は復号・構築とも固定文言で拒否する。
     #[test]
     fn cli1_cap_drop_record_rejects_invalid() {
@@ -508,6 +576,45 @@ tmpfs 14\n/run:rw,noexec\n";
                 .with_cap_drop(many)
                 .is_err()
         );
+    }
+
+    /// CLI-1・SUP-12(#2828): `read-only` は符号化の具体値・往復・変換後の `launch_options` が一致し、旧形式は false。
+    /// 本体が `true` 以外・空・重複は固定文言で拒否する。
+    #[test]
+    fn sup12_options_document_read_only_round_trip() {
+        let d = ContainerOptionsDocument::default()
+            .with_read_only(true)
+            .expect("read-only");
+        assert!(!d.is_empty());
+        let bytes = d.encode();
+        assert_eq!(bytes, b"FCOPT1\nread-only 4\ntrue\n".to_vec());
+        let back = ContainerOptionsDocument::decode(&bytes).expect("decode");
+        assert_eq!(back, d);
+        assert!(back.read_only());
+        let opts = back.to_container_options().expect("opts");
+        assert!(opts.read_only());
+        assert!(opts.launch_options().expect("launch").root_readonly());
+        let old = ContainerOptionsDocument::decode(b"FCOPT1\nipc 7\nprivate\n").expect("old");
+        assert!(!old.read_only());
+        assert!(
+            !old.to_container_options()
+                .expect("opts")
+                .launch_options()
+                .expect("launch")
+                .root_readonly()
+        );
+        assert!(ContainerOptionsDocument::default().is_empty());
+        for bad in [
+            &b"FCOPT1\nread-only 5\nfalse\n"[..],
+            b"FCOPT1\nread-only 0\n\n",
+        ] {
+            let e = ContainerOptionsDocument::decode(bad).expect_err("rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        }
+        let dup =
+            ContainerOptionsDocument::decode(b"FCOPT1\nread-only 4\ntrue\nread-only 4\ntrue\n")
+                .expect_err("dup");
+        assert_eq!(dup.message(), "an options record is duplicated");
     }
 
     fn decode_err(bytes: &[u8]) -> TraitError {

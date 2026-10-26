@@ -699,11 +699,25 @@ struct PreparedOptions {
     written: Option<options_store::WrittenOptions>,
 }
 
-fn options_timeout() -> TraitError {
-    TraitError::new(
-        fandhe_container_core::traits::ErrorCode::Timeout,
-        "container options file I/O did not finish within the deadline",
-    )
+/// 起動オプション文書の I/O を期限つきの作業スレッドで行う（枠の満杯は期限内で待つ）。
+///
+/// 同時実行枠（プロセス共有）が期限まで空かなかったときは、何も実行していないので期限切れの `TIMEOUT` ではなく
+/// `RESOURCE_EXHAUSTED` を返す（ERR-2・REPAIR-4。#2834）。期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。
+fn run_options_io<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, TraitError> + Send + 'static,
+) -> Result<T, TraitError> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    match run_bounded_waiting(job, OPTIONS_IO_TIMEOUT) {
+        Ok(result) => result,
+        Err(BoundedFailure::Busy) => Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::ResourceExhausted,
+            "container options file workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Timeout,
+            "container options file I/O did not finish within the deadline",
+        )),
+    }
 }
 
 /// 起動オプション文書を書く前の整理と書き込み(#2713・SUP-12)。ロックと書いた文書の識別(巻き戻し用)を返す。
@@ -736,28 +750,24 @@ fn prepare_options_file(
     let job_root = root.clone();
     let id = id.clone();
     let document = document.clone();
-    let prepared = fandhe_container_supervisor::supervisor_log::run_bounded(
-        move || -> Result<_, TraitError> {
-            let lock = options_store::acquire_lock(&job_root, &id, OPTIONS_LOCK_WAIT)?;
-            // 同じ ID の状態が既にある(または確認できない)なら拒否する。ここで見送って core の create に任せると、
-            // 確認の後に並行 delete が状態を消したとき、世代注釈つきの新しい記録に対応する文書が無い(または前の世代の
-            // 文書が残る)状態で create が成功してしまう(SUP-12・SEC-1・#2713)。
-            if !super::stop_delete::id_is_still_deleted(&job_root, &id) {
-                return Err(TraitError::new(
-                    fandhe_container_core::traits::ErrorCode::AlreadyExists,
-                    "the container already exists or its state cannot be checked",
-                ));
-            }
-            options_store::remove(&job_root, &id)?;
-            if document.is_empty() {
-                return Ok((lock, None));
-            }
-            let written = options_store::write_new(&job_root, &id, &document)?;
-            Ok((lock, Some(written)))
-        },
-        OPTIONS_IO_TIMEOUT,
-    )
-    .unwrap_or_else(|| Err(options_timeout()))?;
+    let prepared = run_options_io(move || -> Result<_, TraitError> {
+        let lock = options_store::acquire_lock(&job_root, &id, OPTIONS_LOCK_WAIT)?;
+        // 同じ ID の状態が既にある(または確認できない)なら拒否する。ここで見送って core の create に任せると、
+        // 確認の後に並行 delete が状態を消したとき、世代注釈つきの新しい記録に対応する文書が無い(または前の世代の
+        // 文書が残る)状態で create が成功してしまう(SUP-12・SEC-1・#2713)。
+        if !super::stop_delete::id_is_still_deleted(&job_root, &id) {
+            return Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::AlreadyExists,
+                "the container already exists or its state cannot be checked",
+            ));
+        }
+        options_store::remove(&job_root, &id)?;
+        if document.is_empty() {
+            return Ok((lock, None));
+        }
+        let written = options_store::write_new(&job_root, &id, &document)?;
+        Ok((lock, Some(written)))
+    })?;
     let (lock, written) = prepared;
     Ok(Some(PreparedOptions {
         lock,
@@ -803,18 +813,14 @@ fn rollback_options(prepared: PreparedOptions, id: &ContainerId) -> Result<(), T
         written,
     } = prepared;
     let id = id.clone();
-    fandhe_container_supervisor::supervisor_log::run_bounded(
-        move || -> Result<(), TraitError> {
-            let result = match &written {
-                Some(w) => options_store::remove_if_same(&root, &id, w),
-                None => Ok(()),
-            };
-            lock.remove_lock_file();
-            result
-        },
-        OPTIONS_IO_TIMEOUT,
-    )
-    .unwrap_or_else(|| Err(options_timeout()))
+    run_options_io(move || -> Result<(), TraitError> {
+        let result = match &written {
+            Some(w) => options_store::remove_if_same(&root, &id, w),
+            None => Ok(()),
+        };
+        lock.remove_lock_file();
+        result
+    })
 }
 
 /// 起動オプション文書を core の create の前に書き、create が失敗したら自分が作った inode だけを消す(#2713・SUP-12)。
@@ -1847,6 +1853,7 @@ mod tests {
                     env: vec!["A=1".into()],
                     labels: vec!["tier=web".into()],
                     cap_drop: vec!["chown".into(), "CAP_NET_RAW".into()],
+                    read_only: true,
                     ..CreateOptionArgs::default()
                 },
                 bundle: bundle.to_path_buf(),
@@ -1888,6 +1895,8 @@ mod tests {
             assert_eq!(written.env(), doc.env());
             // `--cap-drop` も文書に載り、supervisor 側の復号で同じ集合になる(CLI-1・SEC-1・#2775)。
             assert_eq!(written.cap_drop(), ["chown", "CAP_NET_RAW"]);
+            // `--read-only` も文書に載る(CLI-1・SUP-12・#2828)。
+            assert!(written.read_only());
             let before = std::fs::read(&path).expect("bytes");
             let e = create_with_options(&rt, &req, None, &doc).expect_err("dup");
             assert_eq!(e.code(), ErrorCode::AlreadyExists);

@@ -80,7 +80,7 @@
 //! （all-or-nothing）でネットワーク専用テーブルの `prerouting` / `output` へ投入する（[`PortPublish`]）。
 //!
 //! これらのいずれかが失敗したら接続全体（IPAM の払い出し・veth・netns）を戻す。`RTM_DELROUTE` /
-//! `RTM_DELADDR` / ルールハンドル取得が未実装のため個別の巻き戻しができず、netns 内の address・route は
+//! `RTM_DELADDR` が未実装で、公開済みルールの個別の巻き戻し（`unpublish_container_port`）は attach の失敗経路に組み込んでいないため、個別の巻き戻しができず、netns 内の address・route は
 //! veth と netns の破棄で消え、nft バッチは失敗時に何も適用されない（`Aborted` / `NotSent`）ことに
 //! 依存する。結果が不明なバッチは `AttachResource::PortRules` と `AttachResource::Address` を `Unknown` で報告し、
 //! IPAM のアドレスと [`PortRegistry`] の予約を保持する（残ったルールが別コンテナへ転送しないための quarantine。
@@ -106,7 +106,9 @@
 //!   このため default route を張っても、コンテナ発の通信を host 外部へ届けるには masquerade と host の
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
-//!   （ルールハンドルの取得経路が無い。公開は attach 後にも `publish_container_ports` で追加できる。#2676・NET-4）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
+//!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
+//!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
+//!   再起動後のハンドル復元は未実装）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
 //! - IPAM 状態の永続化、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
 //!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで。再起動後のネットワーク本体は手動。
@@ -120,6 +122,7 @@ pub mod attach_claim;
 pub mod delete;
 pub mod ipam;
 pub mod publish;
+pub mod unpublish;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
@@ -138,6 +141,9 @@ pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteRe
 pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
+#[cfg(target_os = "linux")]
+pub use unpublish::unpublish_container_port;
+pub use unpublish::{PublishedPort, UnpublishPortError, UnpublishRules};
 
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
@@ -155,6 +161,7 @@ use crate::nftables_batch::{
     NetlinkNetfilterSocket, NfInetHook, NftFamily, TableCreate,
 };
 use crate::nftables_batch::{NftBatchOutcome, NftName};
+use crate::nftables_rules::NftRuleHandle;
 #[cfg(target_os = "linux")]
 use crate::nftables_rules::RuleCreate;
 
@@ -1209,6 +1216,9 @@ pub struct AttachedContainer<N> {
     pub address: IpPrefix,
     /// netns ハンドル（fd を保持する。解放は pin の unpin）。
     pub netns: N,
+    /// attach 時のポート公開で投入した DNAT ルールのハンドル（`ContainerAttachSpec` の公開指定の順。
+    /// 個別の解除は `unpublish_container_port`。指定が無ければ空。NET-3・#2839）。
+    pub published_ports: Vec<PublishedPort>,
 }
 
 impl<N> AttachedContainer<N> {
@@ -1533,13 +1543,17 @@ pub(crate) trait AttachOps {
     /// 接続成功時に netns 内の route ソケットを閉じる（fd を常駐させない。CORE-9）。
     fn release_netns_socket(&self, ns: &mut Self::Netns);
     /// `table` の `prerouting` / `output` へ DNAT ルールを 1 バッチで投入する。
+    /// 戻り値は `ports` と同じ順の `(prerouting, output)` のルールハンドル（echo 応答。NET-3）。
     fn publish_ports(
         &self,
         table: &NftName,
         container: Ipv4Addr,
         ports: &[PortPublish],
-    ) -> Result<(), NftApplyFailure>;
+    ) -> Result<Vec<RuleHandlePair>, NftApplyFailure>;
 }
+
+/// 公開 1 件の DNAT ルール 2 本の `(prerouting, output)` のハンドル。
+pub(crate) type RuleHandlePair = (NftRuleHandle, NftRuleHandle);
 
 /// pin を外し、結果をロールバック報告へ載せる。
 fn rollback_netns<O: AttachOps>(
@@ -1850,51 +1864,57 @@ fn attach_with_source<O: AttachOps>(
     }
 
     // netns 内の設定 → ポート公開。ここからの失敗は veth・netns を戻す（モジュール doc）。
-    if let Err(f) = configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
-        let mut report = AttachRollbackReport::default();
-        if f.ports_unknown {
-            // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
-            // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
-            report.leftover.push((
-                AttachResource::PortRules(spec.table.clone()),
-                ResourceState::Unknown,
-            ));
-            report
-                .leftover
-                .push((AttachResource::Address(address), ResourceState::Unknown));
-        }
-        rollback_veth(ops, names.host(), host_index, &mut report);
-        let back = if keep_netns {
-            Some(give_back(netns))
-        } else {
-            rollback_netns(ops, netns, &pin, &mut report);
-            None
-        };
-        if !f.ports_unknown {
-            // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
-            // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
-            // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
-            // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
-            if report.leftover.is_empty() {
-                let _ = ipam.release(&spec.endpoint);
-                // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
-                if !spec.ports.is_empty() && ports.release(&spec.network, &spec.endpoint).is_err() {
+    let published_ports =
+        match configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
+            Ok(p) => p,
+            Err(f) => {
+                let mut report = AttachRollbackReport::default();
+                if f.ports_unknown {
+                    // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
+                    // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
                     report.leftover.push((
-                        AttachResource::PortReservation(
-                            spec.network.clone(),
-                            spec.endpoint.clone(),
-                        ),
-                        ResourceState::Present,
+                        AttachResource::PortRules(spec.table.clone()),
+                        ResourceState::Unknown,
                     ));
+                    report
+                        .leftover
+                        .push((AttachResource::Address(address), ResourceState::Unknown));
                 }
-            } else {
-                report
-                    .leftover
-                    .push((AttachResource::Address(address), ResourceState::Unknown));
+                rollback_veth(ops, names.host(), host_index, &mut report);
+                let back = if keep_netns {
+                    Some(give_back(netns))
+                } else {
+                    rollback_netns(ops, netns, &pin, &mut report);
+                    None
+                };
+                if !f.ports_unknown {
+                    // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
+                    // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
+                    // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
+                    // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
+                    if report.leftover.is_empty() {
+                        let _ = ipam.release(&spec.endpoint);
+                        // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
+                        if !spec.ports.is_empty()
+                            && ports.release(&spec.network, &spec.endpoint).is_err()
+                        {
+                            report.leftover.push((
+                                AttachResource::PortReservation(
+                                    spec.network.clone(),
+                                    spec.endpoint.clone(),
+                                ),
+                                ResourceState::Present,
+                            ));
+                        }
+                    } else {
+                        report
+                            .leftover
+                            .push((AttachResource::Address(address), ResourceState::Unknown));
+                    }
+                }
+                return Err(Box::new((fail(f.error, f.step, report), back)));
             }
-        }
-        return Err(Box::new((fail(f.error, f.step, report), back)));
-    }
+        };
     ops.release_netns_socket(&mut netns);
 
     Ok(AttachedContainer {
@@ -1906,6 +1926,7 @@ fn attach_with_source<O: AttachOps>(
         netns_path: pin,
         address,
         netns,
+        published_ports,
     })
 }
 
@@ -1926,7 +1947,7 @@ fn configure_in_netns<O: AttachOps>(
     peer: &IfName,
     address: IpPrefix,
     gateway: Ipv4Addr,
-) -> Result<(), ConfigureFailure> {
+) -> Result<Vec<PublishedPort>, ConfigureFailure> {
     let step = |step: AttachStep| {
         move |error: NetError| ConfigureFailure {
             error,
@@ -1959,7 +1980,8 @@ fn configure_in_netns<O: AttachOps>(
                 "container address is not an IPv4 address",
             )));
         };
-        ops.publish_ports(&spec.table, container, &spec.ports)
+        let handles = ops
+            .publish_ports(&spec.table, container, &spec.ports)
             .map_err(|f| ConfigureFailure {
                 ports_unknown: !matches!(
                     f.outcome,
@@ -1968,8 +1990,43 @@ fn configure_in_netns<O: AttachOps>(
                 error: f.error,
                 step: AttachStep::PublishPorts,
             })?;
+        // ハンドルの本数が公開指定と食い違う応答は、投入結果を信用できないので結果不明として扱う（quarantine）。
+        return bind_published(
+            &spec.network,
+            &spec.bridge_token,
+            &spec.endpoint,
+            &spec.ports,
+            handles,
+        )
+        .map_err(|error| ConfigureFailure {
+            error,
+            step: AttachStep::PublishPorts,
+            ports_unknown: true,
+        });
     }
-    Ok(())
+    Ok(Vec::new())
+}
+
+/// 公開指定と同じ順のハンドル列を [`PublishedPort`] に束ねる。本数の不一致は `Internal`（呼び出し側は
+/// 結果不明として予約を保持する）。
+fn bind_published(
+    network: &NetworkName,
+    bridge_token: &str,
+    endpoint: &EndpointId,
+    ports: &[PortPublish],
+    handles: Vec<RuleHandlePair>,
+) -> Result<Vec<PublishedPort>, NetError> {
+    if handles.len() != ports.len() {
+        return Err(NetError::new(
+            NetErrorCode::Internal,
+            "rule handle count does not match the port publishes",
+        ));
+    }
+    Ok(ports
+        .iter()
+        .zip(handles)
+        .map(|(p, h)| PublishedPort::new(network, bridge_token, endpoint, *p, h))
+        .collect())
 }
 
 /// attach 後のポート公開の失敗（原因と、DNAT バッチの結果が不明かどうか）。
@@ -2004,13 +2061,17 @@ impl std::error::Error for PublishPortsError {}
 /// 予約を保持する。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn publish_ports_with(
-    publish: impl FnOnce(&NftName, Ipv4Addr, &[PortPublish]) -> Result<(), NftApplyFailure>,
+    publish: impl FnOnce(
+        &NftName,
+        Ipv4Addr,
+        &[PortPublish],
+    ) -> Result<Vec<RuleHandlePair>, NftApplyFailure>,
     network: &CreatedNetwork,
     endpoint: &EndpointId,
     container_addr: IpPrefix,
     ports: &[PortPublish],
     registry: &mut PortRegistry,
-) -> Result<(), PublishPortsError> {
+) -> Result<Vec<PublishedPort>, PublishPortsError> {
     let known = |error: NetError| PublishPortsError {
         error,
         rules_unknown: false,
@@ -2048,27 +2109,54 @@ pub(crate) fn publish_ports_with(
     registry
         .reserve(&network.name, endpoint, ports)
         .map_err(known)?;
-    let Err(f) = publish(&network.table, container, ports) else {
-        return Ok(());
+    let handles = match publish(&network.table, container, ports) {
+        Ok(h) => h,
+        Err(f) => return Err(publish_failed(f, network, endpoint, ports, registry)),
+    };
+    // 本数の食い違いは、ルールが入っているのにハンドルを確定できない状態。結果不明として予約を保持する。
+    bind_published(
+        &network.name,
+        &network.bridge_token,
+        endpoint,
+        ports,
+        handles,
+    )
+    .map_err(|error| PublishPortsError {
+        error,
+        rules_unknown: true,
+    })
+}
+
+/// 公開バッチの失敗を [`PublishPortsError`] へ写す（結果不明なら予約を保持し、確定失敗なら今回分を戻す）。
+fn publish_failed(
+    f: NftApplyFailure,
+    network: &CreatedNetwork,
+    endpoint: &EndpointId,
+    ports: &[PortPublish],
+    registry: &mut PortRegistry,
+) -> PublishPortsError {
+    let known = |error: NetError| PublishPortsError {
+        error,
+        rules_unknown: false,
     };
     if !matches!(
         f.outcome,
         NftBatchOutcome::Aborted | NftBatchOutcome::NotSent
     ) {
         // DNAT ルールが入っている可能性がある。予約は保持する（quarantine）。
-        return Err(PublishPortsError {
+        return PublishPortsError {
             error: f.error,
             rules_unknown: true,
-        });
+        };
     }
     // 確定的に適用されていない。今回の予約だけを戻す。戻せなければ予約が残るため結果不明と同じ扱い
     // （fail-closed。解放は delete_network）。
     match registry.release_listeners(&network.name, endpoint, ports) {
-        Ok(_) => Err(known(f.error)),
-        Err(_) => Err(PublishPortsError {
+        Ok(_) => known(f.error),
+        Err(_) => PublishPortsError {
             error: f.error,
             rules_unknown: true,
-        }),
+        },
     }
 }
 
@@ -2078,9 +2166,13 @@ pub(crate) fn publish_ports_with(
 /// 専用テーブルの `prerouting` / `output` へ 1 バッチで投入する。失敗時の扱いは [`PublishPortsError`]。
 /// `CAP_NET_ADMIN` が必要で、本 crate は権限を上げない。`timeout` は nft 要求の期限（REPAIR-5）。
 ///
+/// 成功すると `ports` と同じ順の [`PublishedPort`] を返す。ルールは `NLM_F_ECHO` 付きで投入し、echo 応答の
+/// ハンドルを検証して保持する（応答が欠けた・壊れた場合は結果不明として予約を保持する。NET-3・#2839）。
+/// 個別の解除は [`unpublish_container_port`]。
+///
 /// # 未実装範囲（REPAIR-3）
-/// 公開の個別解除は無い（`delete_network` がテーブルごと解放する）。masquerade と host の
-/// `ip_forward` は別途必要。
+/// [`PublishedPort`] のプロセス再起動後の復元は無い（`delete_network` がテーブルごと解放する）。
+/// masquerade と host の `ip_forward` は別途必要。
 #[cfg(target_os = "linux")]
 pub fn publish_container_ports<N>(
     nft: &NetlinkNetfilterSocket,
@@ -2089,7 +2181,7 @@ pub fn publish_container_ports<N>(
     ports: &[PortPublish],
     registry: &mut PortRegistry,
     timeout: Duration,
-) -> Result<(), PublishPortsError> {
+) -> Result<Vec<PublishedPort>, PublishPortsError> {
     publish_ports_with(
         |table, addr, ports| send_dnat_batch(nft, timeout, table, addr, ports),
         network,
@@ -2253,7 +2345,7 @@ impl AttachOps for LinuxAttachOps<'_> {
         table: &NftName,
         container: Ipv4Addr,
         ports: &[PortPublish],
-    ) -> Result<(), NftApplyFailure> {
+    ) -> Result<Vec<RuleHandlePair>, NftApplyFailure> {
         send_dnat_batch(self.nft, self.timeout, table, container, ports)
     }
 }
@@ -2267,27 +2359,44 @@ fn send_dnat_batch(
     table: &NftName,
     container: Ipv4Addr,
     ports: &[PortPublish],
-) -> Result<(), NftApplyFailure> {
-    nft.send_batch(timeout, |batch| {
-        for port in ports {
-            // 外部から（prerouting）とホスト自身から（output）の両経路へ同じルールを入れる。
-            for chain in ["prerouting", "output"] {
-                let rule = RuleCreate::new(
-                    NftFamily::Ipv4,
-                    table.clone(),
-                    NftName::new(chain)?,
-                    port.dnat_rule_exprs(container)?,
-                );
-                batch.push_with(|seq| rule.build(seq))?;
+) -> Result<Vec<RuleHandlePair>, NftApplyFailure> {
+    let ack = nft
+        .send_batch(timeout, |batch| {
+            for port in ports {
+                // 外部から（prerouting）とホスト自身から（output）の両経路へ同じルールを入れる。
+                for chain in ["prerouting", "output"] {
+                    let rule = RuleCreate::new(
+                        NftFamily::Ipv4,
+                        table.clone(),
+                        NftName::new(chain)?,
+                        port.dnat_rule_exprs(container)?,
+                    );
+                    // echo 応答（NLM_F_ECHO）でカーネル採番のルールハンドルを受け取る（NET-3・#2839）。
+                    batch.push_with(|seq| rule.build_echo(seq))?;
+                }
             }
-        }
-        Ok(())
-    })
-    .map(|_| ())
-    .map_err(|e| NftApplyFailure {
-        outcome: e.outcome(),
-        error: e.into(),
-    })
+            Ok(())
+        })
+        .map_err(|e| NftApplyFailure {
+            outcome: e.outcome(),
+            error: e.into(),
+        })?;
+    // 公開 i のルールは本体の添字 2i（prerouting）・2i+1（output）。ACK 判定は echo を要求した本体の
+    // ハンドルが揃わなければ成功にしない（ここでの欠落は防御。結果不明として予約を保持させる）。
+    let missing = || NftApplyFailure {
+        outcome: NftBatchOutcome::Unknown,
+        error: NetError::new(
+            NetErrorCode::DataLoss,
+            "rule handle missing from echo reply",
+        ),
+    };
+    (0..ports.len())
+        .map(|i| {
+            let pre = ack.rule_handle(i * 2).ok_or_else(missing)?;
+            let out = ack.rule_handle(i * 2 + 1).ok_or_else(missing)?;
+            Ok((pre, out))
+        })
+        .collect()
 }
 
 /// コンテナをネットワークへ接続する（netns の作成と pin・veth ペアの作成・host 側の bridge 接続と up・
@@ -3670,7 +3779,7 @@ mod attach_tests {
             table: &NftName,
             container: Ipv4Addr,
             ports: &[PortPublish],
-        ) -> Result<(), NftApplyFailure> {
+        ) -> Result<Vec<RuleHandlePair>, NftApplyFailure> {
             self.rec(format!(
                 "publish {} {container} {}",
                 table.as_str(),
@@ -3681,9 +3790,21 @@ mod attach_tests {
                     error: err(c),
                     outcome,
                 }),
-                None => Ok(()),
+                None => Ok(test_handles(ports.len())),
             }
         }
+    }
+
+    /// 公開指定の順に `(2i + 2, 2i + 3)` を返す（新規テーブルで chain 作成の次から採番した想定の具体値）。
+    fn test_handles(n: usize) -> Vec<RuleHandlePair> {
+        (0..n as u64)
+            .map(|i| {
+                (
+                    NftRuleHandle::new(2 * i + 2).unwrap(),
+                    NftRuleHandle::new(2 * i + 3).unwrap(),
+                )
+            })
+            .collect()
     }
 
     fn addr_str(p: IpPrefix) -> String {
@@ -4561,7 +4682,7 @@ mod attach_tests {
         ports: &[PortPublish],
         reg: &mut PortRegistry,
         calls: &RefCell<Vec<String>>,
-    ) -> Result<(), PublishPortsError> {
+    ) -> Result<Vec<PublishedPort>, PublishPortsError> {
         super::publish_ports_with(
             |table, container, ports| {
                 calls.borrow_mut().push(format!(
@@ -4574,7 +4695,7 @@ mod attach_tests {
                         error: NetError::new(c, "injected"),
                         outcome: o,
                     }),
-                    None => Ok(()),
+                    None => Ok(test_handles(ports.len())),
                 }
             },
             &created(),
@@ -4583,6 +4704,68 @@ mod attach_tests {
             ports,
             reg,
         )
+    }
+
+    /// NET-3・NET-4・#2839: 公開の成功結果は公開指定と同じ順の `PublishedPort` で、ハンドルとネットワーク・
+    /// endpoint・受け口の束縛が具体値で一致する。ハンドルの本数が食い違う応答は結果不明として予約を保持する。
+    #[test]
+    fn net3_publish_returns_bound_handles_and_rejects_count_mismatch() {
+        let calls = RefCell::new(Vec::new());
+        let mut reg = PortRegistry::new();
+        let got = publish_with(None, ip(2), &[port(8080), port(8081)], &mut reg, &calls).unwrap();
+        let view: Vec<(u16, u64, u64)> = got
+            .iter()
+            .map(|p| {
+                (
+                    p.publish().host_port(),
+                    p.prerouting_handle().get(),
+                    p.output_handle().get(),
+                )
+            })
+            .collect();
+        assert_eq!(view, vec![(8080, 2, 3), (8081, 4, 5)]);
+        assert!(got.iter().all(|p| p.network().as_str() == "web"));
+        assert!(got.iter().all(|p| p.endpoint().as_str() == "c1"));
+
+        let mut reg = PortRegistry::new();
+        let e = super::publish_ports_with(
+            |_, _, _| Ok(test_handles(1)),
+            &created(),
+            &eid("c1"),
+            ip(2),
+            &[port(8080), port(8081)],
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::Internal);
+        assert!(e.rules_unknown);
+        assert_eq!(reg.len(), 2, "reservation is kept when handles are unknown");
+    }
+
+    /// NET-3・#2839: attach 時の公開でも、ハンドルが公開指定の順に `AttachedContainer::published_ports` へ残る。
+    #[test]
+    fn net3_attach_keeps_published_handles() {
+        let fake = Fake::default();
+        let mut ipam = ipam();
+        let mut ports = PortRegistry::new();
+        let sp = spec("c1")
+            .with_port_publishes(vec![port(8080), port(8081)])
+            .unwrap();
+        let c = attach_container_with(&fake, &sp, &mut ipam, &mut ports).unwrap();
+        let view: Vec<(u16, u64, u64)> = c
+            .published_ports
+            .iter()
+            .map(|p| {
+                (
+                    p.publish().host_port(),
+                    p.prerouting_handle().get(),
+                    p.output_handle().get(),
+                )
+            })
+            .collect();
+        assert_eq!(view, vec![(8080, 2, 3), (8081, 4, 5)]);
+        let none = attach_container_with(&fake, &spec("c2"), &mut ipam, &mut ports).unwrap();
+        assert!(none.published_ports.is_empty());
     }
 
     /// NET-1・NET-4: attach 後の公開は予約してから 1 バッチで投入する。衝突はバッチを送らない。

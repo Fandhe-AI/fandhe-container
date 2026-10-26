@@ -6,7 +6,7 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`image_id`・`message`・`info` は空のスタブ（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`message`・`info` は空のスタブ（`image_ref`・`image_id` は CreateContainer 時の解決結果を返し、報告の無い経路は空。#2831）（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use crate::adapter::RuntimeTerminationReason;
-use crate::bundle::AppliedUser;
+use crate::bundle::{AppliedUser, ResolvedImage};
 use crate::error::CriError;
 use fandhe_container_core::traits::ContainerLogPath;
 use prost::Message;
@@ -167,6 +167,11 @@ pub(super) struct ContainerRecord {
     /// 実行層の経路で `SpecBundleProvider` が config.json に書いた値だけが入る。報告の無い経路は `None`
     /// （root を作り出さない）。寿命は `stop_signal` と同じ。
     pub(super) applied_user: Option<AppliedUser>,
+    /// CreateContainer 時に解決したイメージ（`image_ref`・`image_id` の元。#2831・CRI-2・OCI-1）。
+    ///
+    /// 置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも
+    /// `StateStore` にも書かない。plugin-cri の再起動で失われる）。報告の無い経路（スタブ・外部 bundle）は `None`。
+    pub(super) resolved_image: Option<ResolvedImage>,
 }
 
 /// 新しい記録の `stop_signal` の初期値（config の値。`RUNTIME_DEFAULT` は `SIGTERM`）。
@@ -221,8 +226,11 @@ impl ContainerRecord {
     /// `reason` は `exit_reason` で導く（`Completed`・`Error`・`OOMKilled`）。
     ///
     /// **スタブの明示（REPAIR-3・CRI-2）**: 次の項目は返せる情報源が無く、空・`None` のまま。
-    /// - `image_ref`・`image_id`: `CriRuntimeService` が `ImageStore` を持たない。将来は CreateContainer 時に
-    ///   `ImageStore` で解決して記録へ保持した digest 等を返す（未注入・未解決は空のまま）。
+    /// - `image_ref`・`image_id`（#2831）: `BundleProvider` が報告した CreateContainer 時の解決結果を返す。
+    ///   `image_id` は image ID（`sha256:<config digest>`。`PullImageResponse.image_ref` と同じ）、`image_ref` は在庫の
+    ///   `repo_digests[0]`（無ければ image ID）。報告の無い経路（スタブ・外部 bundle）は両方空（digest を推測しない。
+    ///   containerd は空を返さない本リポ固有の挙動）。containerd main cfb18c4 は Status の時点で在庫を引き直すが、
+    ///   本実装は create 時のスナップショットを返し続ける（既知の差。`docs/design/cri-config-acceptance.md`）。
     /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。
     ///   `applied_user`）を返す。報告の無い経路（スタブ等）と、補助グループが空で実プロセスのグループと一致を保証できない場合は `None`。`supplemental_groups` は重複除去後の最終の
     ///   集合で、主 gid は自動では含めない（containerd は含めることがある既知の差）。`stop_signal` は実際に
@@ -256,7 +264,10 @@ impl ContainerRecord {
             finished_at: self.finished_at_nanos,
             exit_code: self.exit_code.unwrap_or(0),
             image: self.config.image.clone(),
-            image_ref: String::new(),
+            image_ref: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.image_ref().to_owned()),
             reason: exit_reason(self.state, self.exit_code, self.termination).to_owned(),
             message: String::new(),
             labels: self.config.labels.clone(),
@@ -267,7 +278,10 @@ impl ContainerRecord {
                 .as_ref()
                 .map_or_else(|| self.config.log_path.clone(), |p| p.as_str().to_owned()),
             resources,
-            image_id: String::new(),
+            image_id: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
             // 補助グループが明示（非空）のときだけ報告する。空の指定は core が `setgroups(0)` で消去するが、
             // `RootlessSingleId` のように user namespace が `setgroups` を禁じる構成では起動元の補助グループを
             // 現状維持して起動を続ける（`KeptSetgroupsDenied`）。cri 側では実際に残るグループを知り得ず、
@@ -292,19 +306,28 @@ impl ContainerRecord {
         }
     }
 
-    /// ListContainers 応答用の変換（Status の部分集合。`image_ref`・`image_id` は TASK-59 まで空）。
+    /// ListContainers 応答用の変換（Status の部分集合）。
+    ///
+    /// `image_ref`・`image_id` はどちらも image ID（containerd main cfb18c4 の `toCRIContainer` と同じ）。
+    /// 報告の無い経路は空（#2831）。
     pub(super) fn to_summary(&self, id: &str) -> v1::Container {
         v1::Container {
             id: id.to_owned(),
             pod_sandbox_id: self.pod_sandbox_id.clone(),
             metadata: self.config.metadata.clone(),
             image: self.config.image.clone(),
-            image_ref: String::new(),
+            image_ref: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
             labels: self.config.labels.clone(),
             annotations: self.config.annotations.clone(),
-            image_id: String::new(),
+            image_id: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
         }
     }
 }

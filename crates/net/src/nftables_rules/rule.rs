@@ -38,15 +38,15 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - `NFTA_RULE_POSITION`（挿入位置の指定）・`NFTA_RULE_USERDATA`・`NLM_F_REPLACE`
-//! - ルールハンドルの取得経路。NEWRULE の `NLM_F_ECHO` 応答の回収と GETRULE dump は、バッチ層
-//!   （`nftables_batch`）が範囲内の `NLMSG_ERROR` 以外を `DataLoss` にするため未対応。
-//!   [`NftRuleHandle::from_rule_attrs`] は将来その経路から使う純デコーダ
+//! - GETRULE dump によるハンドルの再照会。ハンドルの取得は [`RuleCreate::build_echo`]（NEWRULE の
+//!   `NLM_F_ECHO` 応答。バッチ層 `nftables_batch` の ACK 判定が回収し、[`NftRuleHandle::from_rule_attrs`]
+//!   で復号する。NET-3・CRI-2・#2839）だけで、プロセス再起動後のハンドル復元は無い
 
 use std::num::NonZeroU64;
 
 use super::NftRuleExprs;
 use crate::error::{NetError, NetErrorCode};
-use crate::netlink::{AttrIter, NLM_F_APPEND, NLM_F_CREATE, NlMsgBuilder};
+use crate::netlink::{AttrIter, NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NlMsgBuilder};
 use crate::nftables_batch::{
     NFNL_SUBSYS_NFTABLES, NfGenMsg, NftFamily, NftName, nfnl_msg_type, start_nft_request,
 };
@@ -107,6 +107,19 @@ impl RuleCreate {
     /// REQUEST / ACK 付きで組み立てる。`NftBatch::push_with` へそのまま渡せる。
     pub fn build(&self, seq: u32) -> Result<NlMsgBuilder, NetError> {
         let mut b = start_nft_request(NFT_MSG_NEWRULE, self.flags(), self.family, seq)?;
+        self.put_attrs(&mut b)?;
+        Ok(b)
+    }
+
+    /// `build` に `NLM_F_ECHO` を足して組み立てる（NET-3・CRI-2・#2839）。
+    ///
+    /// カーネルは追加したルールを NEWRULE の応答（echo）として送り元へ返し、そのペイロードに採番した
+    /// `NFTA_RULE_HANDLE` が入る。バッチ層（`NftBatch::push_with`）は echo 付きの本体を記録し、
+    /// ACK 判定（`NftBatchAck::rule_handle`）が応答からハンドルを取り出す。ハンドルを必要としない
+    /// 呼び出し元は `build` を使う（既定は変えない）。
+    pub fn build_echo(&self, seq: u32) -> Result<NlMsgBuilder, NetError> {
+        let mut b =
+            start_nft_request(NFT_MSG_NEWRULE, self.flags() | NLM_F_ECHO, self.family, seq)?;
         self.put_attrs(&mut b)?;
         Ok(b)
     }
@@ -270,6 +283,24 @@ mod tests {
         );
         assert_eq!(NftRuleExprs::decode(e).expect("decode"), exprs());
         assert!(it.next().is_none());
+    }
+
+    /// NET-3・REPAIR-2: `build_echo` は `build` と同じ本体に `NLM_F_ECHO`（0x08）だけを足す。
+    #[test]
+    fn build_echo_adds_only_echo_flag() {
+        let r = rule();
+        let plain = r.build(7).expect("build").finish().expect("finish");
+        let echo = r.build_echo(7).expect("echo").finish().expect("finish");
+        let hp = NlMsgIter::new(&plain).next().expect("one").expect("msg");
+        let he = NlMsgIter::new(&echo).next().expect("one").expect("msg");
+        assert_eq!(hp.header().flags(), 0x0001 | 0x0004 | 0x0400 | 0x0800);
+        assert_eq!(
+            he.header().flags(),
+            0x0001 | 0x0004 | 0x0008 | 0x0400 | 0x0800
+        );
+        assert_eq!(he.header().msg_type(), 0x0a06);
+        assert_eq!(he.header().seq(), 7);
+        assert_eq!(hp.payload(), he.payload());
     }
 
     /// NET-11: encode は build と同じ nfgenmsg・属性を追記する。

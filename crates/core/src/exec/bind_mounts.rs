@@ -1325,7 +1325,7 @@ fn check_place_not_protected(
             targets.extend(
                 mounts_under(mounts, chain_path)
                     .into_iter()
-                    .map(|(id, _)| id),
+                    .map(|(id, _, _)| id),
             );
         }
         for target in &targets {

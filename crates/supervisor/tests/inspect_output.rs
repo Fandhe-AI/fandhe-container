@@ -24,6 +24,8 @@ use fandhe_container_supervisor::inspect::inspect;
 enum V {
     Null,
     Num(i64),
+    /// 真偽値(`rootReadonly` 用。#2828)。
+    Bool(bool),
     Str(String),
     /// 入れ子のオブジェクト（`auditCoverage` 用。出現順を保つ。SEC-4・#2027）。
     Obj(Vec<(String, V)>),
@@ -55,6 +57,18 @@ fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
             b'"' => V::Str(parse_str(b, i)?),
             b'{' => V::Obj(parse_object(b, i)?),
             b'[' => V::Arr(parse_array(b, i)?),
+            b't' | b'f' => {
+                let (lit, val): (&[u8], bool) = if peek(b, *i)? == b't' {
+                    (b"true", true)
+                } else {
+                    (b"false", false)
+                };
+                if b.get(*i..*i + lit.len()) != Some(lit) {
+                    return Err(format!("invalid literal at {}", *i));
+                }
+                *i += lit.len();
+                V::Bool(val)
+            }
             b'n' => {
                 if b.get(*i..*i + 4) != Some(b"null".as_slice()) {
                     return Err(format!("invalid literal at {}", *i));
@@ -206,7 +220,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 15] = [
+const ORDERED_KEYS: [&str; 16] = [
     "id",
     "status",
     "pid",
@@ -222,6 +236,7 @@ const ORDERED_KEYS: [&str; 15] = [
     "idMapping",
     "explicitStop",
     "capabilities",
+    "rootReadonly",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -381,6 +396,10 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         }
         other => panic!("capabilities: expected object or null, got {other:?}"),
     }
+    assert!(
+        matches!(m.get("rootReadonly"), Some(V::Null | V::Bool(_))),
+        "rootReadonly must be null or bool"
+    );
     match m.get("idMapping") {
         Some(V::Null) => {}
         Some(V::Obj(fields)) => {
@@ -547,6 +566,33 @@ fn cli1_2775_capabilities_are_reported() {
     // 番号順（CAP_DAC_OVERRIDE が先頭、CAP_SETFCAP が末尾）。
     assert_eq!(expected.first(), Some(&s("CAP_DAC_OVERRIDE")));
     assert_eq!(expected.last(), Some(&s("CAP_SETFCAP")));
+}
+
+/// CLI-1・SUP-12・#2828: 実効の `root.readonly` は `true` / `false` で出し、記録が無ければ `null`（推測しない）。
+#[test]
+fn cli1_2828_root_readonly_is_reported() {
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+    };
+    let iso = LaunchIsolationRecord::from_parts(
+        RootIdentity::new(44, 1234),
+        RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)]).unwrap(),
+    );
+    let none = record(ContainerStatus::created(cid("c"), None), 1);
+    assert_eq!(
+        render_map(&FakeStore(none.clone()), "c")["rootReadonly"],
+        V::Null
+    );
+    let legacy = none.clone().with_launch_isolation(iso.clone());
+    assert_eq!(render_map(&FakeStore(legacy), "c")["rootReadonly"], V::Null);
+    for ro in [true, false] {
+        let rec = none
+            .clone()
+            .with_launch_isolation(iso.clone().with_root_readonly(ro));
+        let m = render_map(&FakeStore(rec), "c");
+        assert_schema(&m);
+        assert_eq!(m["rootReadonly"], V::Bool(ro));
+    }
 }
 
 /// SUP-9・#2601: 明示 stop の記録は `stopped` のときだけ `"recorded"`、それ以外・既定は `"not_recorded"`。
@@ -909,7 +955,7 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 15] = [
+    const KEYS: [&str; 16] = [
         "auditCoverage",
         "bundle",
         "capabilities",
@@ -923,6 +969,7 @@ mod linux {
         "pid",
         "restartCount",
         "revision",
+        "rootReadonly",
         "status",
         "supervisorPid",
     ];

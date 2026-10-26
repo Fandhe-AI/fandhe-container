@@ -269,7 +269,15 @@ fn running_container(tag: &str, pid: u32) -> Env {
         ),
         &mut out,
     );
-    assert_eq!(ex.exit_code(), 0);
+    // 失敗時の原因（TIMEOUT か ResourceExhausted か等）を見分けられるよう stderr を assert の文言へ含める（#2834）。
+    let mut err = Vec::new();
+    ex.write_stderr(&mut err).unwrap();
+    assert_eq!(
+        ex.exit_code(),
+        0,
+        "create failed: {}",
+        String::from_utf8_lossy(&err)
+    );
     let id = ContainerId::new(tag).unwrap();
     let store = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap();
     let launcher: Arc<dyn ProcessLauncher> = Arc::new(PidLauncher(pid));

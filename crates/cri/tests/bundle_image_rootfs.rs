@@ -591,6 +591,49 @@ fn cri2_image_store_resolves_tags() {
     assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
 }
 
+/// 在庫の記録の `repo_digests[0]` が解決結果の digest 参照になり、image ID は config digest になる（CRI-2・OCI-1。#2831）。
+#[test]
+fn cri2_prepare_reports_resolved_image_with_digest_ref() {
+    let env = pulled_env("store-digest-ref", CONFIG_SECTION);
+    let digest_ref = format!("docker.io/library/alpine@sha256:{}", "d".repeat(64));
+    let store = Arc::new(InMemoryImageStore::new());
+    store
+        .upsert(
+            ImageRecord::new(
+                env.image_id.clone(),
+                vec!["docker.io/library/alpine:3.20".to_owned()],
+                vec![digest_ref.clone()],
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let pod = PodSandboxConfig::default();
+    let c = container("docker.io/library/alpine:3.20");
+    let prepared = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &c))
+        .expect("prepare");
+    let image = prepared.image().expect("image reported");
+    assert_eq!(image.id_str(), env.image_id);
+    assert_eq!(image.image_ref(), digest_ref);
+}
+
+/// 在庫なしで image ID を指定したときは image_ref も image ID（CRI-2・OCI-1。#2831）。
+#[test]
+fn cri2_prepare_reports_image_id_without_store() {
+    let env = pulled_env("no-store-ref", CONFIG_SECTION);
+    let p = env.provider();
+    let pod = PodSandboxConfig::default();
+    let c = container(&env.image_id);
+    let prepared = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &c))
+        .expect("prepare");
+    let image = prepared.image().expect("image reported");
+    assert_eq!(image.id_str(), env.image_id);
+    assert_eq!(image.image_ref(), env.image_id);
+}
+
 /// 短縮名（`alpine:3.20`）は PullImage と同じ規則で正規化したタグ（`docker.io/library/alpine:3.20`）として登録された
 /// 記録へ解決される（CRI-2・CRI-3・CRI-4。#2592）。
 #[test]

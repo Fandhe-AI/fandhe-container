@@ -75,6 +75,18 @@
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
 //!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
 //!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
+//! - シナリオ X（launch 経路の entrypoint の実行失敗。#2763・SEC-4・CORE-5・REPAIR-12）: 3 ケースの `start` が、期待する ErrorCode で
+//!   失敗し、状態が Created のまま・`last_launch_may_have_left_process() == false`・`confirm_no_process` が `Ok`・子が残らず、
+//!   専用の記録先に監査の記録が 0 件（違反ではない失敗は記録しない）であることを照合する。メッセージは `Exec` 段の固定文言で、
+//!   `R` の前後の経路は公開 API から区別できない（成功行の `phase` は設計上の経路の表示）。
+//!   (1) ローダ欠落: rootfs 内の `PT_INTERP` のローダを消すと `NotFound`。ローダは `R` の前の `prepare_exec_child`
+//!   （`pin_interpreter`）で `O_PATH` で開かれ、不在はそこで拒否されるため、経路は `R` の前（`E NOT_FOUND`）である。実カーネルで
+//!   `R` の後に `ENOENT` を決定的に起こす手段は無く、`R` の後の `NOT_FOUND` は単体試験
+//!   `sec4_2716_launch_fails_on_execveat_failure_after_ready_and_on_silence_after_ready` が担う。
+//!   (2) 0644: 実行ビットの無いエントリポイントは launch では事前検査が無く、`R` の後の `execveat` が `EACCES` →
+//!   `PermissionDenied`（`X PERMISSION_DENIED`）。(3) ゴミのバイト列: `#!` でも ELF でもない 0755 のファイルは `execveat` が
+//!   `ENOEXEC` → `InvalidArgument`（`X INVALID_ARGUMENT`）。各ケースの固有の成功行
+//!   `production_launcher: scenario=exec-failure case=<..> code=<..> phase=<..> ...` を CI が完全一致で照合する
 //! - シナリオ I・O の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）で
 //!   `process.user` 1000:1000・`additionalGids` [3000, 2000] を指定すると、コンテナ内の `Groups:` が `2000,3000`、ホストから見た
 //!   `/proc/<pid>/status` の `Groups:` が subgid 先頭 + 1999 / + 2999 になる（成功行 `scenario=groups-applied gids=2000,3000
@@ -882,6 +894,7 @@ mod linux {
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
         scenario_s_entrypoint_violation_recorded(&env, container, tag);
+        scenario_x_exec_failures(&env, container, tag);
         scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
@@ -2908,6 +2921,153 @@ mod linux {
         println!(
             "production_launcher: entrypoint violation recorded once and launch refused (scenario=S)"
         );
+    }
+
+    /// シナリオ X（#2763・SEC-4・CORE-5・REPAIR-12）: launch の entrypoint の実行失敗（ローダ欠落・0644・ゴミのバイト列）が、
+    /// ErrorCode つきの起動失敗になり、何も残さず監査にも記録されない。
+    ///
+    /// ケースごとに専用の記録先を持つ launcher を作る（`scenarios()` 共有の `MemSink` は他のシナリオの記録が溜まり、
+    /// 0 件を照合できない）。cgroup の join は `container` の `join_hook` を使う（シナリオ S と同じ）。
+    fn scenario_x_exec_failures(env: &Env, container: &Arc<ContainerCgroup>, tag: u32) {
+        struct RecSink(std::sync::Mutex<Vec<AuditRecord>>);
+        impl AuditSink for RecSink {
+            fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(record.clone());
+                Ok(())
+            }
+        }
+        /// 呼び出し側（supervisor / CLI / CRI）へ返るメッセージは、`R` の前の拒否も `R` の後の `execveat` の失敗も
+        /// `Exec` 段の固定文言に揃う（パス・errno を載せない。`launch_error`）。経路（`phase`）は公開 API からは
+        /// 見分けられないため、設計上の経路を成功行の表示として記す（`R` の後の経路は単体試験が別に固定する）。
+        const EXEC_STAGE_MESSAGE: &str = "container launch failed in the Exec stage";
+
+        // (case, 期待する ErrorCode, 設計上の経路の名前)
+        let cases: [(&str, ErrorCode, &str); 3] = [
+            ("loader-missing", ErrorCode::NotFound, "prepare"),
+            ("not-executable", ErrorCode::PermissionDenied, "execveat"),
+            ("garbage", ErrorCode::InvalidArgument, "execveat"),
+        ];
+        for (index, (case, expected, phase)) in cases.into_iter().enumerate() {
+            let sink = Arc::new(RecSink(std::sync::Mutex::new(Vec::new())));
+            let join_container = Arc::clone(container);
+            let launcher = ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::clone(&sink) as Arc<dyn AuditSink>)
+                .cgroup_join_source(move || join_container.join_hook())
+                .build()
+                .expect("build the launcher with a recording sink");
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+
+            let bundle = Bundle::new(&format!("x{index}"));
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            let root = bundle.rootfs();
+            let entry = match case {
+                "loader-missing" => {
+                    // 動的ローダを rootfs から消す。ローダのパスは試験バイナリの `PT_INTERP`（静的リンクなら前提欠如で失敗）。
+                    let exe = std::fs::read(std::env::current_exe().expect("current_exe"))
+                        .expect("read the test binary");
+                    let interp = real_entry::elf_interp(&exe)
+                        .expect("the test binary must be dynamically linked (PT_INTERP)");
+                    std::fs::remove_file(root.join(interp.trim_start_matches('/')))
+                        .expect("remove the loader from the rootfs");
+                    "/probe"
+                }
+                "not-executable" => {
+                    std::fs::copy(root.join("probe"), root.join("probe-noexec"))
+                        .expect("copy probe");
+                    std::fs::set_permissions(
+                        root.join("probe-noexec"),
+                        std::fs::Permissions::from_mode(0o644),
+                    )
+                    .expect("chmod 0644");
+                    "/probe-noexec"
+                }
+                _ => {
+                    std::fs::write(root.join("garbage"), b"this is not an executable image\n")
+                        .expect("write the garbage entrypoint");
+                    std::fs::set_permissions(
+                        root.join("garbage"),
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .expect("chmod 0755");
+                    "/garbage"
+                }
+            };
+            let config = json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs", "readonly": false},
+                "hostname": HOSTNAME,
+                "process": {
+                    "user": {"uid": 0, "gid": 0},
+                    "args": [entry],
+                    "env": ["PATH=/", "TERM=dumb", format!("LD_LIBRARY_PATH={ld}")],
+                    "cwd": "/"
+                },
+                "mounts": [],
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                ]}
+            });
+            std::fs::write(
+                bundle.dir.join("config.json"),
+                serde_json::to_vec(&config).expect("serialize config"),
+            )
+            .expect("write config.json");
+            let id = ContainerId::new(format!("plx{index}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let err = match start(
+                &env.store,
+                &env.recorder,
+                &launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Ok(started) => {
+                    let _ = started.into_parts().1.terminate(timeout());
+                    panic!("{case}: the launch must fail");
+                }
+                Err(e) => e,
+            };
+            assert_ne!(err.code(), ErrorCode::Timeout, "{case}: {}", err.message());
+            assert_eq!(err.code(), expected, "{case}: {}", err.message());
+            assert_eq!(err.message(), EXEC_STAGE_MESSAGE, "{case} ({phase})");
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created, "{case}");
+            assert!(
+                env.store
+                    .get(&GetStateRequest::new(id.clone()))
+                    .expect("get state")
+                    .launch_isolation()
+                    .is_none(),
+                "{case}: a failed launch must leave no launch_isolation"
+            );
+            assert!(!launcher.last_launch_may_have_left_process(), "{case}");
+            launcher
+                .confirm_no_process(&id, timeout())
+                .unwrap_or_else(|e| panic!("{case}: confirm_no_process: {e:?}"));
+            let records = sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert!(
+                records.is_empty(),
+                "{case}: a non-violation failure must not be audited: {records:?}"
+            );
+            drop(launcher);
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "{case}: no process may remain: {:?}",
+                children_of_self()
+            );
+            println!(
+                "production_launcher: scenario=exec-failure case={case} code={:?} phase={phase} state=created audit=0 children=0",
+                err.code()
+            );
+        }
     }
 
     /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の

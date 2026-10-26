@@ -100,7 +100,7 @@ fn copy_into(rootfs: &Path, host: &Path, mode: u32) {
 }
 
 /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` で検査する。
-fn elf_interp(exe: &[u8]) -> Option<String> {
+pub fn elf_interp(exe: &[u8]) -> Option<String> {
     let u16_at = |o: usize| Some(u16::from_le_bytes(exe.get(o..o + 2)?.try_into().ok()?));
     let u32_at = |o: usize| Some(u32::from_le_bytes(exe.get(o..o + 4)?.try_into().ok()?));
     let u64_at = |o: usize| Some(u64::from_le_bytes(exe.get(o..o + 8)?.try_into().ok()?));

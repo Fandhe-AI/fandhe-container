@@ -656,7 +656,7 @@ fn options_timeout() -> TraitError {
 /// で create が止まらない)。期限切れの作業スレッドは CLI の終了で消え、後から文書が残っても状態が無いので次の create /
 /// delete が掃除する(別の世代の文書は、掃除がロックと状態の不在確認の下で行われるため消えない)。
 ///
-/// - 同じ ID の状態が既にある(または確認できない)なら何もしない(core の create が拒否し、既存コンテナの文書は触らない)
+/// - 同じ ID の状態が既にある(または確認できない)なら `ALREADY_EXISTS` で拒否する(既存コンテナの文書は触らない)
 /// - 状態が無いのに文書が残っている(前のコンテナの残骸)なら先に消す。指定が空でもこの掃除は行う
 /// - 指定が空なら書かない(文書が無ければ supervisor は既定値で動く)
 /// - 状態ルートを持たない backend(非 Linux の plugin 経路)で指定があれば `UNIMPLEMENTED`(黙って捨てない)
@@ -681,8 +681,14 @@ fn prepare_options_file(
     let prepared = fandhe_container_supervisor::supervisor_log::run_bounded(
         move || -> Result<_, TraitError> {
             let lock = options_store::acquire_lock(&job_root, &id, OPTIONS_LOCK_WAIT)?;
+            // 同じ ID の状態が既にある(または確認できない)なら拒否する。ここで見送って core の create に任せると、
+            // 確認の後に並行 delete が状態を消したとき、世代注釈つきの新しい記録に対応する文書が無い(または前の世代の
+            // 文書が残る)状態で create が成功してしまう(SUP-12・SEC-1・#2713)。
             if !super::stop_delete::id_is_still_deleted(&job_root, &id) {
-                return Ok((lock, None));
+                return Err(TraitError::new(
+                    fandhe_container_core::traits::ErrorCode::AlreadyExists,
+                    "the container already exists or its state cannot be checked",
+                ));
             }
             options_store::remove(&job_root, &id)?;
             if document.is_empty() {

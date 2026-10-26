@@ -82,7 +82,18 @@ pub(super) fn labels_of(options: &CreateOptionArgs) -> Result<Annotations, Trait
         .iter()
         .map(|s| Label::parse(s))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Labels::resolve(labels)?.annotations().clone())
+    let annotations = Labels::resolve(labels)?.annotations().clone();
+    // 予約キー(作成世代)は CLI が足す。利用者の指定を受けると、文書が無いのに世代だけが記録され start が拒否される(#2713)。
+    if annotations
+        .get(fandhe_container_supervisor::container_options::store::GENERATION_ANNOTATION)
+        .is_some()
+    {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the label key is reserved",
+        ));
+    }
+    Ok(annotations)
 }
 
 #[cfg(test)]
@@ -178,5 +189,16 @@ mod tests {
         let l = labels_of(&a).expect("labels");
         assert_eq!(l.get("tier"), Some("db"));
         assert_eq!(l.get("flag"), Some(""));
+    }
+
+    /// SUP-12・SEC-1(#2713): 作成世代の予約キーは利用者の label として受けない。
+    #[test]
+    fn sup12_create_options_rejects_reserved_generation_label() {
+        let a = CreateOptionArgs {
+            labels: vec!["io.fandhe.container.options-generation=x".into()],
+            ..args()
+        };
+        let e = labels_of(&a).expect_err("reserved");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 }

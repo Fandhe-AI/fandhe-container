@@ -148,6 +148,15 @@ pub trait StartDeps {
         None
     }
 
+    /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
+    ///
+    /// `Some` のとき入口は、手順 3 で観測した記録の世代がこれと一致しない start を拒否する。2c の読み取りの後に同じ ID が
+    /// 削除・再作成されても、前の世代の env・ulimit・`--ipc=host` 等で新しいコンテナを起動しない(SEC-1・SUP-12・#2713)。
+    /// 既定は `None`(照合しない。フェイクの [`StartDeps`] は上書きしなくてよい)。
+    fn expected_options_generation(&self) -> Option<Option<String>> {
+        None
+    }
+
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
     fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError>;
 
@@ -1247,6 +1256,24 @@ fn prepare_start(
             Cleanup::Nothing,
         );
     }
+    // 2c で文書を照合した作成世代と、ここで観測した記録の世代が違えば、2c の後に同じ ID が削除・再作成されている。
+    // 観測した記録は後続の世代の照合(cgroup の instance)で予約時点の記録と結びつくため、ここで一致を確かめれば
+    // 前の世代のオプションを新しいコンテナへ適用しない(SEC-1・SUP-12・#2713)。
+    if let Some(expected) = deps.expected_options_generation() {
+        let actual = observed
+            .annotations()
+            .get(crate::container_options::store::GENERATION_ANNOTATION)
+            .map(str::to_owned);
+        if actual != expected {
+            return fail(
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the container was recreated after its options were read; retry start",
+                ),
+                Cleanup::Nothing,
+            );
+        }
+    }
     // 4: 副作用なしで launcher の可用性を確かめる。
     if let Err(e) = deps.check_launcher_available() {
         return fail(e, Cleanup::Nothing);
@@ -2108,6 +2135,8 @@ mod linux {
         /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
         /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
         container_options_error: Option<TraitError>,
+        /// 手順 2c で文書を照合した状態記録の作成世代(`with_options_generation`。`expected_options_generation`)。
+        options_generation: Option<Option<String>>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2221,6 +2250,7 @@ mod linux {
                 audit_policy: AuditCoveragePolicy::default(),
                 container_options: ContainerOptions::default(),
                 container_options_error: None,
+                options_generation: None,
             }
         }
 
@@ -2229,6 +2259,13 @@ mod linux {
         #[must_use]
         pub fn with_container_options_error(mut self, error: TraitError) -> Self {
             self.container_options_error = Some(error);
+            self
+        }
+
+        /// 手順 2c で文書を照合した作成世代を覚えさせる(手順 3 で観測した記録の世代と照合する。SEC-1・#2713)。
+        #[must_use]
+        pub fn with_options_generation(mut self, recorded: Option<String>) -> Self {
+            self.options_generation = Some(recorded);
             self
         }
 
@@ -2339,6 +2376,10 @@ mod linux {
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を
         /// fork の前に拒否するが、cgroup の連鎖（取り消せないスコープの追記）の前に止めるためここで前倒しする（CORE-5）。
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
+        fn expected_options_generation(&self) -> Option<Option<String>> {
+            self.options_generation.clone()
+        }
+
         fn check_launcher_available(&self) -> Result<(), TraitError> {
             // 起動オプション文書が読めない・壊れているときは、cgroup にも launch にも触れずに止める(SUP-12・#2713)。
             if let Some(e) = &self.container_options_error {
@@ -2631,20 +2672,27 @@ mod linux {
     /// ストアの `host_state_root()`(検査済み。CLI の create が文書を書いた場所と同じ)を優先する。読み取りは状態ルートの
     /// I/O が止まりうるため作業スレッドで行い `until` まで待つ(REPAIR-5)。成功時は `join` でスレッドの終了まで確認してから
     /// 返す。期限超過は `Timeout`(作業スレッドは残るが、呼び出し側は手順 4 で止まり launch しない)。
-    fn prepare_container_options(
+    ///
+    /// 戻り値の 2 つ目は、文書を照合した状態記録の作成世代(記録が無い・世代なしは `None`)。呼び出し側が deps に覚えさせ、
+    /// 手順 3 の観測と照合する(SEC-1)。
+    fn prepare_container_options_with_generation(
         store: &Arc<dyn StateStore>,
         root: &std::path::Path,
         id: &ContainerId,
         until: Option<Instant>,
-    ) -> Result<Option<ContainerOptions>, TraitError> {
+    ) -> Result<(Option<ContainerOptions>, Option<String>), TraitError> {
         let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
         let store = Arc::clone(store);
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("fandhe-supopt".into())
             .spawn(move || {
-                let result = read_generation_checked_document(&store, &root, &id)
-                    .and_then(|doc| doc.map(|d| d.to_container_options()).transpose());
+                let result =
+                    read_generation_checked_document(&store, &root, &id).and_then(|(doc, rec)| {
+                        doc.map(|d| d.to_container_options())
+                            .transpose()
+                            .map(|o| (o, rec))
+                    });
                 let _ = tx.send(result);
             })
             .map_err(|_| {
@@ -2667,6 +2715,17 @@ mod linux {
         }
     }
 
+    /// 試験用の薄い入口(世代を捨てる)。
+    #[cfg(test)]
+    fn prepare_container_options(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+    ) -> Result<Option<ContainerOptions>, TraitError> {
+        prepare_container_options_with_generation(store, root, id, until).map(|(o, _)| o)
+    }
+
     /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
     ///
     /// 記録が無い(`NotFound`)ときは文書を採用しない(後続の手順が記録の不在を報告する)。ほかの取得失敗はそのまま返す。
@@ -2674,8 +2733,13 @@ mod linux {
         store: &Arc<dyn StateStore>,
         root: &std::path::Path,
         id: &ContainerId,
-    ) -> Result<Option<crate::container_options::document::ContainerOptionsDocument>, TraitError>
-    {
+    ) -> Result<
+        (
+            Option<crate::container_options::document::ContainerOptionsDocument>,
+            Option<String>,
+        ),
+        TraitError,
+    > {
         use crate::container_options::store as options;
         let doc = options::read(root, id)?;
         let recorded = match store.get(&GetStateRequest::new(id.clone())) {
@@ -2683,10 +2747,11 @@ mod linux {
                 .annotations()
                 .get(options::GENERATION_ANNOTATION)
                 .map(str::to_owned),
-            Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok((None, None)),
             Err(e) => return Err(e),
         };
-        options::select_document(doc, recorded.as_deref())
+        let selected = options::select_document(doc, recorded.as_deref())?;
+        Ok((selected, recorded))
     }
 
     /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
@@ -2889,11 +2954,17 @@ mod linux {
         // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
         // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
         // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
-        let deps = match prepare_container_options(&store, &args.root, &args.id, deadline) {
-            Ok(Some(options)) => Box::new(deps.with_container_options(options)),
-            Ok(None) => deps,
-            Err(e) => Box::new(deps.with_container_options_error(e)),
-        };
+        let deps =
+            match prepare_container_options_with_generation(&store, &args.root, &args.id, deadline)
+            {
+                // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
+                Ok((Some(options), recorded)) => Box::new(
+                    deps.with_container_options(options)
+                        .with_options_generation(recorded),
+                ),
+                Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
+                Err(e) => Box::new(deps.with_container_options_error(e)),
+            };
         let running = match run_start_until(
             deps,
             &store,

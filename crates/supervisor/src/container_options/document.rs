@@ -50,6 +50,8 @@ const SHM_RECORD_MAX: usize = 64;
 const TMPFS_RECORD_MAX: usize = 4096;
 /// 作成世代の識別子の最大バイト数(#2713)。
 pub const GENERATION_MAX: usize = 64;
+/// 作成世代の記録(`gen <len>\n<値>\n`)の最大バイト数(後から足す分を、全体の上限の検査で確保する)。
+const GENERATION_RECORD_RESERVE: usize = 4 + 1 + 2 + 1 + GENERATION_MAX + 1;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
 const HEADER_LINE_MAX: usize = 24;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
@@ -118,6 +120,11 @@ impl ContainerOptionsDocument {
             generation: None,
         };
         doc.check_record_lengths()?;
+        // 符号化後の文書全体(見出し・区切りを含む)が、supervisor の読み取りの上限に作成世代の記録の分を足しても
+        // 収まることを確かめる。create が書けても start の読み取りが拒否する文書を作らない(REPAIR-2・#2713)。
+        if doc.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
         // 変換に通して検証する(変換結果は捨てる。保持するのは生の文字列)。
         doc.to_container_options()?;
         Ok(doc)

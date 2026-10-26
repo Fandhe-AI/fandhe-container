@@ -43,7 +43,7 @@ pub(super) struct CreateOptionArgs {
     pub(super) env: Vec<String>,
     /// `--env-file <path>`(最大 [`MAX_CREATE_ENV_FILES`] 件。CLI が非特権のまま読む)。
     pub(super) env_files: Vec<PathBuf>,
-    /// `--label <key>[=<value>]`(最大 `ANNOTATIONS_MAX_ENTRIES` 件)。
+    /// `--label <key>[=<value>]`(最大 `ANNOTATIONS_MAX_ENTRIES` − 1 件。世代の注釈の分を空ける)。
     pub(super) labels: Vec<String>,
     /// `--ipc <private|shareable|host>`(1 回まで)。
     pub(super) ipc: Option<String>,
@@ -343,7 +343,8 @@ fn push_option(
             options.env_files.push(PathBuf::from(value));
         }
         RepeatableOption::Label => {
-            if options.labels.len() >= ANNOTATIONS_MAX_ENTRIES {
+            // 作成世代の注釈(CLI が足す 1 件)の分を確保する(#2713)。
+            if options.labels.len() >= ANNOTATIONS_MAX_ENTRIES - 1 {
                 return Err(UsageError);
             }
             options.labels.push(text(value)?);

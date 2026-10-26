@@ -17,7 +17,7 @@
 //!
 //! # 残余(REPAIR-3)
 //!
-//! 同じ ID の `create` と `delete` は ID 単位のロック(`@container-options/@lock-<id>`。[`acquire_lock`])で直列化する
+//! 同じ ID の `create` と `delete` は ID 単位のロック(`@container-options/@locks/<id>`。ID 名をそのまま使い、接頭辞でファイル名の上限を狭めない。[`acquire_lock`])で直列化する
 //! (並行 create で成功した側の文書を消さない)。plugin-cri の create は残骸を掃除しない
 //! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が残りうるが、文書は作成世代
 //! (`gen` レコード)を持ち、状態記録の annotations([`GENERATION_ANNOTATION`])と一致しない文書は採用しない
@@ -47,6 +47,9 @@ fn io_failed(_: std::io::Error) -> TraitError {
 pub fn options_dir(root: &Path) -> PathBuf {
     root.join(OPTIONS_DIR_NAME)
 }
+
+/// ロックファイルを置くサブディレクトリ名(`@` は ID に使えないので文書名と衝突しない)。
+pub const LOCKS_DIR_NAME: &str = "@locks";
 
 /// 文書ファイルのパス。
 pub fn options_path(root: &Path, id: &ContainerId) -> PathBuf {
@@ -108,6 +111,23 @@ mod imp {
         Ok(dir)
     }
 
+    /// `<root>/@container-options/@locks/` を用意する(文書ディレクトリと同じ検査)。
+    ///
+    /// ロックファイルは ID 名そのままで置く。接頭辞を付けると `ContainerId` の長さ上限(255 バイト)を狭めてしまうため、
+    /// 文書とは別のディレクトリに分ける(SUP-12・#2713)。
+    fn ensure_lock_dir(root: &Path, uid: u32) -> Result<PathBuf, TraitError> {
+        let base = ensure_dir(root, uid)?;
+        let dir = base.join(LOCKS_DIR_NAME);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => sync_dir(&base)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_failed(e)),
+        }
+        let meta = std::fs::symlink_metadata(&dir).map_err(io_failed)?;
+        check_dir_meta(meta.is_dir(), meta.uid(), meta.mode(), uid)?;
+        Ok(dir)
+    }
+
     /// 文書を新規作成する(既存なら `AlreadyExists`)。0600・`O_EXCL`・`O_NOFOLLOW`。
     pub fn write_new(
         root: &Path,
@@ -152,7 +172,7 @@ mod imp {
         Ok(written)
     }
 
-    /// ID 単位の排他ロック(`<dir>/@lock-<id>`。`@` は ID に使えないので文書名と衝突しない)。
+    /// ID 単位の排他ロック(`<dir>/@locks/<id>`)。
     /// drop で解放する。ロックファイルは [`OptionsLock::remove_lock_file`] で消す(消さなければ残る)。
     #[derive(Debug)]
     pub struct OptionsLock {
@@ -182,14 +202,8 @@ mod imp {
         timeout: std::time::Duration,
     ) -> Result<OptionsLock, TraitError> {
         let uid = effective_uid()?;
-        let dir = ensure_dir(root, uid)?;
-        let path = dir.join(format!("@lock-{}", id.as_str()));
-        if path.file_name().is_none_or(|n| n.len() > 255) {
-            return Err(err(
-                ErrorCode::InvalidArgument,
-                "the container id is too long for the options lock",
-            ));
-        }
+        let dir = ensure_lock_dir(root, uid)?;
+        let path = dir.join(id.as_str());
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let file = OpenOptions::new()
@@ -541,8 +555,21 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Timeout);
         acquire_lock(&root, &id("c2"), short).expect("other id");
         first.remove_lock_file();
-        assert!(!options_dir(&root).join("@lock-c1").exists());
+        assert!(!options_dir(&root).join(LOCKS_DIR_NAME).join("c1").exists());
         acquire_lock(&root, &id("c1"), short).expect("after release");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SUP-12・#2713: 255 バイトの ID でも、ロックの接頭辞に狭められず create の準備(ロック・書き込み)が通る。
+    #[test]
+    fn sup12_options_lock_and_write_accept_max_length_id() {
+        let root = tmp("maxid");
+        let long = id(&"a".repeat(255));
+        let short = std::time::Duration::from_millis(50);
+        let lock = acquire_lock(&root, &long, short).expect("lock");
+        write_new(&root, &long, &doc()).expect("write");
+        assert!(read(&root, &long).expect("read").is_some());
+        lock.remove_lock_file();
         let _ = std::fs::remove_dir_all(&root);
     }
 

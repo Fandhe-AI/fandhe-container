@@ -15,10 +15,12 @@
 //!
 //! | #1473（TASK-169.4.2） | secrets / configs（[`secrets`]）。[`ContainerOptions::injected_files`] で core の注入仕様型へ変換 | core の `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化） |
 //!
+//! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
+//!
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
 //! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
 //! `--shm-size`・`--tmpfs`・secrets / configs・ulimit・env。#2625・#2713）は実装済み。CLI の `create` は
-//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs` を [`document`] の形で
+//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop` を [`document`] の形で
 //! 状態ルート配下の 0600 のファイル（[`store`]）へ書き、supervisor の `start` が読む（#2713）。
 //! label は create 時に core の状態記録（`CreateRequest::with_annotations`）へ直接書く。
 //!
@@ -64,6 +66,7 @@ pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
+use fandhe_container_core::capabilities::CapabilitySet;
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::injected_files::InjectedFileSet;
 use fandhe_container_core::oci_runtime::{LaunchIpcMode, LaunchOptions};
@@ -122,6 +125,8 @@ pub struct ContainerOptions {
     labels: Labels,
     mounts: MountOptions,
     injected: InjectedFileOptions,
+    /// `--cap-drop` で除く capability(狭める方向のみ。CLI-1・SEC-1・#2775)。
+    cap_drop: CapabilitySet,
 }
 
 impl ContainerOptions {
@@ -134,6 +139,19 @@ impl ContainerOptions {
     pub fn with_ulimits(mut self, ulimits: Vec<Ulimit>) -> Result<Self, TraitError> {
         self.rlimits = Rlimits::new(ulimits.into_iter().map(|u| u.rlimit()).collect())?;
         Ok(self)
+    }
+
+    /// `--cap-drop` の集合を設定する(CLI-1・SEC-1・#2775)。名前の検証・正規化は core の
+    /// `parse_drop_list` が済ませた集合を受ける。
+    #[must_use]
+    pub fn with_cap_drop(mut self, drop: CapabilitySet) -> Self {
+        self.cap_drop = drop;
+        self
+    }
+
+    /// `--cap-drop` の集合。
+    pub fn cap_drop(&self) -> CapabilitySet {
+        self.cap_drop
     }
 
     /// `--ipc` の指定を設定する（SUP-12・TASK-169.3。未指定は `Private`）。
@@ -240,6 +258,7 @@ impl ContainerOptions {
         LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)?
             .with_rlimits(self.rlimits.clone())
             .with_env(self.env.to_env_strings())
+            .map(|o| o.with_capability_drop(self.cap_drop))
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。

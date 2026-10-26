@@ -80,12 +80,19 @@ fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
     Ok(map)
 }
 
-/// `[{...},{...}]` 形式（要素はオブジェクトのみ・空配列は不可）を読む。
+/// `[{...},{...}]` または `["a","b"]` 形式（要素はオブジェクトか文字列。空配列 `[]` は `capabilities` 用）を読む。
 fn parse_array(b: &[u8], i: &mut usize) -> Result<Vec<V>, String> {
     expect(b, i, b'[')?;
     let mut out = Vec::new();
+    if peek(b, *i)? == b']' {
+        *i += 1;
+        return Ok(out);
+    }
     loop {
-        out.push(V::Obj(parse_object(b, i)?));
+        match peek(b, *i)? {
+            b'"' => out.push(V::Str(parse_str(b, i)?)),
+            _ => out.push(V::Obj(parse_object(b, i)?)),
+        }
         match peek(b, *i)? {
             b',' => *i += 1,
             b']' => {
@@ -199,7 +206,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 14] = [
+const ORDERED_KEYS: [&str; 15] = [
     "id",
     "status",
     "pid",
@@ -214,6 +221,7 @@ const ORDERED_KEYS: [&str; 14] = [
     "auditCoverage",
     "idMapping",
     "explicitStop",
+    "capabilities",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -349,6 +357,38 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         }
         other => panic!("explicitStop: expected string, got {other:?}"),
     }
+    match m.get("capabilities") {
+        Some(V::Null) => {}
+        Some(V::Obj(fields)) => {
+            let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                [
+                    "bounding",
+                    "effective",
+                    "permitted",
+                    "inheritable",
+                    "ambient"
+                ]
+            );
+            for (_, v) in fields {
+                let V::Arr(items) = v else {
+                    panic!("capabilities members must be arrays, got {v:?}");
+                };
+                assert!(items.len() <= 41);
+                for it in items {
+                    let V::Str(n) = it else {
+                        panic!("capability must be a string, got {it:?}");
+                    };
+                    assert!(
+                        fandhe_container_core::capabilities::Capability::from_name(n).is_some(),
+                        "unknown capability {n}"
+                    );
+                }
+            }
+        }
+        other => panic!("capabilities: expected object or null, got {other:?}"),
+    }
     match m.get("idMapping") {
         Some(V::Null) => {}
         Some(V::Obj(fields)) => {
@@ -465,6 +505,62 @@ fn sec4_2027_audit_coverage_is_reported() {
             ("record", V::Null),
         ])
     );
+}
+
+/// CLI-1・SEC-1・#2775: 記録した capability 集合は番号順の `CAP_*` で出し、inheritable・ambient は `[]`、
+/// 記録が無ければ `null`。
+#[test]
+fn cli1_2775_capabilities_are_reported() {
+    use fandhe_container_core::capabilities::{Capability, ContainerCapabilities, parse_drop_list};
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+    };
+    let iso = LaunchIsolationRecord::from_parts(
+        RootIdentity::new(44, 1234),
+        RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)]).unwrap(),
+    );
+    let none = record(ContainerStatus::created(cid("c"), None), 1);
+    assert_eq!(
+        render_map(&FakeStore(none.clone()), "c")["capabilities"],
+        V::Null
+    );
+    // `capabilities` の記録が無い旧記録。
+    let legacy = none.clone().with_launch_isolation(iso.clone());
+    assert_eq!(render_map(&FakeStore(legacy), "c")["capabilities"], V::Null);
+
+    let narrowed =
+        ContainerCapabilities::oci_default().without(parse_drop_list(&["chown"]).expect("drop"));
+    let rec = none.with_launch_isolation(iso.with_capabilities(narrowed));
+    let m = render_map(&FakeStore(rec), "c");
+    assert_schema(&m);
+    let expected: Vec<V> = narrowed.iter().map(|c| s(c.as_str())).collect();
+    assert_eq!(expected.len(), 13);
+    assert!(!narrowed.bounding().contains(Capability::Chown));
+    let arr = |v: Vec<V>| V::Arr(v);
+    let mk = |v: &Vec<V>| {
+        arr(v
+            .iter()
+            .map(|x| {
+                s(match x {
+                    V::Str(t) => t,
+                    _ => unreachable!(),
+                })
+            })
+            .collect())
+    };
+    assert_eq!(
+        m["capabilities"],
+        V::Obj(vec![
+            ("bounding".to_string(), mk(&expected)),
+            ("effective".to_string(), mk(&expected)),
+            ("permitted".to_string(), mk(&expected)),
+            ("inheritable".to_string(), V::Arr(vec![])),
+            ("ambient".to_string(), V::Arr(vec![])),
+        ])
+    );
+    // 番号順（CAP_DAC_OVERRIDE が先頭、CAP_SETFCAP が末尾）。
+    assert_eq!(expected.first(), Some(&s("CAP_DAC_OVERRIDE")));
+    assert_eq!(expected.last(), Some(&s("CAP_SETFCAP")));
 }
 
 /// SUP-9・#2601: 明示 stop の記録は `stopped` のときだけ `"recorded"`、それ以外・既定は `"not_recorded"`。
@@ -827,9 +923,10 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 14] = [
+    const KEYS: [&str; 15] = [
         "auditCoverage",
         "bundle",
+        "capabilities",
         "cgroupInstance",
         "cgroupScope",
         "exitCode",

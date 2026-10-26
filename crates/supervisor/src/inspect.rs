@@ -1,7 +1,7 @@
 //! コンテナ状態の `inspect` 相当の機械可読出力（SUP-11・TASK-168.1・#523・MS-9）。
 //!
-//! 自動化・AI 自己補修（REPAIR-4）や将来の CLI `inspect` 相当コマンドから呼ばれ、`state.json` の
-//! 1 レコードを 1 個の JSON オブジェクトへ整形する。CLI への配線は未実装（本モジュールは出力生成のみ）。
+//! 自動化・AI 自己補修（REPAIR-4）や CLI の `inspect` コマンド（#2775）から呼ばれ、`state.json` の
+//! 1 レコードを 1 個の JSON オブジェクトへ整形する。CLI の `inspect` コマンド（`crates/cli`。#2775）がこの出力をそのまま stdout へ書く（2 つ目の整形は持たない）。
 //! 出力を機械的にパースして型・値域・キー順・値を検証する結合テストは `tests/inspect_output.rs` に置く
 //! （TASK-168.2・#524。#523 で先行追加した試験へ #524 で型・キー順・列挙値の照合を追加した）。
 //!
@@ -25,6 +25,10 @@
 //! - `auditCoverage.record`（SEC-4・REPAIR-4・#2601）は縮退の監査記録を記録先へ書けなかったときだけ `"failed"`、
 //!   それ以外は `null`。`null` は「記録された」保証ではない（縮退なし・記録成功・#2468 より前の旧記録を区別しない）。
 //!   `auditCoverage` 自体が `null` のときは出ない。
+//! - `capabilities`（CLI-1・SEC-1・REPAIR-4・#2775）は launch が実際に適用した capability 集合（`create --cap-drop` で
+//!   狭めた後の値）。記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、OCI 既定とは推測しない。
+//!   あるときは `{"bounding":[..],"effective":[..],"permitted":[..],"inheritable":[],"ambient":[]}`。
+//!   前 3 つは同じ値（番号順の `CAP_*`）、後ろ 2 つは常に空（add・ambient の経路が無い）。出力は有界（最大 41 件 × 3）。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
@@ -185,8 +189,43 @@ impl InspectReport {
         self.push_id_mapping(&mut s);
         s.push_str(",\"explicitStop\":");
         push_str_value(&mut s, self.explicit_stop().as_str());
+        s.push_str(",\"capabilities\":");
+        self.push_capabilities(&mut s);
         s.push('}');
         s
+    }
+
+    /// launch が実際に適用した capability 集合（CLI-1・SEC-1・REPAIR-4・#2775）。記録が無ければ `null`
+    /// （OCI 既定とは推測しない）。値は固定語彙の `CAP_*` だけ（エスケープ不要）。
+    /// `inheritable`・`ambient` は型が空以外を表せないため常に `[]`。
+    fn push_capabilities(&self, s: &mut String) {
+        let Some(caps) = self
+            .record
+            .launch_isolation()
+            .and_then(|l| l.capabilities())
+        else {
+            s.push_str("null");
+            return;
+        };
+        let list = |s: &mut String| {
+            s.push('[');
+            for (i, c) in caps.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(c.as_str());
+                s.push('"');
+            }
+            s.push(']');
+        };
+        s.push_str("{\"bounding\":");
+        list(s);
+        s.push_str(",\"effective\":");
+        list(s);
+        s.push_str(",\"permitted\":");
+        list(s);
+        s.push_str(",\"inheritable\":[],\"ambient\":[]}");
     }
 
     /// 選ばれた ID 写像のモデルと範囲（CORE-6・SEC-5・REPAIR-4・#2388）。記録が無ければ `null`。値はすべて数値と
@@ -366,7 +405,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -385,7 +424,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -408,7 +447,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -429,7 +468,7 @@ mod tests {
         .unwrap()
         .with_explicit_stop(fandhe_container_core::traits::ExplicitStop::Recorded);
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

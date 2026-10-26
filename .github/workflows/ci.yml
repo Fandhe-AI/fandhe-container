@@ -1099,6 +1099,40 @@ jobs:
             --select '^tmpfs_mount: mounts, flags' --subst root=false \
             --forbid 'tmpfs_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
+      # exec_child_setup の `--ignored` の場面（`crates/core/tests/exec_child_setup.rs`。SUP-6・SEC-1・
+      # REPAIR-7・REPAIR-12・#1531・#2854・#2885）: 非特権 user namespace + mount namespace の中で
+      # tmpfs を `noexec` と通常の 2 つでマウントし、`noexec` 上のエントリポイントが違反
+      # `entrypoint_on_noexec_mount`（126）で拒否され、通常の tmpfs 上では封印した複製まで進むことを照合する。
+      # 既定の場面は既定の結合試験で実行済み。Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・
+      # sudo・permissions は追加しない。マウントは使い捨ての namespace 内（`--propagation private`）だけで、
+      # ホストのマウントは変えない。`--ignored` が届かなくても exit 0 になるため、成功行を共通スクリプトで
+      # 照合し、前提（util-linux の unshare・非特権の user / mount namespace）は事前に fail-closed で確認する。
+      - name: exec_child_setup のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test exec_child_setup --no-run
+
+      - name: exec_child_setup の実行（実機前提テスト・--ignored。SUP-6・SEC-1・#2885）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v unshare >/dev/null 2>&1; then
+            echo "::error::exec_child_setup requires util-linux unshare" >&2
+            exit 1
+          fi
+          if ! unshare --user --map-root-user --mount --propagation private true; then
+            echo "::error::exec_child_setup requires unprivileged user and mount namespaces" >&2
+            exit 1
+          fi
+          log="${RUNNER_TEMP}/exec_child_setup.log"
+          cargo test -p fandhe-container-core --test exec_child_setup -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name exec_child_setup --src crates/core/tests/exec_child_setup.rs \
+            --log "${log}" \
+            --select '^exec_child_setup: (all scenarios passed|noexec tmpfs scenario passed)$' --min 2 \
+            --forbid 'noexec tmpfs scenario ignored' --forbid 'not applicable' \
+            --forbid 'exec_child_setup: not verified' --summary
+
       # readonly_paths（`crates/core/tests/readonly_paths.rs`。SEC-2・CORE-5・#1850）と
       # config_paths_implicit_dev（`crates/core/tests/config_paths_implicit_dev.rs`。SEC-2・CORE-5・#2015）:
       # 読み取り専用化・覆いの rootless での実機結果を CI のログに残す実機前提テスト（harness = false）。

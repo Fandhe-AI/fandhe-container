@@ -157,6 +157,15 @@ pub(super) fn resolve_create_image(
 /// 正規パス）で、`--root` の表記（`//`・末尾 `/`・祖先の symlink）が create と delete で違っても同じ scope になる
 /// （#2499 P2-2）。字面だけを畳んで存在しないパスを許す経路は作らない。大文字小文字を区別しない FS の同一視は
 /// 範囲外（ローカル経路は Linux のみ）。
+///
+/// 表記ゆれで scope が割れない根拠（#2796。照合は `oci7_state_scope_is_stable_across_root_spellings` と
+/// `oci7_state_scope_rejects_parent_dir_and_final_symlink_spellings`）:
+/// - `//`・末尾 `/`・`.` は `StateRoot::from_override` が要素を組み直して落とす
+/// - `..` は `StateRoot::from_override` が `InvalidArgument` で拒否する（scope は作られない）
+/// - 祖先の symlink は `FileStateStore::open` の `canonical_root` が解決する
+/// - 最終要素の symlink は `FileStateStore::open` が `PermissionDenied` で拒否する
+///
+/// `legacy_scope` が字面をハッシュするのは旧 scope の読み戻し用の意図した互換処理で、ここには影響しない。
 pub(super) fn state_scope(store: &dyn StateStore) -> Result<String, TraitError> {
     let root = store
         .host_state_root()
@@ -574,9 +583,39 @@ mod tests {
             "{}/state/",
             real.display()
         )));
+        let dot = scope(std::path::PathBuf::from(format!(
+            "{}/./state",
+            real.display()
+        )));
         assert_eq!(via_link, double_slash);
         assert_eq!(via_link, trailing);
+        assert_eq!(via_link, dot);
         assert_eq!(via_link.len(), 32);
+    }
+
+    /// OCI-7・#2796: `..` を含む表記と最終要素が symlink の表記は、scope ができる前に fail-closed になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_rejects_parent_dir_and_final_symlink_spellings() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = Tmp::new("scope-reject");
+        let state = tmp.path().join("real").join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let dotdot = tmp
+            .path()
+            .join("real")
+            .join("..")
+            .join("real")
+            .join("state");
+        let err = StateRoot::from_override(dotdot).expect_err("dotdot");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        let final_link = tmp.path().join("finallink");
+        std::os::unix::fs::symlink(&state, &final_link).expect("symlink");
+        let err = FileStateStore::open(StateRoot::from_override(final_link).expect("root"))
+            .expect_err("final symlink");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
     }
 
     /// OCI-7・#2499: 状態ルートを示せないストアの scope は固定文言の `FAILED_PRECONDITION`。

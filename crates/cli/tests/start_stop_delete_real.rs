@@ -33,6 +33,15 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/start_stop_delete_real-XXXX> --ignored
 //! ```
 //!
+//! # create の起動オプションと `start --audit-policy` の観測（#2761・SUP-12・SEC-4・CLI-1）
+//! create に `--ulimit nofile=256:512` と `--env FANDHE_OPT_PROBE=observed-2761` を付け、start に `--audit-policy best-effort` を付ける。
+//! プローブはコンテナ内の `/proc/self/limits` の `Max open files` の soft / hard と、`/proc/self/environ` の
+//! `FANDHE_OPT_PROBE` の値を `OPT_NOFILE <soft> <hard>`・`OPT_ENV <値>` として出し、親が `logs` で完全一致の行として照合する
+//! （値が supervisor の launcher まで届き、コンテナの rlimit と environ に載ったことの観測）。hard を継承値より上げる指定は
+//! `prlimit` の EPERM で起動失敗になるため、継承値より十分小さい 512 を使う。`--audit-policy` は strict を使わない
+//! （CI の runner は監査が縮退している可能性があり、拒否されうるため）。best-effort で実際の supervisor が argv を受理して
+//! 起動まで通ることを確かめる（strict の argv の組み立ては supervisor の `start_client` の単体試験が照合する）。
+//!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
 //! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
 
@@ -101,6 +110,14 @@ mod linux {
     const POLL: Duration = Duration::from_millis(20);
     /// プローブの寿命の上限。これを過ぎたら終了コード 8 で終わる（寿命切れを停止と取り違えないための目印）。
     const PROBE_LIFETIME: Duration = Duration::from_secs(60);
+    /// プローブが `/proc` から読む上限(バイト)。
+    const PROBE_PROC_READ_MAX: u64 = 64 * 1024;
+    /// create に渡す `--ulimit`(nofile の soft:hard)と、コンテナ内で観測されるべき行。
+    const OPT_ULIMIT: &str = "nofile=256:512";
+    const OPT_NOFILE_LINE: &str = "stdout OPT_NOFILE 256 512";
+    /// create に渡す `--env` と、コンテナ内で観測されるべき行(ダミー値。秘密情報ではない)。
+    const OPT_ENV: &str = "FANDHE_OPT_PROBE=observed-2761";
+    const OPT_ENV_LINE: &str = "stdout OPT_ENV observed-2761";
     /// `/proc/<pid>/status` の `SigCgt` で SIGTERM（15）に当たるビット（1 << 14）。
     const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
 
@@ -112,6 +129,8 @@ mod linux {
             let _ = out.flush();
             std::process::exit(9);
         }
+        let _ = writeln!(out, "OPT_NOFILE {}", read_nofile());
+        let _ = writeln!(out, "OPT_ENV {}", read_probe_env());
         let _ = writeln!(out, "READY_TERM");
         let _ = out.flush();
         let deadline = Instant::now() + PROBE_LIFETIME;
@@ -119,6 +138,39 @@ mod linux {
             thread::sleep(Duration::from_millis(100));
         }
         std::process::exit(8);
+    }
+
+    /// `/proc/self/limits` の `Max open files` 行の soft / hard（読めなければ `unreadable`）。読み取りには上限を付ける。
+    fn read_nofile() -> String {
+        let mut text = String::new();
+        let read = fs::File::open("/proc/self/limits")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_string(&mut text));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        text.lines()
+            .find_map(|l| l.strip_prefix("Max open files"))
+            .and_then(|rest| {
+                let mut cols = rest.split_whitespace();
+                Some(format!("{} {}", cols.next()?, cols.next()?))
+            })
+            .unwrap_or_else(|| "unreadable".to_string())
+    }
+
+    /// `/proc/self/environ`(NUL 区切り)の `FANDHE_OPT_PROBE` の値(無ければ `missing`、読めなければ `unreadable`)。
+    fn read_probe_env() -> String {
+        let mut buf = Vec::new();
+        let read = fs::File::open("/proc/self/environ")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_end(&mut buf));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        buf.split(|b| *b == 0)
+            .find_map(|kv| kv.strip_prefix(b"FANDHE_OPT_PROBE="))
+            .map_or_else(
+                || "missing".to_string(),
+                |v| String::from_utf8_lossy(v).into_owned(),
+            )
     }
 
     pub fn main() -> ExitCode {
@@ -130,6 +182,9 @@ mod linux {
         }
         match scenario() {
             Ok(scope_present) => {
+                println!(
+                    "start_stop_delete_real: create options observed in the container: /proc/self/limits nofile soft=256 hard=512; environ FANDHE_OPT_PROBE=observed-2761; start passed --audit-policy best-effort"
+                );
                 println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
                 );
@@ -319,14 +374,28 @@ mod linux {
         // 1. create
         let out = run_cli(
             &cli,
-            &["--root", &root_s, "create", "--bundle", bundle_s, &id_s],
+            &[
+                "--root", &root_s, "create", "--ulimit", OPT_ULIMIT, "--env", OPT_ENV, "--bundle",
+                bundle_s, &id_s,
+            ],
             CLI_TIMEOUT,
         )?;
         expect_ok(&out, "create")?;
         cleanup.armed = true;
 
         // 2. start
-        let out = run_cli(&cli, &["--root", &root_s, "start", &id_s], START_TIMEOUT)?;
+        let out = run_cli(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "start",
+                "--audit-policy",
+                "best-effort",
+                &id_s,
+            ],
+            START_TIMEOUT,
+        )?;
         expect_ok(&out, "start")?;
 
         // 3. list（Running）と状態記録・cgroup 配置
@@ -376,26 +445,27 @@ mod linux {
         // 5. logs
         // ハンドラ登録後でも supervisor の非同期ログ捕捉・flush は未完のことがあるため、期限内で再取得する（REPAIR-5）。
         let mut last_logs = String::new();
-        let logs_ok =
-            wait_until(
-                STATE_TIMEOUT,
-                "logs to contain `stdout READY_TERM`",
-                || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
-                    Ok(o) if o.code == Some(0) => {
-                        let found = o.stdout.lines().any(|l| l == "stdout READY_TERM");
-                        last_logs = o.stdout;
-                        found
-                    }
-                    Ok(o) => {
-                        last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
-                        false
-                    }
-                    Err(e) => {
-                        last_logs = e;
-                        false
-                    }
-                },
-            );
+        let logs_ok = wait_until(
+            STATE_TIMEOUT,
+            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV)",
+            || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
+                Ok(o) if o.code == Some(0) => {
+                    let has = |want: &str| o.stdout.lines().any(|l| l == want);
+                    let found =
+                        has("stdout READY_TERM") && has(OPT_NOFILE_LINE) && has(OPT_ENV_LINE);
+                    last_logs = o.stdout;
+                    found
+                }
+                Ok(o) => {
+                    last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                    false
+                }
+                Err(e) => {
+                    last_logs = e;
+                    false
+                }
+            },
+        );
         logs_ok.map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
         let container_log = root.join("@container-logs").join(format!("{id_s}.log"));
         let supervisor_log = root.join("@supervisor-logs").join(format!("{id_s}.log"));

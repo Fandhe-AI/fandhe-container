@@ -40,13 +40,68 @@ pub(crate) fn read_mountinfo_bounded(path: &str) -> Result<String, MountinfoRead
     Ok(text)
 }
 
-/// `/proc/<...>/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
+/// fdinfo として読むバイト数の上限（超過は拒否）。`O_PATH` の fd の fdinfo は数十バイトで、crates/net の
+/// `MAX_FDINFO_READ` と同じ値にそろえる。landlock の旧上限（4096 での黙った切り捨て）はこの拒否に統一した（#2762）。
 #[cfg(target_os = "linux")]
-pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
-    fdinfo
-        .lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
+pub(crate) const FDINFO_MAX_BYTES: u64 = 64 * 1024;
+
+/// fdinfo の `mnt_id` の読み取り・解析の失敗。呼び出し側が自分の段・エラー型へ写す（REPAIR-1・CORE-2・#2762）。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum FdinfoMountIdError {
+    /// 読めない（open・read の失敗、または UTF-8 でない）。
+    Read(std::io::Error),
+    /// [`FDINFO_MAX_BYTES`] を超える。
+    TooLarge,
+    /// 行頭が `mnt_id:` の行が無い。
+    Missing,
+    /// 行頭が `mnt_id:` の行が 2 つ以上ある（値が同じでも拒否する。fail-closed）。
+    Duplicate,
+    /// 値が `u64` として解釈できない（空・非数値・負数・桁あふれ）。
+    Invalid,
+}
+
+/// fdinfo の本文から行頭が `mnt_id:` の行の値（fd が属するマウントの ID）を取り出す純関数。
+/// 重複行は拒否する（`setns::parse_fdinfo_pid` と同じ。カーネルは 1 行しか出さない）。
+/// 呼び出しは [`read_fd_mnt_id`] 経由が基本で、crates/core で fdinfo の `mnt_id` を解析する唯一の実装（REPAIR-1）。
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Result<u64, FdinfoMountIdError> {
+    let mut found: Option<&str> = None;
+    for value in fdinfo.lines().filter_map(|l| l.strip_prefix("mnt_id:")) {
+        if found.replace(value).is_some() {
+            return Err(FdinfoMountIdError::Duplicate);
+        }
+    }
+    let value = found.ok_or(FdinfoMountIdError::Missing)?;
+    value
+        .trim()
+        .parse()
+        .map_err(|_| FdinfoMountIdError::Invalid)
+}
+
+/// `r` を [`FDINFO_MAX_BYTES`] までだけ読む。超過は `TooLarge`（fail-closed）。
+#[cfg(target_os = "linux")]
+fn read_fdinfo_bounded(r: impl std::io::Read) -> Result<String, FdinfoMountIdError> {
+    let mut text = String::new();
+    // 上限 + 1 バイトまで読み、超えたら拒否する（確保量は上限で頭打ち）。
+    r.take(FDINFO_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(FdinfoMountIdError::Read)?;
+    if u64::try_from(text.len()).map_or(true, |n| n > FDINFO_MAX_BYTES) {
+        return Err(FdinfoMountIdError::TooLarge);
+    }
+    Ok(text)
+}
+
+/// `fd` の属するマウント ID を `/proc/thread-self/fdinfo/<fd>` から上限つきで読む。
+/// `/proc/self` ではなく `thread-self` を使う（`establish` 後の別スレッドでは `/proc/self` が別の mount namespace を
+/// 指し得るため）。exec・bind mount・landlock・image rootfs の各段が使う（REPAIR-1・CORE-2・#2762）。
+#[cfg(target_os = "linux")]
+pub(crate) fn read_fd_mnt_id(fd: std::os::fd::BorrowedFd<'_>) -> Result<u64, FdinfoMountIdError> {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+        .map_err(FdinfoMountIdError::Read)?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(file)?)
 }
 
 /// `path` を `O_PATH` で開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
@@ -55,7 +110,6 @@ pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 #[cfg(target_os = "linux")]
 pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     use std::os::fd::AsFd as _;
-    use std::os::fd::AsRawFd as _;
     let c = std::ffi::CString::new(path).ok()?;
     // 絶対パスのため dirfd は解決に影響しない（`/` の fd を渡す）。
     let root = crate::sys::open_dir_path_nofollow(None, c"/").ok()?;
@@ -66,9 +120,7 @@ pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     if !meta.is_dir() && !meta.is_file() {
         return None;
     }
-    let fdinfo =
-        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
-    parse_fdinfo_mnt_id(&fdinfo)
+    read_fd_mnt_id(fd.as_fd()).ok()
 }
 
 /// Linux 以外では `/proc` と `crate::sys` が無いため特定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
@@ -96,11 +148,9 @@ pub(crate) fn dir_identity_chain(path: &str) -> Option<Vec<(u64, u64)>> {
 /// （SEC-1・#2166）。末端の fd を固定したまま `mnt_id` を読むため、辿り直しによる差し替えの余地が無い。
 #[cfg(target_os = "linux")]
 pub(crate) fn dir_identity_chain_with_mnt_id(path: &str) -> Option<(Vec<(u64, u64)>, u64)> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::AsFd as _;
     let (chain, leaf) = walk_dir_chain(path)?;
-    let fdinfo =
-        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", leaf.as_raw_fd())).ok()?;
-    Some((chain, parse_fdinfo_mnt_id(&fdinfo)?))
+    Some((chain, read_fd_mnt_id(leaf.as_fd()).ok()?))
 }
 
 /// `dir_identity_chain` の本体。鎖と末端のディレクトリの fd を返す。
@@ -562,14 +612,70 @@ mod tests {
         assert_eq!(v[0].1, "/state/c1");
     }
 
+    /// REPAIR-1・CORE-2（#2762）: fdinfo の `mnt_id` 解析の正常系と、欠落・重複・非数値・上限超えの拒否。
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_fdinfo_mnt_id_reads_the_field() {
-        assert_eq!(
-            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012\nmnt_id:\t42\n"),
-            Some(42)
-        );
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
+    fn repair1_parse_fdinfo_mnt_id_cases() {
+        let ok = |s: &str| parse_fdinfo_mnt_id(s).unwrap();
+        assert_eq!(ok("pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n"), 52);
+        // 行頭が `mnt_id:` でない行は対象にならない。
+        assert_eq!(ok("fanotify mnt_id:\t9\nmnt_id:\t7\n"), 7);
+        assert_eq!(ok("mnt_id:\t18446744073709551615\n"), u64::MAX);
+        assert!(matches!(
+            parse_fdinfo_mnt_id("pos:\t0\nflags:\t0\n"),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(""),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id("mnt_id:\t52\nmnt_id:\t53\n"),
+            Err(FdinfoMountIdError::Duplicate)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id("mnt_id:\t52\nmnt_id:\t52\n"),
+            Err(FdinfoMountIdError::Duplicate)
+        ));
+        for bad in [
+            "mnt_id:\tx\n",
+            "mnt_id:\t-1\n",
+            "mnt_id:\t\n",
+            "mnt_id:\t18446744073709551616\n",
+        ] {
+            assert!(
+                matches!(parse_fdinfo_mnt_id(bad), Err(FdinfoMountIdError::Invalid)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// REPAIR-1・REPAIR-5（#2762）: 読み取りの上限ちょうどは通り、1 バイト超えは `TooLarge`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_read_fdinfo_bounded_limit() {
+        let n = usize::try_from(FDINFO_MAX_BYTES).unwrap();
+        let at = read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; n])).unwrap();
+        assert_eq!(at.len(), n);
+        assert!(matches!(
+            read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; n + 1])),
+            Err(FdinfoMountIdError::TooLarge)
+        ));
+    }
+
+    /// REPAIR-1・CORE-2（#2762）: 実 fd の `mnt_id` が `/proc/thread-self/mountinfo` にちょうど 1 行ある。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_read_fd_mnt_id_matches_mountinfo() {
+        use std::os::fd::AsFd as _;
+        let f = std::fs::File::open("/").unwrap();
+        let id = read_fd_mnt_id(f.as_fd()).unwrap();
+        let info = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
+        let n = info
+            .lines()
+            .filter(|l| l.split(' ').next().and_then(|v| v.parse::<u64>().ok()) == Some(id))
+            .count();
+        assert_eq!(n, 1);
     }
 
     /// SEC-1（#2066）: 鎖は自身が先頭・`/` が末尾で、各要素は実ディレクトリの (dev, ino)。symlink・存在しない・相対は `None`。

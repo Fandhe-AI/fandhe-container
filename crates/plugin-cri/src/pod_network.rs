@@ -128,9 +128,11 @@ pub fn set_up_sandbox(
     let (name, container, _) = sandbox_names(sandbox_id).map_err(plain)?;
     // `Internal` は取り残しの件数入りの失敗（契約 6）を含む。残骸があるのに枠を返すと別 pod に同じサブネットが
     // 渡りうるため、`Internal` は巻き戻し済みとみなさず、`tear_down`（delete_network）の成功まで枠を保持させる。
+    // `AlreadyExists` は同名の稼働中ネットワーク（同じ sandbox への set_up の再呼び出し等）が残っている失敗で、
+    // ここでは作っていないため戻さない（消すと稼働中の pod を壊す）。資源は残るので巻き戻し済みとはみなさない（NET-1）。
     net.create_network(&CreateNetworkRequest::new(name.clone(), subnet))
         .map_err(|error| SandboxSetUpError {
-            rolled_back: error.code() != ErrorCode::Internal,
+            rolled_back: !matches!(error.code(), ErrorCode::Internal | ErrorCode::AlreadyExists),
             error,
         })?;
     let mut rollback: Vec<(&str, TraitError)> = Vec::new();
@@ -219,11 +221,22 @@ impl PodSubnetPool {
         IpCidr::new(IpAddr::V4(Ipv4Addr::from(addr)), self.pod_prefix_len)
     }
 
-    /// `sandbox_id` に枠を払い出す（既に払い出し済みなら同じ枠）。
+    /// `sandbox_id` に枠を払い出す（既に払い出し済みなら同じ枠）。新規か既存の予約かは [`Self::lease`] で区別する。
     pub fn allocate(&self, sandbox_id: &str) -> Result<IpCidr, TraitError> {
+        self.lease(sandbox_id).map(|l| l.subnet)
+    }
+
+    /// `sandbox_id` に枠を払い出し、今回の呼び出しで新しく払い出したか（[`PodSubnetLease::newly_allocated`]）も返す。
+    ///
+    /// 既存の予約は別の呼び出し（稼働中の pod・回収待ちの残骸）が持つ枠なので、今回の失敗を理由に返してはならない
+    /// （返すと次の sandbox に同じサブネットが渡り、bridge のアドレス・経路が重複する。NET-1）。
+    pub fn lease(&self, sandbox_id: &str) -> Result<PodSubnetLease, TraitError> {
         let mut used = self.lock()?;
         if let Some(slot) = used.get(sandbox_id) {
-            return self.subnet_of(*slot);
+            return Ok(PodSubnetLease {
+                subnet: self.subnet_of(*slot)?,
+                newly_allocated: false,
+            });
         }
         let taken: BTreeSet<u32> = used.values().copied().collect();
         let slot = (0..self.slots)
@@ -233,7 +246,10 @@ impl PodSubnetPool {
             })?;
         let subnet = self.subnet_of(slot)?;
         used.insert(sandbox_id.to_owned(), slot);
-        Ok(subnet)
+        Ok(PodSubnetLease {
+            subnet,
+            newly_allocated: true,
+        })
     }
 
     /// `sandbox_id` の枠を返す（未払い出しは何もしない）。
@@ -247,6 +263,15 @@ impl PodSubnetPool {
     pub fn in_use(&self) -> usize {
         self.lock().map(|u| u.len()).unwrap_or(0)
     }
+}
+
+/// [`PodSubnetPool::lease`] の結果（払い出した枠と、今回新しく払い出したか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodSubnetLease {
+    /// 払い出した pod 用サブネット。
+    pub subnet: IpCidr,
+    /// 今回の呼び出しで新しく払い出したか。偽なら既存の予約で、失敗しても呼び出し側が返してはならない。
+    pub newly_allocated: bool,
 }
 
 /// cri の `PodNetworkProvider` を `NetworkPlugin` の呼び出しへ写す実装（CRI-2・NET-1・PLUG-1・#2675）。
@@ -278,12 +303,13 @@ impl PodNetworkProvider for NetsetupPodNetwork {
     fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
         let to_cri = |e: TraitError| CriError::from(&e);
         let (_, _, netns_name) = sandbox_names(req.sandbox_id).map_err(to_cri)?;
-        let subnet = self.pool.allocate(req.sandbox_id).map_err(to_cri)?;
-        match set_up_sandbox(self.net.as_ref(), req.sandbox_id, subnet) {
+        let lease = self.pool.lease(req.sandbox_id).map_err(to_cri)?;
+        match set_up_sandbox(self.net.as_ref(), req.sandbox_id, lease.subnet) {
             Ok(_) => PodNetns::new(self.netns_dir.join(netns_name.as_str())),
             Err(f) => {
-                // 資源が残らないと確認できたときだけ枠を返す（残りうる間は tear_down の成功まで保持する）。
-                if f.rolled_back {
+                // 今回新しく払い出した枠で、資源が残らないと確認できたときだけ返す。既存の予約（同じ sandbox の
+                // 稼働中のネットワーク・回収待ちの残骸）の枠は tear_down の成功まで保持する（NET-1）。
+                if lease.newly_allocated && f.rolled_back {
                     self.pool.release(req.sandbox_id);
                 }
                 Err(to_cri(f.error))

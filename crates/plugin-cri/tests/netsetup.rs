@@ -1334,3 +1334,79 @@ fn pod_network_provider_reuses_the_subnet_after_a_clean_rollback() {
         ]
     );
 }
+
+/// set_up_sandbox: 同名の稼働中ネットワークで create_network が AlreadyExists なら、戻さず rolled_back は偽
+/// （稼働中のネットワークを消さない・枠を返させない。CRI-2・NET-1）。
+#[test]
+fn set_up_sandbox_already_exists_is_not_rolled_back() {
+    let (net, fake) = plugin();
+    pod_network::set_up_sandbox(&net, SB, subnet()).expect("first");
+    let f = pod_network::set_up_sandbox(&net, SB, subnet()).expect_err("dup");
+    assert_eq!(f.error.code(), ErrorCode::AlreadyExists);
+    assert!(!f.rolled_back);
+    // 稼働中のネットワークを消す呼び出しは無い。
+    assert!(
+        !fake.calls().iter().any(|c| c.starts_with("delete_network")),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+/// サブネットの払い出し: lease は新規払い出しと既存予約を区別する（NET-1）。
+#[test]
+fn pod_subnet_pool_lease_distinguishes_new_and_existing() {
+    use fandhe_container_plugin_cri::pod_network::PodSubnetPool;
+    let pool = PodSubnetPool::new(parent(), 24).expect("pool");
+    let first = pool.lease("a").expect("a");
+    assert!(first.newly_allocated);
+    assert_eq!(
+        first.subnet.network_address(),
+        IpAddr::V4(Ipv4Addr::new(10, 90, 0, 0))
+    );
+    let again = pool.lease("a").expect("again");
+    assert!(!again.newly_allocated);
+    assert_eq!(again.subnet, first.subnet);
+    assert_eq!(pool.in_use(), 1);
+}
+
+/// provider: 同じ sandbox への set_up の再呼び出しが AlreadyExists で失敗しても、稼働中のネットワークの枠を
+/// 返さない。次の sandbox には別のサブネットが渡り、tear_down の成功で初めて枠が返る（CRI-2・NET-1）。
+#[test]
+fn pod_network_provider_duplicate_set_up_keeps_the_subnet_in_use() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    let other = "b".repeat(64);
+    let third = "c".repeat(64);
+    provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("first");
+    let dup = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect_err("dup");
+    assert_eq!(dup.code().as_str(), "ALREADY_EXISTS");
+    provider
+        .set_up(&PodNetworkRequest::new(&other, &cfg))
+        .expect("other");
+    provider.tear_down(SB).expect("tear down");
+    provider
+        .set_up(&PodNetworkRequest::new(&third, &cfg))
+        .expect("third");
+    let creates: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("create_network"))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            // 二重作成は registry が backend の前で拒否するため backend の呼び出しは 1 回だけ。
+            format!("create_network {SB} 10.90.0.1/24"),
+            format!("create_network {other} 10.90.1.1/24"),
+            // SB の tear_down で返った枠が再利用される。
+            format!("create_network {third} 10.90.0.1/24"),
+        ]
+    );
+}

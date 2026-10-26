@@ -690,7 +690,9 @@ do_capture() {
     exit 3
   fi
 
-  tmp_dir="$(mktemp -d)"
+  # テンプレートを明示して TMPDIR 配下に作る。引数なしの mktemp -d は macOS（BSD）では TMPDIR を見ず
+  # ユーザー専用の一時領域へ作るため、TMPDIR を専用にした自己テストが状態ルートを数えられない（#2954）。
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/fandhe-cli-parity.XXXXXX")"
   trap cleanup EXIT
   trap 'cleanup; exit 130' INT
   trap 'cleanup; exit 143' TERM

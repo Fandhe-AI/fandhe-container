@@ -2,14 +2,16 @@
 //!
 //! # 責務境界
 //! `cdi_edits::AggregatedEdits`（集計済みの edits）を受け、コンテナの実行環境へ反映する。
-//! 現状は `deviceNodes` の作成（`device_nodes` モジュール。TASK-127.1・#547）のみ実装済みで、
-//! mounts・hooks・env の適用は後続（#548〜#550）、cgroup device の `permissions` は TASK-129、
+//! 現状は `deviceNodes` の作成（`device_nodes` モジュール。TASK-127.1・#547）と mounts の bind 指定への変換
+//! （`mounts`。TASK-127.2・#548）が実装済みで、hooks・env の適用は後続（#549・#550）、cgroup device の `permissions` は TASK-129、
 //! core の実行フロー（`create_default_devices` の後・`pivot_root` の前）への配線も未実装（REPAIR-3）。
 //!
 //! # 呼び出し文脈
 //! 呼び出し元は core の実行層（PLUG-1 の区分で CDI の適用は core 側）を想定する。ホストの `/dev` を
 //! 読む `resolve_device_nodes` を `pivot_root` の前に呼び、コンテナの `/dev` のマウントのルート fd に
 //! 対して `create_device_nodes` を呼ぶ。
+
+pub mod mounts;
 
 mod device_nodes;
 

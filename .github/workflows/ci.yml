@@ -1494,7 +1494,7 @@ jobs:
           # 期待する成功行は試験ソースの println! から導出する（手書きの並びとシナリオ集合のずれで
           # 実行されない成功行を見逃さない。#2699・REPAIR-12）。集合は双方向で一致させる。
           src="crates/core/tests/rootless_image_rootfs_remove.rs"
-          min_scenarios=10
+          min_scenarios=12
           mapfile -t expected < <(
             grep -oE 'println!\("rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified"\)' "${src}" \
               | sed -E 's/^println!\("//; s/"\)$//' | LC_ALL=C sort -u

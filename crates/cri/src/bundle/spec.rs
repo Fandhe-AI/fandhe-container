@@ -25,7 +25,7 @@
 //!   `{"type":"network","path":…}` にする。core の start は network namespace も `linux.namespaces[].path` の
 //!   network もまだ受けず `Unimplemented` で拒否する（core の join は後続。`docs/design/cri-config-acceptance.md` の順 13）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
-//!   （#442）の pod.json は当面 `namespace_options.network = NODE` を要する。
+//!   （#442）の pod.json（`scripts/testdata/cri/pod.json`）は `namespace_options.network = NODE` を明示して揃えてある（#2592）。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
 //!   uid の写像は core の launcher が権限モデルから導く。SEC-5）。`uids` / `gids` の指定は未実装（#2240）。
 //! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は [`super::ImageRootfsSource`]（#2433）が行い、

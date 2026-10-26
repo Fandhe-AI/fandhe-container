@@ -45,6 +45,7 @@
 - sandbox の記録はプロセス内メモリのスタブ（TASK-59 の `StateStore` 置換が前提。REPAIR-3）で、plugin-cri の再起動で失われる。保持役の寿命をこれに揃えるのは整合した fail-closed である。永続化と再起動後の再採用は `StateStore` 置換時に再設計する。ネットワークの残りは既存の reclaim の仕組み（#2604）に委ねる
 - CORE-1 との整合: 保持役は pod ごとの軽量プロセス（supervisor がコンテナごとなのと同じ粒度）で、中央の常駐デーモンではない。常駐するのは CRI サーバーとしての plugin-cri だけ（既存の前提）
 - 再起動後にコンテナのプロセスが残る場合、namespace はそのプロセスが保持し続ける。その掃除は TASK-59 の範囲
+- 記録の永続化と再採用の設計は [cri-record-readoption.md](cri-record-readoption.md)（#2902）
 
 ## netns の共有と core の join の受け口
 
@@ -71,7 +72,7 @@
 - pid の共有（`shareProcessNamespace`。`Pid1Target` の見直しが要る）
 - `/dev/shm` の共有、uts の共有、`NamespaceMode::TARGET`
 - rootful の pod netns（#2241）
-- 再起動をまたぐ sandbox の再採用（TASK-59）
+- 再起動をまたぐ sandbox の再採用（TASK-59。設計は [cri-record-readoption.md](cri-record-readoption.md)・#2902）
 
 ## セキュリティ上の要点
 

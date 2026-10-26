@@ -117,6 +117,7 @@ fandhe-container/
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）
 │   │   ├── cri-status-rpc.md      # CRI の Status・Version・UpdateRuntimeConfig RPC（#2896 を併記。RuntimeReady・NetworkReady の判定材料と待ちが無い設計・runtime_handlers・features・verbose で info を出さない方針・kubelet / containerd の一次情報・本番で NetworkReady=false になる帰結・死活確認を足さない判断と再評価条件。#2830・#2897・CRI-1・CRI-2・PLUG-1・PLUG-4・REPAIR-3・REPAIR-5）
 │   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（#2838・CRI-2・CORE-3・SEC-5・NET-3）
+│   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）
 │   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
 │   ├── setup/                     # 利用者向けセットアップ手順

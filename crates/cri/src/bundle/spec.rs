@@ -66,7 +66,10 @@
 //!   （containerd も pod の sysctls を各コンテナへ写す）。分類は core の `sysctl::SysctlKey` を使い、規則を二重に持たない:
 //!   `net.*`（pod の netns の結線 #2675 が前提）と UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
 //!   文法違反・名前空間を持たないキー（`kernel.panic`・`vm.*` 等）・不正な値は `INVALID_ARGUMENT`。
-//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（port_mappings・cgroup_parent・
+//! - `port_mappings` は検証し（`crate::port_mapping`）、公開する要素（`host_port > 0`）があるときは pod の
+//!   netns（`pod_netns`）がある構成だけ受ける（なければ `UNIMPLEMENTED`）。公開そのものは RunPodSandbox の結線
+//!   （plugin-cri の `publish_port`）が行い、config.json には何も出さない（#2676・CRI-2・NET-3）。
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（cgroup_parent・
 //!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
@@ -1202,7 +1205,11 @@ fn build_inner(
     if container.windows.is_some() || sandbox.windows.is_some() {
         return Err(unsupported("windows"));
     }
-    if !sandbox.port_mappings.is_empty() {
+    // port_mappings は検証し、公開する要素があるときは pod の netns（公開先）が無ければ拒否する。
+    // 公開そのものは RunPodSandbox の結線（`publish_port`）が行い、config.json には何も出さない（#2676）。
+    if !crate::port_mapping::parse_port_mappings(&sandbox.port_mappings)?.is_empty()
+        && pod_netns.is_none()
+    {
         return Err(unsupported("port_mappings"));
     }
     let hostname = check_hostname(&sandbox.hostname)?;

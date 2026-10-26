@@ -120,6 +120,7 @@ use crate::adapter::{
     RuntimeContainerStatus, RuntimeLifecycle,
 };
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
+use crate::port_mapping::{PodPortPublish, parse_port_mappings};
 use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
     runtime_service_server::RuntimeService,
@@ -1046,11 +1047,17 @@ impl CriRuntimeService {
         &self,
         req: v1::RunPodSandboxRequest,
         network_pending: bool,
-    ) -> Result<v1::RunPodSandboxResponse, CriError> {
+    ) -> Result<(v1::RunPodSandboxResponse, Vec<PodPortPublish>), CriError> {
         let ValidatedRun {
             config,
             runtime_handler,
         } = validate_run_request(req)?;
+        // port_mappings は資源・記録を作る前に検証する。公開できるのは provider 注入下の POD だけで
+        // （`network_pending` はその経路の印）、それ以外で公開する要素があれば `UNIMPLEMENTED`（CRI-2・NET-3）。
+        let publishes = parse_port_mappings(config.port_mappings())?;
+        if !network_pending && !publishes.is_empty() {
+            return Err(CriError::unimplemented("port_mappings is not supported"));
+        }
         let retained_bytes = config.retained_bytes();
 
         let created_at_nanos = now_nanos()?;
@@ -1112,7 +1119,7 @@ impl CriRuntimeService {
             },
         );
         registry.retained_bytes = total_retained_bytes;
-        Ok(v1::RunPodSandboxResponse { pod_sandbox_id })
+        Ok((v1::RunPodSandboxResponse { pod_sandbox_id }, publishes))
     }
 
     /// pod の netns を作って結線する `RunPodSandbox`（#2675・CRI-2・NET-1・PLUG-1）。
@@ -1127,7 +1134,7 @@ impl CriRuntimeService {
         provider: &Arc<dyn PodNetworkProvider>,
         req: v1::RunPodSandboxRequest,
     ) -> Result<v1::RunPodSandboxResponse, CriError> {
-        let resp = self.reserve_sandbox(req, true)?;
+        let (resp, publishes) = self.reserve_sandbox(req, true)?;
         let id = resp.pod_sandbox_id.clone();
         let config = {
             let registry = self
@@ -1160,7 +1167,9 @@ impl CriRuntimeService {
         let set_up = run_bounded(self.runtime_timeout, move || {
             let _guard = guard;
             worker_ran.store(true, Ordering::SeqCst);
-            let result = worker_provider.set_up(&PodNetworkRequest::new(&worker_id, &config));
+            let result = worker_provider.set_up(
+                &PodNetworkRequest::new(&worker_id, &config).with_port_publishes(&publishes),
+            );
             let (netns, outcome) = match result {
                 Ok(netns) => (Some(netns), Ok(())),
                 Err(err) => (None, Err(err)),
@@ -2539,7 +2548,7 @@ impl RuntimeService for CriRuntimeService {
             Some(provider) if wants_pod_network(req.config.as_ref()) => {
                 self.run_sandbox_networked(provider, req).await
             }
-            _ => self.reserve_sandbox(req, false),
+            _ => self.reserve_sandbox(req, false).map(|(resp, _)| resp),
         }
         .map_err(Status::from);
         timer.finish_with(&result);

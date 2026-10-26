@@ -1172,7 +1172,7 @@ fn rejection_table_is_unimplemented() {
         p.windows = Some(Default::default());
     });
     add("ports", &|p, _| {
-        p.port_mappings = vec![fandhe_container_cri::runtime::v1::PortMapping::default()];
+        p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
     });
     add("cgroup_parent", &|p, _| {
         p.linux = Some(LinuxPodSandboxConfig {
@@ -1718,6 +1718,20 @@ fn cri2_stop_signal_unknown_value_is_invalid_argument() {
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
     }
 }
+fn port_mapping(
+    protocol: i32,
+    host_port: i32,
+    container_port: i32,
+    host_ip: &str,
+) -> fandhe_container_cri::runtime::v1::PortMapping {
+    fandhe_container_cri::runtime::v1::PortMapping {
+        protocol,
+        container_port,
+        host_port,
+        host_ip: host_ip.into(),
+    }
+}
+
 const POD_NETNS: &str =
     "/state/.netns/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1799,4 +1813,25 @@ fn malformed_pod_netns_path_is_rejected() {
         .unwrap_err();
         assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad}");
     }
+}
+
+/// CRI-2・NET-3（#2676）: 公開する port_mappings は pod の netns がある構成だけ受け、config.json には出さない。
+#[test]
+fn port_mappings_are_accepted_only_with_pod_netns() {
+    let mut p = pod();
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    // pod の netns が無ければ UNIMPLEMENTED のまま。
+    assert_eq!(code(&p, &ctr()), CriErrorCode::Unimplemented);
+    // pod の netns があれば受け入れ、network namespace の path が出る。
+    let v = build_with_netns(&p, &ctr(), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network", "path": POD_NETNS})
+    );
+    // host_port 0（公開しない）は netns が無くても受ける。
+    p.port_mappings = vec![port_mapping(0, 0, 80, "")];
+    assert!(build_runtime_config(&p, &ctr(), &ImageDefaults::default()).is_ok());
+    // 値の不正は INVALID_ARGUMENT。
+    p.port_mappings = vec![port_mapping(0, 8080, 0, "192.0.2.10")];
+    assert_eq!(code(&p, &ctr()), CriErrorCode::InvalidArgument);
 }

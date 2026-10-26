@@ -1925,7 +1925,9 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
                     .ok_or_else(malformed)?,
             ),
         };
-        let code = ErrorCode::from_name(code).unwrap_or(ErrorCode::Internal);
+        // 未知の code は行全体を malformed として拒否する（fail-closed。方針は core の `ErrorCode` の doc。
+        // untrusted な message も出力へ載せない）。
+        let code = ErrorCode::from_name(code).ok_or_else(malformed)?;
         return Err(WorkerFailure {
             error: TraitError::new(code, message),
             violation,
@@ -3124,12 +3126,17 @@ mod tests {
         assert_eq!(back.error.code(), ErrorCode::Timeout);
         assert_eq!(back.error.message(), "exec timed out before x");
 
-        // REPAIR-1・ERR-1: 一覧は core の `ErrorCode::ALL` を共有するため `RESOURCE_EXHAUSTED` も通る。未知は `Internal`。
+        // REPAIR-1・ERR-1: 一覧は core の `ErrorCode::ALL` を共有するため `RESOURCE_EXHAUSTED` も通る。未知は malformed（fail-closed）。
         let back = decode_worker_result(b"err RESOURCE_EXHAUSTED - m\n").unwrap_err();
         assert_eq!(back.error.code(), ErrorCode::ResourceExhausted);
         assert_eq!(back.error.message(), "m");
         let back = decode_worker_result(b"err BOGUS - m\n").unwrap_err();
         assert_eq!(back.error.code(), ErrorCode::Internal);
+        assert_eq!(
+            back.error.message(),
+            "exec stage Spawn: the exec worker returned a malformed result"
+        );
+        assert_eq!(back.violation, None);
 
         // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
         for deferred in [0usize, 1] {

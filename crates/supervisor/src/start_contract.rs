@@ -79,7 +79,7 @@ pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 ///
 /// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `ErrorCode::from_name` が
-/// `None` にして fail-closed で失敗し、CLI と supervisor は同じ版を一組で配置する前提のため。
+/// `None` にし、`ErrorCode` の doc の方針（行全体を拒否する fail-closed）で失敗する。CLI と supervisor は同じ版を一組で配置する前提のため。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
 pub const MAX_REPORT_LEN: usize = 640;

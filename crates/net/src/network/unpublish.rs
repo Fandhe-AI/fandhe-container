@@ -25,8 +25,8 @@
 //!   （`delete_network` と同じ水準。nft にテーブルハンドルを条件にした削除は無い）
 //! - [`PublishedPort`] はプロセス内のメモリ上の値で、再起動後の復元（GETRULE dump・永続化。#1870 の後続）は
 //!   無い。再起動後の解放は `delete_network` によるテーブル単位の一括解放だけ
-//! - 解除の契機が `delete_network` 以外にも要るかの検討は plugin-cri の `netsetup` の doc を参照。
-//!   `NetworkPlugin` トレイトへの `unpublish_port` 追加（PLUG-1）は main の設計を経る後続事項
+//! - `NetworkPlugin::unpublish_port`（#2904・PLUG-1）は追加済みで、plugin-cri の `netsetup` が本 API を呼ぶ。
+//!   呼び出し元は `set_up_sandbox` の公開途中の失敗の巻き戻し（`pod_network`）。attach 済みコンテナの `detach` は後続事項
 
 use std::fmt;
 

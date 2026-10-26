@@ -355,7 +355,7 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 - `host_port == 0` を読み飛ばす扱いは kubelet・containerd と一致する（下記「外部の事実の照合（port_mappings）」で 2026-10-26 に照合済み。kubelet は `host_port == 0` の要素もそのまま CRI へ送り、containerd が `HostPort <= 0` を読み飛ばす）。hostNetwork の扱いは**挙動が食い違う**: kubelet は hostNetwork の pod の ports に `host_port = container_port` を入れて送り、containerd は `NODE` でネットワークの setup を行わず port_mappings を使わない（黙って無視する）。本実装は公開する要素がある `NODE` を `UNIMPLEMENTED` にするため、ports を宣言した hostNetwork の pod は本実装では起動できない（厳しい側の差）。無視に合わせるかはオーナー判断の事項で、コードは変えていない
 - masquerade 未実装と host の `ip_forward` が前提で、外部からの到達は保証しない
 - 他プロセスとの受け口の衝突は検出しない（`LinuxNetwork` が共有ファイルなしの `PortRegistry` をネットワークごとに持つ。ネットワークをまたぐ契約 11 は `NetsetupNetwork` のプロセス内の記録で担保する）
-- 公開の個別解除は net の `unpublish_container_port` と `NetsetupBackend::unpublish_port`（#2839・NET-3）で可能だが、CRI の経路は呼ばない（`port_mappings` は sandbox 単位で、`delete_network` が一括で解放する。`NetworkPlugin` への追加は後続事項）。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
+- 公開の個別解除は net の `unpublish_container_port` と `NetsetupBackend::unpublish_port`（#2839・NET-3）に加え、`NetworkPlugin::unpublish_port`（#2904・契約 13）で行える。CRI の経路で使うのは `set_up_sandbox` の公開途中の失敗の巻き戻しだけで（公開済みを逆順に個別解除してから `delete_network`）、通常の停止・削除は `delete_network` が一括で解放する。結果不明のバッチは受け口の記録を保持し、`delete_network` まで再公開を拒む
 - `NODE`（hostNetwork）の hostPort・IPv6・SCTP・loopback への公開は `UNIMPLEMENTED`
 - 実機（root）での DNAT 到達確認は本変更では未実行
 

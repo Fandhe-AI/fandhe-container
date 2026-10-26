@@ -1777,7 +1777,7 @@ jobs:
           fi
           echo "SSD_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・#2596）
+      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・SEC-1・#2596・#2833）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
@@ -1800,6 +1800,21 @@ jobs:
             echo "::error::start_stop_delete_real did not report the create options line (possibly not executed)" >&2
             exit 1
           fi
+          # create --cap-drop の観測（#2833・SEC-1・CLI-1）: NET_RAW（CapPrm=CapEff=CapBnd=00000000a80405fb）と ALL（すべて 0）。
+          capdrop='start_stop_delete_real: create --cap-drop NET_RAW observed in the container:'
+          capdrop+=' CapPrm=CapEff=CapBnd=00000000a80405fb CapInh=CapAmb=0000000000000000;'
+          capdrop+=' inspect bounding lists 13 capabilities without CAP_NET_RAW'
+          if ! grep -Fxq "${capdrop}" "${log}"; then
+            echo "::error::start_stop_delete_real did not report the cap-drop NET_RAW line (possibly not executed)" >&2
+            exit 1
+          fi
+          capall='start_stop_delete_real: create --cap-drop ALL observed in the container:'
+          capall+=' CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty;'
+          capall+=' stop recorded Stopped(43); delete left no state dir'
+          if ! grep -Fxq "${capall}" "${log}"; then
+            echo "::error::start_stop_delete_real did not report the cap-drop ALL line (possibly not executed)" >&2
+            exit 1
+          fi
           part='start_stop_delete_real: scenario ok scope_present_before_delete='
           if ! grep -Fq "${part}" "${log}"; then
             echo "::error::start_stop_delete_real did not report: ${part} (possibly not executed)" >&2
@@ -1813,6 +1828,8 @@ jobs:
           done
           echo "${final}" >> "$GITHUB_STEP_SUMMARY"
           echo "${opts}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${capdrop}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${capall}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::start_stop_delete_real verified"
 
       # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の

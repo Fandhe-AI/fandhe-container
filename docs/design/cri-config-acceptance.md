@@ -126,7 +126,7 @@ sandbox 側（`LinuxSandboxSecurityContext.readonly_rootfs`）は出力しない
 containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`・`/etc/hosts`・`/etc/resolv.conf`）の bind を readonly_rootfs に従わせ、`/dev/shm` は rw と記憶しているが、本変更では一次情報（commit 指定）を再確認していない。以下は未検証の見込みとして扱う。
 
 - `/etc/resolv.conf` は readonly_rootfs=false でも本実装は常に ro（containerd は rw の見込み）。既存の差
-- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込み）。追跡 issue は未起票
+- `/proc` は readonly root で本実装は書き込めない（containerd は readonlyPaths を除き書ける見込み）。追跡 issue は [#2859](https://github.com/Fandhe-AI/fandhe-container/issues/2859)
 - `/etc/hosts`・`/etc/hostname` の供給を足すときは readonly_rootfs に従わせる
 - `process.cwd` が rootfs に無いとき、runc は作るが core は作らず失敗する（readonly とは独立した既存の差）
 

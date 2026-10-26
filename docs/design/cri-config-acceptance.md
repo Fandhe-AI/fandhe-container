@@ -190,17 +190,18 @@ containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`�
 - CRI の enum `Signal` の値は Linux の番号ではない（例: `SIGTERM = 23`、`SIGKILL = 13`）。`crates/cri/src/stop_signal.rs` の表で Linux の番号へ写す。`RUNTIME_DEFAULT`（0）は SIGTERM。実時間シグナルは glibc / moby の慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64。containerd・moby の表と一致することを照合済み。下記「外部の事実の照合」）
 - 未知の値は CreateContainer の検証で `INVALID_ARGUMENT`。StopContainer は記録した config から、StopPodSandbox はコンテナごとに値を求めて渡す（写像に失敗したら SIGTERM へ落とさず `INTERNAL`）
 - イメージ config の `StopSignal` を読む（#2771・OCI-1）。`ImageDefaults.stop_signal` へ解釈し、CRI の `stop_signal` が `RUNTIME_DEFAULT` のときだけ使う（無ければ SIGTERM）。CRI の明示値が優先される。解釈できない値は、CRI 側が既定以外でも CreateContainer を `INVALID_ARGUMENT` で拒否する（fail-closed。レイヤー展開の前に判定）
-- StopSignal で受ける形式（`parse_image_stop_signal`）:
+- StopSignal で受ける形式（`parse_image_stop_signal`。語彙の解釈は core の `Signal::parse_notation` に委ね、CLI の `stop --signal` と同じ部品を使う。#2832・CLI-1）:
 
   | 入力 | 結果 |
   | ---- | ---- |
   | 空・欠落 | 未指定 |
   | 数字だけ（1〜64。32・33 を除く） | その Linux 番号 |
   | `SIGTERM`・`TERM`・`sigterm`（`SIG` 接頭辞は任意・ASCII の大文字小文字を区別しない） | 名前の表との照合 |
-  | `SIGRTMIN`・`SIGRTMIN+1`〜`+15`・`SIGRTMAX`・`SIGRTMAX-1`〜`-14` | 実時間シグナル |
+  | `SIGRTMIN`・`SIGRTMIN+1`〜`+15`・`SIGRTMAX`・`SIGRTMAX-1`〜`-14`（オフセットは先頭 0 なしの 1〜2 桁） | 実時間シグナル。`RTMIN+01`・`RTMINPLUS3` 等の綴りは受けない |
+  | 別名 `IOT`・`CLD`・`POLL` | 番号経由で正規の名前（`SIGABRT`・`SIGCHLD`・`SIGIO`）へ寄る。送る番号は同じで、`ContainerStatus.stop_signal` は正規名で報告される |
   | 上記以外（空白・非 ASCII・範囲外・未知の名前・64 バイト超） | `INVALID_ARGUMENT`（固定文言。値は含めない） |
 
-- `ContainerStatus.stop_signal` は実際に stop で使う解決済みの値を返す（`ContainerRecord.stop_signal`。`RUNTIME_DEFAULT` は入れない）。`RUNTIME_DEFAULT` の config は SIGTERM（23）と報告され、別名の明示値（例: 15 = SIGPOLL）はそのまま返る。StopContainer・StopPodSandbox も同じ値を使う。置き場所と寿命は `applied_user` と同じ
+- `ContainerStatus.stop_signal` は実際に stop で使う解決済みの値を返す（`ContainerRecord.stop_signal`。`RUNTIME_DEFAULT` は入れない）。`RUNTIME_DEFAULT` の config は SIGTERM（23）と報告され、別名の明示値（例: 15 = SIGPOLL）はそのまま返る（CRI の明示値の話。イメージ由来の値は上表のとおり正規名に寄る）。StopContainer・StopPodSandbox も同じ値を使う。置き場所と寿命は `applied_user` と同じ
 
 ## capabilities の受け入れ方式（CRI-2・SEC-1。#2666）
 
@@ -386,6 +387,7 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 | kubernetes | `v1.37.1`（`crates/cri/proto` の cri-api `v0.37.1` と同期した版） | `f78e722310e50bcaca9276be22276d9e91d91308` |
 | containerd | `v2.4.2`（`go.mod` が `k8s.io/cri-api v0.37.0`・`github.com/moby/sys/signal v0.7.1` を使う） | `b7a25261e029d68978bbf290df0a62fc819b3c51` |
 | moby/sys | `signal/v0.7.1`（containerd `v2.4.2` が参照する版） | `cafbe42351600ca9b363e220722f66d96f6e71f4` |
+| OCI image-spec | `v1.1.1`（tag object `de7a13cc5ce022e0486d22211e80eb36f9d4a218`。2026-10-26 確認） | `147f9c13cedb47a0c4d9a11a222961073d585877` |
 
 ### dns_config の上限（kubelet）
 
@@ -400,9 +402,10 @@ pod の netns の結線（順 13）の最後で、`port_mappings` を `NetworkPl
 
 | 事実 | 出典 | 結果 |
 | ---- | ---- | ---- |
-| `SIGRTMIN` = 34・`SIGRTMAX` = 64 | [moby/sys `signal/signal_linux.go`](https://github.com/moby/sys/blob/cafbe42351600ca9b363e220722f66d96f6e71f4/signal/signal_linux.go#L13-L14)（`sigrtmin = 34`・`sigrtmax = 64`）と、`RTMIN+0..15`・`RTMAX-14..0` の表（L53-L83）。カーネルは 32〜64 の 33 個を持ち、glibc の NPTL が 2 個を使って `SIGRTMIN` を 34 にする（[man-pages `signal(7)`](https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man/man7/signal.7?h=man-pages-6.20)。tag `man-pages-6.20`） | 一致。本実装の表（`stop_signal.rs`）の 34〜64 と同じ |
+| `SIGRTMIN` = 34・`SIGRTMAX` = 64 | [moby/sys `signal/signal_linux.go`](https://github.com/moby/sys/blob/cafbe42351600ca9b363e220722f66d96f6e71f4/signal/signal_linux.go#L13-L14)（`sigrtmin = 34`・`sigrtmax = 64`）と、`RTMIN`・`RTMIN+1..15`・`RTMAX-14..-1`・`RTMAX` の表（L53-L83。`+0`・`-0`・先頭 0 のキーは無い）。カーネルは 32〜64 の 33 個を持ち、glibc の NPTL が 2 個を使って `SIGRTMIN` を 34 にする（[man-pages `signal(7)`](https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man/man7/signal.7?h=man-pages-6.20)。tag `man-pages-6.20`） | 一致。本実装の表（`stop_signal.rs`）の 34〜64 と同じ |
 | containerd が CRI の enum から名前・番号へ写す方法 | [`internal/cri/server/container_stop_signal.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_stop_signal.go#L27-L43)（enum 名から `SIGNAL_` を外し、`PLUS`・`MINUS` を `+`・`-` へ置換）→ [`container_stop.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_stop.go#L167-L199) が `signal.ParseSignal`（moby/sys の `signal.go` L38-L51。`SIG` を外して `SignalMap` を引く）で番号にする | 一致。`SIGRTMINPLUS1` は `RTMIN+1` = 35、`SIGRTMAXMINUS1` は `RTMAX-1` = 63。containerd は stop_signal を消費している（未対応ではない） |
 | イメージ config の `StopSignal` の扱い | [`container_create.go`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/internal/cri/server/container_create.go#L332-L339)（要求が `RUNTIME_DEFAULT` ならイメージの `StopSignal` を記録に使う） | 一致する差（本実装は読まない）。「既知の差」はそのまま |
+| イメージ `StopSignal` の語彙（moby `ParseSignal` と OCI image-spec。#2832） | moby/sys [`signal/signal.go`](https://github.com/moby/sys/blob/cafbe42351600ca9b363e220722f66d96f6e71f4/signal/signal.go) の `ParseSignal`: `Atoi` で数に読めれば 0 だけを拒否し範囲検査なしで受理（負数・`+15`・32・33・65 以上・先頭 0 も通る）。数でなければ Unicode の大文字化 → `SIG` 除去 → `SignalMap`。長さ上限なし。OCI image-spec [`config.md`](https://github.com/opencontainers/image-spec/blob/147f9c13cedb47a0c4d9a11a222961073d585877/config.md) の `StopSignal` は「`SIGNAME` 形式のシグナル名（例 `SIGKILL`・`SIGRTMIN+3`）を取りうる」とだけ書く | 名前の集合（別名 `IOT`・`CLD`・`POLL` を含む）は moby と同じ。本実装（core の `Signal::parse_notation`）は moby より厳しい: 符号つき数字・0・32・33・65 以上・非 ASCII・64 バイト超・空（cri は空を未指定とする）を拒否し、先頭 0 のオフセットも moby と同じく拒否する。番号・接頭辞なし・小文字は仕様の文面外で、moby の慣習に合わせた受理。別名は正規名へ寄せる |
 
 ### cgroup_parent（containerd・kubelet）
 

@@ -114,7 +114,7 @@ impl Signal {
     ///
     /// - 数字だけなら Linux の番号（1..=64。glibc が予約する 32・33 は拒否する）
     /// - それ以外は ASCII の大文字小文字を区別しない名前で、`SIG` 接頭辞は任意
-    ///   （`RTMIN`・`RTMIN+1..=15`・`RTMAX-14..=-1`・`RTMAX`、別名の `IOT`・`CLD`・`POLL` を含む）
+    ///   （`RTMIN`・`RTMIN+1..=15`・`RTMAX-14..=-1`・`RTMAX`。オフセットは先頭 0 なしの 1〜2 桁で moby の `SignalMap` と同じ。別名の `IOT`・`CLD`・`POLL` を含む）
     /// - 空・長さ上限（64 バイト）超え・非 ASCII・符号つき数字・空白は拒否する。長さは解釈の前に検査する
     ///
     /// エラーは [`ErrorCode::InvalidArgument`] で、固定の英語文言にし入力値を含めない。
@@ -196,6 +196,10 @@ fn signal_number_of_name(upper: &str) -> Option<u32> {
 /// 1〜2 桁の ASCII 数字だけの文字列を数にする（符号・空白・長い桁は `None`）。
 fn parse_small_decimal(text: &str) -> Option<u32> {
     if text.is_empty() || text.len() > 2 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // moby の `SignalMap` に先頭 0 のキー（`RTMIN+01` 等）は無い。イメージ由来の入力の受理範囲を広げない。
+    if text.len() == 2 && text.starts_with('0') {
         return None;
     }
     text.parse().ok()
@@ -1030,6 +1034,9 @@ mod tests {
             "RTMIN+16",
             "RTMAX-15",
             "RTMAX-0",
+            "RTMIN+01",
+            "RTMAX-01",
+            "SIGRTMIN+09",
             "RTMIN+",
             "SIGNAL_SIGTERM",
             "ＳＩＧＫＩＬＬ",

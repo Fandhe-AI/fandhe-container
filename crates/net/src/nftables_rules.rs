@@ -47,8 +47,8 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - 型付き expr は payload（load 形式）・masq・cmp・immediate・nat のみ。bitwise / meta は未実装（TASK-139）
-//! - ルールハンドルの取得経路（`NLM_F_ECHO` 応答の回収・GETRULE dump）。バッチ層が NEWRULE 応答を
-//!   受理しないため未対応で、[`NftRuleHandle::from_rule_attrs`] の純デコーダまで。詳細は各サブモジュールの doc
+//! - GETRULE dump によるハンドルの再照会・プロセス再起動後のハンドル復元。ハンドルは NEWRULE の
+//!   `NLM_F_ECHO` 応答（`RuleCreate::build_echo`。NET-3・#2839）からだけ取れる。詳細は各サブモジュールの doc
 //! - `NLA_F_NET_BYTEORDER` 付き属性のデコード（本エンコーダが出さないため現状は拒否。
 //!   GETRULE dump 等で必要になった時点で受理を検討する）
 

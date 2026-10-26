@@ -24,7 +24,9 @@ const ATTACH_RECORD_VERSION_LINE: &str = "fandhe-net-attach-claim v1";
 ///
 /// 請求書がどの接続世代の pin を指すかを固定する。inode 番号は解除後に再利用されうるため、連番を併せて持ち、
 /// 同じ endpoint・置き場に作り直された新しい pin を古い請求書で解除しないために使う（NET-1・#2681）。
-/// 連番は作成したプロセスの中でだけ意味を持ち、再起動後の記録は所有記録に照合できず解除自体が拒否される。
+/// 連番は現在時刻（ns）を下限に単調増加するため、再起動をまたいでも別世代と衝突しない。再起動後は、
+/// 置き場の `.owned/<endpoint>` に永続化した所有記録（#2824）と照合し、一致して初めて解除される。
+/// 所有記録の無い旧い請求書の pin は照合できず、解除自体が拒否される（手動回収）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PinIdentity {
     pub(crate) dev: u64,

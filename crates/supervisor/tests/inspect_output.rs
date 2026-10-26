@@ -23,9 +23,9 @@ use fandhe_container_supervisor::inspect::inspect;
 #[derive(Debug, PartialEq)]
 enum V {
     Null,
-    /// `rootReadonly` 用の真偽値（SUP-6・CORE-5・#2829）。
-    Bool(bool),
     Num(i64),
+    /// 真偽値(`rootReadonly` 用。#2828)。
+    Bool(bool),
     Str(String),
     /// 入れ子のオブジェクト（`auditCoverage` 用。出現順を保つ。SEC-4・#2027）。
     Obj(Vec<(String, V)>),
@@ -398,7 +398,7 @@ fn assert_schema(m: &BTreeMap<String, V>) {
     }
     assert!(
         matches!(m.get("rootReadonly"), Some(V::Null | V::Bool(_))),
-        "rootReadonly must be bool or null"
+        "rootReadonly must be null or bool"
     );
     match m.get("idMapping") {
         Some(V::Null) => {}
@@ -568,10 +568,9 @@ fn cli1_2775_capabilities_are_reported() {
     assert_eq!(expected.last(), Some(&s("CAP_SETFCAP")));
 }
 
-/// SUP-6・CORE-5・#2829: rootfs 読み取り専用の記録は `true` / `false` で出し、記録が無ければ `null`
-/// （`false` と推測しない）。
+/// CLI-1・SUP-12・#2828: 実効の `root.readonly` は `true` / `false` で出し、記録が無ければ `null`（推測しない）。
 #[test]
-fn sup6_core5_2829_root_readonly_is_reported() {
+fn cli1_2828_root_readonly_is_reported() {
     use fandhe_container_core::launch_isolation::{
         LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
     };

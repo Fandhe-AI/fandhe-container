@@ -285,6 +285,17 @@ fn cli1_create_start_usage_errors() {
         &["create", "c1"],
         &["create", "--bundle", "/b"],
         &["create", "--bundle", "/b", "--x", "c1"],
+        // `--read-only` は値を取らず 1 回まで(CLI-1・SUP-12・#2828)。
+        &[
+            "create",
+            "--read-only",
+            "--read-only",
+            "--bundle",
+            "/b",
+            "c1",
+        ],
+        &["create", "--read-only=true", "--bundle", "/b", "c1"],
+        &["create", "--read-only", "true", "--bundle", "/b", "c1"],
         &["start"],
         &["start", "a", "b"],
         &["--root"],

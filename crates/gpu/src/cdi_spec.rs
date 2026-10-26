@@ -68,7 +68,12 @@ const CDI_SPEC_ERROR_MESSAGE_MAX_BYTES: usize = 512;
 
 /// `CdiSpecError` の機械可読な分類（ERR-1。文字列は他 crate の `code` と揃える）。
 ///
-/// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
+/// `#[non_exhaustive]` のため、他 crate の `match` は網羅にできない。`_` に吸収させず、[`CdiSpecErrorCode::ALL`] 由来の
+/// `const` 表＋`find` と表外への明示の倒し先にし、試験で表の網羅を照合する（REPAIR-1・ERR-1）。
+/// 文字列から戻すときは [`CdiSpecErrorCode::from_name`] の `None` を fail-closed で扱う。
+///
+/// core の `ErrorCode` への写像は持たせない: gpu はワークスペース内の crate に依存せず、消費側（edits の適用。
+/// TASK-127 以降）がまだ無い。写像は消費側を作るときにその crate に `ALL` 由来の表で置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CdiSpecErrorCode {
@@ -86,6 +91,25 @@ pub enum CdiSpecErrorCode {
 }
 
 impl CdiSpecErrorCode {
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験（`ordinal` の網羅 match と件数）が検出する。
+    pub const ALL: [CdiSpecErrorCode; 5] = [
+        CdiSpecErrorCode::InvalidArgument,
+        CdiSpecErrorCode::ResourceExhausted,
+        CdiSpecErrorCode::NotFound,
+        CdiSpecErrorCode::Internal,
+        CdiSpecErrorCode::Unimplemented,
+    ];
+
+    /// `as_str` の逆写像。完全一致だけを受ける（大文字小文字の畳み込み・空白の除去をしない）。
+    ///
+    /// 未知は `None` で、呼び出し側は固定文言で拒否する（fail-closed。既知の variant へ黙って
+    /// 置き換えない）。現時点で製品経路の呼び出し元は無く、往復試験と将来の受信側のために置く。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
+
     /// 機械可読な `code` 文字列を返す（ERR-1）。
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -922,6 +946,56 @@ fn read_cdi_spec_file_inner(path: &Path) -> Result<CdiSpec, CdiSpecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: CdiSpecErrorCode) -> usize {
+        match code {
+            CdiSpecErrorCode::InvalidArgument => 0,
+            CdiSpecErrorCode::ResourceExhausted => 1,
+            CdiSpecErrorCode::NotFound => 2,
+            CdiSpecErrorCode::Internal => 3,
+            CdiSpecErrorCode::Unimplemented => 4,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err1_cdispecerrorcode_all_covers_every_variant() {
+        for (i, c) in CdiSpecErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(CdiSpecErrorCode::ALL.len(), 5);
+        let set: std::collections::HashSet<_> = CdiSpecErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 5);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err1_cdispecerrorcode_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (CdiSpecErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (CdiSpecErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (CdiSpecErrorCode::NotFound, "NOT_FOUND"),
+            (CdiSpecErrorCode::Internal, "INTERNAL"),
+            (CdiSpecErrorCode::Unimplemented, "UNIMPLEMENTED"),
+        ];
+        assert_eq!(table.len(), CdiSpecErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(CdiSpecErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(CdiSpecErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(CdiSpecErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
 
     const SECRET: &str = "DUMMY_SECRET_TOKEN_12345";
 

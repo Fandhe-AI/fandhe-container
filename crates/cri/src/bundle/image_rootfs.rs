@@ -77,7 +77,7 @@ use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
 
 use super::provider::{RootfsSource, UserResolveRequest};
-use super::spec::ImageDefaults;
+use super::spec::{ImageDefaults, ResolvedImage};
 use crate::error::CriError;
 use crate::image_pull::{
     DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, canonical_reference,
@@ -183,7 +183,7 @@ impl ImageRootfsSource {
     }
 
     /// `ImageSpec` を検証し、image ID（config digest）へ解決する。キャッシュには触れない。
-    fn resolve_image_id(&self, spec: &ImageSpec) -> Result<Digest, CriError> {
+    fn resolve_image(&self, spec: &ImageSpec) -> Result<ResolvedImage, CriError> {
         let bad = || CriError::invalid_argument("image reference is invalid");
         let too_long = |s: &str| s.len() > MAX_IMAGE_FIELD_BYTES;
         if spec.image.is_empty()
@@ -208,8 +208,8 @@ impl ImageRootfsSource {
             let found = store
                 .get(&spec.image)
                 .map_err(|_| CriError::internal("image store is unavailable"))?;
-            if let Some(id) = found.and_then(|r| Digest::parse(r.id()).ok()) {
-                return Ok(id);
+            if let Some(resolved) = found.and_then(|r| resolved_from_record(&r)) {
+                return Ok(resolved);
             }
             // 短縮名（`alpine:3.20` 等）は PullImage と同じ規則で正規化して再照会する（`ImageStatus` と同じ。CRI-3・CRI-4）。
             // 長さ・NUL の検証は上で済ませてあり、正規化した文字列は在庫の照会にしか使わない（パス要素にしない）。
@@ -219,8 +219,8 @@ impl ImageRootfsSource {
                 let found = store
                     .get(&canonical)
                     .map_err(|_| CriError::internal("image store is unavailable"))?;
-                if let Some(id) = found.and_then(|r| Digest::parse(r.id()).ok()) {
-                    return Ok(id);
+                if let Some(resolved) = found.and_then(|r| resolved_from_record(&r)) {
+                    return Ok(resolved);
                 }
             }
         }
@@ -228,7 +228,14 @@ impl ImageRootfsSource {
             spec.image.len() == 64 && spec.image.bytes().all(|b| b.is_ascii_hexdigit());
         if spec.image.starts_with("sha256:") || is_bare_hex {
             // image ID の形をしているものは、形が不正なら INVALID_ARGUMENT（素の hex も受けない）。
-            return Digest::parse(&spec.image).map_err(|_| bad());
+            let id = Digest::parse(&spec.image).map_err(|_| bad())?;
+            // 在庫があれば digest 参照も拾う（在庫に無い・照会できない場合は image ID だけ。#2831）。
+            let reference = self
+                .store
+                .as_ref()
+                .and_then(|store| store.get(id.as_str()).ok().flatten())
+                .and_then(|r| r.repo_digests().first().cloned());
+            return Ok(ResolvedImage::new(id, reference));
         }
         if self.store.is_some() {
             // 解決は実行済みで参照が未知なだけなので、機能欠如ではなく NOT_FOUND を返す。
@@ -247,6 +254,15 @@ impl ImageRootfsSource {
         }
         Ok(())
     }
+}
+
+/// 在庫の記録から image ID と digest 参照（`repo_digests[0]`）を取る（#2831・CRI-2・OCI-1）。
+fn resolved_from_record(record: &crate::image_service::ImageRecord) -> Option<ResolvedImage> {
+    let id = Digest::parse(record.id()).ok()?;
+    Some(ResolvedImage::new(
+        id,
+        record.repo_digests().first().cloned(),
+    ))
 }
 
 /// 展開成功後に rootfs 自体へ検索権限（0755）を付ける（CRI-2・SEC-1）。
@@ -389,6 +405,7 @@ fn defaults_from(process: &ImageProcessConfig) -> Result<ImageDefaults, CriError
         resolved_run_as_username: None,
         supplementary_gids: Vec::new(),
         stop_signal: crate::stop_signal::parse_image_stop_signal(process.stop_signal())?,
+        resolved_image: None,
     })
 }
 
@@ -697,7 +714,9 @@ impl RootfsSource for ImageRootfsSource {
         user: &UserResolveRequest<'_>,
     ) -> Result<ImageDefaults, CriError> {
         let started = Instant::now();
-        let id = self.resolve_image_id(image)?;
+        let resolved = self.resolve_image(image)?;
+        let id = Digest::parse(resolved.id_str())
+            .map_err(|_| CriError::internal("resolved image id is invalid"))?;
         let opts = &self.config.extract_options;
         let blobs = prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])?;
         let entries = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
@@ -713,6 +732,7 @@ impl RootfsSource for ImageRootfsSource {
         let layers = read_layers(&entry.join(RECORD_FILE), &settings, entries.owner)?;
         let (diff_ids, process) = read_config(&blobs.path, blobs.owner, &id)?;
         let mut defaults = defaults_from(&process)?;
+        defaults.resolved_image = Some(resolved);
         if layers.len() != diff_ids.len() {
             return Err(CriError::new(
                 crate::error::CriErrorCode::DataLoss,

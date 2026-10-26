@@ -50,6 +50,11 @@
 //! 2 つ目のコンテナは `--cap-drop ALL` で短い一連（create → start → 観測 → stop → delete）を通し、5 集合すべてが 0・`bounding` が `[]` であることを照合する。
 //! `production_launcher` のシナリオ T は config の `process.capabilities` を直接書く経路で、本節は CLI の `create --cap-drop` → `start` 経路の担当（分担）。
 //!
+//! # create の `--read-only` の観測（#2828・CLI-1・SUP-12・CORE-5）
+//! 1 つ目のコンテナの create には `--read-only` も付ける（#2828・CLI-1・SUP-12・CORE-5）。プローブは rootfs 直下への新規作成の errno を
+//! `OPT_ROOT_RO <errno>` として出し、親が `logs` で `stdout OPT_ROOT_RO 30`（`EROFS`。Landlock の `EACCES` = 13 ではなく
+//! mount の RDONLY が効いたことの観測）を完全一致で照合する。あわせて `inspect` の出力に `"rootReadonly":true` が出ることも照合する。
+//!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
 //! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
 
@@ -139,6 +144,9 @@ mod linux {
     const NET_RAW_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[\"CAP_CHOWN\",\"CAP_DAC_OVERRIDE\",\"CAP_FOWNER\",\"CAP_FSETID\",\"CAP_KILL\",\"CAP_SETGID\",\"CAP_SETUID\",\"CAP_SETPCAP\",\"CAP_NET_BIND_SERVICE\",\"CAP_SYS_CHROOT\",\"CAP_MKNOD\",\"CAP_AUDIT_WRITE\",\"CAP_SETFCAP\"]}";
     /// `--cap-drop ALL` のときの `inspect` の `capabilities` の観測。
     const ALL_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[]}";
+    /// `create --read-only` のコンテナ内で、rootfs 直下への新規作成が返すべき errno(`EROFS` = 30。#2828)。
+    /// mount の RDONLY が Landlock の拒否(`EACCES` = 13)より先に効くため 30 になる。13 や 0 は失敗として扱う。
+    const OPT_ROOT_RO_LINE: &str = "stdout OPT_ROOT_RO 30";
     /// `/proc/<pid>/status` の `SigCgt` で SIGTERM（15）に当たるビット（1 << 14）。
     const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
 
@@ -155,6 +163,7 @@ mod linux {
         for key in CAP_KEYS {
             let _ = writeln!(out, "OPT_CAP {key} {}", read_cap(key));
         }
+        let _ = writeln!(out, "OPT_ROOT_RO {}", probe_root_write_errno());
         let _ = writeln!(out, "READY_TERM");
         let _ = out.flush();
         let deadline = Instant::now() + PROBE_LIFETIME;
@@ -162,6 +171,22 @@ mod linux {
             thread::sleep(Duration::from_millis(100));
         }
         std::process::exit(8);
+    }
+
+    /// rootfs 直下へ新規ファイルを作る試みの errno(成功したら `0` で、作ったファイルは消す。errno が無い失敗は `-1`)。
+    fn probe_root_write_errno() -> i32 {
+        let path = "/fandhe_ro_probe_2828";
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => {
+                let _ = fs::remove_file(path);
+                0
+            }
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        }
     }
 
     /// `/proc/self/limits` の `Max open files` 行の soft / hard（読めなければ `unreadable`）。読み取りには上限を付ける。
@@ -494,6 +519,7 @@ mod linux {
                 "--root",
                 &root_s,
                 "create",
+                "--read-only",
                 "--ulimit",
                 OPT_ULIMIT,
                 "--env",
@@ -573,13 +599,14 @@ mod linux {
         let mut last_logs = String::new();
         let logs_ok = wait_until(
             STATE_TIMEOUT,
-            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV, OPT_CAP)",
+            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV, OPT_ROOT_RO, OPT_CAP)",
             || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
                 Ok(o) if o.code == Some(0) => {
                     let has = |want: &str| o.stdout.lines().any(|l| l == want);
                     let found = has("stdout READY_TERM")
                         && has(OPT_NOFILE_LINE)
                         && has(OPT_ENV_LINE)
+                        && has(OPT_ROOT_RO_LINE)
                         && has_cap_lines(&o.stdout, NET_RAW_DROPPED_MASK);
                     last_logs = o.stdout;
                     found
@@ -598,6 +625,24 @@ mod linux {
         // create --cap-drop NET_RAW: ホスト側の /proc と inspect でも照合する（#2833・SEC-1・CLI-1）
         check_host_caps(pid, NET_RAW_DROPPED_MASK)?;
         check_inspect_caps(&cli, &root_s, &id_s, NET_RAW_DROPPED_INSPECT)?;
+        // `--read-only` の実効値は分離の記録として `inspect` にも出る(CLI-1・SUP-12・#2828)。
+        let out = run_cli(&cli, &["--root", &root_s, "inspect", &id_s], CLI_TIMEOUT)?;
+        expect_ok_code(&out, "inspect")?;
+        if !out.stdout.contains("\"status\":\"running\"") {
+            return Err(format!("inspect did not report running: {:?}", out.stdout));
+        }
+        if !out.stdout.contains("\"capabilities\":{\"bounding\":[") {
+            return Err(format!(
+                "inspect did not report capabilities.bounding: {:?}",
+                out.stdout
+            ));
+        }
+        if !out.stdout.contains("\"rootReadonly\":true") {
+            return Err(format!(
+                "inspect did not report rootReadonly=true: {:?}",
+                out.stdout
+            ));
+        }
         let container_log = root.join("@container-logs").join(format!("{id_s}.log"));
         let supervisor_log = root.join("@supervisor-logs").join(format!("{id_s}.log"));
         expect(

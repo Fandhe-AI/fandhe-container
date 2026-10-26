@@ -43,8 +43,11 @@
 //! - 解除（`unpin`）が失敗したら `ContainerNetns` を呼び出し側へ返す（再試行可能）
 //! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
 //!   もの）だけを対象にする。記録の無いファイル・マウントは形が pin と同じでも削除・アンマウントしない
-//!   （fail-closed）。作成プロセスの終了後・再起動後の残置 pin の清掃は、永続的な所有記録と照合する設計
-//!   で扱う（未実装。担当 Issue 未確定。REPAIR-3）ため、それまでは本 API からは解除できない
+//!   （fail-closed）
+//! - 作成プロセスの終了後・再起動後の残置 pin は、置き場の `.owned/<endpoint>` に永続化した所有記録
+//!   （`owner_record`。#2824）と、attach の取り残しの請求書に控えた識別子（`unpin_path_expecting`）の
+//!   両方に一致し、さらにカーネルの実状態（nsfs の inode は umount の前、pin ファイルの inode と形は
+//!   unlink の前）も一致したときだけ解除できる。識別子を持たない `unpin_path` は再起動後の pin を扱わない
 //!
 //! # 権限
 //!
@@ -71,6 +74,9 @@ use crate::network::attach_claim::PinIdentity;
 use crate::network::delete::PinCheckError;
 use crate::network::{EndpointId, NetnsFailure, ResourceState, UnpinFailure};
 use crate::sys::{self, SysError};
+
+mod owner_record;
+use owner_record::{OwnedDir, OwnerRecord};
 
 /// `ns` ファイルの絶対パス。`unshare` したスレッド自身の netns を指す。
 const THREAD_NS_PATH: &CStr = c"/proc/thread-self/ns/net";
@@ -459,6 +465,28 @@ fn remove_pin_file(pin: &Path, fid: FileId) -> Option<ResourceState> {
     }
 }
 
+/// [`remove_pin_file`] に加え、消せた（または既に無かった）ときは永続の所有記録 `.owned/<name>` も、
+/// 中身が自分の世代（pin ファイルの識別子と連番）と一致するときだけ消す。新しい世代の記録は消さない。
+fn remove_pin_file_in(dir: &PinDir, name: &std::ffi::OsStr, fid: FileId) -> Option<ResourceState> {
+    let rec = lookup_pin(fid);
+    let left = remove_pin_file(&dir.entry(name), fid);
+    if left.is_none() {
+        forget_ledger(dir, name, rec);
+    }
+    left
+}
+
+/// 永続の所有記録を、`rec`（メモリの記録から控えた自分の世代）と一致するときだけ消す。失敗は無視する
+/// （pin の無い古い記録は無害で、次の作成が上書きする）。
+fn forget_ledger(dir: &PinDir, name: &std::ffi::OsStr, rec: Option<PinRecord>) {
+    let (Some(rec), Some(n)) = (rec, name.to_str()) else {
+        return;
+    };
+    if let Ok(owned) = OwnedDir::open(dir, false) {
+        owned.remove_if_matches(n, rec.file, rec.serial);
+    }
+}
+
 /// `base` 直下に `id` 名の pin を作り、新しい netns をそこへ固定する。
 ///
 /// 成功時は `ContainerNetns`（fd と pin パス）と、検査して開いた置き場ディレクトリの識別子
@@ -483,6 +511,8 @@ pub(crate) fn create_pinned(
     let pin = base.join(name);
     // 本関数内の操作に使う、固定したディレクトリ経由のパス。
     let via = dir.entry(name);
+    // 永続の所有記録の置き場（#2824）。何かを作る前に開き、使えなければ何も作らずに失敗する。
+    let owned = OwnedDir::open(&dir, true).map_err(|e| fail(e, None))?;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -507,31 +537,49 @@ pub(crate) fn create_pinned(
     if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o400)) {
         return Err(fail(
             io_error("chmod netns pin file", &e),
-            remove_pin_file(&via, fid),
+            remove_pin_file_in(&dir, name, fid),
         ));
+    }
+    // 永続の所有記録を、netns を固定する前に置く（`ns=-`）。完了後に `ns` つきで置き換える。
+    // 記録できなければ pin を作らずに失敗する（再起動後に照合できない pin を作らない）。
+    let serial = lookup_pin(fid).map_or(0, |r| r.serial);
+    let write_ledger = |ns: Option<FileId>| {
+        owned.replace(
+            id.as_str(),
+            &OwnerRecord {
+                endpoint: id.as_str().to_owned(),
+                file: fid,
+                ns,
+                serial,
+            },
+        )
+    };
+    if let Err(e) = write_ledger(None) {
+        return Err(fail(e, remove_pin_file_in(&dir, name, fid)));
     }
     let target = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
         fail(
             NetError::new(NetErrorCode::Internal, "invalid pin target"),
-            remove_pin_file(&via, fid),
+            remove_pin_file_in(&dir, name, fid),
         )
     })?;
 
     // 伝播検査は pin ファイルの作成後に行う（既存物への `AlreadyExists` を先に返すため）。
     // 拒否したら自分が作ったファイルだけ消す。
     if let Err(e) = check_dir_propagation(&dir) {
-        return Err(fail(e, remove_pin_file(&via, fid)));
+        return Err(fail(e, remove_pin_file_in(&dir, name, fid)));
     }
     let via_c = CString::new(via.as_os_str().as_bytes()).map_err(|_| {
         fail(
             NetError::new(NetErrorCode::InvalidArgument, "netns path contains NUL"),
-            remove_pin_file(&via, fid),
+            remove_pin_file_in(&dir, name, fid),
         )
     })?;
 
     let handoff: Arc<Handoff> = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
     let worker_handoff = Arc::clone(&handoff);
     let worker_via = via.clone();
+    let worker_name = name.to_owned();
     // ワーカーが後始末を担う間も `/proc/self/fd/<dirfd>` を有効に保つ。
     let worker_dir = Arc::clone(&dir);
     // 時間切れ後もワーカーが完走するまで `unpin_path` を拒否させる（unlink との競合防止）。
@@ -541,7 +589,7 @@ pub(crate) fn create_pinned(
         .spawn(move || {
             // `file` を握ったまま mount することで、`/proc/self/fd/<n>` が差し替え不能な対象を指す。
             let _hold = file;
-            let _dir = worker_dir;
+            let dir = worker_dir;
             let inflight = inflight;
             let result = unshare_and_pin(&target).map(|(fd, ns_id, sock)| {
                 set_pin_ns(fid, ns_id);
@@ -552,7 +600,7 @@ pub(crate) fn create_pinned(
             if matches!(*slot, Slot::Abandoned) {
                 // 呼び出し側は期限切れで見切り済み。完了した副作用はこのスレッドが回収する。
                 drop(slot);
-                reclaim_abandoned(&via_c, &worker_via, fid, result.is_ok());
+                reclaim_abandoned(&dir, &worker_name, &via_c, &worker_via, fid, result.is_ok());
                 drop(inflight);
             } else {
                 drop(inflight);
@@ -566,7 +614,7 @@ pub(crate) fn create_pinned(
                 NetErrorCode::ResourceExhausted,
                 "failed to spawn netns thread",
             ),
-            remove_pin_file(&via, fid),
+            remove_pin_file_in(&dir, name, fid),
         ));
     }
 
@@ -579,7 +627,18 @@ pub(crate) fn create_pinned(
     match std::mem::replace(&mut *guard, Slot::Abandoned) {
         Slot::Done(Ok((fd, sock))) => {
             // bind 以降は呼び出し側スレッドで行う（bind は socket 作成時の netns を引き継ぐ）。
-            match NetlinkRouteSocket::from_unbound_route_fd(sock, Arc::clone(recorder)) {
+            // 完全な所有記録（`ns` つき）へ置き換えてからハンドルを作る。置けなければ pin を解除して失敗する
+            // （生きている pin の所有記録は常に完全、という不変条件を保つ）。
+            let ns = lookup_pin(fid).and_then(|r| r.ns);
+            let route = match ns {
+                Some(_) => write_ledger(ns),
+                None => Err(NetError::new(
+                    NetErrorCode::Internal,
+                    "netns identity was not recorded",
+                )),
+            }
+            .and_then(|()| NetlinkRouteSocket::from_unbound_route_fd(sock, Arc::clone(recorder)));
+            match route {
                 Ok(route) => Ok((
                     ContainerNetns {
                         fd,
@@ -601,7 +660,7 @@ pub(crate) fn create_pinned(
                 }
             }
         }
-        Slot::Done(Err(error)) => Err(fail(error, remove_pin_file(&via, fid))),
+        Slot::Done(Err(error)) => Err(fail(error, remove_pin_file_in(&dir, name, fid))),
         Slot::Pending => Err(fail(
             NetError::new(NetErrorCode::Timeout, "timed out creating netns"),
             Some(ResourceState::Unknown),
@@ -633,11 +692,21 @@ type Handoff = (Mutex<Slot>, Condvar);
 ///
 /// `via_c` / `via` は固定した置き場ディレクトリ経由のパス（`/proc/self/fd/<dirfd>/<名前>`）。呼び出し側の
 /// ワーカーがディレクトリの fd を保持している間だけ有効。
-fn reclaim_abandoned(via_c: &CStr, via: &Path, fid: FileId, mounted: bool) {
+fn reclaim_abandoned(
+    dir: &PinDir,
+    name: &std::ffi::OsStr,
+    via_c: &CStr,
+    via: &Path,
+    fid: FileId,
+    mounted: bool,
+) {
     if mounted && sys::unmount_detach(via_c).is_err() {
         return;
     }
-    let _ = remove_pin_file(via, fid);
+    let rec = lookup_pin(fid);
+    if remove_pin_file(via, fid).is_none() {
+        forget_ledger(dir, name, rec);
+    }
 }
 
 /// pin を外す（`umount2(MNT_DETACH)` → ファイル削除）。fd を drop し参照が尽きれば、カーネルが
@@ -668,8 +737,9 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 ///   （操作の直前に stat し直して照合）。記録が無い pin（作成プロセスの終了後・再起動後の残置）は、
 ///   マウントの有無に関わらず umount・削除の前に `FailedPrecondition` で拒否する。形（mode `0o400`・
 ///   サイズ 0・実効 UID 所有の通常ファイル）だけでは本モジュールが作った pin と証明できず、任意の空ファイルの
-///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は、永続的な所有記録と
-///   照合する設計で扱う（未実装。担当 Issue 未確定。REPAIR-3）
+///   削除や同一 UID の別プロセスの netns の破棄につながるため。プロセスをまたぐ清掃は
+///   `unpin_path_expecting`（請求書の識別子と、置き場の `.owned/<名前>` に永続化した所有記録の
+///   三者照合。#2824）だけが扱い、識別子を持たない本関数は扱わない（連番で世代を固定できないため）
 /// - pin を開いた fd の mount ID が置き場と同じ（未マウント）か、その ID の mountinfo の行が `nsfs` である
 /// - アンマウント後の実体が、作成時の pin ファイル（上記 inode）かつ本モジュールが作った形
 ///   （実効 UID 所有・mode `0o400`・サイズ 0 の通常ファイル）
@@ -765,7 +835,23 @@ fn unpin_in_dir(
     let dir_mnt_id =
         file_mount_id(&dir.file).map_err(|e| io_error("read fdinfo of netns directory", &e))?;
     // 本プロセスの記録（所有の証明）を引く。nsfs マウントの解除は記録がある場合に限る（下記）。
-    let record = lookup_pin(current);
+    let mut record = lookup_pin(current);
+    // メモリに記録が無く、請求書の識別子が与えられた場合（作成プロセスの終了後・再起動後の pin）は、
+    // 永続の所有記録（`.owned/<name>`）を読んで同じ形の記録として扱う。記録が欠けている・壊れている・
+    // 属性違反は照合不能として、何も外さずに拒否する（fail-closed）。請求書との照合は直後の判定が行い、
+    // 記録と実体の照合（nsfs の inode は umount の前、pin ファイルの inode と形は unlink の前）は
+    // 以降の既存の判定が行う。
+    if record.is_none()
+        && expected.is_some()
+        && let Some(n) = name.to_str()
+    {
+        let ledger = OwnedDir::open(dir, false)?.read(n)?;
+        record = Some(PinRecord {
+            file: ledger.file,
+            ns: ledger.ns,
+            serial: ledger.serial,
+        });
+    }
     // 請求書に控えた識別子があれば、現在の pin が同じ作成のものでなければ何も解除しない（別世代の pin を守る）。
     if let Some(want) = expected {
         let same = record.is_some_and(|r| {
@@ -814,7 +900,8 @@ fn unpin_in_dir(
         PinMount::Nsfs => {
             // 所有を証明できない nsfs マウントは umount 前に拒否する（fail-closed）。umount すると
             // 後続の検査で拒否しても名前空間は既に切り離されており、同一 UID の別プロセスの pin を
-            // 破棄しうる。作成プロセス終了後の清掃は永続状態による所有照合（未実装。担当 Issue 未確定。REPAIR-3）で行う。
+            // 破棄しうる。作成プロセス終了後の清掃は、永続の所有記録（`record` へ読み込み済み。#2824）との
+            // 照合を通ったものだけで、ここでも umount の前に nsfs の inode を照合する。
             let Some(r) = record else {
                 return Err(not_our_pin());
             };
@@ -830,6 +917,7 @@ fn unpin_in_dir(
                 Ok(_) => return Err(not_our_pin()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     forget_pin(r.file);
+                    forget_ledger(dir, name, Some(r));
                     return Ok(());
                 }
                 Err(e) => return Err(io_error("stat netns pin", &e)),
@@ -864,6 +952,7 @@ fn unpin_in_dir(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Some(r) = record {
                 forget_pin(r.file);
+                forget_ledger(dir, name, Some(r));
             }
             return Ok(());
         }
@@ -876,6 +965,7 @@ fn unpin_in_dir(
     }
     if let Some(r) = record {
         forget_pin(r.file);
+        forget_ledger(dir, name, Some(r));
     }
     forget_pin(final_id);
     Ok(())
@@ -905,8 +995,26 @@ struct PinRecord {
     serial: u64,
 }
 
-/// pin の作成の連番の払い出し元。
+/// pin の作成の連番の払い出し元（直前に払い出した値）。
 static PIN_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// 作成の連番を払い出す。プロセス内で単調増加し、現在時刻（UNIX epoch からの ns）を下限にするため、
+/// 再起動後の値は前のプロセスの値より大きくなる（請求書・永続の所有記録の連番が再起動をまたいで
+/// 衝突しない。#2824）。時計が戻った場合に限り衝突しうるが、照合は dev:ino の一致も要るため、
+/// 実害には複数の偶然の一致が必要になる（残余リスクとして `docs/design/network-reclaim-persistence.md` に記す）。
+fn next_pin_serial() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
+    let prev = PIN_SERIAL
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
+            Some(p.saturating_add(1).max(now))
+        })
+        .unwrap_or(0);
+    prev.saturating_add(1).max(now)
+}
 
 /// 本プロセスが作成して未解除の pin。`unpin_path` が所有の証明に使う（形の検査だけでは足りないため）。
 static PINS: Mutex<Vec<PinRecord>> = Mutex::new(Vec::new());
@@ -914,7 +1022,7 @@ static PINS: Mutex<Vec<PinRecord>> = Mutex::new(Vec::new());
 fn register_pin(file: FileId) {
     let mut v = PINS.lock().unwrap_or_else(PoisonError::into_inner);
     v.retain(|r| r.file != file);
-    let serial = PIN_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let serial = next_pin_serial();
     v.push(PinRecord {
         file,
         ns: None,
@@ -1209,7 +1317,8 @@ mod tests {
     }
 
     /// NET-1・P0: 所有記録の無いファイルは、置き場検証と形の検査（実効 UID 所有・0o400・空の通常ファイル）を
-    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は未実装で担当 Issue 未確定）。
+    /// 通っても削除しない（作成プロセスの終了後の残置を含む。プロセスをまたぐ清掃は永続の所有記録と請求書の
+    /// 識別子を要する `unpin_path_expecting` だけが扱う。#2824）。
     #[test]
     fn net1_unpin_path_rejects_pin_shaped_file_without_record() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1253,6 +1362,226 @@ mod tests {
         fs::remove_file(&pin).unwrap();
         fs::remove_file(&kept).unwrap();
         fs::remove_dir(&dir).unwrap();
+    }
+
+    /// `create_pinned` と同じ手順（pin ファイルの作成 → メモリの記録 → 永続の所有記録）で、未マウントの pin を作る。
+    /// 実 netns を作らないため `ns` は `None`（非 root の試験用）。請求書に控える識別子を返す。
+    fn make_ledgered_pin(base: &Path, name: &str) -> PinIdentity {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = open_pin_dir(base).unwrap();
+        let owned = OwnedDir::open(&dir, true).unwrap();
+        let pin = base.join(name);
+        fs::write(&pin, b"").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o400)).unwrap();
+        let fid = file_id(&fs::symlink_metadata(&pin).unwrap());
+        register_pin(fid);
+        let serial = lookup_pin(fid).unwrap().serial;
+        owned
+            .replace(
+                name,
+                &OwnerRecord {
+                    endpoint: name.to_owned(),
+                    file: fid,
+                    ns: None,
+                    serial,
+                },
+            )
+            .unwrap();
+        PinIdentity {
+            dev: fid.0,
+            ino: fid.1,
+            serial,
+        }
+    }
+
+    /// 再起動の模擬: その pin のメモリの記録だけを外す（`PINS` 全体は並行する他の試験のため消さない）。
+    fn simulate_restart(pin: &Path) {
+        forget_pin(file_id(&fs::symlink_metadata(pin).unwrap()));
+    }
+
+    fn ledger_path(base: &Path, name: &str) -> PathBuf {
+        base.join(".owned").join(name)
+    }
+
+    fn cleanup_scratch(base: &Path) {
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// NET-1・REPAIR-3・#2824: 再起動後（メモリの記録なし）でも、永続の所有記録と請求書の識別子が一致する
+    /// pin は外せる。pin ファイルと所有記録の両方が消える。
+    #[test]
+    fn net1_unpin_expecting_cross_process_removes_recorded_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-ok");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let want = make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        unpin_path_expecting(&pin, want).unwrap();
+        assert!(!pin.exists());
+        assert!(!ledger_path(&base, "web-1").exists());
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・REPAIR-3・#2824: 所有記録が無い・壊れている・symlink・mode 違反なら、何も外さずに拒否する。
+    #[test]
+    fn net1_unpin_expecting_cross_process_rejects_missing_or_invalid_record() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let base = scratch_dir("xproc-bad");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let want = make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        let ledger = ledger_path(&base, "web-1");
+        let good = fs::read(&ledger).unwrap();
+        let expect_rejected = |what: &str| {
+            let e = unpin_path_expecting(&pin, want).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition, "{what}");
+            assert_eq!(
+                e.message(),
+                "netns pin has no valid ownership record",
+                "{what}"
+            );
+            assert!(pin.exists(), "{what}");
+        };
+        // 壊れた中身
+        fs::write(&ledger, b"garbage\n").unwrap();
+        expect_rejected("garbage");
+        // mode 違反
+        fs::write(&ledger, &good).unwrap();
+        fs::set_permissions(&ledger, fs::Permissions::from_mode(0o644)).unwrap();
+        expect_rejected("mode 0644");
+        // symlink
+        fs::remove_file(&ledger).unwrap();
+        let other = base.join("other-record");
+        fs::write(&other, &good).unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&other, &ledger).unwrap();
+        expect_rejected("symlink");
+        // 欠落
+        fs::remove_file(&ledger).unwrap();
+        expect_rejected("missing");
+        // 置き場ごと欠落
+        fs::remove_file(&other).unwrap();
+        fs::remove_dir(base.join(".owned")).unwrap();
+        expect_rejected("missing dir");
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・REPAIR-3・#2824: 請求書の識別子（serial・ino・dev のどれか 1 つ）が記録と違えば拒否し、何も外さない。
+    #[test]
+    fn net1_unpin_expecting_cross_process_rejects_identity_mismatch() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-mismatch");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let want = make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        for (what, bad) in [
+            (
+                "serial",
+                PinIdentity {
+                    serial: want.serial + 1,
+                    ..want
+                },
+            ),
+            (
+                "ino",
+                PinIdentity {
+                    ino: want.ino + 1,
+                    ..want
+                },
+            ),
+            (
+                "dev",
+                PinIdentity {
+                    dev: want.dev + 1,
+                    ..want
+                },
+            ),
+        ] {
+            let e = unpin_path_expecting(&pin, bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition, "{what}");
+            assert_eq!(
+                e.message(),
+                "netns pin is not the one this claim was issued for",
+                "{what}"
+            );
+            assert!(pin.exists(), "{what}");
+            assert!(ledger_path(&base, "web-1").exists(), "{what}");
+        }
+        unpin_path_expecting(&pin, want).unwrap();
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・REPAIR-3・#2824（AC3）: 手動回収のあと同じ名前に作り直された新しい pin を、古い請求書では外さない。
+    #[test]
+    fn net1_unpin_expecting_rejects_recreated_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-recreated");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = base.join("web-1");
+        let id1 = make_ledgered_pin(&base, "web-1");
+        simulate_restart(&pin);
+        // 手動回収（pin だけ消す。所有記録は残る）→ 同じ名前に作り直す（新しい連番の記録が上書きする）。
+        fs::remove_file(&pin).unwrap();
+        let id2 = make_ledgered_pin(&base, "web-1");
+        assert_ne!(id1.serial, id2.serial);
+        let rejected = |id: PinIdentity, what: &str| {
+            let e = unpin_path_expecting(&pin, id).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition, "{what}");
+            assert_eq!(
+                e.message(),
+                "netns pin is not the one this claim was issued for",
+                "{what}"
+            );
+            assert!(pin.exists(), "{what}");
+        };
+        // 同じプロセス内（メモリの記録あり）でも古い請求書は拒否される。
+        rejected(id1, "in-process");
+        // 再起動後（所有記録との照合）でも拒否される。dev・ino が同じで連番だけ古い識別子も同様。
+        simulate_restart(&pin);
+        rejected(id1, "after restart");
+        rejected(
+            PinIdentity {
+                dev: id2.dev,
+                ino: id2.ino,
+                serial: id1.serial,
+            },
+            "same inode, old serial",
+        );
+        unpin_path_expecting(&pin, id2).unwrap();
+        assert!(!pin.exists());
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・REPAIR-3・#2824: 識別子を持たない `unpin_path` は、所有記録があっても再起動後の pin を外さない。
+    #[test]
+    fn net1_unpin_path_ignores_ledger_after_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-noexpect");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・REPAIR-3・#2824: 作成の連番は単調増加し、現在時刻（ns）を下限にする（再起動後に衝突しない）。
+    #[test]
+    fn net1_next_pin_serial_is_monotonic_and_time_based() {
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap())
+            .unwrap();
+        let a = next_pin_serial();
+        let b = next_pin_serial();
+        let c = next_pin_serial();
+        assert!(a >= start, "a={a} start={start}");
+        assert!(b > a && c > b, "a={a} b={b} c={c}");
     }
 
     /// NET-1: 作成時の識別子と異なる実体へ差し替わった pin ファイルは、失敗時の後始末でも削除しない。
@@ -1606,6 +1935,172 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// 実機前提（root）の別プロセス試験の子役: 環境変数で指定された置き場に実 netns を pin し、識別子を
+    /// 標準出力へ出して終了する（pin は解除しない）。環境変数が無ければ何もしない（親役から起動されたときだけ働く）。
+    #[test]
+    #[ignore = "real-machine child role of net1_xproc_nsfs_pin_cleanup (needs root)"]
+    fn net1_xproc_child_create_pin() {
+        let (Ok(base), Ok(name)) = (
+            std::env::var("FANDHE_NETNS_XPROC_BASE"),
+            std::env::var("FANDHE_NETNS_XPROC_NAME"),
+        ) else {
+            return;
+        };
+        let id = EndpointId::new(&name).unwrap();
+        let (_ns, _dir_id) = create_pinned(
+            Path::new(&base),
+            &id,
+            Duration::from_secs(10),
+            &noop_recorder(),
+        )
+        .unwrap_or_else(|f| panic!("create_pinned failed: {}", f.error.message()));
+        // 第 2 戻り値は置き場ディレクトリの識別子で PINS に無い。pin ファイルの識別子を取り直す。
+        let pin = Path::new(&base).join(&name);
+        let ident = pin_identity(&pin)
+            .unwrap_or_else(|e| panic!("pin_identity failed: {}", e.message()))
+            .unwrap_or_else(|| panic!("pin {} is not registered", pin.display()));
+        println!("XPROC_IDENT {} {} {}", ident.dev, ident.ino, ident.serial);
+    }
+
+    /// 子の終了と stdout / stderr の収集に期限を設ける（REPAIR-5）。超過したら kill して回収し panic する。
+    /// `Command::output()` は子の終了と EOF を無期限に待つため試験では使わない。
+    pub(in crate::netns) fn output_bounded(
+        cmd: &mut std::process::Command,
+        limit: Duration,
+    ) -> std::process::Output {
+        // kill 後に子の回収（try_wait）を待つ猶予。超過したら回収を諦めて失敗にする（REPAIR-5）。
+        const REAP_GRACE: Duration = Duration::from_secs(5);
+        use std::io::Read as _;
+        use std::process::Stdio;
+        use std::sync::mpsc;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
+        let out_pipe = child.stdout.take().unwrap();
+        let err_pipe = child.stderr.take().unwrap();
+        let t1 = tx.clone();
+        std::thread::spawn(move || {
+            let mut p = out_pipe;
+            let mut b = Vec::new();
+            let _ = p.read_to_end(&mut b);
+            let _ = t1.send((true, b));
+        });
+        std::thread::spawn(move || {
+            let mut p = err_pipe;
+            let mut b = Vec::new();
+            let _ = p.read_to_end(&mut b);
+            let _ = tx.send((false, b));
+        });
+        let deadline = std::time::Instant::now() + limit;
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                // SIGKILL は終了完了を保証しない（割り込み不能な I/O 待ち等）ため、回収にも期限を設ける。
+                let reap_deadline = std::time::Instant::now() + REAP_GRACE;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            panic!("child did not exit within {limit:?}; killed and reaped")
+                        }
+                        Ok(None) if std::time::Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => panic!(
+                            "child did not exit within {limit:?}; kill sent but not reaped within {REAP_GRACE:?}"
+                        ),
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left.max(Duration::from_secs(1))) {
+                Ok((true, b)) => stdout = b,
+                Ok((false, b)) => stderr = b,
+                Err(_) => panic!("child output not closed within {limit:?}"),
+            }
+        }
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// 子役を別プロセスで起動し、出力された識別子を返す。子が終了してから返る。
+    /// 子の終了・出力の収集・強制終了後の回収にはすべて期限がある（REPAIR-5。`output_bounded`）。
+    fn spawn_pin_creator(base: &Path, name: &str) -> PinIdentity {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "netns::tests::net1_xproc_child_create_pin",
+        ])
+        .env("FANDHE_NETNS_XPROC_BASE", base)
+        .env("FANDHE_NETNS_XPROC_NAME", name);
+        let out = output_bounded(&mut cmd, Duration::from_secs(60));
+        assert!(out.status.success(), "child failed: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("XPROC_IDENT "))
+            .expect("child must print XPROC_IDENT");
+        let v: Vec<u64> = line.split(' ').map(|x| x.parse().unwrap()).collect();
+        PinIdentity {
+            dev: v[0],
+            ino: v[1],
+            serial: v[2],
+        }
+    }
+
+    /// NET-1・REPAIR-3・#2824（実機前提・root）: pin を作ったプロセスが終了した後、別プロセス（本プロセス）が
+    /// 永続の所有記録を読み、nsfs の識別子・umount 後のファイルを照合して回収できる。別世代の識別子では
+    /// 何も解除しない。実行: `cargo test -p fandhe-container-net --lib -- --ignored net1_xproc_nsfs_pin_cleanup`
+    #[test]
+    #[ignore = "needs root (mount of nsfs); NET-1・#2824. See AGENTS.md real-machine tests"]
+    fn net1_xproc_nsfs_pin_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("xproc-nsfs");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = base.join("web-1");
+        let base_mnt = file_mount_id(&File::open(&base).unwrap()).unwrap();
+
+        // 1 世代目: 作成プロセスは終了済み。本プロセスのメモリには記録が無い。
+        let old = spawn_pin_creator(&base, "web-1");
+        assert!(lookup_pin((old.dev, old.ino)).is_none());
+        assert_ne!(file_mount_id(&File::open(&pin).unwrap()).unwrap(), base_mnt);
+        assert!(ledger_path(&base, "web-1").exists());
+        // 識別子なしの unpin_path は再起動後の pin を扱わない。
+        let e = unpin_path(&pin).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        unpin_path_expecting(&pin, old).unwrap();
+        assert!(!pin.exists());
+        assert!(!ledger_path(&base, "web-1").exists());
+
+        // 2 世代目: 同じ名前の別世代。古い識別子では解除せず、正しい識別子なら解除する。
+        let new = spawn_pin_creator(&base, "web-1");
+        assert_ne!(new.serial, old.serial);
+        let e = unpin_path_expecting(&pin, old).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(pin.exists());
+        assert_ne!(file_mount_id(&File::open(&pin).unwrap()).unwrap(), base_mnt);
+        unpin_path_expecting(&pin, new).unwrap();
+        assert!(!pin.exists());
+        cleanup_scratch(&base);
+    }
+
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "fandhe-netns-test-{tag}-{}-{:?}",
@@ -1676,6 +2171,9 @@ mod tests {
         assert_eq!(f.error.code(), NetErrorCode::AlreadyExists);
         assert_eq!(f.leftover, None);
         assert_eq!(fs::read(&pin).unwrap(), b"keep");
+        // 所有記録の置き場（空）だけは先に作られる。記録は書かれない。
+        assert_eq!(fs::read_dir(dir.join(".owned")).unwrap().count(), 0);
+        fs::remove_dir(dir.join(".owned")).unwrap();
         fs::remove_file(&pin).unwrap();
         fs::remove_dir(&dir).unwrap();
     }

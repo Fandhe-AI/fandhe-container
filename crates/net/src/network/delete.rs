@@ -845,12 +845,32 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
         let pin = netns_dir.join(claim.endpoint().as_str());
         let res = DeleteResource::Netns(pin.clone());
         let veth_res = DeleteResource::Veth(veth_names.host().clone());
+        // netns のみの請求書で、請求書が含まない host veth が同じ endpoint に（世代を問わず）居ないかを確かめる。
+        // 居る間は成功を返さない。返すと請求書が消費され、veth が bridge 上に追跡外で残って再 attach が
+        // AlreadyExists になる（NET-1・REPAIR-3）。veth は請求書の対象外のため、ここでは消さず、手動回収または
+        // 別の請求書に委ねる。pin の識別子の有無に関わらず同じ判定を通す（#2681）。
+        let uncovered_veth_absent = || match ops.link_attachment(veth_names.host()) {
+            Err(e) if e.code() == NetErrorCode::NotFound => Ok(()),
+            Err(e) => Err(e),
+            Ok(_) => Err(precondition(
+                "endpoint still has a host veth not covered by the claim; netns pin left in place",
+            )),
+        };
         // 識別子を控えていない請求書（`create_pinned` のタイムアウト等）は pin を外せない。ただし固定設定の
         // 置き場で pin の不存在を安全に確認できたら、回収済みとして冪等に扱う（回収側が既に消した場合に
         // detach / delete_network が永久に未回収扱いになるのを避ける）。存在する・確認できないなら拒否する。
         if claim.pin().is_none() {
             match ops.pin_absent(netns_dir, claim.endpoint()) {
-                Ok(true) => report.removed.push(res),
+                // veth を含む請求書の veth は手順 2 で判定済み（消せなければ失敗が記録されている）。
+                Ok(true) if claim.includes_veth() => report.removed.push(res),
+                Ok(true) => {
+                    // pin は確かに無い。ただし請求書が含まない veth が残るなら、請求書を消費させない。
+                    report.removed.push(res);
+                    if let Err(e) = uncovered_veth_absent() {
+                        report.leftover.push((veth_res, ResourceState::Unknown));
+                        failures.note(e, DeleteStep::UnpinNetns);
+                    }
+                }
                 Ok(false) => {
                     report.leftover.push((res, ResourceState::Unknown));
                     failures.note(
@@ -877,16 +897,8 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
                 ))
             }
         } else {
-            match ops.link_attachment(veth_names.host()) {
-                Err(e) if e.code() == NetErrorCode::NotFound => Ok(()),
-                Err(e) => Err(e),
-                // 請求書が含まない host veth が居る間は pin を外さず成功も返さない。外すと請求書が消費され、
-                // veth が bridge 上に追跡外で残って再 attach が AlreadyExists になる（NET-1・REPAIR-3）。
-                // veth は請求書の対象外のため、ここでは消さず、手動回収または別の請求書に委ねる。
-                Ok(_) => Err(precondition(
-                    "endpoint still has a host veth not covered by the claim; netns pin left in place",
-                )),
-            }
+            // 請求書が含まない host veth が居る間は pin を外さず成功も返さない。
+            uncovered_veth_absent()
         };
         match proven {
             Err(e) => {
@@ -2650,6 +2662,24 @@ mod tests {
         let claim = attach_claim(false, true, false).with_pin_for_test(None);
         let report = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap();
         assert_eq!(report.removed, vec![DeleteResource::Netns(pin("c1"))]);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・REPAIR-3・#2681: 識別子の無い netns のみの請求書で pin が無くても、請求書が含まない host veth が
+    /// 同じ endpoint に残っていれば成功を返さず（請求書を消費させず）、veth には触れない。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_keeps_claim_while_veth_remains() {
+        let fake = Fake::default();
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.report.removed, vec![DeleteResource::Netns(pin("c1"))]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
         assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
     }
 

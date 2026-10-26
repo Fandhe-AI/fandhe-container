@@ -71,7 +71,7 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 
 **採用した方式**: 内容を呼び出し元のユーザー空間メモリに載せず、カーネル内コピーで封印 memfd に置き、PID 1 の pivot 前段（`inject_files`）で memfd から tmpfs のファイルへ `sendfile(2)` で書く。
 
-- ホストのファイル → `sendfile(2)` → memfd（C の中。`InjectedContent::from_file`）。ユーザーバッファを通らない。memfd は `MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL`（6.3 未満は `MFD_NOEXEC_SEAL` を外して再試行。`MFD_EXEC` は付けない）、`F_SEAL_WRITE | SHRINK | GROW | SEAL` で封印し、fd は 3 以上へ置く。
+- ホストのファイル → `sendfile(2)` → memfd（C の中。`InjectedContent::from_file`）。ユーザーバッファを通らない。memfd は `MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL`（6.3 未満は `MFD_NOEXEC_SEAL` を外して再試行。`MFD_EXEC` は付けない。実行できないことの保証〔`F_SEAL_EXEC` と実行ビットの除去〕は Linux 6.3 以降に限り、6.3 未満では実行可能な memfd になるが、内容専用で exec には使わず、close-on-exec で holder は fd 3 以上を閉じ、`Exec` 段の `close_inherited_fds` より前に使い終える。本番の起動は Landlock ABI 6〔6.12 以降〕が必須なので常に満たされる。#2759・#2728 P2-1）、`F_SEAL_WRITE | SHRINK | GROW | SEAL` で封印し、fd は 3 以上へ置く。
 - U は fd 3 以上を閉じてから dumpable になるため memfd を持たず、memfd のページは U のアドレス空間に写像されないので `/proc/<U>/mem` に現れない。
 - `inject_files` は `Exec` 段の `close_inherited_fds` より前（pivot 前）に走るため、memfd は PID 1 の準備段まで開いており、Exec 段の一括 close でコンテナへ漏れない。
 - `copy_file_range(2)` は使わない（別 fs 間で `EXDEV` になりうる）。`std::io::copy` も使わない（カーネル内コピーが効かないとユーザーバッファへ黙って縮退するため）。失敗はどれも起動の拒否（fail-closed）。

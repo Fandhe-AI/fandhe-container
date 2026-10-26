@@ -6,6 +6,7 @@
 //! 実装の組み立ては `adapter::CriPluginBackends::production`（失敗したら fail-closed で起動しない）。
 //! 既定の socket パスは未定義のため、引数なしの起動は `UNIMPLEMENTED` で失敗させる（REPAIR-3）。
 //! Linux では peer 認証の拒否と、create の `mounts[].destination` の拒否（#2594）を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
+//! 起動時に `<状態ルート>/.cri/images` の残り pull を回収してから受け付ける（`recover_stale_image_pulls`。失敗・期限超過は起動しない。#2819・OCI-7）。
 //! SIGTERM の正常停止は未実装（SIGKILL で止まる。`server` の未実装の注記を参照）。
 //!
 //! 終了コード: 0 = `--help`、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
@@ -40,7 +41,9 @@ fn fail_err(e: &PluginError) -> ExitCode {
 #[cfg(unix)]
 fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
-    use fandhe_container_plugin_cri::adapter::{self, CriPluginBackends, PLUGIN_REQUEST_TIMEOUT};
+    use fandhe_container_plugin_cri::adapter::{
+        self, CriPluginBackends, PLUGIN_REQUEST_TIMEOUT, StartupPullRecovery,
+    };
     use fandhe_container_plugin_cri::{server, telemetry};
 
     // 監査の記録経路（Linux）は、スレッド・listener・ランタイムを作る前に用意する（SEC-4・PLUG-12・#2484）。
@@ -98,6 +101,28 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    // 前回までに残った pull のステージングとリースを、受け付けの前に 1 回回収する（OCI-7・OCI-1・#2819）。
+    // 生存判定は `@pull.lock` の OS ロックで、生きている別プロセスの pull は残す。fail-closed: 在庫の root を
+    // 信頼できない・排他を取れない・期限（REPAIR-5）を超えた場合は起動しない（取り残した worker が `@lock` を握ったまま
+    // 受け付けると PullImage が全て Timeout になるため）。一部の削除失敗は余分に残す側（次回の起動で再試行）なので続行する。
+    match backends.recover_stale_image_pulls(adapter::STARTUP_PULL_RECOVERY_BUDGET) {
+        StartupPullRecovery::Completed(counts) => {
+            // 何も無かった（初回起動・空の置き場）ときは出さない。起動の失敗時の stderr を静かに保つ。
+            if counts != Default::default() {
+                let _ = telemetry::stderr_sink().submit(counts.summary_line());
+            }
+        }
+        StartupPullRecovery::Failed(code) => {
+            eprintln!("error: {code}: failed to recover stale image pulls");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+        StartupPullRecovery::TimedOut | StartupPullRecovery::SpawnFailed | _ => {
+            return fail(
+                PluginErrorCode::Timeout,
+                "failed to recover stale image pulls in time",
+            );
+        }
+    }
     let svc = backends.runtime_service(bundles);
     // 1 リクエストの待ち上限は PullImage・StartContainer が収まる値に引き上げる（既定 10 秒では途中で切れる。REPAIR-5）。
     let grpc_config = match GrpcServerConfig::new().with_request_timeout(PLUGIN_REQUEST_TIMEOUT) {

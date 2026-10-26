@@ -1201,14 +1201,6 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         &self,
         req: &UnpublishPortRequest,
     ) -> Result<UnpublishPortResponse, TraitError> {
-        // 入力の検証（バックエンドを呼ぶ前）。
-        let publish = port_publish_from(
-            req.host_ip(),
-            req.protocol(),
-            req.host_port().get(),
-            req.container_port().get(),
-        )?;
-
         let mut guard = self.lock()?;
         let reg = &mut *guard;
         let network = reg
@@ -1237,6 +1229,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         if container.network != req.network().as_str() {
             return Err(network_mismatch());
         }
+        // 入力の検証（バックエンドを呼ぶ前）。network → attach → 越境の確認の後で行う（契約 13）。
+        let publish = port_publish_from(
+            req.host_ip(),
+            req.protocol(),
+            req.host_port().get(),
+            req.container_port().get(),
+        )?;
         let key = (req.host_port().get(), req.protocol());
         if !container.published.contains(&key) {
             return Err(TraitError::new(
@@ -1262,7 +1261,15 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 Ok(UnpublishPortResponse::new())
             }
             // 結果不明: 記録（受け口の予約）を保持し、解放は delete_network に任せる。
-            Err(f) if f.rules_unknown => Err(with_leftover(f.error, 1)),
+            Err(f) if f.rules_unknown => {
+                // 対象キーを隔離状態にし、以後の個別解除を拒否する（契約 13）。
+                if let Some(c) = reg.containers.get_mut(req.container().as_str())
+                    && !c.unknown_published.contains(&key)
+                {
+                    c.unknown_published.push(key);
+                }
+                Err(with_leftover(f.error, 1))
+            }
             // 確定的な失敗（ルールが残っている・予約の解放に失敗・未対応等）: 記録を保持して再試行できる。
             Err(f) => Err(f.error),
         }

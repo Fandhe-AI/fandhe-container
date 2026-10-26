@@ -14,8 +14,10 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
     ContainerId, DeleteNetworkRequest, IpCidr, NetworkName, NetworkPlugin, Protocol,
@@ -35,11 +37,48 @@ fn ns_inode(path: &str) -> u64 {
         .ino()
 }
 
+/// 外部コマンド 1 回の期限（REPAIR-5）。超過したら子を kill して回収する。
+const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn run(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+    let mut so = child.stdout.take().expect("stdout");
+    let mut se = child.stderr.take().expect("stderr");
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if start.elapsed() > CMD_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = t_out.join();
+                let _ = t_err.join();
+                panic!("{program} {args:?} timed out after {CMD_TIMEOUT:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let out = std::process::Output {
+        status,
+        stdout: t_out.join().expect("stdout thread"),
+        stderr: t_err.join().expect("stderr thread"),
+    };
     assert!(
         out.status.success(),
         "{program} {args:?} failed: {}",
@@ -78,6 +117,12 @@ fn netsetup_unpublish_port_privileged() {
         ns_inode("/proc/self/ns/net"),
         ns_inode("/proc/1/ns/net"),
         "refusing to run in the initial net namespace: use `unshare --net --mount`"
+    );
+    // mount namespace も専用であることを確認する（共有のままだと伝播変更・マウントがホストへ及ぶ。SEC-1）。
+    assert_ne!(
+        ns_inode("/proc/self/ns/mnt"),
+        ns_inode("/proc/1/ns/mnt"),
+        "refusing to run in the initial mount namespace: use `unshare --net --mount`"
     );
     // pin の置き場は mount namespace の中の tmpfs に閉じる（host へ漏らさない）。
     run("mount", &["--make-rprivate", "/"]);

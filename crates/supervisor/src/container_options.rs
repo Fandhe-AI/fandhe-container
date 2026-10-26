@@ -17,7 +17,10 @@
 //!
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
 //! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
-//! `--shm-size`・`--tmpfs`・secrets / configs。#2625）は実装済み。CLI・stack（TOML）から supervisor への受け渡しは未実装（REPAIR-3）。
+//! `--shm-size`・`--tmpfs`・secrets / configs・ulimit・env。#2625・#2713）は実装済み。CLI の `create` は
+//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs` を [`document`] の形で
+//! 状態ルート配下の 0600 のファイル（[`store`]）へ書き、supervisor の `start` が読む（#2713）。
+//! label は create 時に core の状態記録（`CreateRequest::with_annotations`）へ直接書く。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -25,7 +28,7 @@
 //! `state.json` に記録する launch 時の rlimit（exec が適用する値。TASK-169 追補・#1467）は、ここで保持する
 //! 「指定した種別だけ」の集合ではなく、core の `exec::launch_rlimits_from_self` で指定の無い種別を launch 時点の
 //! 実効値で埋めた全 16 種である。launcher はその同じ集合を `StagePipeline::with_rlimits` と
-//! `CreateStateRequest::with_rlimits` の両方へ渡す（結線は本番 launcher の後続作業。REPAIR-3）。
+//! `CreateStateRequest::with_rlimits` の両方へ渡す（本番 launcher の `launch_checked` が結線済み。#2713）。
 //!
 //! `--ipc`（`host` / `shareable`）は [`ipc`] サブモジュールの [`IpcMode`] で保持する（#528・TASK-169.3）。
 //!
@@ -36,10 +39,9 @@
 //!
 //! # 未結線の箇所（REPAIR-3）
 //!
-//! - `--ipc`・`--shm-size`・`--tmpfs`・secrets / configs は start の `build_launcher` が [`ContainerOptions::launch_options`] を
-//!   本番 launcher へ渡す（#2625）。ただし CLI から supervisor への `ContainerOptions` の受け渡しは未実装で、`run_main` は
-//!   既定のまま（secret の内容を argv / env に載せない受け渡し方式が要る）。
-//! - ulimit・env・label の launcher への結線は未実装（label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。
+//! - secrets / configs は CLI のフラグも文書の kind も無い。ホストのパスを特権の supervisor が読むと confused deputy に
+//!   なりうるため、fd の所有者照合か非特権のままの受け渡しという別の設計が要る（後続）。
+//! - stack（TOML）の `up` からの結線は TASK-155 の後続（`Service::create_option_args` が create の引数列へ写す）。
 //!
 //! OS 非依存で、3 OS でビルド・テストする。
 //!
@@ -48,11 +50,13 @@
 //! `--ulimit` 文字列は外部入力として、長さ上限・形式・数値・種別名を検証してから型へ写す。
 //! エラーメッセージは固定の英語文言で、入力値は含めない。
 
+pub mod document;
 pub mod env;
 pub mod ipc;
 pub mod labels;
 pub mod mounts;
 pub mod secrets;
+pub mod store;
 
 pub use ipc::IpcMode;
 pub use labels::{Label, Labels};
@@ -232,7 +236,10 @@ impl ContainerOptions {
         } else {
             LaunchIpcMode::Private
         };
-        LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)
+        // ulimit は種別ごとの指定値(launcher が 16 種へ補完)、env は `process.env` への上書き。core は再検証する。
+        LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)?
+            .with_rlimits(self.rlimits.clone())
+            .with_env(self.env.to_env_strings())
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -517,6 +524,28 @@ mod tests {
         let o = shareable.launch_options().expect("shareable");
         assert_eq!(o.ipc(), LaunchIpcMode::Private);
         assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::All);
+    }
+
+    /// SUP-12・CLI-1(#2713): ulimit と env は `LaunchOptions` へ具体値で届く(ulimit は指定した種別だけ)。
+    #[test]
+    fn sup12_launch_options_carries_ulimit_and_env() {
+        let vars = vec![
+            env::EnvVar::parse("A=1").expect("var"),
+            env::EnvVar::parse("B=2").expect("var"),
+        ];
+        let o = ContainerOptions::new()
+            .with_ulimits(vec![Ulimit::parse("nofile=1024:2048").expect("ulimit")])
+            .expect("ulimits")
+            .with_env(EnvSet::resolve(&[], &[], &vars).expect("env"))
+            .launch_options()
+            .expect("options");
+        let limits: Vec<_> = o
+            .rlimits()
+            .iter()
+            .map(|r| (r.kind(), r.soft(), r.hard()))
+            .collect();
+        assert_eq!(limits, vec![(RlimitKind::Nofile, 1024, 2048)]);
+        assert_eq!(o.merged_env(&["A=0".to_owned()]), vec!["A=1", "B=2"]);
     }
 
     /// SUP-12(#2625): `--shm-size 128m` は `/dev/shm` の size=134217728 になる。

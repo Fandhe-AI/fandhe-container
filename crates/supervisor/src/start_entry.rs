@@ -13,6 +13,9 @@
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
+//!    2c. 起動オプション文書(状態ルート配下の `@container-options/<id>`。CLI の create が書く。形式は
+//!    [`crate::container_options::document`])を同じ期限つき作業スレッドで読む。無ければ既定値。読めない・壊れている
+//!    ときは手順 4 の [`StartDeps::check_launcher_available`] が cgroup にも launch にも触れずに止める。#2713・SUP-12／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
 //!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
@@ -2102,6 +2105,9 @@ mod linux {
         /// 起動オプション（`with_container_options`。`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・#2625）。
         /// 既定（指定なし）は従来の動作と同じ。
         container_options: ContainerOptions,
+        /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
+        /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
+        container_options_error: Option<TraitError>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2214,7 +2220,16 @@ mod linux {
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
                 container_options: ContainerOptions::default(),
+                container_options_error: None,
             }
+        }
+
+        /// 起動オプション文書の読み込みに失敗したことを覚えさせる。手順 4 が cgroup の連鎖より前にそのエラーで止める
+        /// (手順 3 の中断起動の回復〔CORE-2〕は従来どおり先に走る。SUP-12・SEC-1・#2713)。
+        #[must_use]
+        pub fn with_container_options_error(mut self, error: TraitError) -> Self {
+            self.container_options_error = Some(error);
+            self
         }
 
         /// 起動オプション（`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs）を設定する（SUP-12・CORE-5・#2625）。
@@ -2223,7 +2238,7 @@ mod linux {
         /// `build_launcher` が [`ContainerOptions::launch_options`] を本番 launcher へ渡す。restart の再 launch も同じ
         /// launcher を使うので同じ指定が効く。ホストの secrets のファイルは手順 7 で一度だけ読み、launcher が保持する
         /// （内容は core が封印 memfd に置くため、範囲写像の経路で holder が継承するメモリに載らない。#2628）。
-        /// CLI からの受け渡しは未実装（`run_main` は既定のまま。REPAIR-3）。
+        /// CLI からの受け渡しは状態ルート配下の 0600 の文書(`run_main` が手順 2c で読む。#2713)。
         #[must_use]
         pub fn with_container_options(mut self, options: ContainerOptions) -> Self {
             self.container_options = options;
@@ -2325,6 +2340,10 @@ mod linux {
         /// fork の前に拒否するが、cgroup の連鎖（取り消せないスコープの追記）の前に止めるためここで前倒しする（CORE-5）。
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
         fn check_launcher_available(&self) -> Result<(), TraitError> {
+            // 起動オプション文書が読めない・壊れているときは、cgroup にも launch にも触れずに止める(SUP-12・#2713)。
+            if let Some(e) = &self.container_options_error {
+                return Err(e.clone());
+            }
             self.privilege.clone()?;
             // 起動オプションの矛盾は cgroup の連鎖の前に拒否する（ファイルは読まない純粋な検証。手順 7 が変換の本体）。
             self.container_options.implicit_dev_mounts()?;
@@ -2607,6 +2626,46 @@ mod linux {
         }
     }
 
+    /// 手順 2c: 起動オプション文書を読んで検証済みの [`ContainerOptions`] にする(#2713)。文書が無ければ `Ok(None)`。
+    ///
+    /// ストアの `host_state_root()`(検査済み。CLI の create が文書を書いた場所と同じ)を優先する。読み取りは状態ルートの
+    /// I/O が止まりうるため作業スレッドで行い `until` まで待つ(REPAIR-5)。成功時は `join` でスレッドの終了まで確認してから
+    /// 返す。期限超過は `Timeout`(作業スレッドは残るが、呼び出し側は手順 4 で止まり launch しない)。
+    fn prepare_container_options(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+    ) -> Result<Option<ContainerOptions>, TraitError> {
+        let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("fandhe-supopt".into())
+            .spawn(move || {
+                let result = crate::container_options::store::read(&root, &id)
+                    .and_then(|doc| doc.map(|d| d.to_container_options()).transpose());
+                let _ = tx.send(result);
+            })
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to spawn the container options worker",
+                )
+            })?;
+        let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+        let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
+        match rx.recv_timeout(limit) {
+            Ok(result) => {
+                let _ = handle.join();
+                result
+            }
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "container options preparation timed out",
+            )),
+        }
+    }
+
     /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
     fn open_supervisor_log(
         store: &Arc<dyn StateStore>,
@@ -2804,6 +2863,14 @@ mod linux {
         if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
             return fail(&mut out, op_err(e));
         }
+        // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
+        // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
+        // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
+        let deps = match prepare_container_options(&store, &args.root, &args.id, deadline) {
+            Ok(Some(options)) => Box::new(deps.with_container_options(options)),
+            Ok(None) => deps,
+            Err(e) => Box::new(deps.with_container_options_error(e)),
+        };
         let running = match run_start_until(
             deps,
             &store,
@@ -3046,6 +3113,62 @@ mod linux {
             let sink: Arc<dyn AuditSink> = Arc::new(OkSink);
             let got = require_seccomp_audit_sink(Ok(Arc::clone(&sink))).expect("kept");
             assert!(Arc::ptr_eq(&sink, &got));
+        }
+
+        /// SUP-12・SEC-1(#2713): 起動オプション文書の読み込みエラーは手順 4 がそのまま返して止める(既定値で続けない)。
+        #[test]
+        fn sup12_2713_options_error_stops_at_step_4() {
+            let deps = ProductionStartDeps::new(std::env::temp_dir()).with_container_options_error(
+                TraitError::new(ErrorCode::InvalidArgument, "options document is too large"),
+            );
+            let err = deps.check_launcher_available().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "options document is too large");
+        }
+
+        /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sup12_2713_prepare_container_options_reads_document() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use crate::container_options::store;
+            let root = std::env::temp_dir().join(format!("fcopt-prep-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let store_dyn: Arc<dyn StateStore> = Arc::new(
+                fandhe_container_core::state_store::FileStateStore::open(
+                    fandhe_container_core::state_store::StateRoot::from_override(root.clone())
+                        .expect("root"),
+                )
+                .expect("store"),
+            );
+            let id = ContainerId::new("c1").expect("id");
+            let until = Some(Instant::now() + Duration::from_secs(30));
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("none")
+                    .is_none()
+            );
+            let doc = ContainerOptionsDocument::new(
+                vec!["nofile=1024:2048".into()],
+                vec!["A=1".into()],
+                None,
+                None,
+                vec![],
+            )
+            .expect("doc");
+            store::write_new(&root, &id, &doc).expect("write");
+            let got = prepare_container_options(&store_dyn, &root, &id, until)
+                .expect("read")
+                .expect("some");
+            assert_eq!(got.env().to_env_strings(), vec!["A=1"]);
+            assert_eq!(got.rlimits().len(), 1);
+            std::fs::write(store::options_path(&root, &id), b"junk").expect("corrupt");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。

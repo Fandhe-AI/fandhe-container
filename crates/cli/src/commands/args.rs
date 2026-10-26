@@ -28,7 +28,7 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
-    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`(未検証の文字列。意味検証は `create_options`。
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`(未検証の文字列。意味検証は `create_options`。
     /// SUP-12・CLI-1・#2713)。
     pub(super) options: CreateOptionArgs,
 }
@@ -53,6 +53,8 @@ pub(super) struct CreateOptionArgs {
     pub(super) tmpfs: Vec<String>,
     /// `--cap-drop <CAP>`(最大 core の `MAX_DROP_NAMES` 件。`ALL` を含む。CLI-1・SEC-1・#2775)。
     pub(super) cap_drop: Vec<String>,
+    /// `--read-only`(値を取らないフラグ。1 回まで。`root.readonly` と OR で効く。CLI-1・SUP-12・#2828)。
+    pub(super) read_only: bool,
 }
 
 /// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
@@ -252,6 +254,12 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
                 return Err(UsageError);
             }
             *slot = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if a == "--read-only" {
+            // 値を取らない(`--read-only=false` は未知のオプション、`--read-only true` は余剰の位置引数で使い方エラー)。
+            if options.read_only {
+                return Err(UsageError);
+            }
+            options.read_only = true;
         } else if a == "--bundle" {
             let value = it.next().ok_or(UsageError)?;
             if bundle.is_some() {
@@ -892,8 +900,30 @@ mod tests {
                 shm_size: Some("128m".into()),
                 tmpfs: vec!["/run:rw".into()],
                 cap_drop: Vec::new(),
+                read_only: false,
             }
         );
+    }
+
+    /// CLI-1・SUP-12(#2828): `create --read-only` は値を取らないフラグで、指定の有無が `read_only` になる。
+    /// 重複・`--read-only=true`・`--read-only true`(余剰の位置引数)は使い方エラー。
+    #[test]
+    fn cli1_parse_create_read_only() {
+        let a = parse_create(v(&["--read-only", "--bundle", "/b", "c1"])).expect("parsed");
+        assert!(a.options.read_only);
+        assert_eq!(a.id, "c1");
+        let a = parse_create(v(&["--bundle", "/b", "c1", "--read-only"])).expect("parsed");
+        assert!(a.options.read_only);
+        let a = parse_create(v(&["--bundle", "/b", "c1"])).expect("parsed");
+        assert!(!a.options.read_only);
+        for bad in [
+            v(&["--read-only", "--read-only", "--bundle", "/b", "c1"]),
+            v(&["--read-only=true", "--bundle", "/b", "c1"]),
+            v(&["--read-only=false", "--bundle", "/b", "c1"]),
+            v(&["--read-only", "true", "--bundle", "/b", "c1"]),
+        ] {
+            assert!(parse_create(bad).is_err());
+        }
     }
 
     /// SUP-12・SEC-1(#2713): `--ipc` / `--shm-size` の重複、値の欠落、繰り返しの件数超過は使い方エラー。

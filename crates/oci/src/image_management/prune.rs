@@ -112,7 +112,9 @@ impl ReferenceTable {
 
     /// `image prune` を実行する。排他の内側（`ImageStoreGuard` 越し）で呼ぶこと。
     ///
-    /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら何も変えず `FailedPrecondition`。
+    /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら何も変えず `FailedPrecondition`（root 配下の
+    /// 別マウントのときも同じ code で、メッセージはマウント越え。#2701）。ガードの外の単体テーブルでは、
+    /// 本番ビルドは `FailedPrecondition` で拒否する。
     pub fn execute_image_prune(&mut self, root: &Path) -> Result<ImagePruneOutcome, OciError> {
         self.execute_image_prune_with(&NoopOciOpRecorder, root)
     }

@@ -427,6 +427,35 @@ mod tests {
         assert_eq!(StartReport::decode(r.encode().as_bytes()).unwrap(), r);
     }
 
+    /// SEC-4・CORE-5・ERR-1・SUP-1（#2716）: launch の `Exec` 段の失敗（`R` の後の `execveat` の errno 分類）の報告行は、
+    /// 分類ごとの具体的な `CODE`・終了コードと固定文言になる。
+    #[test]
+    fn sec4_2716_exec_stage_failure_report_lines() {
+        for (code, line) in [
+            (
+                ErrorCode::NotFound,
+                "FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::PermissionDenied,
+                "FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::InvalidArgument,
+                "FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n",
+            ),
+        ] {
+            let err = OciRuntimeError::new(
+                fandhe_container_core::oci_runtime::LifecycleOp::Start,
+                code,
+                "container launch failed in the Exec stage",
+            );
+            let r = StartReport::failed(&err);
+            assert_eq!(r.encode(), line);
+            assert_eq!(StartReport::decode(line.as_bytes()).unwrap(), r);
+        }
+    }
+
     /// REPAIR-2・ERR-2: `exit_code` が `exit_code_for(CODE)` と食い違う報告は拒否し、一致すれば受理する。
     #[test]
     fn repair2_report_decode_rejects_exit_code_mismatch() {

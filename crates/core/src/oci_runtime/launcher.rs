@@ -1934,6 +1934,26 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+    /// SEC-4・CORE-5・ERR-1・#2716: `R` の後の `execveat` の失敗（`Exec` 段）は、errno の分類を `code` に、固定文言を
+    /// `message` に写す（パス・errno を含めない）。supervisor / CLI / CRI はこの `code` で表示を決める。
+    #[test]
+    fn sec4_2716_execveat_failure_maps_to_fixed_message_with_errno_class() {
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+        ] {
+            let e = ExecError::new(
+                code,
+                IsolationStage::Exec,
+                "the entrypoint execveat failed in the container child",
+            );
+            let t = launch_error(&e, false);
+            assert_eq!(t.code(), code);
+            assert_eq!(t.message(), "container launch failed in the Exec stage");
+        }
+    }
+
     struct NullSink;
 
     impl AuditSink for NullSink {

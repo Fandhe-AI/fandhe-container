@@ -677,6 +677,48 @@ fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// SEC-4・CORE-5・ERR-1・SUP-1・CLI-1（#2716）: launch の `R` の後の `execveat` の失敗は、supervisor が errno の分類
+/// （NOT_FOUND / PERMISSION_DENIED / INVALID_ARGUMENT）つきの固定文言の `ERR` として報告し、CLI はその終了コード
+/// （3 / 6 / 2）と構造化エラーの `op`・`code`・`message` で表示する。stdout は空で、状態は書かず created のまま。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_2716_start_exec_stage_failure_is_shown_with_code_and_fixed_message() {
+    let tmp = TmpDir::new("sup2716");
+    let dir = isolated_cli_dir("sup2716");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    let scope = FakeScope::new(&dir, &tmp);
+
+    for (code, exit) in [
+        ("NOT_FOUND", 3),
+        ("PERMISSION_DENIED", 6),
+        ("INVALID_ARGUMENT", 2),
+    ] {
+        install_fake_supervisor(
+            &dir,
+            &format!(
+                "printf 'FCSUP1 ERR {code} {exit} container launch failed in the Exec stage\\n'"
+            ),
+        );
+        let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+        assert_eq!(out.status.code(), Some(exit), "{code}");
+        assert_eq!(op_and_code(&out), ("start".into(), code.into()));
+        assert!(out.stdout.is_empty(), "{code}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("\"message\":\"container launch failed in the Exec stage\""),
+            "{stderr}"
+        );
+    }
+
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` -> 配置先の CLI）を作る。
 /// symlink の置き場所 `bin_dir` は呼び出し側が用意する。
 #[cfg(target_os = "linux")]

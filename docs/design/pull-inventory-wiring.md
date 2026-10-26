@@ -18,7 +18,9 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 2. blob ごとに、既存ならリース登録 → 信頼条件・digest の検査（合格で再利用、不合格はリース解放して取得）。無ければ
    `open_staged_blob` の writer（検査済み root の fd 起点の `<hex>.part`）へ取得して `commit`、`verify_staged_blob`
    （サイズは宣言値と完全一致。#2765）
-3. config を読み、layer を `staging/<id>/unpack/entry/rootfs` へ展開（diff_id 突合）
+3. config を読み、layer を `staging/<id>/unpack/entry/rootfs` へ展開（diff_id 突合）。ステージングの blob は
+   `open_verified_staged_blob` で pull ディレクトリ fd 起点に開いたハンドルから読む（#2893。リース済みの既存 blob と
+   `unpack/` の作成はパス起点のまま。#2921）
 4. rootfs のエントリを `rootfs/sha256/<config-hex>` へ rename（記録と一緒に原子的）
 5. `publish`（blob の公開・manifest とタグの登録・リース解放を排他の下で 1 回の保存）
 
@@ -59,6 +61,7 @@ PR #2520（#2380）で manifest の在庫・タグ・pull リースを `@image-i
 - `InMemoryImageStore` の置き換え（TASK-183）。plugin-cri の ImageService と本番の `PullConfig` は #2592 で配線済み
 - #2377（本番の `ImageRootfsUnpacker`）には、在庫に layer の mediaType・`diff_ids` が要る。`@image-inventory.json` のスキーマは広げていない
 - 展開済み `rootfs/sha256/<hex>` の GC と `image rm` / `prune` への接続（#2315・#471）
+- リース済みの既存 blob の読み取りと展開先 `unpack/` の作成の fd 起点化、Windows のパス起点（#2921。検証後のステージング blob の読み取りは #2893 で移した）
 
 ## 起動時の pull 回収 GC の配線（#2819・OCI-7・OCI-1・REPAIR-3・REPAIR-4・REPAIR-5）
 

@@ -41,6 +41,12 @@ mod rootfs_read;
 
 pub use rootfs_read::read_rootfs_file;
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) use anchored::remove_name_tree;
+
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek as _, SeekFrom, Write};

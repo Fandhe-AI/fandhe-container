@@ -773,6 +773,14 @@ pub trait LaunchedProcess: Send {
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         None
     }
+
+    /// launch が `Rlimits` 段へ渡した全 16 種の rlimit 集合(`--ulimit` の指定値と継承値の補完。SUP-12・#2713)。
+    /// start / restart が Running の更新と同じ `update` で `state.json` へ書き、exec の再適用が launch と同じ制限を
+    /// 載せる根拠になる。`LaunchedProcess` を包み直す実装は内側へ転送すること(`launch_isolation` と同じ注意)。
+    /// 持たない実装は `None`(既定。前の記録が引き継がれる)。
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -796,6 +804,8 @@ pub struct ContainerChildProcess {
     reap_notice: Option<ReapNotice>,
     /// launch が確定した分離の記録（本番 launcher が付ける。[`LaunchedProcess::launch_isolation`]）。
     launch_isolation: Option<crate::launch_isolation::LaunchIsolationRecord>,
+    /// launch が `Rlimits` 段へ渡した全 16 種の集合(本番 launcher が付ける。[`LaunchedProcess::launch_rlimits`])。
+    launch_rlimits: Option<crate::rlimits::Rlimits>,
     /// SIGSYS 終了の補助記録（SEC-4・ESC-06・#2004）。本番 launcher だけが付ける。
     exit_audit: Option<ExitAudit>,
 }
@@ -851,6 +861,7 @@ impl ContainerChildProcess {
             seccomp_listener: std::sync::Mutex::new(None),
             reap_notice: None,
             launch_isolation: None,
+            launch_rlimits: None,
             exit_audit: None,
         })
     }
@@ -862,6 +873,13 @@ impl ContainerChildProcess {
         record: crate::launch_isolation::LaunchIsolationRecord,
     ) -> Self {
         self.launch_isolation = Some(record);
+        self
+    }
+
+    /// launch が適用した全 16 種の rlimit 集合を持たせる([`LaunchedProcess::launch_rlimits`] で返る。#2713)。
+    #[must_use]
+    pub(crate) fn with_launch_rlimits(mut self, rlimits: crate::rlimits::Rlimits) -> Self {
+        self.launch_rlimits = Some(rlimits);
         self
     }
 
@@ -973,6 +991,10 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         self.launch_isolation.as_ref()
+    }
+
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        self.launch_rlimits.as_ref()
     }
 
     fn take_output(&self) -> Option<ContainerOutput> {

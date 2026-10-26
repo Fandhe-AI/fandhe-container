@@ -106,7 +106,7 @@
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
-//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625)の tmpfs・注入ファイル・IPC は載せる。
+//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625・#2713)の tmpfs・注入ファイル・IPC・rlimit(16 種へ補完して `Rlimits` 段と状態記録へ)・env の上書きは載せる。
 //!   未指定なら既定の `/dev/shm`(64 MiB)のみ・注入なし・専用 IPC namespace。`Host` は IPC namespace を作らず `/dev/shm` を載せず、
 //!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
@@ -1298,7 +1298,15 @@ impl Inner {
                 .with_hook(StageKind::CgroupJoin, join)
                 .map_err(|e| to_trait_error(&e))?;
         }
-        let entry = entrypoint_of(spec)?;
+        // `--ulimit` の指定を 16 種へ補完し、`Rlimits` 段と `state.json` の記録の両方へ同じ集合を渡す(exec の再適用が
+        // launch と一致する。fork 前に 1 回だけ読む。SUP-12・SEC-1・#2713)。
+        let launch_rlimits = crate::exec::launch_rlimits_from_self(options.rlimits())
+            .map_err(|e| to_trait_error(&e))?;
+        stages = stages
+            .with_rlimits(launch_rlimits.clone())
+            .map_err(|e| to_trait_error(&e))?;
+        let merged_env = options.merged_env(spec.env());
+        let entry = entrypoint_of(spec, &merged_env)?;
         let isolation = isolation_config_of(spec, options.ipc())?;
         // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
         // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
@@ -1378,6 +1386,7 @@ impl Inner {
             .with_output(stdout, stderr)
             .with_seccomp_listener(listener)
             .with_launch_isolation(isolation_record)
+            .with_launch_rlimits(launch_rlimits)
             .with_exit_audit(self.exit_audit_sink(), id.clone())
             .with_reap_notice(Box::new(move || {
                 let Some(ledger) = ledger.upgrade() else {
@@ -1718,7 +1727,7 @@ fn to_trait_error(e: &ExecError) -> TraitError {
 
 /// `process.args` から exec するエントリポイントを作る(シェルを介さず配列のまま渡す。インジェクション防止)。
 #[cfg(target_os = "linux")]
-fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
+fn entrypoint_of(spec: &LaunchSpec, env: &[String]) -> Result<Entrypoint, TraitError> {
     let first = spec.args().first().ok_or_else(|| {
         TraitError::new(ErrorCode::InvalidArgument, "process.args must not be empty")
     })?;
@@ -1726,11 +1735,11 @@ fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
     // runtime-spec は `args[0]` を `execvp` の file と同じ意味とする)。`/` を含む相対パスは `PATH` を引かず、
     // pivot と cwd の適用後に cwd 起点で解決する(OCI-1・OCI-4・#2432。`..` は `cwd_relative` が拒否)。
     let built = if first.starts_with('/') {
-        Entrypoint::new(first, spec.args(), spec.env())
+        Entrypoint::new(first, spec.args(), env)
     } else if first.contains('/') {
-        Entrypoint::cwd_relative(first, spec.args(), spec.env())
+        Entrypoint::cwd_relative(first, spec.args(), env)
     } else {
-        Entrypoint::search_path(first, spec.args(), spec.env())
+        Entrypoint::search_path(first, spec.args(), env)
     };
     built.map_err(|e| to_trait_error(&e))
 }
@@ -1934,6 +1943,26 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+    /// SEC-4・CORE-5・ERR-1・#2716: `R` の後の `execveat` の失敗（`Exec` 段）は、errno の分類を `code` に、固定文言を
+    /// `message` に写す（パス・errno を含めない）。supervisor / CLI / CRI はこの `code` で表示を決める。
+    #[test]
+    fn sec4_2716_execveat_failure_maps_to_fixed_message_with_errno_class() {
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+        ] {
+            let e = ExecError::new(
+                code,
+                IsolationStage::Exec,
+                "the entrypoint execveat failed in the container child",
+            );
+            let t = launch_error(&e, false);
+            assert_eq!(t.code(), code);
+            assert_eq!(t.message(), "container launch failed in the Exec stage");
+        }
+    }
+
     struct NullSink;
 
     impl AuditSink for NullSink {
@@ -2004,6 +2033,8 @@ mod tests {
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
         /// spawn に渡った起動オプション由来の値(注入の宛先列・namespace に IPC があるか。SUP-12・#2625)。
         seen_options: Arc<Mutex<Vec<SeenOptions>>>,
+        /// spawn に渡った entrypoint の env(launch ごとに 1 件。#2713)。
+        seen_env: Arc<Mutex<Vec<Vec<String>>>>,
         /// `landlock_ruleset` に渡った暗黙マウントの含め方(launch ごとに 1 件)。
         seen_implicit: Arc<Mutex<Vec<ImplicitDevMounts>>>,
         /// `root_identity` が `None`(rootfs を fstat できない)を返すか。
@@ -2031,6 +2062,7 @@ mod tests {
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
                 seen_options: Arc::new(Mutex::new(Vec::new())),
+                seen_env: Arc::new(Mutex::new(Vec::new())),
                 seen_implicit: Arc::new(Mutex::new(Vec::new())),
                 fail_root_identity: false,
                 recorded_script: Mutex::new(VecDeque::new()),
@@ -2099,6 +2131,10 @@ mod tests {
                     .map(|m| m.destination.as_str().to_owned())
                     .collect(),
             ));
+            self.seen_env
+                .lock()
+                .unwrap()
+                .push(input.entry.env_for_test());
             self.seen_options.lock().unwrap().push((
                 input.inject.map(|set| {
                     set.files()
@@ -2272,6 +2308,20 @@ mod tests {
         env: &[&str],
         user: (u32, u32),
     ) -> LaunchSpec {
+        spec_with_root_readonly(name, false, linux_extra, mounts, args, env, user)
+    }
+
+    /// `root.readonly` を選べる組み立て(#2714)。`LaunchSpec::new` を直接使うため、`start` の `root.readonly` 拒否
+    /// (`Unimplemented`)は通らない。Landlock のルールが読み取り専用 root でどうなるかの単体照合専用。
+    fn spec_with_root_readonly(
+        name: &str,
+        root_readonly: bool,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+        args: &[&str],
+        env: &[&str],
+        user: (u32, u32),
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
@@ -2289,7 +2339,7 @@ mod tests {
         }
         let cfg = serde_json::json!({
             "ociVersion": "1.2.0",
-            "root": {"path": "rootfs"},
+            "root": {"path": "rootfs", "readonly": root_readonly},
             "hostname": "box",
             "process": {"user": {"uid": user.0, "gid": user.1}, "args": ["/bin/echo", "hi"],
                         "env": ["PATH=/bin"], "cwd": "/"},
@@ -2326,13 +2376,14 @@ mod tests {
     #[test]
     fn oci1_entrypoint_of_bare_name_search_and_rejections() {
         let ok = |args: &[&str], env: &[&str]| {
-            entrypoint_of(&spec_with_process(
+            let spec = spec_with_process(
                 "ep",
                 serde_json::json!({}),
                 serde_json::json!([]),
                 args,
                 env,
-            ))
+            );
+            entrypoint_of(&spec, spec.env())
         };
         let e = ok(
             &["docker-entrypoint.sh", "redis-server"],
@@ -3872,6 +3923,50 @@ mod tests {
         );
     }
 
+    /// SUP-12・CLI-1(#2713): `--ulimit nofile=1024:2048` は 16 種へ補完されて `launch_rlimits` に残り、
+    /// `--env` の上書きは `process.env` の位置を保って重なり、新しいキーは末尾へ付く。
+    #[test]
+    fn sup12_ulimit_and_env_options_reach_spawn_and_record() {
+        use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
+        let spec = spec_for("opts-env", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let seen_env = Arc::clone(&ops.seen_env);
+        let mut l = launcher(ops, rootless(), None);
+        let specified = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 1024, 2048).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        let base = options_with(&[], true, &[], LaunchIpcMode::Private);
+        let base_env = spec.env().to_vec();
+        let first_key = base_env
+            .first()
+            .and_then(|e| e.split_once('=').map(|(k, _)| k.to_owned()));
+        let mut overrides = vec!["FANDHE_NEW=3".to_owned()];
+        if let Some(k) = &first_key {
+            overrides.insert(0, format!("{k}=overridden"));
+        }
+        l.inner.launch_options = Some(
+            base.with_rlimits(specified)
+                .with_env(overrides.clone())
+                .expect("env"),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let recorded = p.launch_rlimits().expect("rlimits recorded").clone();
+        assert!(recorded.is_complete());
+        let nofile = recorded
+            .iter()
+            .find(|r| r.kind() == RlimitKind::Nofile)
+            .expect("nofile");
+        assert_eq!((nofile.soft(), nofile.hard()), (1024, 2048));
+        let mut expected = base_env.clone();
+        if first_key.is_some() {
+            expected[0] = overrides[0].clone();
+        }
+        expected.push("FANDHE_NEW=3".to_owned());
+        assert_eq!(seen_env.lock().unwrap().clone(), vec![expected]);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
     /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に
     /// `InvalidArgument` で拒否する(join を黙って捨てて弱い分離で起動しない)。
     #[test]
@@ -3914,6 +4009,58 @@ mod tests {
         assert_eq!(run.1 & write, write);
         assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12・CORE-5・SEC-2(#2714): 読み取り専用 root では、分離の記録で WRITE を持つ宛先が利用者 tmpfs(`/run`)と
+    /// 暗黙の `/dev` 系だけになり、root は READ(0x000D)のまま。`--ipc=host` では `/dev/shm` が外れる。
+    #[test]
+    fn sup12_readonly_root_user_tmpfs_is_writable_only_at_destination() {
+        use crate::launch_isolation::RecordedTarget;
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        for (shm, ipc, want) in [
+            (
+                true,
+                LaunchIpcMode::Private,
+                vec!["/dev", "/dev/pts", "/dev/shm", "/run"],
+            ),
+            (false, LaunchIpcMode::Host, vec!["/dev", "/dev/pts", "/run"]),
+        ] {
+            let spec = spec_with_root_readonly(
+                "opts-ro-root-tmpfs",
+                true,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&["/run"], shm, &[], ipc));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            let record = p.launch_isolation().expect("record");
+            let rules = record.landlock().rules();
+            let root = rules
+                .iter()
+                .find(|r| matches!(r.target(), RecordedTarget::Root))
+                .expect("root rule");
+            assert_eq!(root.allowed(), 0x000D);
+            let run = rules
+                .iter()
+                .find(|r| {
+                    matches!(r.target(), RecordedTarget::Tmpfs { destination }
+                        if destination.as_str() == "/run")
+                })
+                .expect("/run rule");
+            assert_eq!(run.allowed() & write, write);
+            let mut writable: Vec<&str> = rules
+                .iter()
+                .filter(|r| r.allowed() & write != 0)
+                .map(|r| r.target().as_str())
+                .collect();
+            writable.sort();
+            assert_eq!(writable, want);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
     }
 
     /// SUP-12・CORE-5(#2625): `ro` の利用者 tmpfs は書き込み可能な root の下でも起動でき、Landlock のルールには載らない。

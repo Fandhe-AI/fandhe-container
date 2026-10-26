@@ -13,6 +13,8 @@
 //! - parse / serialize の公開入口はまだ無い（担当は後続。STACK-1）。テストは `toml` を直接使う。
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +104,35 @@ pub struct Service {
     pub labels: BTreeMap<String, String>,
 }
 
+impl Service {
+    /// このサービスの環境変数・env ファイル・ラベルを、CLI の `create` の引数列へ写す(SUP-12・CLI-1・CLI-4・#2713)。
+    ///
+    /// 返すのは `--env-file <path>`(`env_files`。相対パスは `project_dir` 起点で解決)、`--env <KEY=VALUE>`(`env`。
+    /// キー昇順)、`--label <KEY=VALUE>`(`labels`。キー昇順)の列で、`up`(TASK-155)が CLI の `create` を呼ぶ想定に
+    /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
+    /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
+    /// `ulimit`・`tmpfs` はスキーマに無い(#586・#862)ため含めない。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    ///
+    /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
+    /// パスは検証しない(読むのは CLI が利用者の権限で行う。範囲外参照の扱いは `up` の責務)。
+    pub fn create_option_args(&self, project_dir: &Path) -> Vec<OsString> {
+        let mut args = Vec::new();
+        for file in &self.env_files {
+            args.push(OsString::from("--env-file"));
+            args.push(project_dir.join(file).into_os_string());
+        }
+        for (key, value) in &self.env {
+            args.push(OsString::from("--env"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+        for (key, value) in &self.labels {
+            args.push(OsString::from("--label"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+        args
+    }
+}
+
 /// `depends_on` の起動条件（STACK-1・D-17 論点 2）。
 ///
 /// `Default` は持たない。compose で condition を省いたときの既定（`started`）を補うのは
@@ -168,6 +199,42 @@ pub struct Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-12・CLI-4(#2713): env・env_files・labels が create の引数列に具体値で写る(env ファイルは project_dir 起点)。
+    #[test]
+    fn sup12_service_create_option_args() {
+        let service = Service {
+            env: BTreeMap::from([("B".into(), "2".into()), ("A".into(), "x=y".into())]),
+            env_files: vec![".env".into(), "/abs/other.env".into()],
+            labels: BTreeMap::from([("tier".into(), "web".into())]),
+            ..Service::default()
+        };
+        let args: Vec<String> = service
+            .create_option_args(Path::new("/proj"))
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8"))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--env-file",
+                "/proj/.env",
+                "--env-file",
+                "/abs/other.env",
+                "--env",
+                "A=x=y",
+                "--env",
+                "B=2",
+                "--label",
+                "tier=web",
+            ]
+        );
+        assert!(
+            Service::default()
+                .create_option_args(Path::new("/proj"))
+                .is_empty()
+        );
+    }
 
     const FULL: &str = r#"
 [project]

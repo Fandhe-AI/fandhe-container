@@ -35,7 +35,8 @@
 //!   bind マウントすると peer の mount namespace へ pin が伝播し、unpin 後も別 namespace が保持して
 //!   netns が生き残りうるため。呼び出し側は置き場を private（または slave）なマウントにしておく
 //!   （例: `mount --bind DIR DIR && mount --make-private DIR`）。`ip netns add` のように置き場を
-//!   `MS_SHARED` の自己 bind にする処理は行わない。判定は `/proc/self/mountinfo` から行い、
+//!   `MS_SHARED` の自己 bind にする処理は行わない。判定は置き場を開いた fd の mount ID（fdinfo の
+//!   `mnt_id`）で `/proc/self/mountinfo` の行を引いて行い（隠れたマウントを取り違えない。#2724）、
 //!   判定できなければ拒否する
 //! - 解除（`unpin`）が失敗したら `ContainerNetns` を呼び出し側へ返す（再試行可能）
 //! - 解除（`unpin_path`）は、本プロセスが作成して未解除の pin（プロセス内の所有記録 `PINS` と照合できる
@@ -221,43 +222,6 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
     out
 }
 
-/// `mountinfo` の内容から `path`（正規化済みの絶対パス）を含むマウントの行を空白区切りの欄で返す
-/// （OS 呼び出しを含まない純粋関数）。最長一致のマウントポイントを採り、同長なら後の行（重ねマウントの
-/// 最上位）を採る。見つからなければ `None`。
-fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
-    let target = path.as_os_str().as_bytes();
-    let mut best: Option<(usize, Vec<&str>)> = None;
-    for line in mountinfo.lines() {
-        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-        let Some(mp_field) = fields.get(4) else {
-            continue;
-        };
-        let mp = unescape_mountinfo(mp_field);
-        let contains = target == mp.as_slice()
-            || mp == b"/"
-            || (target.starts_with(&mp) && target.get(mp.len()) == Some(&b'/'));
-        if !contains {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(len, _)| mp.len() >= *len) {
-            best = Some((mp.len(), fields));
-        }
-    }
-    best.map(|(_, fields)| fields)
-}
-
-/// `mountinfo`（`/proc/self/mountinfo` の内容）上で `path`（正規化済みの絶対パス）を含むマウントの
-/// ファイルシステム種別（`-` の次の欄。例: `proc`）を返す。該当マウントが無い・欄が欠けている場合は `None`。
-///
-/// パスの存在だけでは分からない「そのパスがどのファイルシステム上にあるか」の確認に使う
-/// （cli の `doctor` が `/proc/sys/net` が procfs 上にあることを確認する。NET-10・TASK-148.1）。
-/// 選び方は netns 置き場の伝播検査と同じ（最長一致・同長は最上位）。OS 呼び出しを含まない純粋関数。
-pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
-    let fields = covering_mount(mountinfo, path)?;
-    let sep = fields.iter().position(|f| *f == "-")?;
-    fields.get(sep + 1).map(|f| (*f).to_string())
-}
-
 /// [`mount_option_by_id`] の判定結果。option の有無と、判定できない理由を区別する（将来の理由追加に備え列挙型にする）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -287,6 +251,37 @@ const MAX_FDINFO_READ: u64 = 64 * 1024;
 /// 該当の行が無い・壊れている・同じ ID の行が複数ある場合は理由つきの判定不能（`Present` / `Absent` 以外）で返す。
 /// 呼び出し側は fail-closed に扱う。OS 呼び出しを含まない純粋関数。
 pub fn mount_option_by_id(mountinfo: &[u8], mount_id: u64, option: &str) -> MountOptionState {
+    let fields = match mount_entry_by_id(mountinfo, mount_id) {
+        Ok(fields) => fields,
+        Err(MountLookupError::MountNotFound) => return MountOptionState::MountNotFound,
+        Err(_) => return MountOptionState::MalformedEntry,
+    };
+    let Some(opts) = fields.get(5) else {
+        return MountOptionState::MalformedEntry;
+    };
+    if opts.split(|b| *b == b',').any(|t| t == option.as_bytes()) {
+        MountOptionState::Present
+    } else {
+        MountOptionState::Absent
+    }
+}
+
+/// mountinfo の行を mount ID で引けなかった理由（[`mount_fstype_by_id`] の失敗。将来の理由追加に備え列挙型にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MountLookupError {
+    /// 指定の mount ID の行が mountinfo に無い。
+    MountNotFound,
+    /// 該当の行が壊れている（`-` 区切りが無い・欄が欠けている）か、同じ mount ID の行が複数ある。
+    MalformedEntry,
+}
+
+/// `mountinfo` の生バイト列から mount ID（1 番目の欄）が `mount_id` の行を空白区切りの欄で返す
+/// （OS 呼び出しを含まない純粋関数）。[`mount_option_by_id`]・[`mount_fstype_by_id`]・伝播検査
+/// （`check_propagation`）が共有する行の選び方で、パス欄を比べないため非 UTF-8 の名前も置換せずに扱える。
+/// 6 番目の欄より後に `-` 区切りが無い行・同じ ID の行が複数ある場合は `MalformedEntry`、行が無ければ
+/// `MountNotFound`（呼び出し側は fail-closed に扱う。#2724）。
+fn mount_entry_by_id(mountinfo: &[u8], mount_id: u64) -> Result<Vec<&[u8]>, MountLookupError> {
     let mut found: Option<Vec<&[u8]>> = None;
     for line in mountinfo.split(|b| *b == b'\n') {
         let fields: Vec<&[u8]> = line
@@ -301,45 +296,83 @@ pub fn mount_option_by_id(mountinfo: &[u8], mount_id: u64, option: &str) -> Moun
             continue;
         }
         if found.is_some() {
-            return MountOptionState::MalformedEntry;
+            return Err(MountLookupError::MalformedEntry);
         }
         found = Some(fields);
     }
-    let Some(fields) = found else {
-        return MountOptionState::MountNotFound;
-    };
-    // 6 番目の欄（per-mount options）より後に `-` 区切りがある行だけを正しい行とみなす。
+    let fields = found.ok_or(MountLookupError::MountNotFound)?;
     if !fields.iter().skip(6).any(|f| *f == b"-") {
-        return MountOptionState::MalformedEntry;
+        return Err(MountLookupError::MalformedEntry);
     }
-    let Some(opts) = fields.get(5) else {
-        return MountOptionState::MalformedEntry;
-    };
-    if opts.split(|b| *b == b',').any(|t| t == option.as_bytes()) {
-        MountOptionState::Present
-    } else {
-        MountOptionState::Absent
+    Ok(fields)
+}
+
+/// `mountinfo` 上で mount ID が `mount_id` の行のファイルシステム種別（`-` の次の欄。例 `proc`）を返す。
+///
+/// cli の `doctor` が `/proc/sys/net`・`/proc/net` を開いた fd の mount ID（[`file_mount_id`]）でこれを呼び、
+/// procfs 上にあることを確かめる（NET-10・TASK-148.1）。パスの最長一致では祖先への重ねマウントや
+/// `mount --move` で隠れた古い子マウントの行を選びうるため、実体の mount ID で引く（#2724）。
+/// 行が無い・壊れている・重複・種別欄が無い／UTF-8 でない場合は `Err`（呼び出し側は fail-closed）。
+/// OS 呼び出しを含まない純粋関数。
+pub fn mount_fstype_by_id(mountinfo: &[u8], mount_id: u64) -> Result<String, MountLookupError> {
+    let fields = mount_entry_by_id(mountinfo, mount_id)?;
+    let sep = fields
+        .iter()
+        .position(|f| *f == b"-")
+        .ok_or(MountLookupError::MalformedEntry)?;
+    fields
+        .get(sep + 1)
+        .and_then(|f| std::str::from_utf8(f).ok())
+        .map(str::to_string)
+        .ok_or(MountLookupError::MalformedEntry)
+}
+
+/// fdinfo から mount ID を読めなかった理由（[`read_fdinfo_mount_id`] の失敗）。
+///
+/// 呼び出し側（`add_host_dns::hosts_file` は理由ごとの message に写す）が理由を型で区別できるように
+/// する。io::Error の文字列から理由を読み戻さない（REPAIR-1）。
+#[derive(Debug)]
+pub(crate) enum FdinfoMountIdError {
+    /// `/proc/self/fdinfo/<fd>` を開けない・読めない（元の io::Error を保つ）。
+    Read(io::Error),
+    /// 読み込み上限（`MAX_FDINFO_READ`）を超えた。
+    TooLarge,
+    /// `mnt_id:` 行が無い、または数値でない。
+    MissingMountId,
+}
+
+/// fdinfo の `mnt_id:` 行を読む crate 内で唯一の実装（REPAIR-1）。
+///
+/// 呼び出し元は [`file_mount_id`]（cli の `doctor`・SUP-14）と
+/// `add_host_dns::hosts_file::verify_same_mount`（NET-12・P0）。読めない・上限超過・行が無い・
+/// 数値でない場合はすべてエラーで、呼び出し側は fail-closed で扱う。読み込みは上限つき。
+pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdError> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .and_then(|f| f.take(MAX_FDINFO_READ + 1).read_to_end(&mut buf))
+        .map_err(FdinfoMountIdError::Read)?;
+    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
+        return Err(FdinfoMountIdError::TooLarge);
     }
+    parse_fdinfo_mnt_id(&buf).ok_or(FdinfoMountIdError::MissingMountId)
 }
 
 /// 開いたファイルが属するマウントの ID（mountinfo の 1 番目の欄と同じ値）を `/proc/self/fdinfo/<fd>` の
 /// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・数値でない場合はエラー。
 ///
 /// cli の `doctor` が [`mount_option_by_id`] に渡す ID を得るために呼ぶ（SUP-14・#2661）。
+/// 実体は `read_fdinfo_mount_id` で、ここは `io::Error` に写す薄い包み。
 pub fn file_mount_id(file: &File) -> io::Result<u64> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?
-        .take(MAX_FDINFO_READ + 1)
-        .read_to_end(&mut buf)?;
-    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "fdinfo is too large",
-        ));
-    }
-    parse_fdinfo_mnt_id(&buf)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo"))
+    read_fdinfo_mount_id(file).map_err(|e| match e {
+        FdinfoMountIdError::Read(e) => e,
+        FdinfoMountIdError::TooLarge => {
+            io::Error::new(io::ErrorKind::InvalidData, "fdinfo is too large")
+        }
+        FdinfoMountIdError::MissingMountId => {
+            io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo")
+        }
+    })
 }
 
 /// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
@@ -351,21 +384,33 @@ fn parse_fdinfo_mnt_id(text: &[u8]) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
-/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
-/// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
-fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
-    let Some(fields) = covering_mount(mountinfo, dir) else {
-        return Err(NetError::new(
-            NetErrorCode::Internal,
-            "mount of netns directory not found in mountinfo",
-        ));
+/// `mountinfo`（生バイト列）上で mount ID が `mount_id` のマウントの伝播が `shared` なら拒否する
+/// （OS 呼び出しを含まない純粋関数。単体テスト用に分離）。
+///
+/// 行はパスの最長一致ではなく、置き場ディレクトリを開いた fd の mount ID で引く。祖先への重ねマウントや
+/// `mount --move` で隠れた古い子マウントの行を選んで shared のマウント上に pin を作る事故を防ぐ（#2724）。
+/// 行が無い・壊れている・重複している場合は拒否する（fail-closed。`Internal`）。
+fn check_propagation(mountinfo: &[u8], mount_id: u64) -> Result<(), NetError> {
+    let fields = match mount_entry_by_id(mountinfo, mount_id) {
+        Ok(fields) => fields,
+        Err(MountLookupError::MountNotFound) => {
+            return Err(NetError::new(
+                NetErrorCode::Internal,
+                "mount of netns directory not found in mountinfo",
+            ));
+        }
+        Err(_) => {
+            return Err(NetError::new(
+                NetErrorCode::Internal,
+                "mount of netns directory is malformed or duplicated in mountinfo",
+            ));
+        }
     };
     let shared = fields
         .iter()
         .skip(6)
-        .take_while(|f| **f != "-")
-        .any(|f| f.starts_with("shared:"));
+        .take_while(|f| **f != b"-")
+        .any(|f| f.starts_with(b"shared:"));
     if shared {
         Err(NetError::new(
             NetErrorCode::FailedPrecondition,
@@ -376,10 +421,30 @@ fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
     }
 }
 
-/// 固定済みの置き場ディレクトリ（`PinDir::real`。開いた fd から得た実際の位置）の伝播を検査する。
+/// `/proc/self/mountinfo` の読み込み上限（無制限確保の防止。cli の doctor と同じ 4 MiB）。
+const MAX_MOUNTINFO_READ: u64 = 4 * 1024 * 1024;
+
+/// 固定済みの置き場ディレクトリの伝播を検査する。
+///
+/// 開いた fd（`PinDir::file`）の mount ID（fdinfo の `mnt_id`）で mountinfo の行を引く。pin の bind 元は
+/// この fd 経由で作ったファイルのため同じマウントに属し、fd がマウントを保持する間 ID は変わらない
+/// （lazy umount 等で mountinfo から外れていれば `MountNotFound` で拒否される）。
+/// mountinfo は上限つきで生バイトのまま読み、上限超過は拒否する。
 fn check_dir_propagation(dir: &PinDir) -> Result<(), NetError> {
-    let raw = fs::read("/proc/self/mountinfo").map_err(|e| io_error("read mountinfo", &e))?;
-    check_propagation(&String::from_utf8_lossy(&raw), &dir.real)
+    use std::io::Read as _;
+    let id =
+        file_mount_id(&dir.file).map_err(|e| io_error("read fdinfo of netns directory", &e))?;
+    let mut raw = Vec::new();
+    fs::File::open("/proc/self/mountinfo")
+        .and_then(|f| f.take(MAX_MOUNTINFO_READ + 1).read_to_end(&mut raw))
+        .map_err(|e| io_error("read mountinfo", &e))?;
+    if u64::try_from(raw.len()).map_or(true, |n| n > MAX_MOUNTINFO_READ) {
+        return Err(NetError::new(
+            NetErrorCode::Internal,
+            "mountinfo is too large",
+        ));
+    }
+    check_propagation(&raw, id)
 }
 
 /// 作った pin ファイルを消す（消せたら `PINS` の記録も外す）。失敗は `Present`（残っていると分かる）で報告する。
@@ -876,7 +941,7 @@ fn lookup_pin(id: FileId) -> Option<PinRecord> {
 struct PinDir {
     /// 開いたままにして `/proc/self/fd/<n>` を有効に保つ。
     file: File,
-    /// 開いた時点の正規パス（mountinfo 照合用）。
+    /// 開いた時点の正規パス（`pin_mount_state` のパス照合用。伝播検査は fd の mount ID で行う）。
     real: PathBuf,
     /// 開いた実体の識別子 (st_dev, st_ino)。
     id: FileId,
@@ -1305,53 +1370,81 @@ mod tests {
 43 41 0:42 / /run/priv/slave rw shared:7 master:3 - tmpfs tmpfs rw
 ";
 
-    /// NET-1: 置き場を含むマウントの伝播判定（最長一致・shared 拒否・private / slave 許可）。
+    /// NET-1・#2724: 置き場を含むマウントの伝播判定を mount ID で行う（shared 拒否・private / slave 許可）。
     #[test]
-    fn net1_propagation_check_uses_longest_mount() {
-        let code = |p: &str| check_propagation(MOUNTINFO, Path::new(p)).map_err(|e| e.code());
-        assert_eq!(code("/run/netns"), Err(NetErrorCode::FailedPrecondition));
-        assert_eq!(code("/var/lib/x"), Err(NetErrorCode::FailedPrecondition));
-        assert_eq!(code("/run/priv"), Ok(()));
-        assert_eq!(code("/run/priv/d"), Ok(()));
-        assert_eq!(code("/run/with space/d"), Ok(()));
-        assert_eq!(
-            code("/run/priv/slave/d"),
-            Err(NetErrorCode::FailedPrecondition)
-        );
-        // 前方一致だけでは別マウントとみなさない（`/run/privx` は `/run` に属する）。
-        assert_eq!(code("/run/privx"), Err(NetErrorCode::FailedPrecondition));
+    fn net1_propagation_check_by_mount_id() {
+        let code = |id: u64| check_propagation(MOUNTINFO.as_bytes(), id).map_err(|e| e.code());
+        assert_eq!(code(22), Err(NetErrorCode::FailedPrecondition));
+        assert_eq!(code(30), Err(NetErrorCode::FailedPrecondition));
+        assert_eq!(code(41), Ok(()));
+        assert_eq!(code(42), Ok(()));
+        assert_eq!(code(43), Err(NetErrorCode::FailedPrecondition));
     }
 
-    /// NET-1: mountinfo に該当マウントが無ければ拒否する（fail-closed）。
+    /// NET-1・#2724: 祖先への重ねマウントで隠れた子マウントの行を、パス上の位置で取り違えない。
+    #[test]
+    fn net1_propagation_check_does_not_pick_hidden_mount() {
+        // 41 は /run/netns の隠れた private な古い子、60 は後から /run に重ねた shared。
+        let info = b"\
+22 1 8:1 / / rw shared:1 - ext4 /dev/sda1 rw
+41 30 0:40 / /run/netns rw - tmpfs tmpfs rw
+60 22 0:50 / /run rw shared:9 - tmpfs tmpfs rw
+";
+        let code = |i: &[u8], id: u64| check_propagation(i, id).map_err(|e| e.code());
+        assert_eq!(code(info, 60), Err(NetErrorCode::FailedPrecondition));
+        assert_eq!(code(info, 41), Ok(()));
+        // 逆: 隠れた子が shared、fd 側の ID が private。行順を入れ替えても結果は変わらない。
+        let rev = b"\
+60 22 0:50 / /run rw - tmpfs tmpfs rw
+41 30 0:40 / /run/netns rw shared:3 - tmpfs tmpfs rw
+";
+        assert_eq!(code(rev, 60), Ok(()));
+        assert_eq!(code(rev, 41), Err(NetErrorCode::FailedPrecondition));
+    }
+
+    /// NET-1・#2724: 行が無い・重複・壊れている場合は拒否する（fail-closed）。
     #[test]
     fn net1_propagation_check_rejects_unknown_mount() {
-        let e = check_propagation("", Path::new("/run/x")).unwrap_err();
-        assert_eq!(e.code(), NetErrorCode::Internal);
+        let dup = b"1 0 0:1 / / rw - tmpfs t rw\n1 0 0:2 / /a rw - tmpfs t rw\n";
+        let nosep = b"1 0 0:1 / / rw shared:1\n";
+        for (info, id) in [(&b""[..], 1), (&dup[..], 1), (&nosep[..], 1), (&dup[..], 9)] {
+            let e = check_propagation(info, id).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::Internal);
+        }
     }
 
-    /// NET-10・TASK-148.1: パスを含むマウントの fstype（最長一致・同長は最上位・欄欠けは None）。
+    /// NET-10・TASK-148.1・#2724: mount ID で行を引いた fstype（欠け・重複・不在は理由つきの Err）。
     #[test]
-    fn net10_covering_mount_fstype() {
-        let info = "\
+    fn net10_mount_fstype_by_id() {
+        let info = b"\
 22 1 8:1 / / rw - ext4 /dev/sda1 rw
 24 22 0:22 / /proc rw,nosuid - proc proc rw
-25 24 0:22 /sys /proc/sys ro,nosuid - proc proc rw
-26 22 0:23 / /procx rw - tmpfs tmpfs rw
-27 22 0:24 / /over rw - proc proc rw
-28 22 0:25 / /over rw - tmpfs tmpfs rw
-29 22 0:26 / /broken rw
+30 24 0:30 / /proc/sys rw - tmpfs tmpfs rw
+31 22 0:31 / /\xff\xfe rw - tmpfs tmpfs rw
+32 22 0:32 / /broken rw
+33 22 0:33 / /dup rw - proc proc rw
+33 22 0:34 / /dup2 rw - tmpfs tmpfs rw
+34 22 0:35 / /nofs rw -
 ";
-        let fs = |p: &str| covering_mount_fstype(info, Path::new(p));
-        assert_eq!(fs("/proc/sys/net").as_deref(), Some("proc"));
-        assert_eq!(fs("/proc").as_deref(), Some("proc"));
-        // 前方一致だけでは別マウントとみなさない（`/procx` 配下は tmpfs、`/procy` は `/` の ext4）。
-        assert_eq!(fs("/procx/sys/net").as_deref(), Some("tmpfs"));
-        assert_eq!(fs("/procy/sys/net").as_deref(), Some("ext4"));
-        // 同じマウントポイントに重ねた場合は後の行（最上位）。
-        assert_eq!(fs("/over/a").as_deref(), Some("tmpfs"));
-        // `-` 区切りの無い壊れた行は種別を返さない。
-        assert_eq!(fs("/broken/a"), None);
-        assert_eq!(covering_mount_fstype("", Path::new("/proc/sys/net")), None);
+        assert_eq!(mount_fstype_by_id(info, 24).as_deref(), Ok("proc"));
+        assert_eq!(mount_fstype_by_id(info, 30).as_deref(), Ok("tmpfs"));
+        assert_eq!(mount_fstype_by_id(info, 31).as_deref(), Ok("tmpfs"));
+        assert_eq!(
+            mount_fstype_by_id(info, 32),
+            Err(MountLookupError::MalformedEntry)
+        );
+        assert_eq!(
+            mount_fstype_by_id(info, 33),
+            Err(MountLookupError::MalformedEntry)
+        );
+        assert_eq!(
+            mount_fstype_by_id(info, 34),
+            Err(MountLookupError::MalformedEntry)
+        );
+        assert_eq!(
+            mount_fstype_by_id(info, 99),
+            Err(MountLookupError::MountNotFound)
+        );
     }
 
     /// SUP-14・#2661: mount ID で行を引き、per-mount options のトークン完全一致で判定する（super options は
@@ -1397,6 +1490,18 @@ mod tests {
         );
     }
 
+    /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は `None`。
+    #[test]
+    fn net12_parse_fdinfo_mnt_id_ignores_other_lines_and_rejects_invalid() {
+        let text = b"pos:\t0\nflags:\t02102002\nmnt_id:\t39\nino:\t5\n\
+                    lock:\t1: FLOCK  ADVISORY  WRITE 1234 00:2a:5 0 EOF\n";
+        assert_eq!(parse_fdinfo_mnt_id(text), Some(39));
+        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0100000\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\tabc\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t-1\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b""), None);
+    }
+
     /// SUP-14・#2661: fdinfo の `mnt_id:` 行の取り出し。
     #[test]
     fn sup14_parse_fdinfo_mnt_id() {
@@ -1422,6 +1527,31 @@ mod tests {
             ),
             "mount id {id} not resolvable"
         );
+    }
+
+    /// NET-1・#2724: 実際に開いた置き場の fd から mount ID を引き、独立した判定と結果が一致する。
+    #[test]
+    fn net1_check_dir_propagation_resolves_real_mount() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("propid");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = open_pin_dir(&base).expect("open pin dir");
+        let id = file_mount_id(&dir.file).expect("mount id");
+        let info = fs::read("/proc/self/mountinfo").expect("mountinfo");
+        let fields = mount_entry_by_id(&info, id).expect("single mount line");
+        let shared = fields
+            .iter()
+            .skip(6)
+            .take_while(|f| **f != b"-")
+            .any(|f| f.starts_with(b"shared:"));
+        let got = check_dir_propagation(&dir).map_err(|e| e.code());
+        let want = if shared {
+            Err(NetErrorCode::FailedPrecondition)
+        } else {
+            Ok(())
+        };
+        assert_eq!(got, want);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// 8 進エスケープの復号。

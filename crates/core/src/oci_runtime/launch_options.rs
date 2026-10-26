@@ -12,6 +12,8 @@
 //! | `tmpfs` | pivot 前段の `mount_tmpfs`(`--ipc=host` 以外では `/dev/shm` を必ず含む) |
 //! | `inject` | pivot 前段の `inject_files`(secrets / configs。空なら注入しない) |
 //! | `ipc` | `Host` のときだけ IPC namespace を作らず、Landlock の暗黙マウントを `WithoutShm` にする |
+//! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
+//! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //!
 //! # 契約
 //!
@@ -25,7 +27,8 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
-//! - CLI / stack から supervisor への `ContainerOptions` の受け渡しは未結線(`run_main` は既定のまま)。
+//! - CLI から supervisor への受け渡しは状態ルート配下の 0600 の文書(`fandhe-container-supervisor` の
+//!   `container_options::document`・#2713)で行う。stack の `up` からの結線は TASK-155 の後続。
 //! - 範囲写像の経路では ID 写像の holder が中間プロセスのメモリを継承し dumpable になる。注入内容は
 //!   `InjectedContent::from_file` の封印 memfd ならユーザー空間のメモリに載らず holder にも継承されない(#2628)。
 //!   呼び出し元のメモリにある内容(`from_bytes`)は、launcher が範囲写像(`RootlessSubordinateIds`)との併用を
@@ -33,6 +36,8 @@
 
 use crate::dev_mounts::ImplicitDevMounts;
 use crate::injected_files::{InjectedFileSet, overlaps};
+use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
+use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
 use crate::traits::types::{ErrorCode, TraitError};
 
@@ -47,11 +52,28 @@ pub enum LaunchIpcMode {
 }
 
 /// 検証済みの起動オプション(モジュール doc)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
     tmpfs: TmpfsMountSet,
     inject: InjectedFileSet,
     ipc: LaunchIpcMode,
+    /// `--ulimit` で指定された種別だけ(未指定の種別は launcher が継承値で補う)。
+    rlimits: Rlimits,
+    /// `--env` の上書き(`KEY=VALUE`。`with_env` で検証済み)。
+    env: Vec<String>,
+}
+
+/// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
+impl std::fmt::Debug for LaunchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchOptions")
+            .field("tmpfs", &self.tmpfs)
+            .field("inject", &self.inject)
+            .field("ipc", &self.ipc)
+            .field("rlimits", &self.rlimits)
+            .field("env_count", &self.env.len())
+            .finish()
+    }
 }
 
 fn invalid(message: &'static str) -> TraitError {
@@ -94,7 +116,38 @@ impl LaunchOptions {
                 "an injected file under /dev/shm cannot be combined with --ipc=host",
             ));
         }
-        Ok(Self { tmpfs, inject, ipc })
+        Ok(Self {
+            tmpfs,
+            inject,
+            ipc,
+            rlimits: Rlimits::default(),
+            env: Vec::new(),
+        })
+    }
+
+    /// `--ulimit` の指定を持たせる(種別の重複は [`Rlimits`] が構築時に拒否済み。#2713)。
+    #[must_use]
+    pub fn with_rlimits(mut self, rlimits: Rlimits) -> Self {
+        self.rlimits = rlimits;
+        self
+    }
+
+    /// `--env` の上書きを持たせる。core は supervisor の検証を信用せず、件数・長さ・形式(`KEY=VALUE`・キー非空・
+    /// NUL なし)を再検証する(fail-closed。値は文言に含めない。SEC-1・#2713)。
+    pub fn with_env(mut self, env: Vec<String>) -> Result<Self, TraitError> {
+        if env.len() > CONFIG_MAX_ENV {
+            return Err(invalid("too many environment overrides"));
+        }
+        for entry in &env {
+            let valid = entry.len() <= CONFIG_MAX_STRING_BYTES
+                && !entry.contains('\0')
+                && entry.split_once('=').is_some_and(|(k, _)| !k.is_empty());
+            if !valid {
+                return Err(invalid("an environment override is malformed"));
+            }
+        }
+        self.env = env;
+        Ok(self)
     }
 
     /// 指定が無いときの値(既定の `/dev/shm` 64 MiB 1 件・注入なし・`Private`)。従来の launcher の動作と同じ。
@@ -119,6 +172,44 @@ impl LaunchOptions {
     /// IPC namespace の扱い。
     pub fn ipc(&self) -> LaunchIpcMode {
         self.ipc
+    }
+
+    /// `--ulimit` で指定された rlimit(指定した種別だけ)。
+    pub fn rlimits(&self) -> &Rlimits {
+        &self.rlimits
+    }
+
+    /// `process.env`(`base`)へ上書きを重ねた env。既存のキーはその位置で値を置き換え、新しいキーは末尾へ足す
+    /// (`--env` の後勝ち・初出位置の保持。`base` 側に同じキーが複数あれば最初の位置を置き換え、残りは落とす)。
+    pub fn merged_env(&self, base: &[String]) -> Vec<String> {
+        // キー部分(`=` より前。`=` が無ければ全体)。スライスの添字は使わない。
+        fn key_of(s: &str) -> &str {
+            s.split_once('=').map_or(s, |(k, _)| k)
+        }
+        let mut out: Vec<String> = base.to_vec();
+        for over in &self.env {
+            let k = key_of(over);
+            match out.iter().position(|e| key_of(e) == k) {
+                Some(i) => {
+                    if let Some(slot) = out.get_mut(i) {
+                        *slot = over.clone();
+                    }
+                    // 同じキーの後続の重複は落とす(先頭の位置に 1 つだけ残す)。
+                    let mut seen = false;
+                    out.retain(|e| {
+                        if key_of(e) == k {
+                            let keep = !seen;
+                            seen = true;
+                            keep
+                        } else {
+                            true
+                        }
+                    });
+                }
+                None => out.push(over.clone()),
+            }
+        }
+        out
     }
 
     /// Landlock の暗黙マウント(実際に載せる tmpfs の集合から導く。CORE-5)。
@@ -167,6 +258,40 @@ mod tests {
         assert!(o.inject().is_empty());
         assert_eq!(o.ipc(), LaunchIpcMode::Private);
         assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::All);
+    }
+
+    /// SUP-12・#2713: env の上書きは既存キーの位置を保ち、新しいキーは末尾へ足す。
+    #[test]
+    fn sup12_launch_options_env_merge() {
+        let o = LaunchOptions::try_default()
+            .expect("default")
+            .with_env(vec!["A=2".into(), "B=3".into()])
+            .expect("env");
+        let base = vec!["PATH=/bin".to_owned(), "A=1".to_owned()];
+        assert_eq!(o.merged_env(&base), vec!["PATH=/bin", "A=2", "B=3"]);
+        assert_eq!(
+            LaunchOptions::try_default().expect("d").merged_env(&base),
+            base
+        );
+    }
+
+    /// SUP-12・#2713: 不正な env の上書きは固定文言で拒否する(値を含めない)。
+    #[test]
+    fn sup12_launch_options_with_env_rejects_malformed() {
+        for bad in ["NOEQ", "=v", "A=\0"] {
+            let err = LaunchOptions::try_default()
+                .expect("d")
+                .with_env(vec![bad.to_owned()])
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "an environment override is malformed");
+        }
+        let many = vec!["A=1".to_owned(); CONFIG_MAX_ENV + 1];
+        let err = LaunchOptions::try_default()
+            .expect("d")
+            .with_env(many)
+            .expect_err("rejected");
+        assert_eq!(err.message(), "too many environment overrides");
     }
 
     /// SUP-12: Host と /dev/shm の組み合わせは拒否する。
@@ -255,6 +380,23 @@ mod tests {
         .expect("options");
         assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::WithoutShm);
         assert_eq!(o.inject().files().len(), 1);
+    }
+
+    /// SEC-1: Debug に env の値が出ない(件数だけ)。
+    #[test]
+    fn sec1_debug_does_not_leak_env_values() {
+        let o = LaunchOptions::new(
+            set_of(&["/run"]),
+            secret("/etc/token", b"x"),
+            LaunchIpcMode::Host,
+        )
+        .expect("options")
+        .with_env(vec!["API_KEY=ENVSECRETVALUE".to_string()])
+        .expect("env");
+        let text = format!("{o:?}");
+        assert!(!text.contains("ENVSECRETVALUE"), "{text}");
+        assert!(!text.contains("API_KEY"), "{text}");
+        assert!(text.contains("env_count: 1"), "{text}");
     }
 
     /// SEC-1: Debug に secret の内容が出ない。

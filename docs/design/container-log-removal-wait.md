@@ -18,7 +18,7 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 | ---- | ---- | ---- |
 | A: sink の閉鎖を期限つきで待ってから消す | 採用 | 新しい永続状態を作らない（CORE-1 の常駐デーモン無しと整合）。試験が決定的に書ける |
 | B: 後で再試行（plugin 内の遅延スレッド） | 不採用 | スレッド数の上限管理と plugin 再起動時の取りこぼしが増える |
-| C: 次の操作で回収 | 不採用 | 回収の起点と、同じ ID の再作成との排他の設計が新たに要る |
+| C: 次の操作で回収 | 限定して採用（#2698） | 起点は「同じ ID の CLI `create`、core を呼ぶ前」だけ。排他は既存の guard（ロック保持中に状態の不在を確認）で足りる。全体走査の GC は採らない |
 
 ## 実装
 
@@ -47,6 +47,13 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 ## 残る制約・対象外
 
 - terminate は最大 600 秒まで設定できる。既定を超えて窓が 10 秒を超えたときは待ち切れず、`FailedPrecondition` として計上してログを残す
-  （1 ID あたり世代数 × 上限に収まる）。後から回収する経路は作らない
-- CLI の `delete` にも `stop` 直後に同じ窓がある。新しい関数へ差し替えるかは別 issue の候補（CLI-1・SUP-7）
-- `DeleteResponse` に後始末の結果を載せることは #2633（PR #2685）の担当
+  （1 ID あたり世代数 × 上限に収まる）
+- CLI の `delete` も同じ待ち（`remove_container_logs_guarded_bounded_waiting`）を使い、結果を `DeleteResponse` の
+  `supervisor_log` / `container_log` に載せる（#2698）。CLI の後始末の最悪は supervisor ログ 5 秒 + 待ち 10 秒 + 最後の試行 5 秒 = 20 秒
+  （`repair5_cli_delete_cleanup_budget_fits_20s`）
+- 残ったログの回収（#2698）: 同じ ID の CLI `create` が core を呼ぶ前に、待たずに 1 回だけ（上限 5 秒）消す
+  （`reclaim_stale_container_log`）。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。best effort で
+  create の成否と stderr は変えず（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる）、観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
+- 範囲外: ID を再利用しない場合（plugin-cri の CRI など）の残りの自動回収（`@container-logs` 全体の走査は stem の復号と状態の照合、
+  delete の遅延予算の再設計が要る）、plugin-cri の `CreateContainer` への同じ契機の配線。残りは手動で消す
+  （`docs/setup/container-log-recovery.md`）

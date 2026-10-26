@@ -319,9 +319,22 @@ pub struct ExecTarget {
     /// pid1 の特定に使った記録の launch 時の分離（`/` の同一性と Landlock ルール。
     /// [`require_recorded_launch_isolation`] が存在を確かめた）。[`prepare_restrictions`] が core へ渡す。
     launch_isolation: LaunchIsolationRecord,
+    /// launch 時に適用した起動オプションの env 上書き(`KEY=VALUE`。SUP-12・#2713)。`config.json` の `process.env` の上に、
+    /// exec 固有の指定([`ExecRequest::with_env`])より前に重ねる。launch と exec で同じ env を共有するため。
+    /// 既定は空(従来どおり)。[`ExecTarget::with_launch_env`] で足す。
+    launch_env: Vec<String>,
 }
 
 impl ExecTarget {
+    /// launch 時の起動オプションの env 上書きを持たせる(検証済みの文書から取り出した `KEY=VALUE` の列。#2713)。
+    ///
+    /// 各要素の形式は実行時に [`ContainerEnv::with_var`] が改めて検証する(件数・長さ・形式)。
+    #[must_use]
+    pub fn with_launch_env(mut self, launch_env: Vec<String>) -> Self {
+        self.launch_env = launch_env;
+        self
+    }
+
     /// 対象のコンテナ ID。
     pub fn id(&self) -> &ContainerId {
         &self.id
@@ -402,6 +415,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
@@ -442,6 +456,7 @@ pub fn identify_pid1_with_pidfd(
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
@@ -467,6 +482,7 @@ pub fn identify_pid1_in(
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
@@ -963,6 +979,24 @@ pub fn run_command_with_pidfd(
     timeout: Duration,
     audit: &dyn AuditSink,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_env(record, pidfd, request, timeout, audit, &[])
+}
+
+/// [`run_command_with_pidfd`] に、launch 時の起動オプションの env 上書き(`launch_env`。`KEY=VALUE`)を足した入口
+/// (SUP-12・SUP-6・#2713)。
+///
+/// `config.json` の `process.env` の上に `launch_env` を重ね、その上に `request` の明示の指定を重ねる。launch の
+/// Entrypoint が使う env と exec(healthcheck を含む)の env を揃えるため。`launch_env` は信頼済みの保存文書
+/// (`container_options::store::read_launch_env`)から取り出した値だけを渡すこと(呼び出し側が任意に足す口ではない)。
+/// 空なら [`run_command_with_pidfd`] と同じ。呼び出し元の配線(healthcheck #2441・CLI の exec #2626)は未実装。
+pub fn run_command_with_pidfd_env(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    launch_env: &[String],
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let sweep = sweep_before_create(record);
@@ -973,7 +1007,8 @@ pub fn run_command_with_pidfd(
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
-            let target = identify_pid1_with_pidfd(record, pidfd)?;
+            let target =
+                identify_pid1_with_pidfd(record, pidfd)?.with_launch_env(launch_env.to_vec());
             run_with_target(proof, &target, request, deadline, child, sender)
         },
     );
@@ -2016,7 +2051,18 @@ fn run_in_child_cgroup(
     // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
-    let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
+    // launch 時の起動オプションの env 上書きは、exec 固有の指定(`request`)より前に重ねる(SUP-12・#2713)。
+    let mut base = ContainerEnv::from_config(&config).map_err(from_exec_error)?;
+    for entry in &target.launch_env {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "a launch env override is malformed",
+            )
+        })?;
+        base = base.with_var(key, value).map_err(from_exec_error)?;
+    }
+    let command = request.command(&base)?;
     let restrictions = core_prepare_exec_restrictions(
         proof,
         &target.pid1,

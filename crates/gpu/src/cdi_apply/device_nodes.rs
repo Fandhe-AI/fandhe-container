@@ -1196,13 +1196,32 @@ mod tests {
         // プロセス全体の umask を試験内で変えない（unsafe 回避）。umask 077 の子プロセスで自身を再実行する。
         if std::env::var_os("FC_GPU_UMASK_CHILD").is_none() {
             let exe = std::env::current_exe().unwrap();
-            let st = std::process::Command::new("sh")
+            let mut child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg("umask 077; exec \"$0\" --exact cdi_apply::device_nodes::tests::intermediate_dirs_are_0755_under_restrictive_umask")
                 .arg(exe)
                 .env("FC_GPU_UMASK_CHILD", "1")
-                .status()
+                .spawn()
                 .unwrap();
+            // REPAIR-5: 子が停止しても無期限に待たない。期限超過で kill し、回収にも上限を設ける。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let st = loop {
+                if let Some(st) = child.try_wait().unwrap() {
+                    break st;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while child.try_wait().unwrap().is_none()
+                        && std::time::Instant::now() < reap_deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    panic!("umask child did not finish within 60s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
             assert!(st.success());
             return;
         }

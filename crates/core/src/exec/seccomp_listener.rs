@@ -466,6 +466,51 @@ enum ReceiveFailure {
     Failed(ExecError),
 }
 
+/// listener の受信を、待機（`wait`）と非ブロック受信（`recv`）の組で `EAGAIN` のときだけ繰り返す。
+///
+/// [`receive_listener_classified`] から本番の `wait_readable` と `recv_fd_with_creds` を渡されて呼ばれる。
+/// 受信は `MSG_DONTWAIT` のため、poll の見かけ上の起床で `EAGAIN`（待機中メッセージ無し。Linux v6.12
+/// `net/unix/af_unix.c` の `__unix_dgram_recvmsg`。#2498）になりうる。その場合は同じ期限までで待ち直す。
+/// 各周回の `wait` が期限を見て `false` を返せば `Timeout` にするため、無期限に待たない（REPAIR-5・#2372）。
+/// `EAGAIN` 以外の受信失敗は再試行せず、そのまま失敗にする（fail-closed）。注入点を設けたのは、実際の
+/// 見かけ上の起床を試験で再現できないためで、ループの試験は SEC-4・REPAIR-12（#2498）。
+fn recv_retrying_eagain<W, R>(
+    mut wait: W,
+    mut recv: R,
+) -> Result<sys::seccomp_notify::ReceivedFd, ExecError>
+where
+    W: FnMut() -> Result<bool, SysError>,
+    R: FnMut() -> Result<sys::seccomp_notify::ReceivedFd, SysError>,
+{
+    const STAGE: IsolationStage = IsolationStage::Seccomp;
+    loop {
+        match wait() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ExecError::new(
+                    ErrorCode::Timeout,
+                    STAGE,
+                    "the seccomp listener was not delivered in time",
+                ));
+            }
+            Err(e) => {
+                return Err(ExecError::from_sys(
+                    e,
+                    STAGE,
+                    "wait for the seccomp listener",
+                ));
+            }
+        }
+        match recv() {
+            Err(SysError::Os(e)) if e == sys::EAGAIN => {}
+            other => {
+                return other
+                    .map_err(|e| ExecError::from_sys(e, STAGE, "receive of the seccomp listener"));
+            }
+        }
+    }
+}
+
 /// [`receive_listener`] の本体。EOF を [`ReceiveFailure::SenderClosed`] として区別して返す。
 fn receive_listener_classified(
     sock: BorrowedFd<'_>,
@@ -474,39 +519,11 @@ fn receive_listener_classified(
 ) -> Result<SeccompListener, ReceiveFailure> {
     const STAGE: IsolationStage = IsolationStage::Seccomp;
     let failed = |e: ExecError| ReceiveFailure::Failed(e);
-    // 受信は `MSG_DONTWAIT`。poll の見かけ上の起床で `EAGAIN` になれば、同じ `deadline` までで待ち直す
-    // （各周回の `wait_readable` が期限を見るため無期限にならない。REPAIR-5・#2372）。
-    let received = loop {
-        match wait_readable(sock, deadline) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(failed(ExecError::new(
-                    ErrorCode::Timeout,
-                    STAGE,
-                    "the seccomp listener was not delivered in time",
-                )));
-            }
-            Err(e) => {
-                return Err(failed(ExecError::from_sys(
-                    e,
-                    STAGE,
-                    "wait for the seccomp listener",
-                )));
-            }
-        }
-        match sys::seccomp_notify::recv_fd_with_creds(sock) {
-            Err(SysError::Os(e)) if e == sys::EAGAIN => {}
-            other => {
-                break other.map_err(|e| {
-                    failed(ExecError::from_sys(
-                        e,
-                        STAGE,
-                        "receive of the seccomp listener",
-                    ))
-                })?;
-            }
-        }
-    };
+    let received = recv_retrying_eagain(
+        || wait_readable(sock, deadline),
+        || sys::seccomp_notify::recv_fd_with_creds(sock),
+    )
+    .map_err(failed)?;
     if let Some(e) = decode_failure(&received, expected_pid) {
         return Err(failed(e));
     }
@@ -866,6 +883,85 @@ pub fn user_notif_probe_for_test() -> Result<UserNotifProbe, String> {
 mod tests {
     use super::*;
     use sys::seccomp_notify::{ReceivedFd, Ucred};
+
+    /// SEC-4・REPAIR-5・#2498: `EAGAIN`（見かけ上の起床）は同じ期限内で待ち直し、届いたメッセージを返す。
+    #[test]
+    fn sec4_2498_eagain_is_retried_until_a_message_arrives() {
+        use std::cell::Cell;
+        let (waits, recvs) = (Cell::new(0u32), Cell::new(0u32));
+        let got = recv_retrying_eagain(
+            || {
+                waits.set(waits.get() + 1);
+                Ok(true)
+            },
+            || {
+                recvs.set(recvs.get() + 1);
+                if recvs.get() == 1 {
+                    Err(SysError::Os(sys::EAGAIN))
+                } else {
+                    Ok(ReceivedFd {
+                        payload: vec![b'L'],
+                        fds: vec![],
+                        creds: None,
+                        truncated: false,
+                    })
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(got.payload, vec![b'L']);
+        assert_eq!((waits.get(), recvs.get()), (2, 2));
+    }
+
+    /// SEC-4・REPAIR-5・#2498: `EAGAIN` の後で期限が切れたら `Timeout`（無期限に待たない）。
+    #[test]
+    fn sec4_2498_eagain_then_deadline_is_timeout() {
+        use std::cell::Cell;
+        let (waits, recvs) = (Cell::new(0u32), Cell::new(0u32));
+        let err = recv_retrying_eagain(
+            || {
+                waits.set(waits.get() + 1);
+                Ok(waits.get() == 1)
+            },
+            || {
+                recvs.set(recvs.get() + 1);
+                Err(SysError::Os(sys::EAGAIN))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(err.stage, IsolationStage::Seccomp);
+        assert_eq!(
+            err.message,
+            "the seccomp listener was not delivered in time"
+        );
+        assert_eq!((waits.get(), recvs.get()), (2, 1));
+    }
+
+    /// SEC-4・REPAIR-5・#2498: `EAGAIN` 以外の受信失敗は再試行せず、その場で失敗にする（fail-closed）。
+    #[test]
+    fn sec4_2498_non_eagain_recv_error_is_not_retried() {
+        use std::cell::Cell;
+        let (waits, recvs) = (Cell::new(0u32), Cell::new(0u32));
+        let err = recv_retrying_eagain(
+            || {
+                waits.set(waits.get() + 1);
+                Ok(true)
+            },
+            || {
+                recvs.set(recvs.get() + 1);
+                Err(SysError::Os(sys::EINVAL))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.stage, IsolationStage::Seccomp);
+        assert!(
+            err.message.starts_with("receive of the seccomp listener"),
+            "{}",
+            err.message
+        );
+        assert_eq!((waits.get(), recvs.get()), (1, 1));
+    }
 
     /// SEC-4・REPAIR-5: 非ブロック化が先で ACK が後。非ブロック化が失敗したら ACK を送らず、そのエラーを返す。
     #[test]

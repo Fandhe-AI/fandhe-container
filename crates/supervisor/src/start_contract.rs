@@ -17,6 +17,9 @@
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
 //! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。CLI が渡す環境は `PATH`（固定値）と
 //!   `XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。supervisor は読まない）だけである。
+//! - 起動オプション（`--ulimit`・`--env` 等。#2713・SUP-12）は argv にも環境にも載せない。CLI の `create` が書いた
+//!   `<root>/@container-options/<id>`（0600）を、supervisor が手順 2c で読む（形式は
+//!   [`crate::container_options::document`]、置き場所と検査は [`crate::container_options::store`]）。argv は変えない。
 //! - 委譲スコープ（#2081・CORE-3・CORE-4）: `DelegatedCgroup::prepare` は親 cgroup に自分以外のプロセスがいると拒否するため、
 //!   CLI は supervisor を [`USER_SCOPE_WRAPPER_ARGS`] で包んで起動する（`systemd-run <引数> <supervisor の絶対パス> start ...`）。
 //!   systemd-run は scope の登録後に同じプロセスでコマンドを exec する（`man systemd-run` の scope の説明と systemd の
@@ -425,6 +428,35 @@ mod tests {
             )
         );
         assert_eq!(StartReport::decode(r.encode().as_bytes()).unwrap(), r);
+    }
+
+    /// SEC-4・CORE-5・ERR-1・SUP-1（#2716）: launch の `Exec` 段の失敗（`R` の後の `execveat` の errno 分類）の報告行は、
+    /// 分類ごとの具体的な `CODE`・終了コードと固定文言になる。
+    #[test]
+    fn sec4_2716_exec_stage_failure_report_lines() {
+        for (code, line) in [
+            (
+                ErrorCode::NotFound,
+                "FCSUP1 ERR NOT_FOUND 3 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::PermissionDenied,
+                "FCSUP1 ERR PERMISSION_DENIED 6 container launch failed in the Exec stage\n",
+            ),
+            (
+                ErrorCode::InvalidArgument,
+                "FCSUP1 ERR INVALID_ARGUMENT 2 container launch failed in the Exec stage\n",
+            ),
+        ] {
+            let err = OciRuntimeError::new(
+                fandhe_container_core::oci_runtime::LifecycleOp::Start,
+                code,
+                "container launch failed in the Exec stage",
+            );
+            let r = StartReport::failed(&err);
+            assert_eq!(r.encode(), line);
+            assert_eq!(StartReport::decode(line.as_bytes()).unwrap(), r);
+        }
     }
 
     /// REPAIR-2・ERR-2: `exit_code` が `exit_code_for(CODE)` と食い違う報告は拒否し、一致すれば受理する。

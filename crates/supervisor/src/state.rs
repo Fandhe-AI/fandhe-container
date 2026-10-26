@@ -95,19 +95,21 @@ impl SupervisedState {
         status: ContainerStatus,
         supervision: SupervisionState,
     ) -> Result<&StateRecord, TraitError> {
-        self.write_with_isolation(status, supervision, None)
+        self.write_with_isolation(status, supervision, None, None)
     }
 
     /// restart の再 launch の記録用。`write` に加えて、再 launch が確定した分離の記録を渡されれば置き換える
     /// （再 launch で mount namespace が作り直されるため。`None` は前の記録を引き継ぐ。トレイト契約 12。
-    /// SUP-6・SUP-3・#2007）。
+    /// SUP-6・SUP-3・#2007）。`rlimits` も同様に、再 launch が適用した全 16 種を渡されれば置き換える
+    /// （`None` は前の記録を引き継ぐ。SUP-12・#2713）。
     pub fn write_relaunched(
         &mut self,
         status: ContainerStatus,
         supervision: SupervisionState,
         launch_isolation: Option<LaunchIsolationRecord>,
+        rlimits: Option<fandhe_container_core::rlimits::Rlimits>,
     ) -> Result<&StateRecord, TraitError> {
-        self.write_with_isolation(status, supervision, launch_isolation)
+        self.write_with_isolation(status, supervision, launch_isolation, rlimits)
     }
 
     fn write_with_isolation(
@@ -115,6 +117,7 @@ impl SupervisedState {
         status: ContainerStatus,
         supervision: SupervisionState,
         launch_isolation: Option<LaunchIsolationRecord>,
+        rlimits: Option<fandhe_container_core::rlimits::Rlimits>,
     ) -> Result<&StateRecord, TraitError> {
         if status.id() != &self.id {
             return Err(TraitError::new(
@@ -126,6 +129,9 @@ impl SupervisedState {
             UpdateStateRequest::new(status, self.last.revision()).with_supervision(supervision);
         if let Some(record) = launch_isolation {
             req = req.with_launch_isolation(record);
+        }
+        if let Some(set) = rlimits {
+            req = req.with_rlimits(set);
         }
         self.last = self.store.update(&req)?;
         Ok(&self.last)

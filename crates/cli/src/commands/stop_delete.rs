@@ -323,6 +323,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
             for warning in cleanup_warnings(&resp) {
                 emit_warning_bounded(warning, write_warning_to_stderr, WARNING_WRITE_TIMEOUT);
             }
+            remove_container_options(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -396,6 +397,59 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) -> Cleanup
     }
 }
 
+/// 起動オプション文書の削除の失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・内容は含めない。
+pub(super) fn options_removal_warning(e: &TraitError) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container options file removal failed; a leftover file may remain\"}}",
+        e.code().as_str()
+    )
+}
+
+/// 起動オプション文書の削除を作業スレッドで待つ上限(REPAIR-5)。
+const OPTIONS_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// ID 単位のロックの取得を待つ上限(`OPTIONS_REMOVE_TIMEOUT` より短くする)。
+const OPTIONS_LOCK_WAIT: Duration = Duration::from_secs(8);
+
+/// core の `delete` が成功した後に、起動オプション文書(`<root>/@container-options/<id>`。#2713・SUP-12)を消す。
+///
+/// ログの削除と同じく、失敗しても delete の結果は変えず警告を 1 行だけ出す。ID 単位のロックを取った上で、同じ ID が
+/// 再作成されていないことを確かめてから消す(並行 `create` の新しいインスタンスの文書を消さない。`id_is_still_deleted`)。
+/// ロック取得・削除は作業スレッドで期限つきに待つ(REPAIR-5)。期限切れの作業スレッドは CLI の終了で消え、
+/// 文書が残っても次の同 ID の `create` が(ロックと状態の不在確認の下で)掃除する。
+fn remove_container_options(store: &dyn StateStore, req: &DeleteRequest) {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let root = root.to_path_buf();
+    let id = req.id().clone();
+    let result = fandhe_container_supervisor::supervisor_log::run_bounded(
+        move || -> Result<(), TraitError> {
+            let lock = options_store::acquire_lock(&root, &id, OPTIONS_LOCK_WAIT)?;
+            if !id_is_still_deleted(&root, &id) {
+                return Ok(());
+            }
+            let removed = options_store::remove(&root, &id);
+            lock.remove_lock_file();
+            removed
+        },
+        OPTIONS_REMOVE_TIMEOUT,
+    )
+    .unwrap_or_else(|| {
+        Err(TraitError::new(
+            ErrorCode::Timeout,
+            "container options file removal did not finish within the deadline",
+        ))
+    });
+    if let Err(e) = result {
+        emit_warning_bounded(
+            options_removal_warning(&e),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
+    }
+}
+
 /// supervisor ログ削除の警告。期限切れは専用文言、それ以外（ロック保持・権限エラー等）は `code` つきの失敗文言（REPAIR-4）。
 fn supervisor_log_removal_warning(code: ErrorCode) -> String {
     if code == ErrorCode::Timeout {
@@ -466,10 +520,10 @@ pub(super) fn id_is_still_deleted(
 }
 
 /// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
-const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 本番の警告出力。`eprintln!` は書き込み失敗で panic するため使わず、エラーは捨てる（delete の成功を保つ）。
-fn write_warning_to_stderr(line: &str) {
+pub(super) fn write_warning_to_stderr(line: &str) {
     use std::io::Write as _;
     let mut err = std::io::stderr();
     let _ = err.write_all(line.as_bytes());
@@ -481,7 +535,7 @@ fn write_warning_to_stderr(line: &str) {
 /// stderr が満杯の pipe / socket だと書き込みは無期限に止まり得るため、呼び出し元スレッドでは書かない。
 /// 期限切れ・書き込み側の panic・スレッド起動失敗のいずれでも何も伝播せず戻り、delete の結果は変えない
 /// （`main.rs` の `report_deferred` と同じ流儀。止まった書き込みのスレッドは置き去りにする）。
-fn emit_warning_bounded(
+pub(super) fn emit_warning_bounded(
     line: String,
     write: impl FnOnce(&str) + Send + 'static,
     timeout: Duration,
@@ -505,6 +559,30 @@ mod tests {
             supervisor_log_removal_warning(ErrorCode::Timeout),
             log_removal_timeout_warning()
         );
+    }
+
+    /// SUP-12(#2713): delete の後、状態の無い ID の起動オプション文書を消す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup12_delete_removes_options_document() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+        use fandhe_container_supervisor::container_options::store;
+        let dir = std::env::temp_dir().join(format!("fc-cli-del-opt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        let root = StateRoot::from_override(dir.join("state")).expect("root");
+        let fs_store = FileStateStore::open(root).expect("open");
+        let state_root = fs_store.host_state_root().expect("root").to_path_buf();
+        let id = ContainerId::new("c1").expect("id");
+        let doc = ContainerOptionsDocument::new(vec![], vec!["A=1".into()], None, None, vec![])
+            .expect("doc");
+        store::write_new(&state_root, &id, &doc).expect("write");
+        remove_container_options(&fs_store, &DeleteRequest::new(id.clone()));
+        assert!(!store::options_path(&state_root, &id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5: 警告の書き込みが止まっても期限で戻り、書き込みが panic しても呼び出し元へ伝播しない。

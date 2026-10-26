@@ -908,6 +908,10 @@ const LOG_READ_FLAGS: i32 = crate::container_options::env::O_NONBLOCK
     | O_NOFOLLOW
     | crate::container_options::env::O_NOCTTY;
 
+/// symlink 非追従の `open` フラグ(`O_NOFOLLOW`。起動オプション文書の新規作成が使う。#2713)。
+#[cfg(target_os = "linux")]
+pub(crate) const NOFOLLOW_FLAG: i32 = O_NOFOLLOW;
+
 /// 読み取り専用・非ブロッキング・symlink 非追従（`O_NOFOLLOW`）・`O_NOCTTY` でログを開く（unix。SUP-7・IO-5）。
 ///
 /// lstat 後に末尾要素が symlink へ差し替えられても、リンク先を開かずに失敗する。supervisor はセッションリーダー

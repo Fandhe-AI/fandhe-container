@@ -41,6 +41,7 @@
 //! `process::exec_errno_to_code` による errno の分類（`ErrorCode` の名前のみ。errno の生値・文字列は運ばない）。
 //! 親は `R` の後も書き込み側が全て閉じる（EOF）まで読む（[`read_exec_phase_until_close`]）。EOF だけなら
 //! `execveat` の成功（状態 pipe は close-on-exec）、`X` が届けば起動失敗で、PID 1 は回収する。
+//! 完成した失敗報告（`E` 行、`R` に続く `X` 行）は EOF を待たずに判定する（子が stderr で詰まっても `Timeout` に置き換えない。REPAIR-5）。
 //! 受理する形は `R\n`・`R\nX <CODE>\n`・`E ...\n` の 3 つだけで、それ以外は `Malformed`（fail-closed）。
 //! **`X` は監査に記録しない**: ENOENT・ENOEXEC 等は設定の誤りで違反ではなく、EACCES・EPERM は DAC・noexec・
 //! Landlock・LSM のどれによるかをユーザー空間から区別できず、Landlock / LSM の拒否はカーネル側の監査が担うため
@@ -633,6 +634,19 @@ pub(super) fn read_exec_phase_until_close(
         }
         if filled > EXEC_PHASE_TAIL_MAX_BYTES {
             return Err(PrePivotStatusError::TooLong);
+        }
+        // 完成した失敗報告（`E` 行、または `R` に続く `X` 行）は EOF を待たずに判定する。子は失敗報告の後に
+        // stderr へ同期書き込みしてから終了するため、stderr が詰まると状態 pipe が閉じず、届いた失敗コードが
+        // `Timeout` に置き換わる（REPAIR-5・CORE-5。EOF 待ちは成功候補の `R` だけの場合に限る）。
+        let got = buf.get(..filled).unwrap_or(&[]);
+        let lines = got.iter().filter(|c| **c == b'\n').count();
+        let complete_failure = match got.first() {
+            Some(b'E') => lines >= 1,
+            Some(b'R') => lines >= 2,
+            _ => false,
+        };
+        if complete_failure {
+            return ExecPhaseOutcome::decode_tail(got);
         }
     }
     ExecPhaseOutcome::decode_tail(buf.get(..filled).unwrap_or(&[]))
@@ -1495,6 +1509,50 @@ mod tests {
                 violation: None
             })
         );
+    }
+
+    /// 完成した失敗報告は、状態 pipe が閉じなくても `Timeout` にならず失敗コードで返る
+    /// （子が stderr で詰まる状況の模擬。REPAIR-5・CORE-5・#2716）。
+    #[test]
+    fn repair5_2716_complete_failure_report_is_decided_without_eof() {
+        for (bytes, expected) in [
+            (
+                &b"R\nX PERMISSION_DENIED\n"[..],
+                ExecPhaseOutcome::ExecReturned {
+                    code: ErrorCode::PermissionDenied,
+                },
+            ),
+            (
+                b"E NOT_FOUND -\n",
+                ExecPhaseOutcome::Failed {
+                    code: ErrorCode::NotFound,
+                    violation: None,
+                },
+            ),
+        ] {
+            let (r, w) = std::io::pipe().unwrap();
+            let mut w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+            w.write_all(bytes).unwrap();
+            // 書き込み側は閉じない（EOF にならない）。
+            let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+            assert_eq!(
+                read_exec_phase_until_close(&r, Duration::from_secs(5)),
+                Ok(expected),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            drop(w);
+        }
+        // 成功候補の `R` だけなら EOF を待つ（閉じなければ期限で `Timeout`）。
+        let (r, w) = std::io::pipe().unwrap();
+        let mut w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+        w.write_all(b"R\n").unwrap();
+        let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        assert_eq!(
+            read_exec_phase_until_close(&r, Duration::from_millis(200)),
+            Err(PrePivotStatusError::Timeout)
+        );
+        drop(w);
     }
 
     /// `X` 行の具体値の符号化（ワイヤー形式の固定。SEC-4・#2716）。

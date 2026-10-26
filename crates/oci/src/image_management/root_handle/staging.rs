@@ -192,6 +192,11 @@ mod imp {
         pub(crate) fn remove_pull_dir(&self, id: &PullId) -> io::Result<()> {
             at::unlinkat_name(self.0.as_fd(), OsStr::new(id.as_str()), true)
         }
+
+        /// `<root>/staging` 自身を fsync する（直下の `<id>` のエントリを永続化する。#2539・OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            File::from(self.0.try_clone()?).sync_all()
+        }
     }
 
     /// 開いた `<root>/staging/<pull-id>`。
@@ -213,6 +218,11 @@ mod imp {
                 0o600,
             )
             .map(File::from)
+        }
+
+        /// `<root>/staging/<id>` 自身を fsync する（直下の `@pull.lock` のエントリを永続化する。OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            File::from(self.0.try_clone()?).sync_all()
         }
 
         /// 生存確認のために `@pull.lock` を開く（作成しない・symlink は辿らない・FIFO で止まらない）。
@@ -398,6 +408,18 @@ mod imp {
         pub(crate) fn remove_pull_dir(&self, id: &PullId) -> io::Result<()> {
             fs::remove_dir(self.0.join(id.as_str()))
         }
+
+        /// `<root>/staging` 自身を fsync する（Windows は std で開けないため何もしない。#2539・OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                File::open(&self.0)?.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(())
+            }
+        }
     }
 
     /// `<root>/staging/<pull-id>` のパス。
@@ -421,6 +443,18 @@ mod imp {
                 opts.mode(0o600);
             }
             opts.open(self.0.join(name))
+        }
+
+        /// `<root>/staging/<id>` 自身を fsync する（Windows は std で開けないため何もしない。OCI-7）。
+        pub(crate) fn sync(&self) -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                File::open(&self.0)?.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(())
+            }
         }
 
         /// 生存確認のために `@pull.lock` を開く（作成しない。Windows の `LockFileEx` は読み書き権限が要る）。

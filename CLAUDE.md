@@ -82,6 +82,7 @@ fandhe-container/
 │   │   ├── macos-shared-vm.md     # macOS 既定方式（常駐 VM 共用）の未決事項の設計案（保持役・bind mount・ゲスト内実行・計測対象。TASK-191・#1905・MAC-4。承認待ち #1906）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
 │   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）と、tar の uid/gid を subuid 範囲へ写像して chown する経路・rootful で特殊ビットを残す条件（#2225）
+│   │   ├── pull-inventory-wiring.md  # pull の結果を ImageStore の在庫へ登録する配線の判断記録（入口は cri の OciImagePuller::pull・手順と順序・孤児リースの分析と fsync・subuid のずれの検出方針・スコープ外。#2539・OCI-1・OCI-7・CRI-3）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）

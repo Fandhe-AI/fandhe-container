@@ -44,6 +44,8 @@ mod imp {
     use std::io;
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Path;
 
     use super::super::imp::RESOLVE;
     use crate::error::{OciError, OciErrorCode};
@@ -299,6 +301,14 @@ mod imp {
             crate::layer::remove_name_tree(self.0.as_fd(), name)
                 .map_err(|e| io::Error::other(e.message().to_owned()))
         }
+
+        /// `p`（パスで辿った pull ディレクトリ）が、この fd と同じ実体か（dev / ino の照合。OCI-7・SEC-1・#2893）。
+        pub(crate) fn matches_path(&self, p: &Path) -> bool {
+            let Ok(mine) = self.dir_meta() else {
+                return false;
+            };
+            std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
+        }
     }
 }
 
@@ -533,6 +543,11 @@ mod imp {
             } else {
                 fs::remove_file(&p)
             }
+        }
+
+        /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
+        pub(crate) fn matches_path(&self, _p: &Path) -> bool {
+            true
         }
     }
 }

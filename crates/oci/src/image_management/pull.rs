@@ -550,6 +550,21 @@ impl PullSession<'_> {
         &self.staging_dir
     }
 
+    /// `staging_dir()` のパスが、`begin_pull` で保持している pull ディレクトリの fd と同じ実体であることを確かめる
+    /// （OCI-7・SEC-1・#2893）。cri がパス起点の副作用（`unpack/` の作成・展開・`rename`）へ進む前に呼ぶ。
+    /// 違えば（`staging/<id>` が差し替えられている）`Internal`（`image store root changed after open`）で拒否する。
+    /// パス起点の実装（Linux x86_64 / aarch64 以外）は常に通る。
+    pub fn check_staging_dir_current(&self) -> Result<(), OciError> {
+        if self.pull_dir.matches_path(&self.staging_dir) {
+            Ok(())
+        } else {
+            Err(err(
+                OciErrorCode::Internal,
+                "image store root changed after open",
+            ))
+        }
+    }
+
     fn note_blob(&mut self, digest: &Digest) -> Result<(), OciError> {
         if !self.touched.contains(digest) && self.touched.len() >= MAX_SESSION_BLOBS {
             return Err(err(

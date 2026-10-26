@@ -677,6 +677,11 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .map_err(|e| PullError::from_extract(&e))?;
         // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
         // 展開先の作業領域はセッションのステージング配下（パス起点。fd 起点化は #2893 の対象外）。
+        // パス起点の副作用へ進む前に、`staging/<id>` が保持している fd と同じ実体であることを確かめる
+        // （取得中の差し替えで、おとり配下へ展開・rename しないため。OCI-7・SEC-1・#2893）。
+        session
+            .check_staging_dir_current()
+            .map_err(|e| PullError::from_store(&e))?;
         let unpack_dir = session.staging_dir().join(UNPACK_SUBDIR);
         create_private_dir(&unpack_dir)?;
         let staged_entry = unpack_dir.join("entry");

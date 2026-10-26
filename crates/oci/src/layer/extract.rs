@@ -22,20 +22,20 @@
 //!
 //! - イメージの展開（`extract_image_layers`）は、`VerifiedLayerBlob`（`open_blob_nofollow` で開き、同じハンドルで
 //!   信頼条件と digest を確かめた値。#2309）だけを受ける。パスを開き直さないため、検証と展開の間にパスを別の
-//!   ファイルへ差し替えられても展開物は変わらない。パスを受ける旧入口（`extract_layer_blob(s)*`。gzip 固定で
-//!   diff_id を突合しない）は、呼び出し側が排他的に所有する 0700 のステージングにある、直前に `verify_blob_digest` を
-//!   通した blob に限る。キャッシュの blob を再利用する経路と diff_id の突合には使わない。
+//!   ファイルへ差し替えられても展開物は変わらない。パスを受けて走査のたびに開き直す旧入口（`extract_layer_blob(s)*`）は、
+//!   検証と展開の間の差し替えを防げないため #2535 で廃止した（#2309）。入口は検証済みハンドル版
+//!   （`extract_image_layers*`）と、`Read + Seek` を受けるストリーム版（`extract_layers*`・`extract_tar*`）の 2 系統である。
 //! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
 //!   symlink であってはならない。空でなければ `FailedPrecondition` で拒否する（別表記の衝突の判定が
 //!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
 //!   書き換える競合（TOCTOU）は、Linux の x86_64 / aarch64 では変更操作を `root` のディレクトリ fd 起点に閉じて
 //!   防ぐ（下記「ディレクトリ fd 起点の解決」）。それ以外のホストでは防げない。
 //! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
-//! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
+//! - 複数レイヤーは `extract_layers` / `extract_image_layers` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
 //!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。
 //! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。ハンドル版（`VerifiedLayerBlob`）は各走査の前に
-//!   ハンドルの先頭へ戻し、パス版の旧入口は blob をパスから 2 回開き、ストリーム版（`extract_tar`・`extract_layers`）は
+//!   ハンドルの先頭へ戻し、ストリーム版（`extract_tar`・`extract_layers`）は
 //!   入力に `Seek` を求めて最初の位置へ戻す。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、
 //!   `extract_image_layers` では image config の `rootfs.diff_ids` と突合する（#2017・OCI-1）。パス 3 でも同じ構成で
 //!   同じハッシュを計算し、末尾でパス 1 の値と照合して、違えば `DataLoss` にする（#2309。同じ inode への上書きなど、
@@ -215,7 +215,7 @@ use sha2::{Digest as _, Sha256};
 use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
-    VerifiedLayerBlob, oci_error_from_layer_io, open_gzip_layer,
+    VerifiedLayerBlob, oci_error_from_layer_io,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -322,7 +322,7 @@ pub struct ExtractedLayer {
 
 /// 通常ファイルの setuid / setgid / sticky の扱い（SEC-5・SEC-1・#1810）。既定は `Strip`。
 ///
-/// 展開の入口 `extract_layers_with_policy` / `extract_layer_blobs_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
+/// 展開の入口 `extract_layers_with_policy` / `extract_image_layers_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
 /// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
 /// 変更〔TOCTOU〕は防げない）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
 /// ビットの保持までを扱う。
@@ -395,7 +395,7 @@ pub enum OwnershipPolicy {
 
 /// 展開の選択肢（所有者・特殊ビット）。将来の項目追加に備え `non_exhaustive`。
 ///
-/// `extract_layers_with_options` / `extract_layer_blobs_with_options` が受け取る。既定は従来の挙動
+/// `extract_layers_with_options` / `extract_image_layers_with_options` が受け取る。既定は従来の挙動
 /// （`chown` しない・特殊ビットは落とす）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -531,7 +531,7 @@ pub fn extract_tar<R: Read + Seek>(
 ///
 /// `src` は gzip 展開済みの tar バイトストリーム。tar を 2 回走査するため `Seek` を求め、各走査の前に
 /// 最初に渡された時点の位置へ戻す（モジュール冒頭「レイヤーごとの 3 パス」）。gzip の blob は
-/// `extract_layer_blob_with` を使う。契約はモジュール冒頭を参照。
+/// `extract_image_layers`（検証済みハンドル）を使う。契約はモジュール冒頭を参照。
 /// 複数レイヤーを重ねるときは `extract_layers_with` を使う（これは要素 1 つのスタックと同じ）。
 pub fn extract_tar_with<R: Read + Seek>(
     recorder: &dyn OciOpRecorder,
@@ -542,50 +542,6 @@ pub fn extract_tar_with<R: Read + Seek>(
     single(extract_stack(
         recorder,
         [Rewind::new(src)],
-        root,
-        limits,
-        host_lstat,
-        SpecialSetup::host(SpecialBitsPolicy::Strip),
-    )?)
-}
-
-/// 圧縮レイヤー blob（digest 検証済み）を開き、gzip 展開しながら `root` へ展開する便宜関数。
-///
-/// `max_uncompressed_bytes` は gzip 展開後（tar 全体）の上限で、`limits.max_total_bytes` とは別に効く。
-pub fn extract_layer_blob(
-    blob_path: &Path,
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<ExtractedLayer, OciError> {
-    extract_layer_blob_with(
-        &NoopOciOpRecorder,
-        blob_path,
-        root,
-        max_uncompressed_bytes,
-        limits,
-    )
-}
-
-/// `extract_layer_blob` の計装版。blob を開く処理から展開完了までを 1 回の
-/// `OciOpKind::ExtractLayer` として `recorder` へ記録する（open 失敗も記録対象。REPAIR-4）。
-///
-/// tar を 2 回走査するため、同じ blob を 2 回開く（モジュール冒頭「レイヤーごとの 3 パス」）。
-pub fn extract_layer_blob_with(
-    recorder: &dyn OciOpRecorder,
-    blob_path: &Path,
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<ExtractedLayer, OciError> {
-    single(extract_stack(
-        recorder,
-        [BlobLayer {
-            path: blob_path,
-            media_type: LayerMediaType::TarGzip,
-            max_uncompressed_bytes,
-            expected_diff_id: None,
-        }],
         root,
         limits,
         host_lstat,
@@ -661,88 +617,6 @@ pub fn extract_layers_with_options<R: Read + Seek>(
     )
 }
 
-/// 計装なしの `extract_layer_blobs_with`（`NoopOciOpRecorder`）。
-pub fn extract_layer_blobs(
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with(
-        &NoopOciOpRecorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-    )
-}
-
-/// 圧縮レイヤー blob（すべて digest 検証済み。下位から上位の順）を重ねて展開する（TASK-52.4・OCI-1・#410）。
-///
-/// `max_uncompressed_bytes` は各レイヤーの gzip 展開後の上限。各 blob は 2 回開く。その他は
-/// `extract_layers_with` と同じ。
-pub fn extract_layer_blobs_with(
-    recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with_policy(
-        recorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-        SpecialBitsPolicy::Strip,
-    )
-}
-
-/// `extract_layer_blobs_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
-pub fn extract_layer_blobs_with_policy(
-    recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-    policy: SpecialBitsPolicy,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with_options(
-        recorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-        &ExtractOptions::new().with_special_bits(policy),
-    )
-}
-
-/// `extract_layer_blobs_with` に所有者（`chown`）と特殊ビットの選択肢を足した版（SEC-5・OCI-1・#2225）。
-///
-/// `options` の契約は `extract_layers_with_options` と同じ。
-pub fn extract_layer_blobs_with_options(
-    recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-    options: &ExtractOptions,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_stack(
-        recorder,
-        blob_paths.iter().map(|path| BlobLayer {
-            path,
-            media_type: LayerMediaType::TarGzip,
-            max_uncompressed_bytes,
-            expected_diff_id: None,
-        }),
-        root,
-        limits,
-        host_lstat,
-        SpecialSetup::from_options(options),
-    )
-}
-
 /// 1 レイヤー分の tar バイトストリームを、走査のたびに先頭から開き直す入力。
 ///
 /// `extract_one_layer` がパス 1（収集・検証）とパス 3（展開）の前に 1 回ずつ `open` を呼ぶ。
@@ -804,7 +678,7 @@ impl<R: Read + Seek> LayerSource for Rewind<R> {
 
 /// blob 系 `LayerSource` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
 ///
-/// `R` は読み取り元で、パス版 `BlobLayer` は `File`、ハンドル版 `VerifiedBlobLayer` は `&File`。
+/// `R` は読み取り元で、ハンドル版 `VerifiedBlobLayer` は `&File`。
 enum LayerReader<R: Read> {
     Gzip(Box<GzipLayerReader<R>>),
     Plain(PlainLayerReader<R>),
@@ -816,41 +690,6 @@ impl<R: Read> Read for LayerReader<R> {
             Self::Gzip(r) => r.read(buf),
             Self::Plain(r) => r.read(buf),
         }
-    }
-}
-
-/// gzip 固定の旧入口（`extract_layer_blobs*`）が使う、パスから走査のたびに開き直す `LayerSource`。
-///
-/// 検証と展開の間の差し替え・symlink は検出しない（パス 3 の再ハッシュが内容の変化だけを `DataLoss` にする）。
-/// 呼び出し側が排他的に所有する 0700 のステージングにある、直前に検証した blob に限る（#2309）。
-/// キャッシュの blob を再利用する経路と diff_id の照合には `VerifiedBlobLayer` を使う。
-struct BlobLayer<'p> {
-    path: &'p Path,
-    media_type: LayerMediaType,
-    max_uncompressed_bytes: u64,
-    expected_diff_id: Option<Digest>,
-}
-
-impl LayerSource for BlobLayer<'_> {
-    type Reader<'a>
-        = LayerReader<File>
-    where
-        Self: 'a;
-
-    fn open(&mut self) -> Result<LayerReader<File>, OciError> {
-        match self.media_type {
-            LayerMediaType::TarGzip => open_gzip_layer(self.path, self.max_uncompressed_bytes)
-                .map(|r| LayerReader::Gzip(Box::new(r))),
-            // 旧入口は gzip 固定のため、非圧縮はここへ来ない。来たら推測で開かず拒否する。
-            LayerMediaType::Tar => Err(err(
-                OciErrorCode::Unimplemented,
-                "plain tar layers require a verified blob handle",
-            )),
-        }
-    }
-
-    fn expected_diff_id(&self) -> Option<&Digest> {
-        self.expected_diff_id.as_ref()
     }
 }
 
@@ -943,7 +782,7 @@ pub fn extract_image_layers(
 /// (2) 各レイヤーのパス 1 で計算した展開後 tar の sha256 を `diff_id` と突合する（不一致は `DataLoss`。そのレイヤーの
 /// 変更を始める前に止まるが、先行レイヤーの展開物は残るため、呼び出し側が `root` ごと破棄すること）。
 /// `layers` の件数と config の `diff_ids` の件数の照合は `image_layers_from` が行う
-/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layer_blobs_with` と同じ。
+/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layers_with` と同じ。
 pub fn extract_image_layers_with(
     recorder: &dyn OciOpRecorder,
     layers: &[ImageLayer<'_>],
@@ -3268,7 +3107,7 @@ fn extract_one_layer<S: LayerSource>(
 
 /// レイヤー列を `root` へ下位から順に重ねて展開する本体（単一レイヤー API もこれの 1 要素版）。
 ///
-/// 各要素は `LayerSource`（blob 版は gzip を開き直す `BlobLayer`、ストリーム版は位置を戻す `Rewind`）。
+/// 各要素は `LayerSource`（ハンドル版は `VerifiedBlobLayer`、ストリーム版は位置を戻す `Rewind`）。
 /// `Extractor`（別表記の索引・遅延ディレクトリ mode・上限のカウンタ）は全レイヤーで共有し、上限は全体で
 /// 累積する。`lstat` はテストだけが差し替える（`Lstat` を参照）。
 fn extract_stack<S: LayerSource>(
@@ -4490,6 +4329,48 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::DataLoss);
     }
 
+    /// メモリ上の gzip を走査のたびに先頭から読み直す試験用 `LayerSource`。
+    ///
+    /// 旧入口 `extract_layer_blob(s)*` の廃止後も、gzip トレーラの検証と展開後サイズの上限を `extract_stack` の
+    /// 経路で（Seek 不要・3 OS で）確かめるために置く（#2535・OCI-1）。
+    struct MemGzip<'g> {
+        gz: &'g [u8],
+        max_uncompressed_bytes: u64,
+    }
+
+    impl LayerSource for MemGzip<'_> {
+        type Reader<'a>
+            = LayerReader<&'a [u8]>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<LayerReader<&[u8]>, OciError> {
+            Ok(LayerReader::Gzip(Box::new(GzipLayerReader::new(
+                self.gz,
+                self.max_uncompressed_bytes,
+            ))))
+        }
+    }
+
+    fn extract_mem_gzip(
+        sb: &Sandbox,
+        gz: &[u8],
+        max_uncompressed_bytes: u64,
+        lim: ExtractLimits,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        extract_stack(
+            &NoopOciOpRecorder,
+            [MemGzip {
+                gz,
+                max_uncompressed_bytes,
+            }],
+            &sb.root,
+            lim,
+            host_lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
+        )
+    }
+
     /// OCI-1: gzip トレーラ破損は終端後の読み捨てで DataLoss になる。上限は gzip 側でも効く。
     #[test]
     fn oci1_gzip_trailer_is_verified_after_tar_end() {
@@ -4500,26 +4381,21 @@ mod tests {
         let lim = ExtractLimits::new(10, 100, 1 << 30, 1 << 20);
 
         let sb = Sandbox::new();
-        let blob = sb.base.join("ok.gz");
-        fs::write(&blob, &gz).unwrap();
-        let r = extract_layer_blob(&blob, &sb.root, 1 << 20, lim).unwrap();
-        assert_eq!(r.bytes, 5);
+        let r = extract_mem_gzip(&sb, &gz, 1 << 20, lim).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].bytes, 5);
 
         let mut bad = gz.clone();
         let n = bad.len();
         bad[n - 8] ^= 0xff; // CRC32 を壊す。
         let sb = Sandbox::new();
-        let blob = sb.base.join("bad.gz");
-        fs::write(&blob, &bad).unwrap();
-        let e = extract_layer_blob(&blob, &sb.root, 1 << 20, lim).expect_err("crc");
+        let e = extract_mem_gzip(&sb, &bad, 1 << 20, lim).expect_err("crc");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         // トレーラの検証はパス 1（副作用なし）の終端で行うため、rootfs には何も作られない（OCI-2）。
         assert!(names_in(&sb.root).is_empty());
 
         let sb = Sandbox::new();
-        let blob = sb.base.join("ok.gz");
-        fs::write(&blob, &gz).unwrap();
-        let e = extract_layer_blob(&blob, &sb.root, 600, lim).expect_err("gzip limit");
+        let e = extract_mem_gzip(&sb, &gz, 600, lim).expect_err("gzip limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
     }
 
@@ -4552,20 +4428,36 @@ mod tests {
         assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
     }
 
-    /// REPAIR-4: blob を開く失敗（不存在）も `oci.layer.extract` の失敗として記録される。
+    /// 開くたびに失敗する試験用 `LayerSource`（`LayerSource::open` の失敗の記録を確かめる）。
+    struct FailingOpen;
+
+    impl LayerSource for FailingOpen {
+        type Reader<'a>
+            = LayerReader<&'a [u8]>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<LayerReader<&[u8]>, OciError> {
+            Err(err(OciErrorCode::NotFound, "layer blob is missing"))
+        }
+    }
+
+    /// REPAIR-4: レイヤー入力を開く失敗も `oci.layer.extract` の失敗として 1 件記録される。
+    /// ハンドル版の open 失敗（`VerifiedLayerBlob::open_with`）は layer.rs 側の試験が確かめる。
     #[test]
     fn repair4_records_blob_open_failure() {
         let c = Collect::default();
         let sb = Sandbox::new();
-        let missing = sb.base.join("no-such-blob");
-        let e = extract_layer_blob_with(
+        let e = extract_stack(
             &c,
-            &missing,
+            [FailingOpen],
             &sb.root,
-            1 << 20,
             ExtractLimits::new(1, 1, 1 << 30, 1 << 20),
+            host_lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
         )
         .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::NotFound);
         let items = c.items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
@@ -5406,6 +5298,95 @@ mod tests {
                 sb.assert_outside_untouched();
             }
         }
+    }
+
+    /// 別表記の whiteout・不透明マーカー検証用の下位レイヤー（`d/{x,sub/y}`・`café/z`・`keep`・`f`）。
+    fn alias_marker_lower() -> Vec<Vec<u8>> {
+        vec![
+            dir("d/", 0o755),
+            file("d/x", 0o644, b"x"),
+            file("d/sub/y", 0o644, b"y"),
+            dir("caf\u{e9}/", 0o755),
+            file("caf\u{e9}/z", 0o644, b"z"),
+            file("keep", 0o644, b"k"),
+            file("f", 0o644, b"F-lower"),
+        ]
+    }
+
+    /// 下位レイヤー（`alias_marker_lower`）の木がそのまま残っていることを具体値で確かめる。
+    fn assert_alias_marker_lower_intact(sb: &Sandbox, msg: &str) {
+        assert_eq!(
+            names_in(&sb.root),
+            vec!["caf\u{e9}", "d", "f", "keep"],
+            "{msg}"
+        );
+        assert_eq!(names_in(&sb.root.join("d")), vec!["sub", "x"], "{msg}");
+        assert_eq!(names_in(&sb.root.join("d/sub")), vec!["y"], "{msg}");
+        assert_eq!(names_in(&sb.root.join("caf\u{e9}")), vec!["z"], "{msg}");
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x", "{msg}");
+        assert_eq!(fs::read(sb.root.join("d/sub/y")).unwrap(), b"y", "{msg}");
+        assert_eq!(
+            fs::read(sb.root.join("caf\u{e9}/z")).unwrap(),
+            b"z",
+            "{msg}"
+        );
+        assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k", "{msg}");
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"F-lower", "{msg}");
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5・OCI-2: 区別しない FS（`folding_lstat` の模擬）で、上位レイヤーの whiteout（`.wh.<名前>`）・不透明
+    /// ディレクトリ（`.wh..wh..opq`）が、対象または親を別表記（大文字小文字・NFC / NFD）の名前で指すと、
+    /// 別表記の衝突として拒否される。名前は書き換えず（`F` を `f` と見なして消さない）、下位の木とルート外は
+    /// 変わらず、マーカー名も書かれない。有効なマーカーと混在させても、削除の前に全解決を済ませるため
+    /// 有効側も適用されない（パス 2 の解決の先行）。
+    #[test]
+    fn io5_oci2_stack_alias_markers_are_rejected_without_removal() {
+        let cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
+            ("wh-target-case", vec![wh(".wh.F")]),
+            ("wh-target-case-dir", vec![wh(".wh.D")]),
+            ("wh-target-nfd", vec![wh(".wh.cafe\u{301}")]),
+            ("wh-parent-case", vec![wh("D/.wh.x")]),
+            ("wh-parent-nfd", vec![wh("cafe\u{301}/.wh.z")]),
+            ("opq-parent-case", vec![wh("D/.wh..wh..opq")]),
+            ("opq-parent-nfd", vec![wh("cafe\u{301}/.wh..wh..opq")]),
+            ("valid-then-alias", vec![wh(".wh.keep"), wh("D/.wh.x")]),
+            ("alias-then-valid", vec![wh("D/.wh.x"), wh(".wh.keep")]),
+        ];
+        for (case, upper) in cases {
+            let sb = Sandbox::new();
+            let r = run_stack(&sb, &[alias_marker_lower(), upper], LIM(), folding_lstat);
+            assert_stack_spelling_collision(r);
+            assert_alias_marker_lower_intact(&sb, case);
+        }
+    }
+
+    /// IO-5・OCI-2: 上の拒否が模擬の過剰反応でないことの対照。同じ綴りのマーカーは効く。
+    #[test]
+    fn io5_oci2_stack_same_spelling_markers_still_apply() {
+        let sb = Sandbox::new();
+        run_stack(
+            &sb,
+            &[alias_marker_lower(), vec![wh(".wh.f")]],
+            LIM(),
+            folding_lstat,
+        )
+        .unwrap();
+        assert_eq!(names_in(&sb.root), vec!["caf\u{e9}", "d", "keep"]);
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x");
+
+        let sb = Sandbox::new();
+        run_stack(
+            &sb,
+            &[alias_marker_lower(), vec![wh("d/.wh..wh..opq")]],
+            LIM(),
+            folding_lstat,
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(sb.root.join("d")).unwrap().is_dir());
+        assert!(names_in(&sb.root.join("d")).is_empty());
+        assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k");
+        sb.assert_outside_untouched();
     }
 
     /// OCI-1: 上位レイヤーの `..` は既存どおり拒否され、ルート外へは何も書かれない。

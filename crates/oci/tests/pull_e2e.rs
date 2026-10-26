@@ -5,8 +5,10 @@
 //! （REPAIR-4。トークン・URL は出さない）と要約行で報告する。1 件でも失敗すれば非 0 で終了する（fail-closed）。
 //!
 //! 1. 匿名認証 → manifest 取得（image index は host の linux platform へ解決）→ config と全レイヤーの取得
-//! 2. 全 blob の digest 検証（`layer::verify_fetched_blob`。検証前のファイルは展開・パースしない）
-//! 3. レイヤーの展開（`layer::extract::extract_layer_blobs`。whiteout 統合済み。パス検証・hardlink 制限は
+//! 2. 全 blob の digest 検証（config は `layer::verify_fetched_blob`、レイヤーは `layer::VerifiedLayerBlob::open` で
+//!    信頼条件と digest を同じハンドルで確かめる。検証前のファイルは展開・パースしない）
+//! 3. レイヤーの展開（`layer::extract::extract_image_layers`。検証済みハンドルだけを受け、展開後 tar の sha256 を
+//!    image config の `rootfs.diff_ids` と突合する。whiteout 統合済み。パス検証・hardlink 制限は
 //!    oci 側に任せ、ハーネスで緩めない）→ `proc`/`dev`/`sys` の補完 → image config から `config.json` を生成
 //! 4. TASK-29 の `create` → `start`（本番 `ProductionLauncher`）で実行し、終了コード 0 を確認
 //!
@@ -60,7 +62,6 @@
 //!   `FANDHE_CONTAINER_TEST_ID_HELPER=1`（`production_launcher` のシナリオ I と同じ opt-in）を指定する
 //! - `process.user.additionalGids`・cwd の symlink の追従・setuid ビットの保持は未実装（cwd に symlink を含む image は
 //!   start が拒否する）
-//! - manifest の `diff_id` の検証は未実装（config blob と各レイヤーの digest のみ）
 //! - gzip 以外（zstd・無圧縮）のレイヤーは `UNIMPLEMENTED` として失敗にする
 //! - stdin は `/dev/null` に置き換わるため、対話シェルを Cmd にしたイメージは EOF で終了する
 //! - 展開時にデバイス・FIFO・hardlink 制限等で失敗するイメージは、ハーネスで回避せず #421 の所見として記録する
@@ -121,11 +122,14 @@ mod linux {
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerId, CreateRequest, StartRequest, TraitError};
+    use fandhe_container_oci::config::parse_image_config_rootfs;
     use fandhe_container_oci::error::{OciError, OciErrorCode};
-    use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blobs};
+    use fandhe_container_oci::layer::extract::{
+        ExtractLimits, ImageLayer, extract_image_layers, image_layers_from,
+    };
     use fandhe_container_oci::layer::{
-        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, verify_blob_digest,
-        verify_fetched_blob,
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, VerifiedLayerBlob,
+        verify_blob_digest, verify_fetched_blob,
     };
     use fandhe_container_oci::manifest::Platform;
     use fandhe_container_oci::reference::ImageReference;
@@ -484,18 +488,18 @@ mod linux {
             .map_err(|_| Failure::new("config", "INTERNAL"))
     }
 
-    /// 検証済みレイヤー blob（下位から順）を `bundle/rootfs` へ展開し、マウント先の補完と `config.json` を作る。
-    /// 実 pull と、ローカルのレイヤーによる自己検証が共有する。戻り値は (展開所要, 落とした特殊ビット数)。
+    /// 検証済みレイヤー（下位から順。`rootfs.diff_ids` との突合つき）を `bundle/rootfs` へ展開し、マウント先の補完と
+    /// `config.json` を作る。実 pull と、ローカルのレイヤーによる自己検証が共有する。
+    /// 戻り値は (展開所要, 落とした特殊ビット数)。
     fn extract_and_finalize(
-        blobs: &[PathBuf],
+        layers: &[ImageLayer<'_>],
         bundle: &Path,
         process: &Process,
     ) -> Result<(Duration, u64), Failure> {
         let rootfs = bundle.join("rootfs");
         let t = Instant::now();
-        let refs: Vec<&Path> = blobs.iter().map(PathBuf::as_path).collect();
-        let layers = extract_layer_blobs(
-            &refs,
+        let layers = extract_image_layers(
+            layers,
             &rootfs,
             DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
             ExtractLimits::default(),
@@ -943,9 +947,9 @@ mod linux {
         r.manifest_digest = Some(resolved.manifest_digest.as_str().to_string());
         r.from_index = Some(resolved.from_index);
         r.layers = resolved.manifest.layers.len();
-        // 通常は fetch_manifest の事前拒否（layer::LAYER_MEDIA_TYPES の pull 列）が先に効く。ここは、この
-        // harness の展開器が gzip 固定であることに対する防御で、将来 pull の受理集合が広がっても
-        // 非圧縮 tar が gzip デコーダへ届く前に止める（実装済みを装わない。REPAIR-3）。
+        // 通常は fetch_manifest の事前拒否（layer::LAYER_MEDIA_TYPES の pull 列）が先に効く。展開器（`extract_image_layers`）は
+        // mediaType で入口を選べるが、このハーネスは pull の受理集合を広げず gzip だけを扱う。将来 pull の受理集合が
+        // 広がっても、ハーネスの確認範囲外の形式を黙って通さないための防御（実装済みを装わない。REPAIR-3）。
         if resolved.manifest.layers.iter().any(|l| {
             !matches!(
                 LayerMediaType::parse(&l.media_type),
@@ -983,9 +987,27 @@ mod linux {
         };
         let config_path = fetch_verify(config_desc, "config.json".to_string(), r)?;
         r.config_bytes = config_desc.size;
-        let mut layer_paths = Vec::new();
+        // レイヤーは取得後に `VerifiedLayerBlob::open` で信頼条件（通常ファイル・自分の uid・リンク数 1・0600）と
+        // digest を同じハンドルで確かめる。blobs_dir はこのハーネスが 0700 で作った自分の領域で、fetch_blob は 0600 で作る。
+        let owner = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(blobs_dir)
+                .map_err(|_| Failure::new("verify", "INTERNAL"))?
+                .uid()
+        };
+        let mut verified_layers = Vec::new();
         for (i, d) in resolved.manifest.layers.iter().enumerate() {
-            layer_paths.push(fetch_verify(d, format!("layer-{i}.tar.gz"), r)?);
+            let dest = blobs_dir.join(format!("layer-{i}.tar.gz"));
+            let t = Instant::now();
+            client
+                .fetch_blob(&endpoint, reference.repository(), d, &auth, &dest)
+                .map_err(|e| Failure::oci("blobs", &e))?;
+            r.blobs_ms += ms(t.elapsed());
+            let t = Instant::now();
+            let blob = VerifiedLayerBlob::open(&dest, &d.digest, d.size, owner)
+                .map_err(|e| Failure::oci("verify", &e))?;
+            r.verify_ms += ms(t.elapsed());
+            verified_layers.push(blob);
             r.layer_bytes = r.layer_bytes.saturating_add(d.size);
         }
         drop(client);
@@ -996,7 +1018,13 @@ mod linux {
             .map_err(|_| Failure::new("config", "INTERNAL"))?;
         let cfg = parse_image_config(&config_bytes)?;
         let process = derive_process(&cfg, spec.cmd_override.as_deref())?;
-        let (took, stripped) = extract_and_finalize(&layer_paths, bundle, &process)?;
+        // config の `rootfs.diff_ids` と manifest の layers・検証済み blob の件数と対応を照合し、展開時に突合する。
+        let rootfs_ids =
+            parse_image_config_rootfs(&config_bytes).map_err(|e| Failure::oci("extract", &e))?;
+        let blob_refs: Vec<&VerifiedLayerBlob> = verified_layers.iter().collect();
+        let image_layers = image_layers_from(&resolved.manifest.layers, &blob_refs, &rootfs_ids)
+            .map_err(|e| Failure::oci("extract", &e))?;
+        let (took, stripped) = extract_and_finalize(&image_layers, bundle, &process)?;
         r.extract_ms = ms(took);
         r.stripped = stripped;
         Ok(())
@@ -1412,7 +1440,8 @@ mod linux {
             File(&'a str, &'a [u8], u32),
         }
 
-        fn make_layer(entries: &[Ent<'_>]) -> Vec<u8> {
+        /// 戻り値は (非圧縮 tar, gzip)。tar の sha256 が diff_id になる。
+        fn make_layer(entries: &[Ent<'_>]) -> (Vec<u8>, Vec<u8>) {
             let mut b = tar::Builder::new(Vec::new());
             for e in entries {
                 let mut h = tar::Header::new_gnu();
@@ -1437,7 +1466,7 @@ mod linux {
             let tar_bytes = b.into_inner().expect("finish tar");
             let mut gz = GzEncoder::new(Vec::new(), Compression::default());
             gz.write_all(&tar_bytes).expect("gzip");
-            gz.finish().expect("gzip finish")
+            (tar_bytes, gz.finish().expect("gzip finish"))
         }
 
         fn digest_of(bytes: &[u8]) -> Digest {
@@ -1473,18 +1502,36 @@ mod linux {
                 Ent::Dir("app"),
                 Ent::File("app/run.txt", b"layer 2\n", 0o644),
             ]);
+            let owner = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(&blobs).expect("blobs dir").uid()
+            };
             let mut paths = Vec::new();
-            for (i, bytes) in [&l1, &l2].into_iter().enumerate() {
+            let mut opened = Vec::new();
+            for (i, (tar_bytes, bytes)) in [&l1, &l2].into_iter().enumerate() {
                 let p = blobs.join(format!("layer-{i}.tar.gz"));
                 std::fs::write(&p, bytes).expect("write blob");
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                        .expect("chmod blob");
+                }
                 let d = digest_of(bytes);
                 let v = verify_blob_digest(&p, &d, bytes.len() as u64).expect("verify");
                 assert_eq!(v.size, bytes.len() as u64);
+                opened.push((
+                    VerifiedLayerBlob::open(&p, &d, bytes.len() as u64, owner).expect("open"),
+                    digest_of(tar_bytes),
+                ));
                 paths.push(p);
             }
             // 別の digest は DataLoss で拒否される（検証前の blob を展開しない）。
             let wrong = digest_of(b"other");
-            let err = verify_blob_digest(&paths[0], &wrong, l1.len() as u64).expect_err("mismatch");
+            let err =
+                verify_blob_digest(&paths[0], &wrong, l1.1.len() as u64).expect_err("mismatch");
+            assert_eq!(err.code(), OciErrorCode::DataLoss);
+            let err = VerifiedLayerBlob::open(&paths[0], &wrong, l1.1.len() as u64, owner)
+                .expect_err("handle mismatch");
             assert_eq!(err.code(), OciErrorCode::DataLoss);
 
             let cfg = parse_image_config(
@@ -1493,8 +1540,24 @@ mod linux {
             )
             .expect("cfg");
             let process = derive_process(&cfg, Some(&strs(&["y"]))).expect("process");
+            const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+            // diff_id の不一致は "extract" 段の DATA_LOSS で拒否される（2 層目の diff_id に 1 層目の値を渡す）。
+            let swapped = [
+                ImageLayer::new(&opened[0].0, TAR_GZIP, &opened[0].1),
+                ImageLayer::new(&opened[1].0, TAR_GZIP, &opened[0].1),
+            ];
+            let bad_bundle = work.dir.join("bundle-bad");
+            mkdir_mode(&bad_bundle, 0o700).expect("mkdir");
+            mkdir_mode(&bad_bundle.join("rootfs"), 0o755).expect("mkdir");
+            let f = extract_and_finalize(&swapped, &bad_bundle, &process).expect_err("diff_id");
+            assert_eq!(f, Failure::new("extract", "DATA_LOSS"));
+
+            let layers = [
+                ImageLayer::new(&opened[0].0, TAR_GZIP, &opened[0].1),
+                ImageLayer::new(&opened[1].0, TAR_GZIP, &opened[1].1),
+            ];
             let (_took, stripped) =
-                extract_and_finalize(&paths, &bundle, &process).expect("extract");
+                extract_and_finalize(&layers, &bundle, &process).expect("extract");
             assert_eq!(stripped, 0);
 
             let rootfs = bundle.join("rootfs");

@@ -32,7 +32,7 @@
 //! `mediaType` は推測で開かず `Unimplemented` で拒否する（zstd 対応の要否は #2029 で判断）。
 //!
 //! tar 展開（TASK-52.3・OCI-1・#409）は子モジュール `extract` が担う（呼び出し契約と未実装項目はそちらを参照）。
-//! 複数レイヤーの重ね合わせ展開（TASK-52.4・#410）も同モジュールの `extract_layers` / `extract_layer_blobs`。
+//! 複数レイヤーの重ね合わせ展開（TASK-52.4・#410）も同モジュールの `extract_layers`（ストリーム版）/ `extract_image_layers`（検証済みハンドル版。パスを開き直す旧入口は #2535 で廃止）。
 
 mod anchored;
 pub mod extract;

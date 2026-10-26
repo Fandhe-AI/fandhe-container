@@ -3,9 +3,19 @@
 
 use std::fmt::Write as _;
 use std::io::Write;
+use std::path::Path;
 
-use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blob};
+use fandhe_container_oci::error::{OciError, OciErrorCode};
+#[cfg(unix)]
+use fandhe_container_oci::layer::VerifiedLayerBlob;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::decompress_layer_to_writer;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::extract::extract_layers;
+use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractedLayer};
+#[cfg(unix)]
+use fandhe_container_oci::layer::extract::{ImageLayer, extract_image_layers};
+#[cfg(not(unix))]
 use fandhe_container_oci::layer::verify_blob_digest;
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
@@ -34,6 +44,59 @@ fn layer_gz() -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(&tar_bytes).unwrap();
     e.finish().unwrap()
+}
+
+/// gzip の tar を gunzip する（blob の diff_id = 展開後 tar の sha256 を計算するため）。
+#[cfg(unix)]
+fn gunzip(gz: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(gz)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+/// digest 検証済みの gzip blob を、下位から上位の順に `root` へ重ねて展開する（パスで開く旧入口の代わり。#2535・OCI-1）。
+///
+/// Unix（Linux・macOS）は本番と同じ検証済みハンドル版（`VerifiedLayerBlob` → `extract_image_layers`）を通す。
+/// blob は 0600 にして umask に依らず信頼条件を満たす。Windows は `VerifiedLayerBlob` を作れない（`Unimplemented`）ため、
+/// 検証 → gzip 展開 → ストリーム展開（`extract_layers`）の連結で代える。パスを開き直す展開入口は使わず、期待値は 3 OS 共通。
+fn extract_blobs(
+    blobs: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mut opened = Vec::new();
+        for p in blobs {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let gz = std::fs::read(p).unwrap();
+            let owner = std::fs::metadata(p).unwrap().uid();
+            let blob = VerifiedLayerBlob::open(p, &sha(&gz), gz.len() as u64, owner)?;
+            opened.push((blob, sha(&gunzip(&gz))));
+        }
+        let layers: Vec<ImageLayer<'_>> = opened
+            .iter()
+            .map(|(b, d)| ImageLayer::new(b, "application/vnd.oci.image.layer.v1.tar+gzip", d))
+            .collect();
+        extract_image_layers(&layers, root, max_uncompressed_bytes, limits)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut tars = Vec::new();
+        for p in blobs {
+            let gz = std::fs::read(p).unwrap();
+            verify_blob_digest(p, &sha(&gz), gz.len() as u64)?;
+            let mut tar = Vec::new();
+            decompress_layer_to_writer(p, max_uncompressed_bytes, &mut tar)?;
+            tars.push(std::io::Cursor::new(tar));
+        }
+        extract_layers(tars, root, limits)
+    }
 }
 
 /// 作成時から 0700 でディレクトリを作る（Unix は `DirBuilderExt::mode`。umask 000 の root でも chmod までの隙間を作らない）。
@@ -78,14 +141,16 @@ fn oci1_verify_then_extract() {
     let blob = base.join("layer.tar.gz");
     std::fs::write(&blob, &z).unwrap();
 
-    verify_blob_digest(&blob, &sha(&z), 1 << 20).unwrap();
-    let r = extract_layer_blob(
-        &blob,
+    // 検証 → gzip 展開 → 展開は `extract_blobs` が連結する（Unix はハンドルで検証し、パスを開き直さない）。
+    let r = extract_blobs(
+        &[&blob],
         &root,
         1 << 20,
         ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
     )
     .unwrap();
+    assert_eq!(r.len(), 1);
+    let r = &r[0];
     assert_eq!((r.entries, r.bytes), (2, 10));
     assert_eq!(
         std::fs::read(root.join("etc/os-release")).unwrap(),
@@ -95,8 +160,8 @@ fn oci1_verify_then_extract() {
 
     let root2 = base.join("root2");
     std::fs::create_dir(&root2).unwrap();
-    let e = extract_layer_blob(
-        &blob,
+    let e = extract_blobs(
+        &[&blob],
         &root2,
         1 << 20,
         ExtractLimits::new(1, 100, 1 << 30, 1 << 20),

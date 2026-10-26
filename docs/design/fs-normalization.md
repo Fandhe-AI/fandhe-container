@@ -4,7 +4,7 @@
 
 - 対象ビヘイビア: IO-5（関連: REPAIR-3・WIN-4・CLI-1）
 - タスク: TASK-21（TASK-21.h1・TASK-21.hdep1・TASK-21.1・TASK-21.2）。前提は TASK-19（MS-1 Phase 2）
-- 関連 issue: #103（方針）・#798・#1720（依存）・#104（親）・#105（実装）・#106（本書）・PR #1733
+- 関連 issue: #103（方針）・#798・#1720（依存）・#104（親）・#105（実装）・#106（本書）・PR #1733・#2535（oci の試験の追補）
 - 出典: `docs/spec/04-behavior/api-io-share.md` の `IO-5` と `05-tasks.md` の `TASK-21`（submodule リビジョン `18386e7`）
 
 ## 背景（解決する課題）
@@ -67,6 +67,16 @@ IO-5 と TASK-21 の見出しは spec PR #12（`18386e7`）で改訂済み。詳
 | `crates/io/src/fs_normalize.rs` | `io5_nfc_and_nfd_spellings_collide`・`io5_distinct_names_do_not_collide_under_normalization`・`io5_case_only_collision_keeps_legacy_message`・`io5_collision_message_keeps_original_spellings`・`io5_trailing_nfd_difference_is_pinned`・`io5_unicode_normalization_table_version_is_pinned` |
 | `crates/io/tests/fs_normalize.rs` | `io5_public_api_detects_nfc_nfd_collision` |
 | `crates/io/tests/guest_files.rs` | `io5_nfc_then_nfd_create_is_rejected_without_creating_second_file` |
+
+### oci のレイヤー展開での同じ方針（TASK-52 追補・TASK-53 追補・#2310・#2535）
+
+`crates/oci` のレイヤー展開（`layer::extract`）も、別表記（大文字小文字・NFC / NFD）の衝突を検出して拒否し、名前を書き換えない（`ALREADY_EXISTS`）。実装は io の `fold_component` や正規化表を使わず、展開先 FS の `lstat` と `NameIndex`（この展開が作った実在項目の索引）で「展開先 FS が別表記を既存の実体へ解決するか」の実挙動で判定する。上位レイヤーの whiteout（`.wh.<名前>`）・不透明ディレクトリ（`.wh..wh..opq`）が対象または親を別表記で指す場合も、変更操作（削除）の前に拒否し、下位の木とルート外を変えない（OCI-2）。上の表は io の実装の根拠で、oci は独立した実装のため別表にする。
+
+| 場所 | テスト |
+| ---- | ------ |
+| `crates/oci/src/layer/extract.rs`（`folding_lstat` で区別しない FS を模擬） | `oci2_whiteout_alias_spelling_is_rejected_without_removal`・`oci2_opaque_alias_parent_is_rejected_without_removal`・`io5_marker_alias_is_rejected_before_any_removal`・`io5_stack_alias_entry_replacing_lower_dir_is_rejected`・`io5_oci2_stack_alias_markers_are_rejected_without_removal`・`io5_oci2_stack_same_spelling_markers_still_apply`・`io5_case_variants_follow_destination_fs`・`io5_normalization_variants_follow_destination_fs` |
+| `crates/oci/tests/layer_overlay.rs`（実 FS） | `io5_oci1_upper_alias_file_over_lower_dir_follows_destination_fs`・`io5_default_host_fs_folds_spelling_variants`（macOS / Windows のみ） |
+| `crates/oci/tests/layer_whiteout.rs`（実 FS） | `io5_oci2_alias_markers_follow_destination_fs` |
 
 ## 既知の限界・未実装（REPAIR-3）
 

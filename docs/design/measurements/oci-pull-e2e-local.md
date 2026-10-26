@@ -78,7 +78,7 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 
 - 展開時のデバイス・FIFO・hardlink 制限による失敗は出なかった（ハーネスでの回避なし）。debian の `stripped_special_bits: 11` は setuid / setgid / sticky を既定で落とした数（`docs/design/oci-layer-special-bits.md`）
 - `redis:alpine` は config 段で `INVALID_ARGUMENT`。原因はハーネスの `derive_process`（`crates/oci/tests/pull_e2e.rs`）のコード上の挙動から特定した。args を Entrypoint ++ cmd で組み立てるが、`redis:alpine` の Entrypoint は相対パスの `docker-entrypoint.sh` で `args[0]` が絶対パスにならず、`--cmd` で上書きしても Entrypoint は残る（実行での再現確認は未実施）。当時は core の launch が絶対パスの `args[0]` しか受けず（`start` の検査と `Entrypoint::new`）、ハーネスも同じ制約を持っていた。#2314（OCI-1）で、名前だけの `args[0]` を core が pivot 後に `process.env` の `PATH` で解決するようになり（runtime-spec・runc と同じ。`crates/core/src/exec/path_lookup.rs`）、ハーネスも受けるようにした。`redis:alpine` は config 段を通る見込みだが、実機での再実行は未実施（成功を装わない。REPAIR-3）。`/` を含む相対パスの `args[0]`（`./entrypoint.sh`・`bin/app`）も #2432（OCI-1・OCI-4）で、core が pivot と `process.cwd` の適用後に cwd 起点で解決するようになり（`..` 要素は拒否。runc との差）、ハーネスも受けるようにした（実機での再実行は未実施）。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
-- 既知の制約（ハーネスの `//!` と同じ）: `WorkingDir` を `process.cwd`、数値形式の `User` を `process.user` へ写す（名前形式は `UNIMPLEMENTED`、非 root の `User` は `FANDHE_CONTAINER_TEST_ID_HELPER=1` 無しでは `FAILED_PRECONDITION`）、`diff_id` は未検証、レイヤーは gzip のみ
+- 既知の制約（ハーネスの `//!` と同じ）: `WorkingDir` を `process.cwd`、数値形式の `User` を `process.user` へ写す（名前形式は `UNIMPLEMENTED`、非 root の `User` は `FANDHE_CONTAINER_TEST_ID_HELPER=1` 無しでは `FAILED_PRECONDITION`）、`diff_id` は未検証（実行時点。#2535 で展開時の突合を追加済み）、レイヤーは gzip のみ
 
 ## 引き継ぎ（人間担当）
 

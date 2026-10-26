@@ -71,8 +71,9 @@
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
-//! 無改変で返し、`envs` は返さない。`image_ref`・`image_id` は CreateContainer 時の解決結果（報告の無い経路は空。#2831）を返し、`info`・`message` は空のスタブ
-//! （REPAIR-3。項目ごとの将来仕様は `container::ContainerRecord::to_status` の doc、追跡は TASK-59 追補 #2322 の分割 issue）。
+//! 無改変で返し、`envs` は返さない。`image_ref`・`image_id` は CreateContainer 時の解決結果（報告の無い経路は空。#2831）を返し、`image` は在庫の `repo_tags[0]`（無ければ `config.image`。#2901）、
+//! `info`・`message` は方針として常に空（内部のパス・構成・実行層の応答文字列を出さない。理由と containerd との差は
+//! `docs/design/cri-config-acceptance.md`。#2901・CRI-2・OCI-1）。
 //! `exit_code` は実行層が報告した値を反映し、`reason` は実行層の報告から導く（OOM の報告があれば `OOMKilled`、
 //! 0 は `Completed`、非 0 は `Error`、不明は空）。
 //!
@@ -905,6 +906,7 @@ fn attach_prepared(
         i.image_ref()
             .len()
             .saturating_add(i.id_str().len())
+            .saturating_add(i.tag().map_or(0, str::len))
             .saturating_add(RESOLVED_IMAGE_RETAINED_BASE_BYTES)
     });
     let extra = user_extra.saturating_add(image_extra);
@@ -2413,7 +2415,8 @@ impl CriRuntimeService {
     /// 存在しない可能性があり、`ListContainers` も同様（仕様。Remove は `FAILED_PRECONDITION`）。
     ///
     /// 空 ID は `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）は `NOT_FOUND`（文言に入力 ID を含めない）。
-    /// `verbose` でも `info` は空のスタブ（REPAIR-3）。`envs` 等は応答に含めない。
+    /// `verbose` でも `info` は方針として空（内部のパス・構成を出さない。#2901・`docs/design/cri-config-acceptance.md`）。
+    /// `envs` 等は応答に含めない。
     fn container_status_impl(
         &self,
         req: v1::ContainerStatusRequest,

@@ -1875,6 +1875,70 @@ async fn cri2_status_image_without_digest_ref_and_without_report() {
     assert_eq!((st2.image_ref.as_str(), st2.image_id.as_str()), ("", ""));
 }
 
+/// CRI-2・OCI-1（#2901）: 在庫のタグがあれば Status の image は新しい ImageSpec（タグのみ）、List は config の値のまま。
+/// タグが無い・報告が無い経路は config の値。message は常に空、verbose でも info は空。
+#[tokio::test]
+async fn cri2_status_image_uses_inventory_tag_and_message_info_stay_empty() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let id = Digest::parse(&format!("sha256:{}", "d".repeat(64))).unwrap();
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() = Some(
+        ResolvedImage::new(id.clone(), None)
+            .with_tag(Some("docker.io/library/busybox:1.36".into())),
+    );
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(
+        st.image,
+        Some(ImageSpec {
+            image: "docker.io/library/busybox:1.36".into(),
+            ..Default::default()
+        })
+    );
+    assert_eq!(st.message, "");
+    let verbose = RuntimeService::container_status(
+        &h.service,
+        Request::new(v1::ContainerStatusRequest {
+            container_id: cid.clone(),
+            verbose: true,
+        }),
+    )
+    .await
+    .expect("verbose status")
+    .into_inner();
+    assert!(verbose.info.is_empty());
+    let list = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(
+        list[0].image.as_ref().map(|i| i.image.as_str()),
+        Some("busybox:1.36")
+    );
+
+    // タグが無い報告・報告が無い経路は config の値。
+    let h2 = harness();
+    *h2.bundles.report_image.lock().unwrap() = Some(ResolvedImage::new(id, None));
+    let sb2 = run_sandbox(&h2.service).await;
+    let cid2 = create(&h2.service, &sb2, "a").await.expect("create");
+    assert_eq!(
+        status(&h2.service, &cid2).await.image.map(|i| i.image),
+        Some("busybox:1.36".to_string())
+    );
+    let h3 = harness();
+    let sb3 = run_sandbox(&h3.service).await;
+    let cid3 = create(&h3.service, &sb3, "a").await.expect("create");
+    assert_eq!(
+        status(&h3.service, &cid3).await.image.map(|i| i.image),
+        Some("busybox:1.36".to_string())
+    );
+}
+
 /// CRI-2（#2771）: 報告の無い bundle 供給元では user は未報告で、RUNTIME_DEFAULT は SIGTERM（23）と報告される。
 #[tokio::test]
 async fn cri2_status_without_report_has_no_user_and_defaults_to_sigterm() {

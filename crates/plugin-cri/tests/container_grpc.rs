@@ -591,6 +591,9 @@ async fn container_rpcs_reach_the_plugin_binary() {
         assert_eq!(id.len(), 64);
         let st = container_status(&mut c, &id).await.expect("status");
         assert_eq!(st.state, cri::ContainerState::ContainerCreated as i32);
+        // 在庫に無い image ID の指定なので digest 参照は無く、image_ref も image ID（#2831・CRI-2・OCI-1）。
+        assert_eq!(st.image_id, image_id);
+        assert_eq!(st.image_ref, image_id);
         assert_eq!(list_containers_len(&mut c).await, 1);
         remove_container(&mut c, &id).await.expect("remove");
         assert_eq!(list_containers_len(&mut c).await, 0);
@@ -985,6 +988,14 @@ async fn production_binary_full_lifecycle_real() {
         .expect("start");
         let st = container_status(&mut c, &id).await.expect("status");
         assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
+        // 解決結果の報告（#2831）: image_id は PullImage の image_ref と同じ（proto の MUST）、image_ref は digest 参照。
+        assert_eq!(st.image_id, image_ref);
+        let repo = IMAGE.rsplit_once(':').map_or(IMAGE, |(r, _)| r);
+        assert!(
+            st.image_ref.contains(&format!("{}@sha256:", repo.rsplit('/').next().unwrap_or(repo))),
+            "image_ref: {}",
+            st.image_ref
+        );
 
         call_with_deadline(
             c.stop_container(cri::StopContainerRequest {

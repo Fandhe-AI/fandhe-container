@@ -22,7 +22,7 @@ pub mod spec;
 pub use image_rootfs::{DEFAULT_ROOTFS_DEADLINE, ImageExtractConfig, ImageRootfsSource};
 pub use provider::{RootfsSource, SpecBundleProvider, UserResolveRequest};
 pub use spec::{
-    AppliedUser, BundleFiles, ImageDefaults, PodNamespacePaths, RuntimeConfigJson,
+    AppliedUser, BundleFiles, ImageDefaults, PodNamespacePaths, ResolvedImage, RuntimeConfigJson,
     build_runtime_config, build_runtime_config_with_files,
     build_runtime_config_with_files_and_pod_namespaces,
     build_runtime_config_with_files_and_pod_netns, build_runtime_config_with_files_and_pods,

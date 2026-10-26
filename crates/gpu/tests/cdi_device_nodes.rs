@@ -20,7 +20,7 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
-/// 子プロセスを期限つきで待つ（REPAIR-5）。超過時は kill して wait で回収し、失敗として返す。
+/// 子プロセスを期限つきで待つ（REPAIR-5）。超過時は kill して有限の猶予で回収し、失敗として返す。
 fn run_with_deadline(cmd: &mut std::process::Command, limit: Duration) -> bool {
     let Ok(mut child) = cmd.spawn() else {
         return false;
@@ -32,7 +32,14 @@ fn run_with_deadline(cmd: &mut std::process::Command, limit: Duration) -> bool {
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
-                let _ = child.wait();
+                // kill 後の回収も有限の猶予で待つ（D 状態などで無期限にハングしない。REPAIR-5）。
+                let reap_start = Instant::now();
+                while reap_start.elapsed() < Duration::from_secs(5) {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 return false;
             }
         }

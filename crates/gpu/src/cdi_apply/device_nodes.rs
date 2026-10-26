@@ -99,6 +99,8 @@ pub(crate) fn encode_dev(major: u32, minor: u32) -> u64 {
 }
 
 /// `dev_t` を glibc の `gnu_dev_major` / `gnu_dev_minor` と同じ配置で分解する。
+/// Linux のビット配置であり、他 OS の `st_rdev` には使わない（`RealHost` は Linux 限定）。
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn decode_dev(dev: u64) -> (u64, u64) {
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
     let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
@@ -130,7 +132,7 @@ pub(crate) trait HostDeviceLookup {
 /// 実ホストの `lstat`（symlink を辿らない。デバイスを open しない）。
 struct RealHost;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl HostDeviceLookup for RealHost {
     fn lstat(&self, path: &str) -> Result<HostStat, Code> {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -157,7 +159,9 @@ impl HostDeviceLookup for RealHost {
     }
 }
 
-#[cfg(not(unix))]
+/// Linux 以外では `st_rdev` の復号が異なるため未実装として明示的に拒否する（3 OS 一級対応の
+/// うち macOS / Windows の復号は未実装。誤った major/minor を黙って返さない）。
+#[cfg(not(target_os = "linux"))]
 impl HostDeviceLookup for RealHost {
     fn lstat(&self, _path: &str) -> Result<HostStat, Code> {
         Err(Code::Unimplemented)
@@ -327,8 +331,20 @@ fn resolve_one(
     let mut minor = spec_minor;
     let mut host_mode = None;
     if let Some(h) = host {
-        host_mode = Some(h.mode & 0o777);
-        if !minimal {
+        if minimal {
+            // 完全指定でも mode をホストから補う場合は、種別を検証する（symlink 自身の 0777 や
+            // 非デバイスの mode を適用しない。fail-closed）。
+            if n.file_mode.is_none() {
+                if host_kind_to_kind(h.kind) != kind {
+                    return Err(err(
+                        Code::InvalidArgument,
+                        "device node type does not match the host device",
+                    ));
+                }
+                host_mode = Some(h.mode & 0o777);
+            }
+        } else {
+            host_mode = Some(h.mode & 0o777);
             let Some(hk) = host_kind_to_kind(h.kind) else {
                 return Err(err(Code::InvalidArgument, "host path is not a device node"));
             };
@@ -858,6 +874,26 @@ mod tests {
         )]));
         let r = one(n, &f).unwrap();
         assert_eq!((r.major(), r.minor(), r.mode()), (195, 0, 0o660));
+    }
+
+    /// GPU-2: 完全指定でも mode をホストから補う場合は種別を検証し、非デバイス（symlink 等）を拒否する。
+    /// fileMode を明示すればホストの mode は使わない。
+    #[test]
+    fn minimal_spec_rejects_non_device_host_when_mode_is_borrowed() {
+        let f = Fake(HashMap::from([(
+            "/dev/nvidia0",
+            host(HostKind::Other, 0, 0, 0o120_777),
+        )]));
+        let mut n = node("/dev/nvidia0");
+        n.r#type = Some("c".into());
+        n.major = Some(195);
+        n.minor = Some(0);
+        assert_eq!(
+            one(n.clone(), &f).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        n.file_mode = Some(0o600);
+        assert_eq!(one(n, &f).unwrap().mode(), 0o600);
     }
 
     /// GPU-2: type の食い違い・デバイスでないホストは拒否する。

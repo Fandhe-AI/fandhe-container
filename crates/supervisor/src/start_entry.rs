@@ -2518,7 +2518,13 @@ mod linux {
                 }
             }
             let config = crate::logs::container_log_rotation_config();
-            let sink = crate::logs::RotatingFileSink::open(&dir, id, config)?;
+            // 起動時の残存ログ掃除が同じ ID のロックを短く保持している窓を覆うため、有界で試し直す（#2760）。
+            let sink = crate::logs::open_container_log_sink_waiting(
+                &dir,
+                id,
+                config,
+                crate::logs::CONTAINER_LOG_OPEN_LOCK_WAIT,
+            )?;
             let Some(cri_path) = &self.cri_log_path else {
                 return Ok(Some(Arc::new(sink)));
             };

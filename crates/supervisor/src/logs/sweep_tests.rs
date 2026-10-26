@@ -151,3 +151,42 @@ fn repair4_sup7_removal_reason_only_for_sink_open() {
     );
     assert_eq!(container_log_removal_reason(ErrorCode::Timeout), None);
 }
+/// 掃除が同じ ID のロックを短く保持している間に start の open が当たっても、有界の試し直しで開ける（#2760・SUP-7・CRI-2）。
+#[test]
+fn sup7_cri2_open_waiting_survives_short_lock_hold() {
+    let t = Tmp::new("openwait");
+    let held = open(&t, "c1");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+    });
+    let dir = container_log_dir(&t.0);
+    let sink = open_container_log_sink_waiting(
+        &dir,
+        &id("c1"),
+        container_log_rotation_config(),
+        Duration::from_secs(10),
+    );
+    releaser.join().expect("join");
+    assert!(sink.is_ok());
+}
+
+/// 本当に生きている sink があれば、待ちを使い切った後は `FailedPrecondition` のまま返る（待ちは有界）。
+#[test]
+fn sup7_cri2_open_waiting_gives_up_when_sink_stays_alive() {
+    let t = Tmp::new("openwaitlive");
+    let _live = open(&t, "c1");
+    let dir = container_log_dir(&t.0);
+    let started = Instant::now();
+    let e = open_container_log_sink_waiting(
+        &dir,
+        &id("c1"),
+        container_log_rotation_config(),
+        Duration::from_millis(150),
+    )
+    .err()
+    .expect("must fail");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

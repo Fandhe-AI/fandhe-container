@@ -226,6 +226,40 @@ pub fn remove_container_logs_guarded_bounded_waiting(
     }
 }
 
+/// コンテナログの sink を開くとき、ロック競合（`FailedPrecondition`）を試し直す上限（SUP-7・CRI-2・REPAIR-5・#2760）。
+///
+/// plugin-cri の起動時掃除（[`sweep_stale_container_logs`]）は ID ごとに短時間ロックを保持して消す。kubelet が同じ残存 ID で
+/// create → start を進めると、掃除の保持中に start の open が当たり得る。この窓だけを覆う短い値で、
+/// 本当に別の sink が生存中の場合は上限後に `FailedPrecondition` のまま返す。
+pub const CONTAINER_LOG_OPEN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`rotating::RotatingFileSink::open`] を、`FailedPrecondition` のあいだ `lock_wait` まで試し直す版（#2760）。
+///
+/// 呼び出し元スレッドが [`CONTAINER_LOG_LOCK_POLL`] 刻みで sleep するだけで、他のコードは走らない。
+/// `FailedPrecondition` 以外は即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
+pub fn open_container_log_sink_waiting(
+    dir: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    config: RotationConfig,
+    lock_wait: std::time::Duration,
+) -> Result<rotating::RotatingFileSink, fandhe_container_core::traits::TraitError> {
+    let started = Instant::now();
+    loop {
+        match rotating::RotatingFileSink::open(dir, id, config) {
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                let Some(remaining) = lock_wait
+                    .checked_sub(started.elapsed())
+                    .filter(|r| !r.is_zero())
+                else {
+                    return Err(e);
+                };
+                std::thread::sleep(CONTAINER_LOG_LOCK_POLL.min(remaining));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// 待ちを使い切っても同じ ID の sink が閉じなかったことを示す警告行の `reason`（閉じた語彙。#2760・SUP-7・CRI-2・REPAIR-4）。
 ///
 /// [`remove_container_logs_guarded_bounded_waiting`] が `FailedPrecondition` を返すのは `lock_wait` を使い切ったときだけ

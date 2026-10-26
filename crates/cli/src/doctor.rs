@@ -198,36 +198,41 @@ impl BrNetfilterProbe {
 /// procfs 配下のファイルの `NotFound` を「存在しない」と断定してよいかの前提（NET-10）。
 ///
 /// パスの存在だけでは procfs 上と保証できない（通常のディレクトリが残っている環境がありうる）ため、
-/// `/proc/self/mountinfo` で `dir` を含むマウントの fstype が `proc` であり、かつ `dir` がディレクトリで
-/// あることを確かめる。mountinfo を読めない・上限超過・該当マウントが無い・fstype が `proc` でない・
+/// `dir` を開いた fd の mount ID（fdinfo の `mnt_id`）で `/proc/self/mountinfo` の行を引き、その fstype が
+/// `proc` であり、かつ同じ fd が指す `dir` がディレクトリであることを確かめる。パスの最長一致では祖先への
+/// 重ねマウントや `mount --move` で隠れた古い子マウントの行を選びうるため、実体の ID で引く（#2724）。
+/// mountinfo を読めない・上限超過・該当マウントが無い／壊れている／重複・fstype が `proc` でない・
 /// `dir` が無い場合は確認できないとして理由を返す（呼び出し側は判定不能として扱う。fail-closed）。
 fn confirm_procfs(root: &Path, dir: &str) -> Result<(), DoctorProbeError> {
     let not_confirmed = || DoctorProbeError {
         code: NetErrorCode::Internal.as_str().to_string(),
         message: "procfs mount could not be confirmed".to_string(),
     };
-    let mountinfo = read_limited(&root.join(PROC_SELF_MOUNTINFO), MAX_MOUNTINFO_READ)
+    let mountinfo = read_limited_bytes(&root.join(PROC_SELF_MOUNTINFO), MAX_MOUNTINFO_READ)
         .map_err(|e| DoctorProbeError::from_io(&e))?;
-    // mountinfo のマウントポイントは自プロセスの root からの絶対パスで書かれている。
-    if mount_fstype(&mountinfo, &Path::new("/").join(dir)).as_deref() != Some("proc") {
+    // symlink は辿る（実環境の `/proc/net` は `self/net` への symlink）。判定はこの fd だけで完結させる。
+    let file = File::open(root.join(dir)).map_err(|e| DoctorProbeError::from_io(&e))?;
+    match file.metadata() {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err(not_confirmed()),
+        Err(e) => return Err(DoctorProbeError::from_io(&e)),
+    }
+    if mount_fstype_of(&mountinfo, &file).as_deref() != Some("proc") {
         return Err(not_confirmed());
     }
-    match std::fs::metadata(root.join(dir)) {
-        Ok(m) if m.is_dir() => Ok(()),
-        Ok(_) => Err(not_confirmed()),
-        Err(e) => Err(DoctorProbeError::from_io(&e)),
-    }
+    Ok(())
 }
 
-/// `mountinfo` 上で `path` を含むマウントの fstype（net の mountinfo 解析を再利用する）。
+/// 開いたファイルが属するマウントの fstype（net の mountinfo 解析を再利用する）。判定できなければ `None`。
 #[cfg(target_os = "linux")]
-fn mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
-    fandhe_container_net::netns::covering_mount_fstype(mountinfo, path)
+fn mount_fstype_of(mountinfo: &[u8], file: &File) -> Option<String> {
+    let id = fandhe_container_net::netns::file_mount_id(file).ok()?;
+    fandhe_container_net::netns::mount_fstype_by_id(mountinfo, id).ok()
 }
 
 /// Linux 以外では mountinfo が無いため常に確認できない（`probe` は先に `Unsupported` を返すので到達しない）。
 #[cfg(not(target_os = "linux"))]
-fn mount_fstype(_mountinfo: &str, _path: &Path) -> Option<String> {
+fn mount_fstype_of(_mountinfo: &[u8], _file: &File) -> Option<String> {
     None
 }
 
@@ -1180,19 +1185,24 @@ mod tests {
         p
     }
 
-    /// `/proc` に procfs がマウントされた mountinfo（`/` は ext4）。
-    const MOUNTINFO_PROCFS: &str = "\
-22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
-24 22 0:22 / /proc rw,nosuid,nodev,noexec - proc proc rw
-";
+    /// `root` 配下の `/proc/sys/net`・`/proc/net` を開いて得た実際の mount ID で、fstype `fstype` の行を持つ
+    /// mountinfo を作る（`/` は ext4 の別 ID の行）。偽 root は同じ一時領域にあるため 1 行で足りる。
+    fn mountinfo_for(root: &Path, fstype: &str) -> String {
+        let f = File::open(root.join(PROC_SYS_NET)).expect("open");
+        let id = fandhe_container_net::netns::file_mount_id(&f).expect("mount id");
+        format!(
+            "{} 1 8:1 / / rw - ext4 /dev/sda1 rw\n{id} 1 0:22 / /proc rw,nosuid - {fstype} {fstype} rw\n",
+            id + 100_000
+        )
+    }
 
     /// procfs が参照できる環境を模した root（`/proc/sys/net`・`/proc/net` が存在し、mountinfo 上で
-    /// `/proc` が procfs）。
+    /// それらを含む実際のマウントが procfs）。
     fn procfs_root() -> TempRoot {
         let t = TempRoot::new();
         std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
         std::fs::create_dir_all(t.0.join(PROC_NET)).expect("mkdir");
-        t.write(PROC_SELF_MOUNTINFO, MOUNTINFO_PROCFS);
+        t.write(PROC_SELF_MOUNTINFO, &mountinfo_for(&t.0, "proc"));
         t
     }
 
@@ -1245,8 +1255,8 @@ mod tests {
         );
     }
 
-    /// NET-10: mountinfo 上で `/proc/sys/net` を含むマウントが procfs でなければ、ディレクトリと mountinfo が
-    /// 揃っていても NotLoaded と断定せず Unknown。
+    /// NET-10・#2724: fd の mount ID で引いた行が procfs でなければ、ディレクトリと mountinfo が
+    /// 揃っていても NotLoaded と断定せず Unknown。パス上の別の行（隠れたマウント）には惑わされない。
     #[test]
     fn net10_br_netfilter_non_procfs_mount_is_unknown() {
         let not_confirmed = BrNetfilterState::Unknown {
@@ -1255,32 +1265,32 @@ mod tests {
                 message: "procfs mount could not be confirmed".to_string(),
             },
         };
-        let probe = |mountinfo: &str| {
+        let probe = |mountinfo: &dyn Fn(&Path) -> String| {
             let t = TempRoot::new();
             std::fs::create_dir_all(t.0.join(PROC_SYS_NET)).expect("mkdir");
-            t.write(PROC_SELF_MOUNTINFO, mountinfo);
+            t.write(PROC_SELF_MOUNTINFO, &mountinfo(&t.0));
             BrNetfilterProbe::with_root(t.0.clone()).probe()
         };
-        // `/proc` が通常のディレクトリ（`/` の ext4 上）。
+        // 実際の ID の行が ext4。
+        assert_eq!(probe(&|r| mountinfo_for(r, "ext4")), not_confirmed);
+        // 実際の ID の行は tmpfs で、パス `/proc/sys/net` には別 ID の procfs の行がある（隠れたマウント）。
         assert_eq!(
-            probe("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"),
-            not_confirmed
-        );
-        // `/proc` は procfs だが `/proc/sys` に tmpfs が重ねられている。
-        assert_eq!(
-            probe(&format!(
-                "{MOUNTINFO_PROCFS}30 24 0:30 / /proc/sys rw - tmpfs tmpfs rw\n"
+            probe(&|r| format!(
+                "{}99 1 0:99 / /proc/sys/net rw - proc proc rw\n",
+                mountinfo_for(r, "tmpfs")
             )),
             not_confirmed
         );
         // 該当マウントが無い（空の mountinfo）。
-        assert_eq!(probe(""), not_confirmed);
-        // 上限を超えて読み切れない mountinfo（procfs の行が上限より後ろにある）。
-        let mut big =
-            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n".repeat(MAX_MOUNTINFO_READ as usize / 30 + 1);
-        big.push_str(MOUNTINFO_PROCFS);
+        assert_eq!(probe(&|_| String::new()), not_confirmed);
+        // 上限を超えて読み切れない mountinfo。
         assert_eq!(
-            probe(&big),
+            probe(&|r| {
+                let mut big = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                    .repeat(MAX_MOUNTINFO_READ as usize / 30 + 1);
+                big.push_str(&mountinfo_for(r, "proc"));
+                big
+            }),
             BrNetfilterState::Unknown {
                 reason: DoctorProbeError {
                     code: "INTERNAL".to_string(),
@@ -1290,11 +1300,24 @@ mod tests {
         );
     }
 
+    /// NET-10・#2724: パス `/proc/sys/net` に tmpfs の行があっても、実際の ID の行が procfs なら取り違えない。
+    #[test]
+    fn net10_br_netfilter_hidden_path_line_is_ignored() {
+        let t = procfs_root();
+        let mut info = std::fs::read_to_string(t.0.join(PROC_SELF_MOUNTINFO)).expect("read");
+        info.push_str("99 1 0:99 / /proc/sys/net rw - tmpfs tmpfs rw\n");
+        t.write(PROC_SELF_MOUNTINFO, &info);
+        assert_eq!(
+            BrNetfilterProbe::with_root(t.0.clone()).probe(),
+            BrNetfilterState::NotLoaded
+        );
+    }
+
     /// NET-10: mountinfo 上は procfs でも `/proc/sys/net` が無ければ（net sysctl 不在）Unknown。
     #[test]
     fn net10_br_netfilter_missing_proc_sys_net_is_unknown() {
         let t = TempRoot::new();
-        t.write(PROC_SELF_MOUNTINFO, MOUNTINFO_PROCFS);
+        t.write(PROC_SELF_MOUNTINFO, "");
         let st = BrNetfilterProbe::with_root(t.0.clone()).probe();
         assert_eq!(
             st,

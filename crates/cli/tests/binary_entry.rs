@@ -3225,3 +3225,38 @@ fn sec4_start_passes_audit_policy_to_supervisor_argv() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+/// CORE-5・SEC-4・CLI-1（#2761）: 実バイナリの `doctor` は Landlock ABI の行をちょうど 1 行出し、`start` に要る下限（6）と
+/// 監査の下限（7）を数値で示す。`state` は固定語彙のどれか（実カーネルの結果は環境で変わるため語彙で照合する）。
+#[cfg(target_os = "linux")]
+#[test]
+fn core5_doctor_reports_landlock_line() {
+    let out = run_env(&["doctor"], &[]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("\"check\":\"landlock\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let line = lines[0];
+    assert!(
+        line.ends_with(",\"required\":6,\"audit_required\":7}"),
+        "{line}"
+    );
+    let states = [
+        "supported",
+        "audit_abi_too_old",
+        "abi_too_old",
+        "kernel_lacks_landlock",
+        "disabled_at_boot",
+        "unsupported_architecture",
+        "invalid_kernel_response",
+        "probe_failed",
+    ];
+    assert!(
+        states
+            .iter()
+            .any(|s| line.contains(&format!("\"state\":\"{s}\",\"abi\":"))),
+        "{line}"
+    );
+}

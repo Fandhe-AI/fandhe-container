@@ -19,8 +19,9 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
-//!   manifest の在庫は永続化済み（#2380）だが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、`register` は
-//!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。
+//!   manifest の在庫は永続化済み（#2380）だが、在庫を埋める経路は cri の `OciImagePuller::pull` に配線済み（#2539）で、同じ root を
+//!   `--image-root` に渡せば `register` が成功する。本番の `PullImage` への到達（plugin-cri の ImageService・#2592）までは
+//!   在庫が空のため `register` は `NOT_FOUND` になる。
 //!   `--image` の判別規則（digest かタグ参照か）と解決・付け替えの扱いは `image_refs` module の doc（#2496）。
 //!   core 呼び出しの前に同じ参照キーの残骸（状態の無い参照）を回収し（契機 A）、呼び出し全体を create ゲートの共有で包む
 //!   （`ref_reconcile`・`docs/design/container-ref-reconcile.md`。#2495）。

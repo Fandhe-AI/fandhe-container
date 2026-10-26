@@ -647,8 +647,14 @@ expect_rc "list form on a non-list case is rejected" 2 $?
 # --- inspect の 1 行 JSON（種別 i。B17）---
 expect_line "B17 inspect of a created container" ok "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
 expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3,ro=true"
+# 行数は case で先に決める（$( ) の中の case は macOS の /bin/bash 3.2 が `)` を取り違えて構文エラーにするため）
 for n in order extra noro badro extrarw missing nolf crlf twolines badcap badstr; do
-  expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:$(case $n in nolf) echo 0 ;; twolines) echo 2 ;; *) echo 1 ;; esac)"
+  case $n in
+    nolf) lines=0 ;;
+    twolines) lines=2 ;;
+    *) lines=1 ;;
+  esac
+  expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:${lines}"
 done
 for n in lead0pid lead0ext lead0cg; do
   expect_line "B17 leading-zero number ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:1"

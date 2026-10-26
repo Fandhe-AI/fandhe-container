@@ -451,6 +451,17 @@ start_capture noisy noisy
 # 後始末（stop / delete）の最中に TERM を再度受けても状態ルートを消さない（#2891・REPAIR-5）。
 mkdir -p "$work/tmp-sigdel" "$work/sigdel"
 STUB_SIGDEL_DIR="$work/sigdel" TMPDIR="$work/tmp-sigdel" start_capture sigdel sigdel
+# lddhang: ldd が止まっても capture が期限内に終わる（スタブの ldd を PATH の先頭に置く。Linux のみ。REPAIR-5）
+if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+  mkdir -p "$work/lddbin"
+  cat >"$work/lddbin/ldd" <<'LDD'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$LDD_PIDFILE"
+exec sleep 300
+LDD
+  chmod +x "$work/lddbin/ldd"
+  LDD_PIDFILE="$work/ldd.pid" CLI_PARITY_LDD_LIMIT_SECS=1 PATH="$work/lddbin:$PATH" start_capture lddhang ok
+fi
 STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
@@ -478,6 +489,18 @@ else
 fi
 wait
 
+if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+  expect_rc "ldd hang: capture finishes with rc 0" 0 "$(rc_of lddhang)"
+  if grep -q 'start rootfs was not assembled' "$work/lddhang.err"; then pass "ldd hang: rootfs assembly reported as failed"; else fail "ldd hang: rootfs assembly reported as failed"; fi
+  ldd_alive=0
+  if [ -r "$work/ldd.pid" ]; then
+    IFS= read -r lddp <"$work/ldd.pid"
+    kill -0 "$lddp" 2>/dev/null && ldd_alive=1
+  else
+    ldd_alive=2
+  fi
+  expect_eq "ldd hang: stub ldd was reclaimed" 0 "$ldd_alive"
+fi
 all_caps="ok lcall nonlinux nostart diff noisy errtable errmax outtable"
 for n in $insp_names; do all_caps="$all_caps insp_$n"; done
 for name in $all_caps; do

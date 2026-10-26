@@ -618,7 +618,11 @@ inspect_is_running() {
 # start が失敗して B21 / B23 が <start-failed> になる）。
 build_ld=""
 build_start_rootfs() {
-  local rootfs="$1" exe="" cand w lib dir line
+  local rootfs="$1" exe="" cand w lib dir line ldd_bin
+  # ldd の実行は run_cli の監視下（既定 10 秒。CLI_PARITY_LDD_LIMIT_SECS で 1..60 に変更可）に置く。ローダーが止まっても
+  # capture が無期限に待たないため（REPAIR-5）。期限切れ・異常終了は組み立て失敗（return 1）として扱う。
+  local ldd_limit="${CLI_PARITY_LDD_LIMIT_SECS:-10}"
+  [[ $ldd_limit =~ ^[1-9][0-9]?$ ]] && [ "$ldd_limit" -le 60 ] || ldd_limit=10
   local path_re='^/[A-Za-z0-9._/+-]+$'
   build_ld=""
   for cand in /bin/sleep /usr/bin/sleep; do
@@ -628,10 +632,15 @@ build_start_rootfs() {
     fi
   done
   [ -n "$exe" ] || return 1
-  command -v ldd >/dev/null 2>&1 || return 1
+  ldd_bin="$(command -v ldd 2>/dev/null)" || return 1
+  [ -n "$ldd_bin" ] || return 1
   mkdir -p -- "$rootfs/bin" "$rootfs/proc" "$rootfs/dev" "$rootfs/tmp" "$rootfs/etc" || return 1
   cp -- "$exe" "$rootfs/bin/sleep" || return 1
   chmod 755 "$rootfs/bin/sleep" || return 1
+  run_cli "$ldd_bin" "$ldd_limit" "$exe"
+  if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
+    return 1
+  fi
   while IFS= read -r line; do
     for w in $line; do
       [[ $w =~ $path_re ]] || continue
@@ -643,7 +652,7 @@ build_start_rootfs() {
       chmod 755 "$rootfs$lib" || return 1
       case ":$build_ld:" in *":$dir:"*) ;; *) build_ld="${build_ld:+$build_ld:}$dir" ;; esac
     done
-  done < <(ldd "$exe" 2>/dev/null)
+  done <"$tmp_dir/out"
   return 0
 }
 

@@ -48,7 +48,7 @@ pub struct ExpandedUsage {
 }
 
 /// ガードの内側で取る計測計画（レイヤー digest の和集合。config blob はレイヤーではないので含めない）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExpandedSizePlan {
     layers: BTreeSet<Digest>,
     /// 計画を取った排他区間の検査済み root（#2695）。`measure` がガードの外でも、渡されたパスをこれと
@@ -66,6 +66,17 @@ impl ReferenceTable {
         ExpandedSizePlan {
             layers,
             root: self.journal_root.share(),
+        }
+    }
+}
+
+/// 複製でも検査済み root を共有して引き継ぐ（`JournalRoot::clone` は root を落とすため明示実装する。
+/// 複製した計画の `measure` がおとりの root を読まないようにする。OCI-7・SEC-1・#2701）。
+impl Clone for ExpandedSizePlan {
+    fn clone(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            root: self.root.share(),
         }
     }
 }
@@ -316,6 +327,33 @@ mod tests {
         let _other = store.lock().unwrap();
         drop(_other);
         assert_eq!(plan.measure(&r.0).unwrap().expanded_bytes, 66);
+    }
+
+    /// OCI-7・SEC-1・#2701: ガード内で取った plan を複製しても検査済み root を保ち、別のパス（おとりの root）
+    /// での計測は `InvalidArgument` で拒否する。
+    #[test]
+    fn oci7_expanded_plan_clone_keeps_checked_root() {
+        let r = Root::new("clone-real");
+        let decoy = Root::new("clone-decoy");
+        let t = table();
+        r.put(0x10, &gz(&[0u8; 11]));
+        r.put(0x11, &gz(&[0u8; 22]));
+        r.put(0x12, &gz(&[0u8; 33]));
+        decoy.put(0x10, &gz(&[0u8; 1]));
+        decoy.put(0x11, &gz(&[0u8; 1]));
+        decoy.put(0x12, &gz(&[0u8; 1]));
+        let store = crate::image_management::ImageStore::with_table(&r.0, t).unwrap();
+        let plan = {
+            let guard = store.lock().unwrap();
+            guard.expanded_size_plan()
+        };
+        let cloned = plan.clone();
+        let err = cloned.measure(&decoy.0).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::image_management::OciErrorCode::InvalidArgument
+        );
+        assert_eq!(cloned.measure(&r.0).unwrap().expanded_bytes, 66);
     }
 
     /// OCI-7: blob ディレクトリが無ければ全レイヤーが missing。

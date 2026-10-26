@@ -50,7 +50,7 @@ pub(super) fn document_of(
         options.tmpfs.clone(),
     )?
     .with_cap_drop(options.cap_drop.clone())
-    .map(|doc| doc.with_read_only(options.read_only))
+    .and_then(|doc| doc.with_read_only(options.read_only))
 }
 
 /// `--env-file` を読む待ちの上限(REPAIR-5)。

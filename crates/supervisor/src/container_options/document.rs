@@ -181,10 +181,14 @@ impl ContainerOptionsDocument {
     }
 
     /// `--read-only` を持たせる(CLI-1・SUP-12・#2828)。false は「指定なし」で、config の値に従う。
-    #[must_use]
-    pub fn with_read_only(mut self, read_only: bool) -> Self {
+    /// `read-only` の記録を足した後の文書全体の上限を、`new` / `with_cap_drop` と同じ基準(作成世代の記録の分を
+    /// 含む)で再検査する。create が書けても start の読み取りが拒否する文書を作らない(REPAIR-2)。
+    pub fn with_read_only(mut self, read_only: bool) -> Result<Self, TraitError> {
         self.read_only = read_only;
-        self
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
     }
 
     /// `--read-only` が指定されたか。
@@ -412,7 +416,7 @@ impl ContainerOptionsDocument {
         }
         let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
             .with_cap_drop(cap_drop)?
-            .with_read_only(read_only);
+            .with_read_only(read_only)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
@@ -526,6 +530,32 @@ tmpfs 14\n/run:rw,noexec\n";
         );
     }
 
+    /// CLI-1・SUP-12(#2828): `with_read_only(true)` は記録を足した後の文書が上限(作成世代の記録の分を含む)に
+    /// ちょうど収まれば成功し、1 バイト超えれば固定文言で拒否する。
+    #[test]
+    fn sup12_options_document_read_only_checks_size_boundary() {
+        let with_ipc = |n: usize| ContainerOptionsDocument {
+            ipc: Some("x".repeat(n)),
+            ..ContainerOptionsDocument::default()
+        };
+        let total = |n: usize| {
+            let mut d = with_ipc(n);
+            d.read_only = true;
+            d.encode().len() + GENERATION_RECORD_RESERVE
+        };
+        let mut n = OPTIONS_DOC_MAX_BYTES - 64;
+        while total(n) < OPTIONS_DOC_MAX_BYTES {
+            n += 1;
+        }
+        assert_eq!(total(n), OPTIONS_DOC_MAX_BYTES);
+        assert!(with_ipc(n).with_read_only(true).is_ok());
+        let err = with_ipc(n + 1)
+            .with_read_only(true)
+            .expect_err("over the limit");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "options document is too large");
+    }
+
     /// CLI-1・SEC-1(#2775): 未知名・空・長すぎる名前・件数超過を含む文書は復号・構築とも固定文言で拒否する。
     #[test]
     fn cli1_cap_drop_record_rejects_invalid() {
@@ -552,7 +582,9 @@ tmpfs 14\n/run:rw,noexec\n";
     /// 本体が `true` 以外・空・重複は固定文言で拒否する。
     #[test]
     fn sup12_options_document_read_only_round_trip() {
-        let d = ContainerOptionsDocument::default().with_read_only(true);
+        let d = ContainerOptionsDocument::default()
+            .with_read_only(true)
+            .expect("read-only");
         assert!(!d.is_empty());
         let bytes = d.encode();
         assert_eq!(bytes, b"FCOPT1\nread-only 4\ntrue\n".to_vec());

@@ -504,7 +504,16 @@ mod linux {
         logs_ok.map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
         // `--read-only` の実効値は分離の記録として `inspect` にも出る(CLI-1・SUP-12・#2828)。
         let out = run_cli(&cli, &["--root", &root_s, "inspect", &id_s], CLI_TIMEOUT)?;
-        expect_ok(&out, "inspect")?;
+        expect_ok_code(&out, "inspect")?;
+        if !out.stdout.contains("\"status\":\"running\"") {
+            return Err(format!("inspect did not report running: {:?}", out.stdout));
+        }
+        if !out.stdout.contains("\"capabilities\":{\"bounding\":[") {
+            return Err(format!(
+                "inspect did not report capabilities.bounding: {:?}",
+                out.stdout
+            ));
+        }
         if !out.stdout.contains("\"rootReadonly\":true") {
             return Err(format!(
                 "inspect did not report rootReadonly=true: {:?}",

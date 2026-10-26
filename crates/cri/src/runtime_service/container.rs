@@ -224,7 +224,7 @@ impl ContainerRecord {
     /// - `image_ref`・`image_id`: `CriRuntimeService` が `ImageStore` を持たない。将来は CreateContainer 時に
     ///   `ImageStore` で解決して記録へ保持した digest 等を返す（未注入・未解決は空のまま）。
     /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。
-    ///   `applied_user`）を返す。報告の無い経路（スタブ等）は `None`。`supplemental_groups` は重複除去後の最終の
+    ///   `applied_user`）を返す。報告の無い経路（スタブ等）と、補助グループが空で実プロセスのグループと一致を保証できない場合は `None`。`supplemental_groups` は重複除去後の最終の
     ///   集合で、主 gid は自動では含めない（containerd は含めることがある既知の差）。`stop_signal` は実際に
     ///   stop で使う解決済みの値（#2771）。
     /// - `message`: 実行層の応答文字列を外へ出さない方針のため固定文字列のみ許す。OOM でも空。
@@ -268,17 +268,26 @@ impl ContainerRecord {
                 .map_or_else(|| self.config.log_path.clone(), |p| p.as_str().to_owned()),
             resources,
             image_id: String::new(),
-            user: self.applied_user.as_ref().map(|u| v1::ContainerUser {
-                linux: Some(v1::LinuxContainerUser {
-                    uid: i64::from(u.uid()),
-                    gid: i64::from(u.gid()),
-                    supplemental_groups: u
-                        .additional_gids()
-                        .iter()
-                        .map(|g| i64::from(*g))
-                        .collect(),
+            // 補助グループが明示（非空）のときだけ報告する。空の指定は core が `setgroups(0)` で消去するが、
+            // `RootlessSingleId` のように user namespace が `setgroups` を禁じる構成では起動元の補助グループを
+            // 現状維持して起動を続ける（`KeptSetgroupsDenied`）。cri 側では実際に残るグループを知り得ず、
+            // 空を報告すると実プロセスと食い違うため、その場合は user を未報告にする（CRI-2・SEC-5。
+            // 実行層が確定した初期グループを記録へ返す経路は未実装）。非空は適用できなければ起動が失敗する。
+            user: self
+                .applied_user
+                .as_ref()
+                .filter(|u| !u.additional_gids().is_empty())
+                .map(|u| v1::ContainerUser {
+                    linux: Some(v1::LinuxContainerUser {
+                        uid: i64::from(u.uid()),
+                        gid: i64::from(u.gid()),
+                        supplemental_groups: u
+                            .additional_gids()
+                            .iter()
+                            .map(|g| i64::from(*g))
+                            .collect(),
+                    }),
                 }),
-            }),
             stop_signal: self.stop_signal,
         }
     }

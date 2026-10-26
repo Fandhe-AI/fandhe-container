@@ -1797,6 +1797,22 @@ async fn cri2_status_reports_applied_user_and_resolved_stop_signal() {
     assert_eq!(h.runtime.stop_signals.lock().unwrap().clone(), vec![2]);
 }
 
+/// CRI-2・SEC-5（#2771）: 補助グループが空の識別情報は、core が起動元のグループを現状維持し得る
+/// （`KeptSetgroupsDenied`）ため実プロセスとの一致を保証できず、user は未報告になる。
+#[tokio::test]
+async fn cri2_status_omits_user_when_supplemental_groups_empty() {
+    let h = harness();
+    *h.bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        Vec::new(),
+    ));
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert!(st.user.is_none());
+}
+
 /// CRI-2（#2771）: 報告の無い bundle 供給元では user は未報告で、RUNTIME_DEFAULT は SIGTERM（23）と報告される。
 #[tokio::test]
 async fn cri2_status_without_report_has_no_user_and_defaults_to_sigterm() {

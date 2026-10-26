@@ -35,7 +35,8 @@
 //! 見る `fstatfs(2)` を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! デバイス cgroup の層ごとの実機照合（TASK-32 追補・#1681）は、`ptmx` を開いた pty の slave を開けるよう
-//! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。
+//! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。`ioctl(2)` は nsfs の namespace fd の素性の
+//! 照合（`NS_GET_NSTYPE`・`NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_OWNER_UID`。#2674・CORE-3・CRI-2）にも使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
@@ -259,8 +260,9 @@ mod consts {
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
     // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
-    // （`_IO(0xb7, 1..4)`・`_IO(0xb7, 4)` は `_IOR` ではなく `_IO`。方向・大きさのビットを持たないため
-    // x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。#2674・CORE-3）。
+    // （4 つとも `_IO(0xb7, 1)`〜`_IO(0xb7, 4)`。`NS_GET_OWNER_UID` は `uid_t` を書き込むが定義は `_IOR` ではなく
+    // `_IO` で、方向・大きさのビットを持たないため x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。
+    // #2674・CORE-3）。
     pub const NS_GET_USERNS: u64 = 0xb701;
     pub const NS_GET_PARENT: u64 = 0xb702;
     pub const NS_GET_NSTYPE: u64 = 0xb703;
@@ -610,8 +612,9 @@ mod consts {
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
     // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
-    // （`_IO(0xb7, 1..4)`・`_IO(0xb7, 4)` は `_IOR` ではなく `_IO`。方向・大きさのビットを持たないため
-    // x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。#2674・CORE-3）。
+    // （4 つとも `_IO(0xb7, 1)`〜`_IO(0xb7, 4)`。`NS_GET_OWNER_UID` は `uid_t` を書き込むが定義は `_IOR` ではなく
+    // `_IO` で、方向・大きさのビットを持たないため x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。
+    // #2674・CORE-3）。
     pub const NS_GET_USERNS: u64 = 0xb701;
     pub const NS_GET_PARENT: u64 = 0xb702;
     pub const NS_GET_NSTYPE: u64 = 0xb703;
@@ -1271,7 +1274,9 @@ unsafe extern "C" {
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は
     // `request` が `int`）。可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
-    // 異なる ABI で未定義動作になる）。`c_ulong` は LP64 で u64。pty の unlock と番号の取得だけに使う。
+    // 異なる ABI で未定義動作になる）。`c_ulong` は LP64 で u64。pty の unlock と番号の取得（`TIOCSPTLCK`・
+    // `TIOCGPTN`。#1681）と、nsfs の namespace fd の素性の照合（`NS_GET_NSTYPE`・`NS_GET_USERNS`・`NS_GET_PARENT`・
+    // `NS_GET_OWNER_UID`。#2674・CORE-3・CRI-2）に使う。
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
     fn getegid() -> u32;
@@ -1319,7 +1324,8 @@ unsafe extern "C" {
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
     // SAFETY（宣言そのものの妥当性）: `ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)`
     // （glibc / musl。Linux の LP64 で `off_t` は i64・`ssize_t` は isize）。`libc` との機械照合は core には未適用
-    // （適用は cli・oci のみ。docs/design/ffi-libc-check.md）。#2628・CORE-6・SEC-5。
+    // （適用は cli・oci のみ。docs/design/ffi-libc-check.md）。core へ照合を入れるとき（#1849。#1837 の子）に、この宣言の
+    // 型（`off_t *`・`size_t`・`ssize_t`）の照合も足す（#2759・#2728 P2-3）。#2628・CORE-6・SEC-5。
     fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize;
     // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
@@ -3545,7 +3551,9 @@ pub(crate) fn memfd_create_for_exec_copy(name: &'static CStr) -> Result<OwnedFd,
 /// 内容をユーザー空間のバッファへ載せず、ホストのファイルから `sendfile(2)` のカーネル内コピーだけで置く入口
 /// （ID 写像の holder が fork で継承するメモリへ secret を載せないため。#2628・CORE-6・SEC-5）。実行できない
 /// memfd にする（`MFD_EXEC` は付けない）。`MFD_NOEXEC_SEAL` を知らないカーネル（6.3 未満）は `EINVAL` を返すため、
-/// そのときだけ外して 1 回再試行する（6.3 未満の memfd は実行可能だが、内容用で実行には使わない）。
+/// そのときだけ外して 1 回再試行する（6.3 未満の memfd は実行可能だが、内容用で実行には使わない）。実行できないこと
+/// の保証（`F_SEAL_EXEC`）は Linux 6.3 以降に限る。本番の起動は Landlock ABI 6（6.12 以降）が必須なので本番では常に
+/// 満たされる（#2759・#2728 P2-1）。
 /// それ以外の失敗（`EPERM` = seccomp・`ENOSYS` など）はそのまま返し、呼び出し側が拒否する（fail-closed）。
 /// `name` は固定値を渡す前提で外部入力を混ぜない。
 pub(crate) fn memfd_create_for_data(name: &'static CStr) -> Result<OwnedFd, SysError> {
@@ -4483,7 +4491,11 @@ pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
 ///
 /// 自分の user namespace の `CAP_SETGID` を要し、user namespace が `setgroups` を `deny` にしている場合
 /// （非特権で作った user namespace。`/proc/<pid>/setgroups`）は権限があっても `EPERM` になる。生の syscall のため
-/// 効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+/// 効果は呼び出しスレッドだけに及ぶ。単一スレッドであることは呼び出し側が確かめる:
+/// 本番の呼び出し元 `exec::capabilities` の `apply_capabilities_single_threaded_with_groups` と
+/// `clear_groups_single_threaded` が、副作用の前後で自プロセスの `Threads: 1` を確かめる（満たさなければ前は
+/// `FailedPrecondition`、後は `Internal`）。他スレッドに古い補助グループが残る状態のまま進まないための検査で、
+/// 外してはならない（#2759・#2731 P2-2）。
 // テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
 // 変えないため）。
 #[cfg_attr(test, allow(dead_code))]
@@ -4494,7 +4506,8 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     let nr = consts::SYS_SETGROUPS.get()?;
     // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
     // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
-    // 資格情報（補助グループ）の変更のみで、メモリには触れない。
+    // 資格情報（補助グループ）の変更のみで、メモリには触れない（単一スレッドの担保は呼び出し側の `Threads: 1` 検査。
+    // 上の doc を参照）。
     let rc = unsafe { syscall(nr, 0i64, core::ptr::null::<u32>()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
@@ -4510,7 +4523,11 @@ pub(crate) const SUPPLEMENTARY_GROUPS_MAX: usize = 65_536;
 /// launch の子の capability 削減段が、`process.user.additionalGids` を適用するために呼ぶ（launcher が fork の前に
 /// user namespace の gid 写像と照合済み）。`CAP_SETGID` を要し、`setgroups` が `deny` の user namespace では
 /// `EPERM`、写像されていない gid は `EINVAL`。件数が [`SUPPLEMENTARY_GROUPS_MAX`] を超える場合は syscall の前に
-/// `EINVAL`。生の syscall のため効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+/// `EINVAL`。生の syscall のため効果は呼び出しスレッドだけに及ぶ。単一スレッドであることは呼び出し側が確かめる:
+/// 本番の呼び出し元 `exec::capabilities` の `apply_capabilities_single_threaded_with_groups` と
+/// `clear_groups_single_threaded` が、副作用の前後で自プロセスの `Threads: 1` を確かめる（満たさなければ前は
+/// `FailedPrecondition`、後は `Internal`）。他スレッドに古い補助グループが残る状態のまま進まないための検査で、
+/// 外してはならない（#2759・#2731 P2-2）。
 // テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
 // 変えないため）。
 #[cfg_attr(test, allow(dead_code))]
@@ -4524,7 +4541,8 @@ pub(crate) fn set_supplementary_groups(gids: &[u32]) -> Result<(), SysError> {
     let nr = consts::SYS_SETGROUPS.get()?;
     // SAFETY: `setgroups(size_t size, const gid_t *list)` に `gids.len()` と `gids.as_ptr()` を渡す。ポインタは
     // `len` 個の `u32`（gid_t と同幅）の有効な領域を指し、カーネルはそこを読むだけで書き込まない。呼び出しの間
-    // `gids` は借用されたまま生きている。効果は呼び出しスレッドの資格情報の変更のみ。
+    // `gids` は借用されたまま生きている。効果は呼び出しスレッドの資格情報の変更のみ（他スレッドに古い補助グループが
+    // 残らないことは、呼び出し側が副作用の前後に `Threads: 1` を確かめることで担保する。上の doc を参照）。
     let rc = unsafe { syscall(nr, gids.len() as i64, gids.as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
@@ -4533,6 +4551,12 @@ pub(crate) fn set_supplementary_groups(gids: &[u32]) -> Result<(), SysError> {
 ///
 /// 件数を `getgroups(0, NULL)` で取り、[`SUPPLEMENTARY_GROUPS_MAX`] 以下を確かめてから確保して読む。
 /// 読んだ件数が最初の件数と食い違えば `EINVAL`（呼び出しの間に変わった = 単一スレッドの前提違反）。
+///
+/// fork 子で呼ぶ場合の確保（本関数の `vec!`）は安全である: 子は必ず `fork_single_threaded*`（`fork_checked`。core で
+/// 唯一の `fork()` 呼び出し）を経ており、fork 直前の `Threads: 1` が強制されるため、他スレッドが握ったアロケータの
+/// ロックを引き継がない。本番の経路（launch の C → I → PID 1、exec worker、mapper）はどれも本物のスレッド数判定を
+/// 渡し、定数判定（`|| true`）は `#[cfg(test)]` の中だけにある。同じ段は既に確保もしている。この前提は
+/// `fork_checked` の強制に依存するため、そこを変えるときは再確認する（#2759・#2731 P2-1）。
 // テストビルドでは capability 削減段が偽のカーネルを使うため、本関数は sys の試験からだけ呼ばれる。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn read_supplementary_groups() -> Result<Vec<u32>, SysError> {

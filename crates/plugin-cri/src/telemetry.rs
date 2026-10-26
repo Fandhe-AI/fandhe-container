@@ -13,6 +13,8 @@
 //! 有界バッファ・書き込み失敗を黙って捨てない」と同じ趣旨。ただし 4.7 の文字列回収ではなく型つきの記録を直接渡し、
 //! JSON 行の読み直しを避ける。REPAIR-2）。
 //!
+//! 操作統計は記録器ごとのブロックで出す。本番は共有記録器と oci 専用記録器の 2 つで、1 周期に `op_stats_meta` 行が 2 行出る（共有・oci の順。#2900）。
+//!
 //! # 未実装（REPAIR-3）
 //! - 操作統計の出力先は stderr のみ。メトリクス公開口への接続は #1869 の core 側 proxy の責務
 //! - 監査の永続化経路は Linux 限定（`ControlAuditRelay` が Linux 限定、非 Linux の `FileAuditSink` は #2430 の
@@ -325,11 +327,23 @@ pub fn export_op_stats_to(recorder: &OpRecorder, sink: &LineSink) -> usize {
     }
 }
 
+/// 複数の記録器の操作統計を、記録器ごとのブロック（各ブロックは自分の `op_stats_meta` 行で終わる）として順に `sink` へ渡す。
+/// 積めた行数の合計を返す（共有記録器と oci 専用記録器を分けて持つため。REPAIR-4・#2900）。
+pub fn export_many_to(recorders: &[Arc<OpRecorder>], sink: &LineSink) -> usize {
+    recorders.iter().map(|r| export_op_stats_to(r, sink)).sum()
+}
+
 /// `period` ごとに操作統計を stderr 書き出し口へ渡し続ける（呼び出し側が abort して止める）。
 pub async fn op_stats_export_loop(recorder: Arc<OpRecorder>, period: Duration) {
+    op_stats_export_loop_many(vec![recorder], period).await;
+}
+
+/// [`op_stats_export_loop`] の複数記録器版。1 周期に記録器の数だけブロック（`op_stats_meta` 行も同数）が出る
+/// （本番は共有・oci 専用の順。#2900）。
+pub async fn op_stats_export_loop_many(recorders: Vec<Arc<OpRecorder>>, period: Duration) {
     loop {
         tokio::time::sleep(period).await;
-        export_op_stats_to(&recorder, stderr_sink());
+        export_many_to(&recorders, stderr_sink());
     }
 }
 
@@ -647,5 +661,43 @@ mod tests {
         sink.wait_idle(Duration::from_secs(5));
         let text = String::from_utf8(lock(&buf.0).clone()).unwrap();
         assert!(text.contains("cri.run_pod_sandbox"), "{text}");
+    }
+
+    /// REPAIR-4・#2900: 2 つの記録器は記録器ごとのブロック（データ行 + `op_stats_meta` 行）で、共有・oci の順に出る。
+    #[test]
+    fn op_stats_many_exports_one_block_per_recorder() {
+        let mk = |n: &str| {
+            let r = Arc::new(OpRecorder::new());
+            r.record(
+                &OpName::new(n).unwrap(),
+                OpOutcome::Success,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            r
+        };
+        let recorders = vec![mk("cri.run_pod_sandbox"), mk("oci.layer.extract")];
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                lock(&self.0).extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sink = LineSink::spawn(Box::new(buf.clone()), 16);
+        assert_eq!(export_many_to(&recorders, &sink), 4);
+        sink.wait_idle(Duration::from_secs(5));
+        let text = String::from_utf8(lock(&buf.0).clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines[0].contains("cri.run_pod_sandbox"), "{text}");
+        assert!(lines[1].contains("op_stats_meta"), "{text}");
+        assert!(lines[2].contains("oci.layer.extract"), "{text}");
+        assert!(lines[3].contains("op_stats_meta"), "{text}");
     }
 }

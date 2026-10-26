@@ -50,7 +50,10 @@
 //!   在庫は cri の `InMemoryImageStore`（プロセス内だけ）で、plugin-cri の再起動でタグの対応は失われる
 //!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
 //!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
-//!   （#2241・#2315・#482 が前提）。展開の計装（`OciOpRecorder`）は未配線で何も記録しない。
+//!   （#2241・#2315・#482 が前提）。展開・pull・起動時の回収の計装（`OciOpRecorder`）は `CoreOciRecorder` で
+//!   oci 専用の `OpRecorder`（[`CriPluginBackends::oci_op_recorder`]）へ `oci.*` の名前で記録する（REPAIR-4・#2900）。
+//!   共有記録器は操作名の種類に上限（`MAX_TRACKED_OPS`）があり、pull が枠を取ると `create`・`delete` の記録を捨てさせるため分ける。
+//!   エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため）。
 //!   起動時の残り pull の回収 GC（`ImageStore::recover_stale_pulls`）は `CriPluginBackends::recover_stale_image_pulls` で配線済み（#2819）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
@@ -92,6 +95,8 @@ use fandhe_container_cri::image_service::{ImageStore, InMemoryImageStore};
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 #[cfg(unix)]
+use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
+#[cfg(unix)]
 use fandhe_container_oci::registry::RegistryClientConfig;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::logs::{
@@ -121,6 +126,8 @@ pub struct CriPluginBackends {
     network: Arc<dyn NetworkPlugin>,
     /// 実行層（`oci_runtime`）と CRI サービスが共有する記録器（REPAIR-4）。
     recorder: Arc<OpRecorder>,
+    /// oci の pull・展開・回収の操作統計（`oci.*`）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
+    oci_recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
     /// `ImageService`（`PullImage` の登録先）と本番の `BundleProvider`（`CreateContainer` のタグ解決）が共有する在庫。
@@ -157,6 +164,7 @@ impl CriPluginBackends {
             state,
             network,
             recorder,
+            oci_recorder: Arc::new(OpRecorder::new()),
             state_root: None,
             images: Arc::new(InMemoryImageStore::new()),
         }
@@ -218,7 +226,11 @@ impl CriPluginBackends {
     #[cfg(unix)]
     pub fn production_bundle_provider(&self) -> Result<Arc<dyn BundleProvider>, CriError> {
         match &self.state_root {
-            Some(root) => bundle_provider_with(root, Some(Arc::clone(&self.images))),
+            Some(root) => bundle_provider_with(
+                root,
+                Some(Arc::clone(&self.images)),
+                Some(self.oci_adapter()),
+            ),
             None => Err(CriError::failed_precondition(
                 "state root is not configured",
             )),
@@ -242,12 +254,15 @@ impl CriPluginBackends {
         };
         let pull = production_pull_config(root)?;
         let client = OciRegistryClient::new(&production_registry_config())
-            .map_err(|_| CriError::failed_precondition("failed to prepare the registry client"))?;
+            .map_err(|_| CriError::failed_precondition("failed to prepare the registry client"))?
+            .with_recorder(self.oci_adapter());
         Ok(CriImageService::with_store_and_recorder(
             Arc::clone(&self.images),
             Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))),
         )
-        .with_puller(Arc::new(OciImagePuller::new(client, pull))))
+        .with_puller(Arc::new(
+            OciImagePuller::new(client, pull).with_recorder(self.oci_adapter()),
+        )))
     }
 
     /// 起動時に 1 回、`<state_root>/.cri/images` に残った pull のステージングとリースを回収する（OCI-7・OCI-1。#2819）。
@@ -262,8 +277,9 @@ impl CriPluginBackends {
         };
         let images_root = root.join(IMAGES_DIR);
         let recorder = Arc::clone(&self.recorder);
+        let oci = self.oci_adapter();
         run_startup_pull_recovery(
-            move || recover_stale_image_pulls_in(&images_root, &recorder),
+            move || recover_stale_image_pulls_in(&images_root, &recorder, oci),
             budget,
         )
     }
@@ -294,6 +310,18 @@ impl CriPluginBackends {
     /// （実行層の `create`・`delete` と CRI の各 RPC が同じ記録器へ書く。REPAIR-4）。
     pub fn op_recorder(&self) -> &Arc<OpRecorder> {
         &self.recorder
+    }
+
+    /// oci の pull・展開・起動時の回収の操作統計（`oci.*`）の記録器。共有記録器とは枠を分ける
+    /// （操作名の種類の上限 `MAX_TRACKED_OPS` を pull が使い切って `create`・`delete` の記録を捨てさせないため。REPAIR-4・#2900）。
+    pub fn oci_op_recorder(&self) -> &Arc<OpRecorder> {
+        &self.oci_recorder
+    }
+
+    /// oci の `OciOpRecorder` を [`Self::oci_op_recorder`] へ流す橋渡し（pull・展開・回収の 3 か所へ渡す）。
+    #[cfg(unix)]
+    fn oci_adapter(&self) -> Arc<dyn OciOpRecorder> {
+        Arc::new(CoreOciRecorder(Arc::clone(&self.oci_recorder)))
     }
 
     /// 実行層を接続した `CriRuntimeService` を作る。サーブは `server::serve` が担う（#849）。
@@ -490,16 +518,19 @@ pub enum StartupPullRecovery {
 /// `images_root` の在庫を開いて `recover_stale_pulls` を 1 回呼び、`image_pull_recovery` を記録器へ計上する
 /// （OCI-7・OCI-1・REPAIR-4。#2819）。生存判定は `@pull.lock` の OS ロックで、生きている pull は回収しない。
 /// root は呼び出し側が状態ルート配下の固定位置を渡す（外部入力から受けない）。
+/// `oci` は oci 側の計装（`oci.pull.gc_recover`・`oci.store.lock`）の記録先で、本番は oci 専用の記録器への橋渡しを渡す（#2900）。
 #[cfg(unix)]
 pub fn recover_stale_image_pulls_in(
     images_root: &std::path::Path,
     recorder: &OpRecorder,
+    oci: Arc<dyn OciOpRecorder>,
 ) -> Result<
     fandhe_container_oci::image_management::StalePullRecovery,
     fandhe_container_oci::error::OciError,
 > {
     let started = Instant::now();
     let r = fandhe_container_oci::image_management::ImageStore::open(images_root)
+        .map(|store| store.with_recorder(oci))
         .and_then(|store| store.recover_stale_pulls());
     if let Ok(name) = OpName::new("image_pull_recovery") {
         let ok = matches!(&r, Ok(v) if v.failed().is_empty());
@@ -702,6 +733,69 @@ impl fandhe_container_net::instrument::NetOpRecorder for CoreNetRecorder {
         };
         let outcome = match sample.outcome() {
             NetOpOutcome::Success => OpOutcome::Success,
+            _ => OpOutcome::Failure,
+        };
+        let _ = self.0.record(&name, outcome, sample.latency());
+    }
+}
+
+/// oci の計測結果を oci 専用の `OpRecorder` へ流す橋渡し（操作名は `OciOpKind::as_str` と同じ固定 22 種。REPAIR-4・OCI-1・#2900）。
+///
+/// 呼び出し元は `CriPluginBackends` の pull（`OciImagePuller`・`OciRegistryClient`）・展開（`ImageRootfsSource`）・
+/// 起動時の回収（`recover_stale_image_pulls_in`）。`OciOpKind` は `#[non_exhaustive]` のため未知の種別は記録しない
+/// （名前の種類数を有界に保つ。追加時はここと試験を足す）。エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため。
+/// 分類は oci のエラー応答と構造化ログに残る）。記録の失敗は無視し、操作の結果は変えない。
+#[cfg(unix)]
+struct CoreOciRecorder(Arc<OpRecorder>);
+
+#[cfg(unix)]
+impl fmt::Debug for CoreOciRecorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreOciRecorder").finish_non_exhaustive()
+    }
+}
+
+/// `OciOpKind` から操作名への写像（22 種。未知の種別は `None`）。
+#[cfg(unix)]
+fn oci_op_name(kind: OciOpKind) -> Option<&'static str> {
+    Some(match kind {
+        OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
+        OciOpKind::AuthenticateBasic => "oci.auth.basic",
+        OciOpKind::AuthenticateBearer => "oci.auth.bearer",
+        OciOpKind::Authenticate => "oci.auth",
+        OciOpKind::FetchManifest => "oci.manifest.fetch",
+        OciOpKind::FetchBlob => "oci.blob.fetch",
+        OciOpKind::VerifyBlobDigest => "oci.blob.verify",
+        OciOpKind::DecompressLayer => "oci.layer.decompress",
+        OciOpKind::ExtractLayer => "oci.layer.extract",
+        OciOpKind::ListImages => "oci.image.list",
+        OciOpKind::DiskUsage => "oci.image.df",
+        OciOpKind::RemoveImage => "oci.image.rm",
+        OciOpKind::AcquireImageStoreLock => "oci.store.lock",
+        OciOpKind::BeginPull => "oci.pull.begin",
+        OciOpKind::LeaseBlob => "oci.pull.lease",
+        OciOpKind::ReleaseBlobLease => "oci.pull.release",
+        OciOpKind::PublishPull => "oci.pull.publish",
+        OciOpKind::AbortPull => "oci.pull.abort",
+        OciOpKind::PruneImages => "oci.image.prune",
+        OciOpKind::TagImage => "oci.image.tag",
+        OciOpKind::RecoverPendingDeletion => "oci.image.gc_recover",
+        OciOpKind::RecoverStalePulls => "oci.pull.gc_recover",
+        _ => return None,
+    })
+}
+
+#[cfg(unix)]
+impl OciOpRecorder for CoreOciRecorder {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        let Some(raw) = oci_op_name(sample.kind()) else {
+            return;
+        };
+        let Ok(name) = OpName::new(raw) else {
+            return;
+        };
+        let outcome = match sample.outcome() {
+            OciOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
         let _ = self.0.record(&name, outcome, sample.latency());
@@ -1148,17 +1242,19 @@ const IMAGES_DIR: &str = ".cri/images";
 pub fn bundle_provider_in(
     state_root: &std::path::Path,
 ) -> Result<Arc<dyn BundleProvider>, CriError> {
-    bundle_provider_with(state_root, None)
+    bundle_provider_with(state_root, None, None)
 }
 
 /// [`bundle_provider_in`] に、タグ・digest 参照を image ID へ解決する在庫 `store` を足した形（CRI-2・CRI-3。#2592）。
 ///
 /// `store` は `ImageService` と同じものを渡す。`None` なら image ID（`sha256:<hex>`）だけを受ける。展開設定は
 /// `production_pull_config`（`ImageService` の pull と同じ値）から `ImageExtractConfig::from_pull_config` で作る。
+/// `recorder` が `Some` なら展開の計装（`oci.layer.extract` 等）をそこへ渡す（REPAIR-4・#2900）。
 #[cfg(unix)]
 pub fn bundle_provider_with(
     state_root: &std::path::Path,
     store: Option<Arc<dyn ImageStore>>,
+    recorder: Option<Arc<dyn OciOpRecorder>>,
 ) -> Result<Arc<dyn BundleProvider>, CriError> {
     use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
@@ -1190,6 +1286,9 @@ pub fn bundle_provider_with(
     let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
     if let Some(store) = store {
         source = source.with_image_store(store);
+    }
+    if let Some(recorder) = recorder {
+        source = source.with_recorder(recorder);
     }
     Ok(Arc::new(SpecBundleProvider::new(
         bundles,
@@ -1522,6 +1621,107 @@ mod tests {
             .snapshot_op(&OpName::new("cri.create_container").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// 22 種すべての `OciOpKind` の名前（REPAIR-4・OCI-1・#2900 の写像の固定用）。
+    #[cfg(unix)]
+    fn all_oci_kinds() -> [(OciOpKind, &'static str); 22] {
+        [
+            (OciOpKind::AuthenticateAnonymous, "oci.auth.anonymous"),
+            (OciOpKind::AuthenticateBasic, "oci.auth.basic"),
+            (OciOpKind::AuthenticateBearer, "oci.auth.bearer"),
+            (OciOpKind::Authenticate, "oci.auth"),
+            (OciOpKind::FetchManifest, "oci.manifest.fetch"),
+            (OciOpKind::FetchBlob, "oci.blob.fetch"),
+            (OciOpKind::VerifyBlobDigest, "oci.blob.verify"),
+            (OciOpKind::DecompressLayer, "oci.layer.decompress"),
+            (OciOpKind::ExtractLayer, "oci.layer.extract"),
+            (OciOpKind::ListImages, "oci.image.list"),
+            (OciOpKind::DiskUsage, "oci.image.df"),
+            (OciOpKind::RemoveImage, "oci.image.rm"),
+            (OciOpKind::AcquireImageStoreLock, "oci.store.lock"),
+            (OciOpKind::BeginPull, "oci.pull.begin"),
+            (OciOpKind::LeaseBlob, "oci.pull.lease"),
+            (OciOpKind::ReleaseBlobLease, "oci.pull.release"),
+            (OciOpKind::PublishPull, "oci.pull.publish"),
+            (OciOpKind::AbortPull, "oci.pull.abort"),
+            (OciOpKind::PruneImages, "oci.image.prune"),
+            (OciOpKind::TagImage, "oci.image.tag"),
+            (OciOpKind::RecoverPendingDeletion, "oci.image.gc_recover"),
+            (OciOpKind::RecoverStalePulls, "oci.pull.gc_recover"),
+        ]
+    }
+
+    /// REPAIR-4・OCI-1: 写像の名前は 22 種で重複なく、`as_str` と一致し、`OpName` として有効で、記録器の枠に収まる。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_op_names_are_valid_and_bounded() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (kind, expected) in all_oci_kinds() {
+            assert_eq!(oci_op_name(kind), Some(expected));
+            assert_eq!(kind.as_str(), expected);
+            assert!(OpName::new(expected).is_ok(), "{expected}");
+            seen.insert(expected);
+        }
+        assert_eq!(seen.len(), 22);
+        const { assert!(22 <= fandhe_container_core::observability::MAX_TRACKED_OPS) };
+    }
+
+    /// REPAIR-4・OCI-1: 成功と失敗が操作名ごとに具体値で計上され、エラー code は名前に混ざらない。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_adapter_maps_success_and_failure() {
+        use fandhe_container_oci::error::OciErrorCode;
+        let rec = Arc::new(OpRecorder::new());
+        let bridge = CoreOciRecorder(Arc::clone(&rec));
+        bridge.record_oci_op(&OciOpSample::new(
+            OciOpKind::ExtractLayer,
+            OciOpOutcome::Success,
+            None,
+            Duration::from_millis(5),
+        ));
+        bridge.record_oci_op(&OciOpSample::new(
+            OciOpKind::PublishPull,
+            OciOpOutcome::Failure,
+            Some(OciErrorCode::Timeout),
+            Duration::from_millis(7),
+        ));
+        let get = |n: &str| {
+            rec.snapshot_op(&OpName::new(n).expect("name"))
+                .expect("recorded")
+        };
+        let ex = get("oci.layer.extract");
+        assert_eq!((ex.success(), ex.failure()), (1, 0));
+        let pu = get("oci.pull.publish");
+        assert_eq!((pu.success(), pu.failure()), (0, 1));
+        assert_eq!(rec.snapshot().len(), 2);
+        assert_eq!(rec.dropped_records(), 0);
+    }
+
+    /// REPAIR-4・#2900: oci の記録は専用記録器へ入り、共有記録器の枠を使わない。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_recorder_is_separate_from_shared() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let shared = Arc::new(OpRecorder::new());
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::clone(&shared),
+        ));
+        let backends =
+            CriPluginBackends::with_recorder(rt, store, Arc::new(UnimplementedNetwork), shared);
+        backends.oci_adapter().record_oci_op(&OciOpSample::new(
+            OciOpKind::FetchBlob,
+            OciOpOutcome::Success,
+            None,
+            Duration::from_millis(1),
+        ));
+        assert!(backends.op_recorder().snapshot().is_empty());
+        let s = backends
+            .oci_op_recorder()
+            .snapshot_op(&OpName::new("oci.blob.fetch").expect("name"))
+            .expect("recorded");
+        assert_eq!((s.success(), s.failure()), (1, 0));
     }
 
     /// SEC-4・REPAIR-4（#2594）: 記録の失敗は固定語彙の 1 行にだけ出し、結果（`code`）は内側のまま返す。成功では何も出さない。

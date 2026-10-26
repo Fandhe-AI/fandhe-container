@@ -31,7 +31,8 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! ルール本体（NEWRULE）は `nftables_rules` が担当する（TASK-138.1・TASK-138.2）。NEWRULE の
-//! `NLM_F_ECHO` 応答からのルールハンドル取得は `ack` が担う（NET-3・#2839。GETRULE dump は未実装）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
+//! `NLM_F_ECHO` 応答からのルールハンドル取得と、echo の family・テーブル名・チェイン名の照合は `ack` が担う
+//! （NET-3・SEC-1・#2839・#2905。GETRULE dump は未実装）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
 //! （#306）は実装済みだが、`SO_SNDBUF` / `SO_RCVBUF` の調整・extended ACK・`NFTA_GEN_ID` は未実装（`socket` の doc）。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
@@ -52,9 +53,9 @@ pub use table_chain::*;
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{
     MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_ECHO, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder,
-    NlMsgHeader,
+    NlMsgHeader, NlMsgIter,
 };
-use crate::nftables_rules::NFT_MSG_NEWRULE;
+use crate::nftables_rules::{NFT_MSG_NEWRULE, rule_table_chain_attrs};
 
 /// バッチがカーネルに適用されたかどうか（OS 非依存。`network` の判定でも使うため ack から切り出した。呼び出し側が再照会の要否を判断する材料）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,8 +221,35 @@ pub struct NftBatch {
     begin_seq: u32,
     next_seq: u32,
     body_seqs: Vec<u32>,
-    /// 本体ごとの echo 要求（`NLM_F_ECHO`。`body_seqs` と同じ添字）。
-    body_echo: Vec<bool>,
+    /// 本体ごとの echo 要求（`NLM_F_ECHO`。`body_seqs` と同じ添字）と、積んだ要求から取った照合用の期待値。
+    body_echo: Vec<Option<RuleEchoExpect>>,
+}
+
+/// echo 付き NEWRULE の要求から取った、echo 応答の照合用の期待値（NET-3・SEC-1・#2905）。
+///
+/// 呼び出し側が別に渡す値ではなく、`NftBatch::push_with` が実際に積むバイト列から取り出す
+/// （送ったものと比べる値がずれない）。フィールドは非公開で、作れるのは `push_with` だけ。
+/// 保持量は積んだバイト列の部分コピーなのでバッチ長の上限で有界。名前は NUL 込みの生バイト列。
+// 読み手は Linux 限定の ack だけ（他 OS では未使用になるため dead_code を許す）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleEchoExpect {
+    family: u8,
+    table: Vec<u8>,
+    chain: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl RuleEchoExpect {
+    pub(crate) fn family(&self) -> u8 {
+        self.family
+    }
+    pub(crate) fn table(&self) -> &[u8] {
+        &self.table
+    }
+    pub(crate) fn chain(&self) -> &[u8] {
+        &self.chain
+    }
 }
 
 /// 閉じたバッチ。#306 が送信と seq 照合に使う。
@@ -231,7 +259,7 @@ pub struct NftBatchBytes {
     begin_seq: u32,
     end_seq: u32,
     body_seqs: Vec<u32>,
-    body_echo: Vec<bool>,
+    body_echo: Vec<Option<RuleEchoExpect>>,
 }
 
 impl NftBatchBytes {
@@ -258,7 +286,13 @@ impl NftBatchBytes {
     /// `index` 番目の本体が echo 応答（`NLM_F_ECHO`。NEWRULE のルールハンドル取得）を要求しているか。
     /// 範囲外は `false`（NET-3・#2839）。
     pub fn body_echo(&self, index: usize) -> bool {
-        self.body_echo.get(index).copied().unwrap_or(false)
+        self.body_echo.get(index).is_some_and(Option::is_some)
+    }
+
+    /// `index` 番目の本体の echo 照合用の期待値（echo 未要求・範囲外は `None`）。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn body_echo_expect(&self, index: usize) -> Option<&RuleEchoExpect> {
+        self.body_echo.get(index).and_then(Option::as_ref)
     }
 }
 
@@ -275,6 +309,8 @@ impl NftBatch {
     }
 
     /// 次の seq を `f` に渡して本体メッセージを組み立てさせ、検証のうえ追記する。
+    /// echo 付き NEWRULE は、積むバイト列から family・テーブル名・チェイン名を取って echo 照合の期待値として
+    /// 記録する（`RuleEchoExpect`。取れない形は `InvalidArgument`。NET-3・SEC-1・#2905）。
     /// 失敗時はバッファも seq も変えない。戻り値は割り当てた seq。
     pub fn push_with(
         &mut self,
@@ -322,6 +358,24 @@ impl NftBatch {
         if !is_known_nfproto(nfg.family()) {
             return Err(invalid(format!("unknown nfproto family {}", nfg.family())));
         }
+        // echo 付き NEWRULE は、応答の照合に使う family・テーブル名・チェイン名を、積むバイト列から
+        // 取る。取れない形（名前の欠落・重複等）は echo を照合できないため積む前に拒否する（SEC-1・#2905）。
+        let echo_expect = if echo {
+            let attrs = NlMsgIter::new(&msg)
+                .next()
+                .and_then(Result::ok)
+                .ok_or_else(|| invalid("message cannot be re-parsed"))?
+                .attrs(NFGENMSG_LEN)?;
+            let (table, chain) = rule_table_chain_attrs(attrs)
+                .map_err(|m| invalid(format!("NLM_F_ECHO NEWRULE: {m}")))?;
+            Some(RuleEchoExpect {
+                family: nfg.family(),
+                table,
+                chain,
+            })
+        } else {
+            None
+        };
         // 末尾に積む END の分を常に残して上限判定する。
         let total = self
             .buf
@@ -334,7 +388,7 @@ impl NftBatch {
         }
         self.buf.extend_from_slice(&msg);
         self.body_seqs.push(seq);
-        self.body_echo.push(echo);
+        self.body_echo.push(echo_expect);
         self.next_seq = seq.wrapping_add(1);
         Ok(seq)
     }
@@ -360,7 +414,6 @@ impl NftBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netlink::NlMsgIter;
 
     const NEWTABLE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, 0);
 
@@ -470,6 +523,10 @@ mod tests {
             move |seq: u32| {
                 let mut b = NlMsgBuilder::new(ty, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
                 NfGenMsg::new(NFPROTO_IPV4, 0).put_into(&mut b)?;
+                if ty == newrule {
+                    b.put_attr(1, b"t\0")?;
+                    b.put_attr(2, b"c\0")?;
+                }
                 Ok(b)
             }
         };
@@ -485,6 +542,48 @@ mod tests {
         assert_eq!(
             (out.body_echo(0), out.body_echo(1), out.body_echo(2)),
             (false, true, false)
+        );
+    }
+
+    /// NET-3・SEC-1・#2905: echo 付き NEWRULE の期待値は積んだバイト列から取り、取れない形は
+    /// `InvalidArgument` で拒否してバッファも seq も変えない。
+    #[test]
+    fn net3_echo_expect_is_taken_from_pushed_bytes_and_bad_shapes_rejected() {
+        use crate::nftables_rules::NFT_MSG_NEWRULE;
+        let newrule = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        let make = |attrs: Vec<(u16, &'static [u8])>| {
+            move |seq: u32| {
+                let mut b =
+                    NlMsgBuilder::new(newrule, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
+                NfGenMsg::new(NFPROTO_INET, 0).put_into(&mut b)?;
+                for (t, p) in attrs {
+                    b.put_attr(t, p)?;
+                }
+                Ok(b)
+            }
+        };
+        let mut b = NftBatch::new(0).unwrap();
+        for bad in [
+            vec![(2u16, &b"c\0"[..])],
+            vec![(1, &b"t\0"[..])],
+            vec![(1, &b"t\0"[..]), (1, &b"t\0"[..]), (2, &b"c\0"[..])],
+            vec![(1, &b"t"[..]), (2, &b"c\0"[..])],
+        ] {
+            let before = (b.buf.len(), b.next_seq);
+            let e = b.push_with(make(bad)).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            assert_eq!((b.buf.len(), b.next_seq), before);
+        }
+        assert_eq!(
+            b.push_with(make(vec![(1, &b"t\0"[..]), (2, &b"c\0"[..])]))
+                .unwrap(),
+            1
+        );
+        let out = b.finish().unwrap();
+        let e = out.body_echo_expect(0).unwrap();
+        assert_eq!(
+            (e.family(), e.table(), e.chain()),
+            (NFPROTO_INET, &b"t\0"[..], &b"c\0"[..])
         );
     }
 

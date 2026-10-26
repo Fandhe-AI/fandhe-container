@@ -115,7 +115,9 @@ impl RuleCreate {
     ///
     /// カーネルは追加したルールを NEWRULE の応答（echo）として送り元へ返し、そのペイロードに採番した
     /// `NFTA_RULE_HANDLE` が入る。バッチ層（`NftBatch::push_with`）は echo 付きの本体を記録し、
-    /// ACK 判定（`NftBatchAck::rule_handle`）が応答からハンドルを取り出す。ハンドルを必要としない
+    /// ACK 判定（`NftBatchAck::rule_handle`）が応答からハンドルを取り出す。バッチ層は積んだ要求の
+    /// family・テーブル名・チェイン名を期待値として持ち、echo の同項目と一致しなければ拒否する（SEC-1・#2905）。
+    /// ハンドルを必要としない
     /// 呼び出し元は `build` を使う（既定は変えない）。
     pub fn build_echo(&self, seq: u32) -> Result<NlMsgBuilder, NetError> {
         let mut b =
@@ -171,6 +173,45 @@ impl NftRuleHandle {
         }
         let v = found.ok_or_else(|| loss("rule handle attribute is missing"))?;
         Self::new(v).map_err(|_| loss("rule handle is zero"))
+    }
+}
+
+/// NEWRULE ペイロードの属性列から、所属テーブル名（`NFTA_RULE_TABLE`）とチェイン名
+/// （`NFTA_RULE_CHAIN`）の生バイト列（末尾の NUL 込み）をちょうど 1 件ずつ取り出す純デコーダ
+/// （NET-3・SEC-1・#2905）。
+///
+/// バッチ層が 2 箇所で共有する: 積む時点（`NftBatch::push_with`。自分で組み立てた要求から echo の期待値を
+/// 取る。エラーは `InvalidArgument` に写す）と、echo の受信時（`NftBatchAckCollector`。カーネル応答を
+/// 期待値と突き合わせる。エラーは `DataLoss` に写す）。欠落・重複・ネスト・`NLA_F_NET_BYTEORDER` 付き・
+/// 末尾がちょうど 1 つの NUL でないもの（NUL なし・途中に NUL）は `Err`。他の属性は読み飛ばす。
+/// エラーは固定文字列で、名前の値は含めない。
+pub(crate) fn rule_table_chain_attrs(
+    attrs: AttrIter<'_>,
+) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    let mut table: Option<Vec<u8>> = None;
+    let mut chain: Option<Vec<u8>> = None;
+    for a in attrs {
+        let a = a.map_err(|_| "malformed rule attribute")?;
+        let slot = match a.attr_type() {
+            NFTA_RULE_TABLE => &mut table,
+            NFTA_RULE_CHAIN => &mut chain,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err("duplicate table or chain attribute");
+        }
+        if a.is_nested() || a.is_net_byteorder() {
+            return Err("table or chain attribute has unexpected flags");
+        }
+        let p = a.payload();
+        match p.split_last() {
+            Some((0, name)) if !name.contains(&0) => *slot = Some(p.to_vec()),
+            _ => return Err("table or chain name is not a single NUL-terminated string"),
+        }
+    }
+    match (table, chain) {
+        (Some(t), Some(c)) => Ok((t, c)),
+        _ => Err("table or chain attribute is missing"),
     }
 }
 

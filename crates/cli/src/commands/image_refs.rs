@@ -24,7 +24,14 @@
 //! 使用中で拒否したとき）。未確定参照の回収の前提「進行中の create が無いこと」は、oci の create ゲート
 //! （`ImageStore::quiesce_container_creates`）で保証する。イメージつき create は `create_with_image` の呼び出し全体を
 //! ゲートの共有（`ImageStore::enter_container_create`）で包む。本アダプタをゲートなしで `create_with_image` に渡す新しい
-//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。参照キーの形式（`ref_key`・`state_scope`）は変えない。
+//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。
+//!
+//! # 参照キーの形式と旧形式の扱い（#2500）
+//!
+//! `state_scope` と `ref_key` の畳み込みは SHA-256 にした（旧: 非暗号の FNV-1a 64 を 2 本）。旧形式のキーは移行しない。
+//! 本番では在庫を埋める経路が無く `register` が常に `NOT_FOUND` のため、本番のストアにコンテナ参照は無い。
+//! 開発・試験環境に旧キーが残った場合、新コードから見て別の状態ルートのキーになり、delete は外さず契機 B は回収しない
+//! （守りすぎの側に倒れる）。回復は、そのストアの `@container-refs.json` を消すかストアを作り直す。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
@@ -142,14 +149,14 @@ pub(super) fn resolve_create_image(
 ///
 /// イメージストアは状態ルートをまたいで共有できる（`--root` と `--image-root` は独立）。参照キーが
 /// `ContainerId` だけだと、別の状態ルートの同名コンテナの delete が他方の参照を外してしまう（OCI-7 の
-/// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスから決定的な 32 桁の小文字 hex
-/// （FNV-1a 64 を異なる初期値で 2 本。暗号学的ハッシュではなく、同一利用者の状態ルート同士の区別用）
-/// を作り、キーを `<hex>.<id>` にする。
+/// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスの SHA-256 の先頭 32 桁（128 bit の
+/// 小文字 hex）を作り、キーを `<hex>.<id>` にする。入力は利用者が選ぶパスで、脅威は他人の scope への
+/// 第 2 原像のため 128 bit で足りる（core の `scope_of` と同じ切り詰め。#2500・REPAIR-12）。
 ///
 /// 入力は「開いた状態ストアの `host_state_root()`」（`FileStateStore::open` が親の symlink を解決して固定した
 /// 正規パス）で、`--root` の表記（`//`・末尾 `/`・祖先の symlink）が create と delete で違っても同じ scope になる
 /// （#2499 P2-2）。字面だけを畳んで存在しないパスを許す経路は作らない。大文字小文字を区別しない FS の同一視は
-/// 範囲外（ローカル経路は Linux のみ）。ハッシュ関数そのものは #2500 の担当。
+/// 範囲外（ローカル経路は Linux のみ）。
 pub(super) fn state_scope(store: &dyn StateStore) -> Result<String, TraitError> {
     let root = store
         .host_state_root()
@@ -208,18 +215,17 @@ pub(super) fn attach_image_root(
     Ok(req.clone().with_annotations(annotations))
 }
 
-/// 32 桁の小文字 hex（FNV-1a 64 を異なる初期値で 2 本）。
+/// パスのバイト列から scope の 32 桁 hex を作る（[`state_scope`]・[`legacy_scope`] で共有）。
 fn state_hash(bytes: &[u8]) -> String {
-    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
-        bytes.iter().fold(seed, |h, b| {
-            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
-    format!(
-        "{:016x}{:016x}",
-        fnv1a(0xcbf2_9ce4_8422_2325, bytes),
-        fnv1a(0x8422_2325_cbf2_9ce4, bytes)
-    )
+    let full = sha256_hex(bytes);
+    full.get(..32).map_or_else(|| full.clone(), str::to_owned)
+}
+
+/// SHA-256 の小文字 hex 64 桁。oci の `Digest::sha256_of`（`sha256:` + 64 桁の不変条件）を使う。
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Digest::sha256_of(bytes);
+    let s = digest.as_str();
+    s.strip_prefix("sha256:").unwrap_or(s).to_owned()
 }
 
 /// `ImageStore` を借りて `ContainerImageRefs` を満たすアダプタ。参照キーは状態ルートごとに分ける。
@@ -245,14 +251,15 @@ const REF_KEY_MAX: usize = 255;
 /// 状態ルートの `scope` とコンテナ ID から参照キーを作る（create / delete / 停止中スナップショットで共有）。
 ///
 /// 通常は `<scope>.<id>`。接頭辞を足すと 255 バイトを超える長い ID（223 バイト以上）は
-/// `<scope>-<id の 32 桁 hex>` に畳む。区切りが `.` と `-` で違うため、通常形と畳んだ形は衝突しない。
+/// `<scope>-<id の SHA-256 の 64 桁 hex>`（256 bit。ID は攻撃者が選べる入力のため衝突耐性 2^128 を取る。
+/// 非暗号の FNV からの置き換え。#2500・OCI-7）に畳む。区切りが `.` と `-` で違うため、通常形と畳んだ形は衝突しない。
 /// 結果は常に `[A-Za-z0-9._-]` かつ 255 バイト以下で、変換は失敗しない。
 pub(super) fn ref_key(scope: &str, id: &str) -> String {
     let plain = format!("{scope}.{id}");
     if plain.len() <= REF_KEY_MAX {
         return plain;
     }
-    format!("{scope}-{}", state_hash(id.as_bytes()))
+    format!("{scope}-{}", sha256_hex(id.as_bytes()))
 }
 
 fn fail(e: OciError) -> TraitError {
@@ -669,6 +676,88 @@ mod tests {
         .expect("req");
         let e = attach_image_root(&base, &store).expect_err("too large");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: 畳んだ参照キーは SHA-256 の具体値と一致する。
+    #[test]
+    fn oci7_ref_key_sha256_known_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            ref_key(SCOPE, &"a".repeat(255)),
+            format!("{SCOPE}-b0f3323e7a3cad8ae6778340cc2a17ae0cb31c818df3767cda7c3dd423725e90")
+        );
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: scope は状態ルートのパスの SHA-256 の先頭 32 桁。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_is_sha256_prefix() {
+        let tmp = Tmp::new("scope");
+        let path = tmp.path().join("state");
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert_eq!(state_hash(bytes), sha256_hex(bytes)[..32]);
+        assert_eq!(state_hash(b"/x/state"), "165fe1065cc95b4bb8e93c5a50ba3276");
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: キーは常に `[A-Za-z0-9._-]` かつ 255 バイト以下。
+    #[test]
+    fn oci7_ref_key_charset_and_length() {
+        for len in [1usize, 222, 223, 254, 255] {
+            let id = "a".repeat(len);
+            let k = ref_key(SCOPE, &id);
+            assert!(k.len() <= 255, "{len}");
+            assert!(
+                k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                "{len}"
+            );
+            if len <= 222 {
+                assert_eq!(k, format!("{SCOPE}.{id}"));
+            } else {
+                assert!(k.starts_with(&format!("{SCOPE}-")), "{len}");
+                let h = &k[SCOPE.len() + 1..];
+                assert_eq!(h.len(), 64);
+                assert!(h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+                assert_eq!(k.len(), 97);
+            }
+        }
+    }
+
+    /// OCI-7・REPAIR-12（#2500・P2-3）: 長い別 ID の release / release_if は他方の確定済み参照を外さない。
+    #[test]
+    fn oci7_long_id_delete_does_not_release_other() {
+        let tmp = Tmp::new("longdel");
+        let store = seeded(tmp.path(), &[MANIFEST]);
+        let refs = StoreImageRefs::new(&store, SCOPE);
+        let base = |n: usize| "a".repeat(n);
+        let pairs = [
+            (format!("{}x", base(222)), format!("{}y", base(222))),
+            (format!("{}x", base(253)), format!("{}y", base(253))),
+            (format!("{}x", base(254)), format!("{}y", base(254))),
+            (format!("{}xy", base(221)), format!("{}yx", base(221))),
+            (base(223), base(224)),
+        ];
+        for (x, y) in pairs {
+            let (a, b) = (cid(&x), cid(&y));
+            refs.register(&a, &mdigest(MANIFEST)).expect("reg a");
+            let ga = refs.bind(&a).expect("bind a");
+            refs.register(&b, &mdigest(MANIFEST)).expect("reg b");
+            let gb = refs.bind(&b).expect("bind b");
+            assert_eq!(
+                refs.release(&b).expect("release b"),
+                ImageRefRelease::Released
+            );
+            assert_eq!(refs.registration(&a).expect("a"), Some(ga));
+            assert_eq!(refs.registration(&b).expect("b"), None);
+            let _ = gb;
+            assert_eq!(
+                refs.release(&a).expect("release a"),
+                ImageRefRelease::Released
+            );
+        }
     }
 
     /// REPAIR-4・OCI-7: エラーの message は固定文言だけで、ID・パスを含まない。

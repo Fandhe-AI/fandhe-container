@@ -56,9 +56,9 @@
 //!   観測しても exec 後の PID 1 と同じ結果になる。exec 経路は Landlock が必須で `EACCES` の発生源が増えるため、
 //!   Landlock を載せない fork 子のほうが拒否の理由を識別しやすい
 //! - 移せない事情: exec 経路の試験用入口（`spawn_container_with_stages_and_devices`）は `devices` しか渡せず、
-//!   `config_paths` / `sysfs` を受け取らない。本試験は `platform-ci` の `--ignored` 対象でもなく、移行後の観測を CI で
-//!   確かめる手段が無い
-//! - 移す条件（後続）: `config_paths` / `sysfs` を受け取る exec 経路の入口と `platform-ci` への登録を同じ変更で入れる
+//!   `config_paths` / `sysfs` を受け取らない。本試験は #2533 で `platform-ci`（ubuntu）の `--ignored` 対象に
+//!   登録済みで、fork 子での観測は CI で継続して確かめられる
+//! - 移す条件（後続）: `config_paths` / `sysfs` を受け取る exec 経路の入口を足すときは、`platform-ci` の成功行の照合も同じ変更で更新する
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

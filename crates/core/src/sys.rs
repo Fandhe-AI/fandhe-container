@@ -6716,21 +6716,15 @@ mod tests {
         let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
         assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
 
-        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。5 列目は 8 進エスケープを
-        // 戻してから比べる（`TMPDIR` が空白等を含んでも見落とさない。`is_mount_point` と同じ扱い）。
+        // mountinfo: 返された fd の mount ID（fdinfo の `mnt_id`）で行を引き、fstype devpts・nosuid・noexec で現れ、
+        // nodev は付かないことを確かめる。マウントポイントの文字列で引くと、同じ点に別のマウントが重なる環境で
+        // 下側の行を拾いうる（#2823・SEC-1）。
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-        let dir_bytes = {
-            use std::os::unix::ffi::OsStrExt as _;
-            dir.as_os_str().as_bytes().to_vec()
-        };
+        let mnt_id = crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(mnt.as_fd()).unwrap();
         let line = mountinfo
             .lines()
-            .find(|l| {
-                l.split(' ')
-                    .nth(4)
-                    .is_some_and(|f| unescape_mountinfo_field(f.as_bytes()) == dir_bytes)
-            })
-            .expect("mountinfo entry for the target");
+            .find(|l| l.split(' ').next().and_then(|f| f.parse::<u64>().ok()) == Some(mnt_id))
+            .expect("mountinfo entry for the mount");
         let (pre, post) = line.split_once(" - ").unwrap();
         let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();
         assert!(

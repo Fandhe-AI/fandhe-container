@@ -14,7 +14,8 @@
 //! | `net-create` | `create_network` | `network::create_network` と `StaticIpam::for_network` |
 //! | `netns-create` | `create_netns` | `network::create_container_netns`（netns の作成と pin。#2675） |
 //! | `veth-attach` | `attach` | `network::attach_prepared_container`（事前作成の netns へ接続） |
-//! | `publish-port` | `publish_port` | `network::publish_container_ports`（attach 済みコンテナへ DNAT を追加。#2676） |
+//! | `publish-port` | `publish_port` | `network::publish_container_ports`（attach 済みコンテナへ DNAT を追加。#2676）。投入ルールのハンドル（echo 応答。#2839）はネットワークのハンドルに保持する |
+//! | （なし） | `unpublish_port` | `network::unpublish_container_port`（保持したハンドルで DNAT 2 件を個別に削除し、予約を戻す。#2839・NET-3） |
 //! | （なし） | `detach` | 未 attach の記録の取り消しと事前作成 netns の解放（`network::release_container_netns`）、attach の取り残しの回収（`network::reclaim_failed_attach`）。attach 済みは `Unimplemented` |
 //! | `net-delete` | `delete_network` | `network::delete_network` |
 //!
@@ -54,7 +55,13 @@
 //! - `publish_port`（#2676・NET-4）: attach 済みコンテナへ DNAT を追加する。ホスト側 bind IP（`host_ip`）は
 //!   明示した IPv4 だけ受け、未指定・IPv6 は `Unimplemented`（全アドレスへの公開を黙って作らない）。契約 11 は
 //!   全ネットワーク共通の `(host_port, protocol)` で本層が判定する（net の予約表はネットワークごとのため）。
-//!   公開の個別解除は無く、`delete_network` が一括で解放する。他プロセスとの受け口の衝突は検出しない
+//!   公開 1 件の個別解除は `unpublish_port`（#2839・NET-3。net の `unpublish_container_port`）で行える。ただし
+//!   **CRI の経路は個別解除を呼ばない**: `port_mappings` は sandbox 単位で RunPodSandbox 以降変わらず、
+//!   `StopPodSandbox` / `RemovePodSandbox` は pod 専用ネットワークを `delete_network` で一括解放するため、
+//!   `delete_network` 以外の解除の契機は現状要らない。将来の候補は `set_up_sandbox` の公開途中の失敗の巻き戻しと、
+//!   attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）で、いずれも `NetworkPlugin` トレイトへの
+//!   `unpublish_port` 追加（PLUG-1 の拡張点の変更）を伴うため main の設計を経る後続事項とする。保持したハンドルは
+//!   プロセスのメモリ上だけで、再起動後は `delete_network` の一括解放に頼る。他プロセスとの受け口の衝突は検出しない
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
 //!   併用できないため `Unimplemented`（契約 10。カーネル操作の前に判定する）
@@ -434,6 +441,26 @@ pub trait NetsetupBackend: Send + Sync {
             error: TraitError::new(
                 ErrorCode::Unimplemented,
                 "publish_port is not supported by this backend",
+            ),
+            rules_unknown: false,
+        })
+    }
+
+    /// 公開済みの受け口 1 件を個別に解除する（DNAT ルールの削除と受け口の予約の解放。NET-3・#2839）。
+    /// 既定は `Unimplemented`（未対応のバックエンドが成功を装わないため）。
+    ///
+    /// 結果が不明なら `rules_unknown` を立てて返す。呼び出し側は受け口の記録を保持し、解放は `delete_network` に
+    /// 任せる（`publish_port` と同じ）。`NetworkPlugin` トレイトには出していない（PLUG-1 の拡張は後続事項）。
+    fn unpublish_port(
+        &self,
+        _network: &mut Self::Network,
+        _container: &Self::Container,
+        _publish: &PortPublish,
+    ) -> Result<(), PublishFailure> {
+        Err(PublishFailure {
+            error: TraitError::new(
+                ErrorCode::Unimplemented,
+                "unpublish_port is not supported by this backend",
             ),
             rules_unknown: false,
         })
@@ -1549,10 +1576,10 @@ mod linux {
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
         AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedAttachClaim,
-        FailedCreateClaim, NetworkCreateSpec, PortRegistry, PreparedNetns, StaticIpam,
-        attach_prepared_container, create_container_netns, create_network, delete_network,
-        publish_container_ports, reclaim_failed_attach, reclaim_failed_create,
-        release_container_netns,
+        FailedCreateClaim, NetworkCreateSpec, PortRegistry, PreparedNetns, PublishedPort,
+        StaticIpam, UnpublishRules, attach_prepared_container, create_container_netns,
+        create_network, delete_network, publish_container_ports, reclaim_failed_attach,
+        reclaim_failed_create, release_container_netns, unpublish_container_port,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -1572,6 +1599,9 @@ mod linux {
         created: CreatedNetwork,
         ipam: StaticIpam,
         ports: PortRegistry,
+        /// 公開済みの受け口のルールハンドル（`publish_port` が積み、`unpublish_port` が外す）。件数は
+        /// レジストリの公開件数の上限で有界。プロセス再起動後は失われ、解放は `delete_network` に頼る。
+        published: Vec<PublishedPort>,
     }
 
     /// net の統合 API を呼ぶバックエンド。ソケットは呼び出しごとに開く（起動時に `CAP_NET_ADMIN` が
@@ -1670,6 +1700,7 @@ mod linux {
                 created,
                 ipam,
                 ports: PortRegistry::new(),
+                published: Vec::new(),
             })
         }
 
@@ -1896,7 +1927,7 @@ mod linux {
                     error: net_error_to_trait(&e),
                     rules_unknown: false,
                 })?;
-            publish_container_ports(
+            let published = publish_container_ports(
                 &nft,
                 &network.created,
                 container,
@@ -1907,6 +1938,50 @@ mod linux {
             .map_err(|e| PublishFailure {
                 error: net_error_to_trait(&e.error),
                 rules_unknown: e.rules_unknown,
+            })?;
+            network.published.extend(published);
+            Ok(())
+        }
+
+        fn unpublish_port(
+            &self,
+            network: &mut Self::Network,
+            container: &Self::Container,
+            publish: &PortPublish,
+        ) -> Result<(), PublishFailure> {
+            let Some(pos) = network
+                .published
+                .iter()
+                .position(|p| p.endpoint() == &container.endpoint && p.publish() == publish)
+            else {
+                return Err(PublishFailure {
+                    error: TraitError::new(ErrorCode::NotFound, "published port is not recorded"),
+                    rules_unknown: false,
+                });
+            };
+            let nft = NetlinkNetfilterSocket::open_with_recorder(Arc::clone(&self.recorder))
+                .map_err(|e| PublishFailure {
+                    error: net_error_to_trait(&e),
+                    rules_unknown: false,
+                })?;
+            let record = network.published.remove(pos);
+            unpublish_container_port(
+                &nft,
+                &network.created,
+                record,
+                &mut network.ports,
+                NETSETUP_REQUEST_TIMEOUT,
+            )
+            .map_err(|e| {
+                // ルールが残っている可能性がある間は記録を戻し、再試行できるようにする。
+                let rules_unknown = e.rules == UnpublishRules::Unknown;
+                if let Some(back) = e.published {
+                    network.published.push(*back);
+                }
+                PublishFailure {
+                    error: net_error_to_trait(&e.error),
+                    rules_unknown,
+                }
             })
         }
 

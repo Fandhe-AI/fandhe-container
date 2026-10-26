@@ -165,6 +165,56 @@ fn wait_bounded(
     }
 }
 
+/// 期限つきの子プロセス実行（試験専用。REPAIR-5）。stdout / stderr を別スレッドで読み、期限内に
+/// 終了しなければ kill して有限の猶予で回収し、`TimedOut` を返す。
+///
+/// 実機前提の結合試験（`unshare`・`mount` を起動するもの）が子の停止で無期限に待たないための共通口。
+/// 出力の回収も `recv_timeout` で有限にし、子孫が pipe を保持し続けても親は待ち続けない（スレッドは切り離す）。
+#[cfg(target_os = "linux")]
+pub(crate) fn run_bounded(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut readers = Vec::new();
+    for pipe in [
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn io::Read + Send>),
+    ] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        readers.push(rx);
+    }
+    let status = wait_bounded(&mut child, deadline)?;
+    let mut bufs = readers
+        .into_iter()
+        .map(|rx| rx.recv_timeout(WRITER_JOIN_GRACE).unwrap_or_default());
+    Ok(std::process::Output {
+        status,
+        stdout: bufs.next().unwrap_or_default(),
+        stderr: bufs.next().unwrap_or_default(),
+    })
+}
+
 /// 自プロセスが開いている fd のうち、指定 inode を指すものの数（アクセスモード別）。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

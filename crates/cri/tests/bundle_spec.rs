@@ -79,6 +79,34 @@ fn s(v: &Value) -> &str {
     v.as_str().expect("string")
 }
 
+/// CRI-2・CORE-5・SEC-1: readonly_rootfs=true は root.readonly=true へ写り、core が読み戻す（#2827）。
+#[test]
+fn cri2_core5_readonly_rootfs_maps_to_root_readonly() {
+    let c = with_sc(|sc| sc.readonly_rootfs = true);
+    let v = build(&pod(), &c);
+    assert_eq!(
+        v["root"],
+        serde_json::json!({"path": "rootfs", "readonly": true})
+    );
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("build");
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.root().readonly());
+    assert!(cfg.unapplied_fields().is_empty());
+}
+
+/// readonly_rootfs=false・security context なしは従来の出力のまま（readonly キーなし）。
+#[test]
+fn cri2_readonly_rootfs_false_keeps_output_unchanged() {
+    let a = build_runtime_config(&pod(), &ctr(), &ImageDefaults::default()).expect("build");
+    let f = with_sc(|sc| sc.readonly_rootfs = false);
+    let b = build_runtime_config(&pod(), &f, &ImageDefaults::default()).expect("build");
+    assert_eq!(a, b);
+    let v: Value = serde_json::from_slice(b.as_bytes()).expect("json");
+    assert_eq!(v["root"], serde_json::json!({"path": "rootfs"}));
+    let cfg = oci_runtime::parse_config_bytes(b.as_bytes()).expect("core parses it");
+    assert!(!cfg.root().readonly());
+}
+
 /// CRI-1: crictl 疎通確認の fixture（scripts/testdata/cri/{pod,container}.json と同内容）が core の parser に通る。
 #[test]
 fn cri_1_crictl_smoke_fixture_round_trip() {
@@ -1280,7 +1308,6 @@ fn rejection_table_is_unimplemented() {
                 });
             }),
         ),
-        ("readonly_rootfs", Box::new(|sc| sc.readonly_rootfs = true)),
         (
             "selinux",
             Box::new(|sc| sc.selinux_options = Some(Default::default())),

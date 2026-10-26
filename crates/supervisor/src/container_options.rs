@@ -17,10 +17,12 @@
 //!
 //! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
 //!
+//! | #2828（CLI-1・SUP-12） | `--read-only`（[`ContainerOptions::with_read_only`]。config の `root.readonly` と OR で効き、狭める方向のみ） | core の `LaunchOptions::with_root_readonly`（mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値） |
+//!
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
 //! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
 //! `--shm-size`・`--tmpfs`・secrets / configs・ulimit・env。#2625・#2713）は実装済み。CLI の `create` は
-//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop` を [`document`] の形で
+//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only` を [`document`] の形で
 //! 状態ルート配下の 0600 のファイル（[`store`]）へ書き、supervisor の `start` が読む（#2713）。
 //! label は create 時に core の状態記録（`CreateRequest::with_annotations`）へ直接書く。
 //!
@@ -127,6 +129,8 @@ pub struct ContainerOptions {
     injected: InjectedFileOptions,
     /// `--cap-drop` で除く capability(狭める方向のみ。CLI-1・SEC-1・#2775)。
     cap_drop: CapabilitySet,
+    /// `--read-only`(true なら `root.readonly` を実効的に true にする。狭める方向のみ。CLI-1・SUP-12・#2828)。
+    read_only: bool,
 }
 
 impl ContainerOptions {
@@ -147,6 +151,19 @@ impl ContainerOptions {
     pub fn with_cap_drop(mut self, drop: CapabilitySet) -> Self {
         self.cap_drop = drop;
         self
+    }
+
+    /// `--read-only` を設定する(CLI-1・SUP-12・#2828)。false は「指定なし」(config の値に従う)で、
+    /// `readonly:true` の config を書き込み可能に戻す経路は無い。
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// `--read-only` が指定されたか。
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// `--cap-drop` の集合。
@@ -258,7 +275,10 @@ impl ContainerOptions {
         LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)?
             .with_rlimits(self.rlimits.clone())
             .with_env(self.env.to_env_strings())
-            .map(|o| o.with_capability_drop(self.cap_drop))
+            .map(|o| {
+                o.with_capability_drop(self.cap_drop)
+                    .with_root_readonly(self.read_only)
+            })
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。

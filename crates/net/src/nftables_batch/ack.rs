@@ -30,6 +30,20 @@
 //!   処理された要求への応答なので読み切りの印になる。失敗を集めていれば `Aborted`、なければ適用状態を
 //!   確認できないので `Unknown` にする
 //!
+//! # NEWRULE の echo 応答（ルールハンドルの取得。NET-3・CRI-2・#2839）
+//!
+//! `NLM_F_ECHO` 付きで積んだ NEWRULE（`NftBatchBytes::body_echo` が真の本体）には、ACK とは別に
+//! 追加したルールそのものが NEWRULE メッセージとして送り元へ返り（echo。`nlmsg_seq` は要求の seq）、
+//! ペイロードの `NFTA_RULE_HANDLE`（`__be64`）にカーネルが採番したハンドルが入る。echo と ACK の到着順は
+//! 固定とみなさず（一次情報での順序確定は未実施）どちらの順でも受け付ける。どちらも同期点（GETGEN）への
+//! 応答より前に届く（FIFO）ため、読み切り判定は変えない。echo は外部入力として次を fail-closed（`DataLoss`・
+//! `Unknown`）にする: echo を要求していない本体への NEWRULE・同じ本体への重複・nfgenmsg より短い
+//! ペイロード・ハンドル属性の欠落 / 重複 / 8 バイト以外 / 0（`NftRuleHandle::from_rule_attrs`）・
+//! BEGIN / END の seq への NEWRULE。echo を要求した本体のハンドルが同期点までに揃わない場合と、
+//! 失敗を集めたのに echo を受けていた（矛盾する応答）場合も `Unknown`（コミット済みかもしれないが
+//! ハンドルが不明。上位は quarantine に倒す）。echo のテーブル名・チェイン名・family の照合は行わない
+//! （seq の一致のみ。`nftables_batch` の組み立て側が要求を固定しているため。多層防御の追加は未実装）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //!
 //! extended ACK（`NETLINK_EXT_ACK`）の解釈と、`NFTA_GEN_ID` による楽観的並行制御は未実装。
@@ -41,7 +55,10 @@ use super::NftBatchOutcome;
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
-use crate::nftables_batch::{NFNL_SUBSYS_NFTABLES, NftBatchBytes, nfnl_msg_type};
+use crate::nftables_batch::{
+    NFGENMSG_LEN, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, nfnl_msg_type,
+};
+use crate::nftables_rules::{NFT_MSG_NEWRULE, NftRuleHandle};
 
 /// nf_tables の世代番号の照会（`linux/netfilter/nf_tables.h` の `NFT_MSG_GETGEN`）。同期点に使う。
 pub(crate) const NFT_MSG_GETGEN: u8 = 16;
@@ -49,6 +66,8 @@ pub(crate) const NFT_MSG_GETGEN: u8 = 16;
 pub(crate) const NFT_MSG_NEWGEN: u8 = 15;
 /// 同期点への応答 `NFT_MSG_NEWGEN` の `nlmsg_type`（0x0A0F）。
 const NEWGEN_TYPE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWGEN);
+/// `NLM_F_ECHO` に対する応答 `NFT_MSG_NEWRULE` の `nlmsg_type`（0x0A06）。
+const NEWRULE_TYPE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
 
 /// 失敗したメッセージのバッチ内位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -171,12 +190,14 @@ impl From<NftBatchError> for NetError {
     }
 }
 
-/// 全メッセージが成功した結果。将来の拡張に備えた構造体。
+/// 全メッセージが成功した結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftBatchAck {
     begin_seq: u32,
     end_seq: u32,
     body_seqs: Vec<u32>,
+    /// 本体ごとの echo で得たルールハンドル（`body_seqs` と同じ添字。echo 未要求は `None`）。
+    rule_handles: Vec<Option<NftRuleHandle>>,
 }
 
 impl NftBatchAck {
@@ -193,6 +214,12 @@ impl NftBatchAck {
     /// ACK を確認した本体メッセージの seq（積んだ順）。
     pub fn body_seqs(&self) -> &[u32] {
         &self.body_seqs
+    }
+
+    /// `index` 番目の本体の echo 応答から得たルールハンドル。echo を要求していない本体・範囲外は `None`
+    /// （echo を要求した本体のハンドルが欠けた結果は成功にならない）。
+    pub fn rule_handle(&self, index: usize) -> Option<NftRuleHandle> {
+        self.rule_handles.get(index).copied().flatten()
     }
 }
 
@@ -219,6 +246,9 @@ pub(crate) struct NftBatchAckCollector {
     /// 本体ごとの判定済みフラグ（`body_seqs` と同じ添字）。
     seen: Vec<bool>,
     pending: usize,
+    /// 本体ごとの echo 要求（`NftBatchBytes::body_echo`）と、受理した echo のルールハンドル。
+    echo_expected: Vec<bool>,
+    rule_handles: Vec<Option<NftRuleHandle>>,
     failures: Vec<NftMessageFailure>,
     /// BEGIN / END の非 0 errno を受けたか（本体の判定を待たずに判定済みにする）。
     marker_failed: bool,
@@ -242,6 +272,8 @@ impl NftBatchAckCollector {
             end_seq: batch.end_seq(),
             seen: vec![false; body_seqs.len()],
             pending: body_seqs.len(),
+            echo_expected: (0..body_seqs.len()).map(|i| batch.body_echo(i)).collect(),
+            rule_handles: vec![None; body_seqs.len()],
             body_seqs,
             failures: Vec::new(),
             marker_failed: false,
@@ -307,6 +339,10 @@ impl NftBatchAckCollector {
                 continue;
             };
             if h.msg_type() == NLMSG_NOOP {
+                continue;
+            }
+            if h.msg_type() == NEWRULE_TYPE {
+                self.feed_rule_echo(position, h.seq(), &msg)?;
                 continue;
             }
             if h.msg_type() != NLMSG_ERROR {
@@ -378,6 +414,13 @@ impl NftBatchAckCollector {
             )));
         };
         if !self.failures.is_empty() {
+            // 失敗を集めたバッチはカーネルが abort しており echo は出ないはず。受けていたら矛盾する応答で、
+            // 適用状態を断定できない。
+            if self.rule_handles.iter().any(Option::is_some) {
+                return Err(self.unknown(data_loss(
+                    "rule echo received for a batch the kernel rejected",
+                )));
+            }
             return Err(self.aborted());
         }
         if errno != 0 {
@@ -396,11 +439,53 @@ impl NftBatchAckCollector {
                 ),
             )));
         }
+        let missing = self
+            .echo_expected
+            .iter()
+            .zip(&self.rule_handles)
+            .filter(|(want, got)| **want && got.is_none())
+            .count();
+        if missing > 0 {
+            return Err(self.unknown(data_loss(format!(
+                "{missing} requested rule echo(es) missing at the sync reply"
+            ))));
+        }
         Ok(NftBatchAck {
             begin_seq: self.begin_seq,
             end_seq: self.end_seq,
             body_seqs: self.body_seqs.clone(),
+            rule_handles: self.rule_handles.clone(),
         })
+    }
+
+    /// echo を要求した NEWRULE への応答（echo）1 件からルールハンドルを取り出して記録する。
+    /// 検証の規則はモジュール doc「NEWRULE の echo 応答」。
+    fn feed_rule_echo(
+        &mut self,
+        position: NftBatchPosition,
+        seq: u32,
+        msg: &crate::netlink::NlMsg<'_>,
+    ) -> Result<(), NftBatchError> {
+        let NftBatchPosition::Body { index } = position else {
+            return Err(self.unknown(data_loss(format!("rule echo for non-body batch seq {seq}"))));
+        };
+        if !self.echo_expected.get(index).copied().unwrap_or(false) {
+            return Err(self.unknown(data_loss(format!(
+                "unrequested rule echo for batch seq {seq}"
+            ))));
+        }
+        if self.rule_handles.get(index).copied().flatten().is_some() {
+            return Err(self.unknown(data_loss(format!(
+                "duplicate rule echo for batch seq {seq}"
+            ))));
+        }
+        NfGenMsg::decode(msg.payload()).map_err(|e| self.unknown(e))?;
+        let attrs = msg.attrs(NFGENMSG_LEN).map_err(|e| self.unknown(e))?;
+        let handle = NftRuleHandle::from_rule_attrs(attrs).map_err(|e| self.unknown(e))?;
+        if let Some(slot) = self.rule_handles.get_mut(index) {
+            *slot = Some(handle);
+        }
+        Ok(())
     }
 
     /// 同期点の seq を持つ 1 メッセージを判定する（応答は NEWGEN → errno 0 の ACK の順）。
@@ -502,9 +587,9 @@ impl NftBatchAckCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgBuilder};
+    use crate::netlink::{NLM_F_ACK, NLM_F_ECHO, NLM_F_REQUEST, NlMsgBuilder};
     use crate::nftables_batch::{
-        NFNL_SUBSYS_NFTABLES, NFPROTO_INET, NfGenMsg, NftBatch, nfnl_msg_type,
+        NFNL_SUBSYS_NFTABLES, NFPROTO_INET, NFPROTO_IPV4, NfGenMsg, NftBatch, nfnl_msg_type,
     };
 
     const NEWTABLE: u16 = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, 0);
@@ -577,6 +662,7 @@ mod tests {
                 begin_seq: 100,
                 end_seq: 104,
                 body_seqs: vec![101, 102, 103],
+                rule_handles: vec![None, None, None],
             })
         );
     }
@@ -954,5 +1040,154 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::DataLoss);
         assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
         assert!(!c.barrier_reached());
+    }
+
+    // ---- NEWRULE の echo 応答（NET-3・CRI-2・REPAIR-2・#2839） ----
+
+    /// 本体 2 件（index 0 = 101: echo 要求あり、index 1 = 102: echo 要求なし）のバッチ。begin = 100。
+    fn echo_batch(echo: [bool; 2]) -> NftBatchBytes {
+        let mut b = NftBatch::new(100).expect("new");
+        for want in echo {
+            b.push_with(|seq| {
+                let (ty, flags) = if want {
+                    (NEWRULE_TYPE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO)
+                } else {
+                    (NEWTABLE, NLM_F_REQUEST | NLM_F_ACK)
+                };
+                let mut m = NlMsgBuilder::new(ty, flags, seq, 0);
+                NfGenMsg::new(NFPROTO_IPV4, 0).put_into(&mut m)?;
+                Ok(m)
+            })
+            .expect("push");
+        }
+        b.finish().expect("finish")
+    }
+
+    /// echo 応答（NEWRULE。nfgenmsg + TABLE + CHAIN + HANDLE）。`handle` は属性の生バイト列。
+    fn rule_echo_raw(seq: u32, handle: Option<&[u8]>) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(NEWRULE_TYPE, 0, seq, 0);
+        NfGenMsg::new(NFPROTO_IPV4, 0)
+            .put_into(&mut b)
+            .expect("nfg");
+        b.put_attr(1, b"t\0").expect("table");
+        b.put_attr(2, b"c\0").expect("chain");
+        if let Some(h) = handle {
+            b.put_attr(3, h).expect("handle");
+        }
+        b.finish().expect("finish")
+    }
+
+    fn rule_echo(seq: u32, handle: u64) -> Vec<u8> {
+        rule_echo_raw(seq, Some(&handle.to_be_bytes()))
+    }
+
+    fn handle(n: u64) -> Option<NftRuleHandle> {
+        Some(NftRuleHandle::new(n).expect("handle"))
+    }
+
+    /// NET-3: echo → ACK の順でも、ACK → echo の順でも、同じハンドルが得られる。
+    #[test]
+    fn net3_echo_handle_is_collected_in_either_order() {
+        for dgrams in [
+            cat(&[rule_echo(101, 2), ok(101), ok(102)]),
+            cat(&[ok(101), ok(102), rule_echo(101, 2)]),
+        ] {
+            let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+            c.feed(&dgrams).expect("feed");
+            reach_barrier(&mut c, 104, 0);
+            let ack = c.conclude().expect("ack");
+            assert_eq!(ack.rule_handle(0), handle(2));
+            assert_eq!(ack.rule_handle(1), None);
+            assert_eq!(ack.rule_handle(2), None);
+        }
+    }
+
+    /// NET-3: 複数の echo を 1 データグラムにまとめても、別データグラムに分けても受け付ける。
+    #[test]
+    fn net3_multiple_echoes_collected() {
+        let mut c = NftBatchAckCollector::new(&echo_batch([true, true]));
+        c.feed(&cat(&[rule_echo(101, 2), rule_echo(102, 3)]))
+            .expect("echoes");
+        c.feed(&cat(&[ok(101), ok(102)])).expect("acks");
+        reach_barrier(&mut c, 104, 0);
+        let ack = c.conclude().expect("ack");
+        assert_eq!(
+            (ack.rule_handle(0), ack.rule_handle(1)),
+            (handle(2), handle(3))
+        );
+    }
+
+    /// NET-3: echo の欠落は成功にせず Unknown（DataLoss）にする。
+    #[test]
+    fn net3_missing_echo_is_unknown() {
+        let mut c = NftBatchAckCollector::new(&echo_batch([true, true]));
+        c.feed(&cat(&[rule_echo(101, 2), ok(101), ok(102)]))
+            .expect("feed");
+        reach_barrier(&mut c, 104, 0);
+        let e = c.conclude().expect_err("missing");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+    }
+
+    /// NET-3: echo の重複・要求していない本体への echo・BEGIN / END の seq への echo は DataLoss。
+    #[test]
+    fn net3_duplicate_or_unrequested_echo_is_data_loss() {
+        for (dgrams, desc) in [
+            (cat(&[rule_echo(101, 2), rule_echo(101, 3)]), "duplicate"),
+            (rule_echo(102, 2), "unrequested"),
+            (rule_echo(100, 2), "begin"),
+            (rule_echo(103, 2), "end"),
+        ] {
+            let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+            let e = c.feed(&dgrams).expect_err(desc);
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{desc}");
+            assert_eq!(e.outcome(), NftBatchOutcome::Unknown, "{desc}");
+        }
+    }
+
+    /// NET-3・REPAIR-2: 不正なハンドル属性（欠落・0・7 バイト・9 バイト・重複）と短いペイロードは DataLoss。
+    #[test]
+    fn net3_malformed_echo_is_data_loss() {
+        let mut dup = NlMsgBuilder::new(NEWRULE_TYPE, 0, 101, 0);
+        NfGenMsg::new(NFPROTO_IPV4, 0)
+            .put_into(&mut dup)
+            .expect("nfg");
+        dup.put_attr(3, &2u64.to_be_bytes()).expect("h1");
+        dup.put_attr(3, &3u64.to_be_bytes()).expect("h2");
+        let mut short = NlMsgBuilder::new(NEWRULE_TYPE, 0, 101, 0);
+        short.put_fixed(&[2, 0]).expect("short");
+        for dgram in [
+            rule_echo_raw(101, None),
+            rule_echo(101, 0),
+            rule_echo_raw(101, Some(&[0, 0, 0, 0, 0, 0, 2])),
+            rule_echo_raw(101, Some(&[0, 0, 0, 0, 0, 0, 0, 0, 2])),
+            dup.finish().expect("dup"),
+            short.finish().expect("short"),
+        ] {
+            let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+            let e = c.feed(&dgram).expect_err("malformed");
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        }
+    }
+
+    /// NET-3: echo を受けたのに失敗が集まった（矛盾する応答）場合は Aborted と断定せず Unknown にする。
+    /// echo を受けていない失敗は従来どおり Aborted。
+    #[test]
+    fn net3_echo_with_failure_is_unknown_but_plain_failure_is_aborted() {
+        let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+        c.feed(&cat(&[rule_echo(101, 2), ok(101), err_dgram(102, 17, 102)]))
+            .expect("feed");
+        reach_barrier(&mut c, 104, 0);
+        let e = c.conclude().expect_err("contradiction");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+
+        let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+        c.feed(&cat(&[err_dgram(101, 17, 101), ok(102)]))
+            .expect("feed");
+        reach_barrier(&mut c, 104, 0);
+        let e = c.conclude().expect_err("aborted");
+        assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 }

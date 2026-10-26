@@ -9,7 +9,7 @@
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
 //! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
 //! `inspect <id>` は supervisor の `inspect::inspect` が整形した 1 行 JSON（起動時に適用した capability 集合を含む。#2775）を
-//! stdout へ出す（`list_logs` module）。`create --cap-drop <CAP>` は起動オプション文書（`create_options`）経由で launch に届く。
+//! stdout へ出す（`list_logs` module）。`create --cap-drop <CAP>`・`create --read-only` は起動オプション文書（`create_options`）経由で launch に届く。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は存在確認の後に supervisor の
 //! `logs::read_container_log_with` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
 //! （`--follow` / `--tail` / `--stream` / `--escape` つき。TASK-79.3・#640・#1543・#2447。`list_logs` module）。
@@ -831,7 +831,7 @@ mod tests {
             );
             assert!(
                 o.stdout
-                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null}\n"),
+                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}\n"),
                 "{:?}",
                 o.stdout
             );

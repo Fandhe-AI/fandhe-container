@@ -31,6 +31,9 @@
 //!   実際に適用・確認した effective / permitted / inheritable / ambient は記録していないため出さない（推測しない）。
 //!   非 root の `process.user` で ambient が空のまま exec すると実効集合は上限より小さく（空にも）なるため、
 //!   `bounding` を「コンテナのプロセスが今持つ集合」と読んではならない。
+//! - `rootReadonly`（CLI-1・SUP-12・REPAIR-4・#2828）は launcher が実際に適用した `root.readonly` の実効値
+//!   （config の値と `create --read-only` の OR。mount の RDONLY・Landlock の root 規則と同じ値）で、`true` / `false`。
+//!   記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、書き込み可能とは推測しない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
@@ -193,6 +196,16 @@ impl InspectReport {
         push_str_value(&mut s, self.explicit_stop().as_str());
         s.push_str(",\"capabilities\":");
         self.push_capabilities(&mut s);
+        s.push_str(",\"rootReadonly\":");
+        match self
+            .record
+            .launch_isolation()
+            .and_then(|l| l.root_readonly())
+        {
+            Some(true) => s.push_str("true"),
+            Some(false) => s.push_str("false"),
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -403,7 +416,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -422,7 +435,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -445,7 +458,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -466,7 +479,7 @@ mod tests {
         .unwrap()
         .with_explicit_stop(fandhe_container_core::traits::ExplicitStop::Recorded);
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

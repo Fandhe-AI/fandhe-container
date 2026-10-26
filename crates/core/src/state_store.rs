@@ -1750,6 +1750,14 @@ struct LaunchIsolationDto {
         deserialize_with = "capabilities_array"
     )]
     capabilities: Option<Vec<String>>,
+    /// launch が適用した `root.readonly` の実効値（CLI-1・SUP-12・#2828）。キー欠落だけを旧記録（`None`）と
+    /// 読み、`null` や bool 以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "root_readonly_bool"
+    )]
+    root_readonly: Option<bool>,
 }
 
 /// ID 写像の記録。`model` は `single` / `subordinate`。
@@ -1965,6 +1973,7 @@ impl LaunchIsolationDto {
             capabilities: record
                 .capabilities()
                 .map(|c| c.iter().map(|c| c.as_str().to_owned()).collect()),
+            root_readonly: record.root_readonly(),
         }
     }
 
@@ -2017,11 +2026,23 @@ impl LaunchIsolationDto {
             Some(m) => record.with_id_mapping(m.into_record()?),
             None => record,
         };
-        Ok(match self.capabilities {
+        let record = match self.capabilities {
             Some(names) => record.with_capabilities(capabilities_from_names(&names)?),
+            None => record,
+        };
+        Ok(match self.root_readonly {
+            Some(ro) => record.with_root_readonly(ro),
             None => record,
         })
     }
+}
+
+/// `root_readonly` のキーが在るとき bool だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn root_readonly_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(d).map(Some)
 }
 
 /// `capabilities` のキーが在るとき配列だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
@@ -3580,6 +3601,32 @@ mod tests {
         let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
         v["capabilities"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+    }
+
+    /// CLI-1・SUP-12・#2828: `root.readonly` の実効値の記録が bool で往復し、キーの無い旧記録は `None`、
+    /// `null`・文字列・数値は破損として拒否される。
+    #[test]
+    fn cli1_sup12_state_root_readonly_roundtrip_and_rejects_corruption() {
+        for ro in [true, false] {
+            let rec = iso(100).with_root_readonly(ro);
+            let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+            assert_eq!(v["root_readonly"], serde_json::json!(ro));
+            let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert_eq!(back.into_record().unwrap().root_readonly(), Some(ro));
+        }
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("root_readonly").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().root_readonly(), None);
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["root_readonly"] = bad;
+            assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        }
     }
 
     /// CORE-6・SEC-5・#2388: ID 写像の記録が JSON の具体値で往復し、無い旧記録は記録なし、

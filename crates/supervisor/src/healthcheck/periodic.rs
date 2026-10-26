@@ -719,6 +719,7 @@ mod tests {
             exit: ChildExit::Exited(127),
             violation: None,
             code: ErrorCode::NotFound,
+            step: None,
         })
         .unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);

@@ -17,6 +17,10 @@
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
+//! ポート公開付きの接続（c3）では、`nft list table` に DNAT が 2 件入ることに続けて、公開の個別解除
+//! （`unpublish_container_port`。echo 応答のハンドル指定。NET-3・#2839）で 2 件が消え予約が空になること、
+//! 同じ受け口を再び公開できる（`publish_container_ports`）ことを具体値で照合する。
+//!
 //! `delete_network` の前に、attach の取り残しの回収（`reclaim_failed_attach`。#2681）を確かめる。c4 を接続し、
 //! 請求書の記録の復号から回収して veth が `NotFound`・pin が消えること（2 回目も成功する冪等性）と、別名のない他者の veth は
 //! 請求書に載っても消えないことを具体値で照合する。
@@ -73,13 +77,14 @@ mod linux {
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, DeleteStep, EndpointId,
         FailedAttachClaim, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish, PortRegistry,
         StaticIpam, VethNames, attach_container, attach_prepared_container, create_container_netns,
-        create_network, delete_network, reclaim_failed_attach, release_container_netns,
+        create_network, delete_network, publish_container_ports, reclaim_failed_attach,
+        release_container_netns, unpublish_container_port,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
     const LAUNCHER_PID_ENV: &str = "FANDHE_ATTACH_TEST_LAUNCHER_PID";
     const DIR_ENV: &str = "FANDHE_ATTACH_TEST_DIR";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -485,8 +490,8 @@ mod linux {
         )?;
         let spec3 = ContainerAttachSpec::new(EndpointId::new("c3")?, &net, base.clone())?
             .with_port_publishes(vec![publish])?;
-        let attached3 =
-            attach_container(&route, &nft, &spec3, &mut ipam, &mut ports, t).map_err(|e| {
+        let mut attached3 = attach_container(&route, &nft, &spec3, &mut ipam, &mut ports, t)
+            .map_err(|e| {
                 fail(format!(
                     "attach with port publish failed at {:?}: {e}",
                     e.step
@@ -501,6 +506,44 @@ mod linux {
         if dnat_lines != 2 {
             return Err(fail(format!(
                 "expected 2 DNAT rules (prerouting and output), found {dnat_lines} in:\n{ruleset}"
+            )));
+        }
+
+        // --- 公開の個別解除（NET-3・NET-4・#2839）: echo で取ったハンドルで DNAT 2 件だけを消し、予約を戻す ---
+        let count_dnat = || -> Result<usize, NetError> {
+            let rs = run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?;
+            Ok(rs.lines().filter(|l| l.contains("dnat to")).count())
+        };
+        let mut published = std::mem::take(&mut attached3.published_ports);
+        let (Some(first), None) = (published.pop(), published.pop()) else {
+            return Err(fail("attach must return exactly 1 published port"));
+        };
+        if (first.prerouting_handle().get(), first.output_handle().get()) == (0, 0) {
+            return Err(fail("echoed rule handles must be non-zero"));
+        }
+        if ports.len() != 1 {
+            return Err(fail(format!(
+                "expected 1 reservation, found {}",
+                ports.len()
+            )));
+        }
+        unpublish_container_port(&nft, &net, first, &mut ports, t)
+            .map_err(|e| fail(format!("unpublish failed: {e} (rules {:?})", e.rules)))?;
+        let left = count_dnat()?;
+        if left != 0 || !ports.is_empty() {
+            return Err(fail(format!(
+                "after unpublish expected 0 DNAT rules and 0 reservations, found {left} rules and {} reservations",
+                ports.len()
+            )));
+        }
+        // 同じ受け口を再び公開できる（予約が戻っている証拠）。
+        let again = publish_container_ports(&nft, &net, &attached3, &[publish], &mut ports, t)
+            .map_err(|e| fail(format!("re-publish failed: {e}")))?;
+        let again_rules = count_dnat()?;
+        if again.len() != 1 || again_rules != 2 {
+            return Err(fail(format!(
+                "re-publish expected 1 port and 2 DNAT rules, found {} and {again_rules}",
+                again.len()
             )));
         }
 

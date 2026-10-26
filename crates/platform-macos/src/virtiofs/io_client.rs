@@ -149,6 +149,27 @@ pub enum VirtiofsIoError {
     InvalidReconnectPolicy { field: &'static str },
 }
 
+/// `IoErrorCode` から `virtiofs_io.*` へのワイヤー文字列の表（ERR-1・REPAIR-1）。
+///
+/// `IoErrorCode` は `#[non_exhaustive]` で `_` 分岐に黙って吸収されやすいため、`IoErrorCode::ALL` と
+/// 同じ件数の表にして試験で網羅を照合する。値は互換のため変えない。
+pub(crate) const PROTOCOL_CODE_TABLE: [(IoErrorCode, &str); 8] = [
+    (IoErrorCode::InvalidArgument, "virtiofs_io.invalid_argument"),
+    (IoErrorCode::Timeout, "virtiofs_io.timeout"),
+    (IoErrorCode::Unavailable, "virtiofs_io.unavailable"),
+    (IoErrorCode::Unimplemented, "virtiofs_io.unimplemented"),
+    (IoErrorCode::Internal, "virtiofs_io.internal"),
+    (IoErrorCode::DataLoss, "virtiofs_io.data_loss"),
+    (
+        IoErrorCode::ResourceExhausted,
+        "virtiofs_io.resource_exhausted",
+    ),
+    (IoErrorCode::AlreadyExists, "virtiofs_io.already_exists"),
+];
+
+/// 表に無い（将来追加された）`IoErrorCode` の倒し先。
+pub(crate) const PROTOCOL_CODE_FALLBACK: &str = "virtiofs_io.error";
+
 impl VirtiofsIoError {
     /// 機械可読なエラーコード（`virtiofs_io.*`）。
     pub fn code(&self) -> &'static str {
@@ -163,17 +184,10 @@ impl VirtiofsIoError {
             VirtiofsIoError::InvalidReconnectPolicy { .. } => {
                 "virtiofs_io.invalid_reconnect_policy"
             }
-            VirtiofsIoError::Protocol { source, .. } => match source.code() {
-                IoErrorCode::InvalidArgument => "virtiofs_io.invalid_argument",
-                IoErrorCode::Timeout => "virtiofs_io.timeout",
-                IoErrorCode::Unavailable => "virtiofs_io.unavailable",
-                IoErrorCode::Unimplemented => "virtiofs_io.unimplemented",
-                IoErrorCode::Internal => "virtiofs_io.internal",
-                IoErrorCode::DataLoss => "virtiofs_io.data_loss",
-                IoErrorCode::ResourceExhausted => "virtiofs_io.resource_exhausted",
-                IoErrorCode::AlreadyExists => "virtiofs_io.already_exists",
-                _ => "virtiofs_io.error",
-            },
+            VirtiofsIoError::Protocol { source, .. } => PROTOCOL_CODE_TABLE
+                .iter()
+                .find(|(c, _)| *c == source.code())
+                .map_or(PROTOCOL_CODE_FALLBACK, |(_, name)| *name),
         }
     }
 

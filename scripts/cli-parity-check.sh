@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CLI 基本 6 コマンド(と inspect・stop --signal・create --cap-drop)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
+# CLI 基本 6 コマンド(と inspect・stop --signal・create --cap-drop・create --read-only)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
 #
 # 役割: fandhe-container の基本 6 コマンド（create / start / stop / delete / list / logs）を固定のケース表で
 # 実行し、終了コード・stderr の `code`・stdout の形を正規化して 1 ケース 1 行で記録する（capture）。
@@ -110,6 +110,8 @@ CASES=(
   'A23|A|n|--root @R@ create --cap-drop CAP_BOGUS --bundle @B@ c1'
   'A24|A|n|--root @R@ inspect'
   'A25|A|n|--root @R@ inspect c1 c2'
+  'A26|A|n|--root @R@ create --read-only --read-only --bundle @B@ c1'
+  'A27|A|n|--root @R@ create --read-only true --bundle @B@ c1'
   'B01|B|l|--root @R@ list'
   'B02|B|n|--root @R@ create --bundle @B@ c1'
   'B03|B|l|--root @R@ list'

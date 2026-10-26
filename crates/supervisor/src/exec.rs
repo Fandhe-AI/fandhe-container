@@ -89,7 +89,11 @@
 //!   判定する（core の `exec/exec_command.rs`）。分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・
 //!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存は
 //!   下記「未実装」）。`SetupFailed` は子が報告した失敗の分類 `code`（ERR-1 コード。`execve` の後の失敗は errno を
-//!   launch と同じ写像で分類したもの）も持つ。違反でない失敗（`violation: None`）は監査に記録しない（#2763）
+//!   launch と同じ写像で分類したもの）も持つ。違反でない失敗（`violation: None`）は監査に記録しない（#2763）。
+//!   子が失敗した手順の段 `step`（core の `ExecChildStep`。固定語彙）も持ち、worker の結果行では core の語彙で
+//!   引き直す（未知の段は壊れた行）。段が分からない場合は `None`。メッセージは子から運ばず、段から固定の英文を引く
+//!   （`ExecChildStep::message`）。fork の前の失敗（worker 側の `setns`・制限の再適用など）は `err` 行の
+//!   `TraitError`（`exec stage {:?}: <message>`）で届き、`SetupFailed` には載らない（#2822）
 //! - **rlimit は launch 時の記録を適用し、記録が無ければ拒否する**（SUP-12・SUP-6・TASK-169 追補・#1467・#1455）:
 //!   launch は `--ulimit` の指定値に、指定の無い種別は launch 時点の実効値を足した全 16 種を `state.json` へ記録する
 //!   （`StateRecord::rlimits`。トレイト契約 11。作る関数は core の `launch_rlimits_from_self`）。[`identify_pid1`] 系は
@@ -283,11 +287,12 @@ use fandhe_container_core::audit_log::{
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
-    ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError,
-    ExecExit, ExecListenerSender, ExecReady, ExecRestrictionReport, ExecRestrictions,
-    ExecWorkerProof, ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable,
-    SupplementaryGroups, ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup,
-    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
+    ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecChildStep,
+    ExecCommand, ExecError, ExecExit, ExecListenerSender, ExecReady, ExecRestrictionReport,
+    ExecRestrictions, ExecWorkerProof, ListenerReceipt, NamespaceJoinReport, Pid1Target,
+    SealedCopyUnavailable, SupplementaryGroups, ViolationReason, emit_diagnostic_line_to,
+    join_cgroup as core_join_cgroup, join_namespaces,
+    prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command,
@@ -1653,7 +1658,7 @@ pub fn run_in_worker_with_listener_for_test(
             })?;
             work(sender)?;
             decode_worker_result(
-                b"ok command - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
             )
             .map_err(|f| f.error)
         },
@@ -1706,7 +1711,7 @@ pub fn run_in_worker_with_user_notif_for_test(
             })?;
             work(sender)?;
             decode_worker_result(
-                b"ok command - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321
 ",
             )
             .map_err(|f| f.error)
@@ -1817,7 +1822,8 @@ pub fn pin_exec_bundle_with_swap_for_test(
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <ERR-1 コード
-/// （`setup` のときの子が報告した失敗の分類。`command` は -。#2763）> <exited|signaled>
+/// （`setup` のときの子が報告した失敗の分類。`command` は -。#2763）> <失敗した手順の段（core の `ExecChildStep` のトークン。
+/// `command` と、段を受け取れなかった `setup` は -。#2822）> <exited|signaled>
 /// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
 /// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは -> <コマンドの
 /// 子の PID（10 進。起動していなければ -）>`、失敗は
@@ -1826,16 +1832,20 @@ pub fn pin_exec_bundle_with_swap_for_test(
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
-            let (started, violation, failure_code) = match o.exit {
-                ExecExit::Command(_) => ("command", "-", "-"),
+            let (started, violation, failure_code, step) = match o.exit {
+                ExecExit::Command(_) => ("command", "-", "-", "-"),
                 ExecExit::SetupFailed {
-                    violation, code, ..
+                    violation,
+                    code,
+                    step,
+                    ..
                 } => (
                     "setup",
                     violation.map_or("-", ViolationReason::as_str),
                     code.as_str(),
+                    step.map_or("-", ExecChildStep::as_str),
                 ),
-                _ => ("unknown", "-", "-"),
+                _ => ("unknown", "-", "-", "-"),
             };
             let (kind, value) = match o.exit.child_exit() {
                 ChildExit::Exited(n) => ("exited", n),
@@ -1847,7 +1857,7 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {started} {violation} {failure_code} {kind} {value} {} {} {} {} {} {} {groups} {} {} {}\n",
+                "ok {started} {violation} {failure_code} {step} {kind} {value} {} {} {} {} {} {} {groups} {} {} {}\n",
                 o.rlimits_applied,
                 o.rlimits_deferred,
                 o.capability_bounding_dropped,
@@ -1951,6 +1961,12 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "-" => None,
         name => Some(ErrorCode::from_name(name).ok_or_else(malformed)?),
     };
+    // 子が失敗した手順の段。core の固定語彙で静的な値へ引き直す（未知のトークンは壊れた行。fail-closed）。`-` は
+    // 段を受け取れなかった場合（`setup`）と `command`（#2822）。
+    let step = match it.next().ok_or_else(malformed)? {
+        "-" => None,
+        token => Some(ExecChildStep::from_token(token).ok_or_else(malformed)?),
+    };
     let kind = it.next().ok_or_else(malformed)?;
     let value: i32 = it
         .next()
@@ -1961,12 +1977,13 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "signaled" => ChildExit::Signaled(value),
         _ => return Err(malformed()),
     };
-    let exit = match (started, violation, failure_code) {
-        ("command", None, None) => ExecExit::Command(child),
-        ("setup", violation, Some(code)) => ExecExit::SetupFailed {
+    let exit = match (started, violation, failure_code, step) {
+        ("command", None, None, None) => ExecExit::Command(child),
+        ("setup", violation, Some(code), step) => ExecExit::SetupFailed {
             exit: child,
             violation,
             code,
+            step,
         },
         _ => return Err(malformed()),
     };
@@ -2934,7 +2951,7 @@ mod tests {
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
             line,
-            b"ok command - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
+            b"ok command - - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
         );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         // 補助グループの扱いは 4 通りとも往復する（TASK-163 追補・#1457）。
@@ -2953,7 +2970,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - - signaled 15 15 1 23 3 120 {text} sealed_copy - 4321\n")
+                format!("ok command - - - signaled 15 15 1 23 3 120 {text} sealed_copy - 4321\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -2980,7 +2997,7 @@ mod tests {
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
                 format!(
-                    "ok command - - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code} 4321\n"
+                    "ok command - - - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code} 4321\n"
                 )
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
@@ -2991,7 +3008,7 @@ mod tests {
         for (exit, text) in [
             (
                 ExecExit::Command(ChildExit::Exited(126)),
-                "command - - exited 126",
+                "command - - - exited 126",
             ),
             // `R` の後の `execveat` の失敗（違反なし）の分類が往復する（#2763）。
             (
@@ -2999,104 +3016,117 @@ mod tests {
                     exit: ChildExit::Exited(127),
                     violation: None,
                     code: ErrorCode::NotFound,
+                    step: Some(ExecChildStep::Execveat),
                 },
-                "setup - NOT_FOUND exited 127",
+                "setup - NOT_FOUND execveat exited 127",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::Execveat),
                 },
-                "setup - PERMISSION_DENIED exited 126",
+                "setup - PERMISSION_DENIED execveat exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
                     code: ErrorCode::InvalidArgument,
+                    step: Some(ExecChildStep::Execveat),
                 },
-                "setup - INVALID_ARGUMENT exited 126",
+                "setup - INVALID_ARGUMENT execveat exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
                     code: ErrorCode::Internal,
+                    step: Some(ExecChildStep::Execveat),
                 },
-                "setup - INTERNAL exited 126",
+                "setup - INTERNAL execveat exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_interpreter_is_runtime_binary PERMISSION_DENIED exited 126",
+                "setup entrypoint_interpreter_is_runtime_binary PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::StdioNullNotNullDevice),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup stdio_null_not_null_device PERMISSION_DENIED exited 126",
+                "setup stdio_null_not_null_device PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointCopyTooLarge),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_copy_too_large PERMISSION_DENIED exited 126",
+                "setup entrypoint_copy_too_large PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointCopySealUnverified),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_copy_seal_unverified PERMISSION_DENIED exited 126",
+                "setup entrypoint_copy_seal_unverified PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointOnNoexecMount),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_on_noexec_mount PERMISSION_DENIED exited 126",
+                "setup entrypoint_on_noexec_mount PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_is_runtime_binary PERMISSION_DENIED exited 126",
+                "setup entrypoint_is_runtime_binary PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::ExecDevNotDirectory),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup exec_dev_not_directory PERMISSION_DENIED exited 126",
+                "setup exec_dev_not_directory PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::ExecProcNotProcfs),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup exec_proc_not_procfs PERMISSION_DENIED exited 126",
+                "setup exec_proc_not_procfs PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Signaled(9),
                     violation: None,
                     code: ErrorCode::Internal,
+                    step: None,
                 },
-                "setup - INTERNAL signaled 9",
+                "setup - INTERNAL - signaled 9",
             ),
         ] {
             // コマンドの PID は起動したコマンドにだけ載る（`SetupFailed` は `-`）。
@@ -3121,7 +3151,8 @@ mod tests {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: None,
-                code: ErrorCode::Internal
+                code: ErrorCode::Internal,
+                step: None
             }
         );
 
@@ -3148,55 +3179,55 @@ mod tests {
         // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
         for deferred in [0usize, 1] {
             let line =
-                format!("ok command - - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy - 7\n");
+                format!("ok command - - - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy - 7\n");
             let o = decode_worker_result(line.as_bytes()).expect("well-formed");
             assert_eq!((o.rlimits_applied, o.rlimits_deferred), (1, deferred));
         }
         for bad in [
             &b""[..],
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1",
-            b"ok command - - exited 0 1 2 3\n",
-            b"ok command - - exited 0 1 0 2 3 4\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared\n",
-            b"ok command - - exited 0 1 0 2 3 4 unknown 1 sealed_copy -\n",
-            b"ok command - - exited 0 1 0 2 3 4 already_empty 2 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1",
+            b"ok command - - - exited 0 1 2 3\n",
+            b"ok command - - - exited 0 1 0 2 3 4\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared\n",
+            b"ok command - - - exited 0 1 0 2 3 4 unknown 1 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 already_empty 2 sealed_copy -\n",
             b"ok command - - weird 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
             // 実行方式の欄: 欠落・不正な組み合わせ・未知の理由コード。
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7 extra\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7 extra\n",
             // コマンドの PID の欄（#2236）: 欠落・0・負・非数値・符号つき・`u32` 超過・起動していないのに値がある。
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 0\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -5\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 0\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -5\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
             // 起動したコマンドの PID 欠落（`-`）は拒否する（exit_signal の監査が黙って省略されるのを防ぐ）。
-            b"ok command - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok command - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - -\n",
-            b"ok setup - INTERNAL exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command - - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+            b"ok setup - INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             // 失敗の分類の欄（#2763）: 旧形式（欄なし）・`setup` の `-`・未知のコード・小文字・`command` に付くコード。
             b"ok setup - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup - - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup - BOGUS exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup - not_found exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok command - NOT_FOUND exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok setup - - - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup - BOGUS - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup - not_found - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command - NOT_FOUND - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の値域外（契約は 0 か 1。欄はすべて揃っている）。
-            b"ok command - - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の欄が無い旧形式（#1579 以前の行。値域の検査で拒否される）。
-            b"ok command - - exited 0 1 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 2 3 4 cleared 1 sealed_copy - 7\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
             b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
-            b"ok command entrypoint_is_runtime_binary - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
-            b"ok setup rootfs_is_host_root INTERNAL exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command entrypoint_is_runtime_binary - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok setup rootfs_is_host_root INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             // launch だけで生じる `target_moved`・exec 対象の理由は ok 行の違反に載らない（許可リスト外。記録しない。#1595）。
-            b"ok setup target_moved INTERNAL exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup exec_target_cgroup_mismatch INTERNAL exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup bogus INTERNAL exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup target_moved INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup exec_target_cgroup_mismatch INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup bogus INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             b"hello\n",
             // 失敗行: 理由の欄が無い旧形式・未知の理由・種別の無い旧形式の理由・worker の経路で生じない理由・
             // 種別の食い違い（どれも記録せず `Internal`。#1614 の事後監査）。
@@ -3265,9 +3296,67 @@ mod tests {
         }
     }
 
+    /// SUP-6・REPAIR-3・REPAIR-4（#2822）: 子が失敗した手順の段は、core の全段が worker の結果行で往復する。
+    /// `command` に段があるもの・未知の段・段の欄が欠けた行は壊れた行（fail-closed）。
+    #[test]
+    fn sup6_2822_worker_result_carries_every_exec_child_step() {
+        let base = sample_outcome();
+        assert_eq!(fandhe_container_core::exec::exec_child_steps().len(), 15);
+        for step in fandhe_container_core::exec::exec_child_steps() {
+            let outcome = ExecOutcome {
+                exit: ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(*step),
+                },
+                command_pid: None,
+                ..base
+            };
+            let line = encode_worker_result(&Ok(outcome));
+            assert_eq!(
+                String::from_utf8(line.clone()).unwrap(),
+                format!(
+                    "ok setup - PERMISSION_DENIED {} exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+                    step.as_str()
+                )
+            );
+            assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+            assert_eq!(
+                decode_worker_result(&line).unwrap().exit.failure_step(),
+                Some(*step)
+            );
+            // コマンドが起動したのに段がある行は壊れた行。
+            let bad = format!(
+                "ok command - - {} exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+                step.as_str()
+            );
+            assert!(decode_worker_result(bad.as_bytes()).is_err(), "{bad}");
+        }
+        for bad in [
+            &b"ok setup - PERMISSION_DENIED bogus_step exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n"[..],
+            b"ok setup - PERMISSION_DENIED EXECVEAT exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+            // 段の欄が無い（旧形式）。
+            b"ok setup - PERMISSION_DENIED exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+        ] {
+            assert!(decode_worker_result(bad).is_err(), "{bad:?}");
+        }
+        // 段が分からない `setup` は `-` で往復し、`None` に戻る。
+        let none = decode_worker_result(
+            b"ok setup - INTERNAL - exited 125 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+        )
+        .unwrap();
+        assert_eq!(none.exit.failure_step(), None);
+        // 最長の行（最長の段・理由・コード）が上限に収まる。
+        assert!(
+            "ok setup entrypoint_copy_seal_unverified RESOURCE_EXHAUSTED select_executable signaled 2147483647 18446744073709551615 1 18446744073709551615 18446744073709551615 18446744073709551615 kept_setgroups_denied 18446744073709551615 pinned_inode lsm_apparmor -\n".len()
+                < WORKER_LINE_MAX
+        );
+    }
+
     fn sample_outcome() -> ExecOutcome {
         decode_worker_result(
-            b"ok command - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+            b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
         )
         .expect("decode")
     }
@@ -3515,6 +3604,7 @@ mod tests {
                 exit: ChildExit::Exited(126),
                 violation,
                 code: ErrorCode::PermissionDenied,
+                step: None,
             },
             command_pid: None,
             rlimits_applied: 15,
@@ -3613,6 +3703,7 @@ mod tests {
                 exit: ChildExit::Signaled(31),
                 violation: None,
                 code: ErrorCode::Internal,
+                step: None,
             },
         ] {
             let outcome = ExecOutcome { exit, ..sigsys };

@@ -1534,6 +1534,7 @@ mod linux {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
                     code: ErrorCode::PermissionDenied,
+                    step: Some(fandhe_container_core::exec::ExecChildStep::Interpreter),
                 }
             )),
             "the exec child must refuse the runtime-interpreted script: {out}"
@@ -1598,6 +1599,7 @@ mod linux {
                         exit: ChildExit::Exited(126),
                         violation: Some(ViolationReason::StdioNullNotNullDevice),
                         code: ErrorCode::PermissionDenied,
+                        step: Some(fandhe_container_core::exec::ExecChildStep::StdioNull),
                     }
                 )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"
@@ -1658,6 +1660,7 @@ mod linux {
                         exit: ChildExit::Exited(126),
                         violation: Some(ViolationReason::StdioNullNotNullDevice),
                         code: ErrorCode::PermissionDenied,
+                        step: Some(fandhe_container_core::exec::ExecChildStep::StdioNull),
                     }
                 )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"

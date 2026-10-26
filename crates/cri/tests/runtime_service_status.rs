@@ -197,3 +197,105 @@ async fn repair_4_status_records_one_ok_sample() {
     assert_eq!(samples[0].kind(), CriOpKind::Status);
     assert_eq!(samples[0].code(), Code::Ok);
 }
+/// CRI-2: provider だけ注入した構成（実行層なし）は RuntimeReady が false、NetworkReady が true。
+/// 実行層の有無と provider の有無は独立に判定され、provider は呼ばれない（#2897）。
+#[tokio::test]
+async fn cri_2_status_with_network_only_is_network_ready_runtime_not_connected() {
+    let network = Arc::new(CountingNetwork::default());
+    let service = CriRuntimeService::new().with_pod_network(network.clone());
+    let resp = status(&service, false).await;
+    assert_eq!(
+        resp.status.expect("status").conditions,
+        vec![not_connected(), cond("NetworkReady", true, "", "")]
+    );
+    assert_eq!(*network.0.lock().unwrap(), 0);
+}
+
+/// 呼ばれたら回数を数えて最大 30 秒止まる実行層（`Status` が待たないことの照合用。無期限には待たない。REPAIR-5）。
+#[derive(Default)]
+struct BlockingRuntime(Mutex<u32>);
+
+impl BlockingRuntime {
+    fn hit<T>(&self) -> Result<T, TraitError> {
+        *self.0.lock().unwrap() += 1;
+        std::thread::park_timeout(std::time::Duration::from_secs(30));
+        Err(TraitError::new(ErrorCode::Unimplemented, "blocked"))
+    }
+}
+
+impl ContainerRuntime for BlockingRuntime {
+    fn create(&self, _: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        self.hit()
+    }
+    fn start(&self, _: &StartRequest) -> Result<ContainerStatus, TraitError> {
+        self.hit()
+    }
+    fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+        self.hit()
+    }
+    fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        self.hit()
+    }
+    fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+        self.hit()
+    }
+    fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        self.hit()
+    }
+}
+
+/// 呼ばれたら回数を数えて最大 30 秒止まる `PodNetworkProvider`。
+#[derive(Default)]
+struct BlockingNetwork(Mutex<u32>);
+
+impl BlockingNetwork {
+    fn hit<T>(&self) -> Result<T, CriError> {
+        *self.0.lock().unwrap() += 1;
+        std::thread::park_timeout(std::time::Duration::from_secs(30));
+        Err(CriError::unimplemented("blocked"))
+    }
+}
+
+impl PodNetworkProvider for BlockingNetwork {
+    fn set_up(&self, _: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
+        self.hit()
+    }
+    fn tear_down(&self, _: &str) -> Result<(), CriError> {
+        self.hit()
+    }
+}
+
+/// CRI-1・CRI-2・REPAIR-5・#2897: 実行層・provider が応答しなくても `Status` は待たずに返る。
+/// 死活確認を足さない判断（`docs/design/cri-status-rpc.md`）の不変条件で、将来 `Status` が両者を
+/// 呼ぶ変更が入ると、応答が 2 秒の期限を超えるか呼び出し回数が 0 でなくなって失敗する。
+#[test]
+fn repair_5_status_returns_without_waiting_on_blocked_backends() {
+    let runtime = Arc::new(BlockingRuntime::default());
+    let network = Arc::new(BlockingNetwork::default());
+    let service = CriRuntimeService::new()
+        .with_runtime(
+            RuntimeAdapter::new(runtime.clone()),
+            Arc::new(UnusedBundles),
+        )
+        .with_pod_network(network.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let resp = rt.block_on(status(&service, false));
+        let _ = tx.send(resp);
+    });
+    let resp = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("Status must return within the deadline");
+    assert_eq!(
+        resp.status.expect("status").conditions,
+        vec![
+            cond("RuntimeReady", true, "", ""),
+            cond("NetworkReady", true, "", "")
+        ]
+    );
+    assert_eq!(*runtime.0.lock().unwrap(), 0);
+    assert_eq!(*network.0.lock().unwrap(), 0);
+}

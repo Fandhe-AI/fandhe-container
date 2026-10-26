@@ -356,6 +356,9 @@ norm_inspect() {
   local e size rest id status pid exitc rev cg sup health restarts audit idmap stop caps
   local pol skm llm rec model ul gl un gn cl tmp
   local str='"'"$JSON_STR_BODY"'"'
+  # JSON の整数構文（先頭ゼロ不可。042 のような不正な数値を受理して正規化で潰さない）。括弧なしの選択肢で群番号を変えない。
+  local ji='0|[1-9][0-9]{0,9}'
+  local jn='-?0|-?[1-9][0-9]{0,9}'
   size=$(($(wc -c <"$tmp_dir/out")))
   [ "$size" -le "$MAX_INSPECT_BYTES" ] || return 1
   e=""
@@ -370,7 +373,7 @@ norm_inspect() {
     e="${e//[! -~]/~}"
   fi
   # 先頭: id〜revision。bundle は検証だけして記録しない（絶対パス・ユーザー名の漏えい防止）。
-  [[ $e =~ ^\{\"id\":\"([A-Za-z0-9_-]{1,64})\",\"status\":\"([a-z_]{1,16})\",\"pid\":([0-9]{1,10}|null),\"exitCode\":(-?[0-9]{1,10}|null),\"bundle\":$str,\"revision\":([0-9]{1,10}),(.*)$ ]] || return 1
+  [[ $e =~ ^\{\"id\":\"([A-Za-z0-9_-]{1,64})\",\"status\":\"([a-z_]{1,16})\",\"pid\":($ji|null),\"exitCode\":($jn|null),\"bundle\":$str,\"revision\":($ji),(.*)$ ]] || return 1
   id="${BASH_REMATCH[1]}"
   status="${BASH_REMATCH[2]}"
   pid="${BASH_REMATCH[3]}"
@@ -380,7 +383,7 @@ norm_inspect() {
   if [ "$pid" = "null" ]; then pid='-'; else pid='<pid>'; fi
   if [ "$exitc" = "null" ]; then exitc='-'; fi
   # cgroup・supervisorPid・health・restartCount
-  [[ $rest =~ ^\"cgroupScope\":(null|$str),\"cgroupInstance\":(null|[0-9]{1,10}),\"supervisorPid\":(null|[0-9]{1,10}),\"health\":(null|\"[a-z_]{1,16}\"),\"restartCount\":([0-9]{1,10}),(.*)$ ]] || return 1
+  [[ $rest =~ ^\"cgroupScope\":(null|$str),\"cgroupInstance\":(null|$ji),\"supervisorPid\":(null|$ji),\"health\":(null|\"[a-z_]{1,16}\"),\"restartCount\":($ji),(.*)$ ]] || return 1
   cg='<set>'
   if [ "${BASH_REMATCH[1]}" = "null" ] && [ "${BASH_REMATCH[3]}" = "null" ]; then cg='-'; fi
   sup="${BASH_REMATCH[4]}"
@@ -393,7 +396,7 @@ norm_inspect() {
   # auditCoverage: policy・両 layer の mode・record だけ。reason（カーネル版数に依る詳細）は落とす。
   if [[ $rest =~ ^\"auditCoverage\":null,(.*)$ ]]; then
     audit='-'
-  elif [[ $rest =~ ^\"auditCoverage\":\{\"policy\":\"([a-z_]{1,24})\",\"seccompKill\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"landlock\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"record\":(null|\"[a-z_]{1,16}\")\},(.*)$ ]]; then
+  elif [[ $rest =~ ^\"auditCoverage\":\{\"policy\":\"([a-z_-]{1,24})\",\"seccompKill\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"landlock\":\{\"mode\":\"([a-z_]{1,24})\",\"reason\":(null|\"[^\"\\[:cntrl:]]*\")\},\"record\":(null|\"[a-z_]{1,16}\")\},(.*)$ ]]; then
     pol="${BASH_REMATCH[1]}"
     skm="${BASH_REMATCH[2]}"
     llm="${BASH_REMATCH[4]}"
@@ -406,7 +409,7 @@ norm_inspect() {
   fi
   rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
   # idMapping: model と extent 件数だけ（hostId はホストの subuid 設定のため記録しない）。
-  local ext='\{"containerId":[0-9]{1,10},"hostId":[0-9]{1,10},"size":[0-9]{1,10}\}'
+  local ext='\{"containerId":('"$ji"'),"hostId":('"$ji"'),"size":('"$ji"')\}'
   local idm_re='^"idMapping":\{"model":"([a-z_]{1,24})","uid":\[([^]]*)\],"gid":\[([^]]*)\]\},(.*)$'
   if [[ $rest =~ ^\"idMapping\":null,(.*)$ ]]; then
     idmap='-'
@@ -453,6 +456,8 @@ norm_stdout() {
   # 内容は写さず異常として記録する。
   if [ ! -s "$tmp_dir/out" ]; then
     norm_stdout_out='-'
+    # 成功（終了コード 0）した inspect が何も出さないのは異常。失敗時の空出力は従来どおり許容する。
+    if [ "$kind" = "i" ] && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
     return 0
   fi
   raw=$(($(wc -c <"$tmp_dir/out")))
@@ -633,7 +638,7 @@ load_capture() {
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
-  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3})$'
+  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3})$'
   local k entry_id so_ok
   line=""
   while IFS= read -r line; do

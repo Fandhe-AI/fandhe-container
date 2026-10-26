@@ -197,7 +197,7 @@ CLI に `pull` は無いため、plugin-cri の `PullImage` で在庫を埋め�
 | C28 | `image tag --image-root <dir> nginx@sha256:<64 hex> busybox:v2`（空のストア。#2659） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 同上 |
 | C29 | `image tag --image-root <pulled-dir> busybox:latest busybox:v2`（pull 済みの root。#2826） | 0 / `tagged` の 1 行 | | 前提未達 | 前提未達 | | 出力は `tagged\t<tag>\t<manifest>`（`crates/cli/src/commands/image.rs`）。値は記録しない。同じ操作の再実行は `unchanged` |
 | C30 | `create --image-root <pulled-dir> --image busybox:latest --bundle <bundle> <id>`（pull 済みの root。OCI-7・#2826） | 0 / `-` | | 前提未達 | 前提未達 | | 状態が作られ、直後の `list` に ID が現れる。この参照が残る間、C31 は使用中になる |
-| C31 | `image rm --image-root <pulled-dir> busybox:latest`（pull 済みの root。#2826） | 0 / `untagged` 行・`deleted` 行 | | 前提未達 | 前提未達 | | C30 の `delete` 後（参照が残らない状態）の値。コンテナが使用中なら 5 / `FAILED_PRECONDITION`（`--force` なしの拒否）。値は記録しない |
+| C31 | `image rm --image-root <pulled-dir> busybox:latest`（pull 済みの root。#2826） | 0 / `untagged` 行のみ | | 前提未達 | 前提未達 | | C30 の `delete` 後（参照が残らない状態）の値。C29 で付けた `busybox:v2` が残るため `deleted` 行は出ない（最後のタグを消すと `deleted` 行も出る。`image rm busybox:v2` を続けて確認してよい）。コンテナが使用中なら 5 / `FAILED_PRECONDITION`（`--force` なしの拒否）。値は記録しない |
 
 ## D 層: logs のオプション（`--follow`・`--tail`・`--stream`・`--escape`。#2447・CLI-1・SUP-7）
 

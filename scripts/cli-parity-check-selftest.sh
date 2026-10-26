@@ -340,6 +340,11 @@ mkinsp crlf "$base_head$tail_ok"'\r\n'
 mkinsp twolines "$base_head$tail_ok"'\n'"$base_head$tail_ok"'\n'
 mkinsp badcap "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":{"bounding":["cap_chown"]}}\n'
 mkinsp badstr '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"a"b","revision":1,'"$tail_ok"'\n'
+mkinsp lead0pid '{"id":"c1","status":"running","pid":042,"exitCode":null,"bundle":"/b","revision":1,'"$tail_ok"'\n'
+mkinsp lead0ext "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":{"model":"subordinate","uid":[{"containerId":00,"hostId":100000,"size":1}],"gid":[]},"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp lead0cg "$base_head"'"cgroupScope":null,"cgroupInstance":01,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp besteffort "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":{"policy":"best-effort","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":null},"record":null},"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp empty ''
 mkdir -p "$inspdir/big"
 {
   printf '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"'
@@ -396,7 +401,7 @@ STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
 STUB_OUT_DIR="$outdir" start_capture outtable ok
-insp_names="full order extra missing nolf crlf twolines badcap badstr big"
+insp_names="full order extra missing nolf crlf twolines badcap badstr big lead0pid lead0ext lead0cg besteffort empty"
 for n in $insp_names; do
   STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
 done
@@ -637,6 +642,11 @@ expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B$
 for n in order extra missing nolf crlf twolines badcap badstr; do
   expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:$(case $n in nolf) echo 0 ;; twolines) echo 2 ;; *) echo 1 ;; esac)"
 done
+for n in lead0pid lead0ext lead0cg; do
+  expect_line "B17 leading-zero number ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:1"
+done
+expect_line "B17 hyphenated audit policy is accepted" insp_besteffort "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-"
+expect_line "B17 empty stdout on success is unexpected" insp_empty "B17${tab}B${tab}0${tab}-${tab}<unexpected>:0"
 expect_line "B17 oversized inspect is unexpected" insp_big "B17${tab}B${tab}0${tab}-${tab}<unexpected>:big"
 # 漏えい検査: bundle のパス・cgroup 名・ホストの id・reason は capture に現れない
 leak=0

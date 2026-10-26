@@ -514,3 +514,60 @@ async fn err3_pull_image_already_exists_maps_to_internal() {
         .collect();
     assert_eq!(recorded, vec!["INTERNAL"]);
 }
+
+/// CRI-3・ERR-3・REPAIR-4: `PullImage` で 429・503・状態なしは同じ `UNAVAILABLE` のまま、
+/// メタデータ `fandhe-registry-http-status`（と 429 の固定文言）で区別できる。参照や上流文言は漏れない。
+#[tokio::test]
+async fn err3_pull_image_429_is_distinguishable_from_other_unavailable() {
+    use fandhe_container_cri::error::REGISTRY_HTTP_STATUS_METADATA_KEY;
+    let cases = [
+        (Some(429u16), "registry rate limit exceeded", Some("429")),
+        (Some(503), "registry is unavailable", Some("503")),
+        (None, "registry is unavailable", None),
+    ];
+    for (http, msg, meta) in cases {
+        let mut oe = OciError::new(
+            OciErrorCode::Unavailable,
+            "upstream detail private.example.com/team/app token=dummy",
+        );
+        if let Some(h) = http {
+            oe = oe.with_http_status(h);
+        }
+        let puller = Arc::new(FakePuller {
+            err: PullError::from_oci(&oe),
+            calls: AtomicUsize::new(0),
+        });
+        let recorder = Arc::new(Collect::default());
+        let svc = CriImageService::with_store_and_recorder(
+            Arc::new(InMemoryImageStore::new()),
+            recorder.clone(),
+        )
+        .with_puller(puller.clone());
+        let req = v1::PullImageRequest {
+            image: Some(ImageSpec {
+                image: "private.example.com/team/app:1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = ImageService::pull_image(&svc, Request::new(req))
+            .await
+            .expect_err("pull must fail");
+        assert_eq!(pair(&err), (Code::Unavailable, msg.to_string()), "{http:?}");
+        let got = err
+            .metadata()
+            .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(got.as_deref(), meta, "{http:?}");
+        for leaked in ["private.example.com", "upstream detail", "token="] {
+            assert!(!err.message().contains(leaked), "{http:?} leaked {leaked}");
+        }
+        assert_eq!(puller.calls.load(Ordering::SeqCst), 1, "{http:?}");
+        let listed =
+            ImageService::list_images(&svc, Request::new(v1::ListImagesRequest::default()))
+                .await
+                .expect("list")
+                .into_inner();
+        assert!(listed.images.is_empty(), "{http:?}");
+    }
+}

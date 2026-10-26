@@ -13,8 +13,9 @@
 //! `open_store` が先に失敗するため到達しない）。
 //!
 //! `create` は core を呼ぶ前に、同じ ID の前のインスタンスが残したコンテナログを best effort で回収する
-//! （`reclaim_stale_container_log`。`delete` の待ちを超えて残った分。#2698・SUP-7・CLI-1）。ID を再利用しない場合の
-//! 残りは手動で消す（`docs/setup/container-log-recovery.md`）。
+//! （`reclaim_stale_container_log`。`delete` の待ちを超えて残った分。#2698・SUP-7・CLI-1）。本体は plugin-cri の
+//! `CreateContainer` と共有する supervisor の `logs::reclaim_stale_container_logs`（#2760）。ID を再利用しない
+//! CRI 側の残りは plugin-cri の起動時の走査で回収し、それでも残るものは手動で消す（`docs/setup/container-log-recovery.md`）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
@@ -923,28 +924,21 @@ fn reclaim_stale_container_log(
     id: &fandhe_container_core::traits::ContainerId,
     recorder: &OpRecorder,
 ) -> Result<(), OciRuntimeError> {
-    use fandhe_container_supervisor::logs::{
-        CONTAINER_LOG_REMOVE_TIMEOUT, remove_container_logs_guarded_bounded,
-    };
+    use fandhe_container_supervisor::logs::{StaleLogReclaim, reclaim_stale_container_logs};
     let Some(root) = store.host_state_root() else {
         return Ok(());
     };
     let started = Instant::now();
     let guard_root = root.to_path_buf();
     let guard_id = id.clone();
-    let mut timed_out = false;
-    let outcome = match remove_container_logs_guarded_bounded(
-        root,
-        id,
-        CONTAINER_LOG_REMOVE_TIMEOUT,
-        move || super::stop_delete::id_is_still_deleted(&guard_root, &guard_id),
-    ) {
-        Ok(removed) if removed.log_files() > 0 => OpOutcome::Success,
-        Ok(_) => return Ok(()),
-        Err(e) => {
-            timed_out = e.code() == fandhe_container_core::traits::ErrorCode::Timeout;
-            OpOutcome::Failure
-        }
+    // 回収の本体は plugin-cri の `CreateContainer` と共有する（#2760・REPAIR-1）。ここは計上と期限切れの写像だけを持つ。
+    let (outcome, timed_out) = match reclaim_stale_container_logs(root, id, move || {
+        super::stop_delete::id_is_still_deleted(&guard_root, &guard_id)
+    }) {
+        StaleLogReclaim::Removed(_) => (OpOutcome::Success, false),
+        StaleLogReclaim::Nothing => return Ok(()),
+        StaleLogReclaim::Failed(_) => (OpOutcome::Failure, false),
+        StaleLogReclaim::TimedOut => (OpOutcome::Failure, true),
     };
     if let Ok(name) = OpName::new("container_log_reclaim") {
         let _ = recorder.record(&name, outcome, started.elapsed());

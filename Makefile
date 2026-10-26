@@ -35,7 +35,7 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing small-files-compare dns-helper-measure idle-memory \
@@ -232,6 +232,9 @@ install-launcher-selftest: ## 特権ランチャーのインストールスク�
 
 repeat-test-selftest: ## repeat-test スクリプトの自己テスト（REPAIR-12・#2538。スタブの cargo のみ）
 	@scripts/repeat-test-selftest.sh
+
+check-success-lines-selftest: ## 実機前提テストの成功行照合スクリプトの自己テスト（REPAIR-12・#2768。fixture のみ）
+	@scripts/check-success-lines-selftest.sh
 
 crictl-smoke-selftest: ## crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
 	@scripts/with-tools.sh python3 scripts/cri/crictl-smoke-selftest.sh

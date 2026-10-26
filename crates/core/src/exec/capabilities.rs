@@ -86,12 +86,55 @@ trait CapKernel {
 ///
 /// rootless の exec（対象の user namespace へ参加した場合）が `Some` で渡す。launch は `process.user` が 0/0 なら
 /// `None`（`uid_map` の結果として既に名前空間内の uid 0・gid 0）、非 root なら `Some` で渡して同じ経路で切り替える
-/// （OCI-1・SEC-5。写像との整合は launcher が fork 前に検査する）。exec の非 root は `process_ids_from_config` が
-/// `Unimplemented` で拒否する（未対応 = REPAIR-3）。
+/// （OCI-1・SEC-5。写像との整合は launcher が fork 前に検査する）。exec の非 root も `exec::reapply` の
+/// `exec_user_from_config` が対象 user namespace の写像と照合したうえで渡す（#2770）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessIds {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+}
+
+/// 正規化済みの補助グループの指定（並べ替えと重複除去が済み、件数が上限以内。OCI-1・SEC-5・CORE-6・#2667・
+/// #2770）。壊れた値（未検査の件数・未整列の並び）を表現できないよう、構築は [`NormalizedGroups::new`] だけにする。
+///
+/// 確保（`Vec` の作成・`sort`・`dedup`）をここへ集め、fork の **前** に済ませるための型。launch は launcher が
+/// fork の前に、exec は `prepare_exec_restrictions`（worker の中。コマンドを fork する前）で作り、capability 削減段
+/// （`apply_supplementary_groups`）は読み戻した値の比較以外で目標側を確保しない。空は「補助グループを持たない
+/// （消去する）」の意味。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct NormalizedGroups(Vec<u32>);
+
+impl NormalizedGroups {
+    /// 指定を並べ替え・重複除去して作る。件数が `sys::SUPPLEMENTARY_GROUPS_MAX` を超えると `InvalidArgument`
+    /// （段 `Validate`。メッセージに値を含めない。ERR-1）。
+    pub(crate) fn new(gids: &[u32]) -> Result<Self, ExecError> {
+        if gids.len() > crate::sys::SUPPLEMENTARY_GROUPS_MAX {
+            return Err(ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::Validate,
+                "process.user.additionalGids has too many entries",
+            ));
+        }
+        let mut list = gids.to_vec();
+        list.sort_unstable();
+        list.dedup();
+        Ok(Self(list))
+    }
+
+    /// 補助グループを持たない指定（消去）。確保しない。
+    pub(crate) fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// 並べ替えと重複除去が済んだ一覧。
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+
+    /// 空（消去）か。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// 本物の syscall を呼ぶ実装。スレッド数の取得元（`/proc/self/status` か、`setns` 前に開いた fd）を持つ。
@@ -208,7 +251,7 @@ impl CapKernel for RealKernel<'_> {
 /// launch 経路（組み込みの capability 削減段）と稼働中コンテナへの exec（`reapply_restrictions`）が同じ関数で
 /// 同じ扱いをする: 指定が空なら補助グループを **持たない**。launch は `config.json` の
 /// `process.user.additionalGids` が非空ならそのグループだけを持たせる（[`SupplementaryGroups::Applied`]。
-/// exec は非空を拒否するため常に空。OCI-1・SEC-5・CORE-6・#2667）。起動したプロセス（supervisor・
+/// exec も `process.user.additionalGids` を対象の写像と照合したうえで同じ関数で適用する（OCI-1・SEC-5・CORE-6・#2667・#2770）。起動したプロセス（supervisor・
 /// exec を起動した CLI。`sudo` 経由なら呼び出しユーザーのもの）のホスト側の補助グループを持ち越さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -237,7 +280,7 @@ pub enum SupplementaryGroups {
         kept: usize,
     },
     /// `process.user.additionalGids` の指定を `setgroups(list)` で適用し、読み戻して一致を確かめた
-    /// （OCI-1・SEC-5・CORE-6・#2667。launch だけ）。
+    /// （OCI-1・SEC-5・CORE-6・#2667・#2770。launch と、写像と照合済みの exec）。
     Applied {
         /// 適用後の件数。
         count: usize,
@@ -309,6 +352,7 @@ pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError
         &mut ThreadCountSource::ProcSelf,
         None,
         None,
+        &NormalizedGroups::empty(),
         ContainerCapabilities::oci_default(),
     )
 }
@@ -329,11 +373,13 @@ pub(crate) fn apply_default_capabilities_with(
     threads: &mut ThreadCountSource,
     own_proc_dir: Option<BorrowedFd<'_>>,
     ids: Option<ProcessIds>,
+    groups: &NormalizedGroups,
     allowed: ContainerCapabilities,
 ) -> Result<CapabilityReport, ExecError> {
-    apply_capabilities_single_threaded(
+    apply_capabilities_single_threaded_with_groups(
         allowed.bounding(),
         ids,
+        groups,
         &mut RealKernel {
             threads,
             own_proc_dir,
@@ -351,7 +397,7 @@ pub(crate) fn apply_default_capabilities_with(
 pub(crate) fn apply_default_capabilities_for_launch(
     threads: &mut ThreadCountSource,
     ids: Option<ProcessIds>,
-    groups: &[u32],
+    groups: &NormalizedGroups,
     allowed: ContainerCapabilities,
 ) -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded_with_groups(
@@ -366,13 +412,14 @@ pub(crate) fn apply_default_capabilities_for_launch(
     )
 }
 
-/// 補助グループの指定が空の [`apply_capabilities_single_threaded_with_groups`]（exec と単体試験の入口）。
+/// 補助グループの指定が空の [`apply_capabilities_single_threaded_with_groups`]（単体試験の入口）。
+#[cfg(test)]
 fn apply_capabilities_single_threaded(
     allowed: CapabilitySet,
     ids: Option<ProcessIds>,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
-    apply_capabilities_single_threaded_with_groups(allowed, ids, &[], kernel)
+    apply_capabilities_single_threaded_with_groups(allowed, ids, &NormalizedGroups::empty(), kernel)
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_capabilities_with_groups`] を呼ぶ。事前検査は副作用の前に行う。
@@ -381,7 +428,7 @@ fn apply_capabilities_single_threaded(
 fn apply_capabilities_single_threaded_with_groups(
     allowed: CapabilitySet,
     ids: Option<ProcessIds>,
-    groups: &[u32],
+    groups: &NormalizedGroups,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
     if kernel.thread_count() != Some(1) {
@@ -412,13 +459,13 @@ fn apply_capabilities(
     ids: Option<ProcessIds>,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
-    apply_capabilities_with_groups(allowed, ids, &[], kernel)
+    apply_capabilities_with_groups(allowed, ids, &NormalizedGroups::empty(), kernel)
 }
 
 fn apply_capabilities_with_groups(
     allowed: CapabilitySet,
     ids: Option<ProcessIds>,
-    groups: &[u32],
+    groups: &NormalizedGroups,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
     let stage = IsolationStage::CapabilityDrop;
@@ -655,6 +702,30 @@ pub fn apply_join_credentials_for_test(
     Ok(groups)
 }
 
+/// 結合試験専用: user namespace への参加の後に本番が通る「補助グループの適用 → gid・uid の切り替え」を、非 root の
+/// `process.user` と `additionalGids` で本物の syscall により通す（SUP-6・SEC-5・CORE-6・#2770）。
+///
+/// 呼び出し文脈は supervisor の `tests/exec_setns_join.rs` の使い捨ての子プロセス（単一スレッドの `main`。
+/// `join_namespaces` で対象の user namespace へ参加した直後）。capability は削減しない。`groups` は本番と同じ
+/// 正規化（並べ替え・重複除去）を通す。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn apply_join_user_for_test(
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+) -> Result<SupplementaryGroups, ExecError> {
+    let groups = NormalizedGroups::new(groups)?;
+    let mut kernel = RealKernel {
+        threads: &mut ThreadCountSource::ProcSelf,
+        own_proc_dir: None,
+        rebind: CredentialRebind::ExecWorker,
+    };
+    let applied = apply_supplementary_groups(&mut kernel, &groups)?;
+    set_process_ids(&mut kernel, ProcessIds { uid, gid })?;
+    Ok(applied)
+}
+
 /// gid → uid の順で `ids` へ揃え、読み戻して (実, 実効, 保存) の 3 値すべてが一致することを確かめる
 /// （SUP-6・SEC-5・TASK-163 追補・#1462）。
 ///
@@ -715,16 +786,19 @@ fn set_process_ids(kernel: &mut impl CapKernel, ids: ProcessIds) -> Result<(), E
 ///   不足・`setgroups` が `deny`・seccomp・LSM）は `PermissionDenied`、写像の外の gid は `FailedPrecondition`、
 ///   読み戻しの不一致は `Internal`。現状維持（`KeptSetgroupsDenied`）へは逃がさない
 ///
-/// 写像との照合は fork の前に launcher の `check_user_mapped` が済ませているため、ここでの拒否は防御の二重化。
+/// 写像との照合は fork の前に済んでいる（launch は launcher の `check_additional_gids_mapped`、exec は
+/// `exec::reapply` の `exec_user_from_config`）ため、ここでの拒否は防御の二重化。
 ///
-/// 本関数は fork 子で確保する（`to_vec`・`sort`・`dedup`）が安全である。子は必ず `sys::fork_single_threaded*`
-/// （`fork_checked`。core で唯一の `fork()`）を経ており、fork 直前の `Threads: 1` が強制されるため、他スレッドが
-/// 握ったアロケータのロックを引き継がない。本番の経路（launch の C → I → PID 1、exec worker）はどれも本物の
-/// スレッド数判定を渡し、定数判定は `#[cfg(test)]` の中だけにある。同じ段は既に確保もしている（`dropped`）。
-/// 確保を fork の前へ移す必要はない（#2759・#2731 P2-1）。
+/// 確保の位置: `target` の正規化（`to_vec`・`sort`・`dedup`）は [`NormalizedGroups::new`] で fork の前に済んでおり、
+/// 本関数が確保するのは `getgroups` の読み戻し（`sys::read_supplementary_groups` の `vec!`）だけである。この確保は
+/// 子（launch の C → I → PID 1、exec worker）が `sys::fork_single_threaded*`（core で唯一の `fork()`）を経ている
+/// ため、他スレッドが握ったアロケータのロックを引き継がず安全である（#2759・#2731 P2-1・#2797）。
+/// `setgroups` を呼ぶ時点で単一スレッドであることは、呼び出し元の `apply_capabilities_single_threaded_with_groups`
+/// が前後で `Threads: 1` を確かめて保証する（exec では worker 自身が `fork_single_threaded` の子で、コマンドを
+/// fork する `spawn_exec_command` の子は補助グループに触れず、確保もしない）。
 fn apply_supplementary_groups(
     kernel: &mut impl CapKernel,
-    target: &[u32],
+    target: &NormalizedGroups,
 ) -> Result<SupplementaryGroups, ExecError> {
     if target.is_empty() {
         return drop_supplementary_groups(kernel);
@@ -732,17 +806,15 @@ fn apply_supplementary_groups(
     let stage = IsolationStage::CapabilityDrop;
     let fail = |e: SysError, what: &str| ExecError::from_sys(e, stage, what);
     kernel
-        .set_supplementary_groups(target)
+        .set_supplementary_groups(target.as_slice())
         .map_err(|e| fail(e, "setgroups"))?;
     let mut after = kernel
         .supplementary_groups()
         .map_err(|e| fail(e, "getgroups"))?;
-    let mut want = target.to_vec();
+    // 目標側は正規化済み（並べ替えと重複除去が済み）。読み戻した値だけを正規化して比べる。
     after.sort_unstable();
     after.dedup();
-    want.sort_unstable();
-    want.dedup();
-    if after != want {
+    if after.as_slice() != target.as_slice() {
         return Err(ExecError::new(
             ErrorCode::Internal,
             stage,
@@ -842,8 +914,8 @@ pub(super) mod testing {
     use std::cell::Cell;
 
     use super::{
-        CapabilityReport, ContainerCapabilities, ExecError, PreJoinGroups, ProcessIds,
-        apply_capabilities_single_threaded_with_groups,
+        CapabilityReport, ContainerCapabilities, ExecError, NormalizedGroups, PreJoinGroups,
+        ProcessIds, apply_capabilities_single_threaded_with_groups,
     };
     use crate::sys::{EINVAL, EPERM, SysError, ThreadCaps};
 
@@ -862,10 +934,10 @@ pub(super) mod testing {
     /// `process.user`（0/0 のときは `None`。OCI-1・SEC-5）。
     pub(in crate::exec) fn apply_default_capabilities_ids(
         ids: Option<ProcessIds>,
-        groups: &[u32],
+        groups: &NormalizedGroups,
         allowed: ContainerCapabilities,
     ) -> Result<CapabilityReport, ExecError> {
-        GROUPS_SEEN.with(|c| c.set(Some(groups.to_vec())));
+        GROUPS_SEEN.with(|c| c.set(Some(groups.as_slice().to_vec())));
         apply_with_ids(ids, groups, allowed)
     }
 
@@ -876,7 +948,7 @@ pub(super) mod testing {
 
     fn apply_with_ids(
         ids: Option<ProcessIds>,
-        groups: &[u32],
+        groups: &NormalizedGroups,
         allowed: ContainerCapabilities,
     ) -> Result<CapabilityReport, ExecError> {
         crate::exec::no_new_privs::testing::rec("capability_drop");
@@ -943,10 +1015,12 @@ pub(super) mod testing {
         _threads: &mut super::ThreadCountSource,
         _own_proc_dir: Option<std::os::fd::BorrowedFd<'_>>,
         ids: Option<ProcessIds>,
+        groups: &NormalizedGroups,
         allowed: ContainerCapabilities,
     ) -> Result<CapabilityReport, ExecError> {
         IDS_SEEN.with(|c| c.set(Some(ids)));
-        apply_with_ids(ids, &[], allowed)
+        GROUPS_SEEN.with(|c| c.set(Some(groups.as_slice().to_vec())));
+        apply_with_ids(ids, groups, allowed)
     }
 
     /// 直近の偽物の適用に渡された許可集合（読むと消える。launch / exec が記録の集合を渡したことの照合用）。
@@ -1194,6 +1268,63 @@ mod tests {
         apply_capabilities(CapabilitySet::oci_default(), None, fake)
     }
 
+    /// 試験用: 正規化済みの指定を作る。
+    fn ng(gids: &[u32]) -> NormalizedGroups {
+        NormalizedGroups::new(gids).unwrap()
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2770）: 正規化は昇順に並べ替え、重複を除く。空は空。上限ちょうどは通り、上限 + 1 は
+    /// 確保の前に `InvalidArgument`（段 `Validate`。メッセージに値を含めない）。
+    #[test]
+    fn oci1_sec5_normalized_groups_sort_dedup_and_limit() {
+        assert_eq!(ng(&[3000, 2000, 3000, 5]).as_slice(), &[5, 2000, 3000]);
+        assert!(ng(&[]).is_empty());
+        assert_eq!(NormalizedGroups::empty(), ng(&[]));
+        let max = crate::sys::SUPPLEMENTARY_GROUPS_MAX;
+        let at_limit: Vec<u32> = (0..max as u32).collect();
+        assert_eq!(
+            NormalizedGroups::new(&at_limit).unwrap().as_slice().len(),
+            max
+        );
+        let over: Vec<u32> = (0..=max as u32).collect();
+        let e = NormalizedGroups::new(&over).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.stage, IsolationStage::Validate);
+        assert_eq!(
+            e.message,
+            "process.user.additionalGids has too many entries"
+        );
+    }
+
+    /// SUP-6・SEC-5・CORE-6（#2770）: exec が渡す非 root の ids と補助グループは、setgroups → setresgid → setresuid
+    /// の順で適用され、結果は `Applied`（読み戻しは重複を除いた件数）。
+    #[test]
+    fn sup6_sec5_exec_user_applies_groups_then_gid_then_uid() {
+        let mut k = Fake::new();
+        k.groups = 1;
+        let ids = Some(ProcessIds {
+            uid: 1000,
+            gid: 1000,
+        });
+        let report = apply_capabilities_single_threaded_with_groups(
+            CapabilitySet::oci_default(),
+            ids,
+            &ng(&[3000, 2000, 2000]),
+            &mut k,
+        )
+        .unwrap();
+        assert_eq!(
+            report.supplementary_groups,
+            SupplementaryGroups::Applied { count: 2 }
+        );
+        assert_eq!(k.groups_list, vec![2000, 3000]);
+        let pos = |name: &str| k.calls.iter().position(|c| *c == name).unwrap();
+        assert!(pos("setgroups_list") < pos("setresgid"));
+        assert!(pos("setresgid") < pos("setresuid"));
+        assert_eq!(k.uids, [1000, 1000, 1000]);
+        assert_eq!(k.gids, [1000, 1000, 1000]);
+    }
+
     /// OCI-1・SEC-5・CORE-6（#2667）: 非空の補助グループは `setgroups(list)` → 読み戻し → gid の切り替えの順で適用され、
     /// 消去（`setgroups(0)`）は呼ばれない。結果は `Applied`（重複を除いた件数）。
     #[test]
@@ -1208,7 +1339,7 @@ mod tests {
         let report = apply_capabilities_with_groups(
             CapabilitySet::oci_default(),
             ids,
-            &[3000, 2000],
+            &ng(&[3000, 2000]),
             &mut k,
         )
         .unwrap();
@@ -1218,7 +1349,8 @@ mod tests {
         );
         assert_eq!(report.supplementary_groups.as_str(), "applied");
         assert_eq!(report.supplementary_groups.remaining(), 2);
-        assert_eq!(k.groups_list, vec![3000, 2000]);
+        // 正規化済み（昇順）の一覧で setgroups される。
+        assert_eq!(k.groups_list, vec![2000, 3000]);
         assert_eq!(
             &k.calls[..3],
             ["setgroups_list", "getgroups_list", "setresgid"]
@@ -1233,21 +1365,24 @@ mod tests {
         let mut k = Fake::new();
         k.set_list_err = Some(SysError::Os(EPERM));
         k.setgroups_denied = Some(true);
-        let e = apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &[5], &mut k)
-            .unwrap_err();
+        let e =
+            apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &ng(&[5]), &mut k)
+                .unwrap_err();
         assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert!(!k.calls.contains(&"drop"));
 
         let mut k = Fake::new();
         k.set_list_err = Some(SysError::Os(EINVAL));
-        let e = apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &[5], &mut k)
-            .unwrap_err();
+        let e =
+            apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &ng(&[5]), &mut k)
+                .unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
 
         let mut k = Fake::new();
         k.set_list_noop = true;
-        let e = apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &[5], &mut k)
-            .unwrap_err();
+        let e =
+            apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &ng(&[5]), &mut k)
+                .unwrap_err();
         assert_eq!(e.code, ErrorCode::Internal);
         assert_eq!(
             e.message,
@@ -1260,9 +1395,13 @@ mod tests {
     fn oci1_sec5_empty_additional_gids_still_clear() {
         let mut k = Fake::new();
         k.groups = 3;
-        let report =
-            apply_capabilities_with_groups(CapabilitySet::oci_default(), None, &[], &mut k)
-                .unwrap();
+        let report = apply_capabilities_with_groups(
+            CapabilitySet::oci_default(),
+            None,
+            &NormalizedGroups::empty(),
+            &mut k,
+        )
+        .unwrap();
         assert_eq!(
             report.supplementary_groups,
             SupplementaryGroups::Cleared { cleared: 3 }
@@ -1887,6 +2026,7 @@ mod tests {
                 source,
                 None,
                 None,
+                &NormalizedGroups::empty(),
                 ContainerCapabilities::oci_default(),
             )
             .unwrap_err();

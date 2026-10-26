@@ -56,9 +56,9 @@ use std::fmt;
 
 #[cfg(not(test))]
 use super::ThreadCountSource;
-use super::capabilities::ProcessIds;
 #[cfg(not(test))]
 use super::capabilities::apply_default_capabilities_for_launch;
+use super::capabilities::{NormalizedGroups, ProcessIds};
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
@@ -351,7 +351,7 @@ pub struct StagePipeline {
     /// `process.user.additionalGids`。空でなければ組み込みの capability 削減段が `setgroups(list)` で適用し、
     /// 読み戻して確かめる（空なら補助グループを消去する。写像との照合は launcher が fork の前に済ませる。
     /// OCI-1・SEC-5・CORE-6・#2667）。
-    supplementary_groups: Vec<u32>,
+    supplementary_groups: NormalizedGroups,
     /// 組み込みの capability 削減段が適用する許可集合（既定は OCI 既定集合。`process.capabilities` の drop で絞る。
     /// SEC-1・CRI-2・#2666）。OCI 既定の部分集合だけを表す型なので、ここから広げる経路は無い。
     capabilities: ContainerCapabilities,
@@ -403,7 +403,7 @@ impl StagePipeline {
             landlock: None,
             mounts: MountedTargets::new(),
             process_ids: None,
-            supplementary_groups: Vec::new(),
+            supplementary_groups: NormalizedGroups::empty(),
             capabilities: ContainerCapabilities::oci_default(),
             listener_sender: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
@@ -434,7 +434,7 @@ impl StagePipeline {
     }
 
     /// `process.user.additionalGids` を capability 削減段で適用させる（launch。OCI-1・SEC-5・CORE-6・#2667）。
-    pub(crate) fn with_supplementary_groups(mut self, gids: Vec<u32>) -> Self {
+    pub(crate) fn with_supplementary_groups(mut self, gids: NormalizedGroups) -> Self {
         self.supplementary_groups = gids;
         self
     }
@@ -1462,7 +1462,7 @@ mod tests {
     fn oci1_sec5_with_supplementary_groups_reaches_capability_drop() {
         take();
         StagePipeline::new()
-            .with_supplementary_groups(vec![5, 6])
+            .with_supplementary_groups(NormalizedGroups::new(&[6, 5, 6]).unwrap())
             .run_then(|_, _, _| Ok(()))
             .unwrap();
         assert_eq!(

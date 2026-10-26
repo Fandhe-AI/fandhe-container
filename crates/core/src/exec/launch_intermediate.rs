@@ -1363,9 +1363,11 @@ mod tests {
             pinned_rootfs: None,
             status: None,
             working_dir: None,
+            root_readonly: true,
         };
         let out = with_status(setup, &file);
         assert!(out.sysctls.is_some());
+        assert!(out.root_readonly);
         assert!(out.status.is_some());
     }
 

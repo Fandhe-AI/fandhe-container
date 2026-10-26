@@ -69,7 +69,7 @@
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
 //!   補助グループ(`additionalGids`)は uid・gid と同様に fork の前に gid の写像と照合し
 //!   (`check_additional_gids_mapped`。単一 ID 写像では指定を拒否)、同じ削減段が `setgroups(list)` で適用して読み戻す(#2667)。
-//!   名前形式の `User` の解決・exec 経路の非 root は未対応
+//!   名前形式の `User` の解決は未対応(exec 経路の非 root は #2770 で対応済み)
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
 //!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
@@ -101,8 +101,9 @@
 //!   `unshare` する。`--ipc=host` との併用は `InvalidArgument`。pid の共有・`/dev/shm` の共有・片方だけの join は未対応
 //!   (pid は init が PID 1 であることを制限適用の証跡の前提にしているため。保持役〔供給元〕の設計は後続 issue)
 //! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
-//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
-//!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
+//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は、root が書き込み可能なら
+//!   Landlock の `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）。
+//!   `root.readonly=true`（#2767）なら root に書き込み権が無いため拒否に当たらず、`ro` で適用される
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
@@ -148,9 +149,9 @@ use crate::dev_mounts::ImplicitDevMounts;
 use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
     IntermediatePlan, IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage,
-    LaunchAudit, LaunchTag, Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan,
-    StageKind, StagePipeline, SysctlPlan, plan, plan_rootless_subordinate, rescan_unreported_init,
-    spawn_container_via_intermediate,
+    LaunchAudit, LaunchTag, Namespace, NamespaceSet, NormalizedGroups, PrePivotSetup,
+    PreparedLaunchFailure, Rescan, StageKind, StagePipeline, SysctlPlan, plan,
+    plan_rootless_subordinate, rescan_unreported_init, spawn_container_via_intermediate,
 };
 #[cfg(target_os = "linux")]
 use crate::injected_files::InjectedFileSet;
@@ -1286,10 +1287,13 @@ impl Inner {
             .without(options.capability_drop());
         let isolation_record = isolation_record.with_capabilities(capabilities);
         let (uid, gid) = spec.user();
+        // 補助グループの正規化(確保・整列・重複除去)は fork の前に済ませる(#2770)。
+        let additional_gids =
+            NormalizedGroups::new(spec.additional_gids()).map_err(|e| to_trait_error(&e))?;
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
             .with_process_ids(uid, gid)
-            .with_supplementary_groups(spec.additional_gids().to_vec())
+            .with_supplementary_groups(additional_gids)
             .with_capabilities(capabilities)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
@@ -1913,6 +1917,8 @@ impl LaunchOps for RealOps {
             },
             status: None,
             working_dir: Some(input.spec.working_dir()),
+            // config の `root.readonly` そのもの（外す・緩める入口ではない。#2767）。
+            root_readonly: input.spec.config().root().readonly(),
         };
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {
@@ -2328,8 +2334,8 @@ mod tests {
         spec_with_root_readonly(name, false, linux_extra, mounts, args, env, user)
     }
 
-    /// `root.readonly` を選べる組み立て(#2714)。`LaunchSpec::new` を直接使うため、`start` の `root.readonly` 拒否
-    /// (`Unimplemented`)は通らない。Landlock のルールが読み取り専用 root でどうなるかの単体照合専用。
+    /// `root.readonly` を選べる組み立て(#2714)。`start` は #2767 から `root.readonly=true` を受けるため、
+    /// `start` を通しても同じ spec になる。Landlock のルールが読み取り専用 root でどうなるかの単体照合に使う。
     fn spec_with_root_readonly(
         name: &str,
         root_readonly: bool,

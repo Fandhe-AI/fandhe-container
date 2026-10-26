@@ -2907,6 +2907,8 @@ fn set_mount_nodev_raw(fd: RawFd) -> Result<(), SysError> {
 ///
 /// 意味論: `MS_REMOUNT` が superblock ごと ro にするのに対し、本関数はこのマウントの `MNT_READONLY` だけを立てる。
 /// 呼び出し側は同じ superblock の別マウントを作らないため、コンテナから見た保証（`EROFS`）は変わらない。
+/// 呼び出し元は inject の tmpfs・`path_masks` の読み取り専用化に加え、`root.readonly=true` の rootfs の mount top
+/// （`exec::make_root_read_only`。CORE-5・SEC-1・#2767）。
 /// 書き込み中の fd が残っていると `EBUSY` になるので、呼び出し前にすべて閉じておくこと。
 /// fd がマウントのルートでないと `EINVAL`。必要なカーネルは Linux 5.12 以降で、`ENOSYS` は
 /// [`SysError::Unsupported`] で返し `mount(2)` へは縮退しない。

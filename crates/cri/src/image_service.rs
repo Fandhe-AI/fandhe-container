@@ -135,6 +135,11 @@ impl ImageRecord {
         })
     }
 
+    /// タグ参照（`<repo>:<tag>`）の一覧（#2901・CRI-2・OCI-1。ContainerStatus の `image` の元。先頭が `repoTags[0]`）。
+    pub fn repo_tags(&self) -> &[String] {
+        &self.repo_tags
+    }
+
     /// digest 参照（`<repo>@sha256:<manifest digest>`）の一覧（#2831。ContainerStatus の `image_ref` の元）。
     pub fn repo_digests(&self) -> &[String] {
         &self.repo_digests

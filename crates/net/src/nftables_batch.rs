@@ -30,7 +30,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ルール本体（NEWRULE）は `nftables_rules` が担当する（TASK-138.1・TASK-138.2）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
+//! ルール本体（NEWRULE）は `nftables_rules` が担当する（TASK-138.1・TASK-138.2）。NEWRULE の
+//! `NLM_F_ECHO` 応答からのルールハンドル取得は `ack` が担う（NET-3・#2839。GETRULE dump は未実装）。実機前提テストは `tests/nftables_batch_privileged.rs`（TASK-137.4・#307。AGENTS.md「実機前提テスト」）。ソケット送信と ACK 判定
 //! （#306）は実装済みだが、`SO_SNDBUF` / `SO_RCVBUF` の調整・extended ACK・`NFTA_GEN_ID` は未実装（`socket` の doc）。
 //! 定数値は Linux UAPI（`nfnetlink.h`・`netfilter.h`）に基づく。
 
@@ -50,8 +51,10 @@ pub use table_chain::*;
 
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{
-    MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder, NlMsgHeader,
+    MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_ECHO, NLM_F_REQUEST, NLMSG_HEADER_LEN, NlMsgBuilder,
+    NlMsgHeader,
 };
+use crate::nftables_rules::NFT_MSG_NEWRULE;
 
 /// バッチがカーネルに適用されたかどうか（OS 非依存。`network` の判定でも使うため ack から切り出した。呼び出し側が再照会の要否を判断する材料）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,8 @@ pub struct NftBatch {
     begin_seq: u32,
     next_seq: u32,
     body_seqs: Vec<u32>,
+    /// 本体ごとの echo 要求（`NLM_F_ECHO`。`body_seqs` と同じ添字）。
+    body_echo: Vec<bool>,
 }
 
 /// 閉じたバッチ。#306 が送信と seq 照合に使う。
@@ -226,6 +231,7 @@ pub struct NftBatchBytes {
     begin_seq: u32,
     end_seq: u32,
     body_seqs: Vec<u32>,
+    body_echo: Vec<bool>,
 }
 
 impl NftBatchBytes {
@@ -248,6 +254,12 @@ impl NftBatchBytes {
     pub fn body_seqs(&self) -> &[u32] {
         &self.body_seqs
     }
+
+    /// `index` 番目の本体が echo 応答（`NLM_F_ECHO`。NEWRULE のルールハンドル取得）を要求しているか。
+    /// 範囲外は `false`（NET-3・#2839）。
+    pub fn body_echo(&self, index: usize) -> bool {
+        self.body_echo.get(index).copied().unwrap_or(false)
+    }
 }
 
 impl NftBatch {
@@ -258,6 +270,7 @@ impl NftBatch {
             begin_seq: first_seq,
             next_seq: first_seq.wrapping_add(1),
             body_seqs: Vec::new(),
+            body_echo: Vec::new(),
         })
     }
 
@@ -291,6 +304,12 @@ impl NftBatch {
         if header.flags() & NLM_F_ACK == 0 {
             return Err(invalid("message lacks NLM_F_ACK flag"));
         }
+        // echo の応答は ACK 判定側が NEWRULE の形でしか解釈しない。それ以外へ付けた ECHO は応答を
+        // 受理できず結果不明になるため、積む時点で拒否する（NET-3・REPAIR-2・#2839）。
+        let echo = header.flags() & NLM_F_ECHO != 0;
+        if echo && header.msg_type() != nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE) {
+            return Err(invalid("NLM_F_ECHO is only supported for NEWRULE"));
+        }
         let payload = msg.get(NLMSG_HEADER_LEN..).unwrap_or(&[]);
         let nfg = NfGenMsg::decode(payload)
             .map_err(|_| invalid("message payload is shorter than nfgenmsg"))?;
@@ -315,6 +334,7 @@ impl NftBatch {
         }
         self.buf.extend_from_slice(&msg);
         self.body_seqs.push(seq);
+        self.body_echo.push(echo);
         self.next_seq = seq.wrapping_add(1);
         Ok(seq)
     }
@@ -332,6 +352,7 @@ impl NftBatch {
             begin_seq: self.begin_seq,
             end_seq,
             body_seqs: self.body_seqs,
+            body_echo: self.body_echo,
         })
     }
 }
@@ -436,6 +457,34 @@ mod tests {
         assert_eq!(
             (out.begin_seq(), out.end_seq(), out.body_seqs()),
             (100, 103, &[101, 102][..])
+        );
+    }
+
+    /// NET-3・REPAIR-2: echo 付きの NEWRULE は受理して添字ごとに記録し、NEWRULE 以外への ECHO は
+    /// `InvalidArgument` でバッファも seq も変えない（#2839）。
+    #[test]
+    fn echo_is_recorded_for_newrule_and_rejected_elsewhere() {
+        use crate::nftables_rules::NFT_MSG_NEWRULE;
+        let newrule = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        let with_echo = |ty: u16| {
+            move |seq: u32| {
+                let mut b = NlMsgBuilder::new(ty, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
+                NfGenMsg::new(NFPROTO_IPV4, 0).put_into(&mut b)?;
+                Ok(b)
+            }
+        };
+        let mut b = NftBatch::new(10).unwrap();
+        assert_eq!(b.push_with(body).unwrap(), 11);
+        assert_eq!(b.push_with(with_echo(newrule)).unwrap(), 12);
+        let before = (b.buf.len(), b.next_seq);
+        let e = b.push_with(with_echo(NEWTABLE)).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!((b.buf.len(), b.next_seq), before);
+        let out = b.finish().unwrap();
+        assert_eq!(out.body_seqs(), &[11, 12]);
+        assert_eq!(
+            (out.body_echo(0), out.body_echo(1), out.body_echo(2)),
+            (false, true, false)
         );
     }
 

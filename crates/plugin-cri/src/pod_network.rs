@@ -135,7 +135,10 @@ fn with_rollback_errors(orig: TraitError, rollback: &[(&str, TraitError)]) -> Tr
 /// ネットワーク名・コンテナ ID・netns 名は `sandbox_id` を使う。途中で失敗したら逆順に戻す: `attach` の失敗は
 /// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。
 /// `publish_port` の失敗は `delete_network` だけで戻す（attach 済みのコンテナの `detach` は未対応で、専用テーブルの
-/// 削除で DNAT ルールと受け口の予約がまとめて消えるため。#2676・NET-4）。戻しも失敗したら、元のエラーと戻しの
+/// 削除で DNAT ルールと受け口の予約がまとめて消えるため。#2676・NET-4）。
+/// `port_mappings` は sandbox 単位で変わらず、`StopPodSandbox` / `RemovePodSandbox` も `delete_network` で一括解放する
+/// ため、`delete_network` 以外の公開の個別解除（`NetsetupBackend::unpublish_port`）の契機は現状要らない
+/// （将来の候補は公開途中の失敗の巻き戻しだけで、`NetworkPlugin` の拡張を伴う後続事項。#2839・NET-3）。戻しも失敗したら、元のエラーと戻しの
 /// エラーを載せた `Internal` を返し、[`SandboxSetUpError::rolled_back`] を偽にする。
 ///
 /// `ports` は cri が検証した公開指定（`host_port > 0` で明示した IPv4）。空なら公開しない。

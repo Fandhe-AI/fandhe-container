@@ -2236,3 +2236,22 @@ fn set_up_sandbox_publish_rollback_failure_is_not_rolled_back() {
     assert_eq!(f.error.code(), ErrorCode::Internal);
     assert!(f.error.message().contains("rollback delete_network failed"));
 }
+
+/// NET-3・#2839: `unpublish_port` を実装しないバックエンドは成功を装わず `Unimplemented`（結果不明ではない）。
+#[test]
+fn net3_unpublish_port_defaults_to_unimplemented() {
+    let (_, fake) = plugin();
+    let publish = PortPublish::new(
+        fandhe_container_net::network::PortProtocol::Tcp,
+        "192.0.2.10".parse().expect("addr"),
+        8080,
+        80,
+    )
+    .expect("publish");
+    let mut network = "web".to_owned();
+    let e = fake
+        .unpublish_port(&mut network, &FakeContainer("c1".to_owned()), &publish)
+        .expect_err("unimplemented");
+    assert_eq!(e.error.code(), ErrorCode::Unimplemented);
+    assert!(!e.rules_unknown);
+}

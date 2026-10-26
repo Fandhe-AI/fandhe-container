@@ -43,10 +43,10 @@
 //!
 //! # ルールハンドルの前提
 //!
-//! ハンドル取得経路（NLM_F_ECHO・GETRULE dump）は未実装（`nftables_rules::rule` の未実装範囲）のため、
-//! kernel のテーブルごとの採番（`nf_tables_alloc_handle` が `++table->hgenerator`）を前提に、新規
-//! テーブルへ chain → rule の順で作ったルールのハンドルを [`EXPECTED_RULE_HANDLE`] とする。
-//! 前提が外れた場合は削除バッチが ENOENT で失敗するので、その旨を名指しして失敗する（fail-closed）。
+//! ルールは `RuleCreate::build_echo`（`NLM_F_ECHO`）で投入し、ACK 判定が回収した echo 応答のハンドル
+//! （`NftBatchAck::rule_handle`。NET-3・#2839）で削除する。あわせて kernel のテーブルごとの採番
+//! （`nf_tables_alloc_handle` が `++table->hgenerator`）の想定どおり、新規テーブルへ chain → rule の順で
+//! 作ったルールのハンドルが [`EXPECTED_RULE_HANDLE`] に一致することを照合する（外れたら名指しして失敗する）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -90,7 +90,7 @@ mod linux {
     };
     use fandhe_container_net::nftables_rules::{
         NftCmp, NftDataValue, NftImmediate, NftNat, NftPayload, NftRegister, NftRuleExprs,
-        NftRuleHandle, RuleCreate, RuleDelete,
+        RuleCreate, RuleDelete,
     };
 
     /// router の外側アドレスで公開するポート（DNAT 前の宛先ポート）。
@@ -662,16 +662,25 @@ mod linux {
         let rule = RuleCreate::new(NftFamily::Ipv4, table.clone(), chain.clone(), dnat_exprs());
         let limit = timeout();
         let started = Instant::now();
-        guard
+        let installed = guard
             .socket
             .send_batch(limit, |b| {
                 b.push_with(|seq| create_table.build(seq))?;
                 b.push_with(|seq| create_chain.build(seq))?;
-                b.push_with(|seq| rule.build(seq))?;
+                b.push_with(|seq| rule.build_echo(seq))?;
                 Ok(())
             })
             .expect("install dnat rule (needs nf_tables, nft_chain_nat, nft_nat, nf_nat)");
         assert!(started.elapsed() < limit, "batch exceeded {limit:?}");
+        // echo 応答のハンドル（本体の添字 2 = rule。table・chain は echo を要求していない）。
+        let handle = installed.rule_handle(2).expect("echoed rule handle");
+        assert_eq!(installed.rule_handle(0), None, "table has no echo");
+        assert_eq!(installed.rule_handle(1), None, "chain has no echo");
+        assert_eq!(
+            handle.get(),
+            EXPECTED_RULE_HANDLE,
+            "the kernel is expected to assign handle 1 to the chain and 2 to the first rule of a new table (nf_tables_alloc_handle)"
+        );
 
         // 3. 投入後: container の CONT_PORT に届く（送信元は変換されない）。AC1。
         let port_after = external_sends(&mut external, &mut used_ports);
@@ -684,7 +693,6 @@ mod linux {
         );
 
         // 4. ハンドル指定で削除する。AC2。
-        let handle = NftRuleHandle::new(EXPECTED_RULE_HANDLE).expect("handle");
         let delete = RuleDelete::new(NftFamily::Ipv4, table.clone(), chain.clone(), handle);
         guard
             .socket
@@ -692,11 +700,7 @@ mod linux {
                 b.push_with(|seq| delete.build(seq))?;
                 Ok(())
             })
-            .unwrap_or_else(|e| {
-                panic!(
-                    "delete by handle {EXPECTED_RULE_HANDLE} failed: {e}; the test assumes the kernel assigns handle 1 to the chain and 2 to the first rule of a new table (nf_tables_alloc_handle)"
-                )
-            });
+            .unwrap_or_else(|e| panic!("delete by echoed handle {} failed: {e}", handle.get()));
 
         // 5. 削除後: 再び router 自身に届く（DNAT が外れた直接の証拠）。
         // 3 と異なる送信元ポートで送るため、3 で DNAT 済みの conntrack エントリは適用されない。
@@ -725,7 +729,8 @@ mod linux {
 
         drop(guard);
         println!(
-            "{OK_PREFIX} before={before} after={after} removed={removed} handle={EXPECTED_RULE_HANDLE} (NET-11)"
+            "{OK_PREFIX} before={before} after={after} removed={removed} handle={} (NET-11)",
+            handle.get()
         );
     }
 }

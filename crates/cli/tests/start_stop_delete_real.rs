@@ -270,10 +270,16 @@ mod linux {
         )
     }
 
-    /// プローブの `OPT_CAP` 5 行（`stdout OPT_CAP <キー> <値>` の完全一致）が `expected` のものか。
+    /// プローブの `OPT_CAP` 5 行（`stdout OPT_CAP <キー> <値>` の完全一致）が期待どおりか。
+    /// `CapInh`・`CapAmb` は 0、`CapPrm`・`CapEff`・`CapBnd` は `expected`（`check_host_caps` と同じ期待。launch 後の `CapInh`・`CapAmb` は常に 0）。
     fn has_cap_lines(logs: &str, expected: u64) -> bool {
         CAP_KEYS.iter().all(|key| {
-            let want = format!("stdout OPT_CAP {key} {expected:016x}");
+            let value = if *key == "CapInh" || *key == "CapAmb" {
+                0
+            } else {
+                expected
+            };
+            let want = format!("stdout OPT_CAP {key} {value:016x}");
             logs.lines().any(|l| l == want)
         })
     }

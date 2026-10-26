@@ -101,7 +101,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecChildStep, ExecCommand, ExecExit,
         MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
         ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
         observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
@@ -411,6 +411,7 @@ mod linux {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
                     code: ViolationReason::EntrypointInterpreterIsRuntimeBinary.error_code(),
+                    step: Some(ExecChildStep::Interpreter),
                 },
                 "{name}"
             );
@@ -508,6 +509,7 @@ mod linux {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointCopyTooLarge),
                 code: ViolationReason::EntrypointCopyTooLarge.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -530,6 +532,7 @@ mod linux {
                     exit: ChildExit::Exited(126),
                     violation: None,
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::SelectExecutable),
                 }
             );
             assert_eq!(observation.report, None);
@@ -556,6 +559,7 @@ mod linux {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
                 code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -598,6 +602,7 @@ mod linux {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
                 code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -711,6 +716,7 @@ mod linux {
                     exit: ChildExit::Exited(125),
                     violation: None,
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::DeferredRlimit),
                 }
             );
             assert_eq!(observation.report, None);
@@ -835,6 +841,7 @@ exec "$2" "$3" "$1""#;
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
                 code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -865,6 +872,7 @@ exec "$2" "$3" "$1""#;
                 exit: ChildExit::Exited(127),
                 violation: None,
                 code: ErrorCode::NotFound,
+                step: Some(ExecChildStep::OpenEntrypoint),
             }
         );
         assert!(!observation.exit.command_started());
@@ -878,6 +886,7 @@ exec "$2" "$3" "$1""#;
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
                 code: ViolationReason::EntrypointIsRuntimeBinary.error_code(),
+                step: Some(ExecChildStep::RuntimeIdentity),
             }
         );
         // 対照: 手順を通った子は「起動した」側に分類される。
@@ -1081,6 +1090,7 @@ exec "$2" "$3" "$1""#;
                     exit: ChildExit::Exited(126),
                     violation: None,
                     code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
                 "{name}"
             );

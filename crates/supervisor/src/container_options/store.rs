@@ -5,7 +5,7 @@
 //! 文書の形は [`document`](super::document)。置き場所は `<state_root>/@container-options/<id>`(ディレクトリは
 //! 0700、ファイルは 0600)で、`--root` と `<id>` だけから導く(supervisor の起動契約・`start_client`・ランチャーは
 //! 変えない)。書くのは CLI の `create`、読むのは supervisor の `start`(`start_entry` の手順 2c)、消すのは CLI の
-//! `delete`。ファイルが無ければ既定値で動く(plugin-cri や従来のコンテナは書かない)。ファイルがあって壊れている・
+//! `delete` と、状態の記録が無い ID の残骸を掃除する plugin-cri の `create` / `delete`(#2760)。ファイルが無ければ既定値で動く(plugin-cri や従来のコンテナは書かない)。ファイルがあって壊れている・
 //! 権限が不正なら fail-closed で拒否する。
 //!
 //! # 外部入力の扱い
@@ -18,10 +18,10 @@
 //! # 残余(REPAIR-3)
 //!
 //! 同じ ID の `create` と `delete` は ID 単位のロック(`@container-options/@locks/<id>`。ID 名をそのまま使い、接頭辞でファイル名の上限を狭めない。[`acquire_lock`])で直列化する
-//! (並行 create で成功した側の文書を消さない)。plugin-cri の create は残骸を掃除しない
-//! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が残りうるが、文書は作成世代
-//! (`gen` レコード)を持ち、状態記録の annotations([`GENERATION_ANNOTATION`])と一致しない文書は採用しない
-//! ([`select_document`]。#2713・SEC-1)。
+//! (並行 create で成功した側の文書を消さない)。plugin-cri は文書を書かないが、create の前に状態の記録が無い ID の
+//! 残骸を、delete の後に記録の無くなった ID の文書を、ロックの下で掃除する([`remove_stale_bounded`]。#2760)。
+//! 掃除に失敗しても、文書は作成世代(`gen` レコード)を持ち、状態記録の annotations([`GENERATION_ANNOTATION`])と
+//! 一致しない文書は採用しない([`select_document`]。#2713・SEC-1)ので安全側に倒れる。
 //! Linux 以外では `Unimplemented` で拒否する(CLI の create は Linux のローカル実行のみ)。
 
 use std::path::{Path, PathBuf};
@@ -381,6 +381,55 @@ mod imp {
 
 pub use imp::{OptionsLock, acquire_lock, new_generation, read, remove, remove_if_same, write_new};
 
+/// 起動オプション文書の削除（ロック取得を含む）を作業スレッドで待つ上限(REPAIR-5)。CLI の delete と plugin-cri の
+/// create / delete が共有する唯一の定義(#2760)。
+pub const OPTIONS_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ID 単位のロックの取得を待つ上限(`OPTIONS_REMOVE_TIMEOUT` より短くする)。
+pub const OPTIONS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 状態の記録が無い ID の文書(残骸)を、ID 単位のロックの下で `guard` を確かめてから消す(期限つき。#2760・SUP-12・REPAIR-5)。
+///
+/// 呼び出し元: CLI の `delete` 後の掃除(`remove_container_options`)と、plugin-cri の `create` の前・`delete` の後の掃除。
+/// ロック取得・`guard` の評価・削除は作業スレッドで `timeout` まで待つ。`guard` はロック保持中に評価され、`false`
+/// (状態に記録がある = 作り直された新しいインスタンスの文書かもしれない)なら何も消さず `Ok`。期限切れは `Timeout`
+/// (作業スレッドは残り得るが、guard はロック保持中に評価されるので後から新しい文書を消すことはない)。
+/// Linux 以外では `Unimplemented`(文書を書く経路が無いため、呼び出し側は対象外として扱う)。
+pub fn remove_stale_bounded(
+    root: &Path,
+    id: &ContainerId,
+    guard: impl FnOnce() -> bool + Send + 'static,
+    lock_wait: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<(), TraitError> {
+    let root = root.to_path_buf();
+    let id = id.clone();
+    crate::supervisor_log::run_bounded(
+        move || -> Result<(), TraitError> {
+            // 文書が無ければ何もしない(ロックディレクトリ・ロックファイルを作らない。create のたびに状態ルートを汚さない)。
+            // 文書が後から現れうるのは同じ ID の `create` だけで、それは自分でロックを取って書く。
+            match std::fs::symlink_metadata(options_path(&root, &id)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                _ => {}
+            }
+            let lock = acquire_lock(&root, &id, lock_wait)?;
+            if !guard() {
+                return Ok(());
+            }
+            let removed = remove(&root, &id);
+            lock.remove_lock_file();
+            removed
+        },
+        timeout,
+    )
+    .unwrap_or_else(|| {
+        Err(err(
+            ErrorCode::Timeout,
+            "container options file removal did not finish within the deadline",
+        ))
+    })
+}
+
 /// 作成世代の識別子を載せる状態記録の annotations のキー(#2713・SEC-1)。
 ///
 /// CLI の create が文書(`gen` レコード)と状態記録の両方へ同じ値を書く。非秘密の識別子で、利用者の label とは
@@ -623,5 +672,35 @@ mod tests {
         assert_eq!(select_document(None, None).expect("none"), None);
         let e = select_document(None, Some("g1")).expect_err("missing");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    }
+
+    /// #2760・SUP-12: `remove_stale_bounded` は guard が真なら文書とロックファイルを消し、偽（状態に記録がある）なら
+    /// 文書のバイト列を変えずに残す。文書が無ければロックディレクトリも作らない。
+    #[test]
+    fn sup12_remove_stale_bounded_honors_guard() {
+        use std::time::Duration;
+        let root = tmp("stale");
+        let wait = Duration::from_secs(2);
+        let limit = Duration::from_secs(5);
+        // 文書が無ければ何も作らない。
+        remove_stale_bounded(&root, &id("none"), || true, wait, limit).expect("noop");
+        assert!(!options_dir(&root).join(LOCKS_DIR_NAME).exists());
+
+        write_new(&root, &id("keep"), &doc()).expect("write keep");
+        let before = std::fs::read(options_path(&root, &id("keep"))).expect("read");
+        remove_stale_bounded(&root, &id("keep"), || false, wait, limit).expect("guard false");
+        assert_eq!(
+            std::fs::read(options_path(&root, &id("keep"))).expect("still there"),
+            before
+        );
+
+        remove_stale_bounded(&root, &id("keep"), || true, wait, limit).expect("guard true");
+        assert!(!options_path(&root, &id("keep")).exists());
+        assert!(
+            !options_dir(&root)
+                .join(LOCKS_DIR_NAME)
+                .join("keep")
+                .exists()
+        );
     }
 }

@@ -78,6 +78,9 @@ pub mod cri;
 pub mod reader;
 pub mod rotating;
 
+#[cfg(all(test, unix))]
+mod sweep_tests;
+
 pub use reader::{
     ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure,
     LogReadOptions, LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS, TailCount,
@@ -213,6 +216,155 @@ pub fn remove_container_logs_guarded_bounded_waiting(
             _ => return result,
         }
     }
+}
+
+/// 待ちを使い切っても同じ ID の sink が閉じなかったことを示す警告行の `reason`（閉じた語彙。#2760・SUP-7・CRI-2・REPAIR-4）。
+///
+/// [`remove_container_logs_guarded_bounded_waiting`] が `FailedPrecondition` を返すのは `lock_wait` を使い切ったときだけ
+/// （途中の `FailedPrecondition` は試し直す）なので、delete の後始末の `FailedPrecondition` はこの意味で一意に読める。
+/// CLI の警告行と plugin-cri の `container_delete_cleanup` 行が共有する唯一の定義（二重管理しない。REPAIR-1）。
+pub const REASON_SINK_OPEN_AFTER_WAIT: &str = "sink_open_after_wait";
+
+/// コンテナログ削除の失敗コードに対応する警告行の `reason`。待ち切れなかった（`FailedPrecondition`）ときだけ `Some`。
+pub fn container_log_removal_reason(code: ErrorCode) -> Option<&'static str> {
+    (code == ErrorCode::FailedPrecondition).then_some(REASON_SINK_OPEN_AFTER_WAIT)
+}
+
+/// [`reclaim_stale_container_logs`] の結果（CLI の `create` と plugin-cri の `CreateContainer` が共有する。#2760・REPAIR-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleLogReclaim {
+    /// 1 件以上のログファイルを消した（件数）。
+    Removed(u32),
+    /// 消すものが無かった、または guard が見送った（状態が既にある ID）。
+    Nothing,
+    /// 回収に失敗した（生きている sink のロック等）。create は続ける（best effort）。
+    Failed(ErrorCode),
+    /// 期限切れ。作業スレッドが残り得るので、呼び出し元は core を呼ばずに失敗させる（SEC-4）。
+    TimedOut,
+}
+
+/// 同じ ID の前のインスタンスが残したコンテナログを、core の create の前に 1 回だけ回収する（#2698・#2760・SUP-7・CRI-2・CLI-1）。
+///
+/// 待たずに [`CONTAINER_LOG_REMOVE_TIMEOUT`] まで 1 回だけ試す（create を遅らせない）。ロックが取れない（古い sink が
+/// 生きている）ときは何も消さず `Failed(FailedPrecondition)`。`guard` はロック保持中に評価され、`false`（状態が既にある）
+/// なら何も消さない。観測（記録器への計上）と `TimedOut` の写像は呼び出し元の責務。
+pub fn reclaim_stale_container_logs(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> StaleLogReclaim {
+    match remove_container_logs_guarded_bounded(root, id, CONTAINER_LOG_REMOVE_TIMEOUT, guard) {
+        Ok(removed) if removed.log_files() > 0 => StaleLogReclaim::Removed(removed.log_files()),
+        Ok(_) => StaleLogReclaim::Nothing,
+        Err(e) if e.code() == ErrorCode::Timeout => StaleLogReclaim::TimedOut,
+        Err(e) => StaleLogReclaim::Failed(e.code()),
+    }
+}
+
+/// 起動時の走査が処理する ID 数の上限（無制限の走査を避ける。REPAIR-5）。
+pub const MAX_SWEEP_IDS: usize = 4096;
+
+/// [`sweep_stale_container_logs`] の結果。パス・ID は含めない（件数のみ。ERR-1）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// 走査したディレクトリエントリ数。
+    pub scanned: usize,
+    /// 消せた ID の数。
+    pub reclaimed_ids: usize,
+    /// 消せたログファイルの数。
+    pub removed_files: u32,
+    /// 生きている sink があり見送った ID の数。
+    pub skipped_live: usize,
+    /// 状態ストアに記録のある ID で見送った数。
+    pub skipped_present: usize,
+    /// ID に戻せず（帰属を確定できず）見送った名前の数。
+    pub skipped_undecodable: usize,
+    /// それ以外の失敗の数（名前空間の不正・I/O 失敗等）。
+    pub failed: usize,
+    /// 期限切れまたは上限に達して打ち切った。
+    pub timed_out: bool,
+}
+
+/// 状態ルートの `@container-logs` を走査し、状態の記録が無い ID の残りログを回収する（起動時に 1 回。#2760・SUP-7・CRI-2・REPAIR-4）。
+///
+/// CRI は ID を使い回さないため、delete の待ちを超えて残ったログを「同じ ID の create」では回収できない。plugin-cri の
+/// 起動時にこれを 1 回呼んで残りを消す（設計: `docs/design/container-log-removal-wait.md`）。名前から ID を復元できたものだけを対象とし、
+/// 削除は ID ごとに [`remove_container_logs_guarded_bounded`]（ロックと名前空間の検査つき）に任せる。待たず 1 回だけ試すので、
+/// 生きている sink（ロックが取れない）は見送る。`may_remove(id)` はロック保持中に評価され、`false`（状態に記録がある）なら消さない
+/// （評価できない場合も `false` に倒す）。全体の期限は `budget`、ID 数の上限は [`MAX_SWEEP_IDS`]。
+pub fn sweep_stale_container_logs(
+    root: &std::path::Path,
+    may_remove: Arc<dyn Fn(&fandhe_container_core::traits::ContainerId) -> bool + Send + Sync>,
+    budget: Duration,
+) -> SweepReport {
+    use std::sync::atomic::AtomicBool;
+    let started = Instant::now();
+    let mut report = SweepReport::default();
+    let dir = container_log_dir(root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => return report,
+        Err(_) => {
+            report.failed = 1;
+            return report;
+        }
+    }
+    let scan = match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
+        Ok(s) => s,
+        Err(_) => {
+            report.failed = 1;
+            return report;
+        }
+    };
+    report.scanned = scan.scanned;
+    report.skipped_undecodable = scan.undecodable;
+    report.timed_out = scan.truncated;
+    for id in &scan.ids {
+        let Some(remaining) = budget
+            .checked_sub(started.elapsed())
+            .filter(|r| !r.is_zero())
+        else {
+            report.timed_out = true;
+            break;
+        };
+        let blocked = Arc::new(AtomicBool::new(false));
+        let guard_blocked = Arc::clone(&blocked);
+        let guard_fn = Arc::clone(&may_remove);
+        let guard_id = id.clone();
+        let result = remove_container_logs_guarded_bounded(
+            root,
+            id,
+            CONTAINER_LOG_REMOVE_TIMEOUT.min(remaining),
+            move || {
+                let ok = guard_fn(&guard_id);
+                if !ok {
+                    guard_blocked.store(true, Ordering::SeqCst);
+                }
+                ok
+            },
+        );
+        match result {
+            Ok(removed) if removed.log_files() > 0 => {
+                report.reclaimed_ids = report.reclaimed_ids.saturating_add(1);
+                report.removed_files = report.removed_files.saturating_add(removed.log_files());
+            }
+            Ok(_) => {
+                if blocked.load(Ordering::SeqCst) {
+                    report.skipped_present = report.skipped_present.saturating_add(1);
+                }
+            }
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                report.skipped_live = report.skipped_live.saturating_add(1);
+            }
+            Err(e) if e.code() == ErrorCode::Timeout => {
+                // 作業スレッドが残り得る。これ以上の試行を重ねず打ち切る。
+                report.timed_out = true;
+                break;
+            }
+            Err(_) => report.failed = report.failed.saturating_add(1),
+        }
+    }
+    report
 }
 
 /// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。

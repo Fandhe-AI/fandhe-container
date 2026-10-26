@@ -18,7 +18,7 @@ SUP-12・CLI-1・CLI-4・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（#2713。#2625�
 | ---- | ---- |
 | 書く | CLI の `create`（core の create より前。失敗したら inode を照合して巻き戻す） |
 | 読む | supervisor の `start`（`start_entry` の手順 2c。期限つきの作業スレッド） |
-| 消す | CLI の `delete`（成功の後。同じ ID が再作成されていなければ。失敗は警告 1 行のみ） |
+| 消す | CLI の `delete`（成功の後。同じ ID が再作成されていなければ。失敗は警告 1 行のみ）。plugin-cri の `create`（core の create の前。状態の記録が無い ID の残骸）と `delete`（core の delete の成功の後。記録が無くなった ID の文書。#2760） |
 
 文書が無ければ既定値で動く（plugin-cri・従来のコンテナは書かない）。文書があって壊れている・権限が不正なら
 手順 4 で cgroup にも launch にも触れずに止める（fail-closed）。手順 3 の中断起動の回復（CORE-2）は従来どおり先に走る。
@@ -76,7 +76,7 @@ core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数
   なりうるため、fd の所有者照合か、CLI が非特権のまま開いて渡す方式を別に設計する（core の `launch_options.rs` の
   「未設計」と同じ課題）
 - **同じ ID の並行 create / delete**: ID 単位のロック（`@container-options/@lock-<id>`、期限つき）を create の間と delete の削除の間に保持して直列化する。文書の I/O（ロック取得・掃除・書き込み・fsync・巻き戻し・`--env-file` の読み取り）は作業スレッドで期限つきに待つ（REPAIR-5）。期限切れで残った文書は状態が無いので次の create / delete が掃除する。文書の書き込みは親ディレクトリも fsync してから成功を返す（OCI-5）
-- **plugin-cri の create は残骸を掃除しない**: CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直しても、文書は作成世代（`gen` レコード）を持ち、CLI の create が同じ値を状態記録の annotations（`io.fandhe.container.options-generation`）へ書く。supervisor の `start` は両者が一致する文書だけを採用し（`select_document`）、一致しない残骸は適用しない（前の世代の env・ulimit・`--ipc=host` を次のコンテナへ適用しない。SEC-1）。記録が世代を持つのに文書が無ければ `FAILED_PRECONDITION` で拒否する
+- **plugin-cri の create・delete は残骸を掃除する（#2760）**: plugin-cri は文書を書かないので、状態の記録が無い ID の文書はすべて前のコンテナの残骸である。`create` は core を呼ぶ前、`delete` は core の delete の成功の後に、ID 単位のロックの下で「状態ストアが `NotFound`」を確かめてから消す（`container_options::store::remove_stale_bounded`。CLI の delete 後の掃除と同じ関数）。記録がある ID（重複 create の `ALREADY_EXISTS`、作り直された新しいインスタンス）の文書は、世代が一致するものも含めて消さない（読み取りに失敗したら fail-closed で消さない）。文書が無ければロックも作らない。失敗・期限切れ（ロック 8 秒・全体 10 秒）は best effort で、create / delete の結果は変えず、記録器の op `container_options_remove` の Failure と、delete 側は構造化ログ 1 行（`event: container_delete_cleanup`・`target: container_options`）で知らせる。`DeleteResponse` / `CleanupTarget` には語彙を足さない（plugin 境界の型を変えない）。掃除に失敗しても、文書は作成世代（`gen` レコード）を持ち、CLI の create が同じ値を状態記録の annotations（`io.fandhe.container.options-generation`）へ書く。supervisor の `start` は両者が一致する文書だけを採用し（`select_document`）、一致しない残骸は適用しない（前の世代の env・ulimit・`--ipc=host` を次のコンテナへ適用しない。SEC-1）。記録が世代を持つのに文書が無ければ `FAILED_PRECONDITION` で拒否する
 - **exec・healthcheck の env**: launch の env 上書きは `exec::run_command_with_pidfd_env` の `launch_env`（`store::launch_env_for` が世代を照合して返す）で `process.env` の上、exec 固有の指定の下に重ねる。呼び出し元の配線は healthcheck #2441・CLI の exec #2626（未実装）
 - **stack**: `Service::create_option_args` が env・env_files・labels を create の引数列へ写すところまで。`up`
   からの結線は TASK-155、ulimit・tmpfs のスキーマは #586・#862

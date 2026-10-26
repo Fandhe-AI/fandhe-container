@@ -6,14 +6,24 @@ supervisor が `terminate` の既定（5 秒）を超えて sink を閉じなか
 
 ## 見分け方
 
-- CLI の `delete` が stderr に `{"level":"warn","code":"FAILED_PRECONDITION"|"TIMEOUT",...,"message":"container log removal failed; leftover logs may remain"}` を出した
-- plugin-cri の `container_delete_cleanup` の行、または op 名 `container_log_remove.<code>` の Failure が計上された
+- CLI の `delete` が stderr に `{"level":"warn","code":"FAILED_PRECONDITION"|"TIMEOUT",...,"message":"container log removal failed; leftover logs may remain"}` を出した。`FAILED_PRECONDITION` の行には `"reason":"sink_open_after_wait"` が付く（待ちを使い切っても古い supervisor が sink を閉じなかった。`TIMEOUT` など他の失敗には付かない）
+- plugin-cri の `{"event":"container_delete_cleanup","target":"container_log",...}` の行（同じく待ち切れなかった場合は `"reason":"sink_open_after_wait"`）、または op 名 `container_log_remove.<code>` の Failure が計上された（`container_log_remove.failed_precondition` が「待ち切れなかった」）
+- plugin-cri の起動時に `{"event":"container_log_sweep",...}` の 1 行が出る。`skipped_live`・`skipped_present`・`skipped_undecodable`・`failed` が 0 でなければ、その件数ぶんの残りが自動では消えていない
 - ID の符号化の規則: 大文字 `X` は `_x`、`_` は `__`、Windows の予約名には先頭に `_0` が付く
 
 ## 自動回収
 
-同じ ID で CLI の `create` を実行すると、core を呼ぶ前に残りを消す（best effort。古い supervisor が生きていれば消さない）。
-ID を再利用しない場合（plugin-cri の CRI など）は自動では回収されない。
+- CLI の `create`、plugin-cri の `CreateContainer` は、同じ ID の残りを core を呼ぶ前に消す（best effort。古い supervisor が生きていれば消さず、状態がある ID も消さない）
+- plugin-cri は起動時に 1 回、`<state_root>/@container-logs` を走査し、状態の記録が無く、sink も生きていない ID のログを消す（#2760）。
+  CRI は ID を使い回さないため、delete の待ちを超えて残ったログは plugin-cri を再起動すれば消える
+- plugin-cri の `create` / `delete` は、状態の記録が無い ID の起動オプション文書（`<state_root>/@container-options/<id>`）の残骸も消す
+
+自動では消えないもの（次の「手動の手順」の対象）:
+
+- 古い supervisor が生きていて sink のロックを持ち続けているログ（`skipped_live`）
+- 状態がある ID のログ（`skipped_present`）。この ID は消さない
+- ID に戻せない名前（`skipped_undecodable`。大文字入りなど、sink が作らない名前）
+- plugin-cri が動いている間に発生した残り（次の起動まで）と、plugin-cri と異なる `--root` の状態ルート
 
 ## 手動の手順
 

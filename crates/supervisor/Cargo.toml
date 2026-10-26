@@ -34,6 +34,7 @@
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
 # TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
 # #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
+# #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -233,4 +234,14 @@ harness = false
 [[test]]
 name = "privilege"
 path = "tests/privilege.rs"
+harness = false
+
+# 範囲写像（subordinate ids）の rootless コンテナへ、本番の入口（ProductionLauncher の create → start と
+# `run_command_with_pidfd`）だけで exec を通す実機前提の結合試験（SEC-5・CORE-6・SUP-6・#2835）。setns・fork が単一スレッドの
+# 呼び出し元を要求し、`DelegatedCgroup::prepare` は 1 プロセスで 1 回だけのため、単一スレッドの独自 main（harness = false）で動かす。
+# `FANDHE_CONTAINER_TEST_ID_HELPER=1`・uidmap・subuid / subgid・委譲 cgroup v2・Landlock ABI 6 以上を要し、`-- --ignored` 指定時のみ
+# 実行する（AGENTS.md「実機前提テスト」）。`exec-test-support` の試験専用入口は使わない。
+[[test]]
+name = "exec_subordinate_e2e"
+path = "tests/exec_subordinate_e2e.rs"
 harness = false

@@ -9,7 +9,8 @@ use fandhe_container_cri::bundle::spec::{
 };
 use fandhe_container_cri::bundle::{
     BundleFiles, ImageDefaults, PodNamespacePaths, build_runtime_config,
-    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces, validate_config,
+    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces, resolve_log_path,
+    validate_config,
 };
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
@@ -628,6 +629,74 @@ fn working_dir_and_hostname() {
     }
 }
 
+/// CRI-2・SUP-4（#2671）: log_directory と log_path は結合され、config.json は変わらない。
+#[test]
+fn log_path_and_directory_are_joined_cri_2() {
+    let mut p = pod();
+    p.log_directory = "/var/log/pods/default_p_1234".into();
+    let mut c = ctr();
+    c.log_path = "c/0.log".into();
+    let joined = resolve_log_path(&p, &c).unwrap().unwrap();
+    assert_eq!(joined.as_str(), "/var/log/pods/default_p_1234/c/0.log");
+    assert_eq!(build(&p, &c), build(&pod(), &ctr()));
+    validate_config(&p, &c).unwrap();
+}
+
+/// CRI-2・SUP-4（#2671）: log_directory だけなら受け入れ、そのコンテナは CRI ログなし。
+#[test]
+fn log_directory_only_is_accepted_without_log() {
+    let mut p = pod();
+    p.log_directory = "/var/log/pods/x".into();
+    assert_eq!(resolve_log_path(&p, &ctr()).unwrap(), None);
+    validate_config(&p, &ctr()).unwrap();
+    assert_eq!(resolve_log_path(&pod(), &ctr()).unwrap(), None);
+}
+
+/// CRI-2・SUP-4（#2671）: 基点の無い log_path は黙って落とさず INVALID_ARGUMENT。
+#[test]
+fn log_path_without_directory_is_invalid_argument() {
+    let mut c = ctr();
+    c.log_path = "c/0.log".into();
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+}
+
+/// CRI-2・SUP-4・SEC-1（#2671）: トラバーサル・相対 log_directory・制御文字・長さ超過を拒否する。
+#[test]
+fn log_paths_reject_traversal() {
+    let cases: Vec<(String, String)> = vec![
+        ("/var/log/pods/x".into(), "../x.log".into()),
+        ("/var/log/pods/x".into(), "c/../../x".into()),
+        ("/var/log/pods/x".into(), "/abs.log".into()),
+        ("/var/log/pods/x".into(), "c/./0.log".into()),
+        ("/var/log/pods/x".into(), "c//0.log".into()),
+        ("/var/log/pods/x".into(), "c/".into()),
+        ("var/log".into(), "c/0.log".into()),
+        ("/var/log/../x".into(), "c/0.log".into()),
+        ("/var/log/".into(), "c/0.log".into()),
+        ("/var/log/pods/x".into(), "c\0/0.log".into()),
+        ("/var/log/pods/x".into(), "c\n/0.log".into()),
+        ("/var/\0log".into(), "c/0.log".into()),
+        (
+            format!("/{}", "d".repeat(MAX_PATH_BYTES - 2)),
+            "c/0.log".into(),
+        ),
+    ];
+    for (d, l) in cases {
+        let mut p = pod();
+        p.log_directory = d.clone();
+        let mut c = ctr();
+        c.log_path = l.clone();
+        assert_eq!(code(&p, &c), CriErrorCode::InvalidArgument, "{d:?} + {l:?}");
+    }
+    // 結合結果がちょうど 4096 バイトなら受理される。
+    let mut p = pod();
+    p.log_directory = format!("/{}", "d".repeat(4091));
+    let mut c = ctr();
+    c.log_path = "x".into();
+    // log_directory 4092 バイト + "/x" の 2 バイトで上限内。
+    assert!(resolve_log_path(&p, &c).unwrap().is_some());
+}
+
 type MountTweak = Box<dyn Fn(&mut Mount)>;
 type ScTweak = Box<dyn Fn(&mut LinuxContainerSecurityContext)>;
 
@@ -1091,8 +1160,6 @@ fn rejection_table_is_unimplemented() {
     add("cdi", &|_, c| {
         c.cdi_devices = vec![fandhe_container_cri::runtime::v1::CdiDevice::default()];
     });
-    add("log_path", &|_, c| c.log_path = "a.log".into());
-    add("log_directory", &|p, _| p.log_directory = "/var/log".into());
     add("windows ctr", &|_, c| {
         c.windows = Some(Default::default());
     });

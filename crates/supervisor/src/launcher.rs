@@ -1157,4 +1157,29 @@ mod tests {
             assert_eq!(le.reason, LauncherErrorReason::InvalidArguments);
         }
     }
+
+    /// CRI-2・SUP-4・#2671: `--cri-log-path` 付きの argv は検証を通って転送され、不正な値は InvalidArgument で拒否される。
+    /// 転送後の supervisor は ambient capability つきでは CRI ログを開かず拒否する（`logs::cri::deny_elevated_capabilities`）。
+    #[test]
+    fn cri2_launcher_validates_cri_log_path_argument() {
+        use std::ffi::OsString;
+        let parse = |argv: &[&str]| {
+            crate::start_contract::StartArgs::parse(argv.iter().map(OsString::from))
+        };
+        let ok = parse(&[
+            "start",
+            "--root",
+            "/r",
+            "--cri-log-path",
+            "/l/c/0.log",
+            "c1",
+        ])
+        .expect("accepted");
+        assert_eq!(ok.cri_log_path.expect("path").as_str(), "/l/c/0.log");
+        let e = parse(&["start", "--root", "/r", "--cri-log-path", "../x", "c1"])
+            .expect_err("rejected");
+        let le = LauncherError::from(e);
+        assert_eq!(le.code, ErrorCode::InvalidArgument);
+        assert_eq!(le.reason, LauncherErrorReason::InvalidArguments);
+    }
 }

@@ -74,6 +74,7 @@
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 
+pub mod cri;
 pub mod reader;
 pub mod rotating;
 

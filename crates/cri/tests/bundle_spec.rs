@@ -397,6 +397,7 @@ fn cri2_drop_capabilities_acceptance() {
     assert_eq!(core, want);
 
     // 小文字・CAP_ 接頭辞つき・重複は同じ扱い。MKNOD も落ちて 12 個。
+    // containerd では `CAP_MKNOD` は no-op になる（既知の差。#2812）。
     let (_, core) = read_back(&caps(&["cap_net_raw", "CAP_MKNOD", "net_raw"]));
     assert_eq!(core.len(), 12);
     assert!(!core.contains(&"CAP_NET_RAW") && !core.contains(&"CAP_MKNOD"));

@@ -101,12 +101,16 @@ fn main() {
         }
     } else if has("--delete-helper") {
         linux::delete_helper();
-    } else if std::env::args().any(|a| a == "--ignored") {
-        linux::run();
     } else {
-        println!(
-            "supervisor_bin_real: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
-        );
+        // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
+        linux::self_check_precondition();
+        if has("--ignored") {
+            linux::run();
+        } else {
+            println!(
+                "supervisor_bin_real: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+            );
+        }
     }
 }
 
@@ -276,11 +280,54 @@ mod linux {
         std::process::exit(PROBE_EXIT);
     }
 
-    fn require(ok: bool, msg: &str) {
-        if !ok {
-            eprintln!("supervisor_bin_real: precondition failed: {msg}");
-            std::process::exit(1);
+    /// euid の前提の分類（#2788・SEC-4・REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum EuidCheck {
+        NonRoot,
+        /// root で実行されている（rootful start は拒否されるため前提欠如。試験環境の問題）。
+        Root,
+        /// 判定不能。前提欠如とは断定しない（fail-closed）。
+        Unknown,
+    }
+
+    /// `/proc/self/status` の内容から euid（`Uid:` の 2 列目）を分類する。
+    fn classify_euid(status: Option<&str>) -> EuidCheck {
+        let euid = status
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:")))
+            .and_then(|v| v.split_whitespace().nth(1));
+        match euid {
+            Some("0") => EuidCheck::Root,
+            Some(v) if v.parse::<u32>().is_ok() => EuidCheck::NonRoot,
+            _ => EuidCheck::Unknown,
         }
+    }
+
+    /// 前提欠如の panic メッセージ（1 行目で前提欠如と回帰を判別できる）。
+    fn precondition_message() -> String {
+        "supervisor_bin_real: PRECONDITION FAILED (test environment, not a supervisor launch regression): \
+         must run as a non-root user (euid=0); rootful start is refused (SEC-5).\n\
+         hint: run it as an unprivileged user (see AGENTS.md supervisor_bin_real for the --no-run and systemd-run --user --scope steps)."
+            .to_string()
+    }
+
+    pub fn self_check_precondition() {
+        assert_eq!(
+            classify_euid(Some("Uid:\t1000\t1000\t1000\t1000\n")),
+            EuidCheck::NonRoot
+        );
+        assert_eq!(
+            classify_euid(Some("Uid:\t1000\t0\t0\t0\n")),
+            EuidCheck::Root
+        );
+        assert_eq!(classify_euid(Some("Name:\tx\n")), EuidCheck::Unknown);
+        assert_eq!(classify_euid(Some("Uid:\t0\tx\n")), EuidCheck::Unknown);
+        assert_eq!(classify_euid(None), EuidCheck::Unknown);
+        assert_eq!(
+            precondition_message().lines().next(),
+            Some(
+                "supervisor_bin_real: PRECONDITION FAILED (test environment, not a supervisor launch regression): must run as a non-root user (euid=0); rootful start is refused (SEC-5)."
+            )
+        );
     }
 
     fn status_field(path: &str, key: &str) -> Option<String> {
@@ -575,17 +622,14 @@ mod linux {
     }
 
     pub fn run() {
-        let status = std::fs::read_to_string("/proc/self/status").expect("read status");
-        let euid_is_root = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|v| v.split_whitespace().nth(1).map(str::to_owned))
-            .as_deref()
-            == Some("0");
-        require(
-            !euid_is_root,
-            "must run as a non-root user (rootful start is refused)",
-        );
+        let status = std::fs::read_to_string("/proc/self/status").ok();
+        match classify_euid(status.as_deref()) {
+            EuidCheck::NonRoot => {}
+            EuidCheck::Root => panic!("{}", precondition_message()),
+            EuidCheck::Unknown => {
+                panic!("supervisor_bin_real: could not determine euid from /proc/self/status")
+            }
+        }
         scenario_a_start_monitor_record();
         scenario_b_failed_start_leaves_nothing();
         scenario_c_restart_fails_closed();

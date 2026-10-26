@@ -48,7 +48,11 @@
 //! - `capabilities.drop_capabilities` は受け入れ、OCI 既定集合から除いた集合を `process.capabilities` の 3 集合
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
-//!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
+//!   drop は no-op、未知名は `INVALID_ARGUMENT`。正規化は core の `parse_drop_list` に任せ、CLI の `create --cap-drop` と同じ規則。
+//!   containerd（`v2.4.2` で照合）とは 2 点で違う: (1) containerd は接頭辞つきの名前を drop しない（`CAP_CAP_...` になる）、
+//!   (2) containerd は未知名を無視する。どちらも本実装のほうが厳しい側（drop は狭くならない）。照合の記録は
+//!   `docs/design/cri-config-acceptance.md`「外部の事実の照合」。containerd に合わせるかはオーナー判断待ち（#2812）。
+//!   `add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
 //! - `log_path`（コンテナ）と `log_directory`（サンドボックス）は [`resolve_log_path`] で検証して結合し、受け入れる
 //!   （CRI-2・SUP-4・#2671）。結合結果は config.json には出さず、StartContainer が supervisor へ渡す。
 //! - `supplemental_groups` は受け入れ、`process.user.additionalGids` へ写す（core が launch の fork の前に user namespace の
@@ -316,7 +320,10 @@ struct CapabilitiesOut {
 
 /// CRI の `drop_capabilities` を OCI 既定集合から除いた集合へ変換する（CRI-2・SEC-1・#2666）。
 ///
-/// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意（containerd と同じ想定）。`ALL` は全 drop。
+/// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意。`ALL` は全 drop。
+/// 正規化は core の `parse_drop_list` に任せ、CLI の `create --cap-drop` と同じ規則を使う。
+/// containerd とは異なり、接頭辞つきの名前も drop し（containerd は `CAP_CAP_...` になり drop されない）、
+/// 未知名は無視せず拒否する（どちらも厳しい側。挙動を合わせるかはオーナー判断待ち。#2812）。
 /// 既定集合に無い capability の drop は no-op として受理する。未知の名前・空・長すぎる名前は
 /// `INVALID_ARGUMENT`（指定された名前はエラーに載せない）。drop の指定が無ければ `None`。
 fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriError> {

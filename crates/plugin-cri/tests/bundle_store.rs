@@ -74,7 +74,7 @@ fn cri2_bundle_store_directories_are_private() {
 }
 
 /// CRI-2: 本番 provider は UNIMPLEMENTED の固定スタブではなく、未取得の image ID を NOT_FOUND にする。
-/// タグはまだ解決できず UNIMPLEMENTED。どちらも bundle は残らない。
+/// 在庫を渡さない形ではタグを解決できず UNIMPLEMENTED。どちらも bundle は残らない。
 #[test]
 fn cri2_production_provider_reaches_the_image_cache() {
     let tmp = TempDir::new("codes");
@@ -119,4 +119,46 @@ fn sec1_untrusted_bundle_store_is_rejected() {
     let e = bundle_provider_in(&tmp.0).map(|_| ()).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
     assert!(real.is_dir());
+}
+
+/// CRI-2・CRI-3（#2592）: 在庫を渡した形では、未知のタグ・短縮名は UNIMPLEMENTED ではなく NOT_FOUND になり、
+/// 在庫へ登録したタグは image ID へ解決されてキャッシュの照会（未取得の NOT_FOUND）まで進む。bundle は残らない。
+#[test]
+fn cri3_provider_with_store_resolves_tags() {
+    use fandhe_container_cri::image_service::{ImageRecord, ImageStore, InMemoryImageStore};
+    use fandhe_container_plugin_cri::adapter::bundle_provider_with;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new("store");
+    let store = Arc::new(InMemoryImageStore::new());
+    let p =
+        bundle_provider_with(&tmp.0, Some(store.clone() as Arc<dyn ImageStore>)).expect("provider");
+    let pod = PodSandboxConfig::default();
+
+    let c = container("alpine:3.20");
+    let e = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &c))
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::NotFound);
+    assert_eq!(e.message(), "image reference is not found");
+
+    // 登録したタグは解決され、キャッシュに無いイメージは「キャッシュに無い」の NOT_FOUND になる（文言が変わる）。
+    let id = format!("sha256:{}", "b".repeat(64));
+    store
+        .upsert(
+            ImageRecord::new(
+                id,
+                vec!["docker.io/library/alpine:3.20".to_owned()],
+                vec![],
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let e = p
+        .prepare(&BundleRequest::new("ctr2", "sb", &pod, &c))
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::NotFound);
+    assert_eq!(e.message(), "image is not present in the local cache");
+    assert_eq!(fs::read_dir(tmp.0.join(".cri/bundles")).unwrap().count(), 0);
 }

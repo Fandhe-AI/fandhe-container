@@ -2,7 +2,7 @@
 //!
 //! 呼び出し元: 将来は core 側 plugin proxy（#1869 の設計。承認待ち）が検証済みの起動対象として spawn する。
 //! 役割は起動引数の解析（`startup::parse_args`）を終了コードと stderr の 1 行へ写すことと、`--socket <PATH>` で
-//! 受けた UDS 上で `CriRuntimeService` をサーブすること（`server::serve`。unix のみ）。
+//! 受けた UDS 上で `CriRuntimeService` と `CriImageService` をサーブすること（`server::serve`。unix のみ）。
 //! 実装の組み立ては `adapter::CriPluginBackends::production`（失敗したら fail-closed で起動しない）。
 //! 既定の socket パスは未定義のため、引数なしの起動は `UNIMPLEMENTED` で失敗させる（REPAIR-3）。
 //! Linux では peer 認証の拒否と、create の `mounts[].destination` の拒否（#2594）を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
@@ -40,7 +40,7 @@ fn fail_err(e: &PluginError) -> ExitCode {
 #[cfg(unix)]
 fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
-    use fandhe_container_plugin_cri::adapter::{self, CriPluginBackends};
+    use fandhe_container_plugin_cri::adapter::{self, CriPluginBackends, PLUGIN_REQUEST_TIMEOUT};
     use fandhe_container_plugin_cri::{server, telemetry};
 
     // 監査の記録経路（Linux）は、スレッド・listener・ランタイムを作る前に用意する（SEC-4・PLUG-12・#2484）。
@@ -86,7 +86,24 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    // ImageService（PullImage と create のタグ解決で同じ在庫・キャッシュ設定を共有。#2592）。fail-closed:
+    // レジストリクライアントを作れなければ起動しない（固定文言のコードだけ出す）。
+    let images = match backends.image_service() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "error: {}: failed to prepare the image service",
+                e.code().as_str()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     let svc = backends.runtime_service(bundles);
+    // 1 リクエストの待ち上限は PullImage・StartContainer が収まる値に引き上げる（既定 10 秒では途中で切れる。REPAIR-5）。
+    let grpc_config = match GrpcServerConfig::new().with_request_timeout(PLUGIN_REQUEST_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => return fail_err(&e),
+    };
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -136,7 +153,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         let r = server::serve_with_audit(
             socket,
             svc,
-            &GrpcServerConfig::new(),
+            Some(images),
+            &grpc_config,
             audit,
             std::future::pending(),
         )

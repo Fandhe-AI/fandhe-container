@@ -324,7 +324,7 @@ const SLOT_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// [`run_bounded_classified`] の、枠の満杯を `timeout` の範囲で待つ版（#2834・REPAIR-5）。
 ///
-/// 枠が満杯でも即座に `Busy` にせず、`timeout` を上限に [`SLOT_WAIT_POLL`] 間隔で空きを待つ。待った時間は `timeout` から
+/// 枠が満杯でも即座に `Busy` にせず、`timeout` を上限に `SLOT_WAIT_POLL` 間隔で空きを待つ。待った時間は `timeout` から
 /// 引かれるので、全体の待ちは `timeout` を超えない（期限を延ばさない）。待っても空かなければ job を実行せず `Busy`
 /// （期限切れ `Unfinished` とは区別する）。CLI の `create` が 1 プロセスの中で複数の作業を同時に走らせる場面
 /// （並列の結合試験・止まった作業が枠を占めた後）で、一時的な満杯を `TIMEOUT` に誤分類しないために使う。

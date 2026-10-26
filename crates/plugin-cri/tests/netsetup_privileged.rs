@@ -17,6 +17,7 @@
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
@@ -40,51 +41,89 @@ fn ns_inode(path: &str) -> u64 {
 /// 外部コマンド 1 回の期限（REPAIR-5）。超過したら子を kill して回収する。
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn run(program: &str, args: &[&str]) -> String {
+/// 外部コマンドを期限つきで実行する。出力の収集も期限内に限る（REPAIR-5）。
+///
+/// 子孫が stdout / stderr を継承して残っても `read_to_end` の完了を待ち続けないよう、読み取りスレッドの結果は
+/// チャネルの `recv_timeout` で受け、期限を超えたら読み取りを諦めてエラーにする（スレッドは切り離す）。
+fn exec(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
-    let mut so = child.stdout.take().expect("stdout");
-    let mut se = child.stderr.take().expect("stderr");
-    let t_out = std::thread::spawn(move || {
+        .map_err(|e| format!("spawn {program}: {e}"))?;
+    let mut so = child.stdout.take().ok_or("stdout")?;
+    let mut se = child.stderr.take().ok_or("stderr")?;
+    let (tx_o, rx_o) = mpsc::channel();
+    let (tx_e, rx_e) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = so.read_to_end(&mut b);
-        b
+        let _ = tx_o.send(b);
     });
-    let t_err = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = se.read_to_end(&mut b);
-        b
+        let _ = tx_e.send(b);
     });
-    let start = Instant::now();
+    let deadline = Instant::now() + CMD_TIMEOUT;
     let status = loop {
-        match child.try_wait().expect("try_wait") {
+        match child.try_wait().map_err(|e| format!("try_wait: {e}"))? {
             Some(st) => break st,
-            None if start.elapsed() > CMD_TIMEOUT => {
+            None if Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                let _ = t_out.join();
-                let _ = t_err.join();
-                panic!("{program} {args:?} timed out after {CMD_TIMEOUT:?}");
+                // kill 後の回収も期限つきにする（回収できなければ諦める）。
+                let reap_until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < reap_until {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                return Err(format!(
+                    "{program} {args:?} timed out after {CMD_TIMEOUT:?}"
+                ));
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let out = std::process::Output {
+    let left = |d: Instant| d.saturating_duration_since(Instant::now());
+    let drain_until = Instant::now() + Duration::from_secs(5);
+    let stdout = rx_o
+        .recv_timeout(left(drain_until))
+        .map_err(|_| format!("{program} {args:?}: stdout drain timed out"))?;
+    let stderr = rx_e
+        .recv_timeout(left(drain_until))
+        .map_err(|_| format!("{program} {args:?}: stderr drain timed out"))?;
+    Ok(std::process::Output {
         status,
-        stdout: t_out.join().expect("stdout thread"),
-        stderr: t_err.join().expect("stderr thread"),
-    };
+        stdout,
+        stderr,
+    })
+}
+
+fn run(program: &str, args: &[&str]) -> String {
+    let out = exec(program, args).unwrap_or_else(|e| panic!("{e}"));
     assert!(
         out.status.success(),
         "{program} {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// root で作った一時ディレクトリの回収ガード。途中の失敗・panic でもアンマウントして削除する。
+struct DirGuard(std::path::PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        if let Some(d) = self.0.to_str() {
+            // マウントされていなければ失敗するだけなので結果は無視する（後始末は best effort）。
+            let _ = exec("umount", &["-R", "-l", d]);
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
 }
 
 /// ruleset の中の、受け口 `host_port`（192.0.2.10）宛ての DNAT 行の本数。
@@ -134,6 +173,7 @@ fn netsetup_unpublish_port_privileged() {
             .create(&dir)
             .expect("mkdir");
     }
+    let _guard = DirGuard(dir.clone());
     let dir_str = dir.to_str().expect("utf8 path");
     run("mount", &["-t", "tmpfs", "tmpfs", dir_str]);
     let netns_dir = dir.join(".netns");
@@ -176,7 +216,4 @@ fn netsetup_unpublish_port_privileged() {
     let f = pod_network::set_up_sandbox(&net, "sandbox-2904b", subnet, &dup).expect_err("dup");
     assert!(f.rolled_back, "rollback failed: {}", f.error);
     assert_eq!(dnat_lines(8090), 0);
-
-    run("umount", &[dir_str]);
-    std::fs::remove_dir(&dir).expect("cleanup");
 }

@@ -63,3 +63,10 @@ harness = false
 name = "image_store_xdev"
 path = "tests/image_store_xdev.rs"
 harness = false
+
+# 他 uid（範囲写像の subuid）所有の staged blob を verify_staged_blob が chmod せずに拒否することの実機前提試験
+# （#2907・OCI-7・SEC-1・SEC-5）。`-- --ignored` 指定時のみ実行する単一スレッドの独自 main（AGENTS.md）。
+[[test]]
+name = "staged_blob_owner"
+path = "tests/staged_blob_owner.rs"
+harness = false

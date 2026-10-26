@@ -157,6 +157,21 @@ pub(super) fn state_scope(store: &dyn StateStore) -> Result<String, TraitError> 
     Ok(state_hash(root.as_os_str().as_encoded_bytes()))
 }
 
+/// 旧版の scope（`--root` の字面から決めた状態ルートのハッシュ）を、新しい scope と違うときだけ返す（#2499・OCI-7）。
+///
+/// 旧版は `StateRoot::resolve(--root)` の字面をハッシュしていた。現行は開いたストアの `host_state_root()`
+/// （祖先の symlink を解決した正規パス）を使うため、`--root` に symlink を含む表記で作ったコンテナの参照は旧 scope の
+/// キーで残っている。旧 scope のキーは新規には作らず、delete の解除・create 前の回収・`image rm` の照合・停止中の判定だけで
+/// 読み戻す（既存の参照が回収不能になる退行を避ける互換処理）。解決できない・新 scope と同じなら `None`。
+pub(super) fn legacy_scope(
+    override_root: Option<std::path::PathBuf>,
+    current: &str,
+) -> Option<String> {
+    let root = fandhe_container_core::state_store::StateRoot::resolve(override_root).ok()?;
+    let legacy = state_hash(root.path().as_os_str().as_encoded_bytes());
+    (legacy != current).then_some(legacy)
+}
+
 const MSG_NO_STATE_ROOT: &str = "the state store does not expose a host state root";
 
 /// create 時のイメージストア root を状態記録の annotations に残す予約キー（#2499・OCI-7・CLI-1）。

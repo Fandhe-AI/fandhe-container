@@ -99,8 +99,10 @@ use super::create_start::{
     OP_LOG_ENV, export_ops, production_runtime, record_pre_core_failure, require_local_backend,
 };
 use super::image::open_image_store_for_lifecycle;
-use super::image_refs::{IMAGE_ROOT_ANNOTATION, StoreImageRefs, state_scope};
-use fandhe_container_oci::image_management::ImageStore;
+use super::image_refs::{
+    IMAGE_ROOT_ANNOTATION, StoreImageRefs, legacy_scope, ref_key, state_scope,
+};
+use fandhe_container_oci::image_management::{ContainerRefId, ImageStore};
 
 // 本番の signaler・cgroup remover は supervisor crate にある（plugin-cri の `kill`・`stop`・`delete` と共有するため
 // CLI の private 実装から移した。#2434・REPAIR-1）。`production_signaler` は `kill` コマンド（#1902）が入るまで試験だけが使う。
@@ -306,11 +308,15 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
         Err(e) => return CliExit::Runtime(e),
     };
     let remover = production_cgroup_remover();
+    let legacy = state_scope(rt.store.as_ref())
+        .ok()
+        .and_then(|cur| legacy_scope(global.root.clone(), &cur));
     let result = delete_with_recorded_image_root(
         rt.store.as_ref(),
         &rt.recorder,
         &remover,
         images.as_ref(),
+        legacy.as_deref(),
         &req,
         started,
     );
@@ -339,7 +345,8 @@ const MSG_RECORDED_IMAGE_ROOT_INVALID: &str = "the recorded image root is invali
 ///   記録と一致すれば解除つきで delete する。開けない・食い違う・絶対パスでないときは core に入らず失敗し、状態も参照も残す。
 /// - 記録あり・`explicit` あり: `explicit.root()` が記録と一致すれば解除つき、違えば `FAILED_PRECONDITION`（状態も参照も残す）。
 /// - 記録なし・`explicit` あり: 従来どおり `explicit` で解除つき（記録を持たない古いコンテナとの互換）。
-/// - 記録なし・`explicit` なし、または `get` の失敗: 従来どおり通常の delete（`get` の失敗は core が同じエラーを返す）。
+/// - 記録なし（`get` が NOT_FOUND）・`explicit` なし: 従来どおり通常の delete（core が同じ NOT_FOUND を返す）。
+/// - `get` がそれ以外で失敗: 状態も参照も残して core に入る前に失敗する（REPAIR-4）。
 ///
 /// 記録の値は信頼しない入力として扱う。`get` から core の delete までの間に別の delete と同じ ID の再 create が
 /// 割り込むと新しいコンテナの参照が残りうるが、余分に持つ安全側で、次の同じ ID の create（契機 A）が回収する。
@@ -350,17 +357,20 @@ pub(super) fn delete_with_recorded_image_root(
     recorder: &OpRecorder,
     cgroups: &dyn ContainerCgroupRemover,
     explicit: Option<&ImageStore>,
+    legacy_scope: Option<&str>,
     req: &DeleteRequest,
     started: Instant,
 ) -> Result<DeleteResponse, OciRuntimeError> {
-    let recorded = store
-        .get(&GetStateRequest::new(req.id().clone()))
-        .ok()
-        .and_then(|r| {
-            r.annotations()
-                .get(IMAGE_ROOT_ANNOTATION)
-                .map(str::to_owned)
-        });
+    // 記録が無い（NOT_FOUND）ときだけ「記録なし」として core に任せる。ロック競合の Timeout 等の読み取り失敗を
+    // 「記録なし」に畳むと、参照を解除せず状態だけを消してしまうため、core に入る前に失敗させる（OCI-7・REPAIR-4）。
+    let recorded = match store.get(&GetStateRequest::new(req.id().clone())) {
+        Ok(r) => r
+            .annotations()
+            .get(IMAGE_ROOT_ANNOTATION)
+            .map(str::to_owned),
+        Err(e) if e.code() == ErrorCode::NotFound => None,
+        Err(e) => return Err(pre_core_delete_failure(recorder, started, e)),
+    };
     let opened;
     let images = match decide_release_store(recorded.as_deref(), explicit) {
         Ok(ReleaseStore::Explicit(i)) => Some(i),
@@ -387,9 +397,25 @@ pub(super) fn delete_with_recorded_image_root(
                 Ok(s) => s,
                 Err(e) => return Err(pre_core_delete_failure(recorder, started, e)),
             };
-            delete_container_releasing_image_ref(store, recorder, cgroups, images, &scope, req)
+            let result =
+                delete_container_releasing_image_ref(store, recorder, cgroups, images, &scope, req);
+            // 旧 scope のキーで残った参照も外す（旧版で作ったコンテナの互換。コンテナは消えた後なので無条件に外してよく、
+            // 旧 scope のキーは新規に作られない。失敗は残すだけで、契機 A / B の回収に任せる）。
+            if result.is_ok()
+                && let Some(legacy) = legacy_scope
+            {
+                release_legacy_ref(images, legacy, req.id());
+            }
+            result
         }
         None => delete_container(store, recorder, cgroups, req),
+    }
+}
+
+/// 旧 scope の参照キー 1 件を外す（見つからない・失敗は無視。#2499・OCI-7）。
+fn release_legacy_ref(images: &ImageStore, legacy_scope: &str, id: &ContainerId) {
+    if let Ok(key) = ContainerRefId::new(&ref_key(legacy_scope, id.as_str())) {
+        let _ = images.release_container_ref(&key);
     }
 }
 
@@ -1796,6 +1822,7 @@ mod tests {
                 store: images,
                 manifest: ref_digest(),
                 scope: scope_of(base),
+                legacy_scope: None,
             };
             let req = CreateRequest::new(id(name), make_bundle(base)).expect("req");
             create_container_with_image(rt, &image, &req).map(|_| image)
@@ -1838,6 +1865,7 @@ mod tests {
                 &rt.recorder,
                 &remover,
                 explicit,
+                None,
                 &req,
                 Instant::now(),
             )
@@ -1880,6 +1908,103 @@ mod tests {
                     .code(),
                 ErrorCode::NotFound
             );
+            assert_eq!(persisted_refs(&base), Vec::<String>::new());
+        }
+
+        /// 読み取りだけが Timeout で失敗する状態ストア（ロック競合の模擬）。
+        struct GetTimeoutStore(FileStateStore);
+
+        impl StateStore for GetTimeoutStore {
+            fn create(
+                &self,
+                r: &fandhe_container_core::traits::CreateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                self.0.create(r)
+            }
+            fn update(
+                &self,
+                r: &fandhe_container_core::traits::UpdateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                self.0.update(r)
+            }
+            fn get(
+                &self,
+                _r: &GetStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Timeout, "lock timeout"))
+            }
+            fn list(
+                &self,
+                r: &fandhe_container_core::traits::ListStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+                self.0.list(r)
+            }
+            fn delete(
+                &self,
+                r: &fandhe_container_core::traits::DeleteStateRequest,
+            ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError>
+            {
+                self.0.delete(r)
+            }
+            fn host_state_root(&self) -> Option<&std::path::Path> {
+                self.0.host_state_root()
+            }
+        }
+
+        /// OCI-7・REPAIR-4・#2499: 記録の読み取りが Timeout で失敗したら、状態も参照も残して core に入る前に失敗する。
+        #[test]
+        fn oci7_delete_fails_closed_when_record_read_times_out() {
+            let base = TmpDir::new("img-get-timeout");
+            let rt = runtime_with(store(&base));
+            create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            let wrapped = GetTimeoutStore(store(&base));
+            let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
+            let req = build_delete_request(&delete_args("c1", false)).expect("req");
+            let err = delete_with_recorded_image_root(
+                &wrapped,
+                &OpRecorder::new(),
+                &remover,
+                None,
+                None,
+                &req,
+                Instant::now(),
+            )
+            .expect_err("must fail");
+            assert_eq!(err.code(), ErrorCode::Timeout);
+            assert!(store(&base).get(&GetStateRequest::new(id("c1"))).is_ok());
+            assert_eq!(persisted_refs(&base).len(), 1);
+        }
+
+        /// OCI-7・#2499: 旧 scope のキーで残った参照も、delete が新 scope の解除に続けて外す。
+        #[test]
+        fn oci7_delete_releases_reference_under_legacy_scope() {
+            let base = TmpDir::new("img-legacy-scope");
+            let rt = runtime_with(store(&base));
+            let legacy = "0123456789abcdef0123456789abcdef";
+            let image = crate::commands::create_start::CreateImage {
+                store: images_store(&base, true),
+                manifest: ref_digest(),
+                scope: legacy.to_owned(),
+                legacy_scope: None,
+            };
+            let req = CreateRequest::new(id("c1"), make_bundle(&base)).expect("req");
+            crate::commands::create_start::create_container_with_image_reclaiming(
+                &rt, &image, &req,
+            )
+            .expect("create");
+            assert_eq!(container_refs(&image.store), vec![format!("{legacy}.c1")]);
+            let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
+            let dreq = build_delete_request(&delete_args("c1", false)).expect("req");
+            delete_with_recorded_image_root(
+                rt.store.as_ref(),
+                &rt.recorder,
+                &remover,
+                None,
+                Some(legacy),
+                &dreq,
+                Instant::now(),
+            )
+            .expect("delete");
             assert_eq!(persisted_refs(&base), Vec::<String>::new());
         }
 
@@ -2082,6 +2207,7 @@ mod tests {
                 store: images,
                 manifest: ref_digest(),
                 scope: scope_of(base),
+                legacy_scope: None,
             }
         }
 

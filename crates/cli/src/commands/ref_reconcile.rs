@@ -41,7 +41,7 @@ use fandhe_container_oci::image_management::{
 
 use super::args::GlobalArgs;
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
-use super::image_refs::{ref_key, state_scope};
+use super::image_refs::{legacy_scope, ref_key, state_scope};
 use super::list_logs::record_op;
 
 /// 契機 B で 1 回に状態を読む参照の上限（ゲートの排他を長く握らない。REPAIR-5）。超過分は判定不能として残す。
@@ -219,7 +219,12 @@ pub(super) fn reconcile_for_image_rm(
     let ok = (|| {
         let state = open_store(global).ok()?;
         let scope = state_scope(&state).ok()?;
-        reconcile_in_use(images, &state, &scope, candidates)
+        let current = reconcile_in_use(images, &state, &scope, candidates);
+        // 旧版の scope のキーで残った参照も照合する（#2499・OCI-7。失敗しても現行の結果は有効）。
+        if let Some(legacy) = legacy_scope(global.root.clone(), &scope) {
+            let _ = reconcile_in_use(images, &state, &legacy, candidates);
+        }
+        current
     })()
     .is_some();
     record_op(&recorder, "image_ref_reconcile", ok, started);

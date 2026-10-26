@@ -53,7 +53,8 @@ use super::args::{CreateArgs, GlobalArgs, StartArgs};
 use super::create_options;
 use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
 use super::image_refs::{
-    StoreImageRefs, attach_image_root, classify_create_image, resolve_create_image, state_scope,
+    StoreImageRefs, attach_image_root, classify_create_image, legacy_scope, resolve_create_image,
+    state_scope,
 };
 use super::ref_reconcile::reclaim_stale_ref_recorded;
 use super::stop_delete::{
@@ -86,6 +87,8 @@ pub(super) struct CreateImage {
     pub(super) manifest: ImageManifestDigest,
     /// 参照キーの接頭辞（状態ルートごと。`image_refs::state_scope`。別の状態ルートの同名 ID と混ざらないようにする）。
     pub(super) scope: String,
+    /// 旧版の scope（`--root` の字面から決めたもの。新 scope と同じなら `None`）。残骸の回収だけに使う（#2499・OCI-7）。
+    pub(super) legacy_scope: Option<String>,
 }
 
 /// 状態ストアを開く前の段階のイメージつき create の入力（`scope` が未確定）。
@@ -96,13 +99,17 @@ pub(super) struct CreateImage {
 pub(super) struct PendingImage {
     pub(super) store: ImageStore,
     pub(super) manifest: ImageManifestDigest,
+    /// グローバル引数の `--root`（旧 scope の算出用）。
+    pub(super) root_override: Option<std::path::PathBuf>,
 }
 
 impl PendingImage {
     /// 開いた状態ストアから scope を求めて [`CreateImage`] にする。ストアが状態ルートを示せなければ失敗する。
     pub(super) fn bind(self, state: &dyn StateStore) -> Result<CreateImage, TraitError> {
+        let scope = state_scope(state)?;
         Ok(CreateImage {
-            scope: state_scope(state)?,
+            legacy_scope: legacy_scope(self.root_override, &scope),
+            scope,
             store: self.store,
             manifest: self.manifest,
         })
@@ -157,6 +164,16 @@ pub(super) fn create_container_with_image_reclaiming(
         &image.scope,
         req.id(),
     );
+    // 旧版の scope（`--root` の字面から決めたもの）で残った同じ ID の残骸も回収する（#2499・OCI-7）。
+    if let Some(legacy) = &image.legacy_scope {
+        reclaim_stale_ref_recorded(
+            &image.store,
+            rt.store.as_ref(),
+            &rt.recorder,
+            legacy,
+            req.id(),
+        );
+    }
     let gate_started = Instant::now();
     let pass = image.store.enter_container_create().map_err(|e| {
         // ゲート取得の失敗は core に到達せず core 側の計測に載らないため、ここで create の失敗として記録する（REPAIR-4）。
@@ -184,7 +201,11 @@ fn build_create(
             require_local_backend(global)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
             let manifest = resolve_create_image(&store, classified)?;
-            Some(PendingImage { store, manifest })
+            Some(PendingImage {
+                store,
+                manifest,
+                root_override: global.root.clone(),
+            })
         }
     };
     Ok((req, image))
@@ -2050,6 +2071,7 @@ mod tests {
                 store: ImageStore::open(&root).expect("store"),
                 manifest: ImageManifestDigest::new(IMG_DIGEST).expect("digest"),
                 scope: "scope".into(),
+                legacy_scope: None,
             }
         }
 

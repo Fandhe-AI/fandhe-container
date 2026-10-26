@@ -502,6 +502,7 @@ pub struct LaunchIsolationRecord {
     audit_coverage_record: AuditCoverageRecordOutcome,
     id_mapping: Option<RecordedIdMapping>,
     capabilities: Option<ContainerCapabilities>,
+    root_readonly: Option<bool>,
 }
 
 impl LaunchIsolationRecord {
@@ -514,7 +515,28 @@ impl LaunchIsolationRecord {
             audit_coverage_record: AuditCoverageRecordOutcome::NotFailed,
             id_mapping: None,
             capabilities: None,
+            root_readonly: None,
         }
+    }
+
+    /// launch が rootfs を読み取り専用（`MOUNT_ATTR_RDONLY`）で起動したかを添える（SUP-6・CORE-5・SEC-1・#2829）。
+    ///
+    /// 値は launcher が fork 前に config の `root.readonly` から作る（`mount_setattr` 後の観測値ではない）。
+    /// 子の `root_readonly` 段は失敗で launch 全体を失敗させる（fail-closed）ため、記録が書かれた
+    /// コンテナについては `true` ⇒ 実際に ro で起動した、が成り立つ。この段を縮退可能にする変更は
+    /// 記録の意味を壊すので、同時に本記録の作り方を見直すこと。観測専用で、exec の制限の緩和には使わない
+    /// （ro root は mount namespace の属性で、exec は `setns` で同じ namespace に入るため再適用すべきものは無い）。
+    ///
+    /// 版と後方互換: 導入前の記録は持たないので `None`（「書き込み可能」とは推測しない）。
+    #[must_use]
+    pub fn with_root_readonly(mut self, readonly: bool) -> Self {
+        self.root_readonly = Some(readonly);
+        self
+    }
+
+    /// 記録された rootfs の読み取り専用の有無（記録が無ければ `None`）。
+    pub fn root_readonly(&self) -> Option<bool> {
+        self.root_readonly
     }
 
     /// launch が適用した capability の許可集合を添える（SEC-1・CRI-2・#2666）。exec の再適用がこの集合を使い、

@@ -1,0 +1,23 @@
+---
+# 非 GPU デバイス（生の USB デバイスノード）を想定した自作の CDI spec（TASK-132・GPU-9〔検討中〕）。
+# major 189 は Linux の devices.txt の USB デバイスノード（usbfs）の固定割り当て。
+cdiVersion: 0.5.0
+kind: example.com/usb
+devices:
+  - name: bus001-dev002
+    containerEdits:
+      deviceNodes:
+        - path: /dev/bus/usb/001/002
+          hostPath: /dev/bus/usb/001/002
+          type: c
+          major: 189
+          minor: 1
+          permissions: rwm
+      mounts:
+        - hostPath: /run/udev
+          containerPath: /run/udev
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - bind

@@ -15,6 +15,19 @@ const SLOTS: usize = 8;
 
 #[test]
 fn repair5_waiting_run_waits_for_a_free_slot_and_reports_busy_distinctly() {
+    // 枠が空いていても、期限がゼロなら job を起動せず Busy（期限切れ後に副作用を走らせない）。
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started2 = started.clone();
+    assert_eq!(
+        run_bounded_waiting(
+            move || started2.store(true, std::sync::atomic::Ordering::SeqCst),
+            Duration::ZERO
+        ),
+        Err(BoundedFailure::Busy)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+
     // 枠を SLOTS 個、チャネル待ちで止めた作業で埋める。期限切れで戻っても枠は作業の実終了まで残る。
     let mut releases = Vec::new();
     for _ in 0..SLOTS {

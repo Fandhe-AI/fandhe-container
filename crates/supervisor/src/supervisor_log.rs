@@ -334,17 +334,25 @@ pub fn run_bounded_waiting<T: Send + 'static>(
     timeout: std::time::Duration,
 ) -> Result<T, BoundedFailure> {
     let started = std::time::Instant::now();
-    let slot = loop {
-        if let Some(slot) = InflightSlot::acquire() {
-            break slot;
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
+    // 枠の確保の前後に毎回残り時間を確認する。期限が尽きていれば（最後の sleep 中に過ぎた場合を含む）
+    // 作業スレッドを生成せず `Busy` を返す（期限切れ後に job の副作用を走らせない。REPAIR-5）。
+    let (slot, remaining) = loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             return Err(BoundedFailure::Busy);
         }
-        std::thread::sleep(SLOT_WAIT_POLL.min(timeout - elapsed));
+        if let Some(slot) = InflightSlot::acquire() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // 確保後に期限が尽きた: 枠を返して job を起動しない。
+                drop(slot);
+                return Err(BoundedFailure::Busy);
+            }
+            break (slot, remaining);
+        }
+        std::thread::sleep(SLOT_WAIT_POLL.min(remaining));
     };
-    match run_bounded_with_slot(slot, job, timeout.saturating_sub(started.elapsed())) {
+    match run_bounded_with_slot(slot, job, remaining) {
         BoundedOutcome::Done(v) => Ok(v),
         BoundedOutcome::Busy => Err(BoundedFailure::Busy),
         BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),

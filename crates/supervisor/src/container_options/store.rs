@@ -19,10 +19,8 @@
 //!
 //! 同じ利用者が同じ ID で `create` を並行に実行すると片方の文書が消えうる。plugin-cri の create は残骸を掃除しない
 //! ため、CLI で作ったコンテナの delete 後の掃除に失敗した ID を CRI で作り直すと残骸が効きうる(後続)。
-//! Linux 以外では実効 uid を得られず `FailedPrecondition` で拒否する(CLI の create は Linux のローカル実行のみ)。
+//! Linux 以外では `Unimplemented` で拒否する(CLI の create は Linux のローカル実行のみ)。
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use fandhe_container_core::traits::ContainerId;
@@ -37,6 +35,7 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
     TraitError::new(code, message)
 }
 
+#[cfg(target_os = "linux")]
 fn io_failed(_: std::io::Error) -> TraitError {
     err(ErrorCode::Internal, "container options file I/O failed")
 }
@@ -81,8 +80,10 @@ pub fn check_file_meta(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod imp {
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
     use super::*;
@@ -213,7 +214,7 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 mod imp {
     use super::*;
 
@@ -254,7 +255,7 @@ mod imp {
 
 pub use imp::{read, remove, remove_if_same, write_new};
 
-#[cfg(all(test, unix, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 

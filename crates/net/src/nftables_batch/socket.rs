@@ -473,6 +473,62 @@ mod tests {
         assert_eq!(ack.body_seqs(), &[11, 12][..]);
     }
 
+    /// NET-3・#2839: echo 付き NEWRULE 2 件を、echo → ACK → NEWGEN → ACK（同期点）の通しで受け、
+    /// ハンドルが添字ごとに具体値で返る。echo が欠ければ成功にならない。
+    #[test]
+    fn net3_exchange_returns_echoed_rule_handles() {
+        use crate::netlink::NLM_F_ECHO;
+        use crate::nftables_rules::NFT_MSG_NEWRULE;
+        let newrule = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        let mut nb = NftBatch::new(10).expect("new");
+        for _ in 0..2 {
+            nb.push_with(|seq| {
+                let mut m =
+                    NlMsgBuilder::new(newrule, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
+                NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0).put_into(&mut m)?;
+                Ok(m)
+            })
+            .expect("push");
+        }
+        let b = nb.finish().expect("finish");
+        let echo = |seq: u32, handle: u64| {
+            let mut m = NlMsgBuilder::new(newrule, 0, seq, 0);
+            NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0)
+                .put_into(&mut m)
+                .expect("nfg");
+            m.put_attr(3, &handle.to_be_bytes()).expect("handle");
+            m.finish().expect("finish")
+        };
+        let ack = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([echo(11, 2), err_dgram(11, 0), echo(12, 3), err_dgram(12, 0)].concat()),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect("ok");
+        let got: Vec<Option<u64>> = (0..2)
+            .map(|i| ack.rule_handle(i).map(|h| h.get()))
+            .collect();
+        assert_eq!(got, vec![Some(2), Some(3)]);
+
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([echo(11, 2), err_dgram(11, 0), err_dgram(12, 0)].concat()),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect_err("missing echo");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+    }
+
     /// NET-11: 本体の ACK が揃った後に別データグラムで届く END の非 0 errno を見逃さない。
     #[test]
     fn net11_end_error_in_later_datagram_is_not_success() {

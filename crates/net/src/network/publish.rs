@@ -25,8 +25,9 @@
 //!   同じ受け口の重複行・書き込み側が出さない値（ポート 0・公開先範囲外のアドレス・CR）は予約ゼロ件ではなく
 //!   破損として拒否する。サイズ上限（1 MiB）は読み込み・書き込みの両方で同じ検査を通し、上限を超える
 //!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は未実装で担当 Issue 未確定（REPAIR-3）
-//! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
-//!   （ネットワーク削除時にテーブルごと解放する。`PortRegistry::release_network`。TASK-139.4）
+//! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除は
+//!   `network::unpublish_container_port`（NEWRULE の echo 応答のハンドル指定。NET-3・#2839）。プロセス再起動後の
+//!   ハンドル復元は未対応で、ネットワーク削除時はテーブルごと解放する（`PortRegistry::release_network`。TASK-139.4）
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

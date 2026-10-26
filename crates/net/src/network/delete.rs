@@ -348,7 +348,12 @@ fn prove_table<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> TableProof {
 
 /// `table` の所有を、`token` と `NFTA_TABLE_USERDATA` の一致で証明する（作成失敗の回収でも共用。#2467）。
 fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> TableProof {
-    match ops.table_info(table) {
+    judge_table_info(ops.table_info(table), token)
+}
+
+/// テーブル照会の結果を所有の証明へ写す（`prove_table_token` と、公開の個別解除の所有確認が共用する）。
+fn judge_table_info(info: Result<TableInfo, NetError>, token: &str) -> TableProof {
+    match info {
         Err(e) if e.code() == NetErrorCode::NotFound => TableProof::Absent,
         Err(e) => TableProof::Unproven(e),
         Ok(info) => match (info.handle(), info.userdata()) {
@@ -357,6 +362,21 @@ fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> Tab
                 "nft table ownership token mismatch (table was replaced or has no token)",
             )),
         },
+    }
+}
+
+/// 公開の個別解除（`network::unpublish`）の事前確認。テーブルの `NFTA_TABLE_USERDATA` が `token` と一致する
+/// ときだけ `Ok`。無い・不一致・照会失敗はすべて `Err`（何も変えずに断る）。ルールのハンドルはテーブルごとに
+/// 採番されるため、同名で作り直された別のテーブルで古いハンドルが別のルールを消すのを防ぐ（NET-3・SEC-1）。
+// 呼び出し元の `unpublish` は OS 非依存の本体だが、実機の呼び出しは Linux 限定。
+pub(super) fn require_table_owned(
+    info: Result<TableInfo, NetError>,
+    token: &str,
+) -> Result<(), NetError> {
+    match judge_table_info(info, token) {
+        TableProof::Owned(_) => Ok(()),
+        TableProof::Absent => Err(precondition("nft table is absent")),
+        TableProof::Unproven(e) => Err(e),
     }
 }
 
@@ -522,6 +542,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             netns_path,
             address,
             netns,
+            published_ports,
         } = c;
         let veth_gone = delete_veth(
             ops,
@@ -548,6 +569,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 netns_path,
                 address,
                 netns,
+                published_ports,
             });
             false
         } else {
@@ -572,6 +594,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                         netns_path,
                         address,
                         netns,
+                        published_ports,
                     });
                     false
                 }
@@ -1478,6 +1501,7 @@ mod tests {
             netns_path: pin(id),
             address,
             netns: (),
+            published_ports: Vec::new(),
         }
     }
 
@@ -1632,6 +1656,7 @@ mod tests {
             netns_path: c1.netns_path.clone(),
             address: c1.address,
             netns: (),
+            published_ports: Vec::new(),
         };
         let e = delete_network_with(&fake, &net, vec![c1, dup], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(

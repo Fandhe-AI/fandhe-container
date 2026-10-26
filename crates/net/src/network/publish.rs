@@ -509,6 +509,19 @@ impl PortRegistry {
                 return Err(conflict());
             }
         }
+        // コンテナ単位の上限（MAX_PORT_PUBLISHES）は既存の予約（attach 時の公開分・結果不明の予約を含む）と
+        // 今回の件数の合計で検査する。予約・DNAT 投入の前に拒否する（繰り返し公開による無制限増加の防止）。
+        let held = self
+            .owners
+            .values()
+            .filter(|(n, e)| n == network && e == endpoint)
+            .count();
+        if held.saturating_add(ports.len()) > MAX_PORT_PUBLISHES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many published ports for the container",
+            ));
+        }
         let mut next = self.owners.clone();
         for p in ports {
             next.insert(Self::key(p), (network.clone(), endpoint.clone()));
@@ -608,6 +621,29 @@ mod tests {
 
     fn a(x: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(x)
+    }
+
+    /// NET-4・NET-1: 同じ endpoint への繰り返し予約でも、累積が MAX_PORT_PUBLISHES を超えたら
+    /// 何も増やさず `ResourceExhausted` で拒否する。
+    #[test]
+    fn net4_reserve_rejects_cumulative_over_limit() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let mk = |range: std::ops::Range<u16>| -> Vec<PortPublish> {
+            range
+                .map(|i| {
+                    PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 10_000 + i, 80).unwrap()
+                })
+                .collect()
+        };
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, &mk(0..MAX_PORT_PUBLISHES as u16 - 1))
+            .unwrap();
+        let err = reg.reserve(&net, &ep, &mk(1000..1002)).unwrap_err();
+        assert_eq!(err.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES - 1);
+        reg.reserve(&net, &ep, &mk(1000..1001)).unwrap();
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES);
     }
 
     /// NET-1・NET-4: `release_listeners` は指定した受け口だけを外し、同じ endpoint の他の予約を残す。

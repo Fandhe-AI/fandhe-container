@@ -490,6 +490,9 @@ struct NetworkEntry<N, F> {
     /// ネットワークの記録（`CreatedNetwork`・IPAM）は永続化されていない（#1870）ため `handle` は無く、bridge・nft
     /// テーブルは自動回収しない。取り残した veth・pin の回収に使い、回収し終えたら外す。
     recovered: bool,
+    /// delete_network の部分失敗でコンテナの記録を外したあとも、専用 nft テーブル（DNAT）が残りうる受け口。
+    /// テーブルの削除を確認してネットワークの記録ごと外れるまで契約 11 の衝突判定に使う（fail-closed）。
+    orphan_published: Vec<(u16, Protocol)>,
 }
 
 /// 作成失敗で取り残した資源の回収待ちの記録。
@@ -573,6 +576,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     handle: None,
                     leaked: Some(LeakedCreate { claim }),
                     recovered: false,
+                    orphan_published: Vec::new(),
                 },
             );
         }
@@ -606,6 +610,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                         handle: None,
                         leaked: None,
                         recovered: true,
+                        orphan_published: Vec::new(),
                     },
                 );
             }
@@ -848,6 +853,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 handle,
                 leaked,
                 recovered: false,
+                orphan_published: Vec::new(),
             },
         );
         result?;
@@ -1059,6 +1065,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
 
         let mut guard = self.lock()?;
         let reg = &mut *guard;
+        let orphan_key = (req.host_port().get(), req.protocol());
+        let orphan_conflict = reg
+            .networks
+            .values()
+            .any(|n| n.orphan_published.contains(&orphan_key));
         let network = reg
             .networks
             .get_mut(req.network().as_str())
@@ -1087,7 +1098,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         }
         // 契約 11: 全ネットワーク・全コンテナで `(host_port, protocol)` の重複を拒否する。
         let key = (req.host_port().get(), req.protocol());
-        if reg.containers.values().any(|c| c.published.contains(&key)) {
+        if orphan_conflict || reg.containers.values().any(|c| c.published.contains(&key)) {
             return Err(TraitError::new(
                 ErrorCode::AlreadyExists,
                 "host port is already published",
@@ -1351,7 +1362,16 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     }
                 }
                 for id in attached_ids.iter().filter(|id| !kept.contains(id)) {
-                    reg.containers.remove(id);
+                    // テーブルの削除が確認できていないため、公開した受け口はネットワークに引き継ぐ（契約 11）。
+                    if let Some(c) = reg.containers.remove(id)
+                        && let Some(n) = reg.networks.get_mut(name)
+                    {
+                        for k in c.published {
+                            if !n.orphan_published.contains(&k) {
+                                n.orphan_published.push(k);
+                            }
+                        }
+                    }
                 }
                 Err(first_error.unwrap_or(failure.error))
             }

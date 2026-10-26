@@ -68,13 +68,16 @@
 //!   実体・ランタイム自身のバイナリ（本体に加えて、シェバンの連鎖・`PT_INTERP` の解決先。`#!/proc/self/exe` 等。
 //!   #1458）を拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（開く前に 1:3 を検証し、`O_NOCTTY`
 //!   つきで開き直す。#1459）へ置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
-//!   探索はしない。子の失敗は stderr の英語 1 行・終了コード（125 / 126 / 127）・親への pipe（下記）で伝える
+//!   探索はしない。子の失敗は stderr の英語 1 行・終了コード（125 / 126 / 127）・親への pipe（下記。失敗した段も
+//!   固定語彙 [`ExecChildStep`] で運ぶ）で伝える
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ExecChild`] は
 //!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: 子の終了コード 125 / 126 /
 //!   127 は実行されたコマンド自身も返し得るため、終了コードでは区別できない。親は fork の前に close-on-exec の
 //!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コード・
-//!   ERR-1 コード・違反の理由）」を 1 行で書く。`R` の後の `execveat` の失敗（`ENOENT` → `NotFound`・`EACCES` →
+//!   ERR-1 コード・違反の理由）」を 1 行で書く（失敗の行は `<終了コード> <step> <ERR-1 コード> <理由|->` の 4 語で、`step` は子の手順の段を表す固定語彙
+//!   [`ExecChildStep`]。親は長さと語彙を検証して静的な値に引き直し、`SetupFailed { step }` に持たせる。メッセージは子から運ばず、親が
+//!   段から固定の英文を引く（`ExecChildStep::message`）。`bind_to_parent_lifetime` / `join_exec_cgroup` の失敗も同じ行を書く）。`R` の後の `execveat` の失敗（`ENOENT` → `NotFound`・`EACCES` →
 //!   `PermissionDenied`・`ENOEXEC` → `InvalidArgument` 等。launch の `X <CODE>` と同じ写像）も同じ失敗の行で、
 //!   `SetupFailed { code }` として「起動していない」と ErrorCode つきで返る（#2763）。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
 //!   起動した、「失敗の行」または「何も無い」= 起動していない、と判定する（[`ExecExit`]）。**限界**: `R` を
@@ -89,14 +92,16 @@
 //! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定（launch の `process.cwd` は pivot 直後に適用済みだが、exec 経路は未対応 = REPAIR-3）。環境変数は
 //!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
 //!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
-//! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・ERR-1 コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
-use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
+use super::process::{
+    EXIT_SETUP_FAILED, ExecChildStep, exec_child_main, exec_status_pipe, read_exec_status,
+    report_exec_child_failure,
+};
 use super::reapply::ExecReadyParts;
 use super::seccomp_listener::{
     ExecListenerReceiver, ExecListenerSender, exec_listener_pair, exec_sender_from,
@@ -228,10 +233,24 @@ pub fn spawn_exec_command(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
-        || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| join_exec_cgroup(cgroup)) {
-            Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy),
-            // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
-            Err(code) => code,
+        || match bind_to_parent_lifetime(own.as_fd()) {
+            // 失敗の行は best-effort で書く（書けなければ何も書かずに終わり、親は「手順の途中で終了した」=
+            // コマンドは起動していない・段なし、と判定する。#2822）。この時点では状態 pipe の書き込み側が開いている。
+            Err(code) => {
+                report_exec_child_failure(
+                    &status_write,
+                    ExecChildStep::ParentLifetime,
+                    ErrorCode::FailedPrecondition,
+                );
+                code
+            }
+            Ok(()) => match join_exec_cgroup(cgroup) {
+                Err((code, error_code)) => {
+                    report_exec_child_failure(&status_write, ExecChildStep::CgroupJoin, error_code);
+                    code
+                }
+                Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy),
+            },
         },
         EXIT_SETUP_FAILED,
     )
@@ -250,14 +269,14 @@ pub fn spawn_exec_command(
 /// `bind_to_parent_lifetime` の後・`close_range` の前（cgroup の書き込み fd が残っている間）に呼ぶ。この時点で
 /// 子孫は存在しないため、移した後に作られる子孫はすべて子 cgroup に入る。失敗したら stderr に英語 1 行を出し
 /// `EXIT_SETUP_FAILED` を返す（何も書かずに終了 = 親は「コマンドは起動していない」と判定する。fail-closed）。
-fn join_exec_cgroup(cgroup: &ExecChildCgroup) -> Result<(), i32> {
+fn join_exec_cgroup(cgroup: &ExecChildCgroup) -> Result<(), (i32, ErrorCode)> {
     use std::io::Write as _;
-    cgroup.join_self().map_err(|_| {
+    cgroup.join_self().map_err(|e| {
         let _ = writeln!(
             std::io::stderr(),
             "fandhe-container: the exec command could not join its child cgroup; refusing to continue"
         );
-        EXIT_SETUP_FAILED
+        (EXIT_SETUP_FAILED, e.code)
     })
 }
 

@@ -230,15 +230,43 @@ fn run_bounded_inner<T: Send + 'static>(
             let _slot = slot;
             let _ = tx.send(job());
         });
-    if spawned.is_err() {
+    let Ok(handle) = spawned else {
         return BoundedOutcome::NoResult;
-    }
+    };
     match rx.recv_timeout(timeout) {
-        Ok(v) => BoundedOutcome::Done(v),
+        Ok(v) => {
+            // 結果送信後の作業スレッドが生きたまま戻ると、呼び出し元が単一スレッド前提の処理
+            // （`FileAuditSink` の fork。SEC-4）へ進めなくなる。終了を有限時間だけ確かめ、確認できなければ
+            // 結果を捨てて期限切れ扱いにする（fail-closed。REPAIR-5）。
+            if join_worker_bounded(handle) {
+                BoundedOutcome::Done(v)
+            } else {
+                BoundedOutcome::TimedOut
+            }
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BoundedOutcome::TimedOut,
         // job の panic（結果を送らず終了）。従来どおり「終わった」扱いだが、値は無い。
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => BoundedOutcome::NoResult,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = join_worker_bounded(handle);
+            BoundedOutcome::NoResult
+        }
     }
+}
+
+/// 結果送信後の作業スレッドの終了を待つ上限（送信後は枠の返却だけで即終わるため短くてよい。REPAIR-5）。
+const WORKER_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 作業スレッドが `WORKER_EXIT_GRACE` 内に終了したら join して `true`。終わらなければ join せず `false`。
+fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
+    let deadline = std::time::Instant::now() + WORKER_EXIT_GRACE;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = handle.join();
+    true
 }
 
 /// `job` を作業スレッドで実行して結果を持ち帰る、期限つき実行（#2446。`run_log_removal_bounded` の汎用版）。

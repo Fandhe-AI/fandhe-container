@@ -57,8 +57,10 @@
 //! `--follow` に当たる指定は [`reader::read_container_log_with`] が受ける（CLI-1・SUP-7）。
 //!
 //! # 後始末（#2446・#2593・SUP-7・CLI-1・CRI-2）
-//! CLI の `delete` と plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
-//! 消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
+//! CLI の `delete` と plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）が core の delete の成功後に
+//! [`remove_container_logs_guarded_bounded_waiting`]（sink 閉鎖の窓を期限つきで待つ。#2634・#2698）で現在ログ・全世代・
+//! ロックファイルを消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
+//! 待ちを超えて残った分は、同じ ID の CLI `create` が core を呼ぶ前に [`remove_container_logs_guarded_bounded`] で回収する（#2698）。
 //!
 //! # 未実装（将来仕様。REPAIR-3）
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
@@ -177,7 +179,7 @@ pub const CONTAINER_LOG_LOCK_WAIT: std::time::Duration = std::time::Duration::fr
 pub const CONTAINER_LOG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// [`remove_container_logs_guarded_bounded`] を、`FailedPrecondition`（同じ ID の sink が生存中）のあいだ
-/// `lock_wait` まで試し直す版（plugin-cri の `RemoveContainer` 用。SUP-7・CRI-2・REPAIR-5・#2634）。
+/// `lock_wait` まで試し直す版（CLI の `delete` と plugin-cri の `RemoveContainer` 用。SUP-7・CLI-1・CRI-2・REPAIR-5・#2634）。
 ///
 /// running への force 削除や `stop` 直後の削除では、状態が `Stopped` になっても supervisor が sink を閉じきるまで
 /// ロックが取れない。ここでは呼び出し元スレッドが sleep するだけで、I/O と同時実行枠（supervisor ログの削除と共有）は

@@ -770,6 +770,19 @@ mod tests {
     use super::*;
     use fandhe_container_supervisor::supervisor_log::LogRemoval;
 
+    /// #2894・ERR-1: 起動オプション文書の削除警告は、枠の満杯（RESOURCE_EXHAUSTED）と期限切れ（TIMEOUT）で code が分かれる。
+    #[test]
+    fn err1_2894_options_removal_warning_distinguishes_busy_from_timeout() {
+        assert_eq!(
+            options_removal_warning(&TraitError::new(ErrorCode::ResourceExhausted, "x")),
+            "{\"level\":\"warn\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"container options file removal failed; a leftover file may remain\"}"
+        );
+        assert_eq!(
+            options_removal_warning(&TraitError::new(ErrorCode::Timeout, "x")),
+            "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"container options file removal failed; a leftover file may remain\"}"
+        );
+    }
+
     /// REPAIR-4: 失敗コードの supervisor ログ警告は code つきの 1 行 JSON。
     #[test]
     fn repair4_supervisor_log_failure_warning_carries_code() {

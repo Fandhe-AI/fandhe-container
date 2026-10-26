@@ -140,6 +140,36 @@ Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel
   supervisor を起動しない `sec1_err2_...` の行へ変えると割り込まない。libtest の並列出力を行照合する場合は、標準出力に何も書かない試験の行を選ぶ
 - 範囲外: `run_bounded` の他の呼び出し元の即時 `Busy` は #2894、`binary_entry.rs` の間欠失敗は #2766 で追跡する
 
+## `run_bounded` 系の枠の満杯の分類（#2894・CLI-1・SUP-7・REPAIR-4・REPAIR-5・ERR-1）
+
+`run_bounded`（`Option`）と `run_log_removal_bounded` は、枠の満杯（何も実行していない）を期限切れと同じ値（`None`・`LogRemoval::TimedOut`）に潰していた。
+判定基準は「何も実行せず即時に失敗したのか、期限まで待った結果なのか」。枠の満杯は `RESOURCE_EXHAUSTED`（または `LogRemoval::Busy`・`workers_busy`）、期限切れは従来どおり `TIMEOUT` にする。
+
+| 箇所 | 方針 | 新しい分類 |
+| ---- | ---- | ---------- |
+| `container_options::store::remove_stale_bounded`（CLI の delete 後の掃除、plugin-cri の create 前・delete 後の掃除） | `run_bounded_classified` へ替える（待たない） | 枠の満杯 `RESOURCE_EXHAUSTED`（`container options file removal workers are busy`）／期限切れ `TIMEOUT` |
+| `logs::sweep_stale_container_logs`（plugin-cri の起動時の走査）の初期走査とループ | `run_bounded_classified` へ替える（待たない） | `SweepReport::workers_busy`（枠の満杯）／`timed_out`（期限切れ）に分ける |
+| `supervisor_log::run_log_removal_bounded`（plugin-cri の `remove_supervisor_log`） | `LogRemoval::Busy` を追加 | plugin-cri は `Kept { ResourceExhausted }`（記録器は Failure） |
+| `logs::remove_container_logs_guarded_bounded` ほか `run_bounded_classified` の呼び出し元 | 変更なし（#2760 で区別済み） | `ResourceExhausted` |
+| CLI の `create` の起動オプション I/O（`run_bounded_waiting`） | 変更なし（#2834） | `RESOURCE_EXHAUSTED`／`TIMEOUT` |
+| CLI の `stop_delete.rs` `remove_supervisor_log`（`run_bounded` の `Option`） | 本変更では触れない。#2892・#2920 で `run_bounded_classified` へ移行する | #2920 で区別 |
+| CLI の `emit_warning_bounded` | 変更なし（結果を捨てるため、分類は外へ出ない） | — |
+
+待たない理由: plugin-cri の即時 `Busy` は #2760 の判断（常駐プロセスで止まった作業が枠を埋めたとき、さらに待ちを重ねない）で、CLI の delete と起動時の走査は
+失敗しても成否が変わらない best effort の後始末で、枠が埋まるのは止まった作業が残るときだけのため待っても空く見込みが低い。create の枠待ち（#2834）は
+並列実行で一時的に満杯になることが原因だったので事情が異なる。
+
+変更しない箇所（理由つき）:
+
+- 枠を持たない同名の関数: `start_entry.rs` の `run_bounded`（呼ぶたびに spawn して bool を返す）、`cri/runtime_service.rs` の `run_bounded`（spawn の失敗は `Unavailable`、期限は `timeout` で区別済み）
+- ロック待ち: core の `state_store.rs` と oci の `image_management/store.rs` の `lock_file_until`・`lock_table_until` は、`WouldBlock` の間は期限まで再試行し、`Timeout` を返すのは実際に期限まで待ったときだけ。即時の失敗を期限切れとして返す形ではない
+- 記録器の操作名の語彙（`container_log_remove.*` の 5 種）は増やさない
+
+ワイヤー・観測の変化: code 名（`RESOURCE_EXHAUSTED`・`TIMEOUT`）は既存で、新しい名前は無い。枠の満杯のときの code が `TIMEOUT` から `RESOURCE_EXHAUSTED` に変わる行は、
+CLI の delete の起動オプション文書の警告、plugin-cri の `container_delete_cleanup`（`target: supervisor_log`・`container_options`）。
+`container_log_sweep` の行にキー `workers_busy`（bool）が加わり、枠の満杯で打ち切ったときは `timed_out: false`・`workers_busy: true` になる。
+試験: `crates/supervisor/tests/bounded_slot_busy.rs`（3 関数の満杯と期限切れの具体値）。
+
 ## 観測（REPAIR-4）
 
 失敗時は従来の `container_log_remove`（成否）に加えて、コード別の操作名にも Failure を 1 件計上する。語彙は固定の 5 種:

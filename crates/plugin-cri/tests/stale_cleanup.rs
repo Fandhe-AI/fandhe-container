@@ -269,7 +269,7 @@ fn sup7_cri2_startup_sweep_removes_only_closed_unrecorded_logs() {
     assert_eq!(
         sweep_summary_line(&report),
         format!(
-            "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":1,\"removed_files\":1,\"skipped_live\":1,\"skipped_present\":1,\"skipped_undecodable\":1,\"failed\":0,\"timed_out\":false}}",
+            "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":1,\"removed_files\":1,\"skipped_live\":1,\"skipped_present\":1,\"skipped_undecodable\":1,\"failed\":0,\"timed_out\":false,\"workers_busy\":false}}",
             report.scanned
         )
     );

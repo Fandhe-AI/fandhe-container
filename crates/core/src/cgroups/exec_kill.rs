@@ -301,7 +301,10 @@ pub(crate) const EXEC_SWEEP_SCAN_LIMIT: usize = 4096;
 pub(crate) const EXEC_SWEEP_CANDIDATE_LIMIT: usize = 256;
 
 /// delete 前の掃除全体で 1 つ持つ、`populated 0` を待つ期限（子ごとに積み重ねない。REPAIR-5）。
-pub(crate) const EXEC_SWEEP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 公開しているのは、plugin-cri が `delete` の待ちの上限（状態ロックの待ち 3 回分 + この値）を具体値で照合するため
+/// （`oci_runtime::delete` の module doc「待ちの上限」。#3027・CRI-2・REPAIR-5）。
+pub const EXEC_SWEEP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 掃除の方式（時機ごとの対象の違いはモジュール doc）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

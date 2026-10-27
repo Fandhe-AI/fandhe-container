@@ -135,6 +135,10 @@ struct Sim {
     deletes: AtomicU32,
     /// 状態ストアの `delete` が呼ばれたら立ち、以後 `get` は `NotFound` を返す（ログ削除の guard が通るように）。
     deleted: AtomicBool,
+    /// 状態ストアの `delete` に入れる遅延（ミリ秒。core の delete が長引く場面の再現。#3027）。
+    delete_delay_ms: std::sync::atomic::AtomicU64,
+    /// true なら `delete` の後も `get` が記録を返し続ける（同じ ID が再作成済みの場面の再現。guard が偽になる。#3027）。
+    recreate_after_delete: AtomicBool,
 }
 
 impl Sim {
@@ -149,6 +153,8 @@ impl Sim {
             root: scripts().dir.clone(),
             deletes: AtomicU32::new(0),
             deleted: AtomicBool::new(false),
+            delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            recreate_after_delete: AtomicBool::new(false),
         })
     }
 
@@ -164,6 +170,8 @@ impl Sim {
             root,
             deletes: AtomicU32::new(0),
             deleted: AtomicBool::new(false),
+            delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            recreate_after_delete: AtomicBool::new(false),
         })
     }
 
@@ -178,6 +186,8 @@ impl Sim {
             root: scripts().dir.clone(),
             deletes: AtomicU32::new(0),
             deleted: AtomicBool::new(false),
+            delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            recreate_after_delete: AtomicBool::new(false),
         })
     }
 
@@ -220,8 +230,14 @@ impl StateStore for SimStore {
         Err(unused())
     }
     fn delete(&self, _r: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        let delay = self.0.delete_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         self.0.deletes.fetch_add(1, Ordering::SeqCst);
-        self.0.deleted.store(true, Ordering::SeqCst);
+        if !self.0.recreate_after_delete.load(Ordering::SeqCst) {
+            self.0.deleted.store(true, Ordering::SeqCst);
+        }
         Ok(DeleteStateResponse::new())
     }
     fn list(&self, _r: &ListStateRequest) -> Result<StateList, TraitError> {
@@ -972,11 +988,12 @@ fn repair5_2964_force_delete_shares_wait_between_both_logs() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// REPAIR-5・#2634・#2760: running への force 削除の最悪所要（stop + ログ 2 件〔待ちは共有〕+ 起動オプション
-/// 文書の掃除）は `PLUGIN_RUNTIME_TIMEOUT` に収まる。
+/// REPAIR-5・#2634・#2760・#3027: 後始末（ログ 2 件〔待ちは共有〕+ 起動オプション文書の掃除）の最悪は 30 秒で、
+/// stop の 17 秒と足すと `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）にちょうど一致する。
 #[test]
 fn repair5_force_delete_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::oci_runtime::KillTimeout;
+    use fandhe_container_plugin_cri::adapter::PLUGIN_FORCE_DELETE_DEADLINE;
     use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
     use fandhe_container_supervisor::container_options::store::OPTIONS_REMOVE_TIMEOUT;
     use fandhe_container_supervisor::logs::{
@@ -991,11 +1008,150 @@ fn repair5_force_delete_worst_case_fits_runtime_timeout() {
         CONTAINER_LOG_LOCK_WAIT + SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_REMOVE_TIMEOUT;
     assert_eq!(logs, Duration::from_secs(20));
     assert_eq!(OPTIONS_REMOVE_TIMEOUT, Duration::from_secs(10));
-    assert_eq!(
-        stop + logs + OPTIONS_REMOVE_TIMEOUT,
-        Duration::from_secs(47)
+    let cleanup = logs + OPTIONS_REMOVE_TIMEOUT;
+    assert_eq!(cleanup, Duration::from_secs(30));
+    assert_eq!(stop + cleanup, PLUGIN_FORCE_DELETE_DEADLINE);
+    assert_eq!(PLUGIN_FORCE_DELETE_DEADLINE, Duration::from_secs(47));
+    assert!(PLUGIN_FORCE_DELETE_DEADLINE < PLUGIN_RUNTIME_TIMEOUT);
+}
+
+/// REPAIR-5・CRI-2・#3027: `RemoveContainer`（running への force delete）の最悪を、core の delete を含めて数える。
+/// 数え方の規則は「`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT` を 1 回」。後始末の前の合計（42 秒）は
+/// 打ち切れないが、全体の期限（47 秒）より先に終わり、全体の最悪は期限で決まる。期限を共有しない場合の合計（72 秒）は
+/// `PLUGIN_RUNTIME_TIMEOUT` を超える（採らない形が崩れることの証跡）。
+#[test]
+fn repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout() {
+    use fandhe_container_core::cgroups::EXEC_SWEEP_DELETE_TIMEOUT;
+    use fandhe_container_core::oci_runtime::KillTimeout;
+    use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
+    use fandhe_container_plugin_cri::adapter::PLUGIN_FORCE_DELETE_DEADLINE;
+    use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
+    let stop = (KillTimeout::DEFAULT + Duration::from_secs(1)) * 2 + STOP_KILL_WAIT;
+    assert_eq!(stop, Duration::from_secs(17));
+    // stop_live_before_force_delete の状態の読み取り（1 回）。
+    let pre_get = STATE_LOCK_TIMEOUT;
+    assert_eq!(pre_get, Duration::from_secs(5));
+    // core の delete: get 2 回 + StateStore::delete 1 回 + exec 掃除（oci_runtime::delete の module doc「待ちの上限」）。
+    assert_eq!(EXEC_SWEEP_DELETE_TIMEOUT, Duration::from_secs(5));
+    let core = STATE_LOCK_TIMEOUT * 3 + EXEC_SWEEP_DELETE_TIMEOUT;
+    assert_eq!(core, Duration::from_secs(20));
+    let before_cleanup = stop + pre_get + core;
+    assert_eq!(before_cleanup, Duration::from_secs(42));
+    assert_eq!(PLUGIN_FORCE_DELETE_DEADLINE, Duration::from_secs(47));
+    // 後始末は期限までの残りで頭打ちなので、全体は max(42, 47) = 47 秒。
+    let worst = before_cleanup.max(PLUGIN_FORCE_DELETE_DEADLINE);
+    assert_eq!(worst, Duration::from_secs(47));
+    assert!(worst < PLUGIN_RUNTIME_TIMEOUT);
+    // 期限を共有しない場合（後始末 30 秒をそのまま足す）は収まらない。
+    let unshared = before_cleanup + Duration::from_secs(30);
+    assert_eq!(unshared, Duration::from_secs(72));
+    assert!(unshared > PLUGIN_RUNTIME_TIMEOUT);
+}
+
+/// REPAIR-5・CRI-2・SUP-7・#3027: core の delete が長引いて全体の期限までの残りが少ないとき、後始末の各段は残りで
+/// 頭打ちになり、期限を大きく超えない（頭打ちが無ければ共有の待ち 3 秒と試行で 3 秒以上かかる）。
+/// 消せなかったログは残し（`FailedPrecondition`）、`delete` 自体は `Ok` のまま。
+#[test]
+fn repair5_cri2_3027_force_delete_cuts_cleanup_at_deadline() {
+    let root = temp_root("deadline-cut");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    sim.delete_delay_ms.store(300, Ordering::SeqCst);
+    let _writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    let _sink = open_log_sink(&root, "c1");
+    let rec = Arc::new(OpRecorder::new());
+    let (rt, warnings) = capture_warnings(
+        force_runtime(&sim, &rec, Duration::from_secs(3))
+            .with_delete_deadline(Duration::from_millis(700)),
     );
-    assert!(stop + logs + OPTIONS_REMOVE_TIMEOUT < PLUGIN_RUNTIME_TIMEOUT);
+    let started = Instant::now();
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    let elapsed = started.elapsed();
+    let kept = CleanupOutcome::Kept {
+        code: ErrorCode::FailedPrecondition,
+    };
+    assert_eq!(resp.supervisor_log(), kept);
+    assert_eq!(resp.container_log(), kept);
+    assert!(elapsed >= Duration::from_millis(550), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    assert_eq!(supervisor_log_names(&root), ["c1.log", "c1.log.lock"]);
+    assert_eq!(log_dir_names(&root), ["c1.log", "c1.log.lock"]);
+    assert_eq!(warnings.lock().expect("lock").len(), 2);
+    drop(_sink);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REPAIR-5・CRI-2・REPAIR-4・#3027: core の delete だけで全体の期限を使い切ったときは、後始末の段を試さず
+/// `Timeout` として残す（ログは消さない）。警告行は固定語彙の code だけで知らせる。
+#[test]
+fn repair5_cri2_3027_force_delete_skips_cleanup_when_deadline_exhausted() {
+    let root = temp_root("deadline-spent");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    sim.delete_delay_ms.store(300, Ordering::SeqCst);
+    let writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    drop(writer);
+    let rec = Arc::new(OpRecorder::new());
+    let (rt, warnings) = capture_warnings(
+        force_runtime(&sim, &rec, Duration::from_secs(3))
+            .with_delete_deadline(Duration::from_millis(200)),
+    );
+    let started = Instant::now();
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    assert!(started.elapsed() < Duration::from_millis(800));
+    let timeout = CleanupOutcome::Kept {
+        code: ErrorCode::Timeout,
+    };
+    assert_eq!(resp.supervisor_log(), timeout);
+    assert_eq!(resp.container_log(), timeout);
+    assert_eq!(supervisor_log_names(&root), ["c1.log", "c1.log.lock"]);
+    assert_eq!(op_counts(&rec, "supervisor_log_remove"), Some((0, 1)));
+    assert_eq!(op_counts(&rec, "container_log_remove"), Some((0, 1)));
+    assert_eq!(
+        op_counts(&rec, "container_log_remove.timeout"),
+        Some((0, 1))
+    );
+    let lines = warnings.lock().expect("lock").clone();
+    for target in ["supervisor_log", "container_log"] {
+        let needle = format!("\"target\":\"{target}\",\"code\":\"TIMEOUT\"");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(&needle)).count(),
+            1,
+            "{lines:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SUP-7・CRI-2・SEC-1・#3027: 同じ ID が再作成済み（guard が偽）のとき、plugin-cri の経路でも supervisor ログを消さない。
+/// 警告行は出さない。なお 0 件で成功した結果は `Removed` と報告される（観測のずれ。設計文書の残余）。
+#[test]
+fn sup7_cri2_3027_force_delete_keeps_supervisor_log_when_id_recreated() {
+    let root = temp_root("recreated");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    sim.recreate_after_delete.store(true, Ordering::SeqCst);
+    let writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    drop(writer);
+    assert_eq!(supervisor_log_names(&root), ["c1.log", "c1.log.lock"]);
+    let rec = Arc::new(OpRecorder::new());
+    let (rt, warnings) = capture_warnings(force_runtime(&sim, &rec, Duration::from_millis(200)));
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    assert_eq!(sim.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(supervisor_log_names(&root), ["c1.log"]);
+    assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+    assert!(warnings.lock().expect("lock").is_empty());
+    assert_eq!(op_counts(&rec, "supervisor_log_remove"), Some((1, 0)));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// REPAIR-5・#2760: `create` の最悪所要（ログ回収 + 起動オプション文書の掃除 + 状態ロック + 監査記録 2 回）は

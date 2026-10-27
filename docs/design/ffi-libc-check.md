@@ -51,6 +51,7 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 | ---------- | -------------- | ---- |
 | x86_64-unknown-linux-gnu | `rust-ci`（clippy・test の `--all-features`）・`platform-ci`（ubuntu の `make lint`・`make test`） | コンパイル時検査（試験の実行を含む） |
 | aarch64-unknown-linux-gnu | `cross-target-check`（`cargo check`・`cargo clippy` の `--all-targets --all-features`） | 型検査（const の評価は行われる。試験は実行しない） |
+| aarch64-unknown-linux-musl（製品のゲストのターゲット。guest-init のみ） | `cross-target-check` の `cargo check` / `cargo clippy -p fandhe-container-guest-init --all-targets` | 型検査（`cfg(test)` の const の評価は行われる。試験は実行しない） |
 | aarch64-apple-darwin | `cross-target-check`（既定 feature の clippy を含む）・main の `platform-ci`（macos。ネイティブ） | PR では型検査、main ではネイティブ |
 | x86_64-apple-darwin | なし | CI の空白。手元で `cargo check --all-targets --target x86_64-apple-darwin` を推奨する |
 | Windows | 対象外 | `sys` は `cfg(unix)`。Windows API の自前宣言は #1837 の範囲外 |
@@ -107,3 +108,5 @@ crates/supervisor（#1840）は `src/sys/linux.rs` の `libc_abi`（最上位と
 crates/gpu（#2979・#2980 で `sys` を新設）は未適用。照合は #1837 の子 #2989 で行う。dev-dependencies の `libc`（=0.2.189）だけを使い、追加には oci（#2590）と同様に crate ごとのオーナー承認が要る。
 
 なお rustdoc は dev-dependencies を解決しないため、`#[cfg(test)]` の外のドキュメントコメントから `libc::…` へ intra-doc リンクを張らない（バッククォートのみ。#1300）。
+
+crates/guest-init（#2076）は `src/sys.rs` の試験専用モジュール `libc_abi` で照合する（`libc` は `cfg(target_os = "linux")` の dev-dependencies。`Cargo.lock` は guest-init の `dependencies` に `libc` が 1 行増えるだけで `[[package]]` は増えない。製品の静的バイナリの依存は不変）。照合したのは定数 6 件（`MS_RDONLY`・`MS_NOSUID`・`MS_NODEV`・`MS_NOEXEC`・`O_NOCTTY`・`ENOSYS`）、`cstring` 内のリテラル EINVAL（22）の値の固定 1 件、`mount` の型（自前と `libc` を同じ関数ポインタ型へ代入）1 件。libc 0.2.189 では値も宣言も x86_64・aarch64 の gnu と musl で同一なので `target_env` では分けず、`SUPPORTED` と同じ LP64（x86_64・aarch64）に限る。musl は aarch64 のみ `cross-target-check` で評価され（x86_64 musl は CI に無いが値は同一）、対象外は `SUPPORTED`・`PSEUDO_STRICT`・`DEVTMPFS_FLAGS`・`virtiofs_flags`（方針値。組み合わせは固定値テストが見る）・安全なラッパー群。値のずらし（`MS_NODEV` を 5 に。x86_64 gnu と aarch64 musl で E0080）と型のずらし（期待型を `c_uint` に。E0308）で評価が失敗することを確認した（ずらした変更はコミットしていない）。

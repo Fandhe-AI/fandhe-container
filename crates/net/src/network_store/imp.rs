@@ -274,6 +274,13 @@ impl NetworkStore {
     /// `state_root` は呼び出し側が与えた信頼するルート（core の状態ストアと同じ扱い）。`@networks` から先は
     /// 作成時に 0700 を明示し、既存のものは検査して違反なら自動修復せず拒否する。
     pub fn open(state_root: &Path) -> Result<Self, NetError> {
+        // 対応外アーキでは O_NOFOLLOW 等が 0 になり symlink 拒否が効かないため、fail-closed で拒否する。
+        if sys::O_NOFOLLOW == 0 || sys::O_DIRECTORY == 0 {
+            return Err(err(
+                NetErrorCode::Unimplemented,
+                "network store requires O_NOFOLLOW support on this architecture",
+            ));
+        }
         if !Path::new("/proc/self/fd").is_dir() {
             return Err(err(
                 NetErrorCode::Unimplemented,
@@ -328,6 +335,18 @@ impl NetworkStore {
             self.lock_timeout,
             "timed out waiting for the network store lock",
         )?;
+        // 取得までに差し替えられていないか、パスの inode と掴んだ fd を照合する。
+        let on_disk = fs::symlink_metadata(self.dir.path(LOCK_FILE))
+            .map_err(|e| map_io(&e, "failed to stat network store lock file"))?;
+        let held = file
+            .metadata()
+            .map_err(|e| map_io(&e, "failed to stat network store lock file"))?;
+        if !same_inode(&on_disk, &held) {
+            return Err(err(
+                NetErrorCode::Internal,
+                "network store lock file was replaced",
+            ));
+        }
         Ok(GlobalLockGuard { store: self, file })
     }
 

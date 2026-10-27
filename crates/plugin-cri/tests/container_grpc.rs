@@ -480,6 +480,96 @@ async fn pull_image(
     .map(|r| r.into_inner().image_ref)
 }
 
+/// 段 C 専用の `PullImage`。`call_with_deadline`（`PluginError` へ写してメタデータを捨てる）を通さず、
+/// 生の `tonic::Status` を返してレジストリの HTTP 状態（トレーラーメタデータ。#2898）を読めるようにする（#2966）。
+/// 期限切れは `DEADLINE_EXCEEDED` の固定文言の `Status` へ写す。
+async fn pull_image_raw(
+    c: &mut ImageServiceClient<Channel>,
+    image: &str,
+    deadline: Duration,
+) -> Result<String, tonic::Status> {
+    let call = c.pull_image(cri::PullImageRequest {
+        image: Some(image_spec(image)),
+        auth: None,
+        sandbox_config: None,
+    });
+    match tokio::time::timeout(deadline, call).await {
+        Ok(r) => r.map(|r| r.into_inner().image_ref),
+        Err(_) => Err(tonic::Status::deadline_exceeded("pull deadline exceeded")),
+    }
+}
+
+/// `pull_image_raw` の失敗を、HTTP 状態の区分つきの固定の 1 行にする（#2966・CRI-3・REPAIR-4）。
+/// 429 は Docker Hub の匿名 pull の rate limit と分かる専用の行にする。生の message・参照・URL は出さない
+/// （`status.message()` を読まない）。
+fn pull_failure_line(status: &tonic::Status) -> String {
+    use fandhe_container_cri::error::registry_http_status_from_metadata;
+    use fandhe_container_cri::instrument::{RegistryHttpClass, code_name};
+    let class = registry_http_status_from_metadata(status.metadata())
+        .and_then(RegistryHttpClass::from_http_status);
+    match class {
+        Some(RegistryHttpClass::RateLimited) => "production_binary_full_lifecycle_real: registry rate limit (HTTP 429); docker hub anonymous pull rate limit is likely exhausted".to_string(),
+        Some(c) => format!(
+            "production_binary_full_lifecycle_real: pull failed with code {} registry_http={}",
+            code_name(status.code()),
+            c.as_str()
+        ),
+        None => format!(
+            "production_binary_full_lifecycle_real: pull failed with code {} registry_http=none",
+            code_name(status.code())
+        ),
+    }
+}
+
+/// 失敗行の書式の固定（#2966・CRI-3）。既定の集合で回り、実レジストリを要しない。
+#[test]
+fn cri3_pull_failure_line_identifies_rate_limit() {
+    use fandhe_container_cri::error::REGISTRY_HTTP_STATUS_METADATA_KEY;
+    use tonic::metadata::{MetadataMap, MetadataValue};
+    let with = |code: tonic::Code, msg: &str, http: Option<&str>| {
+        let mut md = MetadataMap::new();
+        if let Some(h) = http {
+            md.insert(
+                REGISTRY_HTTP_STATUS_METADATA_KEY,
+                h.parse::<MetadataValue<_>>().expect("ascii"),
+            );
+        }
+        tonic::Status::with_metadata(code, msg, md)
+    };
+    let l429 = pull_failure_line(&with(
+        tonic::Code::Unavailable,
+        "registry rate limit exceeded",
+        Some("429"),
+    ));
+    assert_eq!(
+        l429,
+        "production_binary_full_lifecycle_real: registry rate limit (HTTP 429); docker hub anonymous pull rate limit is likely exhausted"
+    );
+    assert!(l429.contains("429") && l429.contains("rate limit"));
+    let l503 = pull_failure_line(&with(
+        tonic::Code::Unavailable,
+        "registry is unavailable",
+        Some("503"),
+    ));
+    assert_eq!(
+        l503,
+        "production_binary_full_lifecycle_real: pull failed with code UNAVAILABLE registry_http=server_error"
+    );
+    assert!(!l503.contains("429") && !l503.contains("rate limit"));
+    assert_eq!(
+        pull_failure_line(&with(
+            tonic::Code::Unavailable,
+            "registry is unavailable",
+            None
+        )),
+        "production_binary_full_lifecycle_real: pull failed with code UNAVAILABLE registry_http=none"
+    );
+    assert_eq!(
+        pull_failure_line(&with(tonic::Code::PermissionDenied, "x", Some("401"))),
+        "production_binary_full_lifecycle_real: pull failed with code PERMISSION_DENIED registry_http=unauthorized"
+    );
+}
+
 /// `Status` を UDS＋gRPC 越しに呼び、実行層ありで pod network 無しの構成の応答を具体値で照合する
 /// （`RuntimeReady`=true・`NetworkReady`=false〔`NetworkPluginNotReady`〕・既定ハンドラ 1 件・features・空の `info`）。
 /// 本番は core の network namespace の join が未実装で `with_pod_network` を差さないため、段 A も同じ値になる
@@ -908,6 +998,7 @@ fn spawn_server_inherit_env(bin: &Path, sock: &Path) -> ChildGuard {
 /// （`cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor`）。試験は plugin と supervisor だけを
 /// 専用ディレクトリへ複製し、隣に特権ランチャー（`fandhe-container-launcher`）が無い構成（SUP-14 の rootful 経路に入らない）で
 /// 実行する。前提が欠けていれば skip せず失敗させる（`start_stop_delete_real` と同じ扱い）。
+/// pull の失敗時はレジストリの HTTP 状態を `production_binary_full_lifecycle_real:` で始まる固定行で出す（429 は rate limit と識別。#2966）。
 /// CI では `platform-ci`（ubuntu）が委譲スコープの中で実行する（#2818）。実機確認は人間担当（結果は #442）。実行例:
 /// `systemd-run --user --scope -p Delegate=yes cargo test -p fandhe-container-plugin-cri --test container_grpc -- --ignored --exact production_binary_full_lifecycle_real`
 #[tokio::test]
@@ -949,9 +1040,15 @@ async fn production_binary_full_lifecycle_real() {
         let mut c = RuntimeServiceClient::new(ch.clone());
         let mut images = ImageServiceClient::new(ch.clone());
 
-        let image_ref = pull_image(&mut images, IMAGE, PULL_DEADLINE)
-            .await
-            .expect("pull image");
+        // 失敗時はレジストリの HTTP 状態を固定行で出す（429 は rate limit と分かる。#2966）。成否の判定は変えない。
+        let image_ref = match pull_image_raw(&mut images, IMAGE, PULL_DEADLINE).await {
+            Ok(r) => r,
+            Err(st) => {
+                let line = pull_failure_line(&st);
+                eprintln!("{line}");
+                panic!("pull image: {line}");
+            }
+        };
         assert!(image_ref.starts_with("sha256:"), "image ref: {image_ref}");
         let status = call_with_deadline(
             images.image_status(cri::ImageStatusRequest {

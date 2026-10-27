@@ -23,6 +23,9 @@
 //!    `registry rate limit exceeded` を持つ（メタデータを捨てる経路でも見分けるため）。
 //! 4. 付けるのはレジストリ由来の失敗（`PullError::from_oci`）だけで、ストア・展開・config 由来には付けない。
 //! 5. plugin 境界の `PluginError` はメタデータを運ばない（対象外）。`ErrorInfo`（details）は新規依存が要るため採らない。
+//! 6. 読み手は [`registry_http_status_from_metadata`] だけ（書き手 `From<CriError> for Status` と対）。
+//!    操作記録（`crate::instrument::CriOpTimer`。#2966）と実機前提試験の失敗表示が使う。区分の語彙は
+//!    `crate::instrument::RegistryHttpClass`。
 //!
 //! `PullError` の `AlreadyExists` は意図して `INTERNAL` に写す（`ALREADY_EXISTS` にしない。
 //! 理由は `From<PullError> for CriError` の doc。ERR-3・TASK-97・#2321）。
@@ -39,6 +42,20 @@ use crate::instrument::code_name;
 
 /// レジストリの HTTP 状態を運ぶトレーラーメタデータのキー（値は 10 進の ASCII。例: `429`）。
 pub const REGISTRY_HTTP_STATUS_METADATA_KEY: &str = "fandhe-registry-http-status";
+
+/// `Status` のメタデータから [`REGISTRY_HTTP_STATUS_METADATA_KEY`] の値を厳格に読む（#2966・CRI-3・REPAIR-4）。
+///
+/// 書き手（`From<CriError> for Status`）と対になる唯一の読み手。ちょうど 3 桁の ASCII 数字で
+/// 100..=599 に入るときだけ `Some`、それ以外（キー無し・空白・先頭 0 の 4 桁・範囲外）は `None`
+/// （fail-closed。アロケーションしない）。
+pub fn registry_http_status_from_metadata(md: &MetadataMap) -> Option<u16> {
+    let text = md.get(REGISTRY_HTTP_STATUS_METADATA_KEY)?.to_str().ok()?;
+    if text.len() != 3 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u16 = text.parse().ok()?;
+    (100..=599).contains(&value).then_some(value)
+}
 
 /// `Status` のメッセージ上限（バイト）。plugin・レジストリ由来の文字列で応答が肥大化するのを防ぐ。
 pub(crate) const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
@@ -540,6 +557,51 @@ mod tests {
                 .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
                 .is_none()
         );
+    }
+
+    /// CRI-3・REPAIR-4（#2966）: メタデータの読み手は 3 桁・範囲内だけを受け、書き手と往復一致する。
+    #[test]
+    fn cri3_registry_http_status_from_metadata_is_strict() {
+        let md_of = |v: &str| {
+            let mut md = MetadataMap::new();
+            md.insert(
+                REGISTRY_HTTP_STATUS_METADATA_KEY,
+                v.parse::<MetadataValue<_>>().unwrap(),
+            );
+            md
+        };
+        for (raw, expected) in [
+            ("429", Some(429)),
+            ("100", Some(100)),
+            ("599", Some(599)),
+            ("099", None),
+            ("600", None),
+            ("0429", None),
+            (" 429", None),
+            ("42", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                registry_http_status_from_metadata(&md_of(raw)),
+                expected,
+                "raw={raw:?}"
+            );
+        }
+        assert_eq!(
+            registry_http_status_from_metadata(&MetadataMap::new()),
+            None
+        );
+        for http in [401u16, 429, 503] {
+            let ce = CriError::from(PullError::from_oci(
+                &OciError::new(OciErrorCode::Unavailable, "x").with_http_status(http),
+            ));
+            let st = Status::from(ce);
+            assert_eq!(
+                registry_http_status_from_metadata(st.metadata()),
+                Some(http)
+            );
+        }
     }
 
     /// CRI-3・OCI-1: HTTP 状態ごとの gRPC コードとメタデータ値（余計なキーは付かない）。

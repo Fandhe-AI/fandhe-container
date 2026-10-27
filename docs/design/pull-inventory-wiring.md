@@ -88,7 +88,30 @@ plugin-cri の `adapter::CoreOciRecorder` が oci の `OciOpRecorder` を core �
 
 - 注入点は 4 つ: `image_service` の `OciImagePuller::with_recorder`（展開と pull 内の `ImageStore`）・`OciRegistryClient::with_recorder`（`oci.auth*`・`oci.manifest.fetch`・`oci.blob.fetch`。cri に素通しの口を足した）・`bundle_provider_with` の `ImageRootfsSource::with_recorder`（`CreateContainer` の展開）・`recover_stale_image_pulls_in` の `ImageStore::with_recorder`（起動時の回収）。`PullConfig` 自体に記録先の欄は無い
 - 写像: 操作名は `OciOpKind::as_str` と同じ固定 22 種（`oci.layer.extract`・`oci.pull.publish` 等。単体試験で全件を具体値と照合）。`Success` は成功、それ以外は失敗。レイテンシはそのまま。エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため。分類は oci のエラー応答と構造化ログに残る）。`#[non_exhaustive]` の未知の種別は記録しない
-- 専用の記録器（`CriPluginBackends::oci_op_recorder`）に分ける理由: core の `OpRecorder` は操作名の種類を `MAX_TRACKED_OPS`（64）までしか持たず、上限後の新しい名前は捨てて `dropped_records` に数える。共有記録器には `cri.*`・`net.*`・`oci_runtime`・plugin-cri の `*_remove` 等で約 51〜56 種が入りうる一方、1 回の pull で通る oci の種別は約 16 ある。共有へ流すと pull が枠を取り、後続の `create`・`delete` の記録を捨てさせる。専用なら 22 種で 64 に収まる。core の上限は変えない（PLUG-4）
+- 専用の記録器（`CriPluginBackends::oci_op_recorder`）に分ける理由: core の `OpRecorder` は操作名の種類を `MAX_TRACKED_OPS`（64）までしか持たず、上限後の新しい名前は捨てて `dropped_records` に数える。共有記録器には `cri.*`・`net.*`・`oci_runtime`・plugin-cri の `*_remove` 等で約 51〜56 種が入りうる一方、1 回の pull で通る oci の種別は約 16 ある。共有へ流すと pull が枠を取り、後続の `create`・`delete` の記録を捨てさせる。専用なら 22 種で 64 に収まる（`cri.pull_image.registry_http.*` の 8 種も同じ専用記録器へ入る。#2966）。core の上限は変えない（PLUG-4）
 - stderr: `op_stats_export_loop_many` が共有・oci の順に記録器ごとのブロックを出す。1 周期に `op_stats_meta` 行が 2 行になる
 - 二重計上: `oci.pull.gc_recover`（oci 側。排他の待ちを含む）と `image_pull_recovery`（plugin-cri 側。共有記録器）は同じ回収を別の意味で数える。意図どおり残す
 - 範囲外: 操作統計のメトリクス公開口への接続（#1869）・CLI 側の橋渡し
+
+## レジストリの HTTP 状態の区分の計上（#2966・REPAIR-4・CRI-3・OCI-1）
+
+PR #2927（#2898）でレジストリの HTTP 状態を `PullImage` のトレーラーメタデータ `fandhe-registry-http-status` で運ぶようにしたが、操作記録は gRPC コードしか見ず、429 も 503 も `UNAVAILABLE` の失敗 1 件になっていた。#2966 で区分を記録に足す。
+
+- 読み手は 1 か所: `fandhe_container_cri::error::registry_http_status_from_metadata`（ちょうど 3 桁の ASCII 数字で 100..=599 のときだけ `Some`。他は `None` で数えない）。操作記録の `CriOpTimer` と実機前提試験の失敗表示が同じ関数を使う
+- 区分は固定の語彙 `instrument::RegistryHttpClass`（8 種）。生の HTTP 状態・URL・資格情報は `CriOpSample` に入れない
+
+| HTTP 状態 | 区分 | 操作名（`cri.pull_image.registry_http.<接尾辞>`） |
+| --------- | ---- | ------------------------------------------------ |
+| 401 | `Unauthorized` | `unauthorized` |
+| 403 | `Forbidden` | `forbidden` |
+| 404 | `NotFound` | `not_found` |
+| 408 | `RequestTimeout` | `request_timeout` |
+| 429 | `RateLimited` | `rate_limited` |
+| 上記以外の 400..=499 | `OtherClientError` | `client_error` |
+| 500..=599 | `ServerError` | `server_error` |
+| 100..=399 | `Other` | `other` |
+
+- 置き場は oci 専用の記録器（`oci_op_recorder`）: 共有記録器へ 8 種を足すと `MAX_TRACKED_OPS`（64）に迫り `create`・`delete` の記録を捨てさせうる。専用は 22 + 8 = 30 種で収まる（単体試験の const 評価で照合）
+- 失敗のときだけ記録する（`CoreCriRecorder`）。共有記録器の `cri.pull_image` の失敗 1 件と、区分側の失敗 1 件は同じ失敗を別の切り口で数えたもの（二重計上。意図どおり）
+- 実機前提試験 `production_binary_full_lifecycle_real` の pull 失敗時は、メタデータから区分を読み、429 なら `production_binary_full_lifecycle_real: registry rate limit (HTTP 429); ...` の固定行を出す（それ以外は `pull failed with code <CODE> registry_http=<区分>`）。成否の判定は変えない。CI の事前プローブ（`make docker-hub-ratelimit-probe`）は残す
+- 範囲外: 操作統計のメトリクス公開口への接続（#1869）

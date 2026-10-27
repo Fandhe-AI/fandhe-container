@@ -34,12 +34,26 @@ n=0
 [ ! -f "${STUB_COUNTER}" ] || n="$(cat "${STUB_COUNTER}")"
 n=$((n + 1))
 echo "${n}" >"${STUB_COUNTER}"
+# libtest の --logfile を模す（#2962）。引数から経路を拾う。
+lf=""; prev=""
+nc=""
+for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; [ "${a}" = --nocapture ] && nc=1; prev="${a}"; done
 case "${STUB_MODE}" in
-  ok) echo "test result: ok. 1 passed; 0 failed" ;;
-  zero) echo "test result: ok. 0 passed; 0 failed" ;;
+  ok) echo "test result: ok. 1 passed; 0 failed"; [ -z "${lf}" ] || echo "ok a::b::c" >"${lf}" ;;
+  zero) echo "test result: ok. 0 passed; 0 failed"; [ -z "${lf}" ] || : >"${lf}" ;;
+  # 要約行はあるがログが空（ログ経由でないと合格にならないことの確認）
+  summary-only) echo "test result: ok. 1 passed; 0 failed"; [ -z "${lf}" ] || : >"${lf}" ;;
   fail2)
-    if [ "${n}" -eq 2 ]; then echo "test result: FAILED. 0 passed; 1 failed"; exit 101; fi
-    echo "test result: ok. 1 passed; 0 failed" ;;
+    if [ "${n}" -eq 2 ]; then echo "test result: FAILED. 0 passed; 1 failed"; [ -z "${lf}" ] || echo "failed a::b::c" >"${lf}"; exit 101; fi
+    echo "test result: ok. 1 passed; 0 failed"; [ -z "${lf}" ] || echo "ok a::b::c" >"${lf}" ;;
+  # 汎用: STUB_STDOUT / STUB_STDERR / STUB_LOG は printf %b で出す。STUB_LOG_FIRST_ONLY=1 は 1 回目だけログを書く。
+  gen)
+    # 成功した試験の出力は --nocapture が無いと libtest にキャプチャされて出ない（P1）。それを模す。
+    [ -z "${STUB_NC_STDOUT:-}" ] || [ -z "${nc}" ] || printf '%b' "${STUB_NC_STDOUT}"
+    [ -z "${STUB_STDOUT:-}" ] || printf '%b' "${STUB_STDOUT}"
+    [ -z "${STUB_STDERR:-}" ] || printf '%b' "${STUB_STDERR}" >&2
+    if [ -n "${lf}" ] && { [ -z "${STUB_LOG_FIRST_ONLY:-}" ] || [ "${n}" -eq 1 ]; }; then printf '%b' "${STUB_LOG:-}" >"${lf}"; fi
+    exit "${STUB_RC:-0}" ;;
   bin-ok) echo "exec_x: all scenarios passed" ;;
   bin-na) echo "exec_x: Linux only, not applicable on this OS" ;;
   bin-prefix) echo "xx exec_x: all scenarios passed yy" ;;
@@ -76,6 +90,15 @@ case "\${STUB_MODE}" in
   scope-fail) exit 1 ;;
   scope-hang) sleep 30 ;;
   scope-slow) sleep 3; echo '${FINAL_LINE}' ;;
+  scope-gen)
+    lf=""; prev=""
+    nc=""
+    for a in "\$@"; do [ "\${prev}" = --logfile ] && lf="\${a}"; [ "\${a}" = --nocapture ] && nc=1; prev="\${a}"; done
+    [ -z "\${STUB_NC_STDOUT:-}" ] || [ -z "\${nc}" ] || printf '%b' "\${STUB_NC_STDOUT}"
+    [ -z "\${STUB_STDOUT:-}" ] || printf '%b' "\${STUB_STDOUT}"
+    [ -z "\${STUB_STDERR:-}" ] || printf '%b' "\${STUB_STDERR}" >&2
+    [ -z "\${lf}" ] || printf '%b' "\${STUB_LOG:-}" >"\${lf}"
+    exit "\${STUB_RC:-0}" ;;
 esac
 STUB
 chmod +x "${work}/bin/exec_x_bin"
@@ -168,6 +191,95 @@ else
   echo "NG: no-features-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
 fi
 
+# --- libtest の --logfile 判定・禁止行（#2962）---
+# lib: ログがちょうど 1 行の `ok a::b::c`。要約行だけでは通さない。
+check lib-summary-without-logfile 1 "reason=missing-libtest-ok" summary-only "${P}" "${T}" COUNT=2
+check lib-logfile-ok 0 "passed=2 failed=0 count=2 test=a::b::c" ok "${P}" "${T}" COUNT=2
+check lib-failed-reason-exit 1 "reason=exit" fail2 "${P}" "${T}" COUNT=3
+LN="LIBTEST_NAME=sec1_x"
+INTERLEAVED='test sec1_x ... {"level":"info","msg":"supervisor"}\nok\n'
+check libtest-interleaved-stdout-pass 0 "passed=2 failed=0 count=2 test_bin=exec_x" gen "${P}" "${B}" "${LN}" "STUB_STDOUT=${INTERLEAVED}" 'STUB_LOG=ok sec1_x\n' COUNT=2
+check libtest-with-other-lines 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok other\nok sec1_x\n' COUNT=1
+check libtest-empty-log 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=' COUNT=2
+check libtest-ignored 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ignored sec1_x\n' COUNT=1
+check libtest-failed-rc0 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=failed sec1_x\n' COUNT=1
+check libtest-suffix-name 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok sec1_x_suffix\n' COUNT=1
+check libtest-prefix-name 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok prefix::sec1_x\n' COUNT=1
+check lib-two-lines 1 "reason=missing-libtest-ok" gen "${P}" "${T}" 'STUB_LOG=ok a::b::c\nok other\n' COUNT=1
+# 2 回目はログを書かずに exit 0 でも、1 回目のログが残っていて合格に見えてはならない。
+check libtest-stale-log 1 "passed=1 failed=1 count=2" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok sec1_x\n' STUB_LOG_FIRST_ONLY=1 COUNT=2
+# SUCCESS_LINE は stdout と stderr を別々に照合する。
+check bin-success-line-split-streams 0 "passed=2 failed=0" gen "${P}" "${B}" "${S}" 'STUB_STDOUT=exec_x: all scenarios passed\n' 'STUB_STDERR={"level":"info"}{"level":"info"}\n' COUNT=2
+check success-line-on-stderr 0 "passed=1 failed=0" gen "${P}" "${B}" "${S}" 'STUB_STDERR=exec_x: all scenarios passed\n' COUNT=1
+check success-line-merged-not-accepted 1 "reason=missing-success-line" gen "${P}" "${B}" "${S}" 'STUB_STDOUT=exec_x: all scenarios ' 'STUB_STDERR=passed\n' COUNT=1
+check success-line-libtest-form-warns 0 "warning: SUCCESS_LINE looks like a libtest result line" gen "${P}" "${B}" "SUCCESS_LINE=test sec1_x ... ok" 'STUB_STDOUT=test sec1_x ... ok\n' COUNT=1
+# 禁止行: 成功しても当たれば失敗。どのストリーム・ログに出ても検出する。
+check forbidden-absent-pass 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-info-count 0 "info: forbidden_count=2" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=a|b" 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-semicolon-accepted 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=a;b" 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-in-stdout 1 "reason=forbidden-line forbidden='(root=true)'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true) y\n' 'STUB_LOG=ok sec1_x\n' COUNT=2
+check forbidden-in-stdout-count 1 "passed=0 failed=2 count=2" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true) y\n' 'STUB_LOG=ok sec1_x\n' COUNT=2
+check forbidden-in-stderr 1 "reason=forbidden-line" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=bad thing" 'STUB_STDERR=a bad thing\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-in-logfile 1 "reason=forbidden-line" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=ok other" 'STUB_LOG=ok sec1_x\nok other\n' COUNT=1
+check forbidden-multi-second 1 "forbidden='b2'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=b1|b2" 'STUB_STDOUT=has b2 here\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-lib-mode 1 "reason=forbidden-line" gen "${P}" "${T}" "FORBIDDEN_LINE=zzz" 'STUB_STDOUT=zzz\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
+check forbidden-success-line-mode 1 "reason=forbidden-line" gen "${P}" "${B}" "${S}" "FORBIDDEN_LINE=zzz" 'STUB_STDOUT=exec_x: all scenarios passed\nzzz\n' COUNT=1
+# 失敗の優先順位: 成功行が無ければ missing が先。
+check forbidden-after-missing 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=zzz" 'STUB_STDOUT=zzz\n' 'STUB_LOG=' COUNT=1
+# 入力不正。
+check libtest-name-with-success-line 2 "usage:" gen "${P}" "${B}" "${LN}" "${S}"
+check bin-neither-mode 2 "usage:" gen "${P}" "${B}"
+check libtest-name-in-lib-mode 2 "usage:" ok "${P}" "${T}" "${LN}"
+check libtest-name-flag 2 "usage:" gen "${P}" "${B}" LIBTEST_NAME=-x
+check libtest-name-slash 2 "usage:" gen "${P}" "${B}" LIBTEST_NAME=a/b
+check libtest-name-space 2 "usage:" gen "${P}" "${B}" "LIBTEST_NAME=a b"
+check libtest-name-too-long 2 "usage:" gen "${P}" "${B}" "LIBTEST_NAME=$(printf 'a%.0s' $(seq 1 257))"
+# shellcheck disable=SC2016
+check forbidden-bad-dollar 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=a$b'
+# shellcheck disable=SC2016
+check forbidden-bad-backtick 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=a`b'
+check forbidden-bad-star 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=a*b'
+check forbidden-empty-middle 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=a||b'
+check forbidden-empty-head 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=|a'
+check forbidden-empty-tail 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=a|'
+check forbidden-9-items 2 "usage:" ok "${P}" "${T}" 'FORBIDDEN_LINE=q1|q2|q3|q4|q5|q6|q7|q8|q9'
+check forbidden-8-items-accepted 0 "passed=1 failed=0" ok "${P}" "${T}" 'FORBIDDEN_LINE=q1|q2|q3|q4|q5|q6|q7|q8' COUNT=1
+check forbidden-item-513 2 "usage:" ok "${P}" "${T}" "FORBIDDEN_LINE=$(printf 'a%.0s' $(seq 1 513))"
+check forbidden-item-512-accepted 0 "passed=1 failed=0" ok "${P}" "${T}" "FORBIDDEN_LINE=$(printf 'a%.0s' $(seq 1 512))" COUNT=1
+check forbidden-total-1025 2 "usage:" ok "${P}" "${T}" "FORBIDDEN_LINE=$(printf 'a%.0s' $(seq 1 400))|$(printf 'b%.0s' $(seq 1 400))|$(printf 'c%.0s' $(seq 1 223))"
+check forbidden-equals-success-line 2 "usage:" gen "${P}" "${B}" "${S}" "FORBIDDEN_LINE=exec_x: all scenarios passed"
+check forbidden-equals-libtest-ok 2 "usage:" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=ok sec1_x"
+check forbidden-equals-lib-ok 2 "usage:" ok "${P}" "${T}" "FORBIDDEN_LINE=ok a::b::c"
+# 成功した試験の出力（--nocapture のときだけ出る）の禁止行を検出する（P1）。FORBIDDEN_LINE 無しでは --nocapture を付けない。
+check forbidden-nocapture-libtest 1 "reason=forbidden-line forbidden='(root=true)'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-nocapture-lib 1 "reason=forbidden-line" gen "${P}" "${T}" "FORBIDDEN_LINE=zzz" 'STUB_NC_STDOUT=zzz\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
+check nocapture-not-without-forbidden 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" 'STUB_NC_STDOUT=(root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+# 引数: --logfile は lib と LIBTEST_NAME にだけ付き、SUCCESS_LINE には付かない。
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${T}" COUNT=1 "${target}" >/dev/null 2>&1
+if grep -qE -- "-- --exact a::b::c --logfile [^ ]+libtest.log$" "${work}/args"; then
+  echo "OK: lib-logfile-args"
+else
+  echo "NG: lib-logfile-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${B}" "${LN}" COUNT=1 "${target}" >/dev/null 2>&1
+if grep -qE -- "--test exec_x -- --logfile [^ ]+libtest.log$" "${work}/args"; then
+  echo "OK: libtest-args"
+else
+  echo "NG: libtest-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${B}" "${LN}" TEST_IGNORED=1 COUNT=1 "${target}" >/dev/null 2>&1
+if grep -qE -- "--test exec_x -- --ignored --logfile [^ ]+libtest.log$" "${work}/args"; then
+  echo "OK: libtest-ignored-args"
+else
+  echo "NG: libtest-ignored-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
+
 # --- 委譲スコープモード（USER_SCOPE=1）と TEST_ENV（#2886）---
 SB="STUB_BIN=${work}/bin/exec_x_bin"
 FL="SUCCESS_LINE=${FINAL_LINE}"
@@ -194,6 +306,11 @@ if [ "$(grep -c -- "--message-format=json" "${work}/args")" -eq 1 ] && [ "$(wc -
 else
   echo "NG: scope-args" >&2; cat "${work}/args" "${work}/sd" >&2; fails=$((fails + 1))
 fi
+check scope-libtest-pass 0 "passed=1 failed=0 count=1 test_bin=exec_x" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 'STUB_LOG=ok sec1_x\n' COUNT=1
+check scope-libtest-missing 1 "reason=missing-libtest-ok" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 'STUB_LOG=' COUNT=1
+check scope-forbidden 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check scope-forbidden-nocapture 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check scope-success-line-forbidden 1 "passed=0 failed=1 count=1" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=false)" COUNT=1
 check scope-binary-none 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=none
 check scope-binary-two 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=two
 check scope-binary-null 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=null

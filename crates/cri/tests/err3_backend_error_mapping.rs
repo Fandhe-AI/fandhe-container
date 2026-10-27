@@ -621,6 +621,15 @@ async fn err3_pull_image_429_is_distinguishable_from_other_unavailable() {
             assert!(!err.message().contains(leaked), "{http:?} leaked {leaked}");
         }
         assert_eq!(puller.calls.load(Ordering::SeqCst), 1, "{http:?}");
+        // 操作記録にも HTTP 状態の区分が載る（#2966・REPAIR-4）。
+        let samples = recorder.0.lock().unwrap().clone();
+        assert_eq!(samples.len(), 1, "{http:?}");
+        let expected_class = match http {
+            Some(429) => Some(fandhe_container_cri::instrument::RegistryHttpClass::RateLimited),
+            Some(503) => Some(fandhe_container_cri::instrument::RegistryHttpClass::ServerError),
+            _ => None,
+        };
+        assert_eq!(samples[0].registry_http(), expected_class, "{http:?}");
         let listed =
             ImageService::list_images(&svc, Request::new(v1::ListImagesRequest::default()))
                 .await

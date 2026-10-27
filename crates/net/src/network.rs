@@ -119,6 +119,9 @@
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
 pub mod attach_claim;
+// 試験専用の故障注入。単体試験（3 OS）と、feature 有効な Linux の結合試験だけで有効にする（NET-1・#2971）。
+#[cfg(any(test, all(feature = "attach-fault-test-support", target_os = "linux")))]
+mod attach_fault;
 pub mod delete;
 pub mod ipam;
 pub mod publish;
@@ -131,6 +134,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use attach_claim::FailedAttachClaim;
+#[cfg(all(feature = "attach-fault-test-support", target_os = "linux"))]
+pub use attach_fault::{AttachFault, AttachFaultPoint, attach_container_with_fault_for_test};
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
 #[cfg(target_os = "linux")]
@@ -4832,5 +4837,153 @@ mod attach_tests {
         assert_eq!(e.error.code(), NetErrorCode::InvalidArgument);
         assert!(calls.borrow().is_empty());
         assert_eq!(reg.len(), 0);
+    }
+
+    // ---- 故障注入（attach_fault）の照合（NET-1・REPAIR-3・#2971） ----
+
+    use super::attach_fault::{AttachFault, AttachFaultPoint, FaultyAttachOps, expected_record};
+
+    /// 故障点、対応する Fake の呼び出し記録の接頭辞、IPAM 払い出し後の段か。
+    const FAULT_POINTS: [(AttachFaultPoint, &str, bool); 6] = [
+        (AttachFaultPoint::SetOwnerToken, "set_owner_token", false),
+        (AttachFaultPoint::SetMaster, "set_master", false),
+        (AttachFaultPoint::SetUp, "set_up", false),
+        (AttachFaultPoint::MoveToNetns, "move_to_netns", false),
+        (AttachFaultPoint::AddAddress, "ns_addr", true),
+        (AttachFaultPoint::DefaultRoute, "ns_route", true),
+    ];
+
+    /// NET-1・REPAIR-3・#2971: 故障点ごとに、巻き戻しの失敗の 4 通りで残る資源・請求書の記録・IPAM の保持を
+    /// 具体値で照合する。IPAM 払い出し前の段は IPAM を変えず、払い出し後の段は取り残しがあるときだけ
+    /// アドレスを保持して quarantine の請求書になる。
+    #[test]
+    fn net1_attach_fault_leftover_matrix() {
+        use AttachResource::{Netns, Veth};
+        use ResourceState::{Present, Unknown};
+        let host = host_of("c1");
+        let pin = pin_of("c1");
+        for (point, _, post_ipam) in FAULT_POINTS {
+            // (veth 削除の失敗, unpin の失敗, removed, leftover, 請求書の (veth, netns))
+            let ie = NetErrorCode::Internal;
+            let to = NetErrorCode::Timeout;
+            let cases = [
+                (
+                    Some(ie),
+                    Some(ie),
+                    vec![],
+                    vec![(Veth(host.clone()), Present), (Netns(pin.clone()), Present)],
+                    Some((true, true)),
+                ),
+                (
+                    Some(to),
+                    None,
+                    vec![Netns(pin.clone())],
+                    vec![(Veth(host.clone()), Unknown)],
+                    Some((true, false)),
+                ),
+                (
+                    None,
+                    Some(ie),
+                    vec![Veth(host.clone())],
+                    vec![(Netns(pin.clone()), Present)],
+                    Some((false, true)),
+                ),
+                (
+                    None,
+                    None,
+                    vec![Veth(host.clone()), Netns(pin.clone())],
+                    vec![],
+                    None,
+                ),
+            ];
+            for (veth_del, unpin, removed, mut leftover, flags) in cases {
+                let mut fault = AttachFault::new(point);
+                if let Some(c) = veth_del {
+                    fault = fault.with_veth_delete_failure(c);
+                }
+                if let Some(c) = unpin {
+                    fault = fault.with_unpin_failure(c);
+                }
+                let ops = FaultyAttachOps {
+                    inner: Fake::default(),
+                    fault,
+                };
+                let mut pool = ipam();
+                let e =
+                    attach_container_with(&ops, &spec("c1"), &mut pool, &mut PortRegistry::new())
+                        .unwrap_err();
+                let ctx = format!("{point:?} veth_del={veth_del:?} unpin={unpin:?}");
+                assert_eq!(e.step, point.step(), "{ctx}");
+                assert_eq!(e.code(), NetErrorCode::Internal, "{ctx}");
+                assert_eq!(e.rollback.removed, removed, "{ctx}");
+                let quarantine = post_ipam && !leftover.is_empty();
+                if quarantine {
+                    leftover.push((AttachResource::Address(ip(2)), Unknown));
+                }
+                assert_eq!(e.rollback.leftover, leftover, "{ctx}");
+                match flags {
+                    Some((veth, netns)) => {
+                        let claim = e.reclaim_claim().expect(&ctx);
+                        assert_eq!(
+                            claim.to_record(),
+                            expected_record("c1", veth, netns, quarantine),
+                            "{ctx}"
+                        );
+                        assert_eq!(claim.quarantine_only().is_some(), quarantine, "{ctx}");
+                    }
+                    None => assert_eq!(e.reclaim_claim(), None, "{ctx}"),
+                }
+                // IPAM: 払い出し前の段は変えない。払い出し後の段は取り残しがあるときだけアドレスを保持する。
+                let held = usize::from(quarantine);
+                assert_eq!(pool.allocated_count(), held, "{ctx}");
+                assert_eq!(
+                    pool.address_of(&eid("c1")),
+                    quarantine.then(|| ip(2)),
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    /// NET-1・#2971: 故障点以外の操作は内側へ委譲される。巻き戻しの失敗を指定しなければ、呼び出し列は
+    /// 成功時の列を故障点の直前で切り、続けて veth 削除と unpin が並ぶだけになる。
+    #[test]
+    fn net1_attach_fault_delegates_everything_else() {
+        let ok = Fake::default();
+        attach_container_with(&ok, &spec("c1"), &mut ipam(), &mut PortRegistry::new()).unwrap();
+        let success = ok.calls();
+        for (point, tag, _) in FAULT_POINTS {
+            let ops = FaultyAttachOps {
+                inner: Fake::default(),
+                fault: AttachFault::new(point),
+            };
+            attach_container_with(&ops, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+                .unwrap_err();
+            let cut = success
+                .iter()
+                .position(|c| c.starts_with(tag))
+                .expect("fault op appears in the success sequence");
+            let mut expected: Vec<String> = success[..cut].to_vec();
+            expected.push("delete_link 21".to_owned());
+            expected.push("unpin_netns".to_owned());
+            assert_eq!(ops.inner.calls(), expected, "{point:?}");
+        }
+    }
+
+    /// NET-1・#2971: 巻き戻しの失敗は内側を呼ばずに返す（veth の削除も unpin も実際には行わない）。
+    #[test]
+    fn net1_attach_fault_rollback_failures_skip_inner() {
+        let ops = FaultyAttachOps {
+            inner: Fake::default(),
+            fault: AttachFault::new(AttachFaultPoint::SetUp)
+                .with_veth_delete_failure(NetErrorCode::Internal)
+                .with_unpin_failure(NetErrorCode::Internal),
+        };
+        attach_container_with(&ops, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        let calls = ops.inner.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("delete_link")));
+        assert!(!calls.iter().any(|c| c.starts_with("unpin_netns")));
+        assert_eq!(calls.last().map(String::as_str), Some("set_master 21 7"));
     }
 }

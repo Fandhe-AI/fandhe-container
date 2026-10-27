@@ -24,6 +24,13 @@
 //! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
 //! 判定は未確定。crate-naming.md）。確定扱いにはしない（spec-reference）。
 
+// 試験専用の故障注入（attach の巻き戻しを失敗させる入口）を製品のリリースビルドへ入れない。最適化ビルド
+// （`debug_assertions` が無効）で有効になっていたらコンパイルを止める（NET-1・REPAIR-3・#2971）。
+#[cfg(all(feature = "attach-fault-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `attach-fault-test-support` feature exposes test-only fault injection and must not be enabled in release builds"
+);
+
 pub mod add_host_dns;
 pub mod dns_helper;
 pub mod error;

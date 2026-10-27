@@ -2819,6 +2819,100 @@ mod tests {
         assert!(fake.calls().is_empty());
     }
 
+    /// 故障注入（attach_fault）が作る請求書の記録を復号する。記録の文字列は attach 側の試験が実際の
+    /// 失敗から作った請求書と一致することを照合済み（`attach_tests::net1_attach_fault_leftover_matrix`）。
+    fn injected_claim(veth: bool, netns: bool, quarantine: bool) -> FailedAttachClaim {
+        let record = super::super::attach_fault::expected_record("c1", veth, netns, quarantine);
+        FailedAttachClaim::from_record(&record).unwrap()
+    }
+
+    /// NET-1・REPAIR-3・#2971: 所有トークンを刻む前（`SetOwnerToken` の失敗）に巻き戻しも失敗して残った veth は、
+    /// 別名が無く所有を証明できないため消さず、`DeleteVeth` の `Unknown` で取り残す（fail-closed）。
+    /// 別名の有無は実カーネルの `network_attach_privileged` の S4 で裏付ける。
+    #[test]
+    fn net1_reclaim_injected_set_owner_token_veth_without_alias_is_kept() {
+        let fake = Fake {
+            veth_alias: Some(None),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &injected_claim(true, false, false), &netns_dir())
+                .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(e.report.removed.is_empty());
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `SetMaster` の失敗後に残った veth は、別名はあるが bridge に繋がっていないため
+    /// 所有を証明できず、消さずに取り残す。
+    #[test]
+    fn net1_reclaim_injected_set_master_veth_without_master_is_kept() {
+        let fake = Fake {
+            veth_master: Some(None),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &injected_claim(true, false, false), &netns_dir())
+                .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `SetUp` の失敗後に veth と pin の両方が残った請求書（pin の識別子なし）は、
+    /// 所有を証明できる veth を消し、pin が実在しなければ回収済みとして成功する。
+    /// pin が実在するなら識別子なしでは外さず、`UnpinNetns` の `Unknown` で取り残す。
+    #[test]
+    fn net1_reclaim_injected_set_up_veth_and_pin() {
+        let claim = injected_claim(true, true, false);
+        let report = reclaim_failed_attach_with(&Fake::default(), &claim, &netns_dir()).unwrap();
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::Veth(host_of("c1")),
+                DeleteResource::Netns(pin("c1"))
+            ]
+        );
+        assert!(report.leftover.is_empty());
+
+        let fake = Fake {
+            pins_present: vec![pin("c1")],
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.report.removed, vec![DeleteResource::Veth(host_of("c1"))]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `AddAddress` の失敗後（quarantine つき）は veth と pin だけを回収し、プロセス内の
+    /// 保持（アドレス・予約）には触れない。quarantine は `quarantine_only` の請求書で `delete_network` の解放を待つ。
+    #[test]
+    fn net1_reclaim_injected_add_address_keeps_quarantine() {
+        let claim = injected_claim(true, true, true);
+        assert!(claim.quarantine_only().is_some());
+        let report = reclaim_failed_attach_with(&Fake::default(), &claim, &netns_dir()).unwrap();
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::Veth(host_of("c1")),
+                DeleteResource::Netns(pin("c1"))
+            ]
+        );
+        assert!(report.leftover.is_empty());
+    }
+
     /// NET-1・#2681: pin の解除に失敗したら Netns の取り残しで、veth の回収は続ける。最初のエラーを保持する。
     #[test]
     fn net1_reclaim_attach_unpin_failure_is_leftover() {

@@ -28,11 +28,18 @@
 //! さらに、作った本人のプロセスが終わった後の回収（プロセスをまたぐ回収。NET-1・REPAIR-3・#2906）を確かめる。
 //! 子プロセス（`--attach-child`）に自前のネットワーク `atx` を作らせて endpoint c8 を接続させ、請求書の記録を
 //! 受けた直後に SIGKILL で終わらせる（デストラクタを走らせず、veth・pin・所有記録 `.owned/c8` が残る状態。実際の
-//! 巻き戻し失敗の取り残しと残る資源は同じで、公開 API には巻き戻しを失敗させる故障注入が無いため、attach 成功後の
-//! プロセス終了で模す）。別プロセス（`--reclaim-child`。メモリ上の所有記録を持たない）が請求書から
+//! 巻き戻し失敗の取り残しと残る資源は近いが、attach 成功後のプロセス終了で模すだけの場面）。別プロセス（`--reclaim-child`。メモリ上の所有記録を持たない）が請求書から
 //! `reclaim_failed_attach` を呼び、veth と pin が回収されること（S1。冪等性を含む）と、同じ endpoint に作り直された
 //! 新しい pin は古い請求書では外れないこと（S2）を具体値で照合する。子モードは inner が直接起動した場合しか
 //! 動かない（親 pid・名前空間のガードで拒否する）。実機（root）での実行は #1626（人間担当）。
+//!
+//! 本物の巻き戻しの失敗による取り残しは、試験用 feature `attach-fault-test-support` の故障注入
+//! （`attach_container_with_fault_for_test`。NET-1・REPAIR-3・#2971。feature が外れていると `--ignored` は名指しで失敗する）で作る。
+//! S3: `SetUp` で失敗し veth 削除・unpin も失敗 → 別名つき・bridge 接続済みの veth と pin が残り、請求書
+//! （pin の識別子つき）から別プロセスが `XRECLAIM ok removed=2 leftover=0` で回収する（冪等）。
+//! S4: `SetOwnerToken` で失敗し veth 削除も失敗 → 別名の無い veth は所有を証明できず、回収は
+//! `XRECLAIM err step=DeleteVeth removed=0 leftover=1` で拒否して veth を残す（試験が後始末する）。
+//! 故障点は IPAM 払い出し前の段に限る。実機（root）での実行は #1626（人間担当）で未実行。
 //!
 //! 続けて netns の事前作成（`create_container_netns`。#2675・CRI-2）→ 接続（`attach_prepared_container`。c6）と、
 //! 作成 → 解放（`release_container_netns`。c7。pin が消える）を確かめる。
@@ -83,15 +90,19 @@ mod linux {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink::AttrIter;
     use fandhe_container_net::netlink_route::{
-        IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_MASTER, IfName, IpPrefix, LinkCreate,
-        NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK,
+        IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_MASTER, IfName, IpPrefix, LinkCreate, LinkDelete,
+        LinkRef, NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK,
+    };
+    #[cfg(feature = "attach-fault-test-support")]
+    use fandhe_container_net::network::{
+        AttachFault, AttachFaultPoint, attach_container_with_fault_for_test,
     };
     use fandhe_container_net::network::{
-        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, DeleteStep, EndpointId,
-        FailedAttachClaim, FailedCreateClaim, NetworkCreateSpec, NetworkName, PortProtocol,
-        PortPublish, PortRegistry, StaticIpam, VethNames, attach_container,
-        attach_prepared_container, create_container_netns, create_network, delete_network,
-        publish_container_ports, reclaim_failed_attach, reclaim_failed_create,
+        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, CreatedNetwork, DeleteStep,
+        EndpointId, FailedAttachClaim, FailedCreateClaim, NetworkCreateSpec, NetworkName,
+        PortProtocol, PortPublish, PortRegistry, ResourceState, StaticIpam, VethNames,
+        attach_container, attach_prepared_container, create_container_netns, create_network,
+        delete_network, publish_container_ports, reclaim_failed_attach, reclaim_failed_create,
         release_container_netns, unpublish_container_port,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
@@ -106,7 +117,7 @@ mod linux {
     const CLAIM_HEX_MAX_LEN: usize = 4096;
     /// attach 子が標準出力へ出す行の接頭辞。
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -623,6 +634,175 @@ mod linux {
             .ok_or_else(|| fail(format!("no XRECLAIM line in {out:?}")))
     }
 
+    /// feature が外れた構成では故障注入の入口が無く、照合できない。`--ignored` で実行されたのに成功を
+    /// 装わないよう、名指しで失敗させる（ci.md の fail-closed。#2971）。
+    #[cfg(not(feature = "attach-fault-test-support"))]
+    fn fault_scenarios(
+        _route: &NetlinkRouteSocket,
+        _nft: &NetlinkNetfilterSocket,
+        _net: &CreatedNetwork,
+        _ipam: &mut StaticIpam,
+        _ports: &mut PortRegistry,
+        _base: &Path,
+        _t: Duration,
+    ) -> Result<(), NetError> {
+        Err(fail(
+            "feature `attach-fault-test-support` is required for the fault injection scenarios (S3/S4)",
+        ))
+    }
+
+    /// 故障注入（`attach_container_with_fault_for_test`）で巻き戻しも失敗させて取り残しを作り、別プロセス
+    /// （`--reclaim-child`）が請求書から回収するかを実カーネルで照合する（NET-1・REPAIR-3・#2971）。
+    /// 故障点は IPAM 払い出し前の段に限る（最後の「IPAM・予約が空」の照合と `delete_network` を崩さないため）。
+    /// - S3: `SetUp` で失敗し veth 削除・unpin も失敗 → veth（別名あり・bridge 接続済み）と pin が残り、
+    ///   請求書（pin の識別子つき）から回収されて冪等に成功する
+    /// - S4: `SetOwnerToken` で失敗し veth 削除も失敗 → 別名の無い veth が残り、所有を証明できないため回収は
+    ///   `DeleteVeth` で拒否して veth を残す（試験が自分で後始末する）
+    #[cfg(feature = "attach-fault-test-support")]
+    fn fault_scenarios(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        net: &CreatedNetwork,
+        ipam: &mut StaticIpam,
+        ports: &mut PortRegistry,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), NetError> {
+        let gone = |name: &IfName| {
+            matches!(
+                route.link_index(name, t),
+                Err(ref e) if e.code() == NetErrorCode::NotFound
+            )
+        };
+
+        // S3
+        let c9 = EndpointId::new("c9")?;
+        let spec9 = ContainerAttachSpec::new(c9.clone(), net, base.to_path_buf())?;
+        let fault = AttachFault::new(AttachFaultPoint::SetUp)
+            .with_veth_delete_failure(NetErrorCode::Internal)
+            .with_unpin_failure(NetErrorCode::Internal);
+        let e =
+            match attach_container_with_fault_for_test(route, nft, &spec9, ipam, ports, t, fault) {
+                Err(e) => e,
+                Ok(_) => return Err(fail("S3: the injected attach unexpectedly succeeded")),
+            };
+        let host9 = VethNames::derive(&c9)?.host().clone();
+        let pin9 = base.join("c9");
+        let ledger9 = base.join(".owned").join("c9");
+        if e.step != AttachStep::SetUp
+            || !e.rollback.removed.is_empty()
+            || e.rollback.leftover
+                != [
+                    (AttachResource::Veth(host9.clone()), ResourceState::Present),
+                    (AttachResource::Netns(pin9.clone()), ResourceState::Present),
+                ]
+            || ipam.address_of(&c9).is_some()
+        {
+            return Err(fail(format!(
+                "S3: unexpected attach failure shape: step {:?}, rollback {:?}",
+                e.step, e.rollback
+            )));
+        }
+        let record9 = e
+            .reclaim_claim()
+            .ok_or_else(|| fail("S3: no reclaim claim for a leftover attach"))?
+            .to_record();
+        if !record9.contains("\nveth=1\nnetns=1\n")
+            || !record9.contains("\nquarantine=0\n")
+            || record9.contains("\npin=-\n")
+        {
+            return Err(fail(format!(
+                "S3: unexpected claim record (pin identity missing?): {record9:?}"
+            )));
+        }
+        // 取り残しの実体: 別名（所有トークン）つきで bridge に繋がった veth、pin、永続の所有記録。
+        let (_, master9, alias9) = route.link_index_master_alias(&host9, t)?;
+        if master9 != Some(net.bridge_index) {
+            return Err(fail(format!(
+                "S3: left-over veth master is {master9:?}, expected the bridge"
+            )));
+        }
+        if !alias9
+            .as_deref()
+            .is_some_and(|a| a.starts_with(&format!("{}/ep/c9/g/", net.bridge_token)))
+        {
+            return Err(fail(format!("S3: left-over veth alias is {alias9:?}")));
+        }
+        if !pin9.exists() || !ledger9.exists() {
+            return Err(fail(
+                "S3: the pin or the ownership record .owned/c9 is missing",
+            ));
+        }
+        let record9_hex = hex_encode(record9.as_bytes());
+        for round in 0..2 {
+            let r = run_reclaim_child(&record9_hex)?;
+            if r != "XRECLAIM ok removed=2 leftover=0" {
+                return Err(fail(format!(
+                    "S3: unexpected reclaim result (round {round}): {r}"
+                )));
+            }
+        }
+        if !gone(&host9) || pin9.exists() || ledger9.exists() {
+            return Err(fail(
+                "S3: the reclaim left the veth, the pin or the ownership record",
+            ));
+        }
+
+        // S4
+        let c10 = EndpointId::new("c10")?;
+        let spec10 = ContainerAttachSpec::new(c10.clone(), net, base.to_path_buf())?;
+        let fault = AttachFault::new(AttachFaultPoint::SetOwnerToken)
+            .with_veth_delete_failure(NetErrorCode::Internal);
+        let e = match attach_container_with_fault_for_test(
+            route, nft, &spec10, ipam, ports, t, fault,
+        ) {
+            Err(e) => e,
+            Ok(_) => return Err(fail("S4: the injected attach unexpectedly succeeded")),
+        };
+        let host10 = VethNames::derive(&c10)?.host().clone();
+        let pin10 = base.join("c10");
+        if e.step != AttachStep::SetOwnerToken
+            || e.rollback.removed != [AttachResource::Netns(pin10.clone())]
+            || e.rollback.leftover
+                != [(AttachResource::Veth(host10.clone()), ResourceState::Present)]
+            || ipam.address_of(&c10).is_some()
+        {
+            return Err(fail(format!(
+                "S4: unexpected attach failure shape: step {:?}, rollback {:?}",
+                e.step, e.rollback
+            )));
+        }
+        let record10 = e
+            .reclaim_claim()
+            .ok_or_else(|| fail("S4: no reclaim claim for a leftover attach"))?
+            .to_record();
+        if !record10.contains("\nveth=1\nnetns=0\n") || !record10.contains("\nquarantine=0\n") {
+            return Err(fail(format!("S4: unexpected claim record: {record10:?}")));
+        }
+        // 取り残しの実体: 所有トークンも bridge 接続も無い veth（所有を証明できない）。
+        let (_, master10, alias10) = route.link_index_master_alias(&host10, t)?;
+        if master10.is_some() || alias10.is_some() {
+            return Err(fail(format!(
+                "S4: left-over veth should have no master and no alias: {master10:?} {alias10:?}"
+            )));
+        }
+        let r = run_reclaim_child(&hex_encode(record10.as_bytes()))?;
+        if r != "XRECLAIM err step=DeleteVeth removed=0 leftover=1" {
+            return Err(fail(format!("S4: unexpected reclaim result: {r}")));
+        }
+        if gone(&host10) {
+            return Err(fail(
+                "S4: the reclaim deleted a veth whose ownership it could not prove",
+            ));
+        }
+        // 後始末: 試験自身が消す（隔離した netns の中なので host には漏れない）。
+        route.delete_link(&LinkDelete::new(LinkRef::Name(host10.clone())), t)?;
+        if !gone(&host10) {
+            return Err(fail("S4: the test cleanup could not delete the veth"));
+        }
+        Ok(())
+    }
+
     pub fn inner() {
         match inner_checked() {
             Ok(()) => println!("{OK_LINE}"),
@@ -1037,6 +1217,9 @@ mod linux {
         {
             return Err(fail("network atx was not reclaimed"));
         }
+
+        // --- 故障注入で作った巻き戻しの失敗の取り残しを別プロセスが回収する（S3・S4。NET-1・REPAIR-3・#2971）---
+        fault_scenarios(&route, &nft, &net, &mut ipam, &mut ports, &base, t)?;
 
         // --- 事前作成の netns（#2675・CRI-2）: 作成 → 接続 と、作成 → 解放 ---
         // 準備済みの試験で、実機（root）での実行結果は PR に記録する（未実行のまま成功とは書かない）。

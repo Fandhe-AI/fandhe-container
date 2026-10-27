@@ -10,6 +10,17 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# 試験専用の故障注入（attach の巻き戻しの特定の段を失敗させる。NET-1・REPAIR-3・#2971）。依存は増えない。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 network_attach_privileged が使う。
+[features]
+attach-fault-test-support = []
+
+[dev-dependencies]
+# core・supervisor・cli と同じ方式の自己参照（外部クレートの追加ではない）。dev-dependency は通常のビルドでは
+# 解決されないため、製品の既定ビルドでは feature は無効のまま。`required-features` は使わない（既定の
+# `cargo test` から結合試験が外れないようにするため）。
+fandhe-container-net = { path = ".", features = ["attach-fault-test-support"] }
+
 # bridge・veth の作成 → netns 移動 → up の実機結合試験（NET-11・TASK-136.3.2・#846）。libtest のスレッド実行と
 # 子の再入（--child）を分けるため harness = false。root と unshare --net が要る実機前提テストなので
 # -- --ignored 指定時のみ実行する（AGENTS.md）。

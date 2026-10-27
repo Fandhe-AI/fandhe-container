@@ -32,6 +32,12 @@ const fn e(code: Code, message: &'static str) -> CdiApplyError {
 #[derive(Debug)]
 pub struct CdiHookStage {
     rootfs: PathBuf,
+    /// 発行時のプロセス ID（`CLONE_NEWPID` 内の値）。別プロセスへ持ち出した証跡を拒否する（GPU-2・REPAIR-2）。
+    pid: u32,
+    /// 発行時の mount namespace の識別子（`/proc/self/ns/mnt` のリンク先）。
+    mnt_ns: String,
+    /// 実行直前に実 mountinfo で再検証するか（試験用の証跡だけ false）。
+    recheck_mounts: bool,
 }
 
 impl CdiHookStage {
@@ -44,8 +50,44 @@ impl CdiHookStage {
     pub(crate) fn for_test(rootfs: &Path) -> Self {
         Self {
             rootfs: rootfs.to_path_buf(),
+            pid: std::process::id(),
+            mnt_ns: current_mnt_ns().unwrap_or_default(),
+            recheck_mounts: false,
         }
     }
+
+    /// 実行直前の再検証。作成元のプロセス・mount namespace に結び付き、前提状態が今も成り立つことを確かめる。
+    fn recheck(&self) -> Result<(), CdiApplyError> {
+        if self.pid != std::process::id() {
+            return Err(e(
+                Code::FailedPrecondition,
+                "hook stage was issued by another process",
+            ));
+        }
+        if current_mnt_ns()? != self.mnt_ns {
+            return Err(e(
+                Code::FailedPrecondition,
+                "hook stage was issued in another mount namespace",
+            ));
+        }
+        if self.recheck_mounts {
+            let again = verify_hook_stage(&self.rootfs)?;
+            if again.mnt_ns != self.mnt_ns {
+                return Err(e(
+                    Code::FailedPrecondition,
+                    "mount namespace changed during hook stage check",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn current_mnt_ns() -> Result<String, CdiApplyError> {
+    fs::read_link("/proc/self/ns/mnt")
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .ok_or_else(|| e(Code::Internal, "failed to read mount namespace id"))
 }
 
 /// 実際の `/proc/self/mountinfo` と `/` で前提（自己 bind 済み・proc 済み・pivot 前）を検証し、証跡を返す。
@@ -82,7 +124,12 @@ pub fn verify_hook_stage(rootfs: &Path) -> Result<CdiHookStage, CdiApplyError> {
     let root = std::str::from_utf8(canon.as_os_str().as_bytes())
         .map_err(|_| e(Code::InvalidArgument, "rootfs is not valid UTF-8"))?;
     check_hook_stage_mountinfo(root, &text)?;
-    Ok(CdiHookStage { rootfs: canon })
+    Ok(CdiHookStage {
+        rootfs: canon,
+        pid: std::process::id(),
+        mnt_ns: current_mnt_ns()?,
+        recheck_mounts: true,
+    })
 }
 
 /// フックへ渡す OCI state の材料。
@@ -137,6 +184,8 @@ pub struct CdiHookError {
     pub stderr: String,
     /// 失敗までに成功したフックの報告。
     pub completed: Vec<CdiHookReport>,
+    /// kill 後も回収できなかった子の pid（あれば。追跡・手動回収用。REPAIR-5）。
+    pub unreaped_pid: Option<u32>,
 }
 
 impl std::fmt::Display for CdiHookError {
@@ -271,11 +320,11 @@ struct StderrCollector {
 }
 
 impl StderrCollector {
-    fn spawn(mut pipe: std::process::ChildStderr) -> Self {
+    fn spawn(mut pipe: std::process::ChildStderr) -> std::io::Result<Self> {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
         let (b, d) = (Arc::clone(&buf), Arc::clone(&done));
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             let mut chunk = [0u8; 4096];
             loop {
                 match pipe.read(&mut chunk) {
@@ -294,30 +343,67 @@ impl StderrCollector {
                 }
             }
             d.store(true, Ordering::Release);
-        });
-        Self { buf, done }
+        })?;
+        Ok(Self { buf, done })
     }
 
     /// 子の終了後に呼ぶ。孫が pipe を持ち続けても塞がらないよう、待ちは短い上限つきにする（REPAIR-5）。
-    fn finish(&self) -> String {
-        let until = Instant::now() + Duration::from_millis(200);
-        while !self.done.load(Ordering::Acquire) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+    /// 戻り値は (stderr の先頭, スレッドが停止したか)。停止していなければ孫が pipe を保持している。
+    fn finish(&self) -> (String, bool) {
+        let stopped = wait_flag(&self.done);
         let bytes = self.buf.lock().map(|g| g.clone()).unwrap_or_default();
-        String::from_utf8_lossy(&bytes).into_owned()
+        (String::from_utf8_lossy(&bytes).into_owned(), stopped)
     }
 }
 
-/// 1 フックを実行する。失敗時は (エラー, stderr 先頭)。
+const IO_STOP_GRACE: Duration = Duration::from_millis(200);
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// フラグが立つのを `IO_STOP_GRACE` まで待つ。
+fn wait_flag(flag: &AtomicBool) -> bool {
+    let until = Instant::now() + IO_STOP_GRACE;
+    while !flag.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    flag.load(Ordering::Acquire)
+}
+
+/// 子を kill して有限の猶予内に回収する。kill の失敗も回収不能もエラー（未回収の pid は呼び出し側が保持する）。
+fn kill_and_reap(child: &mut std::process::Child) -> Result<(), CdiApplyError> {
+    let killed = child.kill().is_ok();
+    let until = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => {
+                return Err(e(
+                    Code::Internal,
+                    "hook process could not be reaped after kill",
+                ));
+            }
+            Err(_) => return Err(e(Code::Internal, "failed to reap hook process")),
+        }
+    }
+    if killed {
+        Ok(())
+    } else {
+        Err(e(Code::Internal, "failed to kill hook process"))
+    }
+}
+
+/// `run_one` の失敗: (分類, stderr 先頭, 未回収の子の pid)。
+type RunFail = (CdiApplyError, String, Option<u32>);
+
+/// 1 フックを実行する。失敗時は (エラー, stderr 先頭, 未回収の pid)。
 fn run_one(
     stage: &CdiHookStage,
     st: &CdiHookState,
     h: &CdiCreateContainerHook,
     work_dir: &Path,
     index: usize,
-) -> Result<CdiHookReport, (CdiApplyError, String)> {
-    let bare = |x| (x, String::new());
+) -> Result<CdiHookReport, RunFail> {
+    let bare = |x| (x, String::new(), None);
     check_executable(h.path()).map_err(bare)?;
     let rootfs = std::str::from_utf8(stage.rootfs.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "rootfs is not valid UTF-8")))?;
@@ -346,18 +432,60 @@ fn run_one(
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(|err| bare(map_io(&err)))?;
     drop(cmd);
+    let pid = child.id();
 
-    // stdin への state 送信は別スレッドで行い、期限監視（下のループ）に含める。フックが stdin を読まなくても
-    // 呼び出し側は塞がらず、timeout で子を kill すれば pipe が閉じて書き込みスレッドも終わる（REPAIR-5）。
+    // 起動後の失敗は必ず子を kill して回収してから返す。回収できなければ pid を報告する。
+    let abort = |child: &mut std::process::Child, err: CdiApplyError, tail: String| -> RunFail {
+        match kill_and_reap(child) {
+            Ok(()) => (err, tail, None),
+            Err(reap) => (reap, tail, Some(pid)),
+        }
+    };
+
+    // stdin への state 送信は別スレッドで行い、フックが読まなくても呼び出し側は塞がらない。
+    // スレッドは `Builder::spawn` で作り、資源不足でも panic させない（REPAIR-5）。
+    let writer_done = Arc::new(AtomicBool::new(false));
     if let Some(mut stdin) = child.stdin.take() {
         let payload = state.into_bytes();
-        std::thread::spawn(move || {
+        let d = Arc::clone(&writer_done);
+        let spawned = std::thread::Builder::new().spawn(move || {
             // BrokenPipe（フックが読まずに終了）等は無視し、成否は終了コードで判定する。
             let _ = stdin.write_all(&payload);
+            d.store(true, Ordering::Release);
         });
+        if spawned.is_err() {
+            let r = abort(
+                &mut child,
+                e(Code::ResourceExhausted, "failed to spawn hook stdin thread"),
+                String::new(),
+            );
+            let _ = bundle.remove();
+            return Err(r);
+        }
+    } else {
+        writer_done.store(true, Ordering::Release);
     }
-    let collector = child.stderr.take().map(StderrCollector::spawn);
-    let tail_of = |c: &Option<StderrCollector>| c.as_ref().map_or_else(String::new, |c| c.finish());
+    let collector = match child.stderr.take().map(StderrCollector::spawn) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => {
+            let r = abort(
+                &mut child,
+                e(
+                    Code::ResourceExhausted,
+                    "failed to spawn hook stderr thread",
+                ),
+                String::new(),
+            );
+            let _ = bundle.remove();
+            return Err(r);
+        }
+        None => None,
+    };
+    // 戻る前に I/O スレッドの停止を確認する。孫が pipe を保持して残る場合は明示的にエラーにする。
+    let finish = |c: &Option<StderrCollector>| -> (String, bool) {
+        let (tail, collector_ok) = c.as_ref().map_or((String::new(), true), |c| c.finish());
+        (tail, collector_ok && wait_flag(&writer_done))
+    };
 
     let deadline = Duration::from_secs(h.timeout_secs);
     let status = loop {
@@ -365,25 +493,45 @@ fn run_one(
             Ok(Some(s)) => break s,
             Ok(None) => {
                 if started.elapsed() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let tail = tail_of(&collector);
+                    let reaped = kill_and_reap(&mut child);
+                    let (tail, _) = finish(&collector);
                     let _ = bundle.remove();
-                    return Err((e(Code::Timeout, "hook timed out"), tail));
+                    return Err(match reaped {
+                        Ok(()) => (e(Code::Timeout, "hook timed out"), tail, None),
+                        Err(err) => (err, tail, Some(pid)),
+                    });
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(bare(e(Code::Internal, "failed to wait for hook")));
+                let r = abort(
+                    &mut child,
+                    e(Code::Internal, "failed to wait for hook"),
+                    String::new(),
+                );
+                let _ = bundle.remove();
+                return Err(r);
             }
         }
     };
     let elapsed = started.elapsed();
-    let stderr = tail_of(&collector);
+    let (stderr, io_stopped) = finish(&collector);
     if bundle.remove().is_err() {
-        return Err((e(Code::Internal, "failed to remove hook bundle"), stderr));
+        return Err((
+            e(Code::Internal, "failed to remove hook bundle"),
+            stderr,
+            None,
+        ));
+    }
+    if !io_stopped {
+        return Err((
+            e(
+                Code::Internal,
+                "hook I/O threads still running (a descendant holds the pipes)",
+            ),
+            stderr,
+            None,
+        ));
     }
     match status.code() {
         Some(0) => Ok(CdiHookReport {
@@ -395,10 +543,12 @@ fn run_one(
         Some(_) => Err((
             e(Code::FailedPrecondition, "hook exited with failure"),
             stderr,
+            None,
         )),
         None => Err((
             e(Code::FailedPrecondition, "hook was terminated by a signal"),
             stderr,
+            None,
         )),
     }
 }
@@ -419,17 +569,29 @@ pub fn run_create_container_hooks(
             error: e(Code::InvalidArgument, "work_dir must be an absolute path"),
             stderr: String::new(),
             completed: done,
+            unreaped_pid: None,
+        });
+    }
+    // 証跡を作成元のプロセス・mount namespace に結び付け、実行直前に前提状態を再検証する（GPU-2・REPAIR-2）。
+    if let Err(error) = stage.recheck() {
+        return Err(CdiHookError {
+            index: 0,
+            error,
+            stderr: String::new(),
+            completed: done,
+            unreaped_pid: None,
         });
     }
     for (index, h) in hooks.iter().enumerate() {
         match run_one(stage, state, h, work_dir, index) {
             Ok(r) => done.push(r),
-            Err((error, stderr)) => {
+            Err((error, stderr, unreaped_pid)) => {
                 return Err(CdiHookError {
                     index,
                     error,
                     stderr,
                     completed: done,
+                    unreaped_pid,
                 });
             }
         }
@@ -654,6 +816,57 @@ mod tests {
             verify_hook_stage(Path::new("/")).unwrap_err().code(),
             Code::FailedPrecondition
         );
+    }
+
+    /// GPU-2・REPAIR-2: 別プロセス・別 mount namespace で発行された証跡では実行せず、フックも起動しない。
+    #[test]
+    fn foreign_stage_is_rejected_before_running() {
+        let t = Tmp::new("foreign");
+        let marker = t.0.join("ran");
+        let hooks = validate_create_container_hooks(&[mk_sh(
+            &format!("touch {}", marker.display()),
+            &["h"],
+            &[],
+            None,
+        )])
+        .unwrap();
+        let mut stage = CdiHookStage::for_test(&t.0);
+        stage.pid = stage.pid.wrapping_add(1);
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.error.message(),
+            "hook stage was issued by another process"
+        );
+        let mut stage = CdiHookStage::for_test(&t.0);
+        stage.mnt_ns = "mnt:[1]".into();
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(
+            err.error.message(),
+            "hook stage was issued in another mount namespace"
+        );
+        assert!(!marker.exists());
+    }
+
+    /// REPAIR-5: 孫が stderr の pipe を保持して残る場合は、成功終了でも明示的にエラーにする。
+    #[test]
+    fn lingering_descendant_is_reported() {
+        let t = Tmp::new("linger");
+        let hooks = validate_create_container_hooks(&[mk_sh(
+            "sleep 3 & exit 0",
+            &["linger"],
+            &[],
+            Some(5),
+        )])
+        .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.error.code(), Code::Internal);
+        assert_eq!(
+            err.error.message(),
+            "hook I/O threads still running (a descendant holds the pipes)"
+        );
+        assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }
 
     /// JSON エスケープを具体文字列で照合する。

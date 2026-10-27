@@ -463,6 +463,9 @@ mod syscall_ffi {
     all(target_arch = "x86_64", target_pointer_width = "64"),
     all(target_arch = "aarch64", target_pointer_width = "64")
 ))]
+// 抑止理由: libc との照合試験（FFI 宣言の機械照合。MVM-4）が `super::*` 経由で syscall_ffi の
+// 定数・構造体・関数を参照する。通常ビルドでは再 export 済みの 3 関数以外は未使用になるため、
+// glob import の `unused_imports` だけを許す（LP64 以外では syscall_ffi ごと cfg で除外される）。
 #[allow(unused_imports)]
 use syscall_ffi::*;
 pub(crate) use syscall_ffi::{cap_set_thread, close_fds_from, execveat_fd};

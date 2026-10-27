@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -272,6 +272,19 @@ fn cli1_list_logs_usage_errors() {
         &["logs", "--tail", "1000001", "a"],
         &["logs", "--stream", "bogus", "a"],
         &["logs", "--follow", "--follow", "a"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
+/// CLI-1・SUP-11(#1903): state は ID をちょうど 1 つ受け、過不足・未知オプションは使い方エラー（2）。stdout は空。
+#[test]
+fn cli1_state_usage_errors() {
+    for a in [
+        &["state"][..],
+        &["state", "a", "b"],
+        &["state", "--bogus", "a"],
+        &["state", "--json", "a"],
     ] {
         assert_failure(&run(a), 2, USAGE_JSON);
     }

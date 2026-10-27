@@ -44,7 +44,7 @@ GPU-9 の確定とオーナー判断が要る。
 ## 受け入れの前に後続が満たす要件
 
 - device cgroup（TASK-129）無しに `devices[]` を受けない
-- rootless では device cgroup が効かない（GPU-4）。mknod の `EPERM` を黙ってホストの bind に縮退させない。[dev-default-mounts.md](dev-default-mounts.md)・`DeviceSupply::BindFromHost` と整合をとる
+- rootless では device cgroup が効かない（GPU-4）。mknod の `EPERM` を黙ってホストの bind に縮退させない。[dev-default-mounts.md](dev-default-mounts.md)・`DeviceSupply::BindFromHost` と整合をとる。rootless の CDI `deviceNodes` をホストのノードの bind で供給する方式は [cdi-rootless-device-nodes.md](cdi-rootless-device-nodes.md)（#2986。オーナー承認待ち）
 - CDI spec ディレクトリは root 所有で他ユーザーが書けないことを検査する（PLUG-11 と同型）
 - CDI hook は spec が指定するホスト側のバイナリを実行する。完全性（OWASP A08）のため、hook のパスの信頼を前提にする
 - `host_path` は文字・ブロックデバイスであることを、symlink を辿らない fd 起点の stat で検証し、major / minor は stat の値を正とする

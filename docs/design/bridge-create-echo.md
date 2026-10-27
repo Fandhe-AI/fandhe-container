@@ -38,8 +38,12 @@ bridge の所有トークン（`IFLA_IFALIAS`）は、作成の ACK 後に ifind
 
 ## 残る窓
 
-- echo 経路: 作成から印付けまでの差し替えの窓は無い（差し替えられても ifindex 指定の `RTM_SETLINK` は
-  `NotFound` になり、他者の link に印は付かない）。印付けから所有再確認・削除までの極小の窓は従来どおり
+- echo 経路: 作成から印付けまでに「異なる ifindex の link」へ差し替えられても、ifindex 指定の `RTM_SETLINK` は
+  `NotFound` になり、他者の link に印は付かない（従来の名前引きの窓を塞ぐ改善）。ただし ifindex は link の
+  寿命を固定するハンドルではない。`CAP_NET_ADMIN` 保持者が bridge を削除し、同名・同じ ifindex で別 link を
+  作ると `RTM_SETLINK` は `NotFound` にならず、その link に印が付き、`verify_owned`（名前・index・トークン）も
+  通る。この「同一 ifindex の再利用」は残余リスクで、同じ権限を持つ者が相手のため権限境界は越えない。
+  印付けから所有再確認・削除までの極小の窓は従来どおり
 - 戻し経路（古いカーネル）: 従来の窓が残る（単体テスト `net1_fallback_swap_before_lookup_stamps_foreign` で固定）
 
 ## 確認状況

@@ -41,8 +41,11 @@
 //! を確認してから行い、不一致（同名 link への差し替え）なら操作も削除もしない。2 の `RTM_SETLINK` が
 //! 失敗・時間切れの場合だけ、再照会して「ifindex が 1 と同じ」かつ（別名がトークン、または別名が空のまま）
 //! のときに限り、ifindex 指定で削除する（`rollback_unstamped`）。echo 経路では、印を付ける相手が作成通知の
-//! ifindex（自分が作った link）に固定されるため、作成から印付けまでの差し替えの窓は無い。残余リスクは
-//! 戻し経路（echo が返らない古いカーネル）に限り、1 の直前に `CAP_NET_ADMIN` 保持者が自分の bridge を別名
+//! ifindex（自分が作った link）に固定されるため、作成から印付けまでに「異なる ifindex の link」へ
+//! 差し替えられても印は付かない（`RTM_SETLINK` が `NotFound`）。ただし ifindex は link の寿命を固定する
+//! ハンドルではなく、`CAP_NET_ADMIN` 保持者が bridge を削除して同名・同 ifindex の別 link を作った場合は
+//! `RTM_SETLINK` が通り、その link に印が付き得る（echo 経路にも残る残余リスク。同じ権限の者が相手のため
+//! 権限境界は越えない）。さらに戻し経路（echo が返らない古いカーネル）に限り、1 の直前に `CAP_NET_ADMIN` 保持者が自分の bridge を別名
 //! なしで差し替えた場合にその link に印を付ける窓が残る。同じ権限を持つ者が相手のため権限境界は越えず、
 //! `NLM_F_EXCL` と ifindex 指定（名前の再解決なし）で窓を最小化している。
 //! bridge 作成要求が
@@ -648,7 +651,9 @@ pub(crate) struct BridgeCreated {
 }
 
 /// `NLM_F_ECHO` の作成通知の読み取り結果。
+/// 構築するのは Linux の `LinuxNetworkOps` だけ（他 OS では参照のみで dead_code になるため局所的に許す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum EchoedIndex {
     /// 検証済みの作成通知から得た、作成した link 自身の ifindex。
     Index(IfIndex),

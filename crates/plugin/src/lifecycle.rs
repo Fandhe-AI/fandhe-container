@@ -58,7 +58,8 @@
 //!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
 //!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`PLUGIN_STDERR_DRAIN_TIMEOUT`]
-//!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
+//!   以内に終端へ達しなければ、停止用 pipe へ書いて読み取りを打ち切る（待ちは `poll` の期限で有限。
+//!   macOS の `shutdown` と `recv` の競合に依存しない。#3003。`poll` 非対応の構成だけ従来の `shutdown`）。
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -169,11 +170,12 @@ pub const PLUGIN_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub const PLUGIN_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 打ち切りを指示した後、読み取りスレッドの停止を確認するまで待つ上限（REPAIR-5。都度起動と常駐で共用する。#2608）。
-/// shutdown で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける。
+/// 停止用 pipe で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける
+/// （この期限内に止まらなければ最後の手段としてソケットを shutdown する。#3003）。
 pub const PLUGIN_STDERR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// stderr の読み取り 1 回の待ち上限。読み取りスレッドはこの間隔で停止指示を確認する
-/// （shutdown による起床が効かない場合でも、この間隔で停止できる）。
+/// （`poll` の期限。停止用 pipe の起床が効かない場合でも、この間隔で停止できる）。
 #[cfg(unix)]
 const STDERR_READ_POLL: Duration = Duration::from_millis(100);
 
@@ -362,8 +364,12 @@ struct StderrCapture {
     state: Arc<Mutex<PluginStderr>>,
     done: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
-    /// ブロック中の読み取りを起こす操作（ソケットの shutdown）。1 回だけ実行する。
+    /// ブロック中の読み取りを起こす操作（停止用 pipe への書き込み。`poll` 非対応の構成はソケットの
+    /// shutdown）。1 回だけ実行する。
     wake: Option<Box<dyn FnOnce() + Send>>,
+    /// 停止用 pipe の起床でも [`PLUGIN_STDERR_STOP_TIMEOUT`] 内に止まらなかったときだけ実行する最後の
+    /// 手段（ソケットの shutdown。以後、孫の書き込みは `EPIPE` になる。#3003）。
+    last_resort: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl StderrCapture {
@@ -399,20 +405,40 @@ impl StderrCapture {
             done,
             stop_requested,
             wake: Some(wake),
+            last_resort: None,
         })
     }
 
-    /// 子の stderr を受けるソケットの読み取り側から収集を始める。停止時はソケットを shutdown して
-    /// ブロック中の読み取りを起こす（以後、書き込み端を保持する孫の書き込みは `EPIPE` になる）。
+    /// 子の stderr を受けるソケットの読み取り側から収集を始める。
+    ///
+    /// `poll` 対応の構成では、読み取りスレッドが「ソケット」と「停止用 pipe」を `poll` で待つ。停止時は
+    /// pipe へ 1 バイト書いて起こし、`shutdown` は呼ばない（macOS で `shutdown` が別スレッドの `recv` と
+    /// 競合して読み取りが戻らない場面の回避。REPAIR-5・#3003）。それでも止まらなかった場合に限り、最後の
+    /// 手段として `shutdown` する。対応外の構成は従来どおり受信期限と `shutdown` で止める。
     #[cfg(unix)]
     fn attach(reader: StderrReader) -> io::Result<Self> {
-        let waker = reader.try_clone()?;
-        Self::start(
-            reader,
+        let shutdown_sock = reader.try_clone()?;
+        let shutdown = move || {
+            let _ = shutdown_sock.shutdown(std::net::Shutdown::Both);
+        };
+        if !crate::sys::POLL_SUPPORTED {
+            return Self::start(reader, Box::new(shutdown));
+        }
+        // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
+        reader.set_nonblocking(true)?;
+        let (stop_rx, mut stop_tx) = io::pipe()?;
+        let mut capture = Self::start(
+            PolledStderr {
+                sock: reader,
+                stop: stop_rx,
+            },
             Box::new(move || {
-                let _ = waker.shutdown(std::net::Shutdown::Both);
+                // 空の pipe への 1 バイトは待たない。読み手が既に去っていても構わない。
+                let _ = io::Write::write_all(&mut stop_tx, &[1u8]);
             }),
-        )
+        )?;
+        capture.last_resort = Some(Box::new(shutdown));
+        Ok(capture)
     }
 
     /// 非 unix では子を spawn しないため、空の入力を読むだけになる（即座に終端へ達する）。
@@ -440,6 +466,9 @@ impl StderrCapture {
         if !stopped {
             self.request_stop();
             stopped = !timed_out(self.done.recv_timeout(PLUGIN_STDERR_STOP_TIMEOUT));
+            if !stopped && let Some(last_resort) = self.last_resort.take() {
+                last_resort();
+            }
         }
         let mut result = lock_stderr(&self.state).clone();
         result.reader_stopped = stopped;
@@ -469,7 +498,7 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &Atom
             return;
         }
         match source.read(&mut chunk) {
-            // 停止指示による shutdown でも 0 が返るため、指示後の 0 は終端として扱わない。
+            // 最後の手段の shutdown でも 0 が返るため、指示後の 0 は終端として扱わない。
             Ok(0) => {
                 if !stop.load(Ordering::SeqCst) {
                     lock_stderr(state).complete = true;
@@ -500,6 +529,32 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &Atom
     }
 }
 
+/// ソケットと停止用 pipe を `poll` で同時に待つ stderr 入力（unix。`poll` 対応の構成のみ。#3003）。
+///
+/// [`StderrCapture::attach`] が作り、読み取りスレッド（[`drain_stderr`]）の `read` として呼ばれる。
+/// 1 回の待ちは [`STDERR_READ_POLL`] で有限。停止用 pipe が読めれば `Interrupted` を返し、呼び出し側が
+/// 停止フラグ（pipe より先に立つ）を見て抜ける。ソケット側は `sock` が非ブロッキングなので、起床後の
+/// `read` が待つことはない。
+#[cfg(unix)]
+struct PolledStderr {
+    sock: std::os::unix::net::UnixStream,
+    stop: io::PipeReader,
+}
+
+#[cfg(unix)]
+impl Read for PolledStderr {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let ms = i32::try_from(STDERR_READ_POLL.as_millis()).unwrap_or(100);
+        match crate::sys::poll_two(&self.sock, &self.stop, ms)? {
+            crate::sys::PollOutcome::TimedOut => Err(io::ErrorKind::WouldBlock.into()),
+            crate::sys::PollOutcome::Ready { second: true, .. } => {
+                Err(io::ErrorKind::Interrupted.into())
+            }
+            crate::sys::PollOutcome::Ready { .. } => self.sock.read(buf),
+        }
+    }
+}
+
 /// 親が読む側の stderr 入力。unix は UNIX ソケット、非 unix は空の入力（子を spawn しないため）。
 #[cfg(unix)]
 type StderrReader = std::os::unix::net::UnixStream;
@@ -509,8 +564,8 @@ type StderrReader = io::Empty;
 /// 子の stderr に渡す書き込み端と、親が読む側の組を作る（REPAIR-5）。
 ///
 /// pipe ではなく UNIX ソケット対を使う。pipe の読み取りは期限を掛けられず、書き込み端を孫が保持
-/// している間は読み取りスレッドを止められない。ソケットなら読み取り期限と shutdown で確実に止め
-/// られる（標準ライブラリの安全な API だけで実現できる）。子から見た書き込みは pipe と同様（端末ではなく、読み手が
+/// している間は読み取りスレッドを止められない。ソケットなら `poll` の期限と停止用 pipe（対応外の構成は
+/// 受信期限と shutdown）で確実に止められる。子から見た書き込みは pipe と同様（端末ではなく、読み手が
 /// 閉じれば `EPIPE`）。どちらの端も close-on-exec で、子へ渡るのは fd 2 に複製した書き込み端のみ。
 #[cfg(unix)]
 fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
@@ -2977,6 +3032,39 @@ mod tests {
         assert!(!got.is_complete());
         assert!(got.reader_stopped());
         assert!(holder.kill_and_reap().is_reaped());
+    }
+
+    /// REPAIR-5・PLUG-7・#3003: 書き込み端を保持する別プロセスがいても、`shutdown` を使わない通常の
+    /// 停止（`poll` と停止用 pipe）で毎回、期限内に読み取りスレッドが止まる。macOS で `shutdown` との
+    /// 競合により 1 回だけ止まらなかった間欠失敗を拾うため、同じ場面を繰り返す。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_stderr_capture_stops_reader_repeatedly_while_writer_is_held() {
+        for round in 0..20 {
+            let (child_stderr, reader) = stderr_channel().unwrap();
+            let holder = Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(child_stderr)
+                .spawn()
+                .unwrap();
+            let mut holder = ChildGuard::new(holder);
+            let capture = StderrCapture::attach(reader).unwrap();
+            let limit = Duration::from_millis(50);
+            let started = Instant::now();
+            let got = capture.finish(limit);
+            let elapsed = started.elapsed();
+            assert!(got.reader_stopped(), "round {round}: {elapsed:?}");
+            assert!(!got.is_complete(), "round {round}");
+            assert_eq!(got.total_bytes(), 0, "round {round}");
+            assert!(elapsed >= limit, "round {round}: {elapsed:?}");
+            assert!(
+                elapsed < limit + PLUGIN_STDERR_STOP_TIMEOUT,
+                "round {round}: {elapsed:?}"
+            );
+            assert!(holder.kill_and_reap().is_reaped());
+        }
     }
 
     /// PLUG-7: 未回収として pid を報告した子は、ガードの破棄時に回収しない（報告した pid を

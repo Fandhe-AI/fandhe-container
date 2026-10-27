@@ -132,7 +132,7 @@ case "$cmd" in
     fi
     bad ;;
   create)
-    bundle=""; id=""; n=0; ro=0
+    bundle=""; id=""; n=0; ro=0; netmode=""; net_seen=0; dns_list=""
     while [ $# -gt 0 ]; do
       case "$1" in
         # 製品 CLI の --read-only は値を取らず 1 回まで（値つきは余剰の位置引数になる。#2828）。
@@ -141,11 +141,23 @@ case "$cmd" in
         # 製品 CLI の --cap-drop は core の語彙で検証する。スタブは代表の名前だけを受ける（#2775）。
         --cap-drop) [ $# -ge 2 ] || bad
           [[ "$2" =~ ^(ALL|(CAP_)?(CHOWN|KILL|NET_RAW))$ ]] || bad; shift 2 ;;
+        # 製品 CLI の --network は 1 回まで。none / host / 小文字の名前を受け、予約名 bridge・default は拒否する（#1871）。
+        --network) [ $# -ge 2 ] && [ "$net_seen" = 0 ] || bad; net_seen=1
+          [[ "$2" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] && [ "$2" != bridge ] && [ "$2" != default ] || bad
+          netmode="$2"; shift 2 ;;
+        # --add-host は <name>:<ip> の代表形だけを受ける（IP 部が 999 を含むものは不正）。
+        --add-host) [ $# -ge 2 ] || bad
+          [[ "$2" =~ ^[a-z0-9-]+:[0-9.]+$ ]] && [[ "$2" != *999* ]] || bad; shift 2 ;;
+        # --dns は値が必要。none のときの loopback 限定は走査後に判定する。
+        --dns) [ $# -ge 2 ] || bad; dns_list="$dns_list $2"; shift 2 ;;
         -*) bad ;;
         *) id="$1"; n=$((n + 1)); shift ;;
       esac
     done
     [ -n "$bundle" ] && [ "$n" -eq 1 ] && valid_id "$id" || bad
+    if [ "$netmode" = none ]; then
+      for d in $dns_list; do [[ "$d" =~ ^(127\.|::1$) ]] || bad; done
+    fi
     # 起動用 bundle（ディレクトリ名 sbundle）と --read-only の有無を、コンテナの記録（<id>.c）へ残す。
     sb=plain; [ "${bundle##*/}" = "sbundle" ] && sb=sbundle ;;
   logs)
@@ -581,7 +593,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 75 cases" 75 "$count"
+expect_eq "capture records 80 cases" 80 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -600,7 +612,7 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 75 "$loc_n"
+expect_eq "lcall stub invocations" 80 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -610,7 +622,7 @@ expect_line "B29 state of a missing container" ok "B29${tab}B${tab}3${tab}NOT_FO
 expect_line "B30 kill of a missing container" ok "B30${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "B27 kill of a created container (no pid)" ok "B27${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
 expect_line "B28 kill KILL of a created container (no pid)" ok "B28${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
-for a in A28 A29 A30 A31 A32 A33 A34 A35 A36 A37 A38; do
+for a in A28 A29 A30 A31 A32 A33 A34 A35 A36 A37 A38 A39 A40 A41 A42 A43; do
   expect_line "$a state / kill usage error" ok "$a${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 done
 expect_line "B16 inspect of a missing container" ok "B16${tab}B${tab}3${tab}NOT_FOUND${tab}-"
@@ -691,12 +703,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
-cmp_has "layer A summary" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
 cmp_has "layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
-cmp_has "lcall layer A summary" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "lcall layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
 cmp_has "lcall layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
 
 compare ok diff
@@ -706,7 +718,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
-cmp_has "non-linux layer A all match" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "non-linux layer A all match" 'layer A (syntax): match=43 mismatch=0 missing=0'
 cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21 and B23 are not started)" 'layer B (behavior): match=4 mismatch=24 missing=0'
 
 # ケース欠落は MISSING

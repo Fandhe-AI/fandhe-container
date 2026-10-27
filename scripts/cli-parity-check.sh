@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CLI のライフサイクル系コマンド(create / start / stop / kill / delete / list / logs / inspect / state。stop --signal・create --cap-drop・create --read-only を含む)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
+# CLI のライフサイクル系コマンド(create / start / stop / kill / delete / list / logs / inspect / state。stop --signal・create --cap-drop・create --read-only・create --network / --add-host / --dns の構文を含む)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
 #
 # 役割: fandhe-container の create / start / stop / kill / delete / list / logs / inspect / state を固定のケース表で
 # 実行し、終了コード・stderr の `code`・stdout の形を正規化して 1 ケース 1 行で記録する（capture）。
@@ -141,6 +141,11 @@ CASES=(
   'A36|A|n|--root @R@ kill c1 65'
   'A37|A|n|--root @R@ kill c1 term'
   'A38|A|n|--root @R@ kill -9 c1'
+  'A39|A|n|--root @R@ create --bundle @B@ c1 --add-host'
+  'A40|A|n|--root @R@ create --network none --network host --bundle @B@ c1'
+  'A41|A|n|--root @R@ create --network bridge --bundle @B@ c1'
+  'A42|A|n|--root @R@ create --add-host web:999.1.1.1 --bundle @B@ c1'
+  'A43|A|n|--root @R@ create --network none --dns 192.0.2.1 --bundle @B@ c1'
   'B01|B|l|--root @R@ list'
   'B02|B|n|--root @R@ create --bundle @B@ c1'
   'B03|B|l|--root @R@ list'

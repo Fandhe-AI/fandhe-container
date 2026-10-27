@@ -363,13 +363,24 @@ impl CriPluginBackends {
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
 ///
 /// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
-/// running への force `delete` の最悪: stop 17 秒 + ログ 2 件 20 秒（共有の待ち 10 + 各最後の試行 5 + 5。#2964）+ 起動オプション文書 10 秒 = 47 秒。
+/// running への force `delete` の最悪: 全体を [`PLUGIN_FORCE_DELETE_DEADLINE`]（47 秒）で打ち切る。後始末の前は stop 17 秒、状態の読み取り 5 秒、
+/// core の delete 20 秒（状態ロック 3 回と exec 掃除 5 秒）の計 42 秒で、後始末（ログ 2 件〔共有の待ち 10 秒と各最後の試行 5 秒ずつ。#2964〕と
+/// 起動オプション文書 10 秒）は 47 秒までの残りに収める（#3027）。bundle の解放は件数で有界（`runtime_remove_one`）。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
 /// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
 /// この値で打ち切られ（DEADLINE_EXCEEDED）、実行層への dispatch より前の worker は取り消しの旗で打ち切られる（展開は
 /// エントリ単位。#2899）。dispatch 後の worker は打ち切れず、core の create 42.9 秒 + 失敗時の削除確認（この値）で有限になる
 /// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// `CoreLifecycleRuntime::delete`（force を含む）が自分で守る全体の期限（REPAIR-5・CRI-2・#3027）。
+///
+/// 従来の文書が最悪として書いていた stop 17 秒 + ログ 2 件 20 秒 + 起動オプション文書 10 秒 = 47 秒をそのまま上限にする。
+/// 後始末（ログ・起動オプション文書）の各段は、いまの上限とこの期限までの残りの小さい方で試し、残りが 0 の段は試さず
+/// `Timeout` として残す（消さずに残す側。`Kept` と警告行で知らせる）。core の delete を含む stop までの 42 秒は
+/// 打ち切れないが、この値より先に終わる。`PLUGIN_RUNTIME_TIMEOUT` との余裕（13.9 秒）は I/O の時間と、数えていない
+/// stop 内の状態ロックの待ちに充てる。
+pub const PLUGIN_FORCE_DELETE_DEADLINE: Duration = Duration::from_secs(47);
 
 /// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
 ///
@@ -627,6 +638,8 @@ pub struct CoreLifecycleRuntime {
     create_audit: Option<Arc<dyn AuditSink>>,
     /// supervisor ログとコンテナログの削除で共有する、ロック解放を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・#2964・REPAIR-5）。
     container_log_lock_wait: Duration,
+    /// `delete` 全体の期限（`PLUGIN_FORCE_DELETE_DEADLINE` 以下。後始末の各段の予算を残りで頭打ちにする。#3027・REPAIR-5）。
+    delete_deadline: Duration,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
     #[cfg(target_os = "linux")]
@@ -863,6 +876,7 @@ impl CoreLifecycleRuntime {
             cgroups: Arc::new(production_cgroup_remover()),
             create_audit: None,
             container_log_lock_wait: CONTAINER_LOG_LOCK_WAIT,
+            delete_deadline: PLUGIN_FORCE_DELETE_DEADLINE,
             cleanup_warn: Arc::new(|line| {
                 let _ = crate::telemetry::stderr_sink().submit(line);
             }),
@@ -890,6 +904,14 @@ impl CoreLifecycleRuntime {
     #[must_use]
     pub fn with_container_log_lock_wait(mut self, wait: Duration) -> Self {
         self.container_log_lock_wait = wait.min(CONTAINER_LOG_LOCK_WAIT);
+        self
+    }
+
+    /// `delete` 全体の期限を変える（試験用。`PLUGIN_FORCE_DELETE_DEADLINE` を超える値は切り詰める。
+    /// `PLUGIN_RUNTIME_TIMEOUT` に収まる予算の不変条件を壊さないため。#3027・REPAIR-5）。
+    #[must_use]
+    pub fn with_delete_deadline(mut self, deadline: Duration) -> Self {
+        self.delete_deadline = deadline.min(PLUGIN_FORCE_DELETE_DEADLINE);
         self
     }
 
@@ -930,20 +952,31 @@ impl CoreLifecycleRuntime {
     /// `NotFound`）はロック保持中に試行ごと評価し、待つ間に同じ ID で作り直されたインスタンスのログは消さない。
     /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）が、握りつぶさず `Kept { code }` と記録器の
     /// `supervisor_log_remove` の失敗として観測できるようにする。
-    fn remove_supervisor_log(&self, id: &ContainerId, lock_wait: Duration) -> CleanupOutcome {
+    ///
+    /// `remaining` は `delete` 全体の期限までの残り。`lock_wait` と 1 回の試行の期限をこの残りで頭打ちにし
+    /// （最悪の所要は `lock_wait` + 試行の期限）、残りが 0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
+    fn remove_supervisor_log(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+        remaining: Duration,
+    ) -> CleanupOutcome {
         let Some(root) = self.store.host_state_root() else {
             return CleanupOutcome::NotApplicable;
         };
         let started = Instant::now();
         let store = Arc::clone(&self.store);
         let guard_id = id.clone();
-        let removed = remove_guarded_bounded_waiting(
-            root,
-            id,
-            lock_wait,
-            SUPERVISOR_LOG_REMOVE_TIMEOUT,
-            Arc::new(move || Self::id_is_absent(&store, &guard_id)),
-        );
+        let removed = match stage_budget(remaining, lock_wait, SUPERVISOR_LOG_REMOVE_TIMEOUT) {
+            Some((lock_wait, attempt)) => remove_guarded_bounded_waiting(
+                root,
+                id,
+                lock_wait,
+                attempt,
+                Arc::new(move || Self::id_is_absent(&store, &guard_id)),
+            ),
+            None => Err(delete_deadline_exhausted()),
+        };
         if let Ok(name) = OpName::new("supervisor_log_remove") {
             let result = match &removed {
                 Ok(_) => OpOutcome::Success,
@@ -968,15 +1001,21 @@ impl CoreLifecycleRuntime {
     /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（待ちの期限まで同じ ID の sink が閉じなかった）・
     /// `Timeout`（期限切れ）・`ResourceExhausted`（枠の満杯。何も実行していない。#2894）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
     pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
-        self.remove_container_log_within(id, self.container_log_lock_wait)
+        self.remove_container_log_within(
+            id,
+            self.container_log_lock_wait,
+            CONTAINER_LOG_REMOVE_TIMEOUT,
+        )
     }
 
     /// [`Self::remove_container_log`] の待ちの上限を呼び出し側が渡す版。`delete` が supervisor ログと待ちを共有するため、
-    /// 残りの予算（`container_log_lock_wait` 以下）を受け取る（#2964・REPAIR-5）。
+    /// 残りの予算（`container_log_lock_wait` 以下）と、`delete` 全体の期限で頭打ちにした 1 回の試行の期限を受け取る
+    /// （#2964・#3027・REPAIR-5）。
     fn remove_container_log_within(
         &self,
         id: &ContainerId,
         lock_wait: Duration,
+        attempt_timeout: Duration,
     ) -> Result<RemovedLogs, TraitError> {
         let Some(root) = self.store.host_state_root() else {
             return Ok(RemovedLogs::default());
@@ -987,7 +1026,7 @@ impl CoreLifecycleRuntime {
             root,
             id,
             lock_wait,
-            CONTAINER_LOG_REMOVE_TIMEOUT,
+            attempt_timeout,
             Arc::new(move || {
                 matches!(
                     store.get(&GetStateRequest::new(guard_id.clone())),
@@ -998,16 +1037,22 @@ impl CoreLifecycleRuntime {
     }
 
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
+    ///
+    /// `remaining` は `delete` 全体の期限までの残り。0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
     fn record_container_log_removal(
         &self,
         id: &ContainerId,
         lock_wait: Duration,
+        remaining: Duration,
     ) -> CleanupOutcome {
         if self.store.host_state_root().is_none() {
             return CleanupOutcome::NotApplicable;
         }
         let started = Instant::now();
-        let removed = self.remove_container_log_within(id, lock_wait);
+        let removed = match stage_budget(remaining, lock_wait, CONTAINER_LOG_REMOVE_TIMEOUT) {
+            Some((lock_wait, attempt)) => self.remove_container_log_within(id, lock_wait, attempt),
+            None => Err(delete_deadline_exhausted()),
+        };
         let elapsed = started.elapsed();
         let result = match &removed {
             Ok(_) => OpOutcome::Success,
@@ -1052,6 +1097,7 @@ impl CoreLifecycleRuntime {
     /// # Errors
     /// ログ回収が期限切れのとき `Timeout`。
     fn reclaim_before_create(&self, id: &ContainerId) -> Result<(), TraitError> {
+        use fandhe_container_supervisor::container_options::store as options_store;
         let Some(root) = self.store.host_state_root() else {
             return Ok(());
         };
@@ -1073,7 +1119,7 @@ impl CoreLifecycleRuntime {
         }
         result?;
         // 起動オプション文書の残骸（best effort。失敗しても create は続ける。文書は世代の照合で採用されない）。
-        let _ = self.remove_stale_options(id);
+        let _ = self.remove_stale_options(id, options_store::OPTIONS_REMOVE_TIMEOUT);
         Ok(())
     }
 
@@ -1082,7 +1128,10 @@ impl CoreLifecycleRuntime {
     /// 同じ ID の記録がある（作り直された新しいインスタンスかもしれない）ときは消さない。文書が無ければロックも作らない。
     /// 失敗は記録器の `container_options_remove` の Failure として計上する。Linux 以外は文書を書く経路が無く
     /// （`Unimplemented`）、対象外として `Ok` を返し何も計上しない。戻り値は呼び出し元が警告行を出すかの判断に使う。
-    fn remove_stale_options(&self, id: &ContainerId) -> Result<(), ErrorCode> {
+    ///
+    /// `remaining` は呼び出し元の残りの予算（`create` は `OPTIONS_REMOVE_TIMEOUT`、`delete` は全体の期限までの残り。#3027）。
+    /// 全体の期限と `OPTIONS_REMOVE_TIMEOUT` の小さい方を期限にし、ロックの待ちはそれ以下にする。0 なら試さず `Timeout`。
+    fn remove_stale_options(&self, id: &ContainerId, remaining: Duration) -> Result<(), ErrorCode> {
         use fandhe_container_supervisor::container_options::store as options_store;
         let Some(root) = self.store.host_state_root() else {
             return Ok(());
@@ -1090,13 +1139,18 @@ impl CoreLifecycleRuntime {
         let started = Instant::now();
         let store = Arc::clone(&self.store);
         let guard_id = id.clone();
-        let removed = options_store::remove_stale_bounded(
-            root,
-            id,
-            move || Self::id_is_absent(&store, &guard_id),
-            options_store::OPTIONS_LOCK_WAIT,
-            options_store::OPTIONS_REMOVE_TIMEOUT,
-        );
+        let timeout = remaining.min(options_store::OPTIONS_REMOVE_TIMEOUT);
+        let removed = if timeout.is_zero() {
+            Err(delete_deadline_exhausted())
+        } else {
+            options_store::remove_stale_bounded(
+                root,
+                id,
+                move || Self::id_is_absent(&store, &guard_id),
+                options_store::OPTIONS_LOCK_WAIT.min(timeout),
+                timeout,
+            )
+        };
         match removed {
             Ok(()) => Ok(()),
             Err(e) if e.code() == ErrorCode::Unimplemented => Ok(()),
@@ -1110,6 +1164,30 @@ impl CoreLifecycleRuntime {
             }
         }
     }
+}
+
+/// `delete` の後始末の 1 段に使える (ロックの待ち, 1 回の試行の期限) を、全体の期限までの `remaining` で頭打ちにして決める
+/// （最悪の所要は両者の和なので、和が `remaining` を超えないようにする。残りが 0 なら `None` で、その段は試さない。#3027・REPAIR-5）。
+fn stage_budget(
+    remaining: Duration,
+    lock_wait_cap: Duration,
+    attempt_cap: Duration,
+) -> Option<(Duration, Duration)> {
+    if remaining.is_zero() {
+        return None;
+    }
+    // 残りが小さいときは半分ずつ。試行の期限は上限であって通常は短時間で終わるため、残りを全部渡すとロックの待ちが消える。
+    let attempt = attempt_cap.min(remaining / 2);
+    let lock_wait = lock_wait_cap.min(remaining.saturating_sub(attempt));
+    Some((lock_wait, attempt))
+}
+
+/// `delete` 全体の期限を使い切って後始末の段を試さなかったときのエラー（`Timeout`。固定文言。#3027・REPAIR-5）。
+fn delete_deadline_exhausted() -> TraitError {
+    TraitError::new(
+        ErrorCode::Timeout,
+        "delete deadline exhausted before cleanup stage",
+    )
 }
 
 /// create 前のログ回収の結果を、core を呼ぶかの判断へ写す（期限切れだけが失敗。#2760・SEC-4・REPAIR-5）。
@@ -1215,6 +1293,9 @@ impl ContainerRuntime for CoreLifecycleRuntime {
     }
 
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+        // 全体の期限（#3027）。stop・core の delete は打ち切れないが、後始末の各段はここまでの残りで頭打ちにする。
+        let deadline = Instant::now() + self.delete_deadline;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
         #[cfg(target_os = "linux")]
         {
             self.supervised.reap();
@@ -1230,14 +1311,15 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         // 順序の根拠: コンテナログの sink は drain の終わりに閉じ、supervisor ログの flock はプロセス終了で外れる。
         // supervisor ログが解放されればコンテナログはほぼ即座に消せるため、先に supervisor ログを待つ。
         let wait = self.container_log_lock_wait;
-        let deadline = Instant::now() + wait;
-        let supervisor_log = self.remove_supervisor_log(req.id(), wait);
+        let wait_deadline = Instant::now() + wait;
+        let supervisor_log = self.remove_supervisor_log(req.id(), wait, remaining());
         let container_log = self.record_container_log_removal(
             req.id(),
-            deadline.saturating_duration_since(Instant::now()),
+            wait_deadline.saturating_duration_since(Instant::now()),
+            remaining(),
         );
         // 起動オプション文書の残骸（記録の無くなった ID の分。失敗は応答に載せず、計上と構造化ログで知らせる。#2760）。
-        if let Err(code) = self.remove_stale_options(req.id()) {
+        if let Err(code) = self.remove_stale_options(req.id(), remaining()) {
             (self.cleanup_warn)(options_cleanup_warning_line(req.id(), code));
         }
         let response = response

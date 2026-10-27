@@ -99,19 +99,25 @@ impl ProcessLauncher for PidLauncher {
     }
 }
 
-struct Tmp(PathBuf);
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+/// 第 2 フィールドは tmpfiles の flock 走査から守る親（最後のため `Drop` の削除の後に消える。#3026）。
+struct Tmp(
+    PathBuf,
+    #[allow(dead_code)] scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p =
-            std::env::temp_dir().join(format!("fc-cli-stopctl-{tag}-{}-{n}", std::process::id()));
+        let scratch =
+            scratch_root::ScratchDir::new("fc-cli-stopctl", std::time::Duration::from_secs(10));
+        // 制御用 UDS のパス長を抑えるため子の名前は短くする。
+        let p = scratch.path().join(tag);
         std::fs::create_dir_all(&p).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(p)
+        Self(p, scratch)
     }
 }
 

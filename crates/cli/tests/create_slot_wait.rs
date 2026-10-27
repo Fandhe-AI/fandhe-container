@@ -12,6 +12,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
 use fandhe_container_cli::commands::run_to;
 use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_classified};
 
@@ -26,7 +30,10 @@ fn argv(root: &Path, rest: &[&str]) -> Vec<OsString> {
 
 #[test]
 fn cli1_repair5_create_waits_for_a_busy_worker_slot_instead_of_timing_out() {
-    let tmp = std::env::temp_dir().join(format!("fc-cli-slotwait-{}", std::process::id()));
+    // tmpfiles の flock 走査から守る親（#3026）。bundle・状態ルートはその子に作り、関数の最後まで保持する。
+    let scratch =
+        scratch_root::ScratchDir::new("fc-cli-slotwait", std::time::Duration::from_secs(10));
+    let tmp = scratch.path().join("t");
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = tmp.join("state");

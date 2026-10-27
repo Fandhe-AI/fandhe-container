@@ -80,7 +80,7 @@ fandhe-container/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
-│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・CORE-2・CORE-5・REPAIR-12）
+│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・CORE-2・CORE-5・REPAIR-12）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── macos-vm-cold-start-bench.md  # 実 VM の cold start 計測ハーネスの計測区間・分解能・出力（crates/platform-macos/tests/vm_cold_start.rs。実機前提・合否は出さない。TASK-70 準備・#1879・MAC-2。区間はオーナー確認待ち）
 │   │   ├── macos-shared-vm.md     # macOS 既定方式（常駐 VM 共用）の未決事項の設計案（保持役・bind mount・ゲスト内実行・計測対象。TASK-191・#1905・MAC-4。承認待ち #1906）
@@ -117,7 +117,7 @@ fandhe-container/
 │   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）と attach の取り残しの記録を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み・再起動後に回収できる範囲・write-ahead を採らない判断。IPAM 等は #1870 の後続。#2604・#2681・NET-1・NET-6・REPAIR-3・REPAIR-4・REPAIR-5）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-options-delivery.md  # 起動オプション（ulimit・env・label ほか）の CLI から supervisor への受け渡し（状態ルート配下の 0600 の文書 `FCOPT1`・経路・却下案・残余。#2713・SUP-12・CLI-1・SEC-1）
-│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測（#2634・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
+│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）

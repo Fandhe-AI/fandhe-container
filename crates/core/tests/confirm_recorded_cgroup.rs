@@ -10,6 +10,7 @@
 //! - シナリオ D: 配置の記録が無いレコード → `FailedPrecondition`・Running のまま
 //!
 //! # 実機前提テストとしての分離
+//! 一時領域は `support/scratch_root.rs` の `ScratchDir` の子に作る（#3026・tmpfiles の flock 走査から守るため）。
 //! 非特権ユーザーに委譲された cgroup v2 サブツリー（と、child subreaper 化できるプロセス）が必要で、GitHub
 //! ホステッド runner では保証できないため `#[ignore]` で既定のテスト集合から分離する（AGENTS.md「実機前提テスト」・
 //! ci.md）。root 不要（root では所有者の検証が省かれるため非 root で実行する）:
@@ -25,6 +26,11 @@
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
 mod precondition;
+
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -87,13 +93,20 @@ mod linux {
         root: PathBuf,
         store: FileStateStore,
         cgroup_dir: Option<PathBuf>,
+        /// tmpfiles の flock 走査から守る親（#3026）。`root` はその子。最後のフィールドで、`Drop` の後に親が消える。
+        _scratch: crate::scratch_root::ScratchDir,
     }
 
     impl Case {
         fn new(tag: &str, recorded: Option<&str>, scope_dir: &Path) -> Self {
             let id = ContainerId::new(format!("{tag}{}", std::process::id())).expect("id");
-            let root = std::env::temp_dir().join(format!("fandhe-confirm-rec-{}", id.as_str()));
-            let _ = fs::remove_dir_all(&root);
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fandhe-confirm-rec",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch
+                .path()
+                .join(format!("fandhe-confirm-rec-{}", id.as_str()));
             fs::create_dir_all(root.join("bundle")).expect("mkdir bundle");
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
             let store = FileStateStore::open(StateRoot::from_override(root.clone()).expect("root"))
@@ -122,6 +135,7 @@ mod linux {
                 root,
                 store,
                 cgroup_dir,
+                _scratch: scratch,
             }
         }
 

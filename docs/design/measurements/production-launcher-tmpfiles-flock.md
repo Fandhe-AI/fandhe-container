@@ -108,8 +108,8 @@ aging（30d）が消さないため対象外。
 
 ### 残余
 
-- 既定のテスト集合の core の試験は #2958 で対応済み（下の節）。supervisor・cli の既定集合と、`#[ignore]` の
-  `cgroup_*`・`confirm_recorded_cgroup` は未判定・未保護で、追跡が必要
+- 既定のテスト集合の core の試験は #2958、supervisor・cli の既定集合と `#[ignore]` の `cgroup_*`・
+  `confirm_recorded_cgroup` は #3026 で対応済み（下の節）。両 crate の `src` の単体試験は未判定
 - `linux-env-probe.yml` への tmpfiles 設定・timer の観測ステップ（任意項目）は未実施
 - CI 外の 3 件（cli）はビルドと clippy までの確認で、実機実行は人手
 
@@ -131,3 +131,40 @@ aging（30d）が消さないため対象外。
 
 対象外: `oci_kill`・`state_store_*`・`oci_runtime_error` の `temp_dir().join("bundle")` はパス文字列のみでディレクトリを作らない。
 `oci_config`・`exec_diagnostic_output`・`audit_file_writer*`・`plugin_*` はディレクトリ flock を通らない。
+
+## cgroup 系の実機前提試験と supervisor・cli の既定集合への展開（#3026・CORE-5・REPAIR-12）
+
+issue #2958 の残余だった 2 群を、同じ `ScratchDir`（`#[path]` で取り込み、状態ルート・bundle は親の **子** に作る）で保護した。
+照合内容（成功行・具体値）は変えていない。tmpfiles の走査との重なりは再現できないため、直接の実証ではない（#2958 と同じ扱い）。
+
+判定基準: 製品がディレクトリへ待たない flock を取る経路（`BundleLock::acquire`。create・start・`recover_interrupted_start`・
+image rootfs を持つ delete）に、`temp_dir()` 直下の **実在する** bundle ディレクトリを通すか。パス文字列だけの bundle、
+状態ストアの `@lock`（ファイル）、exec 系の `pin_bundle_rootfs`（flock を取らない）は対象外。
+
+### 群 1: core の `#[ignore]` の cgroup 系 5 本
+
+| 試験 | 当たる経路 |
+| ---- | ---------- |
+| `confirm_recorded_cgroup` | 実在の `root/bundle` を `recover_interrupted_start` → `BundleLock::acquire` へ通す（厳密に該当） |
+| `cgroup_delete`・`cgroup_delete_recorded`・`cgroup_resources_apply`・`cgroup_start_chain` | bundle はパスのみで現状は flock を通らない。受け入れ条件に従い、delete が将来ロックを取っても壊れない予防として移した |
+
+5 本は CI の `platform-ci` の `--ignored` 一覧に入っておらず、`--ignored` の実機実行（委譲 cgroup が要る）は人手。
+ビルドと既定集合の self_check までを確認した。
+
+### 群 2: supervisor・cli の既定集合（`tests/` の結合試験）
+
+| crate | 試験 | 当たる経路 |
+| ----- | ---- | ---------- |
+| supervisor | `start_entry`・`start_tiocsti_wiring`・`start_entry_audit_record_failed`・`seccomp_notify_wiring`・`log_pipeline` | 実在の bundle の create → `run_start`（claim_start → BundleLock） |
+| supervisor | `start_bind_audit_relay`・`start_destination_audit_relay`・`start_rootfs_pin_audit_relay`（harness = false） | 同上（`ScratchDir` は親プロセスだけが作る） |
+| supervisor | `supervisor_bin` | 実在の bundle の create と bin の `start` |
+| cli | `binary_entry`・`create_slot_wait`・`stop_control_channel`・`start_signal_interrupt` | CLI の create・start・delete |
+
+対象外: bundle がパス文字列だけの `run`・`restart_latency`・`daemonless`・`container_options*`・`healthcheck_sync`・
+`state_store_wiring`・`stop_intent`、ディレクトリ flock を通らない `inherited_fds`・`inspect_output`・`health_hook`・
+`healthcheck_periodic`・`control_channel`・`control_audit_delivery`・`bounded_slot_busy`・`log_rotation`・`privilege*`・`exec*`・
+`seccomp_notify_audit`、cli の `image_ownership_parity`・`sigchld_reset`・`signal_forward`。
+
+### 残余
+
+- `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験は未判定（後続 issue で追跡）

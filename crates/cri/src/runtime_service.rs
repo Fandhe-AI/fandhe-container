@@ -2694,6 +2694,12 @@ impl CriRuntimeService {
     /// 削除済み（成功または `NOT_FOUND`）を確認できたときだけ bundle を解放して記録を解放する。
     /// 確定失敗・解放の失敗は記録を保持して再試行できるようにし（再試行では delete が `NOT_FOUND` になる）、
     /// 結果不明は unknown で保持する（REPAIR-5）。
+    ///
+    /// 待ちの上限（#3027・REPAIR-5）: `adapter.remove` の実行層側（plugin-cri は全体の期限 `PLUGIN_FORCE_DELETE_DEADLINE` で
+    /// 後始末を頭打ちにする）と、`bundles.release` はどちらも worker 内で動く。`release` にはロックの待ちが無く、I/O の量は
+    /// 件数の上限で抑えられているが、時間の定数の上限は無い。RPC の応答は `run_bounded` が `runtime_timeout` で打ち切り、
+    /// worker は取り消されず走り続ける（記録は `in_flight` のままで、再試行は worker が終わるまで `FAILED_PRECONDITION`）。
+    /// 設計と kubelet の `--runtime-request-timeout` との関係は `docs/design/container-log-removal-wait.md`。
     async fn runtime_remove_one(
         &self,
         binding: &RuntimeBinding,

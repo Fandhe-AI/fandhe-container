@@ -24,6 +24,11 @@ fn main() {
     linux::run();
 }
 
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::os::unix::fs::PermissionsExt as _;
@@ -94,9 +99,12 @@ mod linux {
     }
 
     pub fn run() {
-        let base: PathBuf =
-            std::env::temp_dir().join(format!("fandhe-sup-2623-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // tmpfiles の flock 走査から守る親（#3026）。bundle・状態ルートはその子に作り、関数の最後まで保持する。
+        let scratch = super::scratch_root::ScratchDir::new(
+            "fandhe-sup-2623",
+            std::time::Duration::from_secs(10),
+        );
+        let base: PathBuf = scratch.path().join("b");
         private_dir(&base);
         let root = base.join("state");
         private_dir(&root);

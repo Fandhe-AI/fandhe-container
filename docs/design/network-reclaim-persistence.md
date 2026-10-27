@@ -16,7 +16,7 @@
 | write-ahead（作成前・attach 前の記録） | 採らないと判断した（#2681。下の「write-ahead の判断」） |
 | IPAM 状態（`StaticIpam`・`NetnsDirRecord`）、作成に成功したネットワーク（`CreatedNetwork`）、削除中の印 | 置き場所と形式の方針だけを決め、実装は後続（#1870 の network 結線の設計と一緒に決める。CLI の経路と共有しうるため） |
 
-後続で実装するときの置き場は、同じ階層の `<状態ルート>/.cri/net/networks/<名前>/`（`ipam`・`netns-dir` の記録）とする。#1870 で CLI と共有する置き場に決まった場合は、そちらへ移す手順を後続 issue に書く。
+（#1870 の設計で、CLI と共有する置き場は `<状態ルート>/@networks/` に決まった。[network-wiring.md](network-wiring.md) D10・D11、実装は #3059・#3067・#3075。以下は決定前の記述。）後続で実装するときの置き場は、同じ階層の `<状態ルート>/.cri/net/networks/<名前>/`（`ipam`・`netns-dir` の記録）とする。#1870 で CLI と共有する置き場に決まった場合は、そちらへ移す手順を後続 issue に書く。
 
 ## 置き場所
 

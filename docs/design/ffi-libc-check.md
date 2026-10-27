@@ -67,11 +67,13 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）と crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/io（#1842）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 
 crates/io（#1842）: `sys.rs`（`libc_abi`・`beneath::libc_abi`・`tests::libc_abi_fixtures`）と `sys/vsock.rs`（`libc_abi`）で、`Ucred`・`SockaddrVm`・`PollFd` のサイズ・アラインメント・フィールドオフセット、`O_*`・`AT_*`・errno・`SOL_SOCKET` 等の定数、`beneath::raw` ほか全 FFI 関数の型を照合する。`libc` 0.2.189 の `sockaddr_vm` は旧ヘッダ形（`svm_zero: [u8; 4]`）で `svm_flags` を持たないため、自前の `svm_flags`＋`svm_zero[3]` は末尾 4 バイトの位置・サイズで照合する。DIR・`dirent`・`sockaddr` はポインタ先の型が自前と `libc` で別書き（不透明ポインタ・先頭バイト・`SockaddrVm`）のため、関数は別々の型で書き、`dirent` の `d_ino`・`d_name` のオフセットは `offset_of!` で照合する。`vsock.rs` の `map_errno` の数値リテラルは `libc` の errno と値を照合する。対象外（理由は各モジュールのコメント）: `UCRED_SIZE`・`UCRED_LEN`・`SOCKADDR_VM_LEN`（サイズ照合に含まれる）、`MAX_FULL_FSYNC_EINTR_RETRIES`・`consts::SUPPORTED`（FFI でない）、`LINKAT_FLAGS`（`libc` に無い方針値。`AT_SYMLINK_FOLLOW` を含まないことだけ照合）、対応外 arch 用 `consts`、`windows.rs`。
+
+crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は定数 45 件（`AF_NETLINK` は `u16` に範囲検査して比較）・構造体 2 件・関数 12 件。
 
 crates/gpu（#2979・#2980 で `sys` を新設）は未適用。照合は #1837 の子 #2989 で行う。dev-dependencies の `libc`（=0.2.189）だけを使い、追加には oci（#2590）と同様に crate ごとのオーナー承認が要る。
 

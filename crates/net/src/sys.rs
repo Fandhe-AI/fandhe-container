@@ -29,9 +29,9 @@
 //!   （単調時計の開始時刻＋全体 timeout）から毎回計算し直し、無期限に待つ経路を持たない（REPAIR-5）
 //!
 //! # `libc` / `nix` について
-//! `libc` は #86 で採用承認済みだが、自動運転下では「追加時点で新しい版があれば PR で確認する」
-//! 運用条件を満たせないため、`crates/core/src/sys.rs` と同じ流儀で `Cargo.toml` を変更せず
-//! 必要最小限の `extern "C"` 宣言を自前で持つ（dependency-policy）。
+//! `sys` の本体は `libc` へ切り替えず、必要最小限の `extern "C"` 宣言を自前で持つ（`crates/core/src/sys.rs`
+//! と同じ流儀。dependency-policy）。宣言の正しさは `libc`（dev-dependencies のみ。#1318・#1837）との
+//! `const` 評価の照合で守る（子 `libc_abi`。#1841。方式は `docs/design/ffi-libc-check.md`）。`nix` は使わない。
 //!
 //! # 実装メモ
 //! 受信切り詰め検出は `recvfrom(2)` に `MSG_TRUNC` を渡し、戻り値（データグラムの実長）が
@@ -1094,4 +1094,230 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// 自前 FFI 宣言と `libc`（dev-dependencies のみ。`=0.2.189`）の `const` 評価による機械照合
+/// （#1841・#1837・#1318・MVM-4・REPAIR-7・REPAIR-12。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言の誤りは分離・特権の欠陥になり得る（`CLONE_NEWNET`・`MS_BIND`・`O_NOFOLLOW` など）ため、食い違えば
+/// ビルドが失敗する（fail-closed）。関数は呼ばず型だけを比べるので `unsafe` は足さない。
+/// `consts` はアーキごとの cfg で 1 つだけ有効なので、`libc` の値はそのターゲットのものと比べられる。
+///
+/// 対象外（黙って省かない）:
+/// - 対応外アーキテクチャの `consts`: カーネルへ渡さないプレースホルダ（`SUPPORTED = false`）で、意図的に
+///   `libc` と一致しない。そのため本モジュールの cfg は対応アーキ（LP64 の x86_64・aarch64）に限る
+/// - `consts::SUPPORTED`・`EINTR_RETRY_MAX`・`Deadline`・`poll_timeout_ms`・`RecvMeta`・安全なラッパー群:
+///   FFI の宣言ではない
+/// - `SockaddrNl::nl_pad` のオフセット: `libc::sockaddr_nl` の `nl_pad` は非公開（`Padding`）で `offset_of!`
+///   できない。`nl_family`・`nl_pid` のオフセット一致と自前側の `nl_pad` のオフセットで代わりに押さえる
+/// - `bind` / `getsockname` / `sendto` / `recvfrom` の `sockaddr` 引数: C の原型は `struct sockaddr *` で、
+///   netlink では `sockaddr_nl` を渡すのが通常の用法。自前は `SockaddrNl` を指し、構造体の同一性は下の
+///   `sockaddr_nl` の照合が保証する
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use super::{
+        PollFd, SockaddrNl, bind, consts, geteuid, getsockname, mount, openat, poll, recvfrom,
+        sendto, setsockopt, socket, umount2, unshare,
+    };
+    use core::mem::{align_of, offset_of, size_of};
+
+    // 定数（45 件。`AF_NETLINK` は下で別扱い）。
+    const _: () = {
+        assert!(consts::SOCK_RAW == libc::SOCK_RAW);
+        assert!(consts::SOCK_CLOEXEC == libc::SOCK_CLOEXEC);
+        assert!(consts::NETLINK_ROUTE == libc::NETLINK_ROUTE);
+        assert!(consts::NETLINK_NETFILTER == libc::NETLINK_NETFILTER);
+        assert!(consts::SOL_NETLINK == libc::SOL_NETLINK);
+        assert!(consts::NETLINK_CAP_ACK == libc::NETLINK_CAP_ACK);
+        assert!(consts::NETLINK_EXT_ACK == libc::NETLINK_EXT_ACK);
+        assert!(consts::MSG_PEEK == libc::MSG_PEEK);
+        assert!(consts::MSG_TRUNC == libc::MSG_TRUNC);
+        assert!(consts::MSG_DONTWAIT == libc::MSG_DONTWAIT);
+        assert!(consts::POLLIN == libc::POLLIN);
+        assert!(consts::EPERM == libc::EPERM);
+        assert!(consts::ENOENT == libc::ENOENT);
+        assert!(consts::EINTR == libc::EINTR);
+        assert!(consts::ENOMEM == libc::ENOMEM);
+        assert!(consts::EAGAIN == libc::EAGAIN);
+        assert!(consts::EACCES == libc::EACCES);
+        assert!(consts::EBUSY == libc::EBUSY);
+        assert!(consts::EEXIST == libc::EEXIST);
+        assert!(consts::ENODEV == libc::ENODEV);
+        assert!(consts::EINVAL == libc::EINVAL);
+        assert!(consts::ENFILE == libc::ENFILE);
+        assert!(consts::EMFILE == libc::EMFILE);
+        assert!(consts::EPROTONOSUPPORT == libc::EPROTONOSUPPORT);
+        assert!(consts::EOPNOTSUPP == libc::EOPNOTSUPP);
+        assert!(consts::EAFNOSUPPORT == libc::EAFNOSUPPORT);
+        assert!(consts::ENOBUFS == libc::ENOBUFS);
+        assert!(consts::EMSGSIZE == libc::EMSGSIZE);
+        assert!(consts::CLONE_NEWNET == libc::CLONE_NEWNET);
+        assert!(consts::MS_BIND == libc::MS_BIND);
+        assert!(consts::MNT_DETACH == libc::MNT_DETACH);
+        assert!(consts::ENOTDIR == libc::ENOTDIR);
+        assert!(consts::EISDIR == libc::EISDIR);
+        assert!(consts::ELOOP == libc::ELOOP);
+        assert!(consts::O_RDONLY == libc::O_RDONLY);
+        assert!(consts::O_RDWR == libc::O_RDWR);
+        assert!(consts::O_NOCTTY == libc::O_NOCTTY);
+        assert!(consts::O_APPEND == libc::O_APPEND);
+        assert!(consts::O_NONBLOCK == libc::O_NONBLOCK);
+        assert!(consts::O_DIRECTORY == libc::O_DIRECTORY);
+        assert!(consts::O_NOFOLLOW == libc::O_NOFOLLOW);
+        assert!(consts::O_CLOEXEC == libc::O_CLOEXEC);
+        assert!(consts::O_PATH == libc::O_PATH);
+        assert!(consts::AT_FDCWD == libc::AT_FDCWD);
+    };
+
+    // `AF_NETLINK` は自前が `u16`（`sockaddr_nl.nl_family` と同幅）、`libc` は `c_int`。切り詰めを隠さず、
+    // 範囲外なら評価エラーにして `u16` で比べる。
+    const fn family(v: libc::c_int) -> u16 {
+        assert!(v >= 0 && v <= 0xffff);
+        v as u16
+    }
+    const _: () = assert!(consts::AF_NETLINK == family(libc::AF_NETLINK));
+    const _: () = assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
+
+    // `struct sockaddr_nl`。
+    const _: () = {
+        assert!(size_of::<SockaddrNl>() == size_of::<libc::sockaddr_nl>());
+        assert!(align_of::<SockaddrNl>() == align_of::<libc::sockaddr_nl>());
+        assert!(offset_of!(SockaddrNl, nl_family) == offset_of!(libc::sockaddr_nl, nl_family));
+        assert!(offset_of!(SockaddrNl, nl_pid) == offset_of!(libc::sockaddr_nl, nl_pid));
+        assert!(offset_of!(SockaddrNl, nl_groups) == offset_of!(libc::sockaddr_nl, nl_groups));
+        // `nl_pad` は libc 側が非公開のため、自前のオフセットと型の幅だけを固定する。
+        assert!(offset_of!(SockaddrNl, nl_pad) == 2);
+        assert!(size_of::<u16>() == size_of::<libc::c_ushort>());
+        assert!(size_of::<u32>() == size_of::<libc::__u32>());
+    };
+
+    // `struct pollfd`。
+    const _: () = {
+        assert!(size_of::<PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(PollFd, revents) == offset_of!(libc::pollfd, revents));
+        assert!(size_of::<i32>() == size_of::<libc::c_int>());
+        assert!(size_of::<i16>() == size_of::<libc::c_short>());
+    };
+
+    // 関数の型（12 件）。
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int = socket;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+        libc::socket;
+
+    const _: unsafe extern "C" fn(libc::c_int, *const SockaddrNl, libc::socklen_t) -> libc::c_int =
+        bind;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::c_int = libc::bind;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut SockaddrNl,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = getsockname;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getsockname;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_void,
+        libc::size_t,
+        libc::c_int,
+        *const SockaddrNl,
+        libc::socklen_t,
+    ) -> libc::ssize_t = sendto;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_void,
+        libc::size_t,
+        libc::c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::ssize_t = libc::sendto;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::c_void,
+        libc::size_t,
+        libc::c_int,
+        *mut SockaddrNl,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = recvfrom;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::c_void,
+        libc::size_t,
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = libc::recvfrom;
+
+    const _: unsafe extern "C" fn(*mut PollFd, libc::nfds_t, libc::c_int) -> libc::c_int = poll;
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        libc::poll;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *const libc::c_void,
+        libc::socklen_t,
+    ) -> libc::c_int = setsockopt;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *const libc::c_void,
+        libc::socklen_t,
+    ) -> libc::c_int = libc::setsockopt;
+
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = unshare;
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::unshare;
+
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        libc::c_ulong,
+        *const libc::c_void,
+    ) -> libc::c_int = mount;
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        libc::c_ulong,
+        *const libc::c_void,
+    ) -> libc::c_int = libc::mount;
+
+    const _: unsafe extern "C" fn(*const libc::c_char, libc::c_int) -> libc::c_int = umount2;
+    const _: unsafe extern "C" fn(*const libc::c_char, libc::c_int) -> libc::c_int = libc::umount2;
+
+    const _: unsafe extern "C" fn() -> libc::uid_t = geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+
+    // `openat` は自前も `libc` も可変長（mode）。
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = openat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        ...
+    ) -> libc::c_int = libc::openat;
 }

@@ -59,6 +59,8 @@
 | `4` | `FlushAck` | FLUSH バリアに対する ACK。バリア以前に受理した書き込みが永続化済みであることを保証する（IO-2） |
 | `5..=255` | （未知値） | `INVALID_ARGUMENT` として拒否する |
 
+上表は現行の v1 である。v2 では 5〜8 に `Create`・`WriteFile`・`Close`・`Nack` を割り当てる設計が確定している（未実装。実装は #3161。[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)の F4）。
+
 ### エンコード例
 
 いずれも `crates/io/src/checksum.rs` が実装する CRC-32C と同一パラメータ（反射多項式 `0x82F6_3B78`・初期値 `0xFFFF_FFFF`・最終 XOR `0xFFFF_FFFF`）の独立実装で、標準 check 値 `"123456789"` → `0xE3069283`（`io1_crc32c_matches_standard_check_value` と同じ期待値）を確認した上で算出した値。
@@ -68,7 +70,7 @@
 
 ## バージョン方針（P1-1・設計レビュー・2026-09-28 オーナー決定）
 
-ホスト側 CLI と microVM ゲストは別ビルドになり得るため、`version` フィールドでワイヤー形式の版ずれをフレームごとに検出する。ワイヤー形式（ヘッダ・フレーム全体のバイトレイアウト）を変える変更は必ず `PROTOCOL_VERSION` を上げる。MVP ではネゴシエーション（Hello 交換）は行わず、`FrameHeader::from_bytes` が受信した `version` と自分自身の `PROTOCOL_VERSION` を比較し、不一致を `UNIMPLEMENTED` として返す（message に受信 `version` と対応 `PROTOCOL_VERSION` の両方を含める）。ネゴシエーションが必要になった場合（複数バージョンの相互運用が要件化した場合）は別途設計する。
+ホスト側 CLI と microVM ゲストは別ビルドになり得るため、`version` フィールドでワイヤー形式の版ずれをフレームごとに検出する。ワイヤー形式（ヘッダ・フレーム全体のバイトレイアウト）を変える変更は必ず `PROTOCOL_VERSION` を上げる。MVP ではネゴシエーション（Hello 交換）は行わず、`FrameHeader::from_bytes` が受信した `version` と自分自身の `PROTOCOL_VERSION` を比較し、不一致を `UNIMPLEMENTED` として返す（message に受信 `version` と対応 `PROTOCOL_VERSION` の両方を含める）。ネゴシエーションが必要になった場合（複数バージョンの相互運用が要件化した場合）は別途設計する。ファイル操作要求の追加に伴う v2 への繰り上げは設計確定済みで、実装 issue（#3161）で行う（F2）。
 
 ## チェックサムアルゴリズム: CRC-32C（Castagnoli）
 
@@ -249,7 +251,7 @@ BREAK-2 検出経路の整理:
 
 - `WireRequestId`（非公開フィールド。`RequestId` からのみ構築できる）がワイヤー表現を担う。`RequestId` が内部に持つ発行元キュー識別子（`QueueId`）はメモリ内の区別にのみ使い、ワイヤー上には一切現れない（TASK-12.1 の契約を維持する）
 - `encode_request` / `decode_request`（`Write`・`Flush` 用）、`encode_ack` / `decode_ack`（`Ack`・`FlushAck` 用）が公開 API。種別違反・長さ違反は構築前に検証し、`Frame::decode` 系のアロケーション前検証（TASK-83.2）を壊さない
-- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）
+- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）。ただしファイル操作モード（設計確定済み・未実装。#1886）に限り、`Ack` 自体は status を持たないまま、失敗を別の種別 `Nack` で返す（F8）
 - `PROTOCOL_VERSION` は `1` のまま据え置く。ペイロードはこれまで意味づけされていない不透明なバイト列だったため、本節が初めてその形式を定めるのであり、ヘッダ・フレーム全体のバイトレイアウトは変わっていない
 
 ### 送信（`PipelineClient::send`）
@@ -297,7 +299,7 @@ BREAK-2 検出経路の整理:
 
 ### 書き込み先（ワイヤーにパスがない）
 
-`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式（TASK-14 が前提とする）は、今後の I/O 契約拡張として別途検討する。
+`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式は、別モード（ファイル操作モード）として設計確定済み・未実装である（[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・REPAIR-3）。本節の単一 sink モードの意味論は変わらない。
 
 ### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
 
@@ -367,14 +369,219 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
-- クライアント側の UDS `connect` と `PipelineClient` との本番結合
+- クライアント側の UDS `connect` と `PipelineClient` との本番結合（設計は確定済み・未実装。[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・実装は #3165・#3162）
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み
 - 未フラッシュ滞留量の上限のクライアント側計測・自動 Flush 送出、`--unflushed-max-*` の CLI バイナリ配線（TASK-79）・TOML 読み込み（TASK-82）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
-- ファイル操作を表すペイロード形式（パス・rename・truncate。TASK-14 の前提。I/O 契約の拡張にあたる）
+- ファイル操作を表すペイロード形式のうち、作成・追記・Close・Nack は設計確定済み・未実装（上記の新しい節・実装は #3161・#3163）。rename・truncate・unlink・mkdir 単独・readdir・getattr は範囲外のまま（spec への確認事項 (a)）
 - Windows のトランスポート（`windows-sys` の依存承認が必要）
+
+## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
+
+ステータス: 設計確定・未実装（REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+
+### 背景
+
+現行（v1）の `Write` は `[request_id][body]` だけでパスを持たず、書き込み先は 1 接続につき 1 つの `BatchSink`（`AppendFileSink`）に固定される。ファイルを作る入口はサーバー側 API の `GuestFileCreator::create_file` しかなく、1 本の接続で多数のファイルを作る経路がない。また、クライアント側の UDS `connect` と `PipelineClient` の本番結合がない（vsock の `VsockConnection::connect` はある。named pipe は無い）。このため TASK-23（#107・IO-6）の実測と、TASK-189 のハーネスのワイヤー経路への切り替え（#2074）が止まっている。
+
+spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き込みリクエストを「ID・パス・データ」と定義しており、要求にパスを載せることは IO-1 と整合する。IO-2 の期待は永続化を Linux では `syncfs(2)` またはファイル単位の fsync とディレクトリの fsync と書き、FLUSH ACK にディレクトリエントリの永続化を含めることを裏づける。
+
+### F1 範囲
+
+- 範囲に入れる: ファイルの新規作成（`O_EXCL` 相当）、作成したファイルへの追記、ハンドルの解放（Close）、要求単位の失敗応答（Nack）、複数ファイルにまたがる FLUSH、UDS クライアントの connect
+- 範囲に入れない: 既存ファイルを開く要求、オフセット指定の write、rename・truncate・unlink・mkdir 単独・readdir・getattr、接続全体のエラーを通知するフレーム（接続エラーは従来どおり EOF で、クライアントからは `Unavailable` に見える）、named pipe
+- #1828・#1830・#1831 の rename・truncate・同時読み取りの試験は、従来の定義（試験が書き込み先へ直接操作する）のままとし、本設計の範囲外とする
+
+### F2 版
+
+- `PROTOCOL_VERSION` を 1 から 2 へ上げる。受理する `FrameKind` の集合と ACK の意味（Nack）が変わるため、混在したビルドを最初のフレームで `UNIMPLEMENTED` として検出する
+- ネゴシエーション（Hello）は従来どおり行わない。v1 の相手は `UNIMPLEMENTED` で接続を終える（既存の `FrameHeader::from_bytes` の比較のまま）
+- ヘッダ 10 バイトとトレーラのレイアウトは変えない
+
+### F3 接続のモード
+
+モードはサーバー側の入口で決まり、ワイヤー上では宣言しない。
+
+| モード | 入口 | 受理する種別 |
+| ------ | ---- | ------------ |
+| 単一 sink モード | 既存の `serve_connection` 系 | `Write`・`Flush` |
+| ファイル操作モード | 新設の `serve_file_connection` 系 | `Create`・`WriteFile`・`Close`・`Flush` |
+
+- 単一 sink モードの意味論は v1 と同一で、platform-macos はこちらを使い続ける
+- モードに合わない種別を受けたら、接続全体の `INVALID_ARGUMENT` として接続を終える
+
+### F4 FrameKind（v2）
+
+| 値 | 種別 | 向き | ペイロード |
+| -- | ---- | ---- | ---------- |
+| 1 | `Write` | C→S | `[id u64][body]`（単一 sink モードのみ） |
+| 2 | `Ack` | S→C | `[id]` 8 B |
+| 3 | `Flush` | C→S | `[id]` 8 B |
+| 4 | `FlushAck` | S→C | `[id]` 8 B |
+| 5 | `Create` | C→S | `[id u64][path_len u16 LE][path: UTF-8 path_len B]` |
+| 6 | `WriteFile` | C→S | `[id u64][handle u64][body]` |
+| 7 | `Close` | C→S | `[id u64][handle u64]` 16 B |
+| 8 | `Nack` | S→C | `[id u64][code u8][reason u16 LE]` 11 B |
+
+- 9〜255 は未知値として `INVALID_ARGUMENT` にする。将来のファイル操作（open・rename・truncate・unlink・mkdir・readdir・getattr）は 9 以降に置くが、値は固定せず、追加するときに版を上げる
+- 長さの検証: `Create` は `payload_len == 10 + path_len` かつ `1 ≤ path_len ≤ 4096`。`WriteFile` の body は 1 バイト以上 `MAX_PAYLOAD_LEN - 16` 以下で、空の body は構造違反として拒否する（空ファイルは Create と Close だけで作る）。`Close` と `Nack` は固定長
+- 検証はアロケーション前に行う（TASK-83.2 の順序を壊さない）
+
+### F5 パスの表現と検証の分担
+
+- 表現はゲスト相対パス。区切りは `/`、UTF-8 必須
+- 構文の上限（新設の定数）: `MAX_GUEST_PATH_BYTES` = 4096（既存）、`MAX_GUEST_PATH_COMPONENTS` = 256、`MAX_GUEST_NAME_BYTES` = 255
+- 構文規則は新設の newtype `GuestPath` に 1 か所で集める（REPAIR-2）。拒否するもの: NUL、先頭の `/`（絶対パス）、空のコンポーネント、`.`・`..`、`\` と `:`（`guest_files.rs` の既存規則を移す）、上限超過。`GuestPath` は client・payload・`GuestFileCreator::create_file` の 3 者が同じ関数で検証する
+- 検証の層
+  - 復号時（純関数・OS 非依存）: 長さと UTF-8 だけを見る。違反はフレーム構造の違反として接続全体を失効させる
+  - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
+  - `GuestFileCreator` 内: IO-5 の規則（大文字小文字・NFC / NFD の衝突、ホストパス長）を適用する。ディスクの状態に依存するため、ここで行う
+- ホストパス長（260）: Windows ホストではエラー（Nack `INVALID_ARGUMENT`、reason `HostPathTooLong`）。その他の OS では観測イベント（警告）のみで作成を続ける（npm の深いパスを Linux / macOS で拒否しないため）
+- 閉じ込め: 既存の `*_beneath`（`openat` + `O_NOFOLLOW`）だけを使い、ワイヤーのパスを `Path::join` に渡さない。祖先が symlink、またはディレクトリでなかった場合は Nack `INVALID_ARGUMENT`（reason `EscapesRoot` / `NotADirectory`）
+
+### F6 ハンドル
+
+- ハンドルは、その `Create` フレームの request id（u64）そのものとする。クライアントは Create の送信時点でハンドルを知っているため、Create の ACK を待たずに `WriteFile` / `Close` をパイプライン送信できる。この保証は「サーバーが 1 接続のフレームを受信順に同期的に実行する」ことに由来する
+- request id は接続内で単調増加なので、ハンドルは再利用されない。採番器を別に持たない
+- クライアント側の型は `FileHandle { queue: QueueId, wire: WireRequestId }`。別の `PipelineClient` のハンドルを渡したら、送信前に `InvalidArgument` で拒否する
+- サーバーの表 `FileTable`: 1 接続で同時に開ける数は `MaxOpenFiles`（既定 256、範囲 1〜4096）。満杯のときの Create は Nack `RESOURCE_EXHAUSTED`（reason `OpenFilesLimit`）
+- 失敗した Create は表に入れない（tombstone を持たない）。その後に同じハンドル宛てに届く `WriteFile` / `Close` は Nack `INVALID_ARGUMENT`（reason `UnknownHandle`）で、クライアントはそれより前に届く Create の Nack（FIFO）で失敗を知る。失敗したハンドルの Close は省いてよい
+
+### F7 バッチと実行順
+
+- `BatchBuffer` を `Create`・`WriteFile`・`Close` も積めるように拡張する。バイトの計上は `WriteFile` が body、`Create` が path のバイト数
+- 発火条件は変えない（件数到達・バイト上限到達・`Flush`・IO-10 の自動フラッシュ）
+- 発火したバッチは受信順に 1 件ずつ実行し、応答（`Ack` / `Nack`）も受信順に返す。1 バッチは複数のファイルにまたがってよい
+- 同期実行なので、`ReceiveLimits::admit` へ渡す `pending_frames = 0` の不変条件（上記「受信上限」節）は保たれる
+
+### F8 ACK・Nack の意味
+
+- `Create` / `WriteFile` / `Close` の `Ack` は IO-1 と同じ「バッファリング時点」の保証にとどまる。Create の Ack は名前空間にファイルが存在し他の reader から見えるまでで、永続化は保証しない。Close の Ack はハンドルの解放だけを表し、close 時に fsync はしない
+- `Nack` は「その要求は効果を持たない」ことを表す。Create の Nack では葉を作らない（既存の取り消しの手順）。ただし新設した空の祖先は残りうる
+- 「ACK に status バイトを持たせない」は `Ack` 自体については維持する。ファイル操作モードに限り失敗を別の種別 `Nack` で返すことで、その決定を上書きする
+
+### F9 FLUSH の保証範囲（IO-2）
+
+- 範囲: 同じ接続で `Flush` より前に受信し、`Ack` を返した要求のすべて。Create したファイルのディレクトリエントリ、Create が新設した祖先ディレクトリのエントリ、`WriteFile` のデータとメタデータ（Close 済みのハンドルの分も含む）
+- 範囲外: 別の接続、Nack された要求、`Flush` より後に受信した要求
+- Linux
+  - 接続ごと・デバイス（`st_dev`）ごとに番兵 fd を 1 本持ち、FLUSH ではデバイスごとに 1 回 `syncfs(番兵)` を発行する
+  - 番兵 fd は、そのデバイスで最初の Create の時点で、親ディレクトリのハンドルから `openat(parent, ".", O_DIRECTORY)` で新しく開く（新しい `struct file`）。その接続での最初の書き込みより前に開かれ、カーソルは自分の `syncfs` でしか進まないため、errseq の報告漏れが無い。既存の「sink ごとに自分の fd で発行し、他の sink の結果を流用しない」という理由づけと矛盾しない
+  - 番兵 fd は接続間で共有しない。他プロセスの書き戻しエラーを拾った場合は FlushAck を返さない側に倒れる（fail-closed）
+  - 1 接続のデバイス数の上限は 16。超えた Create は Nack `RESOURCE_EXHAUSTED`（reason `DeviceLimit`）
+  - Linux 5.8 未満は従来どおり `Unimplemented`
+- macOS / Windows: 汚れたファイル（開いているもの・保持中の Close 済みのもの）ごとに `F_FULLFSYNC` / `FlushFileBuffers` を発行し、汚れたディレクトリ（作成した葉の親、新設した祖先の親）のハンドルも同期する。ディレクトリハンドルは `create_file` の祖先ハンドルを使う。デバイスごとに 1 回の full flush への最適化は範囲外とし、MAC-3 の計測への注記を残す
+- Close 済みで未永続化のファイルの fd は、次の永続化まで保持する。保持数の上限 `MaxRetainedDirtyFiles` は既定 1024、範囲 1〜4096。上限に達したら IO-10 と同じ自動フラッシュを行う（FlushAck は送らない）
+- 1 回の FLUSH 全体を、既存の `flush_timeout`（既定 10 秒）と `MaxConcurrentPersist` の 1 枠の中で実行する。helper スレッドが手順を順に回す
+- 発行後の失敗は従来どおり接続全体の失敗として扱う。FlushAck を返さず、状態を破棄する
+- IO-10 の計上: `Create`・`WriteFile`・`Close` をそれぞれ未フラッシュの 1 フレームとして数える
+
+### F10 エラーの範囲
+
+- 要求単位（Nack を返し、接続は続ける）
+  - `INVALID_ARGUMENT`: パスの構文、`EscapesRoot`、`NotADirectory`、`UnknownHandle`、Windows の `HostPathTooLong`
+  - `ALREADY_EXISTS`: `Exists`、`CaseCollision`、`NormalizationCollision`
+  - `RESOURCE_EXHAUSTED`: `OpenFilesLimit`、`DeviceLimit`、`TrackedPathsLimit`
+- 接続全体（応答を返さずに終える。既存の D5・D6・P1-3 と同じ）: フレームの破損、版の不一致、未知の種別またはモードに合わない種別、ペイロード構造の違反、`write()` の I/O エラー（ENOSPC・EIO など。部分書き込みで状態が不定になるため）、`create_file` の `Internal`（再検証や取り消しの失敗）、persist の失敗
+- 接続全体の失敗がバッチの途中で起きたときは、そのバッチの応答を 1 件も返さない。すでに実行した Create の結果は「不定」とする
+- Nack の `code`（u8）は 1 = `InvalidArgument`、2 = `AlreadyExists`、3 = `ResourceExhausted` の 3 つだけ。クライアントは未知の code を受けたらプロトコル違反として接続を失効させる
+- `reason`（u16）の値表
+
+| 値 | reason |
+| -- | ------ |
+| 1 | `PathSyntax` |
+| 2 | `HostPathTooLong` |
+| 3 | `CaseCollision` |
+| 4 | `NormalizationCollision` |
+| 5 | `Exists` |
+| 6 | `EscapesRoot` |
+| 7 | `NotADirectory` |
+| 8 | `UnknownHandle` |
+| 9 | `OpenFilesLimit` |
+| 10 | `DeviceLimit` |
+| 11 | `TrackedPathsLimit` |
+
+- reason は情報目的で、未知の値は `Other(u16)` として受理する。追加しても版は上げない
+- Nack は自由文字列を持たず、ホストのパスや入力のパスをワイヤーへ返さない。詳細はサーバー側の観測へ、既存のサニタイズと上限（`display_sanitize`・`MAX_COLLISION_MESSAGE_PATH_*`）の範囲で出す
+
+### F11 サーバー側の構造
+
+- 新設するもの: `serve_file_connection` 系（既定の上限版・上限指定版・計装版。既存の 3 種に揃える）、接続ごとの `FileTable`、番兵 fd の表、保持中の Close 済みファイルの表
+- 既存の `BatchSink` トレイト・`serve_connection`・`AppendFileSink` の公開シグネチャは変えない。`GuestFileCreator::create_file` の公開シグネチャも変えず、Nack の reason は crate 内の分類関数（`pub(crate)`）から得る
+- 上限（暫定）: `MaxOpenFiles` 256、`MaxRetainedDirtyFiles` 1024、デバイス 16、パスの 3 定数（F5）
+
+### F12 クライアント側
+
+- `PipelineClient` に `create(&GuestPath, timeout) -> FileHandle`・`write_file(FileHandle, &[u8], timeout)`・`close(FileHandle, timeout)` を足す。汎用の `send(kind, ...)` で 5〜8 を指定したら `RejectedInvalidFrameKind` にする（型つき API を経由させる）
+- `recv_ack`: `Nack` を受けてよいのは元の要求が `Create` / `WriteFile` / `Close` のときだけで、`AckReceipt::Rejected(RejectedRequest { request, code, reason })` を返し接続は失効させない。`Write` / `Flush` への `Nack` はプロトコル違反として失効させる。Create などへの `Ack` は通常 ACK（`AckReceipt::Write`）として返す
+- UDS の connect: `UdsClientConnection::connect(path, timeout: IoTimeout, policy: UdsServerPolicy, limits: ReceiveLimits, observer)`（Linux / macOS。その他の OS は `Unimplemented`）
+  1. `lstat` で、ソケットであること、symlink でないこと、所有者が `policy` の uid であることを確かめる。親ディレクトリは symlink でなく、group / other が書き込めないこと。サーバー側の bind 検査に揃える（多層防御）
+  2. `sys` に新設する期限つきの非ブロッキング connect で接続する（vsock の `connect_nonblocking_until` に揃える）。`sun_path` の長さを超えるパスと抽象ソケットは `InvalidArgument`
+  3. 接続後に `sys::peer_uid` でサーバーの uid を照合する。不一致なら切断して `InvalidArgument` とし、観測へ拒否イベントを出す。これが正の検証で、1 のパス検査は補助
+  4. 以後の送受信は `stream_io` のフレーム単位の期限、P1-3 の poison、`SplitTransport` の各契約に従う
+  5. 受信は `Ack` / `FlushAck` / `Nack` に限る。受信上限はクライアント用に小さく取る（ペイロードは 16 バイト以下）
+- `UdsServerPolicy` は `exact_uid(u32)` と `same_effective_uid()` だけを持ち、全許可は作らない。エラーの写像は ENOENT と ECONNREFUSED が `Unavailable`、期限切れが `Timeout`
+- vsock は同じ形にする。`VsockConnection` の ClientSide の受信フィルタに `Nack` を足し、`PipelineClient` へ同じように渡せるようにする
+- named pipe は範囲外。Windows ホストの経路は WSL2・hvsock 側（[windows-execution-layout.md](windows-execution-layout.md)）で、将来扱う場合は依存の承認が要るため別 issue とする
+
+### F13 観測（REPAIR-4）
+
+- クライアント側: `AckOutcome` に `Rejected` を足し、code 別・reason 別の件数を数える。connect の拒否（uid の不一致）は観測へ通知する
+- サーバー側（`FileServeStats`）: create の成功数、reason 別の Nack 数、同時に開いているハンドル数の最大値、保持中ファイル数の最大値、FLUSH 1 回あたりのデバイス・ファイル・ディレクトリの数、自動フラッシュの回数
+- 計装: `IoOpKind::Create`（安定名 `"create"`）を足す
+
+### F14 試験
+
+テスト名にビヘイビア ID を付ける。
+
+- 整合性スイート（UDS の実ソケット越し）
+  - IO-4: N ファイルの作成、write、FLUSH の後、close-to-open で内容が一致する
+  - IO-1: Create の ACK より前に WriteFile を送れる
+  - IO-5: `Foo` / `foo` の衝突が Nack になり、他のハンドルは影響を受けない
+  - 失敗したハンドルへの WriteFile が `UnknownHandle` になる
+  - K ファイルごとの FLUSH で、バッチが複数ファイルにまたがっても順序が保たれる
+  - `OpenFilesLimit` の Nack の後、Close すると再び作成できる
+  - パストラバーサル（`..`・絶対パス・`\`・`:`・symlink の祖先）が Nack になり、共有ルートの外に何もできない
+  - 接続全体の失敗がバッチの途中で起きると、応答が 0 件になる
+- payload: v2 の各種別の golden vector と境界長の拒否
+- 版: v1 のヘッダが `UNIMPLEMENTED` になる
+- IO-3（crash_safety）: FlushAck を受けた直後の SIGKILL で、複数ファイルと新設ディレクトリが失われない
+- REPAIR-7: UDS クライアント経路の BREAK-1（`Timeout`）と BREAK-2（`DataLoss`）
+- UDS クライアントの uid 照合: 期待 uid と違う policy での拒否は CI で回せる。別ユーザーの実サーバーへの接続は root が要るので実機前提とし、人間担当に分ける
+
+### BREAK-1 / BREAK-2 への影響
+
+検出機構（`recv_ack` の期限、トレーラの CRC）は変わらない。版を上げると golden vector と本書のエンコード例（`01 01 03 ...`）が変わるため、版上げの実装 issue（#3161）で更新する。[break-detection-ci-report.md](break-detection-ci-report.md) は過去の記録なので書き換えず、影響は本書にだけ書く。
+
+### 実装 issue 一覧
+
+親 #3158（親 #63 配下・phase:12）。順序と依存は次のとおり。
+
+| issue | 内容 | 依存 |
+| ----- | ---- | ---- |
+| #3159 | `GuestPath` の切り出し（IO-5・REPAIR-2） | #1886 |
+| #3160 | ホストパス長の検査（IO-5） | #3159 |
+| #3161 | v2 の符号化と復号（IO-1・REPAIR-2。BREAKING CHANGE） | #3159 |
+| #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4） | #3161 |
+| #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |
+| #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163 |
+| #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5） | #3161 |
+| #3166 | 整合性スイート（IO-4・TASK-14） | #3162・#3164・#3165 |
+| #3167 | crash_safety・break_detection（IO-3・REPAIR-7） | #3164・#3165 |
+
+下流の #2074（TASK-189 のワイヤー経路への切り替え）は #3162・#3164・#3165 に依存する。各 issue の受け入れ条件に、該当モジュールの REPAIR-3 の記述の更新を含める（`lib.rs`・`guest_files.rs`・`writeback.rs`・`client.rs`・`vsock.rs`）。
+
+### spec への確認事項（オーナーへ報告。本リポでは決めない）
+
+- (a) IO-1 の一覧に rename・truncate・unlink・mkdir が無く、readdir / getattr にはビヘイビア ID が無い。これらをどのビヘイビアと TASK が持つか（TASK-14 は試験スイート）
+- (b) IO-2 の FLUSH ACK の範囲を「1 接続内の複数ファイルとディレクトリエントリ。接続はまたがない」と読んでよいか（文言の「ディレクトリの fsync」と整合）
+- (c) IO-6 の判定に、サーバー側 API の直接計測の値を使ってよいか（TASK-23 で未決）
+- (d) 本設計の `Nack` は、プロトコルメッセージ一覧に無い応答の種別にあたる。一覧へ追記するか
+- (e) TASK-23 と TASK-24 が互いを待つ問題は spec #14（TASK-189）で解消済みで、対応不要
+
+回答次第で本節を見直す。
 
 ## 見直し
 

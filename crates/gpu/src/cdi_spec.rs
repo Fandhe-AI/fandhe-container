@@ -29,10 +29,29 @@
 //! 適用は net crate の責務でありまだ無い。そのため型付きで解析・検証した上で、1 件でもあれば
 //! [`parse_cdi_spec`] が `Unimplemented` で spec 全体を拒否する（要求されないデバイスにだけあっても拒否する）。
 //!
+//! `kind`・デバイス名・`permissions` の形式検査（#2984・GPU-1・SEC-1）: 上流と判定を揃える。対象版は
+//! `cncf-tags/container-device-interface` v1.1.1（commit `cb98bcf66dc68530012483bd56e33e14d815e167`）。
+//! - `kind`: 最初の `/` で `vendor` と `class` に分け（`pkg/parser/parser.go` `ParseQualifier` L106-112）、
+//!   どちらも空でなく、`validateVendorOrClassName`（同 L145-169）を満たすこと。先頭は ASCII 英字、中間は ASCII 英数字と
+//!   `_` `-` `.`、末尾は ASCII 英数字（1 文字なら英字のみで可）。`:` と 2 つ目以降の `/` は不可。
+//!   検査の順は `ValidateVersion` → vendor → class（`pkg/cdi/spec.go` L114, L219-234）。
+//! - デバイス名: `ValidateDeviceName`（`parser.go` L176-214。`pkg/cdi/device.go` L69-72）。先頭は ASCII 英数字、
+//!   中間は ASCII 英数字と `_` `-` `.` `:`、末尾は ASCII 英数字。許可集合が ASCII だけなので、Go のバイト／rune 走査と
+//!   Rust のバイト走査の判定は同じ（非 ASCII はどちらも拒否）。
+//! - `permissions`: 省略・空文字・`none`（完全一致）、または全文字が `r` `w` `m` のいずれか（重複・順序は問わない）
+//!   （`pkg/cdi/container-edits.go` L46-47, L331-355）。`none` は v1.1.1 で入ったが版の要件は無い
+//!   （`SPEC.md` L37）ので `cdiVersion` に関係なく受ける。意味（省略・空は `rwm`、`none` は権限なし。`type` が `b` `c` のときだけ
+//!   cgroup の規則になる。同 L113-121、`SPEC.md` L143）の反映は TASK-129.1（#560）で、ここは値の形だけを見る。
+//! - `SPEC.md`（L195-204, L213-215）の文章（name segment 63 文字以下・prefix 253 文字以下・デバイス名に `:` なし）は
+//!   上流のコードが強制していない、または食い違う。コードに従い、長さの上限は足さず、デバイス名の中間の `:` は受ける。
+//! - 上流にあるが本リポが意図して足さない検査: devices 0 件・同名デバイスの重複・device の edits が空・annotations・
+//!   `hookName` の許可値（本リポの集計設計と食い違うため）。
+//!
 //! 責務境界（将来仕様。REPAIR-3）:
 //! - 本モジュールは構文・型・未知フィールド・重複キー・資源上限の検査までを行う。
-//!   `kind` / `name` の形式検査（最小の版の判定に要る分解だけは行う）、パスの絶対性、`hookName` の許可値などの意味検証は行わない
-//!   （TASK-126.2 以降・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
+//!   `kind` / `name` の形式と `deviceNodes[].permissions` の値は本モジュールが検査する（#2984。下の節）。
+//!   パスの絶対性・正規形（#2978・#2979）、`type` の値（#2979）、`hookName` の許可値などの意味検証は行わない
+//!   （適用層・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
 //! - `/var/run/cdi` の所有者・権限の検証、ディレクトリ走査、名前から spec への解決は後続タスクで扱う。解決済みの
 //!   (spec, 名前) の列の集計は `cdi_edits::aggregate_container_edits_across_specs`（TASK-126.2・GPU-1）が担う。
 //! - 未知フィールドは全構造体で拒否する（fail-closed）。将来の CDI 版で増えたフィールドを受けるには
@@ -230,7 +249,7 @@ impl fmt::Debug for EnvList {
 pub struct CdiSpec {
     /// `cdiVersion`（[`parse_cdi_spec`] が既知の版と、使っているフィールドに対する最小の版を検証する。モジュール doc 参照）。
     pub cdi_version: String,
-    /// `kind`（`vendor/class`。形式検査は TASK-126.2 以降）。
+    /// `kind`（`vendor/class`。形式は [`parse_cdi_spec`] が検査する。モジュール doc 参照。#2984）。
     pub kind: String,
     /// 任意の注釈。
     #[serde(default)]
@@ -247,7 +266,7 @@ pub struct CdiSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CdiDevice {
-    /// デバイス名（文字種の検証は TASK-126.2 以降）。
+    /// デバイス名（文字種は [`parse_cdi_spec`] が検査する。モジュール doc 参照。#2984）。
     pub name: String,
     /// 任意の注釈。
     #[serde(default)]
@@ -317,7 +336,8 @@ pub struct DeviceNode {
     /// ファイルモード。
     #[serde(default)]
     pub file_mode: Option<u32>,
-    /// cgroup device の権限（`rwm` の部分集合）。
+    /// cgroup device の権限。省略・空文字・`none`、または `r` `w` `m` だけの文字列を受ける（#2984）。
+    /// 省略・空は `rwm`、`none` は権限なしの意味で、反映は TASK-129.1（#560）。
     #[serde(default)]
     pub permissions: Option<String>,
     /// 所有 UID。
@@ -435,6 +455,7 @@ fn classify(err: &serde_saphyr::Error) -> CdiSpecError {
 /// 構文の検査に続けて、次の順で検査する（#2445・#2597・GPU-1）。
 /// 1. `cdiVersion` が既知の版でない、または使っているフィールドの最小の版（`netDevices` なら 1.1.0）より古ければ
 ///    `InvalidArgument`（モジュール doc 参照）
+///    （続けて）`kind`・デバイス名・`deviceNodes[].permissions` の形式が不正なら `InvalidArgument`（#2984。1 の直後）
 /// 2. 各 `containerEdits` の名前（15 バイト以下・`.` `..` `/` `:` 空白 NUL 不可。`fandhe-container-net` の
 ///    `IfName::new` と同じ規則）と、1 つの edits 内の `hostInterfaceName`・`name` の重複を検査し `InvalidArgument`
 /// 3. 検査を通っても適用が未実装のため `Unimplemented`（spec 単位。REPAIR-3）
@@ -452,6 +473,7 @@ pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
 pub(crate) fn parse_cdi_spec_unchecked(input: &str) -> Result<CdiSpec, CdiSpecError> {
     let spec = parse_structure(input)?;
     validate_cdi_version(&spec)?;
+    validate_kind_names_permissions(&spec)?;
     validate_net_devices(&spec)?;
     Ok(spec)
 }
@@ -631,6 +653,87 @@ fn is_valid_interface_name(name: &str) -> bool {
         && !name
             .chars()
             .any(|c| c == '/' || c == ':' || c == '\0' || c.is_whitespace())
+}
+
+/// `kind` の `vendor` / `class` 共通の名前規則（上流 `validateVendorOrClassName`）。
+fn is_valid_vendor_or_class(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (Some(first), Some(last)) = (b.first(), b.last()) else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    if !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+}
+
+/// `vendor/class` 形式（最初の `/` で分ける）。
+fn is_valid_kind(kind: &str) -> bool {
+    kind.split_once('/')
+        .is_some_and(|(v, c)| is_valid_vendor_or_class(v) && is_valid_vendor_or_class(c))
+}
+
+/// デバイス名の規則（上流 `ValidateDeviceName`）。
+fn is_valid_device_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (Some(first), Some(last)) = (b.first(), b.last()) else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    if !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':'))
+}
+
+/// `deviceNodes[].permissions` の値の規則（上流 `DeviceNode.Validate`）。
+fn is_valid_device_permissions(p: &str) -> bool {
+    p.is_empty() || p == "none" || p.bytes().all(|b| matches!(b, b'r' | b'w' | b'm'))
+}
+
+fn has_invalid_permissions(edits: &ContainerEdits) -> bool {
+    edits.device_nodes.iter().any(|n| {
+        n.permissions
+            .as_deref()
+            .is_some_and(|p| !is_valid_device_permissions(p))
+    })
+}
+
+/// `kind`・デバイス名・`deviceNodes[].permissions` の形式を検証する（#2984・GPU-1・SEC-1）。
+/// 上流の順（kind → トップレベルの edits → 各デバイスの名前と edits）に見る。メッセージは固定文言で入力の値を載せない。
+/// 逆シリアライズ後の検査のため、エラーの行・列は `None`。`parse_cdi_spec` が呼ぶほか、parse を通らずに作られた
+/// [`CdiSpec`] に備えて `cdi_edits` の集計も呼ぶ。
+pub(crate) fn validate_kind_names_permissions(spec: &CdiSpec) -> Result<(), CdiSpecError> {
+    let bad = |msg: &str| CdiSpecError::new(CdiSpecErrorCode::InvalidArgument, msg);
+    const PERM: &str = "CDI deviceNodes entry has invalid permissions";
+    if !is_valid_kind(&spec.kind) {
+        return Err(bad("CDI kind is not a valid vendor/class"));
+    }
+    if has_invalid_permissions(&spec.container_edits) {
+        return Err(bad(PERM));
+    }
+    for d in &spec.devices {
+        if !is_valid_device_name(&d.name) {
+            return Err(bad("CDI device name is invalid"));
+        }
+        if has_invalid_permissions(&d.container_edits) {
+            return Err(bad(PERM));
+        }
+    }
+    Ok(())
 }
 
 fn validate_net_devices(spec: &CdiSpec) -> Result<(), CdiSpecError> {
@@ -998,6 +1101,152 @@ mod tests {
     }
 
     const SECRET: &str = "DUMMY_SECRET_TOKEN_12345";
+
+    /// 受理する spec を `cdiVersion` / kind / 名前 / permissions（YAML 断片）を差し替えて作る。
+    fn spec_with(version: &str, kind: &str, name: &str, perm: Option<&str>) -> String {
+        let p = perm.map_or(String::new(), |p| format!("\n          permissions: {p}"));
+        format!(
+            "cdiVersion: \"{version}\"\nkind: \"{kind}\"\ndevices:\n  - name: \"{name}\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/x{p}\n"
+        )
+    }
+
+    fn expect_msg(input: &str, msg: &str) {
+        let e = parse_cdi_spec(input).expect_err(input);
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument, "{input}");
+        assert_eq!(e.message(), msg, "{input}");
+        assert_eq!((e.line(), e.column()), (None, None), "{input}");
+    }
+
+    const KIND_MSG: &str = "CDI kind is not a valid vendor/class";
+    const NAME_MSG: &str = "CDI device name is invalid";
+    const PERM_MSG: &str = "CDI deviceNodes entry has invalid permissions";
+
+    /// GPU-1・SEC-1・#2984: kind の受理。
+    #[test]
+    fn gpu1_sec1_2984_kind_accepts_valid() {
+        for k in [
+            "v/c",
+            "V/C",
+            "a/b",
+            "a.b/c",
+            "nvidia.com/gpu",
+            "example.com/serial",
+            "vendor.example/gpu",
+            "a1/b2",
+            "v.e/c-d.e_f",
+            "foo.bar.baz/foo-bar123.B_az",
+        ] {
+            parse_cdi_spec(&spec_with("0.6.0", k, "a", None)).expect(k);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: kind の拒否。
+    #[test]
+    fn gpu1_sec1_2984_kind_rejects_invalid() {
+        for k in [
+            "v",
+            "/c",
+            "v/",
+            "/",
+            "v//c",
+            "v/c/d",
+            "vendor.com/foo/",
+            "0v/c",
+            "v/0c",
+            "-v/c",
+            "v./c",
+            "v/c.",
+            "v/c-",
+            "v/c:d",
+            "v:x/c",
+            "v /c",
+            "v/c d",
+            "v=x/c",
+            "é/c",
+            "v/cé",
+        ] {
+            expect_msg(&spec_with("0.6.0", k, "a", None), KIND_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: デバイス名の受理。
+    #[test]
+    fn gpu1_sec1_2984_device_name_accepts_valid() {
+        for n in [
+            "a",
+            "0",
+            "9z",
+            "all",
+            "GPU-00000000-0000-0000-0000-000000000000",
+            "ttyusb0",
+            "bus001-dev002",
+            "a:b",
+            "A-b.c_d:e",
+        ] {
+            parse_cdi_spec(&spec_with("0.6.0", "v/c", n, None)).expect(n);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: デバイス名の拒否。
+    #[test]
+    fn gpu1_sec1_2984_device_name_rejects_invalid() {
+        for n in [
+            "", "-a", "_a", ".a", ":a", "a-", "a.", "a:", "a_", "a b", "a/b", "a=b", "a\\tb", "aé",
+            "é",
+        ] {
+            expect_msg(&spec_with("0.6.0", "v/c", n, None), NAME_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: permissions の受理（`none` は古い版でも受ける）。
+    #[test]
+    fn gpu1_sec1_2984_permissions_accepts_valid() {
+        for p in [
+            "\"\"", "r", "w", "m", "rw", "rwm", "mwr", "rr", "rwmrwm", "none",
+        ] {
+            parse_cdi_spec(&spec_with("0.3.0", "v/c", "a", Some(p))).expect(p);
+        }
+        parse_cdi_spec(&spec_with("0.3.0", "v/c", "a", None)).expect("omitted");
+    }
+
+    /// GPU-1・SEC-1・#2984: permissions の拒否（デバイスの edits とトップレベルの edits の両方）。
+    #[test]
+    fn gpu1_sec1_2984_permissions_rejects_invalid() {
+        for p in [
+            "x", "rwx", "R", "RWM", "None", "NONE", "nonee", " r", "r ", "r w", "r,w", "-", "rw\\n",
+        ] {
+            let q = format!("\"{p}\"");
+            expect_msg(&spec_with("0.3.0", "v/c", "a", Some(&q)), PERM_MSG);
+            let top = format!(
+                "cdiVersion: \"0.3.0\"\nkind: v/c\ncontainerEdits:\n  deviceNodes:\n    - path: /dev/x\n      permissions: {q}\n"
+            );
+            expect_msg(&top, PERM_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: エラーに入力の値を載せない。
+    #[test]
+    fn gpu1_sec1_2984_errors_do_not_leak_values() {
+        let inputs = [
+            spec_with("0.6.0", &format!("{SECRET}/c/d"), "a", None),
+            spec_with("0.6.0", "v/c", &format!("{SECRET} x"), None),
+            spec_with("0.6.0", "v/c", "a", Some(&format!("\"{SECRET}\""))),
+        ];
+        for i in inputs {
+            let e = parse_cdi_spec(&i).expect_err("invalid");
+            assert!(!e.message().contains(SECRET));
+            assert!(!e.to_string().contains(SECRET));
+        }
+    }
+
+    /// GPU-1・#2984: 版の検査が先（既存の版エラーのメッセージを変えない）。
+    #[test]
+    fn gpu1_2984_version_error_takes_precedence() {
+        let e = parse_cdi_spec(&spec_with("9.9.9", "bad", "-a", Some("x"))).expect_err("v");
+        assert!(e.message().contains("cdiVersion"), "{}", e.message());
+        let e = parse_cdi_spec(&spec_with("0.3.0", "v/c", "0a", None)).expect_err("v");
+        assert!(e.message().contains("0.5.0"), "{}", e.message());
+    }
 
     fn sample() -> String {
         format!(

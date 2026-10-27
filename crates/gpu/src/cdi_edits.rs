@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cdi_spec::{
     CdiSpec, CdiSpecError, CdiSpecErrorCode, ContainerEdits, DeviceNode, EnvList, Hook, IntelRdt,
     Mount, NetDevice, net_devices_unimplemented, validate_cdi_version,
+    validate_kind_names_permissions,
 };
 
 /// 1 回の集計で要求できるデバイス名の最大件数（重複を除く前の件数で数える）。
@@ -352,12 +353,13 @@ pub fn aggregate_container_edits_across_specs(
 /// `CdiSpec` は全フィールドが公開で `parse_cdi_spec` を通らずに作れるため、parse 側のゲートとは別に置く。
 /// 衝突する `netDevices` は `InvalidArgument` が先に返る。
 fn aggregate_requests(requests: &[CdiDeviceRequest<'_>]) -> Result<AggregatedEdits, CdiSpecError> {
-    // parse を通らずに作られた spec に備え、参照される spec ごとに 1 回 cdiVersion を検査する（GPU-1・REPAIR-3）。
+    // parse を通らずに作られた spec に備え、参照される spec ごとに 1 回 cdiVersion と kind・名前・permissions の形式（#2984）を検査する（GPU-1・REPAIR-3）。
     // 存在確認・曖昧名の判定より先に行う。
     let mut checked: BTreeSet<*const CdiSpec> = BTreeSet::new();
     for req in requests {
         if checked.insert(std::ptr::from_ref(req.spec)) {
             validate_cdi_version(req.spec)?;
+            validate_kind_names_permissions(req.spec)?;
         }
     }
     let aggregated = aggregate_requests_ungated(requests)?;
@@ -490,6 +492,29 @@ mod tests {
 
     fn spec(y: &str) -> CdiSpec {
         parse_cdi_spec(y).expect("fixture parses")
+    }
+
+    /// GPU-1・SEC-1・#2984: parse を通らずに書き換えられた kind・名前・permissions も集計が拒否する。
+    #[test]
+    fn gpu1_sec1_2984_aggregate_rejects_tampered_spec() {
+        let base = spec(
+            "cdiVersion: 0.5.0\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      deviceNodes:\n        - path: /dev/x\n",
+        );
+        let mut s = base.clone();
+        s.kind = "bad".into();
+        let mut n = base.clone();
+        n.devices[0].name = "-a".into();
+        let mut p = base.clone();
+        p.devices[0].container_edits.device_nodes[0].permissions = Some("rwx".into());
+        for (s, msg) in [
+            (s, "CDI kind is not a valid vendor/class"),
+            (n, "CDI device name is invalid"),
+            (p, "CDI deviceNodes entry has invalid permissions"),
+        ] {
+            let e = aggregate_container_edits(&s, &["a"]).unwrap_err();
+            assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+            assert_eq!(e.message(), msg);
+        }
     }
 
     fn two_part(dev: &str, top: &str) -> CdiSpec {

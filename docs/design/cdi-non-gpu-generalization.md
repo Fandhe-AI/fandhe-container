@@ -63,7 +63,7 @@ CDI の適用機構（GPU-1〜GPU-4）を GPU 以外の一般デバイス（USB�
 
 ### 観察事項・要追跡
 
-- `kind` / `name` の形式、`deviceNodes[].type` / `permissions` の値、パスの絶対性は解析層で検証していない（TASK-126.2 以降・TASK-127 の担当）。GPU か否かに関係なく残る課題で、一般デバイスを受ける前に必要になる
+- `kind` / `name` の形式と `deviceNodes[].permissions` の値は #2984 で解析層（`cdi_spec.rs`）が検証する。`deviceNodes[].type` の値は #2979、パスの絶対性・正規形は #2978・#2979 で適用層が検証済み。`permissions` の device cgroup への反映は TASK-129.1（#560）
 - spec ディレクトリの所有者の検査と hook の完全性（PLUG-11 と同型）は、非 GPU でも同じ前提になる。device cgroup（TASK-129）を入れずに一般デバイスを受けてはならない（受け入れ前の要件は [cri-devices-cdi.md](cri-devices-cdi.md)）
 - 上限値の根拠・`reopen_via_proc` の doc の GPU 寄りの文言は、コメントのみの直しで済む（本 PR では製品コードを変えていない）
 - 抜き差しで変わる minor が、許可リストで別のデバイスを許す・拒否するおそれ。major / minor は stat の値を正とする方針と整合させる

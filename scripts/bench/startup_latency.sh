@@ -25,7 +25,8 @@
 #     残存があれば消さずに残し、パスを stderr に出す。
 #   - start は rootless のみ（rootful は UNIMPLEMENTED）。delete は委譲スコープの外から実行すると
 #     cgroup を消せず exit 4 になるため、`systemd-run --user --scope -p Delegate=yes` の中で
-#     本スクリプトを実行する（手順は #3125）。delete は状態を消した後にログのロックを最大でおよそ
+#     本スクリプトを実行する（手順の全文は AGENTS.md「実機前提テスト」の `startup_latency.sh`
+#     の項目。要点は下記「実機での実行手順」）。delete は状態を消した後にログのロックを最大でおよそ
 #     20 秒待つため、--timeout で打ち切られても NOT_FOUND と state で削除済みと確定する。
 #   - CLI を経由する誤差は下記「CLI 経由の誤差（#3124）」を参照。method は
 #     "cli-create-to-exec-observed"（CLI 経由であることを値で示す）。
@@ -60,6 +61,18 @@
 #   報告するが、ワークロードの execve の完了は保証しない（launch 経路に exec 成功の通知が無い）。
 #   execve は観測点より後にずれ込み得る（docs/design/startup-latency-bench.md
 #   「CORE-10 の『プロセス実行開始』との差」・REPAIR-3）。
+#
+# 実機での実行手順（#213 向け・#3125。全文は AGENTS.md。未検証: 実機での通しは人間が行う）:
+#   - 計測全体を `systemd-run --user --scope -p Delegate=yes -- bash scripts/bench/startup_latency.sh ...`
+#     で包み、リポジトリのルートから実行する（rootless・非 root。sudo は使わない）。
+#   - CLI（fandhe-container）と supervisor だけを利用者所有の専用ディレクトリへ置く（docs/setup/linux.md
+#     「rootless」）。fandhe-container-launcher を CLI の隣に置かない（置くと rootful のランチャー経路が
+#     選ばれる。#2442・SUP-14）。置き場所とその祖先は g/o 書き込み不可にする。rootless の supervisor は
+#     CLI が検証しない運用規則である（REPAIR-3）。
+#   - 結果ファイルは本スクリプトを `--output <新規ファイル>` 付きで直接実行して作る。`make startup-latency`
+#     は実行コマンド行（絶対パス入り）を stdout に出し OUTPUT も受けないため、その stdout は
+#     report モードの入力にならない。docker・report は make で OUTPUT= を渡せる。
+#   - 終了後に /tmp/fcsl.*・user scope・/sys/fs/cgroup の fc-* の残骸が無いことを確かめる。
 #
 # CLI 経由の誤差（#3124・CORE-10。数値は書かない。実測と合否判定は #213・#230 で人間が行う）:
 #   oci モードは CLI を呼び出しごとに別プロセスで起動する（runc 等でも同じ）。区間内の呼び出しは

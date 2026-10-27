@@ -96,6 +96,39 @@ mod imp {
         let prev = unsafe { signal(SIGTERM, handler as usize) };
         prev != SIG_ERR
     }
+
+    /// 自前の FFI 宣言を dev-dependencies の `libc` と機械照合する（#1846・#1837・MVM-4・REPAIR-7・REPAIR-12。
+    /// 方式は docs/design/ffi-libc-check.md）。いずれもコンパイル時の `const` 検査で、関数は呼ばない。
+    ///
+    /// 外側の `imp` の cfg が（Linux の x86_64 / aarch64・macOS）に限っているため、各ターゲットでは
+    /// そのターゲットの `libc` の値と比べることになる。
+    ///
+    /// 対象外（FFI 宣言ではない）: `SIGTERM_RECEIVED`（`AtomicBool`）・`install` / `register` /
+    /// `install_sigterm_flag`（安全なラッパー）・上の幅の const assert（宣言の前提の検査）。
+    /// Linux の他アーキテクチャと Windows は `imp` が無く、照合する宣言も無い。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::{SIG_ERR, SIGTERM, on_sigterm, signal};
+
+        // 自前の `SIGTERM`（cfg で選ばれた 1 定義）をそのターゲットの `libc` の値と比べる。
+        const _: () = assert!(SIGTERM == libc::SIGTERM);
+
+        // `libc::sighandler_t` は `size_t`、自前は `usize` で同じ幅・同じ符号なし整数。
+        const _: () = assert!(SIG_ERR == libc::SIG_ERR);
+        const _: () = assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+
+        // 試験 `task116_5_win1_sigterm_number_is_15` 内のリテラル 15 の根拠を `libc` 側でも固定する。
+        const _: () = assert!(libc::SIGTERM == 15);
+
+        // `signal(3)` の型。`libc::signal` にも `link_name` の指定は無く、同じシンボルを指す。呼ばずに型だけ比べる。
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            signal;
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            libc::signal;
+
+        // `libc` は型付きのハンドラ型を持たない（`sighandler_t` は `size_t`）ため、引数の型だけを照合する。
+        const _: extern "C" fn(libc::c_int) = on_sigterm;
+    }
 }
 
 /// SIGTERM 受信フラグを登録して返す。接続前に 1 回だけ呼ぶ。

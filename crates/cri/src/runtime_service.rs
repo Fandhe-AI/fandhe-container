@@ -92,6 +92,10 @@
 //! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
 //! サブモジュール。
 //!
+//! **記録ストア（CRI-1・OCI-7。#2932）**: sandbox・コンテナの記録 1 件分のバイト列（`record` サブモジュール）を
+//! `<状態ルート>/.cri/records/` に 1 件 1 ファイルで置く層が `record_store` サブモジュール
+//! （トレイト [`RecordStore`] とファイル実装 `FileRecordStore`〔unix のみ〕）。配線は後続の単位（R4〜R9）。
+//!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
 //! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
@@ -100,6 +104,7 @@
 mod config_limits;
 mod container;
 mod record;
+mod record_store;
 mod runtime_config;
 
 use std::collections::hash_map::RandomState;
@@ -135,6 +140,14 @@ use container::{
 };
 use runtime_config::parse_pod_cidrs;
 
+#[cfg(unix)]
+pub use record_store::FileRecordStore;
+pub use record_store::{
+    DEFAULT_LIST_TIMEOUT, DEFAULT_RECORD_READ_TIMEOUT, ListBudget, ListLimits, ListedRecord,
+    MAX_CONTAINER_LISTING_BYTES, MAX_SANDBOX_LISTING_BYTES, NoopRecordStoreOpRecorder, RecordId,
+    RecordKind, RecordListing, RecordReadFailure, RecordStore, RecordStoreOp,
+    RecordStoreOpRecorder, RecordStoreOpSample, RecordStoreOutcome,
+};
 pub use runtime_config::{MAX_POD_CIDR_BYTES, MAX_POD_CIDRS, PodCidr, PodCidrs};
 
 pub use container::{ContainerLimits, MAX_CONTAINERS, MAX_RETAINED_CONTAINER_CONFIG_BYTES};

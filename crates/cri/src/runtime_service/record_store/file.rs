@@ -148,7 +148,12 @@ impl RecordStore for FileRecordStore {
                     "cri record target is not a regular file",
                 ));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // 記録が既に無くても親ディレクトリの同期を成功条件にする。前回の再試行で unlink
+            // 後の同期が失敗していた場合に、削除が永続化されないまま成功を返さないため（CRI-1）。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return sync_dir(self.dir(kind))
+                    .map_err(|_| CriError::internal("failed to remove the cri record"));
+            }
             Err(_) => return Err(CriError::internal("failed to remove the cri record")),
         }
         fs::remove_file(&target)
@@ -592,6 +597,18 @@ mod tests {
                 .len(),
             max as u64
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 記録が既に無い再試行でも親ディレクトリの同期を行い、同期できなければ失敗を返す（CRI-1）。
+    #[test]
+    fn cri1_record_store_remove_of_absent_record_still_syncs_directory() {
+        let root = temp_root("remove-absent-sync");
+        let store = FileRecordStore::open(&root).unwrap();
+        // 置き場を消すと同期（ディレクトリの open）が失敗する。NotFound 分岐でも成功扱いにならない。
+        fs::remove_dir_all(root.join(".cri/records/sandboxes")).unwrap();
+        let e = store.remove(RecordKind::Sandbox, &id(ID_A)).unwrap_err();
+        assert_eq!(e.message(), "failed to remove the cri record");
         fs::remove_dir_all(&root).unwrap();
     }
 

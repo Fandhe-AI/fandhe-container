@@ -354,7 +354,9 @@ fn run(mode: Mode) -> Result<(), ProbeError> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--serve" || a == "--client") {
+    // 自己試験は引数なしの場合に限る。それ以外（誤綴り・モード指定なし）は必ず parse_args で検証し、
+    // 不正なら ARGS・終了コード 2 で拒否する。
+    if !args.is_empty() {
         let outcome = parse_args(&args).and_then(run);
         if let Err(e) = outcome {
             eprintln!(
@@ -500,7 +502,7 @@ fn net3_timeouts() {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().expect("addr");
     let h = std::thread::spawn(move || {
-        let (s, _) = l.accept().expect("accept");
+        let s = accept_with_deadline(&l, Duration::from_secs(10)).expect("accept");
         std::thread::sleep(Duration::from_millis(1500));
         drop(s);
     });
@@ -513,7 +515,8 @@ fn net3_desync() {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().expect("addr");
     let h = std::thread::spawn(move || {
-        let (mut s, _) = l.accept().expect("accept");
+        let mut s = accept_with_deadline(&l, Duration::from_secs(10)).expect("accept");
+        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
         let mut b = [0u8; 1];
         if s.read_exact(&mut b).is_ok() {
             let _ = s.write_all(&[b[0].wrapping_add(1)]);
@@ -577,13 +580,17 @@ fn net3_loopback_via_processes() {
             .spawn()
             .expect("spawn client"),
     );
-    let mut cout = String::new();
-    client
-        .0
-        .stdout
-        .take()
-        .expect("client stdout")
-        .read_to_string(&mut cout)
+    // 出力収集も期限つき。子がハングしたら panic し、Guard の drop が子を kill して回収する。
+    let mut cstdout = client.0.stdout.take().expect("client stdout");
+    let (otx, orx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let r = cstdout.read_to_string(&mut buf).map(|_| buf);
+        let _ = otx.send(r);
+    });
+    let cout = orx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("client output not collected in time")
         .expect("read client stdout");
     let st = wait_exit(&mut client.0, Duration::from_secs(10));
     assert_eq!(st.code(), Some(0), "client output: {cout}");

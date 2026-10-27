@@ -754,10 +754,21 @@ mod tests {
         let root = temp_root("nonutf8");
         let store = FileRecordStore::open(&root).unwrap();
         let dir = root.join(".cri/records/sandboxes");
-        fs::write(dir.join(OsStr::from_bytes(b"\xff.rec")), b"x").unwrap();
-        fs::write(dir.join(OsStr::from_bytes(b"\xff.txt")), b"x").unwrap();
+        let rec = fs::write(dir.join(OsStr::from_bytes(b"\xff.rec")), b"x");
+        let txt = fs::write(dir.join(OsStr::from_bytes(b"\xff.txt")), b"x");
         let l = list_all(&store, RecordKind::Sandbox);
-        assert_eq!(l.unrecognized, 1);
+        if cfg!(target_os = "macos") {
+            // macOS（APFS・HFS+）は非 UTF-8 名の作成を EILSEQ（92）で拒否する。
+            // 名前が存在し得ないため列挙は空で、不正名の計上も起きない（fail-closed）。
+            for r in [rec, txt] {
+                assert_eq!(r.unwrap_err().raw_os_error(), Some(92));
+            }
+            assert_eq!(l.unrecognized, 0);
+        } else {
+            rec.unwrap();
+            txt.unwrap();
+            assert_eq!(l.unrecognized, 1);
+        }
         assert!(l.records.is_empty());
         fs::remove_dir_all(&root).unwrap();
     }

@@ -45,9 +45,9 @@ CDI の適用機構（GPU-1〜GPU-4）を GPU 以外の一般デバイス（USB�
 
 | 箇所 | GPU 固有の前提 | 非 GPU への影響 | 区分 |
 | ---- | -------------- | --------------- | ---- |
-| `crates/gpu/src/cdi_edits.rs` の `CDI_EDITS_MAX_REQUESTED_DEVICES`・`CDI_EDITS_MAX_DEVICE_NAME_BYTES` | 上限の根拠が nvidia.yaml の構成（GPU 16 基・MIG 7 分割・`GPU-` UUID 長） | 値は USB・シリアルでも足りる | 根拠 |
-| `crates/gpu/src/cdi_spec.rs` の入力上限 1 MiB | 根拠が「nvidia.yaml は数十 KiB」 | 非 GPU の spec は小さく問題なし | 根拠 |
-| `crates/gpu/src/cdi_spec.rs` の `reopen_via_proc` の doc | 「GPU 編集を飛ばすのを防ぐ」と書かれている | 挙動は汎用 | 文言 |
+| `crates/gpu/src/cdi_edits.rs` の `CDI_EDITS_MAX_REQUESTED_DEVICES`・`CDI_EDITS_MAX_DEVICE_NAME_BYTES` | 上限の根拠が nvidia.yaml の構成（GPU 16 基・MIG 7 分割・`GPU-` UUID 長） | 値は USB・シリアルでも足りる。#2983 で根拠を GPU に限らない書き方へ直した（値・挙動は不変） | 根拠 |
+| `crates/gpu/src/cdi_spec.rs` の入力上限 1 MiB | 根拠が「nvidia.yaml は数十 KiB」 | 非 GPU の spec は小さく問題なし。#2983 で根拠を GPU に限らない書き方へ直した（値・挙動は不変） | 根拠 |
+| `crates/gpu/src/cdi_spec.rs` の `reopen_via_proc` の doc | 「GPU 編集を飛ばすのを防ぐ」と書かれている | 挙動は汎用。#2983 で doc を GPU に限らない書き方へ直した（挙動は不変） | 文言 |
 | `crates/gpu/src/cdi_paths.rs` | usr-merge の動機が firmware・`/usr/bin` | `/dev` は対象外で変わらない（試験で確認）。hooks の `path` は正規化しない | 影響なし |
 
 ### 未実装の層（spec の記述から。確定した設計ではない）
@@ -65,7 +65,7 @@ CDI の適用機構（GPU-1〜GPU-4）を GPU 以外の一般デバイス（USB�
 
 - `kind` / `name` の形式、`deviceNodes[].type` / `permissions` の値、パスの絶対性は解析層で検証していない（TASK-126.2 以降・TASK-127 の担当）。GPU か否かに関係なく残る課題で、一般デバイスを受ける前に必要になる
 - spec ディレクトリの所有者の検査と hook の完全性（PLUG-11 と同型）は、非 GPU でも同じ前提になる。device cgroup（TASK-129）を入れずに一般デバイスを受けてはならない（受け入れ前の要件は [cri-devices-cdi.md](cri-devices-cdi.md)）
-- 上限値の根拠・`reopen_via_proc` の doc の GPU 寄りの文言は、コメントのみの直しで済む（本 PR では製品コードを変えていない）
+- 上限値の根拠・`reopen_via_proc` の doc の GPU 寄りの文言は、#2983 でコメントのみ直した（上限値・挙動は不変）
 - 抜き差しで変わる minor が、許可リストで別のデバイスを許す・拒否するおそれ。major / minor は stat の値を正とする方針と整合させる
 
 ## #571 向けの実機 PoC 手順（案）
@@ -83,4 +83,5 @@ CDI の適用機構（GPU-1〜GPU-4）を GPU 以外の一般デバイス（USB�
 
 ## 残課題・追跡
 
-- GPU 前提の文言の直し（コメントのみ）、抜き差しで変わる minor への対応、`type: b` の扱い。新規の起票は本 PR では行わず、PR 本文に要追跡として挙げる
+- GPU 前提の文言の直し（コメントのみ）は #2983 で済み
+- 抜き差しで変わる minor への対応、`type: b` の扱いは未追跡。新規の起票は行わず、PR 本文に要追跡として挙げる

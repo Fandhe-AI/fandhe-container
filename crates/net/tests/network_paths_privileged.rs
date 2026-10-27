@@ -88,10 +88,14 @@ fn main() {
         linux::launcher(Vec::new(), Duration::ZERO);
     } else if args.iter().any(|a| a == "--measure") {
         linux::launcher(linux::measure_args(&args), Duration::ZERO);
+    } else if args.iter().any(|a| a == "--hold-check") {
+        linux::hold_check();
     } else if args.iter().any(|a| a == "--hold") {
         let (extra, hold_secs) = linux::hold_args(&args);
         linux::launcher(extra, Duration::from_secs(u64::from(hold_secs)));
     } else {
+        // root 不要の契約の自己試験は既定の実行で走らせる（実機前提の部分は `--ignored` / `--hold-check`）。
+        linux::hold_contract_selftest();
         println!(
             "network_paths_privileged: ignored (requires root, `unshare`, `nsenter`; run the built executable with `--ignored`, `--measure` or `--hold --max-secs N` under `sudo`, see AGENTS.md)"
         );
@@ -221,16 +225,45 @@ mod linux {
         }
     }
 
-    /// 保持モードの引数を検証する。`--max-secs` は必須（1..=3600）。範囲外・欠落・非数値は終了コード 2。
-    /// 戻り値は inner へ渡す引数と保持秒数（ランチャの期限の算出用）。root の確認より前に呼ぶ。
-    pub fn hold_args(args: &[String]) -> (Vec<String>, u32) {
-        let secs = args
-            .iter()
+    /// `--max-secs N` を取り出す。欠落・非数値・範囲外（1..=3600 の外）は `None`（純関数。自己試験の対象）。
+    fn parse_hold_secs(args: &[String]) -> Option<u32> {
+        args.iter()
             .position(|a| a == "--max-secs")
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| (1..=HOLD_SECS_MAX).contains(v));
-        match secs {
+            .filter(|v| (1..=HOLD_SECS_MAX).contains(v))
+    }
+
+    /// 保持の解放の理由を決める。`next` が `release` の行を返せば `release`、行が尽きれば（EOF）`eof`。
+    /// 他の行は読み捨てる（純関数。stdin の読み取りは呼び出し側が渡す）。
+    fn wait_release(mut next: impl FnMut() -> Option<String>) -> &'static str {
+        loop {
+            match next() {
+                None => return "eof",
+                Some(l) if l == "release" => return "release",
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// 準備完了行（`event: "ready"`）を組み立てる。`c1_json`・`c2_json` は `container_json` の出力。
+    fn ready_line(max_secs: u32, pid: u32, c1_json: &str, c2_json: &str) -> String {
+        format!(
+            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"ready\",\"provisional\":true,\"method\":\"{HOLD_METHOD}\",\"isolation\":\"unshare --net --mount (fresh netns)\",\"max_secs\":{max_secs},\"inner_pid\":{pid},\"host_netns\":\"/proc/{pid}/ns/net\",\"mount_ns\":\"/proc/{pid}/ns/mnt\",\"host\":{{\"bridge_addr\":\"{GATEWAY}\",\"outer_addr\":\"{HOST_OUTER}\"}},\"containers\":[{c1_json},{c2_json}]}}"
+        )
+    }
+
+    /// 解放完了行（`event: "released"`）を組み立てる。`reason` は `eof` / `release` / `deadline`。
+    fn released_line(reason: &str) -> String {
+        format!(
+            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"released\",\"reason\":\"{reason}\",\"cleanup\":\"ok\",\"provisional\":true}}"
+        )
+    }
+
+    /// 保持モードの引数を検証する。`--max-secs` は必須（1..=3600）。範囲外・欠落・非数値は終了コード 2。
+    /// 戻り値は inner へ渡す引数と保持秒数（ランチャの期限の算出用）。root の確認より前に呼ぶ。
+    pub fn hold_args(args: &[String]) -> (Vec<String>, u32) {
+        match parse_hold_secs(args) {
             Some(n) => (vec!["--hold".into(), "--max-secs".into(), n.to_string()], n),
             None => {
                 eprintln!(
@@ -507,9 +540,9 @@ mod linux {
         spawn_launcher_watchdog();
         let measuring = args.iter().any(|a| a == "--measure");
         let result = if args.iter().any(|a| a == "--hold") {
-            match flag_value(args, "--max-secs", 0, HOLD_SECS_MAX, 1) {
-                Some(n) if n >= 1 => hold(n),
-                _ => Err(fail("invalid --max-secs")),
+            match parse_hold_secs(args) {
+                Some(n) => hold(n),
+                None => Err(fail("invalid --max-secs")),
             }
         } else if measuring {
             let trials = flag_value(args, "--trials", TRIALS_DEFAULT, TRIALS_MAX, 1);
@@ -1002,6 +1035,160 @@ mod linux {
         ))
     }
 
+    /// 保持モードの契約の自己試験（root 不要。引数なしの既定の実行で走る。NET-3・TASK-140 準備・#1881・REPAIR-12）。
+    /// 引数の境界値、解放の理由、ready / released 行の具体値を照合する。失敗は panic（非 0 終了）。
+    pub fn hold_contract_selftest() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        // --max-secs の境界値: 1 と 3600 は受理、0・3601・負数・非数値・欠落・値なしは拒否。
+        assert_eq!(parse_hold_secs(&a(&["--hold", "--max-secs", "1"])), Some(1));
+        assert_eq!(
+            parse_hold_secs(&a(&["--hold", "--max-secs", "3600"])),
+            Some(3600)
+        );
+        for bad in ["0", "3601", "-1", "abc", "", "4294967296"] {
+            assert_eq!(
+                parse_hold_secs(&a(&["--hold", "--max-secs", bad])),
+                None,
+                "--max-secs {bad:?} must be rejected"
+            );
+        }
+        assert_eq!(parse_hold_secs(&a(&["--hold"])), None);
+        assert_eq!(parse_hold_secs(&a(&["--hold", "--max-secs"])), None);
+        // 解放の理由: release 行は release、release が無いまま行が尽きれば eof。
+        let mut it = vec!["noise", "release", "later"].into_iter();
+        assert_eq!(wait_release(|| it.next().map(str::to_owned)), "release");
+        let mut it = vec!["noise", "other"].into_iter();
+        assert_eq!(wait_release(|| it.next().map(str::to_owned)), "eof");
+        assert_eq!(wait_release(|| None), "eof");
+        // released 行の具体値。
+        assert_eq!(
+            released_line("deadline"),
+            "{\"schema\":\"fandhe-container.net-hold/v1\",\"event\":\"released\",\"reason\":\"deadline\",\"cleanup\":\"ok\",\"provisional\":true}"
+        );
+        // ready 行の構造と具体値。
+        let line = ready_line(30, 4242, "{\"id\":\"c1\"}", "{\"id\":\"c2\"}");
+        for needle in [
+            "\"schema\":\"fandhe-container.net-hold/v1\"",
+            "\"event\":\"ready\"",
+            "\"provisional\":true",
+            "\"max_secs\":30",
+            "\"inner_pid\":4242",
+            "\"host_netns\":\"/proc/4242/ns/net\"",
+            "\"mount_ns\":\"/proc/4242/ns/mnt\"",
+            "\"bridge_addr\":\"10.214.0.1\"",
+            "\"outer_addr\":\"10.214.1.1\"",
+            "\"containers\":[{\"id\":\"c1\"},{\"id\":\"c2\"}]",
+        ] {
+            assert!(line.contains(needle), "ready line lacks {needle}: {line}");
+        }
+        assert!(!line.contains('\n'), "ready line must be a single line");
+        // pin の文字種検査: 許可外の文字（引用符・空白）を含む pin は出力させない。
+        assert!(json_safe_path(Path::new("/tmp/a\"b")).is_err());
+        assert!(json_safe_path(Path::new("/tmp/a b")).is_err());
+        assert_eq!(
+            json_safe_path(Path::new("/tmp/x-1.y_z/pin")).ok(),
+            Some("/tmp/x-1.y_z/pin")
+        );
+        let c = container_json(
+            "c1",
+            C1_ADDR,
+            Path::new("/tmp/p"),
+            &[(18080, 9080), (15201, 5201)],
+        )
+        .expect("container_json");
+        assert!(c.contains("\"addr\":\"10.214.0.2\""), "{c}");
+        assert!(c.contains("\"pin\":\"/tmp/p\""), "{c}");
+        assert!(
+            c.contains("\"host_addr\":\"10.214.1.1\",\"host_port\":18080,\"container_port\":9080"),
+            "{c}"
+        );
+        println!("network_paths_privileged: hold contract self-test passed (NET-3)");
+    }
+
+    /// 保持モードの実機確認（`--hold-check`。root・util-linux 前提）。自分自身を `--hold --max-secs N` で起動し、
+    /// 準備完了行の検証、`release` 行・stdin EOF・期限による解放と、解放完了行（保持側が削除確認を済ませて
+    /// `cleanup:ok` を出す）・終了コード 0 を照合する（NET-3・TASK-140 準備・#1881・REPAIR-12）。
+    pub fn hold_check() {
+        require_root_and_tools();
+        let exe = std::env::current_exe().expect("current_exe");
+        for (case, max_secs, expect) in [
+            ("release", 60u32, "release"),
+            ("eof", 60, "eof"),
+            ("deadline", 1, "deadline"),
+        ] {
+            let mut child = Command::new(&exe)
+                .args(["--hold", "--max-secs", &max_secs.to_string()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn --hold");
+            let mut stdin = child.stdin.take();
+            let out = child.stdout.take().expect("stdout pipe");
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for l in BufReader::new(out).lines().map_while(Result::ok) {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+            });
+            let recv = |what: &str, child: &mut Child| -> String {
+                match rx.recv_timeout(timeout() * 6 + Duration::from_secs(u64::from(max_secs))) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        let _ = child.kill();
+                        panic!("hold-check[{case}]: no {what} line before deadline");
+                    }
+                }
+            };
+            let ready = recv("ready", &mut child);
+            for needle in [
+                "\"event\":\"ready\"",
+                "\"provisional\":true",
+                &format!("\"max_secs\":{max_secs}"),
+                "\"addr\":\"10.214.0.2\"",
+                "\"addr\":\"10.214.0.3\"",
+                "\"host_port\":18080,\"container_port\":9080",
+                "\"host_port\":15201,\"container_port\":5201",
+            ] {
+                assert!(
+                    ready.contains(needle),
+                    "hold-check[{case}]: ready lacks {needle}: {ready}"
+                );
+            }
+            // ready 行の `netns`（/proc/<inner_pid>/root<pin>）がホストの mount namespace から実在することを確かめる。
+            let mut netns_seen = 0;
+            for part in ready.split("\"netns\":\"").skip(1) {
+                let path = part.split('"').next().unwrap_or("");
+                assert!(
+                    Path::new(path).exists(),
+                    "hold-check[{case}]: netns path {path} does not exist while holding"
+                );
+                netns_seen += 1;
+            }
+            assert_eq!(netns_seen, 2, "hold-check[{case}]: expected 2 netns paths");
+            match case {
+                "release" => {
+                    let w = stdin.as_mut().expect("stdin pipe");
+                    w.write_all(b"release\n").expect("write release");
+                    w.flush().expect("flush");
+                }
+                "eof" => drop(stdin.take()),
+                _ => {}
+            }
+            let released = recv("released", &mut child);
+            assert_eq!(
+                released,
+                released_line(expect),
+                "hold-check[{case}]: unexpected released line"
+            );
+            drop(stdin);
+            let status = child.wait().expect("wait --hold");
+            assert!(status.success(), "hold-check[{case}]: exit status {status}");
+        }
+        println!("network_paths_privileged: hold verified release/eof/deadline (NET-3)");
+    }
+
     /// トポロジーの保持（`--hold`）。解放の理由は stdin の `release` 行・EOF・期限のいずれか。
     /// 失敗時は stderr に診断を出して非 0 で終わり、後始末は netns・mount namespace の消滅に委ねる。
     fn hold(max_secs: u32) -> Result<(), NetError> {
@@ -1045,18 +1232,9 @@ mod linux {
         // stdin の読み取りを先に始める（ready を出した直後の release / EOF を取りこぼさない）。
         let (tx, rx) = mpsc::channel::<&'static str>();
         std::thread::spawn(move || {
-            let reason = loop {
-                match read_line() {
-                    None => break "eof",
-                    Some(l) if l == "release" => break "release",
-                    Some(_) => {}
-                }
-            };
-            let _ = tx.send(reason);
+            let _ = tx.send(wait_release(read_line));
         });
-        say(&format!(
-            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"ready\",\"provisional\":true,\"method\":\"{HOLD_METHOD}\",\"isolation\":\"unshare --net --mount (fresh netns)\",\"max_secs\":{max_secs},\"inner_pid\":{pid},\"host_netns\":\"/proc/{pid}/ns/net\",\"mount_ns\":\"/proc/{pid}/ns/mnt\",\"host\":{{\"bridge_addr\":\"{GATEWAY}\",\"outer_addr\":\"{HOST_OUTER}\"}},\"containers\":[{c1_json},{c2_json}]}}"
-        ));
+        say(&ready_line(max_secs, pid, &c1_json, &c2_json));
         let reason = rx
             .recv_timeout(Duration::from_secs(u64::from(max_secs)))
             .unwrap_or("deadline");
@@ -1073,9 +1251,7 @@ mod linux {
             &mut ports,
             (&bridge, &hosts, &pins),
         )?;
-        say(&format!(
-            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"released\",\"reason\":\"{reason}\",\"cleanup\":\"ok\",\"provisional\":true}}"
-        ));
+        say(&released_line(reason));
         Ok(())
     }
 

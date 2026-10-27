@@ -63,6 +63,11 @@ stdin の `release` 行、stdin の EOF、`max_secs` 経過のいずれか。ス
 
 pin はホストの mount namespace から見えない。計測プロセスはホストの mount namespace のまま `nsenter --net=/proc/<inner_pid>/root<pin>`（ready 行の `netns`）で入る。代替は `nsenter --mount=<mount_ns> -- nsenter --net=<pin> -- ...` の 2 段（`nsenter` は名前空間ファイルを先に全部開くため、`--mount` と `--net=<pin>` を 1 段で並べる形は使えない）。
 
+### 契約の照合（REPAIR-12）
+
+- 既定の実行（引数なし。root 不要）: `--max-secs` の境界値（1・3600 は受理、0・3601・負数・非数値・欠落は拒否）、解放の理由（`release` 行・EOF）、ready / released 行の具体値、`pin` の文字種検査を自己試験する。成功行 `network_paths_privileged: hold contract self-test passed (NET-3)`
+- 実機前提 `sudo <実行ファイル> --hold-check`: 保持を `release` 行・stdin EOF・期限（`--max-secs 1`）の 3 通りで開始から解放まで通し、ready 行の内容・`netns` パスの実在・released 行の完全一致（`cleanup:ok`）・終了コード 0 を照合する。成功行 `network_paths_privileged: hold verified release/eof/deadline (NET-3)`。CI では実行しない
+
 ## 往復計測プログラムの契約
 
 `tcp_rtt_probe`（引数なしは loopback の自己試験）。

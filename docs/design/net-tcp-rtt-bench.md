@@ -93,6 +93,16 @@ ready 行の `containers[].netns` を `<c1>`・`<c2>`、`host_netns` を `<host>
 
 iperf3 は (c) で `9080` の代わりに `5201`（公開は `10.214.1.1:15201`）を使う。
 
+## 計測・比較スクリプト（#1882）
+
+`scripts/bench/net_throughput_rtt.sh`（入口: `make net-throughput-rtt`・`make net-throughput-rtt-compare`。自己テスト: `make net-throughput-rtt-selftest`）が上の 2 つの道具と iperf3 を束ねる。実行手順と出力の読み方は `AGENTS.md`、実測は #319（人間）。
+
+- 対称な計測: 自前と Docker の両側で、ホストの同じ `iperf3` と `tcp_rtt_probe`（検証した fd から複製）を `nsenter --net=<netns>` でコンテナ役の netns へ入れて起動する。自前の netns は ready 行、Docker の netns は `docker inspect` の `State.Pid` の `/proc/<pid>/ns/net`。Docker のコンテナ本体は `sleep` するだけ（イメージに iperf3 は不要。`--pull never`）。コンテナ役は製品の・Docker の起動経路を通らない
+- 経路: 自前は上の表のとおり。Docker は (a) c1 -> c2 の IP、(b) 実ホスト -> c1 の IP、(c) 実ホスト -> `--host-addr`（`-p <host-addr>:15201:5201` と `:18080:9080` で公開。daemon の `userland-proxy` の設定により docker-proxy を通り得る）
+- 交互: `--target both` は試行ごとに own -> docker の順で回す。Docker の後始末は実行ごとのラベルで所有を証明し、残りがあれば終了コード 4
+- 集計: 経路・ストリーム数ごとに試行の標本の中央値（iperf3 は受信側 `end.sum_received`、Mbit/s）。往復は試行ごとの p50・p99 の中央値。compare は own / docker を、スループットは %、往復は倍率で出す。90%・1.1・1.2 との照合と合否は出さない（暫定値。`provisional: true` と `verdict` なし）
+- 方法の差: Docker のホスト役は実ホストの netns（ホストの firewall を通る）、自前は隔離 netns（masquerade 未実装）。PoC-15 は実ホストの自作ツール
+
 ## PoC-15 との差
 
 PoC-15 の自作ツールは spec 側にあり、本リポの製品側には無かった。本プログラムは同じ方法（1 バイト、TCP_NODELAY、既定 10000 往復）を std のみで再現するが、計測の場所が隔離 netns でコンテナ役が起動経路を通らない点が異なる。

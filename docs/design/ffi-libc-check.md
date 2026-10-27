@@ -67,7 +67,7 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/supervisor（#1840）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。crates/core は syscall 番号（#1847）が適用済みで、番号以外の定数（#1848）・構造体と関数の型（#1849）が残る。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin（#1843）・crates/supervisor（#1840）・crates/core の syscall 番号（#1847。番号以外の定数〔#1848〕・構造体と関数の型〔#1849〕は残る）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 
@@ -78,6 +78,15 @@ crates/plugin-macos（#1845）は適用済み。照合は `sys.rs` の `imp::lib
 crates/plugin-windows（#1846）も適用済み。`sys` の `imp` にある `signal(3)` の宣言・`SIG_ERR`・`SIGTERM`（cfg 3 定義）・ハンドラ `on_sigterm` の引数型を `const` 検査で照合した（4 種すべて。対象外は FFI でない `SIGTERM_RECEIVED` と安全なラッパー群。理由は照合モジュールのコメント）。
 
 crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は定数 45 件（`AF_NETLINK` は `u16` に範囲検査して比較）・構造体 2 件・関数 12 件。
+
+crates/plugin（#1843）は `sys.rs` の末尾の `libc_abi`（cfg ごとの子モジュール）と、`tests` の子 `libc_abi_fixtures` で照合する。`MIT OR Apache-2.0` の境界ライブラリだが、dev-dependency のため製品の依存グラフは変わらない。対象外と扱いは次のとおり。
+
+- `waitid` の `idtype`: 自前は `i32`、`libc` は `idtype_t`（`c_uint`）。C の列挙型で列挙子がすべて負でないため `libc` は符号なしを選ぶ。幅・アラインメントは同じで、32 bit 整数引数の渡し方は符号で変わらず ABI は一致する。型の綴りの違いとして、関数は引数の型を別々に書いて照合し、`P_PID` は負でないことを確かめて比べた。自前の宣言を `u32` に揃えるかはオーナー判断（`sys` の本体は変えていない）
+- 関数本体・試験関数の中のローカル項目（`O_PATH`・`SOL_LOCAL`・`LOCAL_PEERPID`・`PROC_PIDTASKINFO`・`ProcTaskInfo`・`proc_pidinfo`・`peer_pid` の `getsockopt`・`WNOHANG`・`EPROTO`）は項目として参照できない。上の「試験関数内のローカル定数」の規則を構造体と関数へ広げ、`libc` 側の値・サイズ・オフセットを自前と同じ値で assert し、関数は自前の宣言と同じ並びで書いた型へ `libc` の関数を代入する
+- `statx` / `statx_timestamp` は `libc` が gnu でだけ定義するため `target_env = "gnu"` の下で照合する。時刻は自前が配列、`libc` が個別フィールドなので、名前の対応をつけてオフセットで比べる。`pad0` は `libc` 側が非公開
+- Linux の `siginfo_t` の `si_pid` は `libc` がアクセサの裏に隠し `offset_of!` で取れない。本体の assert が担う
+- macOS の `link_name`（`$INODE64`）は型の照合で検査できない
+- FFI でない値（`PROBE_EINTR_RETRIES`・`CREATED_LOCK_WAIT_*`・`UCRED_SIZE`・`MTIME_INDEX` など）は対象外
 
 crates/core の syscall 番号（#1847）の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts` と `seccomp_notify` の対応外側（`ArchSysNo::UNSUPPORTED` で番号を持たない）、x32・ILP32（`target_pointer_width = "64"` の cfg で対応外）。照合は x86_64 と aarch64 の `consts` の 27 件ずつと `SYS_SECCOMP`（`sys/seccomp_notify.rs`）の各 1 件で、値は既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` を通す `const fn` で読み、`sysno` の型の保証は変えない。
 

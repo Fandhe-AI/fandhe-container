@@ -39,6 +39,8 @@
 //!   ホストが終了時に出す。#1673）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
+//! - Linux（x86_64 / aarch64）・macOS: `poll(2)`（`poll_two`。stderr 読み取りスレッドがソケットと停止用 pipe を同時に待つ。
+//!   macOS の `shutdown` と `recv` の競合に依存しない停止のため。REPAIR-5・PLUG-7・#3003。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
@@ -3023,6 +3025,156 @@ pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
     unsafe { kill(pid, sig) == 0 }
 }
 
+/// [`poll_two`] の結果。真偽値にせず、待ちの結末を区別する（REPAIR-5・#3003）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollOutcome {
+    /// 期限内にどちらも読み取り可能（EOF・エラーを含む。読めば待たずに戻る）にならなかった
+    /// （シグナルによる中断を含む。呼び出し側が再度呼ぶ）。
+    TimedOut,
+    /// 1 つ以上が読み取り可能（`POLLIN`・`POLLHUP`・`POLLERR`・`POLLNVAL` のいずれか）になった。
+    Ready { first: bool, second: bool },
+}
+
+/// `poll(2)` が使える構成か（[`poll_two`] が `Unsupported` を返さない構成）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+pub(crate) const POLL_SUPPORTED: bool = true;
+/// 対応外の OS・アーキテクチャでは `poll(2)` を使わない（呼び出し側が従来の受信期限へ縮退する）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+pub(crate) const POLL_SUPPORTED: bool = false;
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod poll_abi {
+    /// `struct pollfd`（`<poll.h>`。Linux・macOS とも `int fd; short events; short revents;`）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct PollFd {
+        pub(super) fd: i32,
+        pub(super) events: i16,
+        pub(super) revents: i16,
+    }
+    pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLERR: i16 = 0x0008;
+    pub(super) const POLLHUP: i16 = 0x0010;
+    pub(super) const POLLNVAL: i16 = 0x0020;
+
+    /// `nfds_t`。Linux は `unsigned long`（LP64 で 64 bit）、macOS は `unsigned int`。
+    #[cfg(target_os = "linux")]
+    pub(super) type NfdsT = u64;
+    #[cfg(target_os = "macos")]
+    pub(super) type NfdsT = u32;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`。出典: `man 2 poll`。
+        pub(super) fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+    }
+}
+
+/// 2 つの fd が読み取り可能になるか `timeout_ms` が尽きるまで待つ（`poll(2)`。stderr 読み取りスレッドが
+/// 「ソケットの到着」と「停止用 pipe」を同時に待つために使う。REPAIR-5・PLUG-7・#3003）。
+///
+/// macOS ではソケットの `shutdown` が別スレッドの `recv` の起床・受信期限と競合して読み取りが戻らない
+/// 場面を観測した（#3003）ため、停止指示を `shutdown` ではなく pipe への書き込みで届け、待ち自体を
+/// `poll` の期限で必ず有限にする。`EINTR` は `TimedOut` として返す（呼び出し側が再度呼ぶ）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+pub(crate) fn poll_two(
+    first: &impl AsFd,
+    second: &impl AsFd,
+    timeout_ms: i32,
+) -> io::Result<PollOutcome> {
+    use poll_abi::{POLLERR, POLLHUP, POLLIN, POLLNVAL, PollFd, poll};
+    let mut fds = [
+        PollFd {
+            fd: first.as_fd().as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: second.as_fd().as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `fds` はスタック上の初期化済み配列で、渡す要素数 2 と `nfds` が一致する。`poll` は各要素の
+    // `revents` だけを書き換え、呼び出しの後は参照を保持しない。fd は呼び出し側の借用が呼び出し中開いて
+    // いることを保証する（閉じられていれば `POLLNVAL` で戻り、メモリ安全性には影響しない）。
+    let n = unsafe { poll(fds.as_mut_ptr(), 2, timeout_ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted {
+            Ok(PollOutcome::TimedOut)
+        } else {
+            Err(e)
+        };
+    }
+    let ready = |f: &PollFd| f.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0;
+    let (a, b) = (ready(&fds[0]), ready(&fds[1]));
+    if a || b {
+        Ok(PollOutcome::Ready {
+            first: a,
+            second: b,
+        })
+    } else {
+        Ok(PollOutcome::TimedOut)
+    }
+}
+
+/// 対応外の OS・アーキテクチャ向け。待たず `Unsupported`（呼び出し側が従来の受信期限へ縮退する）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+pub(crate) fn poll_two(
+    first: &impl AsFd,
+    second: &impl AsFd,
+    timeout_ms: i32,
+) -> io::Result<PollOutcome> {
+    let _ = (first, second, timeout_ms);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(test)]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `pid_t waitpid(pid_t pid, int *status, int options)`
@@ -3575,6 +3727,57 @@ mod libc_abi {
         assert!(libc::WNOHANG == 1);
     };
 
+    // ---- poll（Linux 64 bit・macOS。#3003）----
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: () = {
+        use core::mem::{align_of, offset_of, size_of};
+        assert!(size_of::<poll_abi::PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<poll_abi::PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(poll_abi::PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(poll_abi::PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(poll_abi::PollFd, revents) == offset_of!(libc::pollfd, revents));
+        assert!(poll_abi::POLLIN == libc::POLLIN);
+        assert!(poll_abi::POLLERR == libc::POLLERR);
+        assert!(poll_abi::POLLHUP == libc::POLLHUP);
+        assert!(poll_abi::POLLNVAL == libc::POLLNVAL);
+    };
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: unsafe extern "C" fn(
+        *mut poll_abi::PollFd,
+        poll_abi::NfdsT,
+        libc::c_int,
+    ) -> libc::c_int = poll_abi::poll;
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        libc::poll;
+
     // ---- Linux・macOS 共通 ----
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const _: () = {
@@ -4043,5 +4246,72 @@ mod libc_abi {
             assert!(offset_of!(Timespec, tv_sec) == offset_of!(libc::timespec, tv_sec));
             assert!(offset_of!(Timespec, tv_nsec) == offset_of!(libc::timespec, tv_nsec));
         };
+    }
+}
+
+/// [`poll_two`] の結末の区別（REPAIR-5・#3003）。pipe で結末を具体値で照合する。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    )
+))]
+mod poll_two_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn repair5_poll_two_distinguishes_timeout_data_and_hangup() {
+        let (r1, mut w1) = std::io::pipe().unwrap();
+        let (r2, w2) = std::io::pipe().unwrap();
+        // 何も書かれていなければ期限で TimedOut。
+        assert_eq!(poll_two(&r1, &r2, 10).unwrap(), PollOutcome::TimedOut);
+        // 1 本目にだけ書けば first のみ。
+        w1.write_all(b"x").unwrap();
+        assert_eq!(
+            poll_two(&r1, &r2, 1000).unwrap(),
+            PollOutcome::Ready {
+                first: true,
+                second: false
+            }
+        );
+        // 2 本目の書き込み端を閉じる（EOF = POLLHUP）と second も ready。
+        // 並行する別テストの fork から exec までの間は、子が複製した書き込み端を保持して EOF が遅れ得るため、
+        // 期限つきで待つ（本番も停止フラグと `poll` の期限で有限に止まる。REPAIR-5・#3003）。
+        drop(w2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = poll_two(&r1, &r2, 100).unwrap();
+            if got
+                == (PollOutcome::Ready {
+                    first: true,
+                    second: true,
+                })
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "got={got:?}");
+        }
+    }
+
+    #[test]
+    fn repair5_poll_two_reports_only_second_when_stop_pipe_written() {
+        let (r1, _w1) = std::io::pipe().unwrap();
+        let (r2, mut w2) = std::io::pipe().unwrap();
+        w2.write_all(b"s").unwrap();
+        assert_eq!(
+            poll_two(&r1, &r2, 1000).unwrap(),
+            PollOutcome::Ready {
+                first: false,
+                second: true
+            }
+        );
     }
 }

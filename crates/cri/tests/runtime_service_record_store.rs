@@ -701,3 +701,96 @@ async fn late_remove_after_timeout_also_removes_the_memory_record() {
         Code::NotFound
     );
 }
+
+/// 失敗した put の後始末の削除がハングしている間は、予約（件数枠）を保ち、同じ metadata の Run は
+/// `ALREADY_EXISTS` で拒否される。削除が終わると worker が予約を戻し、再び Run できる
+/// （削除完了まで件数枠を保持する。#2933・CRI-2・REPAIR-5）。ネットワークなし・ありの両方。
+#[tokio::test]
+async fn failed_put_cleanup_keeps_the_reservation_until_the_remove_finishes() {
+    for networked_path in [false, true] {
+        let log: Log = Arc::default();
+        let (store, gate) = FakeStore::new(&log);
+        let mut svc = CriRuntimeService::new()
+            .with_runtime_timeout(Duration::from_millis(200))
+            .with_record_store(store.clone());
+        if networked_path {
+            svc = svc.with_pod_network(Arc::new(FakeNet {
+                log: Arc::clone(&log),
+                fail_set_up: false,
+            }));
+        }
+        store.fail_put_at.lock().unwrap().push(0);
+        *store.block_remove_at.lock().unwrap() = Some(0);
+        let e = run(&svc).await.unwrap_err();
+        assert_eq!(e.code(), Code::Internal);
+        assert_eq!(list(&svc).await.len(), 1, "reservation must be kept");
+        let dup = run(&svc).await.unwrap_err();
+        assert_eq!(dup.code(), Code::AlreadyExists);
+        assert_eq!(dup.message(), "sandbox already exists");
+        gate.release.send(()).unwrap();
+        wait_for_empty_list(&svc).await;
+        run(&svc).await.expect("same metadata must run again");
+    }
+}
+
+/// 失敗した put の後始末の削除も失敗したら、予約を捨てず notready の記録として残し、Remove で回収できる
+/// （#2933・CRI-2・REPAIR-3）。
+#[tokio::test]
+async fn failed_put_and_failed_cleanup_leave_a_removable_record() {
+    let (svc, store, _g, _log) = plain();
+    store.fail_put_at.lock().unwrap().push(0);
+    store.fail_remove_at.lock().unwrap().push(0);
+    assert_eq!(run(&svc).await.unwrap_err().code(), Code::Internal);
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    remove(&svc, &items[0].id)
+        .await
+        .expect("remove recovers it");
+    assert!(list(&svc).await.is_empty());
+}
+
+/// set_up の失敗を回収できても、記録ファイルの削除がハングしている間は件数枠を保ち、重複 Run を拒否する。
+/// 削除が失敗した場合も notready の記録が残り Remove で回収できる（#2933・CRI-2・REPAIR-5）。
+#[tokio::test]
+async fn reclaimed_set_up_failure_keeps_the_slot_while_the_remove_hangs() {
+    let log: Log = Arc::default();
+    let (store, gate) = FakeStore::new(&log);
+    let net = Arc::new(FakeNet {
+        log: Arc::clone(&log),
+        fail_set_up: true,
+    });
+    let svc = CriRuntimeService::new()
+        .with_runtime_timeout(Duration::from_millis(200))
+        .with_pod_network(net)
+        .with_record_store(store.clone());
+    *store.block_remove_at.lock().unwrap() = Some(0);
+    assert!(run(&svc).await.is_err());
+    assert_eq!(list(&svc).await.len(), 1, "slot must be kept");
+    assert_eq!(
+        run(&svc).await.unwrap_err().code(),
+        Code::AlreadyExists,
+        "duplicate Run must be rejected while the remove runs"
+    );
+    gate.release.send(()).unwrap();
+    wait_for_empty_list(&svc).await;
+    // 予約が空いている: 重複ではなく set_up まで進んで失敗する（この試験の網は常に set_up に失敗する）。
+    assert_eq!(
+        run(&svc).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+}
+
+/// 回収後の記録ファイルの削除が失敗したら、notready の記録が残り Remove で回収できる。
+#[tokio::test]
+async fn reclaimed_set_up_failure_with_failed_remove_is_recoverable() {
+    let (svc, store, _g, _log) = networked(true);
+    store.fail_remove_at.lock().unwrap().push(0);
+    assert!(run(&svc).await.is_err());
+    let items = list(&svc).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].state, v1::PodSandboxState::SandboxNotready as i32);
+    remove(&svc, &items[0].id)
+        .await
+        .expect("remove recovers it");
+    assert!(list(&svc).await.is_empty());
+}

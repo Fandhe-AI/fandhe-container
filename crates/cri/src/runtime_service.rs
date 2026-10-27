@@ -698,6 +698,12 @@ impl SetUpSettlement {
             .is_ok()
     }
 
+    /// 巻き戻し用の put が失敗した worker が、後始末（記録の削除と予約の解放）の責任を自分で負う印を付ける。
+    /// 以後は呼び出し側の手放し（`abandon`・`abandon_put`・`accept`）が何もしない（二重の後始末を防ぐ。#2933・CRI-2）。
+    fn take_failed_cleanup(&self) {
+        self.0.store(Self::ACCEPTED, Ordering::SeqCst);
+    }
+
     /// 巻き戻し用の put を呼び出し側が結果の受領前に手放す。worker が既に書き終えて確定していた
     /// （受領前）なら真で、ファイルだけが残るため呼び出し側が消す責任を負う（#2933・CRI-2）。
     fn abandon_put(&self) -> bool {
@@ -1786,14 +1792,7 @@ impl CriRuntimeService {
                 // worker を起動できなかった（`ran` が偽の `UNAVAILABLE`）なら資源は作られていない。
                 // 予約を巻き戻して記録を除去する（pending を残して Stop・Remove を塞がない）。
                 if err.code() == CriErrorCode::Unavailable && !ran.load(Ordering::SeqCst) {
-                    if let Ok(mut registry) = self.registry.lock() {
-                        if let Some(record) = registry.records.get_mut(&id) {
-                            record.network_pending = false;
-                            record.network_owned = false;
-                        }
-                        remove_sandbox_record(&mut registry, &id);
-                    }
-                    self.rollback_unwritten(&id, &mut write_guard).await;
+                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
                     return Err(err);
                 }
                 // 期限超過・待ち受け側の失敗は worker がまだ走っている可能性があり、tear_down を同時に呼ばない。
@@ -1814,12 +1813,9 @@ impl CriRuntimeService {
                     }
                 };
                 if reclaimed {
-                    // 資源は無い。記録と件数枠を解放する（失敗しても元のエラーを返す）。
-                    if let Ok(mut registry) = self.registry.lock() {
-                        remove_sandbox_record(&mut registry, &id);
-                    }
-                    // pending 記録も消す（失敗しても元のエラーを返す。残れば R6 の pending 解決に委ねる）。
-                    self.rollback_unwritten(&id, &mut write_guard).await;
+                    // 資源は無い。記録ファイルを消せた worker が件数枠ごとメモリの記録を除去する
+                    // （失敗しても元のエラーを返す。消せなければ notready の記録のまま残り Remove で回収できる）。
+                    self.release_unwritten_sandbox(&id, &mut write_guard).await;
                 } else if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.records.get_mut(&id)
                 {
@@ -2080,7 +2076,7 @@ impl CriRuntimeService {
         self.persist_sandbox_inner(id, pending, guard, false).await
     }
 
-    /// 書けなかったらメモリの予約ごと巻き戻す put（`rollback_unwritten` と組で使う）。期限超過・future の
+    /// 書けなかったらメモリの予約ごと巻き戻す put。期限超過・future の
     /// 破棄で手放したあとに遅れて書けた記録は、worker が書いた直後に自分で消す。
     async fn persist_sandbox_rollbackable(
         &self,
@@ -2135,22 +2131,16 @@ impl CriRuntimeService {
             .await;
         if let Some(rb) = &rollback {
             if result.is_ok() {
-                // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路（rollback_unwritten など）が持つ。
+                // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路が持つ。
                 rb.settlement.accept();
-            } else if rb.settlement.abandon() {
-                // worker がまだ put を終えていない（期限超過）。遅れて書けた記録の削除と予約の巻き戻しは
-                // worker が行う（予約は worker の終了まで保つ。remove が先に終わって元の put が後で残るのを
-                // 防ぐため、ここで別 worker の削除は並行させない。#2933・REPAIR-5）。worker が走り始めて
-                // いなければ（起動失敗）誰も戻さないため、ここで戻す。
-                if !rb.ran.load(Ordering::SeqCst) {
-                    rb.release_reservation();
-                }
+            } else if !rb.ran.load(Ordering::SeqCst) {
+                // worker が走り始めていない（起動失敗）。ファイルは書かれていないため予約を戻す。
+                rb.release_reservation();
             } else {
-                // put は完了済みで失敗した。予約を戻し、記録ファイルを直列に（put の後に）消す。
-                // 消せたときだけ予約を戻す（消せなければ回収できる記録として残す）。
-                rb.settlement.accept();
-                let removed = self.unpersist_sandbox(id, guard, false).await.is_ok();
-                rb.settle_after_remove(removed);
+                // 期限超過なら worker へ手放しを伝える。put の失敗・遅れた完了の後始末（削除と予約の解放）は
+                // worker 自身が行うため、ここでは削除も予約の解放もしない（中断で漏れない。#2933・CRI-2）。
+                // worker が既に失敗の後始末を引き取っていれば何もしない。
+                rb.settlement.abandon();
             }
         }
         drop(abandon);
@@ -2226,13 +2216,20 @@ impl CriRuntimeService {
                     };
                     let result = store.put(RecordKind::Sandbox, id, bytes);
                     panic_guard.defuse();
-                    // 手放された巻き戻し用の put は、完了の直後にここで消す（別 worker の削除と競合させない）。
-                    // 予約は削除に成功したときだけ戻す（失敗時は回収できる記録として残す）。
-                    if let Some(rb) = rollback
-                        && !rb.settlement.settle_by_worker()
-                    {
-                        let removed = store.remove(RecordKind::Sandbox, id).is_ok();
-                        rb.settle_after_remove(removed);
+                    // 巻き戻し用の put の後始末（ファイルの削除と予約の解放）は worker 自身が持つ。呼び出し側が
+                    // 手放した（期限超過・future の破棄）場合と、put 自体が失敗した場合（書きかけが残りうる）は、
+                    // 完了の直後にここで消す（別 worker の削除と競合させず、await の途中で中断されても
+                    // 予約の解放・回復可能化が漏れない）。予約は削除に成功したときだけ戻す（失敗時は Stop・Remove で
+                    // 回収できる notready の記録として残す。#2933・CRI-2・REPAIR-3・REPAIR-5）。
+                    if let Some(rb) = rollback {
+                        let failed = result.is_err();
+                        if failed {
+                            rb.settlement.take_failed_cleanup();
+                        }
+                        if failed || !rb.settlement.settle_by_worker() {
+                            let removed = store.remove(RecordKind::Sandbox, id).is_ok();
+                            rb.settle_after_remove(removed);
+                        }
                     }
                     result.map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))
                 }
@@ -2257,9 +2254,31 @@ impl CriRuntimeService {
         }
     }
 
-    /// 巻き戻した予約のファイルを消す後始末（失敗しても元のエラーを優先して無視する）。
-    async fn rollback_unwritten(&self, id: &str, guard: &mut Option<SandboxRecordWriteGuard>) {
-        let _ = self.unpersist_sandbox(id, guard, false).await;
+    /// 資源の無い sandbox の記録（予約・pending 記録）を、記録ファイルの削除に順序付けて解放する（失敗しても
+    /// 元のエラーを優先して無視する）。
+    ///
+    /// 予約を先にメモリから外さない（削除がハングしたときに同じ metadata の Run が worker と pending ファイルを
+    /// 無制限に積めてしまうため）。メモリの記録を notready・`network_pending=false` にしてから、ファイルを消せた
+    /// worker が件数・保持量ごと除去する。削除が失敗・期限超過したときは notready の記録が残り、worker の完了まで
+    /// `record_write` が重複 Run・Stop・Remove を拒否する。ストア未注入ならその場でメモリから除去する
+    /// （#2933・CRI-2・REPAIR-3・REPAIR-5）。
+    async fn release_unwritten_sandbox(
+        &self,
+        id: &str,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) {
+        if let Ok(mut registry) = self.registry.lock() {
+            if let Some(record) = registry.records.get_mut(id) {
+                record.network_pending = false;
+                record.network_owned = false;
+                record.state = SandboxState::NotReady;
+            }
+            if self.record_store.is_none() {
+                remove_sandbox_record(&mut registry, id);
+                return;
+            }
+        }
+        let _ = self.unpersist_sandbox(id, guard, true).await;
     }
 
     /// ネットワークなしの `RunPodSandbox`。予約 → 確定版を 1 回書く。

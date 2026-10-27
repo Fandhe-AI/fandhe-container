@@ -3063,9 +3063,24 @@ fn run_child_then<T>(
     };
     // pivot 後・終端前にステージ列を固定順で実行する。pivot 前段が記録したマウントの識別子を Landlock 段へ渡す
     // （Mount 由来のルールの対象がマウントのルートであることの照合。#2071）。
-    stages.with_mounted_targets(ops.into_mounted()).run_then(
-        |_stage_report, _capability_report, evidence| terminal(&isolation, &report, evidence),
-    )
+    let mut terminal_ran = false;
+    let result = stages.with_mounted_targets(ops.into_mounted()).run_then(
+        |_stage_report, _capability_report, evidence| {
+            terminal_ran = true;
+            terminal(&isolation, &report, evidence)
+        },
+    );
+    // Landlock 段の失敗は seccomp の listener を送る前に起きるため、親は listener の EOF しか見えない。
+    // 照合の違反を親の監査へ届けられるよう、状態 pipe に `E landlock ...` を書く（SEC-1・SEC-4・CORE-5・#2130）。
+    // 他の段の失敗は従来どおり何も書かない。書けなくても失敗は変わらない（best-effort）。
+    // 終端（`verify_caller` 等。自前の `E` 行を書く）まで進んだ後の失敗は対象外（`E` 行の二重書き込みを避ける）。
+    if let (Err(err), Some(status)) = (&result, status)
+        && !terminal_ran
+        && err.stage == IsolationStage::Landlock
+    {
+        report_exec_failure_best_effort(status, ExecPhaseStep::Landlock, err);
+    }
+    result
 }
 
 /// 結合試験専用: exec の代わりに任意の攻撃プローブを実行する子を fork する（SEC-2・TASK-42.1・#199）。

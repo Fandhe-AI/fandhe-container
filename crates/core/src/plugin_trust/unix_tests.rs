@@ -1,4 +1,4 @@
-//! plugin 所有者・モード検証の Linux 実ファイルシステム試験（TASK-122.1・PLUG-11・REPAIR-12）。
+//! plugin 所有者・モード検証の Linux・macOS 実ファイルシステム試験（TASK-122.1・PLUG-11・REPAIR-12・#1865）。
 //!
 //! 信頼起点より下だけを検証する試験専用変種 `verify_plugin_dir_below` を使うため、公開 API を
 //! 増やさないよう結合試験ではなく `plugin_trust` の子モジュール（`cfg(test)` 限定）に置く。
@@ -18,8 +18,36 @@ use super::{
 struct Tmp(PathBuf);
 
 /// 試験の信頼起点（これより下だけを検証する。上位の権限が開発機・CI で異なるため）。
+///
+/// macOS の `temp_dir()` は `/var/folders/...`（`/var` は symlink）を返すため、正規化して
+/// `/private/var/folders/...` にする。Linux の `/tmp` は変わらない。
 fn anchor() -> PathBuf {
-    std::env::temp_dir()
+    fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir")
+}
+
+/// other 書き込み可の祖先の実体（sticky の 1777）。Linux は `/tmp`、macOS は `/private/tmp`
+/// （`/tmp` は symlink で `NotDirectory` になるため、実体を直接使う）。
+#[cfg(target_os = "linux")]
+const WORLD_WRITABLE_TMP: &str = "/tmp";
+#[cfg(target_os = "macos")]
+const WORLD_WRITABLE_TMP: &str = "/private/tmp";
+
+/// 公開 API の成功経路の信頼できる起点。Linux は `$HOME`、macOS は正規化した `temp_dir()`
+/// （`$HOME` 配下の既定の拡張 ACL を避けるため。#1865）。前提が崩れたら拒否内容つきで落とす。
+fn trusted_base() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let base = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    #[cfg(target_os = "macos")]
+    let base = anchor();
+    if let Err(e) = verify_plugin_dir(&base) {
+        panic!(
+            "trusted base {} is not trusted: kind={:?} path={}",
+            base.display(),
+            e.kind(),
+            e.path().display()
+        );
+    }
+    base
 }
 
 impl Tmp {
@@ -247,8 +275,8 @@ fn plug11_task122_1_verify_candidate_from_discovery() {
 #[test]
 fn plug11_task122_1_verify_candidate_rejects_world_writable_tmp_ancestor() {
     // /tmp（sticky・other 書き込み可）は祖先として拒否される。
-    let base = Path::new("/tmp");
-    let md = fs::metadata(base).expect("/tmp");
+    let base = Path::new(WORLD_WRITABLE_TMP);
+    let md = fs::metadata(base).expect("world-writable tmp");
     assert_ne!(
         md.mode() & 0o002,
         0,
@@ -274,7 +302,7 @@ fn plug11_task122_1_verify_candidate_rejects_world_writable_tmp_ancestor() {
 fn plug11_task122_1_verify_candidate_accepts_under_trusted_ancestors() {
     // 公開 API `verify_candidate` の成功経路（祖先の検証を含む）。/tmp は祖先として拒否される
     // ため、開発機・CI とも group/other 書き込み不可の `$HOME` 配下に plugin を置く。
-    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let home = trusted_base();
     let base = home.join(format!("fandhe-plugin-trust-{}-okanc", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir(&base).unwrap();
@@ -399,13 +427,13 @@ fn plug11_task122_2_rejects_writable_real_parent_directory() {
 /// 指していても `/tmp` 祖先で拒否される。
 #[test]
 fn plug11_task122_2_rejects_target_under_world_writable_ancestor() {
-    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let home = trusted_base();
     let base = home.join(format!("fandhe-plugin-trust-{}-s2tmp", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir(&base).unwrap();
     chmod(&base, 0o755);
-    let real_dir =
-        PathBuf::from("/tmp").join(format!("fandhe-plugin-trust-{}-s2real", std::process::id()));
+    let real_dir = PathBuf::from(WORLD_WRITABLE_TMP)
+        .join(format!("fandhe-plugin-trust-{}-s2real", std::process::id()));
     let _ = fs::remove_dir_all(&real_dir);
     fs::create_dir(&real_dir).unwrap();
     chmod(&real_dir, 0o755);
@@ -425,7 +453,7 @@ fn plug11_task122_2_rejects_target_under_world_writable_ancestor() {
     assert!(res.is_err());
     let err = res_kind.expect("rejected");
     assert_eq!(err.kind(), PluginTrustErrorKind::GroupOrOtherWritable);
-    assert_eq!(err.path(), Path::new("/tmp"));
+    assert_eq!(err.path(), Path::new(WORLD_WRITABLE_TMP));
 }
 
 #[test]
@@ -636,7 +664,7 @@ fn plug11_task122_5_audited_verify_records_mode_rejection() {
     use crate::plugin_trust::{PluginVerificationMethod, verify_candidate_audited};
 
     // /tmp（other 書き込み可）配下は祖先検証で拒否される（既存テストと同じ前提）。
-    let tmp = Path::new("/tmp").join(format!(
+    let tmp = Path::new(WORLD_WRITABLE_TMP).join(format!(
         "fandhe-plugin-trust-{}-audited",
         std::process::id()
     ));

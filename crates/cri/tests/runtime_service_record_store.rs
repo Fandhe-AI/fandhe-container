@@ -794,3 +794,31 @@ async fn reclaimed_set_up_failure_with_failed_remove_is_recoverable() {
         .expect("remove recovers it");
     assert!(list(&svc).await.is_empty());
 }
+
+/// 確定版の put を待っている間に RPC の future が破棄され、その後 put が失敗しても、worker 自身がメモリの記録を
+/// notready にする（Ready のまま CreateContainer を通さない。#2933・CRI-2）。
+#[tokio::test]
+async fn dropped_run_during_confirmation_marks_notready_when_the_put_fails() {
+    let (svc, store, gate, _log) = networked(false);
+    *store.block_put_at.lock().unwrap() = Some(1);
+    store.fail_put_at.lock().unwrap().push(1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), run(&svc))
+            .await
+            .is_err()
+    );
+    // 確定版の put の途中で破棄された。解放後に put が失敗する。
+    gate.entered
+        .recv_timeout(WAIT)
+        .expect("confirm put reached");
+    gate.release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let items = list(&svc).await;
+        if items.len() == 1 && items[0].state == v1::PodSandboxState::SandboxNotready as i32 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "not marked notready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

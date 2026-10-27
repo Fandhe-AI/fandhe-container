@@ -820,6 +820,17 @@ enum StoreCall {
     Remove(RecordId, Option<RemoveFinalize>),
 }
 
+/// `persist_sandbox_inner` の put の種類（#2933）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PutMode {
+    /// 状態の更新（Stop）。失敗してもメモリの記録は変えない。
+    Plain,
+    /// 予約の put（Run の write-ahead・ネットワークなしの確定版）。失敗・手放しの後始末は worker が持つ。
+    Reservation,
+    /// set_up 成功後の確定版。失敗したら worker が notready にする。
+    Confirm,
+}
+
 /// 巻き戻し用の put の引数（#2933・CRI-2・REPAIR-5）。
 ///
 /// 手放された put の worker は、書けた記録ファイルを消したあとに `registry` の予約（件数・保持量）も
@@ -829,8 +840,12 @@ struct PutRollback {
     settlement: Arc<SetUpSettlement>,
     registry: Arc<Mutex<SandboxRegistry>>,
     sandbox_id: String,
-    /// worker が走り始めたか（起動に失敗した put の予約を呼び出し側が戻すための印）。
-    ran: Arc<AtomicBool>,
+    /// worker のスレッドを起動できなかったか（起動失敗の put は何も書かないため、呼び出し側が予約を戻す。
+    /// 期限超過とは区別する。起動済みの worker は後から put を実行するので、予約は worker が戻す）。
+    spawn_failed: Arc<AtomicBool>,
+    /// 確定版の put か。真なら put の失敗を worker が notready にするだけで、予約の解放はしない
+    /// （確定版の失敗でも資源は既にあり、記録は Stop・Remove で回収できる状態で残す。#2933・CRI-2）。
+    confirm: bool,
 }
 
 impl PutRollback {
@@ -848,6 +863,15 @@ impl PutRollback {
             self.release_reservation();
         } else {
             self.make_recoverable();
+        }
+    }
+
+    /// put に進めなかった（符号化の失敗）ときの扱い。予約の put なら予約を戻し、確定版なら notready にする。
+    fn settle_unwritten(&self) {
+        if self.confirm {
+            self.make_recoverable();
+        } else {
+            self.release_reservation();
         }
     }
 
@@ -1849,7 +1873,7 @@ impl CriRuntimeService {
         guard: &mut Option<SandboxRecordWriteGuard>,
         resp: v1::RunPodSandboxResponse,
     ) -> Result<v1::RunPodSandboxResponse, CriError> {
-        if let Err(err) = self.persist_sandbox(id, false, guard).await {
+        if let Err(err) = self.persist_sandbox_confirm(id, guard).await {
             if let Ok(mut registry) = self.registry.lock()
                 && let Some(record) = registry.records.get_mut(id)
             {
@@ -2073,7 +2097,19 @@ impl CriRuntimeService {
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
     ) -> Result<(), CriError> {
-        self.persist_sandbox_inner(id, pending, guard, false).await
+        self.persist_sandbox_inner(id, pending, guard, PutMode::Plain)
+            .await
+    }
+
+    /// 確定版（set_up 成功後）の put。失敗・期限超過・future の破棄のあとに worker が失敗しても、worker 自身が
+    /// メモリの記録を notready にする（Ready のまま CreateContainer を通さない。#2933・CRI-2）。
+    async fn persist_sandbox_confirm(
+        &self,
+        id: &str,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) -> Result<(), CriError> {
+        self.persist_sandbox_inner(id, false, guard, PutMode::Confirm)
+            .await
     }
 
     /// 書けなかったらメモリの予約ごと巻き戻す put。期限超過・future の
@@ -2084,7 +2120,8 @@ impl CriRuntimeService {
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
     ) -> Result<(), CriError> {
-        self.persist_sandbox_inner(id, pending, guard, true).await
+        self.persist_sandbox_inner(id, pending, guard, PutMode::Reservation)
+            .await
     }
 
     async fn persist_sandbox_inner(
@@ -2092,36 +2129,39 @@ impl CriRuntimeService {
         id: &str,
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
-        rollbackable: bool,
+        mode: PutMode,
     ) -> Result<(), CriError> {
         if self.record_store.is_none() {
             return Ok(());
         }
-        let rollback = rollbackable.then(|| PutRollback {
+        let confirm = mode == PutMode::Confirm;
+        let reservation = mode == PutMode::Reservation;
+        let rollback = (reservation || confirm).then(|| PutRollback {
             settlement: Arc::new(SetUpSettlement::new()),
             registry: Arc::clone(&self.registry),
             sandbox_id: id.to_owned(),
-            ran: Arc::new(AtomicBool::new(false)),
+            spawn_failed: Arc::new(AtomicBool::new(false)),
+            confirm,
         });
         let prepared = self.encode_sandbox(id, pending);
         let (record_id, bytes) = match prepared {
             Ok(v) => v,
             Err(err) => {
-                // put に進めなかった。予約を戻す（worker は無い）。
+                // put に進めなかった（worker は無い）。予約の put なら予約を戻し、確定版なら notready にする。
                 if let Some(rb) = &rollback {
-                    rb.release_reservation();
+                    rb.settle_unwritten();
                 }
                 return Err(err);
             }
         };
         // 巻き戻し用の put は、この future が破棄・期限超過で手放した時点で worker へ手放しを伝える。
-        let extra_guard = if rollback.is_some() {
+        let extra_guard = if reservation {
             self.extra_write_guard(id)
         } else {
             None
         };
         let abandon = AbandonPutOnDrop {
-            rollback: rollback.clone(),
+            rollback: rollback.clone().filter(|rb| !rb.confirm),
             store: self.record_store.as_ref().map(Arc::clone),
             id: Some(record_id.clone()),
             extra_guard,
@@ -2129,12 +2169,13 @@ impl CriRuntimeService {
         let result = self
             .store_io_bounded(StoreCall::Put(record_id, bytes, rollback.clone()), guard)
             .await;
-        if let Some(rb) = &rollback {
+        if let Some(rb) = rollback.as_ref().filter(|rb| !rb.confirm) {
             if result.is_ok() {
                 // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路が持つ。
                 rb.settlement.accept();
-            } else if !rb.ran.load(Ordering::SeqCst) {
-                // worker が走り始めていない（起動失敗）。ファイルは書かれていないため予約を戻す。
+            } else if rb.spawn_failed.load(Ordering::SeqCst) {
+                // worker のスレッドを起動できなかった。ファイルは書かれないため予約を戻す。期限超過は
+                // 起動済みの worker が後から put を実行するので、ここでは戻さない（worker が戻す）。
                 rb.release_reservation();
             } else {
                 // 期限超過なら worker へ手放しを伝える。put の失敗・遅れた完了の後始末（削除と予約の解放）は
@@ -2142,6 +2183,12 @@ impl CriRuntimeService {
                 // worker が既に失敗の後始末を引き取っていれば何もしない。
                 rb.settlement.abandon();
             }
+        } else if let Some(rb) = &rollback
+            && result.is_err()
+            && rb.spawn_failed.load(Ordering::SeqCst)
+        {
+            // 確定版の put の worker を起動できなかった。メモリの記録を notready にする。
+            rb.make_recoverable();
         }
         drop(abandon);
         result
@@ -2204,33 +2251,42 @@ impl CriRuntimeService {
             StoreCall::Remove(..) => SANDBOX_UNPERSIST_FAILED,
         };
         let moved = guard.take();
+        let spawn_failed = match &call {
+            StoreCall::Put(_, _, Some(rb)) => Some(Arc::clone(&rb.spawn_failed)),
+            _ => None,
+        };
         let outcome = run_bounded(self.runtime_timeout, move || {
             let result = match &call {
                 StoreCall::Put(id, bytes, rollback) => {
-                    if let Some(rb) = rollback {
-                        rb.ran.store(true, Ordering::SeqCst);
-                    }
-                    // panic したら予約を回復可能な状態へ倒す（スロットを塞いだままにしない）。
+                    // panic したら予約を回復可能な状態へ倒す（スロットを塞いだままにしない）。後始末の削除も
+                    // 守るため、番人は後始末が済むまで外さない。
                     let mut panic_guard = PutWorkerGuard {
                         rollback: rollback.clone(),
                     };
                     let result = store.put(RecordKind::Sandbox, id, bytes);
-                    panic_guard.defuse();
                     // 巻き戻し用の put の後始末（ファイルの削除と予約の解放）は worker 自身が持つ。呼び出し側が
                     // 手放した（期限超過・future の破棄）場合と、put 自体が失敗した場合（書きかけが残りうる）は、
                     // 完了の直後にここで消す（別 worker の削除と競合させず、await の途中で中断されても
                     // 予約の解放・回復可能化が漏れない）。予約は削除に成功したときだけ戻す（失敗時は Stop・Remove で
                     // 回収できる notready の記録として残す。#2933・CRI-2・REPAIR-3・REPAIR-5）。
+                    // 確定版の put が失敗したら notready にする（削除はしない。資源は既にある）。
                     if let Some(rb) = rollback {
                         let failed = result.is_err();
-                        if failed {
-                            rb.settlement.take_failed_cleanup();
-                        }
-                        if failed || !rb.settlement.settle_by_worker() {
-                            let removed = store.remove(RecordKind::Sandbox, id).is_ok();
-                            rb.settle_after_remove(removed);
+                        if rb.confirm {
+                            if failed {
+                                rb.make_recoverable();
+                            }
+                        } else {
+                            if failed {
+                                rb.settlement.take_failed_cleanup();
+                            }
+                            if failed || !rb.settlement.settle_by_worker() {
+                                let removed = store.remove(RecordKind::Sandbox, id).is_ok();
+                                rb.settle_after_remove(removed);
+                            }
                         }
                     }
+                    panic_guard.defuse();
                     result.map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))
                 }
                 StoreCall::Remove(id, finalize) => match store.remove(RecordKind::Sandbox, id) {
@@ -2250,7 +2306,15 @@ impl CriRuntimeService {
                 result
             }
             // 期限超過・起動失敗: guard は worker（または破棄されたクロージャ）が持つ。
-            Err(_) => Err(CriError::internal(failure)),
+            Err(err) => {
+                // スレッドを起動できなかった（`UNAVAILABLE`）なら worker は走らない。期限超過とは区別する。
+                if err.code() == CriErrorCode::Unavailable
+                    && let Some(flag) = spawn_failed
+                {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Err(CriError::internal(failure))
+            }
         }
     }
 

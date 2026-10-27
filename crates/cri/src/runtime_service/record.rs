@@ -23,7 +23,7 @@
 //! `RunPodSandbox` / `CreateContainer` と同じ上限検証（`config_limits`）を通す。
 //!
 //! 呼び出し元になる予定: R2（バイト列の読み書き。上限は [`MAX_SANDBOX_RECORD_BYTES`] /
-//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4 / R5（書く時点）・R6 / R7（起動時の再採用）。
+//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4（sandbox の書く時点。実装済み）・R5（コンテナの書く時点）・R6 / R7（起動時の再採用）。
 
 use std::collections::HashSet;
 
@@ -31,7 +31,9 @@ use prost::Message;
 
 use super::config_limits::MAX_CONFIG_ENCODED_BYTES;
 use super::container::{ContainerState, validate_container_config};
-use super::{InFlightKind, SUPPORTED_RUNTIME_HANDLERS, SandboxState, validate_sandbox_config};
+use super::{
+    InFlightKind, SUPPORTED_RUNTIME_HANDLERS, SandboxRecord, SandboxState, validate_sandbox_config,
+};
 use crate::adapter::RuntimeTerminationReason;
 use crate::bundle::spec::{MAX_ADDITIONAL_GIDS, is_valid_image_reference, is_valid_image_tag};
 use crate::bundle::{AppliedUser, ResolvedImage};
@@ -79,9 +81,7 @@ const _: () = assert!(MAX_CONTAINER_RECORD_BYTES > MAX_SANDBOX_RECORD_BYTES);
 const SANDBOX_MALFORMED: &str = "sandbox record is malformed";
 const CONTAINER_MALFORMED: &str = "container record is malformed";
 
-/// sandbox 記録 1 件分の内容（registry の `SandboxRecord` との変換は R4 #2933）。
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
+/// sandbox 記録 1 件分の内容（registry の `SandboxRecord` からの変換は [`Self::from_registry`]。R4 #2933）。
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SandboxRecordData {
     pub(super) id: String,
@@ -118,7 +118,7 @@ pub(super) struct ContainerRecordData {
 }
 
 /// 復号した sandbox 記録と、数え直した config の保持量見積もり。
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+// R6 #2935（起動時の再採用）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct DecodedSandbox {
@@ -357,9 +357,22 @@ impl<'a> Lines<'a> {
 // sandbox
 // ---------------------------------------------------------------------------
 
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
 impl SandboxRecordData {
+    /// registry の記録 1 件から、ディスクへ書く内容を作る（`CriRuntimeService` が書く時点ごとにロック下で呼ぶ。
+    /// R4 #2933）。`network_teardown`・`pod_netns`（R12）・`retained_bytes` は記録に載せない。
+    pub(super) fn from_registry(id: &str, record: &SandboxRecord, pending: bool) -> Self {
+        Self {
+            id: id.to_owned(),
+            config: record.config.clone(),
+            state: record.state,
+            created_at_nanos: record.created_at_nanos,
+            runtime_handler: record.runtime_handler,
+            pending,
+            network_owned: record.network_owned,
+            network_pending: record.network_pending,
+        }
+    }
+
     /// 記録のバイト列を作る。形式に載せられない値（ID の形式違反・未対応の handler・時刻の範囲外・
     /// config の符号化長超過）は `INTERNAL`（成功を装わない）。
     pub(super) fn encode(&self) -> Result<Vec<u8>, CriError> {
@@ -390,6 +403,8 @@ impl SandboxRecordData {
 
     /// 記録のバイト列を厳密に復号する。`expect_id` は記録のファイル名由来の ID。
     /// どの違反も固定文言の `INVALID_ARGUMENT` で、入力値を含めない。
+    // R6 #2935（起動時の再採用）が呼ぶまでは試験からしか呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+    #[allow(dead_code)]
     pub(super) fn decode(bytes: &[u8], expect_id: &str) -> Result<DecodedSandbox, CriError> {
         let malformed = || CriError::invalid_argument(SANDBOX_MALFORMED);
         if bytes.len() > MAX_SANDBOX_RECORD_BYTES {

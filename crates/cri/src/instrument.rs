@@ -420,7 +420,6 @@ mod tests {
         CriOpKind::PullImage,
     ];
 
-    /// REPAIR-4: 操作名は安定した固定文字列。
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。
     #[test]
     fn repair4_registry_http_class_table() {
@@ -482,6 +481,7 @@ mod tests {
         assert_eq!(rec.items()[0].registry_http(), None);
     }
 
+    /// REPAIR-4: 操作名は安定した固定文字列。
     #[test]
     fn repair4_cri_op_kind_as_str_is_stable() {
         assert_eq!(CriOpKind::RunPodSandbox.as_str(), "cri.run_pod_sandbox");

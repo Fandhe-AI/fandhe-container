@@ -28,8 +28,11 @@
 //! 2. core の bind 経路は rootless の起動経路が対象。rootful との差は #2241 の範囲。
 //! 3. 元が UNIX ソケット（PoC-14 の `/run/nvidia-persistenced/socket`）は core が種別で拒否する。本層は
 //!    FS に触れないため検出しない。
-//! 4. 宛先経路上の symlink の解決は TASK-127 の別の子の担当。usr-merge 正規化済みの宛先を受けるだけで、
-//!    それ以外の symlink を含む宛先は core が拒否する。
+//! 4. 宛先経路上の symlink は gpu では解決しない。usr-merge のリンク（rootfs 直下の 6 件）は適用層が
+//!    `detect_usr_merge_layout` でコンテナ rootfs を検出し `normalize_cdi_spec_paths`（`PathLayouts.container`）
+//!    で避ける。それ以外の symlink を含む宛先は core の適用の段（契約 3・`path_symlink_or_not_directory`）が
+//!    拒否する（#1910 の項目 5）。固定する試験は `tests/cdi_mount_destination_links.rs`（#2985・GPU-1・
+//!    GPU-2・SEC-1）。検出を呼ぶ配線（どの rootfs を渡すか）は #2774 の範囲。
 //! 5. `mounts[]` への合流と実 namespace の mountinfo での確認は #2774・#552 の範囲。
 
 use crate::cdi_edits::AggregatedEdits;

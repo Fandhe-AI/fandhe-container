@@ -349,7 +349,7 @@ mod supported {
 
     /// 計測対象のプロセスグループ（計測対象と、その子孫である常駐 plugin）へ SIGKILL を送る。
     /// 計測対象は未回収（pid 保持中）の状態で呼ぶこと。pgid の再利用による誤殺を避けるため。
-    /// 本 crate は libc に依存せず unsafe も使えないため、OS 同梱の `kill` コマンドを環境空・
+    /// `libc` は unix の dev-dependency だが宣言の照合専用で、試験コードでは `sys` の外の `unsafe` を使えない（coding-rust.md）ため、OS 同梱の `kill` コマンドを環境空・
     /// 絶対パスで起動する。失敗は無視し、呼び出し側が続けて計測対象本体を kill する。
     fn kill_process_group(child: &std::process::Child) {
         let target = format!("-{}", child.id());

@@ -253,10 +253,10 @@ if [ ! -e "${TMP}/own-out.json" ]; then pass "own creates no output file"; else 
 check "own makes no docker call" empty_file "${STUB_DIR}/calls"
 
 # --- report ---
-# mkres <target> <wall_ms> <p95_us> [method] [count]
+# mkres <target> <wall_ms> <p95_us> [method] [count] [image_id]
 mkres() {
-  jq -n --arg t "$1" --argjson w "$2" --argjson p "$3" --arg m "${4:-batch-boundary-provisional}" --argjson c "${5:-2000}" '
-    { schema: "fandhe-container.mac-small-files/v1", mode: $t, target: $t, label: $t, image: "alpine:3.20", mount_kind: "bind",
+  jq -n --arg id "${6:-sha256:$(printf 'a%.0s' $(seq 1 64))}" --arg t "$1" --argjson w "$2" --argjson p "$3" --arg m "${4:-batch-boundary-provisional}" --argjson c "${5:-2000}" '
+    { schema: "fandhe-container.mac-small-files/v1", mode: $t, target: $t, label: $t, image: "alpine:3.20", image_id: $id, mount_kind: "bind",
       workload: { count: $c, file_bytes: 2, batch: 20, ops: "x" }, trials_ok: 5,
       metrics: { wall_clock_median_ms: { value: $w, unit: "ms", method: "docker-run-rm-total" },
                  metadata_p95_us: { value: $p, unit: "us", method: $m } } }'
@@ -284,6 +284,21 @@ runit --mode report --own-result "${TMP}/o-noimg.json" --baseline-result "${TMP}
 check "report rejects results without image with 2" rc_is 2
 runit --mode report --own-result "${TMP}/b.json" --baseline-result "${TMP}/b.json"
 check "report rejects a docker result as --own-result with 2" rc_is 2
+# 同じタグでも image_id が違えば比較不能（率は null）
+mkres own 800 75 batch-boundary-provisional 2000 "sha256:$(printf 'b%.0s' $(seq 1 64))" >"${TMP}/o-id.json"
+runit --mode report --own-result "${TMP}/o-id.json" --baseline-result "${TMP}/b.json"
+check "image_id mismatch: both ratios are null" jq_ok '.metadata_p95_reduction_ratio == null and .wall_clock_reduction_ratio == null' "${TMP}/out"
+# 複数 JSON 値（不正な先頭 + 正しい own）は拒否（2）
+{ jq -c '.target = "docker"' "${TMP}/o.json"; cat "${TMP}/o.json"; } >"${TMP}/o-multi.json"
+runit --mode report --own-result "${TMP}/o-multi.json" --baseline-result "${TMP}/b.json"
+check "multi-value result file is rejected with 2" rc_is 2
+# unit / mount_kind / trials_ok / image_id 欠損は両側で欠けても入力エラー（2）
+for k in .mount_kind .trials_ok .image_id .metrics.wall_clock_median_ms.unit; do
+  jq "del($k)" "${TMP}/b.json" >"${TMP}/b-del.json"
+  jq "del($k)" "${TMP}/o.json" >"${TMP}/o-del.json"
+  runit --mode report --own-result "${TMP}/o-del.json" --baseline-result "${TMP}/b-del.json"
+  check "report rejects results without ${k} with 2" rc_is 2
+done
 
 echo "passed=${PASS} failed=${FAIL}"
 [ "$FAIL" -eq 0 ]

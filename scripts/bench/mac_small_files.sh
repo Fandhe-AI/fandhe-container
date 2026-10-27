@@ -223,7 +223,7 @@ backend_cleanup() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  run_limited_abort
+  run_limited_abort || true
   if [ "$cleanup_needed" -eq 1 ] && [ -n "$run_tag" ] && [ -d "$work" ]; then
     backend_cleanup || cleanup_failed=1
   fi
@@ -232,11 +232,12 @@ cleanup() {
     local d
     while IFS= read -r d; do
       case "$d" in
-        "${host_dir}"/fandhe-mac-small-files.*) rm -rf "$d" ;;
+        "${host_dir}"/fandhe-mac-small-files.*) rm -rf "$d" || cleanup_failed=1 ;;
       esac
     done <"$trial_dirs_file"
   fi
-  [ -z "$work" ] || rm -rf "$work"
+  # 後始末の失敗でも set -e で打ち切らず、cleanup-failed（終了コード 4）まで到達させる。
+  if [ -n "$work" ]; then rm -rf "$work" || cleanup_failed=1; fi
   if [ "$cleanup_failed" -eq 1 ]; then
     echo "error: code=cleanup-failed message=containers labeled ${LABEL_KEY}=${run_tag} may remain; inspect and remove them manually" >&2
     exit 4
@@ -263,31 +264,34 @@ run_report() {
     [ -f "$f" ] && [ ! -L "$f" ] || usage_error "result files must be regular files"
     size="$(wc -c <"$f" | tr -d ' ')"
     [ "$size" -le "$MAX_RESULT_BYTES" ] || usage_error "result file is too large"
-    jq -e --arg s "$SCHEMA" '
-      .schema == $s
+    # 複数の JSON 値を含むファイルを弾くため slurp し、ちょうど 1 要素であることを要求する。
+    jq -s -e --arg s "$SCHEMA" --arg want "$([ "$f" = "$own_result" ] && echo own || echo docker)" '
+      length == 1 and (.[0]
+      | .schema == $s
+      and .target == $want
       and (.metrics.wall_clock_median_ms.value | type == "number" and . > 0)
       and (.metrics.metadata_p95_us.value | type == "number" and . > 0)
-      and (.metrics.wall_clock_median_ms.method | type == "string")
-      and (.metrics.metadata_p95_us.method | type == "string")
+      and (.metrics.wall_clock_median_ms.method | type == "string" and length > 0)
+      and (.metrics.metadata_p95_us.method | type == "string" and length > 0)
+      and (.metrics.wall_clock_median_ms.unit | type == "string" and length > 0)
+      and (.metrics.metadata_p95_us.unit | type == "string" and length > 0)
       and (.workload | type == "object")
       and (.workload.count | type == "number" and . > 0)
       and (.workload.batch | type == "number" and . > 0)
       and (.workload.file_bytes | type == "number" and . >= 0)
       and (.image | type == "string" and length > 0)
+      and (.image_id | type == "string" and test("^sha256:[0-9a-f]{64}$"))
       and (.mount_kind | type == "string" and length > 0)
-      and (.metrics.wall_clock_median_ms.unit | type == "string" and length > 0)
-      and (.metrics.metadata_p95_us.unit | type == "string" and length > 0)
-      and (.trials_ok | type == "number" and . >= 5)
-    ' "$f" >/dev/null 2>&1 || usage_error "result file failed schema validation"
+      and (.label | type == "string")
+      and (.trials_ok | type == "number" and . >= 5))
+    ' "$f" >/dev/null 2>&1 || usage_error "result file failed validation (single JSON object, schema, target=$([ "$f" = "$own_result" ] && echo own || echo docker) and required fields)"
   done
-  jq -e '.target == "own"' "$own_result" >/dev/null 2>&1 || usage_error "--own-result must be a target=own result"
-  jq -e '.target == "docker"' "$baseline_result" >/dev/null 2>&1 || usage_error "--baseline-result must be a target=docker result"
   local tmp
   tmp="$(mktemp)"
   trap 'rm -f "$tmp"' EXIT
   jq -n --slurpfile o "$own_result" --slurpfile b "$baseline_result" --arg schema "$REPORT_SCHEMA" '
     ($o[0]) as $own | ($b[0]) as $base
-    | (($own.workload == $base.workload) and ($own.image == $base.image) and ($own.mount_kind == $base.mount_kind)) as $same_wl
+    | (($own.workload == $base.workload) and ($own.image == $base.image) and ($own.image_id == $base.image_id) and ($own.mount_kind == $base.mount_kind)) as $same_wl
     | def rate($k): if $same_wl and ($own.metrics[$k].method == $base.metrics[$k].method) and ($own.metrics[$k].unit == $base.metrics[$k].unit)
         then ((1 - ($own.metrics[$k].value / $base.metrics[$k].value)) * 1000000 | round / 1000000) else null end;
     {
@@ -299,7 +303,7 @@ run_report() {
       wall_clock_reduction_ratio: rate("wall_clock_median_ms"),
       metadata_p95_reduction_ratio: rate("metadata_p95_us"),
       methods_differ: ((rate("wall_clock_median_ms") == null) or (rate("metadata_p95_us") == null)),
-      note: "ratios are 1 - own/baseline (positive means own is faster); null when workload, image, mount kind, method or unit differ. No pass/fail here: the MAC-3 thresholds (wall clock >= 15% shorter, or metadata p95 >= 20% lower than Docker Desktop VirtioFS) are judged by a human in TASK-70 (#381). The p95 method is provisional (owner confirmation pending)"
+      note: "ratios are 1 - own/baseline (positive means own is faster); null when workload, image (tag or digest), mount kind, method or unit differ. No pass/fail here: the MAC-3 thresholds (wall clock >= 15% shorter, or metadata p95 >= 20% lower than Docker Desktop VirtioFS) are judged by a human in TASK-70 (#381). The p95 method is provisional (owner confirmation pending)"
     }' >"$tmp" 2>/dev/null || fail_measure "cannot build the report"
   emit_result "$tmp"
   rm -f "$tmp"

@@ -14,4 +14,5 @@ if [ -z "${OWN_RESULT:-}" ] || [ -z "${BASELINE_RESULT:-}" ]; then
 fi
 args=(--mode report --own-result "${OWN_RESULT}" --baseline-result "${BASELINE_RESULT}")
 if [ -n "${OUTPUT:-}" ]; then args+=(--output "${OUTPUT}"); fi
-run bash scripts/bench/mac_small_files.sh "${args[@]}"
+# run は実行前にコマンド行を stdout へ出し JSON を壊すため、直接呼ぶ（small_files_compare.sh と同じ）。
+bash scripts/bench/mac_small_files.sh "${args[@]}"

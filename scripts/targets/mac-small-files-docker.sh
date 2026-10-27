@@ -22,4 +22,5 @@ if [ -n "${LABEL:-}" ]; then args+=(--label "${LABEL}"); fi
 if [ -n "${TRIAL_TIMEOUT_SECS:-}" ]; then args+=(--trial-timeout-secs "${TRIAL_TIMEOUT_SECS}"); fi
 if [ -n "${TIMEOUT_SECS:-}" ]; then args+=(--timeout-secs "${TIMEOUT_SECS}"); fi
 if [ -n "${OUTPUT:-}" ]; then args+=(--output "${OUTPUT}"); fi
-run bash scripts/bench/mac_small_files.sh "${args[@]}"
+# run は実行前にコマンド行を stdout へ出し JSON を壊すため、直接呼ぶ（small_files_compare.sh と同じ）。
+bash scripts/bench/mac_small_files.sh "${args[@]}"

@@ -6,6 +6,10 @@
 //! `rootless_uid_mapping`・`rootless_image_rootfs_remove`）が、委譲 cgroup・範囲写像の前提（`uidmap`・
 //! `/etc/subuid`・`/etc/subgid`）・Landlock の前提が欠けたとき、`expect` の文言ではなく
 //! `<試験名>: PRECONDITION FAILED (test environment, not a <X> regression): ...` の 1 行目で失敗させる。
+//! core の cgroup 系の実機前提試験（`cgroup_*`・`cgroups*`・`confirm_recorded_cgroup`・
+//! `device_cgroup_layers`・`exec_cgroup_kill`・`exec_cgroup_sweep` の 23 本。#2956）は、委譲 cgroup の検出だけを
+//! `delegated_cgroup()` で行う。`cgroups_release_agent` の既定試験 `sec6_task35_*` が行う
+//! `DelegatedCgroup::detect()` の拒否そのものの検証（CORE-4・SEC-6）は、検証が逆になるため通さない。
 //! kcmp の前提欠如（#2788）と同じ接頭辞で、`AGENTS.md` の見分け方と一致する。
 //!
 //! # 契約
@@ -19,6 +23,9 @@
 //! # 取り込み方
 //! `real_entry.rs` が `pub mod precondition` として取り込む（それを使う試験は `real_entry::precondition`）。
 //! `real_entry.rs` を使わない試験は `#[path = "support/precondition.rs"] mod precondition;` で直接取り込む。
+//! cgroup 系は `real_entry.rs` を使わず、各試験の `mod linux` と同じ cfg の下で直接取り込む。
+//! libtest の試験は ignore しない `repair12_precondition_self_check` で、`harness = false` の試験は
+//! `main` の先頭で `self_check()` を呼び、既定の `cargo test -p fandhe-container-core` で自己照合を走らせる。
 
 use fandhe_container_core::cgroups::CgroupStep;
 use fandhe_container_core::landlock::LandlockUnavailable;

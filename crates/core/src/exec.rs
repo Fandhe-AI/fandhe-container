@@ -117,6 +117,7 @@ mod device_probe;
 mod devices;
 mod diagnostic;
 mod entrypoint_mode;
+mod etc_mounts;
 mod exec_command;
 mod inject;
 mod interpreter;
@@ -184,6 +185,7 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
+pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
     ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
     spawn_exec_worker_with_listener,
@@ -838,6 +840,8 @@ pub enum IsolationStage {
     ApplySysctls,
     /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true`。`mount_setattr(MOUNT_ATTR_RDONLY)`。CORE-5・SEC-1・#2767）。
     RootReadOnly,
+    /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
+    MountEtcFiles,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

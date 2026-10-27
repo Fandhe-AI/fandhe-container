@@ -13,7 +13,7 @@
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
 //!       -> (apply_sysctls)  // `linux.sysctl` の指定時のみ。verify_pinned の直後・mount_sysfs の前（CRI-2・CORE-3・#2670）
-//!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
+//!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_etc_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
@@ -133,9 +133,10 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::sysctls::{self, SysctlPlan};
 use super::{
-    DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir, fd_mount_id,
-    inject_files, mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
+    DeviceReport, DevptsGidSource, EtcFileMounts, ExecError, IsolationStage, MountIsolation,
+    PivotReport, StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir,
+    fd_mount_id, inject_files, mount_etc_files, mount_sysfs, mount_tmpfs, pivot_root,
+    prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
@@ -2473,6 +2474,10 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
     /// tmpfs の後に注入するファイル（無ければ注入しない）。
     pub(crate) inject: Option<&'a InjectedFileSet>,
+    /// 注入の後・bind mount の前に載せる、管理ルートの `/etc/hosts`・`/etc/resolv.conf`(無ければ載せない。NET-12・#1872)。
+    /// launcher が fork 前に `EtcFileMounts::verify` で検証したものだけを渡す。[`run_pre_pivot`] は tmpfs・注入・bind との
+    /// 重なりを副作用の前に再検査する(多重防御)。
+    pub(crate) etc_files: Option<&'a EtcFileMounts>,
     /// 注入の後に載せる bind mount（無ければ載せない。#1914・TASK-29 追補）。呼び出し側（`start` が host_paths・保護パスを、
     /// 本番 launcher が tmpfs を検査済み。#1915）が `check_against_*` を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・
     /// 保護パスとの重なりを副作用の前に再検査する（多重防御）。本番の launcher は `LaunchSpec::bind_mounts` が非空のときだけ渡す。
@@ -2573,6 +2578,13 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         set: &InjectedFileSet,
+    ) -> Result<(), ExecError>;
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind(NET-12・#1872)。`inject_files` の後・`mount_binds` の前。
+    fn mount_etc_files(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        mounts: &EtcFileMounts,
     ) -> Result<(), ExecError>;
     /// 検証済みの bind mount の適用。`/dev` とその配下は宛先にできない（`RESERVED_DESTINATIONS`）ため、
     /// `mount_tmpfs` と違い `/dev` の作成順の証跡（`Devices`）は受けない（#1914）。
@@ -2781,6 +2793,25 @@ impl PrePivotOps for RealPrePivotOps {
         Ok(())
     }
 
+    fn mount_etc_files(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        mounts: &EtcFileMounts,
+    ) -> Result<(), ExecError> {
+        let report = mount_etc_files(isolation, prepared, mounts)?;
+        for outcome in &report.mounts {
+            self.record(
+                prepared,
+                MountedBy::EtcFile,
+                outcome.destination,
+                outcome.read_only,
+                IsolationStage::MountEtcFiles,
+            )?;
+        }
+        Ok(())
+    }
+
     fn mount_binds(
         &self,
         isolation: &MountIsolation,
@@ -2880,10 +2911,22 @@ fn check_bind_overlaps(
         .map_err(to_exec)
 }
 
+/// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` が tmpfs・注入・bind の宛先と重ならないことを再検査する(純関数。NET-12・SEC-1)。
+fn check_etc_overlaps_exec(
+    mounts: &EtcFileMounts,
+    tmpfs: Option<&TmpfsMountSet>,
+    inject: Option<&InjectedFileSet>,
+    binds: Option<&BindMountSet>,
+) -> Result<(), ExecError> {
+    let empty = TmpfsMountSet::new();
+    crate::etc_files::check_etc_overlaps(mounts.selection(), tmpfs.unwrap_or(&empty), inject, binds)
+        .map_err(|e| ExecError::new(e.code(), IsolationStage::MountEtcFiles, e.message()))
+}
+
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
 /// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `apply_sysctls`（指定時。#2670）→ `mount_sysfs`（指定時）→ `create_default_devices` →
-/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_etc_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
 /// `masked_paths`（`setup` 指定時）→ `pivot_root`。
 ///
 /// # bind mount の段の位置（#1914・TASK-29 追補。CORE-1・CORE-5・SEC-1・SEC-2）
@@ -2900,8 +2943,11 @@ fn check_bind_overlaps(
 /// 5. OCI の「`mounts` は列挙順に適用」は、bind 以外を拒否し `mount_binds` が指定順に適用することで守る。他の段とは
 ///    重ならないため、順序を入れ替えても木は同じになる。
 ///
-/// #1872（`/etc/hosts`・`/etc/resolv.conf`）の段は `inject_files` と同種のため、`inject_files` の後・`mount_binds` の前に
-/// 置く想定。その際は `/etc` などの祖先 bind を拒否する重なり検査も要る（本 PR は先取りしない）。
+/// `/etc/hosts`・`/etc/resolv.conf` の段(`mount_etc_files`。指定時のみ。NET-12・#1872)は `inject_files` と同種のため、
+/// `inject_files` の後・`mount_binds` の前に置く。`/etc` などの祖先の tmpfs・bind と、`/etc/hosts` 自体への重なりは
+/// 段の先頭の `check_etc_overlaps_exec` が副作用の前に拒否する。bind より前に置くのは、利用者の bind が `/etc/hosts` と
+/// 重なる構成を型の検査で除外済みであること(重なれば `check_etc_overlaps_exec` が拒否)と、作成を伴う段を bind より
+/// 前に置く規則(上の 2)に揃えるため。
 ///
 /// Landlock との整合: `mount_binds` が付け替え後に自分のマウントを事後検証し、以降の段は `/proc`・`/sys` だけを対象と
 /// するため、pivot 時点で宛先の最上位のマウントは bind のまま残る。`RulePath::Beneath(dest)` を辿ると適用した bind の
@@ -2972,6 +3018,13 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(set) = setup.inject {
             ops.inject_files(&isolation, &prepared, set)
                 .map_err(StepError::at(S::InjectFiles))?;
+        }
+        if let Some(mounts) = setup.etc_files {
+            // 多重防御: launcher の fork 前の検査と同じ規則を、副作用の前に再検査する(NET-12・SEC-1)。
+            check_etc_overlaps_exec(mounts, setup.tmpfs, setup.inject, setup.binds)
+                .map_err(StepError::at(S::EtcFiles))?;
+            ops.mount_etc_files(&isolation, &prepared, mounts)
+                .map_err(StepError::at(S::EtcFiles))?;
         }
         if let Some(set) = setup.binds {
             check_bind_overlaps(set, setup.tmpfs, setup.inject, setup.config_paths)
@@ -3300,6 +3353,7 @@ where
                 devices,
                 tmpfs,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
@@ -3358,6 +3412,7 @@ where
                 devices,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: Some(sysfs),
                 working_dir: None,
@@ -3533,6 +3588,7 @@ pub fn spawn_container_with_stages_and_devices(
                 devices,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
@@ -6541,6 +6597,11 @@ mod tests {
                 IsolationStage::ApplySysctls,
                 "injected failure",
             ),
+            "etc_files" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountEtcFiles,
+                "injected failure",
+            ),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -6598,6 +6659,9 @@ mod tests {
         }
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
+        }
+        fn mount_etc_files(&self, _: &(), _: &(), _: &EtcFileMounts) -> Result<(), ExecError> {
+            self.step("etc_files")
         }
         fn mount_binds(&self, _: &(), _: &(), _: &BindMountSet) -> Result<(), ExecError> {
             self.step("mount_binds")
@@ -6673,6 +6737,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let pinned = std::fs::File::open("/").unwrap();
+        let etc_mounts = EtcFileMounts::for_test(
+            &[
+                crate::etc_files::EtcFileKind::Hosts,
+                crate::etc_files::EtcFileKind::ResolvConf,
+            ],
+            false,
+        );
         let _ = take_calls();
         run_pre_pivot(
             &RecordingOps { fail_at: None },
@@ -6682,6 +6753,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
+                etc_files: Some(&etc_mounts),
                 binds: Some(&binds),
                 sysfs: Some(&sysfs),
                 pinned_rootfs: Some(pinned.as_fd()),
@@ -6703,6 +6775,7 @@ mod tests {
                 "create_default_devices",
                 "mount_tmpfs",
                 "inject_files",
+                "etc_files",
                 "mount_binds",
                 "readonly_paths",
                 "masked_paths",
@@ -6731,6 +6804,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: Some(pinned.as_fd()),
@@ -6780,6 +6854,7 @@ mod tests {
                     devices: DevptsGidSource::Rootful,
                     tmpfs: None,
                     inject: None,
+                    etc_files: None,
                     binds: None,
                     sysfs: spec,
                     pinned_rootfs: None,
@@ -6807,6 +6882,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
@@ -6848,6 +6924,7 @@ mod tests {
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             pinned_rootfs: None,
@@ -6908,6 +6985,7 @@ mod tests {
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             pinned_rootfs: None,
@@ -6985,6 +7063,7 @@ mod tests {
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             pinned_rootfs: None,
@@ -7052,6 +7131,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
@@ -7086,6 +7166,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: Some(&binds),
                 sysfs: None,
                 pinned_rootfs: None,
@@ -7162,6 +7243,7 @@ mod tests {
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
+                    etc_files: None,
                     binds: Some(&binds),
                     sysfs: None,
                     pinned_rootfs: None,
@@ -7225,6 +7307,7 @@ mod tests {
             ),
             ("mount_tmpfs", ErrorCode::NotFound, None),
             ("inject_files", ErrorCode::InvalidArgument, None),
+            ("etc_files", ErrorCode::FailedPrecondition, None),
             (
                 "mount_binds",
                 ErrorCode::PermissionDenied,
@@ -7248,6 +7331,7 @@ mod tests {
             ("working_dir", ErrorCode::NotFound, None),
         ];
         let wd = ContainerWorkingDir::parse(Path::new("/app")).unwrap();
+        let etc_mounts = EtcFileMounts::for_test(&[crate::etc_files::EtcFileKind::Hosts], false);
         for (name, code, reason) in expected {
             let err = run_pre_pivot(
                 &RecordingOps {
@@ -7259,6 +7343,7 @@ mod tests {
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
+                    etc_files: Some(&etc_mounts),
                     binds: Some(&binds),
                     sysfs: None,
                     pinned_rootfs: Some(pinned.as_fd()),

@@ -1357,6 +1357,7 @@ mod tests {
             devices: crate::exec::DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             sysctls: Some(&plan),

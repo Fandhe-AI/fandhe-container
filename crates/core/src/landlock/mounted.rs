@@ -10,7 +10,7 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_binds` の成功直後に
+//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_etc_files`・`mount_binds` の成功直後に
 //!   [`MountedTargets::push`] する。段の順に並ぶ（同じキーが複数あれば後勝ち。後から載せたものが上になる）
 //! - 受け渡し: `run_child_then` が `StagePipeline::with_mounted_targets` で Landlock 段へ渡す（pivot で `mnt_id` と
 //!   `(st_dev, st_ino)` は変わらない。`PivotReport.new_root_mnt_id` の pivot 後の再照合が先例）
@@ -60,6 +60,8 @@ pub(crate) enum MountedBy {
     Tmpfs,
     /// ファイル注入の段（注入ディレクトリの tmpfs）。
     Inject,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount の段（識別子の記録のみ。Landlock のルールは作らない。NET-12・#1872）。
+    EtcFile,
     /// bind mount の段。`index` は `mounts[]` 内の位置（`RuleOrigin::Mount` と同じ番号）。
     Bind {
         /// `mounts[]` 内の位置。

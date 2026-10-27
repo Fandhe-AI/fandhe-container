@@ -115,6 +115,42 @@ impl FailedAttachClaim {
         })
     }
 
+    /// 単体の切り離し（`detach_container`）の取り残しから請求書を組む（NET-1・NET-3・#3062）。
+    ///
+    /// 世代は veth の所有トークン `host_token` の末尾 `/g/<世代>` から取る（入力検証で `host_token_is_for` を
+    /// 通した値だけを渡す）。取れない・3 つのフラグがすべて偽なら `None`（`from_record` が資源なしの記録を
+    /// 拒否する規則と揃える）。`pin` は `netns` のときだけ持つ。
+    // 呼び出し元の `detach_container_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_detach(
+        network: &NetworkName,
+        token: &str,
+        endpoint: &EndpointId,
+        host_token: &str,
+        pin: Option<PinIdentity>,
+        veth: bool,
+        netns: bool,
+        quarantine: bool,
+    ) -> Option<Self> {
+        if !(veth || netns || quarantine) {
+            return None;
+        }
+        let generation = host_token
+            .rfind("/g/")
+            .map(|i| &host_token[i + 3..])
+            .filter(|g| is_valid_generation(g))?;
+        Some(Self {
+            network: network.clone(),
+            token: token.to_owned(),
+            endpoint: endpoint.clone(),
+            generation: generation.to_owned(),
+            veth,
+            netns,
+            pin: if netns { pin } else { None },
+            quarantine,
+        })
+    }
+
     /// 永続化記録（固定のテキスト。LF・ASCII）へ符号化する。
     pub fn to_record(&self) -> String {
         format!(

@@ -102,9 +102,11 @@
 //! - テーブルの所有トークンは `NFTA_TABLE_USERDATA` を保持するカーネルを前提とする。保持しない
 //!   カーネルではトークンが読み戻せず、削除は拒否される（手動解放）
 //! - link の dump API が無いため、IPAM に記録されていない孤児 veth は回収しない。担当 Issue 未確定
-//! - コンテナ単体の切り離しは未実装（attach の取り残しの veth は #2681、再起動後の pin は #2824 で回収できる）。担当 Issue 未確定
+//! - コンテナ単体の切り離しは `detach_container`（`delete/detach.rs`。#3062）。他のコンテナを残したまま公開 → veth → pin → アドレスの順に解放する。attach の取り残しの veth は #2681、再起動後の pin は #2824 で回収できる
 //! - pin 置き場の記録は IPAM のメモリ上の状態で、永続化（IPAM 状態の永続化と同じく未実装・担当 Issue 未確定）
 //!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
+
+mod detach;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -120,13 +122,20 @@ use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableDelete, TableGet};
 use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
+use crate::nftables_rules::NftRuleHandle;
+#[cfg(target_os = "linux")]
+use crate::nftables_rules::RuleDelete;
+
+pub use detach::ContainerDetachError;
+#[cfg(target_os = "linux")]
+pub use detach::detach_container;
 
 use super::attach_claim::PinIdentity;
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
     AttachedContainer, CreatedNetwork, EndpointId, FailedAttachClaim, FailedCreateClaim,
-    NetnsDirRecord, NetworkName, NetworkResourceNames, NftApplyFailure, PortRegistry,
+    NetnsDirRecord, NetworkName, NetworkResourceNames, NftApplyFailure, PortPublish, PortRegistry,
     ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, host_token_is_for,
     is_indeterminate, is_valid_generation, token_names_network,
 };
@@ -149,6 +158,8 @@ pub enum DeleteStep {
     DeleteBridge,
     /// IPAM・ポート予約の解放。
     ReleaseReservations,
+    /// コンテナ単体の切り離しでの公開（DNAT ルール）の個別解除（`detach_container`。#3062）。
+    UnpublishPorts,
 }
 
 /// 削除対象のリソース。
@@ -167,6 +178,8 @@ pub enum DeleteResource {
     Address(EndpointId, IpPrefix),
     /// ポート予約（ネットワーク単位）。
     PortReservation(NetworkName),
+    /// コンテナ単体の切り離しで扱った公開 1 件（DNAT ルール 2 本と受け口の予約。#3062）。
+    PortRules(EndpointId, PortPublish),
 }
 
 /// ネットワーク削除の結果。
@@ -248,6 +261,13 @@ pub(crate) trait DeleteOps {
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
     /// 専用テーブルをハンドル指定で削除する（配下の chain・ルールも消える）。名前では消さない。
     fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルの DNAT ルール 2 本（`prerouting`・`output`）をハンドル指定で 1 バッチ（all-or-nothing）で
+    /// 削除する（コンテナ単体の切り離しの公開の個別解除。`unpublish_container_port` と同じ手順。#3062）。
+    fn delete_rules(
+        &self,
+        table: &NftName,
+        handles: (NftRuleHandle, NftRuleHandle),
+    ) -> Result<(), NftApplyFailure>;
 }
 
 /// 渡されていない endpoint の pin の残存確認の失敗。
@@ -380,6 +400,49 @@ pub(super) fn require_table_owned(
     }
 }
 
+/// ネットワークのハンドルと IPAM の整合を検証する（何も変更しない）。`CreatedNetwork` も公開フィールドの
+/// ため、bridge・テーブル名と所有トークンがネットワーク名から導出したものと食い違っていないこと、IPAM が
+/// そのネットワークのものであることを確かめる。
+fn validate_network(network: &CreatedNetwork, ipam: &StaticIpam) -> Result<(), NetError> {
+    let consistent = NetworkResourceNames::derive(&network.name).is_ok_and(|n| {
+        n.bridge() == &network.bridge
+            && n.table() == &network.table
+            && token_names_network(&network.bridge_token, &network.name)
+    });
+    if !consistent {
+        return Err(precondition("network handle is inconsistent with its name"));
+    }
+    if ipam.network() != &network.name || ipam.gateway() != network.gateway {
+        return Err(precondition("ipam does not belong to the network"));
+    }
+    Ok(())
+}
+
+/// 渡されたコンテナが、このネットワークと IPAM の払い出しに属することを検証する（何も変更しない）。
+///
+/// 公開フィールドは呼び出し側が書き換えうるため、所有の判断に使う値はすべてネットワークと IPAM から
+/// 再導出した値と照合する。veth の所有トークンは bridge のトークンと endpoint から、pin のパスは接続時に
+/// 記録した置き場（記録があれば）から導く。`delete_network_with` と `detach_container_with` が共用する。
+fn validate_container<N>(
+    network: &CreatedNetwork,
+    ipam: &StaticIpam,
+    c: &AttachedContainer<N>,
+) -> Result<(), NetError> {
+    let names = VethNames::derive(&c.endpoint)?;
+    let pin_mismatch = ipam
+        .netns_dir_of(&c.endpoint)
+        .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
+    if ipam.address_of(&c.endpoint) != Some(c.address)
+        || names.host() != &c.host_veth
+        || names.peer() != &c.peer_veth
+        || !host_token_is_for(&network.bridge_token, &c.endpoint, &c.host_token)
+        || pin_mismatch
+    {
+        return Err(precondition("container does not belong to the network"));
+    }
+    Ok(())
+}
+
 /// 削除手順本体（OS 非依存。`ops` を差し替えて 3 OS で単体テストできる）。手順と方針はモジュール doc。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn delete_network_with<O: DeleteOps>(
@@ -391,28 +454,9 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
 ) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
     let mut report = NetworkDeleteReport::default();
 
-    // 0. 入力検証（何も変更しない）。`CreatedNetwork` も公開フィールドのため、bridge・テーブル名と
-    //    所有トークンがネットワーク名から導出したものと食い違っていないことを確かめる。
-    let consistent = NetworkResourceNames::derive(&network.name).is_ok_and(|n| {
-        n.bridge() == &network.bridge
-            && n.table() == &network.table
-            && token_names_network(&network.bridge_token, &network.name)
-    });
-    if !consistent {
-        return Err(fail(
-            precondition("network handle is inconsistent with its name"),
-            DeleteStep::Validate,
-            report,
-            containers,
-        ));
-    }
-    if ipam.network() != &network.name || ipam.gateway() != network.gateway {
-        return Err(fail(
-            precondition("ipam does not belong to the network"),
-            DeleteStep::Validate,
-            report,
-            containers,
-        ));
+    // 0. 入力検証（何も変更しない）。
+    if let Err(e) = validate_network(network, ipam) {
+        return Err(fail(e, DeleteStep::Validate, report, containers));
     }
     let mut passed: HashSet<EndpointId> = HashSet::new();
     let mut invalid: Option<NetError> = None;
@@ -424,28 +468,9 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             ));
             break;
         }
-        match VethNames::derive(&c.endpoint) {
-            Err(e) => {
-                invalid = Some(e);
-                break;
-            }
-            Ok(names) => {
-                // 公開フィールドは呼び出し側が書き換えうるため、所有の判断に使う値はすべてネットワークと
-                // IPAM から再導出した値と照合する。veth の所有トークンは bridge のトークンと endpoint から、
-                // pin のパスは接続時に記録した置き場（記録があれば）から導く。
-                let pin_mismatch = ipam
-                    .netns_dir_of(&c.endpoint)
-                    .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
-                if ipam.address_of(&c.endpoint) != Some(c.address)
-                    || names.host() != &c.host_veth
-                    || names.peer() != &c.peer_veth
-                    || !host_token_is_for(&network.bridge_token, &c.endpoint, &c.host_token)
-                    || pin_mismatch
-                {
-                    invalid = Some(precondition("container does not belong to the network"));
-                    break;
-                }
-            }
+        if let Err(e) = validate_container(network, ipam, c) {
+            invalid = Some(e);
+            break;
         }
     }
     if let Some(error) = invalid {
@@ -1150,6 +1175,31 @@ impl DeleteOps for LinuxDeleteOps<'_> {
                 error: e.into(),
             })
     }
+
+    fn delete_rules(
+        &self,
+        table: &NftName,
+        (prerouting, output): (NftRuleHandle, NftRuleHandle),
+    ) -> Result<(), NftApplyFailure> {
+        self.nft
+            .send_batch(self.timeout, |batch| {
+                for (chain, handle) in [("prerouting", prerouting), ("output", output)] {
+                    let rule = RuleDelete::new(
+                        NftFamily::Ipv4,
+                        table.clone(),
+                        NftName::new(chain)?,
+                        handle,
+                    );
+                    batch.push_with(|seq| rule.build(seq))?;
+                }
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|e| NftApplyFailure {
+                outcome: e.outcome(),
+                error: e.into(),
+            })
+    }
 }
 
 /// ネットワークを削除する（コンテナ側の veth・netns pin → 専用 nft テーブル → bridge → IPAM・ポート予約）。
@@ -1292,6 +1342,8 @@ mod tests {
         /// 置き場を開けない（消失・検査違反）とみなすときのエラー。
         dir_open_err: Option<NetErrorCode>,
         table_err: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// `delete_rules`（公開の個別解除）の失敗。
+        rules_err: Option<(NetErrorCode, NftBatchOutcome)>,
         /// 照会（`table_info`）で専用テーブルが存在しない（`NotFound`）とみなすか。
         table_absent: bool,
         /// 照会（`table_info`）の失敗。
@@ -1446,6 +1498,25 @@ mod tests {
         fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure> {
             self.rec(format!("delete_table {} handle={handle}", table.as_str()));
             match self.table_err {
+                Some((c, outcome)) => Err(NftApplyFailure {
+                    error: err(c),
+                    outcome,
+                }),
+                None => Ok(()),
+            }
+        }
+        fn delete_rules(
+            &self,
+            table: &NftName,
+            handles: (NftRuleHandle, NftRuleHandle),
+        ) -> Result<(), NftApplyFailure> {
+            self.rec(format!(
+                "delete_rules {} {}/{}",
+                table.as_str(),
+                handles.0.get(),
+                handles.1.get()
+            ));
+            match self.rules_err {
                 Some((c, outcome)) => Err(NftApplyFailure {
                     error: err(c),
                     outcome,
@@ -3015,4 +3086,6 @@ mod tests {
             assert!(!host_token_is_for(TOKEN, &ep, &bad), "{bad}");
         }
     }
+
+    mod detach_tests;
 }

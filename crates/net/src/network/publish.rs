@@ -593,6 +593,32 @@ impl PortRegistry {
         Ok(before - self.owners.len())
     }
 
+    /// `endpoint`（`network` 内）が持つ予約の件数を返す（予約は変えない。コンテナ単体の切り離し NET-1・NET-3・#3062）。
+    ///
+    /// 結果不明のまま記録した公開（ハンドルが無い）の予約が残っていないかの確認に使う。共有ファイル使用時は
+    /// ロックして最新を読み直す。ロック・解析の失敗は `Err`（呼び出し側は予約が残るものとして fail-closed に扱う）。
+    // 呼び出し元の `detach_container_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn held_by(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+    ) -> Result<usize, NetError> {
+        let _lock = match &self.shared {
+            Some(path) => {
+                let lock = open_locked(path)?;
+                self.owners = parse_shared(path)?;
+                Some(lock)
+            }
+            None => None,
+        };
+        Ok(self
+            .owners
+            .values()
+            .filter(|(n, e)| n == network && e == endpoint)
+            .count())
+    }
+
     /// `network` の予約をすべて解放し、解放した件数を返す（ネットワーク削除用。TASK-139.4・NET-1）。
     ///
     /// 結果が不明なバッチで quarantine 中の endpoint の予約も含む。手順・失敗時の扱い（予約を残して `Err`）は
@@ -806,6 +832,39 @@ mod tests {
         assert_eq!(
             s2.reserve(&web, &c2, &[p82]).unwrap_err().code(),
             NetErrorCode::AlreadyExists
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-1・NET-3・#3062: `held_by` は持ち主ごとの件数を返し、予約を変えない。共有ファイルでは別
+    /// インスタンスの予約も読み直して数え、壊れた内容は `Err`。
+    #[test]
+    fn net1_held_by_counts_owner_reservations() {
+        let web = NetworkName::new("web").unwrap();
+        let (c1, c2) = (
+            EndpointId::new("c1").unwrap(),
+            EndpointId::new("c2").unwrap(),
+        );
+        let mk = |p: u16| PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), p, 80).unwrap();
+        let mut r = PortRegistry::new();
+        r.reserve(&web, &c1, &[mk(8080), mk(8081)]).unwrap();
+        r.reserve(&web, &c2, &[mk(8082)]).unwrap();
+        assert_eq!(r.held_by(&web, &c1).unwrap(), 2);
+        assert_eq!(r.held_by(&web, &c2).unwrap(), 1);
+        assert_eq!(r.held_by(&NetworkName::new("db").unwrap(), &c1).unwrap(), 0);
+        assert_eq!(r.len(), 3);
+
+        let dir = shared_dir("held-by");
+        let path = dir.join("ports.reg");
+        let mut s1 = PortRegistry::with_shared_file(path.clone());
+        let mut s2 = PortRegistry::with_shared_file(path.clone());
+        s1.reserve(&web, &c1, &[mk(9000), mk(9001)]).unwrap();
+        assert_eq!(s2.held_by(&web, &c1).unwrap(), 2);
+        assert_eq!(s2.held_by(&web, &c2).unwrap(), 0);
+        write_private(&path, "fandhe-portreg v1\nbroken\nend\n");
+        assert_eq!(
+            s2.held_by(&web, &c1).unwrap_err().code(),
+            NetErrorCode::Internal
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

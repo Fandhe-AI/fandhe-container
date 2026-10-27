@@ -26,7 +26,7 @@
 //! - [`PublishedPort`] はプロセス内のメモリ上の値で、再起動後の復元（GETRULE dump・永続化。#1870 の後続）は
 //!   無い。再起動後の解放は `delete_network` によるテーブル単位の一括解放だけ
 //! - `NetworkPlugin::unpublish_port`（#2904・PLUG-1）は追加済みで、plugin-cri の `netsetup` が本 API を呼ぶ。
-//!   呼び出し元は `set_up_sandbox` の公開途中の失敗の巻き戻し（`pod_network`）。attach 済みコンテナの `detach` は後続事項
+//!   呼び出し元は `set_up_sandbox` の公開途中の失敗の巻き戻し（`pod_network`）。attach 済みコンテナの `detach` は `detach_container`（#3062）が本モジュールの本体 `unpublish_ports_with` を再利用して公開を個別に解除する
 
 use std::fmt;
 

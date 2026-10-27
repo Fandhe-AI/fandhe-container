@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::fd::AsFd as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -309,6 +309,30 @@ fn which(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// 強制終了後の子の回収猶予（REPAIR-5）。割り込み不能な待ちの子で試験が止まらないよう有限にする。
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// 子を SIGKILL し、`REAP_GRACE` 内に `try_wait` で回収する。回収できなければ PID と残した作業領域を
+/// 報告して即終了する（子が生きている可能性があるため作業領域は消さない。REPAIR-5・SEC-1）。
+fn kill_and_reap(child: &mut std::process::Child, what: &str, leftover: Option<&Path>) {
+    let _ = child.kill();
+    let end = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => {
+                eprintln!(
+                    "FATAL: {what} (pid {}) not reaped within {REAP_GRACE:?} after SIGKILL; leftover work dir: {}",
+                    child.id(),
+                    leftover.map_or("(none)".to_string(), |p| p.display().to_string())
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// 期限つきで外部コマンドを実行する（REPAIR-5）。シェルを経由しない。
 fn run_cmd(program: &str, args: &[&str], timeout: Duration) -> Result<(), String> {
     let mut child = Command::new(program)
@@ -324,13 +348,23 @@ fn run_cmd(program: &str, args: &[&str], timeout: Duration) -> Result<(), String
             Ok(Some(st)) => return Err(format!("{program} {args:?} exited with {st}")),
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child, program, None);
                 return Err(format!("{program} timed out"));
             }
             Err(e) => return Err(format!("wait {program}: {e}")),
         }
     }
+}
+
+/// 新規作成のみで書く（`O_CREAT|O_EXCL` は既存要素・symlink に対して失敗し、辿らない。SEC-1）。
+fn write_new(path: &Path, data: &[u8]) {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap_or_else(|e| panic!("create_new {}: {e}", path.display()));
+    f.write_all(data).expect("write input");
 }
 
 fn mount(args: &[&str]) {
@@ -479,15 +513,17 @@ fn gpu2_cuda_workload_five_trials_with_namespace_isolation() {
             run_trial(
                 trial,
                 &work,
-                &exe,
-                &rootfs_tpl,
-                &workload,
-                &spec_path,
-                &devices,
-                n,
-                timeout,
-                &host,
-                &rows,
+                &TrialCfg {
+                    exe: &exe,
+                    rootfs_tpl: &rootfs_tpl,
+                    workload: &workload,
+                    spec_path: &spec_path,
+                    devices: &devices,
+                    n,
+                    timeout,
+                    host: &host,
+                    rows: &rows,
+                },
             )
         }));
         // 後始末: 作業ディレクトリ配下にマウントが残っていれば、bind 先を辿ってホストを消さないよう削除しない。
@@ -514,20 +550,31 @@ fn gpu2_cuda_workload_five_trials_with_namespace_isolation() {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_trial(
-    trial: u32,
-    work: &Path,
-    exe: &Path,
-    rootfs_tpl: &Path,
-    workload: &Path,
-    spec_path: &Path,
-    devices: &str,
+/// 1 試行の共通設定（引数の数を抑えるためにまとめる）。
+struct TrialCfg<'a> {
+    exe: &'a Path,
+    rootfs_tpl: &'a Path,
+    workload: &'a Path,
+    spec_path: &'a Path,
+    devices: &'a str,
     n: usize,
     timeout: u64,
-    host: &HostIdent,
-    rows: &[usize],
-) -> (f64, String) {
+    host: &'a HostIdent,
+    rows: &'a [usize],
+}
+
+fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
+    let TrialCfg {
+        exe,
+        rootfs_tpl,
+        workload,
+        spec_path,
+        devices,
+        n,
+        timeout,
+        host,
+        rows,
+    } = *cfg;
     let rootfs = work.join("rootfs");
     run_cmd(
         "cp",
@@ -544,12 +591,24 @@ fn run_trial(
         .mode(0o700)
         .create(&hooks_work)
         .expect("create hooks-work");
+    // 雛形由来の symlink を拒否する（`cp -a` は symlink を保存する。root で開く前に検証。SEC-1）。
+    assert!(
+        fs::symlink_metadata(&rootfs).is_ok_and(|m| m.file_type().is_dir()),
+        "rootfs copy must be a real directory"
+    );
     let io_dir = rootfs.join("fc-cuda-io");
-    fs::create_dir_all(&io_dir).expect("create io dir");
+    assert!(
+        fs::symlink_metadata(&io_dir).is_err(),
+        "rootfs template must not contain fc-cuda-io (symlink or otherwise)"
+    );
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&io_dir)
+        .expect("create io dir");
     let a = gen_matrix(0x9e37_79b9 ^ trial, n * n);
     let b = gen_matrix(0x85eb_ca6b ^ trial.wrapping_mul(7919), n * n);
-    fs::write(io_dir.join("a.f32"), f32s_to_le(&a)).expect("write a");
-    fs::write(io_dir.join("b.f32"), f32s_to_le(&b)).expect("write b");
+    write_new(&io_dir.join("a.f32"), &f32s_to_le(&a));
+    write_new(&io_dir.join("b.f32"), &f32s_to_le(&b));
 
     let out_path = work.join("inner.out");
     let err_path = work.join("inner.err");
@@ -595,8 +654,7 @@ fn run_trial(
             Some(s) => break s,
             None if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child, "unshare inner", Some(work));
                 panic!("trial {trial}: inner timed out after {timeout}s");
             }
         }
@@ -910,8 +968,7 @@ fn inner_main() {
             Some(s) => break s,
             None if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child, "workload", None);
                 panic!("workload timed out");
             }
         }

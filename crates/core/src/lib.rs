@@ -114,6 +114,7 @@ pub mod capabilities;
 pub mod cgroups;
 pub mod container_usage;
 pub mod dev_mounts;
+pub mod etc_files;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod injected_files;

@@ -118,6 +118,12 @@
   - 先が symlink: `InvalidArgument`（`RESOLVE_IN_ROOT` で解決する案は残余）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
   - rootless は `SingleId`・`SubordinateIds` のどちらでも、元のファイルの所有者はコンテナの root に当たる uid で 0644 なので読める。mount はコンテナの user namespace が所有する mount namespace の中で行う
   - 後始末: start の失敗時は supervisor が自分で作ったものを消す。CLI の `delete` が成功した後に `@container-etc/<id>` を消す（`@container-options` と同じ条件）。plugin-cri は作らない
+- **実装の補足（#1872。core 側の実装済みの範囲）**:
+  - core の公開 API は `etc_files`（`create_etc_files`・`remove_etc_files`・`check_etc_overlaps`）と、launcher の起動オプション `LaunchOptions::with_etc_files`、pivot 前段の `exec::mount_etc_files`（`inject_files` の後・`mount_binds` の前。`PrePivotStep::EtcFiles`・`IsolationStage::MountEtcFiles`）。`CreateRequest`・`StateRecord` には何も足さない
+  - `create_etc_files` は `<id>` が既にあれば `ALREADY_EXISTS` で拒否する。「start のたびに作り直す」は呼び出し側（supervisor。#1873・#3065）が `remove_etc_files` の後に `create_etc_files` を呼んで実現する
+  - mount のモード: 既定は rw（D9 のとおり）。実効の `root.readonly=true` では ro で載せる（containerd の `containerMounts` が `readonly_rootfs` を hosts / resolv.conf の `Readonly` に写す挙動に揃えた、閉じた側の選択。一次情報の確認は #2859 に残し、違えば緩める）。ro のときに先が無いなら rootfs へ書かず `FailedPrecondition`
+  - 元の検証は 2 段: launcher が fork 前に所有者・権限・nlink を検査して `(st_dev, st_ino)` を記録し、子（新しい mount namespace）が同じ正規化済みパスを辿り直して `(st_dev, st_ino)` と nlink 1 の一致を要求する（user namespace の中では uid が写像後の値になるため）
+  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、先が symlink のときの `RESOLVE_IN_ROOT`、`RootfulHostRoot`（launcher が拒否。#2241）
 - **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。
 
 ### D10 ネットワーク定義の状態ストア（CORE-1）

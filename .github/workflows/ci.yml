@@ -1260,6 +1260,28 @@ jobs:
             --select '^inject_files: content, read-only' --subst root=false \
             --forbid 'inject_files: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
+      # etc_files_mount（`crates/core/tests/etc_files_mount.rs`。NET-12・CORE-1・SEC-1・TASK-185 追補・#1872）:
+      # 管理ルートの /etc/hosts・/etc/resolv.conf を rootfs へ bind する段（exec::mount_etc_files）を、先が symlink の拒否と
+      # 後始末・空ファイルの作成・読み取り専用 rootfs での拒否と ro・`/etc` が symlink の拒否まで実カーネルで検証する
+      # 実機前提テスト（harness = false）。Linux 5.12 以降が要る。inject_files と同じく上で緩和した sysctl を再利用し、
+      # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。
+      # 成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
+      - name: etc_files_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test etc_files_mount --no-run
+
+      - name: etc_files_mount の実行（実機前提テスト・--ignored。NET-12・#1872）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/etc_files_mount.log"
+          cargo test -p fandhe-container-core --test etc_files_mount -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name etc_files_mount \
+            --src crates/core/tests/etc_files_mount.rs --log "${log}" \
+            --select '^etc_files_mount: content, read-only' --subst root=false \
+            --forbid 'etc_files_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
       # lo_self_delivery（`crates/net/tests/lo_self_delivery.rs`。NET-2・NET-11・TASK-140 追補・#2077）:
       # 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れ
       # （#1927 の場面）と up 後の配送を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、

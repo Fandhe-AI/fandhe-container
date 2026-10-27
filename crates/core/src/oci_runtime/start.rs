@@ -958,7 +958,8 @@ fn build_spec_with_swap(
     .with_sysfs(sysfs)
     .with_additional_gids(additional_gids)
     .with_namespace_join(namespace_join)
-    .with_network(network, network_mode))
+    .with_network(network, network_mode)
+    .with_state_root(state_root.map(Path::to_path_buf)))
 }
 
 /// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・

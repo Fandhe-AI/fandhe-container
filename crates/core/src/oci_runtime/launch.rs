@@ -501,6 +501,9 @@ pub struct LaunchSpec {
     network: EffectiveNetwork,
     /// 突き合わせに使ったモード(launcher が自身のモードと照合し、転送漏れによる縮退を拒否する)。
     network_mode: LaunchNetworkMode,
+    /// `start` が使った状態ルート（`StateStore::host_state_root()`。管理ルートの `/etc/hosts` 等の元の場所を導く入力。
+    /// 無ければ `None`。NET-12・#1872）。
+    state_root: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -539,6 +542,7 @@ impl LaunchSpec {
             namespace_join: None,
             network: EffectiveNetwork::HostShared,
             network_mode: LaunchNetworkMode::FromConfig,
+            state_root: None,
         }
     }
 
@@ -561,6 +565,20 @@ impl LaunchSpec {
     /// `network()` を決めた起動オプションのモード。
     pub fn network_mode(&self) -> LaunchNetworkMode {
         self.network_mode
+    }
+
+    /// `start` が使った状態ルートを載せる(`start` だけが呼ぶ。呼び出し側が任意のパスを渡す入口にしない。NET-12・#1872)。
+    pub(super) fn with_state_root(mut self, state_root: Option<PathBuf>) -> Self {
+        self.state_root = state_root;
+        self
+    }
+
+    /// `start` が使った状態ルート(`StateStore::host_state_root()` の値。無ければ `None`)。
+    ///
+    /// 本番 launcher が、`LaunchOptions::etc_files` の指定時に `<state_root>/@container-etc/<id>/` の生成物を
+    /// fork 前に検証するために使う(NET-12・#1872)。
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
     }
 
     /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。

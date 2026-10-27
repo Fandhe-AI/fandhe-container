@@ -29,7 +29,7 @@
 //! [`remove`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
 //! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
 //! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
-//! plugin-cri の `RemoveContainer` は従来の [`remove_bounded`]（1 回だけ）のまま。
+//! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -205,7 +205,7 @@ pub fn remove_guarded_bounded(
 /// `stop` 直後は supervisor が `Stopped` の記録後も drain を続け、プロセス終了までロックを持つ。待ちは呼び出し元
 /// スレッドの sleep（[`crate::logs::CONTAINER_LOG_LOCK_POLL`] 刻み）だけで、同時実行枠は試行の間しか使わない。
 /// 試し直すのは `FailedPrecondition` だけで、他のエラーは即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
-/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri は従来の [`remove_bounded`]（1 回だけ）のまま。
+/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri の `RemoveContainer` も使う（#2964）。
 pub fn remove_guarded_bounded_waiting(
     root: &Path,
     id: &ContainerId,

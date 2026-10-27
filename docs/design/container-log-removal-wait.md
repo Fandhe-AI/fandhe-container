@@ -36,8 +36,8 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 ## 期限と予算（REPAIR-5）
 
 - ログ削除全体の最悪は「待ち 10 秒 + 最後の試行 5 秒」= 15 秒
-- force delete の最悪（plugin-cri）: stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`）+ supervisor ログ 5 秒 +
-  コンテナログ 15 秒 + 起動オプション文書の掃除 10 秒（#2760）= 47 秒で、`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まる。不等式は結合試験
+- force delete の最悪（plugin-cri）: stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`）+ ログ 2 件 20 秒
+  （共有の待ち 10 秒 + supervisor ログの最後の試行 5 秒 + コンテナログの最後の試行 5 秒。#2964）+ 起動オプション文書の掃除 10 秒（#2760）= 47 秒で、`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まる。不等式は結合試験
   `repair5_force_delete_worst_case_fits_runtime_timeout` で機械照合する
 - `CreateContainer` の最悪（plugin-cri。#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック `STATE_LOCK_TIMEOUT` 5 秒 +
   create の監査記録 2 回（`2 × RECORD_WAIT_LIMIT` 11.45 秒 = 22.9 秒）= 42.9 秒で、同じく 60.9 秒に収まる
@@ -150,7 +150,7 @@ Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel
 | ---- | ---- | ---------- |
 | `container_options::store::remove_stale_bounded`（CLI の delete 後の掃除、plugin-cri の create 前・delete 後の掃除） | `run_bounded_classified` へ替える（待たない） | 枠の満杯 `RESOURCE_EXHAUSTED`（`container options file removal workers are busy`）／期限切れ `TIMEOUT` |
 | `logs::sweep_stale_container_logs`（plugin-cri の起動時の走査）の初期走査とループ | `run_bounded_classified` へ替える（待たない） | `SweepReport::workers_busy`（枠の満杯）／`timed_out`（期限切れ）に分ける |
-| `supervisor_log::run_log_removal_bounded`（plugin-cri の `remove_supervisor_log`） | `LogRemoval::Busy` を追加 | plugin-cri は `Kept { ResourceExhausted }`（記録器は Failure） |
+| `supervisor_log::run_log_removal_bounded`（旧 plugin-cri の `remove_supervisor_log`。#2964 で `remove_guarded_bounded_waiting` に置換） | `LogRemoval::Busy` を追加 | 現在は `remove_guarded_bounded_waiting` の `Err(ResourceExhausted)` を `Kept { ResourceExhausted }`（記録器は Failure）に写す |
 | `logs::remove_container_logs_guarded_bounded` ほか `run_bounded_classified` の呼び出し元 | 変更なし（#2760 で区別済み） | `ResourceExhausted` |
 | CLI の `create` の起動オプション I/O（`run_bounded_waiting`） | 変更なし（#2834） | `RESOURCE_EXHAUSTED`／`TIMEOUT` |
 | CLI の `stop_delete.rs` `remove_supervisor_log`（`run_bounded` の `Option`） | #2920 で `run_bounded_classified` 系（`remove_guarded_bounded_waiting`）へ移行済み。`Option` 版の `run_bounded` は #2965 で削除 | 枠の満杯 `RESOURCE_EXHAUSTED`／期限切れ `TIMEOUT` |
@@ -206,5 +206,26 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 - 不採用: 2 つのログで 10 秒ずつ独立に待つ案。最悪が 30 秒になり、`start_stop_delete_real` の `CLI_TIMEOUT`（30 秒）に並び、
   上の 20 秒の予算の記述と試験が崩れる
 - 失敗の扱い: 待ち切れなければ `Kept { FailedPrecondition }` と、コンテナログと同じ語彙の `reason: "sink_open_after_wait"` つきの警告
-- 対象外: plugin-cri の `RemoveContainer` は従来の `remove_bounded`（1 回だけ）のまま。入れる場合は force delete の最悪値と
-  `PLUGIN_RUNTIME_TIMEOUT` の不等式の見直しが要る。待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る
+- 待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る（CRI は ID を使い回さないため、実質は手動の回収。
+  `docs/setup/container-log-recovery.md` はコンテナログが対象で supervisor ログは含まない。残余。REPAIR-3）
+
+## plugin-cri の `RemoveContainer` の supervisor ログ側の待ち（#2964・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
+
+- 従来: `remove_bounded`（1 回だけ）は中の失敗を握りつぶして `Finished` を返すため、ロック保持中でログが残っても `Removed`・Success と
+  報告していた（観測の欠落）。CLI と同じ構造に揃える
+- 方式: `CoreLifecycleRuntime::delete` が `container_log_lock_wait`（既定 10 秒）を期限として決め、supervisor ログを
+  `remove_guarded_bounded_waiting`（guard は状態ストアの `NotFound`。試行ごとにロック保持中に評価）で処理し、
+  コンテナログには残り（`deadline - now`）を渡す
+- 予算: supervisor ログにかかる時間を t（t ≤ 10 + 5）とすると、コンテナログは max(0, 10 - t) + 5 以下で、合計は max(t, 10) + 5 ≤ 20 秒。
+  force delete の最悪は stop 17 + ログ 20 + 起動オプション文書 10 = 47 秒で従来と同じ。`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まり、
+  RPC 側は `run_bounded(runtime_timeout)` で打ち切る。kubelet の `--runtime-request-timeout` との関係は本変更で変わらない（予算が #2760 から不変。
+  kubelet 側の既定値の一次情報は未確認）。core の delete（状態ストア・cgroup・rootfs の削除）と bundle の解放の上限は
+  この内訳に入っておらず、定数で有界でない部分は本変更で変わらない残余（REPAIR-3）
+- 不採用: 独立に待つ案。最悪 30 秒で 47 秒が 57 秒になり、余裕が 3.9 秒しか残らない
+- 観測の変化（REPAIR-4）: ロック保持中は `Kept { FailedPrecondition }`・記録器 `supervisor_log_remove` の Failure、`target: supervisor_log` の
+  警告行に `reason: sink_open_after_wait`。`Internal`・`InvalidArgument` も握りつぶさず `Kept { code }` で出る。
+  code 名（`FAILED_PRECONDITION`・`TIMEOUT`・`RESOURCE_EXHAUSTED`）は既存のまま。`reason` は既存の閉じた語彙で、新しい語彙は足さない
+- 試験: `sup7_cri2_2964_force_delete_waits_for_supervisor_log_release`・
+  `sup7_repair5_2964_force_delete_keeps_supervisor_log_when_lock_outlives_wait`・
+  `repair5_2964_force_delete_shares_wait_between_both_logs`（`crates/plugin-cri/tests/lifecycle_supervisor.rs`）。guard の偽（再作成された
+  インスタンスのログを消さない）は supervisor 側 `remove_guarded` の試験が担う

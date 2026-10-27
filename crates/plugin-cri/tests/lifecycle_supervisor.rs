@@ -20,10 +20,11 @@ use fandhe_container_core::oci_runtime::{
     CgroupRemoval, ContainerCgroupRemover, ProcessSignaler, StartTimeouts,
 };
 use fandhe_container_core::traits::{
-    CgroupPlacement, CgroupScope, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
-    ContainerStatus, CreateStateRequest, DeleteRequest, DeleteStateRequest, DeleteStateResponse,
-    ErrorCode, GetStateRequest, KillRequest, ListStateRequest, Signal, StartRequest, StateList,
-    StateRecord, StateRevision, StateStore, StopRequest, TraitError, UpdateStateRequest,
+    CgroupPlacement, CgroupScope, CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime,
+    ContainerState, ContainerStatus, CreateStateRequest, DeleteRequest, DeleteStateRequest,
+    DeleteStateResponse, ErrorCode, GetStateRequest, KillRequest, ListStateRequest, Signal,
+    StartRequest, StateList, StateRecord, StateRevision, StateStore, StopRequest, TraitError,
+    UpdateStateRequest,
 };
 use fandhe_container_plugin_cri::adapter::{
     CoreLifecycleRuntime, PLUGIN_ROOTFS_DEADLINE, PLUGIN_RUNTIME_TIMEOUT,
@@ -865,7 +866,113 @@ fn sup7_cri2_force_delete_running_keeps_logs_after_wait_deadline() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// REPAIR-5・#2634・#2760: running への force 削除の最悪所要（stop + supervisor ログ + コンテナログの待ち + 起動オプション
+/// 警告行を捕捉する出力先つきに差し替える。
+fn capture_warnings(rt: CoreLifecycleRuntime) -> (CoreLifecycleRuntime, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    let rt = rt.with_cleanup_warning_sink(Arc::new(move |l| sink.lock().expect("lock").push(l)));
+    (rt, lines)
+}
+
+fn supervisor_log_names(root: &Path) -> Vec<String> {
+    let dir = fandhe_container_supervisor::supervisor_log::log_dir(root);
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// SUP-7・CRI-2・REPAIR-5・#2964: supervisor ログの flock が drain 中に保持されていても、解放を期限つきで待って消す。
+#[test]
+fn sup7_cri2_2964_force_delete_waits_for_supervisor_log_release() {
+    let root = temp_root("suplog-ok");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    let writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    assert!(!supervisor_log_names(&root).is_empty());
+    let rec = Arc::new(OpRecorder::new());
+    let (rt, warnings) = capture_warnings(force_runtime(&sim, &rec, Duration::from_secs(3)));
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(writer);
+    });
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    closer.join().expect("join");
+    assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+    assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+    assert_eq!(supervisor_log_names(&root), Vec::<String>::new());
+    assert!(warnings.lock().expect("lock").is_empty());
+    assert_eq!(op_counts(&rec, "supervisor_log_remove"), Some((1, 0)));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SUP-7・CRI-2・REPAIR-4・REPAIR-5・#2964: 待ちの期限までロックが解放されなければ、`delete` は `Ok` のまま
+/// supervisor ログを残し、`FailedPrecondition`・`sink_open_after_wait` の警告と Failure の計上で知らせる。
+#[test]
+fn sup7_repair5_2964_force_delete_keeps_supervisor_log_when_lock_outlives_wait() {
+    let root = temp_root("suplog-keep");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    let _writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    let rec = Arc::new(OpRecorder::new());
+    let (rt, warnings) = capture_warnings(force_runtime(&sim, &rec, Duration::from_millis(200)));
+    let started = Instant::now();
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        resp.supervisor_log(),
+        CleanupOutcome::Kept {
+            code: ErrorCode::FailedPrecondition
+        }
+    );
+    assert_eq!(supervisor_log_names(&root), ["c1.log", "c1.log.lock"]);
+    assert_eq!(
+        *warnings.lock().expect("lock"),
+        [
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
+        ]
+    );
+    assert_eq!(op_counts(&rec, "supervisor_log_remove"), Some((0, 1)));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REPAIR-5・#2964: 2 つのログの待ちは共有され、独立に待つ場合（2 倍）より短く済む。
+#[test]
+fn repair5_2964_force_delete_shares_wait_between_both_logs() {
+    let root = temp_root("suplog-share");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    let _writer =
+        fandhe_container_supervisor::supervisor_log::open(&root, &cid("c1")).expect("open");
+    let _sink = open_log_sink(&root, "c1");
+    let rec = Arc::new(OpRecorder::new());
+    let rt = force_runtime(&sim, &rec, Duration::from_millis(300));
+    let started = Instant::now();
+    let resp = rt
+        .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    let elapsed = started.elapsed();
+    let kept = CleanupOutcome::Kept {
+        code: ErrorCode::FailedPrecondition,
+    };
+    assert_eq!(resp.supervisor_log(), kept);
+    assert_eq!(resp.container_log(), kept);
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(590), "{elapsed:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REPAIR-5・#2634・#2760: running への force 削除の最悪所要（stop + ログ 2 件〔待ちは共有〕+ 起動オプション
 /// 文書の掃除）は `PLUGIN_RUNTIME_TIMEOUT` に収まる。
 #[test]
 fn repair5_force_delete_worst_case_fits_runtime_timeout() {
@@ -878,8 +985,10 @@ fn repair5_force_delete_worst_case_fits_runtime_timeout() {
     use fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT;
     let stop = (KillTimeout::DEFAULT + Duration::from_secs(1)) * 2 + STOP_KILL_WAIT;
     assert_eq!(stop, Duration::from_secs(17));
+    // ログ 2 件は待ち（CONTAINER_LOG_LOCK_WAIT）を共有する: 共有の待ち + 各ログの最後の試行（#2964）。
+    assert_eq!(CONTAINER_LOG_LOCK_WAIT, Duration::from_secs(10));
     let logs =
-        SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_LOCK_WAIT + CONTAINER_LOG_REMOVE_TIMEOUT;
+        CONTAINER_LOG_LOCK_WAIT + SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_REMOVE_TIMEOUT;
     assert_eq!(logs, Duration::from_secs(20));
     assert_eq!(OPTIONS_REMOVE_TIMEOUT, Duration::from_secs(10));
     assert_eq!(

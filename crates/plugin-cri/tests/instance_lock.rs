@@ -18,6 +18,7 @@ use fandhe_container_plugin_cri::instance_lock::{
     INSTANCE_LOCK_NAME, MSG_INSTANCE_LOCK_BUSY, acquire_instance_lock_in,
 };
 
+#[cfg(target_os = "linux")]
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const ENV_ROOT: &str = "FC_CRI_INSTLOCK_ROOT";
 const ENV_READY: &str = "FC_CRI_INSTLOCK_READY";
@@ -131,6 +132,7 @@ fn cri2_lock_held_by_other_process_until_it_is_killed() {
     assert!(root.0.join(".cri").join(INSTANCE_LOCK_NAME).exists());
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_server(sock: &Path, xdg: &Path) -> ChildGuard {
     let child = Command::new(BIN)
         .arg("--socket")

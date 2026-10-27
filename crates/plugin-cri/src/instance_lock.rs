@@ -4,8 +4,8 @@
 //! socket パスが違えば同じ状態ルートの記録・bundle・回収を 2 プロセスが競合して書いてしまうため
 //! （再採用の前提。`docs/design/cri-record-readoption.md` の実装単位 R3）。
 //!
-//! 呼び出し元: `main.rs` の `serve` が `CriPluginBackends::acquire_instance_lock` 経由で、状態を変える最初の処理の前に取り、
-//! プロセスが終わるまで持ち続ける。後続の孤児 bundle の回収（R8）は `&InstanceLock` を引数に取り、保持の証明として使う。
+//! 呼び出し元: `CriPluginBackends::production*` が、回収記録の読み込みを含む状態を変える最初の処理の前に取り、
+//! backends の生存の間（プロセスが終わるまで）持ち続ける。後続の孤児 bundle の回収（R8）は `&InstanceLock` を引数に取り、保持の証明として使う。
 //! ロック順序は インスタンスロック（最外・常時）＞ registry の `Mutex` ＞ core の `StateStore` の `@lock`。
 //!
 //! 方式:

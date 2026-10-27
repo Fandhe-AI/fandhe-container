@@ -130,6 +130,9 @@ pub struct CriPluginBackends {
     oci_recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
+    /// `production()` が取った状態ルートのインスタンスロック（`.cri/@instance.lock`。注入で組んだときは `None`）。
+    /// 全 clone が共有し、最後の clone が drop されるまで保持する（CRI-2・CORE-1・#2931）。
+    _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// `ImageService`（`PullImage` の登録先）と本番の `BundleProvider`（`CreateContainer` のタグ解決）が共有する在庫。
     /// プロセス内だけで永続化しない（再起動でタグの対応は失われる。モジュール doc の REPAIR-3）。
     images: Arc<dyn ImageStore>,
@@ -166,6 +169,7 @@ impl CriPluginBackends {
             recorder,
             oci_recorder: Arc::new(OpRecorder::new()),
             state_root: None,
+            _instance_lock: None,
             images: Arc::new(InMemoryImageStore::new()),
         }
     }
@@ -195,6 +199,13 @@ impl CriPluginBackends {
         // 状態ルートの作成・検証・初期化（`FileStateStore::open`）を先に済ませる。`ReclaimStore::open` はルートが
         // 既にあることを前提にし、先に `.cri` を作ると新規ストアの判定を壊すため（NET-1・#2604）。
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
+        // 同じ状態ルートの別インスタンスを排他する（CRI-2・CORE-1・#2931）。回収記録（`ReclaimStore`）の読み込みは
+        // メモリへ取り込むため、先行インスタンスの追加・削除を見落とさないよう、必ずその読み込みより前に取る。
+        // 期限内に取れなければ `Timeout`（固定文言 `MSG_INSTANCE_LOCK_BUSY`）を返す。
+        let instance_lock = Arc::new(crate::instance_lock::acquire_instance_lock_in(
+            &state_root,
+            crate::instance_lock::INSTANCE_LOCK_TIMEOUT,
+        )?);
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
         // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
         #[cfg(target_os = "linux")]
@@ -217,26 +228,8 @@ impl CriPluginBackends {
         let runtime = Arc::new(runtime);
         let mut backends = Self::with_recorder(runtime, state, network, recorder);
         backends.state_root = Some(state_root);
+        backends._instance_lock = Some(instance_lock);
         Ok(backends)
-    }
-
-    /// 状態ルートのインスタンスロック（`.cri/@instance.lock`）を期限つきで取る（CRI-2・CORE-1・REPAIR-5。#2931）。
-    ///
-    /// 呼び出し位置の制約: `production*` の成功の直後で、状態を変える最初の処理（`production_bundle_provider` の
-    /// ディレクトリ作成・`recover_stale_image_pulls`・ログの掃除・記録の読み込み）より前に呼び、戻り値をプロセスの終わりまで
-    /// 持つ。`production_inner` 内の `ReclaimStore` の読み込みはメモリへの読み込みだけでロックの前でも安全だが、そこに
-    /// 状態を変える処理を足す場合はロックの後へ移すこと。注入で組んだ（状態ルートが無い）場合は `FailedPrecondition`。
-    pub fn acquire_instance_lock(&self) -> Result<crate::instance_lock::InstanceLock, TraitError> {
-        match &self.state_root {
-            Some(root) => crate::instance_lock::acquire_instance_lock_in(
-                root,
-                crate::instance_lock::INSTANCE_LOCK_TIMEOUT,
-            ),
-            None => Err(TraitError::new(
-                fandhe_container_core::traits::ErrorCode::FailedPrecondition,
-                "state root is not configured",
-            )),
-        }
     }
 
     /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。

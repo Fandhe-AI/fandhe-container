@@ -67,29 +67,21 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     let backends = CriPluginBackends::production();
     let backends = match backends {
         Ok(b) => b,
-        Err(e) => {
-            // 状態ルートが解決できない等は fail-closed。メッセージは固定文言のコードだけ写す。
-            eprintln!(
-                "error: {}: failed to open the state store",
-                e.code().as_str()
-            );
-            return ExitCode::from(EXIT_FAILURE);
-        }
-    };
-    // 同じ状態ルートの別インスタンスを排他する（CRI-2・CORE-1・#2931）。状態を変える最初の処理より前に取り、
-    // `serve` の終わりまで持つ（`_` に束縛すると即 drop されるので `_instance_lock` と名付ける）。
-    // 監査 relay の fork は上で済んでおり、ここで取る fd は継承されない。
-    let _instance_lock = match backends.acquire_instance_lock() {
-        Ok(l) => l,
-        Err(e) if e.code() == fandhe_container_core::traits::ErrorCode::Timeout => {
+        // インスタンスロックは `production*` が回収記録の読み込みより前に取り、`backends` の生存の間持つ（CRI-2・CORE-1・#2931）。
+        Err(e)
+            if e.code() == fandhe_container_core::traits::ErrorCode::Timeout
+                && e.message()
+                    == fandhe_container_plugin_cri::instance_lock::MSG_INSTANCE_LOCK_BUSY =>
+        {
             return fail(
                 PluginErrorCode::Timeout,
                 fandhe_container_plugin_cri::instance_lock::MSG_INSTANCE_LOCK_BUSY,
             );
         }
         Err(e) => {
+            // 状態ルートが解決できない等は fail-closed。メッセージは固定文言のコードだけ写す。
             eprintln!(
-                "error: {}: failed to acquire the instance lock",
+                "error: {}: failed to open the state store",
                 e.code().as_str()
             );
             return ExitCode::from(EXIT_FAILURE);

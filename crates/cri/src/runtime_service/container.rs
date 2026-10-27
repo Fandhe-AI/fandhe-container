@@ -285,8 +285,8 @@ impl ContainerRecord {
                 .map_or_else(String::new, |i| i.image_ref().to_owned()),
             reason: exit_reason(self.state, self.exit_code, self.termination).to_owned(),
             message: String::new(),
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             mounts: self.config.mounts.clone(),
             log_path: self
                 .resolved_log_path
@@ -337,8 +337,8 @@ impl ContainerRecord {
                 .map_or_else(String::new, |i| i.id_str().to_owned()),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             image_id: self
                 .resolved_image
                 .as_ref()
@@ -415,21 +415,13 @@ pub(super) struct ValidatedCreate {
     pub(super) config: BoundedContainerConfig,
 }
 
-/// `CreateContainer` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+/// `ContainerConfig` の必須項目と上限を検証し、保持用に作り直す（CreateContainer と記録の復号が共有する。
+/// #2930・CRI-1・REPAIR-1・REPAIR-2）。
 ///
-/// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
-pub(super) fn validate_create_request(
-    req: v1::CreateContainerRequest,
-) -> Result<ValidatedCreate, CriError> {
-    let v1::CreateContainerRequest {
-        pod_sandbox_id,
-        config,
-        sandbox_config,
-    } = req;
-    if pod_sandbox_id.is_empty() {
-        return Err(CriError::invalid_argument("pod_sandbox_id is required"));
-    }
-    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
+/// 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
+pub(super) fn validate_container_config(
+    config: ContainerConfig,
+) -> Result<BoundedContainerConfig, CriError> {
     let metadata = config
         .metadata
         .as_ref()
@@ -446,12 +438,6 @@ pub(super) fn validate_create_request(
     if image.image.is_empty() {
         return Err(CriError::invalid_argument("config.image.image is required"));
     }
-    if let Some(sandbox_config) = sandbox_config.as_ref()
-        && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
-    {
-        return Err(CriError::invalid_argument("sandbox_config is too large"));
-    }
-    // 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
     if metadata.name.len() > MAX_METADATA_FIELD_BYTES {
         return Err(CriError::invalid_argument(format!(
             "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
@@ -464,9 +450,37 @@ pub(super) fn validate_create_request(
             "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
         )));
     }
-    let name = metadata.name.clone();
-    let attempt = metadata.attempt;
-    let config = BoundedContainerConfig::new(config)?;
+    BoundedContainerConfig::new(config)
+}
+
+/// `CreateContainer` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+///
+/// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
+pub(super) fn validate_create_request(
+    req: v1::CreateContainerRequest,
+) -> Result<ValidatedCreate, CriError> {
+    let v1::CreateContainerRequest {
+        pod_sandbox_id,
+        config,
+        sandbox_config,
+    } = req;
+    if pod_sandbox_id.is_empty() {
+        return Err(CriError::invalid_argument("pod_sandbox_id is required"));
+    }
+    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
+    if let Some(sandbox_config) = sandbox_config.as_ref()
+        && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
+    {
+        return Err(CriError::invalid_argument("sandbox_config is too large"));
+    }
+    // 名前・attempt は検証後の config から取る（metadata 必須は validate_container_config が保証する）。
+    let config = validate_container_config(config)?;
+    let (name, attempt) = config
+        .config()
+        .metadata
+        .as_ref()
+        .map(|m| (m.name.clone(), m.attempt))
+        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
     Ok(ValidatedCreate {
         pod_sandbox_id,
         name,

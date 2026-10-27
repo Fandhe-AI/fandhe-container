@@ -29,10 +29,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
-)]
+// 利用箇所は macOS 限定の実 VM 試験だけなので、宣言自体を macOS に限る（dead_code の抑止を使わない）。
+#[cfg(target_os = "macos")]
 #[path = "support/guest_markers.rs"]
 mod guest_markers;
 
@@ -527,7 +525,9 @@ mod real_vm {
                         code: "launch_failed",
                         detail: Some(sanitize_code(e.code())),
                     },
-                    false,
+                    // launch 失敗（start のタイムアウト等）では `Vm` の drop が停止要求を非同期に投入するだけで、
+                    // 停止完了を確認できない。以降の試行は起動せず not_run にする（REPAIR-5）。
+                    true,
                 );
             }
         };
@@ -654,7 +654,8 @@ mod real_vm {
                 }),
             }
         }
-        println!("{}", render_json(trials, &results));
+        // libtest の「test ... ... 」と同じ行に出ないよう、JSON の前に改行を置く。
+        println!("\n{}", render_json(trials, &results));
         let failed = results
             .iter()
             .filter(|r| matches!(r, TrialResult::Err { .. }))

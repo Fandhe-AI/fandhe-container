@@ -48,6 +48,10 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0o020_000;
     pub const S_IFBLK: u32 = 0o060_000;
     pub const S_IFIFO: u32 = 0o010_000;
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_NOCTTY: i32 = 0o400;
 }
 
 /// 定数（aarch64。`O_DIRECTORY` / `O_NOFOLLOW` が x86_64 と異なる）。
@@ -62,6 +66,10 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0o020_000;
     pub const S_IFBLK: u32 = 0o060_000;
     pub const S_IFIFO: u32 = 0o010_000;
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_NOCTTY: i32 = 0o400;
 }
 
 /// 対応外アーキテクチャ。値は使われない（各ラッパーが `Unsupported` を返す）。
@@ -79,6 +87,10 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0;
     pub const S_IFBLK: u32 = 0;
     pub const S_IFIFO: u32 = 0;
+    pub const F_GETFL: i32 = 0;
+    pub const F_SETFL: i32 = 0;
+    pub const O_NONBLOCK: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
 }
 
 // SAFETY: 以下は libc（glibc / musl）が提供する POSIX 関数の宣言で、LP64 の x86_64 / aarch64 では
@@ -94,6 +106,14 @@ unsafe extern "C" {
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
     // 原型: `int unlinkat(int dirfd, const char *pathname, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+    // 原型: `int fcntl(int fd, int cmd, ...)`。本モジュールは `F_GETFL`（引数なし）と `F_SETFL`（int 1 個）だけ使う。
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    // 原型: `uid_t geteuid(void)`。引数なしで失敗しない。LP64 の Linux では `uid_t` = u32。
+    #[link_name = "geteuid"]
+    fn c_geteuid() -> u32;
+    // 原型: `int unshare(int flags)`。試験で呼び出しスレッドだけを別の mount namespace へ移すために使う。
+    #[cfg(test)]
+    fn unshare(flags: i32) -> i32;
 }
 
 fn last_error() -> SysError {
@@ -186,6 +206,38 @@ pub(crate) fn unlink_at(
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// このプロセスの実効 uid（`geteuid(2)`）。`/proc/self` の所有者は non-dumpable なプロセスで root になるため、
+/// 信用する所有者の判定（TASK-127.3・GPU-2・SEC-1）にはこちらを使う。
+pub(crate) fn geteuid() -> u32 {
+    // SAFETY: `geteuid` は引数を取らず、メモリに触れず、失敗しない。
+    unsafe { c_geteuid() }
+}
+
+/// `fd` を `O_NONBLOCK` にする（既存のステータスフラグは保つ）。createContainer フックの stdin / stderr の pipe を
+/// スレッド無しで有界に回すために使う（TASK-127.3・GPU-2・REPAIR-5）。フラグは open file description に付くため、
+/// 子が持つ反対側の端には影響しない。
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    check_supported()?;
+    // SAFETY: `fd` は借用中の生存 fd。`F_GETFL` は第 3 引数を読まず、ポインタも渡さない。
+    let flags = unsafe { fcntl(fd.as_raw_fd(), consts::F_GETFL) };
+    if flags < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: 同上。`F_SETFL` の第 3 引数は int 値渡しで、直前に得たフラグに `O_NONBLOCK` を足しただけ。
+    let r = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFL, flags | consts::O_NONBLOCK) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドを新しい mount namespace へ移す（`unshare(CLONE_NEWNS)`。CAP_SYS_ADMIN が要る）。試験専用。
+/// フック実行の前提状態がスレッド単位の namespace に結び付くことの確認に使う（GPU-2）。
+#[cfg(test)]
+pub(crate) fn unshare_mount_ns() -> Result<(), SysError> {
+    check_supported()?;
+    // SAFETY: 引数は値渡しのフラグ（`CLONE_NEWNS` = 0x20000。x86_64・aarch64 共通）だけでポインタを含まない。
+    let r = unsafe { unshare(0x0002_0000) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +259,7 @@ mod tests {
         assert_eq!(consts::S_IFCHR, 0o020_000);
         assert_eq!(consts::S_IFBLK, 0o060_000);
         assert_eq!(consts::S_IFIFO, 0o010_000);
+        assert_eq!(consts::O_NOCTTY, 0o400);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
@@ -217,6 +270,39 @@ mod tests {
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
             (0o40_000, 0o100_000)
         );
+    }
+
+    /// SEC-1: `geteuid` は、このプロセスが作ったファイルの所有者 uid と一致する（`/proc/self` の所有者に依らない）。
+    #[test]
+    fn geteuid_matches_created_file_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let d = tmp("uid");
+        let f = d.join("f");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(geteuid(), std::fs::metadata(&f).unwrap().uid());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GPU-2・REPAIR-5: `set_nonblocking` 後の空 pipe の read は WouldBlock、端を閉じると EOF になる。
+    #[test]
+    fn nonblocking_pipe_read() {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("sleep")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = c.stdout.take().unwrap();
+        set_nonblocking(out.as_fd()).unwrap();
+        let mut b = [0u8; 8];
+        assert_eq!(
+            out.read(&mut b).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        c.kill().unwrap();
+        c.wait().unwrap();
+        assert_eq!(out.read(&mut b).unwrap(), 0);
     }
 
     /// GPU-2: mkdirat / openat が動き、symlink は O_NOFOLLOW で拒否される。

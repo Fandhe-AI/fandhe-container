@@ -588,6 +588,15 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   sudo -E cargo test -p fandhe-container-gpu --test cdi_device_nodes_root -- --ignored
   ```
 
+- CDI `createContainer` フックの namespace 前提の実機前提試験 2 件（GPU-2・REPAIR-2・SEC-1・TASK-127.3・#549。`crates/gpu/src/cdi_apply/hooks/run.rs` の lib 内 `#[ignore]` 試験）。必要環境は、非特権の user namespace と mount namespace を作れること（root は不要。ubuntu では AppArmor の `kernel.apparmor_restrict_unprivileged_userns` の緩和が要る）と `unshare`・`mount` コマンド。CI の `platform-ci` への登録は未実施で、#2987 で追跡する（登録までは手元・実機で実行する）:
+  - `cdi_apply::hooks::run::tests::stage_recheck_fails_after_unshare_in_thread`: 呼び出しスレッドだけ `unshare(CLONE_NEWNS)` すると、移す前に発行した `CdiHookStage` の再検証がそのスレッドで `FailedPrecondition` になり、元のスレッドでは通ること（証跡が `/proc/thread-self` の mount namespace に結び付くこと）を確認する。この試験は自分では namespace を作らないため、`unshare` の下で実行する。成功行は `test cdi_apply::hooks::run::tests::stage_recheck_fails_after_unshare_in_thread ... ok`
+  - `cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary`: bundle 内へ既存ディレクトリを bind mount すると、削除がマウント境界の中へ入らず元のファイルを消さずに失敗する（`bundle_cleanup_failed` 相当）ことを確認する。試験が自分自身を `unshare -r -m` の下で再実行する（内側は環境変数 `FANDHE_GPU_NS_INNER=1`）ため、外側は通常の実行でよい。成功行は `test cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary ... ok`
+
+  ```bash
+  unshare -r -m -- cargo test -p fandhe-container-gpu --lib -- --ignored --exact cdi_apply::hooks::run::tests::stage_recheck_fails_after_unshare_in_thread
+  cargo test -p fandhe-container-gpu --lib -- --ignored --exact cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary
+  ```
+
 ### ライセンス検査
 
 ```bash

@@ -33,10 +33,21 @@
 //!
 //! # 対応 OS
 //!
-//! 既定探索先の定義は Linux のみ（system は `/usr/libexec/fandhe-container/plugins`、user は
-//! XDG Base Directory の `<XDG_DATA_HOME>/fandhe-container/plugins`、未設定なら
-//! `<HOME>/.local/share/fandhe-container/plugins`）。macOS / Windows の「相当」パスは spec で
-//! 未確定のため空の探索先一覧を返す（エラーにしない。PLUG-11）。走査関数自体は 3 OS で動く。
+//! - Linux: system は `/usr/libexec/fandhe-container/plugins`、user は XDG Base Directory の
+//!   `<XDG_DATA_HOME>/fandhe-container/plugins`、未設定なら
+//!   `<HOME>/.local/share/fandhe-container/plugins`
+//! - macOS（#1539 のオーナー判断 2026-10-12・#1863）: system は
+//!   `/usr/local/libexec/fandhe-container/plugins`、user は絶対パスの `XDG_DATA_HOME` があれば
+//!   `<XDG_DATA_HOME>/fandhe-container/plugins`、無ければ絶対パスの `HOME` から
+//!   `<HOME>/Library/Application Support/fandhe-container/plugins`。ただし信頼性検証は非 Linux では
+//!   `Unsupported` で常に拒否されるため（#1865 が担当）、探索先を返しても plugin は登録されない
+//!   （fail-closed）。実機での権限の実態は未確認で、`/usr/local` がグループ書き込み可の環境（古い
+//!   Homebrew 等）では祖先検査の導入後に拒否され得る。確認先は #1628 の環境。spec の PLUG-11 には
+//!   macOS の記述がまだ無い
+//! - Windows（#1415・#1539）: Windows ホストでは plugin の発見も信頼性検証も行わないため空の
+//!   探索先一覧を返す（エラーにしない。PLUG-11）
+//!
+//! 走査関数自体は 3 OS で動く。
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -246,8 +257,45 @@ fn resolve_default_dirs(
     dirs
 }
 
-/// 非 Linux では既定探索先が未確定のため空を返す（PLUG-11。モジュール doc 参照）。
-#[cfg(not(target_os = "linux"))]
+/// macOS の既定探索先を組み立てる純粋関数（#1539 の決定 2026-10-12・#1863・PLUG-11）。
+///
+/// `resolve_default_dirs`（macOS 版）から呼ばれる。試験で Linux・Windows でも具体値を照合できるよう
+/// `test` でもコンパイルする。user の基点は `XDG_DATA_HOME` を優先する（#1539 の決定）。相対パス・
+/// 空文字の環境値は採用しない（カレントディレクトリ依存の探索を作らない）。
+#[cfg(any(target_os = "macos", test))]
+fn resolve_default_dirs_macos(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Vec<PluginSearchDir> {
+    let mut dirs = vec![PluginSearchDir::new(
+        PluginDirKind::System,
+        Path::new("/usr/local/libexec")
+            .join("fandhe-container")
+            .join("plugins"),
+    )];
+    let absolute = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let data_home = absolute(xdg_data_home)
+        .or_else(|| absolute(home).map(|h| h.join("Library").join("Application Support")));
+    if let Some(base) = data_home {
+        dirs.push(PluginSearchDir::new(
+            PluginDirKind::User,
+            base.join("fandhe-container").join("plugins"),
+        ));
+    }
+    dirs
+}
+
+/// macOS の既定探索先（`resolve_default_dirs_macos` へ委ねる。PLUG-11）。
+#[cfg(target_os = "macos")]
+fn resolve_default_dirs(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Vec<PluginSearchDir> {
+    resolve_default_dirs_macos(xdg_data_home, home)
+}
+
+/// Windows ホストでは plugin の発見も信頼性検証も行わないため空を返す（#1415・#1539 の決定。PLUG-11）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_default_dirs(
     _xdg_data_home: Option<OsString>,
     _home: Option<OsString>,
@@ -621,7 +669,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     fn dirs_of(v: Vec<PluginSearchDir>) -> Vec<(PluginDirKind, PathBuf)> {
         v.into_iter().map(|d| (d.kind, d.path)).collect()
     }
@@ -677,10 +724,84 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    fn macos_system() -> (PluginDirKind, PathBuf) {
+        (
+            PluginDirKind::System,
+            PathBuf::from("/usr/local/libexec/fandhe-container/plugins"),
+        )
+    }
+
     #[test]
-    fn plug11_default_dirs_are_empty_outside_linux() {
-        assert!(resolve_default_dirs(Some("/xdg".into()), Some("/h".into())).is_empty());
+    fn plug11_macos_default_dirs_use_xdg_data_home() {
+        let got = resolve_default_dirs_macos(Some("/xdg".into()), Some("/Users/u".into()));
+        assert_eq!(
+            dirs_of(got),
+            vec![
+                macos_system(),
+                (
+                    PluginDirKind::User,
+                    PathBuf::from("/xdg/fandhe-container/plugins")
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn plug11_macos_default_dirs_fall_back_to_home() {
+        for xdg in [None, Some(OsString::new()), Some("relative".into())] {
+            let got = resolve_default_dirs_macos(xdg, Some("/Users/u".into()));
+            assert_eq!(
+                dirs_of(got),
+                vec![
+                    macos_system(),
+                    (
+                        PluginDirKind::User,
+                        PathBuf::from(
+                            "/Users/u/Library/Application Support/fandhe-container/plugins"
+                        )
+                    )
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn plug11_macos_default_dirs_skip_user_when_env_unusable() {
+        for home in [None, Some(OsString::new()), Some("rel".into())] {
+            let got = resolve_default_dirs_macos(None, home);
+            assert_eq!(dirs_of(got), vec![macos_system()]);
+        }
+        let got = resolve_default_dirs_macos(Some("rel-xdg".into()), Some("rel-home".into()));
+        assert_eq!(dirs_of(got), vec![macos_system()]);
+    }
+
+    /// macOS では `resolve_default_dirs` が macOS 版へ委ねる（main の platform-ci と dispatch の
+    /// macOS leg でだけ走る）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plug11_default_dirs_on_macos_delegate_to_macos_resolver() {
+        let got = resolve_default_dirs(Some("/xdg".into()), Some("/Users/u".into()));
+        assert_eq!(
+            dirs_of(got),
+            vec![
+                macos_system(),
+                (
+                    PluginDirKind::User,
+                    PathBuf::from("/xdg/fandhe-container/plugins")
+                )
+            ]
+        );
+    }
+
+    /// Windows ホストでは plugin を発見しないため空（#1415・#1539。PLUG-11）。PR の CI では走らず、
+    /// main の platform-ci と dispatch の Windows leg で走る。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn plug11_default_dirs_are_empty_on_windows() {
+        assert_eq!(
+            dirs_of(resolve_default_dirs(Some("/xdg".into()), Some("/h".into()))),
+            vec![]
+        );
     }
 
     #[test]

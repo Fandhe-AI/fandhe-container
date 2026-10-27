@@ -85,7 +85,9 @@
 //!
 //! - `exec`・`sys`（`sys.rs`）は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
 //!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。macOS には別ファイル `sys/macos.rs`
-//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出のみ。`state_store` 用。#2247・OCI-5）を
+//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出〔`state_store` 用。#2247・OCI-5〕と、
+//!   plugin 検証向けの symlink 非追従の fd 相対 open・fd の実体パス取得・fd の拡張 ACL 検出〔`plugin_fs`。
+//!   呼び出し元は #1865 予定。#1864・PLUG-11〕のみ）を
 //!   `#[cfg(target_os = "macos")]` で取り込み、Linux の宣言は macOS に漏らさない。`traits` は OS 非依存で 3 OS に公開される
 //! - `sys` の `extern "C"` 宣言と `unsafe` は glibc / musl の型幅・syscall 番号を前提とするため、
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）

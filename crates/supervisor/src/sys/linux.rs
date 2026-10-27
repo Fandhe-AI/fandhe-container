@@ -76,7 +76,7 @@ mod arch {
 
 /// `EPERM`（include/uapi/asm-generic/errno-base.h の 1。x86_64・aarch64 で共通）。`privilege` が `setsid(2)` の
 /// 「プロセスグループのリーダー」と capability 系 syscall の権限不足を見分けるのに使う（SUP-14・#2426）。
-/// この crate は `libc` との機械照合が未導入のため、値は下の単体テストで具体値を照合する。
+/// 値は `libc_abi`（#1840）が `libc` と照合し、下の単体テストが具体値も照合する。
 pub(crate) const EPERM: i32 = 1;
 
 /// include/uapi/linux/prctl.h の値。
@@ -118,11 +118,10 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int close(int fd)`。
     fn close(fd: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（`pid_t` は Linux で i32）。引数なし・ポインタなし。
-    // `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
-    // crate には、その crate の実装 issue が済んでから効く」）。#537 で追加。
+    // `libc` との照合は `libc_abi`（#1840）。#537 で追加。
     fn setsid() -> i32;
     // SAFETY（宣言そのものの妥当性）: `int kill(pid_t pid, int sig)`（`pid_t` は Linux で i32）。整数引数のみ。
-    // `libc` との機械照合はこの crate では未導入（上の `setsid` と同じ理由）。
+    // `libc` との照合は `libc_abi`（#1840）。
     fn kill(pid: i32, sig: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int getsockopt(int sockfd, int level, int optname, void *optval,
     // socklen_t *optlen)`（`socklen_t` は Linux で u32）。制御チャネルの `SO_PEERCRED` 取得だけに使う（#2058）。
@@ -135,8 +134,8 @@ unsafe extern "C" {
     ) -> i32;
     // SAFETY（宣言そのものの妥当性）: `ssize_t lgetxattr(const char *path, const char *name, void *value,
     // size_t size)`（glibc / musl。LP64 で `ssize_t` は isize、`size_t` は usize）。symlink を辿らない。
-    // doctor の特権ランチャー診断（#2599）の `security.capability` 読み取りだけに使う。`libc` との機械照合は
-    // この crate では未導入（上の `setsid` と同じ理由）。
+    // doctor の特権ランチャー診断（#2599）の `security.capability` 読み取りだけに使う。`libc` との照合は
+    // `libc_abi`（#1840）。
     fn lgetxattr(
         path: *const std::ffi::c_char,
         name: *const std::ffi::c_char,
@@ -146,8 +145,8 @@ unsafe extern "C" {
 }
 
 /// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
-/// `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
-/// crate」）。レイアウトは pid_t(i32)・uid_t(u32)・gid_t(u32) の 12 バイトで、単体テストが大きさを固定する。
+/// `libc::ucred` との照合は `libc_abi`（#1840）。レイアウトは pid_t(i32)・uid_t(u32)・gid_t(u32) の 12 バイトで、
+/// 単体テストが大きさも固定する。
 #[repr(C)]
 struct Ucred {
     pid: i32,
@@ -643,6 +642,59 @@ mod control_ffi {
             std::mem::size_of::<SockaddrUn>(),
         )
     }
+
+    /// 制御チャネル用 FFI と `libc` の機械照合（親の `libc_abi` と同じ方針。#1840。コンパイル時評価のみ）。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::*;
+        use std::mem::{align_of, offset_of, size_of};
+
+        const _: () = {
+            assert!(AF_UNIX == libc::AF_UNIX);
+            assert!(SOCK_STREAM == libc::SOCK_STREAM);
+            assert!(SOCK_NONBLOCK == libc::SOCK_NONBLOCK);
+            assert!(SOCK_CLOEXEC == libc::SOCK_CLOEXEC);
+            assert!(CLOCK_MONOTONIC == libc::CLOCK_MONOTONIC);
+            // Timespec（LP64 の struct timespec）。
+            assert!(size_of::<Timespec>() == size_of::<libc::timespec>());
+            assert!(align_of::<Timespec>() == align_of::<libc::timespec>());
+            assert!(offset_of!(Timespec, tv_sec) == offset_of!(libc::timespec, tv_sec));
+            assert!(offset_of!(Timespec, tv_nsec) == offset_of!(libc::timespec, tv_nsec));
+            assert!(size_of::<i64>() == size_of::<libc::time_t>());
+            assert!(size_of::<i64>() == size_of::<libc::c_long>());
+            // SockaddrUn。自前の sun_path は u8 で、x86_64 の c_char（i8）と符号が違う。バイト列としてしか使わないため
+            // 大きさとオフセットで照合する。
+            assert!(size_of::<SockaddrUn>() == size_of::<libc::sockaddr_un>());
+            assert!(align_of::<SockaddrUn>() == align_of::<libc::sockaddr_un>());
+            assert!(
+                offset_of!(SockaddrUn, sun_family) == offset_of!(libc::sockaddr_un, sun_family)
+            );
+            assert!(offset_of!(SockaddrUn, sun_path) == offset_of!(libc::sockaddr_un, sun_path));
+            assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
+            assert!(size_of::<[u8; 108]>() == size_of::<[libc::c_char; 108]>());
+        };
+
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+            socket;
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+            libc::socket;
+        // connect の第 2 引数は自前が不透明ポインタ（c_void）、libc は sockaddr を指すポインタ。どちらも同じ幅の
+        // データポインタで ABI は同じ。渡す SockaddrUn のレイアウトは上で照合している。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_void,
+            libc::socklen_t,
+        ) -> libc::c_int = connect;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::sockaddr,
+            libc::socklen_t,
+        ) -> libc::c_int = libc::connect;
+        const _: unsafe extern "C" fn(libc::clockid_t, *mut Timespec) -> libc::c_int =
+            clock_gettime;
+        const _: unsafe extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
+            libc::clock_gettime;
+    }
 }
 
 /// LP64 でない（または x86_64 / aarch64 でない）ターゲットのフォールバック。構造体レイアウトを推測せず
@@ -711,6 +763,155 @@ pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
     // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの dumpable 属性のみ。
     let rc = unsafe { prctl(PR_SET_DUMPABLE, u64::from(on), 0u64, 0u64, 0u64) };
     check(i64::from(rc)).map(|_| ())
+}
+
+/// 自前の FFI 宣言と `libc` の機械照合（コンパイル時の `const` 評価のみ。関数は呼ばず `unsafe` を足さない。
+/// #1840・#1837・#1318・MVM-4・REPAIR-7・REPAIR-12。方式は docs/design/ffi-libc-check.md）。
+///
+/// `libc` は dev-dependencies だけ（`libc` =0.2.189）で、製品コードの依存グラフは変わらない。
+/// 対象は本モジュールが対応する LP64 の x86_64・aarch64 に限る（`syscall(i64, ...)` が LP64 前提のため）。
+/// 他の構成は `arch` が `None` を返す `Unsupported` の fail-closed で、照合する値が無い。
+/// `arch` の値と `libc` の値はどちらもターゲットの cfg で決まるため、同じ cfg の下で比べる（他ターゲットの値は流用しない）。
+///
+/// 対象外（`libc` 0.2.189 に対応物が無い）:
+/// - `LINUX_CAPABILITY_VERSION_3`・`CapUserHeader`・`CapUserData`: カーネルの include/uapi/linux/capability.h の
+///   `_LINUX_CAPABILITY_VERSION_3`・`struct __user_cap_header_struct`・`__user_cap_data_struct`。実行時には
+///   `/proc/thread-self/status` との一致を見る単体テストが `capget` の結果を照合する。
+/// - `XATTR_NAME_CAPS`: include/uapi/linux/xattr.h の `XATTR_NAME_CAPS`。
+/// - `FILE_CAPS_BUF_LEN`: include/uapi/linux/capability.h の `XATTR_CAPS_SZ_3`（24）に対応する。
+/// - `MAX_EXEC_VECTOR`・`CAP_NUMBER_LIMIT`: FFI ではなく自前の上限。
+/// - `arch` の非 LP64 系統: 値が `None` で照合する値が無い。
+///
+/// 関数内のローカル定数やリテラルで書いた errno 等は項目として参照できないため、`libc` の値をリテラルと比べる。
+#[cfg(all(
+    test,
+    any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    )
+))]
+mod libc_abi {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    const fn opt_i64_eq(o: Option<i64>, v: i64) -> bool {
+        match o {
+            Some(x) => x == v,
+            None => false,
+        }
+    }
+    const fn opt_i32_eq(o: Option<i32>, v: libc::c_int) -> bool {
+        match o {
+            Some(x) => x == v,
+            None => false,
+        }
+    }
+    /// `c_int` を負でないことを確かめて `u64` へ広げる（符号の食い違いを見逃さない）。
+    const fn widen_u64(v: libc::c_int) -> u64 {
+        assert!(v >= 0);
+        v as u64
+    }
+    /// `c_int` を `i64` へ広げる（拡幅で切り詰めは起きない）。
+    const fn widen_i64(v: libc::c_int) -> i64 {
+        v as i64
+    }
+
+    const _: () = {
+        // arch（syscall 番号・open フラグ・ソケット定数）。
+        assert!(opt_i64_eq(arch::SYS_CAPGET, libc::SYS_capget));
+        assert!(opt_i64_eq(arch::SYS_CAPSET, libc::SYS_capset));
+        assert!(opt_i64_eq(arch::SYS_EXECVEAT, libc::SYS_execveat));
+        assert!(opt_i32_eq(arch::O_DIRECTORY, libc::O_DIRECTORY));
+        assert!(opt_i32_eq(arch::O_NOFOLLOW, libc::O_NOFOLLOW));
+        assert!(opt_i32_eq(arch::SOL_SOCKET, libc::SOL_SOCKET));
+        assert!(opt_i32_eq(arch::SO_PEERCRED, libc::SO_PEERCRED));
+        // errno。
+        assert!(EPERM == libc::EPERM);
+        assert!(ENODATA == libc::ENODATA);
+        assert!(EOPNOTSUPP == libc::EOPNOTSUPP);
+        assert!(ERANGE == libc::ERANGE);
+        // prctl。
+        assert!(PR_SET_DUMPABLE == libc::PR_SET_DUMPABLE);
+        assert!(PR_GET_KEEPCAPS == libc::PR_GET_KEEPCAPS);
+        assert!(PR_SET_KEEPCAPS == libc::PR_SET_KEEPCAPS);
+        assert!(PR_CAPBSET_DROP == libc::PR_CAPBSET_DROP);
+        assert!(PR_CAP_AMBIENT == libc::PR_CAP_AMBIENT);
+        assert!(PR_CAP_AMBIENT_RAISE == widen_u64(libc::PR_CAP_AMBIENT_RAISE));
+        assert!(PR_CAP_AMBIENT_CLEAR_ALL == widen_u64(libc::PR_CAP_AMBIENT_CLEAR_ALL));
+        // そのほか。
+        assert!(AT_EMPTY_PATH == widen_i64(libc::AT_EMPTY_PATH));
+        assert!(SYS_CLOSE_RANGE == libc::SYS_close_range);
+        assert!(F_GETFD == libc::F_GETFD);
+        // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
+        assert!(libc::SIGKILL == 9); // kill_process_group
+        assert!(libc::EINVAL == 22); // check_cap_number ほか
+        assert!(libc::ENOSYS == 38); // close_fds_from の縮退の判定
+        assert!(libc::EBADF == 9); // 試験 sup14_task1719_execveat_bad_fd_returns_ebadf
+    };
+
+    // Ucred（struct ucred）。
+    const _: () = {
+        assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+        assert!(size_of::<i32>() == size_of::<libc::pid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::uid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::gid_t>());
+    };
+
+    // 関数の型（自前と libc を同じ型の const に代入する。食い違えば型エラー）。
+    const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = prctl;
+    const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = libc::prctl;
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = syscall;
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = libc::syscall;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = fcntl;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = libc::fcntl;
+    const _: unsafe extern "C" fn(libc::size_t, *const libc::gid_t) -> libc::c_int = setgroups;
+    const _: unsafe extern "C" fn(libc::size_t, *const libc::gid_t) -> libc::c_int =
+        libc::setgroups;
+    const _: unsafe extern "C" fn(libc::gid_t, libc::gid_t, libc::gid_t) -> libc::c_int = setresgid;
+    const _: unsafe extern "C" fn(libc::gid_t, libc::gid_t, libc::gid_t) -> libc::c_int =
+        libc::setresgid;
+    const _: unsafe extern "C" fn(libc::uid_t, libc::uid_t, libc::uid_t) -> libc::c_int = setresuid;
+    const _: unsafe extern "C" fn(libc::uid_t, libc::uid_t, libc::uid_t) -> libc::c_int =
+        libc::setresuid;
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = close;
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::close;
+    const _: unsafe extern "C" fn() -> libc::pid_t = setsid;
+    const _: unsafe extern "C" fn() -> libc::pid_t = libc::setsid;
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = kill;
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = libc::kill;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = getsockopt;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getsockopt;
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        *const libc::c_char,
+        *mut libc::c_void,
+        libc::size_t,
+    ) -> libc::ssize_t = lgetxattr;
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        *const libc::c_char,
+        *mut libc::c_void,
+        libc::size_t,
+    ) -> libc::ssize_t = libc::lgetxattr;
+    // 試験 repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full の関数内宣言 `listen` は
+    // 項目として参照できないため、試験に書いた型 `unsafe extern "C" fn(i32, i32) -> i32` へ libc を代入して照合する。
+    const _: unsafe extern "C" fn(i32, i32) -> i32 = libc::listen;
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@
 # TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
 # #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
 # #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。
+# #1840 で sys の自前 FFI 宣言と libc の照合試験を追加した（dev-dependencies に workspace の libc =0.2.189。Linux のみ）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -84,6 +85,11 @@ exec-test-support = ["fandhe-container-core/exec-test-support"]
 # 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
 [dev-dependencies]
 fandhe-container-supervisor = { path = ".", features = ["exec-test-support"] }
+
+# 自前 FFI 宣言と libc のコンパイル時照合（`src/sys/linux.rs` の `libc_abi`。#1840・#1318・MVM-4・REPAIR-12。
+# 方式は docs/design/ffi-libc-check.md）。dev-dependencies のみで製品コードの依存には入れない。sys は Linux 限定。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
 
 # 実 pid1 の 5 種 namespace への setns 参加の結合試験（TASK-163.1・#500・SUP-6）。
 # setns(CLONE_NEWNS) は複数スレッドのプロセスから拒否されるため、単一スレッドの独自 main（harness = false）で動かす。

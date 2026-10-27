@@ -434,6 +434,7 @@ dependencies = [
  "fandhe-container-io",
  "fandhe-container-platform-macos",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]

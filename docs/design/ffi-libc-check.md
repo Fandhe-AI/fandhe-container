@@ -71,6 +71,8 @@ crates/cli（#1838）と crates/oci（#2590。#1837 の範囲に入れる。2026
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 
+crates/plugin-macos（#1845）は適用済み。照合は `sys.rs` の `imp::libc_abi`（`SIGTERM` の 3 腕・`SIG_ERR`・`signal` の型・`on_sigterm` の引数型）と `libc_abi`（`NOFOLLOW_NONBLOCK_FLAGS` の 3 腕・`ELOOP` の 2 腕）。対象外は `None` の腕・Windows の `ELOOP` 腕・FFI でない安全なラッパーで、構造体は無い。評価対象外のターゲット（Linux mips / mips64 / sparc64、illumos 等）では `ELOOP` の宣言が `libc` と食い違う可能性があり、別 issue で扱う。
+
 crates/gpu（#2979・#2980 で `sys` を新設）は未適用。照合は #1837 の子 #2989 で行う。dev-dependencies の `libc`（=0.2.189）だけを使い、追加には oci（#2590）と同様に crate ごとのオーナー承認が要る。
 
 なお rustdoc は dev-dependencies を解決しないため、`#[cfg(test)]` の外のドキュメントコメントから `libc::…` へ intra-doc リンクを張らない（バッククォートのみ。#1300）。

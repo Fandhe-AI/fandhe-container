@@ -14,6 +14,9 @@
 //! OS・アーキテクチャでレイアウトが異なるため使わず、番号とハンドラのアドレスだけを取る `signal(3)`
 //! （glibc・musl・macOS とも BSD セマンティクスで、ハンドラは解除されず再設定も不要）を使う。
 //!
+//! 自前宣言の正しさは dev-dependencies の `libc` との機械照合（コンパイル時 `const`）で守る
+//! （#1318・#1845・MVM-4・REPAIR-12。`imp::libc_abi` と `libc_abi`。方式は `docs/design/ffi-libc-check.md`）。
+//!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`install_sigterm_flag`] のみ。
 //! - ハンドラは `static AtomicBool` への `store` だけを行う（async-signal-safe。確保・ロック・I/O をしない）。
@@ -95,6 +98,36 @@ mod imp {
         // ハンドラは解除されないため、2 回目以降の SIGTERM もフラグを再度立てるだけでプロセスを殺さない。
         let prev = unsafe { signal(SIGTERM, handler as usize) };
         prev != SIG_ERR
+    }
+
+    /// 自前の FFI 宣言を dev-dependencies の `libc` とコンパイル時に照合する（#1845・MVM-4・REPAIR-12。
+    /// 方式は `docs/design/ffi-libc-check.md`）。`const` の評価なので食い違えばビルドが落ちる。
+    /// 関数は呼ばず型だけを比べる（`unsafe` は足さない）。
+    ///
+    /// 対象外: 構造体は無い（`struct sigaction` は使わない）。`install` は FFI でない安全なラッパー。
+    /// 宣言側に gnu / musl の分岐は無く、`libc` 0.2.189 の値も arch ごとに env で同一のため `target_env` 分岐は不要。
+    #[cfg(test)]
+    mod libc_abi {
+        // SIGTERM は宣言と同じ cfg の腕ごとに、同じ組の `libc` の値と比べる。
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(super::SIGTERM == libc::SIGTERM);
+
+        // `sighandler_t` は `libc` で `size_t`。自前は `usize`（`as` で合わせず値と幅を直接比べる）。
+        const _: () = assert!(super::SIG_ERR == libc::SIG_ERR);
+        const _: () = assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+
+        // `signal` の型（引数・戻り値）を `libc` の宣言と同一視できるか。
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            super::signal;
+        const _: unsafe extern "C" fn(libc::c_int, libc::sighandler_t) -> libc::sighandler_t =
+            libc::signal;
+
+        // `libc` に型付きのハンドラ型は無い（`sighandler_t` は整数）ため、引数型だけを確かめる。
+        const _: extern "C" fn(libc::c_int) = super::on_sigterm;
     }
 }
 
@@ -194,6 +227,41 @@ const NOFOLLOW_NONBLOCK_FLAGS: Option<i32> = None;
 pub const ELOOP: i32 = 40;
 #[cfg(not(target_os = "linux"))]
 pub const ELOOP: i32 = 62;
+
+/// 直下の自前定数を `libc` と照合する（#1845・MVM-4・REPAIR-12）。`imp::libc_abi` が SIGTERM・`signal` を担当する。
+///
+/// 対象外（理由）:
+/// - `NOFOLLOW_NONBLOCK_FLAGS = None` の腕: 値を持たず、通常の open へフォールバックする。
+/// - `ELOOP` の Windows 腕: dev-dependency の `libc` は `cfg(unix)` で無く、Windows の `raw_os_error` は errno でない。
+/// - `open_nofollow_nonblock`・`install_sigterm_flag`・`register`・`SIGTERM_RECEIVED`: FFI でない安全なラッパー・状態。
+///
+/// 既知の潜在的な食い違い（評価対象外のターゲット。CI は Linux x86_64 / aarch64・macOS のみ。
+/// `libc` 0.2.189 の `src/unix/` を出典）: `ELOOP` の Linux 腕は全アーキテクチャで 40 だが、Linux の
+/// mips / mips64 は 90、sparc64 は 62。非 Linux 腕の 62 も illumos / solaris 等は 90。宣言の修正は別 issue。
+#[cfg(all(test, unix))]
+mod libc_abi {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const _: () = assert!(matches!(
+        super::NOFOLLOW_NONBLOCK_FLAGS,
+        Some(f) if f == libc::O_NOFOLLOW | libc::O_NONBLOCK
+    ));
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const _: () = assert!(matches!(
+        super::NOFOLLOW_NONBLOCK_FLAGS,
+        Some(f) if f == libc::O_NOFOLLOW | libc::O_NONBLOCK
+    ));
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(matches!(
+        super::NOFOLLOW_NONBLOCK_FLAGS,
+        Some(f) if f == libc::O_NOFOLLOW | libc::O_NONBLOCK
+    ));
+
+    // ELOOP は宣言の 2 腕と `libc` の入る cfg（unix）の積で照合する。CI で評価される非 Linux は macOS のみ。
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(super::ELOOP == libc::ELOOP);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    const _: () = assert!(super::ELOOP == libc::ELOOP);
+}
 
 #[cfg(test)]
 mod tests {

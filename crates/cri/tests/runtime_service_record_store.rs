@@ -484,7 +484,60 @@ async fn hung_put_is_bounded_by_the_runtime_timeout() {
         .expect("run must return within a bounded time")
         .unwrap_err();
     assert_eq!(e.code(), Code::Internal);
+    // 予約は put の worker が終わるまで保たれ、終わると戻る。
     gate.release.send(()).unwrap();
+    wait_for_empty_list(&svc).await;
+}
+
+/// 有限時間で一覧が空になるのを待つ（手放した put の worker が予約を戻すまで）。
+async fn wait_for_empty_list(svc: &CriRuntimeService) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !list(svc).await.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reservation was not released in time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 手放した put の後始末で削除が失敗したら予約を捨てず、notready の記録として残す。Remove で回収できる
+/// （#2933・CRI-2・REPAIR-3）。
+#[tokio::test]
+async fn failed_cleanup_remove_keeps_a_recoverable_record() {
+    let log: Log = Arc::default();
+    let (store, gate) = FakeStore::new(&log);
+    let svc = CriRuntimeService::new()
+        .with_runtime_timeout(Duration::from_millis(200))
+        .with_record_store(store.clone());
+    *store.block_put_at.lock().unwrap() = Some(0);
+    store.fail_remove_at.lock().unwrap().push(0);
+    let e = run(&svc).await.unwrap_err();
+    assert_eq!(e.code(), Code::Internal);
+    gate.release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let items = loop {
+        let items = list(&svc).await;
+        if !items.is_empty() && *store.removes.lock().unwrap() >= 1 {
+            break items;
+        }
+        assert!(std::time::Instant::now() < deadline, "cleanup did not run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(items.len(), 1);
+    let id = items[0].id.clone();
+    // 回復可能: 重複の Run を拒否しつつ、Remove で回収できる。
+    let mut tries = 0;
+    loop {
+        match remove(&svc, &id).await {
+            Ok(()) => break,
+            Err(e) if e.code() == Code::FailedPrecondition && tries < 100 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("remove failed: {e:?}"),
+        }
+    }
     assert!(list(&svc).await.is_empty());
 }
 
@@ -543,9 +596,9 @@ async fn dropped_run_during_write_ahead_releases_the_reservation() {
             .await
             .is_err()
     );
-    assert!(list(&svc).await.is_empty());
     gate.release.send(()).unwrap();
     wait_for_put_then_remove(&log).await;
+    wait_for_empty_list(&svc).await;
     run(&svc).await.expect("same metadata must not be rejected");
 }
 

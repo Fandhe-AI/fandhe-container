@@ -771,6 +771,12 @@ impl Drop for NetworkTearDownGuard {
     }
 }
 
+/// 記録ストアへの 1 回の I/O（worker へ渡す。#2933）。
+enum StoreCall {
+    Put(RecordId, Vec<u8>),
+    Remove(RecordId),
+}
+
 /// sandbox 記録の書き込み・削除が終わるまで `record_write` を保つ guard（#2933・CRI-1・CRI-2）。
 ///
 /// `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` が書く時点の前後で持つ。future が中断されても
@@ -1517,15 +1523,15 @@ impl CriRuntimeService {
         let (resp, publishes) = self.reserve_sandbox(req, true)?;
         let id = resp.pod_sandbox_id.clone();
         // 確定の書き込みが済むまで（set_up を含む全体）同じ ID への並行操作を拒否する。
-        let _write_guard = self.write_guard(&id);
+        let mut write_guard = self.write_guard(&id);
         // write-ahead: set_up（副作用）の前に pending つきで書く。失敗したら副作用を起こさず巻き戻す
         // （#2933・CRI-2・REPAIR-3）。この記録は「副作用が起きたかもしれない」印として、結果不明のまま
         // 残る場合は pending=1 のままディスクに残り、R6 #2935 が起動時に解決する。
-        if let Err(err) = self.persist_sandbox(&id, true) {
+        if let Err(err) = self.persist_sandbox(&id, true, &mut write_guard).await {
             if let Ok(mut registry) = self.registry.lock() {
                 remove_sandbox_record(&mut registry, &id);
             }
-            self.rollback_unwritten(&id);
+            self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
         let config = {
@@ -1589,7 +1595,7 @@ impl CriRuntimeService {
             Ok(()) => {
                 // 確定版（pending=0・ready・network_owned）へ置き換える。失敗したら成功を装わず、
                 // メモリの記録は NotReady で残して（network_owned のまま Stop・Remove が回収できる）INTERNAL を返す。
-                if let Err(err) = self.persist_sandbox(&id, false) {
+                if let Err(err) = self.persist_sandbox(&id, false, &mut write_guard).await {
                     if let Ok(mut registry) = self.registry.lock()
                         && let Some(record) = registry.records.get_mut(&id)
                     {
@@ -1610,7 +1616,7 @@ impl CriRuntimeService {
                         }
                         remove_sandbox_record(&mut registry, &id);
                     }
-                    self.rollback_unwritten(&id);
+                    self.rollback_unwritten(&id, &mut write_guard).await;
                     return Err(err);
                 }
                 // 期限超過・待ち受け側の失敗は worker がまだ走っている可能性があり、tear_down を同時に呼ばない。
@@ -1635,7 +1641,7 @@ impl CriRuntimeService {
                         remove_sandbox_record(&mut registry, &id);
                     }
                     // pending 記録も消す（失敗しても元のエラーを返す。残れば R6 の pending 解決に委ねる）。
-                    self.rollback_unwritten(&id);
+                    self.rollback_unwritten(&id, &mut write_guard).await;
                 } else if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.records.get_mut(&id)
                 {
@@ -1761,8 +1767,12 @@ impl CriRuntimeService {
         self.release_pod_network(&id).await?;
         // 停止とネットワークの回収が済んだ時点の状態を書く（途中の失敗では書かない: ディスクの古い ready は
         // 安全側で、R6 は常に NotReady として再採用する）。失敗してもメモリは Stop 後のまま INTERNAL を返す。
-        let _write_guard = self.begin_record_write(&id)?;
-        self.persist_sandbox(&id, false)?;
+        // 記録が無い（並行する Remove が完了した・未知 ID）ときは書く対象が無く、成功のまま返す。
+        let Some(guard) = self.begin_record_write(&id)? else {
+            return Ok(resp);
+        };
+        let mut write_guard = Some(guard);
+        self.persist_sandbox(&id, false, &mut write_guard).await?;
         Ok(resp)
     }
 
@@ -1793,7 +1803,7 @@ impl CriRuntimeService {
         }
         match &self.runtime {
             Some(binding) => self.remove_sandbox_runtime(binding, req).await,
-            None => self.remove_sandbox(req),
+            None => self.remove_sandbox(req).await,
         }
     }
 
@@ -1844,13 +1854,18 @@ impl CriRuntimeService {
 
     /// sandbox の現在の記録をスナップショットして記録ストアへ書く（#2933・CRI-1・CRI-2）。
     ///
-    /// ストア未注入なら何もしない。スナップショットはロック下で取り、符号化と `put`（fsync）はロックを外して
-    /// 行う（registry の `Mutex` を持ったまま I/O しない）。失敗は種別によらず固定文言の `INTERNAL`。
-    /// 呼び出し側は `record_write` の guard を持っていること。
-    fn persist_sandbox(&self, id: &str, pending: bool) -> Result<(), CriError> {
-        let Some(store) = &self.record_store else {
+    /// ストア未注入なら何もしない。スナップショットはロック下で取り、符号化はロックを外して行い、`put`
+    /// （fsync）は専用 worker で期限つきに走らせる（[`Self::store_io_bounded`]。REPAIR-5）。失敗・期限超過は
+    /// 種別によらず固定文言の `INTERNAL`。呼び出し側は `record_write` の guard を `guard` に渡すこと。
+    async fn persist_sandbox(
+        &self,
+        id: &str,
+        pending: bool,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) -> Result<(), CriError> {
+        if self.record_store.is_none() {
             return Ok(());
-        };
+        }
         let data = {
             let registry = self
                 .registry
@@ -1865,44 +1880,82 @@ impl CriRuntimeService {
         let record_id =
             RecordId::new(id).map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))?;
         let bytes = data.encode()?;
-        store
-            .put(RecordKind::Sandbox, &record_id, &bytes)
-            .map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))
+        self.store_io_bounded(StoreCall::Put(record_id, bytes), guard)
+            .await
     }
 
-    /// 記録ファイルを消す（無ければ成功）。失敗は固定文言の `INTERNAL`。
-    fn unpersist_sandbox(&self, id: &str) -> Result<(), CriError> {
-        let Some(store) = &self.record_store else {
+    /// 記録ファイルを期限つきで消す（無ければ成功）。失敗・期限超過は固定文言の `INTERNAL`。
+    async fn unpersist_sandbox(
+        &self,
+        id: &str,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) -> Result<(), CriError> {
+        if self.record_store.is_none() {
             return Ok(());
-        };
+        }
         let record_id =
             RecordId::new(id).map_err(|_| CriError::internal(SANDBOX_UNPERSIST_FAILED))?;
-        store
-            .remove(RecordKind::Sandbox, &record_id)
-            .map_err(|_| CriError::internal(SANDBOX_UNPERSIST_FAILED))
+        self.store_io_bounded(StoreCall::Remove(record_id), guard)
+            .await
+    }
+
+    /// 記録ストアの I/O を専用 worker で走らせ、`runtime_timeout` まで待つ（REPAIR-5）。
+    ///
+    /// `put` / `remove` は fsync で無期限に止まりうるため、async の RPC から直接呼ばない。`guard` は worker へ
+    /// 移し、成功したときだけ呼び出し側へ戻す。期限超過・失敗後は worker が完了するまで `record_write` が
+    /// 立ったままになり（worker が guard を Drop する）、遅れて完了する書き込みと並行操作が交錯しない。
+    async fn store_io_bounded(
+        &self,
+        call: StoreCall,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) -> Result<(), CriError> {
+        let Some(store) = self.record_store.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let failure = match call {
+            StoreCall::Put(..) => SANDBOX_PERSIST_FAILED,
+            StoreCall::Remove(..) => SANDBOX_UNPERSIST_FAILED,
+        };
+        let moved = guard.take();
+        let outcome = run_bounded(self.runtime_timeout, move || {
+            let result = match &call {
+                StoreCall::Put(id, bytes) => store.put(RecordKind::Sandbox, id, bytes),
+                StoreCall::Remove(id) => store.remove(RecordKind::Sandbox, id),
+            };
+            (result, moved)
+        })
+        .await;
+        match outcome {
+            Ok((result, returned)) => {
+                *guard = returned;
+                result.map_err(|_| CriError::internal(failure))
+            }
+            // 期限超過・起動失敗: guard は worker（または破棄されたクロージャ）が持つ。
+            Err(_) => Err(CriError::internal(failure)),
+        }
     }
 
     /// 巻き戻した予約のファイルを消す後始末（失敗しても元のエラーを優先して無視する）。
-    fn rollback_unwritten(&self, id: &str) {
-        let _ = self.unpersist_sandbox(id);
+    async fn rollback_unwritten(&self, id: &str, guard: &mut Option<SandboxRecordWriteGuard>) {
+        let _ = self.unpersist_sandbox(id, guard).await;
     }
 
     /// ネットワークなしの `RunPodSandbox`。予約 → 確定版を 1 回書く。
     ///
     /// 現時点では副作用が無いため pending を書かない（pending を書くと R6 が所有情報不足として保持し続ける）。
     /// 保持役の起動を入れる #2871 は、その前に pending の書き込みを足すこと（REPAIR-3）。
-    fn run_sandbox_plain(
+    async fn run_sandbox_plain(
         &self,
         req: v1::RunPodSandboxRequest,
     ) -> Result<v1::RunPodSandboxResponse, CriError> {
         let (resp, _) = self.reserve_sandbox(req, false)?;
         let id = resp.pod_sandbox_id.clone();
-        let _write_guard = self.write_guard(&id);
-        if let Err(err) = self.persist_sandbox(&id, false) {
+        let mut write_guard = self.write_guard(&id);
+        if let Err(err) = self.persist_sandbox(&id, false, &mut write_guard).await {
             if let Ok(mut registry) = self.registry.lock() {
                 remove_sandbox_record(&mut registry, &id);
             }
-            self.rollback_unwritten(&id);
+            self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
         Ok(resp)
@@ -1980,7 +2033,7 @@ impl CriRuntimeService {
     /// （ロック外）→ メモリの除去（ロック下）」の順で行う（#2933・CRI-1・CRI-2）。この時点で実行層・
     /// ネットワークの資源は回収済みで、所有の証明（ファイル）を先に消しても回収不能な資源は残らない。
     /// 削除に失敗したらメモリの記録を残して `INTERNAL`（再試行でファイルを消し直せる）。
-    fn remove_sandbox(
+    async fn remove_sandbox(
         &self,
         req: v1::RemovePodSandboxRequest,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
@@ -1999,7 +2052,7 @@ impl CriRuntimeService {
             return Ok(v1::RemovePodSandboxResponse {});
         }
         // 検査を通ったときだけ record_write を立てる（拒否の応答でフラグを残さない）。
-        let _write_guard = {
+        let mut write_guard = {
             let mut registry = self
                 .registry
                 .lock()
@@ -2016,21 +2069,26 @@ impl CriRuntimeService {
             record.record_write = true;
             self.write_guard(id)
         };
-        self.unpersist_sandbox(id)?;
-        let mut registry = self
-            .registry
-            .lock()
-            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-        // ロックを外した間に状態が変わっていないか再検査する（配下の操作の開始など）。
-        match plan_sandbox_removal(&registry, id) {
-            Ok(Some(plan)) => apply_sandbox_removal(&mut registry, id, plan),
-            Ok(None) => {}
-            Err(err) => {
-                // ファイルは消えたがメモリに残す場合は、書き直して再起動後も追跡できるようにする（best effort）。
-                drop(registry);
-                let _ = self.persist_sandbox(id, false);
-                return Err(err);
+        self.unpersist_sandbox(id, &mut write_guard).await?;
+        let rewrite_err = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            // ロックを外した間に状態が変わっていないか再検査する（配下の操作の開始など）。
+            match plan_sandbox_removal(&registry, id) {
+                Ok(Some(plan)) => {
+                    apply_sandbox_removal(&mut registry, id, plan);
+                    None
+                }
+                Ok(None) => None,
+                Err(err) => Some(err),
             }
+        };
+        if let Some(err) = rewrite_err {
+            // ファイルは消えたがメモリに残す場合は、書き直して再起動後も追跡できるようにする（best effort）。
+            let _ = self.persist_sandbox(id, false, &mut write_guard).await;
+            return Err(err);
         }
         Ok(v1::RemovePodSandboxResponse {})
     }
@@ -2722,7 +2780,7 @@ impl CriRuntimeService {
         if let Some(status) = first_error {
             return Err(status);
         }
-        self.remove_sandbox(req)
+        self.remove_sandbox(req).await
     }
 
     /// `StopContainer` の本体。running を exited へ遷移させる（CRI-1・ERR-3・TASK-58.2）。
@@ -3117,7 +3175,7 @@ impl RuntimeService for CriRuntimeService {
             Some(provider) if wants_pod_network(req.config.as_ref()) => {
                 self.run_sandbox_networked(provider, req).await
             }
-            _ => self.run_sandbox_plain(req),
+            _ => self.run_sandbox_plain(req).await,
         }
         .map_err(Status::from);
         timer.finish_with(&result);

@@ -5,6 +5,7 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fandhe_container_cri::adapter::{PodNetns, PodNetworkProvider, PodNetworkRequest};
 use fandhe_container_cri::error::CriError;
@@ -30,6 +31,9 @@ enum Ev {
     SetUp,
     TearDown,
 }
+
+/// 試験内の全待機の上限（回帰時にも有限時間で失敗させる。REPAIR-5）。
+const WAIT: Duration = Duration::from_secs(10);
 
 type Log = Arc<Mutex<Vec<Ev>>>;
 
@@ -93,7 +97,10 @@ impl RecordStore for FakeStore {
         };
         if *self.block_put_at.lock().unwrap() == Some(n) {
             self.entered.lock().unwrap().send(()).unwrap();
-            self.release.lock().unwrap().recv().unwrap();
+            let released = self.release.lock().unwrap().recv_timeout(WAIT).is_ok();
+            if !released {
+                return Err(CriError::timeout("test gate was not released"));
+            }
         }
         if self.fail_put_at.lock().unwrap().contains(&n) {
             return Err(CriError::timeout("injected"));
@@ -428,15 +435,49 @@ async fn without_a_store_nothing_is_written() {
     assert!(list(&svc).await.is_empty());
 }
 
+/// 別スレッドで future を走らせ、結果を期限つきで待つ（`join` の無期限待ちを避ける）。
+struct Joiner<T>(Receiver<T>);
+
+impl<T> Joiner<T> {
+    fn join(self) -> Result<T, &'static str> {
+        self.0
+            .recv_timeout(WAIT)
+            .map_err(|_| "thread did not finish in time")
+    }
+}
+
 fn on_thread<T: Send + 'static>(
     f: impl std::future::Future<Output = T> + Send + 'static,
-) -> std::thread::JoinHandle<T> {
+) -> Joiner<T> {
+    let (tx, rx) = channel();
     std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
-            .block_on(f)
-    })
+            .block_on(f);
+        let _ = tx.send(out);
+    });
+    Joiner(rx)
+}
+
+/// 記録ストアの `put` が戻らなくても、RPC は `runtime_timeout` で `INTERNAL` を返す（REPAIR-5・#2933）。
+/// 予約は巻き戻され、一覧に残らない。
+#[tokio::test]
+async fn hung_put_is_bounded_by_the_runtime_timeout() {
+    let log: Log = Arc::default();
+    let (store, gate) = FakeStore::new(&log);
+    let svc = CriRuntimeService::new()
+        .with_runtime_timeout(Duration::from_millis(200))
+        .with_record_store(store.clone());
+    *store.block_put_at.lock().unwrap() = Some(0);
+    let e = tokio::time::timeout(WAIT, run(&svc))
+        .await
+        .expect("run must return within a bounded time")
+        .unwrap_err();
+    assert_eq!(e.code(), Code::Internal);
+    gate.release.send(()).unwrap();
+    assert!(list(&svc).await.is_empty());
 }
 
 /// fsync 中は registry のロックを持たない（List が返る）。同じ ID への並行 Stop・Remove・
@@ -450,7 +491,9 @@ async fn concurrent_operations_during_run_write_are_rejected_without_the_lock() 
         let svc = Arc::clone(&svc);
         on_thread(async move { run(&svc).await })
     };
-    gate.entered.recv().unwrap();
+    gate.entered
+        .recv_timeout(WAIT)
+        .expect("put did not reach the gate in time");
     let items = list(&svc).await;
     assert_eq!(items.len(), 1);
     let id = items[0].id.clone();
@@ -480,7 +523,9 @@ async fn remove_during_stop_write_is_rejected() {
         let id = id.clone();
         on_thread(async move { stop(&svc, &id).await })
     };
-    gate.entered.recv().unwrap();
+    gate.entered
+        .recv_timeout(WAIT)
+        .expect("put did not reach the gate in time");
     assert_eq!(
         remove(&svc, &id).await.unwrap_err().code(),
         Code::FailedPrecondition

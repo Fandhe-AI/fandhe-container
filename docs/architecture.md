@@ -283,7 +283,7 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 
 ## 設計ドラフト（採否未決）
 
-- rootful の CLI 経路のユーザー定義ネットワークの実行主体（NET-1・PLUG-1・SUP-14）: [network-wiring.md](design/network-wiring.md) D13（#1870。人間担当の判断は #3057。オーナー承認待ち。決まるまで rootful の bridge の結線は着手しない）
+- rootful の CLI 経路のユーザー定義ネットワークの実行主体（NET-1・PLUG-1・SUP-14）: [network-wiring.md](design/network-wiring.md) D13（#1870。判断シートあり・オーナー承認待ち。判断は #3057。決まるまで rootful の bridge の結線〔#3069・#3074〕は着手しない）
 - `VolumeProvider` の core 側実装の担当 TASK と時期（CRI-7・PLUG-1・IO-7）: [volume-provider-implementation.md](design/volume-provider-implementation.md)（#2451。オーナー承認待ち。決まるまで core に実装は無い）
 - イメージストア root の検査の基準（OCI-7・SEC-1）: [image-store-root-trust.md](design/image-store-root-trust.md)（#2547。権限ビットと所有者の基準はオーナー承認待ち。決まるまで現行を保つ）
 - macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）

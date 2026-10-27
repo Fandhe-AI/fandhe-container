@@ -1123,7 +1123,6 @@ mod tests {
         }
     }
 
-    /// CLI-1・#2775: `stop --signal` は前後どちらでも受け、値の欠落・重複・`-s` は使い方エラー。値の意味は見ない。
     /// CLI-1・#1902: `kill <id> [<signal>]` の構文（値の意味は見ない）。
     #[test]
     fn cli1_parse_kill() {
@@ -1162,6 +1161,7 @@ mod tests {
         );
     }
 
+    /// CLI-1・#2775: `stop --signal` は前後どちらでも受け、値の欠落・重複・`-s` は使い方エラー。値の意味は見ない。
     #[test]
     fn cli1_parse_stop_signal() {
         let want = Ok(StopArgs {

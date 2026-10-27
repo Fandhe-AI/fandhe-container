@@ -71,6 +71,13 @@
 //! `kernel.apparmor_restrict_unprivileged_userns=1` がない環境）と `unshare` / `nsenter`（util-linux）が
 //! 必要なため、`-- --ignored` 指定時のみ実行する（`crates/core/tests/unshare_isolation.rs` と同じ方式。
 //! AGENTS.md「実機前提テスト」）。実行された場合は拒否を含むあらゆる失敗を失敗として扱う。
+//! 範囲写像の helper ケース（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）の前提欠如（`newuidmap` / `newgidmap`・
+//! subuid / subgid）は、1 行目が `exec_setns_join: PRECONDITION FAILED (test environment, ...)` になる
+//! （分類元は `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
+
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -79,6 +86,7 @@ fn main() {
 
 #[cfg(all(target_os = "linux", not(feature = "exec-test-support")))]
 fn main() {
+    precondition::self_check();
     if std::env::args().any(|a| a == "--ignored" || a.starts_with("--joiner")) {
         eprintln!(
             "exec_setns_join: not verified; rebuild with `--features exec-test-support` (see AGENTS.md)"
@@ -138,8 +146,10 @@ fn main() {
         let rootfs = args.get(i + 1).expect("pid1 requires the rootfs path");
         linux::pid1_pivot(std::path::Path::new(rootfs));
     } else if args.iter().any(|a| a == "--ignored") {
+        precondition::self_check();
         linux::orchestrate();
     } else {
+        precondition::self_check();
         println!(
             "exec_setns_join: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
         );
@@ -311,6 +321,8 @@ mod linux {
         );
         // #2770: 範囲写像の対象への非 root の `process.user` と `additionalGids`（実機前提の追加。前提が揃う時だけ）。
         if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            let uid = fs::metadata("/proc/self").expect("stat /proc/self").uid();
+            crate::precondition::require_subordinate_ids(uid);
             let (uid_range, gid_range) = subordinate_ranges();
             let map_users = format!("--map-users=0:{}:{}", uid_range.0, uid_range.1);
             let map_groups = format!("--map-groups=0:{}:{}", gid_range.0, gid_range.1);
@@ -334,7 +346,8 @@ mod linux {
         println!("exec_setns_join: namespace join verified");
     }
 
-    /// 自ユーザーの subuid・subgid の最初の範囲 `(先頭, 件数)`（件数は 65536 まで）。無ければ前提欠如として失敗させる。
+    /// 自ユーザーの subuid・subgid の最初の範囲 `(先頭, 件数)`（件数は 65536 まで）。前提欠如は呼び出し前の
+    /// `require_subordinate_ids` が PRECONDITION FAILED で拒否済みで、ここでの失敗は事前検査後の回帰として扱う。
     fn subordinate_ranges() -> ((u32, u32), (u32, u32)) {
         use fandhe_container_core::rootless::{SubIdOwner, load_subordinate_ids};
         let uid = fs::metadata("/proc/self").expect("stat /proc/self").uid();

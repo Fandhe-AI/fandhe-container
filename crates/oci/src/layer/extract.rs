@@ -397,8 +397,8 @@ pub enum OwnershipPolicy {
 
 /// 展開の期限と取り消し（REPAIR-5・CRI-2・#2899）。
 ///
-/// cri の `ImageRootfsSource::prepare`（CreateContainer の rootfs 用意）が `extract_image_layers_bounded` /
-/// `extract_layers_bounded` へ渡す。展開の結果を決める設定ではないため `ExtractOptions`（展開記録の `settings` に
+/// cri の `ImageRootfsSource::prepare`（CreateContainer の rootfs 用意）と `OciImagePuller`（PullImage。#2967）が
+/// `extract_image_layers_bounded` / `extract_layers_bounded` へ渡す。展開の結果を決める設定ではないため `ExtractOptions`（展開記録の `settings` に
 /// 直列化して pull と create の間で照合する）には入れない。既定（`new()`）は期限も取り消しも無く、従来の入口と同じ。
 ///
 /// 確認はレイヤーの前・パス 1 のエントリごと・パス 2 のマーカーごと・パス 3 のエントリごと（書き込みの前）・

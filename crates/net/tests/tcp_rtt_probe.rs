@@ -11,7 +11,7 @@
 //!   期限つきで受け、受けた 1 バイトをそのまま返し続ける。EOF で `served` 行を出して終了する
 //! - `--client <ip:port> [--rounds N] [--warmup W]`: 接続して W 回のウォームアップの後 N 回を計り、
 //!   結果を 1 行 JSON（`schema` = `fandhe-container.tcp-rtt/v1`、単位 us）で出す
-//! - 引数なし: loopback の自己試験（成功行 `tcp_rtt_probe: self-test passed (NET-3)`）
+//! - 先頭が上記以外（引数なし・`--nocapture`・試験名フィルタ等）: loopback の自己試験（成功行 `tcp_rtt_probe: self-test passed (NET-3)`）
 //!
 //! # 契約
 //!
@@ -262,14 +262,35 @@ fn run_serve(
     }
 }
 
+/// 全体期限までの残り時間。尽きていれば `TIMEOUT`。
+fn remaining(overall: Instant) -> Result<Duration, ProbeError> {
+    let left = overall.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(err(Code::Timeout, "overall deadline exceeded"))
+    } else {
+        Ok(left)
+    }
+}
+
+/// 個別の期限 `limit` と全体の残りの小さい方を、読み書きの期限として設定する。
+fn arm(s: &TcpStream, limit: Duration, overall: Instant) -> Result<(), ProbeError> {
+    let t = limit.min(remaining(overall)?);
+    s.set_read_timeout(Some(t))
+        .and_then(|()| s.set_write_timeout(Some(t)))
+        .map_err(|e| io_err("set timeouts", &e))
+}
+
 /// 送信側。`rounds` は呼び出し側が上限検証済みであること。
+/// `overall_limit` は接続前から数える全体期限で、connect・各往復・close 待ちはその残り以下に制限する。
 fn run_client(
     addr: SocketAddr,
     rounds: u32,
     warmup: u32,
     limit: Duration,
+    overall_limit: Duration,
 ) -> Result<Stats, ProbeError> {
-    let mut s = TcpStream::connect_timeout(&addr, limit).map_err(|e| {
+    let overall = Instant::now() + overall_limit;
+    let mut s = TcpStream::connect_timeout(&addr, limit.min(remaining(overall)?)).map_err(|e| {
         let mut p = io_err("connect", &e);
         if p.code != Code::Timeout {
             p.code = Code::Connect;
@@ -277,16 +298,10 @@ fn run_client(
         p
     })?;
     s.set_nodelay(true).map_err(|e| io_err("set_nodelay", &e))?;
-    s.set_read_timeout(Some(limit))
-        .and_then(|()| s.set_write_timeout(Some(limit)))
-        .map_err(|e| io_err("set timeouts", &e))?;
-    let overall = Instant::now() + limit * 30;
     let mut samples: Vec<u64> = Vec::with_capacity(rounds as usize);
     let mut back = [0u8; 1];
     for i in 0..(u64::from(rounds) + u64::from(warmup)) {
-        if Instant::now() >= overall {
-            return Err(err(Code::Timeout, "overall deadline exceeded"));
-        }
+        arm(&s, limit, overall)?;
         let byte = [(i % 251) as u8];
         let start = Instant::now();
         s.write_all(&byte).map_err(|e| io_err("write", &e))?;
@@ -302,9 +317,11 @@ fn run_client(
             samples.push(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         }
     }
-    // サーバーの close を期限つきで待つ（結果には影響させない）。
+    // サーバーの close を全体期限の残りの範囲で待つ。期限が尽きていれば成功にしない。
+    arm(&s, limit, overall)?;
     let _ = s.shutdown(std::net::Shutdown::Write);
     let _ = s.read(&mut back);
+    remaining(overall)?;
     summarize(&mut samples).ok_or_else(|| err(Code::Io, "no samples"))
 }
 
@@ -345,22 +362,30 @@ fn run(mode: Mode) -> Result<(), ProbeError> {
             rounds,
             warmup,
         } => {
-            let stats = run_client(addr, rounds, warmup, timeout())?;
+            let stats = run_client(addr, rounds, warmup, timeout(), timeout() * 30)?;
             say(&result_json(addr, rounds, warmup, &stats));
         }
     }
     Ok(())
 }
 
+/// probe モードに入るか。先頭が `--serve` / `--client` のときだけ。
+fn is_probe_mode(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--serve" | "--client")
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // 自己試験は引数なしの場合に限る。それ以外（誤綴り・モード指定なし）は必ず parse_args で検証し、
-    // 不正なら ARGS・終了コード 2 で拒否する。
-    // CI の `cargo test -- --list` による列挙（libtest 互換）。列挙する試験名は無いので何も出さず成功する。
+    // probe モードは先頭が `--serve` / `--client` のときだけ。それ以外（Cargo が足す `--nocapture`・
+    // `--ignored`・試験名フィルタ等）は無視して自己試験を実行する（兄弟の dns_helper_process と同じ）。
+    // `--list`（libtest 互換の列挙）は列挙する試験名が無いので何も出さず成功する。
     if args.iter().any(|a| a == "--list") {
         return;
     }
-    if !args.is_empty() {
+    if is_probe_mode(&args) {
         let outcome = parse_args(&args).and_then(run);
         if let Err(e) = outcome {
             eprintln!(
@@ -397,6 +422,7 @@ fn self_test() {
     net3_args();
     net3_timeouts();
     net3_desync();
+    net3_overall_deadline();
     net3_loopback_via_processes();
 }
 
@@ -438,6 +464,18 @@ fn net3_json_line() {
 }
 
 fn net3_args() {
+    // Cargo が足しうる引数は probe モードにしない（自己試験を実行する）。
+    for a in [
+        &["--nocapture"][..],
+        &["--ignored"],
+        &["some_filter"],
+        &["--bogus", "x"],
+        &[],
+    ] {
+        assert!(!is_probe_mode(&sv(a)), "{a:?}");
+    }
+    assert!(is_probe_mode(&sv(&["--serve", "127.0.0.1:0"])));
+    assert!(is_probe_mode(&sv(&["--client", "127.0.0.1:1"])));
     let a: SocketAddr = "127.0.0.1:9000".parse().expect("addr");
     assert_eq!(
         parse_args(&sv(&["--serve", "127.0.0.1:9000"])).expect("serve"),
@@ -510,8 +548,44 @@ fn net3_timeouts() {
         std::thread::sleep(Duration::from_millis(1500));
         drop(s);
     });
-    let e = run_client(addr, 5, 0, Duration::from_millis(300)).expect_err("must time out");
+    let e = run_client(
+        addr,
+        5,
+        0,
+        Duration::from_millis(300),
+        Duration::from_secs(30),
+    )
+    .expect_err("must time out");
     assert_eq!(e.code, Code::Timeout);
+    let _ = h.join();
+}
+
+fn net3_overall_deadline() {
+    // 個別の期限は十分長くても、全体期限が尽きたら成功を返さず TIMEOUT にする。
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    let h = std::thread::spawn(move || {
+        let mut s = accept_with_deadline(&l, Duration::from_secs(10)).expect("accept");
+        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut b = [0u8; 1];
+        while s.read_exact(&mut b).is_ok() {
+            std::thread::sleep(Duration::from_millis(60));
+            if s.write_all(&b).is_err() {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let e = run_client(
+        addr,
+        1000,
+        0,
+        Duration::from_secs(5),
+        Duration::from_millis(250),
+    )
+    .expect_err("must hit the overall deadline");
+    assert_eq!(e.code, Code::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(3));
     let _ = h.join();
 }
 
@@ -526,7 +600,8 @@ fn net3_desync() {
             let _ = s.write_all(&[b[0].wrapping_add(1)]);
         }
     });
-    let e = run_client(addr, 3, 0, Duration::from_secs(5)).expect_err("must desync");
+    let e = run_client(addr, 3, 0, Duration::from_secs(5), Duration::from_secs(150))
+        .expect_err("must desync");
     assert_eq!(e.code, Code::Desync);
     let _ = h.join();
 }

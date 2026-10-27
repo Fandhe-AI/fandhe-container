@@ -48,18 +48,25 @@ use super::{
 use crate::error::NetError;
 
 /// 変換種別（`NFTA_NAT_TYPE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_TYPE: u16 = 1;
 /// アドレス family（`NFTA_NAT_FAMILY`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_FAMILY: u16 = 2;
 /// アドレス範囲の下限レジスタ（`NFTA_NAT_REG_ADDR_MIN`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
 /// アドレス範囲の上限レジスタ（`NFTA_NAT_REG_ADDR_MAX`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_REG_ADDR_MAX: u16 = 4;
 /// ポート範囲の下限レジスタ（`NFTA_NAT_REG_PROTO_MIN`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_REG_PROTO_MIN: u16 = 5;
 /// ポート範囲の上限レジスタ（`NFTA_NAT_REG_PROTO_MAX`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_REG_PROTO_MAX: u16 = 6;
 /// フラグ（`NFTA_NAT_FLAGS`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_NAT_FLAGS: u16 = 7;
 /// `NFT_NAT_SNAT`。
 pub const NFT_NAT_SNAT: u32 = 0;
@@ -70,10 +77,13 @@ const NFPROTO_IPV4: u32 = 2;
 /// `NFPROTO_IPV6`。
 const NFPROTO_IPV6: u32 = 10;
 /// ソースポートをランダム化する（`NF_NAT_RANGE_PROTO_RANDOM`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NAT_RANGE_PROTO_RANDOM: u32 = 1 << 2;
 /// 同一送信元に同じマッピングを使う（`NF_NAT_RANGE_PERSISTENT`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NAT_RANGE_PERSISTENT: u32 = 1 << 3;
 /// 完全にランダム化する（`NF_NAT_RANGE_PROTO_RANDOM_FULLY`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NAT_RANGE_PROTO_RANDOM_FULLY: u32 = 1 << 4;
 
 const NAT_EXPR_NAME: &str = "nat";
@@ -587,4 +597,32 @@ mod tests {
         let mut batch = NftBatch::new(1).expect("batch");
         batch.push_with(|seq| rule.build(seq)).expect("push");
     }
+}
+
+/// nat expr の定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_NAT_*`・`NAT_RANGE_*` は定義の横に出典を書いた。
+/// 非公開の `NFPROTO_*` と `NatType` / `NatFamily` の `wire_value`（`const fn`）も評価で照合する。
+/// masq 側の同値の重複定義（`NF_NAT_RANGE_*`）とは crate 内で一致を固定する。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use super::{NatFamily, NatType};
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_NAT_SNAT, u32, c_int);
+        libc_const_eq!(NFT_NAT_DNAT, u32, c_int);
+        libc_const_eq!(NFPROTO_IPV4, u32, c_int);
+        libc_const_eq!(NFPROTO_IPV6, u32, c_int);
+        libc_const_eq!(NatType::Snat.wire_value(), u32, libc::NFT_NAT_SNAT, c_int);
+        libc_const_eq!(NatType::Dnat.wire_value(), u32, libc::NFT_NAT_DNAT, c_int);
+        libc_const_eq!(NatFamily::Ipv4.wire_value(), u32, libc::NFPROTO_IPV4, c_int);
+        libc_const_eq!(NatFamily::Ipv6.wire_value(), u32, libc::NFPROTO_IPV6, c_int);
+        assert!(super::NAT_RANGE_PROTO_RANDOM == crate::nftables_rules::NF_NAT_RANGE_PROTO_RANDOM);
+        assert!(super::NAT_RANGE_PERSISTENT == crate::nftables_rules::NF_NAT_RANGE_PERSISTENT);
+        assert!(
+            super::NAT_RANGE_PROTO_RANDOM_FULLY
+                == crate::nftables_rules::NF_NAT_RANGE_PROTO_RANDOM_FULLY
+        );
+    };
 }

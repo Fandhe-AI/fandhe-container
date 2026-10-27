@@ -36,8 +36,10 @@ use super::{NftDataValue, NftExpr, NftExprAttr, NftExprName, NftRegister, data_l
 use crate::error::NetError;
 
 /// 書き込み先レジスタ（`NFTA_IMMEDIATE_DREG`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_IMMEDIATE_DREG: u16 = 1;
 /// 書き込むデータ（ネスト。`NFTA_IMMEDIATE_DATA`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_IMMEDIATE_DATA: u16 = 2;
 
 const IMMEDIATE_EXPR_NAME: &str = "immediate";

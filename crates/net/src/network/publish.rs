@@ -1064,3 +1064,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// nft の cmp データとしてカーネルへ渡る L4 プロトコル番号の `libc` 照合（NET-1・NET-3・MVM-4・REPAIR-12。#3102。
+/// 方式は `docs/design/ffi-libc-check.md`）。宣言と同じく Linux の試験ビルド限定。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(IPPROTO_TCP, u8, c_int);
+        libc_const_eq!(IPPROTO_UDP, u8, c_int);
+    };
+}

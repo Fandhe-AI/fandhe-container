@@ -84,7 +84,8 @@ pub const IFLA_IFNAME: u16 = 3;
 /// インターフェースの別名属性（`linux/if_link.h` の `IFLA_IFALIAS`）。`RTM_SETLINK` で付けた所有トークンを
 /// 後から読み戻して、同名の別 link に差し替わっていないかを確認するために使う（TASK-139.1）。
 pub const IFLA_IFALIAS: u16 = 20;
-/// 別名の最大長（NUL を含まない。`linux/if.h` の `IFALIASZ` = 256 から NUL 分を引いた値）。
+/// 別名の最大長（NUL を含まない。`IFALIASZ` = 256 から NUL 分を引いた値）。
+/// （出典: `include/uapi/linux/if.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で `IFALIASZ` = 256 を確認。libc 0.2.189 に無い）
 pub const IFALIAS_MAX_LEN: usize = 255;
 /// 移動先 netns を PID で指定する属性（`linux/if_link.h`）。
 pub const IFLA_NET_NS_PID: u16 = 19;
@@ -101,6 +102,7 @@ pub const IFLA_INFO_KIND: u16 = 1;
 /// リンク種別固有データのネスト属性（`linux/if_link.h`）。
 pub const IFLA_INFO_DATA: u16 = 2;
 /// veth の peer 側を指定するネスト属性（`linux/veth.h`）。
+/// （出典: `include/uapi/linux/veth.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const VETH_INFO_PEER: u16 = 1;
 /// インターフェース名の最大長（NUL を含む。`linux/if.h`）。
 pub const IFNAMSIZ: usize = 16;
@@ -1030,4 +1032,35 @@ mod tests {
         let nfd = NetnsFd::new(f.as_fd()).unwrap();
         assert_eq!(nfd.raw(), f.as_raw_fd() as u32);
     }
+}
+
+/// rtnetlink の link 系定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `VETH_INFO_PEER`・`IFALIAS_MAX_LEN` は定義の横に
+/// 出典を書いた。
+///
+/// 対象外（黙って省かない）: link 名・別名の検証の方針値以外に、uapi でない定数は無い。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::{c_int, c_ushort};
+    use core::mem::size_of;
+
+    const _: () = {
+        libc_const_eq!(RTM_NEWLINK, u16, u16);
+        libc_const_eq!(RTM_DELLINK, u16, u16);
+        libc_const_eq!(RTM_GETLINK, u16, u16);
+        libc_const_eq!(RTM_SETLINK, u16, u16);
+        libc_const_eq!(AF_UNSPEC, u8, c_int);
+        libc_const_eq!(IFLA_IFNAME, u16, c_ushort);
+        libc_const_eq!(IFLA_IFALIAS, u16, c_ushort);
+        libc_const_eq!(IFLA_NET_NS_PID, u16, c_ushort);
+        libc_const_eq!(IFLA_NET_NS_FD, u16, c_ushort);
+        libc_const_eq!(IFLA_MASTER, u16, c_ushort);
+        libc_const_eq!(IFLA_LINKINFO, u16, c_ushort);
+        libc_const_eq!(IFLA_INFO_KIND, u16, c_ushort);
+        libc_const_eq!(IFLA_INFO_DATA, u16, c_ushort);
+        libc_const_eq!(IFF_UP, u32, c_int);
+        libc_const_eq!(IFNAMSIZ, usize, libc::size_t);
+        assert!(super::IFINFOMSG_LEN == size_of::<libc::ifinfomsg>());
+    };
 }

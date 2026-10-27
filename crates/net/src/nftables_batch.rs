@@ -78,6 +78,7 @@ pub const NFNL_MSG_BATCH_END: u16 = 0x11;
 /// nfnetlink バージョン 0（`NFNETLINK_V0`）。
 pub const NFNETLINK_V0: u8 = 0;
 /// `nfgenmsg` の固定長（バイト）。
+/// （出典: `include/uapi/linux/netfilter/nfnetlink.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFGENMSG_LEN: usize = 4;
 /// BATCH_BEGIN / END 1 件の長さ（nlmsghdr 16 + nfgenmsg 4。パディングなし）。
 pub(crate) const BATCH_MARKER_LEN: usize = 20;
@@ -692,4 +693,30 @@ mod tests {
         let out = b.finish().unwrap();
         assert_eq!(NlMsgIter::new(out.bytes()).count(), 3);
     }
+}
+
+/// nfnetlink のサブシステム・バッチ・`NFPROTO_*` 定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFGENMSG_LEN`（`struct nfgenmsg`）は定義の横に出典を書いた。
+/// `BATCH_MARKER_LEN` は派生値（nlmsghdr + nfgenmsg）として構造体サイズで照合する。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+    use core::mem::size_of;
+
+    const _: () = {
+        libc_const_eq!(NFNL_SUBSYS_NFTABLES, u8, c_int);
+        libc_const_eq!(NFNL_MSG_BATCH_BEGIN, u16, c_int);
+        libc_const_eq!(NFNL_MSG_BATCH_END, u16, c_int);
+        libc_const_eq!(NFNETLINK_V0, u8, c_int);
+        libc_const_eq!(NFPROTO_UNSPEC, u8, c_int);
+        libc_const_eq!(NFPROTO_INET, u8, c_int);
+        libc_const_eq!(NFPROTO_IPV4, u8, c_int);
+        libc_const_eq!(NFPROTO_ARP, u8, c_int);
+        libc_const_eq!(NFPROTO_NETDEV, u8, c_int);
+        libc_const_eq!(NFPROTO_BRIDGE, u8, c_int);
+        libc_const_eq!(NFPROTO_IPV6, u8, c_int);
+        assert!(super::BATCH_MARKER_LEN == size_of::<libc::nlmsghdr>() + super::NFGENMSG_LEN);
+    };
 }

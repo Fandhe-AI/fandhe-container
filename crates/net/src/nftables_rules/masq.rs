@@ -39,12 +39,16 @@ use super::{NftExpr, NftExprAttr, NftExprName, collect_u32_attrs, data_loss, inv
 use crate::error::NetError;
 
 /// masq のフラグ（`NFTA_MASQ_FLAGS`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_MASQ_FLAGS: u16 = 1;
 /// ソースポートをランダム化する（`NF_NAT_RANGE_PROTO_RANDOM`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NF_NAT_RANGE_PROTO_RANDOM: u32 = 1 << 2;
 /// 同一送信元に同じマッピングを使う（`NF_NAT_RANGE_PERSISTENT`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NF_NAT_RANGE_PERSISTENT: u32 = 1 << 3;
 /// 完全にランダム化する（`NF_NAT_RANGE_PROTO_RANDOM_FULLY`）。
+/// （出典: `include/uapi/linux/netfilter/nf_nat.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NF_NAT_RANGE_PROTO_RANDOM_FULLY: u32 = 1 << 4;
 
 const MASQ_EXPR_NAME: &str = "masq";
@@ -231,4 +235,19 @@ mod tests {
             assert_eq!(e.code(), NetErrorCode::DataLoss, "case {i}");
         }
     }
+}
+
+/// masq expr の定数の照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に `NFTA_MASQ_*`・`NF_NAT_RANGE_*` は無いため、定義の横に出典を
+/// 書き、nat 側の同値の重複定義（`NAT_RANGE_*`）との一致だけを crate 内で固定する。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    const _: () = {
+        assert!(super::NF_NAT_RANGE_PROTO_RANDOM == crate::nftables_rules::NAT_RANGE_PROTO_RANDOM);
+        assert!(super::NF_NAT_RANGE_PERSISTENT == crate::nftables_rules::NAT_RANGE_PERSISTENT);
+        assert!(
+            super::NF_NAT_RANGE_PROTO_RANDOM_FULLY
+                == crate::nftables_rules::NAT_RANGE_PROTO_RANDOM_FULLY
+        );
+    };
 }

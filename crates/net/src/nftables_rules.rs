@@ -72,14 +72,19 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{Attr, MAX_ATTR_PAYLOAD_LEN, NLA_TYPE_MASK, NlMsgBuilder};
 
 /// ルールの expr 列（ネスト。`NFTA_RULE_EXPRESSIONS`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_RULE_EXPRESSIONS: u16 = 4;
 /// リスト要素（ネスト。`NFTA_LIST_ELEM`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_LIST_ELEM: u16 = 1;
 /// expr 名（`NFTA_EXPR_NAME`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_EXPR_NAME: u16 = 1;
 /// expr 固有データ（ネスト。`NFTA_EXPR_DATA`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_EXPR_DATA: u16 = 2;
 /// 1 ルールあたりの expr 上限（`NFT_RULE_MAXEXPRS`）。
+/// uapi ではなくカーネル内部の上限（`NFT_RULE_MAXEXPRS`）で、`libc` にも uapi ヘッダにも無いため照合の対象外。
 pub const NFT_RULE_MAXEXPRS: usize = 128;
 /// expr 名の最大長（NUL を除く。kernel の `NFTA_EXPR_NAME` policy の `NFT_NAME_MAXLEN - 1`）。
 pub const NFT_EXPR_NAME_MAXLEN: usize = 255;

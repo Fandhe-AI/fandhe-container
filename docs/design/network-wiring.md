@@ -60,6 +60,7 @@
   - `add-host`: 256 件以下、299 バイト以下
   - `dns`: 32 件以下、45 バイト以下
   - CLI は `--network` を省略しても `network none` を必ず書く（NET-6 の既定は CLI が適用する）。supervisor は復号のたびに net のパーサで再検証する（未信頼の入力）。文書に `network` kind が無い（plugin-cri・従来のコンテナ）ときは「config に従う」＝現行の挙動のまま
+- 追記（#1935）: rootless のユーザー定義名（pasta 構成）では kind `pasta` と `publish` を足す。詳細は [rootless-network.md](rootless-network.md) 12.4・12.6。
 - **理由**: argv・特権ランチャー・`start_client` を変えずに済む。serde / toml を supervisor へ足さない（依存の承認が要る。既存文書でも却下済み）。
 - **却下した案**: argv / env で渡す（既存文書の却下理由と同じ）。core の `StateRecord` に同梱する（plugin 境界の型が変わる）。
 
@@ -95,6 +96,7 @@
 | Host | 無し、または path の無い `{"type":"network"}` | ホスト共有。config のエントリより起動オプションを優先する（`--ipc host` の前例と同じ。`runc spec` の既定 bundle でも使えるように） |
 | Host | path 付き | `InvalidArgument` |
 
+- 追記（#1935）: ユーザー定義名かつ rootless の場合、core のモードは「外から付ける netns」（Loopback と同じ中身で、同期点で fd を渡す）になる。[rootless-network.md](rootless-network.md) 12.2・12.3。
 - `net.*` の sysctl は、実効のモードが Host なら拒否する（既存の `reject_net_sysctls_without_network_namespace` を実効の名前空間で判定する）。
 - **理由**: CLI の既定を変えても CRI の経路（文書なし）の挙動を変えない。
 - **却下した案**: core で path の無い network エントリを常に受ける（CRI の `POD` が pod 内で共有されない netns で黙って動く）。Host で config の network エントリを `InvalidArgument` にする（`runc spec` の bundle がそのまま使えず、`--ipc host` と扱いが揃わない）。
@@ -102,6 +104,7 @@
 ### D8 host モード
 
 - **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3058 の core の変更に含める。pasta の同期点〔#1939〕と共有する）で、次の方式で確かめる（本番の supervisor は `start_entry.rs` で `PR_SET_DUMPABLE=0` にしており、中間プロセスと exec 前の子もこれを継承する。non-dumpable のプロセスの `/proc/<pid>/ns/*` と `/proc/<pid>/task/<tid>/ns/net` は ptrace アクセス検査で非特権の親から `PermissionDenied` になるため、親が procfs で子の netns を参照する `HostNetns::verify_process(pid)` は本番経路では使わない。既存の non-dumpable 防御〔SEC-1〕は緩めず、`PR_SET_DUMPABLE` を 1 に戻さず、`CAP_SYS_PTRACE` も足さない）。子は同期点で、自分の `/proc/self/ns/net` を `O_RDONLY|O_CLOEXEC` で開き（自分自身の参照は dumpable に依らず許される）、その fd を同期用の `socketpair(AF_UNIX, SOCK_SEQPACKET)` で `SCM_RIGHTS` により親へ渡す。親は受け取った fd を `fstat` し、(dev, ino) を基準と比較する。netns の fd は inode が netns を一意に表すため、procfs の参照と同じ判定になる。fd は 1 本だけを受け、control メッセージ長・fd 数・種別を検証し（余分な fd は閉じて `FailedPrecondition`）、受信には期限を付ける（REPAIR-5）。net 側の判定（Host / Loopback / Other の分類）は pid ではなく (dev, ino) を取る関数 `HostNetns::verify_ns_identity` として切り出し、`verify_process` はその薄い呼び出し元に保つ（実装は #3058 と net の担当 issue で足す）。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。照合は資格情報を落とす前に行う（fd 渡しなので、資格情報の前後に依らず成立するが、順序は変えない）: 同期点は子が `process.user` の setuid / setgid / `setgroups` を行う前（子がまだ supervisor と同じ実 UID の間）に置き、照合の完了を pipe で親子同期してから子が資格情報を切り替えて exec する。これにより RootlessSubordinateIds で `process.user` が非 root（子のホスト UID が supervisor と異なる）でも、`/proc/<pid>/task/<tid>/ns/net` の stat に要る ptrace 相当の権限を増やさずに照合でき、非特権の supervisor が `PermissionDenied` で正常な起動を拒否する（既定の none でも起きる）ことがない。資格情報を落とした後の再照合はしない（netns は setns / unshare 済みで、以後 exec までに変わる経路が無い。エラーの意味は SEC-5 の `FailedPrecondition` に統一し、`PermissionDenied` を照合の失敗として黙って握りつぶさない）。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
+- 追記（#1935）: pasta 構成の同期点では netns と user namespace の fd を 2 本、この順で受ける（[rootless-network.md](rootless-network.md) 12.2）。Loopback・Host は 1 本のまま。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
 ### D9 hosts / resolv.conf
@@ -212,6 +215,8 @@
 
 launch の前に `launch_step_budget` が残っていることを確かめる（既存）。
 
+pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完了 5 秒・停止の各段）は [rootless-network.md](rootless-network.md) 12.9 で決めた。起動側の合計は上の `result_deadline` と `launch_step_budget` に収める。
+
 ### D16 実装単位
 
 下の「実装 issue」を正とする。2h 以下の粒度で、親 #3056 の配下に起票した。
@@ -304,5 +309,5 @@ launch の前に `launch_step_budget` が残っていることを確かめる（
 ## 残余・見直し条件
 
 - bind mount の先が symlink の場合の `RESOLVE_IN_ROOT` による解決は未対応（D9）
-- #1935（pasta の設計）が予約名や名前の照合を変えたら D1・D10 を見直す
+- #1935（pasta の設計。[rootless-network.md](rootless-network.md) 12 章）は予約名と名前の照合を変えなかった。D1・D10 の見直しは不要。今後変わったら見直す
 - #3057 の判断が出たら D13 を確定し、本書の位置づけの注記と `docs/architecture.md` の設計ドラフトの行を更新する

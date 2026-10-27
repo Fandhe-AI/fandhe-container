@@ -2,7 +2,7 @@
 
 非特権 user namespace（rootless）で host / none 以外のネットワークとポート公開を成立させる方式の選択肢を整理し、その判断を記録する（NET-9）。
 
-> **位置づけ**: 本書は 2026-10-12 に #340 で採用を決定した判断記録である。決定の要点は下の「決定」のとおり。NET-9 は 2026-10-12 に spec 上も「確定」になった（Fandhe-AI/fandhe-container-spec#18）。
+> **位置づけ**: 本書は 2026-10-12 に #340 で採用を決定した判断記録である。2026-10-27 に #1935 で起動点・同期・設定の入口・版の固定の設計を確定し、12 章に記録した（自動運転で選んだ項目はオーナー承認が未取得で、12.15 に分けた）。決定の要点は下の「決定」のとおり。NET-9 は 2026-10-12 に spec 上も「確定」になった（Fandhe-AI/fandhe-container-spec#18）。
 
 - 対象ビヘイビア: NET-9（Should・確定。関連: CORE-6・SEC-5・NET-11・NET-6・PLUG-1・ERR-1・REPAIR-5）
 - タスク: TASK-147（MS-8・G10。本書は TASK-147.1・#339。前提は TASK-8〔#26。完了済み〕）
@@ -93,11 +93,12 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 
 ## 7. 採用時の実装方針・工数概略（#341 の範囲）
 
-- 設計の選択 4 点（上の「決定」）は 2026-10-12 に決まった。起動主体は supervisor に決まった。起動の時点・同期・失敗の分類・寿命・フラグの名前・最小版の値などの残りの設計は #1935 で確定する
+- 設計の選択 4 点（上の「決定」）は 2026-10-12 に決まった。起動主体は supervisor に決まった。起動の時点・同期・失敗の分類・寿命・フラグの名前・最小版の値などの残りの設計は #1935 で確定した（12 章）
 - 決定した構成: pasta を利用者が導入し、fandhe-container は `crates/net` から別プロセスとして exec する。同梱・リンクはしない。ポート公開の bind の既定は loopback
 - 実装で守る点:
   - pasta の既定（`auto`）と、アドレスを省いた明示の指定は、ホストの全アドレスでポートを開く。loopback を既定にするには待ち受けアドレスを必ず明示する
   - `-t none` と明示のポートは併用できない。明示の `-t` に `-u none -T none -U none` を足す
+- 12 章（#1935）で、起動の時点と同期（12.2）・入口のフラグ（12.4〜12.5）・pasta の引数（12.7）・準備完了と PID ファイル（12.8）・失敗の分類と期限（12.9）・寿命と回収（12.10）・版の固定（12.12）を確定した。実機で確かめていない点の一覧は 12.11
 - まだ確かめていない点（#341）: 制限 `1` のまま既存の namespace へ後から付ける形、IPv6、`--netns <パス>` の指定、`-T none -U none` を付けたときの名前解決、常駐時の PSS、rootful 比のスループット劣化
 - AppArmor の補足: Ubuntu 26.04 では `sleep` の実体が pasta の AppArmor プロファイルの exec 規則の外にあり、pasta から直接は起動できなかった。`sh -c` を挟めば動いた（実機確認 2026-10-12）
 - #341 の実証範囲: rootless の経路で host / none 以外のネットワーク構成（ポート公開を含む）が実機で成り立つこと（NET-9）。実装の issue は #1935（設計の確定）・#1936〜#1941（実装と試験）
@@ -132,6 +133,8 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 | 完全性 | ヘルパーは絶対パス・所有者・権限を検証し、信頼できない `PATH` の暗黙探索をしない（PLUG-11 の opt-in 方針に倣う）。対応版数は最小版以上とし、`--version` の出力を解釈できないものは拒否する |
 | サプライチェーン | `cargo deny` で検出できないため、ライセンス・脆弱性への追随を手動で確認する運用が必要 |
 | 監査 | 起動失敗・分離違反の試行を構造化ログ・監査ログへ記録する（SEC-4・REPAIR-4） |
+| ホストの loopback・ホストのサービス | pasta の既定は gateway をホストの loopback へ写し、コンテナからホストの 127.0.0.1 専用のサービスへ届く。`--map-host-loopback none` と `--map-guest-addr none` で閉じ、`--host-lo-to-ns-lo` は付けない（12.7） |
+| holder の露出 | netns holder は capability を落とし、secret・fd を継承せず、no_new_privs にする。同じ uid への露出は owner が元々持つ権限の範囲（12.2） |
 
 ## 10. 判断した項目（#340）
 
@@ -147,5 +150,216 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 - 2026-10-12 に判断記録へ更新した
 - 2026-10-12 に spec の更新（Fandhe-AI/fandhe-container-spec#18・#19。NET-9 の確定、未解決疑問点 11・14、NET-6 の既定、rootless でのネットワークの指定の読みと待ち受けアドレスの規則）へ追従した
 - 2026-10-12 に配置の決定（pasta は supervisor〔core 側〕、DNS ヘルパーは `NetworkPlugin` の実装〔plugin 側〕）へ追従した。2026-10-15 に未解決疑問点 11 のほかの論点の決定（Fandhe-AI/fandhe-container-spec#22）へ 6 章を追従した
-- #1935 の設計の確定で 7 章の内容が変わった場合は追従する
+- 2026-10-27 に #1935 の設計（起動点・同期・入口・版の固定）を 12 章に確定し、7 章・9 章を追従した。12 章の実機未確認の点（12.11）が確かめられて設計が変わったら 12 章を更新する
 - pasta を同梱・再配布することにした場合は、ライセンスの判断をやり直す
+
+## 12. 起動点・同期・設定の入口・版の固定（#1935・TASK-147 追補）
+
+rootless の pasta 構成について、起動の時点と同期、pasta に渡す引数、設定の入口、版の固定、失敗の分類、寿命と回収を確定する（NET-9・NET-6・PLUG-11・SEC-1・SEC-4・ERR-1・REPAIR-4・REPAIR-5）。#1870 の [network-wiring.md](network-wiring.md) の D1・D4・D6〜D8・D10・D14・D15 と矛盾しない範囲で細目を決める。実装は #1936〜#1941 と 12.14 の後続 issue が担う。
+
+- **自動運転で選んだ項目**: 12.1 のオーナー決定以外（12.2・12.3・12.5〜12.10・12.12）は、自動運転で安全側に選んだ方式で、オーナーの承認は未取得である（`rootless-id-map-holder.md` §3 と同じ扱い）。承認待ちの点は 12.15 に分けた
+- **一次情報**（確認日 2026-10-27。GPL のソースはコードを写さず、挙動の事実だけを書く）:
+  - passt の `conf.c`（`conf_pasta_ns`）と `man pasta`: `pasta [OPTION]... PID` は `/proc/<PID>/ns/net` と `/proc/<PID>/ns/user` を組み立てて開く。`--netns` は PID と併用できず、`--netns PATH` に `--userns` を付けないと `--netns-only` 扱いになる。`--map-host-loopback` は既定で gateway をホストの loopback へ写し、`none` は `--no-map-gw` も含意する。`-T` / `-U` の既定は `auto`。`--version` は「pasta」と空白に続けて版の文字列を出し、exit 0 で終わる
+  - passt の `isolation.c`・`passt.c`: 起動直後の `isolate_fds()` が fd 3 以上を `close_range` で閉じる（`--fd` の tap 用だけが例外）。この処理は引数の解釈より前に走る。したがって継承した fd を `/proc/self/fd/N` で渡す形は成り立たない
+  - passt の `pasta.c`: netns-quit は対象が procfs の `/proc/<pid>/ns` なら 1 秒周期のタイマーで消滅を検出する
+  - 本機の AppArmor プロファイル（`/etc/apparmor.d/usr.bin.pasta`）: 書き込みは `/tmp/**`・`owner @{HOME}/**`・`@{run}/user/@{uid}/**` に限り、`/proc/<pid>/ns/{net,user}` の読みと `ptrace r` は許す
+  - 本リポ: `network-wiring.md` D8（本番の supervisor は `PR_SET_DUMPABLE=0` で、exec 前の子もこれを継承する。親は子の `/proc/<pid>/ns/*` を開けない。dumpable を 1 に戻すことも `CAP_SYS_PTRACE` を足すことも禁じる）、`rootless-id-map-holder.md` §4、rootless の既定の状態ルートは `$XDG_RUNTIME_DIR/fandhe-container`
+
+### 12.1 既決事項（再決定しない）
+
+| 事項 | 決定 | 出典 |
+| ---- | ---- | ---- |
+| `--network <名前>` の読み | rootless のユーザー定義名は pasta 構成。コンテナごとに pasta を 1 プロセス | #340（2026-10-12） |
+| 既定 | `none` のまま（NET-6） | #340 |
+| 場所の入口 | CLI のグローバルフラグ。環境変数では受けない。作成時に解決・検証して記録し、起動時に再検証 | [#1935 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1935#issuecomment-6128208117) |
+| 版 | 最小版以上。解釈できない出力は拒否 | 同上 |
+| 待ち受けアドレス | 省略時は loopback。明示は `0.0.0.0` を含めて受ける。IPv6 は作成前に拒否 | 同上 |
+| 起動主体 | コンテナごとの supervisor（core 側）。起動・待機・回収の関数は `crates/net` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225) |
+| 依存の向き | `supervisor` → `net` は通常の依存。`core` → `net` は足さない | network-wiring.md D5（#3065） |
+| 予約名・定義の状態 | D1・D10 のまま。pasta 構成でも名前の照合は変えない | network-wiring.md |
+
+### 12.2 netns の作り手・pasta の対象・付ける時点
+
+- **決定**
+  - **netns の作り手**は core の rootless 経路とする。D6 の `CLONE_NEWNET` と `lo` の up をそのまま使い、`LaunchOptions` の network モードに「外から付ける netns」（名前は #1939 で決める。例: `Attachable`）を足す。中身は Loopback と同じで、exec 前の同期点で fd を渡して親の合図を待つ点だけが違う。core は pasta を知らない
+  - **同期点**は D8 を拡張する。子は `process.user` の資格情報を切り替える前・exec の前の同期点で、`/proc/self/ns/net` と `/proc/self/ns/user` をこの順で `O_RDONLY|O_CLOEXEC` で開き、同期用の `SOCK_SEQPACKET` に 1 メッセージの `SCM_RIGHTS` で載せて親へ送る。親は fd がちょうど 2 本であること・control メッセージ長・余分な fd が無いこと（あれば閉じる）・各 fd の `fstat`・nsfs であること・netns の (dev, ino) が supervisor の基準と違うこと（D8 の `Other`）を検証し、不一致なら子を止めて `FailedPrecondition` にする。待ちは期限つき。型の最終照合は holder の `setns(fd, CLONE_NEWUSER / CLONE_NEWNET)` が行う（型違いは `EINVAL`）。Loopback・Host のモードは D8 のとおり 1 本のまま
+  - **pasta の対象（PID）**は、コンテナのプロセスではなく専用の **netns holder** とする。holder は supervisor が `/proc/self/exe` を exec し直して作る（argv は `netns-holder`、`env_clear`、stdin は socketpair の片端、stdout は null、stderr は supervisor のログ）。exec 直後で単一スレッド・メモリは空・dumpable は既定のまま。holder は最初に `PR_SET_PDEATHSIG=SIGKILL` を設定して `getppid` で親を確かめ、socketpair から 2 本の fd を受け、`setns(user)` → `setns(net)` の順で参加し、参加後の `/proc/self/ns/net` の (dev, ino) が受けた fd と一致することを確かめて fd を閉じる。続けて全 capability を落とし（capset で空）`PR_SET_NO_NEW_PRIVS` を設定し、固定長の READY フレームを返して、以後は socket の EOF または STOP を待つだけにする。ロジックは `crates/net` の `run_netns_holder_main` に置き（DNS ヘルパーの `run_dns_helper_main` と同じ形）、supervisor の bin の main が `netns-holder` で振り分ける
+  - **pasta が holder の ns を開ける根拠**: pasta は supervisor と同じ uid で init の user namespace にいる。holder は dumpable で uid も同じなので `ptrace_may_access(READ_FSCREDS)` を通る（dumpable なら能力の検査に入らない）。AppArmor も `ptrace r` を許す。#340 で確かめた `pasta --config-net <PID>`（`unshare --user --net` の子が対象）と同じ形である
+  - **付ける時点**は launch の中で、子が同期点で待っている間に、(1) fd を受けて検証、(2) holder を起動して READY を待つ、(3) pasta を起動、(4) 準備完了を待つ（12.8）、(5) 子へ合図、(6) 子が資格情報を切り替えて exec、の順に進める。合図の前のコンテナには `lo` しかない
+- **理由**: pasta は fd 3 以上を閉じるので fd を渡す形は成り立たない。PID の形の対象は ptrace で読める必要があり、exec 前のコンテナの子（non-dumpable）は対象にできず、D8 は dumpable を戻すことも `CAP_SYS_PTRACE` を足すことも禁じている。holder は exec し直すので supervisor のメモリ（注入ファイル等。#2628）を継承しない。SingleId でも SubordinateIds でも同じ形で使える。文書化され実機で確かめた PID の形だけを使える
+- **却下した案**
+  - コンテナの子を対象にする（non-dumpable のため開けない）
+  - 同期点の間だけ子を dumpable にする（D8・SEC-1 が禁じる。子は secret の memfd などを持つ）
+  - `--netns /proc/self/fd/N --userns ...` で fd を渡す（`isolate_fds` で閉じられる）
+  - netns を bind mount して `--netns <パス>` を使う（rootless はホストの mount namespace に bind できず、パスの寿命の管理も要る）
+  - holder U（`rootless-id-map-holder.md`）に netns も作らせる（SubordinateIds の経路にしか無く、U は RELEASE で消え、dumpable の窓が延び、#2374 の設計を崩す）
+  - exec の後に PID 1 へ付ける（entrypoint がネットワークの準備前に走る競合が残る）
+  - holder を fork だけで作る（supervisor のメモリを継承する）
+- **残る露出**: 同じ uid のホスト側プロセスは holder の ns を開いてコンテナの user namespace と netns に入れる。これは exec 後の PID 1（dumpable で owner は全 capability を持つ）から owner が元々できることと同じで、新しい権限は与えない。holder は capability を落としているので乗っ取られても netns を書き換える権限が残らず、fd 3 以上と secret を持たない
+
+### 12.3 #1870 との分担
+
+- **決定**: rootful の netns の渡し方（D12）と Host・Loopback の照合（D8）は変えない。pasta 構成は rootless のユーザー定義名だけに限り、D8 の同期点を「fd を 2 本」に拡張して使う。config.json との突き合わせは D7 の Loopback の行と同じ規則にする（path の無い network エントリは受け、path 付きは `InvalidArgument`）。#1870 は close 済みなので、記録は network-wiring.md の D4・D7・D8・D15 と残余の参照の行で行う
+- **理由**: D8 が「pasta の同期点〔#1939〕と共有する」と定めており、同期点を 2 つ作らない
+- **却下した案**: pasta 専用の別の同期点を作る
+
+### 12.4 pasta の場所の入口（フラグの名前・作成時の記録・起動時の再検証）
+
+- **決定**: グローバルフラグを 2 つ足す: `--pasta-path <絶対パス>` と `--pasta-path-search`
+  - `--root`・`--plugin-path-search` と順不同で各 1 回まで。両方の指定は使い方エラー
+  - 使うのはコンテナを作る subcommand（`create`。stack の up が入ったらそれも）で、rootless のインストールかつユーザー定義名の `--network` のときだけ。それ以外で指定したら `InvalidArgument`（効かない指定を黙って受けない）
+  - rootless のユーザー定義名でどちらも無い場合は `FailedPrecondition`（固定文言 `pasta path is not configured`）。既定のパスは持たない（12.15）
+  - 作成時: CLI が #1936 の検証関数で解決・検証し、FCOPT1（D4）に kind `pasta` を 1 レコード書く（上限 4 KiB）。値は、絶対パス（UTF-8・制御文字なし・3072 バイト以下。識別情報・版の日付・符号化の枠を 4 KiB のレコード内に収める余裕を確保するための上限で、超えるパスは作成時に解決段階で `invalid-argument` 相当の構造化エラーで拒否し、切り詰めない）、fd の `fstat` から得る識別（dev・ino・size・mtime・ctime〔ns〕・uid・mode）、解釈した版の日付
+  - 起動時: supervisor が文書を復号するたびに未信頼の入力として再検証する。パスを同じ規則で辿り直して識別を記録と照合し、`--version` も実行し直して照合する。不一致は `FailedPrecondition` とし、監査ログ（SEC-4）に「作成から起動までの間にバイナリが替わった」を記録する
+  - 実行は検証したパスで行い、`argv[0]` は常に `pasta` に固定する（12.7）
+  - 版の固定は 12.12
+- **理由**: 特権ランチャーの `sanitize_env` は環境を許可リストで作り直し、supervisor は契約の値を環境から読まず、argv は `StartArgs::parse` で固定されている。どちらも変えずに済む経路は既存の文書 FCOPT1 だけである（[container-options-delivery.md](container-options-delivery.md) の却下理由と同じ）。`--plugin-path-search` とは信頼の対象が違うので opt-in は別のフラグにする
+- **却下した案**: 環境変数・設定ファイル（オーナー決定で不採用）、`--plugin-path-search` を pasta にも効かせる（plugin と pasta の opt-in が結合する）、supervisor の argv に足す（`MAX_ARGS` と契約が変わる）、core の `StateRecord` に同梱する（plugin 境界の型が変わる）
+
+### 12.5 opt-in の `PATH` 探索
+
+- **決定**: `--pasta-path-search` のときだけ、CLI 自身の `PATH` を先頭から見て、名前 `pasta` の最初の候補を採る。空の要素と相対の要素は飛ばす。最初の候補が検証に落ちたら、後ろの候補へ進まずその失敗を返す。採ったパスは警告として 1 行 stderr に出す（`PathSearchWarning` と同じ流儀）。記録以降は 12.4 と同じ
+  - 検証の基準は PLUG-11 と同じ: 全祖先とバイナリが root または実効 UID の所有で `mode & 0o022 == 0`（sticky でも例外にしない）。通常ファイルで実行可能。symlink は解決先まで検証し、判定は fd の `fstat` で行う。細部は #1936
+- **却下した案**: 失敗した候補を飛ばして次へ進む（どのバイナリが選ばれたか分かりにくい）、supervisor 側で探索する（supervisor は環境を読まない）
+
+### 12.6 待ち受けアドレスとポート公開の入口
+
+- **決定**: 公開は IPv4 だけ。アドレスを省いたら `127.0.0.1` へ解決する。明示したアドレスは `0.0.0.0` を含めて受け、IPv6 のリテラルは作成前に `InvalidArgument`。ポート 0 と範囲指定は v1 では受けない。件数の上限は `MAX_PORT_PUBLISHES`
+  - `--freebind` は付けない。ホストに無いアドレスを明示すると pasta の起動が失敗し、準備完了前に終われば `FailedPrecondition`（12.9）。pasta が警告だけで続ける場合の扱いは未確認（12.11）
+  - CLI の入口は `create` の `-p` / `--publish`（`[<ipv4>:]<host>:<container>[/tcp|udp]`）で、FCOPT1 に kind `publish` を足す（1 件 64 バイト以下）。rootful の `-p` は D13 の判断が出てから扱い、v1 では rootful で指定すると `UNIMPLEMENTED`
+  - 利用者向けの doc に、rootful の `PortPublish`（DNAT。loopback と未指定を拒否）との差を書く。pasta はホスト側の socket を bind するので loopback も `0.0.0.0` も成り立つ
+- **却下した案**: 省略時に全アドレスで開く（オーナー決定）、`PortPublish` を流用する（loopback を表せない）
+
+### 12.7 pasta の argv（常に固定で渡すもの）
+
+- **決定**: 引数は OS 文字列の配列で組み、シェルを介さない（#1937）。
+
+```text
+argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  -4  -I eth0
+  --map-host-loopback none  --map-guest-addr none  --dns-forward 169.254.1.1
+  -t <addr>/<host>:<ctr>[,...] | -t none   -u ... | -u none   -T none  -U none   <holder の PID>
+```
+
+| 引数 | 理由 |
+| ---- | ---- |
+| `-f` | supervisor の直接の子のまま pidfd で監視・回収するため（背景化すると別 PID になる）。PID ファイルも初期化の完了後に書かれる |
+| `-P` | 準備完了の合図に使う（12.8） |
+| `--config-net` | アドレス・経路・up を pasta に設定させる（#340 で確かめた形） |
+| `-4` | IPv6 は v1 で受けない。外向きの IPv6 も同時に閉じ、確かめていない経路を開かない |
+| `-I eth0` | rootful の peer 名（#3061）と揃える |
+| `--map-host-loopback none` | 既定のままだと gateway がホストの 127.0.0.1 へ写り、コンテナからホストの loopback 専用のサービスへ届く。閉じる側にする |
+| `--map-guest-addr none` | 既定はホストの global アドレスへの写像に従う。ホストのサービスへの到達は v1 では約束しない |
+| `--dns-forward 169.254.1.1` | コンテナの nameserver をこのアドレスにする（D9 の `@container-etc` の生成に pasta 構成の行を足す）。`--dns` 指定があればそちらを使う（loopback は D1 の検証で拒否） |
+| `-T none -U none`、0 件時の `-t none -u none` | 既定の `auto` を止める（7 章） |
+| `--host-lo-to-ns-lo` は付けない | 付けると、ホストの loopback から来た接続がコンテナ内で loopback 発に見え、netns 内の loopback 専用のサービスがホストへ漏れる（man の記述） |
+
+- `argv[0]` は `--pasta-path` の basename に関係なく `pasta` にする（pasta は実行名でモードを決めうる。`/usr/bin/pasta` と `/usr/bin/passt` はリンク数 2 の同一実体）
+- **却下した案**: アドレスを省いた `-t`（全アドレスで開く）、既定の `--map-host-loopback` のまま、IPv6 を有効のまま
+
+### 12.8 PID ファイル・準備完了・置き場所
+
+- **決定**: 置き場所は `<state_root>/@pasta/<container-id>/`（0700・所有者は euid）。supervisor が状態ルートの fd から `mkdirat` と `O_NOFOLLOW` で作る。既存のエントリが `pid` という名前の通常ファイル（所有者 euid・nlink 1）なら消し、それ以外なら `FailedPrecondition`。pasta へは `pid` の絶対パスを渡す
+  - 準備完了は、`pid` が現れ、32 バイト以下の 10 進で spawn した子の PID と一致することで判定し、並行して pidfd で子の生存も見る。期限 `ready_timeout` は既定 5 秒・上限 10 秒で、0 は `InvalidArgument`
+  - stop・delete でディレクトリを消し、CLI の delete も残骸を消す（`@container-options` と同じ扱い）
+  - 既定の rootless の状態ルートは `/run/user/<uid>/` の下にあり AppArmor が許す。`--root` を許可外（`/tmp`・`$HOME`・`/run/user/<uid>` 以外）に置き、プロファイルが enforce のときは、pasta が書けず準備完了前に終わる（`FailedPrecondition`）。黙って別の場所へ逃がさない（fail-closed）。注意は #1941 の手順と setup の doc に書く
+- **却下した案**: `/tmp` の固定の場所（名前の衝突と symlink を仕込まれる余地）、pipe を `-P /proc/self/fd/N` で渡す（fd は閉じられる）、stderr の文言で判定する（契約ではない）
+
+### 12.9 失敗の分類（ERR-1・NetErrorCode）・監査・期限
+
+| 事象 | code | 監査（SEC-4） |
+| ---- | ---- | ---- |
+| 相対パス・両フラグ・効かない指定・IPv6・ポート 0・範囲指定 | InvalidArgument | なし |
+| パスの要素が無い | NotFound | なし |
+| 所有者・権限・symlink 先が基準外 | PermissionDenied | 記録する（改ざんの可能性） |
+| 通常ファイルでない・実行できない・フラグが無い | FailedPrecondition | なし |
+| `--version` の期限超過 | Timeout | なし |
+| `--version` の非 0 終了・解釈できない・最小版未満 | FailedPrecondition | なし |
+| 作成時と起動時の識別の不一致 | FailedPrecondition | 記録する |
+| supervisor が capability を持つ（rootless でない構成での誤用） | FailedPrecondition | なし |
+| holder の起動失敗・READY の不正 | Internal / FailedPrecondition | なし |
+| holder の READY 待ちの期限超過 | Timeout | なし |
+| holder の setns の EPERM | PermissionDenied | なし |
+| pasta の exec 失敗 | Internal（EACCES は PermissionDenied） | なし |
+| 準備完了の期限超過 | Timeout | なし |
+| 準備完了前の終了 | FailedPrecondition | なし |
+| 実行中の pasta・holder の死 | コンテナを止める（12.10） | なし（構造化ログ） |
+
+- message は固定の英文にし、パス・pasta の出力・利用者の入力値を含めない。pasta の stderr は pipe で受け、4 KiB を上限に非印字文字をエスケープして supervisor のログ（`@supervisor-logs`・0600）にだけ書く
+- 構造化ログ（REPAIR-4）の event は `pasta_verify`・`netns_holder_ready`・`pasta_ready`・`pasta_exit`・`netns_holder_exit`。項目は container id・code・所要 ms・版の日付・終了 status / signal・公開の件数
+- 期限（REPAIR-5。D15 の表に参照を足す）:
+
+| 操作 | 期限 |
+| ---- | ---- |
+| `--version` | 2 秒 |
+| holder の READY | 2 秒 |
+| 準備完了（`ready_timeout`） | 5 秒（上限 10 秒） |
+| pasta の停止 | SIGTERM → 2 秒 → SIGKILL → 回収 1 秒 |
+| holder の停止 | STOP / EOF → 1 秒 → SIGKILL → 回収 1 秒 |
+
+- 起動側の合計は既存の `result_deadline` と `launch_step_budget` に収め、spawn の前に残りの予算を確かめる
+- **却下した案**: `Unavailable` などの新しい code を足す（`NetErrorCode` を変えない）
+
+### 12.10 寿命と回収
+
+| 場面 | 何が起きるか |
+| ---- | ---- |
+| 起動の途中の失敗 | 起動したものを逆順に止める（pasta を kill・回収 → holder を kill・回収 → 同期点の子を kill）。コンテナを `Running` にしない。netns はプロセスと一緒に消える（pin しない） |
+| コンテナの終了・stop | PID 1 を回収した後、pasta を先に止める（ホストのポートを持つため）。続けて holder を止め、`@pasta/<id>` を消す |
+| restart | 新しい netns に、同じ関数で holder と pasta を作り直す（起動の経路を 1 つに保つ） |
+| delete | stop 済みが前提。ディレクトリの残骸だけを消し、記録の pid でのプロセスの探索・kill はしない（pid の再利用を避ける） |
+| supervisor の異常終了 | (1) pasta は pre_exec で `PR_SET_PDEATHSIG=SIGKILL` を設定し `getppid` で確かめる。(2) holder は自分で設定した PDEATHSIG と socket の EOF で終わる。(3) 3 段目として pasta の netns-quit（holder が消えると約 1 秒）が効く。PDEATHSIG は spawn したスレッドの終了でも届くので、**pasta は supervisor と同じ寿命のスレッド（入口の main スレッド）から spawn する**。これは #1940 の受け入れ条件と試験に入れる。孤児になったコンテナは稼働を続けるが（SUP-5）、ネットワークの転送は失われる（12.13 で報告） |
+| pasta・holder の途中死 | supervisor が pidfd で検出して構造化ログに残し、コンテナを stop と同じ手順で止めて終了理由を記録する。その後は restart policy に従う。分離は緩めない |
+
+- 配置: pasta と holder は launch の後に起動するので supervisor の退避リーフを継承する。companion には登録しない。コンテナの cgroup と委譲親のどちらにも入らないことを #1940 で確かめる
+- unsafe: pre_exec と holder の `setns`・capset・prctl は `crates/net/src/sys.rs` の薄いラッパーに置く。事前承認の範囲に収まるかは該当 PR で security-auditor が判断し、収まらなければユーザーの承認を求める。net は libc 照合が入っている crate なので、定数・宣言の照合も同じ PR で足す
+- **却下した案**: pasta の netns-quit だけに頼る（issue が禁じる）、pasta だけを再接続する（起動の経路が 2 つになる）、コンテナを止めずにネットワーク無しで続ける（公開ポートが黙って消える）、pasta を holder の子にする（holder に fork と exec の unsafe が増え、supervisor から監視できない）、pasta を companion にする（コンテナの cgroup の上限と OOM の巻き添え）
+
+### 12.11 実機で確かめていない点と担当 issue
+
+| 項目 | 担当 |
+| ---- | ---- |
+| AppArmor の制限が `1` のままで、既存の user namespace に PID の形で付けられるか | #1941（試験の用意）・#341（人間の実行） |
+| 対象を holder（exec し直して setns したプロセス）にした PID の形で動くか | #1941 |
+| IPv6 | v1 は `-4` で閉じる。有効にするのは将来 |
+| `--netns <パス>` | 設計で使わないので確認しない |
+| `-T none -U none` と `--dns-forward 169.254.1.1` で名前解決できるか | #1941 |
+| Ubuntu 26.04 のプロファイルの exec 規則 | PID の形では pasta がコマンドを起動しないので該当しない |
+| `-f` のときの PID ファイルの書き込みの時点 | #1938（man の確認）・#1941 |
+| `argv[0]` とモード（名前を変えたファイル・リンク数 2） | #1936（一次情報で確認）・#1941 |
+| 他のディストリビューション・上流の版の表記 | #1936（一次情報で確かめるまで拒否する） |
+| 明示の `-t` の bind に失敗したとき pasta が終わるか、警告だけで続けるか | #1941。続ける場合は準備完了後に待ち受けを確かめる後続 issue を起こす |
+| `--map-host-loopback none` でホストの loopback に届かないこと | #1941 |
+| PDEATHSIG と、holder が消えた後の netns-quit | #1941 |
+| 状態ルートの下の PID ファイルを AppArmor が許すか | #1941 |
+
+### 12.12 版の固定
+
+- **決定**: `--version` を `env_clear`・stdin null・stdout の読み取り 4 KiB 上限・期限 2 秒で実行する。exit 0 で、1 行目が「pasta」と空白で始まる 128 バイト以下の ASCII であること
+  - 受ける形式: Debian / Ubuntu（実機で確認済み）の `0.0~git<YYYYMMDD>.<hex 7〜40>-<rev>`。上流の tag 形式 `YYYY_MM_DD.<hex>`（任意で `-N-g<hex>`）は、#1936 が一次情報で確かめた場合に限り足す。それ以外（Fedora・Arch・Alpine・`unknown version` を含む）は確かめるまで拒否する
+  - 比較は日付だけで行う（実在する暦日であること）。最小版は `20260120`（#340 で実機確認した版）
+- **理由**: 上流の `VERSION` は `git describe` の結果で失敗時は `unknown version` になり、ディストリビューションは独自の文字列を渡す。形式を絞り、確かめた形だけを受ける方が fail-closed に合う
+- **却下した案**: 完全一致（ディストリビューションの更新のたびに壊れる）、許可リスト（保守の手間）、semver として解釈（pasta の版は semver ではない）
+
+### 12.13 spec 側への報告事項（本リポで決めない）
+
+1. SUP-5 の「孤児化で失われるもの」に、rootless の pasta の転送を足すこと
+2. CLI の `-p` / `--publish`（#1870 でも報告済み。pasta の形式を添える）
+3. 新しいグローバルフラグ `--pasta-path` / `--pasta-path-search`（CLI-1・PLUG-11 に無い）
+4. NET-9 の補足: ホストの loopback へは届かないこと、v1 は外向きも IPv4 だけであること、DNS は 169.254.1.1 経由であること
+5. 最小版の値 `20260120`
+
+### 12.14 後続の実装単位
+
+既存の #1936〜#1941 に収まらない単位を次に起票する（番号は #1935 に記録する）。
+
+| 単位 | crate | 依存 |
+| ---- | ----- | ---- |
+| netns holder（`run_netns_holder_main`・fd の受信・setns・capset・READY / STOP・PDEATHSIG） | net | #1936 |
+| bin の `netns-holder` の振り分けと holder の起動・回収 | supervisor | 上の holder・#3065 |
+| `--pasta-path` / `--pasta-path-search` と作成時の検証・FCOPT1 の `pasta` の書き込み | cli | #1936・#3065 |
+| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065 |
+
+### 12.15 オーナー確認事項（実装は止めない）
+
+- 既定のパス（`/usr/bin/pasta` 等）を持つか。現状は持たない
+- 12.2 の holder 方式、12.10 の「途中死でコンテナを止める」、12.7 の固定の argv は自動運転で決めた。承認は未取得

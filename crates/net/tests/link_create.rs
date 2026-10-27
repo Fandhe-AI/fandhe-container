@@ -7,8 +7,8 @@
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::netlink_route::{
     AttrIter, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINKINFO, IfName,
-    LinkCreate, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NlMsgBuilder, NlMsgIter,
-    RTM_NEWLINK, VETH_INFO_PEER,
+    LinkCreate, NLM_F_ACK, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_REQUEST, NlMsgBuilder,
+    NlMsgIter, RTM_NEWLINK, VETH_INFO_PEER, decode_created_link,
 };
 
 const SEQ: u32 = 0x2468_ace0;
@@ -127,4 +127,49 @@ fn net11_veth_same_name_rejected() {
     let e = LinkCreate::veth(name("v0"), name("v0")).expect_err("same name");
     assert_eq!(e.code(), NetErrorCode::InvalidArgument);
     assert!(LinkCreate::veth(name("v0"), name("v1")).is_ok());
+}
+
+/// NET-1・Issue #1972: echo 付き bridge 作成要求は flags に `NLM_F_ECHO` だけを足し、属性構造は変わらない。
+#[test]
+fn net1_bridge_echo_message_flags_and_attrs() {
+    let data = build(&LinkCreate::bridge(name("br0")).with_echo());
+    let msg = NlMsgIter::new(&data).next().expect("msg").expect("decode");
+    let h = msg.header();
+    assert_eq!(h.msg_type(), RTM_NEWLINK);
+    assert_eq!(h.flags(), NLM_F_CREATE | NLM_F_EXCL | NLM_F_ECHO);
+    assert_eq!(h.flags(), 0x0608);
+    assert_eq!(h.flags() & (NLM_F_REQUEST | NLM_F_ACK), 0);
+    let attrs: Vec<_> = msg
+        .attrs(IFINFOMSG_LEN)
+        .expect("attrs")
+        .map(|a| a.expect("attr"))
+        .collect();
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].payload(), b"br0\0");
+}
+
+/// NET-1・Issue #1972: 合成した作成通知から ifindex を取り出し、通知なしは `None`、名前の不一致は `DataLoss`。
+#[test]
+fn net1_decode_created_link_from_synthetic_notification() {
+    let mut b = NlMsgBuilder::new(RTM_NEWLINK, 0, 1, 0);
+    let mut ifinfo = [0u8; IFINFOMSG_LEN];
+    ifinfo[4..8].copy_from_slice(&42i32.to_ne_bytes());
+    b.put_fixed(&ifinfo).expect("fixed");
+    b.put_attr(IFLA_IFNAME, b"fcbr1\0").expect("name");
+    let data = b.finish().expect("finish");
+    let payload = NlMsgIter::new(&data)
+        .next()
+        .expect("msg")
+        .expect("decode")
+        .payload()
+        .to_vec();
+    let got = decode_created_link([(RTM_NEWLINK, payload.as_slice())], &name("fcbr1"))
+        .expect("decode")
+        .expect("some");
+    assert_eq!(got.get(), 42);
+    let none: [(u16, &[u8]); 0] = [];
+    assert_eq!(decode_created_link(none, &name("fcbr1")).expect("ok"), None);
+    let e = decode_created_link([(RTM_NEWLINK, payload.as_slice())], &name("fcbr2"))
+        .expect_err("mismatch");
+    assert_eq!(e.code(), NetErrorCode::DataLoss);
 }

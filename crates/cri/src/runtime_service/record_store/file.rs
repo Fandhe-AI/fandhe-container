@@ -162,6 +162,8 @@ impl RecordStore for FileRecordStore {
         budget: ListBudget,
         limits: ListLimits,
     ) -> Result<RecordListing, CriError> {
+        // 呼び出し側が別種別の上限を渡しても、この種別の既定値を超えさせない。
+        let limits = limits.clamp_to(kind);
         let dir = self.dir(kind).to_path_buf();
         let lock_path = self.lock_path.clone();
         let lock_timeout = self.lock_timeout;
@@ -287,10 +289,11 @@ fn read_one(
     if len > max {
         return Ok(Err(RecordReadFailure::TooLong));
     }
-    let new_total = total
-        .checked_add(len)
-        .filter(|t| *t <= max_total)
-        .ok_or_else(|| CriError::failed_precondition("cri record store holds too much data"))?;
+    if total.checked_add(len).is_none_or(|t| t > max_total) {
+        return Err(CriError::failed_precondition(
+            "cri record store holds too much data",
+        ));
+    }
     let Ok(file) = File::open(path) else {
         return Ok(Err(RecordReadFailure::Unreadable));
     };
@@ -301,13 +304,22 @@ fn read_one(
         return Ok(Err(RecordReadFailure::Unreadable));
     }
     let mut buf = Vec::new();
-    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    // 検査後の伸長に備え、種別の上限と残りの総量予算の小さい方 + 1 バイトまでしか読まない。
+    let remaining = max_total.saturating_sub(*total);
+    let limit = u64::try_from(max.min(remaining))
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     if file.take(limit).read_to_end(&mut buf).is_err() {
         return Ok(Err(RecordReadFailure::Unreadable));
     }
     if buf.len() > max {
         return Ok(Err(RecordReadFailure::TooLong));
     }
+    // 実際に読んだバイト数で総量を検証・計上する（metadata の長さは信用しない）。
+    let new_total = total
+        .checked_add(buf.len())
+        .filter(|t| *t <= max_total)
+        .ok_or_else(|| CriError::failed_precondition("cri record store holds too much data"))?;
     *total = new_total;
     Ok(Ok(buf))
 }
@@ -687,6 +699,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code(), crate::error::CriErrorCode::FailedPrecondition);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// CRI-1・REPAIR-5: 別種別の上限を渡しても list の入口で種別の既定値に絞られる。
+    #[test]
+    fn repair5_record_store_list_clamps_foreign_kind_limits() {
+        let root = temp_root("clamp");
+        let store = FileRecordStore::open(&root).unwrap();
+        let foreign = ListLimits::for_kind(RecordKind::Container);
+        assert!(foreign.max_records() > RecordKind::Sandbox.max_records());
+        let clamped = foreign.clamp_to(RecordKind::Sandbox);
+        assert_eq!(clamped.max_records(), RecordKind::Sandbox.max_records());
+        store.put(RecordKind::Sandbox, &id(ID_A), b"x").unwrap();
+        let listing = store
+            .list(RecordKind::Sandbox, ListBudget::default(), foreign)
+            .unwrap();
+        assert_eq!(listing.records.len(), 1);
     }
 
     #[test]

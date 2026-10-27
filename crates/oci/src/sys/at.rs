@@ -4,7 +4,7 @@
 //! `layer::anchored` の `AnchoredRoot` と `image_management::root_handle` が使う。前者はレイヤー展開
 //! （OCI-1・OCI-2）の変更操作を `root` の fd 起点に閉じ込め、確認（`lstat`）から使用までの間に祖先が
 //! symlink へ差し替えられても `root` の外へ書き込めないようにする（SEC-5・#2437）。後者はイメージストア root
-//! 直下の永続化操作を検査済み root の fd 起点に閉じ込める（OCI-7・SEC-1・#2638）。依存追加は禁止のため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は
+//! 直下の永続化操作を検査済み root の fd 起点に閉じ込める（OCI-7・SEC-1・#2638）。製品の依存に `libc` は入れない（dependency-policy・#1318。`libc` は dev-dependencies で照合にだけ使う）ため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は
 //! 子 `libc_abi` で行う（#2590。`docs/design/ffi-libc-check.md`）。定数と構造体は次の一次情報で確認した値である:
 //! `include/uapi/linux/openat2.h`（`struct open_how` は `flags` / `mode` / `resolve` の `u64` 3 つで 24 バイト。
 //! Linux 5.6 で追加）、`include/uapi/asm-generic/unistd.h`（`__NR_openat2` = 437 は全アーキテクチャ共通。

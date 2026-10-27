@@ -6,8 +6,10 @@
 //! # 呼び出し文脈
 //! `crate::transport` の UDS listener が、bind 時に自プロセスの実効 uid を取得して配置ディレクトリ
 //! 所有者と照合し、accept ごとに接続元の接続時点の実効 uid を取得して照合する（PLUG-12・
-//! security.md「別 UID からの接続は peer credential 検証で切断する」）。`libc` / `nix` は依存追加が
-//! 禁止（dependency-policy）で `UnixStream::peer_cred` は unstable のため、`crates/io/src/sys.rs` と
+//! security.md「別 UID からの接続は peer credential 検証で切断する」）。製品の依存に `libc` は
+//! 入れず（`libc` は dev-dependencies で宣言の機械照合にだけ使う。#1318・#1843。照合は末尾の `libc_abi`
+//! と `tests::libc_abi_fixtures`。方式は `docs/design/ffi-libc-check.md`）、`nix` は不採用
+//! （dependency-policy）。`UnixStream::peer_cred` は unstable のため、`crates/io/src/sys.rs` と
 //! 同じ流儀で必要最小限の `extern "C"` 宣言を自前で持つ。
 //!
 //! - Linux（x86_64 / aarch64）: `getsockopt(SOL_SOCKET, SO_PEERCRED)` の `struct ucred`

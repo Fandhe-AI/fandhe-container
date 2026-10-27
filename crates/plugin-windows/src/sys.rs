@@ -9,10 +9,13 @@
 //! フラグが立つとフレームループが次の受信境界で抜け、`release_all` で保持中の共有マウントを解除してから終了する。
 //! core 自身の終了要求は SIGTERM を使わず接続切断（EOF）で伝わる（`ResidentPlugin::shutdown`）。
 //!
-//! `libc` / `nix` は依存追加が承認制（dependency-policy）で std にシグナル API が無いため、
+//! 製品の依存に `libc` は入れず（dev-dependencies で照合にだけ使う。#1318）、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
 //! `crates/plugin/src/sys.rs` と同じ流儀で最小限の `extern "C"` 宣言を自前で持つ。`struct sigaction` は
 //! OS・アーキテクチャでレイアウトが異なるため使わず、番号とハンドラのアドレスだけを取る `signal(3)`
 //! （glibc・musl・macOS とも BSD セマンティクスで、ハンドラは解除されず再設定も不要）を使う。
+//!
+//! 自前宣言の正しさは dev-dependencies の `libc` との機械照合（コンパイル時 `const`）で守る
+//! （#1318・#1846・MVM-4・REPAIR-12。`imp::libc_abi`。方式は `docs/design/ffi-libc-check.md`）。
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`install_sigterm_flag`] のみ。

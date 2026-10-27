@@ -54,21 +54,37 @@ fn chmod(p: &Path, mode: u32) {
     fs::set_permissions(p, fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// `chmod` 系コマンドを 10 秒の期限つきで実行して成功を要求する。
-fn run_limited(mut cmd: Command) {
-    let mut child = cmd.stdin(Stdio::null()).spawn().expect("spawn");
+/// 子プロセスを 10 秒の期限つきで待つ。期限超過なら kill し、回収も 5 秒で打ち切る（REPAIR-5）。
+/// 終了状態を得られたら `Some`、期限超過・待機失敗なら `None`。
+fn wait_limited(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
-            assert!(st.success(), "command failed: {st}");
-            return;
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {}
+            Err(_) => return None,
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("command timed out");
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < reap_deadline {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `chmod` 系コマンドを期限つきで実行して成功を要求する。
+fn run_limited(mut cmd: Command) {
+    let mut child = cmd.stdin(Stdio::null()).spawn().expect("spawn");
+    match wait_limited(&mut child) {
+        Some(st) => assert!(st.success(), "command failed: {st}"),
+        None => panic!("command timed out"),
     }
 }
 
@@ -81,13 +97,15 @@ fn add_ace(path: &Path, ace: &str) {
 
 /// 後始末用。存在しない・ACL が無い場合の失敗は無視する。
 fn strip_acl_recursive(path: &Path) {
-    if path.exists() {
-        let _ = Command::new("chmod")
+    if path.exists()
+        && let Ok(mut child) = Command::new("chmod")
             .arg("-R")
             .arg("-N")
             .arg(path)
             .stdin(Stdio::null())
-            .status();
+            .spawn()
+    {
+        let _ = wait_limited(&mut child);
     }
 }
 

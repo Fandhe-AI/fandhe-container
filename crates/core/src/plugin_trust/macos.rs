@@ -46,8 +46,9 @@ pub struct VerifiedPluginDir {
     anchor: Option<PathBuf>,
 }
 
-/// 非追従 open の errno 写像。`ELOOP` は O_NOFOLLOW の対象が symlink のとき（ディレクトリの文脈では
-/// 祖先・探索先の symlink なので `NotDirectory`）。
+/// 非追従 open の errno 写像。ファイルの open では `ELOOP` が O_NOFOLLOW の対象が symlink のとき。
+/// ディレクトリの open（`O_DIRECTORY` 付き）では XNU が symlink に `ENOTDIR` を返す（#3126）ため、
+/// どちらも祖先・探索先の symlink 等として `NotDirectory` に写す（fail-closed）。
 pub(super) fn map_sys(e: SysError, dir_open: bool) -> PluginTrustErrorKind {
     match e {
         SysError::Unsupported => PluginTrustErrorKind::Unsupported,

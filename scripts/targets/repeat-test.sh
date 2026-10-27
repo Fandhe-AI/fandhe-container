@@ -175,6 +175,9 @@ if [ -n "${TEST}" ] || [ -n "${LIBTEST_NAME}" ]; then
   log_arg="${logf}"
   if command -v cygpath >/dev/null 2>&1; then log_arg="$(cygpath -m "${logf}")"; fi
   LOGARGS=(--logfile "${log_arg}")
+  # 成功した試験の println!/eprintln! は既定でキャプチャされ、禁止行の照合に届かない。FORBIDDEN_LINE 指定時は
+  # --nocapture で出力を stdout/stderr へ流す（lib・LIBTEST_NAME・USER_SCOPE のすべてで LOGARGS が `--` 以降に渡る。P1）。
+  if [ "${#FORBIDDEN_ITEMS[@]}" -gt 0 ]; then LOGARGS+=(--nocapture); fi
 fi
 
 # ビルドは 1 回だけ（以降は同じバイナリを繰り返す）。結合試験の名前誤り・required-features 不足もここで落ちる。

@@ -743,8 +743,10 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_id = id.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(fandhe_container_core::etc_files::remove_etc_files(
-            &root, &worker_id,
+        let _ = tx.send(remove_etc_files_if_still_deleted(
+            &root,
+            &worker_id,
+            fandhe_container_core::etc_files::remove_etc_files,
         ));
     });
     let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
@@ -757,6 +759,28 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
         write_warning_to_stderr,
         WARNING_WRITE_TIMEOUT,
     );
+}
+
+/// 削除直前に ID が再作成されていないことを再確認して `remove` を呼ぶ(options の cleanup と同じ形。#1872・NET-12)。
+/// 起動前の確認から worker の実行までに再作成された新インスタンスの `@container-etc/<id>` を消さない。
+fn remove_etc_files_if_still_deleted(
+    root: &std::path::Path,
+    id: &ContainerId,
+    remove: impl FnOnce(
+        &std::path::Path,
+        &ContainerId,
+    ) -> Result<
+        fandhe_container_core::etc_files::EtcRemoveOutcome,
+        fandhe_container_core::traits::types::TraitError,
+    >,
+) -> Result<
+    fandhe_container_core::etc_files::EtcRemoveOutcome,
+    fandhe_container_core::traits::types::TraitError,
+> {
+    if !id_is_still_deleted(root, id) {
+        return Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::NotPresent);
+    }
+    remove(root, id)
 }
 
 /// supervisor ログ削除の警告。期限切れは専用文言、それ以外（ロック保持・権限エラー等）は `code` つきの失敗文言（REPAIR-4）。
@@ -1742,6 +1766,34 @@ mod tests {
             assert!(id_is_still_deleted(&root, &id("c2")));
             std::fs::write(root.join("c1").join("state.json"), "{").expect("corrupt");
             assert!(!id_is_still_deleted(&root, &id("c1")));
+        }
+
+        /// NET-12・#1872: worker の直前で再作成済みと分かれば remover を呼ばない(新インスタンスの生成物を消さない)。
+        #[test]
+        fn net12_etc_files_removal_skipped_when_recreated_before_worker() {
+            let base = TmpDir::new("etc-recreated");
+            let store = store(&base);
+            let root = state_root(&base);
+            create_placed(&base, &store, "e1");
+            let called = std::cell::Cell::new(false);
+            let r = remove_etc_files_if_still_deleted(&root, &id("e1"), |_, _| {
+                called.set(true);
+                Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::Removed)
+            });
+            assert_eq!(
+                r.expect("ok"),
+                fandhe_container_core::etc_files::EtcRemoveOutcome::NotPresent
+            );
+            assert!(!called.get());
+            let r = remove_etc_files_if_still_deleted(&root, &id("e2"), |_, _| {
+                called.set(true);
+                Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::Removed)
+            });
+            assert_eq!(
+                r.expect("ok"),
+                fandhe_container_core::etc_files::EtcRemoveOutcome::Removed
+            );
+            assert!(called.get());
         }
 
         /// 検出の呼び出し回数を数えつつ `fake` を返す remover を作る。

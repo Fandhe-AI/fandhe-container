@@ -1106,9 +1106,11 @@ mod tests {
             &cid,
             EtcFileKind::Hosts,
         );
-        std::fs::remove_file(&p).expect("rm");
-        std::fs::write(&p, b"other").expect("write");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        // 旧ファイルが残っている間に新 inode を確保する(remove 直後の再作成だと inode 番号が再利用されうる)。
+        let tmp = p.with_extension("new");
+        std::fs::write(&tmp, b"other").expect("write");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        std::fs::rename(&tmp, &p).expect("rename");
         let err = m.open_sources().expect_err("replaced");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
     }

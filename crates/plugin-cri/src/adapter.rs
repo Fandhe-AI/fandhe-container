@@ -30,8 +30,8 @@
 //!   plugin プロセス自身の cgroup から委譲スコープを遅延検出する。plugin を委譲されたスコープの外（ログインセッション等）で
 //!   動かすと検出に失敗し、cgroup の配置を記録したコンテナの `delete` は記録を残したまま失敗する（fail-closed。CLI と同じ
 //!   方針で、検出の失敗を記録の経路へ回すかはオーナー判断待ち。#2133・#2060）。非 Linux は常に `Unimplemented`。
-//!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を期限つきで
-//!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）。
+//!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）も CLI と同じ
+//!   `remove_guarded_bounded_waiting` で消す（flock 保持中は `FailedPrecondition` として試し直す。待ちはコンテナログと共有する 10 秒で、guard は試行ごとにロック保持中に評価。#2964。失敗は戻り値に影響させず `Kept { code }` と記録器の `supervisor_log_remove` の失敗として計上する）。
 //!   続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロック。#2593・SUP-7・CRI-2・CLI-1）も CLI の `delete` と同じ
 //!   `remove_container_logs_guarded_bounded_waiting` で消す（同じ ID の sink が生きていれば `FailedPrecondition` で何も消さず、
 //!   最大 10 秒まで 50ms 間隔で試し直して sink の閉鎖を待つ。1 回の試行の期限は 5 秒。設計は
@@ -41,7 +41,7 @@
 //!   消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
 //!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
-//!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
+//!   supervisor ログと合わせて 20 秒（共有の待ち 10 + 各最後の試行 5 + 5）。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
 //!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。待ち切れなかった失敗（`FailedPrecondition`）は警告行に `reason: sink_open_after_wait` を足して他の失敗と区別する（#2760。terminate を設定する経路が無く、待ちを伸ばさない判断は `docs/design/container-log-removal-wait.md`）。待ちを超えて残ったログは、plugin の起動時の走査（[`sweep_leftover_container_logs`]）と同じ ID の `create` の前の回収（`reclaim_before_create`）で消える（生きている sink・状態がある ID・帰属できない名前は残り、手動で消す。docs/setup/container-log-recovery.md）。
 //!   core の `delete` の成功後には起動オプション文書（`<root>/@container-options/<id>`）の残骸も、記録の無い ID に限りロックの下で期限つきに消す（失敗は `container_options_remove` の Failure と `target: container_options` の警告行。`create` の前にも同じ掃除をする。SUP-12・#2760）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
@@ -105,7 +105,7 @@ use fandhe_container_supervisor::logs::{
     remove_container_logs_guarded_bounded_waiting,
 };
 use fandhe_container_supervisor::supervisor_log::{
-    LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_bounded,
+    SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_guarded_bounded_waiting,
 };
 
 /// 起動・シグナル系の未実装文言（固定。入力を含めない。非 Linux でだけ返す。Linux は supervisor 経由で結線済み）。
@@ -355,7 +355,7 @@ impl CriPluginBackends {
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
 ///
 /// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
-/// running への force `delete` の最悪: stop 17 秒 + supervisor ログ 5 秒 + コンテナログ 15 秒 + 起動オプション文書 10 秒 = 47 秒。
+/// running への force `delete` の最悪: stop 17 秒 + ログ 2 件 20 秒（共有の待ち 10 + 各最後の試行 5 + 5。#2964）+ 起動オプション文書 10 秒 = 47 秒。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
 /// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
 /// この値で打ち切られ（DEADLINE_EXCEEDED）、実行層への dispatch より前の worker は取り消しの旗で打ち切られる（展開は
@@ -417,19 +417,14 @@ pub fn sweep_leftover_container_logs(
     Some(report)
 }
 
-/// supervisor ログの期限つき削除の結果を `container_delete_cleanup` の結果へ写す（#2894・ERR-1）。
+/// ログ削除の結果（`Ok`／`Err`）を `container_delete_cleanup` の結果へ写す（#2894・#2964・ERR-1）。
 ///
-/// 枠の満杯（`Busy`。何も実行していない）は期限切れ（`Timeout`）と区別して `ResourceExhausted` にする。
-/// `Finished` は期限内に作業を終えた best effort（個々の失敗は削除関数が握る）。
-pub(crate) fn supervisor_log_cleanup_outcome(outcome: &LogRemoval) -> CleanupOutcome {
-    match outcome {
-        LogRemoval::Finished => CleanupOutcome::Removed,
-        LogRemoval::TimedOut => CleanupOutcome::Kept {
-            code: ErrorCode::Timeout,
-        },
-        LogRemoval::Busy => CleanupOutcome::Kept {
-            code: ErrorCode::ResourceExhausted,
-        },
+/// `Err` はコードをそのまま `Kept` に載せる。supervisor ログ側の枠の満杯は `ResourceExhausted`、期限切れは `Timeout`、
+/// ロックが待ちの期限まで解放されなかったときは `FailedPrecondition`（`remove_guarded_bounded_waiting` が分類する）。
+fn cleanup_outcome_of(result: &Result<RemovedLogs, TraitError>) -> CleanupOutcome {
+    match result {
+        Ok(_) => CleanupOutcome::Removed,
+        Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
 }
 
@@ -622,7 +617,7 @@ pub struct CoreLifecycleRuntime {
     cgroups: Arc<dyn ContainerCgroupRemover>,
     /// `create` の `mounts[].destination` 拒否の記録先（`with_create_audit_sink`。#2594）。無ければ記録しない。
     create_audit: Option<Arc<dyn AuditSink>>,
-    /// コンテナログ削除で sink の閉鎖を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・REPAIR-5）。
+    /// supervisor ログとコンテナログの削除で共有する、ロック解放を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・#2964・REPAIR-5）。
     container_log_lock_wait: Duration,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
@@ -637,7 +632,9 @@ pub struct CoreLifecycleRuntime {
 fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode) -> String {
     // コンテナログが「待ちを使い切っても sink が閉じなかった」ときだけ `reason` を足す（他の失敗と見分ける。#2760・REPAIR-4）。
     let reason = match target {
-        CleanupTarget::ContainerLog => container_log_removal_reason(code),
+        CleanupTarget::ContainerLog | CleanupTarget::SupervisorLog => {
+            container_log_removal_reason(code)
+        }
         _ => None,
     }
     .map(|r| format!(",\"reason\":\"{r}\""))
@@ -857,7 +854,7 @@ impl CoreLifecycleRuntime {
         self
     }
 
-    /// コンテナログ削除で sink の閉鎖を待つ上限を変える（試験用。`CONTAINER_LOG_LOCK_WAIT` を超える値は切り詰める。
+    /// ログ 2 件の削除で共有するロック解放の待ちの上限を変える（試験用。`CONTAINER_LOG_LOCK_WAIT` を超える値は切り詰める。
     /// `PLUGIN_RUNTIME_TIMEOUT` に収まる予算の不変条件を壊さないため。#2634・REPAIR-5）。
     #[must_use]
     pub fn with_container_log_lock_wait(mut self, wait: Duration) -> Self {
@@ -895,24 +892,35 @@ impl CoreLifecycleRuntime {
         &self.recorder
     }
 
-    /// core の `delete` が成功した後に、supervisor の構造化ログを期限つきで best effort に消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+    /// core の `delete` が成功した後に、supervisor の構造化ログを期限つきで消す（#2067・#2434・#2964・REPAIR-4・REPAIR-5）。
     ///
-    /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）。期限切れは記録器の操作名
-    /// `supervisor_log_remove` の失敗として計上し、観測できるようにする。
-    fn remove_supervisor_log(&self, id: &ContainerId) -> CleanupOutcome {
+    /// CLI の `delete` と同じ契約。`FailedPrecondition`（同じ ID の supervisor が drain 中にログの flock を保持）のあいだ
+    /// 最大 `lock_wait` まで試し直し、1 回の試行の期限は [`SUPERVISOR_LOG_REMOVE_TIMEOUT`]（5 秒）。guard（状態ストアが
+    /// `NotFound`）はロック保持中に試行ごと評価し、待つ間に同じ ID で作り直されたインスタンスのログは消さない。
+    /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）が、握りつぶさず `Kept { code }` と記録器の
+    /// `supervisor_log_remove` の失敗として観測できるようにする。
+    fn remove_supervisor_log(&self, id: &ContainerId, lock_wait: Duration) -> CleanupOutcome {
         let Some(root) = self.store.host_state_root() else {
             return CleanupOutcome::NotApplicable;
         };
         let started = Instant::now();
-        let outcome = remove_bounded(root, id, SUPERVISOR_LOG_REMOVE_TIMEOUT);
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let removed = remove_guarded_bounded_waiting(
+            root,
+            id,
+            lock_wait,
+            SUPERVISOR_LOG_REMOVE_TIMEOUT,
+            Arc::new(move || Self::id_is_absent(&store, &guard_id)),
+        );
         if let Ok(name) = OpName::new("supervisor_log_remove") {
-            let result = match outcome {
-                LogRemoval::Finished => OpOutcome::Success,
-                LogRemoval::TimedOut | LogRemoval::Busy => OpOutcome::Failure,
+            let result = match &removed {
+                Ok(_) => OpOutcome::Success,
+                Err(_) => OpOutcome::Failure,
             };
             let _ = self.recorder.record(&name, result, started.elapsed());
         }
-        supervisor_log_cleanup_outcome(&outcome)
+        cleanup_outcome_of(&removed)
     }
 
     /// コンテナログ（現在ログ・全世代・ロック）を消す。core の `delete` が成功した後にだけ呼ぶ（失敗した delete で
@@ -929,6 +937,16 @@ impl CoreLifecycleRuntime {
     /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（待ちの期限まで同じ ID の sink が閉じなかった）・
     /// `Timeout`（期限切れ）・`ResourceExhausted`（枠の満杯。何も実行していない。#2894）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
     pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
+        self.remove_container_log_within(id, self.container_log_lock_wait)
+    }
+
+    /// [`Self::remove_container_log`] の待ちの上限を呼び出し側が渡す版。`delete` が supervisor ログと待ちを共有するため、
+    /// 残りの予算（`container_log_lock_wait` 以下）を受け取る（#2964・REPAIR-5）。
+    fn remove_container_log_within(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+    ) -> Result<RemovedLogs, TraitError> {
         let Some(root) = self.store.host_state_root() else {
             return Ok(RemovedLogs::default());
         };
@@ -937,7 +955,7 @@ impl CoreLifecycleRuntime {
         remove_container_logs_guarded_bounded_waiting(
             root,
             id,
-            self.container_log_lock_wait,
+            lock_wait,
             CONTAINER_LOG_REMOVE_TIMEOUT,
             Arc::new(move || {
                 matches!(
@@ -949,12 +967,16 @@ impl CoreLifecycleRuntime {
     }
 
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
-    fn record_container_log_removal(&self, id: &ContainerId) -> CleanupOutcome {
+    fn record_container_log_removal(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+    ) -> CleanupOutcome {
         if self.store.host_state_root().is_none() {
             return CleanupOutcome::NotApplicable;
         }
         let started = Instant::now();
-        let removed = self.remove_container_log(id);
+        let removed = self.remove_container_log_within(id, lock_wait);
         let elapsed = started.elapsed();
         let result = match &removed {
             Ok(_) => OpOutcome::Success,
@@ -1173,8 +1195,16 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         }
         let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
             .map_err(to_trait_error)?;
-        let supervisor_log = self.remove_supervisor_log(req.id());
-        let container_log = self.record_container_log_removal(req.id());
+        // 2 つのログで待ちを共有する（最悪 10 + 5 + 5 = 20 秒。独立に待つと 30 秒で `PLUGIN_RUNTIME_TIMEOUT` の余裕が尽きる。#2964）。
+        // 順序の根拠: コンテナログの sink は drain の終わりに閉じ、supervisor ログの flock はプロセス終了で外れる。
+        // supervisor ログが解放されればコンテナログはほぼ即座に消せるため、先に supervisor ログを待つ。
+        let wait = self.container_log_lock_wait;
+        let deadline = Instant::now() + wait;
+        let supervisor_log = self.remove_supervisor_log(req.id(), wait);
+        let container_log = self.record_container_log_removal(
+            req.id(),
+            deadline.saturating_duration_since(Instant::now()),
+        );
         // 起動オプション文書の残骸（記録の無くなった ID の分。失敗は応答に載せず、計上と構造化ログで知らせる。#2760）。
         if let Err(code) = self.remove_stale_options(req.id()) {
             (self.cleanup_warn)(options_cleanup_warning_line(req.id(), code));
@@ -1548,13 +1578,17 @@ mod tests {
             !cleanup_warning_line(&id, CleanupTarget::ContainerLog, ErrorCode::Timeout)
                 .contains("reason")
         );
-        assert!(
-            !cleanup_warning_line(
+        assert_eq!(
+            cleanup_warning_line(
                 &id,
                 CleanupTarget::SupervisorLog,
                 ErrorCode::FailedPrecondition
-            )
-            .contains("reason")
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert!(
+            !cleanup_warning_line(&id, CleanupTarget::SupervisorLog, ErrorCode::Timeout)
+                .contains("reason")
         );
         assert_eq!(
             options_cleanup_warning_line(&id, ErrorCode::Timeout),
@@ -1562,23 +1596,23 @@ mod tests {
         );
     }
 
-    /// #2894・ERR-1: 枠の満杯（`Busy`）は期限切れ（`Timeout`）と別のコード（`RESOURCE_EXHAUSTED`）で警告行に出る。
+    /// #2894・#2964・ERR-1: ログ削除の `Err` は code をそのまま `Kept` に載せ、枠の満杯は `RESOURCE_EXHAUSTED` で警告行に出る。
     #[test]
     fn err1_2894_supervisor_log_busy_is_not_timeout() {
         assert_eq!(
-            supervisor_log_cleanup_outcome(&LogRemoval::Busy),
+            cleanup_outcome_of(&Err(TraitError::new(ErrorCode::ResourceExhausted, "busy"))),
             CleanupOutcome::Kept {
                 code: ErrorCode::ResourceExhausted
             }
         );
         assert_eq!(
-            supervisor_log_cleanup_outcome(&LogRemoval::TimedOut),
+            cleanup_outcome_of(&Err(TraitError::new(ErrorCode::Timeout, "t"))),
             CleanupOutcome::Kept {
                 code: ErrorCode::Timeout
             }
         );
         assert_eq!(
-            supervisor_log_cleanup_outcome(&LogRemoval::Finished),
+            cleanup_outcome_of(&Ok(RemovedLogs::default())),
             CleanupOutcome::Removed
         );
         let id = cid("c1");

@@ -10,7 +10,7 @@
 //! core の pre-pivot 段で `prepare_rootfs` の後・`pivot_root` の前に、`verify_hook_stage` で証跡
 //! `CdiHookStage` を得て `run_create_container_hooks` を呼ぶ（いずれも Linux のみ）。失敗したら `pivot_root` へ
 //! 進まない（fail-closed）。順序を呼び出し側の申告ではなく実際の mountinfo で検証し、通過時だけ証跡を発行するため、
-//! 順序を逸脱した状態では実行 API を呼べない。env の付与は #550、`create-symlinks` の全リンク網羅検証は #551 の範囲。
+//! 順序を逸脱した状態では実行 API を呼べない。コンテナプロセスの env は `cdi_apply::env`（フックの env とは別）、`create-symlinks` の全リンク網羅検証は #551 の範囲。
 //!
 //! # 上流 runc との差と残余
 //! - フックの環境変数はフック指定分だけで、ホストの環境変数を継承しない（supervisor 側の秘密情報の漏えい防止。

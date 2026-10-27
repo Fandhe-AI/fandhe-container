@@ -66,8 +66,9 @@
 //! - 起動対象の信頼性検証そのもの（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの fd を持つ起動対象を渡すことを前提とする（起動 API はパスだけでは
 //!   起動できない。#1856）。Linux は fd の実体を実行し、検証後のパス差し替えでは別の実行ファイルを
-//!   起動しない。macOS は実体のパスで起動し、起動直前の同一性確認は未実装（#1866）。構築口と本番配線は
-//!   #1857・#1869。
+//!   起動しない。macOS は実体のパスで起動するが、spawn 直前に `lstat` の dev / ino を保持 fd と照合し、
+//!   不一致なら spawn しない（#1866。残余は確認から exec までの窓での同じ UID / root による差し替えで、
+//!   PLUG-11 の脅威の外）。構築口と本番配線は #1857・#1869。
 //! - 孫プロセスの回収の残る制限（#1311・#1604）。タイムアウト・後始末の kill は子のプロセスグループ全体へ
 //!   送るため孫も止まる。plugin が自発終了した場合も、`waitid(WNOWAIT)`（`sys::probe_child_exit`）で回収せずに
 //!   終了を観測し（ゾンビのまま pgid は再利用されない）、グループへ `SIGKILL` を送ってから回収する
@@ -1277,7 +1278,9 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
 ///
 /// 実行するプログラムは起動対象から決める（#1856・PLUG-11）。Linux は保持した fd の実体を
 /// `/proc/self/fd/<N>` 経由で実行し（実行できなければ `FailedPrecondition`。パスへ縮退しない）、
-/// それ以外はパス（`exec_path`）で起動する（macOS の起動直前の同一性確認は未実装。#1866）。
+/// Linux 以外の unix はパス（`exec_path`）で起動するが、spawn の直前に `lstat` で dev / ino を保持 fd と
+/// 照合し、違えば `FailedPrecondition` で子を spawn しない（#1866。常駐の再起動でも毎回通る）。
+/// 非 unix はパスで起動する（listener の bind が先に `Unimplemented` を返し子は spawn されない）。
 /// `argv[0]` は OS を問わず実体の正規パス。
 fn plugin_command(
     plugin: &PluginLaunchSpec,
@@ -1286,7 +1289,9 @@ fn plugin_command(
 ) -> Result<Command, PluginError> {
     #[cfg(target_os = "linux")]
     let program = launch_target::linux_fd_exec_path(&plugin.target, Path::new("/proc/self/fd"))?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let program = launch_target::checked_exec_path(&plugin.target)?;
+    #[cfg(not(unix))]
     let program = plugin.target.exec_path().to_path_buf();
 
     let mut cmd = Command::new(program);
@@ -1308,10 +1313,16 @@ fn plugin_command(
 
 /// spawn の失敗を起動対象の経路に合わせて写す。Linux は fd を保持しているのでファイル不在
 /// （`NotFound`）はあり得ず、確認後に `/proc` が使えなくなった等の競合として fd 経由の起動失敗にする。
+/// Linux 以外の unix の `NotFound` は、直前の `lstat` 確認を通った後にパスが消えた（残余の窓）ことなので、
+/// 確認での拒否と同じ「検証したファイルを指していない」エラーにする（#1866）。
 fn launch_spawn_error(e: PluginError) -> PluginError {
     #[cfg(target_os = "linux")]
     if e.code() == PluginErrorCode::NotFound {
         return launch_target::fd_launch_error();
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if e.code() == PluginErrorCode::NotFound {
+        return launch_target::path_identity_error();
     }
     e
 }

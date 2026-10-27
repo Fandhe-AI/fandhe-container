@@ -220,6 +220,25 @@ impl CriPluginBackends {
         Ok(backends)
     }
 
+    /// 状態ルートのインスタンスロック（`.cri/@instance.lock`）を期限つきで取る（CRI-2・CORE-1・REPAIR-5。#2931）。
+    ///
+    /// 呼び出し位置の制約: `production*` の成功の直後で、状態を変える最初の処理（`production_bundle_provider` の
+    /// ディレクトリ作成・`recover_stale_image_pulls`・ログの掃除・記録の読み込み）より前に呼び、戻り値をプロセスの終わりまで
+    /// 持つ。`production_inner` 内の `ReclaimStore` の読み込みはメモリへの読み込みだけでロックの前でも安全だが、そこに
+    /// 状態を変える処理を足す場合はロックの後へ移すこと。注入で組んだ（状態ルートが無い）場合は `FailedPrecondition`。
+    pub fn acquire_instance_lock(&self) -> Result<crate::instance_lock::InstanceLock, TraitError> {
+        match &self.state_root {
+            Some(root) => crate::instance_lock::acquire_instance_lock_in(
+                root,
+                crate::instance_lock::INSTANCE_LOCK_TIMEOUT,
+            ),
+            None => Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::FailedPrecondition,
+                "state root is not configured",
+            )),
+        }
+    }
+
     /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。
     ///
     /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。詳細は `bundle_provider_in`。

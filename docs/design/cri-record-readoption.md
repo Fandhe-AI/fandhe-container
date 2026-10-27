@@ -20,7 +20,7 @@
 | 保持役は plugin-cri の直接の子で stdin EOF で終了する（再起動をまたがない）。パスは自 sandbox の記録の pid からだけ作る（SEC-5 の P0・#2776） | [pod-namespace-holder.md](pod-namespace-holder.md) |
 | `CreatedNetwork`・IPAM は未永続（#1870 の後続） | [network-reclaim-persistence.md](network-reclaim-persistence.md)「未対応（後続）」 |
 | 本番の `PodNetworkProvider` は未注入。本番の在庫は `InMemoryImageStore`（プロセス内） | `crates/plugin-cri/src/adapter.rs` |
-| 状態ルートを単一の plugin-cri に固定する排他は無い（UDS の bind は socket 単位） | 現状のコード |
+| 状態ルートを単一の plugin-cri に固定する排他は、`.cri/@instance.lock` で実装済み（#2931。UDS の bind は socket 単位のため別途必要だった） | 現状のコード |
 
 ## 範囲
 

@@ -1353,6 +1353,12 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner.launch_mode()
     }
 
+    /// 内側の launcher の network モードを転送する(転送しないと既定の `FromConfig` になり、`Loopback` 指定が
+    /// 黙って縮退する。本番 launcher は不一致を拒否する。NET-6・SEC-1・#3058)。
+    fn network_mode(&self) -> fandhe_container_core::oci_runtime::LaunchNetworkMode {
+        self.inner.network_mode()
+    }
+
     /// 内側の launcher の監査 sink を転送する(転送しないと既定の `None` になり、start の設定検証での拒否が
     /// 本番で監査に記録されず黙って落ちる。SEC-4・#1915)。
     fn rejection_audit_sink(&self) -> Option<&dyn fandhe_container_core::audit_log::AuditSink> {

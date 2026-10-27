@@ -74,7 +74,8 @@
 //! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
 //!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
 //!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
-//! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
+//! - `cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）。`network` は起動オプションの network モードとの
+//!   突き合わせ（`network_mode.rs` の D7 の表。NET-6・SEC-1・#3058）で、既定の `FromConfig` ではエントリありを `Unimplemented`
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
@@ -84,8 +85,9 @@
 //!   変更し得る。`InvalidArgument`。SEC-1）
 //!
 //! 必須とする namespace は CORE-1 の最小分離（PID・mount・UTS・IPC）と user（SEC-5）。network は
-//! 指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
-//! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。
+//! `FromConfig` で指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
+//! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。起動オプションの
+//! `Host` / `Loopback` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064）。
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
@@ -140,6 +142,7 @@ use super::mountinfo_identity::{
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
 use super::namespace_join::NamespaceJoin;
+use super::network_mode::{EffectiveNetwork, reconcile_network};
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
@@ -874,8 +877,11 @@ fn build_spec_with_swap(
     if process.terminal() {
         return Err(unsupported("process.terminal"));
     }
+    // 起動オプションの network モードと config の突き合わせ(D7)は予約・fork より前に終える(NET-6・SEC-1・#3058)。
+    let network_mode = launcher.network_mode();
+    let network = reconcile_network(&config, network_mode)?;
     reject_unsupported_linux(&config)?;
-    reject_net_sysctls_without_network_namespace(&config)?;
+    reject_net_sysctls_without_network_namespace(&config, network)?;
     reject_protected_paths_over_implicit_dev(&config)?;
     // user namespace が無いと process.user がホストの uid として働いてしまう（SEC-5）。
     if !config
@@ -951,7 +957,8 @@ fn build_spec_with_swap(
     )
     .with_sysfs(sysfs)
     .with_additional_gids(additional_gids)
-    .with_namespace_join(namespace_join))
+    .with_namespace_join(namespace_join)
+    .with_network(network, network_mode))
 }
 
 /// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・
@@ -1334,10 +1341,8 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
     // 固定の段。他の種別の path・片方だけの path は `Unimplemented`。#2674）。
     NamespaceJoin::paths_of(config)?;
     for ns in config.namespaces() {
-        if matches!(
-            ns.kind(),
-            NamespaceKind::Network | NamespaceKind::Cgroup | NamespaceKind::Time
-        ) {
+        // network の扱いは起動オプションとの突き合わせ(`reconcile_network`)が先に決めて拒否済み(NET-6・#3058)。
+        if matches!(ns.kind(), NamespaceKind::Cgroup | NamespaceKind::Time) {
             return Err(unsupported("network / cgroup / time namespace"));
         }
     }
@@ -1346,16 +1351,18 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
 
 /// `net.*` の sysctl は network namespace が無いとホストの値を書き換えるため拒否する（CRI-2・CORE-3・SEC-1・#2670）。
 ///
-/// network namespace を伴う構成は `reject_unsupported_linux` が先に `Unimplemented` で拒否する（コンテナ自身の
-/// network namespace は未実装。pod の netns の結線は #2675）ため、現状 `net.*` を受けて起動できる経路は無い。
+/// 実効の network が `HostShared`（ホストの netns を共有）なら `net.*` を拒否する。`NewLoopback`（新しい netns。
+/// 実体は #3064）なら通す。`FromConfig` で network エントリがある構成は `reconcile_network` が先に `Unimplemented`
+/// で拒否する（pod の netns の結線は #2675）。起動オプションの network モードとの突き合わせは NET-6・#3058。
 /// IPC 系は IPC namespace の必須検査（本関数の呼び出し側）と、launcher の実効の名前空間との照合
 /// （`--ipc=host` との組み合わせの拒否）が担う。
-fn reject_net_sysctls_without_network_namespace(config: &OciConfig) -> Result<(), TraitError> {
-    let has_network_ns = config
-        .namespaces()
-        .iter()
-        .any(|n| n.kind() == NamespaceKind::Network);
-    if config.sysctls().has_namespace(SysctlNamespace::Net) && !has_network_ns {
+fn reject_net_sysctls_without_network_namespace(
+    config: &OciConfig,
+    network: EffectiveNetwork,
+) -> Result<(), TraitError> {
+    if config.sysctls().has_namespace(SysctlNamespace::Net)
+        && network == EffectiveNetwork::HostShared
+    {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
             "linux.sysctl net.* requires a network namespace",
@@ -1597,6 +1604,8 @@ mod tests {
         rlimits: Mutex<Option<crate::rlimits::Rlimits>>,
         /// `confirm_no_process_recorded` に渡された配置（呼び出し順。#2011）。
         recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
+        /// `network_mode` が返すモード(既定 `FromConfig`。NET-6・#3058)。
+        network_mode: Mutex<super::super::network_mode::LaunchNetworkMode>,
     }
 
     impl RecordingLauncher {
@@ -1618,7 +1627,12 @@ mod tests {
                 isolation: Mutex::new(None),
                 rlimits: Mutex::new(None),
                 recorded: Mutex::new(Vec::new()),
+                network_mode: Mutex::new(super::super::network_mode::LaunchNetworkMode::FromConfig),
             })
+        }
+
+        fn set_network_mode(&self, mode: super::super::network_mode::LaunchNetworkMode) {
+            *self.network_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
         }
 
         /// 次の launch が返すハンドルに持たせる分離の記録を設定する。
@@ -1687,6 +1701,10 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn network_mode(&self) -> super::super::network_mode::LaunchNetworkMode {
+            *self.network_mode.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
             self.audit
                 .get()
@@ -3314,6 +3332,84 @@ mod tests {
                 ("kernel.shmmax", "68719476736")
             ]
         );
+    }
+
+    /// 指定のモードで start を試み、拒否されたときの誤りを返す(launcher 0 回・記録は Created のまま)。
+    fn start_rejected_with_mode(
+        name: &str,
+        cfg: &Value,
+        mode: super::super::network_mode::LaunchNetworkMode,
+    ) -> OciRuntimeError {
+        let (b, store) = created(name);
+        b.write_config(cfg);
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(mode);
+        let err = run(&store, &launcher, name).expect_err("must fail");
+        assert_eq!(launcher.calls(), 0);
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        err
+    }
+
+    fn with_network_entry(entry: Value) -> Value {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"]
+            .as_array_mut()
+            .expect("array")
+            .push(entry);
+        cfg
+    }
+
+    /// NET-6・SEC-1（#3058）: `Loopback` / `Host` と path 付きの network エントリは予約の前に `InvalidArgument`。
+    #[test]
+    fn net6_sec1_start_rejects_network_mode_conflicting_with_path() {
+        use super::super::network_mode::LaunchNetworkMode;
+        let cfg = with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
+        for (name, mode) in [
+            ("net-loop-path", LaunchNetworkMode::Loopback),
+            ("net-host-path", LaunchNetworkMode::Host),
+        ] {
+            let err = start_rejected_with_mode(name, &cfg, mode);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+            assert_eq!(
+                err.message(),
+                "the network mode conflicts with a linux.namespaces network path"
+            );
+        }
+    }
+
+    /// NET-6・SEC-1（#3058）: `Host` で `net.*` の sysctl はホストの値を書き換えるため拒否する。
+    #[test]
+    fn net6_sec1_start_rejects_net_sysctls_in_host_mode() {
+        use super::super::network_mode::LaunchNetworkMode;
+        let mut cfg = with_network_entry(json!({"type": "network"}));
+        cfg["linux"]["sysctl"] = json!({"net.ipv4.ip_forward": "1"});
+        let err = start_rejected_with_mode("net-host-sysctl", &cfg, LaunchNetworkMode::Host);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl net.* requires a network namespace"
+        );
+    }
+
+    /// NET-6（#3058）: `Host` + path 無しの network エントリは start が受け、spec に `HostShared` と
+    /// モードが載る。成功する start は rootfs の固定を要するため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_start_host_mode_with_pathless_entry_shares_host() {
+        use super::super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
+        let name = "net-host-ok";
+        let (b, store) = created(name);
+        b.write_config(&with_network_entry(json!({"type": "network"})));
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(LaunchNetworkMode::Host);
+        run(&store, &launcher, name).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert_eq!(spec.network(), EffectiveNetwork::HostShared);
+        assert_eq!(spec.network_mode(), LaunchNetworkMode::Host);
     }
 
     /// CRI-2・CORE-3・SEC-1（#2670）: network namespace の無い `net.*` は host の値を書き換えるため `InvalidArgument`、

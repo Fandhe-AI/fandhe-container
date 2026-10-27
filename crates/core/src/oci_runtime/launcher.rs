@@ -136,6 +136,9 @@ use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
 use super::launch_options::{LaunchIpcMode, LaunchOptions};
 #[cfg(target_os = "linux")]
+use super::network_mode::EffectiveNetwork;
+use super::network_mode::LaunchNetworkMode;
+#[cfg(target_os = "linux")]
 use super::resources::LinuxResourceLimits;
 #[cfg(target_os = "linux")]
 use super::sysfs_mount::SysfsMountSpec;
@@ -718,6 +721,22 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
+    /// 起動オプションの network モード(start が予約前に config と突き合わせる。NET-6・SEC-1・#3058)。
+    /// launch で使う値と同じ `launch_options` から取る(未指定は `FromConfig`)。
+    fn network_mode(&self) -> LaunchNetworkMode {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .map_or(LaunchNetworkMode::FromConfig, LaunchOptions::network)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -1249,6 +1268,22 @@ impl Inner {
                 &default_options
             }
         };
+        // network: spec は start が `launch_options` と同じモードで突き合わせ済みのはず。ラッパーが `network_mode` を
+        // 転送しないと `FromConfig` で判定され、`Loopback` 指定がホスト共有へ黙って縮退する(fail-closed。NET-6・SEC-1・#3058)。
+        if spec.network_mode() != options.network() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launch spec was reconciled with a different network mode",
+            ));
+        }
+        // 新しい netns と lo の up の実体は #3064。それまで受理して反映しない状態を作らず拒否する(REPAIR-3)。
+        // config に network エントリが無い `Loopback` でも拒否するため、namespaces ではなく実効の結果で判定する。
+        if spec.network() == EffectiveNetwork::NewLoopback {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                "the loopback network mode is not implemented yet",
+            ));
+        }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
@@ -1810,6 +1845,8 @@ fn isolation_config_of(
         let ns = match kind {
             // `--ipc=host` のときだけ IPC namespace を作らない(config.json からは外せない。SEC-1・SUP-12・#2625)。
             NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
+            // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
+            NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
             NamespaceKind::Pid => Namespace::Pid,
             NamespaceKind::Mount => Namespace::Mount,
             NamespaceKind::Uts => Namespace::Uts,
@@ -4166,6 +4203,86 @@ mod tests {
             panic!("must be rejected");
         };
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
+    fn net_namespaces() -> serde_json::Value {
+        serde_json::json!({"namespaces": [
+            {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"},
+            {"type": "network"}
+        ]})
+    }
+
+    /// NET-6・SEC-1(#3058): `Host` で突き合わせ済みの spec は network namespace を作らず、launch が通る。
+    #[test]
+    fn net6_host_mode_skips_the_network_namespace() {
+        let spec = spec_for("net-host", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::HostShared,
+            LaunchNetworkMode::Host,
+        );
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Host),
+        );
+        assert_eq!(l.network_mode(), LaunchNetworkMode::Host);
+        isolation_config_of(&spec, LaunchIpcMode::Private).expect("network entry is skipped");
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// NET-6・REPAIR-3(#3058): `Loopback` は実体(#3064)ができるまで fork 前に `Unimplemented`。config に
+    /// network エントリが無くても拒否する(ホスト netns での黙った起動を作らない)。
+    #[test]
+    fn net6_loopback_mode_is_unimplemented_before_spawn() {
+        let spec = spec_for("net-loop", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "the loopback network mode is not implemented yet"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// SEC-1(#3058): spec のモードと launcher のモードが食い違う(ラッパーの転送漏れ等)なら `FailedPrecondition`。
+    #[test]
+    fn sec1_network_mode_mismatch_is_refused_before_spawn() {
+        let spec = spec_for("net-mismatch", serde_json::json!({}));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launch spec was reconciled with a different network mode"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3058): 起動オプション未指定の `network_mode` は `FromConfig`。
+    #[test]
+    fn net6_default_network_mode_is_from_config() {
+        let l = launcher(FakeOps::new(&events()), rootless(), None);
+        assert_eq!(l.network_mode(), LaunchNetworkMode::FromConfig);
     }
 
     /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。

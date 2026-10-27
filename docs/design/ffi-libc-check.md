@@ -67,9 +67,11 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
+
+crates/io（#1842）: `sys.rs`（`libc_abi`・`beneath::libc_abi`・`tests::libc_abi_fixtures`）と `sys/vsock.rs`（`libc_abi`）で、`Ucred`・`SockaddrVm`・`PollFd` のサイズ・アラインメント・フィールドオフセット、`O_*`・`AT_*`・errno・`SOL_SOCKET` 等の定数、`beneath::raw` ほか全 FFI 関数の型を照合する。`libc` 0.2.189 の `sockaddr_vm` は旧ヘッダ形（`svm_zero: [u8; 4]`）で `svm_flags` を持たないため、自前の `svm_flags`＋`svm_zero[3]` は末尾 4 バイトの位置・サイズで照合する。DIR・`dirent`・`sockaddr` はポインタ先の型が自前と `libc` で別書き（不透明ポインタ・先頭バイト・`SockaddrVm`）のため、関数は別々の型で書き、`dirent` の `d_ino`・`d_name` のオフセットは `offset_of!` で照合する。`vsock.rs` の `map_errno` の数値リテラルは `libc` の errno と値を照合する。対象外（理由は各モジュールのコメント）: `UCRED_SIZE`・`UCRED_LEN`・`SOCKADDR_VM_LEN`（サイズ照合に含まれる）、`MAX_FULL_FSYNC_EINTR_RETRIES`・`consts::SUPPORTED`（FFI でない）、`LINKAT_FLAGS`（`libc` に無い方針値。`AT_SYMLINK_FOLLOW` を含まないことだけ照合）、対応外 arch 用 `consts`、`windows.rs`。
 
 crates/plugin-macos（#1845）は適用済み。照合は `sys.rs` の `imp::libc_abi`（`SIGTERM` の 3 腕・`SIG_ERR`・`signal` の型・`on_sigterm` の引数型）と `libc_abi`（`NOFOLLOW_NONBLOCK_FLAGS` の 3 腕・`ELOOP` の 2 腕）。対象外は `None` の腕・Windows の `ELOOP` 腕・FFI でない安全なラッパーで、構造体は無い。評価対象外のターゲット（Linux mips / mips64 / sparc64、illumos 等）では `ELOOP` の宣言が `libc` と食い違う可能性があり、別 issue で扱う。
 

@@ -78,10 +78,13 @@
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
-//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
+//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）は範囲外。
+//! - oci の `OciOpRecorder` は `oci_recorder::CliOciRecorder` で CLI の `OpRecorder` へ橋渡しし、`image ls` / `image rm` / `image tag` / `system df` の
+//!   `ImageStore` に付ける（`oci.*` の名前で記録。#2968・REPAIR-4・OCI-1）。CLI に pull・展開の経路は無いため、それらの計装は経路が入った時点で同じアダプタを渡す。
 
 use std::io::Write;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Instant;
 
 use fandhe_container_core::observability::OpRecorder;
@@ -94,6 +97,7 @@ use fandhe_container_oci::image_management::{
     ImageRmTarget, ImageStore, ImageTagChange, ImageTagOutcome, ImageTagSource, StoppedContainers,
     TagKey,
 };
+use fandhe_container_oci::instrument::OciOpRecorder;
 use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 
 use super::CliExit;
@@ -101,6 +105,7 @@ use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
 use super::image_refs::{is_bare_digest_form, legacy_scope, ref_key, state_scope};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
+use super::oci_recorder::CliOciRecorder;
 use super::ref_reconcile::reconcile_for_image_rm;
 use crate::error::CliError;
 
@@ -377,10 +382,24 @@ fn run_image_tag_with(
     }
 }
 
-/// `image ls` の実処理（ストアは呼び出し側が開く）。
+/// `image ls` の実処理（ストアは呼び出し側が開く。計装なし。試験用）。
+#[cfg(test)]
 fn run_image_ls_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
+    run_image_ls_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        out,
+    )
+}
+
+/// 計装つきの `image ls`。`list_images_with` へ記録先を渡す（ストアの記録先はロック取得だけに効くため。#2968）。
+fn run_image_ls_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
+    out: &mut dyn Write,
+) -> CliExit {
     let list = match store.lock() {
-        Ok(g) => g.list_images(store.root()),
+        Ok(g) => g.list_images_with(recorder, store.root()),
         Err(e) => return oci_failure(&e, Stage::Lock),
     };
     match list {
@@ -392,10 +411,24 @@ fn run_image_ls_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
     }
 }
 
-/// `system df` の実処理。
+/// `system df` の実処理（計装なし。試験用）。
+#[cfg(test)]
 fn run_system_df_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
+    run_system_df_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        out,
+    )
+}
+
+/// 計装つきの `system df`（#2968）。
+fn run_system_df_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
+    out: &mut dyn Write,
+) -> CliExit {
     let usage = match store.lock() {
-        Ok(g) => g.disk_usage(store.root()),
+        Ok(g) => g.disk_usage_with(recorder, store.root()),
         Err(e) => return oci_failure(&e, Stage::Lock),
     };
     match usage {
@@ -423,8 +456,30 @@ fn run_image_rm_with(
 ///
 /// 1 回目の判定が使用中で拒否したら、**ガードを手放した状態で** `reclaim`（拒否に載った参照の照合と回収。契機 B・#2495）を
 /// 呼び、判定をやり直す。照合に失敗・保留しても従来どおりの拒否に進む（残す側に誤る）。
+#[cfg(test)]
 fn run_image_rm_reclaiming(
     store: &ImageStore,
+    target: &ImageRmTarget,
+    force: bool,
+    snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
+    reclaim: &dyn Fn(&[ContainerRefId]),
+    out: &mut dyn Write,
+) -> CliExit {
+    run_image_rm_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        target,
+        force,
+        snapshot,
+        reclaim,
+        out,
+    )
+}
+
+/// 計装つきの `image rm`（`execute_image_rm_with` へ記録先を渡す。#2968）。
+fn run_image_rm_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
     target: &ImageRmTarget,
     force: bool,
     snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
@@ -447,7 +502,8 @@ fn run_image_rm_reclaiming(
         match guard.plan_image_rm_with(target, &opts, &none) {
             Err(e) => Err(oci_failure(&e, Stage::Remove)),
             Ok(ImageRmPlan::Refuse(u)) => Ok(Err(u.containers)),
-            Ok(_) => Ok(Ok(guard.execute_image_rm(
+            Ok(_) => Ok(Ok(guard.execute_image_rm_with(
+                recorder,
                 store.root(),
                 target,
                 &opts,
@@ -484,7 +540,9 @@ fn run_image_rm_reclaiming(
             match guard.plan_image_rm_with(target, &opts, &stopped) {
                 Err(e) => return oci_failure(&e, Stage::Remove),
                 Ok(ImageRmPlan::Refuse(_)) => return in_use(true),
-                Ok(_) => guard.execute_image_rm(store.root(), target, &opts, &stopped),
+                Ok(_) => {
+                    guard.execute_image_rm_with(recorder, store.root(), target, &opts, &stopped)
+                }
             }
         }
     };
@@ -549,10 +607,13 @@ fn snapshot_from(store: &dyn StateStore, scopes: &[&str]) -> Result<StoppedConta
 }
 
 /// 計測へ成功・失敗を 1 回記録して出力する（REPAIR-4）。
-fn with_ops(op_name: &str, f: impl FnOnce() -> CliExit) -> CliExit {
+///
+/// closure には記録器の共有ハンドルを渡す。イメージストアを開く入口（`open_image_store_recorded`）へ渡すと、
+/// oci 内の操作が同じ記録器へ `oci.*` の名前で入る（`oci_recorder`。REPAIR-4・OCI-1・#2968）。
+fn with_ops(op_name: &str, f: impl FnOnce(&Arc<OpRecorder>) -> CliExit) -> CliExit {
     let started = Instant::now();
-    let recorder = OpRecorder::new();
-    let exit = f();
+    let recorder = Arc::new(OpRecorder::new());
+    let exit = f(&recorder);
     record_op(
         &recorder,
         op_name,
@@ -581,24 +642,38 @@ fn open_image_store(root: &std::path::Path) -> Result<ImageStore, CliExit> {
     ImageStore::open(root).map_err(|e| oci_failure(&e, Stage::Open))
 }
 
+/// `open_image_store` に oci の計装（`OciOpRecorder`）を `recorder` へ橋渡しして付ける（#2968）。
+fn open_image_store_recorded(
+    root: &std::path::Path,
+    recorder: &Arc<OpRecorder>,
+) -> Result<ImageStore, CliExit> {
+    open_image_store(root)
+        .map(|s| s.with_recorder(Arc::new(CliOciRecorder::new(Arc::clone(recorder)))))
+}
+
 /// 本番入口の `image`。
 pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn Write) -> CliExit {
     if let Some(e) = non_linux_failure(global) {
         return e;
     }
     match args {
-        ImageArgs::Ls(a) => with_ops("image_ls", || match open_image_store(&a.image_root) {
-            Ok(store) => run_image_ls_with(&store, stdout),
-            Err(e) => e,
+        ImageArgs::Ls(a) => with_ops("image_ls", |rec| {
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => {
+                    run_image_ls_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
+                }
+                Err(e) => e,
+            }
         }),
-        ImageArgs::Rm(a) => with_ops("image_rm", || {
+        ImageArgs::Rm(a) => with_ops("image_rm", |rec| {
             let target = match parse_target(&a.reference) {
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store(&a.image_root) {
-                Ok(store) => run_image_rm_reclaiming(
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => run_image_rm_recorded(
                     &store,
+                    &CliOciRecorder::new(Arc::clone(rec)),
                     &target,
                     a.force,
                     &|| stopped_snapshot(global),
@@ -608,7 +683,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Err(e) => e,
             }
         }),
-        ImageArgs::Tag(a) => with_ops("image_tag", || {
+        ImageArgs::Tag(a) => with_ops("image_tag", |rec| {
             let source = match parse_tag_source(&a.source) {
                 Ok(s) => s,
                 Err(e) => return e,
@@ -617,7 +692,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store(&a.image_root) {
+            match open_image_store_recorded(&a.image_root, rec) {
                 Ok(store) => run_image_tag_with(&store, &source, target, stdout),
                 Err(e) => e,
             }
@@ -635,9 +710,13 @@ pub(super) fn run_system(
         return e;
     }
     match args {
-        SystemArgs::Df(a) => with_ops("system_df", || match open_image_store(&a.image_root) {
-            Ok(store) => run_system_df_with(&store, stdout),
-            Err(e) => e,
+        SystemArgs::Df(a) => with_ops("system_df", |rec| {
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => {
+                    run_system_df_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
+                }
+                Err(e) => e,
+            }
         }),
     }
 }
@@ -1153,6 +1232,26 @@ mod tests {
             assert_eq!(e.exit_code(), 5);
             assert_eq!(out, "");
         }
+    }
+
+    /// REPAIR-4・OCI-1: 記録付きで開いたストアの `image ls` / `system df` が `oci.*` の操作を記録器へ入れる。
+    #[test]
+    fn repair4_recorded_store_feeds_oci_ops_into_recorder() {
+        let tmp = Tmp::new();
+        let rec = Arc::new(OpRecorder::new());
+        let store = open_image_store_recorded(tmp.path(), &rec).expect("open");
+        let bridge = CliOciRecorder::new(Arc::clone(&rec));
+        let (e, _) = out_of(|o| run_image_ls_recorded(&store, &bridge, o));
+        assert_eq!(e.exit_code(), 0);
+        let (e, _) = out_of(|o| run_system_df_recorded(&store, &bridge, o));
+        assert_eq!(e.exit_code(), 0);
+        let get = |n: &str| {
+            let name = fandhe_container_core::observability::OpName::new(n).expect("name");
+            rec.snapshot_op(&name).map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get("oci.image.list"), Some((1, 0)));
+        assert_eq!(get("oci.image.df"), Some((1, 0)));
+        assert_eq!(get("oci.store.lock"), Some((2, 0)));
     }
 
     /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。

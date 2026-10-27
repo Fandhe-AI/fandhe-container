@@ -5,6 +5,8 @@
 //! `OciOpRecorder` を実装して差し込む（`fandhe-container-net` の `instrument` と同じ形。oci は core に依存しない）。
 //! 本番の記録先は plugin-cri の `CoreOciRecorder`（`adapter.rs`）で、oci 専用の `OpRecorder` へ `OciOpKind::as_str` の
 //! 名前で写す（エラー code は名前に含めない。写像と専用にした理由は `docs/design/pull-inventory-wiring.md`。#2900）。
+//! CLI の `image ls` / `image rm` / `image tag` / `system df` の記録先は cli の `CliOciRecorder`（`commands/oci_recorder.rs`）で、
+//! 同じ写像を `with_ops` の `OpRecorder` へ書く（#2968）。
 //! 既定は何も記録しない `NoopOciOpRecorder`。
 //!
 //! # 機微情報

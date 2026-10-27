@@ -941,6 +941,14 @@ jobs:
         timeout-minutes: 5
         run: make guest-initrd-build-selftest
 
+      # /dev/fd/N 経由の権限検査の観測スクリプト（scripts/probe-dev-fd-perm.sh）の自己テスト（#2088・MAC-1・REPAIR-12）。
+      # 一時ファイルだけを使う。macOS では観測値を assert せず形式だけ照合し、ログが一次データになる。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）
+      - name: /dev/fd 権限検査の観測スクリプトの自己テスト（#2088・MAC-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make dev-fd-perm-probe-selftest
+
       # commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh）の自己テスト
       # （Issue #1295・REPAIR-12）。一時ファイルと一時 git リポジトリだけを使い、ネットワーク・secrets・
       # `${{ }}` の埋め込みは使わない。フックは開発者の macOS（BSD tr / awk）・Windows（Git Bash）でも

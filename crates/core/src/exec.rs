@@ -215,6 +215,10 @@ pub use launch_status::relay_entrypoint_violation_for_test;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_exec_returned_for_test;
+/// 結合試験 `tests/launch_landlock_audit.rs` 専用の再公開（SEC-1・SEC-4・CORE-5・#2130。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_landlock_failure_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -557,6 +561,38 @@ pub(crate) fn record_launch_mount_rejection_at<E>(
                 event,
                 container,
                 stage.map(Into::into),
+                sink,
+                None,
+            );
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
+/// launcher の `plan()` / `plan_rootless_subordinate()` が子を fork する前に拒否した計画の違反（種別 `PlanRejected`。
+/// `no_namespaces`・`user_namespace_required`・`host_root_identity_mapping` 等）を、層 `mount` のパスなし・理由コードつきの
+/// レコードとして 1 件記録して返す（SEC-1・SEC-4・#2130）。
+///
+/// 呼び出し元は本番 launcher（`oci_runtime::ProductionLauncher` の `spawn`）だけで、`plan` の呼び出しはそこの 1 か所に
+/// 限る（二重記録を避けるため、共有の写像 `mount_layer_audit_event` は `PlanRejected` を記録しないまま専用の
+/// `launch_plan_audit_event` を使う）。`PlanRejected` 以外・違反なしのエラーは記録せず `NotApplicable`。時刻と PID は
+/// 記録を行った親のもの。記録の成否で `error` は変わらない（fail-closed）。
+pub(crate) fn record_launch_plan_rejection(
+    error: ExecError,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = error
+        .violation
+        .as_ref()
+        .and_then(|v| v.reason.launch_plan_audit_event());
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(error.stage.into()),
                 sink,
                 None,
             );

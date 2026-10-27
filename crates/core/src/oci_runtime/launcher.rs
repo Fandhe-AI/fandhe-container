@@ -1939,7 +1939,7 @@ impl LaunchOps for RealOps {
         let (isolation_plan, gid_map): (IntermediatePlan<'_>, &IdMapSet) = match input.subordinate {
             None => {
                 single_plan = plan(&input.isolation)
-                    .map_err(not_started)?
+                    .map_err(|e| plan_rejected(e, input.audit))?
                     .with_host_slave_root(host_slave);
                 // 計画が euid / egid 0 を拒否した後に作る。
                 single_gid = crate::rootless::single_id_mapping(crate::sys::effective_gid())
@@ -1960,7 +1960,7 @@ impl LaunchOps for RealOps {
                     ids.writer.clone(),
                     ids.timeout,
                 )
-                .map_err(not_started)?
+                .map_err(|e| plan_rejected(e, input.audit))?
                 .with_host_slave_root(host_slave);
                 (
                     IntermediatePlan::Subordinate(&subordinate_plan),
@@ -2023,6 +2023,17 @@ impl LaunchOps for RealOps {
         // 失敗は code だけを残す(メッセージ・パスは呼び出し側で固定文言に置き換えるため捨てる)。
         crate::cgroups::ensure_no_process_in_recorded(id, placement, deadline).map_err(|e| e.code)
     }
+}
+
+/// 計画の拒否 `e` を、親の監査へ 1 件記録した起動失敗にする(SEC-1・SEC-4・#2130)。
+///
+/// `spawn` の `plan()` / `plan_rootless_subordinate()` の失敗だけが使う。fork 前の拒否のため回収する子は無い
+/// (`clean`)。違反なしのエラー・`PlanRejected` 以外は記録せず `not_applicable`(従来どおり)。
+#[cfg(target_os = "linux")]
+fn plan_rejected(e: ExecError, audit: LaunchAudit<'_>) -> Box<PreparedLaunchFailure> {
+    Box::new(PreparedLaunchFailure::clean(
+        crate::exec::record_launch_plan_rejection(e, audit.container, audit.sink),
+    ))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4610,6 +4621,104 @@ mod tests {
         assert!(!std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
         assert!(Arc::ptr_eq(&l.inner.audit_sink, &main));
         assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
+    }
+
+    /// 記録を溜める試験用 sink(`fail` なら記録に失敗する)。
+    struct CollectSink {
+        records: std::sync::Mutex<Vec<AuditRecord>>,
+        fail: bool,
+    }
+
+    impl AuditSink for CollectSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Internal, "sink failed"));
+            }
+            self.records.lock().expect("lock").push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// SEC-1・SEC-4・#2130: 計画の拒否(名前空間が空)は、層 `mount`・パスなし・理由コード `no_namespaces`・
+    /// 段 `validate`・container_id つきで 1 件記録され、返す `ExecError` は元のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_is_recorded_once() {
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        let id = ContainerId::new("c2130").expect("id");
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("empty namespaces are rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let failure = plan_rejected(original.clone(), audit);
+        assert_eq!(failure.rejection.delivery, AuditDelivery::Recorded);
+        assert_eq!(failure.rejection.error, original);
+        assert!(failure.unreaped.is_empty());
+        let recs = sink.records.lock().expect("lock");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].reason().map(|r| r.as_str()), Some("no_namespaces"));
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c2130"));
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("validate"));
+    }
+
+    /// SEC-4・#2130: 記録先が失敗しても拒否は覆らず、失敗は `SinkFailed` として残る(黙って捨てない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_survives_sink_failure() {
+        use crate::audit_log::AuditDelivery;
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let failure = plan_rejected(
+            original.clone(),
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert!(matches!(
+            failure.rejection.delivery,
+            AuditDelivery::SinkFailed(_)
+        ));
+        assert_eq!(failure.rejection.error, original);
+    }
+
+    /// SEC-4・#2130: 違反でないエラー(システムエラー)は記録せず `NotApplicable`(従来どおり)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_non_violation_plan_error_is_not_recorded() {
+        use crate::audit_log::AuditDelivery;
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let e = ExecError::new(ErrorCode::Internal, IsolationStage::Validate, "boom");
+        let failure = plan_rejected(
+            e,
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert_eq!(failure.rejection.delivery, AuditDelivery::NotApplicable);
+        assert!(sink.records.lock().expect("lock").is_empty());
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

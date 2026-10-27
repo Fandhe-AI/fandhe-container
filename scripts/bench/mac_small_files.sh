@@ -177,8 +177,8 @@ probe_script() {
 }
 
 # 引数: <log>。イメージ ID を stdout へ出す。事前取得が無ければ失敗（--pull never のため計測中に取得しない）。
-backend_image_id() { run_limited "$CLEANUP_TIMEOUT_SECS" "$runtime" image inspect --format '{{.Id}}' "$image" 2>"$1"; }
-backend_version() { run_limited "$CLEANUP_TIMEOUT_SECS" "$runtime" version --format '{{.Server.Version}}' 2>/dev/null; }
+backend_image_id() { run_limited "${cap_secs:-$CLEANUP_TIMEOUT_SECS}" "$runtime" image inspect --format '{{.Id}}' "$image" 2>"$1"; }
+backend_version() { run_limited "${cap_secs:-$CLEANUP_TIMEOUT_SECS}" "$runtime" version --format '{{.Server.Version}}' 2>/dev/null; }
 
 # 1 試行。引数: <limit秒> <cidfile> <host の作業ディレクトリ> <script> <stdout> <stderr>
 backend_run_once() {
@@ -270,6 +270,14 @@ run_report() {
       and (.metrics.wall_clock_median_ms.method | type == "string")
       and (.metrics.metadata_p95_us.method | type == "string")
       and (.workload | type == "object")
+      and (.workload.count | type == "number" and . > 0)
+      and (.workload.batch | type == "number" and . > 0)
+      and (.workload.file_bytes | type == "number" and . >= 0)
+      and (.image | type == "string" and length > 0)
+      and (.mount_kind | type == "string" and length > 0)
+      and (.metrics.wall_clock_median_ms.unit | type == "string" and length > 0)
+      and (.metrics.metadata_p95_us.unit | type == "string" and length > 0)
+      and (.trials_ok | type == "number" and . >= 5)
     ' "$f" >/dev/null 2>&1 || usage_error "result file failed schema validation"
   done
   jq -e '.target == "own"' "$own_result" >/dev/null 2>&1 || usage_error "--own-result must be a target=own result"
@@ -389,11 +397,24 @@ run_docker() {
 
   # 事前確認: イメージの事前取得・サーバー版数の記録。
   local image_id backend_ver rc=0
+  # 全体期限の残り時間（秒）。呼び出しごとの上限をこれ以下にする。
+  remaining_secs() { echo $((total_timeout - (SECONDS - started))); }
+  # 引数: <希望の上限秒>。残りが無ければ失敗し、残りが小さければそれに切り詰めた値を $cap_secs へ入れる。
+  local cap_secs=0
+  cap_for() {
+    local want="$1" rem
+    rem="$(remaining_secs)"
+    [ "$rem" -gt 0 ] || fail_measure "total deadline exceeded"
+    cap_secs="$want"
+    [ "$rem" -ge "$cap_secs" ] || cap_secs="$rem"
+  }
+  cap_for "$CLEANUP_TIMEOUT_SECS"
   image_id="$(backend_image_id "${work}/image.err")" || rc=$?
   [ "$rc" -eq 0 ] || fail_measure "image is not available locally (pull it first; --pull never is used)"
   case "$image_id" in sha256:*) ;; *) fail_measure "unexpected image id" ;; esac
   case "${image_id#sha256:}" in *[!0-9a-f]* | '') fail_measure "unexpected image id" ;; esac
   rc=0
+  cap_for "$CLEANUP_TIMEOUT_SECS"
   backend_ver="$(backend_version)" || rc=$?
   [ "$rc" -eq 0 ] || fail_measure "cannot read the docker server version"
   case "$backend_ver" in '' | *[!A-Za-z0-9._+-]*) fail_measure "unexpected docker server version" ;; esac
@@ -410,7 +431,8 @@ run_docker() {
   # bind が効いていることの確認（コンテナ内の書き込みがホストから見える）。
   new_trial_dir probe
   rc=0
-  backend_run_once "$trial_timeout" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" || rc=$?
+  cap_for "$trial_timeout"
+  backend_run_once "$cap_secs" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" || rc=$?
   [ "$rc" -eq 0 ] || fail_measure "the bind probe run failed (exit ${rc})"
   [ -f "${trial_dir}/probe" ] && [ "$(tr -d '\n' <"${trial_dir}/probe")" = "probe" ] \
     || fail_measure "bind mount is not effective: a file written in the container is not visible on the host"
@@ -419,6 +441,7 @@ run_docker() {
   script="$(workload_script "$count" "$batch")"
   : >"${work}/samples.jsonl"
   : >"${work}/walls"
+  : >"${work}/pooled"
   while [ "$n" -lt "$trials" ]; do
     n=$((n + 1))
     remaining=$((total_timeout - (SECONDS - started)))
@@ -442,11 +465,14 @@ run_docker() {
     local why=""
     why="$(parse_trial "${work}/out.${n}" "${work}/int.${n}")" || {
       echo "warning: trial ${n} failed: ${why}" >&2
+      rm -f "${work}/int.${n}"
       failed=$((failed + 1))
       continue
     }
-    [ "$wall_us" -gt 0 ] || { echo "warning: trial ${n} failed: non-positive wall clock" >&2; failed=$((failed + 1)); continue; }
+    [ "$wall_us" -gt 0 ] || { echo "warning: trial ${n} failed: non-positive wall clock" >&2; rm -f "${work}/int.${n}"; failed=$((failed + 1)); continue; }
     ok=$((ok + 1))
+    # p95 の母集団には検証を通った試行の区間だけを足す（失敗試行の区間を混ぜない）。
+    cat "${work}/int.${n}" >>"${work}/pooled"
     echo "$wall_us" >>"${work}/walls"
     jq -Rn --argjson t "$n" --argjson w "$wall_us" '
       [inputs | tonumber] | sort
@@ -458,7 +484,6 @@ run_docker() {
   [ "$ok" -ge 5 ] || fail_measure "only ${ok} valid trials (at least 5 required; ${failed} failed)"
 
   local pooled="${work}/pooled"
-  cat "${work}"/int.* >"$pooled"
   local final="${work}/final.json"
   jq -n --slurpfile samples "${work}/samples.jsonl" \
     --slurpfile pool <(jq -Rn '[inputs | tonumber] | sort | .[((length * 0.95 | ceil) - 1)]' <"$pooled") \

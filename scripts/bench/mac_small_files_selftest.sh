@@ -35,7 +35,7 @@ check() {
   if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi
 }
 
-# スタブの docker。STUB_MODE: ok / noimage / shortcount / badts / hang / stuck / nobind / failrun
+# スタブの docker。STUB_MODE: ok / noimage / shortcount / badts / hang / stuck / nobind / failrun / onebad
 cat >"${STUB_DIR}/docker" <<'STUB'
 #!/usr/bin/env bash
 calls="${STUB_DIR}/calls"
@@ -95,14 +95,17 @@ case "${1:-}" in
     count="$(printf '%s' "$script" | sed -n 's/.*-lt \([0-9]*\) .*/\1/p' | head -1)"
     batch="$(printf '%s' "$script" | sed -n 's/.*% \([0-9]*\)).*/\1/p' | head -1)"
     ts=1700000000000000000
+    # onebad: 4 回目の run（probe を含む。試行 3）だけ区間が巨大で件数も不一致の失敗試行にする。
+    mul=1
+    if [ "${STUB_MODE:-ok}" = onebad ] && [ "$n" -eq 4 ]; then mul=1000; fi
     if [ "${STUB_MODE:-ok}" = badts ]; then echo "TS %N"; else echo "TS $ts"; fi
     k=1
     while [ "$k" -le $((count / batch)) ]; do
-      ts=$((ts + k * 100 * batch))
+      ts=$((ts + k * 100 * batch * mul))
       echo "TS $ts"
       k=$((k + 1))
     done
-    if [ "${STUB_MODE:-ok}" = shortcount ]; then echo "FILES_CREATED=$((count - 1))"; else echo "FILES_CREATED=$count"; fi
+    if [ "${STUB_MODE:-ok}" = shortcount ] || { [ "${STUB_MODE:-ok}" = onebad ] && [ "$n" -eq 4 ]; }; then echo "FILES_CREATED=$((count - 1))"; else echo "FILES_CREATED=$count"; fi
     echo DONE
     finish
     [ "${STUB_MODE:-ok}" = failrun ] && exit 1
@@ -211,6 +214,12 @@ runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
 check "bind not effective exits 1" rc_is 1
 check "bind failure is reported" err_has 'bind mount is not effective'
 
+# 失敗試行（件数不一致）の区間は p95 に混ざらない（6 試行中 1 試行が失敗でも p95 は 9.5 us のまま）
+reset_stub onebad
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --trials 6 --output "${TMP}/onebad.json"
+check "one failed trial of six: exits 0" rc_is 0
+check "failed trial is excluded from pooled p95 and trials_ok" jq_ok '.trials_ok == 5 and .metrics.metadata_p95_us.value == 9.5' "${TMP}/onebad.json"
+
 # --- 期限と後始末（所有の証明） ---
 reset_stub hang
 other_id="$(printf '%064x' 99999)"
@@ -264,6 +273,15 @@ check "method mismatch: p95 ratio null, wall ratio stays, methods_differ true" j
 mkres own 800 75 batch-boundary-provisional 5000 >"${TMP}/o3.json"
 runit --mode report --own-result "${TMP}/o3.json" --baseline-result "${TMP}/b.json"
 check "workload mismatch: both ratios are null" jq_ok '.metadata_p95_reduction_ratio == null and .wall_clock_reduction_ratio == null and .methods_differ == true' "${TMP}/out"
+# workload / image が欠損した入力は、欠損同士が一致しても入力エラー（2）
+jq 'del(.workload.count)' "${TMP}/b.json" >"${TMP}/b-nocount.json"
+jq 'del(.workload.count)' "${TMP}/o.json" >"${TMP}/o-nocount.json"
+runit --mode report --own-result "${TMP}/o-nocount.json" --baseline-result "${TMP}/b-nocount.json"
+check "report rejects results without workload.count with 2" rc_is 2
+jq 'del(.image)' "${TMP}/b.json" >"${TMP}/b-noimg.json"
+jq 'del(.image)' "${TMP}/o.json" >"${TMP}/o-noimg.json"
+runit --mode report --own-result "${TMP}/o-noimg.json" --baseline-result "${TMP}/b-noimg.json"
+check "report rejects results without image with 2" rc_is 2
 runit --mode report --own-result "${TMP}/b.json" --baseline-result "${TMP}/b.json"
 check "report rejects a docker result as --own-result with 2" rc_is 2
 

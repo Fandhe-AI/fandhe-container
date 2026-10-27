@@ -1461,3 +1461,15 @@ mod tests {
         assert_eq!(c.rule_handles[0], handle(2));
     }
 }
+
+/// ACK 判定が使う nf_tables のメッセージ種別の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。宣言と同じく Linux の試験ビルド限定。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_MSG_NEWGEN, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETGEN, u8, c_int);
+    };
+}

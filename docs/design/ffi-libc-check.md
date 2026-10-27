@@ -80,6 +80,16 @@ crates/plugin-windows（#1846）も適用済み。`sys` の `imp` にある `sig
 
 crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は定数 45 件（`AF_NETLINK` は `u16` に範囲検査して比較）・構造体 2 件・関数 12 件。
 
+crates/net の uapi 定数（`sys.rs` の外にある netlink・rtnetlink・nfnetlink・nf_tables の定数。#3102・NET-1・MVM-4・REPAIR-12）は、宣言の隣の `libc_abi`（`#[cfg(all(test, target_os = "linux"))]`。uapi の値はアーキに依らないため arch の cfg は付けない）で照合する。`cfg(test)` だけにすると macOS・Windows の `cross-target-check` で `libc::` が解決できず落ちるため、Linux 限定にする。対象は `netlink.rs`・`netlink_route/link.rs`・`netlink_route/addr_route.rs`・`nftables_batch.rs`・`nftables_batch/table_chain.rs`・`nftables_batch/ack.rs`・`nftables_rules/{rule,nat,masq,payload,cmp,data}.rs`・`network/publish.rs`。マクロ `libc_const_eq!` は `lib.rs` の `pub mod` 列より前に置く（core の同名マクロの複製。`macro_rules` はテキスト順にしか見えないため）。
+
+- 照合: `libc_const_eq!` の呼び出し 122 件（`const fn`・newtype 経由の評価 25 件を含む。`NftFamily::nfproto`・`NfInetHook::value`・`NftCmpOp::wire_value`・`NatType` / `NatFamily` の `wire_value`・`NftRegister`）。構造体のサイズ 6 件（`nlmsghdr`・`nlattr`〔`rtattr` も同値〕・`ifinfomsg`・`ifaddrmsg`。`BATCH_MARKER_LEN` は `nlmsghdr` + `NFGENMSG_LEN`）。`NftCmpOp::from_wire` は `libc` の値から復元する `#[test]` を 1 件足した
+- 名前が違う対応: `ALIGN_TO` ↔ `NLA_ALIGNTO`（`libc` に `NLMSG_ALIGNTO` が無い）、`NFT_NAME_MAXLEN` ↔ `NFT_TABLE_MAXNAMELEN` と `NFT_CHAIN_MAXNAMELEN`、`NFT_REG_AREA_BYTES` ↔ `(NFT_REG32_15 - NFT_REG32_00 + 1) * NFT_REG32_SIZE`（派生値）
+- `NLA_TYPE_MASK`: C のヘッダーが int の補数で定義するため `libc` の値は負数（-49153）になる。`nla_type` は `__u16` なので 16 bit 幅に丸めて比べる（宣言は直さない）
+- `libc` に無いもの（出典を定義の横に書いた。書式は「出典: `include/uapi/<ヘッダー>`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い」）: `NLMSGERR_ATTR_*`・`VETH_INFO_PEER`・`IFALIAS_MAX_LEN`（`IFALIASZ` = 256）・`RTMSG_LEN`・`NFGENMSG_LEN`・`NFTA_*` 全般・`NAT_RANGE_*` / `NF_NAT_RANGE_*`（nat と masq の重複定義は crate 内の一致で固定）・`is_dump_request` 内のローカル定数 `RTM_BASE`（その場のコメント）。出典の値は C の小さなプログラムで uapi ヘッダーから実際に出力して突き合わせた
+- 対象外（理由は各 `libc_abi` のコメント）: 方針値・上限（`MAX_*`・受信バッファ長・`MAX_ATTR_PAYLOAD_LEN`）、uapi に名前が無い値（`NFT_RULE_MAXEXPRS` はカーネル内部の上限、`NFT_PAYLOAD_MAX_FIELD` はカーネルの検査から導いた値、`NFT_EXPR_NAME_MAXLEN`）、expr 名の文字列、DNS ヘルパー・記録形式の定数、`dns_helper::is_msgsize` の `EMSGSIZE`（`sys.rs` の `consts::EMSGSIZE` が照合済み）
+- 確認: 値をわざとずらして `const` 評価が `E0080` で止まることを 4 例で確かめて戻した（素の `u16` の `IFLA_IFALIAS`、`u8` を広げて比べる `NFT_MSG_NEWRULE`、丸めて比べる `NLA_TYPE_MASK`、`const fn` 経由の `NfInetHook::Forward.value()`）
+- 新しい `unsafe`・関数呼び出し・依存の変更は無い。`sys.rs` の外に uapi 定数を足す PR は、同じ PR で照合か出典を足す
+
 crates/plugin（#1843）は `sys.rs` の末尾の `libc_abi`（cfg ごとの子モジュール）と、`tests` の子 `libc_abi_fixtures` で照合する。`MIT OR Apache-2.0` の境界ライブラリだが、dev-dependency のため製品の依存グラフは変わらない。対象外と扱いは次のとおり。
 
 - `waitid` の `idtype`: 自前は `i32`、`libc` は `idtype_t`（`c_uint`）。C の列挙型で列挙子がすべて負でないため `libc` は符号なしを選ぶ。幅・アラインメントは同じで、32 bit 整数引数の渡し方は符号で変わらず ABI は一致する。型の綴りの違いとして、関数は引数の型を別々に書いて照合し、`P_PID` は負でないことを確かめて比べた。自前の宣言を `u32` に揃えるかはオーナー判断（`sys` の本体は変えていない）
@@ -103,7 +113,7 @@ crates/core の構造体と関数の型（#1849）: 照合は `sys.rs` 最上位
 
 crates/platform-macos の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`MFSTYPENAMELEN`（`libc` に無い。`libc::statfs` の `f_fstypename` と `f_mntonname` のオフセット差で間接照合）、`statfs` の `link_name`（自前は `x86_64`、`libc` は `not(aarch64)` と書き方が違うが、親の `compile_error!` で 2 アーキに限るため同じシンボルになる）。`geteuid` は macOS と Linux の両方でコンパイルされるため、PR の ubuntu CI でもネイティブに評価される。
 
-crates/supervisor（#1840）は `src/sys/linux.rs` の `libc_abi`（最上位と `control_ffi` の子）で、LP64 の x86_64・aarch64 に限って照合する。`libc` は `cfg(target_os = "linux")` の dev-dependencies。対象外（`libc` に対応物が無い）: `LINUX_CAPABILITY_VERSION_3`・`CapUserHeader`・`CapUserData`・`XATTR_NAME_CAPS`・`FILE_CAPS_BUF_LEN`、FFI でない上限（`MAX_EXEC_VECTOR`・`CAP_NUMBER_LIMIT`）、非 LP64 の `arch`（値が `None`）。`PR_CAP_AMBIENT_RAISE` 等は `u64`、`AT_EMPTY_PATH` は `i64` のため、`libc` の `c_int` を広げて比べる。関数内の `listen` やリテラルの errno（`SIGKILL`・`EINVAL`・`ENOSYS`・`EBADF`）は項目として参照できないため、型の代入と `libc` の値の固定で照合する。`connect` の第 2 引数は自前が `c_void`、`libc` が `sockaddr` を指すポインタで ABI は同じ（`SockaddrUn` のレイアウトは別に照合）。
+crates/supervisor（#1840）は `src/sys/linux.rs` の `libc_abi`（最上位と `control_ffi` の子）で、LP64 の x86_64・aarch64 に限って照合する。宣言 `syscall` と利用経路（capget / capset / execveat / close_range）も同じ cfg に限り（非 LP64 は `Unsupported`、`close_fds_from` は `/proc/self/fd` のみ。#3100・SUP-6）、照合の cfg と宣言の cfg を揃える。`libc` は `cfg(target_os = "linux")` の dev-dependencies。対象外（`libc` に対応物が無い）: `LINUX_CAPABILITY_VERSION_3`・`CapUserHeader`・`CapUserData`・`XATTR_NAME_CAPS`・`FILE_CAPS_BUF_LEN`、FFI でない上限（`MAX_EXEC_VECTOR`・`CAP_NUMBER_LIMIT`）、非 LP64 の `arch`（値が `None`）。`PR_CAP_AMBIENT_RAISE` 等は `u64`、`AT_EMPTY_PATH` は `i64` のため、`libc` の `c_int` を広げて比べる。関数内の `listen` やリテラルの errno（`SIGKILL`・`EINVAL`・`ENOSYS`・`EBADF`）は項目として参照できないため、型の代入と `libc` の値の固定で照合する。`connect` の第 2 引数は自前が `c_void`、`libc` が `sockaddr` を指すポインタで ABI は同じ（`SockaddrUn` のレイアウトは別に照合）。
 
 crates/gpu（#2979・#2980 で `sys` を新設）は未適用。照合は #1837 の子 #2989 で行う。dev-dependencies の `libc`（=0.2.189）だけを使い、追加には oci（#2590）と同様に crate ごとのオーナー承認が要る。
 

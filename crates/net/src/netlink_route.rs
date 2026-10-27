@@ -1192,6 +1192,8 @@ mod socket {
     /// - カーネルは `NLM_F_ROOT`・`NLM_F_MATCH` のどちらか一方でも dump として扱う（両方揃いを要求すると、
     ///   片方だけの GET で ACK が来ないまま DONE で終わる応答を非 dump として扱い、判定がずれる）
     fn is_dump_request(msg_type: u16, flags: u16) -> bool {
+        // 出典: `include/uapi/linux/rtnetlink.h` の `RTM_BASE`（Linux 7.0.14 の uapi で値を確認。libc 0.2.189 に
+        // 無い。関数内のローカル定数で照合できないため値だけ出典で固定する）。
         const RTM_BASE: u16 = 16;
         msg_type >= RTM_BASE && msg_type & 3 == 2 && flags & (NLM_F_ROOT | NLM_F_MATCH) != 0
     }

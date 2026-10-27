@@ -43,12 +43,16 @@ use super::{NftExpr, NftExprAttr, NftExprName, collect_u32_attrs, data_loss, inv
 use crate::error::NetError;
 
 /// 読み込み先レジスタ（`NFTA_PAYLOAD_DREG`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_PAYLOAD_DREG: u16 = 1;
 /// ヘッダー種別（`NFTA_PAYLOAD_BASE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_PAYLOAD_BASE: u16 = 2;
 /// ヘッダー先頭からのオフセット（`NFTA_PAYLOAD_OFFSET`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_PAYLOAD_OFFSET: u16 = 3;
 /// 読み込み長（`NFTA_PAYLOAD_LEN`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_PAYLOAD_LEN: u16 = 4;
 /// network header（`NFT_PAYLOAD_NETWORK_HEADER`）。
 pub const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
@@ -484,4 +488,36 @@ mod tests {
             assert!(a.as_u32_be().is_some());
         }
     }
+}
+
+/// payload expr とレジスタ番号の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_PAYLOAD_*` は定義の横に出典を書いた。
+/// `NFT_REG_AREA_BYTES` は uapi の名前を持たない派生値（`NFT_REG32_00`〜`NFT_REG32_15` の 16 本 × 4 バイト）
+/// として `libc` の値から導いて照合する。`NFT_PAYLOAD_MAX_FIELD` はカーネルの
+/// `nft_parse_u32_check(..., U8_MAX)` から導いた値で uapi に名前が無いため対象外。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use super::NftRegister;
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_PAYLOAD_NETWORK_HEADER, u32, c_int);
+        libc_const_eq!(NFT_PAYLOAD_TRANSPORT_HEADER, u32, c_int);
+        libc_const_eq!(NFT_REG_1, u32, c_int);
+        libc_const_eq!(NFT_REG32_00, u32, c_int);
+        libc_const_eq!(NFT_REG_4, u32, c_int);
+        libc_const_eq!(NFT_REG32_15, u32, c_int);
+        libc_const_eq!(NftRegister::REG_1.0, u32, libc::NFT_REG_1, c_int);
+        libc_const_eq!(NftRegister::REG_2.0, u32, libc::NFT_REG_2, c_int);
+        libc_const_eq!(NftRegister::REG_3.0, u32, libc::NFT_REG_3, c_int);
+        libc_const_eq!(NftRegister::REG_4.0, u32, libc::NFT_REG_4, c_int);
+        libc_const_eq!(
+            super::NFT_REG_AREA_BYTES,
+            u32,
+            (libc::NFT_REG32_15 - libc::NFT_REG32_00 + 1) * libc::NFT_REG32_SIZE,
+            c_int
+        );
+    };
 }

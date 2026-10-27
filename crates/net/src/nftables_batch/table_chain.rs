@@ -60,30 +60,40 @@ pub const NFT_MSG_NEWCHAIN: u8 = 3;
 /// チェイン照会（`NFT_MSG_GETCHAIN`）。
 pub const NFT_MSG_GETCHAIN: u8 = 4;
 /// テーブル名属性（`NFTA_TABLE_NAME`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_NAME: u16 = 1;
 /// テーブルのハンドル属性（`NFTA_TABLE_HANDLE`。`__be64`。カーネルが採番し再利用されない）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_HANDLE: u16 = 4;
 /// テーブルのユーザーデータ属性（`NFTA_TABLE_USERDATA`。最大 `NFT_USERDATA_MAXLEN` バイト）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_USERDATA: u16 = 6;
 /// ユーザーデータの最大長（`NFT_USERDATA_MAXLEN`）。
 pub const NFT_USERDATA_MAXLEN: usize = 256;
 /// チェインの所属テーブル名属性（`NFTA_CHAIN_TABLE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_TABLE: u16 = 1;
 /// チェイン名属性（`NFTA_CHAIN_NAME`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_NAME: u16 = 3;
 /// base chain の policy 属性（`NFTA_CHAIN_POLICY`。`__be32` の `NF_DROP` / `NF_ACCEPT`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_POLICY: u16 = 5;
 /// policy 値 drop（`linux/netfilter.h` の `NF_DROP`）。
 pub const NF_DROP: u32 = 0;
 /// policy 値 accept（`NF_ACCEPT`）。
 pub const NF_ACCEPT: u32 = 1;
 /// base chain の hook 指定（ネスト。`NFTA_CHAIN_HOOK`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_HOOK: u16 = 4;
 /// チェイン種別属性（`NFTA_CHAIN_TYPE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_TYPE: u16 = 7;
 /// hook 番号（`NFTA_HOOK_HOOKNUM`。`__be32`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_HOOK_HOOKNUM: u16 = 1;
 /// hook 優先度（`NFTA_HOOK_PRIORITY`。`__be32` 上の符号付き値）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_HOOK_PRIORITY: u16 = 2;
 /// 名前の最大長（NUL を含む。`NFT_NAME_MAXLEN`）。
 pub const NFT_NAME_MAXLEN: usize = 256;
@@ -1077,4 +1087,85 @@ mod tests {
             m.build(5).expect("build").finish().expect("f")
         );
     }
+}
+
+/// nf_tables の table / chain 系定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_TABLE_*`・`NFTA_CHAIN_*`・`NFTA_HOOK_*` は
+/// 定義の横に出典を書いた。`NFT_NAME_MAXLEN` は `NFT_TABLE_MAXNAMELEN` / `NFT_CHAIN_MAXNAMELEN` と名前が
+/// 違う対応で照合する。`NftFamily::nfproto`・`NfInetHook::value` は `const fn` の評価で照合する。
+///
+/// 対象外（黙って省かない）: 非公開の `NFGENMSG_LEN` は親の同名定義との一致のみ確かめる
+/// （`struct nfgenmsg` は `libc` に無く、出典は親の定義の横）。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use super::{NfInetHook, NftFamily};
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_MSG_NEWTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_DELTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_NEWCHAIN, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETCHAIN, u8, c_int);
+        libc_const_eq!(NFT_USERDATA_MAXLEN, usize, c_int);
+        libc_const_eq!(NF_DROP, u32, c_int);
+        libc_const_eq!(NF_ACCEPT, u32, c_int);
+        libc_const_eq!(NF_IP_PRI_FILTER, i32, c_int);
+        libc_const_eq!(NF_IP_PRI_NAT_DST, i32, c_int);
+        libc_const_eq!(NF_IP_PRI_NAT_SRC, i32, c_int);
+        // 名前が違う対応（table 名・chain 名の上限はどちらも 256）。
+        libc_const_eq!(
+            super::NFT_NAME_MAXLEN,
+            usize,
+            libc::NFT_TABLE_MAXNAMELEN,
+            c_int
+        );
+        libc_const_eq!(
+            super::NFT_NAME_MAXLEN,
+            usize,
+            libc::NFT_CHAIN_MAXNAMELEN,
+            c_int
+        );
+        // 非公開の重複定義が親の定義と一致していること。
+        assert!(super::NFGENMSG_LEN == crate::nftables_batch::NFGENMSG_LEN);
+        // const fn 経由の family / hook。
+        libc_const_eq!(NftFamily::Inet.nfproto(), u8, libc::NFPROTO_INET, c_int);
+        libc_const_eq!(NftFamily::Ipv4.nfproto(), u8, libc::NFPROTO_IPV4, c_int);
+        libc_const_eq!(NftFamily::Ipv6.nfproto(), u8, libc::NFPROTO_IPV6, c_int);
+        libc_const_eq!(NftFamily::Arp.nfproto(), u8, libc::NFPROTO_ARP, c_int);
+        libc_const_eq!(NftFamily::Bridge.nfproto(), u8, libc::NFPROTO_BRIDGE, c_int);
+        libc_const_eq!(NftFamily::Netdev.nfproto(), u8, libc::NFPROTO_NETDEV, c_int);
+        libc_const_eq!(
+            NfInetHook::PreRouting.value(),
+            u32,
+            libc::NF_INET_PRE_ROUTING,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::LocalIn.value(),
+            u32,
+            libc::NF_INET_LOCAL_IN,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::Forward.value(),
+            u32,
+            libc::NF_INET_FORWARD,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::LocalOut.value(),
+            u32,
+            libc::NF_INET_LOCAL_OUT,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::PostRouting.value(),
+            u32,
+            libc::NF_INET_POST_ROUTING,
+            c_int
+        );
+    };
 }

@@ -56,10 +56,13 @@ pub const NFT_MSG_NEWRULE: u8 = 6;
 /// ルール削除（`NFT_MSG_DELRULE`）。
 pub const NFT_MSG_DELRULE: u8 = 8;
 /// ルールのハンドル属性（`NFTA_RULE_HANDLE`。`__be64`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_RULE_HANDLE: u16 = 3;
 /// ルールの所属テーブル名属性（`NFTA_RULE_TABLE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_RULE_TABLE: u16 = 1;
 /// ルールの所属チェイン名属性（`NFTA_RULE_CHAIN`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_RULE_CHAIN: u16 = 2;
 
 /// `NFT_MSG_NEWRULE`。チェイン末尾へルールを追加する。
@@ -499,4 +502,16 @@ mod tests {
             }
         }
     }
+}
+
+/// ルールのメッセージ種別の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_RULE_*` は定義の横に出典を書いた。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_MSG_NEWRULE, u8, c_int);
+        libc_const_eq!(NFT_MSG_DELRULE, u8, c_int);
+    };
 }

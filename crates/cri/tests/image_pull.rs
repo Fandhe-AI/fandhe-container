@@ -917,8 +917,8 @@ async fn cri4_index_digest_pull_is_resolvable_by_index_digest() {
         assert_eq!(
             image.repo_digests,
             vec![
-                format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
                 format!("docker.io/library/alpine@sha256:{SHA_INDEX_TOP}"),
+                format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
             ]
         );
         let list = ImageService::list_images(
@@ -947,8 +947,8 @@ async fn cri4_index_digest_pull_is_resolvable_by_index_digest() {
     assert_eq!(
         pulled.repo_digests,
         vec![
-            format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
             format!("docker.io/library/alpine@sha256:{SHA_INDEX_TOP}"),
+            format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
         ]
     );
 }

@@ -63,6 +63,7 @@ use crate::sys::{
 use crate::traits::ContainerId;
 use crate::traits::types::ErrorCode;
 
+use super::violation::ViolationReason;
 use super::{
     ExecError, IsolationStage, MountIsolation, PreparedRootfs, fd_mount_id, fd_still_at,
     mount_is_shared,
@@ -75,6 +76,14 @@ const MAX_SOURCE_COMPONENTS: usize = 256;
 
 fn fail(code: ErrorCode, msg: &'static str) -> ExecError {
     ExecError::new(code, STAGE, msg)
+}
+
+/// 境界違反の失敗。違反記録（`ViolationReason`）を持たせ、子の状態チャネル経由で親の監査経路へ渡す
+/// （SEC-4。bind mount の段と同じ。`code` は理由が決める）。メッセージは固有のものを使う。
+fn violation(reason: ViolationReason, msg: &'static str) -> ExecError {
+    let mut err = ExecError::from_violation_at(reason, None, STAGE);
+    err.message = msg.into();
+    err
 }
 
 fn precondition(msg: &'static str) -> ExecError {
@@ -378,14 +387,14 @@ pub(super) fn judge_target(
     match etc {
         EtcDirState::Directory => {}
         EtcDirState::Missing => {
-            return Err(fail(
-                ErrorCode::InvalidArgument,
+            return Err(violation(
+                ViolationReason::PathMissing,
                 "the rootfs has no /etc directory for /etc/hosts or /etc/resolv.conf",
             ));
         }
         EtcDirState::Other => {
-            return Err(fail(
-                ErrorCode::InvalidArgument,
+            return Err(violation(
+                ViolationReason::PathSymlinkOrNotDirectory,
                 "/etc in the rootfs is a symbolic link or not a directory",
             ));
         }
@@ -396,12 +405,12 @@ pub(super) fn judge_target(
             "the rootfs is read-only and has no file for the container etc mount",
         )),
         TargetState::Missing => Ok(TargetAction::CreateThenMount),
-        TargetState::Symlink => Err(fail(
-            ErrorCode::InvalidArgument,
+        TargetState::Symlink => Err(violation(
+            ViolationReason::PathSymlinkOrNotDirectory,
             "the container etc mount destination is a symbolic link",
         )),
-        TargetState::Other => Err(fail(
-            ErrorCode::InvalidArgument,
+        TargetState::Other => Err(violation(
+            ViolationReason::BindTargetKindMismatch,
             "the container etc mount destination is not a regular file",
         )),
     }
@@ -592,13 +601,14 @@ fn apply_one(
     let dest = sys::open_path_nofollow(etc_ref, &name)
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(container etc target)"))?;
     if classify_target(&dest)? != TargetState::Regular {
-        return Err(fail(
-            ErrorCode::InvalidArgument,
+        return Err(violation(
+            ViolationReason::BindTargetKindMismatch,
             "the container etc mount destination is not a regular file",
         ));
     }
     if (deps.is_shared)(&dest)? {
-        return Err(precondition(
+        return Err(violation(
+            ViolationReason::TargetOnSharedMount,
             "the container etc mount destination is on a shared mount",
         ));
     }
@@ -618,7 +628,8 @@ fn apply_one(
     judge_flags(flags, read_only).map_err(precondition)?;
     let expected = host_root.join("etc").join(kind.file_name());
     if !(deps.still_at)(&dest, &expected) {
-        return Err(precondition(
+        return Err(violation(
+            ViolationReason::TargetMoved,
             "the container etc mount destination moved before the mount",
         ));
     }
@@ -813,6 +824,22 @@ mod tests {
                 "{t:?}"
             );
         }
+        // SEC-4: 境界違反は違反記録を持ち、親の監査経路へ渡る。
+        for (t, want) in [
+            (T::Symlink, ViolationReason::PathSymlinkOrNotDirectory),
+            (T::Other, ViolationReason::BindTargetKindMismatch),
+        ] {
+            let v = judge_target(E::Directory, t, false)
+                .expect_err("bad")
+                .violation
+                .expect("violation record");
+            assert_eq!(v.reason, want, "{t:?}");
+        }
+        let v = judge_target(E::Other, T::Regular, false)
+            .expect_err("bad etc")
+            .violation
+            .expect("violation record");
+        assert_eq!(v.reason, ViolationReason::PathSymlinkOrNotDirectory);
         for e in [E::Missing, E::Other] {
             assert_eq!(
                 judge_target(e, T::Regular, false)

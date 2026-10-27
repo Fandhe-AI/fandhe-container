@@ -310,7 +310,8 @@ mod linux {
             Err(SysError::Os(sys::ENOENT)) if !create => return Ok(None),
             Err(SysError::Os(sys::ENOENT)) => {
                 match sys::mkdir_at(root_fd.as_fd(), &name, DIR_MODE) {
-                    Ok(()) | Err(SysError::Os(sys::EEXIST)) => {}
+                    Ok(()) => fix_dir_mode(&root.join(ETC_DIR_NAME))?,
+                    Err(SysError::Os(sys::EEXIST)) => {}
                     Err(e) => return Err(sys_err(e)),
                 }
                 sync_dir(root);
@@ -324,6 +325,14 @@ mod linux {
         };
         check_private_dir(fd.as_fd(), euid)?;
         Ok(Some(fd))
+    }
+
+    /// 自分が作った直後のディレクトリのモードを `DIR_MODE` に固定する（`mkdir` は umask を受けるため。
+    /// 管理ディレクトリの 0700 は契約）。fd は O_PATH で `fchmod` できないためパスで行い、
+    /// 取り違えは直後の `check_private_dir`（fd 起点の所有者・モード検査）が拒否する。
+    fn fix_dir_mode(path: &Path) -> Result<(), TraitError> {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(DIR_MODE))
+            .map_err(|_| err(ErrorCode::Internal, "container etc files operation failed"))
     }
 
     /// ディレクトリの fsync（best-effort。耐久性のためで、分離の判断には使わない）。
@@ -364,7 +373,12 @@ mod linux {
         };
         let id_name = cstr(id.as_str())?;
         match sys::mkdir_at(etc_fd.as_fd(), &id_name, DIR_MODE) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Err(e) = fix_dir_mode(&root.join(ETC_DIR_NAME).join(id.as_str())) {
+                    let _ = sys::remove_dir_at(etc_fd.as_fd(), &id_name);
+                    return Err(e);
+                }
+            }
             Err(SysError::Os(sys::EEXIST)) => {
                 return Err(err(
                     ErrorCode::AlreadyExists,

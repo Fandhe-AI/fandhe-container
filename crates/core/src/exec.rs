@@ -885,7 +885,7 @@ pub enum IsolationStage {
 
 impl IsolationStage {
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Validate,
         Self::Unshare,
         Self::SetGroups,
@@ -917,6 +917,7 @@ impl IsolationStage {
         Self::WorkingDir,
         Self::ApplySysctls,
         Self::RootReadOnly,
+        Self::MountEtcFiles,
     ];
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
@@ -951,6 +952,7 @@ impl IsolationStage {
             Self::MountReadonlyPaths => "mount_readonly_paths",
             Self::MountMaskedPaths => "mount_masked_paths",
             Self::MountBinds => "mount_binds",
+            Self::MountEtcFiles => "mount_etc_files",
             Self::MountSysfs => "mount_sysfs",
             Self::WorkingDir => "working_dir",
             Self::ApplySysctls => "apply_sysctls",
@@ -3015,6 +3017,7 @@ mod tests {
             IsolationStage::WorkingDir => 28,
             IsolationStage::ApplySysctls => 29,
             IsolationStage::RootReadOnly => 30,
+            IsolationStage::MountEtcFiles => 31,
         }
     }
 
@@ -3031,7 +3034,7 @@ mod tests {
             );
             assert!(seen.insert(token), "duplicate {token}");
         }
-        assert_eq!(IsolationStage::ALL.len(), 31);
+        assert_eq!(IsolationStage::ALL.len(), 32);
         assert_eq!(
             IsolationStage::MountReadonlyPaths.as_str(),
             "mount_readonly_paths"

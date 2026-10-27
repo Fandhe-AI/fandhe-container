@@ -207,7 +207,7 @@ impl Bundle {
             .mode(0o700)
             .create(&dir)
             .map_err(|_| err())?;
-        let mut b = Self {
+        let b = Self {
             dir,
             removed: false,
         };
@@ -220,7 +220,6 @@ impl Bundle {
         f.write_all(config_json(rootfs).as_bytes())
             .map_err(|_| err())?;
         drop(f);
-        b.removed = false;
         Ok(b)
     }
 
@@ -452,6 +451,16 @@ mod tests {
         }
     }
 
+    /// `/bin/sh -c <body>` で動くフック定義を作る。`args[0]` は argv[0]（`$0`）。
+    /// 書き込み直後のスクリプトを exec すると、並列の別試験の fork が書き込み fd を
+    /// 持ち越す間に ETXTBSY（Text file busy）で間欠失敗するため、ファイルを作らない（REPAIR-12）。
+    fn mk_sh(body: &str, args: &[&str], env: &[&str], timeout: Option<i64>) -> Hook {
+        let a0 = args.first().copied().unwrap_or("h");
+        let mut v: Vec<&str> = vec![a0, "-c", body, a0];
+        v.extend(args.iter().skip(1).copied());
+        mk("/bin/sh", &v, env, timeout)
+    }
+
     fn state() -> CdiHookState {
         CdiHookState::new("c1", 4242).unwrap()
     }
@@ -461,16 +470,13 @@ mod tests {
     fn hook_receives_argv_state_and_env() {
         let t = Tmp::new("ok");
         let out = t.0.join("out.txt");
-        let sh = t.script(
-            "h.sh",
-            &format!(
-                "echo \"$1|$2\" > {o}\ncat >> {o}\necho >> {o}\ncat \"$(sed -n 's/.*\"bundle\":\"\\([^\"]*\\)\".*/\\1/p' {o} | head -1)/config.json\" >> {o}\nenv > {e}",
-                o = out.display(),
-                e = t.0.join("env.txt").display()
-            ),
+        let body = format!(
+            "echo \"$1|$2\" > {o}\ncat >> {o}\necho >> {o}\ncat \"$(sed -n 's/.*\"bundle\":\"\\([^\"]*\\)\".*/\\1/p' {o} | head -1)/config.json\" >> {o}\nenv > {e}",
+            o = out.display(),
+            e = t.0.join("env.txt").display()
         );
-        let hooks = validate_create_container_hooks(&[mk(
-            &sh,
+        let hooks = validate_create_container_hooks(&[mk_sh(
+            &body,
             &["nvidia-cdi-hook", "create-symlinks", "--x"],
             &["FOO=bar baz"],
             Some(10),
@@ -531,13 +537,10 @@ mod tests {
         let t = Tmp::new("fail");
         let m1 = t.0.join("m1");
         let m3 = t.0.join("m3");
-        let h1 = t.script("h1.sh", &format!("touch {}", m1.display()));
-        let h2 = t.script("h2.sh", "echo boom >&2; exit 1");
-        let h3 = t.script("h3.sh", &format!("touch {}", m3.display()));
         let hooks = validate_create_container_hooks(&[
-            mk(&h1, &["h1"], &[], None),
-            mk(&h2, &["h2"], &[], None),
-            mk(&h3, &["h3"], &[], None),
+            mk_sh(&format!("touch {}", m1.display()), &["h1"], &[], None),
+            mk_sh("echo boom >&2; exit 1", &["h2"], &[], None),
+            mk_sh(&format!("touch {}", m3.display()), &["h3"], &[], None),
         ])
         .unwrap();
         let stage = CdiHookStage::for_test(&t.0);
@@ -556,8 +559,9 @@ mod tests {
     #[test]
     fn times_out() {
         let t = Tmp::new("to");
-        let sh = t.script("slow.sh", "exec sleep 30");
-        let hooks = validate_create_container_hooks(&[mk(&sh, &["slow"], &[], Some(1))]).unwrap();
+        let hooks =
+            validate_create_container_hooks(&[mk_sh("exec sleep 30", &["slow"], &[], Some(1))])
+                .unwrap();
         let stage = CdiHookStage::for_test(&t.0);
         let start = Instant::now();
         let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();

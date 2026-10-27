@@ -39,7 +39,7 @@ I/O 共有層の SIGKILL 耐性試験（`crates/io/tests/crash_safety.rs`）を�
 ### この対照で示せる範囲
 
 - 示せること: FLUSH ACK が `persist` の成功の後にだけ返ること（SIGKILL 後の可視性として）、および計測の仕組み（ディスク照合）が損失を検出できること
-- 示せないこと: 電源断・カーネルクラッシュ後の媒体への永続化（IO-2）。再読込はページキャッシュ経由であり、この試験では検証していない。追跡は [#1965](https://github.com/Fandhe-AI/fandhe-container/issues/1965)
+- 示せないこと: 電源断・カーネルクラッシュ後の媒体への永続化（IO-2）。再読込はページキャッシュ経由であり、この試験では検証していない。追跡は [#1965](https://github.com/Fandhe-AI/fandhe-container/issues/1965)。検証方式の判断記録は [io-power-loss-verification.md](io-power-loss-verification.md)（オーナー承認待ち）
 
 ## 保証範囲
 
@@ -140,4 +140,4 @@ test other::io3_crash_test_server_reports_unsupported_platform ... ok
 - 解消（#1832）: 未フラッシュ対照が損失 0 で対照として働かない点は、試験専用 sink を相手役にした 2 ケースの対へ作り直して解消した。この対照で示せる範囲は上記「この対照で示せる範囲」のとおり
 - 未解決: 結果として tmpfs と実 FS のどちらを採用するか（本実測では差が出ていない）
 - 解消（#1833）: 有効試行数・損失件数を CI の実行結果（`GITHUB_STEP_SUMMARY`）へ出す仕組みを設けた。macOS の件数は main への push 後の `platform-ci (macos-latest)` の要約で確認できる。FLUSH ACK 非対応時は `persist_supported:false` が表と警告に出る
-- 未解決: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証をどのタスクで扱うか（追跡は [#1965](https://github.com/Fandhe-AI/fandhe-container/issues/1965)）
+- 未解決: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証をどのタスクで扱うか（追跡は [#1965](https://github.com/Fandhe-AI/fandhe-container/issues/1965)。方式の比較と推奨は [io-power-loss-verification.md](io-power-loss-verification.md)・オーナー承認待ち）

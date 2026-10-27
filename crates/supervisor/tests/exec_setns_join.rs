@@ -73,10 +73,10 @@
 //! AGENTS.md「実機前提テスト」）。実行された場合は拒否を含むあらゆる失敗を失敗として扱う。
 //! 範囲写像の helper ケース（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）の前提欠如（`newuidmap` / `newgidmap`・
 //! subuid / subgid）は、1 行目が `exec_setns_join: PRECONDITION FAILED (test environment, ...)` になる
-//! （分類元は `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
+//! （分類元は core の `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
 
 #[cfg(target_os = "linux")]
-#[path = "support/precondition.rs"]
+#[path = "../../core/tests/support/precondition.rs"]
 mod precondition;
 
 #[cfg(not(target_os = "linux"))]

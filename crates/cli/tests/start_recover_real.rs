@@ -16,7 +16,7 @@
 //!
 //! # 実機前提テストとしての分離
 //! 委譲 cgroup の前提欠如は 1 行目が `start_recover_real: PRECONDITION FAILED (test environment, ...)` になり、
-//! それ以外の失敗は `start_recover_real: FAILED: ...`（分類元は `tests/support/precondition.rs`。#2957・CLI-1・REPAIR-12）。
+//! それ以外の失敗は `start_recover_real: FAILED: ...`（分類元は core の `tests/support/precondition.rs`（cli は薄いアダプタ経由）。#2957・CLI-1・REPAIR-12）。
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。
 //!
 //! ```text

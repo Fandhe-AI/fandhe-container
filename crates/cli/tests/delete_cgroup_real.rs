@@ -29,7 +29,7 @@
 //! `XDG_RUNTIME_DIR`）。root では所有者の検証が省かれ照合の意味が変わるため、非 root で実行する。
 //!
 //! # 実機前提テストとしての分離
-//! 委譲 cgroup の前提欠如は 1 行目が `delete_cgroup_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `delete_cgroup_real: FAILED: ...`（分類元は `tests/support/precondition.rs`。#2957・CLI-1・REPAIR-12）。
+//! 委譲 cgroup の前提欠如は 1 行目が `delete_cgroup_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `delete_cgroup_real: FAILED: ...`（分類元は core の `tests/support/precondition.rs`（cli は薄いアダプタ経由）。#2957・CLI-1・REPAIR-12）。
 //! GitHub ホステッド runner では委譲 cgroup を前提にできないため、`-- --ignored` 指定時のみ実行する（ci.md
 //! 「実機前提テスト」。既定集合の試験を移したものではない。既定集合ではフェイクの remover を使う `stop_delete.rs` の
 //! 単体テストが照合する）。実行された場合は、前提が欠けていても失敗として扱い、検証せずに成功する分岐は持たない。

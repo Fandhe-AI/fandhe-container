@@ -468,7 +468,10 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 - 範囲外: 別の接続、Nack された要求、`Flush` より後に受信した要求
 - Linux
   - 接続ごと・デバイス（`st_dev`）ごとに番兵 fd を 1 本持ち、FLUSH ではデバイスごとに 1 回 `syncfs(番兵)` を発行する
-  - 番兵 fd は、そのデバイスで最初の Create の時点で、親ディレクトリのハンドルから `openat(parent, ".", O_DIRECTORY)` で新しく開く（新しい `struct file`）。その接続での最初の書き込みより前に開かれ、カーソルは自分の `syncfs` でしか進まないため、errseq の報告漏れが無い。既存の「sink ごとに自分の fd で発行し、他の sink の結果を流用しない」という理由づけと矛盾しない
+  - 番兵 fd は、そのデバイスで最初の Create の時点で、既存の祖先ディレクトリのハンドルから `openat(parent, ".", O_DIRECTORY)` で新しく開く（新しい `struct file`）。その接続での最初の書き込みより前に開かれ、カーソルは自分の `syncfs` でしか進まないため、errseq の報告漏れが無い。既存の「sink ごとに自分の fd で発行し、他の sink の結果を流用しない」という理由づけと矛盾しない
+  - 取得の順序（新設祖先を含む Create。例: 未存在の `a/b/file`）: 葉の親のハンドルは祖先の `mkdir` の後でないと得られないが、番兵 fd をその親から開くと、`mkdir` で生じたディレクトリの書き戻しエラーが errseq の初期値に取り込まれ、後の `syncfs` が報告しない恐れがある。そこで番兵 fd は、最初の `mkdir`・ファイル作成より前に、パスを先頭から辿って「存在する最も深い祖先」(`P0`。新設が不要なら葉の親そのもの。ルートは常に存在する) のハンドルから開く。新設する祖先は `P0` と同じマウントの中に作られるため、`P0` の `st_dev` が新設分を含む対象のデバイスと一致する（`mkdir` は親と同じ FS に作る。祖先の探索は `*_beneath` の `openat` + `O_NOFOLLOW` だけで行い、作成はしない）
+  - `GuestFileCreator` との連携（公開シグネチャは変えない）: `create_file` の本体を `pub(crate)` の内部関数 `create_file_inner(path, mode, pre_mutation)` に切り出す。`pre_mutation: &mut dyn FnMut(&DirHandle) -> Result<(), IoError>` は、`P0` を確定した直後、最初の `mkdir` またはファイル作成より前に 1 回だけ呼ばれる。`serve_file_connection` は `P0` の `st_dev` を引いて、そのデバイスの番兵 fd が接続の表になければここで `openat(P0, ".", O_DIRECTORY)` を開いて表へ入れる（上限 16 を超えるなら Nack `RESOURCE_EXHAUSTED`・reason `DeviceLimit` を返し、この時点では何も作っていないので取り消しは不要）。コールバックが失敗したら `create_file_inner` は何も作らずにそのエラーを返す。公開の `create_file` は no-op のコールバックで `create_file_inner` を呼ぶ
+  - 番兵 fd の取得に成功した後でのみ、`mkdir` とファイル作成を行う。この順序は既存の `create_beneath` の「存在する祖先を辿り、無ければ作る」手順と整合し、検証は「`mkdir` を伴う Create の直前に番兵 fd が表にある」ことを確認する結合試験で行う（実装 issue の受け入れ条件とする）
   - 番兵 fd は接続間で共有しない。他プロセスの書き戻しエラーを拾った場合は FlushAck を返さない側に倒れる（fail-closed）
   - 1 接続のデバイス数の上限は 16。超えた Create は Nack `RESOURCE_EXHAUSTED`（reason `DeviceLimit`）
   - Linux 5.8 未満は従来どおり `Unimplemented`

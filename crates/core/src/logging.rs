@@ -6,10 +6,10 @@
 //!
 //! # 位置づけと呼び出し元
 //!
-//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto` は移行済み（#3115）。残りの既存の出力（
-//! `observability` の手組み行・`oci_runtime::error`・`plugin_discovery`）は
+//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）と `observability` の op_stats は移行済み。残りの既存出力（
+//! `oci_runtime::error`・`plugin_discovery`）は
 //! まだ本型を使っておらず、移行は TASK-98.2（#653）で行う（REPAIR-3: 実装済みを装わない）。
-//! `legacy_tiocsti` の警告行は移行済み（#3117）。
+//! `legacy_tiocsti` の警告行は移行済み（#3117）。`observability` の op_stats の行も移行済み（#3116）。
 //!
 //! # 確定した設計判断
 //!
@@ -24,7 +24,7 @@
 //!   そのうえで LF / CR のバイトが無いことを防御として確かめ、末尾に LF をちょうど 1 つ付け、
 //!   `write_all` 1 回で書く。オブジェクトでない本体は flatten が失敗し `Encode` になる。
 //! - **予約キー**: 本体は `level` / `event` を持たない契約とする。持つと重複キーになる
-//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、残りは TASK-98.2）。
+//!   （検出は各 DTO の試験の責務。監査は file_writer の試験で検出済み〔#3115〕、op_stats は `observability` の試験で照合済み〔#3116〕、残りは TASK-98.2）。
 //! - **表示を乱す文字**（Cf・Zl・Zp 等）の置換は封筒の責務ではなく、各本体が前処理する。
 //! - 資格情報・ホストの機密値をフィールドに入れない。出力先の権限は呼び出し元が決める。
 //!

@@ -120,7 +120,8 @@ fn merge_env_entries(base: &[String], cdi: &EnvList) -> Result<CdiProcessEnv, Cd
         }
     }
 
-    let mut out: Vec<String> = base.to_vec();
+    // 借用参照だけで合成後の列を決め、合計バイトを検証してから String を複製する（確保前の上限検証）。
+    let mut out: Vec<&str> = base.iter().map(String::as_str).collect();
     // キー -> 最後の出現位置（上流の createEnvCacheMap と同じ）。
     let mut index: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, item) in base.iter().enumerate() {
@@ -134,7 +135,7 @@ fn merge_env_entries(base: &[String], cdi: &EnvList) -> Result<CdiProcessEnv, Cd
                 let slot = out
                     .get_mut(pos)
                     .ok_or_else(|| e(Code::Internal, "env index out of range"))?;
-                *slot = item.clone();
+                *slot = item.as_str();
                 replaced += 1;
             }
             None => {
@@ -142,21 +143,22 @@ fn merge_env_entries(base: &[String], cdi: &EnvList) -> Result<CdiProcessEnv, Cd
                     return Err(e(Code::ResourceExhausted, "too many env entries"));
                 }
                 index.insert(key, out.len());
-                out.push(item.clone());
+                out.push(item.as_str());
                 appended += 1;
             }
         }
     }
 
-    let total = out
-        .iter()
-        .try_fold(0usize, |acc, s| acc.checked_add(s.len())?.checked_add(1));
+    let total = out.iter().try_fold(0usize, |acc, s: &&str| {
+        acc.checked_add(s.len())?.checked_add(1)
+    });
     match total {
         Some(t) if t <= CDI_APPLY_MAX_ENV_TOTAL_BYTES => {}
         _ => return Err(e(Code::ResourceExhausted, "env total size is too large")),
     }
+    let env: Vec<String> = out.into_iter().map(str::to_owned).collect();
     Ok(CdiProcessEnv {
-        env: out,
+        env,
         replaced,
         appended,
     })
@@ -240,6 +242,18 @@ mod tests {
             assert_eq!(err.code(), Code::InvalidArgument);
             assert_eq!(err.message(), msg);
         }
+    }
+
+    /// GPU-2: 巨大な base 1 件 + 空の edits は合計上限で拒否される（上限検証後にだけ複製する）。
+    #[test]
+    fn gpu2_task127_4_huge_base_rejected_before_copy() {
+        let huge = vec![format!(
+            "K={}",
+            "x".repeat(CDI_APPLY_MAX_ENV_TOTAL_BYTES + 1)
+        )];
+        let err = merge_env_entries(&huge, &EnvList::from_entries(Vec::new())).unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        assert_eq!(err.message(), "env total size is too large");
     }
 
     /// GPU-2: 件数・要素長・合計バイトの境界。

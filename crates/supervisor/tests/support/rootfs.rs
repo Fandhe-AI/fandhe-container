@@ -5,10 +5,10 @@
 //! 対象にならない）。試験バイナリ自身を rootfs の `/probe`（別 inode のコピー。ランタイム自身のバイナリを exec
 //! させない）へ置き、動的ローダ（ELF の `PT_INTERP`）と読み込み済みの共有ライブラリを同じ絶対パスへコピーする。
 //!
-//! 置き場所の判断: 利用元が同じ crate なので `crates/supervisor/tests/support/` に置き、crate はまたがない。
-//! core の `tests/support/real_entry.rs`・`tests/production_launcher.rs`、cli の `tests/start_stop_delete_real.rs`、
-//! `benches/src/startup_latency/bundle.rs` に似た部品があるが、契約（`Result` を返すか panic か・symlink を辿らない
-//! `mkdir`・`/entry` の命名・core の API への依存）が違うため今回はまとめない（別 issue で扱う）。
+//! 置き場所の判断: 組み立て部品の本体は core の `tests/support/minimal_rootfs.rs`（組み立て）と `loader_deps.rs`
+//! （ELF の `PT_INTERP`・maps の解析）に集約済みで、core・supervisor・cli・benches が `#[path]` で共有する
+//! （`scratch_root.rs` の前例どおり。依存は増えない）。本ファイルはその薄い包みで、supervisor の 2 本の試験に固有の
+//! `/probe` の命名と `proc/` の有無（`ProcDir`）だけを持つ（#2963・REPAIR-1）。
 //!
 //! 契約: 失敗はすべて panic。ELF の読み取り（外部入力）は共有部品が `get()` と checked 演算で検査する。
 

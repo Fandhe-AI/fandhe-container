@@ -44,7 +44,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 ## シナリオ 1（主）: 端末からの本番の start、観察、delete
 
-どの自動試験も本番の `start` から `delete` までを通していないため、手作業で補う（受け入れ条件 1・3）。`<root>`・`<bundle>`・`<id>` は置き換える。
+`start_stop_delete_real`（#2450）は委譲スコープの中から本番の `start` から `delete` までを自動で通し、CI でも回っている（下の「CI での先行観測」）。ただし端末の session scope から `start` する本シナリオと、利用者の実機の版での確認は自動試験に無いため、手作業で補う（受け入れ条件 1・3）。`<root>`・`<bundle>`・`<id>` は置き換える。
 
 1. 実行前に自分のシェルの cgroup を記録する: `cat /proc/self/cgroup`
 2. 作成と起動:
@@ -70,20 +70,27 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
    - supervisor の scope の `cgroup.procs` に CLI がいない。CLI は既に終了している
    - `systemctl --user list-units --type=scope` に新しい scope がある
    - `state.json` の `cgroupScope`・`cgroupInstance`
-5. 後始末: `stop`（`run_stop`）は `ControlSignaler` と supervisor の制御チャネルで SIGTERM を送る。実装済みなのはこの SIGTERM の送達までで、猶予後の SIGKILL や停止完了の確認などは未実装（#1544）のため、停止しないときがある。止まらないプロセスを止めるときは [runbook の後始末](supervisor-measurement-runbook.md#実行後の確認)と同じく、pid と起動時刻の一致を確かめてから送る（pid 再利用による誤 kill を避ける）。その後 `delete <id>` を実行する。通常の端末（SSH・TTY の root 所有 session scope）のシェルからの `delete` は `DelegatedCgroup::detect` が失敗し、記録済み scope を使う削除へ進めず、cgroup と状態記録が残る。これは本確認の前提不備であり、`prepare` の回帰とは区別して記録する。後始末は `systemd-run --user --scope -p Delegate=yes -- "$BIN_DIR/fandhe-container" --root <root> delete <id>` で包んで実行する。その終了コードを記録し、cgroup・`state.json`・scope の残骸が無いことを確かめる。`cgroup.procs` が空でない状態の `delete` が `FAILED_PRECONDITION` で拒否されるのは仕様どおり（`delete_cgroup_real` のシナリオ B）
+5. 後始末: `stop`（`run_stop`）は `ControlSignaler` と supervisor の制御チャネルで SIGTERM を送る。実装済みなのはこの SIGTERM の送達までで、猶予後の SIGKILL や停止完了の確認などは未実装（#1545 で追う）のため、停止しないときがある。止まらないプロセスを止めるときは [runbook の後始末](supervisor-measurement-runbook.md#実行後の確認)と同じく、pid と起動時刻の一致を確かめてから送る（pid 再利用による誤 kill を避ける）。その後 `delete <id>` を実行する。通常の端末（SSH・TTY の root 所有 session scope）のシェルからの `delete` は `DelegatedCgroup::detect` が失敗し、記録済み scope を使う削除へ進めず、cgroup と状態記録が残る。これは本確認の前提不備であり、`prepare` の回帰とは区別して記録する。後始末は `systemd-run --user --scope -p Delegate=yes -- "$BIN_DIR/fandhe-container" --root <root> delete <id>` で包んで実行する。その終了コードを記録し、cgroup・`state.json`・scope の残骸が無いことを確かめる。`cgroup.procs` が空でない状態の `delete` が `FAILED_PRECONDITION` で拒否されるのは仕様どおり（`delete_cgroup_real` のシナリオ B）
 6. 副次の変種（任意）: `systemd-run --user --scope -p Delegate=yes -- <シェル>` で作った scope の中のシェルから 1〜5 を行う
+
+## CI での先行観測
+
+`start_stop_delete_real` は #2596 以降、`platform-ci` の ubuntu-latest が `systemd-run --user --scope --quiet -p Delegate=yes --` の中で毎回実行し、成功行を `scripts/check-success-lines.sh` で完全一致照合している（job の緑だけを根拠にしない）。これは参考であり、受け入れ条件 1 の記録の代わりにならない。理由は次のとおり。
+
+- 委譲スコープの中から `start` する変種で、端末の session scope から `start` する主シナリオとは別物である
+- 人間の実機の OS・カーネル・systemd の版での結果ではない
 
 ## シナリオ 2: 実機前提試験の実行
 
 どれも `harness = false` で、`cargo test -p <パッケージ> --test <名前> --no-run` でビルドし、出力された試験バイナリを `cargo` 経由でなく直接実行する。前提が欠けると skip でなく失敗する。起動の仕方の取り違えに注意する。成功時の最終行は [AGENTS.md](../../AGENTS.md)「実機前提テスト」と同じ。
 
-| 試験 | パッケージ | 起動の仕方 | 成功時の最終行 |
-| ---- | ---------- | ---------- | -------------- |
-| `start_scope_real`（#2081） | `fandhe-container-cli` | **包まず**直接 `<bin> --ignored`（同居する cgroup から実行しないと感度の確認が逆になる） | `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted` |
-| `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` |
-| `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` |
-| `start_stop_delete_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored`（CLI の実バイナリだけで create → start → list → logs → stop → delete を通す。#2450） | `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs` |
-| `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | AGENTS.md の該当行を参照 |
+| 試験 | パッケージ | 起動の仕方 | 成功時の最終行 | CI での実行 |
+| ---- | ---------- | ---------- | -------------- | ----------- |
+| `start_scope_real`（#2081） | `fandhe-container-cli` | **包まず**直接 `<bin> --ignored`（同居する cgroup から実行しないと感度の確認が逆になる） | `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted` | なし（人間が実行） |
+| `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` | なし（人間が実行） |
+| `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` | なし（人間が実行） |
+| `start_stop_delete_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored`（CLI の実バイナリだけで create → start → list → logs → stop → delete を通す。#2450） | `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs` | あり（platform-ci の ubuntu。#2596） |
+| `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | AGENTS.md の該当行を参照 | あり（platform-ci の ubuntu。#2596） |
 
 ## 結果記録の雛形
 
@@ -104,6 +111,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 | `start_recover_real`（任意） | (記入) |
 | `start_stop_delete_real`（任意） | 一致 / 不一致（出力の末尾。`scope_present_before_delete` の値も記入） |
 | 後始末で残骸が無いこと | (記入) |
+| CI の先行観測（参考。判定には使わない） | 直近の main の CI の `start_stop_delete_real` 最終行の一致 / 不一致 |
 | 判定 | 成功 / prepare で拒否 / その他の失敗 |
 
 ## 拒否・失敗したときの扱い
@@ -119,4 +127,4 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 ## 後続
 
-本番の `start` から `stop`・`delete` までの自動の通し試験 `start_stop_delete_real` を追加した（#2450）。実行と結果の記録は人間担当（#2062・#1621）で、作成時は未実行。
+本番の `start` から `stop`・`delete` までの自動の通し試験 `start_stop_delete_real` を追加した（#2450）。CI では #2596 以降実行している。手元の実機での実行と結果の記録は人間担当（#2062・#1621）。

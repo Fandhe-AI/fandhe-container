@@ -1224,7 +1224,7 @@ expect_contains "mode-invalid-error" "invalid-mode"
 expect_rc "mode-duplicate" 2 --mode oci --mode docker --runtime "$stub" --bundle "$work/bundle"
 expect_rc "mode-oci-explicit" 0 --mode oci --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_eq "oci-mode-field" "oci" "$(jq -r '.mode' <<<"$last_stdout")"
-expect_eq "oci-method-field" "create-to-exec-observed" "$(jq -r '.method' <<<"$last_stdout")"
+expect_eq "oci-method-field" "cli-create-to-exec-observed" "$(jq -r '.method' <<<"$last_stdout")"
 expect_eq "oci-no-image-param" "false" "$(jq -r '.params | has("image")' <<<"$last_stdout")"
 oci_json="$last_stdout"
 
@@ -1246,7 +1246,7 @@ default_args=()
 own_fixture="$work/own-fixture.json"
 docker_fixture="$work/docker-fixture.json"
 cat >"$own_fixture" <<'JSON'
-{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":230000},{"total_us":240000},{"total_us":250000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
+{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"cli-create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":230000},{"total_us":240000},{"total_us":250000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
 JSON
 cat >"$docker_fixture" <<'JSON'
 {"schema_version":1,"benchmark":"startup_latency","mode":"docker","method":"docker-run-rm-total","target":"docker","label":"docker","params":{"iterations":3,"warmup":1,"timeout_secs":10,"image":"alpine:3.20"},"samples_us":[{"run_us":290000,"total_us":290000},{"run_us":300000,"total_us":300000},{"run_us":310000,"total_us":310000}],"metrics":{"startup_latency_p50_ms":{"value":300,"unit":"ms"},"startup_latency_min_ms":{"value":290,"unit":"ms"},"startup_latency_max_ms":{"value":310,"unit":"ms"}}}
@@ -1279,8 +1279,10 @@ expect_rc "report-mode-swapped" 2 --mode report --own-result "$docker_fixture" -
 jq '.method = "docker-run-rm-total"' "$own_fixture" >"$work/bad-method-own.json"
 expect_rc "report-method-forged-same" 2 --mode report --own-result "$work/bad-method-own.json" --docker-result "$docker_fixture"
 expect_contains "report-method-forged-error" "invalid-result"
-jq '.method = "create-to-exec-observed"' "$docker_fixture" >"$work/bad-method-docker.json"
+jq '.method = "cli-create-to-exec-observed"' "$docker_fixture" >"$work/bad-method-docker.json"
 expect_rc "report-method-forged-docker" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-method-docker.json"
+jq '.method = "create-to-exec-observed"' "$own_fixture" >"$work/bad-method-legacy.json"
+expect_rc "report-method-legacy-rejected" 2 --mode report --own-result "$work/bad-method-legacy.json" --docker-result "$docker_fixture"
 jq '.method = "other"' "$own_fixture" >"$work/bad-method-other.json"
 expect_rc "report-method-unknown" 2 --mode report --own-result "$work/bad-method-other.json" --docker-result "$docker_fixture"
 # samples_us と整合しない p50・件数不一致・不正なサンプルは拒否する（p50 だけの書き換えを防ぐ）。

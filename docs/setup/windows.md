@@ -105,6 +105,16 @@ virtiofs に必要な WSL の最小バージョンは、根拠となる資料が
 
 未検証の注記（REPAIR-3）: `[wsl2]` の `virtiofs=true` というキーの配置と、drvfs のマウントが virtiofs で成立するかは Windows 実機で未検証（WIN-2 の再検証条件 1。手順は TASK-67.6〔#377〕）。なお現状、実装が `.wslconfig` を自動で書く経路は本番コードに配線されていない（`.wslconfig` を確認・設定するのはホストの起動役で、まだ配線されていない。構成は [windows-execution-layout.md](../design/windows-execution-layout.md)〔設計ドラフト・承認待ち〕）ため、手作業で設定する。
 
+## ゲスト側の前提（共有マウントの解除。SEC-1・WIN-1）
+
+共有マウントの解除では、ゲスト内のスクリプトがマウント先のパスを実際に開いた fd の `mnt_id`（`/proc/self/fdinfo/<fd>`）を記録値と照合してから `umount` する。祖先（`/mnt/fandhe` 等）に別のマウントが重ねられても、別のマウントを外さないための確認である（不一致は外さず終了コード 214、準備の自己後始末では 210。#2973）。ゲストに次を求める。
+
+- 既定ディストリビューション（Ubuntu）の `/bin/sh`（dash。bash でも動く）
+- util-linux の `flock`・`mount`・`umount`、coreutils の `stat`
+- fdinfo に `mnt_id:` 行があるカーネル（Linux 3.15 以降。WSL2 のカーネルは満たす）
+
+未検証の注記（REPAIR-3）: busybox 系など `/bin/sh` が dash でないディストリビューションと、Windows 実機の WSL2 ゲストでの動作は未検証。実機確認は人間担当の [#1629](https://github.com/Fandhe-AI/fandhe-container/issues/1629) で行う。
+
 ## virtiofs が使えないとき（9P フォールバック）
 
 - 既定の `TransportPolicy::PreferVirtiofs` では、警告を出したうえで 9P に切り替えて続行する（暗黙には降格しない）

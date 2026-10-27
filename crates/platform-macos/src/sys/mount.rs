@@ -6,8 +6,8 @@
 //! 呼び出し文脈: `config` の ReadWrite 共有の走査が、配下のディレクトリが共有ルートと同じマウントに
 //! 属するかを [`mount_identity`] で照合する（MAC-1・TASK-65.1）。`st_dev` だけでは同一デバイス上の
 //! 別マウント（nullfs 等）を見分けられないため、カーネルが返すマウント先（`f_mntonname`）と
-//! `f_fsid` を比較する。`libc` / `nix` は依存追加が禁止（dependency-policy）のため、`posix.rs` と同じ流儀で
-//! 必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
+//! `f_fsid` を比較する。`libc` / `nix` は製品の依存に入れない（dependency-policy。`libc` は dev-dependencies で照合にだけ使う。#1318）ため、
+//! `posix.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で持つ。`libc` との機械照合は子 `libc_abi` で行う（#1844）。
 //!
 //! 不変条件: `unsafe fn` を公開しない。公開するのは安全な [`mount_identity`]（`pub(crate)`）のみ。
 
@@ -139,4 +139,67 @@ mod tests {
         let err = mount_identity(Path::new("/nonexistent-fandhe-mount-test")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
+}
+
+#[cfg(test)]
+mod libc_abi {
+    //! 自前の宣言を `libc` 0.2.189 と `const` 評価で照合する（#1844・MAC-1・MVM-4・REPAIR-12）。関数は呼ばない。
+    //! 親モジュールと同じ cfg（macOS の x86_64 / aarch64）の下にあり、ターゲットごとの `libc` の値と比べる。
+    //!
+    //! 対象外（理由つき）:
+    //! - `MFSTYPENAMELEN`: `libc` に対応物が無い（一次情報は macOS SDK の `<sys/mount.h>` の
+    //!   `#define MFSTYPENAMELEN 16`）。代わりに `libc::statfs` の `f_fstypename` と `f_mntonname` の
+    //!   オフセット差（配列の幅）で間接的に照合する
+    //! - `statfs` の `link_name`: 型では照合できない。自前は `target_arch = "x86_64"` で `statfs$INODE64`、
+    //!   `libc` は `not(target_arch = "aarch64")` で同じ名前。親の `compile_error!` で x86_64 / aarch64 に限るため、
+    //!   対応する 2 アーキでは同じシンボルになる
+    //! - `MountIdentity`・`mount_identity`・`bytes_until_nul`: FFI ではない安全なラッパー
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// `libc` の `c_int` を `usize` へ広げる。負値は拒否する（切り詰めを隠さない）。
+    const fn widen(v: libc::c_int) -> usize {
+        assert!(v >= 0);
+        v as usize
+    }
+
+    const _: () = {
+        assert!(MAXPATHLEN == widen(libc::MAXPATHLEN));
+        // `MFSTYPENAMELEN` の間接照合（上記の対象外を参照）。
+        assert!(
+            offset_of!(libc::statfs, f_mntonname) - offset_of!(libc::statfs, f_fstypename)
+                == MFSTYPENAMELEN * size_of::<libc::c_char>()
+        );
+
+        assert!(size_of::<Statfs>() == size_of::<libc::statfs>());
+        assert!(align_of::<Statfs>() == align_of::<libc::statfs>());
+        assert!(offset_of!(Statfs, f_bsize) == offset_of!(libc::statfs, f_bsize));
+        assert!(offset_of!(Statfs, f_iosize) == offset_of!(libc::statfs, f_iosize));
+        assert!(offset_of!(Statfs, f_blocks) == offset_of!(libc::statfs, f_blocks));
+        assert!(offset_of!(Statfs, f_bfree) == offset_of!(libc::statfs, f_bfree));
+        assert!(offset_of!(Statfs, f_bavail) == offset_of!(libc::statfs, f_bavail));
+        assert!(offset_of!(Statfs, f_files) == offset_of!(libc::statfs, f_files));
+        assert!(offset_of!(Statfs, f_ffree) == offset_of!(libc::statfs, f_ffree));
+        assert!(offset_of!(Statfs, f_fsid) == offset_of!(libc::statfs, f_fsid));
+        assert!(offset_of!(Statfs, f_owner) == offset_of!(libc::statfs, f_owner));
+        assert!(offset_of!(Statfs, f_type) == offset_of!(libc::statfs, f_type));
+        assert!(offset_of!(Statfs, f_flags) == offset_of!(libc::statfs, f_flags));
+        assert!(offset_of!(Statfs, f_fssubtype) == offset_of!(libc::statfs, f_fssubtype));
+        assert!(offset_of!(Statfs, f_fstypename) == offset_of!(libc::statfs, f_fstypename));
+        assert!(offset_of!(Statfs, f_mntonname) == offset_of!(libc::statfs, f_mntonname));
+        assert!(offset_of!(Statfs, f_mntfromname) == offset_of!(libc::statfs, f_mntfromname));
+        assert!(offset_of!(Statfs, f_flags_ext) == offset_of!(libc::statfs, f_flags_ext));
+        assert!(offset_of!(Statfs, f_reserved) == offset_of!(libc::statfs, f_reserved));
+
+        // 型の書き方が違う 2 フィールド。`fsid_t` の中身は非公開（`__fsid_val: [i32; 2]`）のため、
+        // サイズとアラインメントだけを照合する。
+        assert!(size_of::<[i32; 2]>() == size_of::<libc::fsid_t>());
+        assert!(align_of::<[i32; 2]>() == align_of::<libc::fsid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::uid_t>());
+    };
+
+    // 関数の型（引数・戻り値）。構造体の同一性は上の `Statfs` の照合が保証する。
+    const _: unsafe extern "C" fn(*const libc::c_char, *mut Statfs) -> libc::c_int = statfs;
+    const _: unsafe extern "C" fn(*const libc::c_char, *mut libc::statfs) -> libc::c_int =
+        libc::statfs;
 }

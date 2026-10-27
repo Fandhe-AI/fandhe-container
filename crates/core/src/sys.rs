@@ -243,6 +243,252 @@ mod sysno {
 }
 use sysno::{ArchSysNo, SyscallNumber};
 
+/// 自前の定数と `libc` の定数を `const` 評価で 1 件照合する試験専用マクロ（#1848・#1837・#1318・MVM-4・
+/// REPAIR-7・REPAIR-12）。`consts::libc_abi`（arch ごと）・最上位の `libc_abi`・`seccomp_notify::libc_abi`・
+/// から、そのモジュールの `super::<名前>` と `libc::<名前>` を比べるために使う（`sys/macos.rs` は別ファイルのため複製を持つ）。
+///
+/// 両辺の型を引数で明記する。`libc` 側の型（`c_int`・`c_uint`・`c_ulong`・`Ioctl` 等）が将来変わったときは
+/// E0308 で表に出る。比較は `as i128` で行い、これは 64 bit 以下の整数同士では値を切り詰めない（符号の違う
+/// 型も値のまま比べる）ので、幅の違いが食い違いを隠すことはない。食い違いは宣言を直す別 issue とし、
+/// 試験側を宣言に合わせて通さない。関数は呼ばず `unsafe` を使わない。
+#[cfg(test)]
+macro_rules! libc_const_eq {
+    ($own:path, $own_ty:ty, $lib:path, $lib_ty:ty) => {{
+        const OWN: $own_ty = $own;
+        const LIB: $lib_ty = $lib;
+        assert!(
+            OWN as i128 == LIB as i128,
+            concat!("libc mismatch: ", stringify!($own))
+        );
+    }};
+    ($name:ident, $own_ty:ty, $lib_ty:ty) => {
+        libc_const_eq!(super::$name, $own_ty, libc::$name, $lib_ty)
+    };
+}
+
+/// x86_64・aarch64 の `consts` が持つ番号以外の定数を `libc` と照合する一覧（#1848）。両 arch の
+/// `consts::libc_abi` から展開し、`super::` はその arch の `consts`、`libc::` はそのターゲットの `libc`
+/// を指す（他 arch の値は流用しない）。
+///
+/// `libc` に対応物が無く対象外とするもの（一次情報は Linux カーネルのヘッダ）。
+/// - fs magic: `BINFMTFS_MAGIC`・`CONFIGFS_MAGIC`・`EFIVARFS_MAGIC`・`FUSE_CTL_SUPER_MAGIC`・
+///   `MQUEUE_MAGIC`・`PSTOREFS_MAGIC`（include/uapi/linux/magic.h と各 fs の定義）
+/// - `BINDERFS_SUPER_MAGIC`（`libc` は gnu・uclibc にしか持たないため、gnu に限って照合する）
+/// - `ST_VALID`（include/linux/statfs.h）
+/// - bpf: `BPF_PROG_LOAD`・`BPF_PROG_ATTACH`・`BPF_PROG_QUERY`・`BPF_PROG_TYPE_CGROUP_DEVICE`・
+///   `BPF_CGROUP_DEVICE`・`BPF_LOG_LEVEL1`（include/uapi/linux/bpf.h・include/linux/bpf_verifier.h）
+/// - `KCMP_VM`（include/uapi/linux/kcmp.h。`libc` では FreeBSD にしか無い）・`KEXEC_SEGMENT_MAX`
+///   （include/linux/kexec.h）
+/// - Landlock: `LANDLOCK_CREATE_RULESET_VERSION`・`LANDLOCK_RULE_PATH_BENEATH`・
+///   `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`（include/uapi/linux/landlock.h）
+/// - `LINUX_CAPABILITY_VERSION_3`（include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`）
+///
+/// 環境（`target_env`）で `libc` の型が変わる `Ioctl` 型（`NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`）・
+/// `RLIMIT_*`・`PTRACE_CONT` は gnu に限って照合する。musl は `libc` の型が `c_int` で、
+/// `TIOCGPTN`（0x8004_5430）が負の値になるため、`as` の読み替えで通さず対象外とする
+/// （core は musl 向けに CI でビルドしない）。
+#[cfg(test)]
+macro_rules! libc_consts_checks {
+    () => {
+        const _: () = {
+            use libc::{c_int, c_long, c_short, c_uint, c_ulong};
+            libc_const_eq!(CLONE_FS, i32, c_int);
+            libc_const_eq!(CLONE_NEWNS, i32, c_int);
+            libc_const_eq!(CLONE_NEWUTS, i32, c_int);
+            libc_const_eq!(CLONE_NEWIPC, i32, c_int);
+            libc_const_eq!(CLONE_NEWUSER, i32, c_int);
+            libc_const_eq!(CLONE_NEWPID, i32, c_int);
+            libc_const_eq!(CLONE_NEWNET, i32, c_int);
+            libc_const_eq!(MS_RDONLY, u64, c_ulong);
+            libc_const_eq!(MS_NOSUID, u64, c_ulong);
+            libc_const_eq!(MS_NODEV, u64, c_ulong);
+            libc_const_eq!(MS_NOEXEC, u64, c_ulong);
+            libc_const_eq!(MS_BIND, u64, c_ulong);
+            libc_const_eq!(MS_REC, u64, c_ulong);
+            libc_const_eq!(MS_PRIVATE, u64, c_ulong);
+            libc_const_eq!(MS_SLAVE, u64, c_ulong);
+            libc_const_eq!(MNT_DETACH, i32, c_int);
+            libc_const_eq!(FSOPEN_CLOEXEC, u32, c_uint);
+            libc_const_eq!(FSMOUNT_CLOEXEC, u32, c_uint);
+            libc_const_eq!(FSCONFIG_SET_FLAG, u32, libc::fsconfig_command);
+            libc_const_eq!(FSCONFIG_SET_STRING, u32, libc::fsconfig_command);
+            libc_const_eq!(FSCONFIG_CMD_CREATE, u32, libc::fsconfig_command);
+            libc_const_eq!(MOUNT_ATTR_RDONLY, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NOSUID, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NODEV, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NOEXEC, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_STRICTATIME, u32, u64);
+            libc_const_eq!(MOVE_MOUNT_F_EMPTY_PATH, u32, c_uint);
+            libc_const_eq!(MOVE_MOUNT_T_EMPTY_PATH, u32, c_uint);
+            libc_const_eq!(OPEN_TREE_CLONE, u32, c_uint);
+            libc_const_eq!(OPEN_TREE_CLOEXEC, u32, c_uint);
+            // `open_tree`・`mount_setattr` 用に u32 で持つ `AT_*`。名前が `libc` と違う（`libc` は `AT_EMPTY_PATH`・`AT_RECURSIVE`）。
+            libc_const_eq!(
+                super::OPEN_TREE_AT_EMPTY_PATH,
+                u32,
+                libc::AT_EMPTY_PATH,
+                c_int
+            );
+            libc_const_eq!(
+                super::OPEN_TREE_AT_RECURSIVE,
+                u32,
+                libc::AT_RECURSIVE,
+                c_int
+            );
+            libc_const_eq!(
+                super::MOUNT_SETATTR_AT_EMPTY_PATH,
+                u32,
+                libc::AT_EMPTY_PATH,
+                c_int
+            );
+            libc_const_eq!(
+                super::MOUNT_SETATTR_AT_RECURSIVE,
+                u32,
+                libc::AT_RECURSIVE,
+                c_int
+            );
+            libc_const_eq!(CLOSE_RANGE_CLOEXEC, i64, c_uint);
+            libc_const_eq!(WNOHANG, i32, c_int);
+            libc_const_eq!(SIGKILL, i32, c_int);
+            libc_const_eq!(SIGPIPE, i32, c_int);
+            libc_const_eq!(SIGCHLD, i32, c_int);
+            libc_const_eq!(SIGTERM, i32, c_int);
+            libc_const_eq!(O_DIRECTORY, i32, c_int);
+            libc_const_eq!(O_NOFOLLOW, i32, c_int);
+            libc_const_eq!(O_CLOEXEC, i32, c_int);
+            libc_const_eq!(O_PATH, i32, c_int);
+            libc_const_eq!(O_NONBLOCK, i32, c_int);
+            libc_const_eq!(O_RDWR, i32, c_int);
+            libc_const_eq!(O_NOCTTY, i32, c_int);
+            libc_const_eq!(O_RDONLY, i32, c_int);
+            libc_const_eq!(O_WRONLY, i32, c_int);
+            libc_const_eq!(O_CREAT, i32, c_int);
+            libc_const_eq!(O_EXCL, i32, c_int);
+            libc_const_eq!(AT_REMOVEDIR, i32, c_int);
+            libc_const_eq!(EBUSY, i32, c_int);
+            libc_const_eq!(ENOTEMPTY, i32, c_int);
+            // `statfs.f_type` の magic。`libc` は s390x 以外で `c_long`（= i64）。
+            libc_const_eq!(CGROUP2_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(SYSFS_MAGIC, i64, c_long);
+            libc_const_eq!(DEBUGFS_MAGIC, i64, c_long);
+            libc_const_eq!(TRACEFS_MAGIC, i64, c_long);
+            libc_const_eq!(SECURITYFS_MAGIC, i64, c_long);
+            libc_const_eq!(CGROUP_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(BPF_FS_MAGIC, i64, c_long);
+            libc_const_eq!(SELINUX_MAGIC, i64, c_long);
+            libc_const_eq!(SMACK_MAGIC, i64, c_long);
+            libc_const_eq!(RDTGROUP_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(XENFS_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(NSFS_MAGIC, i64, c_long);
+            libc_const_eq!(ST_NOEXEC, i64, c_ulong);
+            libc_const_eq!(ST_NODEV, i64, c_ulong);
+            libc_const_eq!(ST_RDONLY, i64, c_ulong);
+            libc_const_eq!(ST_NOSUID, i64, c_ulong);
+            libc_const_eq!(AT_EMPTY_PATH, i64, c_int);
+            libc_const_eq!(AT_EXECVE_CHECK, i64, c_int);
+            libc_const_eq!(MFD_CLOEXEC, u32, c_uint);
+            libc_const_eq!(MFD_ALLOW_SEALING, u32, c_uint);
+            libc_const_eq!(MFD_EXEC, u32, c_uint);
+            libc_const_eq!(MFD_NOEXEC_SEAL, u32, c_uint);
+            libc_const_eq!(F_ADD_SEALS, i32, c_int);
+            libc_const_eq!(F_GET_SEALS, i32, c_int);
+            libc_const_eq!(F_SEAL_SEAL, u32, c_int);
+            libc_const_eq!(F_SEAL_SHRINK, u32, c_int);
+            libc_const_eq!(F_SEAL_GROW, u32, c_int);
+            libc_const_eq!(F_SEAL_WRITE, u32, c_int);
+            libc_const_eq!(F_SEAL_EXEC, u32, c_int);
+            libc_const_eq!(F_GETFD, i32, c_int);
+            libc_const_eq!(F_SETFD, i32, c_int);
+            libc_const_eq!(F_GETFL, i32, c_int);
+            libc_const_eq!(F_SETFL, i32, c_int);
+            libc_const_eq!(FD_CLOEXEC, i32, c_int);
+            libc_const_eq!(F_DUPFD_CLOEXEC, i32, c_int);
+            libc_const_eq!(EPERM, i32, c_int);
+            libc_const_eq!(ENOENT, i32, c_int);
+            libc_const_eq!(EACCES, i32, c_int);
+            libc_const_eq!(EEXIST, i32, c_int);
+            libc_const_eq!(ENOTDIR, i32, c_int);
+            libc_const_eq!(EINVAL, i32, c_int);
+            libc_const_eq!(EOPNOTSUPP, i32, c_int);
+            libc_const_eq!(ELOOP, i32, c_int);
+            libc_const_eq!(ESRCH, i32, c_int);
+            libc_const_eq!(ECHILD, i32, c_int);
+            libc_const_eq!(EINTR, i32, c_int);
+            libc_const_eq!(E2BIG, i32, c_int);
+            libc_const_eq!(ENOEXEC, i32, c_int);
+            libc_const_eq!(EBADF, i32, c_int);
+            libc_const_eq!(ENOSYS, i32, c_int);
+            libc_const_eq!(ENOMEM, i32, c_int);
+            libc_const_eq!(ENFILE, i32, c_int);
+            libc_const_eq!(EMFILE, i32, c_int);
+            libc_const_eq!(ENOSPC, i32, c_int);
+            libc_const_eq!(S_IFCHR, u32, libc::mode_t);
+            libc_const_eq!(PR_SET_NO_NEW_PRIVS, i32, c_int);
+            libc_const_eq!(PR_GET_NO_NEW_PRIVS, i32, c_int);
+            libc_const_eq!(PR_GET_DUMPABLE, i32, c_int);
+            libc_const_eq!(PR_SET_DUMPABLE, i32, c_int);
+            libc_const_eq!(PR_SET_PDEATHSIG, i32, c_int);
+            libc_const_eq!(PR_SET_KEEPCAPS, i32, c_int);
+            libc_const_eq!(PR_SET_CHILD_SUBREAPER, i32, c_int);
+            libc_const_eq!(PR_SET_NAME, i32, c_int);
+            libc_const_eq!(PR_GET_CHILD_SUBREAPER, i32, c_int);
+            libc_const_eq!(PR_GET_SECCOMP, i32, c_int);
+            libc_const_eq!(PR_SET_SECCOMP, i32, c_int);
+            libc_const_eq!(SECCOMP_MODE_FILTER, u64, c_uint);
+            libc_const_eq!(PR_CAPBSET_READ, i32, c_int);
+            libc_const_eq!(PR_CAPBSET_DROP, i32, c_int);
+            libc_const_eq!(PR_CAP_AMBIENT, i32, c_int);
+            libc_const_eq!(PR_CAP_AMBIENT_CLEAR_ALL, u64, c_int);
+            libc_const_eq!(AF_NETLINK, u16, c_int);
+            libc_const_eq!(SOCK_RAW, i32, c_int);
+            libc_const_eq!(SOCK_CLOEXEC, i32, c_int);
+            libc_const_eq!(NETLINK_AUDIT, i32, c_int);
+            libc_const_eq!(POLLIN, i16, c_short);
+            libc_const_eq!(MSG_DONTWAIT, i32, c_int);
+            libc_const_eq!(SOL_SOCKET, i32, c_int);
+            libc_const_eq!(SO_DOMAIN, i32, c_int);
+            libc_const_eq!(AF_UNIX, i32, c_int);
+            libc_const_eq!(MSG_NOSIGNAL, i32, c_int);
+            libc_const_eq!(EAGAIN, i32, c_int);
+            libc_const_eq!(EPIPE, i32, c_int);
+            libc_const_eq!(EPROTONOSUPPORT, i32, c_int);
+            libc_const_eq!(EAFNOSUPPORT, i32, c_int);
+            libc_const_eq!(ECONNREFUSED, i32, c_int);
+        };
+        // `libc` の型が環境で変わる定数は gnu に限る（`libc::Ioctl` = `c_ulong`、`RLIMIT_*` = `c_uint`、
+        // `PTRACE_CONT` = `c_uint`、`BINDERFS_SUPER_MAGIC` は gnu・uclibc にだけある。musl は `c_int` で
+        // `TIOCGPTN` が負になるため対象外）。
+        #[cfg(target_env = "gnu")]
+        const _: () = {
+            use libc::{c_long, c_uint, c_ulong};
+            libc_const_eq!(BINDERFS_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(NS_GET_USERNS, u64, c_ulong);
+            libc_const_eq!(NS_GET_PARENT, u64, c_ulong);
+            libc_const_eq!(NS_GET_NSTYPE, u64, c_ulong);
+            libc_const_eq!(NS_GET_OWNER_UID, u64, c_ulong);
+            libc_const_eq!(TIOCGPTN, u64, c_ulong);
+            libc_const_eq!(TIOCSPTLCK, u64, c_ulong);
+            libc_const_eq!(PTRACE_CONT, i64, c_uint);
+            libc_const_eq!(RLIMIT_CPU, i32, c_uint);
+            libc_const_eq!(RLIMIT_FSIZE, i32, c_uint);
+            libc_const_eq!(RLIMIT_DATA, i32, c_uint);
+            libc_const_eq!(RLIMIT_STACK, i32, c_uint);
+            libc_const_eq!(RLIMIT_CORE, i32, c_uint);
+            libc_const_eq!(RLIMIT_RSS, i32, c_uint);
+            libc_const_eq!(RLIMIT_NPROC, i32, c_uint);
+            libc_const_eq!(RLIMIT_NOFILE, i32, c_uint);
+            libc_const_eq!(RLIMIT_MEMLOCK, i32, c_uint);
+            libc_const_eq!(RLIMIT_AS, i32, c_uint);
+            libc_const_eq!(RLIMIT_LOCKS, i32, c_uint);
+            libc_const_eq!(RLIMIT_SIGPENDING, i32, c_uint);
+            libc_const_eq!(RLIMIT_MSGQUEUE, i32, c_uint);
+            libc_const_eq!(RLIMIT_NICE, i32, c_uint);
+            libc_const_eq!(RLIMIT_RTPRIO, i32, c_uint);
+            libc_const_eq!(RLIMIT_RTTIME, i32, c_uint);
+        };
+    };
+}
+
 pub(crate) mod bpf;
 pub(crate) mod seccomp_notify;
 
@@ -650,6 +896,8 @@ mod consts {
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
         };
+
+        libc_consts_checks!();
     }
 }
 
@@ -1060,6 +1308,8 @@ mod consts {
             assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
             assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
         };
+
+        libc_consts_checks!();
     }
 }
 
@@ -4980,8 +5230,57 @@ pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<()
 }
 
 /// `pidfd_send_signal(2)` の `flags` に渡す `PIDFD_SIGNAL_PROCESS_GROUP`(`include/uapi/linux/pidfd.h` の `1 << 2`。
-/// Linux 6.9 以降。全アーキテクチャ共通の値)。`libc` に対応物が無い(カーネル ABI のフラグを直接使う)ため照合しない。
+/// Linux 6.9 以降。全アーキテクチャ共通の値)。`libc` 0.2.189 の `PIDFD_SIGNAL_PROCESS_GROUP`
+/// (`new/linux_uapi/linux/pidfd.rs`)と最上位の `libc_abi` で照合する(#1848)。
 const PIDFD_SIGNAL_PROCESS_GROUP: i64 = 1 << 2;
+
+/// `consts` の外にある定数(`AT_FDCWD`・fs magic・`SIG_*`・`PIDFD_SIGNAL_PROCESS_GROUP`・`renameat2` の
+/// `RENAME_NOREPLACE`)を `libc` 0.2.189 と `const` 評価で照合する(#1848・#1837・#1318・MVM-4・REPAIR-7・
+/// REPAIR-12)。関数は呼ばず `unsafe` を使わない。`consts` の中の定数は各 arch の `consts::libc_abi` が担う。
+///
+/// cfg は `seccomp_notify::libc_abi` と揃える。64 bit かつ x86_64 / aarch64 に限るため、`*_MAGIC` の `i64` と
+/// `libc` の `c_long` の比較が成り立つ(s390x の `c_uint` 版は評価されない)。
+///
+/// 名前が `libc` と違う対応: `PROC_MAGIC` = `PROC_SUPER_MAGIC`、`DEVPTS_MAGIC` = `DEVPTS_SUPER_MAGIC`。
+/// `renameat2` のローカル定数 `RENAME_NOREPLACE` は関数の中にあり項目として参照できないため、`libc` 側が
+/// ラッパーの宣言(`1`)と同じであることだけを確かめる。
+///
+/// 対象外(`libc` に対応物が無い、または FFI の値でない方針値・内部の上限):
+/// - `SUPPLEMENTARY_GROUPS_MAX`: `libc` の linux に `NGROUPS_MAX` が無い。カーネルの include/uapi/linux/limits.h の
+///   `NGROUPS_MAX`(65536)と同値の方針値
+/// - `SIGTERM_HANDLER_EXIT_CODE`・`DevptsCreate::*`・`DevTmpfsCreate::*`・`SealSet::*`・
+///   `LANDLOCK_RESTRICT_SELF_KNOWN_FLAGS`: 本実装の方針値(カーネル ABI の値でない)
+/// - 試験の中の `CAP_SYS_ADMIN_BIT`(include/uapi/linux/capability.h の `CAP_SYS_ADMIN` = 21)・`READ_DIR`
+///   (include/uapi/linux/landlock.h の `LANDLOCK_ACCESS_FS_READ_DIR`): `libc` の linux に定義が無い
+/// - 試験の `BOGUS_FD`・`*_ENV`: FFI の値でない
+///
+/// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use libc::{c_int, c_long, c_uint};
+
+    const _: () = {
+        libc_const_eq!(super::AT_FDCWD, i32, libc::AT_FDCWD, c_int);
+        libc_const_eq!(super::TMPFS_MAGIC, i64, libc::TMPFS_MAGIC, c_long);
+        libc_const_eq!(super::PROC_MAGIC, i64, libc::PROC_SUPER_MAGIC, c_long);
+        libc_const_eq!(super::DEVPTS_MAGIC, i64, libc::DEVPTS_SUPER_MAGIC, c_long);
+        libc_const_eq!(super::SIG_DFL, usize, libc::SIG_DFL, libc::sighandler_t);
+        libc_const_eq!(super::SIG_ERR, usize, libc::SIG_ERR, libc::sighandler_t);
+        libc_const_eq!(super::SIG_IGN, usize, libc::SIG_IGN, libc::sighandler_t);
+        libc_const_eq!(
+            super::PIDFD_SIGNAL_PROCESS_GROUP,
+            i64,
+            libc::PIDFD_SIGNAL_PROCESS_GROUP,
+            c_uint
+        );
+    };
+    // `renameat2` の関数内ローカル定数 `RENAME_NOREPLACE`(u32)。宣言の値 `1` と `libc` を比べる。
+    const _: () = assert!(libc::RENAME_NOREPLACE == 1);
+}
 
 /// [`pidfd_open`] で得た pidfd の指すプロセスの**プロセスグループ全員**へシグナルを送る
 /// (`pidfd_send_signal(fd, sig, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`。Linux 6.9 以降。CORE-6・SEC-5・#2551)。

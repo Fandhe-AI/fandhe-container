@@ -141,7 +141,9 @@ impl ImageRecord {
         &self.repo_tags
     }
 
-    /// digest 参照（`<repo>@sha256:<manifest digest>`）の一覧（#2831。ContainerStatus の `image_ref` の元）。
+    /// digest 参照（`<repo>@sha256:<digest>`）の一覧（#2831。ContainerStatus の `image_ref` の元）。
+    /// 先頭は pull 時の top-level digest（multi-arch では index digest。containerd と同じ。#2969・CRI-2・OCI-1）、
+    /// 続けてプラットフォーム manifest digest。統合後は既存を先に保つ挿入順で、containerd の辞書順とは異なる。
     pub fn repo_digests(&self) -> &[String] {
         &self.repo_digests
     }
@@ -167,7 +169,7 @@ impl ImageRecord {
     }
 
     /// 同一 ID の既存レコード（`self`）へ新しい取り込み結果を統合する（タグ・digest は和集合、size は新しい値、
-    /// uid・username・pinned は既存を保つ）。件数が [`MAX_REFS_PER_IMAGE`] を超えるなら `TooManyRefs`。
+    /// uid・username・pinned は既存を保つ。digest の並びは既存を先に保つ挿入順。#2969）。件数が [`MAX_REFS_PER_IMAGE`] を超えるなら `TooManyRefs`。
     fn merged_with(mut self, newer: ImageRecord) -> Result<Self, ImageStoreError> {
         fn union(base: &mut Vec<String>, extra: Vec<String>) {
             for item in extra {
@@ -666,6 +668,30 @@ mod tests {
         );
         assert_eq!(store.insert(rec("id0", "t2", "d", 2)), Ok(()));
         assert_eq!(store.len(), MAX_IMAGES);
+    }
+
+    /// CRI-2・OCI-1（#2969）: 統合後の digest は既存を先に保つ挿入順（containerd の辞書順とは異なる残差を固定する）。
+    #[test]
+    fn cri2_upsert_keeps_existing_digest_order_first() {
+        let store = InMemoryImageStore::new();
+        let rec = |d: &[&str]| {
+            ImageRecord::new(
+                "sha256:a",
+                vec![],
+                d.iter().map(|s| (*s).to_owned()).collect(),
+                1,
+            )
+            .expect("record")
+        };
+        store.upsert(rec(&["reg/a@sha256:P"])).expect("first");
+        store
+            .upsert(rec(&["reg/a@sha256:I", "reg/a@sha256:P"]))
+            .expect("merge");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(
+            got.repo_digests(),
+            ["reg/a@sha256:P", "reg/a@sha256:I"].map(String::from)
+        );
     }
 
     /// CRI-4: upsert は同一 ID のタグを統合し、他イメージの同一タグを外し、件数上限を守る。

@@ -15,6 +15,7 @@
 //! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
+//! | `network` | start が予約前に config の network エントリと突き合わせ(D7。`network_mode.rs`)、launcher が spec と照合する。`Loopback` の実体は #3064 まで `Unimplemented`(NET-6・SEC-1・#3058) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
@@ -42,6 +43,7 @@ use crate::dev_mounts::ImplicitDevMounts;
 use crate::etc_files::{EtcFileSelection, check_etc_overlaps};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
+use crate::oci_runtime::network_mode::LaunchNetworkMode;
 use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
 use crate::traits::types::{ErrorCode, TraitError};
@@ -70,6 +72,8 @@ pub struct LaunchOptions {
     capability_drop: CapabilitySet,
     /// `--read-only`(true なら config の値によらず root を読み取り専用にする。false なら config に従う)。
     root_readonly: bool,
+    /// network namespace の扱い(既定 `FromConfig`。NET-6・SEC-1・#3058)。
+    network: LaunchNetworkMode,
     /// 管理ルート(`@container-etc/<id>`)の生成物のうち rootfs へ bind する種別(空なら載せない。NET-12・#1872)。
     etc_files: EtcFileSelection,
 }
@@ -85,6 +89,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("env_count", &self.env.len())
             .field("capability_drop", &self.capability_drop)
             .field("root_readonly", &self.root_readonly)
+            .field("network", &self.network)
             .field("etc_files", &self.etc_files)
             .finish()
     }
@@ -138,6 +143,7 @@ impl LaunchOptions {
             env: Vec::new(),
             capability_drop: CapabilitySet::empty(),
             root_readonly: false,
+            network: LaunchNetworkMode::FromConfig,
             etc_files: EtcFileSelection::default(),
         })
     }
@@ -162,6 +168,14 @@ impl LaunchOptions {
     #[must_use]
     pub fn with_root_readonly(mut self, root_readonly: bool) -> Self {
         self.root_readonly = root_readonly;
+        self
+    }
+
+    /// network namespace の扱いを持たせる(NET-6・SEC-1・#3058)。config との突き合わせは start が予約前に行い、
+    /// `Host` は起動オプションだけで選べる(config.json からは選べない)。
+    #[must_use]
+    pub fn with_network(mut self, network: LaunchNetworkMode) -> Self {
+        self.network = network;
         self
     }
 
@@ -233,6 +247,11 @@ impl LaunchOptions {
         self.root_readonly
     }
 
+    /// network namespace の扱い。
+    pub fn network(&self) -> LaunchNetworkMode {
+        self.network
+    }
+
     /// rootfs へ bind する管理ルートの生成物の種別(既定は空)。
     pub fn etc_files(&self) -> EtcFileSelection {
         self.etc_files
@@ -287,6 +306,16 @@ mod tests {
     use super::*;
     use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
     use crate::tmpfs::{TmpfsMountSpec, TmpfsSize};
+
+    /// NET-6(#3058): network の既定は `FromConfig`、`with_network` で往復し、`Debug` に出る。
+    #[test]
+    fn net6_network_mode_defaults_to_from_config_and_round_trips() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert_eq!(opts.network(), LaunchNetworkMode::FromConfig);
+        let opts = opts.with_network(LaunchNetworkMode::Host);
+        assert_eq!(opts.network(), LaunchNetworkMode::Host);
+        assert!(format!("{opts:?}").contains("network: Host"));
+    }
 
     fn set_of(dests: &[&str]) -> TmpfsMountSet {
         let mut set = TmpfsMountSet::new();

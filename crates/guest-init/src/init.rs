@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::cmdline::{MAX_CMDLINE_BYTES, read_bounded};
 use crate::directive::{Access, Directive, GUEST_MOUNT_BASE, MountPoint};
+use crate::link_probe::{RO_MOUNT, RW_MOUNT, link_plan, run_virtiofs_link};
 use crate::mountinfo::{MAX_MOUNTINFO_BYTES, check_dev_hardened};
 use crate::probe::{GUEST_MOUNT, decode_test_mode, probe_plan, run_virtiofs_io};
 use crate::process::{GuestOps, emit_ready, process_directives};
@@ -190,8 +191,15 @@ pub fn run() -> ! {
     let outcome = process_directives(&cmdline, &mut ops);
     emit_ready(&mut ops);
     // 試験用プローブは ready の後（init 自身の責務の完了を遅らせない）。起動条件を満たさない本番の起動では何もしない。
-    if let Some(plan) = probe_plan(decode_test_mode(&cmdline), &outcome) {
+    let mode = decode_test_mode(&cmdline);
+    if let Some(plan) = probe_plan(mode, &outcome) {
         run_virtiofs_io(plan, Path::new(GUEST_MOUNT), &mut |l| ops.write_line(&l));
+    }
+    // symlink・ハードリンクの観測（#1877）。モードは排他のため上の io のプローブとは同時に走らない。
+    if let Some(plan) = link_plan(mode, &outcome) {
+        run_virtiofs_link(plan, Path::new(RO_MOUNT), Path::new(RW_MOUNT), &mut |l| {
+            ops.write_line(&ReportLine::from_link(l));
+        });
     }
     idle()
 }

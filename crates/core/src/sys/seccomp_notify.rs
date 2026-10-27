@@ -60,6 +60,28 @@ const SYS_SECCOMP: ArchSysNo = ArchSysNo::new(277);
 )))]
 const SYS_SECCOMP: ArchSysNo = ArchSysNo::UNSUPPORTED;
 
+/// `SYS_SECCOMP` を `libc` 0.2.189 の `SYS_seccomp` と `const` 評価で照合する（#1847・#1837・#1318・
+/// MVM-4・REPAIR-7・REPAIR-12）。`sys.rs` の `consts` の照合と同じ方式（`get` + `raw` のみ使用、`unsafe` なし）。
+/// 対応外 arch は `ArchSysNo::UNSUPPORTED` で番号が無く対象外。食い違いは試験側を合わせない。
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use super::{ArchSysNo, SYS_SECCOMP};
+
+    const fn nr(n: ArchSysNo) -> i64 {
+        match n.get() {
+            Ok(v) => v.raw(),
+            // 対応 arch の cfg の下でだけ定義するため到達しない（到達すればコンパイルエラー）。
+            Err(_) => panic!("unsupported arch"),
+        }
+    }
+
+    const _: () = assert!(nr(SYS_SECCOMP) == libc::SYS_seccomp);
+}
+
 // include/linux/net.h の `SOCK_SEQPACKET`（5）、include/uapi/asm-generic/socket.h の `SO_PASSCRED`（16）、
 // include/linux/socket.h の `SCM_RIGHTS`（1）・`SCM_CREDENTIALS`（2）・`MSG_*`。x86_64 / aarch64 は asm-generic の値を
 // 上書きしない（mips・sparc・alpha・parisc は異なるが対応外 arch。ラッパーは `SUPPORTED` で拒否する）。

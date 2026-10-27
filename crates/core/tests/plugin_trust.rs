@@ -15,10 +15,22 @@ fn plug11_task122_1_pure_check_is_reachable_from_public_api() {
     );
 }
 
-/// 非 Linux は同等検証が未実装のため、どのパスも fail-closed で拒否する（PLUG-11・REPAIR-3）。
-#[cfg(not(target_os = "linux"))]
+/// macOS（#1865）: `/tmp` は `/private/tmp` への symlink のため祖先の symlink として拒否する（PLUG-11・MAC-1）。
+#[cfg(target_os = "macos")]
 #[test]
-fn plug11_task122_1_non_linux_is_rejected_fail_closed() {
+fn plug11_1865_macos_rejects_symlinked_tmp() {
+    use fandhe_container_core::plugin_trust::{TrustTarget, verify_plugin_dir};
+
+    let err = verify_plugin_dir(std::path::Path::new("/tmp/fandhe-x")).expect_err("must reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotDirectory);
+    assert_eq!(err.target(), TrustTarget::Directory);
+    assert_eq!(err.path(), std::path::Path::new("/tmp"));
+}
+
+/// Windows 等は同等検証を持たない（ホストでは検証しない。#1415・#1539）ため、どのパスも fail-closed で拒否する（PLUG-11・REPAIR-3）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn plug11_task122_1_windows_is_rejected_fail_closed() {
     use fandhe_container_core::plugin_trust::{TrustTarget, verify_plugin_dir};
 
     let dir = std::env::temp_dir();

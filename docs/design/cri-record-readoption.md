@@ -63,6 +63,13 @@
 - write-ahead を採る理由: #2681 で net が write-ahead を採らなかった理由（成功後か途中かを見分けられない）は、ここでは core の状態（Present/Absent）で見分けられる。逆に後書きにすると「core にコンテナがあるのに CRI 記録が無い」状態が生じ、状態ルートを CLI と共有するため plugin-cri 由来かを証明できず回収できない
 - 書けなかった場合: 副作用の前なら RPC を `Internal` で失敗させる（成功を装わない）。確定・更新の書き込み失敗はメモリの記録を保持して `Internal` を返し、次の起動では古い記録と core の状態で照合される（次節の表で安全側に倒れる）
 - 性能: RPC ごとに fsync が 1〜2 回増える。CORE-10 の起動 p95 への影響は実装単位の試験で計測項目に挙げる
+- R4 の実装（#2933。`crates/cri/src/runtime_service.rs` の `with_record_store`・`persist_sandbox`・`remove_sandbox`）: sandbox 記録だけを書く（コンテナは R5）。注入しなければ何も書かない
+  - 書く時点: ネットワークなしの Run は予約後に確定版を 1 回書く（現時点で副作用が無く、pending を書くと R6 が所有情報不足として保持し続けるため。保持役の起動を入れる #2871 がその前に pending の書き込みを足す）。pod network ありの Run は、予約後に `pending=1`・notready・`network_pending=1` を書き、`set_up` 成功後に `pending=0`・ready・`network_owned=1` へ置き換える。Stop は配下の停止とネットワークの回収が済んだ後に状態を書く（途中の失敗では書かない。ディスクの古い ready は安全側で、R6 は常に NotReady で再採用する）。Remove は資源の回収と除去条件の検査が済んだ後に、先にファイルを消してからメモリを除去する
+  - ファイルを先に消す理由: この時点で資源は回収済みで、所有の証明を消しても回収不能な資源は残らない。メモリを先に消すと、削除に失敗した後の再試行が「未知 ID は成功」でファイルに触れず、孤児が再起動まで残る。削除に失敗したらメモリを残して `INTERNAL` を返す
+  - 失敗の写し方: `put`・`remove`・符号化の失敗はコード（`DEADLINE_EXCEEDED`・`FAILED_PRECONDITION` を含む）によらず固定文言の `INTERNAL` にする。副作用の前の `put` の失敗は予約を戻し `set_up` を呼ばない。確定の `put` の失敗は notready のままメモリに残す（`network_owned` なので Stop・Remove が回収できる）
+  - 並行操作: `SandboxRecord::record_write` を書く間だけ立て、同じ ID への Stop・Remove・CreateContainer を `FAILED_PRECONDITION` で拒否する。`put` / `remove`（fsync）は registry の `Mutex` の外で行い、書くたびにロック下でスナップショットを取り直す
+  - `run_bounded` を使わない理由: ストアの `put` / `remove` は同期 API で、`.lock` の待ちは 5 秒で打ち切られる。期限を外から付けると、期限切れの後に書けたか不明なままメモリを巻き戻して所有者の無い記録ファイルを作りうる。fsync 自体は打ち切れず、tokio の worker を一時的に塞ぐ（残余）
+  - 残余: 期限超過の後に worker が遅れて成功した場合と、set_up 失敗の回収後の `remove` が失敗した場合は `pending=1` の記録がディスクに残る（R6 の pending 解決に委ねる）。Remove の途中で配下の状態が変わりメモリを除去できなかった場合は、記録を書き直して `INTERNAL` を返す（best effort）。Remove の連鎖で消える配下のコンテナ記録ファイルは R5 で扱う
 
 ## 起動時の読み込みと照合（fail-closed）
 

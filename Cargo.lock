@@ -388,6 +388,7 @@ dependencies = [
  "block2",
  "dispatch2",
  "fandhe-container-io",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
@@ -436,6 +437,7 @@ dependencies = [
  "fandhe-container-io",
  "fandhe-container-platform-macos",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]

@@ -56,6 +56,7 @@ use crate::doctor::DoctorExitStatus;
 use crate::error::CliError;
 
 mod args;
+mod create_network;
 mod create_options;
 mod create_start;
 mod image;
@@ -1362,5 +1363,104 @@ mod tests {
                 ]
             );
         }
+    }
+}
+/// `create` の `--network`・`--add-host`・`--dns` を argv から通す試験(NET-12・CLI-1・ERR-1・#1871)。
+///
+/// cfg で絞らず 3 OS で走る。存在しない `--root` を渡し、拒否が状態ルートの作成より前であることも照合する。
+#[cfg(test)]
+mod net12_argv_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 存在しない状態ルートを返す(作られていないことを後で照合する)。
+    fn fresh_root() -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("fc-cli-net12-{}-{n}", std::process::id()))
+    }
+
+    /// `create` を実行し (終了コード, code, stderr) を返す。状態ルートが作られていないことも確かめる。
+    fn create(extra: &[&str]) -> (u8, Option<&'static str>, String) {
+        let root = fresh_root();
+        let mut full: Vec<OsString> = vec!["--root".into(), root.clone().into(), "create".into()];
+        full.extend(extra.iter().map(OsString::from));
+        full.extend(["--bundle", "/nonexistent-bundle", "c1"].map(OsString::from));
+        let mut out = Vec::new();
+        let r = run_to(full, &mut out);
+        let mut buf = Vec::new();
+        r.write_stderr(&mut buf).expect("write");
+        let stderr = String::from_utf8(buf).expect("utf8");
+        assert!(!root.exists(), "state root must not be created: {extra:?}");
+        (r.exit_code(), r.code(), stderr)
+    }
+
+    fn assert_invalid(extra: &[&str], leak: &str) {
+        let (exit, code, stderr) = create(extra);
+        assert_eq!(exit, 2, "{extra:?}: {stderr}");
+        assert_eq!(code, Some("INVALID_ARGUMENT"), "{extra:?}");
+        assert!(stderr.ends_with('\n'), "{stderr:?}");
+        assert_eq!(stderr.matches('\n').count(), 1, "{stderr:?}");
+        if !leak.is_empty() {
+            assert!(!stderr.contains(leak), "{extra:?} leaked: {stderr}");
+        }
+    }
+
+    fn assert_unimplemented(extra: &[&str]) {
+        let (exit, code, stderr) = create(extra);
+        assert_eq!(exit, 8, "{extra:?}: {stderr}");
+        assert_eq!(code, Some("UNIMPLEMENTED"), "{extra:?}");
+    }
+
+    /// TASK-186 の不正入力 8 種(空値・IP でない・空白・ハイフン・ラベル長・総長・改行・制御文字)。
+    #[test]
+    fn net12_invalid_inputs_rejected_before_any_side_effect() {
+        let l63 = "a".repeat(63);
+        let l64 = "a".repeat(64);
+        let l62 = "a".repeat(62);
+        let l61 = "a".repeat(61);
+        let host254 = format!("{l63}.{l63}.{l63}.{l62}:192.0.2.1");
+        let host253 = format!("{l63}.{l63}.{l63}.{l61}:192.0.2.1");
+        let label64 = format!("{l64}:192.0.2.1");
+        assert_invalid(&["--add-host", ":192.0.2.1"], "");
+        assert_invalid(&["--dns", ""], "");
+        assert_invalid(&["--add-host", "web:999.1.1.1"], "999");
+        assert_invalid(&["--dns", "example.com"], "example");
+        assert_invalid(&["--add-host", "my host:192.0.2.1"], "my host");
+        assert_invalid(&["--dns", " 192.0.2.1"], "192.0.2.1");
+        assert_invalid(&["--add-host", "-web:192.0.2.1"], "-web");
+        assert_invalid(&["--add-host", "web-:192.0.2.1"], "web-");
+        assert_invalid(&["--add-host", &label64], &l64);
+        assert_invalid(&["--add-host", &host254], &l63);
+        assert_unimplemented(&["--add-host", &host253]);
+        assert_invalid(&["--add-host", "web:192.0.2.1\n10.0.0.9 evil"], "evil");
+        assert_invalid(&["--dns", "127.0.0.1\nnameserver 8.8.8.8"], "8.8.8.8");
+        assert_invalid(&["--add-host", "web\t:192.0.2.1"], "web");
+        assert_invalid(&["--add-host", "we\u{1b}b:192.0.2.1"], "we");
+    }
+
+    /// `name:::1` は最初の `:` で分割され IPv6 として受理される(検証後に UNIMPLEMENTED)。
+    #[test]
+    fn net12_add_host_splits_at_first_colon() {
+        assert_unimplemented(&["--add-host", "name:::1"]);
+        assert_invalid(&["--add-host", "name::::1"], "");
+    }
+
+    /// none では loopback 以外の `--dns` を作成前に拒否する。
+    #[test]
+    fn net12_none_rejects_non_loopback_dns() {
+        assert_invalid(&["--network", "none", "--dns", "192.0.2.1"], "192.0.2.1");
+        assert_unimplemented(&["--network", "none", "--dns", "127.0.0.1"]);
+    }
+
+    /// `--network` の判定と使い方エラー、値が正しくても UNIMPLEMENTED。
+    #[test]
+    fn net12_network_flag_cases() {
+        assert_invalid(&["--network", "bridge"], "");
+        assert_unimplemented(&["--network", "container:x"]);
+        assert_unimplemented(&["--network", "host"]);
+        // 使い方エラーは exit 2 の INVALID_ARGUMENT(状態ルートは作られない)。
+        assert_invalid(&["--network", "a", "--network", "b"], "");
+        assert_invalid(&["--add-host"], "");
     }
 }

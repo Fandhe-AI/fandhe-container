@@ -119,6 +119,11 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | A36 | `kill <id> 65`（範囲外の番号。受けるのは 1〜64） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
 | A37 | `kill <id> term`（小文字。シグナル名は大文字小文字を区別する） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
 | A38 | `kill -9 <id>`（オプション形。`-` で始まる引数は受けない） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A39 | `create --bundle <dir> <id> --add-host`（値の欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1871 で追加） | |
+| A40 | `create --network none --network host ...`（`--network` の重複） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1871 で追加） | |
+| A41 | `create --network bridge ...`（予約名） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1871 で追加） | |
+| A42 | `create --add-host web:999.1.1.1 ...`（IP として解釈できない） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1871 で追加） | |
+| A43 | `create --network none --dns 192.0.2.1 ...`（none での非 loopback の `--dns`） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1871 で追加） | |
 
 ## B 層: 挙動（macOS / Windows は plugin 発見機構経由）
 

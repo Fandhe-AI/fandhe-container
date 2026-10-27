@@ -174,8 +174,8 @@ use crate::nftables_rules::RuleCreate;
 const BRIDGE_PREFIX: &str = "fcbr";
 /// nft テーブル名のプレフィックス。
 const TABLE_PREFIX: &str = "fandhe_net_";
-/// ネットワーク名の最大長（バイト）。
-const NAME_MAX_LEN: usize = 64;
+/// ネットワーク名の最大長（バイト）。CLI の `--network` 1 値の argv 上限が参照する（#1871・NET-12）。
+pub const NAME_MAX_LEN: usize = 64;
 /// FNV-1a 64bit の offset basis。
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a 64bit の prime。

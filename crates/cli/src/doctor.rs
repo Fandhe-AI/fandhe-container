@@ -67,8 +67,8 @@
 //!   `/proc/thread-self` を読む。doctor は setns せず単一の mount namespace で動き、cli は既に net に依存し、
 //!   net の `file_mount_id`（`/proc/self/fdinfo`）が同じ `mnt_id` を返すため等価。core に新しい公開 API は要らない。
 //! - `unescape_mountinfo` は cli に存在せず（パス欄を解釈しない）、統合の対象は無い。
-//! - 残余: net の `parse_fdinfo_mnt_id` は `mnt_id:` 行の重複を拒否せず先頭を採る（core は拒否）。カーネルは 1 行しか
-//!   出さないため判定に影響しない。判定は doctor 自身の mount namespace からの観測で、`start` の実行環境と食い違いうる。
+//! - net の `parse_fdinfo_mnt_id` は #2974 で core と同じ判定（`mnt_id:` 行の重複・不正値を拒否）に揃えた。
+//! - 残余: 判定は doctor 自身の mount namespace からの観測で、`start` の実行環境と食い違いうる。
 //! - 結合試験 `binary_entry.rs` のパス最長一致は、製品側と別の方法で期待値を独立に求める試験側のオラクルで、据え置く。
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）

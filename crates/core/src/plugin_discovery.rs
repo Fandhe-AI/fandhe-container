@@ -731,6 +731,8 @@ mod tests {
         )
     }
 
+    /// 絶対パスの判定が OS で異なる（Windows はドライブ無しの `/xxx` を相対扱いにする）ため unix に限る。
+    #[cfg(unix)]
     #[test]
     fn plug11_macos_default_dirs_use_xdg_data_home() {
         let got = resolve_default_dirs_macos(Some("/xdg".into()), Some("/Users/u".into()));
@@ -746,6 +748,8 @@ mod tests {
         );
     }
 
+    /// 絶対パスの判定が OS で異なる（Windows はドライブ無しの `/xxx` を相対扱いにする）ため unix に限る。
+    #[cfg(unix)]
     #[test]
     fn plug11_macos_default_dirs_fall_back_to_home() {
         for xdg in [None, Some(OsString::new()), Some("relative".into())] {

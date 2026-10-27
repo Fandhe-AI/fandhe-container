@@ -109,9 +109,12 @@ st() {
     emit "case=$c obs=stat-nolink target=$label $raw"
 }
 
-# fm <find の引数...>: -print の出力があれば yes（match）、なければ no。
+# fm <find の引数...>: -print の出力があれば yes（match）、なければ no。find 自体が非 0 で終わった
+# （走査の失敗）ときは error を返し、「一致しなかった」と区別する。
 fm() {
-    if [ -n "$(find "$@" -print 2>/dev/null)" ]; then echo yes; else echo no; fi
+    local out frc=0
+    out="$(find "$@" -print 2>/dev/null)" || frc=$?
+    if [ "$frc" -ne 0 ]; then echo error; elif [ -n "$out" ]; then echo yes; else echo no; fi
 }
 
 find_set() {
@@ -136,10 +139,11 @@ observe_case() {
     find_ls_mode "$c" path "$p"
     find_ls_mode "$c" fd9 /dev/fd/9
     emit "case=$c obs=fd9-rawtype is-symlink=$(fm /dev/fd/9 -prune -type l) is-chardev=$(fm /dev/fd/9 -prune -type c)"
-    # (c) プロセス経路: 現在の bash のコマンド置換と、fd を継承した別プロセスの /bin/sh。
+    # (c) プロセス経路: 親が開いた fd 9 を、bash のコマンド置換と、そのまま継承した別プロセスの
+    # /bin/sh で検査して比べる（sh 側では開き直さない。fd 9 は親の exec 9<"$p" のもの）。
     local in_bash in_sh
     in_bash="$(fm -L /dev/fd/9 -prune -perm -0002)"
-    if [ -n "$(/bin/sh -c 'find -L /dev/fd/9 -prune -perm -0002 -print 2>/dev/null' 9<"$p")" ]; then in_sh=yes; else in_sh=no; fi
+    in_sh="$(/bin/sh -c 'out=$(find -L /dev/fd/9 -prune -perm -0002 -print 2>/dev/null); frc=$?; if [ "$frc" -ne 0 ]; then echo error; elif [ -n "$out" ]; then echo yes; else echo no; fi')"
     emit "case=$c obs=route w-other-bash-subst=$in_bash w-other-sh-child=$in_sh"
     exec 9<&-
 }

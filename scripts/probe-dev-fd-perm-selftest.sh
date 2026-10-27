@@ -38,6 +38,10 @@ run_probe() {
     shift 2
     rc=0
     "$target" "$@" >"$out" 2>"$err" || rc=$?
+    # 観測値（mode・uid・route）を CI のログに残す（手順書は macOS leg のログを一次データとして参照する）。
+    printf '%s\n' "--- probe output (rc=$rc, args: $*) ---"
+    cat "$out"
+    printf '%s\n' "--- end probe output ---"
 }
 
 # obs <ファイル> <case> <obs> <key>: 該当行の key の値を返す。

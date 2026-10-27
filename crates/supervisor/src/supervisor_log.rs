@@ -29,7 +29,7 @@
 //! [`remove`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
 //! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
 //! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
-//! plugin-cri の `RemoveContainer` は従来の [`remove_bounded`]（1 回だけ）のまま。
+//! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -205,7 +205,7 @@ pub fn remove_guarded_bounded(
 /// `stop` 直後は supervisor が `Stopped` の記録後も drain を続け、プロセス終了までロックを持つ。待ちは呼び出し元
 /// スレッドの sleep（[`crate::logs::CONTAINER_LOG_LOCK_POLL`] 刻み）だけで、同時実行枠は試行の間しか使わない。
 /// 試し直すのは `FailedPrecondition` だけで、他のエラーは即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
-/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri は従来の [`remove_bounded`]（1 回だけ）のまま。
+/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri の `RemoveContainer` も使う（#2964）。
 pub fn remove_guarded_bounded_waiting(
     root: &Path,
     id: &ContainerId,
@@ -287,7 +287,7 @@ pub fn run_log_removal_bounded(
     job: impl FnOnce() + Send + 'static,
     timeout: std::time::Duration,
 ) -> LogRemoval {
-    // 起動失敗は従来どおり `Finished` 扱い（結果を持ち帰る `run_bounded` では区別できないため、起動失敗を別に判定する）。
+    // 起動失敗・job の panic（`NoResult`）は、同期実行へ退避せず結果の無い job として `Finished` に畳む。
     match run_bounded_inner(job, timeout) {
         BoundedOutcome::TimedOut => LogRemoval::TimedOut,
         BoundedOutcome::Busy => LogRemoval::Busy,
@@ -295,7 +295,7 @@ pub fn run_log_removal_bounded(
     }
 }
 
-/// [`run_bounded`] の内部結果。結果が無い理由（起動失敗・job の panic）を期限切れと区別するために持つ。
+/// [`run_log_removal_bounded`]・[`run_bounded_classified`]・`run_bounded_waiting` が共有する内部結果。結果が無い理由（起動失敗・job の panic）を期限切れと区別するために持つ。
 enum BoundedOutcome<T> {
     Done(T),
     TimedOut,
@@ -366,24 +366,6 @@ fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
     true
 }
 
-/// `job` を作業スレッドで実行して結果を持ち帰る、期限つき実行（#2446。`run_log_removal_bounded` の汎用版）。
-///
-/// 結果が得られなかったとき（期限切れ・同時実行枠の満杯・スレッド起動失敗・job の panic）は `None` を返す。
-/// 枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。呼び出し元は `None` を「結果が無い」として扱う
-/// （コンテナログの削除は `logs::remove_container_logs_bounded` が `Timeout` のエラーにする）。
-///
-/// 枠の満杯（何も実行していない）と期限切れを同じ `None` に潰すため、新しい呼び出し元は
-/// [`run_bounded_classified`] か `run_bounded_waiting` を使う（#2894）。
-pub fn run_bounded<T: Send + 'static>(
-    job: impl FnOnce() -> T + Send + 'static,
-    timeout: std::time::Duration,
-) -> Option<T> {
-    match run_bounded_inner(job, timeout) {
-        BoundedOutcome::Done(v) => Some(v),
-        BoundedOutcome::TimedOut | BoundedOutcome::Busy | BoundedOutcome::NoResult => None,
-    }
-}
-
 /// [`run_bounded_classified`] が結果を得られなかった理由（#2760・REPAIR-5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundedFailure {
@@ -393,7 +375,10 @@ pub enum BoundedFailure {
     Unfinished,
 }
 
-/// [`run_bounded`] の、枠の満杯とそれ以外の失敗を区別する版（#2760）。
+/// `job` を作業スレッドで実行して結果を持ち帰る期限つき実行で、枠の満杯とそれ以外の失敗を区別する（#2446・#2760）。
+/// [`run_log_removal_bounded`] の汎用版で、枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。
+/// 枠の満杯は即時に `Busy`、期限切れ・スレッド起動失敗・job の panic は `Unfinished`。枠を待つ場合は
+/// `run_bounded_waiting` を使う。両者を `None` に潰す `Option` 版は誤分類を呼ぶため削除済み（#2965）。
 ///
 /// 枠が満杯なら job は実行されず `Busy`。長寿命の plugin-cri で、止まった作業が枠を埋めたことと、この job 自身の
 /// 期限切れを同じ失敗として扱わないために使う。
@@ -903,20 +888,23 @@ mod tests {
         assert!(!crate::logs::container_log_dir(&t.0).exists());
     }
 
-    /// REPAIR-5・#2446: `run_bounded` は結果を返し、止まった job は期限で `None` になる。
+    /// REPAIR-5・#2446・#2965: `run_bounded_classified` は結果を返し、止まった job は期限で `Unfinished` になる。
     #[test]
-    fn repair5_run_bounded_returns_result_or_none() {
-        assert_eq!(run_bounded(|| 7_u32, Duration::from_secs(10)), Some(7));
+    fn repair5_run_bounded_classified_returns_result_or_unfinished() {
+        assert_eq!(
+            run_bounded_classified(|| 7_u32, Duration::from_secs(10)),
+            Ok(7)
+        );
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = Instant::now();
-        let out = run_bounded(
+        let out = run_bounded_classified(
             move || {
                 let _ = release_rx.recv_timeout(Duration::from_secs(30));
                 1_u32
             },
             Duration::from_millis(100),
         );
-        assert_eq!(out, None);
+        assert_eq!(out, Err(BoundedFailure::Unfinished));
         assert!(started.elapsed() < Duration::from_secs(10));
         drop(release_tx);
     }

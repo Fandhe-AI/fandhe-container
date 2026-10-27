@@ -42,7 +42,11 @@
 //! - registry-1.docker.io への外向き HTTPS（匿名 pull。Docker Hub のレート制限で失敗しうる）
 //! - exec 可能で十分な空きのある作業ディレクトリ
 //!
-//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。GitHub ホステッド runner では
+//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。委譲 cgroup の欠如と、opt-in 時の
+//! 範囲写像の前提欠如（`uidmap`・subuid / subgid）は、1 行目が
+//! `pull_e2e: PRECONDITION FAILED (test environment, not a cgroup delegation regression): ...` になる（分類は core の
+//! `tests/support/precondition.rs`。#3028・REPAIR-12）。非 root の要求（root での実行の拒否）は従来どおり
+//! `pull_e2e: FAILED setup: ...` のままで、前提欠如の新種別にするかはオーナー判断待ち。GitHub ホステッド runner では
 //! 保証できないため CI には組み込まない（ci.md「実機前提テスト」）。
 //!
 //! ```text
@@ -96,6 +100,18 @@ fn main() {
     linux::main();
 }
 
+/// 前提欠如（委譲 cgroup・opt-in 時の範囲写像）を `PRECONDITION FAILED` の 1 行目で報告する共有部品
+/// （core の `tests/support/precondition.rs` の正本を取り込む。`#[path]` は `mod linux` の外に置く。#3028）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "../../core/tests/support/precondition.rs"]
+mod precondition;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -113,7 +129,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
-    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup};
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
@@ -622,11 +638,23 @@ mod linux {
             .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
     }
 
-    fn is_root() -> bool {
+    fn effective_uid() -> Option<u32> {
         status_field("/proc/self/status", "Uid:")
-            .and_then(|v| v.split_whitespace().nth(1).map(str::to_string))
-            .as_deref()
-            == Some("0")
+            .and_then(|v| v.split_whitespace().nth(1).and_then(|u| u.parse().ok()))
+    }
+
+    fn is_root() -> bool {
+        effective_uid() == Some(0)
+    }
+
+    /// 実機モードの前提の失敗を標準エラーへ出して終了コード 1 を返す。前提欠如は `PRECONDITION FAILED` の
+    /// 1 行目つきの文面をそのまま、回帰の可能性がある失敗は従来どおり `pull_e2e: FAILED setup: ...`（#3028）。
+    fn report_setup_failure(f: crate::precondition::Failure) -> i32 {
+        match f {
+            crate::precondition::Failure::Precondition(m) => eprintln!("{m}"),
+            crate::precondition::Failure::Other(e) => eprintln!("pull_e2e: FAILED setup: {e}"),
+        }
+        1
     }
 
     fn children_of_self() -> Vec<String> {
@@ -1106,15 +1134,9 @@ mod linux {
             );
             return 1;
         }
-        let delegated = match DelegatedCgroup::detect() {
+        let delegated = match crate::precondition::try_delegated_cgroup() {
             Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "pull_e2e: FAILED setup: no delegated cgroup v2 ({:?})",
-                    e.code
-                );
-                return 1;
-            }
+            Err(f) => return report_setup_failure(f),
         };
         let tag = std::process::id();
         let Ok(cg_id) = ContainerId::new(format!("pe{tag}")) else {
@@ -1182,6 +1204,13 @@ mod linux {
             .cgroup_join_source(move || join_container.join_hook());
         // 非 root の `User` を効かせる範囲写像は opt-in（`production_launcher` のシナリオ I と同じ環境変数）。
         let builder = if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            let Some(euid) = effective_uid() else {
+                eprintln!("pull_e2e: FAILED setup: effective uid");
+                return 1;
+            };
+            if let Err(f) = crate::precondition::try_require_subordinate_ids(euid) {
+                return report_setup_failure(f);
+            }
             match SubordinateIdSource::system(std::env::var("USER").ok()) {
                 Ok(source) => builder
                     .privilege(IsolationPrivilege::RootlessSubordinateIds)
@@ -1625,6 +1654,7 @@ mod linux {
     }
 
     pub fn main() {
+        crate::precondition::self_check();
         selfcheck::run();
         let argv: Vec<String> = std::env::args().skip(1).collect();
         if !argv.iter().any(|a| a == "--ignored") {

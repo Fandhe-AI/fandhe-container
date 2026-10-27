@@ -43,10 +43,10 @@
 //!
 //! 実行された場合は、環境不備を含むあらゆる失敗を失敗として扱う（検証せずに成功する分岐を持たない）。
 //! 委譲 cgroup の前提欠如は、1 行目が `exec_identify_cgroup: PRECONDITION FAILED (test environment, ...)`
-//! になる（分類元は `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
+//! になる（分類元は core の `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
 
 #[cfg(target_os = "linux")]
-#[path = "support/precondition.rs"]
+#[path = "../../core/tests/support/precondition.rs"]
 mod precondition;
 
 #[cfg(not(target_os = "linux"))]

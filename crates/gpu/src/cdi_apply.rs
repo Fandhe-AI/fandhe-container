@@ -4,7 +4,7 @@
 //! `cdi_edits::AggregatedEdits`（集計済みの edits）を受け、コンテナの実行環境へ反映する。
 //! 現状は `deviceNodes` の作成（`device_nodes` モジュール。TASK-127.1・#547）、mounts の bind 指定への変換
 //! （`mounts`。TASK-127.2・#548）、`createContainer` フックの実行と実行順序の強制（`hooks`。TASK-127.3・#549）が
-//! 実装済みで、env の適用は後続（#550）、cgroup device の `permissions` は TASK-129、
+//! 実装済み、コンテナプロセス env の合成（`env`。TASK-127.4・#550）も実装済みで、cgroup device の `permissions` は TASK-129、
 //! core の実行フロー（`create_default_devices` の後・`pivot_root` の前）への配線も未実装（REPAIR-3）。
 //!
 //! # 呼び出し文脈
@@ -12,6 +12,7 @@
 //! 読む `resolve_device_nodes` を `pivot_root` の前に呼び、コンテナの `/dev` のマウントのルート fd に
 //! 対して `create_device_nodes` を呼ぶ。
 
+pub mod env;
 pub mod hooks;
 pub mod mounts;
 

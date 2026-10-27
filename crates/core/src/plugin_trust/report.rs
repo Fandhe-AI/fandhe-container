@@ -58,6 +58,7 @@ impl PluginTrustErrorKind {
         match self {
             PluginTrustErrorKind::UntrustedOwner => "untrusted_owner",
             PluginTrustErrorKind::GroupOrOtherWritable => "group_or_other_writable",
+            PluginTrustErrorKind::ExtendedAcl => "extended_acl",
             PluginTrustErrorKind::NotRegularFile => "not_regular_file",
             PluginTrustErrorKind::NotDirectory => "not_directory",
             PluginTrustErrorKind::InvalidPath => "invalid_path",
@@ -79,6 +80,7 @@ impl PluginTrustErrorKind {
                 "plugin owner is neither root nor the effective user"
             }
             PluginTrustErrorKind::GroupOrOtherWritable => "plugin is writable by group or other",
+            PluginTrustErrorKind::ExtendedAcl => "plugin path has an extended ACL",
             PluginTrustErrorKind::NotRegularFile => "plugin is not a regular file",
             PluginTrustErrorKind::NotDirectory => {
                 "plugin directory is not a directory or is a symlink"
@@ -104,6 +106,7 @@ impl PluginTrustErrorKind {
         match self {
             PluginTrustErrorKind::UntrustedOwner
             | PluginTrustErrorKind::GroupOrOtherWritable
+            | PluginTrustErrorKind::ExtendedAcl
             | PluginTrustErrorKind::HashMismatch => ErrorCode::PermissionDenied,
             PluginTrustErrorKind::NotRegularFile
             | PluginTrustErrorKind::NotDirectory
@@ -240,9 +243,10 @@ mod tests {
     use crate::traits::TraitError;
     use std::path::Path;
 
-    const ALL: [PluginTrustErrorKind; 11] = [
+    const ALL: [PluginTrustErrorKind; 12] = [
         PluginTrustErrorKind::UntrustedOwner,
         PluginTrustErrorKind::GroupOrOtherWritable,
+        PluginTrustErrorKind::ExtendedAcl,
         PluginTrustErrorKind::NotRegularFile,
         PluginTrustErrorKind::NotDirectory,
         PluginTrustErrorKind::InvalidPath,
@@ -271,7 +275,7 @@ mod tests {
             );
             assert!(seen.insert(r), "duplicate reason {r}");
         }
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
     }
 
     /// 受入基準 B: message は英語 ASCII で、パスを含まない。代表 3 種は具体値で照合する。
@@ -294,6 +298,15 @@ mod tests {
             PluginTrustErrorKind::HashMismatch.message(),
             "plugin sha256 digest is not in the allowed hash list"
         );
+    }
+
+    /// macOS の拡張 ACL 拒否（#1865・PLUG-11・#1539）の reason / message / code を具体値で固定する。
+    #[test]
+    fn plug11_1865_extended_acl_reason_message_code() {
+        let e = err(PluginTrustErrorKind::ExtendedAcl, "/x");
+        assert_eq!(PluginTrustErrorKind::ExtendedAcl.as_str(), "extended_acl");
+        assert_eq!(e.message(), "plugin path has an extended ACL");
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
     }
 
     /// code は既存の TraitError 変換と全 kind で一致する（写像の不変）。

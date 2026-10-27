@@ -17,7 +17,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 | ゲストカーネル・initrd のビルドスクリプト | 実装済み（macOS ホストでのビルド・リンクと VM での起動は未確認） | `make guest-kernel-build`・`make guest-initrd-build` |
 | `fandhe-container setup` の手順表示 | 実装済み | 表示のみ。検出も適用もしない |
 | CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 は承認待ち） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
-| 非 Linux の plugin の信頼性検証（PLUG-11） | 未実装 | 検証は常に拒否される。許可済みハッシュ一覧は未配線（#1868、承認待ち） |
+| macOS の plugin の信頼性検証（PLUG-11） | core は実装済み（#1865。所有者・モード・祖先・symlink 実体・拡張 ACL） | CLI の分類・文言は #1867、許可済みハッシュ一覧は未配線（#1868、承認待ち）のため、現状は全件拒否される |
 | `setup` のステップの自動検出・適用 | 未実装（TASK-125） | |
 
 判断待ち:
@@ -92,7 +92,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 
 ## plugin の配置と信頼性検証
 
-未実装・判断待ち。既定の探索先は system の `/usr/local/libexec/fandhe-container/plugins` と user の `<XDG_DATA_HOME>/fandhe-container/plugins`（無ければ `~/Library/Application Support/fandhe-container/plugins`）の 2 か所（#1539・#1863）だが、信頼性検証（PLUG-11）は #1865 まで常に拒否される（fail-closed）。許可済みハッシュ一覧の作り方（署名後のバイナリのハッシュを載せる方針は #1539）は #1868 の承認後に本節へ書く。
+未実装・判断待ち。既定の探索先は system の `/usr/local/libexec/fandhe-container/plugins` と user の `<XDG_DATA_HOME>/fandhe-container/plugins`（無ければ `~/Library/Application Support/fandhe-container/plugins`）の 2 か所（#1539・#1863）だが、信頼性検証（PLUG-11）は core では実装済み（#1865。拡張 ACL のあるディレクトリ・ファイルは拒否する。`~/Library` 配下は既定の ACL で拒否されうる〔実機未確認〕）だが、許可済みハッシュ一覧が未配線のため現状は全件拒否される（fail-closed）。許可済みハッシュ一覧の作り方（署名後のバイナリのハッシュを載せる方針は #1539）は #1868 の承認後に本節へ書く。
 
 ## 状態ルート
 

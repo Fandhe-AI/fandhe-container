@@ -511,23 +511,43 @@ mod tests {
         assert_eq!(sink.record(&rec), Err(want));
     }
 
-    /// PLUG-11（非 Linux）: 信頼性検証が未実装のため Unimplemented（fail-closed）。
-    #[cfg(not(target_os = "linux"))]
+    /// PLUG-11（Windows 等。Linux・macOS 以外）: ホストでは信頼性検証をしないため Unimplemented（fail-closed。#1415・#1539）。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn plug11_non_linux_trust_unimplemented() {
+    fn plug11_windows_trust_unimplemented() {
         let tmp = Tmp::new("unsupported");
         let sink = CollectSink::new();
         let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &["macos"]), &sink);
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(e.message(), MSG_TRUST_UNSUPPORTED);
         assert_no_path_or_name(&e, &tmp);
-        // 非 Linux の拒否 `unsupported` も記録を試みる（SEC-4・#2013）。
+        // 拒否 `unsupported` も記録を試みる（SEC-4・#2013）。
         let recs = sink.records();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].layer(), AuditLayer::PluginTrust);
         assert_eq!(
             recs[0].reason().map(|r| r.as_str().to_string()).as_deref(),
             Some("unsupported")
+        );
+    }
+
+    /// PLUG-11・MAC-1（macOS。#1865）: 検証は実装済みで、`temp_dir()`（`/var/...`。`/var` は symlink）配下の
+    /// 候補は祖先の symlink として拒否され、Untrusted / PermissionDenied になる。パス・名前は出力へ反射しない。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plug11_macos_symlinked_ancestor_is_untrusted() {
+        let tmp = Tmp::new("macos-untrusted");
+        let sink = CollectSink::new();
+        let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &["macos"]), &sink);
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        assert_eq!(e.message(), MSG_UNTRUSTED);
+        assert_no_path_or_name(&e, &tmp);
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::PluginTrust);
+        assert_eq!(
+            recs[0].reason().map(|r| r.as_str().to_string()).as_deref(),
+            Some("not_directory")
         );
     }
 

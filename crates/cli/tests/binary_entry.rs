@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|image|system|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -304,13 +304,17 @@ fn cli1_create_start_usage_errors() {
     }
 }
 
-/// CLI-1: stop / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
+/// CLI-1: stop / kill / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
 #[test]
 fn cli1_stop_delete_usage_errors() {
     for a in [
         &["stop"][..],
         &["stop", "a", "b"],
         &["stop", "--force", "c1"],
+        &["kill"],
+        &["kill", "a", "b", "c"],
+        &["kill", "--x", "c1"],
+        &["kill", "-9", "c1"],
         &["delete"],
         &["delete", "--x", "c1"],
         &["delete", "--force", "--force", "c1"],
@@ -989,7 +993,11 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
 
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    let out = run(&["--root", root_s, "kill", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("kill".into(), "NOT_FOUND".into()));
+
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root_s, cmd, "a/b"]);
         assert_eq!(out.status.code(), Some(2));
         assert_eq!(op_and_code(&out), (op.into(), "INVALID_ARGUMENT".into()));
@@ -1003,6 +1011,26 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(
         op_and_code(&out),
         ("kill".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(root.join("c1").join("state.json").exists());
+
+    // kill: Created（pid なし）は 5。不正なシグナルは状態を触る前に 2（固定文言）。
+    for argv in [
+        &["--root", root_s, "kill", "c1"][..],
+        &["--root", root_s, "kill", "c1", "KILL"],
+    ] {
+        let out = run(argv);
+        assert_eq!(out.status.code(), Some(5), "{argv:?}");
+        assert_eq!(
+            op_and_code(&out),
+            ("kill".into(), "FAILED_PRECONDITION".into())
+        );
+    }
+    let out = run(&["--root", root_s, "kill", "c1", "BOGUS"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"op\":\"kill\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"signal is invalid\"}\n"
     );
     assert!(root.join("c1").join("state.json").exists());
 
@@ -1376,13 +1404,33 @@ fn sec1_create_fails_closed_off_linux() {
 fn sec1_stop_delete_fail_closed_off_linux() {
     let tmp = TmpDir::new("offlinux-sd");
     let root = tmp.0.join("state");
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
         assert_eq!(out.status.code(), Some(5));
         assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
     assert_state_root_after_fail_closed(&root);
+}
+
+/// CLI-1・#1902: 不正なシグナルは OS を問わず状態ルートを開く前に INVALID_ARGUMENT（2）で拒否される。
+#[test]
+fn cli1_kill_invalid_signal_is_rejected_on_every_os() {
+    let tmp = TmpDir::new("killbadsig");
+    let root = tmp.0.join("state");
+    let out = run(&[
+        "--root",
+        root.to_str().expect("utf8"),
+        "kill",
+        "c1",
+        "BOGUS",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        op_and_code(&out),
+        ("kill".into(), "INVALID_ARGUMENT".into())
+    );
+    assert!(!root.exists(), "the state root must not be created");
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、

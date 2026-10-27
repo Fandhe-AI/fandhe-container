@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(fallback_bytes(true, &usage), expected);
         assert_eq!(
             String::from_utf8(line).unwrap(),
-            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>\"}\n"
+            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|image|system|setup|doctor>\"}\n"
         );
     }
 }

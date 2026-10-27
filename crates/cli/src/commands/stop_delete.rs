@@ -65,7 +65,13 @@
 //!   `container is not running` で失敗する。取り消しの時点で新しいプロセスが動いていたら、期限内に記録を読み直して通常の stop を
 //!   やり直す。
 //! - stop の猶予後の SIGKILL と Stopped への遷移確認（#1545。同じ stop 用 signaler を使う。意図は一度立てば残るので 2 回目は
-//!   無害）、`kill` コマンド（#1902。[`production_signaler`] を使い、意図は立てない）は未実装。
+//!   無害）は未実装。
+//! - `kill <id> [<signal>]`（#1902・CLI-1）はシグナルを 1 回送るだけで、終了を待たず状態も変えない（OCI Runtime の `kill` と同じ）。
+//!   core の `kill` を [`production_signaler`]（`ControlSignaler::new`・kind 2）で呼び、`stop` と違って明示 stop の意図は立てない
+//!   （`stop_or_cancel_restart` の分岐も通らない）。記録が `Stopped` なら core の規則どおり `FAILED_PRECONDITION` になる。
+//!   シグナルの語彙は `stop --signal`（Docker の語彙）と異なり spec の CLI-1 の固定表（`kill_signal` module）。
+//!   残余: moby の `kill` は SIGKILL か StopSignal と一致するとき再起動を止めるが、本実装は止めない
+//!   （`always`・`unless-stopped`・`on-failure` では `kill <id> KILL` の後に再起動されうる）。Docker 互換にするかはオーナー判断待ち。
 //! - `delete` が最初に照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
 //!   スコープと一致すれば従来の経路、食い違えば記録のスコープを直接開く経路（#2096）で消す。検出自体の失敗は
 //!   記録の経路へ回さず失敗させる（壊れた環境で使わない安全側の判断）。#2133 で再検討し、挙動を変えず維持した:
@@ -98,7 +104,7 @@ use fandhe_container_core::oci_runtime::CgroupRemoval;
 use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, StateRevision};
 
 use super::CliExit;
-use super::args::{DeleteArgs, GlobalArgs, StopArgs};
+use super::args::{DeleteArgs, GlobalArgs, KillArgs, StopArgs};
 use super::create_start::{
     OP_LOG_ENV, export_ops, production_runtime, record_pre_core_failure, require_local_backend,
 };
@@ -106,10 +112,11 @@ use super::image::open_image_store_for_lifecycle;
 use super::image_refs::{
     IMAGE_ROOT_ANNOTATION, StoreImageRefs, fail, legacy_scope, ref_key, state_scope,
 };
+use super::kill_signal::parse_kill_signal;
 use fandhe_container_oci::image_management::{ContainerRefId, ContainerRefRelease, ImageStore};
 
 // 本番の signaler・cgroup remover は supervisor crate にある（plugin-cri の `kill`・`stop`・`delete` と共有するため
-// CLI の private 実装から移した。#2434・REPAIR-1）。`production_signaler` は `kill` コマンド（#1902）が入るまで試験だけが使う。
+// CLI の private 実装から移した。#2434・REPAIR-1）。`production_signaler` は `kill` コマンド（#1902）が使う。
 #[cfg(all(test, not(target_os = "linux")))]
 use fandhe_container_supervisor::cgroup_remover::UnavailableCgroupRemover;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
@@ -117,10 +124,9 @@ use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::cgroup_remover::{DetectedCgroupRemover, detect_error};
 #[cfg(test)]
 use fandhe_container_supervisor::control::UnavailableSignaler;
-#[cfg(all(test, target_os = "linux"))]
-use fandhe_container_supervisor::control::production_signaler;
 use fandhe_container_supervisor::control::{
-    CancelOutcome, PendingRestartCanceller, production_restart_canceller, production_stop_signaler,
+    CancelOutcome, PendingRestartCanceller, production_restart_canceller, production_signaler,
+    production_stop_signaler,
 };
 use fandhe_container_supervisor::logs::{CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT};
 use fandhe_container_supervisor::supervisor_log::{
@@ -134,6 +140,21 @@ use fandhe_container_supervisor::supervisor_log::{
 fn build_stop_request(args: &StopArgs) -> Result<KillRequest, TraitError> {
     let signal = match args.signal.as_deref() {
         Some(text) => Signal::parse_notation(text)?,
+        None => Signal::SIGTERM,
+    };
+    Ok(KillRequest::new(
+        ContainerId::new(args.id.as_str())?,
+        signal,
+    ))
+}
+
+/// ID とシグナルを検証し、`kill` の要求を作る（`<signal>` 省略は `SIGTERM`。CLI-1・#1902）。
+///
+/// シグナルは `kill_signal::parse_kill_signal`（spec の固定表）で解釈し、不正値は固定文言の `INVALID_ARGUMENT`。
+/// 状態ルートを開く前に終わるので、非 Linux でも同じ結果になる。
+fn build_kill_request(args: &KillArgs) -> Result<KillRequest, TraitError> {
+    let signal = match args.signal.as_deref() {
+        Some(text) => parse_kill_signal(text)?,
         None => Signal::SIGTERM,
     };
     Ok(KillRequest::new(
@@ -286,6 +307,32 @@ pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
         &rt.recorder,
         &signaler,
         canceller.as_ref(),
+        &req,
+        &KillTimeout::default(),
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    match result {
+        Ok(_) => CliExit::Success,
+        Err(e) => CliExit::Runtime(e),
+    }
+}
+
+/// 本番入口の `kill`（CLI-1・#1902）。成功時は何も出力しない。意図は立てず、猶予待ちも再起動の取り消しもしない。
+pub(super) fn run_kill(global: &GlobalArgs, args: &KillArgs) -> CliExit {
+    let started = Instant::now();
+    let prepared = production_runtime(global, OpRecorder::new(), "kill", started, || {
+        build_kill_request(args)
+    })
+    .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Kill, e));
+    let (rt, req) = match prepared {
+        Ok(v) => v,
+        Err(e) => return CliExit::Runtime(e),
+    };
+    let signaler = production_signaler(rt.store.as_ref());
+    let result = stop_container(
+        rt.store.as_ref(),
+        &rt.recorder,
+        &signaler,
         &req,
         &KillTimeout::default(),
     );
@@ -1016,6 +1063,40 @@ mod tests {
                 signal: Some(text.into()),
             };
             let e = build_stop_request(&args).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{text}");
+            assert_eq!(e.message(), "signal is invalid", "{text}");
+        }
+    }
+
+    fn kill_args(id: &str, signal: Option<&str>) -> KillArgs {
+        KillArgs {
+            id: id.into(),
+            signal: signal.map(str::to_owned),
+        }
+    }
+
+    /// CLI-1・#1902: `kill` の省略は SIGTERM（15）、指定は `kill_signal` の語彙で番号に解く。
+    #[test]
+    fn cli1_build_kill_request_defaults_to_sigterm() {
+        for (signal, want) in [
+            (None, 15),
+            (Some("KILL"), 9),
+            (Some("10"), 10),
+            (Some("33"), 33),
+        ] {
+            let k = build_kill_request(&kill_args("c1", signal)).expect("kill");
+            assert_eq!(k.id().as_str(), "c1");
+            assert_eq!(k.signal().as_u8(), want, "{signal:?}");
+        }
+    }
+
+    /// ERR-1・ERR-2・#1902: 不正な ID・シグナルは core の型 / 固定文言の `INVALID_ARGUMENT`。
+    #[test]
+    fn err2_build_kill_request_rejects_invalid_id_and_signal() {
+        let e = build_kill_request(&kill_args("a/b", None)).expect_err("id");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        for text in ["", "BOGUS", "term", "RTMIN"] {
+            let e = build_kill_request(&kill_args("c1", Some(text))).expect_err("signal");
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{text}");
             assert_eq!(e.message(), "signal is invalid", "{text}");
         }
@@ -1803,6 +1884,83 @@ mod tests {
                 *sig.0.lock().expect("lock"),
                 vec![("sd-stop-ok".to_string(), 4242, 15)]
             );
+        }
+
+        fn kill_with(
+            store: &FileStateStore,
+            rec: &OpRecorder,
+            signaler: Arc<dyn ProcessSignaler>,
+            name: &str,
+            signal: Option<&str>,
+        ) -> Result<ContainerStatus, OciRuntimeError> {
+            let req = build_kill_request(&kill_args(name, signal)).expect("req");
+            stop_container(store, rec, &signaler, &req, &KillTimeout::default())
+        }
+
+        /// CLI-1・#1902: kill は指定番号を 1 回だけ送り、終了を待たず状態も変えない（Running のまま・pid 不変）。
+        #[test]
+        fn cli1_kill_signals_requested_number_once() {
+            for (signal, want) in [
+                (None, 15),
+                (Some("KILL"), 9),
+                (Some("SIGUSR1"), 10),
+                (Some("10"), 10),
+            ] {
+                let base = TmpDir::new("kill-ok");
+                let st = store(&base);
+                let rec = OpRecorder::new();
+                do_create(&base, &st, &rec, "sd-kill-ok");
+                let _handle = do_start(&st, &rec, "sd-kill-ok");
+                let sig = Arc::new(RecordingSignaler::default());
+                let status = kill_with(&st, &rec, sig.clone(), "sd-kill-ok", signal).expect("kill");
+                assert_eq!(status.state(), ContainerState::Running);
+                assert_eq!(
+                    *sig.0.lock().expect("lock"),
+                    vec![("sd-kill-ok".to_string(), 4242, want)],
+                    "{signal:?}"
+                );
+                let got = st
+                    .get(&GetStateRequest::new(id("sd-kill-ok")))
+                    .expect("get");
+                assert_eq!(got.status().state(), ContainerState::Running);
+                assert_eq!(got.status().pid(), std::num::NonZeroU32::new(4242));
+            }
+        }
+
+        /// ERR-2・#1902: 未作成は NOT_FOUND（3）、Created は FAILED_PRECONDITION（5）で、signaler は呼ばれない。
+        #[test]
+        fn err2_kill_unknown_and_created_do_not_signal() {
+            let base = TmpDir::new("kill-pre");
+            let st = store(&base);
+            let rec = OpRecorder::new();
+            let sig = Arc::new(RecordingSignaler::default());
+            let e = kill_with(&st, &rec, sig.clone(), "none", None).expect_err("nf");
+            assert_eq!((e.code(), e.exit_code().get()), (ErrorCode::NotFound, 3));
+            assert_eq!(e.op(), LifecycleOp::Kill);
+            do_create(&base, &st, &rec, "c1");
+            let e = kill_with(&st, &rec, sig.clone(), "c1", None).expect_err("fp");
+            assert_eq!(e.exit_code().get(), 5);
+            assert!(sig.0.lock().expect("lock").is_empty());
+        }
+
+        /// SEC-1・ERR-2・#1902: 本番 signaler（意図なし）は supervisor が無ければ UNAVAILABLE（9）で、
+        /// pid へ縮退せず状態は Running のまま。
+        #[test]
+        fn sec1_kill_with_production_signaler_without_supervisor_is_unavailable() {
+            let base = TmpDir::new("kill-unavail");
+            let st = store(&base);
+            let rec = OpRecorder::new();
+            do_create(&base, &st, &rec, "sd-kill-unavail");
+            let _handle = do_start(&st, &rec, "sd-kill-unavail");
+            let e = kill_with(&st, &rec, production_signaler(&st), "sd-kill-unavail", None)
+                .expect_err("unavailable");
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert_eq!(e.exit_code().get(), 9);
+            assert_eq!(e.op(), LifecycleOp::Kill);
+            let got = st
+                .get(&GetStateRequest::new(id("sd-kill-unavail")))
+                .expect("get");
+            assert_eq!(got.status().state(), ContainerState::Running);
         }
 
         /// SEC-1・ERR-2: 本番 signaler は supervisor のソケットが無ければ UNAVAILABLE（9・op=kill）で失敗し、

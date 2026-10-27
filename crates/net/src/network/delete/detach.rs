@@ -256,13 +256,16 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
         false
     };
 
-    // 5. アドレス。公開の残りがなく、veth・pin が消えたときだけ解放する。
+    // 5. アドレス。公開の残りがなく、veth・pin が消えたときだけ解放する。解放できなかった（保持した）
+    //    ときは請求書に quarantine を立てる。立てないと、回収（veth・pin だけ）が記録を外して成功し、
+    //    IPAM のアドレスだけが残って同じ endpoint の再 attach が `AlreadyExists` になる（NET-1・#3062）。
     if veth_gone && unpinned && !quarantine {
         match ipam.release(&endpoint) {
             Ok(addr) => report
                 .removed
                 .push(DeleteResource::Address(endpoint.clone(), addr)),
             Err(e) => {
+                quarantine = true;
                 report.leftover.push((
                     DeleteResource::Address(endpoint.clone(), address),
                     ResourceState::Present,
@@ -271,6 +274,8 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
             }
         }
     } else {
+        // アドレスを保持する。カーネル側の回収後も記録を残し、`delete_network` が解放する。
+        quarantine = true;
         let state = if report
             .leftover
             .iter()

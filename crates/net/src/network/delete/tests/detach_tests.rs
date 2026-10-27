@@ -309,7 +309,9 @@ fn net1_detach_veth_failure_keeps_pin_and_address() {
     assert!(!fake.calls().iter().any(|c| c == "unpin_netns"));
     assert_eq!(ipam.address_of(&eid("c1")), Some(a1));
     let claim = e.reclaim_claim().unwrap();
-    assert!(claim.includes_veth() && claim.includes_netns() && !claim.includes_quarantine());
+    // アドレスを保持するため quarantine も含む（回収後に記録を外して再 attach が AlreadyExists になるのを防ぐ）。
+    assert!(claim.includes_veth() && claim.includes_netns() && claim.includes_quarantine());
+    assert!(claim.quarantine_only().is_some());
     let fake2 = Fake::default();
     let report = reclaim_failed_attach_with(&fake2, &claim, &netns_dir());
     assert!(report.is_ok(), "{:?}", fake2.calls());
@@ -331,7 +333,7 @@ fn net1_detach_unpin_failure_keeps_address() {
     assert_eq!(e.step, DeleteStep::UnpinNetns);
     assert_eq!(ipam.address_of(&eid("c1")), Some(a1));
     let claim = e.reclaim_claim().unwrap();
-    assert!(!claim.includes_veth() && claim.includes_netns());
+    assert!(!claim.includes_veth() && claim.includes_netns() && claim.includes_quarantine());
     assert_eq!(
         FailedAttachClaim::from_record(&claim.to_record()),
         Ok(claim)

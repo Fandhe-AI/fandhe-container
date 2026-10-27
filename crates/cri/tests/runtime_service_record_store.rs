@@ -480,6 +480,67 @@ async fn hung_put_is_bounded_by_the_runtime_timeout() {
     assert!(list(&svc).await.is_empty());
 }
 
+/// 有限時間でログに `Put` の直後の `Remove` が現れるのを待つ。
+async fn wait_for_put_then_remove(log: &Log) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let evs = events(log);
+        if let Some(i) = evs.iter().position(|e| matches!(e, Ev::Put { .. }))
+            && evs
+                .get(i + 1..)
+                .is_some_and(|rest| rest.contains(&Ev::Remove))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late put was not followed by a remove: {evs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 期限超過した巻き戻し用の put が遅れて書けても、worker が書いた直後に自分で消す（所有者の無い記録を
+/// 残さない。#2933・REPAIR-5）。ネットワークなし・ありの両方。
+#[tokio::test]
+async fn late_put_after_timeout_is_removed_by_its_own_worker() {
+    for networked_path in [false, true] {
+        let log: Log = Arc::default();
+        let (store, gate) = FakeStore::new(&log);
+        let mut svc = CriRuntimeService::new()
+            .with_runtime_timeout(Duration::from_millis(200))
+            .with_record_store(store.clone());
+        if networked_path {
+            svc = svc.with_pod_network(Arc::new(FakeNet {
+                log: Arc::clone(&log),
+                fail_set_up: false,
+            }));
+        }
+        *store.block_put_at.lock().unwrap() = Some(0);
+        let e = run(&svc).await.unwrap_err();
+        assert_eq!(e.code(), Code::Internal);
+        gate.release.send(()).unwrap();
+        wait_for_put_then_remove(&log).await;
+    }
+}
+
+/// write-ahead の待機中に RPC の future が破棄されても、予約は戻り、遅れて書けた記録は消され、
+/// 同じ metadata の Run が重複として拒否され続けない（#2933・CRI-2）。
+#[tokio::test]
+async fn dropped_run_during_write_ahead_releases_the_reservation() {
+    let (svc, store, gate, log) = networked(false);
+    *store.block_put_at.lock().unwrap() = Some(0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), run(&svc))
+            .await
+            .is_err()
+    );
+    assert!(list(&svc).await.is_empty());
+    gate.release.send(()).unwrap();
+    wait_for_put_then_remove(&log).await;
+    run(&svc).await.expect("same metadata must not be rejected");
+}
+
 /// fsync 中は registry のロックを持たない（List が返る）。同じ ID への並行 Stop・Remove・
 /// CreateContainer は `FAILED_PRECONDITION`。解放後は通常どおり操作できる。
 #[tokio::test]

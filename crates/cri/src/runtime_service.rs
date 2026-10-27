@@ -773,8 +773,49 @@ impl Drop for NetworkTearDownGuard {
 
 /// 記録ストアへの 1 回の I/O（worker へ渡す。#2933）。
 enum StoreCall {
-    Put(RecordId, Vec<u8>),
+    /// 書き込み。`rollback` が `Some` のときは「書けなかった予約の巻き戻し」用の put で、呼び出し側が
+    /// 手放した（期限超過・future の破棄）後に worker が遅れて書けた場合は、worker 自身が書いた直後に
+    /// 削除する（削除を put の完了に順序付ける。所有者の無い記録を残さない。#2933・REPAIR-5）。
+    Put(RecordId, Vec<u8>, Option<Arc<SetUpSettlement>>),
     Remove(RecordId),
+}
+
+/// 巻き戻し用の put を呼び出し側が手放したことを worker へ伝える番人。`Drop` は atomic の CAS だけ
+/// （RPC スレッドで走るため外部処理を持たない）。worker が先に確定済みなら何も起きない。
+struct AbandonPutOnDrop(Option<Arc<SetUpSettlement>>);
+
+impl Drop for AbandonPutOnDrop {
+    fn drop(&mut self) {
+        if let Some(settlement) = &self.0 {
+            settlement.abandon();
+        }
+    }
+}
+
+/// 予約済みの sandbox 記録を、`RunPodSandbox` の future が副作用の前に破棄されたときに戻す guard
+/// （#2933・CRI-2。破棄されると `network_pending` や重複の予約がメモリに残り続けるため）。
+///
+/// 副作用（`set_up`）へ進む前に `disarm` する。`Drop` はロックと除去だけで外部処理を持たない。
+struct ReservationRollback {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+    armed: bool,
+}
+
+impl ReservationRollback {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservationRollback {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut registry) = self.registry.lock()
+        {
+            remove_sandbox_record(&mut registry, &self.id);
+        }
+    }
 }
 
 /// sandbox 記録の書き込み・削除が終わるまで `record_write` を保つ guard（#2933・CRI-1・CRI-2）。
@@ -1303,10 +1344,12 @@ impl CriRuntimeService {
     /// - `StopPodSandbox`: 回収まで済んだら状態を書く。`RemovePodSandbox`: 資源の回収と検査が済んだら記録を消す
     ///
     /// 書き込み・削除の失敗は、ストアのコードによらず固定文言の `INTERNAL` に正規化する（成功を装わない。
-    /// 確定・更新の失敗ではメモリの記録を残す）。`put` / `remove` は同期 I/O で registry のロックの外で直接呼ぶ
-    /// （`run_bounded` で期限を付けると、期限切れ後に書けたか不明なままメモリを巻き戻して所有者の無い記録を
-    /// 残すため。`.lock` の待ちは記録ストア側で 5 秒に有界。fsync 自体は打ち切れず tokio の worker を塞ぎうる）。
-    /// 同じ ID への並行操作は `SandboxRecord::record_write` で拒否する。
+    /// 確定・更新の失敗ではメモリの記録を残す）。`put` / `remove` は registry のロックの外で、専用スレッドの
+    /// worker に `runtime_timeout` の期限つきで渡す（`store_io_bounded`。tokio の worker を塞がない）。
+    /// 同じ ID への並行操作は `SandboxRecord::record_write` で拒否し、その guard は worker が持つため、期限超過
+    /// 後も worker の完了まで保たれる。予約の巻き戻し用の `put` が期限超過・future の破棄で手放された場合は、
+    /// 遅れて書けた worker が自分で記録を消す（別 worker の削除と競合させない）。副作用の前に future が破棄
+    /// されたときは予約（`ReservationRollback`）もメモリから戻す。
     ///
     /// 未実装（REPAIR-3）: コンテナ記録の書く・消す時点は R5 #2934、起動時の読み込みと再採用は R6 #2935・
     /// R7 #2936、本番の配線は R9 #2938。
@@ -1524,16 +1567,27 @@ impl CriRuntimeService {
         let id = resp.pod_sandbox_id.clone();
         // 確定の書き込みが済むまで（set_up を含む全体）同じ ID への並行操作を拒否する。
         let mut write_guard = self.write_guard(&id);
+        // write-ahead の待機中に future が破棄されても、予約（`network_pending`・重複判定）を戻す。
+        let mut reservation = ReservationRollback {
+            registry: Arc::clone(&self.registry),
+            id: id.clone(),
+            armed: true,
+        };
         // write-ahead: set_up（副作用）の前に pending つきで書く。失敗したら副作用を起こさず巻き戻す
-        // （#2933・CRI-2・REPAIR-3）。この記録は「副作用が起きたかもしれない」印として、結果不明のまま
-        // 残る場合は pending=1 のままディスクに残り、R6 #2935 が起動時に解決する。
-        if let Err(err) = self.persist_sandbox(&id, true, &mut write_guard).await {
+        // （#2933・CRI-2・REPAIR-3）。期限超過・破棄で手放した put が遅れて書けた場合は worker が自分で消す。
+        if let Err(err) = self
+            .persist_sandbox_rollbackable(&id, true, &mut write_guard)
+            .await
+        {
             if let Ok(mut registry) = self.registry.lock() {
                 remove_sandbox_record(&mut registry, &id);
             }
+            reservation.disarm();
             self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
+        // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
+        reservation.disarm();
         let config = {
             let registry = self
                 .registry
@@ -1863,6 +1917,27 @@ impl CriRuntimeService {
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
     ) -> Result<(), CriError> {
+        self.persist_sandbox_inner(id, pending, guard, false).await
+    }
+
+    /// 書けなかったらメモリの予約ごと巻き戻す put（`rollback_unwritten` と組で使う）。期限超過・future の
+    /// 破棄で手放したあとに遅れて書けた記録は、worker が書いた直後に自分で消す。
+    async fn persist_sandbox_rollbackable(
+        &self,
+        id: &str,
+        pending: bool,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+    ) -> Result<(), CriError> {
+        self.persist_sandbox_inner(id, pending, guard, true).await
+    }
+
+    async fn persist_sandbox_inner(
+        &self,
+        id: &str,
+        pending: bool,
+        guard: &mut Option<SandboxRecordWriteGuard>,
+        rollbackable: bool,
+    ) -> Result<(), CriError> {
         if self.record_store.is_none() {
             return Ok(());
         }
@@ -1880,7 +1955,10 @@ impl CriRuntimeService {
         let record_id =
             RecordId::new(id).map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))?;
         let bytes = data.encode()?;
-        self.store_io_bounded(StoreCall::Put(record_id, bytes), guard)
+        let settlement = rollbackable.then(|| Arc::new(SetUpSettlement::new()));
+        // 巻き戻し用の put は、この future が破棄・期限超過で手放した時点で worker へ手放しを伝える。
+        let _abandon = AbandonPutOnDrop(settlement.clone());
+        self.store_io_bounded(StoreCall::Put(record_id, bytes, settlement), guard)
             .await
     }
 
@@ -1919,7 +1997,14 @@ impl CriRuntimeService {
         let moved = guard.take();
         let outcome = run_bounded(self.runtime_timeout, move || {
             let result = match &call {
-                StoreCall::Put(id, bytes) => store.put(RecordKind::Sandbox, id, bytes),
+                StoreCall::Put(id, bytes, rollback) => {
+                    let result = store.put(RecordKind::Sandbox, id, bytes);
+                    // 手放された巻き戻し用の put は、完了の直後にここで消す（別 worker の削除と競合させない）。
+                    if rollback.as_ref().is_some_and(|s| !s.settle_by_worker()) {
+                        let _ = store.remove(RecordKind::Sandbox, id);
+                    }
+                    result
+                }
                 StoreCall::Remove(id) => store.remove(RecordKind::Sandbox, id),
             };
             (result, moved)
@@ -1951,13 +2036,23 @@ impl CriRuntimeService {
         let (resp, _) = self.reserve_sandbox(req, false)?;
         let id = resp.pod_sandbox_id.clone();
         let mut write_guard = self.write_guard(&id);
-        if let Err(err) = self.persist_sandbox(&id, false, &mut write_guard).await {
+        let mut reservation = ReservationRollback {
+            registry: Arc::clone(&self.registry),
+            id: id.clone(),
+            armed: true,
+        };
+        if let Err(err) = self
+            .persist_sandbox_rollbackable(&id, false, &mut write_guard)
+            .await
+        {
             if let Ok(mut registry) = self.registry.lock() {
                 remove_sandbox_record(&mut registry, &id);
             }
+            reservation.disarm();
             self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
+        reservation.disarm();
         Ok(resp)
     }
 

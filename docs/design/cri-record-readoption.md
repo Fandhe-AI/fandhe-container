@@ -68,8 +68,8 @@
   - ファイルを先に消す理由: この時点で資源は回収済みで、所有の証明を消しても回収不能な資源は残らない。メモリを先に消すと、削除に失敗した後の再試行が「未知 ID は成功」でファイルに触れず、孤児が再起動まで残る。削除に失敗したらメモリを残して `INTERNAL` を返す
   - 失敗の写し方: `put`・`remove`・符号化の失敗はコード（`DEADLINE_EXCEEDED`・`FAILED_PRECONDITION` を含む）によらず固定文言の `INTERNAL` にする。副作用の前の `put` の失敗は予約を戻し `set_up` を呼ばない。確定の `put` の失敗は notready のままメモリに残す（`network_owned` なので Stop・Remove が回収できる）
   - 並行操作: `SandboxRecord::record_write` を書く間だけ立て、同じ ID への Stop・Remove・CreateContainer を `FAILED_PRECONDITION` で拒否する。`put` / `remove`（fsync）は registry の `Mutex` の外で行い、書くたびにロック下でスナップショットを取り直す
-  - `run_bounded` を使わない理由: ストアの `put` / `remove` は同期 API で、`.lock` の待ちは 5 秒で打ち切られる。期限を外から付けると、期限切れの後に書けたか不明なままメモリを巻き戻して所有者の無い記録ファイルを作りうる。fsync 自体は打ち切れず、tokio の worker を一時的に塞ぐ（残余）
-  - 残余: 期限超過の後に worker が遅れて成功した場合と、set_up 失敗の回収後の `remove` が失敗した場合は `pending=1` の記録がディスクに残る（R6 の pending 解決に委ねる）。Remove の途中で配下の状態が変わりメモリを除去できなかった場合は、記録を書き直して `INTERNAL` を返す（best effort）。Remove の連鎖で消える配下のコンテナ記録ファイルは R5 で扱う
+  - ストア I/O の実行方式: `put` / `remove`（fsync）は `store_io_bounded` が `run_bounded` で専用スレッドの worker に渡し、`runtime_timeout` で待つ（tokio の worker を塞がない。REPAIR-5）。`record_write` の guard は worker へ move し、期限超過後も worker の完了まで保つ。副作用の前の予約を戻す `put` は、呼び出し側が手放した（期限超過・future の破棄）あとに遅れて書けた場合、worker が書いた直後に自分で `remove` する（削除を `put` の完了に順序付け、所有者の無い記録を残さない）。write-ahead の待機中に future が破棄されたときは `ReservationRollback` が予約（`network_pending`・重複判定）をメモリから戻す
+  - 残余: 確定版の `put` が期限超過した後に worker が遅れて成功した場合と、set_up 失敗の回収後の `remove` が失敗した場合は `pending=1` の記録がディスクに残る（R6 の pending 解決に委ねる）。Remove の途中で配下の状態が変わりメモリを除去できなかった場合は、記録を書き直して `INTERNAL` を返す（best effort）。Remove の連鎖で消える配下のコンテナ記録ファイルは R5 で扱う
 
 ## 起動時の読み込みと照合（fail-closed）
 

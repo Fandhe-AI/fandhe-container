@@ -427,9 +427,13 @@ impl NetworkStore {
                 // rename は空の既存ディレクトリを置き換えるため、直前に不在を確かめ直す。
                 self.ensure_absent(name)?;
                 fs::rename(self.dir.path(&stage), self.dir.path(name))
-                    .map_err(|e| map_io(&e, "failed to publish network definition"))?;
-                self.dir.sync()
+                    .map_err(|e| map_io(&e, "failed to publish network definition"))
             });
+            if result.is_ok() {
+                // rename 後は定義が公開済み。ここで sync の失敗を返すと再試行が AlreadyExists になり
+                // 呼び出し側が回復できないため、成功扱いにする（耐久性は次の sync で追いつく。NET-6）。
+                let _ = self.dir.sync();
+            }
             if result.is_err() {
                 self.discard(&stage);
             }
@@ -596,7 +600,8 @@ impl NetworkStore {
             let gone = stage_name(REMOVING_PREFIX);
             fs::rename(self.dir.path(name.as_str()), self.dir.path(&gone))
                 .map_err(|e| map_io(&e, "failed to remove network definition"))?;
-            self.dir.sync()?;
+            // rename 後は名前が消えている。sync の失敗を返すと再試行が NotFound になるため成功扱いにする。
+            let _ = self.dir.sync();
             // 名前は原子的に消えた。中身の後始末の失敗は残骸として残り、次の create が掃除する。
             let _ = fs::remove_file(n.dir.path(DEFINITION_FILE));
             let _ = fs::remove_file(n.dir.path(LOCK_FILE));

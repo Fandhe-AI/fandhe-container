@@ -15,11 +15,23 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroup_start_chain-XXXX> --ignored
 //! ```
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use fandhe_container_core::cgroups::{
-        CgroupLimitPlan, DelegatedCgroup, DevicePolicyMode, DevicePolicyNotApplied,
-        DevicePolicyOutcome,
+        CgroupLimitPlan, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::delete;
@@ -35,7 +47,7 @@ mod linux {
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn core3_oci6_task32_start_chain_records_then_creates_and_delete_cleans_up() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let parent = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
         let id = ContainerId::new(format!("s{}", std::process::id())).expect("id");
 

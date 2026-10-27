@@ -104,6 +104,16 @@ mod libc_abi {
         assert!(super::FULLFSYNC_FALLBACK_ERRNOS[0] == libc::EINVAL);
         assert!(super::FULLFSYNC_FALLBACK_ERRNOS[1] == libc::ENOTSUP);
     };
+
+    // 最上位の `extern "C"` 関数の型の照合（#1849・#1837）。同じ関数ポインタ型へ自前と `libc` の両方を代入する。
+    // 関数は呼ばず `unsafe` を使わない。`geteuid` の `uid_t` は apple で `u32`（自前の宣言と同じ）。
+    // 対象外: `acl_get_link_np`・`acl_get_entry`・`acl_free`。`libc` 0.2.189 の apple に `acl_*` の宣言が無い
+    // （一次情報は Apple SDK の `sys/acl.h` と `acl_get_file(3)`・`acl_get_entry(3)`・`acl_free(3)`）。
+    // SDK との照合は #2369 から未了で、この照合では確認していない。
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+    const _: unsafe extern "C" fn(c_int) -> c_int = super::fsync;
+    const _: unsafe extern "C" fn(c_int) -> c_int = libc::fsync;
 }
 
 // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`uid_t geteuid(void)`、
@@ -399,6 +409,18 @@ pub(crate) mod plugin_fs {
             libc_const_eq!(F_GETPATH, c_int, c_int);
             libc_const_eq!(MAXPATHLEN, usize, c_int);
         };
+
+        // `extern "C"` 関数の型の照合（#1849・#1837）。`openat`・`fcntl` はどちらも可変長で、`libc` も可変長
+        // （Apple arm64 ABI は可変長部をスタックに積むため、可変長の食い違いは ABI の不一致になる）。
+        // `fcntl$UNIX2003` 等の `link_name` の違いは 32 bit の macOS x86 だけで、本 crate の対応（64 bit の
+        // x86_64・aarch64）には該当しない。対象外: `acl_get_fd_np`・`acl_get_entry`・`acl_free`
+        // （`libc` の apple に宣言が無い。理由と出典は最上位の `libc_abi` と同じで、SDK との照合は #2369 から未了）。
+        const _: unsafe extern "C" fn(c_int, *const libc::c_char, c_int, ...) -> c_int =
+            super::openat;
+        const _: unsafe extern "C" fn(c_int, *const libc::c_char, c_int, ...) -> c_int =
+            libc::openat;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = super::fcntl;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = libc::fcntl;
     }
 
     #[cfg(test)]

@@ -101,7 +101,7 @@
 
 ### D8 host モード
 
-- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3058 の core の変更に含める。pasta の同期点〔#1939〕と共有する）で、net の `HostNetns::verify_process(pid)` により確かめる。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
+- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3058 の core の変更に含める。pasta の同期点〔#1939〕と共有する）で、net の `HostNetns::verify_process(pid)` により確かめる。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。照合は資格情報を落とす前に行う: 同期点は子が `process.user` の setuid / setgid / `setgroups` を行う前（子がまだ supervisor と同じ実 UID の間）に置き、照合の完了を pipe で親子同期してから子が資格情報を切り替えて exec する。これにより RootlessSubordinateIds で `process.user` が非 root（子のホスト UID が supervisor と異なる）でも、`/proc/<pid>/task/<tid>/ns/net` の stat に要る ptrace 相当の権限を増やさずに照合でき、非特権の supervisor が `PermissionDenied` で正常な起動を拒否する（既定の none でも起きる）ことがない。資格情報を落とした後の再照合はしない（netns は setns / unshare 済みで、以後 exec までに変わる経路が無い。エラーの意味は SEC-5 の `FailedPrecondition` に統一し、`PermissionDenied` を照合の失敗として黙って握りつぶさない）。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
 ### D9 hosts / resolv.conf
@@ -191,6 +191,12 @@
 ### D14 失敗時のロールバック・stop / delete の後始末
 
 - **決定**: supervisor の start の順序は、(1) 文書の復号、(2) hosts の作成と、host / none の resolv.conf の書き込み（D9）、(3) rootful のみ plugin の `attach`（D13）と、bridge の resolv.conf の生成（D9。ヘルパーのアドレスは attach の結果から得る）、(4) cgroup、(5) launch（netns の作成 / 参加）、(6) host / none の照合（D8）、(7) 報告。k 段目で失敗したら k−1 段目から逆順に戻す（detach → 生成ファイルの削除）。none / host ではカーネル資源の巻き戻しは無い（netns はプロセスと一緒に消える）。
+- cgroup 配置（NET-7。(3) の plugin と DNS ヘルパーは (4) の cgroup 準備より前に起動するため、ここで決める）: `DelegatedCgroup::prepare` は委譲親に supervisor と登録済み companion 以外のプロセスがあると拒否し、companion は評価時にコンテナの cgroup 側へ退避（移動）される。`setsid` と二重 fork は cgroup の所属を変えないので、何もしないと plugin とヘルパーが supervisor の scope を継承して最初の bridge 起動が失敗する。また共有ヘルパーはコンテナより長生きするため、コンテナの cgroup や supervisor の scope に置いてはならない（コンテナの終了や scope の削除で巻き添えになる）。そこで次のとおり決める。
+  - 配置先: 委譲された cgroup の根の直下に専用の兄弟 cgroup `net-helpers` を置く（コンテナごとの cgroup とは別。ランチャーが rootful の起動時に作成し、supervisor の scope・コンテナの cgroup のどちらの配下にも入れない）。plugin（`attach` / `detach` の間だけ生きる一時プロセス）と DNS ヘルパー（参照カウントが 0 になるまで生きる共有プロセス）の両方をここに置く。
+  - 移動する時点: 起動の瞬間から入れる。`clone3` の `CLONE_INTO_CGROUP`（`net-helpers` の fd）で起動し、fork から移動までの間に委譲親へ残る窓を作らない。`CLONE_INTO_CGROUP` が使えない環境では、起動の直後・(4) の前に、`pidfd` で同一性を確かめた上で `cgroup.procs` へ書いて移し、移し終えるまで (4) へ進まない（移せなければ起動を失敗にして D14 の逆順に戻す）。
+  - companion の範囲: plugin とヘルパーは companion に登録しない（登録すると prepare がコンテナ側へ退避して寿命が壊れるため）。companion は従来どおり、supervisor 自身に付随してコンテナと運命を共にするプロセスに限る。`prepare` の委譲親の検査はそのまま（supervisor と companion 以外のプロセスがいれば拒否）で、plugin とヘルパーは `net-helpers` にいるため検査に掛からない。
+  - 順序の整合: (3) の起動時に配置が済んでいることを (4) の前提条件とし、(4) は委譲親に `net-helpers` 由来のプロセスが残っていないことを（記録の pid の cgroup を読んで）確かめてから進む。0→1 で起動したヘルパーは、最後の detach（1→0）の停止（D11）まで `net-helpers` に居続ける。supervisor が先に異常終了してもヘルパーは `net-helpers` にいるので scope の削除に巻き込まれず、回収は次の特権操作が先頭で行う（D13）。
+  - 実装: ランチャーの `net-helpers` の作成と supervisor の配置を #3074 に、`DelegatedCgroup` 側の変更が要れば（`net-helpers` を検査の対象外とする指定）core の cgroups に、受け入れ条件として入れる。
 - stop / delete の後始末: none / host は delete で `@container-etc` を消すだけ。pasta は #1940。rootful bridge は D13（supervisor が最終終了で detach、CLI の delete は孤児の印を付ける）。netns の pin・veth・公開・DNS からの離脱は `detach` が逆順で行う。
 
 ### D15 期限（REPAIR-5）

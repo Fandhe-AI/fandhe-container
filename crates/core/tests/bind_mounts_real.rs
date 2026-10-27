@@ -840,7 +840,12 @@ mod linux {
 
     /// READY を T へ出し、`GO` を 1 行受けるまで待つ（EOF・別の行は失敗。T の期限と kill で回収される）。
     fn ready_and_wait_go() {
+        // READY は GO を待つ前に必ず T へ届ける（明示 flush でバッファ滞留によるデッドロックを避ける）。
         println!("READY");
+        {
+            use std::io::Write;
+            std::io::stdout().flush().expect("flush READY");
+        }
         let mut line = String::new();
         std::io::stdin()
             .lock()

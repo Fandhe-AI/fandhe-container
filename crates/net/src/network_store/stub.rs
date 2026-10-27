@@ -5,10 +5,12 @@
 
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{NetworkDefinition, NetworkListing};
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::NetOpRecorder;
 use crate::network::NetworkName;
 
 fn unsupported() -> NetError {
@@ -39,6 +41,14 @@ pub struct NetworkLockGuard<'g> {
 impl NetworkStore {
     /// 常に `Unimplemented`。
     pub fn open(_state_root: &Path) -> Result<Self, NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`（記録先は使わない）。
+    pub fn open_with_recorder(
+        _state_root: &Path,
+        _recorder: Arc<dyn NetOpRecorder>,
+    ) -> Result<Self, NetError> {
         Err(unsupported())
     }
 

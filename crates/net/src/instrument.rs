@@ -63,6 +63,16 @@ pub enum NetOpKind {
     /// 軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入（検証 + 追記。
     /// `etc_hosts::inject_service_hosts_with_recorder`。TASK-146.1・#334・NET-8）。
     StaticHostsInject,
+    /// ネットワーク定義ストアの open（`NetworkStore::open`。NET-6・#3059）。
+    NetworkStoreOpen,
+    /// ネットワーク定義の作成（`NetworkStore::create`。ロック待ちを含む）。
+    NetworkStoreCreate,
+    /// ネットワーク定義の取得（`NetworkStore::get`）。
+    NetworkStoreGet,
+    /// ネットワーク定義の一覧（`NetworkStore::list`）。
+    NetworkStoreList,
+    /// ネットワーク定義の削除（`NetworkStore::remove`）。
+    NetworkStoreRemove,
 }
 
 impl NetOpKind {
@@ -82,6 +92,11 @@ impl NetOpKind {
             NetOpKind::AddHostsApply => "hosts.add_host.apply",
             NetOpKind::DnsResolvConfWrite => "dns.resolv_conf.write",
             NetOpKind::StaticHostsInject => "hosts.static.inject",
+            NetOpKind::NetworkStoreOpen => "network.store.open",
+            NetOpKind::NetworkStoreCreate => "network.store.create",
+            NetOpKind::NetworkStoreGet => "network.store.get",
+            NetOpKind::NetworkStoreList => "network.store.list",
+            NetOpKind::NetworkStoreRemove => "network.store.remove",
         }
     }
 }
@@ -256,7 +271,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 13] = [
+    const ALL_KINDS: [NetOpKind; 18] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -270,6 +285,11 @@ mod tests {
         NetOpKind::AddHostsApply,
         NetOpKind::DnsResolvConfWrite,
         NetOpKind::StaticHostsInject,
+        NetOpKind::NetworkStoreOpen,
+        NetOpKind::NetworkStoreCreate,
+        NetOpKind::NetworkStoreGet,
+        NetOpKind::NetworkStoreList,
+        NetOpKind::NetworkStoreRemove,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。

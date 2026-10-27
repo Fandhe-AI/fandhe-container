@@ -11,8 +11,8 @@ use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::definition::{DEFINITION_MAX_BYTES, MAX_NETWORKS, is_reserved_network_name};
@@ -21,6 +21,7 @@ use super::{
     NetworkListing, check_dir_meta, check_file_meta,
 };
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::network::NetworkName;
 use crate::sys;
 
@@ -235,10 +236,20 @@ fn stage_name(prefix: &str) -> String {
 }
 
 /// ネットワーク定義ストア（`<state_root>/@networks`）。
-#[derive(Debug)]
 pub struct NetworkStore {
     dir: Dir,
     lock_timeout: Duration,
+    /// 操作の結果と所要時間の記録先（REPAIR-4）。既定は記録しない。
+    recorder: Arc<dyn NetOpRecorder>,
+}
+
+impl std::fmt::Debug for NetworkStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkStore")
+            .field("dir", &self.dir)
+            .field("lock_timeout", &self.lock_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 全体のロックのガード。解放はドロップ時。
@@ -274,6 +285,22 @@ impl NetworkStore {
     /// `state_root` は呼び出し側が与えた信頼するルート（core の状態ストアと同じ扱い）。`@networks` から先は
     /// 作成時に 0700 を明示し、既存のものは検査して違反なら自動修復せず拒否する。
     pub fn open(state_root: &Path) -> Result<Self, NetError> {
+        Self::open_with_recorder(state_root, Arc::new(NoopNetOpRecorder))
+    }
+
+    /// [`open`](Self::open) に記録先を渡す。以降の open / create / get / list / remove の結果と所要時間を
+    /// `recorder` へ渡す（早期エラー・ロック待ちの時間切れを含む。REPAIR-4）。記録先は有界時間で戻ること。
+    pub fn open_with_recorder(
+        state_root: &Path,
+        recorder: Arc<dyn NetOpRecorder>,
+    ) -> Result<Self, NetError> {
+        let rec = Arc::clone(&recorder);
+        record_net_op(&*rec, NetOpKind::NetworkStoreOpen, || {
+            Self::open_inner(state_root, recorder)
+        })
+    }
+
+    fn open_inner(state_root: &Path, recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
         // 対応外アーキでは O_NOFOLLOW 等が 0 になり symlink 拒否が効かないため、fail-closed で拒否する。
         if sys::O_NOFOLLOW == 0 || sys::O_DIRECTORY == 0 {
             return Err(err(
@@ -318,6 +345,7 @@ impl NetworkStore {
         Ok(Self {
             dir,
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
+            recorder,
         })
     }
 
@@ -362,40 +390,42 @@ impl NetworkStore {
 
     /// 定義を作る。カーネル資源は作らない。全体の排他ロックの下で、staging に書いてから rename で公開する。
     pub fn create(&self, def: &NetworkDefinition) -> Result<(), NetError> {
-        let name = def.name().as_str();
-        if is_reserved_network_name(name) {
-            return Err(err(
-                NetErrorCode::InvalidArgument,
-                "network name is reserved",
-            ));
-        }
-        let _g = self.lock_global_exclusive()?;
-        self.sweep_leftovers()?;
-        self.ensure_absent(name)?;
-        let count = self
-            .dir
-            .entries(SCAN_LIMIT)?
-            .iter()
-            .filter(|n| NetworkName::new(n).is_ok() && !is_reserved_network_name(n))
-            .count();
-        if count >= MAX_NETWORKS {
-            return Err(err(
-                NetErrorCode::ResourceExhausted,
-                "too many networks are defined",
-            ));
-        }
-        let stage = stage_name(STAGING_PREFIX);
-        let result = self.write_staging(&stage, def).and_then(|()| {
-            // rename は空の既存ディレクトリを置き換えるため、直前に不在を確かめ直す。
+        record_net_op(&*self.recorder, NetOpKind::NetworkStoreCreate, || {
+            let name = def.name().as_str();
+            if is_reserved_network_name(name) {
+                return Err(err(
+                    NetErrorCode::InvalidArgument,
+                    "network name is reserved",
+                ));
+            }
+            let _g = self.lock_global_exclusive()?;
+            self.sweep_leftovers()?;
             self.ensure_absent(name)?;
-            fs::rename(self.dir.path(&stage), self.dir.path(name))
-                .map_err(|e| map_io(&e, "failed to publish network definition"))?;
-            self.dir.sync()
-        });
-        if result.is_err() {
-            self.discard(&stage);
-        }
-        result
+            let count = self
+                .dir
+                .entries(SCAN_LIMIT)?
+                .iter()
+                .filter(|n| NetworkName::new(n).is_ok() && !is_reserved_network_name(n))
+                .count();
+            if count >= MAX_NETWORKS {
+                return Err(err(
+                    NetErrorCode::ResourceExhausted,
+                    "too many networks are defined",
+                ));
+            }
+            let stage = stage_name(STAGING_PREFIX);
+            let result = self.write_staging(&stage, def).and_then(|()| {
+                // rename は空の既存ディレクトリを置き換えるため、直前に不在を確かめ直す。
+                self.ensure_absent(name)?;
+                fs::rename(self.dir.path(&stage), self.dir.path(name))
+                    .map_err(|e| map_io(&e, "failed to publish network definition"))?;
+                self.dir.sync()
+            });
+            if result.is_err() {
+                self.discard(&stage);
+            }
+            result
+        })
     }
 
     fn ensure_absent(&self, name: &str) -> Result<(), NetError> {
@@ -451,6 +481,14 @@ impl NetworkStore {
 
     fn read_one(&self, name: &str) -> Result<NetworkDefinition, NetError> {
         let sub = self.dir.open_subdir(name)?;
+        // 読み取りでも @lock を検査する（欠落・symlink・権限不正・複数ハードリンクは破損として扱う）。
+        sub.open_regular_ro(LOCK_FILE, u64::MAX).map_err(|e| {
+            if e.code() == NetErrorCode::NotFound {
+                err(NetErrorCode::DataLoss, "network lock file is missing")
+            } else {
+                e
+            }
+        })?;
         let mut f = sub
             .open_regular_ro(DEFINITION_FILE, DEFINITION_MAX_BYTES as u64)
             .map_err(|e| {
@@ -466,8 +504,8 @@ impl NetworkStore {
                 .len(),
         )
         .map_err(|_| err(NetErrorCode::DataLoss, "network definition is too large"))?;
-        // 確保の前にサイズを検証済み（check_file_meta の max_len）。
-        let mut buf = Vec::with_capacity(len);
+        // metadata は検査時と別の取得で拡張されうるため、確保は固定上限で頭打ちにする。
+        let mut buf = Vec::with_capacity(len.min(DEFINITION_MAX_BYTES));
         (&mut f)
             .take(DEFINITION_MAX_BYTES as u64 + 1)
             .read_to_end(&mut buf)
@@ -490,30 +528,35 @@ impl NetworkStore {
 
     /// 定義を 1 件読む。無ければ `NotFound`。
     pub fn get(&self, name: &NetworkName) -> Result<NetworkDefinition, NetError> {
-        let _g = self.lock_global_shared()?;
-        self.read_one(name.as_str())
+        record_net_op(&*self.recorder, NetOpKind::NetworkStoreGet, || {
+            let _g = self.lock_global_shared()?;
+            self.read_one(name.as_str())
+        })
     }
 
     /// 全定義を名前順に返す。破損した項目は `broken` に分類つきで載せ、他の定義を隠さない。
     pub fn list(&self) -> Result<NetworkListing, NetError> {
-        let _g = self.lock_global_shared()?;
-        let mut names = self.dir.entries(SCAN_LIMIT)?;
-        names.sort();
-        let mut out = NetworkListing::default();
-        for n in names {
-            if n == LOCK_FILE || n.starts_with(STAGING_PREFIX) || n.starts_with(REMOVING_PREFIX) {
-                continue;
+        record_net_op(&*self.recorder, NetOpKind::NetworkStoreList, || {
+            let _g = self.lock_global_shared()?;
+            let mut names = self.dir.entries(SCAN_LIMIT)?;
+            names.sort();
+            let mut out = NetworkListing::default();
+            for n in names {
+                if n == LOCK_FILE || n.starts_with(STAGING_PREFIX) || n.starts_with(REMOVING_PREFIX)
+                {
+                    continue;
+                }
+                if NetworkName::new(&n).is_err() || is_reserved_network_name(&n) {
+                    out.unrecognized += 1;
+                    continue;
+                }
+                match self.read_one(&n) {
+                    Ok(d) => out.definitions.push(d),
+                    Err(e) => out.broken.push((n, e.code())),
+                }
             }
-            if NetworkName::new(&n).is_err() || is_reserved_network_name(&n) {
-                out.unrecognized += 1;
-                continue;
-            }
-            match self.read_one(&n) {
-                Ok(d) => out.definitions.push(d),
-                Err(e) => out.broken.push((n, e.code())),
-            }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     /// 定義を消す。`definition` と `@lock` 以外の項目（メンバー等）があれば `FailedPrecondition`。
@@ -522,33 +565,35 @@ impl NetworkStore {
     /// ロックを取れず `NotFound` となり、本メソッドでは回収できない。staging と rename で作成するため
     /// 通常運用では起きず、外部要因の破損に限る。その回収手順は後続 issue（#3067 周辺）で扱う（NET-6）。
     pub fn remove(&self, name: &NetworkName) -> Result<(), NetError> {
-        let g = self.lock_global_exclusive()?;
-        let n = g.lock_network(name)?;
-        let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
-            if e.code() == NetErrorCode::ResourceExhausted {
-                err(
+        record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
+            let g = self.lock_global_exclusive()?;
+            let n = g.lock_network(name)?;
+            let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
+                if e.code() == NetErrorCode::ResourceExhausted {
+                    err(
+                        NetErrorCode::FailedPrecondition,
+                        "network has members or pending records",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            if items.iter().any(|i| i != DEFINITION_FILE && i != LOCK_FILE) {
+                return Err(err(
                     NetErrorCode::FailedPrecondition,
                     "network has members or pending records",
-                )
-            } else {
-                e
+                ));
             }
-        })?;
-        if items.iter().any(|i| i != DEFINITION_FILE && i != LOCK_FILE) {
-            return Err(err(
-                NetErrorCode::FailedPrecondition,
-                "network has members or pending records",
-            ));
-        }
-        let gone = stage_name(REMOVING_PREFIX);
-        fs::rename(self.dir.path(name.as_str()), self.dir.path(&gone))
-            .map_err(|e| map_io(&e, "failed to remove network definition"))?;
-        self.dir.sync()?;
-        // 名前は原子的に消えた。中身の後始末の失敗は残骸として残り、次の create が掃除する。
-        let _ = fs::remove_file(n.dir.path(DEFINITION_FILE));
-        let _ = fs::remove_file(n.dir.path(LOCK_FILE));
-        let _ = fs::remove_dir(self.dir.path(&gone));
-        Ok(())
+            let gone = stage_name(REMOVING_PREFIX);
+            fs::rename(self.dir.path(name.as_str()), self.dir.path(&gone))
+                .map_err(|e| map_io(&e, "failed to remove network definition"))?;
+            self.dir.sync()?;
+            // 名前は原子的に消えた。中身の後始末の失敗は残骸として残り、次の create が掃除する。
+            let _ = fs::remove_file(n.dir.path(DEFINITION_FILE));
+            let _ = fs::remove_file(n.dir.path(LOCK_FILE));
+            let _ = fs::remove_dir(self.dir.path(&gone));
+            Ok(())
+        })
     }
 }
 
@@ -814,6 +859,58 @@ mod tests {
         assert_eq!(
             code(s.lock_global_shared()),
             NetErrorCode::FailedPrecondition
+        );
+    }
+
+    /// NET-6: 読み取りでもネットワークの @lock の破損を検出する（get はエラー、list は broken）。
+    #[test]
+    fn net6_3059_read_detects_broken_lock() {
+        let t = Tmp::new("readlock");
+        let s = NetworkStore::open(&t.0).unwrap();
+        s.create(&pasta("n1")).unwrap();
+        s.create(&pasta("n2")).unwrap();
+        fs::remove_file(t.nets().join("n1/@lock")).unwrap();
+        fs::remove_file(t.nets().join("n2/@lock")).unwrap();
+        symlink("/dev/null", t.nets().join("n2/@lock")).unwrap();
+        assert_eq!(code(s.get(&nn("n1"))), NetErrorCode::DataLoss);
+        assert_eq!(code(s.get(&nn("n2"))), NetErrorCode::FailedPrecondition);
+        let l = s.list().unwrap();
+        assert!(l.definitions.is_empty());
+        assert_eq!(
+            l.broken,
+            vec![
+                ("n1".to_string(), NetErrorCode::DataLoss),
+                ("n2".to_string(), NetErrorCode::FailedPrecondition)
+            ]
+        );
+    }
+
+    /// REPAIR-4: 各操作の結果（成功・失敗）が記録される。
+    #[test]
+    fn net6_3059_operations_are_recorded() {
+        use crate::instrument::{NetOpOutcome, testing::Collect};
+        let t = Tmp::new("recorded");
+        let c = Arc::new(Collect::default());
+        let s = NetworkStore::open_with_recorder(&t.0, c.clone()).unwrap();
+        s.create(&pasta("n1")).unwrap();
+        assert!(s.create(&pasta("n1")).is_err());
+        s.get(&nn("n1")).unwrap();
+        s.list().unwrap();
+        s.remove(&nn("n1")).unwrap();
+        assert!(s.get(&nn("n1")).is_err());
+        use NetOpKind as K;
+        use NetOpOutcome::{Failure as F, Success as S};
+        assert_eq!(
+            c.kinds(),
+            vec![
+                (K::NetworkStoreOpen, S),
+                (K::NetworkStoreCreate, S),
+                (K::NetworkStoreCreate, F),
+                (K::NetworkStoreGet, S),
+                (K::NetworkStoreList, S),
+                (K::NetworkStoreRemove, S),
+                (K::NetworkStoreGet, F),
+            ]
         );
     }
 

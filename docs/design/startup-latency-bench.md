@@ -23,7 +23,7 @@
 | argv | `USER_SCOPE_WRAPPER_ARGS` の末尾 `--` の直前にベンチだけの `--unit=<名前>` を足す（後始末が scope の cgroup を名前で探すため。名前は実行ごとの nonce を含み一意） |
 | 環境 | `env_clear()` の後、固定 `PATH` と検証済み `XDG_RUNTIME_DIR` だけ。`DBUS_SESSION_BUS_ADDRESS` は渡さず user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` を使う |
 | cwd・その他 | cwd は `/`、`process_group(0)`、stdin は null、stderr は null |
-| 事前検査 | `$XDG_RUNTIME_DIR/systemd/private` が自 euid 所有のソケットでなければ、試行の前に `unsupported-environment` で止まる（CLI の `user_manager_env` と同じ判定。値は出力しない） |
+| 事前検査 | `$XDG_RUNTIME_DIR/systemd/private` が自 euid 所有のソケットでなければ、試行の前に `unsupported-environment` で止まる（CLI の `user_manager_env` と同じ判定。値は出力しない）。スモークの `user_manager=` も同じ判定を使う（CORE-10・REPAIR-8） |
 
 詳細は [cgroups.md](cgroups.md) を参照。
 

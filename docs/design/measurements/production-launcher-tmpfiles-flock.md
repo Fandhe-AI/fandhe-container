@@ -107,7 +107,26 @@ aging（30d）が消さないため対象外。
 
 ### 残余
 
-- 既定のテスト集合（`--ignored` 不要）で temp_dir 直下に bundle を作り fake launcher で create/start/delete を通す試験も
-  同じ競合を受けうる（本 issue の対象外）
+- 既定のテスト集合の core の試験は #2958 で対応済み（下の節）。supervisor・cli の既定集合と、`#[ignore]` の
+  `cgroup_*`・`confirm_recorded_cgroup` は未判定・未保護で、追跡が必要
 - `linux-env-probe.yml` への tmpfiles 設定・timer の観測ステップ（任意項目）は未実施
 - CI 外の 3 件（cli）はビルドと clippy までの確認で、実機実行は人手
+
+## 既定のテスト集合への展開（#2958・CORE-5・REPAIR-12）
+
+`--ignored` 不要の core の試験にも同じ競合が起きうるため、試験ごとの保護済み親 `ScratchDir`
+（`crates/core/tests/support/scratch_root.rs`。排他作成した 0700 の親に共有 flock を持ち、drop で親を消す）を
+適用した。プロセスで 1 つの `scratch_root` は harness = false の 1 本向け、`ScratchDir` は libtest の並列試験と
+複数 fixture 向け。bundle・状態ルートは親の **子** に作る（親自体は製品がロックしない）。Linux 以外は
+`BundleLock` が無いため保護せず、排他作成だけ行う。挙動は `scratch_root_guard` で固定した。
+
+適用（判定基準: 製品の `BundleLock` / image rootfs の `try_lock` を通るか）:
+
+| 試験 | 当たる経路 |
+| ---- | ---------- |
+| `oci_create`・`oci_start`（`MemStateStore` の状態ルートを含む）・`oci_delete`・`oci_lifecycle`・`oci_runtime_error` | create・start・delete |
+| `oci_create_with_image`・`oci_create_crash_reclaim` | `create_with_image`（BundleLock と rootfs の `try_lock`） |
+| `state_store`・`daemonless`・`create_mount_audit_delivery` | create・start・delete（子は親が保持するロックの下で動く） |
+
+対象外: `oci_kill`・`state_store_*`・`oci_runtime_error` の `temp_dir().join("bundle")` はパス文字列のみでディレクトリを作らない。
+`oci_config`・`exec_diagnostic_output`・`audit_file_writer*`・`plugin_*` はディレクトリ flock を通らない。

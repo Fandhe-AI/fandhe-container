@@ -42,6 +42,12 @@
 //! 外側の `timeout` は、試験内の各待機の上限（REPAIR-5）が万一効かない場合の最終的な打ち切り。
 //!
 //! 実行された場合は、環境不備を含むあらゆる失敗を失敗として扱う（検証せずに成功する分岐を持たない）。
+//! 委譲 cgroup の前提欠如は、1 行目が `exec_identify_cgroup: PRECONDITION FAILED (test environment, ...)`
+//! になる（分類元は `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
+
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -55,10 +61,16 @@ fn main() {
         Some(linux::JOINER_OK) => linux::joiner_ok(&args),
         Some(linux::JOINER_RECREATED) => linux::joiner_recreated(&args),
         Some(linux::JOINER_MOVED) => linux::joiner_moved(&args),
-        _ if args.iter().any(|a| a == "--ignored") => linux::orchestrate(),
-        _ => println!(
-            "exec_identify_cgroup: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
-        ),
+        _ if args.iter().any(|a| a == "--ignored") => {
+            precondition::self_check();
+            linux::orchestrate()
+        }
+        _ => {
+            precondition::self_check();
+            println!(
+                "exec_identify_cgroup: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+            )
+        }
     }
 }
 
@@ -249,7 +261,7 @@ mod linux {
 
     pub fn orchestrate() {
         // 1. 委譲スコープと状態ストア。ストアの読み書きは初期 user namespace のここで行う。
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let scope = delegated.scope().expect("delegated scope");
         let state_dir = TempDir::create("state");
         let store = FileStateStore::open(

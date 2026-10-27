@@ -406,7 +406,7 @@ mod tests {
         let map = || {
             (0..count)
                 .map(|i| (i.to_string(), String::new()))
-                .collect::<std::collections::HashMap<_, _>>()
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         let linux = |f: &dyn Fn(&mut LinuxPodSandboxConfig)| {
             let mut config = base_config();
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn task_57_1_retained_bytes_formula() {
         let mut config = base_config();
-        config.labels.insert("k".into(), "v".into());
+        config.labels.insert("k".into(), "v".into()); // BTreeMap は容量を持たないため labels は容量の対象外
         config.annotations.insert("a".into(), "b".into());
         config.annotations.insert("c".into(), "d".into());
         config.port_mappings.push(PortMapping::default());
@@ -554,14 +554,12 @@ mod tests {
         let mut config = base_config();
         config.hostname = String::with_capacity(1 << 20);
         config.hostname.push_str("host");
-        config.labels = std::collections::HashMap::with_capacity(1 << 16);
-        config.labels.insert("k".into(), "v".into());
+        config.labels.insert("k".into(), "v".into()); // BTreeMap は容量を持たないため labels は容量の対象外
         config.port_mappings = Vec::with_capacity(1 << 16);
         let expected = config.clone();
         let rebuilt = BoundedConfig::new(config).expect("valid").into_config();
         assert_eq!(rebuilt, expected);
         assert!(rebuilt.hostname.capacity() < 64);
-        assert!(rebuilt.labels.capacity() < 16);
         assert!(rebuilt.port_mappings.capacity() < 16);
     }
 

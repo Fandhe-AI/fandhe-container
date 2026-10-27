@@ -1054,7 +1054,8 @@ jobs:
             --select "^exec_setns_join: (rootless join|root after joining|${scn})" \
             --min 6 \
             --forbid 'exec_setns_join: ignored' --forbid 'subordinate id case not requested' \
-            --forbid 'exec_setns_join: not verified' --forbid 'not applicable' --summary
+            --forbid 'exec_setns_join: not verified' --forbid 'PRECONDITION FAILED' \
+            --forbid 'not applicable' --summary
 
       # exec（`crates/supervisor/tests/exec.rs`。SUP-6・TASK-163.4・#503）: 稼働中コンテナへの setns・cgroup join・
       # 制限の再適用・execve の通し結合試験。rootful の pivot_root と cgroup v2 の書き込みに root が必要で、
@@ -1288,10 +1289,10 @@ jobs:
       # TASK-29 追補・#2536・#2793）: 保護対象（状態ルート・rootfs・bundle）が実機の overlayfs の上にあるときの逆方向の照合を、
       # 非特権 user + mount namespace の中の実 overlay と実 mountinfo で確かめる実機前提テスト（Linux 6.8 以降・util-linux の
       # unshare / mount）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（ホストのマウントは
-      # 変えない）。libtest のため自前の成功行が無く、結果行を完全一致で照合する（`--ignored` が届かないと `ignored` となり
-      # `ok` の行が出ないので fail-closed）。外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ
-      # `ok` 行が 2 回出る。grep は試験に届いたことの確認で、外側の成否は pipefail で cargo の終了コードが担う。
-      # 外側に `--test-threads=1` は付けない（結果行が子の出力と混ざりうるため）。
+      # 変えない）。結果行は check-success-lines.sh の `--libtest-ignored --libtest-module` が `#[ignore]` 関数から導出し、
+      # `1 passed; 0 failed;` と ignored / FAILED の不在を照合する（`--ignored` が届かないと `ignored` となり fail-closed）。
+      # 外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ `ok` 行が 2 回出るが受理される
+      # （自己テストの「libtest module duplicated nested ok line」）。外側の成否は pipefail で cargo の終了コードが担う（#2959）。
       - name: sec1_2536_protected_root_on_real_overlay のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -1305,26 +1306,18 @@ jobs:
           log="${RUNNER_TEMP}/sec1_2536_real_overlay.log"
           cargo test -p fandhe-container-core --lib \
             -- --ignored sec1_2536_protected_root_on_real_overlay 2>&1 | tee "${log}"
-          name='exec::bind_mounts::tests::sec1_2536_protected_root_on_real_overlay'
-          if grep -Fxq "test ${name} ... ignored" "${log}"; then
-            echo "::error::${name} was ignored (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          if ! grep -Fxq "test ${name} ... ok" "${log}"; then
-            echo "::error::${name} did not report ok (possibly not executed)" >&2
-            exit 1
-          fi
-          {
-            echo "kernel: $(uname -r)"
-            echo "test ${name} ... ok"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::sec1_2536_protected_root_on_real_overlay verified"
+          m='exec::bind_mounts::tests'
+          scripts/check-success-lines.sh --name sec1_2536_protected_root_on_real_overlay \
+            --src crates/core/src/exec/bind_mounts.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --summary
+          echo "kernel: $(uname -r)" >> "$GITHUB_STEP_SUMMARY"
 
       # sec1_2823_overmount_hides_child_in_real_namespace（`crates/core/src/oci_runtime/start.rs` の lib 内試験。SEC-1・CORE-2・
       # NET-1・#2823）: 祖先の overmount で隠れた子マウントを、本番の fd の mount ID 照合（`child_is_visible`）から
       # `build_protected_roots` まで通し、隠れた子が「リンクあり」に固定されることを非特権 user + mount namespace の実マウントで
       # 確かめる実機前提テスト。上で緩和した sysctl を使い回す。ビルドは sec1_2536 のステップが済ませた lib を使い回す。
-      # 結果行（`ok`）に加え、内側の成功行 `ok: sec1_2823_overmount` も完全一致で照合する。
+      # 結果行（`ok`）と内側の成功行 `ok: sec1_2823_overmount` を、check-success-lines.sh が試験ソースから導出して照合する（#2959）。
       - name: sec1_2823_overmount_hides_child_in_real_namespace の実行（実機前提テスト・--ignored。SEC-1・CORE-2・#2823）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
@@ -1333,20 +1326,11 @@ jobs:
           log="${RUNNER_TEMP}/sec1_2823_overmount.log"
           cargo test -p fandhe-container-core --lib \
             -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --nocapture 2>&1 | tee "${log}"
-          name='oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace'
-          if grep -Fxq "test ${name} ... ignored" "${log}"; then
-            echo "::error::${name} was ignored (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          if ! grep -Fxq "test ${name} ... ok" "${log}"; then
-            echo "::error::${name} did not report ok (possibly not executed)" >&2
-            exit 1
-          fi
-          if ! grep -Fxq "ok: sec1_2823_overmount" "${log}"; then
-            echo "::error::sec1_2823_overmount success line is missing" >&2
-            exit 1
-          fi
-          echo "::notice::sec1_2823_overmount_hides_child_in_real_namespace verified"
+          m='oci_runtime::start::tests'
+          scripts/check-success-lines.sh --name sec1_2823_overmount_hides_child_in_real_namespace \
+            --src crates/core/src/oci_runtime/start.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^(test [A-Za-z0-9_:]+ \.\.\. |ok: sec1_2823)' --min 2 --summary
 
       # CDI createContainer フックの namespace 前提の実機前提テスト 2 件（`crates/gpu/src/cdi_apply/hooks/run.rs` の lib 内
       # `#[ignore]` 試験。GPU-2・SEC-1・REPAIR-2・REPAIR-12・TASK-127.3・#549・#2980・#2987）。上で緩和した sysctl を使い回し、
@@ -1568,51 +1552,50 @@ jobs:
           log="${RUNNER_TEMP}/production_launcher.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${PL_BIN}" --ignored 2>&1 | tee "${log}"
-          final='production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified;'
-          final+=' failed launch left no process; bind mount visible on host;'
-          final+=' post-exec capabilities and seccomp verified (root=false)'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::production_launcher did not report the final line (possibly not executed)" >&2
-            exit 1
-          fi
+          check() {
+            scripts/check-success-lines.sh --name production_launcher \
+              --src crates/core/tests/production_launcher.rs --log "${log}" \
+              --forbid 'subordinate id case not requested' --forbid '(root=true)' \
+              --forbid 'production_launcher: ignored' --forbid 'PRECONDITION FAILED' \
+              --forbid 'not applicable' "$@"
+          }
+          code='[A-Z][A-Za-z]+'
+          # 二者択一（rslave-bind・p2/r3/r4 の start refused）と root 専用の行は select に入れない。
+          # --min は導出件数の実測値（A 21・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
+          # 定数の出典は production_launcher.rs の const（HOSTNAME・BIND_DEST・LO_TMPFS_DEST・WANT・EXIT_CODE）と scenario_k の配列。
+          # A: 位置プレースホルダの無い行（最終行・正常系・説明行）。rslave-bind は到達だけを --require で照合する
+          sel_a='^production_launcher: (pid1, default |scenario=(ok|bind-mount|multithreaded-refused|j|k'
+          sel_a+='|working-dir'
+          sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
+          sel_a+='|injected secret '
+          sel_a+='|capabilities drop |sysctls applied |pod ipc |entrypoint violation |exit_signal )'
+          check --select "${sel_a}" \
+            --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst HOSTNAME=fandhe-prod-launcher --subst BIND_DEST=/data --subst LO_TMPFS_DEST=/run \
+            --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
+            --subst name=unshare,ptrace,kexec_load \
+            --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
+            --require 'production_launcher: scenario=rslave-bind host=' --min 21 --summary
+          # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
           ef='production_launcher: scenario=exec-failure'
           ef_tail='state=created audit=0 children=0'
-          for part in \
-            'production_launcher: subordinate id mapping verified (uid extents=' \
-            'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
-            'production_launcher: scenario=groups-applied gids=2000,3000 host_gids=' \
-            'production_launcher: scenario=groups-single-id-refused' \
-            'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
-            'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run' \
-            'injected secret reached the container under subordinate id mapping (scenario=S-sub' \
-            'production_launcher: capabilities drop applied (scenario=T pid=' \
-            'production_launcher: sysctls applied (scenario=V shmmax=' \
-            'production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y' \
-            'production_launcher: pod ipc namespace joined (scenario=W' \
-            'production_launcher: scenario=rslave-bind host=' \
-            "${ef} case=loader-missing code=NotFound phase=prepare ${ef_tail}" \
-            "${ef} case=not-executable code=PermissionDenied phase=execveat ${ef_tail}" \
-            "${ef} case=garbage code=InvalidArgument phase=execveat ${ef_tail}"; do
-            if ! grep -Fq "${part}" "${log}"; then
-              echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
-              exit 1
-            fi
-          done
-          for bad in \
-            'subordinate id case not requested' \
-            '(root=true)' \
-            'production_launcher: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::production_launcher reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "${final}"
-            grep -F 'production_launcher: subordinate id mapping verified' "${log}" || true
-            grep -F 'production_launcher: scenario=user-applied' "${log}" || true
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::production_launcher verified"
+          sel_b='^production_launcher: scenario=(failed-launch|bind-over-protected-path-refused'
+          sel_b+='|state-root-moved-after-start'
+          sel_b+='|working-dir-refused|user-unmapped-refused|groups-single-id-refused|exec-failure) '
+          check --select "${sel_b}" \
+            --subst-pos-re "${code}" --subst cwd=/missing,/afile,/alink/x \
+            --subst-re case='[a-z-]+' --subst-re phase='[a-z]+' \
+            --require "${ef} case=loader-missing code=NotFound phase=prepare ${ef_tail}" \
+            --require "${ef} case=not-executable code=PermissionDenied phase=execveat ${ef_tail}" \
+            --require "${ef} case=garbage code=InvalidArgument phase=execveat ${ef_tail}" --min 9
+          # C / D: {label} の値の集合が異なるので別呼び出し
+          check --select '^production_launcher: scenario=state-root-bind-refused ' \
+            --subst label=direct,symlink --subst-pos-re "${code}" --min 2
+          check --select '^production_launcher: scenario=devtmpfs-bind-refused ' \
+            --subst label=bind,rbind --subst-pos-re "${code}" --min 2
+          # E: {} が 2 つの範囲写像の行
+          check --select '^production_launcher: subordinate id mapping verified ' \
+            --subst-pos-re '[1-9][0-9]*' --subst-pos-re '[1-9][0-9]*' --summary
 
       # exec_subordinate_e2e（`crates/supervisor/tests/exec_subordinate_e2e.rs`。
       # SEC-5・CORE-6・SUP-6・#2835。非 root の exec の capability の照合は SEC-1・#2889）: 範囲写像の rootless コンテナへ、
@@ -1834,38 +1817,23 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/supervisor_bin_real.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" "${SBR_BIN}" --ignored 2>&1 | tee "${log}"
-          final='supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs captured,'
-          final+=' seccomp denial recorded once; failed start left no process; restart fails closed until #2043;'
-          final+=' SIGTERM via the control channel recorded Stopped(43) and the stopped container was deleted;'
-          final+=' ESC-03 mount denied via the SeccompNotifyHub and recorded once'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::supervisor_bin_real did not report the final line (possibly not executed)" >&2
-            exit 1
-          fi
-          for part in \
-            'supervisor_bin_real: id mapping verified (model=subordinate' \
-            'supervisor_bin_real: scenario=A ok ' \
-            'supervisor_bin_real: scenario=B ok ' \
-            'supervisor_bin_real: scenario=C ok ' \
-            'supervisor_bin_real: scenario=D ok ' \
-            'supervisor_bin_real: scenario=E ok ' \
-            'supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log'; do
-            if ! grep -Fq "${part}" "${log}"; then
-              echo "::error::supervisor_bin_real did not report: ${part} (possibly not executed)" >&2
-              exit 1
-            fi
-          done
-          for bad in 'supervisor_bin_real: ignored' 'supervisor_bin_real: PRECONDITION FAILED' 'model=single'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::supervisor_bin_real reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "${final}"
-            grep -F 'supervisor_bin_real: id mapping verified' "${log}" || true
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::supervisor_bin_real verified"
+          check() {
+            scripts/check-success-lines.sh --name supervisor_bin_real \
+              --src crates/supervisor/tests/supervisor_bin_real.rs --log "${log}" \
+              --forbid 'supervisor_bin_real: ignored' --forbid 'PRECONDITION FAILED' \
+              --forbid 'not applicable' --forbid 'model=single' "$@"
+          }
+          # 7 は試験の PROBE_EXIT、43 は fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST（変われば導出との照合で失敗する）。
+          # scenario B の code は試験が Unimplemented 以外だけを assert するため正規表現で受ける
+          sel='^supervisor_bin_real: (start reported OK|scenario=[A-E] ok |seccomp denial returned|ESC-03 '
+          sel+='|SIGTERM delivered)'
+          check --select "${sel}" \
+            --subst PROBE_EXIT=7 --subst TERM_HANDLER_EXIT=43 --subst label=mount \
+            --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst-pos-re '[A-Z_]+' --min 9 --summary
+          # model は subordinate に固定する（FANDHE_CONTAINER_TEST_ID_HELPER=1。single は期待行にも forbid にも掛かって失敗する）
+          check --select '^supervisor_bin_real: id mapping verified ' \
+            --subst-pos subordinate --subst-pos-re '[1-9][0-9]*' --subst-pos-re '[1-9][0-9]*' --summary
 
       # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・SUP-12・SEC-4・CORE-3・OCI-6・#2596・#2761）: CLI は同じ
       # ディレクトリの supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
@@ -1896,12 +1864,13 @@ jobs:
           USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
           # create の起動オプション（#2761）・--cap-drop NET_RAW / ALL（#2833）・最終行を、ソースの文字列リテラルから導出して照合する
+          # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_stop_delete_real: FAILED`。両方を禁止（#2957）
           scripts/check-success-lines.sh --name start_stop_delete_real \
             --src crates/cli/tests/start_stop_delete_real.rs \
             --log "${log}" --select '^start_stop_delete_real: (create |scenario ok |cli start )' \
             --subst-re scope_present='(true|false)' --min 5 \
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
-            --forbid 'not applicable' --summary
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
       # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
       # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、
@@ -1913,9 +1882,8 @@ jobs:
       # - launcher 回避: `target/debug/` には前段のビルドで fandhe-container-launcher が置かれる。plugin の隣にあると
       #   ProductionStarter が rootful 経路（file capability 前提）へ入って失敗するため、試験本体が plugin と supervisor だけを
       #   専用ディレクトリへ複製し、launcher が無いことを assert してから起動する（start_stop_delete_real と同じ扱い）。
-      # - 成功行の照合: scripts/check-success-lines.sh は試験ソースの文字列リテラルから期待行を導くが、libtest の結果行
-      #   （`test <名前> ... ok`）はソースにリテラルが無いため使えない。runtime_service_namespaces と同じく完全一致 grep で照合し、
-      #   加えて `1 passed` の行（0 件実行の排除）と `ignored` 行の不在を確かめる。
+      # - 成功行の照合: scripts/check-success-lines.sh の `--libtest-ignored` が `#[ignore]` 関数から `test <名前> ... ok` を導き、
+      #   `test result: ok. 1 passed; 0 failed;` と ignored / FAILED の不在をあわせて照合する（runtime_service_namespaces と同じ。#2959）。
       # - rate limit の方式: 試験 1 回で pull は 1 回（小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
       #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
       #   pull を消費する前に fail-closed にする。CRI の境界では 429 が gRPC の UNAVAILABLE に潰れて他の失敗と区別できないため、
@@ -1967,21 +1935,9 @@ jobs:
             echo "::error::${msg}" >&2
             exit 1
           fi
-          line='test production_binary_full_lifecycle_real ... ok'
-          if ! grep -Fxq "${line}" "${log}"; then
-            echo "::error::production_binary_full_lifecycle_real did not report: ${line} (possibly not executed)" >&2
-            exit 1
-          fi
-          if ! grep -Eq '^test result: ok\. 1 passed;' "${log}"; then
-            echo "::error::production_binary_full_lifecycle_real did not report '1 passed' (possibly not executed)" >&2
-            exit 1
-          fi
-          if grep -Fq 'production_binary_full_lifecycle_real ... ignored' "${log}"; then
-            echo "::error::production_binary_full_lifecycle_real was reported as ignored" >&2
-            exit 1
-          fi
-          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::production_binary_full_lifecycle_real verified"
+          scripts/check-success-lines.sh --name production_binary_full_lifecycle_real \
+            --src crates/plugin-cri/tests/container_grpc.rs --log "${log}" --libtest-ignored \
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --summary
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

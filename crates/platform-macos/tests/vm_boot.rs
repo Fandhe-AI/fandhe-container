@@ -27,6 +27,12 @@ use fandhe_container_platform_macos::virtiofs::{
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmEvent, VmState};
 
+#[path = "support/guest_markers.rs"]
+mod guest_markers;
+use guest_markers::{
+    markers_observed_in_order, resolve_boot_marker, resolve_ready_marker, validate_marker_pair,
+};
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// テストごとの新規ディレクトリ（0700）。`keep` が false なら `Drop` で削除する（実機テストはログを残す）。
@@ -391,52 +397,6 @@ fn require_kernel() -> PathBuf {
              FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
         )
     })
-}
-
-/// ブートマーカーを決める。未指定は既定値、空文字列は拒否する。
-///
-/// 空マーカーは `contains` が常に true になり、ゲストが何も出力しなくても起動確認を通過してしまうため（MAC-1）。
-fn resolve_boot_marker(raw: Option<String>) -> Result<String, String> {
-    match raw {
-        None => Ok("Linux version".to_string()),
-        Some(m) if m.is_empty() => {
-            Err("boot marker must not be empty (it would match any console output)".to_string())
-        }
-        Some(m) => Ok(m),
-    }
-}
-
-/// 起動完了マーカーを決める。既定値は無く、未指定・空文字列は拒否する。
-///
-/// `Linux version` のような起動初期のマーカーだけでは、直後にゲストが停止しても成功してしまう。
-/// ゲスト資産が起動完了後にだけ出力する文字列を呼び出し側に必ず指定させる（MAC-1）。
-fn resolve_ready_marker(raw: Option<String>) -> Result<String, String> {
-    match raw {
-        None => Err("FANDHE_CONTAINER_MACOS_VM_READY_MARKER is required".to_string()),
-        Some(m) if m.is_empty() => Err("ready marker must not be empty".to_string()),
-        Some(m) => Ok(m),
-    }
-}
-
-/// ブートマーカーと起動完了マーカーの重複を拒否する。
-///
-/// 一致・包含関係にあると起動初期の出力だけで両方が成立し、起動完了前にゲストが停止しても通ってしまう（MAC-1）。
-fn validate_marker_pair(boot: &str, ready: &str) -> Result<(), String> {
-    if boot.contains(ready) || ready.contains(boot) {
-        return Err(format!(
-            "boot marker {boot:?} and ready marker {ready:?} must not be equal or contain one another"
-        ));
-    }
-    Ok(())
-}
-
-/// ブートマーカーの出現より後に起動完了マーカーが現れたかを返す。
-///
-/// 起動完了マーカーはブートマーカー末尾以降だけを探索し、順序（ブート後に起動完了）を保証する（MAC-1）。
-fn markers_observed_in_order(text: &str, boot: &str, ready: &str) -> bool {
-    text.find(boot)
-        .and_then(|pos| text.get(pos + boot.len()..))
-        .is_some_and(|rest| rest.contains(ready))
 }
 
 #[test]

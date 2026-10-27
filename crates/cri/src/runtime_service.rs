@@ -666,6 +666,8 @@ impl SetUpSettlement {
     const PENDING: u8 = 0;
     const BY_WORKER: u8 = 1;
     const ABANDONED: u8 = 2;
+    /// 巻き戻し用の put で、worker の確定後に呼び出し側が結果を受け取った状態（後始末の責任が消える）。
+    const ACCEPTED: u8 = 3;
 
     fn new() -> Self {
         Self(AtomicU8::new(Self::PENDING))
@@ -677,6 +679,34 @@ impl SetUpSettlement {
             .compare_exchange(
                 Self::PENDING,
                 Self::BY_WORKER,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// 呼び出し側が worker の確定済みの結果を受け取った（以後は記録の後始末を呼び出し側の経路が持つ）。
+    fn accept(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::BY_WORKER,
+                Self::ACCEPTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// 巻き戻し用の put を呼び出し側が結果の受領前に手放す。worker が既に書き終えて確定していた
+    /// （受領前）なら真で、ファイルだけが残るため呼び出し側が消す責任を負う（#2933・CRI-2）。
+    fn abandon_put(&self) -> bool {
+        if self.abandon() {
+            return false;
+        }
+        self.0
+            .compare_exchange(
+                Self::BY_WORKER,
+                Self::ABANDONED,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
@@ -780,14 +810,28 @@ enum StoreCall {
     Remove(RecordId),
 }
 
-/// 巻き戻し用の put を呼び出し側が手放したことを worker へ伝える番人。`Drop` は atomic の CAS だけ
-/// （RPC スレッドで走るため外部処理を持たない）。worker が先に確定済みなら何も起きない。
-struct AbandonPutOnDrop(Option<Arc<SetUpSettlement>>);
+/// 巻き戻し用の put を呼び出し側が手放したことを worker へ伝える番人。
+///
+/// worker が先に書き終えて確定済みでも、呼び出し側が結果を受け取る前（`accept` 前）に破棄されたら、
+/// ファイルだけが残る（`ReservationRollback` はメモリの予約しか戻さない）。その場合は切り離したスレッドで
+/// 記録を消す（`Drop` 自体は I/O をせず atomic の CAS とスレッド起動だけ。#2933・CRI-2・REPAIR-5）。
+struct AbandonPutOnDrop {
+    settlement: Option<Arc<SetUpSettlement>>,
+    store: Option<Arc<dyn RecordStore>>,
+    id: Option<RecordId>,
+}
 
 impl Drop for AbandonPutOnDrop {
     fn drop(&mut self) {
-        if let Some(settlement) = &self.0 {
-            settlement.abandon();
+        let Some(settlement) = &self.settlement else {
+            return;
+        };
+        if settlement.abandon_put()
+            && let (Some(store), Some(id)) = (self.store.take(), self.id.take())
+        {
+            let _ = spawn_runtime_thread("cri-record-cleanup", move || {
+                let _ = store.remove(RecordKind::Sandbox, &id);
+            });
         }
     }
 }
@@ -1957,9 +2001,22 @@ impl CriRuntimeService {
         let bytes = data.encode()?;
         let settlement = rollbackable.then(|| Arc::new(SetUpSettlement::new()));
         // 巻き戻し用の put は、この future が破棄・期限超過で手放した時点で worker へ手放しを伝える。
-        let _abandon = AbandonPutOnDrop(settlement.clone());
-        self.store_io_bounded(StoreCall::Put(record_id, bytes, settlement), guard)
-            .await
+        let abandon = AbandonPutOnDrop {
+            settlement: settlement.clone(),
+            store: self.record_store.as_ref().map(Arc::clone),
+            id: Some(record_id.clone()),
+        };
+        let result = self
+            .store_io_bounded(StoreCall::Put(record_id, bytes, settlement.clone()), guard)
+            .await;
+        // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路（rollback_unwritten など）が持つ。
+        if result.is_ok()
+            && let Some(settlement) = &settlement
+        {
+            settlement.accept();
+        }
+        drop(abandon);
+        result
     }
 
     /// 記録ファイルを期限つきで消す（無ければ成功）。失敗・期限超過は固定文言の `INTERNAL`。
@@ -3638,6 +3695,24 @@ mod tests {
         assert!(caller_first.abandon());
         assert!(!caller_first.settle_by_worker());
         assert!(!caller_first.abandon());
+    }
+
+    /// CRI-2・REPAIR-5（#2933）: worker が書き終えて確定した後でも、呼び出し側が受領前に手放したら
+    /// ファイルの後始末の責任は呼び出し側にある（真）。受領後は責任が無い（偽）。
+    #[test]
+    fn put_settlement_keeps_cleanup_duty_until_accepted() {
+        let unaccepted = SetUpSettlement::new();
+        assert!(unaccepted.settle_by_worker());
+        assert!(unaccepted.abandon_put());
+
+        let accepted = SetUpSettlement::new();
+        assert!(accepted.settle_by_worker());
+        assert!(accepted.accept());
+        assert!(!accepted.abandon_put());
+
+        let before_put = SetUpSettlement::new();
+        assert!(!before_put.abandon_put());
+        assert!(!before_put.settle_by_worker());
     }
 
     thread_local! {

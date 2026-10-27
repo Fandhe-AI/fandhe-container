@@ -718,6 +718,11 @@ mod linux {
                     }
                     let mut fd = sys::open_dir_nofollow_at(cur.as_fd(), &name)
                         .map_err(|e| map_sys(e, "failed to open a /dev subdirectory"))?;
+                    if !made {
+                        // 最初の open の後に同名が並行して作られた場合（EEXIST）も、既存と同じ検査を通す
+                        // （実効 uid 所有の 0700 は権限を変えずに拒否する。タイミングに依らない契約。GPU-2・SEC-1）。
+                        fd = check_existing_dir(fd)?;
+                    }
                     if made {
                         // 開き直した fd の (dev, ino) を記録して、後始末で同一性を照合できるようにする。
                         // 観測が一時的に失敗しても 0700 のまま識別なしで残さないよう、開き直して 1 回だけ再観測する。

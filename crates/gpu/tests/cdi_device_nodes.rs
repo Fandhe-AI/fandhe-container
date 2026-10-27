@@ -196,3 +196,35 @@ fn gpu2_owner_is_applied() {
     assert_eq!((md.uid(), md.gid()), (me.uid(), me.gid()));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// GPU-1・SEC-1: uid / gid に予約値 u32::MAX（chown の -1）を渡すと InvalidArgument で拒否される。
+#[test]
+fn gpu1_reserved_uid_gid_are_rejected_as_invalid_argument() {
+    let mut n = node("/dev/o", Some("p"));
+    n.uid = Some(u32::MAX);
+    let e = resolve_device_nodes(&[n]).unwrap_err();
+    assert_eq!(e.code(), CdiApplyErrorCode::InvalidArgument);
+    let mut n = node("/dev/o", Some("p"));
+    n.gid = Some(u32::MAX);
+    let e = resolve_device_nodes(&[n]).unwrap_err();
+    assert_eq!(e.code(), CdiApplyErrorCode::InvalidArgument);
+}
+
+/// GPU-2・SEC-1: 既存の 0700 ディレクトリは権限を変えずに FailedPrecondition で拒否される。
+#[test]
+fn gpu2_existing_0700_dir_is_rejected_and_mode_kept() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = tmp("m700");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::set_permissions(d.join("sub"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = std::fs::File::open(&d).unwrap();
+    let resolved = resolve_device_nodes(&[node("/dev/sub/fifo0", Some("p"))]).unwrap();
+    let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
+    assert_eq!(e.code(), CdiApplyErrorCode::FailedPrecondition);
+    assert_eq!(
+        std::fs::metadata(d.join("sub")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    assert!(!d.join("sub/fifo0").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}

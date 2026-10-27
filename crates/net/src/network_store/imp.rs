@@ -517,6 +517,10 @@ impl NetworkStore {
     }
 
     /// 定義を消す。`definition` と `@lock` 以外の項目（メンバー等）があれば `FailedPrecondition`。
+    ///
+    /// 既知の制約: ネットワークのディレクトリに `@lock` が無い破損エントリ（`list` の `broken` に出る）は
+    /// ロックを取れず `NotFound` となり、本メソッドでは回収できない。staging と rename で作成するため
+    /// 通常運用では起きず、外部要因の破損に限る。その回収手順は後続 issue（#3067 周辺）で扱う（NET-6）。
     pub fn remove(&self, name: &NetworkName) -> Result<(), NetError> {
         let g = self.lock_global_exclusive()?;
         let n = g.lock_network(name)?;

@@ -170,6 +170,9 @@ impl<O: AttachOps> AttachOps for FaultyAttachOps<O> {
     fn netns_set_up(&self, ns: &Self::Netns, link: IfIndex) -> Result<(), NetError> {
         self.inner.netns_set_up(ns, link)
     }
+    fn netns_rename(&self, ns: &Self::Netns, link: IfIndex, name: &IfName) -> Result<(), NetError> {
+        self.inner.netns_rename(ns, link, name)
+    }
     fn netns_add_address(
         &self,
         ns: &Self::Netns,

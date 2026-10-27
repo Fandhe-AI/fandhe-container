@@ -56,7 +56,8 @@
 //!
 //! - down 操作、MTU・MAC 等の追加属性、bridge のオプション（`IFLA_BR_*`）。
 //!   bridge への接続（`IFLA_MASTER`）は `LinkSet::set_master`（TASK-139.2.1）、`RTM_DELLINK` は
-//!   `LinkDelete` で実装済み（TASK-139.1）
+//!   `LinkDelete` で実装済み（TASK-139.1）。改名（`IFLA_IFNAME`）は `LinkSet::rename`（RTM_SETLINK。
+//!   ifindex 指定・down のうちに netns 内のソケットから送る。#3061）
 //! - netns を作る・開く API（実機テストは外部コマンド `unshare(1)` と `/proc/<pid>/ns/net` を使う）
 
 use std::marker::PhantomData;
@@ -367,6 +368,10 @@ enum SetKind<'a> {
         link: LinkRef,
         alias: &'a str,
     },
+    Rename {
+        link: LinkIndex,
+        name: IfName,
+    },
 }
 
 /// `RTM_SETLINK` によるリンク設定要求（netns 移動・up）。
@@ -407,6 +412,19 @@ impl<'a> LinkSet<'a> {
         Ok(Self(SetKind::SetAlias { link, alias }))
     }
 
+    /// リンクの名前を `new_name` へ変える要求（`IFLA_IFNAME`。attach で netns 内の peer を `eth0` へ
+    /// 改名する。NET-1・#3061・D11）。
+    ///
+    /// 対象は必ず ifindex で指定する。`do_setlink` は `ifi_index > 0` のときだけ `IFLA_IFNAME` を改名に使い、
+    /// `ifi_index = 0` では対象の検索に使うため、名前指定では新しい名前で引いて `NotFound` になる。
+    /// 対象が down のうちに、そのリンクがある netns のソケットから送ること（up 中の改名は `EBUSY`）。
+    pub fn rename(link: LinkIndex, new_name: IfName) -> Self {
+        Self(SetKind::Rename {
+            link,
+            name: new_name,
+        })
+    }
+
     /// `nlmsg_type`（常に `RTM_SETLINK`）。
     pub fn msg_type(&self) -> u16 {
         RTM_SETLINK
@@ -422,10 +440,11 @@ impl<'a> LinkSet<'a> {
         let (link, flags, change) = match &self.0 {
             SetKind::MoveToNetns { link, .. }
             | SetKind::SetMaster { link, .. }
-            | SetKind::SetAlias { link, .. } => (link, 0, 0),
-            SetKind::Up { link } => (link, IFF_UP, IFF_UP),
+            | SetKind::SetAlias { link, .. } => (link.clone(), 0, 0),
+            SetKind::Up { link } => (link.clone(), IFF_UP, IFF_UP),
+            SetKind::Rename { link, .. } => (LinkRef::Index(*link), 0, 0),
         };
-        let (index, name) = match link {
+        let (index, name) = match &link {
             LinkRef::Index(i) => (i.get(), None),
             LinkRef::Name(n) => (0, Some(n)),
         };
@@ -444,6 +463,9 @@ impl<'a> LinkSet<'a> {
         }
         if let SetKind::SetAlias { alias, .. } = &self.0 {
             b.put_attr(IFLA_IFALIAS, &nul_terminated(alias.as_bytes()))?;
+        }
+        if let SetKind::Rename { name, .. } = &self.0 {
+            b.put_attr(IFLA_IFNAME, &name.to_nul_terminated())?;
         }
         Ok(())
     }
@@ -1057,6 +1079,18 @@ mod tests {
                 (IFLA_MASTER, 3u32.to_ne_bytes().to_vec())
             ]
         );
+    }
+
+    /// NET-1・#3061: 改名は ifindex 指定で、IFLA_IFNAME が新しい名前の 1 件だけ載る（名前指定にしない）。
+    #[test]
+    fn net1_setlink_rename_encodes_single_ifname_by_index() {
+        let req = LinkSet::rename(LinkIndex::new(5).unwrap(), name("eth0"));
+        assert_eq!(req.msg_type(), RTM_SETLINK);
+        assert_eq!(req.flags(), 0);
+        let (ifi, attrs) = set_attrs(&build_set(&req));
+        assert_eq!(ifi.get(4..8).unwrap(), &5i32.to_ne_bytes());
+        assert_eq!(ifi.get(8..16).unwrap(), &[0u8; 8]);
+        assert_eq!(attrs, vec![(IFLA_IFNAME, b"eth0\0".to_vec())]);
     }
 
     /// NET-1・TASK-139.4: veth の所有トークンは ifindex 指定の SETLINK で IFLA_IFALIAS に NUL 終端で載る。

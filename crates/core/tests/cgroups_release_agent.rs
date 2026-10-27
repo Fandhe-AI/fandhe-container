@@ -142,8 +142,21 @@ fn sec6_task35_scanner_detects_code_and_ignores_comments() {
     );
 }
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use fandhe_container_core::cgroups::{
         CgroupName, CgroupStep, ContainerCgroup, DelegatedCgroup,
     };
@@ -222,6 +235,7 @@ mod linux {
 
     /// SEC-6・CORE-4・TASK-35: 実ホストの cgroup 階層に応じ、v2 では v1 専用ファイルの不在を、
     /// それ以外では `detect` の fail-closed 拒否を照合する。
+    /// `detect` の拒否そのものを検証するため、前提欠如の部品（`precondition::delegated_cgroup`）には通さない（#2956）。
     #[test]
     fn sec6_task35_host_cgroup_has_no_release_agent_or_rejected() {
         let fstype = cgroup_root_fstype(&read_limited("/proc/self/mountinfo"));
@@ -323,7 +337,7 @@ mod linux {
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn sec6_task35_delegated_cgroup_has_no_release_agent() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let parent = PathBuf::from(CGROUP_ROOT).join(delegated.path().trim_start_matches('/'));
         let id = ContainerId::new(format!("t{}", std::process::id())).unwrap();
         let name = CgroupName::new(&id).unwrap();

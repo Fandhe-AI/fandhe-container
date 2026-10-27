@@ -151,14 +151,13 @@ pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
 /// plugin の信頼性検証（PLUG-11・TASK-122 追補・#1864）向けの fd 相対 open・実体パス・fd の ACL 検出。
 ///
 /// 呼び出し元は #1865（`plugin_trust` の macOS 実装）の予定で、それまで本番の呼び出し元が無いため
-/// `dead_code` を許す（呼び出し元を足したら外す）。Linux の `O_PATH` が macOS に無いため構造が違う。
+/// 未使用の項目ごとに `dead_code` を許す（モジュール全体では許さない。呼び出し元を足したら外す）。Linux の `O_PATH` が macOS に無いため構造が違う。
 /// - 非追従 open は `O_NOFOLLOW` 付きで開き、最終要素が symlink なら `ELOOP` で失敗する。呼び出し側は
 ///   それを合図に `open_read_nonblock_follow_at`（カーネルが 1 回だけ辿る）へ切り替え、その戻り fd を保持 fd とする
 /// - 所有者・モード・dev/ino・種別は開いた fd への `File::metadata`（std）で取る（unsafe を足さない）
 /// - パス要素は `&CStr`（NUL を含まない）で受ける。単一要素であることの検証は呼び出し側の責務
 /// - 種別のプローブ（`O_PATH` 相当）は無い。FIFO は `O_NONBLOCK`・端末は `O_NOCTTY` で止めないが、
 ///   デバイスの open の副作用は避けられないため、検証済みディレクトリの下だけを開く前提で使う
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod plugin_fs {
     use super::{EINVAL, SysError, last_errno};
     use std::ffi::{CStr, c_char, c_int, c_void};
@@ -168,41 +167,58 @@ pub(crate) mod plugin_fs {
     /// `ENOENT`（`sys/errno.h`）。
     pub(crate) const ENOENT: i32 = 2;
     /// `EBADF`（`sys/errno.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) const EBADF: i32 = 9;
     /// `EACCES`（`sys/errno.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) const EACCES: i32 = 13;
     /// `ENOTDIR`（`sys/errno.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) const ENOTDIR: i32 = 20;
     /// `ERANGE`（`sys/errno.h`）。`F_GETPATH` の結果が整形できないときの取り決めにも使う。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) const ERANGE: i32 = 34;
     /// `ELOOP`（`sys/errno.h`。Linux の 40 とは異なる）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) const ELOOP: i32 = 62;
 
     // 以下は Apple の SDK ヘッダ（x86_64・aarch64 で同値）。Linux の値は流用しない。
     /// `O_RDONLY`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_RDONLY: c_int = 0x0000;
     /// `O_NONBLOCK`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_NONBLOCK: c_int = 0x0004;
     /// `O_NOFOLLOW`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_NOFOLLOW: c_int = 0x0100;
     /// `O_NOCTTY`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_NOCTTY: c_int = 0x0002_0000;
     /// `O_DIRECTORY`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_DIRECTORY: c_int = 0x0010_0000;
     /// `O_CLOEXEC`（`sys/fcntl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const O_CLOEXEC: c_int = 0x0100_0000;
     /// `AT_FDCWD`（`sys/fcntl.h`。Linux の -100 とは異なる）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const AT_FDCWD: c_int = -2;
     /// `F_GETPATH`（`sys/fcntl.h`。ファームリンクは利用者視点のパスで返す。`F_GETPATH_NOFIRMLINK` は使わない）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const F_GETPATH: c_int = 50;
     /// `MAXPATHLEN`（`sys/param.h`）。`F_GETPATH` のバッファ長の要件。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const MAXPATHLEN: usize = 1024;
     /// `ACL_TYPE_EXTENDED`（`sys/acl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
     /// `ACL_FIRST_ENTRY`（`sys/acl.h`）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const ACL_FIRST_ENTRY: c_int = 0;
 
     /// 定数を確認済みのアーキテクチャか。それ以外の関数は `Unsupported` で拒否する。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     const SUPPORTED_ARCH: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
 
     // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`int openat(int, const char *, int, ...)` と
@@ -210,14 +226,25 @@ pub(crate) mod plugin_fs {
     // 必ず `...` 付きで宣言する。`acl_t acl_get_fd_np(int, acl_type_t)`・`int acl_get_entry(acl_t, int, acl_entry_t *)`・
     // `int acl_free(void *)` と同じ型幅（`acl_t` は不透明ポインタ・`acl_type_t` は `unsigned int`）。
     unsafe extern "C" {
+        #[cfg_attr(not(test), allow(dead_code))]
+        // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
         fn openat(dirfd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
+        #[cfg_attr(not(test), allow(dead_code))]
+        // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        #[cfg_attr(not(test), allow(dead_code))]
+        // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
         fn acl_get_fd_np(fd: c_int, acl_type: u32) -> *mut c_void;
+        #[cfg_attr(not(test), allow(dead_code))]
+        // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
         fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry_p: *mut *mut c_void) -> c_int;
+        #[cfg_attr(not(test), allow(dead_code))]
+        // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
         fn acl_free(obj: *mut c_void) -> c_int;
     }
 
     /// `openat` の薄い包み。`O_CREAT` を含まないフラグだけを渡す（mode 引数は渡さない）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(super) fn openat_raw(dirfd: c_int, name: &CStr, flags: c_int) -> Result<OwnedFd, SysError> {
         if !SUPPORTED_ARCH {
             return Err(SysError::Unsupported);
@@ -237,6 +264,7 @@ pub(crate) mod plugin_fs {
     /// symlink は `Os(ELOOP)`（Linux は `ENOTDIR`）、非ディレクトリは `Os(ENOTDIR)`、不在は `Os(ENOENT)`。
     /// `O_SEARCH` は一次資料で確認できないため `O_RDONLY` で開き、読み取り権限の無いディレクトリは
     /// `Os(EACCES)` で返す（呼び出し側が拒否する。fail-closed）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) fn open_dir_nofollow_at(
         parent: Option<BorrowedFd<'_>>,
         name: &CStr,
@@ -250,6 +278,7 @@ pub(crate) mod plugin_fs {
     }
 
     /// `parent` の下の `name` を symlink を辿らず読み取り専用で開く（FIFO で止まらない）。symlink は `Os(ELOOP)`。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) fn open_read_nonblock_nofollow_at(
         parent: BorrowedFd<'_>,
         name: &CStr,
@@ -263,6 +292,7 @@ pub(crate) mod plugin_fs {
 
     /// `parent` の下の `name` を、最終要素の symlink をカーネルに辿らせて読み取り専用で開く。
     /// ループ・ホップ超過は `Os(ELOOP)`。戻り fd がそのまま保持 fd になる（開き直さない）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) fn open_read_nonblock_follow_at(
         parent: BorrowedFd<'_>,
         name: &CStr,
@@ -275,6 +305,7 @@ pub(crate) mod plugin_fs {
     }
 
     /// `F_GETPATH` の薄い包み。NUL が無い・空・相対パスの結果は `Os(ERANGE)` とする。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(super) fn real_path_of_raw(fd: c_int) -> Result<PathBuf, SysError> {
         use std::os::unix::ffi::OsStrExt;
         if !SUPPORTED_ARCH {
@@ -296,11 +327,13 @@ pub(crate) mod plugin_fs {
     }
 
     /// 開いた `fd` の実体の正規パス（`F_GETPATH`。`/var` は `/private/var` で返る等）。失敗は `Err`。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) fn fd_real_path(fd: BorrowedFd<'_>) -> Result<PathBuf, SysError> {
         real_path_of_raw(fd.as_raw_fd())
     }
 
     /// `acl_get_fd_np` の薄い包み。判定は `has_extended_acl(path)` と同じ（空 ACL は「無し」）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(super) fn extended_acl_of_raw(fd: c_int) -> Result<bool, SysError> {
         if !SUPPORTED_ARCH {
             return Err(SysError::Unsupported);
@@ -332,6 +365,7 @@ pub(crate) mod plugin_fs {
     }
 
     /// 開いた `fd` に拡張 ACL が付いているか。無し=`Ok(false)`・有り=`Ok(true)`・判定不能=`Err`（呼び出し側が拒否）。
+    #[cfg_attr(not(test), allow(dead_code))] // 呼び出し元は #1865（PLUG-11）で追加するまで未使用
     pub(crate) fn has_extended_acl_fd(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
         extended_acl_of_raw(fd.as_raw_fd())
     }

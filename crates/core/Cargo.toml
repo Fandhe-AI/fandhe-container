@@ -251,6 +251,14 @@ name = "inject_files"
 path = "tests/inject_files.rs"
 harness = false
 
+# 管理ルートの /etc/hosts・/etc/resolv.conf を rootfs へ bind する段（exec::mount_etc_files）を実カーネルで照合する結合試験
+# （NET-12・CORE-1・SEC-1・SEC-5・TASK-185 追補・#1872）。上と同じ理由で harness = false。Linux 5.12 以降（新マウント API）と
+# 非特権 user namespace（または root）が要るため `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "etc_files_mount"
+path = "tests/etc_files_mount.rs"
+harness = false
+
 # bind mount の適用の段（exec::mount_binds）を実カーネルで照合する結合試験（CORE-1・SEC-1・SEC-5・IO-8・TASK-29 追補・#1916）。
 # 上と同じ理由で harness = false。user namespace・新しいマウント API・root の経路が要るため `-- --ignored` 指定時のみ
 # 実行する実機前提テスト（AGENTS.md）。

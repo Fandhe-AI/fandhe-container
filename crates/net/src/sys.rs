@@ -788,6 +788,32 @@ pub(crate) fn open_path_nofollow_at(dir: BorrowedFd<'_>, name: &CStr) -> Result<
     )
 }
 
+/// `dir` 直下の 1 要素 `name` のディレクトリを `O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` で開く。
+///
+/// 読み取り権限が無い（`--x` のみの）ディレクトリでも位置を固定でき、中身は読めない。symlink は
+/// 辿らず `ELOOP` または `ENOTDIR`、ディレクトリでなければ `ENOTDIR`。pasta のバイナリの祖先連鎖の検証
+/// （`pasta::binary`。NET-9・PLUG-11）が `/` から 1 要素ずつ辿るのに使う。
+pub(crate) fn open_dir_path_nofollow_at(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+) -> Result<OwnedFd, SysError> {
+    check_single_component(name)?;
+    open_at_raw(
+        dir.as_raw_fd(),
+        name,
+        consts::O_PATH | consts::O_DIRECTORY | consts::O_NOFOLLOW | consts::O_CLOEXEC,
+    )
+}
+
+/// `dir` 直下の 1 要素 `name` を `O_PATH | O_CLOEXEC` で開く（symlink は辿って実体を固定する・作成しない）。
+///
+/// 最終要素が symlink のときに実体を 1 回だけ固定するために使う（`pasta::binary`。NET-9）。ループは
+/// `ELOOP`、不在（dangling）は `ENOENT`。
+pub(crate) fn open_path_follow_at(dir: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
+    check_single_component(name)?;
+    open_at_raw(dir.as_raw_fd(), name, consts::O_PATH | consts::O_CLOEXEC)
+}
+
 /// `O_PATH` の fd `path_fd` が指すファイルを `/proc/self/fd/<fd>` 経由で
 /// `O_RDWR | O_APPEND | O_NOCTTY | O_NONBLOCK | O_CLOEXEC` で開き直す（作成しない）。
 ///
@@ -1050,6 +1076,27 @@ mod tests {
             cur = open_dir_nofollow_at(cur.as_fd(), &name).unwrap();
         }
         let r = cur.as_fd();
+
+        // NET-9: O_PATH 版のディレクトリ open は symlink を辿らず、追従版は実体を固定する。
+        assert!(open_dir_path_nofollow_at(r, c"sub").is_ok());
+        assert_eq!(
+            open_dir_path_nofollow_at(r, c"dlnk").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        assert_eq!(
+            open_dir_path_nofollow_at(r, c"f").err(),
+            Some(SysError::Os(ENOTDIR))
+        );
+        let followed = std::fs::File::from(open_path_follow_at(r, c"lnk").unwrap());
+        assert!(followed.metadata().unwrap().file_type().is_file());
+        assert_eq!(
+            open_path_follow_at(r, c"none").err(),
+            Some(SysError::Os(ENOENT))
+        );
+        assert_eq!(
+            open_path_follow_at(r, c"a/b").err(),
+            Some(SysError::Os(EINVAL))
+        );
 
         assert!(open_dir_nofollow_at(r, c"sub").is_ok());
         // O_DIRECTORY と O_NOFOLLOW の併用では、ディレクトリへの symlink は ENOTDIR になる（Linux）。

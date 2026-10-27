@@ -14,12 +14,22 @@ publish = false
 # リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 network_attach_privileged が使う。
 [features]
 attach-fault-test-support = []
+# 試験専用: pasta のバイナリ検証で anchor より上の所有者・権限の検査を省く入口（`/tmp` が 1777 のため。NET-9・#1936）。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 pasta_binary が使う。依存は増えない。
+pasta-test-support = []
 
 [dev-dependencies]
 # core・supervisor・cli と同じ方式の自己参照（外部クレートの追加ではない）。dev-dependency は通常のビルドでは
 # 解決されないため、製品の既定ビルドでは feature は無効のまま。`required-features` は使わない（既定の
 # `cargo test` から結合試験が外れないようにするため）。
-fandhe-container-net = { path = ".", features = ["attach-fault-test-support"] }
+fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support"] }
+
+# pasta のバイナリの検証（パスの表・偽の pasta を子として実行する --version の振る舞い。NET-9・PLUG-11・#1936）。
+# 自身を偽の pasta として再実行するため harness = false。root 不要で 3 OS の既定集合で実行する。
+[[test]]
+name = "pasta_binary"
+path = "tests/pasta_binary.rs"
+harness = false
 
 # bridge・veth の作成 → netns 移動 → up の実機結合試験（NET-11・TASK-136.3.2・#846）。libtest のスレッド実行と
 # 子の再入（--child）を分けるため harness = false。root と unshare --net が要る実機前提テストなので

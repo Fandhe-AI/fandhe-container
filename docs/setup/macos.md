@@ -92,7 +92,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 
 ## plugin の配置と信頼性検証
 
-未実装・判断待ち。非 Linux の既定の探索先は空で、信頼性検証（PLUG-11）は常に拒否される（fail-closed）。許可済みハッシュ一覧の作り方（署名後のバイナリのハッシュを載せる方針は #1539）は #1868 の承認後に本節へ書く。
+未実装・判断待ち。既定の探索先は system の `/usr/local/libexec/fandhe-container/plugins` と user の `<XDG_DATA_HOME>/fandhe-container/plugins`（無ければ `~/Library/Application Support/fandhe-container/plugins`）の 2 か所（#1539・#1863）だが、信頼性検証（PLUG-11）は #1865 まで常に拒否される（fail-closed）。許可済みハッシュ一覧の作り方（署名後のバイナリのハッシュを載せる方針は #1539）は #1868 の承認後に本節へ書く。
 
 ## 状態ルート
 

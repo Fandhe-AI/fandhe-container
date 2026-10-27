@@ -166,6 +166,38 @@ printf '// #[ignore]\nfn plain() {}\n' > "${work}/lt0.rs"
 expect 1 "libtest zero ignored functions" -- --name lt --src "${work}/lt0.rs" --log "${work}/lt.log" \
   --select '^test [A-Za-z0-9_]+ \.\.\. ' --libtest-ignored
 
+# --libtest-module（#2987）: mod 内の ignore 試験は `test <mod::path>::<名前> ... ok` を導出する
+cat > "${work}/lm.rs" <<'EOF4B'
+mod tests {
+    #[test]
+    #[ignore = "needs ns"]
+    fn x_case() {}
+
+    #[test]
+    #[ignore]
+    fn y_case() {}
+
+    #[test]
+    fn plain_case() {}
+}
+EOF4B
+lm=(--name lm --src "${work}/lm.rs" --select '^test [A-Za-z0-9_:]+ \.\.\. ' --libtest-ignored --libtest-module a::b::tests)
+printf 'test a::b::tests::x_case ... ok\ntest a::b::tests::y_case ... ok\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lm.log"
+expect 0 "libtest module prefix derived" -- "${lm[@]}" --log "${work}/lm.log" --min 2
+printf 'test x_case ... ok\ntest y_case ... ok\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lm2.log"
+expect 1 "libtest module prefix missing in log" -- "${lm[@]}" --log "${work}/lm2.log"
+printf 'test a::b::tests::x_case ... ok\ntest a::b::tests::y_case ... ok\ntest a::b::tests::y_case ... ok\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lm3.log"
+expect 0 "libtest module duplicated nested ok line" -- "${lm[@]}" --log "${work}/lm3.log"
+printf 'test a::b::tests::x_case ... ok\ntest a::b::tests::y_case ... ignored\ntest result: ok. 2 passed; 0 failed;\n' > "${work}/lm4.log"
+expect 1 "libtest module ignored line fails" -- "${lm[@]}" --log "${work}/lm4.log"
+expect 2 "libtest module without libtest-ignored" -- --name lm --src "${work}/lm.rs" --log "${work}/lm.log" \
+  --select '^test ' --libtest-module a::b
+for badmod in 'a::' '::a' 'a b' 'a;b'; do
+  expect 2 "libtest module invalid path '${badmod}'" -- --name lm --src "${work}/lm.rs" --log "${work}/lm.log" \
+    --select '^test ' --libtest-ignored --libtest-module "${badmod}"
+done
+expect 2 "libtest module with two srcs" -- "${lm[@]}" --src "${work}/lm.rs" --log "${work}/lm.log"
+
 # 移行後の形: 組の値は --subst-re + --require（直積は全組み合わせを要求して失敗する）
 cat > "${work}/g.rs" <<'EOF5'
 fn main() { println!("g: case={case} code={:?} phase={phase}", 1); }

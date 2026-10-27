@@ -144,6 +144,7 @@ Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel
 
 `run_bounded`（`Option`）と `run_log_removal_bounded` は、枠の満杯（何も実行していない）を期限切れと同じ値（`None`・`LogRemoval::TimedOut`）に潰していた。
 判定基準は「何も実行せず即時に失敗したのか、期限まで待った結果なのか」。枠の満杯は `RESOURCE_EXHAUSTED`（または `LogRemoval::Busy`・`workers_busy`）、期限切れは従来どおり `TIMEOUT` にする。
+`run_bounded`（`Option`）は製品の呼び出し元が無くなったため削除した（#2965・REPAIR-1）。結果を持ち帰る期限つき実行は `run_bounded_classified`（即時 `Busy`）か `run_bounded_waiting`（枠を待つ）を使う。
 
 | 箇所 | 方針 | 新しい分類 |
 | ---- | ---- | ---------- |
@@ -152,7 +153,7 @@ Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel
 | `supervisor_log::run_log_removal_bounded`（plugin-cri の `remove_supervisor_log`） | `LogRemoval::Busy` を追加 | plugin-cri は `Kept { ResourceExhausted }`（記録器は Failure） |
 | `logs::remove_container_logs_guarded_bounded` ほか `run_bounded_classified` の呼び出し元 | 変更なし（#2760 で区別済み） | `ResourceExhausted` |
 | CLI の `create` の起動オプション I/O（`run_bounded_waiting`） | 変更なし（#2834） | `RESOURCE_EXHAUSTED`／`TIMEOUT` |
-| CLI の `stop_delete.rs` `remove_supervisor_log`（`run_bounded` の `Option`） | 本変更では触れない。#2892・#2920 で `run_bounded_classified` へ移行する | #2920 で区別 |
+| CLI の `stop_delete.rs` `remove_supervisor_log`（`run_bounded` の `Option`） | #2920 で `run_bounded_classified` 系（`remove_guarded_bounded_waiting`）へ移行済み。`Option` 版の `run_bounded` は #2965 で削除 | 枠の満杯 `RESOURCE_EXHAUSTED`／期限切れ `TIMEOUT` |
 | CLI の `emit_warning_bounded` | 変更なし（結果を捨てるため、分類は外へ出ない） | — |
 
 待たない理由: plugin-cri の即時 `Busy` は #2760 の判断（常駐プロセスで止まった作業が枠を埋めたとき、さらに待ちを重ねない）で、CLI の delete と起動時の走査は

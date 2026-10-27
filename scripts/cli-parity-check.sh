@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# CLI 基本 6 コマンド(と inspect・stop --signal・create --cap-drop・create --read-only)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
+# CLI のライフサイクル系コマンド(create / start / stop / kill / delete / list / logs / inspect / state。stop --signal・create --cap-drop・create --read-only を含む)の 3 OS 同一構文・挙動の比較スクリプト（TASK-125.1・CLI-1・MS-6）。
 #
-# 役割: fandhe-container の基本 6 コマンド（create / start / stop / delete / list / logs）を固定のケース表で
+# 役割: fandhe-container の create / start / stop / kill / delete / list / logs / inspect / state を固定のケース表で
 # 実行し、終了コード・stderr の `code`・stdout の形を正規化して 1 ケース 1 行で記録する（capture）。
 # 別 OS で取った記録同士を突き合わせる（compare）。期待値は「Linux ネイティブ実行と同一」で、
 # 比較の基準は Linux で取った capture ファイルとする。実機での実行・結果の記録・CLI-1 の合否判定は
@@ -26,7 +26,10 @@
 # ユーザー名・環境変数は書かない。list の PID 列は <pid> に置換し、想定外の出力は内容を写さず
 # <unexpected>:行数 とする。inspect の 1 行 JSON は bundle（絶対パス）を記録せず、PID は <pid>、
 # cgroup は <set>、idMapping は model と extent 件数、auditCoverage は reason を落とし、capabilities は
-# 件数だけ、rootReadonly は true / false / - にする（CLI-1・#2826）。
+# 件数だけ、rootReadonly は true / false / - にする（CLI-1・#2826）。state の 1 行 JSON（OCI の state。種別 o）は
+# キーの集合と status・ociVersion だけを `state:<id>,<status>,ver=<版>,keys=<キー名>,ann=<set|->` で記録し、
+# pid の値・bundle（絶対パス）・annotations の中身は記録しない（CLI-1・#1904）。kill は成功時の stdout が
+# 空で、stderr の code（不在は NOT_FOUND・実行中でなければ FAILED_PRECONDITION・構文は INVALID_ARGUMENT）だけを比べる。
 #
 # start 済みの inspect（B18〜B25・種別 s / w。#2891・SEC-1・CLI-1）: B18 で `--read-only --cap-drop NET_RAW` つきの
 # コンテナ c2 を起動用 bundle（Linux だけホストの sleep と依存ライブラリを集めた最小 rootfs を持つ）で作り、
@@ -94,6 +97,7 @@ usage() {
 # ケース表: ID|層|種別|argv（空白区切り。@R@ = 状態ルート、@B@ = バンドル、@S@ = 起動用バンドル、@M@ = 存在しない状態ルート）
 # 種別 l = stdout が list 形式、n = 成功時の stdout は空であるべき、
 # i = stdout が inspect の 1 行 JSON（固定語彙の 1 欄へ正規化して記録する。norm_inspect）、
+# o = stdout が state の 1 行 JSON（OCI の state。キーの集合と status を固定語彙で記録する。norm_state。#1904）、
 # s = start 済みコンテナの inspect（直前の start が成功したときだけ中身を記録し、失敗したときは
 #     <start-failed> の印にする。#2891）、w = s と同じ形で、状態が running でなくなるまで期限つきで繰り返す。
 # B 層は上から順に実行する（状態遷移を観測する）。ID・層はドキュメントのチェックリストと一致させる。
@@ -126,10 +130,24 @@ CASES=(
   'A25|A|n|--root @R@ inspect c1 c2'
   'A26|A|n|--root @R@ create --read-only --read-only --bundle @B@ c1'
   'A27|A|n|--root @R@ create --read-only true --bundle @B@ c1'
+  'A28|A|n|--root @R@ state'
+  'A29|A|n|--root @R@ state c1 c2'
+  'A30|A|n|--root @R@ state a/b'
+  'A31|A|n|--root @R@ state --bogus c1'
+  'A32|A|n|--root @R@ kill'
+  'A33|A|n|--root @R@ kill c1 KILL extra'
+  'A34|A|n|--root @R@ kill a/b'
+  'A35|A|n|--root @R@ kill c1 BOGUS'
+  'A36|A|n|--root @R@ kill c1 65'
+  'A37|A|n|--root @R@ kill c1 term'
+  'A38|A|n|--root @R@ kill -9 c1'
   'B01|B|l|--root @R@ list'
   'B02|B|n|--root @R@ create --bundle @B@ c1'
   'B03|B|l|--root @R@ list'
   'B17|B|i|--root @R@ inspect c1'
+  'B26|B|o|--root @R@ state c1'
+  'B27|B|n|--root @R@ kill c1'
+  'B28|B|n|--root @R@ kill c1 KILL'
   'B04|B|n|--root @R@ create --bundle @B@ c1'
   'B05|B|n|--root @R@ start c1'
   'B06|B|l|--root @R@ list'
@@ -143,6 +161,8 @@ CASES=(
   'B14|B|n|--root @R@ logs nonexist'
   'B15|B|l|--root @M@ list'
   'B16|B|n|--root @R@ inspect nonexist'
+  'B29|B|n|--root @R@ state nonexist'
+  'B30|B|n|--root @R@ kill nonexist'
   'B18|B|n|--root @R@ create --read-only --cap-drop NET_RAW --bundle @S@ c2'
   'B19|B|i|--root @R@ inspect c2'
   'B20|B|n|--root @R@ start c2'
@@ -522,6 +542,42 @@ norm_inspect() {
   return 0
 }
 
+# state の 1 行 JSON（supervisor::inspect::InspectReport::write_oci_state_json。キー順固定・LF 終端 1 行）を
+# 固定語彙の 1 欄へ畳む（種別 o。CLI-1・#1904）。キーの集合（pid は記録があるときだけ出る）・id・status・
+# ociVersion を記録し、pid の値・bundle（絶対パス）・annotations の中身（config 由来の任意の文字列）は
+# 記録しない（情報漏えい防止）。id と ociVersion は固定のケース表・ランタイムの定数でホストに依らないため、
+# OS 間の差を検出できるよう値を記録する。合わない形は 1 を返す（呼び出し側が <unexpected>:行数 にする）。
+# 作法は norm_inspect と同じ（ファイルから直接 1 行読み、LF 終端 1 個・NUL 無し・2 行目無しを確かめる）。
+norm_state() {
+  local e size id status ver keys ann body
+  local str='"'"$JSON_STR_BODY"'"'
+  size=$(($(wc -c <"$tmp_dir/out")))
+  [ "$size" -le "$MAX_INSPECT_BYTES" ] || return 1
+  e=""
+  IFS= read -r e <"$tmp_dir/out" || return 1
+  [ $((${#e} + 1)) -eq "$size" ] || return 1
+  if [ -n "${e//[ -~]/}" ]; then
+    case "$e" in
+      *[$'\001'-$'\037']*) return 1 ;;
+    esac
+    command -v iconv >/dev/null 2>&1 || return 1
+    iconv -f UTF-8 -t UTF-8 <"$tmp_dir/out" >/dev/null 2>&1 || return 1
+    e="${e//[! -~]/~}"
+  fi
+  [[ $e =~ ^\{\"ociVersion\":\"([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\",\"id\":\"([A-Za-z0-9_-]{1,64})\",\"status\":\"([a-z_]{1,16})\",(\"pid\":(0|[1-9][0-9]{0,9}),)?\"bundle\":$str,\"annotations\":\{(.*)\}\}$ ]] || return 1
+  ver="${BASH_REMATCH[1]}"
+  id="${BASH_REMATCH[2]}"
+  status="${BASH_REMATCH[3]}"
+  keys='ociVersion+id+status+bundle+annotations'
+  if [ -n "${BASH_REMATCH[4]}" ]; then keys='ociVersion+id+status+pid+bundle+annotations'; fi
+  body="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+  [[ $body =~ ^($str:$str(,$str:$str)*)?$ ]] || return 1
+  ann='-'
+  if [ -n "$body" ]; then ann='<set>'; fi
+  norm_stdout_out="state:${id},${status},ver=${ver},keys=${keys},ann=${ann}"
+  return 0
+}
+
 # stdout を正規化する。種別 l は list 形式（ヘッダ + 行）を厳格に検査し PID 列を <pid> へ置換する。
 # 結果は norm_stdout_out に入れる。
 norm_stdout_out=""
@@ -540,7 +596,7 @@ norm_stdout() {
   if [ ! -s "$tmp_dir/out" ]; then
     norm_stdout_out='-'
     # 成功（終了コード 0）した inspect が何も出さないのは異常。失敗時の空出力は従来どおり許容する。
-    if { [ "$kind" = "i" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
+    if { [ "$kind" = "i" ] || [ "$kind" = "o" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
     return 0
   fi
   raw=$(($(wc -c <"$tmp_dir/out")))
@@ -552,6 +608,11 @@ norm_stdout() {
   # 検査上限を超える出力は先頭が正常でも後続を検査できないため、一致扱いにせず異常として記録する。
   if [ "$raw" -gt 65536 ]; then
     norm_stdout_out='<unexpected>:big'
+    return 0
+  fi
+  if [ "$kind" = "o" ]; then
+    if norm_state; then return 0; fi
+    norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
     return 0
   fi
   if [ "$kind" = "i" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; then
@@ -818,6 +879,8 @@ load_capture() {
   local id_re='^[ABD][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_started_re='^started:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),sup=(<pid>|-),cg=(<set>|-),health=([a-z_]{1,16}|-),audit=(<set>|-),idmap=(<set>|-),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
+  # 種別 o（state の 1 行 JSON の正規化形式。norm_state と対応させる）。
+  local so_state_re='^state:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},ver=[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3},keys=ociVersion\+id\+status(\+pid)?\+bundle\+annotations,ann=(<set>|-)$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
   local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
@@ -860,6 +923,8 @@ load_capture() {
           elif [ "$k" = "l" ] && [[ $so =~ $so_list_re ]]; then
             so_ok=1
           elif [ "$k" = "i" ] && [[ $so =~ $so_inspect_re ]]; then
+            so_ok=1
+          elif [ "$k" = "o" ] && [[ $so =~ $so_state_re ]]; then
             so_ok=1
           elif { [ "$k" = "s" ] || [ "$k" = "w" ]; } && { [ "$so" = "<start-failed>" ] || [[ $so =~ $so_started_re ]]; }; then
             so_ok=1

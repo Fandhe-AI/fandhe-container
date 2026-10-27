@@ -198,6 +198,9 @@ pub enum ViolationReason {
     /// Landlock の適用時に、Mount 由来のルールの対象がマウントのルートでない（マウントの内側のディレクトリを
     /// 指している。CORE-5・SEC-1・SEC-4・#2071）。
     LandlockMountNotRoot,
+    /// Landlock の適用時に、祖先の書き込み権を VFS の読み取り専用属性で打ち消すはずのルール（検証済みの `ro` の bind）の
+    /// 対象のマウントが、実際には読み取り専用でない（CORE-5・SEC-1・SEC-4・#1917）。
+    LandlockMountNotReadOnly,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -371,10 +374,12 @@ impl ViolationReason {
     /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
     /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）、
     /// bundle の rootfs の固定（`oci_runtime::RootfsDir::pin`）が検証後の差し替えで拒否する種別 `mount_target` の
-    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）から成る。
+    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）、Landlock の再適用が
+    /// `NotRecorded` でも行う読み取り専用属性の照合の拒否（種別 `mount_target` の `landlock_mount_not_read_only`。
+    /// `ro` の bind の属性が失われた・観測できない場合。CORE-5・SEC-1・SEC-4・#1917）から成る。
     /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
     /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
-    pub const EXEC_WORKER_REASONS: [ViolationReason; 13] = [
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 14] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -388,6 +393,7 @@ impl ViolationReason {
         Self::RootfsIsHostRoot,
         Self::PathSymlinkOrNotDirectory,
         Self::PathMissing,
+        Self::LandlockMountNotReadOnly,
     ];
 
     /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
@@ -424,7 +430,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 64] = [
+    pub(super) const ALL: [ViolationReason; 65] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -462,6 +468,7 @@ impl ViolationReason {
         Self::BindTargetKindMismatch,
         Self::LandlockMountIdentityMismatch,
         Self::LandlockMountNotRoot,
+        Self::LandlockMountNotReadOnly,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -563,8 +570,9 @@ impl ViolationReason {
     /// Landlock 適用の失敗の種別から、対応する違反理由を引く（Mount 由来のルールの識別子の照合の違反だけ。
     /// 他は分離違反の試行ではないため `None`。CORE-5・SEC-4・#2071）。
     ///
-    /// launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の再適用（worker の経路）は `NotRecorded` で
-    /// 照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    /// 識別子の照合（`MountIdentityMismatch`・`MountNotRoot`）は launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の
+    /// 再適用（worker の経路）は `NotRecorded` で照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    /// `MountNotReadOnly` は `NotRecorded` でも生じるため含める（#1917）。
     pub(super) fn from_landlock_apply_kind(
         kind: &crate::landlock::LandlockApplyErrorKind,
     ) -> Option<Self> {
@@ -572,6 +580,7 @@ impl ViolationReason {
         match kind {
             K::MountIdentityMismatch { .. } => Some(Self::LandlockMountIdentityMismatch),
             K::MountNotRoot { .. } => Some(Self::LandlockMountNotRoot),
+            K::MountNotReadOnly { .. } => Some(Self::LandlockMountNotReadOnly),
             _ => None,
         }
     }
@@ -616,6 +625,7 @@ impl ViolationReason {
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
             Self::LandlockMountNotRoot => "landlock_mount_not_root",
+            Self::LandlockMountNotReadOnly => "landlock_mount_not_read_only",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -687,6 +697,7 @@ impl ViolationReason {
             | Self::BindTargetKindMismatch
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -745,7 +756,9 @@ impl ViolationReason {
             | Self::BindSourceReachesStateRoot
             | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
-            Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
+            Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly => "CORE-5",
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => "SEC-2",
@@ -801,6 +814,7 @@ impl ViolationReason {
             | Self::HostDeviceNodeUnexpected
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -934,6 +948,9 @@ impl ViolationReason {
                 "the mount identity of a landlock rule target differs from the one recorded after mounting"
             }
             Self::LandlockMountNotRoot => "the landlock rule target is not the root of its mount",
+            Self::LandlockMountNotReadOnly => {
+                "the landlock rule target relies on a read-only mount but the mount is writable"
+            }
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }
@@ -1747,11 +1764,11 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 14 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
     /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
     #[test]
     fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 14);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
         }
@@ -1903,7 +1920,7 @@ mod tests {
         }
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 14 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
     /// コード、`rootfs_is_host_root` と rootfs の固定の 2 理由〔#1702〕は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {

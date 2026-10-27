@@ -1,4 +1,4 @@
-# CLI 基本 6 コマンド（と inspect・stop --signal・create --cap-drop・create --read-only）の 3 OS 同一構文・挙動 確認記録（雛形）
+# CLI のライフサイクル系コマンド（create・start・stop・kill・delete・list・logs・inspect・state。stop --signal・create --cap-drop・create --read-only を含む）の 3 OS 同一構文・挙動 確認記録（雛形）
 
 TASK-125（共同タスク）の確認記録の雛形。実機での実行・結果の記入・CLI-1 の合否判定は #661（TASK-125.h1・人間担当）が行う。本ファイルと `scripts/cli-parity-check.sh` は Agent 担当分（TASK-125.1・#660）の準備物で、結果欄に Agent が実測値を埋めてはならない。
 
@@ -10,9 +10,10 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 | 項目 | 内容 |
 | ---- | ---- |
-| 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
+| 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（#1869）。macOS / Windows ではバックエンド解決が必ず失敗する（macOS は候補なしで 5、候補ありで検証の拒否 6〔`platform backend plugin failed trust verification`〕。Windows は既定で 5、`--plugin-path-search` で候補があるとホストが検証しないため 8〔`plugin trust verification is not performed on this host`〕）。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の `start` | `start` は supervisor 経由で本番 launcher まで配線済み（#2048・#1718・#1715・#1819・#2442。CLI は実体と同じディレクトリの `fandhe-container-supervisor` を `systemd-run --user --scope -p Delegate=yes` で包んで起動する）。cgroup 配置つき `delete` も実装済み（#2096。ただし Running のコンテナへの `delete --force` は 8 になる）。pid ありの `stop` は supervisor の制御チャネル経由（#2059。届かなければ `UNAVAILABLE`（9））。restart の再 launch は fail-closed（#2043）。**`start` の終了コードは環境（前提）で変わる**: supervisor が CLI の隣に無ければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`（`RootfulHostRoot`・#2241 の判断待ち）、`systemd-run` や user マネージャが無ければ 5 / `FAILED_PRECONDITION`。成功には非 root・supervisor を CLI の隣に置く・特権ランチャー `fandhe-container-launcher` を置かない（置くと rootful のインストールとみなされる）・user マネージャと委譲 cgroup・Landlock ABI 6 以上が要る。Linux 側の値は環境で変わる参考値で、固定の合格基準にしない（REPAIR-3）。B05 の bundle は rootfs が空なので、前提が揃っていても起動に失敗する |
 | イメージ管理の現状（C 層） | コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みで、在庫は plugin-cri の `PullImage`（cri の `OciImagePuller::pull`）が登録する。plugin-cri のキャッシュは「plugin-cri が解決する既定の状態ルート（`StateRoot::resolve(None)`）の `.cri/images`」（#2539・#2800・#2592）。CLI に `pull` サブコマンドは無い（`docs/design/pull-inventory-wiring.md`）。同じ root を `--image-root` に渡せば、pull 済みの在庫に対して `image ls`・`image rm`・`image tag`・`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から解決。#2496）が成功する。未 pull の root（空のストア）では従来どおり `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image` は `NOT_FOUND`（3）で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する。pull 済み root の手順は C 層の節の「pull 済みの root の用意」 |
+| kill・state の自動収集の範囲（#1904・CLI-1） | `kill` の本番 signaler は supervisor の制御チャネル経由で実装済み（実行中の対象へは届かなければ `UNAVAILABLE`（9））。自動収集するのは、実行中でない対象（created の c1。pid の記録が無く 5 / `FAILED_PRECONDITION`。B27・B28）と不在の ID（3 / `NOT_FOUND`。B30）と構文（A32〜A38）だけで、**実行中のコンテナへのシグナル送出と、実行中のコンテナの `state`（`pid` つき）は自動収集していない**（手動で確認する。値は環境で変わる参考値で、合格の基準にしない）。`state` の `pid` は記録があるときだけ出る。B27・B28 の非 Linux の 5 は、バックエンド解決の失敗による偶然の一致で、parity の合格を意味しない |
 | Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
@@ -52,7 +53,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 スクリプトが `code` として受理する stderr は次の 2 形式だけで、どちらも 1 行・LF 終端・キー順固定とする。
 
 - 固定文言の失敗（使い方エラー・未実装・状態ルート不在など）: `{"code":"<CODE>","message":"<文字列>"}`
-- core 由来の失敗（`create` / `start` / `stop` / `delete`）: `{"op":"<操作>","code":"<CODE>","message":"<文字列>"}`（`stop` の `op` は `kill`）
+- core 由来の失敗（`create` / `start` / `stop` / `kill` / `delete`）: `{"op":"<操作>","code":"<CODE>","message":"<文字列>"}`（`stop` の `op` は `kill`）
 
 `message` は JSON 文字列として検証する（未エスケープの `"`・`\`・制御文字、不正なエスケープ、不正な UTF-8 は拒否）。記録と比較の対象は `code` だけで、`op` の有無と値・`message` の内容は記録しない。上記以外の出力（キーの追加・欠落・順序違い、複数行、LF 終端なし、NUL、16384 バイト超）は `<unparsed>` と記録し、compare は同じ `<unparsed>` 同士でも一致扱いにしない（UNVERIFIED）。
 
@@ -107,12 +108,23 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | A25 | `inspect <id> <id>`（余剰引数） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2775 で追加） | |
 | A26 | `create --read-only --read-only ...`（重複） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2828 で追加） | |
 | A27 | `create --read-only true ...`（値つき。`true` が余剰の位置引数になる） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#2828 で追加） | |
+| A28 | `state`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A29 | `state <id> <id>`（余剰引数） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A30 | `state a/b`（不正な ID） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A31 | `state --bogus <id>`（未知のオプション） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A32 | `kill`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A33 | `kill <id> KILL extra`（位置引数が 3 個） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A34 | `kill a/b`（不正な ID） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A35 | `kill <id> BOGUS`（未知のシグナル名） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A36 | `kill <id> 65`（範囲外の番号。受けるのは 1〜64） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A37 | `kill <id> term`（小文字。シグナル名は大文字小文字を区別する） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
+| A38 | `kill -9 <id>`（オプション形。`-` で始まる引数は受けない） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | 未確認（#1904 で追加） | |
 
 ## B 層: 挙動（macOS / Windows は plugin 発見機構経由）
 
-B 層は上から順に実行し、状態遷移を直後の `list` で観測する。Linux 欄の期待は現行実装の参考値（REPAIR-3）。macOS / Windows 欄は plugin 起動・RPC 配線（TASK-114）が整うまで「前提未達」を既定値とする。
+B 層は上から順に実行し、状態遷移を直後の `list` で観測する。Linux 欄の期待は現行実装の参考値（REPAIR-3）。macOS / Windows 欄は plugin 起動・RPC 配線（#1869）が整うまで「前提未達」を既定値とする。
 
-### 6 コマンド別の比較項目
+### コマンド別の比較項目
 
 | コマンド | 受理される構文 | 比較項目 |
 | -------- | -------------- | -------- |
@@ -122,11 +134,15 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | `delete` | `delete [--force] <id>` | 終了コード・`code`・stdout 空・直後の `list` から ID が消える |
 | `list` | `list` | 終了コード・stdout の形式（ヘッダ `ID<TAB>STATUS<TAB>PID`、ID 昇順、0 件はヘッダのみで 0）・状態ルート不在は `NOT_FOUND`（3） |
 | `inspect` | `inspect <id>` | 終了コード・`code`・正規化した 1 行 JSON（B17。種別 `i`）・不在 ID は `NOT_FOUND`（3）。構文は A24・A25 |
+| `kill` | `kill <id> [<signal>]` | 終了コード・`code`・stdout 空・不在 ID は `NOT_FOUND`（3）・実行中でなければ `FAILED_PRECONDITION`（5。B27・B28）。シグナルの語彙は標準 31 個の名前（`SIG` 接頭辞は任意）と 1〜64 の番号で、名前は大文字小文字を区別する。構文は A32〜A38 |
+| `state` | `state <id>` | 終了コード・`code`・正規化した 1 行 JSON（B26。種別 `o`）・不在 ID は `NOT_FOUND`（3。B29）。構文は A28〜A31 |
 | `logs` | `logs [--follow] [--tail <N>] [--stream <stdout\|stderr>] [--escape] <id>` | 終了コード・`code`・不在 ID は `NOT_FOUND`（3）。オプションの構文は D 層（#2447・SUP-7） |
 
 ### ケース別チェックリスト
 
-結果欄は 終了コード / `code` / stdout 要約（`-` = 空、`list:H;<id>,<status>,<pid|->` = list 形式、`inspect:...` = inspect の 1 行 JSON の正規化形式）。
+結果欄は 終了コード / `code` / stdout 要約（`-` = 空、`list:H;<id>,<status>,<pid|->` = list 形式、`inspect:...` = inspect の 1 行 JSON の正規化形式、`state:...` = state の 1 行 JSON の正規化形式）。
+
+`state:<id>,<status>,ver=<x.y.z>,keys=<キー名を + で連結>,ann=<set|->` の固定語彙の 1 欄に畳んで記録する（`scripts/cli-parity-check.sh` の `norm_state`。CLI-1・#1904）。記録するのはキーの集合（`pid` は記録があるときだけ出る）・id・status・`ociVersion` で、id は固定のケース表、`ociVersion` はランタイムの定数のためホストに依らず、OS 間の差を検出できるよう値を残す。記録しない値は pid の値・bundle（絶対パス）・annotations の中身（config 由来の任意の文字列。有無だけを `<set>` / `-` にする）。キー順や形が製品の出力（`crates/supervisor/src/inspect.rs` の `write_oci_state_json`）と違う出力は `<unexpected>:<行数>` になり、一致扱いにならない。
 
 `inspect:<id>,<status>,pid=<pid|->,exit=<整数|->,rev=<整数>,cg=<set|->,sup=<pid|->,health=<語彙|->,rst=<整数>,audit=<policy/seccompKill/landlock/record|->,idmap=<model:uid件数:gid件数|->,stop=<語彙>,caps=<件数|->,ro=<true|false|->` の固定語彙の 1 欄に畳んで記録する（`scripts/cli-parity-check.sh` の `norm_inspect`。CLI-1・#2826）。値を記録する項目は id・status・health・exitCode・revision・restartCount・explicitStop で、PID（pid・supervisorPid）は `<pid>`、cgroup（cgroupScope・cgroupInstance）は `<set>` に置換する。記録しない項目は bundle（絶対パス）・auditCoverage の reason（カーネル版数に依る詳細）・idMapping の hostId（ホストの subuid 設定）・capabilities の名前（件数だけ記録）。キー順や形が製品の出力契約（`crates/supervisor/src/inspect.rs`）と違う出力は `<unexpected>:<行数>` になり、一致扱いにならない。
 
@@ -136,6 +152,9 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B02 | `create --bundle <bundle> c1` | 0 / `-` / `-` | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B03 | `list`（create 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B17 | `inspect c1`（B03 の直後。created のコンテナ） | 0 / `-` / `inspect:c1,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-` | | 前提未達 | 前提未達 | | `rev` は参考値で固定の合格基準にしない。macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#2826 で追加 |
+| B26 | `state c1`（B17 の直後。created のコンテナ。種別 `o`） | 0 / `-` / `state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-` | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。pid の記録が無いため `keys` に `pid` が入らない。#1904 で追加 |
+| B27 | `kill c1`（B26 の直後。created で pid なし。シグナル省略） | 5 / `FAILED_PRECONDITION` / `-`（pid の記録が無い） | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`。値は Linux と同じだが、pid が無い判定ではなくバックエンド解決の失敗で、parity の合格を意味しない。#1904 で追加 |
+| B28 | `kill c1 KILL`（B27 の直後。シグナル指定） | 5 / `FAILED_PRECONDITION` / `-`（pid の記録が無い） | | 前提未達 | 前提未達 | | B27 と同じ（偶然の一致で、合格を意味しない）。kill は失敗するため状態は変わらず、B04 以降は従来どおり。#1904 で追加 |
 | B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | 4 / `ALREADY_EXISTS` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B05 | `start c1` | 5 / `FAILED_PRECONDITION` / `-`（supervisor が CLI の隣に無い場合。uid 0 は 8 / `UNIMPLEMENTED`。c1 の rootfs は空のため supervisor があっても起動に失敗する。環境で変わる参考値） | 8 / `UNIMPLEMENTED` / `-`（#2048 より前の実測。参考期待値は #2891 で更新） | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
@@ -149,6 +168,8 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B14 | `logs nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B16 | `inspect nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B29 | `state nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#1904 で追加 |
+| B30 | `kill nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#1904 で追加 |
 | B18 | `create --read-only --cap-drop NET_RAW --bundle <起動用 bundle> c2` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | 起動用 bundle は長寿命の `sleep` を動かす config を持つ（#2891） |
 | B19 | `inspect c2`（create 直後） | 0 / `-` / `inspect:c2,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-` | | 前提未達 | 前提未達 | | capabilities・rootReadonly は launcher が適用した値の記録で、create だけでは `caps=-`・`ro=-`（start 前は null）であることを固定する |
 | B20 | `start c2` | 0 / `-` / `-`（前提が揃った場合。揃わなければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`） | | 前提未達 | 前提未達 | | 環境で変わる値。B21・B23 の前提 |
@@ -257,5 +278,5 @@ CLI に `pull` は無いため、plugin-cri の `PullImage` で在庫を埋め�
 | 差異の種類 | 戻し先 |
 | ---------- | ------ |
 | 構文（A 層）・Linux 経路の挙動 | TASK-79 系（CLI 本体） |
-| 非 Linux の plugin 経由の挙動 | TASK-114（plugin 起動・RPC）・TASK-115 / TASK-116（macOS / Windows バックエンド）の該当 Issue |
+| 非 Linux の plugin 経由の挙動 | #1869（plugin 起動・RPC）・TASK-115 / TASK-116（macOS / Windows バックエンド）の該当 Issue |
 | 本スクリプトの不具合 | TASK-125.1（#660）系 |

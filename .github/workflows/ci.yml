@@ -1996,12 +1996,14 @@ jobs:
       # 長いものを先に並べる。ターゲットごとのログは `::group::` で出力し、1 つでも失敗すれば失敗する。
       # 対象: fio-bench・fio-baseline-ratio（TASK-25.1・25.2・IO-8）・bench-check・bench-baseline（REPAIR-8・TASK-88.1）・
       # startup-latency（TASK-46.1・CORE-10）・net-setup-timing（TASK-139.5・NET-4。実測は TASK-140）・
+      # net-throughput-rtt（TASK-140 準備・#1882・NET-2・NET-3。スタブのみ。実測は #319）・
       # dns-helper-measure（TASK-141.3・NET-5。実測は TASK-142）・idle-memory（TASK-45.1・CORE-7）・
       # concurrent-memory（TASK-50.1・50.2・CORE-9）・idle-memory-supervised（TASK-47）・
       # supervisor-independence（TASK-162・SUP-5。実機実証は #499）・supervisor-pss（TASK-158・SUP-2。実測は #485）・
       # restart-latency（TASK-160・SUP-3。実測は #491）
       # crictl-smoke（TASK-60・CRI-1。スタブの crictl のみ。実機は #442）
       # small-files-compare（TASK-24.1・IO-7。スタブのハーネスのみ。実測は #107、評価は #110）
+      # mac-small-files（TASK-70 準備・#1880・MAC-3。スタブの docker のみ。実測は #381・#354）
       # install-launcher（TASK-171 追補・#1721・SUP-14。スタブのみ）・cli-parity の期限・回収（#1688・REPAIR-5。platform-ci の ubuntu 分を移した）
       - name: 計測スクリプト群の自己テスト（並列 3。REPAIR-12）
         run: >-
@@ -2021,8 +2023,10 @@ jobs:
           bench-check-selftest
           bench-baseline-selftest
           net-setup-timing-selftest
+          net-throughput-rtt-selftest
           dns-helper-measure-selftest
           small-files-compare-selftest
+          mac-small-files-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は

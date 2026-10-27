@@ -71,7 +71,7 @@ rustdoc の警告（壊れた intra-doc リンク・private 項目へのリン�
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として `platform-ci` の macos（main への push と `workflow_dispatch`）で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
-`bench-regression` ジョブは次の 21 個の `make`（下記 1〜18・14a・14b と `make cli-parity-native-reclaim-selftest`）を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14・14a・14b の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
+`bench-regression` ジョブは次の 23 個の `make`（下記 1〜18・14a・14b・14c・14d と `make cli-parity-native-reclaim-selftest`）を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14・14a・14b・14c・14d の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
 
 1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
 2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）
@@ -89,6 +89,8 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 14. `make install-launcher-selftest`（特権ランチャーのインストールスクリプト `scripts/install-privileged-launcher.sh` の自己テスト。スタブ・一時ディレクトリのみで root 不要。TASK-171 追補・#1721・SUP-14）
 14a. `make crictl-smoke-selftest`（crictl 疎通確認スクリプト `scripts/cri/crictl-smoke.sh` の自己テスト。スタブの crictl と一時ディレクトリの UNIX ソケットのみ。python3 が必要。実機は #442 で人間が行う。TASK-60・CRI-1）
 14b. `make small-files-compare-selftest`（bind / named volume の 2 構成比較スクリプト `scripts/bench/small_files_compare.sh` の自己テスト。スタブのハーネスと fixture のみ。実測は #107、評価は #110。TASK-24.1・IO-7）
+14c. `make mac-small-files-selftest`（MAC-3 小ファイル多数計測スクリプト `scripts/bench/mac_small_files.sh` の自己テスト。スタブの docker と一時ディレクトリのみ。bash 5 以上が必要。実測は #381・#354 で人間が行う。TASK-70 準備・#1880・MAC-3）
+14d. `make net-throughput-rtt-selftest`（iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプト `scripts/bench/net_throughput_rtt.sh` の自己テスト。スタブの保持入口・nsenter・iperf3・probe・docker のみ。実測は #319 で人間が行う。TASK-140 準備・#1882・NET-2・NET-3）
 15. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 16. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）
 17. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）

@@ -64,7 +64,7 @@ TASK-190 は「CI で分離込みの起動を測れるか」を実装の前に�
 | 委譲 cgroup | `DelegatedCgroup` の契約（非 root ではルート cgroup を拒否・親に自分以外のプロセスがいれば拒否）と #2049 の観察 | supervisor ごとに `systemd-run --user --scope -p Delegate=yes` が要る。hosted runner に user manager の直結ソケット（`$XDG_RUNTIME_DIR/systemd/private`。本番の start とベンチの事前検査が見るもの）があるかは未確認。用意には `loginctl enable-linger` などの sudo が要り、ci.md の方針（sudo の用途を増やさない）に反する |
 | root | — | runner は非 root。supervisor は rootful を拒否する（SEC-5） |
 | 揺らぎ | — | 共有 VM で p95 に 15% の閾値をかけると誤検知の恐れがある（未実測） |
-| runner 上のプローブ | スモーク（引数なし。`cargo bench -p fandhe-container-benches --bench startup_latency` を手元で実行して採る。CI では実行しない）が 1 行出す（`apparmor_restrict_unprivileged_userns`・`max_user_namespaces`・landlock・user bus・`DelegatedCgroup::detect`・euid） | 未取得（CI にスモークの実行経路は無い。runner で採るには上のコマンドを実行するステップの追加が要り、本 issue では追加しない） |
+| runner 上のプローブ | スモーク（引数なし。`cargo bench -p fandhe-container-benches --bench startup_latency` を手元で実行して採る。CI では実行しない）が 1 行出す（`apparmor_restrict_unprivileged_userns`・`max_user_namespaces`・landlock・user マネージャ（`user_manager=`。`$XDG_RUNTIME_DIR/systemd/private` の lstat で、本番の start・事前検査と同じ `user_manager_env` の判定）・`DelegatedCgroup::detect`・euid） | 未取得（CI にスモークの実行経路は無い。runner で採るには上のコマンドを実行するステップの追加が要り、本 issue では追加しない） |
 
 **暫定の決定（オーナー確認待ち）: (b) ベンチ全体を実機前提として分離し、CI の回帰比較に入れない**（ci.md「実機前提テスト」）。
 

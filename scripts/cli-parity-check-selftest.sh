@@ -57,6 +57,8 @@ expect_eq() {
 #                  A 層 18 ケースは全て使い方エラーで順に呼ばれるため、n 回目 = ケース A<n>。
 #   STUB_OUT_DIR = 成功するコマンドの n 回目に out.<n> があれば、その内容をそのまま stdout へ流す。
 #                  成功の順は B01 list・B02 create・B03 list・B06 list・B09 delete・B10 list。
+#   STUB_STATE_DIR = 存在する ID の state（B26。種別 o。c1 だけ）の stdout を、そのディレクトリの out ファイルの内容で
+#                  差し替える（無ければ製品と同じ形の 1 行 JSON）。state・kill は成功の順（STUB_OUT_DIR）を進めない（#1904）。
 #   STUB_INSPECT_DIR = 存在する ID の inspect（B17。成功は 1 回だけ）の stdout を、そのディレクトリの
 #                  out ファイルの内容で差し替える（無ければ製品と同じ形の created の 1 行 JSON）。
 #                  STUB_OUT_DIR とはカウンタを共有しない（既存の fixture の番号をずらさないため）。
@@ -179,7 +181,25 @@ case "$cmd" in
       esac
     done
     [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
-  start | inspect)
+  kill)
+    # 製品 CLI の kill は位置引数 1〜2 個（<id> [<signal>]）で、`-` で始まる引数は受けない（-9 も拒否）。シグナルの名前は
+    # 大文字小文字を区別する。スタブは stop と同じく代表の名前だけを受ける（#1904）。
+    n=0; id=""; sig=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -*) bad ;;
+        *) n=$((n + 1)); if [ "$n" -eq 1 ]; then id="$1"; else sig="$1"; fi; shift ;;
+      esac
+    done
+    { [ "$n" -ge 1 ] && [ "$n" -le 2 ] && valid_id "$id"; } || bad
+    if [ -n "$sig" ]; then
+      if [[ "$sig" =~ ^[0-9]{1,3}$ ]]; then
+        v=$((10#$sig)); { [ "$v" -ge 1 ] && [ "$v" -le 64 ]; } || bad
+      else
+        [[ "$sig" =~ ^(SIG)?(TERM|KILL|INT|HUP)$ ]] || bad
+      fi
+    fi ;;
+  start | inspect | state)
     [ $# -eq 1 ] && valid_id "$1" && [ "${1#-}" = "$1" ] || bad; id="$1" ;;
   delete)
     force=0; n=0
@@ -239,6 +259,23 @@ case "$cmd" in
       # 製品の InspectReport::to_json と同じキー順。bundle にはパス風の文字列を入れ、漏えいしないことを照合する。
       printf '{"id":"%s","status":"created","pid":null,"exitCode":null,"bundle":"/home/secret-user/bundle","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n' "$id"
     fi
+    ;;
+  state)
+    [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND
+    if [ "$id" = "c1" ] && [ -n "${STUB_STATE_DIR:-}" ] && [ -f "$STUB_STATE_DIR/out" ]; then
+      cat "$STUB_STATE_DIR/out"
+    else
+      # 製品の InspectReport::write_oci_state_json と同じキー順。pid は記録があるときだけ出る。bundle にはパス風の文字列を入れ、漏えいしないことを照合する。
+      if [ -e "$root/$id.started" ]; then st='running'; pj='"pid":4242,'
+      elif [ -e "$root/$id.stopped" ]; then st='stopped'; pj=''
+      else st='created'; pj=''; fi
+      printf '{"ociVersion":"1.3.0","id":"%s","status":"%s",%s"bundle":"/home/secret-user/bundle","annotations":{}}\n' "$id" "$st" "$pj"
+    fi
+    ;;
+  kill)
+    [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill
+    # pid の無い（start されていない）対象は FAILED_PRECONDITION。実行中への送出はスタブでは状態を変えない。
+    [ -e "$root/$id.started" ] || fail_op 5 FAILED_PRECONDITION kill
     ;;
   stop)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill
@@ -401,6 +438,29 @@ mkdir -p "$inspdir/big"
   printf '%s\n' "$tail_ok"
 } >"$inspdir/big/out"
 
+# state fixture（B26 の stdout）。1 ケース 1 capture で、B26 の行を具体値で照合する（#1904）。
+statedir="$work/state"
+mkdir -p "$statedir"
+mkstate() { # <名前> <printf の書式（stdout の全バイト）>
+  mkdir -p "$statedir/$1"
+  # shellcheck disable=SC2059 # 書式は本ファイル内の固定 fixture
+  printf "$2" >"$statedir/$1/out"
+}
+st_head='{"ociVersion":"1.3.0","id":"c1","status":"created",'
+mkstate full '{"ociVersion":"1.3.0","id":"c1","status":"running","pid":42,"bundle":"/home/secret-user/b\\"q\\" \303\251","annotations":{"k":"secret-value","a\\"b":"\303\251"}}\n'
+mkstate withann "$st_head"'"bundle":"/b","annotations":{"k":"v"}}\n'
+mkstate missing "$st_head"'"annotations":{}}\n'
+mkstate extra "$st_head"'"bundle":"/b","annotations":{},"extra":1}\n'
+mkstate order '{"ociVersion":"1.3.0","status":"created","id":"c1","bundle":"/b","annotations":{}}\n'
+mkstate notjson 'created\n'
+mkstate nolf "$st_head"'"bundle":"/b","annotations":{}}'
+mkstate crlf "$st_head"'"bundle":"/b","annotations":{}}\r\n'
+mkstate twolines "$st_head"'"bundle":"/b","annotations":{}}\n'"$st_head"'"bundle":"/b","annotations":{}}\n'
+mkstate lead0pid '{"ociVersion":"1.3.0","id":"c1","status":"running","pid":042,"bundle":"/b","annotations":{}}\n'
+mkstate badann "$st_head"'"bundle":"/b","annotations":{"a":1}}\n'
+mkstate badstr "$st_head"'"bundle":"a"b","annotations":{}}\n'
+mkstate empty ''
+
 # --------------------------------------------------
 # capture を同時に起動し、全て終わってから照合する。
 # --------------------------------------------------
@@ -470,6 +530,10 @@ insp_names="full rofalse noro badro extrarw order extra missing nolf crlf twolin
 for n in $insp_names; do
   STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
 done
+state_names="full withann missing extra order notjson nolf crlf twolines lead0pid badann badstr empty"
+for n in $state_names; do
+  STUB_STATE_DIR="$statedir/$n" start_capture "state_$n" ok
+done
 # sigdel: 連鎖中の delete（m1）で 1 回目の TERM、後始末中の delete（m2）で 2 回目の TERM を送る。
 wait_for_file() { # <パス>。最大 60 秒
   local n=0
@@ -503,6 +567,7 @@ if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
 fi
 all_caps="ok lcall nonlinux nostart diff noisy errtable errmax outtable"
 for n in $insp_names; do all_caps="$all_caps insp_$n"; done
+for n in $state_names; do all_caps="$all_caps state_$n"; done
 for name in $all_caps; do
   expect_rc "capture $name exits 0" 0 "$(rc_of "$name")"
 done
@@ -516,7 +581,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 59 cases" 59 "$count"
+expect_eq "capture records 75 cases" 75 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -535,12 +600,19 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 59 "$loc_n"
+expect_eq "lcall stub invocations" 75 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A26 duplicate read-only" ok "A26${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A27 read-only with a value" ok "A27${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "B29 state of a missing container" ok "B29${tab}B${tab}3${tab}NOT_FOUND${tab}-"
+expect_line "B30 kill of a missing container" ok "B30${tab}B${tab}3${tab}NOT_FOUND${tab}-"
+expect_line "B27 kill of a created container (no pid)" ok "B27${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "B28 kill KILL of a created container (no pid)" ok "B28${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+for a in A28 A29 A30 A31 A32 A33 A34 A35 A36 A37 A38; do
+  expect_line "$a state / kill usage error" ok "$a${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+done
 expect_line "B16 inspect of a missing container" ok "B16${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "B15 missing state root" ok "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 expect_line "D01 tail without value" ok "D01${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -619,13 +691,13 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
-cmp_has "layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=25 mismatch=0 missing=0'
+cmp_has "layer A summary" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
-cmp_has "lcall layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=25 mismatch=0 missing=0'
+cmp_has "lcall layer A summary" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -634,8 +706,8 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
-cmp_has "non-linux layer A all match" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B05 and B08 coincide at 5; B21 and B23 are not started)" 'layer B (behavior): match=2 mismatch=21 missing=0'
+cmp_has "non-linux layer A all match" 'layer A (syntax): match=38 mismatch=0 missing=0'
+cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21 and B23 are not started)" 'layer B (behavior): match=4 mismatch=24 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -652,7 +724,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=24 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=29 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"
@@ -777,6 +849,45 @@ expect_rc "list form on an inspect case is rejected" 2 $?
 sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}inspect:garbage/" "$work/ok.txt" >"$work/i3.txt"
 compare i3 i3
 expect_rc "inspect:garbage stdout field is rejected" 2 $?
+
+# --- state の 1 行 JSON（種別 o。B26。#1904）---
+want_state_created="B26${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-"
+expect_line "B26 state of a created container" ok "$want_state_created"
+expect_line "B26 state with pid and annotations is normalized" state_full "B26${tab}B${tab}0${tab}-${tab}state:c1,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=<set>"
+expect_line "B26 state with annotations only records the key set" state_withann "B26${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=<set>"
+for n in missing extra order notjson crlf lead0pid badann badstr; do
+  expect_line "B26 malformed state ($n) is unexpected" "state_$n" "B26${tab}B${tab}0${tab}-${tab}<unexpected>:1"
+done
+expect_line "B26 state without LF is unexpected" state_nolf "B26${tab}B${tab}0${tab}-${tab}<unexpected>:0"
+expect_line "B26 two-line state is unexpected" state_twolines "B26${tab}B${tab}0${tab}-${tab}<unexpected>:2"
+expect_line "B26 empty stdout on success is unexpected" state_empty "B26${tab}B${tab}0${tab}-${tab}<unexpected>:0"
+leak=0
+for n in ok state_full; do
+  while IFS= read -r l; do
+    case "$l" in *secret*|*/home*|*4242*|*bundle/*) leak=$((leak + 1)) ;; esac
+  done <"$work/$n.txt"
+done
+expect_eq "state capture leaks no pid value / path / annotation" 0 "$leak"
+compare ok state_order
+expect_rc "malformed state differs from ok (rc 1)" 1 $?
+cmp_has_prefix "B26 malformed state reported as UNVERIFIED" "B26 UNVERIFIED"
+compare ok state_full
+expect_rc "different state values differ (rc 1)" 1 $?
+cmp_has_prefix "B26 different state values reported as MISMATCH" "B26 MISMATCH"
+compare ok nonlinux
+cmp_has_prefix "B26 non-linux is MISMATCH" "B26 MISMATCH"
+sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/o1.txt"
+compare ok o1
+expect_rc "state form on a non-state case is rejected" 2 $?
+sed "s/^B26${tab}B${tab}0${tab}-${tab}.*/B26${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/o2.txt"
+compare ok o2
+expect_rc "list form on a state case is rejected" 2 $?
+sed "s/^B26${tab}B${tab}0${tab}-${tab}.*/B26${tab}B${tab}0${tab}-${tab}state:garbage/" "$work/ok.txt" >"$work/o3.txt"
+compare ok o3
+expect_rc "state:garbage stdout field is rejected" 2 $?
+sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/o4.txt"
+compare ok o4
+expect_rc "state form on an inspect case is rejected" 2 $?
 
 # --- start 済みの inspect（種別 s / w。B18〜B25。#2891・SEC-1・CLI-1） ---
 expect_line "B18 create with --read-only --cap-drop on the start bundle" ok "B18${tab}B${tab}0${tab}-${tab}-"

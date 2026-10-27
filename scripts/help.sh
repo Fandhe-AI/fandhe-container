@@ -109,8 +109,12 @@ cat <<'EOF'
                                         起動時間計測スクリプトの自己テスト（REPAIR-12。実ランタイム不要）
   net-setup-timing-selftest           scripts/with-tools.sh jq scripts/bench/net_setup_timing_selftest.sh
                                         ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
+  net-throughput-rtt-selftest         scripts/with-tools.sh jq scripts/bench/net_throughput_rtt_selftest.sh
+                                        iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプトの自己テスト（NET-2・NET-3・REPAIR-12。実機・docker 不要）
   small-files-compare-selftest        scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
                                         bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
+  mac-small-files-selftest            scripts/with-tools.sh jq scripts/bench/mac_small_files_selftest.sh
+                                        MAC-3 小ファイル多数計測スクリプトの自己テスト（REPAIR-12。実 Docker Desktop 不要。#1880）
   dns-helper-measure-selftest         scripts/with-tools.sh jq scripts/bench/dns_helper_measure_selftest.sh
                                         DNS ヘルパー計測スクリプトの自己テスト（NET-5・REPAIR-12。実機不要）
   idle-memory-selftest                scripts/bench/idle_memory_selftest.sh
@@ -171,8 +175,16 @@ cat <<'EOF'
                                         own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）
   net-setup-timing                    scripts/targets/net-setup-timing.sh
                                         ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
+  net-throughput-rtt                  scripts/targets/net-throughput-rtt.sh
+                                        iperf3 スループットと 1 バイト TCP 往復を計測し JSON で出力する（実機前提。PROBE・EXE 必須。TARGET=docker|both は docker を使うため人間の承認後。NET-2・NET-3・TASK-140 準備）
+  net-throughput-rtt-compare          scripts/targets/net-throughput-rtt-compare.sh
+                                        2 つの計測結果から Docker 比（%）と p50・p99 の倍率を出す（OWN_RESULT・DOCKER_RESULT 必須。合否なし。NET-2・NET-3）
   small-files-compare                 scripts/targets/small-files-compare.sh
                                         bind / named volume の 2 構成で small_files を回し JSON で出力する（実機前提。BIND_ROOT・VOLUME_ROOT 必須。IO-7・TASK-24.1）
+  mac-small-files-docker              scripts/targets/mac-small-files-docker.sh
+                                        Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・#1880）
+  mac-small-files-report              scripts/targets/mac-small-files-report.sh
+                                        own と Docker Desktop の小ファイル多数の結果を統合する（OWN_RESULT=<file> BASELINE_RESULT=<file> 必須。合否は出さない。MAC-3・#1880）
   dns-helper-measure                  scripts/targets/dns-helper-measure.sh
                                         DNS ヘルパーの正答率・レイテンシ・常駐 PSS を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-5・TASK-141.3）
   idle-memory                         scripts/targets/idle-memory.sh

@@ -69,6 +69,53 @@ const ENOTSUP: i32 = 45;
 /// ディレクトリ fd や一部のファイルシステムで `F_FULLFSYNC` が非対応を返すため。これ以外は fail-closed。
 pub(crate) const FULLFSYNC_FALLBACK_ERRNOS: [i32; 2] = [EINVAL, ENOTSUP];
 
+/// 自前の定数と `libc` の定数を `const` 評価で 1 件照合する試験専用マクロ（#1848・#1837・#1318・MVM-4・
+/// REPAIR-7・REPAIR-12）。Linux の `sys.rs` の同名マクロと同じ方式（macOS 側は別ファイルのため複製）。
+/// 両辺の型を引数で明記し、比較は `as i128`（64 bit 以下の整数では値を切り詰めない）で行う。
+/// 食い違いは宣言を直す別 issue とし、試験側を合わせない。関数は呼ばず `unsafe` を使わない。
+#[cfg(test)]
+macro_rules! libc_const_eq {
+    ($own:path, $own_ty:ty, $lib:path, $lib_ty:ty) => {{
+        const OWN: $own_ty = $own;
+        const LIB: $lib_ty = $lib;
+        assert!(
+            OWN as i128 == LIB as i128,
+            concat!("libc mismatch: ", stringify!($own))
+        );
+    }};
+    ($name:ident, $own_ty:ty, $lib_ty:ty) => {
+        libc_const_eq!(super::$name, $own_ty, libc::$name, $lib_ty)
+    };
+}
+
+/// 最上位の定数を `libc` の apple ターゲットと `const` 評価で照合する（#1848・MAC-1・PLUG-11）。
+/// 対象外: `ACL_TYPE_EXTENDED`・`ACL_FIRST_ENTRY` は `libc` の apple に ACL の定数が無い（出典は Apple SDK の
+/// `sys/acl.h`。SDK との照合は #2369 から未了で、この照合では確認していない）。
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod libc_abi {
+    use libc::c_int;
+
+    const _: () = {
+        libc_const_eq!(O_NONBLOCK, i32, c_int);
+        libc_const_eq!(O_NOFOLLOW, i32, c_int);
+        libc_const_eq!(EINVAL, i32, c_int);
+        libc_const_eq!(ENOTSUP, i32, c_int);
+        // `FULLFSYNC_FALLBACK_ERRNOS` の要素が上の errno と同じであること（配列の添字は const 評価で確定する）。
+        assert!(super::FULLFSYNC_FALLBACK_ERRNOS[0] == libc::EINVAL);
+        assert!(super::FULLFSYNC_FALLBACK_ERRNOS[1] == libc::ENOTSUP);
+    };
+
+    // 最上位の `extern "C"` 関数の型の照合（#1849・#1837）。同じ関数ポインタ型へ自前と `libc` の両方を代入する。
+    // 関数は呼ばず `unsafe` を使わない。`geteuid` の `uid_t` は apple で `u32`（自前の宣言と同じ）。
+    // 対象外: `acl_get_link_np`・`acl_get_entry`・`acl_free`。`libc` 0.2.189 の apple に `acl_*` の宣言が無い
+    // （一次情報は Apple SDK の `sys/acl.h` と `acl_get_file(3)`・`acl_get_entry(3)`・`acl_free(3)`）。
+    // SDK との照合は #2369 から未了で、この照合では確認していない。
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+    const _: unsafe extern "C" fn(c_int) -> c_int = super::fsync;
+    const _: unsafe extern "C" fn(c_int) -> c_int = libc::fsync;
+}
+
 // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`uid_t geteuid(void)`、
 // `acl_t acl_get_link_np(const char *, acl_type_t)`（`acl_t` は不透明ポインタ・`acl_type_t` は
 // `unsigned int`）、`int acl_free(void *)`、`int fsync(int)` と同じ型幅。
@@ -335,6 +382,45 @@ pub(crate) mod plugin_fs {
     /// 開いた `fd` に拡張 ACL が付いているか。無し=`Ok(false)`・有り=`Ok(true)`・判定不能=`Err`（呼び出し側が拒否）。
     pub(crate) fn has_extended_acl_fd(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
         extended_acl_of_raw(fd.as_raw_fd())
+    }
+
+    /// `plugin_fs` の private な定数を `libc` の apple ターゲットと `const` 評価で照合する（#1848・PLUG-11・MAC-1）。
+    /// `MAXPATHLEN` は `libc` が `c_int`（= `PATH_MAX`）、自前は `usize` で、`as i128` の比較で値を比べる。
+    /// 対象外: `ACL_TYPE_EXTENDED`・`ACL_FIRST_ENTRY`（`libc` の apple に定義が無い。出典は Apple SDK の `sys/acl.h`
+    /// で、SDK との照合は #2369 から未了）、`SUPPORTED_ARCH`（FFI の値でない）。
+    #[cfg(test)]
+    mod libc_abi {
+        use libc::c_int;
+
+        const _: () = {
+            libc_const_eq!(ENOENT, i32, c_int);
+            libc_const_eq!(EBADF, i32, c_int);
+            libc_const_eq!(EACCES, i32, c_int);
+            libc_const_eq!(ENOTDIR, i32, c_int);
+            libc_const_eq!(ERANGE, i32, c_int);
+            libc_const_eq!(ELOOP, i32, c_int);
+            libc_const_eq!(O_RDONLY, c_int, c_int);
+            libc_const_eq!(O_NONBLOCK, c_int, c_int);
+            libc_const_eq!(O_NOFOLLOW, c_int, c_int);
+            libc_const_eq!(O_NOCTTY, c_int, c_int);
+            libc_const_eq!(O_DIRECTORY, c_int, c_int);
+            libc_const_eq!(O_CLOEXEC, c_int, c_int);
+            libc_const_eq!(AT_FDCWD, c_int, c_int);
+            libc_const_eq!(F_GETPATH, c_int, c_int);
+            libc_const_eq!(MAXPATHLEN, usize, c_int);
+        };
+
+        // `extern "C"` 関数の型の照合（#1849・#1837）。`openat`・`fcntl` はどちらも可変長で、`libc` も可変長
+        // （Apple arm64 ABI は可変長部をスタックに積むため、可変長の食い違いは ABI の不一致になる）。
+        // `fcntl$UNIX2003` 等の `link_name` の違いは 32 bit の macOS x86 だけで、本 crate の対応（64 bit の
+        // x86_64・aarch64）には該当しない。対象外: `acl_get_fd_np`・`acl_get_entry`・`acl_free`
+        // （`libc` の apple に宣言が無い。理由と出典は最上位の `libc_abi` と同じで、SDK との照合は #2369 から未了）。
+        const _: unsafe extern "C" fn(c_int, *const libc::c_char, c_int, ...) -> c_int =
+            super::openat;
+        const _: unsafe extern "C" fn(c_int, *const libc::c_char, c_int, ...) -> c_int =
+            libc::openat;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = super::fcntl;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = libc::fcntl;
     }
 
     #[cfg(test)]

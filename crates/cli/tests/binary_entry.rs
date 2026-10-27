@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|inspect|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -277,6 +277,19 @@ fn cli1_list_logs_usage_errors() {
     }
 }
 
+/// CLI-1・SUP-11(#1903): state は ID をちょうど 1 つ受け、過不足・未知オプションは使い方エラー（2）。stdout は空。
+#[test]
+fn cli1_state_usage_errors() {
+    for a in [
+        &["state"][..],
+        &["state", "a", "b"],
+        &["state", "--bogus", "a"],
+        &["state", "--json", "a"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
 /// CLI-1: create / start は引数不足・未知オプションで使い方エラー（2）。
 #[test]
 fn cli1_create_start_usage_errors() {
@@ -304,13 +317,17 @@ fn cli1_create_start_usage_errors() {
     }
 }
 
-/// CLI-1: stop / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
+/// CLI-1: stop / kill / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
 #[test]
 fn cli1_stop_delete_usage_errors() {
     for a in [
         &["stop"][..],
         &["stop", "a", "b"],
         &["stop", "--force", "c1"],
+        &["kill"],
+        &["kill", "a", "b", "c"],
+        &["kill", "--x", "c1"],
+        &["kill", "-9", "c1"],
         &["delete"],
         &["delete", "--x", "c1"],
         &["delete", "--force", "--force", "c1"],
@@ -989,7 +1006,11 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
 
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    let out = run(&["--root", root_s, "kill", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("kill".into(), "NOT_FOUND".into()));
+
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root_s, cmd, "a/b"]);
         assert_eq!(out.status.code(), Some(2));
         assert_eq!(op_and_code(&out), (op.into(), "INVALID_ARGUMENT".into()));
@@ -1003,6 +1024,26 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(
         op_and_code(&out),
         ("kill".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(root.join("c1").join("state.json").exists());
+
+    // kill: Created（pid なし）は 5。不正なシグナルは状態を触る前に 2（固定文言）。
+    for argv in [
+        &["--root", root_s, "kill", "c1"][..],
+        &["--root", root_s, "kill", "c1", "KILL"],
+    ] {
+        let out = run(argv);
+        assert_eq!(out.status.code(), Some(5), "{argv:?}");
+        assert_eq!(
+            op_and_code(&out),
+            ("kill".into(), "FAILED_PRECONDITION".into())
+        );
+    }
+    let out = run(&["--root", root_s, "kill", "c1", "BOGUS"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"op\":\"kill\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"signal is invalid\"}\n"
     );
     assert!(root.join("c1").join("state.json").exists());
 
@@ -1376,13 +1417,33 @@ fn sec1_create_fails_closed_off_linux() {
 fn sec1_stop_delete_fail_closed_off_linux() {
     let tmp = TmpDir::new("offlinux-sd");
     let root = tmp.0.join("state");
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
         assert_eq!(out.status.code(), Some(5));
         assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
     assert_state_root_after_fail_closed(&root);
+}
+
+/// CLI-1・#1902: 不正なシグナルは OS を問わず状態ルートを開く前に INVALID_ARGUMENT（2）で拒否される。
+#[test]
+fn cli1_kill_invalid_signal_is_rejected_on_every_os() {
+    let tmp = TmpDir::new("killbadsig");
+    let root = tmp.0.join("state");
+    let out = run(&[
+        "--root",
+        root.to_str().expect("utf8"),
+        "kill",
+        "c1",
+        "BOGUS",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        op_and_code(&out),
+        ("kill".into(), "INVALID_ARGUMENT".into())
+    );
+    assert!(!root.exists(), "the state root must not be created");
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
@@ -1809,9 +1870,26 @@ fn plug11_path_search_is_off_by_default_off_linux() {
     assert!(out.stdout.is_empty());
 }
 
+/// 非 Linux で PATH 由来の候補が採用されないときの終了コードと最終行（#1867）。macOS は信頼性検証の拒否
+/// （PERMISSION_DENIED = 6）、Windows はホストが検証しない（UNIMPLEMENTED = 8）。拒否の理由は照合しない。
+#[cfg(not(target_os = "linux"))]
+fn path_search_rejection() -> (i32, &'static str) {
+    if cfg!(target_os = "macos") {
+        (
+            6,
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}",
+        )
+    } else {
+        (
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}",
+        )
+    }
+}
+
 /// PLUG-11・CLI-1・REPAIR-12: `--plugin-path-search` で opt-in すると候補ごとに警告が stderr へ出る
-/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、信頼性検証の未実装で拒否される
-/// （UNIMPLEMENTED = 8）。
+/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、macOS は信頼性検証の拒否（6）、
+/// Windows はホストが検証しないため 8 で拒否される。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn plug11_path_search_flag_warns_and_rejects_off_linux() {
@@ -1826,15 +1904,13 @@ fn plug11_path_search_flag_warns_and_rejects_off_linux() {
         ],
         &[("PATH", tmp.0.as_os_str())],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let last = stderr.lines().last().expect("last line");
     // 「未導入」（FAILED_PRECONDITION）とは別の識別子で、パス・plugin 名を含まない（C1）。
-    assert_eq!(
-        last,
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(last, want_line);
     assert!(out.stdout.is_empty());
 }
 
@@ -1854,13 +1930,11 @@ fn plug11_path_search_env_warns_and_rejects_off_linux() {
             ),
         ],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(
-        stderr.lines().last().expect("last line"),
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(stderr.lines().last().expect("last line"), want_line);
     assert!(out.stdout.is_empty());
 }
 

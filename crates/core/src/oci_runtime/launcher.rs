@@ -101,9 +101,10 @@
 //!   `unshare` する。`--ipc=host` との併用は `InvalidArgument`。pid の共有・`/dev/shm` の共有・片方だけの join は未対応
 //!   (pid は init が PID 1 であることを制限適用の証跡の前提にしているため。保持役〔供給元〕の設計は後続 issue)
 //! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
-//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は、root が書き込み可能なら
-//!   Landlock の `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）。
-//!   `root.readonly=true`（#2767）なら root に書き込み権が無いため拒否に当たらず、`ro` で適用される
+//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は、Landlock のルール生成へ
+//!   `spec.bind_mounts()`（検証済みの集合）を渡すため、root が書き込み可能でも受ける（書き込みの禁止は載せた bind の VFS の
+//!   読み取り専用属性が担い、Landlock の側は `ShadowBacking::ReadOnlyBind` として記録するだけ。CORE-5・#1917・#1910 の決定 B）。
+//!   `root.readonly=true`（#2767）なら root に書き込み権が無いため記録も要らず、`ro` で適用される
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
@@ -812,11 +813,14 @@ trait LaunchOps: Send + Sync {
     ///
     /// `user_tmpfs` は利用者指定の tmpfs(暗黙の `/dev/shm` を除く。`mounts[]` とは別枠で `RuleOrigin::UserTmpfs` になる)。
     /// `implicit` は暗黙の `/dev` 系マウントのルールの含め方(起動オプションの tmpfs 集合から導く。SUP-12・#2625)。
+    /// `binds` は start が検証した bind の集合(`spec.bind_mounts()`)。書き込み可能な root の下の `ro` の bind は、
+    /// これと一致するときだけ Landlock のルール生成が受ける(CORE-5・#1917)。
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
         user_tmpfs: &[super::config::OciMount],
         implicit: ImplicitDevMounts,
+        binds: &super::bind_mounts::BindMountSet,
     ) -> Result<LandlockRuleset, ExecError>;
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
     /// SUP-6・#2007）。
@@ -1270,7 +1274,13 @@ impl Inner {
             };
         let ruleset = self
             .ops
-            .landlock_ruleset(&landlock_config, &user_tmpfs, options.implicit_dev_mounts())
+            .landlock_ruleset(
+                &landlock_config,
+                &user_tmpfs,
+                options.implicit_dev_mounts(),
+                // `--read-only` で config を複製しても `mounts()` は同じなので、bind の `index` はずれない。
+                spec.bind_mounts(),
+            )
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -1843,9 +1853,11 @@ impl LaunchOps for RealOps {
         config: &super::config::OciConfig,
         user_tmpfs: &[super::config::OciMount],
         implicit: ImplicitDevMounts,
+        binds: &super::bind_mounts::BindMountSet,
     ) -> Result<LandlockRuleset, ExecError> {
-        let ruleset =
-            crate::exec::landlock_ruleset_from_config_with_dev(config, user_tmpfs, implicit)?;
+        let ruleset = crate::exec::landlock_ruleset_from_config_with_dev(
+            config, user_tmpfs, implicit, binds,
+        )?;
         // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026）。
         // 縮退の拒否(厳格モード)と 3 か所への表示は `Inner::assess_audit_coverage`（#2027）。送れなくても起動の可否は変えない。
         if let Some(line) = ruleset.audit_mode().log_line() {
@@ -2127,11 +2139,14 @@ mod tests {
             config: &super::super::config::OciConfig,
             user_tmpfs: &[super::super::config::OciMount],
             implicit: ImplicitDevMounts,
+            binds: &super::super::bind_mounts::BindMountSet,
         ) -> Result<LandlockRuleset, ExecError> {
             push(&self.events, "landlock");
             self.seen_implicit.lock().unwrap().push(implicit);
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
-            crate::exec::ruleset_from_detection_with_dev(detected, config, user_tmpfs, implicit)
+            crate::exec::ruleset_from_detection_with_dev(
+                detected, config, user_tmpfs, implicit, binds,
+            )
         }
 
         fn effective_ids(&self) -> (u32, u32) {
@@ -2689,6 +2704,34 @@ mod tests {
             mounts,
             vec![("/data".to_owned(), 0), ("/cache".to_owned(), 1)]
         );
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CORE-5・OCI-4(#1917): `ro` の bind は、launcher が `spec.bind_mounts()` を Landlock のルール生成へ渡すため、
+    /// 書き込み可能な root でも fork 前に拒否されず、記録に `/data` の Mount 由来のルールが入る。
+    #[test]
+    fn core5_1917_launch_accepts_readonly_bind_under_writable_root() {
+        use crate::launch_isolation::RecordedTarget;
+        let mounts = serde_json::json!([
+            {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "ro"]}
+        ]);
+        let spec = spec_with_mounts("ro-bind", serde_json::json!({}), mounts);
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let mounts: Vec<(String, usize)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, index } => {
+                    Some((destination.as_str().to_owned(), *index))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mounts, vec![("/data".to_owned(), 0)]);
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 

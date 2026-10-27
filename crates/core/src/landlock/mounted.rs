@@ -25,6 +25,8 @@
 //! - exec の再適用（SUP-6）は launch 時の記録を持たない（`LaunchIsolationRecord` がマウントの識別子を持たず、
 //!   マウント ID は restart で変わる）ため [`MountCheck::NotRecorded`] で、従来どおり暗黙のマウントの
 //!   fs 種別・独立性の確認だけを行う。永続化と照合は後続作業
+//! - 読み取り専用の記録（`MountedTarget::read_only`。#1917）は bind の段の事後検証済みの値だけを持つ。exec の再適用は
+//!   記録を持たないため、`ro` の bind に頼るルールは開いた fd の `fstatfs` だけで確かめる
 //! - 利用者の tmpfs・注入の宛先には今は Landlock のルールが無い。識別子は記録するが、照合の対象は
 //!   今あるルール（暗黙の `/dev` 系 3 本と bind）だけ
 //! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）による強化は将来仕様
@@ -74,6 +76,9 @@ pub(crate) struct MountedTarget {
     pub(crate) destination: String,
     /// 載せた直後に観測した識別子。
     pub(crate) identity: MountIdentity,
+    /// 載せたマウントが読み取り専用か（bind は事後検証済みの値。それ以外の段は `false`。#1917・CORE-5）。
+    /// 検証済みの `ro` の bind に頼るルール（`requires_read_only_mount`）の適用時の照合に使う。
+    pub(crate) read_only: bool,
 }
 
 /// pivot 前段が載せたマウントの記録（段の順）。既定値は空で、空のまま Mount 由来のルールがあれば照合は拒否する。
@@ -121,7 +126,16 @@ impl MountedTargets {
         origin: &RuleOrigin,
         destination: &str,
     ) -> Option<&MountIdentity> {
-        let found = self.0.iter().rev().find(|t| match origin {
+        self.target_for(origin, destination).map(|t| &t.identity)
+    }
+
+    /// [`Self::expected_for`] と同じ引き方で、記録 1 件（`read_only` を含む）を返す（#1917）。
+    pub(crate) fn target_for(
+        &self,
+        origin: &RuleOrigin,
+        destination: &str,
+    ) -> Option<&MountedTarget> {
+        self.0.iter().rev().find(|t| match origin {
             RuleOrigin::Implicit {
                 mount: ImplicitDevMount::DevShm,
             } => {
@@ -131,8 +145,7 @@ impl MountedTargets {
             RuleOrigin::Mount { index } => t.by == MountedBy::Bind { index: *index },
             RuleOrigin::UserTmpfs => t.by == MountedBy::Tmpfs && t.destination == destination,
             _ => false,
-        });
-        found.map(|t| &t.identity)
+        })
     }
 }
 
@@ -162,6 +175,7 @@ mod tests {
             by,
             destination: destination.to_string(),
             identity: MountIdentity { mnt_id, ..ID },
+            read_only: false,
         }
     }
 

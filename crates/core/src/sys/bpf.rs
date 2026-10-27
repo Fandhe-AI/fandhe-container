@@ -59,6 +59,10 @@ pub(crate) const DEVICE_PROG_TYPE: u32 = consts::BPF_PROG_TYPE_CGROUP_DEVICE;
 /// アタッチ・問い合わせの attach type（`BPF_CGROUP_DEVICE`）。用途は [`DEVICE_PROG_TYPE`] と同じ。
 pub(crate) const DEVICE_ATTACH_TYPE: u32 = consts::BPF_CGROUP_DEVICE;
 
+// 以下の 3 構造体は `libc` 0.2.189 に `union bpf_attr` が無く、`libc` との機械照合の対象外（一次情報は
+// include/uapi/linux/bpf.h・Linux v6.12。理由は `sys.rs` 最上位の `libc_abi` の doc。#1849・#1837）。
+// サイズ（72・32・64）とフィールドのオフセットは、本ファイルの試験が uapi の値で固定する。
+
 /// `union bpf_attr` の `BPF_PROG_LOAD` 用の先頭部分（72 バイト）。暗黙のパディングを作らず全バイトを
 /// 名前付きで持つ。
 #[derive(Debug, Clone, Copy)]

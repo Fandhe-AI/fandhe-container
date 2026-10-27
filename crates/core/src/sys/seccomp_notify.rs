@@ -80,6 +80,145 @@ mod libc_abi {
     }
 
     const _: () = assert!(nr(SYS_SECCOMP) == libc::SYS_seccomp);
+
+    // 番号以外の定数の照合（#1848）。型は `libc_const_eq!` の引数で明記する（`sys.rs` の同名マクロ）。
+    // 名前が `libc` と違う対応: `ENOENT_ERRNO` = `ENOENT`、`EPERM_ERRNO` = `EPERM`。
+    // `SECCOMP_IOCTL_NOTIF_*` は `libc` が `_IOWR::<seccomp_notif>` 等で組み立てるため、一致すれば構造体の大きさ
+    // （80・24・8）も間接的に一致する。構造体のレイアウトは下の「構造体と関数の型」（#1849）が個別に照合する。
+    // 対象外: `SECCOMP_IOC_MAGIC`・`IOC_READ`・`IOC_WRITE`（`libc` で非公開。ioctl の値の照合に含まれる）、
+    // `MAX_RECV_FDS`・`MAX_PAYLOAD`・`CMSG_HDR_LEN`・`UCRED_LEN`・`CONTROL_CAP`・`SEND_MAX_FDS`・
+    // `SEND_EINTR_ATTEMPTS`（本実装の内部の上限・派生値で、カーネル ABI の値でない）。
+    const _: () = {
+        use libc::{c_int, c_short, c_uint, c_ulong};
+        libc_const_eq!(SECCOMP_SET_MODE_FILTER, u64, c_uint);
+        libc_const_eq!(SECCOMP_FILTER_FLAG_NEW_LISTENER, u64, c_ulong);
+        libc_const_eq!(SOCK_SEQPACKET, i32, c_int);
+        libc_const_eq!(SO_PASSCRED, i32, c_int);
+        libc_const_eq!(SCM_RIGHTS, i32, c_int);
+        libc_const_eq!(SCM_CREDENTIALS, i32, c_int);
+        libc_const_eq!(MSG_CTRUNC, i32, c_int);
+        libc_const_eq!(MSG_TRUNC, i32, c_int);
+        libc_const_eq!(MSG_DONTWAIT, i32, c_int);
+        libc_const_eq!(MSG_NOSIGNAL, i32, c_int);
+        libc_const_eq!(MSG_CMSG_CLOEXEC, i32, c_int);
+        libc_const_eq!(super::ENOENT_ERRNO, i32, libc::ENOENT, c_int);
+        libc_const_eq!(super::EPERM_ERRNO, i32, libc::EPERM, c_int);
+        libc_const_eq!(POLLERR, i16, c_short);
+        libc_const_eq!(POLLHUP, i16, c_short);
+    };
+    // `Ioctl` 型は環境で変わる（gnu は `c_ulong`、musl は `c_int` で負になり得る）ため gnu に限る。
+    #[cfg(target_env = "gnu")]
+    const _: () = {
+        use libc::c_ulong;
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_RECV, u64, c_ulong);
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_SEND, u64, c_ulong);
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, u64, c_ulong);
+    };
+
+    // ---- 構造体と `extern "C"` 関数の型（#1849・#1837） ----
+    // 構造体は `size_of`・`align_of`・フィールドのオフセット（`libc` のフィールドが pub のもの）を、関数は同じ
+    // 関数ポインタ型への代入で照合する。関数は呼ばず `unsafe` を使わない。食い違いは宣言を直す別 issue とし、
+    // 試験側を合わせない。
+    use core::mem::{align_of, offset_of, size_of};
+    use libc::{c_int, c_void};
+
+    // `SeccompData`・`SeccompNotif`・`SeccompNotifResp`: `libc` の uapi 版（`seccomp_data`・`seccomp_notif`・
+    // `seccomp_notif_resp`。全フィールドが pub。Linux の x86_64・aarch64 で共通の 64・80・24 バイト）。
+    const _: () = {
+        use super::{SeccompData, SeccompNotif, SeccompNotifResp};
+        assert!(size_of::<SeccompData>() == size_of::<libc::seccomp_data>());
+        assert!(align_of::<SeccompData>() == align_of::<libc::seccomp_data>());
+        assert!(offset_of!(SeccompData, nr) == offset_of!(libc::seccomp_data, nr));
+        assert!(offset_of!(SeccompData, arch) == offset_of!(libc::seccomp_data, arch));
+        assert!(
+            offset_of!(SeccompData, instruction_pointer)
+                == offset_of!(libc::seccomp_data, instruction_pointer)
+        );
+        assert!(offset_of!(SeccompData, args) == offset_of!(libc::seccomp_data, args));
+
+        assert!(size_of::<SeccompNotif>() == size_of::<libc::seccomp_notif>());
+        assert!(align_of::<SeccompNotif>() == align_of::<libc::seccomp_notif>());
+        assert!(offset_of!(SeccompNotif, id) == offset_of!(libc::seccomp_notif, id));
+        assert!(offset_of!(SeccompNotif, pid) == offset_of!(libc::seccomp_notif, pid));
+        assert!(offset_of!(SeccompNotif, flags) == offset_of!(libc::seccomp_notif, flags));
+        assert!(offset_of!(SeccompNotif, data) == offset_of!(libc::seccomp_notif, data));
+
+        assert!(size_of::<SeccompNotifResp>() == size_of::<libc::seccomp_notif_resp>());
+        assert!(align_of::<SeccompNotifResp>() == align_of::<libc::seccomp_notif_resp>());
+        assert!(offset_of!(SeccompNotifResp, id) == offset_of!(libc::seccomp_notif_resp, id));
+        assert!(offset_of!(SeccompNotifResp, val) == offset_of!(libc::seccomp_notif_resp, val));
+        assert!(offset_of!(SeccompNotifResp, error) == offset_of!(libc::seccomp_notif_resp, error));
+        assert!(offset_of!(SeccompNotifResp, flags) == offset_of!(libc::seccomp_notif_resp, flags));
+    };
+
+    // `IoVec`・`Ucred`: `libc::iovec`・`libc::ucred`（全ターゲット共通。フィールド名の対応は
+    // `base` = `iov_base`・`len` = `iov_len`）。
+    const _: () = {
+        use super::{IoVec, Ucred};
+        assert!(size_of::<IoVec>() == size_of::<libc::iovec>());
+        assert!(align_of::<IoVec>() == align_of::<libc::iovec>());
+        assert!(offset_of!(IoVec, base) == offset_of!(libc::iovec, iov_base));
+        assert!(offset_of!(IoVec, len) == offset_of!(libc::iovec, iov_len));
+
+        assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+    };
+
+    // `MsgHdr`・`CmsgHdr`: `libc::msghdr`・`libc::cmsghdr`。gnu に限る。musl は `msg_iovlen`・`msg_controllen`・
+    // `cmsg_len` を `int` / `socklen_t` と非公開のパディングで持つ一方、自前はカーネルの `user_msghdr` に合わせた
+    // `size_t` のため、フィールドが公開されている gnu でだけオフセットまで照合する（core は musl 向けに CI で
+    // ビルドしないため musl は未照合）。名前の対応は `name` = `msg_name`・`namelen` = `msg_namelen`・
+    // `iov` = `msg_iov`・`iovlen` = `msg_iovlen`・`control` = `msg_control`・`controllen` = `msg_controllen`・
+    // `flags` = `msg_flags`、`len` = `cmsg_len`・`level` = `cmsg_level`・`kind` = `cmsg_type`。
+    #[cfg(target_env = "gnu")]
+    const _: () = {
+        use super::{CmsgHdr, MsgHdr};
+        assert!(size_of::<MsgHdr>() == size_of::<libc::msghdr>());
+        assert!(align_of::<MsgHdr>() == align_of::<libc::msghdr>());
+        assert!(offset_of!(MsgHdr, name) == offset_of!(libc::msghdr, msg_name));
+        assert!(offset_of!(MsgHdr, namelen) == offset_of!(libc::msghdr, msg_namelen));
+        assert!(offset_of!(MsgHdr, iov) == offset_of!(libc::msghdr, msg_iov));
+        assert!(offset_of!(MsgHdr, iovlen) == offset_of!(libc::msghdr, msg_iovlen));
+        assert!(offset_of!(MsgHdr, control) == offset_of!(libc::msghdr, msg_control));
+        assert!(offset_of!(MsgHdr, controllen) == offset_of!(libc::msghdr, msg_controllen));
+        assert!(offset_of!(MsgHdr, flags) == offset_of!(libc::msghdr, msg_flags));
+
+        assert!(size_of::<CmsgHdr>() == size_of::<libc::cmsghdr>());
+        assert!(align_of::<CmsgHdr>() == align_of::<libc::cmsghdr>());
+        assert!(offset_of!(CmsgHdr, len) == offset_of!(libc::cmsghdr, cmsg_len));
+        assert!(offset_of!(CmsgHdr, level) == offset_of!(libc::cmsghdr, cmsg_level));
+        assert!(offset_of!(CmsgHdr, kind) == offset_of!(libc::cmsghdr, cmsg_type));
+    };
+
+    // 対象外: `ControlBuf`・`SendControlBuf` は `cmsghdr` の整列を満たすバイトの入れ物で、`libc` に対応物が無い。
+    // 整列だけを `cmsghdr` に対して確かめる。
+    const _: () = {
+        assert!(align_of::<super::ControlBuf>() >= align_of::<libc::cmsghdr>());
+        assert!(align_of::<super::SendControlBuf>() >= align_of::<libc::cmsghdr>());
+    };
+
+    // `extern "C"` 関数。`sendmsg`・`recvmsg` は自前が `MsgHdr` を指すため、ポインタ先の型を別々に書く
+    // （`MsgHdr` の同一性は上の構造体の照合が保証する）。
+    const _: unsafe extern "C" fn(c_int, c_int, c_int, *mut c_int) -> c_int = super::socketpair;
+    const _: unsafe extern "C" fn(c_int, c_int, c_int, *mut c_int) -> c_int = libc::socketpair;
+    const _: unsafe extern "C" fn(c_int, *const super::MsgHdr, c_int) -> libc::ssize_t =
+        super::sendmsg;
+    const _: unsafe extern "C" fn(c_int, *const libc::msghdr, c_int) -> libc::ssize_t =
+        libc::sendmsg;
+    const _: unsafe extern "C" fn(c_int, *mut super::MsgHdr, c_int) -> libc::ssize_t =
+        super::recvmsg;
+    const _: unsafe extern "C" fn(c_int, *mut libc::msghdr, c_int) -> libc::ssize_t = libc::recvmsg;
+    const _: unsafe extern "C" fn(c_int, c_int, c_int, *const c_void, libc::socklen_t) -> c_int =
+        super::setsockopt;
+    const _: unsafe extern "C" fn(c_int, c_int, c_int, *const c_void, libc::socklen_t) -> c_int =
+        libc::setsockopt;
+    const _: unsafe extern "C" fn(c_int, *mut c_void, libc::size_t, c_int) -> libc::ssize_t =
+        super::recv;
+    const _: unsafe extern "C" fn(c_int, *mut c_void, libc::size_t, c_int) -> libc::ssize_t =
+        libc::recv;
 }
 
 // include/linux/net.h の `SOCK_SEQPACKET`（5）、include/uapi/asm-generic/socket.h の `SO_PASSCRED`（16）、
@@ -529,7 +668,7 @@ pub(crate) fn recv_nowait(sock: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize,
 // - `SEND` は `ENOENT`（対象が既に消えた）・`EINPROGRESS`（応答済み）を返す。`ID_VALID` は `RECV` 済み（SENT 状態）の
 //   通知が存在するとき 0、無ければ `ENOENT`
 // - poll: 未処理の通知があれば `EPOLLIN`、filter の利用者が 0 なら `EPOLLHUP`
-// `libc` との機械照合は core には未導入（#1837 の子の未着手）のため、本節の定数は上記 uapi 値を `tests` で照合する。
+// 本節の定数のうち `libc` に対応物があるものは `libc_abi`（#1847・#1848）で `libc` と `const` 評価で照合し、`tests` でも上記 uapi 値を照合する。
 // `SECCOMP_USER_NOTIF_FLAG_CONTINUE` は引数を許可判断に使うと TOCTOU になるため、定数も宣言しない。
 
 const SECCOMP_IOC_MAGIC: u64 = b'!' as u64;

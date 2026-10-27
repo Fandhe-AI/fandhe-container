@@ -580,6 +580,7 @@ mod tests {
                 // （非 Linux は plugin 解決の失敗の 5。いずれも OS 固有設定を要求しない。#1718）。
                 Command::Start => (vec!["start", "c1"], 5, ""),
                 Command::Stop => (vec!["stop", "c1"], 5, ""),
+                Command::Kill => (vec!["kill", "c1"], 5, ""),
                 Command::Delete => (vec!["delete", "d1"], if linux { 0 } else { 5 }, ""),
                 Command::List => (
                     vec!["list"],
@@ -593,6 +594,8 @@ mod tests {
                 Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
                 // 不在 ID の inspect は Linux で NOT_FOUND(3)、非 Linux は plugin 解決の失敗(5)。出力は無い。
                 Command::Inspect => (vec!["inspect", "none"], if linux { 3 } else { 5 }, ""),
+                // state も inspect と同じ(不在 ID は Linux で NOT_FOUND(3)、非 Linux は plugin 解決の失敗(5)。#1903)。
+                Command::State => (vec!["state", "none"], if linux { 3 } else { 5 }, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },
@@ -629,7 +632,8 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "create", "start", "stop", "delete", "list", "logs", "inspect", "image", "system"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
+                "image", "system"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

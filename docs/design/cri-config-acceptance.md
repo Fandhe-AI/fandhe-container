@@ -430,7 +430,7 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 
 | 経路 | ContainerStatus.image_ref | ContainerStatus.image_id | ListContainers の image_ref・image_id |
 | ---- | ---- | ---- | ---- |
-| 在庫の記録に `repo_digests` がある | `repo_digests[0]` | image ID（`sha256:<config digest>`） | image ID |
+| 在庫の記録に `repo_digests` がある | `repo_digests[0]`（pull 時の top-level digest） | image ID（`sha256:<config digest>`） | image ID |
 | 記録に digest が無い・在庫なしで image ID 指定 | image ID | image ID | image ID |
 | 報告の無い経路（スタブ・外部 bundle・報告しない provider） | 空 | 空 | 空 |
 
@@ -450,11 +450,51 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 | kubelet は create に image ID を渡し、Status の `Image.Image` を Pod status の `image` に使う。`user_specified_image` は読まない | kubelet `kuberuntime_container.go` L373・L716-L747 | 置き換えないと image ID が表示されるため寄せる。`runtime_handler` は create 時に拒否するので常に空で、落としても失うものは無い |
 | `message` を書くのは start 失敗（`status.Message = retErr.Error()`）だけ。start 失敗は `StartError`・`errorStartExitCode` の exited にする | `container_start.go` L73-L75 | **方針として空**: 実行層のエラー文字列を外へ出さない方針に合わない。本実装は確定した start 失敗で created に戻すため、message を付ける exited の記録も無い |
 | verbose の `info` は `{"info": <JSON 文字列>}` の 1 キー。JSON は sandboxID・pid・snapshotKey・snapshotter・runtimeType・config（envs を含む CRI の ContainerConfig）・runtimeSpec（OCI spec。ホストパスを含む） | `container_status.go` L219 ほか | **方針として空**: envs（秘密値）・ホストパス・snapshot のキーは「内部のパス・構成を出さない」方針に合わない。pid は cri が持たない。将来値を入れる場合もキーは `"info"` の 1 つで値は crictl が解釈する JSON 文字列にする |
-| 在庫の references は `docker.Sort(MergeStringSlices(...))` で整列する。pull 時に記録する digest 参照は top-level の digest 1 件（multi-arch では index） | `image.go` L258 | **差として残す**（下記） |
+| 在庫の references は `docker.Sort(MergeStringSlices(...))` で整列する。pull 時に記録する digest 参照は top-level の digest 1 件（multi-arch では index） | `image.go` L258 | **揃える**（#2969。下記小節） |
 
 本実装の残る差（コードは変えない）。
 
 - タグはスナップショット: containerd は Status のたびに在庫を引き直し、create 後の retag・タグ削除・イメージ削除が `image`・`image_ref` に反映される。本実装は create 時の値を返し続ける（`to_status` はレジストリのロック下で呼ばれ、在庫への参照を持たない。引き直しには構造の変更が要る）
-- `repo_digests` の並び: 本実装は検証済みのプラットフォーム manifest digest を先頭、index digest を 2 番目に入れる（`image_ref` はタグ pull でプラットフォームの manifest digest になる。containerd は multi-arch で index digest）。並びを変えると ImageStatus・ListImages・`image_ref` が変わり、`merged_with` の和集合や永続在庫との整合にも手が要るため、本 issue では変えない。追跡が要る場合は別 issue で扱う
+- `repo_digests` の並び: #2969 で揃えた。判断と残る差は次の小節
 - start 失敗の記録: containerd は `StartError`・非 0 の exit code・message つきの exited にし、restart 復旧時の不明は reason `Unknown` にする。本実装は created に戻すか、reason 空の exited
 - `message`・`info` は上記のとおり方針として空（スタブではない）
+
+### repo_digests の並びと image_ref（CRI-2・OCI-1・OCI-7。#2969）
+
+確認日 2026-10-27。containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）、distribution/reference v0.6.0、kubelet v1.37.1。
+
+| 主張 | 一次情報 |
+| ---- | ---- |
+| pull 1 回で記録する digest 参照は `GetRepoDigestAndTag(namedRef, image.Target().Digest)` の 1 件。タグ参照なら `name@<top-level target の digest>`（multi-arch では index）、digest 参照なら要求した digest。プラットフォーム manifest の digest は記録しない | containerd `internal/cri/server/images/image_pull.go` L206-L207・`internal/cri/util/references.go` |
+| `repo_digests` は references のうち Named+Digested のみ（素の image ID は入らない） | `internal/cri/util/references.go` の `ParseImageReferences`・`image_status.go` L63-L68 |
+| 同一 image ID への統合は `docker.Sort(MergeStringSlices(...))`。digest 参照どうしは rank が同じで辞書順 | `internal/cri/store/image/image.go` L258・distribution/reference `sort.go` |
+| kubelet は CRI の `image_ref` を Pod の公開 `status.containerStatuses[].imageID` へそのまま写す | kubelet `pkg/kubelet/kubelet_pods.go` L2322 |
+| Node status の `images[].names` は `RepoDigests` の後に `RepoTags` を並べて上限件数で切る（並びは表示のみ）。ListImages の `RepoDigests` は並びに依存した判断なしで写す | `nodestatus/setters.go` L409-L413・`kuberuntime_image.go` L124-L131 |
+
+**判定: 揃える。** 決め手は、`image_ref` が Pod の公開 `imageID` になるため、multi-arch のタグ pull で利用者が参照するレジストリの index digest が出ないと、ポリシー・スキャナの digest 照合と食い違うこと。`OciImagePuller::pull` は「pull 1 回の記録の先頭を top-level digest（index があれば index、無ければ manifest）」にし、プラットフォーム manifest digest を後ろに併記する。
+
+| 対象 | 変化 |
+| ---- | ---- |
+| `PulledImage.repo_digests`（index 経由のタグ pull・index digest での pull） | `[platform, index]` から `[index, platform]` |
+| 単一 arch のタグ pull・プラットフォーム digest での pull | `[manifest]` のまま |
+| ImageStatus・ListImages の `repo_digests` | 同じ並び替え（集合は不変。絞り込みは集合照合なので不変） |
+| ContainerStatus の `image_ref` | multi-arch のタグ・index digest pull で index digest（containerd と一致） |
+| ListContainers の `image_ref`・`image_id`、PullImage の `image_ref`、ContainerStatus の `image_id` | image ID のまま |
+| Node status の `images[].names` | 先頭が index digest 参照（表示のみ） |
+
+互換（読み替えの要否）:
+
+- cri の在庫（`InMemoryImageStore`）は永続化されておらず、永続化済みの記録は無いので読み替え不要。永続在庫への配線（#2945）では、先頭が top-level digest である並びを保つこと
+- コンテナの記録は `image_ref` を create 時のスナップショットで持つため、変更前に作ったコンテナはプラットフォーム digest のまま返す（読み替えない。「タグはスナップショット」の差と同じ）
+- oci の在庫（`@image-inventory.json`）は `repo_digests` の文字列を持たず、キーはプラットフォーム manifest digest のまま。影響なし
+
+残る差（意図的）:
+
+- 件数: 本実装はプラットフォーム manifest digest も併記する（CRI-4 の `name@<platform>` での引き当てと oci 在庫のキーのため）。containerd は 1 件
+- 複数 pull の統合順: `merged_with` は既存を先に保つ挿入順（試験 `cri2_upsert_keeps_existing_digest_order_first` で固定）。containerd は辞書順。例: プラットフォーム digest で pull した後にタグ pull すると `[platform, index]` で、先頭が index になるとは限らない
+- `repo_tags` の並び: containerd は同じ `docker.Sort` で辞書順、本実装は挿入順（ContainerStatus の `image` は `repo_tags[0]`）。本 issue の対象外
+
+却下案:
+
+- プラットフォーム digest を落として containerd と件数まで一致させる: CRI-4 の引き当て試験と oci 在庫のキーに反する
+- `PulledImage`・`ImageRecord` に top-level digest と補助 digest を分けて持たせ、統合時も辞書順で先頭を保つ: 公開構造体の変更が試験と plugin-cri に波及するため見送り。必要になれば別 issue

@@ -269,7 +269,7 @@ impl ImageRootfsSource {
     }
 }
 
-/// 在庫の記録から image ID と digest 参照（`repo_digests[0]`）を取る（#2831・CRI-2・OCI-1）。
+/// 在庫の記録から image ID と digest 参照（`repo_digests[0]`。pull 時の top-level digest で、multi-arch では index digest。#2969）を取る（#2831・CRI-2・OCI-1）。
 fn resolved_from_record(record: &crate::image_service::ImageRecord) -> Option<ResolvedImage> {
     let id = Digest::parse(record.id()).ok()?;
     Some(

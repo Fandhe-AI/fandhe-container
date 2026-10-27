@@ -233,7 +233,7 @@ impl ContainerRecord {
     /// **方針として空の項目と未実装の明示（REPAIR-3・CRI-2）**:
     /// - `image_ref`・`image_id`（#2831）: `BundleProvider` が報告した CreateContainer 時の解決結果を返す。
     ///   `image_id` は image ID（`sha256:<config digest>`。`PullImageResponse.image_ref` と同じ）、`image_ref` は在庫の
-    ///   `repo_digests[0]`（無ければ image ID）。報告の無い経路（スタブ・外部 bundle）は両方空（digest を推測しない。
+    ///   `repo_digests[0]`（無ければ image ID。multi-arch のタグ pull では index digest で containerd と同じ。#2969）。報告の無い経路（スタブ・外部 bundle）は両方空（digest を推測しない。
     ///   containerd は空を返さない本リポ固有の挙動）。containerd b7a2526 は Status の時点で在庫を引き直すが、
     ///   本実装は create 時のスナップショットを返し続ける（既知の差。`docs/design/cri-config-acceptance.md`）。
     /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。

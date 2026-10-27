@@ -328,7 +328,9 @@ pub struct PulledImage {
     pub id: String,
     /// 参照が tag のときの正規化タグ（`<registry>/<repo>:<tag>`）。
     pub repo_tags: Vec<String>,
-    /// `<registry>/<repo>@<digest>`（取得できる範囲。上記「未実装範囲」参照）。
+    /// `<registry>/<repo>@<digest>`（取得できる範囲。上記「未実装範囲」参照）。先頭は pull の top-level digest
+    /// （index 経由なら index digest、無ければ manifest digest。containerd と同じ。#2969・CRI-2）、続けて
+    /// プラットフォーム manifest digest（CRI-4 の引き当てのため）。
     pub repo_digests: Vec<String>,
     /// config と全 layer の圧縮サイズの合計（展開後サイズではない）。
     pub size: u64,
@@ -1125,24 +1127,19 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let name = display_name(image_ref.registry(), repository);
         let mut repo_tags = Vec::new();
         let mut repo_digests = Vec::new();
-        match image_ref.reference() {
-            Reference::Tag(tag) => {
-                repo_tags.push(format!("{name}:{}", tag.as_str()));
-                // 検証済みの manifest digest のみ登録する（index 選択時は選択エントリ照合済み。OCI-1）。
-                repo_digests.push(format!("{name}@{}", resolved.manifest_digest.as_str()));
-            }
-            Reference::Digest(_) => {
-                // oci が本文ハッシュと要求 digest を突合済み（不一致は DataLoss）。
-                repo_digests.push(format!("{name}@{}", resolved.manifest_digest.as_str()));
-            }
+        if let Reference::Tag(tag) = image_ref.reference() {
+            repo_tags.push(format!("{name}:{}", tag.as_str()));
         }
-        // index 経由なら index 本文の digest も登録する（tag / digest 参照とも oci が検証済みの値のみ。
-        // kubelet が `name@<index digest>` で ImageStatus / ListImages を引けるようにする。CRI-4）。
+        // 先頭は pull 1 回の top-level digest（index 経由なら index、無ければ manifest）。containerd の
+        // `GetRepoDigestAndTag` と同じで、ContainerStatus の `image_ref`（= `repo_digests[0]`）を kubelet が
+        // Pod の公開 `imageID` へ写すため（CRI-2・OCI-1・#2969）。oci が検証済みの値のみ登録する。
         if let Some(index_digest) = &resolved.index_digest {
-            let entry = format!("{name}@{}", index_digest.as_str());
-            if !repo_digests.contains(&entry) {
-                repo_digests.push(entry);
-            }
+            repo_digests.push(format!("{name}@{}", index_digest.as_str()));
+        }
+        // プラットフォーム manifest digest は後ろに併記する（CRI-4 の引き当てと oci 在庫のキーのため）。
+        let manifest_entry = format!("{name}@{}", resolved.manifest_digest.as_str());
+        if !repo_digests.contains(&manifest_entry) {
+            repo_digests.push(manifest_entry);
         }
         if repo_tags
             .iter()

@@ -100,14 +100,14 @@
 
 ### D8 host モード
 
-- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の後、報告の前に net の `HostNetns::verify_process(pid)` で確かめる。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
+- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3058 の core の変更に含める。pasta の同期点〔#1939〕と共有する）で、net の `HostNetns::verify_process(pid)` により確かめる。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
 ### D9 hosts / resolv.conf
 
 - **決定**:
   - 生成場所は `<state_root>/@container-etc/<id>/`（ディレクトリ 0700）の `hosts` / `resolv.conf`（通常ファイル 0644・所有者は supervisor の euid）。core の新 API（`etc_files`。型は OS 非依存、実体は Linux）が排他作成（`O_CREAT|O_EXCL|O_NOFOLLOW`・fd 起点）で作る。`@container-options` と同じく `--root` と `<id>` だけから導く
-  - `hosts` は core が固定の初期内容（`127.0.0.1 localhost` と `::1 localhost ip6-localhost ip6-loopback`）を書き、supervisor が net の `apply_add_hosts` で `--add-host` を追記する。`resolv.conf` は supervisor が net の `apply_dns` で書く（host / none のみ。rename 置換）。イメージの `/etc/hosts` は読まない（未信頼の rootfs のファイルを読む経路を作らない）
+  - `hosts` は core が固定の初期内容（`127.0.0.1 localhost` と `::1 localhost ip6-localhost ip6-loopback`）を書き、supervisor が net の `apply_add_hosts` で `--add-host` を追記する。`resolv.conf` は supervisor が net の `apply_dns` で書く（host / none。`--dns` があるときのみ。rename 置換）。rootful のユーザー定義ネットワーク（bridge）では指定の有無に依らず supervisor が `resolv.conf` を生成する: `nameserver` は DNS ヘルパーの待ち受けアドレス（ネットワークの gateway アドレス。attach 後に確定するため、D14 の順序で attach の結果を受けてから書く）だけにし、`--dns` はコンテナの記録（`members/<id>`）経由でヘルパーの上流（D11 の `--dns` の上流転送）に渡す。この場合 `--dns` の値は `resolv.conf` に直接は書かない。イメージの `/etc/hosts` は読まない（未信頼の rootfs のファイルを読む経路を作らない）
   - 生成するのは指定があるときだけ（`--add-host` があれば `hosts`、`--dns` があれば `resolv.conf`）。無ければイメージのファイルをそのまま使い、従来の挙動を変えない
   - 段は supervisor の start の手順 3〜7（作業スレッド・期限つき）で、launcher を作る前に作成と書き込みを終える。`apply_dns` は rename で inode が替わるため bind mount より前に済ませる。start のたびに作り直し（前回の残りを消してから排他作成）、supervisor 内の restart は同じファイルを使い回す
   - bind mount は launcher のオプションで core に渡し、pivot の前、検証済みの bind（#1915）と同じ段で適用する。元のファイルは launch の時点で fd 起点（`O_PATH|O_NOFOLLOW`）で開き直し、通常ファイル・所有者・nlink 1 を確かめる。先は rootfs の fd から 1 要素ずつ辿る（`mount_destination` の検証）。rw で mount する（Docker と同等。書き換えても自分の生成ファイルにしか及ばない）
@@ -145,14 +145,14 @@
 | 項目 | 持ち方（決定） |
 | ---- | -------------- |
 | ネットワーク定義 | D10 の `definition` |
-| `CreatedNetwork`（作成済みのカーネル資源） | `realized` に bridge 名・ifindex・所有トークン・nft テーブル名・テーブル handle・gateway・subnet を記録する。`create_network` の成功後に書き、`delete_network` の成功後に消す。作成途中のクラッシュは既存の請求書（`FailedCreateClaim`）を `pending-reclaim/` に残す |
+| `CreatedNetwork`（作成済みのカーネル資源） | `realized` に bridge 名・ifindex・所有トークン・nft テーブル名・テーブル handle・gateway・subnet を記録する。`create_network` の成功後に書き、`delete_network` の成功後に消す。カーネル操作の前に意図記録（`realized.intent`。操作の種類・bridge 名・所有トークン・予約した subnet）を fsync して書き、成功後に `realized` へ置き換える。操作後・記録前に SIGKILL されても意図記録が残るため、次の特権操作の先頭が所有トークンでカーネルを照合し、実在すれば `realized` に昇格、無ければ意図記録を捨てる。`FailedCreateClaim` は失敗を受け取れる経路でしか生成できないので、クラッシュの回収はこの意図記録が担う |
 | 静的 IPAM | 独立したカウンタを持たない。全メンバーのアドレスと隔離（結果不明で保持した）アドレスから、ネットワークのロックの下で操作のたびに `StaticIpam` を組み立て直す（数え違いが起きない） |
-| メンバー（attach） | `members/<id>` に endpoint・アドレス・公開（受け口と nft の rule handle）・`--dns` の上流を記録する。attach の成功後に書き、detach の成功後に消す。取り残しは既存の `FailedAttachClaim` と `.owned/<endpoint>` |
+| メンバー（attach） | `members/<id>` に endpoint・アドレス・公開（受け口と nft の rule handle）・`--dns` の上流を記録する。attach の前に意図記録（`members/<id>.intent`。割り当てるアドレス・endpoint 名・所有トークン）を fsync して書き、成功後に `members/<id>` へ置き換え、detach の成功後に消す。IPAM の再構成は `members/*` に加えて `*.intent` のアドレスも使用中として数えるため、クラッシュで未記録になった endpoint のアドレスを再割り当てしない。意図記録が残っていて実体が無いものは次の特権操作が掃除する。取り残しは既存の `FailedAttachClaim` と `.owned/<endpoint>` |
 | DNS ヘルパーの参照カウント | カウンタを持たず、メンバーの記録の件数を正とする（ロックの下で数える）。0→1 で起動、1→0 で停止（NET-7） |
 | 親からの切り離し | ヘルパーを `setsid` と二重 fork で親から切り離して起動し、`dns-helper` に pid・`/proc/<pid>/stat` の開始時刻・boot id を記録する。停止時は開始時刻と boot id を照合して pid の再利用を除いてから止める（制御 UDS の停止要求 → 期限つきで待つ → 超えたら SIGKILL）。`Drop` で止める今の形は試験専用に残す |
 | 名前の登録経路 | ヘルパーはメンバーの記録を正として読み込む。登録側は記録を書いた後に制御 UDS（`<name>/dns.ctl`・0600・`SO_PEERCRED` で uid を照合。PLUG-12）へ `Reload{generation}` を送り、`Loaded{generation}` の ack を期限つき（既定 2 秒）で待つ。フレームは型付きの長さ接頭辞（REPAIR-2）。ack が無ければ attach を失敗にする |
 | `--dns` の上流転送 | メンバーの記録の `--dns` から、ヘルパーが読み込みのたびに `ForwardingHandler` をコンテナのアドレス単位で組む（製品の経路）。upstream の検証は net の既存関数 |
-| ポート予約（`PortRegistry`） | 同じ状態ルート内では、全ネットワークのメンバーの公開を全体のロックの下で集めて照合する。状態ルートをまたぐ衝突（CLI と plugin-cri の `.cri`、別の `--root`）はファイルを共有しても保証できないので、カーネルを正とし、公開の前に全 `fandhe_net_*` テーブルの DNAT を GETRULE で dump して照合する |
+| ポート予約（`PortRegistry`） | 同じ状態ルート内では、全ネットワークのメンバーの公開を全体のロックの下で集めて照合する。状態ルートをまたぐ衝突（CLI と plugin-cri の `.cri`、別の `--root`）はファイルを共有しても保証できないので、カーネルを正とし、公開の前に全 `fandhe_net_*` テーブルの DNAT を GETRULE で dump して照合する。nft は同一の受け口の重複を拒否しない（`publish.rs` の契約）ため、照会と投入の間に別の `--root` が割り込むと両方が「競合なし」と判定して二重に投入できる。これを避けるため、dump の照合から DNAT の投入までを、状態ルートに依らない共有ロック（`/run/fandhe-container/net-publish.lock` 相当。rootful の plugin が使える root 所有 0644 の固定パスで、`flock` を `LOCK_NB` の取り直しと期限 5 秒で取る。D15）の下で行う。ロックを取れない環境（rootless の pasta など）は対象外で、kernel の bind 衝突に任せる。ロックの外から投入する経路（手動の nft 操作）は検出のみで、投入後にもう一度 dump して自分の受け口が複数ある場合は自分のルールを削除して `AlreadyExists` で失敗する（世代を条件にした事後確認と再試行は 1 回まで） |
 | 公開ハンドルの再起動後の復元 | dump ではなく永続化で復元する。メンバーの記録の rule handle とテーブル handle を照合し、テーブルが作り直されていた（handle が違う）ら、その rule handle は古いので削除に使わず報告する |
 | attach 済みコンテナの detach | net に、コンテナ単体の切り離し（`unpublish_container_port` で公開を個別に解除 → veth → pin → IPAM の記録）を足す。`NetworkPlugin::detach` の attach 済みの `Unimplemented` をこれで埋める |
 | masquerade と `ip_forward` | net に `bitwise` / `meta` の expr と、postrouting の masquerade（出口が bridge 以外）を足す。host の `ip_forward` は net が変更しない方針のまま（NET-10 の診断で案内する） |
@@ -189,7 +189,7 @@
 
 ### D14 失敗時のロールバック・stop / delete の後始末
 
-- **決定**: supervisor の start の順序は、(1) 文書の復号、(2) hosts / resolv.conf の作成と書き込み（D9）、(3) rootful のみ plugin の `attach`（D13）、(4) cgroup、(5) launch（netns の作成 / 参加）、(6) host / none の照合（D8）、(7) 報告。k 段目で失敗したら k−1 段目から逆順に戻す（detach → 生成ファイルの削除）。none / host ではカーネル資源の巻き戻しは無い（netns はプロセスと一緒に消える）。
+- **決定**: supervisor の start の順序は、(1) 文書の復号、(2) hosts の作成と、host / none の resolv.conf の書き込み（D9）、(3) rootful のみ plugin の `attach`（D13）と、bridge の resolv.conf の生成（D9。ヘルパーのアドレスは attach の結果から得る）、(4) cgroup、(5) launch（netns の作成 / 参加）、(6) host / none の照合（D8）、(7) 報告。k 段目で失敗したら k−1 段目から逆順に戻す（detach → 生成ファイルの削除）。none / host ではカーネル資源の巻き戻しは無い（netns はプロセスと一緒に消える）。
 - stop / delete の後始末: none / host は delete で `@container-etc` を消すだけ。pasta は #1940。rootful bridge は D13（supervisor が最終終了で detach、CLI の delete は孤児の印を付ける）。netns の pin・veth・公開・DNS からの離脱は `detach` が逆順で行う。
 
 ### D15 期限（REPAIR-5）

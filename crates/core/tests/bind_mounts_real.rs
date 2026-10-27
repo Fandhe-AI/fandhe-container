@@ -297,24 +297,61 @@ mod linux {
         }
     }
 
-    /// P の後始末。panic でも C に EOF を返し P を kill して回収する（置き去りを残さない。REPAIR-5）。
+    /// kill 後の回収を期限つきで行う（REPAIR-5）。期限内に回収できなければ警告だけ出す
+    /// （`Drop` 中の panic による abort を避ける）。
+    fn kill_and_reap(child: &mut Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    eprintln!("bind_mounts_real: warning: a child was not reaped after SIGKILL");
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// `pid` の子の PID 一覧（`/proc/<pid>/task/<pid>/children`）。読めなければ空。
+    fn children_of(pid: u32) -> Vec<u32> {
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .map(|s| {
+                s.split_whitespace()
+                    .filter_map(|v| v.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// P の後始末。panic でも C に EOF を返し、P と、P の子の C（新しい PID namespace の PID 1）を
+    /// kill して消えるまで期限つきで確認する。C が消えれば namespace 内の子孫とマウントも消える。
+    /// fixture の削除（`Base` の drop）より前に走る（宣言順の逆に drop される）。
     struct ParentGuard(Child);
 
     impl Drop for ParentGuard {
         fn drop(&mut self) {
             drop(self.0.stdin.take());
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            // P を kill する前に C の PID を控える（kill 後は C が孤児になり辿れない）。
+            let kids = children_of(self.0.id());
+            kill_and_reap(&mut self.0);
+            for pid in kids {
+                // 同じ UID の祖先 namespace からの SIGKILL は PID 1 にも届く。
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let gone = Instant::now() + timeout();
+                while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if Path::new(&format!("/proc/{pid}")).exists() {
+                    eprintln!("bind_mounts_real: warning: child {pid} still exists after SIGKILL");
+                }
+            }
         }
-    }
-
-    fn run_tool(tool: &str, args: &[&str]) {
-        let status = Command::new(tool)
-            .args(args)
-            .stdout(Stdio::null())
-            .status()
-            .unwrap_or_else(|e| panic!("spawn {tool} (required for this test): {e}"));
-        assert!(status.success(), "{tool} {args:?} failed: {status:?}");
     }
 
     /// 期限つきで外部コマンドを実行する（REPAIR-5）。
@@ -332,8 +369,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap(&mut child);
                     panic!("{tool} {args:?} did not finish within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -395,11 +431,13 @@ mod linux {
         write_file(&base.join("src/file.txt"), FILE_BYTES, 0o644);
         write_file(&base.join("ovl/lower/lower.txt"), b"lower\n", 0o644);
         // whiteout（文字デバイス 0:0）。`nodev` の観測に使う。作れなければ前提の欠如。
-        run_tool(
+        // 0:0 の文字デバイスは whiteout として扱われ、`CAP_MKNOD` が無くても作れる
+        // （`vfs_mknod` の whiteout 例外）。一般の文字デバイスは使わない。
+        run_tool_with_deadline(
             "mknod",
             &[path_str(&base.join("src/data/wh")), "c", "0", "0"],
         );
-        run_tool("mkfifo", &[path_str(&base.join("src/fifo"))]);
+        run_tool_with_deadline("mkfifo", &[path_str(&base.join("src/fifo"))]);
         // listener を drop しても socket の inode は残る。
         drop(
             std::os::unix::net::UnixListener::bind(base.join("src/sock")).unwrap_or_else(|e| {
@@ -617,8 +655,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = c.kill();
-                    let _ = c.wait();
+                    kill_and_reap(&mut c);
                     panic!("child did not exit within {budget:?}");
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -1070,7 +1107,7 @@ mod linux {
         // overlay の merged を元にすると、層が元のディレクトリであることを確かめられず拒否される（#2298）。
         let ovl = ctx.base.join("ovl");
         let opts = format!(
-            "lowerdir={},upperdir={},workdir={}",
+            "userxattr,lowerdir={},upperdir={},workdir={}",
             path_str(&ovl.join("lower")),
             path_str(&ovl.join("upper")),
             path_str(&ovl.join("work"))
@@ -1106,17 +1143,18 @@ mod linux {
 
     // ---------------------------------------------------------------- pivot 後の観測
 
-    /// `errno` を返す形で exec を試みる。実行できてしまったら失敗。
+    /// `errno` を返す形で exec を試みる。実行できてしまったら失敗。標準入出力は pivot 前に開いた fd を
+    /// 継承する（`Stdio::null()` は pivot 後の `/dev/null` を開こうとして、rootfs に無いと ENOENT になり、
+    /// 対象ファイルの exec 由来の errno を隠すため）。
     fn exec_errno(path: &str) -> Option<i32> {
         match Command::new(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
         {
             Ok(mut c) => {
-                let _ = c.kill();
-                let _ = c.wait();
+                kill_and_reap(&mut c);
                 panic!("{path} unexpectedly started");
             }
             Err(e) => e.raw_os_error(),

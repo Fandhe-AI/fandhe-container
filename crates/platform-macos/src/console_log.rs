@@ -65,7 +65,8 @@ pub const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
 /// 保持するコンソールログの世代数（現在のログを含む。`<name>`・`<name>.1`・`<name>.2`）。
 ///
 /// supervisor の `SUPERVISOR_LOG_GENERATIONS`（`crates/supervisor`）と同じ値と意味（新しいほど番号が小さい）。
-/// コードは共有しない（platform-macos は supervisor へ依存しないため。共通化は crate 境界の変更として別途）。
+/// コードは共有しない（platform-macos は supervisor へ依存しないため）。共通化しない判断と再評価条件は
+/// `docs/design/rotating-log-sharing.md`（#2172・REPAIR-1）。
 /// 回転・削除は `config::VmConfigSpec` の `open_serial_console`（回転）と `remove_console_logs`（削除）が行う。
 pub const CONSOLE_LOG_GENERATIONS: u32 = 3;
 

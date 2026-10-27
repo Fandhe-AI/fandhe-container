@@ -285,8 +285,8 @@ impl ContainerRecord {
                 .map_or_else(String::new, |i| i.image_ref().to_owned()),
             reason: exit_reason(self.state, self.exit_code, self.termination).to_owned(),
             message: String::new(),
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             mounts: self.config.mounts.clone(),
             log_path: self
                 .resolved_log_path
@@ -337,8 +337,8 @@ impl ContainerRecord {
                 .map_or_else(String::new, |i| i.id_str().to_owned()),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             image_id: self
                 .resolved_image
                 .as_ref()

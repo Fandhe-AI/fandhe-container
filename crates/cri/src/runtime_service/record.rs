@@ -25,9 +25,6 @@
 //! 呼び出し元になる予定: R2（バイト列の読み書き。上限は [`MAX_SANDBOX_RECORD_BYTES`] /
 //! [`MAX_CONTAINER_RECORD_BYTES`]）・R4 / R5（書く時点）・R6 / R7（起動時の再採用）。
 
-// R2・R4・R5 が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashSet;
 
 use prost::Message;
@@ -83,6 +80,8 @@ const SANDBOX_MALFORMED: &str = "sandbox record is malformed";
 const CONTAINER_MALFORMED: &str = "container record is malformed";
 
 /// sandbox 記録 1 件分の内容（registry の `SandboxRecord` との変換は R4 #2933）。
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SandboxRecordData {
     pub(super) id: String,
@@ -97,6 +96,8 @@ pub(super) struct SandboxRecordData {
 }
 
 /// コンテナ記録 1 件分の内容（registry の `ContainerRecord` との変換は R5 #2934）。
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ContainerRecordData {
     pub(super) id: String,
@@ -117,6 +118,8 @@ pub(super) struct ContainerRecordData {
 }
 
 /// 復号した sandbox 記録と、数え直した config の保持量見積もり。
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct DecodedSandbox {
     pub(super) data: SandboxRecordData,
@@ -126,6 +129,8 @@ pub(super) struct DecodedSandbox {
 /// 復号したコンテナ記録と、数え直した config の保持量見積もり。
 ///
 /// `applied_user`・`resolved_image` の上乗せ分（`attach_prepared` と同じ計算）は含まない。R7 #2936 が足す。
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct DecodedContainer {
     pub(super) data: ContainerRecordData,
@@ -352,6 +357,8 @@ impl<'a> Lines<'a> {
 // sandbox
 // ---------------------------------------------------------------------------
 
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 impl SandboxRecordData {
     /// 記録のバイト列を作る。形式に載せられない値（ID の形式違反・未対応の handler・時刻の範囲外・
     /// config の符号化長超過）は `INTERNAL`（成功を装わない）。
@@ -413,8 +420,9 @@ fn decode_sandbox(bytes: &[u8], expect_id: &str) -> R<DecodedSandbox> {
     let payload = l.config_payload()?;
 
     let config = PodSandboxConfig::decode(payload).map_err(|_| Bad)?;
-    // 未知フィールドの読み飛ばし・重複フィールドの後勝ち・非正準な符号化は、再符号化の長さが変わる。
-    if config.encoded_len() != payload.len() {
+    // 未知フィールド・重複フィールドの後勝ち・非正準な符号化（例: bool の 0x02）は、再符号化のバイト列と一致しない。
+    // map は BTreeMap（build.rs）で符号化が決定的なため、長さではなくバイト完全一致で判定する。
+    if config.encode_to_vec() != payload {
         return Err(Bad);
     }
     // RunPodSandbox と同じ検証（必須項目・config_limits の上限・port_mappings の値）。
@@ -487,6 +495,8 @@ fn is_concrete_signal(v: i32) -> bool {
     matches!(Signal::try_from(v), Ok(s) if s != Signal::RuntimeDefault)
 }
 
+// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
+#[allow(dead_code)]
 impl ContainerRecordData {
     /// 記録のバイト列を作る。`config.envs` は複製の側で消してから符号化する（呼び出し元の値は変えない）。
     /// 形式に載せられない値は `INTERNAL`（成功を装わない）。
@@ -639,7 +649,7 @@ fn decode_container(bytes: &[u8], expect_id: &str) -> R<DecodedContainer> {
     let payload = l.config_payload()?;
 
     let config = ContainerConfig::decode(payload).map_err(|_| Bad)?;
-    if config.encoded_len() != payload.len() || !config.envs.is_empty() {
+    if config.encode_to_vec() != payload || !config.envs.is_empty() {
         return Err(Bad);
     }
     // CreateContainer と同じ検証（必須項目・config_limits の上限）。
@@ -673,7 +683,6 @@ mod tests {
     use crate::runtime::v1::{
         ContainerMetadata, DnsConfig, ImageSpec, KeyValue, Mount, PodSandboxMetadata, PortMapping,
     };
-    use std::collections::HashMap;
 
     fn id(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
@@ -688,8 +697,8 @@ mod tests {
                 attempt: 2,
             }),
             hostname: "h".into(),
-            labels: HashMap::from([("app".to_owned(), "web".to_owned())]),
-            annotations: HashMap::from([("note".to_owned(), "x".to_owned())]),
+            labels: std::collections::BTreeMap::from([("app".to_owned(), "web".to_owned())]),
+            annotations: std::collections::BTreeMap::from([("note".to_owned(), "x".to_owned())]),
             dns_config: Some(DnsConfig {
                 servers: vec!["10.0.0.1".into()],
                 searches: vec!["svc.local".into()],
@@ -739,8 +748,8 @@ mod tests {
                 host_path: "/srv/data".into(),
                 ..Default::default()
             }],
-            labels: HashMap::from([("k".to_owned(), "v".to_owned())]),
-            annotations: HashMap::from([("a".to_owned(), "b".to_owned())]),
+            labels: std::collections::BTreeMap::from([("k".to_owned(), "v".to_owned())]),
+            annotations: std::collections::BTreeMap::from([("a".to_owned(), "b".to_owned())]),
             ..Default::default()
         }
     }
@@ -991,6 +1000,36 @@ mod tests {
         no_lf.extend(std::iter::repeat_n(b'x', 1000));
         assert_sandbox_rejected(&no_lf, "SECRETMARK");
         assert_sandbox_rejected(b"", "SECRETMARK");
+    }
+
+    #[test]
+    fn cri1_repair2_container_rejects_noncanonical_bool_wire_value() {
+        // 長さを変えない非正準表現（bool true の 0x01 を 0x02）も拒否する（バイト完全一致の判定）。
+        let mut data = container_data();
+        data.config.stdin = true;
+        let mut bytes = data.encode().unwrap();
+        let pos = bytes
+            .windows(2)
+            .rposition(|w| w == [0x60, 0x01])
+            .expect("stdin field");
+        bytes[pos + 1] = 0x02;
+        assert_container_rejected(&bytes);
+    }
+
+    #[test]
+    fn cri1_repair2_multi_label_config_roundtrips_and_dash_tag_is_not_kept() {
+        let mut data = container_data();
+        for i in 0..8 {
+            data.config.labels.insert(format!("k{i}"), format!("v{i}"));
+            data.config.annotations.insert(format!("a{i}"), "x".into());
+        }
+        let decoded = ContainerRecordData::decode(&data.encode().unwrap(), &id('b')).unwrap();
+        assert_eq!(decoded.data.config.labels, data.config.labels);
+        assert_eq!(decoded.data.config.annotations, data.config.annotations);
+        // "-" はタグ無しのセンチネルと衝突するため、タグとして受けない。
+        let img = ResolvedImage::new(digest(), None).with_tag(Some("-".into()));
+        assert_eq!(img.tag(), None);
+        assert!(!is_valid_image_tag("-"));
     }
 
     #[test]

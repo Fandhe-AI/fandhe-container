@@ -180,10 +180,12 @@ pub(crate) fn is_valid_image_reference(r: &str) -> bool {
         && !r.chars().any(char::is_control)
 }
 
-/// タグとして受ける条件（空でない・長さ上限・`@` を含まない・制御文字なし）。
-/// [`ResolvedImage::with_tag`] と記録の復号（#2930）の共有。
+/// タグとして受ける条件（空でない・`-` 単独でない・長さ上限・`@` を含まない・制御文字なし）。
+/// [`ResolvedImage::with_tag`] と記録の復号（#2930）の共有。`-` は記録でタグ無しを表す語（センチネル）で、
+/// 有効値と衝突して無言で欠落しないよう受けない（OCI のタグは英数字か `_` で始まるため実在しない）。
 pub(crate) fn is_valid_image_tag(t: &str) -> bool {
     !t.is_empty()
+        && t != "-"
         && t.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
         && !t.contains('@')
         && !t.chars().any(char::is_control)
@@ -582,7 +584,7 @@ struct CpuOut {
 /// pod の `sysctls` を core の分類で検証する（#2670）。キー昇順に走査して、複数の不正があっても結果を決定的にする。
 /// 受理した組は予算に計上し、`config.json` の `linux.sysctl` へ写す。
 fn check_sysctls<'a>(
-    sysctls: &'a HashMap<String, String>,
+    sysctls: &'a BTreeMap<String, String>,
     budget: &mut Budget,
 ) -> Result<BTreeMap<&'a str, &'a str>, CriError> {
     if sysctls.len() > SYSCTL_MAX_ENTRIES {

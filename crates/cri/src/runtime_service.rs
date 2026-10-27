@@ -2642,8 +2642,8 @@ impl SandboxRecord {
             created_at: self.created_at_nanos,
             network: None,
             linux: None,
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             runtime_handler: self.runtime_handler.to_owned(),
         }
     }
@@ -2655,8 +2655,8 @@ impl SandboxRecord {
             metadata: self.config.metadata.clone(),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             runtime_handler: self.runtime_handler.to_owned(),
         }
     }
@@ -4122,8 +4122,11 @@ mod tests {
         assert_eq!(st.id, id);
         assert_eq!(st.metadata, cfg.metadata);
         assert_eq!(st.state, PodSandboxState::SandboxReady as i32);
-        assert_eq!(st.labels, cfg.labels);
-        assert_eq!(st.annotations, cfg.annotations);
+        assert_eq!(st.labels, cfg.labels.clone().into_iter().collect());
+        assert_eq!(
+            st.annotations,
+            cfg.annotations.clone().into_iter().collect()
+        );
         assert_eq!(st.runtime_handler, "");
         assert!(st.created_at > 0 && resp.timestamp >= st.created_at);
         assert!(resp.containers_statuses.is_empty() && resp.info.is_empty());
@@ -5078,8 +5081,11 @@ mod tests {
         assert_eq!((created.started_at, created.finished_at), (0, 0));
         assert_eq!(created.metadata, cfg.metadata);
         assert_eq!(created.image, cfg.image);
-        assert_eq!(created.labels, cfg.labels);
-        assert_eq!(created.annotations, cfg.annotations);
+        assert_eq!(created.labels, cfg.labels.clone().into_iter().collect());
+        assert_eq!(
+            created.annotations,
+            cfg.annotations.clone().into_iter().collect()
+        );
         assert_eq!(created.mounts, cfg.mounts);
         assert_eq!(created.log_path, "c/0.log");
         assert_eq!(created.stop_signal, 15);

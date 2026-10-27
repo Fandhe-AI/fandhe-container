@@ -93,7 +93,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 14d. `make net-throughput-rtt-selftest`（iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプト `scripts/bench/net_throughput_rtt.sh` の自己テスト。スタブの保持入口・nsenter・iperf3・probe・docker のみ。実測は #319 で人間が行う。TASK-140 準備・#1882・NET-2・NET-3）
 15. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 16. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）
-17. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）
+17. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。CLI の実行ファイルは plugin を除外してビルドできないため rlib 計測で（#2170）、サイズ差に閾値は設けない）
 18. `make plug4-core-invariance`（plugin の追加で core が変わらないことの判定。pull_request では base ブランチを fetch して比較する。自己テスト `make plug4-core-invariance-selftest` は `platform-ci` ジョブ側で実行する。core の成果物は rlib の sha256 を比べる〔理由は crate-naming.md 決定 3 の補足・#2136〕。TASK-109.4・PLUG-4）
 
 `make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具である。ベンチ・基準値の現状は次のとおり（spec 側の判断は先取りしない）。

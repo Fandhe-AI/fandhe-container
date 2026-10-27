@@ -106,6 +106,16 @@ mod scratch_root;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../core/tests/support/minimal_rootfs.rs"]
+mod minimal_rootfs;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 #[path = "support/precondition.rs"]
 mod precondition;
 
@@ -1086,102 +1096,16 @@ mod linux {
         })
     }
 
-    // ---- bundle の用意（supervisor_bin_real.rs の make_rootfs 等を写したもの。crate が違うため共有できない） ----
-
-    fn mkdir(path: &Path) -> Result<(), String> {
-        fs::create_dir_all(path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
-        set_mode(path, 0o755)
-    }
-
-    /// `host` のファイルを rootfs 内の同じ絶対パスへコピーする。
-    fn copy_into(rootfs: &Path, host: &Path) -> Result<(), String> {
-        let rel = host
-            .strip_prefix("/")
-            .map_err(|_| format!("not absolute: {}", host.display()))?;
-        let dest = rootfs.join(rel);
-        mkdir(dest.parent().ok_or("no parent")?)?;
-        let _ = fs::remove_file(&dest);
-        fs::copy(host, &dest)
-            .map_err(|e| format!("copy {} -> {}: {e}", host.display(), dest.display()))?;
-        set_mode(&dest, 0o755)
-    }
-
-    /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` で検査する。
-    fn elf_interp(exe: &[u8]) -> Option<String> {
-        let u16_at = |o: usize| Some(u16::from_le_bytes(exe.get(o..o + 2)?.try_into().ok()?));
-        let u32_at = |o: usize| Some(u32::from_le_bytes(exe.get(o..o + 4)?.try_into().ok()?));
-        let u64_at = |o: usize| Some(u64::from_le_bytes(exe.get(o..o + 8)?.try_into().ok()?));
-        if exe.get(0..4)? != b"\x7fELF" {
-            return None;
-        }
-        let phoff = usize::try_from(u64_at(0x20)?).ok()?;
-        let phentsize = usize::from(u16_at(0x36)?);
-        let phnum = usize::from(u16_at(0x38)?);
-        for i in 0..phnum {
-            let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
-            if u32_at(base)? == 3 {
-                let off = usize::try_from(u64_at(base + 8)?).ok()?;
-                let len = usize::try_from(u64_at(base + 32)?).ok()?;
-                let raw = exe.get(off..off.checked_add(len)?)?;
-                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-                return String::from_utf8(raw.get(..end)?.to_vec()).ok();
-            }
-        }
-        None
-    }
-
-    /// 自プロセスに読み込み済みの共有ライブラリの実パス（`/proc/self/maps` から。重複なし）。
-    fn loaded_libraries(exe: &Path) -> Result<Vec<PathBuf>, String> {
-        let maps = fs::read_to_string("/proc/self/maps").map_err(|e| format!("read maps: {e}"))?;
-        let mut libs: Vec<PathBuf> = Vec::new();
-        for line in maps.lines() {
-            let Some(path) = line.split_whitespace().nth(5) else {
-                continue;
-            };
-            let p = PathBuf::from(path);
-            if !path.starts_with('/')
-                || p == exe
-                || ["/dev/", "/proc/", "/sys/", "/tmp/", "/memfd:"]
-                    .iter()
-                    .any(|pre| path.starts_with(pre))
-                || libs.contains(&p)
-            {
-                continue;
-            }
-            if fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-                libs.push(p);
-            }
-        }
-        Ok(libs)
-    }
+    // ---- bundle の用意（rootfs の部品は core の tests/support/minimal_rootfs.rs と共有。#2963・REPAIR-1） ----
 
     /// bundle（`config.json` と最小 rootfs）を作る。`/probe` は本試験の実行ファイルのコピー。
     fn make_bundle(bundle: &Path) -> Result<(), String> {
-        mkdir(bundle)?;
-        let rootfs = bundle.join("rootfs");
-        for d in ["", "proc", "dev", "tmp", "etc"] {
-            mkdir(&rootfs.join(d))?;
-        }
-        let exe =
-            fs::canonicalize(std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?)
-                .map_err(|e| format!("canonicalize exe: {e}"))?;
-        let probe = rootfs.join("probe");
-        fs::copy(&exe, &probe).map_err(|e| format!("copy probe binary: {e}"))?;
-        set_mode(&probe, 0o755)?;
-        let bytes = fs::read(&exe).map_err(|e| format!("read exe: {e}"))?;
-        let mut lib_dirs: Vec<String> = Vec::new();
-        if let Some(interp) = elf_interp(&bytes) {
-            copy_into(&rootfs, Path::new(&interp))?;
-        }
-        for lib in loaded_libraries(&exe)? {
-            copy_into(&rootfs, &lib)?;
-            if let Some(dir) = lib.parent().and_then(Path::to_str)
-                && !lib_dirs.iter().any(|d| d == dir)
-            {
-                lib_dirs.push(dir.to_string());
-            }
-        }
-        let ld = lib_dirs.join(":");
+        super::minimal_rootfs::mkdir(bundle)?;
+        let ld = super::minimal_rootfs::install_binary_at(
+            &bundle.join("rootfs"),
+            "probe",
+            &["proc", "dev", "tmp", "etc"],
+        )?;
         // uidMappings / gidMappings・cgroupsPath は書かない（それぞれ UNIMPLEMENTED で拒否される）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",

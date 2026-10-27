@@ -5,7 +5,7 @@
 //! 用意する。`call_once` は子の環境を `env_clear()` するため、振る舞いは socket ディレクトリ内の
 //! `behavior` ファイルで子へ伝える。
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[path = "support/swap.rs"]
 mod swap;
 
@@ -818,6 +818,68 @@ mod unix {
         // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
         let err = fx.try_target_from_path().unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+    }
+
+    /// macOS 等（Linux 以外の unix）: 構築後にパスを別ファイルへ差し替えると、spawn 直前の同一性確認で
+    /// 拒否され、子は spawn されない（#1866・PLUG-11）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_one_shot_rejects_after_path_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let plugin = PluginLaunchSpec::new(fx.target(), vec![], dir.0.clone()).unwrap();
+        let marker = fx.marker_path();
+        fx.replace_with_marker_script(&marker);
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let err = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "plugin launch target path does not refer to the verified file"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "child must not be spawned");
+        // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
+        assert_eq!(
+            fx.try_target_from_path().unwrap_err().code(),
+            PluginErrorCode::InvalidArgument
+        );
+    }
+
+    /// macOS 等: 差し替えなしなら起動し、1 往復が成功する（#1866）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_one_shot_runs_when_not_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let plugin = PluginLaunchSpec::new(fx.target(), args, dir.0.clone()).unwrap();
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let out = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            out.termination(),
+            PluginTermination::Exited { code: Some(0) }
+        );
+        assert_ne!(pid_of(out.response().payload()), std::process::id());
     }
 
     /// 構築後に同じ inode の内容が `#!` スクリプトへ書き換えられた場合は、解釈系が閉じた fd を開き直せず

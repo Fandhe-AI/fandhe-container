@@ -274,10 +274,10 @@ pub fn check_hook_stage_mountinfo(rootfs: &str, mountinfo: &str) -> Result<(), C
 mod run;
 #[cfg(target_os = "linux")]
 pub use run::{
-    CdiHookError, CdiHookExecutables, CdiHookReport, CdiHookResult, CdiHookRunRecorder,
-    CdiHookRunSample, CdiHookStage, CdiHookState, CdiHookWorkDir, open_hook_executables,
-    open_hook_work_dir, run_create_container_hooks, run_create_container_hooks_with_recorder,
-    verify_hook_stage,
+    CdiHookError, CdiHookExecutables, CdiHookExit, CdiHookReport, CdiHookResult,
+    CdiHookRunRecorder, CdiHookRunSample, CdiHookStage, CdiHookState, CdiHookWorkDir,
+    open_hook_executables, open_hook_work_dir, run_create_container_hooks,
+    run_create_container_hooks_with_recorder, verify_hook_stage,
 };
 
 #[cfg(test)]

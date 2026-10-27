@@ -192,6 +192,16 @@ pub struct CdiHookReport {
     pub stderr: String,
 }
 
+/// フックの異常な終了状態。非ゼロの終了コードとシグナル終了を区別して持つ（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CdiHookExit {
+    /// 非ゼロの終了コード。
+    Code(i32),
+    /// シグナル番号による終了。
+    Signal(i32),
+}
+
 /// フック失敗。何件目かと、診断用の stderr の先頭を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -209,6 +219,8 @@ pub struct CdiHookError {
     /// bundle（`config.json`）の後始末に失敗したか。真なら `error` は元の失敗理由のまま、作業ディレクトリに
     /// 残留が有りうる（手動回収の対象。REPAIR-4）。
     pub bundle_cleanup_failed: bool,
+    /// フックが終了した場合の終了状態（非ゼロの終了コード、またはシグナル）。起動拒否・タイムアウト等では `None`。
+    pub exit: Option<CdiHookExit>,
 }
 
 impl std::fmt::Display for CdiHookError {
@@ -398,9 +410,41 @@ impl RemoveBudget {
     }
 }
 
-/// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。深さ・件数・時間のすべてに上限がある。
+/// fdinfo の最大読み取りバイト数（無制限確保を避ける）。
+const FDINFO_MAX_BYTES: u64 = 4096;
+
+/// `/proc/thread-self/fdinfo/<n>` の本文から `mnt_id` を取り出す。無い・数値でないときは `None`。
+fn parse_fdinfo_mnt_id(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// `fd` が属するマウントの ID。同一ファイルシステム内の bind mount も別の ID になるため、`st_dev` の比較では
+/// 検出できない横断をこれで検出する（core の `fd_mount_id` と同じ方式。SEC-1・GPU-2）。
+fn fd_mnt_id(fd: &OwnedFd) -> Result<u64, sys::SysError> {
+    let mut text = String::new();
+    File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+        .and_then(|f| f.take(FDINFO_MAX_BYTES).read_to_string(&mut text))
+        .map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
+    parse_fdinfo_mnt_id(&text).ok_or(sys::SysError::Os(5))
+}
+
+/// 親と子のマウント ID が同じことを要求する。違えば `EXDEV` 相当の失敗（配下は削除しない）。
+fn require_same_mount(parent: u64, child: u64) -> Result<(), sys::SysError> {
+    if parent == child {
+        Ok(())
+    } else {
+        Err(sys::SysError::Os(18)) // EXDEV
+    }
+}
+
+/// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。深さ・件数・時間に上限があり、
+/// 開いたディレクトリが親と別のマウント（フックが bind mount した先）なら、中へ入らず失敗にする。
+/// `mnt_id` は `fd` 自身のマウント ID。
 fn remove_children(
     fd: &OwnedFd,
+    mnt_id: u64,
     depth: usize,
     budget: &mut RemoveBudget,
 ) -> Result<(), sys::SysError> {
@@ -415,10 +459,14 @@ fn remove_children(
             if depth >= REMOVE_MAX_DEPTH {
                 return Err(sys::SysError::Os(39)); // ENOTEMPTY
             }
+            // `O_PATH` で開いた実体そのものについてマウント ID を確かめてから中へ入る（開く前後の差し替えを避ける）。
             let child = sys::open_dir_nofollow_at(fd.as_fd(), &name)?;
-            remove_children(&child, depth + 1, budget)?;
+            let child_mnt = fd_mnt_id(&child)?;
+            require_same_mount(mnt_id, child_mnt)?;
+            remove_children(&child, child_mnt, depth + 1, budget)?;
             sys::unlink_at(fd.as_fd(), &name, true)?;
         } else {
+            // マウントポイントの unlink は EBUSY で失敗し、重なった先には触れない。
             sys::unlink_at(fd.as_fd(), &name, false)?;
         }
     }
@@ -477,7 +525,8 @@ impl<'a> Bundle<'a> {
     /// 削除する。成功したときだけ `removed` を立て、失敗時は `Drop` が再試行する（config.json の残留を避ける）。
     fn remove(&mut self) -> Result<(), sys::SysError> {
         // `Drop` の再試行も同じ有界の予算で行う（呼ぶたびに新しい予算）。
-        let r = remove_children(&self.fd, 0, &mut RemoveBudget::new())
+        let r = fd_mnt_id(&self.fd)
+            .and_then(|m| remove_children(&self.fd, m, 0, &mut RemoveBudget::new()))
             .and_then(|()| sys::unlink_at(self.work.fd.as_fd(), &self.name, true));
         if r.is_ok() {
             self.removed = true;
@@ -717,10 +766,16 @@ fn kill_and_reap(child: &mut std::process::Child) -> Result<(), CdiApplyError> {
 }
 
 /// `run_one` の失敗: (分類, stderr 先頭, 未回収の子の pid, bundle の後始末に失敗したか)。
-type RunFail = (CdiApplyError, String, Option<u32>, bool);
+type RunFail = (
+    CdiApplyError,
+    String,
+    Option<u32>,
+    bool,
+    Option<CdiHookExit>,
+);
 
 fn rf(error: CdiApplyError, stderr: String, pid: Option<u32>) -> RunFail {
-    (error, stderr, pid, false)
+    (error, stderr, pid, false, None)
 }
 
 /// 1 フックを実行する。bundle は成功・失敗のどの経路でもここで削除し、削除の失敗は元の失敗理由を保ったまま
@@ -749,7 +804,7 @@ fn run_one(
     let rootfs = std::str::from_utf8(stage.rootfs.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "rootfs is not valid UTF-8")))?;
     let mut bundle = Bundle::create(work_dir, rootfs)
-        .map_err(|(err, cleanup_failed)| (err, String::new(), None, cleanup_failed))?;
+        .map_err(|(err, cleanup_failed)| (err, String::new(), None, cleanup_failed, None))?;
     let result = run_in_bundle(h, st, index, exe, &bundle);
     let cleaned = bundle.remove().is_ok();
     match (result, cleaned) {
@@ -759,8 +814,9 @@ fn run_one(
             report.stderr,
             None,
             true,
+            None,
         )),
-        (Err((error, stderr, pid, _)), cleaned) => Err((error, stderr, pid, !cleaned)),
+        (Err((error, stderr, pid, _, exit)), cleaned) => Err((error, stderr, pid, !cleaned, exit)),
     }
 }
 
@@ -886,15 +942,19 @@ fn run_in_bundle(
             elapsed,
             stderr,
         }),
-        Some(_) => Err(rf(
+        Some(code) => Err((
             e(Code::FailedPrecondition, "hook exited with failure"),
             stderr,
             None,
+            false,
+            Some(CdiHookExit::Code(code)),
         )),
-        None => Err(rf(
+        None => Err((
             e(Code::FailedPrecondition, "hook was terminated by a signal"),
             stderr,
             None,
+            false,
+            std::os::unix::process::ExitStatusExt::signal(&status).map(CdiHookExit::Signal),
         )),
     }
 }
@@ -955,6 +1015,7 @@ pub fn open_hook_executables(
                     completed: Vec::new(),
                     unreaped_pid: None,
                     bundle_cleanup_failed: false,
+                    exit: None,
                 });
             }
         }
@@ -970,8 +1031,10 @@ pub struct CdiHookRunSample {
     pub index: usize,
     /// 失敗の分類（成功なら `None`）。
     pub error_code: Option<Code>,
-    /// 終了コード（正常終了した場合のみ）。
+    /// 終了コード（フックが終了コードを返した場合。非ゼロの失敗も含む）。
     pub exit_code: Option<i32>,
+    /// シグナル終了の場合のシグナル番号。
+    pub signal: Option<i32>,
     /// 試行に要した時間（起動拒否・タイムアウトを含む）。
     pub latency: Duration,
 }
@@ -1012,6 +1075,7 @@ pub fn run_create_container_hooks(
                 completed: Vec::new(),
                 unreaped_pid: None,
                 bundle_cleanup_failed: false,
+                exit: None,
             });
         }
     };
@@ -1035,6 +1099,7 @@ pub fn run_create_container_hooks_with_recorder(
             index: 0,
             error_code: Some(error.code()),
             exit_code: None,
+            signal: None,
             latency: started.elapsed(),
         });
         CdiHookError {
@@ -1044,6 +1109,7 @@ pub fn run_create_container_hooks_with_recorder(
             completed: Vec::new(),
             unreaped_pid: None,
             bundle_cleanup_failed: false,
+            exit: None,
         }
     };
     let gate_started = Instant::now();
@@ -1072,6 +1138,7 @@ pub fn run_create_container_hooks_with_recorder(
                 index,
                 error_code: Some(error.code()),
                 exit_code: None,
+                signal: None,
                 latency: started.elapsed(),
             });
             return Err(CdiHookError {
@@ -1081,6 +1148,7 @@ pub fn run_create_container_hooks_with_recorder(
                 completed: done,
                 unreaped_pid: None,
                 bundle_cleanup_failed: false,
+                exit: None,
             });
         }
         let mut opened: Option<File> = None;
@@ -1098,15 +1166,23 @@ pub fn run_create_container_hooks_with_recorder(
                     index,
                     error_code: None,
                     exit_code: Some(r.exit_code),
+                    signal: None,
                     latency: started.elapsed(),
                 });
                 done.push(r);
             }
-            Err((error, stderr, unreaped_pid, bundle_cleanup_failed)) => {
+            Err((error, stderr, unreaped_pid, bundle_cleanup_failed, exit)) => {
                 recorder.record(CdiHookRunSample {
                     index,
                     error_code: Some(error.code()),
-                    exit_code: None,
+                    exit_code: match exit {
+                        Some(CdiHookExit::Code(c)) => Some(c),
+                        _ => None,
+                    },
+                    signal: match exit {
+                        Some(CdiHookExit::Signal(n)) => Some(n),
+                        _ => None,
+                    },
                     latency: started.elapsed(),
                 });
                 return Err(CdiHookError {
@@ -1116,6 +1192,7 @@ pub fn run_create_container_hooks_with_recorder(
                     completed: done,
                     unreaped_pid,
                     bundle_cleanup_failed,
+                    exit,
                 });
             }
         }
@@ -1731,13 +1808,13 @@ mod tests {
         let mut over = RemoveBudget::new();
         over.left = 3;
         assert_eq!(
-            remove_children(&b.fd, 0, &mut over),
+            remove_children(&b.fd, fd_mnt_id(&b.fd).unwrap(), 0, &mut over),
             Err(sys::SysError::Os(110))
         );
         let mut late = RemoveBudget::new();
         late.deadline = Instant::now();
         assert_eq!(
-            remove_children(&b.fd, 0, &mut late),
+            remove_children(&b.fd, fd_mnt_id(&b.fd).unwrap(), 0, &mut late),
             Err(sys::SysError::Os(110))
         );
         assert!(!b.removed);
@@ -1805,6 +1882,95 @@ mod tests {
         assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
     }
 
+    /// SEC-1・GPU-2: fdinfo の `mnt_id` の読み取りと、親子のマウント ID の不一致判定を具体値で固定する。
+    #[test]
+    fn mount_id_parse_and_boundary_decision() {
+        assert_eq!(
+            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012010000\nmnt_id:\t412\nino:\t5\n"),
+            Some(412)
+        );
+        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nino:\t5\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tabc\n"), None);
+        assert_eq!(require_same_mount(7, 7), Ok(()));
+        assert_eq!(require_same_mount(7, 8), Err(sys::SysError::Os(18)));
+        // 実在の fd では取得できる。
+        let t = Tmp::new("mntid");
+        let a = CdiHookWorkDir::open(&t.work()).unwrap();
+        assert!(fd_mnt_id(&a.fd).unwrap() > 0);
+    }
+
+    /// REPAIR-4: 非ゼロで終了したフックの終了コードは `CdiHookError` と計測値に残り、シグナル終了は区別される。
+    #[test]
+    fn exit_code_and_signal_are_preserved() {
+        let t = Tmp::new("exit");
+        let stage = CdiHookStage::for_test(&t.0);
+        for (body, want, code, sig) in [
+            ("exit 7", CdiHookExit::Code(7), Some(7), None),
+            ("kill -9 $$", CdiHookExit::Signal(9), None, Some(9)),
+        ] {
+            let hooks = validate_create_container_hooks(&[mk_sh(body, &["h"], &[], None)]).unwrap();
+            let rec = Rec(Default::default());
+            let err = run_create_container_hooks_with_recorder(
+                &stage,
+                &hooks,
+                None,
+                &state(),
+                &open_hook_work_dir(&t.work()).unwrap(),
+                &rec,
+            )
+            .unwrap_err();
+            assert_eq!(err.exit, Some(want), "{body}");
+            let got = rec.0.lock().unwrap();
+            assert_eq!((got[0].exit_code, got[0].signal), (code, sig), "{body}");
+        }
+    }
+
+    /// SEC-1・GPU-2: bundle 内へ既存ディレクトリを bind mount されても、削除はその中へ入らず
+    /// 元のファイルを消さず、後始末の失敗として返す。user + mount namespace を作れる環境（`unshare -rm`）が前提。
+    /// 外側の実行では自分自身を `unshare` の下で再実行し、内側（`FANDHE_GPU_NS_INNER=1`）で本体を行う。
+    #[test]
+    #[ignore = "needs unprivileged user + mount namespaces (unshare -rm) and mount(8)"]
+    fn bundle_remove_refuses_bind_mount_boundary() {
+        if std::env::var("FANDHE_GPU_NS_INNER").is_err() {
+            let exe = std::env::current_exe().unwrap();
+            let st = Command::new("unshare")
+                .args(["-r", "-m", "--"])
+                .arg(exe)
+                .args([
+                    "--exact",
+                    "cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FANDHE_GPU_NS_INNER", "1")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            return;
+        }
+        let t = Tmp::new("bindmnt");
+        let wd = CdiHookWorkDir::open(&t.work()).unwrap();
+        let mut b = Bundle::create(&wd, "/r").unwrap();
+        let victim = t.0.join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep"), b"x").unwrap();
+        let mp = b.dir.join("m");
+        fs::create_dir(&mp).unwrap();
+        let ok = Command::new("mount")
+            .arg("--bind")
+            .arg(&victim)
+            .arg(&mp)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "mount --bind failed");
+        assert!(b.remove().is_err());
+        assert!(!b.removed);
+        assert!(victim.join("keep").exists());
+        println!("bundle_remove_refuses_bind_mount_boundary: ok");
+        let _ = Command::new("umount").arg(&mp).status();
+    }
+
     struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);
     impl CdiHookRunRecorder for Rec {
         fn record(&self, sample: CdiHookRunSample) {
@@ -1844,7 +2010,7 @@ mod tests {
         );
         assert_eq!(
             (got[1].index, got[1].error_code, got[1].exit_code),
-            (1, Some(Code::FailedPrecondition), None)
+            (1, Some(Code::FailedPrecondition), Some(3))
         );
         drop(got);
 

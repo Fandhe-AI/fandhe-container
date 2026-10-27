@@ -27,7 +27,8 @@
 #     cgroup を消せず exit 4 になるため、`systemd-run --user --scope -p Delegate=yes` の中で
 #     本スクリプトを実行する（手順は #3125）。delete は状態を消した後にログのロックを最大でおよそ
 #     20 秒待つため、--timeout で打ち切られても NOT_FOUND と state で削除済みと確定する。
-#   - CLI を経由する誤差の見積もりと method の記述は #3124 で扱う。
+#   - CLI を経由する誤差は下記「CLI 経由の誤差（#3124）」を参照。method は
+#     "cli-create-to-exec-observed"（CLI 経由であることを値で示す）。
 #   - create から `FCSUP1 OK` までの p95 回帰ベンチは別に benches/benches/startup_latency.rs
 #     （TASK-190・docs/design/startup-latency-bench.md）がある。区間は CORE-10 の中央値
 #     （create からプロセス実行開始まで）と異なる。
@@ -54,10 +55,42 @@
 #   ないため、start 復帰後に state を照会し、status が running（プログラム実行済み・未終了）
 #   または stopped（終了済み）を初めて返した時点を実行開始の観測点とする。計測値 total は
 #   create 呼び出し直前からその state 復帰直後まで（実行開始時刻の上側推定。内訳として
-#   create・start・観測待ち observe と state 照会回数を記録する）。
+#   create・start・観測待ち observe と state 照会回数を記録する）。ただし own 実装の観測点は
+#   厳密には「Running の記録の観測」である。supervisor は Running を記録してから `FCSUP1 OK` を
+#   報告するが、ワークロードの execve の完了は保証しない（launch 経路に exec 成功の通知が無い）。
+#   execve は観測点より後にずれ込み得る（docs/design/startup-latency-bench.md
+#   「CORE-10 の『プロセス実行開始』との差」・REPAIR-3）。
+#
+# CLI 経由の誤差（#3124・CORE-10。数値は書かない。実測と合否判定は #213・#230 で人間が行う）:
+#   oci モードは CLI を呼び出しごとに別プロセスで起動する（runc 等でも同じ）。区間内の呼び出しは
+#   create・start・state × state_polls の 2 + state_polls 回で、docker モード（run 1 回）より多い。
+#   - create_us: CLI プロセス 1 回分（timeout と収集の fork・exec と動的リンク・状態ストアの
+#     open）＋ create 本体。ハーネス上は create 本体と分離できない。
+#   - start_us: 次の 2 つを含む。製品の起動経路そのもの（誤差ではない）は、user scope の取得
+#     （systemd-run）・supervisor の手順（launcher・Landlock・Running の記録）・`FCSUP1 OK` の報告で、
+#     benches/benches/startup_latency.rs（TASK-190）の区間とほぼ同じ。CLI 経由の上乗せは CLI
+#     プロセス 1 回分（起動・状態ストアの open・存在確認の読み取り）と OK 受信後の終了。同じホストで
+#     本スクリプトの start_us と TASK-190 の区間を並べた差が上乗せの目安になる。
+#   - observe_us: start は Running の記録の後に OK を返すため、本番 CLI の通常経路では start 復帰直後の
+#     最初の state が running / stopped を返し state_polls=1 になる。このとき observe_us は CLI の
+#     state 1 往復（プロセス起動＋状態ストアの open と読み取り＋ JSON 出力）の所要そのもので、
+#     samples_us[].observe_us（state_polls=1 の回）から直接読める。上限は
+#     observe_us <= n x (state 1 回の所要) + (n-1) x (STATE_POLL_INTERVAL + sleep の起動)
+#     （n = state_polls）。ポーリング間隔が値に入るのは start 成功後も created が返る例外時だけで、
+#     観測期限 --timeout 秒で打ち切る（REPAIR-5）。
+#   - CLI 1 回分の固定費の目安は上記 observe_us（n=1）。上乗せの合計は目安として
+#     CLI 1 回分 x (2 + state_polls) だが、create・start の CLI 側の仕事は state より多いため
+#     厳密な上限ではない。
+#   - ハーネス側の上乗せ: 呼び出しごとの timeout と収集プロセス 1〜2 個の fork、時刻取得
+#     （wall_us・mono_us）のサブシェル。呼び出し回数分だけ oci の方が多く払う。
+#   - 偏りの向き: 上記の上乗せはすべて値を大きくする（own に不利）。一方、観測点が Running の記録の
+#     観測であり execve は後にずれ込み得るため、execve までを含む保証はない（own に有利になり得る）。
+#     両者は相殺せず別々に扱う。
+#   method の変更: 旧値 "create-to-exec-observed" は report モードで受けない（fail-closed。
+#   旧値の実測結果はまだ無い）。
 #
 # モード（--mode。既定 oci。TASK-46.2・CORE-10）:
-#   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "create-to-exec-observed"。
+#   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "cli-create-to-exec-observed"（CLI 経由）。
 #   docker: `docker run --rm --pull never ... --entrypoint true <image>` 全体の壁時計時間を計測する
 #           （イメージの ENTRYPOINT は `--entrypoint true` で明示的に上書きし、固定ワークロードを保つ）
 #           （spec の Docker ベースライン 0.290〜0.298 秒と同じ手法）。method = "docker-run-rm-total"。
@@ -140,6 +173,8 @@ readonly LOG_REAP_WAIT_US=500000
 # start 復帰後に state で実行開始（running / stopped）を観測する照会の間隔（秒）。
 # 打ち切りは --timeout 秒の観測期限だけで判定し（REPAIR-5）、照会回数は間隔により
 # 期限 / 間隔 程度に収まる。観測点の上側推定は最大でこの間隔＋state 1 回分だけ遅れる。
+# 本番 CLI の通常経路では start 復帰時点で Running が記録済みのため初回の state で観測でき、
+# この間隔は値に入らない（入るのは start 成功後も created が返る例外時だけ。#3124）。
 readonly STATE_POLL_INTERVAL=0.01
 readonly STATE_POLL_INTERVAL_US=10000
 # kill 後に delete を再試行する最大回数と間隔（秒）。時間上限は --timeout 秒。
@@ -608,8 +643,9 @@ flush_last_call() {
 # rt_deadline_us が設定されている間（実行開始の観測中・後始末中）は、TERM までの時間と KILL 猶予の合計が
 # 期限までの残り時間に収まるよう配分し、残りが MIN_CALL_BUDGET_US 未満なら呼ばずに
 # 124（timeout と同じ値）を返す。収集プロセスは cleanup が回収する（collector_pids）。
-# 計測区間への影響: 収集プロセスの fork は計時点の内側で行われ、oci・docker の両モードに
-# 一律に上乗せされる（process substitution の fork 1〜2 回分）。
+# 計測区間への影響: 収集プロセスの fork は計時点の内側で行われ、呼び出しごとに上乗せされる
+# （process substitution の fork 1〜2 回分）。区間内の呼び出しは oci が 2 + state_polls 回、
+# docker が 1 回なので、一律ではなく呼び出し回数の分だけ oci の方が多い（#3124）。
 run_rt() {
   local out="$1" errf="$2"
   shift 2
@@ -1128,6 +1164,7 @@ trap 'on_signal 129' HUP
 #       「ユーザー指定プログラムを実行済みで未終了」、stopped を「プロセスが終了済み」と
 #       定義する）。start の復帰はプロセスの実行開始を保証しないため、実行開始を state で
 #       観測する。t2 は state 呼び出しの復帰後に取るため、実行開始時刻の上側推定になる
+#       （own 実装では Running の記録の観測で、execve のずれ込みは別。冒頭の CLI 経由の誤差を参照）
 #       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
   local id="$1" t0 t1 ts t2 m0 m2 deadline wall_total mono_total diff
@@ -1303,7 +1340,7 @@ load_result_file() {
   local opt="$1" f="$2" want="$3" size obj want_method
   # mode ごとの計測区間（method）は固定値で検証する。入力の自己申告で methods_differ を偽装させない。
   case "$want" in
-    oci) want_method="create-to-exec-observed" ;;
+    oci) want_method="cli-create-to-exec-observed" ;;
     docker) want_method="docker-run-rm-total" ;;
     *) err "invalid-result" "unsupported mode $want"; exit "$EXIT_INPUT" ;;
   esac
@@ -1383,7 +1420,7 @@ if [ "$mode" = "report" ]; then
 fi
 
 if [ "$mode" = "oci" ]; then
-  method="create-to-exec-observed"
+  method="cli-create-to-exec-observed"
 else
   method="docker-run-rm-total"
   # 計測区間外の事前確認。イメージが無ければ自動 pull せず（ネットワーク副作用・計測の歪み）

@@ -413,7 +413,13 @@ pub fn audit_mount_violation(
         .and_then(IsolationViolation::mount_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -444,7 +450,13 @@ pub fn audit_exec_violation(
         .and_then(IsolationViolation::exec_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -524,9 +536,30 @@ pub fn record_launch_mount_rejection<E>(
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_launch_mount_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_launch_mount_rejection`] に拒否した段を足した版（SEC-4・ERR-4・#3121）。
+///
+/// 呼び出し元: `launch_status::resolve_pre_pivot_status`。親が組み立てた `ExecError::stage` の段を
+/// 記録の `stage` に載せる（経路検査の拒否は理由が汎用トークンのため、段でどの保護の失敗かが分かる）。
+/// 公開版は段を持たない呼び出し側向けに `None` で委ねる（出力は従来どおり）。
+pub(crate) fn record_launch_mount_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.launch_mount_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -558,7 +591,13 @@ pub fn audit_entrypoint_violation(
         .and_then(IsolationViolation::entrypoint_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -842,6 +881,89 @@ pub enum IsolationStage {
     RootReadOnly,
     /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
     MountEtcFiles,
+}
+
+impl IsolationStage {
+    /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
+    pub const ALL: [Self; 31] = [
+        Self::Validate,
+        Self::Unshare,
+        Self::SetGroups,
+        Self::UidMap,
+        Self::GidMap,
+        Self::MountPrivate,
+        Self::SetHostname,
+        Self::MountProc,
+        Self::PrepareRootfs,
+        Self::PivotRoot,
+        Self::Spawn,
+        Self::UserNamespaceMap,
+        Self::Exec,
+        Self::Wait,
+        Self::CreateDevices,
+        Self::CgroupJoin,
+        Self::Rlimits,
+        Self::CapabilityDrop,
+        Self::NoNewPrivs,
+        Self::Landlock,
+        Self::Seccomp,
+        Self::SetNs,
+        Self::MountTmpfs,
+        Self::InjectFiles,
+        Self::MountReadonlyPaths,
+        Self::MountMaskedPaths,
+        Self::MountBinds,
+        Self::MountSysfs,
+        Self::WorkingDir,
+        Self::ApplySysctls,
+        Self::RootReadOnly,
+    ];
+
+    /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
+    ///
+    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）。外部入力は混ざらない静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::Unshare => "unshare",
+            Self::SetGroups => "set_groups",
+            Self::UidMap => "uid_map",
+            Self::GidMap => "gid_map",
+            Self::MountPrivate => "mount_private",
+            Self::SetHostname => "set_hostname",
+            Self::MountProc => "mount_proc",
+            Self::PrepareRootfs => "prepare_rootfs",
+            Self::PivotRoot => "pivot_root",
+            Self::Spawn => "spawn",
+            Self::UserNamespaceMap => "user_namespace_map",
+            Self::Exec => "exec",
+            Self::Wait => "wait",
+            Self::CreateDevices => "create_devices",
+            Self::CgroupJoin => "cgroup_join",
+            Self::Rlimits => "rlimits",
+            Self::CapabilityDrop => "capability_drop",
+            Self::NoNewPrivs => "no_new_privs",
+            Self::Landlock => "landlock",
+            Self::Seccomp => "seccomp",
+            Self::SetNs => "set_ns",
+            Self::MountTmpfs => "mount_tmpfs",
+            Self::InjectFiles => "inject_files",
+            Self::MountReadonlyPaths => "mount_readonly_paths",
+            Self::MountMaskedPaths => "mount_masked_paths",
+            Self::MountBinds => "mount_binds",
+            Self::MountSysfs => "mount_sysfs",
+            Self::WorkingDir => "working_dir",
+            Self::ApplySysctls => "apply_sysctls",
+            Self::RootReadOnly => "root_read_only",
+        }
+    }
+}
+
+impl From<IsolationStage> for crate::audit_log::AuditStage {
+    /// 監査の段トークンを作る唯一の経路（`ExecError::stage` と同じ語彙。SEC-4・ERR-4・#3121）。
+    fn from(stage: IsolationStage) -> Self {
+        Self::new(stage.as_str())
+    }
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -2858,6 +2980,84 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// 全変種を列挙する序数（変種を足すとコンパイルエラーになり、`ALL` の更新漏れを防ぐ）。
+    fn stage_ordinal(s: IsolationStage) -> usize {
+        match s {
+            IsolationStage::Validate => 0,
+            IsolationStage::Unshare => 1,
+            IsolationStage::SetGroups => 2,
+            IsolationStage::UidMap => 3,
+            IsolationStage::GidMap => 4,
+            IsolationStage::MountPrivate => 5,
+            IsolationStage::SetHostname => 6,
+            IsolationStage::MountProc => 7,
+            IsolationStage::PrepareRootfs => 8,
+            IsolationStage::PivotRoot => 9,
+            IsolationStage::Spawn => 10,
+            IsolationStage::UserNamespaceMap => 11,
+            IsolationStage::Exec => 12,
+            IsolationStage::Wait => 13,
+            IsolationStage::CreateDevices => 14,
+            IsolationStage::CgroupJoin => 15,
+            IsolationStage::Rlimits => 16,
+            IsolationStage::CapabilityDrop => 17,
+            IsolationStage::NoNewPrivs => 18,
+            IsolationStage::Landlock => 19,
+            IsolationStage::Seccomp => 20,
+            IsolationStage::SetNs => 21,
+            IsolationStage::MountTmpfs => 22,
+            IsolationStage::InjectFiles => 23,
+            IsolationStage::MountReadonlyPaths => 24,
+            IsolationStage::MountMaskedPaths => 25,
+            IsolationStage::MountBinds => 26,
+            IsolationStage::MountSysfs => 27,
+            IsolationStage::WorkingDir => 28,
+            IsolationStage::ApplySysctls => 29,
+            IsolationStage::RootReadOnly => 30,
+        }
+    }
+
+    /// SEC-4・ERR-4（#3121）: 監査の `stage` 語彙は `IsolationStage` と一致し、全変種を網羅して一意な `[a-z_]` のトークンになる。
+    #[test]
+    fn sec4_err4_3121_stage_vocabulary_matches_isolation_stage() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, s) in IsolationStage::ALL.into_iter().enumerate() {
+            assert_eq!(stage_ordinal(s), i);
+            let token = crate::audit_log::AuditStage::from(s).as_str();
+            assert_eq!(token, s.as_str());
+            assert!(
+                !token.is_empty() && token.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+            );
+            assert!(seen.insert(token), "duplicate {token}");
+        }
+        assert_eq!(IsolationStage::ALL.len(), 31);
+        assert_eq!(
+            IsolationStage::MountReadonlyPaths.as_str(),
+            "mount_readonly_paths"
+        );
+        assert_eq!(
+            IsolationStage::MountMaskedPaths.as_str(),
+            "mount_masked_paths"
+        );
+    }
+
+    /// SEC-4・ERR-4（#3121）: 違反を記録する公開入口は、返す `ExecError::stage` と同じ段を記録に載せる。
+    #[test]
+    fn sec4_err4_3121_violation_audits_carry_error_stage() {
+        use crate::audit_log::mount::tests::VecSink;
+        let sink = VecSink::new(false);
+        let err = ExecError::from_violation_at(
+            ViolationReason::RootfsIsHostRoot,
+            None,
+            IsolationStage::PivotRoot,
+        );
+        let out = audit_mount_violation(err, None, &sink);
+        assert_eq!(out.delivery, crate::audit_log::AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("pivot_root"));
+    }
 
     fn pivot_report_with(mnt_id: u64) -> PivotReport {
         PivotReport {

@@ -113,7 +113,7 @@
 //!   チェインは空。saddr のみの masq は `bridge-nf-call-iptables` 有効環境で bridge 内通信まで書き換える）。
 //!   このため default route を張っても、コンテナ発の通信を host 外部へ届けるには masquerade と host の
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
-//! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
+//! - コンテナ単位のポート公開解除
 //!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
 //!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
 //!   再起動後のハンドル復元は未実装）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
@@ -1129,6 +1129,9 @@ const VETH_HOST_PREFIX: &str = "fcvh";
 /// veth の peer（コンテナ）側名のプレフィックス。
 const VETH_PEER_PREFIX: &str = "fcvp";
 
+/// コンテナの netns の中での peer の名前（attach が peer を改名する先。D11・NET-1・#3061）。
+pub const CONTAINER_IFNAME: &str = "eth0";
+
 /// 検証済みのエンドポイント ID（コンテナ 1 つの接続口の識別子。REPAIR-2）。`NetworkName` と同じ文字種規則
 /// （1〜64 バイト、先頭 `[a-z0-9]`、以降 `[a-z0-9_.-]`）で、netns の pin ファイル名にそのまま使う。
 /// ホスト全体で一意であること（veth 名は ID だけから導出する）は呼び出し側（状態レジストリ）の責務。
@@ -1260,7 +1263,7 @@ impl ContainerAttachSpec {
 ///
 /// peer 側は netns へ移動済みで、netns 内で `lo` と peer が up、払い出しアドレスの付与と default route
 /// （gateway = bridge アドレス）の設定、およびポート公開指定の DNAT 投入まで済んでいる
-/// （TASK-139.3・#316）。`eth0` へのリネームは未実施（REPAIR-3）。
+/// （TASK-139.3・#316）。peer は `eth0` へ改名済み（#3061）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct AttachedContainer<N> {
@@ -1273,8 +1276,11 @@ pub struct AttachedContainer<N> {
     /// host 側 veth の `IFLA_IFALIAS` に付けた所有トークン。ifindex は再利用されうるため、削除直前に
     /// このトークンの一致で元の veth であることを確認する（`delete_network`。TASK-139.4・NET-1）。
     pub host_token: String,
-    /// コンテナ netns に入った peer 側 veth の名前（netns 内での名前。リネーム前）。
+    /// veth 作成時の peer 側の名前。netns 内では `container_ifname` へ改名済みでこの名前では引けない。
+    /// `delete_network` の所有の照合に使う。
     pub peer_veth: IfName,
+    /// netns 内での peer の名前（[`CONTAINER_IFNAME`]。改名済み。NET-1・#3061）。
+    pub container_ifname: IfName,
     /// netns の pin 先パス。
     pub netns_path: PathBuf,
     /// 静的 IPAM で払い出し、netns 内の peer へ設定したアドレス。
@@ -1322,6 +1328,8 @@ pub enum AttachStep {
     ConfigureLoopback,
     /// netns 内での peer 側 veth の ifindex 解決（移動で変わりうる）。
     ResolvePeer,
+    /// netns 内の peer の `eth0` への改名（D11・#3061）。
+    RenamePeer,
     /// netns 内の peer へのアドレス付与。
     AddAddress,
     /// netns 内の peer 側の up。
@@ -1591,6 +1599,9 @@ pub(crate) trait AttachOps {
     fn netns_link_index(&self, ns: &Self::Netns, name: &IfName) -> Result<IfIndex, NetError>;
     /// `ns` の中で ifindex 指定で up にする。
     fn netns_set_up(&self, ns: &Self::Netns, link: IfIndex) -> Result<(), NetError>;
+    /// `ns` の中で ifindex 指定で `link` の名前を `name` へ変える。down のうちに呼ぶこと（up 中は
+    /// カーネルが `EBUSY` を返す。NET-1・#3061）。
+    fn netns_rename(&self, ns: &Self::Netns, link: IfIndex, name: &IfName) -> Result<(), NetError>;
     /// `ns` の中で `link` にアドレスを付与する。
     fn netns_add_address(
         &self,
@@ -1774,8 +1785,9 @@ fn attach_with_source<O: AttachOps>(
         )));
     }
     // 何かを作る前の検査（すべて読み取りのみ）。失敗時は `source` をそのまま返す。
-    let precheck = || -> Result<(VethNames, Ipv4Addr), (NetError, AttachStep)> {
+    let precheck = || -> Result<(VethNames, Ipv4Addr, IfName), (NetError, AttachStep)> {
         let names = VethNames::derive(&spec.endpoint).map_err(|e| (e, AttachStep::DeriveNames))?;
+        let ifname = IfName::new(CONTAINER_IFNAME).map_err(|e| (e, AttachStep::RenamePeer))?;
         // default route の gateway（bridge アドレス）は IPv4 に限る。
         let IpAddr::V4(gateway) = spec.gateway.addr() else {
             return Err((
@@ -1798,7 +1810,7 @@ fn attach_with_source<O: AttachOps>(
         }
         // 接続先が作成時の bridge のままであることを確認する。
         match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
-            Ok(i) if i == spec.bridge_index => Ok((names, gateway)),
+            Ok(i) if i == spec.bridge_index => Ok((names, gateway, ifname)),
             Ok(_) => Err((
                 NetError::new(
                     NetErrorCode::FailedPrecondition,
@@ -1809,7 +1821,7 @@ fn attach_with_source<O: AttachOps>(
             Err(e) => Err((e, AttachStep::VerifyBridge)),
         }
     };
-    let (names, gateway) = match precheck() {
+    let (names, gateway, container_ifname) = match precheck() {
         Ok(v) => v,
         Err((e, step)) => {
             return Err(Box::new((
@@ -1929,57 +1941,63 @@ fn attach_with_source<O: AttachOps>(
     }
 
     // netns 内の設定 → ポート公開。ここからの失敗は veth・netns を戻す（モジュール doc）。
-    let published_ports =
-        match configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
-            Ok(p) => p,
-            Err(f) => {
-                let mut report = AttachRollbackReport::default();
-                if f.ports_unknown {
-                    // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
-                    // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
-                    report.leftover.push((
-                        AttachResource::PortRules(spec.table.clone()),
-                        ResourceState::Unknown,
-                    ));
+    let published_ports = match configure_in_netns(
+        ops,
+        spec,
+        &netns,
+        (names.peer(), &container_ifname),
+        address,
+        gateway,
+    ) {
+        Ok(p) => p,
+        Err(f) => {
+            let mut report = AttachRollbackReport::default();
+            if f.ports_unknown {
+                // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
+                // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
+                report.leftover.push((
+                    AttachResource::PortRules(spec.table.clone()),
+                    ResourceState::Unknown,
+                ));
+                report
+                    .leftover
+                    .push((AttachResource::Address(address), ResourceState::Unknown));
+            }
+            rollback_veth(ops, names.host(), host_index, &mut report);
+            let back = if keep_netns {
+                Some(give_back(netns))
+            } else {
+                rollback_netns(ops, netns, &pin, &mut report);
+                None
+            };
+            if !f.ports_unknown {
+                // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
+                // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
+                // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
+                // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
+                if report.leftover.is_empty() {
+                    let _ = ipam.release(&spec.endpoint);
+                    // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
+                    if !spec.ports.is_empty()
+                        && ports.release(&spec.network, &spec.endpoint).is_err()
+                    {
+                        report.leftover.push((
+                            AttachResource::PortReservation(
+                                spec.network.clone(),
+                                spec.endpoint.clone(),
+                            ),
+                            ResourceState::Present,
+                        ));
+                    }
+                } else {
                     report
                         .leftover
                         .push((AttachResource::Address(address), ResourceState::Unknown));
                 }
-                rollback_veth(ops, names.host(), host_index, &mut report);
-                let back = if keep_netns {
-                    Some(give_back(netns))
-                } else {
-                    rollback_netns(ops, netns, &pin, &mut report);
-                    None
-                };
-                if !f.ports_unknown {
-                    // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
-                    // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
-                    // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
-                    // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
-                    if report.leftover.is_empty() {
-                        let _ = ipam.release(&spec.endpoint);
-                        // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
-                        if !spec.ports.is_empty()
-                            && ports.release(&spec.network, &spec.endpoint).is_err()
-                        {
-                            report.leftover.push((
-                                AttachResource::PortReservation(
-                                    spec.network.clone(),
-                                    spec.endpoint.clone(),
-                                ),
-                                ResourceState::Present,
-                            ));
-                        }
-                    } else {
-                        report
-                            .leftover
-                            .push((AttachResource::Address(address), ResourceState::Unknown));
-                    }
-                }
-                return Err(Box::new((fail(f.error, f.step, report), back)));
             }
-        };
+            return Err(Box::new((fail(f.error, f.step, report), back)));
+        }
+    };
     ops.release_netns_socket(&mut netns);
 
     Ok(AttachedContainer {
@@ -1988,6 +2006,7 @@ fn attach_with_source<O: AttachOps>(
         host_index,
         host_token,
         peer_veth: names.peer().clone(),
+        container_ifname,
         netns_path: pin,
         address,
         netns,
@@ -2009,7 +2028,7 @@ fn configure_in_netns<O: AttachOps>(
     ops: &O,
     spec: &ContainerAttachSpec,
     netns: &O::Netns,
-    peer: &IfName,
+    (peer, ifname): (&IfName, &IfName),
     address: IpPrefix,
     gateway: Ipv4Addr,
 ) -> Result<Vec<PublishedPort>, ConfigureFailure> {
@@ -2032,6 +2051,10 @@ fn configure_in_netns<O: AttachOps>(
     let peer_index = ops
         .netns_link_index(netns, peer)
         .map_err(step(AttachStep::ResolvePeer))?;
+    // `eth0` への改名は up の前でなければ `EBUSY` になる（移動直後の peer は down）。改名で ifindex は
+    // 変わらないので、以降は同じ `peer_index` を使う。netns 内に `eth0` が既にあれば `AlreadyExists`。
+    ops.netns_rename(netns, peer_index, ifname)
+        .map_err(step(AttachStep::RenamePeer))?;
     ops.netns_add_address(netns, peer_index, address)
         .map_err(step(AttachStep::AddAddress))?;
     ops.netns_set_up(netns, peer_index)
@@ -2369,6 +2392,20 @@ impl AttachOps for LinuxAttachOps<'_> {
             .map(|_| ())
     }
 
+    fn netns_rename(
+        &self,
+        ns: &ContainerNetns,
+        link: IfIndex,
+        name: &IfName,
+    ) -> Result<(), NetError> {
+        let LinkRef::Index(index) = link_ref(link)? else {
+            unreachable!("link_ref always returns LinkRef::Index")
+        };
+        Self::ns_route(ns)?
+            .set_link(&LinkSet::rename(index, name.clone()), self.timeout)
+            .map(|_| ())
+    }
+
     fn netns_add_address(
         &self,
         ns: &ContainerNetns,
@@ -2480,7 +2517,7 @@ fn send_dnat_batch(
 /// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
 ///
 /// # 未実装範囲（REPAIR-3）
-/// `eth0` へのリネーム・masquerade・コンテナ単位のポート公開解除（`unpublish_container_port`）は別 API（モジュール doc「未実装範囲」）。
+/// masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
 /// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
 /// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）、コンテナ 1 件だけの切り離しは `detach_container`（#3062）。
 #[cfg(target_os = "linux")]
@@ -3944,6 +3981,13 @@ mod attach_tests {
             }
             Ok(())
         }
+        fn netns_rename(&self, (): &(), link: IfIndex, name: &IfName) -> Result<(), NetError> {
+            self.rec(format!("ns_rename {} {}", link.get(), name.as_str()));
+            if self.fail_ns == Some("ns_rename") {
+                return Err(err(NetErrorCode::AlreadyExists));
+            }
+            Ok(())
+        }
         fn netns_add_address(
             &self,
             (): &(),
@@ -4120,6 +4164,7 @@ mod attach_tests {
                 "ns_index_lo lo".to_owned(),
                 "ns_up_lo 1".to_owned(),
                 format!("ns_index_peer {}", n.peer().as_str()),
+                "ns_rename 5 eth0".to_owned(),
                 "ns_addr 5 10.89.0.2/24".to_owned(),
                 "ns_up_peer 5".to_owned(),
                 "ns_route 10.89.0.1 5".to_owned(),
@@ -4129,6 +4174,7 @@ mod attach_tests {
         assert_eq!(a.host_index.get(), 21);
         assert_eq!(a.host_veth, *n.host());
         assert_eq!(a.peer_veth, *n.peer());
+        assert_eq!(a.container_ifname.as_str(), "eth0");
         assert_eq!(a.netns_path, pin_of("web-1"));
         assert_eq!(a.address, ip(2));
         // 削除時の残存 pin の照合用に、置き場のパスと識別子を払い出しと同時に記録する（TASK-139.4）。
@@ -4475,6 +4521,7 @@ mod attach_tests {
                 "ns_index_lo lo".to_owned(),
                 "ns_up_lo 1".to_owned(),
                 format!("ns_index_peer {}", n.peer().as_str()),
+                "ns_rename 5 eth0".to_owned(),
                 "ns_addr 5 10.89.0.2/24".to_owned(),
                 "ns_up_peer 5".to_owned(),
                 "ns_route 10.89.0.1 5".to_owned(),
@@ -4670,6 +4717,23 @@ mod attach_tests {
         assert_eq!(calls[n - 1], "release_socket");
     }
 
+    /// NET-1・#3061: 改名が失敗したら後の段（アドレス付与・up・route）へ進まない。
+    #[test]
+    fn net1_attach_rename_failure_stops_before_address_and_up() {
+        let f = Fake {
+            fail_ns: Some("ns_rename"),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        assert_eq!(e.step, AttachStep::RenamePeer);
+        let calls = f.calls();
+        assert!(calls.contains(&"ns_rename 5 eth0".to_owned()));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_addr")));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_up_peer")));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_route")));
+    }
+
     /// NET-1・TASK-139.3: netns 内の各手順の失敗は、失敗手順と元のエラーを返し、IPAM の払い出し・veth・netns を戻す。
     #[test]
     fn net1_attach_netns_config_failures_roll_back_everything() {
@@ -4692,6 +4756,11 @@ mod attach_tests {
             (
                 "ns_addr",
                 AttachStep::AddAddress,
+                NetErrorCode::AlreadyExists,
+            ),
+            (
+                "ns_rename",
+                AttachStep::RenamePeer,
                 NetErrorCode::AlreadyExists,
             ),
             ("ns_up_peer", AttachStep::PeerUp, NetErrorCode::Internal),

@@ -13,7 +13,7 @@
 //!   （bind マウントと pin ファイルを host へ漏らさない）→ `create_network` で bridge を作る →
 //!   `attach_container` を実行し、(1) host 側 veth の `IFLA_MASTER` が bridge の ifindex と一致し `IFF_UP`、
 //!   (2) peer 側が子の netns から消えている、(3) pin パスの inode が保持 fd の netns と一致し子の netns と
-//!   別、(4) `nsenter --net=<pin>` 越しの `/proc/net/dev` に peer 名が現れる、を具体値で照合する。
+//!   別、(4) `nsenter --net=<pin>` 越しの `/proc/net/dev` に `eth0` が現れ、veth 作成時の peer 名は無い（改名。#3061）、を具体値で照合する。
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
@@ -122,7 +122,7 @@ mod linux {
     const CLAIM_HEX_MAX_LEN: usize = 4096;
     /// attach 子が標準出力へ出す行の接頭辞。
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept detach=ok detach_sibling=kept";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept detach=ok detach_sibling=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -867,6 +867,10 @@ mod linux {
         }
         let host = attached.host_veth.as_str();
         let peer = attached.peer_veth.as_str();
+        let ifname = attached.container_ifname.as_str();
+        if ifname != "eth0" {
+            return Err(fail(format!("unexpected container ifname {ifname}")));
+        }
 
         let (index, flags, master) = link_state(&route, host)?;
         if index != attached.host_index.get() {
@@ -918,10 +922,16 @@ mod linux {
         )?;
         if !dev
             .lines()
+            .any(|l| l.trim_start().starts_with(&format!("{ifname}:")))
+        {
+            return Err(fail(format!("{ifname} not found in the container netns")));
+        }
+        if dev
+            .lines()
             .any(|l| l.trim_start().starts_with(&format!("{peer}:")))
         {
             return Err(fail(format!(
-                "peer {peer} not found in the container netns"
+                "peer {peer} still has its original name in the container netns"
             )));
         }
 
@@ -935,7 +945,7 @@ mod linux {
             .lines()
             .filter(|l| {
                 let f: Vec<&str> = l.split_whitespace().collect();
-                f.first() == Some(&peer)
+                f.first() == Some(&ifname)
                     && f.get(1) == Some(&"00000000")
                     && f.get(7) == Some(&"00000000")
             })
@@ -944,7 +954,7 @@ mod linux {
             || default_routes[0].split_whitespace().nth(2) != Some("0100D50A")
         {
             return Err(fail(format!(
-                "expected exactly one default route via 10.213.0.1 on {peer}, got {default_routes:?}"
+                "expected exactly one default route via 10.213.0.1 on {ifname}, got {default_routes:?}"
             )));
         }
 

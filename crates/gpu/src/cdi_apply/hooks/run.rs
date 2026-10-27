@@ -424,24 +424,76 @@ impl RemoveBudget {
     }
 }
 
-/// fdinfo の最大読み取りバイト数（無制限確保を避ける）。
-const FDINFO_MAX_BYTES: u64 = 4096;
+/// fdinfo の最大読み取りバイト数（無制限確保を避ける）。超過は切り捨てず拒否する。
+/// core の `FDINFO_MAX_BYTES`・net の `MAX_FDINFO_READ` と同値（実装は依存方向のため共有しない。#3025）。
+const FDINFO_MAX_BYTES: u64 = 64 * 1024;
 
-/// `/proc/thread-self/fdinfo/<n>` の本文から `mnt_id` を取り出す。無い・数値でないときは `None`。
-fn parse_fdinfo_mnt_id(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
+/// fdinfo からの `mnt_id` 取得の失敗理由（core の `FdinfoMountIdError`・net と同じ区別。SEC-1・GPU-2・REPAIR-2）。
+///
+/// 理由はこの型で保ち、呼び出し側へは `fdinfo_error_errno` で errno に写して返す。
+#[derive(Debug)]
+enum FdinfoMountIdError {
+    /// open・read の失敗、または UTF-8 でない本文。
+    Read(std::io::Error),
+    /// 本文が `FDINFO_MAX_BYTES` を超えた（切り捨てると誤った値を採りうるため拒否する）。
+    TooLarge,
+    /// 行頭が `mnt_id:` の行が無い。
+    Missing,
+    /// 行頭が `mnt_id:` の行が 2 つ以上ある（値が同じでも拒否する。fail-closed）。
+    Duplicate,
+    /// `mnt_id:` の値が u64 として解釈できない（空・非数値・負数・桁あふれ）。
+    Invalid,
+}
+
+/// `/proc/thread-self/fdinfo/<n>` の本文から `mnt_id` を取り出す。重複・欠落・不正値は理由つきで拒否する。
+fn parse_fdinfo_mnt_id(text: &str) -> Result<u64, FdinfoMountIdError> {
+    let mut found = text.lines().filter_map(|l| l.strip_prefix("mnt_id:"));
+    let first = found.next().ok_or(FdinfoMountIdError::Missing)?;
+    if found.next().is_some() {
+        return Err(FdinfoMountIdError::Duplicate);
+    }
+    first
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| FdinfoMountIdError::Invalid)
+}
+
+/// fdinfo を上限 + 1 バイトまで読み、上限超過は `TooLarge` として拒否する（確保量は上限 + 1 で頭打ち）。
+fn read_fdinfo_bounded(r: impl Read) -> Result<String, FdinfoMountIdError> {
+    let mut text = String::new();
+    r.take(FDINFO_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(FdinfoMountIdError::Read)?;
+    if text.len() as u64 > FDINFO_MAX_BYTES {
+        return Err(FdinfoMountIdError::TooLarge);
+    }
+    Ok(text)
+}
+
+/// `fd` の fdinfo を読んで `mnt_id` を理由つきの型で返す。
+fn read_fd_mnt_id(fd: &OwnedFd) -> Result<u64, FdinfoMountIdError> {
+    let f = File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+        .map_err(FdinfoMountIdError::Read)?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(f)?)
+}
+
+/// 失敗理由を errno に写す。`Read` は OS の errno（無ければ EIO）、それ以外は EIO。
+/// 呼び出し側（`remove_children`・`Bundle::remove`）は失敗を fail-closed（配下に入らず後始末失敗）で扱い、
+/// errno の値には依存しない。理由の区別は `FdinfoMountIdError` の型で保ち、errno から読み戻さない。
+fn fdinfo_error_errno(err: &FdinfoMountIdError) -> sys::SysError {
+    match err {
+        FdinfoMountIdError::Read(e) => sys::SysError::Os(e.raw_os_error().unwrap_or(5)),
+        FdinfoMountIdError::TooLarge
+        | FdinfoMountIdError::Missing
+        | FdinfoMountIdError::Duplicate
+        | FdinfoMountIdError::Invalid => sys::SysError::Os(5),
+    }
 }
 
 /// `fd` が属するマウントの ID。同一ファイルシステム内の bind mount も別の ID になるため、`st_dev` の比較では
-/// 検出できない横断をこれで検出する（core の `fd_mount_id` と同じ方式。SEC-1・GPU-2）。
+/// 検出できない横断をこれで検出する（core の `fd_mount_id`・net と同じ判定。SEC-1・GPU-2。#3025）。
 fn fd_mnt_id(fd: &OwnedFd) -> Result<u64, sys::SysError> {
-    let mut text = String::new();
-    File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
-        .and_then(|f| f.take(FDINFO_MAX_BYTES).read_to_string(&mut text))
-        .map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
-    parse_fdinfo_mnt_id(&text).ok_or(sys::SysError::Os(5))
+    read_fd_mnt_id(fd).map_err(|e| fdinfo_error_errno(&e))
 }
 
 /// 親と子のマウント ID が同じことを要求する。違えば `EXDEV` 相当の失敗（配下は削除しない）。
@@ -1900,17 +1952,104 @@ mod tests {
     #[test]
     fn mount_id_parse_and_boundary_decision() {
         assert_eq!(
-            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012010000\nmnt_id:\t412\nino:\t5\n"),
+            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012010000\nmnt_id:\t412\nino:\t5\n").ok(),
             Some(412)
         );
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nino:\t5\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tabc\n"), None);
+        assert!(matches!(
+            parse_fdinfo_mnt_id("pos:\t0\nino:\t5\n"),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id("mnt_id:\tabc\n"),
+            Err(FdinfoMountIdError::Invalid)
+        ));
         assert_eq!(require_same_mount(7, 7), Ok(()));
         assert_eq!(require_same_mount(7, 8), Err(sys::SysError::Os(18)));
         // 実在の fd では取得できる。
         let t = Tmp::new("mntid");
         let a = CdiHookWorkDir::open(&t.work()).unwrap();
         assert!(fd_mnt_id(&a.fd).unwrap() > 0);
+    }
+
+    /// SEC-1・GPU-2・REPAIR-2（#3025）: `mnt_id:` の重複・欠落・不正値を理由つきで拒否する（core・net と同じ表）。
+    #[test]
+    fn sec1_gpu2_parse_fdinfo_mnt_id_rejects_duplicate_missing_invalid() {
+        let ok: &[(&str, u64)] = &[
+            ("pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n", 52),
+            ("fanotify mnt_id:\t9\nmnt_id:\t7\n", 7),
+            ("mnt_id:\t18446744073709551615\n", u64::MAX),
+        ];
+        for (input, want) in ok {
+            let got = parse_fdinfo_mnt_id(input);
+            assert_eq!(got.as_ref().ok(), Some(want), "input={input:?} got={got:?}");
+        }
+        for input in ["pos:\t0\nflags:\t0\n", ""] {
+            let got = parse_fdinfo_mnt_id(input);
+            assert!(
+                matches!(got, Err(FdinfoMountIdError::Missing)),
+                "input={input:?} got={got:?}"
+            );
+        }
+        for input in [
+            "mnt_id:\t52\nmnt_id:\t53\n",
+            "mnt_id:\t52\nmnt_id:\t52\n",
+            "mnt_id:\tx\nmnt_id:\t7\n",
+        ] {
+            let got = parse_fdinfo_mnt_id(input);
+            assert!(
+                matches!(got, Err(FdinfoMountIdError::Duplicate)),
+                "input={input:?} got={got:?}"
+            );
+        }
+        for input in [
+            "mnt_id:\tx\n",
+            "mnt_id:\t-1\n",
+            "mnt_id:\t\n",
+            "mnt_id:\t18446744073709551616\n",
+        ] {
+            let got = parse_fdinfo_mnt_id(input);
+            assert!(
+                matches!(got, Err(FdinfoMountIdError::Invalid)),
+                "input={input:?} got={got:?}"
+            );
+        }
+    }
+
+    /// REPAIR-5・SEC-1（#3025）: 上限ちょうどは通り、1 バイト超過は切り捨てず拒否する。非 UTF-8 は `Read`。
+    #[test]
+    fn sec1_gpu2_read_fdinfo_bounded_limit() {
+        let n = FDINFO_MAX_BYTES as usize;
+        let at = read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; n])).unwrap();
+        assert_eq!(at.len(), n);
+        for over in [n + 1, n + 2, n * 2] {
+            let got = read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; over]));
+            assert!(
+                matches!(got, Err(FdinfoMountIdError::TooLarge)),
+                "len={over} got={got:?}"
+            );
+        }
+        let got = read_fdinfo_bounded(std::io::Cursor::new(b"mnt_id:\t\xff\n".to_vec()));
+        assert!(
+            matches!(got, Err(FdinfoMountIdError::Read(_))),
+            "got={got:?}"
+        );
+    }
+
+    /// SEC-1・GPU-2（#3025）: 失敗理由の errno への写像を具体値で固定する。
+    #[test]
+    fn sec1_gpu2_fdinfo_error_maps_to_errno() {
+        let read_enoent = FdinfoMountIdError::Read(std::io::Error::from_raw_os_error(2));
+        assert_eq!(fdinfo_error_errno(&read_enoent), sys::SysError::Os(2));
+        let read_other = FdinfoMountIdError::Read(std::io::Error::new(ErrorKind::InvalidData, "x"));
+        assert_eq!(fdinfo_error_errno(&read_other), sys::SysError::Os(5));
+        for e in [
+            FdinfoMountIdError::TooLarge,
+            FdinfoMountIdError::Missing,
+            FdinfoMountIdError::Duplicate,
+            FdinfoMountIdError::Invalid,
+        ] {
+            assert_eq!(fdinfo_error_errno(&e), sys::SysError::Os(5), "e={e:?}");
+        }
     }
 
     /// REPAIR-4: 非ゼロで終了したフックの終了コードは `CdiHookError` と計測値に残り、シグナル終了は区別される。

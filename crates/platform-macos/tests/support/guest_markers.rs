@@ -3,8 +3,7 @@
 //! 役割: ブートマーカーと起動完了マーカーの決定・重複拒否・出現順の判定を 1 か所に置き、2 つの試験で
 //! 必須性・空文字拒否・順序の規則がずれるのを防ぐ。呼び出し元は `tests/vm_boot.rs` と
 //! `tests/vm_cold_start.rs`（どちらも `#[path]` で取り込む）。std だけで書き、cfg は付けない。
-//! 双方が全関数を使うとは限らないため、未使用警告は `allow(dead_code)` で抑える。
-#![allow(dead_code)]
+//! 片方の試験だけが使う関数には、その関数にだけ理由付きで `allow(dead_code)` を付ける。
 
 /// ブートマーカーを決める。未指定は既定値、空文字列は拒否する。
 ///
@@ -46,6 +45,10 @@ pub fn validate_marker_pair(boot: &str, ready: &str) -> Result<(), String> {
 /// ブートマーカーの出現より後に起動完了マーカーが現れたかを返す。
 ///
 /// 起動完了マーカーはブートマーカー末尾以降だけを探索し、順序（ブート後に起動完了）を保証する（MAC-1）。
+#[allow(
+    dead_code,
+    reason = "vm_boot だけが使う。vm_cold_start は走査器（MarkerScanner）で同じ順序規則を実装する"
+)]
 pub fn markers_observed_in_order(text: &str, boot: &str, ready: &str) -> bool {
     text.find(boot)
         .and_then(|pos| text.get(pos + boot.len()..))

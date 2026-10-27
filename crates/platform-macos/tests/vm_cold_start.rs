@@ -19,7 +19,6 @@
 //! 二層構成: 純粋ロジック（引数の検証・集計・JSON 整形・マーカー走査・watcher）は全 OS の既定集合で具体値を照合する。
 //! 実 VM を起動する 1 件は macOS 限定の `#[ignore]` で分離する（実機 macOS 13 以上・
 //! `com.apple.security.virtualization` 付き署名・ゲスト資産が要る。CI 通過のための弱体化ではない）。手順は AGENTS.md。
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -30,6 +29,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
+)]
 #[path = "support/guest_markers.rs"]
 mod guest_markers;
 
@@ -38,9 +41,25 @@ const SCHEMA: &str = "fandhe-container.macos-vm-cold-start.v1";
 const TRIALS_DEFAULT: u32 = 5;
 const TRIALS_MIN: u32 = 5;
 const TRIALS_MAX: u32 = 50;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
+)]
 const TRIAL_TIMEOUT_DEFAULT_SECS: u64 = 60;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
+)]
 const TRIAL_TIMEOUT_RANGE_SECS: (u64, u64) = (1, 600);
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
+)]
 const TOTAL_TIMEOUT_DEFAULT_SECS: u64 = 900;
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "実 VM 試験（macOS 限定）だけが使う")
+)]
 const TOTAL_TIMEOUT_RANGE_SECS: (u64, u64) = (1, 3600);
 /// `fandhe_container_platform_macos::vm::MIN_OP_TIMEOUT` と同値（100 ms。これ未満の予算では VM を起動しない）。
 const MIN_BUDGET: Duration = Duration::from_millis(100);
@@ -215,6 +234,9 @@ fn spawn_watcher(
             if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return;
             }
+            // この周回の開始時刻。ready が無いと確認した読み取り（EOF）の開始より後にはならないので、
+            // 次の周回で ready を見つけたときの `end_window` の始点に使える（REPAIR-4）。
+            let mut iter_start = Instant::now();
             if file.is_none() {
                 match std::fs::File::open(&path) {
                     Ok(f) => file = Some(f),
@@ -227,8 +249,13 @@ fn spawn_watcher(
             }
             if let Some(f) = file.as_mut() {
                 loop {
+                    // EOF を確認する読み取りの開始時刻。ここまでに書かれた出力は読み切っていると保証できる。
+                    let read_started = Instant::now();
                     match f.read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            iter_start = read_started;
+                            break;
+                        }
                         Ok(n) => {
                             total += n;
                             let chunk = buf.get(..n).unwrap_or_default();
@@ -256,7 +283,7 @@ fn spawn_watcher(
                     }
                 }
             }
-            last_poll = Instant::now();
+            last_poll = iter_start;
             std::thread::sleep(poll);
         }
     });
@@ -514,7 +541,12 @@ mod real_vm {
             match rx.recv_timeout(remaining) {
                 Ok(WatchMsg::Boot(at)) => boot_marker = Some(at.saturating_duration_since(t0)),
                 Ok(WatchMsg::Ready { at, window }) => {
-                    outcome = Ok((at.saturating_duration_since(t0), window));
+                    // 期限後にキューへ入った Ready は成功にしない（REPAIR-5）。
+                    outcome = if at <= deadline {
+                        Ok((at.saturating_duration_since(t0), window))
+                    } else {
+                        Err("ready_timeout")
+                    };
                     break;
                 }
                 Ok(WatchMsg::Failed) | Err(RecvTimeoutError::Disconnected) => {

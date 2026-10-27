@@ -144,8 +144,9 @@ use runtime_config::parse_pod_cidrs;
 pub use record_store::FileRecordStore;
 pub use record_store::{
     DEFAULT_LIST_TIMEOUT, DEFAULT_RECORD_READ_TIMEOUT, ListBudget, ListLimits, ListedRecord,
-    MAX_CONTAINER_LISTING_BYTES, MAX_SANDBOX_LISTING_BYTES, RecordId, RecordKind, RecordListing,
-    RecordReadFailure, RecordStore,
+    MAX_CONTAINER_LISTING_BYTES, MAX_SANDBOX_LISTING_BYTES, NoopRecordStoreOpRecorder, RecordId,
+    RecordKind, RecordListing, RecordReadFailure, RecordStore, RecordStoreOp,
+    RecordStoreOpRecorder, RecordStoreOpSample, RecordStoreOutcome,
 };
 pub use runtime_config::{MAX_POD_CIDR_BYTES, MAX_POD_CIDRS, PodCidr, PodCidrs};
 

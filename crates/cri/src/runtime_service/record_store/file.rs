@@ -10,12 +10,14 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{
-    ListBudget, ListLimits, ListSink, ListedRecord, RecordId, RecordKind, RecordListing,
-    RecordReadFailure, RecordStore, run_listing,
+    Failed, ListBudget, ListLimits, ListSink, ListedRecord, NoopRecordStoreOpRecorder, RecordId,
+    RecordKind, RecordListing, RecordReadFailure, RecordStore, RecordStoreOp,
+    RecordStoreOpRecorder, RecordStoreOpSample, RecordStoreOutcome, run_listing,
 };
 use crate::error::CriError;
 
@@ -42,6 +44,7 @@ pub struct FileRecordStore {
     lock_path: PathBuf,
     lock_timeout: Duration,
     next_seq: AtomicU64,
+    recorder: Arc<dyn RecordStoreOpRecorder>,
     #[cfg(test)]
     read_hook: Option<ReadHook>,
 }
@@ -84,6 +87,7 @@ impl FileRecordStore {
             containers,
             lock_timeout: LOCK_TIMEOUT,
             next_seq: AtomicU64::new(0),
+            recorder: Arc::new(NoopRecordStoreOpRecorder),
             #[cfg(test)]
             read_hook: None,
         })
@@ -101,24 +105,52 @@ impl FileRecordStore {
         self.dir(kind).join(format!("{}{REC_EXT}", id.as_str()))
     }
 
-    fn lock(&self) -> Result<File, CriError> {
+    /// 操作の計測結果を受ける記録器を差し替える（既定は何も記録しない。REPAIR-4）。
+    ///
+    /// `put` / `remove` / `list` の全終了経路（成功・上限拒否・ロック取得失敗・列挙の期限切れ・I/O エラー）で、
+    /// 操作名・種別・結果区分・所要時間だけを記録する。バイト列・ID・パスは渡さない。
+    pub fn with_recorder(mut self, recorder: Arc<dyn RecordStoreOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    fn lock(&self) -> Result<File, Failed> {
         lock_file(&self.lock_path, self.lock_timeout)
     }
-}
 
-impl RecordStore for FileRecordStore {
-    fn put(&self, kind: RecordKind, id: &RecordId, bytes: &[u8]) -> Result<(), CriError> {
+    /// `f` を計測して結果を記録し、呼び出し側へは `CriError` だけを返す。
+    fn timed<T>(
+        &self,
+        op: RecordStoreOp,
+        kind: RecordKind,
+        f: impl FnOnce() -> Result<T, Failed>,
+    ) -> Result<T, CriError> {
+        let start = Instant::now();
+        let result = f();
+        let outcome = match &result {
+            Ok(_) => RecordStoreOutcome::Ok,
+            Err(e) => e.outcome,
+        };
+        self.recorder.record_store_op(&RecordStoreOpSample {
+            op,
+            kind,
+            outcome,
+            latency: start.elapsed(),
+        });
+        result.map_err(|e| e.err)
+    }
+
+    fn put_inner(&self, kind: RecordKind, id: &RecordId, bytes: &[u8]) -> Result<(), Failed> {
         if bytes.len() > kind.max_record_bytes() {
-            return Err(CriError::internal("cri record is too long"));
+            return Err(Failed::new(
+                RecordStoreOutcome::TooLong,
+                CriError::internal("cri record is too long"),
+            ));
         }
         let _guard = self.lock()?;
         let target = self.record_path(kind, id);
         match fs::symlink_metadata(&target) {
-            Ok(m) if !m.file_type().is_file() => {
-                return Err(CriError::internal(
-                    "cri record target is not a regular file",
-                ));
-            }
+            Ok(m) if !m.file_type().is_file() => return Err(not_regular()),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(persist_error()),
@@ -138,35 +170,29 @@ impl RecordStore for FileRecordStore {
         sync_dir(dir).map_err(|_| persist_error())
     }
 
-    fn remove(&self, kind: RecordKind, id: &RecordId) -> Result<(), CriError> {
+    fn remove_inner(&self, kind: RecordKind, id: &RecordId) -> Result<(), Failed> {
         let _guard = self.lock()?;
         let target = self.record_path(kind, id);
         match fs::symlink_metadata(&target) {
             Ok(m) if m.file_type().is_file() => {}
-            Ok(_) => {
-                return Err(CriError::internal(
-                    "cri record target is not a regular file",
-                ));
-            }
+            Ok(_) => return Err(not_regular()),
             // 記録が既に無くても親ディレクトリの同期を成功条件にする。前回の再試行で unlink
             // 後の同期が失敗していた場合に、削除が永続化されないまま成功を返さないため（CRI-1）。
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return sync_dir(self.dir(kind))
-                    .map_err(|_| CriError::internal("failed to remove the cri record"));
+                return sync_dir(self.dir(kind)).map_err(|_| remove_error());
             }
-            Err(_) => return Err(CriError::internal("failed to remove the cri record")),
+            Err(_) => return Err(remove_error()),
         }
-        fs::remove_file(&target)
-            .map_err(|_| CriError::internal("failed to remove the cri record"))?;
-        sync_dir(self.dir(kind)).map_err(|_| CriError::internal("failed to remove the cri record"))
+        fs::remove_file(&target).map_err(|_| remove_error())?;
+        sync_dir(self.dir(kind)).map_err(|_| remove_error())
     }
 
-    fn list(
+    fn list_inner(
         &self,
         kind: RecordKind,
         budget: ListBudget,
         limits: ListLimits,
-    ) -> Result<RecordListing, CriError> {
+    ) -> Result<RecordListing, Failed> {
         // 呼び出し側が別種別の上限を渡しても、この種別の既定値を超えさせない。
         let limits = limits.clamp_to(kind);
         let dir = self.dir(kind).to_path_buf();
@@ -188,11 +214,9 @@ impl RecordStore for FileRecordStore {
             sink.finish(result);
         })
     }
-}
 
-impl FileRecordStore {
     /// `O_EXCL` の一時ファイルを作る。衝突したら連番を進めて最大 [`TMP_ATTEMPTS`] 回まで再試行する。
-    fn create_tmp(&self, dir: &Path) -> Result<(PathBuf, File), CriError> {
+    fn create_tmp(&self, dir: &Path) -> Result<(PathBuf, File), Failed> {
         for _ in 0..TMP_ATTEMPTS {
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!(".tmp-{}-{seq}", std::process::id()));
@@ -208,6 +232,27 @@ impl FileRecordStore {
     }
 }
 
+impl RecordStore for FileRecordStore {
+    fn put(&self, kind: RecordKind, id: &RecordId, bytes: &[u8]) -> Result<(), CriError> {
+        self.timed(RecordStoreOp::Put, kind, || self.put_inner(kind, id, bytes))
+    }
+
+    fn remove(&self, kind: RecordKind, id: &RecordId) -> Result<(), CriError> {
+        self.timed(RecordStoreOp::Remove, kind, || self.remove_inner(kind, id))
+    }
+
+    fn list(
+        &self,
+        kind: RecordKind,
+        budget: ListBudget,
+        limits: ListLimits,
+    ) -> Result<RecordListing, CriError> {
+        self.timed(RecordStoreOp::List, kind, || {
+            self.list_inner(kind, budget, limits)
+        })
+    }
+}
+
 /// 列挙の本体（専用スレッドで動く）。ロック → 走査 → 昇順に 1 件ずつ読む。
 fn list_worker(
     dir: &Path,
@@ -217,10 +262,15 @@ fn list_worker(
     limits: ListLimits,
     sink: &ListSink,
     #[cfg(test)] hook: Option<ReadHook>,
-) -> Result<usize, CriError> {
+) -> Result<usize, Failed> {
     // ガードは worker の終了（期限切れで切り離されても中止フラグで抜ける）で drop される。
     let _guard = lock_file(lock_path, lock_timeout)?;
-    let too_many = || CriError::failed_precondition("cri record store holds too many records");
+    let too_many = || {
+        Failed::new(
+            RecordStoreOutcome::TooManyRecords,
+            CriError::failed_precondition("cri record store holds too many records"),
+        )
+    };
     let max_entries = limits
         .max_records()
         .saturating_mul(2)
@@ -291,7 +341,7 @@ fn read_one(
     max: usize,
     max_total: usize,
     total: &mut usize,
-) -> Result<Result<Vec<u8>, RecordReadFailure>, CriError> {
+) -> Result<Result<Vec<u8>, RecordReadFailure>, Failed> {
     let Ok(before) = fs::symlink_metadata(path) else {
         return Ok(Err(RecordReadFailure::Unreadable));
     };
@@ -303,9 +353,7 @@ fn read_one(
         return Ok(Err(RecordReadFailure::TooLong));
     }
     if total.checked_add(len).is_none_or(|t| t > max_total) {
-        return Err(CriError::failed_precondition(
-            "cri record store holds too much data",
-        ));
+        return Err(too_much_data());
     }
     let Ok(file) = File::open(path) else {
         return Ok(Err(RecordReadFailure::Unreadable));
@@ -332,19 +380,20 @@ fn read_one(
     let new_total = total
         .checked_add(buf.len())
         .filter(|t| *t <= max_total)
-        .ok_or_else(|| CriError::failed_precondition("cri record store holds too much data"))?;
+        .ok_or_else(too_much_data)?;
     *total = new_total;
     Ok(Ok(buf))
 }
 
 /// `.lock` を期限つきで取る。**決して unlink しない**（消えた inode をロックして二重取得になるのを防ぐ。
 /// plugin-cri の `InstanceLock`・`ReclaimStore` と同じ）。
-fn lock_file(path: &Path, timeout: Duration) -> Result<File, CriError> {
+fn lock_file(path: &Path, timeout: Duration) -> Result<File, Failed> {
     if let Ok(m) = fs::symlink_metadata(path)
         && !m.file_type().is_file()
     {
-        return Err(CriError::internal(
-            "cri record store lock is not a regular file",
+        return Err(Failed::new(
+            RecordStoreOutcome::NotRegularFile,
+            CriError::internal("cri record store lock is not a regular file"),
         ));
     }
     let mut opts = OpenOptions::new();
@@ -355,21 +404,22 @@ fn lock_file(path: &Path, timeout: Duration) -> Result<File, CriError> {
         .mode(0o600);
     let file = opts
         .open(path)
-        .map_err(|_| CriError::internal("failed to open the cri record store lock"))?;
+        .map_err(|_| lock_error("failed to open the cri record store lock"))?;
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
-                    return Err(CriError::timeout(
-                        "timed out waiting for the cri record store lock",
+                    return Err(Failed::new(
+                        RecordStoreOutcome::LockTimeout,
+                        CriError::timeout("timed out waiting for the cri record store lock"),
                     ));
                 }
                 std::thread::sleep(LOCK_POLL);
             }
             Err(std::fs::TryLockError::Error(_)) => {
-                return Err(CriError::internal("failed to lock the cri record store"));
+                return Err(lock_error("failed to lock the cri record store"));
             }
         }
     }
@@ -393,12 +443,43 @@ fn prepare_error() -> CriError {
     CriError::failed_precondition("failed to prepare the cri record store")
 }
 
-fn persist_error() -> CriError {
-    CriError::internal("failed to persist the cri record")
+fn persist_error() -> Failed {
+    Failed::new(
+        RecordStoreOutcome::Io,
+        CriError::internal("failed to persist the cri record"),
+    )
 }
 
-fn list_error() -> CriError {
-    CriError::internal("failed to list the cri records")
+fn remove_error() -> Failed {
+    Failed::new(
+        RecordStoreOutcome::Io,
+        CriError::internal("failed to remove the cri record"),
+    )
+}
+
+fn list_error() -> Failed {
+    Failed::new(
+        RecordStoreOutcome::Io,
+        CriError::internal("failed to list the cri records"),
+    )
+}
+
+fn not_regular() -> Failed {
+    Failed::new(
+        RecordStoreOutcome::NotRegularFile,
+        CriError::internal("cri record target is not a regular file"),
+    )
+}
+
+fn too_much_data() -> Failed {
+    Failed::new(
+        RecordStoreOutcome::TooMuchData,
+        CriError::failed_precondition("cri record store holds too much data"),
+    )
+}
+
+fn lock_error(message: &'static str) -> Failed {
+    Failed::new(RecordStoreOutcome::LockError, CriError::internal(message))
 }
 
 /// `result` が失敗でも、`tolerated` に含まれる errno のときだけ成功として扱う。
@@ -910,5 +991,224 @@ mod tests {
             Some(5)
         );
         assert!(tolerate_errnos(Ok(()), &[]).is_ok());
+    }
+
+    /// 記録器の呼び出しを控える試験用の実装。
+    #[derive(Default)]
+    struct Capture(std::sync::Mutex<Vec<RecordStoreOpSample>>);
+
+    impl RecordStoreOpRecorder for Capture {
+        fn record_store_op(&self, sample: &RecordStoreOpSample) {
+            self.0.lock().unwrap().push(*sample);
+        }
+    }
+
+    impl Capture {
+        fn take(&self) -> Vec<RecordStoreOpSample> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+
+        /// 直近 1 件の (操作, 種別, 結果区分) を取り出して 1 件だけであることを確認する。
+        fn one(&self) -> RecordStoreOpSample {
+            let mut v = self.take();
+            assert_eq!(v.len(), 1, "exactly one sample per operation: {v:?}");
+            v.remove(0)
+        }
+    }
+
+    fn captured_store(root: &Path) -> (FileRecordStore, Arc<Capture>) {
+        let cap = Arc::new(Capture::default());
+        let store = FileRecordStore::open(root)
+            .unwrap()
+            .with_recorder(Arc::clone(&cap) as Arc<dyn RecordStoreOpRecorder>);
+        (store, cap)
+    }
+
+    fn expect(
+        s: RecordStoreOpSample,
+        op: RecordStoreOp,
+        kind: RecordKind,
+        outcome: RecordStoreOutcome,
+    ) {
+        assert_eq!((s.op, s.kind, s.outcome), (op, kind, outcome));
+    }
+
+    #[test]
+    fn repair4_record_store_records_put_and_remove_outcomes() {
+        let root = temp_root("rec-putrm");
+        let (mut store, cap) = captured_store(&root);
+        let k = RecordKind::Sandbox;
+        // 成功。
+        store.put(k, &id(ID_A), b"x").unwrap();
+        expect(cap.one(), RecordStoreOp::Put, k, RecordStoreOutcome::Ok);
+        // 上限拒否（何も書かない）。
+        let big = vec![0u8; k.max_record_bytes() + 1];
+        store.put(k, &id(ID_A), &big).unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::Put,
+            k,
+            RecordStoreOutcome::TooLong,
+        );
+        // 通常ファイルでない対象。
+        let dir_target = store.record_path(k, &id(ID_B));
+        fs::create_dir(&dir_target).unwrap();
+        store.put(k, &id(ID_B), b"x").unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::Put,
+            k,
+            RecordStoreOutcome::NotRegularFile,
+        );
+        store.remove(k, &id(ID_B)).unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::Remove,
+            k,
+            RecordStoreOutcome::NotRegularFile,
+        );
+        fs::remove_dir(&dir_target).unwrap();
+        // 削除の成功と、既に無い場合（冪等）。
+        store.remove(k, &id(ID_A)).unwrap();
+        expect(cap.one(), RecordStoreOp::Remove, k, RecordStoreOutcome::Ok);
+        store.remove(k, &id(ID_A)).unwrap();
+        expect(cap.one(), RecordStoreOp::Remove, k, RecordStoreOutcome::Ok);
+        // ロック取得の期限切れ（所要時間に待ちが含まれる）。
+        store.lock_timeout = Duration::from_millis(100);
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&store.lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+        store.put(k, &id(ID_A), b"x").unwrap_err();
+        let s = cap.one();
+        expect(s, RecordStoreOp::Put, k, RecordStoreOutcome::LockTimeout);
+        assert!(s.latency >= Duration::from_millis(100), "{:?}", s.latency);
+        store.remove(k, &id(ID_A)).unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::Remove,
+            k,
+            RecordStoreOutcome::LockTimeout,
+        );
+        drop(held);
+        // ロックファイルが symlink。
+        fs::remove_file(&store.lock_path).unwrap();
+        let other = root.join("other-lock");
+        fs::write(&other, b"").unwrap();
+        symlink(&other, &store.lock_path).unwrap();
+        store.put(k, &id(ID_A), b"x").unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::Put,
+            k,
+            RecordStoreOutcome::NotRegularFile,
+        );
+        fs::remove_file(&store.lock_path).unwrap();
+        // I/O エラー（置き場が消えた）。
+        fs::remove_dir_all(store.dir(k)).unwrap();
+        store.put(k, &id(ID_A), b"x").unwrap_err();
+        expect(cap.one(), RecordStoreOp::Put, k, RecordStoreOutcome::Io);
+        store.remove(k, &id(ID_A)).unwrap_err();
+        expect(cap.one(), RecordStoreOp::Remove, k, RecordStoreOutcome::Io);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repair4_record_store_records_list_outcomes() {
+        let root = temp_root("rec-list");
+        let (mut store, cap) = captured_store(&root);
+        let k = RecordKind::Container;
+        store.put(k, &id(ID_A), &[b'x'; 60]).unwrap();
+        store.put(k, &id(ID_B), &[b'x'; 60]).unwrap();
+        cap.take();
+        // 成功。
+        store
+            .list(k, ListBudget::default(), ListLimits::for_kind(k))
+            .unwrap();
+        expect(cap.one(), RecordStoreOp::List, k, RecordStoreOutcome::Ok);
+        // 件数の上限。
+        let e = store
+            .list(
+                k,
+                ListBudget::default(),
+                ListLimits::for_kind(k).with_max_records(k, 1),
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), crate::error::CriErrorCode::FailedPrecondition);
+        expect(
+            cap.one(),
+            RecordStoreOp::List,
+            k,
+            RecordStoreOutcome::TooManyRecords,
+        );
+        // 保持量の上限。
+        store
+            .list(
+                k,
+                ListBudget::default(),
+                ListLimits::for_kind(k).with_max_total_bytes(k, 100),
+            )
+            .unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::List,
+            k,
+            RecordStoreOutcome::TooMuchData,
+        );
+        // 列挙の期限切れ（所要時間に待ちが含まれる）。
+        with_sleep_hook(&mut store, 300);
+        let budget = ListBudget {
+            per_record: Duration::from_millis(50),
+            total: Duration::from_secs(10),
+        };
+        store.list(k, budget, ListLimits::for_kind(k)).unwrap_err();
+        let s = cap.one();
+        expect(s, RecordStoreOp::List, k, RecordStoreOutcome::ListTimeout);
+        assert!(s.latency >= Duration::from_millis(50), "{:?}", s.latency);
+        // worker が抜けるのを待ってから、ロック取得の期限切れ（worker 側）を確認する。
+        std::thread::sleep(Duration::from_millis(800));
+        store.read_hook = None;
+        store.lock_timeout = Duration::from_millis(100);
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&store.lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+        store
+            .list(k, ListBudget::default(), ListLimits::for_kind(k))
+            .unwrap_err();
+        expect(
+            cap.one(),
+            RecordStoreOp::List,
+            k,
+            RecordStoreOutcome::LockTimeout,
+        );
+        drop(held);
+        // I/O エラー（置き場が消えた）。
+        fs::remove_dir_all(store.dir(k)).unwrap();
+        store
+            .list(k, ListBudget::default(), ListLimits::for_kind(k))
+            .unwrap_err();
+        expect(cap.one(), RecordStoreOp::List, k, RecordStoreOutcome::Io);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repair4_record_store_outcome_names_are_fixed() {
+        // 記録先へ渡す語彙は固定。名前の変更は集計の互換性を壊すため具体値で固定する。
+        assert_eq!(RecordStoreOp::Put.as_str(), "put");
+        assert_eq!(RecordStoreOp::Remove.as_str(), "remove");
+        assert_eq!(RecordStoreOp::List.as_str(), "list");
+        assert_eq!(RecordStoreOutcome::Ok.as_str(), "ok");
+        assert_eq!(RecordStoreOutcome::LockTimeout.as_str(), "lock_timeout");
+        assert_eq!(RecordStoreOutcome::ListTimeout.as_str(), "list_timeout");
+        assert_eq!(RecordStoreOutcome::TooLong.as_str(), "too_long");
     }
 }

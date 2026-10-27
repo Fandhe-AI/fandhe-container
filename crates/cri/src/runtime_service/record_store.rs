@@ -22,6 +22,8 @@
 //! - **期限（REPAIR-5）**: 列挙は専用スレッドで行い、1 件ごとと全体の期限を持つ。止まった読み取りは
 //!   継続せず列挙全体を `Timeout` にする（起動を fail-closed にする。containerd が 1 件を Unknown として続行する
 //!   のとの差。止まったスレッドを抱えたまま次を読めないため）
+//! - **計測（REPAIR-4）**: `put` / `remove` / `list` の全終了経路で、操作名・種別・結果区分・所要時間だけを
+//!   [`RecordStoreOpRecorder`] へ渡す（既定は [`NoopRecordStoreOpRecorder`]。バイト列・ID・パスは渡さない）
 //! - **壊れた記録**: ファイルは消さず、列挙結果に失敗として返す（手動回収は R10）
 //!
 //! 残余: 通常ファイルの確認と open の間に FIFO へ差し替えられると open がブロックし得る。置き場は 0700 で
@@ -102,6 +104,120 @@ impl RecordKind {
             Self::Sandbox => MAX_SANDBOX_LISTING_BYTES,
             Self::Container => MAX_CONTAINER_LISTING_BYTES,
         }
+    }
+}
+
+/// 記録ストアの操作の種類（固定の語彙。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RecordStoreOp {
+    /// [`RecordStore::put`]。
+    Put,
+    /// [`RecordStore::remove`]。
+    Remove,
+    /// [`RecordStore::list`]。
+    List,
+}
+
+impl RecordStoreOp {
+    /// 操作名の固定文字列（`[a-z_]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Remove => "remove",
+            Self::List => "list",
+        }
+    }
+}
+
+/// 記録ストアの操作の結果区分（固定の語彙。REPAIR-4）。パス・ID・errno・バイト列は持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RecordStoreOutcome {
+    /// 成功。
+    Ok,
+    /// 1 件の長さの上限超過で拒否した（`put`）。
+    TooLong,
+    /// 件数または走査数の上限超過（`list`）。
+    TooManyRecords,
+    /// 保持量（総バイト量）の上限超過（`list`）。
+    TooMuchData,
+    /// 通常ファイルでない対象を拒否した（記録・`.lock`）。
+    NotRegularFile,
+    /// `.lock` の取得が期限切れになった。
+    LockTimeout,
+    /// `.lock` を開く・ロックする操作が失敗した（期限切れ以外）。
+    LockError,
+    /// 列挙の期限（1 件ごとまたは全体）が切れた。
+    ListTimeout,
+    /// 読み書き・同期・列挙の I/O が失敗した。
+    Io,
+    /// 上記以外の内部エラー（スレッド起動失敗・worker の異常終了）。
+    Internal,
+}
+
+impl RecordStoreOutcome {
+    /// 結果区分の固定文字列（`[a-z_]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::TooLong => "too_long",
+            Self::TooManyRecords => "too_many_records",
+            Self::TooMuchData => "too_much_data",
+            Self::NotRegularFile => "not_regular_file",
+            Self::LockTimeout => "lock_timeout",
+            Self::LockError => "lock_error",
+            Self::ListTimeout => "list_timeout",
+            Self::Io => "io_error",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// 記録ストアの 1 回の操作の計測結果（固定サイズの値型）。バイト列・ID・パスは持たない（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordStoreOpSample {
+    /// 操作の種類。
+    pub op: RecordStoreOp,
+    /// 対象の種別。
+    pub kind: RecordKind,
+    /// 結果区分。
+    pub outcome: RecordStoreOutcome,
+    /// 操作に要した時間（ロック待ち・期限切れまでの待ちを含む）。
+    pub latency: Duration,
+}
+
+/// 記録ストアの計測結果の記録先（REPAIR-4）。
+///
+/// 契約: 呼び出し側の操作の経路から同期的に呼ばれるため、有界時間で戻り、panic しないこと
+/// （相手応答待ち・無期限のロック待ちをしない。REPAIR-5）。ストアの内部ロックを解放してから呼ばれる。
+/// 戻り値を `()` にしているのは、計測の失敗で本来の操作結果を変えないため。
+/// 本番の配線（plugin-cri の `OpRecorder` への橋渡し）は R9（#2938）で行う。
+pub trait RecordStoreOpRecorder: Send + Sync {
+    /// 1 件の計測結果を記録する。
+    fn record_store_op(&self, sample: &RecordStoreOpSample);
+}
+
+/// 計測しない場合の既定実装。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopRecordStoreOpRecorder;
+
+impl RecordStoreOpRecorder for NoopRecordStoreOpRecorder {
+    fn record_store_op(&self, _sample: &RecordStoreOpSample) {}
+}
+
+/// 失敗の内部表現: 呼び出し側へ返すエラーと、記録用の結果区分を一緒に運ぶ。
+#[cfg(unix)]
+pub(crate) struct Failed {
+    pub(crate) err: CriError,
+    pub(crate) outcome: RecordStoreOutcome,
+}
+
+#[cfg(unix)]
+impl Failed {
+    pub(crate) fn new(outcome: RecordStoreOutcome, err: CriError) -> Self {
+        Self { err, outcome }
     }
 }
 
@@ -257,7 +373,7 @@ mod driver {
     /// worker から呼び出し側への通知。
     enum Msg {
         Record(ListedRecord),
-        Done(Result<usize, CriError>),
+        Done(Result<usize, Failed>),
     }
 
     /// 列挙の worker が結果を流す口。
@@ -278,15 +394,22 @@ mod driver {
         }
 
         /// 終了を知らせる（`Ok` は `unrecognized` の件数）。
-        pub(crate) fn finish(self, result: Result<usize, CriError>) {
+        pub(crate) fn finish(self, result: Result<usize, Failed>) {
             let _ = self.tx.send(Msg::Done(result));
         }
+    }
+
+    fn list_timeout() -> Failed {
+        Failed::new(
+            RecordStoreOutcome::ListTimeout,
+            CriError::timeout("timed out listing cri records"),
+        )
     }
 
     /// 専用スレッドで `work` を走らせ、1 件ごとと全体の期限つきで結果を集める（REPAIR-5）。
     ///
     /// 期限切れのときは中止フラグを立てて worker を切り離し、`Timeout` を返す。worker は 1 本だけで再生成しない。
-    pub(crate) fn run_listing<F>(budget: ListBudget, work: F) -> Result<RecordListing, CriError>
+    pub(crate) fn run_listing<F>(budget: ListBudget, work: F) -> Result<RecordListing, Failed>
     where
         F: FnOnce(ListSink) + Send + 'static,
     {
@@ -299,7 +422,12 @@ mod driver {
         std::thread::Builder::new()
             .name("cri-record-list".into())
             .spawn(move || work(sink))
-            .map_err(|_| CriError::internal("failed to start the cri record listing"))?;
+            .map_err(|_| {
+                Failed::new(
+                    RecordStoreOutcome::Internal,
+                    CriError::internal("failed to start the cri record listing"),
+                )
+            })?;
 
         let deadline = Instant::now().checked_add(budget.total);
         let mut records = Vec::new();
@@ -309,7 +437,7 @@ mod driver {
         loop {
             if expired() {
                 cancel.store(true, Ordering::Release);
-                return Err(CriError::timeout("timed out listing cri records"));
+                return Err(list_timeout());
             }
             let wait = match deadline {
                 Some(d) => budget
@@ -322,7 +450,7 @@ mod driver {
                 Ok(Msg::Done(Ok(unrecognized))) => {
                     if expired() {
                         cancel.store(true, Ordering::Release);
-                        return Err(CriError::timeout("timed out listing cri records"));
+                        return Err(list_timeout());
                     }
                     return Ok(RecordListing {
                         records,
@@ -332,10 +460,13 @@ mod driver {
                 Ok(Msg::Done(Err(e))) => return Err(e),
                 Err(RecvTimeoutError::Timeout) => {
                     cancel.store(true, Ordering::Release);
-                    return Err(CriError::timeout("timed out listing cri records"));
+                    return Err(list_timeout());
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(CriError::internal("cri record listing ended unexpectedly"));
+                    return Err(Failed::new(
+                        RecordStoreOutcome::Internal,
+                        CriError::internal("cri record listing ended unexpectedly"),
+                    ));
                 }
             }
         }

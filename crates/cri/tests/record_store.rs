@@ -130,5 +130,7 @@ fn cri1_record_store_list_expired_total_budget_is_timeout() {
         .list(kind, budget, ListLimits::for_kind(kind))
         .unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Timeout);
-    fs::remove_dir_all(&root).unwrap();
+    // 切り離された worker が中止フラグで抜けるまで待ってから片付ける（片付けとの競合を避ける）。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let _ = fs::remove_dir_all(&root);
 }

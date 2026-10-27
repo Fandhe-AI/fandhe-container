@@ -48,6 +48,10 @@ fn core1_task28_2_environ_marker_matching_is_exact() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::environ_has_marker;
 
@@ -224,12 +228,18 @@ mod linux {
     }
 
     /// テスト用一時ディレクトリ（0700。drop で削除）。
-    struct Tmp(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct Tmp(PathBuf, super::scratch_root::ScratchDir);
 
     impl Tmp {
         fn new(tag: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let p = std::env::temp_dir().join(format!("fandhe-daemonless-{}", unique(tag)));
+            let scratch = super::scratch_root::ScratchDir::new(
+                "fandhe-daemonless",
+                std::time::Duration::from_secs(10),
+            );
+            let p = scratch.path().join(unique(tag));
+            fs::create_dir_all(&p).expect("mkdir tmp");
             fs::create_dir_all(p.join("state")).expect("mkdir state");
             fs::create_dir_all(p.join("bundle").join("rootfs")).expect("mkdir bundle");
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -244,7 +254,7 @@ mod linux {
                 serde_json::to_vec(&cfg).expect("serialize"),
             )
             .expect("write config");
-            Self(p)
+            Self(p, scratch)
         }
         fn state(&self) -> PathBuf {
             self.0.join("state")

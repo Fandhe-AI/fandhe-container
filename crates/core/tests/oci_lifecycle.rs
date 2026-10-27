@@ -15,6 +15,9 @@
 //! Linux 限定のため、Linux 以外では create 成功後に start が `Unimplemented` で拒否されること（fail-closed。
 //! SEC-1・CLI-1）を確かめる。実機権限（root 等）は不要で、3 OS の既定のテスト集合で動く。
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -279,22 +282,27 @@ impl ProcessLauncher for RecordingLauncher {
 /// テストごとに一意な bundle ディレクトリ（`rootfs/` と `config.json` を持ち、終了時に削除）。
 struct Bundle {
     dir: PathBuf,
+    /// bundle の親（tmpfiles の flock 走査から守る。最後に drop される）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Bundle {
     fn ready(name: &str, config: &Value) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-core-lifecycle-it-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-lifecycle-it-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
         std::fs::create_dir_all(dir.join("rootfs")).expect("create bundle dir");
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_vec(config).expect("serialize"),
         )
         .expect("write config");
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn create_request(&self, id: &str) -> CreateRequest {

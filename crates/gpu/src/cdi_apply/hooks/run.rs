@@ -9,11 +9,13 @@
 use super::{CDI_HOOK_MAX_MOUNTINFO_BYTES, CdiCreateContainerHook, check_hook_stage_mountinfo};
 use crate::cdi_apply::{CdiApplyError, CdiApplyErrorCode as Code};
 use crate::sys;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -238,14 +240,120 @@ fn state_json(st: &CdiHookState, bundle: &str) -> String {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// フック 1 件分の最小 bundle（`config.json` のみ）。全経路で削除する。
-struct Bundle {
+/// bundle の作成先として検証し、ディレクトリ fd で固定した作業ディレクトリ（SEC-1・GPU-2）。
+///
+/// パスは `/` から 1 要素ずつ `O_NOFOLLOW` で辿り（`.` / `..` / symlink は拒否）、辿った各ディレクトリを
+/// fd に対して検査する。祖先は所有者が root かこのプロセスの uid で、group / other 書き込み不可
+/// （sticky 付きは可）、作成先自身は所有者が信用でき group / other 書き込み不可であること。以降の bundle の
+/// 作成・書き込み・削除はこの fd 起点で行い、パスの再解決による差し替え（改名・symlink 化）を受けない。
+struct WorkDir {
+    fd: OwnedFd,
+    /// 辿った正規のパス（hook の state に載せる表示用。操作には使わない）。
+    path: PathBuf,
+}
+
+impl WorkDir {
+    fn open(path: &Path) -> Result<Self, CdiApplyError> {
+        use std::path::Component;
+        let denied = || {
+            e(
+                Code::PermissionDenied,
+                "work_dir is not a trusted directory",
+            )
+        };
+        let missing = || {
+            e(
+                Code::InvalidArgument,
+                "work_dir must be an existing absolute path without symlinks",
+            )
+        };
+        if !path.is_absolute() {
+            return Err(e(
+                Code::InvalidArgument,
+                "work_dir must be an absolute path",
+            ));
+        }
+        let me = self_uid();
+        let mut names = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::RootDir => {}
+                Component::Normal(n) => {
+                    names.push(CString::new(n.as_bytes()).map_err(|_| missing())?)
+                }
+                _ => return Err(missing()),
+            }
+        }
+        let mut cur = OwnedFd::from(File::open("/").map_err(|_| missing())?);
+        let check = |fd: &OwnedFd, last: bool| -> Result<(), CdiApplyError> {
+            let m = File::from(fd.try_clone().map_err(|_| denied())?)
+                .metadata()
+                .map_err(|_| denied())?;
+            let ok = if last {
+                trusted_uid(m.uid(), me) && m.mode() & 0o022 == 0
+            } else {
+                dir_is_safe(m.uid(), m.mode(), me)
+            };
+            if m.is_dir() && ok {
+                Ok(())
+            } else {
+                Err(denied())
+            }
+        };
+        let total = names.len();
+        if total == 0 {
+            check(&cur, true)?;
+        } else {
+            check(&cur, false)?;
+        }
+        for (i, name) in names.iter().enumerate() {
+            cur = sys::open_dir_nofollow_at(cur.as_fd(), name).map_err(|_| missing())?;
+            check(&cur, i + 1 == total)?;
+        }
+        Ok(Self {
+            fd: cur,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// フック 1 件分の最小 bundle（`config.json` のみ）。作成・削除は [`WorkDir`] の fd 起点。全経路で削除する。
+struct Bundle<'a> {
+    work: &'a WorkDir,
+    name: CString,
+    /// bundle ディレクトリ自身の fd（`O_PATH`）。`config.json` の作成と中身の削除はこの fd 起点で行う。
+    fd: OwnedFd,
     dir: PathBuf,
     removed: bool,
 }
 
-impl Bundle {
-    fn create(work_dir: &Path, rootfs: &str) -> Result<Self, CdiApplyError> {
+/// 削除時に辿る最大の深さ（フックが深い木を作っても有界にする）。
+const REMOVE_MAX_DEPTH: usize = 16;
+
+/// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。
+fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
+    let rd = fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
+    for ent in rd {
+        let ent = ent.map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
+        let name = CString::new(ent.file_name().as_bytes()).map_err(|_| sys::SysError::Os(22))?;
+        let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir {
+            if depth >= REMOVE_MAX_DEPTH {
+                return Err(sys::SysError::Os(39)); // ENOTEMPTY
+            }
+            let child = sys::open_dir_nofollow_at(fd.as_fd(), &name)?;
+            remove_children(&child, depth + 1)?;
+            sys::unlink_at(fd.as_fd(), &name, true)?;
+        } else {
+            sys::unlink_at(fd.as_fd(), &name, false)?;
+        }
+    }
+    Ok(())
+}
+
+impl<'a> Bundle<'a> {
+    fn create(work: &'a WorkDir, rootfs: &str) -> Result<Self, CdiApplyError> {
         let err = || e(Code::Internal, "failed to prepare hook bundle");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -255,20 +363,29 @@ impl Bundle {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let dir = work_dir.join(name);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|_| err())?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| err())?;
+        sys::mkdir_at(work.fd.as_fd(), &cname, 0o700).map_err(|_| err())?;
+        let fd = match sys::open_dir_nofollow_at(work.fd.as_fd(), &cname) {
+            Ok(fd) => fd,
+            Err(_) => {
+                let _ = sys::unlink_at(work.fd.as_fd(), &cname, true);
+                return Err(err());
+            }
+        };
         let b = Self {
-            dir,
+            work,
+            name: cname,
+            fd,
+            dir: work.path.join(name),
             removed: false,
         };
+        // `O_PATH` のディレクトリ fd は /proc/self/fd 経由で辿れる。パスを再解決せず固定した bundle に作る。
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(b.dir.join("config.json"))
+            .custom_flags(sys::consts::O_NOFOLLOW)
+            .open(format!("/proc/self/fd/{}/config.json", b.fd.as_raw_fd()))
             .map_err(|_| err())?;
         f.write_all(config_json(rootfs).as_bytes())
             .map_err(|_| err())?;
@@ -277,8 +394,9 @@ impl Bundle {
     }
 
     /// 削除する。成功したときだけ `removed` を立て、失敗時は `Drop` が再試行する（config.json の残留を避ける）。
-    fn remove(&mut self) -> std::io::Result<()> {
-        let r = fs::remove_dir_all(&self.dir);
+    fn remove(&mut self) -> Result<(), sys::SysError> {
+        let r = remove_children(&self.fd, 0)
+            .and_then(|()| sys::unlink_at(self.work.fd.as_fd(), &self.name, true));
         if r.is_ok() {
             self.removed = true;
         }
@@ -286,10 +404,10 @@ impl Bundle {
     }
 }
 
-impl Drop for Bundle {
+impl Drop for Bundle<'_> {
     fn drop(&mut self) {
         if !self.removed {
-            let _ = fs::remove_dir_all(&self.dir);
+            let _ = self.remove();
         }
     }
 }
@@ -339,14 +457,30 @@ fn open_trusted_executable(path: &str) -> Result<File, CdiApplyError> {
     if !p.is_absolute() {
         return Err(denied());
     }
-    // O_NONBLOCK: 書き手のいない FIFO でも open が塞がらないようにする（REPAIR-5）。種別は取得した fd の
-    // fstat（`metadata`）で通常ファイルだけに絞る。通常ファイルでは O_NONBLOCK は読み書きに影響しない。
-    let mut f = OpenOptions::new()
+    // まず O_PATH で実体を固定する。O_PATH は中身を開かないので、デバイスならドライバの open は走らず、
+    // FIFO でも塞がらない（REPAIR-5）。最終要素の symlink は辿る（update-alternatives 等）が、種別は固定した
+    // fd の fstat で通常ファイルだけに絞り、下で正規化先との同一性も確かめる（SEC-1・GPU-2）。
+    let pinned = OpenOptions::new()
         .read(true)
-        .custom_flags(sys::consts::O_NONBLOCK)
+        .custom_flags(sys::consts::O_PATH)
         .open(p)
         .map_err(|err| map_io(&err))?;
+    let pm = pinned.metadata().map_err(|err| map_io(&err))?;
+    if !pm.is_file() {
+        return Err(denied());
+    }
+    // 通常ファイルと確認できた同じ実体を読み取り用に開き直す。O_NOCTTY で制御端末の取得を避け、
+    // O_NONBLOCK は通常ファイルでは読み書きに影響しない。
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(sys::consts::O_NOCTTY | sys::consts::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|err| map_io(&err))?;
+    drop(pinned);
     let m = f.metadata().map_err(|err| map_io(&err))?;
+    if (m.dev(), m.ino()) != (pm.dev(), pm.ino()) {
+        return Err(denied());
+    }
     let me = self_uid();
     if !m.is_file() || m.mode() & 0o111 == 0 || m.mode() & 0o022 != 0 || !trusted_uid(m.uid(), me) {
         return Err(denied());
@@ -507,7 +641,7 @@ fn run_one(
     stage: &CdiHookStage,
     st: &CdiHookState,
     h: &CdiCreateContainerHook,
-    work_dir: &Path,
+    work_dir: &WorkDir,
     index: usize,
     exe: &File,
 ) -> Result<CdiHookReport, RunFail> {
@@ -656,18 +790,26 @@ fn run_one(
 /// [`run_create_container_hooks_with_recorder`] へ渡すことで、所有者の信頼を保ったまま実行できる（GPU-2・SEC-5）。
 #[derive(Debug)]
 pub struct CdiHookExecutables {
-    files: Vec<File>,
+    entries: Vec<CdiHookExecutable>,
+}
+
+/// 検査時のフック定義と、その `path` から開いた実行ファイルの fd の組。定義と fd を分離させず、
+/// 実行時に渡されたフック定義との一致を確かめる（別集合・順序違いの受理を防ぐ。REPAIR-2・GPU-2）。
+#[derive(Debug)]
+struct CdiHookExecutable {
+    definition: CdiCreateContainerHook,
+    file: File,
 }
 
 impl CdiHookExecutables {
     /// 保持する実行ファイルの件数。
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.entries.len()
     }
 
     /// 件数が 0 か。
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -676,10 +818,13 @@ impl CdiHookExecutables {
 pub fn open_hook_executables(
     hooks: &[CdiCreateContainerHook],
 ) -> Result<CdiHookExecutables, CdiHookError> {
-    let mut files = Vec::with_capacity(hooks.len());
+    let mut entries = Vec::with_capacity(hooks.len());
     for (index, h) in hooks.iter().enumerate() {
         match open_trusted_executable(h.path()) {
-            Ok(f) => files.push(f),
+            Ok(file) => entries.push(CdiHookExecutable {
+                definition: h.clone(),
+                file,
+            }),
             Err(error) => {
                 return Err(CdiHookError {
                     index,
@@ -691,7 +836,7 @@ pub fn open_hook_executables(
             }
         }
     }
-    Ok(CdiHookExecutables { files })
+    Ok(CdiHookExecutables { entries })
 }
 
 /// フック 1 回の試行の計測値（REPAIR-4）。
@@ -723,6 +868,8 @@ impl CdiHookRunRecorder for NoopRecorder {
 
 /// 検証済みフックを集計順に直列実行する。最初の失敗で中止し、後続は起動しない（fail-closed）。
 /// `work_dir` は bundle を作る既存の絶対パスのディレクトリ（呼び出し元の一時領域。状態ルート配下を推奨）。
+/// symlink を含まず、作成先は所有者が root かこのプロセスの uid で group / other 書き込み不可、祖先も同様
+/// （sticky 付きは可）であること。満たさなければ実行前に拒否する（SEC-1）。
 /// ホストの環境変数は継承せず、フック指定の env だけを渡す。
 /// 実行ファイルはここで（呼び出しプロセスの資格情報で）検査する。rootless では
 /// [`open_hook_executables`] と [`run_create_container_hooks_with_recorder`] を使う。
@@ -736,7 +883,7 @@ pub fn run_create_container_hooks(
 }
 
 /// [`run_create_container_hooks`] に計測（REPAIR-4）と事前検査済みの実行ファイル（`exes`）を付けたもの。
-/// `exes` が `Some` の場合は件数が `hooks` と一致している必要があり、各フックの実行ファイルの検査は済んでいるものとして扱う。
+/// `exes` が `Some` の場合は、検査時のフック定義が `hooks` と添字ごとに完全一致している必要がある（不一致は実行前に拒否）。
 pub fn run_create_container_hooks_with_recorder(
     stage: &CdiHookStage,
     hooks: &[CdiCreateContainerHook],
@@ -762,13 +909,18 @@ pub fn run_create_container_hooks_with_recorder(
         }
     };
     let gate_started = Instant::now();
-    if !work_dir.is_absolute() {
-        return Err(gate_fail(
-            e(Code::InvalidArgument, "work_dir must be an absolute path"),
-            gate_started,
-        ));
-    }
-    if exes.is_some_and(|x| x.files.len() != hooks.len()) {
+    // bundle の作成先を検証して fd で固定する（以降の作成・削除はこの fd 起点。SEC-1・GPU-2）。
+    let work = match WorkDir::open(work_dir) {
+        Ok(w) => w,
+        Err(error) => return Err(gate_fail(error, gate_started)),
+    };
+    if exes.is_some_and(|x| {
+        x.entries.len() != hooks.len()
+            || x.entries
+                .iter()
+                .zip(hooks)
+                .any(|(en, h)| en.definition != *h)
+    }) {
         return Err(gate_fail(
             e(Code::InvalidArgument, "hook executables do not match hooks"),
             gate_started,
@@ -781,12 +933,12 @@ pub fn run_create_container_hooks_with_recorder(
     for (index, h) in hooks.iter().enumerate() {
         let started = Instant::now();
         let mut opened: Option<File> = None;
-        let exe = match exes.and_then(|x| x.files.get(index)) {
-            Some(f) => Ok(f),
+        let exe = match exes.and_then(|x| x.entries.get(index)) {
+            Some(en) => Ok(&en.file),
             None => open_trusted_executable(h.path()).map(|f| &*opened.insert(f)),
         };
         let outcome = match exe {
-            Ok(f) => run_one(stage, state, h, work_dir, index, f),
+            Ok(f) => run_one(stage, state, h, &work, index, f),
             Err(err) => Err((err, String::new(), None)),
         };
         match outcome {
@@ -824,7 +976,7 @@ mod tests {
     use super::*;
     use crate::cdi_apply::hooks::validate_create_container_hooks;
     use crate::cdi_spec::{EnvList, Hook};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     /// テスト用の一時ディレクトリ（`std::env::temp_dir` 配下に一意名。終了時に削除）。
     struct Tmp(PathBuf);
@@ -1063,7 +1215,8 @@ mod tests {
     #[test]
     fn bundle_drop_retries_after_failed_remove() {
         let t = Tmp::new("bundle");
-        let mut b = Bundle::create(&t.work(), "/r").unwrap();
+        let wd = WorkDir::open(&t.work()).unwrap();
+        let mut b = Bundle::create(&wd, "/r").unwrap();
         let dir = b.dir.clone();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
         let failed = b.remove().is_err();
@@ -1181,6 +1334,116 @@ mod tests {
         let err = open_trusted_executable(fifo.to_str().unwrap()).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// SEC-1・GPU-2: group 書き込み可の作成先、他者書き込み可（非 sticky）の祖先、symlink の作成先と祖先は
+    /// 実行前に拒否し、フックを起動せず bundle も作らない。
+    #[test]
+    fn untrusted_work_dir_is_rejected() {
+        let t = Tmp::new("wd");
+        let stage = CdiHookStage::for_test(&t.0);
+        let hooks = validate_create_container_hooks(&[mk_sh("exit 0", &["x"], &[], None)]).unwrap();
+        let run = |w: &Path| run_create_container_hooks(&stage, &hooks, &state(), w);
+
+        let loose = t.0.join("loose");
+        fs::DirBuilder::new().mode(0o700).create(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            run(&loose).unwrap_err().error.code(),
+            Code::PermissionDenied
+        );
+
+        let ancestor = t.0.join("anc");
+        let inner = ancestor.join("inner");
+        fs::DirBuilder::new().mode(0o700).create(&ancestor).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&inner).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            run(&inner).unwrap_err().error.code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(fs::read_dir(&inner).unwrap().count(), 0);
+
+        let real = t.work();
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(run(&link).unwrap_err().error.code(), Code::InvalidArgument);
+        assert_eq!(
+            run(&link.join("work")).unwrap_err().error.code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            run(&t.0.join("work/../work")).unwrap_err().error.code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            run(Path::new("relative")).unwrap_err().error.message(),
+            "work_dir must be an absolute path"
+        );
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+    }
+
+    /// SEC-1・GPU-2: 作成した bundle は固定した fd 起点で書かれ、作成後に作業ディレクトリのパスを別の場所へ
+    /// 差し替えても、元の bundle の削除は固定した実体に対して行われる。
+    #[test]
+    fn bundle_is_pinned_to_work_dir_fd() {
+        let t = Tmp::new("pin");
+        let wd = WorkDir::open(&t.work()).unwrap();
+        let mut b = Bundle::create(&wd, "/r").unwrap();
+        let moved = t.0.join("moved");
+        fs::rename(t.work(), &moved).unwrap();
+        let decoy = t.work();
+        assert_eq!(fs::read_dir(&decoy).unwrap().count(), 0);
+        b.remove().unwrap();
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    }
+
+    /// REPAIR-2・GPU-2: 事前検査済みの fd は検査時のフック定義と一体で、別集合・順序違いの定義へは使えない。
+    #[test]
+    fn executables_must_match_hook_definitions() {
+        let t = Tmp::new("bind");
+        let stage = CdiHookStage::for_test(&t.0);
+        let a = validate_create_container_hooks(&[
+            mk("/bin/true", &["t"], &[], None),
+            mk("/bin/false", &["f"], &[], None),
+        ])
+        .unwrap();
+        let exes = open_hook_executables(&a).unwrap();
+        let run = |hooks: &[CdiCreateContainerHook]| {
+            run_create_container_hooks_with_recorder(
+                &stage,
+                hooks,
+                Some(&exes),
+                &state(),
+                &t.work(),
+                &NoopRecorder,
+            )
+        };
+        let swapped: Vec<_> = a.iter().rev().cloned().collect();
+        let err = run(&swapped).unwrap_err();
+        assert_eq!(err.error.code(), Code::InvalidArgument);
+        assert_eq!(err.error.message(), "hook executables do not match hooks");
+        let other = validate_create_container_hooks(&[
+            mk("/bin/true", &["t"], &[], None),
+            mk("/bin/true", &["f"], &[], None),
+        ])
+        .unwrap();
+        assert_eq!(run(&other).unwrap_err().error.code(), Code::InvalidArgument);
+        let err = run(&a).unwrap_err();
+        assert_eq!(err.index, 1);
+        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
+    }
+
+    /// SEC-1・GPU-2: デバイスノードを指すパスは読み取り用に開かず（O_PATH で固定して種別を見る）拒否する。
+    #[test]
+    fn device_path_is_rejected() {
+        for dev in ["/dev/null", "/dev/zero", "/dev/tty"] {
+            if Path::new(dev).exists() {
+                let err = open_trusted_executable(dev).unwrap_err();
+                assert_eq!(err.code(), Code::PermissionDenied, "{dev}");
+            }
+        }
     }
 
     struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);

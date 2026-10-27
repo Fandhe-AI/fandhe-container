@@ -51,6 +51,7 @@ pub(crate) mod consts {
     pub const F_GETFL: i32 = 3;
     pub const F_SETFL: i32 = 4;
     pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_NOCTTY: i32 = 0o400;
 }
 
 /// 定数（aarch64。`O_DIRECTORY` / `O_NOFOLLOW` が x86_64 と異なる）。
@@ -68,6 +69,7 @@ pub(crate) mod consts {
     pub const F_GETFL: i32 = 3;
     pub const F_SETFL: i32 = 4;
     pub const O_NONBLOCK: i32 = 0o4_000;
+    pub const O_NOCTTY: i32 = 0o400;
 }
 
 /// 対応外アーキテクチャ。値は使われない（各ラッパーが `Unsupported` を返す）。
@@ -88,6 +90,7 @@ pub(crate) mod consts {
     pub const F_GETFL: i32 = 0;
     pub const F_SETFL: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
 }
 
 // SAFETY: 以下は libc（glibc / musl）が提供する POSIX 関数の宣言で、LP64 の x86_64 / aarch64 では
@@ -233,6 +236,7 @@ mod tests {
         assert_eq!(consts::S_IFCHR, 0o020_000);
         assert_eq!(consts::S_IFBLK, 0o060_000);
         assert_eq!(consts::S_IFIFO, 0o010_000);
+        assert_eq!(consts::O_NOCTTY, 0o400);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),

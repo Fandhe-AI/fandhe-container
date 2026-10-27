@@ -10,7 +10,7 @@
 //!
 //! - 各レイヤーのフック（seccomp / Landlock / マウント。TASK-41.2〜41.4）が組み立てた [`AuditRecord`] を
 //!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（`AuditSink` への適合は `FileAuditSink`〔#1594〕で実装済み）
-//! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840・#652（TASK-98.1・ERR-4 の共通ログ型）が再利用する
+//! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840。本体は非公開 DTO で、封筒（`event`）は共通ログ型 `logging::LogLine` が付ける（#3115・ERR-4）
 //! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は末尾で常在）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
 //! - [`AuditFileWriter::open`] は symlink・FIFO・他者所有・group/other 権限付きのファイルを拒否する。
@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::{AuditEvent, AuditRecord};
+use crate::logging::{self, LogEvent, LogLine, LogLineErrorKind};
 use crate::traits::ErrorCode;
 
 /// 書き込みロック取得の待ち時間上限（REPAIR-5: 無期限に待たない）。
@@ -147,7 +148,11 @@ impl Drop for TurnGuard<'_> {
 }
 
 /// 1 行（LF 含む）のバイト長上限。パス 4096 バイトの JSON エスケープ最大 6 倍＋固定部に収まる値。
-pub const AUDIT_LINE_MAX_BYTES: usize = 32 * 1024;
+///
+/// 値の定義元は [`logging::MAX_LOG_LINE_BYTES`] に一本化した（#3115・ERR-4）。共通ログ型は LF を除く
+/// 本体をこの値で縛り、監査は加えて LF 込みの長さを同じ値で縛る。そのため監査の実効上限は共通の上限より
+/// 1 バイト厳しい（既存の監査の上限を緩めないため）。
+pub const AUDIT_LINE_MAX_BYTES: usize = logging::MAX_LOG_LINE_BYTES;
 
 /// 監査書き込みエラーの分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,9 +168,9 @@ pub enum AuditWriteErrorKind {
     InsecureFile,
     /// ファイルを開けない（symlink 含む）。
     Open,
-    /// レコードをエンコードできない。
+    /// レコードをエンコードできない（共通ログ型の `Encode`: オブジェクトでない本体、LF / CR の防御検査）。
     Encode,
-    /// エンコード結果が [`AUDIT_LINE_MAX_BYTES`] を超えた。
+    /// エンコード結果が [`AUDIT_LINE_MAX_BYTES`] を超えた（共通ログ型の `TooLong` と、LF 込みの後段検査の両方）。
     LineTooLong,
     /// 書き込みに失敗した。
     Write,
@@ -320,10 +325,10 @@ impl fmt::Display for AuditWriteError {
 
 impl std::error::Error for AuditWriteError {}
 
-/// ワイヤー表現（非公開 DTO）。キー順はフィールド宣言順。
+/// ワイヤー表現（非公開 DTO。`LogLine` の本体）。キー順はフィールド宣言順で、先頭の `event` は封筒が付ける。
+/// 予約キー `level` / `event` を持たない（持つと重複キーになる。試験で検出する）。
 #[derive(Serialize)]
 struct AuditLineDto<'a> {
-    event: &'static str,
     layer: &'static str,
     ts_sec: u64,
     ts_nsec: u32,
@@ -356,10 +361,39 @@ struct AuditLineDto<'a> {
     container_id: Option<&'a str>,
 }
 
+/// 監査行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
+const AUDIT_EVENT: LogEvent = match LogEvent::from_static("audit") {
+    Some(e) => e,
+    None => panic!("invalid audit log event name"),
+};
+
+/// 本体を共通ログ型（level なし）で 1 行（LF 終端）にする。
+///
+/// 共通ログ型の `TooLong` / `Encode` を [`AuditWriteErrorKind`] へ写し、さらに LF 込みの長さを
+/// [`AUDIT_LINE_MAX_BYTES`] で縛る（共通ログ型は LF を除く本体だけを縛るため、1 バイト厳しい）。
+fn encode_audit_body<F: Serialize>(body: &F) -> Result<Vec<u8>, AuditWriteError> {
+    let line = logging::encode_json_line(&LogLine::new(AUDIT_EVENT, body)).map_err(|e| {
+        AuditWriteError::new(match e.kind() {
+            LogLineErrorKind::TooLong => AuditWriteErrorKind::LineTooLong,
+            _ => AuditWriteErrorKind::Encode,
+        })
+    })?;
+    if line.len() > AUDIT_LINE_MAX_BYTES {
+        return Err(AuditWriteError::new(AuditWriteErrorKind::LineTooLong));
+    }
+    Ok(line)
+}
+
 /// レコードを JSON 1 行（LF 終端）へエンコードする。
 ///
 /// 非 UTF-8 のパスは lossy 変換する（`Serialize for Path` は非 UTF-8 でエラーになるため使わない）。
+/// 出力は共通ログ型 `LogLine` 経由で、移行前とバイト列が同じ（#3115・ERR-4）。
 pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError> {
+    encode_audit_body(&audit_line_dto(record))
+}
+
+/// レコードをワイヤー表現（`LogLine` の本体）へ写す。
+fn audit_line_dto(record: &AuditRecord) -> AuditLineDto<'_> {
     let (syscall, path) = match record.event() {
         AuditEvent::Seccomp { syscall, .. } => (Some(syscall.get()), None),
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
@@ -374,8 +408,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
-    let dto = AuditLineDto {
-        event: "audit",
+    AuditLineDto {
         layer: record.event().layer().as_str(),
         ts_sec: ts.as_secs(),
         ts_nsec: ts.subsec_nanos(),
@@ -397,14 +430,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
             .and_then(|(_, l)| l)
             .map(|r| r.as_str()),
         container_id: record.container_id().map(|c| c.as_str()),
-    };
-    let mut line =
-        serde_json::to_vec(&dto).map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Encode))?;
-    line.push(b'\n');
-    if line.len() > AUDIT_LINE_MAX_BYTES {
-        return Err(AuditWriteError::new(AuditWriteErrorKind::LineTooLong));
     }
-    Ok(line)
 }
 
 /// 追記専用の監査ログファイル（主経路）。
@@ -1731,5 +1757,137 @@ mod tests {
         assert_eq!(err.kind, AuditWriteErrorKind::Lock);
         assert_eq!(queue.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全種別の代表レコード。ワイルドカード無しの match で、`AuditEvent` に種別を足すとここが落ちる。
+    fn every_kind() -> Vec<(&'static str, AuditEvent)> {
+        use crate::audit_log::{AuditReason, AuditSignal, ControlPeerRejection};
+        let events = vec![
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
+            },
+            AuditEvent::Landlock {
+                path: AuditPath::new("/etc/shadow"),
+                syscall: AuditSyscallNr::new(2).ok(),
+            },
+            AuditEvent::Mount {
+                path: Some(AuditPath::new("/m")),
+                reason: Some(AuditReason::new("rootfs_is_host_root")),
+            },
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p"),
+                reason: AuditReason::new("hash_mismatch"),
+            },
+            AuditEvent::PluginPeer {
+                path: AuditPath::new("/s"),
+                reason: AuditReason::new("plugin_peer_uid_mismatch"),
+            },
+            AuditEvent::ExecTarget {
+                reason: AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+            AuditEvent::Entrypoint {
+                reason: AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+            ControlPeerRejection::PeerUidMismatch.audit_event(),
+            AuditEvent::ExitSignal {
+                signal: AuditSignal::new(31).unwrap(),
+                target_pid: AuditPid::new(1234).unwrap(),
+            },
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill: Some(AuditReason::new("seccomp_kill_audit_unavailable")),
+                landlock: Some(AuditReason::new("landlock_audit_abi_too_old")),
+            },
+        ];
+        events
+            .into_iter()
+            .map(|e| {
+                let name = match &e {
+                    AuditEvent::Seccomp { .. } => "seccomp",
+                    AuditEvent::Landlock { .. } => "landlock",
+                    AuditEvent::Mount { .. } => "mount",
+                    AuditEvent::PluginTrust { .. } => "plugin_trust",
+                    AuditEvent::PluginPeer { .. } => "plugin_peer",
+                    AuditEvent::ExecTarget { .. } => "exec_target",
+                    AuditEvent::Entrypoint { .. } => "entrypoint",
+                    AuditEvent::ControlPeer { .. } => "control_peer",
+                    AuditEvent::ExitSignal { .. } => "exit_signal",
+                    AuditEvent::AuditCoverageDegraded { .. } => "audit_coverage",
+                };
+                (name, e)
+            })
+            .collect()
+    }
+
+    /// ERR-4・SEC-4・#3115: 全種別を網羅し、本体が予約キー `event` / `level` を持たない（重複キーを出さない）。
+    #[test]
+    fn err4_sec4_3115_body_has_no_reserved_keys() {
+        let kinds = every_kind();
+        let names: std::collections::BTreeSet<_> = kinds.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names.len(), 10);
+        for (name, e) in kinds {
+            for cid_opt in [None, Some(cid("c1"))] {
+                let mut r = rec(5, e.clone());
+                if let Some(c) = cid_opt {
+                    r = r.with_container_id(c);
+                }
+                let v = serde_json::to_value(audit_line_dto(&r)).unwrap();
+                let obj = v
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{name}: not an object"));
+                assert!(!obj.contains_key("event"), "{name}");
+                assert!(!obj.contains_key("level"), "{name}");
+                let line = text(&r);
+                assert!(
+                    line.starts_with("{\"event\":\"audit\",\"layer\":"),
+                    "{name}: {line}"
+                );
+                assert!(line.contains("\"container_id\":"), "{name}");
+            }
+        }
+    }
+
+    /// ERR-4・SEC-4・#3115: ControlPeer の行全体（移行前の出力の写し）。
+    #[test]
+    fn err4_sec4_3115_control_peer_exact_bytes() {
+        use crate::audit_log::ControlPeerRejection;
+        let r = rec(8, ControlPeerRejection::PeerUidMismatch.audit_event());
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"control_channel\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"control_peer_uid_mismatch\",\"container_id\":null}\n"
+        );
+        let r = rec(
+            8,
+            ControlPeerRejection::PeerCredentialsUnavailable.audit_event(),
+        )
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"control_channel\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"control_peer_credentials_unavailable\",\"container_id\":\"c1\"}\n"
+        );
+    }
+
+    #[derive(Serialize)]
+    struct Pad<'a> {
+        s: &'a str,
+    }
+
+    /// ERR-4・SEC-4・#3115: 行長の境界。LF 込みの上限は緩めない（本体 = MAX は拒否）。
+    #[test]
+    fn err4_sec4_3115_line_limit_boundary() {
+        assert_eq!(AUDIT_LINE_MAX_BYTES, crate::logging::MAX_LOG_LINE_BYTES);
+        let fixed = "{\"event\":\"audit\",\"s\":\"\"}".len();
+        let pad = |body_len: usize| "a".repeat(body_len - fixed);
+        let ok = encode_audit_body(&Pad {
+            s: &pad(AUDIT_LINE_MAX_BYTES - 1),
+        })
+        .unwrap();
+        assert_eq!(ok.len(), AUDIT_LINE_MAX_BYTES);
+        for n in [AUDIT_LINE_MAX_BYTES, AUDIT_LINE_MAX_BYTES + 1] {
+            let e = encode_audit_body(&Pad { s: &pad(n) }).unwrap_err();
+            assert_eq!(e.kind, AuditWriteErrorKind::LineTooLong, "{n}");
+        }
+        let e = encode_audit_body(&42u32).unwrap_err();
+        assert_eq!(e.kind, AuditWriteErrorKind::Encode);
     }
 }

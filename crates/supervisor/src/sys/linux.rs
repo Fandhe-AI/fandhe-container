@@ -16,6 +16,10 @@
 //!   配る。呼び出し元（`privilege::elevate`）が単一スレッドであることを確認してから使う。
 //! - 対応 arch は LP64 の x86_64・aarch64 のみ。その他では `capget` / `capset` の syscall 番号を持たず、
 //!   仮の番号を発行せず `Unsupported` を返す（fail-closed）。他 arch の番号を流用しない。
+//! - `syscall(2)` の宣言と、それを使う `capget` / `capset` / `execveat` / `close_range` は LP64 の x86_64・aarch64 に限る。
+//!   それ以外では宣言を持たず、capability / execveat は `Unsupported`、`close_fds_from` は `/proc/self/fd` の走査だけ
+//!   で閉じる（`compile_error!` にしない理由: 他の fail-closed と形を揃え、非 LP64 でも crate をビルドできる
+//!   ため。#3100・SUP-6・MVM-4）。
 //! - 制御チャネル用の FFI（`socket` / `connect` / `clock_gettime`・`Timespec`・`SockaddrUn`）は LP64 の x86_64・aarch64 でのみ
 //!   コンパイルし、それ以外は `Unsupported`（#2140）。
 //! - 引数はすべて整数または呼び出しの間有効なスタック上の `#[repr(C)]` 値で、`-1` 戻り時は直後に
@@ -64,10 +68,6 @@ mod arch {
     all(target_arch = "aarch64", target_pointer_width = "64")
 )))]
 mod arch {
-    #[cfg(test)]
-    pub(super) const SYS_CAPGET: Option<i64> = None;
-    pub(super) const SYS_CAPSET: Option<i64> = None;
-    pub(super) const SYS_EXECVEAT: Option<i64> = None;
     pub(super) const O_DIRECTORY: Option<i32> = None;
     pub(super) const O_NOFOLLOW: Option<i32> = None;
     pub(super) const SOL_SOCKET: Option<i32> = None;
@@ -87,16 +87,8 @@ const PR_CAPBSET_DROP: i32 = 24;
 const PR_CAP_AMBIENT: i32 = 47;
 const PR_CAP_AMBIENT_RAISE: u64 = 2;
 const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
-/// include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-/// `execveat(2)` の `AT_EMPTY_PATH`（include/uapi/linux/fcntl.h）。pathname が空のとき dirfd 自体を実行対象にする。
-const AT_EMPTY_PATH: i64 = 0x1000;
-/// `close_range(2)` の syscall 番号（全 arch 共通の統一番号表の値。Linux 5.9 以降）。
-const SYS_CLOSE_RANGE: i64 = 436;
 /// `fcntl(2)` の `F_GETFD`（fd が開いているかの確認に使う）。
 const F_GETFD: i32 = 1;
-/// execveat に渡す argv / envp の要素数の上限（無制限確保の防止）。
-const MAX_EXEC_VECTOR: usize = 4096;
 /// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
 const CAP_NUMBER_LIMIT: u8 = 64;
 
@@ -105,8 +97,6 @@ unsafe extern "C" {
     // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。可変長部は
     // `unsigned long`（LP64 で u64）に合わせて渡す。
     fn prctl(option: i32, ...) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で `long` は i64）。
-    fn syscall(number: i64, ...) -> i64;
     // SAFETY（宣言そのものの妥当性）: `int setgroups(size_t size, const gid_t *list)`（Linux の `gid_t` は u32）。
     fn setgroups(size: usize, list: *const u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int setresgid(gid_t rgid, gid_t egid, gid_t sgid)`。
@@ -162,22 +152,6 @@ pub(crate) struct PeerCredentials {
     pub(crate) gid: u32,
 }
 
-/// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
-#[repr(C)]
-struct CapUserHeader {
-    version: u32,
-    pid: i32,
-}
-
-/// `capget(2)` / `capset(2)` のデータ 1 語分（`struct __user_cap_data_struct`）。v3 は 2 要素の配列。
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapUserData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
-
 /// 呼び出したスレッドの capability（ビット位置は capability 番号。v3 の 2 語を 64 bit に束ねた値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ThreadCaps {
@@ -207,70 +181,6 @@ fn check_cap_number(cap: u8) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(22)); // EINVAL
     }
     Ok(())
-}
-
-fn split(v: u64) -> [u32; 2] {
-    // 下位 32 bit と上位 32 bit への分割（意図的な切り詰め）。
-    [(v & 0xffff_ffff) as u32, (v >> 32) as u32]
-}
-
-#[cfg(test)]
-fn join(lo: u32, hi: u32) -> u64 {
-    u64::from(lo) | (u64::from(hi) << 32)
-}
-
-/// 呼び出したスレッドの effective / permitted / inheritable を読む（pid 0 の `capget(2)`）。
-///
-/// 単体テストで `capset` のレイアウトと `/proc/self/status` の整合を照合するために使う。カーネルが v3 以外を
-/// 返したら `EINVAL` として fail-closed にする。
-#[cfg(test)]
-pub(crate) fn cap_get_thread() -> io::Result<ThreadCaps> {
-    let nr = arch::SYS_CAPGET.ok_or_else(unsupported)?;
-    let mut header = CapUserHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let mut data = [CapUserData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
-    // SAFETY: `header` と `data`（v3 が要求する 2 要素）はこの関数のスタック上の `#[repr(C)]` 値で、呼び出しの
-    // 間有効かつ排他的に借用されている。カーネルは `CapUserHeader` と `[CapUserData; 2]` の大きさだけ書く。
-    // 影響は呼び出したスレッドの読み取りのみ。
-    let rc = unsafe { syscall(nr, &raw mut header, data.as_mut_ptr()) };
-    check(rc)?;
-    if header.version != LINUX_CAPABILITY_VERSION_3 {
-        return Err(io::Error::from_raw_os_error(22)); // EINVAL
-    }
-    Ok(ThreadCaps {
-        effective: join(data[0].effective, data[1].effective),
-        permitted: join(data[0].permitted, data[1].permitted),
-        inheritable: join(data[0].inheritable, data[1].inheritable),
-    })
-}
-
-/// 呼び出したスレッドの effective / permitted / inheritable を設定する（pid 0 の `capset(2)`）。
-pub(crate) fn cap_set_thread(caps: ThreadCaps) -> io::Result<()> {
-    let nr = arch::SYS_CAPSET.ok_or_else(unsupported)?;
-    let header = CapUserHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let (e, p, i) = (
-        split(caps.effective),
-        split(caps.permitted),
-        split(caps.inheritable),
-    );
-    let data = [0usize, 1].map(|n| CapUserData {
-        effective: e.get(n).copied().unwrap_or(0),
-        permitted: p.get(n).copied().unwrap_or(0),
-        inheritable: i.get(n).copied().unwrap_or(0),
-    });
-    // SAFETY: `header` と `data`（v3 が要求する 2 要素）はスタック上の `#[repr(C)]` 値で、呼び出しの間有効。
-    // カーネルは読み取りのみ行う。資格情報の変更は呼び出したスレッドに限られ、メモリ安全性には影響しない。
-    let rc = unsafe { syscall(nr, &raw const header, data.as_ptr()) };
-    check(rc).map(|_| ())
 }
 
 /// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
@@ -378,48 +288,187 @@ pub(crate) fn set_resuid(real: u32, effective: u32, saved: u32) -> io::Result<()
     check(i64::from(rc)).map(|_| ())
 }
 
-/// 検証済みの実行ファイルの fd を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する（SUP-14・TASK-171 追補・#1719）。
-///
-/// パス文字列で検証して別途パスで exec する方式の TOCTOU を避けるため、呼び出し元が `fstat` で検証した fd をそのまま
-/// 渡す。成功時は戻らない。戻るのは失敗（`io::Error`）のときだけで、`Unsupported`（対応外 arch）・`EINVAL`
-/// （要素数の上限超過）を含む。`argv` / `envp` は NUL 終端済みの `CString` で受け、ポインタ配列は本関数内で組む。
-pub(crate) fn execveat_fd(fd: i32, argv: &[CString], envp: &[CString]) -> io::Result<()> {
-    let nr = arch::SYS_EXECVEAT.ok_or_else(unsupported)?;
-    if argv.len() > MAX_EXEC_VECTOR || envp.len() > MAX_EXEC_VECTOR {
-        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+/// `syscall(2)` を使う経路（capget / capset / execveat / close_range）。`syscall` の宣言が LP64（`long` が 64 bit）
+/// 前提のため、LP64 の x86_64・aarch64 でのみ宣言ごとコンパイルする。cfg は `libc_abi` の照合と同一にし、
+/// 宣言があるのに照合されないターゲットを作らない（#3100・SUP-6・MVM-4・REPAIR-12）。他ターゲットは下の
+/// スタブが `Unsupported` を返し、`close_fds_from` は `/proc/self/fd` の走査だけで閉じる。
+#[cfg(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    all(target_arch = "aarch64", target_pointer_width = "64")
+))]
+mod syscall_ffi {
+    use super::*;
+
+    /// include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
+    pub(super) const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    /// `execveat(2)` の `AT_EMPTY_PATH`（include/uapi/linux/fcntl.h）。pathname が空のとき dirfd 自体を実行対象にする。
+    pub(super) const AT_EMPTY_PATH: i64 = 0x1000;
+    /// `close_range(2)` の syscall 番号（全 arch 共通の統一番号表の値。Linux 5.9 以降）。
+    pub(super) const SYS_CLOSE_RANGE: i64 = 436;
+    /// execveat に渡す argv / envp の要素数の上限（無制限確保の防止）。
+    pub(super) const MAX_EXEC_VECTOR: usize = 4096;
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で `long` は i64）。この宣言は LP64 の x86_64・aarch64 でのみ
+        // コンパイルし、cfg は `libc_abi` と同一（#3100）。
+        pub(super) fn syscall(number: i64, ...) -> i64;
     }
-    let mut argv_ptrs: Vec<*const std::ffi::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
-    argv_ptrs.push(std::ptr::null());
-    let mut envp_ptrs: Vec<*const std::ffi::c_char> = envp.iter().map(|s| s.as_ptr()).collect();
-    envp_ptrs.push(std::ptr::null());
-    let empty = c"";
-    // SAFETY: `empty`・`argv_ptrs`・`envp_ptrs` と各 `CString` は呼び出しの間有効で、ポインタ配列は NULL 終端、
-    // 各要素は NUL 終端の C 文字列を指す。カーネルは読み取りのみ行う。成功時はプロセス像が置き換わって戻らず、
-    // 失敗時は何も変えずに -1 を返す（直後に errno を取る）。
-    let rc = unsafe {
-        syscall(
-            nr,
-            i64::from(fd),
-            empty.as_ptr(),
-            argv_ptrs.as_ptr(),
-            envp_ptrs.as_ptr(),
-            AT_EMPTY_PATH,
-        )
-    };
-    check(rc).map(|_| ())
+
+    /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
+    #[repr(C)]
+    pub(super) struct CapUserHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    /// `capget(2)` / `capset(2)` のデータ 1 語分（`struct __user_cap_data_struct`）。v3 は 2 要素の配列。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    pub(super) fn split(v: u64) -> [u32; 2] {
+        // 下位 32 bit と上位 32 bit への分割（意図的な切り詰め）。
+        [(v & 0xffff_ffff) as u32, (v >> 32) as u32]
+    }
+
+    #[cfg(test)]
+    pub(super) fn join(lo: u32, hi: u32) -> u64 {
+        u64::from(lo) | (u64::from(hi) << 32)
+    }
+
+    /// 呼び出したスレッドの effective / permitted / inheritable を読む（pid 0 の `capget(2)`）。
+    ///
+    /// 単体テストで `capset` のレイアウトと `/proc/self/status` の整合を照合するために使う。カーネルが v3 以外を
+    /// 返したら `EINVAL` として fail-closed にする。
+    #[cfg(test)]
+    pub(super) fn cap_get_thread() -> io::Result<ThreadCaps> {
+        let nr = arch::SYS_CAPGET.ok_or_else(unsupported)?;
+        let mut header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: `header` と `data`（v3 が要求する 2 要素）はこの関数のスタック上の `#[repr(C)]` 値で、呼び出しの
+        // 間有効かつ排他的に借用されている。カーネルは `CapUserHeader` と `[CapUserData; 2]` の大きさだけ書く。
+        // 影響は呼び出したスレッドの読み取りのみ。
+        let rc = unsafe { syscall(nr, &raw mut header, data.as_mut_ptr()) };
+        check(rc)?;
+        if header.version != LINUX_CAPABILITY_VERSION_3 {
+            return Err(io::Error::from_raw_os_error(22)); // EINVAL
+        }
+        Ok(ThreadCaps {
+            effective: join(data[0].effective, data[1].effective),
+            permitted: join(data[0].permitted, data[1].permitted),
+            inheritable: join(data[0].inheritable, data[1].inheritable),
+        })
+    }
+
+    /// 呼び出したスレッドの effective / permitted / inheritable を設定する（pid 0 の `capset(2)`）。
+    pub(crate) fn cap_set_thread(caps: ThreadCaps) -> io::Result<()> {
+        let nr = arch::SYS_CAPSET.ok_or_else(unsupported)?;
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let (e, p, i) = (
+            split(caps.effective),
+            split(caps.permitted),
+            split(caps.inheritable),
+        );
+        let data = [0usize, 1].map(|n| CapUserData {
+            effective: e.get(n).copied().unwrap_or(0),
+            permitted: p.get(n).copied().unwrap_or(0),
+            inheritable: i.get(n).copied().unwrap_or(0),
+        });
+        // SAFETY: `header` と `data`（v3 が要求する 2 要素）はスタック上の `#[repr(C)]` 値で、呼び出しの間有効。
+        // カーネルは読み取りのみ行う。資格情報の変更は呼び出したスレッドに限られ、メモリ安全性には影響しない。
+        let rc = unsafe { syscall(nr, &raw const header, data.as_ptr()) };
+        check(rc).map(|_| ())
+    }
+
+    /// 検証済みの実行ファイルの fd を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する（SUP-14・TASK-171 追補・#1719）。
+    ///
+    /// パス文字列で検証して別途パスで exec する方式の TOCTOU を避けるため、呼び出し元が `fstat` で検証した fd をそのまま
+    /// 渡す。成功時は戻らない。戻るのは失敗（`io::Error`）のときだけで、`Unsupported`（対応外 arch）・`EINVAL`
+    /// （要素数の上限超過）を含む。`argv` / `envp` は NUL 終端済みの `CString` で受け、ポインタ配列は本関数内で組む。
+    pub(crate) fn execveat_fd(fd: i32, argv: &[CString], envp: &[CString]) -> io::Result<()> {
+        let nr = arch::SYS_EXECVEAT.ok_or_else(unsupported)?;
+        if argv.len() > MAX_EXEC_VECTOR || envp.len() > MAX_EXEC_VECTOR {
+            return Err(io::Error::from_raw_os_error(22)); // EINVAL
+        }
+        let mut argv_ptrs: Vec<*const std::ffi::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const std::ffi::c_char> = envp.iter().map(|s| s.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+        let empty = c"";
+        // SAFETY: `empty`・`argv_ptrs`・`envp_ptrs` と各 `CString` は呼び出しの間有効で、ポインタ配列は NULL 終端、
+        // 各要素は NUL 終端の C 文字列を指す。カーネルは読み取りのみ行う。成功時はプロセス像が置き換わって戻らず、
+        // 失敗時は何も変えずに -1 を返す（直後に errno を取る）。
+        let rc = unsafe {
+            syscall(
+                nr,
+                i64::from(fd),
+                empty.as_ptr(),
+                argv_ptrs.as_ptr(),
+                envp_ptrs.as_ptr(),
+                AT_EMPTY_PATH,
+            )
+        };
+        check(rc).map(|_| ())
+    }
+
+    /// `first` 以降の fd をすべて閉じる（`close_range(first, !0, 0)`。Linux 5.9 以降）。`ENOSYS` のときは
+    /// `/proc/self/fd` を列挙して閉じる。継承 fd を supervisor へ渡さないために exec の前に呼ぶ。
+    pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの fd 表の縮小のみ。
+        let rc = unsafe { syscall(SYS_CLOSE_RANGE, i64::from(first), i64::from(u32::MAX), 0i64) };
+        match check(rc) {
+            Ok(_) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(38) => close_fds_from_proc(first), // ENOSYS
+            Err(e) => Err(e),
+        }
+    }
 }
 
-/// `first` 以降の fd をすべて閉じる（`close_range(first, !0, 0)`。Linux 5.9 以降）。`ENOSYS` のときは
-/// `/proc/self/fd` を列挙して閉じる。継承 fd を supervisor へ渡さないために exec の前に呼ぶ。
-pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
-    // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの fd 表の縮小のみ。
-    let rc = unsafe { syscall(SYS_CLOSE_RANGE, i64::from(first), i64::from(u32::MAX), 0i64) };
-    match check(rc) {
-        Ok(_) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(38) => close_fds_from_proc(first), // ENOSYS
-        Err(e) => Err(e),
+/// 非 LP64 向けのスタブ。仮の番号や食い違う ABI で `syscall(2)` を発行しない（fail-closed）。`close_fds_from` は
+/// `close(int)` だけを使う `/proc/self/fd` 経路で、ILP32 でも ABI が正しく、継承 fd を渡さない目的を満たす。
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    all(target_arch = "aarch64", target_pointer_width = "64")
+)))]
+mod syscall_ffi {
+    use super::*;
+
+    pub(crate) fn cap_set_thread(_caps: ThreadCaps) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn execveat_fd(_fd: i32, _argv: &[CString], _envp: &[CString]) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
+        close_fds_from_proc(first)
     }
 }
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    all(target_arch = "aarch64", target_pointer_width = "64")
+))]
+// 抑止理由: libc との照合試験（FFI 宣言の機械照合。MVM-4）が `super::*` 経由で syscall_ffi の
+// 定数・構造体・関数を参照する。通常ビルドでは再 export 済みの 3 関数以外は未使用になるため、
+// glob import の `unused_imports` だけを許す（LP64 以外では syscall_ffi ごと cfg で除外される）。
+#[allow(unused_imports)]
+use syscall_ffi::*;
+pub(crate) use syscall_ffi::{cap_set_thread, close_fds_from, execveat_fd};
 
 /// `close_range` が無いカーネル向けの代替。`/proc/self/fd` の列挙を先に集めてから閉じる（列挙中の fd を閉じない）。
 fn close_fds_from_proc(first: u32) -> io::Result<()> {
@@ -769,7 +818,7 @@ pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
 /// #1840・#1837・#1318・MVM-4・REPAIR-7・REPAIR-12。方式は docs/design/ffi-libc-check.md）。
 ///
 /// `libc` は dev-dependencies だけ（`libc` =0.2.189）で、製品コードの依存グラフは変わらない。
-/// 対象は本モジュールが対応する LP64 の x86_64・aarch64 に限る（`syscall(i64, ...)` が LP64 前提のため）。
+/// 対象は本モジュールが対応する LP64 の x86_64・aarch64 に限る（`syscall(i64, ...)` が LP64 前提のため、宣言自体も同じ cfg に限った。#3100）。
 /// 他の構成は `arch` が `None` を返す `Unsupported` の fail-closed で、照合する値が無い。
 /// `arch` の値と `libc` の値はどちらもターゲットの cfg で決まるため、同じ cfg の下で比べる（他ターゲットの値は流用しない）。
 ///
@@ -958,6 +1007,15 @@ mod tests {
         assert_eq!(PR_CAP_AMBIENT, 47);
         assert_eq!(PR_CAP_AMBIENT_RAISE, 2);
         assert_eq!(PR_CAP_AMBIENT_CLEAR_ALL, 4);
+    }
+
+    /// SUP-6・MVM-4・#3100: capability ABI のバージョン値（`syscall` 経路は LP64 限定）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup14_task171_1_3_capability_version_is_fixed() {
         assert_eq!(LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
     }
 
@@ -1117,6 +1175,10 @@ mod tests {
         assert_eq!(arch::SYS_CAPSET, Some(91));
     }
 
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
     #[test]
     fn sup14_task171_1_3_split_join_roundtrip() {
         assert_eq!(split(0x0000_0000_2820_1122), [0x2820_1122, 0]);
@@ -1159,9 +1221,18 @@ mod tests {
     #[test]
     fn sup14_task1719_launcher_constants_are_fixed() {
         assert_eq!(PR_SET_DUMPABLE, 4);
+        assert_eq!(F_GETFD, 1);
+    }
+
+    /// SUP-6・MVM-4・#3100: `syscall` 経由の定数は LP64 の x86_64・aarch64 だけで存在する。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup14_task1719_syscall_constants_are_fixed() {
         assert_eq!(AT_EMPTY_PATH, 0x1000);
         assert_eq!(SYS_CLOSE_RANGE, 436);
-        assert_eq!(F_GETFD, 1);
     }
 
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -1226,12 +1297,16 @@ mod tests {
         assert_eq!(e.raw_os_error(), Some(9));
     }
 
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
     #[test]
     fn sup14_task1719_execveat_rejects_oversized_vectors() {
         let argv = vec![CString::new("x").unwrap(); MAX_EXEC_VECTOR + 1];
         let e = execveat_fd(i32::MAX, &argv, &[]).unwrap_err();
-        // 対応 arch では EINVAL、対応外 arch では Unsupported。いずれも exec しない。
-        assert!(e.raw_os_error() == Some(22) || e.kind() == io::ErrorKind::Unsupported);
+        // LP64 の対応 arch 限定の試験。EINVAL で戻り、exec しない。
+        assert_eq!(e.raw_os_error(), Some(22));
     }
 
     #[test]

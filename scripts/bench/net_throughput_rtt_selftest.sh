@@ -84,9 +84,17 @@ mk "$stubs/hold" '
 [ "$1" = "--hold" ] && [ "$2" = "--max-secs" ] && [ -n "$3" ] || exit 2
 echo "hold start $3" >>"$SB_LOG/hold.log"
 [ "${SB_HOLD_NOREADY:-}" = 1 ] && exit 1
-ns="/proc/$$/ns/net"
-[ "${SB_HOLD_BADNS:-}" = 1 ] && ns="/proc/$$/ns/net;touch-evil"
-printf "{\"schema\":\"fandhe-container.net-hold/v1\",\"event\":\"ready\",\"provisional\":true,\"inner_pid\":%s,\"host_netns\":\"/proc/%s/ns/net\",\"host\":{\"bridge_addr\":\"10.214.0.1\",\"outer_addr\":\"10.214.1.1\"},\"containers\":[{\"id\":\"c1\",\"addr\":\"10.214.0.2\",\"netns\":\"%s\"},{\"id\":\"c2\",\"addr\":\"10.214.0.3\",\"netns\":\"/proc/%s/root/pin2\"}]}\n" "$$" "$$" "$ns" "$$"
+ip=$$
+if [ "${SB_HOLD_INNER:-}" = 1 ]; then
+  # 内部プロセス役: 別セッション・別プロセスグループのリーダー（外側グループの SIGKILL では届かない）
+  setsid sleep 300 &
+  ip=$!
+  echo "$ip" >"$SB_LOG/inner.pid"
+fi
+ns="/proc/$ip/ns/net"
+[ "${SB_HOLD_BADNS:-}" = 1 ] && ns="/proc/$ip/ns/net;touch-evil"
+printf "{\"schema\":\"fandhe-container.net-hold/v1\",\"event\":\"ready\",\"provisional\":true,\"inner_pid\":%s,\"host_netns\":\"/proc/%s/ns/net\",\"host\":{\"bridge_addr\":\"10.214.0.1\",\"outer_addr\":\"10.214.1.1\"},\"containers\":[{\"id\":\"c1\",\"addr\":\"10.214.0.2\",\"netns\":\"%s\"},{\"id\":\"c2\",\"addr\":\"10.214.0.3\",\"netns\":\"/proc/%s/root/pin2\"}]}\n" "$ip" "$ip" "$ns" "$ip"
+if [ "${SB_HOLD_STUCK:-}" = 1 ]; then exec sleep 300; fi
 read -r line || line=EOF
 echo "hold got $line" >>"$SB_LOG/hold.log"
 cl=ok
@@ -146,6 +154,7 @@ n64="$(printf '1%.0s' $(seq 1 64))"
 mk "$stubs/docker" '
 echo "docker $*" >>"$SB_LOG/docker.log"
 case "$1 $2" in
+  "context show") echo "${SB_DK_CONTEXT:-default}"; exit 0 ;;
   "image inspect") [ "${SB_DK_NOIMAGE:-}" = 1 ] && exit 1; exit 0 ;;
   "network create") for last; do :; done; echo "$last" >"$SB_LOG/netname"; echo "'"$n64"'"; exit 0 ;;
   "network rm") exit 0 ;;
@@ -154,11 +163,16 @@ esac
 case "$1" in
   version) echo "27.0.1" ;;
   run)
+    envv=""
     while [ $# -gt 0 ]; do
       if [ "$1" = "--cidfile" ]; then cid="$2"; fi
+      if [ "$1" = "--env" ]; then envv="$2"; fi
       shift
     done
-    if [ ! -e "$SB_LOG/c1.made" ]; then id='"$a64"'; : >"$SB_LOG/c1.made"; else id='"$b64"'; fi
+    if [ ! -e "$SB_LOG/c1.made" ]; then id='"$a64"'; fp=4242; : >"$SB_LOG/c1.made"; else id='"$b64"'; fp=4243; fi
+    # 偽の /proc: 実行トークン入りの environ（SB_DK_FOREIGN=1 は別の環境を持つ他人のプロセスを模す）
+    mkdir -p "$SB_PROC/$fp"
+    if [ "${SB_DK_FOREIGN:-}" = 1 ]; then printf "OTHER=1\0" >"$SB_PROC/$fp/environ"; else printf "%s\0" "$envv" >"$SB_PROC/$fp/environ"; fi
     printf "%s" "$id" >"$cid"; echo "$id" ;;
   inspect)
     nn=$(cat "$SB_LOG/netname"); pid=4243; ip=172.30.0.3
@@ -170,9 +184,11 @@ case "$1" in
 esac
 '
 
+export SB_PROC="$tmp_root/fakeproc"
+export FANDHE_NET_RTT_PROC_ROOT="$SB_PROC"
 reset_logs() {
-  rm -rf "$SB_LOG"
-  mkdir -p "$SB_LOG"
+  rm -rf "$SB_LOG" "$SB_PROC"
+  mkdir -p "$SB_LOG" "$SB_PROC"
 }
 
 common=(--probe "$stubs/probe" --iperf3 "$stubs/iperf3" --nsenter "$stubs/nsenter" --iperf-secs 1 --rtt-rounds 10 --rtt-warmup 1)
@@ -278,7 +294,25 @@ SB_DK_NOIMAGE=1 run_target "${common[@]}" "${dk_args[@]}" --target docker --tria
 if [ "$last_rc" -eq 1 ] && ! grep -q "^docker run" "$SB_LOG/docker.log"; then pass "イメージ無しは rc=1・pull も run もしない"; else fail "イメージ無し: rc=$last_rc"; fi
 expect_stderr "image-missing" "image-missing"
 
+# Docker のローカル検証・PID の帰属確認（資源を作る前に拒否する）
+reset_logs
+DOCKER_HOST=tcp://192.0.2.99:2375 run_target "${common[@]}" "${dk_args[@]}" --target docker --trials 1 --timeout 60
+if [ "$last_rc" -eq 1 ] && ! grep -q "^docker network create" "$SB_LOG/docker.log" 2>/dev/null; then pass "遠隔の DOCKER_HOST は資源作成前に rc=1"; else fail "遠隔 DOCKER_HOST: rc=$last_rc"; fi
+expect_stderr "docker-not-local の報告" "docker-not-local"
+reset_logs
+SB_DK_CONTEXT=remote run_target "${common[@]}" "${dk_args[@]}" --target docker --trials 1 --timeout 60
+if [ "$last_rc" -eq 1 ] && ! grep -q "^docker network create" "$SB_LOG/docker.log" 2>/dev/null; then pass "default 以外の context は資源作成前に rc=1"; else fail "遠隔 context: rc=$last_rc"; fi
+reset_logs
+SB_DK_FOREIGN=1 run_target "${common[@]}" "${dk_args[@]}" --target docker --trials 1 --timeout 60
+if [ "$last_rc" -eq 1 ] && ! grep -q "nsenter" "$SB_LOG/nsenter.log" 2>/dev/null; then pass "State.Pid が本人でなければ nsenter せず rc=1"; else fail "帰属確認: rc=$last_rc"; fi
+expect_stderr "docker-pid-not-ours の報告" "docker-pid-not-ours"
+
 # ---- 保持入口の異常系（rc=1）----
+reset_logs
+SB_HOLD_INNER=1 SB_HOLD_STUCK=1 run_target "${own_args[@]}" --trials 1 --timeout 60
+if [ "$last_rc" -eq 1 ]; then pass "解放後も終了しない保持入口は rc=1"; else fail "stuck hold: rc=$last_rc"; fi
+inner_pid="$(cat "$SB_LOG/inner.pid" 2>/dev/null || echo 0)"
+if [ "$inner_pid" -gt 1 ] && ! kill -0 "$inner_pid" 2>/dev/null; then pass "内部プロセスグループも回収される (pid $inner_pid)"; else fail "内部プロセスが残った (pid $inner_pid)"; kill -KILL "$inner_pid" 2>/dev/null || true; fi
 reset_logs
 SB_HOLD_BADCLEAN=1 run_target "${own_args[@]}" --trials 1 --timeout 60
 if [ "$last_rc" -eq 1 ]; then pass "cleanup が ok でない保持入口は rc=1"; else fail "badclean: rc=$last_rc"; fi

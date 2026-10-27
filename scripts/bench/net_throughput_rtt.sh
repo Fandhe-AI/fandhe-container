@@ -279,6 +279,8 @@ check_owner_perm() { # path allow_sticky_root
 work="$(mktemp -d)"
 servers=""
 hold_pid=""
+hold_inner_pid=""
+hold_inner_start=""
 hold_open=0
 docker_active=0
 docker_leftover=0
@@ -295,9 +297,45 @@ kill_servers() {
   servers=""
 }
 
+# /proc/<pid>/stat から "pgrp starttime state" を出す（comm に空白・括弧があっても最後の ") " 以降で切る）。
+proc_ident() {
+  local s f
+  s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  s="${s##*) }"
+  read -r -a f <<<"$s"
+  [ "${#f[@]}" -ge 20 ] || return 1
+  printf '%s %s %s' "${f[2]}" "${f[19]}" "${f[0]}"
+}
+# 保持入口の内部プロセス（unshare の子。launcher が別プロセスグループにするため外側グループの SIGKILL では届かない）が
+# ready 行で記録した本人か（pgrp が自身の PID・開始時刻が一致・ゾンビでない）。PID の再利用で他人を撃たないための照合。
+inner_ours() {
+  local pg st state
+  [ -n "$hold_inner_pid" ] || return 1
+  read -r pg st state <<<"$(proc_ident "$hold_inner_pid")" || return 1
+  [ "$pg" = "$hold_inner_pid" ] && [ "$st" = "$hold_inner_start" ] && [ "$state" != "Z" ]
+}
+# 内部プロセスグループを所有確認のうえ SIGKILL し、消えたことを期限つきで確かめる。消えなければ cleanup_bad。
+kill_inner() {
+  [ -n "$hold_inner_pid" ] || return 0
+  if inner_ours; then
+    local i=0
+    cleanup_bad=1
+    echo "net_throughput_rtt: hold inner process group $hold_inner_pid still alive; killing it" >&2
+    kill -KILL -- "-$hold_inner_pid" 2>/dev/null || true
+    while inner_ours && [ "$i" -lt 100 ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    if inner_ours; then
+      echo "net_throughput_rtt: hold inner process group $hold_inner_pid survived SIGKILL (manual cleanup needed)" >&2
+    fi
+  fi
+  hold_inner_pid=""
+}
+
 # 保持入口を解放する（fifo へ release を書き、released 行の cleanup が ok であることを照合する）。
 release_own() {
-  [ -n "$hold_pid" ] || return 0
+  [ -n "$hold_pid" ] || { kill_inner; return 0; }
   if [ "$hold_open" -eq 1 ]; then
     # 読み手（保持入口）が先に終了していると SIGPIPE で自分が死ぬため、サブシェルで PIPE を無視して書く。
     (
@@ -319,6 +357,7 @@ release_own() {
   fi
   wait "$hold_pid" 2>/dev/null || true
   hold_pid=""
+  kill_inner
   if ! tail -n 1 "$work/hold.out" 2>/dev/null | jq -e --arg s "$HOLD_SCHEMA" \
     '.schema == $s and .event == "released" and .cleanup == "ok"' >/dev/null 2>&1; then
     cleanup_bad=1
@@ -327,21 +366,39 @@ release_own() {
 }
 
 # 所有を証明できるもの（cidfile の ID・作成で得たネットワーク ID）だけを消し、ラベルで残りを確かめる。
-dk() { timeout --foreground --kill-after=5 60 "$docker_run" "$@"; }
+# 準備・計測中の docker 呼び出しは --timeout の残り時間で頭打ちにする（残りが無ければ 124 を返し何も実行しない。
+# 期限後に新しい資源を作らない。サブシェルで呼ばれても exit しないよう fail_measure は呼び出し側で行う）。
+dk() {
+  remaining
+  [ "$REM" -gt 0 ] || return 124
+  local cap=60
+  [ "$REM" -ge "$cap" ] || cap="$REM"
+  timeout --foreground --kill-after=5 "$cap" "$docker_run" "$@"
+}
+# 後始末の docker 呼び出しは全体期限と別の有限予算（合計 CLEAN_BUDGET 秒・1 回 30 秒まで）で行う。
+CLEAN_BUDGET=120
+clean_end=0
+dkc() {
+  local left=$((clean_end - SECONDS)) cap=30
+  [ "$left" -gt 0 ] || return 124
+  [ "$left" -ge "$cap" ] || cap="$left"
+  timeout --foreground --kill-after=5 "$cap" "$docker_run" "$@"
+}
 cleanup_docker() {
   [ "$docker_active" -eq 1 ] || return 0
   # 削除と残存確認が終わるまで active を保つ（途中の INT・TERM で on_exit から再入して続きを行えるようにする）
   local f id left
+  [ "$clean_end" -gt 0 ] || clean_end=$((SECONDS + CLEAN_BUDGET))
   for f in "$work"/c1.cid "$work"/c2.cid; do
     [ -s "$f" ] || continue
     id="$(head -c 128 "$f" 2>/dev/null || true)"
-    [[ "$id" =~ ^[0-9a-f]{64}$ ]] && dk rm -f "$id" >/dev/null 2>&1 || true
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]] && dkc rm -f "$id" >/dev/null 2>&1 || true
   done
   if [[ "$dk_net_id" =~ ^[0-9a-f]{12,64}$ ]]; then
-    dk network rm "$dk_net_id" >/dev/null 2>&1 || true
+    dkc network rm "$dk_net_id" >/dev/null 2>&1 || true
   fi
-  left="$(dk ps -a -q --filter "label=$dk_label" 2>/dev/null || echo UNKNOWN)"
-  left="$left$(dk network ls -q --filter "label=$dk_label" 2>/dev/null || echo UNKNOWN)"
+  left="$(dkc ps -a -q --filter "label=$dk_label" 2>/dev/null || echo UNKNOWN)"
+  left="$left$(dkc network ls -q --filter "label=$dk_label" 2>/dev/null || echo UNKNOWN)"
   if [ -n "$left" ]; then
     docker_leftover=1
     echo "net_throughput_rtt: docker resources with label $dk_label remain: $left" >&2
@@ -493,8 +550,14 @@ prepare_own() {
   hold_open=1
   cap_for 120
   wait_line "$work/hold.out" '"event":"ready"' "$CAP" "$hold_pid" || fail_measure "hold did not report ready: $(head -c 200 "$work/hold.err" 2>/dev/null | tr '\n' ' ')"
-  local ready
+  local ready ipid ist ipg
   ready="$(grep -m 1 '"event":"ready"' "$work/hold.out")"
+  # 検証より先に内部プロセスの身元（PID・開始時刻）を記録し、検証失敗の経路でも後始末で内部グループを回収できるようにする。
+  ipid="$(printf '%s' "$ready" | jq -r '.inner_pid | select(type == "number" and . > 1 and . == floor) | tostring' 2>/dev/null || true)"
+  if [[ "$ipid" =~ ^[1-9][0-9]{0,9}$ ]] && read -r ipg ist _ <<<"$(proc_ident "$ipid")" && [ "$ipg" = "$ipid" ]; then
+    hold_inner_pid="$ipid"
+    hold_inner_start="$ist"
+  fi
   printf '%s' "$ready" | jq -e --arg s "$HOLD_SCHEMA" '
     def safe: type == "string" and test("^[A-Za-z0-9/._-]+$");
     def ip: type == "string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$");
@@ -513,9 +576,17 @@ prepare_own() {
 }
 
 # ---- Docker 側の準備
+# 自己テスト専用: 偽の /proc の置き場所（既定は /proc）。
+PROC_ROOT="${FANDHE_NET_RTT_PROC_ROOT:-/proc}"
+PROC_TOK_VAR="FANDHE_NET_RTT_RUN"
 DK_C1NS="" DK_C2NS="" DK_C1IP="" DK_C2IP="" dk_version=""
 prepare_docker() {
   local tok
+  # 資源を作る前に、docker CLI がこのホストのローカルデーモンを指していることを確かめる（State.Pid をローカルの
+  # /proc の PID として使うため。DOCKER_HOST・DOCKER_CONTEXT・選択中の context が遠隔を指す構成を拒否する）。
+  case "${DOCKER_HOST:-}" in "" | unix://*) ;; *) fail_measure "docker-not-local: DOCKER_HOST=${DOCKER_HOST:0:64} is not a unix socket" ;; esac
+  case "${DOCKER_CONTEXT:-}" in "" | default) ;; *) fail_measure "docker-not-local: DOCKER_CONTEXT is not default" ;; esac
+  [ "$(dk context show 2>/dev/null | head -c 64 | tr -d '\n')" = "default" ] || fail_measure "docker-not-local: the selected docker context is not 'default'"
   tok="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   [[ "$tok" =~ ^[0-9a-f]{16}$ ]] || fail_measure "cannot create a run token"
   dk_label="fandhe.net-throughput.run=$tok"
@@ -525,9 +596,9 @@ prepare_docker() {
   local netname="fcnetbench-$tok" hold_secs=$((limit + 60))
   dk_net_id="$(dk network create --driver bridge --label "$dk_label" "$netname" 2>/dev/null | head -c 128 | tr -d '\n')" || true
   [[ "$dk_net_id" =~ ^[0-9a-f]{12,64}$ ]] || fail_measure "docker network create failed"
-  dk run -d --pull never --cidfile "$work/c1.cid" --network "$netname" --label "$dk_label" \
+  dk run -d --pull never --cidfile "$work/c1.cid" --network "$netname" --label "$dk_label" --env "$PROC_TOK_VAR=$tok" \
     -p "$host_addr:15201:5201/tcp" -p "$host_addr:18080:9080/tcp" "$image" sleep "$hold_secs" >/dev/null 2>&1 || fail_measure "docker run (c1) failed"
-  dk run -d --pull never --cidfile "$work/c2.cid" --network "$netname" --label "$dk_label" \
+  dk run -d --pull never --cidfile "$work/c2.cid" --network "$netname" --label "$dk_label" --env "$PROC_TOK_VAR=$tok" \
     "$image" sleep "$hold_secs" >/dev/null 2>&1 || fail_measure "docker run (c2) failed"
   local n info pid ip
   for n in 1 2; do
@@ -538,6 +609,9 @@ prepare_docker() {
     pid="$(printf '%s' "$info" | jq -r '.[0].State.Pid' 2>/dev/null || true)"
     ip="$(printf '%s' "$info" | jq -r --arg n "$netname" '.[0].NetworkSettings.Networks[$n].IPAddress' 2>/dev/null || true)"
     [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || fail_measure "invalid container pid for c$n"
+    # 取得した PID がこの実行で作った（今のホストの）コンテナ本人のものか、環境変数の実行トークンで確かめる。
+    tr '\0' '\n' <"$PROC_ROOT/$pid/environ" 2>/dev/null | grep -q -x -F -- "$PROC_TOK_VAR=$tok" ||
+      fail_measure "docker-pid-not-ours: pid $pid of c$n is not this run's container on this host"
     [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail_measure "invalid container address for c$n"
     if [ "$n" = 1 ]; then
       DK_C1NS="/proc/$pid/ns/net"

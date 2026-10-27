@@ -78,15 +78,17 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    LaunchAudit, PrePivotStatusError, read_exec_phase_until_close, read_line_bounded,
-    read_pre_pivot_status, resolve_exec_phase_status, resolve_pre_pivot_status,
+    ExecPhaseOutcome, ExecPhaseStep, LaunchAudit, PrePivotStatusError, read_exec_phase_until_close,
+    read_line_bounded, read_pre_pivot_status, read_pre_pivot_status_leaving_tail,
+    resolve_exec_phase_status, resolve_pre_pivot_status,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
 };
 use super::seccomp_listener::{
-    ListenerSender, SeccompListener, listener_socketpair, receive_listener,
+    ListenerReceiveFailure, ListenerSender, SeccompListener, listener_socketpair,
+    receive_listener_or_closed,
 };
 use super::{
     ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
@@ -751,13 +753,18 @@ fn launch_via_intermediate(
         }));
     }
 
-    let status = read_pre_pivot_status(&status_r, remaining());
+    // listener を受け取る経路(本番)は、後ろのバイト(Landlock 段の `E`)を取り込まない版で 1 行目を読む(#2130)。
+    let status = if with_listener {
+        read_pre_pivot_status_leaving_tail(&status_r, remaining())
+    } else {
+        read_pre_pivot_status(&status_r, remaining())
+    };
     match resolve_pre_pivot_status(status, audit) {
         Ok(()) if !with_listener => Ok(LaunchedChild {
             child,
             listener: None,
         }),
-        Ok(()) => match receive_listener(parent_end.as_fd(), pid1.get(), deadline) {
+        Ok(()) => match receive_listener_or_closed(parent_end.as_fd(), pid1.get(), deadline) {
             // listener を受け取って ACK を返した後に、PID 1 が書く exec 前の 2 行目(`R`/`E`)を読む(SEC-4・#2624)。
             // 順序の根拠: PID 1 は ACK を待ってからエントリポイントの検証へ進み、C は上の `P` の判定より前に listener を
             // 受け取らない。したがって 2 行目は `P` を読み終えた後にしか書かれず、2 行が 1 回の `read` に混ざらない。
@@ -772,12 +779,41 @@ fn launch_via_intermediate(
                 }
             }
             // 受け渡せなければ listener 無しで走らせない。PID 1 は ACK 待ちか既に終了しているため回収する。
-            Err(e) => Err(kill_pid1_failure(
+            // 送り手が閉じただけ(seccomp より前で子が終わった)なら、Landlock 段の失敗が状態 pipe の `E landlock ...`
+            // で照合の違反を運んでいないか読む(SEC-4・#2130)。何も無い・他の形・読み取り失敗のときは従来どおり
+            // 元の `ExecError` を記録なしで返す(拒否は覆さない。期限は入口の単一期限の残り)。
+            Err(f) => Err(kill_pid1_failure(
                 child,
-                AuditedRejection::not_applicable(e),
+                landlock_rejection_after_sender_closed(&f, &status_r, remaining(), audit),
             )),
         },
         Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
+    }
+}
+
+/// listener の送り手が閉じた失敗 `f` について、状態 pipe の Landlock 段の `E` 行を読み、照合の違反があれば層 `mount` に
+/// 1 件記録した拒否を返す(SEC-1・SEC-4・CORE-5・#2130)。`E landlock` 以外(何も無い・`R`・他の段・形式違反・期限切れ)は
+/// `f.error` を `not_applicable` で返す(従来の挙動。記録の失敗や読み取りの失敗で拒否は覆らない)。
+fn landlock_rejection_after_sender_closed(
+    f: &ListenerReceiveFailure,
+    status_r: &std::fs::File,
+    timeout: Duration,
+    audit: LaunchAudit<'_>,
+) -> AuditedRejection<ExecError> {
+    let fallback = || AuditedRejection::not_applicable(f.error.clone());
+    if !f.sender_closed {
+        return fallback();
+    }
+    match read_exec_phase_until_close(status_r, timeout) {
+        Ok(
+            outcome @ ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::Landlock,
+                ..
+            },
+        ) => resolve_exec_phase_status(Ok(outcome), audit)
+            .err()
+            .map_or_else(fallback, |r| *r),
+        _ => fallback(),
     }
 }
 
@@ -1898,6 +1934,11 @@ mod tests {
         ExecReadyThenSleep,
         /// `P` を報告して何も送らずに終了する(EOF で即時に失敗するはず)。
         NoSend,
+        /// `P` を報告し、listener を送らずに Landlock 段の照合の違反 `E landlock ... landlock_mount_not_root` を書いて
+        /// 終了する(seccomp より前の Landlock 段の失敗。SEC-4・#2130)。
+        LandlockViolation,
+        /// 上と同じだが、違反の理由なしの `E landlock UNIMPLEMENTED -` を書く(記録されない)。
+        LandlockWithoutReason,
         /// listener ではない fd(pipe)を送る(種別の不一致)。
         WrongFd,
         /// PID 1 ではなく中間プロセスが listener を送る(送信元 pid の不一致)。
@@ -2035,6 +2076,30 @@ mod tests {
                             0
                         }
                         Handoff::NoSend | Handoff::WrongSender => 0,
+                        Handoff::LandlockViolation => {
+                            let _ = report_exec_failure(
+                                s,
+                                ExecPhaseStep::Landlock,
+                                &ExecError::from_violation_at(
+                                    ViolationReason::LandlockMountNotRoot,
+                                    None,
+                                    IsolationStage::Landlock,
+                                ),
+                            );
+                            0
+                        }
+                        Handoff::LandlockWithoutReason => {
+                            let _ = report_exec_failure(
+                                s,
+                                ExecPhaseStep::Landlock,
+                                &ExecError::new(
+                                    ErrorCode::Unimplemented,
+                                    IsolationStage::Landlock,
+                                    "unavailable",
+                                ),
+                            );
+                            0
+                        }
                         Handoff::ReportBusy => {
                             sender.report_failure(&ExecError::new(
                                 ErrorCode::FailedPrecondition,
@@ -2247,6 +2312,67 @@ mod tests {
         assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
         assert!(failure.unreaped.is_empty());
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// SEC-4・SEC-1・CORE-5・#2130: seccomp より前の Landlock 段の照合の違反は、listener の EOF に潰れず、層 `mount`・
+    /// 段 `landlock` の記録が 1 件残る。PID 1 は回収される。
+    #[test]
+    fn sec4_2130_launch_records_landlock_violation_after_sender_closed() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::LandlockViolation, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::Recorded
+        );
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Landlock);
+        assert_eq!(
+            failure
+                .rejection
+                .error
+                .violation
+                .as_ref()
+                .map(|v| v.reason.as_str()),
+            Some("landlock_mount_not_root")
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].layer(), crate::audit_log::AuditLayer::Mount);
+        assert_eq!(records[0].path(), None);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("landlock_mount_not_root")
+        );
+    }
+
+    /// SEC-4・#2130: 理由なしの Landlock 段の失敗は記録せず、段 `Landlock` の失敗のまま(`NotApplicable`)。
+    /// 何も書かずに終わった場合(`NoSend`)は従来の EOF 由来の `Internal`・段 `Seccomp` のまま記録なし。
+    #[test]
+    fn sec4_2130_landlock_failure_without_reason_and_silent_exit_are_not_recorded() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::LandlockWithoutReason, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert_eq!(failure.rejection.error.code, ErrorCode::Unimplemented);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Landlock);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+
+        let (result, _, _, records) = run_handoff_audited(Handoff::NoSend, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert!(records.is_empty());
     }
 
     /// SEC-4・#2024: listener 取得前の適用失敗(祖先に listener がある `EBUSY`)は EOF 由来の `Internal` に潰れず、

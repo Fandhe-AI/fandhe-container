@@ -425,9 +425,11 @@ fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
 /// `MountNotRoot`）は分離違反の試行なので、SEC-4 の構造化された違反理由（`ViolationReason::LandlockMount*`）を
 /// `violation` に載せる（段は `Landlock`）。
 ///
-/// 未実装（REPAIR-3）: この違反を親の `AuditSink` へ届ける配送経路。適用は pivot 後の子で行われ、子から親へ
-/// 違反を運ぶ経路が無い（`docs/design/audit-delivery.md` 8 章の配線状況。実装は #2023〜#2028・#2004、同種の欠落は
-/// #2013）。配送が入るまで、`violation` は呼び出し側が取り出せるが本番の sink には記録されない。
+/// 配送の状況（REPAIR-3）: launch 経路は配線済み（#2130）。適用は pivot 後の PID 1 で行われ、失敗した段が
+/// `run_child_then` で状態 pipe に `E landlock ...` を書き、親（`launch_intermediate`）が listener の EOF の後に
+/// 読んで層 `mount` へ 1 件記録する。**未実装**: 稼働中コンテナへの exec の再適用（`NotRecorded`）は
+/// Mount 由来のルールの識別子を照合しないため、`LandlockMountIdentityMismatch`・`LandlockMountNotRoot` は届かない
+/// （`LandlockMountNotReadOnly` は worker の経路で届く。#1917）。識別子の永続化と exec での照合は後続 issue。
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
     // 読み取り専用属性の照合の拒否は再適用（worker の経路。`NotRecorded`）でも生じるため、`EXEC_WORKER_REASONS` との
     // ソース照合（`violation_scan`）が字面で拾えるよう明示的に書く（CORE-5・SEC-4・#1917）。

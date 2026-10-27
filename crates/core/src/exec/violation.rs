@@ -545,6 +545,35 @@ impl ViolationReason {
     pub(super) const MOUNT_BINDS_USER_NAMESPACE_REASONS: [Self; 2] =
         [Self::UserNamespaceRequired, Self::HostRootIdentityMapping];
 
+    /// launch の Landlock 段（`ExecPhaseStep::Landlock`）が `E` 行で運ぶ、Mount 由来のルールの照合の違反の 3 理由
+    /// （SEC-1・SEC-4・CORE-5・#2130）。種別は `MountTarget` だが、他の段では受けないため
+    /// [`Self::from_launch_token`] には入れず、`launch_status` が段 `landlock` と組のときだけ引き直す。
+    /// 理由の集合の唯一の定義（`from_landlock_apply_kind` の分岐との一致は単体テストが固定する）。
+    pub(super) const LANDLOCK_APPLY_REASONS: [Self; 3] = [
+        Self::LandlockMountIdentityMismatch,
+        Self::LandlockMountNotRoot,
+        Self::LandlockMountNotReadOnly,
+    ];
+
+    /// launch の Landlock 段の `E` 行の理由コード `token` から理由を引き直す（許可リスト照合。untrusted な子の入力）。
+    pub(super) fn from_landlock_apply_token(token: &str) -> Option<Self> {
+        Self::LANDLOCK_APPLY_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == token)
+    }
+
+    /// launcher の `plan()` が拒否した理由（種別 `PlanRejected`）を、launch 経路で記録する `Mount` 監査イベントへ
+    /// 写す（パスなし・理由コードつき。SEC-4・SEC-1・#2130）。他の種別は `None`。
+    ///
+    /// [`Self::mount_layer_audit_event`] は `PlanRejected` を記録しない（#2109 の判断。exec の worker の経路が
+    /// 共有するため広げない）。launch の計画の拒否は launcher が親として直接記録するので、専用の写像に分ける。
+    pub(super) fn launch_plan_audit_event(self) -> Option<AuditEvent> {
+        (self.kind() == ViolationKind::PlanRejected).then(|| AuditEvent::Mount {
+            path: None,
+            reason: Some(AuditReason::new(self.as_str())),
+        })
+    }
+
     /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
     /// `Mount` 監査イベントを返す。それ以外の種別は `None`（#1701）。
     ///
@@ -1152,6 +1181,64 @@ pub(super) fn landlock_apply_violation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-4・CORE-5・#2130: Landlock 段の 3 理由の一覧は `from_landlock_apply_kind` の分岐と一致し、トークンから
+    /// 引き直せる。種別は `MountTarget` で、他の種別・未知のトークンは引き直さない。
+    #[test]
+    fn sec4_2130_landlock_apply_reasons_match_kind_mapping() {
+        use crate::landlock::LandlockApplyErrorKind as K;
+        let kinds = [
+            K::MountIdentityMismatch { index: 0 },
+            K::MountNotRoot { index: 0 },
+            K::MountNotReadOnly { index: 0 },
+        ];
+        let mapped: Vec<ViolationReason> = kinds
+            .iter()
+            .filter_map(ViolationReason::from_landlock_apply_kind)
+            .collect();
+        assert_eq!(mapped, ViolationReason::LANDLOCK_APPLY_REASONS.to_vec());
+        for r in ViolationReason::LANDLOCK_APPLY_REASONS {
+            assert_eq!(r.kind(), ViolationKind::MountTarget);
+            assert_eq!(
+                ViolationReason::from_landlock_apply_token(r.as_str()),
+                Some(r)
+            );
+        }
+        assert_eq!(
+            ViolationReason::from_landlock_apply_token("no_namespaces"),
+            None
+        );
+        assert_eq!(
+            ViolationReason::from_landlock_apply_token("entrypoint_is_runtime_binary"),
+            None
+        );
+        assert_eq!(ViolationReason::from_landlock_apply_token(""), None);
+    }
+
+    /// SEC-4・#2130: 計画の拒否(`PlanRejected`)だけが launch 専用の写像で `Mount`(パスなし・理由つき)になる。
+    /// 共有の写像(`launch_mount_audit_event` の `plan_rejected` の扱い)は変わらない(#2109 の判断)。
+    #[test]
+    fn sec4_2130_launch_plan_audit_event_maps_only_plan_rejected() {
+        for r in ViolationReason::ALL {
+            let ev = r.launch_plan_audit_event();
+            if r.kind() == ViolationKind::PlanRejected {
+                assert_eq!(
+                    ev,
+                    Some(AuditEvent::Mount {
+                        path: None,
+                        reason: Some(AuditReason::new(r.as_str())),
+                    }),
+                    "{r:?}"
+                );
+            } else {
+                assert_eq!(ev, None, "{r:?}");
+            }
+        }
+        assert_eq!(
+            ViolationReason::NoNamespaces.mount_layer_audit_event(None),
+            None
+        );
+    }
 
     /// `ALL` は `as_str` の全分岐を網羅する（足し忘れの検出。SEC-4・#1815）。
     #[test]

@@ -352,12 +352,62 @@ struct Bundle<'a> {
 
 /// 削除時に辿る最大の深さ（フックが深い木を作っても有界にする）。
 const REMOVE_MAX_DEPTH: usize = 16;
+/// 1 回の削除で扱う最大のエントリ数。残存した孫プロセスがエントリを作り続けても削除が終わるようにする。
+const REMOVE_MAX_ENTRIES: usize = 20_000;
+/// 1 回の削除の期限。
+const REMOVE_DEADLINE: Duration = Duration::from_secs(3);
 
-/// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。
-fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
+#[cfg(test)]
+thread_local! {
+    /// 試験用: 削除のエントリ数の上限を小さくする（0 は既定）。
+    static TEST_REMOVE_ENTRY_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 削除全体で共有する期限と件数の予算（REPAIR-5）。超過は `ETIMEDOUT` 相当の失敗として返す。
+struct RemoveBudget {
+    deadline: Instant,
+    left: usize,
+}
+
+impl RemoveBudget {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + REMOVE_DEADLINE,
+            left: Self::entry_limit(),
+        }
+    }
+
+    fn entry_limit() -> usize {
+        #[cfg(test)]
+        {
+            let l = TEST_REMOVE_ENTRY_LIMIT.with(std::cell::Cell::get);
+            if l != 0 {
+                return l;
+            }
+        }
+        REMOVE_MAX_ENTRIES
+    }
+
+    /// 1 エントリ分を消費する。期限切れ・件数超過はエラー。
+    fn charge(&mut self) -> Result<(), sys::SysError> {
+        if self.left == 0 || Instant::now() >= self.deadline {
+            return Err(sys::SysError::Os(110)); // ETIMEDOUT
+        }
+        self.left -= 1;
+        Ok(())
+    }
+}
+
+/// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。深さ・件数・時間のすべてに上限がある。
+fn remove_children(
+    fd: &OwnedFd,
+    depth: usize,
+    budget: &mut RemoveBudget,
+) -> Result<(), sys::SysError> {
     let rd = fs::read_dir(format!("/proc/thread-self/fd/{}", fd.as_raw_fd()))
         .map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
     for ent in rd {
+        budget.charge()?;
         let ent = ent.map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
         let name = CString::new(ent.file_name().as_bytes()).map_err(|_| sys::SysError::Os(22))?;
         let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
@@ -366,7 +416,7 @@ fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
                 return Err(sys::SysError::Os(39)); // ENOTEMPTY
             }
             let child = sys::open_dir_nofollow_at(fd.as_fd(), &name)?;
-            remove_children(&child, depth + 1)?;
+            remove_children(&child, depth + 1, budget)?;
             sys::unlink_at(fd.as_fd(), &name, true)?;
         } else {
             sys::unlink_at(fd.as_fd(), &name, false)?;
@@ -426,7 +476,8 @@ impl<'a> Bundle<'a> {
 
     /// 削除する。成功したときだけ `removed` を立て、失敗時は `Drop` が再試行する（config.json の残留を避ける）。
     fn remove(&mut self) -> Result<(), sys::SysError> {
-        let r = remove_children(&self.fd, 0)
+        // `Drop` の再試行も同じ有界の予算で行う（呼ぶたびに新しい予算）。
+        let r = remove_children(&self.fd, 0, &mut RemoveBudget::new())
             .and_then(|()| sys::unlink_at(self.work.fd.as_fd(), &self.name, true));
         if r.is_ok() {
             self.removed = true;
@@ -728,6 +779,26 @@ fn run_in_bundle(
     let state = state_json(st, &bundle_str);
     if state.len() > MAX_STATE_BYTES {
         return Err(bare(e(Code::ResourceExhausted, "hook state is too large")));
+    }
+
+    // フックへ渡す `bundle` はパスの文字列。bundle は保持した fd 起点で作ってあるため、パスが今も同じ実体を
+    // 指すこと（改名・overmount・祖先の差し替えが無いこと）を起動直前に確かめ、食い違えば起動しない。
+    let held = File::from(
+        bundle
+            .fd
+            .try_clone()
+            .map_err(|_| bare(e(Code::Internal, "failed to duplicate bundle fd")))?,
+    )
+    .metadata()
+    .map_err(|_| bare(e(Code::Internal, "failed to stat hook bundle")))?;
+    match fs::metadata(&bundle.dir) {
+        Ok(m) if (m.dev(), m.ino()) == (held.dev(), held.ino()) => {}
+        _ => {
+            return Err(bare(e(
+                Code::FailedPrecondition,
+                "hook bundle path no longer matches the pinned directory",
+            )));
+        }
     }
 
     let (arg0, rest) = h
@@ -1646,6 +1717,92 @@ mod tests {
         assert_eq!(err.completed.len(), 1);
         assert_eq!(err.completed[0].index, 0);
         assert!(!marker.exists());
+    }
+
+    /// REPAIR-5: 削除の件数・期限の予算を超えたら無期限に続けず失敗を返し、`removed` は立てない。
+    #[test]
+    fn bundle_remove_is_bounded_by_budget() {
+        let t = Tmp::new("budget");
+        let wd = CdiHookWorkDir::open(&t.work()).unwrap();
+        let mut b = Bundle::create(&wd, "/r").unwrap();
+        for i in 0..10 {
+            fs::write(b.dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        let mut over = RemoveBudget::new();
+        over.left = 3;
+        assert_eq!(
+            remove_children(&b.fd, 0, &mut over),
+            Err(sys::SysError::Os(110))
+        );
+        let mut late = RemoveBudget::new();
+        late.deadline = Instant::now();
+        assert_eq!(
+            remove_children(&b.fd, 0, &mut late),
+            Err(sys::SysError::Os(110))
+        );
+        assert!(!b.removed);
+        // 予算内なら残りも含めて消せる。
+        b.remove().unwrap();
+        assert!(b.removed);
+    }
+
+    /// REPAIR-5・GPU-2: フックが（残存する子を含め）多数のエントリを bundle に作って終了しても、削除は件数の
+    /// 予算で打ち切られ、`bundle_cleanup_failed` を立てて期限内に返る。
+    #[test]
+    fn runaway_entries_end_with_cleanup_failed() {
+        TEST_REMOVE_ENTRY_LIMIT.with(|l| l.set(50));
+        let t = Tmp::new("runaway");
+        let body = format!(
+            "{} i=0; while [ $i -lt 400 ]; do : > \"$b/f$i\"; i=$((i+1)); done; exit 0",
+            r#"IFS= read -r s; b=${s#*\"bundle\":\"}; b=${b%%\"*};"#
+        );
+        let hooks = validate_create_container_hooks(&[mk_sh(&body, &["h"], &[], None)]).unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let start = Instant::now();
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        TEST_REMOVE_ENTRY_LIMIT.with(|l| l.set(0));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(err.bundle_cleanup_failed);
+        assert_eq!(err.error.code(), Code::Internal);
+        // 後始末（予算を戻して回収）。
+        let dir = fs::read_dir(t.work())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// GPU-2・SEC-1: 事前に開いた作業ディレクトリが改名されると、state の bundle パスが別の場所を指すため、
+    /// フックを起動せずに拒否する。
+    #[test]
+    fn renamed_work_dir_is_rejected_before_launch() {
+        let t = Tmp::new("renamed");
+        let marker = t.0.join("ran");
+        let body = format!("touch {}", marker.display());
+        let hooks = validate_create_container_hooks(&[mk_sh(&body, &["h"], &[], None)]).unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let wd = open_hook_work_dir(&t.work()).unwrap();
+        let moved = t.0.join("moved");
+        fs::rename(t.work(), &moved).unwrap();
+        let err = run_create_container_hooks_with_recorder(
+            &stage,
+            &hooks,
+            None,
+            &state(),
+            &wd,
+            &NoopRecorder,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.error.message(),
+            "hook bundle path no longer matches the pinned directory"
+        );
+        assert!(!err.bundle_cleanup_failed);
+        assert!(!marker.exists());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
     }
 
     struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);

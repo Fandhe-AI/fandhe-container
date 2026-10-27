@@ -108,6 +108,9 @@ unsafe extern "C" {
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
     // 原型: `int fcntl(int fd, int cmd, ...)`。本モジュールは `F_GETFL`（引数なし）と `F_SETFL`（int 1 個）だけ使う。
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    // 原型: `int unshare(int flags)`。試験で呼び出しスレッドだけを別の mount namespace へ移すために使う。
+    #[cfg(test)]
+    fn unshare(flags: i32) -> i32;
 }
 
 fn last_error() -> SysError {
@@ -212,6 +215,16 @@ pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     }
     // SAFETY: 同上。`F_SETFL` の第 3 引数は int 値渡しで、直前に得たフラグに `O_NONBLOCK` を足しただけ。
     let r = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFL, flags | consts::O_NONBLOCK) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドを新しい mount namespace へ移す（`unshare(CLONE_NEWNS)`。CAP_SYS_ADMIN が要る）。試験専用。
+/// フック実行の前提状態がスレッド単位の namespace に結び付くことの確認に使う（GPU-2）。
+#[cfg(test)]
+pub(crate) fn unshare_mount_ns() -> Result<(), SysError> {
+    check_supported()?;
+    // SAFETY: 引数は値渡しのフラグ（`CLONE_NEWNS` = 0x20000。x86_64・aarch64 共通）だけでポインタを含まない。
+    let r = unsafe { unshare(0x0002_0000) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 

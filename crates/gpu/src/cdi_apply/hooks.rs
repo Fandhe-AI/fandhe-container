@@ -275,8 +275,9 @@ mod run;
 #[cfg(target_os = "linux")]
 pub use run::{
     CdiHookError, CdiHookExecutables, CdiHookReport, CdiHookResult, CdiHookRunRecorder,
-    CdiHookRunSample, CdiHookStage, CdiHookState, open_hook_executables,
-    run_create_container_hooks, run_create_container_hooks_with_recorder, verify_hook_stage,
+    CdiHookRunSample, CdiHookStage, CdiHookState, CdiHookWorkDir, open_hook_executables,
+    open_hook_work_dir, run_create_container_hooks, run_create_container_hooks_with_recorder,
+    verify_hook_stage,
 };
 
 #[cfg(test)]

@@ -100,7 +100,7 @@ impl CdiApplyError {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     pub(crate) const fn with_errno(mut self, errno: i32) -> Self {
         self.errno = Some(errno);
         self

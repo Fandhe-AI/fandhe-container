@@ -89,7 +89,9 @@ impl CdiHookStage {
 }
 
 fn current_mnt_ns() -> Result<String, CdiApplyError> {
-    fs::read_link("/proc/self/ns/mnt")
+    // `unshare(CLONE_NEWNS)` は呼び出しスレッドだけを移すため、スレッドグループ代表の `/proc/self` ではなく
+    // 呼び出しスレッドの `/proc/thread-self` を読む（core の thread_ns_link と同じ方式。GPU-2・SEC-1）。
+    fs::read_link("/proc/thread-self/ns/mnt")
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .ok_or_else(|| e(Code::Internal, "failed to read mount namespace id"))
@@ -120,7 +122,7 @@ pub fn verify_hook_stage(rootfs: &Path) -> Result<CdiHookStage, CdiApplyError> {
         ));
     }
     let mut text = String::new();
-    File::open("/proc/self/mountinfo")
+    File::open("/proc/thread-self/mountinfo")
         .and_then(|f| {
             f.take(CDI_HOOK_MAX_MOUNTINFO_BYTES as u64 + 1)
                 .read_to_string(&mut text)
@@ -246,13 +248,18 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// fd に対して検査する。祖先は所有者が root かこのプロセスの uid で、group / other 書き込み不可
 /// （sticky 付きは可）、作成先自身は所有者が信用でき group / other 書き込み不可であること。以降の bundle の
 /// 作成・書き込み・削除はこの fd 起点で行い、パスの再解決による差し替え（改名・symlink 化）を受けない。
-struct WorkDir {
+///
+/// rootless では user namespace に入ると、ホスト root 所有の祖先が overflow uid に見えて所有者検査が正規の
+/// 経路まで拒否する。そのため [`open_hook_work_dir`] を namespace に入る前（[`open_hook_executables`] と
+/// 同じ時点）に呼んで検証・固定し、この fd を実行側へ渡す。overflow uid を許可して検査を緩めることはしない。
+#[derive(Debug)]
+pub struct CdiHookWorkDir {
     fd: OwnedFd,
     /// 辿った正規のパス（hook の state に載せる表示用。操作には使わない）。
     path: PathBuf,
 }
 
-impl WorkDir {
+impl CdiHookWorkDir {
     fn open(path: &Path) -> Result<Self, CdiApplyError> {
         use std::path::Component;
         let denied = || {
@@ -317,9 +324,9 @@ impl WorkDir {
     }
 }
 
-/// フック 1 件分の最小 bundle（`config.json` のみ）。作成・削除は [`WorkDir`] の fd 起点。全経路で削除する。
+/// フック 1 件分の最小 bundle（`config.json` のみ）。作成・削除は [`CdiHookWorkDir`] の fd 起点。全経路で削除する。
 struct Bundle<'a> {
-    work: &'a WorkDir,
+    work: &'a CdiHookWorkDir,
     name: CString,
     /// bundle ディレクトリ自身の fd（`O_PATH`）。`config.json` の作成と中身の削除はこの fd 起点で行う。
     fd: OwnedFd,
@@ -353,7 +360,7 @@ fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
 }
 
 impl<'a> Bundle<'a> {
-    fn create(work: &'a WorkDir, rootfs: &str) -> Result<Self, CdiApplyError> {
+    fn create(work: &'a CdiHookWorkDir, rootfs: &str) -> Result<Self, CdiApplyError> {
         let err = || e(Code::Internal, "failed to prepare hook bundle");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -641,7 +648,7 @@ fn run_one(
     stage: &CdiHookStage,
     st: &CdiHookState,
     h: &CdiCreateContainerHook,
-    work_dir: &WorkDir,
+    work_dir: &CdiHookWorkDir,
     index: usize,
     exe: &File,
 ) -> Result<CdiHookReport, RunFail> {
@@ -813,6 +820,12 @@ impl CdiHookExecutables {
     }
 }
 
+/// bundle の作成先を（呼び出したプロセスの資格情報で）検証して fd で固定する。
+/// rootless では `unshare` / `clone` で user namespace に入る前に呼ぶ（GPU-2・SEC-1・SEC-5）。
+pub fn open_hook_work_dir(path: &Path) -> Result<CdiHookWorkDir, CdiApplyError> {
+    CdiHookWorkDir::open(path)
+}
+
 /// 各フックの実行ファイルを（呼び出したプロセスの資格情報で）検査して開く。
 /// rootless では `unshare` / `clone` で user namespace に入る前に呼ぶ。失敗時はその時点のフックの添字つき。
 pub fn open_hook_executables(
@@ -879,9 +892,22 @@ pub fn run_create_container_hooks(
     state: &CdiHookState,
     work_dir: &Path,
 ) -> CdiHookResult {
-    run_create_container_hooks_with_recorder(stage, hooks, None, state, work_dir, &NoopRecorder)
+    let work = match CdiHookWorkDir::open(work_dir) {
+        Ok(w) => w,
+        Err(error) => {
+            return Err(CdiHookError {
+                index: 0,
+                error,
+                stderr: String::new(),
+                completed: Vec::new(),
+                unreaped_pid: None,
+            });
+        }
+    };
+    run_create_container_hooks_with_recorder(stage, hooks, None, state, &work, &NoopRecorder)
 }
 
+/// `work` は [`open_hook_work_dir`] で事前に検証・固定した作成先（rootless では namespace 参加前に開く）。
 /// [`run_create_container_hooks`] に計測（REPAIR-4）と事前検査済みの実行ファイル（`exes`）を付けたもの。
 /// `exes` が `Some` の場合は、検査時のフック定義が `hooks` と添字ごとに完全一致している必要がある（不一致は実行前に拒否）。
 pub fn run_create_container_hooks_with_recorder(
@@ -889,7 +915,7 @@ pub fn run_create_container_hooks_with_recorder(
     hooks: &[CdiCreateContainerHook],
     exes: Option<&CdiHookExecutables>,
     state: &CdiHookState,
-    work_dir: &Path,
+    work: &CdiHookWorkDir,
     recorder: &dyn CdiHookRunRecorder,
 ) -> CdiHookResult {
     let mut done = Vec::with_capacity(hooks.len());
@@ -909,11 +935,6 @@ pub fn run_create_container_hooks_with_recorder(
         }
     };
     let gate_started = Instant::now();
-    // bundle の作成先を検証して fd で固定する（以降の作成・削除はこの fd 起点。SEC-1・GPU-2）。
-    let work = match WorkDir::open(work_dir) {
-        Ok(w) => w,
-        Err(error) => return Err(gate_fail(error, gate_started)),
-    };
     if exes.is_some_and(|x| {
         x.entries.len() != hooks.len()
             || x.entries
@@ -938,7 +959,7 @@ pub fn run_create_container_hooks_with_recorder(
             None => open_trusted_executable(h.path()).map(|f| &*opened.insert(f)),
         };
         let outcome = match exe {
-            Ok(f) => run_one(stage, state, h, &work, index, f),
+            Ok(f) => run_one(stage, state, h, work, index, f),
             Err(err) => Err((err, String::new(), None)),
         };
         match outcome {
@@ -1215,7 +1236,7 @@ mod tests {
     #[test]
     fn bundle_drop_retries_after_failed_remove() {
         let t = Tmp::new("bundle");
-        let wd = WorkDir::open(&t.work()).unwrap();
+        let wd = CdiHookWorkDir::open(&t.work()).unwrap();
         let mut b = Bundle::create(&wd, "/r").unwrap();
         let dir = b.dir.clone();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
@@ -1388,7 +1409,7 @@ mod tests {
     #[test]
     fn bundle_is_pinned_to_work_dir_fd() {
         let t = Tmp::new("pin");
-        let wd = WorkDir::open(&t.work()).unwrap();
+        let wd = CdiHookWorkDir::open(&t.work()).unwrap();
         let mut b = Bundle::create(&wd, "/r").unwrap();
         let moved = t.0.join("moved");
         fs::rename(t.work(), &moved).unwrap();
@@ -1415,7 +1436,7 @@ mod tests {
                 hooks,
                 Some(&exes),
                 &state(),
-                &t.work(),
+                &open_hook_work_dir(&t.work()).unwrap(),
                 &NoopRecorder,
             )
         };
@@ -1446,6 +1467,50 @@ mod tests {
         }
     }
 
+    /// GPU-2・SEC-1: namespace 識別子は呼び出しスレッドのもの（`/proc/thread-self`）で、別 namespace の証跡は
+    /// 再検証で拒否される。
+    #[test]
+    fn stage_is_bound_to_thread_mount_namespace() {
+        let t = Tmp::new("thns");
+        let own = CdiHookStage::for_test(&t.0);
+        own.recheck().unwrap();
+        let mut foreign = CdiHookStage::for_test(&t.0);
+        foreign.mnt_ns = "mnt:[1]".to_string();
+        let err = foreign.recheck().unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "hook stage was issued in another mount namespace"
+        );
+        // 別スレッドでは `/proc/thread-self` がそのスレッドの task を指す。
+        let tid_link = std::thread::spawn(|| fs::read_link("/proc/thread-self").unwrap())
+            .join()
+            .unwrap();
+        let main_link = fs::read_link("/proc/thread-self").unwrap();
+        assert_ne!(tid_link, main_link);
+    }
+
+    /// GPU-2・SEC-1: 呼び出しスレッドだけ `unshare(CLONE_NEWNS)` すると、移す前に発行した証跡の再検証は
+    /// そのスレッドで通らず、元のスレッドでは通る。
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN (e.g. `unshare -rm`) for unshare(CLONE_NEWNS)"]
+    fn stage_recheck_fails_after_unshare_in_thread() {
+        let t = Tmp::new("unsh");
+        let stage = CdiHookStage::for_test(&t.0);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                stage.recheck().unwrap();
+                sys::unshare_mount_ns().unwrap();
+                let err = stage.recheck().unwrap_err();
+                assert_eq!(err.code(), Code::FailedPrecondition);
+                println!("stage_recheck_fails_after_unshare_in_thread: ok");
+            })
+            .join()
+            .unwrap();
+        });
+        stage.recheck().unwrap();
+    }
+
     struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);
     impl CdiHookRunRecorder for Rec {
         fn record(&self, sample: CdiHookRunSample) {
@@ -1472,7 +1537,7 @@ mod tests {
             &hooks,
             Some(&exes),
             &state(),
-            &t.work(),
+            &open_hook_work_dir(&t.work()).unwrap(),
             &rec,
         )
         .unwrap_err();
@@ -1493,9 +1558,9 @@ mod tests {
         let err = run_create_container_hooks_with_recorder(
             &stage,
             &hooks,
-            None,
+            Some(&open_hook_executables(&hooks[..1]).unwrap()),
             &state(),
-            Path::new("relative"),
+            &open_hook_work_dir(&t.work()).unwrap(),
             &rec,
         )
         .unwrap_err();

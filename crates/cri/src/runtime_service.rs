@@ -99,6 +99,7 @@
 
 mod config_limits;
 mod container;
+mod record;
 mod runtime_config;
 
 use std::collections::hash_map::RandomState;
@@ -2760,6 +2761,27 @@ struct ValidatedRun {
     runtime_handler: &'static str,
 }
 
+/// `PodSandboxConfig` の metadata 必須・name 非空を検査する（`validate_sandbox_config` の前半）。
+fn check_sandbox_metadata(config: &PodSandboxConfig) -> Result<(), CriError> {
+    let metadata = config
+        .metadata
+        .as_ref()
+        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
+    if metadata.name.is_empty() {
+        return Err(CriError::invalid_argument(
+            "config.metadata.name is required",
+        ));
+    }
+    Ok(())
+}
+
+/// `PodSandboxConfig` の必須項目と上限を検証し、保持用に作り直す（RunPodSandbox と記録の復号が共有する。
+/// #2930・CRI-1・REPAIR-1・REPAIR-2）。
+fn validate_sandbox_config(config: PodSandboxConfig) -> Result<BoundedConfig, CriError> {
+    check_sandbox_metadata(&config)?;
+    BoundedConfig::new(config)
+}
+
 /// `RunPodSandbox` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
 ///
 /// 必須フィールドとハンドラを先に確かめ、最後に `config` のサイズ・件数を検証して保持用に作り直す
@@ -2770,21 +2792,14 @@ fn validate_run_request(req: v1::RunPodSandboxRequest) -> Result<ValidatedRun, C
         runtime_handler,
     } = req;
     let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
-    let metadata = config
-        .metadata
-        .as_ref()
-        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
-    if metadata.name.is_empty() {
-        return Err(CriError::invalid_argument(
-            "config.metadata.name is required",
-        ));
-    }
+    // metadata の必須検査は validate_sandbox_config と同じ順序（handler 照合より前）に保つ。
+    check_sandbox_metadata(&config)?;
     let runtime_handler = SUPPORTED_RUNTIME_HANDLERS
         .iter()
         .copied()
         .find(|supported| *supported == runtime_handler.as_str())
         .ok_or_else(|| CriError::invalid_argument("unknown runtime_handler"))?;
-    let config = BoundedConfig::new(config)?;
+    let config = validate_sandbox_config(config)?;
     Ok(ValidatedRun {
         config,
         runtime_handler,

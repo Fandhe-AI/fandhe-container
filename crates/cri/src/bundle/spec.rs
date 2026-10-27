@@ -170,6 +170,25 @@ pub struct ImageDefaults {
     pub resolved_image: Option<ResolvedImage>,
 }
 
+/// digest 参照として受ける条件（長さ上限・`@` を含む・制御文字なし）。
+///
+/// [`ResolvedImage::new`] と記録の復号（`runtime_service::record`。#2930・REPAIR-2）が同じ判定を使い、
+/// 復号側が不正値を黙って `None` に落とさず拒否できるようにする。
+pub(crate) fn is_valid_image_reference(r: &str) -> bool {
+    r.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
+        && r.contains('@')
+        && !r.chars().any(char::is_control)
+}
+
+/// タグとして受ける条件（空でない・長さ上限・`@` を含まない・制御文字なし）。
+/// [`ResolvedImage::with_tag`] と記録の復号（#2930）の共有。
+pub(crate) fn is_valid_image_tag(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
+        && !t.contains('@')
+        && !t.chars().any(char::is_control)
+}
+
 /// CreateContainer 時に解決したイメージ（#2831・CRI-2・OCI-1）。
 ///
 /// `ImageRootfsSource` が在庫（`ImageStore`）で解決した結果を `ImageDefaults` → `PreparedBundle` 経由で
@@ -187,11 +206,7 @@ impl ResolvedImage {
     /// 組み立てる。`reference`（`repo_digests[0]`）は長さ上限・制御文字なし・`@` を含むことを再検証し、
     /// 満たさなければ `None` に倒して image ID を返す側にする（在庫は検証済みなので通常は起きない。多層防御）。
     pub fn new(id: fandhe_container_oci::reference::Digest, reference: Option<String>) -> Self {
-        let reference = reference.filter(|r| {
-            r.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
-                && r.contains('@')
-                && !r.chars().any(char::is_control)
-        });
+        let reference = reference.filter(|r| is_valid_image_reference(r));
         Self {
             id,
             reference,
@@ -202,13 +217,13 @@ impl ResolvedImage {
     /// 長さ上限・制御文字なし・`@` を含まない・空でないことを再検証し、満たさなければ `None`（config の値を返す側）にする。
     #[must_use]
     pub fn with_tag(mut self, tag: Option<String>) -> Self {
-        self.tag = tag.filter(|t| {
-            !t.is_empty()
-                && t.len() <= crate::image_service::MAX_IMAGE_FIELD_BYTES
-                && !t.contains('@')
-                && !t.chars().any(char::is_control)
-        });
+        self.tag = tag.filter(|t| is_valid_image_tag(t));
         self
+    }
+    /// digest 参照（`repo_digests[0]`）。無ければ `None`（`image_ref` の image ID への代替をしない生の値。
+    /// sandbox・コンテナ記録の符号化〔`runtime_service::record`。#2930〕が往復のために使う）。
+    pub(crate) fn reference(&self) -> Option<&str> {
+        self.reference.as_deref()
     }
     /// 在庫のタグ（create 時のスナップショット）。
     pub fn tag(&self) -> Option<&str> {

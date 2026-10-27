@@ -344,6 +344,7 @@ name = "fandhe-container-guest-init"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-platform-macos",
+ "libc",
 ]
 
 [[package]]

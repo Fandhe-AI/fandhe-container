@@ -79,9 +79,11 @@
 //!   `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` / `nix` について
-//! `libc` は #86 で採用承認済みだが、自動運転下では「追加時点で新しい版があれば PR で
-//! 確認する」運用条件を満たせないため、`crates/io/src/sys.rs` と同じ流儀で `Cargo.toml`
-//! を変更せず必要最小限の `extern "C"` 宣言を自前で持つ（dependency-policy）。
+//! `sys` の本体は `libc` へ切り替えず、`crates/io/src/sys.rs` と同じ流儀で必要最小限の `extern "C"`
+//! 宣言を自前で持つ（#1318・dependency-policy）。`libc` は `cfg(unix)` の dev-dependencies で宣言の機械照合に
+//! だけ使う。照合の置き場所は、syscall 番号が各 arch の `consts` の `libc_abi`（#1847）、番号以外の定数が
+//! `libc_consts_checks!`（#1848）、構造体と関数の型が最上位の `libc_abi`・`sys/seccomp_notify.rs`・
+//! `sys/macos.rs`（#1849）。方式は `docs/design/ffi-libc-check.md`。`nix` は不採用。
 
 #![cfg(target_os = "linux")]
 

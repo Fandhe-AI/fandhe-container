@@ -108,6 +108,9 @@ unsafe extern "C" {
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
     // 原型: `int fcntl(int fd, int cmd, ...)`。本モジュールは `F_GETFL`（引数なし）と `F_SETFL`（int 1 個）だけ使う。
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    // 原型: `uid_t geteuid(void)`。引数なしで失敗しない。LP64 の Linux では `uid_t` = u32。
+    #[link_name = "geteuid"]
+    fn c_geteuid() -> u32;
     // 原型: `int unshare(int flags)`。試験で呼び出しスレッドだけを別の mount namespace へ移すために使う。
     #[cfg(test)]
     fn unshare(flags: i32) -> i32;
@@ -203,6 +206,13 @@ pub(crate) fn unlink_at(
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// このプロセスの実効 uid（`geteuid(2)`）。`/proc/self` の所有者は non-dumpable なプロセスで root になるため、
+/// 信用する所有者の判定（TASK-127.3・GPU-2・SEC-1）にはこちらを使う。
+pub(crate) fn geteuid() -> u32 {
+    // SAFETY: `geteuid` は引数を取らず、メモリに触れず、失敗しない。
+    unsafe { c_geteuid() }
+}
+
 /// `fd` を `O_NONBLOCK` にする（既存のステータスフラグは保つ）。createContainer フックの stdin / stderr の pipe を
 /// スレッド無しで有界に回すために使う（TASK-127.3・GPU-2・REPAIR-5）。フラグは open file description に付くため、
 /// 子が持つ反対側の端には影響しない。
@@ -260,6 +270,17 @@ mod tests {
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
             (0o40_000, 0o100_000)
         );
+    }
+
+    /// SEC-1: `geteuid` は、このプロセスが作ったファイルの所有者 uid と一致する（`/proc/self` の所有者に依らない）。
+    #[test]
+    fn geteuid_matches_created_file_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let d = tmp("uid");
+        let f = d.join("f");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(geteuid(), std::fs::metadata(&f).unwrap().uid());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2・REPAIR-5: `set_nonblocking` 後の空 pipe の read は WouldBlock、端を閉じると EOF になる。

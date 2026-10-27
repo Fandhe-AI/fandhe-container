@@ -39,10 +39,13 @@ pub struct CdiHookStage {
     rootfs: PathBuf,
     /// 発行時のプロセス ID（`CLONE_NEWPID` 内の値）。別プロセスへ持ち出した証跡を拒否する（GPU-2・REPAIR-2）。
     pid: u32,
-    /// 発行時の mount namespace の識別子（`/proc/self/ns/mnt` のリンク先）。
+    /// 発行時の mount namespace の識別子（`/proc/thread-self/ns/mnt` のリンク先）。
     mnt_ns: String,
     /// 実行直前に実 mountinfo で再検証するか（試験用の証跡だけ false）。
     recheck_mounts: bool,
+    /// 試験用: 立てると再検証が mount namespace の不一致で失敗する（先行フックが前提を壊した場面の模擬）。
+    #[cfg(test)]
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl CdiHookStage {
@@ -58,6 +61,7 @@ impl CdiHookStage {
             pid: std::process::id(),
             mnt_ns: current_mnt_ns().unwrap_or_default(),
             recheck_mounts: false,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -67,6 +71,13 @@ impl CdiHookStage {
             return Err(e(
                 Code::FailedPrecondition,
                 "hook stage was issued by another process",
+            ));
+        }
+        #[cfg(test)]
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(e(
+                Code::FailedPrecondition,
+                "hook stage was issued in another mount namespace",
             ));
         }
         if current_mnt_ns()? != self.mnt_ns {
@@ -97,7 +108,7 @@ fn current_mnt_ns() -> Result<String, CdiApplyError> {
         .ok_or_else(|| e(Code::Internal, "failed to read mount namespace id"))
 }
 
-/// 実際の `/proc/self/mountinfo` と `/` で前提（自己 bind 済み・proc 済み・pivot 前）を検証し、証跡を返す。
+/// 実際の `/proc/thread-self/mountinfo` と `/` で前提（自己 bind 済み・proc 済み・pivot 前）を検証し、証跡を返す。
 /// 逸脱時は `FailedPrecondition`（GPU-2）。
 pub fn verify_hook_stage(rootfs: &Path) -> Result<CdiHookStage, CdiApplyError> {
     let canon = fs::canonicalize(rootfs).map_err(|_| {
@@ -136,6 +147,8 @@ pub fn verify_hook_stage(rootfs: &Path) -> Result<CdiHookStage, CdiApplyError> {
         pid: std::process::id(),
         mnt_ns: current_mnt_ns()?,
         recheck_mounts: true,
+        #[cfg(test)]
+        poisoned: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -193,6 +206,9 @@ pub struct CdiHookError {
     pub completed: Vec<CdiHookReport>,
     /// kill 後も回収できなかった子の pid（あれば。追跡・手動回収用。REPAIR-5）。
     pub unreaped_pid: Option<u32>,
+    /// bundle（`config.json`）の後始末に失敗したか。真なら `error` は元の失敗理由のまま、作業ディレクトリに
+    /// 残留が有りうる（手動回収の対象。REPAIR-4）。
+    pub bundle_cleanup_failed: bool,
 }
 
 impl std::fmt::Display for CdiHookError {
@@ -339,7 +355,7 @@ const REMOVE_MAX_DEPTH: usize = 16;
 
 /// `fd` 直下を再帰的に消す（fd 起点。symlink は辿らず unlink する）。
 fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
-    let rd = fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+    let rd = fs::read_dir(format!("/proc/thread-self/fd/{}", fd.as_raw_fd()))
         .map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
     for ent in rd {
         let ent = ent.map_err(|err| sys::SysError::Os(err.raw_os_error().unwrap_or(5)))?;
@@ -360,7 +376,7 @@ fn remove_children(fd: &OwnedFd, depth: usize) -> Result<(), sys::SysError> {
 }
 
 impl<'a> Bundle<'a> {
-    fn create(work: &'a CdiHookWorkDir, rootfs: &str) -> Result<Self, CdiApplyError> {
+    fn create(work: &'a CdiHookWorkDir, rootfs: &str) -> Result<Self, (CdiApplyError, bool)> {
         let err = || e(Code::Internal, "failed to prepare hook bundle");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -370,13 +386,13 @@ impl<'a> Bundle<'a> {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let cname = CString::new(name.as_bytes()).map_err(|_| err())?;
-        sys::mkdir_at(work.fd.as_fd(), &cname, 0o700).map_err(|_| err())?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| (err(), false))?;
+        sys::mkdir_at(work.fd.as_fd(), &cname, 0o700).map_err(|_| (err(), false))?;
         let fd = match sys::open_dir_nofollow_at(work.fd.as_fd(), &cname) {
             Ok(fd) => fd,
             Err(_) => {
-                let _ = sys::unlink_at(work.fd.as_fd(), &cname, true);
-                return Err(err());
+                let cleanup_failed = sys::unlink_at(work.fd.as_fd(), &cname, true).is_err();
+                return Err((err(), cleanup_failed));
             }
         };
         let b = Self {
@@ -386,17 +402,25 @@ impl<'a> Bundle<'a> {
             dir: work.path.join(name),
             removed: false,
         };
-        // `O_PATH` のディレクトリ fd は /proc/self/fd 経由で辿れる。パスを再解決せず固定した bundle に作る。
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(sys::consts::O_NOFOLLOW)
-            .open(format!("/proc/self/fd/{}/config.json", b.fd.as_raw_fd()))
-            .map_err(|_| err())?;
-        f.write_all(config_json(rootfs).as_bytes())
-            .map_err(|_| err())?;
-        drop(f);
+        let mut b = b;
+        // `O_PATH` のディレクトリ fd は /proc/thread-self/fd 経由で辿れる。パスを再解決せず固定した bundle に作る。
+        let written = (|| {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(sys::consts::O_NOFOLLOW)
+                .open(format!(
+                    "/proc/thread-self/fd/{}/config.json",
+                    b.fd.as_raw_fd()
+                ))?;
+            f.write_all(config_json(rootfs).as_bytes())
+        })();
+        if written.is_err() {
+            // 作りかけの bundle を消す。消せなければ呼び出し側へ伝える。
+            let cleanup_failed = b.remove().is_err();
+            return Err((err(), cleanup_failed));
+        }
         Ok(b)
     }
 
@@ -436,9 +460,10 @@ fn trusted_uid(uid: u32, me: u32) -> bool {
     uid == 0 || uid == me
 }
 
-/// このプロセスの実効 uid（`/proc/self` の所有者。std だけで得る）。取れなければ root のみ信用する。
+/// このプロセスの実効 uid。`/proc/self` の所有者は non-dumpable なプロセスで root になるため使わず、
+/// `geteuid(2)` を使う（SEC-1・GPU-2）。
 fn self_uid() -> u32 {
-    fs::metadata("/proc/self").map_or(0, |m| m.uid())
+    sys::geteuid()
 }
 
 /// ディレクトリ 1 段の検査。所有者が信用でき、group / other の書き込み不可であること。
@@ -481,7 +506,7 @@ fn open_trusted_executable(path: &str) -> Result<File, CdiApplyError> {
     let mut f = OpenOptions::new()
         .read(true)
         .custom_flags(sys::consts::O_NOCTTY | sys::consts::O_NONBLOCK)
-        .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .open(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
         .map_err(|err| map_io(&err))?;
     drop(pinned);
     let m = f.metadata().map_err(|err| map_io(&err))?;
@@ -640,10 +665,15 @@ fn kill_and_reap(child: &mut std::process::Child) -> Result<(), CdiApplyError> {
     }
 }
 
-/// `run_one` の失敗: (分類, stderr 先頭, 未回収の子の pid)。
-type RunFail = (CdiApplyError, String, Option<u32>);
+/// `run_one` の失敗: (分類, stderr 先頭, 未回収の子の pid, bundle の後始末に失敗したか)。
+type RunFail = (CdiApplyError, String, Option<u32>, bool);
 
-/// 1 フックを実行する。失敗時は (エラー, stderr 先頭, 未回収の pid)。
+fn rf(error: CdiApplyError, stderr: String, pid: Option<u32>) -> RunFail {
+    (error, stderr, pid, false)
+}
+
+/// 1 フックを実行する。bundle は成功・失敗のどの経路でもここで削除し、削除の失敗は元の失敗理由を保ったまま
+/// 4 番目の要素（`bundle_cleanup_failed`）に反映する（握りつぶさない。REPAIR-4・SEC-1）。
 fn run_one(
     stage: &CdiHookStage,
     st: &CdiHookState,
@@ -652,7 +682,7 @@ fn run_one(
     index: usize,
     exe: &File,
 ) -> Result<CdiHookReport, RunFail> {
-    let bare = |x| (x, String::new(), None);
+    let bare = |x| rf(x, String::new(), None);
     // 検査した実体の fd を保持し、そのまま exec する（パスの再解決による差し替えを防ぐ）。
     // `try_clone` は F_DUPFD_CLOEXEC で fd 3 以上を返す。子の stdin / stdout / stderr（fd 0〜2）の付け替えで
     // 実行ファイルの fd が上書きされ、pipe や /dev/null を exec してしまうのを防ぐ。
@@ -667,7 +697,31 @@ fn run_one(
     }
     let rootfs = std::str::from_utf8(stage.rootfs.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "rootfs is not valid UTF-8")))?;
-    let mut bundle = Bundle::create(work_dir, rootfs).map_err(bare)?;
+    let mut bundle = Bundle::create(work_dir, rootfs)
+        .map_err(|(err, cleanup_failed)| (err, String::new(), None, cleanup_failed))?;
+    let result = run_in_bundle(h, st, index, exe, &bundle);
+    let cleaned = bundle.remove().is_ok();
+    match (result, cleaned) {
+        (Ok(report), true) => Ok(report),
+        (Ok(report), false) => Err((
+            e(Code::Internal, "failed to remove hook bundle"),
+            report.stderr,
+            None,
+            true,
+        )),
+        (Err((error, stderr, pid, _)), cleaned) => Err((error, stderr, pid, !cleaned)),
+    }
+}
+
+/// 作成済みの bundle でフックを起動して終了まで回す（bundle の削除は呼び出し側）。
+fn run_in_bundle(
+    h: &CdiCreateContainerHook,
+    st: &CdiHookState,
+    index: usize,
+    exe: File,
+    bundle: &Bundle<'_>,
+) -> Result<CdiHookReport, RunFail> {
+    let bare = |x| rf(x, String::new(), None);
     let bundle_str = std::str::from_utf8(bundle.dir.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "work_dir is not valid UTF-8")))?
         .to_string();
@@ -696,18 +750,15 @@ fn run_one(
     drop(exe);
     let mut child = match spawned {
         Ok(c) => c,
-        Err(err) => {
-            let _ = bundle.remove();
-            return Err(bare(map_io(&err)));
-        }
+        Err(err) => return Err(bare(map_io(&err))),
     };
     let pid = child.id();
 
     // 起動後の失敗は必ず子を kill して回収してから返す。回収できなければ pid を報告する。
     let abort = |child: &mut std::process::Child, err: CdiApplyError, tail: String| -> RunFail {
         match kill_and_reap(child) {
-            Ok(()) => (err, tail, None),
-            Err(reap) => (reap, tail, Some(pid)),
+            Ok(()) => rf(err, tail, None),
+            Err(reap) => rf(reap, tail, Some(pid)),
         }
     };
 
@@ -715,11 +766,7 @@ fn run_one(
     // 孫が pipe を保持しても取り残すスレッドが無い（REPAIR-5）。
     let mut io = match ChildIo::new(&mut child, state.into_bytes()) {
         Ok(io) => io,
-        Err(err) => {
-            let r = abort(&mut child, err, String::new());
-            let _ = bundle.remove();
-            return Err(r);
-        }
+        Err(err) => return Err(abort(&mut child, err, String::new())),
     };
 
     let deadline = Duration::from_secs(h.timeout_secs);
@@ -731,10 +778,9 @@ fn run_one(
                 if started.elapsed() >= deadline {
                     let reaped = kill_and_reap(&mut child);
                     let (tail, _) = io.finish();
-                    let _ = bundle.remove();
                     return Err(match reaped {
-                        Ok(()) => (e(Code::Timeout, "hook timed out"), tail, None),
-                        Err(err) => (err, tail, Some(pid)),
+                        Ok(()) => rf(e(Code::Timeout, "hook timed out"), tail, None),
+                        Err(err) => rf(err, tail, Some(pid)),
                     });
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -746,22 +792,14 @@ fn run_one(
                     String::new(),
                 );
                 let _ = io.finish();
-                let _ = bundle.remove();
                 return Err(r);
             }
         }
     };
     let elapsed = started.elapsed();
     let (stderr, io_closed) = io.finish();
-    if bundle.remove().is_err() {
-        return Err((
-            e(Code::Internal, "failed to remove hook bundle"),
-            stderr,
-            None,
-        ));
-    }
     if !io_closed {
-        return Err((
+        return Err(rf(
             e(
                 Code::Internal,
                 "hook stderr pipe is still open (a descendant holds it)",
@@ -777,12 +815,12 @@ fn run_one(
             elapsed,
             stderr,
         }),
-        Some(_) => Err((
+        Some(_) => Err(rf(
             e(Code::FailedPrecondition, "hook exited with failure"),
             stderr,
             None,
         )),
-        None => Err((
+        None => Err(rf(
             e(Code::FailedPrecondition, "hook was terminated by a signal"),
             stderr,
             None,
@@ -845,6 +883,7 @@ pub fn open_hook_executables(
                     stderr: String::new(),
                     completed: Vec::new(),
                     unreaped_pid: None,
+                    bundle_cleanup_failed: false,
                 });
             }
         }
@@ -901,6 +940,7 @@ pub fn run_create_container_hooks(
                 stderr: String::new(),
                 completed: Vec::new(),
                 unreaped_pid: None,
+                bundle_cleanup_failed: false,
             });
         }
     };
@@ -932,6 +972,7 @@ pub fn run_create_container_hooks_with_recorder(
             stderr: String::new(),
             completed: Vec::new(),
             unreaped_pid: None,
+            bundle_cleanup_failed: false,
         }
     };
     let gate_started = Instant::now();
@@ -953,6 +994,24 @@ pub fn run_create_container_hooks_with_recorder(
     }
     for (index, h) in hooks.iter().enumerate() {
         let started = Instant::now();
+        // 先行フックが mount を変える・隠す場合があるため、前提状態を各フックの起動直前に確かめ直す。
+        // 崩れていたらその添字で中断し、完了済みの報告を保つ（GPU-2・REPAIR-2）。
+        if let Err(error) = stage.recheck() {
+            recorder.record(CdiHookRunSample {
+                index,
+                error_code: Some(error.code()),
+                exit_code: None,
+                latency: started.elapsed(),
+            });
+            return Err(CdiHookError {
+                index,
+                error,
+                stderr: String::new(),
+                completed: done,
+                unreaped_pid: None,
+                bundle_cleanup_failed: false,
+            });
+        }
         let mut opened: Option<File> = None;
         let exe = match exes.and_then(|x| x.entries.get(index)) {
             Some(en) => Ok(&en.file),
@@ -960,7 +1019,7 @@ pub fn run_create_container_hooks_with_recorder(
         };
         let outcome = match exe {
             Ok(f) => run_one(stage, state, h, work, index, f),
-            Err(err) => Err((err, String::new(), None)),
+            Err(err) => Err(rf(err, String::new(), None)),
         };
         match outcome {
             Ok(r) => {
@@ -972,7 +1031,7 @@ pub fn run_create_container_hooks_with_recorder(
                 });
                 done.push(r);
             }
-            Err((error, stderr, unreaped_pid)) => {
+            Err((error, stderr, unreaped_pid, bundle_cleanup_failed)) => {
                 recorder.record(CdiHookRunSample {
                     index,
                     error_code: Some(error.code()),
@@ -985,6 +1044,7 @@ pub fn run_create_container_hooks_with_recorder(
                     stderr,
                     completed: done,
                     unreaped_pid,
+                    bundle_cleanup_failed,
                 });
             }
         }
@@ -1509,6 +1569,83 @@ mod tests {
             .unwrap();
         });
         stage.recheck().unwrap();
+    }
+
+    /// フックが bundle 内に消せない木（中身ありの 0500 ディレクトリ）を作る sh の前置き。
+    const STICKY_BUNDLE: &str = r#"IFS= read -r s; b=${s#*\"bundle\":\"}; b=${b%%\"*}; mkdir "$b/d"; : > "$b/d/f"; chmod 500 "$b/d"; "#;
+
+    /// 作った消せない木を戻して一時領域ごと消せるようにする。
+    fn unstick(t: &Tmp) {
+        for ent in fs::read_dir(t.work()).unwrap().flatten() {
+            let d = ent.path().join("d");
+            let _ = fs::set_permissions(&d, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// REPAIR-4・SEC-1: タイムアウト・異常終了・正常終了のどの経路でも、bundle の削除失敗は握りつぶさず
+    /// `bundle_cleanup_failed` に反映し、元の失敗理由（Timeout 等）は保つ。
+    #[test]
+    fn bundle_cleanup_failure_is_reported_on_every_path() {
+        if self_uid() == 0 {
+            return; // root は 0500 でも消せるため、この観測は非 root 前提（root 前提の環境では対象外）。
+        }
+        let cases: [(&str, Option<i64>, Code); 3] = [
+            ("exec sleep 30", Some(1), Code::Timeout),
+            ("exit 3", None, Code::FailedPrecondition),
+            ("exit 0", None, Code::Internal),
+        ];
+        for (tail, timeout, code) in cases {
+            let t = Tmp::new("cleanup");
+            let body = format!("{STICKY_BUNDLE}{tail}");
+            let hooks =
+                validate_create_container_hooks(&[mk_sh(&body, &["h"], &[], timeout)]).unwrap();
+            let stage = CdiHookStage::for_test(&t.0);
+            let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+            assert_eq!(err.error.code(), code, "{tail}");
+            assert!(err.bundle_cleanup_failed, "{tail}");
+            unstick(&t);
+        }
+        // 後始末に成功する通常の失敗では立たない。
+        let t = Tmp::new("cleanup-ok");
+        let hooks = validate_create_container_hooks(&[mk_sh("exit 3", &["h"], &[], None)]).unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert!(!err.bundle_cleanup_failed);
+    }
+
+    /// GPU-2・REPAIR-2: 先行フックが前提を壊した（証跡が無効になった）場合、後続フックは起動されず、
+    /// その添字で中断し、完了済みの報告を保つ。
+    #[test]
+    fn stage_is_rechecked_before_every_hook() {
+        struct Poison<'a>(&'a CdiHookStage);
+        impl CdiHookRunRecorder for Poison<'_> {
+            fn record(&self, _sample: CdiHookRunSample) {
+                self.0.poisoned.store(true, Ordering::SeqCst);
+            }
+        }
+        let t = Tmp::new("recheck");
+        let marker = t.0.join("second-ran");
+        let second = format!("touch {}", marker.display());
+        let hooks = validate_create_container_hooks(&[
+            mk_sh("exit 0", &["h1"], &[], None),
+            mk_sh(&second, &["h2"], &[], None),
+        ])
+        .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let err = run_create_container_hooks_with_recorder(
+            &stage,
+            &hooks,
+            None,
+            &state(),
+            &open_hook_work_dir(&t.work()).unwrap(),
+            &Poison(&stage),
+        )
+        .unwrap_err();
+        assert_eq!(err.index, 1);
+        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(err.completed.len(), 1);
+        assert_eq!(err.completed[0].index, 0);
+        assert!(!marker.exists());
     }
 
     struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);

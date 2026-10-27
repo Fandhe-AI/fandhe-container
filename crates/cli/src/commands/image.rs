@@ -1234,8 +1234,6 @@ mod tests {
         }
     }
 
-    /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。
-    #[cfg(unix)]
     /// REPAIR-4・OCI-1: 記録付きで開いたストアの `image ls` / `system df` が `oci.*` の操作を記録器へ入れる。
     #[test]
     fn repair4_recorded_store_feeds_oci_ops_into_recorder() {
@@ -1256,6 +1254,8 @@ mod tests {
         assert_eq!(get("oci.store.lock"), Some((2, 0)));
     }
 
+    /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。
+    #[cfg(unix)]
     #[test]
     fn cli1_oci7_sec1_store_root_mode_checks() {
         use std::os::unix::fs::PermissionsExt;

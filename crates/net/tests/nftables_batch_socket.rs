@@ -116,7 +116,7 @@ fn net3_dump_of_tables_and_rules_terminates_with_done() {
     let limit = Duration::from_secs(5);
 
     let started = Instant::now();
-    match socket.dump_table_names(NftFamily::Ipv4, "fandhe_net_", limit) {
+    match socket.dump_table_names(NftFamily::Ipv4, "fandhe_net_", 4096, limit) {
         Ok(names) => {
             // 取得できた名前はすべて検証済みの nft 名で、重複を含まない。
             let mut sorted: Vec<&str> = names.iter().map(NftName::as_str).collect();

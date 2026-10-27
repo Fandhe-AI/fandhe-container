@@ -314,14 +314,15 @@ impl NetlinkNetfilterSocket {
     ///
     /// 公開の前に他の状態ルートの `fandhe_net_*` テーブルを見つけるための入口。応答はカーネル由来の外部入力で、
     /// 接頭辞 `prefix` に一致するテーブルだけを返し（他者のテーブルは名前を検証せず読み飛ばす）、
-    /// 一致したものが復号できなければ `DataLoss`（fail-closed）。件数の上限は呼び出し側が掛ける
-    /// （応答の総量は `MAX_REPLY_BYTES` / `MAX_REPLY_MESSAGES` で既に上限がある）。`timeout` は順番待ちと
+    /// 一致したものが復号できなければ `DataLoss`（fail-closed）。総数の上限 `max_total`（接頭辞で絞る前の件数）を超えたら `ResourceExhausted`。
+    /// 一致したテーブル数の上限は呼び出し側が掛ける（応答の総量は `MAX_REPLY_BYTES` / `MAX_REPLY_MESSAGES` で既に上限がある）。`timeout` は順番待ちと
     /// 往復を通した全体の期限（REPAIR-5）。dump 中の変更（`NLM_F_DUMP_INTR`）は `FailedPrecondition`。
     /// seq の確保は [`Self::table_info`] と同じ（バッチ用の空間から取り、再利用しない）。
     pub fn dump_table_names(
         &self,
         family: NftFamily,
         prefix: &str,
+        max_total: usize,
         timeout: Duration,
     ) -> Result<Vec<NftName>, NetError> {
         let deadline = Deadline::after(timeout);
@@ -336,6 +337,14 @@ impl NetlinkNetfilterSocket {
             deadline.remaining(),
             |b| req.encode(b),
         )?;
+        // 接頭辞で絞る前の総数に上限を掛ける（他者のテーブルも数える。絞り込み後の件数では
+        // 総数の上限が効かないため）。
+        if reply.messages().len() > max_total {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many nftables tables in the dump reply",
+            ));
+        }
         let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWTABLE);
         let mut names = Vec::new();
         for m in reply.messages() {

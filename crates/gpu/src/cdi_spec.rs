@@ -1,8 +1,11 @@
 //! CDI spec（Container Device Interface）の YAML / JSON 読み込み基盤（TASK-126.1・GPU-1・MS-10）。
 //!
-//! NVIDIA Container Toolkit が生成する `/var/run/cdi/nvidia.yaml` 等を型付き構造体 [`CdiSpec`] へ
+//! CDI spec（デバイスの種類を問わない。ベンダーの生成ツールが `/etc/cdi`・`/var/run/cdi` に置くもの。
+//! NVIDIA Container Toolkit の `nvidia.yaml` はその一例）を型付き構造体 [`CdiSpec`] へ
 //! デシリアライズするだけの層で、`fandhe-container-gpu` の他モジュール（TASK-126.2 の集計、
 //! TASK-126.3 の usr-merge パス正規化、TASK-127 以降の edits 適用）から入力として使われる。
+//!
+//! 非 GPU デバイスでの利用は GPU-9（検討中・#571 の判断待ち）の対象で、確定した対応範囲ではない。
 //!
 //! フィールド集合は CDI v1.1.x のもの（GPU-1）。v1.1.0 で `containerEdits.netDevices` と `intelRdt` の
 //! `schemata`・`enableMonitoring` が追加され、`enableCMT`・`enableMBM` が削除された。
@@ -52,7 +55,10 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
 
-/// 読み込みを許す CDI spec の最大バイト数（1 MiB）。実際の nvidia.yaml は数十 KiB 程度。
+/// 読み込みを許す CDI spec の最大バイト数（1 MiB）。
+///
+/// spec の種類に依らない入力の資源上限。例として実際の nvidia.yaml は数十 KiB 程度で、デバイス数・edits が
+/// 少ない非 GPU の spec（`crates/gpu/tests/fixtures/cdi-non-gpu-*.yaml` は 1 KiB 未満）にも十分足りる。
 pub const CDI_SPEC_MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 /// YAML の最大ネスト深さ。CDI spec の実際の深さは 7 程度。
@@ -791,7 +797,7 @@ fn stat_error() -> CdiSpecError {
 /// 固定済みハンドルの `/proc/self/fd/N` を読み取り用に開き直す。
 ///
 /// 対象ファイルの存在判定とは無関係なため、失敗は `NotFound` にせず常に `Internal` とする
-/// （`/proc` 欠落で実在する spec が不在扱いになり、呼び出し側が GPU 編集を飛ばすのを防ぐ。GPU-1）。
+/// （`/proc` 欠落で実在する spec が不在扱いになり、呼び出し側がそのデバイスの CDI 編集（deviceNodes・mounts・hooks 等）を適用せずに進むのを防ぐ。GPU-1）。
 #[cfg(all(
     target_os = "linux",
     any(

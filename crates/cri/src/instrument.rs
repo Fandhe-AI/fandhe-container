@@ -5,14 +5,15 @@
 //! 構造化ログへの出力は core の `OpRecorder` が担うが、cri は core へ依存しない（PLUG-1・CRI-7・CRI-8）
 //! ため、本モジュールが cri 内の型だけで完結するトレイトを定義する（`fandhe-container-net`・
 //! `fandhe-container-io` の `instrument` モジュールと同じ形）。core の記録器への接続は、core と cri の
-//! 両方に依存する上位 crate（`fandhe-container-plugin-cri`。TASK-108）に置く newtype アダプタが担い、
+//! 両方に依存し CRI の RPC を本番で呼ぶ crate（`fandhe-container-plugin-cri`。TASK-108）に置く newtype アダプタが担い
+//! （`docs/architecture.md` の「計装アダプタの配置」の原則）、
 //! `sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` / `sample.latency()` を
 //! `OpRecorder::record` へ写す。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
-//!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
+//! - core の `OpRecorder` との接続: 本番経路は plugin-cri の `CoreCriRecorder` を注入済み（TASK-108）。
+//!   記録先を注入しないコンストラクタの既定は [`NoopCriOpRecorder`] で、何も出力されない
 //! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報

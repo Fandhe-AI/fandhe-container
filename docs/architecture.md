@@ -260,6 +260,24 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | REPAIR-1 | 19 crate＋`benches` の workspace 構成（crate 分割の前提として本書冒頭の「crate 境界」節が参照する） | `ai-self-repair.md` | [crate-naming.md](design/crate-naming.md)（TASK-1.h1・#9） |
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |
 | SEC-4 | seccomp・Landlock の拒否の配送: ERRNO の 40 件は USER_NOTIF で supervisor が記録して EPERM で応答、KILL_PROCESS の 3 件はカーネル監査と終了シグナル（補助）、Landlock はカーネル監査（未対応なら縮退を明示）。確実な層は fail-closed・カーネル監査頼みは警告して続行・厳格モードは opt-in | `security-isolation.md` | [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。2026-10-15 オーナー決定・#2018。実装は #2023〜#2028・#2004） |
+| REPAIR-4・REPAIR-1・PLUG-1 の計装アダプタの配置 | 各 crate の計装トレイトを core の `OpRecorder` へつなぐアダプタは、その操作を本番で呼び `OpRecorder` を持つ crate に置く。計装だけのために依存辺は足さない | `ai-self-repair.md`・`plugin-system.md` | 本書の下の「計装アダプタの配置」・[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)（2026-10-12 オーナー決定。#1860） |
+
+### 計装アダプタの配置（REPAIR-4・REPAIR-1・PLUG-1）
+
+core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows`）は、自前の計装トレイト（`IoOpRecorder`・`NetOpRecorder`・`OciOpRecorder`・`CriOpRecorder`・`WinOpRecorder`）を持つ。これを core の `OpRecorder` へつなぐアダプタの置き場の原則は次のとおり（TASK-84 追補。2026-10-12 オーナー決定、[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)）。
+
+- 配置: アダプタは、その操作を本番で呼び、かつ `OpRecorder` を持っている crate に置く
+- 依存辺: 計装だけのために workspace 内の依存辺は足さない。機能上の辺（例: core → io の `VolumeProvider`、core → net の依存辺の採否（net の PLUG-1 区分は core 側ライブラリで確定済み））を入れる issue で、アダプタも一緒に入れる
+- 対象外: plugin の計装（`crates/plugin/src/lifecycle.rs` の observer）は、core 側の proxy を配線する場所で `OpRecorder` に渡す（[plugin-backend-wiring.md](design/plugin-backend-wiring.md)）
+- #653（TASK-98.2）は出力形式の統一で、配置とは独立。5 つのトレイトの統合は #653 の後に再検討する
+- 採らなかった案: cli か core に集める。計装のための辺が増えるため。core → net は net が core 側ライブラリに確定済みだが、依存辺の採否（向き・feature の切り方）が未決（#1870）
+
+現状の当てはめ（詳細の正は各 crate の `instrument` モジュールの doc）:
+
+- plugin-cri: `CoreCriRecorder`（cri）・`CoreNetRecorder`（net）・`CoreOciRecorder`（oci）
+- cli: `CliOciRecorder`（oci の `image ls` / `rm` / `tag`・`system df`）
+- io: 本番で io の write 経路を呼ぶ crate が無く、未配線
+- platform-windows: 本番の呼び出し元は plugin-windows だが core に依存せず、`OpRecorder` へは未接続（stderr の JSON 行に出している）
 
 ## 設計ドラフト（採否未決）
 

@@ -46,24 +46,28 @@
 //!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
-//! - 型付き expr は payload（load 形式）・masq・cmp・immediate・nat のみ。bitwise / meta は未実装（TASK-139）
+//! - 型付き expr は payload（load 形式）・masq・cmp・immediate・nat・bitwise（mask-xor 形式のみ。[`NftBitwise`]・#3060）・meta（load 形式のみ。[`NftMeta`]・#3060）。shift 等の bitwise・meta の set 形式は未実装
 //! - GETRULE dump によるハンドルの再照会・プロセス再起動後のハンドル復元。ハンドルは NEWRULE の
 //!   `NLM_F_ECHO` 応答（`RuleCreate::build_echo`。NET-3・#2839）からだけ取れる。詳細は各サブモジュールの doc
 //! - `NLA_F_NET_BYTEORDER` 付き属性のデコード（本エンコーダが出さないため現状は拒否。
 //!   GETRULE dump 等で必要になった時点で受理を検討する）
 
+mod bitwise;
 mod cmp;
 mod data;
 mod immediate;
 mod masq;
+mod meta;
 mod nat;
 mod payload;
 mod rule;
 
+pub use bitwise::*;
 pub use cmp::*;
 pub use data::*;
 pub use immediate::*;
 pub use masq::*;
+pub use meta::*;
 pub use nat::*;
 pub use payload::*;
 pub use rule::*;
@@ -776,5 +780,45 @@ mod tests {
                 let _ = NftRuleExprs::decode(attr);
             }
         }
+    }
+
+    /// NET-1・NET-11: masquerade の形（saddr のマスク照合 + 出口 interface 名の否定 + masq）が往復する。
+    #[test]
+    fn masquerade_shaped_rule_roundtrips() {
+        let reg = NftRegister::REG_1;
+        let payload = NftPayload::ipv4_saddr(reg).expect("payload");
+        let bitwise = NftBitwise::and_mask(
+            reg,
+            NftDataValue::new(&[0xff, 0xff, 0xff, 0x00]).expect("m"),
+        )
+        .expect("bitwise");
+        let net = NftCmp::eq(reg, NftDataValue::new(&[10, 88, 0, 0]).expect("n")).expect("cmp");
+        let meta = NftMeta::load(NftMetaKey::OifName, reg).expect("meta");
+        let mut ifname = [0u8; 16];
+        ifname[..7].copy_from_slice(b"br-test");
+        let not_bridge = NftCmp::new(
+            reg,
+            NftCmpOp::Neq,
+            NftDataValue::new(&ifname).expect("ifname"),
+        )
+        .expect("cmp");
+        let masq = NftMasq::new();
+        let r = rule(vec![
+            payload.to_expr().expect("e"),
+            bitwise.to_expr().expect("e"),
+            net.to_expr().expect("e"),
+            meta.to_expr().expect("e"),
+            not_bridge.to_expr().expect("e"),
+            masq.to_expr().expect("e"),
+        ]);
+        let back = decode_msg(&encode(&r)).expect("decode");
+        let exprs = back.exprs();
+        assert_eq!(exprs.len(), 6);
+        assert_eq!(NftPayload::from_expr(&exprs[0]).expect("p"), payload);
+        assert_eq!(NftBitwise::from_expr(&exprs[1]).expect("b"), bitwise);
+        assert_eq!(NftCmp::from_expr(&exprs[2]).expect("c"), net);
+        assert_eq!(NftMeta::from_expr(&exprs[3]).expect("m"), meta);
+        assert_eq!(NftCmp::from_expr(&exprs[4]).expect("c"), not_bridge);
+        assert_eq!(NftMasq::from_expr(&exprs[5]).expect("q"), masq);
     }
 }

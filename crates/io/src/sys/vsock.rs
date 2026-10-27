@@ -421,6 +421,149 @@ pub(crate) fn connect_nonblocking_until(
     Ok(Some(fd))
 }
 
+/// 自前の FFI 宣言を `libc` 0.2.189 と `const` 評価で照合する（#1842・IO-1・MVM-4・REPAIR-12）。関数は呼ばない。
+/// 対応 arch（LP64 の x86_64 / aarch64）の `consts` と同じ cfg の下にあり、そのターゲットの `libc` と比べる。
+///
+/// 対象外（理由つき）:
+/// - `consts::SUPPORTED`: FFI ではなく対応 arch の判定
+/// - `SOCKADDR_VM_LEN`: `size_of::<SockaddrVm>()` 由来で、構造体のサイズ照合に含まれる
+/// - 対応外 arch 用の `consts`（全て 0）: 値が使われず、評価されない
+///
+/// `SockaddrVm::svm_flags`: `libc` 0.2.189 の `sockaddr_vm` は旧ヘッダ形（`svm_zero: [u8; 4]`）で
+/// `svm_flags` を持たない。カーネルの `include/uapi/linux/vm_sockets.h` は `svm_flags`（1 バイト）＋
+/// `svm_zero[3]` で、末尾 4 バイトの位置とサイズが一致することを照合する（食い違いではない）。
+/// 将来 `libc` が `svm_flags` を足したら `offset_of!(libc::sockaddr_vm, svm_flags)` へ寄せる。
+#[cfg(test)]
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use super::consts;
+    use super::{PollFd, SockaddrVm};
+    use std::mem::{align_of, offset_of, size_of};
+
+    const _: () = {
+        assert!(consts::AF_VSOCK == libc::AF_VSOCK);
+        assert!(consts::SOCK_STREAM == libc::SOCK_STREAM);
+        assert!(consts::SOCK_NONBLOCK == libc::SOCK_NONBLOCK);
+        assert!(consts::SOCK_CLOEXEC == libc::SOCK_CLOEXEC);
+        assert!(consts::SOL_SOCKET == libc::SOL_SOCKET);
+        assert!(consts::SO_ERROR == libc::SO_ERROR);
+        assert!(consts::POLLIN == libc::POLLIN);
+        assert!(consts::POLLOUT == libc::POLLOUT);
+
+        assert!(super::EINTR == libc::EINTR);
+        assert!(super::EAGAIN == libc::EAGAIN);
+        assert!(super::EINPROGRESS == libc::EINPROGRESS);
+        assert!(super::ECONNABORTED == libc::ECONNABORTED);
+
+        // `map_errno` の数値リテラルと試験 `io1_vsock_map_errno_maps_known_errnos` の 5。
+        assert!(libc::EAFNOSUPPORT == 97);
+        assert!(libc::ENODEV == 19);
+        assert!(libc::EPROTONOSUPPORT == 93);
+        assert!(libc::EADDRINUSE == 98);
+        assert!(libc::EADDRNOTAVAIL == 99);
+        assert!(libc::EACCES == 13);
+        assert!(libc::EPERM == 1);
+        assert!(libc::EINVAL == 22);
+        assert!(libc::ECONNREFUSED == 111);
+        assert!(libc::ECONNRESET == 104);
+        assert!(libc::ETIMEDOUT == 110);
+        assert!(libc::ENETUNREACH == 101);
+        assert!(libc::ENOTCONN == 107);
+        assert!(libc::EMFILE == 24);
+        assert!(libc::ENFILE == 23);
+        assert!(libc::ENOMEM == 12);
+        assert!(libc::ENOBUFS == 105);
+        assert!(libc::EIO == 5);
+
+        // `struct sockaddr_vm`。
+        assert!(size_of::<SockaddrVm>() == size_of::<libc::sockaddr_vm>());
+        assert!(align_of::<SockaddrVm>() == align_of::<libc::sockaddr_vm>());
+        assert!(offset_of!(SockaddrVm, svm_family) == offset_of!(libc::sockaddr_vm, svm_family));
+        assert!(
+            offset_of!(SockaddrVm, svm_reserved1) == offset_of!(libc::sockaddr_vm, svm_reserved1)
+        );
+        assert!(offset_of!(SockaddrVm, svm_port) == offset_of!(libc::sockaddr_vm, svm_port));
+        assert!(offset_of!(SockaddrVm, svm_cid) == offset_of!(libc::sockaddr_vm, svm_cid));
+        assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
+        assert!(size_of::<u16>() == size_of::<libc::c_ushort>());
+        assert!(size_of::<u32>() == size_of::<libc::c_uint>());
+        // 末尾 4 バイト: 自前は `svm_flags`(1) + `svm_zero`(3)、`libc` は `svm_zero`(4)。
+        assert!(offset_of!(SockaddrVm, svm_flags) == offset_of!(libc::sockaddr_vm, svm_zero));
+        assert!(offset_of!(SockaddrVm, svm_zero) == offset_of!(libc::sockaddr_vm, svm_zero) + 1);
+        assert!(offset_of!(SockaddrVm, svm_zero) + 3 == size_of::<libc::sockaddr_vm>());
+
+        // `struct pollfd`。
+        assert!(size_of::<PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(PollFd, revents) == offset_of!(libc::pollfd, revents));
+    };
+
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+        super::socket;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+        libc::socket;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = super::listen;
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = libc::listen;
+
+    // アドレスは自前が `*const/*mut SockaddrVm`、`libc` が `*const/*mut sockaddr`（別書き。
+    // レイアウトの一致は上の構造体の照合が担う）。
+    const _: unsafe extern "C" fn(libc::c_int, *const SockaddrVm, libc::socklen_t) -> libc::c_int =
+        super::bind;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::c_int = libc::bind;
+    const _: unsafe extern "C" fn(libc::c_int, *const SockaddrVm, libc::socklen_t) -> libc::c_int =
+        super::connect;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::c_int = libc::connect;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut SockaddrVm,
+        *mut libc::socklen_t,
+        libc::c_int,
+    ) -> libc::c_int = super::accept4;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+        libc::c_int,
+    ) -> libc::c_int = libc::accept4;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut SockaddrVm,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = super::getsockname;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getsockname;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut SockaddrVm,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = super::getpeername;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getpeername;
+    const _: unsafe extern "C" fn(*mut PollFd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        super::poll;
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        libc::poll;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

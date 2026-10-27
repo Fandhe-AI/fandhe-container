@@ -5,15 +5,19 @@
 //! 記録先へ渡すための境界。集計（成功・失敗件数とレイテンシ分布）と構造化ログへの出力は core の
 //! `OpRecorder` が担うが、本 crate は core に依存しないため、本 crate の型だけで完結するトレイトを定義する
 //! （`fandhe-container-net` の `instrument`・`fandhe-container-io` の `instrument` と同じ形）。core の記録器への
-//! 接続は、両方に依存する上位 crate（`fandhe-container-plugin-windows`・TASK-116）に置くアダプタが担い、
-//! `sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` / `sample.latency()` を
-//! `OpRecorder::record` へ写す。
+//! 接続は、`docs/architecture.md` の「計装アダプタの配置」の原則に従い、本番でこれらの操作を呼び
+//! `OpRecorder` を持つ crate に置く。本番の呼び出し元は `fandhe-container-plugin-windows`（TASK-116）だが、
+//! 現状は core に依存せず、自前の stderr JSON 行の記録先（`adapter.rs` の `StderrJsonRecorder`）へ出している。
+//! `OpRecorder` へ接続する場合は、`sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` /
+//! `sample.latency()` を `OpRecorder::record` へ写す。機能上の依存辺が入る issue で一緒に置き、
+//! 計装だけのために辺は足さない。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。本 crate からは提供しない）
-//! - 9P フォールバック警告（[`WinWarning`]）の構造化ログ行（`level: warn`）への書き出し（上位 crate の担当。
-//!   本 crate は JSON を組まず、[`WinOpRecorder::record_win_warning`] でデータとして渡すだけ。TASK-67.5・WIN-2）
+//! - core の `OpRecorder` との接続アダプタ: 本 crate からは提供しない。現状は未接続（上記）
+//! - 9P フォールバック警告（[`WinWarning`]）の構造化ログ行（`level: warn`）への書き出しは呼び出し元の担当
+//!   （plugin-windows の `StderrJsonRecorder` が stderr へ出している）。
+//!   本 crate は JSON を組まず、[`WinOpRecorder::record_win_warning`] でデータとして渡すだけ。TASK-67.5・WIN-2
 //!
 //! # 機微情報
 //!

@@ -47,8 +47,9 @@
 //! 以下は未実装である。
 //!
 //! - io の read / write 向け連携点は io 側の `fandhe_container_io::instrument::IoOpRecorder`
-//!   として定義済み（TASK-84.5）。core との接続は core と io の両方に依存する上位 crate の
-//!   newtype アダプタで行う（core → io 依存辺は未承認のため core には置かない）。
+//!   として定義済み（TASK-84.5）。core との接続は
+//!   `docs/architecture.md` の「計装アダプタの配置」の原則に従い、機能上の依存辺（core → io 等）を
+//!   入れる issue でアダプタも一緒に入れる（計装だけのために辺は足さない）。
 //!   io 側の計装は TASK-84.7
 //! - 結合テスト: 分布（min / mean / p95 / max）・件数の照合は `tests/observability.rs`
 //!   （TASK-84.6）で実装済み

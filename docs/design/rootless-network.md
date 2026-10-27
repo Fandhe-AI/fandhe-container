@@ -254,6 +254,7 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | `--host-lo-to-ns-lo` は付けない | 付けると、ホストの loopback から来た接続がコンテナ内で loopback 発に見え、netns 内の loopback 専用のサービスがホストへ漏れる（man の記述） |
 
 - `argv[0]` は `--pasta-path` の basename に関係なく `pasta` にする（pasta は実行名でモードを決めうる。`/usr/bin/pasta` と `/usr/bin/passt` はリンク数 2 の同一実体）
+- 公開指定は `crates/net` の `pasta::port_forward`（#1937）が検証して組む。待ち受けアドレスごとに `-t <addr>/<h>:<c>[,...]` を 1 つにまとめ、アドレスが違えば `-t` を複数並べる（passt の `conf_ports` は SPEC を累積し、`/` の前のアドレスはその spec 全体にかかる。tag `2026_01_20.386b5f5` の挙動の読み取り）。公開の無いプロトコルは `none`
 - **却下した案**: アドレスを省いた `-t`（全アドレスで開く）、既定の `--map-host-loopback` のまま、IPv6 を有効のまま
 
 ### 12.8 PID ファイル・準備完了・置き場所
@@ -331,6 +332,8 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | `--map-host-loopback none` でホストの loopback に届かないこと | #1941 |
 | PDEATHSIG と、holder が消えた後の netns-quit | #1941 |
 | 状態ルートの下の PID ファイルを AppArmor が許すか | #1941 |
+| 同じプロトコルの `-t` を複数回渡したとき、規則が累積して bind されるか | #1941 |
+| `-u none` のとき、TCP と同じ番号の UDP が開かないこと | #1941 |
 
 ### 12.12 版の固定
 
@@ -362,4 +365,5 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 ### 12.15 オーナー確認事項（実装は止めない）
 
 - 既定のパス（`/usr/bin/pasta` 等）を持つか。現状は持たない
+- ポート公開の細部（#1937。自動運転で安全側に決めた）: 同じプロトコルでアドレスが違う公開は `-t` を複数並べる / 明示アドレスのうち bind できないもの（`0.0.0.0` 以外の `0.0.0.0/8`・multicast・予約）は拒否 / `0.0.0.0` と個別アドレスの同じ（プロトコル・ホストのポート）は重なりとして拒否 / プロトコル省略は TCP（`/TCP` の大文字は不可）/ 1 件 64 バイトの上限を解析の入口にも置く / ポートの名前（`http` 等）は受けない
 - 12.2 の holder 方式、12.10 の「途中死でコンテナを止める」、12.7 の固定の argv は自動運転で決めた。承認は未取得

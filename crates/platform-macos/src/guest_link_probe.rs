@@ -66,7 +66,37 @@ pub struct LinkLog {
     pub invalid: bool,
 }
 
-/// 名前空間を持つ 1 行が契約の形か（`done` は別扱い）。上限・UTF-8・制御文字・`share=` 始まりを見る。
+/// `result=` 以降が `op` ごとの語彙どおりか。`value=` は行末までを値とする（空白を含みうる）。
+fn result_matches_contract(op: &str, result: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let kind = |s: &str| matches!(s, "file" | "dir" | "symlink" | "other");
+    if result == "ok" {
+        // 引数なしの ok は create・symlink・link だけ。
+        return matches!(op, "create" | "symlink" | "link");
+    }
+    if result.starts_with("ok value=") {
+        return matches!(op, "readlink" | "read");
+    }
+    if let Some(rest) = result.strip_prefix("ok kind=") {
+        let mut it = rest.split(' ');
+        let (k, n, z) = (it.next(), it.next(), it.next());
+        let fields_ok = k.is_some_and(kind)
+            && n.and_then(|n| n.strip_prefix("nlink=")).is_some_and(digits)
+            && z.and_then(|z| z.strip_prefix("size=")).is_some_and(digits);
+        return matches!(op, "lstat" | "stat") && fields_ok && it.next().is_none();
+    }
+    if let Some(e) = result.strip_prefix("error errno=") {
+        return digits(e);
+    }
+    if let Some(k) = result.strip_prefix("not-regular kind=") {
+        return op == "read" && kind(k);
+    }
+    result == "unprintable" && matches!(op, "readlink" | "read")
+}
+
+/// 名前空間を持つ 1 行が契約の形か（`done` は別扱い）。上限・UTF-8・制御文字に加え、`share`・`name`・`op`・
+/// `result` の固定語彙と op ごとの結果フィールドの組み合わせを検証する。余分なトークン・未知の語・必須
+/// フィールドの欠落は不正（MAC-1・SEC-4）。観測の良し悪し自体は判定しない。
 fn decode_observation(line: &[u8]) -> Option<&str> {
     if line.len() > MAX_LINK_LINE_BYTES {
         return None;
@@ -76,7 +106,24 @@ fn decode_observation(line: &[u8]) -> Option<&str> {
         return None;
     }
     let rest = text.strip_prefix(LINK_PREFIX)?;
-    (rest.starts_with("share=ro ") || rest.starts_with("share=rw ")).then_some(rest)
+    let (share, tail) = rest.strip_prefix("share=")?.split_once(' ')?;
+    let names: &[&str] = match share {
+        RO_TAG => &RO_LINK_NAMES,
+        RW_TAG => &[RW_SRC_NAME, RW_SYM_NAME, RW_HARD_NAME],
+        _ => return None,
+    };
+    // mount 不成立の行だけ `name=` を持たない。
+    if let Some(r) = tail.strip_prefix("op=mount ") {
+        return (r == "result=missing").then_some(rest);
+    }
+    let (name, tail) = tail.strip_prefix("name=")?.split_once(' ')?;
+    let (op, result) = tail.strip_prefix("op=")?.split_once(' ')?;
+    let known_op = matches!(
+        op,
+        "readlink" | "lstat" | "stat" | "read" | "create" | "symlink" | "link"
+    );
+    let result = result.strip_prefix("result=")?;
+    (names.contains(&name) && known_op && result_matches_contract(op, result)).then_some(rest)
 }
 
 /// ログ全体を畳み込む。ログは生バイトのまま `\n` で行に分割する（lossy 変換すると非 UTF-8 の行が置換文字で
@@ -167,17 +214,17 @@ mod tests {
     /// MAC-1・SEC-4・#1877: 契約外の名前空間つきの行・done の重複・done 後の行・行数超過はすべて不正にする。
     #[test]
     fn mac1_sec4_parse_rejects_malformed_lines_fail_closed() {
-        let ok = format!("{P}share=ro name=a op=stat result=ok kind=file nlink=1 size=1");
+        let ok = format!("{P}share=ro name=inside_link op=stat result=ok kind=file nlink=1 size=1");
         let long = format!(
-            "{P}share=ro name=a op=readlink result=ok value={}",
+            "{P}share=ro name=inside_link op=readlink result=ok value={}",
             "a".repeat(300)
         );
         let boundary = format!(
-            "{P}share=ro name=a op=readlink result=ok value={}",
+            "{P}share=ro name=inside_link op=readlink result=ok value={}",
             "a".repeat(
                 MAX_LINK_LINE_BYTES
                     - P.len()
-                    - "share=ro name=a op=readlink result=ok value=".len()
+                    - "share=ro name=inside_link op=readlink result=ok value=".len()
             )
         );
         assert_eq!(boundary.len(), 256);
@@ -199,16 +246,80 @@ mod tests {
             ("too long", long),
             (
                 "control char",
-                format!("{P}share=ro name=a op=readlink result=ok value=a\u{1b}[2J"),
+                format!("{P}share=ro name=inside_link op=readlink result=ok value=a\u{1b}[2J"),
             ),
             ("done with tail", format!("{P}done now")),
+            ("garbage after share", format!("{P}share=ro garbage")),
+            (
+                "garbage after mount",
+                format!("{P}share=ro op=mount result=missing extra"),
+            ),
+            (
+                "unknown op",
+                format!("{P}share=ro name=inside_link op=chmod result=ok"),
+            ),
+            (
+                "unknown result",
+                format!("{P}share=ro name=inside_link op=stat result=weird"),
+            ),
+            (
+                "unknown name",
+                format!("{P}share=rw name=evil op=create result=ok"),
+            ),
+            (
+                "name of other share",
+                format!("{P}share=ro name=src op=lstat result=error errno=2"),
+            ),
+            (
+                "missing name",
+                format!("{P}share=ro op=stat result=ok kind=file nlink=1 size=1"),
+            ),
+            (
+                "missing result",
+                format!("{P}share=ro name=inside_link op=stat"),
+            ),
+            (
+                "stat without fields",
+                format!("{P}share=ro name=inside_link op=stat result=ok"),
+            ),
+            (
+                "stat with extra field",
+                format!(
+                    "{P}share=ro name=inside_link op=stat result=ok kind=file nlink=1 size=1 x=y"
+                ),
+            ),
+            (
+                "stat bad kind",
+                format!("{P}share=ro name=inside_link op=stat result=ok kind=door nlink=1 size=1"),
+            ),
+            (
+                "errno not digits",
+                format!("{P}share=ro name=inside_link op=stat result=error errno=ENOENT"),
+            ),
+            (
+                "create with value",
+                format!("{P}share=rw name=src op=create result=ok value=x"),
+            ),
+            (
+                "not-regular on stat",
+                format!("{P}share=ro name=inside_link op=stat result=not-regular kind=dir"),
+            ),
+            (
+                "unprintable on lstat",
+                format!("{P}share=ro name=inside_link op=lstat result=unprintable"),
+            ),
+            (
+                "mount not missing",
+                format!("{P}share=ro op=mount result=ok"),
+            ),
         ] {
             let parsed = parse_link_log(log(&[bad]));
             assert!(parsed.invalid, "{name}");
             assert!(parsed.lines.is_empty(), "{name}");
         }
         // 非 UTF-8 のバイト列は置換文字で受理しない。
-        let mut bytes = format!("{P}share=ro name=a op=readlink result=ok value=").into_bytes();
+        let mut bytes =
+            format!("{P}share=ro name=inside_link op=readlink result=ok value=").into_bytes();
         bytes.extend_from_slice(&[0xff, b'\n']);
         assert!(parse_link_log(&bytes).invalid);
         // done の重複・done 後の行。

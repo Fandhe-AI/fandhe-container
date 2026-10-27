@@ -61,6 +61,8 @@ pub(crate) enum MountedBy {
     /// ファイル注入の段（注入ディレクトリの tmpfs）。
     Inject,
     /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount の段（識別子の記録のみ。Landlock のルールは作らない。NET-12・#1872）。
+    /// ファイルの bind mount はアクセス時のパス探索がマウント点（rootfs 側の `/etc/hosts`）を経て rootfs の root ルールへ届くため、
+    /// 実効の権利は root と同じで、`/sys` の sysfs（`build_path_rules_with_dev` の `/sys` の項）と同じ理由で個別のルールを要さない。
     EtcFile,
     /// bind mount の段。`index` は `mounts[]` 内の位置（`RuleOrigin::Mount` と同じ番号）。
     Bind {

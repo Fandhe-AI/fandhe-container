@@ -743,11 +743,7 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_id = id.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(remove_etc_files_if_still_deleted(
-            &root,
-            &worker_id,
-            fandhe_container_core::etc_files::remove_etc_files,
-        ));
+        let _ = tx.send(remove_etc_files_locked(&root, &worker_id));
     });
     let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
         Ok(Ok(_)) => return,
@@ -760,6 +756,35 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
         WARNING_WRITE_TIMEOUT,
     );
 }
+
+/// ID 単位のロック(`create` が起動オプション文書の書き込みで取るものと同じ `@container-options/@locks/<id>`)を
+/// 保持したまま、不在確認から削除までを直列化する(#1872・NET-12)。
+///
+/// ロックなしでは「確認 → 並行 `create` の再作成と生成 → 削除」の順で新インスタンスの生成物を消す競合が残る。
+/// 生成側(`create` / start)は同じロックの下で作るため、ここで保持中は新しい生成が割り込まない。
+/// 削除したときだけロックファイルを回収する(再作成済みで見送ったときは触らない)。
+fn remove_etc_files_locked(
+    root: &std::path::Path,
+    id: &ContainerId,
+) -> Result<
+    fandhe_container_core::etc_files::EtcRemoveOutcome,
+    fandhe_container_core::traits::types::TraitError,
+> {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let lock = options_store::acquire_lock(root, id, ETC_FILES_LOCK_WAIT)?;
+    let outcome = remove_etc_files_if_still_deleted(
+        root,
+        id,
+        fandhe_container_core::etc_files::remove_etc_files,
+    );
+    if outcome.is_ok() && id_is_still_deleted(root, id) {
+        lock.remove_lock_file();
+    }
+    outcome
+}
+
+/// 管理ルートの生成物の削除で ID 単位のロックを待つ上限(`ETC_FILES_REMOVE_TIMEOUT` より短くする。REPAIR-5)。
+const ETC_FILES_LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// 削除直前に ID が再作成されていないことを再確認して `remove` を呼ぶ(options の cleanup と同じ形。#1872・NET-12)。
 /// 起動前の確認から worker の実行までに再作成された新インスタンスの `@container-etc/<id>` を消さない。

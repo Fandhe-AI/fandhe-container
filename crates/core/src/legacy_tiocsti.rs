@@ -25,7 +25,8 @@
 //! - `ReadFailed`: `NotFound` 以外の I/O 失敗
 //!
 //! procfs の内容は外部入力として扱う。読み取りは固定の上限で打ち切り、上限を超えたら解釈しない。ログの 1 行は
-//! 固定の文字列で、procfs の内容・パス・errno 文字列を含めない（ログ行の偽装を防ぐ。`REPAIR-4`）。
+//! 固定の本体を共通ログ型 [`LogLine`]（level `warn`。`ERR-4`・#3117）で組んだもので、procfs の内容・パス・
+//! errno 文字列を含めない（ログ行の偽装を防ぐ。`REPAIR-4`）。出力のバイト列は移行前の固定文字列と同一。
 //!
 //! # 呼び出し元
 //!
@@ -40,6 +41,11 @@
 
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::OnceLock;
+
+use serde::Serialize;
+
+use crate::logging::{LogEvent, LogLevel, LogLine, encode_json_line};
 
 /// 読む sysctl のパス。固定で、利用者の入力は入らない。
 pub const LEGACY_TIOCSTI_PATH: &str = "/proc/sys/dev/tty/legacy_tiocsti";
@@ -126,12 +132,46 @@ pub fn read_host() -> LegacyTiocsti {
     read_from(Path::new(LEGACY_TIOCSTI_PATH))
 }
 
-/// `Enabled` のときの固定の 1 行（改行を含まない）。他の状態では `None`。
+/// 警告行の本体（`level`・`event` は封筒 [`LogLine`] が持つため含めない。予約キーの重複は試験で検出する）。
+/// フィールドの宣言順が出力のキー順になる。
+#[derive(Serialize)]
+struct LegacyTiocstiWarning {
+    sysctl: &'static str,
+    value: u32,
+}
+
+/// 警告行の本体。定数だけで、外部入力は入らない。
+const WARNING_BODY: LegacyTiocstiWarning = LegacyTiocstiWarning {
+    sysctl: SYSCTL_NAME,
+    value: 1,
+};
+
+/// 警告行のイベント名。規則に合わなければ const 評価でコンパイルが失敗し、実行時には panic しない。
+const WARNING_EVENT: LogEvent = match LogEvent::from_static("legacy_tiocsti_enabled") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+/// 共通ログ型で警告行（末尾の LF を除く）を組む。符号化できなければ `None`
+/// （本体は定数のため通らない。通れば厳密 JSON の試験が失敗して検出する）。
+fn encode_warning_line() -> Option<String> {
+    let line = LogLine::new(WARNING_EVENT, &WARNING_BODY).with_level(LogLevel::Warn);
+    let bytes = encode_json_line(&line).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    text.strip_suffix('\n').map(str::to_owned)
+}
+
+/// `Enabled` のときの固定の 1 行（改行を含まない。改行は呼び出し元が付ける）。他の状態では `None`。
+///
+/// 共通ログ型 [`LogLine`]（level `warn`）で初回だけ組み、以降は同じ文字列を返す（ERR-4・#3117）。
+/// 初回の確保を伴うため、fork した子の中では呼ばない（呼び出し元は fork 成功後の親の側か、
+/// supervisor の start 成功後）。
 pub fn warning_line(state: LegacyTiocsti) -> Option<&'static str> {
     match state {
-        LegacyTiocsti::Enabled => Some(
-            r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#,
-        ),
+        LegacyTiocsti::Enabled => {
+            static LINE: OnceLock<Option<String>> = OnceLock::new();
+            LINE.get_or_init(encode_warning_line).as_deref()
+        }
         _ => None,
     }
 }
@@ -233,6 +273,28 @@ mod tests {
         ] {
             assert_eq!(warning_line(s), None, "{s:?}");
         }
+    }
+
+    #[test]
+    fn err4_3117_warning_body_has_no_reserved_keys() {
+        let v = serde_json::to_value(WARNING_BODY).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["sysctl", "value"]);
+        assert!(!obj.contains_key("level") && !obj.contains_key("event"));
+    }
+
+    #[test]
+    fn err4_3117_warning_line_built_via_log_line() {
+        assert_eq!(WARNING_EVENT.as_str(), "legacy_tiocsti_enabled");
+        let line = warning_line(LegacyTiocsti::Enabled).unwrap();
+        let expected = encode_json_line(
+            &LogLine::new(WARNING_EVENT, &WARNING_BODY).with_level(LogLevel::Warn),
+        )
+        .unwrap();
+        assert_eq!(format!("{line}\n").into_bytes(), expected);
+        assert_eq!(warning_line(LegacyTiocsti::Enabled), Some(line));
     }
 
     #[test]

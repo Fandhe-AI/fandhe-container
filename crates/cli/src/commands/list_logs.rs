@@ -87,12 +87,13 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - logs: 利用者向けの期限フラグ（`--until` 等）の要否と構文、`--follow` の期限（24 時間）・`--tail` の件数（1,000,000）の
 //!   上限の値はオーナー確認待ち（#2605）。追従の遅延の短縮（inotify / kqueue）は行わない。非 Linux の読み出しは plugin 経由
-//!   （TASK-114・TASK-125）。
+//!   （#1869・TASK-125）。
 //! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では状態ストアを開けず core 側が
-//!   `Unimplemented` を返す（fail-closed）。
+//!   失敗を返す（fail-closed）。`plugin_backend` の固定文言表の失敗
+//!   （候補なし 5・検証の拒否 6・Windows でホストが検証しない場合 8・起動未実装 8）がそのまま届く。
 
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -439,7 +440,7 @@ mod tests {
         );
     }
 
-    /// C1: 非 Linux の plugin 解決失敗は「未導入」と「検証未実装」で別の固定文言になる。
+    /// C1: 非 Linux の plugin 解決失敗は「未導入」「検証の拒否」「ホストが検証しない」で別の固定文言になる。
     /// 表に無い失敗（任意文言）は汎用文言のまま。
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -451,11 +452,17 @@ mod tests {
             stderr_line(&e),
             "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
         );
-        let e = store_open_failure(&BackendFailure::TrustUnsupported.into_error());
+        let e = store_open_failure(&BackendFailure::TrustNotPerformedOnHost.into_error());
         assert_eq!(e.exit_code(), 8);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}\n"
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}\n"
+        );
+        let e = store_open_failure(&BackendFailure::Untrusted.into_error());
+        assert_eq!(e.exit_code(), 6);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}\n"
         );
         let e = store_open_failure(&TraitError::new(ErrorCode::FailedPrecondition, "detail"));
         assert_eq!(

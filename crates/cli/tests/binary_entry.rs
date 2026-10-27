@@ -1809,9 +1809,26 @@ fn plug11_path_search_is_off_by_default_off_linux() {
     assert!(out.stdout.is_empty());
 }
 
+/// 非 Linux で PATH 由来の候補が採用されないときの終了コードと最終行（#1867）。macOS は信頼性検証の拒否
+/// （PERMISSION_DENIED = 6）、Windows はホストが検証しない（UNIMPLEMENTED = 8）。拒否の理由は照合しない。
+#[cfg(not(target_os = "linux"))]
+fn path_search_rejection() -> (i32, &'static str) {
+    if cfg!(target_os = "macos") {
+        (
+            6,
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}",
+        )
+    } else {
+        (
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}",
+        )
+    }
+}
+
 /// PLUG-11・CLI-1・REPAIR-12: `--plugin-path-search` で opt-in すると候補ごとに警告が stderr へ出る
-/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、信頼性検証の未実装で拒否される
-/// （UNIMPLEMENTED = 8）。
+/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、macOS は信頼性検証の拒否（6）、
+/// Windows はホストが検証しないため 8 で拒否される。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn plug11_path_search_flag_warns_and_rejects_off_linux() {
@@ -1826,15 +1843,13 @@ fn plug11_path_search_flag_warns_and_rejects_off_linux() {
         ],
         &[("PATH", tmp.0.as_os_str())],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let last = stderr.lines().last().expect("last line");
     // 「未導入」（FAILED_PRECONDITION）とは別の識別子で、パス・plugin 名を含まない（C1）。
-    assert_eq!(
-        last,
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(last, want_line);
     assert!(out.stdout.is_empty());
 }
 
@@ -1854,13 +1869,11 @@ fn plug11_path_search_env_warns_and_rejects_off_linux() {
             ),
         ],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(
-        stderr.lines().last().expect("last line"),
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(stderr.lines().last().expect("last line"), want_line);
     assert!(out.stdout.is_empty());
 }
 

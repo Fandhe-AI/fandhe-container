@@ -11,7 +11,7 @@
 //! - 各レイヤーのフック（seccomp / Landlock / マウント。TASK-41.2〜41.4）が組み立てた [`AuditRecord`] を
 //!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（`AuditSink` への適合は `FileAuditSink`〔#1594〕で実装済み）
 //! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840。本体は非公開 DTO で、封筒（`event`）は共通ログ型 `logging::LogLine` が付ける（#3115・ERR-4）
-//! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は末尾で常在）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
+//! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は常在で、段を持つ記録だけその後ろに `stage`。#3121）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
 //! - [`AuditFileWriter::open`] は symlink・FIFO・他者所有・group/other 権限付きのファイルを拒否する。
 //!   親ディレクトリも `/` から 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で辿って fd で固定し、いずれかが
@@ -357,8 +357,12 @@ struct AuditLineDto<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     landlock_reason: Option<&'static str>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
-    /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
+    /// 常在で、段を持たない記録では末尾（既存キーの値と順序は変えない。#1618）。
     container_id: Option<&'a str>,
+    /// 拒否した段（`IsolationStage` と同じ固定語彙）。段を持つ記録のみ、`container_id` の後ろに出す
+    /// （他は省略＝既存行は不変。#3121）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'static str>,
 }
 
 /// 監査行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
@@ -430,6 +434,7 @@ fn audit_line_dto(record: &AuditRecord) -> AuditLineDto<'_> {
             .and_then(|(_, l)| l)
             .map(|r| r.as_str()),
         container_id: record.container_id().map(|c| c.as_str()),
+        stage: record.stage().map(|s| s.as_str()),
     }
 }
 
@@ -1258,6 +1263,90 @@ mod tests {
             "{}",
             text(&no_path)
         );
+    }
+
+    /// SEC-4・ERR-4・#3121: 段なしの記録は全層で `"stage"` キーを持たず、末尾は従来どおり `container_id`。
+    #[test]
+    fn sec4_3121_records_without_stage_keep_bytes() {
+        let events = [
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
+            },
+            AuditEvent::Landlock {
+                path: AuditPath::new("/etc/shadow"),
+                syscall: None,
+            },
+            AuditEvent::Mount {
+                path: None,
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "readonly_path_apply_failed",
+                )),
+            },
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p/plugin"),
+                reason: crate::audit_log::AuditReason::new("hash_mismatch"),
+            },
+            AuditEvent::ExecTarget {
+                reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+            AuditEvent::Entrypoint {
+                reason: crate::audit_log::AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+        ];
+        for e in events {
+            let s = text(&rec(3, e.clone()));
+            assert!(!s.contains("\"stage\""), "{s}");
+            assert!(s.ends_with(",\"container_id\":null}\n"), "{s}");
+            let s = text(&rec(3, e).with_container_id(cid("c1")));
+            assert!(!s.contains("\"stage\""), "{s}");
+            assert!(s.ends_with(",\"container_id\":\"c1\"}\n"), "{s}");
+        }
+    }
+
+    /// SEC-4・ERR-4・#3121: 段つきの 1 行全体の厳密バイト列。`stage` は `container_id` の後ろ（ID が null でも）。
+    #[test]
+    fn sec4_3121_encode_mount_with_stage_is_exact() {
+        let ev = || AuditEvent::Mount {
+            path: None,
+            reason: Some(crate::audit_log::AuditReason::new(
+                "readonly_path_apply_failed",
+            )),
+        };
+        let stage = crate::audit_log::AuditStage::new("mount_readonly_paths");
+        let with_id = rec(8, ev()).with_container_id(cid("c1")).with_stage(stage);
+        assert_eq!(
+            text(&with_id),
+            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"readonly_path_apply_failed\",\"container_id\":\"c1\",\"stage\":\"mount_readonly_paths\"}\n"
+        );
+        let no_id = rec(8, ev()).with_stage(stage);
+        assert!(
+            text(&no_id).ends_with(",\"container_id\":null,\"stage\":\"mount_readonly_paths\"}\n"),
+            "{}",
+            text(&no_id)
+        );
+    }
+
+    /// SEC-4・ERR-4・#3121: 最悪ケース（制御文字だけの 4096 バイトのパス・最長の理由・255 バイトの ID・段）でも 1 行の上限に収まる。
+    #[test]
+    fn sec4_3121_stage_worst_case_line_fits() {
+        let id = "a".repeat(255);
+        let r = rec(
+            2_000_000_000,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new(&"\u{1}".repeat(4096))),
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "rootfs_symlink_or_not_directory",
+                )),
+            },
+        )
+        .with_container_id(cid(&id))
+        .with_stage(crate::audit_log::AuditStage::new("mount_readonly_paths"));
+        let line = encode_json_line(&r).expect("worst case encodes");
+        assert!(line.len() <= AUDIT_LINE_MAX_BYTES, "{}", line.len());
+        assert!(String::from_utf8(line).unwrap().ends_with(&format!(
+            ",\"container_id\":\"{id}\",\"stage\":\"mount_readonly_paths\"}}\n"
+        )));
     }
 
     /// SEC-4・#1618: ID が無い記録は全層で `"container_id":null` を末尾に持つ。

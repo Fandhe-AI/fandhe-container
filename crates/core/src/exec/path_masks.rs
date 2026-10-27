@@ -65,9 +65,10 @@
 //!   覆いは後段の `masked_paths` が担う（`exec::masked_paths`。#2014）
 //! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
 //!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
-//! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由（`path_symlink_or_not_directory` 等）で記録され、
-//!   記録の理由だけでは段が分からない（段は返る `ExecError::stage` に載る）。段のフィールドは #653（TASK-98.2）
-//!   の共通ログ型の範囲
+//!
+//! 記録の `stage` キー（#3121・SEC-4・ERR-4）: 経路検査の拒否は汎用理由（`path_symlink_or_not_directory` 等）で
+//! 記録されるが、親が `ExecError::stage` の段 `mount_readonly_paths` を記録の末尾（`container_id` の後ろ）に載せるため、
+//! 記録だけで段が分かる。
 //!
 //! # 監査（SEC-4）
 //!
@@ -693,6 +694,11 @@ mod tests {
         assert_eq!(recs[0].layer(), AuditLayer::Mount);
         assert_eq!(recs[0].path(), None);
         assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+        // #3121: 汎用理由でも記録だけで段が分かる。
+        assert_eq!(
+            recs[0].stage().map(|s| s.as_str()),
+            Some("mount_readonly_paths")
+        );
         let reason = recs[0].reason().map(|r| r.as_str().to_string());
         (out.error, reason)
     }

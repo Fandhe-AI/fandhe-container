@@ -256,7 +256,11 @@ mod linux {
         dm_created: bool,
         /// `dmsetup create` を実行した（タイムアウト等で Err でもカーネル内に作成済みの可能性がある）。
         dm_attempted: bool,
+        /// `mount` を実行した（タイムアウト等で Err でもカーネル内で成立済みの可能性がある）。
+        mount_attempted: bool,
         mounted: bool,
+        /// `dmsetup suspend` を実行して resume が未確認（I/O 停止のまま残る恐れ）。
+        suspend_attempted: bool,
         sectors: u64,
     }
 
@@ -289,7 +293,9 @@ mod linux {
                 loop_attempted: false,
                 dm_created: false,
                 dm_attempted: false,
+                mount_attempted: false,
                 mounted: false,
+                suspend_attempted: false,
                 sectors: IMAGE_BYTES / SECTOR_BYTES,
             };
             rig.setup()?;
@@ -334,6 +340,8 @@ mod linux {
 
         fn mount(&mut self) -> Result<(), String> {
             let mnt = self.mnt.to_string_lossy().into_owned();
+            // 結果が不明でも成立済みの可能性があるため、実行前に試行を記録する
+            self.mount_attempted = true;
             run_cmd("mount", &["-t", "ext4", &self.dm_path(), &mnt])?;
             self.mounted = true;
             // mount した先が自分の dm 上の ext4 であることを確かめる（tmpfs 等を拒む）
@@ -358,16 +366,22 @@ mod linux {
         }
 
         /// 書き込みを止めずに table を差し替える（`suspend --nolockfs` → load → resume）。
-        fn switch(&self, mode: FlakeyMode) -> Result<(), String> {
+        fn switch(&mut self, mode: FlakeyMode) -> Result<(), String> {
             let dev = self
                 .loop_dev
                 .as_deref()
                 .ok_or_else(|| "loop device not set".to_string())?;
             let table = flakey_table(self.sectors, dev, mode);
-            run_cmd("dmsetup", &["suspend", "--nolockfs", &self.dm_name])?;
-            let load = run_cmd("dmsetup", &["load", &self.dm_name, "--table", &table]);
-            // load が失敗しても必ず resume する（suspend のまま残さない）
+            // 結果が不明（タイムアウト等）でも suspend 済みの可能性があるため、実行前に記録する
+            self.suspend_attempted = true;
+            let suspend = run_cmd("dmsetup", &["suspend", "--nolockfs", &self.dm_name]);
+            let load = suspend
+                .and_then(|_| run_cmd("dmsetup", &["load", &self.dm_name, "--table", &table]));
+            // suspend・load のどちらが失敗しても必ず resume する（suspend のまま残さない）
             let resume = run_cmd("dmsetup", &["resume", &self.dm_name]);
+            if resume.is_ok() {
+                self.suspend_attempted = false;
+            }
             load.and(resume).map(|_| ())
         }
     }
@@ -382,6 +396,28 @@ mod linux {
                     Ok(true) => self.dm_created = true,
                     Ok(false) => {}
                     Err(e) => failures.push(format!("cannot confirm dm absence: {e}")),
+                }
+            }
+            // suspend のまま umount すると I/O 停止で解除できないため、先に期限付きで resume する
+            if self.suspend_attempted && (self.dm_created || self.dm_attempted) {
+                match run_cmd("dmsetup", &["resume", &self.dm_name]) {
+                    Ok(_) => self.suspend_attempted = false,
+                    Err(e) => match dm_exists(&self.dm_name) {
+                        Ok(false) => self.suspend_attempted = false,
+                        _ => failures.push(format!("dmsetup resume: {e}")),
+                    },
+                }
+            }
+            // mount の結果が不明な場合は mountinfo で自分のマウントを照合する
+            if self.mount_attempted && !self.mounted {
+                let mnt = self.mnt.to_string_lossy().into_owned();
+                match std::fs::read_to_string("/proc/self/mountinfo") {
+                    Ok(info) => {
+                        if mountinfo_entry(&info, &mnt).is_some() {
+                            self.mounted = true;
+                        }
+                    }
+                    Err(e) => failures.push(format!("cannot confirm mount absence: {e}")),
                 }
             }
             if self.loop_attempted && self.loop_dev.is_none() {

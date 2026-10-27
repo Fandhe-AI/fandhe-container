@@ -87,6 +87,7 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | 乱数 | `HW_RANDOM`・`HW_RANDOM_VIRTIO` | VZ のエントロピーデバイス。不要と判断したら外す |
 
 init（#1875）への申し送り: `DEVTMPFS_MOUNT` は initramfs 起動には効かないため、init が自分で `/dev` を mount する必要があります。
+`DEVTMPFS_MOUNT` が効く起動（initramfs の `/init` を使わずディスクの root から起動し、カーネルが `/dev` を先に mount する場合）でも、既存のマウントポイントへの重ね掛けは許されるため、init の devtmpfs の mount は通常 `EBUSY` にならず、新規 mount として成功します（`classify_dev_mount` は Fresh を返し、既存 mount の検査は通りません）。init の mount が実際に `EBUSY` を受けた場合に限り、init は `/proc` の mount 後に mountinfo で `/dev` が `devtmpfs` かつ `nosuid`・`noexec` であることを確かめ、満たさなければ `stage=dev errno=16` を出して `READY_MARKER` を出さずに止まります（[`init.rs`](../../crates/guest-init/src/init.rs) の `classify_dev_mount`・`verify_existing_dev`、検査は [`mountinfo.rs`](../../crates/guest-init/src/mountinfo.rs) の `check_dev_hardened`。#2139）。本構成は `DEVTMPFS_SAFE` を有効にしておらずカーネルの自動 mount に `nosuid`・`noexec` が付かないため、`EBUSY` を受けた場合のこの経路では止まります（自動 mount 済みでも重ね掛けが成功すれば止まりません。現行の initramfs 起動では `EBUSY` の分岐に入りません）。
 
 ## 未確認事項
 

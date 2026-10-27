@@ -111,6 +111,8 @@ pub(super) enum PrePivotStep {
     MountTmpfs,
     /// ファイルの注入。
     InjectFiles,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount（`LaunchOptions::etc_files` の指定時のみ。NET-12・#1872）。
+    EtcFiles,
     /// 検証済み bind mount の適用（指定時のみ。#1914）。user namespace 由来の 2 理由（SEC-5。
     /// `ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS`）は、この段に限って許可リストに入り、
     /// 親へ届いて層 `mount` に記録される（#2072）。他の段では `Malformed`。
@@ -128,7 +130,7 @@ pub(super) enum PrePivotStep {
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -137,6 +139,7 @@ impl PrePivotStep {
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
+        Self::EtcFiles,
         Self::MountBinds,
         Self::ReadonlyPaths,
         Self::MaskedPaths,
@@ -156,6 +159,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
+            Self::EtcFiles => "etc_files",
             Self::MountBinds => "mount_binds",
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
@@ -179,6 +183,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
+            Self::EtcFiles => IsolationStage::MountEtcFiles,
             Self::MountBinds => IsolationStage::MountBinds,
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
@@ -1088,12 +1093,13 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::CreateDefaultDevices => 5,
         PrePivotStep::MountTmpfs => 6,
         PrePivotStep::InjectFiles => 7,
-        PrePivotStep::MountBinds => 8,
-        PrePivotStep::ReadonlyPaths => 9,
-        PrePivotStep::MaskedPaths => 10,
-        PrePivotStep::PivotRoot => 11,
-        PrePivotStep::RootReadOnly => 12,
-        PrePivotStep::WorkingDir => 13,
+        PrePivotStep::EtcFiles => 8,
+        PrePivotStep::MountBinds => 9,
+        PrePivotStep::ReadonlyPaths => 10,
+        PrePivotStep::MaskedPaths => 11,
+        PrePivotStep::PivotRoot => 12,
+        PrePivotStep::RootReadOnly => 13,
+        PrePivotStep::WorkingDir => 14,
     }
 }
 
@@ -1155,7 +1161,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 14);
+        assert_eq!(PrePivotStep::ALL.len(), 15);
     }
 
     /// exec の子の段（`ExecChildStep`）と launch の段のトークンは重ならない（取り違えの検出。SUP-6・#2822）。

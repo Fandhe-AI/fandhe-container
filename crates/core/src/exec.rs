@@ -117,6 +117,7 @@ mod device_probe;
 mod devices;
 mod diagnostic;
 mod entrypoint_mode;
+mod etc_mounts;
 mod exec_command;
 mod inject;
 mod interpreter;
@@ -184,6 +185,7 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
+pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
     ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
     spawn_exec_worker_with_listener,
@@ -913,11 +915,13 @@ pub enum IsolationStage {
     ApplySysctls,
     /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true`。`mount_setattr(MOUNT_ATTR_RDONLY)`。CORE-5・SEC-1・#2767）。
     RootReadOnly,
+    /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
+    MountEtcFiles,
 }
 
 impl IsolationStage {
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Validate,
         Self::Unshare,
         Self::SetGroups,
@@ -949,6 +953,7 @@ impl IsolationStage {
         Self::WorkingDir,
         Self::ApplySysctls,
         Self::RootReadOnly,
+        Self::MountEtcFiles,
     ];
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
@@ -983,6 +988,7 @@ impl IsolationStage {
             Self::MountReadonlyPaths => "mount_readonly_paths",
             Self::MountMaskedPaths => "mount_masked_paths",
             Self::MountBinds => "mount_binds",
+            Self::MountEtcFiles => "mount_etc_files",
             Self::MountSysfs => "mount_sysfs",
             Self::WorkingDir => "working_dir",
             Self::ApplySysctls => "apply_sysctls",
@@ -3047,6 +3053,7 @@ mod tests {
             IsolationStage::WorkingDir => 28,
             IsolationStage::ApplySysctls => 29,
             IsolationStage::RootReadOnly => 30,
+            IsolationStage::MountEtcFiles => 31,
         }
     }
 
@@ -3063,7 +3070,7 @@ mod tests {
             );
             assert!(seen.insert(token), "duplicate {token}");
         }
-        assert_eq!(IsolationStage::ALL.len(), 31);
+        assert_eq!(IsolationStage::ALL.len(), 32);
         assert_eq!(
             IsolationStage::MountReadonlyPaths.as_str(),
             "mount_readonly_paths"

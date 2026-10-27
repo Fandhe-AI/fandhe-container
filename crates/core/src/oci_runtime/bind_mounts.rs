@@ -223,6 +223,8 @@ pub enum BindMountErrorKind {
     OverlapsInjected,
     /// `readonlyPaths` / `maskedPaths` と重なる。
     OverlapsProtectedPath,
+    /// 管理ルートから載せる `/etc/hosts`・`/etc/resolv.conf` と重なる(NET-12・#1872)。
+    OverlapsEtcFile,
 }
 
 /// bind mount 変換・検証のエラー（ERR-1）。メッセージは位置と固定英文のみで、パス・オプション値を含めない。
@@ -284,6 +286,9 @@ impl BindMountError {
             }
             BindMountErrorKind::OverlapsProtectedPath => {
                 "bind mount destination overlaps a readonly or masked path"
+            }
+            BindMountErrorKind::OverlapsEtcFile => {
+                "bind mount destination overlaps /etc/hosts or /etc/resolv.conf"
             }
         };
         match self.index {
@@ -574,6 +579,27 @@ impl BindMountSet {
                 return Err(BindMountError::at(
                     b.index,
                     BindMountErrorKind::OverlapsInjected,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 管理ルートから載せる `/etc/hosts`・`/etc/resolv.conf`(`sel` の種別だけ)と同一・祖先・子孫なら拒否する
+    /// (NET-12・SEC-1・#1872。launcher が fork 前に呼ぶ)。
+    pub fn check_against_etc_files(
+        &self,
+        sel: crate::etc_files::EtcFileSelection,
+    ) -> Result<(), BindMountError> {
+        for b in &self.mounts {
+            if sel
+                .kinds()
+                .iter()
+                .any(|k| overlaps(b.destination.as_str(), k.container_path()))
+            {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::OverlapsEtcFile,
                 ));
             }
         }

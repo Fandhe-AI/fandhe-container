@@ -16,9 +16,16 @@
 //!   `FailedPrecondition` で失敗し、パスでの起動へ縮退しない（fail-closed）。保持 fd は構築時に必ず
 //!   close-on-exec で複製し直す（呼び出し側の fd の状態に依らない）ため、exec 後の plugin には残らない。plugin が見る `argv[0]` は実体の正規パス（`exec_path`）で、
 //!   `/proc/<pid>/comm` は fd 番号になる。
-//! - Linux 以外の unix（macOS 等）: 実体の正規パス（`exec_path`）で起動する。起動直前の同一性確認
-//!   （dev / ino の比較）は未実装で（#1866・REPAIR-3）、それまでは検証から起動までに実体のパスを
-//!   差し替えられ得る。
+//! - Linux 以外の unix（macOS 等）: fd の実体を実行する手段が無いため、実体の正規パス（`exec_path`）で
+//!   起動する。ただし spawn の直前（都度起動・常駐の再起動のたび）に、symlink を辿らない `lstat` で
+//!   「通常ファイルであり、dev / ino が構築時に保持 fd を `fstat` した値と一致する」ことを確かめる
+//!   （#1866）。不一致・不在・非通常ファイル・symlink・stat の失敗はすべて `FailedPrecondition` で、
+//!   子は spawn しない（パス起動へ縮退しない）。
+//!   - 残余: 確認から `exec` までの短い窓に差し替えられるのは、検証済みの祖先を書き換えられる同じ UID か
+//!     root だけで、PLUG-11 の脅威の外である。fd の実体を実行する Linux にはこの窓が無い。
+//!   - 保持 fd が元の inode を生かし続けるため、差し替え先が同じ dev / ino を再利用することはない。
+//!   - 同一 inode の中身の書き換えは防がない（内容はハッシュ照合の計算時点保証の範囲）。依存する
+//!     動的ライブラリがパスで解決される点は Linux と同じで、OS 固有の差ではない。
 //! - 非 unix: 起動仕様は構築できるが、listener の bind が `Unimplemented` を返し子は spawn されない。
 //! - plugin はネイティブの実行ファイルに限る。`#!` で始まるスクリプトは構築時に拒否する
 //!   （解釈系が fd を開き直す経路を作らない）。構築後に同じ inode が `#!` へ書き換えられた場合、
@@ -26,7 +33,6 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - macOS の起動直前の同一性確認（#1866）。
 //! - 検証後の起動と RPC の本番配線（#1869）。
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -35,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 起動対象ファイルの同一性（dev / ino）。構築時に fd を `fstat` して記録する。
-/// 起動直前の同一性確認（#1866）と試験が使う。
+/// 起動直前の同一性確認（`checked_exec_path`。#1866）と試験が使う。
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PluginFileIdentity {
@@ -219,6 +225,40 @@ pub(crate) fn fd_launch_error() -> PluginError {
         PluginErrorCode::FailedPrecondition,
         "plugin launch target cannot be executed through its file descriptor",
     )
+}
+
+/// パスでの起動で、検証したファイルを指していないときの構造化エラー（#1866）。不一致・不在・
+/// 非通常ファイル・symlink・stat の失敗を区別せず、パス・errno も含めない固定文言にする。
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn path_identity_error() -> PluginError {
+    PluginError::new(
+        PluginErrorCode::FailedPrecondition,
+        "plugin launch target path does not refer to the verified file",
+    )
+}
+
+/// Linux 以外の unix で、spawn 直前に `exec_path` が検証したファイルを指すことを確かめて返す（#1866・
+/// PLUG-11）。`plugin_command`（都度起動・常駐の起動と再起動）から呼ばれる。`lstat` で最終要素の symlink を
+/// 辿らず、通常ファイルかつ dev / ino が構築時の同一性と一致するときだけ `Ok`。それ以外は
+/// `path_identity_error`（fail-closed。パスでの起動へ縮退しない）。確認から exec までの窓の残余は
+/// モジュール doc を参照。Linux では使わない（fd の実体を実行する）が、試験を共通に回すため
+/// コンパイルする。
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn checked_exec_path(target: &PluginLaunchTarget) -> Result<PathBuf, PluginError> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(target.exec_path()) {
+        Ok(m)
+            if m.file_type().is_file()
+                && m.dev() == target.identity.dev
+                && m.ino() == target.identity.ino =>
+        {
+            Ok(target.exec_path().to_path_buf())
+        }
+        _ => Err(path_identity_error()),
+    }
 }
 
 /// 単体試験用: 実行中のテストバイナリ自身の起動対象（試験コードだけが構築口を呼んでよい契約）。
@@ -419,5 +459,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!ran, "rewritten script must not run through /proc/self/fd");
         assert!(!matches!(status, Ok(s) if s.success()));
+    }
+
+    /// 単体試験用の作業ディレクトリに、テストバイナリの複製を起動対象として置く。
+    #[cfg(unix)]
+    fn copied_target(tag: &str) -> (PathBuf, PathBuf, PluginLaunchTarget) {
+        let dir = std::env::temp_dir().join(format!("launch-target-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("plugin");
+        let exe = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&exe, &p).is_err() {
+            std::fs::copy(&exe, &p).unwrap();
+        }
+        let t =
+            PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), p.clone(), p.clone())
+                .unwrap();
+        (dir, p, t)
+    }
+
+    #[cfg(unix)]
+    fn assert_path_rejected(r: Result<PathBuf, PluginError>) {
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "plugin launch target path does not refer to the verified file"
+        );
+    }
+
+    /// PLUG-11・#1866: 差し替えなしなら実体のパスをそのまま返す。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_1866_checked_exec_path_accepts_unchanged() {
+        let (dir, p, t) = copied_target("ok");
+        let r = checked_exec_path(&t);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r.unwrap(), p);
+    }
+
+    /// PLUG-11・#1866: 別 inode への差し替え（rename）は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_1866_checked_exec_path_rejects_replaced_inode() {
+        let (dir, p, t) = copied_target("swap");
+        let other = dir.join("other");
+        std::fs::write(&other, b"other").unwrap();
+        std::fs::rename(&other, &p).unwrap();
+        let r = checked_exec_path(&t);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_path_rejected(r);
+    }
+
+    /// PLUG-11・#1866: パスの消失は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_1866_checked_exec_path_rejects_missing() {
+        let (dir, p, t) = copied_target("gone");
+        std::fs::remove_file(&p).unwrap();
+        let r = checked_exec_path(&t);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_path_rejected(r);
+    }
+
+    /// PLUG-11・#1866: 元の実体を指す symlink でも（辿れば同じ inode でも）拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_1866_checked_exec_path_rejects_symlink_to_same_inode() {
+        let (dir, p, t) = copied_target("link");
+        let real = dir.join("real");
+        std::fs::rename(&p, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &p).unwrap();
+        let r = checked_exec_path(&t);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_path_rejected(r);
+    }
+
+    /// PLUG-11・#1866: ディレクトリへの置き換えは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_1866_checked_exec_path_rejects_directory() {
+        let (dir, p, t) = copied_target("dir");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        let r = checked_exec_path(&t);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_path_rejected(r);
     }
 }

@@ -145,6 +145,12 @@ name = "lo_self_delivery"
 path = "tests/lo_self_delivery.rs"
 harness = false
 
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1841・#1318・#1837・MVM-4・REPAIR-12）。製品の依存には
+# 入れない（cargo tree -e normal,build に現れない）。`sys.rs` は Linux 限定のため Linux に限る。
+# 方式は docs/design/ffi-libc-check.md。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

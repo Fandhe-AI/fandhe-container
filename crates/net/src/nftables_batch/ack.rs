@@ -41,11 +41,11 @@
 //! URL は `https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/<path>#L<行>`。
 //!
 //! - 到着順は **echo → 各 ACK → 同期点の応答**。`net/netfilter/nfnetlink.c` の `nfnetlink_rcv_batch` は
-//!   BEGIN / 本体の ACK・エラーを `err_list` に積むだけで（L430-433・L535-560。L536-539 のコメント
+//!   BEGIN / 本体の ACK・エラーを `err_list` に積むだけで（L430-433・L535-559。L537-540 のコメント
 //!   「Errors are delivered once the full batch has been processed」）、`ss->commit`（L574）の後、最後の
 //!   `nfnl_err_deliver`（L603）で送る。echo は `net/netfilter/nf_tables_api.c` の `nf_tables_commit`
 //!   （L10300〜。`nf_tables_rule_notify` の呼び出しは L10465 / L10475）が作り、末尾の `nft_commit_notify`
-//!   （L10173-10210・呼び出し L10623）が `nfnetlink_send`（nfnetlink.c L176-183）→ `nlmsg_notify`
+//!   （L10173-10207・呼び出し L10623）が `nfnetlink_send`（nfnetlink.c L176-182）→ `nlmsg_notify`
 //!   （`net/netlink/af_netlink.c` L2564〜）で要求元へ unicast する。同じソケットの受信キュー（FIFO）に
 //!   入るため、成功したバッチでは echo（本体の順。複数件が 1 データグラムにまとまることがある）→ ACK の順
 //!   になる。それでも本実装は **両方の順を受理する**（判定の決め手は「同期点までに要求した echo が揃う
@@ -56,14 +56,15 @@
 //!   （L3513-3554）は `NLM_F_ECHO` 付きなら必ず通知を作る（L3523-3525）。echo の flags は
 //!   `NLM_F_APPEND` / `NLM_F_CREATE` / `NLM_F_EXCL` だけで `NLM_F_REQUEST` は付かない（L3537-3540）。
 //!   `nf_tables_fill_rule_info`（L3454〜）の nfgenmsg は `family = ctx->family`・`res_id = nft_base_seq(net)`
-//!   （L3467-3468。**世代番号で 0 ではない**）で、`NFTA_RULE_TABLE` / `NFTA_RULE_CHAIN`（NUL 込みの文字列。
-//!   L3471・L3473）・`NFTA_RULE_HANDLE`（L3475）、条件つきで POSITION / EXPRESSIONS / USERDATA が続く。
+//!   （L3467-3468。**世代番号で 0 ではない**。version は `NFNETLINK_V0` 固定）で、`NFTA_RULE_TABLE` /
+//!   `NFTA_RULE_CHAIN`（NUL 込みの文字列。L3472・L3474）・`NFTA_RULE_HANDLE`（L3476）、条件つきで POSITION / EXPRESSIONS / USERDATA が続く。
 //! - echo が届かない場合: (1) 通知用 skb の確保・組み立ての失敗は `nfnetlink_set_err`（L3553）だが、
-//!   `do_one_set_err`（af_netlink.c L1561〜）は要求元のソケットを飛ばすため要求元には何の知らせも無く echo
+//!   `do_one_set_err`（af_netlink.c L1561〜。飛ばす根拠は L1566-1567 の `sk == p->exclude_sk` と L1572 の
+//!   `nlk->portid == p->portid`）は要求元のソケットを飛ばすため要求元には何の知らせも無く echo
 //!   が欠ける、(2) 受信キューのあふれは `nlmsg_unicast`（`MSG_DONTWAIT`）の `netlink_overrun`
 //!   （af_netlink.c L350-360）で要求元に `ENOBUFS`（`socket` が `ResourceExhausted`・`Unknown` にする）、
 //!   (3) バッチの失敗（本体のエラー・commit の失敗）は abort で echo が出ない（`-EAGAIN` の replay では
-//!   最後の 1 回分だけ届く。nfnetlink.c L567-572）。(1) が黙って起きるため、「同期点までに要求した echo が
+//!   最後の 1 回分だけ届く。nfnetlink.c L567-572 の `NFNL_BATCH_REPLAY` と L575-577 の commit の `-EAGAIN`）。(1) が黙って起きるため、「同期点までに要求した echo が
 //!   揃わなければ `Unknown`」が必須の守りになる。
 //! - BEGIN には `NLM_F_ECHO` を付けない前提: commit 後の `nf_tables_gen_notify(NEWGEN)`（L10624）は BEGIN
 //!   の `NLM_F_ECHO` を見るため、付けると BEGIN の seq に NEWGEN が届き `DataLoss` になる。
@@ -76,10 +77,25 @@
 //! `NFTA_RULE_TABLE`、`NFTA_RULE_CHAIN` が要求（`NftBatch::push_with` が積んだバイト列から取った期待値。
 //! `RuleEchoExpect`）とバイト単位で一致しないもの**（欠落・重複・ネスト・NUL の不正を含む。seq が合っていても
 //! 別のルールのハンドルを採ると、後の DELRULE が別のルールを消しうるため。SEC-1）・ハンドル属性の
-//! 欠落 / 重複 / 8 バイト以外 / 0（`NftRuleHandle::from_rule_attrs`）。比べるのは family の 1 バイトと 2 つの
-//! 名前だけで、`res_id`（世代番号）・version・flags・他の属性は見ない。エラーメッセージに名前や受信バイト列は
+//! 欠落 / 重複 / 8 バイト以外 / 0（`NftRuleHandle::from_rule_attrs`）。加えて nfgenmsg の version が `NFNETLINK_V0`
+//! 以外のもの（v6.12・v5.15 とも `nf_tables_fill_rule_info` は `nfnl_msg_put(..., NFNETLINK_V0, ...)` で 0 に
+//! 固定するため、0 以外は解釈の前提が崩れた応答。#2970）も拒否する。比べるのは version・family の各 1 バイトと
+//! 2 つの名前だけで、`res_id`（世代番号）・flags・他の属性は見ない。エラーメッセージに名前や受信バイト列は
 //! 載せない。echo を要求した本体のハンドルが同期点までに揃わない場合と、失敗を集めたのに echo を受けていた
 //! （矛盾する応答）場合も `Unknown`（コミット済みかもしれないがハンドルが不明。上位は quarantine に倒す）。
+//!
+//! ## v5.15 との差（一次情報。Linux v5.15 = commit `8bb7eca972ad531c9b149c0a51ab43a417385813`。#2970・REPAIR-3）
+//!
+//! 同じ: `nft_ctx_init` の `ctx->report = nlmsg_report(nlh)`（L142）・`nf_tables_fill_rule_info` の
+//! `nfnl_msg_put(..., NFNETLINK_V0, nft_base_seq(net))`（L2884-2885）・`nft_commit_notify`（L8432〜。呼び出し L8750）
+//! → `nf_tables_gen_notify(NEWGEN)`（L8751）の順・`ss->commit`（nfnetlink.c L562）→ `nfnl_err_deliver`（L590）。
+//! よって echo の送信条件・到着順（echo → ACK → 同期点）・echo の version（0）は変わらず、version の照合は
+//! v5.15 でも正常な echo を拒否しない。
+//!
+//! 差: v5.15 の `nfnetlink_rcv_batch` は本体の `NLM_F_ACK`（L525）にしか errno 0 を積まず、v6.12 の BEGIN の ACK
+//! （L430-433）と END の ACK（L581-584）は無い。本実装は BEGIN / END に `NLM_F_ACK` を付けず errno 0 の ACK の到着を
+//! 判定に使わないので影響しない。範囲: 確かめたのは upstream のタグだけで、5.15.y の stable や distro（Ubuntu 等）の
+//! パッチは未確認。実カーネルでの観測は #1626（人間担当）。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -93,7 +109,8 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
 use crate::nftables_batch::{
-    NFGENMSG_LEN, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, RuleEchoExpect, nfnl_msg_type,
+    NFGENMSG_LEN, NFNETLINK_V0, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, RuleEchoExpect,
+    nfnl_msg_type,
 };
 use crate::nftables_rules::{NFT_MSG_NEWRULE, NftRuleHandle, rule_table_chain_attrs};
 
@@ -521,11 +538,13 @@ impl NftBatchAckCollector {
         let nfg = NfGenMsg::decode(msg.payload()).map_err(|e| self.unknown(e))?;
         // 応答の中身が要求と同じルールのものかを、family・テーブル名・チェイン名で照合する（SEC-1・#2905）。
         // seq が合っていても別のルールのハンドルを採ると、後の DELRULE が別のルールを消しうる。
-        // メッセージには名前の値や受信バイト列を載せない。res_id（世代番号）と version は比べない。
+        // メッセージには名前の値や受信バイト列を載せない。version は NFNETLINK_V0 と照合し（#2970）、
+        // res_id（世代番号）は比べない。
         let family_ok = nfg.family() == expect.family();
         let attrs = msg.attrs(NFGENMSG_LEN).map_err(|e| self.unknown(e))?;
         let identity = rule_table_chain_attrs(attrs);
         let rejected = match &identity {
+            _ if nfg.version() != NFNETLINK_V0 => Some("nfnetlink version"),
             _ if !family_ok => Some("family"),
             Err(_) => Some("table or chain attribute"),
             Ok((t, _)) if t.as_slice() != expect.table() => Some("table"),
@@ -1139,8 +1158,20 @@ mod tests {
         chain: Option<&[u8]>,
         handle: Option<&[u8]>,
     ) -> Vec<u8> {
+        rule_echo_versioned(seq, 0, family, table, chain, handle)
+    }
+
+    /// `rule_echo_with` に nfgenmsg の version を指定できる版（res_id は 0x0102）。
+    fn rule_echo_versioned(
+        seq: u32,
+        version: u8,
+        family: u8,
+        table: Option<&[u8]>,
+        chain: Option<&[u8]>,
+        handle: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut b = NlMsgBuilder::new(NEWRULE_TYPE, 0, seq, 0);
-        NfGenMsg::new(family, 0x0102).put_into(&mut b).expect("nfg");
+        b.put_fixed(&[family, version, 0x01, 0x02]).expect("nfg");
         if let Some(t) = table {
             b.put_attr(1, t).expect("table");
         }
@@ -1265,6 +1296,29 @@ mod tests {
         reach_barrier(&mut c, 104, 0);
         let e = c.conclude().expect_err("aborted");
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
+    }
+
+    /// NET-3・SEC-1・#2970: echo の nfgenmsg の version が NFNETLINK_V0 以外なら、
+    /// seq が合っていても DataLoss・Unknown とし、ハンドルを記録しない。
+    #[test]
+    fn net3_sec1_echo_version_mismatch_is_data_loss() {
+        let h = 2u64.to_be_bytes();
+        for version in [1u8, 0xFF] {
+            let dgram = rule_echo_versioned(
+                101,
+                version,
+                NFPROTO_IPV4,
+                Some(b"t\0"),
+                Some(b"c\0"),
+                Some(&h),
+            );
+            let mut c = NftBatchAckCollector::new(&echo_batch([true, false]));
+            let e = c.feed(&dgram).expect_err("version");
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "version {version}");
+            assert_eq!(e.outcome(), NftBatchOutcome::Unknown, "version {version}");
+            assert!(e.message().contains("nfnetlink version"), "{}", e.message());
+            assert_eq!(c.rule_handles[0], None, "version {version}");
+        }
     }
 
     /// NET-3・SEC-1・#2905: echo の family・テーブル名・チェイン名が要求（IPv4・`t`・`c`）と違えば、

@@ -70,7 +70,7 @@
 //!   Landlock の規則も同じ実効値から決まる。実効値は config の値と起動オプション `--read-only` の OR で、狭める方向のみ。CLI-1・CORE-5・SEC-1・SUP-12・#2767・#2828）
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
-//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は、root が書き込み可能な間は未対応で、`root.readonly=true` なら `ro` で適用する）
+//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind は root が書き込み可能でも受ける〔#1917。Landlock のルール生成へ検証済みの集合を渡す〕）
 //! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
 //!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
 //!   片方だけの path は未実装。CRI-2・CORE-3。#2674）

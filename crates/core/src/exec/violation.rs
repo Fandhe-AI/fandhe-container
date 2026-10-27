@@ -198,6 +198,9 @@ pub enum ViolationReason {
     /// Landlock の適用時に、Mount 由来のルールの対象がマウントのルートでない（マウントの内側のディレクトリを
     /// 指している。CORE-5・SEC-1・SEC-4・#2071）。
     LandlockMountNotRoot,
+    /// Landlock の適用時に、祖先の書き込み権を VFS の読み取り専用属性で打ち消すはずのルール（検証済みの `ro` の bind）の
+    /// 対象のマウントが、実際には読み取り専用でない（CORE-5・SEC-1・SEC-4・#1917）。
+    LandlockMountNotReadOnly,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -424,7 +427,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 64] = [
+    pub(super) const ALL: [ViolationReason; 65] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -462,6 +465,7 @@ impl ViolationReason {
         Self::BindTargetKindMismatch,
         Self::LandlockMountIdentityMismatch,
         Self::LandlockMountNotRoot,
+        Self::LandlockMountNotReadOnly,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -572,6 +576,7 @@ impl ViolationReason {
         match kind {
             K::MountIdentityMismatch { .. } => Some(Self::LandlockMountIdentityMismatch),
             K::MountNotRoot { .. } => Some(Self::LandlockMountNotRoot),
+            K::MountNotReadOnly { .. } => Some(Self::LandlockMountNotReadOnly),
             _ => None,
         }
     }
@@ -616,6 +621,7 @@ impl ViolationReason {
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
             Self::LandlockMountNotRoot => "landlock_mount_not_root",
+            Self::LandlockMountNotReadOnly => "landlock_mount_not_read_only",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -687,6 +693,7 @@ impl ViolationReason {
             | Self::BindTargetKindMismatch
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -745,7 +752,9 @@ impl ViolationReason {
             | Self::BindSourceReachesStateRoot
             | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
-            Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
+            Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly => "CORE-5",
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => "SEC-2",
@@ -801,6 +810,7 @@ impl ViolationReason {
             | Self::HostDeviceNodeUnexpected
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -934,6 +944,9 @@ impl ViolationReason {
                 "the mount identity of a landlock rule target differs from the one recorded after mounting"
             }
             Self::LandlockMountNotRoot => "the landlock rule target is not the root of its mount",
+            Self::LandlockMountNotReadOnly => {
+                "the landlock rule target relies on a read-only mount but the mount is writable"
+            }
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }

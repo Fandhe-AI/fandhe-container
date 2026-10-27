@@ -32,11 +32,10 @@
 #[cfg(target_os = "linux")]
 #[path = "crash_safety/client_end.rs"]
 mod client_end;
-// crash_safety と共有する判定モジュール。power_loss が使わない項目があるため dead_code を許す
+// crash_safety と共有するディスク照合（試行管理の `trial` は取り込まない）
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
-#[path = "crash_safety/trial.rs"]
-mod trial;
+#[path = "crash_safety/disk_check.rs"]
+mod disk_check;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -53,7 +52,7 @@ mod linux {
     };
 
     use crate::client_end::UnixClientEnd;
-    use crate::trial::{RECORD_LEN, check_disk_records};
+    use crate::disk_check::{RECORD_LEN, check_disk_records};
 
     /// イメージの大きさ（固定の上限。疎ファイル）。
     const IMAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -183,6 +182,49 @@ mod linux {
         }
     }
 
+    /// `/sys/class/block/dm-*/dm/name` を走査して、指定名の dm デバイスがあるかを返す。
+    /// 走査できなければ Err（不存在を確認できない）。
+    fn dm_exists(name: &str) -> Result<bool, String> {
+        let dir = std::fs::read_dir("/sys/class/block")
+            .map_err(|e| format!("cannot read /sys/class/block: {e}"))?;
+        for entry in dir {
+            let entry = entry.map_err(|e| format!("cannot read dir entry: {e}"))?;
+            if !entry.file_name().to_string_lossy().starts_with("dm-") {
+                continue;
+            }
+            match std::fs::read_to_string(entry.path().join("dm/name")) {
+                Ok(n) if n.trim() == name => return Ok(true),
+                Ok(_) => {}
+                // 走査中に消えたデバイスは対象外
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot read dm name: {e}")),
+            }
+        }
+        Ok(false)
+    }
+
+    /// `/sys/block/loop*/loop/backing_file` が自分のイメージを指す loop デバイスを探す。
+    /// 走査できなければ Err（不存在を確認できない）。
+    fn find_loop_for_image(image: &Path) -> Result<Option<String>, String> {
+        let dir =
+            std::fs::read_dir("/sys/block").map_err(|e| format!("cannot read /sys/block: {e}"))?;
+        for entry in dir {
+            let entry = entry.map_err(|e| format!("cannot read dir entry: {e}"))?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.starts_with("loop") {
+                continue;
+            }
+            match std::fs::read_to_string(entry.path().join("loop/backing_file")) {
+                Ok(b) if Path::new(b.trim()) == image => return Ok(Some(format!("/dev/{fname}"))),
+                Ok(_) => {}
+                // 未接続の loop には backing_file が無い
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot read backing_file: {e}")),
+            }
+        }
+        Ok(None)
+    }
+
     /// loop・dm・mount を必ず外す後始末つきの試験装置。Drop は逆順で外す。
     struct Rig {
         root: PathBuf,
@@ -190,7 +232,11 @@ mod linux {
         mnt: PathBuf,
         dm_name: String,
         loop_dev: Option<String>,
+        /// `losetup` を実行した（結果が不明でも作成済みの可能性がある）。cleanup が sysfs で照合する。
+        loop_attempted: bool,
         dm_created: bool,
+        /// `dmsetup create` を実行した（タイムアウト等で Err でもカーネル内に作成済みの可能性がある）。
+        dm_attempted: bool,
         mounted: bool,
         sectors: u64,
     }
@@ -221,7 +267,9 @@ mod linux {
                 root,
                 dm_name,
                 loop_dev: None,
+                loop_attempted: false,
                 dm_created: false,
+                dm_attempted: false,
                 mounted: false,
                 sectors: IMAGE_BYTES / SECTOR_BYTES,
             };
@@ -235,6 +283,8 @@ mod linux {
             drop(f);
             std::fs::create_dir(&self.mnt).map_err(|e| e.to_string())?;
             let image = self.image.to_string_lossy().into_owned();
+            // 結果が不明（タイムアウト等）でも接続済みの可能性があるため、実行前に試行を記録する
+            self.loop_attempted = true;
             let dev = run_cmd("losetup", &["--find", "--show", &image])?
                 .trim()
                 .to_string();
@@ -249,6 +299,7 @@ mod linux {
                 "loop backing_file is our image",
             )?;
             let table = flakey_table(self.sectors, &dev, FlakeyMode::Up);
+            self.dm_attempted = true;
             run_cmd("dmsetup", &["create", &self.dm_name, "--table", &table])?;
             self.dm_created = true;
             run_cmd("mkfs.ext4", &["-q", "-F", &self.dm_path()])?;
@@ -296,10 +347,32 @@ mod linux {
     }
 
     impl Rig {
+        /// 実行結果が不明だった作成操作を sysfs で照合し、作成済みなら追跡へ取り込む。
+        /// 存在の有無を確認できない場合は `failures` に積み、イメージと残存情報を保持させる。
+        fn reconcile(&mut self, failures: &mut Vec<String>) -> bool {
+            let before = failures.len();
+            if self.dm_attempted && !self.dm_created {
+                match dm_exists(&self.dm_name) {
+                    Ok(true) => self.dm_created = true,
+                    Ok(false) => {}
+                    Err(e) => failures.push(format!("cannot confirm dm absence: {e}")),
+                }
+            }
+            if self.loop_attempted && self.loop_dev.is_none() {
+                match find_loop_for_image(&self.image) {
+                    Ok(found) => self.loop_dev = found,
+                    Err(e) => failures.push(format!("cannot confirm loop absence: {e}")),
+                }
+            }
+            failures.len() > before
+        }
+
         /// 逆順で解除する。失敗した段階は残し、1 つでも失敗したらイメージ・配置先を消さずに
         /// 残存情報を Err で返す（特権操作の後始末。使用中の backing image を unlink しない）。
         fn cleanup(&mut self) -> Result<(), String> {
             let mut failures: Vec<String> = Vec::new();
+            // 照合できない作成操作が残る間は、使用中の恐れがある loop を外さずイメージも消さない
+            let unconfirmed = self.reconcile(&mut failures);
             if self.mounted {
                 let mnt = self.mnt.to_string_lossy().into_owned();
                 match run_cmd("umount", &[&mnt]) {
@@ -314,7 +387,7 @@ mod linux {
                     Err(e) => failures.push(format!("dmsetup remove: {e}")),
                 }
             }
-            let loop_to_detach = if self.dm_created {
+            let loop_to_detach = if self.dm_created || unconfirmed {
                 None
             } else {
                 self.loop_dev.clone()
@@ -469,8 +542,9 @@ mod linux {
         let path = data_dir.join(file);
         let cap = WRITES * RECORD_LEN as u64 + 4096;
         let bytes = match std::fs::File::open(&path) {
-            // ファイル自体が残っていなければ全件欠落
-            Err(_) => Vec::new(),
+            // ファイル自体が残っていなければ全件欠落。それ以外の失敗（EIO・権限等）は測定不能として Err
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
             Ok(f) => {
                 let mut b = Vec::new();
                 f.take(cap)

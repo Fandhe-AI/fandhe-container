@@ -37,6 +37,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "crash_safety/client_end.rs"]
 mod client_end;
+#[path = "crash_safety/disk_check.rs"]
+mod disk_check;
 #[path = "crash_safety/trial.rs"]
 mod trial;
 
@@ -58,10 +60,11 @@ mod unix {
         PipelineClient, persist_support,
     };
 
+    use crate::disk_check::{RECORD_LEN, check_disk_records};
     use crate::trial::{
-        DiskObservation, InvalidReason, MAX_ATTEMPTS, RECORD_LEN, ServerExit, TARGET_VALID_TRIALS,
-        TrialLedger, TrialObservation, TrialSummary, TrialVerdict, check_disk_records,
-        classify_trial, loss_summary, run_until_valid,
+        DiskObservation, InvalidReason, MAX_ATTEMPTS, ServerExit, TARGET_VALID_TRIALS, TrialLedger,
+        TrialObservation, TrialSummary, TrialVerdict, classify_trial, loss_summary,
+        run_until_valid,
     };
 
     /// テストが起動するサーバーの書き込み先 sink（`crash_test_server` の `--sink`）。

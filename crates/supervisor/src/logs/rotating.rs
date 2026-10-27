@@ -94,6 +94,8 @@
 //!   削除が失敗してロックファイルが残る（排他は保たれる）。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。コンテナのログは
 //!   `<root>/@container-logs`、supervisor 自身の構造化ログは `<root>/@supervisor-logs`（`supervisor_log` モジュール。#2067）。
+//! - platform-macos のコンソールログ回転（`crates/platform-macos/src/console_log.rs`）は同じ値と番号規則の別実装で、
+//!   コードは共有しない（#2172・REPAIR-1。理由と再評価条件は `docs/design/rotating-log-sharing.md`）。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Write};

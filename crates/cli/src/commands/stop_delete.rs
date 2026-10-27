@@ -386,6 +386,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
                 emit_warning_bounded(warning, write_warning_to_stderr, WARNING_WRITE_TIMEOUT);
             }
             remove_container_options(rt.store.as_ref(), &req);
+            remove_etc_files_after_delete(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -710,6 +711,103 @@ fn remove_container_options(store: &dyn StateStore, req: &DeleteRequest) {
     }
 }
 
+/// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の削除(`<root>/@container-etc/<id>`)の期限(REPAIR-5)。
+pub(super) const ETC_FILES_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 管理ルートの生成物の削除失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・ID は含めない。
+pub(super) fn etc_files_removal_warning(code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container etc files removal failed; leftover files may remain\"}}",
+        code.as_str()
+    )
+}
+
+/// core の `delete` が成功した後に、管理ルートの生成物(`<root>/@container-etc/<id>`。NET-12・#1872)を消す。
+///
+/// 起動オプション文書の削除と同じく、失敗・期限切れでも delete の結果は変えず警告を 1 行だけ出す。再作成済みの ID は
+/// 見送り(`id_is_still_deleted`)、新しいインスタンスの生成物を消さない。削除は作業スレッドで期限つきに待つ(REPAIR-5)。
+/// 期限切れの作業スレッドは CLI の終了で消え、残った生成物は次の start の `remove` → `create` で回収される。
+fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
+    // 生成は Linux だけ(非 Linux の `remove_etc_files` は UNIMPLEMENTED のため、毎回警告を出さないよう呼ばない)。
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let root = root.to_path_buf();
+    let id = req.id().clone();
+    if !id_is_still_deleted(&root, &id) {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_id = id.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(remove_etc_files_locked(&root, &worker_id));
+    });
+    let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => e.code(),
+        Err(_) => ErrorCode::Timeout,
+    };
+    emit_warning_bounded(
+        etc_files_removal_warning(code),
+        write_warning_to_stderr,
+        WARNING_WRITE_TIMEOUT,
+    );
+}
+
+/// ID 単位のロック(`create` が起動オプション文書の書き込みで取るものと同じ `@container-options/@locks/<id>`)を
+/// 保持したまま、不在確認から削除までを直列化する(#1872・NET-12)。
+///
+/// ロックなしでは「確認 → 並行 `create` の再作成と生成 → 削除」の順で新インスタンスの生成物を消す競合が残る。
+/// 生成側(`create` / start)は同じロックの下で作るため、ここで保持中は新しい生成が割り込まない。
+/// 削除したときだけロックファイルを回収する(再作成済みで見送ったときは触らない)。
+fn remove_etc_files_locked(
+    root: &std::path::Path,
+    id: &ContainerId,
+) -> Result<
+    fandhe_container_core::etc_files::EtcRemoveOutcome,
+    fandhe_container_core::traits::types::TraitError,
+> {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let lock = options_store::acquire_lock(root, id, ETC_FILES_LOCK_WAIT)?;
+    let outcome = remove_etc_files_if_still_deleted(
+        root,
+        id,
+        fandhe_container_core::etc_files::remove_etc_files,
+    );
+    if outcome.is_ok() && id_is_still_deleted(root, id) {
+        lock.remove_lock_file();
+    }
+    outcome
+}
+
+/// 管理ルートの生成物の削除で ID 単位のロックを待つ上限(`ETC_FILES_REMOVE_TIMEOUT` より短くする。REPAIR-5)。
+const ETC_FILES_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// 削除直前に ID が再作成されていないことを再確認して `remove` を呼ぶ(options の cleanup と同じ形。#1872・NET-12)。
+/// 起動前の確認から worker の実行までに再作成された新インスタンスの `@container-etc/<id>` を消さない。
+fn remove_etc_files_if_still_deleted(
+    root: &std::path::Path,
+    id: &ContainerId,
+    remove: impl FnOnce(
+        &std::path::Path,
+        &ContainerId,
+    ) -> Result<
+        fandhe_container_core::etc_files::EtcRemoveOutcome,
+        fandhe_container_core::traits::types::TraitError,
+    >,
+) -> Result<
+    fandhe_container_core::etc_files::EtcRemoveOutcome,
+    fandhe_container_core::traits::types::TraitError,
+> {
+    if !id_is_still_deleted(root, id) {
+        return Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::NotPresent);
+    }
+    remove(root, id)
+}
+
 /// supervisor ログ削除の警告。期限切れは専用文言、それ以外（ロック保持・権限エラー等）は `code` つきの失敗文言（REPAIR-4）。
 fn supervisor_log_removal_warning(code: ErrorCode) -> String {
     if code == ErrorCode::Timeout {
@@ -868,6 +966,42 @@ mod tests {
         store::write_new(&state_root, &id, &doc).expect("write");
         remove_container_options(&fs_store, &DeleteRequest::new(id.clone()));
         assert!(!store::options_path(&state_root, &id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-12(#1872): delete の後に管理ルートの生成物(`@container-etc/<id>`)が消え、他の ID は残る。
+    /// 再作成済み(状態にある)ID は見送る。警告文言は固定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net12_delete_removes_etc_files_and_keeps_recreated_or_other_ids() {
+        use fandhe_container_core::etc_files::{
+            EtcFileKind, EtcFileSelection, create_etc_files, etc_dir,
+        };
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        let dir = std::env::temp_dir().join(format!("fc-cli-del-etc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        let root = StateRoot::from_override(dir.join("state")).expect("root");
+        let fs_store = FileStateStore::open(root).expect("open");
+        let state_root = fs_store.host_state_root().expect("root").to_path_buf();
+        let sel = EtcFileSelection::default()
+            .with(EtcFileKind::Hosts)
+            .with(EtcFileKind::ResolvConf);
+        let (a, b) = (
+            ContainerId::new("c1").expect("id"),
+            ContainerId::new("c2").expect("id"),
+        );
+        create_etc_files(&state_root, &a, sel).expect("create c1");
+        create_etc_files(&state_root, &b, sel).expect("create c2");
+        remove_etc_files_after_delete(&fs_store, &DeleteRequest::new(a.clone()));
+        assert!(!etc_dir(&state_root, &a).exists(), "deleted id is removed");
+        assert!(etc_dir(&state_root, &b).exists(), "other ids are kept");
+        assert_eq!(
+            etc_files_removal_warning(ErrorCode::FailedPrecondition),
+            r#"{"level":"warn","code":"FAILED_PRECONDITION","message":"container etc files removal failed; leftover files may remain"}"#
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1657,6 +1791,34 @@ mod tests {
             assert!(id_is_still_deleted(&root, &id("c2")));
             std::fs::write(root.join("c1").join("state.json"), "{").expect("corrupt");
             assert!(!id_is_still_deleted(&root, &id("c1")));
+        }
+
+        /// NET-12・#1872: worker の直前で再作成済みと分かれば remover を呼ばない(新インスタンスの生成物を消さない)。
+        #[test]
+        fn net12_etc_files_removal_skipped_when_recreated_before_worker() {
+            let base = TmpDir::new("etc-recreated");
+            let store = store(&base);
+            let root = state_root(&base);
+            create_placed(&base, &store, "e1");
+            let called = std::cell::Cell::new(false);
+            let r = remove_etc_files_if_still_deleted(&root, &id("e1"), |_, _| {
+                called.set(true);
+                Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::Removed)
+            });
+            assert_eq!(
+                r.expect("ok"),
+                fandhe_container_core::etc_files::EtcRemoveOutcome::NotPresent
+            );
+            assert!(!called.get());
+            let r = remove_etc_files_if_still_deleted(&root, &id("e2"), |_, _| {
+                called.set(true);
+                Ok(fandhe_container_core::etc_files::EtcRemoveOutcome::Removed)
+            });
+            assert_eq!(
+                r.expect("ok"),
+                fandhe_container_core::etc_files::EtcRemoveOutcome::Removed
+            );
+            assert!(called.get());
         }
 
         /// 検出の呼び出し回数を数えつつ `fake` を返す remover を作る。

@@ -860,6 +860,9 @@ struct SpawnInput<'a> {
     tmpfs: &'a TmpfsMountSet,
     /// 注入するファイル(secrets / configs。空なら `None`。SUP-12・#2625)。bind との重なりは検査済み。
     inject: Option<&'a InjectedFileSet>,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind(`LaunchOptions::etc_files` が空なら `None`)。fork 前に
+    /// `EtcFileMounts::verify` で検証し、bind・tmpfs・注入との重なりも検査済み(NET-12・#1872)。
+    etc_files: Option<&'a crate::exec::EtcFileMounts>,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
     /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
@@ -1374,6 +1377,41 @@ impl Inner {
             );
             return Err(TraitError::new(code, message));
         }
+        // 管理ルートの `/etc/hosts`・`/etc/resolv.conf`(指定時のみ)。宛先の重なりを検査し(bind との重なりは他の bind の
+        // 拒否と同じく監査 sink へ記録する)、元を fork 前に fd で検証する。restart の再 launch でも毎回やり直す
+        // (NET-12・SEC-1・REPAIR-5・#1872)。
+        let etc_mounts = if options.etc_files().is_empty() {
+            None
+        } else {
+            if let Some(binds) = binds
+                && let Err(err) = binds.check_against_etc_files(options.etc_files())
+            {
+                let (code, message) = (err.code(), err.message());
+                let _ = audit_bind_mount_error(
+                    err,
+                    spec.config().mounts(),
+                    Some(id),
+                    self.audit_sink.as_ref(),
+                );
+                return Err(TraitError::new(code, message));
+            }
+            crate::etc_files::check_etc_overlaps(options.etc_files(), tmpfs, inject, None)?;
+            let Some(state_root) = spec.state_root() else {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container etc files require a state store root",
+                ));
+            };
+            Some(
+                crate::exec::EtcFileMounts::verify(
+                    state_root,
+                    id,
+                    options.etc_files(),
+                    effective_root_readonly,
+                )
+                .map_err(|e| to_trait_error(&e))?,
+            )
+        };
         let audit = LaunchAudit {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
@@ -1397,6 +1435,7 @@ impl Inner {
                 timeout,
                 tmpfs,
                 inject,
+                etc_files: etc_mounts.as_ref(),
                 binds,
                 sysfs: spec.sysfs_mount(),
                 sysctls: sysctls.as_ref(),
@@ -1934,6 +1973,7 @@ impl LaunchOps for RealOps {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
             inject: input.inject,
+            etc_files: input.etc_files,
             binds: input.binds,
             sysfs: input.sysfs,
             sysctls: input.sysctls,
@@ -4330,6 +4370,81 @@ mod tests {
                 .expect_err("rejected");
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
         }
+    }
+
+    /// NET-12・SEC-1(#1872): `etc_files` の指定は、状態ルートが無い・生成物が無い・`/etc` の bind と重なる構成を
+    /// spawn の前に拒否し、生成済みなら通る。指定しない launch は従来どおり(A6)。
+    #[test]
+    fn net12_etc_files_are_verified_before_spawn() {
+        use crate::etc_files::{EtcFileKind, EtcFileSelection, create_etc_files};
+        let sel = EtcFileSelection::default()
+            .with(EtcFileKind::Hosts)
+            .with(EtcFileKind::ResolvConf);
+        let with_etc = || {
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_etc_files(sel)
+                .expect("etc files")
+        };
+        let launch = |spec: &LaunchSpec, options: LaunchOptions| {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let r = l.launch(spec, Duration::from_secs(1));
+            let spawned = ev
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn "))
+                .count();
+            (r, spawned)
+        };
+
+        // 状態ルートが無い。
+        let spec = spec_for("etc-no-root", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("no state root");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // 状態ルートはあるが生成していない。
+        let dir = crate::test_support::TestTempDir::new("etc-launch").expect("tmp");
+        let spec = spec_for("etc-missing", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("not created");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // `/etc` の bind と重なる。
+        let spec = spec_with_mounts(
+            "etc-bind",
+            serde_json::json!({}),
+            serde_json::json!([
+                {"destination": "/etc", "type": "bind", "source": "/srv/data", "options": ["rbind"]}
+            ]),
+        )
+        .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("overlap");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(spawned, 0);
+
+        // 生成済みなら通る。
+        let spec = spec_for("etc-ok", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        create_etc_files(dir.path(), spec.container_id(), sel).expect("create");
+        let (r, spawned) = launch(&spec, with_etc());
+        let p = r.expect("launched");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+
+        // 指定しない launch は状態ルートの有無に関わらず従来どおり。
+        let spec = spec_for("etc-none", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, LaunchOptions::try_default().expect("default"));
+        let p = r.expect("launched without etc files");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     /// SEC-2・CORE-5(#2625): readonlyPaths の厳密な子孫への tmpfs・注入ディレクトリは spawn の前に拒否する。

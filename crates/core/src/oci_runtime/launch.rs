@@ -496,6 +496,9 @@ pub struct LaunchSpec {
     /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
     /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
     namespace_join: Option<NamespaceJoin>,
+    /// `start` が使った状態ルート（`StateStore::host_state_root()`。管理ルートの `/etc/hosts` 等の元の場所を導く入力。
+    /// 無ければ `None`。NET-12・#1872）。
+    state_root: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -532,7 +535,22 @@ impl LaunchSpec {
             user,
             additional_gids: Vec::new(),
             namespace_join: None,
+            state_root: None,
         }
+    }
+
+    /// `start` が使った状態ルートを載せる(`start` だけが呼ぶ。呼び出し側が任意のパスを渡す入口にしない。NET-12・#1872)。
+    pub(super) fn with_state_root(mut self, state_root: Option<PathBuf>) -> Self {
+        self.state_root = state_root;
+        self
+    }
+
+    /// `start` が使った状態ルート(`StateStore::host_state_root()` の値。無ければ `None`)。
+    ///
+    /// 本番 launcher が、`LaunchOptions::etc_files` の指定時に `<state_root>/@container-etc/<id>/` の生成物を
+    /// fork 前に検証するために使う(NET-12・#1872)。
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
     }
 
     /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。

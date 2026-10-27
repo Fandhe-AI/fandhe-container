@@ -8,7 +8,7 @@
 //! peer credential を検証する（PLUG-12・security.md「UDS は所有者・権限・
 //! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
 //! 切断する」）ために、std だけでは取得できない次の値を FFI で直接取得する。
-//! `libc` / `nix` は依存追加が禁止されている
+//! `libc` / `nix` は製品の依存に入れない
 //! （dependency-policy。`std::os::unix::net::UnixStream::peer_cred` は
 //! unstable のため使えない）ため、本モジュールが必要最小限のラッパーを持つ。
 //!
@@ -80,7 +80,10 @@
 //! 確認する」という運用条件を満たせないため、本モジュールは `Cargo.toml` を
 //! 変更せず、既存の `getsockopt`・`getpeereid`・`geteuid` と同じ流儀で
 //! 必要最小限の `extern "C"` 宣言を自前で持つ（dependency-policy「ユーザー
-//! 承認制」）。
+//! 承認制」）。ただし #1318 の決定により、`libc` は試験専用の dev-dependency
+//! として宣言の機械照合にだけ使う（子モジュール `libc_abi`・`beneath::libc_abi`・
+//! `tests::libc_abi_fixtures` と `sys/vsock.rs` の `libc_abi`。#1842・MVM-4・REPAIR-12。
+//! 方式は `docs/design/ffi-libc-check.md`）。製品コードは `libc` を参照しない。
 //!
 //! # `syncfs` の定数について
 //! `syncfs(2)` はアーキテクチャ非依存の libc シンボル名で呼び出す（生の
@@ -1109,6 +1112,129 @@ mod beneath {
             Ok(entries)
         }
     }
+
+    /// `raw` の関数の型と `beneath_consts` を `libc` と照合する（#1842・IO-5・IO-2・REPAIR-12）。関数は呼ばない。
+    /// 親 `beneath` と同じ cfg（macOS、Linux の LP64 x86_64 / aarch64）の下にあり、ターゲットごとの
+    /// `libc` の値と比べる。対象外: `LINKAT_FLAGS`（`libc` に無い方針値。`AT_SYMLINK_FOLLOW` を
+    /// 含まないことだけ照合）。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::c;
+        use super::raw;
+        use std::mem::{offset_of, size_of};
+
+        const _: () = {
+            assert!(c::O_WRONLY == libc::O_WRONLY);
+            assert!(c::O_CREAT == libc::O_CREAT);
+            assert!(c::O_EXCL == libc::O_EXCL);
+            assert!(c::O_APPEND == libc::O_APPEND);
+            assert!(c::O_NONBLOCK == libc::O_NONBLOCK);
+            assert!(c::O_DIRECTORY == libc::O_DIRECTORY);
+            assert!(c::O_NOFOLLOW == libc::O_NOFOLLOW);
+            assert!(c::O_CLOEXEC == libc::O_CLOEXEC);
+            assert!(c::AT_REMOVEDIR == libc::AT_REMOVEDIR);
+            assert!(c::AT_SYMLINK_FOLLOW == libc::AT_SYMLINK_FOLLOW);
+            // `linkat` は symlink を辿らない（`AT_SYMLINK_FOLLOW` を含まない）ことを固定する。
+            assert!(c::LINKAT_FLAGS & libc::AT_SYMLINK_FOLLOW == 0);
+            assert!(c::EEXIST == libc::EEXIST);
+            assert!(c::ENOTDIR == libc::ENOTDIR);
+            assert!(c::ELOOP == libc::ELOOP);
+
+            // `mode_t` の幅（Linux は u32、macOS は u16）。
+            assert!(size_of::<c::ModeT>() == size_of::<libc::mode_t>());
+
+            // `readdir` が返す先頭バイトから `d_ino`（u64 で読む）と `d_name` を固定オフセットで読む。
+            assert!(size_of::<u64>() == size_of::<libc::ino_t>());
+            assert!(c::DIRENT_INO_OFFSET == offset_of!(libc::dirent, d_ino));
+            assert!(c::DIRENT_NAME_OFFSET == offset_of!(libc::dirent, d_name));
+        };
+
+        // `openat` は自前も `libc` も可変長（第 4 引数 mode は `O_CREAT` のときだけ読まれる）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = raw::openat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = libc::openat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = raw::mkdirat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = libc::mkdirat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = raw::unlinkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = libc::unlinkat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+        ) -> libc::c_int = raw::renameat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+        ) -> libc::c_int = libc::renameat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = raw::linkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = libc::linkat;
+
+        // DIR は自前では不透明な `*mut c_void`、`readdir` の戻りは先頭バイトへの `*mut u8`、
+        // `libc` では `*mut DIR`・`*mut dirent`。ポインタ先の型は別書きで、ABI は同じポインタ幅。
+        // `dirent` の中身のオフセットの一致は上の `offset_of!` が担う。macOS x86_64 の
+        // `$INODE64` の link_name は `libc` も同じ（`fdopendir`・`readdir`・`rewinddir`）。
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut core::ffi::c_void = raw::fdopendir;
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut libc::DIR = libc::fdopendir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut u8 = raw::readdir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent = libc::readdir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) = raw::rewinddir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) = libc::rewinddir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) -> libc::c_int = raw::closedir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int = libc::closedir;
+
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = raw::__errno_location;
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__errno_location;
+        #[cfg(target_os = "macos")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = raw::__error;
+        #[cfg(target_os = "macos")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__error;
+    }
 }
 
 /// 対応外アーキテクチャ向け（fail-closed）。実装（unsafe を含む）はビルドから
@@ -1197,6 +1323,83 @@ mod beneath {
     ) -> Result<Vec<DirEntryName>, ReadDirError> {
         Err(ReadDirError::Io(io::ErrorKind::Unsupported))
     }
+}
+
+/// 自前の FFI 宣言を `libc` 0.2.189 と `const` 評価で照合する（#1842・PLUG-12・IO-2・MVM-4・REPAIR-12）。
+/// 関数は呼ばない。ターゲットごとに `cfg` を揃え、そのターゲットの `libc` の値・レイアウトと比べる。
+/// `beneath` の定数・関数は `beneath::libc_abi`、`TEST_O_PATH` は `tests::libc_abi_fixtures`、
+/// vsock は `sys/vsock.rs` の `libc_abi` で照合する。
+///
+/// 対象外（理由つき）:
+/// - `linux::UCRED_SIZE`・`linux::UCRED_LEN`: `size_of::<Ucred>()` 由来で、構造体のサイズ照合に含まれる
+/// - `MAX_FULL_FSYNC_EINTR_RETRIES`: 再試行の上限で FFI ではない
+/// - 安全なラッパー群と `windows.rs`（Windows API。#1837 の範囲外）
+#[cfg(test)]
+mod libc_abi {
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const _: () = {
+        use super::linux::{SO_PEERCRED, SOL_SOCKET, Ucred};
+        use std::mem::{align_of, offset_of, size_of};
+        assert!(SOL_SOCKET == libc::SOL_SOCKET);
+        assert!(SO_PEERCRED == libc::SO_PEERCRED);
+        assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+        assert!(size_of::<i32>() == size_of::<libc::pid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::uid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::gid_t>());
+    };
+
+    // 自前は `*mut core::ffi::c_void`・`*mut u32`、`libc` は `*mut c_void`・`*mut socklen_t`（= u32）。
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = super::linux::getsockopt;
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getsockopt;
+
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = super::syncfs_raw::syncfs;
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::syncfs;
+
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, *mut libc::uid_t, *mut libc::gid_t) -> libc::c_int =
+        super::getpeereid;
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, *mut libc::uid_t, *mut libc::gid_t) -> libc::c_int =
+        libc::getpeereid;
+
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(super::full_fsync_raw::F_FULLFSYNC == libc::F_FULLFSYNC);
+        assert!(super::full_fsync_raw::EINTR == libc::EINTR);
+    };
+    // `fcntl` は自前も `libc` も可変長。
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int =
+        super::full_fsync_raw::fcntl;
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = libc::fcntl;
 }
 
 #[cfg(test)]
@@ -1296,6 +1499,16 @@ mod tests {
         target_pointer_width = "64"
     ))]
     const TEST_O_PATH: i32 = 0o10_000_000;
+
+    /// `TEST_O_PATH` を `libc` と照合する（#1842。使う試験は `io2_syncfs_on_o_path_fd_returns_ebadf`）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod libc_abi_fixtures {
+        const _: () = assert!(super::TEST_O_PATH == libc::O_PATH);
+    }
 
     #[cfg(all(
         target_os = "linux",

@@ -106,6 +106,7 @@ fandhe-container/
 │   │   ├── cri-cgroup-parent.md   # CRI の cgroup_parent の受け入れ方針の判断記録（#2672・CRI-2・CORE-4。オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）
 │   │   ├── cdi-non-gpu-generalization.md  # 非 GPU デバイスの CDI spec 一般化の机上検証・GPU 固有前提の洗い出し・#571 向け PoC 手順（TASK-132・GPU-9〔検討中〕。判断は #571）
 │   │   ├── cri-devices-cdi.md     # CRI の devices・CDI の受け入れ方針の判断記録（#2673・CRI-2・GPU-1・SEC-1。オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）
+│   │   ├── cdi-rootless-device-nodes.md  # rootless での CDI deviceNodes をホストのノードの bind で供給する方式の設計・判断シート（#2986・GPU-2・GPU-4・CORE-6・SEC-5。オーナー承認待ち）
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
 │   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・OCI-5・SEC-4。オーナー承認待ち）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）

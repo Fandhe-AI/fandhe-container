@@ -282,7 +282,10 @@ pub(crate) mod plugin_fs {
 
     /// `parent`（`None` なら `AT_FDCWD`）の下の `name` を symlink を辿らずディレクトリとして開く。
     ///
-    /// symlink は `Os(ELOOP)`（Linux は `ENOTDIR`）、非ディレクトリは `Os(ENOTDIR)`、不在は `Os(ENOENT)`。
+    /// symlink・非ディレクトリはどちらも `Os(ENOTDIR)`、不在は `Os(ENOENT)`（Linux と同じ）。XNU の
+    /// `vn_authorize_open_existing`（bsd/vfs/vfs_subr.c）は非ディレクトリへ `O_DIRECTORY` の `ENOTDIR` を
+    /// `O_NOFOLLOW` の `ELOOP` より先に返すため、symlink で `ELOOP` にはならない（#3126）。呼び出し元
+    /// （`plugin_trust` の `map_sys`）はどちらも `NotDirectory` に写して拒否する（fail-closed）。
     /// `O_SEARCH` は一次資料で確認できないため `O_RDONLY` で開き、読み取り権限の無いディレクトリは
     /// `Os(EACCES)` で返す（呼び出し側が拒否する。fail-closed）。
     pub(crate) fn open_dir_nofollow_at(
@@ -509,7 +512,9 @@ pub(crate) mod plugin_fs {
             std::fs::write(t.0.join("f"), b"x").expect("write");
             symlink("d", t.0.join("l")).expect("symlink");
             let go = |n: &str| open_dir_nofollow_at(Some(dir.as_fd()), &c(n)).err();
-            assert_eq!(go("l"), Some(SysError::Os(ELOOP)));
+            // XNU は O_DIRECTORY の ENOTDIR を O_NOFOLLOW の ELOOP より先に返すため、symlink も ENOTDIR
+            // （Linux と同じ。#3126）。拒否されること自体が契約で、エラー種別は区別しない。
+            assert_eq!(go("l"), Some(SysError::Os(ENOTDIR)));
             assert_eq!(go("f"), Some(SysError::Os(ENOTDIR)));
             assert_eq!(go("nope"), Some(SysError::Os(ENOENT)));
             assert!(go("d").is_none());

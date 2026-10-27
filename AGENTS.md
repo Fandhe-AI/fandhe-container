@@ -597,6 +597,20 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   cargo test -p fandhe-container-gpu --lib -- --ignored --exact cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary
   ```
 
+- CUDA ワークロード統合テスト（GPU-2・TASK-127.6・#552。`crates/gpu/tests/cuda_workload.rs` の `gpu2_cuda_workload_five_trials_with_namespace_isolation`）: CDI の deviceNodes・mounts・フック・env を新しい PID / mount / UTS / IPC namespace の rootfs へ当て、CUDA の行列積が 5 回中 5 回成功し CPU 参照値との最大相対誤差が 1e-3 以下であること、同じ実行の中で独自の hostname・PID 1 が自プロセス・独自の mountinfo（mount ID がホストと共有されない）・4 種の namespace 識別子がホストと異なることを照合する。出力行列は試験側が CPU 参照値（64 行を抜き出し f64 で累算）と照合し、ワークロードの自己申告は信用しない。core の pre-pivot 段への配線は #2774 で未実装のため、core の経路ではなく試験コードが `unshare`・`mount`・`pivot_root` で順序を組み立てる（#2774 の完了後に core の経路へ移す。REPAIR-3）。CI では回さず、実機の実行は人間担当（#1621・`cdi_device_nodes_root` と同じ扱い）。純関数の単体試験（参照値・誤差・解析・分離判定）は `#[ignore]` なしで既定の集合で回る。前提が欠けたときは skip せず panic する
+  - 必要環境: root、NVIDIA GPU とドライバ、NVIDIA Container Toolkit が生成した CDI spec（`nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml`）と spec が指す `nvidia-cdi-hook`、util-linux の `unshare`・`mount`・`pivot_root`、rootfs の雛形（例: `docker export` した `ubuntu:24.04` を展開したもの。`umount` を含む）、`crates/gpu/tests/cuda/matmul.cu` を `nvcc -O2 -o cuda-matmul matmul.cu` でビルドして雛形に置いた `cuda-matmul`
+  - 環境変数（必須）: `FANDHE_CONTAINER_GPU_TEST_CDI_SPEC`（spec の絶対パス）・`FANDHE_CONTAINER_GPU_TEST_CDI_DEVICES`（カンマ区切りのデバイス名。例 `all`）・`FANDHE_CONTAINER_GPU_TEST_ROOTFS`（雛形の絶対パス。毎回 `cp -a` で複製する）・`FANDHE_CONTAINER_GPU_TEST_WORKLOAD`（rootfs 内のワークロードの絶対パス。例 `/opt/fandhe/cuda-matmul`）。任意: `FANDHE_CONTAINER_GPU_TEST_MATRIX_N`（既定 1024・64〜8192 の 64 の倍数）・`FANDHE_CONTAINER_GPU_TEST_TIMEOUT_SECS`（1 試行の期限。既定 600・上限 1800）・`FANDHE_CONTAINER_GPU_TEST_WORK_ROOT`（既定は一時ディレクトリ）
+  - 成功行: `gpu2_cuda_workload: 5/5 trials passed (max_rel_err=<e> <= 1e-3, cuda_device=<名前>, pid/mnt/uts/ipc namespaces isolated)`
+  - 結果は PR に記録する。実機での 5/5 の確認は未実施（人間へ引き継ぎ）
+
+  ```bash
+  # sudo の PATH には通常 cargo が無いため、ビルドと実行を 2 段に分ける
+  cargo test -p fandhe-container-gpu --test cuda_workload --no-run   # 出力の試験バイナリのパスを控える
+  sudo env FANDHE_CONTAINER_GPU_TEST_CDI_SPEC=/var/run/cdi/nvidia.yaml FANDHE_CONTAINER_GPU_TEST_CDI_DEVICES=all \
+    FANDHE_CONTAINER_GPU_TEST_ROOTFS=<rootfs 雛形> FANDHE_CONTAINER_GPU_TEST_WORKLOAD=/opt/fandhe/cuda-matmul \
+    <試験バイナリ> --ignored --exact gpu2_cuda_workload_five_trials_with_namespace_isolation --nocapture
+  ```
+
 ### ライセンス検査
 
 ```bash

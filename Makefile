@@ -206,7 +206,7 @@ net-setup-timing-selftest: ## ネットワーク作成/接続/削除の所要時
 net-throughput-rtt-selftest: ## iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプトの自己テスト（NET-2・NET-3・REPAIR-12。実機・docker 不要）
 	@scripts/with-tools.sh jq scripts/bench/net_throughput_rtt_selftest.sh
 
-small-files-compare-selftest: ##bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
+small-files-compare-selftest: ## bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
 	@scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
 
 mac-small-files-selftest: ## MAC-3 小ファイル多数計測スクリプトの自己テスト（REPAIR-12。実 Docker Desktop 不要。#1880）

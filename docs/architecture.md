@@ -267,10 +267,10 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows`）は、自前の計装トレイト（`IoOpRecorder`・`NetOpRecorder`・`OciOpRecorder`・`CriOpRecorder`・`WinOpRecorder`）を持つ。これを core の `OpRecorder` へつなぐアダプタの置き場の原則は次のとおり（TASK-84 追補。2026-10-12 オーナー決定、[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)）。
 
 - 配置: アダプタは、その操作を本番で呼び、かつ `OpRecorder` を持っている crate に置く
-- 依存辺: 計装だけのために workspace 内の依存辺は足さない。機能上の辺（例: core → io の `VolumeProvider`、net の PLUG-1 区分の確定）を入れる issue で、アダプタも一緒に入れる
+- 依存辺: 計装だけのために workspace 内の依存辺は足さない。機能上の辺（例: core → io の `VolumeProvider`、core → net の依存辺の採否（net の PLUG-1 区分は core 側ライブラリで確定済み））を入れる issue で、アダプタも一緒に入れる
 - 対象外: plugin の計装（`crates/plugin/src/lifecycle.rs` の observer）は、core 側の proxy を配線する場所で `OpRecorder` に渡す（[plugin-backend-wiring.md](design/plugin-backend-wiring.md)）
 - #653（TASK-98.2）は出力形式の統一で、配置とは独立。5 つのトレイトの統合は #653 の後に再検討する
-- 採らなかった案: cli か core に集める。計装のための辺が増えるため。core → net は PLUG-1 の区分が未確定
+- 採らなかった案: cli か core に集める。計装のための辺が増えるため。core → net は net が core 側ライブラリに確定済みだが、依存辺の採否（向き・feature の切り方）が未決（#1870）
 
 現状の当てはめ（詳細の正は各 crate の `instrument` モジュールの doc）:
 

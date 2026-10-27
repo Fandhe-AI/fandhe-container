@@ -134,7 +134,7 @@ loop {
 - クラッシュ安全性テスト（TASK-18）
 - クライアント側の UDS `connect` と `PipelineClient` の本番結合
 - vsock・named pipe のトランスポート
-- 電源断への耐性の検証
+- 電源断への耐性の検証（方式の判断記録: [io-power-loss-verification.md](../design/io-power-loss-verification.md)。オーナー承認待ち）
 
 ## 関連ドキュメント・ソース
 

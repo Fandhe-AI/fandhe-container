@@ -37,7 +37,7 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 
 - ログ削除全体の最悪は「待ち 10 秒 + 最後の試行 5 秒」= 15 秒
 - force delete の後始末の最悪（plugin-cri）: ログ 2 件 20 秒（共有の待ち 10 秒 + supervisor ログの最後の試行 5 秒 + コンテナログの最後の試行 5 秒。#2964）
-  + 起動オプション文書の掃除 10 秒（#2760）= 30 秒。stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`）と足すと 47 秒で、
+  に加えて起動オプション文書の掃除 10 秒（#2760）で 30 秒。stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`）と足すと 47 秒で、
   `PLUGIN_FORCE_DELETE_DEADLINE` と一致する。core の delete と bundle の解放を含めた全体は「`RemoveContainer` の全体の上限と kubelet の期限」節
   （#3027）。不等式は結合試験 `repair5_force_delete_worst_case_fits_runtime_timeout` で機械照合する
 - `CreateContainer` の最悪（plugin-cri。#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック `STATE_LOCK_TIMEOUT` 5 秒 +
@@ -256,7 +256,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 
 ## `RemoveContainer` の全体の上限と kubelet の期限（#3027・CRI-2・SUP-7・REPAIR-3・REPAIR-5）
 
-#2964 の内訳（47 秒）には、core の `oci_runtime::delete` と、CRI 層 `runtime_remove_one` の bundle の解放が入っていなかった。
+従来の内訳（#2964。47 秒）には、core の `oci_runtime::delete` と、CRI 層 `runtime_remove_one` の bundle の解放が入っていなかった。
 
 ### core の delete の待ち
 

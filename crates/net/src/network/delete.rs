@@ -569,6 +569,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             address,
             netns,
             published_ports,
+            pin_identity,
         } = c;
         let veth_gone = delete_veth(
             ops,
@@ -597,6 +598,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 address,
                 netns,
                 published_ports,
+                pin_identity,
             });
             false
         } else {
@@ -623,6 +625,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                         address,
                         netns,
                         published_ports,
+                        pin_identity,
                     });
                     false
                 }
@@ -1577,6 +1580,7 @@ mod tests {
             address,
             netns: (),
             published_ports: Vec::new(),
+            pin_identity: None,
         }
     }
 
@@ -1733,6 +1737,7 @@ mod tests {
             address: c1.address,
             netns: (),
             published_ports: Vec::new(),
+            pin_identity: None,
         };
         let e = delete_network_with(&fake, &net, vec![c1, dup], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(

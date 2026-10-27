@@ -339,3 +339,28 @@ fn net1_detach_unpin_failure_keeps_address() {
         Ok(claim)
     );
 }
+
+/// NET-1・#3062: 請求書の pin 識別子は接続時にハンドルへ固定した値で、現在のパスから採り直さない
+/// （パス上の pin が作り直されても、古いハンドルの請求書が新世代の識別子を取り込まない）。
+#[test]
+fn net1_detach_claim_uses_pin_identity_fixed_at_attach() {
+    use crate::network::attach_claim::TEST_PIN;
+    let (net, mut ipam, mut ports) = setup();
+    let mut c1 = attached(&mut ipam, "c1");
+    // 接続時に控えた識別子。テストのパスには実在の pin が無く、採り直せば `None` になる。
+    c1.pin_identity = Some(TEST_PIN);
+    let fake = Fake {
+        veth_delete_err: Some(NetErrorCode::Internal),
+        ..Fake::default()
+    };
+    let e = detach::detach_container_with(&fake, &net, c1, Vec::new(), &mut ipam, &mut ports)
+        .unwrap_err();
+    assert_eq!(e.reclaim_claim().unwrap().pin(), Some(TEST_PIN));
+
+    // 識別子を控えていない接続は、パスから採り直さず `None` のまま。
+    let mut c2 = attached(&mut ipam, "c2");
+    c2.pin_identity = None;
+    let e = detach::detach_container_with(&fake, &net, c2, Vec::new(), &mut ipam, &mut ports)
+        .unwrap_err();
+    assert_eq!(e.reclaim_claim().unwrap().pin(), None);
+}

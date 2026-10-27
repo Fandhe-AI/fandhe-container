@@ -1290,6 +1290,9 @@ pub struct AttachedContainer<N> {
     /// attach 時のポート公開で投入した DNAT ルールのハンドル（`ContainerAttachSpec` の公開指定の順。
     /// 個別の解除は `unpublish_container_port`。指定が無ければ空。NET-3・#2839）。
     pub published_ports: Vec<PublishedPort>,
+    /// 接続時に固定した pin の識別子（回収用。切り離しの請求書はこれを使い、現在のパスから採り直さない。
+    /// pin が作り直された場合に新世代の pin を指さないため。NET-1・#3062）。特定できなければ `None`。
+    pub(crate) pin_identity: Option<attach_claim::PinIdentity>,
 }
 
 impl<N> AttachedContainer<N> {
@@ -2000,6 +2003,7 @@ fn attach_with_source<O: AttachOps>(
     };
     ops.release_netns_socket(&mut netns);
 
+    let pin_identity = attach_claim::pin_identity_of(&pin);
     Ok(AttachedContainer {
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
@@ -2011,6 +2015,7 @@ fn attach_with_source<O: AttachOps>(
         address,
         netns,
         published_ports,
+        pin_identity,
     })
 }
 

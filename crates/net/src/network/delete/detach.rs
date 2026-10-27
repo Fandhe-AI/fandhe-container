@@ -43,7 +43,7 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::NetlinkRouteSocket;
 #[cfg(target_os = "linux")]
 use crate::netns::ContainerNetns;
-use crate::network::attach_claim::{FailedAttachClaim, pin_identity_of};
+use crate::network::attach_claim::FailedAttachClaim;
 use crate::network::unpublish::{UnpublishRules, unpublish_ports_with};
 use crate::network::{
     AttachedContainer, CreatedNetwork, MAX_PORT_PUBLISHES, PortRegistry, PublishedPort,
@@ -163,6 +163,7 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
         address,
         netns,
         published_ports,
+        pin_identity,
         ..
     } = container;
     let mut report = NetworkDeleteReport::default();
@@ -221,8 +222,8 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
         }
     }
 
-    // 3. veth。pin の識別子は請求書用に unpin より前に控える。
-    let pin_identity = pin_identity_of(&netns_path);
+    // 3. veth。pin の識別子は接続時に固定したものを使う（現在のパスから採り直すと、pin が作り直された
+    //    ときに新世代の識別子を請求書へ取り込み、新世代の pin を回収で外せてしまう。NET-1）。
     let veth_gone = delete_veth(
         ops,
         &host_veth,

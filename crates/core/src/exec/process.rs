@@ -2637,6 +2637,7 @@ impl RealPrePivotOps {
         prepared: &PreparedRootfs,
         by: MountedBy,
         destination: &str,
+        read_only: bool,
         stage: IsolationStage,
     ) -> Result<(), ExecError> {
         let identity = crate::landlock::observe_mount_beneath(prepared.new_root(), destination)
@@ -2649,6 +2650,7 @@ impl RealPrePivotOps {
                 by,
                 destination: destination.to_string(),
                 identity,
+                read_only,
             })
             .map_err(|_| {
                 ExecError::new(
@@ -2733,6 +2735,7 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::DefaultDevices(mount),
                 mount.destination(),
+                false,
                 IsolationStage::CreateDevices,
             )?;
         }
@@ -2752,6 +2755,7 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::Tmpfs,
                 &outcome.destination,
+                false,
                 IsolationStage::MountTmpfs,
             )?;
         }
@@ -2770,6 +2774,7 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::Inject,
                 &dir.destination,
+                false,
                 IsolationStage::InjectFiles,
             )?;
         }
@@ -2790,6 +2795,8 @@ impl PrePivotOps for RealPrePivotOps {
                     index: outcome.index,
                 },
                 &outcome.destination,
+                // 事後検証済みの値（`ro` の bind に頼る Landlock のルールの適用時の照合に使う。#1917）。
+                outcome.read_only,
                 IsolationStage::MountBinds,
             )?;
         }

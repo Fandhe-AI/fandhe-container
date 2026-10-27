@@ -149,6 +149,13 @@ pub enum LandlockApplyErrorKind {
         /// errno（errno を伴わない失敗は 0）。
         errno: i32,
     },
+    /// 祖先の書き込み権を VFS の読み取り専用属性で打ち消すルール（検証済みの `ro` の bind。`requires_read_only_mount`）の
+    /// 対象が、実際には読み取り専用でない（`fstatfs` の `ST_RDONLY` が無い、観測できない、記録の `read_only` が偽）。
+    /// `landlock_add_rule` の前に拒否する（書き込みを禁じる層が Landlock には無いため。#1917・CORE-5・SEC-1）。
+    MountNotReadOnly {
+        /// ルールの位置。
+        index: usize,
+    },
     /// 内部不整合（パスに NUL が含まれる等。型により通常は起こらない）。
     Internal,
 }
@@ -173,6 +180,7 @@ impl LandlockApplyErrorKind {
             Self::MountNotRoot { .. } => "landlock_mount_not_root",
             Self::MountIdentityMismatch { .. } => "landlock_mount_identity_mismatch",
             Self::MountIdentityUnobservable { .. } => "landlock_mount_identity_unobservable",
+            Self::MountNotReadOnly { .. } => "landlock_mount_not_read_only",
             Self::Internal => "internal",
         }
     }
@@ -309,6 +317,8 @@ pub(crate) trait LandlockKernel {
     fn probe_mount(&self, path: &Self::PathFd) -> Result<MountProbe, SysError>;
     /// ルール対象（`open_rule_path` が返した fd。開き直さない）のマウントの識別子を観測する（#2071）。
     fn mount_identity(&self, path: &Self::PathFd) -> Result<MountIdentity, SysError>;
+    /// ルール対象（開き直さない）のマウントのフラグを観測する（`ro` の bind に頼るルールの確認。#1917）。
+    fn mount_flags(&self, path: &Self::PathFd) -> Result<sys::MountFlags, SysError>;
 }
 
 /// 実カーネルへの適用（`crate::sys` の安全なラッパーを呼ぶだけ）。
@@ -361,6 +371,10 @@ impl LandlockKernel for RealKernel<'_> {
 
     fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
         MountIdentity::of_fd(path)
+    }
+
+    fn mount_flags(&self, path: &OwnedFd) -> Result<sys::MountFlags, SysError> {
+        sys::mount_flags(path.as_fd())
     }
 
     fn probe_mount(&self, path: &OwnedFd) -> Result<MountProbe, SysError> {
@@ -682,6 +696,28 @@ fn apply_with<K: LandlockKernel>(
             check_mount_identity(index, expected, &observed)?;
             report.mounts_verified += 1;
         }
+        // 祖先の書き込み権を VFS の読み取り専用属性で打ち消すルール（検証済みの `ro` の bind）は、対象のマウントが
+        // 実際に読み取り専用であることを確かめてから足す。launch の経路では記録の `read_only` も照合する（#1917）。
+        if super::rules::requires_read_only_mount(ruleset.rules(), index) {
+            let not_ro = || {
+                LandlockApplyError::new(
+                    ErrorCode::FailedPrecondition,
+                    Kind::MountNotReadOnly { index },
+                    "rule target relies on a read-only mount but the mount is writable",
+                )
+            };
+            let flags = kernel.mount_flags(&fd).map_err(|_| not_ro())?;
+            if !(flags.is_valid() && flags.is_read_only()) {
+                return Err(not_ro());
+            }
+            if let MountCheck::Recorded(recorded) = check
+                && recorded
+                    .target_for(&rule.origin, rule.path.as_str())
+                    .is_none_or(|t| !t.read_only)
+            {
+                return Err(not_ro());
+            }
+        }
         let allowed = effective_allowed(rule, kind);
         if kind == PathKind::File {
             report.file_rules += 1;
@@ -841,6 +877,8 @@ mod tests {
         probes: RefCell<Vec<Result<MountProbe, SysError>>>,
         /// `mount_identity` の応答を呼び出し順に返す（尽きたら `ID_A`）。
         identities: RefCell<Vec<Result<MountIdentity, SysError>>>,
+        /// `mount_flags` の応答を呼び出し順に返す（尽きたら読み取り専用で有効）。
+        flags: RefCell<Vec<Result<sys::MountFlags, SysError>>>,
     }
 
     /// 偽カーネルが既定で返す識別子。
@@ -857,6 +895,13 @@ mod tests {
     ) -> Result<LandlockApplyReport, LandlockApplyError> {
         super::apply_with(k, rs, MountCheck::NotRecorded)
     }
+
+    /// 読み取り専用で有効な `f_flags`（`ST_VALID | ST_RDONLY`）。
+    const RO_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x21);
+    /// 書き込み可能で有効な `f_flags`（`ST_VALID` のみ）。
+    const RW_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x20);
+    /// `ST_VALID` が立っていない `f_flags`（信用できない値）。
+    const INVALID_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x1);
 
     /// 期待どおりの tmpfs の独立したマウントのルート。
     const TMPFS_ROOT: MountProbe = MountProbe {
@@ -884,6 +929,7 @@ mod tests {
                 restrict: Ok(()),
                 probes: RefCell::new(Vec::new()),
                 identities: RefCell::new(Vec::new()),
+                flags: RefCell::new(Vec::new()),
             }
         }
         fn log(&self, s: impl Into<String>) {
@@ -932,6 +978,15 @@ mod tests {
             self.log(format!("identity:{path}"));
             let mut p = self.identities.borrow_mut();
             if p.is_empty() { Ok(ID_A) } else { p.remove(0) }
+        }
+        fn mount_flags(&self, path: &usize) -> Result<sys::MountFlags, SysError> {
+            self.log(format!("flags:{path}"));
+            let mut p = self.flags.borrow_mut();
+            if p.is_empty() {
+                Ok(RO_FLAGS)
+            } else {
+                p.remove(0)
+            }
         }
         fn probe_mount(&self, path: &usize) -> Result<MountProbe, SysError> {
             self.log(format!("probe:{path}"));
@@ -1489,6 +1544,7 @@ mod tests {
                 by: *by,
                 destination: (*dest).to_string(),
                 identity: *identity,
+                read_only: false,
             })
             .expect("capacity");
         }
@@ -1545,6 +1601,93 @@ mod tests {
         assert_eq!((r.rules_added, r.mounts_verified), (2, 1));
         assert!(k.calls().contains(&"identity:1".to_string()));
         assert!(k.calls().contains(&"add:1:0xffff".to_string()));
+    }
+
+    /// 書き込み可能な root の下の `ro` の bind（`/data`。`requires_read_only_mount` が真になる形）の ruleset。
+    fn ro_bind_rs() -> LandlockRuleset {
+        LandlockRuleset::for_observation(
+            6,
+            vec![
+                PathRule {
+                    path: RulePath::Root,
+                    allowed: AccessFs::READ.union(AccessFs::WRITE),
+                    origin: RuleOrigin::Root,
+                },
+                PathRule {
+                    path: rule_path("/data"),
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Mount { index: 0 },
+                },
+            ],
+        )
+    }
+
+    fn recorded_ro(read_only: bool) -> MountedTargets {
+        let mut m = MountedTargets::new();
+        m.push(MountedTarget {
+            by: MountedBy::Bind { index: 0 },
+            destination: "/data".to_string(),
+            identity: ID_A,
+            read_only,
+        })
+        .expect("capacity");
+        m
+    }
+
+    /// CORE-5・SEC-1・#1917: `ro` の bind に頼るルールは、開いた fd のマウントが `ST_VALID | ST_RDONLY` なら通り、
+    /// `landlock_add_rule` の前に `fstatfs` で確かめる。頼らないルール（root）には問い合わせない。
+    #[test]
+    fn core5_1917_readonly_bind_rule_checks_flags_before_add_rule() {
+        let k = Fake::ok(2);
+        let r = apply_with(&k, &ro_bind_rs()).expect("applied");
+        assert_eq!(r.rules_added, 2);
+        let calls = k.calls();
+        let flags = calls.iter().position(|c| c == "flags:1").expect("flags:1");
+        let add = calls
+            .iter()
+            .position(|c| c.starts_with("add:1"))
+            .expect("add:1");
+        assert!(flags < add, "{calls:?}");
+        assert!(!calls.contains(&"flags:0".to_string()), "{calls:?}");
+    }
+
+    /// CORE-5・SEC-1・#1917: 書き込み可能・`ST_VALID` なし・観測失敗はいずれも `MountNotReadOnly`
+    /// （`FailedPrecondition`）で、`add_rule`・`restrict_self` を呼ばない（fail-closed）。
+    #[test]
+    fn core5_1917_not_read_only_mount_refuses_before_add_rule() {
+        for resp in [
+            Ok(RW_FLAGS),
+            Ok(INVALID_FLAGS),
+            Err(SysError::Os(sys::EACCES)),
+        ] {
+            let k = Fake::ok(2);
+            *k.flags.borrow_mut() = vec![resp];
+            let e = apply_with(&k, &ro_bind_rs()).expect_err("not read-only");
+            assert_eq!(
+                e.kind,
+                LandlockApplyErrorKind::MountNotReadOnly { index: 1 }
+            );
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.kind.as_str(), "landlock_mount_not_read_only");
+            let calls = k.calls();
+            assert!(!calls.iter().any(|c| c.starts_with("add:1")), "{calls:?}");
+            assert!(!calls.contains(&"restrict".to_string()), "{calls:?}");
+        }
+    }
+
+    /// CORE-5・SEC-1・#1917: launch の経路（`Recorded`）では、記録の `read_only` も真であることを要求する。
+    #[test]
+    fn core5_1917_recorded_read_only_flag_is_required() {
+        let k = Fake::ok(2);
+        let e = apply_recorded(&k, &ro_bind_rs(), &recorded_ro(false)).expect_err("recorded rw");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountNotReadOnly { index: 1 }
+        );
+        assert!(!k.calls().contains(&"restrict".to_string()));
+        let k = Fake::ok(2);
+        let r = apply_recorded(&k, &ro_bind_rs(), &recorded_ro(true)).expect("applied");
+        assert_eq!((r.rules_added, r.mounts_verified), (2, 1));
     }
 
     /// CORE-5・SEC-1・#2071: 識別子が違えば `restrict_self` の前に拒否する（権利は `add_rule` されない）。
@@ -1706,6 +1849,9 @@ mod tests {
         }
         fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
             MountIdentity::of_fd(path)
+        }
+        fn mount_flags(&self, path: &OwnedFd) -> Result<sys::MountFlags, SysError> {
+            sys::mount_flags(path.as_fd())
         }
     }
 

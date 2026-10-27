@@ -1281,6 +1281,7 @@ mod tests {
                 by: MountedBy::Bind { index },
                 destination: format!("/d{index}"),
                 identity: id,
+                read_only: false,
             })
             .unwrap();
         }

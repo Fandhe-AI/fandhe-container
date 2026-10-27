@@ -121,7 +121,7 @@ fn sec4_sup6_exec_worker_reasons_match_worker_path_sources() {
         stale.is_empty(),
         "EXEC_WORKER_REASONS entries not produced by worker-path sources: {stale:?}"
     );
-    assert_eq!(found.len(), 13);
+    assert_eq!(found.len(), 14);
     // launch.rs が作る理由は pin の 2 理由だけ（他の理由を足すと一覧との照合に混ざる）。
     assert_eq!(
         violation_names(include_str!("../oci_runtime/launch.rs")),

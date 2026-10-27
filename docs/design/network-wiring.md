@@ -35,6 +35,7 @@
   - `--add-host <hostname>:<ip>`: 繰り返し可。最大 `MAX_ADD_HOST_ENTRIES`=256 件、1 件 299 バイト（253 + 1 + 45）
   - `--dns <ip>`: 繰り返し可。最大 `MAX_DNS_SERVERS`=32 件、1 件 45 バイト
   - 上限は確保の前に検証し、超過は使い方エラー
+  - ユーザー定義ネットワーク（bridge）では `--dns` の転送先が DNS ヘルパーの上流転送（D11）に渡るため、上記の件数上限とは別に、上流転送の制約（最大 3 件・loopback・link-local・ヘルパー自身の gateway アドレスの拒否。net の `DnsUpstreamMap::set` と同じ検証）を D2 の検証で作成前に適用する。`ResolvConfPlan::for_mode` が bridge の非空指定を `Unimplemented` にする経路は、この検証を通った値を記録経由で渡す形に結線の側で置き換える（bridge で `--dns` を受けて start 時に初めて失敗する形にしない。NET-12）
   - `--network` の解釈: `none` / `host` は完全一致。`container:` で始まる値は `UNIMPLEMENTED`（spec で将来扱い）。それ以外は net の `NetworkName::parse` で検証する。予約名 `none`・`host`・`bridge`・`default` は名前として使えず `InvalidArgument`（net の `NetworkMode::parse` は `bridge` を受けるが、spec の値は 3 種で `bridge` モードは無いため CLI は使わない）
   - `network create <name>`・`network rm <name>`・`network ls` は位置引数のみでオプションを持たない（spec に無い。subnet 等を足すなら spec 側の課題）
   - 3 OS で構文は同じ（CLI-1）。Linux 以外は検証を通した後に `UNIMPLEMENTED`（platform の結線は MAC / WIN 系の後続）
@@ -43,7 +44,7 @@
 
 ### D2 検証の順序と副作用の前の拒否
 
-- **決定**: CLI `create` の順序は、(1) argv の解析、(2) net の検証関数（`parse_add_hosts`・`parse_ip_addr`・`ResolvConfPlan::for_mode`。none は loopback 限定）、(3) ユーザー定義名なら定義ストア（D10）での存在確認（読み取りのみ）、(4) OS の判定、(5) 起動オプション文書の書き込み、(6) core の create。状態ディレクトリの作成を含むどの副作用より前に ERR-1 形式で拒否し、メッセージに入力値を含めない。
+- **決定**: CLI `create` の順序は、(1) argv の解析、(2) net の検証関数（`parse_add_hosts`・`parse_ip_addr`・`ResolvConfPlan::for_mode`。none は loopback 限定）、(3) ユーザー定義名なら定義ストア（D10）での存在確認（読み取りのみ）と、その定義が bridge である場合の `--dns` の上流転送用検証（3 件以下・アドレス種別。D1。gateway との一致は定義の subnet から算出して照合する）、(4) OS の判定、(5) 起動オプション文書の書き込み、(6) core の create。状態ディレクトリの作成を含むどの副作用より前に ERR-1 形式で拒否し、メッセージに入力値を含めない。
 - **理由**: 規則を CLI 側に二重実装しない（#1871 の受け入れ条件と一致）。
 
 ### D3 段階的な導入
@@ -145,11 +146,11 @@
 | 項目 | 持ち方（決定） |
 | ---- | -------------- |
 | ネットワーク定義 | D10 の `definition` |
-| `CreatedNetwork`（作成済みのカーネル資源） | `realized` に bridge 名・ifindex・所有トークン・nft テーブル名・テーブル handle・gateway・subnet を記録する。`create_network` の成功後に書き、`delete_network` の成功後に消す。カーネル操作の前に意図記録（`realized.intent`。操作の種類・bridge 名・所有トークン・予約した subnet）を fsync して書き、成功後に `realized` へ置き換える。操作後・記録前に SIGKILL されても意図記録が残るため、次の特権操作の先頭が所有トークンでカーネルを照合し、実在すれば `realized` に昇格、無ければ意図記録を捨てる。`FailedCreateClaim` は失敗を受け取れる経路でしか生成できないので、クラッシュの回収はこの意図記録が担う |
+| `CreatedNetwork`（作成済みのカーネル資源） | `realized` に bridge 名・ifindex・所有トークン・nft テーブル名・テーブル handle・gateway・subnet を記録する。`create_network` の成功後に書き、`delete_network` の成功後に消す。カーネル操作の前に意図記録（`realized.intent`。操作の種類・bridge 名・所有トークン・予約した subnet）を fsync して書き、成功後に `realized` へ置き換える。操作後・記録前に SIGKILL されても意図記録が残るため、次の特権操作の先頭が所有トークンでカーネルを照合し、実在し、かつ全構成の完成（アドレス設定・up・nft テーブルの作成と、記録する handle の取得）を確認できたときだけ `realized` に昇格する。所有トークンが一致しても未完成（トークン設定の後、アドレス設定・up・nft テーブル作成の途中で SIGKILL された部分状態）の場合は、昇格せず意図記録を残したまま、不足している操作を冪等に完了させるか、完了できなければ所有トークンで照合できた資源だけを逆順に巻き戻して意図記録を捨てる（巻き戻しの失敗は `FailedCreateClaim` 相当の回収待ちとして残す。特権操作の後始末・REPAIR-3）。実体が無ければ意図記録を捨てる。`FailedCreateClaim` は失敗を受け取れる経路でしか生成できないので、クラッシュの回収はこの意図記録が担う |
 | 静的 IPAM | 独立したカウンタを持たない。全メンバーのアドレスと隔離（結果不明で保持した）アドレスから、ネットワークのロックの下で操作のたびに `StaticIpam` を組み立て直す（数え違いが起きない） |
 | メンバー（attach） | `members/<id>` に endpoint・アドレス・公開（受け口と nft の rule handle）・`--dns` の上流を記録する。attach の前に意図記録（別ディレクトリ `members-intent/<id>`。割り当てるアドレス・endpoint 名・所有トークン）を fsync して書き、成功後に `members/<id>` を作って意図記録を消し、detach の成功後に `members/<id>` を消す。ContainerId はドットを許すため、確定記録（`members/`）と意図記録（`members-intent/`）はディレクトリで名前空間を分け、拡張子による判別は行わない。IPAM の再構成は `members/*` に加えて `members-intent/*` のアドレスも使用中として数えるため、クラッシュで未記録になった endpoint のアドレスを再割り当てしない。意図記録が残っていて実体が無いものは次の特権操作が掃除する。取り残しは既存の `FailedAttachClaim` と `.owned/<endpoint>` |
 | DNS ヘルパーの参照カウント | カウンタを持たず、メンバーの記録の件数を正とする（ロックの下で数える）。0→1 で起動、1→0 で停止（NET-7） |
-| 親からの切り離し | ヘルパーを `setsid` と二重 fork で親から切り離して起動し、`dns-helper` に pid・`/proc/<pid>/stat` の開始時刻・boot id を記録する。停止時は開始時刻と boot id を照合して pid の再利用を除いてから止める（制御 UDS の停止要求 → 期限つきで待つ → 超えたら SIGKILL）。`Drop` で止める今の形は試験専用に残す |
+| 親からの切り離し | ヘルパーを `setsid` と二重 fork で親から切り離して起動し、`dns-helper` に pid・`/proc/<pid>/stat` の開始時刻・boot id を記録する。停止時は記録の pid から `pidfd_open` で pidfd を先に取得し、その pidfd が指すプロセスの開始時刻（`/proc/<pid>/stat`）と boot id を記録と照合して同一性を確かめる（取得後に照合するため、照合と操作の間の pid の再利用で別プロセスを対象にしない）。同一でなければ何も送らず記録を古いものとして扱う。以降の期限つきの待機（pidfd の可読化）と強制停止（`pidfd_send_signal` の SIGKILL）はすべてその pidfd に対して行い、pid 番号へのシグナル送信はしない（制御 UDS の停止要求 → pidfd で期限つきで待つ → 超えたら pidfd へ SIGKILL）。pidfd_open が使えないカーネルでは停止を行わず `Unimplemented` で報告する。`Drop` で止める今の形は試験専用に残す |
 | 名前の登録経路 | ヘルパーはメンバーの記録を正として読み込む。登録側は記録を書いた後に制御 UDS（`<name>/dns.ctl`・0600・`SO_PEERCRED` で uid を照合。PLUG-12）へ `Reload{generation}` を送り、`Loaded{generation}` の ack を期限つき（既定 2 秒）で待つ。フレームは型付きの長さ接頭辞（REPAIR-2）。ack が無ければ attach を失敗にする |
 | `--dns` の上流転送 | メンバーの記録の `--dns` から、ヘルパーが読み込みのたびに `ForwardingHandler` をコンテナのアドレス単位で組む（製品の経路）。upstream の検証は net の既存関数 |
 | ポート予約（`PortRegistry`） | 同じ状態ルート内では、全ネットワークのメンバーの公開を全体のロックの下で集めて照合する。状態ルートをまたぐ衝突（CLI と plugin-cri の `.cri`、別の `--root`）はファイルを共有しても保証できないので、カーネルを正とし、公開の前に全 `fandhe_net_*` テーブルの DNAT を GETRULE で dump して照合する。nft は同一の受け口の重複を拒否しない（`publish.rs` の契約）ため、照会と投入の間に別の `--root` が割り込むと両方が「競合なし」と判定して二重に投入できる。これを避けるため、dump の照合から DNAT の投入までを、状態ルートに依らない共有ロック（`/run/fandhe-container/net-publish.lock` 相当。rootful の plugin が使える root 所有 0644 の固定パスで、`flock` を `LOCK_NB` の取り直しと期限 5 秒で取る。D15）の下で行う。ロックを取れない環境（rootless の pasta など）は対象外で、kernel の bind 衝突に任せる。ロックの外から投入する経路（手動の nft 操作）は検出のみで、投入後にもう一度 dump して自分の受け口が複数ある場合は自分のルールを削除して `AlreadyExists` で失敗する（世代を条件にした事後確認と再試行は 1 回まで） |
@@ -282,7 +283,7 @@ launch の前に `launch_step_budget` が残っていることを確かめる（
 - インジェクション: `--add-host` / `--dns` / `--network` は net の検証を通してから使う。生の文字列をファイル・パス・コマンドへ連結しない。resolv.conf には `IpAddr` の表記だけを書く。エラーメッセージに入力値を含めない
 - アクセス制御: 状態ストアと生成ファイルは 0700 / 0600（hosts / resolv.conf は 0644）・所有者 euid・fd 起点・`O_NOFOLLOW`・nlink 1。DNS の制御 UDS は 0600 で `SO_PEERCRED` が別 uid なら切断する（PLUG-12）。host モードは明示した場合だけ使い、ログに残す
 - 不安全な設計の防止: 件数・長さは確保の前に検証する。ロック・ack・RPC・照合はすべて期限つき（REPAIR-5）。失敗時は逆順に巻き戻す。既定は `none`（閉じた側）。指定の衝突は `InvalidArgument`
-- 完全性: netns への参加はパスを 1 回だけ開いて fd に固定し、nsfs・種別・(dev, ino)・所有 user namespace・配下性を照合する（SEC-1）。pid の再利用は開始時刻と boot id の照合で除く。公開の rule handle はテーブル handle と照合し、古い handle で他者のルールを消さない
+- 完全性: netns への参加はパスを 1 回だけ開いて fd に固定し、nsfs・種別・(dev, ino)・所有 user namespace・配下性を照合する（SEC-1）。pid の再利用は、pidfd を先に取得してから開始時刻と boot id を照合し、待機と強制停止をその pidfd に対して行うことで除く。公開の rule handle はテーブル handle と照合し、古い handle で他者のルールを消さない
 - コンテナ分離: bind mount の先は rootfs の fd から辿り、symlink・`..`・外への脱出を拒否する。init user namespace 所有の netns への参加は承認（#3057）まで実装しない。コンテナ内の root は init user namespace 所有の netns に対して `CAP_NET_ADMIN` を持たない
 - 依存: 新規依存なし。serde / toml を supervisor へ足さない。`lo` の up の ioctl は core の `sys` の事前承認の範囲で、PR 記録の条件は #3064 の受け入れ条件に入れた
 

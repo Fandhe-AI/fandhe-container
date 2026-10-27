@@ -2,7 +2,7 @@
 //!
 //! 偽の `wsl.exe`（`tests/bin/fake_wsl.rs`）を実際に子プロセスとして起動し、`wsl2::test_support` 経由で
 //! 公開 API と同じ処理（固定引数と `WSL_UTF8=1` での起動・期限と出力上限・出力の解析・構造化エラーへの
-//! 変換）を 3 OS で確かめる。本物の `wsl.exe` は使わない（実機確認は TASK-67.6・#377）。
+//! 変換）を 3 OS で確かめる。本物の `wsl.exe` は使わない（実機確認は #353・#1629）。
 //! feature `wsl2-test-support` が必要（`cargo test -p fandhe-container-platform-windows --all-features`）。
 //! feature なしでは本ファイル全体を外し、0 件の test target になる（Cargo.toml のコメント参照）。
 

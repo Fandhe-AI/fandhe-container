@@ -330,7 +330,7 @@ release_own() {
 dk() { timeout --foreground --kill-after=5 60 "$docker_run" "$@"; }
 cleanup_docker() {
   [ "$docker_active" -eq 1 ] || return 0
-  docker_active=0
+  # 削除と残存確認が終わるまで active を保つ（途中の INT・TERM で on_exit から再入して続きを行えるようにする）
   local f id left
   for f in "$work"/c1.cid "$work"/c2.cid; do
     [ -s "$f" ] || continue
@@ -346,6 +346,7 @@ cleanup_docker() {
     docker_leftover=1
     echo "net_throughput_rtt: docker resources with label $dk_label remain: $left" >&2
   fi
+  docker_active=0
 }
 
 teardown() {
@@ -356,6 +357,8 @@ teardown() {
 on_exit() {
   local rc=$?
   trap - EXIT
+  # 後始末中の INT・TERM は無視する（削除の途中で抜けて資源を残さない。個々の docker 呼び出しには期限がある）
+  trap '' INT TERM
   teardown
   rm -rf "$work"
   if [ "$docker_leftover" -eq 1 ]; then exit 4; fi
@@ -420,7 +423,8 @@ IPERF3="$work/bin/iperf3"
 NSENTER="$work/bin/nsenter"
 PROBE="$work/bin/probe"
 
-iperf_version="$("$IPERF3" --version 2>/dev/null | head -n 1 || true)"
+# 応答しない実行ファイルで止まらないよう期限をつける（期限超過は空になり、下で失敗として扱う。REPAIR-5）
+iperf_version="$(timeout --foreground --kill-after=2 10 "$IPERF3" --version 2>/dev/null | head -n 1 || true)"
 [[ "$iperf_version" =~ ^iperf\ 3\. ]] || usage_error "--iperf3 must be iperf 3.x (got: ${iperf_version:-none})"
 iperf_version="${iperf_version:0:80}"
 
@@ -454,6 +458,8 @@ start_server() { # out ns cmd...（別プロセスグループで起動。SPID �
   shift 2
   ns_prefix "$ns"
   cap_for 600
+  # 前回の待受行で wait_line が成功しないよう、切り詰めは親で同期的に済ませてから起動する
+  : >"$out"
   (
     ulimit -f "$OUT_LIMIT_KIB"
     exec setsid timeout --foreground --kill-after=5 "$CAP" ${NSP[@]+"${NSP[@]}"} "$@" >"$out" 2>&1
@@ -562,7 +568,7 @@ num_re='^[0-9]+(\.[0-9]+)?$'
 
 measure_iperf() { # target path streams
   local o="$work/iperf.out" v
-  start_server "$o.srv" "$SNS" "$IPERF3" -s -1 -B "$SBIND" -p "$IPERF_SPORT"
+  start_server "$o.srv" "$SNS" "$IPERF3" -s -1 --forceflush -B "$SBIND" -p "$IPERF_SPORT"
   wait_line "$o.srv" 'Server listening on' 15 "$SPID" || fail_measure "iperf3 server did not start ($1 path $2)"
   run_client "$o" $((iperf_secs + 30)) "$CNS" "$IPERF3" -c "$DIP" -p "$IPERF_DPORT" -t "$iperf_secs" -P "$3" -J
   kill_servers

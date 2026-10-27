@@ -466,9 +466,14 @@ impl TableDump {
 /// （NET-3・#3063）。
 ///
 /// カーネル応答は外部入力。短い・属性が壊れている・名前が無い／重複・NUL 終端でない・
-/// 名前が [`NftName`] の検証を通らないものは `DataLoss`。family が要求した値と異なるものも `DataLoss`。
+/// 接頭辞 `prefix` に一致する名前が [`NftName`] の検証を通らないものは `DataLoss`。接頭辞に一致しない
+/// 他者のテーブルは名前を検証せず `Ok(None)`（読み飛ばし）。family が要求した値と異なるものも `DataLoss`。
 /// エラーメッセージに名前の値は載せない。
-pub fn decode_table_name(payload: &[u8], family: NftFamily) -> Result<NftName, NetError> {
+pub fn decode_table_name(
+    payload: &[u8],
+    family: NftFamily,
+    prefix: &str,
+) -> Result<Option<NftName>, NetError> {
     let loss = |m: &'static str| NetError::new(NetErrorCode::DataLoss, m);
     let head = NfGenMsg::decode(payload)?;
     if head.family() != family.nfproto() {
@@ -477,7 +482,7 @@ pub fn decode_table_name(payload: &[u8], family: NftFamily) -> Result<NftName, N
     let attrs = payload
         .get(NFGENMSG_LEN..)
         .ok_or_else(|| loss("table reply is shorter than nfgenmsg"))?;
-    let mut found: Option<NftName> = None;
+    let mut found: Option<Option<NftName>> = None;
     for attr in crate::netlink::AttrIter::new(attrs) {
         let attr = attr?;
         if attr.attr_type() != NFTA_TABLE_NAME {
@@ -493,8 +498,16 @@ pub fn decode_table_name(payload: &[u8], family: NftFamily) -> Result<NftName, N
             Some((0, name)) if !name.contains(&0) => name,
             _ => return Err(loss("table name is not a single NUL-terminated string")),
         };
+        if !bytes.starts_with(prefix.as_bytes()) {
+            // 他者のテーブル（docker・kube-proxy 等）は名前を検証せず読み飛ばす。nft の識別子は
+            // `/` や先頭 `.` を許し NftName より広いため、検証すると無関係なテーブル 1 件で全公開が失敗する。
+            found = Some(None);
+            continue;
+        }
         let text = std::str::from_utf8(bytes).map_err(|_| loss("table name is not valid text"))?;
-        found = Some(NftName::new(text).map_err(|_| loss("table name is not a valid nft name"))?);
+        found = Some(Some(
+            NftName::new(text).map_err(|_| loss("table name is not a valid nft name"))?,
+        ));
     }
     found.ok_or_else(|| loss("table name attribute is missing"))
 }
@@ -955,10 +968,31 @@ mod tests {
                 .expect("h");
         });
         assert_eq!(
-            decode_table_name(&ok, NftFamily::Ipv4)
+            decode_table_name(&ok, NftFamily::Ipv4, "fandhe_net_")
                 .expect("name")
+                .expect("ours")
                 .as_str(),
             "fandhe_net_web"
+        );
+        // 他者のテーブルは不正な nft 名（`/`・先頭 `.`・非 UTF-8）でも読み飛ばす。
+        for foreign in [&b"a/b\0"[..], b".x\0", b"\xff\xfe\0", b"1abc\0"] {
+            let r = table_reply(2, |b| {
+                b.put_attr(NFTA_TABLE_NAME, foreign).expect("n");
+            });
+            assert_eq!(
+                decode_table_name(&r, NftFamily::Ipv4, "fandhe_net_").expect("skip"),
+                None
+            );
+        }
+        // 接頭辞が一致して名前が不正なものは fail-closed のまま。
+        let bad = table_reply(2, |b| {
+            b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_a/b\0").expect("n");
+        });
+        assert_eq!(
+            decode_table_name(&bad, NftFamily::Ipv4, "fandhe_net_")
+                .expect_err("bad")
+                .code(),
+            NetErrorCode::DataLoss
         );
         let cases: Vec<(&str, Vec<u8>)> = vec![
             (
@@ -983,7 +1017,7 @@ mod tests {
             (
                 "invalid name",
                 table_reply(2, |b| {
-                    b.put_attr(NFTA_TABLE_NAME, b"1abc\0").expect("n");
+                    b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_1/\0").expect("n");
                 }),
             ),
             (
@@ -996,7 +1030,7 @@ mod tests {
             ("short", vec![2, 0]),
         ];
         for (label, payload) in cases {
-            let e = decode_table_name(&payload, NftFamily::Ipv4).expect_err(label);
+            let e = decode_table_name(&payload, NftFamily::Ipv4, "fandhe_net_").expect_err(label);
             assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
         }
     }

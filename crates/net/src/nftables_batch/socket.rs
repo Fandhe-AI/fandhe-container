@@ -313,13 +313,15 @@ impl NetlinkNetfilterSocket {
     /// `family` のテーブル名を `NFT_MSG_GETTABLE` の dump で全件列挙する（読み取り専用。NET-3・#3063）。
     ///
     /// 公開の前に他の状態ルートの `fandhe_net_*` テーブルを見つけるための入口。応答はカーネル由来の外部入力で、
-    /// 1 件でも復号できなければ `DataLoss`（fail-closed）。件数の上限は呼び出し側が掛ける
+    /// 接頭辞 `prefix` に一致するテーブルだけを返し（他者のテーブルは名前を検証せず読み飛ばす）、
+    /// 一致したものが復号できなければ `DataLoss`（fail-closed）。件数の上限は呼び出し側が掛ける
     /// （応答の総量は `MAX_REPLY_BYTES` / `MAX_REPLY_MESSAGES` で既に上限がある）。`timeout` は順番待ちと
     /// 往復を通した全体の期限（REPAIR-5）。dump 中の変更（`NLM_F_DUMP_INTR`）は `FailedPrecondition`。
     /// seq の確保は [`Self::table_info`] と同じ（バッチ用の空間から取り、再利用しない）。
     pub fn dump_table_names(
         &self,
         family: NftFamily,
+        prefix: &str,
         timeout: Duration,
     ) -> Result<Vec<NftName>, NetError> {
         let deadline = Deadline::after(timeout);
@@ -335,19 +337,20 @@ impl NetlinkNetfilterSocket {
             |b| req.encode(b),
         )?;
         let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWTABLE);
-        reply
-            .messages()
-            .iter()
-            .map(|m| {
-                if m.msg_type() != want {
-                    return Err(NetError::new(
-                        NetErrorCode::DataLoss,
-                        "unexpected message type in table dump reply",
-                    ));
-                }
-                decode_table_name(m.payload(), family)
-            })
-            .collect()
+        let mut names = Vec::new();
+        for m in reply.messages() {
+            if m.msg_type() != want {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "unexpected message type in table dump reply",
+                ));
+            }
+            // 接頭辞に一致しない他者のテーブルは読み飛ばす（名前を検証しない）。
+            if let Some(n) = decode_table_name(m.payload(), family, prefix)? {
+                names.push(n);
+            }
+        }
+        Ok(names)
     }
 
     /// 1 テーブルの全ルールを `NFT_MSG_GETRULE` の dump で列挙する（読み取り専用。NET-3・#3063）。

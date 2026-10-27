@@ -353,7 +353,7 @@ pub(crate) fn scan_published_listeners(
     use crate::nftables_batch::NftFamily;
     use crate::nftables_rules::RuleDump;
     scan_with(
-        || nft.dump_table_names(NftFamily::Ipv4, deadline.remaining()),
+        || nft.dump_table_names(NftFamily::Ipv4, TABLE_PREFIX, deadline.remaining()),
         |table| {
             nft.dump_rules(
                 &RuleDump::new(NftFamily::Ipv4, table.clone()),

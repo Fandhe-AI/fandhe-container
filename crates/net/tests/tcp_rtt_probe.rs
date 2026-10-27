@@ -356,6 +356,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 自己試験は引数なしの場合に限る。それ以外（誤綴り・モード指定なし）は必ず parse_args で検証し、
     // 不正なら ARGS・終了コード 2 で拒否する。
+    // CI の `cargo test -- --list` による列挙（libtest 互換）。列挙する試験名は無いので何も出さず成功する。
+    if args.iter().any(|a| a == "--list") {
+        return;
+    }
     if !args.is_empty() {
         let outcome = parse_args(&args).and_then(run);
         if let Err(e) = outcome {

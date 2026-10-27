@@ -304,8 +304,17 @@ mod linux {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         // 専用プロセスグループで起動し、期限切れ時に inner・nsenter・その配下の子孫をまとめて停止できるようにする。
+        // 保持モードの解放は stdin で受ける。分離した（バックグラウンドの）プロセスグループが制御端末を直接
+        // 読むと SIGTTIN で停止するため、inner の stdin はパイプにし、ランチャ（前面のグループ）が自身の
+        // stdin を転送する。保持モード以外は stdin を使わないので null にする（REPAIR-5）。
+        let hold = extra.iter().any(|a| a == "--hold");
         let mut child = Command::new("unshare")
             .process_group(0)
+            .stdin(if hold {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .args(["--net", "--mount", "--"])
             .arg(exe)
             .arg("--inner")
@@ -314,6 +323,19 @@ mod linux {
             .env(DIR_ENV, &dir)
             .spawn()
             .expect("spawn unshare --net --mount");
+        if let Some(mut pipe) = child.stdin.take() {
+            // ランチャの stdin の各行を inner へ転送する。EOF で pipe を閉じ、inner 側にも EOF を伝える。
+            std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    let Ok(line) = line else { break };
+                    if writeln!(pipe, "{line}").is_err() || pipe.flush().is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         // 計測は最大 (200 + 20) 試行になり得るため、期限は試行数に依らず固定倍率にせず十分長く取る。
         let pgid = child.id();
         let deadline = Instant::now() + timeout() * 60 + extra_deadline;

@@ -4713,7 +4713,6 @@ mod attach_tests {
         assert_eq!(calls[n - 1], "release_socket");
     }
 
-    /// NET-1・TASK-139.3: netns 内の各手順の失敗は、失敗手順と元のエラーを返し、IPAM の払い出し・veth・netns を戻す。
     /// NET-1・#3061: 改名が失敗したら後の段（アドレス付与・up・route）へ進まない。
     #[test]
     fn net1_attach_rename_failure_stops_before_address_and_up() {
@@ -4731,6 +4730,7 @@ mod attach_tests {
         assert!(!calls.iter().any(|c| c.starts_with("ns_route")));
     }
 
+    /// NET-1・TASK-139.3: netns 内の各手順の失敗は、失敗手順と元のエラーを返し、IPAM の払い出し・veth・netns を戻す。
     #[test]
     fn net1_attach_netns_config_failures_roll_back_everything() {
         let cases = [

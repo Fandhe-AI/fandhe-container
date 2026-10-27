@@ -981,9 +981,14 @@ impl Drop for AbandonPutOnDrop {
         {
             let for_failure = rollback.clone();
             let spawned = spawn_runtime_thread("cri-record-cleanup", move || {
+                // 削除が panic しても予約を回復可能な状態へ倒す（pending のまま永久に塞がない）。
+                let mut panic_guard = PutWorkerGuard {
+                    rollback: Some(rollback.clone()),
+                };
                 // 削除に成功したときだけ予約を戻す。書き込み guard はその後に解除する。
                 let removed = store.remove(RecordKind::Sandbox, &id).is_ok();
                 rollback.settle_after_remove(removed);
+                panic_guard.defuse();
                 drop(extra_guard);
             });
             if spawned.is_err() {

@@ -48,6 +48,9 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0o020_000;
     pub const S_IFBLK: u32 = 0o060_000;
     pub const S_IFIFO: u32 = 0o010_000;
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const O_NONBLOCK: i32 = 0o4_000;
 }
 
 /// 定数（aarch64。`O_DIRECTORY` / `O_NOFOLLOW` が x86_64 と異なる）。
@@ -62,6 +65,9 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0o020_000;
     pub const S_IFBLK: u32 = 0o060_000;
     pub const S_IFIFO: u32 = 0o010_000;
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const O_NONBLOCK: i32 = 0o4_000;
 }
 
 /// 対応外アーキテクチャ。値は使われない（各ラッパーが `Unsupported` を返す）。
@@ -79,6 +85,9 @@ pub(crate) mod consts {
     pub const S_IFCHR: u32 = 0;
     pub const S_IFBLK: u32 = 0;
     pub const S_IFIFO: u32 = 0;
+    pub const F_GETFL: i32 = 0;
+    pub const F_SETFL: i32 = 0;
+    pub const O_NONBLOCK: i32 = 0;
 }
 
 // SAFETY: 以下は libc（glibc / musl）が提供する POSIX 関数の宣言で、LP64 の x86_64 / aarch64 では
@@ -94,6 +103,8 @@ unsafe extern "C" {
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
     // 原型: `int unlinkat(int dirfd, const char *pathname, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+    // 原型: `int fcntl(int fd, int cmd, ...)`。本モジュールは `F_GETFL`（引数なし）と `F_SETFL`（int 1 個）だけ使う。
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
 fn last_error() -> SysError {
@@ -186,6 +197,21 @@ pub(crate) fn unlink_at(
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `fd` を `O_NONBLOCK` にする（既存のステータスフラグは保つ）。createContainer フックの stdin / stderr の pipe を
+/// スレッド無しで有界に回すために使う（TASK-127.3・GPU-2・REPAIR-5）。フラグは open file description に付くため、
+/// 子が持つ反対側の端には影響しない。
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    check_supported()?;
+    // SAFETY: `fd` は借用中の生存 fd。`F_GETFL` は第 3 引数を読まず、ポインタも渡さない。
+    let flags = unsafe { fcntl(fd.as_raw_fd(), consts::F_GETFL) };
+    if flags < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: 同上。`F_SETFL` の第 3 引数は int 値渡しで、直前に得たフラグに `O_NONBLOCK` を足しただけ。
+    let r = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFL, flags | consts::O_NONBLOCK) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +243,28 @@ mod tests {
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
             (0o40_000, 0o100_000)
         );
+    }
+
+    /// GPU-2・REPAIR-5: `set_nonblocking` 後の空 pipe の read は WouldBlock、端を閉じると EOF になる。
+    #[test]
+    fn nonblocking_pipe_read() {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("/bin/sh")
+            .args(["-c", "sleep 1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = c.stdout.take().unwrap();
+        set_nonblocking(out.as_fd()).unwrap();
+        let mut b = [0u8; 8];
+        assert_eq!(
+            out.read(&mut b).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        c.kill().unwrap();
+        c.wait().unwrap();
+        assert_eq!(out.read(&mut b).unwrap(), 0);
     }
 
     /// GPU-2: mkdirat / openat が動き、symlink は O_NOFOLLOW で拒否される。

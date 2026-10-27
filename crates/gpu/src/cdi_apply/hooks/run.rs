@@ -1,20 +1,23 @@
 //! `createContainer` フックの前提状態ゲートと実行（Linux 限定。TASK-127.3・GPU-2）。
 //!
 //! 呼び出し元は core の pre-pivot 段（配線は #2774）。検証済みフック（`validate_create_container_hooks`）と
-//! `verify_hook_stage` の証跡を受け、各フックを直列に host 側プロセスとして起動する。新しい `unsafe` は無く、
-//! std の `Command`・`fs` だけで実装する。
+//! `verify_hook_stage` の証跡を受け、各フックを直列に host 側プロセスとして起動する。
+//! `unsafe` は `crate::sys` の fcntl ラッパー（pipe の
+//! non-blocking 化）に限る。stdin / stderr はスレッド無しで回し（REPAIR-5）、実行ファイルは所有者と祖先経路を
+//! 検査して fd で固定し exec する。
 
 use super::{CDI_HOOK_MAX_MOUNTINFO_BYTES, CdiCreateContainerHook, check_hook_stage_mountinfo};
 use crate::cdi_apply::{CdiApplyError, CdiApplyErrorCode as Code};
+use crate::sys;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 報告に載せる stderr の先頭最大バイト数。
@@ -273,9 +276,13 @@ impl Bundle {
         Ok(b)
     }
 
+    /// 削除する。成功したときだけ `removed` を立て、失敗時は `Drop` が再試行する（config.json の残留を避ける）。
     fn remove(&mut self) -> std::io::Result<()> {
-        self.removed = true;
-        fs::remove_dir_all(&self.dir)
+        let r = fs::remove_dir_all(&self.dir);
+        if r.is_ok() {
+            self.removed = true;
+        }
+        r
     }
 }
 
@@ -299,73 +306,167 @@ fn map_io(err: &std::io::Error) -> CdiApplyError {
     }
 }
 
-/// 実行ファイルの検査（通常ファイル・実行ビット・group / other 書き込み不可。A08）。
-fn check_executable(path: &str) -> Result<(), CdiApplyError> {
-    let m = fs::metadata(path).map_err(|err| map_io(&err))?;
-    let mode = m.permissions().mode();
-    if !m.is_file() || mode & 0o111 == 0 || mode & 0o022 != 0 {
-        return Err(e(
+/// 所有者として信用する uid か（root、またはこのプロセスの uid）。
+fn trusted_uid(uid: u32, me: u32) -> bool {
+    uid == 0 || uid == me
+}
+
+/// このプロセスの実効 uid（`/proc/self` の所有者。std だけで得る）。取れなければ root のみ信用する。
+fn self_uid() -> u32 {
+    fs::metadata("/proc/self").map_or(0, |m| m.uid())
+}
+
+/// ディレクトリ 1 段の検査。所有者が信用でき、group / other の書き込み不可であること。
+/// sticky 付き（`/tmp` 等）は、直下の要素が別途所有者検査を受けるため書き込み可を許す。
+fn dir_is_safe(uid: u32, mode: u32, me: u32) -> bool {
+    trusted_uid(uid, me) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+/// 実行ファイルを検査して開き、検査した実体の fd を返す（A08・GPU-2）。
+///
+/// 通常ファイル・実行ビット・group / other 書き込み不可・所有者が root かこのプロセスの uid、
+/// 祖先ディレクトリがすべて同条件、であることを要求する。検査は open 済みの fd に対して行い、
+/// 呼び出し側はこの fd を `/proc/self/fd/<n>` 経由で exec してパスの再解決による差し替えを防ぐ。
+/// shebang スクリプトは fd 経由の exec で解釈器が fd を開けず失敗するため拒否する（CDI フックは実行ファイル）。
+fn open_trusted_executable(path: &str) -> Result<File, CdiApplyError> {
+    let denied = || {
+        e(
             Code::PermissionDenied,
             "hook executable is not a safe regular file",
+        )
+    };
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(denied());
+    }
+    let mut f = File::open(p).map_err(|err| map_io(&err))?;
+    let m = f.metadata().map_err(|err| map_io(&err))?;
+    let me = self_uid();
+    if !m.is_file() || m.mode() & 0o111 == 0 || m.mode() & 0o022 != 0 || !trusted_uid(m.uid(), me) {
+        return Err(denied());
+    }
+    // 開いた実体が、パスを正規化した先と同一であること（open 後の差し替えの検出）。
+    let canon = fs::canonicalize(p).map_err(|err| map_io(&err))?;
+    let cm = fs::metadata(&canon).map_err(|err| map_io(&err))?;
+    if (cm.dev(), cm.ino()) != (m.dev(), m.ino()) {
+        return Err(denied());
+    }
+    for dir in canon.ancestors().skip(1) {
+        let dm = fs::metadata(dir).map_err(|err| map_io(&err))?;
+        if !dm.is_dir() || !dir_is_safe(dm.uid(), dm.mode(), me) {
+            return Err(denied());
+        }
+    }
+    let mut magic = [0u8; 2];
+    if f.read_exact(&mut magic).is_ok() && &magic == b"#!" {
+        return Err(e(
+            Code::PermissionDenied,
+            "hook executable must not be a script",
         ));
     }
-    Ok(())
+    Ok(f)
 }
 
-/// 子の stderr を pipe で受ける収集器。先頭 `CDI_HOOK_STDERR_CAP` バイトだけ保持し、以降は読み捨てる
-/// （実行中の保存量を有界にする。ファイルシステムは使わない）。
-struct StderrCollector {
-    buf: Arc<Mutex<Vec<u8>>>,
-    done: Arc<AtomicBool>,
+const REAP_GRACE: Duration = Duration::from_secs(5);
+/// 1 回の `pump` で読む最大チャンク数（読み続けて期限を超えないための上限）。
+const PUMP_MAX_CHUNKS: usize = 64;
+/// 子の終了後の最終回収で読む最大チャンク数。これで EOF に達しなければ孫が pipe を保持しているとみなす。
+const FINAL_DRAIN_CHUNKS: usize = 256;
+
+/// 子の stdin / stderr をスレッド無しで回す入出力。pipe は non-blocking で、呼び出し側のループが
+/// `pump` を呼ぶたびに進める。保持するのは stderr の先頭 `CDI_HOOK_STDERR_CAP` バイトだけ（以降は読み捨て）。
+/// スレッドを持たないので、全経路で停止・回収の問題が生じない（REPAIR-5）。
+struct ChildIo {
+    stdin: Option<std::process::ChildStdin>,
+    payload: Vec<u8>,
+    written: usize,
+    stderr: Option<std::process::ChildStderr>,
+    buf: Vec<u8>,
 }
 
-impl StderrCollector {
-    fn spawn(mut pipe: std::process::ChildStderr) -> std::io::Result<Self> {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let done = Arc::new(AtomicBool::new(false));
-        let (b, d) = (Arc::clone(&buf), Arc::clone(&done));
-        std::thread::Builder::new().spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break,
+impl ChildIo {
+    fn new(child: &mut std::process::Child, payload: Vec<u8>) -> Result<Self, CdiApplyError> {
+        let err = || e(Code::Internal, "failed to set hook pipes non-blocking");
+        let stdin = child.stdin.take();
+        let stderr = child.stderr.take();
+        if let Some(s) = &stdin {
+            sys::set_nonblocking(s.as_fd()).map_err(|_| err())?;
+        }
+        if let Some(s) = &stderr {
+            sys::set_nonblocking(s.as_fd()).map_err(|_| err())?;
+        }
+        Ok(Self {
+            stdin,
+            payload,
+            written: 0,
+            stderr,
+            buf: Vec::new(),
+        })
+    }
+
+    /// 書ける分だけ state を送り、読める分だけ stderr を読む。塞がらない。
+    fn pump(&mut self, max_chunks: usize) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let mut close = false;
+            while let Some(rest) = self.payload.get(self.written..) {
+                if rest.is_empty() {
+                    close = true;
+                    break;
+                }
+                match stdin.write(rest) {
+                    Ok(0) => close = true,
                     Ok(n) => {
-                        if let Ok(mut g) = b.lock() {
-                            let room = CDI_HOOK_STDERR_CAP.saturating_sub(g.len());
-                            let take = n.min(room);
-                            if let Some(head) = chunk.get(..take) {
-                                g.extend_from_slice(head);
-                            }
+                        self.written += n;
+                        continue;
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    // BrokenPipe（フックが読まずに終了）等。成否は終了コードで判定する。
+                    Err(_) => close = true,
+                }
+                break;
+            }
+            if close {
+                self.stdin = None;
+            }
+        }
+        if let Some(pipe) = self.stderr.as_mut() {
+            let mut chunk = [0u8; 4096];
+            let mut eof = false;
+            for _ in 0..max_chunks {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        let room = CDI_HOOK_STDERR_CAP.saturating_sub(self.buf.len());
+                        if let Some(head) = chunk.get(..n.min(room)) {
+                            self.buf.extend_from_slice(head);
                         }
                     }
                     Err(err) if err.kind() == ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        eof = true;
+                        break;
+                    }
                 }
             }
-            d.store(true, Ordering::Release);
-        })?;
-        Ok(Self { buf, done })
+            if eof {
+                self.stderr = None;
+            }
+        }
     }
 
-    /// 子の終了後に呼ぶ。孫が pipe を持ち続けても塞がらないよう、待ちは短い上限つきにする（REPAIR-5）。
-    /// 戻り値は (stderr の先頭, スレッドが停止したか)。停止していなければ孫が pipe を保持している。
-    fn finish(&self) -> (String, bool) {
-        let stopped = wait_flag(&self.done);
-        let bytes = self.buf.lock().map(|g| g.clone()).unwrap_or_default();
-        (String::from_utf8_lossy(&bytes).into_owned(), stopped)
+    /// 子の終了後に呼ぶ最終回収。(stderr の先頭, 全 pipe が閉じたか)。閉じていなければ孫が保持している。
+    fn finish(&mut self) -> (String, bool) {
+        self.pump(FINAL_DRAIN_CHUNKS);
+        let closed = self.stderr.is_none();
+        // 子が終わった後は state を読む者がいない。stdin を閉じて残りを捨てる。
+        self.stdin = None;
+        (String::from_utf8_lossy(&self.buf).into_owned(), closed)
     }
-}
-
-const IO_STOP_GRACE: Duration = Duration::from_millis(200);
-const REAP_GRACE: Duration = Duration::from_secs(5);
-
-/// フラグが立つのを `IO_STOP_GRACE` まで待つ。
-fn wait_flag(flag: &AtomicBool) -> bool {
-    let until = Instant::now() + IO_STOP_GRACE;
-    while !flag.load(Ordering::Acquire) && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    flag.load(Ordering::Acquire)
 }
 
 /// 子を kill して有限の猶予内に回収する。kill の失敗も回収不能もエラー（未回収の pid は呼び出し側が保持する）。
@@ -404,7 +505,8 @@ fn run_one(
     index: usize,
 ) -> Result<CdiHookReport, RunFail> {
     let bare = |x| (x, String::new(), None);
-    check_executable(h.path()).map_err(bare)?;
+    // 検査した実体の fd を保持し、そのまま exec する（パスの再解決による差し替えを防ぐ）。
+    let exe = open_trusted_executable(h.path()).map_err(bare)?;
     let rootfs = std::str::from_utf8(stage.rootfs.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "rootfs is not valid UTF-8")))?;
     let mut bundle = Bundle::create(work_dir, rootfs).map_err(bare)?;
@@ -420,7 +522,8 @@ fn run_one(
         .args
         .split_first()
         .ok_or_else(|| bare(e(Code::InvalidArgument, "CDI hook args must not be empty")))?;
-    let mut cmd = Command::new(&h.path);
+    // `exe` は O_CLOEXEC で、exec 時に子のパス解決が終わってから閉じる（fork 後・exec 前は有効）。
+    let mut cmd = Command::new(format!("/proc/self/fd/{}", exe.as_raw_fd()));
     cmd.arg0(arg0)
         .args(rest)
         .env_clear()
@@ -430,8 +533,16 @@ fn run_one(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let mut child = cmd.spawn().map_err(|err| bare(map_io(&err)))?;
+    let spawned = cmd.spawn();
     drop(cmd);
+    drop(exe);
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = bundle.remove();
+            return Err(bare(map_io(&err)));
+        }
+    };
     let pid = child.id();
 
     // 起動後の失敗は必ず子を kill して回収してから返す。回収できなければ pid を報告する。
@@ -442,59 +553,26 @@ fn run_one(
         }
     };
 
-    // stdin への state 送信は別スレッドで行い、フックが読まなくても呼び出し側は塞がらない。
-    // スレッドは `Builder::spawn` で作り、資源不足でも panic させない（REPAIR-5）。
-    let writer_done = Arc::new(AtomicBool::new(false));
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload = state.into_bytes();
-        let d = Arc::clone(&writer_done);
-        let spawned = std::thread::Builder::new().spawn(move || {
-            // BrokenPipe（フックが読まずに終了）等は無視し、成否は終了コードで判定する。
-            let _ = stdin.write_all(&payload);
-            d.store(true, Ordering::Release);
-        });
-        if spawned.is_err() {
-            let r = abort(
-                &mut child,
-                e(Code::ResourceExhausted, "failed to spawn hook stdin thread"),
-                String::new(),
-            );
+    // stdin / stderr はスレッド無しの non-blocking I/O で回す。フックが読まなくても呼び出し側は塞がらず、
+    // 孫が pipe を保持しても取り残すスレッドが無い（REPAIR-5）。
+    let mut io = match ChildIo::new(&mut child, state.into_bytes()) {
+        Ok(io) => io,
+        Err(err) => {
+            let r = abort(&mut child, err, String::new());
             let _ = bundle.remove();
             return Err(r);
         }
-    } else {
-        writer_done.store(true, Ordering::Release);
-    }
-    let collector = match child.stderr.take().map(StderrCollector::spawn) {
-        Some(Ok(c)) => Some(c),
-        Some(Err(_)) => {
-            let r = abort(
-                &mut child,
-                e(
-                    Code::ResourceExhausted,
-                    "failed to spawn hook stderr thread",
-                ),
-                String::new(),
-            );
-            let _ = bundle.remove();
-            return Err(r);
-        }
-        None => None,
-    };
-    // 戻る前に I/O スレッドの停止を確認する。孫が pipe を保持して残る場合は明示的にエラーにする。
-    let finish = |c: &Option<StderrCollector>| -> (String, bool) {
-        let (tail, collector_ok) = c.as_ref().map_or((String::new(), true), |c| c.finish());
-        (tail, collector_ok && wait_flag(&writer_done))
     };
 
     let deadline = Duration::from_secs(h.timeout_secs);
     let status = loop {
+        io.pump(PUMP_MAX_CHUNKS);
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) => {
                 if started.elapsed() >= deadline {
                     let reaped = kill_and_reap(&mut child);
-                    let (tail, _) = finish(&collector);
+                    let (tail, _) = io.finish();
                     let _ = bundle.remove();
                     return Err(match reaped {
                         Ok(()) => (e(Code::Timeout, "hook timed out"), tail, None),
@@ -509,13 +587,14 @@ fn run_one(
                     e(Code::Internal, "failed to wait for hook"),
                     String::new(),
                 );
+                let _ = io.finish();
                 let _ = bundle.remove();
                 return Err(r);
             }
         }
     };
     let elapsed = started.elapsed();
-    let (stderr, io_stopped) = finish(&collector);
+    let (stderr, io_closed) = io.finish();
     if bundle.remove().is_err() {
         return Err((
             e(Code::Internal, "failed to remove hook bundle"),
@@ -523,11 +602,11 @@ fn run_one(
             None,
         ));
     }
-    if !io_stopped {
+    if !io_closed {
         return Err((
             e(
                 Code::Internal,
-                "hook I/O threads still running (a descendant holds the pipes)",
+                "hook stderr pipe is still open (a descendant holds it)",
             ),
             stderr,
             None,
@@ -604,6 +683,7 @@ mod tests {
     use super::*;
     use crate::cdi_apply::hooks::validate_create_container_hooks;
     use crate::cdi_spec::{EnvList, Hook};
+    use std::os::unix::fs::PermissionsExt;
 
     /// テスト用の一時ディレクトリ（`std::env::temp_dir` 配下に一意名。終了時に削除）。
     struct Tmp(PathBuf);
@@ -799,6 +879,59 @@ mod tests {
         assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }
 
+    /// GPU-2・A08: 祖先ディレクトリが group 書き込み可なら実行ファイルが安全でも拒否し、shebang は拒否する。
+    #[test]
+    fn untrusted_ancestor_and_script_are_rejected() {
+        let t = Tmp::new("anc");
+        let stage = CdiHookStage::for_test(&t.0);
+        let dir = t.0.join("shared");
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let bin = dir.join("hook");
+        fs::copy("/bin/true", &bin).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o770)).unwrap();
+        let p = bin.to_str().unwrap();
+        let hooks = validate_create_container_hooks(&[mk(p, &["x"], &[], None)]).unwrap();
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.error.code(), Code::PermissionDenied);
+        assert_eq!(
+            err.error.message(),
+            "hook executable is not a safe regular file"
+        );
+        let sh = t.script("s.sh", "exit 0");
+        let hooks = validate_create_container_hooks(&[mk(&sh, &["x"], &[], None)]).unwrap();
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.error.message(), "hook executable must not be a script");
+        assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
+    }
+
+    /// A08: 所有者・ディレクトリの判定を具体値で照合する（他 UID の所有は拒否）。
+    #[test]
+    fn owner_and_dir_rules() {
+        assert!(trusted_uid(0, 1000));
+        assert!(trusted_uid(1000, 1000));
+        assert!(!trusted_uid(1001, 1000));
+        assert!(dir_is_safe(0, 0o755, 1000));
+        assert!(!dir_is_safe(1001, 0o755, 1000));
+        assert!(!dir_is_safe(0, 0o775, 1000));
+        assert!(!dir_is_safe(0, 0o757, 1000));
+        assert!(dir_is_safe(0, 0o1777, 1000));
+    }
+
+    /// REPAIR-5: remove が失敗しても `removed` を立てず、Drop が再試行してバンドルを残さない。
+    #[test]
+    fn bundle_drop_retries_after_failed_remove() {
+        let t = Tmp::new("bundle");
+        let mut b = Bundle::create(&t.work(), "/r").unwrap();
+        let dir = b.dir.clone();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = b.remove().is_err();
+        assert_eq!(b.removed, !failed);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(b);
+        assert!(!dir.exists());
+    }
+
     /// GPU-2: 前提を満たさない状態ではゲートが失敗し、フックは起動されない。
     #[test]
     fn gate_failure_never_runs_hooks() {
@@ -864,7 +997,7 @@ mod tests {
         assert_eq!(err.error.code(), Code::Internal);
         assert_eq!(
             err.error.message(),
-            "hook I/O threads still running (a descendant holds the pipes)"
+            "hook stderr pipe is still open (a descendant holds it)"
         );
         assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }

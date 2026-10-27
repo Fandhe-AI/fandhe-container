@@ -2002,6 +2002,7 @@ jobs:
       # restart-latency（TASK-160・SUP-3。実測は #491）
       # crictl-smoke（TASK-60・CRI-1。スタブの crictl のみ。実機は #442）
       # small-files-compare（TASK-24.1・IO-7。スタブのハーネスのみ。実測は #107、評価は #110）
+      # mac-small-files（TASK-70 準備・#1880・MAC-3。スタブの docker のみ。実測は #381・#354）
       # install-launcher（TASK-171 追補・#1721・SUP-14。スタブのみ）・cli-parity の期限・回収（#1688・REPAIR-5。platform-ci の ubuntu 分を移した）
       - name: 計測スクリプト群の自己テスト（並列 3。REPAIR-12）
         run: >-
@@ -2023,6 +2024,7 @@ jobs:
           net-setup-timing-selftest
           dns-helper-measure-selftest
           small-files-compare-selftest
+          mac-small-files-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は

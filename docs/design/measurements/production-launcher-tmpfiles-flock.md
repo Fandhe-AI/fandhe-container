@@ -134,7 +134,7 @@ aging（30d）が消さないため対象外。
 
 ## cgroup 系の実機前提試験と supervisor・cli の既定集合への展開（#3026・CORE-5・REPAIR-12）
 
-#2958 の残余だった 2 群を、同じ `ScratchDir`（`#[path]` で取り込み、状態ルート・bundle は親の **子** に作る）で保護した。
+issue #2958 の残余だった 2 群を、同じ `ScratchDir`（`#[path]` で取り込み、状態ルート・bundle は親の **子** に作る）で保護した。
 照合内容（成功行・具体値）は変えていない。tmpfiles の走査との重なりは再現できないため、直接の実証ではない（#2958 と同じ扱い）。
 
 判定基準: 製品がディレクトリへ待たない flock を取る経路（`BundleLock::acquire`。create・start・`recover_interrupted_start`・

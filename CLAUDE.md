@@ -126,7 +126,7 @@ fandhe-container/
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）
 │   │   ├── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
-│   │   ├── macos.md               # macOS セットアップ前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネル / initrd の用意。実装済み / 未実装・#1906 等の判断待ちを区別。#2602・MAC-1・CLI-2）
+│   │   ├── macos.md               # macOS セットアップ前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネル / initrd の用意・plugin の配置と信頼性検証の要件と署名後のハッシュの注意。実装済み / 未実装・#1906 等の判断待ちを区別。#2602・MAC-1・CLI-2）
 │   │   ├── network-reclaim-recovery.md  # 作成失敗で残った資源の観測と、印を刻む前に失敗した別名なし bridge の手動回収の手順（#2604・NET-1・REPAIR-4）
 │   │   ├── container-log-recovery.md  # delete の後に残ったコンテナログの見分け方と手動削除の手順（#2698・SUP-7・CLI-1）
 │   │   └── plugin-socket-recovery.md  # plugin socket の `ALREADY_EXISTS` の見分け方と記録の無い socket の手動削除の手順（#1859・PLUG-12）

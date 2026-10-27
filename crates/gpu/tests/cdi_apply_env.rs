@@ -62,13 +62,42 @@ fn gpu2_task127_4_cdi_env_reaches_exec_child() {
         .iter()
         .map(|e| e.split_once('=').unwrap())
         .collect();
-    let out = Command::new("/usr/bin/env")
+    // REPAIR-5: 子の終了も出力の EOF も有限の期限で待つ。超過時は kill して回収し、失敗にする。
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("/usr/bin/env")
         .env_clear()
         .envs(pairs.iter().copied())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let got: BTreeSet<String> = String::from_utf8(out.stdout)
+    let mut pipe = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let limit = Duration::from_secs(10);
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(st) => break st,
+            None if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("/usr/bin/env did not exit within {limit:?}");
+            }
+        }
+    };
+    assert_eq!(status.code(), Some(0));
+    let stdout = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stdout EOF was not reached in time");
+    let got: BTreeSet<String> = String::from_utf8(stdout)
         .unwrap()
         .lines()
         .map(str::to_string)

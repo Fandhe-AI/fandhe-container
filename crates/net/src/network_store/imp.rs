@@ -222,6 +222,12 @@ fn open_dir_checked(path: &Path) -> Result<Dir, NetError> {
     Ok(Dir { file: f })
 }
 
+/// 初期化で作ったエントリを永続化する。`@networks` 自身 → 親の state_root の順に fsync する。
+fn sync_init(root: &Dir, networks: &Dir) -> Result<(), NetError> {
+    networks.sync()?;
+    root.sync()
+}
+
 /// 同一 inode か（取得後の `@lock` 照合）。
 fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
@@ -342,6 +348,9 @@ impl NetworkStore {
         let dir = Dir { file: f };
         // 全体のロックファイルを作って検査する（以降の取得は検査つきで開き直す）。
         dir.open_regular(LOCK_FILE, true, u64::MAX)?;
+        // 新規作成した `@networks` のエントリと `@lock` を永続化してから使う。既存でも（別プロセスが
+        // 作った直後の可能性があるため）同期する。失敗は握りつぶさず返す（NET-6）。
+        sync_init(&root, &dir)?;
         Ok(Self {
             dir,
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
@@ -680,6 +689,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// NET-6: 初期化の同期は成功時に Ok、fsync できない fd（/dev/null）では Err を返す。
+    #[test]
+    fn sync_init_ok_and_propagates_failure() {
+        let t = Tmp::new("syncinit");
+        let _s = NetworkStore::open(&t.0).unwrap();
+        let root = open_dir_checked(&t.0).unwrap();
+        let nets = open_dir_checked(&t.nets()).unwrap();
+        assert!(sync_init(&root, &nets).is_ok());
+        let bad = Dir {
+            file: File::open("/dev/null").unwrap(),
+        };
+        assert!(sync_init(&root, &bad).is_err());
+        assert!(sync_init(&bad, &nets).is_err());
     }
 
     fn nn(s: &str) -> NetworkName {

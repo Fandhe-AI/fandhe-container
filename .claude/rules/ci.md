@@ -10,7 +10,7 @@
 2. 変更した crate だけの lint とテスト: `cargo clippy -p <パッケージ名> --all-targets -- -D warnings` と `cargo test -p <パッケージ名>`（複数 crate なら `-p` を並べる）。`<パッケージ名>` はディレクトリ名ではなく Cargo のパッケージ名（`fandhe-container-<短縮名>`。例: `crates/io` は `-p fandhe-container-io`）。ワークスペース全体の `make lint`・`make test` は必須にしない
 3. Rust 以外の変更: 変更したスクリプトに対応する自己テスト（`make <name>-selftest`）や、変更した Markdown / YAML だけの lint（必要なら）に限る。docs のみの変更ではビルド・テストを省略してよい
 4. 他 crate へ波及しうる変更（共有の型・公開トレイト・`Cargo.toml`・feature・`cfg` 分岐の変更）では、`cargo check --workspace --all-targets` を追加で通す（型検査のみで速い）
-   - 試験用 feature（`escape-probe`・`exec-test-support`・`*-test-support` 等）を持つ crate（core・supervisor・cli・plugin）や共有の型・`cfg` を変えたときは、`cargo clippy -p <パッケージ名> --lib --bins -- -D warnings`（または全メンバーを回す `make check-standalone-clippy`。warm で数十秒）も通す。`--all-targets` は自 crate の dev-dependency の自己参照で試験用 feature が有効になり、自 crate の `dead_code`・`unused_imports` を見逃すため（#2640・REPAIR-12）
+   - 試験用 feature（`escape-probe`・`exec-test-support`・`*-test-support` 等）を持つ crate（core・supervisor・cli・plugin・net）や共有の型・`cfg` を変えたときは、`cargo clippy -p <パッケージ名> --lib --bins -- -D warnings`（または全メンバーを回す `make check-standalone-clippy`。warm で数十秒）も通す。`--all-targets` は自 crate の dev-dependency の自己参照で試験用 feature が有効になり、自 crate の `dead_code`・`unused_imports` を見逃すため（#2640・REPAIR-12）
 5. PR のマージゲートは CI。CI が失敗したら、失敗したジョブ・テストの範囲だけを手元で再現して直す
 
 維持するもの（ローカルを軽くしても変えない）:

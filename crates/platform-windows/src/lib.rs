@@ -9,7 +9,7 @@
 //! - `wsl2` の WSL2 検出・バージョン確認（TASK-67.3・#374）は実装済み。virtiofs 共有マウントと起動前の検証
 //!   シーケンス（TASK-67.4・#375。ゲスト内ランタイムの常駐起動は TASK-116）も実装済み。virtiofs が使えない
 //!   環境での 9P フォールバックと警告・エラー型の統合（TASK-67.5・#376。WIN-2・ERR-1）も実装済み。実機での
-//!   fstype・オプション確認は TASK-67.6（#377）。
+//!   fstype・オプション確認は #353（TASK-22。`win1_win2_shared_mount_on_real_wsl2` を virtiofs と 9p で実行）。
 //! - `sys` は `unsafe` を閉じ込める FFI の薄いラッパー。Windows は `wsl2` の `wsl.exe` パス解決・Job Object と
 //!   `wslconfig` 置換時のアクセス制御の複製・検査に、unix は `wslconfig` 置換時の拡張 ACL の検出に使う。
 //!

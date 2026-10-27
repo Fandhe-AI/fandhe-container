@@ -1,4 +1,4 @@
-//! WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（TASK-67.6・#377。WIN-1・WIN-2・MS-5・REPAIR-12）。
+//! WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（TASK-67.6・#377 で作成。実機の実行記録は #353。WIN-1・WIN-2・MS-5・REPAIR-12）。
 //!
 //! Windows でのみビルドする（他 OS は 0 件の test target。`tests/vm_boot.rs`〔platform-macos〕と同じ方式）。
 //! feature `wsl2-test-support` は使わず公開 API だけを使うため、`make test-integration` の既定集合に入る。

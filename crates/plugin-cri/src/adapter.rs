@@ -593,6 +593,9 @@ pub const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `PullImage` 全体の期限（[`PLUGIN_REQUEST_TIMEOUT`] より短くする）。gRPC 側が先に切れても、裏の `spawn_blocking` の取り込みが
 /// 有界時間で終わるようにするため（oci の既定は pull 1 時間・blob 30 分で、request timeout より長い）。
+/// 展開の `ExtractBudget` にも pull の開始時に求めた同じ絶対時刻を渡して期限を共有する（展開に別の予算は持たせない。
+/// 別予算にすると pull 全体が本値を超えうる。#2967・CRI-3・REPAIR-5。設計は `docs/design/container-log-removal-wait.md`。
+/// 照合は `cri3_repair5_extraction_shares_the_pull_deadline`・`repair5_pull_deadline_fits_inside_request_timeout`）。
 pub const PLUGIN_PULL_DEADLINE: Duration = Duration::from_secs(540);
 
 /// 本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`。pull と create の展開設定の単一の出所）。

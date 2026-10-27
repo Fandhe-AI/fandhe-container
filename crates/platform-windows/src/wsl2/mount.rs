@@ -57,16 +57,16 @@
 //!   証明する [`PreparedLaunch`] と、それを受け取る起動ステップを注入する [`launch_with`] までを提供する。
 //! - `mount -t drvfs <Windows パス> <マウント先>` が `virtiofs=true` 有効時に virtiofs で成立するという
 //!   前提、およびマウントオプション `nosuid,nodev` の受理は実機で未検証（PoC-4 は机上調査のみ。WIN-2 の再検証
-//!   条件）。コマンドの組み立ては `mount_argv` に集約しており、実機確認は TASK-67.6（#377）で行う。
+//!   条件）。コマンドの組み立ては `mount_argv` に集約しており、実機確認は #353（TASK-22。`win1_win2_shared_mount_on_real_wsl2` の virtiofs の回）で行う。
 //! - 9P フォールバック（TASK-67.5）で、WSL2 の drvfs 共有が `/proc/self/mountinfo` 上で fstype `9p` になること、
-//!   9P 経路で `nosuid,nodev,ro` が受理されることも実機で未検証（偽 `wsl.exe` は `9p` を返す前提）。TASK-67.6（#377）で
-//!   実機確認する。
+//!   9P 経路で `nosuid,nodev,ro` が受理されることも実機で未検証（偽 `wsl.exe` は `9p` を返す前提）。#353（TASK-22。
+//!   `win1_win2_shared_mount_on_real_wsl2` の 9p の回）で実機確認する。
 //! - 結合試験 `tests/wsl2_mount.rs`（feature `wsl2-test-support`）は、偽 `wsl.exe`（`tests/bin/fake_wsl.rs` の
 //!   マウント系モード）を子プロセスとして起動し、公開 API と同じ経路（検出 → mount → mountinfo によるマウント
 //!   ID・fstype の確認 → 起動ステップ → 解除）と argv の受け渡しを検証する。偽 `wsl.exe` はゲスト内スクリプトを
 //!   解釈しないため、スクリプトの振る舞い（ロック・claim・記録・取り下げ・タイムアウトからの回復）は模擬ゲストの
-//!   ユニットテストで検証し、本物の WSL2 ゲストでの挙動（`flock`・`/run`・`mount.drvfs`）は TASK-67.6（#377）で
-//!   実機確認する。
+//!   ユニットテストで検証し、本物の WSL2 ゲストでの挙動（`flock`・`/run`・`mount.drvfs`）は #353 の実機試験がこの経路を通る
+//!   （挙動そのものの観測は受け入れ条件に無く追跡 issue なし。REPAIR-3）。
 //!
 //! # 権限
 //!
@@ -651,7 +651,7 @@ const MNT_ID_SH: &str = mnt_id_sh!();
 /// 検証後に要素を差し替えられる（rename・symlink への置換）のはゲスト内の root（uid 0）に限られる。ゲスト内 root は
 /// マウントの付け外しやこのシェルへの介入も自由にできる信頼境界の内側であり、本スクリプトが防ぐ対象は非特権の
 /// プロセスによる差し替えである。ディレクトリをハンドル（fd・cwd）で固定してマウントする方式は、WSL の
-/// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（TASK-67.6・#377 で再検討する。REPAIR-3）。
+/// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（#353 の実機記録を踏まえて再検討する。追跡 issue なし。REPAIR-3）。
 const MOUNT_SCRIPT: &str = concat!(
     "set -eu; B=/mnt/fandhe; R=/run/fandhe; ",
     mnt_id_sh!(),
@@ -718,7 +718,7 @@ fn new_nonce() -> String {
     format!("{:08x}{seq:016x}{nanos:032x}", std::process::id())
 }
 
-/// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
+/// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（#353 の virtiofs の回で確認する。REPAIR-3）。
 fn mount_argv(
     distro: &DistroName,
     m: &SharedMount,
@@ -1479,7 +1479,7 @@ fn with_rollback_note(e: Wsl2Error, outcome: &RollbackOutcome) -> Wsl2Error {
 /// マウントは成立しない。`mount` の途中で上限まで記録が確定しなければ（`mount(2)` が戻らない等）、
 /// [`ABANDON_SCRIPT`] で取り下げ、`mount` が戻った時点でゲスト内の [`MOUNT_SCRIPT`] が自分のマウントを外す。
 /// 取り下げもできなければ `ownership unconfirmed` として返す。ゲスト内のプロセス自体が外部から強制終了された
-/// 場合の後始末は対象外（実機での挙動確認は TASK-67.6・#377。REPAIR-3）。
+/// 場合の後始末は対象外（実機での挙動確認は未実施で追跡 issue なし。REPAIR-3）。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,

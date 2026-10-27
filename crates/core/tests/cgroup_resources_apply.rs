@@ -8,6 +8,7 @@
 //! `io.max` も照合する。最後に delete で cgroup と記録が消えることを確かめる。
 //!
 //! # 実機前提テストとしての分離
+//! 一時領域は `support/scratch_root.rs` の `ScratchDir` の子に作る（#3026・tmpfiles の flock 走査から守るため）。
 //! `memory`・`cpu`・`pids`（と、デバイス指定時は `io`）が委譲された cgroup v2 サブツリーと、swap accounting
 //! （`memory.swap.max` の存在）が要り、GitHub ホステッド runner では保証できないため `#[ignore]` で既定の
 //! テスト集合から分離する（AGENTS.md「実機前提テスト」・ci.md）。root は不要。条件が欠ける場合は成功扱いに
@@ -23,6 +24,11 @@
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
 mod precondition;
+
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -81,8 +87,14 @@ mod linux {
         let delegated = crate::precondition::delegated_cgroup();
         let parent = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
         let id = ContainerId::new(format!("r{}", std::process::id())).expect("id");
-        let root_dir = std::env::temp_dir().join(format!("fandhe-resources-{}", id.as_str()));
-        let _ = fs::remove_dir_all(&root_dir);
+        // tmpfiles の flock 走査から守る保護済みの親（#3026）。状態ルートは必ずその子に作り、関数の最後まで保持する。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-resources",
+            std::time::Duration::from_secs(10),
+        );
+        let root_dir = scratch
+            .path()
+            .join(format!("fandhe-resources-{}", id.as_str()));
         fs::create_dir_all(&root_dir).expect("create state root");
         fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
         let store = FileStateStore::open(StateRoot::from_override(root_dir.clone()).expect("root"))

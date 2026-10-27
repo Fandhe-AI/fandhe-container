@@ -52,9 +52,42 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 | x86_64-unknown-linux-gnu | `rust-ci`（clippy・test の `--all-features`）・`platform-ci`（ubuntu の `make lint`・`make test`） | コンパイル時検査（試験の実行を含む） |
 | aarch64-unknown-linux-gnu | `cross-target-check`（`cargo check`・`cargo clippy` の `--all-targets --all-features`） | 型検査（const の評価は行われる。試験は実行しない） |
 | aarch64-unknown-linux-musl（製品のゲストのターゲット。guest-init のみ） | `cross-target-check` の `cargo check` / `cargo clippy -p fandhe-container-guest-init --all-targets` | 型検査（`cfg(test)` の const の評価は行われる。試験は実行しない） |
+| x86_64-unknown-linux-musl・aarch64-unknown-linux-musl の core・net | なし（対象外。決定は「musl の扱い（#3103）」） | core・net を musl で使う配布物が無いため評価しない |
 | aarch64-apple-darwin | `cross-target-check`（既定 feature の clippy を含む）・main の `platform-ci`（macos。ネイティブ） | PR では型検査、main ではネイティブ |
 | x86_64-apple-darwin | なし | CI の空白。手元で `cargo check --all-targets --target x86_64-apple-darwin` を推奨する |
 | Windows | 対象外 | `sys` は `cfg(unix)`。Windows API の自前宣言は #1837 の範囲外 |
+
+## musl の扱い（#3103）
+
+決定: crates/core・crates/net の musl（`x86_64-unknown-linux-musl`・`aarch64-unknown-linux-musl`）は libc 照合の対象外とする（MVM-4・REPAIR-7・REPAIR-12・MS-6）。CI で core・net の musl の型検査・照合は行わない（新しいジョブ・check-run も足さない）。
+
+根拠:
+
+- musl の配布ターゲットは crates/guest-init（`aarch64-unknown-linux-musl`）だけで、guest-init は std のみ（`cargo tree -p fandhe-container-guest-init -e normal --target aarch64-unknown-linux-musl` は自身だけ。core・net を引かない）。
+- core・net を使う crate（cli・supervisor・cri・oci・plugin-cri・plugin-mcp）はすべて gnu の Linux 向けで、配布物の生成（`release.yml`）は発火条件を無効化中。
+
+musl に関係する分岐の一覧:
+
+- 製品コードに `cfg(target_env = "musl")` の分岐は無い。宣言は glibc の原型に合わせてあり、musl との差（`ioctl` の `request`、`renameat2` が musl 1.2.6 以降など）は各宣言のコメントに書いてある。
+- core の照合のうち `cfg(target_env = "gnu")` に限ったもの: `libc_consts_checks!` の gnu 節（`BINDERFS_SUPER_MAGIC`・`NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`・`RLIMIT_*`・`PTRACE_CONT`）、`seccomp_notify.rs` の ioctl 定数 3 件、`libc_abi` の `StatFs.f_flags`、`ioctl`・`prlimit`・`renameat2` の関数型、`MsgHdr`・`CmsgHdr`。
+- net に `target_env` の分岐は無い（`msghdr` を使わない設計で glibc / musl の差を避けており、照合は arch の cfg のみ）。
+
+gnu 限定の分岐を残す理由: 外すと musl では型の違い（`c_int`・非公開フィールド）で通らないか、`as` の読み替えで通すことになり照合の意味が無くなる。gnu に限る形は、将来 musl を採るときに musl の節を足す土台にもなる。`compile_error!` 等で musl のビルドを機械的に禁じることはしない（製品挙動の変更になり、本 issue の範囲外）。
+
+手元の確認（commit 315e25aa。`aarch64-unknown-linux-musl` のみ。`x86_64-unknown-linux-musl` は toolchain に入っておらず未確認）:
+
+| 確認 | 結果 |
+| ---- | ---- |
+| `cargo check -p fandhe-container-net --all-targets --target aarch64-unknown-linux-musl` | 成功 |
+| `cargo check -p fandhe-container-core --lib --bins --target aarch64-unknown-linux-musl` | 成功 |
+| `cargo check -p fandhe-container-core --all-targets --target aarch64-unknown-linux-musl` | 失敗。`StatFs` の照合の `libc::__fsword_t`（gnu にしか無い）が E0425。名前解決で止まるため、その先の `const` 評価で musl に食い違いがあるかは未確認 |
+
+再検討の条件: musl で core・net をリンクする crate・配布物が加わったとき（`rename_noreplace_at` の doc の条件と同じ）。その場合の作業案（採否・CI の追加はオーナー承認事項で、未実施）:
+
+- `cross-target-check` の既存ジョブにステップとして `cargo check` / `cargo clippy -p fandhe-container-core -p fandhe-container-net --all-targets --all-features --target <musl target>` を足す（新しいジョブ・check-run は増やさない）
+- `__fsword_t` の照合を gnu に限り、musl の `--all-targets` を通す
+- musl の節を照合に足す（`c_int` の `Ioctl`・`resource`、`renameat2` の musl 1.2.6 前提、`msghdr` の非公開パディング）
+- 製品の宣言（`ioctl` の `request` 型など）を musl に合わせて cfg で分けるかを判断する
 
 ## 手元での評価の確認（#1838）
 
@@ -101,14 +134,14 @@ crates/plugin（#1843）は `sys.rs` の末尾の `libc_abi`（cfg ごとの子�
 
 crates/core の syscall 番号（#1847）の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts` と `seccomp_notify` の対応外側（`ArchSysNo::UNSUPPORTED` で番号を持たない）、x32・ILP32（`target_pointer_width = "64"` の cfg で対応外）。照合は x86_64 と aarch64 の `consts` の 27 件ずつと `SYS_SECCOMP`（`sys/seccomp_notify.rs`）の各 1 件で、値は既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` を通す `const fn` で読み、`sysno` の型の保証は変えない。
 
-crates/core の番号以外の定数（#1848）: 照合は `const` 評価で、試験専用の `libc_const_eq!`（両辺の型を引数で明記し `as i128` で比べる。64 bit 以下の整数では値を切り詰めず、`libc` の型が変われば E0308 で表に出る）を使う。x86_64 と aarch64 の `consts` は名前が同じ 183 件ずつ（`SYS_*`・`SUPPORTED` を除く）で、一覧 `libc_consts_checks!` を各 arch の `consts::libc_abi` から展開して 164 件ずつ照合し、19 件は `libc` に対応物が無く対象外（fs magic 6 件・`ST_VALID`・bpf 6 件・`KCMP_VM`・`KEXEC_SEGMENT_MAX`・Landlock 3 件・`LINUX_CAPABILITY_VERSION_3`。一次情報は `libc_consts_checks!` のコメント）。164 件のうち 24 件（`Ioctl` 型の `NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`、`RLIMIT_*`、`PTRACE_CONT`、`BINDERFS_SUPER_MAGIC`）は `libc` の型が環境で変わる、または gnu にしか無いため `target_env = "gnu"` に限る（musl は `c_int` で `TIOCGPTN` が負になり、読み替えで通さない。core は musl 向けに CI でビルドしない）。名前が違う対応は `OPEN_TREE_AT_*`・`MOUNT_SETATTR_AT_*`（`libc` は `AT_EMPTY_PATH`・`AT_RECURSIVE`）、`PROC_MAGIC`（`PROC_SUPER_MAGIC`）、`DEVPTS_MAGIC`（`DEVPTS_SUPER_MAGIC`）、`ENOENT_ERRNO`・`EPERM_ERRNO`。`consts` の外は `sys.rs` 最上位の `libc_abi` で 9 件（`AT_FDCWD`・`TMPFS_MAGIC`・`PROC_MAGIC`・`DEVPTS_MAGIC`・`SIG_DFL`・`SIG_ERR`・`SIG_IGN`・`PIDFD_SIGNAL_PROCESS_GROUP`・`renameat2` 内の `RENAME_NOREPLACE`）、`sys/seccomp_notify.rs` で 18 件（ioctl の 3 件は gnu のみ）、`sys/macos.rs` で最上位 4 件と `plugin_fs` 15 件を照合する（`sys/bpf.rs` に照合できる定数は無い。内部の上限と方針値のみ）。対象外の方針値・試験の固定値は `sys.rs` 最上位の `libc_abi` のコメントに列挙した。macOS の `ACL_TYPE_EXTENDED`・`ACL_FIRST_ENTRY` は `libc` の apple に定義が無く未照合のまま残る（Apple SDK の `sys/acl.h` との照合は #2369 から未了）。`libc` の dev-dependency は macOS の照合のため `cfg(target_os = "linux")` から `cfg(unix)` に広げた（版・`Cargo.lock` は不変）。値をわざとずらして評価が失敗することを、そのまま比べる `O_NOFOLLOW`（aarch64）、広げて比べる `MOUNT_ATTR_NODEV`、gnu の ioctl `TIOCGPTN`、名前が違う `MOUNT_SETATTR_AT_RECURSIVE`、`consts` の外の `PROC_MAGIC`、`seccomp_notify` の `SO_PASSCRED`、macOS の `plugin_fs::F_GETPATH` で確認した（いずれも E0080）。
+crates/core の番号以外の定数（#1848）: 照合は `const` 評価で、試験専用の `libc_const_eq!`（両辺の型を引数で明記し `as i128` で比べる。64 bit 以下の整数では値を切り詰めず、`libc` の型が変われば E0308 で表に出る）を使う。x86_64 と aarch64 の `consts` は名前が同じ 183 件ずつ（`SYS_*`・`SUPPORTED` を除く）で、一覧 `libc_consts_checks!` を各 arch の `consts::libc_abi` から展開して 164 件ずつ照合し、19 件は `libc` に対応物が無く対象外（fs magic 6 件・`ST_VALID`・bpf 6 件・`KCMP_VM`・`KEXEC_SEGMENT_MAX`・Landlock 3 件・`LINUX_CAPABILITY_VERSION_3`。一次情報は `libc_consts_checks!` のコメント）。164 件のうち 24 件（`Ioctl` 型の `NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`、`RLIMIT_*`、`PTRACE_CONT`、`BINDERFS_SUPER_MAGIC`）は `libc` の型が環境で変わる、または gnu にしか無いため `target_env = "gnu"` に限る（musl は `c_int` で `TIOCGPTN` が負になり、読み替えで通さない。core は musl 向けに CI でビルドしない。「musl の扱い（#3103）」参照）。名前が違う対応は `OPEN_TREE_AT_*`・`MOUNT_SETATTR_AT_*`（`libc` は `AT_EMPTY_PATH`・`AT_RECURSIVE`）、`PROC_MAGIC`（`PROC_SUPER_MAGIC`）、`DEVPTS_MAGIC`（`DEVPTS_SUPER_MAGIC`）、`ENOENT_ERRNO`・`EPERM_ERRNO`。`consts` の外は `sys.rs` 最上位の `libc_abi` で 9 件（`AT_FDCWD`・`TMPFS_MAGIC`・`PROC_MAGIC`・`DEVPTS_MAGIC`・`SIG_DFL`・`SIG_ERR`・`SIG_IGN`・`PIDFD_SIGNAL_PROCESS_GROUP`・`renameat2` 内の `RENAME_NOREPLACE`）、`sys/seccomp_notify.rs` で 18 件（ioctl の 3 件は gnu のみ）、`sys/macos.rs` で最上位 4 件と `plugin_fs` 15 件を照合する（`sys/bpf.rs` に照合できる定数は無い。内部の上限と方針値のみ）。対象外の方針値・試験の固定値は `sys.rs` 最上位の `libc_abi` のコメントに列挙した。macOS の `ACL_TYPE_EXTENDED`・`ACL_FIRST_ENTRY` は `libc` の apple に定義が無く未照合のまま残る（Apple SDK の `sys/acl.h` との照合は #2369 から未了）。`libc` の dev-dependency は macOS の照合のため `cfg(target_os = "linux")` から `cfg(unix)` に広げた（版・`Cargo.lock` は不変）。値をわざとずらして評価が失敗することを、そのまま比べる `O_NOFOLLOW`（aarch64）、広げて比べる `MOUNT_ATTR_NODEV`、gnu の ioctl `TIOCGPTN`、名前が違う `MOUNT_SETATTR_AT_RECURSIVE`、`consts` の外の `PROC_MAGIC`、`seccomp_notify` の `SO_PASSCRED`、macOS の `plugin_fs::F_GETPATH` で確認した（いずれも E0080）。
 
 crates/core の構造体と関数の型（#1849）: 照合は `sys.rs` 最上位の `libc_abi`（構造体 6 種〔`RLimit64`・`SockaddrNl`・`PollFd`・`StatFs`・`MountAttr`・`SockFprog`〕と `SyscallNumber`・`BpfInstruction` のサイズ、関数 33 件・`sendfile` の型〔`off_t *`・`size_t`・`ssize_t`。#2759〕）、`sys/seccomp_notify.rs` の `libc_abi`（構造体 5 種〔`SeccompData`・`SeccompNotif`・`SeccompNotifResp`・`IoVec`・`Ucred`〕と gnu の `MsgHdr`・`CmsgHdr`、関数 5 件）、`sys/macos.rs`（関数 4 件〔`geteuid`・`fsync`、`plugin_fs` の可変長 `openat`・`fcntl`〕）で、いずれも `const` 評価。構造体は `size_of`・`align_of` とフィールドのオフセット、関数は同じ関数ポインタ型への自前と `libc` の代入で照合する。対象外と扱い（理由は `libc_abi` の doc）は次のとおり。
 
 - 対象外（`libc` 0.2.189 に対応物が無い）: `CapUserHeader`・`CapUserData`（capability.h）、`LandlockRulesetAttr`・`LandlockPathBeneathAttr`（landlock.h。サイズとオフセットは実行時の試験が照合）、`sys/bpf.rs` の `BpfProgLoadAttr`・`BpfProgAttachAttr`・`BpfProgQueryAttr`（`union bpf_attr`。bpf.h）、`ControlBuf`・`SendControlBuf`（バイトの入れ物。`cmsghdr` への整列だけ確認）。macOS の `acl_*` 6 件は `libc` の apple に宣言が無く未照合（SDK の `sys/acl.h` との照合は #2369 から未了）
 - 型の綴りの違いで ABI は同じ: `prlimit` の `resource`（自前 `i32`・`libc` は `c_uint`。自前を `u32` に揃えるかはオーナー判断で `sys` の本体は変えていない）、`syscall` の第 1 引数（`SyscallNumber` は `repr(transparent)` の `i64`。`size_of`・`align_of` で `c_long` と照合）、`SockFprog.filter` の `*const`（`libc` は `*mut`）、自前の構造体を指すポインタ（`fstatfs`・`sendto`・`recvfrom`・`poll`・`prlimit`・`sendmsg`・`recvmsg`。ポインタ先の型を別々に書き、構造体の同一性は構造体の照合が保証する）
 - 一部だけの照合: `StatFs.f_flags` は gnu の `libc::statfs` で非公開の `f_spare` の先頭にあるため、gnu に限り `f_frsize` のオフセット + 1 語（80）で照合。`BpfInstruction` は `seccomp` の非公開フィールドのため `libc::sock_filter` とサイズ・アラインメントだけ。`SockaddrNl.nl_pad` は `nl_family` の直後で代替
-- gnu に限る（musl は core を CI でビルドしないため未照合）: `ioctl`・`prlimit`・`renameat2`、`MsgHdr`・`CmsgHdr`（musl は `size_t` でなく `int` / `socklen_t` と非公開のパディング）
+- gnu に限る（musl は core を CI でビルドしないため未照合。「musl の扱い（#3103）」参照）: `ioctl`・`prlimit`・`renameat2`、`MsgHdr`・`CmsgHdr`（musl は `size_t` でなく `int` / `socklen_t` と非公開のパディング）
 - 値をわざとずらして評価が失敗することを、`MountAttr` のフィールド順の入れ替え（x86_64 で E0080）と `kill` の期待型の変更（aarch64 で E0308）で確認した（ずらした変更はコミットしていない）
 
 crates/platform-macos の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`MFSTYPENAMELEN`（`libc` に無い。`libc::statfs` の `f_fstypename` と `f_mntonname` のオフセット差で間接照合）、`statfs` の `link_name`（自前は `x86_64`、`libc` は `not(aarch64)` と書き方が違うが、親の `compile_error!` で 2 アーキに限るため同じシンボルになる）。`geteuid` は macOS と Linux の両方でコンパイルされるため、PR の ubuntu CI でもネイティブに評価される。

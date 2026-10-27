@@ -143,6 +143,26 @@ mod linux {
         }
     }
 
+    /// パイプを読み切るまで排出し、先頭 64KiB だけ文字列にして送る別スレッドを起こす。
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            if let Some(mut p) = pipe {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = p.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = (64 * 1024usize).saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&kept).into_owned());
+        });
+        rx
+    }
+
     /// 外部コマンドを期限つきで実行する（REPAIR-5）。シェルは経由しない。
     fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
         let mut child = Command::new(program)
@@ -152,6 +172,9 @@ mod linux {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("{program}: spawn failed: {e}"))?;
+        // 出力は実行中から別スレッドで排出する。子孫がパイプを保持しても収集の待ちは有限（REPAIR-5）
+        let out_rx = drain(child.stdout.take());
+        let err_rx = drain(child.stderr.take());
         let deadline = Instant::now() + CMD_TIMEOUT;
         let status = loop {
             match child.try_wait() {
@@ -167,14 +190,10 @@ mod linux {
                 Err(e) => return Err(format!("{program}: wait failed: {e}")),
             }
         };
-        let mut out = String::new();
-        if let Some(o) = child.stdout.take() {
-            let _ = o.take(64 * 1024).read_to_string(&mut out);
-        }
-        let mut err = String::new();
-        if let Some(e) = child.stderr.take() {
-            let _ = e.take(64 * 1024).read_to_string(&mut err);
-        }
+        let collect_until = Instant::now() + REAP_TIMEOUT;
+        let remaining = || collect_until.saturating_duration_since(Instant::now());
+        let out = out_rx.recv_timeout(remaining()).unwrap_or_default();
+        let err = err_rx.recv_timeout(remaining()).unwrap_or_default();
         if status.success() {
             Ok(out)
         } else {
@@ -299,6 +318,13 @@ mod linux {
                 "loop backing_file is our image",
             )?;
             let table = flakey_table(self.sectors, &dev, FlakeyMode::Up);
+            // 同名の既存デバイスを自分の作成物と取り違えて remove しないよう、作成前に不存在を確認する
+            if dm_exists(&self.dm_name)? {
+                return Err(format!(
+                    "precondition failed: dm device {} already exists (not ours; refusing to touch it)",
+                    self.dm_name
+                ));
+            }
             self.dm_attempted = true;
             run_cmd("dmsetup", &["create", &self.dm_name, "--table", &table])?;
             self.dm_created = true;

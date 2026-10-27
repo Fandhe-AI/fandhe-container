@@ -8,6 +8,11 @@
 
 #![cfg(target_os = "linux")]
 
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
 use std::num::{NonZeroU8, NonZeroU32};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -37,17 +42,17 @@ struct Env {
     id: String,
     base: PathBuf,
     store: Arc<dyn StateStore>,
+    /// tmpfiles の flock 走査から守る親（#3026）。`base` はその子。最後のフィールドで、`Drop` の後に親が消える。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Env {
     fn new(tag: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-sup-seccomp-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let scratch =
+            scratch_root::ScratchDir::new("fandhe-sup-seccomp", std::time::Duration::from_secs(10));
+        let base = scratch.path().join(format!("{tag}-{n}"));
         std::fs::create_dir_all(base.join("bundle/rootfs")).unwrap();
         std::fs::write(
             base.join("bundle/config.json"),
@@ -64,7 +69,12 @@ impl Env {
         let id = format!("c-{tag}-{n}");
         let req = CreateRequest::new(ContainerId::new(&id).unwrap(), base.join("bundle")).unwrap();
         create(store.as_ref(), &OpRecorder::new(), &req).unwrap();
-        Self { id, base, store }
+        Self {
+            id,
+            base,
+            store,
+            _scratch: scratch,
+        }
     }
 }
 

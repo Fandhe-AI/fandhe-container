@@ -91,6 +91,7 @@ case "${1:-}" in
         exit 0
         ;;
     esac
+    printf '%s' "$script" >"${STUB_DIR}/last_script"
     [ "${STUB_MODE:-ok}" = hang ] && exec sleep 30
     count="$(printf '%s' "$script" | sed -n 's/.*-lt \([0-9]*\) .*/\1/p' | head -1)"
     batch="$(printf '%s' "$script" | sed -n 's/.*% \([0-9]*\)).*/\1/p' | head -1)"
@@ -206,6 +207,25 @@ check "count mismatch is reported" err_has 'file count mismatch'
 reset_stub badts
 runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
 check "unexpanded %N timestamps exit 1" rc_is 1
+# BusyBox の date は %N 非対応（#3079）。ワークロードは %N を使わず、/proc/uptime 由来の数値だけの時刻を出す。
+reset_stub ok
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
+no_pct_n() { ! grep -q '%N' "${STUB_DIR}/last_script"; }
+check "workload script does not use date %N" no_pct_n
+workload_fake_uptime() {
+  local w="${TMP}/wl" up
+  for up in "0.05" "12345.67" "100000.09"; do
+    rm -rf "$w"
+    mkdir -p "$w/data"
+    echo "$up 0.00" >"$w/uptime"
+    sed -e "s#/proc/uptime#$w/uptime#" -e "s#/data#$w/data#g" "${STUB_DIR}/last_script" >"$w/s.sh"
+    sh "$w/s.sh" >"$w/out" 2>&1 || return 1
+    # 先頭と末尾以外の TS 行が全て数字のみで、DONE がある
+    [ "$(grep -c '^TS [0-9][0-9]*$' "$w/out")" -ge 2 ] || return 1
+    grep -q '^DONE$' "$w/out" || return 1
+  done
+}
+check "workload emits numeric timestamps from /proc/uptime (no date %N)" workload_fake_uptime
 reset_stub failrun
 runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
 check "failed docker run exits 1 (fewer than 5 valid trials)" rc_is 1

@@ -161,7 +161,7 @@ pending_result=""
 # ワークロードの組み立て workload_script は両側で共通。CLI の差分が出たらここだけを直す）
 # ---------------------------------------------------------------------------
 
-# コンテナ内で実行する sh スクリプトを作る。検証済みの整数だけから組み立てる（利用者の文字列を入れない）。
+# コンテナ内で実行する sh スクリプトを作る（時刻は BusyBox の date が %N 非対応のため /proc/uptime 由来。fork しない read で読む）。検証済みの整数だけから組み立てる（利用者の文字列を入れない）。
 # 引数: <count> <batch>。出力は `TS <ns>` 行（バッチ境界）・`FILES_CREATED=<n>`・`DONE`。
 workload_script() {
   cat <<EOF
@@ -169,12 +169,17 @@ set -e
 d=/data/w
 mkdir -p "\$d"
 cd "\$d"
-echo "TS \$(date +%s%N)"
+now_ns() {
+  read -r up _ < /proc/uptime
+  fr="\${up#*.}"
+  echo \$(( \${up%.*} * 100 + 1\${fr} - 100 ))0000000
+}
+echo "TS \$(now_ns)"
 i=0
 while [ "\$i" -lt $1 ]; do
   echo x > "f_\$i"
   i=\$((i + 1))
-  if [ \$((i % $2)) -eq 0 ]; then echo "TS \$(date +%s%N)"; fi
+  if [ \$((i % $2)) -eq 0 ]; then echo "TS \$(now_ns)"; fi
 done
 echo "FILES_CREATED=\$(ls | wc -l)"
 cd /data
@@ -349,8 +354,8 @@ parse_trial() { # <stdout file> <intervals out>
     case "$line" in
       "TS "*)
         cur="${line#TS }"
-        case "$cur" in '' | *[!0-9]*) echo "timestamp is not numeric (busybox date may not support %N)"; return 1 ;; esac
-        [ "${#cur}" -ge 16 ] && [ "${#cur}" -le 19 ] || { echo "timestamp has an unexpected width"; return 1; }
+        case "$cur" in '' | *[!0-9]*) echo "timestamp is not numeric (workload clock output is not a number)"; return 1 ;; esac
+        [ "${#cur}" -ge 1 ] && [ "${#cur}" -le 19 ] || { echo "timestamp has an unexpected width"; return 1; }
         if [ -n "$prev" ]; then
           if [ "$cur" -lt "$prev" ]; then echo "timestamps are not monotonic"; return 1; fi
           delta=$(((cur - prev) / batch))

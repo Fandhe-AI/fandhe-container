@@ -66,8 +66,8 @@
 //!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
 //!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
 //!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
-//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線（#1902）と
-//!   明示的な stop の意図の伝達（SUP-9）は未実装。
+//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線も済み（#1902。
+//!   意図は立てない）。明示的な stop の意図の伝達（SUP-9）は未実装。
 //! - 権限モデルは rootless のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。1 対 1 の `RootlessSingleId` か
 //!   範囲写像の `RootlessSubordinateIds` かは `/etc/subuid`・`/etc/subgid` の設定で選ぶ（#2243・CORE-6。規則と所有者名の
 //!   取得は `id_model`）。

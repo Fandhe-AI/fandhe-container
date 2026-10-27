@@ -26,8 +26,9 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - CLI の `kill` への結線（`stop` は `stop_delete::production_stop_signaler` で結線済み。#2059・#2162。`kill` は #1902 が
-//!   `ControlSignaler::new`〔stop の意図を立てない kind 2〕を使う。`kill` が意図を立てるかは #1902 の判断）
+//! - CLI の `kill` は結線済み（#1902。`ControlSignaler::new`〔stop の意図を立てない kind 2〕。`stop` は
+//!   `stop_delete::production_stop_signaler`。#2059・#2162）。残余: moby の `kill` は SIGKILL か StopSignal と一致するとき再起動を
+//!   止めるが、本実装は意図を立てないため `kill <id> KILL` の後に再起動されうる（Docker 互換にするかはオーナー判断待ち）
 //! - 明示 stop の意図は StopRequest（kind 4。稼働中）か CancelRestartRequest（kind 5。バックオフ・再 launch 中。#2440）が
 //!   `StopToken::mark_explicit_stop` で立て、restart の判定が読む（SUP-9・#2162）。supervisor の寿命の中では `always`・
 //!   `unless-stopped` を含む全ポリシーで、stop 後は再起動しない。明示 stop は `restart` ループが state.json の `Stopped` の記録へ

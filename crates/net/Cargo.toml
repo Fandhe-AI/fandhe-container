@@ -69,10 +69,19 @@ harness = false
 
 # 統合 API（create_network / attach_container / delete_network）を通しで使う 3 経路疎通の実機結合試験と、
 # 作成・接続・削除の所要時間計測（NET-1・TASK-139.5・#318）。子の再入（--inner / --child）と root 前提の分離のため
-# harness = false。`--ignored`（疎通）または `--measure`（計測）指定時のみ実行する（AGENTS.md）。
+# harness = false。`--ignored`（疎通）、`--measure`（計測）、`--hold --max-secs N`（トポロジーの保持。#1881）の
+# 指定時のみ実行する（AGENTS.md）。
 [[test]]
 name = "network_paths_privileged"
 path = "tests/network_paths_privileged.rs"
+harness = false
+
+# 1 バイト TCP 往復の p50・p99 計測プログラム（NET-3・TASK-140 準備・#1881）。root 不要・std のみで、引数なしは
+# loopback の自己試験（3 OS の既定のテスト集合）。--serve / --client は保持入口の netns 内で nsenter 越しに使う。
+# 自身を子プロセスとして再入するため harness = false。
+[[test]]
+name = "tcp_rtt_probe"
+path = "tests/tcp_rtt_probe.rs"
 harness = false
 
 # host モード（ホスト netns 共有）の実機結合試験（NET-6・TASK-143.1・#326）。root と util-linux の `unshare --net` が要り、

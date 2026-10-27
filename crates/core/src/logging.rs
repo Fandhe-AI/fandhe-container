@@ -7,8 +7,9 @@
 //! # 位置づけと呼び出し元
 //!
 //! 本モジュールは型と書き出しの仕組みだけを持つ。既存の出力（`audit_log` の `AuditLineDto`・
-//! `observability` の手組み行・`oci_runtime::error`・`legacy_tiocsti`・`plugin_discovery`）は
+//! `observability` の手組み行・`oci_runtime::error`・`plugin_discovery`）は
 //! まだ本型を使っておらず、移行は TASK-98.2（#653）で行う（REPAIR-3: 実装済みを装わない）。
+//! `legacy_tiocsti` の警告行は移行済み（#3117）。
 //!
 //! # 確定した設計判断
 //!

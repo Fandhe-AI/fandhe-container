@@ -568,6 +568,8 @@ mod linux {
     thread_local! {
         /// 試験用: `observe` を n 回目（0 起点）に失敗させる（EMFILE 等の模擬）。
         pub(super) static FAIL_OBSERVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        /// 試験用: 発火後にさらに連続して失敗させる回数（再観測も失敗する場面の模擬）。
+        pub(super) static FAIL_OBSERVE_EXTRA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// fd を複製せずに fstat する（FD 枯渇下の回収でも追加の FD を要しない）。fd は結果と一緒に返す。
@@ -576,7 +578,13 @@ mod linux {
         {
             let hit = FAIL_OBSERVE_AT.with(|c| match c.get() {
                 Some(0) => {
-                    c.set(None);
+                    let extra = FAIL_OBSERVE_EXTRA.with(|x| x.replace(0));
+                    if extra > 0 {
+                        FAIL_OBSERVE_EXTRA.with(|x| x.set(extra - 1));
+                        c.set(Some(0));
+                    } else {
+                        c.set(None);
+                    }
                     true
                 }
                 Some(n) => {
@@ -712,7 +720,18 @@ mod linux {
                         .map_err(|e| map_sys(e, "failed to open a /dev subdirectory"))?;
                     if made {
                         // 開き直した fd の (dev, ino) を記録して、後始末で同一性を照合できるようにする。
-                        let (o, back) = observe(fd)?;
+                        // 観測が一時的に失敗しても 0700 のまま識別なしで残さないよう、開き直して 1 回だけ再観測する。
+                        // 再観測も失敗した場合は識別が未確定のまま残る（残余。後始末は fail-closed で消さない）。
+                        let (o, back) = match observe(fd) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let again =
+                                    sys::open_dir_nofollow_at(cur.as_fd(), &name).map_err(|e| {
+                                        map_sys(e, "failed to open a /dev subdirectory")
+                                    })?;
+                                observe(again)?
+                            }
+                        };
                         fd = back;
                         if o.mode & S_IFMT != S_IFDIR {
                             return Err(precondition(
@@ -1312,9 +1331,12 @@ mod tests {
         let mut n = node("/dev/sub/q");
         n.r#type = Some("p".into());
         let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        // 最初の観測と再観測の両方を失敗させる。
+        linux::FAIL_OBSERVE_EXTRA.with(|c| c.set(1));
         linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(0)));
         let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
         linux::FAIL_OBSERVE_AT.with(|c| c.set(None));
+        linux::FAIL_OBSERVE_EXTRA.with(|c| c.set(0));
         assert_eq!(e.code(), Code::ResourceExhausted);
         assert_eq!(e.errno(), Some(24));
         assert!(d.join("sub").is_dir(), "unidentified dir must be left");
@@ -1374,7 +1396,10 @@ mod tests {
         let mut n = node("/dev/dri/q1");
         n.r#type = Some("p".into());
         let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        // 中間ディレクトリの最初の観測を失敗させても、再観測で 0755 に補正される（#2982）。
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(0)));
         create_device_nodes(root.as_fd(), &resolved).unwrap();
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(None));
         let mode = std::fs::metadata(d.join("dri"))
             .unwrap()
             .permissions()

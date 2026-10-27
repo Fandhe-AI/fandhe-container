@@ -251,6 +251,14 @@ name = "inject_files"
 path = "tests/inject_files.rs"
 harness = false
 
+# bind mount の適用の段（exec::mount_binds）を実カーネルで照合する結合試験（CORE-1・SEC-1・SEC-5・IO-8・TASK-29 追補・#1916）。
+# 上と同じ理由で harness = false。user namespace・新しいマウント API・root の経路が要るため `-- --ignored` 指定時のみ
+# 実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "bind_mounts_real"
+path = "tests/bind_mounts_real.rs"
+harness = false
+
 # user namespace UID/GID 写像（rootless）の結合試験（CORE-6・SEC-5・TASK-40.1）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]

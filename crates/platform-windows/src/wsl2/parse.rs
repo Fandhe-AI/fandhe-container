@@ -396,7 +396,7 @@ pub(super) fn classify_failure(out: &Captured) -> Failure {
 /// - その行は任意のラベル（「Error code」等のローカライズ文字列）と `:`（全角も可）の後に、
 ///   `Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND` または `Wsl/Service/WSL_E_DEFAULT_DISTRO_NOT_FOUND` だけを持つ
 ///
-/// 終了コードの値は実機で未確認のため条件にしない（追跡 issue なし。REPAIR-3）。識別子を伴わない説明文だけの
+/// 終了コードの値は実機で未確認のため条件にしない（追跡は #3137。REPAIR-3）。識別子を伴わない説明文だけの
 /// 別の失敗はロケール表なしには区別できないが、`wsl.exe` は失敗ごとにエラーコード行を 1 行出すため、
 /// 別の失敗は別の識別子として [`only_error_id_is`] で拒否される。
 fn has_no_distro_shape(out: &Captured) -> bool {

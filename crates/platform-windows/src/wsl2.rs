@@ -19,7 +19,7 @@
 //! virtiofs 共有マウントと起動前の検証シーケンス（TASK-67.4・#375）は `mount` モジュール。
 //!
 //! エラー型は crate 共通の `error` モジュールの `WinError` / `WinErrorCode` に統合済み（TASK-67.5・#376。
-//! `Wsl2Error` / `Wsl2ErrorCode` は互換の別名）。実機の `wsl.exe` での確認は #353・#1629 の実機試験が `detect` を通す範囲で得られる（出力形式・終了コードの確認は受け入れ条件に無く追跡 issue なし。REPAIR-3）。
+//! `Wsl2Error` / `Wsl2ErrorCode` は互換の別名）。実機の `wsl.exe` での確認は #353・#1629 の実機試験が `detect` を通す範囲で得られる（出力形式・終了コードの確認は受け入れ条件に無く追跡は #3137。REPAIR-3）。
 
 mod mount;
 mod parse;

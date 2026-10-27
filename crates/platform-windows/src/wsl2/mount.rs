@@ -66,7 +66,7 @@
 //!   ID・fstype の確認 → 起動ステップ → 解除）と argv の受け渡しを検証する。偽 `wsl.exe` はゲスト内スクリプトを
 //!   解釈しないため、スクリプトの振る舞い（ロック・claim・記録・取り下げ・タイムアウトからの回復）は模擬ゲストの
 //!   ユニットテストで検証し、本物の WSL2 ゲストでの挙動（`flock`・`/run`・`mount.drvfs`）は #353 の実機試験がこの経路を通る
-//!   （挙動そのものの観測は受け入れ条件に無く追跡 issue なし。REPAIR-3）。
+//!   （挙動そのものの観測は受け入れ条件に無く追跡は #3137。REPAIR-3）。
 //!
 //! # 権限
 //!
@@ -651,7 +651,7 @@ const MNT_ID_SH: &str = mnt_id_sh!();
 /// 検証後に要素を差し替えられる（rename・symlink への置換）のはゲスト内の root（uid 0）に限られる。ゲスト内 root は
 /// マウントの付け外しやこのシェルへの介入も自由にできる信頼境界の内側であり、本スクリプトが防ぐ対象は非特権の
 /// プロセスによる差し替えである。ディレクトリをハンドル（fd・cwd）で固定してマウントする方式は、WSL の
-/// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（#353 の実機記録を踏まえて再検討する。追跡 issue なし。REPAIR-3）。
+/// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（#353 の実機記録を踏まえて再検討する。追跡は #3137。REPAIR-3）。
 const MOUNT_SCRIPT: &str = concat!(
     "set -eu; B=/mnt/fandhe; R=/run/fandhe; ",
     mnt_id_sh!(),
@@ -1479,7 +1479,7 @@ fn with_rollback_note(e: Wsl2Error, outcome: &RollbackOutcome) -> Wsl2Error {
 /// マウントは成立しない。`mount` の途中で上限まで記録が確定しなければ（`mount(2)` が戻らない等）、
 /// [`ABANDON_SCRIPT`] で取り下げ、`mount` が戻った時点でゲスト内の [`MOUNT_SCRIPT`] が自分のマウントを外す。
 /// 取り下げもできなければ `ownership unconfirmed` として返す。ゲスト内のプロセス自体が外部から強制終了された
-/// 場合の後始末は対象外（実機での挙動確認は未実施で追跡 issue なし。REPAIR-3）。
+/// 場合の後始末は対象外（実機での挙動確認は未実施で追跡は #3137。REPAIR-3）。
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,

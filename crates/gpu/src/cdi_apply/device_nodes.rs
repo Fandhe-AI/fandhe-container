@@ -699,7 +699,7 @@ mod linux {
         for c in comps {
             let name = cstr(c)?;
             let next = match sys::open_dir_nofollow_at(cur.as_fd(), &name) {
-                Ok(fd) => recover_leftover_dir(fd)?,
+                Ok(fd) => check_existing_dir(fd)?,
                 Err(SysError::Os(2)) => {
                     // 複製は作成の前に済ませる（作成後に失敗して取り残さない）。
                     let rec_parent = clone_fd(cur.as_fd())?;
@@ -763,18 +763,18 @@ mod linux {
         Ok(cur)
     }
 
-    /// 既存ディレクトリのうち、前回の試行が識別できないまま 0700 で残したものを 0755 へ回復する（GPU-2・SEC-1）。
+    /// 既存ディレクトリの権限は変更しない（GPU-2・SEC-1・fail-closed）。
     ///
-    /// umask 077 の `mkdirat` 成功後に開き直し・観測が失敗すると、補正前の 0700 のディレクトリが識別なしで
-    /// 残る（後始末は fail-closed で消さない）。再試行はこれを既存として開くため、ここで fd 経由に
-    /// 種別（ディレクトリ）・所有者（実効 uid）・権限（ちょうど 0700）を再確認できたものだけを fd 経由で
-    /// 0755 にする。他人の所有物や別の権限のものは変更しない。観測・補正に失敗したら、
-    /// 別 UID から到達できない状態を成功扱いにしないためエラーを返す。
-    fn recover_leftover_dir(fd: OwnedFd) -> Result<OwnedFd, CdiApplyError> {
+    /// 今回の呼び出しが `mkdirat` で作ったと証明できるディレクトリだけを 0755 へ補正する（`walk_dirs`）。
+    /// 既存のものは前回の取り残しか意図的な 0700 かを識別できないため、権限を広げて別 UID に公開しない。
+    /// 実効 uid 所有の 0700（他ユーザーが辿れない）は権限を変えずに構造化エラーで拒否する。
+    /// 取り残しの手動回収は呼び出し側の運用に委ねる。
+    fn check_existing_dir(fd: OwnedFd) -> Result<OwnedFd, CdiApplyError> {
         let (o, fd) = observe(fd)?;
         if o.mode & S_IFMT == S_IFDIR && o.uid == sys::geteuid() && o.mode & 0o7777 == 0o700 {
-            std::fs::set_permissions(proc_fd_path(&fd), std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| io_err(&e, "failed to set the /dev subdirectory mode"))?;
+            return Err(precondition(
+                "an existing /dev subdirectory is mode 0700; refusing to change its mode",
+            ));
         }
         Ok(fd)
     }
@@ -1357,8 +1357,20 @@ mod tests {
         assert_eq!(e.errno(), Some(24));
         assert!(d.join("sub").is_dir(), "unidentified dir must be left");
         assert_eq!(std::fs::read_dir(d.join("sub")).unwrap().count(), 0);
-        // 0700 のまま識別なしで残った状況を再現し、再試行が 0755 へ回復することを確かめる。
+        // 0700 のまま残った既存ディレクトリは権限を変えず、構造化エラーで拒否する（GPU-1・GPU-2・SEC-1）。
         std::fs::set_permissions(d.join("sub"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
+        assert_eq!(e.code(), Code::FailedPrecondition);
+        assert_eq!(
+            std::fs::metadata(d.join("sub"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        // 呼び出し側が明示的に 0755 にした後なら成功する。
+        std::fs::set_permissions(d.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
         create_device_nodes(root.as_fd(), &resolved).unwrap();
         assert_eq!(
             std::fs::metadata(d.join("sub"))

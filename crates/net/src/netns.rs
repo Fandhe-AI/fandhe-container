@@ -314,21 +314,27 @@ pub fn mount_fstype_by_id(mountinfo: &[u8], mount_id: u64) -> Result<String, Mou
 ///
 /// 呼び出し側（`add_host_dns::hosts_file` は理由ごとの message に写す）が理由を型で区別できるように
 /// する。io::Error の文字列から理由を読み戻さない（REPAIR-1）。
+/// `Missing`・`Duplicate`・`Invalid` の判定は core の `mountinfo_identity` の同名の型と揃える
+/// （#2974・SEC-1・NET-1・REPAIR-2。実装は共有しない）。
 #[derive(Debug)]
 pub(crate) enum FdinfoMountIdError {
     /// `/proc/self/fdinfo/<fd>` を開けない・読めない（元の io::Error を保つ）。
     Read(io::Error),
     /// 読み込み上限（`MAX_FDINFO_READ`）を超えた。
     TooLarge,
-    /// `mnt_id:` 行が無い、または数値でない。
-    MissingMountId,
+    /// 行頭が `mnt_id:` の行が無い。
+    Missing,
+    /// 行頭が `mnt_id:` の行が 2 つ以上ある（値が同じでも拒否する。fail-closed）。
+    Duplicate,
+    /// `mnt_id:` の値が `u64` として解釈できない（空・非数値・負数・桁あふれ・UTF-8 でない）。
+    Invalid,
 }
 
 /// fdinfo の `mnt_id:` 行を読む crate 内で唯一の実装（REPAIR-1）。
 ///
 /// 呼び出し元は [`file_mount_id`]（cli の `doctor`・SUP-14）と
 /// `add_host_dns::hosts_file::verify_same_mount`（NET-12・P0）。読めない・上限超過・行が無い・
-/// 数値でない場合はすべてエラーで、呼び出し側は fail-closed で扱う。読み込みは上限つき。
+/// 重複する・値が不正な場合はすべてエラーで、呼び出し側は fail-closed で扱う。読み込みは上限つき。
 pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdError> {
     use std::io::Read as _;
     let mut buf = Vec::new();
@@ -338,11 +344,11 @@ pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdErro
     if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
         return Err(FdinfoMountIdError::TooLarge);
     }
-    parse_fdinfo_mnt_id(&buf).ok_or(FdinfoMountIdError::MissingMountId)
+    parse_fdinfo_mnt_id(&buf)
 }
 
 /// 開いたファイルが属するマウントの ID（mountinfo の 1 番目の欄と同じ値）を `/proc/self/fdinfo/<fd>` の
-/// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・数値でない場合はエラー。
+/// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・重複する・値が不正な場合はエラー。
 ///
 /// cli の `doctor` が [`mount_option_by_id`] に渡す ID を得るために呼ぶ（SUP-14・#2661）。
 /// 実体は `read_fdinfo_mount_id` で、ここは `io::Error` に写す薄い包み。
@@ -352,19 +358,41 @@ pub fn file_mount_id(file: &File) -> io::Result<u64> {
         FdinfoMountIdError::TooLarge => {
             io::Error::new(io::ErrorKind::InvalidData, "fdinfo is too large")
         }
-        FdinfoMountIdError::MissingMountId => {
+        FdinfoMountIdError::Missing => {
             io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo")
         }
+        FdinfoMountIdError::Duplicate => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mount id appears more than once in fdinfo",
+        ),
+        FdinfoMountIdError::Invalid => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mount id in fdinfo is not a valid number",
+        ),
     })
 }
 
 /// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
-/// 行が無い・数値でない場合は `None`。`pos:`・`flags:` 等の他の行は無視する。
-fn parse_fdinfo_mnt_id(text: &[u8]) -> Option<u64> {
-    text.split(|b| *b == b'\n')
-        .find_map(|l| l.strip_prefix(b"mnt_id:"))
-        .and_then(|v| std::str::from_utf8(v).ok())
+///
+/// 行頭が `mnt_id:` の行だけを対象にし、無ければ `Missing`、2 つ以上あれば値の正否や同値かに関わらず
+/// `Duplicate`、値が `u64` でなければ `Invalid`（core の判定と同じ。#2974・SEC-1・NET-1・REPAIR-2）。
+/// `pos:`・`flags:` 等の他の行は無視する。
+fn parse_fdinfo_mnt_id(text: &[u8]) -> Result<u64, FdinfoMountIdError> {
+    let mut found: Option<&[u8]> = None;
+    for value in text
+        .split(|b| *b == b'\n')
+        .filter_map(|l| l.strip_prefix(b"mnt_id:"))
+    {
+        if found.is_some() {
+            return Err(FdinfoMountIdError::Duplicate);
+        }
+        found = Some(value);
+    }
+    let value = found.ok_or(FdinfoMountIdError::Missing)?;
+    std::str::from_utf8(value)
+        .ok()
         .and_then(|v| v.trim().parse().ok())
+        .ok_or(FdinfoMountIdError::Invalid)
 }
 
 /// `mountinfo`（生バイト列）上で mount ID が `mount_id` のマウントの伝播が `shared` なら拒否する
@@ -1871,28 +1899,91 @@ mod tests {
         );
     }
 
-    /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は `None`。
+    /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は拒否する。
     #[test]
     fn net12_parse_fdinfo_mnt_id_ignores_other_lines_and_rejects_invalid() {
         let text = b"pos:\t0\nflags:\t02102002\nmnt_id:\t39\nino:\t5\n\
                     lock:\t1: FLOCK  ADVISORY  WRITE 1234 00:2a:5 0 EOF\n";
-        assert_eq!(parse_fdinfo_mnt_id(text), Some(39));
-        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0100000\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\tabc\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t-1\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(b""), None);
+        assert_eq!(parse_fdinfo_mnt_id(text).ok(), Some(39));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0100000\n"),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b"mnt_id:\tabc\n"),
+            Err(FdinfoMountIdError::Invalid)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b"mnt_id:\t-1\n"),
+            Err(FdinfoMountIdError::Invalid)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b""),
+            Err(FdinfoMountIdError::Missing)
+        ));
     }
 
     /// SUP-14・#2661: fdinfo の `mnt_id:` 行の取り出し。
     #[test]
     fn sup14_parse_fdinfo_mnt_id() {
         assert_eq!(
-            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t02100000\nmnt_id:\t27\nino:\t5\n"),
+            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t02100000\nmnt_id:\t27\nino:\t5\n").ok(),
             Some(27)
         );
-        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\tx\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id(b""), None);
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0\n"),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b"mnt_id:\tx\n"),
+            Err(FdinfoMountIdError::Invalid)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(b""),
+            Err(FdinfoMountIdError::Missing)
+        ));
+    }
+
+    /// SEC-1・NET-1・REPAIR-2・#2974: core の `repair1_parse_fdinfo_mnt_id_cases` と同じ表で、
+    /// 重複・欠落・不正値の拒否と正常値を具体値で照合する。
+    #[test]
+    fn sec1_net1_parse_fdinfo_mnt_id_rejects_duplicate_missing_invalid() {
+        #[derive(Clone, Copy, Debug)]
+        enum Want {
+            Ok(u64),
+            Missing,
+            Duplicate,
+            Invalid,
+        }
+        let cases: [(&[u8], Want); 13] = [
+            (
+                b"pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n",
+                Want::Ok(52),
+            ),
+            (b"fanotify mnt_id:\t9\nmnt_id:\t7\n", Want::Ok(7)),
+            (b"mnt_id:\t18446744073709551615\n", Want::Ok(u64::MAX)),
+            (b"pos:\t0\nflags:\t0\n", Want::Missing),
+            (b"", Want::Missing),
+            (b"mnt_id:\t52\nmnt_id:\t53\n", Want::Duplicate),
+            (b"mnt_id:\t52\nmnt_id:\t52\n", Want::Duplicate),
+            (b"mnt_id:\tx\nmnt_id:\t7\n", Want::Duplicate),
+            (b"mnt_id:\tx\n", Want::Invalid),
+            (b"mnt_id:\t-1\n", Want::Invalid),
+            (b"mnt_id:\t\n", Want::Invalid),
+            (b"mnt_id:\t18446744073709551616\n", Want::Invalid),
+            (b"mnt_id:\t\xff\n", Want::Invalid),
+        ];
+        for (text, want) in cases {
+            let got = parse_fdinfo_mnt_id(text);
+            let ok = match (&got, want) {
+                (Ok(n), Want::Ok(w)) => *n == w,
+                (Err(FdinfoMountIdError::Missing), Want::Missing)
+                | (Err(FdinfoMountIdError::Duplicate), Want::Duplicate)
+                | (Err(FdinfoMountIdError::Invalid), Want::Invalid) => true,
+                _ => false,
+            };
+            assert!(ok, "input {text:?}: got {got:?}, want {want:?}");
+        }
     }
 
     /// SUP-14・#2661: 実ファイルの fd から得た mount ID が、`/proc/self/mountinfo` に 1 行だけある。

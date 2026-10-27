@@ -253,7 +253,9 @@ fn fdinfo_error(e: crate::netns::FdinfoMountIdError) -> NetError {
     match e {
         E::Read(_) => io_err("failed to read fdinfo"),
         E::TooLarge => io_err("fdinfo is too large"),
-        E::MissingMountId => io_err("mount id is missing in fdinfo"),
+        E::Missing => io_err("mount id is missing in fdinfo"),
+        E::Duplicate => io_err("mount id appears more than once in fdinfo"),
+        E::Invalid => io_err("mount id in fdinfo is not a valid number"),
     }
 }
 
@@ -621,7 +623,9 @@ mod tests {
                 "failed to read fdinfo",
             ),
             (E::TooLarge, "fdinfo is too large"),
-            (E::MissingMountId, "mount id is missing in fdinfo"),
+            (E::Missing, "mount id is missing in fdinfo"),
+            (E::Duplicate, "mount id appears more than once in fdinfo"),
+            (E::Invalid, "mount id in fdinfo is not a valid number"),
         ];
         for (reason, message) in cases {
             let e = fdinfo_error(reason);

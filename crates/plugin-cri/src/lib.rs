@@ -13,9 +13,11 @@
 //! `docs/verification/crictl-smoke.md`）。
 //! Container 系 4 RPC の UDS＋gRPC 境界越しの到達と、注入したフェイクでの一連の成功は `tests/container_grpc.rs` で照合済み（#850）。
 //! PLUG-12 の別 UID 拒否（実機前提）と正規クライアントの一連は `tests/integration.rs` で照合する（#461）。
+//! 状態ルートのインスタンス排他は [`instance_lock`]（`<状態ルート>/.cri/@instance.lock`。起動時に取りプロセスの間持つ。#2931・CRI-2・CORE-1）。
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
+pub mod instance_lock;
 pub mod netsetup;
 pub mod pod_network;
 #[cfg(unix)]

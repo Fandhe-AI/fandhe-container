@@ -12,13 +12,22 @@
 # `--mode docker` / `--mode report` として追加した（下記「モード」）。
 #
 # 現状の制約（REPAIR-3: 実装済みを装わない）:
-#   - CLI の fandhe-container は提供済みで create / start / stop / delete / list / logs を持つ。
-#     start は supervisor を user scope で起動し `FCSUP1 OK` を受けて復帰する（#1718・#2122）。
-#     本番 ProcessLauncher（#1715）とファイルベース StateStore（TASK-31）も提供済み。
-#   - 本スクリプトの契約が使う `state`・`kill` は CLI にまだ無く（#1903・#1902）、stop も未結線
-#     （#2059）。このため `--runtime <fandhe-container>` での own の実測は、ランタイム呼び出し部
-#     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）を
-#     差し替える #1890 の後になる。
+#   - CLI の fandhe-container は create / start / stop / kill / delete / list / logs / inspect / state を
+#     持つ（#1903・#1902・#2059 は提供済み）。start は supervisor を user scope で起動し
+#     `FCSUP1 OK` を受けて復帰する（#1718・#2122）。本番 ProcessLauncher（#1715）とファイルベース
+#     StateStore（TASK-31）も提供済み。ランタイム呼び出し部（rt_create / rt_start / rt_delete /
+#     rt_kill / rt_state / rt_is_not_found の 6 関数）は CLI の契約（`state` の 1 行 JSON・不存在は
+#     stderr の `NOT_FOUND` で終了コード 3・実行中でない kill は `FAILED_PRECONDITION` で 5）に
+#     照合済み（#3123・CLI-1）。
+#   - 状態ルートは毎回作る専用ディレクトリ（/tmp/fcsl.*・0700）を全呼び出しの `--root` に渡し、
+#     利用者の既定の状態ルートに計測のコンテナを残さない。/tmp に固定するのは制御ソケット
+#     （<root>/<id>/supervisor.sock.tmp-<pid>）を sun_path の 108 バイトに収めるため。後始末で
+#     残存があれば消さずに残し、パスを stderr に出す。
+#   - start は rootless のみ（rootful は UNIMPLEMENTED）。delete は委譲スコープの外から実行すると
+#     cgroup を消せず exit 4 になるため、`systemd-run --user --scope -p Delegate=yes` の中で
+#     本スクリプトを実行する（手順は #3125）。delete は状態を消した後にログのロックを最大でおよそ
+#     20 秒待つため、--timeout で打ち切られても NOT_FOUND と state で削除済みと確定する。
+#   - CLI を経由する誤差の見積もりと method の記述は #3124 で扱う。
 #   - create から `FCSUP1 OK` までの p95 回帰ベンチは別に benches/benches/startup_latency.rs
 #     （TASK-190・docs/design/startup-latency-bench.md）がある。区間は CORE-10 の中央値
 #     （create からプロセス実行開始まで）と異なる。
@@ -34,6 +43,7 @@
 # 実機前提のため `make ci` には含めない（.claude/rules/ci.md「実機前提テスト」）。
 #
 # 計測対象の起動契約（opencontainers/runtime-tools の command-line-interface・runc 互換）:
+#   （oci モードは全呼び出しの先頭に専用の状態ルートの `--root <state_root>` を付ける）
 #   <runtime> state <id>                       # create 前の ID 未使用確認（計測対象外）と実行開始の観測
 #   <runtime> create --bundle <bundle> <id>    # 計測対象
 #   <runtime> start <id>                       # 計測対象
@@ -76,7 +86,7 @@
 #   1: ランタイムの create / start / state（docker モードは image inspect / run）の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中、計測中の時計の変更を検出した
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
+#   3: 前提ツール欠如（状態ルートのパスが制御ソケットの長さの上限を超える場合を含む。Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない〔docker モードは cidfile の ID で rm -f できない、
 #      ラベル一覧を取得できない・所有を証明できないコンテナが残っている〕、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
@@ -428,6 +438,26 @@ if [ -z "$run_tag" ]; then
   err "missing-prerequisite" "could not derive a unique run id from mktemp"
   exit "$EXIT_PREREQ"
 fi
+# oci モードの専用の状態ルート（CLI の --root。mktemp -d で排他作成・0700・所有者は自分）。
+# TMPDIR を使わず /tmp に固定するのは、制御ソケットのパス
+# <root>/<id>/supervisor.sock.tmp-<pid> を sun_path（108 バイト、NUL 込みで 107）に確実に収めるため。
+# tmpdir とは別にするのは、残存時に手動確認できるよう状態ルートだけを残せるようにするため。
+state_root=""
+if [ "$mode" = "oci" ]; then
+  if ! state_root="$(mktemp -d -p /tmp fcsl.XXXXXXXXXX)"; then
+    rm -rf -- "$tmpdir"
+    err "missing-prerequisite" "could not create the state root under /tmp"
+    exit "$EXIT_PREREQ"
+  fi
+  id_prefix="fandhe-startup-$run_tag-$$-"
+  # root + '/' + id + '/' + "supervisor.sock.tmp-" + pid の最大 7 桁
+  sock_len=$((${#state_root} + 1 + ${#id_prefix} + ${#warmup} + ${#iterations} + 1 + 20 + 7))
+  if [ "$sock_len" -gt 107 ]; then
+    rm -rf -- "$tmpdir" "$state_root"
+    err "missing-prerequisite" "the control socket path under the state root could be $sock_len bytes, over the 107-byte sun_path limit"
+    exit "$EXIT_PREREQ"
+  fi
+fi
 seq_no=0
 # 現在の試行で後始末対象のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
 live_id=""
@@ -622,21 +652,25 @@ us_to_secs() {
   printf '%d.%06d' $(($1 / 1000000)) $(($1 % 1000000))
 }
 
-# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える。差し替えは #1890） ---
-rt_create() { run_rt "$1" "$1" create --bundle "$bundle" "$2"; }
-rt_start() { run_rt "$1" "$1" start "$2"; }
-rt_delete() { run_rt "$1" "$1" delete "$2"; }
-rt_kill() { run_rt "$1" "$1" kill "$2" KILL; }
+# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える。CLI の契約〔#1903・#1902〕に照合済み。#3123） ---
+# グローバル --root（専用の状態ルート）はサブコマンドの前に置く（runc / crun と同じ位置）。
+rt_create() { run_rt "$1" "$1" --root "$state_root" create --bundle "$bundle" "$2"; }
+rt_start() { run_rt "$1" "$1" --root "$state_root" start "$2"; }
+rt_delete() { run_rt "$1" "$1" --root "$state_root" delete "$2"; }
+rt_kill() { run_rt "$1" "$1" --root "$state_root" kill "$2" KILL; }
 # state は stdout（OCI state JSON）と stderr を分けて受け取る。引数: <stdout> <stderr> <id>
-rt_state() { run_rt "$1" "$2" state "$3"; }
+rt_state() { run_rt "$1" "$2" --root "$state_root" state "$3"; }
 # state の stderr（引数のファイル）が「コンテナが存在しない」ことを明確に示すか。OCI の CLI
 # 契約には不存在専用の応答がないため、fandhe-container の CLI のエラー形式（ERR-1: stderr へ
 # 機械可読な code / message の構造化エラー。不存在は ERR-3 / ERR-5 と同じ NOT_FOUND）に
 # 合わせる。空行を除く全行が「code・message が文字列の JSON オブジェクト」で、code がすべて
 # NOT_FOUND（1 行以上）の場合だけ真にする。自由文・不正な JSON・code が文字列でない行・
 # 別の code が 1 行でも混ざれば判定不能として偽にする（runc 等の構造化エラーを持たない
-# ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。CLI の state の
-# 不存在応答（#1903）への照合は #1890 で行う。
+# ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。
+# CLI の state の不存在応答は `{"code":"NOT_FOUND","message":"container not found"}`・終了コード 3
+# （#1903・#3123 で照合）。ただし状態ルートの親が無いときも同じ NOT_FOUND（message が
+# "parent of the state root not found"）で終了コード 3 になり、これはコンテナの不存在を示さない
+# ため、その行が 1 行でもあれば偽にする（fail-closed）。
 rt_is_not_found() {
   jq -Rse '
     [split("\n")[] | select(length > 0)] as $lines
@@ -645,7 +679,8 @@ rt_is_not_found() {
         (try fromjson catch null) as $o
         | ($o | type) == "object"
           and ($o.code | type) == "string" and ($o.message | type) == "string"
-          and $o.code == "NOT_FOUND")' <"$1" >/dev/null 2>&1
+          and $o.code == "NOT_FOUND"
+          and $o.message != "parent of the state root not found")' <"$1" >/dev/null 2>&1
 }
 # ---------------------------------------------------------------------------
 
@@ -749,6 +784,8 @@ create_not_made() {
 #              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
+# 例外: created=1 の delete が NOT_FOUND のときの削除済み確認（delete_reported_not_found）も
+# 収集待ち（≦ --timeout）と state（収集待ち込みで ≦ 2 × --timeout）を 1 回だけ足す。
 # 例外: created=0 の照会（query_state）の収集待ちは期限で切り詰めないため、その経路の最悪時間は
 # state 呼び出し（≦ --timeout）＋収集待ち（≦ --timeout）の 2 × --timeout になる（有界。#2548・REPAIR-5）。
 finish_container() {
@@ -759,10 +796,29 @@ finish_container() {
   return "$status"
 }
 
+# created=1 の delete が NOT_FOUND を返した場合に、削除済みと確定できるか。CLI の delete は
+# 状態を消した後にログのロック解放を待つため（最大でおよそ 20 秒）、その間に期限で打ち切ると
+# 以後の delete はすべて NOT_FOUND になる。created=1 の ID は今回の create が作ったものなので、
+# delete の NOT_FOUND と state の不存在応答がそろえば削除済みとみなす。確認は 1 試行 1 回まで
+# （delete_gone_checked）で、最悪時間を有界に保つ（REPAIR-5）。引数: <delete のログ> <id> <delete の終了コード>
+delete_gone_checked=0
+delete_reported_not_found() {
+  [ "$delete_gone_checked" = "0" ] || return 1
+  is_runtime_error "$3" || return 1
+  flush_last_call $((timeout_secs * 1000000)) || return 1
+  ! log_truncated "$1" || return 1
+  ! log_incomplete "$1" || return 1
+  rt_is_not_found "$1" || return 1
+  delete_gone_checked=1
+  query_state "$2"
+  state_not_found
+}
+
 # finish_container の本体（rt_deadline_us が設定された状態で呼ばれる）。
 finish_container_within_deadline() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
+  delete_gone_checked=0
   if [ "$created" = "0" ]; then
     # 収集待ちは後始末の期限で切り詰めない（上限は --timeout 秒のまま。#2548・REPAIR-12）。
     # state が期限の大半を使っても、収集が上限内に終わるなら collector-timeout にしない。
@@ -774,14 +830,26 @@ finish_container_within_deadline() {
     leftover_ids+=("$id")
     return 1
   fi
-  if rt_delete "$log" "$id"; then
+  local del_rc=0
+  rt_delete "$log" "$id" || del_rc=$?
+  if [ "$del_rc" -eq 0 ]; then
+    return 0
+  fi
+  # 初回の delete が NOT_FOUND なら（直前の delete が状態を消した後に打ち切られた場合は起きない
+  # ため）削除済みの確認を 1 回だけ行う。確定できなければ従来どおり kill と再試行へ進む。
+  if delete_reported_not_found "$log" "$id" "$del_rc"; then
     return 0
   fi
   rt_kill "$log" "$id" || true
   local tries=0
   while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ $((rt_deadline_us - $(mono_us))) -ge "$MIN_CALL_BUDGET_US" ]; do
     tries=$((tries + 1))
-    if rt_delete "$log" "$id"; then
+    del_rc=0
+    rt_delete "$log" "$id" || del_rc=$?
+    if [ "$del_rc" -eq 0 ]; then
+      return 0
+    fi
+    if delete_reported_not_found "$log" "$id" "$del_rc"; then
       return 0
     fi
     # 待機後に呼び出せる残り時間がなければ期限を越えて待たずに打ち切る。
@@ -1022,6 +1090,15 @@ cleanup() {
   if ! rm -rf -- "$tmpdir"; then
     echo "error: cleanup-failed: could not remove temporary directory" >&2
     final="$EXIT_CLEANUP"
+  fi
+  if [ -n "$state_root" ]; then
+    if [ "${#leftover_ids[@]}" -gt 0 ]; then
+      # 残存の確認と手動回収に使えるよう状態ルートを消さずに残す。
+      echo "error: state root kept for manual inspection: $state_root (check with: <runtime> --root $state_root state <id>)" >&2
+    elif ! rm -rf -- "$state_root"; then
+      echo "error: cleanup-failed: could not remove the state root $state_root" >&2
+      final="$EXIT_CLEANUP"
+    fi
   fi
   if [ "${#leftover_ids[@]}" -gt 0 ]; then
     echo "error: cleanup-failed: containers left behind: ${leftover_ids[*]}" >&2

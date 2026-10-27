@@ -35,7 +35,7 @@
 //!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
-//!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
+//!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（共通ログ型 `LogLine` 経由で書く。#3115・ERR-4）。
 //!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
 //!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
 //!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、

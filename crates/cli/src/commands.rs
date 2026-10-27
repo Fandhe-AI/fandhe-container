@@ -58,6 +58,7 @@ mod create_start;
 mod image;
 mod image_refs;
 mod list_logs;
+mod oci_recorder;
 mod ref_reconcile;
 // Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。
 #[cfg(any(not(target_os = "linux"), test))]

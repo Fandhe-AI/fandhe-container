@@ -79,7 +79,7 @@
 //!   発見・登録・起動の本番配線は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
 //!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
-//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。非 Linux は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装
+//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。macOS は実装済み（拡張 ACL を含む。#1865）、Windows は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
@@ -87,7 +87,7 @@
 //!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。macOS には別ファイル `sys/macos.rs`
 //!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出〔`state_store` 用。#2247・OCI-5〕と、
 //!   plugin 検証向けの symlink 非追従の fd 相対 open・fd の実体パス取得・fd の拡張 ACL 検出〔`plugin_fs`。
-//!   呼び出し元は #1865 予定。#1864・PLUG-11〕のみ）を
+//!   呼び出し元は `plugin_trust`〔#1865〕。#1864・PLUG-11〕のみ）を
 //!   `#[cfg(target_os = "macos")]` で取り込み、Linux の宣言は macOS に漏らさない。`traits` は OS 非依存で 3 OS に公開される
 //! - `sys` の `extern "C"` 宣言と `unsafe` は glibc / musl の型幅・syscall 番号を前提とするため、
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）

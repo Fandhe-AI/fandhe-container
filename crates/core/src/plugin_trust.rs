@@ -9,7 +9,7 @@
 //! [`VerifiedPluginFile::verify_hash`]）・登録処理は **パスを開き直さずこの fd だけを使う** 契約とする（検証と使用の間の差し替え
 //! 〔TOCTOU〕を避ける）。
 //!
-//! # 検証方式
+//! # 検証方式（Linux）
 //!
 //! - ディレクトリは `/` から 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` の fd 相対 open で辿り、
 //!   ルート・全祖先・探索先のそれぞれを開いた fd への `fstat` で判定する（中間 symlink は拒否、
@@ -26,6 +26,32 @@
 //!   検証済みの祖先連鎖の下にあることの証明。パスから fd を開き直さない）
 //! - 判定基準はディレクトリ・ファイルとも同一で、所有者が root か実効 UID であり、かつ
 //!   `mode & 0o022 == 0`。sticky bit 付きでも例外にしない
+//!
+//! # 検証方式（macOS。#1865・MAC-1・#1539）
+//!
+//! 判定基準は Linux と同一（所有者・`mode & 0o022`・sticky も例外にしない・symlink は実体で判定・
+//! sha256 許可一覧）。実装は `plugin_trust/macos.rs` で、syscall は `sys::plugin_fs`（#1864）のラッパーのみ。
+//! コード署名の検証は使わない。Linux との差分は次のとおり。
+//!
+//! - `O_PATH` が無いため `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` で開く。読み取り権限の無い祖先は `Io` で拒否する
+//! - ファイルは `O_NONBLOCK|O_NOCTTY` で 1 回だけ開いた fd をそのまま保持 fd にする（開き直さない）。
+//!   種別の事前プローブが無いため、デバイスノードは拒否する前に開く（残余。置けるのは信頼できる所有者だけ）
+//! - symlink の実体パスは `F_GETPATH` で得て、実体の親を `/` から検証し dev/ino を照合する。ホップ上限は 32
+//! - 辿った全ディレクトリ（実体の祖先を含む）とファイルに **拡張 ACL** があれば、中身を解釈せず
+//!   [`PluginTrustErrorKind::ExtendedAcl`] で拒否する（拒否だけの ACE も拒否）。判定不能は `Io`
+//!
+//! ## macOS 固有の祖先の扱い（規則は緩めない）
+//!
+//! - `/tmp`・`/var`・`/etc` は `/private/...` への symlink のため、これらを経由する探索先は `NotDirectory` で拒否する。
+//!   `/private/tmp` は 1777 のため `GroupOrOtherWritable` で拒否する
+//! - `/usr/local` がグループ書き込み可（古い Homebrew 等）なら、その配下の探索先は `GroupOrOtherWritable` で拒否する
+//! - ホーム配下のフォルダ（`~/Library` 等）は既定で `group:everyone deny delete` の拡張 ACL を持つことがあり、
+//!   その場合は `ExtendedAcl` で拒否される（実機未確認。user 探索先の扱いは #1863・#1867 の判断事項）
+//!
+//! ## 署名後のハッシュ
+//!
+//! macOS の plugin は Virtualization.framework の entitlement のために署名が要り、署名でバイナリが変わる。
+//! 許可一覧に載せるのは **署名後** のバイナリの sha256 とする（手順書への記載は #1867）。
 //!
 //! # ハッシュ照合（TASK-122.3・PLUG-11）
 //!
@@ -78,8 +104,8 @@
 //! - チェーン中間ホップの symlink が置かれたディレクトリ自体は検証しない（検証するのは探索先
 //!   連鎖と、最終実体およびその祖先連鎖）。最終実体は信頼できる所有者・書き込み不可の祖先配下に
 //!   限られ、内容の同一性はハッシュ照合（TASK-122.3）で担保する前提
-//! - symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
-//!   拒否する（fail-closed）
+//! - Linux の symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
+//!   拒否する（fail-closed）。macOS は `F_GETPATH` を使い `/proc` を要さない
 //! - 署名の照合は未実装（切替点はあるが [`PluginVerificationMethod::Signature`] は常に拒否する）。ハッシュ照合は「計算時点」の内容を保証するもので、信頼された所有者
 //!   （root / 実効 UID）自身が計算後に内容を書き換える場合は防げない。照合済み fd から起動対象を作る変換
 //!   `HashVerifiedPluginFile::into_launch_target`（`plugin` feature 配下の `crate::plugin`・#1857）はあり、
@@ -90,14 +116,14 @@
 //!   `docs/design/plugin-hash-allowlist.md`（#1868。オーナー承認待ちで未確定）
 //! - 併用方式（ハッシュ AND 署名）は未実装（切替点は TASK-122.4 で実装済み）
 //! - レジストリへの配線は未実施で、本モジュール単体では未検証候補の登録を防がない
-//! - setuid / setgid ビット・ACL・拡張属性は判定対象外（PLUG-11 の記述範囲外）
-//! - 非 Linux は同等検証が未実装のため常に拒否する（fail-closed。macOS / Windows の「相当」
-//!   検証は spec で未確定）
+//! - setuid / setgid ビット・拡張属性は判定対象外（PLUG-11 の記述範囲外）。ACL は macOS のみ拡張 ACL を
+//!   拒否する（#1539）。Linux の POSIX ACL は判定対象外
+//! - macOS は実装済み（#1865）。Windows はホストでは検証せず常に拒否する（fail-closed。#1415・#1539）
 //! - error-format 準拠の構造化エラー（`code` / `reason` / `message` の 1 行 JSON）と監査レコード化
 //!   （`PluginTrust` レイヤー）、監査つき検証ラッパーは `report` に実装済み（TASK-122.5・#283）。
 //!   レジストリ・本番 `AuditSink`・CLI の終了コード処理への配線は未実装
 //!
-//! 本モジュールは `unsafe` を持たない（Linux では `sys` のラッパーと std のみを使う）。
+//! 本モジュールは `unsafe` を持たない（Linux・macOS では `sys` のラッパーと std のみを使う）。
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -132,6 +158,9 @@ pub enum PluginTrustErrorKind {
     UntrustedOwner,
     /// group または other に書き込みビットがある。
     GroupOrOtherWritable,
+    /// 拡張 ACL が付いている（macOS のみ。中身を解釈せず拒否する。PLUG-11・#1865・#1539）。
+    /// 判定できない場合は `Io`（fail-closed）。Linux はこの種別を返さない。
+    ExtendedAcl,
     /// 通常ファイルでない（symlink・FIFO・デバイス・ディレクトリ等）。
     NotRegularFile,
     /// 探索先がディレクトリでない、または symlink。
@@ -194,6 +223,7 @@ impl fmt::Display for PluginTrustError {
         let reason = match self.kind {
             PluginTrustErrorKind::UntrustedOwner => "owner is neither root nor the effective user",
             PluginTrustErrorKind::GroupOrOtherWritable => "writable by group or other",
+            PluginTrustErrorKind::ExtendedAcl => "has an extended ACL",
             PluginTrustErrorKind::NotRegularFile => "not a regular file",
             PluginTrustErrorKind::NotDirectory => "not a directory (or a symlink)",
             PluginTrustErrorKind::InvalidPath => "invalid path",
@@ -219,6 +249,7 @@ impl From<PluginTrustError> for TraitError {
         let code = match e.kind {
             PluginTrustErrorKind::UntrustedOwner
             | PluginTrustErrorKind::GroupOrOtherWritable
+            | PluginTrustErrorKind::ExtendedAcl
             | PluginTrustErrorKind::HashMismatch => ErrorCode::PermissionDenied,
             PluginTrustErrorKind::NotRegularFile
             | PluginTrustErrorKind::NotDirectory
@@ -253,7 +284,7 @@ pub fn check_owner_and_mode(
 
 /// ファイル名が 1 要素（`/`・`.`・`..`・空・NUL を含まない）であることを確認する。
 /// バイト列で判定し OS 非依存にする（非 UTF-8 も扱う）。
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn is_single_component(name: &OsStr) -> bool {
     let s = name.to_string_lossy();
     !(s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\0'))
@@ -947,17 +978,23 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS の実装（#1865・PLUG-11・MAC-1）。`#[path]` は本ファイル基準（`src/`）で解決される。
+#[cfg(target_os = "macos")]
+#[path = "plugin_trust/macos.rs"]
+mod imp;
+
+/// Windows 等の実装。ホストでは検証せず常に拒否する（fail-closed。#1415・#1539 の決定）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::*;
 
-    /// 検証済みの探索先ディレクトリ（非 Linux では生成されない）。
+    /// 検証済みの探索先ディレクトリ（Linux・macOS 以外では生成されない）。
     #[derive(Debug)]
     pub struct VerifiedPluginDir {
         _private: (),
     }
 
-    /// 非 Linux は同等検証が未実装のため常に拒否する（fail-closed。PLUG-11・REPAIR-3）。
+    /// Windows はホストでは検証しないため常に拒否する（fail-closed。PLUG-11・#1415・#1539）。
     pub fn verify_plugin_dir(dir: &Path) -> Result<VerifiedPluginDir, PluginTrustError> {
         Err(PluginTrustError::new(
             PluginTrustErrorKind::Unsupported,
@@ -967,7 +1004,7 @@ mod imp {
     }
 
     impl VerifiedPluginDir {
-        /// 非 Linux では到達しない（`verify_plugin_dir` が常に拒否する）。
+        /// Linux・macOS 以外では到達しない（`verify_plugin_dir` が常に拒否する）。
         pub fn verify_file(
             &self,
             _file_name: &OsStr,
@@ -1000,8 +1037,11 @@ pub fn verify_candidate(
     verify_plugin_dir(parent)?.verify_file(name)
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod linux_tests;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod unix_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1061,6 +1101,10 @@ mod tests {
             ),
             (
                 PluginTrustErrorKind::GroupOrOtherWritable,
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                PluginTrustErrorKind::ExtendedAcl,
                 ErrorCode::PermissionDenied,
             ),
             (

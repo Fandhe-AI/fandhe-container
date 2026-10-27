@@ -9,6 +9,9 @@
 //! 常駐 plugin の起動・接続・子プロセス回収は計測区間の外に置く。
 //! 参照値は PoC-13（長さ接頭辞フレーム: 都度 2.043 ms／常駐 4.500 ms、gRPC: 2.537 ms／5.032 ms）。
 //!
+//! 実 VM の cold start（`Vm::launch` から ready マーカー観測まで）の実機計測は別物で、
+//! `crates/platform-macos/tests/vm_cold_start.rs` と `docs/design/macos-vm-cold-start-bench.md`（#1879）にある。
+//!
 //! 呼び出し元: `benches/plugin_boundary_macos_cold_start.rs`（薄い `main`）と
 //! `tests/macos_cold_start.rs`（macOS 結合試験）、子プロセス側 `bin/plugin_boundary_stub.rs`（plugin 役のみ）。
 //! 純粋ロジック（定数・比率・判定・ログ整形）は全 OS で単体テストし、計測部（`cfg(unix)`）の

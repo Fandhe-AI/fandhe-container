@@ -67,7 +67,7 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin（#1843）・crates/supervisor（#1840）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin（#1843）・crates/supervisor（#1840）・crates/core の syscall 番号（#1847。番号以外の定数〔#1848〕・構造体と関数の型〔#1849〕は残る）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。残りの crate は #1840〜#1849（core の #1849 では、#2628 で足した `sendfile` の型〔`off_t *`・`size_t`・`ssize_t`〕の照合も含める。#2759）。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 
@@ -87,6 +87,8 @@ crates/plugin（#1843）は `sys.rs` の末尾の `libc_abi`（cfg ごとの子�
 - Linux の `siginfo_t` の `si_pid` は `libc` がアクセサの裏に隠し `offset_of!` で取れない。本体の assert が担う
 - macOS の `link_name`（`$INODE64`）は型の照合で検査できない
 - FFI でない値（`PROBE_EINTR_RETRIES`・`CREATED_LOCK_WAIT_*`・`UCRED_SIZE`・`MTIME_INDEX` など）は対象外
+
+crates/core の syscall 番号（#1847）の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts` と `seccomp_notify` の対応外側（`ArchSysNo::UNSUPPORTED` で番号を持たない）、x32・ILP32（`target_pointer_width = "64"` の cfg で対応外）。照合は x86_64 と aarch64 の `consts` の 27 件ずつと `SYS_SECCOMP`（`sys/seccomp_notify.rs`）の各 1 件で、値は既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` を通す `const fn` で読み、`sysno` の型の保証は変えない。
 
 crates/platform-macos の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`MFSTYPENAMELEN`（`libc` に無い。`libc::statfs` の `f_fstypename` と `f_mntonname` のオフセット差で間接照合）、`statfs` の `link_name`（自前は `x86_64`、`libc` は `not(aarch64)` と書き方が違うが、親の `compile_error!` で 2 アーキに限るため同じシンボルになる）。`geteuid` は macOS と Linux の両方でコンパイルされるため、PR の ubuntu CI でもネイティブに評価される。
 

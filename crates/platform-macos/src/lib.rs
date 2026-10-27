@@ -7,7 +7,7 @@
 //! クライアント（`virtiofs::VirtiofsIoClient`。TASK-65.2）も実装済み。クライアント側の UDS `connect`・
 //! macOS ホスト側の VZ vsock は未実装（REPAIR-3）。ゲスト内 mount（`guest_mount`。TASK-65.3）は
 //! ホスト側（指示の生成・報告の検証・`Vm::launch` での待機）まで実装済みで、指示を実行して報告する
-//! ゲスト init は `crates/guest-init`（#1875）で実装済みで、`virtiofs_io` 用の試験プローブ（#1876）の行の契約と復号は `guest_probe`。実機での起動確認は #1628（人間担当）。
+//! ゲスト init は `crates/guest-init`（#1875）で実装済みで、`virtiofs_io` 用の試験プローブ（#1876）の行の契約と復号は `guest_probe`、symlink・ハードリンクの観測モード（#1877）は `guest_link_probe`。実機での起動確認は #1628（人間担当）。
 //! 協調停止・pause / resume / save / restore と plugin 境界のエラー写像（TASK-115）は未実装（REPAIR-3）。
 //!
 //! - プラットフォーム対応: OS 非依存の検証ロジックは全 OS でビルドし 3 OS CI でテストする。
@@ -21,6 +21,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod console_log;
 pub mod error;
+pub mod guest_link_probe;
 pub mod guest_mount;
 pub mod guest_probe;
 pub mod virtiofs;

@@ -101,7 +101,7 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 - まだ確かめていない点（#341）: 制限 `1` のまま既存の namespace へ後から付ける形、IPv6、`--netns <パス>` の指定、`-T none -U none` を付けたときの名前解決、常駐時の PSS、rootful 比のスループット劣化
 - AppArmor の補足: Ubuntu 26.04 では `sleep` の実体が pasta の AppArmor プロファイルの exec 規則の外にあり、pasta から直接は起動できなかった。`sh -c` を挟めば動いた（実機確認 2026-10-12）
 - #341 の実証範囲: rootless の経路で host / none 以外のネットワーク構成（ポート公開を含む）が実機で成り立つこと（NET-9）。実装の issue は #1935（設計の確定）・#1936〜#1941（実装と試験）
-- 配置（決定）: `crates/net`（core 側のライブラリ）に pasta の起動・待機・回収の関数を置き、supervisor から呼ぶ（NET-9・CORE-1。pasta の起動関数は未実装で、実装は #1936〜#1941。supervisor → `net` の依存の向き・feature の切り方は #1870 の設計で決める〔#1940〕）。`NetworkPlugin` は plugin 側のまま。ヘルパーの寿命は supervisor のコンテナ寿命に連動させ、コンテナ終了時に確実に回収する
+- 配置（決定）: `crates/net`（core 側のライブラリ）に pasta の起動・待機・回収の関数を置き、supervisor から呼ぶ（NET-9・CORE-1。pasta の起動関数は未実装で、実装は #1936〜#1941。supervisor → `net` の依存は feature を切らない通常の依存に決まった〔[network-wiring.md](network-wiring.md) D5・#1870〕）。`NetworkPlugin` は plugin 側のまま。ヘルパーの寿命は supervisor のコンテナ寿命に連動させ、コンテナ終了時に確実に回収する
 - ヘルパー探索: 絶対パス指定または opt-in の探索のみとし、所有者・権限・版数を検証する（9 章）
 - ポート公開指定の変換: 利用者入力を検証してから `-t` / `-u` 相当の引数配列へ変換する。シェルを介さない
 - 失敗時の挙動: ヘルパー不在・版不一致・起動失敗は fail-closed とし、作成前に ERR-1 形式で拒否する。起動・readiness 待ちにタイムアウトを設ける（REPAIR-5）

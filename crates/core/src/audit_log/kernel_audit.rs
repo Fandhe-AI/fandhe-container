@@ -320,6 +320,11 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         }
         None => tail.push_str(" container_id=?"),
     }
+    // 拒否した段（静的語彙 `[a-z_]` のみ。段を持つ記録だけ。#3121）。
+    if let Some(stage) = record.stage() {
+        tail.push_str(" stage=");
+        tail.push_str(stage.as_str());
+    }
     // パス欄の予算 = 上限 - (ここまで + パス以外の固定部 + 末尾)。hex は 1 バイトにつき 2 文字。
     let mut no_hex = String::new();
     push_path_fields(
@@ -876,6 +881,47 @@ mod tests {
             t.ends_with(&format!(
                 " reason=rootfs_symlink_or_not_directory container_id={id}"
             )),
+            "{t}"
+        );
+    }
+
+    /// SEC-4・ERR-4・#3121: 段つきの本文は ` stage=<トークン>` を container_id の後ろに付け、段なしの本文は不変。
+    #[test]
+    fn sec4_3121_payload_stage_is_exact_and_optional() {
+        let ev = || AuditEvent::Mount {
+            path: None,
+            reason: Some(crate::audit_log::AuditReason::new(
+                "masked_path_apply_failed",
+            )),
+        };
+        let plain = encode_payload(&rec(ev()).with_container_id(cid("c1"))).unwrap();
+        assert!(plain.ends_with(" reason=masked_path_apply_failed container_id=c1"));
+        assert!(!plain.contains("stage="), "{plain}");
+        let staged = encode_payload(
+            &rec(ev())
+                .with_container_id(cid("c1"))
+                .with_stage(crate::audit_log::AuditStage::new("mount_masked_paths")),
+        )
+        .unwrap();
+        assert_eq!(staged, format!("{plain} stage=mount_masked_paths"));
+    }
+
+    /// SEC-4・ERR-4・#3121: 最悪ケースでも上限に収まり、末尾の `stage=` は残る（切られるのはパスの hex 側）。
+    #[test]
+    fn sec4_3121_payload_stage_worst_case_fits() {
+        let id = "a".repeat(255);
+        let r = rec(AuditEvent::Mount {
+            path: Some(AuditPath::new(&"a".repeat(4096))),
+            reason: Some(crate::audit_log::AuditReason::new(
+                "rootfs_symlink_or_not_directory",
+            )),
+        })
+        .with_container_id(cid(&id))
+        .with_stage(crate::audit_log::AuditStage::new("mount_readonly_paths"));
+        let t = encode_payload(&r).unwrap();
+        assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX, "{}", t.len());
+        assert!(
+            t.ends_with(&format!(" container_id={id} stage=mount_readonly_paths")),
             "{t}"
         );
     }

@@ -457,6 +457,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-platform-windows",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]

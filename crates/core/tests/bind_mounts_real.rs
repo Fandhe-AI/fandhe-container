@@ -314,6 +314,22 @@ mod linux {
         }
     }
 
+    /// 子の終了を期限つきで待つ。期限を超えたら kill して回収する（REPAIR-5）。
+    /// `Drop` 中でも使うため panic しない。
+    fn wait_or_reap(child: &mut Child) {
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_and_reap(child);
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     /// `pid` の子の PID 一覧（`/proc/<pid>/task/<pid>/children`）。読めなければ空。
     fn children_of(pid: u32) -> Vec<u32> {
         std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
@@ -338,11 +354,16 @@ mod linux {
             kill_and_reap(&mut self.0);
             for pid in kids {
                 // 同じ UID の祖先 namespace からの SIGKILL は PID 1 にも届く。
-                let _ = Command::new("kill")
+                // kill コマンドの待機にも期限を設ける（REPAIR-5）。Drop 中は panic しない。
+                match Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .spawn()
+                {
+                    Ok(mut killer) => wait_or_reap(&mut killer),
+                    Err(e) => eprintln!("bind_mounts_real: warning: spawn kill failed: {e}"),
+                }
                 let gone = Instant::now() + timeout();
                 while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
                     std::thread::sleep(Duration::from_millis(20));

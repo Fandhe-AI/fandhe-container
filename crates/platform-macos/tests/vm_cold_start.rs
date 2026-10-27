@@ -223,10 +223,12 @@ fn spawn_watcher(
 ) -> (JoinHandle<()>, Receiver<WatchMsg>) {
     let (tx, rx) = mpsc::channel();
     let mut scanner = MarkerScanner::new(boot, ready);
+    // 初回の窓の起点は spawn 前に取る。スレッドの実行開始が遅れても end_window が観測遅延を包含する（REPAIR-4）。
+    let first_poll = Instant::now();
     let handle = std::thread::spawn(move || {
         let mut file: Option<std::fs::File> = None;
         let mut total = 0usize;
-        let mut last_poll = Instant::now();
+        let mut last_poll = first_poll;
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -466,7 +468,13 @@ mod real_vm {
     }
 
     /// 試行 1 回。VM を得た経路では必ず stop → `Stopped` の確認まで行う。戻り値の bool は「以降の試行を止める」。
-    fn run_trial(n: u32, g: &Guest, root: &Path, budget: Duration) -> (TrialResult, bool) {
+    fn run_trial(
+        n: u32,
+        g: &Guest,
+        root: &Path,
+        trial_timeout: Duration,
+        total_end: Instant,
+    ) -> (TrialResult, bool) {
         let dir = root.join(format!("trial-{n}"));
         std::fs::create_dir(&dir).expect("create trial dir");
         {
@@ -493,6 +501,18 @@ mod real_vm {
             .expect("spec")
             .with_devices(devices)
             .expect("with_devices");
+        // 準備（ディレクトリ作成・検証・spec 構築）で使った時間を差し引き、起動直前に残予算を再計算する。
+        // 100 ms 未満なら VM を起動しない（REPAIR-5）。
+        let remaining = total_end.saturating_duration_since(Instant::now());
+        let Some(budget) = trial_budget(trial_timeout, remaining) else {
+            return (
+                TrialResult::Err {
+                    code: "not_run",
+                    detail: None,
+                },
+                false,
+            );
+        };
         let timeouts = OpTimeouts::try_new(
             start_timeout_for(budget),
             DEFAULT_STOP_TIMEOUT,
@@ -640,19 +660,16 @@ mod real_vm {
         let mut results = Vec::new();
         let mut halted = false;
         for n in 1..=trials {
-            let remaining = total_end.saturating_duration_since(Instant::now());
-            let budget = trial_budget(Duration::from_secs(trial_secs), remaining);
-            match (halted, budget) {
-                (false, Some(b)) => {
-                    let (r, halt) = run_trial(n, &g, &root, b);
-                    halted = halt;
-                    results.push(r);
-                }
-                _ => results.push(TrialResult::Err {
+            if halted {
+                results.push(TrialResult::Err {
                     code: "not_run",
                     detail: None,
-                }),
+                });
+                continue;
             }
+            let (r, halt) = run_trial(n, &g, &root, Duration::from_secs(trial_secs), total_end);
+            halted = halt;
+            results.push(r);
         }
         // libtest の「test ... ... 」と同じ行に出ないよう、JSON の前に改行を置く。
         println!("\n{}", render_json(trials, &results));

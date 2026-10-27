@@ -87,7 +87,8 @@ aging（30d）が消さないため対象外。
 正本は core の試験補助（`crates/core/tests/support/scratch_root.rs`）で、supervisor・cli の試験は
 `#[path = "../../core/tests/support/scratch_root.rs"]` で同じファイルを取り込む（複製しない。保護条件の修正を
 1 箇所に保つため。試験専用で製品コード・rlib に影響しない）。代替は、各 crate の `tests/support/` へ複製し
-正本を指すヘッダを付ける方式（`crates/supervisor/tests/support/rootfs.rs` の前例）。
+正本を指すヘッダを付ける方式。rootfs の組み立て部品も当初は複製だったが、#2963 で core の `tests/support/`
+（`minimal_rootfs.rs`・`loader_deps.rs`）へ集約し、同じく `#[path]` で共有している（複製の乖離を避けるため）。
 
 ### 残余
 

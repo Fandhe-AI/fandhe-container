@@ -5,8 +5,8 @@
 //!
 //! # 呼び出し文脈
 //! `image_management::store` の `ImageStore::open` / `with_table` が、イメージストア root と祖先ディレクトリの
-//! 所有者を現在プロセスの実効 uid と照合するために使う（OCI-7・SEC-1・#2381）。依存追加は禁止
-//! （dependency-policy）のため、他 crate の `sys` と同じ流儀で `extern "C"` 宣言を自前で持つ。
+//! 所有者を現在プロセスの実効 uid と照合するために使う（OCI-7・SEC-1・#2381）。製品の依存に `libc` は入れない
+//! （dependency-policy・#1318。`libc` は dev-dependencies で照合にだけ使う）ため、他 crate の `sys` と同じ流儀で `extern "C"` 宣言を自前で持つ。
 //! Linux の x86_64 / aarch64 では `at`（`openat2` 系）を `layer::anchored` と `image_management::root_handle`
 //! （root 配下の永続化操作を検査済み root の fd 起点にする。#2638）が使う。
 //!

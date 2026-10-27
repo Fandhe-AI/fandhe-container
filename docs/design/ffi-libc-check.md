@@ -67,7 +67,7 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin（#1843）・crates/supervisor（#1840）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）は適用済み。crates/core（syscall 番号〔#1847〕・番号以外の定数〔#1848〕・構造体と関数の型〔#1849〕）も適用済み。残りの crate は #1840〜#1849 のうち未完了のもの。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）・crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）・crates/net（#1841）・crates/io（#1842）・crates/plugin（#1843）・crates/supervisor（#1840）・crates/plugin-windows（#1846）・crates/platform-macos（#1844）・crates/plugin-macos（#1845）は適用済み。crates/core（syscall 番号〔#1847〕・番号以外の定数〔#1848〕・構造体と関数の型〔#1849〕）も適用済み。#1837 の子 #1840〜#1849 はすべて完了している。未適用は crates/gpu（#2989）で、dev-dependencies に `libc` を持たない crate（crates/guest-init・crates/platform-windows の手作業の突き合わせなど）には機械照合が無い。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
 
 crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 

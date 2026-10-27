@@ -33,13 +33,13 @@
 //! | ID による照合（`entries.iter().any(\|e\| e.mount_id == id)`） | 変更不要。実体照合 |
 //! | `unescape_mountinfo`・`parse_mountinfo` | 変更不要。復号と解析のみ。[`MountName`] は ASCII 英数字と `.`・`_`・`-` だけで、マウント先に 8 進エスケープ対象が現れないためゲストの生の文字列とホストの復号後の文字列の判定は一致する |
 //! | ゲストの [`MOUNT_SCRIPT`] の ID 列挙（208 判定・mount 前後の差分） | 変更不要。208 は拒否側で、帰属は flock の下の ID の差分のため隠れた行で誤帰属しない |
-//! | ゲストの [`UMOUNT_SCRIPT`]・[`MOUNT_SCRIPT`] 自己後始末の最上位照合と、パス指定の `umount` | 残余。同じパス文字列の行が複数なら 203（fail-closed）だが、隠れた行 1 件はパス解決先に作用する |
+//! | ゲストの [`UMOUNT_SCRIPT`]・[`MOUNT_SCRIPT`] 自己後始末の最上位照合と、パス指定の `umount` | 対応済み（#2973）。mountinfo の最上位照合に加え、`umount` の直前にパスを開いた fd の `mnt_id`（`/proc/self/fdinfo/<fd>`）を記録値と照合する。不一致・読み取り不能は [`UMOUNT_SCRIPT`] で 214、自己後始末で 210（外さない。fail-closed） |
 //!
-//! ゲスト側の残余は、祖先（`/`・`/mnt`・`/mnt/fandhe`。root 所有で他者は書き込めないことを検査済み）へ overmount できる
-//! ゲスト内 root だけが起こせる（信頼境界の内側。非特権 userns 内のマウントは初期 namespace へ伝播しない）。ホスト側の
-//! 到達判定により、隠れたマウントへのパス指定 `umount` は [`UMOUNT_SCRIPT`] を呼ぶ前に止まる。残る窓はホストの照合から
-//! 実行までの間にゲスト内 root が overmount する場合だけである。fdinfo の `mnt_id` による実体照合は、実 WSL2 での確認
-//! （#377・TASK-67.6）で扱う。
+//! 残る窓は、ゲスト内で fd を閉じてから `umount` するまでの間（fd を開いたままだと `umount` が EBUSY になるため閉じる
+//! 構成は避けられない）に、祖先（`/`・`/mnt`・`/mnt/fandhe`。root 所有で他者は書き込めないことを検査済み）へ
+//! overmount できるゲスト内 root だけが起こせる（信頼境界の内側。非特権 userns 内のマウントは初期 namespace へ伝播しない）。
+//! ゲストで動く前提は既定ディストリ（Ubuntu）の `/bin/sh`（dash）・util-linux・coreutils・fdinfo の `mnt_id:` 行
+//! （Linux 3.15 以降）で、busybox 系は未検証（REPAIR-3）。実 WSL2 での確認は人間担当の #1629 で行う。
 //!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
@@ -564,6 +564,34 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
     v
 }
 
+/// ゲスト用スクリプトの共有断片: `mid <dir>` は、パス `<dir>` を実際に開いた fd の `mnt_id`
+/// （`/proc/self/fdinfo/<fd>`）を標準出力へ 10 進で書く。ディレクトリでない・symlink・open 失敗・`mnt_id:` 行が
+/// 無い場合は何も書かず非 0 で戻る（fail-closed）。
+///
+/// [`UMOUNT_SCRIPT`] と [`MOUNT_SCRIPT`] の自己後始末が、パス指定の `umount` の直前に「パス解決の先のマウント」が
+/// 記録した ID と同じ実体であることを確かめるために使う（照合の実装を 1 か所にまとめる。#2973・SEC-1・WIN-1・NET-1）。
+/// 祖先（`/mnt`・`/mnt/fandhe`）が overmount されて対象の行が隠れていても、fd はカーネルのパス解決と同じ先を開く
+/// ので、mountinfo の文字列照合では見えない取り違えを検出できる。
+///
+/// 前提: POSIX `sh`（既定ディストリ Ubuntu の dash で動作。bash でも動く）・`/proc/<pid>/fdinfo` の `mnt_id:` 行
+/// （Linux 3.15 以降。WSL2 のカーネルは満たす）。busybox 系は未検証（REPAIR-3）。サブシェルで fd 8 を開くので、
+/// スクリプト本体の fd は増えず、`umount` が EBUSY になる原因（開いたままの fd）も残らない。`/proc/self` は
+/// サブシェル自身を指す（`$$` は親を指して fd 8 を持たないため使わない）。fifo 等で open がブロックしないよう、
+/// 先にディレクトリかつ非 symlink を確かめる。
+macro_rules! mnt_id_sh {
+    () => {
+        concat!(
+            "mid() { [ -d \"$1\" ] && [ ! -L \"$1\" ] || return 1; ( exec 8< \"$1\" || exit 1; ",
+            "while read -r k v; do if [ \"$k\" = mnt_id: ]; then printf '%s' \"$v\"; exit 0; fi; ",
+            "done < /proc/self/fdinfo/8; exit 1 ) 2>/dev/null; }; "
+        )
+    };
+}
+
+/// 試験から `mnt_id_sh!` の断片を単体で実 `sh` に流すための文字列。
+#[cfg(test)]
+const MNT_ID_SH: &str = mnt_id_sh!();
+
 /// ゲスト内で「パス検証 → 必要ならディレクトリ作成 → 再検証 → mount → 自分のマウントの特定と記録」を
 /// 1 つの `sh` プロセスで行うスクリプト。
 ///
@@ -603,7 +631,9 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 場合も 209）。外せなかった場合や、新しいマウントが複数あって自分のものを特定できなかった場合は 210 で、記録
 /// （マウント ID または `none`）と `.done` を残して終わる。呼び出し側は未確定の記録として
 /// [`MountError::unreleased`] に載せ、後の [`release_virtiofs_launch`] が [`STATUS_SCRIPT`] で記録を読み直して
-/// 回収する（記録が無ければ 209 で外し終えたとみなす）。
+/// 回収する（記録が無ければ 209 で外し終えたとみなす）。自分のマウントを外す前には、最上位の照合に加えて
+/// `mid`（パスを開いた fd の `mnt_id`。祖先の overmount で別のマウントへ解決されないことの確認）も ID と照合し、
+/// 一致しなければ外さず 210 とする（#2973・SEC-1）。
 ///
 /// ディレクトリの作成は、並行する別の準備が先に作った場合（`EEXIST`）も成功として扱い、直後の検証で安全性を
 /// 確かめる（`/run` は tmpfs で WSL の再起動ごとに消えるため、記録ディレクトリの同時作成は起こりうる）。
@@ -624,6 +654,7 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// `mount.drvfs` ヘルパーの挙動が実機未検証のため採らない（TASK-67.6・#377 で再検討する。REPAIR-3）。
 const MOUNT_SCRIPT: &str = concat!(
     "set -eu; B=/mnt/fandhe; R=/run/fandhe; ",
+    mnt_id_sh!(),
     "chk() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || return 1; ",
     "set -- $(stat -c '%u %f' -- \"$1\"); ",
     "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
@@ -656,7 +687,7 @@ const MOUNT_SCRIPT: &str = concat!(
     "&& mkdir -- \"$R/$4.done\" 2>/dev/null; then ",
     "[ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; ",
     "x=209; if [ \"$n\" = 1 ]; then ",
-    "if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; ",
+    "if [ \"$(top \"$T\")\" = \"$new\" ] && [ \"$(mid \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; ",
     "elif [ \"$n\" != 0 ]; then x=210; fi; ",
     "if [ \"$x\" = 209 ]; then rm -f -- \"$R/$4\" \"$R/$4.tmp\"; rmdir -- \"$R/$4.claim\" \"$R/$4.done\" 2>/dev/null || :; ",
     "else printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; ",
@@ -814,20 +845,26 @@ fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> bool {
 /// （マウント先）だけを `read` で読む（awk 等に依存しない）。最上位は行順でなくマウント階層で
 /// 決める（同じマウント先の他のエントリから親として参照されていないものがちょうど 1 件）。`umount` に成功したら
 /// [`MOUNT_SCRIPT`] の記録と claim を消す。終了コード 203=最上位を確定できない・最上位が記録したマウントでない（外さない）。
+/// 214=パスを開いた fd の `mnt_id`（`mid`。祖先の overmount で隠れた行があるとパス解決の先は別のマウントになる）が
+/// 記録値と一致しない、または読めない（外さず、記録も消さない。#2973・SEC-1・WIN-1）。
 /// それ以外は `umount` の終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と
-/// 重ならない 200 番台に置く）。残る窓（同一プロセス内の確認から `umount` まで）に同じマウント先へマウントできるのは
+/// 重ならない 200 番台に置く）。ゲストの前提は既定ディストリ（Ubuntu）の `/bin/sh`（dash）・util-linux の `flock`・
+/// `umount`・fdinfo の `mnt_id:` 行（Linux 3.15 以降。busybox 系は未検証）。残る窓（`mid` の fd を閉じてから `umount` まで）に同じマウント先へマウントできるのは
 /// ゲスト内の root（CAP_SYS_ADMIN）に限られ、[`MOUNT_SCRIPT`] と同じく信頼境界の内側として扱う。
 /// 照合と `umount` は [`MOUNT_SCRIPT`] と同じマウント先ごとのロック（`/run/fandhe/lock.<名前>` の `flock`）の下で
 /// 行い、取り下げられた [`MOUNT_SCRIPT`] 自身の後始末と同時に同じマウント先を外さない（ロックを取れなければ 207 で
 /// 外さずに終え、呼び出し側は未解除として扱う）。
 const UMOUNT_SCRIPT: &str = concat!(
-    "set -u; command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; w=0; ",
+    "set -u; ",
+    mnt_id_sh!(),
+    "command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; w=0; ",
     "until flock -n 9; do w=$((w + 1)); [ \"$w\" -le 100 ] || exit 207; sleep 0.1; done; ",
     "ids=; pars=; ",
     "while read -r id par _ _ mp _; do if [ \"$mp\" = \"$1\" ]; then ids=\"$ids $id\"; pars=\"$pars $par\"; fi; ",
     "done < /proc/self/mountinfo; ",
     "top=; n=0; for i in $ids; do case \" $pars \" in *\" $i \"*) ;; *) top=$i; n=$((n + 1)) ;; esac; done; ",
     "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; ",
+    "[ \"$(mid \"$1\")\" = \"$2\" ] || exit 214; ",
     "umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\" || exit 213; ",
     "for d in \"/run/fandhe/$3.claim\" \"/run/fandhe/$3.done\"; do ",
     "rmdir -- \"$d\" 2>/dev/null || [ ! -e \"$d\" ] && [ ! -L \"$d\" ] || exit 213; done; exit 0"
@@ -1288,7 +1325,8 @@ impl std::error::Error for MountError {}
 ///
 /// 解除の直前に mountinfo を読み直し、マウント先の最上位エントリが記録したマウント ID と一致する場合に限り
 /// `umount` する。`umount` は [`UMOUNT_SCRIPT`] がゲスト内で同じ照合をやり直してから行う（照合と解除の間に
-/// 積まれた他者のマウントを外さない。不一致の終了コード 203 は `umount` の失敗と同様に読み直して判定する）。
+/// 積まれた他者のマウントを外さない。不一致の終了コード 203 と、パス解決先の `mnt_id` の不一致 214 は
+/// `umount` の失敗と同様に読み直して判定する）。
 /// 一致しない（他プロセスが差し替えた・既に外れている）場合は他者のマウントを外さないよう何もしない。
 /// mountinfo を読めない場合は所有を確認できないため外さず、失敗として数える。
 /// 記録したマウント ID がマウント先の最上位でなくても mountinfo のどこか（他者が移動した別のマウント先を含む）に
@@ -2701,7 +2739,7 @@ mod tests {
         ));
         // 記録を確定できない（取り下げを含む）ときは、自分のマウントが最上位なら自分で外して終える。
         assert!(MOUNT_SCRIPT.contains(
-            "x=209; if [ \"$n\" = 1 ]; then if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; elif [ \"$n\" != 0 ]; then x=210; fi; "
+            "x=209; if [ \"$n\" = 1 ]; then if [ \"$(top \"$T\")\" = \"$new\" ] && [ \"$(mid \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; elif [ \"$n\" != 0 ]; then x=210; fi; "
         ));
         // 210 では記録（ID または none）と .done を残し、後の release が STATUS_SCRIPT で回収できるようにする。
         assert!(MOUNT_SCRIPT.contains(
@@ -2711,9 +2749,18 @@ mod tests {
             STATUS_SCRIPT
                 .ends_with("if [ -d \"/run/fandhe/$1.claim\" ]; then exit 206; fi; exit 212")
         );
-        assert!(UMOUNT_SCRIPT.starts_with(
-            "set -u; command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; "
+        assert!(UMOUNT_SCRIPT.starts_with("set -u; "));
+        assert!(UMOUNT_SCRIPT.contains(
+            "command -v flock > /dev/null || exit 207; exec 9> \"/run/fandhe/lock.${1##*/}\"; "
         ));
+        // #2973: パス解決先の mnt_id の照合（mid）が両スクリプトにあり、UMOUNT_SCRIPT では 203 の後・umount の前。
+        assert!(UMOUNT_SCRIPT.contains(mnt_id_sh!()) && MOUNT_SCRIPT.contains(mnt_id_sh!()));
+        assert!(UMOUNT_SCRIPT.contains(
+            "|| exit 203; [ \"$(mid \"$1\")\" = \"$2\" ] || exit 214; umount \"$1\" || exit $?; "
+        ));
+        assert_eq!(UMOUNT_SCRIPT.matches("exit 214").count(), 1);
+        // 試験用の参照が製品の断片と食い違わない（実 `sh` での試験は Linux のみ）。
+        assert_eq!(MNT_ID_SH, mnt_id_sh!());
         assert_eq!(
             status_argv(&d, "00ff").get(9).map(String::as_str),
             Some("00ff")
@@ -2753,7 +2800,7 @@ mod tests {
                 .contains("chk / || exit 200; chk /mnt || exit 200; chk /run || exit 200; ")
         );
         assert!(UMOUNT_SCRIPT.contains(
-            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\" || exit 213; "
+            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; [ \"$(mid \"$1\")\" = \"$2\" ] || exit 214; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\" || exit 213; "
         ));
         // 記録の削除失敗は成功に丸めず非ゼロ（213）で伝える（呼び出し側が未完了として保持する）。
         assert!(UMOUNT_SCRIPT.ends_with("|| exit 213; done; exit 0"));
@@ -2941,6 +2988,15 @@ mod tests {
         umount_timeout: Option<bool>,
         /// true なら UMOUNT_SCRIPT の照合直前に同じマウント先へ他者のマウントが積まれる（照合と解除の競合の模擬）。
         stack_before_umount: bool,
+        /// `Some(祖先のパス)` なら UMOUNT_SCRIPT の照合の前に、その祖先へ tmpfs が overmount される
+        /// （対象の行は mountinfo に残るが、パス解決では隠れる。#2973）。
+        overmount_before_umount: Option<&'static str>,
+        /// `Some(祖先のパス)` なら MOUNT_SCRIPT の自己後始末の前に、その祖先へ tmpfs が overmount される（#2973）。
+        overmount_before_self_umount: Option<&'static str>,
+        /// 親のマウント ID の明示（マウント ID → 親）。無い行は同じマウント先の直前のマウント、無ければ `/`。
+        parent_override: std::collections::HashMap<u32, u32>,
+        /// 直近の UMOUNT_SCRIPT の模擬の終了コード（203・214・0。#2973）。
+        last_umount_exit: Option<i32>,
         /// `Some(code)` なら mount を成立させたうえで終了コード `code` の失敗を返す（16 等の不確定な失敗の模擬）。
         landed_exit_code: Option<i32>,
     }
@@ -3000,7 +3056,55 @@ mod tests {
                 umount_timeout: None,
                 landed_exit_code: None,
                 stack_before_umount: false,
+                overmount_before_umount: None,
+                overmount_before_self_umount: None,
+                parent_override: std::collections::HashMap::new(),
+                last_umount_exit: None,
             }
+        }
+
+        /// 添字 `i` の行の親のマウント ID（明示があればそれ、無ければ同じマウント先の直前のマウント、無ければ `/`）。
+        fn parent_of(&self, i: usize) -> u32 {
+            let id = self.ids.get(i).copied().unwrap_or(0);
+            if let Some(p) = self.parent_override.get(&id) {
+                return *p;
+            }
+            self.mounts
+                .iter()
+                .take(i)
+                .rposition(|(q, _)| Some(q) == self.mounts.get(i).map(|(p, _)| p))
+                .and_then(|j| self.ids.get(j).copied())
+                .unwrap_or(if i == 0 { 0 } else { 1 })
+        }
+
+        /// 祖先 `path` へ tmpfs を積む（overmount。ID を返す）。
+        fn push_tmpfs(&mut self, path: &str) -> u32 {
+            let id = self.next_id;
+            self.mounts.push((path.to_string(), "tmpfs".to_string()));
+            self.ids.push(id);
+            self.opts.push("rw".into());
+            self.next_id += 1;
+            id
+        }
+
+        /// ゲストのパス解決の模擬: `/` から要素ごとの接頭辞を、親が現在のマウントである行だけ辿って降り、最後に
+        /// 到達したマウントの ID を返す（`path` がマウント先でなくても、含むマウントの ID。fd の `mnt_id` に相当）。
+        /// 製品の `find_reachable_mount` を呼ばない独立の実装（自己照合を避ける）。
+        fn resolve_id(&self, path: &str) -> Option<u32> {
+            let mut cur = *self.ids.first()?;
+            let mut prefix = String::new();
+            for part in path.split('/').filter(|p| !p.is_empty()) {
+                prefix.push('/');
+                prefix.push_str(part);
+                while let Some(next) = (0..self.mounts.len()).find(|&i| {
+                    self.mounts.get(i).is_some_and(|(p, _)| *p == prefix)
+                        && self.parent_of(i) == cur
+                        && self.ids.get(i) != Some(&cur)
+                }) {
+                    cur = *self.ids.get(next)?;
+                }
+            }
+            Some(cur)
         }
 
         fn ids_at(&self, target: &str) -> Vec<u32> {
@@ -3059,8 +3163,16 @@ mod tests {
             }
             let mut code = if fresh.len() > 1 { 210 } else { 209 };
             if let Some(m) = mine {
+                if let Some(anc) = self.overmount_before_self_umount {
+                    self.push_tmpfs(anc);
+                }
                 match self.mounts.iter().rposition(|(p, _)| p == target) {
-                    Some(i) if self.ids.get(i) == Some(&m) && !self.self_umount_fails => {
+                    // 最上位の文字列照合に加え、パス解決先の mnt_id（mid）も一致するときだけ外す（#2973）。
+                    Some(i)
+                        if self.ids.get(i) == Some(&m)
+                            && self.resolve_id(target) == Some(m)
+                            && !self.self_umount_fails =>
+                    {
                         self.mounts.remove(i);
                         self.ids.remove(i);
                         self.opts.remove(i);
@@ -3131,13 +3243,7 @@ mod tests {
                         .enumerate()
                         .map(|(i, (p, t))| {
                             let id = self.ids.get(i).copied().unwrap_or(0);
-                            let parent = self
-                                .mounts
-                                .iter()
-                                .take(i)
-                                .rposition(|(q, _)| q == p)
-                                .and_then(|j| self.ids.get(j).copied())
-                                .unwrap_or(if i == 0 { 0 } else { 1 });
+                            let parent = self.parent_of(i);
                             let o = self.opts.get(i).map_or("rw", String::as_str);
                             format!("{id} {parent} 0:{i} / {p} {o} - {t} src rw\n")
                         })
@@ -3342,6 +3448,9 @@ mod tests {
                 ["sh", "-c", script, "sh", target, id, nonce] if *script == UMOUNT_SCRIPT => {
                     // UMOUNT_SCRIPT の模擬: 最上位のマウント ID が記録値と一致するときだけ外す（不一致は 203）。
                     self.umounts.push((*target).to_string());
+                    if let Some(anc) = self.overmount_before_umount {
+                        self.push_tmpfs(anc);
+                    }
                     if self.stack_before_umount {
                         self.mounts
                             .push(((*target).to_string(), "tmpfs".to_string()));
@@ -3356,8 +3465,15 @@ mod tests {
                         .and_then(|i| self.ids.get(i))
                         .map(u32::to_string);
                     if top.as_deref() != Some(*id) {
+                        self.last_umount_exit = Some(203);
                         return fail_cat(203);
                     }
+                    // パスを開いた fd の mnt_id（mid）の照合: 祖先の overmount で解決先が変われば外さない（#2973）。
+                    if self.resolve_id(target).map(|v| v.to_string()).as_deref() != Some(*id) {
+                        self.last_umount_exit = Some(214);
+                        return fail_cat(214);
+                    }
+                    self.last_umount_exit = Some(0);
                     if self.umount_timeout == Some(false) {
                         return Self::timeout();
                     }
@@ -4035,6 +4151,177 @@ mod tests {
         assert_eq!(failures, 1);
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.ids, [1, 100, 101]);
+    }
+
+    /// 準備直後の `/mnt/fandhe/a`（ID 100）の祖先 `/mnt/fandhe` へ tmpfs（ID 101）を overmount した状態の模擬ゲストと
+    /// 準備結果（#2973）。
+    fn guest_with_hidden_mount() -> (Guest, PreparedLaunch) {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        assert_eq!(g.push_tmpfs("/mnt/fandhe"), 101);
+        (g, p)
+    }
+
+    /// 祖先の overmount の中に、同じパス文字列の別のマウント（ID 102、親は overmount の 101）を置く（#2973）。
+    fn add_mount_inside_overmount(g: &mut Guest) {
+        g.mounts
+            .push(("/mnt/fandhe/a".to_string(), "virtiofs".to_string()));
+        g.ids.push(102);
+        g.opts.push("rw,nosuid,nodev".into());
+        g.parent_override.insert(102, 101);
+        g.next_id = 103;
+    }
+
+    fn owned_a() -> Vec<OwnedMount> {
+        vec![OwnedMount {
+            guest_path: "/mnt/fandhe/a".to_string(),
+            mount_id: Some(100),
+            nonce: "00ff".to_string(),
+            read_only: false,
+        }]
+    }
+
+    /// #2973・SEC-1・WIN-1: 祖先の overmount で隠れた記録のマウントは、`verify_shared` が「最上位を確定できない」で拒否する。
+    #[test]
+    fn sec1_2973_verify_shared_rejects_hidden_mount() {
+        let (mut g, _p) = guest_with_hidden_mount();
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = verify_shared(&r, VirtiofsState::Enabled, &owned_a(), &mut |a, m| {
+            g.run(a, m)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "the shared mount is missing or its topmost mount cannot be determined after mounting"
+        );
+        assert!(g.umounts.is_empty());
+    }
+
+    /// #2973: overmount の中に別の `/mnt/fandhe/a`（ID 102）があれば、それが到達するので「別のマウントに差し替わった」で拒否する。
+    #[test]
+    fn sec1_2973_verify_shared_rejects_mount_inside_overmount() {
+        let (mut g, _p) = guest_with_hidden_mount();
+        add_mount_inside_overmount(&mut g);
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = verify_shared(&r, VirtiofsState::Enabled, &owned_a(), &mut |a, m| {
+            g.run(a, m)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "a shared mount was replaced by another mount after mounting"
+        );
+        assert!(g.umounts.is_empty());
+    }
+
+    /// #2973: 隠れたマウントを `release` は外さず（`UMOUNT_SCRIPT` も呼ばない）、未解除 1 件として記録を残す。
+    #[test]
+    fn sec1_2973_release_does_not_unmount_hidden_mount() {
+        let (mut g, p) = guest_with_hidden_mount();
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 1);
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.ids, [1, 100, 101]);
+        assert_eq!(
+            g.records.values().map(String::as_str).collect::<Vec<_>>(),
+            ["100"]
+        );
+        assert_eq!(g.clears, 0);
+    }
+
+    /// #2973: overmount の中の別のマウント（ID 102）を取り違えて外さず、隠れた自分のマウント（ID 100）も外さない。
+    #[test]
+    fn sec1_2973_release_does_not_unmount_mount_inside_overmount() {
+        let (mut g, p) = guest_with_hidden_mount();
+        add_mount_inside_overmount(&mut g);
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 1);
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.ids, [1, 100, 101, 102]);
+        assert_eq!(g.clears, 0);
+    }
+
+    /// #2973・A1: ホストの照合を通った後でパス解決先が変わる（祖先の overmount）と、`UMOUNT_SCRIPT` は 214 で
+    /// 外さず、記録も消さない。ホストは mountinfo の読み直しで ID の残存を見て未解除（retry）にする。
+    #[test]
+    fn sec1_2973_umount_script_refuses_when_path_resolves_elsewhere() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        g.overmount_before_umount = Some("/mnt/fandhe");
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 1);
+        assert_eq!(g.last_umount_exit, Some(214));
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert_eq!(g.ids, [1, 100, 101]);
+        assert_eq!(
+            g.records.values().map(String::as_str).collect::<Vec<_>>(),
+            ["100"]
+        );
+        assert_eq!(g.clears, 0);
+    }
+
+    /// #2973・A1: 記録を確定できずゲスト内で自分のマウントを外す経路（MOUNT_SCRIPT の自己後始末）でも、パス解決先が
+    /// 変わっていれば外さず 210 で終え、記録（ID）と `.done` を残す。
+    #[test]
+    fn sec1_2973_guest_self_cleanup_keeps_mount_when_path_resolves_elsewhere() {
+        let mut g = Guest::new("virtiofs");
+        g.fail_record_write = true;
+        g.overmount_before_self_umount = Some("/mnt/fandhe");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let e = drive(&mut g, &r, VirtiofsState::Enabled).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "the shared mount could not be recorded and was not rolled back in the distribution (1 rollback unmount(s) also failed)"
+        );
+        let left = e.unreleased().unwrap();
+        assert_eq!(summary(left), [("/mnt/fandhe/a", Some(100), false)]);
+        assert_eq!(g.ids, [1, 100, 101]);
+        assert_eq!(
+            g.records.values().map(String::as_str).collect::<Vec<_>>(),
+            ["100"]
+        );
+        assert_eq!(g.dones.len(), 1);
+    }
+
+    /// #2973・A1・A2: 実 `sh` で `mid` の断片を回す。`/` の `mnt_id` は mountinfo の `/` の ID と一致し、記録値と
+    /// 違う・存在しない・ディレクトリでないパスでは出力が空（不一致）になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2973_mnt_id_snippet_matches_mountinfo_on_real_sh() {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let entries = parse_mountinfo(&text).unwrap();
+        let root_id = find_reachable_mount(&entries, "/").unwrap().mount_id;
+        let script = concat!(
+            mnt_id_sh!(),
+            "if [ \"$(mid \"$1\")\" = \"$2\" ]; then printf match; else printf nomatch; fi"
+        );
+        let run = |path: &str, id: u32| {
+            let out = run_sh_args_with_deadline(
+                script,
+                &[path, &id.to_string()],
+                Duration::from_secs(20),
+            );
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run("/", root_id), "match");
+        assert_eq!(run("/", root_id + 1), "nomatch");
+        let missing = format!("/nonexistent-{}", std::process::id());
+        assert_eq!(run(&missing, root_id), "nomatch");
+        let file = std::env::temp_dir().join(format!("fandhe-mid-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let on_file = run(file.to_str().unwrap(), root_id);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(on_file, "nomatch");
+        // 生の出力は 10 進の ID と完全一致する。
+        let raw = run_sh_args_with_deadline(
+            concat!(mnt_id_sh!(), "mid \"$1\""),
+            &["/"],
+            Duration::from_secs(20),
+        );
+        assert_eq!(String::from_utf8(raw.stdout).unwrap(), root_id.to_string());
     }
 
     /// SEC: 最上位はマウント階層（親のマウント ID）で決め、mountinfo の行順に頼らない。
@@ -4803,10 +5090,21 @@ mod tests {
     /// `sh -c script sh arg` を期限つきで実行して出力を返す（超過時は kill して回収し panic する。REPAIR-5）。
     #[cfg(target_os = "linux")]
     fn run_sh_with_deadline(script: &str, arg: &str, limit: Duration) -> std::process::Output {
+        run_sh_args_with_deadline(script, &[arg], limit)
+    }
+
+    /// [`run_sh_with_deadline`] の位置引数を複数取れる版（`sh -c script sh args...`）。
+    #[cfg(target_os = "linux")]
+    fn run_sh_args_with_deadline(
+        script: &str,
+        args: &[&str],
+        limit: Duration,
+    ) -> std::process::Output {
         use std::io::Read;
         use std::process::{Command, Stdio};
         let mut child = Command::new("sh")
-            .args(["-c", script, "sh", arg])
+            .args(["-c", script, "sh"])
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -2,8 +2,8 @@
 //!
 //! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount に使う。公開するのは用途別の安全な関数
 //! （virtiofs・proc・sysfs・devtmpfs）だけで、任意の flags / data は型の上で渡せない（`MS_BIND`・
-//! `MS_MOVE`・`MS_REMOUNT` を呼び出し側が組めない。REPAIR-2）。`unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。#1318 の `libc` との
-//! 機械照合はこの crate には未導入で、フラグ定数は固定値テストで照合する。
+//! `MS_MOVE`・`MS_REMOUNT` を呼び出し側が組めない。REPAIR-2）。`unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。`libc` との機械照合
+//! （#1318・#2076）は試験専用モジュール `libc_abi` が const 評価で行い、固定値テストも併用する。
 //!
 //! 定数は x86_64 / aarch64 の Linux で同値だが、他アーキテクチャへ流用しない（`SUPPORTED` が偽なら
 //! `ENOSYS` を返して何も呼ばない）。`c_ulong` が u64 になる LP64 だけを対象にし、x32・ILP32 は `ENOSYS`
@@ -128,6 +128,50 @@ pub fn mount_devtmpfs(target: &Path) -> io::Result<()> {
         DEVTMPFS_FLAGS,
         Some("mode=0755"),
     )
+}
+
+/// 自前の FFI 宣言・定数と `libc`（dev-dependencies のみ）のコンパイル時照合（#2076・#1318・MVM-4・REPAIR-12。
+/// 方式は docs/design/ffi-libc-check.md）。食い違えば const 評価（E0080）か型不一致（E0308）で
+/// ビルドが落ちる。評価されるターゲット: x86_64-unknown-linux-gnu（ネイティブ）、
+/// aarch64-unknown-linux-gnu と製品のターゲット aarch64-unknown-linux-musl（cross-target-check の型検査。
+/// const は評価される）。libc 0.2.189 では下記の値も `mount` の宣言も x86_64・aarch64 の gnu と musl で
+/// 同一なので `target_env` では分けない（一次情報: libc の `unix/linux_like/mod.rs`・`linux_l4re_shared.rs`、
+/// Linux uapi の `linux/mount.h`・`asm-generic/fcntl.h`・`asm-generic/errno-base.h`・`errno.h`）。
+/// `SUPPORTED` と同じ LP64（x86_64・aarch64）に限る。他は `SUPPORTED` が偽で呼ばないため評価しない。
+/// 対象外: `SUPPORTED`（cfg の判定で FFI でない）、`PSEUDO_STRICT`・`DEVTMPFS_FLAGS`・`virtiofs_flags`
+/// （方針値で `libc` に無い。構成要素は照合済みで組み合わせは固定値テストが見る）、安全なラッパー群。
+#[cfg(all(
+    test,
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+))]
+mod libc_abi {
+    use super::*;
+
+    // 型合わせに `as` は使わない。LP64 では u64 == c_ulong、i32 == c_int なので型が変われば E0308 になる。
+    const _: () = {
+        let _: libc::c_ulong = MS_RDONLY;
+        assert!(MS_RDONLY == libc::MS_RDONLY);
+        assert!(MS_NOSUID == libc::MS_NOSUID);
+        assert!(MS_NODEV == libc::MS_NODEV);
+        assert!(MS_NOEXEC == libc::MS_NOEXEC);
+        assert!(O_NOCTTY == libc::O_NOCTTY);
+        assert!(ENOSYS == libc::ENOSYS);
+        // `cstring` の中のリテラル 22（EINVAL）。関数内で項目として参照できないため値だけを照合する
+        // （`cstring` と試験 `mac1_mount_rejects_nul_with_einval` が使う）。
+        assert!(libc::EINVAL == 22);
+    };
+
+    // `mount` の型を自前の宣言と `libc` の宣言で同じ関数ポインタ型へ代入して照合する。
+    type MountFn = unsafe extern "C" fn(
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        libc::c_ulong,
+        *const libc::c_void,
+    ) -> libc::c_int;
+    const _: MountFn = mount;
+    const _: MountFn = libc::mount;
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 # macOS ゲスト VM の initrd に入れる Rust 製 PID 1（crate-naming.md の表 #20。TASK-64 追補・#1875・MAC-1）。
 # 配置・unsafe・ターゲット・ライセンスは #1823 のオーナー判断（2026-10-12）による。busybox 等の GPL ユーザーランドは
 # 入れない（#362）。version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
-# 外部クレートは使わない（std のみ）。契約の照合試験（tests/contract.rs）のためだけに platform-macos を
+# 製品コードは外部クレートを使わない（std のみ）。照合の試験に限り dev-dependencies で libc を使う（#2076）。契約の照合試験（tests/contract.rs）のためだけに platform-macos を
 # dev-dependencies に置く。通常の依存に入れると静的なゲストバイナリへバックエンドが入るため置かない
 # （workspace 内 path 依存で外部クレートの追加ではない）。
 
@@ -20,6 +20,11 @@ doc = false
 
 [dev-dependencies]
 fandhe-container-platform-macos = { path = "../platform-macos" }
+
+# libc は自前 FFI 宣言（sys.rs）との機械照合の試験専用（#2076・#1318・MVM-4・REPAIR-12。docs/design/ffi-libc-check.md）。
+# dev-dependencies のみで、静的なゲストバイナリ（initrd の /init）の依存グラフには入らない。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

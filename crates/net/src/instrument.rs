@@ -4,15 +4,14 @@
 //! 1 回の操作ごとの結果（成功 / 失敗）と所要時間を記録先へ渡すための境界。集計（成功・失敗件数と
 //! レイテンシ分布）と構造化ログへの出力は core の `OpRecorder` が担うが、net は core に依存しない
 //! ため、本モジュールが net 内の型だけで完結するトレイトを定義する（`fandhe-container-io` の
-//! `instrument` モジュールと同じ形）。core の記録器への接続は、core と net の両方に依存する上位
-//! crate に置く newtype アダプタが担い、`sample.kind().as_str()` を core の `OpName::new` へ、
-//! `sample.outcome()` / `sample.latency()` を `OpRecorder::record` へ写す。
+//! `instrument` モジュールと同じ形）。core の記録器への接続は、`docs/architecture.md` の「計装アダプタの配置」の原則
+//! （net の操作を本番で呼び、`OpRecorder` を持つ crate に置く newtype アダプタ）に従う。
+//! アダプタは `sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` / `sample.latency()` を `OpRecorder::record` へ写す。
 //!
 //! OS 非依存（型とトレイトのみ）で、Linux 以外でもアダプタをビルドできる。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。net からは提供しない）
 //! - 後続の操作（address / route 送信ラッパー等。#301）の種別は、送信ラッパーと一緒に
 //!   [`NetOpKind`] へ追加する
 //!

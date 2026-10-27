@@ -59,8 +59,8 @@
 //! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
-//! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は上位 crate の
-//! アダプタが担う。write 経路の実計装は TASK-84.7 で組み込み済みで、入口は
+//! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は
+//! `docs/architecture.md` の「計装アダプタの配置」の原則に従い、io の操作を本番で呼ぶ crate のアダプタが担う。write 経路の実計装は TASK-84.7 で組み込み済みで、入口は
 //! [`writeback::serve_connection_with_recorder`] / [`settings::BoundConnection::serve_with_recorder`]
 //! （既存の `serve_*` は計装しない版）。read は現状 io にファイル読み出し経路がなく未計装（REPAIR-3）。
 //!

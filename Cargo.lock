@@ -350,6 +350,7 @@ dependencies = [
 name = "fandhe-container-io"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "unicode-normalization",
 ]
 

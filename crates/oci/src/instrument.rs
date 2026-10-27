@@ -1,8 +1,8 @@
 //! oci 操作の計装連携点（REPAIR-4・OCI-1・TASK-51.2・MS-4・#401）。
 //!
 //! oci の各操作（認証・manifest / blob 取得・検証・解凍・展開・在庫の操作・回収）が、1 回の操作ごとの結果
-//! （成功 / 失敗とエラー code）と所要時間を記録先へ渡すための境界。集計と構造化ログへの出力は上位 crate が
-//! `OciOpRecorder` を実装して差し込む（`fandhe-container-net` の `instrument` と同じ形。oci は core に依存しない）。
+//! （成功 / 失敗とエラー code）と所要時間を記録先へ渡すための境界。集計と構造化ログへの出力は、`docs/architecture.md` の「計装アダプタの配置」の原則に従い、
+//! oci の操作を本番で呼び `OpRecorder` を持つ crate が `OciOpRecorder` を実装して差し込む（`fandhe-container-net` の `instrument` と同じ形。oci は core に依存しない）。
 //! 本番の記録先は plugin-cri の `CoreOciRecorder`（`adapter.rs`）で、oci 専用の `OpRecorder` へ `OciOpKind::as_str` の
 //! 名前で写す（エラー code は名前に含めない。写像と専用にした理由は `docs/design/pull-inventory-wiring.md`。#2900）。
 //! CLI の `image ls` / `image rm` / `image tag` / `system df` の記録先は cli の `CliOciRecorder`（`commands/oci_recorder.rs`）で、

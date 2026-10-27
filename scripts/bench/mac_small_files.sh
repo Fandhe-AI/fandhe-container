@@ -293,7 +293,7 @@ run_report() {
       | .schema == $s
       and .target == $want
       and (.metrics.wall_clock_median_ms.value | type == "number" and . > 0)
-      and (.metrics.metadata_p95_us.value | type == "number" and . > 0)
+      and (.metrics.metadata_p95_us.value | type == "number" and . >= 0)
       and (.metrics.wall_clock_median_ms.method | type == "string" and length > 0)
       and (.metrics.metadata_p95_us.method | type == "string" and length > 0)
       and (.metrics.wall_clock_median_ms.unit | type == "string" and length > 0)
@@ -316,6 +316,7 @@ run_report() {
     ($o[0]) as $own | ($b[0]) as $base
     | (($own.workload == $base.workload) and ($own.image == $base.image) and ($own.image_id == $base.image_id) and ($own.mount_kind == $base.mount_kind)) as $same_wl
     | def rate($k): if $same_wl and ($own.metrics[$k].method == $base.metrics[$k].method) and ($own.metrics[$k].unit == $base.metrics[$k].unit)
+        and ($base.metrics[$k].value > 0)
         then ((1 - ($own.metrics[$k].value / $base.metrics[$k].value)) * 1000000 | round / 1000000) else null end;
     {
       schema: $schema,
@@ -325,7 +326,7 @@ run_report() {
       baseline: { label: $base.label, metrics: $base.metrics, trials_ok: $base.trials_ok },
       wall_clock_reduction_ratio: rate("wall_clock_median_ms"),
       metadata_p95_reduction_ratio: rate("metadata_p95_us"),
-      methods_differ: ((rate("wall_clock_median_ms") == null) or (rate("metadata_p95_us") == null)),
+      methods_differ: ((rate("wall_clock_median_ms") == null) or ((rate("metadata_p95_us") == null) and ($base.metrics.metadata_p95_us.value > 0))),
       note: "ratios are 1 - own/baseline (positive means own is faster); null when workload, image (tag or digest), mount kind, method or unit differ. No pass/fail here: the MAC-3 thresholds (wall clock >= 15% shorter, or metadata p95 >= 20% lower than Docker Desktop VirtioFS) are judged by a human in TASK-70 (#381). The p95 method is provisional (owner confirmation pending)"
     }' >"$tmp" 2>/dev/null || fail_measure "cannot build the report"
   emit_result "$tmp"

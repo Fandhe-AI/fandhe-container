@@ -4,15 +4,15 @@
 # スタブの docker CLI（bash）と一時ディレクトリのみで、引数検証・起動引数・集計の具体値・件数不一致・期限・
 # 後始末（所有の証明）・own の未実装・report の率を照合する。実 Docker Desktop・実ランタイム・root は使わない。
 # 呼び出し元: Makefile の `mac-small-files-selftest`（CI は bench-regression の並列グループ）。
-# 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 5 以上が必要（EPOCHREALTIME）。
+# 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 5 以上が必要（EPOCHREALTIME）。満たさなければ skip せず非ゼロ（2）で終わる。
 set -euo pipefail
 export LC_ALL=C
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SELF_DIR}/mac_small_files.sh"
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
-  echo "skip: bash 5 or later is required for the docker mode tests (EPOCHREALTIME)"
-  exit 0
+  echo "error: bash 5 or later is required (EPOCHREALTIME). Run with a newer bash, e.g. /opt/homebrew/bin/bash on macOS" >&2
+  exit 2
 fi
 
 TMP="$(mktemp -d)"
@@ -329,6 +329,14 @@ for k in .mount_kind .trials_ok .image_id .metrics.wall_clock_median_ms.unit; do
   runit --mode report --own-result "${TMP}/o-del.json" --baseline-result "${TMP}/b-del.json"
   check "report rejects results without ${k} with 2" rc_is 2
 done
+# p95 が 0（/proc/uptime の 10ms 分解能で起こりうる）: own 側 0 は受理して率 1、基準側 0 は p95 の率だけ null（methods_differ は false のまま）
+mkres own 800 0 >"${TMP}/o-p0.json"
+runit --mode report --own-result "${TMP}/o-p0.json" --baseline-result "${TMP}/b.json"
+check "own p95=0 is accepted: ratio 1 and wall ratio 0.2" jq_ok '.metadata_p95_reduction_ratio == 1 and .wall_clock_reduction_ratio == 0.2 and .methods_differ == false' "${TMP}/out"
+mkres docker 1000 0 >"${TMP}/b-p0.json"
+runit --mode report --own-result "${TMP}/o-p0.json" --baseline-result "${TMP}/b-p0.json"
+check "baseline p95=0: exits 0" rc_is 0
+check "baseline p95=0: p95 ratio null, wall ratio stays, methods_differ false" jq_ok '.metadata_p95_reduction_ratio == null and .wall_clock_reduction_ratio == 0.2 and .methods_differ == false' "${TMP}/out"
 
 echo "passed=${PASS} failed=${FAIL}"
 [ "$FAIL" -eq 0 ]

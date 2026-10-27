@@ -64,7 +64,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use crate::error::{NetError, NetErrorCode};
-use crate::netlink::{NLM_F_CREATE, NLM_F_EXCL, NlMsgBuilder};
+use crate::netlink::{NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NlMsgBuilder};
 use crate::netlink_route::IfIndex;
 
 /// リンクの新規作成（`linux/rtnetlink.h`）。
@@ -167,7 +167,10 @@ enum Kind {
 
 /// `RTM_NEWLINK` によるリンク作成要求（bridge / veth ペア）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkCreate(Kind);
+pub struct LinkCreate {
+    kind: Kind,
+    echo: bool,
+}
 
 impl LinkCreate {
     /// bridge を 1 本作る要求。
@@ -177,7 +180,23 @@ impl LinkCreate {
     /// 処理するのは `do_setlink` の `netif_set_alias` だけで、作成経路の `rtnl_newlink_create`・
     /// `rtnl_create_link` は読まない。Issue #1925）。所有は作成の ACK 後に [`LinkSet::set_alias`] で付ける。
     pub fn bridge(name: IfName) -> Self {
-        Self(Kind::Bridge { name })
+        Self {
+            kind: Kind::Bridge { name },
+            echo: false,
+        }
+    }
+
+    /// 作成要求に `NLM_F_ECHO` を付け、カーネルが返す作成通知（`RTM_NEWLINK`）を `NetlinkReply::messages`
+    /// に集める指定にする（Issue #1972・NET-1）。
+    ///
+    /// 呼び出し元は通知を [`decode_created_link`] で検証して作成した link 自身の ifindex を得る。名前での
+    /// 引き直しをなくし、所有トークンを付ける相手を「自分が作った link」に固定するのが目的。
+    /// 通知を返すのは Linux v6.2 以降（`rtnl_configure_link` が portid・`nlh` を受けて `NLM_F_ECHO` を
+    /// 守る）。それより前のカーネルでは ACK だけが返るため、呼び出し側は通知なしを戻し経路で扱うこと。
+    #[must_use]
+    pub fn with_echo(mut self) -> Self {
+        self.echo = true;
+        self
     }
 
     /// veth ペア（`name` と `peer`）を作る要求。同名は `InvalidArgument`（fail-closed）。
@@ -185,7 +204,10 @@ impl LinkCreate {
         if name == peer {
             return Err(invalid("veth name and peer name must differ"));
         }
-        Ok(Self(Kind::Veth { name, peer }))
+        Ok(Self {
+            kind: Kind::Veth { name, peer },
+            echo: false,
+        })
     }
 
     /// `nlmsg_type`（常に `RTM_NEWLINK`）。
@@ -193,14 +215,16 @@ impl LinkCreate {
         RTM_NEWLINK
     }
 
-    /// `nlmsg_flags`（`NLM_F_CREATE | NLM_F_EXCL`。REQUEST / ACK は `request` が付与する）。
+    /// `nlmsg_flags`（`NLM_F_CREATE | NLM_F_EXCL`。[`with_echo`](Self::with_echo) のときだけ `NLM_F_ECHO` も付く。
+    /// REQUEST / ACK は `request` が付与する）。
     pub fn flags(&self) -> u16 {
-        NLM_F_CREATE | NLM_F_EXCL
+        let base = NLM_F_CREATE | NLM_F_EXCL;
+        if self.echo { base | NLM_F_ECHO } else { base }
     }
 
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
-        let (name, kind, peer) = match &self.0 {
+        let (name, kind, peer) = match &self.kind {
             Kind::Bridge { name } => (name, "bridge", None),
             Kind::Veth { name, peer } => (name, "veth", Some(peer)),
         };
@@ -463,6 +487,83 @@ impl LinkDelete {
     }
 }
 
+/// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFNAME` を取り出す（無ければ `None`）。
+///
+/// 応答はカーネル由来の外部入力として属性走査で検証する。NUL 終端を除いた部分が UTF-8 でなければ
+/// `DataLoss`（Issue #1972）。
+pub fn decode_ifinfomsg_name(payload: &[u8]) -> Result<Option<String>, NetError> {
+    let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "link reply is shorter than ifinfomsg",
+        )
+    })?;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() == IFLA_IFNAME {
+            let raw = attr.payload();
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            let bytes = raw.get(..end).unwrap_or_default();
+            let name = std::str::from_utf8(bytes).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_IFNAME is not valid UTF-8")
+            })?;
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// `NLM_F_ECHO` 付きの bridge 作成要求に対する応答メッセージ（`(nlmsg_type, payload)`）から、作成した
+/// link 自身の ifindex を取り出す（Issue #1972・NET-1）。
+///
+/// 呼び出し元は `NetlinkReply::messages` を写して渡す。`RTM_NEWLINK` 以外の型は無視する。判定:
+///
+/// - `RTM_NEWLINK` が 0 件 → `Ok(None)`（echo が返らなかった。v6.2 より前のカーネルなど。呼び出し側は
+///   名前で引き直す戻し経路へ移る）
+/// - ちょうど 1 件で、ifindex が正・`IFLA_IFNAME` が `expected` と一致・`IFLA_IFALIAS` が無いか空 →
+///   `Ok(Some(ifindex))`
+/// - 2 件以上・ペイロードの破損・名前の不一致・別名あり → `DataLoss`（カーネル応答は外部入力。通知は
+///   rtnl ロックの中で作られるため、食い違いは正常系では起きない。何も言わずに戻し経路へ移らない）
+pub fn decode_created_link<'a>(
+    messages: impl IntoIterator<Item = (u16, &'a [u8])>,
+    expected: &IfName,
+) -> Result<Option<IfIndex>, NetError> {
+    let mut found: Option<&[u8]> = None;
+    for (msg_type, payload) in messages {
+        if msg_type != RTM_NEWLINK {
+            continue;
+        }
+        if found.replace(payload).is_some() {
+            return Err(NetError::new(
+                NetErrorCode::DataLoss,
+                "multiple link creation notifications in echo reply",
+            ));
+        }
+    }
+    let Some(payload) = found else {
+        return Ok(None);
+    };
+    let index = decode_ifinfomsg_index(payload).map_err(|e| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            format!("invalid echo reply: {}", e.message()),
+        )
+    })?;
+    if decode_ifinfomsg_name(payload)?.as_deref() != Some(expected.as_str()) {
+        return Err(NetError::new(
+            NetErrorCode::DataLoss,
+            "link creation notification names a different link",
+        ));
+    }
+    if decode_ifinfomsg_alias(payload)?.is_some_and(|a| !a.is_empty()) {
+        return Err(NetError::new(
+            NetErrorCode::DataLoss,
+            "link creation notification already has an alias",
+        ));
+    }
+    Ok(Some(index))
+}
+
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFALIAS` を取り出す（無ければ `None`）。
 ///
 /// 応答はカーネル由来の外部入力として属性走査で検証する。NUL 終端を除いた UTF-8 文字列のみ返し、
@@ -551,6 +652,23 @@ mod tests {
         let mut b = NlMsgBuilder::new(req.msg_type(), req.flags(), 0x1234, 0);
         req.encode(&mut b).unwrap();
         b.finish().unwrap()
+    }
+
+    fn link_payload(index: i32, name: Option<&[u8]>, alias: Option<&[u8]>) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(RTM_NEWLINK, 0, 1, 0);
+        b.put_fixed(&ifinfomsg(index, 0, 0)).unwrap();
+        if let Some(n) = name {
+            b.put_attr(IFLA_IFNAME, n).unwrap();
+        }
+        if let Some(a) = alias {
+            b.put_attr(IFLA_IFALIAS, a).unwrap();
+        }
+        let data = b.finish().unwrap();
+        let msg = crate::netlink::NlMsgIter::new(&data)
+            .next()
+            .unwrap()
+            .unwrap();
+        msg.payload().to_vec()
     }
 
     fn name(s: &str) -> IfName {
@@ -1031,6 +1149,75 @@ mod tests {
         let f = std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_owned() + "/Cargo.toml").unwrap();
         let nfd = NetnsFd::new(f.as_fd()).unwrap();
         assert_eq!(nfd.raw(), f.as_raw_fd() as u32);
+    }
+    /// NET-1・Issue #1972: echo 指定は flags に NLM_F_ECHO だけを足し、既定（bridge・veth）は変えない。
+    #[test]
+    fn net1_with_echo_adds_only_echo_flag() {
+        let echo = LinkCreate::bridge(name("br0")).with_echo();
+        assert_eq!(echo.flags(), 0x0608);
+        assert_eq!(echo.flags() & (NLM_F_REQUEST | NLM_F_ACK), 0);
+        assert_eq!(LinkCreate::bridge(name("br0")).flags(), 0x0600);
+        assert_eq!(
+            LinkCreate::veth(name("a"), name("b")).unwrap().flags(),
+            0x0600
+        );
+        // 属性構造は echo の有無で変わらない。
+        let a = build(&echo);
+        let mut b = build(&LinkCreate::bridge(name("br0")));
+        // flags は nlmsghdr の 6..8 バイト目。差を揃えれば完全一致する。
+        b.splice(6..8, a.get(6..8).unwrap().iter().copied());
+        assert_eq!(a, b);
+    }
+
+    /// NET-1・Issue #1972: 作成通知の検証（0 件・正常・異常各種）。
+    #[test]
+    fn net1_decode_created_link_cases() {
+        let br = name("fcbr0");
+        let ok = link_payload(7, Some(b"fcbr0\0"), None);
+        let empty_alias = link_payload(7, Some(b"fcbr0\0"), Some(b"\0"));
+        let none: [(u16, &[u8]); 0] = [];
+        assert_eq!(decode_created_link(none, &br).unwrap(), None);
+        // RTM_NEWLINK 以外は無視する。
+        assert_eq!(
+            decode_created_link([(RTM_DELLINK, ok.as_slice())], &br).unwrap(),
+            None
+        );
+        for p in [&ok, &empty_alias] {
+            let got = decode_created_link([(RTM_NEWLINK, p.as_slice())], &br).unwrap();
+            assert_eq!(got.map(|i| i.get()), Some(7));
+        }
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("name mismatch", link_payload(7, Some(b"other\0"), None)),
+            ("no name", link_payload(7, None, None)),
+            ("alias", link_payload(7, Some(b"fcbr0\0"), Some(b"tok\0"))),
+            ("index 0", link_payload(0, Some(b"fcbr0\0"), None)),
+            ("non utf8", link_payload(7, Some(b"\xff\xfe\0"), None)),
+            ("short", vec![0u8; 8]),
+        ];
+        for (label, p) in &bad {
+            let e = decode_created_link([(RTM_NEWLINK, p.as_slice())], &br).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
+        }
+        let e = decode_created_link(
+            [(RTM_NEWLINK, ok.as_slice()), (RTM_NEWLINK, ok.as_slice())],
+            &br,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+    }
+
+    /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。
+    #[test]
+    fn net1_decode_ifinfomsg_name_cases() {
+        let p = link_payload(3, Some(b"br0\0"), None);
+        assert_eq!(decode_ifinfomsg_name(&p).unwrap().as_deref(), Some("br0"));
+        let p = link_payload(3, None, None);
+        assert_eq!(decode_ifinfomsg_name(&p).unwrap(), None);
+        let p = link_payload(3, Some(b"\xff\0"), None);
+        assert_eq!(
+            decode_ifinfomsg_name(&p).unwrap_err().code(),
+            NetErrorCode::DataLoss
+        );
     }
 }
 

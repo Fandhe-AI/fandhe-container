@@ -1348,6 +1348,45 @@ jobs:
           fi
           echo "::notice::sec1_2823_overmount_hides_child_in_real_namespace verified"
 
+      # CDI createContainer フックの namespace 前提の実機前提テスト 2 件（`crates/gpu/src/cdi_apply/hooks/run.rs` の lib 内
+      # `#[ignore]` 試験。GPU-2・SEC-1・REPAIR-2・REPAIR-12・TASK-127.3・#549・#2980・#2987）。上で緩和した sysctl を使い回し、
+      # sudo・新しい check-run・permissions は増やさない。stage_recheck_fails_after_unshare_in_thread は自分では namespace を
+      # 作らないため、外側を `unshare -r -m` で包む。bundle_remove_refuses_bind_mount_boundary はその中でさらに自分を
+      # `unshare -r -m` で再実行する（入れ子の user namespace。内側の出力も同じ stdout に出る）。
+      # `--test-threads=1` は付けない（直列だと開始時の `test X ... ` に子の出力が割り込み行が割れるため。割れても (b)(c) で
+      # false-red になるだけで false-green にはならない）。`2 passed` を照合するため 1 回の起動で 2 件を実行する。
+      # 成功行（mod 内の試験なので module 接頭辞つき）は `--libtest-module` で試験ソースから導出して照合する。
+      - name: gpu cdi hooks の namespace 試験のビルド（バイナリの特定。GPU-2・SEC-1・#2987）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/gpu-lib-build.json"
+          cargo test -p fandhe-container-gpu --lib --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.kind == ["lib"]'
+          sel="${sel}"' and .target.name == "fandhe_container_gpu") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::gpu lib test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "GPU_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: gpu cdi hooks の namespace 試験の実行（実機前提テスト・--ignored。GPU-2・SEC-1・#2987）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/gpu_cdi_hooks_ns.log"
+          m='cdi_apply::hooks::run::tests'
+          unshare -r -m -- "${GPU_LIB_TEST_BIN}" --ignored --exact \
+            "${m}::stage_recheck_fails_after_unshare_in_thread" \
+            "${m}::bundle_remove_refuses_bind_mount_boundary" 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name gpu_cdi_hooks_ns \
+            --src crates/gpu/src/cdi_apply/hooks/run.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --min 2 --summary
+
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の

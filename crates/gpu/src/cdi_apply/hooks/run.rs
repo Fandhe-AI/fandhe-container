@@ -350,6 +350,20 @@ impl CdiHookWorkDir {
             path: path.to_path_buf(),
         })
     }
+
+    /// 試験専用: 祖先の所有者検査を行わずにディレクトリ fd だけで固定する。
+    ///
+    /// rootless の user namespace 内では `/` などホスト root 所有の祖先が overflow uid に見えて
+    /// [`Self::open`] が正規の経路まで拒否する（検査は namespace に入る前に行う設計。上記参照）。
+    /// namespace 内で bundle の削除経路だけを試験するために使い、製品コードからは呼ばない（GPU-2・SEC-1）。
+    #[cfg(test)]
+    fn open_unchecked_for_test(path: &Path) -> Self {
+        let fd = File::open(path).expect("open test work dir");
+        Self {
+            fd: OwnedFd::from(fd),
+            path: path.to_path_buf(),
+        }
+    }
 }
 
 /// フック 1 件分の最小 bundle（`config.json` のみ）。作成・削除は [`CdiHookWorkDir`] の fd 起点。全経路で削除する。
@@ -1949,7 +1963,8 @@ mod tests {
             return;
         }
         let t = Tmp::new("bindmnt");
-        let wd = CdiHookWorkDir::open(&t.work()).unwrap();
+        // namespace 内では祖先が overflow uid に見えるため、所有者検査つきの open は使えない。
+        let wd = CdiHookWorkDir::open_unchecked_for_test(&t.work());
         let mut b = Bundle::create(&wd, "/r").unwrap();
         let victim = t.0.join("victim");
         fs::create_dir(&victim).unwrap();

@@ -11,6 +11,7 @@
 #   check-success-lines.sh --name <test> --src <file.rs>... --log <file> --select <ERE>
 #     [--subst key=v1,v2]... [--subst-pos <v>]... [--subst-re key=<ERE>]... [--min N]
 #     [--subst-pos-re <ERE>]... [--require <fixed>]... [--libtest-ignored]
+#     [--libtest-module <mod::path>]
 #     [--forbid <fixed>]... [--summary]
 #   --select       導出元テンプレート（プレースホルダ込みのリテラル）とログの各行の両方に適用する ERE
 #   --subst        名前つきプレースホルダ {key} の置換値（複数値は直積）
@@ -23,8 +24,11 @@
 #   --require      ログに無ければ失敗する固定文字列（導出では表せない組の値・二者択一の分岐の到達の照合。--forbid の対）
 #   --libtest-ignored  各 --src の `#[ignore]` / `#[ignore = "..."]` つきトップレベル関数から libtest の成功行
 #                  `test <名前> ... ok` を導出して合併し、`test result: ok. N passed; 0 failed;` も必須にする。
-#                  `... ignored` / `... FAILED` は失敗。対象外: mod 内の試験（`test m::f` と出るため (b)(c) で検出される）・
-#                  `#[cfg_attr(.., ignore)]`。ignore 関数が 0 件なら失敗。--select は `^test [A-Za-z0-9_]+ \.\.\. ` を推奨
+#                  `... ignored` / `... FAILED` は失敗。対象外: `#[cfg_attr(.., ignore)]`。ignore 関数が 0 件なら失敗。
+#                  --select は `^test [A-Za-z0-9_]+ \.\.\. ` を推奨（--libtest-module 併用時は `^test [A-Za-z0-9_:]+ \.\.\. `）
+#   --libtest-module  mod 内の試験用に、導出する行を `test <mod::path>::<名前> ... ok` にする（#2987）。--libtest-ignored が
+#                  必須・--src は 1 件に限り、そのファイルの ignore 関数がすべて指定の module にあること（別 module のものが
+#                  あれば (b)(c) で失敗する）。値は Rust のパス（英数字・_ と ::）に限る
 #   --min          期待行の下限（既定 1。0 件は常に失敗）
 #   --forbid       ログに出たら失敗する固定文字列（ignored・not applicable 等）
 # 照合: (a) 期待行数 >= min (b) 期待行がすべてログにある (c) ログの選別行がすべて期待行 (d) forbid が無い。
@@ -34,7 +38,7 @@ set -euo pipefail
 usage() {
   echo "usage: $0 --name <test> --src <file.rs>... --log <file> --select <ERE> [--subst k=v1,v2]..." \
     "[--subst-pos v]... [--subst-pos-re ERE]... [--subst-re k=ERE]... [--min N] [--forbid str]..." \
-    "[--require str]... [--libtest-ignored] [--summary]" >&2
+    "[--require str]... [--libtest-ignored] [--libtest-module path] [--summary]" >&2
   exit 2
 }
 
@@ -47,6 +51,7 @@ srcs=()
 forbids=()
 requires=()
 libtest=0
+libmod=""
 substs=""
 subst_pos=""
 subst_re=""
@@ -61,6 +66,7 @@ while [ $# -gt 0 ]; do
     --subst-pos-re) [ $# -ge 2 ] && [ -n "$2" ] || usage; subst_pos="${subst_pos}R"$'\t'"$2"$'\n'; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; requires+=("$2"); shift 2 ;;
     --libtest-ignored) libtest=1; shift ;;
+    --libtest-module) [ $# -ge 2 ] && [ -n "$2" ] || usage; libmod="$2"; shift 2 ;;
     --subst-re) [ $# -ge 2 ] || usage; subst_re="${subst_re}$2"$'\n'; shift 2 ;;
     --min) [ $# -ge 2 ] || usage; min="$2"; shift 2 ;;
     --forbid) [ $# -ge 2 ] || usage; forbids+=("$2"); shift 2 ;;
@@ -71,6 +77,10 @@ done
 { [ -n "${name}" ] && [ -n "${log}" ] && [ -n "${select_re}" ] && [ "${#srcs[@]}" -gt 0 ]; } || usage
 case "${name}" in *[!A-Za-z0-9_]*) usage ;; esac
 case "${min}" in '' | *[!0-9]*) usage ;; esac
+if [ -n "${libmod}" ]; then
+  [ "${libtest}" -eq 1 ] && [ "${#srcs[@]}" -eq 1 ] || usage
+  printf '%s\n' "${libmod}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$' || usage
+fi
 
 fail() {
   echo "::error::${name} $*" >&2
@@ -153,7 +163,7 @@ BEGIN {
   nposv = 0
   n = split(ENVIRON["SUBSTPOS"], tmpv, "\n")
   for (i = 1; i <= n; i++) if (tmpv[i] != "") { nposv++; posk[nposv] = substr(tmpv[i], 1, 1); posv[nposv] = substr(tmpv[i], 3) }
-  libt = (ENVIRON["LIBTEST"] == "1"); pend = 0
+  libt = (ENVIRON["LIBTEST"] == "1"); libmod = ENVIRON["LIBMOD"]; pend = 0
   src = ""
   while ((getline line) > 0) src = src line "\n"
   n = length(src); i = 1
@@ -175,7 +185,7 @@ BEGIN {
       while (substr(src, j, 1) ~ /[A-Za-z0-9_]/) { fname = fname substr(src, j, 1); j++ }
       if (fname == "" || fname !~ /^[A-Za-z_][A-Za-z0-9_]*$/) die("cannot read fn name after #[ignore]")
       print "I\t" fname
-      print "L\ttest " fname " ... ok"
+      print "L\ttest " (libmod == "" ? "" : libmod "::") fname " ... ok"
       pend = 0; i = j; continue
     }
     if (c == "'") {
@@ -226,7 +236,7 @@ AWK
 
 : > "${tmp}/derived"
 for f in "${srcs[@]}"; do
-  if ! LIBTEST="${libtest}" SEL="${select_re}" SUBST="${substs}" SUBSTPOS="${subst_pos}" SUBSTRE="${subst_re}" \
+  if ! LIBTEST="${libtest}" LIBMOD="${libmod}" SEL="${select_re}" SUBST="${substs}" SUBSTPOS="${subst_pos}" SUBSTRE="${subst_re}" \
     awk -f "${tmp}/derive.awk" "${f}" >> "${tmp}/derived" 2> "${tmp}/awk.err" < /dev/null; then
     fail "could not derive expected lines from ${f}: $(tr '\n' ' ' < "${tmp}/awk.err")"
   fi

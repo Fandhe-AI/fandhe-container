@@ -32,6 +32,7 @@ pub const NLMSG_HEADER_LEN: usize = 16;
 /// rtattr ヘッダの固定長（バイト）。
 pub const ATTR_HEADER_LEN: usize = 4;
 /// メッセージ・属性の境界（`NLMSG_ALIGNTO` = `RTA_ALIGNTO`）。
+/// `libc` に `NLMSG_ALIGNTO` が無いため、同値の `NLA_ALIGNTO` と照合する（`libc_abi`。`linux/netlink.h`）。
 pub const ALIGN_TO: usize = 4;
 /// 1 メッセージの上限長。暫定値 1 MiB（spec に根拠値なし。REPAIR-3）。#843 のソケット層は受信する
 /// 1 データグラムの上限長にも同じ値を使う（`netlink_route::MAX_RECV_DATAGRAM_LEN`）。
@@ -79,9 +80,11 @@ pub const NLM_F_CAPPED: u16 = 0x100;
 /// `NLM_F_MATCH` / `NLM_F_EXCL` と同じビット値のため、`NLMSG_ERROR` に対してだけ意味を持つ（NET-11）。
 pub const NLM_F_ACK_TLVS: u16 = 0x200;
 /// 拡張 ACK 属性: 失敗理由の NUL 終端文字列（uapi `NLMSGERR_ATTR_MSG`）。
+/// （出典: `include/uapi/linux/netlink.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NLMSGERR_ATTR_MSG: u16 = 1;
 /// 拡張 ACK 属性: 問題のある属性の、元要求先頭からのバイトオフセット（`u32`。uapi
 /// `NLMSGERR_ATTR_OFFS`）。
+/// （出典: `include/uapi/linux/netlink.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NLMSGERR_ATTR_OFFS: u16 = 2;
 
 /// `rta_type` のフラグ: ネスト属性。
@@ -835,4 +838,63 @@ mod tests {
         assert_eq!(msg.attrs(5).unwrap().count(), 0);
         assert_eq!(code(&msg.attrs(6).unwrap_err()), NetErrorCode::DataLoss);
     }
+}
+
+/// netlink 共通定数・ヘッダー長の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定（uapi の値はアーキに依らないため arch の cfg は付けない）。
+/// `libc` に無い `NLMSGERR_ATTR_*` は定義の横に出典を書いた。
+///
+/// 対象外（黙って省かない）: `MAX_*` 系の上限・`MAX_ATTR_PAYLOAD_LEN`（`nla_len` が u16 であることから
+/// 導いた方針値で uapi の名前を持たない）。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+    use core::mem::size_of;
+
+    // メッセージ種別・フラグ（`linux/netlink.h`）。
+    const _: () = {
+        libc_const_eq!(NLMSG_NOOP, u16, c_int);
+        libc_const_eq!(NLMSG_ERROR, u16, c_int);
+        libc_const_eq!(NLMSG_DONE, u16, c_int);
+        libc_const_eq!(NLMSG_OVERRUN, u16, c_int);
+        libc_const_eq!(NLM_F_REQUEST, u16, c_int);
+        libc_const_eq!(NLM_F_MULTI, u16, c_int);
+        libc_const_eq!(NLM_F_ACK, u16, c_int);
+        libc_const_eq!(NLM_F_ECHO, u16, c_int);
+        libc_const_eq!(NLM_F_DUMP_INTR, u16, c_int);
+        libc_const_eq!(NLM_F_ROOT, u16, c_int);
+        libc_const_eq!(NLM_F_MATCH, u16, c_int);
+        libc_const_eq!(NLM_F_REPLACE, u16, c_int);
+        libc_const_eq!(NLM_F_EXCL, u16, c_int);
+        libc_const_eq!(NLM_F_CREATE, u16, c_int);
+        libc_const_eq!(NLM_F_APPEND, u16, c_int);
+        libc_const_eq!(NLM_F_CAPPED, u16, c_int);
+        libc_const_eq!(NLM_F_ACK_TLVS, u16, c_int);
+        libc_const_eq!(NLA_F_NESTED, u16, c_int);
+        libc_const_eq!(NLA_F_NET_BYTEORDER, u16, c_int);
+    };
+
+    // `NLA_TYPE_MASK`: C のヘッダーは `~(NLA_F_NESTED | NLA_F_NET_BYTEORDER)` を int で定義するため
+    // `libc` の値は負数（-49153）になる。`nla_type` は `__u16` なので 16 bit 幅に丸めて比べる
+    // （宣言側を直して通さない）。
+    const _: () = {
+        const OWN: u16 = super::NLA_TYPE_MASK;
+        const LIB: c_int = libc::NLA_TYPE_MASK;
+        assert!(
+            (LIB as i128) & 0xffff == OWN as i128,
+            "libc mismatch: NLA_TYPE_MASK"
+        );
+    };
+
+    // 名前が違う対応: 自前の `ALIGN_TO` は `NLMSG_ALIGNTO` / `NLA_ALIGNTO` 共通の 4。`libc` には
+    // `NLMSG_ALIGNTO` が無いため `NLA_ALIGNTO` と照合する。
+    const _: () = libc_const_eq!(super::ALIGN_TO, usize, libc::NLA_ALIGNTO, c_int);
+
+    // ヘッダー長は構造体のサイズで照合する（`nlattr` と `rtattr` はどちらも 4）。
+    const _: () = {
+        assert!(super::NLMSG_HEADER_LEN == size_of::<libc::nlmsghdr>());
+        assert!(super::ATTR_HEADER_LEN == size_of::<libc::nlattr>());
+        assert!(super::ATTR_HEADER_LEN == size_of::<libc::rtattr>());
+    };
 }

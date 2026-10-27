@@ -31,6 +31,28 @@ compile_error!(
     "the `attach-fault-test-support` feature exposes test-only fault injection and must not be enabled in release builds"
 );
 
+/// uapi 定数を `libc` と `const` 評価で照合するマクロ（Linux の試験ビルド限定。#3102・#1318・MVM-4・REPAIR-12）。
+///
+/// `crates/core/src/sys.rs` の同名マクロの複製（crate をまたいで共有できないため。方式は
+/// `docs/design/ffi-libc-check.md`）。両辺の型を引数で明記し、`libc` 側の型が将来変わったときは E0308 で
+/// 表に出る。比較は `as i128` で行い、64 bit 以下の整数同士では値を切り詰めない。食い違いは宣言を直す別
+/// issue とし、試験側を宣言に合わせて通さない。関数は呼ばず `unsafe` を使わない。各モジュールの
+/// `libc_abi`（宣言の隣）から使うため、`pub mod` 列より前に置く（`macro_rules` はテキスト順にしか見えない）。
+#[cfg(all(test, target_os = "linux"))]
+macro_rules! libc_const_eq {
+    ($name:ident, $own_ty:ty, $lib_ty:ty) => {
+        libc_const_eq!(super::$name, $own_ty, libc::$name, $lib_ty)
+    };
+    ($own:expr, $own_ty:ty, $lib:expr, $lib_ty:ty) => {{
+        const OWN: $own_ty = $own;
+        const LIB: $lib_ty = $lib;
+        assert!(
+            OWN as i128 == LIB as i128,
+            concat!("libc mismatch: ", stringify!($own))
+        );
+    }};
+}
+
 pub mod add_host_dns;
 pub mod dns_helper;
 pub mod error;

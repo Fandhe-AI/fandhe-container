@@ -7,7 +7,8 @@
 //!
 //! - 実装済みなのは `ListImages`・`ImageStatus`・`PullImage`（TASK-61.3）。`RemoveImage`・`StreamImages`・
 //!   `ImageFsInfo` は `Unimplemented` を返す。`PullImage` は [`ImagePuller`] を注入されたときだけ動き、
-//!   未設定なら従来どおり `Unimplemented`。取り込み手順と限界は [`crate::image_pull`] を参照
+//!   未設定なら従来どおり `Unimplemented`。取り込み手順と限界は [`crate::image_pull`] を参照。RPC が期限切れ・
+//!   取り消しで破棄されたときは番人が旗を立て、worker は次の確認点で止まる（#2967・REPAIR-5）
 //! - `PullImage` の `sandbox_config` は無視する（Pod 単位の pull 文脈は未対応）。同時 pull 数は
 //!   [`DEFAULT_MAX_CONCURRENT_PULLS`] で制限する（blocking プールの枯渇防止。REPAIR-5）
 //! - `ImageStatus` の `verbose` 拡張情報（`info`）は未実装で常に空。OCI image config 由来の情報は
@@ -25,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tonic::codegen::tokio_stream::Empty;
@@ -326,6 +327,29 @@ impl Drop for PullSlot {
     }
 }
 
+/// `PullImage` の future が worker の完了前に破棄されたとき、取り消しの旗を立てる番人（#2967・CRI-3・REPAIR-5）。
+///
+/// RPC スレッド（tokio）で `Drop` が走るため、atomic の store だけを行い I/O もロックも持たない。
+/// 旗は `ImagePuller::pull_cancellable` が次の確認点で読み、`Timeout` で止まる。
+struct CancelOnDrop {
+    cancel: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// `ImageService` の実装（`ListImages`・`ImageStatus`・`PullImage`。TASK-61.1・61.2・61.3）。
 pub struct CriImageService {
     store: Arc<dyn ImageStore>,
@@ -406,14 +430,23 @@ impl CriImageService {
             reference,
             credentials,
         };
-        let pulled = tokio::task::spawn_blocking(move || {
+        // RPC の future が期限切れ・取り消しで破棄されたら旗を立て、worker を次の確認点で止める（#2967・REPAIR-5）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut guard = CancelOnDrop {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+        };
+        let joined = tokio::task::spawn_blocking(move || {
             // スロットはタスクの完了（成否・panic）まで保持する。
             let _slot = slot;
-            puller.pull(&pull_request)
+            puller.pull_cancellable(&pull_request, Some(&cancel))
         })
-        .await
-        .map_err(|_| CriError::internal("image pull task failed"))?
-        .map_err(CriError::from)?;
+        .await;
+        // worker が戻ったあとは旗を立てない（成否・panic を問わない）。
+        guard.disarm();
+        let pulled = joined
+            .map_err(|_| CriError::internal("image pull task failed"))?
+            .map_err(CriError::from)?;
         let record = pulled.into_record().map_err(CriError::from)?;
         let image_ref = record.id().to_owned();
         self.store
@@ -556,6 +589,26 @@ impl ImageService for CriImageService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRI-3・REPAIR-5・#2967: 番人は armed のまま破棄されたときだけ旗を立てる。
+    #[test]
+    fn cri3_repair5_cancel_on_drop_sets_flag_only_when_armed() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(CancelOnDrop {
+            cancel: Arc::clone(&flag),
+            armed: true,
+        });
+        assert!(flag.load(Ordering::Acquire));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut g = CancelOnDrop {
+            cancel: Arc::clone(&flag),
+            armed: true,
+        };
+        g.disarm();
+        drop(g);
+        assert!(!flag.load(Ordering::Acquire));
+    }
     use crate::instrument::CriOpOutcome;
     use crate::instrument::testing::Collect;
     use tonic::Code;

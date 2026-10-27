@@ -17,7 +17,7 @@
 //!    fd 起点で開いたハンドル。リース済みの既存 blob は symlink を辿らずパスで開く。#2893）、同じハンドルで信頼条件と
 //!    digest を確かめ、同じハンドルから上限つきで読んで `rootfs.diff_ids` を解析（`read_verified_config_file`）
 //! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル。ステージングの blob は `from_file`、既存 blob は `open`）で開き直し、セッションのステージングの `unpack/` 配下の
-//!    `rootfs/` へ `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
+//!    `rootfs/` へ `extract_image_layers_bounded` で展開しながら diff_id を突合（期限と取り消しをエントリ単位で確認。#2967・#2323・OCI-1・OCI-2）
 //! 9. 展開に成功したときだけ、組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の `rename` で
 //!    `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
 //!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
@@ -81,7 +81,7 @@
 //!   開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと。tar 展開の実体は
 //!   `fandhe_container_oci::layer::extract` にあり（TASK-52.3・TASK-52.4・TASK-53）、本モジュールは oci の契約を満たす
 //!   入口 `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめた値）と
-//!   `extract_image_layers_with_options` だけを使う（#2309・#2323）。パスを受け取って開き直す旧入口
+//!   `extract_image_layers_bounded` だけを使う（#2309・#2323・#2967）。パスを受け取って開き直す旧入口
 //!   （`extract_layer_blob` / `extract_layer_blobs` 系）は、最終要素の symlink を辿り所有者・権限・ハードリンク数も
 //!   確かめないため #2535 で oci から廃止した
 //! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::open`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
@@ -113,16 +113,18 @@
 //!     （`docs/design/pull-inventory-wiring.md`）。本番の値が `Keep` + `Strip` の間は写像が空で効かず、
 //!     `ChownMapped` 等の配線時に start 側の写像との照合を足す（#2592・#2377・#2241・#482）
 //!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
-//!   - 展開中の処理は gRPC のキャンセルで打ち切れず、期限（[`PullConfig::pull_deadline`]）は展開の前後で確認する。
-//!     展開中は外部の応答を待たず（検証済みのローカル blob だけを読む）、所要時間は `ExtractLimits` と
-//!     `max_uncompressed_layer_bytes` で有界になる。展開の直後に期限を超えていれば公開も記録の書き込みもせず
-//!     `Timeout` を返す（ステージングは `abort` が消す。#2534・REPAIR-5）。展開中に打ち切る協調キャンセルが要る場合は
-//!     oci の展開 API の変更として別に扱う
+//!   - 展開は `extract_image_layers_bounded` で、期限（[`PullConfig::pull_deadline`] の絶対時刻を pull 全体で共有）と
+//!     取り消しの旗をエントリ単位で確認する。期限超過・取り消しは `Timeout`（gRPC `DEADLINE_EXCEEDED`）で止まり、
+//!     ステージング（展開途中の rootfs を含む）は `abort` が消し、在庫・リースは残らない（#2967・REPAIR-5）。
+//!     分割できない区間（1 エントリの書き込み・blob 1 本の取得と sha256 検証）は打ち切れない。設計と残余は
+//!     `docs/design/container-log-removal-wait.md`
 //! - 永続イメージストアと展開後サイズの算出は TASK-183（OCI-7。展開後サイズは #2222）の担当。本モジュールが返す
 //!   `size` は config と全 layer の**圧縮サイズの合計**で、展開後サイズではない
 //! - `AuthConfig.identity_token`（OAuth2）・`registry_token` は未対応で `UNIMPLEMENTED`（oci の OAuth2 POST フロー待ち。OCI-3）
-//! - 実行中の blocking 処理は gRPC 側のキャンセルでは打ち切れず、[`PullConfig::pull_deadline`] のステップ間確認と
-//!   oci の各リクエスト期限で有界化される。全体 timeout は plugin-cri（TASK-108・TASK-114）の責務
+//! - 実行中の blocking 処理は、RPC の期限切れ・future の破棄で `CriImageService::pull` の番人が立てる旗
+//!   （[`ImagePuller::pull_cancellable`]）と [`PullConfig::pull_deadline`] を、次の確認点（ステップ間・層ごと・
+//!   展開のエントリごと）で確かめて止まる。確認点の間は oci の各リクエスト期限で有界化される。
+//!   全体 timeout は plugin-cri（TASK-108・TASK-114）の責務（#2967）
 //! - UDS の権限・peer credential 検証（PLUG-12）は plugin-cri の責務
 
 use std::collections::BTreeMap;
@@ -131,6 +133,7 @@ use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 #[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -146,7 +149,7 @@ use fandhe_container_oci::image_management::{
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
-    ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_with_options,
+    ExtractBudget, ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_bounded,
     image_layers_from, remove_extracted_tree,
 };
 use fandhe_container_oci::layer::{
@@ -345,6 +348,20 @@ impl PulledImage {
 pub trait ImagePuller: Send + Sync {
     /// 参照を解決してローカルキャッシュへ取り込む。
     fn pull(&self, request: &PullRequest) -> Result<PulledImage, PullError>;
+
+    /// [`ImagePuller::pull`] に取り消しの旗を足した版（REPAIR-5・CRI-3・#2967）。
+    ///
+    /// `CriImageService::pull` の RPC が期限切れか future の破棄で手放されたとき、番人が旗を立てる。実装は
+    /// 次の確認点で `Timeout` を返して止まること。既定の実装は旗を無視して `pull` を呼ぶ（旗を扱えない
+    /// 偽の puller 用。`ImageRootfsSource::prepare_cancellable` と同じ形）。
+    fn pull_cancellable(
+        &self,
+        request: &PullRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PulledImage, PullError> {
+        let _ = cancel;
+        self.pull(request)
+    }
 }
 
 /// `fetch_manifest` の結果（oci の `ResolvedManifest` は `non_exhaustive` で外から作れないため、境界用に写す）。
@@ -511,8 +528,8 @@ pub struct PullConfig {
     pub max_image_bytes: u64,
     /// config blob の上限。
     pub max_config_bytes: u64,
-    /// pull 全体の期限（ステップ間と、展開の前後で確認し、超過なら `Timeout`。展開中は打ち切らず、`extract_limits` で
-    /// 有界にする。#2534・REPAIR-5）。
+    /// pull 全体の期限（ステップ間・層ごとに確認し、超過なら `Timeout`。展開へは残り時間を同じ絶対期限として渡し、
+    /// エントリ単位で確認する。#2967・#2534・REPAIR-5）。
     pub pull_deadline: Duration,
     /// 資格情報を送ってよい token realm の追加ホスト（既定は空。接続先と同一ホスト・oci の組み込み既知対は常に許可）。
     pub trusted_realm_hosts: Vec<RegistryHost>,
@@ -584,16 +601,6 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .map_err(|e| PullError::from_oci(&e))
     }
 
-    fn check_deadline(&self, started: Instant) -> Result<(), PullError> {
-        if started.elapsed() >= self.config.pull_deadline {
-            return Err(PullError::new(
-                OciErrorCode::Timeout,
-                "image pull exceeded its deadline",
-            ));
-        }
-        Ok(())
-    }
-
     /// `blobs/sha256` を作る（Unix では 0700）。
     fn blobs_dir(&self) -> Result<TrustedDir, PullError> {
         prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
@@ -625,7 +632,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         blob_owner: u32,
         manifest: &ImageManifest,
         rootfs_cfg: &ImageRootFs,
-        started: Instant,
+        budget: &PullBudget<'_>,
     ) -> Result<(), PullError> {
         let rootfs_dir = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
         let entry_path = rootfs_dir.path.join(digest_hex(&manifest.config.digest));
@@ -653,6 +660,8 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .layers
             .iter()
             .map(|d| {
+                // sha256 の検証が大きさに比例するため、層ごとに確かめる（#2967・#2821 と同じ考え方）。
+                budget.check()?;
                 let source = paths.get(&d.digest).ok_or_else(|| {
                     PullError::new(OciErrorCode::Internal, "image layer blob path is missing")
                 })?;
@@ -688,17 +697,25 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         create_private_dir(&staged_entry)?;
         let root = staged_entry.join(ROOTFS_SUBDIR);
         create_private_dir(&root)?;
-        self.check_deadline(started)?;
-        extract_image_layers_with_options(
+        budget.check()?;
+        // 期限は pull 全体の残り時間を同じ絶対時刻で渡し、取り消しの旗と合わせてエントリ単位で確かめる（#2967）。
+        extract_image_layers_bounded(
             self.recorder.as_ref(),
             &layers,
             &root,
             self.config.max_uncompressed_layer_bytes,
             self.config.extract_limits,
             &self.config.extract_options,
+            &budget.extract_budget(),
         )
-        .map_err(|e| PullError::from_extract(&e))?;
-        self.check_deadline(started)?;
+        .map_err(|e| {
+            if e.code() == OciErrorCode::Timeout {
+                budget.timeout_error()
+            } else {
+                PullError::from_extract(&e)
+            }
+        })?;
+        budget.check()?;
         if verify_only {
             return Ok(());
         }
@@ -758,6 +775,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         session: &mut PullSession<'_>,
         blob_owner: u32,
         descriptor: &Descriptor,
+        budget: &PullBudget<'_>,
     ) -> Result<BlobSource, PullError> {
         if let BlobReuse::Leased(token) = session
             .lease_existing_blob(&descriptor.digest)
@@ -777,6 +795,8 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // 取得が PermissionDenied なら有限回（MAX_REAUTH_RETRIES）だけ再認証して再試行する（OCI-3）。
         let mut retries = 0u32;
         loop {
+            // 取り消し・期限切れの後に再取得しない（#2967・REPAIR-5）。
+            budget.check()?;
             if matches!(&*auth, RegistryAuth::Bearer(t) if t.is_expired(Instant::now())) {
                 *auth = self.reauthenticate(request)?;
             }
@@ -832,7 +852,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         auth: &mut RegistryAuth,
         blobs: &TrustedDir,
         manifest: &ImageManifest,
-        started: Instant,
+        budget: &PullBudget<'_>,
     ) -> Result<ManifestComposition, PullError> {
         // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
         // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
@@ -848,13 +868,13 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 }
                 continue;
             }
-            self.check_deadline(started)?;
-            let path = self.ensure_blob(ctx, auth, session, blobs.owner, descriptor)?;
+            budget.check()?;
+            let path = self.ensure_blob(ctx, auth, session, blobs.owner, descriptor, budget)?;
             paths.insert(descriptor.digest.clone(), path);
             seen.push((&descriptor.digest, descriptor.size));
         }
         // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
-        self.check_deadline(started)?;
+        budget.check()?;
 
         // config を検証してから解析し、検証済みハンドルでレイヤーを展開する（#2323・OCI-1・OCI-2）。
         let config_source = paths.get(&manifest.config.digest).ok_or_else(|| {
@@ -879,13 +899,77 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 self.config.max_config_bytes,
             )?,
         };
-        self.ensure_rootfs(session, &paths, blobs.owner, manifest, &rootfs_cfg, started)?;
-        self.check_deadline(started)?;
+        self.ensure_rootfs(session, &paths, blobs.owner, manifest, &rootfs_cfg, budget)?;
+        budget.check()?;
         ManifestComposition::new(
             manifest.config.digest.clone(),
             manifest.layers.iter().map(|d| d.digest.clone()).collect(),
         )
         .map_err(|e| PullError::from_oci(&e))
+    }
+}
+
+/// 1 回の pull の期限と取り消しをまとめた予算（REPAIR-5・CRI-3・#2967）。
+///
+/// `OciImagePuller::pull_inner` が作り、blob 取得・検証・展開の各確認点へ渡す。期限は pull の開始から
+/// `pull_deadline` の絶対時刻 1 つで、展開（`ExtractBudget`）へも同じ時刻を渡す（展開に別の予算を持たせない）。
+/// 取り消しの旗は `CriImageService::pull` の番人が RPC の破棄時に立てる。どちらも `Timeout` になり gRPC では
+/// `DEADLINE_EXCEEDED`。文言は固定の英語でイメージ名等を含めない（ERR-3）。
+struct PullBudget<'a> {
+    deadline: Option<Instant>,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl<'a> PullBudget<'a> {
+    fn new(pull_deadline: Duration, cancel: Option<&'a AtomicBool>) -> Self {
+        Self {
+            // あふれたときは期限なし（`image_rootfs.rs` と同じ扱い）。
+            deadline: Instant::now().checked_add(pull_deadline),
+            cancel,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// 取り消し、次に期限超過を確かめる。
+    fn check(&self) -> Result<(), PullError> {
+        if self.cancelled() {
+            return Err(PullError::new(
+                OciErrorCode::Timeout,
+                "image pull was cancelled",
+            ));
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(PullError::new(
+                OciErrorCode::Timeout,
+                "image pull exceeded its deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 展開へ渡す予算（期限は共有、取り消しも同じ旗）。
+    fn extract_budget(&self) -> ExtractBudget<'a> {
+        let mut b = ExtractBudget::new();
+        if let Some(d) = self.deadline {
+            b = b.with_deadline(d);
+        }
+        if let Some(c) = self.cancel {
+            b = b.with_cancel(c);
+        }
+        b
+    }
+
+    /// 展開が `Timeout` を返したときの写像（旗の状態で 2 つの文言のどちらかにそろえる）。
+    fn timeout_error(&self) -> PullError {
+        if self.cancelled() {
+            PullError::new(OciErrorCode::Timeout, "image pull was cancelled")
+        } else {
+            PullError::new(OciErrorCode::Timeout, "image pull exceeded its deadline")
+        }
     }
 }
 
@@ -911,7 +995,28 @@ const MAX_REAUTH_RETRIES: u32 = 2;
 
 impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
     fn pull(&self, request: &PullRequest) -> Result<PulledImage, PullError> {
-        let started = Instant::now();
+        self.pull_inner(request, None)
+    }
+
+    fn pull_cancellable(
+        &self,
+        request: &PullRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PulledImage, PullError> {
+        self.pull_inner(request, cancel)
+    }
+}
+
+impl<C: RegistryPullClient> OciImagePuller<C> {
+    /// `pull` / `pull_cancellable` の本体。期限（`pull_deadline`）と取り消しは `PullBudget` が一括で確かめる。
+    fn pull_inner(
+        &self,
+        request: &PullRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PulledImage, PullError> {
+        let budget = PullBudget::new(self.config.pull_deadline, cancel);
+        // すでに取り消されていれば外部へ通信しない。
+        budget.check()?;
         let image_ref =
             ImageReference::parse(&request.reference).map_err(|e| PullError::from_oci(&e))?;
         let endpoint = RegistryEndpoint::new(image_ref.registry().clone());
@@ -926,7 +1031,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
                 &self.config.trusted_realm_hosts,
             )
             .map_err(|e| PullError::from_oci(&e))?;
-        self.check_deadline(started)?;
+        budget.check()?;
 
         let resolved = self
             .client
@@ -938,7 +1043,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
                 &self.config.platform,
             )
             .map_err(|e| PullError::from_oci(&e))?;
-        self.check_deadline(started)?;
+        budget.check()?;
 
         // 通信前に descriptor の宣言サイズで上限を検証する（無制限確保・巨大転送の防止）。
         let manifest = &resolved.manifest;
@@ -984,7 +1089,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             credentials: request.credentials.as_ref(),
         };
         let prepared =
-            self.stage_and_unpack(&mut session, &ctx, &mut auth, &blobs, manifest, started);
+            self.stage_and_unpack(&mut session, &ctx, &mut auth, &blobs, manifest, &budget);
         // 展開の作業領域は `staging/<id>` を消さずに自分の子だけ消す（`staging/<id>` を消してよいのは
         // `abort` / `publish` / 回収 GC だけ。永続化済みのリースだけが残る孤児リースを作らないため）。
         // 検証だけの経路や失敗経路に残る展開物は 0555 等を含むため、oci の削除で消す。
@@ -992,7 +1097,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
         if fs::symlink_metadata(&unpack_dir).is_ok() {
             let _ = remove_extracted_tree(&unpack_dir);
         }
-        let composition = match prepared.and_then(|c| self.check_deadline(started).map(|()| c)) {
+        let composition = match prepared.and_then(|c| budget.check().map(|()| c)) {
             Ok(c) => c,
             Err(e) => {
                 // abort の失敗は元のエラーを優先する（残骸は回収 GC が拾う）。
@@ -1806,6 +1911,36 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// CRI-3・REPAIR-5・#2967: `PullBudget` は取り消し、期限超過の順に固定の文言で `Timeout` を返す。
+    #[test]
+    fn cri3_repair5_pull_budget_checks_cancel_then_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        let b = super::PullBudget::new(Duration::from_secs(3600), Some(&flag));
+        assert!(b.check().is_ok());
+        flag.store(true, Ordering::Release);
+        let e = b.check().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "image pull was cancelled");
+        assert_eq!(b.timeout_error().message(), "image pull was cancelled");
+
+        let expired = super::PullBudget::new(Duration::ZERO, None);
+        let e = expired.check().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "image pull exceeded its deadline");
+        assert_eq!(
+            expired.timeout_error().message(),
+            "image pull exceeded its deadline"
+        );
+    }
+
+    /// REPAIR-5: 期限の加算があふれたときは期限なし（取り消しだけが効く）。
+    #[test]
+    fn cri3_repair5_pull_budget_overflow_means_no_deadline() {
+        let b = super::PullBudget::new(Duration::MAX, None);
+        assert!(b.check().is_ok());
+    }
+
     use super::*;
 
     /// CRI-3・OCI-1: HTTP 状態を運ぶのは `from_oci` だけで、範囲外（100..=599 の外）は捨てる。

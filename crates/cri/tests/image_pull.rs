@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -187,6 +187,8 @@ struct FakeClient {
     staged_symlink_target: Option<(PathBuf, PathBuf)>,
     /// 指定すると、最初の取得だけ本文の一部を書いてから PermissionDenied を返す（部分書きの後の再認証・再試行の模擬）。
     partial_then_denied: AtomicUsize,
+    /// 指定すると、最初の blob 取得でこの旗を立てる（取得中に RPC が取り消された模擬。#2967）。
+    cancel_on_fetch: Option<Arc<AtomicBool>>,
 }
 
 impl FakeClient {
@@ -206,6 +208,7 @@ impl FakeClient {
             auth_calls: AtomicUsize::new(0),
             staged_symlink_target: None,
             partial_then_denied: AtomicUsize::new(0),
+            cancel_on_fetch: None,
         }
     }
 }
@@ -266,6 +269,9 @@ impl RegistryPullClient for FakeClient {
         dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
+        if let Some(flag) = &self.cancel_on_fetch {
+            flag.store(true, Ordering::Release);
+        }
         if self.deny_blob_fetches.load(Ordering::SeqCst) > 0 {
             self.deny_blob_fetches.fetch_sub(1, Ordering::SeqCst);
             return Err(OciError::new(
@@ -1741,8 +1747,8 @@ fn oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs() {
     assert_eq!(fs::read(&marker).expect("kept"), b"m");
 }
 
-/// OCI-1・REPAIR-5・#2534: 展開中に期限を過ぎたら、展開の直後の確認で `Timeout` にし、公開も記録の書き込みもしない
-/// （展開中の打ち切りは行わず、上限で有界にして前後で確認する方針）。
+/// OCI-1・REPAIR-5・#2534・#2967: 展開中に期限を過ぎたら、エントリ単位の確認で `Timeout` にし、公開も記録の書き込みもしない
+/// （期限は pull 全体で共有し、展開へ絶対時刻として渡す）。
 #[test]
 fn oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published() {
     use fandhe_container_oci::instrument::{OciOpKind, OciOpRecorder, OciOpSample};
@@ -1762,6 +1768,234 @@ fn oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published() {
         .with_recorder(Arc::new(SlowExtract));
     let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
     assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(err.message(), "image pull exceeded its deadline");
     assert!(!rootfs_exists(&dir, SHA_CONFIG));
     assert!(staging_is_empty(&dir));
+}
+
+/// 取り消し・期限切れの後に在庫とリースが残らないこと（#2967）。
+fn assert_no_inventory(dir: &TempDir) {
+    use fandhe_container_oci::image_management::ImageStore;
+    let cache = dir.0.join("cache");
+    let store = ImageStore::open(&cache).expect("open");
+    let guard = store.lock().expect("lock");
+    assert_eq!(guard.list_images(&cache).expect("list").entries.len(), 0);
+    for hex in [SHA_CONFIG, SHA_LAYER1, SHA_LAYER2] {
+        let d = Digest::parse(&format!("sha256:{hex}")).expect("digest");
+        assert_eq!(guard.blob_references(&d).leases, Vec::new(), "lease {hex}");
+    }
+}
+
+/// 成功した `ExtractLayer` の標本ごとに `on_extract` を呼び、件数を数える偽の recorder。
+struct ExtractProbe {
+    extracted: AtomicUsize,
+    on_extract: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for ExtractProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExtractProbe")
+    }
+}
+
+impl fandhe_container_oci::instrument::OciOpRecorder for ExtractProbe {
+    fn record_oci_op(&self, sample: &fandhe_container_oci::instrument::OciOpSample) {
+        use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome};
+        // 打ち切られた層も失敗の標本として記録される。数えるのは成功した展開だけ。
+        if sample.kind() == OciOpKind::ExtractLayer && sample.outcome() == OciOpOutcome::Success {
+            self.extracted.fetch_add(1, Ordering::SeqCst);
+            (self.on_extract)();
+        }
+    }
+}
+
+/// CRI-3・REPAIR-5・#2967: 展開中に取り消されたら次のエントリ境界で `Timeout`（`DEADLINE_EXCEEDED`）で止まり、
+/// 2 層目は展開されず、rootfs・ステージング・在庫・リースを残さない。
+#[test]
+fn cri3_repair5_pull_cancel_during_extraction_leaves_no_rootfs_or_inventory() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f2 = Arc::clone(&flag);
+    let probe = Arc::new(ExtractProbe {
+        extracted: AtomicUsize::new(0),
+        on_extract: Box::new(move || f2.store(true, Ordering::Release)),
+    });
+    let dir = TempDir::new("cancel-extract");
+    let puller = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    )
+    .with_recorder(probe.clone());
+    let err = puller
+        .pull_cancellable(&req("alpine:3.20"), Some(&flag))
+        .expect_err("cancelled");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(err.message(), "image pull was cancelled");
+    assert_eq!(tonic::Status::from(err).code(), Code::DeadlineExceeded);
+    assert_eq!(probe.extracted.load(Ordering::SeqCst), 1);
+    assert!(!rootfs_exists(&dir, SHA_CONFIG));
+    assert!(staging_is_empty(&dir));
+    assert_no_inventory(&dir);
+}
+
+/// CRI-3・REPAIR-5・#2967: blob の取得中に取り消されたら次の blob を取りに行かず、展開にも進まない。
+#[test]
+fn cri3_repair5_pull_cancel_during_fetch_does_not_advance() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut client = FakeClient::new(two_layer_manifest());
+    client.cancel_on_fetch = Some(Arc::clone(&flag));
+    let client = Arc::new(client);
+    let probe = Arc::new(ExtractProbe {
+        extracted: AtomicUsize::new(0),
+        on_extract: Box::new(|| {}),
+    });
+    let dir = TempDir::new("cancel-fetch");
+    let puller =
+        OciImagePuller::new(Arc::clone(&client), config(&dir)).with_recorder(probe.clone());
+    let err = puller
+        .pull_cancellable(&req("alpine:3.20"), Some(&flag))
+        .expect_err("cancelled");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(err.message(), "image pull was cancelled");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.extracted.load(Ordering::SeqCst), 0);
+    assert!(staging_is_empty(&dir));
+    assert!(!blob_path(&dir, SHA_CONFIG).exists());
+    assert_no_inventory(&dir);
+}
+
+/// CRI-3・REPAIR-5・#2967: 開始前に取り消されていれば、レジストリへ通信しない。
+#[test]
+fn cri3_repair5_pull_cancelled_before_start_does_not_contact_registry() {
+    let flag = AtomicBool::new(true);
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let dir = TempDir::new("cancel-start");
+    let puller = OciImagePuller::new(Arc::clone(&client), config(&dir));
+    let err = puller
+        .pull_cancellable(&req("alpine:3.20"), Some(&flag))
+        .expect_err("cancelled");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(client.auth_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+}
+
+/// CRI-3・REPAIR-5・#2967: 展開の期限は pull 全体の期限と共有する（取得で使った残りだけが展開に渡る）。
+/// 3 blob の取得で約 1.5 秒を使い、最初の層の展開後の 700ms の待ちで 2 秒を超えるため、2 層目は展開されない
+/// （展開に別の予算があれば 2 層とも通る値の組）。
+#[test]
+fn cri3_repair5_extraction_shares_the_pull_deadline() {
+    let mut client = FakeClient::new(two_layer_manifest());
+    client.blob_delay = Duration::from_millis(500);
+    let probe = Arc::new(ExtractProbe {
+        extracted: AtomicUsize::new(0),
+        on_extract: Box::new(|| std::thread::sleep(Duration::from_millis(700))),
+    });
+    let dir = TempDir::new("share-deadline");
+    let mut cfg = config(&dir);
+    cfg.pull_deadline = Duration::from_secs(2);
+    let puller = OciImagePuller::new(Arc::new(client), cfg).with_recorder(probe.clone());
+    let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(err.message(), "image pull exceeded its deadline");
+    assert_eq!(probe.extracted.load(Ordering::SeqCst), 1);
+    assert!(!rootfs_exists(&dir, SHA_CONFIG));
+    assert!(staging_is_empty(&dir));
+    assert_no_inventory(&dir);
+}
+
+/// 旗を観測して返す puller（RPC の破棄で worker に旗が届くことの検証用）。
+struct FlagWatcher {
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    observed: Mutex<std::sync::mpsc::Sender<bool>>,
+    calls: AtomicUsize,
+}
+
+impl ImagePuller for FlagWatcher {
+    fn pull(&self, _r: &PullRequest) -> Result<PulledImage, PullError> {
+        unreachable!("the service must call pull_cancellable")
+    }
+
+    fn pull_cancellable(
+        &self,
+        _r: &PullRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<PulledImage, PullError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(PulledImage {
+                id: "sha256:aa".into(),
+                repo_tags: vec![],
+                repo_digests: vec![],
+                size: 1,
+            });
+        }
+        let _ = self.entered.lock().expect("lock").send(());
+        let start = std::time::Instant::now();
+        let mut seen = false;
+        while start.elapsed() < Duration::from_secs(10) {
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = self.observed.lock().expect("lock").send(seen);
+        Err(PullError::new(
+            OciErrorCode::Timeout,
+            "image pull was cancelled",
+        ))
+    }
+}
+
+/// CRI-3・REPAIR-5・#2967: RPC の future が破棄されたら worker の旗が立ち、worker が止まって同時 pull の枠が戻る。
+#[tokio::test]
+async fn cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let puller = Arc::new(FlagWatcher {
+        entered: Mutex::new(entered_tx),
+        observed: Mutex::new(observed_tx),
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(InMemoryImageStore::new());
+    let svc = Arc::new(
+        CriImageService::with_store(store.clone())
+            .with_puller(puller)
+            .with_max_concurrent_pulls(1),
+    );
+    let first = {
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            ImageService::pull_image(svc.as_ref(), Request::new(pull_req("alpine"))).await
+        })
+    };
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("join")
+        .expect("pull started");
+    // RPC の future を破棄する（kubelet の取り消し・タイムアウトの模擬）。
+    first.abort();
+    let _ = first.await;
+    let seen =
+        tokio::task::spawn_blocking(move || observed_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("worker returned");
+    assert!(seen, "worker must observe the cancel flag");
+    assert_eq!(store.list().expect("list").len(), 0);
+    // worker が戻れば枠が解放される（戻る直前の短い窓があるため、少し待って取り直す）。
+    let mut result = None;
+    for _ in 0..200 {
+        let r = ImageService::pull_image(svc.as_ref(), Request::new(pull_req("busybox"))).await;
+        match r {
+            Err(e) if e.code() == Code::ResourceExhausted => {
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(25)))
+                    .await
+                    .expect("join");
+            }
+            other => {
+                result = Some(other);
+                break;
+            }
+        }
+    }
+    result.expect("slot released").expect("second pull ok");
 }

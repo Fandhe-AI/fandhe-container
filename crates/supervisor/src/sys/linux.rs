@@ -183,6 +183,7 @@ fn check_cap_number(cap: u8) -> io::Result<()> {
     Ok(())
 }
 
+/// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
 pub(crate) fn cap_bounding_drop(cap: u8) -> io::Result<()> {
     check_cap_number(cap)?;
     // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
@@ -392,7 +393,6 @@ mod syscall_ffi {
         check(rc).map(|_| ())
     }
 
-    /// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
     /// 検証済みの実行ファイルの fd を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する（SUP-14・TASK-171 追補・#1719）。
     ///
     /// パス文字列で検証して別途パスで exec する方式の TOCTOU を避けるため、呼び出し元が `fstat` で検証した fd をそのまま

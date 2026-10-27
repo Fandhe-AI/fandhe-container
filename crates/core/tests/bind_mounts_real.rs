@@ -482,6 +482,14 @@ mod linux {
                 "the temp directory is on overlayfs; every bind source would be rejected. \
                  Point TMPDIR at a non-overlay filesystem (e.g. a tmpfs)"
             );
+            // bind はソースのマウントフラグを複製して noexec を外せないため、noexec の TMPDIR では
+            // 成功経路の /data 等が "specify noexec" で失敗し exec の判別に届かない。fail-closed にする。
+            assert!(
+                !e.has_opt("noexec"),
+                "the temp directory is on a noexec filesystem ({}); bind sources inherit noexec and \
+                 the exec checks cannot run. Point TMPDIR at an exec-capable filesystem",
+                e.point
+            );
         }
         assert!(
             host_entries.iter().any(|e| e.point.starts_with("/dev/")),

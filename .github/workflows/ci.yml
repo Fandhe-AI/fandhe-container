@@ -76,12 +76,25 @@ on:
       repeat-test-bin:
         description: >-
           繰り返す harness = false の結合試験の名前（[[test]] の name。例 exec_seccomp_listener）。
-          repeat-test と排他で、repeat-success-line が必須（REPAIR-12・#2660）
+          repeat-test と排他で、repeat-success-line か repeat-libtest-name のどちらか一方が必須（REPAIR-12・#2660・#2962）
         type: string
         default: ''
       repeat-success-line:
         description: >-
-          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）
+          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）。
+          harness = false の試験用で、repeat-libtest-name と排他
+        type: string
+        default: ''
+      repeat-libtest-name:
+        description: >-
+          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（libtest の --logfile の `ok <名前>` 行で判定し、
+          並列出力の行の割り込みを受けない。repeat-success-line と排他。REPAIR-12・#2962）
+        type: string
+        default: ''
+      repeat-forbidden-line:
+        description: >-
+          出たら失敗にする固定文字列（`|` 区切り・8 個以下・部分一致）。成功行が出ていても当たった回は失敗に数える
+          （REPAIR-12・#2962）
         type: string
         default: ''
       repeat-test-ignored:
@@ -592,6 +605,8 @@ jobs:
           TEST: ${{ inputs.repeat-test }}
           TEST_BIN: ${{ inputs.repeat-test-bin }}
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
+          FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
@@ -1428,6 +1443,8 @@ jobs:
           PACKAGE: ${{ inputs.repeat-package }}
           TEST_BIN: ${{ inputs.repeat-test-bin }}
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
+          FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}

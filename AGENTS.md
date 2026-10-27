@@ -582,6 +582,12 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml --test real_machine_capset_log -- --ignored
   ```
 
+- CDI `deviceNodes` の mknod の root 前提試験（GPU-2・TASK-127.1・#547。`crates/gpu/tests/cdi_device_nodes_root.rs` の `gpu2_root_mknod_preserves_major_minor`）: `CAP_MKNOD`（root）を要し、`/dev/null` の path だけの指定が 1:3、明示指定の c 195:0 と b 7:0 が指定どおりの major / minor で作られ、ホストの `st_rdev` と一致することを照合する。非特権で動く場面（FIFO・whiteout・symlink 拒否・後始末・chown）は `crates/gpu/tests/cdi_device_nodes.rs` が既定集合で実行する。CI の `platform-ci` は root の分岐を回さず、実機の実行は人間担当（#1621 と同じ扱い）:
+
+  ```bash
+  sudo -E cargo test -p fandhe-container-gpu --test cdi_device_nodes_root -- --ignored
+  ```
+
 ### ライセンス検査
 
 ```bash

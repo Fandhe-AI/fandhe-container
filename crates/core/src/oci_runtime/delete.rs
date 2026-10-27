@@ -117,6 +117,23 @@
 //! 回さず、そのエラーを返す（壊れた環境で記録の経路を使わない安全側の判断。#2133 で再検討し維持した。
 //! 理由と回避策は CLI の `stop_delete` の module doc）。
 //!
+//! # 待ちの上限（REPAIR-5・CRI-2・#3027）
+//!
+//! 成功の経路で `delete` が待つ箇所は次のとおりで、どれも定数で有界である（I/O 自体の時間は別）。数え方の規則は
+//! 「`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT`（5 秒）を 1 回」。
+//!
+//! | 段 | 待ち | 上限 |
+//! | -- | ---- | ---- |
+//! | `StateStore::get`（手順 2） | プロセス内ゲートと `@lock` の flock | 5 秒 |
+//! | `ContainerCgroupRemover::scope` | `/proc/self/cgroup` の読み取りのみ | 待ちなし |
+//! | `StateStore::get`（cgroup の配置が記録されているときの revision の再確認） | 同上 | 5 秒 |
+//! | cgroup の削除 | 残った `exec-*` の掃除全体で 1 つの期限（`EXEC_SWEEP_DELETE_TIMEOUT`）と rmdir | 5 秒 |
+//! | `StateStore::delete`（手順 5） | 同上 | 5 秒 |
+//!
+//! 合計は 3 × `STATE_LOCK_TIMEOUT` + `EXEC_SWEEP_DELETE_TIMEOUT` = 20 秒。`BundleLock` は `LOCK_NB` で待たない。
+//! revision 不一致の再試行の `get` は `Err` で終わる経路にだけ足される。呼び出し元の plugin-cri はこの値を
+//! `PLUGIN_RUNTIME_TIMEOUT` の内訳に使う（`docs/design/container-log-removal-wait.md`）。
+//!
 //! # 削除・再作成との競合（OCI-6・CORE-2）
 //!
 //! cgroup の削除は名前指定（`unlinkat`）で、`StateStore` の楽観的排他とは原子的に組み合わせられない。
@@ -1047,6 +1064,23 @@ mod tests {
         let rec = store.get(&GetStateRequest::new(cid("c1"))).expect("kept");
         assert_eq!(rec.status(), &recreated);
         assert_eq!(rec.revision(), StateRevision::from_raw(2));
+    }
+
+    /// REPAIR-5・#3027: 成功の経路の `StateStore` の呼び出しは、cgroup の配置が記録されていれば get 2 回、無ければ 1 回で、
+    /// どちらも delete は 1 回。module doc「待ちの上限」の 3 回（get 2 + delete 1）という数え方の根拠。
+    #[test]
+    fn repair5_3027_delete_store_calls_are_bounded() {
+        let with_scope =
+            MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecordingRemover::removed();
+        run_with(&with_scope, &remover, "c1", false).expect("delete");
+        assert_eq!(*with_scope.gets.lock().expect("lock"), 2);
+        assert!(!with_scope.has("c1"));
+
+        let without = MemStateStore::with(ContainerStatus::stopped(cid("c2"), Some(0)));
+        run_with(&without, &RecordingRemover::removed(), "c2", false).expect("delete");
+        assert_eq!(*without.gets.lock().expect("lock"), 1);
+        assert!(!without.has("c2"));
     }
 
     /// OCI-6・CORE-3（AC2）: Stopped は cgroup 削除がちょうど 1 回、正しい ID で呼ばれ、レコードも消える。

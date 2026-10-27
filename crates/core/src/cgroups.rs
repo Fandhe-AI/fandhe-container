@@ -153,9 +153,10 @@ mod exec_join;
 mod exec_kill;
 mod recorded_scope;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+pub use exec_kill::EXEC_SWEEP_DELETE_TIMEOUT;
 pub(crate) use exec_kill::{
-    EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
-    remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
+    ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode, remove_exec_child_cgroup_at,
+    sweep_exec_children_at, validate_exec_child_name,
 };
 pub use recorded_scope::{
     RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,

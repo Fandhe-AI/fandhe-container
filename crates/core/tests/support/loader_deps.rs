@@ -15,7 +15,6 @@
 //! # 置き場所の判断
 //! crate をまたぐ共有は `#[path]` で行う（前例は `scratch_root.rs`）。試験用の補助 crate は、workspace メンバーの追加と
 //! 各 crate の dev-dependencies の追加が要り、依存を増やさない方針に反するため採らない。
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +79,8 @@ pub fn libraries_from_maps(maps: &str, exe: &Path) -> Vec<PathBuf> {
 }
 
 /// 自プロセスに読み込み済みの共有ライブラリの実パス（`/proc/self/maps` から。重複なし）。
+// benches の startup_latency/bundle.rs はこの関数を使わない取り込み元のため、そこでの未使用警告だけを抑える。
+#[allow(dead_code)]
 pub fn loaded_libraries(exe: &Path) -> std::io::Result<Vec<PathBuf>> {
     let maps = std::fs::read_to_string("/proc/self/maps")?;
     Ok(libraries_from_maps(&maps, exe))

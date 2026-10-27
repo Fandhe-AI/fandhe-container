@@ -19,7 +19,6 @@
 //! # 置き場所の判断
 //! crate をまたぐ共有は `#[path]`（前例は `scratch_root.rs`）。補助 crate は workspace メンバーと dev-dependencies の
 //! 追加が要るため採らない。std のみに依存し、`fandhe_container_core` は use しない。
-#![allow(dead_code)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;

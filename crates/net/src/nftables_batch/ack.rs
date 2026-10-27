@@ -1298,7 +1298,7 @@ mod tests {
         assert_eq!(e.outcome(), NftBatchOutcome::Aborted);
     }
 
-    /// NET-3・SEC-1・#2905: echo の family・テーブル名・チェイン名が要求（IPv4・`t`・`c`）と違えば、
+    /// NET-3・SEC-1・#2970: echo の nfgenmsg の version が NFNETLINK_V0 以外なら、
     /// seq が合っていても DataLoss・Unknown とし、ハンドルを記録しない。
     #[test]
     fn net3_sec1_echo_version_mismatch_is_data_loss() {
@@ -1321,6 +1321,8 @@ mod tests {
         }
     }
 
+    /// NET-3・SEC-1・#2905: echo の family・テーブル名・チェイン名が要求（IPv4・`t`・`c`）と違えば、
+    /// seq が合っていても DataLoss・Unknown とし、ハンドルを記録しない。
     #[test]
     fn net3_sec1_echo_identity_mismatch_is_data_loss() {
         let h = 2u64.to_be_bytes();

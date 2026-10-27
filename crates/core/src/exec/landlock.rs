@@ -30,16 +30,17 @@
 
 use std::path::PathBuf;
 
-use super::{ExecError, IsolationStage, ThreadCountSource};
+use super::{ExecError, IsolationStage, ThreadCountSource, ViolationReason};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
 use crate::dev_mounts::ImplicitDevMounts;
 use crate::landlock::{
-    LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
-    LandlockSupport, build_path_rules_with_user_tmpfs, detect_landlock_abi,
+    LandlockApplyError, LandlockApplyErrorKind, LandlockApplyReport, LandlockError,
+    LandlockRuleError, LandlockRuleset, LandlockSupport, build_path_rules_with_user_tmpfs,
+    detect_landlock_abi,
 };
 use crate::landlock::{MountCheck, handled_for_abi};
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
-use crate::oci_runtime::{OciConfig, OciMount, RootfsDir};
+use crate::oci_runtime::{BindMountSet, OciConfig, OciMount, RootfsDir};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
@@ -96,19 +97,29 @@ pub(super) fn apply_landlock_stage_with(
 pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
-    landlock_ruleset_from_config_with_dev(config, &[], ImplicitDevMounts::All)
+    // config だけの入口は検証済みの bind の集合を持たないため空を渡し、`ro` の bind は拒否のまま（#1917）。
+    landlock_ruleset_from_config_with_dev(
+        config,
+        &[],
+        ImplicitDevMounts::All,
+        &BindMountSet::default(),
+    )
 }
 
 /// [`landlock_ruleset_from_config`] で暗黙の `/dev` 系マウントの含め方を選べる版(SUP-12・CORE-5・#2625)。
 ///
 /// 本番 launcher が、起動オプションの tmpfs 集合から導いた [`ImplicitDevMounts`](`--ipc=host` では
 /// `WithoutShm`)を渡す。権利は減る方向にしか働かない。
+///
+/// `binds` は start が検証した bind の集合（`spec.bind_mounts()`）。書き込み可能な root の下の `ro` の bind は、
+/// これと一致するときだけ許容する（CORE-5・#1917。`build_path_rules_with_user_tmpfs` の doc）。
 pub(crate) fn landlock_ruleset_from_config_with_dev(
     config: &OciConfig,
     user_tmpfs: &[OciMount],
     implicit: ImplicitDevMounts,
+    binds: &BindMountSet,
 ) -> Result<LandlockRuleset, ExecError> {
-    ruleset_from_detection_with_dev(detect_landlock_abi(), config, user_tmpfs, implicit)
+    ruleset_from_detection_with_dev(detect_landlock_abi(), config, user_tmpfs, implicit, binds)
 }
 
 /// 記録した launch 時の Landlock ルールから ruleset を組み直す（exec の再適用用。CORE-5・SUP-6・TASK-163 追補・
@@ -191,7 +202,13 @@ pub(crate) fn ruleset_from_detection(
     detected: Result<LandlockSupport, LandlockError>,
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
-    ruleset_from_detection_with_dev(detected, config, &[], ImplicitDevMounts::All)
+    ruleset_from_detection_with_dev(
+        detected,
+        config,
+        &[],
+        ImplicitDevMounts::All,
+        &BindMountSet::default(),
+    )
 }
 
 /// [`ruleset_from_detection`] で暗黙マウントの含め方を選べる版(SUP-12・CORE-5・#2625)。
@@ -200,6 +217,7 @@ pub(crate) fn ruleset_from_detection_with_dev(
     config: &OciConfig,
     user_tmpfs: &[OciMount],
     implicit: ImplicitDevMounts,
+    binds: &BindMountSet,
 ) -> Result<LandlockRuleset, ExecError> {
     let support = detected.map_err(from_landlock_unavailable)?;
     build_path_rules_with_user_tmpfs(
@@ -208,6 +226,7 @@ pub(crate) fn ruleset_from_detection_with_dev(
         config.mounts(),
         user_tmpfs,
         implicit,
+        binds,
     )
     .map_err(from_landlock_rule)
 }
@@ -410,7 +429,14 @@ fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
 /// 違反を運ぶ経路が無い（`docs/design/audit-delivery.md` 8 章の配線状況。実装は #2023〜#2028・#2004、同種の欠落は
 /// #2013）。配送が入るまで、`violation` は呼び出し側が取り出せるが本番の sink には記録されない。
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
-    let reason = super::violation::landlock_apply_violation(&e.kind);
+    // 読み取り専用属性の照合の拒否は再適用（worker の経路。`NotRecorded`）でも生じるため、`EXEC_WORKER_REASONS` との
+    // ソース照合（`violation_scan`）が字面で拾えるよう明示的に書く（CORE-5・SEC-4・#1917）。
+    let reason = match &e.kind {
+        LandlockApplyErrorKind::MountNotReadOnly { .. } => {
+            Some(ViolationReason::LandlockMountNotReadOnly)
+        }
+        kind => super::violation::landlock_apply_violation(kind),
+    };
     if let Some(reason) = reason {
         let mut err = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
         // 詳細（ルールの位置）は message に保つ。違反理由は reason から決まる静的トークン。
@@ -503,8 +529,7 @@ pub(super) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::ViolationReason;
-    use crate::landlock::{LandlockApplyErrorKind, LandlockRuleErrorKind, LandlockUnavailable};
+    use crate::landlock::{LandlockRuleErrorKind, LandlockUnavailable};
     use crate::traits::types::ErrorCode;
 
     /// CORE-5・#1714: ABI 6 未満は段に入る前（ruleset を作る前）に `FailedPrecondition` で起動を拒否し、
@@ -646,10 +671,7 @@ mod tests {
         assert_eq!(rebuilt.rules(), ruleset.rules());
     }
 
-    /// OCI-4・CORE-5(#1915): `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を
-    /// 保証できず fork 前に拒否される(`WriteRestrictionShadowed`。#1917 の解消までの想定挙動)。
-    #[test]
-    fn core5_readonly_bind_is_refused_before_fork_until_1917() {
+    fn ro_bind_config() -> OciConfig {
         let json = serde_json::json!({
             "ociVersion": "1.2.0",
             "root": {"path": "rootfs"},
@@ -657,8 +679,66 @@ mod tests {
                 {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "ro"]}
             ]
         });
-        let config =
-            crate::oci_runtime::parse_config_bytes(json.to_string().as_bytes()).expect("config");
+        crate::oci_runtime::parse_config_bytes(json.to_string().as_bytes()).expect("config")
+    }
+
+    /// OCI-4・CORE-5(#1917): 検証済みの bind の集合を渡すと、書き込み可能な root の下の `ro` の bind を受け、
+    /// 書き込みの差分を `ReadOnlyBind` として記録する(ルールは残る)。
+    #[test]
+    fn core5_readonly_bind_with_verified_set_is_accepted_and_shadowed() {
+        use crate::landlock::{AccessFs, ShadowBacking};
+        let config = ro_bind_config();
+        let binds = BindMountSet::from_mounts(config.mounts()).expect("bind accepted");
+        let rs = ruleset_from_detection_with_dev(
+            crate::landlock::evaluate_abi(6),
+            &config,
+            &[],
+            ImplicitDevMounts::All,
+            &binds,
+        )
+        .expect("ro bind accepted");
+        let s: Vec<_> = rs
+            .shadowed()
+            .iter()
+            .map(|s| {
+                (
+                    s.path.as_str().to_owned(),
+                    s.intended,
+                    s.effective,
+                    s.backing,
+                )
+            })
+            .collect();
+        let want = (
+            "/data".to_owned(),
+            AccessFs::from_bits(0x000D).expect("bits"),
+            AccessFs::from_bits(0x77BF).expect("bits"),
+            ShadowBacking::ReadOnlyBind { index: 0 },
+        );
+        assert!(s.contains(&want), "{s:?}");
+        // launch の記録から組み直した ruleset(exec の再適用の入力)でも、ルールが一致し、`ro` の bind に頼るルールを
+        // 同じ index で導ける(`state.json` の形式は変えない)。
+        let record =
+            LaunchIsolationRecord::new(crate::launch_isolation::RootIdentity::new(1, 2), &rs)
+                .expect("record");
+        let rebuilt = record.landlock_ruleset(rs.audit_mode()).expect("rebuilt");
+        assert_eq!(rebuilt.rules(), rs.rules());
+        let i = rebuilt
+            .rules()
+            .iter()
+            .position(|r| r.path.as_str() == "/data")
+            .expect("rule");
+        assert!(crate::landlock::requires_read_only_mount(
+            rebuilt.rules(),
+            i
+        ));
+    }
+
+    /// OCI-4・CORE-5(#1915・#1917): config だけの入口(空の集合)では、`ro` の bind は fork 前に拒否される
+    /// (`WriteRestrictionShadowed`。裏付けを型で結べない)。
+    #[test]
+    fn core5_readonly_bind_without_verified_set_is_refused() {
+        let config = ro_bind_config();
         let e = ruleset_from_detection(crate::landlock::evaluate_abi(6), &config)
             .expect_err("ro bind must be refused");
         assert_eq!(e.stage, IsolationStage::Landlock);
@@ -762,6 +842,11 @@ mod tests {
                 ViolationReason::LandlockMountNotRoot,
                 "landlock_mount_not_root",
             ),
+            (
+                LandlockApplyErrorKind::MountNotReadOnly { index: 2 },
+                ViolationReason::LandlockMountNotReadOnly,
+                "landlock_mount_not_read_only",
+            ),
         ] {
             let e = from_landlock_apply(LandlockApplyError {
                 code: ErrorCode::FailedPrecondition,
@@ -783,6 +868,34 @@ mod tests {
                 v.mount_audit_event()
             );
         }
+    }
+
+    /// SEC-4・CORE-5・#1917: 再適用（`NotRecorded`。worker の経路）で読み取り専用属性が失われた・観測できない拒否は、
+    /// worker の許可リストに載る違反理由を運び、親が層 `mount`・理由コード `landlock_mount_not_read_only`・パスなしで
+    /// 1 件記録できる。
+    #[test]
+    fn sec4_1917_reapply_not_read_only_reaches_worker_audit() {
+        let e = from_landlock_apply(LandlockApplyError {
+            code: ErrorCode::FailedPrecondition,
+            kind: LandlockApplyErrorKind::MountNotReadOnly { index: 1 },
+            message: "m".to_string(),
+        });
+        let v = e.violation.expect("violation");
+        assert_eq!(v.reason, ViolationReason::LandlockMountNotReadOnly);
+        assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&v.reason));
+        assert_eq!(
+            ViolationReason::from_exec_worker_token("mount_target", "landlock_mount_not_read_only"),
+            Some(ViolationReason::LandlockMountNotReadOnly)
+        );
+        assert_eq!(
+            v.reason.exec_worker_audit_event(),
+            Some(crate::audit_log::AuditEvent::Mount {
+                path: None,
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "landlock_mount_not_read_only"
+                )),
+            })
+        );
     }
 
     /// CORE-5・TASK-39.4: ABI 不足は FailedPrecondition・理由コード付き。

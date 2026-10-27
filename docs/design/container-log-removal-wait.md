@@ -62,7 +62,8 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 - worker 側: 残存は `PLUGIN_ROOTFS_DEADLINE`（600 秒。plugin-cri が明示。値は既定のまま）+ 分割できない区間 1 つ分の超過 + core の create の
   42.9 秒。同時に残る worker は `MAX_CONTAINERS` の件数枠で有界。照合は `repair5_create_worker_residual_is_bounded`
 - 期限の数値の見直しはオーナー判断（値は変えない）
-- 範囲外: core の `create_with_image*`（CRI の経路では呼ばれない）・デバイス停止による I/O の停止・`PullImage` の展開への期限の配線
+- 範囲外: core の `create_with_image*`（CRI の経路では呼ばれない）・デバイス停止による I/O の停止
+  （`PullImage` の展開への期限の配線は次の小節。#2967）
 - 残る制約: 1 エントリの本体の書き込み（最大 `max_total_bytes`）・blob 1 本の sha256 検証・失敗時の削除は途中で止められない（REPAIR-3）
 
 ### RPC の期限切れの後の worker（#2899・CRI-2・REPAIR-5・REPAIR-3）
@@ -80,6 +81,29 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
   `PLUGIN_ROOTFS_DEADLINE` の 600 秒は、取り消しが届かない場合の上限として残る
 - 照合: `repair5_extract_*`（oci の単体）・`repair5_cancel_during_extraction_*`（cri の rootfs）・`repair5_create_timeout_during_prepare_*`・
   `repair5_create_future_drop_during_prepare_*`（cri の worker）・`err3_bundle_prepare_timeout_maps_to_deadline_exceeded_and_releases`（prepare の Timeout → DEADLINE_EXCEEDED → `release`）
+
+### `PullImage` の展開の期限と取り消し（#2967・CRI-3・OCI-1・REPAIR-5・REPAIR-3）
+
+- 経路: `CriImageService::pull` → `spawn_blocking` → `OciImagePuller::pull_inner` → `stage_and_unpack`（blob ごと）→ `ensure_rootfs`
+  （公開済みの命中、または層ごとの `VerifiedLayerBlob` の検証、または `extract_image_layers_bounded`。`verify_only` を含む）→
+  `write_unpack_record` / `rename` → publish の直前の確認 → `PullSession::publish`
+- 期限は共有する: pull の開始から `pull_deadline`（本番 540 秒）の絶対時刻を 1 つだけ求め、展開の `ExtractBudget` へそのまま渡す。
+  不採用の案は「展開に別の予算を持たせる」で、pull 全体が 540 秒を超えうるため、plugin-cri の `PLUGIN_REQUEST_TIMEOUT`（600 秒）との不等式
+  （`repair5_pull_deadline_fits_inside_request_timeout`）が崩れる。`CreateContainer` 側の `PLUGIN_ROOTFS_DEADLINE` は別 RPC の予算で関係しない
+- 確認点（取り消しの旗 → 期限の順。どちらも `Timeout` = gRPC `DEADLINE_EXCEEDED`）: pull の先頭（取り消し済みなら通信しない）→ 認証の後 →
+  manifest の後 → blob ごとの前 → 再認証ループの試行ごと → 最後の blob の後 → 層ごとの検証の前 → 展開のエントリごと → 展開の後 →
+  publish の直前（最後の打ち切り点）。publish が確定した後は取り消されていても成功を返す（OCI-7）
+- 打ち切り時: `unpack/` は `remove_extracted_tree`、ステージングは `PullSession::abort` が消し、在庫・タグ・リースは残らない
+- RPC 側: `PullImage` は `CancelOnDrop` を持ち、future の破棄（kubelet の取り消し・`PLUGIN_REQUEST_TIMEOUT`）で取り消しの旗を立てる
+  （atomic の store だけ。worker の完了後は disarm）。worker は次の確認点で止まり、`PullSlot` も早く戻る
+- 取り消しの口: `ImagePuller::pull_cancellable`（既定は旗を無視して `pull`。`PullRequest` は変えない）
+- 分割できない区間: blob 1 本の取得（`blob_request_timeout` で有界）・blob 1 本の sha256 検証・1 エントリの書き込み・失敗時の削除。
+  worker の最悪の残存は `pull_deadline` + 分割できない区間 1 つ分
+- 残余（REPAIR-3）: 取り消しが `publish` と handler の `upsert` の間に届くと、永続在庫には登録されるが `CriImageService` のメモリのストアは
+  更新されない（従来の gRPC タイムアウトにもある窓で、再試行がキャッシュ命中で揃える）。oci の `fetch_blob` の通信を途中で取り消す口は無い。
+  期限の数値（540 秒・1 時間）の見直しはオーナー判断
+- 照合: `cri3_repair5_pull_cancel_during_extraction_*`・`cri3_repair5_pull_cancel_during_fetch_*`・`cri3_repair5_pull_cancelled_before_start_*`・
+  `cri3_repair5_extraction_shares_the_pull_deadline`・`cri3_repair5_dropped_pull_rpc_cancels_worker_and_releases_slot`
 
 ## 待ち切れなかったことの区別（#2760）
 

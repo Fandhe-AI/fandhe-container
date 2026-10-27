@@ -426,15 +426,16 @@ impl StderrCapture {
         }
         // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
         reader.set_nonblocking(true)?;
-        let (stop_rx, mut stop_tx) = io::pipe()?;
+        let (stop_rx, stop_tx) = io::pipe()?;
         let mut capture = Self::start(
             PolledStderr {
                 sock: reader,
                 stop: stop_rx,
             },
             Box::new(move || {
-                // 空の pipe への 1 バイトは待たない。読み手が既に去っていても構わない。
-                let _ = io::Write::write_all(&mut stop_tx, &[1u8]);
+                // 書き込み端を閉じて `POLLHUP` で起こす。pipe へは書かない（読み手が先に去っていると `EPIPE` と
+                // `SIGPIPE` になり、ホストの signal 設定が既定のままだとプロセスごと落ちるため。REPAIR-5・#3003）。
+                drop(stop_tx);
             }),
         )?;
         capture.last_resort = Some(Box::new(shutdown));

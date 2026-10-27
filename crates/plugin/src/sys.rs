@@ -4283,14 +4283,22 @@ mod poll_two_tests {
             }
         );
         // 2 本目の書き込み端を閉じる（EOF = POLLHUP）と second も ready。
+        // 並行する別テストの fork から exec までの間は、子が複製した書き込み端を保持して EOF が遅れ得るため、
+        // 期限つきで待つ（本番も停止フラグと `poll` の期限で有限に止まる。REPAIR-5・#3003）。
         drop(w2);
-        assert_eq!(
-            poll_two(&r1, &r2, 1000).unwrap(),
-            PollOutcome::Ready {
-                first: true,
-                second: true
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = poll_two(&r1, &r2, 100).unwrap();
+            if got
+                == (PollOutcome::Ready {
+                    first: true,
+                    second: true,
+                })
+            {
+                break;
             }
-        );
+            assert!(std::time::Instant::now() < deadline, "got={got:?}");
+        }
     }
 
     #[test]

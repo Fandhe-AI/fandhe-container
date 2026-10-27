@@ -597,6 +597,60 @@ mod consts {
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
+
+    /// x86_64 の syscall 番号を `libc` 0.2.189 と `const` 評価で照合する（#1847・#1837・#1318・MVM-4・
+    /// REPAIR-7・REPAIR-12）。関数は呼ばず `unsafe` を使わない。
+    ///
+    /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
+    /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
+    /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
+    /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
+    /// 一次情報: arch/x86/entry/syscalls/syscall_64.tbl、`libc` の `src/unix/linux_like/linux/{gnu,musl}/b64/`。
+    /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::super::ArchSysNo;
+
+        const fn nr(n: ArchSysNo) -> i64 {
+            match n.get() {
+                Ok(v) => v.raw(),
+                // 対応 arch の cfg の下でだけ定義するため到達しない（到達すればコンパイルエラー）。
+                Err(_) => panic!("unsupported arch"),
+            }
+        }
+
+        const _: () = {
+            assert!(nr(super::SYS_PIVOT_ROOT) == libc::SYS_pivot_root);
+            assert!(nr(super::SYS_CLOSE_RANGE) == libc::SYS_close_range);
+            assert!(nr(super::SYS_MOVE_MOUNT) == libc::SYS_move_mount);
+            assert!(nr(super::SYS_FSOPEN) == libc::SYS_fsopen);
+            assert!(nr(super::SYS_FSCONFIG) == libc::SYS_fsconfig);
+            assert!(nr(super::SYS_FSMOUNT) == libc::SYS_fsmount);
+            assert!(nr(super::SYS_OPEN_TREE) == libc::SYS_open_tree);
+            assert!(nr(super::SYS_MOUNT_SETATTR) == libc::SYS_mount_setattr);
+            assert!(nr(super::SYS_PIDFD_SEND_SIGNAL) == libc::SYS_pidfd_send_signal);
+            assert!(nr(super::SYS_PIDFD_OPEN) == libc::SYS_pidfd_open);
+            assert!(nr(super::SYS_EXECVEAT) == libc::SYS_execveat);
+            assert!(nr(super::SYS_MEMFD_CREATE) == libc::SYS_memfd_create);
+            assert!(nr(super::SYS_LANDLOCK_CREATE_RULESET) == libc::SYS_landlock_create_ruleset);
+            assert!(nr(super::SYS_LANDLOCK_ADD_RULE) == libc::SYS_landlock_add_rule);
+            assert!(nr(super::SYS_LANDLOCK_RESTRICT_SELF) == libc::SYS_landlock_restrict_self);
+            assert!(nr(super::SYS_BPF) == libc::SYS_bpf);
+            assert!(nr(super::SYS_CAPGET) == libc::SYS_capget);
+            assert!(nr(super::SYS_CAPSET) == libc::SYS_capset);
+            assert!(nr(super::SYS_GETGROUPS) == libc::SYS_getgroups);
+            assert!(nr(super::SYS_SETGROUPS) == libc::SYS_setgroups);
+            assert!(nr(super::SYS_SETRESUID) == libc::SYS_setresuid);
+            assert!(nr(super::SYS_GETRESUID) == libc::SYS_getresuid);
+            assert!(nr(super::SYS_SETRESGID) == libc::SYS_setresgid);
+            assert!(nr(super::SYS_GETRESGID) == libc::SYS_getresgid);
+            assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
+            assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
+            assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+        };
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
@@ -953,6 +1007,60 @@ mod consts {
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
+
+    /// aarch64 の syscall 番号を `libc` 0.2.189 と `const` 評価で照合する（#1847・#1837・#1318・MVM-4・
+    /// REPAIR-7・REPAIR-12）。関数は呼ばず `unsafe` を使わない。
+    ///
+    /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
+    /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
+    /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
+    /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
+    /// 一次情報: include/uapi/asm-generic/unistd.h、`libc` の `src/unix/linux_like/linux/{gnu,musl}/b64/`。
+    /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::super::ArchSysNo;
+
+        const fn nr(n: ArchSysNo) -> i64 {
+            match n.get() {
+                Ok(v) => v.raw(),
+                // 対応 arch の cfg の下でだけ定義するため到達しない（到達すればコンパイルエラー）。
+                Err(_) => panic!("unsupported arch"),
+            }
+        }
+
+        const _: () = {
+            assert!(nr(super::SYS_PIVOT_ROOT) == libc::SYS_pivot_root);
+            assert!(nr(super::SYS_CLOSE_RANGE) == libc::SYS_close_range);
+            assert!(nr(super::SYS_MOVE_MOUNT) == libc::SYS_move_mount);
+            assert!(nr(super::SYS_FSOPEN) == libc::SYS_fsopen);
+            assert!(nr(super::SYS_FSCONFIG) == libc::SYS_fsconfig);
+            assert!(nr(super::SYS_FSMOUNT) == libc::SYS_fsmount);
+            assert!(nr(super::SYS_OPEN_TREE) == libc::SYS_open_tree);
+            assert!(nr(super::SYS_MOUNT_SETATTR) == libc::SYS_mount_setattr);
+            assert!(nr(super::SYS_PIDFD_SEND_SIGNAL) == libc::SYS_pidfd_send_signal);
+            assert!(nr(super::SYS_PIDFD_OPEN) == libc::SYS_pidfd_open);
+            assert!(nr(super::SYS_EXECVEAT) == libc::SYS_execveat);
+            assert!(nr(super::SYS_MEMFD_CREATE) == libc::SYS_memfd_create);
+            assert!(nr(super::SYS_LANDLOCK_CREATE_RULESET) == libc::SYS_landlock_create_ruleset);
+            assert!(nr(super::SYS_LANDLOCK_ADD_RULE) == libc::SYS_landlock_add_rule);
+            assert!(nr(super::SYS_LANDLOCK_RESTRICT_SELF) == libc::SYS_landlock_restrict_self);
+            assert!(nr(super::SYS_BPF) == libc::SYS_bpf);
+            assert!(nr(super::SYS_CAPGET) == libc::SYS_capget);
+            assert!(nr(super::SYS_CAPSET) == libc::SYS_capset);
+            assert!(nr(super::SYS_GETGROUPS) == libc::SYS_getgroups);
+            assert!(nr(super::SYS_SETGROUPS) == libc::SYS_setgroups);
+            assert!(nr(super::SYS_SETRESUID) == libc::SYS_setresuid);
+            assert!(nr(super::SYS_GETRESUID) == libc::SYS_getresuid);
+            assert!(nr(super::SYS_SETRESGID) == libc::SYS_setresgid);
+            assert!(nr(super::SYS_GETRESGID) == libc::SYS_getresgid);
+            assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
+            assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
+            assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+        };
+    }
 }
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない

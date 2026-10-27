@@ -74,13 +74,16 @@ pub const GUEST_TEST_KEY: &str = "fandhe.guest-test=";
 /// ゲスト init が走らせる試験用プローブの種別（試験専用。本番の起動では指定されない）。
 ///
 /// ゲストは `GUEST_TEST_KEY` のトークンがちょうど 1 個で値が既知のときだけプローブを走らせる
-/// （未知の値・重複は fail-closed で何もしない）。#1877（symlink・ハードリンクの観測）は variant を
-/// 足すだけで済み、起動条件の仕組みには手を入れない（REPAIR-3）。
+/// （未知の値・重複は fail-closed で何もしない）。symlink・ハードリンクの観測（#1877）は variant を
+/// 足しただけで、起動条件の仕組みには手を入れていない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GuestTestMode {
     /// 共有 `fandhe-io` の read / write / readdir のプローブ（`guest_probe` の契約。IO-5）。
     VirtiofsIo,
+    /// 共有 `ro`（RO）・`rw`（RW）の symlink・ハードリンクの観測（`guest_link_probe` の契約。
+    /// MAC-1・SEC-4・TASK-65.1 追補・#1877・#1374）。判定はしない。
+    VirtiofsLink,
 }
 
 impl GuestTestMode {
@@ -88,6 +91,7 @@ impl GuestTestMode {
     pub fn token(self) -> &'static str {
         match self {
             Self::VirtiofsIo => "virtiofs-io",
+            Self::VirtiofsLink => "virtiofs-link",
         }
     }
 }
@@ -794,8 +798,13 @@ mod tests {
         assert!(GUEST_TEST_KEY.starts_with(RESERVED_KEY_PREFIX));
         assert_eq!(GUEST_TEST_KEY, "fandhe.guest-test=");
         assert_eq!(GuestTestMode::VirtiofsIo.token(), "virtiofs-io");
+        assert_eq!(GuestTestMode::VirtiofsLink.token(), "virtiofs-link");
         assert_eq!(
             reject_reserved_keys("console=hvc0 fandhe.guest-test=virtiofs-io"),
+            Err(ConfigError::CommandLineReservedKey { index: 13 })
+        );
+        assert_eq!(
+            reject_reserved_keys("console=hvc0 fandhe.guest-test=virtiofs-link"),
             Err(ConfigError::CommandLineReservedKey { index: 13 })
         );
     }

@@ -187,10 +187,11 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | 結合試験 | 各 crate の `tests/*.rs`（integration test target） | `make test-integration` | `crates/io/tests/` に導入済み。他 crate の結合試験は各機能タスクで追加する。件数は `make test-integration` が出力する `integration test targets: N` 行で確認する |
 | SIGKILL 耐性（IO-3・TASK-18.3.1。実測は [io-crash-safety](docs/design/io-crash-safety.md)） | `crates/io/tests/crash_safety.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-io --features crash-test-server --test crash_safety` | 既定 CI 集合（`platform-ci`〔PR は ubuntu・main は 3 OS〕・`rust-ci`）で実行し、実機前提ではない。`platform-ci` は「crash_safety の存在確認」ステップで glob による無言除外を検出し、「crash_safety 件数の集計」ステップで有効 / 無効の試行数・損失件数を実行結果の要約に出す（環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR`・`make crash-summary-check`。#1833）。電源断後の媒体永続化（IO-2）と実測レポート・妥当性判断（TASK-18 の人間担当）は保証しない |
 | vsock トランスポート往復・期限・受信上限・poison・CID 検証（IO-1・REPAIR-5・P1-3・PLUG-12 相当・SEC-4・#1119） | `crates/io/tests/vsock.rs` | 実機前提の loopback 試験 14 件は `make test-integration` では `ignored`。手順は「実機前提テスト」節 | `vsock_loopback` カーネルモジュールを要するため `#[ignore]` で分離（CI 通過のための弱体化ではない）。アドレス定数・`VsockPeerPolicy` の検証（全 OS）と、非 Linux で `bind` / `connect` が `Unimplemented` になること（REPAIR-3）は既定集合で常時実行する。期限・受信上限・poison・方向別のフレーム種別の共通処理は UDS と共有する `crates/io/src/stream_io.rs` にあり、`tests/server.rs` が既定集合で検証する |
-| macOS ゲスト init の単体・契約照合（MAC-1・TASK-64 追補・#1875） | `crates/guest-init/src/*.rs` の単体テストと `crates/guest-init/tests/contract.rs` | `cargo test -p fandhe-container-guest-init` | 3 OS の既定集合。指示の復号・報告行・fake による mount の段取りと、ホスト側 `guest_mount` との定数・復号結果・報告行の往復の照合。`virtiofs_io` のプローブ（#1876）の起動条件・出力行・上限と、一時ディレクトリで実際に走らせた出力をホスト側 `guest_probe` の `parse_probe_log`・`compare_entries` で受理する往復の照合を含む。実機（initrd に入れて `vm_boot` で起動完了マーカーを確認）は #1628（人間担当）で本表の対象外 |
+| macOS ゲスト init の単体・契約照合（MAC-1・TASK-64 追補・#1875） | `crates/guest-init/src/*.rs` の単体テストと `crates/guest-init/tests/contract.rs` | `cargo test -p fandhe-container-guest-init` | 3 OS の既定集合。指示の復号・報告行・fake による mount の段取りと、ホスト側 `guest_mount` との定数・復号結果・報告行の往復の照合。`virtiofs_io` のプローブ（#1876）の起動条件・出力行・上限と、一時ディレクトリで実際に走らせた出力をホスト側 `guest_probe` の `parse_probe_log`・`compare_entries` で受理する往復の照合を含む。symlink・ハードリンク観測モード（#1877）の起動条件・出力行（観測 18 行 + done）・各上限と、実際に走らせた出力をホスト側 `guest_link_probe` の `parse_link_log` で受理する往復・名前空間の相互非誤認の照合も含む。実機（initrd に入れて `vm_boot` で起動完了マーカーを確認）は #1628（人間担当）で本表の対象外 |
 | macOS VM cold start 計測ハーネスの純粋ロジック（MAC-2・TASK-70 準備・#1879） | `crates/platform-macos/tests/vm_cold_start.rs` | `cargo test -p fandhe-container-platform-macos --test vm_cold_start` | 3 OS の既定集合 15 件。試行回数・期限の検証、予算計算、マーカーの増分走査（チャンク境界・順序）、中央値・最小・最大、ms 整形、JSON の完全一致、実ファイルを追う watcher を具体値で照合する。実 VM の 1 件は macOS 限定の `#[ignore]` で、手順は「実機前提テスト」節の `vm_cold_start` |
 | macOS VM 起動・設定構築の結合試験（MAC-1・TASK-64.6・#363） | `crates/platform-macos/tests/vm_boot.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-macos --test vm_boot` | macOS のみ（他 OS は `#![cfg]` で 0 件）。範囲外 CPU・メモリの拒否（副作用前）・`PlatformError` の表示・`build_vz_configuration` の読み戻しの 4 件、ゲスト mount 指定のコンソール必須拒否と実効コマンドライン読み戻し（TASK-65.3）の 2 件に加え、実機テスト用マーカー検証（ブート・起動完了マーカーの重複拒否・出現順・必須性・既定値）の 4 件、計 10 件を既定集合で実行する。実機起動の 1 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
 | macOS virtiofs の read/write/readdir 結合試験（MAC-1・IO-5・TASK-65.4・#367） | `crates/platform-macos/tests/virtiofs_io.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-macos --test virtiofs_io` | macOS のみ（他 OS は `#![cfg]` で 0 件）。fixture・spec 読み戻し（試験モードのキーを含む実効コマンドライン）・コンソールログの打ち切り検出と確定待ち・停止後の write 検証・実機テストの期限など 6 件を既定集合で実行する（プローブ行の解釈は `crates/platform-macos/src/guest_probe.rs` の単体テストに移し、3 OS で実行する）。read / write / readdir の実機テスト 3 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
+| macOS virtiofs の symlink・ハードリンク観測の入口（MAC-1・SEC-4・TASK-65.1 追補・#1877・#1374） | `crates/platform-macos/tests/virtiofs_link.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-macos --test virtiofs_link` | macOS のみ（他 OS は `#![cfg]` で 0 件）。spec 読み戻し（ro / rw の 2 共有と観測モードのキーを含む実効コマンドライン）・fixture のレイアウト・コンソールログの打ち切り検出・実機テストの期限の 4 件を既定集合で実行する（行の復号は `crates/platform-macos/src/guest_link_probe.rs` の単体テストで 3 OS）。観測の実機テスト 1 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節の「virtiofs の symlink・ハードリンク挙動の手動確認」 |
 | plugin-macos E2E 結合試験（PLUG-1・MAC-1・TASK-115.6・#390） | `crates/plugin-macos/tests/e2e.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-plugin-macos --test e2e` | unix のみ（Windows は `#![cfg]` で 0 件）。core 役のモッククライアントと偽バックエンドで create → start → stop・切断時 / 終了要求時の VM 回収・virtiofs 共有の委譲・エラーフレーム後の接続維持・起動失敗の remaining 計上の 6 件を既定集合で実行する。実 VM を plugin 経由で起動する 1 件は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
 | plugin-windows E2E 結合試験（PLUG-1・WIN-1・TASK-116.6・#397） | `crates/plugin-windows/tests/e2e.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-plugin-windows --test e2e` | 既定集合は unix のみ 6 件（Windows では 0 件）。core 役のモッククライアントと偽バックエンドで create → start → stop・切断時の解除・create 引数のバックエンド到達・9P 降格警告の伝播・起動失敗後の stop 再試行・エラーフレーム後の接続維持を実 UDS 上で検証する。実 WSL2 を plugin のアダプタ経由で駆動する 1 件は Windows のみ `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
 | WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（WIN-1・WIN-2・TASK-67.6・#377） | `crates/platform-windows/tests/wsl2_virtiofs.rs` | `make test-integration`、単体は `cargo test -p fandhe-container-platform-windows --test wsl2_virtiofs` | Windows のみ（他 OS は `#![cfg]` で 0 件）。一時ディレクトリ配下の受理・`canonicalize` の `\\?\` 形式の拒否・`%USERPROFILE%\.wslconfig` の既定パスの 3 件を既定集合で実行する（WSL の有無に依存しない）。実機 WSL2 の 2 件（共有の準備・解除と、コンテナ ID による回収〔#1412〕）は `#[ignore]` で分離しており（CI 通過のための弱体化ではない）、手順は「実機前提テスト」節 |
@@ -452,7 +453,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   ```
 
 - `virtiofs_io`（MAC-1・IO-5・TASK-65.4・#367・MS-5。`crates/platform-macos/tests/virtiofs_io.rs` の `#[ignore]` テスト `mac1_io5_virtiofs_read_on_real_macos`・`mac1_io5_virtiofs_write_on_real_macos`・`mac1_io5_virtiofs_readdir_on_real_macos` の 3 件、通常の libtest harness）: 実機でゲストから RW の virtiofs 共有（タグ `fandhe-io`・ゲスト mount point `/mnt/fandhe/io`）へ read / write / readdir できることを検証する実機前提テスト。`Vm::launch` の成功がゲスト mount 報告（TASK-65.3）のゲートを兼ねる。IO-5 のうち macOS 分の疎通のみが対象で、大文字小文字衝突・Unicode 正規化は対象外。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名）に加え、`crates/guest-init`（#1875・#1876）を入れた initrd（梱包は #1878）とゲストカーネルで virtiofs が有効であること（カーネル・initrd は本リポに含めない）。`FANDHE_CONTAINER_MACOS_VM_INITRD` に同じ guest-init の initrd を指定すれば `vm_boot` と同じ資産で通る。環境変数は `vm_boot` と共通の `FANDHE_CONTAINER_MACOS_VM_KERNEL`（必須）・`_INITRD`・`_DISK_IMAGE`・`_CMDLINE`（既定 `console=hvc0`）と、`FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS`（1〜600、既定 60）。ホストは起動前に `in/read.txt`（nonce 1 行）・`in/dir/{a,b,c}-<nonce>`・空の `out/` を共有へ置く。ゲストは次の行をコンソールへ出す（read / readdir はコンソール報告、write だけ `out/write.txt` に `fandhe-virtiofs-write-v1` を 4096 行書いて sync する）: `fandhe-guest-test: virtiofs-io v1 op=read value=<read.txt の 1 行目>`、`... op=readdir entries=<in/dir の名前のカンマ区切り>`、`... op=write result=done`、失敗時 `... op=<op> result=error`、最後に `fandhe-guest-test: virtiofs-io v1 done`。`fandhe-guest-test: virtiofs-io`（末尾に半角空白 1 つ）で始まる行はすべてプローブ行とみなし、上記の形に復号できない行（版数違い・未知 op・空 value・256 バイト超等）は done の前後を問わず不正として失敗させる。ホストは VM を停止して `Stopped` を確認した後に `out/` を検証する（ゲスト出力は untrusted）。プローブの最終判定は、VM を破棄してコンソールログの書き出しスレッドが排他 lock を手放す（EOF で終了する）のを最大 30 秒待ってから、確定したログに対して行う（期限内に手放されなければ失敗）。各テストが VM を 1 台起動するため `--test-threads=1` で直列に実行する。結果は PR に記録する（Agent は実機未実施）。
-  ゲスト側の実装は `crates/guest-init/src/probe.rs`（busybox は入れない。#362）。起動条件は、ホストが `VmConfigSpec::with_guest_test(GuestTestMode::VirtiofsIo)` で付ける予約キー `fandhe.guest-test=virtiofs-io`（コマンドラインにちょうど 1 個。未知の値・重複はプローブを走らせない）と、`fandhe-io`・`/mnt/fandhe/io`・`rw` の mount 成功の両方で、本リポのテストは `probe_spec` でこれを有効にする。`fandhe.` 始まりの予約キーは利用者指定のコマンドラインでは拒否される（`FANDHE_CONTAINER_MACOS_VM_CMDLINE` でも指定できない）ため、本番の起動では走らない（plugin-macos の `build_spec` は有効にしない）。キーがあって mount が成立していないときは、共有に触れず全 op の `result=error` と `done` を出す。出力順は mount 報告、起動完了マーカー、プローブ行（read、readdir、write、done）で、op ごとに 1 行だけ出す。値は 256 バイト以下の行に収まる非空で制御文字を含まないものに限り、read は 257 バイトまで、readdir は 32 件までしか読まない（超過・`,` を含む名前は `result=error`）。write は `out/write.txt` を `create_new` で開き（既存ファイル・symlink は拒否）、4096 行を書いて `sync_all` してから `result=done` を出す。行の形・名前空間の SSOT はホスト側 `crates/platform-macos/src/guest_probe.rs`。symlink・ハードリンクの観測モードは #1877 が `GuestTestMode` に variant を足して実装する。
+  ゲスト側の実装は `crates/guest-init/src/probe.rs`（busybox は入れない。#362）。起動条件は、ホストが `VmConfigSpec::with_guest_test(GuestTestMode::VirtiofsIo)` で付ける予約キー `fandhe.guest-test=virtiofs-io`（コマンドラインにちょうど 1 個。未知の値・重複はプローブを走らせない）と、`fandhe-io`・`/mnt/fandhe/io`・`rw` の mount 成功の両方で、本リポのテストは `probe_spec` でこれを有効にする。`fandhe.` 始まりの予約キーは利用者指定のコマンドラインでは拒否される（`FANDHE_CONTAINER_MACOS_VM_CMDLINE` でも指定できない）ため、本番の起動では走らない（plugin-macos の `build_spec` は有効にしない）。キーがあって mount が成立していないときは、共有に触れず全 op の `result=error` と `done` を出す。出力順は mount 報告、起動完了マーカー、プローブ行（read、readdir、write、done）で、op ごとに 1 行だけ出す。値は 256 バイト以下の行に収まる非空で制御文字を含まないものに限り、read は 257 バイトまで、readdir は 32 件までしか読まない（超過・`,` を含む名前は `result=error`）。write は `out/write.txt` を `create_new` で開き（既存ファイル・symlink は拒否）、4096 行を書いて `sync_all` してから `result=done` を出す。行の形・名前空間の SSOT はホスト側 `crates/platform-macos/src/guest_probe.rs`。symlink・ハードリンクの観測モード（`virtiofs-link`。#1877）は同じ仕組みの別 variant で、手順は「virtiofs の symlink・ハードリンク挙動の手動確認」を参照。
 
   実行手順:
 
@@ -480,55 +481,21 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   cargo test -p fandhe-container-platform-windows --test wsl2_virtiofs -- --ignored --nocapture win2_recover_shared_mount_by_container_id_on_real_wsl2
   ```
 
-- virtiofs の symlink・ハードリンク挙動の手動確認（MAC-1・TASK-65.1 追補・#1374。人間担当。Agent は手順準備まで）: 自動テストは無い手動手順。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル。root 不要）。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない。**現行 API では、共有範囲外を指す symlink（絶対パス・`..` 経由）・範囲外への dangling symlink・ハードリンク（`nlink > 1`）を含む fixture は ReadOnly 共有でも `VmConfigSpec::check_share_conflicts`（`build_vz_configuration` が VZ 呼び出し前に実行）が拒否するため VM を起動できず、これらをゲストから観測することはできない**（観測するには拒否の緩和が要り、本手順の範囲外。緩和の要否は別途ユーザー判断）。本手順で観測できるのは共有範囲内に収まるリンクと、ゲストが実行中に作るリンク（空の ReadWrite 共有）に限る。書き込みを伴う確認は `RW` 内に限り、ホストの共有外ファイルを書き換えない。
-  1. fixture（ホスト側。パスは必ずダブルクォートする）:
+- virtiofs の symlink・ハードリンク挙動の観測（MAC-1・SEC-4・TASK-65.1 追補・#1374・#1877。観測の実行は人間担当。Agent は入口の準備まで）: `crates/platform-macos/tests/virtiofs_link.rs` の `#[ignore]` テスト `mac1_sec4_virtiofs_link_observation_on_real_macos` 1 件（通常の libtest harness）。ゲスト init（`crates/guest-init/src/link_probe.rs`）の観測モードがゲストの中から `readlink`・`stat`・`read` と、`rw` 共有での symlink・ハードリンクの作成を行い、結果を hvc0 へ 1 行 1 観測で出す。シェル・起動スクリプトへの仕込み・`vm_boot.rs` の一時的な編集は要らない。必要環境は `vm_boot` と同じ（実機の macOS 13 以上・`com.apple.security.virtualization` 付き ad-hoc 署名・自前ビルドのゲストカーネル・`crates/guest-init` を入れた initrd〔#1878〕。root 不要）。**判定は人間が行う**: 本テストが assert するのはプロトコルの健全性（終端 `done` があり、契約外の行がなく、ログが打ち切られていない）だけで、観測内容の良し悪しは判定しない。**正常ゲストの観測は拒否を維持する判断の補強にしかならない**（`cat link` は `FUSE_READLINK` → ゲスト側解決の正常経路で、侵害ゲストが symlink の nodeid へ直接 `FUSE_OPEN` を送る脅威は観測できない）ため、結果にかかわらず絶対パス symlink・ハードリンクの拒否は本手順だけでは緩めない（拒否範囲を緩めるか・TOCTOU・タイムアウトの扱いは #1374 の条件 3〜5 でオーナーが判断する）。**共有範囲外を指す symlink（絶対パス・`..` 経由）・範囲外への dangling symlink・既存のハードリンク（`nlink > 1`）を含む fixture は ReadOnly 共有でも `VmConfigSpec::check_share_conflicts`（`build_vz_configuration` が VZ 呼び出し前に実行）が拒否するため VM を起動できず、これらは観測できない**（観測するには拒否の緩和が要り、本手順の範囲外）。観測できるのは共有範囲内に収まるリンクと、ゲストが実行中に `rw` で作るリンクに限る。
+  1. fixture（テストが自動で作る。手で作らない）: `CARGO_TARGET_TMPDIR` 配下の scratch に、読み取り専用の共有 `ro`（タグ `ro`・ゲスト mount `/mnt/fandhe/ro`）として `inside.txt`（内容 `inside`）・`inside_link`（相対 symlink `inside.txt`）・`abs_inside_link`（共有内の実体パスを指す絶対パス symlink）・`dangling_inside_link`（共有内の未作成パスを指す dangling）を置き、読み書きできる共有 `rw`（タグ `rw`・ゲスト mount `/mnt/fandhe/rw`）は空にする。書き込みは `rw` の中の固定名 `src`・`sym`・`hard` だけで、ホストの共有外ファイルは書き換えない。起動条件はホストが `VmConfigSpec::with_guest_test(GuestTestMode::VirtiofsLink)` で付ける予約キー `fandhe.guest-test=virtiofs-link`（利用者のコマンドラインでは指定できない。本番の起動では走らない）と、`ro`（RO）・`rw`（RW）の mount 成功の両方。
+  2. 実行入口:
 
      ```bash
-     W="$(mktemp -d)"; mkdir "$W/ro" "$W/rw"
-     echo inside > "$W/ro/inside.txt"
-     ln -s inside.txt "$W/ro/inside_link"                   # 共有内の相対 symlink
-     ln -s "$W/ro/inside.txt" "$W/ro/abs_inside_link"       # 共有内を指す絶対パス symlink
-     ln -s "$W/ro/missing" "$W/ro/dangling_inside_link"     # 共有内の未作成パスを指す dangling
-     # 範囲外 symlink・ハードリンク（nlink > 1）の fixture は check_share_conflicts に拒否され起動できないため作らない
+     cargo test -p fandhe-container-platform-macos --test virtiofs_link --no-run --message-format=json \
+       | jq -r 'select(.reason == "compiler-artifact" and .target.name == "virtiofs_link" and .executable != null) | .executable'
+     codesign --sign - --force --entitlements crates/platform-macos/tests/vm_boot.entitlements <上で得たバイナリ>
+     FANDHE_CONTAINER_MACOS_VM_KERNEL=/abs/path/to/Image FANDHE_CONTAINER_MACOS_VM_INITRD=/abs/path/to/initrd.cpio.gz \
+       <上で得たバイナリ> --ignored --exact mac1_sec4_virtiofs_link_observation_on_real_macos --test-threads=1 --nocapture
      ```
 
-  2. 実行入口（既存の起動コマンドだけでは共有されない）: `vm_boot` の `#[ignore]` テストは `VmConfigSpec` に共有を追加せず `Vm::launch` を呼ぶため、そのままではゲストから fixture を観測できない。手元の作業ツリーで `crates/platform-macos/tests/vm_boot.rs` の `mac1_minimal_vm_boots_and_stops_on_real_macos` に一時的に次を足して実行する（**コミットしない**。観測後に当該ファイルの変更を破棄して戻す）。`W` は手順 1 の値を環境変数 `FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE` で渡す。
-
-     ```rust
-     // `.with_devices(devices).expect("with_devices")` の直後に連結する
-     .with_shared_directories({
-         use fandhe_container_platform_macos::virtiofs::{
-             ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
-         };
-         let w = std::path::PathBuf::from(
-             std::env::var("FANDHE_CONTAINER_TEST_VIRTIOFS_FIXTURE").expect("fixture dir"),
-         );
-         let share = |tag: &str, dir: &str, access| {
-             VirtiofsShareSpec::new(
-                 VirtiofsTag::try_new(tag).expect("tag"),
-                 SharedDirectoryPath::try_new(&w.join(dir)).expect("dir"),
-                 access,
-             )
-         };
-         VirtiofsSharesSpec::try_new(vec![
-             share("ro", "ro", ShareAccess::ReadOnly),
-             share("rw", "rw", ShareAccess::ReadWrite),
-         ])
-         .expect("shares")
-     })
-     ```
-
-     ゲスト側のマウント手順（ゲスト資産の init か対話シェルで実行。ゲストカーネルで virtiofs が有効であること）:
-
-     ```sh
-     mkdir -p /mnt/ro /mnt/rw
-     mount -t virtiofs ro /mnt/ro; mount -t virtiofs rw /mnt/rw
-     ```
-
-     対応はホストの `$W/ro`・`$W/rw` がゲストの `/mnt/ro`・`/mnt/rw`（タグ名 = mount の第 1 引数）。シリアル入力手段が無い場合は、上の mount と下の観測コマンドをゲスト資産の起動スクリプトに仕込み、結果をコンソールログ（stderr に出るパス）で読む。
-  3. ゲスト側の観測: `/mnt/ro` の各 symlink（`inside_link`・`abs_inside_link`・`dangling_inside_link`）を `readlink`・`cat`・`stat` して結果を記録する（`abs_inside_link` はゲスト内に同パスが無いため、`cat` が失敗すればゲストの名前空間で解決された証拠になる）。`/mnt/rw` 内でリンク元の通常ファイルを作成（`echo data > /mnt/rw/src`）したうえで、`ln -s src /mnt/rw/sym`（`FUSE_SYMLINK`）・`ln /mnt/rw/src /mnt/rw/hard`（`FUSE_LINK`）を実行し、ホスト側の `$W/rw` で `ls -l`・`stat` してリンクの実体・リンク数を記録する
-  4. 判定: `abs_inside_link` の `cat` がゲスト側で失敗する（ホストが辿らずゲストで解決される）なら拒否維持の補強のみ。ホスト上の `inside.txt` の内容が読めるなら、ホスト側サーバがリンクを辿る証拠としてユーザーへ報告し別 Issue とする。範囲外 symlink・ハードリンクの挙動は本手順では確認できない旨も記録に残す
-  5. 記録先: 結果を #1374 にコメントし、関連 PR にも記録する
+     環境変数は `virtiofs_io` と共通の `FANDHE_CONTAINER_MACOS_VM_KERNEL`（必須）・`_INITRD`・`_CMDLINE`（既定 `console=hvc0`）・`FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS`（1〜600、既定 60）。scratch はログ参照のため削除せず残す（不要になったら当該ディレクトリを手動で削除する）。
+  3. 出力の読み方: 観測行を stderr に `virtiofs_link: guest: ...` で全件出す（正常時は 18 行。終端 `done` は出さない）。形は `share=<ro|rw> name=<固定名> op=<op> result=<結果>` で、結果は `ok`（`value=<文字列>` または `kind=<file|dir|symlink|other> nlink=<n> size=<n>` が付くことがある）・`error errno=<n>`・`not-regular kind=<k>`（read の前の stat が通常ファイルでなかった）・`unprintable`（制御文字・非 UTF-8・行の上限超過）・`missing`（共有の mount が不成立）。`ro` では `inside_link`・`abs_inside_link`・`dangling_inside_link` の各々に `readlink` → `lstat` → `stat` → `read` が並ぶ。`rw` では `src` の `create`、`sym` の `symlink`（FUSE_SYMLINK）、`hard` の `link`（FUSE_LINK）、`sym` の `readlink`・`lstat`、`hard` の `lstat`（ゲストから見た `nlink`）が並ぶ。テストは停止後にホストから `rw/` を `lstat` だけで観察し、`src`・`sym`・`hard` の種別・`nlink`・`(dev, ino)`・`sym` の `read_link` と想定外のエントリ名を `virtiofs_link: host rw/...` で出す（open も symlink の追従もしない）。`abs_inside_link` の `read` が `error errno=2` ならゲストの名前空間で解決された（ホストが辿らない）証拠になる。ホストの `inside.txt` の内容（`inside`）が読めるなら、ホスト側サーバがリンクを辿る証拠としてユーザーへ報告し別 Issue とする。行の形の SSOT は `crates/platform-macos/src/guest_link_probe.rs`。
+  4. 記録: 観測行・ホスト側の観察・環境（macOS の版・ゲストカーネル）を #1374 にコメントし、関連 PR にも記録する。解釈（条件 1・2）は人間、緩和の要否（条件 3〜5）はオーナーが判断する。Agent は実機未実施で、結果を判定扱いにしない
 
 - `make fio-bench`（TASK-25.1・IO-8）: fio・GNU coreutils の `timeout` が入った Linux 環境が必要（root 権限・`/dev/kvm` は不要）。`make fio-bench-selftest`（`--from-json` モード＋固定 fixture＋fio スタブで完結し、実 fio は使わない）は CI の `bench-regression` ジョブに組み込み済みで既定のテスト集合の一部。`make fio-bench` 自体の実機実行・Docker コンテナ内での fio 実行（runbook は [docs/design/io-fio-bench.md](docs/design/io-fio-bench.md)「Docker ベースラインの計測手順」）・その結果の `make fio-baseline-ratio` への入力は TASK-25.2（#113。人間共同）が担う。`make fio-baseline-ratio`（比率算出そのもの）は fio・Docker を必要としないため既定のテスト集合の一部（`make fio-baseline-ratio-selftest` として CI に組み込み済み）
 - 実機での実測・判定が「人間」担当のタスク（`.claude/rules/delegation-impl.md`「着手条件」）を、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する

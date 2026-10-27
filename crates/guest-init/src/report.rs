@@ -200,6 +200,11 @@ impl ReportLine {
         Self(format!("{PROBE_PREFIX}done"))
     }
 
+    /// virtiofs-link の観測行（検証済みの [`crate::link_probe::LinkLine`] から作る。#1877）。
+    pub fn from_link(line: crate::link_probe::LinkLine) -> Self {
+        Self(line.into_string())
+    }
+
     /// 行の文字列（改行を含まない）。
     pub fn as_str(&self) -> &str {
         &self.0

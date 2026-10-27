@@ -2,8 +2,9 @@
 //!
 //! # 責務境界
 //! `cdi_edits::AggregatedEdits`（集計済みの edits）を受け、コンテナの実行環境へ反映する。
-//! 現状は `deviceNodes` の作成（`device_nodes` モジュール。TASK-127.1・#547）と mounts の bind 指定への変換
-//! （`mounts`。TASK-127.2・#548）が実装済みで、hooks・env の適用は後続（#549・#550）、cgroup device の `permissions` は TASK-129、
+//! 現状は `deviceNodes` の作成（`device_nodes` モジュール。TASK-127.1・#547）、mounts の bind 指定への変換
+//! （`mounts`。TASK-127.2・#548）、`createContainer` フックの実行と実行順序の強制（`hooks`。TASK-127.3・#549）が
+//! 実装済みで、env の適用は後続（#550）、cgroup device の `permissions` は TASK-129、
 //! core の実行フロー（`create_default_devices` の後・`pivot_root` の前）への配線も未実装（REPAIR-3）。
 //!
 //! # 呼び出し文脈
@@ -11,6 +12,7 @@
 //! 読む `resolve_device_nodes` を `pivot_root` の前に呼び、コンテナの `/dev` のマウントのルート fd に
 //! 対して `create_device_nodes` を呼ぶ。
 
+pub mod hooks;
 pub mod mounts;
 
 mod device_nodes;
@@ -42,19 +44,22 @@ pub enum CdiApplyErrorCode {
     ResourceExhausted,
     /// 当該 OS・アーキテクチャでは未実装。
     Unimplemented,
+    /// 期限内に終わらなかった（フックの timeout。REPAIR-5）。
+    Timeout,
     /// 上記以外の内部エラー。
     Internal,
 }
 
 impl CdiApplyErrorCode {
     /// 全 variant（網羅の試験用）。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::InvalidArgument,
         Self::NotFound,
         Self::FailedPrecondition,
         Self::PermissionDenied,
         Self::ResourceExhausted,
         Self::Unimplemented,
+        Self::Timeout,
         Self::Internal,
     ];
 
@@ -67,6 +72,7 @@ impl CdiApplyErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::Unimplemented => "UNIMPLEMENTED",
+            Self::Timeout => "TIMEOUT",
             Self::Internal => "INTERNAL",
         }
     }
@@ -94,7 +100,7 @@ impl CdiApplyError {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const fn with_errno(mut self, errno: i32) -> Self {
         self.errno = Some(errno);
         self
@@ -145,6 +151,7 @@ mod tests {
                 "PERMISSION_DENIED",
                 "RESOURCE_EXHAUSTED",
                 "UNIMPLEMENTED",
+                "TIMEOUT",
                 "INTERNAL"
             ]
         );

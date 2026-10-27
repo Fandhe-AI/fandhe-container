@@ -11,7 +11,7 @@
 //!
 //! # 監査（SEC-4・PLUG-11・#2013）
 //!
-//! 信頼性検証の拒否（所有者・モード・ハッシュ・未実装方式）は core の `verify_candidate_audited` で検証し、
+//! 信頼性検証の拒否（所有者・モード・ハッシュ・検証しないホスト）は core の `verify_candidate_audited` で検証し、
 //! 拒否 1 回につき層 `plugin_trust` の監査レコードを 1 件、`AuditSink` へ記録する。本番の記録先は
 //! `unavailable` が `FileAuditSink::open_in_state_root`（`<状態ルート>/@audit.log`）で作る。記録先を作れない
 //! ときは、常にその `TraitError` を返す私的な sink を渡し、`AuditDelivery::SinkFailed` として扱う（黙って捨てない。
@@ -20,16 +20,18 @@
 //! 記録先の作成失敗は私的な sink が、どちらも固定スキーマ 1 行を stderr へ出す（REPAIR-4。パス・errno は含めない）。記録に `container_id` は付けない: 検証はコンテナを特定する前にバックエンドを解決するために走り
 //! （create・start・stop・delete・list・logs のどれでも）、特定のコンテナに属さないため。
 //!
-//! 未実装・簡易実装（REPAIR-3。実装済みを装わない）:
-//! - 非 Linux の既定探索先は空（core が未確定のため）で、実環境では「候補なし」になる。
-//! - 非 Linux の信頼性検証は core が常に `Unsupported` で拒否する（PLUG-11 の非 Linux 実装待ち）。この拒否も
-//!   `unsupported` として記録を試みる。macOS は `FileStateStore` 対応済み（OCI-5）で記録先を作れる。
-//!   Windows は `FileStateStore::open` が `Unimplemented` を返し記録先が作れないため、記録は `SinkFailed` になる
-//!   （`FileStateStore` の Windows 実装待ち）。
+//! 現状（REPAIR-3。実装済みを装わない）:
+//! - 既定の探索先: macOS は system の `/usr/local/libexec/fandhe-container/plugins` と user の
+//!   `<XDG_DATA_HOME>/fandhe-container/plugins`（無ければ `~/Library/Application Support/fandhe-container/plugins`）の
+//!   2 か所（#1863）。Windows は空で、実環境では「候補なし」になる（#1415・#1539）。
+//! - 信頼性検証: macOS は core で実装済み（拡張 ACL を含む。#1865）で、拒否は `Untrusted` に写す。Windows はホストで
+//!   検証せず（core が `Unsupported` で拒否）、`TrustNotPerformedOnHost` に写す。この拒否も `unsupported` として記録を
+//!   試みる。macOS は `FileStateStore` 対応済み（OCI-5）で記録先を作れる。Windows は `FileStateStore::open` が
+//!   `Unimplemented` を返し記録先が作れないため、記録は `SinkFailed` になる（`FileStateStore` の Windows 実装待ち）。
 //! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
 //!   （設計案は `docs/design/plugin-hash-allowlist.md`・#1868。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は
-//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
+//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち〕、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
 //!
 //! したがって [`backend_failure`] は現状必ず失敗を返す。
 //!
@@ -74,7 +76,7 @@ use super::args::GlobalArgs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BackendFailure {
     NotInstalled,
-    TrustUnsupported,
+    TrustNotPerformedOnHost,
     Untrusted,
     NotInvokable,
     NoBackend,
@@ -84,7 +86,7 @@ impl BackendFailure {
     /// 全 variant（`classify` の走査対象。表の追加漏れをテストで検出する）。
     pub(super) const ALL: [Self; 5] = [
         Self::NotInstalled,
-        Self::TrustUnsupported,
+        Self::TrustNotPerformedOnHost,
         Self::Untrusted,
         Self::NotInvokable,
         Self::NoBackend,
@@ -93,7 +95,7 @@ impl BackendFailure {
     pub(super) fn code(self) -> ErrorCode {
         match self {
             Self::NotInstalled => ErrorCode::FailedPrecondition,
-            Self::TrustUnsupported | Self::NotInvokable | Self::NoBackend => {
+            Self::TrustNotPerformedOnHost | Self::NotInvokable | Self::NoBackend => {
                 ErrorCode::Unimplemented
             }
             Self::Untrusted => ErrorCode::PermissionDenied,
@@ -103,7 +105,7 @@ impl BackendFailure {
     pub(super) fn message(self) -> &'static str {
         match self {
             Self::NotInstalled => MSG_NOT_INSTALLED,
-            Self::TrustUnsupported => MSG_TRUST_UNSUPPORTED,
+            Self::TrustNotPerformedOnHost => MSG_TRUST_NOT_PERFORMED_ON_HOST,
             Self::Untrusted => MSG_UNTRUSTED,
             Self::NotInvokable => MSG_NOT_INVOKABLE,
             Self::NoBackend => MSG_NO_BACKEND,
@@ -123,7 +125,8 @@ impl BackendFailure {
 }
 
 const MSG_NOT_INSTALLED: &str = "platform backend plugin is not installed";
-const MSG_TRUST_UNSUPPORTED: &str = "plugin trust verification is not implemented on this platform";
+const MSG_TRUST_NOT_PERFORMED_ON_HOST: &str =
+    "plugin trust verification is not performed on this host";
 const MSG_UNTRUSTED: &str = "platform backend plugin failed trust verification";
 const MSG_NOT_INVOKABLE: &str = "plugin backend invocation is not implemented";
 const MSG_NO_BACKEND: &str = "no platform backend plugin exists for this platform";
@@ -162,8 +165,8 @@ pub(super) fn host_backend() -> Option<BackendPlugin> {
 
 /// 発見結果を登録・検証し、現時点で到達できる段階の失敗を返す（常に失敗。モジュール doc 参照）。
 ///
-/// 対応表: 候補なし → `FailedPrecondition`、非 Linux の検証未実装 → `Unimplemented`、
-/// 検証・ハッシュ照合の拒否 → `PermissionDenied`、全検証通過後（起動未実装）→ `Unimplemented`。
+/// 対応表: 候補なし → `FailedPrecondition`、ホストが検証しない（Windows）→ `Unimplemented`、
+/// 検証・ハッシュ照合の拒否（macOS の拡張 ACL を含む）→ `PermissionDenied`、全検証通過後（起動未実装）→ `Unimplemented`。
 /// 同名候補の shadowed へは自動フォールバックしない（レジストリの契約どおり）。
 ///
 /// PATH 由来の候補もレジストリへ渡す。許可一覧の配線時に採否を再評価する（モジュール doc 参照。#1869 の設計・TASK-122）。
@@ -187,10 +190,18 @@ pub(super) fn backend_failure(
     // （設計案は docs/design/plugin-hash-allowlist.md・#1868）。
     match verify_candidate_audited(candidate, &PluginVerificationMethod::default(), sink) {
         Ok(_) => BackendFailure::NotInvokable.into_error(),
-        Err(rejection) if rejection.error.kind() == PluginTrustErrorKind::Unsupported => {
-            BackendFailure::TrustUnsupported.into_error()
-        }
-        Err(_) => BackendFailure::Untrusted.into_error(),
+        Err(rejection) => failure_for_trust_kind(rejection.error.kind()).into_error(),
+    }
+}
+
+/// 信頼性検証の拒否の種別から失敗の分類への写像（PLUG-11・#1867）。`Unsupported`（検証しないホスト = Windows）だけを
+/// [`BackendFailure::TrustNotPerformedOnHost`] に、それ以外（macOS の拡張 ACL を含む全拒否）を
+/// [`BackendFailure::Untrusted`] に写す。種別は `#[non_exhaustive]` のため未知の種別も拒否（`Untrusted`）に落とす（fail-closed）。
+/// `VerificationMethodNotImplemented` は既定の方式では到達せず、方式を選べる配線（#1868・#1869）の時点で見直す。
+fn failure_for_trust_kind(kind: PluginTrustErrorKind) -> BackendFailure {
+    match kind {
+        PluginTrustErrorKind::Unsupported => BackendFailure::TrustNotPerformedOnHost,
+        _ => BackendFailure::Untrusted,
     }
 }
 
@@ -514,12 +525,12 @@ mod tests {
     /// PLUG-11（Windows 等。Linux・macOS 以外）: ホストでは信頼性検証をしないため Unimplemented（fail-closed。#1415・#1539）。
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn plug11_windows_trust_unimplemented() {
+    fn plug11_windows_trust_not_performed_on_host() {
         let tmp = Tmp::new("unsupported");
         let sink = CollectSink::new();
         let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &["macos"]), &sink);
         assert_eq!(e.code(), ErrorCode::Unimplemented);
-        assert_eq!(e.message(), MSG_TRUST_UNSUPPORTED);
+        assert_eq!(e.message(), MSG_TRUST_NOT_PERFORMED_ON_HOST);
         assert_no_path_or_name(&e, &tmp);
         // 拒否 `unsupported` も記録を試みる（SEC-4・#2013）。
         let recs = sink.records();
@@ -569,12 +580,15 @@ mod tests {
             PluginRegistry::from_candidates(report.candidates().iter().cloned()).expect("registry");
         let entry = registered.get("macos").expect("macos registered");
         assert_eq!(entry.origin(), PluginDirKind::Path);
-        // PATH 由来の候補も信頼性検証を通る。Linux では一時ディレクトリが不適格、非 Linux は未実装で拒否。
+        // PATH 由来の候補も信頼性検証を通る。Linux・macOS は検証で拒否（PermissionDenied）、
+        // それ以外（Windows）はホストが検証しないため Unimplemented。
         let e = backend_failure(BackendPlugin::Macos, report, &CollectSink::new());
-        assert!(matches!(
-            e.code(),
-            ErrorCode::PermissionDenied | ErrorCode::Unimplemented
-        ));
+        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            ErrorCode::PermissionDenied
+        } else {
+            ErrorCode::Unimplemented
+        };
+        assert_eq!(e.code(), expected);
     }
 
     /// CLI-1: ホスト OS ごとのバックエンド選択。
@@ -605,6 +619,32 @@ mod tests {
         }
     }
 
+    /// PLUG-11・#1867: 拒否の種別から分類への写像を具体値で固定する（3 OS で走る。拡張 ACL は macOS の拒否で `Untrusted`）。
+    #[test]
+    fn plug11_trust_kind_mapping_is_exact() {
+        use PluginTrustErrorKind as K;
+        let table = [
+            (K::UntrustedOwner, BackendFailure::Untrusted),
+            (K::GroupOrOtherWritable, BackendFailure::Untrusted),
+            (K::ExtendedAcl, BackendFailure::Untrusted),
+            (K::NotRegularFile, BackendFailure::Untrusted),
+            (K::NotDirectory, BackendFailure::Untrusted),
+            (K::InvalidPath, BackendFailure::Untrusted),
+            (K::Io, BackendFailure::Untrusted),
+            (K::SymlinkLoop, BackendFailure::Untrusted),
+            (K::Unsupported, BackendFailure::TrustNotPerformedOnHost),
+            (K::HashMismatch, BackendFailure::Untrusted),
+            (K::TooLarge, BackendFailure::Untrusted),
+            (
+                K::VerificationMethodNotImplemented,
+                BackendFailure::Untrusted,
+            ),
+        ];
+        for (kind, want) in table {
+            assert_eq!(failure_for_trust_kind(kind), want, "{kind:?}");
+        }
+    }
+
     /// 固定文言は引用符・バックスラッシュ・制御文字を含まない（出力への反射・エスケープ不要）。
     #[test]
     fn fixed_messages_need_no_escaping() {
@@ -624,9 +664,9 @@ mod tests {
                 "platform backend plugin is not installed",
             ),
             (
-                BackendFailure::TrustUnsupported,
+                BackendFailure::TrustNotPerformedOnHost,
                 ErrorCode::Unimplemented,
-                "plugin trust verification is not implemented on this platform",
+                "plugin trust verification is not performed on this host",
             ),
             (
                 BackendFailure::Untrusted,
@@ -664,6 +704,11 @@ mod tests {
                 "platform backend plugin is not installed",
             ),
             TraitError::new(ErrorCode::FailedPrecondition, "detail"),
+            // 表から消えた旧文言は逆引きされない（#1867）。
+            TraitError::new(
+                ErrorCode::Unimplemented,
+                "plugin trust verification is not implemented on this platform",
+            ),
         ] {
             assert_eq!(BackendFailure::classify(&e), None);
         }

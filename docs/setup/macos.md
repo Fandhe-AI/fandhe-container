@@ -17,7 +17,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 | ゲストカーネル・initrd のビルドスクリプト | 実装済み（macOS ホストでのビルド・リンクと VM での起動は未確認） | `make guest-kernel-build`・`make guest-initrd-build` |
 | `fandhe-container setup` の手順表示 | 実装済み | 表示のみ。検出も適用もしない |
 | CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 は承認待ち） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
-| macOS の plugin の信頼性検証（PLUG-11） | core は実装済み（#1865。所有者・モード・祖先・symlink 実体・拡張 ACL） | CLI の分類・文言は #1867、許可済みハッシュ一覧は未配線（#1868、承認待ち）のため、現状は全件拒否される |
+| macOS の plugin の信頼性検証（PLUG-11） | core・CLI とも実装済み（#1865・#1867。所有者・モード・祖先・symlink 実体・拡張 ACL） | 拒否は `PERMISSION_DENIED`（6）・`platform backend plugin failed trust verification`、候補なしは `FAILED_PRECONDITION`（5）・`platform backend plugin is not installed`。許可済みハッシュ一覧は未配線（#1868、承認待ち）のため、現状は全件拒否される |
 | `setup` のステップの自動検出・適用 | 未実装（TASK-125） | |
 
 判断待ち:
@@ -92,7 +92,18 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 
 ## plugin の配置と信頼性検証
 
-未実装・判断待ち。既定の探索先は system の `/usr/local/libexec/fandhe-container/plugins` と user の `<XDG_DATA_HOME>/fandhe-container/plugins`（無ければ `~/Library/Application Support/fandhe-container/plugins`）の 2 か所（#1539・#1863）だが、信頼性検証（PLUG-11）は core では実装済み（#1865。拡張 ACL のあるディレクトリ・ファイルは拒否する。`~/Library` 配下は既定の ACL で拒否されうる〔実機未確認〕）だが、許可済みハッシュ一覧が未配線のため現状は全件拒否される（fail-closed）。許可済みハッシュ一覧の作り方（署名後のバイナリのハッシュを載せる方針は #1539）は #1868 の承認後に本節へ書く。
+導入場所と信頼性検証（PLUG-11）の要件を次に示す。ただし許可済みハッシュ一覧が未配線（#1868）のため、現状はどの plugin も検証で拒否される（fail-closed）。
+
+- 導入場所（ファイル名は `fandhe-container-plugin-macos`）:
+  - system: `/usr/local/libexec/fandhe-container/plugins`
+  - user: `$XDG_DATA_HOME/fandhe-container/plugins`（`XDG_DATA_HOME` が絶対パスのときだけ使う。無ければ `~/Library/Application Support/fandhe-container/plugins`）
+  - `PATH` の探索は opt-in のみ（`--plugin-path-search`、または `FANDHE_CONTAINER_PLUGIN_PATH_SEARCH=1`）。候補ごとに警告が出る（#1539・#1863）
+- 所有者・モード: ファイル、探索先、`/` までの全祖先が、root か実行ユーザーの所有で、group と other に書き込み権限が無いこと（sticky ビットも例外にしない）。symlink の plugin は実体とその祖先で判定する。探索先と祖先が symlink の場合は拒否する（`/tmp`・`/var` を通るパスは使えない）
+- 拡張 ACL: ディレクトリやファイルに拡張 ACL があれば、中身を解釈せずに拒否する。`~/Library` 配下は既定の ACL（`group:everyone deny delete`）で拒否されうる（実機未確認。要確認。確認例: `ls -le <パス>`）
+- `/usr/local` が group 書き込み可の環境（古い Homebrew など）では、system の探索先が祖先の検査で拒否される
+- 署名後のハッシュ: plugin-macos は Virtualization.framework の entitlement のために署名が要り（上の「entitlement とコード署名」と `AGENTS.md` の `codesign` の手順を参照）、署名でバイナリが変わる。許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539）
+- CLI の失敗: 拒否は `PERMISSION_DENIED`（6）、候補なしは `FAILED_PRECONDITION`（5）。どちらもパス・plugin 名を出力しない固定文言（#1867）
+- 未確定・未確認: 許可済みハッシュ一覧の置き場所と指定方法は未確定（#1868、承認待ち）。plugin の起動と RPC は未実装（#1869）。権限の実態は実機で未確認（#1628・#1923）
 
 ## 状態ルート
 
@@ -104,7 +115,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 | ----- | ---- | ---------- |
 | #1906 | 既定方式（常駐 VM の共用）の未決事項 | ゲストカーネルと initrd の用意と配置 |
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
-| #1867 | macOS の信頼性検証の結果を CLI に反映 | plugin の配置と信頼性検証 |
+| #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
 | #1869 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |
 | #2431 | 状態ルートの既定 | 状態ルート |

@@ -172,7 +172,7 @@ runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --label stub --output
 check "ok run exits 0" rc_is 0
 if [ "$rc" -ne 0 ]; then cat "${TMP}/err"; fi
 runl="$(grep '^run ' "${STUB_DIR}/calls" | tail -1)"
-for want in '--pull never' '--rm' '--cidfile' '--label fandhe.mac-small-files.run=' ':/data alpine:3.20'; do
+for want in '--pull never' '--rm' '--cidfile' '--label fandhe.mac-small-files.run=' ":/data sha256:$(printf 'a%.0s' $(seq 1 64)) "; do
   case "$runl" in *"$want"*) pass "run line has: $want" ;; *) fail "run line has: $want (got: $runl)" ;; esac
 done
 check "image inspect was called before run" calls_has '^image inspect'
@@ -243,6 +243,12 @@ reset_stub stuck
 runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
 check "containers that cannot be removed exit 4" rc_is 4
 check "cleanup-failed is reported" err_has 'code=cleanup-failed'
+reset_stub stuck
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --output "${TMP}/stuck.json"
+check "cleanup failure: exit 4 with --output" rc_is 4
+check "cleanup failure: result file is not published" test ! -e "${TMP}/stuck.json"
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST"
+check "cleanup failure: nothing on stdout" empty_file "${TMP}/out"
 
 # --- own は未実装 ---
 reset_stub ok
@@ -284,6 +290,10 @@ runit --mode report --own-result "${TMP}/o-noimg.json" --baseline-result "${TMP}
 check "report rejects results without image with 2" rc_is 2
 runit --mode report --own-result "${TMP}/b.json" --baseline-result "${TMP}/b.json"
 check "report rejects a docker result as --own-result with 2" rc_is 2
+runit --mode report --own-result "${TMP}/o.json" --baseline-result "${TMP}/o.json"
+check "report rejects the same file as own and baseline with 2" rc_is 2
+runit --mode report --own-result "${TMP}/o.json" --baseline-result "${TMP}/o2.json"
+check "report rejects a target=own result as --baseline-result with 2" rc_is 2
 # 同じタグでも image_id が違えば比較不能（率は null）
 mkres own 800 75 batch-boundary-provisional 2000 "sha256:$(printf 'b%.0s' $(seq 1 64))" >"${TMP}/o-id.json"
 runit --mode report --own-result "${TMP}/o-id.json" --baseline-result "${TMP}/b.json"

@@ -137,12 +137,24 @@ emit_result() { # file
   fi
 }
 
+# 後始末の成功後に結果を公開する（stdout または --output の新規ファイル）。
+publish_result() {
+  if [ -n "$output" ]; then
+    (set -o noclobber; printf '%s\n' "$1" >"$output") 2>/dev/null || usage_error "cannot create --output"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 work=""
 RUN_LIMITED_DIR=""
 run_tag=""
 cleanup_needed=0
 trial_dirs_file=""
 cleanup_failed=0
+run_image=""
+# 公開待ちの結果。後始末が成功した後にだけ公開する。
+pending_result=""
 
 # ---------------------------------------------------------------------------
 # バックエンド差し替え点（docker 側。own 側を実装するときはこの関数群だけを差し替える。
@@ -183,7 +195,7 @@ backend_version() { run_limited "${cap_secs:-$CLEANUP_TIMEOUT_SECS}" "$runtime" 
 # 1 試行。引数: <limit秒> <cidfile> <host の作業ディレクトリ> <script> <stdout> <stderr>
 backend_run_once() {
   run_limited "$1" "$runtime" run --rm --pull never --cidfile "$2" \
-    --label "${LABEL_KEY}=${run_tag}" -v "$3:/data" "$image" sh -c "$4" >"$5" 2>"$6"
+    --label "${LABEL_KEY}=${run_tag}" -v "$3:/data" "${run_image:-$image}" sh -c "$4" >"$5" 2>"$6"
 }
 
 # 完全一致のラベルで所有を証明できたコンテナ ID（停止中を含む）を stdout へ出す。--filter name= は部分一致のため使わない。
@@ -242,6 +254,9 @@ cleanup() {
     echo "error: code=cleanup-failed message=containers labeled ${LABEL_KEY}=${run_tag} may remain; inspect and remove them manually" >&2
     exit 4
   fi
+  if [ "$rc" -eq 0 ] && [ -n "$pending_result" ]; then
+    publish_result "$pending_result"
+  fi
   exit "$rc"
 }
 
@@ -259,13 +274,16 @@ run_report() {
   [ -n "$baseline_result" ] || usage_error "--baseline-result is required"
   validate_output
   local f size
-  for f in "$own_result" "$baseline_result"; do
+  [ "$own_result" != "$baseline_result" ] || usage_error "--own-result and --baseline-result must be different files"
+  local role
+  for role in own docker; do
+    if [ "$role" = own ]; then f="$own_result"; else f="$baseline_result"; fi
     case "$f" in /*) ;; *) usage_error "result files must be absolute paths" ;; esac
     [ -f "$f" ] && [ ! -L "$f" ] || usage_error "result files must be regular files"
     size="$(wc -c <"$f" | tr -d ' ')"
     [ "$size" -le "$MAX_RESULT_BYTES" ] || usage_error "result file is too large"
     # 複数の JSON 値を含むファイルを弾くため slurp し、ちょうど 1 要素であることを要求する。
-    jq -s -e --arg s "$SCHEMA" --arg want "$([ "$f" = "$own_result" ] && echo own || echo docker)" '
+    jq -s -e --arg s "$SCHEMA" --arg want "$role" '
       length == 1 and (.[0]
       | .schema == $s
       and .target == $want
@@ -284,7 +302,7 @@ run_report() {
       and (.mount_kind | type == "string" and length > 0)
       and (.label | type == "string")
       and (.trials_ok | type == "number" and . >= 5))
-    ' "$f" >/dev/null 2>&1 || usage_error "result file failed validation (single JSON object, schema, target=$([ "$f" = "$own_result" ] && echo own || echo docker) and required fields)"
+    ' "$f" >/dev/null 2>&1 || usage_error "result file failed validation (single JSON object, schema, target=${role} and required fields)"
   done
   local tmp
   tmp="$(mktemp)"
@@ -417,6 +435,8 @@ run_docker() {
   [ "$rc" -eq 0 ] || fail_measure "image is not available locally (pull it first; --pull never is used)"
   case "$image_id" in sha256:*) ;; *) fail_measure "unexpected image id" ;; esac
   case "${image_id#sha256:}" in *[!0-9a-f]* | '') fail_measure "unexpected image id" ;; esac
+  # 計測の各 run は事前確認した ID を起動する（可変タグの差し替えで別イメージを測らない）。タグは表示用に残す。
+  run_image="$image_id"
   rc=0
   cap_for "$CLEANUP_TIMEOUT_SECS"
   backend_ver="$(backend_version)" || rc=$?
@@ -512,7 +532,7 @@ run_docker() {
   jq -e '.trials_ok >= 5 and (.metrics.wall_clock_median_ms.value > 0) and (.metrics.metadata_p95_us.value >= 0)' "$final" >/dev/null 2>&1 \
     || fail_measure "result failed validation"
   [ "$(wc -c <"$final" | tr -d ' ')" -le "$MAX_RESULT_BYTES" ] || fail_measure "result is too large"
-  emit_result "$final"
+  pending_result="$(cat "$final")"
 }
 
 case "$mode" in

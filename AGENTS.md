@@ -61,7 +61,7 @@ make third-party-licenses   # cargo about でサードパーティのライセ�
 make third-party-licenses-selftest  # 上記スクリプトの自己テスト（スタブ cargo のみ）
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
-make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
+make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。CLI の実行ファイルは plugin を除外できないため rlib 計測。#2170）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。実行対象は plugin 境界ベンチ・small_files を含むが、baseline 登録済みの metric に限って比較する。現状の比較対象はプレースホルダのみ）
 cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 と Δp50（TASK-113.3）を ns で出力し、Δp50 と CORE-10 比は stderr へログ。Unix のみ。baseline 未登録のため bench-check には未接続）
 cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。Δp50 も出力。bench-check には未接続）

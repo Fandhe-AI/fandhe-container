@@ -694,6 +694,8 @@ mod socket {
         /// として記録する（内側の request / send / recv も個別に記録）。`timeout` は全体の期限
         /// （推奨 5〜10 秒）。`Timeout` / `DataLoss` ではカーネル側で作成済みか不明なため、状態を再照会すること。
         /// 同名が既にあれば `AlreadyExists`、権限不足は `PermissionDenied`。
+        /// `LinkCreate::with_echo` の要求では `reply.messages()` に作成通知（`RTM_NEWLINK`）が入る（v6.2 以降。
+        /// 検証は `decode_created_link`。Issue #1972）。
         pub fn create_link(
             &self,
             req: &LinkCreate,

@@ -28,8 +28,11 @@
 //! `net/core/rtnetlink.c` で `IFLA_IFALIAS` を処理するのは `do_setlink` の `netif_set_alias` だけ。
 //! Issue #1925）。そのため bridge は `NLM_F_EXCL` で作成した後、次の順で所有トークンを刻む。
 //!
-//! 1. 名前から ifindex と別名を 1 回の `RTM_GETLINK` で引く。別名が既にあれば別者が差し替えた link なので
-//!    止まる（削除しない）
+//! 1. 作成要求に付けた `NLM_F_ECHO` の作成通知（`RTM_NEWLINK`）から、作成した link 自身の ifindex を得る
+//!    （Linux v6.2 以降。`docs/design/bridge-create-echo.md`・Issue #1972）。通知が返らなかった場合
+//!    （v6.2 より前のカーネルなど）だけ、名前から ifindex と別名を 1 回の `RTM_GETLINK` で引く戻し経路に
+//!    移る。別名が既にあれば別者が差し替えた link なので止まる（削除しない）。通知が届いたのに内容が
+//!    不正（件数・名前・別名の食い違い）なときも、戻し経路には移らず止まる（削除しない）
 //! 2. その ifindex 指定の `RTM_SETLINK` で作成ごとに一意な所有トークンを `IFLA_IFALIAS` に付ける
 //!    （名前では指定しない。名前の差し替えを巻き込まない）
 //! 3. 名前から引き直して、ifindex が 1 と同じで別名がトークンと一致することを確認する
@@ -37,9 +40,14 @@
 //! 3 までに同名 link へ差し替えられれば ifindex か別名が食い違って検出する。確認後の操作はすべてトークン一致
 //! を確認してから行い、不一致（同名 link への差し替え）なら操作も削除もしない。2 の `RTM_SETLINK` が
 //! 失敗・時間切れの場合だけ、再照会して「ifindex が 1 と同じ」かつ（別名がトークン、または別名が空のまま）
-//! のときに限り、ifindex 指定で削除する（`rollback_unstamped`）。残余リスク: 1 の直前に `CAP_NET_ADMIN`
-//! 保持者が自分の bridge を別名なしで差し替えた場合に限り、その link に印を付ける窓が残る。同じ権限を持つ者が
-//! 相手のため権限境界は越えず、`NLM_F_EXCL` と ifindex 指定（名前の再解決なし）で窓を最小化している。
+//! のときに限り、ifindex 指定で削除する（`rollback_unstamped`）。echo 経路では、印を付ける相手が作成通知の
+//! ifindex（自分が作った link）に固定されるため、作成から印付けまでに「異なる ifindex の link」へ
+//! 差し替えられても印は付かない（`RTM_SETLINK` が `NotFound`）。ただし ifindex は link の寿命を固定する
+//! ハンドルではなく、`CAP_NET_ADMIN` 保持者が bridge を削除して同名・同 ifindex の別 link を作った場合は
+//! `RTM_SETLINK` が通り、その link に印が付き得る（echo 経路にも残る残余リスク。同じ権限の者が相手のため
+//! 権限境界は越えない）。さらに戻し経路（echo が返らない古いカーネル）に限り、1 の直前に `CAP_NET_ADMIN` 保持者が自分の bridge を別名
+//! なしで差し替えた場合にその link に印を付ける窓が残る。同じ権限を持つ者が相手のため権限境界は越えず、
+//! `NLM_F_EXCL` と ifindex 指定（名前の再解決なし）で窓を最小化している。
 //! bridge 作成要求が
 //! 送信後の応答エラー（`ResourceExhausted` 等）で失敗した場合は作成済みの可能性があるため
 //! `ResourceState::Unknown` で報告する（確定的な拒否のみ空報告）。
@@ -155,7 +163,7 @@ use crate::etc_hosts::NameResolution;
 #[cfg(target_os = "linux")]
 use crate::netlink_route::{
     AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet,
-    NetlinkRouteSocket, NetnsFd, NetnsTarget, RouteNextHop, RouteSpec,
+    NetlinkRouteSocket, NetnsFd, NetnsTarget, RouteNextHop, RouteSpec, decode_created_link,
 };
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 #[cfg(target_os = "linux")]
@@ -632,12 +640,36 @@ pub(crate) struct NftApplyFailure {
     pub(crate) outcome: NftBatchOutcome,
 }
 
+/// bridge 作成の ACK 後に、`NLM_F_ECHO` の作成通知から得られた結果（Issue #1972・NET-1）。
+///
+/// `create_network_with` が印を付ける相手の ifindex を、名前の引き直しなしで決めるために使う。
+/// 作成手順のうち `create_bridge` と手順 2 の間の契約で、crate 外には出さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeCreated {
+    /// 作成通知の読み取り結果。
+    pub(crate) echo: EchoedIndex,
+}
+
+/// `NLM_F_ECHO` の作成通知の読み取り結果。
+/// 構築するのは Linux の `LinuxNetworkOps` だけ（他 OS では参照のみで dead_code になるため局所的に許す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum EchoedIndex {
+    /// 検証済みの作成通知から得た、作成した link 自身の ifindex。
+    Index(IfIndex),
+    /// 通知が返らなかった（v6.2 より前のカーネルなど）。名前で引き直す戻し経路に移る。
+    Absent,
+    /// 通知は届いたが内容が不正。ACK は成功しているため bridge は作成済みで、自分のものと確定できない。
+    Invalid(NetError),
+}
+
 /// 作成手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。
 pub(crate) trait NetworkOps {
-    /// bridge を `NLM_F_EXCL` で作る。カーネルは作成時の `IFLA_IFALIAS` を反映しないため、所有トークンは
-    /// 作成後に [`set_owner_token`](Self::set_owner_token) で付ける（Issue #1925）。
-    fn create_bridge(&self, name: &IfName) -> Result<(), NetError>;
+    /// bridge を `NLM_F_EXCL | NLM_F_ECHO` で作る。カーネルは作成時の `IFLA_IFALIAS` を反映しないため、
+    /// 所有トークンは作成後に [`set_owner_token`](Self::set_owner_token) で付ける（Issue #1925）。
+    /// 戻り値の [`BridgeCreated`] は作成通知から得た ifindex を持つ（Issue #1972）。
+    fn create_bridge(&self, name: &IfName) -> Result<BridgeCreated, NetError>;
     /// 名前から ifindex と現在の別名（`IFLA_IFALIAS`。無ければ `None`）を引く。所有の確認はしない。
     /// 作成直後の link に別名が既にあれば、差し替えられた別者の link と判断するために使う。
     fn link_state(&self, name: &IfName) -> Result<(IfIndex, Option<String>), NetError>;
@@ -829,25 +861,39 @@ pub(crate) fn create_network_with(
     // 1. bridge 作成。カーネルは作成時の IFLA_IFALIAS を反映しないため、この要求では所有を刻まない。
     // AlreadyExists は他者のリソースなので削除しない。確定的な拒否以外（送信後の応答エラー等）は
     // 作成済みの可能性があるため Unknown で報告する。
-    if let Err(e) = ops.create_bridge(&bridge) {
-        let mut report = RollbackReport::default();
-        if !is_definitely_rejected(e.code()) {
-            report
-                .leftover
-                .push((NetworkResource::Bridge(bridge), ResourceState::Unknown));
+    let created = match ops.create_bridge(&bridge) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut report = RollbackReport::default();
+            if !is_definitely_rejected(e.code()) {
+                report
+                    .leftover
+                    .push((NetworkResource::Bridge(bridge), ResourceState::Unknown));
+            }
+            return Err(fail(collision_or(e), CreateStep::CreateBridge, report));
         }
-        return Err(fail(collision_or(e), CreateStep::CreateBridge, report));
-    }
+    };
 
-    // 2. 作成直後の ifindex と別名を引く。別名が空でなければ別者が差し替えた link なので、自分のものと
-    // 確定できず削除しない（Unknown）。NotFound は残るものが無い。
+    // 2. 印を付ける相手の ifindex を決める。作成通知（NLM_F_ECHO）があればそれが作った link 自身なので、
+    // 名前では引き直さない（Issue #1972）。通知が無い場合だけ作成直後の ifindex と別名を引き、別名が空で
+    // なければ別者が差し替えた link なので、自分のものと確定できず削除しない（Unknown）。
+    // NotFound は残るものが無い。通知が届いたのに不正な場合は ACK 済みで作成済みのため Unknown。
     let unknown_bridge = |report: &mut RollbackReport| {
         report.leftover.push((
             NetworkResource::Bridge(bridge.clone()),
             ResourceState::Unknown,
         ));
     };
-    let index = match ops.link_state(&bridge) {
+    let looked_up = match created.echo {
+        EchoedIndex::Index(i) => Ok((i, None)),
+        EchoedIndex::Invalid(e) => {
+            let mut report = RollbackReport::default();
+            unknown_bridge(&mut report);
+            return Err(fail(e, CreateStep::ResolveIndex, report));
+        }
+        EchoedIndex::Absent => ops.link_state(&bridge),
+    };
+    let index = match looked_up {
         Ok((i, alias)) if alias.as_deref().is_none_or(str::is_empty) => i,
         Ok(_) => {
             let mut report = RollbackReport::default();
@@ -939,10 +985,20 @@ struct LinuxNetworkOps<'a> {
 
 #[cfg(target_os = "linux")]
 impl NetworkOps for LinuxNetworkOps<'_> {
-    fn create_bridge(&self, name: &IfName) -> Result<(), NetError> {
-        self.route
-            .create_link(&LinkCreate::bridge(name.clone()), self.timeout)
-            .map(|_| ())
+    fn create_bridge(&self, name: &IfName) -> Result<BridgeCreated, NetError> {
+        let reply = self
+            .route
+            .create_link(&LinkCreate::bridge(name.clone()).with_echo(), self.timeout)?;
+        // ACK は成功済み。通知の検証失敗は create の失敗ではなく Invalid として呼び出し元へ返す。
+        let echo = match decode_created_link(
+            reply.messages().iter().map(|m| (m.msg_type(), m.payload())),
+            name,
+        ) {
+            Ok(Some(i)) => EchoedIndex::Index(i),
+            Ok(None) => EchoedIndex::Absent,
+            Err(e) => EchoedIndex::Invalid(e),
+        };
+        Ok(BridgeCreated { echo })
     }
 
     fn link_state(&self, name: &IfName) -> Result<(IfIndex, Option<String>), NetError> {
@@ -2747,6 +2803,14 @@ mod tests {
         /// 指定回数の verify_owned 成功後に FailedPrecondition を返す（差し替えの注入）。
         fail_verify_after: Option<u32>,
         verify_count: std::cell::Cell<u32>,
+        /// 作成通知（NLM_F_ECHO）が ifindex 7 で届く（Issue #1972）。既定は届かない（戻し経路）。
+        echo_enabled: bool,
+        /// 作成通知が届いたが内容が不正な模型。
+        echo_invalid: Option<NetError>,
+        /// create_bridge の直後にカーネル模型を置き換える差し替えの注入。
+        swap_after_create: Option<(u32, Option<String>)>,
+        /// set_owner_token を実カーネルと同じく ifindex に従わせる。
+        strict_setlink: bool,
     }
 
     impl Fake {
@@ -2763,14 +2827,25 @@ mod tests {
     }
 
     impl NetworkOps for Fake {
-        fn create_bridge(&self, _: &IfName) -> Result<(), NetError> {
+        fn create_bridge(&self, _: &IfName) -> Result<BridgeCreated, NetError> {
             self.rec("create_bridge");
             if let Some(c) = self.fail_bridge {
                 return Err(err(c));
             }
             // 実カーネルと同じく、作成直後は別名なし（initial_alias は差し替えの注入）。
             *self.kernel.borrow_mut() = Some((7, self.initial_alias.clone()));
-            Ok(())
+            let echo = if let Some(e) = self.echo_invalid.clone() {
+                EchoedIndex::Invalid(e)
+            } else if self.echo_enabled {
+                EchoedIndex::Index(IfIndex::new(7)?)
+            } else {
+                EchoedIndex::Absent
+            };
+            // 作成の直後（通知の送出後）に別者が link を差し替える模型。
+            if let Some(sw) = self.swap_after_create.clone() {
+                *self.kernel.borrow_mut() = Some(sw);
+            }
+            Ok(BridgeCreated { echo })
         }
         fn link_state(&self, _: &IfName) -> Result<(IfIndex, Option<String>), NetError> {
             self.rec("link_state");
@@ -2790,8 +2865,18 @@ mod tests {
                 .ok_or_else(|| err(NetErrorCode::NotFound))?;
             Ok((IfIndex::new(i)?, a))
         }
-        fn set_owner_token(&self, _: IfIndex, token: &str) -> Result<(), NetError> {
+        fn set_owner_token(&self, index: IfIndex, token: &str) -> Result<(), NetError> {
             self.rec("set_owner_token");
+            // 実カーネルの ifindex 指定の RTM_SETLINK: 対象が今その ifindex でなければ NotFound で印は付かない。
+            if self.strict_setlink
+                && self
+                    .kernel
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|(i, _)| *i != index.get())
+            {
+                return Err(err(NetErrorCode::NotFound));
+            }
             if let Some(c) = self.fail_setlink {
                 if self.stamp_on_fail
                     && let Some(k) = self.kernel.borrow_mut().as_mut()
@@ -3359,6 +3444,109 @@ mod tests {
         assert_eq!(e.rollback.leftover, unknown_bridge("web"));
     }
 
+    /// NET-1・Issue #1972: 作成通知（NLM_F_ECHO）の ifindex があれば、名前での引き直し（link_state）を呼ばない。
+    #[test]
+    fn net1_echo_index_skips_name_lookup() {
+        let f = Fake {
+            echo_enabled: true,
+            ..Default::default()
+        };
+        let c = create_network_with(&f, &spec("web")).unwrap();
+        assert_eq!(
+            f.calls(),
+            [
+                "create_bridge",
+                "set_owner_token",
+                "verify_owned",
+                "verify_owned",
+                "add_address",
+                "verify_owned",
+                "set_up",
+                "apply_nft"
+            ]
+        );
+        assert_eq!(c.bridge_index.get(), 7);
+    }
+
+    /// NET-1・Issue #1972: echo 経路では、作成直後に同名の別 link へ差し替えられても、その link に印を付けない
+    /// （印は作成した link の ifindex 7 に固定。7 はもう無いので NotFound で止まり、削除もしない）。
+    #[test]
+    fn net1_echo_swap_before_stamp_is_not_stamped() {
+        let f = Fake {
+            echo_enabled: true,
+            strict_setlink: true,
+            swap_after_create: Some((9, None)),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::SetOwnerToken);
+        assert_eq!(
+            f.calls(),
+            ["create_bridge", "set_owner_token", "link_state"]
+        );
+        assert!(!f.calls().contains(&"delete_bridge"));
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+        assert_eq!(f.kernel.borrow().clone(), Some((9, None)));
+    }
+
+    /// NET-1・Issue #1972: 戻し経路（echo なし）の残余リスクの固定。名前で引き直す前に別名なしの link へ
+    /// 差し替えられると、その link に印を付けてしまう（echo 経路ではこれが起きない）。
+    #[test]
+    fn net1_fallback_swap_before_lookup_stamps_foreign() {
+        let f = Fake {
+            echo_enabled: false,
+            strict_setlink: true,
+            swap_after_create: Some((9, None)),
+            ..Default::default()
+        };
+        let c = create_network_with(&f, &spec("web")).unwrap();
+        assert_eq!(c.bridge_index.get(), 9);
+        assert_eq!(f.calls()[..2], ["create_bridge", "link_state"]);
+    }
+
+    /// NET-1・Issue #1972: echo 経路でも、印の付与が失敗して別名が空のままなら同じ ifindex で削除する。
+    #[test]
+    fn net1_echo_setlink_failure_unstamped_same_index_deletes_by_index() {
+        let f = Fake {
+            echo_enabled: true,
+            fail_setlink: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::SetOwnerToken);
+        assert_eq!(
+            f.calls(),
+            [
+                "create_bridge",
+                "set_owner_token",
+                "link_state",
+                "delete_bridge"
+            ]
+        );
+        assert_eq!(
+            e.rollback.removed,
+            [NetworkResource::Bridge(bridge_of("web"))]
+        );
+        assert!(e.rollback.leftover.is_empty());
+    }
+
+    /// NET-1・Issue #1972: 作成通知が届いたが不正なら、ACK 済みで作成済みのため Unknown で報告し、
+    /// 印付けも削除も名前の引き直しもしない。
+    #[test]
+    fn net1_echo_invalid_is_unknown_and_not_touched() {
+        let f = Fake {
+            echo_invalid: Some(err(NetErrorCode::DataLoss)),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(f.calls(), ["create_bridge"]);
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+    }
+
     /// NET-1・Issue #1925: 非 UTF-8 の別名（復号結果は置換文字入りの非空文字列）は所有者不明として扱い、
     /// 作成直後は上書きせず、印の付与後に差し替わっても削除しない（ロールバックは `_` 腕で Unknown）。
     #[test]
@@ -3535,7 +3723,7 @@ mod tests {
     }
 
     impl NetworkOps for SwapOnSetlink<'_> {
-        fn create_bridge(&self, n: &IfName) -> Result<(), NetError> {
+        fn create_bridge(&self, n: &IfName) -> Result<BridgeCreated, NetError> {
             self.inner.create_bridge(n)
         }
         fn link_state(&self, n: &IfName) -> Result<(IfIndex, Option<String>), NetError> {

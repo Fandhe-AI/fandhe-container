@@ -81,7 +81,7 @@ use crate::traits::types::ErrorCode;
 
 use super::{
     ExecChildStep, ExecError, IsolationStage, ViolationKind, ViolationReason,
-    audit_entrypoint_violation, record_launch_mount_rejection,
+    audit_entrypoint_violation, record_launch_mount_rejection_at,
 };
 
 /// 状態行の最大バイト数（LF を含む）。最長の行は約 85 バイトで、それより十分大きい固定上限。
@@ -957,7 +957,15 @@ pub(super) fn resolve_pre_pivot_status(
                 if reason.kind() == ViolationKind::ProtectedPathApply {
                     error.code = f.code;
                 }
-                record_launch_mount_rejection(error, reason, audit.container, audit.sink)
+                // 段は親が組み立てた `ExecError::stage` を記録にも載せる（#3121）。
+                let stage = error.stage;
+                record_launch_mount_rejection_at(
+                    error,
+                    reason,
+                    Some(stage),
+                    audit.container,
+                    audit.sink,
+                )
             }
             None => AuditedRejection::not_applicable(ExecError::new(
                 f.code,

@@ -54,6 +54,7 @@ struct FakeStore {
     fail_put_at: Mutex<Vec<usize>>,
     fail_remove_at: Mutex<Vec<usize>>,
     block_put_at: Mutex<Option<usize>>,
+    block_remove_at: Mutex<Option<usize>>,
     entered: Mutex<Sender<()>>,
     release: Mutex<Receiver<()>>,
 }
@@ -75,6 +76,7 @@ impl FakeStore {
                 fail_put_at: Mutex::new(Vec::new()),
                 fail_remove_at: Mutex::new(Vec::new()),
                 block_put_at: Mutex::new(None),
+                block_remove_at: Mutex::new(None),
                 entered: Mutex::new(entered_tx),
                 release: Mutex::new(release_rx),
             }),
@@ -122,6 +124,12 @@ impl RecordStore for FakeStore {
             *r += 1;
             n
         };
+        if *self.block_remove_at.lock().unwrap() == Some(n) {
+            self.entered.lock().unwrap().send(()).unwrap();
+            if self.release.lock().unwrap().recv_timeout(WAIT).is_err() {
+                return Err(CriError::timeout("test gate was not released"));
+            }
+        }
         if self.fail_remove_at.lock().unwrap().contains(&n) {
             return Err(CriError::timeout("injected"));
         }
@@ -599,5 +607,44 @@ async fn remove_during_stop_write_is_rejected() {
             put(false, "ready", false, false),
             put(false, "notready", false, false)
         ]
+    );
+}
+
+/// 期限超過した Remove の削除が遅れて完了しても、worker がメモリの除去まで確定する。完了までは sandbox が
+/// 残っても CreateContainer は拒否され、完了後に「ファイルは無いのにメモリは Ready」が残らない
+/// （#2933・CRI-2・REPAIR-5）。
+#[tokio::test]
+async fn late_remove_after_timeout_also_removes_the_memory_record() {
+    let log: Log = Arc::default();
+    let (store, gate) = FakeStore::new(&log);
+    let svc = CriRuntimeService::new()
+        .with_runtime_timeout(Duration::from_millis(200))
+        .with_record_store(store.clone());
+    let id = run(&svc).await.unwrap();
+    *store.block_remove_at.lock().unwrap() = Some(0);
+    let e = tokio::time::timeout(WAIT, remove(&svc, &id))
+        .await
+        .expect("remove must return within a bounded time")
+        .unwrap_err();
+    assert_eq!(e.code(), Code::Internal);
+    assert_eq!(
+        create_container(&svc, &id).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    gate.entered
+        .recv_timeout(WAIT)
+        .expect("remove did not reach the gate in time");
+    gate.release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while !list(&svc).await.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late remove did not drop the memory record"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        create_container(&svc, &id).await.unwrap_err().code(),
+        Code::NotFound
     );
 }

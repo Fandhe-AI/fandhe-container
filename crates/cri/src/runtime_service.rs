@@ -807,7 +807,54 @@ enum StoreCall {
     /// 手放した（期限超過・future の破棄）後に worker が遅れて書けた場合は、worker 自身が書いた直後に
     /// 削除する（削除を put の完了に順序付ける。所有者の無い記録を残さない。#2933・REPAIR-5）。
     Put(RecordId, Vec<u8>, Option<Arc<SetUpSettlement>>),
-    Remove(RecordId),
+    /// 削除。`Some` のときは、ファイルを消せた worker 自身がメモリの記録の除去まで確定する（期限超過で
+    /// 呼び出し側が先に返っても、遅れて完了した削除が「ファイルは無いのにメモリは Ready」を残さない。
+    /// `record_write` の guard は除去の後に解除される。#2933・CRI-2）。
+    Remove(RecordId, Option<RemoveFinalize>),
+}
+
+/// `StoreCall::Remove` の worker がメモリの除去まで行うための引数。
+struct RemoveFinalize {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    sandbox_id: String,
+}
+
+/// ファイルを消せた後に、ロック下で検査し直してメモリの記録を除去する（worker 側。#2933・CRI-2）。
+///
+/// 検査が通らない（配下の操作が始まった等）ときは、ファイルを書き直して（best effort）検査のエラーを返す。
+fn finalize_sandbox_removal(
+    store: &Arc<dyn RecordStore>,
+    finalize: &RemoveFinalize,
+) -> Result<(), CriError> {
+    let id = finalize.sandbox_id.as_str();
+    let rewrite = {
+        let mut registry = finalize
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        match plan_sandbox_removal(&registry, id) {
+            Ok(Some(plan)) => {
+                apply_sandbox_removal(&mut registry, id, plan);
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                let data = registry
+                    .records
+                    .get(id)
+                    .map(|r| SandboxRecordData::from_registry(id, r, false));
+                (err, data)
+            }
+        }
+    };
+    let (err, data) = rewrite;
+    if let Some(data) = data
+        && let Ok(bytes) = data.encode()
+        && let Ok(record_id) = RecordId::new(id)
+    {
+        let _ = store.put(RecordKind::Sandbox, &record_id, &bytes);
+    }
+    Err(err)
 }
 
 /// 巻き戻し用の put を呼び出し側が手放したことを worker へ伝える番人。
@@ -1627,7 +1674,6 @@ impl CriRuntimeService {
                 remove_sandbox_record(&mut registry, &id);
             }
             reservation.disarm();
-            self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
         // 以降は await を挟まず `NetworkSetUpGuard` が引き継ぐ。
@@ -2009,11 +2055,19 @@ impl CriRuntimeService {
         let result = self
             .store_io_bounded(StoreCall::Put(record_id, bytes, settlement.clone()), guard)
             .await;
-        // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路（rollback_unwritten など）が持つ。
-        if result.is_ok()
-            && let Some(settlement) = &settlement
-        {
-            settlement.accept();
+        if let Some(settlement) = &settlement {
+            if result.is_ok() {
+                // 書けた結果を受け取れた。以後の後始末は呼び出し側の経路（rollback_unwritten など）が持つ。
+                settlement.accept();
+            } else if settlement.abandon() {
+                // worker がまだ put を終えていない（期限超過）。遅れて書けた記録は worker が自分で消すため、
+                // ここで別 worker の削除を並行させない（remove が先に終わって元の put が後で残るのを防ぐ。
+                // #2933・REPAIR-5）。
+            } else {
+                // put は完了済みで失敗した。直列に（put の後に）消す。
+                settlement.accept();
+                self.rollback_unwritten(id, guard).await;
+            }
         }
         drop(abandon);
         result
@@ -2024,13 +2078,18 @@ impl CriRuntimeService {
         &self,
         id: &str,
         guard: &mut Option<SandboxRecordWriteGuard>,
+        finalize: bool,
     ) -> Result<(), CriError> {
         if self.record_store.is_none() {
             return Ok(());
         }
         let record_id =
             RecordId::new(id).map_err(|_| CriError::internal(SANDBOX_UNPERSIST_FAILED))?;
-        self.store_io_bounded(StoreCall::Remove(record_id), guard)
+        let finalize = finalize.then(|| RemoveFinalize {
+            registry: Arc::clone(&self.registry),
+            sandbox_id: id.to_owned(),
+        });
+        self.store_io_bounded(StoreCall::Remove(record_id, finalize), guard)
             .await
     }
 
@@ -2060,9 +2119,15 @@ impl CriRuntimeService {
                     if rollback.as_ref().is_some_and(|s| !s.settle_by_worker()) {
                         let _ = store.remove(RecordKind::Sandbox, id);
                     }
-                    result
+                    result.map_err(|_| CriError::internal(SANDBOX_PERSIST_FAILED))
                 }
-                StoreCall::Remove(id) => store.remove(RecordKind::Sandbox, id),
+                StoreCall::Remove(id, finalize) => match store.remove(RecordKind::Sandbox, id) {
+                    Err(_) => Err(CriError::internal(SANDBOX_UNPERSIST_FAILED)),
+                    Ok(()) => match finalize {
+                        Some(f) => finalize_sandbox_removal(&store, f),
+                        None => Ok(()),
+                    },
+                },
             };
             (result, moved)
         })
@@ -2070,7 +2135,7 @@ impl CriRuntimeService {
         match outcome {
             Ok((result, returned)) => {
                 *guard = returned;
-                result.map_err(|_| CriError::internal(failure))
+                result
             }
             // 期限超過・起動失敗: guard は worker（または破棄されたクロージャ）が持つ。
             Err(_) => Err(CriError::internal(failure)),
@@ -2079,7 +2144,7 @@ impl CriRuntimeService {
 
     /// 巻き戻した予約のファイルを消す後始末（失敗しても元のエラーを優先して無視する）。
     async fn rollback_unwritten(&self, id: &str, guard: &mut Option<SandboxRecordWriteGuard>) {
-        let _ = self.unpersist_sandbox(id, guard).await;
+        let _ = self.unpersist_sandbox(id, guard, false).await;
     }
 
     /// ネットワークなしの `RunPodSandbox`。予約 → 確定版を 1 回書く。
@@ -2106,7 +2171,6 @@ impl CriRuntimeService {
                 remove_sandbox_record(&mut registry, &id);
             }
             reservation.disarm();
-            self.rollback_unwritten(&id, &mut write_guard).await;
             return Err(err);
         }
         reservation.disarm();
@@ -2221,27 +2285,11 @@ impl CriRuntimeService {
             record.record_write = true;
             self.write_guard(id)
         };
-        self.unpersist_sandbox(id, &mut write_guard).await?;
-        let rewrite_err = {
-            let mut registry = self
-                .registry
-                .lock()
-                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-            // ロックを外した間に状態が変わっていないか再検査する（配下の操作の開始など）。
-            match plan_sandbox_removal(&registry, id) {
-                Ok(Some(plan)) => {
-                    apply_sandbox_removal(&mut registry, id, plan);
-                    None
-                }
-                Ok(None) => None,
-                Err(err) => Some(err),
-            }
-        };
-        if let Some(err) = rewrite_err {
-            // ファイルは消えたがメモリに残す場合は、書き直して再起動後も追跡できるようにする（best effort）。
-            let _ = self.persist_sandbox(id, false, &mut write_guard).await;
-            return Err(err);
-        }
+        // ファイルの削除とメモリの除去（再検査つき）は同じ worker が続けて行う。期限超過で先に返っても、
+        // 遅れて完了した削除が「ファイルは無いのにメモリは Ready」を残さず、その間は `record_write` が
+        // CreateContainer・Stop・Remove を拒否する（#2933・CRI-2）。再検査の失敗時は worker がファイルを
+        // 書き直す（best effort）。
+        self.unpersist_sandbox(id, &mut write_guard, true).await?;
         Ok(v1::RemovePodSandboxResponse {})
     }
 

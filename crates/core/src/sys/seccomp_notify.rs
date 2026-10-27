@@ -80,6 +80,40 @@ mod libc_abi {
     }
 
     const _: () = assert!(nr(SYS_SECCOMP) == libc::SYS_seccomp);
+
+    // 番号以外の定数の照合（#1848）。型は `libc_const_eq!` の引数で明記する（`sys.rs` の同名マクロ）。
+    // 名前が `libc` と違う対応: `ENOENT_ERRNO` = `ENOENT`、`EPERM_ERRNO` = `EPERM`。
+    // `SECCOMP_IOCTL_NOTIF_*` は `libc` が `_IOWR::<seccomp_notif>` 等で組み立てるため、一致すれば構造体の大きさ
+    // （80・24・8）も間接的に一致するが、構造体のレイアウトの照合（#1849）の代わりにはならない。
+    // 対象外: `SECCOMP_IOC_MAGIC`・`IOC_READ`・`IOC_WRITE`（`libc` で非公開。ioctl の値の照合に含まれる）、
+    // `MAX_RECV_FDS`・`MAX_PAYLOAD`・`CMSG_HDR_LEN`・`UCRED_LEN`・`CONTROL_CAP`・`SEND_MAX_FDS`・
+    // `SEND_EINTR_ATTEMPTS`（本実装の内部の上限・派生値で、カーネル ABI の値でない）。
+    const _: () = {
+        use libc::{c_int, c_short, c_uint, c_ulong};
+        libc_const_eq!(SECCOMP_SET_MODE_FILTER, u64, c_uint);
+        libc_const_eq!(SECCOMP_FILTER_FLAG_NEW_LISTENER, u64, c_ulong);
+        libc_const_eq!(SOCK_SEQPACKET, i32, c_int);
+        libc_const_eq!(SO_PASSCRED, i32, c_int);
+        libc_const_eq!(SCM_RIGHTS, i32, c_int);
+        libc_const_eq!(SCM_CREDENTIALS, i32, c_int);
+        libc_const_eq!(MSG_CTRUNC, i32, c_int);
+        libc_const_eq!(MSG_TRUNC, i32, c_int);
+        libc_const_eq!(MSG_DONTWAIT, i32, c_int);
+        libc_const_eq!(MSG_NOSIGNAL, i32, c_int);
+        libc_const_eq!(MSG_CMSG_CLOEXEC, i32, c_int);
+        libc_const_eq!(super::ENOENT_ERRNO, i32, libc::ENOENT, c_int);
+        libc_const_eq!(super::EPERM_ERRNO, i32, libc::EPERM, c_int);
+        libc_const_eq!(POLLERR, i16, c_short);
+        libc_const_eq!(POLLHUP, i16, c_short);
+    };
+    // `Ioctl` 型は環境で変わる（gnu は `c_ulong`、musl は `c_int` で負になり得る）ため gnu に限る。
+    #[cfg(target_env = "gnu")]
+    const _: () = {
+        use libc::c_ulong;
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_RECV, u64, c_ulong);
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_SEND, u64, c_ulong);
+        libc_const_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, u64, c_ulong);
+    };
 }
 
 // include/linux/net.h の `SOCK_SEQPACKET`（5）、include/uapi/asm-generic/socket.h の `SO_PASSCRED`（16）、
@@ -529,7 +563,7 @@ pub(crate) fn recv_nowait(sock: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize,
 // - `SEND` は `ENOENT`（対象が既に消えた）・`EINPROGRESS`（応答済み）を返す。`ID_VALID` は `RECV` 済み（SENT 状態）の
 //   通知が存在するとき 0、無ければ `ENOENT`
 // - poll: 未処理の通知があれば `EPOLLIN`、filter の利用者が 0 なら `EPOLLHUP`
-// `libc` との機械照合は core には未導入（#1837 の子の未着手）のため、本節の定数は上記 uapi 値を `tests` で照合する。
+// 本節の定数のうち `libc` に対応物があるものは `libc_abi`（#1847・#1848）で `libc` と `const` 評価で照合し、`tests` でも上記 uapi 値を照合する。
 // `SECCOMP_USER_NOTIF_FLAG_CONTINUE` は引数を許可判断に使うと TOCTOU になるため、定数も宣言しない。
 
 const SECCOMP_IOC_MAGIC: u64 = b'!' as u64;

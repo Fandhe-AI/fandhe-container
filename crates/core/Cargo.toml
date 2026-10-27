@@ -47,10 +47,10 @@ exec-test-support = []
 [dev-dependencies]
 fandhe-container-core = { path = ".", default-features = false, features = ["escape-probe", "exec-test-support"] }
 
-# `sys` の自前 FFI 宣言（syscall 番号）を libc と照合する試験専用の依存（#1847・#1318・#1837・MVM-4・REPAIR-12）。
-# 製品の依存には入れない（cargo tree -e normal,build に現れない）。Linux 用の `sys.rs` だけが使う。
-# 方式は docs/design/ffi-libc-check.md。
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `sys` の自前 FFI 宣言（syscall 番号・番号以外の定数）を libc と照合する試験専用の依存（#1847・#1848・#1318・#1837・MVM-4・REPAIR-12）。
+# 製品の依存には入れない（cargo tree -e normal,build に現れない）。Linux 用の `sys.rs` と macOS 用の `sys/macos.rs`
+# （#1848）が使うため `cfg(unix)` にする。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し

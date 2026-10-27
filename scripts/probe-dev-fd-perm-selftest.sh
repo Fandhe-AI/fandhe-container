@@ -77,6 +77,18 @@ run_probe "$sb/o" "$sb/e" --foreign "$sb/link"
 check "symlink --foreign exits 2" 2 "$rc"
 run_probe "$sb/o" "$sb/e" --foreign
 check "missing --foreign value exits 2" 2 "$rc"
+# 読み取り不可の通常ファイル（root は権限を無視して開けるため対象外）
+if [ "$(id -u)" -ne 0 ]; then
+    printf 'x\n' >"$sb/unreadable"
+    chmod 0000 "$sb/unreadable"
+    run_probe "$sb/o" "$sb/e" --foreign "$sb/unreadable"
+    check "unreadable --foreign exits 2" 2 "$rc"
+    if grep -q 'code=bad-input' "$sb/e"; then ok "unreadable --foreign code"; else ng "unreadable --foreign code"; fi
+    if grep -qF -- "$sb" "$sb/e" "$sb/o"; then ng "unreadable --foreign: no path in output"; else ok "unreadable --foreign: no path in output"; fi
+    if grep -q '^probe=dev-fd-perm done' "$sb/o"; then ng "unreadable --foreign: no done line"; else ok "unreadable --foreign: no done line"; fi
+else
+    printf 'info: running as root: unreadable --foreign case skipped\n'
+fi
 
 # 通常実行（foreign 無し）
 run_probe "$sb/o" "$sb/e"

@@ -76,6 +76,12 @@ if [ -n "$foreign" ]; then
         err_code bad-input "--foreign is not a regular file"
         exit 2
     fi
+    # 開けないファイル（読み取り権限なし等）は、観測の途中で fd 9 が無効のまま進まないよう先に弾く。
+    # サブシェルで開くだけ（中身は読まない）。エラー文に入力パスが出ないよう stderr は捨てる。
+    if ! (exec 8<"$foreign") 2>/dev/null; then
+        err_code bad-input "--foreign cannot be opened for reading"
+        exit 2
+    fi
 fi
 
 work_dir="$(mktemp -d)" || { err_code bad-environment "cannot create a temporary directory"; exit 2; }
@@ -131,7 +137,11 @@ find_ls_mode() {
 
 observe_case() {
     local c="$1" p="$2"
-    exec 9<"$p"
+    # run_limited は || の左辺で呼ばれ set -e が効かないため、open の失敗はここで明示的に伝播させる。
+    if ! { exec 9<"$p"; } 2>/dev/null; then
+        err_code bad-input "cannot open an observation input"
+        return 2
+    fi
     st "$c" path "$p"
     st "$c" fd9 /dev/fd/9
     find_set "$c" path "$p"
@@ -167,10 +177,10 @@ observe_all() {
     local m f
     for m in 0644 0664 0666; do
         f="$(make_file "f$m" "$m")"
-        observe_case "$m" "$f"
+        observe_case "$m" "$f" || return $?
     done
     if [ -n "$foreign" ]; then
-        observe_case foreign "$foreign"
+        observe_case foreign "$foreign" || return $?
     else
         emit "skip: foreign owner case not provided (pass --foreign)"
     fi

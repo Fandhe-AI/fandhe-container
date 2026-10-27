@@ -29,6 +29,7 @@
 //! `XDG_RUNTIME_DIR`）。root では所有者の検証が省かれ照合の意味が変わるため、非 root で実行する。
 //!
 //! # 実機前提テストとしての分離
+//! 委譲 cgroup の前提欠如は 1 行目が `delete_cgroup_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `delete_cgroup_real: FAILED: ...`（分類元は `tests/support/precondition.rs`。#2957・CLI-1・REPAIR-12）。
 //! GitHub ホステッド runner では委譲 cgroup を前提にできないため、`-- --ignored` 指定時のみ実行する（ci.md
 //! 「実機前提テスト」。既定集合の試験を移したものではない。既定集合ではフェイクの remover を使う `stop_delete.rs` の
 //! 単体テストが照合する）。実行された場合は、前提が欠けていても失敗として扱い、検証せずに成功する分岐は持たない。
@@ -56,6 +57,10 @@ fn main() -> std::process::ExitCode {
 mod scratch_root;
 
 #[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Read;
@@ -66,7 +71,7 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
+    use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
         CgroupScope, ContainerId, ContainerStatus, CreateStateRequest, GetStateRequest, StateStore,
@@ -81,6 +86,7 @@ mod linux {
     const POLL: Duration = Duration::from_millis(20);
 
     pub fn main() -> ExitCode {
+        super::precondition::self_check();
         if !std::env::args().skip(1).any(|a| a == "--ignored") {
             println!(
                 "delete_cgroup_real: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
@@ -96,29 +102,34 @@ mod linux {
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
+            Err(super::precondition::Failure::Precondition(msg)) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            Err(super::precondition::Failure::Other(e)) => {
                 eprintln!("delete_cgroup_real: FAILED: {e}");
                 ExitCode::FAILURE
             }
         }
     }
 
-    fn scenarios() -> Result<(), String> {
+    fn scenarios() -> Result<(), super::precondition::Failure> {
         // root では所有者検証が省かれ、非特権委譲の証跡にならない。cgroup や状態ルートを作る前に拒否する（REPAIR-12）。
         let euid = effective_uid()?;
         if euid == 0 {
             return Err(
                 "must run as a non-root user: owner checks are skipped for root, so results would not prove unprivileged delegation"
-                    .to_string(),
+                    .into(),
             );
         }
-        let delegated = DelegatedCgroup::detect().map_err(|e| format!("detect: {e:?}"))?;
+        let delegated = super::precondition::delegated_cgroup()?;
         let detected = delegated.path().to_string();
         let own = own_cgroup()?;
         if own != detected {
             return Err(format!(
                 "detected path {detected:?} differs from /proc/self/cgroup {own:?}"
-            ));
+            )
+            .into());
         }
         let base = PathBuf::from("/sys/fs/cgroup").join(detected.trim_start_matches('/'));
         scenario_a(&detected, &base)?;

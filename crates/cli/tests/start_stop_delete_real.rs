@@ -56,6 +56,7 @@
 //! mount の RDONLY が効いたことの観測）を完全一致で照合する。あわせて `inspect` の出力に `"rootReadonly":true` が出ることも照合する。
 //!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
+//! 前提欠如（委譲 cgroup・Landlock ABI）は 1 行目が `start_stop_delete_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `start_stop_delete_real: FAILED: ...`（分類元は `tests/support/precondition.rs`。#2957・CLI-1・REPAIR-12）。CI は両方を禁止行にする。
 //! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
 
 #[cfg(not(target_os = "linux"))]
@@ -105,6 +106,16 @@ mod scratch_root;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "support/precondition.rs"]
+mod precondition;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod linux {
     use std::fs;
     use std::io::{Read, Write as _};
@@ -116,7 +127,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::capabilities::{Capability, OCI_DEFAULT_CAPABILITIES};
-    use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
+    use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -247,6 +258,7 @@ mod linux {
     }
 
     pub fn main() -> ExitCode {
+        super::precondition::self_check();
         if !std::env::args().skip(1).any(|a| a == "--ignored") {
             println!(
                 "start_stop_delete_real: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
@@ -272,7 +284,11 @@ mod linux {
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
+            Err(super::precondition::Failure::Precondition(msg)) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            Err(super::precondition::Failure::Other(e)) => {
                 eprintln!("start_stop_delete_real: FAILED: {e}");
                 ExitCode::FAILURE
             }
@@ -432,7 +448,10 @@ mod linux {
     }
 
     /// 前提の検査。欠けたら skip せず失敗にする。
-    fn check_prerequisites() -> Result<(), String> {
+    ///
+    /// 委譲 cgroup と Landlock ABI の欠如だけを `PRECONDITION FAILED` にする（#2957）。root・cgroup v2 の有無・
+    /// 自 cgroup の不一致・user manager の socket は環境起因と断定できないため、従来どおり `FAILED:` のまま回帰側に倒す。
+    fn check_prerequisites() -> Result<(), super::precondition::Failure> {
         if effective_uid()? == 0 {
             return Err("must run as a non-root user: owner checks are skipped for root".into());
         }
@@ -442,8 +461,7 @@ mod linux {
             );
         }
         let hint = "run this test inside `systemd-run --user --scope -p Delegate=yes`";
-        let delegated = DelegatedCgroup::detect()
-            .map_err(|e| format!("no delegated cgroup ({e:?}); {hint}"))?;
+        let delegated = super::precondition::delegated_cgroup()?;
         let own = fs::read_to_string("/proc/self/cgroup")
             .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
         let own_path = own
@@ -451,7 +469,7 @@ mod linux {
             .find_map(|l| l.strip_prefix("0::"))
             .ok_or("no cgroup v2 line in /proc/self/cgroup")?;
         if own_path.trim_end_matches('/') != delegated.path().trim_end_matches('/') {
-            return Err(format!("detected cgroup differs from own cgroup; {hint}"));
+            return Err(format!("detected cgroup differs from own cgroup; {hint}").into());
         }
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
         let private = Path::new(&runtime).join("systemd/private");
@@ -459,14 +477,18 @@ mod linux {
             .map(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
             .unwrap_or(false);
         expect(is_socket, "the systemd user manager socket is missing")?;
-        fandhe_container_core::landlock::detect_landlock_abi()
-            .map_err(|e| format!("Landlock ABI 6 or newer is required: {e:?}"))?;
+        super::precondition::landlock_support()?;
         Ok(())
     }
 
     /// 戻り値は削除前に記録のスコープのディレクトリが存在したか。
-    fn scenario() -> Result<bool, String> {
+    fn scenario() -> Result<bool, super::precondition::Failure> {
         check_prerequisites()?;
+        scenario_body().map_err(super::precondition::Failure::Other)
+    }
+
+    /// 前提の検査を終えた後の本体。ここでの失敗は回帰として扱う。
+    fn scenario_body() -> Result<bool, String> {
         check_expected_masks()?;
         let cli_src = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-container"));
         let sup_src = cli_src

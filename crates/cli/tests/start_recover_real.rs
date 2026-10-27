@@ -15,6 +15,8 @@
 //! 置く。無ければ skip ではなく失敗する。root では所有者の検証が省かれるため非 root で実行する。
 //!
 //! # 実機前提テストとしての分離
+//! 委譲 cgroup の前提欠如は 1 行目が `start_recover_real: PRECONDITION FAILED (test environment, ...)` になり、
+//! それ以外の失敗は `start_recover_real: FAILED: ...`（分類元は `tests/support/precondition.rs`。#2957・CLI-1・REPAIR-12）。
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。未指定は案内を出して成功する。
 //!
 //! ```text
@@ -41,6 +43,10 @@ fn main() -> std::process::ExitCode {
 mod scratch_root;
 
 #[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Read;
@@ -51,7 +57,7 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
+    use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
         CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateStateRequest,
@@ -65,6 +71,7 @@ mod linux {
     const POLL: Duration = Duration::from_millis(20);
 
     pub fn main() -> ExitCode {
+        super::precondition::self_check();
         if !std::env::args().skip(1).any(|a| a == "--ignored") {
             println!(
                 "start_recover_real: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
@@ -78,7 +85,11 @@ mod linux {
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
+            Err(super::precondition::Failure::Precondition(msg)) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            Err(super::precondition::Failure::Other(e)) => {
                 eprintln!("start_recover_real: FAILED: {e}");
                 ExitCode::FAILURE
             }
@@ -125,7 +136,7 @@ mod linux {
         }
     }
 
-    fn scenario() -> Result<(), String> {
+    fn scenario() -> Result<(), super::precondition::Failure> {
         // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を終了時に消す（#2887）。
         let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         if effective_uid()? == 0 {
@@ -140,9 +151,10 @@ mod linux {
             return Err(format!(
                 "{} is missing; run `cargo build -p fandhe-container-supervisor` first",
                 supervisor.display()
-            ));
+            )
+            .into());
         }
-        let delegated = DelegatedCgroup::detect().map_err(|e| format!("detect: {e:?}"))?;
+        let delegated = super::precondition::delegated_cgroup()?;
         let base = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
         let scope_name = format!("rec-{}", std::process::id());
         let scope_dir = base.join(&scope_name);
@@ -204,7 +216,8 @@ mod linux {
             return Err(format!(
                 "start: want exit 5, got {:?} stdout={:?} stderr={:?}",
                 out.code, out.stdout, out.stderr
-            ));
+            )
+            .into());
         }
         let all = format!("{}{}", out.stdout, out.stderr);
         for want in [
@@ -212,7 +225,7 @@ mod linux {
             "an interrupted start was recovered; delete and recreate the container",
         ] {
             if !all.contains(want) {
-                return Err(format!("start output lacks {want:?}: {all:?}"));
+                return Err(format!("start output lacks {want:?}: {all:?}").into());
             }
         }
         let store = open_store(&root)?;
@@ -222,7 +235,7 @@ mod linux {
             .status()
             .state();
         if state != ContainerState::Created {
-            return Err(format!("state after recovery: want Created, got {state:?}"));
+            return Err(format!("state after recovery: want Created, got {state:?}").into());
         }
         drop(store);
         let reaped = {
@@ -252,7 +265,8 @@ mod linux {
             return Err(format!(
                 "delete: want exit 0, got {:?} stdout={:?} stderr={:?}",
                 out.code, out.stdout, out.stderr
-            ));
+            )
+            .into());
         }
         if cgroup.exists() {
             return Err("container cgroup remains after delete".into());

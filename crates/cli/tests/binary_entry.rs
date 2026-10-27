@@ -365,12 +365,22 @@ fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
     panic!("could not exclusively create a dir for {prefix}");
 }
 
-/// 一意な一時ディレクトリ（Drop で削除）。
-struct TmpDir(std::path::PathBuf);
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+/// 一意な一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る親で、
+/// 最後のフィールドのため `Drop` の削除の後に消える（#3026）。
+struct TmpDir(
+    std::path::PathBuf,
+    #[allow(dead_code)] scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
-        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        let scratch =
+            scratch_root::ScratchDir::new("fc-cli-bin", std::time::Duration::from_secs(10));
+        let tmp = scratch.path().to_path_buf();
         let p = exclusive_dir(&tmp, &format!("fc-cli-bin-{tag}"));
         // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
         #[cfg(unix)]
@@ -378,7 +388,7 @@ impl TmpDir {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         }
-        Self(p)
+        Self(p, scratch)
     }
 }
 

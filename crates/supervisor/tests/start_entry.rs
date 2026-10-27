@@ -8,6 +8,11 @@
 
 #![cfg(target_os = "linux")]
 
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -42,15 +47,17 @@ struct Env {
     id: String,
     base: PathBuf,
     store: Arc<dyn StateStore>,
+    /// tmpfiles の flock 走査から守る親（#3026）。`base` はその子。最後のフィールドで、`Drop` の後に親が消える。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Env {
     fn new(tag: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let base =
-            std::env::temp_dir().join(format!("fandhe-sup-start-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let scratch =
+            scratch_root::ScratchDir::new("fandhe-sup-start", std::time::Duration::from_secs(10));
+        let base = scratch.path().join(format!("{tag}-{n}"));
         std::fs::create_dir_all(base.join("bundle/rootfs")).unwrap();
         std::fs::write(
             base.join("bundle/config.json"),
@@ -68,6 +75,7 @@ impl Env {
             id: format!("c-{tag}-{n}"),
             base,
             store,
+            _scratch: scratch,
         }
     }
 

@@ -234,7 +234,15 @@ fn list_worker(
             return Err(too_many());
         }
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+        let Some(name) = name.to_str() else {
+            // 非 UTF-8 の名前は ID になり得ない。`.rec` で終わるものは不正名として数える。
+            if std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str())
+                .ends_with(REC_EXT.as_bytes())
+            {
+                unrecognized += 1;
+            }
+            continue;
+        };
         let Some(stem) = name.strip_suffix(REC_EXT) else {
             continue;
         };
@@ -637,6 +645,22 @@ mod tests {
         assert!(dir.join(format!("{ID_A}.rec")).exists());
         assert!(dir.join(format!("{ID_B}.rec")).is_dir());
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// OCI-7: 非 UTF-8 の `.rec` 名も不正名として数える（`.rec` で終わらない非 UTF-8 名は数えない）。
+    #[test]
+    fn oci7_record_store_list_counts_non_utf8_rec_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp_root("nonutf8");
+        let store = FileRecordStore::open(&root).unwrap();
+        let dir = root.join(".cri/records/sandboxes");
+        fs::write(dir.join(OsStr::from_bytes(b"\xff.rec")), b"x").unwrap();
+        fs::write(dir.join(OsStr::from_bytes(b"\xff.txt")), b"x").unwrap();
+        let l = list_all(&store, RecordKind::Sandbox);
+        assert_eq!(l.unrecognized, 1);
+        assert!(l.records.is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 

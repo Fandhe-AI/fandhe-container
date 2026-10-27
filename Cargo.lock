@@ -309,6 +309,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-plugin",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

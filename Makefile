@@ -33,12 +33,12 @@ SHELL := /bin/bash
 	crash-summary-check-selftest lib-selftest \
 	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
-	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
+	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
 	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
-	startup-latency-docker startup-latency-report net-setup-timing small-files-compare mac-small-files-docker mac-small-files-report dns-helper-measure idle-memory \
+	startup-latency-docker startup-latency-report net-setup-timing net-throughput-rtt net-throughput-rtt-compare small-files-compare mac-small-files-docker mac-small-files-report dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
 	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-hub-ratelimit-probe docker-build docker-shell \
 	docker-ci
@@ -203,7 +203,10 @@ startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト
 net-setup-timing-selftest: ## ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
 	@scripts/with-tools.sh jq scripts/bench/net_setup_timing_selftest.sh
 
-small-files-compare-selftest: ## bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
+net-throughput-rtt-selftest: ## iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプトの自己テスト（NET-2・NET-3・REPAIR-12。実機・docker 不要）
+	@scripts/with-tools.sh jq scripts/bench/net_throughput_rtt_selftest.sh
+
+small-files-compare-selftest: ##bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
 	@scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
 
 mac-small-files-selftest: ## MAC-3 小ファイル多数計測スクリプトの自己テスト（REPAIR-12。実 Docker Desktop 不要。#1880）
@@ -313,6 +316,12 @@ startup-latency-report: ## own と Docker の起動時間の結果を 1 つの�
 
 net-setup-timing: ## ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
 	@scripts/targets/net-setup-timing.sh
+
+net-throughput-rtt: ## iperf3 スループットと 1 バイト TCP 往復を計測し JSON で出力する（実機前提。PROBE・EXE 必須。TARGET=docker|both は docker を使うため人間の承認後。NET-2・NET-3・TASK-140 準備）
+	@scripts/targets/net-throughput-rtt.sh
+
+net-throughput-rtt-compare: ## 2 つの計測結果から Docker 比（%）と p50・p99 の倍率を出す（OWN_RESULT・DOCKER_RESULT 必須。合否なし。NET-2・NET-3）
+	@scripts/targets/net-throughput-rtt-compare.sh
 
 mac-small-files-docker: ## Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・TASK-70 準備・#1880）
 	@scripts/targets/mac-small-files-docker.sh

@@ -20,9 +20,9 @@
 //! `unshare` / `mount` は `sys` の薄いラッパー。TASK-139.2.1・#847）に加え、netns 内の `lo` / peer の up・アドレス付与・default route の設定と、
 //! ポート公開指定の DNAT ルール一括投入（`network::PortPublish`。TASK-139.3・#316）も持つ。チェイン policy の読み取り照会（`nftables_batch::ChainGet`・`NetlinkNetfilterSocket::chain_info`。TASK-148.1・NET-10）も持つ。ネットワーク削除（veth・netns pin・専用 nft テーブル・bridge の一括解放と IPAM・ポート予約の解放。`network::delete_network`。TASK-139.4・#317）も持つ。作成失敗で取り残した bridge・nft テーブルの所有確認つき回収（`network::reclaim_failed_create`。NET-1・#2467）も持つ。none モード（`lo` のみの netns の作成・pin と解放。`network_mode::none`。NET-6・TASK-143.2・#327）も持つ。host モード（ホスト netns 共有の検証と bridge / host / none の排他的なモード選択。`network_mode`。TASK-143.1・#326）も持つ。link の down、
 //! DNS ヘルパーのプロセス起動・UDP 待受・不正パケット破棄（`dns_helper`。TASK-141.1・#321）と A レコード応答・REFUSED（管理外名）・コンテナ名レジストリ（TASK-141.2・#322。ヘルパープロセスへの外部からの登録経路は未実装）も持つ。参照カウントによる DNS ヘルパーのオンデマンド起動・終了（`dns_helper::refcount`。プロセス内のみ。NET-7・TASK-144.1・#329）も持つ。ユーザー定義ネットワーク上の `--dns` 上流転送先マッピングと転送（`dns_helper::upstream`。プロセス内のみで、ヘルパープロセスへの登録経路・製品入口への接続は未実装〔REPAIR-3〕。NET-12・TASK-185.3・#346）も持つ。`--add-host` / `--dns` の hostname・IP 入力検証（`add_host_dns`。NET-12・TASK-185.1・#335）と、host/none モードでの `--dns` の resolv.conf 反映・none の loopback 制限（`add_host_dns::resolv_conf`。NET-12・TASK-185.4・#347）も持つ。`--add-host` の分割パースおよびコンテナ hosts ファイルへの追記（`add_host_dns::apply_add_hosts`。Linux 限定。NET-12・TASK-185.2・#345）も持つ。軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入と名前解決方式の選択（`etc_hosts`・`dns_helper::refcount::DnsHelperRefCounts::join_network`。NET-8・TASK-146.1・#334。動的更新は未実装〔REPAIR-3〕）と、軽量運用での `--dns` の `resolv.conf` 直接書き込み（`etc_hosts::apply_static_dns`。NET-8・TASK-146.2・#336）も持つ。masquerade ルール本体（nftables の bitwise / meta expr が前提）・`eth0` へのリネーム・GETRULE dump によるハンドルの再照会等は未実装で（ルールハンドルは NEWRULE の `NLM_F_ECHO` 応答から取得済み。公開の個別解除は `network::unpublish_container_port`。NET-3・#2839）、G10（TASK-136〜148・TASK-185〜186）で実装する（REPAIR-3）。
-//! PLUG-1 区分は検討中
-//! （制御面の `NetworkPlugin` は plugin 側に区分される一方、DNS ヘルパー・rootless 転送のデータパス
-//! 判定は未確定。crate-naming.md）。確定扱いにはしない（spec-reference）。
+//! rootless の pasta 構成のポート公開指定の検証と引数配列への変換（`pasta::port_forward`。OS 非依存。NET-9・#1937）も持つ。
+//! pasta の起動・監視・回収は supervisor（core 側）が `crates/net` の関数で行う。DNS ヘルパー（NET-5）は
+//! plugin 側の `NetworkPlugin` の実装が起動する（`docs/design/rootless-network.md` 12 章）。
 
 // 試験専用の故障注入（attach の巻き戻しを失敗させる入口）を製品のリリースビルドへ入れない。最適化ビルド
 // （`debug_assertions` が無効）で有効になっていたらコンパイルを止める（NET-1・REPAIR-3・#2971）。
@@ -66,5 +66,6 @@ pub mod network;
 pub mod network_mode;
 pub mod nftables_batch;
 pub mod nftables_rules;
+pub mod pasta;
 #[cfg(target_os = "linux")]
 mod sys;

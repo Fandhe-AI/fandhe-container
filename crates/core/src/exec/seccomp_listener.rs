@@ -6,7 +6,7 @@
 //! コンテナの PID 1（または exec の worker）が seccomp の最終段で `NEW_LISTENER` 付きで filter を載せ、得た
 //! listener fd を起動側（supervisor 側のプロセス C）へ socketpair の `SCM_RIGHTS` で渡す。
 //! `exec/seccomp.rs` の `apply_default_seccomp_with_listener` が [`ListenerSender::hand_over`] を呼び、
-//! `exec/launch_intermediate.rs` の launch 経路（と exec の経路）が [`receive_listener`] で受け取る。
+//! `exec/launch_intermediate.rs` の launch 経路（と exec の経路）が `receive_listener` で受け取る。
 //! 受け取った [`SeccompListener`] は `LaunchedProcess::take_seccomp_listener` で supervisor へ渡る。
 //! 通知を読んで応答するループ（PID 変換・`record_seccomp_denial_for`・`EPERM` 応答）は supervisor の
 //! `seccomp_notify`（#2025）が担い、本モジュールは取得・受け渡しと、通知の読み書きの安全 API（[`SeccompListener::wait`]・
@@ -277,7 +277,7 @@ impl ListenerSender {
     /// listener を得る前の適用失敗(`EBUSY` 等)を `E` + コード 1 バイト(`F` FailedPrecondition・`P` PermissionDenied・
     /// `U` Unimplemented・`T` Timeout・その他 `I`)の 1 通で C へ知らせる(ベストエフォート。SEC-4・#2024)。
     ///
-    /// 運ぶのは `ErrorCode` の分類 1 バイトだけ(メッセージ・errno は運ばない)。C は [`receive_listener`] で段 `Seccomp` の
+    /// 運ぶのは `ErrorCode` の分類 1 バイトだけ(メッセージ・errno は運ばない)。C は `receive_listener` で段 `Seccomp` の
     /// 同じコードの失敗に復元し、EOF 由来の `Internal` に潰れない。送れなくても(C が既に閉じた等)失敗は変わらない。
     pub(crate) fn report_failure(&self, error: &ExecError) {
         let code = match error.code {
@@ -439,18 +439,46 @@ fn decode_failure(
 ///
 /// `expected_pid` は C が起動した子（launch は PID 1、exec は worker）の pid。`deadline` までに届かなければ
 /// `Timeout`、EOF（子が送る前に死んだ）・検証の不一致は `Internal`（段 `Seccomp`）。呼び出し側が子を回収する。
+///
+/// 本番の launch の親は EOF を区別できる [`receive_listener_or_closed`] を使う（#2130）。本関数は試験と
+/// `escape-probe` の入口だけが使う。
+#[cfg(any(test, feature = "escape-probe"))]
 pub(crate) fn receive_listener(
     sock: BorrowedFd<'_>,
     expected_pid: u32,
     deadline: Instant,
 ) -> Result<SeccompListener, ExecError> {
+    receive_listener_or_closed(sock, expected_pid, deadline).map_err(|f| f.error)
+}
+
+/// [`receive_listener_or_closed`] の失敗。`error` は `receive_listener` が返すものと同じ。
+#[derive(Debug)]
+pub(crate) struct ListenerReceiveFailure {
+    pub(crate) error: ExecError,
+    /// 本文も fd も無いまま送り手が閉じた（seccomp より前で子が失敗して終わった）。launch の親は、この場合に限って
+    /// 状態 pipe の `E landlock ...` 行を読む（SEC-4・#2130）。検証の不一致・期限切れは `false`。
+    pub(crate) sender_closed: bool,
+}
+
+/// `receive_listener` に、EOF（送り手が閉じた）かどうかを添えた版（launch の親が使う。#2130）。
+pub(crate) fn receive_listener_or_closed(
+    sock: BorrowedFd<'_>,
+    expected_pid: u32,
+    deadline: Instant,
+) -> Result<SeccompListener, Box<ListenerReceiveFailure>> {
     receive_listener_classified(sock, expected_pid, deadline).map_err(|failure| match failure {
-        ReceiveFailure::SenderClosed => ExecError::new(
-            ErrorCode::Internal,
-            IsolationStage::Seccomp,
-            SENDER_CLOSED_MESSAGE,
-        ),
-        ReceiveFailure::Failed(e) => e,
+        ReceiveFailure::SenderClosed => Box::new(ListenerReceiveFailure {
+            error: ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Seccomp,
+                SENDER_CLOSED_MESSAGE,
+            ),
+            sender_closed: true,
+        }),
+        ReceiveFailure::Failed(e) => Box::new(ListenerReceiveFailure {
+            error: e,
+            sender_closed: false,
+        }),
     })
 }
 
@@ -511,7 +539,7 @@ where
     }
 }
 
-/// [`receive_listener`] の本体。EOF を [`ReceiveFailure::SenderClosed`] として区別して返す。
+/// `receive_listener` の本体。EOF を [`ReceiveFailure::SenderClosed`] として区別して返す。
 fn receive_listener_classified(
     sock: BorrowedFd<'_>,
     expected_pid: u32,

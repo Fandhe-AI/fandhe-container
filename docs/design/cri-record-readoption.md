@@ -38,6 +38,7 @@
 - パスは固定で、要求の入力から受けない。ファイル名はサービスが採番した ID（形式を検証済み）だけ
 - `.cri/records` と配下は 0700 で作る。既存のものは symlink でない・ディレクトリ・状態ルートと同じ所有者・group/other 権限なしを確認し、反すれば消さずに拒否する（`bundle_provider_in`・`ReclaimStore` と同じ基準。unix のみ。他 OS は plugin-cri の本番自体が `Unimplemented`）
 - core の `<状態ルート>/<id>/` とは名前空間が分かれる（`.` 始まり）
+- R2 の実装（#2932。`crates/cri/src/runtime_service/record_store.rs`・`record_store/file.rs`）: トレイト `RecordStore`（`put`・`remove`・`list`）とファイル実装 `FileRecordStore`（unix のみ）。拡張子は `.rec`、一時ファイルは同じディレクトリの `.tmp-<pid>-<連番>`（`O_EXCL`・0600。fsync → rename → ディレクトリの fsync）、排他は `.cri/records/.lock`（期限 5 秒の `try_lock`。決して unlink しない）。比較交換（CAS）は持たない（書き手は R3 のインスタンス排他と registry の `in_flight` で 1 つ）。列挙は専用スレッドで 1 件 10 秒・全体 60 秒の期限つきで、止まった読み取りは継続せず起動失敗（`Timeout`）にする。保持量の上限は `MAX_RETAINED_*_CONFIG_BYTES + 件数上限 × ヘッダ予算`、走査するエントリ数は `件数上限 × 2 + 64` まで。壊れた記録・不正な名前の `.rec` は消さず、列挙結果に失敗・件数として返す
 
 ## 形式
 

@@ -56,11 +56,11 @@ const LINE_MAX_IMAGE_FIELD: usize = 10 + MAX_IMAGE_FIELD_BYTES;
 
 /// sandbox 記録のヘッダ部（`config=` 行を含む）の予算: 版・id・state・created_at・runtime_handler・pending・
 /// network_owned・network_pending・config の 9 行（各 LF 込み）。
-const SANDBOX_HEADER_BUDGET: usize = 9 * (LINE_MAX_SCALAR + 1);
+pub(super) const SANDBOX_HEADER_BUDGET: usize = 9 * (LINE_MAX_SCALAR + 1);
 /// コンテナ記録のヘッダ部の予算。スカラー行 14（版・id・pod_sandbox_id・state・in_flight・created_at・
 /// started_at・finished_at・exit_code・termination・stop_signal・config の 12 行と余裕 2）と
 /// `user`・`log_path`・`image_id`・`image_ref`・`image_tag` の可変行（image_id は digest 文字列で 64 バイトを超える）。
-const CONTAINER_HEADER_BUDGET: usize = 14 * (LINE_MAX_SCALAR + 1)
+pub(super) const CONTAINER_HEADER_BUDGET: usize = 14 * (LINE_MAX_SCALAR + 1)
     + (LINE_MAX_USER + 1)
     + (LINE_MAX_LOG_PATH + 1)
     + 3 * (LINE_MAX_IMAGE_FIELD + 1);
@@ -279,7 +279,7 @@ fn parse_i64_non_negative(s: &str) -> R<i64> {
 }
 
 /// `generate_id` の出力と同じ形（64 文字の小文字 16 進）か。
-fn is_record_id(s: &str) -> bool {
+pub(super) fn is_record_id(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

@@ -628,7 +628,7 @@ const OP_LOG_WRITE_ATTEMPTS: u32 = 4;
 /// 計測スナップショット全体を 1 つのバッファへ組み立て、`w` へ **1 回の `write`** で書く（REPAIR-4）。
 ///
 /// 複数の CLI プロセスが同じ計測ログへ並行に追記しても JSON 行が混ざらないようにするための入口。
-/// core の `OpRecorder::export_json_lines` は行本体と改行を別々の `write_all` で書くため、ファイルへ
+/// core の `OpRecorder::export_json_lines` は 1 行ごとに別々の `write_all` で書く（`write_all` 自体も複数回の write に分かれうる）ため、ファイルへ
 /// 直接渡すと「A の本体 → B の本体 → 改行」の順で 1 行に 2 つの JSON が並びうる。ここではメモリ上の
 /// バッファへ書かせ、全行（LF 終端）を 1 回の write(2) にまとめる。`O_APPEND` で開いた通常ファイルへの
 /// 1 回の write(2) は、追記位置の決定と書き込みを inode ロックの下で一括して行うため、他プロセスの

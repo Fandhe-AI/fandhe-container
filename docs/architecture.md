@@ -262,6 +262,7 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |
 | SEC-4 | seccomp・Landlock の拒否の配送: ERRNO の 40 件は USER_NOTIF で supervisor が記録して EPERM で応答、KILL_PROCESS の 3 件はカーネル監査と終了シグナル（補助）、Landlock はカーネル監査（未対応なら縮退を明示）。確実な層は fail-closed・カーネル監査頼みは警告して続行・厳格モードは opt-in | `security-isolation.md` | [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。2026-10-15 オーナー決定・#2018。実装は #2023〜#2028・#2004） |
 | REPAIR-4・REPAIR-1・PLUG-1 の計装アダプタの配置 | 各 crate の計装トレイトを core の `OpRecorder` へつなぐアダプタは、その操作を本番で呼び `OpRecorder` を持つ crate に置く。計装だけのために依存辺は足さない | `ai-self-repair.md`・`plugin-system.md` | 本書の下の「計装アダプタの配置」・[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)（2026-10-12 オーナー決定。#1860） |
+| IO-1・IO-2（追補） | ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`・`Nack`。`PROTOCOL_VERSION` 2。ファイル操作モード）と UDS クライアントの本番結合を設計確定（未実装。実装は #3158 配下）。FLUSH ACK の範囲は 1 接続内の複数ファイルとディレクトリエントリ。spec の確認事項はオーナーへ報告済みで、回答次第で見直す | `api-io-share.md` | [io-protocol.md](design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節（#1886） |
 
 ### 計装アダプタの配置（REPAIR-4・REPAIR-1・PLUG-1）
 

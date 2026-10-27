@@ -46,7 +46,7 @@
 //! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |
-//! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線〔#1902〕・stop の意図の伝達〔SUP-9〕は未実装。REPAIR-3） |
+//! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線も済み〔#1902。意図は立てない〕、stop の意図の伝達〔SUP-9〕は未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch の成立は #2043） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
 //! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（`tests/inspect_output.rs`。#523 で先行追加し、#524 でキー順・型・値域・列挙値の照合を追加。実装済み） |

@@ -19,7 +19,7 @@
 //! 止めたい対象がもう終わっているので意図を残す。競合しない理由: 意図の設定・取り消しと、restart の判定
 //! （`supervise_with_restart` が `monitor` から戻った後に読む）は、どちらも監視スレッドの上で順に起きる。
 //! [`ControlledProcess`] の `wait` は内側の `wait` の前に受け箱を処理するので、SIGTERM による終了が観測されるのは必ず
-//! 意図が立った後になる。`RequestKind::Signal`（将来の `kill`。#1902）は意図に触れない。
+//! 意図が立った後になる。`RequestKind::Signal`（CLI の `kill`。#1902）は意図に触れない。
 //!
 //! # バックオフ中・再 launch 中の stop（SUP-9・SUP-3・#2440）
 //!

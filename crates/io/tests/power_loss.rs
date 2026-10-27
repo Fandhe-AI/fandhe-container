@@ -63,6 +63,8 @@ mod linux {
     /// 有効試行の目標（crash_safety と同じ）。
     const TRIALS: usize = 10;
     const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+    /// kill 後の子の回収を待つ上限（REPAIR-5）。
+    const REAP_TIMEOUT: Duration = Duration::from_secs(10);
     const READY_WAIT: Duration = Duration::from_secs(10);
 
     /// dm-flakey の table の状態。
@@ -127,6 +129,21 @@ mod linux {
         }
     }
 
+    /// kill 後の回収を有限時間だけ待つ（REPAIR-5）。割り込み不能待ち（D 状態）の子は
+    /// SIGKILL でも終わらないため、期限内に回収できなければ打ち切って false を返す。
+    fn reap_bounded(child: &mut Child) -> bool {
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) | Err(_) => return false,
+            }
+        }
+    }
+
     /// 外部コマンドを期限つきで実行する（REPAIR-5）。シェルは経由しない。
     fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
         let mut child = Command::new(program)
@@ -145,8 +162,8 @@ mod linux {
                 }
                 Ok(None) => {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{program} {args:?}: timed out"));
+                    let reaped = reap_bounded(&mut child);
+                    return Err(format!("{program} {args:?}: timed out (reaped: {reaped})"));
                 }
                 Err(e) => return Err(format!("{program}: wait failed: {e}")),
             }
@@ -222,8 +239,8 @@ mod linux {
                 .trim()
                 .to_string();
             // 取得した名前を Drop が外せるよう、検証より先に記録する
-            let idx = loop_index(&dev).ok_or_else(|| format!("not a loop device: {dev}"))?;
             self.loop_dev = Some(dev.clone());
+            let idx = loop_index(&dev).ok_or_else(|| format!("not a loop device: {dev}"))?;
             let backing =
                 std::fs::read_to_string(format!("/sys/block/loop{idx}/loop/backing_file"))
                     .map_err(|e| format!("cannot read backing_file: {e}"))?;
@@ -278,30 +295,60 @@ mod linux {
         }
     }
 
-    impl Drop for Rig {
-        fn drop(&mut self) {
-            let report = |what: &str, r: Result<String, String>| {
-                if let Err(e) = r {
-                    eprintln!(
-                        "{{\"event\":\"cleanup_failed\",\"step\":\"{what}\",\"error\":{e:?}}}"
-                    );
-                }
-            };
+    impl Rig {
+        /// 逆順で解除する。失敗した段階は残し、1 つでも失敗したらイメージ・配置先を消さずに
+        /// 残存情報を Err で返す（特権操作の後始末。使用中の backing image を unlink しない）。
+        fn cleanup(&mut self) -> Result<(), String> {
+            let mut failures: Vec<String> = Vec::new();
             if self.mounted {
                 let mnt = self.mnt.to_string_lossy().into_owned();
-                report("umount", run_cmd("umount", &[&mnt]));
+                match run_cmd("umount", &[&mnt]) {
+                    Ok(_) => self.mounted = false,
+                    Err(e) => failures.push(format!("umount: {e}")),
+                }
             }
-            if self.dm_created {
-                report(
-                    "dmsetup_remove",
-                    run_cmd("dmsetup", &["remove", "--retry", &self.dm_name]),
-                );
+            // マウントが残るなら dm は使用中のため外さない
+            if self.dm_created && !self.mounted {
+                match run_cmd("dmsetup", &["remove", "--retry", &self.dm_name]) {
+                    Ok(_) => self.dm_created = false,
+                    Err(e) => failures.push(format!("dmsetup remove: {e}")),
+                }
             }
-            if let Some(dev) = &self.loop_dev {
-                report("losetup_d", run_cmd("losetup", &["-d", dev]));
+            let loop_to_detach = if self.dm_created {
+                None
+            } else {
+                self.loop_dev.clone()
+            };
+            if let Some(dev) = loop_to_detach {
+                match run_cmd("losetup", &["-d", &dev]) {
+                    Ok(_) => self.loop_dev = None,
+                    Err(e) => failures.push(format!("losetup -d: {e}")),
+                }
             }
-            // 自分が作った一時ディレクトリだけを消す
-            let _ = std::fs::remove_dir_all(&self.root);
+            if failures.is_empty() {
+                // 自分が作った一時ディレクトリだけを消す
+                let _ = std::fs::remove_dir_all(&self.root);
+                Ok(())
+            } else {
+                Err(format!(
+                    "cleanup incomplete, kept root={} image={} mnt={} dm={} loop={:?}: {}",
+                    self.root.display(),
+                    self.image.display(),
+                    self.mnt.display(),
+                    self.dm_name,
+                    self.loop_dev,
+                    failures.join("; ")
+                ))
+            }
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            // 明示の cleanup 済みなら何もしない。失敗は残存情報として stderr に出す
+            if let Err(e) = self.cleanup() {
+                eprintln!("{{\"event\":\"cleanup_failed\",\"error\":{e:?}}}");
+            }
         }
     }
 
@@ -310,7 +357,9 @@ mod linux {
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            if !reap_bounded(&mut self.0) {
+                eprintln!("{{\"event\":\"child_not_reaped\",\"pid\":{}}}", self.0.id());
+            }
         }
     }
 
@@ -406,7 +455,12 @@ mod linux {
         // FLUSH ACK の直後から以降の書き込みを捨てる（カーネルクラッシュ相当）
         rig.switch(FlakeyMode::DropWrites)?;
         let _ = child.0.kill();
-        let _ = child.0.wait();
+        if !reap_bounded(&mut child.0) {
+            return Err(format!(
+                "server pid {} was not reaped in time",
+                child.0.id()
+            ));
+        }
         drop(client);
         rig.umount()?;
         rig.switch(FlakeyMode::Up)?;
@@ -461,8 +515,12 @@ mod linux {
         println!(
             "power_loss_summary {{\"flushed_trials\":{TRIALS},\"flushed_lost\":{flushed_lost},\"unflushed_trials\":{TRIALS},\"unflushed_lost\":{unflushed_lost}}}"
         );
-        println!("io2_flushed_data_survives_dm_flakey_drop_writes: ok");
+        // 後始末の失敗は試験の失敗にする（残存情報は Err に含まれる）
+        if let Err(e) = rig.cleanup() {
+            panic!("power_loss cleanup failed: {e}");
+        }
         assert_eq!(flushed_lost, 0);
+        println!("io2_flushed_data_survives_dm_flakey_drop_writes: ok");
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl CdiCreateContainerHook {
     pub fn path(&self) -> &str {
         &self.path
     }
-    /// argv 全体（`args[0]` が argv[0]。CDI の規約）。
+    /// argv 全体（先頭要素が argv 0 番になる。CDI の規約）。
     pub fn args(&self) -> &[String] {
         &self.args
     }
@@ -190,22 +190,18 @@ struct MountEntry {
 
 /// mountinfo の 8 進エスケープ（`\040` 等）を復号する。不正は `None`。
 fn unescape_mount_point(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' {
-            let d = b.get(i + 1..i + 4)?;
-            if !d.iter().all(|c| (b'0'..=b'7').contains(c)) {
-                return None;
+    let mut it = s.bytes();
+    let mut out = Vec::with_capacity(s.len());
+    while let Some(c) = it.next() {
+        if c == b'\\' {
+            let mut v: u32 = 0;
+            for _ in 0..3 {
+                let d = it.next().filter(|d| (b'0'..=b'7').contains(d))?;
+                v = v * 8 + u32::from(d - b'0');
             }
-            let v =
-                u32::from(d[0] - b'0') * 64 + u32::from(d[1] - b'0') * 8 + u32::from(d[2] - b'0');
             out.push(u8::try_from(v).ok()?);
-            i += 4;
         } else {
-            out.push(b[i]);
-            i += 1;
+            out.push(c);
         }
     }
     String::from_utf8(out).ok()

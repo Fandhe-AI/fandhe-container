@@ -13,7 +13,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 報告に載せる stderr の先頭最大バイト数。
@@ -120,7 +121,7 @@ pub struct CdiHookReport {
     pub exit_code: i32,
     /// 実行時間。
     pub elapsed: Duration,
-    /// stderr の先頭（最大 [`CDI_HOOK_STDERR_CAP`] バイト。UTF-8 は損失変換）。
+    /// stderr の先頭（最大 `CDI_HOOK_STDERR_CAP` バイト。UTF-8 は損失変換）。
     pub stderr: String,
 }
 
@@ -262,12 +263,50 @@ fn check_executable(path: &str) -> Result<(), CdiApplyError> {
     Ok(())
 }
 
-fn read_head(path: &Path) -> String {
-    let mut buf = Vec::new();
-    if let Ok(f) = File::open(path) {
-        let _ = f.take(CDI_HOOK_STDERR_CAP as u64).read_to_end(&mut buf);
+/// 子の stderr を pipe で受ける収集器。先頭 `CDI_HOOK_STDERR_CAP` バイトだけ保持し、以降は読み捨てる
+/// （実行中の保存量を有界にする。ファイルシステムは使わない）。
+struct StderrCollector {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl StderrCollector {
+    fn spawn(mut pipe: std::process::ChildStderr) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let (b, d) = (Arc::clone(&buf), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut g) = b.lock() {
+                            let room = CDI_HOOK_STDERR_CAP.saturating_sub(g.len());
+                            let take = n.min(room);
+                            if let Some(head) = chunk.get(..take) {
+                                g.extend_from_slice(head);
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            d.store(true, Ordering::Release);
+        });
+        Self { buf, done }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+
+    /// 子の終了後に呼ぶ。孫が pipe を持ち続けても塞がらないよう、待ちは短い上限つきにする（REPAIR-5）。
+    fn finish(&self) -> String {
+        let until = Instant::now() + Duration::from_millis(200);
+        while !self.done.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let bytes = self.buf.lock().map(|g| g.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// 1 フックを実行する。失敗時は (エラー, stderr 先頭)。
@@ -290,13 +329,6 @@ fn run_one(
     if state.len() > MAX_STATE_BYTES {
         return Err(bare(e(Code::ResourceExhausted, "hook state is too large")));
     }
-    let err_path = bundle.dir.join("stderr");
-    let err_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&err_path)
-        .map_err(|_| bare(e(Code::Internal, "failed to prepare hook bundle")))?;
 
     let (arg0, rest) = h
         .args
@@ -310,22 +342,22 @@ fn run_one(
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(err_file));
+        .stderr(Stdio::piped());
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(|err| bare(map_io(&err)))?;
     drop(cmd);
 
+    // stdin への state 送信は別スレッドで行い、期限監視（下のループ）に含める。フックが stdin を読まなくても
+    // 呼び出し側は塞がらず、timeout で子を kill すれば pipe が閉じて書き込みスレッドも終わる（REPAIR-5）。
     if let Some(mut stdin) = child.stdin.take() {
-        match stdin.write_all(state.as_bytes()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(bare(e(Code::Internal, "failed to write hook state")));
-            }
-        }
+        let payload = state.into_bytes();
+        std::thread::spawn(move || {
+            // BrokenPipe（フックが読まずに終了）等は無視し、成否は終了コードで判定する。
+            let _ = stdin.write_all(&payload);
+        });
     }
+    let collector = child.stderr.take().map(StderrCollector::spawn);
+    let tail_of = |c: &Option<StderrCollector>| c.as_ref().map_or_else(String::new, |c| c.finish());
 
     let deadline = Duration::from_secs(h.timeout_secs);
     let status = loop {
@@ -335,7 +367,7 @@ fn run_one(
                 if started.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let tail = read_head(&err_path);
+                    let tail = tail_of(&collector);
                     let _ = bundle.remove();
                     return Err((e(Code::Timeout, "hook timed out"), tail));
                 }
@@ -349,7 +381,7 @@ fn run_one(
         }
     };
     let elapsed = started.elapsed();
-    let stderr = read_head(&err_path);
+    let stderr = tail_of(&collector);
     if bundle.remove().is_err() {
         return Err((e(Code::Internal, "failed to remove hook bundle"), stderr));
     }
@@ -567,6 +599,24 @@ mod tests {
         let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
         assert_eq!(err.error.code(), Code::Timeout);
         assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
+    }
+
+    /// GPU-2・REPAIR-5: stdin を読まず stderr を大量に出すフックでも、保存量は上限で、期限内に戻る。
+    #[test]
+    fn stderr_is_capped_and_unread_stdin_does_not_block() {
+        let t = Tmp::new("flood");
+        let hooks = validate_create_container_hooks(&[mk_sh(
+            "head -c 200000 /dev/zero | tr '\\0' x >&2; exit 3",
+            &["flood"],
+            &[],
+            Some(5),
+        )])
+        .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let err = run_create_container_hooks(&stage, &hooks, &state(), &t.work()).unwrap_err();
+        assert_eq!(err.error.code(), Code::FailedPrecondition);
+        assert_eq!(err.stderr.len(), CDI_HOOK_STDERR_CAP);
         assert_eq!(fs::read_dir(t.work()).unwrap().count(), 0);
     }
 

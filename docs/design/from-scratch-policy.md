@@ -42,7 +42,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 | クレート | バージョン | 用途 | issue |
 | -------- | ---------- | ---- | ----- |
-| `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で完了し、`[workspace.dependencies]` と crates/cli・crates/oci の `cfg(unix)` の dev-dependencies に導入済み。oci は #2590） | #86・#1318・#2590 |
+| `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で完了し、`[workspace.dependencies]` と crates/cli・crates/oci の `cfg(unix)` と crates/supervisor の `cfg(target_os = "linux")` の dev-dependencies に導入済み。oci は #2590、supervisor は #1840） | #86・#1318・#2590 |
 | `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |

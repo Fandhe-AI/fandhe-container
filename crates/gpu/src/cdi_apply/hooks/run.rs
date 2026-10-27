@@ -339,7 +339,13 @@ fn open_trusted_executable(path: &str) -> Result<File, CdiApplyError> {
     if !p.is_absolute() {
         return Err(denied());
     }
-    let mut f = File::open(p).map_err(|err| map_io(&err))?;
+    // O_NONBLOCK: 書き手のいない FIFO でも open が塞がらないようにする（REPAIR-5）。種別は取得した fd の
+    // fstat（`metadata`）で通常ファイルだけに絞る。通常ファイルでは O_NONBLOCK は読み書きに影響しない。
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(sys::consts::O_NONBLOCK)
+        .open(p)
+        .map_err(|err| map_io(&err))?;
     let m = f.metadata().map_err(|err| map_io(&err))?;
     let me = self_uid();
     if !m.is_file() || m.mode() & 0o111 == 0 || m.mode() & 0o022 != 0 || !trusted_uid(m.uid(), me) {
@@ -503,10 +509,21 @@ fn run_one(
     h: &CdiCreateContainerHook,
     work_dir: &Path,
     index: usize,
+    exe: &File,
 ) -> Result<CdiHookReport, RunFail> {
     let bare = |x| (x, String::new(), None);
     // 検査した実体の fd を保持し、そのまま exec する（パスの再解決による差し替えを防ぐ）。
-    let exe = open_trusted_executable(h.path()).map_err(bare)?;
+    // `try_clone` は F_DUPFD_CLOEXEC で fd 3 以上を返す。子の stdin / stdout / stderr（fd 0〜2）の付け替えで
+    // 実行ファイルの fd が上書きされ、pipe や /dev/null を exec してしまうのを防ぐ。
+    let exe = exe
+        .try_clone()
+        .map_err(|_| bare(e(Code::Internal, "failed to duplicate hook executable fd")))?;
+    if exe.as_raw_fd() < 3 {
+        return Err(bare(e(
+            Code::Internal,
+            "hook executable fd is not above stdio",
+        )));
+    }
     let rootfs = std::str::from_utf8(stage.rootfs.as_os_str().as_bytes())
         .map_err(|_| bare(e(Code::InvalidArgument, "rootfs is not valid UTF-8")))?;
     let mut bundle = Bundle::create(work_dir, rootfs).map_err(bare)?;
@@ -632,39 +649,163 @@ fn run_one(
     }
 }
 
+/// 事前に検査して開いた実行ファイルの fd 群。[`open_hook_executables`] が発行する。
+///
+/// rootless では user namespace の内側からはホスト root 所有のファイルが overflow uid に見え、所有者検査が
+/// 正規のフックまで拒否する。namespace を作る前にホスト側の資格情報で検査して fd を保持し、その fd を
+/// [`run_create_container_hooks_with_recorder`] へ渡すことで、所有者の信頼を保ったまま実行できる（GPU-2・SEC-5）。
+#[derive(Debug)]
+pub struct CdiHookExecutables {
+    files: Vec<File>,
+}
+
+impl CdiHookExecutables {
+    /// 保持する実行ファイルの件数。
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// 件数が 0 か。
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+/// 各フックの実行ファイルを（呼び出したプロセスの資格情報で）検査して開く。
+/// rootless では `unshare` / `clone` で user namespace に入る前に呼ぶ。失敗時はその時点のフックの添字つき。
+pub fn open_hook_executables(
+    hooks: &[CdiCreateContainerHook],
+) -> Result<CdiHookExecutables, CdiHookError> {
+    let mut files = Vec::with_capacity(hooks.len());
+    for (index, h) in hooks.iter().enumerate() {
+        match open_trusted_executable(h.path()) {
+            Ok(f) => files.push(f),
+            Err(error) => {
+                return Err(CdiHookError {
+                    index,
+                    error,
+                    stderr: String::new(),
+                    completed: Vec::new(),
+                    unreaped_pid: None,
+                });
+            }
+        }
+    }
+    Ok(CdiHookExecutables { files })
+}
+
+/// フック 1 回の試行の計測値（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CdiHookRunSample {
+    /// フックの添字（実行前の共通ゲートの失敗は 0）。
+    pub index: usize,
+    /// 失敗の分類（成功なら `None`）。
+    pub error_code: Option<Code>,
+    /// 終了コード（正常終了した場合のみ）。
+    pub exit_code: Option<i32>,
+    /// 試行に要した時間（起動拒否・タイムアウトを含む）。
+    pub latency: Duration,
+}
+
+/// [`run_create_container_hooks_with_recorder`] の計測先。成功・失敗（起動拒否・タイムアウトを含む）の
+/// 全経路で、試行したフックごとに 1 回呼ぶ。
+pub trait CdiHookRunRecorder {
+    /// 1 回の試行を記録する。
+    fn record(&self, sample: CdiHookRunSample);
+}
+
+struct NoopRecorder;
+
+impl CdiHookRunRecorder for NoopRecorder {
+    fn record(&self, _sample: CdiHookRunSample) {}
+}
+
 /// 検証済みフックを集計順に直列実行する。最初の失敗で中止し、後続は起動しない（fail-closed）。
 /// `work_dir` は bundle を作る既存の絶対パスのディレクトリ（呼び出し元の一時領域。状態ルート配下を推奨）。
 /// ホストの環境変数は継承せず、フック指定の env だけを渡す。
+/// 実行ファイルはここで（呼び出しプロセスの資格情報で）検査する。rootless では
+/// [`open_hook_executables`] と [`run_create_container_hooks_with_recorder`] を使う。
 pub fn run_create_container_hooks(
     stage: &CdiHookStage,
     hooks: &[CdiCreateContainerHook],
     state: &CdiHookState,
     work_dir: &Path,
 ) -> CdiHookResult {
+    run_create_container_hooks_with_recorder(stage, hooks, None, state, work_dir, &NoopRecorder)
+}
+
+/// [`run_create_container_hooks`] に計測（REPAIR-4）と事前検査済みの実行ファイル（`exes`）を付けたもの。
+/// `exes` が `Some` の場合は件数が `hooks` と一致している必要があり、各フックの実行ファイルの検査は済んでいるものとして扱う。
+pub fn run_create_container_hooks_with_recorder(
+    stage: &CdiHookStage,
+    hooks: &[CdiCreateContainerHook],
+    exes: Option<&CdiHookExecutables>,
+    state: &CdiHookState,
+    work_dir: &Path,
+    recorder: &dyn CdiHookRunRecorder,
+) -> CdiHookResult {
     let mut done = Vec::with_capacity(hooks.len());
-    if !work_dir.is_absolute() {
-        return Err(CdiHookError {
+    let gate_fail = |error: CdiApplyError, started: Instant| {
+        recorder.record(CdiHookRunSample {
             index: 0,
-            error: e(Code::InvalidArgument, "work_dir must be an absolute path"),
-            stderr: String::new(),
-            completed: done,
-            unreaped_pid: None,
+            error_code: Some(error.code()),
+            exit_code: None,
+            latency: started.elapsed(),
         });
-    }
-    // 証跡を作成元のプロセス・mount namespace に結び付け、実行直前に前提状態を再検証する（GPU-2・REPAIR-2）。
-    if let Err(error) = stage.recheck() {
-        return Err(CdiHookError {
+        CdiHookError {
             index: 0,
             error,
             stderr: String::new(),
-            completed: done,
+            completed: Vec::new(),
             unreaped_pid: None,
-        });
+        }
+    };
+    let gate_started = Instant::now();
+    if !work_dir.is_absolute() {
+        return Err(gate_fail(
+            e(Code::InvalidArgument, "work_dir must be an absolute path"),
+            gate_started,
+        ));
+    }
+    if exes.is_some_and(|x| x.files.len() != hooks.len()) {
+        return Err(gate_fail(
+            e(Code::InvalidArgument, "hook executables do not match hooks"),
+            gate_started,
+        ));
+    }
+    // 証跡を作成元のプロセス・mount namespace に結び付け、実行直前に前提状態を再検証する（GPU-2・REPAIR-2）。
+    if let Err(error) = stage.recheck() {
+        return Err(gate_fail(error, gate_started));
     }
     for (index, h) in hooks.iter().enumerate() {
-        match run_one(stage, state, h, work_dir, index) {
-            Ok(r) => done.push(r),
+        let started = Instant::now();
+        let mut opened: Option<File> = None;
+        let exe = match exes.and_then(|x| x.files.get(index)) {
+            Some(f) => Ok(f),
+            None => open_trusted_executable(h.path()).map(|f| &*opened.insert(f)),
+        };
+        let outcome = match exe {
+            Ok(f) => run_one(stage, state, h, work_dir, index, f),
+            Err(err) => Err((err, String::new(), None)),
+        };
+        match outcome {
+            Ok(r) => {
+                recorder.record(CdiHookRunSample {
+                    index,
+                    error_code: None,
+                    exit_code: Some(r.exit_code),
+                    latency: started.elapsed(),
+                });
+                done.push(r);
+            }
             Err((error, stderr, unreaped_pid)) => {
+                recorder.record(CdiHookRunSample {
+                    index,
+                    error_code: Some(error.code()),
+                    exit_code: None,
+                    latency: started.elapsed(),
+                });
                 return Err(CdiHookError {
                     index,
                     error,
@@ -1022,5 +1163,82 @@ mod tests {
                 "{id:?} {pid}"
             );
         }
+    }
+
+    /// REPAIR-5・GPU-2: 書き手のいない FIFO を指すパスは open で塞がらず、通常ファイルでないとして即拒否する。
+    #[test]
+    fn fifo_path_is_rejected_without_blocking() {
+        let t = Tmp::new("fifo");
+        let fifo = t.0.join("fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = Instant::now();
+        let err = open_trusted_executable(fifo.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    struct Rec(std::sync::Mutex<Vec<CdiHookRunSample>>);
+    impl CdiHookRunRecorder for Rec {
+        fn record(&self, sample: CdiHookRunSample) {
+            self.0.lock().unwrap().push(sample);
+        }
+    }
+
+    /// REPAIR-4: 成功・失敗・起動拒否の各経路で、結果コードと所要時間が 1 試行ごとに通知される。
+    /// 事前検査済みの fd（`open_hook_executables`）経由でも同じ結果になる。
+    #[test]
+    fn recorder_sees_success_failure_and_refusal() {
+        let t = Tmp::new("rec");
+        let hooks = validate_create_container_hooks(&[
+            mk_sh("exit 0", &["h1"], &[], None),
+            mk_sh("exit 3", &["h2"], &[], None),
+        ])
+        .unwrap();
+        let stage = CdiHookStage::for_test(&t.0);
+        let exes = open_hook_executables(&hooks).unwrap();
+        assert_eq!(exes.len(), 2);
+        let rec = Rec(Default::default());
+        let err = run_create_container_hooks_with_recorder(
+            &stage,
+            &hooks,
+            Some(&exes),
+            &state(),
+            &t.work(),
+            &rec,
+        )
+        .unwrap_err();
+        assert_eq!(err.index, 1);
+        let got = rec.0.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].index, got[0].error_code, got[0].exit_code),
+            (0, None, Some(0))
+        );
+        assert_eq!(
+            (got[1].index, got[1].error_code, got[1].exit_code),
+            (1, Some(Code::FailedPrecondition), None)
+        );
+        drop(got);
+
+        let rec = Rec(Default::default());
+        let err = run_create_container_hooks_with_recorder(
+            &stage,
+            &hooks,
+            None,
+            &state(),
+            Path::new("relative"),
+            &rec,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.code(), Code::InvalidArgument);
+        let got = rec.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].error_code, Some(Code::InvalidArgument));
     }
 }

@@ -17,8 +17,11 @@
 //!   runc は未指定時に継承する）。
 //! - スレッドを作らない（後続の Landlock・seccomp はスレッド単位で効くため）。stdout は捨て、stderr は bundle 内の
 //!   ファイルへ向けて終了後に先頭だけ読む。
-//! - タイムアウトは子プロセスの SIGKILL と回収まで。孫プロセスの残存、実行ファイルの所有者照合
-//!   （rootless ではホスト root が overflow uid に見える）、検証から exec までの TOCTOU は残余（REPAIR-3）。
+//! - タイムアウトは子プロセスの SIGKILL と回収まで。孫プロセスの残存、検証から exec までの TOCTOU は残余（REPAIR-3）。
+//! - rootless: user namespace 内ではホスト root 所有のフックが overflow uid に見えて所有者検査が拒否する。
+//!   namespace に入る前に `open_hook_executables` で検査して fd を保持し、`run_create_container_hooks_with_recorder`
+//!   へ渡す契約とする（overflow uid を一律に信用しない）。
+//! - 計測は `run_create_container_hooks_with_recorder` の `CdiHookRunRecorder`（結果コードと所要時間。REPAIR-4）。
 //! - `createContainer` 以外の OCI フック名は `Unimplemented` で拒否する。
 //! - CDI spec ファイル自体の信頼（置き場所・所有者）は読み込み側（TASK-126）の責務で、本層は前提とする。
 //!
@@ -271,8 +274,9 @@ pub fn check_hook_stage_mountinfo(rootfs: &str, mountinfo: &str) -> Result<(), C
 mod run;
 #[cfg(target_os = "linux")]
 pub use run::{
-    CdiHookError, CdiHookReport, CdiHookResult, CdiHookStage, CdiHookState,
-    run_create_container_hooks, verify_hook_stage,
+    CdiHookError, CdiHookExecutables, CdiHookReport, CdiHookResult, CdiHookRunRecorder,
+    CdiHookRunSample, CdiHookStage, CdiHookState, open_hook_executables,
+    run_create_container_hooks, run_create_container_hooks_with_recorder, verify_hook_stage,
 };
 
 #[cfg(test)]

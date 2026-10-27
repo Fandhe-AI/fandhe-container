@@ -250,8 +250,8 @@ mod tests {
     fn nonblocking_pipe_read() {
         use std::io::Read as _;
         use std::process::{Command, Stdio};
-        let mut c = Command::new("/bin/sh")
-            .args(["-c", "sleep 1"])
+        let mut c = Command::new("sleep")
+            .arg("1")
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();

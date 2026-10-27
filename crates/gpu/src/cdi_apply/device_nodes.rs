@@ -313,6 +313,20 @@ fn resolve_one(
             "device node fileMode must not exceed 0o777",
         ));
     }
+    // u32::MAX は chown(2) で -1（変更しない）と同じ意味になり、指定と観測が黙って食い違うため入口で拒否する
+    // （GPU-1・SEC-1）。ホストの lookup より前に判定し、結果がホストの状態に依らないようにする。
+    if n.uid == Some(u32::MAX) {
+        return Err(err(
+            Code::InvalidArgument,
+            "device node uid must not be 4294967295 (reserved as -1 by chown)",
+        ));
+    }
+    if n.gid == Some(u32::MAX) {
+        return Err(err(
+            Code::InvalidArgument,
+            "device node gid must not be 4294967295 (reserved as -1 by chown)",
+        ));
+    }
     let host_path = match n.host_path.as_deref() {
         None | Some("") => n.path.as_str(),
         Some(h) => {
@@ -540,7 +554,7 @@ mod linux {
             .map_err(|e| io_err(&e, "failed to duplicate a directory fd"))
     }
 
-    /// 観測した inode の属性（O_PATH の fd を `File` にして `statx` で読む）。
+    /// 観測した inode の属性（fd を `File` にして `File::metadata` で読む。std が `statx`、使えなければ `fstat` を選ぶ）。
     struct Observed {
         mode: u32,
         rdev: u64,
@@ -601,29 +615,43 @@ mod linux {
     }
 
     const S_IFMT: u32 = 0o170_000;
+    const S_IFDIR: u32 = 0o040_000;
 
     /// この呼び出しが作ったものの記録（失敗時の逆順の後始末用）。
     #[derive(Default)]
-    struct Created {
-        dirs: Vec<(OwnedFd, CString)>,
-        nodes: Vec<CreatedNode>,
+    pub(super) struct Created {
+        pub(super) dirs: Vec<CreatedDir>,
+        pub(super) nodes: Vec<CreatedNode>,
+    }
+
+    /// 作成した中間ディレクトリ 1 件。`mkdirat` の成功直後に `ident: None` で登録し、開き直して観測できたら
+    /// `(dev, ino)` を埋める。後始末は同一性を照合できたものだけを消す（GPU-2・SEC-1）。
+    pub(super) struct CreatedDir {
+        pub(super) parent: OwnedFd,
+        pub(super) name: CString,
+        pub(super) ident: Option<(u64, u64)>,
     }
 
     /// 作成したノード 1 件。`mknodat` の直前に親 fd を複製しておき、成功した直後に登録する
     /// （再オープン・観測・複製の失敗でも回収できるようにする。特権操作の後始末）。
-    struct CreatedNode {
-        parent: OwnedFd,
-        name: CString,
+    pub(super) struct CreatedNode {
+        pub(super) parent: OwnedFd,
+        pub(super) name: CString,
         /// 作成した種別ビット（`S_IFCHR` 等）と rdev。識別が未確定の間の照合に使う。
-        type_bits: u32,
-        rdev: u64,
+        pub(super) type_bits: u32,
+        pub(super) rdev: u64,
         /// 再オープンして観測できた後に埋める `(dev, ino)`。
-        ident: Option<(u64, u64)>,
+        pub(super) ident: Option<(u64, u64)>,
     }
 
     impl Created {
         /// 最善努力の後始末。失敗しても元のエラーを優先するため結果は捨てる。
-        fn rollback(self) {
+        ///
+        /// ディレクトリは `(dev, ino)` が作成時の記録と一致する場合だけ `rmdir` する。識別が未確定
+        /// （作成直後の開き直し・観測の失敗）のものは、差し替えられた別物を消さないよう残す（fail-closed）。
+        /// 残った空ディレクトリは再試行の `walk_dirs` が既存として開くので作成を妨げない。照合から `rmdir`
+        /// までの名前の差し替えは、fd 指定の rmdir が Linux に無いため残余（空ディレクトリ 1 個に限る）。
+        pub(super) fn rollback(self) {
             for n in self.nodes.into_iter().rev() {
                 // 識別が未確定でも、種別と rdev が作ったものと一致する場合だけ消す。
                 let same = sys::open_path_nofollow_at(n.parent.as_fd(), &n.name)
@@ -638,8 +666,17 @@ mod linux {
                     let _ = sys::unlink_at(n.parent.as_fd(), &n.name, false);
                 }
             }
-            for (parent, name) in self.dirs.into_iter().rev() {
-                let _ = sys::unlink_at(parent.as_fd(), &name, true);
+            for d in self.dirs.into_iter().rev() {
+                let Some((di, ii)) = d.ident else { continue };
+                let same = sys::open_dir_nofollow_at(d.parent.as_fd(), &d.name)
+                    .ok()
+                    .and_then(|fd| observe(fd).ok())
+                    .is_some_and(|(o, _fd)| {
+                        o.mode & S_IFMT == S_IFDIR && o.dev == di && o.ino == ii
+                    });
+                if same {
+                    let _ = sys::unlink_at(d.parent.as_fd(), &d.name, true);
+                }
             }
         }
     }
@@ -661,15 +698,30 @@ mod linux {
                     let mut made = false;
                     match sys::mkdir_at(cur.as_fd(), &name, 0o755) {
                         Ok(()) => {
-                            created.dirs.push((rec_parent, name.clone()));
+                            created.dirs.push(CreatedDir {
+                                parent: rec_parent,
+                                name: name.clone(),
+                                ident: None,
+                            });
                             made = true;
                         }
                         Err(SysError::Os(17)) => {}
                         Err(e) => return Err(map_sys(e, "failed to create a /dev subdirectory")),
                     }
-                    let fd = sys::open_dir_nofollow_at(cur.as_fd(), &name)
+                    let mut fd = sys::open_dir_nofollow_at(cur.as_fd(), &name)
                         .map_err(|e| map_sys(e, "failed to open a /dev subdirectory"))?;
                     if made {
+                        // 開き直した fd の (dev, ino) を記録して、後始末で同一性を照合できるようにする。
+                        let (o, back) = observe(fd)?;
+                        fd = back;
+                        if o.mode & S_IFMT != S_IFDIR {
+                            return Err(precondition(
+                                "a created /dev subdirectory is not a directory",
+                            ));
+                        }
+                        if let Some(last) = created.dirs.last_mut() {
+                            last.ident = Some((o.dev, o.ino));
+                        }
                         // umask で削られた権限を、開き直した検証済み fd に対してだけ 0755 へ補正する
                         // （プロセス全体の umask は変えない。GPU-2）。
                         std::fs::set_permissions(
@@ -1168,8 +1220,8 @@ mod tests {
         let mut n = node("/dev/sub/q");
         n.r#type = Some("p".into());
         let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
-        // 観測の 1 回目（作成直後の観測）を失敗させる。
-        linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(0)));
+        // 観測の 2 回目（0 回目は中間ディレクトリの観測。ここはノード作成直後の観測）を失敗させる。
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(1)));
         let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
         linux::FAIL_OBSERVE_AT.with(|c| c.set(None));
         assert_eq!(e.code(), Code::ResourceExhausted);
@@ -1178,6 +1230,96 @@ mod tests {
         // 再試行は FailedPrecondition にならず成功する。
         let rep = create_device_nodes(root.as_fd(), &resolved).unwrap();
         assert_eq!(rep.outcomes.len(), 1);
+        assert!(
+            std::fs::symlink_metadata(d.join("sub/q"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GPU-1・SEC-1: uid / gid の `u32::MAX`（chown の -1）を lookup より前に拒否する。
+    #[test]
+    fn uid_gid_u32_max_is_rejected() {
+        let empty = Fake(HashMap::new());
+        let mut n = node("/dev/null");
+        n.uid = Some(u32::MAX);
+        assert_eq!(one(n, &empty).unwrap_err().code(), Code::InvalidArgument);
+        let mut n = node("/dev/null");
+        n.gid = Some(u32::MAX);
+        assert_eq!(one(n, &empty).unwrap_err().code(), Code::InvalidArgument);
+        for (u, g) in [(u32::MAX - 1, u32::MAX - 1), (0, 0)] {
+            let mut n = node("/dev/null");
+            n.uid = Some(u);
+            n.gid = Some(g);
+            n.r#type = Some("c".into());
+            n.major = Some(1);
+            n.minor = Some(3);
+            let r = one(n, &empty).unwrap();
+            assert_eq!((r.uid(), r.gid()), (Some(u), Some(g)));
+        }
+    }
+
+    /// GPU-2・SEC-1: 差し替えられたディレクトリは消さず、差し替えが無ければ消す（陽性対照）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_skips_replaced_empty_dir() {
+        use linux::{Created, CreatedDir};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::MetadataExt as _;
+        for replace in [false, true] {
+            let d = std::env::temp_dir()
+                .join(format!("fc-gpu-ut-repl-{}-{replace}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+            let md = std::fs::metadata(d.join("sub")).unwrap();
+            let parent = OwnedFd::from(std::fs::File::open(&d).unwrap());
+            let created = Created {
+                dirs: vec![CreatedDir {
+                    parent,
+                    name: std::ffi::CString::new("sub").unwrap(),
+                    ident: Some((md.dev(), md.ino())),
+                }],
+                nodes: vec![],
+            };
+            if replace {
+                // 元の inode は生かしたまま（番号の再利用を避ける）別の空ディレクトリに差し替える。
+                std::fs::rename(d.join("sub"), d.join("sub.orig")).unwrap();
+                std::fs::create_dir(d.join("sub")).unwrap();
+            }
+            created.rollback();
+            if replace {
+                assert!(d.join("sub").is_dir(), "replaced dir must be left");
+                assert_ne!(std::fs::metadata(d.join("sub")).unwrap().ino(), md.ino());
+            } else {
+                assert!(!d.join("sub").exists(), "same dir must be removed");
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// GPU-2・SEC-1: 作成直後の観測に失敗して識別できないディレクトリは消さず、再試行は成功する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_leaves_dir_with_unknown_identity() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        let d = std::env::temp_dir().join(format!("fc-gpu-ut-unk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::File::open(&d).unwrap();
+        let mut n = node("/dev/sub/q");
+        n.r#type = Some("p".into());
+        let resolved = resolve_device_nodes_with(&[n], &Fake(HashMap::new())).unwrap();
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(Some(0)));
+        let e = create_device_nodes(root.as_fd(), &resolved).unwrap_err();
+        linux::FAIL_OBSERVE_AT.with(|c| c.set(None));
+        assert_eq!(e.code(), Code::ResourceExhausted);
+        assert_eq!(e.errno(), Some(24));
+        assert!(d.join("sub").is_dir(), "unidentified dir must be left");
+        assert_eq!(std::fs::read_dir(d.join("sub")).unwrap().count(), 0);
+        create_device_nodes(root.as_fd(), &resolved).unwrap();
         assert!(
             std::fs::symlink_metadata(d.join("sub/q"))
                 .unwrap()

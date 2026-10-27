@@ -359,6 +359,9 @@ version = "0.0.0"
 [[package]]
 name = "fandhe-container-net"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-net",
+]
 
 [[package]]
 name = "fandhe-container-oci"

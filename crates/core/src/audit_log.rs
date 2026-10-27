@@ -54,6 +54,10 @@
 //! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
 //! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。landlock への配線は未実装。plugin_trust は
 //! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
+//! 拒否した段は #3121 で [`AuditRecord::stage`] として追加済み（`IsolationStage` と同じ固定語彙の [`AuditStage`]）。
+//! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）だけが
+//! 載せ、理由コードだけを持つ公開ヘルパ（supervisor の exec の親が使う `record_*_rejection`）と他の層は載せない
+//! （キー自体を出さない）。制御チャネルの中継は枠が段を運ばない（REPAIR-3）。
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
@@ -390,6 +394,28 @@ impl AuditReason {
     }
 }
 
+/// 監査レコードに載せる、拒否した段（stage）のトークン（SEC-4・ERR-4・REPAIR-4・#3121）。
+///
+/// 語彙は実行層の `IsolationStage`（`ExecError::stage`）の固定語彙（snake_case）と同じで、Linux 限定の
+/// `From<IsolationStage>`（`exec.rs`）が唯一の生成経路。構築子は crate 内専用なので、外部入力由来の
+/// 文字列を載せられない（ログ注入の防止。REPAIR-2）。`audit_log` は 3 OS でコンパイルされ
+/// `IsolationStage` は Linux 限定のため、型自体は文字列の newtype にしてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditStage(&'static str);
+
+impl AuditStage {
+    /// 静的トークンから構築する（crate 内専用）。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn new(token: &'static str) -> Self {
+        Self(token)
+    }
+
+    /// トークンを返す。
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// 違反を検知したレイヤー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -659,6 +685,7 @@ pub struct AuditRecord {
     pid: AuditPid,
     event: AuditEvent,
     container_id: Option<ContainerId>,
+    stage: Option<AuditStage>,
 }
 
 impl AuditRecord {
@@ -669,7 +696,25 @@ impl AuditRecord {
             pid,
             event,
             container_id: None,
+            stage: None,
         }
+    }
+
+    /// 拒否した段を載せる（SEC-4・ERR-4・#3121）。
+    ///
+    /// 経路検査の拒否は汎用の理由トークンで記録されるため、どの段（readonly_paths か masked_paths か等）
+    /// の拒否かは `ExecError::stage` にしか無かった。段を知る呼び出し側（`exec` の記録点）だけがこれで足す。
+    /// 段を持たない記録ではワイヤーにキー自体を出さず、既存の行は変わらない。
+    /// 制御チャネルの中継（`ControlAuditRelay`）は枠が段を運ばないので、通すと段は落ちる（REPAIR-3）。
+    #[must_use]
+    pub(crate) fn with_stage(mut self, stage: AuditStage) -> Self {
+        self.stage = Some(stage);
+        self
+    }
+
+    /// 記録に載せた段。載せない記録は `None`（ワイヤーではキー自体が無い）。
+    pub fn stage(&self) -> Option<AuditStage> {
+        self.stage
     }
 
     /// 検証済みのコンテナ ID を載せる（#1618）。

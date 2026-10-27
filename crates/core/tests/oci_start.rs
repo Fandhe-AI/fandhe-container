@@ -14,6 +14,9 @@
 //! 待ちの上限は CI の `platform-ci` ジョブが設定する `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒。AGENTS.md「推奨タイムアウト値」・REPAIR-5）から組み立てる。
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -86,15 +89,22 @@ struct MemStateStore {
     fail_update_at: Option<usize>,
     update_calls: AtomicUsize,
     state_root: PathBuf,
+    /// 状態ルートの親（tmpfiles の flock 走査から守る）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl MemStateStore {
     fn new(fail_update_at: Option<usize>) -> Self {
+        let scratch = scratch_root::ScratchDir::new(
+            "fandhe-core-start-it-mem",
+            std::time::Duration::from_secs(10),
+        );
         Self {
             records: Mutex::new(HashMap::new()),
             fail_update_at,
             update_calls: AtomicUsize::new(0),
-            state_root: std::env::temp_dir(),
+            state_root: scratch.path().to_path_buf(),
+            _scratch: scratch,
         }
     }
 
@@ -339,22 +349,27 @@ fn dynl(l: &Arc<FakeLauncher>) -> Arc<dyn ProcessLauncher> {
 /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
 struct Bundle {
     dir: PathBuf,
+    /// bundle の親（tmpfiles の flock 走査から守る。最後に drop される）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Bundle {
     fn ready(name: &str, config: &Value) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-core-start-it-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-start-it-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
         std::fs::create_dir_all(dir.join("rootfs")).expect("create bundle dir");
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_vec(config).expect("serialize"),
         )
         .expect("write config");
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn create(&self, store: &dyn StateStore, id: &str) {
@@ -846,16 +861,17 @@ fn assert_iso_values(
 #[cfg(target_os = "linux")]
 struct StateDir {
     dir: PathBuf,
+    _scratch: scratch_root::ScratchDir,
 }
 
 #[cfg(target_os = "linux")]
 impl StateDir {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-core-start-it-state-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-start-it-state-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("state-parent");
         std::fs::create_dir_all(&dir).expect("create state parent");
         // 状態ルートの祖先は group / other 書き込み不可でなければ `open` が拒否する（umask に依らず 0700 にする）。
         {
@@ -863,7 +879,10 @@ impl StateDir {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod state parent");
         }
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn root(&self) -> PathBuf {

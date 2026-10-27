@@ -10,6 +10,10 @@
 //! `oci_runtime::image_rootfs` のユニットテストが担う。`FileStateStore` は Linux 限定のため Linux のみで動く。
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
@@ -94,17 +98,20 @@ mod linux {
     }
 
     /// テスト用一時ディレクトリ（drop で削除。0700）。
-    struct TmpDir(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct TmpDir(PathBuf, super::scratch_root::ScratchDir);
 
     impl TmpDir {
         fn new() -> Self {
-            let p =
-                std::env::temp_dir().join(format!("fandhe-create-crash-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
+            let scratch = super::scratch_root::ScratchDir::new(
+                "fandhe-create-crash",
+                std::time::Duration::from_secs(10),
+            );
+            let p = scratch.path().join("work");
             fs::create_dir_all(&p).unwrap();
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(p)
+            Self(p, scratch)
         }
     }
 

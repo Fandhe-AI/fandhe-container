@@ -11,6 +11,9 @@
 //! 記録と異なる委譲スコープからの delete は状態記録を残して拒否される。実 cgroup での削除は実機前提の
 //! `cgroup_delete.rs`、状態ファイルの削除（受入基準 1）は実 `FileStateStore` を使う `state_store.rs` が照合する。
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -166,22 +169,27 @@ fn cid(s: &str) -> ContainerId {
 /// テスト専用の bundle ディレクトリ（drop で削除する）。
 struct Bundle {
     dir: PathBuf,
+    /// bundle の親（tmpfiles の flock 走査から守る。最後に drop される）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Bundle {
     fn ready(name: &str, config: &Value) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-core-delete-it-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-delete-it-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
         std::fs::create_dir_all(dir.join("rootfs")).expect("create bundle dir");
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_vec(config).expect("serialize"),
         )
         .expect("write config");
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn create_request(&self, id: &str) -> CreateRequest {

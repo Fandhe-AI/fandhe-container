@@ -144,7 +144,7 @@ loop {
 - クライアント側の UDS `connect` と `PipelineClient` の本番結合（設計確定済み。実装は #3165・#3162）
 - ファイル操作要求のワイヤー形式とファイル操作接続（設計確定済み。実装は #3161・#3163・#3164）
 - named pipe のトランスポート（範囲外。設計節 F12）
-- 電源断への耐性の検証
+- 電源断への耐性の検証（方式の判断記録: [io-power-loss-verification.md](../design/io-power-loss-verification.md)。オーナー承認待ち）
 
 ## 関連ドキュメント・ソース
 

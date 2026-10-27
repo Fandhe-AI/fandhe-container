@@ -35,10 +35,10 @@ CI 上の値は PR の `bench-regression` ジョブのサマリを参照する�
 
 ## 解釈と限界
 
-- 計測対象は rlib（中間成果物）で、リンク後のサイズではない。最終バイナリ（CLI）は TASK-79 で追加予定のため、追加後に実行ファイルのサイズへ切り替える
+- 計測対象は rlib（中間成果物）で、リンク後のサイズではない。CLI の bin はあるが、cli が `fandhe-container-plugin` に直接依存し、supervisor が core を既定 feature で引くため、plugin なしの実行ファイルを作れない。rlib のまま記録する（#2170 の判断）。実行ファイルへの切り替えは下記の feature 伝播の設計の後に行う
 - 合計の差の大半は plugin rlib 自体であり、実行ファイルでの削減量を意味しない。core rlib の差が 4,322 bytes と僅少なのは、ゲート配下が現状再エクスポートのみのため
 - PLUG-3 の軽量化効果の実測は未完。ゲート配下に実装が入る TASK-109・TASK-110 の後に再計測する
-- supervisor 経由のビルドでは `plugin` を除外できない。最終バイナリで PLUG-3 を成立させるには feature 伝播の設計が別途必要
+- supervisor 経由のビルドでは `plugin` を除外できない。最終バイナリで PLUG-3 を成立させるには feature 伝播の設計が別途必要（切り替えの前提。plugin-cri の #2434 と同根）。本計測は `-p fandhe-container-core` 単独のビルドなので、この feature 統合の影響を受けない
 
 ## 再現手順
 

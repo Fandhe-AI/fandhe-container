@@ -38,21 +38,25 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - `NFTA_RULE_POSITION`（挿入位置の指定）・`NFTA_RULE_USERDATA`・`NLM_F_REPLACE`
-//! - GETRULE dump によるハンドルの再照会。ハンドルの取得は [`RuleCreate::build_echo`]（NEWRULE の
+//! - GETRULE dump によるハンドルの再照会（dump 自体は [`RuleDump`]・[`DumpedRule`] で実装済みだが、expr 列のみを読む。
+//!   ハンドルの復元は #3068 の担当で未実装。NET-3・#3063）。ハンドルの取得は [`RuleCreate::build_echo`]（NEWRULE の
 //!   `NLM_F_ECHO` 応答。バッチ層 `nftables_batch` の ACK 判定が回収し、[`NftRuleHandle::from_rule_attrs`]
 //!   で復号する。NET-3・CRI-2・#2839）だけで、プロセス再起動後のハンドル復元は無い
 
 use std::num::NonZeroU64;
 
-use super::NftRuleExprs;
+use super::{NFTA_RULE_EXPRESSIONS, NftRuleExprs};
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{AttrIter, NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NlMsgBuilder};
 use crate::nftables_batch::{
-    NFNL_SUBSYS_NFTABLES, NfGenMsg, NftFamily, NftName, nfnl_msg_type, start_nft_request,
+    NFGENMSG_LEN, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftFamily, NftName, nfnl_msg_type,
+    start_nft_request,
 };
 
 /// ルール追加（`linux/netfilter/nf_tables.h` の `NFT_MSG_NEWRULE`）。
 pub const NFT_MSG_NEWRULE: u8 = 6;
+/// ルール照会（`NFT_MSG_GETRULE`。dump 要求に使う）。
+pub const NFT_MSG_GETRULE: u8 = 7;
 /// ルール削除（`NFT_MSG_DELRULE`）。
 pub const NFT_MSG_DELRULE: u8 = 8;
 /// ルールのハンドル属性（`NFTA_RULE_HANDLE`。`__be64`）。
@@ -218,6 +222,114 @@ pub(crate) fn rule_table_chain_attrs(
     }
 }
 
+/// `NFT_MSG_GETRULE` の dump 要求。1 テーブルの全ルールを読み取り専用で列挙する（NET-3・#3063）。
+///
+/// 公開の前に、他の状態ルートが投入した DNAT ルールの受け口を調べるために使う
+/// （`network::listener_dump`）。`NFTA_RULE_TABLE` を付けてカーネル側でテーブルを絞り込む。family 全体を
+/// 1 回で取ると、無関係なテーブル（docker・kube-proxy 等）のルールまで件数上限に数えてしまうため、
+/// テーブルごとに要求する。`NLM_F_DUMP` は送信側（`NetlinkNetfilterSocket::dump_rules`）が足す。
+/// ルールセットは変更しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleDump {
+    family: NftFamily,
+    table: NftName,
+}
+
+impl RuleDump {
+    /// 列挙対象のテーブルを指定して作る。
+    pub fn new(family: NftFamily, table: NftName) -> Self {
+        Self { family, table }
+    }
+
+    /// 対象の family。
+    pub fn family(&self) -> NftFamily {
+        self.family
+    }
+
+    /// 対象のテーブル名。
+    pub fn table(&self) -> &NftName {
+        &self.table
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETRULE)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK / DUMP は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg と属性（`NFTA_RULE_TABLE`）を `b` へ追記する。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
+        self.table.put_into(b, NFTA_RULE_TABLE)
+    }
+}
+
+/// `NFT_MSG_GETRULE` dump の応答 1 件（`NFT_MSG_NEWRULE`）から読み取ったルール（NET-3・#3063）。
+///
+/// ハンドルは読まない（ハンドルの復元は #3068 の担当で未実装）。expr 列だけを保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpedRule {
+    chain: NftName,
+    exprs: NftRuleExprs,
+}
+
+impl DumpedRule {
+    /// 応答ペイロード（nfgenmsg + 属性）を復号する。カーネル応答は外部入力として検証し、違反は
+    /// `DataLoss`: 短い・family が `family` と異なる・テーブル名が `table` と異なる・テーブル名／チェイン名が
+    /// 欠落／重複／不正・`NFTA_RULE_EXPRESSIONS` の重複や壊れた expr 列。
+    /// expr 列が無いルールは空の expr 列として扱う。エラーに名前の値は載せない。
+    pub fn decode(payload: &[u8], family: NftFamily, table: &NftName) -> Result<Self, NetError> {
+        let loss = |m: &'static str| NetError::new(NetErrorCode::DataLoss, m);
+        let head = NfGenMsg::decode(payload)?;
+        if head.family() != family.nfproto() {
+            return Err(loss("rule dump reply has an unexpected family"));
+        }
+        let attrs = payload
+            .get(NFGENMSG_LEN..)
+            .ok_or_else(|| loss("rule reply is shorter than nfgenmsg"))?;
+        let (got_table, got_chain) = rule_table_chain_attrs(AttrIter::new(attrs)).map_err(loss)?;
+        let mut want_table = table.as_str().as_bytes().to_vec();
+        want_table.push(0);
+        if got_table != want_table {
+            return Err(loss("rule dump reply belongs to a different table"));
+        }
+        let chain = got_chain
+            .split_last()
+            .and_then(|(_, name)| std::str::from_utf8(name).ok())
+            .and_then(|s| NftName::new(s).ok())
+            .ok_or_else(|| loss("rule chain name is not a valid nft name"))?;
+        let mut exprs: Option<NftRuleExprs> = None;
+        for a in AttrIter::new(attrs) {
+            let a = a?;
+            if a.attr_type() != NFTA_RULE_EXPRESSIONS {
+                continue;
+            }
+            if exprs.is_some() {
+                return Err(loss("duplicate rule expressions attribute"));
+            }
+            exprs = Some(NftRuleExprs::decode(a)?);
+        }
+        Ok(Self {
+            chain,
+            exprs: exprs.unwrap_or_default(),
+        })
+    }
+
+    /// ルールの所属チェイン。
+    pub fn chain(&self) -> &NftName {
+        &self.chain
+    }
+
+    /// ルールの expr 列。
+    pub fn exprs(&self) -> &NftRuleExprs {
+        &self.exprs
+    }
+}
+
 /// `NFT_MSG_DELRULE`。ハンドルで 1 ルールだけを削除する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleDelete {
@@ -270,7 +382,7 @@ impl RuleDelete {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{NFTA_RULE_EXPRESSIONS, NftMasq, NftPayload, NftRegister};
+    use super::super::{NftMasq, NftPayload, NftRegister};
     use super::*;
     use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgIter};
     use crate::nftables_batch::{NFGENMSG_LEN, NftBatch};
@@ -454,6 +566,64 @@ mod tests {
         NftRuleHandle::from_rule_attrs(msg.attrs(NFGENMSG_LEN).expect("attrs"))
     }
 
+    /// NET-3・#3063: GETRULE の dump 要求は nfgenmsg（ipv4）と `NFTA_RULE_TABLE`（NUL 終端）だけを持つ
+    /// （type 0x0A07。DUMP フラグは送信側が足す）。
+    #[test]
+    fn net3_ruledump_carries_only_table() {
+        let d = RuleDump::new(NftFamily::Ipv4, name("fandhe_net_a"));
+        let mut b = NlMsgBuilder::new(d.msg_type(), d.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        d.encode(&mut b).expect("encode");
+        let bytes = b.finish().expect("finish");
+        let msg = NlMsgIter::new(&bytes).next().expect("one").expect("msg");
+        assert_eq!(msg.header().msg_type(), 0x0A07);
+        let attrs: Vec<_> = msg
+            .attrs(NFGENMSG_LEN)
+            .expect("attrs")
+            .map(|a| {
+                let a = a.expect("attr");
+                (a.attr_type(), a.payload().to_vec())
+            })
+            .collect();
+        assert_eq!(attrs, vec![(1, b"fandhe_net_a\0".to_vec())]);
+        assert_eq!(msg.payload().first(), Some(&2));
+    }
+
+    /// NET-3・#3063: dump 応答の復号は family・テーブル名の不一致、重複した expr 属性を DataLoss にし、
+    /// expr 列が無いルールは空として受理する。
+    #[test]
+    fn net3_dumped_rule_decode_checks_binding() {
+        let payload = |table: &str, with_exprs: bool, family: u8| {
+            let mut b = NlMsgBuilder::new(0x0a06, 0, 1, 0);
+            NfGenMsg::new(family, 0).put_into(&mut b).expect("nfgen");
+            name(table).put_into(&mut b, NFTA_RULE_TABLE).expect("t");
+            name("output").put_into(&mut b, NFTA_RULE_CHAIN).expect("c");
+            if with_exprs {
+                exprs().put_into(&mut b).expect("exprs");
+                exprs().put_into(&mut b).expect("exprs");
+            }
+            let bytes = b.finish().expect("finish");
+            NlMsgIter::new(&bytes)
+                .next()
+                .expect("one")
+                .expect("msg")
+                .payload()
+                .to_vec()
+        };
+        let t = name("fandhe_net_a");
+        let bare = DumpedRule::decode(&payload("fandhe_net_a", false, 2), NftFamily::Ipv4, &t)
+            .expect("bare");
+        assert_eq!(bare.chain().as_str(), "output");
+        assert!(bare.exprs().is_empty());
+        for (label, p) in [
+            ("table", payload("fandhe_net_b", false, 2)),
+            ("family", payload("fandhe_net_a", false, 10)),
+            ("dup exprs", payload("fandhe_net_a", true, 2)),
+        ] {
+            let e = DumpedRule::decode(&p, NftFamily::Ipv4, &t).expect_err(label);
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
+        }
+    }
+
     /// NET-11: NEWRULE 相当のペイロードからハンドルを取り出せる（他属性は読み飛ばす）。
     #[test]
     fn from_rule_attrs_extracts_handle() {
@@ -512,6 +682,7 @@ mod libc_abi {
 
     const _: () = {
         libc_const_eq!(NFT_MSG_NEWRULE, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETRULE, u8, c_int);
         libc_const_eq!(NFT_MSG_DELRULE, u8, c_int);
     };
 }

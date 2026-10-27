@@ -103,3 +103,37 @@ fn net10_getchain_of_missing_chain_reports_structured_error() {
         "{err}"
     );
 }
+
+/// NET-3・#3063: GETTABLE / GETRULE の dump が実カーネルで往復し、ハングせず期限内に戻る
+/// （読み取り専用でルールセットは変更しない）。
+///
+/// `CAP_NET_ADMIN` なしは `PermissionDenied`、ありは成功（存在しない一意なテーブルの GETRULE dump は
+/// 空の結果）。nfnetlink の dump は ACK を送らず `NLMSG_DONE` で終わるため、その終端規則の実カーネルでの確認を兼ねる。
+#[test]
+fn net3_dump_of_tables_and_rules_terminates_with_done() {
+    use fandhe_container_net::nftables_rules::RuleDump;
+    let socket = NetlinkNetfilterSocket::open().expect("open NETLINK_NETFILTER");
+    let limit = Duration::from_secs(5);
+
+    let started = Instant::now();
+    match socket.dump_table_names(NftFamily::Ipv4, limit) {
+        Ok(names) => {
+            // 取得できた名前はすべて検証済みの nft 名で、重複を含まない。
+            let mut sorted: Vec<&str> = names.iter().map(NftName::as_str).collect();
+            sorted.sort_unstable();
+            let n = sorted.len();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "table names must be unique");
+        }
+        Err(e) => assert_eq!(e.code(), NetErrorCode::PermissionDenied, "{e}"),
+    }
+    assert!(started.elapsed() < limit);
+
+    let started = Instant::now();
+    let req = RuleDump::new(NftFamily::Ipv4, NftName::new(&unique_name()).expect("name"));
+    match socket.dump_rules(&req, limit) {
+        Ok(rules) => assert!(rules.is_empty(), "a missing table has no rules"),
+        Err(e) => assert_eq!(e.code(), NetErrorCode::PermissionDenied, "{e}"),
+    }
+    assert!(started.elapsed() < limit);
+}

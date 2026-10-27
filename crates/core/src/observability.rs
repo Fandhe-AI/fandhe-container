@@ -30,7 +30,12 @@
 //! - 末尾にメタ行を常に 1 行出す（空の記録器でも `ops:0` で出る）。記録落ちを観測可能にするため
 //!   `{"event":"op_stats_meta","ops":3,"dropped_records":0}`
 //! - 単位は整数マイクロ秒（`_us`。io の `latency_us` と揃える。PoC-8 の ms 小数表記は採らない）。
-//!   タイムスタンプ・pid 等の共通ヘッダや監査ログとの形式統一は TASK-98（ERR-4）の責務で、ここでは付けない
+//!   行は共通ログ型 [`crate::logging::LogLine`]（level なし）で組み、バイト列は移行前の手組みと
+//!   完全に同じ（TASK-98.2・#3116・ERR-4）。タイムスタンプ・pid 等の共通ヘッダは付けない
+//!   （封筒に ts を入れない判断は `logging` の module doc を参照）
+//! - 全行を先に符号化してから、1 行を 1 回の `write_all`（本体 + LF）で書く。符号化の失敗（行長上限
+//!   超過など）は 1 行も書かずに `ErrorCode::Internal` で返す（黙って捨てず、部分出力も残さない）。
+//!   固定スキーマ（[`OpName`] は 64 バイト以下・整数のみ）では実際には起きず、起きれば不変条件の破れ
 //! - I/O は集計のロックを解放してから行う（出力先がブロックしても記録経路を止めない。REPAIR-5）
 //! - 出力先が `None` なら何も書かず成功を返す。書き込み・flush の失敗は panic せず
 //!   `ErrorCode::Internal` の [`TraitError`] で返す。途中失敗時は部分的な行が書かれうる
@@ -60,6 +65,9 @@ use std::io::Write;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
+use crate::logging::{LogEvent, LogLine, LogLineError, encode_json_line};
 use crate::traits::{ErrorCode, TraitError};
 
 /// 操作名の許容バイト数の上限。ログのフィールドとして出すため短く抑える。
@@ -586,6 +594,8 @@ impl OpRecorder {
     /// ロックを解放してから書くため、`sink` 内から同じ記録器を呼んでもデッドロックしない。
     /// 書き込み・flush の失敗は `ErrorCode::Internal` を返す（メッセージは `ErrorKind` と
     /// 書けた行数のみで、OS メッセージ全文は含めない）。途中失敗では部分的な行が残りうる。
+    /// 行の符号化の失敗（行長上限超過など。固定スキーマでは起きない不変条件の破れ）は、
+    /// 1 行も書かずに `ErrorCode::Internal` を返す（黙って捨てない）。
     /// 操作名に資格情報やホストの実パスを入れない契約は [`OpName`] を参照。
     ///
     /// ```
@@ -614,14 +624,18 @@ impl OpRecorder {
                 ops,
             });
         };
-        let mut lines: Vec<String> = stats.iter().map(encode_op_stats_line).collect();
-        lines.push(encode_op_stats_meta_line(ops, dropped));
+        // 全行を先に符号化する（1 行でも失敗したら何も書かない）。
+        let mut lines: Vec<Vec<u8>> = Vec::with_capacity(stats.len() + 1);
+        for (i, s) in stats.iter().enumerate() {
+            lines.push(encode_op_stats_line(s).map_err(|e| encode_error(i, &e))?);
+        }
+        lines.push(
+            encode_op_stats_meta_line(ops, dropped).map_err(|e| encode_error(stats.len(), &e))?,
+        );
         let mut written = 0usize;
         for line in &lines {
-            let res = w
-                .write_all(line.as_bytes())
-                .and_then(|()| w.write_all(b"\n"));
-            if let Err(e) = res {
+            // 符号化済みの行は末尾 LF つき。1 行 1 回の write_all で書く。
+            if let Err(e) = w.write_all(line) {
                 return Err(export_error(written, e.kind()));
             }
             written += 1;
@@ -640,6 +654,17 @@ fn export_error(lines: usize, kind: std::io::ErrorKind) -> TraitError {
     TraitError::new(
         ErrorCode::Internal,
         format!("failed to write op_stats json lines after {lines} lines: {kind:?}"),
+    )
+}
+
+/// 行の符号化失敗を `ErrorCode::Internal` へ変換する（固定メッセージ・行番号のみ）。
+fn encode_error(index: usize, e: &LogLineError) -> TraitError {
+    TraitError::new(
+        ErrorCode::Internal,
+        format!(
+            "failed to encode op_stats json line {index}: {}",
+            e.message()
+        ),
     )
 }
 
@@ -679,36 +704,75 @@ impl ExportReport {
     }
 }
 
-/// レイテンシ 1 値を整数マイクロ秒または `null` の JSON 表記にする。
-fn us_or_null(v: Option<Duration>) -> String {
-    match v {
-        Some(d) => d.as_micros().to_string(),
-        None => "null".to_string(),
+/// op_stats 行のイベント名（const 文脈で検証する。不正名はコンパイルエラー）。
+const OP_STATS_EVENT: LogEvent = match LogEvent::from_static("op_stats") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+/// op_stats_meta 行のイベント名。
+const OP_STATS_META_EVENT: LogEvent = match LogEvent::from_static("op_stats_meta") {
+    Some(e) => e,
+    None => panic!("invalid log event name"),
+};
+
+/// op_stats 行の本体。フィールド宣言順がキー順で、`level` / `event` は持たない（封筒の予約キー）。
+/// レイテンシ未取得は `null`（`Option` の `None`）。値は `as_micros()` をそのまま出す。
+#[derive(Serialize)]
+struct OpStatsFields<'a> {
+    op: &'a str,
+    success: u64,
+    failure: u64,
+    count: u64,
+    min_us: Option<u128>,
+    mean_us: Option<u128>,
+    p95_us: Option<u128>,
+    max_us: Option<u128>,
+}
+
+impl<'a> From<&'a OpStats> for OpStatsFields<'a> {
+    fn from(s: &'a OpStats) -> Self {
+        let lat = s.latency();
+        Self {
+            op: s.name().as_str(),
+            success: s.success(),
+            failure: s.failure(),
+            count: s.total(),
+            min_us: lat.map(|l| l.min().as_micros()),
+            mean_us: lat.map(|l| l.mean().as_micros()),
+            p95_us: lat.map(|l| l.p95().as_micros()),
+            max_us: lat.map(|l| l.max().as_micros()),
+        }
     }
 }
 
-/// [`OpStats`] を JSON Lines の 1 行（改行なし）へ符号化する（TASK-84.3）。
-///
-/// 文字列値は固定リテラルと操作名のみで、エスケープは行わない。操作名は [`OpName`] が
-/// `[A-Za-z0-9._-]` に制限しているためで、[`OpName`] の制約を緩める場合はここにエスケープが必要。
-pub fn encode_op_stats_line(stats: &OpStats) -> String {
-    let lat = stats.latency();
-    format!(
-        "{{\"event\":\"op_stats\",\"op\":\"{}\",\"success\":{},\"failure\":{},\"count\":{},\"min_us\":{},\"mean_us\":{},\"p95_us\":{},\"max_us\":{}}}",
-        stats.name().as_str(),
-        stats.success(),
-        stats.failure(),
-        stats.total(),
-        us_or_null(lat.map(|l| l.min())),
-        us_or_null(lat.map(|l| l.mean())),
-        us_or_null(lat.map(|l| l.p95())),
-        us_or_null(lat.map(|l| l.max())),
-    )
+/// op_stats_meta 行の本体（`level` / `event` は持たない）。
+#[derive(Serialize)]
+struct OpStatsMetaFields {
+    ops: usize,
+    dropped_records: u64,
 }
 
-/// 集計全体のメタ行（改行なし）を符号化する（TASK-84.3）。
-pub fn encode_op_stats_meta_line(ops: usize, dropped_records: u64) -> String {
-    format!("{{\"event\":\"op_stats_meta\",\"ops\":{ops},\"dropped_records\":{dropped_records}}}")
+/// [`OpStats`] を JSON Lines の 1 行（末尾 LF つき）へ符号化する（TASK-84.3・TASK-98.2）。
+///
+/// 共通ログ型 [`crate::logging::LogLine`]（level なし）経由で組む。文字列のエスケープは serde_json が
+/// 行う。[`OpName`] が `[A-Za-z0-9._-]` に制限しているため実際にはエスケープは発生せず、
+/// 移行前の手組みとバイト列は一致する。戻り値は書き出すバイト列そのもの。
+pub fn encode_op_stats_line(stats: &OpStats) -> Result<Vec<u8>, LogLineError> {
+    let fields = OpStatsFields::from(stats);
+    encode_json_line(&LogLine::new(OP_STATS_EVENT, &fields))
+}
+
+/// 集計全体のメタ行（末尾 LF つき）を符号化する（TASK-84.3・TASK-98.2）。
+pub fn encode_op_stats_meta_line(
+    ops: usize,
+    dropped_records: u64,
+) -> Result<Vec<u8>, LogLineError> {
+    let fields = OpStatsMetaFields {
+        ops,
+        dropped_records,
+    };
+    encode_json_line(&LogLine::new(OP_STATS_META_EVENT, &fields))
 }
 
 /// 計測中の操作を表すガード（[`OpRecorder::start`] が返す）。
@@ -1051,8 +1115,8 @@ mod tests {
     fn repair4_encode_line_with_latency() {
         let s = st("read", 3, 2, Some(lat(1, 3, 5, 6)));
         assert_eq!(
-            encode_op_stats_line(&s),
-            r#"{"event":"op_stats","op":"read","success":3,"failure":2,"count":5,"min_us":1000,"mean_us":3000,"p95_us":5000,"max_us":6000}"#
+            encode_op_stats_line(&s).unwrap(),
+            b"{\"event\":\"op_stats\",\"op\":\"read\",\"success\":3,\"failure\":2,\"count\":5,\"min_us\":1000,\"mean_us\":3000,\"p95_us\":5000,\"max_us\":6000}\n"
         );
     }
 
@@ -1060,16 +1124,157 @@ mod tests {
     fn repair4_encode_line_without_latency() {
         let s = st("read", 0, 0, None);
         assert_eq!(
-            encode_op_stats_line(&s),
-            r#"{"event":"op_stats","op":"read","success":0,"failure":0,"count":0,"min_us":null,"mean_us":null,"p95_us":null,"max_us":null}"#
+            encode_op_stats_line(&s).unwrap(),
+            b"{\"event\":\"op_stats\",\"op\":\"read\",\"success\":0,\"failure\":0,\"count\":0,\"min_us\":null,\"mean_us\":null,\"p95_us\":null,\"max_us\":null}\n"
         );
     }
 
     #[test]
     fn repair4_encode_meta_line() {
         assert_eq!(
-            encode_op_stats_meta_line(3, 7),
-            r#"{"event":"op_stats_meta","ops":3,"dropped_records":7}"#
+            encode_op_stats_meta_line(3, 7).unwrap(),
+            b"{\"event\":\"op_stats_meta\",\"ops\":3,\"dropped_records\":7}\n"
+        );
+    }
+
+    /// 移行前の手組み実装（バイト列の不変を照合する基準。TASK-98.2・#3116）。
+    fn legacy_us(v: Option<Duration>) -> String {
+        match v {
+            Some(d) => d.as_micros().to_string(),
+            None => "null".to_string(),
+        }
+    }
+
+    fn legacy_line(stats: &OpStats) -> String {
+        let lat = stats.latency();
+        format!(
+            "{{\"event\":\"op_stats\",\"op\":\"{}\",\"success\":{},\"failure\":{},\"count\":{},\"min_us\":{},\"mean_us\":{},\"p95_us\":{},\"max_us\":{}}}\n",
+            stats.name().as_str(),
+            stats.success(),
+            stats.failure(),
+            stats.total(),
+            legacy_us(lat.map(|l| l.min())),
+            legacy_us(lat.map(|l| l.mean())),
+            legacy_us(lat.map(|l| l.p95())),
+            legacy_us(lat.map(|l| l.max())),
+        )
+    }
+
+    fn legacy_meta(ops: usize, dropped: u64) -> String {
+        format!("{{\"event\":\"op_stats_meta\",\"ops\":{ops},\"dropped_records\":{dropped}}}\n")
+    }
+
+    /// module doc の 2 つの例の行を逐語で照合する（ERR-4・REPAIR-4）。
+    #[test]
+    fn err4_repair4_module_doc_example_lines_exact_bytes() {
+        let s = st("read", 3, 2, Some(lat(1, 3, 5, 6)));
+        assert_eq!(
+            String::from_utf8(encode_op_stats_line(&s).unwrap()).unwrap(),
+            "{\"event\":\"op_stats\",\"op\":\"read\",\"success\":3,\"failure\":2,\"count\":5,\"min_us\":1000,\"mean_us\":3000,\"p95_us\":5000,\"max_us\":6000}\n"
+        );
+        assert_eq!(
+            String::from_utf8(encode_op_stats_meta_line(3, 0).unwrap()).unwrap(),
+            "{\"event\":\"op_stats_meta\",\"ops\":3,\"dropped_records\":0}\n"
+        );
+    }
+
+    /// 新旧実装のバイト列が複数入力で一致する（u128 の十進表記を含む）。
+    #[test]
+    fn err4_repair4_matches_legacy_format() {
+        let long = "a".repeat(64);
+        let huge = Duration::from_secs(u64::MAX);
+        let cases = [
+            st("read", 3, 2, Some(lat(1, 3, 5, 6))),
+            st("x", 0, 0, None),
+            st(&long, u64::MAX - 1, 1, None),
+            st(
+                "big",
+                1,
+                0,
+                Some(LatencySummary::new(huge, huge, huge, huge).unwrap()),
+            ),
+            st("a.b_c-d", 0, 5, Some(lat(0, 0, 0, 0))),
+        ];
+        for s in &cases {
+            assert_eq!(
+                String::from_utf8(encode_op_stats_line(s).unwrap()).unwrap(),
+                legacy_line(s)
+            );
+        }
+        for (ops, dropped) in [(0usize, 0u64), (64, 1), (3, u64::MAX)] {
+            assert_eq!(
+                String::from_utf8(encode_op_stats_meta_line(ops, dropped).unwrap()).unwrap(),
+                legacy_meta(ops, dropped)
+            );
+        }
+        let big = String::from_utf8(encode_op_stats_line(&cases[3]).unwrap()).unwrap();
+        assert!(big.contains(&format!("\"min_us\":{}", huge.as_micros())));
+    }
+
+    /// 最長ケースでも行長上限を超えない（符号化失敗が固定スキーマでは起きない根拠）。
+    #[test]
+    fn err4_repair4_worst_case_line_fits_limit() {
+        let huge = Duration::from_secs(u64::MAX);
+        let s = st(
+            &"a".repeat(64),
+            u64::MAX - 1,
+            1,
+            Some(LatencySummary::new(huge, huge, huge, huge).unwrap()),
+        );
+        let line = encode_op_stats_line(&s).unwrap();
+        assert_eq!(line.len(), legacy_line(&s).len());
+        assert!(line.len() < crate::logging::MAX_LOG_LINE_BYTES);
+        assert!(line.len() < 400);
+    }
+
+    /// 本体 DTO が予約キー（level・event）を持たない（封筒との重複キーを防ぐ）。
+    #[test]
+    fn err4_op_stats_fields_have_no_reserved_keys() {
+        let expected = [
+            "op", "success", "failure", "count", "min_us", "mean_us", "p95_us", "max_us",
+        ];
+        for s in [st("a", 1, 0, Some(lat(1, 2, 3, 4))), st("b", 0, 0, None)] {
+            let v = serde_json::to_value(OpStatsFields::from(&s)).unwrap();
+            let k: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            let mut sorted = expected.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(k, sorted, "serde_json map is key-sorted");
+            assert!(v.get("level").is_none() && v.get("event").is_none());
+            let line = String::from_utf8(encode_op_stats_line(&s).unwrap()).unwrap();
+            assert_eq!(line.matches("\"event\":").count(), 1);
+            assert_eq!(line.matches("\"level\":").count(), 0);
+        }
+        let v = serde_json::to_value(OpStatsMetaFields {
+            ops: 1,
+            dropped_records: 2,
+        })
+        .unwrap();
+        let mut k: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        k.sort_unstable();
+        assert_eq!(k, ["dropped_records", "ops"]);
+        let line = String::from_utf8(encode_op_stats_meta_line(1, 2).unwrap()).unwrap();
+        assert_eq!(line.matches("\"event\":").count(), 1);
+        assert_eq!(line.matches("\"level\":").count(), 0);
+    }
+
+    /// 符号化失敗は Internal・固定メッセージ（OS 詳細なし）に変換される。
+    #[test]
+    fn err4_encode_error_is_internal_and_fixed_message() {
+        #[derive(Serialize)]
+        struct Huge {
+            v: String,
+        }
+        let body = Huge {
+            v: "x".repeat(crate::logging::MAX_LOG_LINE_BYTES),
+        };
+        let le = encode_json_line(&LogLine::new(OP_STATS_EVENT, &body)).unwrap_err();
+        let te = encode_error(2, &le);
+        assert_eq!(te.code(), ErrorCode::Internal);
+        assert!(
+            te.to_string().contains(
+                "failed to encode op_stats json line 2: log line exceeds the maximum length"
+            ),
+            "unexpected: {te}"
         );
     }
 
@@ -1128,7 +1333,8 @@ mod tests {
             "event", "op", "success", "failure", "count", "min_us", "mean_us", "p95_us", "max_us",
         ];
         for s in [with, without] {
-            assert_eq!(keys(&encode_op_stats_line(&s)), expected);
+            let line = String::from_utf8(encode_op_stats_line(&s).unwrap()).unwrap();
+            assert_eq!(keys(&line), expected);
         }
     }
 
@@ -1183,6 +1389,7 @@ mod tests {
         };
         let e = rec3().export_json_lines(Some(&mut sink)).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(e.to_string().contains("after 2 lines"), "{e}");
         assert!(!e.to_string().contains("secret"));
         let mut sink = FailingSink {
             writes: 0,

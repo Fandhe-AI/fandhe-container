@@ -45,10 +45,10 @@ use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_
 const MAX_HOSTNAME_LEN: usize = 253;
 /// ラベルの最大バイト長（RFC 1123）。
 const MAX_LABEL_LEN: usize = 63;
-/// IPv6 の最長テキスト表記（IPv4 射影を含む）のバイト長。
-const MAX_IP_TEXT_LEN: usize = 45;
-/// `--add-host` 1 件の最大バイト長（hostname + `:` + IP）。分割前に検査する。
-const MAX_ADD_HOST_LEN: usize = MAX_HOSTNAME_LEN + 1 + MAX_IP_TEXT_LEN;
+/// IPv6 の最長テキスト表記（IPv4 射影を含む）のバイト長。CLI の `--dns` 1 値の argv 上限が参照する（#1871・NET-12）。
+pub const MAX_IP_TEXT_LEN: usize = 45;
+/// `--add-host` 1 件の最大バイト長（hostname + `:` + IP）。分割前に検査する。CLI の argv 上限も参照する（#1871・NET-12）。
+pub const MAX_ADD_HOST_LEN: usize = MAX_HOSTNAME_LEN + 1 + MAX_IP_TEXT_LEN;
 /// `--add-host` の最大件数。spec（NET-12）に件数規定は無く、無制限確保を避けるための実装上限。
 pub const MAX_ADD_HOST_ENTRIES: usize = 256;
 

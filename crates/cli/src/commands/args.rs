@@ -28,7 +28,7 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
-    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`(未検証の文字列。意味検証は `create_options`。
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`(未検証の文字列。意味検証は `create_options`)と、`--network`・`--add-host`・`--dns`(`options.network`。意味検証は `create_network`。NET-12・#1871)。
     /// SUP-12・CLI-1・#2713)。
     pub(super) options: CreateOptionArgs,
 }
@@ -55,6 +55,22 @@ pub(super) struct CreateOptionArgs {
     pub(super) cap_drop: Vec<String>,
     /// `--read-only`(値を取らないフラグ。1 回まで。`root.readonly` と OR で効く。CLI-1・SUP-12・#2828)。
     pub(super) read_only: bool,
+    /// `--network`・`--add-host`・`--dns`(未検証の文字列。意味検証は `create_network`。NET-12・CLI-1・#1871)。
+    pub(super) network: CreateNetworkArgs,
+}
+
+/// `create` のネットワーク関連フラグ(argv の生の値。件数と 1 値の長さの上限だけをここで見る。#1871・NET-12)。
+///
+/// 意味検証は `create_network::validate_network_options` が net の検証関数で行う。現状は検証を通っても
+/// `UNIMPLEMENTED` で拒否する(起動経路への結線は #1873。NET-6・REPAIR-3)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct CreateNetworkArgs {
+    /// `--network <none|host|名前>`(1 回まで。64 バイト以下)。
+    pub(super) network: Option<String>,
+    /// `--add-host <hostname>:<ip>`(最大 `MAX_ADD_HOST_ENTRIES` 件。1 件 `MAX_ADD_HOST_LEN` バイト以下)。
+    pub(super) add_hosts: Vec<String>,
+    /// `--dns <ip>`(最大 `MAX_DNS_SERVERS` 件。1 件 `MAX_IP_TEXT_LEN` バイト以下)。
+    pub(super) dns: Vec<String>,
 }
 
 /// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
@@ -268,6 +284,16 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
                 return Err(UsageError);
             }
             *slot = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if a == "--network" {
+            let value = it.next().ok_or(UsageError)?;
+            if options.network.network.is_some() {
+                return Err(UsageError);
+            }
+            let value = value.into_string().map_err(|_| UsageError)?;
+            if value.len() > fandhe_container_net::network::NAME_MAX_LEN {
+                return Err(UsageError);
+            }
+            options.network.network = Some(value);
         } else if a == "--read-only" {
             // 値を取らない(`--read-only=false` は未知のオプション、`--read-only true` は余剰の位置引数で使い方エラー)。
             if options.read_only {
@@ -330,6 +356,8 @@ enum RepeatableOption {
     Label,
     Tmpfs,
     CapDrop,
+    AddHost,
+    Dns,
 }
 
 fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
@@ -345,6 +373,10 @@ fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
         Some(RepeatableOption::Tmpfs)
     } else if a == "--cap-drop" {
         Some(RepeatableOption::CapDrop)
+    } else if a == "--add-host" {
+        Some(RepeatableOption::AddHost)
+    } else if a == "--dns" {
+        Some(RepeatableOption::Dns)
     } else {
         None
     }
@@ -400,6 +432,24 @@ fn push_option(
                 return Err(UsageError);
             }
             options.cap_drop.push(text(value)?);
+        }
+        RepeatableOption::AddHost => {
+            use fandhe_container_net::add_host_dns::{MAX_ADD_HOST_ENTRIES, MAX_ADD_HOST_LEN};
+            let v = text(value)?;
+            if options.network.add_hosts.len() >= MAX_ADD_HOST_ENTRIES || v.len() > MAX_ADD_HOST_LEN
+            {
+                return Err(UsageError);
+            }
+            options.network.add_hosts.push(v);
+        }
+        RepeatableOption::Dns => {
+            use fandhe_container_net::add_host_dns::MAX_IP_TEXT_LEN;
+            use fandhe_container_net::add_host_dns::resolv_conf::MAX_DNS_SERVERS;
+            let v = text(value)?;
+            if options.network.dns.len() >= MAX_DNS_SERVERS || v.len() > MAX_IP_TEXT_LEN {
+                return Err(UsageError);
+            }
+            options.network.dns.push(v);
         }
     }
     Ok(())
@@ -952,6 +1002,7 @@ mod tests {
                 tmpfs: vec!["/run:rw".into()],
                 cap_drop: Vec::new(),
                 read_only: false,
+                network: CreateNetworkArgs::default(),
             }
         );
     }
@@ -975,6 +1026,68 @@ mod tests {
         ] {
             assert!(parse_create(bad).is_err());
         }
+    }
+
+    /// NET-12・CLI-1(#1871): ネットワーク関連フラグは生の文字列のまま指定順に集める。
+    #[test]
+    fn cli1_net12_parse_create_network_options() {
+        let got = parse_create(v(&[
+            "--network",
+            "host",
+            "--add-host",
+            "a:1.2.3.4",
+            "--add-host",
+            "b:::1",
+            "--dns",
+            "127.0.0.1",
+            "--bundle",
+            "/b",
+            "c1",
+        ]))
+        .expect("parsed");
+        assert_eq!(
+            got.options.network,
+            CreateNetworkArgs {
+                network: Some("host".into()),
+                add_hosts: vec!["a:1.2.3.4".into(), "b:::1".into()],
+                dns: vec!["127.0.0.1".into()],
+            }
+        );
+    }
+
+    /// NET-12・SEC-1(#1871): 重複・値の欠落・件数と 1 値の長さの上限超過は使い方エラー(確保の前に止める)。
+    #[test]
+    fn cli1_net12_parse_create_network_limits() {
+        let with = |extra: Vec<OsString>| {
+            let mut a = extra;
+            a.extend(v(&["--bundle", "/b", "c1"]));
+            parse_create(a)
+        };
+        let rep = |flag: &str, value: &str, n: usize| -> Vec<OsString> {
+            (0..n).flat_map(|_| v(&[flag, value])).collect()
+        };
+        assert!(with(rep("--add-host", "h:1.2.3.4", 256)).is_ok());
+        assert_eq!(with(rep("--add-host", "h:1.2.3.4", 257)), Err(UsageError));
+        assert!(with(rep("--dns", "127.0.0.1", 32)).is_ok());
+        assert_eq!(with(rep("--dns", "127.0.0.1", 33)), Err(UsageError));
+        assert!(with(rep("--add-host", &"a".repeat(299), 1)).is_ok());
+        assert_eq!(
+            with(rep("--add-host", &"a".repeat(300), 1)),
+            Err(UsageError)
+        );
+        assert!(with(rep("--dns", &"1".repeat(45), 1)).is_ok());
+        assert_eq!(with(rep("--dns", &"1".repeat(46), 1)), Err(UsageError));
+        assert!(with(rep("--network", &"a".repeat(64), 1)).is_ok());
+        assert_eq!(with(rep("--network", &"a".repeat(65), 1)), Err(UsageError));
+        assert_eq!(with(rep("--network", "none", 2)), Err(UsageError));
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--dns"])),
+            Err(UsageError)
+        );
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--network"])),
+            Err(UsageError)
+        );
     }
 
     /// SUP-12・SEC-1(#2713): `--ipc` / `--shm-size` の重複、値の欠落、繰り返しの件数超過は使い方エラー。

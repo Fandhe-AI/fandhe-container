@@ -1,9 +1,9 @@
-//! `create` / `start` / `stop` / `kill` / `delete` / `list` / `logs` / `inspect` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `kill` / `delete` / `list` / `logs` / `inspect` / `state` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -94,6 +94,12 @@ pub(super) struct KillArgs {
     pub(super) id: String,
     /// 位置引数 `<signal>` の生の値（未検証。解釈は `kill_signal::parse_kill_signal`。未指定は SIGTERM）。
     pub(super) signal: Option<String>,
+}
+
+/// `state` の引数(CLI-1・SUP-11・#1903)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StateArgs {
+    pub(super) id: String,
 }
 
 /// `inspect` の引数(CLI-1・SUP-11・#2775)。
@@ -488,6 +494,13 @@ pub(super) fn parse_kill(args: Vec<OsString>) -> Result<KillArgs, UsageError> {
 /// `inspect <id>` を解析する(オプションは受け付けない)。
 pub(super) fn parse_inspect(args: Vec<OsString>) -> Result<InspectArgs, UsageError> {
     Ok(InspectArgs {
+        id: single_positional(args)?,
+    })
+}
+
+/// `state <id>` を解析する(オプションは受け付けない)。
+pub(super) fn parse_state(args: Vec<OsString>) -> Result<StateArgs, UsageError> {
+    Ok(StateArgs {
         id: single_positional(args)?,
     })
 }
@@ -1182,6 +1195,20 @@ mod tests {
             v(&["--signal", "9"]),
         ] {
             assert_eq!(parse_stop(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・SUP-11・#1903: `state` は ID をちょうど 1 つ受け、オプション・余分な引数は使い方エラー。
+    #[test]
+    fn cli1_parse_state() {
+        assert_eq!(parse_state(v(&["c1"])), Ok(StateArgs { id: "c1".into() }));
+        for a in [
+            v(&[]),
+            v(&["a", "b"]),
+            v(&["--x", "c1"]),
+            v(&["--json", "c1"]),
+        ] {
+            assert_eq!(parse_state(a), Err(UsageError));
         }
     }
 

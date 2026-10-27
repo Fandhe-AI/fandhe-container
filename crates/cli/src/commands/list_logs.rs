@@ -10,7 +10,7 @@
 //! `<id>\t<status>\t<pid または ->`。並びは状態ストアが返す順（ID 昇順）、0 件はヘッダのみで終了コード 0。
 //! 値は core が検証済みの ID（`[A-Za-z0-9._-]`）・固定語の状態（`creating/created/running/stopped`）・
 //! 10 進の PID だけで、エスケープ不要。`bundle` や annotations は任意の UTF-8（タブ・改行・端末制御文字を含み得る）
-//! ため出力しない（インジェクション回避。SEC-1）。
+//! ため出力しない（インジェクション回避。SEC-1。エスケープして読める出力は `inspect` / `state` が持つ）。
 //!
 //! # 状態ルートの開き方と失敗時の文言（#1607 E1〜E3・ERR-1・OCI-5）
 //!
@@ -112,7 +112,7 @@ use fandhe_container_supervisor::logs::{
 };
 
 use super::CliExit;
-use super::args::{GlobalArgs, InspectArgs, ListArgs, LogStreamArg, LogsArgs};
+use super::args::{GlobalArgs, InspectArgs, ListArgs, LogStreamArg, LogsArgs, StateArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime};
 
 /// list の固定ヘッダ行（LF 終端）。
@@ -381,6 +381,40 @@ pub(super) fn run_inspect(
     record_op(
         &rt.recorder,
         "inspect",
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
+}
+
+/// `state` の本体(CLI-1・SUP-11・#1903)。`inspect` と同じ読み口で、supervisor の
+/// `InspectReport::write_oci_state_json` が整形した OCI state の 1 行 JSON(末尾 LF)を stdout へ書く
+/// (整形は supervisor に 1 つだけ。cli に JSON を組まない。REPAIR-1・REPAIR-2)。状態は書き換えない。
+///
+/// 失敗は `inspect` と同じ(不在は `NOT_FOUND`、書き込み失敗は `INTERNAL`)。出力は部分的に作らない。
+pub(super) fn run_state(global: &GlobalArgs, args: &StateArgs, stdout: &mut dyn Write) -> CliExit {
+    let started = Instant::now();
+    let prepared = production_runtime(global, OpRecorder::new(), "state", started, || {
+        ContainerId::new(args.id.as_str())
+    });
+    let (rt, id) = match prepared {
+        Ok(v) => v,
+        Err(e) => return store_open_failure(&e),
+    };
+    let exit = match fandhe_container_supervisor::inspect::inspect(rt.store.as_ref(), &id) {
+        Err(e) => CliExit::failed(e.code()),
+        Ok(report) => match report
+            .write_oci_state_json(stdout)
+            .and_then(|()| stdout.flush())
+        {
+            Ok(()) => CliExit::Success,
+            Err(_) => CliExit::failed(ErrorCode::Internal),
+        },
+    };
+    record_op(
+        &rt.recorder,
+        "state",
         matches!(exit, CliExit::Success),
         started,
     );

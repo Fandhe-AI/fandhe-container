@@ -3,7 +3,7 @@
 //! # 役割
 //!
 //! `fandhe-container-platform-macos` の `Vm::launch` が起動したゲストカーネルが最初に実行する。
-//! 責務は次の 3 点に限る（4 は試験専用の追加）。
+//! 責務は次の 3 点に限る（4・5 は試験専用の追加）。
 //!
 //! 1. `/proc`・`/sys`・`/dev` を mount する。
 //! 2. カーネルコマンドラインの `fandhe.virtiofs=<tag>:<mountpoint>:<ro|rw>` を untrusted として復号し、
@@ -12,6 +12,9 @@
 //! 4. （試験専用）予約キー `fandhe.guest-test=virtiofs-io` があり、`fandhe-io` の RW mount が成功したときだけ、
 //!    ready の後に共有の read / readdir / write のプローブ行を出す（[`probe`]。MAC-1・IO-5・#1876）。
 //!    キーはホストの `reject_reserved_keys` により利用者指定では注入できず、本番の起動では走らない。
+//! 5. （試験専用）予約キー `fandhe.guest-test=virtiofs-link` があり、`ro`（RO）・`rw`（RW）の mount が成功した
+//!    共有ごとに、ready の後に symlink・ハードリンクの観測行を出す（[`link_probe`]。判定はしない。
+//!    MAC-1・SEC-4・#1877・#1374）。
 //!
 //! # ホストとの契約
 //!
@@ -54,12 +57,13 @@
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
 //! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
 //! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
-//!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。symlink・ハードリンクの観測モードは #1877。
+//!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。
 
 #![deny(unsafe_code)]
 
 pub mod cmdline;
 pub mod directive;
+pub mod link_probe;
 pub mod mountinfo;
 pub mod probe;
 pub mod process;
@@ -94,5 +98,18 @@ mod tests {
         assert!(!"Linux version".contains(READY_MARKER));
         assert!(!READY_MARKER.starts_with(report::REPORT_PREFIX));
         assert!(!READY_MARKER.starts_with(report::PROBE_NAMESPACE));
+        assert!(!READY_MARKER.starts_with(link_probe::LINK_NAMESPACE));
+        // 名前空間・報告の接頭辞は互いにどちら向きにも前方一致しない（ホストの走査が誤認しない）。
+        let all = [
+            report::REPORT_PREFIX,
+            report::PROBE_NAMESPACE,
+            link_probe::LINK_NAMESPACE,
+            READY_MARKER,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert!(i == j || !a.starts_with(b), "{a} / {b}");
+            }
+        }
     }
 }

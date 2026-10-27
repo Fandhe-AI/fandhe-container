@@ -214,6 +214,9 @@ pub enum ConfigError {
     /// ゲスト試験モード（virtiofs-io）が指定されたが、プローブ用の共有（tag `fandhe-io`・RW・
     /// ゲスト mount `/mnt/fandhe/io`）が無い（fail-closed。#1876）。
     GuestTestRequiresProbeShare,
+    /// ゲスト試験モード（virtiofs-link）が指定されたが、観測用の共有（tag `ro`・RO・ゲスト mount
+    /// `/mnt/fandhe/ro` と tag `rw`・RW・ゲスト mount `/mnt/fandhe/rw`）が揃っていない（fail-closed。#1877）。
+    GuestTestRequiresLinkShares,
     /// virtiofs 共有数が上限を超えた。
     TooManyVirtiofsShares { count: usize, max: usize },
     /// 共有ディレクトリがディレクトリでない。
@@ -328,6 +331,7 @@ impl ConfigError {
             ConfigError::GuestMountRequiresConsoleArg => "config.guest_mount_requires_console_arg",
             ConfigError::CommandLineReservedKey { .. } => "config.command_line_reserved_key",
             ConfigError::GuestTestRequiresProbeShare => "config.guest_test_requires_probe_share",
+            ConfigError::GuestTestRequiresLinkShares => "config.guest_test_requires_link_shares",
             ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
             ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
             ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
@@ -532,6 +536,10 @@ impl ConfigError {
             }
             ConfigError::GuestTestRequiresProbeShare => {
                 "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
+                    .to_string()
+            }
+            ConfigError::GuestTestRequiresLinkShares => {
+                "guest test mode virtiofs-link requires a read-only 'ro' share mounted at /mnt/fandhe/ro and a read-write 'rw' share mounted at /mnt/fandhe/rw"
                     .to_string()
             }
             ConfigError::DuplicateVirtiofsTag { tag } => {
@@ -2349,16 +2357,12 @@ impl VmConfigSpec {
         crate::guest_mount::reject_reserved_keys(self.cmdline.as_str())?;
         let mut tokens = crate::guest_mount::encode_directives(&self.shares);
         if let Some(mode) = self.guest_test {
-            // 試験モードはプローブ用の共有が実在するときだけ許す（ゲストも mount 成功を AND 条件にする）。
-            let has_probe_share = self.shares.shares().iter().any(|s| {
-                s.tag.as_str() == crate::guest_probe::SHARE_TAG
-                    && !s.access.is_read_only()
-                    && s.guest_mount
-                        .as_ref()
-                        .is_some_and(|m| m.as_str() == crate::guest_probe::GUEST_MOUNT)
-            });
-            if !has_probe_share {
-                return Err(ConfigError::GuestTestRequiresProbeShare);
+            // 試験モードは必要な共有が実在するときだけ許す（ゲストも mount 成功を AND 条件にする）。
+            if !self.guest_test_shares_present(mode) {
+                return Err(match mode {
+                    GuestTestMode::VirtiofsLink => ConfigError::GuestTestRequiresLinkShares,
+                    _ => ConfigError::GuestTestRequiresProbeShare,
+                });
             }
             if !tokens.is_empty() {
                 tokens.push(' ');
@@ -2375,6 +2379,28 @@ impl VmConfigSpec {
             format!("{} {tokens}", self.cmdline.as_str())
         };
         KernelCommandLine::try_new(&joined)
+    }
+
+    /// 試験モードが要求する共有（tag・access・ゲスト mount）が、そのとおり揃っているか（#1876・#1877）。
+    fn guest_test_shares_present(&self, mode: GuestTestMode) -> bool {
+        let has = |tag: &str, mount: &str, read_only: bool| {
+            self.shares.shares().iter().any(|s| {
+                s.tag.as_str() == tag
+                    && s.access.is_read_only() == read_only
+                    && s.guest_mount.as_ref().is_some_and(|m| m.as_str() == mount)
+            })
+        };
+        match mode {
+            GuestTestMode::VirtiofsLink => {
+                use crate::guest_link_probe::{RO_MOUNT, RO_TAG, RW_MOUNT, RW_TAG};
+                has(RO_TAG, RO_MOUNT, true) && has(RW_TAG, RW_MOUNT, false)
+            }
+            _ => has(
+                crate::guest_probe::SHARE_TAG,
+                crate::guest_probe::GUEST_MOUNT,
+                false,
+            ),
+        }
     }
 
     /// ゲスト mount の結果を待つ対象の tag（mount 指定が無ければ `None`）。
@@ -4598,6 +4624,96 @@ broken line
                 "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
             );
         }
+    }
+
+    /// MAC-1・SEC-4・#1877: virtiofs-link は既定で無効で、有効にすると ro / rw の指示つきの実効コマンドラインになる。
+    #[test]
+    fn guest_test_link_cmdline_is_exact_when_on() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("guest-test-link");
+        let k = t.file("vmlinux");
+        let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(mount_shares(
+                &t.0,
+                &[
+                    ("ro", "/mnt/fandhe/ro", ReadOnly),
+                    ("rw", "/mnt/fandhe/rw", ReadWrite),
+                ],
+            ));
+        assert_eq!(
+            plain.effective_cmdline().unwrap().as_str(),
+            "console=hvc0 fandhe.virtiofs=ro:/mnt/fandhe/ro:ro fandhe.virtiofs=rw:/mnt/fandhe/rw:rw"
+        );
+        // virtiofs_link.rs（macOS 専用）の期待値と同一の文字列。打ち間違いを Linux CI で検出する。
+        assert_eq!(
+            plain
+                .with_guest_test(GuestTestMode::VirtiofsLink)
+                .effective_cmdline()
+                .unwrap()
+                .as_str(),
+            "console=hvc0 fandhe.virtiofs=ro:/mnt/fandhe/ro:ro fandhe.virtiofs=rw:/mnt/fandhe/rw:rw fandhe.guest-test=virtiofs-link"
+        );
+    }
+
+    /// MAC-1・SEC-4・#1877: ro / rw が揃わない構成（欠け・access 逆・mount point 違い・io 用だけ）は拒否する。
+    #[test]
+    fn guest_test_link_requires_both_shares() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("guest-test-link-reject");
+        let k = t.file("vmlinux");
+        let base = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_guest_test(GuestTestMode::VirtiofsLink);
+        let reject = |spec: &VmConfigSpec| {
+            let err = spec.effective_cmdline().unwrap_err();
+            assert_eq!(err.code(), "config.guest_test_requires_link_shares");
+            assert_eq!(
+                err.message(),
+                "guest test mode virtiofs-link requires a read-only 'ro' share mounted at /mnt/fandhe/ro and a read-write 'rw' share mounted at /mnt/fandhe/rw"
+            );
+        };
+        reject(&base);
+        for shares in [
+            &[("ro", "/mnt/fandhe/ro", ReadOnly)][..],
+            &[("rw", "/mnt/fandhe/rw", ReadWrite)][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadWrite),
+                ("rw", "/mnt/fandhe/rw", ReadWrite),
+            ][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadOnly),
+                ("rw", "/mnt/fandhe/rw", ReadOnly),
+            ][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadOnly),
+                ("rw", "/mnt/fandhe/other", ReadWrite),
+            ][..],
+            &[("fandhe-io", "/mnt/fandhe/io", ReadWrite)][..],
+        ] {
+            reject(
+                &base
+                    .clone()
+                    .with_shared_directories(mount_shares(&t.0, shares)),
+            );
+        }
+        // io 用モードの要求は変わらず、link 用の共有だけでは満たされない。
+        let io = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_guest_test(GuestTestMode::VirtiofsIo)
+            .with_shared_directories(mount_shares(
+                &t.0,
+                &[
+                    ("ro", "/mnt/fandhe/ro", ReadOnly),
+                    ("rw", "/mnt/fandhe/rw", ReadWrite),
+                ],
+            ));
+        assert_eq!(
+            io.effective_cmdline().unwrap_err().code(),
+            "config.guest_test_requires_probe_share"
+        );
     }
 
     /// MAC-1・TASK-65.3: mount 指定があるのにコンソールが無い構成は fail-closed で拒否する。

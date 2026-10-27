@@ -5,7 +5,7 @@
 //! 用意する（`lifecycle_one_shot.rs` と同方式）。子の環境は `env_clear()` されるため、振る舞いは
 //! socket ディレクトリ内の `behavior` ファイルで子へ伝える。
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[path = "support/swap.rs"]
 mod swap;
 
@@ -807,6 +807,50 @@ mod unix {
         want.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(expected.as_os_str()));
         assert_eq!(resp.payload(), want.as_slice());
         session.shutdown().unwrap();
+    }
+
+    /// macOS 等（Linux 以外の unix）: 構築後にパスを差し替えると、起動直前の同一性確認で拒否され、
+    /// 子は spawn されない（#1866・PLUG-11）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_resident_rejects_after_path_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let plugin = PluginLaunchSpec::new(fx.target(), vec![], dir.0.clone()).unwrap();
+        let marker = fx.marker_path();
+        fx.replace_with_marker_script(&marker);
+        let err = start_plugin(plugin, 5000).unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "plugin launch target path does not refer to the verified file"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "child must not be spawned");
+    }
+
+    /// macOS 等: 差し替えなしなら起動し、1 往復と shutdown が成功する（#1866）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_resident_runs_when_not_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let plugin = PluginLaunchSpec::new(fx.target(), args, dir.0.clone()).unwrap();
+        let mut session = start_plugin(plugin, 5000).unwrap();
+        let child_pid = session.pid().unwrap();
+        assert_eq!(
+            parse(&session.call(&ping(), rpc(5000)).unwrap()),
+            (child_pid, 1)
+        );
+        let done = session.shutdown().unwrap();
+        assert_eq!(
+            done.termination(),
+            PluginTermination::Exited { code: Some(0) }
+        );
     }
 
     /// 起動対象を作った後に元のパスを別の実行ファイルへ差し替えても、起動されるのは元の実体（Linux。

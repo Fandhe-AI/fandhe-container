@@ -836,6 +836,38 @@ mod launch_target {
         assert_eq!(target.exec_path(), resolved.as_path());
     }
 
+    /// 変換直後の実体のパスを `lstat` した結果が、保持 fd の dev / ino と一致する（#1866。macOS の
+    /// 起動直前の同一性確認が、検証〔#1865〕の結果と食い違わないことの機械照合）。
+    #[test]
+    fn plug11_1866_exec_path_matches_identity_plain() {
+        let (_t, v) = verified("lt-1866-plain");
+        let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+        let target = hv.into_launch_target().expect("converted");
+        let m = fs::symlink_metadata(target.exec_path()).unwrap();
+        assert!(m.file_type().is_file());
+        assert_eq!(m.dev(), target.identity().dev());
+        assert_eq!(m.ino(), target.identity().ino());
+    }
+
+    /// symlink 候補でも `exec_path`（実体側）は symlink でなく、dev / ino が保持 fd と一致する（#1866）。
+    #[test]
+    fn plug11_1866_exec_path_matches_identity_symlink() {
+        let tmp = Tmp::new("lt-1866-link");
+        fs::write(tmp.0.join("real"), b"payload").unwrap();
+        chmod(&tmp.0.join("real"), 0o755);
+        symlink("real", tmp.0.join(NAME)).unwrap();
+        let v = verify_dir(&tmp.0)
+            .expect("dir ok")
+            .verify_file(OsStr::new(NAME))
+            .expect("file ok");
+        let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+        let target = hv.into_launch_target().expect("converted");
+        let m = fs::symlink_metadata(target.exec_path()).unwrap();
+        assert!(m.file_type().is_file(), "exec_path must not be a symlink");
+        assert_eq!(m.dev(), target.identity().dev());
+        assert_eq!(m.ino(), target.identity().ino());
+    }
+
     /// `#!` スクリプトは照合を通っても変換で拒否される（パス起動へ縮退しない）。
     #[test]
     fn plug11_1857_conversion_rejects_script() {

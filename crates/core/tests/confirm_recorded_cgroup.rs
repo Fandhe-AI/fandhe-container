@@ -21,8 +21,21 @@
 //!
 //! 作成時は未実行（ホストに cgroup を作るため Agent は実行しない）。
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
     use fandhe_container_core::exec::IsolationPrivilege;
@@ -139,7 +152,7 @@ mod linux {
     }
 
     fn delegated_scope() -> (DelegatedCgroup, String, PathBuf, ScopeDir) {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let parent = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
         let name = format!("rec-{}", std::process::id());
         let dir = parent.join(&name);

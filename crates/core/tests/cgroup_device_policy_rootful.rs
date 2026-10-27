@@ -15,11 +15,22 @@
 //! 公開入口を本番ビルド（`cfg(test)` の差し込みなし）で通し、実際の `bpf(2)` で付いたこと
 //! （プログラム ID・attach flags 0）と、二重適用の拒否を具体値照合する。
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use fandhe_container_core::cgroups::{
-        CgroupName, DelegatedCgroup, DevicePolicyMode, DevicePolicyOutcome,
-    };
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
+    use fandhe_container_core::cgroups::{CgroupName, DevicePolicyMode, DevicePolicyOutcome};
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
@@ -28,7 +39,7 @@ mod linux {
     #[test]
     #[ignore = "requires root with CAP_BPF+CAP_NET_ADMIN (or CAP_SYS_ADMIN), cgroup v2 and bpf(2) cgroup-device support (sudo systemd-run --scope -p Delegate=yes)"]
     fn sec1_task32_apply_default_device_policy_rootful_attaches_once() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let id = ContainerId::new(format!("dp{}", std::process::id())).unwrap();
         let name = CgroupName::new(&id).unwrap();
         let (child, _proof) = delegated.prepare(&name).expect("prepare");

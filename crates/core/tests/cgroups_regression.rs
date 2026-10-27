@@ -50,6 +50,8 @@ fn main() {
     )
 ))]
 fn main() {
+    // 分類の自己照合（既定のテスト集合でも常に走る。出力はしない）。
+    precondition::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
         println!("cgroups_regression: CORE-3 cgroup ordering and OOM kill verified");
@@ -59,6 +61,17 @@ fn main() {
         );
     }
 }
+
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/precondition.rs"]
+mod precondition;
 
 #[cfg(all(
     target_os = "linux",
@@ -73,8 +86,7 @@ mod linux {
     use std::time::Duration;
 
     use fandhe_container_core::cgroups::{
-        CgroupJoin, CgroupName, Controller, ControllerSet, DelegatedCgroup, MemoryLimit,
-        MemoryLimits,
+        CgroupJoin, CgroupName, Controller, ControllerSet, MemoryLimit, MemoryLimits,
     };
     use fandhe_container_core::exec::{
         ChildExit, ContainerChild, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace,
@@ -192,7 +204,7 @@ mod linux {
     }
 
     pub fn run() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup v2");
+        let delegated = crate::precondition::delegated_cgroup();
         assert_ne!(
             delegated.path().trim_matches('/'),
             "",

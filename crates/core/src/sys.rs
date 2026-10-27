@@ -1681,9 +1681,8 @@ unsafe extern "C" {
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
     // SAFETY（宣言そのものの妥当性）: `ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)`
-    // （glibc / musl。Linux の LP64 で `off_t` は i64・`ssize_t` は isize）。`libc` との機械照合は core には未適用
-    // （適用は cli・oci のみ。docs/design/ffi-libc-check.md）。core へ照合を入れるとき（#1849。#1837 の子）に、この宣言の
-    // 型（`off_t *`・`size_t`・`ssize_t`）の照合も足す（#2759・#2728 P2-3）。#2628・CORE-6・SEC-5。
+    // （glibc / musl。Linux の LP64 で `off_t` は i64・`ssize_t` は isize）。型（`off_t *`・`size_t`・`ssize_t`）は
+    // 最上位の `libc_abi` で `libc` と `const` 評価で照合する（#1849・#2759・#2728 P2-3）。#2628・CORE-6・SEC-5。
     fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize;
     // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
@@ -5254,6 +5253,33 @@ const PIDFD_SIGNAL_PROCESS_GROUP: i64 = 1 << 2;
 ///   (include/uapi/linux/landlock.h の `LANDLOCK_ACCESS_FS_READ_DIR`): `libc` の linux に定義が無い
 /// - 試験の `BOGUS_FD`・`*_ENV`: FFI の値でない
 ///
+/// # 構造体と `extern "C"` 関数の型(#1849・#1837)
+///
+/// 構造体は `size_of`・`align_of` に加え、`libc` のフィールドが pub のものはフィールドのオフセットまで
+/// `offset_of!` で照合する。関数は同じ関数ポインタ型へ自前と `libc` の両方を代入して照合する(関数は呼ばない)。
+/// 自前の構造体を指すポインタ(`fstatfs`・`sendto`・`recvfrom`・`poll`・`prlimit`)は、自前側と `libc` 側で
+/// ポインタ先の型を別々に書く(構造体の同一性は構造体の照合が保証する)。
+///
+/// 型の綴りの違いで ABI は同じもの(止める条件ではない): `prlimit` の `resource`(自前 `i32`・`libc` は
+/// `__rlimit_resource_t` = `c_uint`。幅は同じで 32 bit 整数引数の渡し方は符号で変わらない。自前を `u32` に
+/// 揃えるかはオーナー判断で、`sys` の本体は変えていない)、`syscall` の第 1 引数(自前 `SyscallNumber` は
+/// `repr(transparent)` の `i64`、`libc` は `c_long`。`size_of`・`align_of` で照合)、`SockFprog.filter` の
+/// `*const`(`libc` は `*mut`。レイアウトは同じ)。
+///
+/// `target_env = "gnu"` に限るもの: `ioctl`(musl の `request` は `int`)・`prlimit`(musl の `resource` は `int`)・
+/// `renameat2`・`StatFs.f_flags` の位置(`libc` の gnu の `statfs` の非公開 `f_spare` の先頭。出典は glibc
+/// `sysdeps/unix/sysv/linux/bits/statfs.h` で、`f_frsize` の直後 = 80)。core は musl 向けに CI でビルドしないため
+/// musl は未照合のまま残る。
+///
+/// 対象外の構造体(`libc` 0.2.189 に対応物が無い。一次情報は Linux v6.12 の uapi ヘッダ):
+/// - `CapUserHeader`・`CapUserData`: include/uapi/linux/capability.h(supervisor の #1840 と同じ扱い)
+/// - `LandlockRulesetAttr`・`LandlockPathBeneathAttr`: include/uapi/linux/landlock.h(サイズ 24 / 12・`parent_fd` の
+///   オフセット 8 は既存の実行時の試験が照合している)
+/// - `sys/bpf.rs` の `BpfProgLoadAttr`・`BpfProgAttachAttr`・`BpfProgQueryAttr`: `union bpf_attr`
+///   (include/uapi/linux/bpf.h)。`libc` に無い
+/// - `crate::seccomp::BpfInstruction` はフィールドが `seccomp` の非公開で `sys` から見えないため、
+///   `libc::sock_filter` とサイズ・アラインメントだけを照合する
+///
 /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
 #[cfg(all(
     test,
@@ -5280,6 +5306,331 @@ mod libc_abi {
     };
     // `renameat2` の関数内ローカル定数 `RENAME_NOREPLACE`(u32)。宣言の値 `1` と `libc` を比べる。
     const _: () = assert!(libc::RENAME_NOREPLACE == 1);
+
+    use core::mem::{align_of, offset_of, size_of};
+    use libc::{c_char, c_ulong, c_void};
+
+    // ---- 構造体(#1849) ----
+
+    // `RLimit64`: `libc::rlimit64`(`cur` = `rlim_cur`・`max` = `rlim_max`)。64 bit では `libc::rlimit` も同じ形。
+    const _: () = {
+        assert!(size_of::<super::RLimit64>() == size_of::<libc::rlimit64>());
+        assert!(align_of::<super::RLimit64>() == align_of::<libc::rlimit64>());
+        assert!(offset_of!(super::RLimit64, cur) == offset_of!(libc::rlimit64, rlim_cur));
+        assert!(offset_of!(super::RLimit64, max) == offset_of!(libc::rlimit64, rlim_max));
+        assert!(size_of::<libc::rlim64_t>() == size_of::<u64>());
+        assert!(size_of::<super::RLimit64>() == size_of::<libc::rlimit>());
+        assert!(align_of::<super::RLimit64>() == align_of::<libc::rlimit>());
+    };
+
+    // `SockaddrNl`: `libc::sockaddr_nl`。`nl_pad` は `libc` で非公開のため、自前のオフセットと
+    // 「`nl_family` の直後」で代わりに照合する(net crate の #1841 と同じ扱い)。
+    const _: () = {
+        assert!(size_of::<super::SockaddrNl>() == size_of::<libc::sockaddr_nl>());
+        assert!(align_of::<super::SockaddrNl>() == align_of::<libc::sockaddr_nl>());
+        assert!(
+            offset_of!(super::SockaddrNl, nl_family) == offset_of!(libc::sockaddr_nl, nl_family)
+        );
+        assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
+        assert!(
+            offset_of!(super::SockaddrNl, nl_pad)
+                == offset_of!(libc::sockaddr_nl, nl_family) + size_of::<libc::sa_family_t>()
+        );
+        assert!(offset_of!(super::SockaddrNl, nl_pid) == offset_of!(libc::sockaddr_nl, nl_pid));
+        assert!(
+            offset_of!(super::SockaddrNl, nl_groups) == offset_of!(libc::sockaddr_nl, nl_groups)
+        );
+    };
+
+    // `PollFd`: `libc::pollfd`。
+    const _: () = {
+        assert!(size_of::<super::PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<super::PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(super::PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(super::PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(super::PollFd, revents) == offset_of!(libc::pollfd, revents));
+    };
+
+    // `StatFs`(x86_64 と aarch64 は cfg で別定義。ここは各ターゲットの定義とそのターゲットの `libc::statfs` を
+    // 比べる): サイズ・アラインメントと `f_type`。`f_flags` の位置は gnu の `libc` では非公開の `f_spare` の
+    // 先頭(`f_frsize` の直後)のため、gnu に限って `f_frsize` のオフセット + 1 語で照合する(下の節)。
+    const _: () = {
+        assert!(size_of::<super::StatFs>() == size_of::<libc::statfs>());
+        assert!(align_of::<super::StatFs>() == align_of::<libc::statfs>());
+        assert!(offset_of!(super::StatFs, f_type) == offset_of!(libc::statfs, f_type));
+        assert!(size_of::<i64>() == size_of::<libc::__fsword_t>());
+    };
+    #[cfg(target_env = "gnu")]
+    const _: () = {
+        assert!(
+            offset_of!(super::StatFs, f_flags)
+                == offset_of!(libc::statfs, f_frsize) + size_of::<libc::__fsword_t>()
+        );
+    };
+
+    // `MountAttr`: `libc::mount_attr`(uapi 版)。
+    const _: () = {
+        assert!(size_of::<super::MountAttr>() == size_of::<libc::mount_attr>());
+        assert!(align_of::<super::MountAttr>() == align_of::<libc::mount_attr>());
+        assert!(offset_of!(super::MountAttr, attr_set) == offset_of!(libc::mount_attr, attr_set));
+        assert!(offset_of!(super::MountAttr, attr_clr) == offset_of!(libc::mount_attr, attr_clr));
+        assert!(
+            offset_of!(super::MountAttr, propagation) == offset_of!(libc::mount_attr, propagation)
+        );
+        assert!(offset_of!(super::MountAttr, userns_fd) == offset_of!(libc::mount_attr, userns_fd));
+    };
+
+    // `SockFprog`: `libc::sock_fprog`。`filter` は自前が `*const BpfInstruction`、`libc` が `*mut sock_filter`
+    // で、ポインタの可変性とポインタ先の型だけが違う(オフセットとサイズは同じ)。`BpfInstruction` は
+    // フィールドが非公開のためサイズ・アラインメントだけを `libc::sock_filter` と照合する。
+    const _: () = {
+        assert!(size_of::<super::SockFprog>() == size_of::<libc::sock_fprog>());
+        assert!(align_of::<super::SockFprog>() == align_of::<libc::sock_fprog>());
+        assert!(offset_of!(super::SockFprog, len) == offset_of!(libc::sock_fprog, len));
+        assert!(offset_of!(super::SockFprog, filter) == offset_of!(libc::sock_fprog, filter));
+        assert!(size_of::<crate::seccomp::BpfInstruction>() == size_of::<libc::sock_filter>());
+        assert!(align_of::<crate::seccomp::BpfInstruction>() == align_of::<libc::sock_filter>());
+    };
+
+    // `SyscallNumber`(`repr(transparent)` の `i64`): `syscall(2)` の第 1 引数 `long` と同じ大きさ・整列。
+    const _: () = {
+        assert!(size_of::<super::SyscallNumber>() == size_of::<libc::c_long>());
+        assert!(align_of::<super::SyscallNumber>() == align_of::<libc::c_long>());
+    };
+
+    // ---- `extern "C"` 関数の型(#1849) ----
+    // 同じ関数ポインタ型へ自前と `libc` を代入する。可変長引数・`-> !` はそのまま書く。
+
+    macro_rules! fn_type_eq {
+        ($ty:ty, $own:path, $lib:path) => {
+            const _: $ty = $own;
+            const _: $ty = $lib;
+        };
+    }
+
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int) -> c_int,
+        super::setns,
+        libc::setns
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int) -> c_int,
+        super::unshare,
+        libc::unshare
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, libc::size_t) -> c_int,
+        super::sethostname,
+        libc::sethostname
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            c_ulong,
+            *const c_void,
+        ) -> c_int,
+        super::mount,
+        libc::mount
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int,
+        super::openat,
+        libc::openat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, c_int) -> c_int,
+        super::umount2,
+        libc::umount2
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int) -> c_int,
+        super::fchdir,
+        libc::fchdir
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, libc::mode_t, libc::dev_t) -> c_int,
+        super::mknodat,
+        libc::mknodat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::uid_t,
+        super::geteuid,
+        libc::geteuid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::gid_t,
+        super::getegid,
+        libc::getegid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::pid_t,
+        super::fork,
+        libc::fork
+    );
+    fn_type_eq!(unsafe extern "C" fn(c_int) -> !, super::_exit, libc::_exit);
+    fn_type_eq!(
+        unsafe extern "C" fn(libc::pid_t, *mut c_int, c_int) -> libc::pid_t,
+        super::waitpid,
+        libc::waitpid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(libc::pid_t, c_int) -> c_int,
+        super::kill,
+        libc::kill
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t,
+        super::signal,
+        libc::signal
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, ...) -> c_int,
+        super::fcntl,
+        libc::fcntl
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int) -> c_int,
+        super::dup2,
+        libc::dup2
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::pid_t,
+        super::setsid,
+        libc::setsid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, ...) -> c_int,
+        super::prctl,
+        libc::prctl
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, libc::mode_t) -> c_int,
+        super::mkdirat,
+        libc::mkdirat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+        super::unlinkat,
+        libc::unlinkat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, c_int) -> c_int,
+        super::socket,
+        libc::socket
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_void, libc::size_t, c_int) -> libc::ssize_t,
+        super::send,
+        libc::send
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void, *mut libc::socklen_t) -> c_int,
+        super::getsockopt,
+        libc::getsockopt
+    );
+    // `sendfile(out_fd, in_fd, off_t *offset, size_t count)`(#2759・#2728 P2-3・#2628)。
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, *mut libc::off_t, libc::size_t) -> libc::ssize_t,
+        super::sendfile,
+        libc::sendfile
+    );
+
+    // 自前の構造体を指すポインタを含むもの: 自前側と `libc` 側でポインタ先の型を別々に書く。
+    const _: unsafe extern "C" fn(c_int, *mut super::StatFs) -> c_int = super::fstatfs;
+    const _: unsafe extern "C" fn(c_int, *mut libc::statfs) -> c_int = libc::fstatfs;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *const c_void,
+        libc::size_t,
+        c_int,
+        *const super::SockaddrNl,
+        libc::socklen_t,
+    ) -> libc::ssize_t = super::sendto;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *const c_void,
+        libc::size_t,
+        c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::ssize_t = libc::sendto;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *mut c_void,
+        libc::size_t,
+        c_int,
+        *mut super::SockaddrNl,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = super::recvfrom;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *mut c_void,
+        libc::size_t,
+        c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = libc::recvfrom;
+    const _: unsafe extern "C" fn(*mut super::PollFd, libc::nfds_t, c_int) -> c_int = super::poll;
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int = libc::poll;
+
+    // `syscall(long number, ...)`: 第 1 引数は自前が `SyscallNumber`(`repr(transparent)` の `i64`。上の
+    // `size_of`・`align_of` の照合が `long` との同一性を保証する)、`libc` が `c_long`。
+    const _: unsafe extern "C" fn(super::SyscallNumber, ...) -> i64 = super::syscall;
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = libc::syscall;
+
+    // `sigterm_exit_handler`: `libc` に型付きのハンドラ型が無い(`sighandler_t` は `size_t`)ため、
+    // 引数の型だけを `extern "C" fn(c_int)` への代入で照合する。
+    #[cfg(feature = "exec-test-support")]
+    const _: extern "C" fn(c_int) = super::sigterm_exit_handler;
+
+    // gnu に限るもの。musl は `ioctl` の `request` が `int`、`prlimit` の `resource` が `int` で型が違い、
+    // core は musl 向けに CI でビルドしないため未照合(読み替えで通さない)。
+    #[cfg(target_env = "gnu")]
+    mod gnu_fns {
+        use super::{c_char, c_int, c_ulong};
+        use core::mem::size_of;
+
+        const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = super::super::ioctl;
+        const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = libc::ioctl;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const c_char,
+            c_int,
+            *const c_char,
+            libc::c_uint,
+        ) -> c_int = super::super::renameat2;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const c_char,
+            c_int,
+            *const c_char,
+            libc::c_uint,
+        ) -> c_int = libc::renameat2;
+
+        // `prlimit`: 自前は `resource: i32`・`*const RLimit64`。`libc` は `__rlimit_resource_t`(`c_uint`)と
+        // `rlimit`(`prlimit64` は `rlimit64`)。幅・整列は同じ(`size_of` と構造体の照合)で、型の綴りの違い。
+        const _: () = assert!(size_of::<i32>() == size_of::<libc::__rlimit_resource_t>());
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            i32,
+            *const super::super::RLimit64,
+            *mut super::super::RLimit64,
+        ) -> c_int = super::super::prlimit;
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            libc::__rlimit_resource_t,
+            *const libc::rlimit,
+            *mut libc::rlimit,
+        ) -> c_int = libc::prlimit;
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            libc::__rlimit_resource_t,
+            *const libc::rlimit64,
+            *mut libc::rlimit64,
+        ) -> c_int = libc::prlimit64;
+    }
 }
 
 /// [`pidfd_open`] で得た pidfd の指すプロセスの**プロセスグループ全員**へシグナルを送る

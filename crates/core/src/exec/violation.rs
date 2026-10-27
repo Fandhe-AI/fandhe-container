@@ -374,10 +374,12 @@ impl ViolationReason {
     /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
     /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）、
     /// bundle の rootfs の固定（`oci_runtime::RootfsDir::pin`）が検証後の差し替えで拒否する種別 `mount_target` の
-    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）から成る。
+    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）、Landlock の再適用が
+    /// `NotRecorded` でも行う読み取り専用属性の照合の拒否（種別 `mount_target` の `landlock_mount_not_read_only`。
+    /// `ro` の bind の属性が失われた・観測できない場合。CORE-5・SEC-1・SEC-4・#1917）から成る。
     /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
     /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
-    pub const EXEC_WORKER_REASONS: [ViolationReason; 13] = [
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 14] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -391,6 +393,7 @@ impl ViolationReason {
         Self::RootfsIsHostRoot,
         Self::PathSymlinkOrNotDirectory,
         Self::PathMissing,
+        Self::LandlockMountNotReadOnly,
     ];
 
     /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
@@ -567,8 +570,9 @@ impl ViolationReason {
     /// Landlock 適用の失敗の種別から、対応する違反理由を引く（Mount 由来のルールの識別子の照合の違反だけ。
     /// 他は分離違反の試行ではないため `None`。CORE-5・SEC-4・#2071）。
     ///
-    /// launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の再適用（worker の経路）は `NotRecorded` で
-    /// 照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    /// 識別子の照合（`MountIdentityMismatch`・`MountNotRoot`）は launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の
+    /// 再適用（worker の経路）は `NotRecorded` で照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    /// `MountNotReadOnly` は `NotRecorded` でも生じるため含める（#1917）。
     pub(super) fn from_landlock_apply_kind(
         kind: &crate::landlock::LandlockApplyErrorKind,
     ) -> Option<Self> {
@@ -1760,11 +1764,11 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 14 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
     /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
     #[test]
     fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 14);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
         }
@@ -1916,7 +1920,7 @@ mod tests {
         }
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 14 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
     /// コード、`rootfs_is_host_root` と rootfs の固定の 2 理由〔#1702〕は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {

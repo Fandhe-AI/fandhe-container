@@ -30,12 +30,13 @@
 
 use std::path::PathBuf;
 
-use super::{ExecError, IsolationStage, ThreadCountSource};
+use super::{ExecError, IsolationStage, ThreadCountSource, ViolationReason};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
 use crate::dev_mounts::ImplicitDevMounts;
 use crate::landlock::{
-    LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
-    LandlockSupport, build_path_rules_with_user_tmpfs, detect_landlock_abi,
+    LandlockApplyError, LandlockApplyErrorKind, LandlockApplyReport, LandlockError,
+    LandlockRuleError, LandlockRuleset, LandlockSupport, build_path_rules_with_user_tmpfs,
+    detect_landlock_abi,
 };
 use crate::landlock::{MountCheck, handled_for_abi};
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
@@ -428,7 +429,14 @@ fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
 /// 違反を運ぶ経路が無い（`docs/design/audit-delivery.md` 8 章の配線状況。実装は #2023〜#2028・#2004、同種の欠落は
 /// #2013）。配送が入るまで、`violation` は呼び出し側が取り出せるが本番の sink には記録されない。
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
-    let reason = super::violation::landlock_apply_violation(&e.kind);
+    // 読み取り専用属性の照合の拒否は再適用（worker の経路。`NotRecorded`）でも生じるため、`EXEC_WORKER_REASONS` との
+    // ソース照合（`violation_scan`）が字面で拾えるよう明示的に書く（CORE-5・SEC-4・#1917）。
+    let reason = match &e.kind {
+        LandlockApplyErrorKind::MountNotReadOnly { .. } => {
+            Some(ViolationReason::LandlockMountNotReadOnly)
+        }
+        kind => super::violation::landlock_apply_violation(kind),
+    };
     if let Some(reason) = reason {
         let mut err = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
         // 詳細（ルールの位置）は message に保つ。違反理由は reason から決まる静的トークン。
@@ -521,8 +529,7 @@ pub(super) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::ViolationReason;
-    use crate::landlock::{LandlockApplyErrorKind, LandlockRuleErrorKind, LandlockUnavailable};
+    use crate::landlock::{LandlockRuleErrorKind, LandlockUnavailable};
     use crate::traits::types::ErrorCode;
 
     /// CORE-5・#1714: ABI 6 未満は段に入る前（ruleset を作る前）に `FailedPrecondition` で起動を拒否し、
@@ -861,6 +868,34 @@ mod tests {
                 v.mount_audit_event()
             );
         }
+    }
+
+    /// SEC-4・CORE-5・#1917: 再適用（`NotRecorded`。worker の経路）で読み取り専用属性が失われた・観測できない拒否は、
+    /// worker の許可リストに載る違反理由を運び、親が層 `mount`・理由コード `landlock_mount_not_read_only`・パスなしで
+    /// 1 件記録できる。
+    #[test]
+    fn sec4_1917_reapply_not_read_only_reaches_worker_audit() {
+        let e = from_landlock_apply(LandlockApplyError {
+            code: ErrorCode::FailedPrecondition,
+            kind: LandlockApplyErrorKind::MountNotReadOnly { index: 1 },
+            message: "m".to_string(),
+        });
+        let v = e.violation.expect("violation");
+        assert_eq!(v.reason, ViolationReason::LandlockMountNotReadOnly);
+        assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&v.reason));
+        assert_eq!(
+            ViolationReason::from_exec_worker_token("mount_target", "landlock_mount_not_read_only"),
+            Some(ViolationReason::LandlockMountNotReadOnly)
+        );
+        assert_eq!(
+            v.reason.exec_worker_audit_event(),
+            Some(crate::audit_log::AuditEvent::Mount {
+                path: None,
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "landlock_mount_not_read_only"
+                )),
+            })
+        );
     }
 
     /// CORE-5・TASK-39.4: ABI 不足は FailedPrecondition・理由コード付き。

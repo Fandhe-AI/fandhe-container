@@ -114,3 +114,21 @@ fn repair5_record_store_rejects_over_limit() {
     );
     fs::remove_dir_all(&root).unwrap();
 }
+
+/// CRI-1・REPAIR-5: 全体期限が切れていれば、worker が結果を出し終えていても成功にせず `Timeout` を返す。
+#[test]
+fn cri1_record_store_list_expired_total_budget_is_timeout() {
+    let root = temp_root("expired");
+    let store = FileRecordStore::open(&root).unwrap();
+    let kind = RecordKind::Sandbox;
+    store.put(kind, &id(ID_A), b"a").unwrap();
+    let budget = ListBudget {
+        per_record: std::time::Duration::from_secs(10),
+        total: std::time::Duration::ZERO,
+    };
+    let e = store
+        .list(kind, budget, ListLimits::for_kind(kind))
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    fs::remove_dir_all(&root).unwrap();
+}

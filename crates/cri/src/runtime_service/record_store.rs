@@ -303,7 +303,14 @@ mod driver {
 
         let deadline = Instant::now().checked_add(budget.total);
         let mut records = Vec::new();
+        // 全体期限は受信結果と独立に判定する（呼び出し側が止まっている間に worker が完了し結果が
+        // チャネルに溜まっていても、期限超過なら成功にしない。REPAIR-5）。
+        let expired = || deadline.is_some_and(|d| Instant::now() >= d);
         loop {
+            if expired() {
+                cancel.store(true, Ordering::Release);
+                return Err(CriError::timeout("timed out listing cri records"));
+            }
             let wait = match deadline {
                 Some(d) => budget
                     .per_record
@@ -313,6 +320,10 @@ mod driver {
             match rx.recv_timeout(wait) {
                 Ok(Msg::Record(r)) => records.push(r),
                 Ok(Msg::Done(Ok(unrecognized))) => {
+                    if expired() {
+                        cancel.store(true, Ordering::Release);
+                        return Err(CriError::timeout("timed out listing cri records"));
+                    }
                     return Ok(RecordListing {
                         records,
                         unrecognized,

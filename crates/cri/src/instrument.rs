@@ -17,12 +17,15 @@
 //!
 //! # 機微情報
 //!
-//! [`CriOpSample`] は種別・結果・ステータスコード・レイテンシのみを持つ。要求の中身（`config`・labels・
+//! [`CriOpSample`] は種別・結果・ステータスコード・レイテンシと、レジストリの HTTP 状態の区分
+//! （[`RegistryHttpClass`]。固定語彙の列挙で、生の HTTP 状態・URL・資格情報は持たない。#2966）のみを持つ。要求の中身（`config`・labels・
 //! annotations・サンドボックス ID）とエラー文言は持たせない（`.claude/rules/security.md`）。
 
 use std::time::{Duration, Instant};
 
 use tonic::{Code, Status};
+
+use crate::error::registry_http_status_from_metadata;
 
 /// 計装対象の CRI 操作の種別（REPAIR-4）。
 ///
@@ -144,6 +147,89 @@ pub fn code_name(code: Code) -> &'static str {
     }
 }
 
+/// レジストリの HTTP 状態の区分（固定の語彙。#2966・REPAIR-4・CRI-3・OCI-1）。
+///
+/// gRPC では 401/403 がどちらも `PERMISSION_DENIED`、429 と 5xx がどちらも `UNAVAILABLE` に潰れるため、
+/// 記録でそれらを見分ける目的で持つ。生の値は持たず、plugin-cri が
+/// [`op_name`](Self::op_name) を oci 専用の記録器へ失敗として記録する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RegistryHttpClass {
+    /// 401。
+    Unauthorized,
+    /// 403。
+    Forbidden,
+    /// 404。
+    NotFound,
+    /// 408。
+    RequestTimeout,
+    /// 429（rate limit）。
+    RateLimited,
+    /// 上記以外の 400..=499。
+    OtherClientError,
+    /// 500..=599。
+    ServerError,
+    /// 100..=399。
+    Other,
+}
+
+impl RegistryHttpClass {
+    /// 全区分（宣言順）。
+    pub const ALL: [RegistryHttpClass; 8] = [
+        Self::Unauthorized,
+        Self::Forbidden,
+        Self::NotFound,
+        Self::RequestTimeout,
+        Self::RateLimited,
+        Self::OtherClientError,
+        Self::ServerError,
+        Self::Other,
+    ];
+
+    /// HTTP 状態から区分を導く。100..=599 の外は `None`（数えない。fail-closed）。
+    pub fn from_http_status(status: u16) -> Option<Self> {
+        match status {
+            401 => Some(Self::Unauthorized),
+            403 => Some(Self::Forbidden),
+            404 => Some(Self::NotFound),
+            408 => Some(Self::RequestTimeout),
+            429 => Some(Self::RateLimited),
+            400..=499 => Some(Self::OtherClientError),
+            500..=599 => Some(Self::ServerError),
+            100..=399 => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// 区分の固定の接尾辞（`[a-z_]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::RequestTimeout => "request_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::OtherClientError => "client_error",
+            Self::ServerError => "server_error",
+            Self::Other => "other",
+        }
+    }
+
+    /// 記録器へ渡す完全な操作名（core の `OpName` 規則 `[A-Za-z0-9._-]`・64 バイト以下に収まる固定文字列）。
+    pub fn op_name(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "cri.pull_image.registry_http.unauthorized",
+            Self::Forbidden => "cri.pull_image.registry_http.forbidden",
+            Self::NotFound => "cri.pull_image.registry_http.not_found",
+            Self::RequestTimeout => "cri.pull_image.registry_http.request_timeout",
+            Self::RateLimited => "cri.pull_image.registry_http.rate_limited",
+            Self::OtherClientError => "cri.pull_image.registry_http.client_error",
+            Self::ServerError => "cri.pull_image.registry_http.server_error",
+            Self::Other => "cri.pull_image.registry_http.other",
+        }
+    }
+}
+
 /// 1 回の操作の計測結果（固定サイズの値型。ヒープ確保なし）。
 ///
 /// 結果区分はステータスコードから導くため、「成功なのにエラーコード」のような食い違った値は作れない。
@@ -153,6 +239,7 @@ pub struct CriOpSample {
     kind: CriOpKind,
     code: Code,
     latency: Duration,
+    registry_http: Option<RegistryHttpClass>,
 }
 
 impl CriOpSample {
@@ -162,7 +249,19 @@ impl CriOpSample {
             kind,
             code,
             latency,
+            registry_http: None,
         }
+    }
+
+    /// レジストリの HTTP 状態の区分を付ける（#2966）。
+    pub fn with_registry_http(mut self, class: RegistryHttpClass) -> Self {
+        self.registry_http = Some(class);
+        self
+    }
+
+    /// レジストリの HTTP 状態の区分。レジストリ由来の失敗（`PullImage`）以外は `None`。
+    pub fn registry_http(&self) -> Option<RegistryHttpClass> {
+        self.registry_http
     }
 
     /// 操作の種別。
@@ -228,28 +327,36 @@ impl<'a> CriOpTimer<'a> {
         }
     }
 
-    fn emit(&mut self, code: Code) {
+    fn emit(&mut self, code: Code, registry_http: Option<RegistryHttpClass>) {
         if self.done {
             return;
         }
         self.done = true;
-        let sample = CriOpSample::new(self.kind, code, self.started.elapsed());
+        let mut sample = CriOpSample::new(self.kind, code, self.started.elapsed());
+        if let Some(class) = registry_http {
+            sample = sample.with_registry_http(class);
+        }
         self.recorder.record_cri_op(&sample);
     }
 
     /// RPC の結果に応じて確定する（`Ok` は `Code::Ok`、`Err` はその `Status` のコード。文言は読まない）。
     pub fn finish_with<T>(mut self, result: &Result<T, Status>) {
-        let code = match result {
-            Ok(_) => Code::Ok,
-            Err(status) => status.code(),
+        let (code, class) = match result {
+            Ok(_) => (Code::Ok, None),
+            // メタデータを付けるのは `PullError::from_oci` 経由だけで、他の RPC では常に `None`（#2966）。
+            Err(status) => (
+                status.code(),
+                registry_http_status_from_metadata(status.metadata())
+                    .and_then(RegistryHttpClass::from_http_status),
+            ),
         };
-        self.emit(code);
+        self.emit(code, class);
     }
 }
 
 impl Drop for CriOpTimer<'_> {
     fn drop(&mut self) {
-        self.emit(Code::Internal);
+        self.emit(Code::Internal, None);
     }
 }
 
@@ -314,6 +421,67 @@ mod tests {
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
+    /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。
+    #[test]
+    fn repair4_registry_http_class_table() {
+        use RegistryHttpClass as C;
+        for (status, expected) in [
+            (99, None),
+            (100, Some(C::Other)),
+            (399, Some(C::Other)),
+            (400, Some(C::OtherClientError)),
+            (401, Some(C::Unauthorized)),
+            (403, Some(C::Forbidden)),
+            (404, Some(C::NotFound)),
+            (408, Some(C::RequestTimeout)),
+            (429, Some(C::RateLimited)),
+            (499, Some(C::OtherClientError)),
+            (500, Some(C::ServerError)),
+            (599, Some(C::ServerError)),
+            (600, None),
+        ] {
+            assert_eq!(C::from_http_status(status), expected, "status={status}");
+        }
+        let mut names = std::collections::HashSet::new();
+        for c in C::ALL {
+            let name = c.op_name();
+            assert!(names.insert(name), "duplicate {name}");
+            assert!(name.len() <= 64);
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            );
+            assert_eq!(name, format!("cri.pull_image.registry_http.{}", c.as_str()));
+        }
+        assert_eq!(names.len(), 8);
+    }
+
+    /// REPAIR-4・CRI-3（#2966）: timer は失敗の Status のメタデータから区分を導く。
+    #[test]
+    fn repair4_timer_records_registry_http_class() {
+        use tonic::metadata::{MetadataMap, MetadataValue};
+        let with = |http: u16| {
+            let mut md = MetadataMap::new();
+            md.insert(
+                crate::error::REGISTRY_HTTP_STATUS_METADATA_KEY,
+                MetadataValue::from(http),
+            );
+            Status::with_metadata(Code::Unavailable, "x", md)
+        };
+        let run = |r: Result<(), Status>| {
+            let rec = Collect::default();
+            CriOpTimer::start(&rec, CriOpKind::PullImage).finish_with(&r);
+            rec.items()[0].registry_http()
+        };
+        assert_eq!(run(Err(with(429))), Some(RegistryHttpClass::RateLimited));
+        assert_eq!(run(Err(with(503))), Some(RegistryHttpClass::ServerError));
+        assert_eq!(run(Err(Status::unavailable("x"))), None);
+        assert_eq!(run(Ok(())), None);
+        let rec = Collect::default();
+        drop(CriOpTimer::start(&rec, CriOpKind::PullImage));
+        assert_eq!(rec.items()[0].registry_http(), None);
+    }
+
     #[test]
     fn repair4_cri_op_kind_as_str_is_stable() {
         assert_eq!(CriOpKind::RunPodSandbox.as_str(), "cri.run_pod_sandbox");

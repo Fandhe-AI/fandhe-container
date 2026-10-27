@@ -1886,7 +1886,7 @@ jobs:
       #   `test result: ok. 1 passed; 0 failed;` と ignored / FAILED の不在をあわせて照合する（runtime_service_namespaces と同じ。#2959）。
       # - rate limit の方式: 試験 1 回で pull は 1 回（小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
       #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
-      #   pull を消費する前に fail-closed にする。CRI の境界では 429 が gRPC の UNAVAILABLE に潰れて他の失敗と区別できないため、
+      #   pull を消費する前に fail-closed にする。試験自身も gRPC メタデータから 429 を識別して固定行を出す（#2966）が、
       #   試験が失敗したときも同じプローブを事後診断として再実行し、rate limit が原因なら文言で分かるようにする。
       # - 実行頻度: 他の `--ignored` 試験と揃えて PR と main の両方（ubuntu のみ）で回す。rate limit で頻繁に赤になる場合は
       #   main と workflow_dispatch のみへ絞る判断をオーナーへ上げる（Docker Hub のミラー切替は試験定数の変更が要るため別 issue）。
@@ -1928,7 +1928,7 @@ jobs:
             systemd-run --user --scope --quiet -p Delegate=yes -- "${PCRI_TEST_BIN}" \
             --ignored --exact production_binary_full_lifecycle_real --test-threads=1 2>&1 | tee "${log}" || rc=$?
           if [ "${rc}" -ne 0 ]; then
-            # 事後診断: rate limit が原因ならここで識別文言が出る（CRI の境界では 429 が UNAVAILABLE に潰れるため）。
+            # 事後診断: 試験の固定行（#2966）に加え、rate limit が原因ならここでも識別文言が出る。
             make --no-print-directory docker-hub-ratelimit-probe || true
             msg="production_binary_full_lifecycle_real failed"
             msg+=" (see above; a docker hub rate limit is reported explicitly)"

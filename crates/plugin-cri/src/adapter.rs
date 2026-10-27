@@ -53,7 +53,8 @@
 //!   （#2241・#2315・#482 が前提）。展開・pull・起動時の回収の計装（`OciOpRecorder`）は `CoreOciRecorder` で
 //!   oci 専用の `OpRecorder`（[`CriPluginBackends::oci_op_recorder`]）へ `oci.*` の名前で記録する（REPAIR-4・#2900）。
 //!   共有記録器は操作名の種類に上限（`MAX_TRACKED_OPS`）があり、pull が枠を取ると `create`・`delete` の記録を捨てさせるため分ける。
-//!   エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため）。
+//!   エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため）。同じ専用記録器へ、`PullImage` の失敗に付いたレジストリの HTTP 状態の区分を
+//!   `cri.pull_image.registry_http.<区分>`（固定の 8 種）の失敗として足す（`CoreCriRecorder`。#2966・docs/design/pull-inventory-wiring.md）。
 //!   起動時の残り pull の回収 GC（`ImageStore::recover_stale_pulls`）は `CriPluginBackends::recover_stale_image_pulls` で配線済み（#2819）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
@@ -126,7 +127,7 @@ pub struct CriPluginBackends {
     network: Arc<dyn NetworkPlugin>,
     /// 実行層（`oci_runtime`）と CRI サービスが共有する記録器（REPAIR-4）。
     recorder: Arc<OpRecorder>,
-    /// oci の pull・展開・回収の操作統計（`oci.*`）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
+    /// oci の pull・展開・回収の操作統計（`oci.*`）と `cri.pull_image.registry_http.*`（#2966）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
     oci_recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
@@ -270,7 +271,10 @@ impl CriPluginBackends {
             .with_recorder(self.oci_adapter());
         Ok(CriImageService::with_store_and_recorder(
             Arc::clone(&self.images),
-            Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))),
+            Arc::new(CoreCriRecorder::new(
+                Arc::clone(&self.recorder),
+                Arc::clone(&self.oci_recorder),
+            )),
         )
         .with_puller(Arc::new(
             OciImagePuller::new(client, pull).with_recorder(self.oci_adapter()),
@@ -324,7 +328,8 @@ impl CriPluginBackends {
         &self.recorder
     }
 
-    /// oci の pull・展開・起動時の回収の操作統計（`oci.*`）の記録器。共有記録器とは枠を分ける
+    /// oci の pull・展開・起動時の回収の操作統計（`oci.*`）と、`PullImage` の失敗のレジストリ HTTP 状態の区分
+    /// （`cri.pull_image.registry_http.*`。#2966）の記録器。共有記録器とは枠を分ける
     /// （操作名の種類の上限 `MAX_TRACKED_OPS` を pull が使い切って `create`・`delete` の記録を捨てさせないため。REPAIR-4・#2900）。
     pub fn oci_op_recorder(&self) -> &Arc<OpRecorder> {
         &self.oci_recorder
@@ -343,9 +348,12 @@ impl CriPluginBackends {
     /// 実行層の呼び出しの待ち上限は [`PLUGIN_RUNTIME_TIMEOUT`] にする（CRI の既定 10 秒では supervisor の起動の受信期限
     /// 〔約 58.9 秒〕より先に結果不明へ倒れるため。#2434・REPAIR-5）。
     pub fn runtime_service(&self, bundles: Arc<dyn BundleProvider>) -> CriRuntimeService {
-        CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))))
-            .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
-            .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
+        CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder::new(
+            Arc::clone(&self.recorder),
+            Arc::clone(&self.oci_recorder),
+        )))
+        .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
+        .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
     }
 }
 
@@ -717,18 +725,41 @@ impl AuditSink for ObservedCreateAudit {
 
 /// cri の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `CriOpKind::as_str`）。
 /// 記録の失敗（名前種類の上限等）は `dropped_records` に計上され、RPC の結果は変えない。
-struct CoreCriRecorder(Arc<OpRecorder>);
+///
+/// 2 本の記録器を持つ。`shared` は従来どおり `cri.<操作>` の成功 / 失敗とレイテンシを受ける。
+/// `pull` は oci 専用の記録器で、`PullImage` の失敗に付いたレジストリの HTTP 状態の区分
+/// （`RegistryHttpClass`）を `cri.pull_image.registry_http.<区分>` の失敗として受ける（#2966・REPAIR-4・CRI-3）。
+/// 共有記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける（22 + 8 は上限に収まる）。
+/// `cri.pull_image`（共有）の失敗 1 件と区分側の 1 件は同じ失敗を別の切り口で数えたもの（二重計上）。
+/// 生の HTTP 状態・URL・資格情報は記録しない。
+struct CoreCriRecorder {
+    shared: Arc<OpRecorder>,
+    pull: Arc<OpRecorder>,
+}
+
+impl CoreCriRecorder {
+    fn new(shared: Arc<OpRecorder>, pull: Arc<OpRecorder>) -> Self {
+        Self { shared, pull }
+    }
+}
 
 impl CriOpRecorder for CoreCriRecorder {
     fn record_cri_op(&self, sample: &CriOpSample) {
-        let Ok(name) = OpName::new(sample.kind().as_str()) else {
-            return;
-        };
         let outcome = match sample.outcome() {
             CriOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
-        let _ = self.0.record(&name, outcome, sample.latency());
+        if let Ok(name) = OpName::new(sample.kind().as_str()) {
+            let _ = self.shared.record(&name, outcome, sample.latency());
+        }
+        if outcome == OpOutcome::Failure
+            && let Some(class) = sample.registry_http()
+            && let Ok(name) = OpName::new(class.op_name())
+        {
+            let _ = self
+                .pull
+                .record(&name, OpOutcome::Failure, sample.latency());
+        }
     }
 }
 
@@ -1625,7 +1656,10 @@ mod tests {
             Arc::clone(&recorder),
         );
         assert!(Arc::ptr_eq(backends.op_recorder(), &recorder));
-        let bridge = CoreCriRecorder(Arc::clone(backends.op_recorder()));
+        let bridge = CoreCriRecorder::new(
+            Arc::clone(backends.op_recorder()),
+            Arc::clone(backends.oci_op_recorder()),
+        );
         // 成功は `Ok(())`（Status 型は推論される）、未確定のまま Drop した場合は Internal の失敗。
         CriOpTimer::start(&bridge, CriOpKind::CreateContainer).finish_with(&Ok(()));
         drop(CriOpTimer::start(&bridge, CriOpKind::CreateContainer));
@@ -1633,6 +1667,51 @@ mod tests {
             .snapshot_op(&OpName::new("cri.create_container").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// REPAIR-4・CRI-3（#2966）: `PullImage` の失敗の HTTP 状態の区分は pull 用の記録器だけに入り、共有記録器へは入らない。
+    #[test]
+    fn repair4_2966_pull_http_class_goes_to_pull_recorder() {
+        use fandhe_container_cri::instrument::RegistryHttpClass;
+        const {
+            assert!(
+                22 + RegistryHttpClass::ALL.len()
+                    <= fandhe_container_core::observability::MAX_TRACKED_OPS
+            )
+        };
+        let shared = Arc::new(OpRecorder::new());
+        let pull = Arc::new(OpRecorder::new());
+        let bridge = CoreCriRecorder::new(Arc::clone(&shared), Arc::clone(&pull));
+        let ms = Duration::from_millis;
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Unavailable, ms(3))
+                .with_registry_http(RegistryHttpClass::RateLimited),
+        );
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Unavailable, ms(4))
+                .with_registry_http(RegistryHttpClass::ServerError),
+        );
+        // 成功には区分が付かない前提だが、付いていても数えない。
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Ok, ms(1))
+                .with_registry_http(RegistryHttpClass::RateLimited),
+        );
+        let get = |r: &OpRecorder, n: &str| {
+            r.snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get(&shared, "cri.pull_image"), Some((1, 2)));
+        assert_eq!(
+            get(&pull, "cri.pull_image.registry_http.rate_limited"),
+            Some((0, 1))
+        );
+        assert_eq!(
+            get(&pull, "cri.pull_image.registry_http.server_error"),
+            Some((0, 1))
+        );
+        assert_eq!(pull.snapshot().len(), 2);
+        assert_eq!(shared.snapshot().len(), 1);
+        assert_eq!(pull.dropped_records(), 0);
     }
 
     /// 22 種すべての `OciOpKind` の名前（REPAIR-4・OCI-1・#2900 の写像の固定用）。

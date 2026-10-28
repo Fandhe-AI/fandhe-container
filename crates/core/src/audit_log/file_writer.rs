@@ -894,18 +894,37 @@ impl AuditWriteFailure {
     ///
     /// キーは `event`・`code`・`primary`・`primary_code`・`fallback`・`fallback_code` の固定順。
     /// 値はすべて固定トークンで、レコード内容・パス・errno を含めない（ログ注入・秘密情報の回避）。
+    /// 出力は共通ログ型 `LogLine` 経由で、移行前の `writeln!` とバイト列が同じ（#3209・ERR-4）。
+    /// 書き込みは `write_all` 1 回で、`writeln!` のように断片に分かれない。
     pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(
-            out,
-            "{{\"event\":\"audit_write_failure\",\"code\":\"{}\",\"primary\":\"{}\",\"primary_code\":\"{}\",\"fallback\":\"{}\",\"fallback_code\":\"{}\"}}",
-            self.error_code().as_str(),
-            self.primary.kind().as_str(),
-            self.primary.error_code().as_str(),
-            self.fallback.kind().as_str(),
-            self.fallback.error_code().as_str(),
-        )
+        let body = AuditWriteFailureDto {
+            code: self.error_code().as_str(),
+            primary: self.primary.kind().as_str(),
+            primary_code: self.primary.error_code().as_str(),
+            fallback: self.fallback.kind().as_str(),
+            fallback_code: self.fallback.error_code().as_str(),
+        };
+        logging::write_json_line(out, &LogLine::new(AUDIT_WRITE_FAILURE_EVENT, &body))
+            .map_err(|e| std::io::Error::other(e.message()))
     }
 }
+
+/// `audit_write_failure` 行の本体（非公開 DTO。`LogLine` の本体）。キー順はフィールド宣言順で、
+/// 値はすべて固定トークン。予約キー `level` / `event` を持たない（試験で検出する）。
+#[derive(Serialize)]
+struct AuditWriteFailureDto {
+    code: &'static str,
+    primary: &'static str,
+    primary_code: &'static str,
+    fallback: &'static str,
+    fallback_code: &'static str,
+}
+
+/// 両経路失敗行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
+const AUDIT_WRITE_FAILURE_EVENT: LogEvent = match LogEvent::from_static("audit_write_failure") {
+    Some(e) => e,
+    None => panic!("invalid audit_write_failure log event name"),
+};
 
 impl fmt::Display for AuditWriteFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1934,6 +1953,83 @@ mod tests {
                 assert!(line.contains("\"container_id\":"), "{name}");
             }
         }
+    }
+
+    /// ERR-4・SEC-4・#3209: `audit_write_failure` の行が移行前の `writeln!` とバイト単位で一致する
+    /// （全種別の組、完全一致のリテラル、予約キーを持たないこと）。
+    #[test]
+    fn err4_sec4_3209_write_failure_line_bytes_unchanged() {
+        use AuditWriteErrorKind as K;
+        let kinds = [
+            K::RelativePath,
+            K::Unsupported,
+            K::NotRegularFile,
+            K::InsecureFile,
+            K::Open,
+            K::Encode,
+            K::LineTooLong,
+            K::Write,
+            K::Lock,
+            K::LockFailed,
+            K::Sync,
+            K::FallbackUnavailable,
+            K::KernelAuditUnavailable,
+            K::KernelAuditPermissionDenied,
+            K::KernelAuditTimeout,
+            K::KernelAuditRejected,
+            K::KernelAuditIo,
+            K::IsolationTimeout,
+            K::IsolationUnavailable,
+            K::IsolationFdsNotClosed,
+        ];
+        for p in kinds {
+            for f in kinds {
+                let failure =
+                    AuditWriteFailure::new(AuditWriteError::new(p), AuditWriteError::new(f));
+                let mut out = Vec::new();
+                failure.write_json_line(&mut out).unwrap();
+                // 移行前の書式（writeln! の手組み）を試験内に写して照合する。
+                let old = format!(
+                    "{{\"event\":\"audit_write_failure\",\"code\":\"{}\",\"primary\":\"{}\",\"primary_code\":\"{}\",\"fallback\":\"{}\",\"fallback_code\":\"{}\"}}\n",
+                    failure.error_code().as_str(),
+                    failure.primary().kind().as_str(),
+                    failure.primary().error_code().as_str(),
+                    failure.fallback().kind().as_str(),
+                    failure.fallback().error_code().as_str(),
+                );
+                assert_eq!(String::from_utf8(out).unwrap(), old, "{p:?}/{f:?}");
+            }
+        }
+        let failure = AuditWriteFailure::new(
+            AuditWriteError::new(K::Write),
+            AuditWriteError::new(K::FallbackUnavailable),
+        );
+        let mut out = Vec::new();
+        failure.write_json_line(&mut out).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.starts_with(
+                "{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"write\","
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}\n"
+            ),
+            "{line}"
+        );
+        let dto = AuditWriteFailureDto {
+            code: "INTERNAL",
+            primary: "write",
+            primary_code: "INTERNAL",
+            fallback: "open",
+            fallback_code: "INTERNAL",
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("event"));
+        assert!(!obj.contains_key("level"));
     }
 
     /// ERR-4・SEC-4・#3115: ControlPeer の行全体（移行前の出力の写し）。

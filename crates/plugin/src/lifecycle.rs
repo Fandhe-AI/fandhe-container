@@ -58,7 +58,7 @@
 //!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
 //!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`PLUGIN_STDERR_DRAIN_TIMEOUT`]
-//!   以内に終端へ達しなければ、停止用 pipe へ書いて読み取りを打ち切る（待ちは `poll` の期限で有限。
+//!   以内に終端へ達しなければ、停止用 pipe の書き込み端を閉じて（`POLLHUP`）読み取りを打ち切る（待ちは `poll` の期限で有限。
 //!   macOS の `shutdown` と `recv` の競合に依存しない。#3003。`poll` 非対応の構成だけ従来の `shutdown`）。
 //!
 //! # 未実装（REPAIR-3）
@@ -364,7 +364,7 @@ struct StderrCapture {
     state: Arc<Mutex<PluginStderr>>,
     done: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
-    /// ブロック中の読み取りを起こす操作（停止用 pipe への書き込み。`poll` 非対応の構成はソケットの
+    /// ブロック中の読み取りを起こす操作（停止用 pipe の書き込み端を閉じる。`POLLHUP` で起こす。`poll` 非対応の構成はソケットの
     /// shutdown）。1 回だけ実行する。
     wake: Option<Box<dyn FnOnce() + Send>>,
     /// 停止用 pipe の起床でも [`PLUGIN_STDERR_STOP_TIMEOUT`] 内に止まらなかったときだけ実行する最後の
@@ -412,7 +412,7 @@ impl StderrCapture {
     /// 子の stderr を受けるソケットの読み取り側から収集を始める。
     ///
     /// `poll` 対応の構成では、読み取りスレッドが「ソケット」と「停止用 pipe」を `poll` で待つ。停止時は
-    /// pipe へ 1 バイト書いて起こし、`shutdown` は呼ばない（macOS で `shutdown` が別スレッドの `recv` と
+    /// pipe の書き込み端を閉じて（`drop(stop_tx)`）`POLLHUP` で起こし、pipe へは書かず（理由は `attach` 内のコメント参照）、`shutdown` も呼ばない（macOS で `shutdown` が別スレッドの `recv` と
     /// 競合して読み取りが戻らない場面の回避。REPAIR-5・#3003）。それでも止まらなかった場合に限り、最後の
     /// 手段として `shutdown` する。対応外の構成は従来どおり受信期限と `shutdown` で止める。
     #[cfg(unix)]

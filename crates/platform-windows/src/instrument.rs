@@ -1,19 +1,22 @@
 //! platform-windows の操作の計装連携点（REPAIR-4・TASK-67.2・WIN-2）。
 //!
-//! `.wslconfig` の読み込み（`wslconfig::load_with_recorder`）と virtiofs の opt-in 書き込み
-//! （`wslconfig::enable_virtiofs_at_with_recorder`）が、1 回の操作ごとの結果（成功 / 失敗）と所要時間を
-//! 記録先へ渡すための境界。集計（成功・失敗件数とレイテンシ分布）と構造化ログへの出力は core の
+//! 計装する操作は `WinOpKind` の 4 種（`.wslconfig` の読み込み・virtiofs の opt-in 書き込み・共有マウントの
+//! 準備・解除）で、各操作の `*_with_recorder` 版が 1 回ごとの結果（成功 / 失敗）と所要時間を記録先へ渡すための境界。集計（成功・失敗件数とレイテンシ分布）と構造化ログへの出力は core の
 //! `OpRecorder` が担うが、本 crate は core に依存しないため、本 crate の型だけで完結するトレイトを定義する
 //! （`fandhe-container-net` の `instrument`・`fandhe-container-io` の `instrument` と同じ形）。core の記録器への
 //! 接続は、`docs/architecture.md` の「計装アダプタの配置」の原則に従い、本番でこれらの操作を呼び
-//! `OpRecorder` を持つ crate に置く。本番の呼び出し元は `fandhe-container-plugin-windows`（TASK-116）だが、
-//! 現状は core に依存せず、自前の stderr JSON 行の記録先（`adapter.rs` の `StderrJsonRecorder`）へ出している。
+//! `OpRecorder` を持つ crate に置く。本番の呼び出し元は `fandhe-container-plugin-windows`（TASK-116）の
+//! `wsl2::launch_cancellable_with_recorder`（共有マウントの準備と、起動失敗時のロールバック）と
+//! `wsl2::release_virtiofs_launch_with_recorder`（解除）で、現状は core に依存せず、
+//! 自前の stderr JSON 行の記録先（`adapter.rs` の `StderrJsonRecorder`）へ出している。
 //! `OpRecorder` へ接続する場合は、`sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` /
 //! `sample.latency()` を `OpRecorder::record` へ写す。機能上の依存辺が入る issue で一緒に置き、
 //! 計装だけのために辺は足さない。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
+//! - `.wslconfig` の 2 操作（`wslconfig::load_with_recorder`・`wslconfig::enable_virtiofs_at_with_recorder`）と
+//!   `wsl2::release_container_mounts_with_recorder` には、本番の呼び出し元がまだ無い
 //! - core の `OpRecorder` との接続アダプタ: 本 crate からは提供しない。現状は未接続（上記）
 //! - 9P フォールバック警告（[`WinWarning`]）の構造化ログ行（`level: warn`）への書き出しは呼び出し元の担当
 //!   （plugin-windows の `StderrJsonRecorder` が stderr へ出している）。

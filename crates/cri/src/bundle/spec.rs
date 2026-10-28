@@ -42,8 +42,9 @@
 //!   `mounts[]` の末尾に出す（#2665・CRI-2・NET-5）。ファイル自体は [`super::SpecBundleProvider`] が bundle に書き、
 //!   そのパスを [`BundleFiles`] で受ける（本モジュールはファイルに触れない）。ファイルのパスを渡さない入口
 //!   （[`build_runtime_config`]）に空でない `dns_config` が来たら `UNIMPLEMENTED`（黙って落とさない）。
-//!   現状は core の start が、この ro の bind を拒否する（Landlock の書き込み可能な root 配下の ro は #1917、
-//!   状態ルート配下の source の拒否。plugin-cri の bundle は `<state_root>/.cri/bundles`）。cri は受け入れて mount を
+//!   `ro` の bind 自体は #1917 で書き込み可能な root の下でも core が受理するようになったが、plugin-cri の
+//!   bundle は `<state_root>/.cri/bundles` にあり、core の start が状態ルート配下の source を拒否するため、現状は
+//!   この bind で止まる（拒否の理由はこの 1 点）。cri は受け入れて mount を
 //!   出し、start は構造化エラーで止まる（network namespace と同じ形。`docs/design/cri-config-acceptance.md`）。
 //! - `capabilities.drop_capabilities` は受け入れ、OCI 既定集合から除いた集合を `process.capabilities` の 3 集合
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
@@ -76,7 +77,7 @@
 //!   （plugin-cri の `publish_port`）が行い、config.json には何も出さない（#2676・CRI-2・NET-3）。
 //! - コンテナの `readonly_rootfs` は `root.readonly=true` へ写す（偽は出力しない。core は rootfs の mount top だけを
 //!   ro にし、`/dev/shm`・tmpfs・rw の bind は書き込める。`/etc/resolv.conf` の bind は readonly_rootfs に関わらず常に ro。
-//!   利用者の `ro` の bind は readonly root のときだけ core が受理する〔#1917〕。readonly root では `/proc` への書き込みを
+//!   利用者の `ro` の bind は root が書き込み可能でも core が受理する〔#1917。start が検証した bind の集合と一致するものに限る〕。readonly root では `/proc` への書き込みを
 //!   Landlock が落とす差がある）。sandbox 側の `readonly_rootfs` は適用先のプロセスが無いため出力しない
 //!   （CRI-2・CORE-5・SEC-1。#2767・#2827。`docs/design/cri-config-acceptance.md`）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（cgroup_parent・

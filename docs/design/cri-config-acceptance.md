@@ -8,7 +8,7 @@
 | -- | ---- | -------------- | ---- | ----- |
 | 1 | イメージ User の名前解決 | cri＋oci の fd 起点の読み取り（本変更で実装済み） | cri・oci | #2606 |
 | 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
-| 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔#1917・状態ルート配下の source の拒否〕で現状は拒否される。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
+| 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔状態ルート配下の source の拒否〕で現状は拒否される。`ro` の bind 自体は #1917 で受理済み。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み。`ContainerStatus.user` の報告と機能フラグは #2771 で追加 | core → cri | #2667・#2771 |
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み。イメージ config の `StopSignal` と ContainerStatus の報告は #2771 で追加 | core → cri | #2668・#2771 |
@@ -118,7 +118,7 @@ sandbox 側（`LinuxSandboxSecurityContext.readonly_rootfs`）は出力しない
 | `/dev/shm`・tmpfs・rw の bind | 書き込める（自分の mount 属性のまま） |
 | `/etc/resolv.conf`（`dns_config`） | 常に ro の bind（readonly_rootfs に依らない） |
 | `/etc/hosts`・`/etc/hostname` | bind を供給しない（イメージ内のファイルが root とともに ro になる） |
-| 利用者の `mounts[]` | `Mount.readonly` に従う。`ro` の bind は readonly root のときだけ core が受理する（#1917） |
+| 利用者の `mounts[]` | `Mount.readonly` に従う。`ro` の bind は root が書き込み可能でも core が受理する（#1917。start が検証した集合と一致するものに限る） |
 | `/proc` | Landlock が書き込みを落とす（`EACCES`） |
 
 ### 既知の差（containerd との比較。未検証）
@@ -179,10 +179,9 @@ containerd の `containerMounts` は sandbox のファイル（`/etc/hostname`�
 
 ### 残る制約（REPAIR-3）
 
-`/etc/resolv.conf` の ro の bind は、本番の start では次の 2 点で現状は拒否される。cri は受け入れて mount を出し、start は構造化エラーで止まる（network namespace と同じ形）。
+`/etc/resolv.conf` の ro の bind は、本番の start では次の 1 点で現状は拒否される（Landlock のルール生成が書き込み可能な root 配下の `ro` の mount を拒否していた件は #1917 で解消済み）。cri は受け入れて mount を出し、start は構造化エラーで止まる（network namespace と同じ形）。
 
-1. Landlock のルール生成は、書き込み可能な root 配下の `ro` の mount を拒否する（#1917）
-2. plugin-cri の bundle は `<state_root>/.cri/bundles` にあり、core の `validate_bind_mounts` は状態ルートと重なる source を拒否する（管理ルートに生成して bind する core の処理は #1872〔NET-12〕が近い）
+- plugin-cri の bundle は `<state_root>/.cri/bundles` にあり、core の `validate_bind_mounts` は状態ルートと重なる source を拒否する（管理ルートに生成して bind する core の処理は #1872〔NET-12〕が近い）
 
 ## stop_signal の受け入れ方式（CRI-2・PLUG-1。#2668）
 

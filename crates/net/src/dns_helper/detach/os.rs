@@ -320,33 +320,20 @@ fn spawn_inner(
     // 段 1 が書く `SPAWN <pid>` 行は段 2 の識別行と前後しうるため、識別行が得られるまで高々 2 行を読む。
     let mut stdout = stdout;
     let ident_deadline = Deadline::after(DNS_HELPER_ACK_TIMEOUT);
-    let mut early: Option<OwnedFd> = None;
-    let mut ident_line = None;
-    for _ in 0..2 {
-        match read_line_deadline(&mut stdout, IDENT_LINE_MAX, &ident_deadline) {
-            Ok(l) => match l.strip_prefix(SPAWN_PREFIX) {
-                Some(rest) if early.is_none() => early = adopt_spawned(rest, &nonce),
-                Some(_) => {}
-                None => {
-                    ident_line = Some(l);
-                    break;
-                }
-            },
-            Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
-        }
-    }
-    let Some(ident_line) = ident_line else {
-        return Err(fail_before_ack_any(
-            guard,
-            stdin,
-            early.as_ref(),
-            err(NetErrorCode::FailedPrecondition, "malformed identity line"),
-        ));
+    let pre = read_pre_ack_lines(&mut stdout, &ident_deadline);
+    let early: Option<OwnedFd> = pre
+        .spawn
+        .as_deref()
+        .and_then(|rest| adopt_spawned(rest, &nonce));
+    let ident_line = match pre.ident {
+        Ok(l) => l,
+        Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
     };
     let (identity, pidfd) = match confirm_identity(&ident_line, &nonce) {
         Ok(v) => v,
         Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
     };
+    let mut early = early;
     if let Some(extra) = early.take_if(|fd| !same_pidfd_pid(fd.as_fd(), identity.pid)) {
         // 識別行と別の pid を名乗った SPAWN 行の相手は止めておく。
         let _ = kill_and_confirm(extra.as_fd());
@@ -482,6 +469,61 @@ fn read_line_deadline(
             "readiness line is not UTF-8",
         )
     })
+}
+
+/// ack 前に読んだ行。`spawn` は `SPAWN` 行の `<pid>` 部分（無ければ `None`）。
+struct PreAck {
+    spawn: Option<String>,
+    ident: Result<String, NetError>,
+}
+
+/// ack の前に pipe にありうる 2 行（段 1 の `SPAWN <pid>`・段 2 の `IDENT ...`）を、順序によらず読み切る。
+///
+/// 2 行は別々のプロセスが同じ pipe へ書くため、どちらが先に届くか決まっていない。段 1 の終了を確認してから
+/// 読むので `SPAWN` は（書かれていれば）既に pipe にあり、段 2 は ack まで識別行以外を書かない。したがって
+/// 識別行を先に読んだ場合は、続きを期限 0 で確認して `SPAWN` を取り切る。`SPAWN` が残ったまま ack を返すと、
+/// 準備完了行の読み取りが `SPAWN` を受けてしまう。
+fn read_pre_ack_lines(
+    out: &mut (impl std::io::Read + std::os::fd::AsFd),
+    deadline: &Deadline,
+) -> PreAck {
+    let malformed = || err(NetErrorCode::FailedPrecondition, "malformed identity line");
+    let first = match read_line_deadline(out, IDENT_LINE_MAX, deadline) {
+        Ok(l) => l,
+        Err(e) => {
+            return PreAck {
+                spawn: None,
+                ident: Err(e),
+            };
+        }
+    };
+    if let Some(rest) = first.strip_prefix(SPAWN_PREFIX) {
+        let ident = match read_line_deadline(out, IDENT_LINE_MAX, deadline) {
+            Ok(l) if l.starts_with(SPAWN_PREFIX) => Err(malformed()),
+            other => other,
+        };
+        return PreAck {
+            spawn: Some(rest.to_owned()),
+            ident,
+        };
+    }
+    // 識別行が先。続きがあれば `SPAWN` でなければならない（期限 0 の確認。無ければ段 1 は書かなかった）。
+    let spawn = match read_line_deadline(out, IDENT_LINE_MAX, &Deadline::after(Duration::ZERO)) {
+        Ok(l) => match l.strip_prefix(SPAWN_PREFIX) {
+            Some(rest) => Some(rest.to_owned()),
+            None => {
+                return PreAck {
+                    spawn: None,
+                    ident: Err(malformed()),
+                };
+            }
+        },
+        Err(_) => None,
+    };
+    PreAck {
+        spawn,
+        ident: Ok(first),
+    }
 }
 
 /// 段 1 が報告した段 2 の pid（`SPAWN <pid>` 行）から、失敗時の回収に使う pidfd を取る。
@@ -897,5 +939,57 @@ mod ack_tests {
         assert!(child.try_wait().expect("try_wait").is_none());
         child.kill().expect("kill");
         child.wait().expect("wait");
+    }
+
+    fn pipe_with(data: &[u8]) -> UnixStream {
+        let (mut tx, rx) = UnixStream::pair().expect("pair");
+        tx.write_all(data).expect("write");
+        // 書き手を閉じる (EOF)。読み側のデータは残る。
+        drop(tx);
+        rx
+    }
+
+    /// 段 1 の `SPAWN` と段 2 の `IDENT` はどちらが先でも、両方を読み切って ack 後の読み取りに残さない。
+    #[test]
+    fn net5_3070_spawn_then_ident_order() {
+        let mut rx = pipe_with(b"SPAWN 4242\nIDENT 1 2 b n\n");
+        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        assert_eq!(pre.spawn.as_deref(), Some("4242"));
+        assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
+    }
+
+    #[test]
+    fn net5_3070_ident_then_spawn_order() {
+        let mut rx = pipe_with(b"IDENT 1 2 b n\nSPAWN 4242\n");
+        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        assert_eq!(pre.spawn.as_deref(), Some("4242"));
+        assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
+        // 何も残っていない (後続の準備完了行の読み取りに SPAWN が混ざらない)。
+        let rest = read_line_deadline(&mut rx, 64, &Deadline::after(Duration::from_millis(50)));
+        assert!(rest.is_err());
+    }
+
+    /// `SPAWN` が書かれなかった場合 (識別行のみ) は待たずに戻る。
+    #[test]
+    fn net5_3070_ident_without_spawn() {
+        let (mut tx, mut rx) = UnixStream::pair().expect("pair");
+        tx.write_all(b"IDENT 1 2 b n\n").expect("write");
+        let t = Instant::now();
+        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(5)));
+        assert_eq!(pre.spawn, None);
+        assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        drop(tx);
+    }
+
+    /// 識別行の後に SPAWN 以外の行があれば不正。
+    #[test]
+    fn net5_3070_extra_line_after_ident_is_malformed() {
+        let mut rx = pipe_with(b"IDENT 1 2 b n\nREADY x\n");
+        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        assert_eq!(
+            pre.ident.expect_err("malformed").code(),
+            NetErrorCode::FailedPrecondition
+        );
     }
 }

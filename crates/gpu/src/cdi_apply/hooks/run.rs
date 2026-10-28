@@ -2015,11 +2015,9 @@ mod tests {
             }
             let bytes = hex(f[1]);
             let shared = f[2];
-            let over = f
-                .get(3)
-                .map(|o| o.strip_prefix("net=").expect("net= prefix"));
+            // 第 4 列の `net=` は net 側だけの上書き期待なので、この試験では読み飛ばす。
+            // 解析部・fixture の形式は crates/core・net・gpu の 3 か所の試験で同じ形に保つ（変更時は 3 か所を同期する。REPAIR-1）。
             let want = shared;
-            let _ = over;
             let got = classify(&bytes);
             assert_eq!(
                 got,

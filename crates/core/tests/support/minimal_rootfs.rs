@@ -13,8 +13,7 @@
 //! - エラーは `Result<_, String>`。panic 契約の利用元（core・supervisor）は薄い包みで panic にし、cli は `?` で `FAILED:` 行へ流す
 //! - `mkdir` は祖先を 1 階層ずつ `lstat` し、symlink や非ディレクトリを拒否する（`create_dir_all` は symlink を辿るため使わない。#2324）
 //! - 作成順は「ディレクトリ → バイナリ → ローダ・共有ライブラリ」。mode は 0755
-//! - `benches/src/startup_latency/bundle.rs` のファイル操作は、パスをエラーに載せない・`create_new` で書く契約が強いため
-//!   共有せず解析層（`loader_deps`）だけを使う
+//! - コピーは `file_copy.rs`（`create_new`・symlink を辿らない。#3041）を使う。benches の `bundle.rs` も同じ部品を共有する
 //!
 //! # 置き場所の判断
 //! crate をまたぐ共有は `#[path]`（前例は `scratch_root.rs`）。補助 crate は workspace メンバーと dev-dependencies の
@@ -23,6 +22,8 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
+#[path = "file_copy.rs"]
+pub mod file_copy;
 #[path = "loader_deps.rs"]
 pub mod loader_deps;
 
@@ -58,11 +59,8 @@ fn copy_into(rootfs: &Path, host: &Path) -> Result<(), String> {
         .map_err(|_| format!("not absolute: {}", host.display()))?;
     let dest = rootfs.join(rel);
     mkdir(dest.parent().ok_or("no parent")?)?;
-    let _ = std::fs::remove_file(&dest);
-    std::fs::copy(host, &dest)
-        .map_err(|e| format!("copy {} -> {}: {e}", host.display(), dest.display()))?;
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", dest.display()))
+    file_copy::replace_with_copy(host, &dest)
+        .map_err(|e| format!("copy {} -> {}: {e}", host.display(), dest.display()))
 }
 
 /// 試験バイナリ自身を `rootfs/<dest_name>`（0755）へ置き、動的ローダと読み込み済みの共有ライブラリを同じ絶対パスへ
@@ -75,9 +73,7 @@ pub fn install_binary_at(rootfs: &Path, dest_name: &str, dirs: &[&str]) -> Resul
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let exe = std::fs::canonicalize(exe).map_err(|e| format!("canonicalize exe: {e}"))?;
     let dest = rootfs.join(dest_name);
-    std::fs::copy(&exe, &dest).map_err(|e| format!("copy the test binary: {e}"))?;
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod the test binary: {e}"))?;
+    file_copy::replace_with_copy(&exe, &dest).map_err(|e| format!("copy the test binary: {e}"))?;
     let bytes = std::fs::read(&exe).map_err(|e| format!("read exe: {e}"))?;
     if let Some(interp) = loader_deps::elf_interp(&bytes) {
         // ローダは PT_INTERP のパスのまま（symlink を辿らず）rootfs 内で開かれるため、実体の内容をそのパスへ置く。

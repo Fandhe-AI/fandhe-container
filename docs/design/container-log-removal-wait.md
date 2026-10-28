@@ -160,7 +160,7 @@ Issue #2868 の修正後の main（commit `4819cc9d`）で `stop_control_channel
 
 - 報告元の `sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill`・`sup9_sup3_stop_in_backoff_cancels_pending_restart` は、
   #2868 の後の 600 回で一度も失敗しなかった。報告元 PR（#2861・#2864）は #2868 のマージ前のブランチで、#2868 が直した枠満杯の誤分類で説明できる。したがって製品・試験コードは変えていない
-- 計測の注意: 最初に成功行を `sup9_sup3_stop_in_backoff_cancels_pending_restart ... ok` にした試行は 300 回中 1 回が `missing-success-line` と数えられた（#2962 以降は `LIBTEST_NAME` で回せば libtest の `--logfile` で判定するため割り込まれず、「標準出力に何も書かない試験の行を選ぶ」回避は不要になった。以下は当時の記録）。
+- 計測の注意: 最初に成功行を `sup9_sup3_stop_in_backoff_cancels_pending_restart ... ok` にした試行は 300 回中 1 回が `missing-success-line` と数えられた（#2962 以降、単独試験の繰り返しは `LIBTEST_NAME`〔#3037 で `--exact` による絞り込みになった〕で割り込まれず回せる。ハーネス全体を競合込みで回す再現は、`SUCCESS_LINE` に標準出力へ何も書かない試験の行を渡す。以下は当時の記録）。
   出力は 10 試験とも ok・終了コード 0 で、並列試験の supervisor の JSON ログがその `... ok` の行の途中へ割り込み、行全体の完全一致に外れただけだった（試験の失敗ではない）。
   supervisor を起動しない `sec1_err2_...` の行へ変えると割り込まない。libtest の並列出力を行照合する場合は、標準出力に何も書かない試験の行を選ぶ
 - 範囲外: `run_bounded` の他の呼び出し元の即時 `Busy` は #2894、`binary_entry.rs` の間欠失敗は #2766 で追跡する
@@ -213,7 +213,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   `fandhe_container_supervisor::logs::reclaim_stale_container_logs` で、CLI（`reclaim_stale_container_log`）と plugin-cri
   （`CoreLifecycleRuntime::reclaim_before_create`）が共有する。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。
   best effort で create の成否は変えない（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる。CRI 層は `state` が `NotFound` であることを確かめて資源を解放する）。観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
-- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）
+- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）。supervisor ログは自動回収の対象外で、同じ手順書の「supervisor ログ」の節に従う（#3034）
 
 ## supervisor ログ側の待ち（#2892・SUP-7・CLI-1・REPAIR-5）
 
@@ -232,11 +232,12 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   上の 20 秒の予算の記述と試験が崩れる
 - 失敗の扱い: 待ち切れなければ `Kept { FailedPrecondition }` と、コンテナログと同じ語彙の `reason: "sink_open_after_wait"` つきの警告
 - 待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る（CRI は ID を使い回さないため、実質は手動の回収。
-  `docs/setup/container-log-recovery.md` はコンテナログが対象で supervisor ログは含まない。残余。REPAIR-3）
+  起動時の走査は `@container-logs` だけが対象で supervisor ログは回収されない。見分け方と手順は
+  `docs/setup/container-log-recovery.md` の「supervisor ログ」の節に追加済み〔#3034〕。自動回収は足していない）
 
 ## plugin-cri の `RemoveContainer` の supervisor ログ側の待ち（#2964・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 
-- 従来: `remove_bounded`（1 回だけ）は中の失敗を握りつぶして `Finished` を返すため、ロック保持中でログが残っても `Removed`・Success と
+- 従来の `remove_bounded`（1 回だけ。呼び出し元が無くなり #3033 で削除済み）は中の失敗を握りつぶして `Finished` を返すため、ロック保持中でログが残っても `Removed`・Success と
   報告していた（観測の欠落）。CLI と同じ構造に揃える
 - 方式: `CoreLifecycleRuntime::delete` が `container_log_lock_wait`（既定 10 秒）を期限として決め、supervisor ログを
   `remove_guarded_bounded_waiting`（guard は状態ストアの `NotFound`。試行ごとにロック保持中に評価）で処理し、
@@ -283,7 +284,7 @@ plugin-cri は `create_with_image` を使わず状態レコードに `image_root
 - 後始末の各段（supervisor ログ・コンテナログ・起動オプション文書）は、いまの上限と期限までの残りの小さい方で試す。ロックの待ちと 1 回の試行の
   和が残りを超えないようにし、残りが小さいときは半分ずつ渡す（試行の期限は上限であり通常は短時間で終わるため、残りを全部渡すと待ちが消える）
 - 残りが 0 の段は試さず、`Kept { code: Timeout }`（起動オプション文書は警告行と記録器の Failure）として残す。消さずに残す側に倒し、
-  起動時の走査と手順書（`docs/setup/container-log-recovery.md`）で回収できる。新しい `reason` の語彙は足さない
+  起動時の走査（コンテナログのみ）と手順書（`docs/setup/container-log-recovery.md`。supervisor ログは手順書のみ）で回収できる。新しい `reason` の語彙は足さない
 - 全体の最悪は max(42, 47) = 47 秒で、`PLUGIN_RUNTIME_TIMEOUT` との余裕 13.9 秒は I/O の時間と、stop の中の状態ロックの待ち（下の残余）に充てる
 - 通常（後始末の前が 17 秒以下）は後始末に 30 秒以上残るため、挙動は変わらない
 - 照合: `repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout`（42・47・72 秒の具体値）・

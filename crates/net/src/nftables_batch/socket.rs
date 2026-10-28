@@ -223,6 +223,7 @@ fn drain_until_barrier(
 /// - `NLMSG_NOOP` は `NLMSG_MIN_TYPE` 未満の制御メッセージで nfnetlink の要求ではないため使わない。
 ///   BEGIN / END への `NLM_F_ACK` はカーネル版数によっては ACK されないため完了条件にできない
 /// - GETGEN は読み取りのみの照会で、ルールセットを変更しない
+/// - 応答の NEWGEN の nfgenmsg は family 0・version 0 であることを ack 側が照合する（#3039）
 fn encode_barrier(seq: u32) -> Result<Vec<u8>, NetError> {
     let mut b = NlMsgBuilder::new(
         nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETGEN),
@@ -507,7 +508,7 @@ mod tests {
             seq,
             0,
         );
-        NfGenMsg::new(NFPROTO_UNSPEC, 0)
+        NfGenMsg::new(NFPROTO_UNSPEC, 0x0102)
             .put_into(&mut b)
             .expect("nfgenmsg");
         b.finish().expect("finish")

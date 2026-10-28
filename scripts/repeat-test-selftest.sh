@@ -218,7 +218,7 @@ check lib-failed-reason-exit 1 "reason=exit" fail2 "${P}" "${T}" COUNT=3
 LN="LIBTEST_NAME=sec1_x"
 INTERLEAVED='test sec1_x ... {"level":"info","msg":"supervisor"}\nok\n'
 check libtest-interleaved-stdout-pass 0 "passed=2 failed=0 count=2 test_bin=exec_x" gen "${P}" "${B}" "${LN}" "STUB_STDOUT=${INTERLEAVED}" 'STUB_LOG=ok sec1_x\n' COUNT=2
-check libtest-with-other-lines 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok other\nok sec1_x\n' COUNT=1
+check libtest-two-lines 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ok other\nok sec1_x\n' COUNT=1
 check libtest-empty-log 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=' COUNT=2
 check libtest-ignored 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=ignored sec1_x\n' COUNT=1
 check libtest-failed-rc0 1 "reason=missing-libtest-ok" gen "${P}" "${B}" "${LN}" 'STUB_LOG=failed sec1_x\n' COUNT=1
@@ -239,7 +239,7 @@ check forbidden-semicolon-accepted 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN
 check forbidden-in-stdout 1 "reason=forbidden-line forbidden='(root=true)'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true) y\n' 'STUB_LOG=ok sec1_x\n' COUNT=2
 check forbidden-in-stdout-count 1 "passed=0 failed=2 count=2" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true) y\n' 'STUB_LOG=ok sec1_x\n' COUNT=2
 check forbidden-in-stderr 1 "reason=forbidden-line" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=bad thing" 'STUB_STDERR=a bad thing\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
-check forbidden-in-logfile 1 "reason=forbidden-line" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=ok other" 'STUB_LOG=ok sec1_x\nok other\n' COUNT=1
+check forbidden-in-logfile 1 "reason=forbidden-line" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=sec1" 'STUB_LOG=ok sec1_x\n' COUNT=1
 check forbidden-multi-second 1 "forbidden='b2'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=b1|b2" 'STUB_STDOUT=has b2 here\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
 check forbidden-lib-mode 1 "reason=forbidden-line" gen "${P}" "${T}" "FORBIDDEN_LINE=zzz" 'STUB_STDOUT=zzz\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
 check forbidden-success-line-mode 1 "reason=forbidden-line" gen "${P}" "${B}" "${S}" "FORBIDDEN_LINE=zzz" 'STUB_STDOUT=exec_x: all scenarios passed\nzzz\n' COUNT=1
@@ -285,7 +285,7 @@ fi
 rm -f "${work}/args" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
   "${P}" "${B}" "${LN}" COUNT=1 "${target}" >/dev/null 2>&1
-if grep -qE -- "--test exec_x -- --logfile [^ ]+libtest.log$" "${work}/args"; then
+if grep -qE -- "--test exec_x -- --exact sec1_x --logfile [^ ]+libtest.log$" "${work}/args"; then
   echo "OK: libtest-args"
 else
   echo "NG: libtest-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
@@ -293,7 +293,7 @@ fi
 rm -f "${work}/args" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=gen STUB_LOG='ok sec1_x\n' STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
   "${P}" "${B}" "${LN}" TEST_IGNORED=1 COUNT=1 "${target}" >/dev/null 2>&1
-if grep -qE -- "--test exec_x -- --ignored --logfile [^ ]+libtest.log$" "${work}/args"; then
+if grep -qE -- "--test exec_x -- --ignored --exact sec1_x --logfile [^ ]+libtest.log$" "${work}/args"; then
   echo "OK: libtest-ignored-args"
 else
   echo "NG: libtest-ignored-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
@@ -342,6 +342,18 @@ if [ "$(grep -c -- "--message-format=json" "${work}/args")" -eq 1 ] && [ "$(wc -
 else
   echo "NG: scope-args" >&2; cat "${work}/args" "${work}/sd" >&2; fails=$((fails + 1))
 fi
+# USER_SCOPE の直接実行にも --exact が渡る（#3037）。
+for ign in 1 ""; do
+  rm -f "${work}/args" "${work}/sd" "${work}/counter"
+  if [ -n "${ign}" ]; then ign_arg="--ignored "; else ign_arg=""; fi
+  env PATH="${work}/bin:${PATH}" STUB_MODE=scope-gen STUB_LOG='ok sec1_x\n' STUB_BIN="${work}/bin/exec_x_bin" STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" STUB_SD_LOG="${work}/sd" \
+    "${P}" "${B}" "${LN}" USER_SCOPE=1 ${ign:+TEST_IGNORED=1} COUNT=1 "${target}" >/dev/null 2>&1
+  if grep -qE -- "^--user --scope --quiet -p Delegate=yes --unit=fandhe-repeat-[0-9]+-1 -- ${work}/bin/exec_x_bin ${ign_arg}--exact sec1_x --logfile [^ ]+libtest.log$" "${work}/sd"; then
+    echo "OK: scope-libtest-args-ignored${ign:-0}"
+  else
+    echo "NG: scope-libtest-args-ignored${ign:-0}" >&2; cat "${work}/sd" >&2; fails=$((fails + 1))
+  fi
+done
 check scope-libtest-pass 0 "passed=1 failed=0 count=1 test_bin=exec_x" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 'STUB_LOG=ok sec1_x\n' COUNT=1
 check scope-libtest-missing 1 "reason=missing-libtest-ok" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 'STUB_LOG=' COUNT=1
 check scope-forbidden 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1

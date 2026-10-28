@@ -5435,4 +5435,232 @@ mod attach_tests {
         assert!(!calls.iter().any(|c| c.starts_with("unpin_netns")));
         assert_eq!(calls.last().map(String::as_str), Some("set_master 21 7"));
     }
+
+    /// NET-1・REPAIR-3・#3040: 事前作成 netns の経路で、故障点 × 巻き戻しの veth 削除の失敗ごとに、残る資源・
+    /// 請求書・IPAM の保持を具体値で照合する。この経路は netns を unpin せず呼び出し側へ返すため、netns は
+    /// 取り残しに数えず、請求書は常に `netns=0`・`pin=-`（pin は呼び出し側の所有で回収の対象にしない）。
+    #[test]
+    fn net1_attach_fault_prepared_leftover_matrix() {
+        use AttachResource::Veth;
+        use ResourceState::{Present, Unknown};
+        let host = host_of("c1");
+        for (point, _, post_ipam) in FAULT_POINTS {
+            let cases = [
+                (None, vec![Veth(host.clone())], vec![]),
+                (
+                    Some(NetErrorCode::Internal),
+                    vec![],
+                    vec![(Veth(host.clone()), Present)],
+                ),
+                (
+                    Some(NetErrorCode::Timeout),
+                    vec![],
+                    vec![(Veth(host.clone()), Unknown)],
+                ),
+            ];
+            for (veth_del, removed, mut leftover) in cases {
+                let mut fault = AttachFault::new(point);
+                if let Some(c) = veth_del {
+                    fault = fault.with_veth_delete_failure(c);
+                }
+                let ops = FaultyAttachOps {
+                    inner: Fake::default(),
+                    fault,
+                };
+                let mut pool = ipam();
+                let (e, back) = *attach_prepared_with(
+                    &ops,
+                    &spec("c1"),
+                    prepared("c1", netns_dir()),
+                    &mut pool,
+                    &mut PortRegistry::new(),
+                    TEST_GEN,
+                )
+                .unwrap_err();
+                let ctx = format!("{point:?} veth_del={veth_del:?}");
+                assert_eq!(e.step, point.step(), "{ctx}");
+                assert_eq!(e.code(), NetErrorCode::Internal, "{ctx}");
+                let back = back.expect(&ctx);
+                assert_eq!(back.endpoint(), &eid("c1"), "{ctx}");
+                assert_eq!(back.pin_path(), pin_of("c1"), "{ctx}");
+                assert_eq!(e.rollback.removed, removed, "{ctx}");
+                let quarantine = post_ipam && !leftover.is_empty();
+                if quarantine {
+                    leftover.push((AttachResource::Address(ip(2)), Unknown));
+                }
+                assert_eq!(e.rollback.leftover, leftover, "{ctx}");
+                if veth_del.is_some() {
+                    let claim = e.reclaim_claim().expect(&ctx);
+                    assert_eq!(
+                        claim.to_record(),
+                        expected_record("c1", true, false, quarantine),
+                        "{ctx}"
+                    );
+                    assert_eq!(claim.quarantine_only().is_some(), quarantine, "{ctx}");
+                } else {
+                    assert_eq!(e.reclaim_claim(), None, "{ctx}");
+                }
+                assert_eq!(pool.allocated_count(), usize::from(quarantine), "{ctx}");
+                assert_eq!(
+                    pool.address_of(&eid("c1")),
+                    quarantine.then(|| ip(2)),
+                    "{ctx}"
+                );
+                assert!(
+                    !ops.inner
+                        .calls()
+                        .iter()
+                        .any(|c| c.starts_with("unpin_netns")),
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    /// NET-1・#3040: 事前作成 netns の経路は巻き戻しで unpin を呼ばないため、unpin の注入は届かない。
+    /// 返された netns を呼び出し側が解放するとき（`release_prepared_with`）に初めて unpin が走り、
+    /// 注入した失敗ではハンドルが返って再試行できる。
+    #[test]
+    fn net1_attach_fault_prepared_unpin_failure_is_unreachable() {
+        for veth_del in [None, Some(NetErrorCode::Internal)] {
+            let mut fault = AttachFault::new(AttachFaultPoint::SetUp)
+                .with_unpin_failure(NetErrorCode::Internal);
+            if let Some(c) = veth_del {
+                fault = fault.with_veth_delete_failure(c);
+            }
+            let ops = FaultyAttachOps {
+                inner: Fake::default(),
+                fault,
+            };
+            let (e, back) = *attach_prepared_with(
+                &ops,
+                &spec("c1"),
+                prepared("c1", netns_dir()),
+                &mut ipam(),
+                &mut PortRegistry::new(),
+                TEST_GEN,
+            )
+            .unwrap_err();
+            assert!(
+                !ops.inner
+                    .calls()
+                    .iter()
+                    .any(|c| c.starts_with("unpin_netns")),
+                "{veth_del:?}"
+            );
+            assert!(
+                !e.rollback
+                    .leftover
+                    .iter()
+                    .any(|(r, _)| matches!(r, AttachResource::Netns(_))),
+                "{veth_del:?}"
+            );
+            // 呼び出し側の解放: 注入した unpin の失敗ではハンドルが返る。
+            let (ue, again) =
+                *release_prepared_with(&ops, back.expect("netns handed back")).unwrap_err();
+            assert_eq!(ue.code(), NetErrorCode::Internal);
+            assert_eq!(again.pin_path(), pin_of("c1"));
+            assert!(
+                !ops.inner
+                    .calls()
+                    .iter()
+                    .any(|c| c.starts_with("unpin_netns")),
+                "injected failure skips inner"
+            );
+        }
+        // 故障なしの ops では解放が成功し、内側の unpin が 1 回だけ呼ばれる。
+        let clean = FaultyAttachOps {
+            inner: Fake::default(),
+            fault: AttachFault::new(AttachFaultPoint::SetUp),
+        };
+        release_prepared_with(&clean, prepared("c1", netns_dir())).unwrap();
+        assert_eq!(clean.inner.calls(), ["unpin_netns"]);
+    }
+
+    /// NET-1・#3040: 事前作成 netns の経路でも、故障点以外は内側へ委譲される。呼び出し列は成功時の列を故障点の
+    /// 直前で切り、続けて veth 削除だけが並ぶ（unpin は続かない）。
+    #[test]
+    fn net1_attach_fault_prepared_delegates_everything_else() {
+        let ok = Fake::default();
+        attach_prepared_with(
+            &ok,
+            &spec("c1"),
+            prepared("c1", netns_dir()),
+            &mut ipam(),
+            &mut PortRegistry::new(),
+            TEST_GEN,
+        )
+        .unwrap();
+        let success = ok.calls();
+        for (point, tag, _) in FAULT_POINTS {
+            let ops = FaultyAttachOps {
+                inner: Fake::default(),
+                fault: AttachFault::new(point),
+            };
+            attach_prepared_with(
+                &ops,
+                &spec("c1"),
+                prepared("c1", netns_dir()),
+                &mut ipam(),
+                &mut PortRegistry::new(),
+                TEST_GEN,
+            )
+            .unwrap_err();
+            let cut = success
+                .iter()
+                .position(|c| c.starts_with(tag))
+                .expect("fault op appears in the success sequence");
+            let mut expected: Vec<String> = success[..cut].to_vec();
+            expected.push("delete_link 21".to_owned());
+            assert_eq!(ops.inner.calls(), expected, "{point:?}");
+        }
+    }
+
+    /// NET-1・NET-3・#3040: IPAM 払い出し後の段（アドレス付与・default route）の失敗で、veth を戻せなければ
+    /// アドレスと受け口の予約を保持し、戻せれば両方を解放する。DNAT の投入前の失敗なので `publish` は呼ばれない。
+    /// `attach_container` 経路と事前作成 netns の経路の両方で照合する。
+    #[test]
+    fn net1_attach_fault_post_ipam_port_reservation() {
+        for point in [AttachFaultPoint::AddAddress, AttachFaultPoint::DefaultRoute] {
+            for prepared_path in [false, true] {
+                for stuck in [true, false] {
+                    let mut fault = AttachFault::new(point);
+                    if stuck {
+                        fault = fault
+                            .with_veth_delete_failure(NetErrorCode::Internal)
+                            .with_unpin_failure(NetErrorCode::Internal);
+                    }
+                    let ops = FaultyAttachOps {
+                        inner: Fake::default(),
+                        fault,
+                    };
+                    let mut pool = ipam();
+                    let mut reg = PortRegistry::new();
+                    let s = spec_with_ports("c1", vec![port(8093)]);
+                    let ctx = format!("{point:?} prepared={prepared_path} stuck={stuck}");
+                    let e = if prepared_path {
+                        attach_prepared_with(
+                            &ops,
+                            &s,
+                            prepared("c1", netns_dir()),
+                            &mut pool,
+                            &mut reg,
+                            TEST_GEN,
+                        )
+                        .unwrap_err()
+                        .0
+                    } else {
+                        attach_container_with(&ops, &s, &mut pool, &mut reg).unwrap_err()
+                    };
+                    assert_eq!(e.step, point.step(), "{ctx}");
+                    assert_eq!(reg.len(), usize::from(stuck), "{ctx}");
+                    assert_eq!(pool.allocated_count(), usize::from(stuck), "{ctx}");
+                    assert_eq!(pool.address_of(&eid("c1")), stuck.then(|| ip(2)), "{ctx}");
+                    let calls = ops.inner.calls();
+                    assert!(calls.iter().any(|c| c == "scan_listeners"), "{ctx}");
+                    assert!(!calls.iter().any(|c| c.starts_with("publish")), "{ctx}");
+                }
+            }
+        }
+    }
 }

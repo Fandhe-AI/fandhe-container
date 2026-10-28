@@ -176,7 +176,8 @@
 //!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 14 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
-//!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595）、結果は [`AuditedOutcome::audit`] で返す
+//!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595。worker の結果行で届いた `step` があれば
+//!   `ExecChildStep::stage` で写した拒否の段を `stage` に載せる。無ければ載せない。#3209）、結果は [`AuditedOutcome::audit`] で返す
 //!   （`SetupFailed` は `Err` ではなく `Ok` のまま返り、拒否は変わらない）。監査なしで通す入口は無い。記録点は worker の結果を復号した直後の **親プロセス（exec を起動したプロセス）** の 1 箇所で、
 //!   worker の中では記録しない（worker は `setns` 後にコンテナの mount namespace と cgroup に入っており、そこで
 //!   sink の I/O やロックを走らせると、ホストの監査ファイルのロックをコンテナの cgroup 内のプロセスが保持し得る
@@ -294,7 +295,7 @@ use fandhe_container_core::exec::{
     join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
-    reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
+    reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection_at,
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command,
     spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
 };
@@ -904,9 +905,13 @@ fn audit_worker_result(
         Ok(outcome) => match outcome.exit {
             ExecExit::SetupFailed {
                 violation: Some(reason),
+                step,
                 ..
             } => {
-                let rejected = record_entrypoint_rejection(outcome, reason, container, audit);
+                // 段は worker の結果行で届いた `ExecChildStep` を launch と同じ語彙へ写す（届かなければ載せない。#3209）。
+                let stage = step.map(ExecChildStep::stage);
+                let rejected =
+                    record_entrypoint_rejection_at(outcome, reason, stage, container, audit);
                 Ok(AuditedOutcome {
                     outcome: rejected.error,
                     audit: rejected.delivery,
@@ -3599,12 +3604,19 @@ mod tests {
 
     /// `SetupFailed` の結果（違反の理由は `violation`）。
     fn setup_failed(violation: Option<ViolationReason>) -> ExecOutcome {
+        setup_failed_at(violation, None)
+    }
+
+    fn setup_failed_at(
+        violation: Option<ViolationReason>,
+        step: Option<ExecChildStep>,
+    ) -> ExecOutcome {
         ExecOutcome {
             exit: ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation,
                 code: ErrorCode::PermissionDenied,
-                step: None,
+                step,
             },
             command_pid: None,
             rlimits_applied: 15,
@@ -3625,6 +3637,21 @@ mod tests {
     /// 失敗する sink でも結果は不変で `SinkFailed` を返す。
     #[test]
     fn sec4_sup6_task163_parent_records_one_audit_per_setup_violation() {
+        // #3209: 段が届いていれば launch と同じ語彙（entrypoint の違反は exec）で載り、無ければ載せない。
+        for reason in exec_child_violation_reasons() {
+            for (step, want) in [
+                (Some(ExecChildStep::OpenEntrypoint), Some("exec")),
+                (Some(ExecChildStep::CgroupJoin), Some("cgroup_join")),
+                (None, None),
+            ] {
+                let sink = RecordingSink::new(false);
+                let outcome = setup_failed_at(Some(*reason), step);
+                audit_worker_result(Ok(outcome), Some(&cid()), &sink).unwrap();
+                let recs = sink.snapshot();
+                assert_eq!(recs.len(), 1, "{reason:?}");
+                assert_eq!(recs[0].stage().map(|s| s.as_str()), want, "{reason:?}");
+            }
+        }
         for reason in exec_child_violation_reasons() {
             let outcome = setup_failed(Some(*reason));
             let sink = RecordingSink::new(false);

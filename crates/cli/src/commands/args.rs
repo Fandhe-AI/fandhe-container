@@ -71,6 +71,9 @@ pub(super) struct CreateNetworkArgs {
     pub(super) add_hosts: Vec<String>,
     /// `--dns <ip>`(最大 `MAX_DNS_SERVERS` 件。1 件 `MAX_IP_TEXT_LEN` バイト以下)。
     pub(super) dns: Vec<String>,
+    /// `-p` / `--publish <[ipv4:]host:container[/tcp|udp]>`(最大 `MAX_PORT_PUBLISHES` 件。1 件 `MAX_PORT_FORWARD_SPEC_LEN` バイト以下。
+    /// rootless の pasta のみ。NET-9・NET-3・#3200)。
+    pub(super) publish: Vec<String>,
 }
 
 /// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
@@ -358,6 +361,7 @@ enum RepeatableOption {
     CapDrop,
     AddHost,
     Dns,
+    Publish,
 }
 
 fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
@@ -377,6 +381,8 @@ fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
         Some(RepeatableOption::AddHost)
     } else if a == "--dns" {
         Some(RepeatableOption::Dns)
+    } else if a == "--publish" || a == "-p" {
+        Some(RepeatableOption::Publish)
     } else {
         None
     }
@@ -450,6 +456,17 @@ fn push_option(
                 return Err(UsageError);
             }
             options.network.dns.push(v);
+        }
+        RepeatableOption::Publish => {
+            use fandhe_container_net::network::MAX_PORT_PUBLISHES;
+            use fandhe_container_net::pasta::MAX_PORT_FORWARD_SPEC_LEN;
+            let v = text(value)?;
+            if options.network.publish.len() >= MAX_PORT_PUBLISHES
+                || v.len() > MAX_PORT_FORWARD_SPEC_LEN
+            {
+                return Err(UsageError);
+            }
+            options.network.publish.push(v);
         }
     }
     Ok(())
@@ -1051,6 +1068,7 @@ mod tests {
                 network: Some("host".into()),
                 add_hosts: vec!["a:1.2.3.4".into(), "b:::1".into()],
                 dns: vec!["127.0.0.1".into()],
+                publish: vec![],
             }
         );
     }
@@ -1077,6 +1095,10 @@ mod tests {
         );
         assert!(with(rep("--dns", &"1".repeat(45), 1)).is_ok());
         assert_eq!(with(rep("--dns", &"1".repeat(46), 1)), Err(UsageError));
+        assert!(with(rep("--publish", "8080:80", 64)).is_ok());
+        assert_eq!(with(rep("--publish", "8080:80", 65)), Err(UsageError));
+        assert!(with(rep("-p", &"1".repeat(64), 1)).is_ok());
+        assert_eq!(with(rep("-p", &"1".repeat(65), 1)), Err(UsageError));
         assert!(with(rep("--network", &"a".repeat(64), 1)).is_ok());
         assert_eq!(with(rep("--network", &"a".repeat(65), 1)), Err(UsageError));
         assert_eq!(with(rep("--network", "none", 2)), Err(UsageError));

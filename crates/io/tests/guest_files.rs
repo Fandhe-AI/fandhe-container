@@ -242,3 +242,38 @@ fn io5_creator_rejects_escape_and_does_not_pollute_index() {
             .exists()
     );
 }
+
+/// IO-5・REPAIR-2・F5（#3159）: 上限を 1 超えたパスは `create_file` が FS に触れる前に
+/// `InvalidArgument` で拒否し、同じ文字列を `GuestPath::parse` へ渡すと対応する変種になる
+/// （検証が 1 つの関数に集まっていることの確認）。
+#[test]
+fn io5_repair2_creator_rejects_paths_over_guest_path_limits() {
+    use fandhe_container_io::{
+        GuestPath, GuestPathError, MAX_GUEST_NAME_BYTES, MAX_GUEST_PATH_BYTES,
+        MAX_GUEST_PATH_COMPONENTS,
+    };
+    let dir = TempDir::new("gf-guest-path-limits");
+    let (creator, root) = creator_in(&dir, "root");
+    let cases = [
+        (
+            "x".repeat(MAX_GUEST_PATH_BYTES + 1),
+            GuestPathError::TooLong,
+        ),
+        (
+            vec!["a"; MAX_GUEST_PATH_COMPONENTS + 1].join("/"),
+            GuestPathError::TooManyComponents,
+        ),
+        (
+            format!("d/{}", "n".repeat(MAX_GUEST_NAME_BYTES + 1)),
+            GuestPathError::NameTooLong,
+        ),
+        ("/abs".to_owned(), GuestPathError::Absolute),
+        ("d/../x".to_owned(), GuestPathError::DotComponent),
+    ];
+    for (path, want) in cases {
+        assert_eq!(GuestPath::parse(&path), Err(want));
+        let err = creator.create_file(&path).err().expect("must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
+    assert_eq!(std::fs::read_dir(&root).expect("root").count(), 0);
+}

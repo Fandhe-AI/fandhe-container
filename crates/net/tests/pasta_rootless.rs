@@ -1214,21 +1214,31 @@ mod linux {
 
     /// S4: 公開 0 件ではホスト側のポートが 1 つも開かない（`auto` が働かない）。
     fn scene_none(ctx: Ctx<'_>) -> Result<(), String> {
-        let p3 = free_ports(1)?[0];
-        run_scene("s4", &[], false, &mut |s| {
+        let ports = free_ports(2)?;
+        let (p3, cq) = (ports[0], ports[1]);
+        // 対象側（netns 内）に未公開の待ち受け cq を置く。`-t none` が `auto` に誤ると cq がホストへ転送される。
+        run_scene("s4", &[cq], false, &mut |s| {
             let host_l = TcpListener::bind(("127.0.0.1", p3)).map_err(|e| e.to_string())?;
             let _keep = &host_l;
             s.base = host_snapshot()?;
             s.start(ctx, &PastaPortForwards::new())?;
             let pasta = s.pasta_pid()?;
             expect_basic_net(s.target()?)?;
-            expect_tcp_listeners(pasta, &s.base, &[p3], vec![])?;
+            expect_tcp_listeners(pasta, &s.base, &[p3, cq], vec![])?;
+            // 対象側の cq は待ち受け中のまま（観測の前提）で、ホスト側には転送が生じない。
             let listen = parse_net_table(&s.target()?.net("tcp")?)
                 .into_iter()
-                .filter(|x| x.state == "0A")
+                .filter(|x| x.state == "0A" && x.port == cq)
                 .count();
-            check(listen == 0, || {
-                format!("target has {listen} tcp listeners with no publish")
+            check(listen == 1, || {
+                format!("target has {listen} unpublished listeners on {cq}, want 1")
+            })?;
+            let leaked = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, cq)),
+                Duration::from_millis(500),
+            );
+            check(leaked.is_err(), || {
+                format!("host port {cq} reached the target despite no publish")
             })?;
             stop_and_check(s, true)
         })

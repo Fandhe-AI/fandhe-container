@@ -38,7 +38,7 @@
 //! Linux 専用（`lib.rs` で cfg）。エラーと構造化ログは固定語彙で、パス・argv・入力値を含めない（ERR-1）。
 
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -368,6 +368,9 @@ pub struct PastaAttachConfig {
     pub forwards: PastaPortForwards,
     /// 状態ルートのディレクトリ fd（`O_DIRECTORY | O_NOFOLLOW` で開いたもの）。
     pub state_root: OwnedFd,
+    /// 状態ルートのパス(`state_root` の fd と同じ場所)。コンテナ単位のプロセス間ロック
+    /// (`@container-options/@locks/<id>`。CLI の create / delete と共通)の取得に使う。
+    pub state_root_path: PathBuf,
     /// コンテナ ID。
     pub container: ContainerId,
     /// 準備完了の待ち（既定は [`PASTA_READY_TIMEOUT_DEFAULT`]）。
@@ -410,6 +413,7 @@ pub struct ProductionBackend {
     container: ContainerId,
     ready_timeout: Duration,
     state_root: Arc<OwnedFd>,
+    state_root_path: PathBuf,
     logger: Logger,
     run_dirs: Arc<RunDirGenerations>,
     /// 準備段階で作った置き場所(世代つき)。期限切れの後に作業スレッドが作り終えた分もここへ残る。
@@ -424,6 +428,7 @@ impl ProductionBackend {
             container: config.container,
             ready_timeout: config.ready_timeout,
             state_root: Arc::new(config.state_root),
+            state_root_path: config.state_root_path,
             logger,
             run_dirs: Arc::new(RunDirGenerations::default()),
             prepared: Arc::new(Mutex::new(PreparedSlot::default())),
@@ -503,6 +508,83 @@ fn abandon_prepared(slot: &Mutex<PreparedSlot>, abandoned: &AtomicBool) {
     abandoned.store(true, Ordering::SeqCst);
     g.ready = None;
     g.ours = None;
+}
+
+/// 作業スレッドへ渡す状態ルート操作の道具立て(所有物のみ。`'static`)。
+struct IoJob {
+    state_root: Arc<OwnedFd>,
+    root_path: PathBuf,
+    container: ContainerId,
+    id: String,
+}
+
+impl IoJob {
+    /// コンテナ単位のプロセス間ロックを `wait` まで待って取る(CLI の create / delete と共通。REPAIR-5)。
+    /// 取れなければ(期限切れ含む)エラー。呼び出し側は何にも触れずに返す。
+    fn lock(
+        &self,
+        wait: Duration,
+    ) -> Result<crate::container_options::store::OptionsLock, TraitError> {
+        crate::container_options::store::acquire_lock(&self.root_path, &self.container, wait)
+    }
+
+    fn abandoned_error(&self) -> TraitError {
+        TraitError::new(
+            ErrorCode::Timeout,
+            "the pasta run directory operation was abandoned",
+        )
+    }
+}
+
+/// 置き場所の準備の本体(作業スレッドで動く)。コンテナ単位のロック(プロセス間)を `wait` まで待って取り、
+/// 取れなければ何にも触れず失敗する(fail-closed)。ロックを取れても、呼び出し側が見限った(`abandoned`)なら何もしない
+/// (期限切れの worker がロックを持たない間・持った後に新しい世代へ触れない構造。CORE-2・REPAIR-5)。
+fn prepare_run_dir_job(
+    job: &IoJob,
+    wait: Duration,
+    run_dirs: &RunDirGenerations,
+    prepared: &Mutex<PreparedSlot>,
+    abandoned: &AtomicBool,
+) -> Result<(), TraitError> {
+    let _guard = job.lock(wait)?;
+    if abandoned.load(Ordering::SeqCst) {
+        return Err(job.abandoned_error());
+    }
+    let fd = &job.state_root;
+    let (generation, made) = run_dirs.advance_with(|| PastaRunDir::prepare(fd.as_fd(), &job.id));
+    let dir = made.map_err(|e| net_to_trait(&e))?;
+    let ours = run_dir_identity(fd.as_fd(), &job.id).ok().flatten();
+    deliver_prepared(prepared, abandoned, generation, dir, ours);
+    Ok(())
+}
+
+/// 置き場所の削除の本体(作業スレッドで動く)。ロックの取得から、同一性の確認、削除の完了までを 1 つのロックの下で行う。
+fn remove_run_dir_job(
+    job: &IoJob,
+    wait: Duration,
+    run_dirs: &RunDirGenerations,
+    generation: Option<u64>,
+    ours: Option<DirId>,
+    abandoned: &AtomicBool,
+) -> Result<bool, TraitError> {
+    let _guard = job.lock(wait)?;
+    if abandoned.load(Ordering::SeqCst) {
+        return Err(job.abandoned_error());
+    }
+    run_dirs.remove_if_current(generation, || {
+        remove_run_dir_if_ours(job.state_root.as_fd(), &job.id, ours)
+    })
+}
+
+impl ProductionBackend {
+    fn io_job(&self) -> IoJob {
+        IoJob {
+            state_root: Arc::clone(&self.state_root),
+            root_path: self.state_root_path.clone(),
+            container: self.container.clone(),
+            id: self.container.as_str().to_owned(),
+        }
+    }
 }
 
 /// 状態ルートの I/O(作成・削除)の待ちの上限。超えたら待ちを打ち切る(作業スレッドは残り、枠は実終了まで保持する)。
@@ -671,28 +753,15 @@ impl PastaAttachBackend for ProductionBackend {
                 "the deadline was exceeded before the pasta run directory was prepared",
             ));
         }
-        let (fd, id) = (
-            Arc::clone(&self.state_root),
-            self.container.as_str().to_owned(),
-        );
+        let job = self.io_job();
         let (run_dirs, prepared) = (Arc::clone(&self.run_dirs), Arc::clone(&self.prepared));
         let abandoned = Arc::new(AtomicBool::new(false));
         let worker_abandoned = Arc::clone(&abandoned);
         let result = run_dir_io_bounded(timeout, move || {
-            // 見限られた後に始まった作業は何もしない。
-            if worker_abandoned.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            let (generation, made) =
-                run_dirs.advance_with(|| PastaRunDir::prepare(fd.as_fd(), &id));
-            let dir = made?;
-            let ours = run_dir_identity(fd.as_fd(), &id).ok().flatten();
-            // 期限切れの後に作り終えた分は渡さない(取り残しは次の準備か delete が回収する)。
-            deliver_prepared(&prepared, &worker_abandoned, generation, dir, ours);
-            Ok(())
+            prepare_run_dir_job(&job, timeout, &run_dirs, &prepared, &worker_abandoned)
         });
         match result {
-            Ok(r) => r.map_err(|e: fandhe_container_net::error::NetError| net_to_trait(&e)),
+            Ok(r) => r,
             Err(e) => {
                 abandon_prepared(&self.prepared, &abandoned);
                 Err(e)
@@ -707,14 +776,29 @@ impl PastaAttachBackend for ProductionBackend {
             g.ready = None;
             g.ours
         };
-        let (fd, id) = (
-            Arc::clone(&self.state_root),
-            self.container.as_str().to_owned(),
-        );
+        let job = self.io_job();
         let run_dirs = Arc::clone(&self.run_dirs);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let worker_abandoned = Arc::clone(&abandoned);
+        // ロックの取得から、同一性の確認、削除の完了までを 1 つの作業で行う(ロックを持たない間は何にも触れない)。
         let removed = run_dir_io_bounded(RUN_DIR_IO_TIMEOUT, move || {
-            run_dirs.remove_if_current(generation, || remove_run_dir_if_ours(fd.as_fd(), &id, ours))
-        })?;
+            remove_run_dir_job(
+                &job,
+                RUN_DIR_IO_TIMEOUT,
+                &run_dirs,
+                generation,
+                ours,
+                &worker_abandoned,
+            )
+        });
+        let removed = match removed {
+            Ok(r) => r,
+            Err(e) => {
+                // 期限切れ。以後ロックを取れても何もしない。
+                abandoned.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
         match removed {
             Ok(true) => {}
             // 世代が新しい、または同一性が違う(別の起動の置き場所)ので触れなかった。
@@ -928,6 +1012,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------------------------
 
 /// pasta 構成の組み立て一式。フックと launcher の包みは同じ受け渡し口とログを共有する。
+#[derive(Clone)]
 pub struct PastaWiring {
     hook: Arc<PastaAttachHook>,
     slot: Slot,
@@ -968,7 +1053,14 @@ impl PastaWiring {
         }
     }
 
-    /// launch の前の準備段階で `@pasta/<id>/` を期限つきに作っておく(launch 内では準備済みのものを使う。REPAIR-5)。
+    /// 準備済みの(または準備を試みた)`@pasta/<id>/` を回収する。起動権の予約を握ったまま、launch しなかった・
+    /// 失敗した経路から呼ぶ。コンテナ単位のロックの下で、自分が作った置き場所にだけ触れる(冪等)。
+    pub fn discard(&self) -> Result<(), TraitError> {
+        self.backend.remove_run_dir(None)
+    }
+
+    /// 起動権の予約を握った後の準備段階で `@pasta/<id>/` を期限つきに作っておく(launch 内では準備済みのものを使う。
+    /// コンテナ単位のロックの下で作る。ロックを取れなければ触れずに失敗する。REPAIR-5・CORE-2)。
     pub fn prepare(&self, deadline: Instant) -> Result<(), TraitError> {
         self.backend.prepare_run_dir(deadline)
     }
@@ -1114,6 +1206,8 @@ impl PastaAttachingLauncher {
                     None => {
                         // フックが走らなかった(network のモードとフックの組が崩れた)。ネットワーク無しで走らせない。
                         let _ = process.terminate(MISSING_ATTACHMENT_TERMINATE);
+                        // 準備済みの置き場所も回収する(失敗経路で所有物を残さない。NET-9)。
+                        let _ = self._backend.remove_run_dir(None);
                         Err(TraitError::new(
                             ErrorCode::Internal,
                             "the pasta attachment is missing after launch",
@@ -1123,8 +1217,20 @@ impl PastaAttachingLauncher {
             }
             Err(e) => {
                 // 単一スレッドの区間なのでスレッドは作らない。
-                if let Some(a) = lock(&self.slot).take() {
-                    a.teardown("launch_failed", false, true);
+                let taken = lock(&self.slot).take();
+                match taken {
+                    Some(a) => a.teardown("launch_failed", false, true),
+                    // フックが attach する前(または attach に失敗)に launch が失敗した。準備済みの置き場所を回収する
+                    // (全失敗経路で所有物を残さない。NET-9)。
+                    None => {
+                        if let Err(re) = self._backend.remove_run_dir(None) {
+                            self.logger.log(
+                                true,
+                                "pasta_run_dir_remove_failed",
+                                &[("code", Val::S(re.code().as_str()))],
+                            );
+                        }
+                    }
                 }
                 Err(e)
             }

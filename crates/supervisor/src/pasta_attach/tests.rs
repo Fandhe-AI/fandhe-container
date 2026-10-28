@@ -334,7 +334,7 @@ fn net9_launch_ok_without_attachment_terminates_process() {
         .err()
         .expect("refused");
     assert_eq!(e.code(), ErrorCode::Internal);
-    assert_eq!(events(&ev), ["container terminate"]);
+    assert_eq!(events(&ev), ["container terminate", "remove run_dir"]);
 }
 
 /// 成功した launch は Guarded に載り、PID 1 の回収後に pasta → holder → run dir の順で 1 回だけ止める。
@@ -1264,4 +1264,124 @@ fn repair5_abandoned_prepare_is_not_delivered() {
         assert_eq!(g.ours, ours);
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+fn io_job(root: &std::path::Path, fd: &Arc<OwnedFd>, id: &str) -> IoJob {
+    IoJob {
+        state_root: Arc::clone(fd),
+        root_path: root.to_path_buf(),
+        container: ContainerId::new(id).expect("id"),
+        id: id.to_owned(),
+    }
+}
+
+/// CORE-2・REPAIR-5・NET-9: 別の supervisor / CLI が同じコンテナのロックを持つ間、準備も削除もロックを待って
+/// 期限で失敗し、状態ルートに何も作らず何も消さない(fail-closed)。
+#[test]
+fn core2_run_dir_ops_do_not_touch_anything_without_the_id_lock() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("lock");
+    let fd = Arc::new(fd);
+    let job = io_job(&root, &fd, "web1");
+    let id = ContainerId::new("web1").unwrap();
+    let other = crate::container_options::store::acquire_lock(&root, &id, Duration::from_secs(5))
+        .expect("other process holds the id lock");
+    let gens = RunDirGenerations::default();
+    let slot = Mutex::new(PreparedSlot::default());
+    let never = AtomicBool::new(false);
+    let e = prepare_run_dir_job(&job, Duration::from_millis(50), &gens, &slot, &never)
+        .expect_err("lock not acquired");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert!(!root.join("@pasta").exists());
+    assert!(lock(&slot).ready.is_none());
+    // 既存の置き場所(別の起動のもの)は、ロックが無ければ消えない。
+    let theirs = PastaRunDir::prepare(fd.as_fd(), "web1").expect("their dir");
+    std::fs::write(theirs.pid_path(), b"7\n").expect("pid");
+    let ours = run_dir_identity(fd.as_fd(), "web1").expect("stat");
+    let e = remove_run_dir_job(&job, Duration::from_millis(50), &gens, None, ours, &never)
+        .expect_err("lock not acquired");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert_eq!(std::fs::read(theirs.pid_path()).expect("pid"), b"7\n");
+    drop(other);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CORE-2・REPAIR-5: 期限切れで見限った worker は、後からロックを取れても何にも触れない。
+/// その間に CLI 相当(ロックの下の delete・再作成)が作った新世代は、pid ファイルごと残る。
+#[test]
+fn core2_abandoned_worker_cannot_touch_the_new_generation_after_it_gets_the_lock() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("late");
+    let fd = Arc::new(fd);
+    let id = ContainerId::new("web1").unwrap();
+    // 旧い起動: 準備済みで同一性を控えている。
+    let old = PastaRunDir::prepare(fd.as_fd(), "web1").expect("old");
+    let ours = run_dir_identity(fd.as_fd(), "web1").expect("stat");
+    drop(old);
+    // 別プロセス(CLI)がロックを持ち、旧い worker はそれを待っている。
+    let cli = crate::container_options::store::acquire_lock(&root, &id, Duration::from_secs(5))
+        .expect("cli lock");
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (job, a) = (io_job(&root, &fd, "web1"), Arc::clone(&abandoned));
+        std::thread::spawn(move || {
+            let gens = RunDirGenerations::default();
+            remove_run_dir_job(&job, Duration::from_secs(10), &gens, None, ours, &a)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    // 呼び出し側は期限切れで見限る。CLI は delete・再作成(新しい世代)を行ってからロックを手放す。
+    abandoned.store(true, Ordering::SeqCst);
+    remove_pasta_run_dir(fd.as_fd(), "web1").expect("cli delete");
+    std::fs::create_dir_all(root.join("@pasta")).expect("mkdir");
+    let new = PastaRunDir::prepare(fd.as_fd(), "web1").expect("new generation");
+    std::fs::write(new.pid_path(), b"4242\n").expect("pid");
+    drop(cli);
+    let r = worker.join().expect("worker");
+    assert_eq!(r.expect_err("abandoned").code(), ErrorCode::Timeout);
+    assert_eq!(std::fs::read(new.pid_path()).expect("pid"), b"4242\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CORE-2・NET-9: ロックを取れた準備は置き場所を作って渡し、同じロックの下の削除は自分のものだけを消す。
+#[test]
+fn core2_prepare_then_remove_under_the_id_lock_round_trips() {
+    let (root, fd) = scratch_root("rt");
+    let fd = Arc::new(fd);
+    let job = io_job(&root, &fd, "web1");
+    let gens = RunDirGenerations::default();
+    let slot = Mutex::new(PreparedSlot::default());
+    let never = AtomicBool::new(false);
+    prepare_run_dir_job(&job, Duration::from_secs(5), &gens, &slot, &never).expect("prepare");
+    let (ours, generation) = {
+        let g = lock(&slot);
+        (g.ours, g.ready.as_ref().map(|(n, _)| *n))
+    };
+    assert_eq!(generation, Some(1));
+    assert!(ours.is_some());
+    assert!(root.join("@pasta/web1").is_dir());
+    let removed = remove_run_dir_job(&job, Duration::from_secs(5), &gens, None, ours, &never)
+        .expect("remove");
+    assert!(removed);
+    assert!(!root.join("@pasta/web1").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// NET-9・CORE-2: launch が attach の前に失敗した(フックが走らない・holder の起動失敗など)ときも、準備済みの
+/// 置き場所を回収する。`discard`(起動権の予約を握った後の後始末)も同じ回収を行う。
+#[test]
+fn net9_launch_failure_without_attachment_reclaims_prepared_run_dir() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    let l = launcher(&w);
+    let e = l
+        .adopt(Err(TraitError::new(ErrorCode::Timeout, "launch failed")))
+        .err()
+        .expect("passes the error through");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert_eq!(events(&ev), ["remove run_dir"]);
+    ev.lock().unwrap().clear();
+    w.discard().expect("discard");
+    assert_eq!(events(&ev), ["remove run_dir"]);
 }

@@ -2236,6 +2236,10 @@ mod linux {
         pasta_target: Option<(ContainerId, PathBuf)>,
         /// 単一スレッドの区間で積む pasta まわりの構造化ログ(`flush_deferred_logs` が報告の後に出す。#1940)。
         pasta_logs: Arc<crate::pasta_attach::PastaLogBuffer>,
+        /// 手順 7 で作った pasta の結線(ユーザー定義名のときだけ `Some`)。手順 4b の準備と後始末が使う。
+        pasta: Option<crate::pasta_attach::PastaWiring>,
+        /// 手順 4b で置き場所の準備を試みたか(`release_network` が回収する対象の有無)。
+        pasta_prepare_attempted: bool,
         /// host モードのとき、起動オプションを受けた時点(start の入口の単一スレッド区間)の supervisor の netns。
         /// 手順 4b が作業スレッドの netns と照合する基準(#1873・NET-6・D8)。host 以外、または取得に失敗したら `None`。
         netns_baseline: Option<fandhe_container_net::network_mode::host::NsId>,
@@ -2358,6 +2362,8 @@ mod linux {
                 options_generation: None,
                 pasta_target: None,
                 pasta_logs: Arc::new(crate::pasta_attach::PastaLogBuffer::new()),
+                pasta: None,
+                pasta_prepare_attempted: false,
                 netns_baseline: None,
                 etc_created: None,
             }
@@ -2558,15 +2564,15 @@ mod linux {
                 binary: binary.clone(),
                 forwards: self.container_options.network().publish().clone(),
                 state_root: open_state_root_bounded(root)?,
+                state_root_path: root.clone(),
                 container: container.clone(),
                 ready_timeout: crate::pasta_attach::READY_TIMEOUT_DEFAULT,
             };
-            let wiring =
-                crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))?;
-            // 置き場所(`@pasta/<id>/`)は launch の前のこの準備段階で期限つきに作る。launch 内のフックは準備済みの
-            // ものを使い、状態ルートの I/O を同期で行わない(REPAIR-5)。
-            wiring.prepare(Instant::now() + PASTA_PREPARE_BUDGET)?;
-            Ok(Some(wiring))
+            // 置き場所(`@pasta/<id>/`)はここでは作らない。起動権の予約を握った後の手順 4b(`prepare_network`)で、
+            // コンテナ単位のロックの下に期限つきで作る。予約より前に作ると、その間に delete・再作成された新インスタンスの
+            // 置き場所を旧い start が再利用して壊す(CORE-2・NET-9)。
+            crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))
+                .map(Some)
         }
 
         /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
@@ -2762,6 +2768,8 @@ mod linux {
             let launch_options = self.container_options.launch_options()?;
             // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
             let wiring = self.pasta_wiring()?;
+            // 手順 4b / 後始末(`prepare_network` / `release_network`)が同じ結線を使えるよう控える。
+            self.pasta = wiring.clone();
             let builder = match &wiring {
                 Some(w) => builder.netns_attach_hook(w.hook()),
                 None => builder,
@@ -2798,6 +2806,12 @@ mod linux {
 
         fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
             use crate::container_options::network::NetworkSelection;
+            // pasta 構成: 起動権の予約を握った今、コンテナ単位のロックの下で置き場所を作る(期限つき。取れなければ
+            // 触れずに失敗する。失敗しても `release_network` が自分の分だけ回収する)。
+            if let Some(w) = &self.pasta {
+                self.pasta_prepare_attempted = true;
+                w.prepare(Instant::now() + PASTA_PREPARE_BUDGET)?;
+            }
             let network = self.container_options.network();
             // 文書に network が無い(従来のコンテナ・plugin-cri)なら何もしない。
             let Some(selection) = network.selection() else {
@@ -2823,10 +2837,19 @@ mod linux {
         }
 
         fn release_network(&mut self) -> Result<(), TraitError> {
-            let Some(id) = self.etc_created.take() else {
-                return Ok(());
+            // pasta の置き場所は、起動権の予約を握っている間に(コンテナ単位のロックの下で)回収する。
+            let pasta = match (
+                &self.pasta,
+                std::mem::take(&mut self.pasta_prepare_attempted),
+            ) {
+                (Some(w), true) => w.discard(),
+                _ => Ok(()),
             };
-            crate::container_options::etc_files::discard_etc_files(&self.root, &id)
+            let etc = match self.etc_created.take() {
+                Some(id) => crate::container_options::etc_files::discard_etc_files(&self.root, &id),
+                None => Ok(()),
+            };
+            pasta.and(etc)
         }
 
         fn network_log_mode(&self) -> Option<&'static str> {

@@ -200,12 +200,13 @@ mod linux {
         if bin.join("fandhe-container-launcher").exists() {
             return Err("a privileged launcher must not sit next to the cli".into());
         }
+        // 先にストアを開く。`open` は空のルートにだけ `@revision` を初期化するため、`bundle` を先に作ると
+        // 新規ストアとみなされず、create が「revision high-water mark is missing」で失敗する（#3105）。
+        // 1 回目の supervisor が報告の前に落ちた状態を作る。
+        let store = open_store(&root)?;
         fs::create_dir_all(root.join("bundle")).map_err(|e| format!("mkdir: {e}"))?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod: {e}"))?;
-
-        // 1 回目の supervisor が報告の前に落ちた状態を作る。
-        let store = open_store(&root)?;
         let req = CreateStateRequest::new(
             ContainerStatus::created(id.clone(), None),
             root.join("bundle"),

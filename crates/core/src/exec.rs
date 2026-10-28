@@ -125,6 +125,7 @@ mod landlock;
 mod launch_intermediate;
 mod launch_status;
 mod masked_paths;
+mod netns_sync;
 mod no_new_privs;
 mod overlay_layers;
 mod path_lookup;
@@ -198,7 +199,6 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
-/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
 pub(crate) use landlock::{landlock_ruleset_from_config_with_dev, launch_isolation_from_ruleset};
 #[cfg(test)]
 pub(crate) use landlock::{ruleset_from_detection, ruleset_from_detection_with_dev};
@@ -223,6 +223,8 @@ pub use launch_status::relay_landlock_failure_for_test;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_mount_binds_failure_for_test;
+/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
+pub(crate) use netns_sync::{NetnsExpectation, NetnsIdentity, NetnsSyncRequest};
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -924,11 +926,14 @@ pub enum IsolationStage {
     MountEtcFiles,
     /// 新しい network namespace の `lo` を up にする `ioctl(SIOCSIFFLAGS)`（NET-6・CORE-6・#3064）。
     LoopbackUp,
+    /// entrypoint の exec 直前の同期点での network namespace の素性の照合（子が自分の `/proc/thread-self/ns/net` を
+    /// `SCM_RIGHTS` で渡し、親が (dev, ino) を期待と比べる。NET-6・SEC-1・SEC-4・#3206。`network-wiring.md` D8）。
+    NetnsVerify,
 }
 
 impl IsolationStage {
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Validate,
         Self::Unshare,
         Self::SetGroups,
@@ -962,6 +967,7 @@ impl IsolationStage {
         Self::RootReadOnly,
         Self::MountEtcFiles,
         Self::LoopbackUp,
+        Self::NetnsVerify,
     ];
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
@@ -1002,6 +1008,7 @@ impl IsolationStage {
             Self::ApplySysctls => "apply_sysctls",
             Self::RootReadOnly => "root_read_only",
             Self::LoopbackUp => "loopback_up",
+            Self::NetnsVerify => "netns_verify",
         }
     }
 }
@@ -3078,6 +3085,7 @@ mod tests {
             IsolationStage::RootReadOnly => 30,
             IsolationStage::MountEtcFiles => 31,
             IsolationStage::LoopbackUp => 32,
+            IsolationStage::NetnsVerify => 33,
         }
     }
 
@@ -3094,7 +3102,7 @@ mod tests {
             );
             assert!(seen.insert(token), "duplicate {token}");
         }
-        assert_eq!(IsolationStage::ALL.len(), 33);
+        assert_eq!(IsolationStage::ALL.len(), 34);
         assert_eq!(
             IsolationStage::MountReadonlyPaths.as_str(),
             "mount_readonly_paths"

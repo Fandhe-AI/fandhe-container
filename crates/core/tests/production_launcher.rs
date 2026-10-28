@@ -136,6 +136,14 @@
 //! `ns/net`）が残らないことを照合し、`production_launcher: network loopback isolated lo up and self delivery ok; no netns pin
 //! after terminate (scenario=N)` を出す。範囲写像の経路は `(scenario=N-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
 //!
+//! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
+//! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
+//! 起動が `FailedPrecondition`（メッセージ `the network namespace of the container init does not match the requested network
+//! mode`）で拒否され、監査 sink に段 `netns_verify`・理由 `netns_identity_mismatch` の記録が 1 件残り、状態が Created のまま
+//! 子が残らないことを照合する。成功行は `production_launcher: network host netns sync accepted; forged baseline rejected
+//! with audit and no process (scenario=Z)`。Loopback の拒否は実機で作れない（子の netns は起動の時点まで未知）ため、
+//! `judge` と立て替えの PID 1 を使う単体試験が受け持つ。
+//!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
 //! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
 //!
@@ -1177,6 +1185,7 @@ mod linux {
         scenario_s_launch_options(&env, tag);
         scenario_y_readonly_root(&env, tag);
         scenario_n_network_loopback(&env, tag, false);
+        scenario_z_network_host_netns_sync(&env, tag);
         if subordinate_requested() {
             scenario_n_network_loopback(&env, tag, true);
             scenario_i_subordinate_ids(&env, tag);
@@ -2943,6 +2952,131 @@ mod linux {
                 "production_launcher: network loopback isolated lo up and self delivery ok; no netns pin after terminate (scenario=N)"
             );
         }
+    }
+
+    /// シナリオ Z(NET-6・SEC-1・SEC-4・#3206): `Host` モードの起動が exec 直前の netns 素性の同期点を通る(受理)ことと、
+    /// 基準を差し替えた起動が拒否・監査・回収されることを具体値で照合する。
+    fn scenario_z_network_host_netns_sync(env: &Env, tag: u32) {
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .expect("host net ns")
+            .display()
+            .to_string();
+        let host_ino = std::fs::metadata("/proc/self/ns/net").expect("host ns meta");
+        let make_launcher = |sink: Arc<MemSink>, forged: bool| -> Arc<dyn ProcessLauncher> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs.ensure_default_dev_shm().expect("default dev shm");
+            let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+                .expect("launch options")
+                .with_network(LaunchNetworkMode::Host);
+            let mut builder = ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(sink)
+                .launch_options(options);
+            if forged {
+                use std::os::unix::fs::MetadataExt as _;
+                // 実在しない inode（0）。dev は本物のままで、素性が一致しない。
+                builder = builder.netns_baseline_override_for_test(host_ino.dev(), 0);
+            }
+            Arc::new(builder.build().expect("build launcher for host network"))
+        };
+
+        // 受理: 基準は supervisor 自身の netns（差し替えなし）。コンテナ内の netns の識別子がホストと同じ。
+        let accept_sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+        let launcher = make_launcher(Arc::clone(&accept_sink), false);
+        let bundle = Bundle::new("z");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plnethost{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "NETNS"),
+                host_netns,
+                "host mode must share the host netns"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            accept_sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an accepted netns sync must record nothing"
+        );
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain after terminate"
+        );
+
+        // 拒否: 基準を差し替えた起動は FailedPrecondition で失敗し、監査に 1 件残り、子が残らない。
+        let reject_sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+        let launcher = make_launcher(Arc::clone(&reject_sink), true);
+        let bundle = Bundle::new("zr");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plnethostrej{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("a forged netns baseline must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.message(),
+            "the network namespace of the container init does not match the requested network mode"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        let records = reject_sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            records
+                .iter()
+                .all(|r| r.contains("netns_identity_mismatch") && r.contains("netns_verify")),
+            "{records:?}"
+        );
+        assert!(!launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "a rejected launch must leave no process: {:?}",
+            children_of_self()
+        );
+        println!(
+            "production_launcher: network host netns sync accepted; forged baseline rejected with audit and no process (scenario=Z)"
+        );
     }
 
     /// シナリオ V: `linux.sysctl` の namespaced キー(IPC 系 `kernel.shmmax`)が実際の IPC namespace と procfs を通って

@@ -331,7 +331,11 @@ fn spawn_inner(
     };
     let (identity, pidfd) = match confirm_identity(&ident_line, &nonce) {
         Ok(v) => v,
-        Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
+        Err(f) => {
+            // 照合の途中で終了していた場合は、その pidfd で回収してから意図記録を消す。
+            let fd = f.pidfd.as_ref().or(early.as_ref());
+            return Err(fail_before_ack_any(guard, stdin, fd, f.error));
+        }
     };
     let mut early = early;
     if let Some(extra) = early.take_if(|fd| !same_pidfd_pid(fd.as_fd(), identity.pid)) {
@@ -380,31 +384,47 @@ fn spawn_inner(
 fn confirm_identity(
     line: &str,
     nonce: &HelperNonce,
-) -> Result<(ProcessIdentity, OwnedFd), NetError> {
-    let identity = parse_ident(line, nonce)?;
-    if identity.boot_id != read_boot_id()? {
-        return Err(err(
+) -> Result<(ProcessIdentity, OwnedFd), ConfirmFailure> {
+    let plain = |error| ConfirmFailure { error, pidfd: None };
+    let identity = parse_ident(line, nonce).map_err(plain)?;
+    if identity.boot_id != read_boot_id().map_err(plain)? {
+        return Err(plain(err(
             NetErrorCode::FailedPrecondition,
             "dns helper reported a different boot id",
-        ));
+        )));
     }
     let pidfd = match open_pidfd(identity.pid) {
         Ok(fd) => fd,
         Err(e) if e.code() == NetErrorCode::NotFound => {
-            return Err(err(
+            return Err(plain(err(
                 NetErrorCode::FailedPrecondition,
                 "dns helper exited before its identity was confirmed",
-            ));
+            )));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(plain(e)),
     };
-    if verify_pidfd_target(pidfd.as_fd(), &identity)? != Verify::Same {
-        return Err(err(
+    match verify_pidfd_target(pidfd.as_fd(), &identity).map_err(plain)? {
+        Verify::Same => Ok((identity, pidfd)),
+        // pidfd を持っている間は pid が再利用されないので、`Gone` は「この pidfd の子が終了した」。
+        // 呼び出し側が pidfd で回収できるよう返す。
+        Verify::Gone => Err(ConfirmFailure {
+            error: err(
+                NetErrorCode::FailedPrecondition,
+                "dns helper exited before its identity was confirmed",
+            ),
+            pidfd: Some(pidfd),
+        }),
+        Verify::Different => Err(plain(err(
             NetErrorCode::FailedPrecondition,
             "dns helper identity did not match the process",
-        ));
+        ))),
     }
-    Ok((identity, pidfd))
+}
+
+/// [`confirm_identity`] の失敗。照合の途中で子が終了していた場合だけ、回収用の pidfd を持つ。
+struct ConfirmFailure {
+    error: NetError,
+    pidfd: Option<OwnedFd>,
 }
 
 /// stdout から 1 行（最大 `max` バイト）を、poll と絶対期限つきで読む。1 バイトずつ読むため続く行を食べない。
@@ -693,12 +713,7 @@ pub fn recover_dns_helper_intent(
             Err(e) if e.code() == NetErrorCode::NotFound => continue,
             Err(e) => return Err(with_note(e, "intent record kept")),
         };
-        let identity = match read_identity(pid) {
-            Ok(i) => i,
-            Err(e) if e.code() == NetErrorCode::NotFound => continue,
-            Err(e) => return Err(with_note(e, "intent record kept")),
-        };
-        if stop_confirmed_candidate(pidfd.as_fd(), &identity, intent.nonce())? {
+        if settle_candidate(pidfd.as_fd(), pid, intent.nonce())? {
             stopped += 1;
         }
     }
@@ -713,12 +728,42 @@ pub fn recover_dns_helper_intent(
     Ok(IntentRecovery::Recovered { stopped })
 }
 
+/// nonce の一致を確認して pidfd を取った候補を片付ける（止めた・回収したなら true）。
+///
+/// pidfd を持つ間は pid が再利用されないので、`/proc/<pid>` の消滅（`NotFound`）や空の cmdline（ゾンビ）は
+/// 別のプロセスではなく「この pidfd の子が終了した」と扱い、pidfd で `waitid` して回収する。
+fn settle_candidate(
+    pidfd: BorrowedFd<'_>,
+    pid: u32,
+    nonce: &HelperNonce,
+) -> Result<bool, NetError> {
+    match read_identity(pid) {
+        Ok(identity) => stop_confirmed_candidate(pidfd, &identity, nonce),
+        Err(e) if e.code() == NetErrorCode::NotFound => {
+            let _ = process::reap_pidfd_nohang(pidfd);
+            Ok(true)
+        }
+        Err(e) => Err(with_note(e, "intent record kept")),
+    }
+}
+
+/// pidfd の子が終了していれば（ゾンビの cmdline は空）、別のプロセスではなく子の終了として回収して true。
+/// 生存中なら何もせず false。
+fn reap_if_exited(pidfd: BorrowedFd<'_>) -> bool {
+    if matches!(wait_exit(pidfd, Duration::ZERO), Ok(true)) {
+        let _ = process::reap_pidfd_nohang(pidfd);
+        true
+    } else {
+        false
+    }
+}
+
 /// nonce の一致を確認して pidfd を取った候補を、同一性を再確認したうえで止める（止めた・回収したなら true）。
 ///
 /// nonce の確認後に既に終了していた（`Verify::Gone`）場合も、この pidfd で `waitid` して回収する。
 /// 終了後のゾンビは `/proc/<pid>/cmdline` が空で nonce を再検査できないため、確認済みの pidfd・同一性で扱う
 /// （呼び出し元が child subreaper のとき、回収しないとゾンビが残る。自分の子でなければ回収は親の仕事）。
-/// 開始時刻が違う（別のプロセス）か、生存したまま nonce が消えた場合は何もしない。
+/// 開始時刻が違う（別のプロセス）か、生存したまま nonce が無い場合は何もしない。
 fn stop_confirmed_candidate(
     pidfd: BorrowedFd<'_>,
     identity: &ProcessIdentity,
@@ -732,7 +777,7 @@ fn stop_confirmed_candidate(
         }
         Verify::Same => {
             if !cmdline_has_nonce(identity.pid, nonce)? {
-                return Ok(false);
+                return Ok(reap_if_exited(pidfd));
             }
             if !kill_and_confirm(pidfd) {
                 return Err(err(
@@ -991,5 +1036,71 @@ mod ack_tests {
             pre.ident.expect_err("malformed").code(),
             NetErrorCode::FailedPrecondition
         );
+    }
+
+    /// REPAIR-5・NET-5: 照合（`Verify::Same`）の後に終了して cmdline が空になった窓でも、別のプロセス扱いにせず
+    /// pidfd で回収する。`stop_confirmed_candidate` は終了後のゾンビを `Gone` で回収する経路と、
+    /// `settle_candidate` は `/proc/<pid>` の消滅（`NotFound`）を回収済みとして扱う経路を固定する。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3070_settle_treats_vanished_candidate_as_exited() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let pidfd = open_pidfd(pid).expect("pidfd");
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        // 既に回収済みで /proc/<pid> が無い。
+        let nonce = HelperNonce::generate().expect("nonce");
+        assert!(settle_candidate(pidfd.as_fd(), pid, &nonce).expect("settle"));
+    }
+
+    /// 照合中に終了していた識別行は、`Different` ではなく回収用の pidfd つきの失敗になり、その pidfd で
+    /// ゾンビを回収できる。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3070_confirm_identity_gone_returns_pidfd_for_reaping() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let id = read_identity(pid).expect("identity");
+        let nonce = HelperNonce::generate().expect("nonce");
+        let line = format!(
+            "{IDENT_PREFIX}{pid} {} {} {}",
+            id.start_time_ticks, id.boot_id, nonce
+        );
+        child.kill().expect("kill");
+        let proc_stat = format!("/proc/{pid}/stat");
+        // 終了してゾンビになるまで待つ。
+        let t = Instant::now();
+        while std::fs::read_to_string(&proc_stat).is_ok_and(|s| {
+            !s.rsplit_once(')')
+                .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+        }) {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Err(f) = confirm_identity(&line, &nonce) else {
+            panic!("a dead process must not be confirmed");
+        };
+        assert_eq!(f.error.code(), NetErrorCode::FailedPrecondition);
+        let fd = f.pidfd.expect("pidfd for reaping");
+        assert!(process::reap_pidfd_nohang(fd.as_fd()).expect("reap"));
+        assert!(!std::path::Path::new(&proc_stat).exists(), "zombie reaped");
+    }
+
+    /// 照合の後に終了して cmdline が空になった窓: 終了していれば回収して true、生存中なら触れず false。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3070_reap_if_exited_distinguishes_exit_from_alive() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let pidfd = open_pidfd(pid).expect("pidfd");
+        assert!(!reap_if_exited(pidfd.as_fd()));
+        assert!(child.try_wait().expect("try_wait").is_none());
+        child.kill().expect("kill");
+        assert!(wait_exit(pidfd.as_fd(), Duration::from_secs(5)).expect("wait"));
+        let proc_stat = format!("/proc/{pid}/stat");
+        assert!(std::path::Path::new(&proc_stat).exists(), "zombie before");
+        assert!(reap_if_exited(pidfd.as_fd()));
+        assert!(!std::path::Path::new(&proc_stat).exists(), "reaped");
     }
 }

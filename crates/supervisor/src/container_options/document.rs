@@ -18,7 +18,7 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
@@ -27,6 +27,11 @@
 //! 配布され、未知の kind は旧 supervisor が拒否する(fail-closed)ため、版を上げる利点が無い。
 //! `read-only` も #2828(CLI-1・SUP-12)で足した kind で、本体は固定値 `true` だけを受ける(`false` や空は拒否。
 //! `--read-only` は狭める方向だけで、書き込み可能へ戻す表現を持たない)。重複は拒否する。版は同じ理由で上げない。
+//!
+//! `network`・`add-host`・`dns` は #3065(NET-6・NET-12・network-wiring.md D4)で足した kind で、版は上げない(同じ理由)。
+//! `network` は 1 レコード(64 バイト以下)、`add-host` は 256 件以下(1 件 299 バイト以下)、`dns` は 32 件以下
+//! (1 件 45 バイト以下)。復号のたびに net のパーサで再検証し([`NetworkOptions`])、`network` が無ければ
+//! core の `LaunchNetworkMode::FromConfig`(従来の挙動)になる。CLI が書く処理と既定の `none` は #1873。
 //!
 //! # 外部入力の扱い
 //!
@@ -39,7 +44,11 @@ use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 use super::env::{ENV_MAX_ENTRIES, ENV_MAX_ENTRY_BYTES, ENV_MAX_TOTAL_BYTES, EnvSet, EnvVar};
 use super::mounts::{MountOptions, ShmSize, TmpfsOption};
+use super::network::NetworkOptions;
 use super::{ContainerOptions, IpcMode, Ulimit};
+use fandhe_container_net::add_host_dns::resolv_conf::MAX_DNS_SERVERS;
+use fandhe_container_net::add_host_dns::{MAX_ADD_HOST_ENTRIES, MAX_ADD_HOST_LEN, MAX_IP_TEXT_LEN};
+use fandhe_container_net::network::NAME_MAX_LEN;
 
 /// 文書の先頭行(版つき。版が変わる形式変更ではこの値を上げる)。
 pub const OPTIONS_DOC_MAGIC: &[u8] = b"FCOPT1\n";
@@ -61,6 +70,12 @@ pub const GENERATION_MAX: usize = 64;
 const GENERATION_RECORD_RESERVE: usize = 4 + 1 + 2 + 1 + GENERATION_MAX + 1;
 /// `read-only` の本文の最大バイト数(固定値 `true` の 4)。
 const READ_ONLY_RECORD_MAX: usize = 4;
+/// `network` の本文の最大バイト数(net のネットワーク名の上限。D4)。
+const NETWORK_RECORD_MAX: usize = NAME_MAX_LEN;
+/// `add-host` 1 件の最大バイト数(net の `MAX_ADD_HOST_LEN`。D4)。
+const ADD_HOST_RECORD_MAX: usize = MAX_ADD_HOST_LEN;
+/// `dns` 1 件の最大バイト数(IP 文字列の上限。D4)。
+const DNS_RECORD_MAX: usize = MAX_IP_TEXT_LEN;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
 const HEADER_LINE_MAX: usize = 24;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
@@ -82,6 +97,12 @@ pub struct ContainerOptionsDocument {
     cap_drop: Vec<String>,
     /// `--read-only`(true のとき `root.readonly` を実効的に true にする。#2828)。
     read_only: bool,
+    /// `--network` の生の文字列(構築時に net のパーサで検証済み。NET-6・#3065)。
+    network: Option<String>,
+    /// `--add-host` の生の文字列(`<host>:<ip>`。検証済み。NET-12・#3065)。
+    add_hosts: Vec<String>,
+    /// `--dns` の生の文字列(IP。検証済み。NET-12・#3065)。
+    dns: Vec<String>,
     /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
     generation: Option<String>,
 }
@@ -102,6 +123,9 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("tmpfs", &self.tmpfs)
             .field("cap_drop", &self.cap_drop)
             .field("read_only", &self.read_only)
+            .field("network", &self.network)
+            .field("add_hosts", &self.add_hosts)
+            .field("dns", &self.dns)
             .field("generation", &self.generation)
             .finish()
     }
@@ -134,6 +158,9 @@ impl ContainerOptionsDocument {
             tmpfs,
             cap_drop: Vec::new(),
             read_only: false,
+            network: None,
+            add_hosts: Vec::new(),
+            dns: Vec::new(),
             generation: None,
         };
         doc.check_record_lengths()?;
@@ -191,6 +218,55 @@ impl ContainerOptionsDocument {
         Ok(self)
     }
 
+    /// `--network`・`--add-host`・`--dns` を持たせる(NET-6・NET-12・SUP-12・#3065)。
+    ///
+    /// 件数 → 1 件の長さ → net のパーサ(`NetworkOptions::parse`。復号でも同じ関門を通る)の順に検証し、
+    /// 文書全体の上限を `with_cap_drop` と同じ基準で再検査する。
+    pub fn with_network(
+        mut self,
+        network: Option<String>,
+        add_hosts: Vec<String>,
+        dns: Vec<String>,
+    ) -> Result<Self, TraitError> {
+        if add_hosts.len() > MAX_ADD_HOST_ENTRIES {
+            return Err(invalid("too many add-host records"));
+        }
+        if dns.len() > MAX_DNS_SERVERS {
+            return Err(invalid("too many dns records"));
+        }
+        if network
+            .as_ref()
+            .is_some_and(|s| s.len() > NETWORK_RECORD_MAX)
+            || add_hosts.iter().any(|s| s.len() > ADD_HOST_RECORD_MAX)
+            || dns.iter().any(|s| s.len() > DNS_RECORD_MAX)
+        {
+            return Err(invalid("an options record is too long"));
+        }
+        NetworkOptions::parse(network.as_deref(), &add_hosts, &dns)?;
+        self.network = network;
+        self.add_hosts = add_hosts;
+        self.dns = dns;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
+    /// `--network` の生の指定。
+    pub fn network(&self) -> Option<&str> {
+        self.network.as_deref()
+    }
+
+    /// `--add-host` の生の指定(`<host>:<ip>`)。
+    pub fn add_hosts(&self) -> &[String] {
+        &self.add_hosts
+    }
+
+    /// `--dns` の生の指定(IP)。
+    pub fn dns(&self) -> &[String] {
+        &self.dns
+    }
+
     /// `--read-only` が指定されたか。
     pub fn read_only(&self) -> bool {
         self.read_only
@@ -232,6 +308,9 @@ impl ContainerOptionsDocument {
             && self.tmpfs.is_empty()
             && self.cap_drop.is_empty()
             && !self.read_only
+            && self.network.is_none()
+            && self.add_hosts.is_empty()
+            && self.dns.is_empty()
     }
 
     /// 検証済みの [`ContainerOptions`] へ変換する(label・secrets・configs は含まない)。
@@ -264,9 +343,12 @@ impl ContainerOptionsDocument {
         }
         let cap_drop =
             parse_drop_list(&self.cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
+        // network 系は復号のたびに net のパーサで再検証する(未信頼の入力。NET-6・NET-12・#3065)。
+        let network = NetworkOptions::parse(self.network.as_deref(), &self.add_hosts, &self.dns)?;
         options = options
             .with_cap_drop(cap_drop)
-            .with_read_only(self.read_only);
+            .with_read_only(self.read_only)
+            .with_network(network);
         // 矛盾する指定(ファイルを読まない検査)をここで拒否する。
         options.tmpfs_set()?;
         Ok(options)
@@ -314,6 +396,15 @@ impl ContainerOptionsDocument {
         if self.read_only {
             put("read-only", "true");
         }
+        if let Some(s) = &self.network {
+            put("network", s);
+        }
+        for s in &self.add_hosts {
+            put("add-host", s);
+        }
+        for s in &self.dns {
+            put("dns", s);
+        }
         if let Some(s) = &self.generation {
             put("gen", s);
         }
@@ -332,6 +423,8 @@ impl ContainerOptionsDocument {
         let (mut ulimits, mut env, mut tmpfs) = (Vec::new(), Vec::new(), Vec::new());
         let mut cap_drop: Vec<String> = Vec::new();
         let mut read_only = false;
+        let mut network: Option<String> = None;
+        let (mut add_hosts, mut dns): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
         let mut generation: Option<String> = None;
         // 全体の上限があるため、レコード数は `new` の件数検査と合わせて有限。
@@ -366,6 +459,9 @@ impl ContainerOptionsDocument {
                 "tmpfs" => TMPFS_RECORD_MAX,
                 "cap-drop" => CAP_DROP_RECORD_MAX,
                 "read-only" => READ_ONLY_RECORD_MAX,
+                "network" => NETWORK_RECORD_MAX,
+                "add-host" => ADD_HOST_RECORD_MAX,
+                "dns" => DNS_RECORD_MAX,
                 "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
@@ -385,6 +481,13 @@ impl ContainerOptionsDocument {
                         return Err(invalid("a read-only record is invalid"));
                     }
                     if std::mem::replace(&mut read_only, true) {
+                        return Err(invalid("an options record is duplicated"));
+                    }
+                }
+                "add-host" => add_hosts.push(text),
+                "dns" => dns.push(text),
+                "network" => {
+                    if network.replace(text).is_some() {
                         return Err(invalid("an options record is duplicated"));
                     }
                 }
@@ -410,13 +513,16 @@ impl ContainerOptionsDocument {
                 || env.len() > ENV_MAX_ENTRIES
                 || tmpfs.len() > TMPFS_MAX_MOUNTS
                 || cap_drop.len() > MAX_DROP_NAMES
+                || add_hosts.len() > MAX_ADD_HOST_ENTRIES
+                || dns.len() > MAX_DNS_SERVERS
             {
                 return Err(invalid("too many options records"));
             }
         }
         let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
             .with_cap_drop(cap_drop)?
-            .with_read_only(read_only)?;
+            .with_read_only(read_only)?
+            .with_network(network, add_hosts, dns)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
@@ -739,5 +845,186 @@ tmpfs 14\n/run:rw,noexec\n";
         let mut bytes = d.encode();
         bytes.extend_from_slice(b"gen 1\nz\n");
         assert!(ContainerOptionsDocument::decode(&bytes).is_err());
+    }
+
+    fn net_doc(
+        network: Option<&str>,
+        hosts: &[&str],
+        dns: &[&str],
+    ) -> Result<ContainerOptionsDocument, TraitError> {
+        ContainerOptionsDocument::default().with_network(
+            network.map(str::to_owned),
+            hosts.iter().map(|s| (*s).to_owned()).collect(),
+            dns.iter().map(|s| (*s).to_owned()).collect(),
+        )
+    }
+
+    /// NET-6・NET-12(#3065): 符号化の具体値・往復。
+    #[test]
+    fn net6_options_document_network_records_encode_exact_and_round_trip() {
+        let d = net_doc(Some("none"), &["web:192.0.2.1"], &["127.0.0.1"]).expect("doc");
+        assert!(!d.is_empty());
+        let bytes = d.encode();
+        assert_eq!(
+            bytes,
+            b"FCOPT1\nnetwork 4\nnone\nadd-host 13\nweb:192.0.2.1\ndns 9\n127.0.0.1\n".to_vec()
+        );
+        assert_eq!(ContainerOptionsDocument::decode(&bytes).expect("decode"), d);
+    }
+
+    /// NET-6(#3065): `network` が無い文書(空・旧形式)は `FromConfig` になる。
+    #[test]
+    fn net6_options_document_without_network_is_from_config() {
+        use fandhe_container_core::oci_runtime::LaunchNetworkMode;
+        for bytes in [OPTIONS_DOC_MAGIC, b"FCOPT1\nipc 7\nprivate\n"] {
+            let o = ContainerOptionsDocument::decode(bytes)
+                .expect("decode")
+                .to_container_options()
+                .expect("opts")
+                .launch_options()
+                .expect("launch");
+            assert_eq!(o.network(), LaunchNetworkMode::FromConfig);
+        }
+    }
+
+    /// NET-6(#3065): `host` / `none` は LaunchOptions のモードに届く。
+    #[test]
+    fn net6_options_document_modes_reach_launch_options() {
+        use fandhe_container_core::oci_runtime::LaunchNetworkMode;
+        let mode = |b: &[u8]| {
+            ContainerOptionsDocument::decode(b)
+                .expect("decode")
+                .to_container_options()
+                .expect("opts")
+                .launch_options()
+                .expect("launch")
+                .network()
+        };
+        assert_eq!(mode(b"FCOPT1\nnetwork 4\nhost\n"), LaunchNetworkMode::Host);
+        assert_eq!(
+            mode(b"FCOPT1\nnetwork 4\nnone\n"),
+            LaunchNetworkMode::Loopback
+        );
+    }
+
+    /// NET-12(#3065・A1): 件数と 1 レコードの長さの境界を具体値で照合する。
+    #[test]
+    fn net12_options_document_network_limits() {
+        // add-host: 256 件は可、257 件は拒否(builder と復号)。
+        let h: Vec<String> = vec!["web:192.0.2.1".to_owned(); 256];
+        assert!(
+            ContainerOptionsDocument::default()
+                .with_network(Some("host".into()), h.clone(), vec![])
+                .is_ok()
+        );
+        let mut h257 = h.clone();
+        h257.push("web:192.0.2.1".into());
+        assert_eq!(
+            ContainerOptionsDocument::default()
+                .with_network(Some("host".into()), h257, vec![])
+                .expect_err("257")
+                .message(),
+            "too many add-host records"
+        );
+        let mut raw = Vec::from(&b"FCOPT1\nnetwork 4\nhost\n"[..]);
+        for _ in 0..257 {
+            raw.extend_from_slice(b"add-host 13\nweb:192.0.2.1\n");
+        }
+        assert_eq!(decode_err(&raw).message(), "too many options records");
+        // dns: 32 件は可、33 件は拒否。
+        let d32: Vec<String> = vec!["192.0.2.1".to_owned(); 32];
+        assert!(
+            ContainerOptionsDocument::default()
+                .with_network(Some("host".into()), vec![], d32.clone())
+                .is_ok()
+        );
+        let mut d33 = d32;
+        d33.push("192.0.2.1".into());
+        assert_eq!(
+            ContainerOptionsDocument::default()
+                .with_network(Some("host".into()), vec![], d33)
+                .expect_err("33")
+                .message(),
+            "too many dns records"
+        );
+        let mut raw = Vec::from(&b"FCOPT1\nnetwork 4\nhost\n"[..]);
+        for _ in 0..33 {
+            raw.extend_from_slice(b"dns 9\n192.0.2.1\n");
+        }
+        assert_eq!(decode_err(&raw).message(), "too many options records");
+        // add-host 299 バイト(253 + 1 + 45)は長さ検査を通り、300 バイトは拒否。
+        let host253 = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(61)
+        );
+        assert_eq!(host253.len(), 253);
+        let ip45 = "0000:0000:0000:0000:0000:ffff:192.168.100.228";
+        assert_eq!(ip45.len(), 45);
+        let ok299 = format!("{host253}:{ip45}");
+        assert_eq!(ok299.len(), 299);
+        assert!(net_doc(Some("host"), &[&ok299], &[]).is_ok());
+        let long300 = format!("{ok299}0");
+        assert_eq!(
+            net_doc(Some("host"), &[&long300], &[])
+                .expect_err("300")
+                .message(),
+            "an options record is too long"
+        );
+        // dns 45 / 46 バイト。
+        assert!(net_doc(Some("host"), &[], &[ip45]).is_ok());
+        let ip46 = format!("{ip45}0");
+        assert_eq!(
+            net_doc(Some("host"), &[], &[&ip46])
+                .expect_err("46")
+                .message(),
+            "an options record is too long"
+        );
+        // network 64 / 65 バイト。
+        let n64 = "a".repeat(64);
+        assert!(net_doc(Some(&n64), &[], &[]).is_ok());
+        let n65 = "a".repeat(65);
+        assert_eq!(
+            net_doc(Some(&n65), &[], &[]).expect_err("65").message(),
+            "an options record is too long"
+        );
+        // 復号側の 1 レコードの長さ検査。
+        let mut raw = Vec::from(&b"FCOPT1\nnetwork 65\n"[..]);
+        raw.extend_from_slice(n65.as_bytes());
+        raw.push(b'\n');
+        assert_eq!(decode_err(&raw).message(), "an options record is too long");
+    }
+
+    /// NET-6(#3065): `network` の重複は拒否する。
+    #[test]
+    fn net6_options_document_network_duplicate_rejected() {
+        let e = decode_err(b"FCOPT1\nnetwork 4\nnone\nnetwork 4\nhost\n");
+        assert_eq!(e.message(), "an options record is duplicated");
+    }
+
+    /// NET-12(#3065): 復号は net のパーサで再検証し、不正な値を拒否する。
+    #[test]
+    fn net12_options_document_network_invalid_rejected() {
+        let cases: Vec<(&[u8], ErrorCode)> = vec![
+            (b"FCOPT1\nnetwork 3\nWeb\n", ErrorCode::InvalidArgument),
+            (b"FCOPT1\nnetwork 6\nbridge\n", ErrorCode::InvalidArgument),
+            (
+                b"FCOPT1\nnetwork 4\nnone\ndns 7\n8.8.8.8\n",
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                b"FCOPT1\nnetwork 11\ncontainer:x\n",
+                ErrorCode::Unimplemented,
+            ),
+            (
+                b"FCOPT1\nadd-host 13\nweb:192.0.2.1\n",
+                ErrorCode::InvalidArgument,
+            ),
+        ];
+        for (bytes, code) in cases {
+            assert_eq!(decode_err(bytes).code(), code, "{bytes:?}");
+        }
     }
 }

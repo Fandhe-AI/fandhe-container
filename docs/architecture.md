@@ -80,6 +80,7 @@ flowchart TB
 
     cli --> core
     supervisor --> core
+    supervisor --> net
     compose_convert --> stack
 
     plugin_cri --> cri
@@ -140,6 +141,7 @@ cargo metadata --format-version 1 --no-deps | jq '[.packages[] | {name, deps: [.
 flowchart LR
     compose_convert["compose-convert"] -->|確定| stack
     supervisor -->|確定| core
+    supervisor -->|確定| net
     plugin_cri["plugin-cri"] -->|確定| cri
     plugin_cri -->|確定| net
     plugin_cri -->|確定| supervisor
@@ -179,7 +181,7 @@ flowchart LR
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定。担当 TASK と時期は #2451 で判断待ち: [volume-provider-implementation.md](design/volume-provider-implementation.md)） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
-| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`inspect` と `state` が `inspect::inspect` の `InspectReport` をそれぞれ `write_json` / `write_oci_state_json`（OCI Runtime Spec の state の項目だけ。#1903・CLI-1・SUP-11）で出す。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る。`start` の起動・受信の実装は `supervisor::start_client`、`stop` / `delete` の signaler・cgroup remover は `supervisor::control` / `supervisor::cgroup_remover` にあり、plugin-cri と共有する（#2434。CLI は薄い呼び出し層）（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`inspect` と `state` が `inspect::inspect` の `InspectReport` をそれぞれ `write_json` / `write_oci_state_json`（OCI Runtime Spec の state の項目だけ。#1903・CLI-1・SUP-11）で出す。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る。`start` の起動・受信の実装は `supervisor::start_client`、`stop` / `delete` の signaler・cgroup remover は `supervisor::control` / `supervisor::cgroup_remover` にあり、plugin-cri と共有する（#2434。CLI は薄い呼び出し層）（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core と net にのみ依存し、どちらも supervisor・cli に依存しないため循環しない） | 確定 |
 | `cli` → `oci` | `image ls`・`system df`・`image rm [--force]`・`image tag` が oci の管理 API（`image_management`）を呼ぶ（#2221・#2316・CLI-1・OCI-7・TASK-183。workspace 内 path 依存で実装済み。外部クレートの追加ではない。oci は cli に依存せず循環しない）。あわせて `create --image-root --image` / `delete`（`--image-root` は任意。#2499）が OCI-7 のコンテナ参照の登録・解除に `ImageStore` を使う（#2315。アダプタは cli 内）。コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みだが、在庫を埋める経路（pull → `ImageStore`）は `cri` の `OciImagePuller::pull` に配線済み（#2539。[pull-inventory-wiring.md](design/pull-inventory-wiring.md)）で、同じ root を `--image-root` に渡せば `image ls` 等から見える。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。pull していない root の観測値は `image ls` がヘッダのみ・`image rm` / `image tag` / `create --image` が `NOT_FOUND` | 確定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
@@ -190,7 +192,7 @@ flowchart LR
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
-| `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は `Cargo.toml` にまだ無い。依存の向きは feature を切らない通常の依存に確定〔#1870・[network-wiring.md](design/network-wiring.md) D5〕。辺は #3065 で足す） | 確定（辺は未追加） |
+| `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は #3065 で `Cargo.toml` に追加した。依存の向きは feature を切らない通常の依存に確定〔#1870・[network-wiring.md](design/network-wiring.md) D5〕。起動オプション文書 FCOPT1 の network・add-host・dns を復号のたびに net で再検証する用途も同じ辺を使う〔#3065・NET-6・NET-12〕。外部クレートの追加なし） | 確定 |
 | `plugin-cri` → `supervisor` | `CoreLifecycleRuntime` の `start`・`kill`・`stop` と `delete` の cgroup remover を CLI と同じ本番経路へ結線する（`supervisor::start_client`〔supervisor の bin の委譲 scope 起動と結果の受信〕・`control::production_signaler` / `production_stop_signaler`〔制御チャネル経由。stop の意図は SUP-9〕・`cgroup_remover`・`supervisor_log::remove_guarded_bounded_waiting`〔#2964。コンテナログと共有する期限つきの待ち〕・`logs`〔コンテナログの削除と起動時の回収〕・`container_options::store`。CLI の private 実装を複製せず移設して共有した。#2434・CRI-2・PLUG-1・SUP-1・SUP-9・REPAIR-1。workspace 内 path 依存で外部クレートの追加なし。辺は一方向で、supervisor は core にのみ依存するため循環しない。supervisor が core を既定 feature〔`plugin`〕で引くため、`-p fandhe-container-plugin-cri` のビルドでは feature 統合で core の `plugin` feature が有効になる。PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない） | 確定 |
 | `plugin-cri` → `net` | `NetworkPlugin` の実装（`netsetup`）が TASK-139 の統合 API（`create_network`・`attach_container`・`delete_network`）を呼ぶ（CRI-7・PLUG-1・NET-1〜NET-3・TASK-114.4・#460・MS-4。workspace 内 path 依存で外部クレートの追加なし。`net` は依存を持たない core 側ライブラリで、辺は一方向）。DNS ヘルパーの起動・停止（NET-5・NET-7）は未実装 | 確定 |
 | `gpu` の GPU-1〜4 以外を含む辺 | GPU-5・7・8 は境界表に明示判定なし、GPU-9 は「検討中」（`api-gpu.md`） | 未確定 |

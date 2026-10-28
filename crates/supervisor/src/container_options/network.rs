@@ -39,6 +39,21 @@ use fandhe_container_net::pasta::PastaPortForwards;
 /// `publish` がユーザー定義名の `network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "publish records require a user-defined network";
 /// 結線されていない指定の固定拒否文言。
+/// resolver にできない loopback 系のアドレスか(127.0.0.0/8・`::1`・IPv4-mapped / IPv4-compatible の loopback・
+/// 未指定アドレス)。ユーザー定義名の `--dns` の検証と resolv.conf の書き込み時の再検証が同じ関数を使う
+/// (コンテナの netns の loopback は resolver ではない。D1・NET-12)。
+pub fn is_loopback_like(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // `::ffff:a.b.c.d`(mapped)と `::a.b.c.d`(compatible)の埋め込み IPv4。
+                || v6.to_ipv4().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
 /// pasta 構成(ユーザー定義名)の既定の nameserver。pasta の `--dns-forward` と同じアドレス
 /// (rootless-network.md 12.7・network-wiring.md D9。net の `pasta_argv` の固定引数と同じ値)。
 pub const PASTA_DEFAULT_NAMESERVER: &str = "169.254.1.1";
@@ -150,7 +165,7 @@ impl NetworkOptions {
         }
         // pasta 構成の `--dns` は resolv.conf の nameserver になる。コンテナの netns の loopback は resolver ではない(D1)。
         if matches!(selection, Some(NetworkSelection::Named(_)))
-            && addrs.iter().any(IpAddr::is_loopback)
+            && addrs.iter().any(is_loopback_like)
         {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
@@ -322,12 +337,23 @@ mod tests {
         );
     }
 
-    /// NET-12・D1: ユーザー定義名の --dns に loopback は指定できない。
+    /// NET-12・D1: ユーザー定義名の --dns に loopback 系(mapped・compatible・未指定を含む)は指定できない。
     #[test]
     fn net12_named_dns_rejects_loopback() {
-        assert_eq!(code(p(Some("web"), &[], &["127.0.0.1"])), INV);
-        assert_eq!(code(p(Some("web"), &[], &["::1"])), INV);
-        assert_eq!(code(p(Some("web"), &[], &["192.0.2.53"])), None);
+        for bad in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert_eq!(code(p(Some("web"), &[], &[bad])), INV, "{bad}");
+        }
+        for ok in ["169.254.1.1", "1.1.1.1", "192.0.2.53", "2001:db8::53"] {
+            assert_eq!(code(p(Some("web"), &[], &[ok])), None, "{ok}");
+        }
     }
 
     /// NET-6・D1: `--network` の判定表。

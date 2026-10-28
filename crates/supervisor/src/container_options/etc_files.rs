@@ -83,6 +83,13 @@ fn write_contents(
                 ));
             }
         };
+        // 書き込み時にもユーザー定義名として再検証する(`apply_dns` は Host として走り loopback を許すため。NET-12)。
+        if named && network.dns().iter().any(super::network::is_loopback_like) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "dns on a user-defined network must not be a loopback address",
+            ));
+        }
         let mut dns: Vec<String> = network.dns().iter().map(ToString::to_string).collect();
         if named && dns.is_empty() {
             dns.push(super::network::PASTA_DEFAULT_NAMESERVER.to_owned());

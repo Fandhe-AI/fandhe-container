@@ -16,8 +16,19 @@
 # 並列で動く別の試験が起動した supervisor の JSON ログ（stderr）がその間に入り、全件 ok・rc=0 でも行全体の完全一致が
 # 外れて偽の missing-success-line になる（docs/design/container-log-removal-wait.md「繰り返し実行の記録」）。
 # `--logfile` は libtest 本体だけが開くファイルで（子プロセスは書けない）、結果ごとに `ok|failed|ignored <name>` を
-# 1 行ずつ書くため割り込まれない。`--logfile` は deprecated の警告を出すが rustc 1.99 で受理される。将来削除されたら
-# libtest が未知のオプションで rc≠0 になり失敗側へ倒れる（fail-closed）。代替の `--format json` は stable では使えない。
+# 1 行ずつ書くため割り込まれない。
+# `--logfile` の将来（#3036 で一次情報を確認。2026-10-28 時点）: Rust 1.86.0 で deprecated（rust-lang/rust#134283。
+# 警告は stderr に改行なしで出る）。1.99.0 でも受理され、削除の PR・予定は見つからない。代替の `--format json` / `junit` は
+# stable では使えず（`-Z unstable-options` が要る。rust-lang/rust#49359 は open）、結果をファイルへ書く
+# `--test-results-output`（rust-lang/rust#140805）も未マージ。toolchain は stable 追従のため nightly 前提の方式は採れない。
+# 切り替え方式: 当面は `--logfile` を使い続ける。受理されない toolchain ではループの前のプリフライト（`--list --logfile`）が
+# 固定の `reason=logfile-unsupported` で止める（毎回 `reason=exit` が COUNT 回並ぶ汎用失敗にしない）。採らない案:
+# stdout の `test <name> ... ok` 行での判定（#2962 の割り込みで偽の失敗が戻る）・`--test-threads=1`（再現条件の並列度が変わる）。
+# 移行先は安定化した stable の手段（#140805 の結果ファイル、または stable の `--format json` を jq で数える。後者なら
+# lib・LIBTEST_NAME モードでも `require_cmd jq` を足す）。見直しのきっかけ: (a) libtest の cli.rs から logfile を消す PR が
+# マージされた・Compatibility Notes に載った (b) #140805 がマージされ stable になった (c) #49359 が stable になった
+# (d) repeat-test が `reason=logfile-unsupported` で失敗した。SUCCESS_LINE モード（harness = false）は `--logfile` を
+# 渡さないため削除の影響を受けない。なお `--nocapture` も 1.88.0 で deprecated（`--no-capture` が推奨。置き換えは別件）。
 # stdout と stderr は別ファイルに取り、成功行・禁止行はストリームごとに照合する（試験自身の println と子の stderr が
 # 互いに割り込まない）。失敗時のダンプは見出しつきで 2 本を別に出すため、時系列の並びは失われる。
 # 残余: 同じストリームの別プロセスの書き込みが SUCCESS_LINE の途中に入る場合は救えない（libtest ハーネスは LIBTEST_NAME へ）。
@@ -53,7 +64,10 @@
 # 出力: 最終行（stdout）は lib が `passed=N failed=M count=C test=<TEST>`、結合試験が
 #   `passed=N failed=M count=C test_bin=<TEST_BIN>`。結合試験の失敗行は stderr に
 #   `FAIL: run i/N rc=R reason=<timeout|exit|missing-success-line|missing-libtest-ok|forbidden-line>`
-#   （lib も reason を出す。forbidden-line は `forbidden='<要素>'` を併記）。
+#   （lib も reason を出す。forbidden-line は `forbidden='<要素>'` を併記）。lib・LIBTEST_NAME はループの前に
+#   `--list --logfile` のプリフライトを行い、通れば `info: libtest_logfile=accepted`、失敗なら
+#   `FAIL: preflight rc=R reason=<logfile-unsupported|preflight-failed>` と stdout・stderr のダンプ、集計行
+#   `passed=0 failed=<COUNT> ...`（呼び出し側の「passed=count でなければ失敗」と矛盾させない）を出して exit 1。
 # 終了コード: 0 = 全回 passed / 1 = 失敗した回がある・想定外 / 2 = 入力不正。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,6 +218,46 @@ elif [ "${USER_SCOPE}" = 1 ]; then
   echo "info: user_scope=1 test_env_names=${TEST_ENV_NAMES}"
 else
   run cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} --no-run
+fi
+
+# プリフライト（#3036）: libtest が `--logfile` を受理するかをループの前に 1 回だけ確かめる。`--list` は試験を走らせない
+# （委譲スコープも TEST_ENV も不要）。削除後は未知のオプションで rc≠0 になるため、COUNT 回の汎用 `reason=exit` ではなく
+# 原因の分かる固定行で fail-closed に止める。ラベルは文言で決めるだけで、失敗にするかは rc とログの有無で決める。
+preflight_run() {
+  if [ -n "${SCOPE_BIN}" ]; then
+    "${SCOPE_BIN}" --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
+  elif [ -n "${TEST}" ]; then
+    cargo test -p "${PACKAGE}" --lib ${FEATURES:+--features "${FEATURES}"} -- --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
+  else
+    cargo test -p "${PACKAGE}" --test "${TEST_BIN}" ${FEATURES:+--features "${FEATURES}"} -- --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
+  fi
+}
+if [ "${#LOGARGS[@]}" -gt 0 ]; then
+  pre_o="${RUN_LIMITED_DIR}/preflight.out"
+  pre_e="${RUN_LIMITED_DIR}/preflight.err"
+  pre_rc=0
+  rm -f "${logf}"
+  run_limited "${RUN_TIMEOUT}" preflight_run || pre_rc=$?
+  if [ "${pre_rc}" -eq 0 ] && [ -f "${logf}" ]; then
+    echo "info: libtest_logfile=accepted"
+    rm -f "${logf}"
+  else
+    pre_reason="preflight-failed"
+    if cat "${pre_o}" "${pre_e}" 2>/dev/null | grep -F -- "Unrecognized option: 'logfile'" >/dev/null; then
+      pre_reason="logfile-unsupported"
+    fi
+    echo "FAIL: preflight rc=${pre_rc} reason=${pre_reason}" >&2
+    echo "--- preflight stdout ---" >&2
+    cat "${pre_o}" >&2 2>/dev/null || true
+    echo "--- preflight stderr ---" >&2
+    cat "${pre_e}" >&2 2>/dev/null || true
+    if [ -n "${TEST}" ]; then
+      echo "passed=0 failed=${COUNT} count=${COUNT} test=${TEST}"
+    else
+      echo "passed=0 failed=${COUNT} count=${COUNT} test_bin=${TEST_BIN}"
+    fi
+    exit 1
+  fi
 fi
 
 # 1 回分の実行。stdout・stderr は別ファイルへ溜めて照合する（run_limited はシェル関数も子として受ける）。

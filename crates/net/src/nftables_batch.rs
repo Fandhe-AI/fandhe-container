@@ -166,7 +166,7 @@ impl NfGenMsg {
 
     /// メッセージペイロード先頭から復号する。4 バイトを超える分（属性）は無視する。
     /// version は受信値を保持するだけで拒否しない。照合は呼び出し側が行う（送信側は `NftBatch::push_with`、
-    /// NEWRULE の echo は ack の `feed_rule_echo`。#2970）。
+    /// NEWRULE の echo は ack の `feed_rule_echo`、同期点の NEWGEN は ack の `feed_barrier`。#2970・#3039）。
     pub fn decode(payload: &[u8]) -> Result<Self, NetError> {
         let head = payload.get(..NFGENMSG_LEN).ok_or_else(|| {
             data_loss(format!(

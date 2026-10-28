@@ -26,6 +26,13 @@
 //!   （`nf_tables_getgen` が NEWGEN を unicast してから 0 を返し、`netlink_rcv_skb` が ACK を積む）。
 //!   NEWGEN を受けずに届いた errno 0 の ACK は GETGEN が実行された証拠にならないので `DataLoss`、
 //!   同期点の seq を持つそれ以外の type も `DataLoss` にする（カーネル応答の境界検査）
+//! - 同期点の NEWGEN は外部入力として nfgenmsg を echo と同じ粒度で照合する（#3039・NET-3・SEC-1）。
+//!   ペイロードは 4 バイト以上、version は `NFNETLINK_V0`、family は `NFPROTO_UNSPEC` でなければ `DataLoss`
+//!   （`nf_tables_fill_gen_info` が `nfnl_msg_put(..., AF_UNSPEC, NFNETLINK_V0, ...)` で固定するため。根拠の版と
+//!   行は下の「stable・distro との差」）。`res_id`（世代番号）・flags・属性（`NFTA_GEN_ID` 等。世代番号は
+//!   未使用。REPAIR-3）は見ない。同じ seq の 2 通目の NEWGEN と同期点の ACK / エラー後の NEWGEN も `DataLoss`
+//!   （`nf_tables_getgen` は NEWGEN を 1 通だけ unicast してから ACK が積まれる）。拒否は `Unknown`（上位は
+//!   quarantine 側）
 //! - 同期点が非 0 errno で拒否された場合（権限不足のバッチでは同期点も `EPERM`）も、その応答はバッチより後に
 //!   処理された要求への応答なので読み切りの印になる。失敗を集めていれば `Aborted`、なければ適用状態を
 //!   確認できないので `Unknown` にする
@@ -94,8 +101,31 @@
 //!
 //! 差: v5.15 の `nfnetlink_rcv_batch` は本体の `NLM_F_ACK`（L525）にしか errno 0 を積まず、v6.12 の BEGIN の ACK
 //! （L430-433）と END の ACK（L581-584）は無い。本実装は BEGIN / END に `NLM_F_ACK` を付けず errno 0 の ACK の到着を
-//! 判定に使わないので影響しない。範囲: 確かめたのは upstream のタグだけで、5.15.y の stable や distro（Ubuntu 等）の
-//! パッチは未確認。実カーネルでの観測は #1626（人間担当）。
+//! 判定に使わないので影響しない。
+//!
+//! ## stable・distro との差（#3039・NET-3・SEC-1・REPAIR-3）
+//!
+//! 同期点の NEWGEN（`nf_tables_fill_gen_info`）と echo（`nf_tables_fill_rule_info`）の形を、次の 6 版で
+//! `net/netfilter/nf_tables_api.c` / `nfnetlink.c` の一次情報から確かめた。どの版も NEWGEN は
+//! `nfnl_msg_put(skb, portid, seq, event, 0, AF_UNSPEC, NFNETLINK_V0, <世代番号>)`（family 0・version 0・
+//! res_id = 世代番号）で、`nf_tables_getgen` が NEWGEN を 1 通 unicast してから戻り、echo の送信条件
+//! （`ctx->report`・`NLM_F_ECHO`）・到着順（echo → ACK → 同期点）・echo の version 0・属性の並びも同じ。
+//!
+//! | 版（commit） | `nf_tables_fill_gen_info` / `nfnl_msg_put` | `nf_tables_getgen` の unicast |
+//! | --- | --- | --- |
+//! | upstream v5.15（`8bb7eca972ad531c9b149c0a51ab43a417385813`） | L7825 / L7833-7834 | L7927 |
+//! | upstream v6.12（`adc218676eef25575469234709c2d87185ca223a`） | L9218 / L9226-9227 | L9320 |
+//! | stable v5.15.223（`792fbe1537d8daeca9bd1917e84078b5432aadc2`） | L8502 / L8510-8511 | L8604 |
+//! | Ubuntu jammy `Ubuntu-5.15.0-203.213`（`b14aab7b783edc43be8c9f766561087b04fdfcba`。5.15.223 相当） | L8552 / L8560-8561 | L8654 |
+//! | stable v6.12.114（`85d82e0d7c2dfd3e75d34f35b7ebbf41f45c9c4e`） | L9294 / L9301-9302 | L9395 |
+//! | Ubuntu noble `Ubuntu-6.8.0-149.149`（`6dcf89bf9d1650d117680189bf4bbb596af7ab84`。6.8.12 相当） | L9097 / L9104-9105 | L9198 |
+//!
+//! 版による差は 2 つだけで、どちらも本実装の判定に影響しない。(a) BEGIN / END への errno 0 の ACK は v6.12 系にだけ
+//! あり、5.15 系と Ubuntu 6.8 には無い（判定に使わない）。(b) `res_id` を作る関数が v5.15 系の `nft_base_seq()` と
+//! v6.12.114・Ubuntu 6.8 の `nft_base_seq_be16()` で違う（意味は同じで、`res_id` は照合しない）。
+//!
+//! 未確認: Debian・RHEL 系などほかの distro、Ubuntu 24.04 の HWE（6.8 より新しい版）、6.1.y・6.6.y の stable、
+//! 各 distro の今後のパッチ。実カーネルでの観測は #1626（人間担当）。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -109,8 +139,8 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink::{NLMSG_ERROR, NLMSG_NOOP, NlMsgIter};
 use crate::netlink_route::{classify_errno, decode_nlmsgerr};
 use crate::nftables_batch::{
-    NFGENMSG_LEN, NFNETLINK_V0, NFNL_SUBSYS_NFTABLES, NfGenMsg, NftBatchBytes, RuleEchoExpect,
-    nfnl_msg_type,
+    NFGENMSG_LEN, NFNETLINK_V0, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC, NfGenMsg, NftBatchBytes,
+    RuleEchoExpect, nfnl_msg_type,
 };
 use crate::nftables_rules::{NFT_MSG_NEWRULE, NftRuleHandle, rule_table_chain_attrs};
 
@@ -566,6 +596,9 @@ impl NftBatchAckCollector {
 
     /// 同期点の seq を持つ 1 メッセージを判定する（応答は NEWGEN → errno 0 の ACK の順）。
     ///
+    /// NEWGEN は nfgenmsg の version が `NFNETLINK_V0`・family が `NFPROTO_UNSPEC` であることを照合し、
+    /// 重複や ACK / エラー後の到着とあわせて `DataLoss` / `Unknown` で拒否する（#3039・NET-3・SEC-1）。
+    ///
     /// errno 0 の ACK は、先に NEWGEN を受けていた場合だけ同期点の完了とする。GETGEN の応答を積めなかった
     /// 場合は `nf_tables_getgen` がエラーを返し ACK が非 0 errno になるため、NEWGEN なしの errno 0 は
     /// 想定外の応答として扱う。非 0 errno は読み切りの印として記録し、判定は [`Self::conclude`] に委ねる。
@@ -577,6 +610,24 @@ impl NftBatchAckCollector {
     ) -> Result<(), NftBatchError> {
         match msg_type {
             NEWGEN_TYPE => {
+                // 2 通目の NEWGEN と、同期点の ACK / エラーの後の NEWGEN は順序が崩れた応答（#3039）。
+                if self.barrier_gen_seen || self.barrier_reply.is_some() {
+                    return Err(self.unknown(data_loss(format!(
+                        "duplicate or late generation reply for sync seq {seq}"
+                    ))));
+                }
+                // nfgenmsg は echo と同じ粒度で照合する（version 0・family 0。res_id・属性は見ない。#3039）。
+                let nfg = NfGenMsg::decode(payload).map_err(|e| self.unknown(e))?;
+                if nfg.version() != NFNETLINK_V0 {
+                    return Err(self.unknown(data_loss(format!(
+                        "sync generation reply for seq {seq} has unexpected nfnetlink version"
+                    ))));
+                }
+                if nfg.family() != NFPROTO_UNSPEC {
+                    return Err(self.unknown(data_loss(format!(
+                        "sync generation reply for seq {seq} has unexpected family"
+                    ))));
+                }
                 self.barrier_gen_seen = true;
                 Ok(())
             }
@@ -970,9 +1021,61 @@ mod tests {
 
     /// 同期点への応答 `NFT_MSG_NEWGEN`（type 0x0A0F。属性は省略）。
     fn newgen(seq: u32) -> Vec<u8> {
+        newgen_with(seq, &[0, 0, 0x01, 0x02])
+    }
+
+    /// nfgenmsg の生バイトを指定できる NEWGEN（family, version, res_id の順）。
+    fn newgen_with(seq: u32, nfgenmsg: &[u8]) -> Vec<u8> {
         let mut b = NlMsgBuilder::new(0x0A0F, 0, seq, 0);
-        b.put_fixed(&[0, 0, 0, 0]).expect("nfgenmsg");
+        b.put_fixed(nfgenmsg).expect("nfgenmsg");
         b.finish().expect("finish")
+    }
+
+    /// NET-3・SEC-1・#3039: 同期点の NEWGEN の nfgenmsg が想定外なら DataLoss / Unknown で拒否する。
+    #[test]
+    fn net3_sec1_newgen_nfgenmsg_mismatch_is_data_loss() {
+        let cases: [(&[u8], &str); 3] = [
+            (
+                &[0, 1, 0, 0],
+                "sync generation reply for seq 103 has unexpected nfnetlink version",
+            ),
+            (
+                &[1, 0, 0, 0],
+                "sync generation reply for seq 103 has unexpected family",
+            ),
+            (&[0, 0, 0], "payload too short for nfgenmsg: 3 bytes"),
+        ];
+        for (nfg, msg) in cases {
+            let mut c = NftBatchAckCollector::new(&batch(1));
+            assert_eq!(c.feed(&ok(101)).expect("feed"), Progress::Decided);
+            c.set_barrier(103);
+            let e = c.feed(&newgen_with(103, nfg)).expect_err("nfgenmsg");
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+            assert_eq!(e.message(), msg);
+            assert!(!c.barrier_reached());
+        }
+    }
+
+    /// NET-3・SEC-1・#3039: 同じ seq の 2 通目の NEWGEN と、ACK の後の NEWGEN は拒否する。
+    #[test]
+    fn net3_sec1_duplicate_or_late_newgen_is_data_loss() {
+        let want = "duplicate or late generation reply for sync seq 103";
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        c.feed(&newgen(103)).expect("first");
+        let e = c.feed(&newgen(103)).expect_err("dup");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
+        assert_eq!(e.message(), want);
+
+        let mut c = NftBatchAckCollector::new(&batch(1));
+        c.set_barrier(103);
+        c.feed(&newgen(103)).expect("first");
+        c.feed(&ok(103)).expect("ack");
+        let e = c.feed(&newgen(103)).expect_err("late");
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.message(), want);
     }
 
     /// NET-11: 同期点の応答は NEWGEN（0x0A0F）→ errno 0 の ACK の順で完了する。NEWGEN だけでは未完了。

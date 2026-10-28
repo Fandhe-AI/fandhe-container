@@ -429,7 +429,14 @@ impl CriRuntimeService {
         }
         let mut accepted: Vec<(String, ContainerRecord)> = Vec::new();
         let mut keys: HashSet<(String, String, u32)> = HashSet::new();
+        let mut retained_total: usize = 0;
         for ListedRecord { id, outcome } in listing.records {
+            // 読み取り失敗・復号失敗・親不在の分岐も含め、毎回先頭で全体期限を検査する（REPAIR-5）。
+            if start.elapsed() >= budget.total {
+                let e = CriError::timeout("container record readoption timed out");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
             let one = Instant::now();
             let bytes = match outcome {
                 Ok(b) => b,
@@ -514,6 +521,17 @@ impl CriRuntimeService {
                     data.applied_user.as_ref(),
                     data.resolved_image.as_ref(),
                 ));
+            // 復号後の保持量を逐次積算し、accepted へ載せる前に上限超過を拒否する（OOM 防止）。
+            let next_total = retained_total.checked_add(retained_bytes);
+            if accepted.len() >= self.container_limits.max_containers()
+                || next_total.is_none_or(|t| t > self.container_limits.max_retained_bytes())
+            {
+                let e =
+                    CriError::failed_precondition("container records exceed the configured limits");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+            retained_total = next_total.unwrap_or(retained_total);
             match bucket {
                 Bucket::Present => result.present += 1,
                 Bucket::AbsentExited => result.absent_exited += 1,
@@ -543,13 +561,9 @@ impl CriRuntimeService {
             self.record_load(Code::Ok, one);
         }
 
-        let total = accepted
-            .iter()
-            .try_fold(0usize, |acc, (_, r)| acc.checked_add(r.retained_bytes));
-        let over = accepted.len() > self.container_limits.max_containers()
-            || total.is_none_or(|t| t > self.container_limits.max_retained_bytes());
-        if over {
-            let e = CriError::failed_precondition("container records exceed the configured limits");
+        // 登録前にも全体期限を検査する（期限切れは起動失敗で registry を変えない。REPAIR-5）。
+        if start.elapsed() >= budget.total {
+            let e = CriError::timeout("container record readoption timed out");
             self.record_load(e.code().grpc_code(), start);
             return Err(e);
         }
@@ -564,7 +578,7 @@ impl CriRuntimeService {
                     "container registry is not empty",
                 ));
             }
-            registry.container_retained_bytes = total.unwrap_or(0);
+            registry.container_retained_bytes = retained_total;
             for (id, record) in accepted {
                 if let Some(m) = record.config.metadata.as_ref() {
                     registry.container_keys.insert((
@@ -1634,6 +1648,54 @@ mod tests {
         assert_eq!(err.code().grpc_code(), Code::DeadlineExceeded);
         assert!(csnap(&e.svc).is_empty());
         assert_eq!(*e.store.calls.lock().unwrap(), (0, 0));
+    }
+
+    /// REPAIR-5: 壊れた記録だけの経路でも全体期限を検査し、期限切れなら registry を変えず失敗する。
+    #[test]
+    fn repair5_container_readopt_deadline_checked_on_broken_path() {
+        let broken = ListedRecord {
+            id: RecordId::new(&id('9')).unwrap(),
+            outcome: Ok(b"junk".to_vec()),
+        };
+        let e = env(
+            vec![
+                cok(&cdata('1', "c1", None, ContainerState::Running)),
+                broken,
+            ],
+            &[(id('1'), Core::Running)],
+        );
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        let budget = ListBudget {
+            per_record: Duration::from_secs(1),
+            total: Duration::ZERO,
+        };
+        let err = e.svc.readopt_containers(budget).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::DeadlineExceeded);
+        assert!(csnap(&e.svc).is_empty());
+    }
+
+    /// REPAIR-5: 保持量の積算が上限を超えた時点で拒否する（2 件目で超過）。
+    #[test]
+    fn repair5_container_readopt_cumulative_bytes_rejected_incrementally() {
+        let recs = vec![
+            cok(&cdata('1', "c1", None, ContainerState::Running)),
+            cok(&cdata('2', "c2", None, ContainerState::Running)),
+        ];
+        let core = [(id('1'), Core::Running), (id('2'), Core::Running)];
+        let one = {
+            let e = env(recs[..1].to_vec(), &core);
+            readopt_all(&e).unwrap();
+            e.svc.registry.lock().unwrap().container_retained_bytes
+        };
+        let e = env_with(vec![ok(&data('a', "p"))], recs, &core, true, |s| {
+            s.with_container_limits(
+                super::super::ContainerLimits::new().with_max_retained_bytes(one + 1),
+            )
+        });
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        let err = e.svc.readopt_containers(ListBudget::default()).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::FailedPrecondition);
+        assert!(csnap(&e.svc).is_empty());
     }
 
     /// REPAIR-4: 要約行は固定語彙で、ID を含まない。

@@ -117,6 +117,7 @@ mod device_probe;
 mod devices;
 mod diagnostic;
 mod entrypoint_mode;
+mod etc_mounts;
 mod exec_command;
 mod inject;
 mod interpreter;
@@ -184,6 +185,7 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
+pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
     ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
     spawn_exec_worker_with_listener,
@@ -213,6 +215,10 @@ pub use launch_status::relay_entrypoint_violation_for_test;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_exec_returned_for_test;
+/// 結合試験 `tests/launch_landlock_audit.rs` 専用の再公開（SEC-1・SEC-4・CORE-5・#2130。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_landlock_failure_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -564,6 +570,38 @@ pub(crate) fn record_launch_mount_rejection_at<E>(
     }
 }
 
+/// launcher の `plan()` / `plan_rootless_subordinate()` が子を fork する前に拒否した計画の違反（種別 `PlanRejected`。
+/// `no_namespaces`・`user_namespace_required`・`host_root_identity_mapping` 等）を、層 `mount` のパスなし・理由コードつきの
+/// レコードとして 1 件記録して返す（SEC-1・SEC-4・#2130）。
+///
+/// 呼び出し元は本番 launcher（`oci_runtime::ProductionLauncher` の `spawn`）だけで、`plan` の呼び出しはそこの 1 か所に
+/// 限る（二重記録を避けるため、共有の写像 `mount_layer_audit_event` は `PlanRejected` を記録しないまま専用の
+/// `launch_plan_audit_event` を使う）。`PlanRejected` 以外・違反なしのエラーは記録せず `NotApplicable`。時刻と PID は
+/// 記録を行った親のもの。記録の成否で `error` は変わらない（fail-closed）。
+pub(crate) fn record_launch_plan_rejection(
+    error: ExecError,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = error
+        .violation
+        .as_ref()
+        .and_then(|v| v.reason.launch_plan_audit_event());
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(error.stage.into()),
+                sink,
+                None,
+            );
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
 /// エントリポイント検証の違反を `Entrypoint` 監査レコードとして記録する（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
 ///
 /// `err.violation` が種別 `Entrypoint` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層・exec 対象の違反・
@@ -643,15 +681,18 @@ pub enum Namespace {
     Ipc,
     /// user namespace。
     User,
+    /// network namespace（Loopback モード。新しい netns に入り `lo` だけを up にする。NET-6・CORE-6・#3064）。
+    Net,
 }
 
 impl Namespace {
-    const ALL: [Namespace; 5] = [
+    const ALL: [Namespace; 6] = [
         Namespace::Pid,
         Namespace::Mount,
         Namespace::Uts,
         Namespace::Ipc,
         Namespace::User,
+        Namespace::Net,
     ];
 
     fn flag(self) -> NsFlag {
@@ -661,6 +702,7 @@ impl Namespace {
             Self::Uts => NsFlag::Uts,
             Self::Ipc => NsFlag::Ipc,
             Self::User => NsFlag::User,
+            Self::Net => NsFlag::Net,
         }
     }
 
@@ -671,6 +713,7 @@ impl Namespace {
             Self::Uts => 2,
             Self::Ipc => 3,
             Self::User => 4,
+            Self::Net => 5,
         }
     }
 }
@@ -685,7 +728,7 @@ impl NamespaceSet {
         Self(0)
     }
 
-    /// 5 種すべて。
+    /// 6 種すべて（`Net` を含む）。
     pub fn all() -> Self {
         Namespace::ALL
             .iter()
@@ -877,11 +920,15 @@ pub enum IsolationStage {
     ApplySysctls,
     /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true`。`mount_setattr(MOUNT_ATTR_RDONLY)`。CORE-5・SEC-1・#2767）。
     RootReadOnly,
+    /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
+    MountEtcFiles,
+    /// 新しい network namespace の `lo` を up にする `ioctl(SIOCSIFFLAGS)`（NET-6・CORE-6・#3064）。
+    LoopbackUp,
 }
 
 impl IsolationStage {
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 33] = [
         Self::Validate,
         Self::Unshare,
         Self::SetGroups,
@@ -913,6 +960,8 @@ impl IsolationStage {
         Self::WorkingDir,
         Self::ApplySysctls,
         Self::RootReadOnly,
+        Self::MountEtcFiles,
+        Self::LoopbackUp,
     ];
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
@@ -947,10 +996,12 @@ impl IsolationStage {
             Self::MountReadonlyPaths => "mount_readonly_paths",
             Self::MountMaskedPaths => "mount_masked_paths",
             Self::MountBinds => "mount_binds",
+            Self::MountEtcFiles => "mount_etc_files",
             Self::MountSysfs => "mount_sysfs",
             Self::WorkingDir => "working_dir",
             Self::ApplySysctls => "apply_sysctls",
             Self::RootReadOnly => "root_read_only",
+            Self::LoopbackUp => "loopback_up",
         }
     }
 }
@@ -2410,6 +2461,20 @@ fn unshare_and_configure(
         write_proc_self("gid_map", &gid.to_map_line(), IsolationStage::GidMap)?;
     }
 
+    // Loopback モード（NET-6・#3064）: 新しい netns は `lo` が down で生まれ、down のままだと自己宛て配送が
+    // 落ちる（#1927・#2077）。netns を所有する user namespace の全 capability が使える今のうちに up にする。
+    // 範囲写像の経路では holder の user namespace へ `setns` した後の `rest` の unshare で来るため、この 1 か所で
+    // 両経路を満たす。pin はしない（netns は PID 1 と一緒に消える）。
+    if namespaces.contains(Namespace::Net) {
+        sys::set_loopback_up().map_err(|e| {
+            ExecError::from_sys(
+                e,
+                IsolationStage::LoopbackUp,
+                "bring the loopback interface up",
+            )
+        })?;
+    }
+
     if namespaces.contains(Namespace::Mount) {
         sys::mount_root_recursive(root_propagation).map_err(|e| {
             let what = match root_propagation {
@@ -3011,6 +3076,8 @@ mod tests {
             IsolationStage::WorkingDir => 28,
             IsolationStage::ApplySysctls => 29,
             IsolationStage::RootReadOnly => 30,
+            IsolationStage::MountEtcFiles => 31,
+            IsolationStage::LoopbackUp => 32,
         }
     }
 
@@ -3027,7 +3094,7 @@ mod tests {
             );
             assert!(seen.insert(token), "duplicate {token}");
         }
-        assert_eq!(IsolationStage::ALL.len(), 31);
+        assert_eq!(IsolationStage::ALL.len(), 33);
         assert_eq!(
             IsolationStage::MountReadonlyPaths.as_str(),
             "mount_readonly_paths"
@@ -3298,7 +3365,7 @@ mod tests {
         assert!(status.success(), "{output}");
     }
 
-    /// CORE-1: 5 種の集合と単体の所属判定。
+    /// CORE-1: 6 種の集合と単体の所属判定。
     #[test]
     fn core1_namespace_set_membership() {
         let all = NamespaceSet::all();
@@ -3309,7 +3376,7 @@ mod tests {
         assert!(NamespaceSet::empty().is_empty());
         // 単体フラグの合成値（sys の具体値と一致）
         let bits = all.flags().iter().fold(0i32, |a, f| a | f.bits());
-        assert_eq!(bits, 0x3C02_0000);
+        assert_eq!(bits, 0x7C02_0000);
     }
 
     /// CORE-1: hostname の受理例。

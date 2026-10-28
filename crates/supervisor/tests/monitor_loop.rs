@@ -29,9 +29,9 @@ fn sup1_task157_4_run_rs_has_no_global_state_or_raw_pid_access() {
     }
 }
 
-/// AC2: 依存は core への path 依存のみ（新規依存・中央デーモン用の仕組みを持たない）。
+/// AC2: 依存は workspace 内の path 依存（core と、#3065 で足した net の一方向）のみ。外部クレート・中央デーモン用の仕組みを持たない。
 #[test]
-fn sup1_task157_4_manifest_has_only_core_dependency() {
+fn sup1_task157_4_manifest_has_only_workspace_path_dependencies() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     let deps = MANIFEST.split("[dependencies]").nth(1).unwrap_or("");
     // `[dependencies]` 節のみを対象にする（後続の `[[test]]` 等のテーブルは依存ではない）。
@@ -41,7 +41,13 @@ fn sup1_task157_4_manifest_has_only_core_dependency() {
         .take_while(|l| !l.starts_with('['))
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    assert_eq!(entries, ["fandhe-container-core = { path = \"../core\" }"]);
+    assert_eq!(
+        entries,
+        [
+            "fandhe-container-core = { path = \"../core\" }",
+            "fandhe-container-net = { path = \"../net\" }",
+        ]
+    );
 }
 
 /// TASK-157.5 AC2: 未実装の restart ポリシー詳細が将来仕様と ID 付きで doc に明記されている。

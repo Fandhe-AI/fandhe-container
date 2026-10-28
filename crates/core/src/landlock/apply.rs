@@ -42,10 +42,10 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`）は `exec/landlock.rs` の写像で
-//!   SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みだが、監査の記録先（親の `AuditSink`）へ
-//!   運ぶ経路は未実装（pivot 後の段の違反を親へ届ける経路が無い。`docs/design/audit-delivery.md`・#2023〜#2028・#2004、
-//!   #2013 と同種の欠落）
+//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`・`MountNotReadOnly`）は
+//!   `exec/landlock.rs` の写像で SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みで、launch 経路は
+//!   親の `AuditSink` まで配線済み（子が状態 pipe に `E landlock ...` を書き、親が層 `mount` に記録する。#2130）。
+//!   未実装なのは exec の再適用（`NotRecorded`）での識別子の照合と、その違反の配送（識別子の永続化が前提。後続 issue）
 //! - ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
 //!   なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
 

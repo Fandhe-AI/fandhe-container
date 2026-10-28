@@ -15,6 +15,8 @@
 //! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
+//! | `network` | start が予約前に config の network エントリと突き合わせ(D7。`network_mode.rs`)、launcher が spec と照合する。`Loopback` は新しい netns と `lo` の up を伴う(#3064。NET-6・SEC-1・#3058) |
+//! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約
@@ -38,8 +40,10 @@
 
 use crate::capabilities::CapabilitySet;
 use crate::dev_mounts::ImplicitDevMounts;
+use crate::etc_files::{EtcFileSelection, check_etc_overlaps};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
+use crate::oci_runtime::network_mode::LaunchNetworkMode;
 use crate::rlimits::Rlimits;
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
 use crate::traits::types::{ErrorCode, TraitError};
@@ -68,6 +72,10 @@ pub struct LaunchOptions {
     capability_drop: CapabilitySet,
     /// `--read-only`(true なら config の値によらず root を読み取り専用にする。false なら config に従う)。
     root_readonly: bool,
+    /// network namespace の扱い(既定 `FromConfig`。NET-6・SEC-1・#3058)。
+    network: LaunchNetworkMode,
+    /// 管理ルート(`@container-etc/<id>`)の生成物のうち rootfs へ bind する種別(空なら載せない。NET-12・#1872)。
+    etc_files: EtcFileSelection,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -81,6 +89,8 @@ impl std::fmt::Debug for LaunchOptions {
             .field("env_count", &self.env.len())
             .field("capability_drop", &self.capability_drop)
             .field("root_readonly", &self.root_readonly)
+            .field("network", &self.network)
+            .field("etc_files", &self.etc_files)
             .finish()
     }
 }
@@ -133,6 +143,8 @@ impl LaunchOptions {
             env: Vec::new(),
             capability_drop: CapabilitySet::empty(),
             root_readonly: false,
+            network: LaunchNetworkMode::FromConfig,
+            etc_files: EtcFileSelection::default(),
         })
     }
 
@@ -157,6 +169,30 @@ impl LaunchOptions {
     pub fn with_root_readonly(mut self, root_readonly: bool) -> Self {
         self.root_readonly = root_readonly;
         self
+    }
+
+    /// network namespace の扱いを持たせる(NET-6・SEC-1・#3058)。config との突き合わせは start が予約前に行い、
+    /// `Host` は起動オプションだけで選べる(config.json からは選べない)。
+    #[must_use]
+    pub fn with_network(mut self, network: LaunchNetworkMode) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// 管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を rootfs へ bind する種別を持たせる(NET-12・#1872)。
+    ///
+    /// 生成は [`crate::etc_files::create_etc_files`] が行い(supervisor の start。#1873)、launcher は launch のたびに
+    /// 生成物を fd で検証してから載せる。指定した種別の宛先(`/etc/hosts`・`/etc/resolv.conf`)と、tmpfs・注入ディレクトリの
+    /// 同一・祖先・子孫の重なりは `InvalidArgument` で拒否する(bind mount との重なりは launcher が fork 前に検査する)。
+    pub fn with_etc_files(mut self, etc_files: EtcFileSelection) -> Result<Self, TraitError> {
+        check_etc_overlaps(
+            etc_files,
+            &self.tmpfs,
+            (!self.inject.is_empty()).then_some(&self.inject),
+            None,
+        )?;
+        self.etc_files = etc_files;
+        Ok(self)
     }
 
     /// `--env` の上書きを持たせる。core は supervisor の検証を信用せず、件数・長さ・形式(`KEY=VALUE`・キー非空・
@@ -211,6 +247,16 @@ impl LaunchOptions {
         self.root_readonly
     }
 
+    /// network namespace の扱い。
+    pub fn network(&self) -> LaunchNetworkMode {
+        self.network
+    }
+
+    /// rootfs へ bind する管理ルートの生成物の種別(既定は空)。
+    pub fn etc_files(&self) -> EtcFileSelection {
+        self.etc_files
+    }
+
     /// `--cap-drop` で除く capability の集合。
     pub fn capability_drop(&self) -> CapabilitySet {
         self.capability_drop
@@ -260,6 +306,16 @@ mod tests {
     use super::*;
     use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
     use crate::tmpfs::{TmpfsMountSpec, TmpfsSize};
+
+    /// NET-6(#3058): network の既定は `FromConfig`、`with_network` で往復し、`Debug` に出る。
+    #[test]
+    fn net6_network_mode_defaults_to_from_config_and_round_trips() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert_eq!(opts.network(), LaunchNetworkMode::FromConfig);
+        let opts = opts.with_network(LaunchNetworkMode::Host);
+        assert_eq!(opts.network(), LaunchNetworkMode::Host);
+        assert!(format!("{opts:?}").contains("network: Host"));
+    }
 
     fn set_of(dests: &[&str]) -> TmpfsMountSet {
         let mut set = TmpfsMountSet::new();
@@ -448,5 +504,35 @@ mod tests {
         let text = format!("{o:?}");
         assert!(!text.contains("TOPSECRETVALUE"), "{text}");
         assert!(text.contains("<redacted 14 bytes>"), "{text}");
+    }
+
+    /// NET-12・A6: 既定では etc_files は空(従来の launch の挙動を変えない)。
+    #[test]
+    fn net12_launch_options_default_has_no_etc_files() {
+        assert!(
+            LaunchOptions::try_default()
+                .expect("default")
+                .etc_files()
+                .is_empty()
+        );
+    }
+
+    /// NET-12: etc_files は指定どおり保持され、`/etc` の tmpfs・`/etc/hosts` の注入ディレクトリとの重なりは拒否する。
+    #[test]
+    fn net12_launch_options_etc_files_keeps_selection_and_rejects_overlap() {
+        use crate::etc_files::{EtcFileKind, EtcFileSelection};
+        let sel = EtcFileSelection::default().with(EtcFileKind::Hosts);
+        let ok = LaunchOptions::try_default()
+            .expect("default")
+            .with_etc_files(sel)
+            .expect("ok");
+        assert_eq!(ok.etc_files().kinds(), vec![EtcFileKind::Hosts]);
+
+        let mut tmpfs = set_of(&["/etc"]);
+        tmpfs.ensure_default_dev_shm().expect("shm");
+        let opts = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("opts");
+        let err = opts.with_etc_files(sel).expect_err("overlap");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 }

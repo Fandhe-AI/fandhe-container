@@ -58,7 +58,7 @@
 //! `ExecChildStep` の doc の表を正とする（要点: exec の `execveat` は本モジュールの `X`、`report_ready` は `R` を書けない
 //! 場合、`close_fds` から `stdio_null` の 11 段は本モジュールの `E` 行と同じトークンで運ぶ共有の段
 //! （[`LAUNCH_SHARED_EXEC_CHILD_STEPS`]。#2895）。`parent_lifetime`・`cgroup_join`・`report_ready`・`execveat` は
-//! `E` 行では受けない。launch だけの段は `verify_caller`・`restriction_evidence`・`verify_root` の 3 つ。
+//! `E` 行では受けない。launch だけの段は `verify_caller`・`restriction_evidence`・`verify_root`・`landlock` の 4 つ（`landlock` は Landlock 段の照合の違反 3 理由を運ぶ。#2130）。
 //! `F <step>` の 14 段に対応する exec の段は無い）。
 //!
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
@@ -111,6 +111,8 @@ pub(super) enum PrePivotStep {
     MountTmpfs,
     /// ファイルの注入。
     InjectFiles,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount（`LaunchOptions::etc_files` の指定時のみ。NET-12・#1872）。
+    EtcFiles,
     /// 検証済み bind mount の適用（指定時のみ。#1914）。user namespace 由来の 2 理由（SEC-5。
     /// `ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS`）は、この段に限って許可リストに入り、
     /// 親へ届いて層 `mount` に記録される（#2072）。他の段では `Malformed`。
@@ -128,7 +130,7 @@ pub(super) enum PrePivotStep {
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -137,6 +139,7 @@ impl PrePivotStep {
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
+        Self::EtcFiles,
         Self::MountBinds,
         Self::ReadonlyPaths,
         Self::MaskedPaths,
@@ -156,6 +159,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
+            Self::EtcFiles => "etc_files",
             Self::MountBinds => "mount_binds",
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
@@ -179,6 +183,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
+            Self::EtcFiles => IsolationStage::MountEtcFiles,
             Self::MountBinds => IsolationStage::MountBinds,
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
@@ -400,6 +405,19 @@ pub(super) fn read_pre_pivot_status(
     PrePivotStatus::decode(buf.get(..end).unwrap_or(&[]))
 }
 
+/// [`read_pre_pivot_status`] の、1 行目の後ろのバイトを取り込まない版（listener を受け取る launch 経路用。SEC-4・#2130）。
+///
+/// Landlock 段の失敗の `E landlock ...` は ACK の手順を経ずに `P` の直後に書かれ得るため、1 回の `read` で 2 行が
+/// 混ざって `Malformed` になるのを避け、1 バイトずつ LF まで読む。後続のバイトは続く
+/// `read_exec_phase_until_close` が厳格に復号する（余分な行は `Malformed`）。それ以外は [`read_pre_pivot_status`] と同じ。
+pub(super) fn read_pre_pivot_status_leaving_tail(
+    status: &std::fs::File,
+    timeout: Duration,
+) -> Result<PrePivotStatus, PrePivotStatusError> {
+    let (buf, end) = read_line_inner::<PRE_PIVOT_STATUS_MAX_BYTES>(status, timeout, true)?;
+    PrePivotStatus::decode(buf.get(..end).unwrap_or(&[]))
+}
+
 /// pipe から LF 終端の 1 行を、全体で `timeout`・最大 `N` バイトの範囲で読む（REPAIR-5）。
 ///
 /// 戻り値は `(バッファ, LF を含む行の長さ)`。行の後ろに余分なバイトがあれば `Malformed`、`N` バイト以内に LF が
@@ -408,6 +426,17 @@ pub(super) fn read_pre_pivot_status(
 pub(super) fn read_line_bounded<const N: usize>(
     pipe: &std::fs::File,
     timeout: Duration,
+) -> Result<([u8; N], usize), PrePivotStatusError> {
+    read_line_inner::<N>(pipe, timeout, false)
+}
+
+/// [`read_line_bounded`] の本体。`single_byte` が真なら 1 回の `read` で 1 バイトだけ読み、LF の後ろのバイトを
+/// 取り込まない（行の後ろの余分なバイトは呼び出し側が続けて読む）。偽なら従来どおり、後ろに余分なバイトがあれば
+/// `Malformed`。
+fn read_line_inner<const N: usize>(
+    pipe: &std::fs::File,
+    timeout: Duration,
+    single_byte: bool,
 ) -> Result<([u8; N], usize), PrePivotStatusError> {
     let deadline = Instant::now() + timeout.min(READ_TIMEOUT_MAX);
     let mut buf = [0u8; N];
@@ -443,6 +472,11 @@ pub(super) fn read_line_bounded<const N: usize>(
             Err(SysError::Os(errno)) if errno == sys::EINTR => continue,
             Err(_) => return Err(PrePivotStatusError::Io),
         }
+        let rest = if single_byte {
+            rest.get_mut(..1).unwrap_or(&mut [])
+        } else {
+            rest
+        };
         match (&*pipe).read(rest) {
             Ok(0) => {
                 return Err(if filled == 0 {
@@ -487,7 +521,8 @@ pub(super) const LAUNCH_SHARED_EXEC_CHILD_STEPS: [ExecChildStep; 11] = [
 /// 子（PID 1）は untrusted 扱いなので、運ぶのはこのトークンだけで、親は [`ExecPhaseStep::from_token`] で
 /// 静的な値へ引き直す（未知の語は `Malformed`）。段は情報用で、`reason` との整合は検査しない
 /// （監査の記録の有無は従来どおり `reason` だけで決まる）。
-/// - launch だけの段: `verify_caller`・`restriction_evidence`（`run_child` の検証）、`verify_root`（pivot 後の
+/// - launch だけの段: `landlock`（制限ステージ列の Landlock 段。照合の違反 3 理由を運ぶ。#2130）、
+///   `verify_caller`・`restriction_evidence`（`run_child` の検証）、`verify_root`（pivot 後の
 ///   `/` の mount ID 照合。`PrePivotStep` の `pivot_root` と重ならない名前）
 /// - exec と共有する段: [`LAUNCH_SHARED_EXEC_CHILD_STEPS`] の 11 段（`prepare_exec_child` の手順）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,16 +534,21 @@ pub(super) enum ExecPhaseStep {
     RestrictionEvidence,
     /// pivot 後の `/` の mount ID 照合 `verify_pivot_root` の失敗（launch だけ）。
     VerifyRoot,
+    /// 制限ステージ列の Landlock 段の失敗（launch だけ。SEC-1・SEC-4・CORE-5・#2130）。Landlock 段は `P` の後、
+    /// seccomp の listener を送る前に走るため、失敗すると親は listener を受け取れず、この段の `E` 行だけが
+    /// 照合の違反（`ViolationReason::LANDLOCK_APPLY_REASONS`）を親へ運ぶ。
+    Landlock,
     /// exec と共有する `prepare_exec_child` の段。
     Child(ExecChildStep),
 }
 
 impl ExecPhaseStep {
-    /// launch だけの段（3 段）。
-    pub(super) const LAUNCH_ONLY: [Self; 3] = [
+    /// launch だけの段（4 段）。
+    pub(super) const LAUNCH_ONLY: [Self; 4] = [
         Self::VerifyCaller,
         Self::RestrictionEvidence,
         Self::VerifyRoot,
+        Self::Landlock,
     ];
 
     /// ワイヤー上のトークン。
@@ -517,6 +557,7 @@ impl ExecPhaseStep {
             Self::VerifyCaller => "verify_caller",
             Self::RestrictionEvidence => "restriction_evidence",
             Self::VerifyRoot => "verify_root",
+            Self::Landlock => "landlock",
             Self::Child(step) => step.as_str(),
         }
     }
@@ -556,8 +597,20 @@ pub(super) enum ExecPhaseStatus {
     Returned { code: ErrorCode },
 }
 
+/// `E` 行の段 `step` と理由コード `token` の組から理由を引き直す唯一の許可リスト照合（子の符号化と親の復号で共有。#2130）。
+///
+/// 段 `landlock` は Landlock 段の 3 理由（`LANDLOCK_APPLY_REASONS`）だけ、それ以外の段は entrypoint 系の 8 理由だけを
+/// 通す。段と理由の食い違いは `None`（復号側は `Malformed`、符号化側は理由を落とす）。子は untrusted なので、
+/// 文字列は固定語彙の走査で静的な値へ引き直す。
+fn exec_phase_violation(step: ExecPhaseStep, token: &str) -> Option<ViolationReason> {
+    match step {
+        ExecPhaseStep::Landlock => ViolationReason::from_landlock_apply_token(token),
+        _ => ViolationReason::from_entrypoint_token(token),
+    }
+}
+
 impl ExecPhaseStatus {
-    /// 子側の唯一の作成入口。entrypoint 系以外の理由は落とす（失敗として報告する点は変わらない）。
+    /// 子側の唯一の作成入口。段と整合しない理由は落とす（失敗として報告する点は変わらない）。
     pub(super) fn failed_from(step: ExecPhaseStep, error: &ExecError) -> Self {
         Self::Failed {
             step,
@@ -565,7 +618,7 @@ impl ExecPhaseStatus {
             violation: error
                 .violation
                 .as_ref()
-                .and_then(|v| ViolationReason::from_entrypoint_token(v.reason.as_str())),
+                .and_then(|v| exec_phase_violation(step, v.reason.as_str())),
         }
     }
 
@@ -623,10 +676,7 @@ impl ExecPhaseStatus {
                 let violation = if *reason == "-" {
                     None
                 } else {
-                    Some(
-                        ViolationReason::from_entrypoint_token(reason)
-                            .ok_or(PrePivotStatusError::Malformed)?,
-                    )
+                    Some(exec_phase_violation(step, reason).ok_or(PrePivotStatusError::Malformed)?)
                 };
                 Ok(Self::Failed {
                     step,
@@ -792,6 +842,23 @@ pub(super) fn resolve_exec_phase_status(
 ) -> Result<(), Box<AuditedRejection<ExecError>>> {
     match result {
         Ok(ExecPhaseOutcome::Executed) => Ok(()),
+        // 段 `landlock` の照合の違反は層 `mount` に記録する（#2130）。親が組み立てた `ExecError::stage` を記録にも載せる。
+        Ok(ExecPhaseOutcome::Failed {
+            step: ExecPhaseStep::Landlock,
+            code,
+            violation: Some(reason),
+        }) => {
+            let mut error = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
+            // errno 由来の分類（`Unimplemented` 等）をワイヤーの `CODE` で保つ。記録の有無・理由は変わらない。
+            error.code = code;
+            Err(Box::new(record_launch_mount_rejection_at(
+                error,
+                reason,
+                Some(IsolationStage::Landlock),
+                audit.container,
+                audit.sink,
+            )))
+        }
         Ok(ExecPhaseOutcome::Failed {
             violation: Some(reason),
             ..
@@ -806,7 +873,12 @@ pub(super) fn resolve_exec_phase_status(
             violation: None,
         }) => Err(Box::new(AuditedRejection::not_applicable(ExecError::new(
             code,
-            IsolationStage::Exec,
+            // Landlock 段の失敗は段 `Landlock` のまま運ぶ（理由なしは記録しない。#2130）。
+            if step == ExecPhaseStep::Landlock {
+                IsolationStage::Landlock
+            } else {
+                IsolationStage::Exec
+            },
             // 静的な段のトークンだけを入れる（子の自由文は運ばない。`PrePivotStep` の文言と同じ形）。
             format!(
                 "exec phase step '{}' failed in the container child",
@@ -910,6 +982,34 @@ pub fn relay_mount_binds_failure_for_test(
     resolve_pre_pivot_status(status, LaunchAudit { sink, container })
 }
 
+/// 結合試験専用: 段 `landlock` の違反 `reason` を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
+/// 往復させる（SEC-1・SEC-4・CORE-5・#2130）。通常の利用者は呼ばない。
+///
+/// 許可リスト外の理由（entrypoint 系等）は子の符号化で落ち、理由なしの失敗として届く（記録されない）。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn relay_landlock_failure_for_test(
+    reason: ViolationReason,
+    sink: &dyn AuditSink,
+    container: Option<&ContainerId>,
+) -> Result<(), Box<AuditedRejection<ExecError>>> {
+    let (r, w) = std::io::pipe().map_err(|e| {
+        Box::new(AuditedRejection::not_applicable(ExecError::from_io(
+            &e,
+            IsolationStage::Spawn,
+            "create the test pipe",
+        )))
+    })?;
+    let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+    let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+    let error = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
+    report_exec_failure(&w, ExecPhaseStep::Landlock, &error)
+        .map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    drop(w);
+    let status = read_exec_phase_until_close(&r, Duration::from_secs(5));
+    resolve_exec_phase_status(status, LaunchAudit { sink, container })
+}
+
 /// 単体テスト専用: 子の失敗 `error`（段 `step`）を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
 /// 往復させる（SEC-4・#2013）。`path_masks` / `masked_paths` の適用失敗が、実際の `ExecError` から親の監査記録まで
 /// 届くことを具体値で照合するために使う。
@@ -993,12 +1093,13 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::CreateDefaultDevices => 5,
         PrePivotStep::MountTmpfs => 6,
         PrePivotStep::InjectFiles => 7,
-        PrePivotStep::MountBinds => 8,
-        PrePivotStep::ReadonlyPaths => 9,
-        PrePivotStep::MaskedPaths => 10,
-        PrePivotStep::PivotRoot => 11,
-        PrePivotStep::RootReadOnly => 12,
-        PrePivotStep::WorkingDir => 13,
+        PrePivotStep::EtcFiles => 8,
+        PrePivotStep::MountBinds => 9,
+        PrePivotStep::ReadonlyPaths => 10,
+        PrePivotStep::MaskedPaths => 11,
+        PrePivotStep::PivotRoot => 12,
+        PrePivotStep::RootReadOnly => 13,
+        PrePivotStep::WorkingDir => 14,
     }
 }
 
@@ -1060,7 +1161,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 14);
+        assert_eq!(PrePivotStep::ALL.len(), 15);
     }
 
     /// exec の子の段（`ExecChildStep`）と launch の段のトークンは重ならない（取り違えの検出。SUP-6・#2822）。
@@ -1192,6 +1293,39 @@ mod tests {
         assert_eq!(
             read_pre_pivot_status(&pipe_with(&long), t),
             Err(PrePivotStatusError::TooLong)
+        );
+    }
+
+    /// SEC-4・#2130: listener 経路の 1 行目の読みは `P` の後ろのバイトを取り込まず、続く 2 行目の読みが `E landlock` を
+    /// 受け取る。余分な行は 2 行目の復号で `Malformed`。
+    #[test]
+    fn sec4_2130_leaving_tail_keeps_the_next_line_for_the_phase_reader() {
+        let t = Duration::from_secs(5);
+        let f = pipe_with(b"P\nE landlock FAILED_PRECONDITION landlock_mount_not_root\n");
+        assert_eq!(
+            read_pre_pivot_status_leaving_tail(&f, t),
+            Ok(PrePivotStatus::Ready)
+        );
+        assert_eq!(
+            read_exec_phase_until_close(&f, t),
+            Ok(ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::Landlock,
+                code: ErrorCode::FailedPrecondition,
+                violation: Some(ViolationReason::LandlockMountNotRoot),
+            })
+        );
+        let f = pipe_with(b"P\nP\n");
+        assert_eq!(
+            read_pre_pivot_status_leaving_tail(&f, t),
+            Ok(PrePivotStatus::Ready)
+        );
+        assert_eq!(
+            read_exec_phase_until_close(&f, t),
+            Err(PrePivotStatusError::Malformed)
+        );
+        assert_eq!(
+            read_pre_pivot_status_leaving_tail(&pipe_with(b"F establish"), t),
+            Err(PrePivotStatusError::Truncated)
         );
     }
 
@@ -1932,12 +2066,17 @@ mod tests {
     #[test]
     fn sup6_2895_roundtrip_every_step_code_and_reason() {
         let steps = all_phase_steps();
-        assert_eq!(steps.len(), 14);
+        assert_eq!(steps.len(), 15);
         let mut longest = 0;
         for step in steps {
             for code in ErrorCode::ALL {
-                let reasons = std::iter::once(None)
-                    .chain(ViolationReason::ENTRYPOINT_REASONS.into_iter().map(Some));
+                // 段 `landlock` は Landlock 段の 3 理由だけ、他の段は entrypoint 系の 8 理由だけが往復する（#2130）。
+                let allowed: &[ViolationReason] = if step == ExecPhaseStep::Landlock {
+                    &ViolationReason::LANDLOCK_APPLY_REASONS
+                } else {
+                    &ViolationReason::ENTRYPOINT_REASONS
+                };
+                let reasons = std::iter::once(None).chain(allowed.iter().copied().map(Some));
                 for violation in reasons {
                     let status = ExecPhaseStatus::Failed {
                         step,
@@ -2017,7 +2156,12 @@ mod tests {
             .collect();
         assert_eq!(
             only,
-            ["verify_caller", "restriction_evidence", "verify_root"]
+            [
+                "verify_caller",
+                "restriction_evidence",
+                "verify_root",
+                "landlock"
+            ]
         );
         for token in &only {
             assert!(ExecChildStep::from_token(token).is_none(), "{token}");
@@ -2037,6 +2181,110 @@ mod tests {
         let mut all: Vec<&str> = all_phase_steps().into_iter().map(|s| s.as_str()).collect();
         all.sort_unstable();
         all.dedup();
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
+    }
+
+    /// 子の符号化 → 状態 pipe → 親の復号 → 記録までを段 `landlock` で往復させる（本番と同じ関数）。
+    fn relay_landlock(
+        reason: ViolationReason,
+        sink: &VecSink,
+    ) -> Result<(), Box<AuditedRejection<ExecError>>> {
+        let (r, w) = std::io::pipe().unwrap();
+        let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+        let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        let error = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
+        report_exec_failure(&w, ExecPhaseStep::Landlock, &error).unwrap();
+        drop(w);
+        resolve_exec_phase_status(
+            read_exec_phase_until_close(&r, Duration::from_secs(5)),
+            LaunchAudit {
+                sink,
+                container: None,
+            },
+        )
+    }
+
+    /// SEC-4・SEC-1・CORE-5・#2130: 段 `landlock` の 3 理由は 1 拒否 1 件、層 `mount`・パスなし・段 `landlock` で記録される。
+    #[test]
+    fn sec4_2130_landlock_reasons_are_recorded_once_with_stage() {
+        assert_eq!(ViolationReason::LANDLOCK_APPLY_REASONS.len(), 3);
+        for reason in ViolationReason::LANDLOCK_APPLY_REASONS {
+            let token = reason.as_str();
+            let sink = VecSink::new(false);
+            let r = relay_landlock(reason, &sink).unwrap_err();
+            assert_eq!(r.delivery, AuditDelivery::Recorded, "{token}");
+            assert_eq!(r.error.stage, IsolationStage::Landlock, "{token}");
+            assert_eq!(
+                r.error.violation.as_ref().map(|v| v.reason.as_str()),
+                Some(token)
+            );
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{token}");
+            assert_eq!(recs[0].layer(), AuditLayer::Mount);
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].reason().map(|x| x.as_str()), Some(token));
+        }
+    }
+
+    /// SEC-4・#2130: 記録先が失敗しても拒否は覆らず、失敗は `SinkFailed` として残る。
+    #[test]
+    fn sec4_2130_sink_failure_keeps_the_landlock_rejection() {
+        let sink = VecSink::new(true);
+        let r = relay_landlock(ViolationReason::LandlockMountNotRoot, &sink).unwrap_err();
+        assert!(
+            matches!(r.delivery, AuditDelivery::SinkFailed { .. }),
+            "{:?}",
+            r.delivery
+        );
+        assert_eq!(r.error.stage, IsolationStage::Landlock);
+        assert!(sink.snapshot().is_empty());
+    }
+
+    /// SEC-4・#2130: 段と理由の食い違い（段 `landlock` に entrypoint 系、entrypoint 系の段に landlock の理由）は復号で
+    /// `Malformed`（fail-closed）。理由 `-` は記録なしの失敗のまま、段は `Landlock`。
+    #[test]
+    fn sec4_2130_landlock_step_reason_mismatch_is_malformed() {
+        let lines: [&[u8]; 3] = [
+            b"E landlock INTERNAL entrypoint_is_runtime_binary\n",
+            b"E open_root FAILED_PRECONDITION landlock_mount_not_root\n",
+            b"E landlock FAILED_PRECONDITION bogus\n",
+        ];
+        for line in lines {
+            assert_eq!(
+                ExecPhaseStatus::decode(line),
+                Err(PrePivotStatusError::Malformed),
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        let sink = VecSink::new(false);
+        let r = resolve_exec_phase_status(
+            ExecPhaseOutcome::decode_tail(b"E landlock UNIMPLEMENTED -\n"),
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(r.error.code, ErrorCode::Unimplemented);
+        assert_eq!(r.error.stage, IsolationStage::Landlock);
+        assert!(sink.snapshot().is_empty());
+    }
+
+    /// 子の符号化は段と整合しない理由を落とす（段 `landlock` に entrypoint 系の理由は載らない）。
+    #[test]
+    fn sec4_2130_failed_from_drops_reason_of_the_other_family() {
+        let e = ExecError::from_violation_at(
+            ViolationReason::EntrypointIsRuntimeBinary,
+            None,
+            IsolationStage::Landlock,
+        );
+        assert_eq!(
+            ExecPhaseStatus::failed_from(ExecPhaseStep::Landlock, &e)
+                .encode()
+                .as_bytes(),
+            format!("E landlock {} -\n", e.code.as_str()).as_bytes()
+        );
     }
 }

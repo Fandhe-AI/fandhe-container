@@ -13,13 +13,18 @@
 //!   （bind マウントと pin ファイルを host へ漏らさない）→ `create_network` で bridge を作る →
 //!   `attach_container` を実行し、(1) host 側 veth の `IFLA_MASTER` が bridge の ifindex と一致し `IFF_UP`、
 //!   (2) peer 側が子の netns から消えている、(3) pin パスの inode が保持 fd の netns と一致し子の netns と
-//!   別、(4) `nsenter --net=<pin>` 越しの `/proc/net/dev` に peer 名が現れる、を具体値で照合する。
+//!   別、(4) `nsenter --net=<pin>` 越しの `/proc/net/dev` に `eth0` が現れ、veth 作成時の peer 名は無い（改名。#3061）、を具体値で照合する。
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
 //! ポート公開付きの接続（c3）では、`nft list table` に DNAT が 2 件入ることに続けて、公開の個別解除
 //! （`unpublish_container_port`。echo 応答のハンドル指定。NET-3・#2839）で 2 件が消え予約が空になること、
 //! 同じ受け口を再び公開できる（`publish_container_ports`）ことを具体値で照合する。
+//!
+//! 公開の個別解除の後に、コンテナ単体の切り離し（`detach_container`。NET-1・NET-3・#3062）を確かめる。c11 と c12
+//! （それぞれ TCP 公開つき）を接続して c11 だけを外し、veth が `NotFound`・pin が消え・DNAT が c12 の 2 件だけになり、
+//! c12 の veth が bridge に属して up のまま・IPAM と予約に c12 だけが残ることを具体値で照合する。続けて同じ
+//! 受け口で再び接続でき、両方を外すと元の状態に戻る。実機（root）での実行は #1626（人間担当）で未実行。
 //!
 //! `delete_network` の前に、attach の取り残しの回収（`reclaim_failed_attach`。#2681）を確かめる。c4 を接続し、
 //! 請求書の記録の復号から回収して veth が `NotFound`・pin が消えること（2 回目も成功する冪等性）と、別名のない他者の veth は
@@ -102,8 +107,8 @@ mod linux {
         EndpointId, FailedAttachClaim, FailedCreateClaim, NetworkCreateSpec, NetworkName,
         PortProtocol, PortPublish, PortRegistry, ResourceState, StaticIpam, VethNames,
         attach_container, attach_prepared_container, create_container_netns, create_network,
-        delete_network, publish_container_ports, reclaim_failed_attach, reclaim_failed_create,
-        release_container_netns, unpublish_container_port,
+        delete_network, detach_container, publish_container_ports, reclaim_failed_attach,
+        reclaim_failed_create, release_container_netns, unpublish_container_port,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -117,7 +122,7 @@ mod linux {
     const CLAIM_HEX_MAX_LEN: usize = 4096;
     /// attach 子が標準出力へ出す行の接頭辞。
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept detach=ok detach_sibling=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -862,6 +867,10 @@ mod linux {
         }
         let host = attached.host_veth.as_str();
         let peer = attached.peer_veth.as_str();
+        let ifname = attached.container_ifname.as_str();
+        if ifname != "eth0" {
+            return Err(fail(format!("unexpected container ifname {ifname}")));
+        }
 
         let (index, flags, master) = link_state(&route, host)?;
         if index != attached.host_index.get() {
@@ -913,10 +922,16 @@ mod linux {
         )?;
         if !dev
             .lines()
+            .any(|l| l.trim_start().starts_with(&format!("{ifname}:")))
+        {
+            return Err(fail(format!("{ifname} not found in the container netns")));
+        }
+        if dev
+            .lines()
             .any(|l| l.trim_start().starts_with(&format!("{peer}:")))
         {
             return Err(fail(format!(
-                "peer {peer} not found in the container netns"
+                "peer {peer} still has its original name in the container netns"
             )));
         }
 
@@ -930,7 +945,7 @@ mod linux {
             .lines()
             .filter(|l| {
                 let f: Vec<&str> = l.split_whitespace().collect();
-                f.first() == Some(&peer)
+                f.first() == Some(&ifname)
                     && f.get(1) == Some(&"00000000")
                     && f.get(7) == Some(&"00000000")
             })
@@ -939,7 +954,7 @@ mod linux {
             || default_routes[0].split_whitespace().nth(2) != Some("0100D50A")
         {
             return Err(fail(format!(
-                "expected exactly one default route via 10.213.0.1 on {peer}, got {default_routes:?}"
+                "expected exactly one default route via 10.213.0.1 on {ifname}, got {default_routes:?}"
             )));
         }
 
@@ -1041,6 +1056,119 @@ mod linux {
                 "re-publish expected 1 port and 2 DNAT rules, found {} and {again_rules}",
                 again.len()
             )));
+        }
+
+        // --- コンテナ単体の切り離し（NET-1・NET-3・#3062）: c11 だけを外し、c12 の公開・veth・アドレスは残る ---
+        let attach_published = |id: &str, host_port: u16| -> Result<_, NetError> {
+            let p = PortPublish::new(
+                PortProtocol::Tcp,
+                "192.0.2.10".parse().map_err(|_| fail("addr"))?,
+                host_port,
+                80,
+            )?;
+            ContainerAttachSpec::new(EndpointId::new(id)?, &net, base.clone())?
+                .with_port_publishes(vec![p])
+        };
+        let (c11, c12) = (EndpointId::new("c11")?, EndpointId::new("c12")?);
+        let attached11 = attach_container(
+            &route,
+            &nft,
+            &attach_published("c11", 8091)?,
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| fail(format!("attach c11 failed at {:?}: {e}", e.step)))?;
+        let attached12 = attach_container(
+            &route,
+            &nft,
+            &attach_published("c12", 8092)?,
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| fail(format!("attach c12 failed at {:?}: {e}", e.step)))?;
+        let (host11, pin11) = (attached11.host_veth.clone(), attached11.netns_path.clone());
+        let (host12, addr12) = (attached12.host_veth.clone(), attached12.address);
+        let before = count_dnat()?;
+        let removed = detach_container(
+            &route,
+            &nft,
+            &net,
+            attached11,
+            Vec::new(),
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| {
+            fail(format!(
+                "detach c11 failed at {:?}: {e}; report: {:?}",
+                e.step, e.report
+            ))
+        })?;
+        if !removed.leftover.is_empty() || removed.removed.len() != 4 {
+            return Err(fail(format!("unexpected detach report: {removed:?}")));
+        }
+        if !matches!(
+            route.link_index(&host11, t),
+            Err(ref e) if e.code() == NetErrorCode::NotFound
+        ) {
+            return Err(fail("detached veth still exists"));
+        }
+        if pin11.exists() {
+            return Err(fail("detached pin still exists"));
+        }
+        let ruleset = run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?;
+        let (n8091, n8092) = (
+            ruleset
+                .lines()
+                .filter(|l| l.contains("dnat to") && l.contains("8091"))
+                .count(),
+            ruleset
+                .lines()
+                .filter(|l| l.contains("dnat to") && l.contains("8092"))
+                .count(),
+        );
+        if (n8091, n8092) != (0, 2) || count_dnat()? != before - 2 {
+            return Err(fail(format!(
+                "after detach expected DNAT 8091 x0 / 8092 x2 and {} in total, found {n8091} / {n8092} and {} in:\n{ruleset}",
+                before - 2,
+                count_dnat()?
+            )));
+        }
+        // 兄弟の veth は bridge に属して up のまま、bridge も残る。
+        let (_, flags12, master12) = link_state(&route, host12.as_str())?;
+        if master12 != Some(net.bridge_index.get()) || flags12 & IFF_UP == 0 {
+            return Err(fail("sibling veth must stay attached to the bridge and up"));
+        }
+        link_state(&route, net.bridge.as_str())?;
+        if ipam.address_of(&c11).is_some() || ipam.address_of(&c12) != Some(addr12) {
+            return Err(fail("detach must release only the detached address"));
+        }
+        if ports.len() != 2 {
+            return Err(fail(format!(
+                "expected 2 reservations (c3 and c12), found {}",
+                ports.len()
+            )));
+        }
+        // 同じ受け口とアドレスを再び使える（予約と払い出しが戻っている証拠）。後始末として両方を切り離す。
+        let again11 = attach_container(
+            &route,
+            &nft,
+            &attach_published("c11", 8091)?,
+            &mut ipam,
+            &mut ports,
+            t,
+        )
+        .map_err(|e| fail(format!("re-attach c11 failed at {:?}: {e}", e.step)))?;
+        for c in [again11, attached12] {
+            let id = c.endpoint.clone();
+            detach_container(&route, &nft, &net, c, Vec::new(), &mut ipam, &mut ports, t)
+                .map_err(|e| fail(format!("cleanup detach {id:?} failed: {e}")))?;
+        }
+        if ports.len() != 1 || count_dnat()? != before - 4 || ipam.address_of(&c12).is_some() {
+            return Err(fail("cleanup detach left reservations, rules or addresses"));
         }
 
         // --- attach の取り残しの回収（NET-1・#2681）: 請求書の記録から、所有を確かめて veth と pin を回収する ---

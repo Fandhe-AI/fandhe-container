@@ -136,6 +136,9 @@ use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
 use super::launch_options::{LaunchIpcMode, LaunchOptions};
 #[cfg(target_os = "linux")]
+use super::network_mode::EffectiveNetwork;
+use super::network_mode::LaunchNetworkMode;
+#[cfg(target_os = "linux")]
 use super::resources::LinuxResourceLimits;
 #[cfg(target_os = "linux")]
 use super::sysfs_mount::SysfsMountSpec;
@@ -718,6 +721,22 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
+    /// 起動オプションの network モード(start が予約前に config と突き合わせる。NET-6・SEC-1・#3058)。
+    /// launch で使う値と同じ `launch_options` から取る(未指定は `FromConfig`)。
+    fn network_mode(&self) -> LaunchNetworkMode {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .map_or(LaunchNetworkMode::FromConfig, LaunchOptions::network)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -860,6 +879,9 @@ struct SpawnInput<'a> {
     tmpfs: &'a TmpfsMountSet,
     /// 注入するファイル(secrets / configs。空なら `None`。SUP-12・#2625)。bind との重なりは検査済み。
     inject: Option<&'a InjectedFileSet>,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind(`LaunchOptions::etc_files` が空なら `None`)。fork 前に
+    /// `EtcFileMounts::verify` で検証し、bind・tmpfs・注入との重なりも検査済み(NET-12・#1872)。
+    etc_files: Option<&'a crate::exec::EtcFileMounts>,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
     /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
@@ -1249,6 +1271,14 @@ impl Inner {
                 &default_options
             }
         };
+        // network: spec は start が `launch_options` と同じモードで突き合わせ済みのはず。ラッパーが `network_mode` を
+        // 転送しないと `FromConfig` で判定され、`Loopback` 指定がホスト共有へ黙って縮退する(fail-closed。NET-6・SEC-1・#3058)。
+        if spec.network_mode() != options.network() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launch spec was reconciled with a different network mode",
+            ));
+        }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
@@ -1374,6 +1404,41 @@ impl Inner {
             );
             return Err(TraitError::new(code, message));
         }
+        // 管理ルートの `/etc/hosts`・`/etc/resolv.conf`(指定時のみ)。宛先の重なりを検査し(bind との重なりは他の bind の
+        // 拒否と同じく監査 sink へ記録する)、元を fork 前に fd で検証する。restart の再 launch でも毎回やり直す
+        // (NET-12・SEC-1・REPAIR-5・#1872)。
+        let etc_mounts = if options.etc_files().is_empty() {
+            None
+        } else {
+            if let Some(binds) = binds
+                && let Err(err) = binds.check_against_etc_files(options.etc_files())
+            {
+                let (code, message) = (err.code(), err.message());
+                let _ = audit_bind_mount_error(
+                    err,
+                    spec.config().mounts(),
+                    Some(id),
+                    self.audit_sink.as_ref(),
+                );
+                return Err(TraitError::new(code, message));
+            }
+            crate::etc_files::check_etc_overlaps(options.etc_files(), tmpfs, inject, None)?;
+            let Some(state_root) = spec.state_root() else {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container etc files require a state store root",
+                ));
+            };
+            Some(
+                crate::exec::EtcFileMounts::verify(
+                    state_root,
+                    id,
+                    options.etc_files(),
+                    effective_root_readonly,
+                )
+                .map_err(|e| to_trait_error(&e))?,
+            )
+        };
         let audit = LaunchAudit {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
@@ -1397,6 +1462,7 @@ impl Inner {
                 timeout,
                 tmpfs,
                 inject,
+                etc_files: etc_mounts.as_ref(),
                 binds,
                 sysfs: spec.sysfs_mount(),
                 sysctls: sysctls.as_ref(),
@@ -1803,6 +1869,14 @@ fn isolation_config_of(
             "a pod namespace join cannot be combined with --ipc=host",
         ));
     }
+    // Loopback の netns は pod の join と組み合わせない。`isolate_join` が `Net` を unshare すると、pod の中で共有されない
+    // netns で黙って動くため(fail-closed。NET-6・CRI-2・SEC-1。#3064・#2675)。
+    if spec.namespace_join().is_some() && spec.network() == EffectiveNetwork::NewLoopback {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with the loopback network mode",
+        ));
+    }
     // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
     // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
@@ -1810,6 +1884,11 @@ fn isolation_config_of(
         let ns = match kind {
             // `--ipc=host` のときだけ IPC namespace を作らない(config.json からは外せない。SEC-1・SUP-12・#2625)。
             NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
+            // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
+            NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
+            // path 無しの network エントリで実効が `NewLoopback` なら、新しい netns を作る(中間プロセスが `lo` を up にする。
+            // NET-6・#3064)。
+            NamespaceKind::Network => Namespace::Net,
             NamespaceKind::Pid => Namespace::Pid,
             NamespaceKind::Mount => Namespace::Mount,
             NamespaceKind::Uts => Namespace::Uts,
@@ -1823,6 +1902,11 @@ fn isolation_config_of(
             }
         };
         namespaces = namespaces.with(ns);
+    }
+    // config に network エントリが無くても、実効が `NewLoopback`(CLI の既定の `none`)なら netns を作る。落とすと最も
+    // 一般的な起動でホストの netns のまま動く(NET-6・SEC-1・#3064)。
+    if spec.network() == EffectiveNetwork::NewLoopback {
+        namespaces = namespaces.with(Namespace::Net);
     }
     let hostname = spec
         .hostname()
@@ -1900,7 +1984,7 @@ impl LaunchOps for RealOps {
         let (isolation_plan, gid_map): (IntermediatePlan<'_>, &IdMapSet) = match input.subordinate {
             None => {
                 single_plan = plan(&input.isolation)
-                    .map_err(not_started)?
+                    .map_err(|e| plan_rejected(e, input.audit))?
                     .with_host_slave_root(host_slave);
                 // 計画が euid / egid 0 を拒否した後に作る。
                 single_gid = crate::rootless::single_id_mapping(crate::sys::effective_gid())
@@ -1921,7 +2005,7 @@ impl LaunchOps for RealOps {
                     ids.writer.clone(),
                     ids.timeout,
                 )
-                .map_err(not_started)?
+                .map_err(|e| plan_rejected(e, input.audit))?
                 .with_host_slave_root(host_slave);
                 (
                     IntermediatePlan::Subordinate(&subordinate_plan),
@@ -1934,6 +2018,7 @@ impl LaunchOps for RealOps {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
             inject: input.inject,
+            etc_files: input.etc_files,
             binds: input.binds,
             sysfs: input.sysfs,
             sysctls: input.sysctls,
@@ -1983,6 +2068,17 @@ impl LaunchOps for RealOps {
         // 失敗は code だけを残す(メッセージ・パスは呼び出し側で固定文言に置き換えるため捨てる)。
         crate::cgroups::ensure_no_process_in_recorded(id, placement, deadline).map_err(|e| e.code)
     }
+}
+
+/// 計画の拒否 `e` を、親の監査へ 1 件記録した起動失敗にする(SEC-1・SEC-4・#2130)。
+///
+/// `spawn` の `plan()` / `plan_rootless_subordinate()` の失敗だけが使う。fork 前の拒否のため回収する子は無い
+/// (`clean`)。違反なしのエラー・`PlanRejected` 以外は記録せず `not_applicable`(従来どおり)。
+#[cfg(target_os = "linux")]
+fn plan_rejected(e: ExecError, audit: LaunchAudit<'_>) -> Box<PreparedLaunchFailure> {
+    Box::new(PreparedLaunchFailure::clean(
+        crate::exec::record_launch_plan_rejection(e, audit.container, audit.sink),
+    ))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4157,6 +4253,106 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
+    fn net_namespaces() -> serde_json::Value {
+        serde_json::json!({"namespaces": [
+            {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"},
+            {"type": "network"}
+        ]})
+    }
+
+    /// NET-6・SEC-1(#3058): `Host` で突き合わせ済みの spec は network namespace を作らず、launch が通る。
+    #[test]
+    fn net6_host_mode_skips_the_network_namespace() {
+        let spec = spec_for("net-host", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::HostShared,
+            LaunchNetworkMode::Host,
+        );
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Host),
+        );
+        assert_eq!(l.network_mode(), LaunchNetworkMode::Host);
+        isolation_config_of(&spec, LaunchIpcMode::Private).expect("network entry is skipped");
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// NET-6(#3064): `Loopback` は fork 前に拒否されず spawn まで届く。config に network エントリが無くても
+    /// 分離の集合に `Net` が入る(エントリ無し・path 無しの両方)。`HostShared` では入らない。
+    #[test]
+    fn net6_loopback_mode_reaches_spawn_and_adds_net() {
+        let spec = spec_for("net-loop", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let host = spec_for("net-host", serde_json::json!({}));
+        let cfg = isolation_config_of(&host, LaunchIpcMode::Private).expect("config");
+        assert!(!cfg.namespaces.contains(Namespace::Net));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert!(ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3064): path 無しの network エントリ + `NewLoopback` でも `Net` が集合に入る。
+    /// pod の join との組は spawn の前に `InvalidArgument`(固定文言)。
+    #[test]
+    fn net6_loopback_with_entry_adds_net_and_rejects_pod_join() {
+        let spec = spec_for("net-loop-entry", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined =
+            spec.with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let err = isolation_config_of(&joined, LaunchIpcMode::Private).expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with the loopback network mode"
+        );
+    }
+
+    /// SEC-1(#3058): spec のモードと launcher のモードが食い違う(ラッパーの転送漏れ等)なら `FailedPrecondition`。
+    #[test]
+    fn sec1_network_mode_mismatch_is_refused_before_spawn() {
+        let spec = spec_for("net-mismatch", serde_json::json!({}));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launch spec was reconciled with a different network mode"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3058): 起動オプション未指定の `network_mode` は `FromConfig`。
+    #[test]
+    fn net6_default_network_mode_is_from_config() {
+        let l = launcher(FakeOps::new(&events()), rootless(), None);
+        assert_eq!(l.network_mode(), LaunchNetworkMode::FromConfig);
+    }
+
     /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。
     #[test]
     fn sup12_user_tmpfs_is_writable_in_landlock_rules_and_record() {
@@ -4319,6 +4515,81 @@ mod tests {
                 .expect_err("rejected");
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
         }
+    }
+
+    /// NET-12・SEC-1(#1872): `etc_files` の指定は、状態ルートが無い・生成物が無い・`/etc` の bind と重なる構成を
+    /// spawn の前に拒否し、生成済みなら通る。指定しない launch は従来どおり(A6)。
+    #[test]
+    fn net12_etc_files_are_verified_before_spawn() {
+        use crate::etc_files::{EtcFileKind, EtcFileSelection, create_etc_files};
+        let sel = EtcFileSelection::default()
+            .with(EtcFileKind::Hosts)
+            .with(EtcFileKind::ResolvConf);
+        let with_etc = || {
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_etc_files(sel)
+                .expect("etc files")
+        };
+        let launch = |spec: &LaunchSpec, options: LaunchOptions| {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let r = l.launch(spec, Duration::from_secs(1));
+            let spawned = ev
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn "))
+                .count();
+            (r, spawned)
+        };
+
+        // 状態ルートが無い。
+        let spec = spec_for("etc-no-root", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("no state root");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // 状態ルートはあるが生成していない。
+        let dir = crate::test_support::TestTempDir::new("etc-launch").expect("tmp");
+        let spec = spec_for("etc-missing", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("not created");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // `/etc` の bind と重なる。
+        let spec = spec_with_mounts(
+            "etc-bind",
+            serde_json::json!({}),
+            serde_json::json!([
+                {"destination": "/etc", "type": "bind", "source": "/srv/data", "options": ["rbind"]}
+            ]),
+        )
+        .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("overlap");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(spawned, 0);
+
+        // 生成済みなら通る。
+        let spec = spec_for("etc-ok", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        create_etc_files(dir.path(), spec.container_id(), sel).expect("create");
+        let (r, spawned) = launch(&spec, with_etc());
+        let p = r.expect("launched");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+
+        // 指定しない launch は状態ルートの有無に関わらず従来どおり。
+        let spec = spec_for("etc-none", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, LaunchOptions::try_default().expect("default"));
+        let p = r.expect("launched without etc files");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     /// SEC-2・CORE-5(#2625): readonlyPaths の厳密な子孫への tmpfs・注入ディレクトリは spawn の前に拒否する。
@@ -4495,6 +4766,104 @@ mod tests {
         assert!(!std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
         assert!(Arc::ptr_eq(&l.inner.audit_sink, &main));
         assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
+    }
+
+    /// 記録を溜める試験用 sink(`fail` なら記録に失敗する)。
+    struct CollectSink {
+        records: std::sync::Mutex<Vec<AuditRecord>>,
+        fail: bool,
+    }
+
+    impl AuditSink for CollectSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Internal, "sink failed"));
+            }
+            self.records.lock().expect("lock").push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// SEC-1・SEC-4・#2130: 計画の拒否(名前空間が空)は、層 `mount`・パスなし・理由コード `no_namespaces`・
+    /// 段 `validate`・container_id つきで 1 件記録され、返す `ExecError` は元のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_is_recorded_once() {
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        let id = ContainerId::new("c2130").expect("id");
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("empty namespaces are rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let failure = plan_rejected(original.clone(), audit);
+        assert_eq!(failure.rejection.delivery, AuditDelivery::Recorded);
+        assert_eq!(failure.rejection.error, original);
+        assert!(failure.unreaped.is_empty());
+        let recs = sink.records.lock().expect("lock");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].reason().map(|r| r.as_str()), Some("no_namespaces"));
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c2130"));
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("validate"));
+    }
+
+    /// SEC-4・#2130: 記録先が失敗しても拒否は覆らず、失敗は `SinkFailed` として残る(黙って捨てない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_survives_sink_failure() {
+        use crate::audit_log::AuditDelivery;
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let failure = plan_rejected(
+            original.clone(),
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert!(matches!(
+            failure.rejection.delivery,
+            AuditDelivery::SinkFailed(_)
+        ));
+        assert_eq!(failure.rejection.error, original);
+    }
+
+    /// SEC-4・#2130: 違反でないエラー(システムエラー)は記録せず `NotApplicable`(従来どおり)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_non_violation_plan_error_is_not_recorded() {
+        use crate::audit_log::AuditDelivery;
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let e = ExecError::new(ErrorCode::Internal, IsolationStage::Validate, "boom");
+        let failure = plan_rejected(
+            e,
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert_eq!(failure.rejection.delivery, AuditDelivery::NotApplicable);
+        assert!(sink.records.lock().expect("lock").is_empty());
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

@@ -10,7 +10,7 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_binds` の成功直後に
+//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_etc_files`・`mount_binds` の成功直後に
 //!   [`MountedTargets::push`] する。段の順に並ぶ（同じキーが複数あれば後勝ち。後から載せたものが上になる）
 //! - 受け渡し: `run_child_then` が `StagePipeline::with_mounted_targets` で Landlock 段へ渡す（pivot で `mnt_id` と
 //!   `(st_dev, st_ino)` は変わらない。`PivotReport.new_root_mnt_id` の pivot 後の再照合が先例）
@@ -29,7 +29,10 @@
 //!   記録を持たないため、`ro` の bind に頼るルールは開いた fd の `fstatfs` だけで確かめる
 //! - 利用者の tmpfs・注入の宛先には今は Landlock のルールが無い。識別子は記録するが、照合の対象は
 //!   今あるルール（暗黙の `/dev` 系 3 本と bind）だけ
-//! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）による強化は将来仕様
+//! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）は使わない（#2130 の判断）。`mnt_id` の再利用による取り違えは
+//!   `(st_dev, st_ino)` の照合で防げており、一意性は restart をまたいで残らないため永続化した記録の強化にもならない。
+//!   使うには `statx` のラッパーを `sys` に新しい `unsafe` として足し（ユーザー承認が要る）、カーネル 6.8 未満では
+//!   fdinfo へ縮退する分岐も要る。必要になったら、その承認を得たうえで改めて採否を決める
 
 use crate::dev_mounts::ImplicitDevMount;
 
@@ -60,6 +63,10 @@ pub(crate) enum MountedBy {
     Tmpfs,
     /// ファイル注入の段（注入ディレクトリの tmpfs）。
     Inject,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount の段（識別子の記録のみ。Landlock のルールは作らない。NET-12・#1872）。
+    /// ファイルの bind mount はアクセス時のパス探索がマウント点（rootfs 側の `/etc/hosts`）を経て rootfs の root ルールへ届くため、
+    /// 実効の権利は root と同じで、`/sys` の sysfs（`build_path_rules_with_dev` の `/sys` の項）と同じ理由で個別のルールを要さない。
+    EtcFile,
     /// bind mount の段。`index` は `mounts[]` 内の位置（`RuleOrigin::Mount` と同じ番号）。
     Bind {
         /// `mounts[]` 内の位置。

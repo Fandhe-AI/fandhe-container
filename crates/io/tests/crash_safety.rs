@@ -34,6 +34,11 @@
 //! ここの小さい目標数の結合試験（`io3_harness_*`）は試行ループの挙動だけを確かめる（REPAIR-3）。
 //! Windows など UDS 未対応 OS では、未対応終了コード 5 を返すことだけを確かめる。
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "crash_safety/client_end.rs"]
+mod client_end;
+#[path = "crash_safety/disk_check.rs"]
+mod disk_check;
 #[path = "crash_safety/trial.rs"]
 mod trial;
 
@@ -51,15 +56,15 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
-        AckReceipt, FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind, FrameReceiver, FrameSender,
-        InFlightLimit, IoError, IoErrorCode, IoTimeout, NoopSendObserver, PipelineClient,
-        persist_support,
+        AckReceipt, FrameKind, InFlightLimit, IoErrorCode, IoTimeout, NoopSendObserver,
+        PipelineClient, persist_support,
     };
 
+    use crate::disk_check::{RECORD_LEN, check_disk_records};
     use crate::trial::{
-        DiskObservation, InvalidReason, MAX_ATTEMPTS, RECORD_LEN, ServerExit, TARGET_VALID_TRIALS,
-        TrialLedger, TrialObservation, TrialSummary, TrialVerdict, check_disk_records,
-        classify_trial, loss_summary, run_until_valid,
+        DiskObservation, InvalidReason, MAX_ATTEMPTS, ServerExit, TARGET_VALID_TRIALS, TrialLedger,
+        TrialObservation, TrialSummary, TrialVerdict, classify_trial, loss_summary,
+        run_until_valid,
     };
 
     /// テストが起動するサーバーの書き込み先 sink（`crash_test_server` の `--sink`）。
@@ -206,95 +211,7 @@ mod unix {
         assert_eq!(status.signal(), Some(9));
     }
 
-    /// テスト用の UDS クライアント端点（`FrameSender` + `FrameReceiver`）。
-    ///
-    /// `src/` には UDS のクライアント側具象実装がないため（`client.rs` の doc 参照）、
-    /// 本テストで `PipelineClient` を使えるよう std の `UnixStream` を包む。ACK の順序・種別の
-    /// 検証は `PipelineClient::recv_ack` に任せ、ここでは観測数を水増ししない。
-    /// 一度でも `Err` を返したら以後は `Unavailable` を返す（transport の poison 契約と同じ）。
-    struct UnixClientEnd {
-        stream: UnixStream,
-        poisoned: bool,
-    }
-
-    impl UnixClientEnd {
-        fn new(stream: UnixStream) -> Self {
-            Self {
-                stream,
-                poisoned: false,
-            }
-        }
-
-        fn fail(&mut self, e: &std::io::Error) -> IoError {
-            self.poisoned = true;
-            let code = match e.kind() {
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                    IoErrorCode::Timeout
-                }
-                _ => IoErrorCode::Unavailable,
-            };
-            IoError::new(code, format!("unix client io failed: {e}"))
-        }
-
-        fn poisoned_error() -> IoError {
-            IoError::new(
-                IoErrorCode::Unavailable,
-                "unix client end is poisoned by a previous error",
-            )
-        }
-    }
-
-    impl FrameSender for UnixClientEnd {
-        type Frame = Frame;
-
-        fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
-            if self.poisoned {
-                return Err(Self::poisoned_error());
-            }
-            let result = self
-                .stream
-                .set_write_timeout(Some(timeout.as_duration()))
-                .and_then(|()| self.stream.write_all(&frame.encode()));
-            result.map_err(|e| self.fail(&e))
-        }
-    }
-
-    impl FrameReceiver for UnixClientEnd {
-        type Frame = Frame;
-
-        fn recv_frame(&mut self, timeout: IoTimeout) -> Result<Frame, IoError> {
-            if self.poisoned {
-                return Err(Self::poisoned_error());
-            }
-            let mut header_bytes = [0u8; FRAME_HEADER_LEN];
-            if let Err(e) = self
-                .stream
-                .set_read_timeout(Some(timeout.as_duration()))
-                .and_then(|()| self.stream.read_exact(&mut header_bytes))
-            {
-                return Err(self.fail(&e));
-            }
-            let header = match FrameHeader::from_bytes(header_bytes) {
-                Ok(h) => h,
-                Err(e) => {
-                    self.poisoned = true;
-                    return Err(e);
-                }
-            };
-            // body 長は検証済みの FrameHeader（MAX_FRAME_LEN 以内）の値だけを使う
-            let mut body = vec![0u8; header.body_len()];
-            if let Err(e) = self.stream.read_exact(&mut body) {
-                return Err(self.fail(&e));
-            }
-            match Frame::decode_body(header, &body) {
-                Ok(frame) => Ok(frame),
-                Err(e) => {
-                    self.poisoned = true;
-                    Err(e)
-                }
-            }
-        }
-    }
+    use crate::client_end::UnixClientEnd;
 
     /// SIGKILL を打つ位置（IO-3・TASK-18.1.2）。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -38,6 +38,7 @@ use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use super::namespace_join::NamespaceJoin;
+use super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
@@ -496,6 +497,13 @@ pub struct LaunchSpec {
     /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
     /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
     namespace_join: Option<NamespaceJoin>,
+    /// start が起動オプションと config を突き合わせた network の実効の扱い(NET-6・SEC-1・#3058)。
+    network: EffectiveNetwork,
+    /// 突き合わせに使ったモード(launcher が自身のモードと照合し、転送漏れによる縮退を拒否する)。
+    network_mode: LaunchNetworkMode,
+    /// `start` が使った状態ルート（`StateStore::host_state_root()`。管理ルートの `/etc/hosts` 等の元の場所を導く入力。
+    /// 無ければ `None`。NET-12・#1872）。
+    state_root: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -532,7 +540,45 @@ impl LaunchSpec {
             user,
             additional_gids: Vec::new(),
             namespace_join: None,
+            network: EffectiveNetwork::HostShared,
+            network_mode: LaunchNetworkMode::FromConfig,
+            state_root: None,
         }
+    }
+
+    /// 突き合わせた network の扱いとそのモードを載せる(`start` だけが呼ぶ。NET-6・#3058)。
+    pub(super) fn with_network(
+        mut self,
+        network: EffectiveNetwork,
+        mode: LaunchNetworkMode,
+    ) -> Self {
+        self.network = network;
+        self.network_mode = mode;
+        self
+    }
+
+    /// network の実効の扱い(NET-6・SEC-1)。`NewLoopback` は新しい netns の作成を要求する(実体は #3064 で実装済み)。
+    pub fn network(&self) -> EffectiveNetwork {
+        self.network
+    }
+
+    /// `network()` を決めた起動オプションのモード。
+    pub fn network_mode(&self) -> LaunchNetworkMode {
+        self.network_mode
+    }
+
+    /// `start` が使った状態ルートを載せる(`start` だけが呼ぶ。呼び出し側が任意のパスを渡す入口にしない。NET-12・#1872)。
+    pub(super) fn with_state_root(mut self, state_root: Option<PathBuf>) -> Self {
+        self.state_root = state_root;
+        self
+    }
+
+    /// `start` が使った状態ルート(`StateStore::host_state_root()` の値。無ければ `None`)。
+    ///
+    /// 本番 launcher が、`LaunchOptions::etc_files` の指定時に `<state_root>/@container-etc/<id>/` の生成物を
+    /// fork 前に検証するために使う(NET-12・#1872)。
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
     }
 
     /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。
@@ -1110,6 +1156,14 @@ pub trait ProcessLauncher: Send + Sync {
     /// （記録先なし）。ラッパー実装は必ず内側へ転送すること（転送しないと本番で監査が黙って落ちる）。
     fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
         None
+    }
+
+    /// 起動オプションの network モード(NET-6・SEC-1・#3058)。start が予約・fork より前に config と突き合わせる。
+    ///
+    /// 既定は `FromConfig`。ラッパー実装は必ず内側へ転送すること(転送しないと `FromConfig` へ黙って縮退する。
+    /// 本番 launcher は spec のモードと自身のモードの不一致を `FailedPrecondition` で拒否する)。
+    fn network_mode(&self) -> LaunchNetworkMode {
+        LaunchNetworkMode::FromConfig
     }
 
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。

@@ -113,11 +113,11 @@
 //!   チェインは空。saddr のみの masq は `bridge-nf-call-iptables` 有効環境で bridge 内通信まで書き換える）。
 //!   このため default route を張っても、コンテナ発の通信を host 外部へ届けるには masquerade と host の
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
-//! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
+//! - コンテナ単位のポート公開解除
 //!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
 //!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
 //!   再起動後のハンドル復元は未実装）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
+//! - IPAM 状態の永続化。担当 Issue 未確定（コンテナ単体の切り離しは `detach_container` で追加済み。#3062。作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
 //!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで。再起動後のネットワーク本体は手動。
 //!   所有記録の無い pin（旧い請求書・none モード）も手動。write-ahead は #1870 の後に再検討）
@@ -132,6 +132,7 @@ pub mod attach_claim;
 mod attach_fault;
 pub mod delete;
 pub mod ipam;
+pub mod listener_dump;
 pub mod publish;
 pub mod unpublish;
 
@@ -147,12 +148,19 @@ pub use attach_fault::{AttachFault, AttachFaultPoint, attach_container_with_faul
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
 #[cfg(target_os = "linux")]
+pub use delete::detach_container;
+#[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_attach;
 #[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_create;
-pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
+pub use delete::{
+    ContainerDetachError, DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport,
+};
 pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
+#[cfg(target_os = "linux")]
+pub use listener_dump::published_dnat_listeners;
+pub use listener_dump::{PublishedListener, PublishedListeners};
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 #[cfg(target_os = "linux")]
 pub use unpublish::unpublish_container_port;
@@ -1125,6 +1133,9 @@ const VETH_HOST_PREFIX: &str = "fcvh";
 /// veth の peer（コンテナ）側名のプレフィックス。
 const VETH_PEER_PREFIX: &str = "fcvp";
 
+/// コンテナの netns の中での peer の名前（attach が peer を改名する先。D11・NET-1・#3061）。
+pub const CONTAINER_IFNAME: &str = "eth0";
+
 /// 検証済みのエンドポイント ID（コンテナ 1 つの接続口の識別子。REPAIR-2）。`NetworkName` と同じ文字種規則
 /// （1〜64 バイト、先頭 `[a-z0-9]`、以降 `[a-z0-9_.-]`）で、netns の pin ファイル名にそのまま使う。
 /// ホスト全体で一意であること（veth 名は ID だけから導出する）は呼び出し側（状態レジストリ）の責務。
@@ -1256,7 +1267,7 @@ impl ContainerAttachSpec {
 ///
 /// peer 側は netns へ移動済みで、netns 内で `lo` と peer が up、払い出しアドレスの付与と default route
 /// （gateway = bridge アドレス）の設定、およびポート公開指定の DNAT 投入まで済んでいる
-/// （TASK-139.3・#316）。`eth0` へのリネームは未実施（REPAIR-3）。
+/// （TASK-139.3・#316）。peer は `eth0` へ改名済み（#3061）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct AttachedContainer<N> {
@@ -1269,8 +1280,11 @@ pub struct AttachedContainer<N> {
     /// host 側 veth の `IFLA_IFALIAS` に付けた所有トークン。ifindex は再利用されうるため、削除直前に
     /// このトークンの一致で元の veth であることを確認する（`delete_network`。TASK-139.4・NET-1）。
     pub host_token: String,
-    /// コンテナ netns に入った peer 側 veth の名前（netns 内での名前。リネーム前）。
+    /// veth 作成時の peer 側の名前。netns 内では `container_ifname` へ改名済みでこの名前では引けない。
+    /// `delete_network` の所有の照合に使う。
     pub peer_veth: IfName,
+    /// netns 内での peer の名前（[`CONTAINER_IFNAME`]。改名済み。NET-1・#3061）。
+    pub container_ifname: IfName,
     /// netns の pin 先パス。
     pub netns_path: PathBuf,
     /// 静的 IPAM で払い出し、netns 内の peer へ設定したアドレス。
@@ -1280,6 +1294,9 @@ pub struct AttachedContainer<N> {
     /// attach 時のポート公開で投入した DNAT ルールのハンドル（`ContainerAttachSpec` の公開指定の順。
     /// 個別の解除は `unpublish_container_port`。指定が無ければ空。NET-3・#2839）。
     pub published_ports: Vec<PublishedPort>,
+    /// 接続時に固定した pin の識別子（回収用。切り離しの請求書はこれを使い、現在のパスから採り直さない。
+    /// pin が作り直された場合に新世代の pin を指さないため。NET-1・#3062）。特定できなければ `None`。
+    pub(crate) pin_identity: Option<attach_claim::PinIdentity>,
 }
 
 impl<N> AttachedContainer<N> {
@@ -1318,6 +1335,8 @@ pub enum AttachStep {
     ConfigureLoopback,
     /// netns 内での peer 側 veth の ifindex 解決（移動で変わりうる）。
     ResolvePeer,
+    /// netns 内の peer の `eth0` への改名（D11・#3061）。
+    RenamePeer,
     /// netns 内の peer へのアドレス付与。
     AddAddress,
     /// netns 内の peer 側の up。
@@ -1587,6 +1606,9 @@ pub(crate) trait AttachOps {
     fn netns_link_index(&self, ns: &Self::Netns, name: &IfName) -> Result<IfIndex, NetError>;
     /// `ns` の中で ifindex 指定で up にする。
     fn netns_set_up(&self, ns: &Self::Netns, link: IfIndex) -> Result<(), NetError>;
+    /// `ns` の中で ifindex 指定で `link` の名前を `name` へ変える。down のうちに呼ぶこと（up 中は
+    /// カーネルが `EBUSY` を返す。NET-1・#3061）。
+    fn netns_rename(&self, ns: &Self::Netns, link: IfIndex, name: &IfName) -> Result<(), NetError>;
     /// `ns` の中で `link` にアドレスを付与する。
     fn netns_add_address(
         &self,
@@ -1603,6 +1625,10 @@ pub(crate) trait AttachOps {
     ) -> Result<(), NetError>;
     /// 接続成功時に netns 内の route ソケットを閉じる（fd を常駐させない。CORE-9）。
     fn release_netns_socket(&self, ns: &mut Self::Netns);
+    /// カーネル上の全 `fandhe_net_*` テーブルの DNAT を dump して、公開済みの受け口を返す
+    /// （読み取り専用。NET-3・#3063）。`ports.reserve` の前に呼び、他の状態ルートが公開済みの受け口との
+    /// 衝突を検出する。`ports` が空の接続では呼ばない。
+    fn published_listeners(&self) -> Result<PublishedListeners, NetError>;
     /// `table` の `prerouting` / `output` へ DNAT ルールを 1 バッチで投入する。
     /// 戻り値は `ports` と同じ順の `(prerouting, output)` のルールハンドル（echo 応答。NET-3）。
     fn publish_ports(
@@ -1770,8 +1796,9 @@ fn attach_with_source<O: AttachOps>(
         )));
     }
     // 何かを作る前の検査（すべて読み取りのみ）。失敗時は `source` をそのまま返す。
-    let precheck = || -> Result<(VethNames, Ipv4Addr), (NetError, AttachStep)> {
+    let precheck = || -> Result<(VethNames, Ipv4Addr, IfName), (NetError, AttachStep)> {
         let names = VethNames::derive(&spec.endpoint).map_err(|e| (e, AttachStep::DeriveNames))?;
+        let ifname = IfName::new(CONTAINER_IFNAME).map_err(|e| (e, AttachStep::RenamePeer))?;
         // default route の gateway（bridge アドレス）は IPv4 に限る。
         let IpAddr::V4(gateway) = spec.gateway.addr() else {
             return Err((
@@ -1794,7 +1821,7 @@ fn attach_with_source<O: AttachOps>(
         }
         // 接続先が作成時の bridge のままであることを確認する。
         match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
-            Ok(i) if i == spec.bridge_index => Ok((names, gateway)),
+            Ok(i) if i == spec.bridge_index => Ok((names, gateway, ifname)),
             Ok(_) => Err((
                 NetError::new(
                     NetErrorCode::FailedPrecondition,
@@ -1805,7 +1832,7 @@ fn attach_with_source<O: AttachOps>(
             Err(e) => Err((e, AttachStep::VerifyBridge)),
         }
     };
-    let (names, gateway) = match precheck() {
+    let (names, gateway, container_ifname) = match precheck() {
         Ok(v) => v,
         Err((e, step)) => {
             return Err(Box::new((
@@ -1916,8 +1943,19 @@ fn attach_with_source<O: AttachOps>(
     };
 
     // 公開する受け口を、ルールを入れる前に予約する。他のコンテナ・ネットワークが公開済みなら
-    // 接続を失敗させる（nft は重複ルールを拒否せず、後から入れた公開が機能しないため）。
-    if let Err(e) = ports.reserve(&spec.network, &spec.endpoint, &spec.ports) {
+    // 接続を失敗させる（nft は重複ルールを拒否せず、後から入れた公開が機能しないため）。予約表は
+    // 状態ルートごとのため、先にカーネルの `fandhe_net_*` の DNAT を dump して他の状態ルートが公開済みの
+    // 受け口との衝突も検出する（NET-3・#3063。照会から投入までの窓は `listener_dump` の未実装範囲）。
+    let reserved = if spec.ports.is_empty() {
+        Ok(())
+    } else {
+        ops.published_listeners()
+            .and_then(|published| {
+                listener_dump::ensure_no_listener_conflict(&published, &spec.ports)
+            })
+            .and_then(|()| ports.reserve(&spec.network, &spec.endpoint, &spec.ports))
+    };
+    if let Err(e) = reserved {
         let _ = ipam.release(&spec.endpoint);
         let mut report = AttachRollbackReport::default();
         rollback_veth(ops, names.host(), host_index, &mut report);
@@ -1925,69 +1963,78 @@ fn attach_with_source<O: AttachOps>(
     }
 
     // netns 内の設定 → ポート公開。ここからの失敗は veth・netns を戻す（モジュール doc）。
-    let published_ports =
-        match configure_in_netns(ops, spec, &netns, names.peer(), address, gateway) {
-            Ok(p) => p,
-            Err(f) => {
-                let mut report = AttachRollbackReport::default();
-                if f.ports_unknown {
-                    // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
-                    // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
-                    report.leftover.push((
-                        AttachResource::PortRules(spec.table.clone()),
-                        ResourceState::Unknown,
-                    ));
+    let published_ports = match configure_in_netns(
+        ops,
+        spec,
+        &netns,
+        (names.peer(), &container_ifname),
+        address,
+        gateway,
+    ) {
+        Ok(p) => p,
+        Err(f) => {
+            let mut report = AttachRollbackReport::default();
+            if f.ports_unknown {
+                // DNAT ルールが入っている可能性がある。ルールの不存在を確認・削除できるまで、アドレスと
+                // 受け口の予約を解放しない（別コンテナへ再払い出しすると、残ったルールがそちらへ転送しうる）。
+                report.leftover.push((
+                    AttachResource::PortRules(spec.table.clone()),
+                    ResourceState::Unknown,
+                ));
+                report
+                    .leftover
+                    .push((AttachResource::Address(address), ResourceState::Unknown));
+            }
+            rollback_veth(ops, names.host(), host_index, &mut report);
+            let back = if keep_netns {
+                Some(give_back(netns))
+            } else {
+                rollback_netns(ops, netns, &pin, &mut report);
+                None
+            };
+            if !f.ports_unknown {
+                // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
+                // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
+                // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
+                // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
+                if report.leftover.is_empty() {
+                    let _ = ipam.release(&spec.endpoint);
+                    // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
+                    if !spec.ports.is_empty()
+                        && ports.release(&spec.network, &spec.endpoint).is_err()
+                    {
+                        report.leftover.push((
+                            AttachResource::PortReservation(
+                                spec.network.clone(),
+                                spec.endpoint.clone(),
+                            ),
+                            ResourceState::Present,
+                        ));
+                    }
+                } else {
                     report
                         .leftover
                         .push((AttachResource::Address(address), ResourceState::Unknown));
                 }
-                rollback_veth(ops, names.host(), host_index, &mut report);
-                let back = if keep_netns {
-                    Some(give_back(netns))
-                } else {
-                    rollback_netns(ops, netns, &pin, &mut report);
-                    None
-                };
-                if !f.ports_unknown {
-                    // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
-                    // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
-                    // アドレスと受け口の予約を残して `leftover` で報告する（別コンテナへの再払い出しで衝突させない。
-                    // 特権操作の後始末の fail-closed）。解放は呼び出し側が資源の除去を確認してから行う。
-                    if report.leftover.is_empty() {
-                        let _ = ipam.release(&spec.endpoint);
-                        // 公開指定が無ければ共有予約表に予約は無い。解放の失敗は予約が残るため leftover で報告する。
-                        if !spec.ports.is_empty()
-                            && ports.release(&spec.network, &spec.endpoint).is_err()
-                        {
-                            report.leftover.push((
-                                AttachResource::PortReservation(
-                                    spec.network.clone(),
-                                    spec.endpoint.clone(),
-                                ),
-                                ResourceState::Present,
-                            ));
-                        }
-                    } else {
-                        report
-                            .leftover
-                            .push((AttachResource::Address(address), ResourceState::Unknown));
-                    }
-                }
-                return Err(Box::new((fail(f.error, f.step, report), back)));
             }
-        };
+            return Err(Box::new((fail(f.error, f.step, report), back)));
+        }
+    };
     ops.release_netns_socket(&mut netns);
 
+    let pin_identity = attach_claim::pin_identity_of(&pin);
     Ok(AttachedContainer {
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
         host_index,
         host_token,
         peer_veth: names.peer().clone(),
+        container_ifname,
         netns_path: pin,
         address,
         netns,
         published_ports,
+        pin_identity,
     })
 }
 
@@ -2005,7 +2052,7 @@ fn configure_in_netns<O: AttachOps>(
     ops: &O,
     spec: &ContainerAttachSpec,
     netns: &O::Netns,
-    peer: &IfName,
+    (peer, ifname): (&IfName, &IfName),
     address: IpPrefix,
     gateway: Ipv4Addr,
 ) -> Result<Vec<PublishedPort>, ConfigureFailure> {
@@ -2028,6 +2075,10 @@ fn configure_in_netns<O: AttachOps>(
     let peer_index = ops
         .netns_link_index(netns, peer)
         .map_err(step(AttachStep::ResolvePeer))?;
+    // `eth0` への改名は up の前でなければ `EBUSY` になる（移動直後の peer は down）。改名で ifindex は
+    // 変わらないので、以降は同じ `peer_index` を使う。netns 内に `eth0` が既にあれば `AlreadyExists`。
+    ops.netns_rename(netns, peer_index, ifname)
+        .map_err(step(AttachStep::RenamePeer))?;
     ops.netns_add_address(netns, peer_index, address)
         .map_err(step(AttachStep::AddAddress))?;
     ops.netns_set_up(netns, peer_index)
@@ -2117,8 +2168,10 @@ impl std::error::Error for PublishPortsError {}
 /// 操作（Linux では `send_dnat_batch`）。
 ///
 /// 手順: 件数と重複の検証 → コンテナのアドレスがネットワークのサブネット内の IPv4 であることの
-/// 再確認（取り違えの多層防御）→ 受け口の予約（衝突は `AlreadyExists`。この時点では何も変えない）→
-/// DNAT の 1 バッチ投入。確定的な失敗（`Aborted` / `NotSent`）では今回の予約だけを戻し、結果不明では
+/// 再確認（取り違えの多層防御）→ カーネルの `fandhe_net_*` の DNAT の dump と照合（`dump`。他の状態ルートが
+/// 公開済みの受け口との衝突は `AlreadyExists`、dump の失敗・上限超過・期限切れもここで失敗にする。
+/// NET-3・#3063）→ 受け口の予約（衝突は `AlreadyExists`。この時点では何も変えない）→
+/// DNAT の 1 バッチ投入。dump の失敗では予約に触れず、投入もしない（`rules_unknown = false`）。確定的な失敗（`Aborted` / `NotSent`）では今回の予約だけを戻し、結果不明では
 /// 予約を保持する。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn publish_ports_with(
@@ -2127,6 +2180,7 @@ pub(crate) fn publish_ports_with(
         Ipv4Addr,
         &[PortPublish],
     ) -> Result<Vec<RuleHandlePair>, NftApplyFailure>,
+    dump: impl FnOnce() -> Result<PublishedListeners, NetError>,
     network: &CreatedNetwork,
     endpoint: &EndpointId,
     container_addr: IpPrefix,
@@ -2167,6 +2221,8 @@ pub(crate) fn publish_ports_with(
             "container address is outside the network subnet",
         )));
     }
+    let published = dump().map_err(known)?;
+    listener_dump::ensure_no_listener_conflict(&published, ports).map_err(known)?;
     registry
         .reserve(&network.name, endpoint, ports)
         .map_err(known)?;
@@ -2231,9 +2287,14 @@ fn publish_failed(
 /// ハンドルを検証して保持する（応答が欠けた・壊れた場合は結果不明として予約を保持する。NET-3・#2839）。
 /// 個別の解除は [`unpublish_container_port`]。
 ///
+/// 予約の前に、カーネルの全 `fandhe_net_*` テーブルの DNAT を dump して受け口の衝突を検出する
+/// （他の状態ルートが公開済みの受け口との衝突は `AlreadyExists`。NET-3・#3063。`listener_dump`）。dump と
+/// DNAT の投入は `timeout` の 1 つの期限を共有する。
+///
 /// # 未実装範囲（REPAIR-3）
 /// [`PublishedPort`] のプロセス再起動後の復元は無い（`delete_network` がテーブルごと解放する）。
-/// masquerade と host の `ip_forward` は別途必要。
+/// masquerade と host の `ip_forward` は別途必要。dump から投入までの間に別の状態ルートが割り込む窓は
+/// 残る（共有ロックと事後確認は未実装。`listener_dump` の未実装範囲）。
 #[cfg(target_os = "linux")]
 pub fn publish_container_ports<N>(
     nft: &NetlinkNetfilterSocket,
@@ -2243,8 +2304,10 @@ pub fn publish_container_ports<N>(
     registry: &mut PortRegistry,
     timeout: Duration,
 ) -> Result<Vec<PublishedPort>, PublishPortsError> {
+    let deadline = crate::sys::Deadline::after(timeout);
     publish_ports_with(
-        |table, addr, ports| send_dnat_batch(nft, timeout, table, addr, ports),
+        |table, addr, ports| send_dnat_batch(nft, deadline.remaining(), table, addr, ports),
+        || listener_dump::scan_published_listeners(nft, &deadline),
         network,
         &container.endpoint,
         container.address,
@@ -2365,6 +2428,20 @@ impl AttachOps for LinuxAttachOps<'_> {
             .map(|_| ())
     }
 
+    fn netns_rename(
+        &self,
+        ns: &ContainerNetns,
+        link: IfIndex,
+        name: &IfName,
+    ) -> Result<(), NetError> {
+        let LinkRef::Index(index) = link_ref(link)? else {
+            unreachable!("link_ref always returns LinkRef::Index")
+        };
+        Self::ns_route(ns)?
+            .set_link(&LinkSet::rename(index, name.clone()), self.timeout)
+            .map(|_| ())
+    }
+
     fn netns_add_address(
         &self,
         ns: &ContainerNetns,
@@ -2399,6 +2476,10 @@ impl AttachOps for LinuxAttachOps<'_> {
 
     fn release_netns_socket(&self, ns: &mut ContainerNetns) {
         ns.release_route_socket();
+    }
+
+    fn published_listeners(&self) -> Result<PublishedListeners, NetError> {
+        published_dnat_listeners(self.nft, self.timeout)
     }
 
     fn publish_ports(
@@ -2476,9 +2557,9 @@ fn send_dnat_batch(
 /// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
 ///
 /// # 未実装範囲（REPAIR-3）
-/// `eth0` へのリネーム・masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
+/// masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
 /// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
-/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）。
+/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）、コンテナ 1 件だけの切り離しは `detach_container`（#3062）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
     route: &NetlinkRouteSocket,
@@ -3816,6 +3897,10 @@ mod attach_tests {
         fail_ns: Option<&'static str>,
         /// ポート公開の失敗（原因・バッチ結果）。
         fail_publish: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// カーネルの dump が返す公開済みの受け口（NET-3・#3063）。
+        kernel_listeners: PublishedListeners,
+        /// dump の失敗（原因）。
+        fail_scan: Option<NetErrorCode>,
     }
 
     impl Fake {
@@ -3940,6 +4025,13 @@ mod attach_tests {
             }
             Ok(())
         }
+        fn netns_rename(&self, (): &(), link: IfIndex, name: &IfName) -> Result<(), NetError> {
+            self.rec(format!("ns_rename {} {}", link.get(), name.as_str()));
+            if self.fail_ns == Some("ns_rename") {
+                return Err(err(NetErrorCode::AlreadyExists));
+            }
+            Ok(())
+        }
         fn netns_add_address(
             &self,
             (): &(),
@@ -3966,6 +4058,13 @@ mod attach_tests {
         }
         fn release_netns_socket(&self, (): &mut ()) {
             self.rec("release_socket");
+        }
+        fn published_listeners(&self) -> Result<PublishedListeners, NetError> {
+            self.rec("scan_listeners");
+            match self.fail_scan {
+                Some(c) => Err(err(c)),
+                None => Ok(self.kernel_listeners.clone()),
+            }
         }
         fn publish_ports(
             &self,
@@ -4116,6 +4215,7 @@ mod attach_tests {
                 "ns_index_lo lo".to_owned(),
                 "ns_up_lo 1".to_owned(),
                 format!("ns_index_peer {}", n.peer().as_str()),
+                "ns_rename 5 eth0".to_owned(),
                 "ns_addr 5 10.89.0.2/24".to_owned(),
                 "ns_up_peer 5".to_owned(),
                 "ns_route 10.89.0.1 5".to_owned(),
@@ -4125,6 +4225,7 @@ mod attach_tests {
         assert_eq!(a.host_index.get(), 21);
         assert_eq!(a.host_veth, *n.host());
         assert_eq!(a.peer_veth, *n.peer());
+        assert_eq!(a.container_ifname.as_str(), "eth0");
         assert_eq!(a.netns_path, pin_of("web-1"));
         assert_eq!(a.address, ip(2));
         // 削除時の残存 pin の照合用に、置き場のパスと識別子を払い出しと同時に記録する（TASK-139.4）。
@@ -4471,6 +4572,7 @@ mod attach_tests {
                 "ns_index_lo lo".to_owned(),
                 "ns_up_lo 1".to_owned(),
                 format!("ns_index_peer {}", n.peer().as_str()),
+                "ns_rename 5 eth0".to_owned(),
                 "ns_addr 5 10.89.0.2/24".to_owned(),
                 "ns_up_peer 5".to_owned(),
                 "ns_route 10.89.0.1 5".to_owned(),
@@ -4666,6 +4768,23 @@ mod attach_tests {
         assert_eq!(calls[n - 1], "release_socket");
     }
 
+    /// NET-1・#3061: 改名が失敗したら後の段（アドレス付与・up・route）へ進まない。
+    #[test]
+    fn net1_attach_rename_failure_stops_before_address_and_up() {
+        let f = Fake {
+            fail_ns: Some("ns_rename"),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        assert_eq!(e.step, AttachStep::RenamePeer);
+        let calls = f.calls();
+        assert!(calls.contains(&"ns_rename 5 eth0".to_owned()));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_addr")));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_up_peer")));
+        assert!(!calls.iter().any(|c| c.starts_with("ns_route")));
+    }
+
     /// NET-1・TASK-139.3: netns 内の各手順の失敗は、失敗手順と元のエラーを返し、IPAM の払い出し・veth・netns を戻す。
     #[test]
     fn net1_attach_netns_config_failures_roll_back_everything() {
@@ -4688,6 +4807,11 @@ mod attach_tests {
             (
                 "ns_addr",
                 AttachStep::AddAddress,
+                NetErrorCode::AlreadyExists,
+            ),
+            (
+                "ns_rename",
+                AttachStep::RenamePeer,
                 NetErrorCode::AlreadyExists,
             ),
             ("ns_up_peer", AttachStep::PeerUp, NetErrorCode::Internal),
@@ -4853,6 +4977,141 @@ mod attach_tests {
         assert_eq!(reg.len(), 1);
     }
 
+    /// NET-3・#3063: 別の状態ルートがカーネルに公開済みの受け口（自分の予約表には無い）を指定した接続は、
+    /// veth・netns・IPAM を戻して `AlreadyExists`（`PublishPorts`）で失敗し、DNAT は投入せず予約も増やさない。
+    /// 公開指定が無い接続では dump を呼ばない。dump 自体の失敗も同じ巻き戻しで失敗する。
+    #[test]
+    fn net3_attach_rejects_listener_published_in_kernel() {
+        let f = Fake {
+            kernel_listeners: PublishedListeners::from_ports_for_test(&[port(8080)]),
+            ..Default::default()
+        };
+        let mut pool = ipam();
+        let mut reg = PortRegistry::new();
+        let e = attach_container_with(
+            &f,
+            &spec_with_ports("c1", vec![port(9090), port(8080)]),
+            &mut pool,
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.step, AttachStep::PublishPorts);
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(
+            e.rollback.removed,
+            [
+                AttachResource::Veth(host_of("c1")),
+                AttachResource::Netns(pin_of("c1"))
+            ]
+        );
+        assert!(e.rollback.leftover.is_empty());
+        assert!(f.calls().iter().any(|c| c == "scan_listeners"));
+        assert!(!f.calls().iter().any(|c| c.starts_with("publish")));
+        assert_eq!(pool.allocated_count(), 0);
+        assert_eq!(reg.len(), 0);
+
+        // 衝突しない受け口は通る。
+        let ok = Fake {
+            kernel_listeners: PublishedListeners::from_ports_for_test(&[port(8080)]),
+            ..Default::default()
+        };
+        attach_container_with(
+            &ok,
+            &spec_with_ports("c2", vec![port(8081)]),
+            &mut pool,
+            &mut reg,
+        )
+        .unwrap();
+        assert_eq!(reg.len(), 1);
+
+        // dump の失敗は fail-closed（公開しない）。
+        let bad = Fake {
+            fail_scan: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        let e = attach_container_with(
+            &bad,
+            &spec_with_ports("c3", vec![port(8082)]),
+            &mut pool,
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.step, AttachStep::PublishPorts);
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert!(e.rollback.leftover.is_empty());
+        assert!(!bad.calls().iter().any(|c| c.starts_with("publish")));
+        assert_eq!(pool.allocated_count(), 1);
+        assert_eq!(reg.len(), 1);
+
+        // 公開指定が無い接続では dump を呼ばない。
+        let none = Fake {
+            fail_scan: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        attach_container_with(&none, &spec("c4"), &mut pool, &mut reg).unwrap();
+        assert!(!none.calls().iter().any(|c| c == "scan_listeners"));
+    }
+
+    /// NET-3・#3063: attach 後の公開は、dump で見つけた受け口との衝突を `AlreadyExists` で拒否し、
+    /// 投入せず予約にも触れない（`rules_unknown = false`）。dump の失敗（`Timeout`）でも同じ。
+    #[test]
+    fn net3_publish_rejects_kernel_conflict_before_reserving() {
+        let calls = RefCell::new(Vec::new());
+        let mut reg = PortRegistry::new();
+        let e = super::publish_ports_with(
+            |_, _, _| {
+                calls.borrow_mut().push("publish".to_owned());
+                Ok(test_handles(1))
+            },
+            || Ok(PublishedListeners::from_ports_for_test(&[port(8080)])),
+            &created(),
+            &eid("c1"),
+            ip(2),
+            &[port(8080)],
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::AlreadyExists);
+        assert!(!e.rules_unknown);
+        assert_eq!(reg.len(), 0);
+        assert!(calls.borrow().is_empty());
+
+        let e = super::publish_ports_with(
+            |_, _, _| {
+                calls.borrow_mut().push("publish".to_owned());
+                Ok(test_handles(1))
+            },
+            || Err(NetError::new(NetErrorCode::Timeout, "injected")),
+            &created(),
+            &eid("c1"),
+            ip(2),
+            &[port(8080)],
+            &mut reg,
+        )
+        .unwrap_err();
+        assert_eq!(e.error.code(), NetErrorCode::Timeout);
+        assert!(!e.rules_unknown);
+        assert_eq!(reg.len(), 0);
+        assert!(calls.borrow().is_empty());
+
+        // 衝突しない受け口なら投入まで進む。
+        super::publish_ports_with(
+            |_, _, _| {
+                calls.borrow_mut().push("publish".to_owned());
+                Ok(test_handles(1))
+            },
+            || Ok(PublishedListeners::from_ports_for_test(&[port(8080)])),
+            &created(),
+            &eid("c1"),
+            ip(2),
+            &[port(8081)],
+            &mut reg,
+        )
+        .unwrap();
+        assert_eq!(calls.borrow().len(), 1);
+        assert_eq!(reg.len(), 1);
+    }
+
     /// NET-1・TASK-139.3: 公開指定の件数上限と受け口の重複は `InvalidArgument`。
     #[test]
     fn net1_port_publishes_limits_and_duplicates() {
@@ -4891,6 +5150,7 @@ mod attach_tests {
                     None => Ok(test_handles(ports.len())),
                 }
             },
+            || Ok(PublishedListeners::default()),
             &created(),
             &eid("c1"),
             addr,
@@ -4923,6 +5183,7 @@ mod attach_tests {
         let mut reg = PortRegistry::new();
         let e = super::publish_ports_with(
             |_, _, _| Ok(test_handles(1)),
+            || Ok(PublishedListeners::default()),
             &created(),
             &eid("c1"),
             ip(2),

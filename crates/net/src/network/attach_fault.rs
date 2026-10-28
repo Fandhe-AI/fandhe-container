@@ -18,8 +18,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use super::{
-    AttachOps, AttachStep, EndpointId, NetnsFailure, NftApplyFailure, PortPublish, RuleHandlePair,
-    UnpinFailure,
+    AttachOps, AttachStep, EndpointId, NetnsFailure, NftApplyFailure, PortPublish,
+    PublishedListeners, RuleHandlePair, UnpinFailure,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
@@ -170,6 +170,9 @@ impl<O: AttachOps> AttachOps for FaultyAttachOps<O> {
     fn netns_set_up(&self, ns: &Self::Netns, link: IfIndex) -> Result<(), NetError> {
         self.inner.netns_set_up(ns, link)
     }
+    fn netns_rename(&self, ns: &Self::Netns, link: IfIndex, name: &IfName) -> Result<(), NetError> {
+        self.inner.netns_rename(ns, link, name)
+    }
     fn netns_add_address(
         &self,
         ns: &Self::Netns,
@@ -190,6 +193,9 @@ impl<O: AttachOps> AttachOps for FaultyAttachOps<O> {
     }
     fn release_netns_socket(&self, ns: &mut Self::Netns) {
         self.inner.release_netns_socket(ns);
+    }
+    fn published_listeners(&self) -> Result<PublishedListeners, NetError> {
+        self.inner.published_listeners()
     }
     fn publish_ports(
         &self,

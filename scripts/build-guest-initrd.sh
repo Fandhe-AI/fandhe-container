@@ -30,6 +30,9 @@
 # 出力は排他ロック（<出力先>.lock）の下で ln により確定し、既存を上書きしない。ビルドは専用の
 # target ディレクトリと umask 077 で行う。cargo・gzip は期限つきで、超過時はグループごと停止する
 # （REPAIR-5）。macOS でのリンクは未検証（Linux x86_64 で rust-lld により確認）。
+# fd 経由の権限検査（/dev/fd/9 への find -L）が有効なのは Linux で確認済み。macOS では /dev/fd/N（fdesc）
+# 経由で効くか未確認で（原因の切り分けは #2088。観測は scripts/probe-dev-fd-perm.sh）、パス側の重ねがけは
+# 早期拒否であって差し替え対策の根拠ではない。macOS では --init に自分の管理下のパスを渡すこと（REPAIR-3）。
 #
 # 前提ツール: cargo と aarch64-unknown-linux-musl の target（--init 無指定時）・gzip（gzip 時）・
 #   od・sha256sum または shasum・mktemp・find
@@ -417,7 +420,7 @@ copy_input() {
         exit 2
     fi
     # macOS の /dev/fd/N（fdesc）では上の fd 経由の権限検査が効かないことがあるため、パス側でも同じ検査を
-    # 重ねる（早期拒否。パスの検査は安全性の根拠にしない。fd 検査は Linux で有効）。
+    # 重ねる（早期拒否。パスの検査は安全性の根拠にしない。fd 検査は Linux で有効、macOS では未確認で #2088）。
     if [ -n "$(find "$init_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
         err_code bad-input "init must not be group or other writable"
         exit 2

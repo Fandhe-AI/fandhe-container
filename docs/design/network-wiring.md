@@ -2,7 +2,7 @@
 
 `crates/net` に実装済みの `--add-host`・`--dns`・host / none モード・ユーザー定義ネットワーク・DNS ヘルパーを、統一 CLI と supervisor の起動経路から呼べるようにするための結線を設計として確定する。呼び出し主体・順序・後始末・netns への参加方法・hosts / resolv.conf・プロセスをまたぐ状態・排他と期限を決め、残りの実装 issue を起票する。
 
-> **位置づけ**: 本書は #1870 の設計確定である。D1〜D12・D14〜D16 は main（opus）が確定した設計で、実装 issue の入力になる。**D13（rootful のユーザー定義ネットワークの実行主体）だけはオーナー承認待ち**で、決定扱いにしない（人間担当の判断 issue は #3057）。D13 に依存する実装は #3057 の判断が出るまで着手しない。
+> **位置づけ**: 本書は #1870 の設計確定である。D1〜D12・D14〜D16 は main（opus）が確定した設計で、実装 issue の入力になる。**D13（rootful のユーザー定義ネットワークの実行主体）だけはオーナー承認待ち**で、決定扱いにしない（人間担当の判断 issue は #3057）。D13 に依存する実装は #3057 の判断が出るまで着手しない。判断シートは D13 節の末尾「D13 の承認事項（判断シート）」にある。
 
 - 対象ビヘイビア: NET-6・NET-12（関連: NET-1〜NET-5・NET-7・NET-9・NET-11・CLI-1・CORE-1・CORE-6・SEC-1・SEC-4・SEC-5・SUP-12・SUP-14・PLUG-1・PLUG-12・REPAIR-2〜REPAIR-5・ERR-1）
 - タスク: TASK-185・TASK-143 の追補（MS-6・MS-8）
@@ -118,6 +118,12 @@
   - 先が symlink: `InvalidArgument`（`RESOLVE_IN_ROOT` で解決する案は残余）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
   - rootless は `SingleId`・`SubordinateIds` のどちらでも、元のファイルの所有者はコンテナの root に当たる uid で 0644 なので読める。mount はコンテナの user namespace が所有する mount namespace の中で行う
   - 後始末: start の失敗時は supervisor が自分で作ったものを消す。CLI の `delete` が成功した後に `@container-etc/<id>` を消す（`@container-options` と同じ条件）。plugin-cri は作らない
+- **実装の補足（#1872。core 側の実装済みの範囲）**:
+  - core の公開 API は `etc_files`（`create_etc_files`・`remove_etc_files`・`check_etc_overlaps`）と、launcher の起動オプション `LaunchOptions::with_etc_files`、pivot 前段の `exec::mount_etc_files`（`inject_files` の後・`mount_binds` の前。`PrePivotStep::EtcFiles`・`IsolationStage::MountEtcFiles`）。`CreateRequest`・`StateRecord` には何も足さない
+  - `create_etc_files` は `<id>` が既にあれば `ALREADY_EXISTS` で拒否する。「start のたびに作り直す」は呼び出し側（supervisor。#1873・#3065）が `remove_etc_files` の後に `create_etc_files` を呼んで実現する
+  - mount のモード: 既定は rw（D9 のとおり）。実効の `root.readonly=true` では ro で載せる（containerd の `containerMounts` が `readonly_rootfs` を hosts / resolv.conf の `Readonly` に写す挙動に揃えた、閉じた側の選択。一次情報の確認は #2859 に残し、違えば緩める）。ro のときに先が無いなら rootfs へ書かず `FailedPrecondition`
+  - 元の検証は 2 段: launcher が fork 前に所有者・権限・nlink を検査して `(st_dev, st_ino)` を記録し、子（新しい mount namespace）が同じ正規化済みパスを辿り直して `(st_dev, st_ino)` と nlink 1 の一致を要求する（user namespace の中では uid が写像後の値になるため）
+  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、先が symlink のときの `RESOLVE_IN_ROOT`、`RootfulHostRoot`（launcher が拒否。#2241）
 - **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。
 
 ### D10 ネットワーク定義の状態ストア（CORE-1）
@@ -191,6 +197,39 @@
 - 関連する承認待ち: RootfulHostRoot（#2241）。plugin の起動の配線（#1869）は closed で、[plugin-backend-wiring.md](plugin-backend-wiring.md) の設計案に従う。
 - spec 側への確認事項: 作成・削除を最初の attach / 最後の detach へ遅らせると、NET-4 の「ネットワーク作成・削除」の時間の意味が変わる。
 
+#### D13 の承認事項（判断シート）
+
+すべて未決である（2026-10-27 時点）。窓口は #3057（open のまま）。返答は「D13-1: A / D13-2: 推奨どおり / D13-3: (a)、spec へ持ち込む / D13-4: 推奨どおり」の形で受ける。回答を受けたら #3057 にコメントで記録して close し、下の棚卸しに沿って設計文書を更新する。
+
+| 番号 | 判断事項 | 選択肢 | 推奨 | 影響 | 判断 |
+| ---- | -------- | ------ | ---- | ---- | ---- |
+| D13-1 | rootful の `NetworkPlugin` 実装（plugin プロセス）の置き場所 | (A) 新 crate `fandhe-container-plugin-net`（bin） / (B) plugin-cri のバイナリに `NetworkPlugin` の RPC を足す / (C) supervisor の中で net を直接呼ぶ | (A) | 下の補足を参照 | 未決 |
+| D13-2 | カーネル資源（bridge・nft のテーブル・DNS ヘルパー）を作る・消す時点 | (i) 遅延: `network create` は定義と subnet の予約だけ。最初の attach で `create_network`、最後の detach で `delete_network` / (ii) 即時: `network create` の時点で作る | (i) | (i) は特権を持たない CLI の前提を崩さない。NET-4 の「作成・削除」の時間の意味が変わる（D13-3）。(ii) は CLI の `network create/rm` にも特権の経路（ランチャー経由の一時プロセス）が要り、SUP-14 の特権の面が広がる | 未決 |
+| D13-3 | D13-2 が (i) のときの NET-4 の計測区間（spec リポ側の事項。本リポでは決めない） | (a) plugin の `create_network` / `delete_network` の RPC 単体を「作成・削除」とする / (b) 最初の attach（作成と接続）・最後の detach（切り離しと削除）をまとめて計測する / (c) CLI の `network create/rm` を計測する | (a)（PoC-15 の計測区間に最も近い。(b) は補助の値として残す） | NET-4 の期待値の読み方と #319 条件 2〜4 の計測手順が決まる。(c) は記録だけの時間のため Docker との比較に意味が無い。spec の文言を改めるかはオーナーが spec リポで判断する | 未決（spec 側） |
+| D13-4 | #2241（RootfulHostRoot）と合わせて判断する必要があるか | 独立に判断する / #2241 の回答を待つ | 独立に判断する | D13 の rootful は、ランチャー経由で ambient capability を持つ非 root の supervisor が、user namespace の中のコンテナのために init user namespace 所有の netns を用意する構成（[privilege-separation.md](privilege-separation.md)）。#2241 は uid 0 のまま user namespace を作らない権限モデルの採否で、どの答えでも D13 の前提は崩れない。D13-1 の推奨は #2241 の結論に依存しない | 未決 |
+
+D13-1 の補足（選択肢ごとの影響）:
+
+- (A) 新 crate `fandhe-container-plugin-net`
+  - [crate-naming.md](crate-naming.md) の確定一覧への追加（plugin 系 6 個目）とオーナー承認が要る。PLUG-11 の発見はバイナリ名 `fandhe-container-plugin-*` で行うので、命名規約に合う
+  - plugin-cri の `crates/plugin-cri/src/netsetup.rs`（`NetsetupNetwork`・`LinuxNetsetup`）と `netsetup/reclaim_store.rs` を新 crate の lib へ移し、plugin-cri がそれに依存する形にする（ワークスペース内の依存辺が 1 本増える。外部依存が増えるなら別途承認が要る）
+  - 許可済みハッシュ一覧（[plugin-hash-allowlist.md](plugin-hash-allowlist.md)）の対象と、`scripts/install-privileged-launcher.sh`・`docs/setup/linux.md` の配置対象に加わる。PLUG-11 の検証対象のバイナリが 1 つ増える
+  - PLUG-4 の判定（core の rlib の sha256）では core が変わらない
+- (B) plugin-cri に RPC を足す: crate は増えない。一方で CRI（kubelet 向け）と CLI 経路が 1 つのバイナリを共有し、plugin-cri の更新と信頼性検証の単位に CLI の rootful 経路が巻き込まれる（REPAIR-1）。plugin-cri の常駐起動と、CLI 経路の一時起動を両立させる設計が別に要る
+- (C) supervisor から net を直接呼ぶ: 2026-10-15 のオーナー決定（rootful のネットワーク設定は plugin 側）に反する。選ぶならその決定の変更が先に要り、D5 の表と crate-naming.md の net 行も改める
+- どの案でも変わらないもの: D14 の `net-helpers` cgroup・`CLONE_INTO_CGROUP` での起動、init user namespace 所有の netns への参加（D12）は承認まで実装しない
+
+#### D13 の決定後の変更の棚卸し
+
+本節の時点では何も変えていない。D13-1 の回答ごとに触れる箇所は次のとおり。
+
+| 区分 | (A) のとき | (B) のとき | 共通 |
+| ---- | ---------- | ---------- | ---- |
+| 設計文書 | `crate-naming.md` の確定一覧・plugin 系の数・決定の追記、本書 D5 の表の「置き場所は承認待ち」と D13 の「承認待ち」の解除、冒頭の位置づけ注記 | 本書の D5・D13、[plugin-backend-wiring.md](plugin-backend-wiring.md) の plugin-cri の役割 | `docs/architecture.md` の設計ドラフト行を確定済み設計判断の表へ移す。crate を足すときは `CLAUDE.md` のリポジトリ構造も更新する |
+| 実装 issue | 新 crate の雛形と netsetup の移設の issue を親 #3056 の配下に起票する（承認後） | plugin-cri への RPC 追加の issue | #3069・#3074・#3075 の依存欄から #3057 を外す。#3074 の本文に選んだ置き場所を書く |
+| 試験 | 新 crate の既定のテスト集合で、`create_network` / `attach` / `detach` / `delete_network` の順序と参照カウント（0→1・1→0）を具体値で照合する | plugin-cri 側で同じ照合 | 実機前提（`CAP_NET_ADMIN`・init user namespace の netns）の試験は `#[ignore]` で分離し、`AGENTS.md`「実機前提テスト」に実行方法を書く（#3074・#3069 で行う） |
+| spec 側 | — | — | D13-3 の回答に応じた NET-4 の文言の見直し（spec リポ側の課題。本リポからは編集しない） |
+
 ### D14 失敗時のロールバック・stop / delete の後始末
 
 - **決定**: supervisor の start の順序は、(1) 文書の復号、(2) hosts の作成と、host / none の resolv.conf の書き込み（D9）、(3) rootful のみ plugin の `attach`（D13）と、bridge の resolv.conf の生成（D9。ヘルパーのアドレスは attach の結果から得る）、(4) cgroup、(5) launch（netns の作成 / 参加）、(6) host / none の照合（D8）、(7) 報告。k 段目で失敗したら k−1 段目から逆順に戻す（detach → 生成ファイルの削除）。none / host ではカーネル資源の巻き戻しは無い（netns はプロセスと一緒に消える）。
@@ -243,7 +282,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | masquerade 本体 | `crates/net/src/network.rs`・`nftables_rules` | なし（NET-1 の期待の一部。#349 の上流 DNS はヘルパーが host の netns から送るため不要。#319 の 3 経路の (c) も DNAT のみ） | #3060・#3073 |
 | `eth0` へのリネーム | `netlink_route/link.rs` | なし | #3061 |
 | コンテナ単体の detach | `crates/net/src/network/delete.rs` | #319 条件 4（削除）・CLI の stop | #3062 |
-| 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/publish.rs` | なし | #3063 |
+| 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/listener_dump.rs`・`publish.rs` | なし | #3063（公開前の DNAT の dump と照合は実装済み。共有ロックと投入後の事後確認は未実装で、#3191 で追跡する） |
 | plugin-cri の netsetup の永続化 | `crates/plugin-cri/src/netsetup.rs` | なし | #3075 |
 | rootless のユーザー定義名（pasta） | net・supervisor | #349 条件 1（rootless）。条件 2 は NET-9 で約束しないため対象外 | #1936〜#1940 |
 | stack の `[networks]` の up / down | stack・cli | なし | #617（D10 の定義ストアを使う） |
@@ -269,7 +308,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | issue | 内容 | 担当 | 依存 |
 | ----- | ---- | ---- | ---- |
 | #3058 | core: `LaunchOptions` の network モードと config との突き合わせ（D7） | runtime-builder | なし |
-| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 |
+| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6。実装済み） | runtime-builder | #3058 |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし |
 | #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 |
@@ -304,7 +343,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 - CLI のポート公開フラグ（`-p` / `--publish`）が CLI-1・NET-6 に無い。pasta（NET-9）と rootful のどちらでも入口が要る
 - `network create` のオプション（subnet 等）が spec に無い。本設計では持たず、subnet は pool から自動で予約する（D13 の推奨）
 - rootless で `--network <名前>` に事前の `network create` を要するか。本設計は「要る」と読む（NET-6 の入口の定義から）。確認を求める
-- rootful で作成・削除を最初の attach / 最後の detach に遅らせると、NET-4 の作成・削除時間の意味が変わる（D13 と #3057 で判断する）
+- rootful で作成・削除を最初の attach / 最後の detach に遅らせると、NET-4 の作成・削除時間の意味が変わる（D13 と #3057 で判断する）。判断シートの D13-3 を参照
 
 ## 残余・見直し条件
 

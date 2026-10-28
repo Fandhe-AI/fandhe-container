@@ -33,8 +33,8 @@ use fandhe_container_core::launch_isolation::{
 };
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    LaunchSpec, LaunchedProcess, LifecycleOp, ProcessExit, ProcessLauncher, StartTimeouts, create,
-    recover_interrupted_start, start,
+    EffectiveNetwork, LaunchNetworkMode, LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError,
+    ProcessExit, ProcessLauncher, StartTimeouts, create, recover_interrupted_start, start,
 };
 #[cfg(target_os = "linux")]
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -222,6 +222,10 @@ struct FakeLauncher {
     /// 起動した模擬プロセスの terminate を失敗させるか。
     fail_terminate: AtomicBool,
     gate: Gate,
+    /// `network_mode` が返す起動オプションのモード（既定 `FromConfig`。NET-6・#3058）。
+    network_mode: Mutex<LaunchNetworkMode>,
+    /// 起動ごとに渡された spec の実効 network（NET-6・#3058）。
+    launched_networks: Mutex<Vec<EffectiveNetwork>>,
     /// 起動した模擬プロセスが返す launch 時の分離の記録（既定は `None`）。
     #[cfg(target_os = "linux")]
     isolation: Mutex<Option<LaunchIsolationRecord>>,
@@ -236,9 +240,15 @@ impl FakeLauncher {
             confirms_no_process: AtomicBool::new(true),
             fail_terminate: AtomicBool::new(false),
             gate: Gate::new(true),
+            network_mode: Mutex::new(LaunchNetworkMode::FromConfig),
+            launched_networks: Mutex::new(Vec::new()),
             #[cfg(target_os = "linux")]
             isolation: Mutex::new(None),
         })
+    }
+
+    fn set_network_mode(&self, mode: LaunchNetworkMode) {
+        *self.network_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
 
     #[cfg(target_os = "linux")]
@@ -305,6 +315,10 @@ impl LaunchedProcess for FakeProcess {
 }
 
 impl ProcessLauncher for FakeLauncher {
+    fn network_mode(&self) -> LaunchNetworkMode {
+        *self.network_mode.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -314,6 +328,10 @@ impl ProcessLauncher for FakeLauncher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(spec.args().to_vec());
+        self.launched_networks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(spec.network());
         self.launched_binds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1061,4 +1079,119 @@ fn core2_oci5_sup6_launch_isolation_survives_and_is_replaced_across_restart_writ
         .expect("status update");
     let got = get_record(&sd.open_store(), "it-riso");
     assert_eq!(got.launch_isolation(), Some(&rec2));
+}
+
+/// network エントリを足した config。
+fn config_with_network_entry(entry: Value) -> Value {
+    let mut cfg = valid_config();
+    cfg["linux"]["namespaces"]
+        .as_array_mut()
+        .expect("array")
+        .push(entry);
+    cfg
+}
+
+/// 指定モードで start を試み、予約の前に拒否される（launcher 0 回・記録は Created のまま）ときの誤りを返す。
+fn net6_start_rejected(name: &str, cfg: &Value, mode: LaunchNetworkMode) -> OciRuntimeError {
+    let b = Bundle::ready(name, cfg);
+    let store = MemStateStore::new(None);
+    b.create(&store, name);
+    let launcher = FakeLauncher::new();
+    launcher.set_network_mode(mode);
+    let err = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req(name),
+        &StartTimeouts::default(),
+    )
+    .expect_err("must be rejected");
+    assert_eq!(launcher.launches(), 0, "{name}");
+    assert_eq!(
+        store.status_of(name).state(),
+        ContainerState::Created,
+        "{name}"
+    );
+    err
+}
+
+/// NET-6・SEC-1（#3058）: `Host` / `Loopback` と path 付きの network エントリの衝突は `InvalidArgument`。
+#[test]
+fn net6_sec1_start_rejects_network_mode_conflicting_with_path() {
+    let cfg = config_with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
+    for (name, mode) in [
+        ("it-net6-host-path", LaunchNetworkMode::Host),
+        ("it-net6-loop-path", LaunchNetworkMode::Loopback),
+    ] {
+        let err = net6_start_rejected(name, &cfg, mode);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+        assert_eq!(
+            err.message(),
+            "the network mode conflicts with a linux.namespaces network path",
+            "{name}"
+        );
+    }
+}
+
+/// NET-6・SEC-1（#3058）: `Host` で `net.*` の sysctl はホストの値を書き換えるため `InvalidArgument`。
+#[test]
+fn net6_sec1_start_rejects_net_sysctl_in_host_mode() {
+    let mut cfg = config_with_network_entry(json!({"type": "network"}));
+    cfg["linux"]["sysctl"] = json!({"net.ipv4.ip_forward": "1"});
+    let err = net6_start_rejected("it-net6-host-sysctl", &cfg, LaunchNetworkMode::Host);
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        "linux.sysctl net.* requires a network namespace"
+    );
+}
+
+/// NET-6（#3058）: 既定の `FromConfig` で network エントリありは従来どおり `Unimplemented`（launcher 0 回）。
+#[test]
+fn net6_start_from_config_with_network_entry_is_unimplemented() {
+    let cfg = config_with_network_entry(json!({"type": "network"}));
+    let err = net6_start_rejected("it-net6-fromcfg", &cfg, LaunchNetworkMode::FromConfig);
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "start does not support yet: network / cgroup / time namespace"
+    );
+}
+
+/// NET-6（#3058）: `Host` + path 無しの network エントリは受理され、spec の実効 network は `HostShared`。
+/// `Loopback` + path 無しは `NewLoopback`（実体の作成は #3064 で実装済み）。
+#[cfg(target_os = "linux")]
+#[test]
+fn net6_start_accepts_pathless_entry_and_reports_effective_network() {
+    for (name, mode, expected) in [
+        (
+            "it-net6-host-ok",
+            LaunchNetworkMode::Host,
+            EffectiveNetwork::HostShared,
+        ),
+        (
+            "it-net6-loop-ok",
+            LaunchNetworkMode::Loopback,
+            EffectiveNetwork::NewLoopback,
+        ),
+    ] {
+        let b = Bundle::ready(name, &config_with_network_entry(json!({"type": "network"})));
+        let store = MemStateStore::new(None);
+        b.create(&store, name);
+        let launcher = FakeLauncher::new();
+        launcher.set_network_mode(mode);
+        let _started = start(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            &start_req(name),
+            &short_timeouts(),
+        )
+        .expect("start");
+        assert_eq!(
+            *launcher.launched_networks.lock().expect("lock"),
+            vec![expected],
+            "{name}"
+        );
+    }
 }

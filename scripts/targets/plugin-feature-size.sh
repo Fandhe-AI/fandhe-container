@@ -4,8 +4,9 @@
 #
 # CI の bench-regression ジョブ（ubuntu-latest 単独。サイズは OS 間で比較できないため）が実行し、stdout の
 # markdown 表を $GITHUB_STEP_SUMMARY へ追記する。`make ci` には含めない。記録文書: docs/design/plugin-feature-size-record.md
-# - 計測対象は rlib: 最終バイナリ（CLI bin）は TASK-79 で追加予定のため未存在。TASK-79 後に実行ファイルのサイズへ
-#   切り替える（REPAIR-3: 実装済みを装わない）。
+# - 計測対象は rlib（#2170 の判断）: CLI の bin はあるが、cli が fandhe-container-plugin に直接依存し、supervisor が
+#   core を既定 feature で引くため、plugin なしの実行ファイルを作れない。実行ファイルへの切り替えは cli・supervisor の
+#   feature 伝播の設計の後（REPAIR-3: 実装済みを装わない）。
 # - `-p fandhe-container-core` で計測する: workspace 全体の `--no-default-features` は supervisor が core を既定
 #   feature つきで依存するため feature 統合で plugin が再有効化され、除外ビルドにならない。
 # - ゲート配下は現状再エクスポートのみで、core rlib の差は僅少（合計差は plugin rlib 自体が占める）。軽量化効果の実測ではない。
@@ -64,7 +65,7 @@ echo "### plugin feature size record (PLUG-3, TASK-111.2)"
 echo
 echo "- rustc: $(rustc --version)"
 echo "- platform: $(uname -sm)"
-echo "- profile: release (rlib size; the final binary does not exist yet, see TASK-79)"
+echo "- profile: release (rlib size; see #2170 for why the executable is not measured)"
 echo
 echo "| build | core rlib (bytes) | plugin rlib (bytes) | total (bytes) |"
 echo "| ----- | ----------------- | ------------------- | ------------- |"
@@ -72,5 +73,5 @@ echo "| default | ${core_def} | ${plugin_def} | ${total_def} |"
 echo "| --no-default-features | ${core_np} | - (not built) | ${core_np} |"
 echo
 echo "- difference (default - no-default-features): ${diff} bytes (${pct} %)"
-echo "- note: measured on rlibs because no final binary exists yet; switch to the executable after TASK-79."
+echo "- note: measured on rlibs because the CLI executable cannot be built without the plugin crate (cli depends on it directly and supervisor enables the core plugin feature); see #2170."
 echo "- note: the total difference is dominated by the plugin rlib itself (an intermediate artifact, not linked size); the core rlib difference is ${core_diff} bytes because the gated code is re-exports only. This is not a measurement of the weight-saving effect."

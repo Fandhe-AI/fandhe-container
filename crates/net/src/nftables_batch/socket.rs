@@ -7,6 +7,8 @@
 //!
 //! # 構成と責務境界
 //!
+//! - dump（`dump_table_names`・`dump_rules`。NET-3・#3063）は読み取り専用で、`NetlinkRouteSocket::dump_with_seq`
+//!   に `NLMSG_DONE` 終端を明示して往復する
 //! - ソケットの open / bind / send / recv は `NetlinkRouteSocket`（TASK-136.2。protocol だけ
 //!   `NETLINK_NETFILTER` に差し替えて再利用）が担い、本型は seq の採番・往復の直列化・期限の管理だけを持つ。
 //!   rtnetlink 固有の往復（dump / DONE の終端規則）は公開しない
@@ -29,13 +31,14 @@ use std::time::Duration;
 use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{
     BATCH_MARKER_LEN, ChainGet, ChainInfo, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC,
-    NFT_MSG_NEWCHAIN, NFT_MSG_NEWTABLE, NfGenMsg, NftBatch, NftBatchBytes, TableGet, TableInfo,
-    nfnl_msg_type,
+    NFT_MSG_NEWCHAIN, NFT_MSG_NEWTABLE, NfGenMsg, NftBatch, NftBatchBytes, NftFamily, NftName,
+    TableDump, TableGet, TableInfo, decode_table_name, nfnl_msg_type,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgBuilder};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
+use crate::nftables_rules::{DumpedRule, NFT_MSG_NEWRULE, RuleDump};
 use crate::sys::Deadline;
 
 /// bind 済みの `NETLINK_NETFILTER` ソケット（NET-11）。
@@ -305,6 +308,95 @@ impl NetlinkNetfilterSocket {
             .find(|m| m.msg_type() == want)
             .ok_or_else(|| NetError::new(NetErrorCode::DataLoss, "no NEWCHAIN in chain reply"))?;
         ChainInfo::decode(msg.payload())
+    }
+
+    /// `family` のテーブル名を `NFT_MSG_GETTABLE` の dump で全件列挙する（読み取り専用。NET-3・#3063）。
+    ///
+    /// 公開の前に他の状態ルートの `fandhe_net_*` テーブルを見つけるための入口。応答はカーネル由来の外部入力で、
+    /// 接頭辞 `prefix` に一致するテーブルだけを返し（他者のテーブルは名前を検証せず読み飛ばす）、
+    /// 一致したものが復号できなければ `DataLoss`（fail-closed）。総数の上限 `max_total`（接頭辞で絞る前の件数）を超えたら `ResourceExhausted`。
+    /// 一致したテーブル数の上限は呼び出し側が掛ける（応答の総量は `MAX_REPLY_BYTES` / `MAX_REPLY_MESSAGES` で既に上限がある）。`timeout` は順番待ちと
+    /// 往復を通した全体の期限（REPAIR-5）。dump 中の変更（`NLM_F_DUMP_INTR`）は `FailedPrecondition`。
+    /// seq の確保は [`Self::table_info`] と同じ（バッチ用の空間から取り、再利用しない）。
+    pub fn dump_table_names(
+        &self,
+        family: NftFamily,
+        prefix: &str,
+        max_total: usize,
+        timeout: Duration,
+    ) -> Result<Vec<NftName>, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let req = TableDump::new(family);
+        let reply = self.inner.dump_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        // 接頭辞で絞る前の総数に上限を掛ける（他者のテーブルも数える。絞り込み後の件数では
+        // 総数の上限が効かないため）。
+        if reply.messages().len() > max_total {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many nftables tables in the dump reply",
+            ));
+        }
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWTABLE);
+        let mut names = Vec::new();
+        for m in reply.messages() {
+            if m.msg_type() != want {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "unexpected message type in table dump reply",
+                ));
+            }
+            // 接頭辞に一致しない他者のテーブルは読み飛ばす（名前を検証しない）。
+            if let Some(n) = decode_table_name(m.payload(), family, prefix)? {
+                names.push(n);
+            }
+        }
+        Ok(names)
+    }
+
+    /// 1 テーブルの全ルールを `NFT_MSG_GETRULE` の dump で列挙する（読み取り専用。NET-3・#3063）。
+    ///
+    /// 要求にテーブル名を付けてカーネル側で絞り込む。応答の各ルールの family・テーブル名が要求と
+    /// 一致することを確かめ、1 件でも復号できなければ `DataLoss`。期限・seq・`NLM_F_DUMP_INTR` の扱いは
+    /// [`Self::dump_table_names`] と同じ。ルールのハンドルは読まない（#3068 の担当）。
+    pub fn dump_rules(
+        &self,
+        req: &RuleDump,
+        timeout: Duration,
+    ) -> Result<Vec<DumpedRule>, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let reply = self.inner.dump_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        reply
+            .messages()
+            .iter()
+            .map(|m| {
+                if m.msg_type() != want {
+                    return Err(NetError::new(
+                        NetErrorCode::DataLoss,
+                        "unexpected message type in rule dump reply",
+                    ));
+                }
+                DumpedRule::decode(m.payload(), req.family(), req.table())
+            })
+            .collect()
     }
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。

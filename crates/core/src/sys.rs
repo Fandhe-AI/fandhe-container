@@ -1833,6 +1833,8 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int mkdirat(int dirfd, const char *path, mode_t mode)`
     // （LP64 で `mode_t` は u32）。
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int chmod(const char *path, mode_t mode)`（LP64 で `mode_t` は u32）。
+    fn chmod(path: *const core::ffi::c_char, mode: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
@@ -4785,7 +4787,7 @@ pub(crate) fn open_path_follow_at(
 /// 行わず、`pinned` が固定した inode そのものを開く（magic link はリンク先を再 walk しない）。
 /// 呼び出し側は `pinned` への fstat で通常ファイルまたはディレクトリと確認済みであること
 /// （デバイス・FIFO 等への open の副作用を避ける。ディレクトリは `O_RDONLY` で開いても副作用が無く、
-/// `etc_files` が検査済みの管理ディレクトリへの `fchmod` に使う。REPAIR-5・PLUG-11・TASK-122.2・SEC-1）。
+/// 他の検査済み固定 inode の読み取りに使う。REPAIR-5・PLUG-11・TASK-122.2・SEC-1）。
 pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
     let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
         // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。
@@ -4796,6 +4798,23 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         &path,
         consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
     )
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode のモードを `/proc/thread-self/fd/N`（magic link）経由の
+/// `chmod(2)` で `mode` に固定する。`O_RDONLY` への開き直しを要しないため、所有者の読み取り権限が無い
+/// （umask 0400 等で mkdir した 0300 の）ディレクトリでも成功する。magic link は inode を再 walk しない
+/// ので、検査と操作の間にパスを差し替える窓が無い（`etc_files`・NET-12・SEC-1）。
+/// 呼び出し側は `pinned` を fstat で検査済みであること。
+pub(crate) fn chmod_pinned(pinned: BorrowedFd<'_>, mode: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| SysError::Os(consts::EINVAL))?;
+    // SAFETY: `path` は NUL 終端の借用で呼び出しの間生存する。対象は `pinned` が固定した inode で、
+    // 副作用はそのモードビットの変更のみ。ポインタは保持されない。
+    let rc = unsafe { chmod(path.as_ptr(), mode & 0o7777) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。
@@ -5781,6 +5800,11 @@ mod libc_abi {
         unsafe extern "C" fn(c_int, *const c_char, libc::mode_t) -> c_int,
         super::mkdirat,
         libc::mkdirat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, libc::mode_t) -> c_int,
+        super::chmod,
+        libc::chmod
     );
     fn_type_eq!(
         unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,

@@ -305,15 +305,12 @@ mod linux {
         let root_fd = sys::open_dir_path_nofollow(None, &c_root).map_err(sys_err)?;
         let name = cstr(ETC_DIR_NAME)?;
         let open = || sys::open_dir_path_nofollow(Some(root_fd.as_fd()), &name);
-        // 自分が mkdir したときだけ、検査の後に fd 起点でモードを固定する。
-        let mut made = false;
         let fd = match open() {
             Ok(fd) => fd,
             Err(SysError::Os(sys::ENOENT)) if !create => return Ok(None),
             Err(SysError::Os(sys::ENOENT)) => {
                 match sys::mkdir_at(root_fd.as_fd(), &name, DIR_MODE) {
-                    Ok(()) => made = true,
-                    Err(SysError::Os(sys::EEXIST)) => {}
+                    Ok(()) | Err(SysError::Os(sys::EEXIST)) => {}
                     Err(e) => return Err(sys_err(e)),
                 }
                 sync_dir(root);
@@ -326,24 +323,21 @@ mod linux {
             Err(e) => return Err(sys_err(e)),
         };
         check_private_dir(fd.as_fd(), euid)?;
-        if made {
-            fix_dir_mode_fd(fd.as_fd())?;
-        }
+        // 検査済み（自分所有・グループ/他者に権限なし）なので、再利用時も 0700 へ固定して取り残しを直す。
+        fix_dir_mode_fd(fd.as_fd())?;
         Ok(Some(fd))
     }
 
     /// 自分が作って検査済みのディレクトリのモードを、その fd が固定した inode に対して `DIR_MODE` へ固定する
     /// （`mkdir` は umask を受けるため。管理ディレクトリの 0700 は契約。SEC-1・NET-12）。
     ///
-    /// O_PATH の fd には `fchmod` が効かないため、`/proc/thread-self/fd/N`（magic link。パスを再解決しない）経由で
-    /// `O_RDONLY` に開き直した fd へ `fchmod` する。パスで辿り直さないので、検査と操作の間に差し替える窓が無い。
+    /// O_PATH の fd には `fchmod` が効かないため、`/proc/thread-self/fd/N`（magic link。パスを再解決しない）経由の
+    /// `chmod` で固定する。`O_RDONLY` へ開き直さないので、umask が所有者の読み取りを落として 0300 等になった
+    /// ディレクトリでも直せる。パスで辿り直さないので、検査と操作の間に差し替える窓が無い。
     /// procfs が無い環境では失敗させる（fail-closed）。
     fn fix_dir_mode_fd(dir: BorrowedFd<'_>) -> Result<(), TraitError> {
-        let io = || err(ErrorCode::Internal, "container etc files operation failed");
-        let reopened = sys::reopen_pinned_read_nonblock(dir).map_err(|_| io())?;
-        std::fs::File::from(reopened)
-            .set_permissions(std::fs::Permissions::from_mode(DIR_MODE))
-            .map_err(|_| io())
+        sys::chmod_pinned(dir, DIR_MODE)
+            .map_err(|_| err(ErrorCode::Internal, "container etc files operation failed"))
     }
 
     /// ディレクトリの fsync（best-effort。耐久性のためで、分離の判断には使わない）。
@@ -697,6 +691,21 @@ mod tests {
             let p = etc_file_path(dir.path(), &cid, EtcFileKind::ResolvConf);
             assert_eq!(std::fs::metadata(&p).expect("meta").mode() & 0o7777, 0o644);
             assert!(!etc_file_path(dir.path(), &cid, EtcFileKind::Hosts).exists());
+        }
+
+        /// NET-12: 所有者の読み取り権限が無い 0300 のディレクトリ（umask 0400 の mkdir 相当）でも 0700 に直せる。
+        #[test]
+        fn net12_fix_dir_mode_works_without_owner_read() {
+            let dir = state_root();
+            let d = dir.path().join("d");
+            std::fs::create_dir(&d).expect("mkdir");
+            std::fs::set_permissions(&d, std::os::unix::fs::PermissionsExt::from_mode(0o300))
+                .expect("chmod");
+            let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(d.as_os_str()))
+                .expect("cstr");
+            let fd = crate::sys::open_dir_path_nofollow(None, &c).expect("open");
+            crate::sys::chmod_pinned(std::os::fd::AsFd::as_fd(&fd), 0o700).expect("fix");
+            assert_eq!(std::fs::metadata(&d).expect("meta").mode() & 0o7777, 0o700);
         }
 
         /// NET-12: 2 回目の create は ALREADY_EXISTS で、内容を変えない。

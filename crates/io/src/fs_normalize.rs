@@ -74,7 +74,8 @@
 //! - サーバーのファイル作成経路への組み込み・結合試験 → #100（TASK-19.2。
 //!   `guest_files` で実装済み。ワイヤー上の作成要求は未実装）
 //! - パス長 260 超の検出: 検証関数は TASK-20.1（#102）で実装済み
-//!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
+//!   （[`check_host_path_length`]）。書き込み経路へは #3160 で `GuestFileCreator` に組み込み済み
+//!   （計測は [`measure_host_path_length`]。Windows ホストはエラー、その他の OS は警告）。
 //!   WIN-4 の per-directory case-sensitive フラグとの関係は記載済み
 //!   （[`check_host_path_length`] の doc の `# WIN-4 との関係` 節。TASK-20.2・#797）
 //! - NFC / NFD の方針の文書化は `docs/design/fs-normalization.md`（TASK-21.2・#106）に作成済み。
@@ -111,8 +112,7 @@
 //! 大文字小文字の区別だけを変え、`MAX_PATH` を緩めない。詳細と、シンボリックリンク
 //! 作成時の Developer Mode 前提は [`check_host_path_length`] を参照（TASK-20.2・#797）。
 //!
-//! 未実装（REPAIR-3）: 書き込み経路（`GuestFileCreator` 等）への組み込み、
-//! `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
+//! 未実装（REPAIR-3）: `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -427,6 +427,34 @@ pub(crate) fn quote_for_message(path: &str) -> String {
     format!("{kept:?}")
 }
 
+/// 衝突の種類（Nack の reason の `CaseCollision` / `NormalizationCollision` に対応。
+/// F10・#3160）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollisionKind {
+    /// 大文字小文字の畳み込みだけで一致する。
+    Case,
+    /// 正規化（NFC / NFD）を経て初めて一致する。
+    Normalization,
+}
+
+/// [`CaseCollisionSet::check_insertable_detailed`] の失敗（種類を保つ）。
+pub(crate) enum InsertCheckError {
+    /// 形式不正（`InvalidArgument`）。
+    Invalid(IoError),
+    /// 既存コンポーネントとの衝突（`AlreadyExists`）。
+    Collision { kind: CollisionKind, error: IoError },
+}
+
+/// 衝突した 2 つのコンポーネントの衝突の種類を判定する（文言の選択と reason の
+/// 分類の共通の根拠）。
+pub(crate) fn collision_kind(component: &str, existing_component: &str) -> CollisionKind {
+    if case_fold_chars(component) == case_fold_chars(existing_component) {
+        CollisionKind::Case
+    } else {
+        CollisionKind::Normalization
+    }
+}
+
 /// 衝突を表す構造化エラーを組み立てる。パス・コンポーネントはすべて
 /// [`quote_for_message`] で衛生化してから埋め込む（生の値を埋め込まない）。
 pub(crate) fn collision_error(
@@ -437,10 +465,9 @@ pub(crate) fn collision_error(
 ) -> IoError {
     // 大文字小文字の畳み込みだけで一致する組は従来の文言を保つ。正規化を経て初めて
     // 一致する組は、NFC/NFD の別表記を含むことを文言に出す（TASK-21.1）。
-    let reason = if case_fold_chars(component) == case_fold_chars(existing_component) {
-        "case"
-    } else {
-        "case or Unicode normalization (NFC/NFD)"
+    let reason = match collision_kind(component, existing_component) {
+        CollisionKind::Case => "case",
+        CollisionKind::Normalization => "case or Unicode normalization (NFC/NFD)",
     };
     IoError::new(
         IoErrorCode::AlreadyExists,
@@ -513,7 +540,19 @@ impl CaseCollisionSet {
     /// [`Self::try_insert`] と同じ）。既存ノードが無い位置から下はすべて新設に
     /// なり衝突しえないため、そこで検査を打ち切る。
     pub fn check_insertable(&self, path: &str) -> Result<(), IoError> {
-        let components = validate_guest_relative_path(path)?;
+        self.check_insertable_detailed(path)
+            .map_err(|err| match err {
+                InsertCheckError::Invalid(error) | InsertCheckError::Collision { error, .. } => {
+                    error
+                }
+            })
+    }
+
+    /// [`Self::check_insertable`] の詳細版。失敗が形式不正か衝突か、衝突なら種類を
+    /// 保ったまま返す（`crate::guest_files` が Nack の reason へ写す元。#3160・IO-5。
+    /// エラー文言は公開版と同一）。
+    pub(crate) fn check_insertable_detailed(&self, path: &str) -> Result<(), InsertCheckError> {
+        let components = validate_guest_relative_path(path).map_err(InsertCheckError::Invalid)?;
         let mut parent = ROOT_NODE;
         for component in &components {
             match self.nodes.get(&CaseFoldKey::new(parent, component)) {
@@ -523,12 +562,10 @@ impl CaseCollisionSet {
                             .origins
                             .get(entry.introduced_by)
                             .map_or("", String::as_str);
-                        return Err(collision_error(
-                            path,
-                            existing_path,
-                            component,
-                            &entry.original,
-                        ));
+                        return Err(InsertCheckError::Collision {
+                            kind: collision_kind(component, &entry.original),
+                            error: collision_error(path, existing_path, component, &entry.original),
+                        });
                     }
                     parent = entry.id;
                 }

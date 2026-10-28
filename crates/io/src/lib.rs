@@ -56,8 +56,9 @@
 //! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
 //! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
 //! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
-//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）。NFC / NFD の別表記も、名前は
-//! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
+//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
+//! （Windows ホストはエラー、その他の OS は警告だけで作成を続ける。警告と拒否理由の観測への配線は
+//! #3163〔REPAIR-3〕）。NFC / NFD の別表記も、名前は書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
 //! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は
@@ -81,6 +82,14 @@ pub mod fs_normalize;
 pub mod guest_files;
 pub mod guest_path;
 pub mod instrument;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the Nack codec (#3161) and serve_file_connection (#3163)"
+    )
+)]
+mod nack_reason;
 pub mod observe;
 pub mod payload;
 pub mod protocol;

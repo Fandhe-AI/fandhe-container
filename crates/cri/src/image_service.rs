@@ -96,19 +96,46 @@ impl std::error::Error for ImageStoreError {}
 pub struct ImageRecord {
     id: String,
     repo_tags: Vec<String>,
+    /// 先頭 `top_level_len` 件が top-level digest、残りが補助（プラットフォーム manifest）digest。各区間は辞書順。
     repo_digests: Vec<String>,
+    top_level_len: usize,
     size: u64,
     uid: Option<i64>,
     username: String,
     pinned: bool,
 }
 
+/// 重複を除いて辞書順（バイト順）に並べる。containerd の `docker.Sort` と同じ結果になる
+/// （前提: 正規化済みの Named 参照で、配列内の rank が揃っていること。distribution/reference v0.6.0 `sort.go`）。
+fn sort_dedup(mut items: Vec<String>) -> Vec<String> {
+    items.sort();
+    items.dedup();
+    items
+}
+
 impl ImageRecord {
     /// 検証してレコードを作る（id 非空・size > 0・長さと件数の上限）。
+    ///
+    /// `repo_digests` の先頭 1 件を top-level digest、残りを補助 digest として扱う（`PulledImage` と同じ契約）。
+    /// 並びは containerd と同じ辞書順（#3038・CRI-2・OCI-1）。
     pub fn new(
         id: impl Into<String>,
         repo_tags: Vec<String>,
         repo_digests: Vec<String>,
+        size: u64,
+    ) -> Result<Self, ImageStoreError> {
+        let mut iter = repo_digests.into_iter();
+        let top: Vec<String> = iter.next().into_iter().collect();
+        Self::from_parts(id, repo_tags, top, iter.collect(), size)
+    }
+
+    /// top-level digest 群と補助 digest 群を分けて受けて作る。永続在庫（#2945）が統合後の複数の
+    /// top-level digest を失わずに読み戻すための入口。検証は [`ImageRecord::new`] と同じ。
+    pub fn from_parts(
+        id: impl Into<String>,
+        repo_tags: Vec<String>,
+        top_level_digests: Vec<String>,
+        auxiliary_digests: Vec<String>,
         size: u64,
     ) -> Result<Self, ImageStoreError> {
         let id = id.into();
@@ -118,17 +145,34 @@ impl ImageRecord {
         if size == 0 {
             return Err(ImageStoreError::ZeroSize);
         }
-        if repo_tags.len() > MAX_REFS_PER_IMAGE || repo_digests.len() > MAX_REFS_PER_IMAGE {
+        if repo_tags.len() > MAX_REFS_PER_IMAGE
+            || top_level_digests
+                .len()
+                .saturating_add(auxiliary_digests.len())
+                > MAX_REFS_PER_IMAGE
+        {
             return Err(ImageStoreError::TooManyRefs);
         }
         let too_long = |s: &String| s.len() > MAX_IMAGE_FIELD_BYTES;
-        if too_long(&id) || repo_tags.iter().any(too_long) || repo_digests.iter().any(too_long) {
+        if too_long(&id)
+            || repo_tags.iter().any(too_long)
+            || top_level_digests.iter().any(too_long)
+            || auxiliary_digests.iter().any(too_long)
+        {
             return Err(ImageStoreError::FieldTooLong);
         }
+        let mut digests = sort_dedup(top_level_digests);
+        let top_level_len = digests.len();
+        let auxiliary: Vec<String> = auxiliary_digests
+            .into_iter()
+            .filter(|d| !digests.contains(d))
+            .collect();
+        digests.extend(sort_dedup(auxiliary));
         Ok(Self {
             id,
-            repo_tags,
-            repo_digests,
+            repo_tags: sort_dedup(repo_tags),
+            repo_digests: digests,
+            top_level_len,
             size,
             uid: None,
             username: String::new(),
@@ -142,10 +186,20 @@ impl ImageRecord {
     }
 
     /// digest 参照（`<repo>@sha256:<digest>`）の一覧（#2831。ContainerStatus の `image_ref` の元）。
-    /// 先頭は pull 時の top-level digest（multi-arch では index digest。containerd と同じ。#2969・CRI-2・OCI-1）、
-    /// 続けてプラットフォーム manifest digest。統合後は既存を先に保つ挿入順で、containerd の辞書順とは異なる。
+    /// 先頭は top-level digest 群（multi-arch では index digest。辞書順で containerd と同じ。#2969・#3038・CRI-2・OCI-1）、
+    /// 続けて補助のプラットフォーム manifest digest（辞書順）。
     pub fn repo_digests(&self) -> &[String] {
         &self.repo_digests
+    }
+
+    /// top-level digest 群（辞書順）。永続在庫（#2945）の保存用。
+    pub fn top_level_digests(&self) -> &[String] {
+        self.repo_digests.get(..self.top_level_len).unwrap_or(&[])
+    }
+
+    /// 補助のプラットフォーム manifest digest 群（辞書順）。永続在庫（#2945）の保存用。
+    pub fn auxiliary_digests(&self) -> &[String] {
+        self.repo_digests.get(self.top_level_len..).unwrap_or(&[])
     }
 
     /// 既定ユーザー（uid / username）を設定する。username が長すぎる場合、および
@@ -169,23 +223,29 @@ impl ImageRecord {
     }
 
     /// 同一 ID の既存レコード（`self`）へ新しい取り込み結果を統合する（タグ・digest は和集合、size は新しい値、
-    /// uid・username・pinned は既存を保つ。digest の並びは既存を先に保つ挿入順。#2969）。件数が [`MAX_REFS_PER_IMAGE`] を超えるなら `TooManyRefs`。
-    fn merged_with(mut self, newer: ImageRecord) -> Result<Self, ImageStoreError> {
-        fn union(base: &mut Vec<String>, extra: Vec<String>) {
-            for item in extra {
-                if !base.contains(&item) {
-                    base.push(item);
-                }
-            }
-        }
-        union(&mut self.repo_tags, newer.repo_tags);
-        union(&mut self.repo_digests, newer.repo_digests);
-        if self.repo_tags.len() > MAX_REFS_PER_IMAGE || self.repo_digests.len() > MAX_REFS_PER_IMAGE
-        {
-            return Err(ImageStoreError::TooManyRefs);
-        }
-        self.size = newer.size;
-        Ok(self)
+    /// uid・username・pinned は既存を保つ。タグと digest は containerd と同じ辞書順で、補助 digest が別の pull で
+    /// top-level になれば top へ移す。#2969・#3038）。件数が [`MAX_REFS_PER_IMAGE`] を超えるなら `TooManyRefs`。
+    fn merged_with(self, newer: ImageRecord) -> Result<Self, ImageStoreError> {
+        let mut tags = self.repo_tags.clone();
+        tags.extend(newer.repo_tags.iter().cloned());
+        let mut top = self.top_level_digests().to_vec();
+        top.extend(newer.top_level_digests().iter().cloned());
+        let mut aux = self.auxiliary_digests().to_vec();
+        aux.extend(newer.auxiliary_digests().iter().cloned());
+        // 件数上限の検査は `from_parts` が重複除去より前に行うため、和集合に落としてから渡す
+        // （上限近くの同内容の再 pull を誤って拒否しない）。
+        tags.sort();
+        tags.dedup();
+        top.sort();
+        top.dedup();
+        aux.sort();
+        aux.dedup();
+        aux.retain(|d| !top.contains(d));
+        let mut merged = Self::from_parts(self.id.clone(), tags, top, aux, newer.size)?;
+        merged.uid = self.uid;
+        merged.username = self.username;
+        merged.pinned = self.pinned;
+        Ok(merged)
     }
 
     /// イメージ ID。
@@ -333,13 +393,13 @@ impl Drop for PullSlot {
 ///
 /// RPC スレッド（tokio）で `Drop` が走るため、atomic の store だけを行い I/O もロックも持たない。
 /// 旗は `ImagePuller::pull_cancellable` が次の確認点で読み、`Timeout` で止まる。
-struct CancelOnDrop {
-    cancel: Arc<AtomicBool>,
-    armed: bool,
+pub(crate) struct CancelOnDrop {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) armed: bool,
 }
 
 impl CancelOnDrop {
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -670,27 +730,167 @@ mod tests {
         assert_eq!(store.len(), MAX_IMAGES);
     }
 
-    /// CRI-2・OCI-1（#2969）: 統合後の digest は既存を先に保つ挿入順（containerd の辞書順とは異なる残差を固定する）。
+    fn digest_rec(d: &[&str]) -> ImageRecord {
+        ImageRecord::new(
+            "sha256:a",
+            vec![],
+            d.iter().map(|s| (*s).to_owned()).collect(),
+            1,
+        )
+        .expect("record")
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// CRI-2・OCI-1（#3038）: 単一 pull の先頭は top-level digest（辞書順で大きくても先頭）。
     #[test]
-    fn cri2_upsert_keeps_existing_digest_order_first() {
+    fn cri2_record_single_pull_head_is_top_level() {
+        let r = digest_rec(&["reg/a@sha256:ff", "reg/a@sha256:00"]);
+        assert_eq!(
+            r.repo_digests(),
+            strs(&["reg/a@sha256:ff", "reg/a@sha256:00"])
+        );
+        assert_eq!(r.top_level_digests(), strs(&["reg/a@sha256:ff"]));
+        assert_eq!(r.auxiliary_digests(), strs(&["reg/a@sha256:00"]));
+    }
+
+    /// CRI-2・OCI-1（#3038）: 統合後の top-level digest は pull の順に依らず containerd と同じ辞書順。
+    #[test]
+    fn cri2_upsert_merge_sorts_digests_like_containerd() {
+        for order in [0, 1] {
+            let store = InMemoryImageStore::new();
+            let by_platform = || digest_rec(&["reg/a@sha256:P"]);
+            let by_tag = || digest_rec(&["reg/a@sha256:I", "reg/a@sha256:P"]);
+            if order == 0 {
+                store.upsert(by_platform()).expect("first");
+                store.upsert(by_tag()).expect("merge");
+            } else {
+                store.upsert(by_tag()).expect("first");
+                store.upsert(by_platform()).expect("merge");
+            }
+            let got = store.get("sha256:a").expect("get").expect("present");
+            assert_eq!(
+                got.repo_digests(),
+                strs(&["reg/a@sha256:I", "reg/a@sha256:P"])
+            );
+            assert_eq!(got.top_level_digests().len(), 2);
+            assert!(got.auxiliary_digests().is_empty());
+        }
+    }
+
+    /// CRI-2・OCI-1（#3038）: 同じ内容の再 pull で並びも件数も変わらない。
+    #[test]
+    fn cri2_upsert_repull_keeps_sorted_order() {
         let store = InMemoryImageStore::new();
-        let rec = |d: &[&str]| {
+        let r = || {
             ImageRecord::new(
                 "sha256:a",
-                vec![],
-                d.iter().map(|s| (*s).to_owned()).collect(),
+                strs(&["reg/a:2", "reg/a:1"]),
+                strs(&["reg/a@sha256:I", "reg/a@sha256:P"]),
                 1,
             )
             .expect("record")
         };
-        store.upsert(rec(&["reg/a@sha256:P"])).expect("first");
-        store
-            .upsert(rec(&["reg/a@sha256:I", "reg/a@sha256:P"]))
-            .expect("merge");
+        store.upsert(r()).expect("first");
+        store.upsert(r()).expect("again");
         let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(got.repo_tags(), strs(&["reg/a:1", "reg/a:2"]));
         assert_eq!(
             got.repo_digests(),
-            ["reg/a@sha256:P", "reg/a@sha256:I"].map(String::from)
+            strs(&["reg/a@sha256:I", "reg/a@sha256:P"])
+        );
+    }
+
+    /// CRI-2・OCI-1（#3038）: 上限ちょうどの件数を同内容で再 pull しても和集合は上限内なので成功する。
+    #[test]
+    fn cri2_upsert_repull_at_limit_succeeds() {
+        let store = InMemoryImageStore::new();
+        let tags: Vec<String> = (0..MAX_REFS_PER_IMAGE)
+            .map(|i| format!("reg/a:{i:03}"))
+            .collect();
+        let digs: Vec<String> = (0..MAX_REFS_PER_IMAGE)
+            .map(|i| format!("reg/a@sha256:{i:03}"))
+            .collect();
+        let r = || ImageRecord::new("sha256:a", tags.clone(), digs.clone(), 1).expect("record");
+        store.upsert(r()).expect("first");
+        store.upsert(r()).expect("again");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(got.repo_tags().len(), MAX_REFS_PER_IMAGE);
+        assert_eq!(got.repo_digests().len(), MAX_REFS_PER_IMAGE);
+    }
+
+    /// CRI-2・OCI-1（#3038）: タグ追加は挿入順でなくバイト順の辞書順になる。
+    #[test]
+    fn cri2_upsert_tag_addition_sorts_tags() {
+        let store = InMemoryImageStore::new();
+        let a =
+            |tags: &[&str]| ImageRecord::new("sha256:a", strs(tags), vec![], 1).expect("record");
+        store.upsert(a(&["reg/a:2"])).expect("first");
+        store.upsert(a(&["reg/a:10", "reg/a:1"])).expect("add");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(got.repo_tags(), strs(&["reg/a:1", "reg/a:10", "reg/a:2"]));
+    }
+
+    /// CRI-2・OCI-1（#3038）: 補助だった digest が別の pull で top-level になれば top へ移る。
+    #[test]
+    fn cri2_upsert_promotes_auxiliary_to_top_level() {
+        let store = InMemoryImageStore::new();
+        store
+            .upsert(digest_rec(&["reg/a@sha256:I", "reg/a@sha256:P"]))
+            .expect("first");
+        store
+            .upsert(digest_rec(&["reg/a@sha256:P"]))
+            .expect("by platform");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(
+            got.top_level_digests(),
+            strs(&["reg/a@sha256:I", "reg/a@sha256:P"])
+        );
+        assert!(got.auxiliary_digests().is_empty());
+    }
+
+    /// #2945 向け: 統合後の記録を `from_parts` で読み戻すと同じ並びになる。
+    #[test]
+    fn cri2_record_from_parts_round_trip() {
+        let store = InMemoryImageStore::new();
+        store
+            .upsert(digest_rec(&["reg/a@sha256:P", "reg/a@sha256:Q"]))
+            .expect("first");
+        store
+            .upsert(digest_rec(&["reg/a@sha256:I", "reg/a@sha256:P"]))
+            .expect("merge");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        let back = ImageRecord::from_parts(
+            "sha256:a",
+            got.repo_tags().to_vec(),
+            got.top_level_digests().to_vec(),
+            got.auxiliary_digests().to_vec(),
+            1,
+        )
+        .expect("from_parts");
+        assert_eq!(back.repo_digests(), got.repo_digests());
+        assert_eq!(back.top_level_digests(), got.top_level_digests());
+        assert_eq!(
+            back.top_level_digests(),
+            strs(&["reg/a@sha256:I", "reg/a@sha256:P"])
+        );
+        assert_eq!(back.auxiliary_digests(), strs(&["reg/a@sha256:Q"]));
+    }
+
+    /// CRI-4: `from_parts` も top と補助の合計件数・長さの上限を守る。
+    #[test]
+    fn cri4_from_parts_bounds() {
+        let many: Vec<String> = (0..MAX_REFS_PER_IMAGE).map(|i| format!("d{i}")).collect();
+        assert_eq!(
+            ImageRecord::from_parts("a", vec![], many, strs(&["x"]), 1),
+            Err(ImageStoreError::TooManyRefs)
+        );
+        let long = "x".repeat(MAX_IMAGE_FIELD_BYTES + 1);
+        assert_eq!(
+            ImageRecord::from_parts("a", vec![], vec![], vec![long], 1),
+            Err(ImageStoreError::FieldTooLong)
         );
     }
 

@@ -60,7 +60,7 @@
   - `add-host`: 256 件以下、299 バイト以下
   - `dns`: 32 件以下、45 バイト以下
   - CLI は `--network` を省略しても `network none` を必ず書く（NET-6 の既定は CLI が適用する）。supervisor は復号のたびに net のパーサで再検証する（未信頼の入力）。文書に `network` kind が無い（plugin-cri・従来のコンテナ）ときは「config に従う」＝現行の挙動のまま
-- 追記（#1935）: rootless のユーザー定義名（pasta 構成）では kind `pasta` と `publish` を足す。詳細は [rootless-network.md](rootless-network.md) 12.4・12.6。
+- 追記（#1935）: rootless のユーザー定義名（pasta 構成）では kind `pasta` と `publish` を足す。詳細は [rootless-network.md](rootless-network.md) 12.4・12.6。`publish` の kind と CLI の `-p` の解析・検証は #3200 で実装済み。CLI が `network` とともに文書へ書くのは #1873 の後。
 - **理由**: argv・特権ランチャー・`start_client` を変えずに済む。serde / toml を supervisor へ足さない（依存の承認が要る。既存文書でも却下済み）。
 - **却下した案**: argv / env で渡す（既存文書の却下理由と同じ）。core の `StateRecord` に同梱する（plugin 境界の型が変わる）。
 

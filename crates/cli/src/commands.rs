@@ -755,21 +755,27 @@ mod tests {
         /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
         const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
 
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-cmd-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-cmd",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
 
             fn state_root(&self) -> PathBuf {
@@ -1462,5 +1468,43 @@ mod net12_argv_tests {
         // 使い方エラーは exit 2 の INVALID_ARGUMENT(状態ルートは作られない)。
         assert_invalid(&["--network", "a", "--network", "b"], "");
         assert_invalid(&["--add-host"], "");
+    }
+
+    /// NET-9・NET-3(#3200): 不正な `-p` は作成前に INVALID_ARGUMENT(状態ルートは作られず、入力値は出ない)。
+    #[test]
+    fn net9_publish_invalid_specs_rejected() {
+        let n = ["--network", "mynet"];
+        for bad in ["[::1]:80:80", "::1:80:80", "80:80/sctp", "0:80", "1-2:80"] {
+            let leak = bad.split(':').next().unwrap_or("");
+            let argv = [n[0], n[1], "-p", bad];
+            assert_invalid(&argv, if leak.len() > 2 { leak } else { "sctp" });
+        }
+    }
+
+    /// NET-9(#3200): ユーザー定義名と組でない `-p` は INVALID_ARGUMENT(none / host / 指定なし)。
+    #[test]
+    fn net9_publish_requires_user_defined_network() {
+        assert_invalid(&["-p", "8080:80"], "");
+        assert_invalid(&["--network", "none", "-p", "8080:80"], "");
+        assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
+    }
+
+    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、結線(#1873・#1940)まで UNIMPLEMENTED(受理して捨てない)。
+    #[test]
+    fn net9_publish_valid_is_unimplemented_until_wired() {
+        assert_unimplemented(&["--network", "mynet", "-p", "8080:80"]);
+        assert_unimplemented(&["--network", "mynet", "--publish", "127.0.0.1:8080:80/udp"]);
+    }
+
+    /// NET-9(#3200): 件数と 1 件の長さの超過は使い方エラー。
+    #[test]
+    fn net9_publish_usage_limits() {
+        let long = "1".repeat(65);
+        assert_invalid(&["--network", "mynet", "-p", long.as_str()], "");
+        let mut many: Vec<&str> = vec!["--network", "mynet"];
+        for _ in 0..65 {
+            many.extend(["-p", "8080:80"]);
+        }
+        assert_invalid(&many, "");
     }
 }

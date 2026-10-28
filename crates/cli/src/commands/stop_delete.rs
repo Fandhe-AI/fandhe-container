@@ -668,6 +668,8 @@ fn remove_supervisor_log(
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
         Arc::new(move || id_is_still_deleted(&guard_root, &guard_id)),
     ) {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
         Ok(_) => CleanupOutcome::Removed,
         Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
@@ -860,6 +862,8 @@ fn remove_container_log(
         CONTAINER_LOG_REMOVE_TIMEOUT,
         Arc::new(move || id_is_still_deleted(&guard_root, &guard_id)),
     ) {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
         Ok(_) => CleanupOutcome::Removed,
         Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
@@ -1298,21 +1302,27 @@ mod tests {
         use fandhe_container_core::traits::{ContainerState, CreateRequest, GetStateRequest};
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-sd-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-sd",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
         }
 
@@ -1745,7 +1755,7 @@ mod tests {
                 DeleteResponse::new(),
                 Duration::from_millis(50),
             );
-            assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.supervisor_log(), CleanupOutcome::Superseded);
             assert!(supervisor_log_names(&base).contains(&"s4.log".to_string()));
         }
 
@@ -1761,7 +1771,7 @@ mod tests {
             assert_eq!(resp.container_log(), CleanupOutcome::Removed);
         }
 
-        /// SUP-7・#2698: 同じ ID が再作成済み（guard が false）ならログは消さずに成功（0 件）で返す。
+        /// SUP-7・#2698・#3143: 同じ ID が再作成済み（guard が false）ならログは消さず `Superseded` で返す（`Removed` と報告しない）。
         #[test]
         fn sup7_delete_does_not_remove_recreated_instance_logs() {
             let base = TmpDir::new("recreated2");
@@ -1774,7 +1784,7 @@ mod tests {
                 DeleteResponse::new(),
                 Duration::from_millis(50),
             );
-            assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.container_log(), CleanupOutcome::Superseded);
             assert!(!log_names(&base).is_empty());
         }
 

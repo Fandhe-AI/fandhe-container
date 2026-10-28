@@ -876,7 +876,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let recorder = OpRecorder::new();
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
-        super::create_network::validate_network_options(&args.options.network)?;
+        super::create_network::validate_network_options(
+            &args.options.network,
+            super::create_network::resolve_publish_privilege,
+        )?;
         let (req, image) = build_create(global, args)?;
         // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
         let document = create_options::document_of(&args.options)?;
@@ -1776,22 +1779,28 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p =
-                    std::env::temp_dir().join(format!("fc-cli-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
         }
 

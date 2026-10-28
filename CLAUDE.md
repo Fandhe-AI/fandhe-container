@@ -37,7 +37,7 @@ fandhe-container/
 ├── Cargo.toml                     # workspace 定義（members は TASK-1.3 で有効化）
 ├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
-│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
+│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
 │   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
@@ -59,6 +59,7 @@ fandhe-container/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
 │   ├── api/                       # 利用者向け API 契約
 │   │   ├── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
+│   │   ├── port-publish.md        # `create` の `-p` / `--publish`（rootless の pasta のみ）の書き方・rootful の `PortPublish` との差・現状の `UNIMPLEMENTED`（#3200・NET-9・NET-3・CLI-1）
 │   │   └── bind-mounts.md         # `config.json` の `mounts[]` の bind mount の書き方・受けるオプション・Docker / runc との差（TASK-29 追補・#1915・OCI-4）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
@@ -80,7 +81,8 @@ fandhe-container/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
-│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・CORE-2・CORE-5・REPAIR-12）
+│   │   │   ├── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・#3141・CORE-2・CORE-5・REPAIR-12）
+│   │   │   └── plugin-stderr-reader-stop-macos.md  # one-shot の stderr 読み手停止（#3003 の修正後）を macOS で 100 回以上繰り返す照合の手順と結果欄。結果は dispatch 後に記入（#3138・REPAIR-5・PLUG-7・PLUG-12・REPAIR-12）
 │   │   ├── io-power-loss-verification.md  # 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証方式の比較と推奨（dm-flakey。#1965・オーナー承認待ち）。実機前提試験 crates/io/tests/power_loss.rs
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── macos-vm-cold-start-bench.md  # 実 VM の cold start 計測ハーネスの計測区間・分解能・出力（crates/platform-macos/tests/vm_cold_start.rs。実機前提・合否は出さない。TASK-70 準備・#1879・MAC-2。区間はオーナー確認待ち）
@@ -120,11 +122,12 @@ fandhe-container/
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-options-delivery.md  # 起動オプション（ulimit・env・label ほか）の CLI から supervisor への受け渡し（状態ルート配下の 0600 の文書 `FCOPT1`・経路・却下案・残余。#2713・SUP-12・CLI-1・SEC-1）
 │   │   ├── rotating-log-sharing.md  # supervisor の RotatingFileSink と platform-macos のコンソールログ回転を共通化しない判断の記録（置き場所の候補・依存方向・検査の差・再評価条件。#2172・REPAIR-1・REPAIR-4・MAC-1）
-│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
+│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・#3142・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）
 │   │   ├── cri-status-rpc.md      # CRI の Status・Version・UpdateRuntimeConfig RPC（#2896 を併記。RuntimeReady・NetworkReady の判定材料と待ちが無い設計・runtime_handlers・features・verbose で info を出さない方針・kubelet / containerd の一次情報・本番で NetworkReady=false になる帰結・死活確認を足さない判断と再評価条件。#2830・#2897・CRI-1・CRI-2・PLUG-1・PLUG-4・REPAIR-3・REPAIR-5）
+│   │   ├── fdinfo-mnt-id-parsing.md  # core・net・gpu の fdinfo `mnt_id` 解析を共有せず、共有 fixture `crates/core/testdata/fdinfo_mnt_id_cases.txt` の照合試験で一致を担保する判断記録（共有下位 crate の案 B はオーナー承認待ち。#3140・GPU-2・SEC-1・REPAIR-1）
 │   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（#2838・CRI-2・CORE-3・SEC-5・NET-3）
 │   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）
 │   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
@@ -135,7 +138,7 @@ fandhe-container/
 │   │   ├── macos.md               # macOS セットアップ前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネル / initrd の用意・plugin の配置と信頼性検証の要件と署名後のハッシュの注意。実装済み / 未実装・#1906 等の判断待ちを区別。#2602・MAC-1・CLI-2）
 │   │   ├── network-reclaim-recovery.md  # 作成失敗で残った資源の観測と、印を刻む前に失敗した別名なし bridge の手動回収の手順（#2604・NET-1・REPAIR-4）
 │   │   ├── cri-record-recovery.md  # plugin-cri の再起動後に照合できない CRI 記録の見分け方と手動回収の手順（#2939・CRI-1・REPAIR-4）
-│   │   ├── container-log-recovery.md  # delete の後に残ったコンテナログの見分け方と手動削除の手順（#2698・SUP-7・CLI-1）
+│   │   ├── container-log-recovery.md  # delete・RemoveContainer の後に残ったコンテナログ・supervisor ログの見分け方と手動削除の手順（#2698・#3034・SUP-7・CRI-2・CLI-1）
 │   │   └── plugin-socket-recovery.md  # plugin socket の `ALREADY_EXISTS` の見分け方と記録の無い socket の手動削除の手順（#1859・PLUG-12）
 │   ├── verification/              # 実機確認の記録雛形（crictl-smoke.md: crictl runp→create→start の疎通確認の手順書と結果雛形。TASK-60・CRI-1。結果記入は #442。cli-cross-platform-parity.md: CLI ライフサイクル系コマンド（kill・state を含む）の 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661。supervisor-measurement-runbook.md: 監視プロセス系の実機計測〔#499・#485・#491・#219〕の実行手順。#1820。rootless-start-cgroup.md: 本番の rootless start と委譲 cgroup の prepare の実機確認・delete の通し試験の手順と結果雛形。#2062・CORE-3・CORE-6・SEC-1・CLI-1。dev-fd-perm-check-macos.md: macOS での `/dev/fd/N` 経由の権限検査が効かない原因の観測手順と結果雛形。#2088・MAC-1。結果記入は #2088（人間担当）。rootless-sysfs-readonly.md: rootless の /sys の読み取り専用 rbind の実機確認と、user namespace の root から ro を外せるかの測定の手順と結果雛形。#2305・SEC-2・SEC-1。landlock-audit-exec.md: Landlock ABI 7 以上の実カーネルで LOG_NEW_EXEC_ON 付き restrict_self が受理され拒否が監査ログに残ることの確認手順と結果雛形。#2306・SEC-4・CORE-5。plugin-peer-uid-after-close-macos.md: macOS で connect 直後に close された接続の peer UID 取得（`getpeereid`）の観測手順と結果雛形。PLUG-12・SEC-4・#2252 P2-2。結果記入は #2405。plugin-cri-peer-auth-reject.md: plugin-cri の別 UID connector 拒否の実機確認の手順書と結果雛形。PLUG-12・TASK-114.5。結果記入は #2485。bind-rslave-propagation.md: `rslave` の bind でホスト側で後からマウントした内容がコンテナ内に見えることの実機確認手順と結果雛形。#2669・CRI-2・OCI-4。結果記入は人間担当。subid-nss-ambient-getent.md: LDAP / sssd・`subid: sss` での所有者名の解決と、ambient capability つきの本番構成で `getent` の子に capability が渡らないことの実機確認手順と結果雛形。SEC-5・CORE-6・SUP-14・#2637。結果記入は #2637。plugin-cri-restart-readoption.md: running のコンテナを残した plugin-cri の再起動と記録の再採用の実機確認の手順と結果雛形。CRI-1・CRI-2・#2942。結果記入は #2942〔人間担当〕）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）

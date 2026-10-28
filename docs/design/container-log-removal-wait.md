@@ -37,7 +37,8 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
 
 - ログ削除全体の最悪は「待ち 10 秒 + 最後の試行 5 秒」= 15 秒
 - force delete の後始末の最悪（plugin-cri）: ログ 2 件 20 秒（共有の待ち 10 秒 + supervisor ログの最後の試行 5 秒 + コンテナログの最後の試行 5 秒。#2964）
-  に加えて起動オプション文書の掃除 10 秒（#2760）で 30 秒。stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`）と足すと 47 秒で、
+  に加えて起動オプション文書の掃除 10 秒（#2760）で 30 秒。名目の stop 17 秒（`2 × (KillTimeout::DEFAULT 5 秒 + 1 秒) + STOP_KILL_WAIT 5 秒`。
+  signaler の期限だけを数えた値で、状態ロックの待ちを含めた厳密な最悪は 42 秒。#3143）と足すと 47 秒で、
   `PLUGIN_FORCE_DELETE_DEADLINE` と一致する。core の delete と bundle の解放を含めた全体は「`RemoveContainer` の全体の上限と kubelet の期限」節
   （#3027）。不等式は結合試験 `repair5_force_delete_worst_case_fits_runtime_timeout` で機械照合する
 - `CreateContainer` の最悪（plugin-cri。#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック `STATE_LOCK_TIMEOUT` 5 秒 +
@@ -213,7 +214,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   `fandhe_container_supervisor::logs::reclaim_stale_container_logs` で、CLI（`reclaim_stale_container_log`）と plugin-cri
   （`CoreLifecycleRuntime::reclaim_before_create`）が共有する。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。
   best effort で create の成否は変えない（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる。CRI 層は `state` が `NotFound` であることを確かめて資源を解放する）。観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
-- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）
+- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）。supervisor ログは自動回収の対象外で、同じ手順書の「supervisor ログ」の節に従う（#3034）
 
 ## supervisor ログ側の待ち（#2892・SUP-7・CLI-1・REPAIR-5）
 
@@ -232,7 +233,8 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   上の 20 秒の予算の記述と試験が崩れる
 - 失敗の扱い: 待ち切れなければ `Kept { FailedPrecondition }` と、コンテナログと同じ語彙の `reason: "sink_open_after_wait"` つきの警告
 - 待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る（CRI は ID を使い回さないため、実質は手動の回収。
-  `docs/setup/container-log-recovery.md` はコンテナログが対象で supervisor ログは含まない。残余。REPAIR-3）
+  起動時の走査は `@container-logs` だけが対象で supervisor ログは回収されない。見分け方と手順は
+  `docs/setup/container-log-recovery.md` の「supervisor ログ」の節に追加済み〔#3034〕。自動回収は足していない）
 
 ## plugin-cri の `RemoveContainer` の supervisor ログ側の待ち（#2964・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 
@@ -242,7 +244,8 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   `remove_guarded_bounded_waiting`（guard は状態ストアの `NotFound`。試行ごとにロック保持中に評価）で処理し、
   コンテナログには残り（`deadline - now`）を渡す
 - 予算: supervisor ログにかかる時間を t（t ≤ 10 + 5）とすると、コンテナログは max(0, 10 - t) + 5 以下で、合計は max(t, 10) + 5 ≤ 20 秒。
-  force delete の最悪は stop 17 + ログ 20 + 起動オプション文書 10 = 47 秒で従来と同じ。`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まり、
+  force delete の最悪は名目の stop 17 + ログ 20 + 起動オプション文書 10 = 47 秒で従来と同じ（stop の数え方は #3143 で
+  「`RemoveContainer` の全体の上限と kubelet の期限」節の規則に揃えた）。`PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）に収まり、
   RPC 側は `run_bounded(runtime_timeout)` で打ち切る。core の delete と bundle の解放の上限、kubelet の `--runtime-request-timeout` との関係は
   #3027 で解消した（次節）
 - 不採用: 独立に待つ案。最悪 30 秒で 47 秒が 57 秒になり、余裕が 3.9 秒しか残らない
@@ -274,29 +277,62 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 plugin-cri は `create_with_image` を使わず状態レコードに `image_rootfs` が無いため、`BundleLock`（`LOCK_NB` で待たない）と rootfs の削除
 （`USERNS_REMOVE_BUDGET`）を通らない。rootfs の削除は次項の bundle の解放が担う。
 
+### 数え方の規則（#3143・REPAIR-5）
+
+最悪時間の見積りは、次の 4 つの規則で数える。
+
+| 規則 | 内容 |
+| ---- | ---- |
+| (a) | `StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT`（5 秒） |
+| (b) | 期限つきのポーリング = within + `STATE_LOCK_TIMEOUT`（最後の読み取りが期限の直前に始まりうる） |
+| (c) | signaler の呼び出し 1 回 = `KillTimeout::DEFAULT`（5 秒）+ `LAUNCHER_REPLY_GRACE`（1 秒）。signaler は状態ルートのパスを使うだけで `StateStore` を呼ばない |
+| (d) | 期限つきの作業スレッドの中の guard の `get` は、その期限に含めて別に数えない |
+
+照合の結果:
+
+- **stop（`SupervisedLifecycle::stop`）**: 入口の読み取り 5 + SIGTERM の送信 11（core の `kill` の中の `get` 5 + signaler 6）+
+  猶予 0 の確認の読み取り 5 + SIGKILL の送信 11 + SIGKILL 後の待ち 10（5 + 5。規則 (b)）= 42 秒（grace 0 のとき。`grace` があればその分が足される）。
+  従来の「17 秒」は (c) だけを数えた名目で、状態ロックの待ちを数えていなかった。`send_or_observe_exit` の失敗分岐の読み直し（5 秒）は、
+  送信の `get` が成功した後の失敗に限られるため、最悪（42 秒）の分岐には現れない
+- **`StopContainer` 単体**: 厳密に数えても grace + 42 秒で、CRI 側の待ち（`PLUGIN_RUNTIME_TIMEOUT + grace`）に収まるため予算をかけない
+  （`repair5_3143_stop_strict_count_fits_stop_container_timeout`）
+- **force delete の stop**: 前置きの読み取り 5 + 厳密な stop 42 + core 20 = 67 秒で `PLUGIN_RUNTIME_TIMEOUT` を超えるため、
+  stop に予算 `FORCE_DELETE_STOP_BUDGET`（22 秒 = 47 − 5 − 20）を持たせた（下記「全体の期限」）
+- **create（plugin-cri）**: `lock_for_create`（`try_lock` で待たない）、検証、`StateStore::create` の順で、`StateStore` の呼び出しは 1 回だけ
+  （`repair5_3143_create_calls_state_store_once`）。`get` が増えるのは `create_with_image` だけで plugin-cri は使わない。
+  回収の guard の `get` は期限つきの作業スレッド（ログ 5 秒・文書 10 秒）の中で評価され、規則 (d) でその期限に含まれる。
+  よって `repair5_create_worst_case_fits_runtime_timeout` の「状態ロック 1 回」は規則どおりで、見積り（42.9 秒）は変わらない
+
 ### 全体の期限
 
-後始末の前の合計は、stop 17 秒 + 状態の読み取り 5 秒（`stop_live_before_force_delete`）+ core 20 秒 = 42 秒。これに後始末の最悪 30 秒を
-そのまま足すと 72 秒で `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）を超える。状態ロックがどれも上限近くまで待つ病的な場合にしか起きないが、
+後始末の前の合計は、状態の読み取り 5 秒（`stop_live_before_force_delete`）+ stop の予算 22 秒 + core 20 秒 = 47 秒。これに後始末の最悪 30 秒を
+そのまま足すと 77 秒で `PLUGIN_RUNTIME_TIMEOUT`（60.9 秒）を超える。状態ロックがどれも上限近くまで待つ病的な場合にしか起きないが、
 不等式は崩れていたため、`CoreLifecycleRuntime::delete` に全体の期限 `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒 = 従来の最悪の値）を持たせた。
+
+- force delete の stop は `SupervisedLifecycle::stop_within(.., Some(FORCE_DELETE_STOP_BUDGET))` で呼ぶ。予算は stop を始めた時点からの相対値で、
+  各段（状態の読み取り 5 秒・シグナル送信 11 秒）は「予算の残り ≥ その段の最悪の所要」のときだけ始める（admission）。始められない段があれば
+  固定文言の `Timeout`（`container stop did not fit in the delete budget`）で止め、後続のシグナルを送らない（fail-closed）。記録と supervisor は残り、
+  kubelet の再試行で回収される。通常の stop は各段がミリ秒で終わるため挙動は変わらない
+- 不採用: 17 秒のまま admission をかける案（前段が 6 秒を超えると SIGKILL の段を拒否する）。重複する `get` の統合だけで済ませる案（5 秒しか減らず 62 秒で
+  まだ超える）。`StateStore` に deadline を通す案（PLUG-1 のトレイトが変わる）
 
 - 後始末の各段（supervisor ログ・コンテナログ・起動オプション文書）は、いまの上限と期限までの残りの小さい方で試す。ロックの待ちと 1 回の試行の
   和が残りを超えないようにし、残りが小さいときは半分ずつ渡す（試行の期限は上限であり通常は短時間で終わるため、残りを全部渡すと待ちが消える）
 - 残りが 0 の段は試さず、`Kept { code: Timeout }`（起動オプション文書は警告行と記録器の Failure）として残す。消さずに残す側に倒し、
-  起動時の走査と手順書（`docs/setup/container-log-recovery.md`）で回収できる。新しい `reason` の語彙は足さない
-- 全体の最悪は max(42, 47) = 47 秒で、`PLUGIN_RUNTIME_TIMEOUT` との余裕 13.9 秒は I/O の時間と、stop の中の状態ロックの待ち（下の残余）に充てる
-- 通常（後始末の前が 17 秒以下）は後始末に 30 秒以上残るため、挙動は変わらない
-- 照合: `repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout`（42・47・72 秒の具体値）・
+  起動時の走査（コンテナログのみ）と手順書（`docs/setup/container-log-recovery.md`。supervisor ログは手順書のみ）で回収できる。新しい `reason` の語彙は足さない
+- 全体の最悪は max(47, 47) = 47 秒で、`PLUGIN_RUNTIME_TIMEOUT` との余裕 13.9 秒は I/O の時間だけに充てる
+- 通常（後始末の前が名目の 17 秒以下）は後始末に 30 秒以上残るため、挙動は変わらない
+- 照合: `repair5_force_delete_worst_case_fits_runtime_timeout`（名目 17・厳密 42・67・予算 22 秒の具体値）・
+  `repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout`（47・77 秒の具体値）・
+  `repair5_3143_force_delete_stop_store_calls_are_bounded`（最悪の分岐の `get` 5 回）・
+  `repair5_3143_force_delete_refuses_stop_stage_when_budget_short`（予算不足の段を始めない）・
   `repair5_cri2_3027_force_delete_cuts_cleanup_at_deadline`・`repair5_cri2_3027_force_delete_skips_cleanup_when_deadline_exhausted`
 - 不採用: `PLUGIN_RUNTIME_TIMEOUT` を上げる案（値は supervisor の受信期限 + 2 秒から導いていて、変更はオーナー判断）。core の `StateStore` 呼び出しに
   共通の deadline を通す案（トレイトの変更で PLUG-1 の拡張点に響く）。2 回目の `get` を消す案（早期終了の意味が変わる）
 
 ### bundle の解放
 
-`SpecBundleProvider::release` はロックの待ちが無い。I/O の量は件数で抑えられている（走査の深さ `MAX_REMOVE_DEPTH`、1 ディレクトリの繰り返し
-`MAX_DRAIN_PASSES`、展開時の件数 `DEFAULT_MAX_LAYER_ENTRIES` × レイヤー数 `MAX_LAYERS`）が、時間を定数で抑える仕組みは無い。RPC は
-`run_bounded` で打ち切られ（`HangingRelease` の試験が実証済み）、記録は `in_flight` のまま残り worker の終了で確定する。時間で打ち切る解放は
-本 issue では入れず、残余とした。
+issue 3027 の時点では `SpecBundleProvider::release` に時間の上限が無かった。#3142 で期限と取り消しの旗を足した（下の節）。
 
 ### kubelet の `--runtime-request-timeout` との関係
 
@@ -321,13 +357,92 @@ plugin-cri は `create_with_image` を使わず状態レコードに `image_root
 ### guard の偽（再作成済みの ID）
 
 `sup7_cri2_3027_force_delete_keeps_supervisor_log_when_id_recreated` が plugin-cri の経路で、同じ ID が再作成済みのとき supervisor ログを消さず、
-警告行も出さないことを固定する。0 件で成功した結果が `Removed` と報告される観測のずれは、`CleanupOutcome` の意味を変えるため本 issue では直さず、
-試験で現状の値を固定した。
+警告行も出さないことを固定する。
+
+従来は 0 件で成功した結果が `Removed` と報告される観測のずれがあったが、#3143 で `CleanupOutcome::Superseded`（同じ ID が再作成済みで、新しい
+インスタンスの資源として消さずに残した。失敗ではないので警告しない）を足して直した。判別は `RemovedLogs::guard_declined()`（guard が偽のときだけ真）で、
+ファイルが無くて 0 件だった成功は従来どおり `Removed` のまま。plugin-cri（`cleanup_outcome_of`）と CLI（`remove_supervisor_log`・`remove_container_log`）が
+同じ規則で写し、CRI 側の `RuntimeCleanupOutcome` にも `Superseded` を足した。記録器では Success として数える。
+
+### 試さなかった起動オプション文書の警告行（#3143・REPAIR-4・REPAIR-5）
+
+全体の期限を使い切って `remove_stale_options` が文書の存在を確かめずに `Timeout` を返したとき、文書が無くても警告行が出ていた。この場合の行にだけ
+`"existence":"unverified"` を足し、試して失敗した行はバイト単位で従来のままにした（`reason` の語彙は足さない）。期限を使い切った後に呼び出し元の
+スレッドで存在を確かめる案は、期限のない I/O を足すことになる（REPAIR-5）ため採らない。
 
 ### 残余（REPAIR-3）
 
-- 時間で打ち切る bundle の解放と、`RemoveContainer` の worker の取り消し（Create の `AbandonOnDrop` に当たるもの）は無い。Create の巻き戻しの
-  `InFlightGuard::drop` の `release` にも時間の上限が無い
-- `RemovePodSandbox` は `runtime_remove_one` をコンテナの数だけ順に回すため、kubelet の 1 回の期限を超えうる
-- stop の 17 秒は、ポーリングの中と kill の中の状態ロックの待ちを数えていない
-- `repair5_create_worst_case_fits_runtime_timeout` は状態ロックを 1 回と数えている。本節の規則との照合は未了
+- bundle の解放・`RemoveContainer` の worker の取り消し・Create の巻き戻しの `release`・`RemovePodSandbox` の合計の上限は #3142 で入れた（下の節）
+- 試さなかった段のログ 2 件（supervisor ログ・コンテナログ）の `Kept { Timeout }` にも、起動オプション文書の `existence` のような「未確認」の区別は無い
+  （存在を確かめずに警告行を出す。#3143 では起動オプション文書のみ対応）
+
+## `RemoveContainer`・`RemovePodSandbox` の残りの待ち（#3142・CRI-2・REPAIR-5・OCI-7）
+
+issue 3027 に残っていた時間の上限の無い 4 つの待ちを有界にした。値は既存のもの（`runtime_timeout`、plugin-cri では `PLUGIN_RUNTIME_TIMEOUT`
+60.9 秒）だけを使い、新しい数値は足していない。
+
+### bundle の解放（1）
+
+| 方式 | 採否 | 理由 |
+| ---- | ---- | ---- |
+| A: `ExtractBudget`（期限と取り消しの旗）を削除の走査へ通し、エントリごとに確かめる | 採用 | PullImage（#2967）・展開（#2899）と同じ型と確認の仕方。打ち切った時点までの削除は残り、再試行の release は冪等で続きから進む |
+| B: `call_with_deadline` で別スレッドへ切り離し、期限で諦める | 不採用 | 切り離したスレッドが削除を続け、再試行の release と同じ木を並行して消す |
+| C: 件数の上限だけに頼る（従来） | 不採用 | 時間では抑えられない |
+
+- oci: `remove_extracted_tree_bounded(path, &ExtractBudget)`。確認はエントリ 1 件を消す前と drain の各パスの前。`RESOLVE_DESCEND`・symlink と
+  マウント越えの拒否・`MAX_REMOVE_DEPTH`・`MAX_DRAIN_PASSES` は変えない（確認を足しただけで検査は迂回しない）。非 Linux のパス起点の実装にも通した
+- cri: `ReleaseBudget`（期限・旗）と `BundleProvider::release_bounded` / `RootfsSource::release_bounded`（既定は `release` を呼ぶ。打ち切れる実装だけが
+  上書きする。REPAIR-3）。`SpecBundleProvider` は先頭で予算を確かめてから rootfs を解放し、その後の bundle 直下（config.json 等）は分割しない
+- 打ち切った後: `Timeout`（`DEADLINE_EXCEEDED`）。worker は既存の「解放の失敗」の分岐（記録は exited・`runtime_owned`・`in_flight` なし）に入り、
+  記録ファイルも残す。再試行は delete（`NOT_FOUND`）→ 続きから release → 記録の削除 → commit と進む
+- 分割できない区間: `unlinkat` 1 回、`getdents64` 1 回分、bundle 直下の小さなファイルの `remove_dir_all`
+
+### `RemoveContainer` の worker の取り消し（2）
+
+PullImage の `CancelOnDrop` と同じ旗 1 本を使う。Create の `AbandonOnDrop` と `SetUpSettlement`（CAS）は使わない。CAS が要るのは、呼び出し側が失敗を
+返した後に worker が Ready を公開する食い違いを防ぐ Create だけで、Remove には無い（期限切れの後に worker が commit まで済ませても、再試行は
+「記録が無い」で冪等に成功する）。
+
+- RPC 側: 結果を受け取れたときだけ `disarm`。期限切れ・future の破棄では `Drop` が旗を立てる（atomic の store だけ。RPC スレッドで I/O をしない）
+- worker の確認点: (a) `adapter.remove` の前（旗が立っていれば delete を呼ばず `Timeout`。状態は変えない）、(b) release の中（予算の期限と旗）、
+  (c) release が成功した後は旗が立っていても記録の削除と commit まで進める（小さな I/O で、省くと再試行が 1 回余るため）
+- 実際に効くのは (b)。本番では RPC の期限が (a) より後に来ることがほとんどで、core の delete の区間（外部プロセスとファイル I/O）は打ち切れない。
+  この区間は `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）で有界になる残余
+
+### Create の巻き戻しの release（3）
+
+`InFlightGuard::drop` は `release_bounded` を呼ぶ。期限は Drop の開始時刻 + `release_timeout`（`arm_bundles` で渡す `runtime_timeout`）。取り消しの旗は
+渡さない（手放した Create の旗で巻き戻しが即座に止まると、bundle が必ず残るため）。期限で打ち切ったら `outcome_unknown` にし、記録を Unknown・
+`runtime_owned` で残して write-ahead の記録ファイル（`in_flight=create`）も残す。回収は RemoveContainer（delete〔`NOT_FOUND`〕→ 続きから release）か、
+plugin-cri の再起動をまたぐときは readopt の `stale_create`（`release_stale_creates`）。worker の残存の式には「巻き戻しの release ≤ `runtime_timeout`」を
+足す（`repair5_create_worker_residual_is_bounded`: 42.9 + 60.9 + 60.9 = 164.7 秒 < `PLUGIN_ROOTFS_DEADLINE` 600 秒）。
+
+### `RemovePodSandbox` の pod 単位の合計期限（4）
+
+| 方式 | 採否 | 理由 |
+| ---- | ---- | ---- |
+| 逐次 + pod 単位の絶対期限を 1 つ持ち、各段に `min(段の上限, 残り)` を渡す | 採用 | 新しいスレッド数の上限を考えずに済み、core の状態ロックの競合も増やさない |
+| 並列（配下ごとに worker を同時起動） | 不採用 | 同時の core delete が `STATE_LOCK_TIMEOUT` を奪い合い、同時スレッド数（最大 `MAX_CONTAINERS`）の管理が要る。join に依存の feature 追加が要りうる |
+| pod 用の新しい値（例: 110 秒）を設ける | 不採用 | 新しい数値はオーナー判断になる。kubelet との余裕も小さい |
+
+- 合計期限 = `runtime_timeout`（RemoveContainer の 1 回と同じ）。RPC の入口（`remove_sandbox_with_network`）で 1 回だけ求め、埋め込みの Stop
+  （`network_owned` のとき）・配下の停止と回収・pod network の回収・最後の記録ファイルの削除の各 `run_bounded` に渡す
+- 残りが 0 なら新しい段を始めず、固定文言の `Timeout`（`pod sandbox removal exceeded its deadline`）で抜ける。未処理の配下は `PendingMarks` の Drop が
+  `in_flight` を外し、sandbox は notready のまま残る。kubelet の再試行が続きから進める
+- kubelet の一次情報（タグ `v1.37.1`）: `remote_runtime.go` の RemovePodSandbox（366〜370 行）は StopPodSandbox（345〜350 行）と同じ
+  `context.WithTimeout(ctx, r.timeout)`。既定は上の `defaults.go` の 2 分。逐次では配下 2 件で 2 × 60.9 = 121.8 秒となり既定を超えていた。
+  新方式の最悪は 60.9 秒 + 同期部分で、余裕は 59.1 秒（`repair5_cri2_3142_remove_pod_sandbox_worst_case_fits_kubelet_timeout`）
+- 合計期限と `runtime_timeout` の値の見直しはオーナー判断
+- 単独の `StopPodSandbox` は期限を共有しない（`None`）ため、「対象数 × `runtime_timeout`」のまま残る。同じ `OpDeadline` で直せるが別 issue とする
+
+### #2933・#2934 との衝突の確認
+
+新しく永続化する状態は無い。Remove は `in_flight=remove` をディスクへ書かず、打ち切りの経路はどれも既存の分岐（解放の失敗・巻き戻しの結果不明）に入るため、
+readopt の表の行は増えない。記録ファイルを書く・消す時点（write-ahead・commit の put・`remove_record`・sandbox の `record_write` の guard）は動かしていない。
+pod の期限で `unpersist_sandbox` に入れなかったときも、sandbox の記録ファイルとメモリは notready で残る。
+
+### 残余（#3142 の後）
+
+- core の delete の区間（外部プロセスとファイル I/O）と記録ストアの fsync の停止は打ち切らない
+- 起動時の `release_stale_creates` は `call_with_deadline` で release を切り離す方式のまま（`release_bounded` への移行は別 issue）
+- `network_owned` の埋め込みの Stop の経路で期限が効くことの専用試験は無い（各段が同じ `step_within` を通る）

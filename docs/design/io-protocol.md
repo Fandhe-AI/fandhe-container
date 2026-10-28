@@ -32,7 +32,7 @@
 | オフセット | サイズ | フィールド | 型・エンコード | 検証内容 | 違反時のエラーコード |
 | ---------- | ------ | ---------- | --------------- | -------- | -------------------- |
 | `0` | 1 B | `version` | `u8`（[`PROTOCOL_VERSION`](../../crates/io/src/protocol.rs)） | このビルドの `PROTOCOL_VERSION` と一致するか | `UNIMPLEMENTED` |
-| `1` | 1 B | `kind` | `u8`（[`FrameKind`](../../crates/io/src/protocol.rs)） | 既知値（1〜4）か | `INVALID_ARGUMENT` |
+| `1` | 1 B | `kind` | `u8`（[`FrameKind`](../../crates/io/src/protocol.rs)） | 既知値（1〜8）か | `INVALID_ARGUMENT` |
 | `2` | 4 B | `payload_len` | `u32` LE（[`PayloadLen`](../../crates/io/src/protocol.rs)） | `≤ MAX_PAYLOAD_LEN` | `INVALID_ARGUMENT` |
 | `6` | 4 B | `header_crc` | CRC-32C `u32` LE | `[version, kind, payload_len]`（オフセット `0..6`）の再計算値と一致 | `DATA_LOSS` |
 | `10` | N B | `payload` | 不透明なバイト列 | 実本体長 = `payload_len + CHECKSUM_LEN` | `INVALID_ARGUMENT` |
@@ -42,7 +42,7 @@
 
 | 定数 | 値 | 備考 |
 | ---- | -- | ---- |
-| `PROTOCOL_VERSION` | 1 | このビルドが送受信するワイヤー形式のバージョン。「バージョン方針」節を参照 |
+| `PROTOCOL_VERSION` | 2 | このビルドが送受信するワイヤー形式のバージョン（v2 はファイル操作の種別 5〜8 の追加。#3161）。「バージョン方針」節を参照 |
 | `FRAME_HEADER_LEN` | 10 | version 1 バイト + 種別 1 バイト + ペイロード長 4 バイト + ヘッダ CRC 4 バイト |
 | `CHECKSUM_LEN` | 4 | CRC-32C（`u32` LE） |
 | `MAX_PAYLOAD_LEN` | 64 MiB（`67_108_864`） | 暫定値。PoC-2（`03-poc/io-layer-redesign`）の `MAX_DATA_LEN` に由来し、`fandhe-container-plugin` の境界機構（plugin-framed）が使う 16 MiB 上限とは別の境界。TASK-12・TASK-13 で見直してよい |
@@ -57,20 +57,30 @@
 | `2` | `Ack` | 書き込みフレームに対する ACK。バッファリング時点（受理）までを保証し、永続化は保証しない（IO-1） |
 | `3` | `Flush` | FLUSH バリア。これ以前に受理した書き込みの永続化を要求する（IO-2） |
 | `4` | `FlushAck` | FLUSH バリアに対する ACK。バリア以前に受理した書き込みが永続化済みであることを保証する（IO-2） |
-| `5..=255` | （未知値） | `INVALID_ARGUMENT` として拒否する |
+| `5` | `Create` | ゲスト相対パスのファイルを新規作成する要求（C→S。v2。#3161） |
+| `6` | `WriteFile` | ハンドルが指すファイルへの追記（C→S。v2。#3161） |
+| `7` | `Close` | ハンドルの解放（C→S。fsync はしない。v2。#3161） |
+| `8` | `Nack` | 要求単位の失敗の通知（S→C。v2。#3161） |
+| `9..=255` | （未知値） | `INVALID_ARGUMENT` として拒否する |
 
-上表は現行の v1 である。v2 では 5〜8 に `Create`・`WriteFile`・`Close`・`Nack` を割り当てる設計が確定している（未実装。実装は #3161。[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)の F4）。
+5〜8 は v2（#3161 で実装済み）。ペイロードのレイアウトは [F4](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886) と `crates/io/src/payload.rs` が定める。サーバー（#3163）とクライアントの型つき API（#3162）は未実装。
 
 ### エンコード例
 
 いずれも `crates/io/src/checksum.rs` が実装する CRC-32C と同一パラメータ（反射多項式 `0x82F6_3B78`・初期値 `0xFFFF_FFFF`・最終 XOR `0xFFFF_FFFF`）の独立実装で、標準 check 値 `"123456789"` → `0xE3069283`（`io1_crc32c_matches_standard_check_value` と同じ期待値）を確認した上で算出した値。
 
-- `Write`・payload `"abc"`: `01 01 03 00 00 00 06 f1 29 e2 61 62 63 59 2a cd e8`（`header_crc` = `0xe229f106`・trailer `checksum` = `0xe8cd2a59`）
-- `Flush`・空 payload: `01 03 00 00 00 00 67 a7 29 f0 67 a7 29 f0`（`header_crc` = `0xf029a767`・trailer `checksum` = `0xf029a767`。ペイロードが空のためトレーラは `header_crc` と同じ入力〔`[version, kind, payload_len]`〕から計算され、`header_crc` と同じ値になる）
+以下は v2（`version` = `02`。#3161 で v1 の例から更新した）。
+
+- `Write`・payload `"abc"`: `02 01 03 00 00 00 dc 3a 95 d6 61 62 63 70 26 62 f1`（`header_crc` = `0xd6953adc`・trailer `checksum` = `0xf1622670`）
+- `Flush`・空 payload: `02 03 00 00 00 00 bd 6c 95 c4 bd 6c 95 c4`（`header_crc` = `0xc4956cbd`・trailer `checksum` = `0xc4956cbd`。ペイロードが空のためトレーラは `header_crc` と同じ入力〔`[version, kind, payload_len]`〕から計算され、`header_crc` と同じ値になる。フレーム層の例で、実際の `Flush` はペイロードに request id を持つ）
+- `Create`・id = 1・path `"a/b"`: `02 05 0d 00 00 00 f8 f5 d1 04 01 00 00 00 00 00 00 00 03 00 61 2f 62 65 35 2f c2`（`header_crc` = `0x04d1f5f8`・trailer `checksum` = `0xc22f3565`）
+- `WriteFile`・id = 2・handle = 1・body `"xy"`: `02 06 12 00 00 00 1d 2f c2 4a 02 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 78 79 72 35 47 59`（`header_crc` = `0x4ac22f1d`・trailer `checksum` = `0x59473572`）
+- `Close`・id = 3・handle = 1: `02 07 10 00 00 00 30 63 b4 cd 03 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 d9 27 a3 89`（`header_crc` = `0xcdb46330`・trailer `checksum` = `0x89a327d9`）
+- `Nack`・id = 1・code = 2（`AlreadyExists`）・reason = 5（`Exists`）: `02 08 0b 00 00 00 07 3d a7 dd 01 00 00 00 00 00 00 00 02 05 00 0f 1c 27 f3`（`header_crc` = `0xdda73d07`・trailer `checksum` = `0xf3271c0f`）
 
 ## バージョン方針（P1-1・設計レビュー・2026-09-28 オーナー決定）
 
-ホスト側 CLI と microVM ゲストは別ビルドになり得るため、`version` フィールドでワイヤー形式の版ずれをフレームごとに検出する。ワイヤー形式（ヘッダ・フレーム全体のバイトレイアウト）を変える変更は必ず `PROTOCOL_VERSION` を上げる。MVP ではネゴシエーション（Hello 交換）は行わず、`FrameHeader::from_bytes` が受信した `version` と自分自身の `PROTOCOL_VERSION` を比較し、不一致を `UNIMPLEMENTED` として返す（message に受信 `version` と対応 `PROTOCOL_VERSION` の両方を含める）。ネゴシエーションが必要になった場合（複数バージョンの相互運用が要件化した場合）は別途設計する。ファイル操作要求の追加に伴う v2 への繰り上げは設計確定済みで、実装 issue（#3161）で行う（F2）。
+ホスト側 CLI と microVM ゲストは別ビルドになり得るため、`version` フィールドでワイヤー形式の版ずれをフレームごとに検出する。ワイヤー形式（ヘッダ・フレーム全体のバイトレイアウト）を変える変更は必ず `PROTOCOL_VERSION` を上げる。MVP ではネゴシエーション（Hello 交換）は行わず、`FrameHeader::from_bytes` が受信した `version` と自分自身の `PROTOCOL_VERSION` を比較し、不一致を `UNIMPLEMENTED` として返す（message に受信 `version` と対応 `PROTOCOL_VERSION` の両方を含める）。ネゴシエーションが必要になった場合（複数バージョンの相互運用が要件化した場合）は別途設計する。ファイル操作要求の追加に伴う v2 への繰り上げは #3161 で実装済み（F2）。v1 のヘッダは `UNIMPLEMENTED` になる。
 
 ## チェックサムアルゴリズム: CRC-32C（Castagnoli）
 
@@ -248,11 +258,15 @@ BREAK-2 検出経路の整理:
 | `FrameKind::Write` | `[request_id: u64 LE][body...]` | `body.len() ≤ MAX_WRITE_BODY_LEN`（`= MAX_PAYLOAD_LEN - 8`） |
 | `FrameKind::Flush` | `[request_id: u64 LE]` | ちょうど 8 バイト（body は空） |
 | `FrameKind::Ack` / `FrameKind::FlushAck` | `[request_id: u64 LE]` | ちょうど 8 バイト（短くても長くても拒否） |
+| `FrameKind::Create`（v2） | `[id u64][path_len u16][path: UTF-8]` | `payload_len == 10 + path_len`、`1 ≤ path_len ≤ 4096` |
+| `FrameKind::WriteFile`（v2） | `[id u64][handle u64][body...]` | body は 1 バイト以上 `MAX_WRITE_FILE_BODY_LEN`（`= MAX_PAYLOAD_LEN - 16`）以下 |
+| `FrameKind::Close`（v2） | `[id u64][handle u64]` | ちょうど 16 バイト |
+| `FrameKind::Nack`（v2） | `[id u64][code u8][reason u16]` | ちょうど 11 バイト。code は 1〜3 のみ、reason の未知値は `Other` |
 
 - `WireRequestId`（非公開フィールド。`RequestId` からのみ構築できる）がワイヤー表現を担う。`RequestId` が内部に持つ発行元キュー識別子（`QueueId`）はメモリ内の区別にのみ使い、ワイヤー上には一切現れない（TASK-12.1 の契約を維持する）
 - `encode_request` / `decode_request`（`Write`・`Flush` 用）、`encode_ack` / `decode_ack`（`Ack`・`FlushAck` 用）が公開 API。種別違反・長さ違反は構築前に検証し、`Frame::decode` 系のアロケーション前検証（TASK-83.2）を壊さない
-- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）。ただしファイル操作モード（設計確定済み・未実装。#1886）に限り、`Ack` 自体は status を持たないまま、失敗を別の種別 `Nack` で返す（F8）
-- `PROTOCOL_VERSION` は `1` のまま据え置く。ペイロードはこれまで意味づけされていない不透明なバイト列だったため、本節が初めてその形式を定めるのであり、ヘッダ・フレーム全体のバイトレイアウトは変わっていない
+- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）。ただしファイル操作モード（v2。ワイヤー形式は #3161 で実装済み、サーバーは #3163 で未実装）に限り、`Ack` 自体は status を持たないまま、失敗を別の種別 `Nack` で返す（F8）
+- `PROTOCOL_VERSION` は v1 ではペイロードが不透明なバイト列だったため `1` のまま据え置いた（ヘッダ・フレーム全体のレイアウトは変わらなかった）。v2（#3161）で種別 5〜8 を足したため `2` に上げた（F2）
 
 ### 送信（`PipelineClient::send`）
 
@@ -299,7 +313,7 @@ BREAK-2 検出経路の整理:
 
 ### 書き込み先（ワイヤーにパスがない）
 
-`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式は、別モード（ファイル操作モード）として設計確定済み・未実装である（[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・REPAIR-3）。本節の単一 sink モードの意味論は変わらない。
+`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式は、別モード（ファイル操作モード）として設計確定済み・ワイヤー形式は #3161 で実装済み、サーバーは未実装である（[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・REPAIR-3）。本節の単一 sink モードの意味論は変わらない。
 
 ### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
 
@@ -375,12 +389,12 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - 件数未達分を時間ベースで追い出す仕組み
 - 未フラッシュ滞留量の上限のクライアント側計測・自動 Flush 送出、`--unflushed-max-*` の CLI バイナリ配線（TASK-79）・TOML 読み込み（TASK-82）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
-- ファイル操作を表すペイロード形式のうち、作成・追記・Close・Nack は設計確定済み・未実装（上記の新しい節・実装は #3161・#3163）。rename・truncate・unlink・mkdir 単独・readdir・getattr は範囲外のまま（spec への確認事項 (a)）
+- ファイル操作を表すペイロード形式のうち、作成・追記・Close・Nack のワイヤー形式（符号化と復号）は #3161 で実装済み、サーバーの処理は未実装（上記の新しい節・実装は #3163）。rename・truncate・unlink・mkdir 単独・readdir・getattr は範囲外のまま（spec への確認事項 (a)）
 - Windows のトランスポート（`windows-sys` の依存承認が必要）
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -434,7 +448,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 - 表現はゲスト相対パス。区切りは `/`、UTF-8 必須
 - 構文の上限（新設の定数）: `MAX_GUEST_PATH_BYTES` = 4096（既存）、`MAX_GUEST_PATH_COMPONENTS` = 256、`MAX_GUEST_NAME_BYTES` = 255
 - 構文規則は新設の newtype `GuestPath` に 1 か所で集める（REPAIR-2）。拒否するもの: NUL、先頭の `/`（絶対パス）、空のコンポーネント、`.`・`..`、`\` と `:`（`guest_files.rs` の既存規則を移す）、上限超過。`GuestPath` は client・payload・`GuestFileCreator::create_file` の 3 者が同じ関数で検証する
-- 状態: `GuestPath` と 3 定数は #3159 で実装済み（`crates/io/src/guest_path.rs`）。`create_file` が利用中で、payload と client からの利用は #3161・#3162
+- 状態: `GuestPath` と 3 定数は #3159 で実装済み（`crates/io/src/guest_path.rs`）。`create_file` が利用中で、payload の復号は長さと UTF-8 だけを見て構文を検証しない（#3161）。client からの利用は #3162
 - 検証の層
   - 復号時（純関数・OS 非依存）: 長さと UTF-8 だけを見る。違反はフレーム構造の違反として接続全体を失効させる
   - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
@@ -558,7 +572,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 
 ### BREAK-1 / BREAK-2 への影響
 
-検出機構（`recv_ack` の期限、トレーラの CRC）は変わらない。版を上げると golden vector と本書のエンコード例（`01 01 03 ...`）が変わるため、版上げの実装 issue（#3161）で更新する。[break-detection-ci-report.md](break-detection-ci-report.md) は過去の記録なので書き換えず、影響は本書にだけ書く。
+検出機構（`recv_ack` の期限、トレーラの CRC）は変わらない。版を上げると golden vector と本書のエンコード例（旧 `01 01 03 ...`）が変わるため、版上げの実装 issue（#3161）で更新した。[break-detection-ci-report.md](break-detection-ci-report.md) は過去の記録なので書き換えず、影響は本書にだけ書く。
 
 ### 実装 issue 一覧
 

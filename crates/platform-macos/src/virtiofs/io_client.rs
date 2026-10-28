@@ -19,7 +19,8 @@
 //!   `ReconnectingVirtiofsIoClient` が担う（TASK-65.5）。
 //! - 共有が [`ShareAccess::ReadOnly`] の場合は構築を拒否する（fail-closed）。
 //! - virtiofs タグはワイヤーへ載せない（`writeback.rs` の D1）。タグは識別・観測用に保持するだけで、
-//!   載せるのは IO-1 契約の変更（`PROTOCOL_VERSION` の繰り上げを伴いうる）になるため行わない。
+//!   載せるのは IO-1 契約の変更になるため行わない。v2（#3161）でファイル操作の種別が足されたが、
+//!   本クライアントは単一 sink モードの `Write` / `Flush` だけを使い続け、意味論は変わらない（F3）。
 //!
 //! # 運用ルール（D3）
 //!

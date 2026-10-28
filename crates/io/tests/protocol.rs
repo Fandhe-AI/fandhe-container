@@ -108,3 +108,49 @@ fn io1_public_api_decode_rejects_too_short_input() {
     let err = Frame::decode(&[1, 0, 0]).expect_err("truncated header must be rejected");
     assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 }
+/// IO-1・REPAIR-2・#3161: v1 時代の正しいフレーム（`header_crc` もトレーラも v1 として
+/// 正しい）は、v2 のビルドでは版の不一致として `Unimplemented` になる。
+#[test]
+fn io1_public_api_v1_header_is_unimplemented() {
+    let v1_frame = [
+        0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x06, 0xf1, 0x29, 0xe2, 0x61, 0x62, 0x63, 0x59, 0x2a,
+        0xcd, 0xe8,
+    ];
+    let err = Frame::decode(&v1_frame).expect_err("v1 frame must be rejected");
+    assert_eq!(err.code(), IoErrorCode::Unimplemented);
+}
+
+/// IO-1・REPAIR-2・#3161: 公開 API だけで v2 のファイル操作 4 種別が往復する。
+#[test]
+fn io1_public_api_v2_file_frames_round_trip() {
+    use fandhe_container_io::{
+        GuestPath, InFlightLimit, NackCode, NackReason, PROTOCOL_VERSION, SendQueue, WireRequestId,
+        decode_close, decode_create, decode_nack, decode_write_file, encode_close, encode_create,
+        encode_nack, encode_write_file,
+    };
+
+    assert_eq!(PROTOCOL_VERSION, 2);
+    let limit = InFlightLimit::new(4).expect("limit");
+    let mut queue = SendQueue::new(limit);
+    let request = queue.register(FrameKind::Write).expect("register");
+    let id = WireRequestId::from(request.id());
+    let path = GuestPath::parse("dir/file").expect("path");
+
+    let create = Frame::decode(&encode_create(id, &path).expect("create").encode()).expect("dec");
+    let env = decode_create(&create).expect("decode_create");
+    assert_eq!(env.path(), "dir/file");
+    assert_eq!(env.id(), id);
+
+    let write =
+        Frame::decode(&encode_write_file(id, id, b"data").expect("write").encode()).expect("dec");
+    assert_eq!(decode_write_file(&write).expect("decode").body(), b"data");
+
+    let close = Frame::decode(&encode_close(id, id).expect("close").encode()).expect("dec");
+    assert_eq!(decode_close(&close).expect("decode").handle(), id);
+
+    let nack = encode_nack(id, NackCode::InvalidArgument, NackReason::UnknownHandle).expect("nack");
+    let nack = Frame::decode(&nack.encode()).expect("dec");
+    let env = decode_nack(&nack).expect("decode_nack");
+    assert_eq!(env.code(), NackCode::InvalidArgument);
+    assert_eq!(env.reason(), NackReason::UnknownHandle);
+}

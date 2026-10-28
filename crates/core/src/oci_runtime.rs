@@ -46,6 +46,8 @@ mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod namespace_join;
+#[cfg(target_os = "linux")]
+mod netns_attach;
 mod network_mode;
 mod resources;
 mod start;
@@ -109,6 +111,8 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use namespace_join::NamespaceJoin;
+#[cfg(target_os = "linux")]
+pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
 pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]

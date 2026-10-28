@@ -50,7 +50,8 @@ impl Dir {
                     .map_err(|e| map_io(&e, msg))?;
                 self.sync()?;
             }
-            Err(e) if e.raw_os_error() == Some(sys::EEXIST) => {}
+            // 既存の再利用でも、前回の作成後の親 fsync が失敗していた可能性があるため親を同期し直す（D11）。
+            Err(e) if e.raw_os_error() == Some(sys::EEXIST) => self.sync()?,
             Err(e) => return Err(map_io(&e, msg)),
         }
         self.open_subdir(name)
@@ -201,6 +202,11 @@ impl NetworkLockGuard<'_> {
                 "network records need the exclusive network lock",
             ))
         }
+    }
+
+    /// 排他ロックのガードか（共有ロックなら偽）。記録つきの操作がカーネル操作の前に確かめる。
+    pub(crate) fn is_exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// ロックしているネットワークの名前。
@@ -426,7 +432,8 @@ impl NetworkLockGuard<'_> {
     fn save_claim(&self, dir: &Dir, name: &str, record: &str) -> Result<(), NetError> {
         match dir.write_new(name, record.as_bytes(), &Dir::sync) {
             Err(e) if e.code() == NetErrorCode::AlreadyExists => match dir.read_record(name)? {
-                Some(old) if old == record.as_bytes() => Ok(()),
+                // 前回は rename 後の親 fsync で失敗した可能性があるため、同じ内容でも同期をやり直す（D11）。
+                Some(old) if old == record.as_bytes() => Dir::sync(dir),
                 _ => Err(e),
             },
             other => other,

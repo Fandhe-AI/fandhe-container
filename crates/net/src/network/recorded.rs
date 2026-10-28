@@ -33,6 +33,7 @@ use super::{
     NetworkCreateError, NetworkDeleteReport, StaticIpam, host_owner_token, new_generation,
     ownership_token,
 };
+use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
 use crate::netlink_route::IpPrefix;
@@ -105,6 +106,35 @@ fn require_settled<E, T>(
     Ok(realized)
 }
 
+/// 排他ロックのガードであることを、カーネル操作の前に確かめる。
+fn require_exclusive_guard<E, T>(guard: &NetworkLockGuard<'_>) -> Result<(), RecordedError<E, T>> {
+    if guard.is_exclusive() {
+        Ok(())
+    } else {
+        Err(RecordedError::Store(precondition(
+            "network operations need the exclusive network lock",
+        )))
+    }
+}
+
+/// `--dns` の上流を、意図記録とカーネル操作の前に検証する（`MemberRecord::new` と `rebuild_ipam` の規則と同じ）。
+fn check_dns(dns: &[IpAddr], gateway: IpAddr) -> Result<(), NetError> {
+    let invalid = |m: &'static str| NetError::new(NetErrorCode::InvalidArgument, m);
+    if dns.len() > MAX_UPSTREAMS_PER_CONTAINER {
+        return Err(invalid("too many dns servers for a member"));
+    }
+    for (i, ip) in dns.iter().enumerate() {
+        UpstreamServer::new(*ip)?;
+        if dns.iter().skip(i + 1).any(|o| o == ip) {
+            return Err(invalid("duplicate dns server for a member"));
+        }
+        if *ip == gateway {
+            return Err(invalid("dns server is the network gateway"));
+        }
+    }
+    Ok(())
+}
+
 /// attach を記録つきで行う本体。`run` は払い出し済みの IPAM と接続の世代を受けて接続する。
 ///
 /// 手順: 記録から IPAM を組み直す → 世代とアドレスを決める → 意図記録を書く → `run` → 成功なら確定記録、
@@ -119,7 +149,9 @@ pub(crate) fn attach_recorded_with<N, F>(
 where
     F: FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<N>, ContainerAttachError>,
 {
+    require_exclusive_guard(guard)?;
     let realized = require_settled(guard)?;
+    check_dns(dns, realized.gateway().addr()).map_err(RecordedError::Store)?;
     if &spec.network != realized.name() || spec.bridge_token != realized.token() {
         return Err(RecordedError::Store(precondition(
             "attach spec does not belong to the network",
@@ -232,19 +264,30 @@ fn commit_attached<N>(
 pub(crate) fn detach_recorded_with<E, F>(
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
+    container: ContainerIdentity<'_>,
     run: F,
 ) -> Result<NetworkDeleteReport, RecordedError<E, NetworkDeleteReport>>
 where
     F: FnOnce(&CreatedNetwork, &mut StaticIpam) -> Result<NetworkDeleteReport, E>,
     E: DetachClaim,
 {
+    require_exclusive_guard(guard)?;
     let realized = require_settled(guard)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let intents = guard.member_intents().map_err(RecordedError::Store)?;
-    if !members.iter().any(|m| m.id() == member_id) {
+    let Some(recorded) = members.iter().find(|m| m.id() == member_id) else {
         return Err(RecordedError::Store(NetError::new(
             NetErrorCode::NotFound,
             "member not found",
+        )));
+    };
+    // 別メンバーのハンドルで切り離して、記録だけ別のメンバーのものを消す事故を防ぐ（カーネル操作の前に照合する）。
+    if recorded.endpoint() != container.endpoint
+        || recorded.address() != container.address
+        || recorded.token() != container.host_token
+    {
+        return Err(RecordedError::Store(precondition(
+            "container does not match the member record",
         )));
     }
     let mut ipam = rebuild_ipam(&realized, &members, &intents).map_err(RecordedError::Store)?;
@@ -271,6 +314,13 @@ where
             Err(RecordedError::Op(e))
         }
     }
+}
+
+/// detach に渡されたコンテナの同一性（メンバー記録との照合用）。
+pub(crate) struct ContainerIdentity<'a> {
+    pub(crate) endpoint: &'a super::EndpointId,
+    pub(crate) address: IpPrefix,
+    pub(crate) host_token: &'a str,
 }
 
 /// detach の失敗から請求書を取り出す口（`ContainerDetachError` と試験用の型を同じ手順で扱う）。
@@ -377,9 +427,17 @@ pub(crate) fn delete_recorded_with<T, E, F>(
 where
     F: FnOnce(&CreatedNetwork, &mut StaticIpam) -> Result<T, E>,
 {
+    require_exclusive_guard(guard)?;
     let realized = require_settled(guard)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let intents = guard.member_intents().map_err(RecordedError::Store)?;
+    // 回収待ちの請求書が残る間は削除しない（bridge が消えると、取り残しの所属を後から証明できなくなる）。
+    let reclaim = guard.reclaim_records().map_err(RecordedError::Store)?;
+    if reclaim.create.is_some() || !reclaim.attach.is_empty() {
+        return Err(RecordedError::Store(precondition(
+            "network has pending reclaim records",
+        )));
+    }
     if !members.is_empty() || !intents.is_empty() {
         return Err(RecordedError::Store(precondition(
             "network still has members",
@@ -505,7 +563,13 @@ mod linux {
         NetworkDeleteReport,
         RecordedError<Box<ContainerDetachError<ContainerNetns>>, NetworkDeleteReport>,
     > {
-        detach_recorded_with(guard, member_id, |created, ipam| {
+        let (endpoint, host_token) = (container.endpoint.clone(), container.host_token.clone());
+        let identity = ContainerIdentity {
+            endpoint: &endpoint,
+            address: container.address,
+            host_token: &host_token,
+        };
+        detach_recorded_with(guard, member_id, identity, |created, ipam| {
             detach_container(
                 route,
                 nft,
@@ -621,6 +685,23 @@ mod tests {
             PathBuf::from(NETNS_DIR),
         )
         .unwrap()
+    }
+    /// 記録済みメンバーと同じ同一性（detach の照合を通す側）。
+    fn own(n: &NetworkLockGuard<'_>, id: &str) -> (EndpointId, IpPrefix, String) {
+        let m = n
+            .members()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id().as_str() == id)
+            .unwrap();
+        (m.endpoint().clone(), m.address(), m.token().to_owned())
+    }
+    fn ident(o: &(EndpointId, IpPrefix, String)) -> ContainerIdentity<'_> {
+        ContainerIdentity {
+            endpoint: &o.0,
+            address: o.1,
+            host_token: &o.2,
+        }
     }
     fn mid(s: &str) -> MemberId {
         MemberId::new(s).unwrap()
@@ -826,11 +907,16 @@ mod tests {
         attach_recorded_with(&n, &mid("c2"), &s2, &[], ok_run(&s2)).unwrap();
         assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 2);
         let seen = std::cell::Cell::new(0usize);
-        let r =
-            detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(&n, &mid("c1"), |_c, ipam| {
+        let o1 = own(&n, "c1");
+        let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &n,
+            &mid("c1"),
+            ident(&o1),
+            |_c, ipam: &mut StaticIpam| {
                 seen.set(ipam.allocated_count());
                 Ok(NetworkDeleteReport::default())
-            });
+            },
+        );
         assert!(r.is_ok());
         assert_eq!(seen.get(), 2, "run には組み直した IPAM が渡る");
         assert_eq!(n.members().unwrap().len(), 1);
@@ -839,11 +925,126 @@ mod tests {
         let att = attach_recorded_with(&n, &mid("c3"), &s3, &[], ok_run(&s3)).unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
         // 記録に無いメンバーの detach は NotFound。
-        let r =
-            detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(&n, &mid("zz"), |_c, _i| {
-                Ok(NetworkDeleteReport::default())
-            });
+        let o3 = own(&n, "c3");
+        let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &n,
+            &mid("zz"),
+            ident(&o3),
+            |_c, _i| Ok(NetworkDeleteReport::default()),
+        );
         assert_eq!(r.unwrap_err().store_code(), Some(NetErrorCode::NotFound));
+    }
+
+    /// NET-1・#3067: 別メンバーの同一性での detach はカーネル操作の前に拒否され、記録は残る。
+    #[test]
+    fn net1_3067_detach_rejects_foreign_container() {
+        let t = Tmp::new("detach-foreign");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let (s1, s2) = (spec("c1"), spec("c2"));
+        attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
+        attach_recorded_with(&n, &mid("c2"), &s2, &[], ok_run(&s2)).unwrap();
+        let o2 = own(&n, "c2");
+        let ran = std::cell::Cell::new(false);
+        let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &n,
+            &mid("c1"),
+            ident(&o2),
+            |_c, _i| {
+                ran.set(true);
+                Ok(NetworkDeleteReport::default())
+            },
+        );
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
+        );
+        assert!(!ran.get(), "カーネル操作は始めない");
+        assert_eq!(n.members().unwrap().len(), 2);
+    }
+
+    /// NET-1・#3067: 共有ガードでは detach / attach / delete をカーネル操作の前に拒否する。
+    #[test]
+    fn net1_3067_shared_guard_rejected_before_kernel_ops() {
+        let t = Tmp::new("shared-guard");
+        let store = setup(&t);
+        {
+            let g = store.lock_global_exclusive().unwrap();
+            let n = g.lock_network(&name()).unwrap();
+            realize(&n);
+            let s1 = spec("c1");
+            attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
+        }
+        let g = store.lock_global_shared().unwrap();
+        let n = g.lock_network_shared(&name()).unwrap();
+        let o1 = own(&n, "c1");
+        let ran = std::cell::Cell::new(false);
+        let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &n,
+            &mid("c1"),
+            ident(&o1),
+            |_c, _i| {
+                ran.set(true);
+                Ok(NetworkDeleteReport::default())
+            },
+        );
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
+        );
+        let r = delete_recorded_with::<(), (), _>(&n, |_c, _i| {
+            ran.set(true);
+            Ok(())
+        });
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
+        );
+        assert!(!ran.get());
+    }
+
+    /// NET-1・#3067: gateway と同じ DNS・重複 DNS の attach は意図記録もカーネル操作も無しで拒否する。
+    #[test]
+    fn net1_3067_attach_rejects_bad_dns_before_intent() {
+        let t = Tmp::new("attach-bad-dns");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = spec("c1");
+        let gw = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ext = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        for dns in [vec![gw], vec![ext, ext]] {
+            let r = attach_recorded_with::<(), _>(&n, &mid("c1"), &s1, &dns, |_i, _g| {
+                panic!("カーネル操作は始めない")
+            });
+            assert_eq!(
+                r.unwrap_err().store_code(),
+                Some(NetErrorCode::InvalidArgument)
+            );
+            assert!(n.member_intents().unwrap().is_empty());
+        }
+    }
+
+    /// NET-1・#3067: 回収待ちの請求書が残るネットワークは削除しない。
+    #[test]
+    fn net1_3067_delete_rejects_pending_reclaim() {
+        let t = Tmp::new("delete-reclaim");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = spec("c1");
+        let r = attach_recorded_with(&n, &mid("c1"), &s1, &[], failing_run(&s1, veth_leftover()));
+        assert!(matches!(r, Err(RecordedError::Op(_))));
+        assert!(!n.reclaim_records().unwrap().attach.is_empty());
+        let r = delete_recorded_with::<(), (), _>(&n, |_c, _i| panic!("カーネル操作は始めない"));
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
+        );
     }
 
     /// detach が失敗してもメンバー記録は残る。
@@ -856,7 +1057,8 @@ mod tests {
         realize(&n);
         let s1 = spec("c1");
         attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
-        let r = detach_recorded_with(&n, &mid("c1"), |_c, _i| {
+        let o1 = own(&n, "c1");
+        let r = detach_recorded_with(&n, &mid("c1"), ident(&o1), |_c, _i| {
             Err::<NetworkDeleteReport, _>(Box::new(ContainerDetachErrorUnit))
         });
         assert!(matches!(r, Err(RecordedError::Op(_))));

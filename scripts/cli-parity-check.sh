@@ -31,6 +31,12 @@
 # pid の値・bundle（絶対パス）・annotations の中身は記録しない（CLI-1・#1904）。kill は成功時の stdout が
 # 空で、stderr の code（不在は NOT_FOUND・実行中でなければ FAILED_PRECONDITION・構文は INVALID_ARGUMENT）だけを比べる。
 #
+# start 済みの state・kill（B31〜B34。種別 p / q。#3098・CLI-1）: B21 の後に実行中の c2 へ state（B31。pid キーあり）、
+# kill c2 TERM（B32。成功は 0・stdout 空）、再度 state（B33）を取る。c2 の PID 1（sleep）は pid namespace 内で
+# SIGTERM を受けず、kill は送るだけで状態を変えないため、B33 は running のまま（停止は B22 の stop --signal KILL が担う）。
+# 停止後の state（B34。種別 q）は B23 の後に置き、running でなくなるまで期限つきで繰り返す（stopped・pid キーなし）。
+# start が成功しない環境では B31・B33・B34 は <start-failed>（NOT_STARTED）、B32 は 5 / FAILED_PRECONDITION の実データになる。
+#
 # start 済みの inspect（B18〜B25・種別 s / w。#2891・SEC-1・CLI-1）: B18 で `--read-only --cap-drop NET_RAW` つきの
 # コンテナ c2 を起動用 bundle（Linux だけホストの sleep と依存ライブラリを集めた最小 rootfs を持つ）で作り、
 # start → inspect → stop --signal KILL → 終了待ちの inspect → delete → list と連鎖する。start が成功した
@@ -100,6 +106,9 @@ usage() {
 # o = stdout が state の 1 行 JSON（OCI の state。キーの集合と status を固定語彙で記録する。norm_state。#1904）、
 # s = start 済みコンテナの inspect（直前の start が成功したときだけ中身を記録し、失敗したときは
 #     <start-failed> の印にする。#2891）、w = s と同じ形で、状態が running でなくなるまで期限つきで繰り返す。
+# p = start 済みコンテナの state（o と同じ正規化。直前の start が失敗したときは <start-failed>。#3098）、
+# q = p と同じ形で、状態が running でなくなるまで期限つきで繰り返す。
+# kill c2 TERM は PID 1 が SIGTERM を受けず止まらないため、停止は B22 が担い、停止後の state（q）は B23 の後に置く。
 # B 層は上から順に実行する（状態遷移を観測する）。ID・層はドキュメントのチェックリストと一致させる。
 # --------------------------------------------------
 CASES=(
@@ -172,8 +181,12 @@ CASES=(
   'B19|B|i|--root @R@ inspect c2'
   'B20|B|n|--root @R@ start c2'
   'B21|B|s|--root @R@ inspect c2'
+  'B31|B|p|--root @R@ state c2'
+  'B32|B|n|--root @R@ kill c2 TERM'
+  'B33|B|p|--root @R@ state c2'
   'B22|B|n|--root @R@ stop --signal KILL c2'
   'B23|B|w|--root @R@ inspect c2'
+  'B34|B|q|--root @R@ state c2'
   'B24|B|n|--root @R@ delete c2'
   'B25|B|l|--root @R@ list'
   'D01|D|n|--root @R@ logs --tail'
@@ -592,7 +605,7 @@ norm_stdout() {
   local kind="$1" line header_expected row_re joined first ok raw stripped pidcol
   # start が成功していない環境では inspect の中身を比べる意味が無い。出力を解析せず固定の印を残し、
   # compare が NOT_STARTED として扱う（合格に見せない）。
-  if { [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$last_start_exit" != "0" ]; then
+  if { [ "$kind" = "s" ] || [ "$kind" = "w" ] || [ "$kind" = "p" ] || [ "$kind" = "q" ]; } && [ "$last_start_exit" != "0" ]; then
     norm_stdout_out='<start-failed>'
     return 0
   fi
@@ -601,7 +614,7 @@ norm_stdout() {
   if [ ! -s "$tmp_dir/out" ]; then
     norm_stdout_out='-'
     # 成功（終了コード 0）した inspect が何も出さないのは異常。失敗時の空出力は従来どおり許容する。
-    if { [ "$kind" = "i" ] || [ "$kind" = "o" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ]; } && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
+    if { [ "$kind" = "i" ] || [ "$kind" = "o" ] || [ "$kind" = "s" ] || [ "$kind" = "w" ] || [ "$kind" = "p" ] || [ "$kind" = "q" ]; } && [ "$run_exit" = "0" ]; then norm_stdout_out='<unexpected>:0'; fi
     return 0
   fi
   raw=$(($(wc -c <"$tmp_dir/out")))
@@ -615,7 +628,7 @@ norm_stdout() {
     norm_stdout_out='<unexpected>:big'
     return 0
   fi
-  if [ "$kind" = "o" ]; then
+  if [ "$kind" = "o" ] || [ "$kind" = "p" ] || [ "$kind" = "q" ]; then
     if norm_state; then return 0; fi
     norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
     return 0
@@ -669,8 +682,9 @@ norm_stdout() {
   return 0
 }
 
-# 直前の inspect の出力（$tmp_dir/out）の status が running か。種別 w の繰り返しの判定に使う。
-inspect_is_running() {
+# 直前の inspect / state の出力（$tmp_dir/out、どちらも 1 行 JSON）の status が running か。
+# 種別 w（inspect）と q（state）の繰り返しの判定に使う。
+status_is_running() {
   local e=""
   IFS= read -r e <"$tmp_dir/out" || true
   [[ $e == *'"status":"running"'* ]]
@@ -809,14 +823,14 @@ do_capture() {
     run_cli "$cli" "$limit" "${argv[@]}"
     # w は状態が running でなくなるまで期限つきで繰り返す（stop 直後の delete が Running で失敗する競合を避ける）。
     # start が成功していなければ待っても変わらないので 1 回で済ませる。
-    if [ "$kind" = "w" ] && [ "$last_start_exit" = "0" ] && [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ]; then
+    if { [ "$kind" = "w" ] || [ "$kind" = "q" ]; } && [ "$last_start_exit" = "0" ] && [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ]; then
       deadline=$((SECONDS + limit))
-      while inspect_is_running && [ "$SECONDS" -lt "$deadline" ]; do
+      while status_is_running && [ "$SECONDS" -lt "$deadline" ]; do
         sleep 0.2
         run_cli "$cli" "$limit" "${argv[@]}"
         [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ] || break
       done
-      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ] && inspect_is_running; then
+      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" = "0" ] && status_is_running; then
         run_timed_out=1
       fi
     fi
@@ -930,6 +944,8 @@ load_capture() {
           elif [ "$k" = "i" ] && [[ $so =~ $so_inspect_re ]]; then
             so_ok=1
           elif [ "$k" = "o" ] && [[ $so =~ $so_state_re ]]; then
+            so_ok=1
+          elif { [ "$k" = "p" ] || [ "$k" = "q" ]; } && { [ "$so" = "<start-failed>" ] || [[ $so =~ $so_state_re ]]; }; then
             so_ok=1
           elif { [ "$k" = "s" ] || [ "$k" = "w" ]; } && { [ "$so" = "<start-failed>" ] || [[ $so =~ $so_started_re ]]; }; then
             so_ok=1

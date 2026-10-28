@@ -48,7 +48,7 @@ expect_eq() {
 #   noisy    = ok と同じ終了コードで、stderr / stdout にパス風文字列・制御文字を流す
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
 #   nostart  = ok と同じだが、起動用 bundle の start も失敗する（supervisor 未配置など start の前提が無い環境。#2891）
-#   stuck    = ok と同じだが、stop しても running のまま（B23 の終了待ちが期限切れになる。#2891）
+#   stuck    = ok と同じだが、stop しても running のまま（B23・B34 の終了待ちが期限切れになる。#2891・#3098）
 #   delfail  = ok と同じだが、c2 の delete が失敗し c2 が残る（後始末の inspect は成功する。#2891）
 #   delgone  = c2 の delete は失敗するが c2 は消える（後始末の inspect は NOT_FOUND。#2891）
 #   sigdel   = c2 の delete が止まる（1 回目 = 連鎖中、2 回目 = 後始末中。印は STUB_SIGDEL_DIR の m1 / m2。#2891 の再入）
@@ -596,7 +596,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 80 cases" 80 "$count"
+expect_eq "capture records 84 cases" 84 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -615,7 +615,7 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 80 "$loc_n"
+expect_eq "lcall stub invocations" 84 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -707,12 +707,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=34 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
 cmp_has "lcall layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=30 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=34 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -722,7 +722,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
 cmp_has "non-linux layer A all match" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21 and B23 are not started)" 'layer B (behavior): match=4 mismatch=24 missing=0'
+cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21, B23, B31, B33 and B34 are not started; B32 differs 0 vs 5)" 'layer B (behavior): match=4 mismatch=25 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -739,7 +739,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=29 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=33 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"
@@ -909,6 +909,10 @@ expect_line "B18 create with --read-only --cap-drop on the start bundle" ok "B18
 expect_line "B19 inspect before start records nothing" ok "B19${tab}B${tab}0${tab}-${tab}inspect:c2,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
 expect_line "B20 start of the start bundle" ok "B20${tab}B${tab}0${tab}-${tab}-"
 expect_line "B21 inspect after start (caps=13, ro=true)" ok "B21${tab}B${tab}0${tab}-${tab}started:c2,running,pid=<pid>,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=not_recorded,caps=13,ro=true"
+expect_line "B31 state of the running container (pid key present)" ok "B31${tab}B${tab}0${tab}-${tab}state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-"
+expect_line "B32 kill TERM on the running container succeeds with empty stdout" ok "B32${tab}B${tab}0${tab}-${tab}-"
+expect_line "B33 state after TERM is still running" ok "B33${tab}B${tab}0${tab}-${tab}state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-"
+expect_line "B34 state after the stop (stopped, no pid key)" ok "B34${tab}B${tab}0${tab}-${tab}state:c2,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-"
 expect_line "B22 stop --signal KILL" ok "B22${tab}B${tab}0${tab}-${tab}-"
 expect_line "B23 inspect after the stop" ok "B23${tab}B${tab}0${tab}-${tab}started:c2,stopped,pid=-,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=recorded,caps=13,ro=true"
 expect_line "B24 delete" ok "B24${tab}B${tab}0${tab}-${tab}-"
@@ -918,13 +922,20 @@ expect_line "B05 start of the empty rootfs bundle fails" ok "B05${tab}B${tab}5${
 expect_line "nostart B20 start fails" nostart "B20${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
 expect_line "nostart B21 is start-failed" nostart "B21${tab}B${tab}0${tab}-${tab}<start-failed>"
 expect_line "nostart B23 is start-failed" nostart "B23${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B31 is start-failed" nostart "B31${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B32 kill is FAILED_PRECONDITION" nostart "B32${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "nostart B33 is start-failed" nostart "B33${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B34 is start-failed" nostart "B34${tab}B${tab}0${tab}-${tab}<start-failed>"
 expect_line "nostart B24 delete of the created container" nostart "B24${tab}B${tab}0${tab}-${tab}-"
 expect_line "nostart B25 list is empty again" nostart "B25${tab}B${tab}0${tab}-${tab}list:H"
 compare ok nostart
 expect_rc "compare with a not started side is rc 1" 1 $?
 cmp_has_prefix "B21 reported as NOT_STARTED" 'B21 NOT_STARTED'
 cmp_has_prefix "B23 reported as NOT_STARTED" 'B23 NOT_STARTED'
-cmp_has "not started count" 'not started (start precondition unmet): 2'
+cmp_has_prefix "B31 reported as NOT_STARTED" 'B31 NOT_STARTED'
+cmp_has_prefix "B34 reported as NOT_STARTED" 'B34 NOT_STARTED'
+cmp_has_prefix "B32 kill mismatch is reported" 'B32 MISMATCH'
+cmp_has "not started count" 'not started (start precondition unmet): 5'
 compare nostart nostart
 expect_rc "matching <start-failed> records are rc 1" 1 $?
 cmp_has_prefix "B21 not started on both sides is NOT_STARTED" 'B21 NOT_STARTED'
@@ -938,6 +949,11 @@ case "$(line_of stuck B23)" in
   "B23${tab}B${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>") pass "B23 recorded as timeout" ;;
   *) fail "B23 recorded as timeout (got '$(line_of stuck B23)')" ;;
 esac
+case "$(line_of stuck B34)" in
+  "B34${tab}B${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>") pass "B34 recorded as timeout" ;;
+  *) fail "B34 recorded as timeout (got '$(line_of stuck B34)')" ;;
+esac
+expect_line "stuck B33 stays running" stuck "B33${tab}B${tab}0${tab}-${tab}state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-"
 expect_line "stuck B24 still deletes" stuck "B24${tab}B${tab}0${tab}-${tab}-"
 # 漏えい検査: bundle・cgroup・hostId・reason は started の記録に現れない
 leak=0
@@ -951,6 +967,36 @@ while IFS= read -r l; do
   case "$l" in *secret*|*100000*|*kernel*|*sbundle*|*rootfs*) leak=$((leak + 1)) ;; esac
 done <"$work/ok.txt"
 expect_eq "started capture leaks no path / cgroup / hostId / reason" 0 "$leak"
+# 具体値の照合: 実行中への kill の終了コード・state の状態が変わったら MISMATCH
+sed "s/^B32${tab}B${tab}0${tab}-${tab}-/B32${tab}B${tab}9${tab}UNAVAILABLE${tab}-/" "$work/ok.txt" >"$work/k1.txt"
+compare ok k1
+expect_rc "changed B32 kill exit code is rc 1" 1 $?
+cmp_has_prefix "B32 changed code is MISMATCH" 'B32 MISMATCH'
+sed "s/^B31${tab}B${tab}0${tab}-${tab}.*/B31${tab}B${tab}0${tab}-${tab}state:c2,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/k2.txt"
+compare ok k2
+expect_rc "changed B31 state is rc 1" 1 $?
+cmp_has_prefix "B31 changed state is MISMATCH" 'B31 MISMATCH'
+# 受理 / 拒否: p / q は state 形か <start-failed> だけ
+sed "s/^B31${tab}B${tab}0${tab}-${tab}.*/B31${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/k3.txt"
+compare k3 k3
+cmp_not_rc2() { if [ "$1" -eq 2 ]; then fail "$2"; else pass "$2"; fi; }
+cmp_not_rc2 $? "<start-failed> on B31 (state after start) is accepted"
+sed "s/^B26${tab}B${tab}0${tab}-${tab}.*/B26${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/k4.txt"
+compare k4 k4
+expect_rc "<start-failed> on B26 (state of created) is rejected" 2 $?
+sed "s/^B32${tab}B${tab}0${tab}-${tab}.*/B32${tab}B${tab}0${tab}-${tab}state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/k5.txt"
+compare k5 k5
+expect_rc "state form on the kill case is rejected" 2 $?
+for form in 'started:c2,running,pid=-,sup=-,cg=-,health=-,audit=-,idmap=-,stop=x,caps=-,ro=-' 'list:H' 'inspect:c2,running,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=x,caps=-,ro=-'; do
+  sed "s/^B31${tab}B${tab}0${tab}-${tab}.*/B31${tab}B${tab}0${tab}-${tab}${form}/" "$work/ok.txt" >"$work/k6.txt"
+  compare k6 k6
+  expect_rc "non-state form on B31 is rejected (${form%%:*})" 2 $?
+done
+sed "s/^B34${tab}B${tab}0${tab}-${tab}.*/B34${tab}B${tab}0${tab}-${tab}state:garbage/" "$work/ok.txt" >"$work/k7.txt"
+compare k7 k7
+expect_rc "state:garbage on B34 is rejected" 2 $?
+# 漏えい検査: state の pid の値と bundle のパスは記録に現れない
+if grep -q '4242\|secret-user' "$work/ok.txt"; then fail "state pid / bundle leaked into the capture"; else pass "state pid / bundle not in the capture"; fi
 # load_capture: started 形式・<start-failed> は種別 s / w にだけ置ける
 sed "s/^B19${tab}B${tab}0${tab}-${tab}.*/B19${tab}B${tab}0${tab}-${tab}started:c2,running,pid=-,sup=-,cg=-,health=-,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/s1.txt"
 compare s1 s1

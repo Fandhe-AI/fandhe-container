@@ -30,7 +30,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 ## 手動の手順
 
 1. その ID の状態が無いことを確かめる（`fandhe-container list` に出ない）。状態がある ID のログは消さない
-2. そのログのロックを持つプロセス（古い supervisor）が居ないことを確かめる（Linux・macOS は `lsof <state_root>/@container-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。居る場合はそのプロセスが終わるのを待つ
+2. そのログのロックを持つプロセス（古い supervisor）が居ないことを確かめる（Linux・macOS は `lsof <state_root>/@container-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。居る場合はそのプロセスが終わるのを待つ。非特権の `lsof` / `fuser` が何も出さなくても「居ない」とは限らない（supervisor は `PR_SET_DUMPABLE=0` のため）。観測できないときの扱いは、末尾の「supervisor ログの手動の手順」の手順 2（非ブロッキングの排他確認。取れなければ中止）と同じにする
 3. 削除候補を先に確認する。対象は次の正確な名前だけで、`<encoded-id>.log*` のような glob は使わない（ID はドットを含み得るため、ID `a` の `a.log*` が別 ID `a.logger` の `a.logger.log` やロックにも一致する）:
    - `<encoded-id>.log`
    - `<encoded-id>.log.lock`
@@ -59,7 +59,11 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 ### supervisor ログの手動の手順
 
 1. その ID の状態が無いことを確かめる（`fandhe-container list` に出ない。plugin-cri の場合は同じ `--root` を指定する）。状態がある ID（稼働中・再作成済み）のログは消さない
-2. そのログのロックを持つプロセスが居ないことを確かめる（Linux・macOS は `lsof <state_root>/@supervisor-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。supervisor はコンテナが生きている間ロックを持ち続けるため、居る場合はそのコンテナのログであり、消さずにプロセスが終わるのを待つ
+2. そのログのロックを持つプロセスが居ないことを確かめる。**非特権の `lsof` / `fuser` が何も表示しないことを「持ち主が居ない」の根拠にしない**。Linux の supervisor は `PR_SET_DUMPABLE=0` で動くため、同じ UID の非特権ユーザーでも `/proc/<pid>/fd` を読めず、持ち主が居ても `lsof` / `fuser` に出ないことがある。次の順で進める:
+   1. 観測できる場合（Linux・macOS は `lsof <state_root>/@supervisor-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可。root なら持ち主を観測できる）に持ち主が出たら、消さずにそのプロセスが終わるのを待つ。supervisor はコンテナが生きている間ロックを持ち続けるため、居る場合はそのコンテナのログである
+   2. 何も出ない場合も「居ない」と結論しない。まず同じ ID の再作成と `start`（CLI の `create`・`start`、plugin-cri の `CreateContainer`・`StartContainer`）を止める。そのうえで、ロックが `flock(2)` であることを前提に、非ブロッキングで排他を取れるかを確かめる（Linux: `flock -n <state_root>/@supervisor-logs/<encoded-id>.log.lock -c true`。成功〔終了コード 0〕なら誰も保持していない。`flock` が無い環境ではこの確認ができない）
+   3. 排他が取れない（終了コード 1）、または観測も排他の確認もできない場合は、持ち主が居る扱いにして手順を中止する。何も削除しない。プロセスが終わるのを待つか、観測できる権限で持ち主を確かめてからやり直す
+
 3. 削除候補を先に確認する。対象は次の正確な名前だけで、`<encoded-id>.log*` のような glob は使わない（ID `a` の `a.log*` が別 ID `a.logger` のファイルにも一致するため）:
    - `<encoded-id>.log`
    - `<encoded-id>.log.lock`
@@ -70,4 +74,4 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
    ls -1 | grep -E '^<encoded-id>\.log(\.lock|\.[0-9]+)?$'   # 候補の確認（<encoded-id> 中のドットは \. にする）
    ```
 
-4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。ディレクトリ `@supervisor-logs` 自体は消さない（0700 のまま残す）。`rm -rf` は使わない。root での実行は不要（rootless の状態ルートは利用者の所有）
+4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。ディレクトリ `@supervisor-logs` 自体は消さない（0700 のまま残す）。`rm -rf` は使わない。削除に root は要らない（rootless の状態ルートは利用者の所有）。ただし持ち主の観測には権限が要り得るため、削除の権限と観測の権限は別に考える（手順 2 の確認が済んでいない限り削除しない）

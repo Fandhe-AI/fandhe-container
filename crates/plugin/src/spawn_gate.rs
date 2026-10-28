@@ -67,9 +67,87 @@ mod tests {
         c
     }
 
+    /// 通常の子の終了待ちの上限。`/bin/sh -c "exit 0"` は通常ミリ秒で終わるため、負荷の高い CI でも
+    /// 十分余る 10 秒とする（REPAIR-5: 期限なしの `wait()` を置かない）。
+    const WAIT_LIMIT: Duration = Duration::from_secs(10);
+    /// 再実行した試験プロセス（20,000 回の spawn と 1,000 回の窓の試行）の終了待ちの上限。
+    const REEXEC_LIMIT: Duration = Duration::from_secs(120);
+    /// SIGKILL 後の回収確認の上限。SIGKILL の配送は即時でないことがあるが、数秒で回収できない子は
+    /// 割り込み不能待ち等の異常として、待ち続けず失敗にする。
+    const REAP_LIMIT: Duration = Duration::from_secs(10);
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// `limit` 以内に `try_wait` が終了を返すまでポーリングする。期限切れなら `Ok(None)`。
+    fn poll_exit(
+        child: &mut Child,
+        limit: Duration,
+    ) -> io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(st) = child.try_wait()? {
+                return Ok(Some(st));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// 期限つきの終了待ち。`limit` を超えたら kill し、`reap_limit` 以内の回収を確認する。
+    /// 期限超過・回収不能はどちらも具体的なメッセージの `Err` にする。
+    fn wait_bounded(
+        child: &mut Child,
+        limit: Duration,
+        reap_limit: Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        if let Some(st) = poll_exit(child, limit).map_err(|e| format!("try_wait failed: {e}"))? {
+            return Ok(st);
+        }
+        let _ = child.kill();
+        match poll_exit(child, reap_limit) {
+            Ok(Some(_)) => Err(format!(
+                "child did not exit within {limit:?}; killed and reaped"
+            )),
+            Ok(None) => Err(format!(
+                "child did not exit within {limit:?} and was not reaped within {reap_limit:?} after SIGKILL"
+            )),
+            Err(e) => Err(format!(
+                "child did not exit within {limit:?}; try_wait after kill failed: {e}"
+            )),
+        }
+    }
+
+    /// kill して `REAP_LIMIT` 以内の回収を確認する。確認できなければ panic で試験を失敗させる。
     fn kill_reap(mut child: Child) {
         let _ = child.kill();
-        let _ = child.wait();
+        match poll_exit(&mut child, REAP_LIMIT) {
+            Ok(Some(_)) => {}
+            other => panic!("child was not reaped within {REAP_LIMIT:?} after SIGKILL: {other:?}"),
+        }
+    }
+
+    /// REPAIR-5: 期限切れでは子を kill して回収し、期限超過を具体的なメッセージで報告する。
+    #[test]
+    fn repair5_wait_bounded_kills_and_reports_on_timeout() {
+        let mut child = holder().spawn().unwrap();
+        let err = wait_bounded(&mut child, Duration::from_millis(100), REAP_LIMIT).unwrap_err();
+        assert_eq!(err, "child did not exit within 100ms; killed and reaped");
+        // 回収済みなので、以後の try_wait は SIGKILL の終了状態を返す。
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    /// REPAIR-5: 期限内に終了した子は終了状態を返す。
+    #[test]
+    fn repair5_wait_bounded_returns_status_when_child_exits() {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = c.spawn().unwrap();
+        let st = wait_bounded(&mut child, WAIT_LIMIT, REAP_LIMIT).unwrap();
+        assert_eq!(st.code(), Some(3));
     }
 
     /// reader を非ブロッキングで 1 回読む。EOF なら `Ok(0)`、相手が生きていれば `WouldBlock`。
@@ -162,7 +240,7 @@ mod tests {
     fn plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer() {
         if std::env::var_os(ROLE_ENV).is_none() {
             let exe = std::env::current_exe().unwrap();
-            let status = Command::new(exe)
+            let mut reexec = Command::new(exe)
                 .args([
                     "--exact",
                     "spawn_gate::tests::plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer",
@@ -172,8 +250,9 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
                 .unwrap();
+            let status = wait_bounded(&mut reexec, REEXEC_LIMIT, REAP_LIMIT).unwrap();
             assert!(status.success(), "child role failed: {status}");
             return;
         }
@@ -189,7 +268,8 @@ mod tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null());
                     let mut child = spawn(&mut c).unwrap();
-                    let _ = child.wait();
+                    let st = wait_bounded(&mut child, WAIT_LIMIT, REAP_LIMIT).unwrap();
+                    assert!(st.success(), "exit 0 child failed: {st}");
                     spawned += 1;
                 }
             });

@@ -5,6 +5,7 @@
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
+//! ユーザー定義ネットワーク（#3066・NET-6）は `network create <name>` / `network rm <name>` / `network ls`（オプションなし）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -196,6 +197,17 @@ pub(super) enum ImageArgs {
     Rm(ImageRmArgs),
     /// `image tag --image-root <dir> <source> <target>`（#2316）。
     Tag(ImageTagArgs),
+}
+
+/// `network` サブコマンドの引数（NET-6・CLI-1・#3066。オプションは持たず位置引数だけ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NetworkArgs {
+    /// `network create <name>`（名前の意味検証は net の `NetworkName::new` に委ねる）。
+    Create(String),
+    /// `network rm <name>`。
+    Rm(String),
+    /// `network ls`。
+    Ls,
 }
 
 /// `image tag` の引数。
@@ -761,6 +773,27 @@ pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> 
             source,
             target,
         }))
+    } else {
+        Err(UsageError)
+    }
+}
+
+/// `network <create|rm|ls> ...` を解析する（サブコマンド無し・未知・位置引数の過不足は使い方エラー。NET-6・CLI-1）。
+pub(super) fn parse_network(args: Vec<OsString>) -> Result<NetworkArgs, UsageError> {
+    let mut it = args.into_iter();
+    let sub = it.next().ok_or(UsageError)?;
+    let rest: Vec<OsString> = it.collect();
+    if sub == "create" {
+        Ok(NetworkArgs::Create(single_positional(rest)?))
+    } else if sub == "rm" {
+        Ok(NetworkArgs::Rm(single_positional(rest)?))
+    } else if sub == "ls" {
+        // 位置引数なし。`--` 以降も含め、何かあれば使い方エラー。
+        if rest.is_empty() {
+            Ok(NetworkArgs::Ls)
+        } else {
+            Err(UsageError)
+        }
     } else {
         Err(UsageError)
     }
@@ -1743,6 +1776,52 @@ mod tests {
 
     /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。
     #[cfg(unix)]
+    /// NET-6・CLI-1（#3066）: `network` の正常系（`--` 以降は位置引数）。
+    #[test]
+    fn cli1_net6_parse_network_accepts_valid() {
+        assert_eq!(
+            parse_network(vec!["create".into(), "n1".into()]),
+            Ok(NetworkArgs::Create("n1".into()))
+        );
+        assert_eq!(
+            parse_network(vec!["create".into(), "--".into(), "-x".into()]),
+            Ok(NetworkArgs::Create("-x".into()))
+        );
+        assert_eq!(
+            parse_network(vec!["rm".into(), "n1".into()]),
+            Ok(NetworkArgs::Rm("n1".into()))
+        );
+        assert_eq!(parse_network(vec!["ls".into()]), Ok(NetworkArgs::Ls));
+    }
+
+    /// NET-6・CLI-1（#3066）: サブコマンド無し・未知・位置引数の過不足・未知オプション・非 UTF-8 は使い方エラー。
+    #[test]
+    fn cli1_net6_parse_network_rejects_invalid() {
+        let bad: Vec<Vec<OsString>> = vec![
+            vec![],
+            vec!["bogus".into()],
+            vec!["create".into()],
+            vec!["create".into(), "a".into(), "b".into()],
+            vec!["create".into(), "--foo".into(), "a".into()],
+            vec!["rm".into()],
+            vec!["rm".into(), "a".into(), "b".into()],
+            vec!["ls".into(), "x".into()],
+            vec!["ls".into(), "--".into()],
+            vec!["ls".into(), "--foo".into()],
+        ];
+        for a in bad {
+            assert_eq!(parse_network(a.clone()), Err(UsageError), "{a:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert_eq!(
+                parse_network(vec!["create".into(), OsString::from_vec(vec![0xff])]),
+                Err(UsageError)
+            );
+        }
+    }
+
     #[test]
     fn cli1_parse_image_tag_rejects_non_utf8() {
         use std::os::unix::ffi::OsStringExt;

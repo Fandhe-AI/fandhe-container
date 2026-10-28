@@ -628,6 +628,12 @@ mod tests {
                     if linux { 0 } else { 5 },
                     if linux { SYSTEM_DF_EMPTY } else { "" },
                 ),
+                // network は Linux 以外では状態ルートも作らず UNIMPLEMENTED(8。#3066・NET-6)。
+                Command::Network => (
+                    vec!["network", "ls"],
+                    if linux { 0 } else { 8 },
+                    if linux { "NAME\tMODE\tSUBNET\n" } else { "" },
+                ),
                 Command::Setup | Command::Doctor => continue,
             };
             let (code, out, err) = invoke(&root, &argv);
@@ -651,7 +657,7 @@ mod tests {
             seen,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
-                "image", "system"
+                "image", "system", "network"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

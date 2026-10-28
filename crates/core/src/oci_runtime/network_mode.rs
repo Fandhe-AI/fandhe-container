@@ -19,7 +19,7 @@
 //! # 実体と未実装(REPAIR-3)
 //!
 //! `NewLoopback` の実体(CLONE_NEWNET と lo の up)は #3064 で入った。rootless の中間プロセスが netns を作り、
-//! exec の前に `exec::unshare_and_configure` が `lo` を up にする。D8 の netns 素性の照合は未実装(#1873)。
+//! exec の前に `exec::unshare_and_configure` が `lo` を up にする。exec 直前の同期点での netns 素性の照合(D8)は core に実装済み(#3206。`exec::netns_sync`。`Host` と `Loopback` の起動だけが通る)。`network_mode=host` の構造化ログと net crate の `HostNetns` を使う結線は未実装(#1873)。
 
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::types::{ErrorCode, TraitError};

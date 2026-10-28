@@ -126,6 +126,14 @@
 ### D8 host モード
 
 - **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3206 で足す。#3058〔PR #3187〕は受け入れ条件に無く `sys` の新しい `unsafe` を伴うため実装しなかった。pasta の同期点〔#1939〕は #3206 の上に fd 2 本への拡張として作る）で、次の方式で確かめる（本番の supervisor は `start_entry.rs` で `PR_SET_DUMPABLE=0` にしており、中間プロセスと exec 前の子もこれを継承する。non-dumpable のプロセスの `/proc/<pid>/ns/*` と `/proc/<pid>/task/<tid>/ns/net` は ptrace アクセス検査で非特権の親から `PermissionDenied` になるため、親が procfs で子の netns を参照する `HostNetns::verify_process(pid)` は本番経路では使わない。既存の non-dumpable 防御〔SEC-1〕は緩めず、`PR_SET_DUMPABLE` を 1 に戻さず、`CAP_SYS_PTRACE` も足さない）。子は同期点で、自分の `/proc/self/ns/net` を `O_RDONLY|O_CLOEXEC` で開き（自分自身の参照は dumpable に依らず許される）、その fd を同期用の `socketpair(AF_UNIX, SOCK_SEQPACKET)` で `SCM_RIGHTS` により親へ渡す。親は受け取った fd を `fstat` し、(dev, ino) を基準と比較する。netns の fd は inode が netns を一意に表すため、procfs の参照と同じ判定になる。fd は 1 本だけを受け、control メッセージ長・fd 数・種別を検証し（余分な fd は閉じて `FailedPrecondition`）、受信には期限を付ける（REPAIR-5）。net 側の判定（Host / Loopback / Other の分類）は pid ではなく (dev, ino) を取る関数 `HostNetns::verify_ns_identity` として切り出し、`verify_process` はその薄い呼び出し元に保つ（実装は #3206 で足す。net 側の切り出しも #3206 の照合に含める。host モードの結線と構造化ログ `network_mode=host` は #1873）。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。照合は資格情報を落とす前に行う（fd 渡しなので、資格情報の前後に依らず成立するが、順序は変えない）: 同期点は子が `process.user` の setuid / setgid / `setgroups` を行う前（子がまだ supervisor と同じ実 UID の間）に置き、照合の完了を pipe で親子同期してから子が資格情報を切り替えて exec する。これにより RootlessSubordinateIds で `process.user` が非 root（子のホスト UID が supervisor と異なる）でも、`/proc/<pid>/task/<tid>/ns/net` の stat に要る ptrace 相当の権限を増やさずに照合でき、非特権の supervisor が `PermissionDenied` で正常な起動を拒否する（既定の none でも起きる）ことがない。資格情報を落とした後の再照合はしない（netns は setns / unshare 済みで、以後 exec までに変わる経路が無い。エラーの意味は SEC-5 の `FailedPrecondition` に統一し、`PermissionDenied` を照合の失敗として黙って握りつぶさない）。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
+- 実装（#3206）: core の `crates/core/src/exec/netns_sync.rs`（C 側の `receive_and_verify`・子側の `NetnsSyncSender`）と `launch_intermediate.rs` の配線。決定の本文は変えず、実装で決めた細部は次のとおり（自動運転で安全側に選んだ。オーナーの承認は未取得）。
+  - **同期点の位置**: PID 1 の開始ゲート通過後・`child_main`（pivot・stdio・StagePipeline の `CapabilityDrop` 段）の前。PID 1 はこの時点で単一スレッドで、fd 1 本で全スレッドが基準の netns にいることを表せる。C は PID 1 の pidfd を開き、ゲートを開放し、中間プロセスを回収した後、状態 pipe の `P` を読む前に受信する。
+  - **範囲**: `LaunchNetworkMode::Host`（期待は基準と同じ）と `Loopback`（基準と異なる）の起動だけが通る。`FromConfig`（既定・CRI の経路）は通さない（D7 の「CRI の経路の挙動を変えない」と整合。pod の netns への join〔#2838〕が入るときに広げるかを見直す）。モードと実効の組が不整合なら fork の前に `Internal` で拒否する。
+  - **基準の取り方**: launch の入口（fork の前）で C が自分の `/proc/thread-self/ns/net` を開いて取る。launch を呼ぶ C は `Threads: 1` の supervisor そのもので、start の入口から launch までの間に `setns` / `unshare(CLONE_NEWNET)` をしないため、D8 の「start の入口で取る基準」と同じ値になる。restart の再 launch でも同じプロセスの netns を取り直す。取れなければ子を作らずに `FailedPrecondition`（段 `netns_verify`）。レビューで決定との食い違いと判断された場合は、`LaunchOptions` に基準を渡す入口を足して supervisor の `start_entry` で取る形へ切り替える。
+  - **ワイヤー**: listener 用とは別の `SOCK_SEQPACKET` の socketpair。子 → C は本文 `N` ＋ `SCM_RIGHTS` の fd 1 本（C の端は `SO_PASSCRED`）、C → 子は本文 `A`。受信側は期待する fd の本数を引数に取り、#1939 は 2 を渡して拡張できる。検証は切り詰め・本文・本数・送信元 pid・close-on-exec・nsfs（`fstatfs`）・`readlink` が `net:[<ino>]` であること、そのうえで (dev, ino) を期待と照合する。
+  - **期限と fail-closed**: 子の ACK 待ちは 60 秒（開始ゲートと同じ）、C の受信は launch の単一期限の残りまで。EOF・期限切れ・`A` 以外では子は exec せずに終了し、C は PID 1 を kill して回収する。C の端は中間プロセスで閉じ（PID 1 へ継承させない）、親の死は EOF で子に届く。
+  - **監査（SEC-4）**: 不一致（理由 `netns_identity_mismatch`）と形式違反（`netns_handoff_invalid`）は、段 `netns_verify`・層 `mount`・パスなしで 1 件記録する（`FailedPrecondition`）。EOF・期限切れ・errno・子の `E` 通知は系のエラーで記録しない。message は固定の英文で、inode の値を含めない。
+  - **範囲外**: `network_mode=host` の構造化ログ 1 行と、net の `HostNetns::verify_ns_identity` の切り出し・結線は #1873、pasta 構成の fd 2 本は #1939。
 - 追記（#1935）: pasta 構成の同期点では netns と user namespace の fd を 2 本、この順で受ける（[rootless-network.md](rootless-network.md) 12.2）。Loopback・Host は 1 本のまま。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
@@ -278,7 +286,7 @@ D13-1 の補足（選択肢ごとの影響）:
 | ストアのロック待ち | 5 秒 |
 | DNS の ack | 2 秒 |
 | plugin の RPC | 既存の `RpcTimeout`（最大 10 秒） |
-| host / none の照合 | 既存の `MAX_PASSES` で有界 |
+| host / none の照合 | 既存の `MAX_PASSES` で有界（fd 方式〔D8。#3206〕では、子の ACK 待ちが 60 秒、C の受信が launch の単一期限の残り） |
 | supervisor の手順 3〜7 | 既存の `result_deadline` |
 
 launch の前に `launch_step_budget` が残っていることを確かめる（既存）。

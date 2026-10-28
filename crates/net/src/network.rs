@@ -2808,6 +2808,10 @@ pub fn release_container_netns(
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::net::{IpAddr, Ipv4Addr};
+
     /// NET-1・#3258: `IfIndex` → `LinkIndex` の変換は正の値をそのまま写し、`i32::MAX` 超は拒否する。
     #[cfg(target_os = "linux")]
     #[test]
@@ -2828,10 +2832,6 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::InvalidArgument);
         assert_eq!(e.message(), "ifindex exceeds i32::MAX");
     }
-
-    use super::*;
-    use std::cell::RefCell;
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn nname(s: &str) -> NetworkName {
         NetworkName::new(s).unwrap()

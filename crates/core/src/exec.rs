@@ -513,6 +513,10 @@ pub fn record_exec_target_rejection<E>(
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
 /// プロセスのもので、違反したプロセスや pid1 ではない。
+///
+/// 段は載せない（#3209・REPAIR-3）: 親の手元に段は無く `TraitError` の自由文にしか無い。理由から段を引く表は
+/// `from_violation_at` が上書きする段と食い違い誤る。載せるには worker の `err` 行に段の欄を足す必要がある
+/// （`audit_log` のモジュール doc「段を載せない記録点と理由」）。
 pub fn record_exec_worker_rejection<E>(
     error: E,
     reason: ViolationReason,
@@ -664,9 +668,31 @@ pub fn record_entrypoint_rejection<E>(
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_entrypoint_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_entrypoint_rejection`] に拒否した段 `stage` を載せる版（SEC-4・ERR-4・SUP-6・#3209）。
+///
+/// 呼び出し元は supervisor の exec の親（`audit_worker_result`）で、worker の結果行で既に届いている
+/// `ExecChildStep` を `ExecChildStep::stage` で写して渡す。launch 側の同じ違反が `IsolationStage::Exec`
+/// 固定で `stage:"exec"` と記録されるのと、語彙が揃う。`stage` が `None`（子が段を報告できなかった）の
+/// ときは段を載せない（推測で捏造しない）。それ以外は [`record_entrypoint_rejection`] と同じ。
+pub fn record_entrypoint_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.entrypoint_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -976,7 +1002,8 @@ impl IsolationStage {
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
     ///
-    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）。外部入力は混ざらない静的トークン。
+    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）と `ExecError` の `Display`（子の stderr の診断行の
+    /// `at <段>`。#3209）。外部入力は混ざらない静的トークン。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Validate => "validate",
@@ -1133,9 +1160,9 @@ impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} at {:?}: {}",
+            "{} at {}: {}",
             self.code.as_str(),
-            self.stage,
+            self.stage.as_str(),
             self.message
         )?;
         if let Some(v) = &self.violation {
@@ -4136,6 +4163,22 @@ mod tests {
             err.to_string()
                 .ends_with("(violation: plan_rejected/identity_changed, SEC-5)")
         );
+    }
+
+    /// ERR-4・REPAIR-4・#3209: `ExecError` の `Display` は段を `IsolationStage::as_str` の語彙で出す
+    /// （旧: `{:?}` の CamelCase）。
+    #[test]
+    fn err4_3209_exec_error_display_uses_as_str_vocabulary() {
+        let e = ExecError::new(ErrorCode::NotFound, IsolationStage::MountReadonlyPaths, "x");
+        assert_eq!(e.to_string(), "NOT_FOUND at mount_readonly_paths: x");
+        for stage in IsolationStage::ALL {
+            let e = ExecError::new(ErrorCode::Internal, stage, "m");
+            assert_eq!(
+                e.to_string(),
+                format!("INTERNAL at {}: m", stage.as_str()),
+                "{stage:?}"
+            );
+        }
     }
 
     /// SEC-4（記録経路）: establish の前提違反と証跡不一致に違反記録が付く（対象なし。

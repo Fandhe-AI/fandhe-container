@@ -14,7 +14,9 @@
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
 //! - 段（`AuditRecord::stage`。#3121）は枠が運ばない。段つきの記録を通すと段は落ちる（現行の配線では段つきの
-//!   pre-pivot の記録は単一スレッドの launch が sink へ直接書き、中継を通らない。REPAIR-3）
+//!   pre-pivot の記録は単一スレッドの launch が sink へ直接書き、中継を通らない。REPAIR-3）。落ちることは試験
+//!   `sec4_err4_3209_stage_is_dropped_by_relay_frame` が固定する（枠が段の有無でバイト同一・復号後は段なし）。
+//!   段つきを拒否せず落とすのは、記録そのものを失わないため（記録の成否で拒否は覆らない。fail-closed）
 //! - 運べるのは [`AuditEvent::PluginPeer`]（#2484。plugin-cri の peer 認証の拒否。socket のパスは mount と同じ枠で運ぶ）・
 //!   [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
 //!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
@@ -1143,6 +1145,45 @@ mod tests {
         let mut zero_pid = good;
         zero_pid[13..17].copy_from_slice(&0u32.to_be_bytes());
         assert!(decode(&zero_pid).is_none());
+    }
+
+    /// SEC-4・ERR-4・REPAIR-3・#3209: 段つきの記録を中継の枠へ通すと段は落ちる（枠は段の有無でバイト同一で、
+    /// 復号後の記録は段なし・他の値は一致）。拒否ではなく落とすのは、記録そのものを失わないため。
+    #[test]
+    fn sec4_err4_3209_stage_is_dropped_by_relay_frame() {
+        use super::super::AuditStage;
+        use crate::exec::IsolationStage;
+        let stage = AuditStage::from(IsolationStage::MountBinds);
+        let mut records = vec![
+            sample(ControlPeerRejection::PeerUidMismatch, Some("c1")),
+            exit_signal_sample(31, 4321, Some("c1")),
+            mount_sample(Some(AuditPath::new("/a/b")), Some("c1")),
+            plugin_peer_sample(PLUGIN_PEER_REJECTIONS[0], "/run/p/cri.sock"),
+            reason_sample(None, MOUNT_REASONS[0].as_str(), Some("c1")),
+            reason_sample(
+                Some(AuditPath::new("/a")),
+                MOUNT_REASONS[1].as_str(),
+                Some("c1"),
+            ),
+            seccomp_sample(165, 0xC000_003E, Some("c1")),
+        ];
+        assert_eq!(records.len(), 7);
+        for plain in records.drain(..) {
+            let staged = plain.clone().with_stage(stage);
+            assert_eq!(staged.stage(), Some(stage));
+            let frame = encode(&staged).unwrap();
+            assert_eq!(
+                frame,
+                encode(&plain).unwrap(),
+                "frame must not carry the stage"
+            );
+            let back = decode(&frame).unwrap();
+            assert_eq!(back.stage(), None);
+            assert_eq!(back.event(), plain.event());
+            assert_eq!(back.timestamp(), plain.timestamp());
+            assert_eq!(back.pid(), plain.pid());
+            assert_eq!(back.container_id(), plain.container_id());
+        }
     }
 
     fn exit_signal_sample(signal: i32, target: i32, id: Option<&str>) -> AuditRecord {

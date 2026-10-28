@@ -398,6 +398,19 @@ mod tests {
 
     use super::*;
 
+    /// NET-9・SUP-14: `netns-holder` で始まる argv は start の argv として拒否する（特権ランチャーは
+    /// `StartArgs::parse` を通った列だけを転送するため、holder の入口にならない。#3198）。
+    #[test]
+    fn net9_sup14_netns_holder_argv_is_not_a_start_argv() {
+        for argv in [
+            &["netns-holder"][..],
+            &["netns-holder", "start", "--root", "/r", "c1"][..],
+        ] {
+            let e = StartArgs::parse(argv.iter().map(OsString::from)).expect_err("rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{argv:?}");
+        }
+    }
+
     /// 絶対パスの fixture（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。
     #[cfg(windows)]
     const ROOT: &str = r"C:\r";

@@ -74,8 +74,30 @@
 | pasta（rootless のユーザー定義名） | supervisor | net（#1936〜#1940） |
 | bridge・veth・nft・DNS ヘルパー（rootful） | `NetworkPlugin` の実装（plugin プロセス） | net（D13。置き場所は承認待ち） |
 
-- **決定**: `supervisor` → `net` は feature を切らない通常の依存にする。net は workspace 内の依存を持たず 3 OS でコンパイルでき（Linux 専用部分は net 側の cfg で閉じている）、循環しない。依存辺を足す PR（#3065）で supervisor の release バイナリのサイズ差分を記録する（CORE-7・SUP-2）。`core` → `net` は足さない。core は netns を用意するだけ（2026-10-15）で、`lo` の up は D6 で core が自前で行う。
+- **決定**: `supervisor` → `net` は feature を切らない通常の依存にする。net は workspace 内の依存を持たず 3 OS でコンパイルでき（Linux 専用部分は net 側の cfg で閉じている）、循環しない。依存辺を足したときの supervisor の release バイナリのサイズ差分を記録する（CORE-7・SUP-2）。#3065 の PR #3194 では記録が漏れたため、#3212 で記録した（下記「計測（#3212）」）。`core` → `net` は足さない。core は netns を用意するだけ（2026-10-15）で、`lo` の up は D6 で core が自前で行う。
 - **却下した案**: supervisor に feature `network` を切る（cfg の組み合わせが増え、`check-standalone-clippy` の行列が増える）。`core` → `net`（core の rlib に netlink / nft の codec が入り、PLUG-4 の不変性判定の対象も広がる）。
+- **計測（#3212）**: `supervisor` → `net` の辺（PR #3194・`38a96dcb`）の前後で、supervisor の release バイナリのサイズを測った（CORE-7・SUP-2）。
+  - 条件: `cargo build --release --locked -p fandhe-container-supervisor --bins`、x86_64-unknown-linux-gnu、rustc 1.99.0（`b940084d7` 2026-09-28、LLVM 23.1.1）・cargo 1.99.0、GNU binutils 2.46、リンカは GNU ld 2.46（`cc` 経由）。ルートの `Cargo.toml` に `[profile.release]` は無く Cargo の既定（LTO なし・codegen-units 既定）。「strip 前」は Cargo の既定の出力（`strip = "debuginfo"`。シンボル表は残る）、「strip 後」は複製に `strip --strip-all` をかけたもの。3 点とも同じソースパスの 1 つの git worktree を切り替えてビルドし（パス文字列の差が混ざらないようにするため）、target はリポ外で計測後に削除した。計測日 2026-10-28。`38a96dcb` は別の target で作り直して sha256 まで一致した（再現する）
+  - 3 点: A = `7b6251b5`（辺の前。issue #3212 の指定）、P = `2df55658`（`38a96dcb` の親）、B = `38a96dcb`（辺を足した commit）。A と B の間には 34 commit があり、その大半は core・supervisor・net に触れる辺と無関係の変更（hosts / resolv.conf 生成・LaunchOptions の network モード・`CLONE_NEWNET` など）を含む。辺の影響として読むのは P → B（ただし #3194 が足した supervisor 側のコード〔`container_options/network.rs`・`document.rs` など〕も含む）
+
+  | 成果物 | 点 | strip 前 | strip 後 |
+  | ------ | -- | -------- | -------- |
+  | supervisor | A `7b6251b5` | 4,263,656 B（4.07 MiB） | 3,177,184 B（3.03 MiB） |
+  | supervisor | P `2df55658` | 4,323,136 B | 3,222,544 B |
+  | supervisor | B `38a96dcb` | 4,409,792 B（4.21 MiB） | 3,276,552 B（3.12 MiB） |
+  | supervisor の差 | A → B | +146,136 B（+3.43%） | +99,368 B（+3.13%） |
+  | supervisor の差 | P → B | +86,656 B（+2.00%） | +54,008 B（+1.68%） |
+  | launcher | A | 999,152 B | 677,208 B |
+  | launcher | P | 1,000,368 B | 677,768 B |
+  | launcher | B | 1,044,784 B | 700,856 B |
+  | launcher の差 | A → B | +45,632 B（+4.57%） | +23,648 B（+3.49%） |
+  | launcher の差 | P → B | +44,416 B（+4.44%） | +23,088 B（+3.41%） |
+
+  - 内訳（supervisor、strip 前の `size -A`。A / P / B）: `.text` 2,436,534 / 2,471,158 / 2,495,366 B、`.rodata` 153,108 / 157,652 / 158,996 B、`.gcc_except_table` 157,752 / 159,116 / 181,316 B、`.eh_frame` 254,644 / 257,280 / 260,960 B。P → B の増加の大半は `.text`（+24,208 B）と `.gcc_except_table`（+22,200 B）。定義シンボルの総数は 8,938 / 9,063 / 9,595
+  - net のシンボル（`nm -C` で `fandhe_container_net` を含む定義シンボル）は A・P で 0 件、B の supervisor で 16 件・合計 5,673 B、launcher で 2 件・合計 200 B。中身は `add_host_dns`（`AddHostEntry::parse`・`HostName::parse`・`parse_add_hosts`・`parse_ip_addr`）、`resolv_conf`（`ResolvConfPlan::for_mode`・`validate_nameservers`）、`network::NetworkName::new` と、これらの `Vec` / `drop_glue` / `RawVec::grow_one` などの単相化だけである。netlink の codec（`netlink*`）と nftables の codec（`nftables_batch` などの組み立て・直列化の関数）は入っていない（`nftables_batch::table_chain::NftName` は `RawVec::grow_one` の型引数に現れるだけ）。supervisor が呼ぶのは net の入力検証と hosts / resolv.conf の純粋関数に限られ、未使用の codec はリンク時に落ちている
+  - 所見: net のシンボル自体は 5.7 KB で、P → B の増加（supervisor +86,656 B）の大半は net ではなく #3194 が足した supervisor 側のコードと、それに伴う `.gcc_except_table`・`.eh_frame` である。net の辺そのもののサイズへの寄与は小さい。supervisor が codec を呼ぶ変更（#1936〜#1940 の pasta、D13 の rootful bridge を supervisor に置く場合など）を入れると、codec が入って増加幅が変わるため、その時点で同じ手順で測り直す
+  - CORE-7・SUP-2 との関係: バイナリのサイズは PSS ではない。text はページキャッシュで複数の supervisor に共有され、PSS に乗るのは触れたページの按分だけである。SUP-2（supervisor 1 つあたりの PSS 中央値 2MB 以下）の合否はバイト数から推さず、PSS の計測（TASK-158・`scripts/bench/supervisor_pss.sh`。実機は `docs/verification/supervisor-measurement-runbook.md`）で判定する。増加は strip 後で約 3%（net の辺だけでは P → B で約 1.7%）で、現時点で問題とする根拠はない。後続の案: 以後 net の codec を supervisor から呼ぶ PR は、同じ手順の前後差と PSS の再計測を記録する
+  - 測っていないもの: PSS・RSS、aarch64・macOS・Windows のサイズ、現在の main のサイズ（#3194 より後に増えた net の利用分は対象外）
 
 ### D6 none モード（rootless・CLI 経路）
 
@@ -123,7 +145,7 @@
   - 生成条件の限定は host / none にだけ適用する（`--add-host` があれば `hosts`、`--dns` があれば `resolv.conf`）。rootful の bridge は上記のとおり `--dns` の有無に依らず `resolv.conf` を生成する。限定に当たらず生成しないものはイメージのファイルをそのまま使い、従来の挙動を変えない
   - 段は supervisor の start の手順 3〜7（作業スレッド・期限つき）で、launcher を作る前に作成と書き込みを終える。`apply_dns` は rename で inode が替わるため bind mount より前に済ませる。start のたびに作り直し（前回の残りを消してから排他作成）、supervisor 内の restart は同じファイルを使い回す
   - bind mount は launcher のオプションで core に渡し、pivot の前、検証済みの bind（#1915）と同じ段で適用する。ただし利用者の bind（`mounts[]`）の検証〔元が状態ルートの同一・祖先・子孫なら `BindSourceReachesStateRoot` で拒否。SEC-1〕には通さず、core 内部の専用の種別（`EtcFileMount`）として扱う。この種別の元は呼び出し側のパスではなく core が `state_root` と `<id>` から固定の形（`<state_root>/@container-etc/<id>/{hosts,resolv.conf}` の 2 つだけ）で導く（任意のパスを受けない。`@container-options` と同じ流儀）。利用者の bind の元が `@container-etc` を指す場合は従来どおり `BindSourceReachesStateRoot` で拒否し、緩めない。元のファイルは launch の時点で状態ルートから 1 要素ずつ fd 起点（`O_PATH|O_NOFOLLOW`）で開き直し、`@container-etc/<id>` が 0700・所有者 euid であること、ファイルが通常ファイル・所有者 euid・nlink 1 であることを確かめる（不適合は `FailedPrecondition`）。先は rootfs の fd から 1 要素ずつ辿る（`mount_destination` の検証）。rw で mount する（Docker と同等。書き換えても自分の生成ファイルにしか及ばない）
-  - 先が symlink: `InvalidArgument`（`RESOLVE_IN_ROOT` で解決する案は残余）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
+  - 先が symlink: 解決せず `InvalidArgument` で拒否を続ける（#3210 の決定。理由と利用者向けの文言は下の「先が symlink の扱い（#3210）」）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
   - rootless は `SingleId`・`SubordinateIds` のどちらでも、元のファイルの所有者はコンテナの root に当たる uid で 0644 なので読める。mount はコンテナの user namespace が所有する mount namespace の中で行う
   - 後始末: start の失敗時は supervisor が自分で作ったものを消す。CLI の `delete` が成功した後に `@container-etc/<id>` を消す（`@container-options` と同じ条件）。plugin-cri は作らない
 - **実装の補足（#1872。core 側の実装済みの範囲）**:
@@ -131,8 +153,15 @@
   - `create_etc_files` は `<id>` が既にあれば `ALREADY_EXISTS` で拒否する。「start のたびに作り直す」は呼び出し側（supervisor。#1873・#3065）が `remove_etc_files` の後に `create_etc_files` を呼んで実現する
   - mount のモード: 既定は rw（D9 のとおり）。実効の `root.readonly=true` では ro で載せる（containerd の `containerMounts` が `readonly_rootfs` を hosts / resolv.conf の `Readonly` に写す挙動に揃えた、閉じた側の選択。一次情報の確認は #2859 に残し、違えば緩める）。ro のときに先が無いなら rootfs へ書かず `FailedPrecondition`
   - 元の検証は 2 段: launcher が fork 前に所有者・権限・nlink を検査して `(st_dev, st_ino)` を記録し、子（新しい mount namespace）が同じ正規化済みパスを辿り直して `(st_dev, st_ino)` と nlink 1 の一致を要求する（user namespace の中では uid が写像後の値になるため）
-  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、先が symlink のときの `RESOLVE_IN_ROOT`、`RootfulHostRoot`（launcher が拒否。#2241）
-- **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。
+  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、`RootfulHostRoot`（launcher が拒否。#2241）
+- **先が symlink の扱い（#3210。NET-12・SEC-1）**: 解決せず拒否を続ける。理由:
+  1. systemd-resolved 形（`/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf`）は、解決しても救えない。`/run` は実行時の tmpfs でイメージの tarball では空のため、解決先の親ディレクトリを作らない制約の下では結局拒否になる。救えるのは rootfs 内にある通常ファイルを指す symlink だけで、まれな場面と見込む（実イメージでの確認はしていない）
+  2. 利用者の bind（`mounts[]`）は先の symlink を解決せずに拒否する（`bind_mounts.rs`）。etc の bind だけ解決すると方針が混ざる
+  3. 影響は狭い。host / none では `--add-host` / `--dns` を指定したときだけ生成するため、フラグなしの起動は当たらない
+  4. pivot 前の段に新しいパス解決の面を足さない。解決する方式は core の `sys` に `openat2(RESOLVE_IN_ROOT)` の新しい `unsafe` ラッパー（`EAGAIN` の再試行・`RESOLVE_NO_XDEV`・親と葉を分ける 2 段の解決・`check_etc_overlaps` の解決後パス対応）を要する
+  - 利用者向けの文言（`InvalidArgument`・固定の英語。rootfs の値は含めない）: hosts は `/etc/hosts in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image)`。resolv.conf は同じ文頭で `(replace it with a regular file in the image, or remove it when the rootfs is writable)`。`/etc` 自体が symlink・非ディレクトリ・無い場合の拒否は変えない
+  - 見直し条件は「残余・見直し条件」を参照
+- **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。symlink の先の inode の上に mount する案、rw の rootfs で symlink を消して通常ファイルに置き換える案（rootfs の意味を未検討の形で変える）。解決先の親ディレクトリを作る案（オーナー判断が出たら見直す）。
 
 ### D10 ネットワーク定義の状態ストア（CORE-1）
 
@@ -356,6 +385,6 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 
 ## 残余・見直し条件
 
-- bind mount の先が symlink の場合の `RESOLVE_IN_ROOT` による解決は未対応（D9）
+- /etc/hosts・/etc/resolv.conf の先が symlink の場合は解決しない（D9・#3210）。次のいずれかが起きたら見直す: (1) オーナーが解決先の親ディレクトリの作成（runc の securejoin + MkdirAll と同等）を認めた、(2) rootful bridge の resolv.conf（D13・#3074）で `--dns` の有無に関わらず resolv.conf を作るようになり、この拒否に当たる場面が増えた、(3) 実イメージの調査で、rootfs 内の既存の通常ファイルを指す symlink の resolv.conf が多いと分かった
 - #1935（pasta の設計。[rootless-network.md](rootless-network.md) 12 章）は予約名と名前の照合を変えなかった。D1・D10 の見直しは不要。今後変わったら見直す
 - #3207 の判断が出たら D13 を確定し、本書の位置づけの注記と `docs/architecture.md` の設計ドラフトの行を更新する

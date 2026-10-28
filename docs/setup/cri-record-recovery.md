@@ -53,7 +53,14 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 - 名前: `ls -1Ab` で列挙し、`^[0-9a-f]{64}\.rec$` に合わないもの（`.lock` と `.tmp-*` を除く）が `unrecognized`
 - 種類: `ls -l` または `stat` で symlink・ディレクトリなどを見る（`not_regular_file`）。辿らない
 - 大きさ: config の上限 512 KiB にヘッダ分を足した値を超えると `too_long`
-- 先頭の行: `head -n 3 -- <名前>` で見る（config 部はバイナリなので `cat` しない）。1 行目が `fandhe-cri-sandbox-record v1` または `fandhe-cri-container-record v1` か、2 行目の `id=` がファイル名と一致するか、コンテナの 3 行目 `pod_sandbox_id=` の sandbox に `sandboxes/<その ID>.rec` があるか（無い、または壊れていれば `parentless`）
+- 先頭の行: 通常ファイルで symlink でないと確認した記録だけを、バイト数の上限と時間の上限をつけて読む（`head -n` のような行数だけの制限は使わない。ヘッダの改行が欠けた記録では config 部が出てしまう）。形式検証に通った行だけを表示し、不正な行の内容は出さない:
+
+  ```sh
+  [ -f <名前> ] && [ ! -L <名前> ] && timeout 5 head -c 256 -- <名前> \
+    | LC_ALL=C grep -a -x -m 3 -E 'fandhe-cri-(sandbox|container)-record v1|id=[0-9a-f]{64}|pod_sandbox_id=[0-9a-f]{64}'
+  ```
+
+  何も出ない、または 1 行目の版・2 行目の `id=` が揃わない記録はヘッダ不正として扱い、内容は表示しない。見るのは、1 行目が `fandhe-cri-sandbox-record v1` または `fandhe-cri-container-record v1` か、`id=` がファイル名と一致するか、コンテナの `pod_sandbox_id=` の sandbox に `sandboxes/<その ID>.rec` があるか（無い、または壊れていれば `parentless`）。通常ファイル以外（FIFO・symlink・ディレクトリ）は開かない
 - 再採用の有無: plugin-cri が動いている間の `crictl pods -q --no-trunc` と `crictl ps -a -q --no-trunc` の ID を控え、どちらにも出ない `.rec` を候補にする
 - ヘッダが正しく config 部だけが壊れた `malformed` は手では判定できない。上の条件の消去法で候補とし、既定では残す
 
@@ -97,9 +104,11 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 4. sandbox 記録の候補ごとに、`containers/` の記録がその sandbox を参照していないことを確かめる:
 
    ```sh
-   grep -l -a -x "pod_sandbox_id=<id>" -- <containers 内の名前>
+   [ -f <containers 内の名前> ] && [ ! -L <containers 内の名前> ] \
+     && timeout 5 head -c 256 -- <containers 内の名前> | grep -a -x -q "pod_sandbox_id=<id>"
    ```
 
+   通常ファイルかつ symlink でないものだけを、有限時間で検査する（実装の列挙も通常ファイル以外を読まずに分類しているので、手動もこの除外条件を揃える。FIFO は open で待ち続け、symlink は参照先を読むため渡さない）。`not_regular_file` など検査できない記録が `containers/` に残る間は「参照なし」と判断せず、その sandbox 記録の削除を保留する（先にその記録を 6 の手順で片付けてから確かめ直す）。
    参照する記録があればそちらを先に処理する（`parentless` のコンテナ記録 → sandbox 記録の順）。`duplicate_metadata` は ID の大きい方が残っているので、core が Absent の場合に限って対象にする
 5. plugin-cri を止め、`<state_root>/.cri/@instance.lock` を持つプロセスが居ないことを確かめる（`lsof <state_root>/.cri/@instance.lock`。Linux は `fuser` でも可）。`.tmp-*` は名前の pid だけで判定しない（pid は再利用される）
 6. 候補を正確な名前でもう一度確かめ（`ls -1Ab -- <名前>`）、1 件ずつ消す:

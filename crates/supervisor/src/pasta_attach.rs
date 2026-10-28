@@ -413,7 +413,7 @@ pub struct ProductionBackend {
     logger: Logger,
     run_dirs: Arc<RunDirGenerations>,
     /// 準備段階で作った置き場所(世代つき)。期限切れの後に作業スレッドが作り終えた分もここへ残る。
-    prepared: Arc<Mutex<Option<(u64, PastaRunDir)>>>,
+    prepared: Arc<Mutex<PreparedSlot>>,
 }
 
 impl ProductionBackend {
@@ -426,9 +426,83 @@ impl ProductionBackend {
             state_root: Arc::new(config.state_root),
             logger,
             run_dirs: Arc::new(RunDirGenerations::default()),
-            prepared: Arc::new(Mutex::new(None)),
+            prepared: Arc::new(Mutex::new(PreparedSlot::default())),
         }
     }
+}
+
+/// 置き場所(`@pasta/<id>`)の同一性(`st_dev`, `st_ino`)。期限切れの旧い操作が、別の起動が作った新しい置き場所に
+/// 触れないよう、削除の前に照合する(CORE-2 の世代保護。プロセス間でも効く)。
+type DirId = (u64, u64);
+
+/// 準備段階の成果物。`ready` は `spawn_pasta` が取り出す。`ours` は自分が作った置き場所の同一性で、後始末の照合に使う。
+#[derive(Default)]
+struct PreparedSlot {
+    ready: Option<(u64, PastaRunDir)>,
+    ours: Option<DirId>,
+}
+
+/// 状態ルート直下の `@pasta/<id>` の同一性。無ければ `None`。symlink・ディレクトリでないものは別物として
+/// 一致しない値(`Some((0, 0))`)にし、呼び出し側が「自分のものではない」と扱えるようにする。
+fn run_dir_identity(root: std::os::fd::BorrowedFd<'_>, id: &str) -> std::io::Result<Option<DirId>> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let path = format!("/proc/thread-self/fd/{}/@pasta/{id}", root.as_raw_fd());
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => Ok(Some((m.dev(), m.ino()))),
+        Ok(_) => Ok(Some((0, 0))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 自分が作った置き場所(`ours`)と同一のときだけ削除する。別物(削除・再作成された新しい置き場所)・自分のものが
+/// 無い(`ours` が `None`)ときは何も触れず `Ok(false)`。消す対象が無ければ `Ok(true)`。
+fn remove_run_dir_if_ours(
+    root: std::os::fd::BorrowedFd<'_>,
+    id: &str,
+    ours: Option<DirId>,
+) -> Result<bool, TraitError> {
+    let Some(ours) = ours else { return Ok(false) };
+    let now = run_dir_identity(root, id).map_err(|_| {
+        TraitError::new(
+            ErrorCode::Internal,
+            "failed to inspect the pasta run directory",
+        )
+    })?;
+    match now {
+        None => Ok(true),
+        Some(cur) if cur == ours => remove_pasta_run_dir(root, id)
+            .map(|()| true)
+            .map_err(|e| net_to_trait(&e)),
+        Some(_) => Ok(false),
+    }
+}
+
+/// 準備の成果物を渡す。呼び出し側が期限切れで見限った(`abandoned`)後に作り終えた分は、捨てて渡さない
+/// (新しい起動が旧い準備の置き場所を誤って使わない)。判定と格納は同じロックの下で行う。
+fn deliver_prepared(
+    slot: &Mutex<PreparedSlot>,
+    abandoned: &AtomicBool,
+    generation: u64,
+    dir: PastaRunDir,
+    ours: Option<DirId>,
+) -> bool {
+    let mut g = lock(slot);
+    if abandoned.load(Ordering::SeqCst) {
+        return false;
+    }
+    g.ready = Some((generation, dir));
+    g.ours = ours;
+    true
+}
+
+/// 期限切れの準備を見限る。以後その準備の成果物は渡されず、自分のものとしても扱わない。
+fn abandon_prepared(slot: &Mutex<PreparedSlot>, abandoned: &AtomicBool) {
+    let mut g = lock(slot);
+    abandoned.store(true, Ordering::SeqCst);
+    g.ready = None;
+    g.ours = None;
 }
 
 /// 状態ルートの I/O(作成・削除)の待ちの上限。超えたら待ちを打ち切る(作業スレッドは残り、枠は実終了まで保持する)。
@@ -471,17 +545,18 @@ impl RunDirGenerations {
         (generation, create())
     }
 
-    /// ロックの下で `remove` を実行する。`generation` が最新でなければ何もしない(`Ok(false)`)。
+    /// ロックの下で `remove` を実行する。`generation` が最新でなければ何もしない(`Ok(false)`)。`remove` の戻りは
+    /// 「触れた(消した・消す対象が無かった)か」で、同一性が違って触れなかったときは `Ok(false)`。
     fn remove_if_current<E>(
         &self,
         generation: Option<u64>,
-        remove: impl FnOnce() -> Result<(), E>,
+        remove: impl FnOnce() -> Result<bool, E>,
     ) -> Result<bool, E> {
         let g = lock(&self.current);
         if generation.is_some_and(|want| want != *g) {
             return Ok(false);
         }
-        remove().map(|()| true)
+        remove()
     }
 }
 
@@ -551,7 +626,7 @@ impl PastaAttachBackend for ProductionBackend {
         }
         check_ready_timeout(timeout).map_err(|e| net_to_trait(&e))?;
         // 置き場所は準備段階(`prepare_run_dir`)で作ってある。launch 内では状態ルートの I/O を同期で行わない。
-        let Some((generation, run_dir)) = lock(&self.prepared).take() else {
+        let Some((generation, run_dir)) = lock(&self.prepared).ready.take() else {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
                 "the pasta run directory was not prepared",
@@ -601,34 +676,54 @@ impl PastaAttachBackend for ProductionBackend {
             self.container.as_str().to_owned(),
         );
         let (run_dirs, prepared) = (Arc::clone(&self.run_dirs), Arc::clone(&self.prepared));
-        // 期限切れの後に作業スレッドが作り終えた分も `prepared` に残る(取り残しは次の準備か delete が回収する)。
-        run_dir_io_bounded(timeout, move || {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let worker_abandoned = Arc::clone(&abandoned);
+        let result = run_dir_io_bounded(timeout, move || {
+            // 見限られた後に始まった作業は何もしない。
+            if worker_abandoned.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let (generation, made) =
                 run_dirs.advance_with(|| PastaRunDir::prepare(fd.as_fd(), &id));
-            made.map(|dir| *lock(&prepared) = Some((generation, dir)))
-        })?
-        .map_err(|e| net_to_trait(&e))
+            let dir = made?;
+            let ours = run_dir_identity(fd.as_fd(), &id).ok().flatten();
+            // 期限切れの後に作り終えた分は渡さない(取り残しは次の準備か delete が回収する)。
+            deliver_prepared(&prepared, &worker_abandoned, generation, dir, ours);
+            Ok(())
+        });
+        match result {
+            Ok(r) => r.map_err(|e: fandhe_container_net::error::NetError| net_to_trait(&e)),
+            Err(e) => {
+                abandon_prepared(&self.prepared, &abandoned);
+                Err(e)
+            }
+        }
     }
 
     fn remove_run_dir(&self, generation: Option<u64>) -> Result<(), TraitError> {
-        // 未使用の準備済み置き場所は、この削除が一緒に消す(fd を持ったまま残さない)。
-        drop(lock(&self.prepared).take());
+        // 未使用の準備済み置き場所の fd は手放し、自分が作った置き場所の同一性を控える。
+        let ours = {
+            let mut g = lock(&self.prepared);
+            g.ready = None;
+            g.ours
+        };
         let (fd, id) = (
             Arc::clone(&self.state_root),
             self.container.as_str().to_owned(),
         );
         let run_dirs = Arc::clone(&self.run_dirs);
         let removed = run_dir_io_bounded(RUN_DIR_IO_TIMEOUT, move || {
-            run_dirs.remove_if_current(generation, || remove_pasta_run_dir(fd.as_fd(), &id))
+            run_dirs.remove_if_current(generation, || remove_run_dir_if_ours(fd.as_fd(), &id, ours))
         })?;
         match removed {
             Ok(true) => {}
+            // 世代が新しい、または同一性が違う(別の起動の置き場所)ので触れなかった。
             Ok(false) => self.logger.log(
                 false,
                 "pasta_run_dir_remove_skipped",
                 &[("reason", Val::S("newer_generation"))],
             ),
-            Err(e) => return Err(net_to_trait(&e)),
+            Err(e) => return Err(e),
         }
         Ok(())
     }

@@ -946,18 +946,18 @@ fn core2_stale_generation_does_not_remove_newer_run_dir() {
     let mut removed = 0;
     let stale: Result<bool, ()> = gens.remove_if_current(Some(g1), || {
         removed += 1;
-        Ok(())
+        Ok(true)
     });
     assert_eq!(stale, Ok(false));
     assert_eq!(removed, 0);
     let current: Result<bool, ()> = gens.remove_if_current(Some(g2), || {
         removed += 1;
-        Ok(())
+        Ok(true)
     });
     assert_eq!(current, Ok(true));
     let rollback: Result<bool, ()> = gens.remove_if_current(None, || {
         removed += 1;
-        Ok(())
+        Ok(true)
     });
     assert_eq!(rollback, Ok(true));
     assert_eq!(removed, 2);
@@ -984,7 +984,9 @@ fn core2_stale_generation_keeps_real_recreated_dir() {
     let (_g2, r2) = gens.advance_with(|| PastaRunDir::prepare(fd.as_fd(), "web1"));
     let run2 = r2.expect("prepare 2");
     std::fs::write(run2.pid_path(), b"1\n").expect("pid");
-    let skipped = gens.remove_if_current(Some(g1), || remove_pasta_run_dir(fd.as_fd(), "web1"));
+    let skipped = gens.remove_if_current(Some(g1), || {
+        remove_pasta_run_dir(fd.as_fd(), "web1").map(|()| true)
+    });
     assert!(matches!(skipped, Ok(false)));
     assert!(run2.pid_path().exists());
     let _ = std::fs::remove_dir_all(&root);
@@ -1183,4 +1185,83 @@ fn repair5_drop_does_not_join_a_stuck_teardown_forever() {
         "{:?}",
         t.elapsed()
     );
+}
+
+/// 試験用の状態ルート(0700)と fd。
+fn scratch_root(tag: &str) -> (std::path::PathBuf, OwnedFd) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("fc-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let fd = open_state_root(&root).expect("open");
+    (root, fd)
+}
+
+/// CORE-2・REPAIR-5・NET-9: 期限切れで残った旧い削除は、別の起動が作り直した `@pasta/<id>` には触れない
+/// (同一性 `(st_dev, st_ino)` が違えば何もせず終える)。同一なら消す。pid ファイルつきの新しい置き場所が残ることを確かめる。
+#[test]
+fn core2_stale_removal_keeps_recreated_run_dir_by_identity() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("ident");
+    // 旧い起動: 準備して同一性を控える。
+    let old = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare old");
+    let old_id = run_dir_identity(fd.as_fd(), "web1")
+        .expect("stat")
+        .expect("exists");
+    // 旧い起動の置き場所が取り除かれ(旧い inode は別名で生かし、再利用で同一に見えないようにする)、
+    // 別の起動が同じ ID で作り直して pid を置く。
+    drop(old);
+    std::fs::rename(root.join("@pasta/web1"), root.join("@pasta/old-keep")).expect("rename");
+    let new = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare new");
+    std::fs::write(new.pid_path(), b"4242\n").expect("pid");
+    let new_id = run_dir_identity(fd.as_fd(), "web1")
+        .expect("stat")
+        .expect("exists");
+    assert_ne!(new_id, old_id);
+    // 期限切れで残っていた旧い削除が今動き出しても、新しい置き場所と pid は残る。
+    assert!(!remove_run_dir_if_ours(fd.as_fd(), "web1", Some(old_id)).expect("stale remove"));
+    assert_eq!(std::fs::read(new.pid_path()).expect("pid"), b"4242\n");
+    // 自分のものが無い(未準備・見限り済み)ときも触れない。
+    assert!(!remove_run_dir_if_ours(fd.as_fd(), "web1", None).expect("not ours"));
+    assert!(new.pid_path().exists());
+    // 同一性が一致する後始末は消す。消す対象が既に無ければ成功。
+    assert!(remove_run_dir_if_ours(fd.as_fd(), "web1", Some(new_id)).expect("own remove"));
+    assert!(!root.join("@pasta/web1").exists());
+    assert!(remove_run_dir_if_ours(fd.as_fd(), "web1", Some(new_id)).expect("already gone"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REPAIR-5・CORE-2: 期限切れで見限った準備が後から作り終えても、その成果物は渡されず(新しい起動が使わない)、
+/// 自分のものとしても控えられない。見限っていない準備は渡される。
+#[test]
+fn repair5_abandoned_prepare_is_not_delivered() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("abandon");
+    let slot = Mutex::new(PreparedSlot::default());
+    let late = AtomicBool::new(false);
+    let dir = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare");
+    let ours = run_dir_identity(fd.as_fd(), "web1").expect("stat");
+    assert!(ours.is_some());
+    // 呼び出し側が期限切れで見限った後に、作業スレッドが作り終えた。
+    abandon_prepared(&slot, &late);
+    assert!(!deliver_prepared(&slot, &late, 1, dir, ours));
+    {
+        let g = lock(&slot);
+        assert!(g.ready.is_none());
+        assert_eq!(g.ours, None);
+    }
+    // 見限っていない準備は渡され、同一性が控えられる。
+    let ok = AtomicBool::new(false);
+    let dir = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare again");
+    assert!(deliver_prepared(&slot, &ok, 2, dir, ours));
+    {
+        let g = lock(&slot);
+        assert_eq!(g.ready.as_ref().map(|(n, _)| *n), Some(2));
+        assert_eq!(g.ours, ours);
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -966,7 +966,8 @@ impl IsolationStage {
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
     ///
-    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）。外部入力は混ざらない静的トークン。
+    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）と `ExecError` の `Display`（子の stderr の診断行の
+    /// `at <段>`。#3209）。外部入力は混ざらない静的トークン。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Validate => "validate",
@@ -1122,9 +1123,9 @@ impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} at {:?}: {}",
+            "{} at {}: {}",
             self.code.as_str(),
-            self.stage,
+            self.stage.as_str(),
             self.message
         )?;
         if let Some(v) = &self.violation {
@@ -4124,6 +4125,22 @@ mod tests {
             err.to_string()
                 .ends_with("(violation: plan_rejected/identity_changed, SEC-5)")
         );
+    }
+
+    /// ERR-4・REPAIR-4・#3209: `ExecError` の `Display` は段を `IsolationStage::as_str` の語彙で出す
+    /// （旧: `{:?}` の CamelCase）。
+    #[test]
+    fn err4_3209_exec_error_display_uses_as_str_vocabulary() {
+        let e = ExecError::new(ErrorCode::NotFound, IsolationStage::MountReadonlyPaths, "x");
+        assert_eq!(e.to_string(), "NOT_FOUND at mount_readonly_paths: x");
+        for stage in IsolationStage::ALL {
+            let e = ExecError::new(ErrorCode::Internal, stage, "m");
+            assert_eq!(
+                e.to_string(),
+                format!("INTERNAL at {}: m", stage.as_str()),
+                "{stage:?}"
+            );
+        }
     }
 
     /// SEC-4（記録経路）: establish の前提違反と証跡不一致に違反記録が付く（対象なし。

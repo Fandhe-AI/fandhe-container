@@ -1606,6 +1606,44 @@ mod tests {
         assert_eq!(cfg.deadline, Duration::from_secs(600));
     }
 
+    /// CRI-2・CORE-1・REPAIR-12・#3035: 注入で組んだバックエンドはインスタンスロックを持たず、状態ルートも持たない
+    /// （ロックファイル `.cri/@instance.lock` を作る経路が無い）。同じ状態ルートへの `production()` の排他を妨げない。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_injected_backends_hold_no_instance_lock_and_create_no_lock_file() {
+        let dir = std::env::temp_dir().join(format!("fcpc-inj-nolock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::new(Arc::clone(&store)));
+
+        let injected = CriPluginBackends::new(
+            rt.clone(),
+            Arc::clone(&store),
+            Arc::new(UnimplementedNetwork),
+        );
+        assert!(injected.instance_lock().is_none());
+        assert!(injected.state_root.is_none());
+
+        let with_rec = CriPluginBackends::with_recorder(
+            rt,
+            store,
+            Arc::new(UnimplementedNetwork),
+            Arc::new(OpRecorder::new()),
+        );
+        assert!(with_rec.instance_lock().is_none());
+        assert!(with_rec.state_root.is_none());
+
+        // 構築しても注入側は状態ルート配下に何も作らず、同じルートの排他は別の取得者が取れる。
+        assert!(!dir.join(".cri").exists());
+        let lock = crate::instance_lock::acquire_instance_lock_in(
+            &dir,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("lock is free for another acquirer");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).expect("valid id")
     }

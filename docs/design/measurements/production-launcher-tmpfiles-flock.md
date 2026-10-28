@@ -88,7 +88,7 @@ aging（30d）が消さないため対象外。
 | `rootless`・`rootless_uid_mapping`・`rootless_file_owner`・`rootless_image_rootfs_remove` | core | platform-ci |
 | `exec_subordinate_e2e`・`supervisor_bin_real` | supervisor | platform-ci |
 | `start_stop_delete_real` | cli | platform-ci |
-| `start_scope_real`・`delete_cgroup_real`・`start_recover_real` | cli | CI 外（人手の実機） |
+| `start_scope_real`・`delete_cgroup_real`・`start_recover_real` | cli | `platform-ci`（#3105） |
 
 ### 対象外
 

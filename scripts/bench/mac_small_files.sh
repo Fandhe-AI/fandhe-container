@@ -24,7 +24,7 @@
 #   mac_small_files.sh --mode own ...                       （未実装。終了コード 5）
 #   mac_small_files.sh --mode report --own-result <file> --baseline-result <file> [--output <abs new file>]
 #   --count 2000〜50000（既定 2000）・--trials 5〜20（既定 5）・--batch 1〜4096（既定 20。count を割り切れること）。
-#   docker モードは bash 5 以上（EPOCHREALTIME）。--host-dir は symlink を含まない実体の絶対パス（bind mount 元）。
+#   docker モードは bash 3.2 以上・perl（Time::HiRes）・jq で動く（macOS 標準の /bin/bash と /usr/bin/perl。#3104）。--host-dir は symlink を含まない実体の絶対パス（bind mount 元）。
 #
 # 出力 JSON: schema "fandhe-container.mac-small-files/v1"（report は ".../mac-small-files-report/v1"）。
 #   絶対パス・ホスト名・ユーザー名は含めない。
@@ -33,7 +33,7 @@
 #   0: 成功
 #   1: 計測失敗（試行の失敗・期限切れ・件数の不一致・bind の未反映・有効な試行が 5 回未満・結果の検証失敗）
 #   2: 入力エラー（副作用の前に検出）
-#   3: 前提ツール欠如（jq・mktemp・timeout 相当・bash 5）
+#   3: 前提ツール欠如（jq・mktemp・perl〔Time::HiRes〕・timeout 相当）
 #   4: 後始末失敗（ラベル付きのコンテナが残る）
 #   5: own 側が未実装
 
@@ -108,12 +108,35 @@ reject_opts() {
   done
 }
 
-for tool in jq mktemp; do
+for tool in jq mktemp perl; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: code=missing-tool message=required tool not found: $tool" >&2
     exit 3
   }
 done
+
+# 各試行の壁時計を測る 1 プロセスのラッパー（#3104・MAC-3・REPAIR-5）。bash 5 の EPOCHREALTIME に頼らず、
+# macOS 標準の bash 3.2 でも高分解能（gettimeofday のマイクロ秒）で測るため、perl の Time::HiRes を使う。
+# perl の起動は t0 の前、終了処理は t1 の後に起きるため、起動・終了の遅れは区間に入らない。
+# 区間は docker CLI の fork から終了までで、時刻の意味は従来の EPOCHREALTIME と同じ壁時計。
+# 使い方: perl -e "$TIMED_EXEC_PL" <時刻ファイル> <コマンド> [引数...]。時刻ファイルへ "<t0_us> <t1_us>" を書く。
+# 子はシェルを介さず exec する。終了状態は子のものを返す（シグナル終了は 128+n。内部の誤りは 125、exec 失敗は 127）。
+# 標準出力・標準エラーには何も書かない（docker の出力を汚さない）。固定の文字列で、利用者の入力は埋め込まない。
+readonly TIMED_EXEC_PL='use strict; use warnings; use Time::HiRes ();
+my ($tsf, @cmd) = @ARGV;
+exit 125 unless defined $tsf && @cmd;
+open(my $fh, ">", $tsf) or exit 125;
+my ($s0, $u0) = Time::HiRes::gettimeofday();
+my $pid = fork();
+exit 125 unless defined $pid;
+if ($pid == 0) { no warnings "exec"; exec { $cmd[0] } @cmd; exit 127; }
+my $w = waitpid($pid, 0);
+my ($s1, $u1) = Time::HiRes::gettimeofday();
+exit 125 if $w != $pid;
+my $st = $?;
+printf($fh "%.0f %.0f\n", $s0 * 1000000 + $u0, $s1 * 1000000 + $u1) or exit 125;
+close($fh) or exit 125;
+exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));'
 
 check_int() { # name value min max
   int_in_range "$2" "$3" "$4" || usage_error "$1 must be an integer in $3..$4"
@@ -197,10 +220,36 @@ probe_script() {
 backend_image_id() { run_limited "${cap_secs:-$CLEANUP_TIMEOUT_SECS}" "$runtime" image inspect --format '{{.Id}}' "$image" 2>"$1"; }
 backend_version() { run_limited "${cap_secs:-$CLEANUP_TIMEOUT_SECS}" "$runtime" version --format '{{.Server.Version}}' 2>/dev/null; }
 
-# 1 試行。引数: <limit秒> <cidfile> <host の作業ディレクトリ> <script> <stdout> <stderr>
+# 1 試行。引数: <limit秒> <cidfile> <host の作業ディレクトリ> <script> <stdout> <stderr> <時刻ファイル>
+# 時刻の計測はバックエンドに依らない共通のラッパー（TIMED_EXEC_PL）で行う。ラッパーと docker CLI は
+# run_limited の同じプロセスグループに入り、期限切れでは両方に TERM から KILL が届く（REPAIR-5）。
 backend_run_once() {
-  run_limited "$1" "$runtime" run --rm --pull never --cidfile "$2" \
+  run_limited "$1" "$perl_bin" -e "$TIMED_EXEC_PL" "$7" "$runtime" run --rm --pull never --cidfile "$2" \
     --label "${LABEL_KEY}=${run_tag}" -v "$3:/data" "${run_image:-$image}" sh -c "$4" >"$5" 2>"$6"
+}
+
+# 時刻ファイルを非信頼の入力として読み、検証を通った区間（マイクロ秒）を $wall_us へ入れる。引数: <ファイル>。
+# 正規ファイル（symlink 不可）・64 バイトまで・"<数字> <数字>" の 2 つちょうど・各 18 桁以内・t1 >= t0。
+read_trial_clock() {
+  local f="$1" line="" a="" b="" extra="" size=0
+  wall_us=0
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  # ファイル全体の大きさを先に検証する（read -n は改行か上限で止まり、続きの不正データを見逃すため）。
+  # BSD の wc は桁寄せの空白を付けるため算術展開で数値化する。
+  size="$(wc -c <"$f")" || return 1
+  size=$((size + 0))
+  [ "$size" -ge 1 ] && [ "$size" -le 64 ] || return 1
+  line="$(cat "$f")" || return 1
+  # 末尾の改行は $(...) が落とす。残る改行は複数行（レコードの後の余分なデータ）なので不正とする。
+  case "$line" in *$'\n'*) return 1 ;; esac
+  read -r a b extra <<<"$line" || true
+  [ -n "$a" ] && [ -n "$b" ] && [ -z "$extra" ] || return 1
+  case "$a$b" in *[!0-9]*) return 1 ;; esac
+  [ "${#a}" -le 18 ] && [ "${#b}" -le 18 ] || return 1
+  a=$((10#$a))
+  b=$((10#$b))
+  [ "$b" -ge "$a" ] || return 1
+  wall_us=$((b - a))
 }
 
 # 完全一致のラベルで所有を証明できたコンテナ ID（停止中を含む）を stdout へ出す。--filter name= は部分一致のため使わない。
@@ -405,10 +454,6 @@ run_docker() {
   case "$label" in *[!A-Za-z0-9_.-]* | '') usage_error "--label has characters outside [A-Za-z0-9_.-]" ;; esac
   [ "${#label}" -le 64 ] || usage_error "--label is too long"
   validate_output
-  if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
-    echo "error: code=missing-tool message=bash 5 or later is required (EPOCHREALTIME)" >&2
-    exit 3
-  fi
 
   work="$(mktemp -d)"
   RUN_LIMITED_DIR="$work"
@@ -420,6 +465,14 @@ run_docker() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
+  # 時刻源の確認（#3104）。Debian 系では Time::HiRes が perl-base に無いことがあるため、実際に読み込めるかを試す。
+  # docker を呼ぶ前に止まる（cleanup_needed は 0 のまま）。新しい外部実行にも期限をつける（REPAIR-5）。
+  perl_bin="$(command -v perl)"
+  case "$perl_bin" in /*) ;; *) perl_bin="" ;; esac
+  if [ -z "$perl_bin" ] || ! run_limited "$CLEANUP_TIMEOUT_SECS" "$perl_bin" -MTime::HiRes -e 1 >/dev/null 2>&1; then
+    echo "error: code=missing-tool message=perl with Time::HiRes is required" >&2
+    exit 3
+  fi
   cleanup_needed=1
   local started=$SECONDS
 
@@ -462,12 +515,12 @@ run_docker() {
   new_trial_dir probe
   rc=0
   cap_for "$trial_timeout"
-  backend_run_once "$cap_secs" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" || rc=$?
+  backend_run_once "$cap_secs" "${work}/cid.probe" "$trial_dir" "$(probe_script)" "${work}/probe.out" "${work}/probe.err" "${work}/ts.probe" || rc=$?
   [ "$rc" -eq 0 ] || fail_measure "the bind probe run failed (exit ${rc})"
   [ -f "${trial_dir}/probe" ] && [ "$(tr -d '\n' <"${trial_dir}/probe")" = "probe" ] \
     || fail_measure "bind mount is not effective: a file written in the container is not visible on the host"
 
-  local script n=0 ok=0 failed=0 t0 t1 wall_us limit remaining
+  local script n=0 ok=0 failed=0 limit remaining
   script="$(workload_script "$count" "$batch")"
   : >"${work}/samples.jsonl"
   : >"${work}/walls"
@@ -479,11 +532,8 @@ run_docker() {
     limit="$trial_timeout"
     [ "$remaining" -ge "$limit" ] || limit="$remaining"
     new_trial_dir "$n"
-    t0="${EPOCHREALTIME/./}"
     rc=0
-    backend_run_once "$limit" "${work}/cid.${n}" "$trial_dir" "$script" "${work}/out.${n}" "${work}/err.${n}" || rc=$?
-    t1="${EPOCHREALTIME/./}"
-    wall_us=$((t1 - t0))
+    backend_run_once "$limit" "${work}/cid.${n}" "$trial_dir" "$script" "${work}/out.${n}" "${work}/err.${n}" "${work}/ts.${n}" || rc=$?
     if [ "$rc" -eq 124 ]; then
       fail_measure "trial ${n} exceeded its deadline (${limit}s)"
     fi
@@ -492,6 +542,8 @@ run_docker() {
       failed=$((failed + 1))
       continue
     fi
+    # 時刻ファイルは rc が 0 のときだけ読む（TERM で殺された試行には無い）。不正なら試行を失敗にする。
+    read_trial_clock "${work}/ts.${n}" || { echo "warning: trial ${n} failed: invalid timing record" >&2; failed=$((failed + 1)); continue; }
     local why=""
     why="$(parse_trial "${work}/out.${n}" "${work}/int.${n}")" || {
       echo "warning: trial ${n} failed: ${why}" >&2

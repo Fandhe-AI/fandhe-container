@@ -3,7 +3,7 @@
 //! 常駐デーモンを持たない設計（CORE-1・D-19）の実装主体で、コンテナ 1 つにつき 1 プロセスで監視する（SUP-1）。
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
-//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch の実機での成立（#2043）・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、明示 stop の意図の伝達と記録（SUP-9。#2162・#2440）は実装済みで、本番 launcher による再 launch の実機での成立（#2043）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
 //! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、出力をパースして型・値域・キー順・値を照合する結合テスト（TASK-168.2・#524。メモリ上のフェイクは 3 OS、実ストアは Linux）（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
 //! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
 //! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）と secrets / configs の指定モデル（TASK-169.4.2・#1473）も実装済みで、launcher への配線は実装済み（#2625。`ContainerOptions::launch_options`）、CLI 配線は未実装。
@@ -46,7 +46,7 @@
 //! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |
-//! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線も済み〔#1902。意図は立てない〕、stop の意図の伝達〔SUP-9〕は未実装。REPAIR-3） |
+//! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線も済み〔#1902。意図は立てない〕、stop の意図の伝達〔SUP-9〕も済み〔#2162・#2440。StopRequest が `StopToken::mark_explicit_stop` で意図を立て、書き先は `SignalSlot::with_stop_intent`〕。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch の成立は #2043） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
 //! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（`tests/inspect_output.rs`。#523 で先行追加し、#524 でキー順・型・値域・列挙値の照合を追加。実装済み） |

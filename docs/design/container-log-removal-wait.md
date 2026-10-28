@@ -236,7 +236,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
 
 ## plugin-cri の `RemoveContainer` の supervisor ログ側の待ち（#2964・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 
-- 従来: `remove_bounded`（1 回だけ）は中の失敗を握りつぶして `Finished` を返すため、ロック保持中でログが残っても `Removed`・Success と
+- 従来の `remove_bounded`（1 回だけ。呼び出し元が無くなり #3033 で削除済み）は中の失敗を握りつぶして `Finished` を返すため、ロック保持中でログが残っても `Removed`・Success と
   報告していた（観測の欠落）。CLI と同じ構造に揃える
 - 方式: `CoreLifecycleRuntime::delete` が `container_log_lock_wait`（既定 10 秒）を期限として決め、supervisor ログを
   `remove_guarded_bounded_waiting`（guard は状態ストアの `NotFound`。試行ごとにロック保持中に評価）で処理し、

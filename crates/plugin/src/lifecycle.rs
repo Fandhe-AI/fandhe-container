@@ -416,7 +416,7 @@ impl StderrCapture {
     /// 競合して読み取りが戻らない場面の回避。REPAIR-5・#3003）。それでも止まらなかった場合に限り、最後の
     /// 手段として `shutdown` する。対応外の構成は従来どおり受信期限と `shutdown` で止める。
     #[cfg(unix)]
-    fn attach(reader: StderrReader) -> io::Result<Self> {
+    fn attach(reader: StderrReader, deadline: Instant) -> io::Result<Self> {
         let shutdown_sock = reader.try_clone()?;
         let shutdown = move || {
             let _ = shutdown_sock.shutdown(std::net::Shutdown::Both);
@@ -426,7 +426,8 @@ impl StderrCapture {
         }
         // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
         reader.set_nonblocking(true)?;
-        let (stop_rx, stop_tx) = io::pipe()?;
+        // ゲート待ちは呼び出し元の合計期限までに限る（REPAIR-5）。
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(deadline, io::pipe)?;
         let mut capture = Self::start(
             PolledStderr {
                 sock: reader,
@@ -444,7 +445,7 @@ impl StderrCapture {
 
     /// 非 unix では子を spawn しないため、空の入力を読むだけになる（即座に終端へ達する）。
     #[cfg(not(unix))]
-    fn attach(reader: StderrReader) -> io::Result<Self> {
+    fn attach(reader: StderrReader, _deadline: Instant) -> io::Result<Self> {
         Self::start(reader, Box::new(|| {}))
     }
 
@@ -568,9 +569,15 @@ type StderrReader = io::Empty;
 /// している間は読み取りスレッドを止められない。ソケットなら `poll` の期限と停止用 pipe（対応外の構成は
 /// 受信期限と shutdown）で確実に止められる。子から見た書き込みは pipe と同様（端末ではなく、読み手が
 /// 閉じれば `EPIPE`）。どちらの端も close-on-exec で、子へ渡るのは fd 2 に複製した書き込み端のみ。
+/// macOS では作成と close-on-exec の設定が別 syscall のため、並行する spawn へ漏れないよう
+/// `spawn_gate` で排他する（#3139）。
 #[cfg(unix)]
-fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
-    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+fn stderr_channel(deadline: Instant) -> io::Result<(Stdio, StderrReader)> {
+    // macOS の std は close-on-exec を作成後に別 syscall で立てるため、並行する spawn と排他にする
+    // （`spawn_gate`。PLUG-7・SEC-1・#3139）。
+    // ゲート待ちは呼び出し元の合計期限までに限る（REPAIR-5）。
+    let (reader, writer) =
+        crate::spawn_gate::create_fds(deadline, std::os::unix::net::UnixStream::pair)?;
     // 相手が健在なうちに期限を設定する（macOS は相手切断後の設定が EINVAL になる）。
     reader.set_read_timeout(Some(STDERR_READ_POLL))?;
     Ok((Stdio::from(std::os::fd::OwnedFd::from(writer)), reader))
@@ -578,7 +585,7 @@ fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
 
 /// 非 unix では listener を bind できず子を spawn しないため到達しない（stderr は破棄する設定を返す）。
 #[cfg(not(unix))]
-fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
+fn stderr_channel(_deadline: Instant) -> io::Result<(Stdio, StderrReader)> {
     Ok((Stdio::null(), io::empty()))
 }
 
@@ -1180,12 +1187,30 @@ fn rpc_timeout(remaining: Duration) -> Result<RpcTimeout, PluginError> {
     RpcTimeout::new(remaining.min(UDS_RPC_TIMEOUT_MAX))
 }
 
+/// stderr 収集の準備で失敗した `io::Error` を写す。ゲート待ちの期限切れ（`TimedOut`）は `Timeout`、
+/// それ以外は `Internal`（`message` 付き）にする（REPAIR-5。`spawn_gate::create_fds` の契約）。
+/// 期限切れ時の `Timeout` の文言は呼び出し側（都度起動・常駐）が `on_timeout` で与える。
+fn stderr_prepare_error(
+    e: &io::Error,
+    message: &'static str,
+    on_timeout: fn() -> PluginError,
+) -> PluginError {
+    if e.kind() == io::ErrorKind::TimedOut {
+        return on_timeout();
+    }
+    PluginError::new(PluginErrorCode::Internal, message)
+}
+
 fn spawn_error(e: &io::Error) -> PluginError {
     let (code, msg) = match e.kind() {
         io::ErrorKind::NotFound => (PluginErrorCode::NotFound, "plugin program not found"),
         io::ErrorKind::PermissionDenied => (
             PluginErrorCode::PermissionDenied,
             "permission denied spawning plugin program",
+        ),
+        io::ErrorKind::TimedOut => (
+            PluginErrorCode::Timeout,
+            "timed out waiting to spawn plugin program",
         ),
         _ => (
             PluginErrorCode::Unavailable,
@@ -1408,19 +1433,20 @@ fn call_once_inner(
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let listener = match UdsListener::bind(&plugin.socket_dir.join(name)) {
+    let listener = match UdsListener::bind_before(&plugin.socket_dir.join(name), deadline) {
         Ok(l) => l,
         Err(e) => return (Err(e), PluginStderr::empty()),
     };
 
     // stderr は親へ継承させない（plugin が親の stderr へ任意の量・内容を書けてしまうため）。
-    let (child_stderr, reader) = match stderr_channel() {
+    let (child_stderr, reader) = match stderr_channel(deadline) {
         Ok(pair) => pair,
-        Err(_) => {
+        Err(e) => {
             return (
-                Err(PluginError::new(
-                    PluginErrorCode::Internal,
+                Err(stderr_prepare_error(
+                    &e,
                     "failed to prepare capturing plugin stderr",
+                    timeout_error,
                 )),
                 PluginStderr::empty(),
             );
@@ -1432,7 +1458,7 @@ fn call_once_inner(
             Ok(c) => c,
             Err(e) => return (Err(e), PluginStderr::empty()),
         };
-        spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)
+        spawn_registered(&mut cmd, registry, deadline).map_err(launch_spawn_error)
     };
     let mut guard = match spawned {
         Ok(g) => g,
@@ -1440,17 +1466,14 @@ fn call_once_inner(
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
-    let capture = match StderrCapture::attach(reader) {
+    let capture = match StderrCapture::attach(reader, deadline) {
         Ok(c) => c,
         // 読み取り手がいないまま子を走らせるとバッファが埋まって子が詰まるため、往復せず回収する。
-        Err(_) => {
+        Err(e) => {
             drop(listener);
             let error = reap_after_failure(
                 &mut guard,
-                PluginError::new(
-                    PluginErrorCode::Internal,
-                    "failed to start capturing plugin stderr",
-                ),
+                stderr_prepare_error(&e, "failed to start capturing plugin stderr", timeout_error),
             );
             return (Err(error), PluginStderr::empty());
         }
@@ -1483,6 +1506,7 @@ fn call_once_inner(
 fn spawn_registered(
     cmd: &mut Command,
     registry: &'static Registry,
+    deadline: Instant,
 ) -> Result<ChildGuard, PluginError> {
     let mut slot = registry.reserve()?;
     #[cfg(unix)]
@@ -1490,7 +1514,15 @@ fn spawn_registered(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    // 非原子の fd 生成と排他で spawn する（`spawn_gate`。PLUG-7・SEC-1・#3139）。非 unix は fd を作らない。
+    #[cfg(unix)]
+    let spawned = crate::spawn_gate::spawn(deadline, cmd);
+    #[cfg(not(unix))]
+    let spawned = {
+        let _ = deadline;
+        cmd.spawn()
+    };
+    let child = spawned.map_err(|e| spawn_error(&e))?;
     let pid = child.id();
     // activate が失敗した場合は guard の Drop が子を kill・回収する。
     let guard = ChildGuard::new(child);
@@ -1630,6 +1662,27 @@ fn check_termination_after_response(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    /// 試験用の十分遠い合計期限。
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// REPAIR-5: stderr 準備のゲート待ちの期限切れは `Internal` ではなく `Timeout` に写す。
+    #[test]
+    fn repair5_stderr_prepare_timeout_maps_to_timeout() {
+        let e = io::Error::new(io::ErrorKind::TimedOut, "gate");
+        assert_eq!(
+            stderr_prepare_error(&e, "m", timeout_error).code(),
+            PluginErrorCode::Timeout
+        );
+        let e = io::Error::other("x");
+        assert_eq!(
+            stderr_prepare_error(&e, "m", timeout_error).code(),
+            PluginErrorCode::Internal
+        );
+    }
+
     use super::*;
 
     thread_local! {
@@ -2393,7 +2446,9 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("fcos-spawn-marker-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let script = format!("touch '{}'", marker.display());
-        let e = spawn_registered(&mut sh(&script), reg).err().unwrap();
+        let e = spawn_registered(&mut sh(&script), reg, far_deadline())
+            .err()
+            .unwrap();
         assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
         assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
         std::thread::sleep(Duration::from_millis(100));
@@ -2429,13 +2484,13 @@ mod tests {
         };
         // kill_and_reap
         let (mut cmd, marker) = make_ignoring("a");
-        let mut g = spawn_registered(&mut cmd, reg).unwrap();
+        let mut g = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
         wait_marker(&marker);
         assert_eq!(targets(reg), 1);
         assert!(g.kill_and_reap().is_reaped());
         assert_eq!(targets(reg), 0);
         // 自発終了を try_wait で回収
-        let mut g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exit 0"), reg, far_deadline()).unwrap();
         let start = Instant::now();
         while g.try_wait().unwrap().is_none() {
             assert!(start.elapsed() < Duration::from_secs(5));
@@ -2444,7 +2499,7 @@ mod tests {
         assert_eq!(targets(reg), 0);
         // 生存中の try_wait は登録を保つ
         let (mut cmd, marker) = make_ignoring("b");
-        let mut live = spawn_registered(&mut cmd, reg).unwrap();
+        let mut live = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
         wait_marker(&marker);
         assert!(live.try_wait().unwrap().is_none());
         assert_eq!(targets(reg), 1);
@@ -2475,7 +2530,7 @@ mod tests {
     #[test]
     fn plug7_spawn_registered_establishes_own_process_group() {
         let reg = local_registry(2);
-        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg, far_deadline()).unwrap();
         let pid = g.child.as_ref().unwrap().id();
         assert_eq!(process_group_of(pid), pid);
         assert!(g.kill_and_reap().is_reaped());
@@ -2488,7 +2543,7 @@ mod tests {
         use crate::signal_forward::ForwardSignal;
         use std::os::unix::process::ExitStatusExt;
         let reg = local_registry(2);
-        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg, far_deadline()).unwrap();
         assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 1);
         let start = Instant::now();
         let status = loop {
@@ -2513,7 +2568,7 @@ mod tests {
             let reg = local_registry(2);
             let mut cmd = sh("/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait");
             cmd.stdout(Stdio::piped());
-            let mut g = spawn_registered(&mut cmd, reg).unwrap();
+            let mut g = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
             let out = g.child.as_mut().unwrap().stdout.take().unwrap();
             let gc: u32 = read_grandchild_pid(&mut g, out);
             assert!(is_running(gc));
@@ -3008,7 +3063,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair5_stderr_capture_stops_reader_while_another_process_holds_the_writer() {
-        let (child_stderr, reader) = stderr_channel().unwrap();
+        let (child_stderr, reader) = stderr_channel(far_deadline()).unwrap();
         // 書き込み端を保持したまま何も書かないプロセス（孫プロセスの代役）。
         let holder = Command::new("/bin/sh")
             .args(["-c", "echo held >&2; exec sleep 30"])
@@ -3018,7 +3073,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut holder = ChildGuard::new(holder);
-        let capture = StderrCapture::attach(reader).unwrap();
+        let capture = StderrCapture::attach(reader, far_deadline()).unwrap();
         let waited = Instant::now();
         while lock_stderr(&capture.state).total_bytes < 5 {
             assert!(waited.elapsed() < Duration::from_secs(5));
@@ -3042,7 +3097,7 @@ mod tests {
     #[test]
     fn repair5_stderr_capture_stops_reader_repeatedly_while_writer_is_held() {
         for round in 0..20 {
-            let (child_stderr, reader) = stderr_channel().unwrap();
+            let (child_stderr, reader) = stderr_channel(far_deadline()).unwrap();
             let holder = Command::new("/bin/sh")
                 .args(["-c", "exec sleep 30"])
                 .stdin(Stdio::null())
@@ -3051,7 +3106,7 @@ mod tests {
                 .spawn()
                 .unwrap();
             let mut holder = ChildGuard::new(holder);
-            let capture = StderrCapture::attach(reader).unwrap();
+            let capture = StderrCapture::attach(reader, far_deadline()).unwrap();
             let limit = Duration::from_millis(50);
             let started = Instant::now();
             let got = capture.finish(limit);
@@ -3213,7 +3268,7 @@ mod tests {
     #[cfg(unix)]
     fn spawn_then_reap_elsewhere(reg: &'static Registry) -> ChildGuard {
         use crate::signal_forward::ForwardSignal;
-        let g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let g = spawn_registered(&mut sh("exit 0"), reg, far_deadline()).unwrap();
         assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 1);
         let pid = g.pid().unwrap();
         let start = Instant::now();

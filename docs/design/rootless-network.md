@@ -197,6 +197,9 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - holder を fork だけで作る（supervisor のメモリを継承する）
 - **残る露出**: 同じ uid のホスト側プロセスは holder の ns を開いてコンテナの user namespace と netns に入れる。これは exec 後の PID 1（dumpable で owner は全 capability を持つ）から owner が元々できることと同じで、新しい権限は与えない。holder は capability を落としているので乗っ取られても netns を書き換える権限が残らず、fd 3 以上と secret を持たない
 
+- **実装（#3197）**: `crates/net/src/netns_holder.rs`（入口 `run_netns_holder_main`・期限の定数）と子モジュール `holder`（holder 側の手順）・`channel`（supervisor 側の端 `NetnsHolderChannel`・`NetnsHolderFds`）・`frame`（固定長 32 バイトのフレーム。magic `FCNH`・version 1・kind・LE の 3 欄。OS 非依存）。syscall は `sys/holder.rs` の薄いラッパーと libc 照合。supervisor の bin の振り分け・起動と回収は 12.14 の次の単位、fd 2 本の送出は #1939、pasta の起動は #1938・#1940 の担当で、本実装には含まない。実機の確認は `netns_holder_userns`（CI の `platform-ci` ubuntu）で行う
+- **実装で決めた細部（自動運転で安全側に選んだ。承認は未取得）**: (1) 親の確認は argv が固定で期待値を受けられないため、stdin が `SOCK_SEQPACKET` であることと、`SO_PEERCRED` の pid（socketpair の作成者）が `getppid` と一致し 1 でないことで行う。(2) fd の待ちに期限を付ける（2 秒。親が送る前に壊れても残らないため。スレッドは使わず `poll`）。(3) 参加の後、capability を落とし `NO_NEW_PRIVS` を立てた後に PDEATHSIG を設定し直し、PDEATHSIG が SIGKILL のままであることと dumpable が 1 のままであることを READY の前に自己確認する（崩れたら `FailedPrecondition` で止まる。回避しない）。(4) 参加前後の失敗は固定の英文と code だけの stderr 1 行と、ワイヤー上の `Error` フレームで返す。(5) nsfs であることの `fstatfs` 確認は足さず、型の最終照合は `setns` の `EINVAL` と参加後の (dev, ino) 照合に任せる。(6) 受信の制御バッファは fd ちょうど 2 本分で、3 本目以降はカーネルが閉じて `MSG_CTRUNC` になり拒否する。(7) READY の後の待ちは期限なし（終わる経路は PDEATHSIG・EOF・STOP）。READY の後に fd や STOP 以外を受けたら fail-closed で終了する
+
 ### 12.3 #1870 との分担
 
 - **決定**: rootful の netns の渡し方（D12）と Host・Loopback の照合（D8）は変えない。pasta 構成は rootless のユーザー定義名だけに限り、D8 の同期点を「fd を 2 本」に拡張して使う。config.json との突き合わせは D7 の Loopback の行と同じ規則にする（path の無い network エントリは受け、path 付きは `InvalidArgument`）。#1870 は close 済みなので、記録は network-wiring.md の D4・D7・D8・D15 と残余の参照の行で行う
@@ -210,10 +213,11 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - 使うのはコンテナを作る subcommand（`create`。stack の up が入ったらそれも）で、rootless のインストールかつユーザー定義名の `--network` のときだけ。それ以外で指定したら `InvalidArgument`（効かない指定を黙って受けない）
   - rootless のユーザー定義名でどちらも無い場合は `FailedPrecondition`（固定文言 `pasta path is not configured`）。既定のパスは持たない（12.15）
   - 作成時: CLI が #1936 の検証関数で解決・検証し、FCOPT1（D4）に kind `pasta` を 1 レコード書く（上限 4 KiB）。値は、絶対パス（UTF-8・制御文字なし・3072 バイト以下。識別情報・版の日付・符号化の枠を 4 KiB のレコード内に収める余裕を確保するための上限で、超えるパスは作成時に解決段階で `invalid-argument` 相当の構造化エラーで拒否し、切り詰めない）、fd の `fstat` から得る識別（dev・ino・size・mtime・ctime〔ns〕・uid・mode）、解釈した版の日付
-  - 起動時: supervisor が文書を復号するたびに未信頼の入力として再検証する。パスを同じ規則で辿り直して識別を記録と照合し、`--version` も実行し直して照合する。不一致は `FailedPrecondition` とし、監査ログ（SEC-4）に「作成から起動までの間にバイナリが替わった」を記録する
+  - 起動時: supervisor が文書を復号するたびに未信頼の入力として再検証する。パスを同じ規則で辿り直し、得た正規パスと識別（dev・ino・size・mtime・ctime・uid・mode）を **`--version` の実行より前に**記録と照合する（不一致なら子を実行せず固定の変更エラーで返し、版のエラーに埋もれさせない）。一致したときだけ `--version` を実行し直して版を照合する。不一致は `FailedPrecondition` とし、監査ログ（SEC-4）に「作成から起動までの間にバイナリが替わった」を記録する
   - 実行は検証したパスで行い、`argv[0]` は常に `pasta` に固定する（12.7）
   - 版の固定は 12.12
 - **理由**: 特権ランチャーの `sanitize_env` は環境を許可リストで作り直し、supervisor は契約の値を環境から読まず、argv は `StartArgs::parse` で固定されている。どちらも変えずに済む経路は既存の文書 FCOPT1 だけである（[container-options-delivery.md](container-options-delivery.md) の却下理由と同じ）。`--plugin-path-search` とは信頼の対象が違うので opt-in は別のフラグにする
+- **実装（#3199）**: 2 フラグの解析は `crates/cli/src/commands/args.rs`、`create` での判定・解決・検証は `commands/create_pasta.rs`（判定表は同ファイルの doc）、`create` 以外への指定の拒否は `commands.rs`。FCOPT1 の kind `pasta` は `crates/supervisor/src/container_options/document.rs`、本文の符号化・復号（`<YYYYMMDD> <dev> <ino> <size> <mtime_sec> <mtime_nsec> <ctime_sec> <ctime_nsec> <uid> <mode(8 進)>\n<絶対パス>`・本文 4096 バイト以下）と `reverify` は `crates/net/src/pasta/record.rs`。復号は本文の形だけを検証し（副作用なし）、バイナリの辿り直しと識別の照合は `reverify_recorded_pasta`（`container_options/pasta.rs`）が行う。**残余**: (1) `--network` のユーザー定義名は #1873 まで `UNIMPLEMENTED` で拒否されるため、本番の `create` が `pasta` を書くのはその後。(2) start 経路からの `reverify_recorded_pasta` の呼び出しと SEC-4 の監査の記録（作成時の `PermissionDenied`・起動時の識別の不一致）は #1940。作成時の記録先は状態ストアを開いた後にしか作れず D2（状態ルートを作る前の拒否）と両立せず、core の `AuditLayer` に pasta の語彙も無いため、本実装は分類（`PastaReverifyError::tamper_suspected`）だけを返す。(3) pasta の解決・検証の子（`--version`）が、`UNIMPLEMENTED` の拒否より前に 1 回起動される（`FailedPrecondition` と検証失敗の分類を作成前に返すため）。
 - **却下した案**: 環境変数・設定ファイル（オーナー決定で不採用）、`--plugin-path-search` を pasta にも効かせる（plugin と pasta の opt-in が結合する）、supervisor の argv に足す（`MAX_ARGS` と契約が変わる）、core の `StateRecord` に同梱する（plugin 境界の型が変わる）
 
 ### 12.5 opt-in の `PATH` 探索
@@ -363,10 +367,11 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | netns holder（`run_netns_holder_main`・fd の受信・setns・capset・READY / STOP・PDEATHSIG） | net | #1936 |
 | bin の `netns-holder` の振り分けと holder の起動・回収 | supervisor | 上の holder・#3065 |
 | `--pasta-path` / `--pasta-path-search` と作成時の検証・FCOPT1 の `pasta` の書き込み | cli | #1936・#3065 |
-| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065 |
+| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065。実装は #3200。CLI が `publish` を文書へ書くのは `network`（ユーザー定義名）を書く #1873 の後（それまでは検証済みの `-p` も `UNIMPLEMENTED`） |
 
 ### 12.15 オーナー確認事項（実装は止めない）
 
 - 既定のパス（`/usr/bin/pasta` 等）を持つか。現状は持たない
 - ポート公開の細部（#1937。自動運転で安全側に決めた）: 同じプロトコルでアドレスが違う公開は `-t` を複数並べる / 明示アドレスのうち bind できないもの（`0.0.0.0` 以外の `0.0.0.0/8`・multicast・予約）は拒否 / `0.0.0.0` と個別アドレスの同じ（プロトコル・ホストのポート）は重なりとして拒否 / プロトコル省略は TCP（`/TCP` の大文字は不可）/ 1 件 64 バイトの上限を解析の入口にも置く / ポートの名前（`http` 等）は受けない
+- `-p` の組の細部（#3200。自動運転で安全側に決めた）: `-p` に `--network` が無い、または `none` / `host` / `container:` が付くときは、権限モデルによらず `INVALID_ARGUMENT`（12.4 の `--pasta-path` と同じく、効かない指定を黙って受けない）。この検査は rootful の `UNIMPLEMENTED` より前に置くため、rootful で `-p` と `none` を指定すると `UNIMPLEMENTED` ではなく `INVALID_ARGUMENT` になる。利用者向けの説明は [port-publish.md](../api/port-publish.md)
 - 12.2 の holder 方式、12.10 の「途中死でコンテナを止める」、12.7 の固定の argv は自動運転で決めた。承認は未取得

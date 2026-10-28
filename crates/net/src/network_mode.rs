@@ -9,6 +9,8 @@
 //! `container:<id>` 等の他コンテナ参照形式は受け付けない（fail-closed）。
 
 use crate::error::{NetError, NetErrorCode};
+use crate::network::NetworkName;
+use crate::network_store::definition::is_reserved_network_name;
 
 #[cfg(target_os = "linux")]
 pub mod host;
@@ -82,6 +84,43 @@ impl NetworkMode {
     }
 }
 
+/// コンテナの `--network` の値の分類（NET-6・D1・REPAIR-1）。
+///
+/// CLI の create 検証（`create_network.rs`）と supervisor の `FCOPT1` 再検証（`container_options/network.rs`）が
+/// 共有する**唯一の規則**。両者が別々に持つと片方だけ変わるずれが生じるため、ここに 1 か所だけ置く。
+/// [`NetworkMode`]（セットアップ経路の選択）とは別の入口で、`container:` 始まりやユーザー定義名も分類する。
+///
+/// `#[non_exhaustive]` にしないのは、variant が増えたとき呼び出し側の `match` をコンパイルエラーにして
+/// 更新を強いるため。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkChoice {
+    /// `none`。
+    None,
+    /// `host`。
+    Host,
+    /// ユーザー定義名（検証済み）。
+    Named(NetworkName),
+    /// `container:` 始まり（参照先は未検証。受理の可否は呼び出し側が決める）。
+    ContainerRef,
+}
+
+impl NetworkChoice {
+    /// 判定順は `none` → `host` → 予約名（`InvalidArgument`）→ `container:` → `NetworkName::new`。
+    /// エラー文言は固定の英語で、入力値を含めない。
+    pub fn parse(value: &str) -> Result<Self, NetError> {
+        match value {
+            "none" => Ok(Self::None),
+            "host" => Ok(Self::Host),
+            n if is_reserved_network_name(n) => Err(NetError::new(
+                NetErrorCode::InvalidArgument,
+                "reserved network name",
+            )),
+            n if n.starts_with("container:") => Ok(Self::ContainerRef),
+            n => NetworkName::new(n).map(Self::Named),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +167,39 @@ mod tests {
         assert_eq!(NetworkMode::Bridge.netns_policy(), NetnsPolicy::Isolated);
         assert_eq!(NetworkMode::Host.netns_policy(), NetnsPolicy::ShareHost);
         assert_eq!(NetworkMode::None.netns_policy(), NetnsPolicy::Isolated);
+    }
+
+    /// NET-6・D1: `--network` の分類の判定表。
+    #[test]
+    fn net6_network_choice_decision_table() {
+        assert_eq!(NetworkChoice::parse("none").unwrap(), NetworkChoice::None);
+        assert_eq!(NetworkChoice::parse("host").unwrap(), NetworkChoice::Host);
+        for n in ["bridge", "default"] {
+            let e = NetworkChoice::parse(n).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "reserved network name");
+        }
+        for n in ["container:x", "container:"] {
+            assert_eq!(
+                NetworkChoice::parse(n).unwrap(),
+                NetworkChoice::ContainerRef
+            );
+        }
+        match NetworkChoice::parse("web").unwrap() {
+            NetworkChoice::Named(n) => assert_eq!(n.as_str(), "web"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let long = "a".repeat(64);
+        assert!(matches!(
+            NetworkChoice::parse(&long).unwrap(),
+            NetworkChoice::Named(_)
+        ));
+        for bad in ["Web", ".x", "", &"a".repeat(65)] {
+            let e = NetworkChoice::parse(bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            if !bad.is_empty() {
+                assert!(!e.message().contains(bad));
+            }
+        }
     }
 }

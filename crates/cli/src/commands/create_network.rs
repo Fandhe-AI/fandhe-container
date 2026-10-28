@@ -9,7 +9,8 @@
 //!
 //! 形式の判定は net の検証関数(`parse_add_hosts`・`parse_ip_addr`・`ResolvConfPlan::for_mode`・
 //! `NetworkName::new`)を唯一の判定とし、CLI は hostname・IP の規則を二重に書かない。
-//! 予約名(`bridge`・`default`)だけは net に規則が無いため CLI 側に置く(D1)。
+//! `--network` の分類は net の `NetworkChoice::parse` を唯一の判定とし(supervisor の `FCOPT1` 再検証と共有。D1・REPAIR-1)、
+//! `NetError` の写像も supervisor の `net_error_to_trait` を共有する。
 //!
 //! # 判定順(`INVALID_ARGUMENT` が `UNIMPLEMENTED` に優先する)
 //!
@@ -43,10 +44,10 @@
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_net::add_host_dns::resolv_conf::ResolvConfPlan;
 use fandhe_container_net::add_host_dns::{parse_add_hosts, parse_ip_addr};
-use fandhe_container_net::error::{NetError, NetErrorCode};
-use fandhe_container_net::network::NetworkName;
-use fandhe_container_net::network_mode::NetworkMode;
+use fandhe_container_net::network_mode::{NetworkChoice, NetworkMode};
 use fandhe_container_net::pasta::PastaPortForwards;
+
+use fandhe_container_supervisor::container_options::network::net_error_to_trait;
 
 use super::args::CreateNetworkArgs;
 
@@ -108,50 +109,6 @@ pub(super) fn resolve_publish_privilege() -> Result<PublishPrivilege, TraitError
     Ok(PublishPrivilege::Unavailable)
 }
 
-/// 予約名の固定拒否文言。
-const RESERVED_NAME_MESSAGE: &str = "reserved network name";
-
-/// `--network` の判定結果(内部用)。
-enum Choice {
-    None,
-    Host,
-    /// ユーザー定義名(検証済み)。
-    Named,
-    /// `container:` 始まり(保留)。
-    Container,
-}
-
-/// 予約名か(`network create` が後で再利用できるよう独立させる。D1・#3066)。
-pub(super) fn is_reserved_network_name(name: &str) -> bool {
-    matches!(name, "bridge" | "default")
-}
-
-/// net の固定メッセージを保ったまま `TraitError` へ写す(`NetErrorCode` は `#[non_exhaustive]`)。
-fn net_error_to_trait(e: &NetError) -> TraitError {
-    let code = match e.code() {
-        NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-        NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-        _ => ErrorCode::Internal,
-    };
-    TraitError::new(code, e.message())
-}
-
-fn choose(network: &str) -> Result<Choice, TraitError> {
-    match network {
-        "none" => Ok(Choice::None),
-        "host" => Ok(Choice::Host),
-        n if is_reserved_network_name(n) => Err(TraitError::new(
-            ErrorCode::InvalidArgument,
-            RESERVED_NAME_MESSAGE,
-        )),
-        n if n.starts_with("container:") => Ok(Choice::Container),
-        n => NetworkName::new(n)
-            .map(|_| Choice::Named)
-            .map_err(|e| net_error_to_trait(&e)),
-    }
-}
-
 /// 4 つのフラグを作成前に検証する。指定が無ければ `Ok(())`、不正は `InvalidArgument`、
 /// 正しくても指定があれば `Unimplemented`(D3)。`resolve_privilege` は `-p` がユーザー定義名と組のときだけ呼ぶ。
 #[cfg(test)]
@@ -171,7 +128,12 @@ pub(super) fn check_network_options(
     args: &CreateNetworkArgs,
     resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
 ) -> Result<bool, TraitError> {
-    let choice = args.network.as_deref().map(choose).transpose()?;
+    let choice = args
+        .network
+        .as_deref()
+        .map(NetworkChoice::parse)
+        .transpose()
+        .map_err(|e| net_error_to_trait(&e))?;
     if !args.add_hosts.is_empty() {
         parse_add_hosts(args.add_hosts.iter().map(String::as_str))
             .map_err(|e| net_error_to_trait(&e))?;
@@ -180,10 +142,10 @@ pub(super) fn check_network_options(
         parse_ip_addr(d).map_err(|e| net_error_to_trait(&e))?;
     }
     let mode = match choice {
-        Some(Choice::None) => Some(NetworkMode::None),
-        Some(Choice::Host) => Some(NetworkMode::Host),
+        Some(NetworkChoice::None) => Some(NetworkMode::None),
+        Some(NetworkChoice::Host) => Some(NetworkMode::Host),
         // 名前つき・container: は for_mode(Bridge は UNIMPLEMENTED を返して検出を隠す)を通さない。
-        Some(Choice::Named | Choice::Container) | None => None,
+        Some(NetworkChoice::Named(_) | NetworkChoice::ContainerRef) | None => None,
     };
     if let Some(mode) = mode {
         let dns: Vec<&str> = args.dns.iter().map(String::as_str).collect();
@@ -192,7 +154,7 @@ pub(super) fn check_network_options(
     if !args.publish.is_empty() {
         PastaPortForwards::parse_all(args.publish.iter().map(String::as_str))
             .map_err(|e| net_error_to_trait(&e))?;
-        if !matches!(choice, Some(Choice::Named)) {
+        if !matches!(choice, Some(NetworkChoice::Named(_))) {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 PUBLISH_NEEDS_NAMED_MESSAGE,
@@ -214,7 +176,7 @@ pub(super) fn check_network_options(
             }
         }
     }
-    Ok(matches!(choice, Some(Choice::Named)))
+    Ok(matches!(choice, Some(NetworkChoice::Named(_))))
 }
 
 /// 検証を通った指定があれば `Unimplemented`(D3。起動経路への結線は #1873)。
@@ -232,6 +194,7 @@ pub(super) fn reject_not_wired(args: &CreateNetworkArgs) -> Result<(), TraitErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_net::error::{NetError, NetErrorCode};
 
     fn a(network: Option<&str>, hosts: &[&str], dns: &[&str]) -> CreateNetworkArgs {
         CreateNetworkArgs {

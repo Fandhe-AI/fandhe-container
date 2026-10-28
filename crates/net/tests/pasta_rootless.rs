@@ -493,11 +493,14 @@ mod linux {
                 Some(l) if l.set_nonblocking(true).is_ok() => listeners.push(l),
                 _ => {
                     println!("ERR bind");
+                    let _ = std::io::stdout().flush();
                     return ExitCode::from(1);
                 }
             }
         }
         println!("READY");
+        // パイプ越しの親が行を読めるよう、行ごとに flush する（ブロックバッファのまま待たせない）。
+        let _ = std::io::stdout().flush();
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
@@ -523,6 +526,7 @@ mod linux {
                 _ => "ERR unknown".into(),
             };
             println!("{reply}");
+            let _ = std::io::stdout().flush();
         }
         ExitCode::SUCCESS
     }

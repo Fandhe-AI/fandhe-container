@@ -2219,7 +2219,11 @@ impl CriRuntimeService {
             return Ok(resp);
         };
         let mut write_guard = Some(guard);
-        self.persist_sandbox(&id, false, &mut write_guard).await?;
+        // 共有の期限があれば残りで頭打ちにする（RemovePodSandbox 経由の Stop で put が止まっても、
+        // RPC 全体が kubelet の期限を超えない。#3142）。残りが 0 なら put を始めず固定文言の Timeout。
+        let put_timeout = step_within(deadline, self.runtime_timeout)?;
+        self.persist_sandbox_timed(&id, false, &mut write_guard, put_timeout)
+            .await?;
         Ok(resp)
     }
 
@@ -2323,13 +2327,16 @@ impl CriRuntimeService {
     /// ストア未注入なら何もしない。スナップショットはロック下で取り、符号化はロックを外して行い、`put`
     /// （fsync）は専用 worker で期限つきに走らせる（[`Self::store_io_bounded`]。REPAIR-5）。失敗・期限超過は
     /// 種別によらず固定文言の `INTERNAL`。呼び出し側は `record_write` の guard を `guard` に渡すこと。
-    async fn persist_sandbox(
+    ///
+    /// put の上限 `timeout` は呼び出し側が決める（RemovePodSandbox 経由の Stop は共有期限の残りで頭打ちにする。#3142）。
+    async fn persist_sandbox_timed(
         &self,
         id: &str,
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
+        timeout: Duration,
     ) -> Result<(), CriError> {
-        self.persist_sandbox_inner(id, pending, guard, PutMode::Plain)
+        self.persist_sandbox_inner(id, pending, guard, PutMode::Plain, timeout)
             .await
     }
 
@@ -2340,7 +2347,7 @@ impl CriRuntimeService {
         id: &str,
         guard: &mut Option<SandboxRecordWriteGuard>,
     ) -> Result<(), CriError> {
-        self.persist_sandbox_inner(id, false, guard, PutMode::Confirm)
+        self.persist_sandbox_inner(id, false, guard, PutMode::Confirm, self.runtime_timeout)
             .await
     }
 
@@ -2352,8 +2359,14 @@ impl CriRuntimeService {
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
     ) -> Result<(), CriError> {
-        self.persist_sandbox_inner(id, pending, guard, PutMode::Reservation)
-            .await
+        self.persist_sandbox_inner(
+            id,
+            pending,
+            guard,
+            PutMode::Reservation,
+            self.runtime_timeout,
+        )
+        .await
     }
 
     async fn persist_sandbox_inner(
@@ -2362,6 +2375,7 @@ impl CriRuntimeService {
         pending: bool,
         guard: &mut Option<SandboxRecordWriteGuard>,
         mode: PutMode,
+        timeout: Duration,
     ) -> Result<(), CriError> {
         if self.record_store.is_none() {
             return Ok(());
@@ -2402,7 +2416,7 @@ impl CriRuntimeService {
             .store_io_bounded(
                 StoreCall::Put(record_id, bytes, rollback.clone()),
                 guard,
-                self.runtime_timeout,
+                timeout,
             )
             .await;
         if let Some(rb) = rollback.as_ref().filter(|rb| !rb.confirm) {

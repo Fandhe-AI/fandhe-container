@@ -2383,11 +2383,20 @@ impl LinuxAttachOps<'_> {
     }
 }
 
+/// `IfIndex` を netlink のリンク番号 `LinkIndex` へ変換する（NET-1）。
+///
+/// `LinkSet::rename` のように番号だけを受ける呼び出しが、`LinkRef` の分岐（到達しない腕）を経ずに
+/// 取り出すための入口。範囲外は `InvalidArgument`（panic しない）。
 #[cfg(target_os = "linux")]
-pub(crate) fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
+pub(crate) fn link_index_of(index: IfIndex) -> Result<LinkIndex, NetError> {
     let raw = i32::try_from(index.get())
         .map_err(|_| NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX"))?;
-    Ok(LinkRef::Index(LinkIndex::new(raw)?))
+    LinkIndex::new(raw)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
+    Ok(LinkRef::Index(link_index_of(index)?))
 }
 
 #[cfg(target_os = "linux")]
@@ -2484,9 +2493,7 @@ impl AttachOps for LinuxAttachOps<'_> {
         link: IfIndex,
         name: &IfName,
     ) -> Result<(), NetError> {
-        let LinkRef::Index(index) = link_ref(link)? else {
-            unreachable!("link_ref always returns LinkRef::Index")
-        };
+        let index = link_index_of(link)?;
         Self::ns_route(ns)?
             .set_link(&LinkSet::rename(index, name.clone()), self.timeout)
             .map(|_| ())

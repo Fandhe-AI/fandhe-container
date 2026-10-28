@@ -48,6 +48,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
 pub(crate) mod holder;
+pub(crate) mod pasta;
 
 /// syscall 失敗の分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

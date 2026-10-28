@@ -362,7 +362,7 @@ fn spawn_inner(
     };
     let (identity, pidfd) = match confirm_identity(&ident_line, &nonce) {
         Ok(v) => v,
-        Err(e) => return Err(fail_before_ack(guard, stdin, e)),
+        Err(e) => return Err(fail_before_ack_unconfirmed(stdin, e)),
     };
     let record = match DnsHelperRecord::new(identity.clone(), nonce, listen) {
         Ok(r) => r,
@@ -444,6 +444,19 @@ fn fail_before_ack(
         Ok(()) => e,
         Err(r) => with_note(e, &format!("intent record kept: {}", r.message())),
     }
+}
+
+/// 識別行を受けた後、pidfd を確保・照合できずに失敗した経路（NET-5・REPAIR-5）。
+///
+/// 段 2 の終了を確認できない（pidfd_open の ENOSYS・EMFILE 等）ため、stdin を閉じて EOF での自発終了に任せるが、
+/// 意図記録は消さずに残す。child subreaper の呼び出し元ではゾンビが残りうるうえ、停止中の子は EOF でも
+/// 終了しないため、後続の `recover_dns_helper_intent` が nonce で再試行できるようにする。
+fn fail_before_ack_unconfirmed(stdin: Option<ChildStdin>, e: NetError) -> NetError {
+    drop(stdin);
+    with_note(
+        e,
+        "dns helper could not be confirmed stopped; intent record kept",
+    )
 }
 
 /// ack を返す前の失敗のうち、段 2 の pidfd を確保済みの経路（NET-5・REPAIR-5）。

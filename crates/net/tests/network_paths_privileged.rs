@@ -39,8 +39,8 @@
 //!
 //! # 対象外の経路
 //!
-//! external netns から PREROUTING を通る DNAT と、コンテナ発の masquerade は検証しない。masquerade 本体は
-//! `network.rs` で未実装（REPAIR-3）であり、PREROUTING 側のルール単位の検証は `nftables_paths_privileged` が行う。
+//! external netns から PREROUTING を通る DNAT と、コンテナ発の masquerade 経由の外向き通信は検証しない。masquerade の
+//! ルールは `create_network` が投入する（#3073）が、変換の実トラフィックは未検証（REPAIR-3）。PREROUTING 側のルール単位の検証は `nftables_paths_privileged` が行う。
 //! `ip_forward` は変更しない。
 //!
 //! # 所要時間計測（`--measure --trials N --warmup W`）
@@ -68,7 +68,7 @@
 //! （シグナルハンドラを持たず `sys` 外の unsafe を作らない）。pin はホストの mount namespace から見えないため、
 //! 計測プロセスは `nsenter --net=/proc/<inner_pid>/root<pin>`（出力の `netns`）で入る。
 //! 制約（出力の `method` にも書く）: コンテナ役は `nsenter` で入った任意のプロセスで製品の起動経路を通らず、
-//! masquerade 本体は未実装、ホスト役は実ホストでなく隔離 netns。値は暫定（`provisional`）で NET-2・NET-3 の
+//! masquerade 経由の外向き通信は未検証、ホスト役は実ホストでなく隔離 netns。値は暫定（`provisional`）で NET-2・NET-3 の
 //! 判定には使わない。詳細は `docs/design/net-tcp-rtt-bench.md`。
 
 #[path = "support/reap.rs"]
@@ -160,7 +160,7 @@ mod linux {
     const IPERF_HOST_PORT: u16 = 15201;
     const IPERF_CONT_PORT: u16 = 5201;
     const HOLD_SCHEMA: &str = "fandhe-container.net-hold/v1";
-    const HOLD_METHOD: &str = "data path (bridge/veth/nftables) built by the crates/net integration API in a fresh netns; container role is a process entered via nsenter --net=<pin> and does not go through the product launch path (namespace isolation, cgroup, seccomp); masquerade is not implemented; host role is the isolated netns, not the real host; values are provisional and not used for NET-2/NET-3 judgement";
+    const HOLD_METHOD: &str = "data path (bridge/veth/nftables) built by the crates/net integration API in a fresh netns; container role is a process entered via nsenter --net=<pin> and does not go through the product launch path (namespace isolation, cgroup, seccomp); masquerade rule is installed by create_network but egress through it is not exercised here; host role is the isolated netns, not the real host; values are provisional and not used for NET-2/NET-3 judgement";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",

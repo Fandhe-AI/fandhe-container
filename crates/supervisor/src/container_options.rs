@@ -17,7 +17,7 @@
 //!
 //! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
 //!
-//! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は #1873 まで未反映で `launch_options` が拒否） | core の `LaunchOptions::with_network` |
+//! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は start の手順 4b で生成し `with_etc_files` で bind） | core の `LaunchOptions::with_network` |
 //!
 //! | #2828（CLI-1・SUP-12） | `--read-only`（[`ContainerOptions::with_read_only`]。config の `root.readonly` と OR で効き、狭める方向のみ） | core の `LaunchOptions::with_root_readonly`（mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値） |
 //!
@@ -58,6 +58,7 @@
 
 pub mod document;
 pub mod env;
+pub mod etc_files;
 pub mod ipc;
 pub mod labels;
 pub mod mounts;
@@ -301,15 +302,9 @@ impl ContainerOptions {
     /// 矛盾した指定（`--ipc=host` と `--shm-size` 等）は `InvalidArgument` で拒否する。
     ///
     /// `network` は core の `LaunchNetworkMode` へ写して渡す(指定なしは `FromConfig`。NET-6・#3065)。
-    /// `add-host`・`dns` は hosts / resolv.conf へ反映する経路が無いため、あれば `Unimplemented` で拒否する
-    /// (受理して反映しない状態を作らない。REPAIR-3。#1873 の start 手順 3〜7〔D9〕で解除する)。
+    /// `add-host`・`dns` が生む `/etc/hosts`・`/etc/resolv.conf` は `with_etc_files` で bind 対象にする
+    /// (生成は start の手順 4b。#1873・NET-12・D9)。
     pub fn launch_options(&self) -> Result<LaunchOptions, TraitError> {
-        if !self.network.add_hosts().is_empty() || !self.network.dns().is_empty() {
-            return Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                "--add-host / --dns are not applied to the container yet",
-            ));
-        }
         let network_mode = self.network.launch_network_mode()?;
         let ipc = if self.ipc.shares_host_namespace() {
             LaunchIpcMode::Host
@@ -319,12 +314,11 @@ impl ContainerOptions {
         // ulimit は種別ごとの指定値(launcher が 16 種へ補完)、env は `process.env` への上書き。core は再検証する。
         LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)?
             .with_rlimits(self.rlimits.clone())
-            .with_env(self.env.to_env_strings())
-            .map(|o| {
-                o.with_capability_drop(self.cap_drop)
-                    .with_root_readonly(self.read_only)
-                    .with_network(network_mode)
-            })
+            .with_env(self.env.to_env_strings())?
+            .with_capability_drop(self.cap_drop)
+            .with_root_readonly(self.read_only)
+            .with_network(network_mode)
+            .with_etc_files(self.network.etc_file_selection())
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -597,22 +591,29 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// NET-12・REPAIR-3(#3065): 反映経路の無い add-host / dns があれば `launch_options` は `Unimplemented`。
+    /// NET-12・#1873: add-host / dns は `etc_files()` の選択として `LaunchOptions` へ届く。
     #[test]
-    fn net12_launch_options_rejects_unapplied_add_host_dns() {
+    fn net12_launch_options_carries_etc_files() {
+        use fandhe_container_core::etc_files::EtcFileKind;
         let with = |hosts: &[&str], dns: &[&str]| {
             let h: Vec<String> = hosts.iter().map(|s| (*s).to_owned()).collect();
             let d: Vec<String> = dns.iter().map(|s| (*s).to_owned()).collect();
             ContainerOptions::new()
                 .with_network(NetworkOptions::parse(Some("host"), &h, &d, &[]).expect("parse"))
         };
-        let e = with(&["web:192.0.2.1"], &[])
+        let o = with(&["web:192.0.2.1"], &[])
             .launch_options()
-            .expect_err("add-host");
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
-        let e = with(&[], &["8.8.8.8"]).launch_options().expect_err("dns");
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
-        assert!(with(&[], &[]).launch_options().is_ok());
+            .expect("hosts");
+        assert_eq!(o.etc_files().kinds(), vec![EtcFileKind::Hosts]);
+        let o = with(&[], &["8.8.8.8"]).launch_options().expect("dns");
+        assert_eq!(o.etc_files().kinds(), vec![EtcFileKind::ResolvConf]);
+        assert!(
+            with(&[], &[])
+                .launch_options()
+                .expect("none")
+                .etc_files()
+                .is_empty()
+        );
     }
 
     /// SUP-12・SEC-1(#2625): `--ipc=host` は IPC を共有し、`/dev/shm` を載せない。`shareable` は `Private` に写る。

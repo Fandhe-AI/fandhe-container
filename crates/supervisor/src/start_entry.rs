@@ -129,6 +129,28 @@ pub trait StartDeps {
         observed: &StateRecord,
     ) -> Result<Option<StateRevision>, TraitError>;
 
+    /// 手順 4b: ネットワーク指定の準備（`/etc/hosts`・`/etc/resolv.conf` の生成と host netns の基準照合。
+    /// #1873・NET-6・NET-12・D14）。起動権の予約（`claim_start`）の後・`launch_claimed` の前に呼ぶ（cgroup・監査 sink・launcher の構築より後）。
+    ///
+    /// 失敗する場合は実装が自分で作ったものを巻き戻してから返す。成功した場合の削除は [`Self::release_network`]。
+    /// 既定は何もしない（ネットワーク指定を持たないフェイクの [`StartDeps`] は上書きしなくてよい）。
+    fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
+        let _ = id;
+        Ok(())
+    }
+
+    /// 手順 4b で作った生成ファイルを消す。cgroup の削除が確かめられた後（逆順）にだけ呼ぶ。
+    /// 生存し得るコンテナの bind 元を消さないため、cgroup を消せなかった経路では呼ばれない。
+    /// 起動権の予約を手放した後の失敗（`start` の失敗の後始末）でも呼ばれない（別世代の生成物を消さないため）。
+    fn release_network(&mut self) -> Result<(), TraitError> {
+        Ok(())
+    }
+
+    /// start の成功後に構造化ログへ残す network モードの固定語彙（host のみ `Some("host")`。#1873・D8）。
+    fn network_log_mode(&self) -> Option<&'static str> {
+        None
+    }
+
     /// 手順 6: 監査 sink を構築する（fork の前。SEC-4）。実装が保持し [`Self::build_launcher`] が使う。
     fn build_audit_sink(&mut self) -> Result<(), TraitError>;
 
@@ -315,6 +337,27 @@ fn log_legacy_tiocsti_to(
 /// `tests/start_tiocsti_wiring.rs` が別プロセスで共有 sink へ届くことを照合する（REPAIR-12）。
 fn log_legacy_tiocsti(observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti) {
     let _ = log_legacy_tiocsti_to(crate::stderr_sink::stderr(), observe());
+}
+
+/// start の成功後に network モードの固定 1 行を `sink` へ待たずに入れる（#1873・NET-6・D8・REPAIR-4）。
+///
+/// `mode` は `StartDeps::network_log_mode` の固定語彙（host のみ）で、入力値は載せない。`None` なら何もしない。
+/// host は分離を緩める指定のため、使われたことを構造化ログに残す（監査ログには書かない。分離違反の試行ではないため）。
+fn log_network_mode_to(
+    sink: &crate::stderr_sink::StderrSink,
+    mode: Option<&'static str>,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    let mode = mode?;
+    let line = format!(
+        "{{\"component\":\"supervisor\",\"event\":\"network_mode\",\"network_mode\":\"{mode}\"}}\n"
+    );
+    Some(sink.emit(line.into_bytes()))
+}
+
+/// 成功報告の後に [`log_network_mode_to`] を共有 sink へ出す（`log_legacy_tiocsti` と同じ位置・同じ制約。
+/// 常駐スレッドを作るため、単一スレッド前提の区間が終わった後にだけ呼ぶ）。
+fn log_network_mode(mode: Option<&'static str>) {
+    let _ = log_network_mode_to(crate::stderr_sink::stderr(), mode);
 }
 
 /// launch が評価した監査の網羅(`launchIsolation.auditCoverage`)が縮退していれば、固定の警告 1 行を `sink` へ待たずに入れる
@@ -516,10 +559,27 @@ fn write_report(out: &mut dyn Write, report: &StartReport) -> std::io::Result<()
     out.flush()
 }
 
+/// cgroup だけを消す。失敗はログへ出し、`false` を返す。
+fn release_cgroup_logged(deps: &mut dyn StartDeps) -> bool {
+    match deps.release_cgroup() {
+        Ok(()) => true,
+        Err(e) => {
+            log_event("cgroup_release_failed", Some(e.code()));
+            false
+        }
+    }
+}
+
 /// cgroup を消す。失敗は元のエラーを隠さずにログへ出し、`false` を返す（後始末の成否へ反映する）。
 fn release_logged(deps: &mut dyn StartDeps) -> bool {
     match deps.release_cgroup() {
-        Ok(()) => true,
+        Ok(()) => match deps.release_network() {
+            Ok(()) => true,
+            Err(e) => {
+                log_event("etc_files_release_failed", Some(e.code()));
+                false
+            }
+        },
         Err(e) => {
             log_event("cgroup_release_failed", Some(e.code()));
             false
@@ -708,6 +768,8 @@ fn start_reporting(
     };
     let wait_until = deadline.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
     if let Some((deps, outcome)) = worker.wait_until(wait_until) {
+        // 成功後の構造化ログに使う network モード（deps は後始末へ移るため先に取る。#1873・D8）。
+        let net_mode = deps.network_log_mode();
         // 作業スレッドは結果を渡した直後に終わる。launch の前に終了を確かめる（単一スレッドの要求。CORE-1）。
         let worker_exited = worker.join();
         let attempt =
@@ -739,6 +801,7 @@ fn start_reporting(
                     },
                 );
                 log_legacy_tiocsti(observe);
+                log_network_mode(net_mode);
                 log_audit_coverage(running.process.as_ref());
                 // 単一スレッドの区間で積んだログは報告の後に出す（#1940）。
                 deps.flush_deferred_logs();
@@ -1164,6 +1227,11 @@ fn cleanup_after_report(
                 "supervisor-claim-release",
                 crate::start_contract::result_deadline(timeouts),
                 move || {
+                    // 生成物は所有ロック（予約）を握っている間に消す。手放した後だと、並行する start が作り直した
+                    // 生成物を消し得る（CORE-2・SEC-1）。失敗はログへ残す。
+                    if let Err(e) = deps.release_network() {
+                        log_event("etc_files_release_failed", Some(e.code()));
+                    }
                     if claimed.release(store.as_ref()).is_ok() {
                         release_logged(deps.as_mut())
                     } else {
@@ -1193,7 +1261,10 @@ fn cleanup_after_report(
                         &late,
                     ) {
                         // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
-                        release_logged(deps.as_mut())
+                        // 手順 4b の生成ファイル（`@container-etc/<id>`）はここでは消さない。起動権の予約はこの時点で
+                        // 解放済みで、並行する delete → 同じ ID の create / start が作った別世代の bind 元を消し得るため
+                        // （CORE-2・CORE-3・SEC-1）。残りは delete か次の start の準備（予約を握って作り直す）が消す。
+                        release_cgroup_logged(deps.as_mut())
                     } else {
                         // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
                         log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
@@ -1321,6 +1392,16 @@ fn prepare_start(
             };
         }
     };
+    // 4b: ネットワーク指定の準備（hosts / resolv.conf の生成・host netns の基準照合。#1873・D14）。
+    // 起動権の予約（所有ロック）を握った後に行う。予約より前に生成・削除すると、並行する同じ ID の start が
+    // 先行する start の生成物を消してしまう（CORE-2・CORE-3・SEC-1）。失敗時は実装が自分で巻き戻し、予約は
+    // 報告の後に戻す（`DiscardClaim` は予約を手放す前に生成物を消す）。
+    if let Err(e) = deps.prepare_network(req.id()) {
+        return PrepareOutcome::Failed {
+            error: op_err(e),
+            cleanup: Cleanup::DiscardClaim(claimed),
+        };
+    }
     // 世代の照合。予約中のレコードは delete が拒否するため、予約の後にここで照合すれば、準備の後・予約の前に同じ ID が
     // 削除・再作成された場合を漏れなく拒否できる。launch 時に `store.get` を入口スレッドで行うと期限の保護から外れる
     // ため、作業スレッドで済ませる（CORE-2・CORE-3・SEC-1・REPAIR-5）。
@@ -2154,6 +2235,11 @@ mod linux {
         pasta_target: Option<(ContainerId, PathBuf)>,
         /// 単一スレッドの区間で積む pasta まわりの構造化ログ(`flush_deferred_logs` が報告の後に出す。#1940)。
         pasta_logs: Arc<crate::pasta_attach::PastaLogBuffer>,
+        /// host モードのとき、起動オプションを受けた時点(start の入口の単一スレッド区間)の supervisor の netns。
+        /// 手順 4b が作業スレッドの netns と照合する基準(#1873・NET-6・D8)。host 以外、または取得に失敗したら `None`。
+        netns_baseline: Option<fandhe_container_net::network_mode::host::NsId>,
+        /// 手順 4b で `@container-etc/<id>` を作ったか(`release_network` が消す対象の有無)。
+        etc_created: Option<ContainerId>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2271,6 +2357,8 @@ mod linux {
                 options_generation: None,
                 pasta_target: None,
                 pasta_logs: Arc::new(crate::pasta_attach::PastaLogBuffer::new()),
+                netns_baseline: None,
+                etc_created: None,
             }
         }
 
@@ -2322,6 +2410,13 @@ mod linux {
         /// CLI からの受け渡しは状態ルート配下の 0600 の文書(`run_main` が手順 2c で読む。#2713)。
         #[must_use]
         pub fn with_container_options(mut self, options: ContainerOptions) -> Self {
+            // host モードの基準は、単一スレッドの入口(本関数の呼び出し元)で自分の netns を取る(D8)。
+            self.netns_baseline = matches!(
+                options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Host)
+            )
+            .then(fandhe_container_net::network_mode::host::current_thread_netns)
+            .and_then(Result::ok);
             self.container_options = options;
             self
         }
@@ -2694,6 +2789,47 @@ mod linux {
                     .build()?,
             );
             recover_interrupted_start(store, &launcher, id, timeouts).map(drop)
+        }
+
+        fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
+            use crate::container_options::network::NetworkSelection;
+            let network = self.container_options.network();
+            // 文書に network が無い(従来のコンテナ・plugin-cri)なら何もしない。
+            let Some(selection) = network.selection() else {
+                return Ok(());
+            };
+            if matches!(selection, NetworkSelection::Host) {
+                // 作業スレッドが start の入口の netns と同じであることを確かめる(多重防御。fail-closed)。
+                let baseline = self.netns_baseline.ok_or_else(|| {
+                    TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "the host network namespace baseline is unavailable",
+                    )
+                })?;
+                fandhe_container_net::network_mode::host::HostNetns::detect(baseline)
+                    .map_err(|e| crate::container_options::network::net_error_to_trait(&e))?;
+            }
+            let selection =
+                crate::container_options::etc_files::prepare_etc_files(&self.root, id, network)?;
+            if !selection.is_empty() {
+                self.etc_created = Some(id.clone());
+            }
+            Ok(())
+        }
+
+        fn release_network(&mut self) -> Result<(), TraitError> {
+            let Some(id) = self.etc_created.take() else {
+                return Ok(());
+            };
+            crate::container_options::etc_files::discard_etc_files(&self.root, &id)
+        }
+
+        fn network_log_mode(&self) -> Option<&'static str> {
+            matches!(
+                self.container_options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Host)
+            )
+            .then_some("host")
         }
 
         fn release_cgroup(&mut self) -> Result<(), TraitError> {
@@ -4192,6 +4328,21 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// NET-6・D8・REPAIR-4(#1873): host のときだけ固定の 1 行が改行付きでログへ入る。`None` は何も出さない。
+    #[test]
+    fn net6_log_network_mode_line_is_fixed() {
+        use crate::stderr_sink::StderrSink;
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert!(log_network_mode_to(&sink, Some("host")).is_some());
+        assert_eq!(log_network_mode_to(&sink, None), None);
+        sink.flush(Duration::from_secs(5));
+        assert_eq!(
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap(),
+            "{\"component\":\"supervisor\",\"event\":\"network_mode\",\"network_mode\":\"host\"}\n"
+        );
     }
 
     const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;

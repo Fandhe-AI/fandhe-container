@@ -75,6 +75,7 @@ use std::os::fd::AsFd as _;
 use std::time::{Duration, Instant};
 
 use crate::audit_log::{AuditSink, AuditedRejection};
+use crate::launch_isolation::RecordedMountIdentity;
 use crate::sys::{self, SysError};
 use crate::traits::ContainerId;
 use crate::traits::types::ErrorCode;
@@ -416,6 +417,106 @@ pub(super) fn read_pre_pivot_status_leaving_tail(
 ) -> Result<PrePivotStatus, PrePivotStatusError> {
     let (buf, end) = read_line_inner::<PRE_PIVOT_STATUS_MAX_BYTES>(status, timeout, true)?;
     PrePivotStatus::decode(buf.get(..end).unwrap_or(&[]))
+}
+
+/// 子側: Mount 由来のルールの launch 時の識別子のブロック（`L <n>` と `M ...` × n 行）を 1 回の `write_all` で書く。
+///
+/// `P` の直後・Landlock 段より前に書く（親は `P` の判定の後・listener を受け取る前にこれを読み切る）。パス・
+/// メッセージは運ばない（SEC-1・SEC-4・#3201）。書けなければ先へ進まない（親が識別子を得られないまま起動しない。fail-closed）。
+pub(super) fn report_mount_identities(
+    status: &std::fs::File,
+    entries: &[(usize, RecordedMountIdentity)],
+) -> Result<(), ExecError> {
+    let mut block = format!("L {}\n", entries.len());
+    for (rule, id) in entries {
+        block.push_str(&format!(
+            "M {} {} {} {} {}\n",
+            rule,
+            id.mnt_id(),
+            id.dev(),
+            id.ino(),
+            u8::from(id.read_only())
+        ));
+    }
+    (&*status)
+        .write_all(block.as_bytes())
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "report the mount identities"))
+}
+
+/// 先頭 0 の無い 10 進の `u64`（`"0"` は可）。符号・空白・空文字・桁あふれは `None`。
+fn parse_canonical_u64(token: &str) -> Option<u64> {
+    let bytes = token.as_bytes();
+    if bytes.is_empty()
+        || !bytes.iter().all(u8::is_ascii_digit)
+        || (bytes.len() > 1 && bytes[0] == b'0')
+    {
+        return None;
+    }
+    token.parse().ok()
+}
+
+/// 親側: 状態 pipe から [`report_mount_identities`] のブロックを期限つきで読み切って厳格に復号する
+/// （SEC-1・SEC-4・REPAIR-2・REPAIR-5・#3201）。
+///
+/// `expected` は親が fork の前に ruleset から計算した Mount 由来のルールの位置の列（昇順）。本数と各行のルール位置が
+/// これと完全一致することを要求する（確保の前に本数を検証する）。子は pivot 前段の後の untrusted なプロセスなので、
+/// 単一スペース区切り・フィールド数固定・先頭 0 なし・`u64` の範囲内・`mnt_id` 0 なし・`ro` は `0`/`1` だけを受け、
+/// 違反はすべて `Malformed`。1 バイトずつ LF まで読むため、後続の `E`/`R` 行を取り込まない。
+pub(super) fn read_mount_identity_block(
+    status: &std::fs::File,
+    expected: &[usize],
+    timeout: Duration,
+) -> Result<Vec<(usize, RecordedMountIdentity)>, PrePivotStatusError> {
+    let deadline = Instant::now() + timeout.min(READ_TIMEOUT_MAX);
+    let line = || -> Result<String, PrePivotStatusError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (buf, end) = read_line_inner::<PRE_PIVOT_STATUS_MAX_BYTES>(status, remaining, true)?;
+        let bytes = buf.get(..end).unwrap_or(&[]);
+        let text = std::str::from_utf8(bytes).map_err(|_| PrePivotStatusError::Malformed)?;
+        text.strip_suffix('\n')
+            .map(str::to_owned)
+            .ok_or(PrePivotStatusError::Malformed)
+    };
+    let header = line()?;
+    let count = header
+        .strip_prefix("L ")
+        .and_then(parse_canonical_u64)
+        .ok_or(PrePivotStatusError::Malformed)?;
+    if usize::try_from(count).ok() != Some(expected.len()) {
+        return Err(PrePivotStatusError::Malformed);
+    }
+    let mut out = Vec::with_capacity(expected.len());
+    for want in expected {
+        let text = line()?;
+        let fields: Vec<&str> = text.split(' ').collect();
+        let [tag, rule, mnt_id, dev, ino, ro] = fields.as_slice() else {
+            return Err(PrePivotStatusError::Malformed);
+        };
+        let bad = PrePivotStatusError::Malformed;
+        if *tag != "M" {
+            return Err(bad);
+        }
+        let rule = parse_canonical_u64(rule)
+            .and_then(|r| usize::try_from(r).ok())
+            .ok_or(bad)?;
+        if rule != *want {
+            return Err(bad);
+        }
+        let read_only = match *ro {
+            "0" => false,
+            "1" => true,
+            _ => return Err(bad),
+        };
+        let id = RecordedMountIdentity::new(
+            parse_canonical_u64(mnt_id).ok_or(bad)?,
+            parse_canonical_u64(dev).ok_or(bad)?,
+            parse_canonical_u64(ino).ok_or(bad)?,
+            read_only,
+        )
+        .map_err(|_| bad)?;
+        out.push((rule, id));
+    }
+    Ok(out)
 }
 
 /// pipe から LF 終端の 1 行を、全体で `timeout`・最大 `N` バイトの範囲で読む（REPAIR-5）。
@@ -1153,6 +1254,66 @@ mod tests {
         w.write_all(bytes).unwrap();
         drop(w);
         std::fs::File::from(std::os::fd::OwnedFd::from(r))
+    }
+
+    /// SEC-1・SEC-4・REPAIR-2・#3201: 識別子のブロックの符号化は具体値で固定され、復号で往復する。
+    #[test]
+    fn sec1_3201_mount_identity_block_roundtrips_with_exact_wire_form() {
+        let entries = vec![
+            (1, RecordedMountIdentity::new(11, 2, 3, false).unwrap()),
+            (3, RecordedMountIdentity::new(13, 4, 5, true).unwrap()),
+        ];
+        let (r, w) = std::io::pipe().unwrap();
+        let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+        report_mount_identities(&w, &entries).unwrap();
+        drop(w);
+        let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        let got = read_mount_identity_block(&r, &[1, 3], Duration::from_secs(5)).unwrap();
+        assert_eq!(got, entries);
+
+        let r = pipe_with(b"L 1\nM 7 11 2 3 1\n");
+        let got = read_mount_identity_block(&r, &[7], Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            got,
+            vec![(7, RecordedMountIdentity::new(11, 2, 3, true).unwrap())]
+        );
+        let r = pipe_with(b"L 0\n");
+        assert_eq!(
+            read_mount_identity_block(&r, &[], Duration::from_secs(5)).unwrap(),
+            Vec::new()
+        );
+    }
+
+    /// SEC-1・SEC-4・REPAIR-2・#3201: 本数・ルール位置・書式・ro の値の違反は `Malformed`、行の途中の EOF は
+    /// `Malformed` 以外の失敗になり、いずれも識別子を返さない(fail-closed)。
+    #[test]
+    fn sec1_3201_mount_identity_block_rejects_malformed_input() {
+        let cases: &[(&[u8], &[usize])] = &[
+            (b"L 2\nM 1 11 2 3 0\nM 3 13 4 5 1\n", &[1]),
+            (b"L 1\nM 2 11 2 3 0\n", &[1]),
+            (b"L 1\nM 1 11 2 3 2\n", &[1]),
+            (b"L 1\nM 1 011 2 3 0\n", &[1]),
+            (b"L 1\nM 1 0 2 3 0\n", &[1]),
+            (b"L 1\nM 1  11 2 3 0\n", &[1]),
+            (b"L 1\nM 1 11 2 3\n", &[1]),
+            (b"L 1\nX 1 11 2 3 0\n", &[1]),
+            (b"L 01\nM 1 11 2 3 0\n", &[1]),
+            (b"L 1\nM 1 99999999999999999999 2 3 0\n", &[1]),
+            (b"P\n", &[]),
+        ];
+        for (bytes, expected) in cases {
+            let r = pipe_with(bytes);
+            assert_eq!(
+                read_mount_identity_block(&r, expected, Duration::from_secs(5)),
+                Err(PrePivotStatusError::Malformed),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        let r = pipe_with(b"L 1\nM 1 11 2");
+        assert!(read_mount_identity_block(&r, &[1], Duration::from_secs(5)).is_err());
+        let r = pipe_with(b"");
+        assert!(read_mount_identity_block(&r, &[], Duration::from_secs(5)).is_err());
     }
 
     /// 段の一覧は全 variant を網羅する（`ErrorCode` は types.rs の試験）（足し忘れの検出。REPAIR-2）。

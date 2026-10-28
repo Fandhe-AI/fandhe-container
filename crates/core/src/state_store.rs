@@ -104,7 +104,7 @@ use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
     AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
     RecordedAuditCoverage, RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock,
-    RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
+    RecordedLandlockAudit, RecordedMountIdentity, RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -1930,6 +1930,34 @@ struct LandlockRuleDto {
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     index: Option<u64>,
+    /// launch 時のマウントの識別子（SEC-1・SEC-4・#3201）。Mount 由来のルール（`mount` / `tmpfs` / `implicit`）だけが
+    /// 持つ。キーが無ければ旧記録（exec は拒否する）。`null`・型違い・`root` の規則への付与・一部だけの付与は破損。
+    /// 1 規則あたり約 70〜90 バイト増えるため、識別子つきで `MAX_STATE_FILE_BYTES` に収まる現実的な規則数は
+    /// およそ数百本まで（超える構成は従来どおり書き込みが `InvalidArgument` で失敗し、launch も失敗する）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "mount_identity_object"
+    )]
+    mount: Option<MountIdentityDto>,
+}
+
+/// マウントの識別子（`mnt_id`・`dev`・`ino`・`read_only`）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MountIdentityDto {
+    mnt_id: u64,
+    dev: u64,
+    ino: u64,
+    read_only: bool,
+}
+
+/// `mount` のキーが在るとき object だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn mount_identity_object<'de, D>(d: D) -> Result<Option<MountIdentityDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    MountIdentityDto::deserialize(d).map(Some)
 }
 
 impl LaunchIsolationDto {
@@ -1950,6 +1978,12 @@ impl LaunchIsolationDto {
                     allowed: r.allowed(),
                     origin: origin.to_owned(),
                     index,
+                    mount: r.mount().map(|m| MountIdentityDto {
+                        mnt_id: m.mnt_id(),
+                        dev: m.dev(),
+                        ino: m.ino(),
+                        read_only: m.read_only(),
+                    }),
                 }
             })
             .collect();
@@ -2085,7 +2119,13 @@ impl LandlockRuleDto {
             ),
             _ => return Err(()),
         };
-        Ok(RecordedRule::new(target, self.allowed))
+        let rule = RecordedRule::new(target, self.allowed);
+        match self.mount {
+            Some(m) => Ok(rule.with_mount(
+                RecordedMountIdentity::new(m.mnt_id, m.dev, m.ino, m.read_only).map_err(|_| ())?,
+            )),
+            None => Ok(rule),
+        }
     }
 }
 
@@ -3673,6 +3713,55 @@ mod tests {
             v["id_mapping"] = bad;
             let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
             assert!(dto.into_record().is_err());
+        }
+    }
+
+    /// SEC-1・SEC-4・#3201: Mount 由来のルールの識別子が JSON の具体値で往復し、`mount` の無い旧記録は
+    /// `Absent` として読め、`null`・不正な値(`mnt_id` 0)は破損として拒否される。
+    #[test]
+    fn sec1_3201_state_mount_identity_roundtrip_and_legacy() {
+        use crate::launch_isolation::RecordedMountIdentities;
+        let legacy = iso(100);
+        assert_eq!(
+            legacy.landlock().mount_identities(),
+            RecordedMountIdentities::Absent
+        );
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&legacy)).unwrap();
+        assert!(v["landlock"]["rules"][1].get("mount").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().landlock().mount_identities(),
+            RecordedMountIdentities::Absent
+        );
+
+        let positions = legacy.landlock().mount_rule_positions();
+        let entries = positions
+            .iter()
+            .map(|i| {
+                (
+                    *i,
+                    RecordedMountIdentity::new(20 + *i as u64, 7, 8, *i == 1).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let full = legacy.with_mount_identities(entries).unwrap();
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&full)).unwrap();
+        assert_eq!(
+            v["landlock"]["rules"][1]["mount"],
+            serde_json::json!({"mnt_id": 21, "dev": 7, "ino": 8, "read_only": true})
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.into_record().unwrap(), full);
+
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({"mnt_id": 0, "dev": 7, "ino": 8, "read_only": false}),
+            serde_json::json!({"mnt_id": 1, "dev": 7, "ino": 8}),
+        ] {
+            let mut v = v.clone();
+            v["landlock"]["rules"][1]["mount"] = bad;
+            let parsed = serde_json::from_value::<LaunchIsolationDto>(v);
+            assert!(parsed.map_or(true, |d| d.into_record().is_err()));
         }
     }
 

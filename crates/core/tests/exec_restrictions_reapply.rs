@@ -12,6 +12,10 @@
 //! （`--child-root-mismatch`）で、参加後の `/` が rootfs でない場合の拒否（違反記録
 //! `exec_root_not_container_rootfs`。`NoNewPrivs`・`Seccomp` とも変化なし = 何も適用していない）を、カーネル
 //! 版数に依存せず具体値で照合する（SEC-1・SEC-4）。
+//! 加えて、launch が記録する Mount 由来のルールの識別子（`mnt_id`・`st_dev`・`st_ino`）を `MountCheck::Recorded` の経路へ渡し、
+//! 一致する記録の受理と、`mnt_id` が変わった記録（overmount 相当）の `landlock_mount_identity_mismatch` での拒否・
+//! 何も適用しないことを具体値で照合する（`--child-mount-identity-*`。SEC-1・SEC-4・CORE-5・#3201）。
+//! `state.json` との往復は state_store の単体試験 `sec1_3201_state_mount_identity_roundtrip_and_legacy` が担う。
 //! 「`setns` の後に保持 fd 経由でスレッド数を読める」「実コンテナへ参加した後の `/` が rootfs と一致する」
 //! 「capability 削減・rlimit 適用」の実機確認は supervisor の `tests/exec.rs`（TASK-163.4・#503）で行う。
 //! 本テストは非特権で動かすため、観測関数は capability 削減を省き、rlimit も変えない（空集合）。省いた 2 つは
@@ -54,8 +58,9 @@ fn main() {
 ))]
 fn main() {
     use fandhe_container_core::exec::{
-        IsolationStage, LandlockAccessKind as K, LandlockAccessProbe, UnappliedExecRestriction,
-        observe_exec_restriction_reapply,
+        IsolationStage, LandlockAccessKind as K, LandlockAccessProbe, ObservedMountRecording,
+        UnappliedExecRestriction, observe_exec_restriction_reapply,
+        observe_exec_restriction_reapply_recorded,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::ErrorCode;
@@ -299,6 +304,57 @@ fn main() {
         println!("exec_restrictions_reapply mismatch child: ok");
     }
 
+    /// マウントの識別子の照合（SEC-1・SEC-4・#3201）。launch が記録する識別子（適用の直前に開いた対象の実値）を
+    /// 本番の `MountCheck::Recorded` の経路へ渡す。`faithful` は一致して受理され（暗黙の `/dev`・`/dev/pts`・
+    /// `/dev/shm` の 3 件を照合）、`shifted` は `mnt_id` が変わった（overmount と同じ）として
+    /// `landlock_mount_identity_mismatch` で拒否し、何も適用しない。
+    fn run_child_mount_identity(dir: &Path, faithful: bool) {
+        let json = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true}}"#;
+        let config = parse_config_bytes(json).expect("valid config");
+        let probes = vec![probe(K::ReadDir, dir.to_path_buf())];
+        let recording = if faithful {
+            ObservedMountRecording::Faithful
+        } else {
+            ObservedMountRecording::MountIdShifted
+        };
+        let label = if faithful { "faithful" } else { "shifted" };
+        let o =
+            observe_exec_restriction_reapply_recorded(&config, Path::new("/"), &probes, recording)
+                .expect("observe");
+        if o.kcmp_before.is_some() {
+            exit_precondition(o.kcmp_before, &o.seccomp_before);
+        }
+        if let Some(e) = &o.prepare_error {
+            assert_eq!(e.stage, IsolationStage::Landlock);
+            println!(
+                "exec_restrictions_reapply mount-identity {label} child: detect-refused ({})",
+                e.message
+            );
+            return;
+        }
+        if faithful {
+            assert!(o.reapply_error.is_none(), "{:?}", o.reapply_error);
+            let report = o.report.expect("report");
+            // root・`/dev`・`/dev/pts`・`/dev/shm` の 4 ルールのうち、Mount 由来の 3 件の識別子が一致した。
+            assert_eq!(report.landlock_rules(), 4, "{report:?}");
+            assert_eq!(o.seccomp_after, "2");
+            assert_eq!(o.no_new_privs_after, "1");
+            println!("exec_restrictions_reapply mount-identity faithful child: ok");
+        } else {
+            let e = o.reapply_error.as_ref().expect("must be refused");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::Landlock);
+            let v = e.violation.as_ref().expect("violation recorded");
+            assert_eq!(v.reason.as_str(), "landlock_mount_identity_mismatch");
+            assert_eq!(v.behavior_id, "CORE-5");
+            assert!(o.report.is_none());
+            // 拒否は Landlock の適用前（restrict_self の前）: seccomp は載っていない。
+            assert_eq!(o.seccomp_after, "0");
+            assert!(o.results.is_empty(), "probes must not run");
+            println!("exec_restrictions_reapply mount-identity shifted child: ok");
+        }
+    }
+
     /// 子（テストバイナリ自身の再実行）を `mode` で起動し、タイムアウト付きで待って標準出力を返す。
     fn spawn_and_wait(exe: &Path, mode: &str, dir: &Path) -> String {
         let mut child = Command::new(exe)
@@ -369,6 +425,14 @@ fn main() {
         run_child_root_mismatch(&probe_dir());
         return;
     }
+    if args.iter().any(|a| a == "--child-mount-identity-faithful") {
+        run_child_mount_identity(&probe_dir(), true);
+        return;
+    }
+    if args.iter().any(|a| a == "--child-mount-identity-shifted") {
+        run_child_mount_identity(&probe_dir(), false);
+        return;
+    }
     if args.iter().any(|a| a == "--child") {
         run_child(&probe_dir());
         return;
@@ -387,7 +451,17 @@ fn main() {
     }
     let stdout = spawn_and_wait(&exe, "--child", &dir);
     let mismatch = spawn_and_wait(&exe, "--child-root-mismatch", &dir);
+    let faithful = spawn_and_wait(&exe, "--child-mount-identity-faithful", &dir);
+    let shifted = spawn_and_wait(&exe, "--child-mount-identity-shifted", &dir);
     let _ = std::fs::remove_dir_all(&dir);
+    let faithful_full =
+        faithful.contains("exec_restrictions_reapply mount-identity faithful child: ok");
+    let shifted_full =
+        shifted.contains("exec_restrictions_reapply mount-identity shifted child: ok");
+    let identity_refused = faithful
+        .contains("exec_restrictions_reapply mount-identity faithful child: detect-refused")
+        && shifted
+            .contains("exec_restrictions_reapply mount-identity shifted child: detect-refused");
     let full = stdout.contains("exec_restrictions_reapply child: ok");
     let refused = stdout.contains("exec_restrictions_reapply child: detect-refused");
     let mismatch_full = mismatch.contains("exec_restrictions_reapply mismatch child: ok");
@@ -402,7 +476,15 @@ fn main() {
             mismatch_full,
             "mismatch child did not fully verify on this host: {mismatch}"
         );
+        assert!(
+            faithful_full && shifted_full,
+            "mount-identity children did not fully verify: {faithful}\n{shifted}"
+        );
     } else {
+        assert!(
+            (faithful_full && shifted_full) || identity_refused,
+            "mount-identity children printed no result: {faithful}\n{shifted}"
+        );
         assert!(full || refused, "child printed no result: {stdout}");
         assert!(
             mismatch_full || mismatch_refused,
@@ -413,5 +495,7 @@ fn main() {
     }
     println!("{}", stdout.trim());
     println!("{}", mismatch.trim());
+    println!("{}", faithful.trim());
+    println!("{}", shifted.trim());
     println!("exec_restrictions_reapply: ok");
 }

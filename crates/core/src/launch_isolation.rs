@@ -19,9 +19,12 @@
 //!   `state.json` から読み戻した値も同じ関数で組み直す（untrusted。破損は呼び出し側が `Internal` にする）
 //! - ルールの対象は [`RecordedTarget`] で、パスと由来が食い違う値を表現できない（REPAIR-2）
 //! - [`Debug`](std::fmt::Debug) はルールの件数だけを出し、パス・識別子の値を載せない
-//! - ルールの対象ごとの `(st_dev, st_ino)` は記録しない（launch の子から親へ状態 pipe が要るため。未実装）。
-//!   「同じ対象」は、照合済みの `/` の fd を起点に記録したパスを `O_NOFOLLOW` で 1 要素ずつ辿ることと、
-//!   対象がすべてマウントポイント（`CAP_SYS_ADMIN` が無いと動かせない）であることで担保する
+//! - Mount 由来のルール（暗黙の `/dev` 系・bind・利用者 tmpfs）の対象ごとの識別子（[`RecordedMountIdentity`]。
+//!   `mnt_id`・`st_dev`・`st_ino`・`read_only`）は、launch の子が pivot 前段の直後に状態 pipe で親へ返し、
+//!   launcher が [`RecordedLandlock::with_mount_identities`] で添える（SEC-1・SEC-4・#3201）。exec の再適用は
+//!   これと適用時の観測を照合し、重ねられたマウントを検出する。識別子の無い旧記録
+//!   （[`RecordedMountIdentities::Absent`]）の exec は拒否する（fail-closed）。記録は「全 Mount 由来のルールに
+//!   あるか、全く無いか」のどちらかしか表現できない（REPAIR-2）
 //!
 //! # 書き込みの経路と残る範囲（REPAIR-3）
 //!
@@ -140,17 +143,109 @@ impl RecordedTarget {
     }
 }
 
+impl RecordedTarget {
+    /// ランタイムが載せたマウント由来の対象か（`Root` 以外すべて。識別子の記録の対象）。
+    pub fn is_mount_origin(&self) -> bool {
+        !matches!(self, Self::Root)
+    }
+}
+
+/// Mount 由来のルールの対象の launch 時の識別子（SEC-1・SEC-4・#3201）。
+///
+/// launch の子が各段の成功直後に採った `mnt_id`・`(st_dev, st_ino)` と、マウントが読み取り専用か。
+/// exec の再適用が適用時の観測と照合する。構築は [`Self::new`] だけ（`mnt_id` 0 は無効）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RecordedMountIdentity {
+    mnt_id: u64,
+    dev: u64,
+    ino: u64,
+    read_only: bool,
+}
+
+impl RecordedMountIdentity {
+    /// 値から作る。`mnt_id` は 0 を拒否する（カーネルは 0 を割り当てない）。
+    pub fn new(
+        mnt_id: u64,
+        dev: u64,
+        ino: u64,
+        read_only: bool,
+    ) -> Result<Self, LaunchIsolationError> {
+        if mnt_id == 0 {
+            return Err(LaunchIsolationError("mount identity has a zero mount id"));
+        }
+        Ok(Self {
+            mnt_id,
+            dev,
+            ino,
+            read_only,
+        })
+    }
+
+    /// マウント ID。
+    pub fn mnt_id(&self) -> u64 {
+        self.mnt_id
+    }
+
+    /// ルートの `st_dev`。
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    /// ルートの `st_ino`。
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// 読み取り専用のマウントか。
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+impl fmt::Debug for RecordedMountIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecordedMountIdentity(..)")
+    }
+}
+
+/// [`RecordedLandlock`] が持つマウントの識別子の状態（全部あるか、全く無いか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedMountIdentities {
+    /// 識別子が無い（このフィールドが入る前の `state.json`）。Mount 由来のルールがあれば exec は拒否する。
+    Absent,
+    /// Mount 由来の全ルールに識別子がある（Mount 由来のルールが 0 件の記録も含む）。
+    Complete,
+}
+
 /// 記録した Landlock ルール 1 件。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedRule {
     target: RecordedTarget,
     allowed: u64,
+    mount: Option<RecordedMountIdentity>,
 }
 
 impl RecordedRule {
     /// 対象と許可する権利のビット値から作る（範囲の検証は [`RecordedLandlock::new`]）。
     pub fn new(target: RecordedTarget, allowed: u64) -> Self {
-        Self { target, allowed }
+        Self {
+            target,
+            allowed,
+            mount: None,
+        }
+    }
+
+    /// マウントの識別子を添える（`state.json` の読み戻し用。全体の整合は [`RecordedLandlock::new`] が検証する）。
+    #[must_use]
+    pub fn with_mount(mut self, mount: RecordedMountIdentity) -> Self {
+        self.mount = Some(mount);
+        self
+    }
+
+    /// launch 時のマウントの識別子（旧記録は `None`）。
+    pub fn mount(&self) -> Option<&RecordedMountIdentity> {
+        self.mount.as_ref()
     }
 
     /// 対象。
@@ -217,7 +312,8 @@ impl RecordedLandlock {
     /// 検証して作る。
     ///
     /// 拒否: ルールが空・[`MAX_RECORDED_RULES`] 超過 / `handled` が空・既知のビット外 / `allowed` が `handled` の
-    /// 外 / 先頭が rootfs でない・rootfs が重複 / 同じパスの重複 / マウント位置が `mounts` の上限以上。
+    /// 外 / 先頭が rootfs でない・rootfs が重複 / 同じパスの重複 / マウント位置が `mounts` の上限以上 /
+    /// rootfs に識別子がある・Mount 由来のルールの一部だけに識別子がある（全部か全く無いかのどちらか。#3201）。
     pub fn new(handled: u64, rules: Vec<RecordedRule>) -> Result<Self, LaunchIsolationError> {
         let err = LaunchIsolationError;
         if rules.is_empty() || rules.len() > MAX_RECORDED_RULES {
@@ -243,6 +339,20 @@ impl RecordedLandlock {
                 return Err(err("landlock rules contain a duplicated path"));
             }
         }
+        if rules
+            .iter()
+            .any(|r| !r.target.is_mount_origin() && r.mount.is_some())
+        {
+            return Err(err("landlock root rule must not carry a mount identity"));
+        }
+        let with = rules
+            .iter()
+            .filter(|r| r.target.is_mount_origin() && r.mount.is_some())
+            .count();
+        let total = rules.iter().filter(|r| r.target.is_mount_origin()).count();
+        if with != 0 && with != total {
+            return Err(err("landlock mount identities are partially recorded"));
+        }
         Ok(Self {
             handled,
             rules,
@@ -267,6 +377,52 @@ impl RecordedLandlock {
     /// カーネル監査の要求の記録。
     pub fn audit(&self) -> RecordedLandlockAudit {
         self.audit
+    }
+
+    /// Mount 由来のルールの位置（`rules()` 内の添字）を昇順で返す（識別子の報告・期待列の共通の定義。#3201）。
+    pub fn mount_rule_positions(&self) -> Vec<usize> {
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.target.is_mount_origin())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Mount 由来のルールへ launch 時の識別子を添える（SEC-1・SEC-4・#3201）。
+    ///
+    /// `entries` は `(rules() 内の位置, 識別子)` で、位置は昇順・重複なし・Mount 由来のルールだけ、かつ
+    /// Mount 由来の全ルールを過不足なく覆うこと（Mount 由来が 0 件なら空）。満たさなければ拒否する。
+    pub fn with_mount_identities(
+        mut self,
+        entries: Vec<(usize, RecordedMountIdentity)>,
+    ) -> Result<Self, LaunchIsolationError> {
+        let err = LaunchIsolationError;
+        let expected = self.mount_rule_positions();
+        if entries.len() != expected.len()
+            || entries.iter().map(|(i, _)| *i).ne(expected.iter().copied())
+        {
+            return Err(err(
+                "landlock mount identities do not cover the mount rules exactly",
+            ));
+        }
+        for (i, id) in entries {
+            if let Some(r) = self.rules.get_mut(i) {
+                r.mount = Some(id);
+            }
+        }
+        Ok(self)
+    }
+
+    /// マウントの識別子の状態（全部あるか、全く無いか）。
+    pub fn mount_identities(&self) -> RecordedMountIdentities {
+        let mut it = self.rules.iter().filter(|r| r.target.is_mount_origin());
+        match it.next() {
+            Some(first) if first.mount.is_some() => RecordedMountIdentities::Complete,
+            Some(_) => RecordedMountIdentities::Absent,
+            // Mount 由来のルールが無ければ照合する対象が無い（exec は拒否しない）。
+            None => RecordedMountIdentities::Complete,
+        }
     }
 
     /// handled access のビット値。
@@ -606,6 +762,16 @@ impl LaunchIsolationRecord {
     pub fn landlock(&self) -> &RecordedLandlock {
         &self.landlock
     }
+
+    /// launch の子が返した Mount 由来のルールの識別子を添える（SEC-1・SEC-4・#3201。検証は
+    /// [`RecordedLandlock::with_mount_identities`]）。起動後（PID 1 が識別子を返した後）に launcher が呼ぶ。
+    pub fn with_mount_identities(
+        mut self,
+        entries: Vec<(usize, RecordedMountIdentity)>,
+    ) -> Result<Self, LaunchIsolationError> {
+        self.landlock = self.landlock.with_mount_identities(entries)?;
+        Ok(self)
+    }
 }
 
 impl fmt::Debug for LaunchIsolationRecord {
@@ -767,6 +933,48 @@ mod tests {
             },
             allowed,
         )
+    }
+
+    /// SEC-1・SEC-4・#3201: 識別子は Mount 由来のルールを過不足なく覆うときだけ添えられ、添える前は `Absent`、
+    /// 添えた後は `Complete` になる。位置の不足・過剰・非 Mount 由来への添付は拒否する。
+    #[test]
+    fn sec1_3201_with_mount_identities_requires_exact_cover() {
+        let id = |n: u64| RecordedMountIdentity::new(n, 2, 3, false).unwrap();
+        let base = || {
+            RecordedLandlock::new(
+                0xFFFF,
+                vec![
+                    root_rule(0x7),
+                    mount_rule("/a", 0, 0x7),
+                    mount_rule("/b", 1, 0x7),
+                ],
+            )
+            .unwrap()
+        };
+        assert_eq!(base().mount_rule_positions(), vec![1, 2]);
+        assert_eq!(base().mount_identities(), RecordedMountIdentities::Absent);
+        assert!(base().with_mount_identities(vec![(1, id(10))]).is_err());
+        assert!(
+            base()
+                .with_mount_identities(vec![(0, id(9)), (1, id(10)), (2, id(11))])
+                .is_err()
+        );
+        assert!(
+            base()
+                .with_mount_identities(vec![(2, id(11)), (1, id(10))])
+                .is_err()
+        );
+        let done = base()
+            .with_mount_identities(vec![(1, id(10)), (2, id(11))])
+            .unwrap();
+        assert_eq!(done.mount_identities(), RecordedMountIdentities::Complete);
+        // Mount 由来のルールが無い記録は、空の識別子で `Complete`(照合する対象が無い)。
+        let root_only = RecordedLandlock::new(0xFFFF, vec![root_rule(0x7)]).unwrap();
+        assert_eq!(
+            root_only.mount_identities(),
+            RecordedMountIdentities::Complete
+        );
+        assert!(root_only.with_mount_identities(Vec::new()).is_ok());
     }
 
     /// SEC-4・REPAIR-4・#2468: 記録失敗は縮退を評価済みの記録にだけ付けられる。

@@ -129,6 +129,30 @@ pub(crate) fn read_fd_mnt_id(fd: std::os::fd::BorrowedFd<'_>) -> Result<u64, Fdi
     parse_fdinfo_mnt_id(&read_fdinfo_bounded(file)?)
 }
 
+/// [`read_fd_mnt_id`] の、保持した自プロセスの procfs ディレクトリ `proc_dir`（`/proc/<自分の pid>` を `setns` の前に
+/// 開いた fd）起点版（SEC-1・SEC-4・#3201）。
+///
+/// exec の再適用の worker は `setns(CLONE_NEWNS)` の後、コンテナの procfs が見えるが、その PID namespace に居ないため
+/// `/proc/thread-self` が解決できない。そこで `setns` の前に開いて procfs と確かめた `proc_dir` から `fdinfo/<N>` を
+/// 相対で開く（パスの再解決をしない）。解析は [`parse_fdinfo_mnt_id`] を唯一の実装として共有する。
+#[cfg(target_os = "linux")]
+pub(crate) fn read_fd_mnt_id_at(
+    proc_dir: std::os::fd::BorrowedFd<'_>,
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> Result<u64, FdinfoMountIdError> {
+    use std::os::fd::AsRawFd as _;
+    let name = std::ffi::CString::new(format!("fdinfo/{}", fd.as_raw_fd())).map_err(|_| {
+        FdinfoMountIdError::Read(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    })?;
+    let opened = crate::sys::open_read_at(proc_dir, &name).map_err(|e| {
+        FdinfoMountIdError::Read(match e {
+            crate::sys::SysError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+            _ => std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    })?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(std::fs::File::from(opened))?)
+}
+
 /// `path` を `O_PATH` で開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
 /// `O_PATH` はブロックしないため、検査と open の間に FIFO 等へ差し替えられても停止しない（REPAIR-5）。
 /// 種別は開いた同じ fd の `fstat` で見て、ディレクトリと通常ファイル以外は `None`（適用の段が種別で拒否する）。

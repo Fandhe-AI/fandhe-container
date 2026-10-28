@@ -213,7 +213,7 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   `fandhe_container_supervisor::logs::reclaim_stale_container_logs` で、CLI（`reclaim_stale_container_log`）と plugin-cri
   （`CoreLifecycleRuntime::reclaim_before_create`）が共有する。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。
   best effort で create の成否は変えない（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる。CRI 層は `state` が `NotFound` であることを確かめて資源を解放する）。観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
-- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）
+- 上記で回収できない残り（生きている sink が続く・状態がある ID・帰属できない名前）は手動で消す（`docs/setup/container-log-recovery.md`）。supervisor ログは自動回収の対象外で、同じ手順書の「supervisor ログ」の節に従う（#3034）
 
 ## supervisor ログ側の待ち（#2892・SUP-7・CLI-1・REPAIR-5）
 
@@ -232,7 +232,8 @@ CLI の delete の起動オプション文書の警告、plugin-cri の `contain
   上の 20 秒の予算の記述と試験が崩れる
 - 失敗の扱い: 待ち切れなければ `Kept { FailedPrecondition }` と、コンテナログと同じ語彙の `reason: "sink_open_after_wait"` つきの警告
 - 待ちを超えて残った supervisor ログは、次の同じ ID の start で世代として回る（CRI は ID を使い回さないため、実質は手動の回収。
-  `docs/setup/container-log-recovery.md` はコンテナログが対象で supervisor ログは含まない。残余。REPAIR-3）
+  起動時の走査は `@container-logs` だけが対象で supervisor ログは回収されない。見分け方と手順は
+  `docs/setup/container-log-recovery.md` の「supervisor ログ」の節に追加済み〔#3034〕。自動回収は足していない）
 
 ## plugin-cri の `RemoveContainer` の supervisor ログ側の待ち（#2964・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 
@@ -283,7 +284,7 @@ plugin-cri は `create_with_image` を使わず状態レコードに `image_root
 - 後始末の各段（supervisor ログ・コンテナログ・起動オプション文書）は、いまの上限と期限までの残りの小さい方で試す。ロックの待ちと 1 回の試行の
   和が残りを超えないようにし、残りが小さいときは半分ずつ渡す（試行の期限は上限であり通常は短時間で終わるため、残りを全部渡すと待ちが消える）
 - 残りが 0 の段は試さず、`Kept { code: Timeout }`（起動オプション文書は警告行と記録器の Failure）として残す。消さずに残す側に倒し、
-  起動時の走査と手順書（`docs/setup/container-log-recovery.md`）で回収できる。新しい `reason` の語彙は足さない
+  起動時の走査（コンテナログのみ）と手順書（`docs/setup/container-log-recovery.md`。supervisor ログは手順書のみ）で回収できる。新しい `reason` の語彙は足さない
 - 全体の最悪は max(42, 47) = 47 秒で、`PLUGIN_RUNTIME_TIMEOUT` との余裕 13.9 秒は I/O の時間と、stop の中の状態ロックの待ち（下の残余）に充てる
 - 通常（後始末の前が 17 秒以下）は後始末に 30 秒以上残るため、挙動は変わらない
 - 照合: `repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout`（42・47・72 秒の具体値）・

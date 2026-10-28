@@ -12,8 +12,10 @@
 //!
 //! - macOS には `O_PATH` が無い。ディレクトリは `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` で開くため、
 //!   読み取り権限の無い祖先は `Io` で拒否される（Linux は検索権限だけで通る）
-//! - 種別の事前プローブが無いため、ファイルは `O_NONBLOCK|O_NOCTTY` で 1 回だけ開き、その fd を
-//!   そのまま保持 fd にする（開き直さない）。FIFO で止まらないが、デバイスノードは拒否する前に開く
+//! - `fstatat`（`plugin_fs::lstat_at`・`stat_follow_at`）で開く前に種別を確かめ、通常ファイル・symlink 以外
+//!   （デバイス・FIFO・ソケット・ディレクトリ）は open せずに拒否する（#3096・SEC-1）。通常ファイルは
+//!   `O_NONBLOCK|O_NOCTTY` で 1 回だけ開き、その fd をそのまま保持 fd にする（開き直さない）。open 後の fd の
+//!   種別と dev/ino を probe と照合し、probe と open の間の差し替えは `Io` で拒否する
 //! - 実体の正規パスは `/proc` ではなく保持 fd への `F_GETPATH` で得る
 //! - symlink のホップ上限は `MAXSYMLINKS`（32）。超過は `ELOOP` を `SymlinkLoop` に写す
 //! - 拡張 ACL（`acl_get_fd_np`）が付いたディレクトリ・ファイルは、中身を解釈せず
@@ -22,12 +24,15 @@
 //!
 //! # 契約
 //!
+//! - 順序は probe（`fstatat`）→ open → fstat での照合。probe は拒否の前倒しにすぎず、所有者・モード・ACL の
+//!   判定は open 後の保持 fd だけで行う。同じ UID / root が検証済みディレクトリ内で probe と open の間に
+//!   差し替える窓は残る（脅威の外）が、その場合も open 後の照合で検出して拒否する
 //! - 判定の起点は `/` から symlink を辿らずに fd 相対で開いた fd 連鎖で、パスを stat し直さない
 //! - 最終要素が symlink のときは、カーネルに 1 回だけ辿らせた fd を保持 fd とし、`F_GETPATH` で得た
 //!   実体の親を `/` から同一基準で検証して、検証済み親の下の dev/ino が保持 fd と一致することを確かめる
 
 use super::*;
-use crate::sys::plugin_fs::{self, ELOOP, ENOTDIR};
+use crate::sys::plugin_fs::{self, ELOOP, ENOTDIR, EntryKind};
 use crate::sys::{self, SysError};
 use std::ffi::CString;
 use std::fs::Metadata;
@@ -67,6 +72,16 @@ pub(super) fn map_sys(e: SysError, dir_open: bool) -> PluginTrustErrorKind {
                 PluginTrustErrorKind::NotRegularFile
             }
         }
+        SysError::Os(_) => PluginTrustErrorKind::Io,
+    }
+}
+
+/// probe（`fstatat`）で通常ファイルと確かめた後の非追従 open の errno 写像。`ELOOP`（probe 後の symlink への
+/// 差し替え）を含め、種別の食い違いはすべて `Io` で拒否する（fail-closed。#3096）。
+pub(super) fn map_sys_open_after_probe(e: SysError) -> PluginTrustErrorKind {
+    match e {
+        SysError::Unsupported => PluginTrustErrorKind::Unsupported,
+        SysError::InvalidInput => PluginTrustErrorKind::InvalidPath,
         SysError::Os(_) => PluginTrustErrorKind::Io,
     }
 }
@@ -202,15 +217,24 @@ impl VerifiedPluginDir {
         }
         let c = CString::new(file_name.as_bytes())
             .map_err(|_| err(PluginTrustErrorKind::InvalidPath))?;
-        // 1 回の非追従 open。最終要素が symlink なら ELOOP で、実体の検証へ進む。
-        let rfd = match plugin_fs::open_read_nonblock_nofollow_at(self.fd.as_fd(), &c) {
-            Ok(fd) => fd,
-            Err(SysError::Os(n)) if n == ELOOP => return self.verify_symlink(&c, path),
-            Err(e) => return Err(err(map_sys(e, false))),
-        };
+        // open の前に種別を確かめる（デバイス・FIFO・ソケットを開かない。#3096）。symlink は実体の検証へ進む。
+        let pre = plugin_fs::lstat_at(self.fd.as_fd(), &c).map_err(|e| err(map_sys(e, false)))?;
+        match pre.kind() {
+            EntryKind::Regular => {}
+            EntryKind::Symlink => return self.verify_symlink(&c, path),
+            EntryKind::Directory | EntryKind::Other => {
+                return Err(err(PluginTrustErrorKind::NotRegularFile));
+            }
+        }
+        // probe 後に symlink へ差し替えられた場合の ELOOP も、symlink 経路へ切り替えず `Io` で拒否する。
+        let rfd = plugin_fs::open_read_nonblock_nofollow_at(self.fd.as_fd(), &c)
+            .map_err(|e| err(map_sys_open_after_probe(e)))?;
         let md = fstat(&rfd).map_err(|_| err(PluginTrustErrorKind::Io))?;
         if !md.is_file() {
             return Err(err(PluginTrustErrorKind::NotRegularFile));
+        }
+        if (md.dev(), md.ino()) != (pre.dev(), pre.ino()) {
+            return Err(err(PluginTrustErrorKind::Io));
         }
         check_owner_and_mode(md.uid(), md.mode(), sys::effective_uid()).map_err(err)?;
         check_acl(&rfd).map_err(err)?;
@@ -232,12 +256,21 @@ impl VerifiedPluginDir {
         path: PathBuf,
     ) -> Result<VerifiedPluginFile, PluginTrustError> {
         let err = |k| PluginTrustError::new(k, TrustTarget::File, &path);
+        // (0) 追従 open の前に、辿った先の種別を確かめる（symlink 経由のデバイス・FIFO・ソケットを開かない。#3096）。
+        let pre =
+            plugin_fs::stat_follow_at(self.fd.as_fd(), name).map_err(|e| err(map_sys_follow(e)))?;
+        if pre.kind() != EntryKind::Regular {
+            return Err(err(PluginTrustErrorKind::NotRegularFile));
+        }
         // (1) 追従 open で実体を一度だけ解決する。得た fd がそのまま保持 fd になる。
         let rfd = plugin_fs::open_read_nonblock_follow_at(self.fd.as_fd(), name)
             .map_err(|e| err(map_sys_follow(e)))?;
         let md = fstat(&rfd).map_err(|_| err(PluginTrustErrorKind::Io))?;
         if !md.is_file() {
             return Err(err(PluginTrustErrorKind::NotRegularFile));
+        }
+        if (md.dev(), md.ino()) != (pre.dev(), pre.ino()) {
+            return Err(err(PluginTrustErrorKind::Io));
         }
         // (2) 判定は実体 inode に対して行う（symlink 自体の属性は使わない）。
         check_owner_and_mode(md.uid(), md.mode(), sys::effective_uid()).map_err(err)?;
@@ -258,13 +291,13 @@ impl VerifiedPluginDir {
         let anchor: Option<&Path> = None;
         let real_dir = walk_verify(real_parent, anchor)?;
         // (5) 検証済み親の下の実体が保持 fd と同一 inode であることを確かめる（保持 fd が検証済みの
-        // 祖先連鎖の下にある証明）。この fd は fstat のみに使い、引き渡さない。
+        // 祖先連鎖の下にある証明）。open せず `fstatat` だけで照合する（この位置でもデバイスを開かない）。
         let real_c = CString::new(real_name.as_bytes())
             .map_err(|_| err(PluginTrustErrorKind::InvalidPath))?;
-        let bound = plugin_fs::open_read_nonblock_nofollow_at(real_dir.fd.as_fd(), &real_c)
+        let bound = plugin_fs::lstat_at(real_dir.fd.as_fd(), &real_c)
             .map_err(|_| err(PluginTrustErrorKind::Io))?;
-        let bound_md = fstat(&bound).map_err(|_| err(PluginTrustErrorKind::Io))?;
-        if bound_md.dev() != md.dev() || bound_md.ino() != md.ino() {
+        if bound.kind() != EntryKind::Regular || bound.dev() != md.dev() || bound.ino() != md.ino()
+        {
             return Err(err(PluginTrustErrorKind::Io));
         }
         Ok(VerifiedPluginFile {

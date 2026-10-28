@@ -979,8 +979,7 @@ cmp_has_prefix "B31 changed state is MISMATCH" 'B31 MISMATCH'
 # 受理 / 拒否: p / q は state 形か <start-failed> だけ
 sed "s/^B31${tab}B${tab}0${tab}-${tab}.*/B31${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/k3.txt"
 compare k3 k3
-cmp_not_rc2() { if [ "$1" -eq 2 ]; then fail "$2"; else pass "$2"; fi; }
-cmp_not_rc2 $? "<start-failed> on B31 (state after start) is accepted"
+expect_rc "<start-failed> on B31 (state after start) is accepted (rc 1, not input error 2)" 1 $?
 sed "s/^B26${tab}B${tab}0${tab}-${tab}.*/B26${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/k4.txt"
 compare k4 k4
 expect_rc "<start-failed> on B26 (state of created) is rejected" 2 $?

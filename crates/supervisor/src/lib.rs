@@ -79,6 +79,8 @@ pub mod launcher;
 pub mod launcher_probe;
 pub mod log_pipeline;
 pub mod logs;
+#[cfg(target_os = "linux")]
+pub mod netns_holder;
 pub mod privilege;
 pub mod restart;
 pub mod run;

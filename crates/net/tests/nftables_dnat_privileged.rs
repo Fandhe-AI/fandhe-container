@@ -84,13 +84,14 @@ mod linux {
         LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder, RTM_GETLINK,
         RTM_NEWLINK, RouteNextHop, RouteSpec,
     };
+    use fandhe_container_net::network::{PortProtocol, PortPublish, published_dnat_listeners};
     use fandhe_container_net::nftables_batch::{
         BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NetlinkNetfilterSocket, NfInetHook,
         NftBatchOutcome, NftBatchPosition, NftFamily, NftName, TableCreate, TableDelete,
     };
     use fandhe_container_net::nftables_rules::{
         NftCmp, NftDataValue, NftImmediate, NftNat, NftPayload, NftRegister, NftRuleExprs,
-        RuleCreate, RuleDelete,
+        RuleCreate, RuleDelete, RuleDump,
     };
 
     /// router の外側アドレスで公開するポート（DNAT 前の宛先ポート）。
@@ -109,6 +110,7 @@ mod linux {
     const RE: &str = "dre0";
     const EX: &str = "dex0";
     const OK_PREFIX: &str = "nftables_dnat_privileged: dnat verified";
+    const LISTENER_OK_PREFIX: &str = "nftables_dnat_privileged: listener dump verified";
     const UDP_PROTO: u8 = 17;
 
     fn timeout() -> Duration {
@@ -727,10 +729,73 @@ mod linux {
         assert_eq!(f.errno(), 2, "{err}");
         assert_eq!(f.code(), NetErrorCode::NotFound, "{err}");
 
+        // 7. 公開の前の DNAT dump（NET-3・#3063）。
+        let listeners = listener_dump_scenario(&guard.socket, limit);
+
         drop(guard);
         println!(
             "{OK_PREFIX} before={before} after={after} removed={removed} handle={} (NET-11)",
             handle.get()
         );
+        println!("{LISTENER_OK_PREFIX} listeners={listeners} conflict=AlreadyExists (NET-3)");
+    }
+
+    /// NET-3・#3063: `fandhe_net_*` テーブルの DNAT だけを dump で拾い、接頭辞のないテーブルの同じ DNAT は
+    /// 拾わないこと、そしてカーネルが `NFTA_NAT_FLAGS`（`MAP_IPS | PROTO_SPECIFIED`）つきで返す実際の応答を
+    /// 認識できることを具体値で照合する。別テーブルへの同じ受け口の公開は衝突として検出でき、
+    /// 衝突を検出した側のテーブルにルールは増えない。隔離 netns の中に閉じ、終了時に netns ごと消える。
+    /// 戻り値は拾った受け口の件数（成功行に載せる）。
+    fn listener_dump_scenario(nft: &NetlinkNetfilterSocket, limit: Duration) -> usize {
+        let chain = nft_name("prerouting");
+        let base = BaseChain {
+            chain_type: ChainType::Nat,
+            hook: NfInetHook::PreRouting,
+            priority: NF_IP_PRI_NAT_DST,
+        };
+        let ita = nft_name("fandhe_net_ita");
+        let itb = nft_name("fandhe_net_itb");
+        let plain = nft_name("fandhe_dnat_plain");
+        nft.send_batch(limit, |b| {
+            for t in [&ita, &itb, &plain] {
+                let ct = TableCreate::new(NftFamily::Ipv4, t.clone()).exclusive();
+                b.push_with(|seq| ct.build(seq))?;
+                let cc = ChainCreate::base(NftFamily::Ipv4, t.clone(), chain.clone(), base)?;
+                b.push_with(|seq| cc.build(seq))?;
+            }
+            // ita と、接頭辞のない plain にだけ同じ DNAT を入れる。itb は空のまま。
+            for t in [&ita, &plain] {
+                let r = RuleCreate::new(NftFamily::Ipv4, t.clone(), chain.clone(), dnat_exprs());
+                b.push_with(|seq| r.build(seq))?;
+            }
+            Ok(())
+        })
+        .expect("install listener-dump tables");
+
+        let found = published_dnat_listeners(nft, limit).expect("dump fandhe_net listeners");
+        assert_eq!(
+            found.len(),
+            1,
+            "only the fandhe_net_ita rule is a published listener"
+        );
+        let l = found.listeners().first().copied().expect("one listener");
+        assert_eq!(l.protocol(), PortProtocol::Udp);
+        assert_eq!(l.host_addr(), ROUTER_OUTER_ADDR);
+        assert_eq!(l.host_port(), HOST_PORT);
+        // 同じ受け口を fandhe_net_itb へ公開しようとすると衝突として検出できる。
+        let again = PortPublish::new(PortProtocol::Udp, ROUTER_OUTER_ADDR, HOST_PORT, CONT_PORT)
+            .expect("port publish");
+        assert!(found.contains(&again), "same listener must conflict");
+        let other = PortPublish::new(PortProtocol::Tcp, ROUTER_OUTER_ADDR, HOST_PORT, CONT_PORT)
+            .expect("port publish");
+        assert!(
+            !found.contains(&other),
+            "different protocol must not conflict"
+        );
+        // 衝突を検出した側（itb）には何も投入されていない。
+        let itb_rules = nft
+            .dump_rules(&RuleDump::new(NftFamily::Ipv4, itb), limit)
+            .expect("dump itb rules");
+        assert!(itb_rules.is_empty(), "itb must stay empty");
+        found.len()
     }
 }

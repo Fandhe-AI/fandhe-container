@@ -282,7 +282,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | masquerade 本体 | `crates/net/src/network.rs`・`nftables_rules` | なし（NET-1 の期待の一部。#349 の上流 DNS はヘルパーが host の netns から送るため不要。#319 の 3 経路の (c) も DNAT のみ） | #3060・#3073 |
 | `eth0` へのリネーム | `netlink_route/link.rs` | なし | #3061 |
 | コンテナ単体の detach | `crates/net/src/network/delete.rs` | #319 条件 4（削除）・CLI の stop | #3062 |
-| 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/publish.rs` | なし | #3063 |
+| 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/listener_dump.rs`・`publish.rs` | なし | #3063（公開前の DNAT の dump と照合は実装済み。共有ロックと投入後の事後確認は未実装で、#3191 で追跡する） |
 | plugin-cri の netsetup の永続化 | `crates/plugin-cri/src/netsetup.rs` | なし | #3075 |
 | rootless のユーザー定義名（pasta） | net・supervisor | #349 条件 1（rootless）。条件 2 は NET-9 で約束しないため対象外 | #1936〜#1940 |
 | stack の `[networks]` の up / down | stack・cli | なし | #617（D10 の定義ストアを使う） |

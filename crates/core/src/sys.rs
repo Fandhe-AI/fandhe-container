@@ -4783,8 +4783,9 @@ pub(crate) fn open_path_follow_at(
 /// 保持中の `O_PATH` fd `pinned` が指す inode を `/proc/thread-self/fd/N` 経由で
 /// `O_RDONLY|O_NONBLOCK|O_CLOEXEC` に開き直す。パスの再解決（symlink チェーンの再走査）を
 /// 行わず、`pinned` が固定した inode そのものを開く（magic link はリンク先を再 walk しない）。
-/// 呼び出し側は `pinned` への fstat で通常ファイルと確認済みであること（デバイス・FIFO 等への
-/// open の副作用を避ける。REPAIR-5・PLUG-11・TASK-122.2）。
+/// 呼び出し側は `pinned` への fstat で通常ファイルまたはディレクトリと確認済みであること
+/// （デバイス・FIFO 等への open の副作用を避ける。ディレクトリは `O_RDONLY` で開いても副作用が無く、
+/// `etc_files` が検査済みの管理ディレクトリへの `fchmod` に使う。REPAIR-5・PLUG-11・TASK-122.2・SEC-1）。
 pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
     let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
         // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。

@@ -22,7 +22,7 @@
 //!
 //! - **作るのは指定した種別だけ**: [`EtcFileSelection`] が空なら何も作らない（ディレクトリも作らない）。`/etc/hostname` は対象外
 //! - **所有者と権限**: ディレクトリ（`@container-etc`・`<id>`）は実効 uid 所有の 0700、ファイルは実効 uid 所有の 0644・
-//!   nlink 1 の通常ファイル。作成は `O_CREAT|O_EXCL|O_NOFOLLOW`、モードは作成後に `fchmod` で固定する（umask に依らない）
+//!   nlink 1 の通常ファイル。作成は `O_CREAT|O_EXCL|O_NOFOLLOW`、モードは作成後に `fchmod` で固定する（umask に依らない。ディレクトリも検査済みの fd 起点で固定し、列挙も同じ fd を使う）
 //! - **既にあれば拒否**: `<id>` が既にあれば `ALREADY_EXISTS` で、何も変えない。「start のたびに作り直す」（D9）は呼び出し側が
 //!   [`remove_etc_files`] の後に [`create_etc_files`] を呼ぶことで実現する
 //! - **初期内容**: hosts は [`INITIAL_HOSTS`]（localhost の 2 行）、resolv.conf は空（`apply_dns` が後で rename 置換する）。
@@ -243,7 +243,7 @@ pub fn remove_etc_files(root: &Path, id: &ContainerId) -> Result<EtcRemoveOutcom
 mod linux {
     use std::ffi::CString;
     use std::io::Write as _;
-    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::Path;
@@ -305,12 +305,14 @@ mod linux {
         let root_fd = sys::open_dir_path_nofollow(None, &c_root).map_err(sys_err)?;
         let name = cstr(ETC_DIR_NAME)?;
         let open = || sys::open_dir_path_nofollow(Some(root_fd.as_fd()), &name);
+        // 自分が mkdir したときだけ、検査の後に fd 起点でモードを固定する。
+        let mut made = false;
         let fd = match open() {
             Ok(fd) => fd,
             Err(SysError::Os(sys::ENOENT)) if !create => return Ok(None),
             Err(SysError::Os(sys::ENOENT)) => {
                 match sys::mkdir_at(root_fd.as_fd(), &name, DIR_MODE) {
-                    Ok(()) => fix_dir_mode(&root.join(ETC_DIR_NAME))?,
+                    Ok(()) => made = true,
                     Err(SysError::Os(sys::EEXIST)) => {}
                     Err(e) => return Err(sys_err(e)),
                 }
@@ -324,15 +326,24 @@ mod linux {
             Err(e) => return Err(sys_err(e)),
         };
         check_private_dir(fd.as_fd(), euid)?;
+        if made {
+            fix_dir_mode_fd(fd.as_fd())?;
+        }
         Ok(Some(fd))
     }
 
-    /// 自分が作った直後のディレクトリのモードを `DIR_MODE` に固定する（`mkdir` は umask を受けるため。
-    /// 管理ディレクトリの 0700 は契約）。fd は O_PATH で `fchmod` できないためパスで行い、
-    /// 取り違えは直後の `check_private_dir`（fd 起点の所有者・モード検査）が拒否する。
-    fn fix_dir_mode(path: &Path) -> Result<(), TraitError> {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(DIR_MODE))
-            .map_err(|_| err(ErrorCode::Internal, "container etc files operation failed"))
+    /// 自分が作って検査済みのディレクトリのモードを、その fd が固定した inode に対して `DIR_MODE` へ固定する
+    /// （`mkdir` は umask を受けるため。管理ディレクトリの 0700 は契約。SEC-1・NET-12）。
+    ///
+    /// O_PATH の fd には `fchmod` が効かないため、`/proc/thread-self/fd/N`（magic link。パスを再解決しない）経由で
+    /// `O_RDONLY` に開き直した fd へ `fchmod` する。パスで辿り直さないので、検査と操作の間に差し替える窓が無い。
+    /// procfs が無い環境では失敗させる（fail-closed）。
+    fn fix_dir_mode_fd(dir: BorrowedFd<'_>) -> Result<(), TraitError> {
+        let io = || err(ErrorCode::Internal, "container etc files operation failed");
+        let reopened = sys::reopen_pinned_read_nonblock(dir).map_err(|_| io())?;
+        std::fs::File::from(reopened)
+            .set_permissions(std::fs::Permissions::from_mode(DIR_MODE))
+            .map_err(|_| io())
     }
 
     /// ディレクトリの fsync（best-effort。耐久性のためで、分離の判断には使わない）。
@@ -373,12 +384,7 @@ mod linux {
         };
         let id_name = cstr(id.as_str())?;
         match sys::mkdir_at(etc_fd.as_fd(), &id_name, DIR_MODE) {
-            Ok(()) => {
-                if let Err(e) = fix_dir_mode(&root.join(ETC_DIR_NAME).join(id.as_str())) {
-                    let _ = sys::remove_dir_at(etc_fd.as_fd(), &id_name);
-                    return Err(e);
-                }
-            }
+            Ok(()) => {}
             Err(SysError::Os(sys::EEXIST)) => {
                 return Err(err(
                     ErrorCode::AlreadyExists,
@@ -393,6 +399,7 @@ mod linux {
             let dir_fd =
                 sys::open_dir_path_nofollow(Some(etc_fd.as_fd()), &id_name).map_err(sys_err)?;
             check_private_dir(dir_fd.as_fd(), euid)?;
+            fix_dir_mode_fd(dir_fd.as_fd())?;
             for (n, kind) in sel.kinds().into_iter().enumerate() {
                 let name = cstr(kind.file_name())?;
                 let fd = sys::create_file_excl_at(dir_fd.as_fd(), &name, FILE_MODE).map_err(
@@ -456,7 +463,8 @@ mod linux {
         };
         check_private_dir(dir_fd.as_fd(), euid)?;
         let mut names = Vec::new();
-        let entries = std::fs::read_dir(etc_dir(root, id))
+        // 検査済みの `dir_fd` が固定した inode を列挙する（パスで辿り直さない。exec_kill.rs と同じ方式で新しい unsafe を足さない）。
+        let entries = std::fs::read_dir(format!("/proc/thread-self/fd/{}", dir_fd.as_raw_fd()))
             .map_err(|_| err(ErrorCode::Internal, "container etc files operation failed"))?;
         for entry in entries {
             let entry = entry

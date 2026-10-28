@@ -17,6 +17,8 @@
 //!
 //! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
 //!
+//! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は #1873 まで未反映で `launch_options` が拒否） | core の `LaunchOptions::with_network` |
+//!
 //! | #2828（CLI-1・SUP-12） | `--read-only`（[`ContainerOptions::with_read_only`]。config の `root.readonly` と OR で効き、狭める方向のみ） | core の `LaunchOptions::with_root_readonly`（mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値） |
 //!
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
@@ -59,12 +61,14 @@ pub mod env;
 pub mod ipc;
 pub mod labels;
 pub mod mounts;
+pub mod network;
 pub mod secrets;
 pub mod store;
 
 pub use ipc::IpcMode;
 pub use labels::{Label, Labels};
 pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
+pub use network::{NetworkOptions, NetworkSelection};
 pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
@@ -131,6 +135,8 @@ pub struct ContainerOptions {
     cap_drop: CapabilitySet,
     /// `--read-only`(true なら `root.readonly` を実効的に true にする。狭める方向のみ。CLI-1・SUP-12・#2828)。
     read_only: bool,
+    /// `--network`・`--add-host`・`--dns`(net で再検証済み。NET-6・NET-12・#3065)。
+    network: NetworkOptions,
 }
 
 impl ContainerOptions {
@@ -159,6 +165,18 @@ impl ContainerOptions {
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
+    }
+
+    /// `--network`・`--add-host`・`--dns` の検証済みの組を設定する(NET-6・NET-12・#3065)。
+    #[must_use]
+    pub fn with_network(mut self, network: NetworkOptions) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// `--network`・`--add-host`・`--dns` の検証済みの組。
+    pub fn network(&self) -> &NetworkOptions {
+        &self.network
     }
 
     /// `--read-only` が指定されたか。
@@ -265,7 +283,18 @@ impl ContainerOptions {
     /// ホスト上の secrets / configs のファイルはこの呼び出しで読むため、呼び出し元（start の `build_launcher`）は
     /// fork 前の単一スレッドで呼ぶ。`Shareable` は join 側が未実装のため `Private` と同じ扱い（`ipc` モジュール）。
     /// 矛盾した指定（`--ipc=host` と `--shm-size` 等）は `InvalidArgument` で拒否する。
+    ///
+    /// `network` は core の `LaunchNetworkMode` へ写して渡す(指定なしは `FromConfig`。NET-6・#3065)。
+    /// `add-host`・`dns` は hosts / resolv.conf へ反映する経路が無いため、あれば `Unimplemented` で拒否する
+    /// (受理して反映しない状態を作らない。REPAIR-3。#1873 の start 手順 3〜7〔D9〕で解除する)。
     pub fn launch_options(&self) -> Result<LaunchOptions, TraitError> {
+        if !self.network.add_hosts().is_empty() || !self.network.dns().is_empty() {
+            return Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                "--add-host / --dns are not applied to the container yet",
+            ));
+        }
+        let network_mode = self.network.launch_network_mode()?;
         let ipc = if self.ipc.shares_host_namespace() {
             LaunchIpcMode::Host
         } else {
@@ -278,6 +307,7 @@ impl ContainerOptions {
             .map(|o| {
                 o.with_capability_drop(self.cap_drop)
                     .with_root_readonly(self.read_only)
+                    .with_network(network_mode)
             })
     }
 
@@ -549,6 +579,24 @@ mod tests {
         let got = ContainerOptions::new().launch_options().expect("options");
         let want = LaunchOptions::try_default().expect("default");
         assert_eq!(got, want);
+    }
+
+    /// NET-12・REPAIR-3(#3065): 反映経路の無い add-host / dns があれば `launch_options` は `Unimplemented`。
+    #[test]
+    fn net12_launch_options_rejects_unapplied_add_host_dns() {
+        let with = |hosts: &[&str], dns: &[&str]| {
+            let h: Vec<String> = hosts.iter().map(|s| (*s).to_owned()).collect();
+            let d: Vec<String> = dns.iter().map(|s| (*s).to_owned()).collect();
+            ContainerOptions::new()
+                .with_network(NetworkOptions::parse(Some("host"), &h, &d).expect("parse"))
+        };
+        let e = with(&["web:192.0.2.1"], &[])
+            .launch_options()
+            .expect_err("add-host");
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        let e = with(&[], &["8.8.8.8"]).launch_options().expect_err("dns");
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert!(with(&[], &[]).launch_options().is_ok());
     }
 
     /// SUP-12・SEC-1(#2625): `--ipc=host` は IPC を共有し、`/dev/shm` を載せない。`shareable` は `Private` に写る。

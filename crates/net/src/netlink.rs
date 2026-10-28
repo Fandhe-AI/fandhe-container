@@ -63,6 +63,8 @@ pub const NLM_F_DUMP_INTR: u16 = 0x10;
 pub const NLM_F_ROOT: u16 = 0x100;
 /// GET: 一致するもの全て。
 pub const NLM_F_MATCH: u16 = 0x200;
+/// GET: dump 要求（uapi `NLM_F_DUMP` = `NLM_F_ROOT | NLM_F_MATCH`）。
+pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// NEW: 既存を置換。
 pub const NLM_F_REPLACE: u16 = 0x100;
 /// NEW: 既存なら失敗。
@@ -865,6 +867,7 @@ mod libc_abi {
         libc_const_eq!(NLM_F_DUMP_INTR, u16, c_int);
         libc_const_eq!(NLM_F_ROOT, u16, c_int);
         libc_const_eq!(NLM_F_MATCH, u16, c_int);
+        libc_const_eq!(NLM_F_DUMP, u16, c_int);
         libc_const_eq!(NLM_F_REPLACE, u16, c_int);
         libc_const_eq!(NLM_F_EXCL, u16, c_int);
         libc_const_eq!(NLM_F_CREATE, u16, c_int);

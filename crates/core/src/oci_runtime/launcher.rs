@@ -1279,14 +1279,6 @@ impl Inner {
                 "the launch spec was reconciled with a different network mode",
             ));
         }
-        // 新しい netns と lo の up の実体は #3064。それまで受理して反映しない状態を作らず拒否する(REPAIR-3)。
-        // config に network エントリが無い `Loopback` でも拒否するため、namespaces ではなく実効の結果で判定する。
-        if spec.network() == EffectiveNetwork::NewLoopback {
-            return Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                "the loopback network mode is not implemented yet",
-            ));
-        }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
@@ -1877,6 +1869,14 @@ fn isolation_config_of(
             "a pod namespace join cannot be combined with --ipc=host",
         ));
     }
+    // Loopback の netns は pod の join と組み合わせない。`isolate_join` が `Net` を unshare すると、pod の中で共有されない
+    // netns で黙って動くため(fail-closed。NET-6・CRI-2・SEC-1。#3064・#2675)。
+    if spec.namespace_join().is_some() && spec.network() == EffectiveNetwork::NewLoopback {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with the loopback network mode",
+        ));
+    }
     // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
     // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
@@ -1886,6 +1886,9 @@ fn isolation_config_of(
             NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
             // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
             NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
+            // path 無しの network エントリで実効が `NewLoopback` なら、新しい netns を作る(中間プロセスが `lo` を up にする。
+            // NET-6・#3064)。
+            NamespaceKind::Network => Namespace::Net,
             NamespaceKind::Pid => Namespace::Pid,
             NamespaceKind::Mount => Namespace::Mount,
             NamespaceKind::Uts => Namespace::Uts,
@@ -1899,6 +1902,11 @@ fn isolation_config_of(
             }
         };
         namespaces = namespaces.with(ns);
+    }
+    // config に network エントリが無くても、実効が `NewLoopback`(CLI の既定の `none`)なら netns を作る。落とすと最も
+    // 一般的な起動でホストの netns のまま動く(NET-6・SEC-1・#3064)。
+    if spec.network() == EffectiveNetwork::NewLoopback {
+        namespaces = namespaces.with(Namespace::Net);
     }
     let hostname = spec
         .hostname()
@@ -4270,30 +4278,50 @@ mod tests {
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
-    /// NET-6・REPAIR-3(#3058): `Loopback` は実体(#3064)ができるまで fork 前に `Unimplemented`。config に
-    /// network エントリが無くても拒否する(ホスト netns での黙った起動を作らない)。
+    /// NET-6(#3064): `Loopback` は fork 前に拒否されず spawn まで届く。config に network エントリが無くても
+    /// 分離の集合に `Net` が入る(エントリ無し・path 無しの両方)。`HostShared` では入らない。
     #[test]
-    fn net6_loopback_mode_is_unimplemented_before_spawn() {
+    fn net6_loopback_mode_reaches_spawn_and_adds_net() {
         let spec = spec_for("net-loop", serde_json::json!({})).with_network(
             super::super::EffectiveNetwork::NewLoopback,
             LaunchNetworkMode::Loopback,
         );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let host = spec_for("net-host", serde_json::json!({}));
+        let cfg = isolation_config_of(&host, LaunchIpcMode::Private).expect("config");
+        assert!(!cfg.namespaces.contains(Namespace::Net));
         let ev = events();
         let mut l = launcher(FakeOps::new(&ev), rootless(), None);
         l.inner.launch_options = Some(
             options_with(&[], true, &[], LaunchIpcMode::Private)
                 .with_network(LaunchNetworkMode::Loopback),
         );
-        let err = l
-            .launch(&spec, Duration::from_secs(1))
-            .err()
-            .expect("refused");
-        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert!(ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3064): path 無しの network エントリ + `NewLoopback` でも `Net` が集合に入る。
+    /// pod の join との組は spawn の前に `InvalidArgument`(固定文言)。
+    #[test]
+    fn net6_loopback_with_entry_adds_net_and_rejects_pod_join() {
+        let spec = spec_for("net-loop-entry", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined =
+            spec.with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let err = isolation_config_of(&joined, LaunchIpcMode::Private).expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
-            "the loopback network mode is not implemented yet"
+            "a pod namespace join cannot be combined with the loopback network mode"
         );
-        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
     }
 
     /// SEC-1(#3058): spec のモードと launcher のモードが食い違う(ラッパーの転送漏れ等)なら `FailedPrecondition`。

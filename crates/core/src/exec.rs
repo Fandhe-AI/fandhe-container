@@ -681,15 +681,18 @@ pub enum Namespace {
     Ipc,
     /// user namespace。
     User,
+    /// network namespace（Loopback モード。新しい netns に入り `lo` だけを up にする。NET-6・CORE-6・#3064）。
+    Net,
 }
 
 impl Namespace {
-    const ALL: [Namespace; 5] = [
+    const ALL: [Namespace; 6] = [
         Namespace::Pid,
         Namespace::Mount,
         Namespace::Uts,
         Namespace::Ipc,
         Namespace::User,
+        Namespace::Net,
     ];
 
     fn flag(self) -> NsFlag {
@@ -699,6 +702,7 @@ impl Namespace {
             Self::Uts => NsFlag::Uts,
             Self::Ipc => NsFlag::Ipc,
             Self::User => NsFlag::User,
+            Self::Net => NsFlag::Net,
         }
     }
 
@@ -709,6 +713,7 @@ impl Namespace {
             Self::Uts => 2,
             Self::Ipc => 3,
             Self::User => 4,
+            Self::Net => 5,
         }
     }
 }
@@ -723,7 +728,7 @@ impl NamespaceSet {
         Self(0)
     }
 
-    /// 5 種すべて。
+    /// 6 種すべて（`Net` を含む）。
     pub fn all() -> Self {
         Namespace::ALL
             .iter()
@@ -917,11 +922,13 @@ pub enum IsolationStage {
     RootReadOnly,
     /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
     MountEtcFiles,
+    /// 新しい network namespace の `lo` を up にする `ioctl(SIOCSIFFLAGS)`（NET-6・CORE-6・#3064）。
+    LoopbackUp,
 }
 
 impl IsolationStage {
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Validate,
         Self::Unshare,
         Self::SetGroups,
@@ -954,6 +961,7 @@ impl IsolationStage {
         Self::ApplySysctls,
         Self::RootReadOnly,
         Self::MountEtcFiles,
+        Self::LoopbackUp,
     ];
 
     /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
@@ -993,6 +1001,7 @@ impl IsolationStage {
             Self::WorkingDir => "working_dir",
             Self::ApplySysctls => "apply_sysctls",
             Self::RootReadOnly => "root_read_only",
+            Self::LoopbackUp => "loopback_up",
         }
     }
 }
@@ -2452,6 +2461,20 @@ fn unshare_and_configure(
         write_proc_self("gid_map", &gid.to_map_line(), IsolationStage::GidMap)?;
     }
 
+    // Loopback モード（NET-6・#3064）: 新しい netns は `lo` が down で生まれ、down のままだと自己宛て配送が
+    // 落ちる（#1927・#2077）。netns を所有する user namespace の全 capability が使える今のうちに up にする。
+    // 範囲写像の経路では holder の user namespace へ `setns` した後の `rest` の unshare で来るため、この 1 か所で
+    // 両経路を満たす。pin はしない（netns は PID 1 と一緒に消える）。
+    if namespaces.contains(Namespace::Net) {
+        sys::set_loopback_up().map_err(|e| {
+            ExecError::from_sys(
+                e,
+                IsolationStage::LoopbackUp,
+                "bring the loopback interface up",
+            )
+        })?;
+    }
+
     if namespaces.contains(Namespace::Mount) {
         sys::mount_root_recursive(root_propagation).map_err(|e| {
             let what = match root_propagation {
@@ -3054,6 +3077,7 @@ mod tests {
             IsolationStage::ApplySysctls => 29,
             IsolationStage::RootReadOnly => 30,
             IsolationStage::MountEtcFiles => 31,
+            IsolationStage::LoopbackUp => 32,
         }
     }
 
@@ -3070,7 +3094,7 @@ mod tests {
             );
             assert!(seen.insert(token), "duplicate {token}");
         }
-        assert_eq!(IsolationStage::ALL.len(), 32);
+        assert_eq!(IsolationStage::ALL.len(), 33);
         assert_eq!(
             IsolationStage::MountReadonlyPaths.as_str(),
             "mount_readonly_paths"
@@ -3341,7 +3365,7 @@ mod tests {
         assert!(status.success(), "{output}");
     }
 
-    /// CORE-1: 5 種の集合と単体の所属判定。
+    /// CORE-1: 6 種の集合と単体の所属判定。
     #[test]
     fn core1_namespace_set_membership() {
         let all = NamespaceSet::all();
@@ -3352,7 +3376,7 @@ mod tests {
         assert!(NamespaceSet::empty().is_empty());
         // 単体フラグの合成値（sys の具体値と一致）
         let bits = all.flags().iter().fold(0i32, |a, f| a | f.bits());
-        assert_eq!(bits, 0x3C02_0000);
+        assert_eq!(bits, 0x7C02_0000);
     }
 
     /// CORE-1: hostname の受理例。

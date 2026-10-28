@@ -16,7 +16,7 @@
 //! | `veth-attach` | `attach` | `network::attach_prepared_container`（事前作成の netns へ接続） |
 //! | `publish-port` | `publish_port` | `network::publish_container_ports`（attach 済みコンテナへ DNAT を追加。#2676）。投入ルールのハンドル（echo 応答。#2839）はネットワークのハンドルに保持する |
 //! | （なし） | `unpublish_port` | `network::unpublish_container_port`（保持したハンドルで DNAT 2 件を個別に削除し、予約を戻す。#2839・NET-3） |
-//! | （なし） | `detach` | 未 attach の記録の取り消しと事前作成 netns の解放（`network::release_container_netns`）、attach の取り残しの回収（`network::reclaim_failed_attach`）。attach 済みは `Unimplemented` |
+//! | （なし） | `detach` | 未 attach の記録の取り消しと事前作成 netns の解放（`network::release_container_netns`）、attach の取り残しの回収（`network::reclaim_failed_attach`）。attach 済みは `network::detach_container`（そのコンテナ 1 件の公開 → veth → pin → アドレスだけを解放。#3062） |
 //! | `net-delete` | `delete_network` | `network::delete_network` |
 //!
 //! # 契約との対応（`NetworkPlugin` の doc の契約番号）
@@ -59,9 +59,12 @@
 //!   `unpublish_container_port`）で行う。CRI の経路で使うのは `set_up_sandbox` の公開途中の失敗の巻き戻しだけで、
 //!   通常の `StopPodSandbox` / `RemovePodSandbox` は pod 専用ネットワークを `delete_network` で一括解放する。
 //!   結果不明で記録した公開（ハンドルを持たない）は個別に解除できず `FailedPrecondition` で、`delete_network` が
-//!   解放する。attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）は後続事項。保持したハンドルは
+//!   解放する。attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）は `network::detach_container`（#3062）。保持したハンドルは
 //!   プロセスのメモリ上だけで、再起動後は `delete_network` の一括解放に頼る。他プロセスとの受け口の衝突は検出しない
-//! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
+//! - `detach`（attach 済み。#3062）: net の `detach_container` で当該コンテナだけを解放する。カーネル操作を始めた後の失敗はハンドルを
+//!   手放して請求書（`FailedAttachClaim`）に一本化し、`unreclaimed` の回収待ちとして保持する（`attach` の取り残しと同じ経路で、
+//!   次の `detach` が回収し、quarantine は `delete_network` が解放する。回収待ちの間、そのネットワークへの新しい `attach` は
+//!   拒否される）。公開ハンドルの永続化・メンバー記録・DNS ヘルパーの参照カウントは別の担当（#3068・#3067・#3070）
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
 //!   併用できないため `Unimplemented`（契約 10。カーネル操作の前に判定する）
 //! - attach の取り残しの回収（#2681）: 請求書は [`ReclaimStore`] の `attach/<endpoint>.attach` に永続化し、再起動後に
@@ -125,9 +128,9 @@ pub const MSG_UNPUBLISH_PORT_RESULT_UNKNOWN: &str =
     "published port has an unknown result and is released only by delete_network";
 /// 記録に無い公開の個別解除の文言。
 const MSG_UNPUBLISH_PORT_NOT_RECORDED: &str = "published port is not recorded";
-/// attach 済みコンテナの切り離しの未実装文言。
-pub const MSG_DETACH_UNAVAILABLE: &str =
-    "detach of an attached container is not available yet: net has no per-container teardown";
+/// バックエンドが attach 済みコンテナの切り離しに未対応のときの文言（既定の `NetsetupBackend::detach`）。
+pub const MSG_DETACH_UNSUPPORTED: &str =
+    "detach of an attached container is not supported by this backend";
 /// 事前作成した netns が見つからないときの文言（Linux バックエンド。attach は `create_netns` を前提とする）。
 pub const MSG_NETNS_NOT_PREPARED: &str = "netns was not prepared for the container";
 /// 静的アドレスの未実装文言。
@@ -301,6 +304,21 @@ impl<A> From<TraitError> for AttachFailure<A> {
             reclaim: None,
         }
     }
+}
+
+/// [`NetsetupBackend::detach`] の失敗。取り残しの件数と請求書を握りつぶさず運ぶ（契約 9）。
+#[derive(Debug)]
+pub struct DetachFailure<C, A = ()> {
+    /// 失敗の原因（取り残しがあれば件数入りの `Internal`）。
+    pub error: TraitError,
+    /// 切り離しで回収できずカーネルまたはプロセス内に残った資源の件数。
+    pub leftover: usize,
+    /// 何も変えずに失敗したとき（入力検証・ソケットを開けない）だけ、渡したハンドルを返す。レジストリは
+    /// 記録を attach 済みのまま戻し、再試行できる。
+    pub retry: Option<C>,
+    /// 取り残しを所有確認つきで回収するための請求書（Linux は net の `FailedAttachClaim`）。
+    /// 所有を証明できない取り残しでは `None`（手動回収）。
+    pub reclaim: Option<A>,
 }
 
 /// [`NetsetupBackend::create_network`] の失敗。作成途中の取り残し・結果不明の資源の件数を握りつぶさず運ぶ
@@ -505,6 +523,25 @@ pub trait NetsetupBackend: Send + Sync {
                 "unpublish_port is not supported by this backend",
             ),
             rules_unknown: false,
+        })
+    }
+
+    /// attach 済みコンテナ 1 件だけを切り離す（公開 → veth → netns の pin → アドレス。NET-1・NET-3・#3062）。
+    /// 他のコンテナと bridge・nft テーブルには触れない。既定は `Unimplemented`（成功を装わない）で、
+    /// ハンドルをそのまま返す。
+    ///
+    /// カーネル操作を始めた後の失敗ではハンドルを手放し、取り残しを件数と請求書で返す。請求書は
+    /// [`reclaim_failed_attach`](Self::reclaim_failed_attach) で回収できる。
+    fn detach(
+        &self,
+        _network: &mut Self::Network,
+        container: Self::Container,
+    ) -> Result<(), DetachFailure<Self::Container, Self::FailedAttach>> {
+        Err(DetachFailure {
+            error: TraitError::new(ErrorCode::Unimplemented, MSG_DETACH_UNSUPPORTED),
+            leftover: 0,
+            retry: Some(container),
+            reclaim: None,
         })
     }
 
@@ -1012,6 +1049,19 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         Ok(NetnsStatus::new(req.container().clone(), netns))
     }
 
+    /// attach の取り残しの請求書を置き場へ書く。書こうとして失敗したときだけ `true`（置き場が無い・符号化できない・
+    /// 請求書が無いときは `false`）。呼び出し側は、メモリの記録は保持したまま成功を装わず失敗を足す
+    /// （`attach_impl`・`detach_impl` が共用する。NET-1・#2681・#3062）。
+    fn persist_attach_claim(&self, endpoint: &str, claim: Option<&B::FailedAttach>) -> bool {
+        match (&self.store, claim) {
+            (Some(store), Some(claim)) => self
+                .backend
+                .encode_attach_claim(claim)
+                .is_some_and(|rec| store.save_attach(endpoint, &rec).is_err()),
+            _ => false,
+        }
+    }
+
     fn attach_impl(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
         let mut guard = self.lock()?;
         let reg = &mut *guard;
@@ -1080,14 +1130,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 container.claim = f.reclaim;
                 // 取り残しの記録は再起動をまたいで残す。書けなくてもメモリの記録は保持し、成功を装わず失敗を足す
                 // （NET-1・#2681）。
-                let persisted = match (&self.store, container.claim.as_ref()) {
-                    (Some(store), Some(claim)) => self
-                        .backend
-                        .encode_attach_claim(claim)
-                        .map(|rec| store.save_attach(container.endpoint.as_str(), &rec)),
-                    _ => None,
-                };
-                return Err(if matches!(persisted, Some(Err(_))) {
+                let persist_failed = self
+                    .persist_attach_claim(container.endpoint.as_str(), container.claim.as_ref());
+                return Err(if persist_failed {
                     with_persist_failure(f.error)
                 } else {
                     f.error
@@ -1312,10 +1357,51 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             return Ok(DetachResponse::new());
         }
         if container.attached.is_some() {
-            return Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                MSG_DETACH_UNAVAILABLE,
-            ));
+            // attach 済み: 公開 → veth → netns の pin → アドレスを、このコンテナ 1 件だけ切り離す（#3062）。
+            // 他のコンテナと bridge・テーブルには触れない。ネットワークの状態は attach と同じ順で判定する。
+            let network = reg
+                .networks
+                .get_mut(req.network().as_str())
+                .ok_or_else(not_found_network)?;
+            if network.leaked.is_some() {
+                return Err(leaked_network());
+            }
+            if network.recovered {
+                return Err(recovered_network());
+            }
+            if network.deleting {
+                return Err(network_deleting());
+            }
+            let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
+            let attached = container.attached.take().ok_or_else(not_attached)?;
+            let Err(f) = self.backend.detach(handle, attached) else {
+                // 成功。受け口のキー（契約 11）も記録と一緒に消え、再公開できる。
+                reg.containers.remove(req.container().as_str());
+                return Ok(DetachResponse::new());
+            };
+            if let Some(back) = f.retry {
+                // 何も変えずに失敗した。attach 済みの記録に戻し、再試行できる。
+                container.attached = Some(back);
+                return Err(f.error);
+            }
+            if f.leftover == 0 && f.reclaim.is_none() {
+                // 取り残しの申告が無いのに失敗した。ハンドルは手放し済みで回収の手掛かりも無いので記録を外す
+                // が、成功は装わない。
+                reg.containers.remove(req.container().as_str());
+                return Err(f.error);
+            }
+            // 取り残しあり。ハンドルは請求書に一本化し、`unreclaimed` の記録として保持する。公開の記録
+            // （`published`・`unknown_published`）は残し、`delete_network` が解放するまで衝突判定に使う
+            // （fail-closed）。次の `detach` は既存の回収経路（`reclaim_attach_entry`）に入る。
+            container.unreclaimed = true;
+            container.claim = f.reclaim;
+            let persist_failed =
+                self.persist_attach_claim(container.endpoint.as_str(), container.claim.as_ref());
+            return Err(if persist_failed {
+                with_persist_failure(f.error)
+            } else {
+                f.error
+            });
         }
         // 未 attach は事前作成した netns があれば解放してから記録を消す。解放に失敗したら記録を保持して
         // エラーを返す（pin を取り残したまま追跡を失わない。#2675）。
@@ -1693,8 +1779,9 @@ mod linux {
         AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedAttachClaim,
         FailedCreateClaim, NetworkCreateSpec, PortRegistry, PreparedNetns, PublishedPort,
         StaticIpam, UnpublishRules, attach_prepared_container, create_container_netns,
-        create_network, delete_network, publish_container_ports, reclaim_failed_attach,
-        reclaim_failed_create, release_container_netns, unpublish_container_port,
+        create_network, delete_network, detach_container, publish_container_ports,
+        reclaim_failed_attach, reclaim_failed_create, release_container_netns,
+        unpublish_container_port,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -2098,6 +2185,64 @@ mod linux {
                     rules_unknown,
                 }
             })
+        }
+
+        fn detach(
+            &self,
+            network: &mut Self::Network,
+            container: Self::Container,
+        ) -> Result<(), DetachFailure<Self::Container, Self::FailedAttach>> {
+            let (route, nft) = match self.open_sockets() {
+                Ok(s) => s,
+                Err(error) => {
+                    return Err(DetachFailure {
+                        error,
+                        leftover: 0,
+                        retry: Some(container),
+                        reclaim: None,
+                    });
+                }
+            };
+            // attach 後に公開した分のルールハンドルをこのコンテナ分だけ取り出して渡す（他のコンテナの分は残す）。
+            let (extra, rest): (Vec<PublishedPort>, Vec<PublishedPort>) =
+                std::mem::take(&mut network.published)
+                    .into_iter()
+                    .partition(|p| p.endpoint() == &container.endpoint);
+            network.published = rest;
+            match detach_container(
+                &route,
+                &nft,
+                &network.created,
+                container,
+                extra,
+                &mut network.ipam,
+                &mut network.ports,
+                NETSETUP_REQUEST_TIMEOUT,
+            ) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let e = *e;
+                    let claim = e.reclaim_claim();
+                    let leftover = e.report.leftover.len();
+                    let error = net_error_to_trait(&e.error);
+                    if let Some(back) = e.retry {
+                        // 入力検証の失敗（何も変えていない）。ハンドルと未使用の公開ハンドルを戻す。
+                        network.published.extend(e.published);
+                        return Err(DetachFailure {
+                            error,
+                            leftover: 0,
+                            retry: Some(*back),
+                            reclaim: None,
+                        });
+                    }
+                    Err(DetachFailure {
+                        error: with_leftover(error, leftover),
+                        leftover,
+                        retry: None,
+                        reclaim: claim,
+                    })
+                }
+            }
         }
 
         fn delete_network(

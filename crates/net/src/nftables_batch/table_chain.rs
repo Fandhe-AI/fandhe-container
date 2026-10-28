@@ -35,7 +35,9 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY`（書き込み）/ `FLAGS` / `HANDLE`、チェインの handle 指定の削除
-//! - `DELCHAIN`・GETTABLE / GETCHAIN 以外の GET 系（ダンプ要求を含む）・`NFT_MSG_DESTROYTABLE`
+//! - `DELCHAIN`・GETTABLE / GETCHAIN / GETRULE 以外の GET 系・`NFT_MSG_DESTROYTABLE`
+//!   （テーブルの dump 要求は [`TableDump`]・[`decode_table_name`]、ルールの dump は
+//!   `nftables_rules::RuleDump` で実装済み。NET-3・#3063）
 //!
 //! 読み取りは `NFT_MSG_GETCHAIN` と応答の `NFTA_CHAIN_POLICY` の復号のみ実装済み（[`ChainGet`]・[`ChainInfo`]。
 //! TASK-148.1・NET-10。cli の `doctor` がホストの `ip filter FORWARD` チェイン policy を調べるために使う）。
@@ -425,6 +427,89 @@ impl TableGet {
         NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
         self.name.put_into(b, NFTA_TABLE_NAME)
     }
+}
+
+/// `NFT_MSG_GETTABLE` の dump 要求。family のテーブルを全件列挙する（NET-3・#3063）。
+///
+/// 公開の前に、他の状態ルートが作った `fandhe_net_*` テーブルを見つけるために使う
+/// （`network::listener_dump`）。読み取り専用でルールセットを変更しない。`NLM_F_DUMP` は送信側
+/// （`NetlinkNetfilterSocket::dump_table_names`）が足す。応答は `NFT_MSG_NEWTABLE` がテーブル数だけ
+/// 並び、`NLMSG_DONE` で終わる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableDump {
+    family: NftFamily,
+}
+
+impl TableDump {
+    /// 列挙する family を指定して作る。
+    pub fn new(family: NftFamily) -> Self {
+        Self { family }
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETTABLE)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK / DUMP は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg を `b` へ追記する（属性なし）。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)
+    }
+}
+
+/// `NFT_MSG_GETTABLE` dump の応答 1 件（`NFT_MSG_NEWTABLE`）から `NFTA_TABLE_NAME` を取り出す
+/// （NET-3・#3063）。
+///
+/// カーネル応答は外部入力。短い・属性が壊れている・名前が無い／重複・NUL 終端でない・
+/// 接頭辞 `prefix` に一致する名前が [`NftName`] の検証を通らないものは `DataLoss`。接頭辞に一致しない
+/// 他者のテーブルは名前を検証せず `Ok(None)`（読み飛ばし）。family が要求した値と異なるものも `DataLoss`。
+/// エラーメッセージに名前の値は載せない。
+pub fn decode_table_name(
+    payload: &[u8],
+    family: NftFamily,
+    prefix: &str,
+) -> Result<Option<NftName>, NetError> {
+    let loss = |m: &'static str| NetError::new(NetErrorCode::DataLoss, m);
+    let head = NfGenMsg::decode(payload)?;
+    if head.family() != family.nfproto() {
+        return Err(loss("table dump reply has an unexpected family"));
+    }
+    let attrs = payload
+        .get(NFGENMSG_LEN..)
+        .ok_or_else(|| loss("table reply is shorter than nfgenmsg"))?;
+    let mut found: Option<Option<NftName>> = None;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() != NFTA_TABLE_NAME {
+            continue;
+        }
+        if found.is_some() {
+            return Err(loss("duplicate table name attribute"));
+        }
+        if attr.is_nested() || attr.is_net_byteorder() {
+            return Err(loss("table name attribute has unexpected flags"));
+        }
+        let bytes = match attr.payload().split_last() {
+            Some((0, name)) if !name.contains(&0) => name,
+            _ => return Err(loss("table name is not a single NUL-terminated string")),
+        };
+        if !bytes.starts_with(prefix.as_bytes()) {
+            // 他者のテーブル（docker・kube-proxy 等）は名前を検証せず読み飛ばす。nft の識別子は
+            // `/` や先頭 `.` を許し NftName より広いため、検証すると無関係なテーブル 1 件で全公開が失敗する。
+            found = Some(None);
+            continue;
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| loss("table name is not valid text"))?;
+        found = Some(Some(
+            NftName::new(text).map_err(|_| loss("table name is not a valid nft name"))?,
+        ));
+    }
+    found.ok_or_else(|| loss("table name attribute is missing"))
 }
 
 /// `NFT_MSG_GETTABLE` 応答（`NFT_MSG_NEWTABLE`）から読み取ったテーブルの識別情報（TASK-139.4・#317）。
@@ -843,6 +928,111 @@ mod tests {
         assert_eq!(ty, 0x0A01);
         assert_eq!(fl, RA);
         assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
+    }
+
+    /// NET-3・#3063: GETTABLE の dump 要求は nfgenmsg（family ipv4 = 2）だけで属性を持たない
+    /// （type 0x0A01。DUMP フラグは送信側が足す）。
+    #[test]
+    fn net3_tabledump_is_bare_nfgenmsg() {
+        let d = TableDump::new(NftFamily::Ipv4);
+        let mut b = NlMsgBuilder::new(d.msg_type(), d.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        d.encode(&mut b).expect("encode");
+        let bytes = b.finish().expect("finish");
+        let msg = crate::netlink::NlMsgIter::new(&bytes)
+            .next()
+            .expect("one")
+            .expect("msg");
+        assert_eq!(msg.header().msg_type(), 0x0A01);
+        assert_eq!(msg.payload(), &[2, 0, 0, 0]);
+    }
+
+    fn table_reply(family: u8, extra: impl FnOnce(&mut NlMsgBuilder)) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(0x0A00, 0, 3, 0);
+        NfGenMsg::new(family, 0).put_into(&mut b).expect("nfgen");
+        extra(&mut b);
+        let bytes = b.finish().expect("finish");
+        crate::netlink::NlMsgIter::new(&bytes)
+            .next()
+            .expect("one")
+            .expect("msg")
+            .payload()
+            .to_vec()
+    }
+
+    /// NET-3・#3063: dump 応答からテーブル名を取り出し、異常はすべて DataLoss（名前の値は載せない）。
+    #[test]
+    fn net3_decode_table_name_validates_reply() {
+        let ok = table_reply(2, |b| {
+            b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_web\0").expect("n");
+            b.put_attr(NFTA_TABLE_HANDLE, &7u64.to_be_bytes())
+                .expect("h");
+        });
+        assert_eq!(
+            decode_table_name(&ok, NftFamily::Ipv4, "fandhe_net_")
+                .expect("name")
+                .expect("ours")
+                .as_str(),
+            "fandhe_net_web"
+        );
+        // 他者のテーブルは不正な nft 名（`/`・先頭 `.`・非 UTF-8）でも読み飛ばす。
+        for foreign in [&b"a/b\0"[..], b".x\0", b"\xff\xfe\0", b"1abc\0"] {
+            let r = table_reply(2, |b| {
+                b.put_attr(NFTA_TABLE_NAME, foreign).expect("n");
+            });
+            assert_eq!(
+                decode_table_name(&r, NftFamily::Ipv4, "fandhe_net_").expect("skip"),
+                None
+            );
+        }
+        // 接頭辞が一致して名前が不正なものは fail-closed のまま。
+        let bad = table_reply(2, |b| {
+            b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_a/b\0").expect("n");
+        });
+        assert_eq!(
+            decode_table_name(&bad, NftFamily::Ipv4, "fandhe_net_")
+                .expect_err("bad")
+                .code(),
+            NetErrorCode::DataLoss
+        );
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "family",
+                table_reply(10, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"t\0").expect("n");
+                }),
+            ),
+            ("missing", table_reply(2, |_| {})),
+            (
+                "no nul",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"abc").expect("n");
+                }),
+            ),
+            (
+                "inner nul",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"a\0b\0").expect("n");
+                }),
+            ),
+            (
+                "invalid name",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_1/\0").expect("n");
+                }),
+            ),
+            (
+                "duplicate",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"a\0").expect("n");
+                    b.put_attr(NFTA_TABLE_NAME, b"b\0").expect("n");
+                }),
+            ),
+            ("short", vec![2, 0]),
+        ];
+        for (label, payload) in cases {
+            let e = decode_table_name(&payload, NftFamily::Ipv4, "fandhe_net_").expect_err(label);
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
+        }
     }
 
     /// NET-11・TASK-139.4: 所有トークンは NFTA_TABLE_USERDATA(6) に載り、範囲外は拒否される。

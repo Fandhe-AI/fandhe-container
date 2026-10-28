@@ -199,6 +199,7 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
+/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
 pub(crate) use landlock::{landlock_ruleset_from_config_with_dev, launch_isolation_from_ruleset};
 #[cfg(test)]
 pub(crate) use landlock::{ruleset_from_detection, ruleset_from_detection_with_dev};
@@ -223,7 +224,7 @@ pub use launch_status::relay_landlock_failure_for_test;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_mount_binds_failure_for_test;
-/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
+/// netns の素性の照合（#3206・NET-6・SEC-1）。launcher と `launch_intermediate` が使う crate 内の再公開。
 pub(crate) use netns_sync::{NetnsExpectation, NetnsIdentity, NetnsSyncRequest};
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]

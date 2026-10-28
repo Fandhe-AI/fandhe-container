@@ -27,7 +27,7 @@ SHELL := /bin/bash
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
 	check-launch-target check-launch-target-selftest \
 	check-standalone-clippy check-standalone-clippy-selftest \
-	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
+	test-core-no-plugin check-cli-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
@@ -127,7 +127,10 @@ check-standalone-clippy-selftest: ## check-standalone-clippy の自己テスト�
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 	@scripts/targets/test-core-no-plugin.sh
 
-plugin-feature-size: ## core の既定 / plugin 除外 release ビルドの rlib サイズを記録する（PLUG-3・TASK-111.2）
+check-cli-no-plugin: ## CLI を --no-default-features で clippy し plugin 依存が入らないことを検証する（PLUG-3・#3204）
+	@scripts/targets/check-cli-no-plugin.sh
+
+plugin-feature-size: ## CLI の実行ファイルの既定 / plugin 除外 release ビルドのサイズを記録する（PLUG-3・TASK-111.2・#3204）
 	@scripts/targets/plugin-feature-size.sh
 
 plug4-core-invariance: ## plugin 追加前後で core の指紋が不変か別ビルドで比較する（PLUG-4・TASK-109.4）

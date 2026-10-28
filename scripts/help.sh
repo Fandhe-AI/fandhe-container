@@ -61,8 +61,10 @@ cat <<'EOF'
                                         check-standalone-clippy の自己テスト（REPAIR-12。スタブの cargo のみ。jq が必要）
   test-core-no-plugin                 scripts/targets/test-core-no-plugin.sh
                                         core を --no-default-features でテストし plugin 依存が入らないことを検証する
+  check-cli-no-plugin                 scripts/targets/check-cli-no-plugin.sh
+                                        CLI を --no-default-features で clippy し plugin 依存が入らないことを検証する（PLUG-3・#3204）
   plugin-feature-size                 scripts/targets/plugin-feature-size.sh
-                                        core の既定 / plugin 除外 release ビルドの rlib サイズを記録する（PLUG-3・TASK-111.2）
+                                        CLI の実行ファイルの既定 / plugin 除外 release ビルドのサイズを記録する（PLUG-3・TASK-111.2・#3204）
   plug4-core-invariance               scripts/with-workspace.sh plug4-core-invariance bash scripts/check-plug4-core-invariance.sh
                                         plugin 追加前後で core の指紋が不変か別ビルドで比較する（PLUG-4・TASK-109.4）
   plug4-core-invariance-selftest      scripts/with-tools.sh cargo,git scripts/check-plug4-core-invariance-selftest.sh

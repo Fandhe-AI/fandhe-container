@@ -620,6 +620,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         shell: bash
         run: make test-core-no-plugin
+      # CLI の plugin 無効構成（--no-default-features）の clippy と plugin 依存なしの検証（PLUG-3・#3204）。
+      # main では 3 OS で cfg 分岐をネイティブに見る。既存ジョブへのステップ追加（check-run 件数は不変）
+      - name: cli plugin 無効構成の検証
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        shell: bash
+        run: make check-cli-no-plugin
       # CLI がバックエンド実装 crate へ直接依存しない（CLI-1・PLUG-4・TASK-79.4）。既存ジョブへのステップ追加
       - name: cli のバックエンド直接依存なしの検証
         if: env.HANG_PROBE != 'true'
@@ -2092,7 +2099,9 @@ jobs:
       # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
       # 既存ジョブのステップとする（本 workflow の check-run 件数は不変）。計測対象は rlib（CLI の実行ファイルは
       # plugin を除外してビルドできないため。#2170）で、差は僅少のため軽量化効果の実測ではない
+      # CLI の実行ファイルを既定と --no-default-features の 2 回 release ビルドして記録する（#3204）。
       - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail

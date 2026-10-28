@@ -25,10 +25,15 @@ fn main() -> ExitCode {
     #[cfg(not(unix))]
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
     let code = exit.exit_code();
+    // plugin feature が無効なら plugin を起動できず、延期した後始末の記録も無い（PLUG-3・#3204）。
+    #[cfg(feature = "plugin")]
     let mut pending = fandhe_container_plugin::take_pending_child_cleanup_failures();
     // `Drop` の即時書き込みが途中で切れた断片が stderr に残っていれば、結果の JSON が連結しないよう
     // 結果の前に改行で分離する（#1673）。
+    #[cfg(feature = "plugin")]
     let partial = pending.take_partial_write_mark();
+    #[cfg(not(feature = "plugin"))]
+    let partial = false;
     // 断片分離の改行・コマンド結果・延期した後始末の記録は、順序を保ったまま 1 つの別スレッドで書く。
     // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、main ではブロックし得る書き込みを
     // 一切せず有限の期限で待つ（REPAIR-5。スレッドを起動できないときの縮退出力もブロックしない 1 回の書き込みに限る）。期限内に終わらなければスレッドを置き去りにして終了する
@@ -37,6 +42,7 @@ fn main() -> ExitCode {
         Report {
             partial,
             exit,
+            #[cfg(feature = "plugin")]
             pending,
         },
         DEFERRED_REPORT_TIMEOUT,
@@ -90,6 +96,7 @@ fn report_deferred<T: Send + 'static>(
 struct Report {
     partial: bool,
     exit: fandhe_container_cli::commands::CliExit,
+    #[cfg(feature = "plugin")]
     pending: fandhe_container_plugin::PendingChildCleanup,
 }
 
@@ -99,6 +106,7 @@ fn write_stderr(r: &Report) {
         let _ = std::io::Write::write_all(&mut err, b"\n");
     }
     let _ = r.exit.write_stderr(&mut err);
+    #[cfg(feature = "plugin")]
     let _ = r.pending.write_json_lines(&mut err);
 }
 
@@ -114,9 +122,14 @@ fn write_stderr(r: &Report) {
 ///   ERR 系の構造化エラーは失われ、終了コードだけが残る（無期限に止まらないこと〔REPAIR-5〕を優先する）
 fn write_stderr_fallback(r: &Report) {
     let bytes = fallback_bytes(r.partial, &r.exit);
+    // plugin feature が無効なら待たずに書く手段（plugin crate の `write_stderr_nonblocking`）が無いため書かない。
+    // 無期限に止まらないこと（REPAIR-5）を優先し、構造化エラーは失われて終了コードだけが残る（PLUG-3・#3204）。
+    #[cfg(feature = "plugin")]
     if !bytes.is_empty() {
         let _ = fandhe_container_plugin::write_stderr_nonblocking(&bytes);
     }
+    #[cfg(not(feature = "plugin"))]
+    let _ = bytes;
 }
 
 /// 縮退出力の内容（断片分離の改行・コマンド結果の順）を 1 つのバッファへ組み立てる（1 回の書き込みで出すため）。

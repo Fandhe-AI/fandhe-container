@@ -68,7 +68,10 @@ path = "src/bin/fandhe-container-launcher.rs"
 doc = false
 
 [dependencies]
-fandhe-container-core = { path = "../core" }
+# core の plugin feature を要求しない（PLUG-3・#3204）。supervisor は `fandhe_container_core::plugin`（plugin 境界基盤の再エクスポート）を
+# 使わないため、既定 feature のまま引くと CLI など依存元の実行ファイルで feature 統合により core の `plugin` が再有効化されてしまう
+# （plugin-cri の #2434 と同じ原因）。oci・cri・plugin-cri と同じく default-features = false で引く。
+fandhe-container-core = { path = "../core", default-features = false }
 fandhe-container-net = { path = "../net" }
 
 # exec-test-support: 実機結合試験（tests/exec_setns_join.rs）専用の入口 `exec::identify_pid1_in`（期待 cgroup

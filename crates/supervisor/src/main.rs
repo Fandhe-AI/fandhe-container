@@ -6,7 +6,16 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
-    fandhe_container_supervisor::start_entry::run_main(std::env::args_os().skip(1))
+    // 第 1 引数が `netns-holder` なら holder 本体へ振り分ける（NET-9・CORE-1・#3198。`docs/design/rootless-network.md` 12.2）。
+    // 継承 fd の整理・結果チャネルの検証・`set_dumpable(false)`（いずれも `run_main` の手順）より前に分けるのは、
+    // holder が dumpable のまま pasta に `/proc/<holder>/ns/*` を開かせる前提で、結果チャネルを持たないため。
+    // 特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にはならない。
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    if fandhe_container_supervisor::netns_holder::is_holder_invocation(first.as_deref()) {
+        return fandhe_container_net::netns_holder::run_netns_holder_main(args);
+    }
+    fandhe_container_supervisor::start_entry::run_main(first.into_iter().chain(args))
 }
 
 #[cfg(not(target_os = "linux"))]

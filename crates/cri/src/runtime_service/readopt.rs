@@ -26,19 +26,52 @@
 //! 破棄せず回収待ちへ倒す（fail-closed）。再採用した記録の pid から namespace のパスを作らず、シグナルも送らない
 //! （SEC-5・#2776。v1 の記録に pid の鍵は無い）。
 //!
-//! 未実装（REPAIR-3）: コンテナ記録の再採用と core の状態との照合は R7 #2936、保持役の素性による pending の解決は
+//! # コンテナ記録の再採用と core の状態との照合（R7 #2936。CRI-1・OCI-7・CORE-1）
+//!
+//! [`CriRuntimeService::readopt_containers`] は [`CriRuntimeService::readopt_sandboxes`] の後に 1 回だけ呼び、
+//! コンテナ記録のうち所属 sandbox を再採用できたものだけを登録する。core の状態は `RuntimeAdapter::state`
+//! （`ContainerRuntime::state` → `StateStore::get`）を **記録にある ID だけ** 1 件ずつ期限つきで照会して得る。
+//! CRI 記録の無い core のコンテナには触れない（照会もしない。SEC-1）。核となる写像は純粋関数 `reconcile`
+//! （15 セルを 1 か所に集める）。core の応答は次のとおり 3 値に写す（`CoreProbe`）。
+//!
+//! - Present: 状態を返した。Absent: `NOT_FOUND` だけ。Undetermined: それ以外（`INTERNAL`・ID 不一致・
+//!   `DEADLINE_EXCEEDED`・`UNAVAILABLE`・`PERMISSION_DENIED`・`UNIMPLEMENTED`・1 件の期限切れ・実行層未注入）
+//!
+//! | CRI 記録 | core | 登録する状態 | `runtime_owned` |
+//! | -------- | ---- | ------------ | --------------- |
+//! | 確定 / in_flight=start / stop | Present | core の lifecycle を写す（Created→created・Running→running・Stopped→exited・その他→unknown） | true |
+//! | 確定 / in_flight=start / stop | Absent | exited（終了コード・時刻は記録の値） | false |
+//! | in_flight=create | Present | unknown（再 Start は拒否） | true |
+//! | in_flight=create | Absent | 登録しない（`stale_create`。消去は R8 #2937） | - |
+//! | in_flight=remove | Present | unknown（Remove の続き待ち） | true |
+//! | in_flight=remove | Absent | unknown（Remove の続き待ち。`remove_pending`） | true |
+//! | 任意 | Undetermined | unknown（`CONTAINER_UNKNOWN`。何も消さない） | true |
+//!
+//! 登録する記録はどれも `in_flight=false`。in_flight=remove × Absent を `runtime_owned=true` にするのは、偽だと
+//! kubelet の再試行がメモリ上の除去だけになり、記録ファイルと bundle が残るため（真なら `delete` の `NOT_FOUND`
+//! を許容して release → 記録の削除まで進める）。in_flight=start / stop × Absent は v1 の R5 が書かない組だが、
+//! 復号器は受理するため確定 × Absent と同じに扱う。
+//!
+//! 副作用なし: 呼ぶのは `state` だけで、`delete`・`stop`・`kill`・`start`・`RecordStore::put` / `remove`・
+//! `BundleProvider::release` は呼ばない。registry の `Mutex` を持ったまま照会しない（ロック順序は registry > core）。
+//!
+//! 未実装（REPAIR-3）: `stale_create` の記録の削除と bundle の release・`runtime_owned=false` の記録の
+//! 回収（記録ファイルの削除を含む）・孤児 bundle の回収は R8 #2937、保持役の素性による pending の解決は
 //! R11 #2940、`pod_netns`・provider 識別子の永続と再起動後の `tear_down` は R12 #2941、本番の配線は R9 #2938。
 
-use std::time::Instant;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use tonic::Code;
 
-use super::record::SandboxRecordData;
+use super::container::{ContainerRecord, ContainerState};
+use super::record::{ContainerRecordData, SandboxRecordData};
 use super::{
-    CriRuntimeService, ListBudget, ListLimits, ListedRecord, RecordKind, RecordReadFailure,
-    SandboxRecord, SandboxState,
+    CriRuntimeService, InFlightKind, ListBudget, ListLimits, ListedRecord, RecordKind,
+    RecordReadFailure, SandboxRecord, SandboxState, call_with_deadline, identity_retained_extra,
 };
-use crate::error::CriError;
+use crate::adapter::RuntimeLifecycle;
+use crate::error::{CriError, CriErrorCode};
 use crate::instrument::{CriOpKind, CriOpSample};
 
 /// 壊れた記録の内訳（件数のみ。ID・パスは持たない。REPAIR-4）。
@@ -57,6 +90,8 @@ pub struct BrokenRecordCounts {
     pub unrecognized: usize,
     /// 他の記録と metadata（name・namespace・uid・attempt）が重複した（ID の小さい方を採り、残りは登録しない）。
     pub duplicate_metadata: usize,
+    /// 所属 sandbox が再採用した registry に無い（コンテナ記録のみ。登録も削除もしない。R7）。
+    pub parentless: usize,
 }
 
 impl BrokenRecordCounts {
@@ -68,6 +103,7 @@ impl BrokenRecordCounts {
             + self.unreadable
             + self.unrecognized
             + self.duplicate_metadata
+            + self.parentless
     }
 }
 
@@ -98,6 +134,118 @@ impl SandboxReadoption {
             self.broken.unrecognized,
             self.broken.duplicate_metadata,
         )
+    }
+}
+
+/// [`CriRuntimeService::readopt_containers`] の結果（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ContainerReadoption {
+    /// registry へ戻したコンテナの件数（`present` + `absent_exited` + `remove_pending` + `undetermined`）。
+    pub adopted: usize,
+    /// core に状態があり、その lifecycle（または unknown）で戻した件数。
+    pub present: usize,
+    /// core に無く、記録の値で exited（`runtime_owned=false`）にした件数。
+    pub absent_exited: usize,
+    /// in_flight=remove で core に無く、Remove の続き待ち（unknown・`runtime_owned=true`）にした件数。
+    pub remove_pending: usize,
+    /// core の状態を確定できず `CONTAINER_UNKNOWN` で保持した件数。
+    pub undetermined: usize,
+    /// in_flight=create で core に無く、登録しなかった件数（記録と bundle の回収は R8 #2937）。
+    pub stale_create: usize,
+    /// 登録しなかった壊れた記録の内訳。
+    pub broken: BrokenRecordCounts,
+    stale_create_ids: Vec<String>,
+}
+
+impl ContainerReadoption {
+    /// `stale_create` の ID（昇順）。R8 #2937 が「bundle の release → 記録の削除」の対象にする。
+    pub fn stale_create_ids(&self) -> &[String] {
+        &self.stale_create_ids
+    }
+
+    /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は R9 #2938 が行う。
+    pub fn summary_line(&self) -> String {
+        format!(
+            "cri record readoption: kind=container adopted={} present={} absent_exited={} remove_pending={} undetermined={} stale_create={} broken={} malformed={} not_regular_file={} too_long={} unreadable={} unrecognized={} duplicate_metadata={} parentless={}",
+            self.adopted,
+            self.present,
+            self.absent_exited,
+            self.remove_pending,
+            self.undetermined,
+            self.stale_create,
+            self.broken.total(),
+            self.broken.malformed,
+            self.broken.not_regular_file,
+            self.broken.too_long,
+            self.broken.unreadable,
+            self.broken.unrecognized,
+            self.broken.duplicate_metadata,
+            self.broken.parentless,
+        )
+    }
+}
+
+/// core の状態の照会結果（`RuntimeAdapter::state` の応答を 3 値に写したもの）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreProbe {
+    Present(RuntimeLifecycle),
+    /// `NOT_FOUND` だけ。
+    Absent,
+    /// それ以外の失敗・期限切れ・実行層未注入。
+    Undetermined,
+}
+
+/// 照合の計上先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bucket {
+    Present,
+    AbsentExited,
+    RemovePending,
+    Undetermined,
+}
+
+/// 照合結果（登録する状態と `runtime_owned`。登録しないものは `StaleCreate`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    StaleCreate,
+    Register {
+        state: ContainerState,
+        runtime_owned: bool,
+        bucket: Bucket,
+    },
+}
+
+fn state_of_lifecycle(l: RuntimeLifecycle) -> ContainerState {
+    match l {
+        RuntimeLifecycle::Created => ContainerState::Created,
+        RuntimeLifecycle::Running => ContainerState::Running,
+        RuntimeLifecycle::Stopped => ContainerState::Exited,
+        _ => ContainerState::Unknown,
+    }
+}
+
+/// CRI 記録の `in_flight` と core の状態から、再採用後の状態と `runtime_owned` を決める（モジュール doc の表）。
+fn reconcile(in_flight: Option<InFlightKind>, probe: CoreProbe) -> Outcome {
+    use InFlightKind::{Create, Remove};
+    let register = |state, runtime_owned, bucket| Outcome::Register {
+        state,
+        runtime_owned,
+        bucket,
+    };
+    match (in_flight, probe) {
+        (_, CoreProbe::Undetermined) => {
+            register(ContainerState::Unknown, true, Bucket::Undetermined)
+        }
+        (Some(Create), CoreProbe::Absent) => Outcome::StaleCreate,
+        (Some(Create | Remove), CoreProbe::Present(_)) => {
+            register(ContainerState::Unknown, true, Bucket::Present)
+        }
+        (Some(Remove), CoreProbe::Absent) => {
+            register(ContainerState::Unknown, true, Bucket::RemovePending)
+        }
+        (_, CoreProbe::Present(l)) => register(state_of_lifecycle(l), true, Bucket::Present),
+        (_, CoreProbe::Absent) => register(ContainerState::Exited, false, Bucket::AbsentExited),
     }
 }
 
@@ -236,6 +384,227 @@ impl CriRuntimeService {
             registry.records.extend(accepted);
         }
         Ok(result)
+    }
+
+    /// 記録ストアのコンテナ記録を registry へ戻し、core の状態で照合する（R7 #2936。CRI-1・OCI-7・CORE-1）。
+    ///
+    /// [`Self::readopt_sandboxes`] の後に 1 回だけ呼ぶ。記録ストア未注入なら何もせず件数 0。コンテナの registry が
+    /// 空でなければ `FAILED_PRECONDITION`。所属 sandbox が registry に無い記録は壊れた記録として数える。
+    /// core の照会は `with_runtime` で注入した実行層の `state` だけで、未注入なら全件 unknown で保持する。
+    /// 件数・保持量の上限超過と全体の期限切れは起動を失敗させ、registry は変えない。モジュール doc の契約と表を参照。
+    pub fn readopt_containers(&self, budget: ListBudget) -> Result<ContainerReadoption, CriError> {
+        let Some(store) = self.record_store.as_ref() else {
+            return Ok(ContainerReadoption::default());
+        };
+        let parents: HashSet<String> = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            if !registry.containers.is_empty() {
+                return Err(CriError::failed_precondition(
+                    "container registry is not empty",
+                ));
+            }
+            registry.records.keys().cloned().collect()
+        };
+        let start = Instant::now();
+        let limits = ListLimits::for_kind(RecordKind::Container).with_max_records(
+            RecordKind::Container,
+            self.container_limits.max_containers(),
+        );
+        let mut listing = match store.list(RecordKind::Container, budget, limits) {
+            Ok(l) => l,
+            Err(e) => {
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+        };
+        listing.records.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut result = ContainerReadoption::default();
+        result.broken.unrecognized = listing.unrecognized;
+        for _ in 0..listing.unrecognized {
+            self.record_load(Code::DataLoss, Instant::now());
+        }
+        let mut accepted: Vec<(String, ContainerRecord)> = Vec::new();
+        let mut keys: HashSet<(String, String, u32)> = HashSet::new();
+        let mut retained_total: usize = 0;
+        for ListedRecord { id, outcome } in listing.records {
+            // 読み取り失敗・復号失敗・親不在の分岐も含め、毎回先頭で全体期限を検査する（REPAIR-5）。
+            if start.elapsed() >= budget.total {
+                let e = CriError::timeout("container record readoption timed out");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+            let one = Instant::now();
+            let bytes = match outcome {
+                Ok(b) => b,
+                Err(RecordReadFailure::NotRegularFile) => {
+                    result.broken.not_regular_file += 1;
+                    self.record_load(Code::DataLoss, one);
+                    continue;
+                }
+                Err(RecordReadFailure::TooLong) => {
+                    result.broken.too_long += 1;
+                    self.record_load(Code::DataLoss, one);
+                    continue;
+                }
+                Err(_) => {
+                    result.broken.unreadable += 1;
+                    self.record_load(Code::DataLoss, one);
+                    continue;
+                }
+            };
+            let decoded = match ContainerRecordData::decode(&bytes, id.as_str()) {
+                Ok(d) => d,
+                Err(_) => {
+                    result.broken.malformed += 1;
+                    self.record_load(Code::InvalidArgument, one);
+                    continue;
+                }
+            };
+            let data = decoded.data;
+            if !parents.contains(&data.pod_sandbox_id) {
+                result.broken.parentless += 1;
+                self.record_load(Code::DataLoss, one);
+                continue;
+            }
+            let Some(metadata) = data.config.metadata.as_ref() else {
+                result.broken.malformed += 1;
+                self.record_load(Code::InvalidArgument, one);
+                continue;
+            };
+            let key = (
+                data.pod_sandbox_id.clone(),
+                metadata.name.clone(),
+                metadata.attempt,
+            );
+            let remaining = budget.total.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                let e = CriError::timeout("container record readoption timed out");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+            let probe = self.probe_core(id.as_str(), budget.per_record.min(remaining));
+            if start.elapsed() >= budget.total {
+                let e = CriError::timeout("container record readoption timed out");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+            let (state, runtime_owned, bucket) = match reconcile(data.in_flight, probe) {
+                Outcome::StaleCreate => {
+                    result.stale_create += 1;
+                    result.stale_create_ids.push(id.as_str().to_owned());
+                    self.record_load(Code::Ok, one);
+                    continue;
+                }
+                Outcome::Register {
+                    state,
+                    runtime_owned,
+                    bucket,
+                } => (state, runtime_owned, bucket),
+            };
+            if !keys.insert(key) {
+                result.broken.duplicate_metadata += 1;
+                self.record_load(Code::InvalidArgument, one);
+                continue;
+            }
+            let log_len = data
+                .resolved_log_path
+                .as_ref()
+                .map_or(0, |p| p.as_str().len());
+            let retained_bytes = decoded
+                .retained_bytes
+                .saturating_add(log_len)
+                .saturating_add(identity_retained_extra(
+                    data.applied_user.as_ref(),
+                    data.resolved_image.as_ref(),
+                ));
+            // 復号後の保持量を逐次積算し、accepted へ載せる前に上限超過を拒否する（OOM 防止）。
+            let next_total = retained_total.checked_add(retained_bytes);
+            if accepted.len() >= self.container_limits.max_containers()
+                || next_total.is_none_or(|t| t > self.container_limits.max_retained_bytes())
+            {
+                let e =
+                    CriError::failed_precondition("container records exceed the configured limits");
+                self.record_load(e.code().grpc_code(), start);
+                return Err(e);
+            }
+            retained_total = next_total.unwrap_or(retained_total);
+            match bucket {
+                Bucket::Present => result.present += 1,
+                Bucket::AbsentExited => result.absent_exited += 1,
+                Bucket::RemovePending => result.remove_pending += 1,
+                Bucket::Undetermined => result.undetermined += 1,
+            }
+            accepted.push((
+                id.as_str().to_owned(),
+                ContainerRecord {
+                    pod_sandbox_id: data.pod_sandbox_id,
+                    config: data.config,
+                    state,
+                    created_at_nanos: data.created_at_nanos,
+                    started_at_nanos: data.started_at_nanos,
+                    finished_at_nanos: data.finished_at_nanos,
+                    exit_code: data.exit_code,
+                    termination: data.termination,
+                    retained_bytes,
+                    resolved_log_path: data.resolved_log_path,
+                    in_flight: false,
+                    runtime_owned,
+                    stop_signal: data.stop_signal,
+                    applied_user: data.applied_user,
+                    resolved_image: data.resolved_image,
+                },
+            ));
+            self.record_load(Code::Ok, one);
+        }
+
+        // 登録前にも全体期限を検査する（期限切れは起動失敗で registry を変えない。REPAIR-5）。
+        if start.elapsed() >= budget.total {
+            let e = CriError::timeout("container record readoption timed out");
+            self.record_load(e.code().grpc_code(), start);
+            return Err(e);
+        }
+        result.adopted = accepted.len();
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            if !registry.containers.is_empty() {
+                return Err(CriError::failed_precondition(
+                    "container registry is not empty",
+                ));
+            }
+            registry.container_retained_bytes = retained_total;
+            for (id, record) in accepted {
+                if let Some(m) = record.config.metadata.as_ref() {
+                    registry.container_keys.insert((
+                        record.pod_sandbox_id.clone(),
+                        m.name.clone(),
+                        m.attempt,
+                    ));
+                }
+                registry.containers.insert(id, record);
+            }
+        }
+        Ok(result)
+    }
+
+    /// core の状態を 1 件照会する（`state` だけを呼ぶ。期限は `timeout`。REPAIR-5）。
+    fn probe_core(&self, id: &str, timeout: Duration) -> CoreProbe {
+        let Some(binding) = self.runtime.as_ref() else {
+            return CoreProbe::Undetermined;
+        };
+        let adapter = binding.adapter.clone();
+        let id = id.to_owned();
+        match call_with_deadline(timeout, move || adapter.state(&id)) {
+            Some(Ok(status)) => CoreProbe::Present(status.lifecycle),
+            Some(Err(e)) if e.code() == CriErrorCode::NotFound => CoreProbe::Absent,
+            _ => CoreProbe::Undetermined,
+        }
     }
 
     fn record_load(&self, code: Code, started: Instant) {
@@ -618,5 +987,851 @@ mod tests {
             "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=1 malformed=0 not_regular_file=0 too_long=0 unreadable=0 unrecognized=1 duplicate_metadata=0"
         );
         assert!(!line.contains(&id('a')));
+    }
+    // ---- コンテナ記録の再採用と core の状態との照合（R7 #2936。CRI-1・OCI-7・CORE-1） ----
+
+    use super::super::InFlightKind;
+    use super::super::container::ContainerState;
+    use super::super::record::ContainerRecordData;
+    use super::{Bucket, CoreProbe, Outcome, reconcile, state_of_lifecycle};
+    use crate::adapter::{
+        BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter, RuntimeLifecycle,
+    };
+    use crate::bundle::{AppliedUser, ResolvedImage};
+    use crate::runtime::v1::{
+        ContainerConfig, ContainerMetadata, ImageSpec, RemoveContainerRequest, Signal,
+        StartContainerRequest, runtime_service_server::RuntimeService,
+    };
+    use fandhe_container_core::traits::{
+        ContainerId, ContainerLogPath, ContainerRuntime, ContainerStatus, CreateRequest,
+        DeleteRequest, DeleteResponse, ErrorCode, KillRequest, StartRequest, StateRequest,
+        StopRequest, TraitError,
+    };
+    use fandhe_container_oci::reference::Digest;
+    use std::collections::HashMap;
+
+    /// 種別ごとの列挙を返す偽ストア（put / remove の回数を数える）。
+    #[derive(Debug, Default)]
+    struct KindStore {
+        sandboxes: Mutex<Vec<ListedRecord>>,
+        containers: Mutex<Vec<ListedRecord>>,
+        calls: Mutex<(usize, usize)>,
+    }
+
+    impl RecordStore for KindStore {
+        fn put(&self, _: RecordKind, _: &RecordId, _: &[u8]) -> Result<(), CriError> {
+            self.calls.lock().unwrap().0 += 1;
+            Ok(())
+        }
+        fn remove(&self, _: RecordKind, _: &RecordId) -> Result<(), CriError> {
+            self.calls.lock().unwrap().1 += 1;
+            Ok(())
+        }
+        fn list(
+            &self,
+            kind: RecordKind,
+            _: ListBudget,
+            _: ListLimits,
+        ) -> Result<RecordListing, CriError> {
+            let records = match kind {
+                RecordKind::Sandbox => std::mem::take(&mut *self.sandboxes.lock().unwrap()),
+                RecordKind::Container => std::mem::take(&mut *self.containers.lock().unwrap()),
+            };
+            Ok(RecordListing {
+                records,
+                unrecognized: 0,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Core {
+        Created,
+        Running,
+        Stopped,
+        Creating,
+        Fail(ErrorCode),
+        WrongId,
+        Sleep(Duration),
+    }
+
+    /// core の偽。`state` は map にある ID だけに答え、無い ID は `NOT_FOUND`。呼ばれた操作を全て記録する。
+    #[derive(Default)]
+    struct FakeCore {
+        states: Mutex<HashMap<String, Core>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    struct SharedCore(Arc<FakeCore>);
+
+    impl ContainerRuntime for SharedCore {
+        fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("create:{}", r.id()));
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn start(&self, r: &StartRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", r.id()));
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("kill:{}", r.id()));
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("stop:{}", r.id()));
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("delete:{}", r.id()));
+            if self.0.states.lock().unwrap().contains_key(r.id().as_str()) {
+                Ok(DeleteResponse::new())
+            } else {
+                Err(TraitError::new(ErrorCode::NotFound, "gone"))
+            }
+        }
+        fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("state:{}", r.id()));
+            let known = self.0.states.lock().unwrap().get(r.id().as_str()).copied();
+            let cid = r.id().clone();
+            match known {
+                None => Err(TraitError::new(ErrorCode::NotFound, "gone")),
+                Some(Core::Created) => Ok(ContainerStatus::created(cid, None)),
+                Some(Core::Running) => Ok(ContainerStatus::running(cid, None)),
+                Some(Core::Stopped) => Ok(ContainerStatus::stopped(cid, Some(9))),
+                Some(Core::Creating) => Ok(ContainerStatus::creating(cid)),
+                Some(Core::Fail(c)) => Err(TraitError::new(c, "failed")),
+                Some(Core::WrongId) => Ok(ContainerStatus::running(
+                    ContainerId::new("f".repeat(64)).unwrap(),
+                    None,
+                )),
+                Some(Core::Sleep(d)) => {
+                    std::thread::sleep(d);
+                    Ok(ContainerStatus::running(cid, None))
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CountBundles(Mutex<usize>);
+    impl BundleProvider for CountBundles {
+        fn prepare(&self, _: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
+            Err(CriError::internal("unused"))
+        }
+        fn release(&self, _: &str) -> Result<(), CriError> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    struct Env {
+        svc: CriRuntimeService,
+        store: Arc<KindStore>,
+        core: Arc<FakeCore>,
+        bundles: Arc<CountBundles>,
+        rec: Arc<Rec>,
+    }
+
+    fn env_with(
+        sandboxes: Vec<ListedRecord>,
+        containers: Vec<ListedRecord>,
+        core: &[(String, Core)],
+        with_runtime: bool,
+        build: impl FnOnce(CriRuntimeService) -> CriRuntimeService,
+    ) -> Env {
+        let store = Arc::new(KindStore {
+            sandboxes: Mutex::new(sandboxes),
+            containers: Mutex::new(containers),
+            calls: Mutex::new((0, 0)),
+        });
+        let fake = Arc::new(FakeCore::default());
+        fake.states.lock().unwrap().extend(core.iter().cloned());
+        let bundles = Arc::new(CountBundles::default());
+        let rec = Arc::new(Rec::default());
+        let mut svc =
+            build(CriRuntimeService::with_recorder(rec.clone())).with_record_store(store.clone());
+        if with_runtime {
+            svc = svc.with_runtime(
+                RuntimeAdapter::new(Arc::new(SharedCore(fake.clone()))),
+                bundles.clone(),
+            );
+        }
+        Env {
+            svc,
+            store,
+            core: fake,
+            bundles,
+            rec,
+        }
+    }
+
+    fn env(containers: Vec<ListedRecord>, core: &[(String, Core)]) -> Env {
+        env_with(vec![ok(&data('a', "p"))], containers, core, true, |s| s)
+    }
+
+    fn digest() -> Digest {
+        Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+    }
+
+    const LOG: &str = "/var/log/pods/ns_p_uid/c/0.log";
+
+    fn cdata(
+        c: char,
+        name: &str,
+        in_flight: Option<InFlightKind>,
+        state: ContainerState,
+    ) -> ContainerRecordData {
+        ContainerRecordData {
+            id: id(c),
+            pod_sandbox_id: id('a'),
+            config: ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: name.into(),
+                    attempt: 0,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:1.36".into(),
+                    ..Default::default()
+                }),
+                labels: [("k".to_owned(), "v".to_owned())].into(),
+                ..Default::default()
+            },
+            state,
+            in_flight,
+            created_at_nanos: 1_700_000_000_000_000_001,
+            started_at_nanos: 1_700_000_000_000_000_002,
+            finished_at_nanos: 1_700_000_000_000_000_003,
+            exit_code: Some(7),
+            termination: None,
+            stop_signal: Signal::Sigint as i32,
+            resolved_log_path: Some(ContainerLogPath::new(LOG).unwrap()),
+            applied_user: Some(AppliedUser::new(1000, 1000, vec![2000])),
+            resolved_image: Some(
+                ResolvedImage::new(
+                    digest(),
+                    Some(format!("busybox@sha256:{}", "ab".repeat(32))),
+                )
+                .with_tag(Some("busybox:1.36".into())),
+            ),
+        }
+    }
+
+    fn cok(d: &ContainerRecordData) -> ListedRecord {
+        ListedRecord {
+            id: RecordId::new(&d.id).unwrap(),
+            outcome: Ok(d.encode().unwrap()),
+        }
+    }
+
+    type Snap = (String, ContainerState, bool, bool);
+
+    fn csnap(s: &CriRuntimeService) -> Vec<Snap> {
+        let r = s.registry.lock().unwrap();
+        let mut v: Vec<_> = r
+            .containers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.state, v.runtime_owned, v.in_flight))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn readopt_all(e: &Env) -> Result<super::ContainerReadoption, CriError> {
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        e.svc.readopt_containers(ListBudget::default())
+    }
+
+    fn state_calls(core: &FakeCore) -> Vec<String> {
+        core.calls.lock().unwrap().clone()
+    }
+
+    /// CRI-1・OCI-7・CORE-1: 照合表の全 15 セル（in_flight 5 種 × core 3 種）を具体値で固定する。
+    #[test]
+    fn cri1_oci7_reconcile_table_all_cells() {
+        use ContainerState::{Created, Exited, Running, Unknown};
+        let present = CoreProbe::Present(RuntimeLifecycle::Running);
+        let reg = |state, runtime_owned, bucket| Outcome::Register {
+            state,
+            runtime_owned,
+            bucket,
+        };
+        let cases = [
+            // 確定（in_flight なし）
+            (None, present, reg(Running, true, Bucket::Present)),
+            (
+                None,
+                CoreProbe::Absent,
+                reg(Exited, false, Bucket::AbsentExited),
+            ),
+            (
+                None,
+                CoreProbe::Undetermined,
+                reg(Unknown, true, Bucket::Undetermined),
+            ),
+            // in_flight=create
+            (
+                Some(InFlightKind::Create),
+                present,
+                reg(Unknown, true, Bucket::Present),
+            ),
+            (
+                Some(InFlightKind::Create),
+                CoreProbe::Absent,
+                Outcome::StaleCreate,
+            ),
+            (
+                Some(InFlightKind::Create),
+                CoreProbe::Undetermined,
+                reg(Unknown, true, Bucket::Undetermined),
+            ),
+            // in_flight=start
+            (
+                Some(InFlightKind::Start),
+                present,
+                reg(Running, true, Bucket::Present),
+            ),
+            (
+                Some(InFlightKind::Start),
+                CoreProbe::Absent,
+                reg(Exited, false, Bucket::AbsentExited),
+            ),
+            (
+                Some(InFlightKind::Start),
+                CoreProbe::Undetermined,
+                reg(Unknown, true, Bucket::Undetermined),
+            ),
+            // in_flight=stop
+            (
+                Some(InFlightKind::Stop),
+                present,
+                reg(Running, true, Bucket::Present),
+            ),
+            (
+                Some(InFlightKind::Stop),
+                CoreProbe::Absent,
+                reg(Exited, false, Bucket::AbsentExited),
+            ),
+            (
+                Some(InFlightKind::Stop),
+                CoreProbe::Undetermined,
+                reg(Unknown, true, Bucket::Undetermined),
+            ),
+            // in_flight=remove
+            (
+                Some(InFlightKind::Remove),
+                present,
+                reg(Unknown, true, Bucket::Present),
+            ),
+            (
+                Some(InFlightKind::Remove),
+                CoreProbe::Absent,
+                reg(Unknown, true, Bucket::RemovePending),
+            ),
+            (
+                Some(InFlightKind::Remove),
+                CoreProbe::Undetermined,
+                reg(Unknown, true, Bucket::Undetermined),
+            ),
+        ];
+        for (in_flight, probe, want) in cases {
+            assert_eq!(
+                reconcile(in_flight, probe),
+                want,
+                "{in_flight:?} x {probe:?}"
+            );
+        }
+        // core の lifecycle の写像（確定 × Present）。
+        assert_eq!(state_of_lifecycle(RuntimeLifecycle::Creating), Unknown);
+        assert_eq!(state_of_lifecycle(RuntimeLifecycle::Created), Created);
+        assert_eq!(state_of_lifecycle(RuntimeLifecycle::Running), Running);
+        assert_eq!(state_of_lifecycle(RuntimeLifecycle::Stopped), Exited);
+        assert_eq!(state_of_lifecycle(RuntimeLifecycle::Unknown), Unknown);
+    }
+
+    /// CRI-1・OCI-7: 公開経路での具体値（状態・runtime_owned・計上・保持量）と、core には `state` しか呼ばないこと。
+    #[test]
+    fn cri1_oci7_readopt_containers_values_and_counts() {
+        let recs = [
+            cdata('1', "c1", None, ContainerState::Running),
+            cdata('2', "c2", None, ContainerState::Running),
+            cdata('3', "c3", None, ContainerState::Running),
+            cdata(
+                '4',
+                "c4",
+                Some(InFlightKind::Create),
+                ContainerState::Created,
+            ),
+            cdata(
+                '5',
+                "c5",
+                Some(InFlightKind::Remove),
+                ContainerState::Exited,
+            ),
+            cdata('6', "c6", None, ContainerState::Created),
+            cdata('7', "c7", None, ContainerState::Created),
+        ];
+        let core = [
+            (id('1'), Core::Running),
+            (id('2'), Core::Stopped),
+            // 3・4・5 は core に無い。
+            (id('6'), Core::Fail(ErrorCode::Internal)),
+            (id('7'), Core::Creating),
+            // CRI 記録の無い core のコンテナ（触れない）。
+            (id('e'), Core::Running),
+        ];
+        let e = env(recs.iter().map(cok).collect(), &core);
+        let r = readopt_all(&e).unwrap();
+        assert_eq!(
+            (
+                r.adopted,
+                r.present,
+                r.absent_exited,
+                r.remove_pending,
+                r.undetermined,
+                r.stale_create,
+                r.broken.total()
+            ),
+            (6, 3, 1, 1, 1, 1, 0)
+        );
+        assert_eq!(r.stale_create_ids(), &[id('4')]);
+        assert_eq!(
+            csnap(&e.svc),
+            vec![
+                (id('1'), ContainerState::Running, true, false),
+                (id('2'), ContainerState::Exited, true, false),
+                (id('3'), ContainerState::Exited, false, false),
+                (id('5'), ContainerState::Unknown, true, false),
+                (id('6'), ContainerState::Unknown, true, false),
+                (id('7'), ContainerState::Unknown, true, false),
+            ]
+        );
+        // 記録の値は保持される（終了コードは記録の値。core の 9 では上書きしない）。
+        {
+            let reg = e.svc.registry.lock().unwrap();
+            let c2 = reg.containers.get(&id('2')).unwrap();
+            assert_eq!(c2.exit_code, Some(7));
+            assert_eq!(c2.started_at_nanos, 1_700_000_000_000_000_002);
+            assert_eq!(c2.finished_at_nanos, 1_700_000_000_000_000_003);
+            assert_eq!(c2.stop_signal, Signal::Sigint as i32);
+            assert_eq!(c2.resolved_log_path.as_ref().map(|p| p.as_str()), Some(LOG));
+            assert_eq!(c2.applied_user.as_ref().map(|u| u.uid()), Some(1000));
+            assert_eq!(
+                c2.resolved_image.as_ref().and_then(|i| i.tag()),
+                Some("busybox:1.36")
+            );
+            assert_eq!(reg.container_keys.len(), 6);
+            // 保持量: 数え直した config 分 + ログパス + 識別情報 + イメージ。
+            let d = &recs[1];
+            let base = ContainerRecordData::decode(&d.encode().unwrap(), &d.id)
+                .unwrap()
+                .retained_bytes;
+            let image = d.resolved_image.as_ref().unwrap();
+            let extra = LOG.len()
+                + (4 + 64)
+                + (image.image_ref().len() + image.id_str().len() + "busybox:1.36".len() + 64);
+            assert_eq!(c2.retained_bytes, base + extra);
+            let sum: usize = reg.containers.values().map(|c| c.retained_bytes).sum();
+            assert_eq!(reg.container_retained_bytes, sum);
+        }
+        // 副作用なし: ストアへ書かず消さず、core には記録の 7 件の `state` だけ。
+        assert_eq!(*e.store.calls.lock().unwrap(), (0, 0));
+        assert_eq!(*e.bundles.0.lock().unwrap(), 0);
+        let mut calls = state_calls(&e.core);
+        calls.sort();
+        let want: Vec<String> = "1234567"
+            .chars()
+            .map(|c| format!("state:{}", id(c)))
+            .collect();
+        assert_eq!(calls, want);
+        let codes = load_codes(&e.rec);
+        // sandbox 1 件 + コンテナ 7 件（stale_create を含む）はすべて成功。
+        assert_eq!(codes, vec![Code::Ok; 8]);
+    }
+
+    /// CRI-1・REPAIR-5: 確定できない応答（各種エラー・ID 不一致・期限切れ）は unknown で保持し、何も消さない。
+    #[test]
+    fn cri1_undetermined_keeps_record_and_deletes_nothing() {
+        let cases = [
+            Core::Fail(ErrorCode::Internal),
+            Core::Fail(ErrorCode::Timeout),
+            Core::Fail(ErrorCode::Unavailable),
+            Core::Fail(ErrorCode::PermissionDenied),
+            Core::Fail(ErrorCode::Unimplemented),
+            Core::WrongId,
+            Core::Sleep(Duration::from_millis(300)),
+        ];
+        for (i, case) in cases.into_iter().enumerate() {
+            let c = char::from(b'1' + i as u8);
+            let e = env(
+                vec![cok(&cdata(c, "c", None, ContainerState::Running))],
+                &[(id(c), case)],
+            );
+            let budget = ListBudget {
+                per_record: Duration::from_millis(100),
+                total: Duration::from_secs(5),
+            };
+            e.svc.readopt_sandboxes(budget).unwrap();
+            let r = e.svc.readopt_containers(budget).unwrap();
+            assert_eq!((r.adopted, r.undetermined), (1, 1), "case {i}");
+            assert_eq!(
+                csnap(&e.svc),
+                vec![(id(c), ContainerState::Unknown, true, false)],
+                "case {i}"
+            );
+            assert_eq!(*e.store.calls.lock().unwrap(), (0, 0));
+            assert_eq!(state_calls(&e.core), vec![format!("state:{}", id(c))]);
+            // CONTAINER_UNKNOWN で公開される。
+            let st = e.svc.registry.lock().unwrap().containers[&id(c)].to_status(&id(c));
+            assert_eq!(st.state, v1_unknown());
+        }
+    }
+
+    fn v1_unknown() -> i32 {
+        crate::runtime::v1::ContainerState::ContainerUnknown as i32
+    }
+
+    /// CRI-1: 実行層が未注入なら照会できず、全件 unknown で保持する。記録 0 件なら何もしない。
+    #[test]
+    fn cri1_readopt_containers_without_runtime_holds_unknown() {
+        let e = env_with(
+            vec![ok(&data('a', "p"))],
+            vec![cok(&cdata('1', "c", None, ContainerState::Running))],
+            &[],
+            false,
+            |s| s,
+        );
+        let r = readopt_all(&e).unwrap();
+        assert_eq!((r.adopted, r.undetermined), (1, 1));
+        assert_eq!(
+            csnap(&e.svc),
+            vec![(id('1'), ContainerState::Unknown, true, false)]
+        );
+
+        let e = env_with(vec![ok(&data('a', "p"))], vec![], &[], false, |s| s);
+        let r = readopt_all(&e).unwrap();
+        assert_eq!(r, super::ContainerReadoption::default());
+    }
+
+    /// CRI-1: 所属 sandbox の無い記録は壊れた記録として数え、登録も照会も削除もしない。
+    #[test]
+    fn cri1_parentless_record_is_broken_not_registered() {
+        let mut orphan = cdata('2', "c2", None, ContainerState::Running);
+        orphan.pod_sandbox_id = id('9');
+        let e = env(
+            vec![
+                cok(&cdata('1', "c1", None, ContainerState::Running)),
+                cok(&orphan),
+            ],
+            &[(id('1'), Core::Running), (id('2'), Core::Running)],
+        );
+        let r = readopt_all(&e).unwrap();
+        assert_eq!(
+            (r.adopted, r.broken.parentless, r.broken.total()),
+            (1, 1, 1)
+        );
+        assert_eq!(csnap(&e.svc).len(), 1);
+        assert_eq!(*e.store.calls.lock().unwrap(), (0, 0));
+        assert_eq!(state_calls(&e.core), vec![format!("state:{}", id('1'))]);
+        assert_eq!(load_codes(&e.rec), vec![Code::Ok, Code::Ok, Code::DataLoss]);
+    }
+
+    /// CRI-1: 同じ (sandbox, name, attempt) は ID の小さい方だけ登録する（stale_create を除いた後で判定する）。
+    #[test]
+    fn cri1_duplicate_key_keeps_smaller_id() {
+        let e = env(
+            vec![
+                cok(&cdata(
+                    '1',
+                    "same",
+                    Some(InFlightKind::Create),
+                    ContainerState::Created,
+                )),
+                cok(&cdata('2', "same", None, ContainerState::Running)),
+                cok(&cdata('3', "same", None, ContainerState::Running)),
+            ],
+            &[(id('2'), Core::Running), (id('3'), Core::Running)],
+        );
+        let r = readopt_all(&e).unwrap();
+        // '1' は core に無い create なので登録せず、'2' が鍵を取り、'3' が重複になる。
+        assert_eq!(
+            (r.adopted, r.stale_create, r.broken.duplicate_metadata),
+            (1, 1, 1)
+        );
+        assert_eq!(csnap(&e.svc)[0].0, id('2'));
+    }
+
+    /// CRI-1: コンテナの registry が空でなければ拒否し、記録ストア未注入は何もしない。
+    #[test]
+    fn cri1_readopt_containers_requires_empty_registry_and_store() {
+        let e = env(
+            vec![cok(&cdata('1', "c", None, ContainerState::Running))],
+            &[(id('1'), Core::Running)],
+        );
+        readopt_all(&e).unwrap();
+        let err = e.svc.readopt_containers(ListBudget::default()).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::FailedPrecondition);
+
+        let s = CriRuntimeService::new();
+        assert_eq!(
+            s.readopt_containers(ListBudget::default()).unwrap(),
+            super::ContainerReadoption::default()
+        );
+    }
+
+    /// REPAIR-5: 件数・保持量の上限超過は起動失敗で、registry は空のまま。
+    #[test]
+    fn repair5_container_readopt_over_limits_fails_closed() {
+        let recs = vec![
+            cok(&cdata('1', "c1", None, ContainerState::Running)),
+            cok(&cdata('2', "c2", None, ContainerState::Running)),
+        ];
+        let core = [(id('1'), Core::Running), (id('2'), Core::Running)];
+        for limits in [
+            super::super::ContainerLimits::new().with_max_containers(1),
+            super::super::ContainerLimits::new().with_max_retained_bytes(1),
+        ] {
+            let e = env_with(vec![ok(&data('a', "p"))], recs.clone(), &core, true, |s| {
+                s.with_container_limits(limits)
+            });
+            e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+            let err = e.svc.readopt_containers(ListBudget::default()).unwrap_err();
+            assert_eq!(err.code().grpc_code(), Code::FailedPrecondition);
+            let reg = e.svc.registry.lock().unwrap();
+            assert!(reg.containers.is_empty() && reg.container_keys.is_empty());
+            assert_eq!(reg.container_retained_bytes, 0);
+        }
+    }
+
+    /// REPAIR-5: 照会の途中で全体の期限が切れたら DEADLINE_EXCEEDED で失敗し、registry は空のまま。
+    #[test]
+    fn repair5_container_readopt_total_deadline_fails_closed() {
+        let e = env(
+            vec![
+                cok(&cdata('1', "c1", None, ContainerState::Running)),
+                cok(&cdata('2', "c2", None, ContainerState::Running)),
+            ],
+            &[
+                (id('1'), Core::Sleep(Duration::from_millis(400))),
+                (id('2'), Core::Running),
+            ],
+        );
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        let budget = ListBudget {
+            per_record: Duration::from_secs(1),
+            total: Duration::from_millis(50),
+        };
+        let err = e.svc.readopt_containers(budget).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::DeadlineExceeded);
+        assert!(csnap(&e.svc).is_empty());
+        assert_eq!(*e.store.calls.lock().unwrap(), (0, 0));
+    }
+
+    /// REPAIR-5: 壊れた記録だけの経路でも全体期限を検査し、期限切れなら registry を変えず失敗する。
+    #[test]
+    fn repair5_container_readopt_deadline_checked_on_broken_path() {
+        let broken = ListedRecord {
+            id: RecordId::new(&id('9')).unwrap(),
+            outcome: Ok(b"junk".to_vec()),
+        };
+        let e = env(
+            vec![
+                cok(&cdata('1', "c1", None, ContainerState::Running)),
+                broken,
+            ],
+            &[(id('1'), Core::Running)],
+        );
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        let budget = ListBudget {
+            per_record: Duration::from_secs(1),
+            total: Duration::ZERO,
+        };
+        let err = e.svc.readopt_containers(budget).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::DeadlineExceeded);
+        assert!(csnap(&e.svc).is_empty());
+    }
+
+    /// REPAIR-5: 保持量の積算が上限を超えた時点で拒否する（2 件目で超過）。
+    #[test]
+    fn repair5_container_readopt_cumulative_bytes_rejected_incrementally() {
+        let recs = vec![
+            cok(&cdata('1', "c1", None, ContainerState::Running)),
+            cok(&cdata('2', "c2", None, ContainerState::Running)),
+        ];
+        let core = [(id('1'), Core::Running), (id('2'), Core::Running)];
+        let one = {
+            let e = env(recs[..1].to_vec(), &core);
+            readopt_all(&e).unwrap();
+            e.svc.registry.lock().unwrap().container_retained_bytes
+        };
+        let e = env_with(vec![ok(&data('a', "p"))], recs, &core, true, |s| {
+            s.with_container_limits(
+                super::super::ContainerLimits::new().with_max_retained_bytes(one + 1),
+            )
+        });
+        e.svc.readopt_sandboxes(ListBudget::default()).unwrap();
+        let err = e.svc.readopt_containers(ListBudget::default()).unwrap_err();
+        assert_eq!(err.code().grpc_code(), Code::FailedPrecondition);
+        assert!(csnap(&e.svc).is_empty());
+    }
+
+    /// REPAIR-4: 要約行は固定語彙で、ID を含まない。
+    #[test]
+    fn repair4_container_summary_line_is_fixed_vocabulary() {
+        let e = env(
+            vec![
+                cok(&cdata('1', "c1", None, ContainerState::Running)),
+                cok(&cdata(
+                    '4',
+                    "c4",
+                    Some(InFlightKind::Create),
+                    ContainerState::Created,
+                )),
+            ],
+            &[(id('1'), Core::Running)],
+        );
+        let r = readopt_all(&e).unwrap();
+        let line = r.summary_line();
+        assert_eq!(
+            line,
+            "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=1 broken=0 malformed=0 not_regular_file=0 too_long=0 unreadable=0 unrecognized=0 duplicate_metadata=0 parentless=0"
+        );
+        assert!(!line.contains(&id('1')) && !line.contains(&id('4')));
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// CRI-2: 確定 × core に無い（runtime_owned=false）の Remove は core の delete を呼ばず、メモリ上の除去だけ。
+    #[test]
+    fn cri2_readopted_absent_confirmed_remove_never_calls_core_delete() {
+        let e = env(
+            vec![cok(&cdata('3', "c", None, ContainerState::Running))],
+            &[],
+        );
+        readopt_all(&e).unwrap();
+        rt().block_on(RuntimeService::remove_container(
+            &e.svc,
+            tonic::Request::new(RemoveContainerRequest {
+                container_id: id('3'),
+            }),
+        ))
+        .unwrap();
+        assert!(csnap(&e.svc).is_empty());
+        assert!(
+            !state_calls(&e.core)
+                .iter()
+                .any(|c| c.starts_with("delete:"))
+        );
+        assert_eq!(*e.bundles.0.lock().unwrap(), 0);
+        assert_eq!(e.svc.registry.lock().unwrap().container_retained_bytes, 0);
+    }
+
+    /// CRI-2: in_flight=remove × core に無い は Remove の続きを完了できる（delete の NOT_FOUND を許容し、
+    /// bundle の解放 → 記録の削除まで進む）。
+    #[test]
+    fn cri2_readopted_remove_pending_absent_completes_remove() {
+        let e = env(
+            vec![cok(&cdata(
+                '5',
+                "c",
+                Some(InFlightKind::Remove),
+                ContainerState::Exited,
+            ))],
+            &[],
+        );
+        let r = readopt_all(&e).unwrap();
+        assert_eq!(r.remove_pending, 1);
+        rt().block_on(RuntimeService::remove_container(
+            &e.svc,
+            tonic::Request::new(RemoveContainerRequest {
+                container_id: id('5'),
+            }),
+        ))
+        .unwrap();
+        assert!(csnap(&e.svc).is_empty());
+        let deletes = state_calls(&e.core)
+            .into_iter()
+            .filter(|c| c.starts_with("delete:"))
+            .count();
+        assert_eq!(deletes, 1);
+        assert_eq!(*e.bundles.0.lock().unwrap(), 1);
+        // 記録の削除（RecordStore::remove）が 1 回。
+        assert_eq!(*e.store.calls.lock().unwrap(), (0, 1));
+    }
+
+    /// CRI-2: in_flight=create × core にある は unknown で、Remove は core の delete を 1 回呼ぶ。
+    #[test]
+    fn cri2_readopted_in_flight_create_present_remove_calls_core_delete_once() {
+        let e = env(
+            vec![cok(&cdata(
+                '4',
+                "c",
+                Some(InFlightKind::Create),
+                ContainerState::Created,
+            ))],
+            &[(id('4'), Core::Created)],
+        );
+        readopt_all(&e).unwrap();
+        rt().block_on(RuntimeService::remove_container(
+            &e.svc,
+            tonic::Request::new(RemoveContainerRequest {
+                container_id: id('4'),
+            }),
+        ))
+        .unwrap();
+        let deletes = state_calls(&e.core)
+            .into_iter()
+            .filter(|c| c.starts_with("delete:"))
+            .count();
+        assert_eq!(deletes, 1);
+        assert!(csnap(&e.svc).is_empty());
+    }
+
+    /// CRI-2: 再採用した sandbox は NotReady なので、配下の Created でも Start は拒否される。
+    #[test]
+    fn cri2_readopted_container_start_is_rejected() {
+        let e = env(
+            vec![cok(&cdata('1', "c", None, ContainerState::Created))],
+            &[(id('1'), Core::Created)],
+        );
+        readopt_all(&e).unwrap();
+        let err = rt()
+            .block_on(RuntimeService::start_container(
+                &e.svc,
+                tonic::Request::new(StartContainerRequest {
+                    container_id: id('1'),
+                }),
+            ))
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(!state_calls(&e.core).iter().any(|c| c.starts_with("start:")));
     }
 }

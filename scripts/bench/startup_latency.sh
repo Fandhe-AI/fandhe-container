@@ -62,6 +62,23 @@
 #   execve は観測点より後にずれ込み得る（docs/design/startup-latency-bench.md
 #   「CORE-10 の『プロセス実行開始』との差」・REPAIR-3）。
 #
+# 期限の関係（#3203）:
+#   --timeout（既定 10 秒・1〜120）は start 1 呼び出しの上限でもある。本番 CLI の start の受信期限は
+#   58.9 秒（CLI_START_RECEIVE_DEADLINE_MS）で、既定の 10 秒はそれより短い。start が遅いと CLI が構造化
+#   TIMEOUT を返す前に本スクリプトが打ち切る（runtime-start-failed・exit 1。この場合は stderr に hint を出す）。
+#   CLI 自身の TIMEOUT を観測したいときは --timeout 60 以上を渡す。健全なホストの start は 1 秒未満なので
+#   既定は変えない。後始末の最悪時間は 2 x --timeout のまま有界（REPAIR-5）。
+#
+# --runtime の検査（#3203・PLUG-11 に準ずる）:
+#   symlink は解決し、解決先が通常ファイル・実行可能・所有者が実行ユーザーか root・group / other 書き込み不可で、
+#   解決先の祖先が --output と同じ基準（所有者が自分か root・g/o 書き込み不可。sticky は可）であること。
+#   以降は解決後のパスを exec する。PLUG-11 と揃えない点: 祖先の sticky ディレクトリを可にする。理由は
+#   (a) 本スクリプトは計測ハーネスで plugin の登録ではない、(b) 祖先は全て自分か root の所有を要求するため
+#   sticky な /tmp 配下でも他人は自分のエントリを rename / unlink できない、(c) --output の既存の基準と揃い
+#   自己テストの mktemp -d（/tmp 配下）が使える。残余: bash は fd で exec できないので plugin_trust のような
+#   TOCTOU 耐性は無い（検査は開始時の前提条件で、残余は祖先の検査で抑える。--output と同じ議論）。
+#   所有者が他 uid の場面は root の無い自己テストでは照合できない。
+#
 # 実機での実行手順（#213 向け・#3125。全文は AGENTS.md。未検証: 実機での通しは人間が行う）:
 #   - 計測全体を `systemd-run --user --scope -p Delegate=yes -- bash scripts/bench/startup_latency.sh ...`
 #     で包み、リポジトリのルートから実行する（rootless・非 root。sudo は使わない）。
@@ -69,9 +86,9 @@
 #     「rootless」）。fandhe-container-launcher を CLI の隣に置かない（置くと rootful のランチャー経路が
 #     選ばれる。#2442・SUP-14）。置き場所とその祖先は g/o 書き込み不可にする。rootless の supervisor は
 #     CLI が検証しない運用規則である（REPAIR-3）。
-#   - 結果ファイルは本スクリプトを `--output <新規ファイル>` 付きで直接実行して作る。`make startup-latency`
-#     は実行コマンド行（絶対パス入り）を stdout に出し OUTPUT も受けないため、その stdout は
-#     report モードの入力にならない。docker・report は make で OUTPUT= を渡せる。
+#   - 結果ファイルは `make startup-latency ... OUTPUT=<新規ファイル>`（または本スクリプトを `--output` 付きで
+#     直接実行）で作る。make は実行コマンド行（絶対パス入り）を stdout に出すため、その stdout ではなく
+#     OUTPUT のファイルを report モードの入力にする。WARMUP・TIMEOUT も make で渡せる。
 #   - 終了後に /tmp/fcsl.*・user scope・/sys/fs/cgroup の fc-* の残骸が無いことを確かめる。
 #
 # CLI 経由の誤差（#3124・CORE-10。数値は書かない。実測と合否判定は #213・#230 で人間が行う）:
@@ -132,7 +149,7 @@
 #   1: ランタイムの create / start / state（docker モードは image inspect / run）の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中、計測中の時計の変更を検出した
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（状態ルートのパスが制御ソケットの長さの上限を超える場合を含む。Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
+#   3: 前提ツール欠如（状態ルートのパスが制御ソケットの長さの上限を超える場合を含む。Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・GNU readlink〔-f〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない〔docker モードは cidfile の ID で rm -f できない、
 #      ラベル一覧を取得できない・所有を証明できないコンテナが残っている〕、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
@@ -203,6 +220,15 @@ readonly MIN_CALL_BUDGET_US=100000
 readonly CLOCK_TOLERANCE_US=30000
 # --output の祖先ディレクトリ検査でたどる段数の上限。
 readonly PATH_DEPTH_MAX=256
+# --timeout の上限（秒）。本番 CLI の start の受信期限（下の CLI_START_RECEIVE_DEADLINE_MS = 58.9 秒）に
+# CLI の起動・事前検査・終了の余裕と KILL_AFTER_SECS を足してもなお収まる値にして、CLI 自身の構造化
+# TIMEOUT を観測できるようにする（旧上限 60 秒は差が 1.1 秒しかなかった。#3203）。後始末の最悪時間は
+# 2 x --timeout のまま有界（REPAIR-5）。
+readonly TIMEOUT_MAX_SECS=120
+# 本番 CLI の start の受信期限（ミリ秒）。出典は crates/supervisor/src/start_client.rs の
+# production_deadline()。値が変わったらここも直す（Rust ソースとの機械照合は結合が脆いので置かない）。
+# --timeout がこれより短いと、start が遅いとき CLI の TIMEOUT より先に本スクリプトが打ち切る。
+readonly CLI_START_RECEIVE_DEADLINE_MS=58900
 # report モードで読む入力 JSON の最大サイズ（バイト。jq に渡す前に検査する）。
 readonly RESULT_MAX_BYTES=1048576
 
@@ -218,7 +244,7 @@ usage: startup_latency.sh [--mode oci|docker|report] [options]
   --target <name>      name of the measured runtime recorded as "target" (required except report mode, e.g. own, docker)
   --iterations <1-1000> measured iterations (default: 10)
   --warmup <0-100>     warmup iterations excluded from statistics (default: 1)
-  --timeout <1-60>     per runtime command timeout in seconds (default: 10)
+  --timeout <1-120>    per runtime command timeout in seconds (default: 10)
   --label <name>       label recorded in the output (default: same as --target)
   --output <file>      also write the JSON result to a new file (must not exist)
   -h, --help           show this help
@@ -391,7 +417,7 @@ if [ "$mode" = "report" ]; then
 fi
 check_int iterations "$iterations" 1 1000
 check_int warmup "$warmup" 0 100
-check_int timeout "$timeout_secs" 1 60
+check_int timeout "$timeout_secs" 1 "$TIMEOUT_MAX_SECS"
 # ラベルの既定値は計測対象名（target と label が食い違って取り違えないように）。
 if [ -z "$label" ]; then
   label="$target"
@@ -440,6 +466,20 @@ output_path_is_safe() {
   return 0
 }
 
+# --runtime の実体が信頼できるか（#3203・CORE-10・PLUG-11 の基準に準ずる）。symlink は解決して、
+# 解決先が通常ファイル・実行可能・所有者が実行ユーザーか root・group / other 書き込み不可であり、
+# その親から / までが output_path_is_safe を満たすこと。通れば解決後のパスを stdout に出す。
+runtime_is_trusted() {
+  local real uid
+  real="$(readlink -f -- "$1" 2>/dev/null)" || return 1
+  [ -n "$real" ] || return 1
+  uid="$(id -u)"
+  [ -n "$(find -P "$real" -maxdepth 0 -type f \( -user "$uid" -o -user 0 \) ! -perm /022 -print 2>/dev/null)" ] || return 1
+  [ -x "$real" ] || return 1
+  output_path_is_safe "$(dirname -- "$real")" || return 1
+  printf '%s\n' "$real"
+}
+
 if [ -n "$output" ]; then
   if [ -e "$output" ] || [ -L "$output" ]; then
     err "invalid-output" "--output must not already exist"
@@ -457,7 +497,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep dd ln chmod find id wc; do
+for tool in jq timeout mktemp tail rm sleep dd ln chmod find id wc readlink; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -472,6 +512,15 @@ fi
 if [ -n "$output" ] && ! output_path_is_safe "$output_dir"; then
   err "invalid-output" "the path of --output must not contain symlinks, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
   exit "$EXIT_INPUT"
+fi
+
+# 検査に通ったら、以降は解決後のパスを exec する（検査後の symlink の差し替えを受けない）。
+# CLI は自身の実体のパスから supervisor を探すため、解決後のパスで exec しても振る舞いは変わらない。
+if [ "$mode" != "report" ]; then
+  if ! runtime="$(runtime_is_trusted "$runtime")"; then
+    err "invalid-runtime" "--runtime must resolve (following symlinks) to an executable regular file owned by you or root and not writable by group/other, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
+    exit "$EXIT_INPUT"
+  fi
 fi
 
 tmpdir="$(mktemp -d)"
@@ -1212,9 +1261,14 @@ measure_once() {
   fi
   live_created=1
   t1="$(wall_us)"
-  if ! rt_start "$tmpdir/start-$seq_no.log" "$id"; then
+  start_rc=0
+  rt_start "$tmpdir/start-$seq_no.log" "$id" || start_rc=$?
+  if [ "$start_rc" -ne 0 ]; then
     err "runtime-start-failed" "start failed or timed out for $id"
     show_log "$tmpdir/start-$seq_no.log"
+    if [ "$start_rc" -eq 124 ] && [ $((timeout_secs * 1000)) -lt $((CLI_START_RECEIVE_DEADLINE_MS + 1000)) ]; then
+      echo "hint: start was cut off by --timeout ${timeout_secs}s, shorter than the CLI's own start receive deadline (58.9s); rerun with --timeout 60 or more to see the CLI's structured error" >&2
+    fi
     return 1
   fi
   ts="$(wall_us)"

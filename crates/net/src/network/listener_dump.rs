@@ -30,7 +30,7 @@
 //!
 //! - [`MAX_DUMP_TABLES`] は GETTABLE dump で受け取る ipv4 テーブルの総数
 //! - [`MAX_FANDHE_TABLES`] は接頭辞が一致したテーブル数
-//! - [`MAX_DUMP_RULES`] は全 `fandhe_net_*` テーブルのルール総数（1 公開あたり 2 ルール）
+//! - [`MAX_DUMP_RULES`] は全 `fandhe_net_*` テーブルのルール総数（1 公開あたり 2 ルール、1 ネットワークあたり masquerade 1 ルール）
 //!
 //! 期限は呼び出し側の `Deadline` で dump 全体を覆い、超えたら `Timeout`。dump 中の変更
 //! （`NLM_F_DUMP_INTR`）は `FailedPrecondition` で返し、再試行はしない（公開は fail-closed）。
@@ -507,6 +507,17 @@ mod tests {
         let mut e = NftRuleExprs::new();
         e.push(NftMasq::new().to_expr().expect("m")).expect("push");
         assert_eq!(recognize_dnat_listener(&e).expect("ok"), None);
+    }
+
+    /// NET-3・NET-11・#3073: `create_network` が投入する本番の masquerade ルールは DNAT 照合で無視される。
+    #[test]
+    fn net3_ignores_production_masquerade_rule() {
+        use crate::netlink_route::{IfName, IpPrefix};
+        let gateway = IpPrefix::new(Ipv4Addr::new(10, 88, 0, 1).into(), 24).expect("gw");
+        let bridge = IfName::new("fcbr1234").expect("br");
+        let exprs =
+            crate::network::masquerade::masquerade_rule_exprs(&gateway, &bridge).expect("exprs");
+        assert_eq!(recognize_dnat_listener(&exprs).expect("ok"), None);
     }
 
     /// NET-3: SNAT は DNAT ではないので無視する。

@@ -119,6 +119,7 @@ pub fn run(exe: &Path) {
     ack_timeout(exe);
     recover_intent(exe);
     start_failure_records(exe);
+    stopped_stage2_is_reaped(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -368,6 +369,63 @@ fn start_failure_records(_exe: &Path) {
         );
         assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
     }
+    drop(n);
+    drop(g);
+}
+
+/// 開いている fd の数（`/proc/self/fd`）。
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").expect("fd dir").count()
+}
+
+/// 識別行を出す前に SIGSTOP された段 2（NET-5・REPAIR-5・#3070）。読み取りは poll と絶対期限で終わり
+/// （読み手スレッドが残らない）、段 1 が知らせた pid の pidfd で SIGKILL して回収し、意図記録を消す。
+/// 試験用の偽の段 1 は `SPAWN <pid>` を出して終了し、段 2 相当の `sh` は stdout を持ったまま自分を止める。
+fn stopped_stage2_is_reaped(_exe: &Path) {
+    let tmp = Tmp::new("stopped");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let script = tmp.0.join("fake-stage1.sh");
+    let pidfile = tmp.0.join("stage2.pid");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\n",
+            pidfile.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod");
+
+    let fds_before = open_fd_count();
+    let t = Instant::now();
+    let e = spawn_detached_dns_helper(
+        &n,
+        &script,
+        listen,
+        Duration::from_secs(2),
+        &NoopNetOpRecorder,
+    )
+    .expect_err("no identity line");
+    let took = t.elapsed();
+    assert_eq!(e.code(), NetErrorCode::Timeout, "{}", e.message());
+    // 識別行の期限（2 秒）の後、停止 → 回収の猶予（高々 4 秒）で戻る。
+    assert!(took < Duration::from_secs(9), "{took:?}");
+    assert_eq!(
+        open_fd_count(),
+        fds_before,
+        "no fd or reader thread may remain"
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(gone(pid), "the stopped stage 2 must be killed");
     drop(n);
     drop(g);
 }

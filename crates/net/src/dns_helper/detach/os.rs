@@ -15,14 +15,13 @@ use std::net::SocketAddrV4;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::{
     ACK, ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DNS_HELPER_KILL_REAP_TIMEOUT,
     DNS_HELPER_STAGE1_EXIT_TIMEOUT, DNS_HELPER_STOP_GRACE, DnsHelperStopRequest, HelperProcessOps,
-    IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome, StopOutcome, StopStage,
-    run_stop_sequence,
+    IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX,
+    StopOutcome, StopStage, run_stop_sequence,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -31,7 +30,6 @@ use crate::dns_helper::identity::{
 use crate::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
 use crate::dns_helper::{
     DnsListenAddr, READY_LINE_MAX, check_timeout, kill_reap_or_detach, map_io, parse_ready,
-    read_line_limited,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
@@ -318,49 +316,41 @@ fn spawn_inner(
         return Err(fail_child_may_exist(stdin, e));
     }
 
-    // 識別行と準備完了行を同じ pipe から順に読む。読み手のスレッドは pipe が閉じれば（ヘルパーの終了で）戻る。
-    let (tx, rx) = mpsc::channel::<Result<String, &'static str>>();
-    // OS がスレッドの生成を拒否しても（pids.max 等）panic せず、起動前の後始末をして失敗にする。
-    let reader = std::thread::Builder::new()
-        .name("dns-helper-reader".to_owned())
-        .spawn(move || {
-            let mut out = stdout;
-            let first = read_line_limited(&mut out, IDENT_LINE_MAX);
-            let failed = first.is_err();
-            let _ = tx.send(first);
-            if !failed {
-                let _ = tx.send(read_line_limited(&mut out, READY_LINE_MAX));
-            }
-        });
-    if let Err(e) = reader {
-        return Err(fail_child_may_exist(
-            stdin,
-            map_io("spawn dns helper reader thread", &e),
-        ));
+    // 識別行と準備完了行を同じ pipe から、poll と絶対期限つきで順に読む（読み手のスレッドを作らない。REPAIR-5）。
+    // 段 1 が書く `SPAWN <pid>` 行は段 2 の識別行と前後しうるため、識別行が得られるまで高々 2 行を読む。
+    let mut stdout = stdout;
+    let ident_deadline = Deadline::after(DNS_HELPER_ACK_TIMEOUT);
+    let mut early: Option<OwnedFd> = None;
+    let mut ident_line = None;
+    for _ in 0..2 {
+        match read_line_deadline(&mut stdout, IDENT_LINE_MAX, &ident_deadline) {
+            Ok(l) => match l.strip_prefix(SPAWN_PREFIX) {
+                Some(rest) if early.is_none() => early = adopt_spawned(rest, &nonce),
+                Some(_) => {}
+                None => {
+                    ident_line = Some(l);
+                    break;
+                }
+            },
+            Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
+        }
     }
-
-    let ident_line = match rx.recv_timeout(DNS_HELPER_ACK_TIMEOUT) {
-        Ok(Ok(l)) => l,
-        Ok(Err(msg)) => {
-            return Err(fail_child_may_exist(
-                stdin,
-                err(NetErrorCode::FailedPrecondition, msg),
-            ));
-        }
-        Err(_) => {
-            return Err(fail_child_may_exist(
-                stdin,
-                err(
-                    NetErrorCode::Timeout,
-                    "dns helper did not report its identity before the deadline",
-                ),
-            ));
-        }
+    let Some(ident_line) = ident_line else {
+        return Err(fail_before_ack_any(
+            guard,
+            stdin,
+            early.as_ref(),
+            err(NetErrorCode::FailedPrecondition, "malformed identity line"),
+        ));
     };
     let (identity, pidfd) = match confirm_identity(&ident_line, &nonce) {
         Ok(v) => v,
-        Err(e) => return Err(fail_child_may_exist(stdin, e)),
+        Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
     };
+    if let Some(extra) = early.take_if(|fd| !same_pidfd_pid(fd.as_fd(), identity.pid)) {
+        // 識別行と別の pid を名乗った SPAWN 行の相手は止めておく。
+        let _ = kill_and_confirm(extra.as_fd());
+    }
     let record = match DnsHelperRecord::new(identity.clone(), nonce, listen) {
         Ok(r) => r,
         Err(e) => return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e)),
@@ -375,13 +365,13 @@ fn spawn_inner(
         None => false,
     };
     let result = if acked {
-        match rx.recv_timeout(ready_timeout) {
-            Ok(Ok(line)) => parse_ready(&line, listen.socket_addr()),
-            Ok(Err(msg)) => Err(err(NetErrorCode::FailedPrecondition, msg)),
-            Err(_) => Err(err(
+        match read_line_deadline(&mut stdout, READY_LINE_MAX, &Deadline::after(ready_timeout)) {
+            Ok(line) => parse_ready(&line, listen.socket_addr()),
+            Err(e) if e.code() == NetErrorCode::Timeout => Err(err(
                 NetErrorCode::Timeout,
                 "dns helper was not ready before the deadline",
             )),
+            Err(e) => Err(e),
         }
     } else {
         Err(err(NetErrorCode::Internal, "cannot send ack to dns helper"))
@@ -428,6 +418,119 @@ fn confirm_identity(
         ));
     }
     Ok((identity, pidfd))
+}
+
+/// stdout から 1 行（最大 `max` バイト）を、poll と絶対期限つきで読む。1 バイトずつ読むため続く行を食べない。
+/// poll が可読を返した後の 1 バイト読みはブロックしない（pipe に 1 バイト以上ある、または EOF）。
+fn read_line_deadline(
+    out: &mut (impl std::io::Read + std::os::fd::AsFd),
+    max: usize,
+    deadline: &Deadline,
+) -> Result<String, NetError> {
+    let mut line = Vec::with_capacity(max);
+    let mut byte = [0u8; 1];
+    loop {
+        match sys::wait_readable(out.as_fd(), deadline) {
+            Ok(Readiness::Readable) => {}
+            Ok(Readiness::TimedOut) => {
+                return Err(err(
+                    NetErrorCode::Timeout,
+                    "dns helper did not report before the deadline",
+                ));
+            }
+            // POLLHUP のみ: 書き手が全員閉じた (EOF)。
+            Ok(Readiness::Exceptional) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "helper exited before readiness",
+                ));
+            }
+            Err(_) => {
+                return Err(err(NetErrorCode::Internal, "cannot poll helper output"));
+            }
+        }
+        match out.read(&mut byte) {
+            Ok(0) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "helper exited before readiness",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "cannot read readiness line",
+                ));
+            }
+        }
+        match byte.first().copied() {
+            Some(b'\n') => break,
+            Some(b) if line.len() < max => line.push(b),
+            _ => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "readiness line too long",
+                ));
+            }
+        }
+    }
+    String::from_utf8(line).map_err(|_| {
+        err(
+            NetErrorCode::FailedPrecondition,
+            "readiness line is not UTF-8",
+        )
+    })
+}
+
+/// 段 1 が報告した段 2 の pid（`SPAWN <pid>` 行）から、失敗時の回収に使う pidfd を取る。
+///
+/// 段 2 が識別行を出す前に止まっても（SIGSTOP 等）、この pidfd で SIGKILL と `waitid` による回収ができる。
+/// 生存中なら cmdline の nonce で別のプロセスでないことを確かめる。既に終了していれば（ゾンビは cmdline が
+/// 空）、pid は回収まで再利用されないため、その pidfd を回収に使う。取れなければ `None`（呼び出し側は
+/// 意図記録を残す）。
+fn adopt_spawned(rest: &str, nonce: &HelperNonce) -> Option<OwnedFd> {
+    let pid: u32 = rest.parse().ok().filter(|p| *p != 0)?;
+    let pidfd = open_pidfd(pid).ok()?;
+    let exited = matches!(wait_exit(pidfd.as_fd(), Duration::ZERO), Ok(true));
+    if !exited && !cmdline_has_nonce(pid, nonce).ok()? {
+        return None;
+    }
+    Some(pidfd)
+}
+
+/// pidfd の指す pid が `pid` と一致するか（`/proc/self/fdinfo` を読まず、pidfd を取った pid を使う代わりに
+/// 開き直して比べる）。
+fn same_pidfd_pid(pidfd: BorrowedFd<'_>, pid: u32) -> bool {
+    read_pidfd_pid(pidfd) == Some(pid)
+}
+
+/// `/proc/self/fdinfo/<fd>` の `Pid:` 行。
+fn read_pidfd_pid(pidfd: BorrowedFd<'_>) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let raw = read_limited(
+        PathBuf::from(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())),
+        CMDLINE_MAX_BYTES,
+    )
+    .ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Pid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// 段 2 の pidfd を持つなら止めて回収して意図記録を消し、持たないなら意図記録を残す（ack 前の失敗）。
+fn fail_before_ack_any(
+    guard: &NetworkLockGuard<'_>,
+    stdin: Option<ChildStdin>,
+    pidfd: Option<&OwnedFd>,
+    e: NetError,
+) -> NetError {
+    match pidfd {
+        Some(fd) => fail_before_ack_reap(guard, stdin, fd.as_fd(), e),
+        None => fail_child_may_exist(stdin, e),
+    }
 }
 
 /// 段 1 の `spawn` 自体が失敗した経路（NET-5・REPAIR-5）。子プロセスは存在しないので、意図記録を消してよい。
@@ -637,6 +740,12 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| map_io("spawn dns helper stage 2", &e))?;
+    // 段 2 の pid を起動元へ知らせる（識別行の前に段 2 が止まっても、起動元が pidfd で回収できる）。
+    // 書けなくても起動は続ける（起動元は識別行の期限で失敗にし、意図記録を残す）。
+    {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{SPAWN_PREFIX}{}", child.id()).and_then(|()| out.flush());
+    }
     // 段 2 は待たない。段 1 の終了で init か subreaper の子になり、そこで回収される（二重 fork と同じ形）。
     #[allow(clippy::zombie_processes)]
     drop(child);

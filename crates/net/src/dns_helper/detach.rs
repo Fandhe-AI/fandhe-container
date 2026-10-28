@@ -67,6 +67,9 @@ pub const ARG_NONCE: &str = "--nonce";
 
 #[cfg(target_os = "linux")]
 const IDENT_PREFIX: &str = "IDENT ";
+
+/// 段 1 が段 2 の pid を起動元へ知らせる行の接頭辞（`SPAWN <pid>`）。
+const SPAWN_PREFIX: &str = "SPAWN ";
 #[cfg(target_os = "linux")]
 const ACK: &[u8; 4] = b"ACK\n";
 

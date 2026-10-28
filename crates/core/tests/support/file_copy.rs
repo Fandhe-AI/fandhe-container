@@ -15,8 +15,6 @@
 //! `fandhe_container_*` は use しない。補助 crate は依存追加が要るため採らない（前例は `scratch_root.rs`）。
 //! 単体試験は取り込み先ごとの重複実行を避け、benches の lib（`bundle.rs`）に置く。
 
-#![allow(dead_code)]
-
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 

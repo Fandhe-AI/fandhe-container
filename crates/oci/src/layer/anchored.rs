@@ -339,7 +339,9 @@ mod imp {
                 Err(e) => return Err(map_at_err(&e)),
             };
             let mut buf = vec![0u8; DIRENT_BUF_LEN];
-            remove_at(self.hooks.openat2, dir.as_fd(), name, 0, &mut buf)
+            remove_at(self.hooks.openat2, dir.as_fd(), name, 0, &mut buf, &|| {
+                Ok(())
+            })
         }
 
         /// `comps` のディレクトリ自体は残し、直下を symlink を追従せず木ごと消す（不透明ディレクトリ）。
@@ -364,7 +366,7 @@ mod imp {
             };
             make_removable(&dir)?;
             let mut buf = vec![0u8; DIRENT_BUF_LEN];
-            remove_contents_of(self.hooks.openat2, &dir, 1, &mut buf)
+            remove_contents_of(self.hooks.openat2, &dir, 1, &mut buf, &|| Ok(()))
         }
     }
 
@@ -419,6 +421,17 @@ mod imp {
     /// で拒否し `path` の外を消さない（OCI-1・SEC-5・#2598）。`file_name` を持たない `path`（`/`・`..` 終わり）は
     /// `InvalidArgument`。親が無ければ成功（冪等）。
     pub(in crate::layer) fn remove_path_tree(path: &Path) -> Result<(), OciError> {
+        remove_path_tree_checked(path, &|| Ok(()))
+    }
+
+    /// `remove_path_tree` に確認点 `check` を足した版（期限・取り消し。#3142・CRI-2・REPAIR-5）。
+    ///
+    /// `check` はエントリ 1 件を消す前と、空の走査になるまでの各パスの前に呼ぶ。`Err` ならそこで止まり、消した分は
+    /// 残る（再実行は冪等で続きから進む）。検査（`RESOLVE_DESCEND`・深さ・走査回数）の順序は変えない。
+    pub(in crate::layer) fn remove_path_tree_checked(
+        path: &Path,
+        check: &dyn Fn() -> Result<(), OciError>,
+    ) -> Result<(), OciError> {
         let bad = || err(OciErrorCode::InvalidArgument, "path to remove is invalid");
         let name = path.file_name().ok_or_else(bad)?;
         at::component_cstring(name).map_err(|_| bad())?;
@@ -442,7 +455,7 @@ mod imp {
             Err(e) => return Err(map_fs_err(&e)),
         };
         let mut buf = vec![0u8; DIRENT_BUF_LEN];
-        remove_at(at::openat2, dir.as_fd(), name, 0, &mut buf)
+        remove_at(at::openat2, dir.as_fd(), name, 0, &mut buf, check)
     }
 
     /// `dirfd` 直下の `name`（1 コンポーネント）を symlink を追従せず木ごと消す（存在しなければ成功）。
@@ -452,7 +465,7 @@ mod imp {
     /// `RESOLVE_NO_SYMLINKS` で開き、深さと走査回数に上限がある（`remove_at` を参照）。
     pub(crate) fn remove_name_tree(dirfd: BorrowedFd<'_>, name: &OsStr) -> Result<(), OciError> {
         let mut buf = vec![0u8; DIRENT_BUF_LEN];
-        remove_at(at::openat2, dirfd, name, 0, &mut buf)
+        remove_at(at::openat2, dirfd, name, 0, &mut buf, &|| Ok(()))
     }
 
     /// 所有者の rwx が欠けるディレクトリは権限を戻す（中身を消せるように）。
@@ -476,7 +489,9 @@ mod imp {
         name: &OsStr,
         depth: usize,
         buf: &mut [u8],
+        check: &dyn Fn() -> Result<(), OciError>,
     ) -> Result<(), OciError> {
+        check()?;
         let first = match at::unlinkat_name(dirfd, name, false) {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -508,7 +523,7 @@ mod imp {
             Err(e) => return Err(map_at_err(&e)),
         };
         make_removable(&child)?;
-        remove_contents_of(openat2, &child, depth + 1, buf)?;
+        remove_contents_of(openat2, &child, depth + 1, buf, check)?;
         match at::unlinkat_name(dirfd, name, true) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(()),
@@ -522,8 +537,10 @@ mod imp {
         dir: &File,
         depth: usize,
         buf: &mut [u8],
+        check: &dyn Fn() -> Result<(), OciError>,
     ) -> Result<(), OciError> {
         for _ in 0..MAX_DRAIN_PASSES {
+            check()?;
             (&*dir).rewind().map_err(|e| map_fs_err(&e))?;
             let mut any = false;
             loop {
@@ -538,7 +555,7 @@ mod imp {
                 .map_err(|_| err(OciErrorCode::Internal, "failed to list a directory"))?;
                 for nm in names {
                     any = true;
-                    remove_at(openat2, dir.as_fd(), &nm, depth, buf)?;
+                    remove_at(openat2, dir.as_fd(), &nm, depth, buf, check)?;
                 }
             }
             if !any {
@@ -766,6 +783,14 @@ mod imp {
     pub(in crate::layer) fn remove_path_tree(path: &Path) -> Result<(), OciError> {
         whiteout::remove_tree_nofollow(path)
     }
+
+    /// 確認点つきの版（パス起点。エントリごとに `check` を呼ぶ。#3142）。
+    pub(in crate::layer) fn remove_path_tree_checked(
+        path: &Path,
+        check: &dyn Fn() -> Result<(), OciError>,
+    ) -> Result<(), OciError> {
+        whiteout::remove_tree_nofollow_checked(path, check)
+    }
 }
 
 #[cfg(all(
@@ -773,7 +798,9 @@ mod imp {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) use imp::remove_name_tree;
-pub(super) use imp::{AnchorHooks, AnchoredRoot, map_at_err, remove_path_tree};
+pub(super) use imp::{
+    AnchorHooks, AnchoredRoot, map_at_err, remove_path_tree, remove_path_tree_checked,
+};
 #[cfg(all(
     test,
     target_os = "linux",

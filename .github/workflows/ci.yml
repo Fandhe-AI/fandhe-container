@@ -87,7 +87,8 @@ on:
         default: ''
       repeat-libtest-name:
         description: >-
-          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（`--exact` で単独の試験へ絞り、libtest の --logfile がちょうど 1 行の `ok <名前>` であることで判定し、
+          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（`--exact` で単独の試験へ絞り、
+          libtest の --logfile がちょうど 1 行の `ok <名前>` であることで判定し、
           並列出力の行の割り込みを受けない。repeat-success-line と排他。REPAIR-12・#2962）
         type: string
         default: ''
@@ -1302,6 +1303,27 @@ jobs:
           scripts/check-success-lines.sh --name lo_self_delivery --src crates/net/tests/lo_self_delivery.rs \
             --log "${log}" --select '^lo_self_delivery: lo down timed out' --subst root=false \
             --forbid 'lo_self_delivery: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
+      # netns_holder_userns（`crates/net/tests/netns_holder_userns.rs`。NET-9・CORE-6・SEC-5・REPAIR-5・#3197）:
+      # pasta 構成の netns holder が非特権の user + network namespace（`unshare --user --map-root-user --net`）へ参加し、
+      # capability を落として待機し、同じ uid の別プロセスが `/proc/<holder>/ns/*` を開けることを照合する実機前提テスト
+      # （harness = false）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
+      - name: netns_holder_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-net --test netns_holder_userns --no-run
+
+      - name: netns_holder_userns の実行（実機前提テスト・--ignored。NET-9・CORE-6・#3197）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/netns_holder_userns.log"
+          cargo test -p fandhe-container-net --test netns_holder_userns -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name netns_holder_userns --src crates/net/tests/netns_holder_userns.rs \
+            --log "${log}" --select '^netns_holder_userns: holder joined' \
+            --forbid 'netns_holder_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
       # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
       # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、

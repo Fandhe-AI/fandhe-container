@@ -679,6 +679,11 @@ pub enum CleanupOutcome {
     Removed,
     /// 既に無かった（冪等な再実行）。
     AlreadyAbsent,
+    /// 同じ ID が再作成済みで、新しいインスタンスの資源として消さずに残した（SUP-7・REPAIR-4・#3143）。
+    ///
+    /// 失敗ではないため警告しない（[`DeleteResponse::kept`] にも載せない）。ロック保持中の確認（guard）が
+    /// 偽だったときだけで、ファイルが無くて 0 件だった成功は [`Self::Removed`] のまま。
+    Superseded,
     /// 消せずに残した。`code` は理由の分類。
     Kept {
         /// 残した理由の機械可読な分類。

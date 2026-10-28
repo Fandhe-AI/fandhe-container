@@ -822,3 +822,49 @@ async fn dropped_run_during_confirmation_marks_notready_when_the_put_fails() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+/// `tear_down` が一定時間かかる pod network（共有期限の消費を再現する。#3142）。
+struct SlowNet {
+    delay: Duration,
+}
+
+impl PodNetworkProvider for SlowNet {
+    fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
+        PodNetns::new(std::path::PathBuf::from(format!(
+            "/state/.netns/{}",
+            req.sandbox_id
+        )))
+    }
+    fn tear_down(&self, _sandbox_id: &str) -> Result<(), CriError> {
+        std::thread::sleep(self.delay);
+        Ok(())
+    }
+}
+
+/// CRI-2・REPAIR-5（#3142）: RemovePodSandbox の network_owned の Stop 経路でも、Stop 後の記録の put は共有期限の
+/// 残りで頭打ちになる（`runtime_timeout` を別に丸ごと待たない）。
+#[tokio::test]
+async fn remove_pod_sandbox_stop_put_is_bounded_by_the_shared_deadline() {
+    let log: Log = Arc::default();
+    let (store, gate) = FakeStore::new(&log);
+    let svc = CriRuntimeService::new()
+        .with_runtime_timeout(Duration::from_millis(1000))
+        .with_pod_network(Arc::new(SlowNet {
+            delay: Duration::from_millis(600),
+        }))
+        .with_record_store(store.clone());
+    // put 0 = pending、1 = 確定、2 = Remove 内の Stop の put。
+    let id = run(&svc).await.unwrap();
+    *store.block_put_at.lock().unwrap() = Some(2);
+    let started = std::time::Instant::now();
+    let e = tokio::time::timeout(WAIT, remove(&svc, &id))
+        .await
+        .expect("remove must return within a bounded time")
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1300),
+        "elapsed={elapsed:?}, code={:?}",
+        e.code()
+    );
+    let _ = gate.release.send(());
+}

@@ -2994,6 +2994,38 @@ mod tests {
         assert!(report.leftover.is_empty());
     }
 
+    /// NET-1・REPAIR-3・#3040: 事前作成 netns の経路の失敗が作る請求書（`netns=0`・`pin=-`）は、呼び出し側が
+    /// 持つ pin が実在していても触れない。回収は veth だけを消し、pin の確認・unpin の呼び出しを一切しない
+    /// （pin の解放は呼び出し側の `release_container_netns` の責務。fail-closed）。quarantine つきでも同じ。
+    #[test]
+    fn net1_reclaim_injected_prepared_claim_keeps_caller_pin() {
+        for quarantine in [false, true] {
+            let fake = Fake {
+                pins_present: vec![pin("c1")],
+                ..Default::default()
+            };
+            let report = reclaim_failed_attach_with(
+                &fake,
+                &injected_claim(true, false, quarantine),
+                &netns_dir(),
+            )
+            .unwrap();
+            assert_eq!(
+                report.removed,
+                vec![DeleteResource::Veth(host_of("c1"))],
+                "quarantine={quarantine}"
+            );
+            assert!(report.leftover.is_empty());
+            let calls = fake.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("unpin") || c.starts_with("pin_")),
+                "{calls:?}"
+            );
+        }
+    }
+
     /// NET-1・#2681: pin の解除に失敗したら Netns の取り残しで、veth の回収は続ける。最初のエラーを保持する。
     #[test]
     fn net1_reclaim_attach_unpin_failure_is_leftover() {

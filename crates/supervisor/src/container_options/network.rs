@@ -14,6 +14,8 @@
 //!
 //! - ユーザー定義名(`Named`)と `container:` 始まりは起動経路に結線されておらず `Unimplemented`
 //!   (rootless の pasta は #1940、rootful の参加指定は #3069・#3074)。
+//! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持するだけで、pasta への反映(`pasta_args()` の連結)は
+//!   #1940(NET-9・NET-3。#3200 で kind を足した)。
 //! - `add-host`・`dns` は検証済みの型として保持するだけで、hosts / resolv.conf への反映は #1873(D9)。
 //!   反映されるまで `ContainerOptions::launch_options` が拒否する。
 //! - D8 の host netns の照合と `network_mode=host` のログは #1873。CLI が kind を書く処理と既定の `none` も #1873。
@@ -27,11 +29,15 @@ use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_net::add_host_dns::resolv_conf::{MAX_DNS_SERVERS, ResolvConfPlan};
 use fandhe_container_net::add_host_dns::{AddHostEntry, parse_add_hosts, parse_ip_addr};
 use fandhe_container_net::error::{NetError, NetErrorCode};
+use fandhe_container_net::network::MAX_PORT_PUBLISHES;
 use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::network_mode::NetworkMode;
+use fandhe_container_net::pasta::PastaPortForwards;
 
 /// 予約名の固定拒否文言。
 const RESERVED_NAME_MESSAGE: &str = "reserved network name";
+/// `publish` がユーザー定義名の `network` と組でないときの固定拒否文言。
+const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "publish records require a user-defined network";
 /// 結線されていない指定の固定拒否文言。
 const NAMED_NOT_WIRED_MESSAGE: &str = "user-defined networks are not wired to the launch path yet";
 
@@ -55,6 +61,7 @@ pub struct NetworkOptions {
     selection: Option<NetworkSelection>,
     add_hosts: Vec<AddHostEntry>,
     dns: Vec<IpAddr>,
+    publish: PastaPortForwards,
 }
 
 /// 予約名(`bridge`・`default`)か(D1)。
@@ -80,13 +87,22 @@ impl NetworkOptions {
     ///    それ以外は `NetworkName::new` で検証して `Named`
     /// 2. `add_hosts`: 全件を `parse_add_hosts` で検証
     /// 3. `dns`: 全件を `parse_ip_addr` で検証し、`none` / `host` では `ResolvConfPlan::for_mode` も通す
-    /// 4. `network` が無いのに `add_hosts` / `dns` がある不整合は拒否する(CLI は必ず `network` を書くため、
+    /// 4. `publish`: 件数を確かめてから `PastaPortForwards::parse_all` で全件を検証し、ユーザー定義名の
+    ///    `network` が無い組(無指定・`none`・`host`・`container:`)は拒否する(#3200・NET-9)
+    /// 5. `network` が無いのに `add_hosts` / `dns` がある不整合は拒否する(CLI は必ず `network` を書くため、
     ///    この形は改ざんか不整合でしか生じない。fail-closed)
     pub fn parse(
         network: Option<&str>,
         add_hosts: &[String],
         dns: &[String],
+        publish: &[String],
     ) -> Result<Self, TraitError> {
+        if publish.len() > MAX_PORT_PUBLISHES {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "too many publish records",
+            ));
+        }
         // 確保前の件数検証: モードによらず上限を超える `dns` は入口で拒否する(Named にも効かせる)。
         if dns.len() > MAX_DNS_SERVERS {
             return Err(TraitError::new(
@@ -135,6 +151,15 @@ impl NetworkOptions {
                 "add-host / dns records require a network record",
             ));
         }
+        let forwards = PastaPortForwards::parse_all(publish.iter().map(String::as_str))
+            .map_err(|e| net_error_to_trait(&e))?;
+        // `container:` は `selection` が `None` なので、ここで併せて拒否される。
+        if !forwards.is_empty() && !matches!(selection, Some(NetworkSelection::Named(_))) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                PUBLISH_NEEDS_NAMED_MESSAGE,
+            ));
+        }
         if container_ref {
             return Err(TraitError::new(
                 ErrorCode::Unimplemented,
@@ -145,6 +170,7 @@ impl NetworkOptions {
             selection,
             add_hosts: entries,
             dns: addrs,
+            publish: forwards,
         })
     }
 
@@ -177,9 +203,17 @@ impl NetworkOptions {
         &self.dns
     }
 
+    /// 検証済みの `-p` / `--publish`(pasta の引数への変換は `PastaPortForwards::pasta_args`。#1940 が連結する)。
+    pub fn publish(&self) -> &PastaPortForwards {
+        &self.publish
+    }
+
     /// 何も指定していないか。
     pub fn is_empty(&self) -> bool {
-        self.selection.is_none() && self.add_hosts.is_empty() && self.dns.is_empty()
+        self.selection.is_none()
+            && self.add_hosts.is_empty()
+            && self.dns.is_empty()
+            && self.publish.is_empty()
     }
 }
 
@@ -194,7 +228,12 @@ mod tests {
     ) -> Result<NetworkOptions, TraitError> {
         let h: Vec<String> = hosts.iter().map(|s| (*s).to_owned()).collect();
         let d: Vec<String> = dns.iter().map(|s| (*s).to_owned()).collect();
-        NetworkOptions::parse(network, &h, &d)
+        NetworkOptions::parse(network, &h, &d, &[])
+    }
+
+    fn pp(network: Option<&str>, publish: &[&str]) -> Result<NetworkOptions, TraitError> {
+        let v: Vec<String> = publish.iter().map(|s| (*s).to_owned()).collect();
+        NetworkOptions::parse(network, &[], &[], &v)
     }
 
     fn code(r: Result<NetworkOptions, TraitError>) -> Option<ErrorCode> {
@@ -315,5 +354,62 @@ mod tests {
             ErrorCode::ResourceExhausted
         );
         assert_eq!(m(NetErrorCode::Timeout), ErrorCode::Internal);
+    }
+
+    /// NET-9・#3200: `publish` はユーザー定義名の `network` と組のときだけ受ける。
+    #[test]
+    fn net9_publish_decision_table() {
+        let o = pp(Some("web"), &["8080:80", "0.0.0.0:53:53/udp"]).expect("named");
+        assert_eq!(o.publish().len(), 2);
+        assert_eq!(
+            o.publish().pasta_args(),
+            [
+                "-t",
+                "127.0.0.1/8080:80",
+                "-u",
+                "0.0.0.0/53:53",
+                "-T",
+                "none",
+                "-U",
+                "none"
+            ]
+        );
+        assert!(!o.is_empty());
+        for n in [None, Some("none"), Some("host"), Some("container:x")] {
+            let e = pp(n, &["8080:80"]).expect_err("needs named");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{n:?}");
+            assert_eq!(
+                e.message(),
+                "publish records require a user-defined network"
+            );
+        }
+        // 空の publish は従来どおり。
+        assert!(pp(Some("host"), &[]).is_ok());
+    }
+
+    /// NET-9・#3200: 不正な指定と件数超過は net の固定文言のまま拒否する。
+    #[test]
+    fn net9_publish_invalid_and_count_limit() {
+        for bad in ["[::1]:80:80", "0:80", "1-2:80", "80:80/sctp", ""] {
+            assert_eq!(
+                pp(Some("web"), &[bad]).err().map(|e| e.code()),
+                INV,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            pp(Some("web"), &["8080:80", "8080:80"])
+                .err()
+                .map(|e| e.code()),
+            INV
+        );
+        let over: Vec<String> = (0..=MAX_PORT_PUBLISHES)
+            .map(|i| format!("{}:80", 1000 + i))
+            .collect();
+        let refs: Vec<&str> = over.iter().map(String::as_str).collect();
+        let e = pp(Some("web"), &refs).expect_err("over");
+        assert_eq!(e.message(), "too many publish records");
+        let e = pp(Some("web"), &["[::1]:80:80"]).expect_err("v6");
+        assert!(!e.message().contains("::1"), "{}", e.message());
     }
 }

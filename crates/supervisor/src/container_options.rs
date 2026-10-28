@@ -62,6 +62,7 @@ pub mod ipc;
 pub mod labels;
 pub mod mounts;
 pub mod network;
+pub mod pasta;
 pub mod secrets;
 pub mod store;
 
@@ -588,7 +589,7 @@ mod tests {
             let h: Vec<String> = hosts.iter().map(|s| (*s).to_owned()).collect();
             let d: Vec<String> = dns.iter().map(|s| (*s).to_owned()).collect();
             ContainerOptions::new()
-                .with_network(NetworkOptions::parse(Some("host"), &h, &d).expect("parse"))
+                .with_network(NetworkOptions::parse(Some("host"), &h, &d, &[]).expect("parse"))
         };
         let e = with(&["web:192.0.2.1"], &[])
             .launch_options()

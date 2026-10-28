@@ -315,7 +315,8 @@ pub fn mount_fstype_by_id(mountinfo: &[u8], mount_id: u64) -> Result<String, Mou
 /// 呼び出し側（`add_host_dns::hosts_file` は理由ごとの message に写す）が理由を型で区別できるように
 /// する。io::Error の文字列から理由を読み戻さない（REPAIR-1）。
 /// `Missing`・`Duplicate`・`Invalid` の判定は core の `mountinfo_identity` の同名の型と揃える
-/// （#2974・SEC-1・NET-1・REPAIR-2。実装は共有しない）。
+/// （#2974・SEC-1・NET-1・REPAIR-2。実装は共有しない。判断は `docs/design/fdinfo-mnt-id-parsing.md`・#3140 で、
+/// 一致は共有 fixture の `repair1_net_fdinfo_mnt_id_shared_cases` が機械照合する）。
 #[derive(Debug)]
 pub(crate) enum FdinfoMountIdError {
     /// `/proc/self/fdinfo/<fd>` を開けない・読めない（元の io::Error を保つ）。
@@ -336,15 +337,25 @@ pub(crate) enum FdinfoMountIdError {
 /// `add_host_dns::hosts_file::verify_same_mount`（NET-12・P0）。読めない・上限超過・行が無い・
 /// 重複する・値が不正な場合はすべてエラーで、呼び出し側は fail-closed で扱う。読み込みは上限つき。
 pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdError> {
+    let f = File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .map_err(FdinfoMountIdError::Read)?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(f)?)
+}
+
+/// `r` を [`MAX_FDINFO_READ`] までだけ読む。超過は切り捨てず `TooLarge`（fail-closed。確保量は上限 + 1 で頭打ち）。
+///
+/// core・gpu の `read_fdinfo_bounded` と同じ形に分けた純関数で、共有 fixture の照合試験
+/// （`repair1_net_fdinfo_mnt_id_shared_cases`・#3140）が `Cursor` で呼ぶ。
+fn read_fdinfo_bounded(r: impl std::io::Read) -> Result<Vec<u8>, FdinfoMountIdError> {
     use std::io::Read as _;
     let mut buf = Vec::new();
-    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
-        .and_then(|f| f.take(MAX_FDINFO_READ + 1).read_to_end(&mut buf))
+    r.take(MAX_FDINFO_READ + 1)
+        .read_to_end(&mut buf)
         .map_err(FdinfoMountIdError::Read)?;
     if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
         return Err(FdinfoMountIdError::TooLarge);
     }
-    parse_fdinfo_mnt_id(&buf)
+    Ok(buf)
 }
 
 /// 開いたファイルが属するマウントの ID（mountinfo の 1 番目の欄と同じ値）を `/proc/self/fdinfo/<fd>` の
@@ -1897,6 +1908,81 @@ mod tests {
             ),
             MountOptionState::Present
         );
+    }
+
+    /// REPAIR-1・SEC-1・#3140: core の fixture（`crates/core/testdata/fdinfo_mnt_id_cases.txt`）の全事例で、解析結果が期待と一致する。UTF-8 でない本文の差だけ `net=` で上書きできる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_net_fdinfo_mnt_id_shared_cases() {
+        use std::io::Cursor;
+        const CASES: &str = include_str!("../../core/testdata/fdinfo_mnt_id_cases.txt");
+
+        fn hex(s: &str) -> Vec<u8> {
+            if s == "-" {
+                return Vec::new();
+            }
+            assert!(s.len().is_multiple_of(2), "odd hex: {s}");
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        let classify = |bytes: &[u8]| -> String {
+            match read_fdinfo_bounded(Cursor::new(bytes)).and_then(|t| parse_fdinfo_mnt_id(&t)) {
+                Ok(n) => format!("ok:{n}"),
+                Err(FdinfoMountIdError::Read(_)) => "read".into(),
+                Err(FdinfoMountIdError::TooLarge) => "too_large".into(),
+                Err(FdinfoMountIdError::Missing) => "missing".into(),
+                Err(FdinfoMountIdError::Duplicate) => "duplicate".into(),
+                Err(FdinfoMountIdError::Invalid) => "invalid".into(),
+            }
+        };
+        let mut max_bytes = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut count = 0usize;
+        for line in CASES
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f[0] == "max_bytes" {
+                max_bytes = Some(f[1].parse::<u64>().expect("max_bytes"));
+                continue;
+            }
+            let bytes = hex(f[1]);
+            let shared = f[2];
+            let over = f
+                .get(3)
+                .map(|o| o.strip_prefix("net=").expect("net= prefix"));
+            let want = over.unwrap_or(shared);
+            // net= の上書きは「UTF-8 でない本文」の差の事例（0x80 以上のバイトを含む入力）にだけ許す。
+            assert!(
+                over.is_none() || bytes.iter().any(|b| *b >= 0x80),
+                "{}: net= is only for non-UTF-8 cases",
+                f[0]
+            );
+            let got = classify(&bytes);
+            assert_eq!(
+                got,
+                want,
+                "case {}: input {:?}",
+                f[0],
+                String::from_utf8_lossy(&bytes)
+            );
+            seen.insert(shared.split(':').next().unwrap().to_string());
+            count += 1;
+        }
+        assert!(count >= 16, "fixture is too small: {count}");
+        for k in ["ok", "missing", "duplicate", "invalid", "read"] {
+            assert!(seen.contains(k), "fixture has no {k} case");
+        }
+        let max = max_bytes.expect("max_bytes line");
+        assert_eq!(max, MAX_FDINFO_READ, "limit constant differs from fixture");
+        let n = usize::try_from(max).unwrap();
+        assert_eq!(classify(&vec![b'a'; n]), "missing");
+        assert_eq!(classify(&vec![b'a'; n + 1]), "too_large");
     }
 
     /// NET-12・TASK-185.2・REPAIR-1（P0）: fdinfo の `mnt_id:` 行だけを数値で取り出し、無い・壊れた値は拒否する。

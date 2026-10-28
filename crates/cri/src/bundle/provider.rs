@@ -30,7 +30,7 @@ use super::resolv_conf;
 use super::spec::{
     BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods, validate_config_with_pods,
 };
-use crate::adapter::{BundleProvider, BundleRequest, PreparedBundle};
+use crate::adapter::{BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget};
 use crate::error::CriError;
 use crate::runtime::v1::{ImageSpec, SupplementalGroupsPolicy};
 use crate::stop_signal::resolve_stop_signal;
@@ -111,6 +111,12 @@ pub trait RootfsSource: Send + Sync {
 
     /// `prepare` で作った rootfs を解放する（不在は `Ok`）。
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
+
+    /// `release` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5）。既定は予算を無視して `release` を呼ぶ。
+    fn release_bounded(&self, rootfs: &Path, budget: &ReleaseBudget<'_>) -> Result<(), CriError> {
+        let _ = budget;
+        self.release(rootfs)
+    }
 }
 
 /// `SpecBundleProvider::list_bundle_ids` の結果（R8 #2937）。ID 以外は件数のみ。
@@ -502,6 +508,14 @@ impl BundleProvider for SpecBundleProvider {
     }
 
     fn release(&self, container_id: &str) -> Result<(), CriError> {
+        self.release_bounded(container_id, &ReleaseBudget::new())
+    }
+
+    fn release_bounded(
+        &self,
+        container_id: &str,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
         let dir = self.bundle_dir(container_id)?;
         // この provider が作っていない実体（prepare が既存を理由に拒否した ID）は消さない。
         if self.lock_refused().remove(container_id) {
@@ -517,7 +531,9 @@ impl BundleProvider for SpecBundleProvider {
         if !meta.file_type().is_dir() {
             return Err(CriError::internal("bundle path is not a directory"));
         }
-        self.rootfs.release(&dir.join("rootfs"))?;
+        budget.check()?;
+        self.rootfs.release_bounded(&dir.join("rootfs"), budget)?;
+        // rootfs を消した後の bundle 直下は小さなファイル（config.json 等）だけで、分割しない。
         fs::remove_dir_all(&dir).map_err(|_| CriError::internal("failed to remove bundle"))
     }
 }

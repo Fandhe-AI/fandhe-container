@@ -72,6 +72,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
 #[cfg(target_os = "linux")]
+use crate::supervised::FORCE_DELETE_STOP_BUDGET;
+#[cfg(target_os = "linux")]
 use crate::supervised::SupervisedLifecycle;
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink, RECORD_WAIT_LIMIT};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
@@ -402,8 +404,9 @@ impl CriPluginBackends {
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
 ///
 /// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
-/// running への force `delete` の最悪: 全体を [`PLUGIN_FORCE_DELETE_DEADLINE`]（47 秒）で打ち切る。後始末の前は stop 17 秒、状態の読み取り 5 秒、
-/// core の delete 20 秒（状態ロック 3 回と exec 掃除 5 秒）の計 42 秒で、後始末（ログ 2 件〔共有の待ち 10 秒と各最後の試行 5 秒ずつ。#2964〕と
+/// running への force `delete` の最悪: 全体を [`PLUGIN_FORCE_DELETE_DEADLINE`]（47 秒）で打ち切る。後始末の前は、状態の読み取り 5 秒、
+/// stop 22 秒（`FORCE_DELETE_STOP_BUDGET`。状態ロックの待ちを含めて各段を admission で頭打ちにする。#3143）、
+/// core の delete 20 秒（状態ロック 3 回と exec 掃除 5 秒）の計 47 秒で、後始末（ログ 2 件〔共有の待ち 10 秒と各最後の試行 5 秒ずつ。#2964〕と
 /// 起動オプション文書 10 秒）は 47 秒までの残りに収める（#3027）。bundle の解放は件数で有界（`runtime_remove_one`）。
 /// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
 /// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
@@ -414,11 +417,13 @@ pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
 
 /// `CoreLifecycleRuntime::delete`（force を含む）が自分で守る全体の期限（REPAIR-5・CRI-2・#3027）。
 ///
-/// 従来の文書が最悪として書いていた stop 17 秒 + ログ 2 件 20 秒 + 起動オプション文書 10 秒 = 47 秒をそのまま上限にする。
+/// 従来の文書が最悪として書いていた stop 17 秒 + ログ 2 件 20 秒 + 起動オプション文書 10 秒 = 47 秒をそのまま上限にする
+/// （17 秒は signaler の期限だけを数えた名目で、状態ロックの待ちを含めた stop の厳密な最悪は 42 秒。force delete の stop には
+/// 予算 `FORCE_DELETE_STOP_BUDGET`〔22 秒〕を持たせ、前置きの読み取り 5 秒・core の delete 20 秒と合わせて 47 秒に収める。#3143）。
 /// 後始末（ログ・起動オプション文書）の各段は、いまの上限とこの期限までの残りの小さい方で試し、残りが 0 の段は試さず
 /// `Timeout` として残す（消さずに残す側。`Kept` と警告行で知らせる）。core の delete を含む stop までの 42 秒は
-/// 打ち切れないが、この値より先に終わる。`PLUGIN_RUNTIME_TIMEOUT` との余裕（13.9 秒）は I/O の時間と、数えていない
-/// stop 内の状態ロックの待ちに充てる。
+/// 打ち切れないが、この値より先に終わる（stop は予算つき、core の delete の 20 秒は上限）。
+/// `PLUGIN_RUNTIME_TIMEOUT` との余裕（13.9 秒）は I/O の時間だけに充てる（#3143）。
 pub const PLUGIN_FORCE_DELETE_DEADLINE: Duration = Duration::from_secs(47);
 
 /// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
@@ -481,6 +486,8 @@ pub fn sweep_leftover_container_logs(
 /// ロックが待ちの期限まで解放されなかったときは `FailedPrecondition`（`remove_guarded_bounded_waiting` が分類する）。
 fn cleanup_outcome_of(result: &Result<RemovedLogs, TraitError>) -> CleanupOutcome {
     match result {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
         Ok(_) => CleanupOutcome::Removed,
         Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
@@ -725,12 +732,27 @@ fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode
 ///
 /// `CleanupTarget`（plugin 境界の型）には語彙を足さないため、`target` はこの module の固定文字列 `container_options` を使う。
 /// 値は `ContainerId`・`ErrorCode::as_str` の固定語彙だけで、パス・errno・文書の中身（env の値）を含めない（ERR-1・ERR-2）。
-fn options_cleanup_warning_line(id: &ContainerId, code: ErrorCode) -> String {
+fn options_cleanup_warning_line(id: &ContainerId, failure: OptionsCleanupFailure) -> String {
+    // 全体の期限を使い切って試さなかった段は、文書が実在したか確かめていない。警告行だけを見た読み手が「文書が残った」と
+    // 誤読しないよう `existence` で示す（`reason` の語彙は増やさない。#3027 の決定。#3143・REPAIR-4）。
+    let (code, existence) = match failure {
+        OptionsCleanupFailure::Skipped => (ErrorCode::Timeout, ",\"existence\":\"unverified\""),
+        OptionsCleanupFailure::Failed(code) => (code, ""),
+    };
     format!(
-        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"container_options\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}",
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"container_options\",\"code\":\"{}\"{existence},\"message\":\"cleanup after delete left resources behind\"}}",
         id.as_str(),
         code.as_str()
     )
+}
+
+/// 起動オプション文書の掃除が残した理由（`remove_stale_options` の失敗。#3143・REPAIR-4・REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionsCleanupFailure {
+    /// 全体の期限を使い切り、文書の存在を確かめずに試さなかった（コードは `Timeout` 固定）。
+    Skipped,
+    /// 試して失敗した。
+    Failed(ErrorCode),
 }
 
 /// `create` の拒否の記録先を包み、記録の失敗を固定語彙の 1 行で stderr へ残す（結果は内側のまま返す。#2594）。
@@ -1147,10 +1169,7 @@ impl CoreLifecycleRuntime {
         {
             let _ = self.recorder.record(&name, OpOutcome::Failure, elapsed);
         }
-        match removed {
-            Ok(_) => CleanupOutcome::Removed,
-            Err(e) => CleanupOutcome::Kept { code: e.code() },
-        }
+        cleanup_outcome_of(&removed)
     }
 }
 
@@ -1211,7 +1230,11 @@ impl CoreLifecycleRuntime {
     ///
     /// `remaining` は呼び出し元の残りの予算（`create` は `OPTIONS_REMOVE_TIMEOUT`、`delete` は全体の期限までの残り。#3027）。
     /// 全体の期限と `OPTIONS_REMOVE_TIMEOUT` の小さい方を期限にし、ロックの待ちはそれ以下にする。0 なら試さず `Timeout`。
-    fn remove_stale_options(&self, id: &ContainerId, remaining: Duration) -> Result<(), ErrorCode> {
+    fn remove_stale_options(
+        &self,
+        id: &ContainerId,
+        remaining: Duration,
+    ) -> Result<(), OptionsCleanupFailure> {
         use fandhe_container_supervisor::container_options::store as options_store;
         let Some(root) = self.store.host_state_root() else {
             return Ok(());
@@ -1220,7 +1243,8 @@ impl CoreLifecycleRuntime {
         let store = Arc::clone(&self.store);
         let guard_id = id.clone();
         let timeout = remaining.min(options_store::OPTIONS_REMOVE_TIMEOUT);
-        let removed = if timeout.is_zero() {
+        let skipped = timeout.is_zero();
+        let removed = if skipped {
             Err(delete_deadline_exhausted())
         } else {
             options_store::remove_stale_bounded(
@@ -1240,7 +1264,11 @@ impl CoreLifecycleRuntime {
                         .recorder
                         .record(&name, OpOutcome::Failure, started.elapsed());
                 }
-                Err(e.code())
+                Err(if skipped {
+                    OptionsCleanupFailure::Skipped
+                } else {
+                    OptionsCleanupFailure::Failed(e.code())
+                })
             }
         }
     }
@@ -1302,7 +1330,8 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
 impl CoreLifecycleRuntime {
     /// force 削除の前に、生きている（Running・pid あり、または pid あり Created）コンテナを停止して終了を確認する。
     ///
-    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界（REPAIR-5）。記録が無い・停止済み・
+    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界、かつ全体を `FORCE_DELETE_STOP_BUDGET` で
+    /// 頭打ちにする（REPAIR-5・#3143）。記録が無い・停止済み・
     /// pid の無い状態は何もせず、core の delete の判定に任せる。
     #[cfg(target_os = "linux")]
     fn stop_live_before_force_delete(&self, id: &ContainerId) -> Result<(), TraitError> {
@@ -1318,7 +1347,13 @@ impl CoreLifecycleRuntime {
         ) && status.pid().is_some();
         if live {
             let stop = StopRequest::new(id.clone(), Duration::ZERO)?;
-            self.supervised.stop(&*self.store, &self.recorder, &stop)?;
+            // 予算つき: 状態ロックの待ちを含めて stop の最悪を頭打ちにし、delete 全体を期限に収める（#3143・REPAIR-5）。
+            self.supervised.stop_within(
+                &*self.store,
+                &self.recorder,
+                &stop,
+                Some(FORCE_DELETE_STOP_BUDGET),
+            )?;
         }
         Ok(())
     }
@@ -1399,8 +1434,8 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             remaining(),
         );
         // 起動オプション文書の残骸（記録の無くなった ID の分。失敗は応答に載せず、計上と構造化ログで知らせる。#2760）。
-        if let Err(code) = self.remove_stale_options(req.id(), remaining()) {
-            (self.cleanup_warn)(options_cleanup_warning_line(req.id(), code));
+        if let Err(failure) = self.remove_stale_options(req.id(), remaining()) {
+            (self.cleanup_warn)(options_cleanup_warning_line(req.id(), failure));
         }
         let response = response
             .with_supervisor_log(supervisor_log)
@@ -1822,8 +1857,13 @@ mod tests {
                 .contains("reason")
         );
         assert_eq!(
-            options_cleanup_warning_line(&id, ErrorCode::Timeout),
+            options_cleanup_warning_line(&id, OptionsCleanupFailure::Failed(ErrorCode::Timeout)),
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        // 試さなかった段（期限切れ）だけ `existence` を足す。試して失敗した行は従来のまま（#3143）。
+        assert_eq!(
+            options_cleanup_warning_line(&id, OptionsCleanupFailure::Skipped),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
         );
     }
 
@@ -1856,7 +1896,10 @@ mod tests {
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
         );
         assert_eq!(
-            options_cleanup_warning_line(&id, ErrorCode::ResourceExhausted),
+            options_cleanup_warning_line(
+                &id,
+                OptionsCleanupFailure::Failed(ErrorCode::ResourceExhausted)
+            ),
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
         );
     }
@@ -2289,5 +2332,136 @@ mod tests {
                 .summary_line()
                 .starts_with("{\"level\":\"info\"")
         );
+    }
+
+    /// 注入で組んだ backends が使う一時ディレクトリ（0700）。Drop で消す。
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p =
+                std::env::temp_dir().join(format!("fcpc-nolock-{}-{nanos}", std::process::id()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&p)
+                .expect("scratch dir");
+            Self(p)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入（`new` / `with_recorder`）で組んだ backends はインスタンスロックも
+    /// 状態ルートも持たない。ロックを要する孤児 bundle の回収・記録の再採用は `instance_lock()` が
+    /// `None` のとき拒否される（拒否の挙動は tests/orphan_bundles.rs・tests/record_readoption.rs が補う）。
+    #[test]
+    fn cri2_core1_injected_backends_hold_no_instance_lock() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rec = Arc::new(OpRecorder::new());
+        let rt = || {
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            ))
+        };
+        let built = [
+            CriPluginBackends::new(rt(), Arc::clone(&store), Arc::new(UnimplementedNetwork)),
+            CriPluginBackends::with_recorder(
+                rt(),
+                Arc::clone(&store),
+                Arc::new(UnimplementedNetwork),
+                Arc::clone(&rec),
+            ),
+        ];
+        for b in built {
+            for x in [b.clone(), b] {
+                assert!(x._instance_lock.is_none());
+                assert!(x.state_root.is_none());
+                #[cfg(unix)]
+                assert!(x.instance_lock().is_none());
+            }
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入で組んでも状態ルート配下へ `.cri/@instance.lock` を作らない。
+    /// 陽性対照として、同じルートで別にロックを取ると `.cri/@instance.lock` が現れる。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_core1_injected_backends_create_no_instance_lock_file() {
+        use crate::instance_lock::{INSTANCE_LOCK_NAME, acquire_instance_lock_in};
+
+        fn entries(dir: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        let scratch = ScratchDir::new();
+        let state = scratch.0.join("state");
+        let store: Arc<dyn StateStore> = Arc::new(
+            FileStateStore::open(StateRoot::resolve(Some(state.clone())).expect("root"))
+                .expect("open"),
+        );
+        let before = entries(&state);
+
+        let rec = Arc::new(OpRecorder::new());
+        let backends = CriPluginBackends::with_recorder(
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            )),
+            store,
+            Arc::new(UnimplementedNetwork),
+            rec,
+        );
+        let cloned = backends.clone();
+
+        for b in [&backends, &cloned] {
+            assert!(b.instance_lock().is_none());
+            assert!(b.state_root.is_none());
+        }
+        // 状態ルート未設定の経路は早期に返り、何も作らない。
+        let e = backends.production_record_store().expect_err("err");
+        assert_eq!(
+            e.code(),
+            fandhe_container_cri::error::CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            backends.recover_stale_image_pulls(Duration::from_secs(1)),
+            StartupPullRecovery::Failed("FAILED_PRECONDITION")
+        );
+
+        let missing = |p: &std::path::Path| {
+            std::fs::symlink_metadata(p)
+                .expect_err("must not exist")
+                .kind()
+        };
+        assert_eq!(missing(&state.join(".cri")), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            missing(&state.join(".cri").join(INSTANCE_LOCK_NAME)),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(entries(&state), before);
+
+        // 陽性対照: backends が生きていても同じルートのロックを取れ、照合したパスに実体ができる。
+        let _held = acquire_instance_lock_in(&state, Duration::ZERO).expect("acquire");
+        let meta = std::fs::symlink_metadata(state.join(".cri").join(INSTANCE_LOCK_NAME))
+            .expect("lock file");
+        assert!(meta.is_file());
     }
 }

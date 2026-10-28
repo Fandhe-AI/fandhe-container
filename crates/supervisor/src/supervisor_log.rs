@@ -26,7 +26,7 @@
 //! のも専用スレッドだけで、呼び出し側の待ちは期限つき。
 //!
 //! # 後始末
-//! [`remove`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
+//! [`remove_guarded_bounded_waiting`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
 //! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
 //! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
 //! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
@@ -39,7 +39,7 @@
 //! `legacy_tiocsti` の警告は #2008 の決定で、start の成功後に supervisor が自分で観測し（`start_entry`）、
 //! `stderr_sink` 経由で本ログへ 1 行残す（core の fd 2 経路は AF_UNIX の socket のときだけ届き、その構成では重複する）。
 //!
-//! 呼び出し元: `start_entry::run_main_inner`（open と差し込み）・CLI の `delete`（[`remove`]）。
+//! 呼び出し元: `start_entry::run_main_inner`（open と差し込み）・CLI の `delete` と plugin-cri の `RemoveContainer`（[`remove_guarded_bounded_waiting`]）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -153,7 +153,7 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
 
 /// [`remove`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2892・SUP-7・REPAIR-5）。
 ///
-/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する。確認はロック保持中に行うため、待ちの間に
+/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する（`RemovedLogs::guard_declined()` が真。#3143）。確認はロック保持中に行うため、待ちの間に
 /// 再作成された別インスタンスの supervisor ログを消さない。ディレクトリが無ければ 0 件で成功する。
 pub fn remove_guarded(
     root: &Path,
@@ -431,21 +431,6 @@ pub fn run_bounded_waiting<T: Send + 'static>(
         BoundedOutcome::Busy => Err(BoundedFailure::Busy),
         BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),
     }
-}
-
-/// core の `delete` が成功した後に、`id` の supervisor ログを best effort で期限つきに消す（#2067・#2434・REPAIR-4・REPAIR-5）。
-///
-/// 失敗は握る（delete の結果は変えない）。期限切れなら [`LogRemoval::TimedOut`] を返すので、警告を出すかは呼び出し側が決める
-/// （CLI は stderr に 1 行の JSON、plugin-cri は構造化ログ）。core の `delete` より前には呼ばない（失敗時に稼働中のログを消さないため）。
-pub fn remove_bounded(root: &Path, id: &ContainerId, timeout: std::time::Duration) -> LogRemoval {
-    let root = root.to_path_buf();
-    let id = id.clone();
-    run_log_removal_bounded(
-        move || {
-            let _ = remove(&root, &id);
-        },
-        timeout,
-    )
 }
 
 #[cfg(all(test, unix))]

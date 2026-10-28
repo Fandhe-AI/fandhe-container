@@ -52,6 +52,20 @@ fn fail_err(e: &PluginError) -> ExitCode {
     fail(e.code(), e.message())
 }
 
+/// serve 後（停止猶予超過を含む）の失敗行を `LineSink` へ積み、期限つきで書き終えるのを待って終了コード 1 を返す。
+/// stderr のパイプが満杯でも同期の `eprintln!` のように無期限に待たない（REPAIR-5）。
+#[cfg(unix)]
+fn fail_err_bounded(e: &PluginError) -> ExitCode {
+    let sink = fandhe_container_plugin_cri::telemetry::stderr_sink();
+    let _ = sink.submit(format!("error: {}: {}", e.code().as_str(), e.message()));
+    sink.wait_idle(shutdown::FINAL_FLUSH_WAIT);
+    if e.code() == PluginErrorCode::InvalidArgument {
+        ExitCode::from(EXIT_INVALID_ARGUMENT)
+    } else {
+        ExitCode::from(EXIT_FAILURE)
+    }
+}
+
 /// 正常停止の完了を示す固定の 1 行を stderr へ出し、期限つきで書き終えるのを待つ（REPAIR-4・REPAIR-5）。
 #[cfg(unix)]
 fn report_shutdown(signal: sys::ShutdownSignal, stage: ShutdownStage) {
@@ -301,10 +315,14 @@ fn serve(socket: &std::path::Path) -> ExitCode {
                 ExitCode::SUCCESS
             }
             // 受信なしで止まるのは想定外。成功を装わず失敗扱いにする。
-            None => fail(PluginErrorCode::Internal, "server stopped unexpectedly"),
+            None => fail_err_bounded(&PluginError::new(
+                PluginErrorCode::Internal,
+                "server stopped unexpectedly",
+            )),
         },
         // 猶予超過は `TIMEOUT`（接続を強制的に閉じた）。記録は結果不明のまま残る。
-        Err(e) => fail_err(&e),
+        // stderr が詰まっても終われるよう、書き出しは期限つきの `LineSink` 経由にする（REPAIR-5）。
+        Err(e) => fail_err_bounded(&e),
     }
 }
 

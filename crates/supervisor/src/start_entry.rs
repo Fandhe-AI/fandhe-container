@@ -157,6 +157,10 @@ pub trait StartDeps {
         None
     }
 
+    /// 単一スレッドの区間（手順 3〜8）で積んだ構造化ログを、start の報告の後に出す（成功・失敗の両方で呼ばれる。
+    /// rootless の pasta 構成の `pasta_verify` / `pasta_ready` など。#1940・REPAIR-4）。既定は何もしない。
+    fn flush_deferred_logs(&self) {}
+
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
     fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError>;
 
@@ -734,10 +738,13 @@ fn start_reporting(
                 );
                 log_legacy_tiocsti(observe);
                 log_audit_coverage(running.process.as_ref());
+                // 単一スレッドの区間で積んだログは報告の後に出す（#1940）。
+                deps.flush_deferred_logs();
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {
                 report(out, &StartReport::failed(&error));
+                deps.flush_deferred_logs();
                 if cleanup_after_report(deps, store, req.id(), timeouts, cleanup) {
                     Err(error.exit_code())
                 } else {
@@ -2141,6 +2148,10 @@ mod linux {
         container_options_error: Option<TraitError>,
         /// 手順 2c で文書を照合した状態記録の作成世代(`with_options_generation`。`expected_options_generation`)。
         options_generation: Option<Option<String>>,
+        /// pasta 構成の結線に要るコンテナ ID と状態ルート(`with_pasta_target`。rootless のユーザー定義名のときだけ使う。#1940)。
+        pasta_target: Option<(ContainerId, PathBuf)>,
+        /// 単一スレッドの区間で積む pasta まわりの構造化ログ(`flush_deferred_logs` が報告の後に出す。#1940)。
+        pasta_logs: Arc<crate::pasta_attach::PastaLogBuffer>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2256,7 +2267,22 @@ mod linux {
                 cri_log_path: None,
                 container_options_error: None,
                 options_generation: None,
+                pasta_target: None,
+                pasta_logs: Arc::new(crate::pasta_attach::PastaLogBuffer::new()),
             }
+        }
+
+        /// pasta 構成の結線に使うコンテナ ID と状態ルート(ストアの検査済みの `host_state_root()` を優先したもの)を渡す
+        /// (rootless のユーザー定義名のときだけ使う。無いままユーザー定義名を選ぶと手順 4 が拒否する。NET-9・#1940)。
+        #[must_use]
+        pub fn with_pasta_target(mut self, id: ContainerId, state_root: PathBuf) -> Self {
+            self.pasta_target = Some((id, state_root));
+            self
+        }
+
+        /// 手順 2c が `pasta_verify` を積む遅延バッファ(`flush_deferred_logs` が出すものと同じ。#1940)。
+        pub fn pasta_log_buffer(&self) -> Arc<crate::pasta_attach::PastaLogBuffer> {
+            Arc::clone(&self.pasta_logs)
         }
 
         /// 起動オプション文書の読み込みに失敗したことを覚えさせる。手順 4 が cgroup の連鎖より前にそのエラーで止める
@@ -2376,6 +2402,71 @@ mod linux {
             })
         }
 
+        /// ユーザー定義名の `--network` か(rootless の pasta 構成。NET-9)。
+        fn selects_named_network(&self) -> bool {
+            matches!(
+                self.container_options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Named(
+                    _
+                ))
+            )
+        }
+
+        /// 手順 4: pasta 構成の前提を副作用なしで確かめる(固定文言。パス・入力値を含めない。NET-9・ERR-1)。
+        ///
+        /// - ユーザー定義名なのに再検証済みの pasta が無い: `FailedPrecondition`(12.4。黙って `none` や host へ落とさない)
+        /// - ユーザー定義名なのに結線先(コンテナ ID・状態ルート)が無い: `Internal`
+        /// - pasta の記録があるのにユーザー定義名でない: `InvalidArgument`(取り違えを黙って無視しない)
+        fn check_pasta_wiring(&self) -> Result<(), TraitError> {
+            let named = self.selects_named_network();
+            let has_pasta = self.container_options.pasta_binary().is_some();
+            if named && !has_pasta {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "pasta path is not configured",
+                ));
+            }
+            if !named && has_pasta {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "a pasta record requires a user-defined network",
+                ));
+            }
+            if named && self.pasta_target.is_none() {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pasta wiring target is not set",
+                ));
+            }
+            Ok(())
+        }
+
+        /// ユーザー定義名のときだけ、holder と pasta を結線する一式を作る(手順 7。状態ルートの fd を開く)。
+        fn pasta_wiring(&self) -> Result<Option<crate::pasta_attach::PastaWiring>, TraitError> {
+            if !self.selects_named_network() {
+                return Ok(None);
+            }
+            self.check_pasta_wiring()?;
+            let (Some(binary), Some((container, root))) = (
+                self.container_options.pasta_binary(),
+                self.pasta_target.as_ref(),
+            ) else {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pasta wiring was built before its prerequisites",
+                ));
+            };
+            let config = crate::pasta_attach::PastaAttachConfig {
+                binary: binary.clone(),
+                forwards: self.container_options.network().publish().clone(),
+                state_root: crate::pasta_attach::open_state_root(root)?,
+                container: container.clone(),
+                ready_timeout: crate::pasta_attach::READY_TIMEOUT_DEFAULT,
+            };
+            crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))
+                .map(Some)
+        }
+
         /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
         #[must_use]
         pub fn with_companions(mut self, pids: Vec<u32>) -> Self {
@@ -2396,12 +2487,19 @@ mod linux {
             self.options_generation.clone()
         }
 
+        fn flush_deferred_logs(&self) {
+            self.pasta_logs.flush();
+        }
+
         fn check_launcher_available(&self) -> Result<(), TraitError> {
             // 起動オプション文書が読めない・壊れているときは、cgroup にも launch にも触れずに止める(SUP-12・#2713)。
             if let Some(e) = &self.container_options_error {
                 return Err(e.clone());
             }
             self.privilege.clone()?;
+            // pasta 構成の前提は cgroup の連鎖の前に確かめる(再検証済みのバイナリが無いまま、またはユーザー定義名の
+            // 無いまま pasta を走らせない。固定文言。NET-9・12.4・#1940)。
+            self.check_pasta_wiring()?;
             // 起動オプションの矛盾は cgroup の連鎖の前に拒否する（ファイルは読まない純粋な検証。手順 7 が変換の本体）。
             self.container_options.implicit_dev_mounts()?;
             // 確実な層（seccomp の ERRNO 側の USER_NOTIF）の応答者が無い構成は起動しない（fail-closed。SEC-4・#2027）。
@@ -2560,12 +2658,22 @@ mod linux {
             // 起動オプションの変換（secrets のファイル読み取りを含む）は fork 前の単一スレッドのこの手順で行う。失敗は
             // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
             let launch_options = self.container_options.launch_options()?;
+            // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
+            let wiring = self.pasta_wiring()?;
+            let builder = match &wiring {
+                Some(w) => builder.netns_attach_hook(w.hook()),
+                None => builder,
+            };
             let launcher = builder
                 .launch_options(launch_options)
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
                 .build()?;
-            Ok(Arc::new(launcher))
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+            Ok(match wiring {
+                Some(w) => w.wrap(launcher),
+                None => launcher,
+            })
         }
 
         /// 参加フックの源を持たない `ProductionLauncher` で `recover_interrupted_start` を呼ぶ(launch はしないので
@@ -2711,16 +2819,18 @@ mod linux {
         root: &std::path::Path,
         id: &ContainerId,
         until: Option<Instant>,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
     ) -> Result<(Option<ContainerOptions>, Option<String>), TraitError> {
         let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
         let store = Arc::clone(store);
+        let logs = Arc::clone(logs);
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("fandhe-supopt".into())
             .spawn(move || {
                 let result =
                     read_generation_checked_document(&store, &root, &id).and_then(|(doc, rec)| {
-                        doc.map(|d| d.to_container_options())
+                        doc.map(|d| options_with_verified_pasta(&d, &id, &logs))
                             .transpose()
                             .map(|o| (o, rec))
                     });
@@ -2743,6 +2853,42 @@ mod linux {
                 ErrorCode::Timeout,
                 "container options preparation timed out",
             )),
+        }
+    }
+
+    /// 文書を検証済みの [`ContainerOptions`] にし、`pasta` の記録があれば起動時に再検証する(NET-9・PLUG-11・12.4・#1940)。
+    ///
+    /// 再検証(パスの辿り直し → 識別の照合 → `--version`)は作業スレッドの中で行い、期限は 2c の待ちに含まれる。
+    /// 通ったバイナリだけを options に持たせる(exec に使えるのはこれだけ)。失敗は固定文言のまま返し、手順 4 が
+    /// cgroup に触れる前に止める。結果は `pasta_verify` として遅延バッファへ積む(監査への記録は #3330)。
+    fn options_with_verified_pasta(
+        doc: &crate::container_options::document::ContainerOptionsDocument,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+    ) -> Result<ContainerOptions, TraitError> {
+        let options = doc.to_container_options()?;
+        let started = Instant::now();
+        match crate::container_options::pasta::reverify_recorded_pasta(doc) {
+            Ok(None) => Ok(options),
+            Ok(Some(binary)) => {
+                crate::pasta_attach::log_pasta_verify(
+                    logs,
+                    id.as_str(),
+                    Ok(binary.version().as_yyyymmdd()),
+                    started.elapsed(),
+                );
+                Ok(options.with_pasta_binary(binary))
+            }
+            Err(e) => {
+                let te = e.trait_error();
+                crate::pasta_attach::log_pasta_verify(
+                    logs,
+                    id.as_str(),
+                    Err((te.code(), e.tamper_suspected())),
+                    started.elapsed(),
+                );
+                Err(te)
+            }
         }
     }
 
@@ -2954,6 +3100,12 @@ mod linux {
             .with_companions(companions)
             .with_audit_policy(args.audit_policy)
             .with_cri_log_path(args.cri_log_path.clone());
+        // pasta 構成の結線先(コンテナ ID と、ストアの検査済みの状態ルート)。ユーザー定義名のときだけ使われる(#1940)。
+        let deps = deps.with_pasta_target(
+            args.id.clone(),
+            supervisor_log_root(&store, &args.root).to_path_buf(),
+        );
+        let pasta_logs = deps.pasta_log_buffer();
         let deps = Box::new(match &audit {
             // relay は launcher の回収点（複数スレッド）の `exit_signal` 監査の記録先にも渡す（#2236）。
             // start の検証（bind・sysfs）の拒否も作業スレッド（複数スレッド）で出るため relay へ渡す（#2481）。
@@ -2975,17 +3127,21 @@ mod linux {
         // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
         // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
         // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
-        let deps =
-            match prepare_container_options_with_generation(&store, &args.root, &args.id, deadline)
-            {
-                // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
-                Ok((Some(options), recorded)) => Box::new(
-                    deps.with_container_options(options)
-                        .with_options_generation(recorded),
-                ),
-                Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
-                Err(e) => Box::new(deps.with_container_options_error(e)),
-            };
+        let deps = match prepare_container_options_with_generation(
+            &store,
+            &args.root,
+            &args.id,
+            deadline,
+            &pasta_logs,
+        ) {
+            // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
+            Ok((Some(options), recorded)) => Box::new(
+                deps.with_container_options(options)
+                    .with_options_generation(recorded),
+            ),
+            Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
+            Err(e) => Box::new(deps.with_container_options_error(e)),
+        };
         let running = match run_start_until(
             deps,
             &store,
@@ -3043,7 +3199,8 @@ mod linux {
             id: &ContainerId,
             until: Option<Instant>,
         ) -> Result<Option<ContainerOptions>, TraitError> {
-            prepare_container_options_with_generation(store, root, id, until).map(|(o, _)| o)
+            let logs = Arc::new(crate::pasta_attach::PastaLogBuffer::new());
+            prepare_container_options_with_generation(store, root, id, until, &logs).map(|(o, _)| o)
         }
 
         use super::*;
@@ -3250,6 +3407,35 @@ mod linux {
             let err = deps.check_launcher_available().unwrap_err();
             assert_eq!(err.code(), ErrorCode::InvalidArgument);
             assert_eq!(err.message(), "options document is too large");
+        }
+
+        /// NET-9・12.4(#1940): ユーザー定義名の network は、再検証済みの pasta が無ければ手順 4 の前提確認で拒否し、
+        /// 指定が無い・`none`・`host` の起動は pasta に触れない(既定は従来のまま)。
+        #[test]
+        fn net9_1940_named_network_requires_a_verified_pasta() {
+            use crate::container_options::network::NetworkOptions;
+            let with = |network: Option<&str>| {
+                let n = NetworkOptions::parse(network, &[], &[], &[]).expect("network");
+                ProductionStartDeps::new(std::env::temp_dir())
+                    .with_container_options(ContainerOptions::new().with_network(n))
+            };
+            let err = with(Some("web")).check_pasta_wiring().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), "pasta path is not configured");
+            for network in [None, Some("none"), Some("host")] {
+                assert!(with(network).check_pasta_wiring().is_ok(), "{network:?}");
+                assert!(with(network).pasta_wiring().expect("wiring").is_none());
+            }
+        }
+
+        /// REPAIR-4(#1940): 単一スレッドの区間で積んだ pasta のログは `flush_deferred_logs` で空になる。
+        #[test]
+        fn repair4_1940_flush_deferred_logs_drains_the_buffer() {
+            let deps = ProductionStartDeps::new(std::env::temp_dir());
+            let buffer = deps.pasta_log_buffer();
+            buffer.push("{}\n".to_owned());
+            deps.flush_deferred_logs();
+            assert!(buffer.take().is_empty());
         }
 
         /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。

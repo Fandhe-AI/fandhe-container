@@ -12,10 +12,11 @@
 //!
 //! # 未実装の範囲(REPAIR-3)
 //!
-//! - ユーザー定義名(`Named`)と `container:` 始まりは起動経路に結線されておらず `Unimplemented`
-//!   (rootless の pasta は #1940、rootful の参加指定は #3069・#3074)。
-//! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持するだけで、pasta への反映(`pasta_args()` の連結)は
-//!   #1940(NET-9・NET-3。#3200 で kind を足した)。
+//! - ユーザー定義名(`Named`)は Linux で `LaunchNetworkMode::Attachable` へ写り、supervisor の `pasta_attach` が
+//!   holder と pasta を結線する(#1940)。CLI が `network <名前>` と `pasta` を FCOPT1 に書く入口は #3329。Linux 以外は
+//!   `Unimplemented`。`container:` 始まりは結線されておらず `Unimplemented`(rootful の参加指定は #3069・#3074)。
+//! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持し、`pasta_attach` が pasta の引数へ連結する(#1940。
+//!   NET-9・NET-3。#3200 で kind を足した)。
 //! - `add-host`・`dns` は検証済みの型として保持するだけで、hosts / resolv.conf への反映は #1873(D9)。
 //!   反映されるまで `ContainerOptions::launch_options` が拒否する。
 //! - D8 の host netns の照合と `network_mode=host` のログは #1873。CLI が kind を書く処理と既定の `none` も #1873。
@@ -47,7 +48,7 @@ pub enum NetworkSelection {
     None,
     /// `host`(ホストの network namespace を共有する)。
     Host,
-    /// ユーザー定義名(検証済み。起動経路への結線は #1940・#3069・#3074)。
+    /// ユーザー定義名(検証済み。rootless の pasta 構成は #1940 で結線済み。rootful の参加指定は #3069・#3074)。
     Named(NetworkName),
 }
 
@@ -167,12 +168,18 @@ impl NetworkOptions {
     }
 
     /// core の `LaunchNetworkMode` へ写す(D7)。指定なしは `FromConfig`、`none` は `Loopback`(実体は #3064 まで
-    /// core が `Unimplemented`)、`host` は `Host`、ユーザー定義名は `Unimplemented`。
+    /// core が `Unimplemented`)、`host` は `Host`、ユーザー定義名は Linux で `Attachable`(rootless の pasta 構成。#1940)、
+    /// それ以外の OS では `Unimplemented`。
     pub fn launch_network_mode(&self) -> Result<LaunchNetworkMode, TraitError> {
         match &self.selection {
             None => Ok(LaunchNetworkMode::FromConfig),
             Some(NetworkSelection::None) => Ok(LaunchNetworkMode::Loopback),
             Some(NetworkSelection::Host) => Ok(LaunchNetworkMode::Host),
+            // rootless の pasta 構成(exec 前の同期点で netns と user namespace の fd を supervisor へ渡す。#1940)。
+            // Linux 以外にはこの経路が無い(挙動の差は固定の文言で示す。CLI-1)。
+            #[cfg(target_os = "linux")]
+            Some(NetworkSelection::Named(_)) => Ok(LaunchNetworkMode::Attachable),
+            #[cfg(not(target_os = "linux"))]
             Some(NetworkSelection::Named(_)) => Err(TraitError::new(
                 ErrorCode::Unimplemented,
                 NAMED_NOT_WIRED_MESSAGE,
@@ -275,8 +282,17 @@ mod tests {
         assert_eq!(mode(None).expect("m"), LaunchNetworkMode::FromConfig);
         assert_eq!(mode(Some("none")).expect("m"), LaunchNetworkMode::Loopback);
         assert_eq!(mode(Some("host")).expect("m"), LaunchNetworkMode::Host);
-        let e = mode(Some("web")).expect_err("named");
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        // ユーザー定義名は Linux で Attachable(#1940)、それ以外の OS では Unimplemented。
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            mode(Some("web")).expect("named"),
+            LaunchNetworkMode::Attachable
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            mode(Some("web")).expect_err("named").code(),
+            ErrorCode::Unimplemented
+        );
         assert!(NetworkOptions::default().is_empty());
     }
 

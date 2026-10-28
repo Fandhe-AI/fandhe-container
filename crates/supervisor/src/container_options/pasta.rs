@@ -7,10 +7,11 @@
 //!
 //! # 将来仕様・残余（REPAIR-3）
 //!
-//! - start の経路（`start_entry`）からの呼び出しは #1940 が結線する。現状は `NetworkSelection::Named` が
-//!   `Unimplemented` で拒否されるため、本関数は本番経路から呼ばれない。
-//! - SEC-4 の監査の記録（識別の不一致と `PermissionDenied`）は #1940。core の `AuditLayer` に pasta 用の語彙が
-//!   無いため、本関数は分類（[`PastaReverifyError::tamper_suspected`]）だけを返し、記録は呼び出し側の責務とする。
+//! - start の経路からの呼び出しは #1940 で結線済み(手順 2c の作業スレッドから `reverify_recorded_pasta` を呼び、
+//!   通った `PastaBinary` を `ContainerOptions` に持たせる。`start_entry::linux::options_with_verified_pasta`)。
+//! - SEC-4 の監査の記録(識別の不一致と `PermissionDenied`)は #3330。core の `AuditLayer` に pasta 用の語彙が
+//!   無いため、本関数は分類([`PastaReverifyError::tamper_suspected`])だけを返し、現状は構造化ログ(`pasta_verify`)に
+//!   残すのみ。監査への記録は呼び出し側の責務とする。
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_net::error::{NetError, NetErrorCode};

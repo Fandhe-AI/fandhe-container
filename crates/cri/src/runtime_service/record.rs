@@ -4,8 +4,7 @@
 //! CRI 層の項目（config・状態・時刻・`resolved_image`・`applied_user`・`stop_signal` 等）が失われる。
 //! 設計 `docs/design/cri-record-readoption.md`（#2902）の実装単位 R1 として、記録 1 件分のバイト列を作る
 //! 符号化と、壊れた入力・改ざんされた入力を untrusted として拒否する復号を提供する。ファイルの置き場・排他・
-//! fsync（R2 #2932）、registry との変換と書く / 消す時点（R4 #2933・R5 #2934）、起動時の再採用（R6 #2935 は実装済みで `readopt` が呼ぶ・
-//! R7 #2936）は範囲外で、本モジュールは純粋な関数だけを持つ（ファイル I/O なし）。
+//! fsync（R2 #2932）、registry との変換と書く / 消す時点（R4 #2933・R5 #2934）、起動時の再採用（R6 #2935・R7 #2936 は実装済みで `readopt` が呼ぶ）は範囲外で、本モジュールは純粋な関数だけを持つ（ファイル I/O なし）。
 //!
 //! # 形式 v1
 //!
@@ -23,7 +22,7 @@
 //! `RunPodSandbox` / `CreateContainer` と同じ上限検証（`config_limits`）を通す。
 //!
 //! 呼び出し元になる予定: R2（バイト列の読み書き。上限は [`MAX_SANDBOX_RECORD_BYTES`] /
-//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4（sandbox の書く時点。実装済み）・R5（コンテナの書く時点。実装済み）・R6 / R7（起動時の再採用）。
+//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4（sandbox の書く時点。実装済み）・R5（コンテナの書く時点。実装済み）・R6 / R7（起動時の再採用。実装済み）。
 
 use std::collections::HashSet;
 
@@ -125,9 +124,8 @@ pub(super) struct DecodedSandbox {
 
 /// 復号したコンテナ記録と、数え直した config の保持量見積もり。
 ///
-/// `applied_user`・`resolved_image` の上乗せ分（`attach_prepared` と同じ計算）は含まない。R7 #2936 が足す。
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
+/// `applied_user`・`resolved_image`・`resolved_log_path` の上乗せ分は含まない。起動時の再採用
+/// （`readopt_containers`。R7 #2936）が `identity_retained_extra` と同じ式で足す。
 #[derive(Debug)]
 pub(super) struct DecodedContainer {
     pub(super) data: ContainerRecordData,
@@ -598,8 +596,6 @@ impl ContainerRecordData {
     }
 
     /// 記録のバイト列を厳密に復号する。`expect_id` は記録のファイル名由来の ID。
-    // R6 / R7（#2935・#2936）の起動時の再採用が呼ぶまでは本番の経路から呼ばれない（REPAIR-3）。
-    #[allow(dead_code)]
     pub(super) fn decode(bytes: &[u8], expect_id: &str) -> Result<DecodedContainer, CriError> {
         let malformed = || CriError::invalid_argument(CONTAINER_MALFORMED);
         if bytes.len() > MAX_CONTAINER_RECORD_BYTES {

@@ -98,7 +98,8 @@
 //! sandbox 記録の書く・消す時点は [`CriRuntimeService::with_record_store`] で注入すると有効になる（R4 #2933）。
 //! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。
 //! コンテナ記録の書く・消す時点は、実行層接続時（`with_runtime` も注入）の経路に限って有効になる（R5 #2934）。
-//! コンテナの再採用と照合（R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
+//! 起動時のコンテナの再採用と core の状態との照合は [`CriRuntimeService::readopt_containers`]（R7 #2936。実装済み）。
+//! 本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
 //!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
@@ -124,7 +125,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
-use crate::bundle::resolve_log_path;
+use crate::bundle::{AppliedUser, ResolvedImage, resolve_log_path};
 use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::ContainerLogPath;
 
@@ -146,7 +147,7 @@ use container::{
 use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
 
-pub use readopt::{BrokenRecordCounts, SandboxReadoption};
+pub use readopt::{BrokenRecordCounts, ContainerReadoption, SandboxReadoption};
 #[cfg(unix)]
 pub use record_store::FileRecordStore;
 pub use record_store::{
@@ -1407,6 +1408,27 @@ const APPLIED_USER_RETAINED_BASE_BYTES: usize = 64;
 /// `ResolvedImage` 1 件の保持量の固定分の見積もり（String の管理領域・Digest の管理領域。#2831）。
 const RESOLVED_IMAGE_RETAINED_BASE_BYTES: usize = 64;
 
+/// 識別情報（`applied_user`）とイメージ解決結果（`resolved_image`）の保持量の上乗せ分の見積もり（#2771・#2831）。
+///
+/// `attach_prepared`（CreateContainer 時の加算）と、起動時の再採用（`readopt_containers`。R7 #2936）が同じ式で
+/// 保持量を数え直すための共通関数。補助グループは最大 65,536 件、image の文字列は `ResolvedImage` が上限内に保つ。
+fn identity_retained_extra(user: Option<&AppliedUser>, image: Option<&ResolvedImage>) -> usize {
+    let user_extra = user.map_or(0, |u| {
+        u.additional_gids()
+            .len()
+            .saturating_mul(APPLIED_GID_RETAINED_BYTES)
+            .saturating_add(APPLIED_USER_RETAINED_BASE_BYTES)
+    });
+    let image_extra = image.map_or(0, |i| {
+        i.image_ref()
+            .len()
+            .saturating_add(i.id_str().len())
+            .saturating_add(i.tag().map_or(0, str::len))
+            .saturating_add(RESOLVED_IMAGE_RETAINED_BASE_BYTES)
+    });
+    user_extra.saturating_add(image_extra)
+}
+
 /// `BundleProvider::prepare` が報告した識別情報と stop signal を、実行層へ渡す前に記録へ反映する（#2771・CRI-2）。
 ///
 /// `create_container_runtime` の worker から呼ぶ。識別情報の保持量（補助グループは最大 65,536 件）を
@@ -1418,21 +1440,7 @@ fn attach_prepared(
     prepared: &PreparedBundle,
     max_retained_bytes: usize,
 ) -> Result<(), CriError> {
-    let user_extra = prepared.user().map_or(0, |u| {
-        u.additional_gids()
-            .len()
-            .saturating_mul(APPLIED_GID_RETAINED_BYTES)
-            .saturating_add(APPLIED_USER_RETAINED_BASE_BYTES)
-    });
-    // image の報告分（参照文字列と image ID。長さは `ResolvedImage` が上限内に保つ。#2831）。
-    let image_extra = prepared.image().map_or(0, |i| {
-        i.image_ref()
-            .len()
-            .saturating_add(i.id_str().len())
-            .saturating_add(i.tag().map_or(0, str::len))
-            .saturating_add(RESOLVED_IMAGE_RETAINED_BASE_BYTES)
-    });
-    let extra = user_extra.saturating_add(image_extra);
+    let extra = identity_retained_extra(prepared.user(), prepared.image());
     let mut registry = registry
         .lock()
         .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
@@ -1648,7 +1656,8 @@ impl CriRuntimeService {
     ///   書けなければメモリを確定したまま `INTERNAL`（次回起動時は core の状態で照合される）
     /// - `RemoveContainer`・`RemovePodSandbox` の配下: `delete` と bundle の解放の成功後に記録を消す
     ///
-    /// 未実装（REPAIR-3）: コンテナの再採用と照合は R7 #2936、本番の配線は R9 #2938。
+    /// 起動時のコンテナ記録の再採用と core の状態との照合は [`Self::readopt_containers`]（R7 #2936。実装済み）。
+    /// 未実装（REPAIR-3）: 本番の配線は R9 #2938。
     pub fn with_record_store(mut self, store: Arc<dyn RecordStore>) -> Self {
         self.record_store = Some(store);
         self

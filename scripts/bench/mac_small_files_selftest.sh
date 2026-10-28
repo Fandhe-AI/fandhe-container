@@ -4,30 +4,35 @@
 # スタブの docker CLI（bash）と一時ディレクトリのみで、引数検証・起動引数・集計の具体値・件数不一致・期限・
 # 後始末（所有の証明）・own の未実装・report の率を照合する。実 Docker Desktop・実ランタイム・root は使わない。
 # 呼び出し元: Makefile の `mac-small-files-selftest`（CI は bench-regression の並列グループ）。
-# 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 5 以上が必要（EPOCHREALTIME）。満たさなければ skip せず非ゼロ（2）で終わる。
+# 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 3.2 以上・perl（Time::HiRes）・jq が必要（#3104）。
+# 全ケースを PATH の bash と、別にある場合は /bin/bash（macOS では 3.2）の両方で回す（lib-selftest と同じ方式）。
+# 各回の先頭に shell=<path> version=<版> を出す。この行が無いのに緑なら、3.2 で回っていない。
+# 注意: ubuntu の /bin/bash は 5.x のため、bench-regression では 3.2 の実行は起きない。3.2 の実行は
+# platform-ci の macOS のステップ（main への push と workflow_dispatch）が担う。
 set -euo pipefail
 export LC_ALL=C
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${SELF_DIR}/mac_small_files.sh"
-if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
-  echo "error: bash 5 or later is required (EPOCHREALTIME). Run with a newer bash, e.g. /opt/homebrew/bin/bash on macOS" >&2
-  exit 2
-fi
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-TMP="$(cd "$TMP" && pwd -P)"
-HOST="${TMP}/host"
-mkdir -p "$HOST"
-STUB_DIR="${TMP}/stub"
-mkdir -p "$STUB_DIR"
-export STUB_DIR
+TMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TMP_ROOT"' EXIT
+TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
+
+# 時刻源の観測値（設計書 docs/design/mac-small-files-bench.md「時刻源」の観測欄の根拠。ログに残す）。
+perl -MTime::HiRes -e 'print "perl=$^V hires=$Time::HiRes::VERSION path=$^X\n"' || {
+  echo "error: perl with Time::HiRes is required" >&2
+  exit 2
+}
+
+SHELLS=("$(command -v bash)")
+if [ -x /bin/bash ] && [ "$(command -v bash)" != "/bin/bash" ]; then SHELLS+=(/bin/bash); fi
 
 PASS=0
 FAIL=0
-pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
-fail() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
+SHELL_TAG=""
+pass() { PASS=$((PASS + 1)); echo "PASS: [${SHELL_TAG}] $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "FAIL: [${SHELL_TAG}] $1"; }
 # check <name> <command...>: コマンドが成功すれば PASS。
 check() {
   local name="$1"
@@ -35,7 +40,20 @@ check() {
   if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi
 }
 
-# スタブの docker。STUB_MODE: ok / noimage / shortcount / badts / hang / stuck / nobind / failrun / onebad
+# run_cases <シェル> <通し番号>: 全ケースを指定のシェルで回す。作業ディレクトリは回ごとに作り直す。
+run_cases() {
+UNDER_SHELL="$1"
+SHELL_TAG="$(basename "$1")#$2"
+echo "shell=$1 version=$("$1" -c 'echo $BASH_VERSION')"
+TMP="${TMP_ROOT}/$2"
+mkdir -p "$TMP"
+HOST="${TMP}/host"
+mkdir -p "$HOST"
+STUB_DIR="${TMP}/stub"
+mkdir -p "$STUB_DIR"
+export STUB_DIR
+
+# スタブの docker。STUB_MODE: slow / ok / noimage / shortcount / badts / hang / stuck / nobind / failrun / onebad
 cat >"${STUB_DIR}/docker" <<'STUB'
 #!/usr/bin/env bash
 calls="${STUB_DIR}/calls"
@@ -93,6 +111,7 @@ case "${1:-}" in
     esac
     printf '%s' "$script" >"${STUB_DIR}/last_script"
     [ "${STUB_MODE:-ok}" = hang ] && exec sleep 30
+    [ "${STUB_MODE:-ok}" = slow ] && sleep 0.3
     count="$(printf '%s' "$script" | sed -n 's/.*-lt \([0-9]*\) .*/\1/p' | head -1)"
     batch="$(printf '%s' "$script" | sed -n 's/.*% \([0-9]*\)).*/\1/p' | head -1)"
     ts=1700000000000000000
@@ -129,7 +148,7 @@ reset_stub() {
 rc=0
 runit() {
   rc=0
-  bash "$SCRIPT" "$@" >"${TMP}/out" 2>"${TMP}/err" || rc=$?
+  "$UNDER_SHELL" "$SCRIPT" "$@" >"${TMP}/out" 2>"${TMP}/err" || rc=$?
 }
 rc_is() { [ "$rc" -eq "$1" ]; }
 calls_count() { grep -c "^$1" "${STUB_DIR}/calls" || true; }
@@ -337,6 +356,70 @@ mkres docker 1000 0 >"${TMP}/b-p0.json"
 runit --mode report --own-result "${TMP}/o-p0.json" --baseline-result "${TMP}/b-p0.json"
 check "baseline p95=0: exits 0" rc_is 0
 check "baseline p95=0: p95 ratio null, wall ratio stays, methods_differ false" jq_ok '.metadata_p95_reduction_ratio == null and .wall_clock_reduction_ratio == 0.2 and .methods_differ == false' "${TMP}/out"
+
+# --- 時刻源（perl Time::HiRes。#3104） ---
+# (a) Time::HiRes を読み込めない perl では、docker を 1 回も呼ばずに 3 で止まる。
+mkdir -p "${TMP}/noperl"
+printf '#!/bin/sh\nexit 1\n' >"${TMP}/noperl/perl"
+chmod 755 "${TMP}/noperl/perl"
+reset_stub ok
+rc=0
+PATH="${TMP}/noperl:${PATH}" "$UNDER_SHELL" "$SCRIPT" --mode docker --runtime "$DOCKER" --host-dir "$HOST" >"${TMP}/out" 2>"${TMP}/err" || rc=$?
+check "no Time::HiRes: exits 3" rc_is 3
+check "no Time::HiRes: missing-tool is reported" err_has 'code=missing-tool'
+check "no Time::HiRes: no docker call happened" empty_file "${STUB_DIR}/calls"
+check "no Time::HiRes: nothing left under --host-dir" dir_empty "$HOST"
+
+# (b) 時刻ファイルが壊れている試行は失敗に数え、有効な試行が 5 未満なら 1 で終わる。
+mkdir -p "${TMP}/badclock"
+cat >"${TMP}/badclock/perl" <<'PSTUB'
+#!/usr/bin/env bash
+# 本物の perl のうち probe（-MTime::HiRes -e 1）は通し、計測呼び出し（-e <code> <tsfile> <cmd...>）では
+# コマンドを実行したうえで BAD_CLOCK の内容を時刻ファイルへ書く。
+case "$1" in
+  -MTime::HiRes) exit 0 ;;
+esac
+tsf="$3"
+shift 3
+rc=0
+"$@" || rc=$?
+printf '%s\n' "$BAD_CLOCK" >"$tsf"
+exit "$rc"
+PSTUB
+chmod 755 "${TMP}/badclock/perl"
+for bad in 'abc def' '200 100' '1 2 3' '1' '-1 5' '1234567890123456789 1234567890123456790'; do
+  reset_stub ok
+  rc=0
+  BAD_CLOCK="$bad" PATH="${TMP}/badclock:${PATH}" "$UNDER_SHELL" "$SCRIPT" --mode docker --runtime "$DOCKER" --host-dir "$HOST" >"${TMP}/out" 2>"${TMP}/err" || rc=$?
+  check "bad timing record '${bad}': exits 1" rc_is 1
+  check "bad timing record '${bad}': invalid timing record is reported" err_has 'invalid timing record'
+done
+
+# (c) 区間が docker の実行の前後を挟んでいる（スタブの run が 0.3 秒かかる）。
+reset_stub slow
+runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --output "${TMP}/slow.json"
+check "slow run exits 0" rc_is 0
+check "each wall clock spans the run (>= 0.3s) and stays far below the deadline" jq_ok 'all(.samples[]; .wall_us >= 300000 and .wall_us < 30000000)' "${TMP}/slow.json"
+
+# (d) 静的走査（ガードであって証明ではない）: bash 4 以降の構文を持ち込んでいないこと。
+# 対象語は分割して組み立て、このファイル自身に当たらないようにする。
+banned="EPOCH""REALTIME|EPOCH""SECONDS|BASH""PID|map""file|read""array|declare -""A|declare -""g|local -""n|co""proc|wait -""n"
+banned="${banned}|"'[$]\{[A-Za-z_]*,,\}|[$]\{[A-Za-z_]*\^\^\}|[|]&|;;'"&"
+scan_ok=1
+for f in "$SCRIPT" "${SELF_DIR}/mac_small_files_selftest.sh" "${SELF_DIR}/../targets/mac-small-files-docker.sh" "${SELF_DIR}/../targets/mac-small-files-report.sh"; do
+  if grep -n -E -- "$banned" "$f" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q .; then
+    echo "bash 4+ construct found in $f"
+    scan_ok=0
+  fi
+done
+check "no bash 4+ construct in the script, its self-test and the make wrappers" test "$scan_ok" -eq 1
+}
+
+i=0
+for sh in "${SHELLS[@]}"; do
+  i=$((i + 1))
+  run_cases "$sh" "$i"
+done
 
 echo "passed=${PASS} failed=${FAIL}"
 [ "$FAIL" -eq 0 ]

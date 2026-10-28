@@ -7,6 +7,8 @@
 //! 記録は人間、拒否範囲を緩めるかはオーナーの判断（#1374 の条件 3〜5）。本試験が assert するのはプロトコルの
 //! 健全性（終端 `done` があり、契約外の行がなく、ログが打ち切られていない）だけ。
 //!
+//! 補助関数は `tests/support/virtiofs_harness.rs` に共通化（単体試験は `tests/virtiofs_harness.rs`。#3099）。
+//!
 //! 二層構成（`virtiofs_io.rs` に倣う。他 OS では `#![cfg]` により 0 件）:
 //! - 既定集合: spec の読み戻し・fixture のレイアウト・期限の境界など VM 生成前に確定する経路。
 //! - 実機テスト（`#[ignore]`）: macOS 13 以上・`com.apple.security.virtualization` 付き署名・観測モードを実装した
@@ -19,13 +21,11 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::config::{
     ConsoleLogPath, DeviceConfigSpec, SerialConsoleSink, VmConfigSpec, build_vz_configuration,
 };
-use fandhe_container_platform_macos::console_log::TRUNCATION_MARKER;
 use fandhe_container_platform_macos::guest_link_probe::{
     LinkLog, RO_MOUNT, RO_TAG, RW_HARD_NAME, RW_MOUNT, RW_SRC_NAME, RW_SYM_NAME, RW_TAG,
     parse_link_log,
@@ -36,111 +36,15 @@ use fandhe_container_platform_macos::virtiofs::{
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
 
+#[path = "support/virtiofs_harness.rs"]
+mod harness;
+use harness::{
+    CONSOLE_LOG_SETTLE_TIMEOUT, Scratch, env_path, log_truncated, resolve_probe_timeout,
+    tail_lossy, wait_console_log_settled,
+};
+
 /// ホストが `rw/` で観察するエントリ名の最大件数（想定外のエントリの列挙上限）。
 const MAX_RW_ENTRIES: usize = 16;
-/// VM 破棄後、コンソールログの書き出しスレッドが EOF で終わるのを待つ上限（REPAIR-5）。
-const CONSOLE_LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// 以下 Scratch / env_path / tail_lossy / log_truncated / wait_console_log_settled / resolve_probe_timeout は
-// virtiofs_io.rs（および vm_boot.rs）からの複製（共通化は両ファイルを巻き込むため別タスク）。
-
-/// テストごとの新規ディレクトリ（0700）。`keep` が false なら `Drop` で削除する。
-struct Scratch {
-    dir: PathBuf,
-    keep: bool,
-}
-
-impl Scratch {
-    fn new(tag: &str, keep: bool) -> Self {
-        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(base).expect("create tmp base");
-        let base = base.canonicalize().expect("canonicalize tmp base");
-        for _ in 0..100 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos());
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = base.join(format!("{tag}-{}-{nanos}-{n}", std::process::id()));
-            if std::fs::create_dir(&dir).is_ok() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod scratch dir");
-                return Self { dir, keep };
-            }
-        }
-        panic!("could not create a fresh scratch directory");
-    }
-
-    fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = self.dir.join(name);
-        std::fs::write(&p, bytes).expect("write fixture");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod fixture");
-        p
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
-
-fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    let start = bytes.len().saturating_sub(max);
-    String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).into_owned()
-}
-
-/// コンソールログが書き出しスレッドの上限で打ち切られたか（末尾が区切り文なら後続は観測できない）。
-fn log_truncated(bytes: &[u8]) -> bool {
-    bytes.ends_with(TRUNCATION_MARKER)
-}
-
-/// コンソールログの書き出しスレッド（`console_log`）がログを閉じ終えるまで待つ（`virtiofs_io.rs` と同じ方式）。
-fn wait_console_log_settled(path: &Path, timeout: Duration) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open console log: {e}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("lock console log: {e}"));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "console log writer did not finish within {timeout:?}"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn resolve_probe_timeout(raw: Option<String>) -> Result<Duration, String> {
-    match raw {
-        None => Ok(Duration::from_secs(60)),
-        Some(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| (1..=600).contains(n))
-            .map(Duration::from_secs)
-            .ok_or_else(|| {
-                "FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS must be an integer in 1..=600"
-                    .to_string()
-            }),
-    }
-}
-
 /// ホストが起動前に置く fixture。`ro` / `rw` は共有ディレクトリ（実体パス）。
 struct Fixture {
     ro: PathBuf,
@@ -325,32 +229,6 @@ fn mac1_sec4_link_fixture_layout() {
         std::fs::metadata(f.ro.join("inside.txt")).unwrap().nlink(),
         1
     );
-}
-
-/// MAC-1・SEC-4・#1877: 上限到達で打ち切られたログは末尾の区切り文で判別できる。
-#[test]
-fn mac1_sec4_link_log_truncation_is_detected_by_marker() {
-    let mut cut = b"noise".to_vec();
-    cut.extend_from_slice(TRUNCATION_MARKER);
-    assert!(log_truncated(&cut));
-    assert!(!log_truncated(b"noise"));
-}
-
-/// MAC-1・SEC-4・#1877・REPAIR-5: 実機テストの期限は 1..=600 秒（既定 60）。
-#[test]
-fn mac1_sec4_link_timeout_bounds() {
-    assert_eq!(resolve_probe_timeout(None), Ok(Duration::from_secs(60)));
-    assert_eq!(
-        resolve_probe_timeout(Some("1".into())),
-        Ok(Duration::from_secs(1))
-    );
-    assert_eq!(
-        resolve_probe_timeout(Some("600".into())),
-        Ok(Duration::from_secs(600))
-    );
-    for bad in ["0", "601", "abc", ""] {
-        assert!(resolve_probe_timeout(Some(bad.into())).is_err(), "{bad}");
-    }
 }
 
 /// 実機で VM を起動して観測を走らせ、停止後に確定したログを返す。

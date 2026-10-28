@@ -66,6 +66,11 @@ pub(super) fn document_of(
             )?
             .with_pasta(Some(record.to_body())),
     })
+    // `network` を書く pasta の段の後ろに `publish` を並べる(`with_publish` はユーザー定義名の `network` を要する)。
+    // 継ぎ目(REPAIR-3・NET-9・#3200): `publish` はユーザー定義名の `network` と組で書く。`with_network` を文書へ書く処理は
+    // #1873 が足し、その後ろに並べる。現状は `validate_network_options` が `-p` を `UNIMPLEMENTED` で止めるため、
+    // 空でない `publish` はここへ届かない(届いても `network` が無いので文書にできず `InvalidArgument`)。
+    .and_then(|doc| doc.with_publish(options.network.publish.clone()))
 }
 
 /// `--env-file` を読む待ちの上限(REPAIR-5)。
@@ -141,6 +146,19 @@ mod tests {
     fn sup12_create_options_empty() {
         assert!(document_of(&args(), None).expect("doc").is_empty());
         assert_eq!(labels_of(&args()).expect("labels"), Annotations::default());
+    }
+
+    /// NET-9(#3200): `network` の無い `publish` は文書にできない(継ぎ目の固定)。
+    #[test]
+    fn net9_document_of_rejects_publish_without_network() {
+        let mut a = args();
+        a.network.publish.push("8080:80".into());
+        let e = document_of(&a, None).expect_err("publish alone");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "publish records require a user-defined network"
+        );
     }
 
     /// SUP-12・CLI-1: `--env-file` は `-e` より優先順位が低く、統合後の `KEY=VALUE` が文書に入る。
@@ -282,6 +300,7 @@ mod tests {
                 network: Some("web".into()),
                 add_hosts: vec![],
                 dns: vec![],
+                publish: vec![],
             },
             ..args()
         };

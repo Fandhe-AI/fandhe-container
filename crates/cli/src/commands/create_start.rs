@@ -876,7 +876,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let recorder = OpRecorder::new();
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
-        let named = super::create_network::check_network_options(&args.options.network)?;
+        let named = super::create_network::check_network_options(
+            &args.options.network,
+            super::create_network::resolve_publish_privilege,
+        )?;
         // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
         let pasta = super::create_pasta::resolve_for_create(global, named)?;
         super::create_network::reject_not_wired(&args.options.network)?;

@@ -1478,4 +1478,57 @@ mod net12_argv_tests {
         assert_invalid(&["--network", "a", "--network", "b"], "");
         assert_invalid(&["--add-host"], "");
     }
+
+    /// NET-9・NET-3(#3200): 不正な `-p` は作成前に INVALID_ARGUMENT(状態ルートは作られず、入力値は出ない)。
+    #[test]
+    fn net9_publish_invalid_specs_rejected() {
+        let n = ["--network", "mynet"];
+        for bad in ["[::1]:80:80", "::1:80:80", "80:80/sctp", "0:80", "1-2:80"] {
+            let leak = bad.split(':').next().unwrap_or("");
+            let argv = [n[0], n[1], "-p", bad];
+            assert_invalid(&argv, if leak.len() > 2 { leak } else { "sctp" });
+        }
+    }
+
+    /// NET-9(#3200): ユーザー定義名と組でない `-p` は INVALID_ARGUMENT(none / host / 指定なし)。
+    #[test]
+    fn net9_publish_requires_user_defined_network() {
+        assert_invalid(&["-p", "8080:80"], "");
+        assert_invalid(&["--network", "none", "-p", "8080:80"], "");
+        assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
+    }
+
+    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、結線(#1873・#1940)まで UNIMPLEMENTED(受理して捨てない)。
+    #[test]
+    fn net9_publish_valid_is_unimplemented_until_wired() {
+        // rootless のユーザー定義名は pasta の場所の判定(#3199・12.4)が `UNIMPLEMENTED` より前に走り、フラグが無ければ
+        // `FAILED_PRECONDITION` になる。root で走る環境(rootful 扱い)では従来どおり `UNIMPLEMENTED`。
+        let rootful = std::fs::read_to_string("/proc/self/status")
+            .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")));
+        for extra in [
+            ["--network", "mynet", "-p", "8080:80"],
+            ["--network", "mynet", "--publish", "127.0.0.1:8080:80/udp"],
+        ] {
+            if rootful {
+                assert_unimplemented(&extra);
+            } else {
+                let (exit, code, stderr) = create(&extra);
+                assert_eq!(code, Some("FAILED_PRECONDITION"), "{extra:?}: {stderr}");
+                assert_ne!(exit, 0, "{extra:?}");
+                assert!(stderr.contains("pasta path is not configured"), "{stderr}");
+            }
+        }
+    }
+
+    /// NET-9(#3200): 件数と 1 件の長さの超過は使い方エラー。
+    #[test]
+    fn net9_publish_usage_limits() {
+        let long = "1".repeat(65);
+        assert_invalid(&["--network", "mynet", "-p", long.as_str()], "");
+        let mut many: Vec<&str> = vec!["--network", "mynet"];
+        for _ in 0..65 {
+            many.extend(["-p", "8080:80"]);
+        }
+        assert_invalid(&many, "");
+    }
 }

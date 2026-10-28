@@ -18,7 +18,7 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
@@ -38,6 +38,10 @@
 //! ユーザー定義名のときだけ置ける(違えば `InvalidArgument`)。復号では本文の形だけを検証し(副作用なし)、バイナリの
 //! 再検証は [`super::pasta::reverify_recorded_pasta`] が起動の直前に行う(start 経路への結線と監査の記録は #1940)。
 //! CLI が書く処理は `--network` のユーザー定義名の解除(#1873)後に有効になる(現状は `UNIMPLEMENTED` で書かれない)。
+//! `publish` は #3200(NET-9・NET-3)で足した kind で、版は上げない(同じ理由)。`-p` / `--publish` の生の文字列
+//! (`[<ipv4>:]<host>:<container>[/tcp|udp]`)を 1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下で持ち、復号のたびに
+//! net の `PastaPortForwards::parse_all` で検証し直す。ユーザー定義名の `network` と組でなければ拒否する
+//! (rootless の pasta のみ。rootful は CLI が `UNIMPLEMENTED` にする。D13)。
 //!
 //! # 外部入力の扱い
 //!
@@ -54,7 +58,8 @@ use super::network::{NetworkOptions, NetworkSelection};
 use super::{ContainerOptions, IpcMode, Ulimit};
 use fandhe_container_net::add_host_dns::resolv_conf::MAX_DNS_SERVERS;
 use fandhe_container_net::add_host_dns::{MAX_ADD_HOST_ENTRIES, MAX_ADD_HOST_LEN, MAX_IP_TEXT_LEN};
-use fandhe_container_net::network::NAME_MAX_LEN;
+use fandhe_container_net::network::{MAX_PORT_PUBLISHES, NAME_MAX_LEN};
+use fandhe_container_net::pasta::MAX_PORT_FORWARD_SPEC_LEN;
 use fandhe_container_net::pasta::record::{PASTA_RECORD_MAX_BYTES, PastaRecord};
 
 /// 文書の先頭行(版つき。版が変わる形式変更ではこの値を上げる)。
@@ -85,6 +90,8 @@ const ADD_HOST_RECORD_MAX: usize = MAX_ADD_HOST_LEN;
 const DNS_RECORD_MAX: usize = MAX_IP_TEXT_LEN;
 /// `pasta` の本文の最大バイト数(net の `PASTA_RECORD_MAX_BYTES`。4 KiB)。
 const PASTA_RECORD_MAX: usize = PASTA_RECORD_MAX_BYTES;
+/// `publish` 1 件の最大バイト数(net の `MAX_PORT_FORWARD_SPEC_LEN`。#3200)。
+const PUBLISH_RECORD_MAX: usize = MAX_PORT_FORWARD_SPEC_LEN;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
 const HEADER_LINE_MAX: usize = 24;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
@@ -114,6 +121,8 @@ pub struct ContainerOptionsDocument {
     dns: Vec<String>,
     /// pasta の実体の記録の本文(net の `PastaRecord`。形は検証済み。`network` がユーザー定義名のときだけ。NET-9・#3199)。
     pasta: Option<String>,
+    /// `--publish` の生の文字列(検証済み。NET-9・#3200)。
+    publish: Vec<String>,
     /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
     generation: Option<String>,
 }
@@ -138,6 +147,7 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("add_hosts", &self.add_hosts)
             .field("dns", &self.dns)
             .field("pasta", &self.pasta)
+            .field("publish", &self.publish)
             .field("generation", &self.generation)
             .finish()
     }
@@ -174,6 +184,7 @@ impl ContainerOptionsDocument {
             add_hosts: Vec::new(),
             dns: Vec::new(),
             pasta: None,
+            publish: Vec::new(),
             generation: None,
         };
         doc.check_record_lengths()?;
@@ -255,7 +266,7 @@ impl ContainerOptionsDocument {
         {
             return Err(invalid("an options record is too long"));
         }
-        NetworkOptions::parse(network.as_deref(), &add_hosts, &dns)?;
+        NetworkOptions::parse(network.as_deref(), &add_hosts, &dns, &self.publish)?;
         self.network = network;
         self.add_hosts = add_hosts;
         self.dns = dns;
@@ -284,13 +295,42 @@ impl ContainerOptionsDocument {
         Ok(self)
     }
 
+    /// `-p` / `--publish` を持たせる(NET-9・NET-3・SUP-12・#3200)。
+    ///
+    /// `with_network` の後に呼ぶ(順序に依らず安全にするため、両方が保持済みの `network` と `publish` を
+    /// `NetworkOptions::parse` で照合する)。件数 → 1 件の長さ → net のパーサの順に検証し、文書全体の上限を再検査する。
+    pub fn with_publish(mut self, publish: Vec<String>) -> Result<Self, TraitError> {
+        if publish.len() > MAX_PORT_PUBLISHES {
+            return Err(invalid("too many publish records"));
+        }
+        if publish.iter().any(|s| s.len() > PUBLISH_RECORD_MAX) {
+            return Err(invalid("an options record is too long"));
+        }
+        NetworkOptions::parse(
+            self.network.as_deref(),
+            &self.add_hosts,
+            &self.dns,
+            &publish,
+        )?;
+        self.publish = publish;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
     /// `pasta` があるなら `network` はユーザー定義名でなければならない(それ以外では pasta を使わない)。
     fn check_pasta_network(&self) -> Result<(), TraitError> {
         if self.pasta.is_none() {
             return Ok(());
         }
-        let named = NetworkOptions::parse(self.network.as_deref(), &self.add_hosts, &self.dns)
-            .is_ok_and(|n| matches!(n.selection(), Some(NetworkSelection::Named(_))));
+        let named = NetworkOptions::parse(
+            self.network.as_deref(),
+            &self.add_hosts,
+            &self.dns,
+            &self.publish,
+        )
+        .is_ok_and(|n| matches!(n.selection(), Some(NetworkSelection::Named(_))));
         if named {
             Ok(())
         } else {
@@ -301,6 +341,11 @@ impl ContainerOptionsDocument {
     /// pasta の実体の記録の本文(形は検証済み)。
     pub fn pasta(&self) -> Option<&str> {
         self.pasta.as_deref()
+    }
+
+    /// `-p` / `--publish` の生の指定。
+    pub fn publish(&self) -> &[String] {
+        &self.publish
     }
 
     /// `--network` の生の指定。
@@ -363,6 +408,7 @@ impl ContainerOptionsDocument {
             && self.add_hosts.is_empty()
             && self.dns.is_empty()
             && self.pasta.is_none()
+            && self.publish.is_empty()
     }
 
     /// 検証済みの [`ContainerOptions`] へ変換する(label・secrets・configs は含まない)。
@@ -396,7 +442,12 @@ impl ContainerOptionsDocument {
         let cap_drop =
             parse_drop_list(&self.cap_drop).map_err(|_| invalid("a cap-drop record is invalid"))?;
         // network 系は復号のたびに net のパーサで再検証する(未信頼の入力。NET-6・NET-12・#3065)。
-        let network = NetworkOptions::parse(self.network.as_deref(), &self.add_hosts, &self.dns)?;
+        let network = NetworkOptions::parse(
+            self.network.as_deref(),
+            &self.add_hosts,
+            &self.dns,
+            &self.publish,
+        )?;
         options = options
             .with_cap_drop(cap_drop)
             .with_read_only(self.read_only)
@@ -461,6 +512,9 @@ impl ContainerOptionsDocument {
         if let Some(s) = &self.pasta {
             put("pasta", s);
         }
+        for s in &self.publish {
+            put("publish", s);
+        }
         if let Some(s) = &self.generation {
             put("gen", s);
         }
@@ -481,6 +535,7 @@ impl ContainerOptionsDocument {
         let mut read_only = false;
         let mut network: Option<String> = None;
         let (mut add_hosts, mut dns): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        let mut publish: Vec<String> = Vec::new();
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
         let mut pasta: Option<String> = None;
         let mut generation: Option<String> = None;
@@ -520,6 +575,7 @@ impl ContainerOptionsDocument {
                 "add-host" => ADD_HOST_RECORD_MAX,
                 "dns" => DNS_RECORD_MAX,
                 "pasta" => PASTA_RECORD_MAX,
+                "publish" => PUBLISH_RECORD_MAX,
                 "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
@@ -544,6 +600,7 @@ impl ContainerOptionsDocument {
                 }
                 "add-host" => add_hosts.push(text),
                 "dns" => dns.push(text),
+                "publish" => publish.push(text),
                 "network" => {
                     if network.replace(text).is_some() {
                         return Err(invalid("an options record is duplicated"));
@@ -578,15 +635,20 @@ impl ContainerOptionsDocument {
                 || cap_drop.len() > MAX_DROP_NAMES
                 || add_hosts.len() > MAX_ADD_HOST_ENTRIES
                 || dns.len() > MAX_DNS_SERVERS
+                || publish.len() > MAX_PORT_PUBLISHES
             {
                 return Err(invalid("too many options records"));
             }
         }
+        // publish の規則(user-defined network が要る等)を `with_network` の Unimplemented より先に適用する
+        // (`NetworkOptions::parse` と CLI 経路と同じ順序。NET-9・#3200)。
+        NetworkOptions::parse(network.as_deref(), &add_hosts, &dns, &publish)?;
         let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
             .with_cap_drop(cap_drop)?
             .with_read_only(read_only)?
             .with_network(network, add_hosts, dns)?
-            .with_pasta(pasta)?;
+            .with_pasta(pasta)?
+            .with_publish(publish)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
@@ -1175,5 +1237,109 @@ tmpfs 14\n/run:rw,noexec\n";
                 ErrorCode::InvalidArgument
             );
         }
+    }
+
+    fn pub_doc(publish: &[&str]) -> Result<ContainerOptionsDocument, TraitError> {
+        net_doc(Some("web"), &[], &[])?
+            .with_publish(publish.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// NET-9・NET-3(#3200): `publish` の符号化の具体値・往復・入力順の保持。
+    #[test]
+    fn net9_publish_round_trip() {
+        let d = pub_doc(&["8080:80", "0.0.0.0:53:53/udp"]).expect("doc");
+        assert!(!d.is_empty());
+        let bytes = d.encode();
+        assert_eq!(
+            bytes,
+            b"FCOPT1\nnetwork 3\nweb\npublish 7\n8080:80\npublish 17\n0.0.0.0:53:53/udp\n".to_vec()
+        );
+        let back = ContainerOptionsDocument::decode(&bytes).expect("decode");
+        assert_eq!(back.publish(), ["8080:80", "0.0.0.0:53:53/udp"]);
+        assert_eq!(back, d);
+        let o = back.to_container_options().expect("options");
+        assert_eq!(o.network().publish().len(), 2);
+    }
+
+    /// NET-9(#3200): 1 件 64 バイト以下・件数上限。
+    #[test]
+    fn net9_publish_limits() {
+        // 64 バイトちょうどの正しい指定は作れないので、長さの検査だけを見る(65 は長さで先に拒否)。
+        let long = "1".repeat(65);
+        let e = pub_doc(&[long.as_str()]).expect_err("long");
+        assert_eq!(e.message(), "an options record is too long");
+        let mut raw = Vec::from(&b"FCOPT1\nnetwork 3\nweb\npublish 65\n"[..]);
+        raw.extend_from_slice(long.as_bytes());
+        raw.push(b'\n');
+        assert_eq!(decode_err(&raw).message(), "an options record is too long");
+        let over: Vec<String> = (0..=MAX_PORT_PUBLISHES)
+            .map(|i| format!("{}:80", 1000 + i))
+            .collect();
+        let e = net_doc(Some("web"), &[], &[])
+            .expect("doc")
+            .with_publish(over.clone())
+            .expect_err("count");
+        assert_eq!(e.message(), "too many publish records");
+        let mut raw = Vec::from(&b"FCOPT1\nnetwork 3\nweb\n"[..]);
+        for s in &over {
+            raw.extend_from_slice(format!("publish {}\n{s}\n", s.len()).as_bytes());
+        }
+        assert_eq!(decode_err(&raw).message(), "too many options records");
+    }
+
+    /// NET-9(#3200): ユーザー定義名の `network` が無い `publish` は、構築順に依らず拒否する。
+    #[test]
+    fn net9_publish_requires_named_network() {
+        let msg = "publish records require a user-defined network";
+        for n in [None, Some("none"), Some("host")] {
+            let d = net_doc(n, &[], &[]).expect("doc");
+            assert_eq!(
+                d.with_publish(vec!["8080:80".into()])
+                    .expect_err("p")
+                    .message(),
+                msg
+            );
+        }
+        let e = ContainerOptionsDocument::default()
+            .with_publish(vec!["8080:80".into()])
+            .expect_err("no network");
+        assert_eq!(e.message(), msg);
+        assert_eq!(decode_err(b"FCOPT1\npublish 7\n8080:80\n").message(), msg);
+        assert_eq!(
+            decode_err(b"FCOPT1\nnetwork 4\nnone\npublish 7\n8080:80\n").message(),
+            msg
+        );
+    }
+
+    /// NET-9(#3200): 復号のたびに net のパーサで検証し直す(IPv6・ポート 0・重複・wildcard との重なり)。
+    #[test]
+    fn net9_publish_revalidated_on_decode() {
+        let head = b"FCOPT1\nnetwork 3\nweb\n";
+        let cases: [&[&str]; 4] = [
+            &["[::1]:80:80"],
+            &["0:80"],
+            &["8080:80", "8080:81"],
+            &["0.0.0.0:8080:80", "127.0.0.1:8080:81"],
+        ];
+        for specs in cases {
+            let mut raw = Vec::from(&head[..]);
+            for s in specs {
+                raw.extend_from_slice(format!("publish {}\n{s}\n", s.len()).as_bytes());
+            }
+            let e = decode_err(&raw);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{specs:?}");
+            assert!(!e.message().contains("8080"), "{}", e.message());
+        }
+    }
+
+    /// NET-9(#3200): `container:` ネットワークと publish の組は、復号でも publish の規則(InvalidArgument)を先に返す。
+    #[test]
+    fn net9_decode_publish_rule_precedes_container_network() {
+        let e = decode_err(b"FCOPT1\nnetwork 11\ncontainer:x\npublish 7\n8080:80\n");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "publish records require a user-defined network"
+        );
     }
 }

@@ -42,7 +42,7 @@ FCOPT1\n
 <kind> <len>\n<len バイトの UTF-8>\n     （繰り返し）
 ```
 
-- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
+- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
 - 値の改行を許すため行区切りではなく長さ接頭辞にする
 - 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ（`Ulimit::parse` 等）へ通し直す（未信頼の入力として検証）
 - 上限は確保の前に検証する: 全体 `ENV_MAX_TOTAL_BYTES + 256 KiB`、件数（ulimit 16・env `ENV_MAX_ENTRIES`・tmpfs
@@ -59,10 +59,11 @@ FCOPT1\n
 | `--cap-drop` | 文書の `cap-drop` kind（名前の生の文字列。1 件 32 バイト・最大 `MAX_DROP_NAMES` 件）→ 復号のたびに core の `parse_drop_list` で再検証（CRI の `drop_capabilities` と同じ正規化）→ `LaunchOptions::with_capability_drop` → launcher が config.json 由来の許可集合から除き、**狭めた同じ値**を launch の段と分離の記録（`launchIsolation.capabilities`。exec の再適用・inspect が見る）へ渡す。狭める方向のみで add の経路は無い（SEC-1・#2775） |
 | `--label` | 文書を通さず、create 時に `CreateRequest::with_annotations` → `CreateStateRequest::with_annotations` で `state.json` の `annotations` へ |
 | `--read-only` | 文書の `read-only` kind（本体は固定値 `true` だけ。`false`・空・重複は固定文言で拒否）→ `LaunchOptions::with_root_readonly(true)` → launcher が config の `root.readonly` と **OR** で実効値を 1 回だけ計算し、pivot 後の mount の `MOUNT_ATTR_RDONLY`・Landlock の root 規則・分離の記録（`launchIsolation.root_readonly`。inspect の `rootReadonly`）へ**同じ値**を渡す。指定が無ければ外部 bundle の値に従う。狭める方向のみで、`readonly:true` の bundle を書き込み可能に戻す経路は無い（`--read-only=false` は使い方エラー）。CLI は外部 bundle の `config.json` を書き換えない（CLI-1・SUP-12・CORE-5・SEC-1・#2828） |
+| `-p` / `--publish` | 文書の `publish` kind（1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下。`[<ipv4>:]<host>:<container>[/tcp\|udp]` の生の文字列）→ 復号のたびに net の `PastaPortForwards::parse_all` で再検証。ユーザー定義名の `network` と組でない文書は拒否する。検証済みの型で保持するだけで、pasta への反映は #1940。CLI が文書へ書くのは #1873 の後（NET-9・NET-3・SUP-12・#3200） |
 | `--network` / `--add-host` / `--dns` | 文書の `network`（1 レコード・64 バイト以下）・`add-host`（256 件以下・1 件 299 バイト以下）・`dns`（32 件以下・1 件 45 バイト以下）kind → 復号のたびに net のパーサ（`NetworkName::new`・`parse_add_hosts`・`parse_ip_addr`・`ResolvConfPlan::for_mode`）で再検証 → `network` は core の `LaunchNetworkMode`（`none` は `Loopback`、`host` は `Host`、`network` kind が無ければ `FromConfig`）へ写して `LaunchOptions::with_network` に渡す。`network` が無いのに `add-host` / `dns` がある文書は拒否する。ユーザー定義名・`container:` は `Unimplemented`（#1940・#3069・#3074）。`add-host` / `dns` は検証済みの型で保持するだけで、hosts / resolv.conf への反映（D9）が入る #1873 まで `launch_options` が `Unimplemented` で拒否する。CLI が kind を書く処理と既定の `none` も #1873（NET-6・NET-12・SUP-12・network-wiring.md D4・D5・#3065） |
 | `--pasta-path <絶対パス>` / `--pasta-path-search`（グローバル） | 文書の `pasta`（1 レコード・4096 バイト以下・重複は拒否）。作成時に net の `verify_pasta_binary` / `search_pasta_in_path` で解決・検証した実体の正規パス・識別（dev・ino・size・mtime・ctime・uid・mode）・版の日付を net の `PastaRecord` の本文で書く → 復号は本文の形だけを検証し（副作用なし）、起動の直前に `reverify_recorded_pasta` がバイナリを辿り直して記録と照合する（不一致は `FailedPrecondition`）。`network` がユーザー定義名のときだけ置ける（違えば `InvalidArgument`）。CLI が書く処理は `--network` のユーザー定義名の解除（#1873）後、start 経路への結線と SEC-4 の監査の記録は #1940（NET-9・CLI-1・PLUG-11・SUP-12・rootless-network.md 12.4・#3199） |
 
-`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
+`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`publish`・`pasta` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
 
 core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数・長さ・形式を再検証する。
 

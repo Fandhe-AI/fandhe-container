@@ -347,8 +347,10 @@ impl NetworkStore {
             .map_err(|e| map_io(&e, "failed to stat network store directory"))?;
         check_dir_meta(m.is_dir(), m.uid(), m.mode(), sys::effective_uid())?;
         let dir = Dir { file: f };
-        // 全体のロックファイルを作って検査する（以降の取得は検査つきで開き直す）。
-        dir.open_regular(LOCK_FILE, true, u64::MAX)?;
+        // 全体のロックファイルを検査する（以降の取得は検査つきで開き直す）。作るのは初期化時（新規作成、
+        // または中身が空）だけで、項目があるのに欠落している既存ストアは破損として拒否する（fail-closed）。
+        let initializing = created || dir.entries(SCAN_LIMIT)?.is_empty();
+        dir.open_regular(LOCK_FILE, initializing, u64::MAX)?;
         // 新規作成した `@networks` のエントリと `@lock` を永続化してから使う。既存でも（別プロセスが
         // 作った直後の可能性があるため）同期する。失敗は握りつぶさず返す（NET-6）。
         sync_init(&root, &dir)?;
@@ -366,7 +368,8 @@ impl NetworkStore {
     }
 
     fn lock_global(&self, shared: bool) -> Result<GlobalLockGuard<'_>, NetError> {
-        let file = self.dir.open_regular(LOCK_FILE, true, u64::MAX)?;
+        // 欠落を作り直すと旧 inode の保持者と排他が破れるため、通常の取得では作らない。
+        let file = self.dir.open_regular(LOCK_FILE, false, u64::MAX)?;
         acquire(
             &file,
             shared,
@@ -1076,5 +1079,18 @@ mod tests {
             el >= Duration::from_secs(5) && el < Duration::from_secs(8),
             "{el:?}"
         );
+    }
+
+    /// NET-6: 項目があるストアで全体の @lock が欠落したら、取得も open も再作成せず失敗する（fail-closed）。
+    #[test]
+    fn net6_3059_missing_global_lock_is_not_recreated() {
+        let t = Tmp::new("lockgone");
+        let s = NetworkStore::open(&t.0).unwrap();
+        s.create(&NetworkDefinition::pasta("alpha").unwrap())
+            .unwrap();
+        fs::remove_file(s.dir.path(LOCK_FILE)).unwrap();
+        assert!(s.lock_global_exclusive().is_err());
+        assert!(NetworkStore::open(&t.0).is_err());
+        assert!(!s.dir.path(LOCK_FILE).exists());
     }
 }

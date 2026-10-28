@@ -38,6 +38,13 @@ pub struct NetworkLockGuard<'g> {
     _global: PhantomData<&'g ()>,
 }
 
+impl NetworkLockGuard<'_> {
+    /// Linux 以外ではガードを作れないため常に偽（Linux 実装と同じシグネチャ）。
+    pub fn is_held(&self) -> bool {
+        false
+    }
+}
+
 impl NetworkStore {
     /// 常に `Unimplemented`。
     pub fn open(_state_root: &Path) -> Result<Self, NetError> {

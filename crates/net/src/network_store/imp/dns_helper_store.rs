@@ -65,8 +65,8 @@ impl NetworkLockGuard<'_> {
         Ok(())
     }
 
+    /// 記録を読む。読み取り経路は副作用を持たない（一時ファイルの掃除は排他ロックの書き込み経路だけが行う）。
     fn read_record_bytes(&self, name: &str) -> Result<Option<Vec<u8>>, NetError> {
-        self.discard_stale_temps()?;
         let f = match self.dir.open_regular_ro(name, RECORD_MAX_BYTES as u64) {
             Ok(f) => f,
             Err(e) if e.code() == NetErrorCode::NotFound => return Ok(None),
@@ -337,7 +337,7 @@ mod tests {
     }
 
     /// NET-7・REPAIR-5・#3070: 書き込み途中で中断され一時名だけが残っても、最終名は現れず、
-    /// 排他ロックの次の操作が一時名を回収して書き直せる。公開後の一時名の取り残し（nlink 2）も戻る。
+    /// 排他ロックの書き込み経路が一時名を回収して書き直せる。公開後の一時名の取り残し（nlink 2）も戻る。
     #[test]
     fn net7_3070_stale_temp_is_recovered() {
         let (dir, st) = store();
@@ -347,7 +347,10 @@ mod tests {
         let n = g.lock_network(&name).expect("net");
         // 空の一時ファイル（作成直後の中断）。
         fs::write(net.join("dns-helper.tmp"), b"").expect("tmp");
+        // 読み取り経路は副作用を持たない（一時名を消さない）。回収は排他ロックの書き込み経路が行う。
         assert_eq!(n.read_dns_helper().expect("read"), None);
+        assert!(net.join("dns-helper.tmp").exists());
+        n.discard_stale_temps().expect("discard");
         assert!(!net.join("dns-helper.tmp").exists());
         fs::write(net.join("dns-helper.intent.tmp"), b"part").expect("tmp");
         n.write_dns_helper_intent(&intent()).expect("write");
@@ -358,6 +361,7 @@ mod tests {
             net.join("dns-helper.intent.tmp"),
         )
         .expect("link");
+        n.discard_stale_temps().expect("discard");
         assert_eq!(n.read_dns_helper_intent().expect("read"), Some(intent()));
         assert_eq!(
             fs::metadata(net.join("dns-helper.intent"))

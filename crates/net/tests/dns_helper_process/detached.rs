@@ -11,11 +11,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fandhe_container_net::dns_helper::detach::{
-    ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DnsHelperStopRequest, NoStopRequest,
-    RequestOutcome, StopOutcome, spawn_detached_dns_helper, stop_recorded_dns_helper,
+    ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DnsHelperStopRequest,
+    IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome, StopOutcome,
+    recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
 };
 use fandhe_container_net::dns_helper::identity::read_identity;
-use fandhe_container_net::dns_helper::record::{DnsHelperRecord, HelperNonce};
+use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
 use fandhe_container_net::dns_helper::{DnsListenAddr, READY_TIMEOUT_DEFAULT};
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::instrument::NoopNetOpRecorder;
@@ -116,6 +117,7 @@ pub fn run(exe: &Path) {
     lifecycle(exe);
     stop_on_request(exe);
     ack_timeout(exe);
+    recover_intent(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -220,8 +222,23 @@ fn ack_timeout(exe: &Path) {
         .expect("spawn stage 2");
     let _stdin = child.stdin.take().expect("stdin");
     let mut out = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    out.read_line(&mut line).expect("ident");
+    // IDENT 行の読み取りにも期限を設ける（子が送らず止まっても試験が無期限に待たない。REPAIR-5）。
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let r = out.read_line(&mut line).map(|_| line);
+        let _ = tx.send(r);
+        out
+    });
+    let line = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(r) => r.expect("ident"),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("helper did not print its identity line before the deadline");
+        }
+    };
+    let mut out = reader.join().expect("reader");
     assert!(line.starts_with("IDENT "), "{line:?}");
     let t = Instant::now();
     let status = loop {
@@ -243,4 +260,70 @@ fn ack_timeout(exe: &Path) {
     let mut rest = String::new();
     out.read_to_string(&mut rest).expect("rest");
     assert_eq!(rest, "", "must not print READY without ack");
+}
+
+/// 起動窓の意図記録の回収（D14 (iv)。NET-5・NET-7・REPAIR-5・REPAIR-12・#3070）。
+/// nonce 一致だけを停止し、不一致は残し、確定記録があれば意図記録だけを消し、候補の上限超過では意図記録を保持する。
+fn recover_intent(exe: &Path) {
+    let tmp = Tmp::new("recover");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let pid = h.identity.pid;
+    let rec = n.read_dns_helper().expect("read").expect("record");
+    let intent_of = |nonce: HelperNonce| DnsHelperIntent::new(name.clone(), nonce, rec.listen());
+
+    // 意図記録なし。
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        IntentRecovery::NoIntent
+    );
+
+    // 確定記録があれば意図記録だけを消し、プロセスには触れない。
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        IntentRecovery::IntentDiscarded
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert!(notimp(h.listen), "a confirmed record must keep the helper");
+
+    // 確定記録を外す（起動窓で記録が無い状態）。
+    n.remove_dns_helper().expect("rm");
+
+    // nonce が一致しない子は残し、意図記録は消す。
+    n.write_dns_helper_intent(&intent_of(HelperNonce::generate().expect("nonce")))
+        .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert!(notimp(h.listen), "a different nonce must not be stopped");
+
+    // 候補の上限を超えたら走査を終えていないので意図記録を保持する。
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
+    let mut many = std::iter::repeat_n(0u32, MAX_RECOVERY_CANDIDATES + 1);
+    let e = recover_dns_helper_intent(&n, &mut many).expect_err("too many");
+    assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+    assert!(n.read_dns_helper_intent().expect("intent").is_some());
+    assert!(
+        notimp(h.listen),
+        "an incomplete scan must not stop anything"
+    );
+
+    // nonce が一致する子だけを停止し、意図記録を消す。
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut [0u32, pid].into_iter()).expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the matching helper must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
 }

@@ -170,6 +170,8 @@ fn stop_inner(
             return Ok(StopOutcome::StaleRecord);
         }
         Verify::Gone => {
+            // subreaper の下では終了済みでもゾンビとして pidfd が開ける。記録を消す前に pidfd 経由で回収する。
+            let _ = process::reap_pidfd_nohang(pidfd.as_fd());
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::AlreadyGone);
         }
@@ -316,15 +318,25 @@ fn spawn_inner(
 
     // 識別行と準備完了行を同じ pipe から順に読む。読み手のスレッドは pipe が閉じれば（ヘルパーの終了で）戻る。
     let (tx, rx) = mpsc::channel::<Result<String, &'static str>>();
-    std::thread::spawn(move || {
-        let mut out = stdout;
-        let first = read_line_limited(&mut out, IDENT_LINE_MAX);
-        let failed = first.is_err();
-        let _ = tx.send(first);
-        if !failed {
-            let _ = tx.send(read_line_limited(&mut out, READY_LINE_MAX));
-        }
-    });
+    // OS がスレッドの生成を拒否しても（pids.max 等）panic せず、起動前の後始末をして失敗にする。
+    let reader = std::thread::Builder::new()
+        .name("dns-helper-reader".to_owned())
+        .spawn(move || {
+            let mut out = stdout;
+            let first = read_line_limited(&mut out, IDENT_LINE_MAX);
+            let failed = first.is_err();
+            let _ = tx.send(first);
+            if !failed {
+                let _ = tx.send(read_line_limited(&mut out, READY_LINE_MAX));
+            }
+        });
+    if let Err(e) = reader {
+        return Err(fail_before_ack(
+            guard,
+            stdin,
+            map_io("spawn dns helper reader thread", &e),
+        ));
+    }
 
     let ident_line = match rx.recv_timeout(DNS_HELPER_ACK_TIMEOUT) {
         Ok(Ok(l)) => l,
@@ -596,8 +608,9 @@ pub(crate) fn run_stage2_handshake(nonce: &HelperNonce) -> Result<(), NetError> 
         }
     }
     let mut buf = [0u8; 4];
-    match stdin.lock().read(&mut buf) {
-        Ok(4) if &buf == ACK => Ok(()),
+    // 部分読み・EINTR で有効な ACK を取り逃さないよう read_exact（EINTR は再試行される）で読む。
+    match stdin.lock().read_exact(&mut buf) {
+        Ok(()) if &buf == ACK => Ok(()),
         _ => Err(err(
             NetErrorCode::FailedPrecondition,
             "ack was not received",

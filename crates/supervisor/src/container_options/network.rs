@@ -36,9 +36,9 @@ use fandhe_container_net::pasta::PastaPortForwards;
 
 /// 予約名の固定拒否文言。
 const RESERVED_NAME_MESSAGE: &str = "reserved network name";
-/// 結線されていない指定の固定拒否文言。
 /// `publish` がユーザー定義名の `network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "publish records require a user-defined network";
+/// 結線されていない指定の固定拒否文言。
 const NAMED_NOT_WIRED_MESSAGE: &str = "user-defined networks are not wired to the launch path yet";
 
 /// `--network` の検証済みの選択(NET-6)。

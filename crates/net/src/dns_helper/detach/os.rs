@@ -366,10 +366,10 @@ fn spawn_inner(
     };
     let record = match DnsHelperRecord::new(identity.clone(), nonce, listen) {
         Ok(r) => r,
-        Err(e) => return Err(fail_before_ack(guard, stdin, e)),
+        Err(e) => return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e)),
     };
     if let Err(e) = guard.write_dns_helper(&record) {
-        return Err(fail_before_ack(guard, stdin, e));
+        return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e));
     }
 
     // 記録を確定した後で ack を返す。ここから先の失敗は、プロセスを pidfd 経由で止めて確認してから記録を消す。
@@ -440,6 +440,36 @@ fn fail_before_ack(
     e: NetError,
 ) -> NetError {
     drop(stdin);
+    match guard.remove_dns_helper_intent() {
+        Ok(()) => e,
+        Err(r) => with_note(e, &format!("intent record kept: {}", r.message())),
+    }
+}
+
+/// ack を返す前の失敗のうち、段 2 の pidfd を確保済みの経路（NET-5・REPAIR-5）。
+///
+/// stdin を閉じて段 2 の自発終了（EOF）を期限つきで待ち、終了しなければ pidfd 経由で SIGKILL する。
+/// child subreaper の呼び出し元では終了後もゾンビが残るため、pidfd 経由で回収する。終了を確認できないときは
+/// 復旧用の意図記録を消さずに残す（後続の回収が nonce で再試行できる）。
+fn fail_before_ack_reap(
+    guard: &NetworkLockGuard<'_>,
+    stdin: Option<ChildStdin>,
+    pidfd: BorrowedFd<'_>,
+    e: NetError,
+) -> NetError {
+    drop(stdin);
+    let exited = if matches!(wait_exit(pidfd, DNS_HELPER_KILL_REAP_TIMEOUT), Ok(true)) {
+        let _ = process::reap_pidfd_nohang(pidfd);
+        true
+    } else {
+        kill_and_confirm(pidfd)
+    };
+    if !exited {
+        return with_note(
+            e,
+            "dns helper could not be confirmed stopped; intent record kept",
+        );
+    }
     match guard.remove_dns_helper_intent() {
         Ok(()) => e,
         Err(r) => with_note(e, &format!("intent record kept: {}", r.message())),

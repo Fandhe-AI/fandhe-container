@@ -3799,6 +3799,10 @@ mod libc_abi {
         assert!(poll_abi::POLLERR == libc::POLLERR);
         assert!(poll_abi::POLLHUP == libc::POLLHUP);
         assert!(poll_abi::POLLNVAL == libc::POLLNVAL);
+        // `poll` の nfds 引数の幅（Linux は unsigned long、macOS は unsigned int）。関数ポインタの照合は
+        // 自前の型どうしでしか見ないため、`NfdsT` と `libc::nfds_t` の幅はここで直接突き合わせる（#3003・#3145）。
+        assert!(size_of::<poll_abi::NfdsT>() == size_of::<libc::nfds_t>());
+        assert!(align_of::<poll_abi::NfdsT>() == align_of::<libc::nfds_t>());
     };
     #[cfg(any(
         target_os = "macos",

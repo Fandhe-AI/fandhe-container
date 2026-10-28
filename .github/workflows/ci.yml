@@ -87,7 +87,7 @@ on:
         default: ''
       repeat-libtest-name:
         description: >-
-          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（libtest の --logfile の `ok <名前>` 行で判定し、
+          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（`--exact` で単独の試験へ絞り、libtest の --logfile がちょうど 1 行の `ok <名前>` であることで判定し、
           並列出力の行の割り込みを受けない。repeat-success-line と排他。REPAIR-12・#2962）
         type: string
         default: ''

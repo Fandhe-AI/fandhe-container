@@ -20,6 +20,10 @@
 //!   それ以外では宣言を持たず、capability / execveat は `Unsupported`、`close_fds_from` は `/proc/self/fd` の走査だけ
 //!   で閉じる（`compile_error!` にしない理由: 他の fail-closed と形を揃え、非 LP64 でも crate をビルドできる
 //!   ため。#3100・SUP-6・MVM-4）。
+//! - `prctl(2)` の宣言と、それを使う `cap_bounding_drop` / `cap_ambient_raise` / `cap_ambient_clear_all` / `set_keep_caps` /
+//!   `get_keep_caps` / `set_dumpable` も同じ LP64 の x86_64・aarch64 に限る（可変長部を `u64` = `unsigned long` で渡すため、
+//!   ILP32 では引数の並びがずれる）。それ以外では FFI を呼ばず `Unsupported` を返す。`clear_ambient_caps_on_exec` は
+//!   `pre_exec` の失敗で `spawn` が `Err` になり、ambient を持ったまま exec しない（#3202・SUP-6・MVM-4）。
 //! - 制御チャネル用の FFI（`socket` / `connect` / `clock_gettime`・`Timespec`・`SockaddrUn`）は LP64 の x86_64・aarch64 でのみ
 //!   コンパイルし、それ以外は `Unsupported`（#2140）。
 //! - 引数はすべて整数または呼び出しの間有効なスタック上の `#[repr(C)]` 値で、`-1` 戻り時は直後に
@@ -79,24 +83,12 @@ mod arch {
 /// 値は `libc_abi`（#1840）が `libc` と照合し、下の単体テストが具体値も照合する。
 pub(crate) const EPERM: i32 = 1;
 
-/// include/uapi/linux/prctl.h の値。
-const PR_SET_DUMPABLE: i32 = 4;
-const PR_GET_KEEPCAPS: i32 = 7;
-const PR_SET_KEEPCAPS: i32 = 8;
-const PR_CAPBSET_DROP: i32 = 24;
-const PR_CAP_AMBIENT: i32 = 47;
-const PR_CAP_AMBIENT_RAISE: u64 = 2;
-const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
 /// `fcntl(2)` の `F_GETFD`（fd が開いているかの確認に使う）。
 const F_GETFD: i32 = 1;
 /// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
 const CAP_NUMBER_LIMIT: u8 = 64;
 
 unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として宣言する
-    // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。可変長部は
-    // `unsigned long`（LP64 で u64）に合わせて渡す。
-    fn prctl(option: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int setgroups(size_t size, const gid_t *list)`（Linux の `gid_t` は u32）。
     fn setgroups(size: usize, list: *const u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int setresgid(gid_t rgid, gid_t egid, gid_t sgid)`。
@@ -183,40 +175,6 @@ fn check_cap_number(cap: u8) -> io::Result<()> {
     Ok(())
 }
 
-/// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
-pub(crate) fn cap_bounding_drop(cap: u8) -> io::Result<()> {
-    check_cap_number(cap)?;
-    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
-    // 影響は呼び出したスレッドの bounding set の縮小のみ（権限を減らす方向にしか働かない）。
-    let rc = unsafe { prctl(PR_CAPBSET_DROP, u64::from(cap), 0u64, 0u64, 0u64) };
-    check(i64::from(rc)).map(|_| ())
-}
-
-/// `cap` を ambient 集合へ載せる（`PR_CAP_AMBIENT_RAISE`。permitted かつ inheritable に含まれる必要がある）。
-pub(crate) fn cap_ambient_raise(cap: u8) -> io::Result<()> {
-    check_cap_number(cap)?;
-    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
-    // 影響は呼び出したスレッドの ambient 集合の拡大のみで、permitted ∩ inheritable を超えてはカーネルが拒否する。
-    let rc = unsafe {
-        prctl(
-            PR_CAP_AMBIENT,
-            PR_CAP_AMBIENT_RAISE,
-            u64::from(cap),
-            0u64,
-            0u64,
-        )
-    };
-    check(i64::from(rc)).map(|_| ())
-}
-
-/// ambient capability をすべて消す（`PR_CAP_AMBIENT_CLEAR_ALL`）。
-pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
-    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
-    // 影響は呼び出したスレッドの ambient 集合の縮小のみ。
-    let rc = unsafe { prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0u64, 0u64, 0u64) };
-    check(i64::from(rc)).map(|_| ())
-}
-
 /// `pgid` のプロセスグループ全体へ SIGKILL を送る（`kill(-pgid, SIGKILL)`。#2390・REPAIR-5）。
 ///
 /// 呼び出し元は `process_group(0)` で起動した子の pid（= pgid）だけを渡す。`pgid` が 2 未満・`i32` 範囲外なら
@@ -244,26 +202,6 @@ pub(crate) fn clear_ambient_caps_on_exec(cmd: &mut std::process::Command) {
     // 確保・ロック・親との共有状態の操作をしない（async-signal-safe）。影響は子の ambient 集合の縮小のみ。
     unsafe {
         cmd.pre_exec(cap_ambient_clear_all);
-    }
-}
-
-/// `PR_SET_KEEPCAPS` を設定 / 解除する（`setresuid` をまたいで permitted を保持するための一時設定。
-/// 呼び出したスレッドのみ）。
-pub(crate) fn set_keep_caps(on: bool) -> io::Result<()> {
-    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
-    // 影響は呼び出したスレッドの securebits の `SECBIT_KEEP_CAPS` のみ。
-    let rc = unsafe { prctl(PR_SET_KEEPCAPS, u64::from(on), 0u64, 0u64, 0u64) };
-    check(i64::from(rc)).map(|_| ())
-}
-
-/// `PR_GET_KEEPCAPS` を読む。戻り値が 0 / 1 以外なら `EINVAL` として扱う。
-pub(crate) fn get_keep_caps() -> io::Result<bool> {
-    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
-    let rc = unsafe { prctl(PR_GET_KEEPCAPS, 0u64, 0u64, 0u64, 0u64) };
-    match check(i64::from(rc))? {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(io::Error::from_raw_os_error(22)), // EINVAL
     }
 }
 
@@ -307,10 +245,84 @@ mod syscall_ffi {
     pub(super) const SYS_CLOSE_RANGE: i64 = 436;
     /// execveat に渡す argv / envp の要素数の上限（無制限確保の防止）。
     pub(super) const MAX_EXEC_VECTOR: usize = 4096;
+    /// include/uapi/linux/prctl.h の値。prctl は可変長部を `unsigned long` で渡すため LP64 限定（#3202）。
+    pub(super) const PR_SET_DUMPABLE: i32 = 4;
+    pub(super) const PR_GET_KEEPCAPS: i32 = 7;
+    pub(super) const PR_SET_KEEPCAPS: i32 = 8;
+    pub(super) const PR_CAPBSET_DROP: i32 = 24;
+    pub(super) const PR_CAP_AMBIENT: i32 = 47;
+    pub(super) const PR_CAP_AMBIENT_RAISE: u64 = 2;
+    pub(super) const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で `long` は i64）。この宣言は LP64 の x86_64・aarch64 でのみ
         // コンパイルし、cfg は `libc_abi` と同一（#3100）。
         pub(super) fn syscall(number: i64, ...) -> i64;
+        // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として宣言する
+        // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。可変長部は
+        // `unsigned long`（LP64 で u64）に合わせて渡す。この宣言は LP64 の x86_64・aarch64 でのみコンパイルする（#3202）。
+        pub(super) fn prctl(option: i32, ...) -> i32;
+    }
+
+    /// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
+    pub(crate) fn cap_bounding_drop(cap: u8) -> io::Result<()> {
+        check_cap_number(cap)?;
+        // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+        // 影響は呼び出したスレッドの bounding set の縮小のみ（権限を減らす方向にしか働かない）。
+        let rc = unsafe { prctl(PR_CAPBSET_DROP, u64::from(cap), 0u64, 0u64, 0u64) };
+        check(i64::from(rc)).map(|_| ())
+    }
+
+    /// `cap` を ambient 集合へ載せる（`PR_CAP_AMBIENT_RAISE`。permitted かつ inheritable に含まれる必要がある）。
+    pub(crate) fn cap_ambient_raise(cap: u8) -> io::Result<()> {
+        check_cap_number(cap)?;
+        // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+        // 影響は呼び出したスレッドの ambient 集合の拡大のみで、permitted ∩ inheritable を超えてはカーネルが拒否する。
+        let rc = unsafe {
+            prctl(
+                PR_CAP_AMBIENT,
+                PR_CAP_AMBIENT_RAISE,
+                u64::from(cap),
+                0u64,
+                0u64,
+            )
+        };
+        check(i64::from(rc)).map(|_| ())
+    }
+
+    /// ambient capability をすべて消す（`PR_CAP_AMBIENT_CLEAR_ALL`）。
+    pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+        // 影響は呼び出したスレッドの ambient 集合の縮小のみ。
+        let rc = unsafe { prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0u64, 0u64, 0u64) };
+        check(i64::from(rc)).map(|_| ())
+    }
+
+    /// `PR_SET_KEEPCAPS` を設定 / 解除する（`setresuid` をまたいで permitted を保持するための一時設定。
+    /// 呼び出したスレッドのみ）。
+    pub(crate) fn set_keep_caps(on: bool) -> io::Result<()> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+        // 影響は呼び出したスレッドの securebits の `SECBIT_KEEP_CAPS` のみ。
+        let rc = unsafe { prctl(PR_SET_KEEPCAPS, u64::from(on), 0u64, 0u64, 0u64) };
+        check(i64::from(rc)).map(|_| ())
+    }
+
+    /// `PR_GET_KEEPCAPS` を読む。戻り値が 0 / 1 以外なら `EINVAL` として扱う。
+    pub(crate) fn get_keep_caps() -> io::Result<bool> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+        let rc = unsafe { prctl(PR_GET_KEEPCAPS, 0u64, 0u64, 0u64, 0u64) };
+        match check(i64::from(rc))? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(io::Error::from_raw_os_error(22)), // EINVAL
+        }
+    }
+
+    /// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを
+    /// 同一 uid の別プロセスから受けない（昇格中の窓の防御）。
+    pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの dumpable 属性のみ。
+        let rc = unsafe { prctl(PR_SET_DUMPABLE, u64::from(on), 0u64, 0u64, 0u64) };
+        check(i64::from(rc)).map(|_| ())
     }
 
     /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -450,6 +462,34 @@ mod syscall_ffi {
         Err(unsupported())
     }
 
+    pub(crate) fn cap_bounding_drop(cap: u8) -> io::Result<()> {
+        check_cap_number(cap)?;
+        Err(unsupported())
+    }
+
+    pub(crate) fn cap_ambient_raise(cap: u8) -> io::Result<()> {
+        check_cap_number(cap)?;
+        Err(unsupported())
+    }
+
+    /// 非 LP64 では `Err` を返す。`clear_ambient_caps_on_exec` が登録する `pre_exec` も失敗し、`spawn` が
+    /// `Err` になる（ambient を持ったまま子を exec しない。fail-closed）。
+    pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn set_keep_caps(_on: bool) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn get_keep_caps() -> io::Result<bool> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn set_dumpable(_on: bool) -> io::Result<()> {
+        Err(unsupported())
+    }
+
     pub(crate) fn execveat_fd(_fd: i32, _argv: &[CString], _envp: &[CString]) -> io::Result<()> {
         Err(unsupported())
     }
@@ -468,7 +508,10 @@ mod syscall_ffi {
 // glob import の `unused_imports` だけを許す（LP64 以外では syscall_ffi ごと cfg で除外される）。
 #[allow(unused_imports)]
 use syscall_ffi::*;
-pub(crate) use syscall_ffi::{cap_set_thread, close_fds_from, execveat_fd};
+pub(crate) use syscall_ffi::{
+    cap_ambient_clear_all, cap_ambient_raise, cap_bounding_drop, cap_set_thread, close_fds_from,
+    execveat_fd, get_keep_caps, set_dumpable, set_keep_caps,
+};
 
 /// `close_range` が無いカーネル向けの代替。`/proc/self/fd` の列挙を先に集めてから閉じる（列挙中の fd を閉じない）。
 fn close_fds_from_proc(first: u32) -> io::Result<()> {
@@ -806,14 +849,6 @@ pub(crate) fn new_session() -> io::Result<()> {
     check(i64::from(rc)).map(|_| ())
 }
 
-/// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを
-/// 同一 uid の別プロセスから受けない（昇格中の窓の防御）。
-pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
-    // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの dumpable 属性のみ。
-    let rc = unsafe { prctl(PR_SET_DUMPABLE, u64::from(on), 0u64, 0u64, 0u64) };
-    check(i64::from(rc)).map(|_| ())
-}
-
 /// 自前の FFI 宣言と `libc` の機械照合（コンパイル時の `const` 評価のみ。関数は呼ばず `unsafe` を足さない。
 /// #1840・#1837・#1318・MVM-4・REPAIR-7・REPAIR-12。方式は docs/design/ffi-libc-check.md）。
 ///
@@ -999,6 +1034,11 @@ mod tests {
     }
 
     /// SUP-14・TASK-171.1.3: prctl の番号と capability ABI の値を固定する（include/uapi の値との照合）。
+    /// 定数は LP64 の x86_64・aarch64 に限って宣言するため、試験も同じ対象に閉じる（#3202）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
     #[test]
     fn sup14_task171_1_3_constants_are_fixed() {
         assert_eq!(PR_GET_KEEPCAPS, 7);

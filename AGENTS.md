@@ -74,7 +74,7 @@ make fio-bench TARGET_DIR=<dir> LABEL=<label> [RUNTIME=<seconds>]  # fio 4K ラ�
 make fio-baseline-ratio-selftest  # fio ベースライン比算出スクリプトの自己テスト（TASK-25.2・IO-8・REPAIR-12。実 fio 不要）
 make fio-baseline-ratio BASELINE=<results.json> CANDIDATE=<results.json>  # Docker ベースライン比（IOPS・レイテンシの倍率）を算出する（実 fio 不要。results.json は fio-randwrite-4k.sh の出力）
 make startup-latency-selftest  # 起動時間計測スクリプトの自己テスト（TASK-46.1・TASK-46.2・CORE-10・REPAIR-12。スタブランタイム・スタブ docker で完結。Linux 限定）
-make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name> [ITERATIONS=<n>] [LABEL=<label>]  # create からプロセス実行開始（state が running / stopped を返した時点）までの起動時間の中央値を計測する（実機前提。委譲スコープ〔`systemd-run --user --scope -p Delegate=yes`〕で包む。report 用の結果ファイルは make 経由では作れず、スクリプトを `--output` 付きで直接実行する。手順は「実機前提テスト」の `startup_latency.sh` の項目）
+make startup-latency RUNTIME=<abs-path> BUNDLE=<dir> TARGET=<name> [ITERATIONS=<n>] [WARMUP=<n>] [TIMEOUT=<1-120>] [LABEL=<label>] [OUTPUT=<新規ファイル>]  # create からプロセス実行開始（state が running / stopped を返した時点）までの起動時間の中央値を計測する（実機前提。委譲スコープ〔`systemd-run --user --scope -p Delegate=yes`〕で包む。report 用の結果ファイルは `OUTPUT=` で作れる。手順は「実機前提テスト」の `startup_latency.sh` の項目）
 make startup-latency-docker DOCKER=<abs-path> [TARGET=<name>] [IMAGE=<ref>] [ITERATIONS=<n>] [LABEL=<label>] [OUTPUT=<file>]  # `docker run --rm --pull never ... --entrypoint true <image>` 全体の起動時間の中央値を計測する（TASK-46.2・CORE-10。実機前提。イメージは事前に手動 pull）
 make startup-latency-report OWN_RESULT=<file> DOCKER_RESULT=<file> [OUTPUT=<file>]  # own（oci モード）と Docker の結果を 1 つのレポートに統合する（TASK-46.2。合否判定は出さない）
 make idle-memory-selftest   # アイドル時常駐メモリ計測スクリプトの自己テスト（TASK-45.1・CORE-7・SUP-1。疑似 /proc のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定で、root 実行は chmod 000 系のケースが成立しないため失敗する）
@@ -343,7 +343,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
        --target own --iterations <N> --output <新規ファイルの絶対パス>
      ```
 
-     `make startup-latency` は実行コマンド行（絶対パス入り）を stdout に出し `OUTPUT` を受けないため、その stdout は report の入力にならない。make との対応は `RUNTIME`→`--runtime`・`BUNDLE`→`--bundle`・`TARGET`→`--target`・`ITERATIONS`→`--iterations`・`LABEL`→`--label`。`--timeout` の既定は 10 秒（1〜60）、`--warmup` の既定は 1。N は Docker 側と同じ値にして記録する（値は Agent が決めない）
+     `make startup-latency` は `OUTPUT=<新規ファイルの絶対パス>` で結果ファイルを作れる（#3203。stdout は実行コマンド行を含むため report の入力にしない）。make との対応は `RUNTIME`→`--runtime`・`BUNDLE`→`--bundle`・`TARGET`→`--target`・`ITERATIONS`→`--iterations`・`WARMUP`→`--warmup`・`TIMEOUT`→`--timeout`・`LABEL`→`--label`・`OUTPUT`→`--output`。`--runtime` は symlink を解決した先が通常ファイル・実行可能・所有者が自分か root・g/o 書き込み不可で、祖先も g/o 書き込み不可（sticky は可）であること。`--timeout` の既定は 10 秒（1〜120。CLI の start の受信期限〔約 58.9 秒〕より短いと start が切られたとき stderr に hint を出す）、`--warmup` の既定は 1。N は Docker 側と同じ値にして記録する（値は Agent が決めない）
   5. Docker 側: イメージを事前に手動 pull し digest を記録してから `make startup-latency-docker DOCKER=<docker の絶対パス> IMAGE=alpine:3.20 ITERATIONS=<N> OUTPUT=<新規ファイル>`。Docker ソケットは root 同等の権限のため人間が明示的に実行する
   6. 統合: `make startup-latency-report OWN_RESULT=<own の結果> DOCKER_RESULT=<docker の結果> OUTPUT=<新規ファイル>`
   7. 出力の読み方: `method`（own は `cli-create-to-exec-observed`）・`samples_us[]`（`create_us`・`start_us`・`observe_us`・`total_us`・`state_polls`）・`metrics.startup_latency_{p50,min,max}_ms`（p50 は `total_us` の中央値で偶数件は中央 2 件の平均）。`observe_us`（`state_polls=1` の回）は CLI の `state` 1 往復の目安（誤差は own に不利な向き。観測点は Running の記録で execve の完了は保証しない。スクリプト冒頭「CLI 経由の誤差（#3124）」）。report は合否を出さず、`comparison.methods_differ: true` と `p50_ratio_own_to_docker` は参考値。`--standalone` の参考値 0.00133 秒は確定の根拠にしない。Conditional Go 条件 1 の判定は #213 で人間が行う

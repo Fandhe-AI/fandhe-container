@@ -3062,6 +3062,20 @@ pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
 }
 
 /// [`poll_two`] の結果。真偽値にせず、待ちの結末を区別する（REPAIR-5・#3003）。
+///
+/// 生成するのは `poll_two`（macOS と LP64 の x86_64・aarch64 Linux のみ）だけなので、それ以外
+/// （x32 など）では未構築の警告を許す（型は呼び出し側の match のために全構成で残す。#3202・MVM-4）。
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PollOutcome {
     /// 期限内にどちらも読み取り可能（EOF・エラーを含む。読めば待たずに戻る）にならなかった

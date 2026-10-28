@@ -311,10 +311,10 @@ fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実
 fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDIDATE に results.json のパスを指定）
 	@scripts/targets/fio-baseline-ratio.sh
 
-startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL OUTPUT）
 	@scripts/targets/startup-latency.sh
 
-startup-latency-docker: ## Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。TASK-46.2）
+startup-latency-docker: ## Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL IMAGE OUTPUT。TASK-46.2）
 	@scripts/targets/startup-latency-docker.sh
 
 startup-latency-report: ## own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）

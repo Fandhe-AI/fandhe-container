@@ -24,7 +24,7 @@ use std::net::IpAddr;
 
 use fandhe_container_core::oci_runtime::LaunchNetworkMode;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
-use fandhe_container_net::add_host_dns::resolv_conf::ResolvConfPlan;
+use fandhe_container_net::add_host_dns::resolv_conf::{MAX_DNS_SERVERS, ResolvConfPlan};
 use fandhe_container_net::add_host_dns::{AddHostEntry, parse_add_hosts, parse_ip_addr};
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::network::NetworkName;
@@ -87,6 +87,13 @@ impl NetworkOptions {
         add_hosts: &[String],
         dns: &[String],
     ) -> Result<Self, TraitError> {
+        // 確保前の件数検証: モードによらず上限を超える `dns` は入口で拒否する(Named にも効かせる)。
+        if dns.len() > MAX_DNS_SERVERS {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "too many dns servers",
+            ));
+        }
         let mut container_ref = false;
         let selection = match network {
             None => None,
@@ -275,6 +282,17 @@ mod tests {
             "add-host / dns records require a network record"
         );
         assert_eq!(code(p(None, &[], &["8.8.8.8"])), INV);
+    }
+
+    /// NET-12: `dns` の件数上限はモードによらず確保前に効く(Named でも 33 件は拒否)。
+    #[test]
+    fn net12_dns_count_limit_applies_to_named() {
+        let ok = vec!["192.0.2.1"; MAX_DNS_SERVERS];
+        assert!(p(Some("web"), &[], &ok).is_ok());
+        let over = vec!["192.0.2.1"; MAX_DNS_SERVERS + 1];
+        assert_eq!(code(p(Some("web"), &[], &over)), INV);
+        assert_eq!(code(p(Some("host"), &[], &over)), INV);
+        assert_eq!(code(p(None, &[], &over)), INV);
     }
 
     /// 固定文言は入力値を含まない。

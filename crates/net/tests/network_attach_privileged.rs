@@ -44,7 +44,13 @@
 //! （pin の識別子つき）から別プロセスが `XRECLAIM ok removed=2 leftover=0` で回収する（冪等）。
 //! S4: `SetOwnerToken` で失敗し veth 削除も失敗 → 別名の無い veth は所有を証明できず、回収は
 //! `XRECLAIM err step=DeleteVeth removed=0 leftover=1` で拒否して veth を残す（試験が後始末する）。
-//! 故障点は IPAM 払い出し前の段に限る。実機（root）での実行は #1626（人間担当）で未実行。
+//! IPAM 払い出し後の段（NET-1・REPAIR-3・#3040）も確かめる。
+//! S5: ポート公開（8093）つきの c13 が `DefaultRoute` で失敗し veth 削除・unpin も失敗 → veth・pin・所有記録に加え
+//! アドレスとポート予約が残り（`leftover` の末尾が `Address`・請求書は `quarantine=1`）、別プロセスの回収は
+//! カーネル側の veth と pin だけを消して quarantine（アドレス・予約）は解放しない。解放は `delete_network` が行う。
+//! S6: ポート公開（8094）つきの c14 が `AddAddress` で失敗し巻き戻しは成功 → veth・pin が消え、アドレスと予約は
+//! 即時に解放され、DNAT は投入されない。S5 の quarantine は `delete_network` の前後で保持と解放を照合する。
+//! 実機（root）での実行は #1626（人間担当）で未実行。
 //!
 //! 続けて netns の事前作成（`create_container_netns`。#2675・CRI-2）→ 接続（`attach_prepared_container`。c6）と、
 //! 作成 → 解放（`release_container_netns`。c7。pin が消える）を確かめる。
@@ -122,7 +128,7 @@ mod linux {
     const CLAIM_HEX_MAX_LEN: usize = 4096;
     /// attach 子が標準出力へ出す行の接頭辞。
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept detach=ok detach_sibling=kept";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -650,19 +656,24 @@ mod linux {
         _ports: &mut PortRegistry,
         _base: &Path,
         _t: Duration,
-    ) -> Result<(), NetError> {
+    ) -> Result<Vec<EndpointId>, NetError> {
         Err(fail(
-            "feature `attach-fault-test-support` is required for the fault injection scenarios (S3/S4)",
+            "feature `attach-fault-test-support` is required for the fault injection scenarios (S3/S4/S5/S6)",
         ))
     }
 
     /// 故障注入（`attach_container_with_fault_for_test`）で巻き戻しも失敗させて取り残しを作り、別プロセス
     /// （`--reclaim-child`）が請求書から回収するかを実カーネルで照合する（NET-1・REPAIR-3・#2971）。
-    /// 故障点は IPAM 払い出し前の段に限る（最後の「IPAM・予約が空」の照合と `delete_network` を崩さないため）。
+    /// S3/S4 の故障点は IPAM 払い出し前の段。S5/S6 は払い出し後の段で、S5 が残した quarantine（アドレス・予約）は
+    /// 戻り値の endpoint として返し、呼び出し側が `delete_network` の前後で保持と解放を照合する
+    /// （最後の「IPAM・予約が空」の照合を崩さない順序。#3040）。
     /// - S3: `SetUp` で失敗し veth 削除・unpin も失敗 → veth（別名あり・bridge 接続済み）と pin が残り、
     ///   請求書（pin の識別子つき）から回収されて冪等に成功する
     /// - S4: `SetOwnerToken` で失敗し veth 削除も失敗 → 別名の無い veth が残り、所有を証明できないため回収は
     ///   `DeleteVeth` で拒否して veth を残す（試験が自分で後始末する）
+    /// - S5: ポート公開つきで `DefaultRoute` に失敗し veth 削除・unpin も失敗 → veth・pin に加えアドレスと予約が残る。
+    ///   回収はカーネル側だけで quarantine は解放しない（c13 を返す）
+    /// - S6: ポート公開つきで `AddAddress` に失敗し巻き戻しは成功 → 資源・アドレス・予約がすべて解放される
     #[cfg(feature = "attach-fault-test-support")]
     fn fault_scenarios(
         route: &NetlinkRouteSocket,
@@ -672,7 +683,7 @@ mod linux {
         ports: &mut PortRegistry,
         base: &Path,
         t: Duration,
-    ) -> Result<(), NetError> {
+    ) -> Result<Vec<EndpointId>, NetError> {
         let gone = |name: &IfName| {
             matches!(
                 route.link_index(name, t),
@@ -805,7 +816,149 @@ mod linux {
         if !gone(&host10) {
             return Err(fail("S4: the test cleanup could not delete the veth"));
         }
-        Ok(())
+
+        // S5: IPAM 払い出し後の段（DefaultRoute）。取り残しがあるのでアドレスと予約を保持する。
+        let base_ports = ports.len();
+        let published = |port: u16| -> Result<Vec<PortPublish>, NetError> {
+            Ok(vec![PortPublish::new(
+                PortProtocol::Tcp,
+                "192.0.2.10".parse().map_err(|_| fail("addr"))?,
+                port,
+                80,
+            )?])
+        };
+        let c13 = EndpointId::new("c13")?;
+        let spec13 = ContainerAttachSpec::new(c13.clone(), net, base.to_path_buf())?
+            .with_port_publishes(published(8093)?)?;
+        let fault = AttachFault::new(AttachFaultPoint::DefaultRoute)
+            .with_veth_delete_failure(NetErrorCode::Internal)
+            .with_unpin_failure(NetErrorCode::Internal);
+        let e = match attach_container_with_fault_for_test(
+            route, nft, &spec13, ipam, ports, t, fault,
+        ) {
+            Err(e) => e,
+            Ok(_) => return Err(fail("S5: the injected attach unexpectedly succeeded")),
+        };
+        let host13 = VethNames::derive(&c13)?.host().clone();
+        let pin13 = base.join("c13");
+        let ledger13 = base.join(".owned").join("c13");
+        let addr13 = ipam
+            .address_of(&c13)
+            .ok_or_else(|| fail("S5: the address was released although resources are left"))?;
+        if e.step != AttachStep::DefaultRoute
+            || !e.rollback.removed.is_empty()
+            || e.rollback.leftover
+                != [
+                    (AttachResource::Veth(host13.clone()), ResourceState::Present),
+                    (AttachResource::Netns(pin13.clone()), ResourceState::Present),
+                    (AttachResource::Address(addr13), ResourceState::Unknown),
+                ]
+            || ports.len() != base_ports + 1
+        {
+            return Err(fail(format!(
+                "S5: unexpected attach failure shape: step {:?}, rollback {:?}, ports {} (base {base_ports})",
+                e.step,
+                e.rollback,
+                ports.len()
+            )));
+        }
+        let record13 = e
+            .reclaim_claim()
+            .ok_or_else(|| fail("S5: no reclaim claim for a leftover attach"))?
+            .to_record();
+        if !record13.contains("\nveth=1\nnetns=1\n")
+            || !record13.contains("\nquarantine=1\n")
+            || record13.contains("\npin=-\n")
+        {
+            return Err(fail(format!("S5: unexpected claim record: {record13:?}")));
+        }
+        let (_, master13, alias13) = route.link_index_master_alias(&host13, t)?;
+        if master13 != Some(net.bridge_index)
+            || !alias13
+                .as_deref()
+                .is_some_and(|a| a.starts_with(&format!("{}/ep/c13/g/", net.bridge_token)))
+        {
+            return Err(fail(format!(
+                "S5: left-over veth master/alias unexpected: {master13:?} {alias13:?}"
+            )));
+        }
+        if !pin13.exists() || !ledger13.exists() {
+            return Err(fail(
+                "S5: the pin or the ownership record .owned/c13 is missing",
+            ));
+        }
+        let record13_hex = hex_encode(record13.as_bytes());
+        for round in 0..2 {
+            let r = run_reclaim_child(&record13_hex)?;
+            if r != "XRECLAIM ok removed=2 leftover=0" {
+                return Err(fail(format!(
+                    "S5: unexpected reclaim result (round {round}): {r}"
+                )));
+            }
+        }
+        if !gone(&host13) || pin13.exists() || ledger13.exists() {
+            return Err(fail(
+                "S5: the reclaim left the veth, the pin or the ownership record",
+            ));
+        }
+        // 回収はカーネル側だけ。quarantine（アドレス・予約）は `delete_network` が解放するまで残る。
+        if ipam.address_of(&c13) != Some(addr13) || ports.len() != base_ports + 1 {
+            return Err(fail(
+                "S5: the reclaim must not release the quarantined address or the port reservation",
+            ));
+        }
+
+        // S6: IPAM 払い出し後の段（AddAddress）。巻き戻しが成功するのでアドレスと予約は即時に解放される。
+        let dnat_count = || -> Result<usize, NetError> {
+            Ok(
+                run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?
+                    .matches("dnat to")
+                    .count(),
+            )
+        };
+        let dnat_before = dnat_count()?;
+        let c14 = EndpointId::new("c14")?;
+        let spec14 = ContainerAttachSpec::new(c14.clone(), net, base.to_path_buf())?
+            .with_port_publishes(published(8094)?)?;
+        let fault = AttachFault::new(AttachFaultPoint::AddAddress);
+        let e = match attach_container_with_fault_for_test(
+            route, nft, &spec14, ipam, ports, t, fault,
+        ) {
+            Err(e) => e,
+            Ok(_) => return Err(fail("S6: the injected attach unexpectedly succeeded")),
+        };
+        let host14 = VethNames::derive(&c14)?.host().clone();
+        let pin14 = base.join("c14");
+        if e.step != AttachStep::AddAddress
+            || e.rollback.removed
+                != [
+                    AttachResource::Veth(host14.clone()),
+                    AttachResource::Netns(pin14.clone()),
+                ]
+            || !e.rollback.leftover.is_empty()
+            || e.reclaim_claim().is_some()
+        {
+            return Err(fail(format!(
+                "S6: unexpected attach failure shape: step {:?}, rollback {:?}",
+                e.step, e.rollback
+            )));
+        }
+        if ipam.address_of(&c14).is_some() || ports.len() != base_ports + 1 {
+            return Err(fail(
+                "S6: the address or the port reservation of c14 was not released by the rollback",
+            ));
+        }
+        if !gone(&host14) || pin14.exists() || base.join(".owned").join("c14").exists() {
+            return Err(fail(
+                "S6: the rollback left the veth, the pin or the ownership record",
+            ));
+        }
+        if dnat_count()? != dnat_before {
+            return Err(fail(
+                "S6: DNAT rules changed although the attach failed before publishing",
+            ));
+        }
+        Ok(vec![c13])
     }
 
     pub fn inner() {
@@ -1347,7 +1500,7 @@ mod linux {
         }
 
         // --- 故障注入で作った巻き戻しの失敗の取り残しを別プロセスが回収する（S3・S4。NET-1・REPAIR-3・#2971）---
-        fault_scenarios(&route, &nft, &net, &mut ipam, &mut ports, &base, t)?;
+        let quarantined = fault_scenarios(&route, &nft, &net, &mut ipam, &mut ports, &base, t)?;
 
         // --- 事前作成の netns（#2675・CRI-2）: 作成 → 接続 と、作成 → 解放 ---
         // 準備済みの試験で、実機（root）での実行結果は PR に記録する（未実行のまま成功とは書かない）。
@@ -1406,6 +1559,15 @@ mod linux {
             attached3.netns_path.clone(),
             attached6.netns_path.clone(),
         ];
+        // S5 の quarantine（アドレス・予約）は、回収後も `delete_network` の直前までは残っている。
+        for ep in &quarantined {
+            if ipam.address_of(ep).is_none() {
+                return Err(fail(format!(
+                    "quarantined address of {} was released before delete_network",
+                    ep.as_str()
+                )));
+            }
+        }
         let deleted = delete_network(
             &route,
             &nft,
@@ -1444,6 +1606,14 @@ mod linux {
         for pin in &pins {
             if pin.exists() {
                 return Err(fail(format!("pin {} still exists", pin.display())));
+            }
+        }
+        for ep in &quarantined {
+            if ipam.address_of(ep).is_some() {
+                return Err(fail(format!(
+                    "quarantined address of {} was not released by delete_network",
+                    ep.as_str()
+                )));
             }
         }
         if ipam.allocated_count() != 0 || !ports.is_empty() {

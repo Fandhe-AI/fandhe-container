@@ -61,7 +61,7 @@
 //! 1 つ目のコンテナは起動オプションを持つため、CLI の create が annotations に作成世代
 //! （`io.fandhe.container.options-generation`。`bind_generation`）を足し、`state` の annotations はその 1 件になる。
 //! 世代の値は状態記録から読み、32 桁の小文字 16 進であることと 3 時点で変わらないことも確かめる。
-//! 3 つ目のコンテナ（オプション無し。annotations は `{}`）では、実行中に `kill <id> TERM` を送り、終了を待って `state` が stopped
+//! 3 つ目のコンテナ（オプション無しだが、Linux の create は既定の `network none` を文書に書くため作成世代の 1 件を持つ。#1873）では、実行中に `kill <id> TERM` を送り、終了を待って `state` が stopped
 //! になることを照合する。`start` は `--restart` を渡さず restart 方針は既定の `no` のため、意図を立てない kill の現状
 //! （#3087 の対象外の残余）に結果が左右されない。記録の `explicit_stop` が `NotRecorded` のままであることを stop との区別に使い、
 //! 終了コードは 43（寿命切れの 8 と区別できる）、停止済みへの 2 回目の kill は `FAILED_PRECONDITION`（終了コード 5）で拒否されることも照合する。
@@ -1039,7 +1039,7 @@ mod linux {
         )?;
         cleanup.armed = false;
 
-        // 14. kill TERM の一連（#3097・CLI-1・SUP-11・SUP-4）。オプション無しのため annotations は `{}`。
+        // 14. kill TERM の一連（#3097・CLI-1・SUP-11・SUP-4）。オプション無しでも Linux の create は既定の `network none` を書くため、annotations は作成世代の 1 件（#1873）。
         // start は `--restart` を渡さず restart 方針は既定の `no`。意図を立てない kill の現状に結果が左右されない。
         let kill_id_s = format!("ssd{}kill", std::process::id());
         cleanup.id = kill_id_s.clone();
@@ -1052,11 +1052,20 @@ mod linux {
         )?;
         expect_ok(&out, "create (kill)")?;
         cleanup.armed = true;
+        let kill_generation = {
+            let store = open_store(&root)?;
+            options_generation(&get_record(
+                &store,
+                &ContainerId::new(kill_id_s.clone()).map_err(|e| format!("id (kill): {e:?}"))?,
+            )?)?
+        };
+        check_json_plain(&kill_generation, "generation (kill)")?;
+        let kill_ann = [(GENERATION_ANNOTATION, kill_generation.as_str())];
         expect_state(
             &cli,
             &root_s,
             &kill_id_s,
-            &oci_state_line(&kill_id_s, "created", None, bundle_s, &[]),
+            &oci_state_line(&kill_id_s, "created", None, bundle_s, &kill_ann),
         )?;
         let out = run_cli(
             &cli,
@@ -1071,7 +1080,7 @@ mod linux {
             &cli,
             &root_s,
             &kill_id_s,
-            &oci_state_line(&kill_id_s, "running", Some(kill_pid), bundle_s, &[]),
+            &oci_state_line(&kill_id_s, "running", Some(kill_pid), bundle_s, &kill_ann),
         )?;
         let out = run_cli(
             &cli,
@@ -1110,7 +1119,7 @@ mod linux {
             &cli,
             &root_s,
             &kill_id_s,
-            &oci_state_line(&kill_id_s, "stopped", None, bundle_s, &[]),
+            &oci_state_line(&kill_id_s, "stopped", None, bundle_s, &kill_ann),
         )?;
         // 停止済みへの kill は core が `FAILED_PRECONDITION` で拒否する（終了コード 5・op は kill）
         let out = run_cli(

@@ -882,7 +882,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         )?;
         // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
         let pasta = super::create_pasta::resolve_for_create(global, named)?;
-        super::create_network::reject_not_wired(&args.options.network)?;
+        super::create_network::reject_unwired_network(
+            &args.options.network,
+            cfg!(target_os = "linux"),
+        )?;
         let (req, image) = build_create(global, args)?;
         // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
         let document = create_options::document_of(&args.options, pasta.as_ref())?;
@@ -1984,7 +1987,9 @@ mod tests {
                 image: None,
             };
             let req = build_create_request(&args).expect("req");
-            let doc = create_options::document_of(&args.options, None).expect("doc");
+            // Linux の `document_of` は既定の `network none` を必ず書く(#1873)ので、空の文書は直接作る。
+            let doc = ContainerOptionsDocument::default();
+            assert!(doc.is_empty());
             create_with_options(&rt, &req, None, &doc).expect("create");
             assert!(!options_store::options_path(&root, &id).exists());
         }

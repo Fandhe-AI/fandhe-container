@@ -465,7 +465,7 @@ fn read_fdinfo_bounded(r: impl Read) -> Result<String, FdinfoMountIdError> {
     r.take(FDINFO_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(FdinfoMountIdError::Read)?;
-    if text.len() as u64 > FDINFO_MAX_BYTES {
+    if u64::try_from(text.len()).map_or(true, |n| n > FDINFO_MAX_BYTES) {
         return Err(FdinfoMountIdError::TooLarge);
     }
     Ok(text)

@@ -11,8 +11,10 @@
 //!   `lib.rs` の `compile_error!` で止める）。
 //! - 注入するのは失敗だけで、`reclaim_failed_attach` の所有の照合（別名・master・pin の識別子・`.owned` 記録）には
 //!   一切手を入れない。回収側の fail-closed は本番と同じ。
-//! - 対象は `attach_container` の経路だけ。事前作成の netns の経路（`attach_prepared_*`）は netns を unpin
-//!   しないため対象外。
+//! - 結合試験の入口 `attach_container_with_fault_for_test` は `attach_container` の経路だけ。事前作成の netns の
+//!   経路（`attach_prepared_*`）は netns を unpin せず呼び出し側へ返すため、unpin の注入は届かず、請求書は常に
+//!   `netns=0` になる。この経路は単体試験（`attach_tests::net1_attach_fault_prepared_*`・#3040）で扱う。
+//! - IPAM 払い出し後の段（`AddAddress`・`DefaultRoute`）は、単体試験に加えて結合試験の S5・S6 でも扱う。
 
 use std::net::Ipv4Addr;
 use std::path::Path;

@@ -181,11 +181,27 @@ mod linux {
             .collect()
     }
 
+    /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス名（`lo_self_delivery` と同じ集合）。
+    /// pasta の有無とは無関係に現れるため、インターフェース一覧の照合では無視する。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+
     fn parse_ifaces(dev: &str) -> Vec<String> {
         let mut v: Vec<String> = dev
             .lines()
             .skip(2)
             .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim().to_string()))
+            .filter(|n| !FALLBACK_TUNNEL_DEVICES.contains(&n.as_str()))
             .collect();
         v.sort();
         v
@@ -214,11 +230,20 @@ mod linux {
             .collect()
     }
 
-    /// `/proc/net/ipv6_route` に既定経路（`::/0`）の行があるか。
+    /// `/proc/net/ipv6_route` に実効のある既定経路（`::/0`）の行があるか。
+    /// カーネルが `lo` に持つ拒否用の `::/0`（flags `00200200`。`RTF_REJECT` を含む）は既定経路に数えない。
     fn has_v6_default(text: &str) -> bool {
+        /// `RTF_REJECT`。
+        const RTF_REJECT: u32 = 0x0200;
         text.lines().any(|l| {
-            let mut it = l.split_whitespace();
-            matches!((it.next(), it.next()), (Some(d), Some("00")) if d.bytes().all(|b| b == b'0'))
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let is_zero_dest = f
+                .first()
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b == b'0'))
+                && f.get(1) == Some(&"00");
+            let flags = f.get(8).and_then(|v| u32::from_str_radix(v, 16).ok());
+            let iface = f.get(9).copied();
+            is_zero_dest && flags.is_some_and(|v| v & RTF_REJECT == 0) && iface != Some("lo")
         })
     }
 
@@ -253,8 +278,17 @@ mod linux {
             || "self-check: route".into(),
         )?;
         let z = "0".repeat(32);
-        let v6 = format!("{z} 00 {z} 00 {z} 00000001 00000000 00000001 eth0\n");
+        let v6 = format!("{z} 00 {z} 00 {z} 00000400 00000001 00000000 00000003 eth0\n");
         check(has_v6_default(&v6), || "self-check: v6 default".into())?;
+        // カーネル内部の拒否用経路（実機の行形式）は既定経路ではない。
+        let v6_reject = format!("{z} 00 {z} 00 {z} ffffffff 00000001 00000001 00200200 lo\n");
+        check(!has_v6_default(&v6_reject), || {
+            "self-check: v6 reject route".into()
+        })?;
+        check(
+            parse_ifaces("Inter-|\n face |\n    lo: 1\n  sit0: 2\n ip6tnl0: 3\n") == ["lo"],
+            || "self-check: fallback tunnels ignored".into(),
+        )?;
         check(
             !has_v6_default("ff000000000000000000000000000000 08 x\n"),
             || "self-check: v6 non-default".into(),
@@ -1498,10 +1532,33 @@ mod linux {
 
     /// S10: 準備完了の前に pasta が死んだ（対象が終了済みで未回収）ときのエラー。
     fn scene_dead_target(ctx: Ctx<'_>) -> Result<(), String> {
-        let mut zombie = Command::new("true")
+        // 対象は必ず新規の user + net namespace 内のプロセスにする（ホストの netns に pasta が attach して
+        // eth0・アドレス・経路を作る事故を避ける）。`unshare` は exec するので子の pid がそのまま対象になる。
+        let host_ifaces_before = parse_ifaces(
+            &std::fs::read_to_string("/proc/self/net/dev")
+                .map_err(|e| format!("read host dev: {e}"))?,
+        );
+        let mut zombie = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net", "sleep", "600"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("spawn true: {e}"))?;
+            .map_err(|e| format!("spawn isolated target: {e}"))?;
         let zpid = zombie.id();
+        let own_net = ns_identity("/proc/self/ns/net")?;
+        let isolated = wait_for("target enters a new net namespace", || {
+            Ok(match ns_identity(&format!("/proc/{zpid}/ns/net")) {
+                Ok(n) if n != own_net => Ok(()),
+                other => Err(format!("{other:?}")),
+            })
+        });
+        if let Err(e) = isolated {
+            let _ = zombie.kill();
+            let _ = reap::wait_within(&mut zombie, limit());
+            return Err(e);
+        }
+        zombie.kill().map_err(|e| format!("kill target: {e}"))?;
         let waited = wait_for("target becomes a zombie", || {
             Ok(match stat_fields(zpid) {
                 Some(('Z', _)) => Ok(()),
@@ -1539,7 +1596,16 @@ mod linux {
             r.and(scene.teardown())
         });
         let reaped = reap::wait_within(&mut zombie, limit()).map(|_| ());
-        result.and(reaped)
+        // ホストの netns に pasta が触れていないこと（インターフェース一覧が不変）。
+        let host_untouched = std::fs::read_to_string("/proc/self/net/dev")
+            .map_err(|e| format!("read host dev: {e}"))
+            .and_then(|t| {
+                let after = parse_ifaces(&t);
+                check(after == host_ifaces_before, || {
+                    format!("host interfaces changed: {host_ifaces_before:?} -> {after:?}")
+                })
+            });
+        result.and(reaped).and(host_untouched)
     }
 
     /// S11: `-P` の PID ファイルが書かれる時点（空のファイルを見るか）の観測。pasta を直接起動する。

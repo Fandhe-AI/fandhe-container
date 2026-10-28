@@ -36,6 +36,7 @@
 # #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
 # #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。
 # #1840 で sys の自前 FFI 宣言と libc の照合試験を追加した（dev-dependencies に workspace の libc =0.2.189。Linux のみ）。
+# #3065 で fandhe-container-net への workspace 内 path 依存（supervisor -> net の一方向。network-wiring.md D5）を追加した（外部クレートの追加なし）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -68,6 +69,7 @@ doc = false
 
 [dependencies]
 fandhe-container-core = { path = "../core" }
+fandhe-container-net = { path = "../net" }
 
 # exec-test-support: 実機結合試験（tests/exec_setns_join.rs）専用の入口 `exec::identify_pid1_in`（期待 cgroup
 # パスを呼び出し側から受け取る）を公開する。既定のビルドには含めず、記録から期待値を導く `identify_pid1` だけを

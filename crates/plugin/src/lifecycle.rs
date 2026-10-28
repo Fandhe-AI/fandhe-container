@@ -1662,6 +1662,7 @@ fn check_termination_after_response(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     /// 試験用の十分遠い合計期限。
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(60)

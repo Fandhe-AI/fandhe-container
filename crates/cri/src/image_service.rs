@@ -232,6 +232,15 @@ impl ImageRecord {
         top.extend(newer.top_level_digests().iter().cloned());
         let mut aux = self.auxiliary_digests().to_vec();
         aux.extend(newer.auxiliary_digests().iter().cloned());
+        // 件数上限の検査は `from_parts` が重複除去より前に行うため、和集合に落としてから渡す
+        // （上限近くの同内容の再 pull を誤って拒否しない）。
+        tags.sort();
+        tags.dedup();
+        top.sort();
+        top.dedup();
+        aux.sort();
+        aux.dedup();
+        aux.retain(|d| !top.contains(d));
         let mut merged = Self::from_parts(self.id.clone(), tags, top, aux, newer.size)?;
         merged.uid = self.uid;
         merged.username = self.username;
@@ -792,6 +801,24 @@ mod tests {
             got.repo_digests(),
             strs(&["reg/a@sha256:I", "reg/a@sha256:P"])
         );
+    }
+
+    /// CRI-2・OCI-1（#3038）: 上限ちょうどの件数を同内容で再 pull しても和集合は上限内なので成功する。
+    #[test]
+    fn cri2_upsert_repull_at_limit_succeeds() {
+        let store = InMemoryImageStore::new();
+        let tags: Vec<String> = (0..MAX_REFS_PER_IMAGE)
+            .map(|i| format!("reg/a:{i:03}"))
+            .collect();
+        let digs: Vec<String> = (0..MAX_REFS_PER_IMAGE)
+            .map(|i| format!("reg/a@sha256:{i:03}"))
+            .collect();
+        let r = || ImageRecord::new("sha256:a", tags.clone(), digs.clone(), 1).expect("record");
+        store.upsert(r()).expect("first");
+        store.upsert(r()).expect("again");
+        let got = store.get("sha256:a").expect("get").expect("present");
+        assert_eq!(got.repo_tags().len(), MAX_REFS_PER_IMAGE);
+        assert_eq!(got.repo_digests().len(), MAX_REFS_PER_IMAGE);
     }
 
     /// CRI-2・OCI-1（#3038）: タグ追加は挿入順でなくバイト順の辞書順になる。

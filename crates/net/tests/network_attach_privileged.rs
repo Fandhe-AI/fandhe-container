@@ -71,6 +71,9 @@
 //! 疑いとして名指しで失敗する。作成時の `IFLA_IFALIAS` はカーネルが反映しなかったため、作成後の
 //! `RTM_SETLINK` で付ける方式に直した（Issue #1925。実機での再確認は `bridge_owner_token_privileged`）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("network_attach_privileged: Linux only, not applicable on this OS");
@@ -206,8 +209,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("network_attach_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -304,8 +306,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -579,8 +580,7 @@ mod linux {
             .spawn()
             .map_err(|e| fail(format!("spawn {mode}: {e}")))?;
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             return Err(fail("child stdout is not piped"));
         };
         let (tx, rx) = std::sync::mpsc::channel::<String>();

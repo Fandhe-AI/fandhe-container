@@ -20,6 +20,9 @@
 //! `RTM_DELLINK` で後始末する（ベストエフォート。他者の同名リンクは消さない）。待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で
 //! 期限を切る（REPAIR-5）。前提（root・`unshare`）を満たさない場合は skip せず失敗する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("link_netns_privileged: Linux only, not applicable on this OS");
@@ -453,8 +456,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 

@@ -17,6 +17,9 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない
 //! 場合は skip せず失敗する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("host_mode_privileged: Linux only, not applicable on this OS");
@@ -112,8 +115,7 @@ mod linux {
                 return st;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
                 panic!("child did not exit within the timeout");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -132,8 +134,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 

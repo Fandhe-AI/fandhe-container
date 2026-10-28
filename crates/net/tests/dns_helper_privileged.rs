@@ -32,6 +32,9 @@
 //!
 //! 実機（root）での実行結果は TASK-142（人間）が記録する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("dns_helper_privileged: Linux only, not applicable on this OS");
@@ -185,8 +188,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -219,8 +221,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("dns_helper_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -509,8 +510,7 @@ mod linux {
                 match child.try_wait() {
                     Ok(Some(st)) => return Some(st.code().unwrap_or(1)),
                     Ok(None) if Instant::now() >= deadline => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
                         return None;
                     }
                     Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -838,8 +838,7 @@ mod linux {
                 .spawn()
                 .map_err(|e| fail(format!("spawn measure helper: {e}")))?;
             let Some(stdout) = child.stdout.take() else {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 return Err(fail("helper stdout unavailable"));
             };
             let (tx, rx) = mpsc::channel();

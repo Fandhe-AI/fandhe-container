@@ -73,6 +73,10 @@
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
 //!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
+//! - **network のモード(NET-6・NET-9・CORE-6・#1939)**: `Host`・`Loopback`・`Attachable` は exec 直前の同期点を通す
+//!   (`exec::netns_sync`)。`Attachable`(rootless の pasta 構成)は netns と user namespace の fd を子が C へこの順で渡し、
+//!   `ProductionLauncherBuilder::netns_attach_hook` のフックが成功したときだけ C が合図を送る。フックの失敗・期限切れでは
+//!   子を exec させずに回収する。`build` が `Attachable`・フック・権限モデル(rootless のみ)の組を fork の前に検査する
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、#2240 で判断待ち。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
@@ -239,6 +243,9 @@ pub struct ProductionLauncherBuilder {
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     #[cfg(target_os = "linux")]
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// `Attachable` の起動で同期点の中で呼ぶ準備処理(NET-9・CORE-6・#1939)。
+    #[cfg(target_os = "linux")]
+    netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
     /// 試験用: netns の素性の照合の基準を差し替える(dev, ino)。拒否の場面を実機で作るための差し込み口で、本番ビルドには無い。
     #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
     netns_baseline_override: Option<(u64, u64)>,
@@ -359,6 +366,18 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// `LaunchNetworkMode::Attachable` の起動で、exec 直前の同期点の中で呼ぶ準備処理(NET-9・CORE-6・SEC-1・REPAIR-5・#1939)。
+    ///
+    /// 呼び出し元は supervisor の start 経路(holder の保持と pasta の起動を行うフックを注入する。実装は #1940)。
+    /// `Attachable` の起動オプションと対で渡す: `Attachable` なのに無い、`Attachable` でないのにある、`Attachable` が
+    /// rootless 以外の権限モデルである、のいずれも `build` が fork の前に拒否する(取り違えを黙って無視しない)。
+    /// restart の再 launch でも同じフックを使う。契約は [`super::NetnsAttachHook`] を参照。
+    #[must_use]
+    pub fn netns_attach_hook(mut self, hook: Arc<dyn super::NetnsAttachHook>) -> Self {
+        self.netns_attach_hook = Some(hook);
+        self
+    }
+
     /// 監査の網羅を満たせない環境(カーネル監査頼みの層の縮退)への方針(SEC-4・#2027)。既定は
     /// [`crate::audit_log::AuditCoveragePolicy::BestEffort`](警告して起動を続け、縮退を `launchIsolation` と監査記録に残す)。
     /// `Strict` は縮退(調べられなかった場合を含む)を fork の前に `FailedPrecondition` で拒否する(opt-in)。
@@ -399,6 +418,11 @@ impl ProductionLauncherBuilder {
             if let Some(options) = &self.launch_options {
                 refuse_inject_with_subordinate(privilege, options)?;
             }
+            check_attach_hook_pairing(
+                privilege,
+                self.launch_options.as_ref(),
+                self.netns_attach_hook.is_some(),
+            )?;
             let subordinate = resolve_privilege(
                 privilege,
                 self.subordinate_ids,
@@ -423,6 +447,7 @@ impl ProductionLauncherBuilder {
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
+            inner.netns_attach_hook = self.netns_attach_hook;
             inner.rejection_audit_sink = self.rejection_audit_sink;
             #[cfg(feature = "exec-test-support")]
             {
@@ -440,10 +465,50 @@ impl ProductionLauncherBuilder {
     }
 }
 
+/// `Attachable` の起動オプションと、`NetnsAttachHook` と、権限モデルの組を `build` で検査する(fork の前・副作用なし。
+/// NET-9・CORE-6・SEC-1・#1939)。
+///
+/// - `Attachable` でフックが無い: `InvalidArgument`
+/// - フックがあるのに `Attachable` でない: `InvalidArgument`(取り違えを黙って無視しない)
+/// - `Attachable` が rootless 以外の権限モデル: `Unimplemented`(rootful の経路は D12〔#3069〕で別に扱う。挙動を変えない)
+#[cfg(target_os = "linux")]
+fn check_attach_hook_pairing(
+    privilege: IsolationPrivilege,
+    options: Option<&LaunchOptions>,
+    has_hook: bool,
+) -> Result<(), TraitError> {
+    let attachable = options.is_some_and(|o| o.network() == LaunchNetworkMode::Attachable);
+    if attachable && !has_hook {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the attachable network mode requires a netns attach hook",
+        ));
+    }
+    if !attachable && has_hook {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a netns attach hook is only valid for the attachable network mode",
+        ));
+    }
+    if attachable
+        && !matches!(
+            privilege,
+            IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds
+        )
+    {
+        return Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "the attachable network mode requires a rootless privilege model",
+        ));
+    }
+    Ok(())
+}
+
 /// exec 直前の netns の素性の同期点の要求を、起動モードと実効の扱いの組から決める(NET-6・SEC-1・#3206。
 /// `docs/design/network-wiring.md` D8)。
 ///
-/// `Host` かつ `HostShared` は基準と同じ、`Loopback` かつ `NewLoopback` は基準と異なる。`FromConfig`(既定・CRI の経路)は
+/// `Host` かつ `HostShared` は基準と同じ、`Loopback` / `Attachable` かつ `NewLoopback` は基準と異なる(`Attachable` は
+/// netns と user namespace の 2 本を渡す。NET-9・#1939)。`FromConfig`(既定・CRI の経路)は
 /// 同期点を通さない(D7: 既定を変えても CRI の経路の挙動を変えない。pod の netns の join〔#2838〕で見直す)。
 /// 上の組以外は start の突き合わせ(`reconcile_network`)と食い違う不整合で、fork の前に `Internal` で拒否する。
 /// `baseline` は試験用の差し替え(通常は `None`で、launch の入口で C が自分の netns から取る)。
@@ -453,13 +518,20 @@ fn netns_sync_request(
     effective: EffectiveNetwork,
     baseline: Option<crate::exec::NetnsIdentity>,
 ) -> Result<Option<crate::exec::NetnsSyncRequest>, TraitError> {
-    use crate::exec::{NetnsExpectation, NetnsSyncRequest};
-    let expectation = match (mode, effective) {
+    use crate::exec::{NetnsExpectation, NetnsHandover, NetnsSyncRequest};
+    let (expectation, handover) = match (mode, effective) {
         (LaunchNetworkMode::FromConfig, _) => return Ok(None),
-        (LaunchNetworkMode::Host, EffectiveNetwork::HostShared) => NetnsExpectation::SameAsBaseline,
-        (LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback) => {
-            NetnsExpectation::DiffersFromBaseline
+        (LaunchNetworkMode::Host, EffectiveNetwork::HostShared) => {
+            (NetnsExpectation::SameAsBaseline, NetnsHandover::NetOnly)
         }
+        (LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback) => (
+            NetnsExpectation::DiffersFromBaseline,
+            NetnsHandover::NetOnly,
+        ),
+        (LaunchNetworkMode::Attachable, EffectiveNetwork::NewLoopback) => (
+            NetnsExpectation::DiffersFromBaseline,
+            NetnsHandover::NetAndUser,
+        ),
         _ => {
             return Err(TraitError::new(
                 ErrorCode::Internal,
@@ -470,6 +542,7 @@ fn netns_sync_request(
     Ok(Some(NetnsSyncRequest {
         expectation,
         baseline,
+        handover,
     }))
 }
 
@@ -944,6 +1017,8 @@ struct SpawnInput<'a> {
     root_readonly: bool,
     /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は `None`。NET-6・SEC-1・#3206)。
     netns_sync: Option<crate::exec::NetnsSyncRequest>,
+    /// `Attachable` の同期点で呼ぶ準備処理(他のモードは `None`。NET-9・CORE-6・#1939)。
+    netns_attach: Option<&'a dyn super::NetnsAttachHook>,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -1193,6 +1268,8 @@ struct Inner {
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     /// 監査の網羅を満たせない環境への方針(`ProductionLauncherBuilder::audit_coverage_policy`。既定 `BestEffort`。SEC-4・#2027)。
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// `Attachable` の同期点で呼ぶ準備処理(`ProductionLauncherBuilder::netns_attach_hook`。NET-9・#1939)。
+    netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
     /// 試験用の netns 基準の差し替え(`ProductionLauncherBuilder::netns_baseline_override_for_test`。#3206)。
     #[cfg(feature = "exec-test-support")]
     netns_baseline_override: Option<(u64, u64)>,
@@ -1226,6 +1303,7 @@ impl Inner {
             launch_options: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
+            netns_attach_hook: None,
             #[cfg(feature = "exec-test-support")]
             netns_baseline_override: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
@@ -1531,6 +1609,15 @@ impl Inner {
             spec.network(),
             self.netns_baseline_override(),
         )?;
+        // `Attachable` はフックが要る。無いまま fork して合図を送れない子を作らない(build の組の検査の多重防御。fail-closed)。
+        if netns_sync.is_some_and(|r| r.handover == crate::exec::NetnsHandover::NetAndUser)
+            && self.netns_attach_hook.is_none()
+        {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the attachable network mode has no attach hook",
+            ));
+        }
         let spawned = self
             .ops
             .spawn(SpawnInput {
@@ -1549,6 +1636,7 @@ impl Inner {
                 subordinate: self.subordinate.as_ref(),
                 root_readonly: effective_root_readonly,
                 netns_sync,
+                netns_attach: self.netns_attach_hook.as_deref(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -2151,6 +2239,7 @@ impl LaunchOps for RealOps {
                 entry: input.entry,
                 setup,
                 netns_sync: input.netns_sync,
+                netns_attach: input.netns_attach,
             },
             input.stages,
             stdio,
@@ -4367,12 +4456,26 @@ mod tests {
                 .map(|r| r.expectation),
             Some(NetnsExpectation::DiffersFromBaseline)
         );
+        // NET-9(#1939): Attachable も基準と異なる新しい netns で、netns と user namespace の 2 本を渡す。
+        let attachable = req(LaunchNetworkMode::Attachable, EffectiveNetwork::NewLoopback)
+            .unwrap()
+            .expect("attachable passes the sync point");
+        assert_eq!(
+            attachable.expectation,
+            NetnsExpectation::DiffersFromBaseline
+        );
+        assert_eq!(attachable.handover, crate::exec::NetnsHandover::NetAndUser);
+        let loopback = req(LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback)
+            .unwrap()
+            .expect("loopback passes the sync point");
+        assert_eq!(loopback.handover, crate::exec::NetnsHandover::NetOnly);
         for e in [EffectiveNetwork::HostShared, EffectiveNetwork::NewLoopback] {
             assert!(req(LaunchNetworkMode::FromConfig, e).unwrap().is_none());
         }
         for (m, e) in [
             (LaunchNetworkMode::Host, EffectiveNetwork::NewLoopback),
             (LaunchNetworkMode::Loopback, EffectiveNetwork::HostShared),
+            (LaunchNetworkMode::Attachable, EffectiveNetwork::HostShared),
         ] {
             let err = req(m, e).unwrap_err();
             assert_eq!(err.code(), ErrorCode::Internal);
@@ -4469,6 +4572,117 @@ mod tests {
             err.message(),
             "a pod namespace join cannot be combined with the loopback network mode"
         );
+    }
+
+    /// 何もしないフック(組の検査と launch の配線の試験用)。
+    struct NoopAttachHook;
+
+    impl super::super::NetnsAttachHook for NoopAttachHook {
+        fn attach(
+            &self,
+            _namespaces: super::super::AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    /// NET-9・CORE-6・SEC-1(#1939): `build` の組の検査。`Attachable` でフック無し・フックだけ・rootful の `Attachable` は
+    /// fork の前に固定文言で拒否し、rootless の `Attachable` とフックの組・どちらも無い組は通る。
+    #[test]
+    fn net9_core6_1939_attach_hook_pairing_is_checked_before_fork() {
+        let attachable = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Attachable);
+        let loopback = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Loopback);
+        let rootless_models = [
+            IsolationPrivilege::RootlessSingleId,
+            IsolationPrivilege::RootlessSubordinateIds,
+        ];
+        for p in rootless_models {
+            let e = check_attach_hook_pairing(p, Some(&attachable), false).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "the attachable network mode requires a netns attach hook"
+            );
+            let e = check_attach_hook_pairing(p, Some(&loopback), true).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "a netns attach hook is only valid for the attachable network mode"
+            );
+            let e = check_attach_hook_pairing(p, None, true).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert!(check_attach_hook_pairing(p, Some(&attachable), true).is_ok());
+            assert!(check_attach_hook_pairing(p, Some(&loopback), false).is_ok());
+            assert!(check_attach_hook_pairing(p, None, false).is_ok());
+        }
+        let e =
+            check_attach_hook_pairing(IsolationPrivilege::RootfulHostRoot, Some(&attachable), true)
+                .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "the attachable network mode requires a rootless privilege model"
+        );
+        // rootful の Attachable 以外の挙動は変えない(この検査は通す)。
+        assert!(
+            check_attach_hook_pairing(IsolationPrivilege::RootfulHostRoot, Some(&loopback), false)
+                .is_ok()
+        );
+    }
+
+    /// NET-9・CORE-6(#1939): `Attachable` は分離の集合に `Net` を足し(エントリ無し)、pod の join との組は
+    /// spawn の前に固定文言で拒否する。
+    #[test]
+    fn net9_attachable_adds_net_and_rejects_pod_join() {
+        let spec = spec_for("net-attach", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Attachable,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined =
+            spec.with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let err = isolation_config_of(&joined, LaunchIpcMode::Private).expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with the loopback network mode"
+        );
+    }
+
+    /// NET-9・SEC-1(#1939): `Attachable` の launch は、フックが無ければ spawn の前に `Internal` で拒否し(多重防御)、
+    /// フックがあれば spawn まで届く。
+    #[test]
+    fn net9_sec1_1939_attachable_launch_requires_the_hook_before_spawn() {
+        let spec = spec_for("net-attach-launch", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Attachable,
+        );
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Attachable),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "the attachable network mode has no attach hook"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+        l.inner.netns_attach_hook = Some(Arc::new(NoopAttachHook));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert!(ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
     }
 
     /// SEC-1(#3058): spec のモードと launcher のモードが食い違う(ラッパーの転送漏れ等)なら `FailedPrecondition`。

@@ -445,8 +445,9 @@ pub(crate) fn send_fd_with_token(
 }
 
 /// [`send_fd_with_token`] の本体。`1..=SEND_MAX_FDS` 本を 1 つの `SCM_RIGHTS` で送る（範囲外は `EINVAL`）。
-/// 本番の入口は 1 本送りの [`send_fd_with_token`] だけで、複数本は受信側の上限の試験（#2372）のために持つ。
-fn send_fds_with_token(
+/// 本番の入口は 1 本送りの [`send_fd_with_token`] と、netns 同期点の 2 本送り（pasta 構成の netns と user namespace を
+/// この順で渡す。NET-9・CORE-6・#1939）。複数本は受信側の上限の試験（#2372）にも使う。
+pub(crate) fn send_fds_with_token(
     sock: BorrowedFd<'_>,
     token: u8,
     fds: &[BorrowedFd<'_>],

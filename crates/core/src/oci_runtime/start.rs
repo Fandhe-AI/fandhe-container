@@ -87,7 +87,8 @@
 //! 必須とする namespace は CORE-1 の最小分離（PID・mount・UTS・IPC）と user（SEC-5）。network は
 //! `FromConfig` で指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
 //! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。起動オプションの
-//! `Host` / `Loopback` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064 で実装済み）。
+//! `Host` / `Loopback` / `Attachable` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064 で実装済み。
+//! `Attachable` は `Loopback` と同じ行で、exec 直前の同期点が netns と user namespace を呼び出し側へ渡す点だけが違う。NET-9・#1939）。
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
@@ -3363,13 +3364,14 @@ mod tests {
         cfg
     }
 
-    /// NET-6・SEC-1（#3058）: `Loopback` / `Host` と path 付きの network エントリは予約の前に `InvalidArgument`。
+    /// NET-6・NET-9・SEC-1（#3058・#1939）: `Loopback` / `Attachable` / `Host` と path 付きの network エントリは予約の前に `InvalidArgument`。
     #[test]
     fn net6_sec1_start_rejects_network_mode_conflicting_with_path() {
         use super::super::network_mode::LaunchNetworkMode;
         let cfg = with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
         for (name, mode) in [
             ("net-loop-path", LaunchNetworkMode::Loopback),
+            ("net-attach-path", LaunchNetworkMode::Attachable),
             ("net-host-path", LaunchNetworkMode::Host),
         ] {
             let err = start_rejected_with_mode(name, &cfg, mode);

@@ -62,7 +62,7 @@ release_lock() {
   fi
 }
 trap 'release_lock; run_limited_abort; rm -rf "${work}"' EXIT
-usage_json='{"code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>"}'
+usage_json='{"code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|network|setup|doctor>"}'
 
 # 1 回起動して終了コード・stdout・stderr を照合する。引数: 名前 期待コード 期待 stderr 引数...
 expect_run() {

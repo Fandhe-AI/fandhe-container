@@ -130,10 +130,10 @@
   - **同期点の位置**: PID 1 の開始ゲート通過後・`child_main`（pivot・stdio・StagePipeline の `CapabilityDrop` 段）の前。PID 1 はこの時点で単一スレッドで、fd 1 本で全スレッドが基準の netns にいることを表せる。C は PID 1 の pidfd を開き、ゲートを開放し、中間プロセスを回収した後、状態 pipe の `P` を読む前に受信する。
   - **範囲**: `LaunchNetworkMode::Host`（期待は基準と同じ）と `Loopback`（基準と異なる）の起動だけが通る。`FromConfig`（既定・CRI の経路）は通さない（D7 の「CRI の経路の挙動を変えない」と整合。pod の netns への join〔#2838〕が入るときに広げるかを見直す）。モードと実効の組が不整合なら fork の前に `Internal` で拒否する。
   - **基準の取り方**: launch の入口（fork の前）で C が自分の `/proc/thread-self/ns/net` を開いて取る。launch を呼ぶ C は `Threads: 1` の supervisor そのもので、start の入口から launch までの間に `setns` / `unshare(CLONE_NEWNET)` をしないため、D8 の「start の入口で取る基準」と同じ値になる。restart の再 launch でも同じプロセスの netns を取り直す。取れなければ子を作らずに `FailedPrecondition`（段 `netns_verify`）。レビューで決定との食い違いと判断された場合は、`LaunchOptions` に基準を渡す入口を足して supervisor の `start_entry` で取る形へ切り替える。
-  - **ワイヤー**: listener 用とは別の `SOCK_SEQPACKET` の socketpair。子 → C は本文 `N` ＋ `SCM_RIGHTS` の fd 1 本（C の端は `SO_PASSCRED`）、C → 子は本文 `A`。受信側は期待する fd の本数を引数に取り、#1939 は 2 を渡して拡張できる。検証は切り詰め・本文・本数・送信元 pid・close-on-exec・nsfs（`fstatfs`）・`readlink` が `net:[<ino>]` であること、そのうえで (dev, ino) を期待と照合する。
+  - **ワイヤー**: listener 用とは別の `SOCK_SEQPACKET` の socketpair。子 → C は本文 `N` ＋ `SCM_RIGHTS` の fd 1 本（C の端は `SO_PASSCRED`）、C → 子は本文 `A`。受信側は期待する fd の種別の列（`[Net]` か `[Net, User]`）を取り、#1939 の `Attachable` は netns・user namespace の 2 本を渡す（実装済み。`rootless-network.md` 12.2「実装（#1939）」）。検証は切り詰め・本文・本数・送信元 pid・close-on-exec・nsfs（`fstatfs`）・`readlink` が `net:[<ino>]` であること、そのうえで (dev, ino) を期待と照合する。
   - **期限と fail-closed**: 子の ACK 待ちは 60 秒（開始ゲートと同じ）、C の受信は launch の単一期限の残りまで。EOF・期限切れ・`A` 以外では子は exec せずに終了し、C は PID 1 を kill して回収する。C の端は中間プロセスで閉じ（PID 1 へ継承させない）、親の死は EOF で子に届く。
   - **監査（SEC-4）**: 不一致（理由 `netns_identity_mismatch`）と形式違反（`netns_handoff_invalid`）は、段 `netns_verify`・層 `mount`・パスなしで 1 件記録する（`FailedPrecondition`）。EOF・期限切れ・errno・子の `E` 通知は系のエラーで記録しない。message は固定の英文で、inode の値を含めない。
-  - **範囲外**: `network_mode=host` の構造化ログ 1 行と、net の `HostNetns::verify_ns_identity` の切り出し・結線は #1873、pasta 構成の fd 2 本は #1939。
+  - **範囲外**: `network_mode=host` の構造化ログ 1 行と、net の `HostNetns::verify_ns_identity` の切り出し・結線は #1873、pasta 構成の fd 2 本と合図は #1939 で実装済み（フックの実装は #1940）。
 - 追記（#1935）: pasta 構成の同期点では netns と user namespace の fd を 2 本、この順で受ける（[rootless-network.md](rootless-network.md) 12.2）。Loopback・Host は 1 本のまま。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
@@ -349,7 +349,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 | 実装済み（PR #3195） |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
-| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 未実装 |
+| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 実装済み（rootful の create は D13 待ちで `UNIMPLEMENTED`） |
 | #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 未実装 |
 | #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 未実装 |
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |

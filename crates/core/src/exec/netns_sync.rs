@@ -3,7 +3,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! `network_mode=host`（供給元は supervisor の netns のまま）と `loopback`（新しい netns）の起動で、PID 1 が
+//! `network_mode=host`（供給元は supervisor の netns のまま）と `loopback`・`attachable`（新しい netns）の起動で、PID 1 が
 //! 実際にいる network namespace が指定どおりかを、exec の前に呼び出しプロセス C が確かめる。呼び出し元は
 //! `launch_intermediate::launch_via_intermediate`（C 側の [`receive_and_verify`]）と、その中の PID 1
 //! （子側の [`NetnsSyncSender::hand_over_current_netns`]）だけ。
@@ -19,23 +19,32 @@
 //! C : 基準(baseline)として自分の netns の (dev, ino) を fork の前に取る → socketpair を作る → fork
 //! PID 1 : 開始ゲート通過後・pivot と資格情報の切り替え(StagePipeline の CapabilityDrop)より前に、
 //!         自分の netns を O_RDONLY|O_CLOEXEC で開いて送り、C の ACK を期限つきで待つ。ACK が無ければ exec しない
-//! C : 受信 → 検証 → 期待(Host: 基準と同じ / Loopback: 基準と異なる)と照合 → 合格なら ACK、不合格なら PID 1 を kill
+//! C : 受信 → 検証 → 期待(Host: 基準と同じ / Loopback・Attachable: 基準と異なる)と照合
+//!     → (Attachable のみ)user namespace が C 自身と異なることを照合 → 呼び出し側のフック(`NetnsAttachHook`)を呼ぶ
+//!     → 合格(Attachable はフックが Ok かつ期限内)なら ACK、不合格なら PID 1 を kill
 //! ```
+//!
+//! # Attachable(rootless の pasta 構成。NET-9・CORE-6・#1939)
+//!
+//! 子は netns と user namespace の fd を**この順で 2 本**、1 通の `SCM_RIGHTS` で渡す。C は種別(`net:` / `user:`)を位置ごとに
+//! 検証し、フックへ所有権ごと渡す。フックが失敗・期限切れ・不正のときは ACK を送らず PID 1 を kill して回収する。
+//! フックは C の単一スレッドの区間で呼ばれる(契約は `oci_runtime::NetnsAttachHook`)。
 //!
 //! # ワイヤー形式（REPAIR-2。AF_UNIX `SOCK_SEQPACKET` の socketpair。パスを持たない。listener 用とは別）
 //!
 //! | 方向 | 内容 |
 //! | ---- | ---- |
-//! | 子 → C | 本文 1 バイト `N`（[`TOKEN_NETNS`]）＋ `SCM_RIGHTS` の fd 1 本。受信側の `SO_PASSCRED` で送信元の pid が付く |
+//! | 子 → C | 本文 1 バイト `N`（[`TOKEN_NETNS`]）＋ `SCM_RIGHTS` の fd 1 本(Attachable は netns・user namespace の 2 本をこの順で）。受信側の `SO_PASSCRED` で送信元の pid が付く |
 //! | 子 → C（失敗時） | `E` ＋ コード 1 バイト（fd 無し。netns を開けなかったときの best-effort の通知） |
 //! | C → 子 | 本文 1 バイト `A`。検証の完了。子はこれを待ってから exec に進む |
 //!
-//! 受信側は期待する fd の本数を引数に取る（今回は 1。pasta 構成の netns と user namespace の 2 本への拡張は #1939）。
+//! 受信側は期待する fd の種別の列（`[Net]` か `[Net, User]`）を取る。
 //!
 //! # 受信側の検証（fail-closed。拒否した fd は `OwnedFd` の drop で閉じる）
 //!
 //! 切り詰め（`MSG_TRUNC` / `MSG_CTRUNC`）が無い・本文がちょうど `N`・fd がちょうど期待の本数・送信元 pid が C が起動した
-//! PID 1 と一致・各 fd が close-on-exec・`fstatfs` が nsfs・`readlink(/proc/self/fd/N)` が `net:[<st_ino>]`。
+//! PID 1 と一致・各 fd が close-on-exec・`fstatfs` が nsfs・`readlink(/proc/self/fd/N)` が位置ごとの期待の種別
+//! （`net:[<st_ino>]` / `user:[<st_ino>]`）。
 //! すべて満たしたときだけ (dev, ino) を取り出し、モードの期待と比べる。
 //!
 //! # 信頼の前提（pid だけを照合する根拠。`seccomp_listener` と同じ）
@@ -50,9 +59,12 @@
 //!
 //! # 範囲と残余（REPAIR-3）
 //!
-//! - 同期点を通すのは `LaunchNetworkMode::Loopback` と `Host` の起動だけ。`FromConfig`（CRI の経路）は通さない
+//! - 同期点を通すのは `LaunchNetworkMode::Loopback`・`Attachable`・`Host` の起動だけ。`FromConfig`（CRI の経路）は通さない
 //!   （pod の netns への join〔#2838〕が入るときに見直す）
-//! - `network_mode=host` の構造化ログと、net crate の `HostNetns` を使う結線は #1873。pasta 構成の fd 2 本は #1939
+//! - `network_mode=host` の構造化ログと、net crate の `HostNetns` を使う結線は #1873。pasta 構成のフックの実装
+//!   （holder の保持と pasta の起動）は #1940
+//! - user namespace と netns の所有関係は C では照合しない（`NS_GET_USERNS` の ioctl は新しい `unsafe`）。holder の
+//!   `setns(user)` → `setns(net)` が組の違いを `EPERM` / `EINVAL` で fail-closed にする
 //! - 基準は launch の入口で C 自身の netns から取る。C は `Threads: 1` の supervisor で、start の入口から launch までの間に
 //!   `setns` / `unshare(CLONE_NEWNET)` をしないため、D8 の「supervisor が start の入口で取る基準」と同じ値になる
 
@@ -63,6 +75,7 @@ use std::time::{Duration, Instant};
 
 use super::seccomp_listener::{ACK, TOKEN_FAILURE, wait_readable};
 use super::{ExecError, IsolationStage, ViolationReason};
+use crate::oci_runtime::{AttachableNamespaces, NetnsAttachHook};
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -72,6 +85,8 @@ pub(super) const TOKEN_NETNS: u8 = b'N';
 pub(super) const NETNS_SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 /// 自スレッドの netns を指すリンク。PID 1 は単一スレッドだが、`/proc/self` ではなくスレッド単位で引く。
 const NETNS_LINK: &str = "/proc/thread-self/ns/net";
+/// 自スレッドの user namespace を指すリンク(Attachable の 2 本目と、C 自身の基準の取得)。
+const USERNS_LINK: &str = "/proc/thread-self/ns/user";
 const STAGE: IsolationStage = IsolationStage::NetnsVerify;
 
 /// network namespace の素性（`fstat` の st_dev と st_ino）。同じ netns なら同じ値になる。
@@ -94,8 +109,51 @@ impl NetnsIdentity {
 pub(crate) enum NetnsExpectation {
     /// 基準（supervisor の netns）と同じ（`network_mode=host`）。
     SameAsBaseline,
-    /// 基準と異なる（`network_mode=loopback`。新しい netns）。
+    /// 基準と異なる（`network_mode=loopback`・`attachable`。新しい netns）。
     DiffersFromBaseline,
+}
+
+/// 子が C へ渡す fd の組(NET-9・#1939)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetnsHandover {
+    /// netns の 1 本だけ(Host・Loopback)。
+    NetOnly,
+    /// netns と user namespace の 2 本をこの順で(Attachable。rootless の pasta 構成)。
+    NetAndUser,
+}
+
+/// fd の種別(位置ごとの検証)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NsKind {
+    Net,
+    User,
+}
+
+impl NsKind {
+    /// `/proc/self/fd/N` の readlink の接頭辞。
+    fn link_prefix(self) -> &'static str {
+        match self {
+            Self::Net => "net",
+            Self::User => "user",
+        }
+    }
+
+    fn not_that_kind(self) -> &'static str {
+        match self {
+            Self::Net => "the received fd is not a network namespace",
+            Self::User => "the received fd is not a user namespace",
+        }
+    }
+}
+
+impl NetnsHandover {
+    /// 子が送る fd の種別の列(送る順)。
+    pub(crate) fn kinds(self) -> &'static [NsKind] {
+        match self {
+            Self::NetOnly => &[NsKind::Net],
+            Self::NetAndUser => &[NsKind::Net, NsKind::User],
+        }
+    }
 }
 
 /// 同期点を通す起動の要求（`IntermediateSpec` に載る）。`baseline` が `None` なら launch の入口で C が自分の netns から取る。
@@ -103,13 +161,33 @@ pub(crate) enum NetnsExpectation {
 pub(crate) struct NetnsSyncRequest {
     pub(crate) expectation: NetnsExpectation,
     pub(crate) baseline: Option<NetnsIdentity>,
+    /// 子が渡す fd の組。`NetAndUser` の起動はフックが要る(launch の入口が欠落を拒否する)。
+    pub(crate) handover: NetnsHandover,
+}
+
+/// Attachable の C 側の追加の照合と、呼び出し側のフック。
+pub(crate) struct AttachCheck<'a> {
+    /// C 自身の user namespace の素性(受け取った 2 本目がこれと異なること)。
+    pub(crate) user_baseline: NetnsIdentity,
+    pub(crate) hook: &'a dyn NetnsAttachHook,
 }
 
 /// 基準が確定した、C が照合に使う値。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NetnsCheck {
+pub(crate) struct NetnsCheck<'a> {
     pub(crate) expectation: NetnsExpectation,
     pub(crate) baseline: NetnsIdentity,
+    /// `Some` なら 2 本版(Attachable)。
+    pub(crate) attach: Option<AttachCheck<'a>>,
+}
+
+impl NetnsCheck<'_> {
+    fn kinds(&self) -> &'static [NsKind] {
+        if self.attach.is_some() {
+            NetnsHandover::NetAndUser.kinds()
+        } else {
+            NetnsHandover::NetOnly.kinds()
+        }
+    }
 }
 
 /// 期待との照合（純粋な判定）。
@@ -148,8 +226,8 @@ impl NetnsSyncFailure {
     }
 }
 
-/// 開いた netns の fd を検証して素性を返す。`fd` は検証に失敗すれば drop で閉じる。
-fn verify_netns_fd(fd: OwnedFd) -> Result<NetnsIdentity, &'static str> {
+/// 開いた ns の fd を検証して、素性と fd を返す。`fd` は検証に失敗すれば drop で閉じる。
+fn verify_ns_fd(fd: OwnedFd, kind: NsKind) -> Result<(NetnsIdentity, OwnedFd), &'static str> {
     match sys::seccomp_notify::fd_is_cloexec(fd.as_fd()) {
         Ok(true) => {}
         _ => return Err("the received fd is not close-on-exec"),
@@ -163,36 +241,58 @@ fn verify_netns_fd(fd: OwnedFd) -> Result<NetnsIdentity, &'static str> {
     let meta = file
         .metadata()
         .map_err(|_| "the received fd could not be inspected")?;
-    let kind = std::fs::read_link(format!("/proc/self/fd/{raw}")).ok();
-    let expected = format!("net:[{}]", meta.ino());
-    if kind.as_deref().and_then(|p| p.to_str()) != Some(expected.as_str()) {
-        return Err("the received fd is not a network namespace");
+    let link = std::fs::read_link(format!("/proc/self/fd/{raw}")).ok();
+    let expected = format!("{}:[{}]", kind.link_prefix(), meta.ino());
+    if link.as_deref().and_then(|p| p.to_str()) != Some(expected.as_str()) {
+        return Err(kind.not_that_kind());
     }
-    Ok(NetnsIdentity {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
+    Ok((
+        NetnsIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        },
+        OwnedFd::from(file),
+    ))
+}
+
+/// 自スレッドのリンクを開いて素性を取る(基準の取得と、子の送信が共有する検査)。
+fn capture_identity(
+    link: &str,
+    kind: NsKind,
+    what: &'static str,
+) -> Result<NetnsIdentity, ExecError> {
+    let file = File::open(link).map_err(|e| ExecError::from_io(&e, STAGE, what))?;
+    verify_ns_fd(OwnedFd::from(file), kind)
+        .map(|(identity, _fd)| identity)
+        .map_err(|why| {
+            ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!("the baseline namespace is unusable: {why}"),
+            )
+        })
 }
 
 /// 自スレッドの netns を開いて素性を取る（基準の取得と、子の送信が共有する検査）。
 pub(crate) fn capture_baseline() -> Result<NetnsIdentity, ExecError> {
-    let file = File::open(NETNS_LINK)
-        .map_err(|e| ExecError::from_io(&e, STAGE, "open the current network namespace"))?;
-    verify_netns_fd(OwnedFd::from(file)).map_err(|why| {
-        ExecError::new(
-            ErrorCode::FailedPrecondition,
-            STAGE,
-            format!("the baseline network namespace is unusable: {why}"),
-        )
-    })
+    capture_identity(
+        NETNS_LINK,
+        NsKind::Net,
+        "open the current network namespace",
+    )
 }
 
-/// 受信した 1 通の検証（純粋な判定。fd は `received` の drop で閉じる）。受理なら受け取った順の素性を返す。
+/// 自スレッドの user namespace の素性を取る(Attachable で、受け取った 2 本目が C 自身のものでないことの照合に使う)。
+pub(crate) fn capture_user_baseline() -> Result<NetnsIdentity, ExecError> {
+    capture_identity(USERNS_LINK, NsKind::User, "open the current user namespace")
+}
+
+/// 受信した 1 通の検証（純粋な判定。fd は `received` の drop で閉じる）。受理なら受け取った順の素性と fd を返す。
 fn validate_netns_handoff(
     received: sys::seccomp_notify::ReceivedFd,
     expected_pid: u32,
-    expected_fds: usize,
-) -> Result<Vec<NetnsIdentity>, &'static str> {
+    kinds: &[NsKind],
+) -> Result<Vec<(NetnsIdentity, OwnedFd)>, &'static str> {
     let sys::seccomp_notify::ReceivedFd {
         payload,
         fds,
@@ -205,7 +305,7 @@ fn validate_netns_handoff(
     if payload.as_slice() != [TOKEN_NETNS] {
         return Err("the network namespace message had an unexpected payload");
     }
-    if fds.len() != expected_fds {
+    if fds.len() != kinds.len() {
         return Err("the network namespace message did not carry the expected number of fds");
     }
     let Some(creds) = creds else {
@@ -215,8 +315,8 @@ fn validate_netns_handoff(
         return Err("the network namespace message came from an unexpected process");
     }
     let mut out = Vec::with_capacity(fds.len());
-    for fd in fds {
-        out.push(verify_netns_fd(fd)?);
+    for (fd, kind) in fds.into_iter().zip(kinds.iter().copied()) {
+        out.push(verify_ns_fd(fd, kind)?);
     }
     Ok(out)
 }
@@ -259,17 +359,19 @@ pub(super) fn netns_socketpair() -> Result<(OwnedFd, OwnedFd), ExecError> {
     super::seccomp_listener::listener_socketpair()
 }
 
-/// C 側: 子の netns を受け取って検証し、期待と照合して合格なら ACK を返す。
-///
-/// `expected_pid` は C が起動した PID 1 の pid、`expected_fds` は期待する fd の本数、`deadline` までに届かなければ
-/// `Timeout`。失敗は [`NetnsSyncFailure`]（`reason` ありは監査に記録する拒否）。呼び出し側が PID 1 を回収する。
-pub(super) fn receive_and_verify(
+/// 受信 → 形式の検証までの結果(fd の所有権を含む)。
+struct Handoff {
+    identities: Vec<NetnsIdentity>,
+    fds: Vec<OwnedFd>,
+}
+
+/// 子の送信を期限つきで受け取り、形式を検証する(ACK は送らない)。形式違反は記録の対象(`reason` あり)。
+fn receive_handoff(
     sock: BorrowedFd<'_>,
     expected_pid: u32,
-    expected_fds: usize,
-    check: &NetnsCheck,
+    kinds: &[NsKind],
     deadline: Instant,
-) -> Result<(), Box<NetnsSyncFailure>> {
+) -> Result<Handoff, Box<NetnsSyncFailure>> {
     let received = loop {
         match wait_readable(sock, deadline) {
             Ok(true) => {}
@@ -310,10 +412,35 @@ pub(super) fn receive_and_verify(
     if let Some(e) = decode_failure(&received, expected_pid) {
         return Err(NetnsSyncFailure::system(e));
     }
-    let identities = validate_netns_handoff(received, expected_pid, expected_fds)
+    let verified = validate_netns_handoff(received, expected_pid, kinds)
         .map_err(|_| NetnsSyncFailure::violation(ViolationReason::NetnsHandoffInvalid))?;
-    // 本数は検証済みで、素性は先頭の 1 本を netns の照合に使う（2 本目以降は #1939）。
-    let Some(observed) = identities.first().copied() else {
+    let (identities, fds) = verified.into_iter().unzip();
+    Ok(Handoff { identities, fds })
+}
+
+/// C → 子の ACK を送る(検証・準備の完了)。
+fn send_ack(sock: BorrowedFd<'_>) -> Result<(), Box<NetnsSyncFailure>> {
+    sys::send_nonblocking_unix(sock, &[ACK])
+        .map(|_| ())
+        .map_err(|e| {
+            NetnsSyncFailure::system(ExecError::from_sys(e, STAGE, "send of the netns ACK"))
+        })
+}
+
+/// C 側: 子の netns(Attachable は netns と user namespace)を受け取って検証し、期待と照合して合格なら ACK を返す。
+///
+/// `expected_pid` は C が起動した PID 1 の pid、`deadline` までに届かなければ `Timeout`。Attachable(`check.attach`)は
+/// 2 本目の user namespace が C 自身と異なることを照合し、フックを呼んで、Ok かつ期限内のときだけ ACK を送る。
+/// 失敗は [`NetnsSyncFailure`]（`reason` ありは監査に記録する拒否）。呼び出し側が PID 1 を回収する。
+pub(super) fn receive_and_verify(
+    sock: BorrowedFd<'_>,
+    expected_pid: u32,
+    check: &NetnsCheck<'_>,
+    deadline: Instant,
+) -> Result<(), Box<NetnsSyncFailure>> {
+    let Handoff { identities, fds } = receive_handoff(sock, expected_pid, check.kinds(), deadline)?;
+    let mut ids = identities.iter().copied();
+    let Some(observed) = ids.next() else {
         return Err(NetnsSyncFailure::violation(
             ViolationReason::NetnsHandoffInvalid,
         ));
@@ -323,11 +450,46 @@ pub(super) fn receive_and_verify(
             ViolationReason::NetnsIdentityMismatch,
         ));
     }
-    sys::send_nonblocking_unix(sock, &[ACK])
-        .map(|_| ())
-        .map_err(|e| {
-            NetnsSyncFailure::system(ExecError::from_sys(e, STAGE, "send of the netns ACK"))
-        })
+    if let Some(attach) = &check.attach {
+        let Some(user_observed) = ids.next() else {
+            return Err(NetnsSyncFailure::violation(
+                ViolationReason::NetnsHandoffInvalid,
+            ));
+        };
+        // 子が C と同じ user namespace にいる(新しい user namespace を作っていない)なら、holder が別の資格で
+        // 参加できない構成を黙って通すことになるため拒否する(SEC-5)。
+        if user_observed == attach.user_baseline {
+            return Err(NetnsSyncFailure::violation(
+                ViolationReason::NetnsIdentityMismatch,
+            ));
+        }
+        let mut fds = fds.into_iter();
+        let (Some(net), Some(user)) = (fds.next(), fds.next()) else {
+            return Err(NetnsSyncFailure::violation(
+                ViolationReason::NetnsHandoffInvalid,
+            ));
+        };
+        // フックの失敗は系のエラー(監査しない。pasta の失敗の分類と記録は呼び出し側〔#1940〕)。message は固定の英文。
+        if let Err(e) = attach
+            .hook
+            .attach(AttachableNamespaces::new(net, user), deadline)
+        {
+            return Err(NetnsSyncFailure::system(ExecError::new(
+                e.code(),
+                IsolationStage::NetnsAttach,
+                "the network attach hook failed",
+            )));
+        }
+        // 期限を越えたフックは Ok でも失敗(合図の前に期限を確かめ直す。REPAIR-5)。
+        if Instant::now() >= deadline {
+            return Err(NetnsSyncFailure::system(ExecError::new(
+                ErrorCode::Timeout,
+                IsolationStage::NetnsAttach,
+                "the network attach hook did not finish in time",
+            )));
+        }
+    }
+    send_ack(sock)
 }
 
 /// 子（PID 1）側の送信口。socketpair の子の端を所有する。
@@ -351,21 +513,34 @@ impl NetnsSyncSender {
         let _ = sys::send_nonblocking_unix(self.0.as_fd(), &[TOKEN_FAILURE, code]);
     }
 
-    /// 自分の netns を開いて C へ送り、自分の fd を閉じ、C の ACK を `timeout` まで待つ。どれかが失敗したら
-    /// exec に進ませない（呼び出し側は `EXIT_SETUP_FAILED` で終了する）。
-    pub(super) fn hand_over_current_netns(self, timeout: Duration) -> Result<(), ExecError> {
-        let file = match File::open(NETNS_LINK) {
-            Ok(f) => f,
-            Err(e) => {
-                let error = ExecError::from_io(&e, STAGE, "open the current network namespace");
-                self.report_failure(&error);
-                return Err(error);
+    /// 自分の netns(`NetAndUser` は続けて user namespace)を開いて C へこの順で送り、自分の fd を閉じ、C の ACK を
+    /// `timeout` まで待つ。どれかが失敗したら exec に進ませない（呼び出し側は `EXIT_SETUP_FAILED` で終了する）。
+    pub(super) fn hand_over(
+        self,
+        handover: NetnsHandover,
+        timeout: Duration,
+    ) -> Result<(), ExecError> {
+        let mut files = Vec::with_capacity(2);
+        for kind in handover.kinds() {
+            let (link, what) = match kind {
+                NsKind::Net => (NETNS_LINK, "open the current network namespace"),
+                NsKind::User => (USERNS_LINK, "open the current user namespace"),
+            };
+            match File::open(link) {
+                Ok(f) => files.push(f),
+                Err(e) => {
+                    let error = ExecError::from_io(&e, STAGE, what);
+                    self.report_failure(&error);
+                    return Err(error);
+                }
             }
-        };
-        sys::seccomp_notify::send_fd_with_token(self.0.as_fd(), TOKEN_NETNS, file.as_fd())
+        }
+        let borrowed: Vec<BorrowedFd<'_>> = files.iter().map(|f| f.as_fd()).collect();
+        sys::seccomp_notify::send_fds_with_token(self.0.as_fd(), TOKEN_NETNS, &borrowed)
             .map_err(|e| ExecError::from_sys(e, STAGE, "send of the network namespace"))?;
         // 手元の fd を閉じる（workload が持たないように）。
-        drop(file);
+        drop(borrowed);
+        drop(files);
         let deadline = Instant::now() + timeout;
         match wait_readable(self.0.as_fd(), deadline) {
             Ok(true) => {}
@@ -427,10 +602,14 @@ mod tests {
     /// NET-6・SEC-1: 自分の netns を送った受け渡しは受理され、基準と同じ素性になる。
     #[test]
     fn net6_sec1_3206_validate_accepts_own_netns() {
-        let got =
-            validate_netns_handoff(msg(b"N", vec![open_ns("net")], Some(me()), false), me(), 1)
-                .unwrap();
-        assert_eq!(got, vec![own_identity()]);
+        let got = validate_netns_handoff(
+            msg(b"N", vec![open_ns("net")], Some(me()), false),
+            me(),
+            &[NsKind::Net],
+        )
+        .unwrap();
+        let identities: Vec<_> = got.into_iter().map(|(i, _fd)| i).collect();
+        assert_eq!(identities, vec![own_identity()]);
     }
 
     /// NET-6・SEC-1: 期待との照合の表（Host は同じ、Loopback は異なる）。
@@ -504,7 +683,10 @@ mod tests {
             ),
         ];
         for (why, m) in cases {
-            assert_eq!(validate_netns_handoff(m, me(), 1).unwrap_err(), why);
+            assert_eq!(
+                validate_netns_handoff(m, me(), &[NsKind::Net]).unwrap_err(),
+                why
+            );
         }
     }
 
@@ -515,27 +697,84 @@ mod tests {
         let extra = OwnedFd::from(w.try_clone().unwrap());
         drop(w);
         let m = msg(b"N", vec![open_ns("net"), extra], Some(me()), false);
-        assert!(validate_netns_handoff(m, me(), 1).is_err());
+        assert!(validate_netns_handoff(m, me(), &[NsKind::Net]).is_err());
         // 書き込み端が全て閉じていれば EOF（0 バイト）になる。
         let mut buf = [0u8; 1];
         assert_eq!(r.read(&mut buf).unwrap(), 0);
     }
 
-    /// 期待の本数が 2 のときは 2 本を受理する（#1939 の拡張点）。
+    /// NET-9(#1939): 期待が (net, user) のとき、この順の 2 本を受理し、素性は各 ns のものと一致する。
     #[test]
-    fn net6_3206_validate_accepts_the_requested_fd_count() {
+    fn net9_1939_validate_accepts_net_then_user() {
         let got = validate_netns_handoff(
             msg(
                 b"N",
-                vec![open_ns("net"), open_ns("net")],
+                vec![open_ns("net"), open_ns("user")],
                 Some(me()),
                 false,
             ),
             me(),
-            2,
+            NetnsHandover::NetAndUser.kinds(),
         )
         .unwrap();
-        assert_eq!(got.len(), 2);
+        let identities: Vec<_> = got.into_iter().map(|(i, _fd)| i).collect();
+        assert_eq!(
+            identities,
+            vec![own_identity(), capture_user_baseline().unwrap()]
+        );
+    }
+
+    /// NET-9・SEC-1(#1939): 2 本の期待に対する逆順・1 本・同種 2 本・3 本は固定文言で拒否する。
+    #[test]
+    fn net9_sec1_1939_validate_rejects_wrong_order_and_count() {
+        let kinds = NetnsHandover::NetAndUser.kinds();
+        let cases: Vec<(&str, ReceivedFd)> = vec![
+            (
+                "the received fd is not a network namespace",
+                msg(
+                    b"N",
+                    vec![open_ns("user"), open_ns("net")],
+                    Some(me()),
+                    false,
+                ),
+            ),
+            (
+                "the network namespace message did not carry the expected number of fds",
+                msg(b"N", vec![open_ns("net")], Some(me()), false),
+            ),
+            (
+                "the received fd is not a user namespace",
+                msg(
+                    b"N",
+                    vec![open_ns("net"), open_ns("net")],
+                    Some(me()),
+                    false,
+                ),
+            ),
+            (
+                "the network namespace message did not carry the expected number of fds",
+                msg(
+                    b"N",
+                    vec![open_ns("net"), open_ns("user"), open_ns("user")],
+                    Some(me()),
+                    false,
+                ),
+            ),
+        ];
+        for (why, m) in cases {
+            assert_eq!(validate_netns_handoff(m, me(), kinds).unwrap_err(), why);
+        }
+        // 1 本の期待に 2 本が来ても拒否する。
+        let m = msg(
+            b"N",
+            vec![open_ns("net"), open_ns("user")],
+            Some(me()),
+            false,
+        );
+        assert_eq!(
+            validate_netns_handoff(m, me(), &[NsKind::Net]).unwrap_err(),
+            "the network namespace message did not carry the expected number of fds"
+        );
     }
 
     fn run_pair(
@@ -544,10 +783,10 @@ mod tests {
     ) -> (Result<(), Box<NetnsSyncFailure>>, Result<(), ExecError>) {
         let (parent, child) = netns_socketpair().unwrap();
         let t = std::thread::spawn(move || {
-            NetnsSyncSender::new(child).hand_over_current_netns(child_timeout)
+            NetnsSyncSender::new(child).hand_over(NetnsHandover::NetOnly, child_timeout)
         });
         let deadline = Instant::now() + Duration::from_secs(10);
-        let parent_result = receive_and_verify(parent.as_fd(), me(), 1, &check, deadline);
+        let parent_result = receive_and_verify(parent.as_fd(), me(), &check, deadline);
         drop(parent);
         (parent_result, t.join().unwrap())
     }
@@ -558,6 +797,7 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let (parent, child) = run_pair(check, Duration::from_secs(10));
         assert!(parent.is_ok());
@@ -571,6 +811,7 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: NetnsIdentity { dev: 0, ino: 0 },
+            attach: None,
         };
         let (parent, child) = run_pair(check, Duration::from_secs(10));
         let f = parent.unwrap_err();
@@ -586,6 +827,7 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::DiffersFromBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let (parent, child) = run_pair(check, Duration::from_secs(10));
         let f = parent.unwrap_err();
@@ -599,7 +841,7 @@ mod tests {
         let (parent, child) = netns_socketpair().unwrap();
         drop(parent);
         let e = NetnsSyncSender::new(child)
-            .hand_over_current_netns(Duration::from_secs(5))
+            .hand_over(NetnsHandover::NetOnly, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(e.stage, IsolationStage::NetnsVerify);
     }
@@ -610,7 +852,7 @@ mod tests {
         let (_parent, child) = netns_socketpair().unwrap();
         let started = Instant::now();
         let e = NetnsSyncSender::new(child)
-            .hand_over_current_netns(Duration::from_millis(200))
+            .hand_over(NetnsHandover::NetOnly, Duration::from_millis(200))
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::Timeout);
         assert_eq!(e.stage, IsolationStage::NetnsVerify);
@@ -622,7 +864,7 @@ mod tests {
     fn sec1_3206_child_rejects_a_non_ack_reply() {
         let (parent, child) = netns_socketpair().unwrap();
         let t = std::thread::spawn(move || {
-            NetnsSyncSender::new(child).hand_over_current_netns(Duration::from_secs(5))
+            NetnsSyncSender::new(child).hand_over(NetnsHandover::NetOnly, Duration::from_secs(5))
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(wait_readable(parent.as_fd(), deadline).unwrap());
@@ -639,11 +881,11 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let f = receive_and_verify(
             parent.as_fd(),
             me(),
-            1,
             &check,
             Instant::now() + Duration::from_millis(200),
         )
@@ -660,11 +902,11 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let f = receive_and_verify(
             parent.as_fd(),
             me(),
-            1,
             &check,
             Instant::now() + Duration::from_secs(5),
         )
@@ -681,11 +923,11 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let f = receive_and_verify(
             parent.as_fd(),
             me(),
-            1,
             &check,
             Instant::now() + Duration::from_secs(5),
         )
@@ -707,11 +949,11 @@ mod tests {
         let check = NetnsCheck {
             expectation: NetnsExpectation::SameAsBaseline,
             baseline: own_identity(),
+            attach: None,
         };
         let f = receive_and_verify(
             parent.as_fd(),
             me(),
-            1,
             &check,
             Instant::now() + Duration::from_secs(5),
         )
@@ -719,5 +961,180 @@ mod tests {
         assert_eq!(f.reason, Some(ViolationReason::NetnsHandoffInvalid));
         assert_eq!(f.error.code, ErrorCode::FailedPrecondition);
         assert_eq!(f.error.stage, IsolationStage::NetnsVerify);
+    }
+
+    /// フックの記録(呼び出し回数と受け取った fd の素性)。
+    struct RecordingHook {
+        calls: std::sync::Mutex<Vec<(NetnsIdentity, NetnsIdentity)>>,
+        result: Result<(), ErrorCode>,
+        delay: Duration,
+    }
+
+    impl RecordingHook {
+        fn new(result: Result<(), ErrorCode>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                result,
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    impl NetnsAttachHook for RecordingHook {
+        fn attach(
+            &self,
+            namespaces: AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), crate::traits::types::TraitError> {
+            let (user_fd, net_fd) = namespaces.into_parts();
+            let (net, _net_fd) = verify_ns_fd(net_fd, NsKind::Net).unwrap();
+            let (user, _user_fd) = verify_ns_fd(user_fd, NsKind::User).unwrap();
+            self.calls.lock().unwrap().push((net, user));
+            std::thread::sleep(self.delay);
+            self.result
+                .map_err(|code| crate::traits::types::TraitError::new(code, "hook detail"))
+        }
+    }
+
+    fn attach_pair(
+        hook: &RecordingHook,
+        user_baseline: NetnsIdentity,
+        deadline: Duration,
+    ) -> (Result<(), Box<NetnsSyncFailure>>, Result<(), ExecError>) {
+        let check = NetnsCheck {
+            expectation: NetnsExpectation::SameAsBaseline,
+            baseline: own_identity(),
+            attach: Some(AttachCheck {
+                user_baseline,
+                hook,
+            }),
+        };
+        let (parent, child) = netns_socketpair().unwrap();
+        let t = std::thread::spawn(move || {
+            NetnsSyncSender::new(child)
+                .hand_over(NetnsHandover::NetAndUser, Duration::from_secs(10))
+        });
+        let parent_result =
+            receive_and_verify(parent.as_fd(), me(), &check, Instant::now() + deadline);
+        drop(parent);
+        (parent_result, t.join().unwrap())
+    }
+
+    fn fake_user() -> NetnsIdentity {
+        NetnsIdentity { dev: 0, ino: 0 }
+    }
+
+    /// NET-9・CORE-6(#1939): 2 本版は net → user の順に届き、フックが 1 回だけ呼ばれ、Ok なら子が ACK を受ける。
+    #[test]
+    fn net9_1939_attach_roundtrip_calls_hook_once_then_acks() {
+        let hook = RecordingHook::new(Ok(()));
+        let (parent, child) = attach_pair(&hook, fake_user(), Duration::from_secs(10));
+        assert!(parent.is_ok());
+        assert!(child.is_ok());
+        let calls = hook.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (own_identity(), capture_user_baseline().unwrap()));
+    }
+
+    /// NET-9・SEC-5(#1939): 子の user namespace が C と同じなら拒否し、フックは呼ばれず子は ACK を受けない。
+    #[test]
+    fn net9_sec5_1939_same_user_namespace_is_rejected_without_calling_the_hook() {
+        let hook = RecordingHook::new(Ok(()));
+        let (parent, child) = attach_pair(
+            &hook,
+            capture_user_baseline().unwrap(),
+            Duration::from_secs(10),
+        );
+        let f = parent.unwrap_err();
+        assert_eq!(f.reason, Some(ViolationReason::NetnsIdentityMismatch));
+        assert!(child.is_err());
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックの失敗は code を保ち、段 `NetnsAttach`・固定文言で、監査の対象にしない。子は ACK を受けない。
+    #[test]
+    fn net9_repair5_1939_hook_failure_keeps_code_and_withholds_ack() {
+        let hook = RecordingHook::new(Err(ErrorCode::Unavailable));
+        let (parent, child) = attach_pair(&hook, fake_user(), Duration::from_secs(10));
+        let f = parent.unwrap_err();
+        assert_eq!(f.error.code, ErrorCode::Unavailable);
+        assert_eq!(f.error.stage, IsolationStage::NetnsAttach);
+        assert_eq!(f.reason, None);
+        assert!(!format!("{}", f.error).contains("hook detail"));
+        assert!(child.is_err());
+        assert_eq!(hook.calls.lock().unwrap().len(), 1);
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックが Ok でも期限を越えていれば `Timeout`(段 `NetnsAttach`)で失敗し、ACK を送らない。
+    #[test]
+    fn net9_repair5_1939_hook_past_the_deadline_fails_with_timeout() {
+        let mut hook = RecordingHook::new(Ok(()));
+        hook.delay = Duration::from_millis(400);
+        let (parent, child) = attach_pair(&hook, fake_user(), Duration::from_millis(200));
+        let f = parent.unwrap_err();
+        assert_eq!(f.error.code, ErrorCode::Timeout);
+        assert_eq!(f.error.stage, IsolationStage::NetnsAttach);
+        assert_eq!(f.reason, None);
+        assert!(child.is_err());
+    }
+
+    /// NET-9・SEC-1(#1939): 2 本の期待に対して子が 1 本しか送らなければ `netns_handoff_invalid` で、フックは呼ばれない。
+    #[test]
+    fn net9_sec1_1939_single_fd_sender_is_a_handoff_violation() {
+        let hook = RecordingHook::new(Ok(()));
+        let check = NetnsCheck {
+            expectation: NetnsExpectation::SameAsBaseline,
+            baseline: own_identity(),
+            attach: Some(AttachCheck {
+                user_baseline: fake_user(),
+                hook: &hook,
+            }),
+        };
+        let (parent, child) = netns_socketpair().unwrap();
+        sys::seccomp_notify::send_fd_with_token(child.as_fd(), TOKEN_NETNS, open_ns("net").as_fd())
+            .unwrap();
+        let f = receive_and_verify(
+            parent.as_fd(),
+            me(),
+            &check,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(f.reason, Some(ViolationReason::NetnsHandoffInvalid));
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    /// REPAIR-5(#1939): 親が死んだ(端が閉じた)とき、2 本版の子も EOF で失敗する。
+    #[test]
+    fn net9_repair5_1939_two_fd_child_fails_on_parent_eof() {
+        let (parent, child) = netns_socketpair().unwrap();
+        drop(parent);
+        let e = NetnsSyncSender::new(child)
+            .hand_over(NetnsHandover::NetAndUser, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(e.stage, IsolationStage::NetnsVerify);
+    }
+
+    /// REPAIR-5(#1939): 2 本版の子は、期限内に ACK が無ければ `Timeout`、`A` 以外の本文は拒否する。
+    #[test]
+    fn net9_repair5_1939_two_fd_child_times_out_and_rejects_non_ack() {
+        let (_parent, child) = netns_socketpair().unwrap();
+        let e = NetnsSyncSender::new(child)
+            .hand_over(NetnsHandover::NetAndUser, Duration::from_millis(200))
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Timeout);
+
+        let (parent, child) = netns_socketpair().unwrap();
+        let t = std::thread::spawn(move || {
+            NetnsSyncSender::new(child).hand_over(NetnsHandover::NetAndUser, Duration::from_secs(5))
+        });
+        assert!(wait_readable(parent.as_fd(), Instant::now() + Duration::from_secs(5)).unwrap());
+        let got = sys::seccomp_notify::recv_fd_with_creds(parent.as_fd()).unwrap();
+        assert_eq!(got.fds.len(), 2);
+        sys::send_nonblocking_unix(parent.as_fd(), b"Z").unwrap();
+        assert_eq!(
+            t.join().unwrap().unwrap_err().code,
+            ErrorCode::FailedPrecondition
+        );
     }
 }

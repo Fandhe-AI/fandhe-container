@@ -92,8 +92,8 @@ use super::launch_status::{
     resolve_pre_pivot_status,
 };
 use super::netns_sync::{
-    NETNS_SYNC_ACK_TIMEOUT, NetnsCheck, NetnsSyncRequest, NetnsSyncSender, capture_baseline,
-    netns_socketpair, receive_and_verify,
+    AttachCheck, NETNS_SYNC_ACK_TIMEOUT, NetnsCheck, NetnsHandover, NetnsSyncRequest,
+    NetnsSyncSender, capture_baseline, capture_user_baseline, netns_socketpair, receive_and_verify,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
@@ -108,6 +108,7 @@ use super::{
     SubordinateIsolationPlan, isolate, isolate_rootless_subordinate_no_flush,
 };
 use crate::launch_isolation::RecordedMountIdentity;
+use crate::oci_runtime::NetnsAttachHook;
 
 /// 報告行の最大バイト数(LF を含む)。最長の行(`R FAILED_PRECONDITION isolate\n` 約 30 バイト)より大きい固定上限。
 pub(super) const REPORT_MAX_BYTES: usize = 48;
@@ -437,6 +438,8 @@ struct RealIntermediateOps<'a> {
     listener_end: &'a OwnedFd,
     /// netns の素性の同期点の socketpair の子の端(同期点を通す起動だけ `Some`。PID 1 は複製を使う。NET-6・#3206)。
     netns_end: Option<&'a OwnedFd>,
+    /// 同期点で子が渡す fd の組(Attachable は netns と user namespace の 2 本。NET-9・#1939)。
+    netns_handover: NetnsHandover,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -479,6 +482,7 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         .with_delivery(delivery);
         let stages = stages.with_listener_sender(sender);
         // netns の同期点の口。複製できなければ PID 1 を作らずに失敗させる(同期点を飛ばして走らせない。fail-closed。#3206)。
+        let netns_handover = self.netns_handover;
         let netns_sender = self
             .netns_end
             .map(|end| {
@@ -505,10 +509,11 @@ impl IntermediateOps for RealIntermediateOps<'_> {
                     return EXIT_SETUP_FAILED;
                 }
                 // exec 直前の同期点(NET-6・SEC-1・#3206): pivot と資格情報の切り替え(`CapabilityDrop` 段)より前に、
-                // 自分の netns を C へ渡して検証済みの ACK を待つ。ACK が無ければ(EOF・期限切れ・拒否)exec しない。
+                // 自分の netns(Attachable は続けて user namespace)を C へ渡して検証済みの ACK を待つ。ACK が無ければ
+                // (EOF・期限切れ・拒否・呼び出し側のフックの失敗)exec しない。
                 if let Some(sender) = netns_sender
                     && sender
-                        .hand_over_current_netns(NETNS_SYNC_ACK_TIMEOUT)
+                        .hand_over(netns_handover, NETNS_SYNC_ACK_TIMEOUT)
                         .is_err()
                 {
                     return EXIT_SETUP_FAILED;
@@ -556,6 +561,9 @@ pub(crate) struct IntermediateSpec<'a> {
     /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は通さない。
     /// NET-6・SEC-1・#3206。`docs/design/network-wiring.md` D8)。
     pub(crate) netns_sync: Option<NetnsSyncRequest>,
+    /// 同期点の中で呼ぶ呼び出し側の準備処理(`Attachable` の起動だけ `Some`。他は `None`。欠落は launch の入口が fork の前に
+    /// 拒否する。NET-9・CORE-6・#1939)。
+    pub(crate) netns_attach: Option<&'a dyn NetnsAttachHook>,
 }
 
 /// 中間プロセス経由でコンテナの PID 1 を起動する(本番 launcher の唯一の起動入口。#1816)。
@@ -594,8 +602,10 @@ pub(crate) fn spawn_container_via_intermediate(
         entry,
         setup,
         netns_sync,
+        netns_attach,
     } = spec;
     let tag = LaunchTag::fresh();
+    let netns_handover = netns_sync.map_or(NetnsHandover::NetOnly, |r| r.handover);
     // 基準(supervisor 自身の netns)は fork の前に取る。取れなければ子を作らずに拒否する(fail-closed。#3206)。
     let netns = match netns_sync {
         None => None,
@@ -608,9 +618,32 @@ pub(crate) fn spawn_container_via_intermediate(
                     ))
                 })?,
             };
+            // 2 本版(Attachable)はフックと C 自身の user namespace の基準が要る。欠ければ子を作らずに拒否する
+            // (フック無しで合図を送らない。fail-closed。NET-9・#1939)。
+            let attach = match (request.handover, netns_attach) {
+                (NetnsHandover::NetOnly, _) => None,
+                (NetnsHandover::NetAndUser, None) => {
+                    return Err(Box::new(PreparedLaunchFailure::clean(
+                        AuditedRejection::not_applicable(ExecError::new(
+                            ErrorCode::Internal,
+                            IsolationStage::NetnsAttach,
+                            "the attachable network mode has no attach hook",
+                        )),
+                    )));
+                }
+                (NetnsHandover::NetAndUser, Some(hook)) => Some(AttachCheck {
+                    user_baseline: capture_user_baseline().map_err(|e| {
+                        Box::new(PreparedLaunchFailure::clean(
+                            AuditedRejection::not_applicable(e),
+                        ))
+                    })?,
+                    hook,
+                }),
+            };
             Some(NetnsCheck {
                 expectation: request.expectation,
                 baseline,
+                attach,
             })
         }
     };
@@ -632,6 +665,7 @@ pub(crate) fn spawn_container_via_intermediate(
                 gate_r,
                 listener_end,
                 netns_end,
+                netns_handover,
             };
             intermediate_body(&mut ops)
         },
@@ -699,7 +733,7 @@ fn launch_via_intermediate(
         Option<&OwnedFd>,
     ) -> i32,
     listener_handoff: Option<&[usize]>,
-    netns: Option<NetnsCheck>,
+    netns: Option<NetnsCheck<'_>>,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -722,6 +756,7 @@ fn launch_via_intermediate(
     let (parent_end, child_end) = listener_socketpair().map_err(not_started)?;
     // netns の素性の同期点(NET-6・#3206)。同期点を通す起動だけ作る。C の端も `SO_PASSCRED` 設定済み。
     let netns_pair = netns
+        .as_ref()
         .map(|_| netns_socketpair().map_err(not_started))
         .transpose()?;
     let (netns_parent, netns_child) = match netns_pair {
@@ -855,7 +890,7 @@ fn launch_via_intermediate(
     // exec 直前の同期点: PID 1 の netns の素性を状態の判定より前に検証する(PID 1 は pivot の前でこれを待つ。NET-6・SEC-1・
     // #3206)。不一致・形式違反は層 `mount` に 1 件記録し、EOF・期限切れ・errno は記録しない(系のエラー)。
     if let (Some(check), Some(sock)) = (netns.as_ref(), netns_parent.as_ref())
-        && let Err(failure) = receive_and_verify(sock.as_fd(), pid1.get(), 1, check, deadline)
+        && let Err(failure) = receive_and_verify(sock.as_fd(), pid1.get(), check, deadline)
     {
         let rejection = match failure.reason {
             Some(reason) => super::record_launch_mount_rejection_at(
@@ -3043,8 +3078,8 @@ mod tests {
     /// netns 同期点の代役の PID 1 の振る舞い。
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NetnsStandIn {
-        /// 本物の送り手で自分の netns を送り、ACK を受けたら `P` を書いて 0 で終了する。
-        Honest,
+        /// 本物の送り手で自分の netns(`NetAndUser` は続けて user namespace)を送り、ACK を受けたら `P` を書いて 0 で終了する。
+        Honest(NetnsHandover),
         /// 何も送らず眠る(C は期限で失敗にする)。
         Silent,
         /// 何も送らずに終了する(C は EOF を観測する)。
@@ -3054,7 +3089,7 @@ mod tests {
     /// 同期点を通す起動を代役の PID 1 で行う(`with_listener = false`)。結果・代役の pid・記録を返す。
     fn run_netns(
         mode: NetnsStandIn,
-        check: NetnsCheck,
+        check: NetnsCheck<'_>,
         timeout: Duration,
     ) -> (
         Result<LaunchedChild, Box<PreparedLaunchFailure>>,
@@ -3081,9 +3116,9 @@ mod tests {
                         return EXIT_SETUP_FAILED;
                     }
                     match mode {
-                        NetnsStandIn::Honest => {
+                        NetnsStandIn::Honest(handover) => {
                             match NetnsSyncSender::new(end)
-                                .hand_over_current_netns(Duration::from_secs(10))
+                                .hand_over(handover, Duration::from_secs(10))
                             {
                                 Ok(()) => {
                                     let _ = report_ready(s);
@@ -3127,9 +3162,13 @@ mod tests {
         let check = NetnsCheck {
             expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
             baseline: own_netns(),
+            attach: None,
         };
-        let (result, pid1, records) =
-            run_netns(NetnsStandIn::Honest, check, Duration::from_secs(20));
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            check,
+            Duration::from_secs(20),
+        );
         let launched = result.expect("must launch");
         assert_eq!(launched.child.pid(), pid1);
         assert_eq!(
@@ -3150,9 +3189,13 @@ mod tests {
         let check = NetnsCheck {
             expectation: super::super::netns_sync::NetnsExpectation::DiffersFromBaseline,
             baseline: own_netns(),
+            attach: None,
         };
-        let (result, pid1, records) =
-            run_netns(NetnsStandIn::Honest, check, Duration::from_secs(20));
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            check,
+            Duration::from_secs(20),
+        );
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
         assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
@@ -3188,6 +3231,7 @@ mod tests {
         let check = NetnsCheck {
             expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
             baseline: own_netns(),
+            attach: None,
         };
         let (result, pid1, records) =
             run_netns(NetnsStandIn::ExitsEarly, check, Duration::from_secs(20));
@@ -3197,6 +3241,11 @@ mod tests {
         assert!(gone(pid1));
         assert!(records.is_empty());
 
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: None,
+        };
         let started = Instant::now();
         let (result, pid1, records) =
             run_netns(NetnsStandIn::Silent, check, Duration::from_secs(2));
@@ -3207,6 +3256,172 @@ mod tests {
         assert!(failure.unreaped.is_empty());
         assert!(gone(pid1));
         assert!(records.is_empty());
+    }
+
+    /// 呼び出しを記録するフック(C 側で呼ばれる)。`delay` の間眠ってから `result` を返す。
+    struct AttachHookProbe {
+        calls: Mutex<Vec<(super::super::netns_sync::NetnsIdentity, bool)>>,
+        result: Result<(), ErrorCode>,
+        delay: Duration,
+    }
+
+    impl NetnsAttachHook for AttachHookProbe {
+        fn attach(
+            &self,
+            namespaces: crate::oci_runtime::AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), crate::traits::types::TraitError> {
+            use std::os::unix::fs::MetadataExt as _;
+            let net = std::fs::File::from(namespaces.net().try_clone_to_owned().unwrap())
+                .metadata()
+                .unwrap();
+            let user = std::fs::File::from(namespaces.user().try_clone_to_owned().unwrap())
+                .metadata()
+                .unwrap();
+            let own_user = std::fs::metadata("/proc/thread-self/ns/user").unwrap();
+            let id =
+                super::super::netns_sync::NetnsIdentity::from_parts_for_test(net.dev(), net.ino());
+            self.calls
+                .lock()
+                .unwrap()
+                .push((id, user.ino() == own_user.ino()));
+            std::thread::sleep(self.delay);
+            self.result
+                .map_err(|c| crate::traits::types::TraitError::new(c, "private detail"))
+        }
+    }
+
+    fn probe(result: Result<(), ErrorCode>, delay: Duration) -> AttachHookProbe {
+        AttachHookProbe {
+            calls: Mutex::new(Vec::new()),
+            result,
+            delay,
+        }
+    }
+
+    fn attach_check(hook: &AttachHookProbe) -> NetnsCheck<'_> {
+        NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: Some(AttachCheck {
+                // 代役は試験プロセスと同じ user namespace にいるため、基準は別の値にして「異なる」判定を通す。
+                user_baseline: super::super::netns_sync::NetnsIdentity::from_parts_for_test(0, 0),
+                hook,
+            }),
+        }
+    }
+
+    /// NET-9・CORE-6・SEC-1(#1939): 2 本版は net → user の順に届き、フックが 1 回だけ呼ばれ(受け取った netns の素性が
+    /// 送り手のものと一致)、合図(ACK)の後に `P` が届いて起動が成功する。記録は 0 件。
+    #[test]
+    fn net9_core6_1939_attachable_calls_hook_once_then_launches() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let launched = result.expect("must launch");
+        assert_eq!(launched.child.pid(), pid1);
+        assert_eq!(
+            launched
+                .child
+                .wait_timeout(Duration::from_secs(10))
+                .unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert!(records.is_empty());
+        let calls = hook.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (own_netns(), true));
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックが Err なら ACK を送らず PID 1 を回収する。code を保ち、段は `NetnsAttach`、記録は 0 件。
+    #[test]
+    fn net9_repair5_1939_hook_failure_reaps_pid1_without_ack_or_audit() {
+        let _serial = serialize_forks();
+        let hook = probe(Err(ErrorCode::Unavailable), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Unavailable);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsAttach);
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert_eq!(hook.calls.lock().unwrap().len(), 1);
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックが Ok でも launch の期限を越えていれば `Timeout`(段 `NetnsAttach`)で失敗し、回収する。
+    #[test]
+    fn net9_repair5_1939_hook_returning_after_the_deadline_is_a_timeout() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::from_millis(2500));
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(2),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsAttach);
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
+    /// NET-9・SEC-1・SEC-4(#1939): 2 本を期待したのに 1 本しか送らない子は `netns_handoff_invalid` を 1 件記録して回収され、
+    /// フックは呼ばれない。
+    #[test]
+    fn net9_sec1_sec4_1939_single_fd_sender_is_rejected_before_the_hook() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("netns_handoff_invalid")
+        );
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    /// NET-9・REPAIR-5(#1939): 2 本版でも代役が何も送らず終了・眠るなら、記録なしの起動失敗になり PID 1 は回収される。
+    #[test]
+    fn net9_repair5_1939_attachable_fails_closed_when_nothing_arrives() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::ExitsEarly,
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        let (result, pid1, _records) = run_netns(
+            NetnsStandIn::Silent,
+            attach_check(&hook),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            result.expect_err("must fail").rejection.error.code,
+            ErrorCode::Timeout
+        );
+        assert!(gone(pid1));
+        assert!(hook.calls.lock().unwrap().is_empty());
     }
 
     /// 子プロセス側の本体(`REPAIR12_2249_CHILD` が無ければ何もしない)。別スレッドが stdout / stderr の

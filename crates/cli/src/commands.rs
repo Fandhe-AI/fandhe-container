@@ -64,6 +64,8 @@ mod image;
 mod image_refs;
 mod kill_signal;
 mod list_logs;
+mod net_recorder;
+mod network;
 mod oci_recorder;
 mod ref_reconcile;
 // Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。
@@ -76,7 +78,8 @@ mod supervisor_start;
 
 use args::{
     parse_create, parse_delete, parse_doctor, parse_global, parse_image, parse_inspect, parse_kill,
-    parse_list, parse_logs, parse_setup, parse_start, parse_state, parse_stop, parse_system,
+    parse_list, parse_logs, parse_network, parse_setup, parse_start, parse_state, parse_stop,
+    parse_system,
 };
 
 /// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
@@ -111,6 +114,8 @@ pub enum Command {
     Image,
     /// システム情報（`system df`。#2221・CLI-1・OCI-7。サブコマンドは `args::SystemArgs`）。
     System,
+    /// ユーザー定義ネットワークの定義管理（`network create|rm|ls`。#3066・NET-6・CLI-1。サブコマンドは `args::NetworkArgs`）。
+    Network,
     /// OS 固有設定のセットアップ（TASK-80.1・CLI-2。日常操作ではない）。
     Setup,
     /// 読み取り専用の診断（NET-10・CORE-3。#2133。状態ルートを開かず plugin も解決しない）。
@@ -119,7 +124,7 @@ pub enum Command {
 
 impl Command {
     /// 全コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 13] = [
+    pub const ALL: [Command; 14] = [
         Command::Create,
         Command::Start,
         Command::Stop,
@@ -131,12 +136,13 @@ impl Command {
         Command::State,
         Command::Image,
         Command::System,
+        Command::Network,
         Command::Setup,
         Command::Doctor,
     ];
 
     /// 日常操作コマンドのみ（`ALL` から `Setup` と `Doctor` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
-    pub const DAILY: [Command; 11] = [
+    pub const DAILY: [Command; 12] = [
         Command::Create,
         Command::Start,
         Command::Stop,
@@ -148,6 +154,7 @@ impl Command {
         Command::State,
         Command::Image,
         Command::System,
+        Command::Network,
     ];
 
     /// コマンドの区分。ワイルドカードを使わず、コマンド追加時に分類漏れをコンパイルエラーにする。
@@ -163,7 +170,8 @@ impl Command {
             | Command::Inspect
             | Command::State
             | Command::Image
-            | Command::System => CommandKind::Daily,
+            | Command::System
+            | Command::Network => CommandKind::Daily,
             Command::Setup => CommandKind::Setup,
             Command::Doctor => CommandKind::Diagnostic,
         }
@@ -183,6 +191,7 @@ impl Command {
             Command::State => "state",
             Command::Image => "image",
             Command::System => "system",
+            Command::Network => "network",
             Command::Setup => "setup",
             Command::Doctor => "doctor",
         }
@@ -320,7 +329,7 @@ impl CliExit {
     }
 }
 
-const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>";
+const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|network|setup|doctor>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
@@ -432,6 +441,10 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => image::run_system(&global, &a, stdout),
             Err(_) => usage(),
         },
+        Command::Network => match parse_network(tail) {
+            Ok(a) => network::run_network(&global, &a, stdout),
+            Err(_) => usage(),
+        },
         Command::Setup => run_setup(tail, stdout),
         Command::Doctor => run_doctor(tail, stdout),
     }
@@ -484,11 +497,12 @@ mod tests {
         assert_eq!(Command::parse("state"), Some(Command::State));
         assert_eq!(Command::parse("image"), Some(Command::Image));
         assert_eq!(Command::parse("system"), Some(Command::System));
+        assert_eq!(Command::parse("network"), Some(Command::Network));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
         assert_eq!(Command::parse("doctor"), Some(Command::Doctor));
     }
 
-    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 11 件は日常操作。
+    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 12 件は日常操作。
     #[test]
     fn cli2_command_kind_classification() {
         let daily: Vec<&str> = Command::ALL
@@ -500,7 +514,7 @@ mod tests {
             daily,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
-                "image", "system"
+                "image", "system", "network"
             ]
         );
         assert_eq!(Command::Setup.kind(), CommandKind::Setup);
@@ -515,7 +529,7 @@ mod tests {
             names,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
-                "image", "system"
+                "image", "system", "network"
             ]
         );
         let rest: Vec<Command> = Command::ALL
@@ -533,7 +547,7 @@ mod tests {
             names,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
-                "image", "system", "setup", "doctor"
+                "image", "system", "network", "setup", "doctor"
             ]
         );
     }
@@ -608,7 +622,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>\"}\n";
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|network|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -624,6 +638,7 @@ mod tests {
                 Command::State => vec!["state"],
                 Command::Image => vec!["image", "bogus"],
                 Command::System => vec!["system", "bogus"],
+                Command::Network => vec!["network", "bogus"],
                 Command::Setup => vec!["setup", "x"],
                 Command::Doctor => vec!["doctor", "x"],
             };
@@ -637,7 +652,7 @@ mod tests {
             covered,
             [
                 "create", "start", "stop", "kill", "delete", "list", "logs", "inspect", "state",
-                "image", "system", "setup", "doctor"
+                "image", "system", "network", "setup", "doctor"
             ]
         );
     }
@@ -702,7 +717,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|network|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
@@ -1347,6 +1362,7 @@ mod tests {
                         None,
                         SYSTEM_DF_EMPTY,
                     ),
+                    Command::Network => (vec!["network", "ls"], 0, None, "NAME\tMODE\tSUBNET\n"),
                     Command::Setup => (
                         vec!["setup"],
                         0,
@@ -1374,7 +1390,7 @@ mod tests {
                 covered,
                 [
                     "create", "start", "stop", "kill", "delete", "list", "logs", "inspect",
-                    "state", "image", "system", "setup", "doctor"
+                    "state", "image", "system", "network", "setup", "doctor"
                 ]
             );
         }

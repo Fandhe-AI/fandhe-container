@@ -96,7 +96,8 @@
 //! `<状態ルート>/.cri/records/` に 1 件 1 ファイルで置く層が `record_store` サブモジュール
 //! （トレイト [`RecordStore`] とファイル実装 `FileRecordStore`〔unix のみ〕）。
 //! sandbox 記録の書く・消す時点は [`CriRuntimeService::with_record_store`] で注入すると有効になる（R4 #2933）。
-//! コンテナ記録（R5）・起動時の再採用（R6・R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
+//! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。コンテナ記録（R5）・
+//! コンテナの再採用と照合（R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
 //!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
@@ -105,6 +106,7 @@
 
 mod config_limits;
 mod container;
+mod readopt;
 mod record;
 mod record_store;
 mod runtime_config;
@@ -143,6 +145,7 @@ use container::{
 use record::SandboxRecordData;
 use runtime_config::parse_pod_cidrs;
 
+pub use readopt::{BrokenRecordCounts, SandboxReadoption};
 #[cfg(unix)]
 pub use record_store::FileRecordStore;
 pub use record_store::{
@@ -1532,8 +1535,10 @@ impl CriRuntimeService {
     /// 遅れて書けた worker が自分で記録を消す（別 worker の削除と競合させない）。副作用の前に future が破棄
     /// されたときも、予約（件数・保持量）は put の worker が終わって記録を消すまで保たれる。
     ///
-    /// 未実装（REPAIR-3）: コンテナ記録の書く・消す時点は R5 #2934、起動時の読み込みと再採用は R6 #2935・
-    /// R7 #2936、本番の配線は R9 #2938。
+    /// 起動時の sandbox の再採用は [`Self::readopt_sandboxes`]（R6 #2935。実装済み）。
+    ///
+    /// 未実装（REPAIR-3）: コンテナ記録の書く・消す時点は R5 #2934、コンテナの再採用と照合は R7 #2936、
+    /// 本番の配線は R9 #2938。
     pub fn with_record_store(mut self, store: Arc<dyn RecordStore>) -> Self {
         self.record_store = Some(store);
         self

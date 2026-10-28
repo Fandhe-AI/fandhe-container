@@ -14,7 +14,7 @@
 //!
 //! - core の `OpRecorder` との接続: 本番経路は plugin-cri の `CoreCriRecorder` を注入済み（TASK-108）。
 //!   記録先を注入しないコンストラクタの既定は [`NoopCriOpRecorder`] で、何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage`・`RecordStoreLoad` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -70,6 +70,8 @@ pub enum CriOpKind {
     ImageStatus,
     /// `ImageService.PullImage` 1 回（レジストリからのイメージ取り込み。CRI-4・OCI-1・TASK-61.3）。
     PullImage,
+    /// 起動時の記録の再採用の 1 件（記録ストアからの読み込みと復号。CRI-2・REPAIR-4・#2935）。
+    RecordStoreLoad,
 }
 
 impl CriOpKind {
@@ -93,6 +95,7 @@ impl CriOpKind {
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
+            CriOpKind::RecordStoreLoad => "cri.record_store_load",
         }
     }
 }
@@ -401,7 +404,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 17] = [
+    const ALL_KINDS: [CriOpKind; 18] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -419,6 +422,7 @@ mod tests {
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
+        CriOpKind::RecordStoreLoad,
     ];
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

@@ -155,8 +155,9 @@ cat >>"$stub" <<'STUB'
 #   exec-never: start 後の state が created のまま
 #   exec-late: start 後の state が 0.6 秒かけて created、次に 0.6 秒かけて running を返す
 #              （--timeout 1 では観測の完了が期限を過ぎる）
-#   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
-#   never-stops: start 後は running のままで kill も効かない
+#   running-race: start 後は running。実行中の delete を構造化エラー（FAILED_PRECONDITION・exit 5。本物の
+#                CLI と同じ形。#3203）で拒否し、kill 後も 2 回は拒否する
+#   never-stops: start 後は running のままで kill も効かない（delete は同じ構造化エラーで拒否）
 #   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
 #   exec-hang-poll: start 後の state が 1.5 秒かけて created を返し、2 回目以降はハングする
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
@@ -191,6 +192,7 @@ case "$cmd" in
   *) id="$1" ;;
 esac
 echo "$cmd $id" >>"$STUB_LOG"
+if [ -n "${STUB_ARGV0_FILE:-}" ]; then echo "$0" >>"$STUB_ARGV0_FILE"; fi
 if [ "$mode" = log-holder ] && { [ "$cmd" = create ] || [ "$cmd" = start ] || [ "$cmd" = delete ]; }; then
   # stdout / stderr（run_rt が向けたログファイル）を継承したまま残る子プロセス。
   sleep 3 &
@@ -356,13 +358,13 @@ case "$cmd" in
         fi
         ;;
       delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
-      never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
+      never-stops) [ -e "$m.started" ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
       running-race)
         if [ -e "$m.started" ]; then
-          [ -e "$m.killed" ] || { echo "stub: cannot delete running container" >&2; exit 1; }
+          [ -e "$m.killed" ] || { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
           n=$(($(cat "$m.delete-after-kill" 2>/dev/null || echo 0) + 1))
           echo "$n" >"$m.delete-after-kill"
-          [ "$n" -le 2 ] && { echo "stub: container is still running" >&2; exit 1; }
+          [ "$n" -le 2 ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
         fi
         ;;
     esac
@@ -571,7 +573,7 @@ expect_rc "input-bundle-symlink" 2 --runtime "$stub" --bundle "$work/bundlelink"
 for v in 0 1001 abc 01 -1; do
   expect_rc "input-iterations-$v" 2 --runtime "$stub" --bundle "$work/bundle" --iterations "$v"
 done
-for v in 0 61; do
+for v in 0 121; do
   expect_rc "input-timeout-$v" 2 --runtime "$stub" --bundle "$work/bundle" --timeout "$v"
 done
 expect_rc "input-warmup-101" 2 --runtime "$stub" --bundle "$work/bundle" --warmup 101
@@ -595,6 +597,68 @@ expect_rc "target-explicit-label" 0 --runtime "$stub" --bundle "$work/bundle" --
 expect_eq "target-explicit-label-value" "runc baseline-1" "$(jq -r '"\(.target) \(.label)"' <<<"$last_stdout")"
 default_args=(--target own)
 expect_rc "help" 0 --help
+expect_contains "help-timeout-range" "--timeout <1-120>"
+
+# --- 項目 3（#3203）: --timeout の上限 120 秒（CLI の start 受信期限 58.9 秒との差を確保）---
+reset_log
+export STUB_MODE=ok
+expect_rc "timeout-max-accepted" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 120
+expect_eq "timeout-max-accepted-param" "120" "$(jq -r '.params.timeout_secs' <<<"$last_stdout")"
+expect_rc "timeout-60-accepted" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 60
+
+# --- 項目 2（#3203）: スタブの実行中 delete 拒否は本物の CLI と同じ構造化エラー（FAILED_PRECONDITION・exit 5）---
+reset_log
+sroot="$work/stub-direct-root"
+mkdir -p "$sroot"
+chmod 700 "$sroot"
+: >"$stub_state/direct-id.created"
+: >"$stub_state/direct-id.started"
+stub_rc=0
+stub_err="$(STUB_MODE=never-stops "$stub" --root "$sroot" delete direct-id 2>&1 >/dev/null)" || stub_rc=$?
+expect_eq "stub-delete-running-rc" "5" "$stub_rc"
+expect_eq "stub-delete-running-code" "FAILED_PRECONDITION" "$(jq -r '.code' <<<"$stub_err")"
+expect_eq "stub-delete-running-op" "delete" "$(jq -r '.op' <<<"$stub_err")"
+expect_eq "stub-delete-running-message" "container is still running" "$(jq -r '.message' <<<"$stub_err")"
+reset_log
+
+# --- 項目 1（#3203）: --runtime の信頼性検査（所有者・権限・symlink・祖先）---
+# 所有者が他 uid の場面は root が無いと作れないため照合しない（実機確認は人間担当）。
+mkdir -p "$work/rt"
+cp "$stub" "$work/rt/gw"
+cp "$stub" "$work/rt/ow"
+chmod 0775 "$work/rt/gw"
+chmod 0757 "$work/rt/ow"
+for case_rt in gw ow; do
+  reset_log
+  expect_rc "runtime-$case_rt-writable" 2 --runtime "$work/rt/$case_rt" --bundle "$work/bundle" --iterations 1 --warmup 0
+  expect_contains "runtime-$case_rt-writable-error" "invalid-runtime"
+  expect_eq "runtime-$case_rt-writable-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
+done
+ln -s "$stub" "$work/rt/link-safe"
+ln -s "$work/rt/gw" "$work/rt/link-unsafe"
+ln -s "$work/rt/nonexistent" "$work/rt/link-dangling"
+reset_log
+argv0_file="$work/argv0.log"
+: >"$argv0_file"
+STUB_ARGV0_FILE="$argv0_file" expect_rc "runtime-symlink-to-safe" 0 --runtime "$work/rt/link-safe" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "runtime-symlink-exec-resolved" "$stub" "$(sort -u "$argv0_file")"
+reset_log
+expect_rc "runtime-symlink-to-unsafe" 2 --runtime "$work/rt/link-unsafe" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "runtime-symlink-to-unsafe-error" "invalid-runtime"
+expect_rc "runtime-dangling-symlink" 2 --runtime "$work/rt/link-dangling" --bundle "$work/bundle" --iterations 1 --warmup 0
+mkdir -p "$work/rt-wdir" "$work/rt-sdir"
+chmod 0777 "$work/rt-wdir"
+chmod 1777 "$work/rt-sdir"
+cp "$stub" "$work/rt-wdir/stub"
+cp "$stub" "$work/rt-sdir/stub"
+chmod 0755 "$work/rt-wdir/stub" "$work/rt-sdir/stub"
+reset_log
+expect_rc "runtime-in-writable-dir" 2 --runtime "$work/rt-wdir/stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "runtime-in-writable-dir-error" "invalid-runtime"
+expect_eq "runtime-in-writable-dir-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
+# 祖先の sticky は PLUG-11 と揃えず許可する（理由は startup_latency.sh 冒頭「--runtime の検査」）。
+reset_log
+expect_rc "runtime-in-sticky-dir" 0 --runtime "$work/rt-sdir/stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 
 # --- 6. create / start 失敗 ---
 # create がランタイム自身のエラーで終了し、state が構造化された NOT_FOUND を返せば未作成と
@@ -693,12 +757,14 @@ expect_contains "id-in-use-error" "container-id-in-use"
 expect_eq "id-in-use-untouched" "state" "$(cut -d' ' -f1 "$stub_log" | sort -u | tr '\n' ' ' | sed 's/ $//')"
 reset_log
 STUB_MODE=start-fail expect_rc "start-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_not_contains "start-fail-no-hint" "hint: start was cut off"
 if grep -q '^delete ' "$stub_log"; then pass "start-fail-delete-called"; else fail "start-fail-delete-called"; fi
 
 # --- 7. start ハング（REPAIR-5）: timeout で打ち切り、delete が呼ばれる ---
 reset_log
 started="$SECONDS"
 STUB_MODE=start-hang expect_rc "start-hang" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "start-hang-deadline-hint" "hint: start was cut off"
 elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "start-hang-elapsed (${elapsed}s < 15s)"; else fail "start-hang-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-hang-delete-called"; else fail "start-hang-delete-called"; fi
@@ -1318,6 +1384,37 @@ expect_rc "report-extra-bundle" 2 --mode report --own-result "$own_fixture" --do
 expect_rc "report-extra-iterations" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --iterations 3
 expect_rc "own-result-in-oci-mode" 2 --mode oci --target own --runtime "$stub" --bundle "$work/bundle" --own-result "$own_fixture"
 default_args=(--target own)
+
+# --- 項目 4（#3203）: make の入口（scripts/targets/）が WARMUP・TIMEOUT・OUTPUT を通す ---
+# lib.sh は source 時にリポジトリルートへ移るので、パスはすべて絶対パスで渡す。
+targets_dir="${script_dir}/../targets"
+make_stdout="$work/make-entry.stdout"
+run_make_entry() {
+  local script="$1"
+  last_rc=0
+  "$bash_bin" "${targets_dir}/${script}" >"$make_stdout" 2>"$work/make-entry.stderr" || last_rc=$?
+}
+reset_log
+export STUB_MODE=ok
+make_out="$work/make-out.json"
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 WARMUP=0 TIMEOUT=7 OUTPUT="$make_out" run_make_entry startup-latency.sh
+expect_eq "make-entry-output-rc" "0" "$last_rc"
+expect_eq "make-entry-output-first-line" "bash scripts/bench/startup_latency.sh" "$(head -n 1 "$make_stdout" | cut -d" " -f1-2)"
+expect_eq "make-entry-output-params" "oci 1 0 7" "$(jq -r '"\(.mode) \(.params.iterations) \(.params.warmup) \(.params.timeout_secs)"' "$make_out" 2>/dev/null)"
+reset_log
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 run_make_entry startup-latency.sh
+expect_eq "make-entry-defaults-rc" "0" "$last_rc"
+expect_eq "make-entry-defaults-params" "1 10" "$(tail -n +2 "$make_stdout" | jq -r '"\(.params.warmup) \(.params.timeout_secs)"' 2>/dev/null)"
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 TIMEOUT=121 run_make_entry startup-latency.sh
+expect_eq "make-entry-timeout-invalid-rc" "2" "$last_rc"
+BUNDLE="$work/bundle" TARGET=own run_make_entry startup-latency.sh
+expect_eq "make-entry-missing-vars-rc" "2" "$last_rc"
+reset_dlog
+export DSTUB_MODE=ok
+make_dout="$work/make-docker-out.json"
+DOCKER="$dstub" ITERATIONS=1 WARMUP=0 TIMEOUT=3 OUTPUT="$make_dout" run_make_entry startup-latency-docker.sh
+expect_eq "make-entry-docker-rc" "0" "$last_rc"
+expect_eq "make-entry-docker-params" "docker 0 3" "$(jq -r '"\(.mode) \(.params.warmup) \(.params.timeout_secs)"' "$make_dout" 2>/dev/null)"
 
 if [ "$failures" -ne 0 ]; then
   echo "startup_latency_selftest: $failures failure(s)" >&2

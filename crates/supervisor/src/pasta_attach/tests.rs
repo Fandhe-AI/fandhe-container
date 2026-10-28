@@ -250,11 +250,24 @@ fn net9_pasta_failure_rolls_back_in_reverse_order() {
             [
                 "spawn holder",
                 "spawn pasta target=4242",
-                "remove run_dir",
                 "stop holder detach=false"
             ]
         );
         assert!(lock(&w.slot).is_none());
+        // 置き場所の削除は単一スレッド区間のフックでは行わず(スレッドを作らない)、launch 失敗の後始末へ渡る。
+        let l = launcher(&w);
+        let _ = l.adopt(Err(TraitError::new(code, "launch failed")));
+        assert_eq!(
+            events(&ev).last().map(String::as_str),
+            Some("remove run_dir")
+        );
+        assert_eq!(
+            events(&ev)
+                .iter()
+                .filter(|x| *x == "remove run_dir")
+                .count(),
+            1
+        );
     }
 }
 
@@ -899,8 +912,11 @@ fn net9_real_helpers_are_reaped_on_spawn_failure() {
     let pids = b.pids.lock().unwrap().clone();
     assert_eq!(pids.len(), 1);
     assert!(gone(pids[0]));
-    assert!(!b.run_dir.exists());
     assert!(lock(&w.slot).is_none());
+    // フックは helper の回収だけを行い、run dir は launch 失敗の後始末(単一スレッド区間の外)が消す。
+    let l = launcher(&w);
+    let _ = l.adopt(Err(TraitError::new(ErrorCode::Internal, "launch failed")));
+    assert!(!b.run_dir.exists());
 }
 
 /// NET-9・REPAIR-12: helper が途中で死んだら SIGTERM が送られ、終了後に残りの helper も回収される。

@@ -1123,14 +1123,10 @@ impl PastaAttachHook {
         let pasta = match self.backend.spawn_pasta(holder.handle.pid(), deadline) {
             Ok(p) => p,
             Err(e) => {
-                // 逆順の巻き戻し: pasta は自分で片付けて戻る。run dir を消してから holder を止める。
-                if let Err(re) = self.backend.remove_run_dir(None) {
-                    self.logger.log(
-                        true,
-                        "pasta_run_dir_remove_failed",
-                        &[("code", Val::S(re.code().as_str()))],
-                    );
-                }
+                // 逆順の巻き戻し: pasta は自分で片付けて戻る。ここ(core の単一スレッド区間)では helper の回収だけを行う。
+                // 置き場所(`@pasta/<id>/`)の削除は作業スレッドとロックを要するため、区間の外の後始末
+                // (`PastaAttachingLauncher::adopt` の launch 失敗経路と `release_network`)へ渡す。準備済みの
+                // 置き場所の同一性は backend が保持している(REPAIR-1・REPAIR-5)。
                 let rep = holder.handle.stop(false);
                 self.logger.log(
                     true,

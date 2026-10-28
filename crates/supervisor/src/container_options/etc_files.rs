@@ -70,10 +70,12 @@ fn write_contents(
             .map_err(|e| net_error_to_trait(&e))?;
     }
     if selection.contains(EtcFileKind::ResolvConf) {
+        // ユーザー定義名(pasta 構成)は `--dns` があればそれ、無ければ pasta の既定の nameserver を載せる(12.7・D9)。
+        // 検証は host と同じ(非 loopback。loopback は NetworkOptions::parse が拒否済み)。
+        let named = matches!(network.selection(), Some(NetworkSelection::Named(_)));
         let mode = match network.selection() {
             Some(NetworkSelection::None) => NetworkMode::None,
-            Some(NetworkSelection::Host) => NetworkMode::Host,
-            // 選択が ResolvConf を含むのは none / host のときだけ(`etc_file_selection`)。到達しない。
+            Some(NetworkSelection::Host | NetworkSelection::Named(_)) => NetworkMode::Host,
             _ => {
                 return Err(TraitError::new(
                     ErrorCode::Internal,
@@ -81,7 +83,10 @@ fn write_contents(
                 ));
             }
         };
-        let dns: Vec<String> = network.dns().iter().map(ToString::to_string).collect();
+        let mut dns: Vec<String> = network.dns().iter().map(ToString::to_string).collect();
+        if named && dns.is_empty() {
+            dns.push(super::network::PASTA_DEFAULT_NAMESERVER.to_owned());
+        }
         let raw: Vec<&str> = dns.iter().map(String::as_str).collect();
         let path = etc_file_path(root, id, EtcFileKind::ResolvConf);
         match apply_dns(mode, &raw, &path, &NoopNetOpRecorder)
@@ -175,6 +180,33 @@ mod tests {
         assert_eq!(
             mode(etc_file_path(&d.0, &id(), EtcFileKind::ResolvConf)),
             0o644
+        );
+    }
+
+    /// NET-12・NET-9・D9(12.7): ユーザー定義名(pasta 構成)は --dns が無ければ既定の nameserver 169.254.1.1 を、
+    /// --dns があればそれを resolv.conf に書く。--add-host があれば hosts も書く。
+    #[test]
+    fn net12_prepare_named_network_writes_pasta_resolv_conf() {
+        let d = Dir::new("named");
+        let o = opts("web", &[], &[]);
+        let sel = prepare_etc_files(&d.0, &id(), &o).expect("prepare");
+        assert_eq!(sel.kinds(), vec![EtcFileKind::ResolvConf]);
+        let resolv =
+            std::fs::read_to_string(etc_file_path(&d.0, &id(), EtcFileKind::ResolvConf)).unwrap();
+        assert_eq!(resolv, format!("{HEADER}nameserver 169.254.1.1\n"));
+        assert!(!etc_file_path(&d.0, &id(), EtcFileKind::Hosts).exists());
+        discard_etc_files(&d.0, &id()).expect("discard");
+        let o = opts("web", &["db:192.0.2.9"], &["192.0.2.53", "192.0.2.54"]);
+        let sel = prepare_etc_files(&d.0, &id(), &o).expect("prepare");
+        assert_eq!(
+            sel.kinds(),
+            vec![EtcFileKind::Hosts, EtcFileKind::ResolvConf]
+        );
+        let resolv =
+            std::fs::read_to_string(etc_file_path(&d.0, &id(), EtcFileKind::ResolvConf)).unwrap();
+        assert_eq!(
+            resolv,
+            format!("{HEADER}nameserver 192.0.2.53\nnameserver 192.0.2.54\n")
         );
     }
 

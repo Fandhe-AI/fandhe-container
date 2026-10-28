@@ -2868,8 +2868,12 @@ mod linux {
         let bundle = Bundle::new(if subordinate { "ns" } else { "n" });
         let ld = make_rootfs(&bundle.rootfs(), true);
         write_config(&bundle, &ld, &["--net-loopback"], json!([]));
-        let id = ContainerId::new(format!("pl{}{tag}", if subordinate { "nn" } else { "n" }))
-            .expect("id");
+        // 他シナリオの id(`pl{name}{tag}`。例: working-dir-refused の `pln{tag}`)と衝突しない固有の接頭辞にする。
+        let id = ContainerId::new(format!(
+            "plnet{}{tag}",
+            if subordinate { "sub" } else { "own" }
+        ))
+        .expect("id");
         do_create(env, &bundle, &id);
 
         wait_single_thread();

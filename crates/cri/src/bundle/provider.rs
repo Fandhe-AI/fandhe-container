@@ -113,7 +113,7 @@ pub trait RootfsSource: Send + Sync {
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
 }
 
-/// [`SpecBundleProvider::list_bundle_ids`] の結果（R8 #2937）。ID 以外は件数のみ。
+/// `SpecBundleProvider::list_bundle_ids` の結果（R8 #2937）。ID 以外は件数のみ。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct BundleListing {

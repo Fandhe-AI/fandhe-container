@@ -8,7 +8,7 @@
 //! 順序は `readopt_sandboxes` → `readopt_containers` → `release_stale_creates` → 本関数。解放に失敗した `stale_create`
 //! の記録が残っている間は、その bundle が「記録あり」として孤児扱いにならないため、この順が要る。
 //!
-//! 排他: [`InstanceLock`] を引数に取る。値は取得関数以外から作れないため、ロックを持たない経路では型として呼べない。
+//! 排他: `Arc<InstanceLock>` を引数に取り、期限切れの解放 worker にも複製を持たせる。値は取得関数以外から作れないため、ロックを持たない経路では型として呼べない。
 //! `CriPluginBackends::reclaim_orphan_bundles` はロックを持たない backends（注入で組んだもの）に
 //! `FAILED_PRECONDITION` を返す。残余: 照会から解放までの窓は、受付の開始前・インスタンスロックの下・状態ルートを共有する
 //! CLI は `.cri/bundles` を使わない、の 3 点で許容する。
@@ -137,11 +137,14 @@ where
     rx.recv_timeout(timeout).ok()
 }
 
-/// 孤児 bundle を回収する。`_lock` はインスタンスロックの保持の証明（呼び出し側が持っている間だけ呼べる）。
+/// 孤児 bundle を回収する。`lock` はインスタンスロックの保持の証明（呼び出し側が持っている間だけ呼べる）。
+///
+/// 期限切れで切り離した解放 worker は `lock` の複製を持ち、解放が終わるまでロックを手放さない
+/// （復帰後に呼び出し側が先にロックを落としても、別インスタンスは削除中の bundle と競合しない。REPAIR-1・SEC-1）。
 ///
 /// 起動を止めない（失敗・期限切れは件数に数えて余分に残す側へ倒す）。モジュール doc の条件を参照。
 pub fn reclaim_orphan_bundles(
-    _lock: &InstanceLock,
+    lock: &Arc<InstanceLock>,
     bundles: &Arc<SpecBundleProvider>,
     records: &dyn RecordStore,
     runtime: &RuntimeAdapter,
@@ -234,11 +237,17 @@ pub fn reclaim_orphan_bundles(
         let per = budget.per_record.min(remaining);
         let b = Arc::clone(bundles);
         let release_id = id.clone();
-        match with_deadline(per, move || b.release(&release_id)) {
+        let held = Arc::clone(lock);
+        match with_deadline(per, move || {
+            let r = b.release(&release_id);
+            // 解放が終わるまでインスタンスロックを保持する。
+            drop(held);
+            r
+        }) {
             Some(Ok(())) => result.reclaimed += 1,
             Some(Err(_)) => result.release_failed += 1,
             None => {
-                // 切り離したスレッドが解放を続けても無害（消えるか残るかのどちらか）。以後は打ち切る。
+                // 切り離したスレッドは lock を持ったまま解放を続ける（消えるか残るかのどちらか）。以後は打ち切る。
                 result.release_timed_out += 1;
                 result.not_attempted = count_without_record(&ids[index + 1..], &with_record);
                 result.kept_has_record += ids.len() - index - 1 - result.not_attempted;

@@ -181,7 +181,8 @@ fn oci7_orphan_bundles_reclaim_only_unowned_absent_directories() {
     let root = &tmp.0;
     let provider = bundle_provider_in(root).expect("provider");
     let store = FileRecordStore::open(root).expect("record store");
-    let lock = acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock");
+    let lock =
+        std::sync::Arc::new(acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock"));
 
     // A: 記録なし・core に無い -> 回収。B: core に Running。C: 照会が INTERNAL。C2: 照会が期限切れ。
     // D: 壊れた記録。E: 記録あり。F: 不正名。G: 採番の形の symlink。
@@ -260,7 +261,8 @@ fn repair4_orphan_summary_line_is_fixed_vocabulary() {
     let root = &tmp.0;
     let provider = bundle_provider_in(root).expect("provider");
     let store = FileRecordStore::open(root).expect("record store");
-    let lock = acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock");
+    let lock =
+        std::sync::Arc::new(acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock"));
     mkbundle(root, &id('a'));
     let runtime = RuntimeAdapter::new(Arc::new(FakeRuntime(HashMap::new())));
     let out: OrphanBundleReclamation =
@@ -277,7 +279,8 @@ fn sec1_orphan_bundles_untouched_when_record_listing_fails() {
     let tmp = TempDir::new("listfail");
     let root = &tmp.0;
     let provider = bundle_provider_in(root).expect("provider");
-    let lock = acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock");
+    let lock =
+        std::sync::Arc::new(acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock"));
     mkbundle(root, &id('a'));
     let runtime = RuntimeAdapter::new(Arc::new(FakeRuntime(HashMap::new())));
     let out = reclaim_orphan_bundles(&lock, &provider, &FailingList, &runtime, budget());
@@ -293,7 +296,8 @@ fn repair5_orphan_bundles_total_deadline_stops() {
     let root = &tmp.0;
     let provider = bundle_provider_in(root).expect("provider");
     let store = FileRecordStore::open(root).expect("record store");
-    let lock = acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock");
+    let lock =
+        std::sync::Arc::new(acquire_instance_lock_in(root, Duration::from_secs(1)).expect("lock"));
     mkbundle(root, &id('a'));
     mkbundle(root, &id('b'));
     let runtime = RuntimeAdapter::new(Arc::new(FakeRuntime(HashMap::new())));

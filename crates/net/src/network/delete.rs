@@ -121,7 +121,7 @@ use crate::netlink_route::{LinkDelete, NetlinkRouteSocket};
 use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableDelete, TableGet};
-use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
+use crate::nftables_batch::{NftBatchOutcome, NftName, NftTableHandle, TableInfo};
 use crate::nftables_rules::NftRuleHandle;
 #[cfg(target_os = "linux")]
 use crate::nftables_rules::RuleDelete;
@@ -391,15 +391,19 @@ fn judge_table_info(info: Result<TableInfo, NetError>, token: &str) -> TableProo
 }
 
 /// 公開の個別解除（`network::unpublish`）の事前確認。テーブルの `NFTA_TABLE_USERDATA` が `token` と一致する
-/// ときだけ `Ok`。無い・不一致・照会失敗はすべて `Err`（何も変えずに断る）。ルールのハンドルはテーブルごとに
-/// 採番されるため、同名で作り直された別のテーブルで古いハンドルが別のルールを消すのを防ぐ（NET-3・SEC-1）。
+/// ときだけ、生きたテーブルのハンドルを返す。無い・不一致・照会失敗・ハンドル欠落（0 を含む）はすべて `Err`
+/// （何も変えずに断る）。ルールのハンドルはテーブルごとに採番されるため、同名で作り直された別のテーブルで
+/// 古いハンドルが別のルールを消すのを防ぐ。返したハンドルは、記録したテーブルハンドルとの照合に使う
+/// （userdata は退避・復元で作り直されたテーブルでも同じになりうるが、ハンドルは変わる。NET-3・SEC-1・#3068）。
 // 呼び出し元の `unpublish` は OS 非依存の本体だが、実機の呼び出しは Linux 限定。
 pub(super) fn require_table_owned(
     info: Result<TableInfo, NetError>,
     token: &str,
-) -> Result<(), NetError> {
+) -> Result<NftTableHandle, NetError> {
     match judge_table_info(info, token) {
-        TableProof::Owned(_) => Ok(()),
+        TableProof::Owned(handle) => {
+            NftTableHandle::new(handle).map_err(|_| precondition("nft table handle is not usable"))
+        }
         TableProof::Absent => Err(precondition("nft table is absent")),
         TableProof::Unproven(e) => Err(e),
     }

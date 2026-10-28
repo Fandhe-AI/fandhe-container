@@ -64,6 +64,7 @@ mod tests {
     use crate::netlink_route::{IfIndex, IpPrefix};
     use crate::network::{CreatedNetwork, EndpointId, NetworkName, NetworkResourceNames};
     use crate::network_store::member::MemberId;
+    use crate::nftables_batch::NftTableHandle;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
 
@@ -85,7 +86,13 @@ mod tests {
             name_resolution: NameResolution::default(),
             name,
         };
-        RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24)).unwrap()
+        RealizedRecord::from_created(
+            &c,
+            pfx([10, 0, 0, 0], 24),
+            NftTableHandle::new(42).unwrap(),
+            crate::network_store::HostGeneration::current().unwrap(),
+        )
+        .unwrap()
     }
 
     fn token(ep: &str) -> String {

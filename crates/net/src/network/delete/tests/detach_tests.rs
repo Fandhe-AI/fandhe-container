@@ -265,6 +265,44 @@ fn net3_detach_rule_delete_unknown_is_reported() {
     assert_eq!(t.ipam.address_of(&eid("c1")), Some(t.a1));
 }
 
+/// NET-3・SEC-1・#3068: 記録したテーブルハンドル（98）が生きたもの（99）と食い違う公開は DELRULE を送らず、
+/// 取り残し（状態 Unknown）として報告してアドレスと予約を保持する（quarantine）。
+#[test]
+fn net3_3068_detach_stale_table_handle_holds_address_without_deleting() {
+    let mut t = two_containers();
+    let c1 = t.c1.take().unwrap();
+    let extra: Vec<PublishedPort> = std::mem::take(&mut t.extra)
+        .into_iter()
+        .map(|p| p.with_table_handle(crate::nftables_batch::NftTableHandle::new(98).unwrap()))
+        .collect();
+    let fake = Fake::default();
+    let e = detach(&fake, &mut t, c1, extra).unwrap_err();
+    assert_eq!(e.step, DeleteStep::UnpublishPorts);
+    assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+    assert!(
+        !fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_rules") && c.ends_with(" 4/5")),
+        "食い違うハンドルでは DELRULE を送らない: {:?}",
+        fake.calls()
+    );
+    assert_eq!(
+        e.report.leftover[0],
+        (
+            DeleteResource::PortRules(eid("c1"), pub_of(8081)),
+            ResourceState::Unknown
+        )
+    );
+    assert_eq!(t.ipam.address_of(&eid("c1")), Some(t.a1));
+    // 束縛の無い 8080 は解除済みで、食い違った 8081 の予約だけが残る。
+    assert_eq!(
+        held(&mut t.ports, "c1"),
+        1,
+        "食い違った公開の予約は解放しない"
+    );
+}
+
 /// NET-1・NET-3・#3062: 結果不明の公開が残した予約（ハンドルなし）があれば、公開なしの切り離しでも
 /// アドレスを保持し、成功を装わない。
 #[test]

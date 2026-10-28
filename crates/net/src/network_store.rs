@@ -41,7 +41,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! 残った `realized.intent` のカーネル照合（所有トークンでの昇格または巻き戻し）は後続で、それまでは
-//! `network::recorded` が次の操作を拒否する。公開の記録は #3068、DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
+//! `network::recorded` が次の操作を拒否する。DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
 //! `remove` は `definition`・`@lock` と空の既知ディレクトリ以外の項目があれば拒否するため、記録を誤って消さない。
 //! Linux 以外ではストアの全操作が `Unimplemented`（FCNET1 コーデックは 3 OS で動く）。
 
@@ -60,8 +60,8 @@ pub use definition::{
     is_reserved_network_name,
 };
 pub use ipam_rebuild::rebuild_ipam;
-pub use member::{MemberId, MemberIntent, MemberRecord};
-pub use realized::{RealizedIntent, RealizedOp, RealizedRecord};
+pub use member::{MemberId, MemberIntent, MemberRecord, RecordedPublish};
+pub use realized::{HostGeneration, NetnsIdentity, RealizedIntent, RealizedOp, RealizedRecord};
 
 /// 1 ネットワークに置けるメンバー記録（確定と意図の各々）の最大件数（D13 の /24 と plugin-cri の上限に合わせる）。
 pub const MAX_MEMBERS_PER_NETWORK: usize = 256;

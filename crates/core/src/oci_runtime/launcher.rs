@@ -239,6 +239,9 @@ pub struct ProductionLauncherBuilder {
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     #[cfg(target_os = "linux")]
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// 試験用: netns の素性の照合の基準を差し替える(dev, ino)。拒否の場面を実機で作るための差し込み口で、本番ビルドには無い。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    netns_baseline_override: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -346,6 +349,16 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// 試験用: exec 直前の netns の素性の照合で、supervisor の netns の代わりに使う基準 `(dev, ino)` を差し替える
+    /// (`network_mode=host` の拒否の場面を実機で作るため。NET-6・SEC-1・#3206)。`exec-test-support` feature の下のみ
+    /// 存在し、本番ビルドからは差し替えられない。
+    #[cfg(feature = "exec-test-support")]
+    #[must_use]
+    pub fn netns_baseline_override_for_test(mut self, dev: u64, ino: u64) -> Self {
+        self.netns_baseline_override = Some((dev, ino));
+        self
+    }
+
     /// 監査の網羅を満たせない環境(カーネル監査頼みの層の縮退)への方針(SEC-4・#2027)。既定は
     /// [`crate::audit_log::AuditCoveragePolicy::BestEffort`](警告して起動を続け、縮退を `launchIsolation` と監査記録に残す)。
     /// `Strict` は縮退(調べられなかった場合を含む)を fork の前に `FailedPrecondition` で拒否する(opt-in)。
@@ -411,6 +424,10 @@ impl ProductionLauncherBuilder {
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
             inner.rejection_audit_sink = self.rejection_audit_sink;
+            #[cfg(feature = "exec-test-support")]
+            {
+                inner.netns_baseline_override = self.netns_baseline_override;
+            }
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -421,6 +438,39 @@ impl ProductionLauncherBuilder {
             ))
         }
     }
+}
+
+/// exec 直前の netns の素性の同期点の要求を、起動モードと実効の扱いの組から決める(NET-6・SEC-1・#3206。
+/// `docs/design/network-wiring.md` D8)。
+///
+/// `Host` かつ `HostShared` は基準と同じ、`Loopback` かつ `NewLoopback` は基準と異なる。`FromConfig`(既定・CRI の経路)は
+/// 同期点を通さない(D7: 既定を変えても CRI の経路の挙動を変えない。pod の netns の join〔#2838〕で見直す)。
+/// 上の組以外は start の突き合わせ(`reconcile_network`)と食い違う不整合で、fork の前に `Internal` で拒否する。
+/// `baseline` は試験用の差し替え(通常は `None`で、launch の入口で C が自分の netns から取る)。
+#[cfg(target_os = "linux")]
+fn netns_sync_request(
+    mode: LaunchNetworkMode,
+    effective: EffectiveNetwork,
+    baseline: Option<crate::exec::NetnsIdentity>,
+) -> Result<Option<crate::exec::NetnsSyncRequest>, TraitError> {
+    use crate::exec::{NetnsExpectation, NetnsSyncRequest};
+    let expectation = match (mode, effective) {
+        (LaunchNetworkMode::FromConfig, _) => return Ok(None),
+        (LaunchNetworkMode::Host, EffectiveNetwork::HostShared) => NetnsExpectation::SameAsBaseline,
+        (LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback) => {
+            NetnsExpectation::DiffersFromBaseline
+        }
+        _ => {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the network mode does not match the reconciled network namespace plan",
+            ));
+        }
+    };
+    Ok(Some(NetnsSyncRequest {
+        expectation,
+        baseline,
+    }))
 }
 
 /// 利用者指定の tmpfs と注入ディレクトリ(いずれも pivot 前段で載せる tmpfs)が、config の
@@ -892,6 +942,8 @@ struct SpawnInput<'a> {
     subordinate: Option<&'a SubordinateIds>,
     /// `root.readonly` の実効値（config と `--read-only` の OR。Landlock・分離の記録と同じ値。#2828）。
     root_readonly: bool,
+    /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は `None`。NET-6・SEC-1・#3206)。
+    netns_sync: Option<crate::exec::NetnsSyncRequest>,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -1141,6 +1193,9 @@ struct Inner {
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     /// 監査の網羅を満たせない環境への方針(`ProductionLauncherBuilder::audit_coverage_policy`。既定 `BestEffort`。SEC-4・#2027)。
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// 試験用の netns 基準の差し替え(`ProductionLauncherBuilder::netns_baseline_override_for_test`。#3206)。
+    #[cfg(feature = "exec-test-support")]
+    netns_baseline_override: Option<(u64, u64)>,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -1171,9 +1226,24 @@ impl Inner {
             launch_options: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
+            #[cfg(feature = "exec-test-support")]
+            netns_baseline_override: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
+        }
+    }
+
+    /// 試験用の基準の差し替え(本番ビルドでは常に `None`)。
+    fn netns_baseline_override(&self) -> Option<crate::exec::NetnsIdentity> {
+        #[cfg(feature = "exec-test-support")]
+        {
+            self.netns_baseline_override
+                .map(|(dev, ino)| crate::exec::NetnsIdentity::from_parts_for_test(dev, ino))
+        }
+        #[cfg(not(feature = "exec-test-support"))]
+        {
+            None
         }
     }
 
@@ -1454,6 +1524,13 @@ impl Inner {
                 "container launch did not complete within the timeout",
             ));
         }
+        // exec 直前の netns の素性の同期点の要求を fork の前に確定する。モードと実効の扱いの組が不整合なら拒否する
+        // (突き合わせ済みの start の結果と食い違う多重防御。NET-6・SEC-1・#3206)。
+        let netns_sync = netns_sync_request(
+            options.network(),
+            spec.network(),
+            self.netns_baseline_override(),
+        )?;
         let spawned = self
             .ops
             .spawn(SpawnInput {
@@ -1471,6 +1548,7 @@ impl Inner {
                 sysctls: sysctls.as_ref(),
                 subordinate: self.subordinate.as_ref(),
                 root_readonly: effective_root_readonly,
+                netns_sync,
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -2072,6 +2150,7 @@ impl LaunchOps for RealOps {
                 rootfs: input.spec.rootfs(),
                 entry: input.entry,
                 setup,
+                netns_sync: input.netns_sync,
             },
             input.stages,
             stdio,
@@ -4267,6 +4346,40 @@ mod tests {
                 assert_eq!(root.allowed() & write, write);
             }
             p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+    }
+
+    /// NET-6・SEC-1(#3206): 同期点の要求はモードと実効の組で決まる。Host は基準と同じ、Loopback は基準と異なる、
+    /// `FromConfig` は通さず、不整合な組は fork の前に `Internal` で拒否する。
+    #[test]
+    fn net6_sec1_3206_netns_sync_request_follows_mode_and_effective_network() {
+        use crate::exec::NetnsExpectation;
+        let req = |m, e| netns_sync_request(m, e, None);
+        assert_eq!(
+            req(LaunchNetworkMode::Host, EffectiveNetwork::HostShared)
+                .unwrap()
+                .map(|r| r.expectation),
+            Some(NetnsExpectation::SameAsBaseline)
+        );
+        assert_eq!(
+            req(LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback)
+                .unwrap()
+                .map(|r| r.expectation),
+            Some(NetnsExpectation::DiffersFromBaseline)
+        );
+        for e in [EffectiveNetwork::HostShared, EffectiveNetwork::NewLoopback] {
+            assert!(req(LaunchNetworkMode::FromConfig, e).unwrap().is_none());
+        }
+        for (m, e) in [
+            (LaunchNetworkMode::Host, EffectiveNetwork::NewLoopback),
+            (LaunchNetworkMode::Loopback, EffectiveNetwork::HostShared),
+        ] {
+            let err = req(m, e).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the network mode does not match the reconciled network namespace plan"
+            );
         }
     }
 

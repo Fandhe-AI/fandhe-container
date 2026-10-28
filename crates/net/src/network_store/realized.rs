@@ -555,18 +555,22 @@ mod tests {
         );
     }
 
+    /// 環境に依らない固定の世代（netns の符号化長を固定: `5:4026531833` は 12 バイト）。
+    fn fixed_generation() -> HostGeneration {
+        HostGeneration::new(
+            "0123abcd-4567-89ab-cdef-0123456789ab",
+            NetnsIdentity::new(5, 4026531833),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn net1_3067_realized_decode_rejects_malformed() {
         let c = created();
         let good = String::from_utf8(
-            RealizedRecord::from_created(
-                &c,
-                pfx([10, 0, 0, 0], 24),
-                th(42),
-                HostGeneration::current().unwrap(),
-            )
-            .unwrap()
-            .encode(),
+            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24), th(42), fixed_generation())
+                .unwrap()
+                .encode(),
         )
         .unwrap();
         let cases = vec![
@@ -577,10 +581,7 @@ mod tests {
             good.replace("table-handle 2\n42\n", ""),
             // NET-3・SEC-1・#3068: 世代（boot ID・netns）の欠落（旧形式）・不正値・順序違いは fail-closed。
             good.replace(
-                &format!(
-                    "boot-id 36\n{}\n",
-                    HostGeneration::current().unwrap().boot_id()
-                ),
+                &format!("boot-id 36\n{}\n", fixed_generation().boot_id()),
                 "",
             ),
             good.replace("netns 12\n", "netns 3\nx\n"),
@@ -601,6 +602,9 @@ mod tests {
             format!("{good}x"),
         ];
         for bad_case in &cases {
+            // 置換が実際に起きていること（no-op の置換で正常な記録が通るのを防ぐ）。`format!("{good}x")` 以外は
+            // 元の記録と異なる。
+            assert_ne!(bad_case, &good);
             assert_eq!(
                 code(RealizedRecord::decode(bad_case.as_bytes())),
                 NetErrorCode::DataLoss,
@@ -609,6 +613,7 @@ mod tests {
         }
         // bridge 名がネットワーク名の導出と一致しない。
         let swapped = good.replace(c.bridge.as_str(), "fcbr0000000000");
+        assert_ne!(swapped, good);
         assert_eq!(
             code(RealizedRecord::decode(swapped.as_bytes())),
             NetErrorCode::DataLoss

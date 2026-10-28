@@ -31,11 +31,9 @@ use fandhe_container_net::add_host_dns::{AddHostEntry, parse_add_hosts, parse_ip
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::network::MAX_PORT_PUBLISHES;
 use fandhe_container_net::network::NetworkName;
-use fandhe_container_net::network_mode::NetworkMode;
+use fandhe_container_net::network_mode::{NetworkChoice, NetworkMode};
 use fandhe_container_net::pasta::PastaPortForwards;
 
-/// 予約名の固定拒否文言。
-const RESERVED_NAME_MESSAGE: &str = "reserved network name";
 /// `publish` がユーザー定義名の `network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "publish records require a user-defined network";
 /// 結線されていない指定の固定拒否文言。
@@ -64,13 +62,10 @@ pub struct NetworkOptions {
     publish: PastaPortForwards,
 }
 
-/// 予約名(`bridge`・`default`)か(D1)。
-pub fn is_reserved_network_name(name: &str) -> bool {
-    matches!(name, "bridge" | "default")
-}
-
 /// net の固定メッセージを保ったまま `TraitError` へ写す(`NetErrorCode` は `#[non_exhaustive]`)。
-pub(crate) fn net_error_to_trait(e: &NetError) -> TraitError {
+///
+/// CLI の create 検証(`create_network.rs`)も同じ写像を使う(REPAIR-1。写像を 2 か所に持たない)。
+pub fn net_error_to_trait(e: &NetError) -> TraitError {
     let code = match e.code() {
         NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
         NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
@@ -111,23 +106,20 @@ impl NetworkOptions {
             ));
         }
         let mut container_ref = false;
-        let selection = match network {
+        // 分類規則は net の `NetworkChoice::parse` が唯一の判定(CLI と共有。REPAIR-1)。
+        let selection = match network
+            .map(NetworkChoice::parse)
+            .transpose()
+            .map_err(|e| net_error_to_trait(&e))?
+        {
             None => None,
-            Some("none") => Some(NetworkSelection::None),
-            Some("host") => Some(NetworkSelection::Host),
-            Some(n) if is_reserved_network_name(n) => {
-                return Err(TraitError::new(
-                    ErrorCode::InvalidArgument,
-                    RESERVED_NAME_MESSAGE,
-                ));
-            }
-            Some(n) if n.starts_with("container:") => {
+            Some(NetworkChoice::None) => Some(NetworkSelection::None),
+            Some(NetworkChoice::Host) => Some(NetworkSelection::Host),
+            Some(NetworkChoice::Named(n)) => Some(NetworkSelection::Named(n)),
+            Some(NetworkChoice::ContainerRef) => {
                 container_ref = true;
                 None
             }
-            Some(n) => Some(NetworkSelection::Named(
-                NetworkName::new(n).map_err(|e| net_error_to_trait(&e))?,
-            )),
         };
         let entries = parse_add_hosts(add_hosts.iter().map(String::as_str))
             .map_err(|e| net_error_to_trait(&e))?;

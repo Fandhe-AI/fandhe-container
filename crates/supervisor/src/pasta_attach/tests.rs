@@ -1090,3 +1090,51 @@ fn core2_terminate_with_pending_teardown_is_not_success() {
         events(&ev)
     );
 }
+
+/// 本番の `ContainerChildProcess::wait` を模す。コンテナが生存していると渡された timeout を使い切って `None` を返す。
+struct SleepyProcess(Events);
+
+impl LaunchedProcess for SleepyProcess {
+    fn pid(&self) -> NonZeroU32 {
+        NonZeroU32::new(88).unwrap()
+    }
+    fn wait(&self, t: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        std::thread::sleep(t);
+        Ok(None)
+    }
+    fn terminate(&self, _t: Duration) -> Result<(), TraitError> {
+        Ok(())
+    }
+    fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
+        push(&self.0, format!("container signal {}", signal.as_u8()));
+        Ok(())
+    }
+}
+
+/// NET-9・REPAIR-5: 生存中の wait が timeout を使い切る本番の挙動でも、helper の途中死は同じ周期内で SIGTERM、
+/// 猶予後の次の周期で SIGKILL が送られ、各 wait は期限(timeout + 余裕)内に戻る。
+#[test]
+fn net9_helper_death_is_signaled_even_when_wait_consumes_its_timeout() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let mut g = PastaGuardedProcess::new(
+        Box::new(SleepyProcess(Arc::clone(&ev))),
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    g.term_grace = Duration::from_millis(10);
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    let t = Instant::now();
+    assert_eq!(g.wait(Duration::from_millis(100)).expect("wait"), None);
+    assert!(
+        t.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(events(&ev), ["container signal 15"]);
+    assert_eq!(g.wait(Duration::from_millis(100)).expect("wait"), None);
+    assert_eq!(events(&ev), ["container signal 15", "container signal 9"]);
+}

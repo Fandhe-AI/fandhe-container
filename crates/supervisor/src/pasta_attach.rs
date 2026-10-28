@@ -1246,7 +1246,14 @@ impl LaunchedProcess for PastaGuardedProcess {
                 }
                 Some(exit)
             }
-            None => self.inner.wait(timeout)?,
+            None => {
+                // 子の終了待ちは生存中だと渡された timeout を使い切るため、helper の死亡処理(シグナル送信)は
+                // 待ちの前に行い、予算を先に確保する(後ろへ回すと残り時間が常に 0 で永遠に繰り越される。NET-9・REPAIR-5)。
+                // 死亡の検知が遅れるのは最大で 1 周期(待ちの timeout)。
+                self.check_helpers(deadline);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.inner.wait(remaining)?
+            }
         };
         match result {
             Some(exit) => {
@@ -1260,10 +1267,7 @@ impl LaunchedProcess for PastaGuardedProcess {
                     Ok(Some(exit))
                 }
             }
-            None => {
-                self.check_helpers(deadline);
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 

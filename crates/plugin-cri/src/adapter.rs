@@ -2252,4 +2252,135 @@ mod tests {
                 .starts_with("{\"level\":\"info\"")
         );
     }
+
+    /// 注入で組んだ backends が使う一時ディレクトリ（0700）。Drop で消す。
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p =
+                std::env::temp_dir().join(format!("fcpc-nolock-{}-{nanos}", std::process::id()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&p)
+                .expect("scratch dir");
+            Self(p)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入（`new` / `with_recorder`）で組んだ backends はインスタンスロックも
+    /// 状態ルートも持たない。ロックを要する孤児 bundle の回収・記録の再採用は `instance_lock()` が
+    /// `None` のとき拒否される（拒否の挙動は tests/orphan_bundles.rs・tests/record_readoption.rs が補う）。
+    #[test]
+    fn cri2_core1_injected_backends_hold_no_instance_lock() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rec = Arc::new(OpRecorder::new());
+        let rt = || {
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            ))
+        };
+        let built = [
+            CriPluginBackends::new(rt(), Arc::clone(&store), Arc::new(UnimplementedNetwork)),
+            CriPluginBackends::with_recorder(
+                rt(),
+                Arc::clone(&store),
+                Arc::new(UnimplementedNetwork),
+                Arc::clone(&rec),
+            ),
+        ];
+        for b in built {
+            for x in [b.clone(), b] {
+                assert!(x._instance_lock.is_none());
+                assert!(x.state_root.is_none());
+                #[cfg(unix)]
+                assert!(x.instance_lock().is_none());
+            }
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入で組んでも状態ルート配下へ `.cri/@instance.lock` を作らない。
+    /// 陽性対照として、同じルートで別にロックを取ると `.cri/@instance.lock` が現れる。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_core1_injected_backends_create_no_instance_lock_file() {
+        use crate::instance_lock::{INSTANCE_LOCK_NAME, acquire_instance_lock_in};
+
+        fn entries(dir: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        let scratch = ScratchDir::new();
+        let state = scratch.0.join("state");
+        let store: Arc<dyn StateStore> = Arc::new(
+            FileStateStore::open(StateRoot::resolve(Some(state.clone())).expect("root"))
+                .expect("open"),
+        );
+        let before = entries(&state);
+
+        let rec = Arc::new(OpRecorder::new());
+        let backends = CriPluginBackends::with_recorder(
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            )),
+            store,
+            Arc::new(UnimplementedNetwork),
+            rec,
+        );
+        let cloned = backends.clone();
+
+        for b in [&backends, &cloned] {
+            assert!(b.instance_lock().is_none());
+            assert!(b.state_root.is_none());
+        }
+        // 状態ルート未設定の経路は早期に返り、何も作らない。
+        let e = backends.production_record_store().expect_err("err");
+        assert_eq!(
+            e.code(),
+            fandhe_container_cri::error::CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            backends.recover_stale_image_pulls(Duration::from_secs(1)),
+            StartupPullRecovery::Failed("FAILED_PRECONDITION")
+        );
+
+        let missing = |p: &std::path::Path| {
+            std::fs::symlink_metadata(p)
+                .expect_err("must not exist")
+                .kind()
+        };
+        assert_eq!(missing(&state.join(".cri")), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            missing(&state.join(".cri").join(INSTANCE_LOCK_NAME)),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(entries(&state), before);
+
+        // 陽性対照: backends が生きていても同じルートのロックを取れ、照合したパスに実体ができる。
+        let _held = acquire_instance_lock_in(&state, Duration::ZERO).expect("acquire");
+        let meta = std::fs::symlink_metadata(state.join(".cri").join(INSTANCE_LOCK_NAME))
+            .expect("lock file");
+        assert!(meta.is_file());
+    }
 }

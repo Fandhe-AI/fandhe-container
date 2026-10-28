@@ -231,10 +231,17 @@ backend_run_once() {
 # 時刻ファイルを非信頼の入力として読み、検証を通った区間（マイクロ秒）を $wall_us へ入れる。引数: <ファイル>。
 # 正規ファイル（symlink 不可）・64 バイトまで・"<数字> <数字>" の 2 つちょうど・各 18 桁以内・t1 >= t0。
 read_trial_clock() {
-  local f="$1" line="" a="" b="" extra=""
+  local f="$1" line="" a="" b="" extra="" size=0
   wall_us=0
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  IFS= read -r -n 64 line <"$f" || [ -n "$line" ] || return 1
+  # ファイル全体の大きさを先に検証する（read -n は改行か上限で止まり、続きの不正データを見逃すため）。
+  # BSD の wc は桁寄せの空白を付けるため算術展開で数値化する。
+  size="$(wc -c <"$f")" || return 1
+  size=$((size + 0))
+  [ "$size" -ge 1 ] && [ "$size" -le 64 ] || return 1
+  line="$(cat "$f")" || return 1
+  # 末尾の改行は $(...) が落とす。残る改行は複数行（レコードの後の余分なデータ）なので不正とする。
+  case "$line" in *$'\n'*) return 1 ;; esac
   read -r a b extra <<<"$line" || true
   [ -n "$a" ] && [ -n "$b" ] && [ -z "$extra" ] || return 1
   case "$a$b" in *[!0-9]*) return 1 ;; esac

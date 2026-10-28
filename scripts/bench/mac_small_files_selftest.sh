@@ -387,7 +387,10 @@ printf '%s\n' "$BAD_CLOCK" >"$tsf"
 exit "$rc"
 PSTUB
 chmod 755 "${TMP}/badclock/perl"
-for bad in 'abc def' '200 100' '1 2 3' '1' '-1 5' '1234567890123456789 1234567890123456790'; do
+# 数字 2 つの後に続く余分なデータ（改行の後の不正行・空白の後の不正データ・64 バイト超）も不正とする。
+long_pad="$(printf '%80s' '')"
+for bad in 'abc def' '200 100' '1 2 3' '1' '-1 5' '1234567890123456789 1234567890123456790' \
+  $'100 200\ninvalid' "100 200${long_pad}x" "100 200${long_pad}"; do
   reset_stub ok
   rc=0
   BAD_CLOCK="$bad" PATH="${TMP}/badclock:${PATH}" "$UNDER_SHELL" "$SCRIPT" --mode docker --runtime "$DOCKER" --host-dir "$HOST" >"${TMP}/out" 2>"${TMP}/err" || rc=$?

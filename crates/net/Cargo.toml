@@ -201,6 +201,15 @@ name = "network_publish_record_privileged"
 path = "tests/network_publish_record_privileged.rs"
 harness = false
 
+# 実際の pasta を本番の API（検証・置き場所・ポート公開・起動・停止）と netns holder に通す実機前提テスト
+# （NET-9・SEC-5・CORE-6・REPAIR-5・REPAIR-12・#1941）。再入のため harness = false。root 不要・pasta と非特権 user
+# namespace が要るため `-- --ignored` 指定時のみ実行する。CI のランナーには pasta が無いため CI では実行せず、
+# 実機での実行と結果の記録は人間が行う（#341。AGENTS.md）。
+[[test]]
+name = "pasta_rootless"
+path = "tests/pasta_rootless.rs"
+harness = false
+
 # ネットワーク定義ストアのプロセス間結合試験（排他・共有ロック・期限・保持プロセス終了後の再取得。
 # NET-6・REPAIR-5・REPAIR-12・#3059）。自分自身を子として再実行する。root 不要・Linux のみ（他 OS は空の試験）。
 [[test]]

@@ -121,7 +121,7 @@ fandhe-container/
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-options-delivery.md  # 起動オプション（ulimit・env・label ほか）の CLI から supervisor への受け渡し（状態ルート配下の 0600 の文書 `FCOPT1`・経路・却下案・残余。#2713・SUP-12・CLI-1・SEC-1）
 │   │   ├── rotating-log-sharing.md  # supervisor の RotatingFileSink と platform-macos のコンソールログ回転を共通化しない判断の記録（置き場所の候補・依存方向・検査の差・再評価条件。#2172・REPAIR-1・REPAIR-4・MAC-1）
-│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
+│   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・#3142・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）

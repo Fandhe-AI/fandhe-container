@@ -2195,11 +2195,17 @@ async fn cri2_repair5_3142_remove_container_future_drop_cancels_worker() {
 
 /// CRI-2・REPAIR-5・OCI-7（#3142）: Create の巻き戻しの解放も期限で打ち切られる。打ち切ったら結果不明（unknown・
 /// `runtime_owned`）で記録を保持し、続く RemoveContainer（delete → 続きから解放）で回収できる。
+///
+/// RPC の期限と巻き戻しの解放の期限はどちらも同じ `runtime_timeout` のため、prepare が即座に失敗すると RPC の
+/// コードが OS のタイマー粒度の競争で決まる（macOS・Windows で `ResourceExhausted` になった。#3257）。そこで
+/// prepare を保留して RPC の期限切れ（`DeadlineExceeded`）を先に確定させ、保留を解いた後の巻き戻しの解放が
+/// 期限で打ち切られることを照合する。
 #[tokio::test]
 async fn cri2_repair5_3142_create_rollback_release_is_bounded() {
     let h = harness();
     h.runtime.delete_ok.store(true, Ordering::SeqCst);
     h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
     h.bundles.slow_release_ms.store(5_000, Ordering::SeqCst);
     let bundles = h.bundles.clone();
     let service = h.service.with_runtime_timeout(Duration::from_millis(300));
@@ -2208,6 +2214,8 @@ async fn cri2_repair5_3142_create_rollback_release_is_bounded() {
     let err = create(&service, &sb, "c").await.expect_err("create");
     assert_eq!(err.code(), Code::DeadlineExceeded);
     assert!(started.elapsed() < Duration::from_millis(900));
+    // 保留を解く。prepare が失敗し、巻き戻しの解放が期限（Drop の開始から 300ms）で打ち切られる。
+    bundles.hold_prepare.store(false, Ordering::SeqCst);
     wait_cuts(&bundles, 1, Duration::from_millis(600)).await;
     // 結果不明として記録が残る。
     let mut id = None;

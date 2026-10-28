@@ -446,3 +446,4 @@ pod の期限で `unpersist_sandbox` に入れなかったときも、sandbox �
 - core の delete の区間（外部プロセスとファイル I/O）と記録ストアの fsync の停止は打ち切らない
 - 起動時の `release_stale_creates` は `call_with_deadline` で release を切り離す方式のまま（`release_bounded` への移行は別 issue）
 - `network_owned` の埋め込みの Stop の経路で期限が効くことの専用試験は無い（各段が同じ `step_within` を通る）
+- Create の RPC の期限と巻き戻しの解放の期限は同じ `runtime_timeout` のため、prepare が即座に失敗し解放が期限まで掛かると、RPC が返すコード（`DEADLINE_EXCEEDED` か prepare のコード）はタイマー粒度の競争で決まる（macOS・Windows で後者になる）。どちらでも記録は Unknown で残り RemoveContainer で回収できる。試験は prepare を保留して RPC の期限切れを先に確定させる（#3257・CRI-2・REPAIR-5）。製品側でコードを決定的にするかは未判断

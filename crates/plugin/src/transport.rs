@@ -67,7 +67,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audit::PeerAuthObserver;
 use crate::error::{PluginError, PluginErrorCode};
@@ -185,6 +185,12 @@ impl UdsListener {
     /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
     /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
+        Self::bind_before(path, Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT)
+    }
+
+    /// [`Self::bind`] の、`spawn_gate` の待ちを `deadline` までに限る版（期限切れは `Timeout`。REPAIR-5）。
+    /// 都度起動の合計期限の内側から呼ばれる（`lifecycle`）。
+    pub(crate) fn bind_before(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
         if path
@@ -199,7 +205,7 @@ impl UdsListener {
         let abs = std::path::absolute(path).map_err(|_| {
             PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
         })?;
-        let inner = imp::ListenerInner::bind(&abs)?;
+        let inner = imp::ListenerInner::bind(&abs, deadline)?;
         Ok(Self { inner })
     }
 
@@ -751,7 +757,7 @@ mod imp {
 
     impl ListenerInner {
         /// `path` は `..` を含まない絶対パス（`UdsListener::bind` が検証・変換済み）。
-        pub(super) fn bind(path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
             let euid = sys::effective_uid();
             let (dir, canonical) = open_parent_dir(path, euid)?;
             let file_name = path.file_name().ok_or_else(|| {
@@ -775,11 +781,8 @@ mod imp {
             crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
             // macOS の std は socket の close-on-exec を作成後に立てるため、並行する spawn と排他にする
             // （別 plugin の子へ listener が漏れない。`spawn_gate`。PLUG-12・SEC-1・#3139）。
-            let listener = crate::spawn_gate::create_fds(
-                Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
-                || UnixListener::bind(&target),
-            )
-            .map_err(|e| map_bind_error(e.kind()))?;
+            let listener = crate::spawn_gate::create_fds(deadline, || UnixListener::bind(&target))
+                .map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name).ok();
             let inner = Self {
@@ -1525,7 +1528,7 @@ mod imp {
     pub(super) enum StreamInner {}
 
     impl ListenerInner {
-        pub(super) fn bind(_path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(_path: &Path, _deadline: Instant) -> Result<Self, PluginError> {
             Err(PluginError::new(
                 PluginErrorCode::Unimplemented,
                 "unix domain socket listener is not supported on this platform",

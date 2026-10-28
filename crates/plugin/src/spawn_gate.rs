@@ -93,6 +93,10 @@ pub(crate) fn create_fds<T>(deadline: Instant, f: impl FnOnce() -> io::Result<T>
 /// ゲートの取得は `deadline` まで（超えたら `ErrorKind::TimedOut`）。
 pub(crate) fn spawn(deadline: Instant, cmd: &mut Command) -> io::Result<Child> {
     let _guard = write_until(deadline)?;
+    // 期限後は子を作らない（待ちの途中で期限を過ぎた場合を含む。REPAIR-5）。
+    if Instant::now() >= deadline {
+        return Err(gate_timeout());
+    }
     cmd.spawn()
 }
 
@@ -308,6 +312,20 @@ mod tests {
 
     /// REPAIR-5・PLUG-7・#3139: ゲートを他スレッドが保持している間、取得は期限で `TimedOut` になる
     /// （書き込み側 spawn が止まっても生成側が無期限に待たず、生成側が保持していても spawn が待たない）。
+    /// REPAIR-5: 期限を過ぎていれば（ゲートが空いていても）子を spawn しない。
+    #[test]
+    fn repair5_spawn_after_deadline_does_not_spawn() {
+        let marker =
+            std::env::temp_dir().join(format!("spawn_gate_expired_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("touch \"$1\"").arg("sh").arg(&marker);
+        let e = spawn(Instant::now() - Duration::from_millis(1), &mut cmd).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!marker.exists());
+    }
+
     #[test]
     fn repair5_spawn_gate_acquisition_times_out_at_deadline() {
         let (held_tx, held_rx) = mpsc::channel::<()>();

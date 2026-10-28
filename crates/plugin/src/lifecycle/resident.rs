@@ -55,7 +55,7 @@ use super::{
     ChildGuard, PLUGIN_EXIT_TIMEOUT, PLUGIN_STDERR_DRAIN_TIMEOUT, PluginLaunchSpec, PluginStderr,
     PluginTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error,
     launch_spawn_error, plugin_command, rpc_timeout, spawn_registered, stderr_channel,
-    unreaped_error, with_group_kill_failure,
+    stderr_prepare_error, unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -338,32 +338,25 @@ impl ResidentPlugin {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let listener = UdsListener::bind(&plugin.socket_dir.join(name))?;
+        let listener = UdsListener::bind_before(&plugin.socket_dir.join(name), deadline)?;
 
-        let (child_stderr, reader) = stderr_channel().map_err(|_| {
-            PluginError::new(
-                PluginErrorCode::Internal,
-                "failed to prepare capturing plugin stderr",
-            )
-        })?;
+        let (child_stderr, reader) = stderr_channel(deadline)
+            .map_err(|e| stderr_prepare_error(&e, "failed to prepare capturing plugin stderr"))?;
         // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
         let mut guard = {
             // spawn 前の失敗なので子は存在しない。
             let mut cmd = plugin_command(plugin, listener.path(), child_stderr)?;
-            spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)?
+            spawn_registered(&mut cmd, registry, deadline).map_err(launch_spawn_error)?
         };
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
-        let capture = match StderrCapture::attach(reader) {
+        let capture = match StderrCapture::attach(reader, deadline) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
                 drop(listener);
                 return Err(reap_after_failure(
                     &mut guard,
-                    PluginError::new(
-                        PluginErrorCode::Internal,
-                        "failed to start capturing plugin stderr",
-                    ),
+                    stderr_prepare_error(&e, "failed to start capturing plugin stderr"),
                 ));
             }
         };

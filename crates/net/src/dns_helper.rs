@@ -32,7 +32,8 @@
 //! 登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
 //! [`MAX_INFLIGHT_DEFERRED`] 件のワーカー（[`HandlerOutcome::Defer`]）で行い、上流の応答待ちで他のクエリを
 //! 待たせない。TCP 再試行（TC=1 応答）は未対応。
-//! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
+//! DNS ヘルパーは plugin 側（`NetworkPlugin` の実装）が起動し、`crates/net` は core 側のライブラリである
+//! （PLUG-1。2026-10-12 のオーナー決定・`docs/design/network-wiring.md` の前提）。
 //!
 //! # 実機計測（TASK-141.3・#323）
 //! 正答率・レイテンシ・常駐 PSS の実機計測は `crates/net/tests/dns_helper_privileged.rs` の `--measure` モードと

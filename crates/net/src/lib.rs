@@ -23,6 +23,7 @@
 //! pasta（rootless のユーザー定義ネットワークの外部ヘルパー）のバイナリの探索と検証（`pasta`。絶対パス・所有者・権限・版数。
 //! 検証済みの型 `pasta::binary::PastaBinary` と opt-in の `PATH` 探索、`--version` の解釈。NET-9・PLUG-11・#1936）と、
 //! ポート公開指定の検証と引数配列への変換（`pasta::port_forward`。OS 非依存。NET-9・#1937）も持つ。
+//! ネットワーク定義の状態ストア（`network_store`。`@networks`・FCNET1・ロック・権限・上限。Linux のみ。NET-6・CORE-1・REPAIR-5・#3059。メンバー記録・IPAM は #3067）も持つ。
 //! pasta の起動・監視・回収は supervisor（core 側）が `crates/net` の関数で行う。DNS ヘルパー（NET-5）は
 //! plugin 側の `NetworkPlugin` の実装が起動する（PLUG-1 の区分。2026-10-12 のオーナー決定・#4。`docs/design/rootless-network.md` 12 章）。
 
@@ -73,6 +74,7 @@ pub mod netlink_route;
 pub mod netns;
 pub mod network;
 pub mod network_mode;
+pub mod network_store;
 pub mod nftables_batch;
 pub mod nftables_rules;
 pub mod pasta;

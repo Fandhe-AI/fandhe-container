@@ -210,7 +210,7 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - 使うのはコンテナを作る subcommand（`create`。stack の up が入ったらそれも）で、rootless のインストールかつユーザー定義名の `--network` のときだけ。それ以外で指定したら `InvalidArgument`（効かない指定を黙って受けない）
   - rootless のユーザー定義名でどちらも無い場合は `FailedPrecondition`（固定文言 `pasta path is not configured`）。既定のパスは持たない（12.15）
   - 作成時: CLI が #1936 の検証関数で解決・検証し、FCOPT1（D4）に kind `pasta` を 1 レコード書く（上限 4 KiB）。値は、絶対パス（UTF-8・制御文字なし・3072 バイト以下。識別情報・版の日付・符号化の枠を 4 KiB のレコード内に収める余裕を確保するための上限で、超えるパスは作成時に解決段階で `invalid-argument` 相当の構造化エラーで拒否し、切り詰めない）、fd の `fstat` から得る識別（dev・ino・size・mtime・ctime〔ns〕・uid・mode）、解釈した版の日付
-  - 起動時: supervisor が文書を復号するたびに未信頼の入力として再検証する。パスを同じ規則で辿り直して識別を記録と照合し、`--version` も実行し直して照合する。不一致は `FailedPrecondition` とし、監査ログ（SEC-4）に「作成から起動までの間にバイナリが替わった」を記録する
+  - 起動時: supervisor が文書を復号するたびに未信頼の入力として再検証する。パスを同じ規則で辿り直し、得た正規パスと識別（dev・ino・size・mtime・ctime・uid・mode）を **`--version` の実行より前に**記録と照合する（不一致なら子を実行せず固定の変更エラーで返し、版のエラーに埋もれさせない）。一致したときだけ `--version` を実行し直して版を照合する。不一致は `FailedPrecondition` とし、監査ログ（SEC-4）に「作成から起動までの間にバイナリが替わった」を記録する
   - 実行は検証したパスで行い、`argv[0]` は常に `pasta` に固定する（12.7）
   - 版の固定は 12.12
 - **理由**: 特権ランチャーの `sanitize_env` は環境を許可リストで作り直し、supervisor は契約の値を環境から読まず、argv は `StartArgs::parse` で固定されている。どちらも変えずに済む経路は既存の文書 FCOPT1 だけである（[container-options-delivery.md](container-options-delivery.md) の却下理由と同じ）。`--plugin-path-search` とは信頼の対象が違うので opt-in は別のフラグにする

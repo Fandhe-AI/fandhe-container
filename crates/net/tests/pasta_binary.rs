@@ -51,6 +51,21 @@ mod linux {
         };
         match mode {
             "ok" => line(GOOD),
+            // 実行回数を数える（親ディレクトリの `runs` へ 1 バイト追記）。出力は GOOD。
+            "count" => {
+                let dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(Path::to_path_buf));
+                if let Some(dir) = dir
+                    && let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("runs"))
+                {
+                    let _ = f.write_all(b"x");
+                }
+                line(GOOD);
+            }
             "old" => line("pasta 0.0~git20260119.386b5f5-1\n"),
             "empty" => {}
             "huge" => line(&"x".repeat(5000)),
@@ -319,6 +334,37 @@ mod linux {
             (e.code(), e.message()),
             (C::FailedPrecondition, MSG_RECORD_CHANGED),
             "別 inode への置き換え"
+        );
+        // 識別の照合は `--version` の実行より前（NET-9・SEC-4・#3251）: 別 inode への置き換えは版のエラーではなく
+        // 固定の変更エラーで返り、置き換えたバイナリは実行されない（実行回数で照合）。
+        let counted = place_exe(base, "count", 0o755);
+        let runs = counted.parent().expect("dir").join("runs");
+        let rec3 = verify(&counted).expect("rec3").record();
+        assert_eq!(
+            std::fs::read(&runs).expect("runs").len(),
+            1,
+            "作成時の 1 回"
+        );
+        assert_eq!(rec3.reverify_below(anchor).expect("same").record(), rec3);
+        assert_eq!(
+            std::fs::read(&runs).expect("runs").len(),
+            2,
+            "一致なら再検証で 1 回実行"
+        );
+        let swapped = counted.with_file_name("pasta.new");
+        std::fs::copy(std::env::current_exe().expect("exe"), &swapped).expect("copy");
+        std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::rename(&swapped, &counted).expect("rename");
+        let e = rec3.reverify_below(anchor).map(|_| ()).unwrap_err();
+        assert_eq!(
+            (e.code(), e.message()),
+            (C::FailedPrecondition, MSG_RECORD_CHANGED),
+            "別 inode は版の実行前に変更エラー"
+        );
+        assert_eq!(
+            std::fs::read(&runs).expect("runs").len(),
+            2,
+            "不一致では --version を実行しない"
         );
         // 消えたら NotFound（差し替えとは区別する）。
         std::fs::remove_file(&mode_changed).expect("rm");

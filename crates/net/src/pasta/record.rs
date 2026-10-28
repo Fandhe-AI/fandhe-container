@@ -28,7 +28,7 @@ use crate::error::{NetError, NetErrorCode};
 
 #[cfg(test)]
 use super::binary::{MSG_PATH_INVALID, MSG_PATH_TOO_LONG};
-use super::binary::{PastaBinary, check_shape, verify_pasta_binary};
+use super::binary::{PastaBinary, PastaBinaryIdentity, check_shape, verify_gated};
 use super::version::{PASTA_MIN_VERSION_DATE, PastaVersionDate};
 
 /// 本文の最大バイト数（4 KiB。FCOPT1 の 1 レコードの上限）。
@@ -193,18 +193,33 @@ impl PastaRecord {
 
     /// バイナリを検証し直し、記録と一致することを確かめる（起動時。12.4）。
     ///
+    /// 順序は、パスを辿って得た正規パスと識別（dev・ino・size・mtime・ctime・uid・mode）の照合、一致したときだけ
+    /// `--version` の実行、最後に版を含む全項目の照合。識別が違えば子を実行せず固定の変更エラーで返す。
     /// 失敗は `FailedPrecondition`（一致しない）か、辿り直しの失敗（`NotFound`・`PermissionDenied` ほか）。
     /// 副作用は `--version` の子の実行だけ。Linux 以外は `Unimplemented`。
     pub fn reverify(&self) -> Result<PastaBinary, NetError> {
-        self.check(verify_pasta_binary(&self.path)?)
+        let gate = |p: &Path, id: &PastaBinaryIdentity| self.check_identity(p, id);
+        self.check(verify_gated(&self.path, None, &gate)?)
     }
 
     /// 試験専用: [`Self::reverify`] の `anchor` 版（`verify_pasta_binary_below` と同じ緩和）。
     #[cfg(any(test, feature = "pasta-test-support"))]
     pub fn reverify_below(&self, anchor: &Path) -> Result<PastaBinary, NetError> {
-        self.check(super::binary::verify_pasta_binary_below(
-            anchor, &self.path,
-        )?)
+        let gate = |p: &Path, id: &PastaBinaryIdentity| self.check_identity(p, id);
+        self.check(verify_gated(&self.path, Some(anchor), &gate)?)
+    }
+
+    /// 辿って得た正規パスと識別が記録と一致するか（`--version` の実行前の照合）。
+    fn check_identity(&self, path: &Path, id: &PastaBinaryIdentity) -> Result<(), NetError> {
+        let same = path == self.path
+            && (id.dev(), id.ino(), id.size()) == (self.dev, self.ino, self.size)
+            && id.mtime() == self.mtime
+            && id.ctime() == self.ctime
+            && (id.uid(), id.mode()) == (self.uid, self.mode);
+        if !same {
+            return Err(err(NetErrorCode::FailedPrecondition, MSG_RECORD_CHANGED));
+        }
+        Ok(())
     }
 
     /// 辿り直した結果の記録（正規パス・識別・版）が、保存した記録と全項目一致するか。

@@ -138,8 +138,8 @@
 //!
 //! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
 //! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
-//! 起動が `FailedPrecondition`（メッセージ `the network namespace of the container init does not match the requested network
-//! mode`）で拒否され、監査 sink に段 `netns_verify`・理由 `netns_identity_mismatch` の記録が 1 件残り、状態が Created のまま
+//! 起動が `FailedPrecondition`（メッセージは launcher の固定文言 `container launch failed in the NetnsVerify stage`。違反の理由は
+//! 監査記録が担う）で拒否され、監査 sink に段 `netns_verify`・理由 `netns_identity_mismatch` の記録が 1 件残り、状態が Created のまま
 //! 子が残らないことを照合する。成功行は `production_launcher: network host netns sync accepted; forged baseline rejected
 //! with audit and no process (scenario=Z)`。Loopback の拒否は実機で作れない（子の netns は起動の時点まで未知）ため、
 //! `judge` と立て替えの PID 1 を使う単体試験が受け持つ。
@@ -3051,9 +3051,10 @@ mod linux {
             "{}",
             err.message()
         );
+        // launcher は ExecError を段名だけの固定文言へ写す(`to_trait_error`)。理由は下の監査記録で照合する。
         assert_eq!(
             err.message(),
-            "the network namespace of the container init does not match the requested network mode"
+            "container launch failed in the NetnsVerify stage"
         );
         assert_eq!(state_of(&env.store, &id), ContainerState::Created);
         let records = reject_sink

@@ -10,7 +10,6 @@
 //! - 待ちはすべて期限つき（REPAIR-5）。後始末に失敗したら記録を残して報告し、黙って捨てない
 //! - エラー文言に pid・ネットワーク名・アドレスを含めない
 
-use std::io::Write as _;
 use std::net::SocketAddrV4;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -30,11 +29,15 @@ use crate::dns_helper::identity::{
 use crate::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
 use crate::dns_helper::{
     DnsListenAddr, READY_LINE_MAX, check_timeout, kill_reap_or_detach, map_io, parse_ready,
+    write_atomic, write_stdout_line_atomic,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
 use crate::network_store::NetworkLockGuard;
 use crate::sys::{self, Deadline, Readiness, SysError, process};
+
+// 識別行の上限は、原子的な 1 回の書き込みの範囲（改行込み）に収まる。
+const _: () = assert!(IDENT_LINE_MAX < crate::dns_helper::PIPE_ATOMIC_MAX);
 
 /// `/proc/<pid>/cmdline` の読み込み上限。
 const CMDLINE_MAX_BYTES: usize = 4096;
@@ -352,7 +355,7 @@ fn spawn_inner(
 
     // 記録を確定した後で ack を返す。ここから先の失敗は、プロセスを pidfd 経由で止めて確認してから記録を消す。
     let acked = match stdin {
-        Some(mut s) => s.write_all(ACK).and_then(|()| s.flush()).is_ok(),
+        Some(mut s) => write_atomic(&mut s, ACK).is_ok(),
         None => false,
     };
     let result = if acked {
@@ -851,10 +854,7 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
         .map_err(|e| map_io("spawn dns helper stage 2", &e))?;
     // 段 2 の pid を起動元へ知らせる（識別行の前に段 2 が止まっても、起動元が pidfd で回収できる）。
     // 書けなくても起動は続ける（起動元は識別行の期限で失敗にし、意図記録を残す）。
-    {
-        let mut out = std::io::stdout();
-        let _ = writeln!(out, "{SPAWN_PREFIX}{}", child.id()).and_then(|()| out.flush());
-    }
+    let _ = write_stdout_line_atomic(&format!("{SPAWN_PREFIX}{}", child.id()));
     // 段 2 は待たない。段 1 の終了で init か subreaper の子になり、そこで回収される（二重 fork と同じ形）。
     #[allow(clippy::zombie_processes)]
     drop(child);
@@ -865,14 +865,15 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
 /// 期限切れ・EOF・不一致は失敗（呼び出し元は bind せずに終了する。D14 (ii)）。
 pub(crate) fn run_stage2_handshake(nonce: &HelperNonce) -> Result<(), NetError> {
     let me = identity::read_self_identity()?;
-    let mut stdout = std::io::stdout();
-    writeln!(
-        stdout,
+    let line = format!(
         "{IDENT_PREFIX}{} {} {} {}",
         me.pid, me.start_time_ticks, me.boot_id, nonce
-    )
-    .and_then(|()| stdout.flush())
-    .map_err(|_| err(NetErrorCode::Internal, "cannot write identity line"))?;
+    );
+    if line.len() > IDENT_LINE_MAX {
+        return Err(err(NetErrorCode::Internal, "identity line is too long"));
+    }
+    write_stdout_line_atomic(&line)
+        .map_err(|_| err(NetErrorCode::Internal, "cannot write identity line"))?;
     let stdin = std::io::stdin();
     read_ack_within(&mut stdin.lock(), &Deadline::after(DNS_HELPER_ACK_TIMEOUT))
 }
@@ -931,6 +932,7 @@ fn read_ack_within<R: std::io::Read + std::os::fd::AsFd>(
 #[cfg(test)]
 mod ack_tests {
     use super::*;
+    use std::io::Write as _;
     use std::os::unix::net::UnixStream;
 
     /// REPAIR-5: ACK の一部だけ届いて止まっても期限で Timeout になる。
@@ -1124,5 +1126,18 @@ mod ack_tests {
         assert!(std::path::Path::new(&proc_stat).exists(), "zombie before");
         assert!(reap_if_exited(pidfd.as_fd()));
         assert!(!std::path::Path::new(&proc_stat).exists(), "reaped");
+    }
+
+    /// REPAIR-2・NET-5: 段 2 が送る識別行は読み側の上限に収まり、原子的に書ける長さである。
+    #[test]
+    fn net5_3070_identity_line_fits_atomic_write() {
+        let me = identity::read_self_identity().expect("identity");
+        let nonce = HelperNonce::generate().expect("nonce");
+        let line = format!(
+            "{IDENT_PREFIX}{} {} {} {}",
+            me.pid, me.start_time_ticks, me.boot_id, nonce
+        );
+        assert!(line.len() <= IDENT_LINE_MAX, "{}", line.len());
+        assert!(line.len() < crate::dns_helper::PIPE_ATOMIC_MAX);
     }
 }

@@ -1185,11 +1185,7 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut stdout = io::stdout();
-    if writeln!(stdout, "{READY_PREFIX}{}", server.local_addr())
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if write_stdout_line_atomic(&format!("{READY_PREFIX}{}", server.local_addr())).is_err() {
         fail_line("INTERNAL", "cannot write readiness line");
         return ExitCode::from(1);
     }
@@ -1317,6 +1313,59 @@ impl Drop for DnsHelperProcess {
         if let Some(child) = self.child.take() {
             let _ = kill_reap_or_detach(child, REAP_TIMEOUT_DEFAULT);
         }
+    }
+}
+
+/// pipe への 1 回の `write(2)` が他の書き手と混ざらない上限（Linux の `PIPE_BUF`）。
+/// 切り離し起動では、段 1 の `SPAWN` 行・段 2 の識別行と準備完了行が同じ pipe に並行して書かれるため、
+/// 各行は改行込みでこの長さ以下の 1 回の書き込みにする（行の途中に別プロセスの出力が入らない。NET-5・REPAIR-2）。
+pub(crate) const PIPE_ATOMIC_MAX: usize = 4096;
+
+// 読み側の行の上限は、書き込みの原子性の上限（改行を含む）に収まる。
+const _: () = assert!(READY_LINE_MAX < PIPE_ATOMIC_MAX);
+
+/// `bytes` を 1 回の `write` で送る。`PIPE_ATOMIC_MAX` 超は書かずに `InvalidInput`、短い書き込みは
+/// `WriteFailed` 扱いの `Other`（`write_all` のように続きを別の write で送ると他の書き手と混ざるため）。
+/// `Interrupted`（何も書いていない）だけ再試行する。
+pub(crate) fn write_atomic(w: &mut impl io::Write, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > PIPE_ATOMIC_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message length is outside the atomic pipe write range",
+        ));
+    }
+    loop {
+        match w.write(bytes) {
+            Ok(n) if n == bytes.len() => return Ok(()),
+            Ok(_) => return Err(io::Error::other("short write")),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `line` に改行を付けた 1 件を [`write_atomic`] で送る。
+pub(crate) fn write_line_atomic(w: &mut impl io::Write, line: &str) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    write_atomic(w, &buf)
+}
+
+/// 標準出力へ 1 行を単一の `write(2)` で送る。Unix では fd 1 を複製した `File` へ直接書く
+/// （`Stdout` の行バッファ経由だと分割されうるため）。
+pub(crate) fn write_stdout_line_atomic(line: &str) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        let mut f = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
+        write_line_atomic(&mut f, line)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut out = io::stdout();
+        write_line_atomic(&mut out, line)?;
+        out.flush()
     }
 }
 
@@ -1974,5 +2023,67 @@ mod tests {
             assert_eq!(got[1].get(3), Some(&5));
         });
         assert_eq!(server.stats().answered, 2);
+    }
+
+    /// 書き込みごとに受け付ける長さを制限する書き手 (短い書き込みの模擬)。
+    struct Limited {
+        max: usize,
+        calls: usize,
+        got: Vec<u8>,
+    }
+    impl io::Write for Limited {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let n = b.len().min(self.max);
+            self.got.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// NET-5・REPAIR-2: 1 行は改行込みの 1 回の write で送る。
+    #[test]
+    fn net5_3070_write_line_atomic_single_write() {
+        let mut w = Limited {
+            max: usize::MAX,
+            calls: 0,
+            got: Vec::new(),
+        };
+        write_line_atomic(&mut w, "READY 127.0.0.1:53").expect("write");
+        assert_eq!(w.calls, 1);
+        assert_eq!(w.got, b"READY 127.0.0.1:53\n");
+    }
+
+    /// 短い書き込みは続きを送らず失敗にする (他の書き手と混ざらない)。
+    #[test]
+    fn net5_3070_write_line_atomic_short_write_fails() {
+        let mut w = Limited {
+            max: 5,
+            calls: 0,
+            got: Vec::new(),
+        };
+        let e = write_line_atomic(&mut w, "READY 127.0.0.1:53").expect_err("short");
+        assert_eq!(e.to_string(), "short write");
+        assert_eq!(w.calls, 1);
+        assert_eq!(w.got, b"READY");
+    }
+
+    /// PIPE_BUF 以下までは書け、超えると何も書かずに InvalidInput。
+    #[test]
+    fn net5_3070_write_atomic_length_bounds() {
+        let mut w = Limited {
+            max: usize::MAX,
+            calls: 0,
+            got: Vec::new(),
+        };
+        write_atomic(&mut w, &vec![b'a'; PIPE_ATOMIC_MAX]).expect("max");
+        assert_eq!(w.got.len(), 4096);
+        let e = write_atomic(&mut w, &vec![b'a'; PIPE_ATOMIC_MAX + 1]).expect_err("over");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = write_atomic(&mut w, &[]).expect_err("empty");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.calls, 1);
     }
 }

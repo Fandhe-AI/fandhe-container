@@ -50,13 +50,23 @@ fn sys_fail(e: SysError, message: &'static str) -> Fail {
     Fail::new(classify(e), message)
 }
 
+/// 失敗行を stderr へ出す。読み手が止まって pipe が満杯でも終了を妨げないよう、書き込みは別スレッドで行い
+/// 期限（`FAIL_LINE_TIMEOUT`）で見切る（REPAIR-5）。見切った場合、ブロック中のスレッドはプロセス終了で消える。
+/// 失敗経路でだけ呼ぶ（`setns` を終えた後か、参加できずに終了する経路）ため、単一スレッド前提を壊さない。
 fn fail_line(code: NetErrorCode, message: &str) {
-    let _ = writeln!(
-        std::io::stderr(),
-        "error code={} message={message}",
-        code.as_str()
-    );
+    let line = format!("error code={} message={message}\n", code.as_str());
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        let _ = tx.send(());
+    });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(FAIL_LINE_TIMEOUT);
+    }
 }
+
+/// `fail_line` の書き込みを待つ上限。
+const FAIL_LINE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 親が存在し、stdin の socketpair の作成者（`SO_PEERCRED` の pid）と一致することを確かめる。
 /// 親が先に死ぬと `getppid` は 1 かサブリーパーに変わり不一致になる（PDEATHSIG の設定前に死んだ場合の備え）。
@@ -252,6 +262,11 @@ fn wait_for_stop(fd: BorrowedFd<'_>) -> Result<(), Fail> {
 
 /// `run_netns_holder_main` の本体（`crate::netns_holder` から委譲される）。
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
+    // 継承 fd（3 以上）を最初に閉じる。dumpable な holder に残さない（SEC-1）。閉じられなければ起動を拒否する。
+    if let Err(e) = sysh::close_inherited_fds() {
+        fail_line(classify(e), "cannot close inherited descriptors");
+        return ExitCode::from(1);
+    }
     if args.count() != 0 {
         fail_line(
             NetErrorCode::InvalidArgument,

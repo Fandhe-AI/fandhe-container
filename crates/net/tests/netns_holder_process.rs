@@ -248,8 +248,55 @@ mod linux {
             stderr_line("FAILED_PRECONDITION", "stdin is not a seqpacket socket")
         );
 
+        inherited_fds_closed();
         pdeath();
         println!("{OK_LINE}");
+    }
+
+    /// 継承した fd（3 以上）は holder の起動直後に閉じられ、`/proc/<holder>/fd` には 0〜2 だけが残る
+    /// （SEC-1・NET-9）。シェルが CLOEXEC なしの fd 3 を開いたまま holder を exec する。
+    fn inherited_fds_closed() {
+        let (ch, child_end) = NetnsHolderChannel::pair().expect("pair");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 3</dev/null 4</dev/null; echo ready >&2; exec \"$0\" netns-holder")
+            .arg(exe())
+            .env_clear()
+            .stdin(Stdio::from(child_end))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        // fd 3・4 を開いた後に出る合図を待ってから観測する（開く前の 0〜2 だけの状態を誤って合格にしない）。
+        let mut stderr = child.stderr.take().expect("stderr");
+        let mut ready = [0u8; 6];
+        stderr.read_exact(&mut ready).expect("ready marker");
+        assert_eq!(&ready, b"ready\n");
+        let dir = format!("/proc/{}/fd", child.id());
+        let deadline = Instant::now() + limit();
+        // exec 後の holder が fd を閉じ終えるまで観測を繰り返し、0〜2 だけになることを確かめる。
+        let observed = loop {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            if names == ["0", "1", "2"] || Instant::now() >= deadline {
+                break names;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(ch);
+        assert_eq!(
+            observed,
+            ["0", "1", "2"],
+            "holder kept inherited descriptors"
+        );
     }
 
     /// 親（socketpair の作成者）が死んだら、端が別プロセスに残っていても holder は EOF を待たずに消える

@@ -50,6 +50,8 @@ mod consts {
     pub const EPIPE: i32 = 32;
     /// `capset(2)` のシステムコール番号（arch/x86/entry/syscalls/syscall_64.tbl）。
     pub const SYS_CAPSET: core::ffi::c_long = 126;
+    /// `close_range(2)` のシステムコール番号（syscall_64.tbl。Linux 5.9 以上）。
+    pub const SYS_CLOSE_RANGE: core::ffi::c_long = 436;
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 }
 
@@ -76,6 +78,8 @@ mod consts {
     pub const EPIPE: i32 = 32;
     /// `capset(2)` のシステムコール番号（include/uapi/asm-generic/unistd.h）。
     pub const SYS_CAPSET: core::ffi::c_long = 91;
+    /// `close_range(2)` のシステムコール番号（asm-generic/unistd.h。Linux 5.9 以上）。
+    pub const SYS_CLOSE_RANGE: core::ffi::c_long = 436;
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 }
 
@@ -104,6 +108,7 @@ mod consts {
     pub const ENOTSOCK: i32 = -1;
     pub const EPIPE: i32 = -2;
     pub const SYS_CAPSET: core::ffi::c_long = 0;
+    pub const SYS_CLOSE_RANGE: core::ffi::c_long = 0;
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0;
 }
 
@@ -534,6 +539,26 @@ pub(crate) fn get_dumpable() -> Result<i32, SysError> {
     prctl_value(consts::PR_GET_DUMPABLE, 0)
 }
 
+/// 継承した fd 3 以上をすべて閉じる（`close_range(3, u32::MAX, 0)`）。dumpable な holder に親から継承した
+/// fd が残ると、同じ uid が `/proc/<holder>/fd` 経由で触れてしまうため（SEC-1・NET-9）。失敗（`ENOSYS` を含む）は
+/// 呼び出し側が起動拒否にする。stdin / stdout / stderr（0〜2）は閉じない。
+pub(crate) fn close_inherited_fds() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `close_range(first, last, flags)` は整数引数のみを取りメモリを参照しない。fd 3 以上を閉じるだけで、
+    // この関数の呼び出し時点で holder は他の fd を所有していない（呼び出しは起動直後の run の先頭）。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            3 as core::ffi::c_ulong,
+            u32::MAX as core::ffi::c_ulong,
+            0 as core::ffi::c_ulong,
+        )
+    };
+    if rc < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `PR_SET_NO_NEW_PRIVS` を 1 にする（不可逆）。
 pub(crate) fn set_no_new_privs() -> Result<(), SysError> {
     if !consts::SUPPORTED {
@@ -703,6 +728,7 @@ mod libc_abi {
         assert!(consts::ENOTSOCK == libc::ENOTSOCK);
         assert!(consts::EPIPE == libc::EPIPE);
         assert!(consts::SYS_CAPSET == libc::SYS_capset);
+        assert!(consts::SYS_CLOSE_RANGE == libc::SYS_close_range);
     };
 
     const _: () = {

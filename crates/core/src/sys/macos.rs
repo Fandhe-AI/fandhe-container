@@ -642,6 +642,26 @@ pub(crate) mod plugin_fs {
         }
 
         /// 期限つきで `chmod +a` を実行する（REPAIR-5。超過時は kill して回収し失敗させる）。
+        /// 子プロセスを 10 秒の期限つきで待つ。超過時は kill し、回収も 5 秒で打ち切って panic する（REPAIR-5）。
+        fn wait_child_limited(child: &mut std::process::Child, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(st) = child.try_wait().expect("try_wait") {
+                    assert!(st.success(), "{what} failed: {st}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let reap = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < reap && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    panic!("{what} timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         fn add_acl(path: &Path) {
             let mut child = Command::new("chmod")
                 .arg("+a")
@@ -650,19 +670,7 @@ pub(crate) mod plugin_fs {
                 .stdin(Stdio::null())
                 .spawn()
                 .expect("spawn chmod");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(st) = child.try_wait().expect("try_wait") {
-                    assert!(st.success(), "chmod +a failed: {st}");
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("chmod +a timed out");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            wait_child_limited(&mut child, "chmod +a");
         }
 
         #[test]
@@ -775,19 +783,7 @@ pub(crate) mod plugin_fs {
                 .stdin(Stdio::null())
                 .spawn()
                 .expect("spawn mkfifo");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(st) = child.try_wait().expect("try_wait") {
-                    assert!(st.success(), "mkfifo failed: {st}");
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("mkfifo timed out");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            wait_child_limited(&mut child, "mkfifo");
         }
 
         #[test]

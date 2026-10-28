@@ -280,12 +280,9 @@ fn verify_with_deadline(
 fn plug11_3096_rejects_unreadable_fifo_without_open() {
     let tmp = Tmp::new("fifo");
     let fifo = tmp.0.join(NAME);
-    let st = Command::new("mkfifo")
-        .arg(&fifo)
-        .stdin(Stdio::null())
-        .status()
-        .expect("mkfifo");
-    assert!(st.success());
+    let mut cmd = Command::new("mkfifo");
+    cmd.arg(&fifo);
+    run_limited(cmd);
     chmod(&fifo, 0o000);
     let err = verify_with_deadline(&tmp.0, NAME).expect_err("reject");
     assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);

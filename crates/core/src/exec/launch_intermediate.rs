@@ -35,6 +35,14 @@
 //! 起動失敗として観測する(従来は PID 1 の終了として観測していた。具体的な原因は PID 1 の stderr に残る)。
 //! 応答ループは #2025。本番の filter は当面 ERRNO 版のため通知は生じない。
 //!
+//! # netns の素性の同期点(NET-6・SEC-1・SEC-4・#3206。`docs/design/network-wiring.md` D8)
+//!
+//! `IntermediateSpec::netns_sync` が `Some`(`network_mode=host` / `loopback` の起動)なら、C は fork の前に基準(自分の netns の
+//! (dev, ino))を取り、listener 用とは別の socketpair を作る。PID 1 は開始ゲートの通過後・`child_main` の前に自分の netns を
+//! 送って ACK を待ち、C は中間プロセスの回収後・状態 `P` の判定の前に受信して期待と照合する([`super::netns_sync`])。不一致・
+//! 形式違反は層 `mount` に 1 件記録し、EOF・期限切れを含むどの失敗でも PID 1 を回収して起動失敗(fail-closed)。
+//! C の端は I で閉じるので、C が死ぬと PID 1 は EOF で exec せずに終わる。
+//!
 //! # 報告 pipe のワイヤー形式(REPAIR-2。ASCII 1 行・LF 終端・最大 [`REPORT_MAX_BYTES`] バイト)
 //!
 //! ```text
@@ -82,6 +90,10 @@ use super::launch_status::{
     read_exec_phase_until_close, read_line_bounded, read_mount_identity_block,
     read_pre_pivot_status, read_pre_pivot_status_leaving_tail, resolve_exec_phase_status,
     resolve_pre_pivot_status,
+};
+use super::netns_sync::{
+    NETNS_SYNC_ACK_TIMEOUT, NetnsCheck, NetnsSyncRequest, NetnsSyncSender, capture_baseline,
+    netns_socketpair, receive_and_verify,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
@@ -423,6 +435,8 @@ struct RealIntermediateOps<'a> {
     gate_r: &'a std::fs::File,
     /// seccomp の listener を C へ渡す socketpair の子の端(借用。PID 1 は複製を `Seccomp` 段へ渡す。SEC-4・#2024)。
     listener_end: &'a OwnedFd,
+    /// netns の素性の同期点の socketpair の子の端(同期点を通す起動だけ `Some`。PID 1 は複製を使う。NET-6・#3206)。
+    netns_end: Option<&'a OwnedFd>,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -464,6 +478,15 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         })?)
         .with_delivery(delivery);
         let stages = stages.with_listener_sender(sender);
+        // netns の同期点の口。複製できなければ PID 1 を作らずに失敗させる(同期点を飛ばして走らせない。fail-closed。#3206)。
+        let netns_sender = self
+            .netns_end
+            .map(|end| {
+                end.try_clone().map(NetnsSyncSender::new).map_err(|e| {
+                    ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the netns socket")
+                })
+            })
+            .transpose()?;
         let gate_r = self.gate_r;
         let report_fd = self.report.as_raw_fd();
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
@@ -478,10 +501,19 @@ impl IntermediateOps for RealIntermediateOps<'_> {
                 if close_inherited(report_fd).is_err() {
                     return EXIT_SETUP_FAILED;
                 }
-                match await_start_gate(gate_r, START_GATE_TIMEOUT) {
-                    Ok(()) => child_main(rootfs, entry, stages, Some(setup), stdio),
-                    Err(_) => EXIT_SETUP_FAILED,
+                if await_start_gate(gate_r, START_GATE_TIMEOUT).is_err() {
+                    return EXIT_SETUP_FAILED;
                 }
+                // exec 直前の同期点(NET-6・SEC-1・#3206): pivot と資格情報の切り替え(`CapabilityDrop` 段)より前に、
+                // 自分の netns を C へ渡して検証済みの ACK を待つ。ACK が無ければ(EOF・期限切れ・拒否)exec しない。
+                if let Some(sender) = netns_sender
+                    && sender
+                        .hand_over_current_netns(NETNS_SYNC_ACK_TIMEOUT)
+                        .is_err()
+                {
+                    return EXIT_SETUP_FAILED;
+                }
+                child_main(rootfs, entry, stages, Some(setup), stdio)
             },
             EXIT_SETUP_FAILED,
         )
@@ -521,6 +553,9 @@ pub(crate) struct IntermediateSpec<'a> {
     pub(crate) entry: &'a Entrypoint,
     /// pivot 前段の指定。`status` は本入口が上書きする。
     pub(crate) setup: PrePivotSetup<'a>,
+    /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は通さない。
+    /// NET-6・SEC-1・#3206。`docs/design/network-wiring.md` D8)。
+    pub(crate) netns_sync: Option<NetnsSyncRequest>,
 }
 
 /// 中間プロセス経由でコンテナの PID 1 を起動する(本番 launcher の唯一の起動入口。#1816)。
@@ -558,13 +593,32 @@ pub(crate) fn spawn_container_via_intermediate(
         rootfs,
         entry,
         setup,
+        netns_sync,
     } = spec;
     let tag = LaunchTag::fresh();
+    // 基準(supervisor 自身の netns)は fork の前に取る。取れなければ子を作らずに拒否する(fail-closed。#3206)。
+    let netns = match netns_sync {
+        None => None,
+        Some(request) => {
+            let baseline = match request.baseline {
+                Some(baseline) => baseline,
+                None => capture_baseline().map_err(|e| {
+                    Box::new(PreparedLaunchFailure::clean(
+                        AuditedRejection::not_applicable(e),
+                    ))
+                })?,
+            };
+            Some(NetnsCheck {
+                expectation: request.expectation,
+                baseline,
+            })
+        }
+    };
     // 子が状態 pipe で返す識別子のブロックの期待列（Mount 由来のルールの位置）。fork の前に ruleset から計算する（#3201）。
     let expected_mounts = stages.mount_rule_positions();
     launch_via_intermediate(
         sys::self_is_single_threaded,
-        |status, report, gate_r, listener_end| {
+        |status, report, gate_r, listener_end, netns_end| {
             let mut ops = RealIntermediateOps {
                 plan,
                 join,
@@ -577,10 +631,12 @@ pub(crate) fn spawn_container_via_intermediate(
                 tag,
                 gate_r,
                 listener_end,
+                netns_end,
             };
             intermediate_body(&mut ops)
         },
         Some(&expected_mounts),
+        netns,
         subreaper,
         audit,
         timeout,
@@ -619,7 +675,12 @@ pub(crate) struct LaunchedChild {
 /// 注入できるようにして、成功・各失敗・無報告の期限切れを結合試験で照合する(REPAIR-10・REPAIR-12)。
 ///
 /// `intermediate` は fork した中間プロセスの中で `(状態 pipe の書き込み側, 報告 pipe の書き込み側, 開始ゲートの
-/// 読み取り側, listener socketpair の子の端)` を受けて呼ばれ、戻り値が `_exit` の終了コードになる。
+/// 読み取り側, listener socketpair の子の端, netns 同期点の socketpair の子の端〔`netns` が `Some` のときだけ〕)` を
+/// 受けて呼ばれ、戻り値が `_exit` の終了コードになる。
+///
+/// `netns` が `Some` なら、PID 1 が exec 直前に渡す自分の netns を状態の判定より前に受け取って検証し(基準と期待の
+/// 照合。不一致・形式違反は層 `mount` に 1 件記録する)、合格したときだけ ACK を返す。EOF・期限切れ・不合格は PID 1 を
+/// 回収して起動失敗(fail-closed)。NET-6・SEC-1・SEC-4・#3206。
 ///
 /// `listener_handoff` が `Some(expected_mounts)` なら、状態の判定（`P`）が成功した後に、子が返す識別子のブロック
 /// （`launch_status` の `L`/`M`。ルール位置が `expected_mounts` と完全一致すること。#3201）を読み切り、そのあと PID 1 から
@@ -630,8 +691,15 @@ pub(crate) struct LaunchedChild {
 #[allow(clippy::too_many_arguments)]
 fn launch_via_intermediate(
     is_single_threaded: impl FnOnce() -> bool,
-    intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File, &OwnedFd) -> i32,
+    intermediate: impl FnOnce(
+        &std::fs::File,
+        &std::fs::File,
+        &std::fs::File,
+        &OwnedFd,
+        Option<&OwnedFd>,
+    ) -> i32,
     listener_handoff: Option<&[usize]>,
+    netns: Option<NetnsCheck>,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -652,8 +720,17 @@ fn launch_via_intermediate(
     let (gate_r, gate_w) = exec_status_pipe().map_err(not_started)?;
     // seccomp の listener の受け渡し(SEC-4・#2024)。C の端は `SO_PASSCRED` 設定済み(送信元の pid を受け取る)。
     let (parent_end, child_end) = listener_socketpair().map_err(not_started)?;
+    // netns の素性の同期点(NET-6・#3206)。同期点を通す起動だけ作る。C の端も `SO_PASSCRED` 設定済み。
+    let netns_pair = netns
+        .map(|_| netns_socketpair().map_err(not_started))
+        .transpose()?;
+    let (netns_parent, netns_child) = match netns_pair {
+        Some((parent, child)) => (Some(parent), Some(child)),
+        None => (None, None),
+    };
     let (status_ref, report_ref) = (&status_w, &report_w);
-    let (gate_r_ref, child_end_ref) = (&gate_r, &child_end);
+    let (gate_r_ref, child_end_ref, netns_child_ref) = (&gate_r, &child_end, netns_child.as_ref());
+    let netns_parent_fd = netns_parent.as_ref().map(|f| f.as_raw_fd());
     let (gate_w_fd, report_r_fd, status_r_fd, parent_end_fd) = (
         gate_w.as_raw_fd(),
         report_r.as_raw_fd(),
@@ -674,7 +751,19 @@ fn launch_via_intermediate(
             {
                 return EXIT_SETUP_FAILED;
             }
-            intermediate(status_ref, report_ref, gate_r_ref, child_end_ref)
+            // netns 同期点の C の端も閉じる(PID 1 へ継承されると、C の死を PID 1 が EOF で検出できない。REPAIR-5)。
+            if let Some(fd) = netns_parent_fd
+                && close_inherited(fd).is_err()
+            {
+                return EXIT_SETUP_FAILED;
+            }
+            intermediate(
+                status_ref,
+                report_ref,
+                gate_r_ref,
+                child_end_ref,
+                netns_child_ref,
+            )
         },
         EXIT_SETUP_FAILED,
     )
@@ -687,6 +776,7 @@ fn launch_via_intermediate(
     drop(gate_r);
     // 子の端を C が持ち続けると、PID 1 が送る前に死んでも EOF を観測できない。
     drop(child_end);
+    drop(netns_child);
     let intermediate_child = ContainerChild::spawned(intermediate_pid);
 
     let report = read_line_bounded::<REPORT_MAX_BYTES>(&report_r, remaining())
@@ -762,6 +852,23 @@ fn launch_via_intermediate(
         }));
     }
 
+    // exec 直前の同期点: PID 1 の netns の素性を状態の判定より前に検証する(PID 1 は pivot の前でこれを待つ。NET-6・SEC-1・
+    // #3206)。不一致・形式違反は層 `mount` に 1 件記録し、EOF・期限切れ・errno は記録しない(系のエラー)。
+    if let (Some(check), Some(sock)) = (netns.as_ref(), netns_parent.as_ref())
+        && let Err(failure) = receive_and_verify(sock.as_fd(), pid1.get(), 1, check, deadline)
+    {
+        let rejection = match failure.reason {
+            Some(reason) => super::record_launch_mount_rejection_at(
+                failure.error,
+                reason,
+                Some(IsolationStage::NetnsVerify),
+                audit.container,
+                audit.sink,
+            ),
+            None => AuditedRejection::not_applicable(failure.error),
+        };
+        return Err(kill_pid1_failure(child, rejection));
+    }
     // listener を受け取る経路(本番)は、後ろのバイト(Landlock 段の `E`)を取り込まない版で 1 行目を読む(#2130)。
     let status = if listener_handoff.is_some() {
         read_pre_pivot_status_leaving_tail(&status_r, remaining())
@@ -1829,7 +1936,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, _listener_end| {
+            |status, report, gate_r, _listener_end, _netns_end| {
                 match behavior {
                     Behavior::Ready => {
                         let pid1 = fork_stand_in(status, &pid_write, |s| {
@@ -1926,6 +2033,7 @@ mod tests {
                 }
                 0
             },
+            None,
             None,
             &subreaper,
             audit,
@@ -2035,7 +2143,7 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, listener_end| {
+            |status, report, gate_r, listener_end, _netns_end| {
                 let end = listener_end.try_clone().expect("dup");
                 let pid1 = fork_stand_in(status, &pid_write, move |s| {
                     if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
@@ -2195,6 +2303,7 @@ mod tests {
                 Handoff::MountIdentitiesGood | Handoff::MountIdentitiesWrongRule => &[1, 3],
                 _ => &[],
             }),
+            None,
             &subreaper,
             audit,
             timeout,
@@ -2931,6 +3040,175 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty());
     }
 
+    /// netns 同期点の代役の PID 1 の振る舞い。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NetnsStandIn {
+        /// 本物の送り手で自分の netns を送り、ACK を受けたら `P` を書いて 0 で終了する。
+        Honest,
+        /// 何も送らず眠る(C は期限で失敗にする)。
+        Silent,
+        /// 何も送らずに終了する(C は EOF を観測する)。
+        ExitsEarly,
+    }
+
+    /// 同期点を通す起動を代役の PID 1 で行う(`with_listener = false`)。結果・代役の pid・記録を返す。
+    fn run_netns(
+        mode: NetnsStandIn,
+        check: NetnsCheck,
+        timeout: Duration,
+    ) -> (
+        Result<LaunchedChild, Box<PreparedLaunchFailure>>,
+        u32,
+        Vec<AuditRecord>,
+    ) {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let (mut pid_read, pid_write) = std::io::pipe().unwrap();
+        let pid_write = std::fs::File::from(std::os::fd::OwnedFd::from(pid_write));
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let id = ContainerId::new("c3206").unwrap();
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
+        let tag = LaunchTag::fresh();
+        let result = launch_via_intermediate(
+            || true,
+            |status, report, gate_r, _listener_end, netns_end| {
+                let end = netns_end.expect("netns end").try_clone().expect("dup");
+                let pid1 = fork_stand_in(status, &pid_write, move |s| {
+                    if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    match mode {
+                        NetnsStandIn::Honest => {
+                            match NetnsSyncSender::new(end)
+                                .hand_over_current_netns(Duration::from_secs(10))
+                            {
+                                Ok(()) => {
+                                    let _ = report_ready(s);
+                                    0
+                                }
+                                Err(_) => 3,
+                            }
+                        }
+                        NetnsStandIn::Silent => {
+                            std::thread::sleep(Duration::from_secs(120));
+                            0
+                        }
+                        NetnsStandIn::ExitsEarly => 3,
+                    }
+                });
+                send_report(report, &IntermediateReport::Pid1(pid(pid1)));
+                0
+            },
+            None,
+            Some(check),
+            &subreaper,
+            audit,
+            timeout,
+            &tag,
+            (crate::legacy_tiocsti::LegacyTiocsti::Absent, out_tx.as_fd()),
+        );
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut pid_read, &mut buf).expect("pid1");
+        let records = sink.0.lock().unwrap().clone();
+        (result, u32::from_le_bytes(buf), records)
+    }
+
+    fn own_netns() -> super::super::netns_sync::NetnsIdentity {
+        capture_baseline().expect("own netns")
+    }
+
+    /// NET-6・SEC-1(#3206): Host 相当(基準と同じ)の代役は同期点を通り、起動に成功する。記録は 0 件。
+    #[test]
+    fn net6_sec1_3206_launch_passes_the_netns_sync_point_when_identity_matches() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+        };
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::Honest, check, Duration::from_secs(20));
+        let launched = result.expect("must launch");
+        assert_eq!(launched.child.pid(), pid1);
+        assert_eq!(
+            launched
+                .child
+                .wait_timeout(Duration::from_secs(10))
+                .unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert!(records.is_empty());
+    }
+
+    /// NET-6・SEC-1・SEC-4(#3206): Loopback 相当(基準と異なる)なのに基準と同じ netns なら、`netns_identity_mismatch` で
+    /// 拒否して 1 件記録し、PID 1 は exec せずに回収される。段は `netns_verify`、code は FailedPrecondition。
+    #[test]
+    fn net6_sec1_sec4_3206_launch_rejects_and_audits_a_netns_mismatch() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::DiffersFromBaseline,
+            baseline: own_netns(),
+        };
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::Honest, check, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert_eq!(
+            failure
+                .rejection
+                .error
+                .violation
+                .as_ref()
+                .map(|v| v.reason.as_str()),
+            Some("netns_identity_mismatch")
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::Recorded
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].layer(), crate::audit_log::AuditLayer::Mount);
+        assert_eq!(records[0].path(), None);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("netns_identity_mismatch")
+        );
+        assert_eq!(records[0].stage().map(|s| s.as_str()), Some("netns_verify"));
+    }
+
+    /// REPAIR-5(#3206): 代役が何も送らず終了(EOF)・眠る(期限切れ)のどちらも、記録なしの起動失敗になり PID 1 は回収される。
+    #[test]
+    fn repair5_3206_launch_fails_closed_when_the_netns_never_arrives() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+        };
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::ExitsEarly, check, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+
+        let started = Instant::now();
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::Silent, check, Duration::from_secs(2));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
     /// 子プロセス側の本体(`REPAIR12_2249_CHILD` が無ければ何もしない)。別スレッドが stdout / stderr の
     /// ロックを握っている間に fork しても、入れ子の代役の fork が flush で止まらず成功することを確かめる。
     /// ロックは共有 libtest プロセスを巻き込まないよう、親が再 exec した専用プロセスの中でだけ握る。
@@ -3223,7 +3501,7 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, _report, gate_r, _listener_end| {
+            |status, _report, gate_r, _listener_end, _netns_end| {
                 let _ = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
@@ -3240,6 +3518,7 @@ mod tests {
                 // 報告せずに終了する。
                 EXIT_SETUP_FAILED
             },
+            None,
             None,
             &_subreaper,
             audit,
@@ -3490,7 +3769,8 @@ mod tests {
         let (out_tx, _out_rx) = UnixStream::pair().unwrap();
         let result = launch_via_intermediate(
             || false,
-            |_, _, _, _| panic!("the intermediate must not run"),
+            |_, _, _, _, _| panic!("the intermediate must not run"),
+            None,
             None,
             &subreaper,
             audit,

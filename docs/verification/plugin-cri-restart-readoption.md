@@ -6,6 +6,7 @@ supervisor 経由の本番の start で running にしたコンテナを残し�
 
 ## 背景
 
+- running のコンテナを残した再起動と再採用の gRPC 直叩きでの照合は、実機前提の自動試験 `production_binary_restart_readopts_running_container_real`（#3225。`platform-ci` の ubuntu）が担う。本確認（#2942）は crictl の経路と、実機での観測（`state.json`・プロセスの生死）に絞る
 - 既定の集合の結合試験 `cri1_cri2_core1_records_survive_plugin_restart`（`crates/plugin-cri/tests/container_grpc.rs`、段 D）は root 不要・ネットワーク不要だが、コンテナは Created の状態でしか確かめていない
 - 本確認は、running のコンテナを残した再起動のあとに、新しい plugin が自分で spawn していない supervisor を通して core の stop / delete を行えること（本確認の中心のリスク）を確かめる
 - sandbox は保持役が再起動をまたがない設計のため、再起動後は `SANDBOX_NOTREADY` で見える（sandbox に core の記録は無い）

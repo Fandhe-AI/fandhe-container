@@ -326,7 +326,7 @@ impl ListenerSender {
 }
 
 /// `deadline` まで `fd` が読み取り可能になるのを待つ（`EINTR` は残り時間で再試行）。時間切れは `false`。
-fn wait_readable(fd: BorrowedFd<'_>, deadline: Instant) -> Result<bool, SysError> {
+pub(super) fn wait_readable(fd: BorrowedFd<'_>, deadline: Instant) -> Result<bool, SysError> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let ms = i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);

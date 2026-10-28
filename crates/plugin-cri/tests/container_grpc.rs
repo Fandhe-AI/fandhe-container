@@ -14,6 +14,8 @@
 //!   成功することを確かめる。
 //! - 段 C（`#[ignore]`・実機前提）: 本番バイナリで `PullImage`（実レジストリ）→ タグで CreateContainer → Start → Stop → Remove →
 //!   サンドボックスの停止・削除まで通す。理由と前提は該当の試験の doc コメントを参照（`AGENTS.md`「実機前提テスト」）。
+//! - 段 E（`#[ignore]`・実機前提。#3225）: running のコンテナを残して plugin-cri だけを SIGKILL し、同じ（本物の）状態ルートで
+//!   起動し直した後の再採用（running のまま・要約行・壊れた記録）と、Stop・Remove・サンドボックスの停止・削除までを通す。
 //!
 //! ハーネス（TempDir・ChildGuard・接続待ち）は `pod_sandbox_grpc.rs` と同じもの（試験 crate 間でモジュールを共有できないため複製）。
 //! 段 A のキャッシュ用の偽クライアント・tar の組み立ては `crates/cri/tests/bundle_image_rootfs.rs` を最小化して写したもの
@@ -70,7 +72,7 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
-/// 停止シグナルから終了までの期限（停止の全体の上限 13.5 秒 + 余裕。`shutdown::SHUTDOWN_TOTAL_BOUND`）。
+/// 停止シグナルから終了までの期限（停止の全体の上限 13.7 秒 + 余裕。`shutdown::SHUTDOWN_TOTAL_BOUND`）。
 const STOP_DEADLINE: Duration = Duration::from_secs(15);
 /// 停止時にフェイクが返す終了コード（SIGTERM 相当。境界越しの反映確認用の具体値）。
 const STOP_EXIT_CODE: i32 = 143;
@@ -505,19 +507,26 @@ async fn pull_image_raw(
 /// 429 は Docker Hub の匿名 pull の rate limit と分かる専用の行にする。生の message・参照・URL は出さない
 /// （`status.message()` を読まない）。
 fn pull_failure_line(status: &tonic::Status) -> String {
+    pull_failure_line_for("production_binary_full_lifecycle_real", status)
+}
+
+/// `pull_failure_line` の試験名つき版（#3225。再起動の実機前提試験も同じ書式の固定行を出す）。
+fn pull_failure_line_for(test: &str, status: &tonic::Status) -> String {
     use fandhe_container_cri::error::registry_http_status_from_metadata;
     use fandhe_container_cri::instrument::{RegistryHttpClass, code_name};
     let class = registry_http_status_from_metadata(status.metadata())
         .and_then(RegistryHttpClass::from_http_status);
     match class {
-        Some(RegistryHttpClass::RateLimited) => "production_binary_full_lifecycle_real: registry rate limit (HTTP 429); docker hub anonymous pull rate limit is likely exhausted".to_string(),
+        Some(RegistryHttpClass::RateLimited) => format!(
+            "{test}: registry rate limit (HTTP 429); docker hub anonymous pull rate limit is likely exhausted"
+        ),
         Some(c) => format!(
-            "production_binary_full_lifecycle_real: pull failed with code {} registry_http={}",
+            "{test}: pull failed with code {} registry_http={}",
             code_name(status.code()),
             c.as_str()
         ),
         None => format!(
-            "production_binary_full_lifecycle_real: pull failed with code {} registry_http=none",
+            "{test}: pull failed with code {} registry_http=none",
             code_name(status.code())
         ),
     }
@@ -995,6 +1004,31 @@ fn spawn_server_inherit_env(bin: &Path, sock: &Path) -> ChildGuard {
     ChildGuard(child)
 }
 
+/// plugin と supervisor だけを 0700 の専用ディレクトリへ複製して返す（段 C / 段 E 共通。SUP-14）。
+/// `target/<profile>/` の隣に launcher があると ProductionStarter が信頼できるランチャーとみなし、
+/// file capability の無い rootful 経路に入るため、launcher を置かないことも assert する。
+fn production_bin_dir(tag: &str) -> (TempDir, PathBuf) {
+    let bin_dir = TempDir::new(tag);
+    let plugin_src = Path::new(BIN);
+    let sup_name = "fandhe-container-supervisor";
+    let sup_src = plugin_src
+        .parent()
+        .expect("plugin binary parent")
+        .join(sup_name);
+    assert!(
+        sup_src.is_file(),
+        "supervisor binary is not built next to the plugin binary; run cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor"
+    );
+    let plugin_bin = bin_dir.0.join("fandhe-container-plugin-cri");
+    std::fs::copy(plugin_src, &plugin_bin).expect("copy plugin binary");
+    std::fs::copy(&sup_src, bin_dir.0.join(sup_name)).expect("copy supervisor binary");
+    assert!(
+        !bin_dir.0.join("fandhe-container-launcher").exists(),
+        "a privileged launcher must not sit next to the plugin binary"
+    );
+    (bin_dir, plugin_bin)
+}
+
 /// 段 C（実機前提・`#[ignore]`。PLUG-1・CRI-1・CRI-2・CRI-3・#2592）: 本番バイナリ越しに、`PullImage`（実レジストリ）→
 /// 正規化タグが `ImageStatus`・`ListImages` に見える → ホストの network namespace の sandbox → **タグで** CreateContainer →
 /// StartContainer（`CONTAINER_RUNNING`）→ StopContainer（`CONTAINER_EXITED`）→ RemoveContainer → StopPodSandbox → RemovePodSandbox
@@ -1018,26 +1052,8 @@ async fn production_binary_full_lifecycle_real() {
     tokio::time::timeout(Duration::from_secs(900), async {
         let dir = TempDir::new("sock-real");
         let sock = dir.0.join("s.sock");
-        // plugin と supervisor だけを専用ディレクトリへ複製する。`target/<profile>/` の隣に launcher があると
-        // ProductionStarter が信頼できるランチャーとみなし、file capability の無い rootful 経路に入るため（SUP-14）。
-        let bin_dir = TempDir::new("bin-real");
-        let plugin_src = Path::new(BIN);
-        let sup_name = "fandhe-container-supervisor";
-        let sup_src = plugin_src
-            .parent()
-            .expect("plugin binary parent")
-            .join(sup_name);
-        assert!(
-            sup_src.is_file(),
-            "supervisor binary is not built next to the plugin binary; run cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor"
-        );
-        let plugin_bin = bin_dir.0.join("fandhe-container-plugin-cri");
-        std::fs::copy(plugin_src, &plugin_bin).expect("copy plugin binary");
-        std::fs::copy(&sup_src, bin_dir.0.join(sup_name)).expect("copy supervisor binary");
-        assert!(
-            !bin_dir.0.join("fandhe-container-launcher").exists(),
-            "a privileged launcher must not sit next to the plugin binary"
-        );
+        let (bin_dir, plugin_bin) = production_bin_dir("bin-real");
+        let _keep_bin_dir = &bin_dir;
         let mut guard = spawn_server_inherit_env(&plugin_bin, &sock);
         // Channel の request timeout を pull の期限（300 秒）以上にする。既定の 10 秒だと
         // call_with_deadline の長い期限より先に打ち切られる（REPAIR-5・REPAIR-12）。
@@ -1134,7 +1150,10 @@ async fn production_binary_full_lifecycle_real() {
         assert_eq!(st.image_id, image_ref);
         let repo = IMAGE.rsplit_once(':').map_or(IMAGE, |(r, _)| r);
         assert!(
-            st.image_ref.contains(&format!("{}@sha256:", repo.rsplit('/').next().unwrap_or(repo))),
+            st.image_ref.contains(&format!(
+                "{}@sha256:",
+                repo.rsplit('/').next().unwrap_or(repo)
+            )),
             "image_ref: {}",
             st.image_ref
         );
@@ -1582,4 +1601,277 @@ async fn cri1_sigint_stops_the_binary_gracefully() {
     tokio::time::timeout(WATCHDOG, assert_binary_graceful_stop("INT", "SIGINT"))
         .await
         .expect("watchdog");
+}
+
+// ---- 段 E（実機前提）: running のコンテナを残した plugin-cri の再起動（#3225。CRI-1・CRI-2・CORE-1）----
+
+/// 自分が作ったファイルだけを Drop で消すガード（壊れた記録の後始末。plugin は壊れた記録を消さない仕様のため）。
+struct OwnedFile(PathBuf);
+
+impl Drop for OwnedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// ディレクトリ内の指定拡張子のエントリ数（ディレクトリが無ければ 0）。
+fn count_entries(dir: &Path, ext: Option<&str>) -> usize {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(Result::ok)
+            .filter(|e| match ext {
+                Some(x) => e.path().extension().is_some_and(|y| y == x),
+                None => true,
+            })
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// `ListContainers` の素の結果（フィルタなし）。
+async fn list_containers(c: &mut Client) -> Vec<cri::Container> {
+    call_with_deadline(
+        c.list_containers(cri::ListContainersRequest { filter: None }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list containers")
+    .into_inner()
+    .containers
+}
+
+/// 再起動をまたいで同一であるべき `ContainerStatus` の部分（走り直していないことの証拠）。
+fn identity_of(st: &cri::ContainerStatus) -> (String, i64, i64, String, String, Option<String>) {
+    (
+        st.id.clone(),
+        st.created_at,
+        st.started_at,
+        st.image_id.clone(),
+        st.image_ref.clone(),
+        st.metadata.as_ref().map(|m| m.name.clone()),
+    )
+}
+
+const RESTART_TEST: &str = "production_binary_restart_readopts_running_container_real";
+
+/// 段 E（実機前提・`#[ignore]`。CRI-1・CRI-2・CORE-1・SUP-5・REPAIR-4・REPAIR-12・#3225・#2942）: running のコンテナ
+/// （本番の supervisor・委譲 cgroup つき）と sandbox を残したまま plugin-cri だけを SIGKILL し、同じ状態ルートで起動し直した
+/// 新しいプロセスが記録を再採用すること（sandbox は NOTREADY、コンテナは core の状態どおり running で同一の実体）、
+/// 壊れた記録 1 件があっても起動が止まらず固定語彙の要約行に件数が出ること、自分で spawn していない supervisor を通して
+/// Stop・Remove・StopPodSandbox・RemovePodSandbox が通ることを具体値で固定する。
+///
+/// `#[ignore]` の理由: `production_binary_full_lifecycle_real` と同じ（委譲 cgroup scope・supervisor の bin・外向き HTTPS）。
+/// 加えて、supervisor の起動が本物の `XDG_RUNTIME_DIR/systemd/private` を要するため `XDG_RUNTIME_DIR` を一時ディレクトリへ
+/// 向けられず、本物の状態ルート（`$XDG_RUNTIME_DIR/fandhe-container`）を共有する。そのため前提検査として記録と bundle が
+/// 空であることを確かめ、満たさなければ何も消さずに失敗する（fail-closed）。試験が消すのは自分で作った壊れた記録 1 件だけ。
+/// 同じバイナリの `#[ignore]` 試験とはインスタンスロックのため直列（`--test-threads=1`）で実行する。
+/// sandbox は NODE の network namespace（core の start が pod の netns への join をまだ受けないための試験専用の設定）。
+/// 失敗で running のコンテナが残った場合は `docs/setup/cri-record-recovery.md` で手動回収する。
+/// 実行例（Agent は手元で実行しない。`AGENTS.md`「実機前提テスト」）:
+/// `systemd-run --user --scope -p Delegate=yes cargo test -p fandhe-container-plugin-cri --test container_grpc -- --ignored --exact production_binary_restart_readopts_running_container_real`
+#[tokio::test]
+#[ignore = "requires systemd --user delegated scope, supervisor bin, real XDG_RUNTIME_DIR state root, and outbound HTTPS to a registry (CRI-1/CRI-2/CORE-1, #3225)"]
+async fn production_binary_restart_readopts_running_container_real() {
+    const IMAGE: &str = "docker.io/library/busybox:1.36";
+    const PULL_DEADLINE: Duration = Duration::from_secs(300);
+    tokio::time::timeout(Duration::from_secs(600), async {
+        let xdg = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR"));
+        assert!(xdg.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
+        let state_root = xdg.join("fandhe-container");
+
+        // 前提検査（何も消さない）。
+        let dirty = count_entries(&records_dir(&xdg, "sandboxes"), Some("rec"))
+            + count_entries(&records_dir(&xdg, "containers"), Some("rec"))
+            + count_entries(&state_root.join(".cri/bundles"), None);
+        assert_eq!(
+            dirty, 0,
+            "{RESTART_TEST}: state root is not clean; see docs/setup/cri-record-recovery.md"
+        );
+
+        let dir = TempDir::new("sock-restart");
+        let (bin_dir, plugin_bin) = production_bin_dir("bin-restart");
+        let _keep_bin_dir = &bin_dir;
+        let long = Duration::from_secs(120);
+        let new_config = || {
+            GrpcClientConfig::new()
+                .with_request_timeout(Duration::from_secs(600))
+                .expect("request timeout")
+        };
+
+        // 1 回目: pull → NODE sandbox → タグで create → start（running）。
+        let sock_a = dir.0.join("a.sock");
+        let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_a);
+        let ch = connect_when_ready_with(&sock_a, Some(&mut guard), new_config()).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let mut images = ImageServiceClient::new(ch.clone());
+        let image_ref = match pull_image_raw(&mut images, IMAGE, PULL_DEADLINE).await {
+            Ok(r) => r,
+            Err(st) => {
+                let line = pull_failure_line_for(RESTART_TEST, &st);
+                eprintln!("{line}");
+                panic!("pull image: {line}");
+            }
+        };
+        assert!(image_ref.starts_with("sha256:"), "image ref: {image_ref}");
+        let mut run = run_req("pod-restart-real");
+        run.config
+            .as_mut()
+            .expect("config")
+            .linux
+            .get_or_insert_with(Default::default)
+            .security_context
+            .get_or_insert_with(Default::default)
+            .namespace_options = Some(cri::NamespaceOption {
+            network: cri::NamespaceMode::Node as i32,
+            ..Default::default()
+        });
+        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+            .await
+            .expect("run sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        let cid = call_with_deadline(
+            c.create_container(cri::CreateContainerRequest {
+                pod_sandbox_id: sb.clone(),
+                config: Some(cri::ContainerConfig {
+                    metadata: Some(cri::ContainerMetadata {
+                        name: "c-restart-real".into(),
+                        attempt: 0,
+                    }),
+                    image: Some(image_spec(IMAGE)),
+                    command: vec!["/bin/sleep".into(), "600".into()],
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }),
+            long,
+        )
+        .await
+        .expect("create by tag")
+        .into_inner()
+        .container_id;
+        call_with_deadline(
+            c.start_container(cri::StartContainerRequest {
+                container_id: cid.clone(),
+            }),
+            long,
+        )
+        .await
+        .expect("start");
+        let before = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(before.state, cri::ContainerState::ContainerRunning as i32);
+        assert_eq!(before.image_id, image_ref);
+        assert!(
+            before.image_ref.contains("busybox@sha256:"),
+            "image_ref: {}",
+            before.image_ref
+        );
+        let ident = identity_of(&before);
+        let sb_rec = records_dir(&xdg, "sandboxes").join(format!("{sb}.rec"));
+        let c_rec = records_dir(&xdg, "containers").join(format!("{cid}.rec"));
+        let bundle = state_root.join(".cri/bundles").join(&cid);
+        let c_state_dir = state_root.join(&cid);
+        assert!(sb_rec.is_file() && c_rec.is_file() && bundle.is_dir());
+        let had_state_dir = c_state_dir.is_dir();
+        drop((c, images, ch));
+        let first_stderr = kill_and_collect_stderr(guard);
+        assert!(
+            !first_stderr.contains("cri record readoption"),
+            "first start must be quiet: {first_stderr}"
+        );
+
+        // 2 回目: 再採用。running のまま同じ実体が見える。
+        let sock_b = dir.0.join("b.sock");
+        let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_b);
+        let ch = connect_when_ready_with(&sock_b, Some(&mut guard), new_config()).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        assert_eq!(
+            sandbox_state(&mut c, &sb).await.expect("sandbox status"),
+            cri::PodSandboxState::SandboxNotready as i32
+        );
+        let listed = list_containers(&mut c).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, cid);
+        assert_eq!(listed[0].state, cri::ContainerState::ContainerRunning as i32);
+        let after = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(after.state, cri::ContainerState::ContainerRunning as i32);
+        assert_eq!(identity_of(&after), ident);
+        assert!(guard.exited().is_none(), "server must still be running");
+        drop((c, ch));
+        let second_stderr = kill_and_collect_stderr(guard);
+        for want in [
+            "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=0 malformed=0 ",
+            "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=0 malformed=0 ",
+            "cri stale create release: released=0 kept=0 release_failed=0 record_remove_failed=0 not_attempted=0 skipped=0",
+            "cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=0 kept_has_record=1 ",
+        ] {
+            assert!(second_stderr.contains(want), "missing {want:?} in: {second_stderr}");
+        }
+        assert!(!second_stderr.contains(&sb) && !second_stderr.contains(&cid));
+
+        // 壊れた記録 1 件を注入（自分のファイルだけを Drop で消す）。
+        let garbage_name = format!("{:064x}", 0x3225_u32);
+        write_garbage_record(&records_dir(&xdg, "containers"), &garbage_name);
+        let garbage = OwnedFile(records_dir(&xdg, "containers").join(format!("{garbage_name}.rec")));
+
+        // 3 回目: 壊れた記録があっても起動は止まらず、再採用は冪等。後始末を kubelet の順で通す。
+        let sock_c = dir.0.join("c.sock");
+        let mut guard = spawn_server_inherit_env(&plugin_bin, &sock_c);
+        let ch = connect_when_ready_with(&sock_c, Some(&mut guard), new_config()).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        assert_eq!(
+            sandbox_state(&mut c, &sb).await.expect("sandbox status"),
+            cri::PodSandboxState::SandboxNotready as i32
+        );
+        let listed = list_containers(&mut c).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, cri::ContainerState::ContainerRunning as i32);
+        let again = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(identity_of(&again), ident);
+
+        call_with_deadline(
+            c.stop_container(cri::StopContainerRequest {
+                container_id: cid.clone(),
+                timeout: 2,
+            }),
+            long,
+        )
+        .await
+        .expect("stop");
+        let st = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(st.state, cri::ContainerState::ContainerExited as i32);
+        assert_ne!(st.finished_at, 0);
+        call_with_deadline(
+            c.remove_container(cri::RemoveContainerRequest {
+                container_id: cid.clone(),
+            }),
+            long,
+        )
+        .await
+        .expect("remove container");
+        assert_eq!(list_containers_len(&mut c).await, 0);
+        assert!(!c_rec.exists() && !bundle.exists());
+        if had_state_dir {
+            assert!(!c_state_dir.exists(), "container state dir must be deleted");
+        }
+        stop_sandbox(&mut c, &sb).await.expect("stop sandbox");
+        remove_sandbox(&mut c, &sb).await.expect("remove sandbox");
+        assert!(!sb_rec.exists());
+        assert!(garbage.0.is_file(), "broken record must be left in place");
+        assert!(guard.exited().is_none(), "server must still be running");
+        drop((c, ch));
+        let third_stderr = kill_and_collect_stderr(guard);
+        for want in [
+            "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=0 malformed=0 ",
+            "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 ",
+            "cri orphan bundle reclamation: scan=completed scanned=1 reclaimed=0 kept_has_record=1 ",
+        ] {
+            assert!(third_stderr.contains(want), "missing {want:?} in: {third_stderr}");
+        }
+        assert!(!third_stderr.contains(&sb) && !third_stderr.contains(&cid));
+        drop(garbage);
+        println!("{RESTART_TEST}: running container readopted after plugin restart");
+    })
+    .await
+    .expect("watchdog");
 }

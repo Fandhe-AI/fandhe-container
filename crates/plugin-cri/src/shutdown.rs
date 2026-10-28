@@ -19,8 +19,12 @@ pub const SHUTDOWN_SIGNAL_POLL: Duration = Duration::from_millis(100);
 /// 再起動時に R7・OCI-7 が扱う）。
 pub const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
-/// 最後の書き出し（stderr の sink の待ち）の上限。
+/// 最後の書き出し 1 回あたりの待ちの上限。停止経路には 3 回ある（`server::serve_with_audit` の stderr sink と
+/// 監査 forwarder、`main` の終了行の sink。[`FINAL_FLUSH_WAITS`]）。
 pub const FINAL_FLUSH_WAIT: Duration = Duration::from_millis(200);
+
+/// 停止経路の書き出し待ちの回数（serve_with_audit の sink・forwarder + main の終了行）。
+pub const FINAL_FLUSH_WAITS: u64 = 3;
 
 /// 停止シグナルを受けるまで待つ。`serve_with_audit` の shutdown future として渡す（SIGTERM・SIGINT 共通）。
 pub async fn wait_for_signal() {
@@ -50,13 +54,13 @@ pub fn shutdown_line(signal: ShutdownSignal, stage: ShutdownStage) -> String {
     )
 }
 
-/// 停止の全体の上限: 検知の周期 + 猶予 + 強制回収（`serve_router` の `FORCE_RECLAIM_WAIT` 2 秒）+ 最後の書き出し（2 回）
+/// 停止の全体の上限: 検知の周期 + 猶予 + 強制回収（`serve_router` の `FORCE_RECLAIM_WAIT` 2 秒）+ 最後の書き出し（3 回）
 /// + ランタイムの待ち。これを超えて待つ経路は無い（REPAIR-5）。
 pub const SHUTDOWN_TOTAL_BOUND: Duration = Duration::from_millis(
     SHUTDOWN_SIGNAL_POLL.as_millis() as u64
         + crate::adapter::PLUGIN_SHUTDOWN_GRACE.as_millis() as u64
         + 2_000
-        + 2 * FINAL_FLUSH_WAIT.as_millis() as u64
+        + FINAL_FLUSH_WAITS * FINAL_FLUSH_WAIT.as_millis() as u64
         + RUNTIME_SHUTDOWN_WAIT.as_millis() as u64,
 );
 
@@ -87,7 +91,7 @@ mod tests {
     /// CRI-1・REPAIR-5: 停止の全体の上限が 15 秒以下で、systemd の既定の停止猶予（90 秒）より十分短い。
     #[test]
     fn total_bound_is_within_fifteen_seconds() {
-        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(13_500));
+        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(13_700));
         assert!(SHUTDOWN_TOTAL_BOUND <= Duration::from_secs(15));
     }
 }

@@ -304,10 +304,12 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     // `Runtime` の暗黙の drop は `spawn_blocking` のタスクの完了を無期限に待つため、期限つきで置き去りにする（REPAIR-5）。
     // 置き去りにしたタスクの結果は不明のまま残り、再起動時に再採用・回収が扱う。
     rt.shutdown_timeout(shutdown::RUNTIME_SHUTDOWN_WAIT);
-    // ロックの解放はプロセスの終了で確定する（切り離した worker が Arc を持つことがあるため明示の drop は best-effort）。
-    drop(backends);
-    drop(bundles);
-    drop(records);
+    // インスタンスロックは `backends` が持つ。`shutdown_timeout` は未完了の blocking worker を残して返るため、
+    // ここで drop すると worker が状態を変えうる間に別インスタンスがロックを取り再採用・回収を始められる。
+    // プロセス終了（fd の close）まで保持するため leak させる（CRI-2・CORE-1。終了行の書き出しの窓も覆う）。
+    std::mem::forget(backends);
+    std::mem::forget(bundles);
+    std::mem::forget(records);
     match result {
         Ok(()) => match sys::received() {
             Some(signal) => {

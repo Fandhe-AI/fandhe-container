@@ -96,6 +96,10 @@ pub enum ViolationKind {
     /// （古いカーネル・LSM）と rootfs の内容起因を親が区別できないため、違反の試行として記録する
     /// （SEC-4・SEC-2・TASK-41 追補・#2013）。
     ProtectedPathApply,
+    /// entrypoint の exec 直前の同期点で、子が自分の network namespace として渡した fd の素性（dev, ino）が
+    /// モードの期待と食い違う、または受け渡しの形式が壊れている（NET-6・SEC-1・SEC-4・#3206。
+    /// `docs/design/network-wiring.md` D8）。
+    NetnsIdentity,
 }
 
 impl ViolationKind {
@@ -111,6 +115,7 @@ impl ViolationKind {
             Self::Entrypoint => "entrypoint",
             Self::ExecTarget => "exec_target",
             Self::ProtectedPathApply => "protected_path_apply",
+            Self::NetnsIdentity => "netns_identity",
         }
     }
 }
@@ -292,6 +297,12 @@ pub enum ViolationReason {
     /// ホスト `/sys` の ro rbind・配下に rw のマウントが残る等の事後条件違反。対象の検査〔symlink・shared〕の
     /// 拒否は含まない。SEC-2・SEC-4・OCI-4・#2020）。
     SysfsApplyFailed,
+    /// 子が渡した network namespace の素性が期待と食い違う(`network_mode=host` なのに supervisor の netns と
+    /// 異なる、`loopback` なのに supervisor の netns と同じ。NET-6・SEC-1・SEC-4・#3206)。
+    NetnsIdentityMismatch,
+    /// 子の netns の受け渡しが形式違反(fd の本数・切り詰め・送信元 pid・close-on-exec・nsfs でない・netns でない・
+    /// 本文。NET-6・SEC-1・SEC-4・#3206)。
+    NetnsHandoffInvalid,
 }
 
 impl ViolationReason {
@@ -434,7 +445,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 65] = [
+    pub(super) const ALL: [ViolationReason; 67] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -500,6 +511,8 @@ impl ViolationReason {
         Self::ReadonlyPathApplyFailed,
         Self::MaskedPathApplyFailed,
         Self::SysfsApplyFailed,
+        Self::NetnsIdentityMismatch,
+        Self::NetnsHandoffInvalid,
     ];
 
     /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
@@ -534,7 +547,9 @@ impl ViolationReason {
         if let Some(event) = self.mount_layer_audit_event(None) {
             return Some(event);
         }
-        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self) {
+        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self)
+            || self.kind() == ViolationKind::NetnsIdentity
+        {
             return Some(AuditEvent::Mount {
                 path: None,
                 reason: Some(AuditReason::new(self.as_str())),
@@ -596,7 +611,8 @@ impl ViolationReason {
             | ViolationKind::EstablishPrecondition
             | ViolationKind::EvidenceMismatch
             | ViolationKind::Entrypoint
-            | ViolationKind::ExecTarget => None,
+            | ViolationKind::ExecTarget
+            | ViolationKind::NetnsIdentity => None,
         }
     }
 
@@ -689,6 +705,8 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed => "readonly_path_apply_failed",
             Self::MaskedPathApplyFailed => "masked_path_apply_failed",
             Self::SysfsApplyFailed => "sysfs_apply_failed",
+            Self::NetnsIdentityMismatch => "netns_identity_mismatch",
+            Self::NetnsHandoffInvalid => "netns_handoff_invalid",
         }
     }
 
@@ -761,6 +779,7 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => ViolationKind::ProtectedPathApply,
+            Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => ViolationKind::NetnsIdentity,
         }
     }
 
@@ -796,6 +815,7 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => "SEC-2",
+            Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => "NET-6",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -868,7 +888,9 @@ impl ViolationReason {
             | Self::EntrypointCopySealUnverified
             | Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
-            | Self::SysfsApplyFailed => ErrorCode::FailedPrecondition,
+            | Self::SysfsApplyFailed
+            | Self::NetnsIdentityMismatch
+            | Self::NetnsHandoffInvalid => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -887,6 +909,7 @@ impl ViolationReason {
             ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
             ViolationKind::Entrypoint => IsolationStage::Exec,
             ViolationKind::ExecTarget => IsolationStage::SetNs,
+            ViolationKind::NetnsIdentity => IsolationStage::NetnsVerify,
             ViolationKind::ProtectedPathApply => match self {
                 Self::MaskedPathApplyFailed => IsolationStage::MountMaskedPaths,
                 Self::SysfsApplyFailed => IsolationStage::MountSysfs,
@@ -1055,6 +1078,12 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed => "failed to apply a read-only path protection",
             Self::MaskedPathApplyFailed => "failed to apply a masked path protection",
             Self::SysfsApplyFailed => "failed to apply the read-only sysfs mount",
+            Self::NetnsIdentityMismatch => {
+                "the network namespace of the container init does not match the requested network mode"
+            }
+            Self::NetnsHandoffInvalid => {
+                "the network namespace handoff from the container init was malformed"
+            }
         }
     }
 }
@@ -1314,7 +1343,8 @@ mod tests {
                 ViolationKind::PlanRejected
                 | ViolationKind::Entrypoint
                 | ViolationKind::ExecTarget
-                | ViolationKind::ProtectedPathApply => false,
+                | ViolationKind::ProtectedPathApply
+                | ViolationKind::NetnsIdentity => false,
             };
             let expected = accepted.then_some(r);
             assert_eq!(ViolationReason::from_launch_token(r.as_str()), expected);

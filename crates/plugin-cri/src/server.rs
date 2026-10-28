@@ -116,9 +116,9 @@ pub async fn serve_with_audit<F: Future<Output = ()>>(
     // 最後の回収。書き込み先が止まっていてもブロックしない（短い期限つきで待つ。REPAIR-5）。
     let sink = telemetry::stderr_sink();
     telemetry::drain_audit_to(&audit_buf, sink);
-    sink.wait_idle(std::time::Duration::from_millis(200));
+    sink.wait_idle(crate::shutdown::FINAL_FLUSH_WAIT);
     if let Some(forwarder) = &audit {
-        forwarder.wait_idle(std::time::Duration::from_millis(200));
+        forwarder.wait_idle(crate::shutdown::FINAL_FLUSH_WAIT);
     }
     result
 }

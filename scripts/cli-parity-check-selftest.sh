@@ -995,7 +995,7 @@ sed "s/^B34${tab}B${tab}0${tab}-${tab}.*/B34${tab}B${tab}0${tab}-${tab}state:gar
 compare k7 k7
 expect_rc "state:garbage on B34 is rejected" 2 $?
 # 漏えい検査: state の pid の値と bundle のパスは記録に現れない
-if grep -q '4242\|secret-user' "$work/ok.txt"; then fail "state pid / bundle leaked into the capture"; else pass "state pid / bundle not in the capture"; fi
+if grep -qE '4242|secret-user' "$work/ok.txt"; then fail "state pid / bundle leaked into the capture"; else pass "state pid / bundle not in the capture"; fi
 # load_capture: started 形式・<start-failed> は種別 s / w にだけ置ける
 sed "s/^B19${tab}B${tab}0${tab}-${tab}.*/B19${tab}B${tab}0${tab}-${tab}started:c2,running,pid=-,sup=-,cg=-,health=-,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/s1.txt"
 compare s1 s1

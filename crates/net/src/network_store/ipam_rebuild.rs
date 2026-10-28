@@ -86,8 +86,13 @@ mod tests {
             name_resolution: NameResolution::default(),
             name,
         };
-        RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24), NftTableHandle::new(42).unwrap())
-            .unwrap()
+        RealizedRecord::from_created(
+            &c,
+            pfx([10, 0, 0, 0], 24),
+            NftTableHandle::new(42).unwrap(),
+            crate::network_store::HostGeneration::current().unwrap(),
+        )
+        .unwrap()
     }
 
     fn token(ep: &str) -> String {

@@ -53,8 +53,8 @@ use crate::netlink_route::IpPrefix;
 use crate::network_store::MAX_MEMBERS_PER_NETWORK;
 use crate::network_store::realized::check_gateway;
 use crate::network_store::{
-    InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkLockGuard,
-    RealizedIntent, RealizedOp, RealizedRecord, RecordedPublish, rebuild_ipam,
+    HostGeneration, InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition,
+    NetworkLockGuard, RealizedIntent, RealizedOp, RealizedRecord, RecordedPublish, rebuild_ipam,
 };
 use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 use crate::nftables_rules::NftRuleHandle;
@@ -119,11 +119,35 @@ fn settled_realized(guard: &NetworkLockGuard<'_>) -> Result<RealizedRecord, NetE
     Ok(realized)
 }
 
+/// `realized` の世代（boot ID・network namespace）が現在と一致することを確かめる。
+///
+/// nft のテーブルハンドルは再起動や namespace の再作成後に同じ数値が再利用されうるため、世代を確認できない
+/// 記録のハンドルは使わない（DELRULE 等の前に `FailedPrecondition` で断る。NET-3・SEC-1・#3068）。
+/// `delete_recorded_with` には適用しない（再起動後の残骸の回収を妨げないため。所有はトークンで証明する）。
+fn check_generation(realized: &RealizedRecord) -> Result<(), NetError> {
+    let now = HostGeneration::current()?;
+    if realized.generation() != &now {
+        return Err(precondition(
+            "recorded nft handles belong to another boot or network namespace",
+        ));
+    }
+    Ok(())
+}
+
 /// [`settled_realized`] の `RecordedError` 版。
 fn require_settled<E, T>(
     guard: &NetworkLockGuard<'_>,
 ) -> Result<RealizedRecord, RecordedError<E, T>> {
     settled_realized(guard).map_err(RecordedError::Store)
+}
+
+/// [`require_settled`] に世代の確認を足したもの（ルールハンドルを使う経路用）。
+fn require_settled_current<E, T>(
+    guard: &NetworkLockGuard<'_>,
+) -> Result<RealizedRecord, RecordedError<E, T>> {
+    let realized = require_settled(guard)?;
+    check_generation(&realized).map_err(RecordedError::Store)?;
+    Ok(realized)
 }
 
 /// 排他ロックのガードであることを、カーネル操作の前に確かめる。
@@ -172,7 +196,7 @@ where
     F: FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<N>, ContainerAttachError>,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled(guard)?;
+    let realized = require_settled_current(guard)?;
     check_dns(dns, realized.gateway().addr()).map_err(RecordedError::Store)?;
     if &spec.network != realized.name() || spec.bridge_token != realized.token() {
         return Err(RecordedError::Store(precondition(
@@ -339,7 +363,7 @@ where
     E: DetachClaim,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled(guard)?;
+    let realized = require_settled_current(guard)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let intents = guard.member_intents().map_err(RecordedError::Store)?;
     let Some(recorded) = members.iter().find(|m| m.id() == member_id) else {
@@ -478,7 +502,9 @@ where
     match run(&token) {
         Ok(created) => {
             let committed = require_table_owned(table_info(&created.table), &created.bridge_token)
-                .and_then(|h| RealizedRecord::from_created(&created, subnet, h))
+                .and_then(|h| {
+                    RealizedRecord::from_created(&created, subnet, h, HostGeneration::current()?)
+                })
                 .and_then(|r| guard.commit_realized(&r));
             match committed {
                 Ok(()) => Ok(created),
@@ -581,6 +607,7 @@ pub(crate) fn restore_published_ports_recorded(
     member_id: &MemberId,
 ) -> Result<Vec<PublishedPort>, NetError> {
     let realized = settled_realized(guard)?;
+    check_generation(&realized)?;
     let members = guard.members()?;
     let rec = members
         .iter()
@@ -619,7 +646,7 @@ where
     S: FnMut(&NftName, &'static str, NftRuleHandle) -> Result<(), NftApplyFailure>,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled(guard)?;
+    let realized = require_settled_current(guard)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let Some(rec) = members.iter().find(|m| m.id() == member_id) else {
         return Err(RecordedError::Store(NetError::new(
@@ -959,12 +986,17 @@ mod tests {
     }
     /// テーブルハンドル 42 で `realized` を書く。
     fn realize(guard: &NetworkLockGuard<'_>) {
+        realize_in(guard, HostGeneration::current().unwrap());
+    }
+    /// 世代を指定して `realized` を書く。
+    fn realize_in(guard: &NetworkLockGuard<'_>, generation: HostGeneration) {
         guard
             .commit_realized(
                 &RealizedRecord::from_created(
                     &created(),
                     pfx([10, 0, 0, 0], 24),
                     NftTableHandle::new(42).unwrap(),
+                    generation,
                 )
                 .unwrap(),
             )
@@ -2017,6 +2049,58 @@ mod tests {
         assert!(e.reservation_held && e.published.is_some());
         // 予約は 1 件のまま残る。
         assert_eq!(reg.held_by(&name(), &EndpointId::new("c1").unwrap()), Ok(1));
+    }
+
+    /// NET-3・SEC-1・#3068: 別の boot ID・network namespace の世代で採ったハンドルの記録は、復元・解除・attach の
+    /// いずれもカーネル操作の前に FailedPrecondition で断る（再起動後にハンドルが偶然一致しても別のルールを消さない）。
+    #[test]
+    fn net3_3068_foreign_generation_refused_before_kernel_ops() {
+        let t = Tmp::new("foreign-generation");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let now = HostGeneration::current().unwrap();
+        let other_boot = HostGeneration::new("ffffffff-ffff-ffff-ffff-ffffffffffff", 5, 1).unwrap();
+        assert_ne!(now, other_boot);
+        realize_in(&n, other_boot);
+        let msg = "recorded nft handles belong to another boot or network namespace";
+        let r = restore_published_ports_recorded(&n, &mid("c1"));
+        assert_eq!(r.unwrap_err().message(), msg);
+        let p = PublishedPort::new(
+            &name(),
+            BRIDGE_TOKEN,
+            &EndpointId::new("c1").unwrap(),
+            web_publish(),
+            (rule(2), rule(3)),
+        )
+        .with_table_handle(NftTableHandle::new(42).unwrap());
+        let mut reg = PortRegistry::new();
+        let r = unpublish_port_recorded_with(
+            &n,
+            &mid("c1"),
+            p,
+            &mut reg,
+            |_| unreachable!("table_info must not be called"),
+            |_, _| unreachable!("delete must not be called"),
+            |_, _, _| unreachable!("delete_one must not be called"),
+        );
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), msg);
+        let s = spec("c1");
+        let r = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(42),
+            run_with_publish(&s),
+        );
+        assert!(matches!(r, Err(RecordedError::Store(ref e)) if e.message() == msg));
+        // 拒否は意図記録の前: メンバー記録は作られない。
+        assert!(n.members().unwrap().is_empty());
     }
 
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。

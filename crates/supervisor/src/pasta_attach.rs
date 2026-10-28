@@ -1135,7 +1135,10 @@ impl PastaGuardedProcess {
     }
 
     /// PID 1 がまだ動いている間の helper の生死確認。死んでいたらコンテナを止める（分離は緩めない）。
-    fn check_helpers(&self) {
+    ///
+    /// `budget_end` は呼び出し元の `wait` の絶対期限。予算が残っていなければシグナルの送信も回収も行わず、
+    /// 次の周期へ繰り越す（`LaunchedProcess::wait` の「timeout まで」の契約と監視ループの停止応答を守る。REPAIR-5）。
+    fn check_helpers(&self, budget_end: Instant) {
         let dead = {
             let mut g = lock(&self.attachment);
             match g.as_mut() {
@@ -1149,10 +1152,12 @@ impl PastaGuardedProcess {
                 .log(false, "pasta_helper_died", &[("helper", Val::S(which))]);
         }
         let mut st = lock(&self.signals);
-        let deadline = Instant::now() + SIGNAL_DEADLINE;
-        if st.killed {
+        let remaining = budget_end.saturating_duration_since(Instant::now());
+        if st.killed || remaining.is_zero() {
             return;
         }
+        let signal_budget = SIGNAL_DEADLINE.min(remaining);
+        let deadline = Instant::now() + signal_budget;
         let kill_due = match st.term_sent_at {
             Some(at) => at.elapsed() >= self.term_grace,
             None => false,
@@ -1196,7 +1201,7 @@ impl PastaGuardedProcess {
                     if st.kill_failures >= MAX_SIGNAL_FAILURES {
                         // 最終手段: 内側の terminate（自身の期限つき）で回収に進める。成功を確認できたときだけ
                         // 完了扱いにし、失敗なら次の周期から SIGKILL の再試行に戻る(生存したまま監視だけ続けない。NET-9)。
-                        match self.inner.terminate(SIGNAL_DEADLINE) {
+                        match self.inner.terminate(signal_budget) {
                             Ok(()) => st.killed = true,
                             Err(e) => {
                                 st.kill_failures = 0;
@@ -1256,7 +1261,7 @@ impl LaunchedProcess for PastaGuardedProcess {
                 }
             }
             None => {
-                self.check_helpers();
+                self.check_helpers(deadline);
                 Ok(None)
             }
         }
@@ -1267,6 +1272,14 @@ impl LaunchedProcess for PastaGuardedProcess {
         let result = self.inner.terminate(timeout);
         self.teardown_bounded("terminate", deadline);
         self.reap_teardown_worker(false);
+        // helper の後始末が期限内に終わっていないのに成功を返さない。呼び出し元はハンドルを保持して再試行できる
+        // (別 supervisor による同一 ID の再作成と、遅れた teardown の競合を作らない。CORE-2・NET-9)。
+        if result.is_ok() && self.teardown_pending() {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "pasta helper teardown is still in progress",
+            ));
+        }
         result
     }
 

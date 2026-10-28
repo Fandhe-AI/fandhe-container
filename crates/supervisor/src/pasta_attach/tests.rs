@@ -354,13 +354,13 @@ fn net9_container_exit_stops_pasta_then_holder_once() {
         .unwrap_or_else(|e| panic!("guarded: {:?}", e.code()));
     assert_eq!(p.pid().get(), 77);
     // 生きている間は何も止めない。
-    assert!(p.wait(Duration::ZERO).expect("wait").is_none());
+    assert!(p.wait(WAIT_BUDGET).expect("wait").is_none());
     assert!(events(&ev).is_empty());
     // 期限が 0 のときの後始末は専用スレッドで継続する(REPAIR-5)。終了は後始末の完了後にだけ返る(CORE-2)。
     let until = Instant::now() + Duration::from_secs(5);
     let mut exit = None;
     while exit.is_none() && Instant::now() < until {
-        exit = p.wait(Duration::ZERO).expect("wait");
+        exit = p.wait(WAIT_BUDGET).expect("wait");
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(exit, Some(ProcessExit::Exited(3)));
@@ -393,12 +393,12 @@ fn net9_helper_death_terminates_container_without_relaxing_isolation() {
     );
     guarded.term_grace = Duration::from_millis(50);
     backend.pasta_alive.store(false, Ordering::SeqCst);
-    assert!(guarded.wait(Duration::ZERO).expect("wait").is_none());
-    assert!(guarded.wait(Duration::ZERO).expect("wait").is_none());
+    assert!(guarded.wait(WAIT_BUDGET).expect("wait").is_none());
+    assert!(guarded.wait(WAIT_BUDGET).expect("wait").is_none());
     assert_eq!(events(&ev), ["container signal 15"]);
     std::thread::sleep(Duration::from_millis(80));
-    assert!(guarded.wait(Duration::ZERO).expect("wait").is_none());
-    assert!(guarded.wait(Duration::ZERO).expect("wait").is_none());
+    assert!(guarded.wait(WAIT_BUDGET).expect("wait").is_none());
+    assert!(guarded.wait(WAIT_BUDGET).expect("wait").is_none());
     assert_eq!(events(&ev), ["container signal 15", "container signal 9"]);
     // helper は PID 1 の回収まで止めない(止めるのは回収後)。
     assert!(!events(&ev).iter().any(|e| e.starts_with("stop ")));
@@ -418,7 +418,7 @@ fn net9_holder_death_terminates_container() {
         w.logger.clone(),
     );
     backend.holder_alive.store(false, Ordering::SeqCst);
-    assert!(guarded.wait(Duration::ZERO).expect("wait").is_none());
+    assert!(guarded.wait(WAIT_BUDGET).expect("wait").is_none());
     assert_eq!(events(&ev), ["container signal 15"]);
 }
 
@@ -674,8 +674,8 @@ fn repair5_failed_sigterm_is_retried_not_counted_as_sent() {
     ev.lock().unwrap().clear();
     let g = guarded_flaky(&w, &ev, 1, 0);
     backend.pasta_alive.store(false, Ordering::SeqCst);
-    g.wait(Duration::ZERO).expect("wait");
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     assert_eq!(
         events(&ev),
         ["container signal 15 failed", "container signal 15"]
@@ -692,11 +692,11 @@ fn repair5_failed_sigkill_is_retried() {
     ev.lock().unwrap().clear();
     let g = guarded_flaky(&w, &ev, 0, 1);
     backend.pasta_alive.store(false, Ordering::SeqCst);
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     std::thread::sleep(Duration::from_millis(30));
-    g.wait(Duration::ZERO).expect("wait");
-    g.wait(Duration::ZERO).expect("wait");
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     assert_eq!(
         events(&ev),
         [
@@ -717,10 +717,10 @@ fn repair5_persistent_sigkill_failure_falls_back_to_terminate() {
     ev.lock().unwrap().clear();
     let g = guarded_flaky(&w, &ev, 0, 100);
     backend.pasta_alive.store(false, Ordering::SeqCst);
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     std::thread::sleep(Duration::from_millis(30));
     for _ in 0..6 {
-        g.wait(Duration::ZERO).expect("wait");
+        g.wait(WAIT_BUDGET).expect("wait");
     }
     let e = events(&ev);
     assert_eq!(
@@ -926,9 +926,9 @@ fn net9_real_helper_mid_death_signals_container_and_reaps_the_rest() {
     while !gone_or_zombie(pasta_pid) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(10));
     }
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     assert_eq!(events(&ev), ["container signal 15"]);
-    g.wait(Duration::ZERO).expect("wait");
+    g.wait(WAIT_BUDGET).expect("wait");
     g.wait(Duration::from_secs(5)).expect("wait");
     drop(g);
     let pids = b.pids.lock().unwrap().clone();
@@ -1028,10 +1028,65 @@ fn net9_failed_final_terminate_is_not_marked_done() {
     g.term_grace = Duration::ZERO;
     backend.pasta_alive.store(false, Ordering::SeqCst);
     for _ in 0..12 {
-        g.wait(Duration::ZERO).expect("wait");
+        g.wait(WAIT_BUDGET).expect("wait");
     }
     let e = events(&ev);
     let terminates = e.iter().filter(|x| *x == "container terminate").count();
     assert!(terminates >= 2, "terminate must be retried: {e:?}");
     assert!(!lock(&g.signals).killed);
+}
+
+/// 途中死の処理（シグナルの送信・回収）に使える `wait` の予算。`Duration::ZERO` では繰り越す契約のため別に置く。
+const WAIT_BUDGET: Duration = Duration::from_millis(50);
+
+/// REPAIR-5: 予算のない `wait`(timeout 0)は、helper の死亡を見つけてもシグナルを送らず次の周期へ繰り越す。
+#[test]
+fn repair5_zero_budget_wait_defers_helper_death_handling() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = guarded_flaky(&w, &ev, 0, 0);
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    let t = Instant::now();
+    assert_eq!(g.wait(Duration::ZERO).expect("wait"), None);
+    assert_eq!(events(&ev), Vec::<String>::new());
+    assert!(t.elapsed() < Duration::from_millis(100));
+    // 予算のある次の周期で SIGTERM が送られる。
+    assert_eq!(g.wait(WAIT_BUDGET).expect("wait"), None);
+    assert_eq!(events(&ev), ["container signal 15"]);
+}
+
+/// CORE-2・NET-9: helper の後始末が期限内に終わらなかった terminate は成功を返さず(Timeout)、
+/// 完了後の再試行で成功する。
+#[test]
+fn core2_terminate_with_pending_teardown_is_not_success() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    *backend.stop_delay.lock().unwrap() = Duration::from_millis(150);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = PastaGuardedProcess::new(
+        FakeProcess::new(&ev, vec![]),
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    let e = g
+        .terminate(Duration::from_millis(10))
+        .expect_err("teardown still pending");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut done = false;
+    while !done && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+        done = g.terminate(Duration::from_millis(10)).is_ok();
+    }
+    assert!(done, "terminate must succeed after the teardown finished");
+    assert!(
+        events(&ev).contains(&"remove run_dir".to_owned()),
+        "{:?}",
+        events(&ev)
+    );
 }

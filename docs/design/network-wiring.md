@@ -115,7 +115,7 @@
   - 生成条件の限定は host / none にだけ適用する（`--add-host` があれば `hosts`、`--dns` があれば `resolv.conf`）。rootful の bridge は上記のとおり `--dns` の有無に依らず `resolv.conf` を生成する。限定に当たらず生成しないものはイメージのファイルをそのまま使い、従来の挙動を変えない
   - 段は supervisor の start の手順 3〜7（作業スレッド・期限つき）で、launcher を作る前に作成と書き込みを終える。`apply_dns` は rename で inode が替わるため bind mount より前に済ませる。start のたびに作り直し（前回の残りを消してから排他作成）、supervisor 内の restart は同じファイルを使い回す
   - bind mount は launcher のオプションで core に渡し、pivot の前、検証済みの bind（#1915）と同じ段で適用する。ただし利用者の bind（`mounts[]`）の検証〔元が状態ルートの同一・祖先・子孫なら `BindSourceReachesStateRoot` で拒否。SEC-1〕には通さず、core 内部の専用の種別（`EtcFileMount`）として扱う。この種別の元は呼び出し側のパスではなく core が `state_root` と `<id>` から固定の形（`<state_root>/@container-etc/<id>/{hosts,resolv.conf}` の 2 つだけ）で導く（任意のパスを受けない。`@container-options` と同じ流儀）。利用者の bind の元が `@container-etc` を指す場合は従来どおり `BindSourceReachesStateRoot` で拒否し、緩めない。元のファイルは launch の時点で状態ルートから 1 要素ずつ fd 起点（`O_PATH|O_NOFOLLOW`）で開き直し、`@container-etc/<id>` が 0700・所有者 euid であること、ファイルが通常ファイル・所有者 euid・nlink 1 であることを確かめる（不適合は `FailedPrecondition`）。先は rootfs の fd から 1 要素ずつ辿る（`mount_destination` の検証）。rw で mount する（Docker と同等。書き換えても自分の生成ファイルにしか及ばない）
-  - 先が symlink: `InvalidArgument`（`RESOLVE_IN_ROOT` で解決する案は残余）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
+  - 先が symlink: 解決せず `InvalidArgument` で拒否を続ける（#3210 の決定。理由と利用者向けの文言は下の「先が symlink の扱い（#3210）」）。`/etc` が無い、または symlink: `InvalidArgument`。先のファイルが無い: `/etc` の fd の下に 0644 の空ファイルを排他作成してから mount する。`root.readonly` で先が無い: `FailedPrecondition`。利用者の `mounts[]`・tmpfs・注入ファイルと先が重なる: `InvalidArgument`
   - rootless は `SingleId`・`SubordinateIds` のどちらでも、元のファイルの所有者はコンテナの root に当たる uid で 0644 なので読める。mount はコンテナの user namespace が所有する mount namespace の中で行う
   - 後始末: start の失敗時は supervisor が自分で作ったものを消す。CLI の `delete` が成功した後に `@container-etc/<id>` を消す（`@container-options` と同じ条件）。plugin-cri は作らない
 - **実装の補足（#1872。core 側の実装済みの範囲）**:
@@ -123,8 +123,15 @@
   - `create_etc_files` は `<id>` が既にあれば `ALREADY_EXISTS` で拒否する。「start のたびに作り直す」は呼び出し側（supervisor。#1873・#3065）が `remove_etc_files` の後に `create_etc_files` を呼んで実現する
   - mount のモード: 既定は rw（D9 のとおり）。実効の `root.readonly=true` では ro で載せる（containerd の `containerMounts` が `readonly_rootfs` を hosts / resolv.conf の `Readonly` に写す挙動に揃えた、閉じた側の選択。一次情報の確認は #2859 に残し、違えば緩める）。ro のときに先が無いなら rootfs へ書かず `FailedPrecondition`
   - 元の検証は 2 段: launcher が fork 前に所有者・権限・nlink を検査して `(st_dev, st_ino)` を記録し、子（新しい mount namespace）が同じ正規化済みパスを辿り直して `(st_dev, st_ino)` と nlink 1 の一致を要求する（user namespace の中では uid が写像後の値になるため）
-  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、先が symlink のときの `RESOLVE_IN_ROOT`、`RootfulHostRoot`（launcher が拒否。#2241）
-- **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。
+  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、`RootfulHostRoot`（launcher が拒否。#2241）
+- **先が symlink の扱い（#3210。NET-12・SEC-1）**: 解決せず拒否を続ける。理由:
+  1. systemd-resolved 形（`/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf`）は、解決しても救えない。`/run` は実行時の tmpfs でイメージの tarball では空のため、解決先の親ディレクトリを作らない制約の下では結局拒否になる。救えるのは rootfs 内にある通常ファイルを指す symlink だけで、まれな場面と見込む（実イメージでの確認はしていない）
+  2. 利用者の bind（`mounts[]`）は先の symlink を解決せずに拒否する（`bind_mounts.rs`）。etc の bind だけ解決すると方針が混ざる
+  3. 影響は狭い。host / none では `--add-host` / `--dns` を指定したときだけ生成するため、フラグなしの起動は当たらない
+  4. pivot 前の段に新しいパス解決の面を足さない。解決する方式は core の `sys` に `openat2(RESOLVE_IN_ROOT)` の新しい `unsafe` ラッパー（`EAGAIN` の再試行・`RESOLVE_NO_XDEV`・親と葉を分ける 2 段の解決・`check_etc_overlaps` の解決後パス対応）を要する
+  - 利用者向けの文言（`InvalidArgument`・固定の英語。rootfs の値は含めない）: hosts は `/etc/hosts in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image)`。resolv.conf は同じ文頭で `(replace it with a regular file in the image, or remove it when the rootfs is writable)`。`/etc` 自体が symlink・非ディレクトリ・無い場合の拒否は変えない
+  - 見直し条件は「残余・見直し条件」を参照
+- **却下した案**: SUP-12 の `injected_files` の流用（親ディレクトリ単位の tmpfs で `/etc` 全体を覆い隠し、単一ファイルの bind は未対応）。CLI の create で生成する（restart と start のたびの再生成を同じ経路にできない）。イメージの hosts を写してから追記する。symlink の先の inode の上に mount する案、rw の rootfs で symlink を消して通常ファイルに置き換える案（rootfs の意味を未検討の形で変える）。解決先の親ディレクトリを作る案（オーナー判断が出たら見直す）。
 
 ### D10 ネットワーク定義の状態ストア（CORE-1）
 
@@ -348,6 +355,6 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 
 ## 残余・見直し条件
 
-- bind mount の先が symlink の場合の `RESOLVE_IN_ROOT` による解決は未対応（D9）
+- /etc/hosts・/etc/resolv.conf の先が symlink の場合は解決しない（D9・#3210）。次のいずれかが起きたら見直す: (1) オーナーが解決先の親ディレクトリの作成（runc の securejoin + MkdirAll と同等）を認めた、(2) rootful bridge の resolv.conf（D13・#3074）で `--dns` の有無に関わらず resolv.conf を作るようになり、この拒否に当たる場面が増えた、(3) 実イメージの調査で、rootfs 内の既存の通常ファイルを指す symlink の resolv.conf が多いと分かった
 - #1935（pasta の設計。[rootless-network.md](rootless-network.md) 12 章）は予約名と名前の照合を変えなかった。D1・D10 の見直しは不要。今後変わったら見直す
 - #3207 の判断が出たら D13 を確定し、本書の位置づけの注記と `docs/architecture.md` の設計ドラフトの行を更新する

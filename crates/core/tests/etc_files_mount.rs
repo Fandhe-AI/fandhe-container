@@ -10,7 +10,7 @@
 //! `create_etc_files` で hosts と resolv.conf を作り、rootfs を用意して分離し、自身を `--child` で起動する
 //! （子が PID 1）。子は `establish` → `prepare_rootfs` の後、同じ分離の中で次を具体値で照合する。
 //!
-//! - `rw`: (1) 先の `etc/resolv.conf` が symlink（`../outside/leak`）なら `InvalidArgument` で拒否し、先に成功していた
+//! - `rw`: (1) 先の `etc/resolv.conf` が symlink（`../outside/leak`。絶対パスと systemd-resolved 形の `../run/systemd/resolve/stub-resolv.conf` も同様。解決せず、`run/` も作らない）なら `InvalidArgument` で拒否し、先に成功していた
 //!   hosts の bind も外れ、symlink の先（`outside`）に何も作られないこと（逆方向の脱出と後始末）。(2) symlink を消すと
 //!   hosts（既存）と resolv.conf（無いので空ファイルを作成）が載り、`pivot_root` の後に `/etc/hosts` の内容が
 //!   `INITIAL_HOSTS` と一致し、mountinfo で `rw,nosuid,nodev,noexec`、`st_ino` が元と一致し、コンテナ内からの書き込みが
@@ -326,6 +326,44 @@ mod linux {
             0,
             "nothing may be created behind the symlink"
         );
+
+        // (1b) 絶対パスの symlink と、systemd-resolved 形（rootfs に無い `run/` を指す）も解決せず拒否し、
+        // 解決先の親ディレクトリを作らない（D9・#3210）。
+        for link in ["/outside/leak", "../run/systemd/resolve/stub-resolv.conf"] {
+            let dst = rootfs.join("etc/resolv.conf");
+            std::fs::remove_file(&dst).expect("remove symlink");
+            std::os::unix::fs::symlink(link, &dst).expect("symlink resolv.conf");
+            let err = mount_etc_files(isolation, &prepared, &mounts).expect_err(link);
+            assert_eq!(err.stage, IsolationStage::MountEtcFiles, "{link}");
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "{link}: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("cleanup failed"),
+                "{link}: {}",
+                err.message
+            );
+            let info = std::fs::read_to_string("/proc/thread-self/mountinfo").expect("mountinfo");
+            assert_eq!(
+                mounts_ending_with(&info, "/etc/hosts"),
+                Vec::<String>::new(),
+                "{link}: the first mount must be rolled back"
+            );
+            assert!(
+                !rootfs.join("run").exists(),
+                "{link}: run/ must not be created"
+            );
+            assert_eq!(
+                std::fs::read_dir(rootfs.join("outside"))
+                    .expect("outside")
+                    .count(),
+                0,
+                "{link}: nothing may be created behind the symlink"
+            );
+        }
 
         // (2) symlink を除くと、hosts は既存へ、resolv.conf は空ファイルを作って載る。
         std::fs::remove_file(rootfs.join("etc/resolv.conf")).expect("remove symlink");

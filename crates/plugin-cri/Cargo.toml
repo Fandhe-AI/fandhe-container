@@ -24,9 +24,8 @@ tonic = { workspace = true }
 fandhe-container-cri = { path = "../cri" }
 # #2592（CRI-3・PLUG-1）: 本番のレジストリクライアント設定（`RegistryClientConfig`）を組むため oci へ path 依存を足した（workspace 内で外部クレートの追加ではない。辺は plugin-cri → oci の一方向）。
 fandhe-container-oci = { path = "../oci" }
-# core 自身は plugin feature を要求しない（PLUG-4）。ただし下の supervisor が core を既定 feature（`plugin`）で引くため、
-# `-p fandhe-container-plugin-cri` でビルドすると feature 統合で core の `plugin` feature が有効になる（#2434）。
-# PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない。
+# core 自身は plugin feature を要求しない（PLUG-4）。下の supervisor も core を `default-features = false` で引く
+# （#3204 で解消。以前は supervisor 経由で core の `plugin` が有効になっていた。#2434）。
 fandhe-container-core = { path = "../core", default-features = false }
 # #2434（CRI-2・PLUG-1・SUP-1・SUP-9）: start・kill・stop と cgroup remover を CLI と同じ本番経路へ結線するため supervisor へ path 依存を
 # 足した（workspace 内 path 依存で外部クレートの追加ではない。辺は plugin-cri → supervisor の一方向で、supervisor は core

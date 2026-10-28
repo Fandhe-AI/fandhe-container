@@ -440,6 +440,58 @@ mod bench {
         Some(s)
     }
 
+    /// mountinfo のマウントポイントの `\ooo`（3 桁 8 進）エスケープ（空白は `\040`）を復号して Path にする。
+    /// 不正な並びはそのまま残す。
+    fn unescape_mount(raw: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        let b = raw.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let decoded = if b[i] == b'\\' {
+                b.get(i + 1..i + 4)
+                    .filter(|oct| oct.iter().all(|c| (b'0'..=b'7').contains(c)))
+                    .and_then(|oct| {
+                        let v = oct.iter().fold(0u32, |a, c| a * 8 + u32::from(c - b'0'));
+                        u8::try_from(v).ok()
+                    })
+            } else {
+                None
+            };
+            match decoded {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 4;
+                }
+                None => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        PathBuf::from(std::ffi::OsString::from_vec(out))
+    }
+
+    /// `unescape_mount` の自己照合（harness = false のため smoke 実行で行う）。失敗時は理由を返す。
+    pub fn self_check() -> Result<(), String> {
+        let cases = [
+            ("/mnt/a\\040b", "/mnt/a b"),
+            ("/mnt/tab\\011x", "/mnt/tab\tx"),
+            ("/plain", "/plain"),
+            ("/bad\\9zz", "/bad\\9zz"),
+            ("/end\\04", "/end\\04"),
+        ];
+        for (raw, want) in cases {
+            if unescape_mount(raw) != Path::new(want) {
+                return Err("mountinfo unescape self-check failed".into());
+            }
+        }
+        if !Path::new("/mnt/a b/state").starts_with(unescape_mount("/mnt/a\\040b")) {
+            return Err("mountinfo prefix self-check failed".into());
+        }
+        Ok(())
+    }
+
     /// 状態ルートを含む最も長いマウントの fstype。取れなければ "unknown"。
     fn fs_type(root: &Path) -> String {
         let Ok(root) = fs::canonicalize(root) else {
@@ -457,8 +509,13 @@ mod bench {
             else {
                 continue;
             };
-            if root.starts_with(mount) && best.as_ref().is_none_or(|(l, _)| mount.len() > *l) {
-                best = Some((mount.len(), fstype.to_owned()));
+            let mount = unescape_mount(mount);
+            if root.starts_with(&mount)
+                && best
+                    .as_ref()
+                    .is_none_or(|(l, _)| mount.as_os_str().len() > *l)
+            {
+                best = Some((mount.as_os_str().len(), fstype.to_owned()));
             }
         }
         best.map_or_else(|| "unknown".into(), |(_, t)| t)
@@ -602,6 +659,9 @@ mod bench {
     pub fn run() -> i32 {
         let args = match parse_args() {
             Ok(Parsed::Smoke) => {
+                if let Err(m) = self_check() {
+                    return fail("self_check_failed", &m);
+                }
                 println!(
                     "{}",
                     json!({"bench": BENCH, "measured": false, "reason": "smoke; pass --state-root <dir> to measure"})

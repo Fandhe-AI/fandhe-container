@@ -248,8 +248,9 @@ fn wait_stage1(mut child: Child) -> Result<(), NetError> {
 ///
 /// 手順は親モジュールの doc を参照。`program` は絶対パスに限る。`dns-helper` か `dns-helper.intent` が既にあれば
 /// `AlreadyExists`（二重起動しない。古い記録は [`stop_recorded_dns_helper`] か [`recover_dns_helper_intent`] で
-/// 片付けてから起動する）。失敗時は、起動窓の記録（意図記録・`dns-helper`）を、プロセスの終了を確認できたときだけ消す。
-/// 確認できなければ記録を残して報告する（次の操作で回収する）。
+/// 片付けてから起動する）。失敗時は、起動窓の記録（意図記録・`dns-helper`）を、子が存在しない（`spawn` 自体の失敗）か
+/// プロセスの終了を確認できたときだけ消す。段 1 の起動後に終了を確認できない失敗（識別行のタイムアウト・
+/// reader スレッドの生成失敗等）は意図記録を残して報告し、次の操作で [`recover_dns_helper_intent`] が回収する。
 pub fn spawn_detached_dns_helper(
     guard: &NetworkLockGuard<'_>,
     program: &Path,
@@ -302,20 +303,19 @@ fn spawn_inner(
     let mut stage1 = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return Err(fail_before_ack(guard, None, map_io("spawn dns helper", &e)));
+            return Err(fail_spawn(guard, map_io("spawn dns helper", &e)));
         }
     };
     let stdin = stage1.stdin.take();
     let Some(stdout) = stage1.stdout.take() else {
         let _ = kill_reap_or_detach(stage1, DNS_HELPER_KILL_REAP_TIMEOUT);
-        return Err(fail_before_ack(
-            guard,
+        return Err(fail_child_may_exist(
             stdin,
             err(NetErrorCode::Internal, "helper stdout unavailable"),
         ));
     };
     if let Err(e) = wait_stage1(stage1) {
-        return Err(fail_before_ack(guard, stdin, e));
+        return Err(fail_child_may_exist(stdin, e));
     }
 
     // 識別行と準備完了行を同じ pipe から順に読む。読み手のスレッドは pipe が閉じれば（ヘルパーの終了で）戻る。
@@ -333,8 +333,7 @@ fn spawn_inner(
             }
         });
     if let Err(e) = reader {
-        return Err(fail_before_ack(
-            guard,
+        return Err(fail_child_may_exist(
             stdin,
             map_io("spawn dns helper reader thread", &e),
         ));
@@ -343,15 +342,13 @@ fn spawn_inner(
     let ident_line = match rx.recv_timeout(DNS_HELPER_ACK_TIMEOUT) {
         Ok(Ok(l)) => l,
         Ok(Err(msg)) => {
-            return Err(fail_before_ack(
-                guard,
+            return Err(fail_child_may_exist(
                 stdin,
                 err(NetErrorCode::FailedPrecondition, msg),
             ));
         }
         Err(_) => {
-            return Err(fail_before_ack(
-                guard,
+            return Err(fail_child_may_exist(
                 stdin,
                 err(
                     NetErrorCode::Timeout,
@@ -362,7 +359,7 @@ fn spawn_inner(
     };
     let (identity, pidfd) = match confirm_identity(&ident_line, &nonce) {
         Ok(v) => v,
-        Err(e) => return Err(fail_before_ack_unconfirmed(stdin, e)),
+        Err(e) => return Err(fail_child_may_exist(stdin, e)),
     };
     let record = match DnsHelperRecord::new(identity.clone(), nonce, listen) {
         Ok(r) => r,
@@ -433,25 +430,22 @@ fn confirm_identity(
     Ok((identity, pidfd))
 }
 
-/// ack を返す前の失敗。stdin を閉じて（段 2 は EOF で終了し bind しない）意図記録を消す。
-fn fail_before_ack(
-    guard: &NetworkLockGuard<'_>,
-    stdin: Option<ChildStdin>,
-    e: NetError,
-) -> NetError {
-    drop(stdin);
+/// 段 1 の `spawn` 自体が失敗した経路（NET-5・REPAIR-5）。子プロセスは存在しないので、意図記録を消してよい。
+/// 消せなければ記録を残したことを失敗に添える。
+fn fail_spawn(guard: &NetworkLockGuard<'_>, e: NetError) -> NetError {
     match guard.remove_dns_helper_intent() {
         Ok(()) => e,
         Err(r) => with_note(e, &format!("intent record kept: {}", r.message())),
     }
 }
 
-/// 識別行を受けた後、pidfd を確保・照合できずに失敗した経路（NET-5・REPAIR-5）。
+/// 段 1 の起動に成功した後、段 2 の終了を確認できないまま失敗した経路（NET-5・REPAIR-5）。
 ///
-/// 段 2 の終了を確認できない（pidfd_open の ENOSYS・EMFILE 等）ため、stdin を閉じて EOF での自発終了に任せるが、
-/// 意図記録は消さずに残す。child subreaper の呼び出し元ではゾンビが残りうるうえ、停止中の子は EOF でも
-/// 終了しないため、後続の `recover_dns_helper_intent` が nonce で再試行できるようにする。
-fn fail_before_ack_unconfirmed(stdin: Option<ChildStdin>, e: NetError) -> NetError {
+/// 識別行のタイムアウト・不正、reader スレッドの生成失敗、段 1 の異常終了などでは、段 2 が生存している
+/// かもしれない（停止中の子は EOF でも終了しない）。stdin を閉じて EOF での自発終了に任せるが、意図記録は
+/// 消さずに残し、後続の `recover_dns_helper_intent` が nonce で再試行できるようにする。残った記録は
+/// 次の `spawn_detached_dns_helper` を `AlreadyExists` にするので、呼び出し側は先に回収を行う。
+fn fail_child_may_exist(stdin: Option<ChildStdin>, e: NetError) -> NetError {
     drop(stdin);
     with_note(
         e,
@@ -559,19 +553,9 @@ pub fn recover_dns_helper_intent(
             Err(e) if e.code() == NetErrorCode::NotFound => continue,
             Err(e) => return Err(with_note(e, "intent record kept")),
         };
-        // pidfd 取得後の再確認: 同じ nonce を持ち、開始時刻が変わっておらず、まだ終了していない。
-        if !cmdline_has_nonce(pid, intent.nonce())?
-            || verify_pidfd_target(pidfd.as_fd(), &identity)? != Verify::Same
-        {
-            continue;
+        if stop_confirmed_candidate(pidfd.as_fd(), &identity, intent.nonce())? {
+            stopped += 1;
         }
-        if !kill_and_confirm(pidfd.as_fd()) {
-            return Err(err(
-                NetErrorCode::Timeout,
-                "dns helper did not exit before the deadline; intent record kept",
-            ));
-        }
-        stopped += 1;
     }
     // 上限に達したのに候補が残っていれば、走査を終えていない。意図記録を消すと生存したヘルパーの nonce を失う。
     if seen >= MAX_RECOVERY_CANDIDATES && candidates.next().is_some() {
@@ -582,6 +566,38 @@ pub fn recover_dns_helper_intent(
     }
     guard.remove_dns_helper_intent()?;
     Ok(IntentRecovery::Recovered { stopped })
+}
+
+/// nonce の一致を確認して pidfd を取った候補を、同一性を再確認したうえで止める（止めた・回収したなら true）。
+///
+/// nonce の確認後に既に終了していた（`Verify::Gone`）場合も、この pidfd で `waitid` して回収する。
+/// 終了後のゾンビは `/proc/<pid>/cmdline` が空で nonce を再検査できないため、確認済みの pidfd・同一性で扱う
+/// （呼び出し元が child subreaper のとき、回収しないとゾンビが残る。自分の子でなければ回収は親の仕事）。
+/// 開始時刻が違う（別のプロセス）か、生存したまま nonce が消えた場合は何もしない。
+fn stop_confirmed_candidate(
+    pidfd: BorrowedFd<'_>,
+    identity: &ProcessIdentity,
+    nonce: &HelperNonce,
+) -> Result<bool, NetError> {
+    match verify_pidfd_target(pidfd, identity)? {
+        Verify::Different => Ok(false),
+        Verify::Gone => {
+            let _ = process::reap_pidfd_nohang(pidfd);
+            Ok(true)
+        }
+        Verify::Same => {
+            if !cmdline_has_nonce(identity.pid, nonce)? {
+                return Ok(false);
+            }
+            if !kill_and_confirm(pidfd) {
+                return Err(err(
+                    NetErrorCode::Timeout,
+                    "dns helper did not exit before the deadline; intent record kept",
+                ));
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// `/proc/<pid>/cmdline` が `--nonce <nonce>` を持つか。プロセスが無い（消滅）・上限超過（ヘルパーの
@@ -724,5 +740,53 @@ mod ack_tests {
         });
         read_ack_within(&mut rx, &Deadline::after(Duration::from_secs(5))).expect("ack");
         drop(h.join());
+    }
+
+    fn spawn_sleeper() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// REPAIR-5・NET-5: nonce 確認後に終了してゾンビ化した子も、確認済みの pidfd・同一性で回収される
+    /// （`/proc/<pid>/cmdline` が空でも）。
+    #[test]
+    // 子は pidfd 経由で回収する（`Child::wait` を呼ぶと回収の検証にならない）。
+    #[allow(clippy::zombie_processes)]
+    fn net5_3070_exited_candidate_is_reaped_via_pidfd() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let pidfd = open_pidfd(pid).expect("pidfd");
+        let identity = read_identity(pid).expect("identity");
+        child.kill().expect("kill");
+        assert!(wait_exit(pidfd.as_fd(), Duration::from_secs(5)).expect("wait"));
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}/stat")).exists(),
+            "an unreaped child stays as a zombie"
+        );
+        let nonce = HelperNonce::generate().expect("nonce");
+        assert!(stop_confirmed_candidate(pidfd.as_fd(), &identity, &nonce).expect("stop"));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}/stat")).exists(),
+            "the zombie must be reaped"
+        );
+    }
+
+    /// 開始時刻が違う（別のプロセス）なら何も送らない。
+    #[test]
+    fn net5_3070_different_identity_is_left_alone() {
+        let mut child = spawn_sleeper();
+        let pidfd = open_pidfd(child.id()).expect("pidfd");
+        let mut identity = read_identity(child.id()).expect("identity");
+        identity.start_time_ticks += 1;
+        let nonce = HelperNonce::generate().expect("nonce");
+        assert!(!stop_confirmed_candidate(pidfd.as_fd(), &identity, &nonce).expect("stop"));
+        assert!(child.try_wait().expect("try_wait").is_none());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
     }
 }

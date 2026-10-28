@@ -118,6 +118,7 @@ pub fn run(exe: &Path) {
     stop_on_request(exe);
     ack_timeout(exe);
     recover_intent(exe);
+    start_failure_records(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -324,6 +325,49 @@ fn recover_intent(exe: &Path) {
     );
     assert!(gone(pid), "the matching helper must be stopped");
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+}
+
+/// 起動失敗時の意図記録（NET-5・REPAIR-5・#3070）。`spawn` 自体の失敗は子が存在しないので消し、段 1 の起動後に
+/// 終了を確認できない失敗（識別行なし・段 1 の異常終了）は nonce の再試行に要るので残す。
+fn start_failure_records(_exe: &Path) {
+    let tmp = Tmp::new("startfail");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let ready = Duration::from_secs(2);
+
+    // 実行できないパス: spawn が失敗する（子は無い）→ 意図記録は消える。
+    let missing = tmp.0.join("no-such-program");
+    let e = spawn_detached_dns_helper(&n, &missing, listen, ready, &NoopNetOpRecorder)
+        .expect_err("spawn fails");
+    assert_ne!(e.code(), NetErrorCode::AlreadyExists);
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+
+    // 識別行を出さずに終了するプログラム: 起動後の失敗 → 意図記録を残す。
+    for prog in ["/bin/true", "/bin/false"] {
+        if !Path::new(prog).exists() {
+            continue;
+        }
+        let e = spawn_detached_dns_helper(&n, Path::new(prog), listen, ready, &NoopNetOpRecorder)
+            .expect_err("no identity line");
+        assert!(
+            e.message().contains("intent record kept"),
+            "{prog}: {}",
+            e.message()
+        );
+        let kept = n.read_dns_helper_intent().expect("intent");
+        assert!(kept.is_some(), "{prog}: intent must be kept");
+        assert_eq!(n.read_dns_helper().expect("record"), None);
+        // 回収（候補なし）で意図記録が消え、再び起動できる状態に戻る。
+        assert_eq!(
+            recover_dns_helper_intent(&n, &mut std::iter::empty()).expect("recover"),
+            IntentRecovery::Recovered { stopped: 0 }
+        );
+        assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    }
     drop(n);
     drop(g);
 }

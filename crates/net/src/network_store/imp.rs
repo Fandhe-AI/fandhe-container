@@ -399,6 +399,18 @@ impl NetworkStore {
 
     /// 定義を作る。カーネル資源は作らない。全体の排他ロックの下で、staging に書いてから rename で公開する。
     pub fn create(&self, def: &NetworkDefinition) -> Result<(), NetError> {
+        self.create_with_sync(def, &Dir::sync)
+    }
+
+    /// [`create`](Self::create) の本体。ディレクトリの同期を差し替えられる（同期失敗の試験用）。
+    ///
+    /// rename 後の同期に失敗したら公開を巻き戻して（定義を staging 名へ戻して捨てる）失敗を返す。
+    /// 永続化を確認できないまま成功を返さず、再試行が `AlreadyExists` にならないようにする（NET-6）。
+    fn create_with_sync(
+        &self,
+        def: &NetworkDefinition,
+        sync: &dyn Fn(&Dir) -> Result<(), NetError>,
+    ) -> Result<(), NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreCreate, || {
             let name = def.name().as_str();
             if is_reserved_network_name(name) {
@@ -429,11 +441,12 @@ impl NetworkStore {
                 fs::rename(self.dir.path(&stage), self.dir.path(name))
                     .map_err(|e| map_io(&e, "failed to publish network definition"))
             });
-            if result.is_ok() {
-                // rename 後は定義が公開済み。ここで sync の失敗を返すと再試行が AlreadyExists になり
-                // 呼び出し側が回復できないため、成功扱いにする（耐久性は次の sync で追いつく。NET-6）。
-                let _ = self.dir.sync();
-            }
+            let result = result.and_then(|()| {
+                sync(&self.dir).inspect_err(|_| {
+                    // 巻き戻し（ベストエフォート）。戻せなければ定義は見えたままで、再試行は AlreadyExists になる。
+                    let _ = fs::rename(self.dir.path(name), self.dir.path(&stage));
+                })
+            });
             if result.is_err() {
                 self.discard(&stage);
             }
@@ -578,6 +591,15 @@ impl NetworkStore {
     /// ロックを取れず `NotFound` となり、本メソッドでは回収できない。staging と rename で作成するため
     /// 通常運用では起きず、外部要因の破損に限る。その回収手順は後続 issue（#3067 周辺）で扱う（NET-6）。
     pub fn remove(&self, name: &NetworkName) -> Result<(), NetError> {
+        self.remove_with_sync(name, &Dir::sync)
+    }
+
+    /// [`remove`](Self::remove) の本体。ディレクトリの同期を差し替えられる（同期失敗の試験用）。
+    fn remove_with_sync(
+        &self,
+        name: &NetworkName,
+        sync: &dyn Fn(&Dir) -> Result<(), NetError>,
+    ) -> Result<(), NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
             let g = self.lock_global_exclusive()?;
             let n = g.lock_network(name)?;
@@ -600,12 +622,14 @@ impl NetworkStore {
             let gone = stage_name(REMOVING_PREFIX);
             fs::rename(self.dir.path(name.as_str()), self.dir.path(&gone))
                 .map_err(|e| map_io(&e, "failed to remove network definition"))?;
-            // rename 後は名前が消えている。sync の失敗を返すと再試行が NotFound になるため成功扱いにする。
-            let _ = self.dir.sync();
+            // 名前が消えたことの永続化を確認するまで中身を消さない。失敗したら名前を戻して失敗を返す
+            // （戻せなければ残骸として残り、次の create が掃除する）。
+            if let Err(e) = sync(&self.dir) {
+                let _ = fs::rename(self.dir.path(&gone), self.dir.path(name.as_str()));
+                return Err(e);
+            }
             // 名前は原子的に消えた。中身の後始末の失敗は残骸として残り、次の create が掃除する。
-            let _ = fs::remove_file(n.dir.path(DEFINITION_FILE));
-            let _ = fs::remove_file(n.dir.path(LOCK_FILE));
-            let _ = fs::remove_dir(self.dir.path(&gone));
+            remove_tree(&self.dir, &gone);
             Ok(())
         })
     }
@@ -694,6 +718,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// NET-6: rename 後の同期失敗は呼び出し側へ返し、状態を巻き戻して再試行できる。
+    #[test]
+    fn net6_3059_sync_failure_is_reported_and_rolled_back() {
+        let t = Tmp::new("syncfail");
+        let store = NetworkStore::open(&t.0).unwrap();
+        let fail = |_: &Dir| Err(err(NetErrorCode::Internal, "injected sync failure"));
+        let def = pasta("a");
+        assert_eq!(
+            code(store.create_with_sync(&def, &fail)),
+            NetErrorCode::Internal
+        );
+        assert_eq!(code(store.get(&nn("a"))), NetErrorCode::NotFound);
+        store.create(&def).unwrap();
+        assert_eq!(
+            code(store.remove_with_sync(&nn("a"), &fail)),
+            NetErrorCode::Internal
+        );
+        // 巻き戻され、定義は読める。再試行で消せる。
+        assert_eq!(store.get(&nn("a")).unwrap(), def);
+        store.remove(&nn("a")).unwrap();
+        assert_eq!(code(store.get(&nn("a"))), NetErrorCode::NotFound);
     }
 
     /// NET-6: 初期化の同期は成功時に Ok、fsync できない fd（/dev/null）では Err を返す。

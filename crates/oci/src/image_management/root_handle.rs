@@ -1120,6 +1120,8 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        // PID の再利用で前回の実行の残骸と名前が衝突しうるため、作る前に消す（#3237）。
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("mkdir");
         p
     }

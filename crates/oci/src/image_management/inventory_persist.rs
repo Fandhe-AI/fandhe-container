@@ -774,20 +774,76 @@ mod tests {
         PullId::new(s).expect("pull id")
     }
 
-    fn root(label: &str) -> PathBuf {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fc-oci-inv-persist-{}-{}-{label}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+    /// 試験ごとに一意な一時 root。作る前に残骸を消し、drop で消す（#3237・OCI-7・REPAIR-12）。
+    /// Windows は PID の再利用が速く、前回の実行の残骸と名前が衝突して排他作成が
+    /// `AlreadyExists` になるのを防ぐ。
+    struct TestRoot(PathBuf);
+
+    impl std::ops::Deref for TestRoot {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TestRoot {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            // 試験本体が root を先に消している場合の NotFound などは無視する。
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 指定パスの root を残骸ごと作り直す。パスは試験補助が組み立てた一時領域配下に限る。
+    fn root_at(p: PathBuf) -> TestRoot {
+        let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).expect("mkdir");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
         }
-        p
+        TestRoot(p)
+    }
+
+    fn root(label: &str) -> TestRoot {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        root_at(std::env::temp_dir().join(format!(
+            "fc-oci-inv-persist-{}-{}-{label}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+
+    /// OCI-7・REPAIR-12・#3237: 前回の実行の残骸（同名ディレクトリとその中身）があっても
+    /// root が空の状態から始まり、後始末も働く。
+    #[test]
+    fn oci7_repair12_root_at_clears_stale_residue() {
+        let p =
+            std::env::temp_dir().join(format!("fc-oci-inv-persist-residue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join(IMAGE_INVENTORY_FILE_NAME)).expect("residue dir");
+        fs::write(
+            p.join(format!("{IMAGE_INVENTORY_TMP_PREFIX}stale")),
+            b"stale",
+        )
+        .expect("residue tmp");
+
+        let r = root_at(p.clone());
+        assert_eq!(fs::read_dir(&r).expect("read_dir").count(), 0);
+        // 失敗した呼び出しと同じ排他作成が残骸の上でも成功する。
+        fs::create_dir(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("create_dir");
+        let err = load_image_inventory(&rh(&r)).expect_err("dir is not a file");
+        assert_eq!(err.code(), OciErrorCode::Internal);
+
+        drop(r);
+        let gone = fs::symlink_metadata(&p).expect_err("removed on drop");
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
     }
 
     fn open(root: &Path) -> ImageStore {
@@ -1091,7 +1147,6 @@ mod tests {
         let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
         assert_eq!(loaded.manifests.len(), MAX_IMAGE_MANIFESTS);
         assert_eq!(loaded.tag_refs.len(), MAX_TAG_REFS);
-        let _ = fs::remove_dir_all(&r);
     }
 
     /// OCI-7: 書き込み側も上限を守る（保存できない状態を作らない）。

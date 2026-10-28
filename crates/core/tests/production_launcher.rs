@@ -130,6 +130,12 @@
 //! `/etc/subgid` の自ユーザー行が要るため、`FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けた時だけ実行する。実行時は成功行の前に
 //! `production_launcher: subordinate id mapping verified (uid extents=N, gid extents=M)` を出す。
 //!
+//! シナリオ N（Loopback モード。NET-6・CORE-6・SEC-1・#3064）は `LaunchNetworkMode::Loopback` の起動で、コンテナ内プローブが出す
+//! netns の識別子がホストと異なること・`/proc/self/net/dev` が `lo` とフォールバックトンネルだけであること・127.0.0.1 の自己宛て
+//! UDP が届くこと（`lo` が down だと受信が期限切れになる。#2077）と、終了後に netns の pin（nsfs のマウント・他プロセスの
+//! `ns/net`）が残らないことを照合し、`production_launcher: network loopback isolated lo up and self delivery ok; no netns pin
+//! after terminate (scenario=N)` を出す。範囲写像の経路は `(scenario=N-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
+//!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
 //! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
 //!
@@ -236,8 +242,8 @@ mod linux {
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        LaunchIpcMode, LaunchOptions, ProcessExit, ProcessLauncher, ProductionLauncher,
-        StartTimeouts, SubordinateIdSource, create, start,
+        LaunchIpcMode, LaunchNetworkMode, LaunchOptions, ProcessExit, ProcessLauncher,
+        ProductionLauncher, StartTimeouts, SubordinateIdSource, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
@@ -544,6 +550,10 @@ mod linux {
                 control.map_or_else(|e| format!("error:{:?}", e.kind()), |_| "ok".to_string())
             ));
         }
+        // シナリオ N(Loopback モード。NET-6・CORE-6・#3064): 新しい netns の識別子・インターフェース・自己宛て UDP 配送を出す。
+        if args.iter().any(|a| a == "--net-loopback") {
+            net_loopback_probe(&mut emit);
+        }
         // シナリオ V(sysctls の適用。#2670・CRI-2・CORE-3): コンテナ内の IPC namespace の `kernel.shmmax` を出す。
         if args.iter().any(|a| a == "--with-sysctl") {
             let v = std::fs::read_to_string("/proc/sys/kernel/shmmax").map_or_else(
@@ -766,6 +776,79 @@ mod linux {
 
     fn mkdir(path: &Path) {
         real_entry::mkdir(path);
+    }
+
+    /// 新しい netns でカーネルが自動生成するフォールバックトンネルデバイス名(モジュールのロード状況で有無が変わる)。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+    /// 自己宛て UDP の内容(固定)。
+    const NET_PING: &[u8] = b"fandhe-loopback-ping";
+
+    /// シナリオ N のコンテナ内プローブ(NET-6・#3064)。std だけを使い、`unsafe`・libc は使わない。
+    fn net_loopback_probe(emit: &mut dyn FnMut(String)) {
+        let ns = std::fs::read_link("/proc/self/ns/net").map_or_else(
+            |e| format!("error:{:?}", e.kind()),
+            |p| p.display().to_string(),
+        );
+        emit(format!("NETNS {ns}"));
+        let names = std::fs::read_to_string("/proc/self/net/dev").map_or_else(
+            |e| vec![format!("error:{:?}", e.kind())],
+            |t| {
+                t.lines()
+                    .skip(2)
+                    .filter_map(|l| l.split(':').next())
+                    .map(|n| n.trim().to_string())
+                    .collect()
+            },
+        );
+        emit(format!("NETDEV_LO {}", names.iter().any(|n| n == "lo")));
+        let extra: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| *n != "lo" && !FALLBACK_TUNNEL_DEVICES.contains(n))
+            .collect();
+        emit(format!(
+            "NETDEV_EXTRA {}",
+            if extra.is_empty() {
+                "none".to_string()
+            } else {
+                extra.join(",")
+            }
+        ));
+        let delivery = (|| -> Result<String, String> {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0")
+                .map_err(|e| format!("bind:{:?}", e.kind()))?;
+            sock.set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|e| format!("timeout:{:?}", e.kind()))?;
+            let me = sock
+                .local_addr()
+                .map_err(|e| format!("addr:{:?}", e.kind()))?;
+            sock.send_to(NET_PING, me)
+                .map_err(|e| format!("send:{:?}", e.kind()))?;
+            let mut buf = [0u8; 64];
+            let (n, from) = sock
+                .recv_from(&mut buf)
+                .map_err(|e| format!("recv:{:?}", e.kind()))?;
+            if buf.get(..n) == Some(NET_PING) && from == me {
+                Ok("ok".to_string())
+            } else {
+                Err("mismatch".to_string())
+            }
+        })();
+        emit(format!(
+            "UDP_SELF {}",
+            delivery.unwrap_or_else(|e| format!("error:{e}"))
+        ));
     }
 
     fn write_config(
@@ -1093,7 +1176,9 @@ mod linux {
         scenario_h_state_root_moved_after_start(&env, tag);
         scenario_s_launch_options(&env, tag);
         scenario_y_readonly_root(&env, tag);
+        scenario_n_network_loopback(&env, tag, false);
         if subordinate_requested() {
+            scenario_n_network_loopback(&env, tag, true);
             scenario_i_subordinate_ids(&env, tag);
             scenario_s_subordinate_sealed_inject(&env, tag);
         } else {
@@ -2744,6 +2829,116 @@ mod linux {
             children_of_self().is_empty(),
             "no child may remain after terminate"
         );
+    }
+
+    /// シナリオ N(NET-6・CORE-6・SEC-1・#3064): `Loopback` モードの起動で、コンテナがホストと別の netns に入り、
+    /// `lo`(とカーネルのフォールバックトンネル)だけを持ち、`lo` が up で 127.0.0.1 の自己宛て UDP が届くことを
+    /// 具体値で照合する(`lo` が down だと受信が期限切れになる: #2077)。コンテナの終了後に netns の pin
+    /// (nsfs のマウント・自 uid で読める他プロセスの `ns/net`)が残らないことも照合する。
+    /// `subordinate` が真なら範囲写像(holder の user namespace へ `setns` した後の unshare)の経路で回す。
+    fn scenario_n_network_loopback(env: &Env, tag: u32, subordinate: bool) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options")
+            .with_network(LaunchNetworkMode::Loopback);
+        let mut builder = ProductionLauncher::builder();
+        builder = if subordinate {
+            builder
+                .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                .subordinate_ids(
+                    SubordinateIdSource::system(std::env::var("USER").ok())
+                        .expect("subordinate ids"),
+                )
+        } else {
+            builder.privilege(IsolationPrivilege::RootlessSingleId)
+        };
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            builder
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for loopback network"),
+        );
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .expect("host net ns")
+            .display()
+            .to_string();
+
+        let bundle = Bundle::new(if subordinate { "ns" } else { "n" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("pl{}{tag}", if subordinate { "nn" } else { "n" }))
+            .expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let mut container_netns = String::new();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            container_netns = value_of(&lines, "NETNS").to_string();
+            assert!(
+                container_netns.starts_with("net:["),
+                "container netns: {container_netns}"
+            );
+            assert_ne!(container_netns, host_netns, "must not share the host netns");
+            assert_eq!(value_of(&lines, "NETDEV_LO"), "true");
+            assert_eq!(value_of(&lines, "NETDEV_EXTRA"), "none");
+            assert_eq!(value_of(&lines, "UDP_SELF"), "ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+        // pin が残らない: nsfs のマウントも、自 uid で読める他プロセスの ns/net も、コンテナの netns を指さない。
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        assert!(
+            !mountinfo
+                .lines()
+                .any(|l| l.contains("nsfs") && l.contains(&container_netns)),
+            "no nsfs mount may pin the container netns"
+        );
+        let held = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter(|e| {
+                std::fs::read_link(e.path().join("ns/net"))
+                    .is_ok_and(|p| p.display().to_string() == container_netns)
+            })
+            .count();
+        assert_eq!(held, 0, "no process may keep the container netns alive");
+        // 成功行は固定文言(CI の照合が試験ソースの文字列リテラルから期待行を導出するため、プレースホルダを持たせない)。
+        if subordinate {
+            println!(
+                "production_launcher: network loopback isolated lo up and self delivery ok; no netns pin after terminate (scenario=N-subordinate)"
+            );
+        } else {
+            println!(
+                "production_launcher: network loopback isolated lo up and self delivery ok; no netns pin after terminate (scenario=N)"
+            );
+        }
     }
 
     /// シナリオ V: `linux.sysctl` の namespaced キー(IPC 系 `kernel.shmmax`)が実際の IPC namespace と procfs を通って

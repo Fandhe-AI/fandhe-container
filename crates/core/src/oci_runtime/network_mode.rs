@@ -16,10 +16,10 @@
 //! | `Host` | 無し、または path 無し | `HostShared`(config のエントリより起動オプションを優先。`--ipc host` と同じ) |
 //! | `Host` | path 付き / 重複 | `InvalidArgument` |
 //!
-//! # 未実装(REPAIR-3)
+//! # 実体と未実装(REPAIR-3)
 //!
-//! `NewLoopback` の実体(CLONE_NEWNET と lo の up)は #3064 の担当で、それまで本番 launcher は
-//! `Unimplemented` で拒否する(受理して反映しない状態を作らない)。D8 の netns 素性の照合は #1873。
+//! `NewLoopback` の実体(CLONE_NEWNET と lo の up)は #3064 で入った。rootless の中間プロセスが netns を作り、
+//! exec の前に `exec::unshare_and_configure` が `lo` を up にする。D8 の netns 素性の照合は未実装(#1873)。
 
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::types::{ErrorCode, TraitError};
@@ -42,7 +42,7 @@ pub enum LaunchNetworkMode {
 pub enum EffectiveNetwork {
     /// ホストの network namespace を共有する(新しい netns を作らない)。
     HostShared,
-    /// 新しい network namespace を作り lo を up する(実体は #3064)。
+    /// 新しい network namespace を作り lo を up する(実体は #3064 で実装済み)。
     NewLoopback,
 }
 

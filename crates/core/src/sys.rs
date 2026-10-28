@@ -90,7 +90,9 @@
 use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{
+    AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd,
+};
 
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +446,11 @@ macro_rules! libc_consts_checks {
             libc_const_eq!(AF_NETLINK, u16, c_int);
             libc_const_eq!(SOCK_RAW, i32, c_int);
             libc_const_eq!(SOCK_CLOEXEC, i32, c_int);
+            libc_const_eq!(AF_INET, i32, c_int);
+            libc_const_eq!(SOCK_DGRAM, i32, c_int);
+            libc_const_eq!(IFF_UP, i16, c_int);
+            libc_const_eq!(IFF_LOOPBACK, i16, c_int);
+            libc_const_eq!(IFNAMSIZ, usize, libc::size_t);
             libc_const_eq!(NETLINK_AUDIT, i32, c_int);
             libc_const_eq!(POLLIN, i16, c_short);
             libc_const_eq!(MSG_DONTWAIT, i32, c_int);
@@ -465,6 +472,8 @@ macro_rules! libc_consts_checks {
             use libc::{c_long, c_uint, c_ulong};
             libc_const_eq!(BINDERFS_SUPER_MAGIC, i64, c_long);
             libc_const_eq!(NS_GET_USERNS, u64, c_ulong);
+            libc_const_eq!(SIOCGIFFLAGS, u64, c_ulong);
+            libc_const_eq!(SIOCSIFFLAGS, u64, c_ulong);
             libc_const_eq!(NS_GET_PARENT, u64, c_ulong);
             libc_const_eq!(NS_GET_NSTYPE, u64, c_ulong);
             libc_const_eq!(NS_GET_OWNER_UID, u64, c_ulong);
@@ -830,6 +839,16 @@ mod consts {
     pub const AF_NETLINK: u16 = 16;
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    // include/linux/socket.h・uapi/asm-generic/socket.h・uapi/linux/sockios.h・uapi/linux/if.h の値
+    // （rootless の中間プロセスが新しい network namespace の `lo` を up にする `SIOCGIFFLAGS` /
+    // `SIOCSIFFLAGS`。NET-6・CORE-6・#3064）。`IFF_UP`・`IFF_LOOPBACK` は `ifr_flags`（`short`）のビット。
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_DGRAM: i32 = 2;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const IFF_UP: i16 = 0x1;
+    pub const IFF_LOOPBACK: i16 = 0x8;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
@@ -1242,6 +1261,16 @@ mod consts {
     pub const AF_NETLINK: u16 = 16;
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    // include/linux/socket.h・uapi/asm-generic/socket.h・uapi/linux/sockios.h・uapi/linux/if.h の値
+    // （rootless の中間プロセスが新しい network namespace の `lo` を up にする `SIOCGIFFLAGS` /
+    // `SIOCSIFFLAGS`。NET-6・CORE-6・#3064）。`IFF_UP`・`IFF_LOOPBACK` は `ifr_flags`（`short`）のビット。
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_DGRAM: i32 = 2;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const IFF_UP: i16 = 0x1;
+    pub const IFF_LOOPBACK: i16 = 0x8;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
@@ -1551,6 +1580,13 @@ mod consts {
     pub const AF_NETLINK: u16 = 0;
     pub const SOCK_RAW: i32 = 0;
     pub const SOCK_CLOEXEC: i32 = 0;
+    pub const AF_INET: i32 = 0;
+    pub const SOCK_DGRAM: i32 = 0;
+    pub const SIOCGIFFLAGS: u64 = 0;
+    pub const SIOCSIFFLAGS: u64 = 0;
+    pub const IFF_UP: i16 = 0;
+    pub const IFF_LOOPBACK: i16 = 0;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 0;
     pub const POLLIN: i16 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
@@ -1577,7 +1613,8 @@ pub(crate) enum NsFlag {
     Ipc,
     User,
     Pid,
-    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）専用で、`unshare` 経路は使わない。
+    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）と、Loopback モードの `unshare`
+    /// （rootless の中間プロセスが新しい netns を作る。NET-6・#3064）で使う。
     Net,
 }
 
@@ -1794,6 +1831,108 @@ struct StatFs {
 struct StatFs {
     f_type: i64,
     f_flags: i64,
+}
+
+/// `struct ifreq` のうち `ifr_flags`（`SIOCGIFFLAGS` / `SIOCSIFFLAGS`）だけを表す型（NET-6・#3064）。
+///
+/// 名前は常に `lo` で、呼び出し元から受け取らない（壊れた値を表現できない形にする。REPAIR-2）。
+/// カーネルは `sizeof(struct ifreq)`（16 バイトの名前 + 24 バイトの union。union は pointer を含み
+/// アラインメント 8）= 40 バイトを読み書きするため、`_pad` で union の大きさを埋める。レイアウトは
+/// 最上位の `libc_abi` で `libc::ifreq` と `const` 評価で照合する。
+#[repr(C, align(8))]
+struct IfReqFlags {
+    ifr_name: [u8; consts::IFNAMSIZ],
+    ifr_flags: i16,
+    _pad: [u8; 22],
+}
+
+impl IfReqFlags {
+    /// 名前 `lo`・flags 0 の要求を作る。
+    fn loopback() -> Self {
+        let mut ifr_name = [0u8; consts::IFNAMSIZ];
+        ifr_name[0] = b'l';
+        ifr_name[1] = b'o';
+        Self {
+            ifr_name,
+            ifr_flags: 0,
+            _pad: [0; 22],
+        }
+    }
+}
+
+/// `socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0)` を開く（`lo` の flags の ioctl 用。送受信はしない）。
+fn inet_dgram_socket() -> Result<OwnedFd, SysError> {
+    // SAFETY: 引数はすべて値渡しの整数でポインタを取らない。成功時の戻り値は新規 fd で、直後に
+    // `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe {
+        socket(
+            consts::AF_INET,
+            consts::SOCK_DGRAM | consts::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した socket が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 現在の network namespace の `lo` の flags を `SIOCGIFFLAGS` で読む。読み取りだけで特権は要らない。
+fn get_loopback_flags(fd: BorrowedFd<'_>) -> Result<i16, SysError> {
+    let mut req = IfReqFlags::loopback();
+    // SAFETY: `req` はスタック上の初期化済み 40 バイトの `repr(C, align(8))` で、カーネルが
+    // `SIOCGIFFLAGS` で読み書きする `struct ifreq`（40 バイト）と同じ大きさ・アラインメント
+    // （`libc_abi` で照合）。`fd` は生存中の `BorrowedFd`。`req` は呼び出しの間ほかから借用されない。
+    let r = unsafe { ioctl(fd.as_raw_fd(), consts::SIOCGIFFLAGS, &raw mut req) };
+    if r < 0 {
+        return Err(last_error());
+    }
+    Ok(req.ifr_flags)
+}
+
+/// 現在の network namespace の `lo` の flags を返す（`SIOCGIFFLAGS`。読み取りのみ）。
+///
+/// 呼び出し元の netns の `lo` を観測する試験・診断用。ホストの設定は変えない（NET-6・#3064）。
+#[cfg(test)]
+pub(crate) fn loopback_flags() -> Result<i16, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let sock = inet_dgram_socket()?;
+    get_loopback_flags(sock.as_fd())
+}
+
+/// 現在の network namespace の `lo` を up にする（NET-6・CORE-6・#3064）。
+///
+/// rootless の中間プロセスが新しい netns（コンテナの user namespace が所有）へ入った直後、exec より前に
+/// 呼ぶ。`SIOCSIFFLAGS` は netns を所有する user namespace の `CAP_NET_ADMIN` を要する。fail-closed:
+/// `lo` が loopback でなければ拒否し、get してから `IFF_UP` を足して set し、事後に up を確かめる。
+/// 名前は固定の `lo`。ホストの netns に対して呼ばないこと（呼び出しは `exec` の `Net` 分岐だけ）。
+pub(crate) fn set_loopback_up() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let sock = inet_dgram_socket()?;
+    let flags = get_loopback_flags(sock.as_fd())?;
+    if flags & consts::IFF_LOOPBACK == 0 {
+        return Err(SysError::Os(consts::EINVAL));
+    }
+    if flags & consts::IFF_UP == 0 {
+        let mut req = IfReqFlags::loopback();
+        req.ifr_flags = flags | consts::IFF_UP;
+        // SAFETY: `req` はスタック上の初期化済み 40 バイトの `repr(C, align(8))`（`struct ifreq` と同じ
+        // 大きさ・アラインメント。`libc_abi` で照合）。`sock` は生存中の `OwnedFd`。カーネルは
+        // `SIOCSIFFLAGS` で `req` を読むだけで、呼び出しの間ほかから借用されない。
+        let r = unsafe { ioctl(sock.as_raw_fd(), consts::SIOCSIFFLAGS, &raw const req) };
+        if r < 0 {
+            return Err(last_error());
+        }
+    }
+    if get_loopback_flags(sock.as_fd())? & consts::IFF_UP == 0 {
+        return Err(SysError::Os(consts::EINVAL));
+    }
+    Ok(())
 }
 
 /// カーネル監査（NETLINK_AUDIT）用のソケットを開く（`SOCK_RAW|SOCK_CLOEXEC`。TASK-41.5.2・#840）。
@@ -5325,6 +5464,15 @@ mod libc_abi {
         assert!(align_of::<super::RLimit64>() == align_of::<libc::rlimit>());
     };
 
+    // `IfReqFlags`: `libc::ifreq`（NET-6・#3064）。`ifr_flags` は `ifr_ifru` union の先頭にある。
+    const _: () = {
+        assert!(size_of::<super::IfReqFlags>() == size_of::<libc::ifreq>());
+        assert!(align_of::<super::IfReqFlags>() == align_of::<libc::ifreq>());
+        assert!(offset_of!(super::IfReqFlags, ifr_name) == offset_of!(libc::ifreq, ifr_name));
+        assert!(offset_of!(super::IfReqFlags, ifr_flags) == offset_of!(libc::ifreq, ifr_ifru));
+        assert!(size_of::<libc::c_short>() == size_of::<i16>());
+    };
+
     // `SockaddrNl`: `libc::sockaddr_nl`。`nl_pad` は `libc` で非公開のため、自前のオフセットと
     // 「`nl_family` の直後」で代わりに照合する(net crate の #1841 と同じ扱い)。
     const _: () = {
@@ -6732,7 +6880,6 @@ mod tests {
             Err(other) => panic!("unexpected result: {other:?}"),
         }
     }
-    use std::os::fd::AsFd as _;
 
     /// REPAIR-5・#1697: AF_UNIX の socket だけが送信対象と判定され、pipe・通常ファイル・`/dev/null`・TCP・UDP は
     /// `Unsupported` で何も書かれない。
@@ -6780,6 +6927,32 @@ mod tests {
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
+    /// NET-6・#3064: `lo` の up に使う定数・構造体の固定値。
+    #[test]
+    fn net6_loopback_ioctl_constants_and_layout() {
+        assert_eq!(consts::SIOCGIFFLAGS, 0x8913);
+        assert_eq!(consts::SIOCSIFFLAGS, 0x8914);
+        assert_eq!(consts::IFF_UP, 1);
+        assert_eq!(consts::IFF_LOOPBACK, 8);
+        assert_eq!(consts::AF_INET, 2);
+        assert_eq!(consts::SOCK_DGRAM, 2);
+        assert_eq!(consts::IFNAMSIZ, 16);
+        assert_eq!(std::mem::size_of::<IfReqFlags>(), 40);
+        assert_eq!(std::mem::align_of::<IfReqFlags>(), 8);
+        let req = IfReqFlags::loopback();
+        assert_eq!(&req.ifr_name[..3], b"lo\0");
+        assert!(req.ifr_name[3..].iter().all(|b| *b == 0));
+        assert_eq!(req.ifr_flags, 0);
+    }
+
+    /// NET-6・#3064: ホストの netns の `lo` を読み取るだけ（変更しない）。`IFF_LOOPBACK` が立つ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_loopback_flags_reads_host_lo() {
+        let flags = loopback_flags().expect("read lo flags");
+        assert_eq!(flags & consts::IFF_LOOPBACK, consts::IFF_LOOPBACK);
+    }
+
     #[test]
     fn sec4_task41_5_2_netlink_consts_and_layout_are_exact() {
         assert_eq!((consts::AF_NETLINK, consts::SOCK_RAW), (16, 3));

@@ -42,7 +42,7 @@
 //!
 //! - NET-6 の host / none モードは `NetworkPlugin` を経由しない。core の `LaunchNetworkMode`（`Host` / `Loopback`）と
 //!   supervisor の起動経路が扱う（`docs/design/network-wiring.md` D5〜D8・#1870。config との突き合わせは #3058、
-//!   Loopback の netns は #3064、netns 素性の照合は #1873）
+//!   Loopback の netns は #3064〔実装済み〕、netns 素性の照合は #1873）
 //! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、
 //!   `--add-host` / `--dns`（NET-12）、rootless ネットワーク（NET-9・検討中）、
 //!   ホスト側 bind IP の解釈（運ぶ口は任意指定の `host_ip` として足した。#2676）

@@ -308,7 +308,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | issue | 内容 | 担当 | 依存 |
 | ----- | ---- | ---- | ---- |
 | #3058 | core: `LaunchOptions` の network モードと config との突き合わせ（D7） | runtime-builder | なし |
-| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 |
+| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6。実装済み） | runtime-builder | #3058 |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし |
 | #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 |

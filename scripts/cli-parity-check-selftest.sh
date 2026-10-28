@@ -9,10 +9,11 @@
 # ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）。make ci には含めない。
 # 失敗は `FAIL:` 行を出し、最後に非 0 で終了する。bash 3.2 以上で動く。
 #
-# 構成: capture は 30 本近くを同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
+# 構成: capture は 40 本強を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
 # CI の時間枠を圧迫するため。同時実行の負荷は、CLI が即座に終わるときの監視サブシェル停止の競合
 # （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない。
 set -uo pipefail
+selftest_t0=$SECONDS
 
 script_dir="$(cd "$(dirname -- "$0")" && pwd)"
 target="$script_dir/cli-parity-check.sh"
@@ -564,6 +565,8 @@ else
   fail "sigdel: chain reached delete"
 fi
 wait
+selftest_t1=$SECONDS
+printf 'cli-parity-selftest: phase=capture elapsed=%ss\n' "$((selftest_t1 - selftest_t0))"
 
 if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
   expect_rc "ldd hang: capture finishes with rc 0" 0 "$(rc_of lddhang)"
@@ -1065,6 +1068,7 @@ for f in "$work/tmpdir"/* "$work/tmpdir"/.[!.]*; do
 done
 expect_eq "no leftover temp directories" 0 "$leftover"
 
+printf 'cli-parity-selftest: phase=assert elapsed=%ss total=%ss\n' "$((SECONDS - selftest_t1))" "$((SECONDS - selftest_t0))"
 if [ "$fails" -ne 0 ]; then
   printf '%s check(s) failed\n' "$fails"
   exit 1

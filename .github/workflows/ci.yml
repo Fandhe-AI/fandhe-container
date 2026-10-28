@@ -1976,14 +1976,20 @@ jobs:
       #   ProductionStarter が rootful 経路（file capability 前提）へ入って失敗するため、試験本体が plugin と supervisor だけを
       #   専用ディレクトリへ複製し、launcher が無いことを assert してから起動する（start_stop_delete_real と同じ扱い）。
       # - 成功行の照合: scripts/check-success-lines.sh の `--libtest-ignored` が `#[ignore]` 関数から `test <名前> ... ok` を導き、
-      #   `test result: ok. 1 passed; 0 failed;` と ignored / FAILED の不在をあわせて照合する（runtime_service_namespaces と同じ。#2959）。
-      # - rate limit の方式: 試験 1 回で pull は 1 回（小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
+      #   `test result: ok. 2 passed; 0 failed;` と ignored / FAILED の不在をあわせて照合する（runtime_service_namespaces と同じ。#2959）。
+      # - 2 試験を 1 回の起動で回す（#3225）: 同じファイルの `#[ignore]` は production_binary_full_lifecycle_real と
+      #   production_binary_restart_readopts_running_container_real（running のコンテナを残した
+      #   plugin-cri の再起動。CRI-1・CRI-2・CORE-1）の 2 件で、
+      #   インスタンスロックのため `--test-threads=1` の直列が必須（名前順で lifecycle が先）。
+      #   再起動の試験は supervisor の起動が本物の `XDG_RUNTIME_DIR/systemd/private` を要するため本物の状態ルートを共有し、記録が空でなければ fail-closed にする。
+      #   `--exact` を外したので、照合は 2 件の ok と `2 passed` を要求する。
+      # - rate limit の方式: 1 回の実行で pull は 2 回（各試験 1 回。小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
       #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
       #   pull を消費する前に fail-closed にする。試験自身も gRPC メタデータから 429 を識別して固定行を出す（#2966）が、
       #   試験が失敗したときも同じプローブを事後診断として再実行し、rate limit が原因なら文言で分かるようにする。
       # - 実行頻度: 他の `--ignored` 試験と揃えて PR と main の両方（ubuntu のみ）で回す。rate limit で頻繁に赤になる場合は
       #   main と workflow_dispatch のみへ絞る判断をオーナーへ上げる（Docker Hub のミラー切替は試験定数の変更が要るため別 issue）。
-      # - timeout: 試験の watchdog が 900 秒・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 20 分にする
+      # - timeout: 試験の watchdog が 900 秒と 600 秒（2 試験の和）・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 30 分にする
       #   （watchdog より先に step timeout が切れると試験側の診断が失われる）。
       - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -2010,16 +2016,16 @@ jobs:
           fi
           echo "PCRI_TEST_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: production_binary_full_lifecycle_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818）
+      - name: container_grpc の実機前提試験 2 件の実行（--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818・#3225）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/production_binary_full_lifecycle_real.log"
           rc=0
           USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${PCRI_TEST_BIN}" \
-            --ignored --exact production_binary_full_lifecycle_real --test-threads=1 2>&1 | tee "${log}" || rc=$?
+            --ignored --test-threads=1 2>&1 | tee "${log}" || rc=$?
           if [ "${rc}" -ne 0 ]; then
             # 事後診断: 試験の固定行（#2966）に加え、rate limit が原因ならここでも識別文言が出る。
             make --no-print-directory docker-hub-ratelimit-probe || true

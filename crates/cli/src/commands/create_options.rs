@@ -57,6 +57,19 @@ pub(super) fn document_of(
     .with_cap_drop(options.cap_drop.clone())
     .and_then(|doc| doc.with_read_only(options.read_only))
     .and_then(|doc| match pasta {
+        // Linux は常に `network` を書く。`--network` の省略は `none`(SEC-1 の「既定で閉じる」。D4・#1873)。
+        // これが既定を `none` に変える唯一の箇所。非 Linux は `create_network` が指定を `UNIMPLEMENTED` で止める。
+        None if cfg!(target_os = "linux") => doc.with_network(
+            Some(
+                options
+                    .network
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| "none".to_owned()),
+            ),
+            options.network.add_hosts.clone(),
+            options.network.dns.clone(),
+        ),
         None => Ok(doc),
         Some(record) => doc
             .with_network(
@@ -67,9 +80,9 @@ pub(super) fn document_of(
             .with_pasta(Some(record.to_body())),
     })
     // `network` を書く pasta の段の後ろに `publish` を並べる(`with_publish` はユーザー定義名の `network` を要する)。
-    // 継ぎ目(REPAIR-3・NET-9・#3200): `publish` はユーザー定義名の `network` と組で書く。`with_network` を文書へ書く処理は
-    // #1873 が足し、その後ろに並べる。現状は `validate_network_options` が `-p` を `UNIMPLEMENTED` で止めるため、
-    // 空でない `publish` はここへ届かない(届いても `network` が無いので文書にできず `InvalidArgument`)。
+    // 継ぎ目(REPAIR-3・NET-9・#3200): `publish` はユーザー定義名の `network` と組で書く。ユーザー定義名は
+    // `create_network::reject_unwired_network` が `UNIMPLEMENTED` で止めるため、空でない `publish` はここへ届かない
+    // (届いても `none` / `host` では文書にできず `InvalidArgument`)。
     .and_then(|doc| doc.with_publish(options.network.publish.clone()))
 }
 
@@ -141,11 +154,35 @@ mod tests {
         CreateOptionArgs::default()
     }
 
-    /// SUP-12・CLI-1: 指定なしは空の文書・空の label。
+    /// SUP-12・CLI-1: 指定なしの label は空。文書は非 Linux では空、Linux では既定の `network none` だけを持つ。
     #[test]
     fn sup12_create_options_empty() {
-        assert!(document_of(&args(), None).expect("doc").is_empty());
+        let doc = document_of(&args(), None).expect("doc");
+        if cfg!(target_os = "linux") {
+            assert_eq!(doc.network(), Some("none"));
+            assert!(doc.add_hosts().is_empty());
+            assert!(doc.dns().is_empty());
+        } else {
+            assert!(doc.is_empty());
+        }
         assert_eq!(labels_of(&args()).expect("labels"), Annotations::default());
+    }
+
+    /// NET-6・NET-12・SEC-1(#1873): Linux は `--network` 省略で `none`、指定した値と add-host / dns は入力順で載る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_document_of_writes_network_modes() {
+        let mut a = args();
+        a.network.network = Some("host".into());
+        a.network.add_hosts = vec!["b:192.0.2.2".into(), "a:192.0.2.1".into()];
+        a.network.dns = vec!["192.0.2.53".into()];
+        let doc = document_of(&a, None).expect("doc");
+        assert_eq!(doc.network(), Some("host"));
+        assert_eq!(doc.add_hosts(), ["b:192.0.2.2", "a:192.0.2.1"]);
+        assert_eq!(doc.dns(), ["192.0.2.53"]);
+        let mut a = args();
+        a.network.add_hosts = vec!["a:192.0.2.1".into()];
+        assert_eq!(document_of(&a, None).expect("doc").network(), Some("none"));
     }
 
     /// NET-9(#3200): `network` の無い `publish` は文書にできない(継ぎ目の固定)。
@@ -184,7 +221,7 @@ mod tests {
     #[test]
     fn cli1_sup12_create_options_read_only() {
         let mut a = CreateOptionArgs::default();
-        assert!(document_of(&a, None).expect("doc").is_empty());
+        assert!(!document_of(&a, None).expect("doc").read_only());
         a.read_only = true;
         let doc = document_of(&a, None).expect("doc");
         assert!(!doc.is_empty());
@@ -307,9 +344,17 @@ mod tests {
         let doc = document_of(&a, Some(&record)).expect("doc");
         assert_eq!(doc.pasta(), Some(BODY));
         assert_eq!(doc.network(), Some("web"));
-        // pasta が無ければ従来どおり network は文書に載らない。
+        // pasta の記録が無ければ pasta は載らない。network は Linux では常に書く(非 Linux は載せない。#1873)。
         let doc = document_of(&a, None).expect("doc");
-        assert!(doc.pasta().is_none() && doc.network().is_none());
+        assert!(doc.pasta().is_none());
+        assert_eq!(
+            doc.network(),
+            if cfg!(target_os = "linux") {
+                Some("web")
+            } else {
+                None
+            }
+        );
         // ユーザー定義名でなければ pasta は置けない(fail-closed)。
         let none = CreateOptionArgs {
             network: crate::commands::args::CreateNetworkArgs {

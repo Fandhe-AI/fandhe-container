@@ -285,6 +285,8 @@ struct FakeDeps {
     release_fails: bool,
     /// `recover_interrupted` が返すエラーの code（`None` なら成功。#2011）。
     recover_fails: Option<ErrorCode>,
+    /// `true` なら `prepare_network` / `release_network` / `network_log_mode` を実装して呼び出しを記録する(#1873・D14)。
+    net_hooks: bool,
 }
 
 impl FakeDeps {
@@ -327,6 +329,24 @@ impl StartDeps for FakeDeps {
         };
         std::thread::sleep(self.prepare_delay);
         Ok(instance)
+    }
+
+    fn prepare_network(&mut self, _id: &ContainerId) -> Result<(), TraitError> {
+        if self.net_hooks {
+            self.step("net")?;
+        }
+        Ok(())
+    }
+
+    fn release_network(&mut self) -> Result<(), TraitError> {
+        if self.net_hooks {
+            self.step("release_net")?;
+        }
+        Ok(())
+    }
+
+    fn network_log_mode(&self) -> Option<&'static str> {
+        self.net_hooks.then_some("host")
     }
 
     fn build_audit_sink(&mut self) -> Result<(), TraitError> {
@@ -373,6 +393,7 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             prepare_delay: Duration::ZERO,
             release_fails: false,
             recover_fails: None,
+            net_hooks: false,
         },
         launcher,
     )
@@ -1330,4 +1351,136 @@ fn core3_launcher_timeout_within_deadline_releases_cgroup() {
         StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::Timeout),
         other => panic!("unexpected report: {other:?}"),
     }
+}
+
+/// NET-6・NET-12・D14(#1873): 手順 4b は起動権の予約の後(cgroup・監査 sink・launcher 構築の後、launch の前)に呼ばれ、
+/// 成功時は生成ファイルを残す。
+#[test]
+fn net12_prepare_network_runs_after_claim_before_launch() {
+    let env = Env::new("net-order");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    d.net_hooks = true;
+    let mut out = Vec::new();
+    let running = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .unwrap_or_else(|_| panic!("started: {}", String::from_utf8_lossy(&out)));
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "net", "launch"]
+    );
+    drop(running);
+}
+
+/// NET-12・D14(#1873): 手順 4b の失敗は launch へ進まず、予約を手放す前に `release_net` が呼ばれ、続けて cgroup を消す。
+#[test]
+fn net12_prepare_network_failure_skips_cgroup_and_releases() {
+    let env = Env::new("net-fail");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    d.net_hooks = true;
+    d.fail_at = Some("net");
+    let mut out = Vec::new();
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(
+        calls_of(&calls),
+        [
+            "check",
+            "prepare",
+            "audit",
+            "build",
+            "net",
+            "release_net",
+            "release",
+            "release_net"
+        ]
+    );
+    assert_eq!(l.launches(), 0);
+    assert_eq!(
+        env.record(&env.id).status().state(),
+        ContainerState::Created
+    );
+}
+
+/// NET-12・D14(#1873): 監査 sink・launcher 構築の失敗は `release` → `release_net` の逆順で巻き戻す。launch の失敗
+/// (予約を手放した後)は別世代の生成物を消さないよう `release_net` を呼ばない(CORE-2・SEC-1)。
+#[test]
+fn net12_later_failures_release_cgroup_then_network() {
+    for step in ["audit", "build"] {
+        let env = Env::new(&format!("net-late-{step}"));
+        env.create(&env.id);
+        let calls = new_calls();
+        let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+        d.net_hooks = true;
+        d.fail_at = Some(step);
+        let mut out = Vec::new();
+        assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+        let got = calls_of(&calls);
+        assert_eq!(&got[got.len() - 2..], ["release", "release_net"], "{step}");
+    }
+    let env = Env::new("net-late-launch");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.launch_error = Some(ErrorCode::Internal);
+    let (mut d, _l) = deps(&calls, fl);
+    d.net_hooks = true;
+    let mut out = Vec::new();
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(
+        calls_of(&calls),
+        [
+            "check", "prepare", "audit", "build", "net", "launch", "release"
+        ]
+    );
+}
+
+/// NET-12・D14(#1873): 生成ファイル(手順 4b)を作った後の失敗でも、cgroup の削除に失敗した経路では生存し得る
+/// コンテナの bind 元を消さない(`release_net` を呼ばない)。`net` を通した後の失敗(launch)で照合する。
+#[test]
+fn net12_release_failure_keeps_generated_files() {
+    let env = Env::new("net-keep");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.launch_error = Some(ErrorCode::Internal);
+    let (mut d, _l) = deps(&calls, fl);
+    d.net_hooks = true;
+    d.release_fails = true;
+    let mut out = Vec::new();
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(
+        calls_of(&calls),
+        [
+            "check", "prepare", "audit", "build", "net", "launch", "release"
+        ]
+    );
+}
+
+/// NET-12・D14(#1873): 手順 4b の後の cgroup 削除の失敗(予約を握ったまま `DiscardClaim`)でも、予約を手放す前に
+/// 生成物を消し、cgroup の削除失敗の後は `release_net` を再度呼ばない(2 回目は no-op のため記録は 1 回分)。
+#[test]
+fn net12_discard_claim_releases_network_before_cgroup() {
+    let env = Env::new("net-discard");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    d.net_hooks = true;
+    d.fail_at = Some("net");
+    d.release_fails = true;
+    let mut out = Vec::new();
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(
+        calls_of(&calls),
+        [
+            "check",
+            "prepare",
+            "audit",
+            "build",
+            "net",
+            "release_net",
+            "release"
+        ]
+    );
 }

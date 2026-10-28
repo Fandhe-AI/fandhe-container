@@ -51,8 +51,10 @@ use fandhe_container_supervisor::container_options::network::net_error_to_trait;
 
 use super::args::CreateNetworkArgs;
 
-/// 結線されるまでの固定拒否文言。
-const NOT_WIRED_MESSAGE: &str = "network options (--network, --add-host, --dns, --publish) are not wired to the launch path yet";
+/// 結線されていない指定(ユーザー定義名・`container:`・`-p`)の固定拒否文言。
+const NOT_WIRED_MESSAGE: &str = "user-defined networks, container: networks and port publishing are not wired to the launch path yet";
+/// 非 Linux で network 系の指定を拒否する固定文言(MAC / WIN 系の結線の後続。D1)。
+const PLATFORM_MESSAGE: &str = "network options are not supported on this platform yet";
 /// `-p` がユーザー定義名の `--network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "port publishing requires a user-defined network";
 /// rootful の `-p` の固定拒否文言(D13 の判断待ち)。
@@ -117,7 +119,7 @@ pub(super) fn validate_network_options(
     resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
 ) -> Result<(), TraitError> {
     check_network_options(args, resolve_privilege)?;
-    reject_not_wired(args)
+    reject_unwired_network(args, cfg!(target_os = "linux"))
 }
 
 /// 4 つのフラグの形式検証だけを行い、`--network` がユーザー定義名かを返す(`Unimplemented` にはしない)。
@@ -145,7 +147,10 @@ pub(super) fn check_network_options(
         Some(NetworkChoice::None) => Some(NetworkMode::None),
         Some(NetworkChoice::Host) => Some(NetworkMode::Host),
         // 名前つき・container: は for_mode(Bridge は UNIMPLEMENTED を返して検出を隠す)を通さない。
-        Some(NetworkChoice::Named(_) | NetworkChoice::ContainerRef) | None => None,
+        Some(NetworkChoice::Named(_) | NetworkChoice::ContainerRef) => None,
+        // 省略は `none` 扱い(D4・#1873。文書へは `none` が書かれる)。`--dns` の none の制約を create の時点で適用し、
+        // supervisor の再検証との食い違いで start だけが失敗する状態を作らない。
+        None => Some(NetworkMode::None),
     };
     if let Some(mode) = mode {
         let dns: Vec<&str> = args.dns.iter().map(String::as_str).collect();
@@ -179,14 +184,28 @@ pub(super) fn check_network_options(
     Ok(matches!(choice, Some(NetworkChoice::Named(_))))
 }
 
-/// 検証を通った指定があれば `Unimplemented`(D3。起動経路への結線は #1873)。
-pub(super) fn reject_not_wired(args: &CreateNetworkArgs) -> Result<(), TraitError> {
-    if args.network.is_some()
-        || !args.publish.is_empty()
-        || !args.add_hosts.is_empty()
-        || !args.dns.is_empty()
-    {
+/// 起動経路に結線されていない指定を `Unimplemented` で拒否する(D3・#1873。形式の検証は済んでいる前提)。
+///
+/// Linux は `none` / `host` と `--add-host` / `--dns` を受ける(supervisor の start が反映する)。
+/// ユーザー定義名・`container:`・`-p` は将来仕様で `UNIMPLEMENTED`(rootless の pasta は #1936〜#1940・NET-9、
+/// rootful は D13〔#3207・#3069・#3074〕、定義の存在確認は #3066)。非 Linux は network 系の指定すべてを拒否する
+/// (MAC / WIN 系の結線の後続。`linux` は試験で差し替えるための引数)。
+pub(super) fn reject_unwired_network(
+    args: &CreateNetworkArgs,
+    linux: bool,
+) -> Result<(), TraitError> {
+    let unwired = !args.publish.is_empty()
+        || args
+            .network
+            .as_deref()
+            .map(NetworkChoice::parse)
+            .and_then(Result::ok)
+            .is_some_and(|c| matches!(c, NetworkChoice::Named(_) | NetworkChoice::ContainerRef));
+    if unwired {
         return Err(TraitError::new(ErrorCode::Unimplemented, NOT_WIRED_MESSAGE));
+    }
+    if !linux && (args.network.is_some() || !args.add_hosts.is_empty() || !args.dns.is_empty()) {
+        return Err(TraitError::new(ErrorCode::Unimplemented, PLATFORM_MESSAGE));
     }
     Ok(())
 }
@@ -237,6 +256,8 @@ mod tests {
 
     const INV: Option<ErrorCode> = Some(ErrorCode::InvalidArgument);
     const UNI: Option<ErrorCode> = Some(ErrorCode::Unimplemented);
+    /// none / host / add-host / dns は Linux では受理し、非 Linux では `UNIMPLEMENTED`(#1873・D1)。
+    const WIRED: Option<ErrorCode> = if cfg!(target_os = "linux") { None } else { UNI };
 
     /// NET-12: 指定が無ければ従来どおり何も拒否しない。
     #[test]
@@ -253,8 +274,8 @@ mod tests {
         assert_eq!(code(&a(Some(".x"), &[], &[])), INV);
         assert_eq!(code(&a(Some("container:x"), &[], &[])), UNI);
         assert_eq!(code(&a(Some("container:x"), &["bad"], &[])), INV);
-        assert_eq!(code(&a(Some("none"), &[], &[])), UNI);
-        assert_eq!(code(&a(Some("host"), &[], &[])), UNI);
+        assert_eq!(code(&a(Some("none"), &[], &[])), WIRED);
+        assert_eq!(code(&a(Some("host"), &[], &[])), WIRED);
         assert_eq!(code(&a(Some("web"), &[], &[])), UNI);
     }
 
@@ -262,11 +283,13 @@ mod tests {
     #[test]
     fn net12_dns_decision_table() {
         assert_eq!(code(&a(Some("none"), &[], &["192.0.2.1"])), INV);
-        assert_eq!(code(&a(Some("none"), &[], &["127.0.0.1"])), UNI);
-        assert_eq!(code(&a(Some("none"), &[], &["::1"])), UNI);
+        assert_eq!(code(&a(Some("none"), &[], &["127.0.0.1"])), WIRED);
+        assert_eq!(code(&a(Some("none"), &[], &["::1"])), WIRED);
         assert_eq!(code(&a(Some("none"), &[], &["::ffff:127.0.0.1"])), INV);
-        assert_eq!(code(&a(Some("host"), &[], &["192.0.2.1"])), UNI);
-        assert_eq!(code(&a(None, &[], &["8.8.8.8"])), UNI);
+        assert_eq!(code(&a(Some("host"), &[], &["192.0.2.1"])), WIRED);
+        // 省略は none 扱い(D4)なので、非 loopback の `--dns` は create の時点で拒否する。
+        assert_eq!(code(&a(None, &[], &["8.8.8.8"])), INV);
+        assert_eq!(code(&a(None, &[], &["127.0.0.1"])), WIRED);
         assert_eq!(code(&a(Some("web"), &[], &["999.1.1.1"])), INV);
         assert_eq!(code(&a(None, &[], &["example.com"])), INV);
     }
@@ -274,7 +297,7 @@ mod tests {
     /// NET-12: `--add-host` は最初の `:` で分割する。
     #[test]
     fn net12_add_host_split() {
-        assert_eq!(code(&a(None, &["name:::1"], &[])), UNI);
+        assert_eq!(code(&a(None, &["name:::1"], &[])), WIRED);
         assert_eq!(code(&a(None, &["name::::1"], &[])), INV);
         assert_eq!(code(&a(None, &["web:999.1.1.1"], &[])), INV);
     }
@@ -366,6 +389,40 @@ mod tests {
             run(&ap(Some("web"), &["8080:80"]), r),
             (Some(ErrorCode::FailedPrecondition), 1)
         );
+    }
+
+    /// NET-6・NET-12(#1873): 結線の拒否の表。Linux は none / host と add-host / dns を受け、
+    /// ユーザー定義名・`container:`・`-p` は常に拒否。非 Linux は network 系の指定すべてを固定文言で拒否する。
+    #[test]
+    fn net6_reject_unwired_network_table() {
+        let r = |args: &CreateNetworkArgs, linux| {
+            reject_unwired_network(args, linux).map_err(|e| (e.code(), e.message().to_owned()))
+        };
+        for linux in [true, false] {
+            for n in ["web", "container:x"] {
+                let (c, m) = r(&a(Some(n), &[], &[]), linux).expect_err(n);
+                assert_eq!(c, ErrorCode::Unimplemented);
+                assert_eq!(m, NOT_WIRED_MESSAGE);
+            }
+            let (c, m) = r(&ap(Some("web"), &["8080:80"]), linux).expect_err("publish");
+            assert_eq!(
+                (c, m.as_str()),
+                (ErrorCode::Unimplemented, NOT_WIRED_MESSAGE)
+            );
+            assert_eq!(r(&a(None, &[], &[]), linux), Ok(()));
+        }
+        for args in [
+            a(Some("none"), &[], &[]),
+            a(Some("host"), &["a:192.0.2.1"], &["192.0.2.53"]),
+            a(None, &["a:192.0.2.1"], &[]),
+        ] {
+            assert_eq!(r(&args, true), Ok(()));
+            let (c, m) = r(&args, false).expect_err("non-linux");
+            assert_eq!(
+                (c, m.as_str()),
+                (ErrorCode::Unimplemented, PLATFORM_MESSAGE)
+            );
+        }
     }
 
     /// 通常の create(`-p` なし)では権限モデルを解決しない。

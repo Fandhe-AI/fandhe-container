@@ -726,6 +726,8 @@ fn start_reporting(
                         Ok(r) => r,
                         Err(code) => {
                             record_start(recorder, started, false);
+                            // 失敗の早期 return でも積んだログを捨てない。
+                            deps.flush_deferred_logs();
                             return Err(code);
                         }
                     };
@@ -2823,14 +2825,14 @@ mod linux {
     ) -> Result<(Option<ContainerOptions>, Option<String>), TraitError> {
         let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
         let store = Arc::clone(store);
-        let logs = Arc::clone(logs);
+        let worker_logs = Arc::clone(logs);
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("fandhe-supopt".into())
             .spawn(move || {
                 let result =
                     read_generation_checked_document(&store, &root, &id).and_then(|(doc, rec)| {
-                        doc.map(|d| options_with_verified_pasta(&d, &id, &logs))
+                        doc.map(|d| options_with_verified_pasta(&d, &id, &worker_logs))
                             .transpose()
                             .map(|o| (o, rec))
                     });
@@ -2849,10 +2851,14 @@ mod linux {
                 let _ = handle.join();
                 result
             }
-            Err(_) => Err(TraitError::new(
-                ErrorCode::Timeout,
-                "container options preparation timed out",
-            )),
+            Err(_) => {
+                // 作業スレッドを join できない。以後の fork を伴う監査の配送を止める。
+                logs.mark_worker_unjoined();
+                Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "container options preparation timed out",
+                ))
+            }
         }
     }
 
@@ -3190,6 +3196,11 @@ mod linux {
         let Some(rejection) = logs.take_tamper() else {
             return;
         };
+        // 2c の作業スレッドが生きたままだと fork がハングするか記録を失うため、fork せず構造化ログだけに残す。
+        if logs.worker_unjoined() {
+            crate::pasta_attach::log_pasta_audit_unavailable(logs, id.as_str(), ErrorCode::Timeout);
+            return;
+        }
         let result = crate::exec::default_audit_sink(Some(root.to_path_buf())).and_then(|sink| {
             let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
                 return Err(TraitError::new(

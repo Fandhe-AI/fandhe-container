@@ -135,6 +135,9 @@ pub struct PastaLogBuffer {
     /// 手順 2c の再検証が見つけた改ざんの疑い(作業スレッドが置き、単一スレッドの入口が取り出して監査へ配送する。
     /// SEC-4・#3330。作業スレッドは監査の `FileAuditSink`〔fork 隔離〕を使えないため、記録は入口に任せる)。
     tamper: Mutex<Option<fandhe_container_core::audit_log::PastaVerifyRejection>>,
+    /// 2c の待ちが期限切れで、作業スレッドを join できないまま進んだ印。立っている間は fork を伴う監査の配送をしない
+    /// (作業スレッド生存中の fork によるハング・記録欠落を避ける。SEC-4・REPAIR-5)。
+    worker_unjoined: std::sync::atomic::AtomicBool,
 }
 
 impl PastaLogBuffer {
@@ -155,6 +158,18 @@ impl PastaLogBuffer {
     pub fn set_tamper(&self, rejection: fandhe_container_core::audit_log::PastaVerifyRejection) {
         let mut g = self.tamper.lock().unwrap_or_else(PoisonError::into_inner);
         g.get_or_insert(rejection);
+    }
+
+    /// 作業スレッドを join できないまま進んだことを記す。
+    pub fn mark_worker_unjoined(&self) {
+        self.worker_unjoined
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 作業スレッドを join できていないか。
+    pub fn worker_unjoined(&self) -> bool {
+        self.worker_unjoined
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 置かれた改ざんの疑いを取り出す。
@@ -971,6 +986,44 @@ impl PastaGuardedProcess {
         }
     }
 
+    /// `deadline` までに終わらせる teardown。helper の停止は pasta 最大 3 秒＋holder 最大 2 秒かかりうるため、
+    /// 専用スレッドで実行して期限まで待つ。期限内に終わらなければ所有権はスレッドが保持したまま継続する
+    /// （呼び出し元の期限契約を守る。REPAIR-5）。スレッドを作れないときは呼び出し元で実行する。
+    fn teardown_bounded(&self, reason: &'static str, deadline: Instant) {
+        let taken = lock(&self.attachment).take();
+        let Some(a) = taken else { return };
+        let reason = if self.unexpected.load(Ordering::SeqCst) {
+            "unexpected"
+        } else {
+            reason
+        };
+        let cell = Arc::new(Mutex::new(Some(a)));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker_cell = Arc::clone(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("pasta-teardown".into())
+            .spawn(move || {
+                let taken = lock(&worker_cell).take();
+                if let Some(a) = taken {
+                    a.teardown(reason, true, false);
+                }
+                let _ = tx.send(());
+            });
+        match spawned {
+            Ok(_) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                // 期限切れでもスレッドは止めずに継続させる（所有権はスレッド側）。
+                let _ = rx.recv_timeout(remaining);
+            }
+            Err(_) => {
+                let taken = lock(&cell).take();
+                if let Some(a) = taken {
+                    a.teardown(reason, true, false);
+                }
+            }
+        }
+    }
+
     /// PID 1 がまだ動いている間の helper の生死確認。死んでいたらコンテナを止める（分離は緩めない）。
     fn check_helpers(&self) {
         let dead = {
@@ -1015,17 +1068,19 @@ impl LaunchedProcess for PastaGuardedProcess {
     }
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        let deadline = Instant::now() + timeout;
         let result = self.inner.wait(timeout)?;
         match result {
-            Some(_) => self.teardown("container_exit", true),
+            Some(_) => self.teardown_bounded("container_exit", deadline),
             None => self.check_helpers(),
         }
         Ok(result)
     }
 
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
+        let deadline = Instant::now() + timeout;
         let result = self.inner.terminate(timeout);
-        self.teardown("terminate", true);
+        self.teardown_bounded("terminate", deadline);
         result
     }
 

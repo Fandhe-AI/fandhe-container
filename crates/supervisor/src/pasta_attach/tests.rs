@@ -350,6 +350,11 @@ fn net9_container_exit_stops_pasta_then_holder_once() {
     assert!(events(&ev).is_empty());
     let exit = p.wait(Duration::ZERO).expect("wait").expect("exited");
     assert_eq!(exit, ProcessExit::Exited(3));
+    // 期限が 0 のときの後始末は専用スレッドで継続する(REPAIR-5)。完了を有限時間だけ待つ。
+    let until = Instant::now() + Duration::from_secs(5);
+    while events(&ev).len() < 3 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(
         events(&ev),
         [

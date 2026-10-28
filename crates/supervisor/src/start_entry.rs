@@ -130,7 +130,7 @@ pub trait StartDeps {
     ) -> Result<Option<StateRevision>, TraitError>;
 
     /// 手順 4b: ネットワーク指定の準備（`/etc/hosts`・`/etc/resolv.conf` の生成と host netns の基準照合。
-    /// #1873・NET-6・NET-12・D14）。`check_launcher_available` の後・`prepare_cgroup` の前に呼ぶ。
+    /// #1873・NET-6・NET-12・D14）。起動権の予約（`claim_start`）の後・`launch_claimed` の前に呼ぶ（cgroup・監査 sink・launcher の構築より後）。
     ///
     /// 失敗する場合は実装が自分で作ったものを巻き戻してから返す。成功した場合の削除は [`Self::release_network`]。
     /// 既定は何もしない（ネットワーク指定を持たないフェイクの [`StartDeps`] は上書きしなくてよい）。
@@ -141,6 +141,7 @@ pub trait StartDeps {
 
     /// 手順 4b で作った生成ファイルを消す。cgroup の削除が確かめられた後（逆順）にだけ呼ぶ。
     /// 生存し得るコンテナの bind 元を消さないため、cgroup を消せなかった経路では呼ばれない。
+    /// 起動権の予約を手放した後の失敗（`start` の失敗の後始末）でも呼ばれない（別世代の生成物を消さないため）。
     fn release_network(&mut self) -> Result<(), TraitError> {
         Ok(())
     }
@@ -552,6 +553,17 @@ fn op_err(e: TraitError) -> OciRuntimeError {
 fn write_report(out: &mut dyn Write, report: &StartReport) -> std::io::Result<()> {
     out.write_all(report.encode().as_bytes())?;
     out.flush()
+}
+
+/// cgroup だけを消す。失敗はログへ出し、`false` を返す。
+fn release_cgroup_logged(deps: &mut dyn StartDeps) -> bool {
+    match deps.release_cgroup() {
+        Ok(()) => true,
+        Err(e) => {
+            log_event("cgroup_release_failed", Some(e.code()));
+            false
+        }
+    }
 }
 
 /// cgroup を消す。失敗は元のエラーを隠さずにログへ出し、`false` を返す（後始末の成否へ反映する）。
@@ -1240,7 +1252,10 @@ fn cleanup_after_report(
                         &late,
                     ) {
                         // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
-                        release_logged(deps.as_mut())
+                        // 手順 4b の生成ファイル（`@container-etc/<id>`）はここでは消さない。起動権の予約はこの時点で
+                        // 解放済みで、並行する delete → 同じ ID の create / start が作った別世代の bind 元を消し得るため
+                        // （CORE-2・CORE-3・SEC-1）。残りは delete か次の start の準備（予約を握って作り直す）が消す。
+                        release_cgroup_logged(deps.as_mut())
                     } else {
                         // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
                         log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));

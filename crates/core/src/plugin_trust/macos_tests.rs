@@ -260,6 +260,68 @@ fn plug11_1865_rejects_unreadable_ancestor_with_io() {
     assert_eq!(err.path(), mid);
 }
 
+/// 検証を別スレッドで走らせ、10 秒の期限内に終わること（open で止まらないこと）を確かめて結果を返す（REPAIR-5）。
+fn verify_with_deadline(
+    dir: &Path,
+    name: &str,
+) -> Result<super::VerifiedPluginFile, PluginTrustError> {
+    let (dir, name) = (dir.to_path_buf(), name.to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(verify_file_in(&dir, &name));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("verify must not block")
+}
+
+/// 読み取り権限の無い FIFO は、open していれば `EACCES` で `Io` になる。probe で `NotRegularFile` になること
+/// （open していないこと）と止まらないことを照合する（#3096・PLUG-11・SEC-1。非 root 前提）。
+#[test]
+fn plug11_3096_rejects_unreadable_fifo_without_open() {
+    let tmp = Tmp::new("fifo");
+    let fifo = tmp.0.join(NAME);
+    let mut cmd = Command::new("mkfifo");
+    cmd.arg(&fifo);
+    run_limited(cmd);
+    chmod(&fifo, 0o000);
+    let err = verify_with_deadline(&tmp.0, NAME).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+    assert_eq!(err.target(), TrustTarget::File);
+    assert_eq!(err.path(), fifo);
+}
+
+/// UNIX ソケットは `open(2)` すると `Io`（`EOPNOTSUPP`）になる。`NotRegularFile` なら open していない。
+#[test]
+fn plug11_3096_rejects_socket_without_open() {
+    let tmp = Tmp::new("sock");
+    let sock = tmp.0.join(NAME);
+    let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    let err = verify_with_deadline(&tmp.0, NAME).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+    assert_eq!(err.path(), sock);
+}
+
+/// symlink 経由のソケットも追従 open の前に `NotRegularFile` で拒否する。
+#[test]
+fn plug11_3096_rejects_symlink_to_socket_without_open() {
+    let tmp = Tmp::new("lsock");
+    let sock = tmp.0.join("s");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    symlink(&sock, tmp.0.join(LINK)).expect("symlink");
+    let err = verify_with_deadline(&tmp.0, LINK).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+    assert_eq!(err.target(), TrustTarget::File);
+}
+
+/// symlink 経由の文字デバイス（`/dev/null`）も open せずに `NotRegularFile` で拒否する。
+#[test]
+fn plug11_3096_rejects_symlink_to_dev_null() {
+    let tmp = Tmp::new("ldev");
+    symlink("/dev/null", tmp.0.join(LINK)).expect("symlink");
+    let err = verify_with_deadline(&tmp.0, LINK).expect_err("reject");
+    assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
+}
+
 /// 公開 API: `/tmp` は `/private/tmp` への symlink のため祖先の symlink として拒否する。
 #[test]
 fn plug11_1865_public_api_rejects_symlinked_tmp() {

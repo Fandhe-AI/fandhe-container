@@ -63,6 +63,10 @@ pub enum NetOpKind {
     /// 軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入（検証 + 追記。
     /// `etc_hosts::inject_service_hosts_with_recorder`。TASK-146.1・#334・NET-8）。
     StaticHostsInject,
+    /// pasta の起動と準備完了待ち（`pasta::process::spawn_pasta_with_recorder`。NET-9・#1938）。
+    PastaStart,
+    /// pasta の停止と回収（`PastaProcess::stop_with_recorder`。NET-9・#1938）。
+    PastaStop,
     /// ネットワーク定義ストアの open（`NetworkStore::open`。NET-6・#3059）。
     NetworkStoreOpen,
     /// ネットワーク定義の作成（`NetworkStore::create`。ロック待ちを含む）。
@@ -92,6 +96,8 @@ impl NetOpKind {
             NetOpKind::AddHostsApply => "hosts.add_host.apply",
             NetOpKind::DnsResolvConfWrite => "dns.resolv_conf.write",
             NetOpKind::StaticHostsInject => "hosts.static.inject",
+            NetOpKind::PastaStart => "pasta.start",
+            NetOpKind::PastaStop => "pasta.stop",
             NetOpKind::NetworkStoreOpen => "network.store.open",
             NetOpKind::NetworkStoreCreate => "network.store.create",
             NetOpKind::NetworkStoreGet => "network.store.get",
@@ -271,7 +277,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 18] = [
+    const ALL_KINDS: [NetOpKind; 20] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -285,6 +291,8 @@ mod tests {
         NetOpKind::AddHostsApply,
         NetOpKind::DnsResolvConfWrite,
         NetOpKind::StaticHostsInject,
+        NetOpKind::PastaStart,
+        NetOpKind::PastaStop,
         NetOpKind::NetworkStoreOpen,
         NetOpKind::NetworkStoreCreate,
         NetOpKind::NetworkStoreGet,
@@ -311,6 +319,8 @@ mod tests {
             "dns.resolv_conf.write"
         );
         assert_eq!(NetOpKind::StaticHostsInject.as_str(), "hosts.static.inject");
+        assert_eq!(NetOpKind::PastaStart.as_str(), "pasta.start");
+        assert_eq!(NetOpKind::PastaStop.as_str(), "pasta.stop");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

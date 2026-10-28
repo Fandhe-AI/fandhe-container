@@ -366,10 +366,11 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | netns holder（`run_netns_holder_main`・fd の受信・setns・capset・READY / STOP・PDEATHSIG） | net | #1936 |
 | bin の `netns-holder` の振り分けと holder の起動・回収 | supervisor | 上の holder・#3065 |
 | `--pasta-path` / `--pasta-path-search` と作成時の検証・FCOPT1 の `pasta` の書き込み | cli | #1936・#3065 |
-| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065 |
+| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065。実装は #3200。CLI が `publish` を文書へ書くのは `network`（ユーザー定義名）を書く #1873 の後（それまでは検証済みの `-p` も `UNIMPLEMENTED`） |
 
 ### 12.15 オーナー確認事項（実装は止めない）
 
 - 既定のパス（`/usr/bin/pasta` 等）を持つか。現状は持たない
 - ポート公開の細部（#1937。自動運転で安全側に決めた）: 同じプロトコルでアドレスが違う公開は `-t` を複数並べる / 明示アドレスのうち bind できないもの（`0.0.0.0` 以外の `0.0.0.0/8`・multicast・予約）は拒否 / `0.0.0.0` と個別アドレスの同じ（プロトコル・ホストのポート）は重なりとして拒否 / プロトコル省略は TCP（`/TCP` の大文字は不可）/ 1 件 64 バイトの上限を解析の入口にも置く / ポートの名前（`http` 等）は受けない
+- `-p` の組の細部（#3200。自動運転で安全側に決めた）: `-p` に `--network` が無い、または `none` / `host` / `container:` が付くときは、権限モデルによらず `INVALID_ARGUMENT`（12.4 の `--pasta-path` と同じく、効かない指定を黙って受けない）。この検査は rootful の `UNIMPLEMENTED` より前に置くため、rootful で `-p` と `none` を指定すると `UNIMPLEMENTED` ではなく `INVALID_ARGUMENT` になる。利用者向けの説明は [port-publish.md](../api/port-publish.md)
 - 12.2 の holder 方式、12.10 の「途中死でコンテナを止める」、12.7 の固定の argv は自動運転で決めた。承認は未取得

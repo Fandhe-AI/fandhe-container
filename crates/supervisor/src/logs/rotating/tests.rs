@@ -1624,3 +1624,23 @@ fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
     drop(r);
     assert!(RotatingFileSink::open(&t.0, &id(), small()).is_ok());
 }
+
+/// SUP-7・REPAIR-4・#3143: guard が偽の 0 件成功は `guard_declined()` が真で、ファイルが無くて 0 件の成功とは区別される。
+#[test]
+fn sup7_3143_guard_declined_is_distinguished_from_nothing_to_remove() {
+    let t = TmpDir::new("guard-declined");
+    drop(RotatingFileSink::open(&t.0, &id(), small()).unwrap());
+    // guard が偽: 何も消さず、再作成済みとして報告できる。
+    let declined = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| false).unwrap();
+    assert_eq!(declined.log_files(), 0);
+    assert!(declined.guard_declined());
+    assert_eq!(files(&t.0), ["c1.log"]);
+    // guard が真: 消す。
+    let removed = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| true).unwrap();
+    assert_eq!(removed.log_files(), 1);
+    assert!(!removed.guard_declined());
+    // ファイルが無くて 0 件: guard が真なら declined ではない。
+    let none = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| true).unwrap();
+    assert_eq!(none.log_files(), 0);
+    assert!(!none.guard_declined());
+}

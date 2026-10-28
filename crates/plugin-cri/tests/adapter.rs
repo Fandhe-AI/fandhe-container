@@ -310,6 +310,95 @@ mod store_backed {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 実ストアへ委譲し、呼び出し回数を数える（`StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT` の数え方の照合用。#3143）。
+    struct CountingStore {
+        inner: Arc<dyn fandhe_container_core::traits::StateStore>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl CountingStore {
+        fn note(&self, name: &'static str) {
+            self.calls.lock().expect("lock").push(name);
+        }
+    }
+
+    impl fandhe_container_core::traits::StateStore for CountingStore {
+        fn create(
+            &self,
+            r: &fandhe_container_core::traits::CreateStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("create");
+            self.inner.create(r)
+        }
+        fn get(
+            &self,
+            r: &fandhe_container_core::traits::GetStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("get");
+            self.inner.get(r)
+        }
+        fn update(
+            &self,
+            r: &fandhe_container_core::traits::UpdateStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("update");
+            self.inner.update(r)
+        }
+        fn delete(
+            &self,
+            r: &fandhe_container_core::traits::DeleteStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::DeleteStateResponse,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("delete");
+            self.inner.delete(r)
+        }
+        fn list(
+            &self,
+            r: &fandhe_container_core::traits::ListStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateList,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("list");
+            self.inner.list(r)
+        }
+        fn host_state_root(&self) -> Option<&std::path::Path> {
+            self.inner.host_state_root()
+        }
+    }
+
+    /// REPAIR-5・#3143: plugin-cri の `create`（新しい ID）が `StateStore` を呼ぶのは `create` 1 回だけ（`update`・`delete`・
+    /// `list` は 0 回）。`repair5_create_worst_case_fits_runtime_timeout` が状態ロックを 1 回と数える根拠の照合。
+    /// 新しい状態ルートでは回収の guard〔`get`〕は評価されない（ログ・文書が無いため）。
+    #[test]
+    fn repair5_3143_create_calls_state_store_once() {
+        let dir = tmp_dir("create-count");
+        let bundle = make_bundle(&dir);
+        let root = StateRoot::resolve(Some(dir.join("state"))).expect("root");
+        let inner: Arc<dyn fandhe_container_core::traits::StateStore> =
+            Arc::new(FileStateStore::open(root).expect("open"));
+        let counting = Arc::new(CountingStore {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let rt = CoreLifecycleRuntime::new(counting.clone());
+        rt.create(&CreateRequest::new(cid("c1"), bundle).expect("req"))
+            .expect("create");
+        assert_eq!(*counting.calls.lock().expect("lock"), ["create"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- コンテナログの後始末（#2593・SUP-7・CRI-2・CLI-1）----
     // CLI の試験（crates/cli/tests/binary_entry.rs）の補助関数は別 crate から使えないため複製している。
 

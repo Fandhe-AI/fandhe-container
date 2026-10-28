@@ -72,11 +72,60 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// 短命の子の回収を期限つきで待つ。超過時は kill して失敗にする（REPAIR-5）。
+    fn wait_bounded(mut child: Child) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                kill_reap(child);
+                panic!("short-lived child did not exit in time");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// reader を非ブロッキングで 1 回読む。EOF なら `Ok(0)`、相手が生きていれば `WouldBlock`。
     fn probe_eof(reader: &mut UnixStream) -> io::Result<usize> {
         reader.set_nonblocking(true)?;
         let mut b = [0u8; 1];
         reader.read(&mut b)
+    }
+
+    const ROLE_ENV: &str = "FANDHE_SPAWN_GATE_ROLE";
+
+    /// 親プロセスなら自分自身を `--exact` で単独再実行して成否を返す（`true`）。再実行された側なら `false`。
+    /// 同一 libtest プロセス内の他試験の直接 spawn による fd の継承を避けるため（REPAIR-12）。
+    /// 子の終了待ちには期限を設け、超過時は kill して回収し失敗にする（REPAIR-5）。
+    fn reexec_isolated(name: &str) -> bool {
+        if std::env::var_os(ROLE_ENV).is_some() {
+            return false;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = Command::new(exe)
+            .args(["--exact", name, "--test-threads=1"])
+            .env(ROLE_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated child of {name} exceeded its deadline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "child role failed: {status}");
+        true
     }
 
     /// PLUG-7・SEC-1・#3139: 本番が作る fd はすべて close-on-exec。
@@ -101,6 +150,11 @@ mod tests {
     /// （漏れの因果の対照）。(b) ゲートは、fd が継承可能な間の spawn を待たせ、窓を閉じてから spawn させる。
     #[test]
     fn plug7_sec1_spawn_gate_blocks_spawn_while_fd_is_inheritable() {
+        if reexec_isolated(
+            "spawn_gate::tests::plug7_sec1_spawn_gate_blocks_spawn_while_fd_is_inheritable",
+        ) {
+            return;
+        }
         // (a) 対照: ゲートを通さず spawn すると writer を子が保持する。
         let (mut reader, writer) = UnixStream::pair().unwrap();
         sys::set_fd_cloexec(writer.as_fd(), false).unwrap();
@@ -153,28 +207,14 @@ mod tests {
         assert_eq!(eof, 0);
     }
 
-    const ROLE_ENV: &str = "FANDHE_SPAWN_GATE_ROLE";
-
     /// PLUG-7・REPAIR-5・SEC-1・#3139: 並行 spawn の下でも、作った直後の stderr 用ソケット対の writer を
     /// 閉じれば EOF になる（macOS では本番の窓を突く回帰試験）。他の試験の子の干渉を避けるため、
     /// 自分自身を単独で再実行したプロセスの中で回す。
     #[test]
     fn plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer() {
-        if std::env::var_os(ROLE_ENV).is_none() {
-            let exe = std::env::current_exe().unwrap();
-            let status = Command::new(exe)
-                .args([
-                    "--exact",
-                    "spawn_gate::tests::plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer",
-                    "--test-threads=1",
-                ])
-                .env(ROLE_ENV, "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "child role failed: {status}");
+        if reexec_isolated(
+            "spawn_gate::tests::plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer",
+        ) {
             return;
         }
         let stop = std::sync::atomic::AtomicBool::new(false);
@@ -188,8 +228,8 @@ mod tests {
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null());
-                    let mut child = spawn(&mut c).unwrap();
-                    let _ = child.wait();
+                    let child = spawn(&mut c).unwrap();
+                    wait_bounded(child);
                     spawned += 1;
                 }
             });

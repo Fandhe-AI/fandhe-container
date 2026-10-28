@@ -26,6 +26,14 @@ fn main() -> std::process::ExitCode {
             std::thread::sleep(std::time::Duration::from_secs(60));
         },
         Some(a) if a == "netns-holder-exit" => std::process::ExitCode::from(3),
+        Some(a) if a == "netns-holder-exit-after-recv" => {
+            // namespace メッセージ（stdin のソケット）を 1 回受けてから終わる。
+            // 送信側の `send_namespaces` が EPIPE にならない順序を保証する（REPAIR-12）。
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let _ = std::io::stdin().read(&mut buf);
+            std::process::ExitCode::from(3)
+        }
         _ => {
             linux::run();
             std::process::ExitCode::SUCCESS
@@ -265,7 +273,7 @@ mod linux {
         let mut p = spawn_netns_holder_unready_for_test(
             own_fds(),
             Instant::now() + Duration::from_secs(10),
-            &["netns-holder-exit"],
+            &["netns-holder-exit-after-recv"],
         )
         .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(10);

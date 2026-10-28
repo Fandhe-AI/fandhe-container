@@ -308,6 +308,8 @@ mod linux {
             }
         };
         println!("{}", holder.pid());
+        // パイプ接続時の stdout は完全バッファのため、親へ届くよう明示的に flush する。
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         // SIGKILL されるまで holder を持ったまま眠る（正常な後始末の経路を通さない）。
         loop {
             std::thread::sleep(Duration::from_secs(60));

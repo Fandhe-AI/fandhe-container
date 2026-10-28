@@ -1343,7 +1343,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/netns_holder_launch_userns.log"
           cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns -- --ignored 2>&1 | tee "${log}"
-          scripts/check-success-lines.sh --name netns_holder_launch_userns --src crates/supervisor/tests/netns_holder_launch_userns.rs \
+          scripts/check-success-lines.sh --name netns_holder_launch_userns \
+            --src crates/supervisor/tests/netns_holder_launch_userns.rs \
             --log "${log}" --select '^netns_holder_launch_userns: holder spawned' \
             --forbid 'netns_holder_launch_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 

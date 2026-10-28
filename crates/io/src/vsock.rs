@@ -267,19 +267,29 @@ use crate::stream_io::reject_client_originated_response_frame;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
     match kind {
-        FrameKind::Write | FrameKind::Flush => Ok(()),
-        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+        FrameKind::Write
+        | FrameKind::Flush
+        | FrameKind::Create
+        | FrameKind::WriteFile
+        | FrameKind::Close => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Err(IoError::new(
             IoErrorCode::InvalidArgument,
             format!("server does not accept client-originated response frames: {kind:?}"),
         )),
     }
 }
 
-/// クライアント側が受信してはならない要求系種別（`Write`・`Flush`）を拒否する。
+/// クライアント側が受信してはならない要求系種別（`Write`・`Flush`・`Create`・
+/// `WriteFile`・`Close`）を拒否する。`Nack` は受理するが、型つきの処理は #3162 まで
+/// 未実装で、`recv_ack` の `decode_ack` が `InvalidArgument` で失効させる（fail-closed）。
 fn reject_server_originated_request_frame(kind: FrameKind) -> Result<(), IoError> {
     match kind {
-        FrameKind::Ack | FrameKind::FlushAck => Ok(()),
-        FrameKind::Write | FrameKind::Flush => Err(IoError::new(
+        FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Ok(()),
+        FrameKind::Write
+        | FrameKind::Flush
+        | FrameKind::Create
+        | FrameKind::WriteFile
+        | FrameKind::Close => Err(IoError::new(
             IoErrorCode::InvalidArgument,
             format!("client does not accept server-originated request frames: {kind:?}"),
         )),
@@ -940,6 +950,44 @@ mod imp {
             _accept_kind: fn(FrameKind) -> Result<(), IoError>,
         ) -> (Result<Frame, IoError>, Option<FrameKind>) {
             match *self {}
+        }
+    }
+}
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    /// IO-1・REPAIR-2・#3161: vsock のサーバー側判定は UDS と同じ（Create /
+    /// WriteFile / Close を受理し Ack / FlushAck / Nack を拒否）。
+    #[test]
+    fn io1_vsock_server_direction_accepts_file_requests_rejects_responses() {
+        for kind in [FrameKind::Create, FrameKind::WriteFile, FrameKind::Close] {
+            reject_client_originated_response_frame(kind).expect("request kinds are accepted");
+        }
+        for kind in [FrameKind::Ack, FrameKind::FlushAck, FrameKind::Nack] {
+            let err = reject_client_originated_response_frame(kind)
+                .expect_err("response kinds must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        }
+    }
+
+    /// IO-1・REPAIR-2・#3161: クライアント側は Nack を受理し、Create / WriteFile /
+    /// Close / Write / Flush を InvalidArgument で拒否する。
+    #[test]
+    fn io1_vsock_client_direction_accepts_nack_rejects_file_requests() {
+        for kind in [FrameKind::Ack, FrameKind::FlushAck, FrameKind::Nack] {
+            reject_server_originated_request_frame(kind).expect("response kinds are accepted");
+        }
+        for kind in [
+            FrameKind::Write,
+            FrameKind::Flush,
+            FrameKind::Create,
+            FrameKind::WriteFile,
+            FrameKind::Close,
+        ] {
+            let err = reject_server_originated_request_frame(kind)
+                .expect_err("request kinds must be rejected on the client side");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         }
     }
 }

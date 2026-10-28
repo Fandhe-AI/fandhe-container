@@ -70,6 +70,7 @@ pub fn net_error_to_trait(e: &NetError) -> TraitError {
         NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
         NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
         NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
+        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
         _ => ErrorCode::Internal,
     };
     TraitError::new(code, e.message())
@@ -251,6 +252,15 @@ mod tests {
 
     fn code(r: Result<NetworkOptions, TraitError>) -> Option<ErrorCode> {
         r.err().map(|e| e.code())
+    }
+
+    /// NET-6・D8: net の `FailedPrecondition`(host netns の不一致等)は `FailedPrecondition` のまま写り、Internal に畳まれない。
+    #[test]
+    fn net6_net_error_to_trait_keeps_failed_precondition() {
+        let e = NetError::new(NetErrorCode::FailedPrecondition, "host netns mismatch");
+        let t = net_error_to_trait(&e);
+        assert_eq!(t.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(t.message(), "host netns mismatch");
     }
 
     const INV: Option<ErrorCode> = Some(ErrorCode::InvalidArgument);

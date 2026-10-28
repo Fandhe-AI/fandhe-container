@@ -1206,6 +1206,11 @@ fn cleanup_after_report(
                 "supervisor-claim-release",
                 crate::start_contract::result_deadline(timeouts),
                 move || {
+                    // 生成物は所有ロック（予約）を握っている間に消す。手放した後だと、並行する start が作り直した
+                    // 生成物を消し得る（CORE-2・SEC-1）。失敗はログへ残す。
+                    if let Err(e) = deps.release_network() {
+                        log_event("etc_files_release_failed", Some(e.code()));
+                    }
                     if claimed.release(store.as_ref()).is_ok() {
                         release_logged(deps.as_mut())
                     } else {
@@ -1329,11 +1334,6 @@ fn prepare_start(
     if let Err(e) = deps.check_launcher_available() {
         return fail(e, Cleanup::Nothing);
     }
-    // 4b: ネットワーク指定の準備（hosts / resolv.conf の生成・host netns の基準照合。#1873・D14）。
-    // 失敗時は実装が自分で巻き戻す。ここから先の失敗は、cgroup に続けて生成ファイルも報告の後に消す。
-    if let Err(e) = deps.prepare_network(req.id()) {
-        return fail(e, Cleanup::ReleaseCgroup);
-    }
     // 5〜7: ここから先の失敗は、作った cgroup を報告の後に消す。
     let prepared = match deps.prepare_cgroup(store, &observed) {
         Ok(instance) => instance,
@@ -1368,6 +1368,16 @@ fn prepare_start(
             };
         }
     };
+    // 4b: ネットワーク指定の準備（hosts / resolv.conf の生成・host netns の基準照合。#1873・D14）。
+    // 起動権の予約（所有ロック）を握った後に行う。予約より前に生成・削除すると、並行する同じ ID の start が
+    // 先行する start の生成物を消してしまう（CORE-2・CORE-3・SEC-1）。失敗時は実装が自分で巻き戻し、予約は
+    // 報告の後に戻す（`DiscardClaim` は予約を手放す前に生成物を消す）。
+    if let Err(e) = deps.prepare_network(req.id()) {
+        return PrepareOutcome::Failed {
+            error: op_err(e),
+            cleanup: Cleanup::DiscardClaim(claimed),
+        };
+    }
     // 世代の照合。予約中のレコードは delete が拒否するため、予約の後にここで照合すれば、準備の後・予約の前に同じ ID が
     // 削除・再作成された場合を漏れなく拒否できる。launch 時に `store.get` を入口スレッドで行うと期限の保護から外れる
     // ため、作業スレッドで済ませる（CORE-2・CORE-3・SEC-1・REPAIR-5）。

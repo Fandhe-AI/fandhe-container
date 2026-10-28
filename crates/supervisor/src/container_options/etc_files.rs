@@ -2,7 +2,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! `ProductionStartDeps::prepare_network`(start の手順 4b)が [`prepare_etc_files`] を呼び、core の `etc_files` で
+//! `ProductionStartDeps::prepare_network`(start の手順 4b。起動権の予約〔`claim_start` の所有ロック〕を握った後に呼ぶ)が [`prepare_etc_files`] を呼び、core の `etc_files` で
 //! 管理ルート(`<root>/@container-etc/<id>`)にファイルを排他作成してから、net の `append_add_hosts`(hosts への追記)・
 //! `apply_dns`(resolv.conf の置換)で内容を書く。生成物の rootfs への bind は launcher が `LaunchOptions::with_etc_files`
 //! の選択に従って行う(選択は [`NetworkOptions::etc_file_selection`] で、生成と bind が同じ関数で決まる)。

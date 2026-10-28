@@ -12,9 +12,14 @@
 //! （sandbox → コンテナと core の照合 → 作成途中の取り残しの解放 → 孤児 bundle の回収。`CriPluginBackends::readopt_records`。#2938・CRI-1・CRI-2・CORE-1）。
 //! 列挙の失敗・件数または保持量の上限超過・期限切れは `error: <CODE>: failed to readopt cri records` で起動しない。壊れた記録は消さず数えるだけで起動は止めない。
 //! 何かを再採用・回収したときだけ、固定語彙の要約 1 行を stderr へ出す（初回起動は静か）。
-//! SIGTERM の正常停止は未実装（SIGKILL で止まる。`server` の未実装の注記を参照）。
+//! SIGTERM・SIGINT で正常停止する（#3226・CRI-1・REPAIR-5。`sys` の自前の `signal(3)` 宣言で受ける）。受けたら新しい接続と RPC を受け付けず、
+//! 実行中の RPC を `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待ち、超えたら接続を強制的に閉じて `TIMEOUT` で終える（結果不明の記録は再起動時に再採用が扱う）。
+//! socket は listener の drop で削除し、ロックは終了時の fd の close で外れる（ロックファイルは消さない）。
+//! 起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見る（段の途中では各段の予算まで待つ）。
+//! 正常停止は stderr に固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>` を出し、終了コード 0。
+//! ハンドラは監査の relay の fork の直後に登録する（helper は既定動作のまま）。SIGHUP は対象外。
 //!
-//! 終了コード: 0 = `--help`、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
+//! 終了コード: 0 = `--help` と正常停止、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
 //! （未実装・起動失敗・serve の失敗）。
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（固定文言のみ。引数の値は含めない。REPAIR-4）。
 //! stdout に書くのは `--help` の usage だけ。起動完了の通知行は出さない（呼び出し側は socket の出現と接続の成否で判定する）。
@@ -23,6 +28,11 @@ use std::process::ExitCode;
 
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 use fandhe_container_plugin_cri::startup::{self, Invocation};
+#[cfg(unix)]
+use fandhe_container_plugin_cri::{
+    shutdown::{self, ShutdownStage},
+    sys,
+};
 
 /// `InvalidArgument` の終了コード。
 const EXIT_INVALID_ARGUMENT: u8 = 2;
@@ -40,6 +50,22 @@ fn fail(code: PluginErrorCode, message: &str) -> ExitCode {
 
 fn fail_err(e: &PluginError) -> ExitCode {
     fail(e.code(), e.message())
+}
+
+/// 正常停止の完了を示す固定の 1 行を stderr へ出し、期限つきで書き終えるのを待つ（REPAIR-4・REPAIR-5）。
+#[cfg(unix)]
+fn report_shutdown(signal: sys::ShutdownSignal, stage: ShutdownStage) {
+    let sink = fandhe_container_plugin_cri::telemetry::stderr_sink();
+    let _ = sink.submit(shutdown::shutdown_line(signal, stage));
+    sink.wait_idle(shutdown::FINAL_FLUSH_WAIT);
+}
+
+/// 起動段の境界で停止シグナルを見る。受けていれば bind せずに正常停止の 1 行を出して終了コード 0 を返す。
+#[cfg(unix)]
+fn stop_at_startup_boundary() -> Option<ExitCode> {
+    let signal = sys::received()?;
+    report_shutdown(signal, ShutdownStage::Startup);
+    Some(ExitCode::SUCCESS)
 }
 
 /// `Serve` の本体。UDS を持たない OS では未実装を返す（WIN-1）。
@@ -62,6 +88,12 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    // 停止シグナルの受信記録は relay の fork の後（helper は既定動作のまま）、受付の前に登録する（#3226・CRI-1）。
+    // 以降の fork は exec しない経路を持たない前提（core の `fork_single_threaded*` は relay の前の単一スレッドが条件）。
+    // 登録できなければ、後始末を経ずに死ぬ状態で動かさないため起動しない（fail-closed）。
+    if let Err(e) = sys::install_shutdown_signals() {
+        return fail(e.code(), e.message());
+    }
     // create の `mounts[].destination` 拒否も同じ relay で永続化する（SEC-4・OCI-4・#2594）。プロセスは常に複数スレッドで
     // `FileAuditSink` を直接使えないため、`PeerAuditForwarder` と共有する。非 Linux は記録先が無く記録しない。
     #[cfg(target_os = "linux")]
@@ -91,6 +123,9 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    if let Some(code) = stop_at_startup_boundary() {
+        return code;
+    }
     let recorder = std::sync::Arc::clone(backends.op_recorder());
     let oci_recorder = std::sync::Arc::clone(backends.oci_op_recorder());
     let sweep_store = std::sync::Arc::clone(backends.state());
@@ -151,6 +186,9 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             );
         }
     }
+    if let Some(code) = stop_at_startup_boundary() {
+        return code;
+    }
     // 記録ストアを注入した CRI サービスを組み、受付の前に 1 回だけ記録を再採用する（CRI-1・CRI-2・CORE-1・#2938）。
     // 列挙の失敗・上限超過・期限切れは fail-closed で起動しない（壊れた記録は数えるだけで止めない）。
     let svc = backends.runtime_service_with_record_store(
@@ -179,8 +217,15 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     }
+    if let Some(code) = stop_at_startup_boundary() {
+        return code;
+    }
     // 1 リクエストの待ち上限は PullImage・StartContainer が収まる値に引き上げる（既定 10 秒では途中で切れる。REPAIR-5）。
-    let grpc_config = match GrpcServerConfig::new().with_request_timeout(PLUGIN_REQUEST_TIMEOUT) {
+    // 停止シグナルを受けてからの猶予は `PLUGIN_SHUTDOWN_GRACE`（超えたら接続を強制的に閉じる。REPAIR-5・#3226）。
+    let grpc_config = match GrpcServerConfig::new()
+        .with_request_timeout(PLUGIN_REQUEST_TIMEOUT)
+        .and_then(|c| c.with_shutdown_grace(adapter::PLUGIN_SHUTDOWN_GRACE))
+    {
         Ok(c) => c,
         Err(e) => return fail_err(&e),
     };
@@ -236,15 +281,29 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             Some(images),
             &grpc_config,
             audit,
-            std::future::pending(),
+            shutdown::wait_for_signal(),
         )
         .await;
         stats.abort();
         r
     });
+    // `Runtime` の暗黙の drop は `spawn_blocking` のタスクの完了を無期限に待つため、期限つきで置き去りにする（REPAIR-5）。
+    // 置き去りにしたタスクの結果は不明のまま残り、再起動時に再採用・回収が扱う。
+    rt.shutdown_timeout(shutdown::RUNTIME_SHUTDOWN_WAIT);
+    // ロックの解放はプロセスの終了で確定する（切り離した worker が Arc を持つことがあるため明示の drop は best-effort）。
+    drop(backends);
+    drop(bundles);
+    drop(records);
     match result {
-        // pending() は完了しないため通常ここへは来ない。成功を装わず失敗扱いにする。
-        Ok(()) => fail(PluginErrorCode::Internal, "server stopped unexpectedly"),
+        Ok(()) => match sys::received() {
+            Some(signal) => {
+                report_shutdown(signal, ShutdownStage::Serve);
+                ExitCode::SUCCESS
+            }
+            // 受信なしで止まるのは想定外。成功を装わず失敗扱いにする。
+            None => fail(PluginErrorCode::Internal, "server stopped unexpectedly"),
+        },
+        // 猶予超過は `TIMEOUT`（接続を強制的に閉じた）。記録は結果不明のまま残る。
         Err(e) => fail_err(&e),
     }
 }

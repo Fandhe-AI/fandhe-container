@@ -21,11 +21,23 @@
 //! - peer 認証の拒否は `telemetry` が 1 秒ごとに別 task で回収して stderr へ JSON Lines で書く（SEC-4）。
 //!   `crates/core` の永続的な監査ログへは [`serve_with_audit`] に渡す `PeerAuditForwarder` が 1 件ずつ書く（#2484。Linux の
 //!   `main.rs` が配線。非 Linux は #2430 の判断待ちで stderr のみ）。[`serve`] は記録先なしの旧形で、試験用
-//! - SIGTERM による正常停止は未実装（`main.rs` は `pending()` を渡す）。残った socket は次回起動の
-//!   `UdsListener::bind` が自 UID の stale socket として掃除する
+//! - SIGKILL・クラッシュで残った socket は次回起動の `UdsListener::bind` が自 UID の stale socket として掃除する。
+//!
+//! # 停止の契約（#3226・CRI-1・REPAIR-5）
+//!
+//! `shutdown` の完了で次の順に止まる。(1) listener を即座に閉じる（`StopOnShutdown`）。tonic は accept のループを抜けた後も
+//! 接続のドレインが終わるまで incoming を持ち続けるため、そのままでは停止中の新しい connect が応答されずに積まれる。
+//! 閉じると `UdsListener::drop` が bind 時の dev/ino と一致する socket だけを検証済みディレクトリの fd 基点で unlink する
+//! （パスの再解決をしない。PLUG-12）。(2) tonic の graceful 停止で実行中の RPC の完了を待つ。(3) `config` の shutdown 猶予を
+//! 過ぎたら接続を強制的に閉じ、`TIMEOUT` を返す（結果不明の RPC の記録は再起動時の照合表で扱う）。
+//! インスタンスロックは fd の close で外れ、ロックファイルは消さない（二重取得を防ぐ契約）。
 
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
+use tonic::codegen::tokio_stream::Stream;
 
 use crate::telemetry::{self, PeerAuditForwarder, SharedPeerAuthObserver};
 use fandhe_container_cri::image_service::CriImageService;
@@ -80,6 +92,7 @@ pub async fn serve_with_audit<F: Future<Output = ()>>(
         None => observer,
     };
     let incoming = UdsIncoming::new(listener, Box::new(observer))?;
+    let (incoming, shutdown) = StopOnShutdown::wrap(incoming, shutdown);
     let svc = RuntimeServiceServer::new(service)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -108,4 +121,43 @@ pub async fn serve_with_audit<F: Future<Output = ()>>(
         forwarder.wait_idle(std::time::Duration::from_millis(200));
     }
     result
+}
+
+/// `UdsIncoming` を shutdown の完了で drop して listener を閉じるための包み（停止の契約 (1)。#3226・CRI-1）。
+///
+/// 呼び出し元は [`serve_with_audit`] だけ。包みの Stream は閉じた後 `Ready(None)` を返す。
+/// 同じ task でしか poll されないため `Mutex` は競合せず、poisoning は `into_inner` で無視する（保持中に panic しても
+/// 中身の `Option` は壊れない）。
+struct StopOnShutdown {
+    inner: std::sync::Arc<Mutex<Option<Pin<Box<UdsIncoming>>>>>,
+}
+
+impl StopOnShutdown {
+    /// `incoming` を包み、`shutdown` の完了後に中身を drop する future を組んで返す。
+    fn wrap<F: Future<Output = ()>>(
+        incoming: UdsIncoming,
+        shutdown: F,
+    ) -> (Self, impl Future<Output = ()>) {
+        let inner = std::sync::Arc::new(Mutex::new(Some(Box::pin(incoming))));
+        let closer = std::sync::Arc::clone(&inner);
+        let fut = async move {
+            shutdown.await;
+            // listener を閉じる（drop で socket を unlink する）。drop は Mutex の外で行う。
+            let taken = closer.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(taken);
+        };
+        (Self { inner }, fut)
+    }
+}
+
+impl Stream for StopOnShutdown {
+    type Item = <UdsIncoming as Stream>::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(incoming) => incoming.as_mut().poll_next(cx),
+            None => Poll::Ready(None),
+        }
+    }
 }

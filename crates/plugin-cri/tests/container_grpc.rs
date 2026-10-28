@@ -70,6 +70,8 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
+/// 停止シグナルから終了までの期限（停止の全体の上限 13.5 秒 + 余裕。`shutdown::SHUTDOWN_TOTAL_BOUND`）。
+const STOP_DEADLINE: Duration = Duration::from_secs(15);
 /// 停止時にフェイクが返す終了コード（SIGTERM 相当。境界越しの反映確認用の具体値）。
 const STOP_EXIT_CODE: i32 = 143;
 
@@ -753,6 +755,8 @@ async fn container_rpcs_reach_the_plugin_binary() {
 struct FakeRuntime {
     calls: Mutex<Vec<String>>,
     states: Mutex<HashMap<String, ContainerState>>,
+    /// `start` の遅延（ミリ秒。0 = なし）。実行中の RPC を作って停止の契約を試す段 E 用（#3226）。
+    start_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl FakeRuntime {
@@ -791,6 +795,10 @@ impl ContainerRuntime for SharedRuntime {
     fn start(&self, r: &StartRequest) -> Result<ContainerStatus, TraitError> {
         let id = r.id().as_str().to_owned();
         self.0.log(format!("start {id}"));
+        let delay = self.0.start_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         let mut states = self.0.states.lock().unwrap();
         match states.get(&id) {
             None => Err(no_such()),
@@ -1172,6 +1180,35 @@ fn kill_and_collect_stderr(mut guard: ChildGuard) -> String {
     rx.recv_timeout(REAP_GRACE).unwrap_or_default()
 }
 
+/// 停止シグナルを送って正常停止を待ち、終了コード 0 を確かめて stderr 全体を返す（全体の期限つき。#3226・REPAIR-5）。
+async fn terminate_and_collect_stderr(mut guard: ChildGuard, signal: &str) -> String {
+    let pid = guard.0.id().to_string();
+    let sent = Command::new("kill")
+        .args(["-s", signal, &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -s {signal} {pid}");
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = guard.exited() {
+            break s;
+        }
+        assert!(
+            start.elapsed() < STOP_DEADLINE,
+            "plugin must stop within {STOP_DEADLINE:?} after SIG{signal}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut err = String::new();
+    if let Some(mut s) = guard.0.stderr.take() {
+        use std::io::Read as _;
+        let _ = s.read_to_string(&mut err);
+    }
+    assert_eq!(status.code(), Some(0), "graceful stop exit code: {err}");
+    assert!(!err.contains("error:"), "{err}");
+    err
+}
+
 /// 状態ルート配下の記録の置き場（`<XDG>/fandhe-container/.cri/records/<kind>`）。
 fn records_dir(xdg: &Path, kind: &str) -> PathBuf {
     xdg.join("fandhe-container/.cri/records").join(kind)
@@ -1199,7 +1236,6 @@ async fn cri1_cri2_core1_records_survive_plugin_restart() {
         let xdg = TempDir::new("xdg-rs");
         let sock_a = dir.0.join("a.sock");
         let sock_b = dir.0.join("b.sock");
-        let sock_c = dir.0.join("c.sock");
         let state_root = xdg.0.join("fandhe-container");
 
         // 1 回目: sandbox とコンテナを作り、記録が書かれたことを確かめて SIGKILL する。
@@ -1266,7 +1302,13 @@ async fn cri1_cri2_core1_records_survive_plugin_restart() {
         assert!(!records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec")).exists());
         assert!(records_dir(&xdg.0, "containers").join(format!("{garbage}.rec")).is_file());
         drop((c, ch));
-        let second_stderr = kill_and_collect_stderr(guard);
+        // 2 回目の停止は SIGTERM（正常停止。#3226）。1 回目の SIGKILL（クラッシュ経路）は残す。
+        let second_stderr = terminate_and_collect_stderr(guard, "TERM").await;
+        assert!(
+            second_stderr.contains("cri plugin shutdown: signal=SIGTERM stage=serve"),
+            "{second_stderr}"
+        );
+        assert!(!sock_b.exists(), "socket must be removed by the graceful stop");
         for want in [
             "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=0 ",
             "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 ",
@@ -1277,9 +1319,9 @@ async fn cri1_cri2_core1_records_survive_plugin_restart() {
         }
         assert!(!second_stderr.contains(&sb) && !second_stderr.contains(&cid));
 
-        // 3 回目: 壊れた記録だけが残っていても起動は止まらず、件数だけが出る。
-        let mut guard = spawn_server(&sock_c, &xdg.0);
-        let ch = connect_when_ready(&sock_c, Some(&mut guard)).await;
+        // 3 回目: 壊れた記録だけが残っていても起動は止まらず、件数だけが出る。正常停止の後なので同じ socket のパスで再 bind できる。
+        let mut guard = spawn_server(&sock_b, &xdg.0);
+        let ch = connect_when_ready(&sock_b, Some(&mut guard)).await;
         let mut c = RuntimeServiceClient::new(ch.clone());
         assert_eq!(list_containers_len(&mut c).await, 0);
         drop((c, ch));
@@ -1339,4 +1381,205 @@ async fn cri2_record_limit_exceeded_stops_startup() {
     })
     .await
     .expect("watchdog");
+}
+
+// ---- 段 E: SIGTERM / SIGINT による正常停止（#3226。CRI-1・CORE-1・PLUG-12・REPAIR-4・REPAIR-5）----
+
+/// フラグが立つまで待つ shutdown future（`tokio::sync` は承認範囲外のためポーリング）。
+async fn wait_flag(flag: Arc<std::sync::atomic::AtomicBool>) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 段 E の共通の準備で組み立てたサーバーと周辺の束。
+struct SlowStartServer {
+    serve: tokio::task::JoinHandle<Result<(), PluginError>>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    client: Client,
+    container_id: String,
+    runtime: Arc<FakeRuntime>,
+    sock: PathBuf,
+    _dir: TempDir,
+}
+
+/// 遅い `start` を持つフェイクを載せたサーバーを起動し、Created のコンテナまで作る。
+async fn start_slow_start_server(grace: Duration) -> SlowStartServer {
+    let runtime = Arc::new(FakeRuntime::default());
+    let bundles = Arc::new(RecordingBundles::default());
+    let service = CriRuntimeService::new().with_runtime(
+        RuntimeAdapter::new(Arc::new(SharedRuntime(Arc::clone(&runtime)))),
+        bundles,
+    );
+    let dir = TempDir::new("sock-e");
+    let sock = dir.0.join("s.sock");
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let config = GrpcServerConfig::new()
+        .with_shutdown_grace(grace)
+        .expect("shutdown grace");
+    let serve_sock = sock.clone();
+    let serve_flag = Arc::clone(&flag);
+    let serve = tokio::spawn(async move {
+        server::serve(&serve_sock, service, &config, wait_flag(serve_flag)).await
+    });
+    let ch = connect_when_ready(&sock, None).await;
+    let mut client = RuntimeServiceClient::new(ch);
+    let sb = run_sandbox(&mut client, "pod-e").await;
+    let container_id = create_container(&mut client, &sb, "c", "busybox:1.36")
+        .await
+        .expect("create");
+    SlowStartServer {
+        serve,
+        flag,
+        client,
+        container_id,
+        runtime,
+        sock,
+        _dir: dir,
+    }
+}
+
+/// 実行層に `start` が届くまで待つ（期限つき）。
+async fn wait_start_reached(runtime: &FakeRuntime) {
+    let t0 = Instant::now();
+    while !runtime
+        .mutating_calls()
+        .iter()
+        .any(|l| l.starts_with("start "))
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "start must reach the runtime"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 段 E-1（CRI-1・REPAIR-5）: 実行中の RPC がある間に shutdown が完了すると、新しい接続は受け付けられず（socket が消える）、
+/// 実行中の RPC は成功で返り、サーバーは猶予内に `Ok` で終わる。
+#[tokio::test]
+async fn cri1_shutdown_stops_accepting_and_waits_for_inflight_rpc() {
+    tokio::time::timeout(WATCHDOG, async {
+        let s = start_slow_start_server(Duration::from_secs(2)).await;
+        s.runtime.start_delay_ms.store(500, Ordering::SeqCst);
+        let mut c_inflight = s.client.clone();
+        let inflight_id = s.container_id.clone();
+        let inflight =
+            tokio::spawn(async move { start_container(&mut c_inflight, &inflight_id).await });
+        wait_start_reached(&s.runtime).await;
+        s.flag.store(true, Ordering::SeqCst);
+
+        // (i) 受付の停止: socket が 1 秒以内に消え、新しい接続は失敗する。
+        let t1 = Instant::now();
+        while s.sock.exists() {
+            assert!(
+                t1.elapsed() < Duration::from_secs(1),
+                "socket must be removed promptly"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            connect_uds_channel(
+                &s.sock,
+                &GrpcClientConfig::new(),
+                Box::new(JsonLinesPeerAuthObserver::new())
+            )
+            .await
+            .is_err(),
+            "new connections must be refused after shutdown"
+        );
+        // (ii) 実行中の RPC は成功で返る。
+        inflight
+            .await
+            .expect("join")
+            .expect("in-flight start succeeds");
+        // (iii) 猶予内に Ok で終わる。
+        let r = tokio::time::timeout(Duration::from_secs(5), s.serve)
+            .await
+            .expect("serve must finish")
+            .expect("join");
+        assert!(r.is_ok(), "{:?}", r.err().map(|e| e.code()));
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 段 E-2（REPAIR-5）: 実行中の RPC が猶予より長引くと、接続を強制的に閉じて `TIMEOUT` で返る（上限内）。socket は消えている。
+#[tokio::test]
+async fn repair5_shutdown_grace_expiry_force_closes_and_times_out() {
+    tokio::time::timeout(WATCHDOG, async {
+        let s = start_slow_start_server(Duration::from_secs(1)).await;
+        s.runtime.start_delay_ms.store(5_000, Ordering::SeqCst);
+        let mut c_inflight = s.client.clone();
+        let inflight_id = s.container_id.clone();
+        let inflight = tokio::spawn(async move {
+            let _ = start_container(&mut c_inflight, &inflight_id).await;
+        });
+        wait_start_reached(&s.runtime).await;
+        let stop_at = Instant::now();
+        s.flag.store(true, Ordering::SeqCst);
+        let r = tokio::time::timeout(Duration::from_secs(5), s.serve)
+            .await
+            .expect("serve must finish within grace + reclaim")
+            .expect("join");
+        let e = r.expect_err("grace expiry must be an error");
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        assert!(
+            stop_at.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            stop_at.elapsed()
+        );
+        assert!(!s.sock.exists(), "socket must be removed");
+        let _ = inflight.await;
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 本番バイナリで停止シグナルを送り、終了コード 0・固定行・socket の削除・ロックの解放・同じパスでの再 bind を確かめる。
+async fn assert_binary_graceful_stop(signal: &str, signal_name: &str) {
+    let dir = TempDir::new("sock-e3");
+    let xdg = TempDir::new("xdg-e3");
+    let sock = dir.0.join("s.sock");
+    let state_root = xdg.0.join("fandhe-container");
+    let mut guard = spawn_server(&sock, &xdg.0);
+    let ch = connect_when_ready(&sock, Some(&mut guard)).await;
+    drop(ch);
+    let err = terminate_and_collect_stderr(guard, signal).await;
+    assert!(
+        err.contains(&format!(
+            "cri plugin shutdown: signal={signal_name} stage=serve"
+        )),
+        "{err}"
+    );
+    assert!(!sock.exists(), "socket must be removed");
+    // ロックファイルは消さず（二重取得を防ぐ契約）、ロック自体は解放されている。
+    assert!(state_root.join(".cri/@instance.lock").is_file());
+    let lock = fandhe_container_plugin_cri::instance_lock::acquire_instance_lock_in(
+        &state_root,
+        Duration::ZERO,
+    )
+    .expect("instance lock must be released");
+    drop(lock);
+    // 同じ socket のパスで再起動して、すぐ接続できる。
+    let mut guard = spawn_server(&sock, &xdg.0);
+    let ch = connect_when_ready(&sock, Some(&mut guard)).await;
+    drop(ch);
+    let _ = terminate_and_collect_stderr(guard, signal).await;
+}
+
+/// 段 E-3（CRI-1・PLUG-12・CORE-1・REPAIR-4）: SIGTERM で正常停止する。
+#[tokio::test]
+async fn cri1_sigterm_stops_the_binary_gracefully() {
+    tokio::time::timeout(WATCHDOG, assert_binary_graceful_stop("TERM", "SIGTERM"))
+        .await
+        .expect("watchdog");
+}
+
+/// 段 E-4（CRI-1）: SIGINT も SIGTERM と同じ扱いで正常停止する。
+#[tokio::test]
+async fn cri1_sigint_stops_the_binary_gracefully() {
+    tokio::time::timeout(WATCHDOG, assert_binary_graceful_stop("INT", "SIGINT"))
+        .await
+        .expect("watchdog");
 }

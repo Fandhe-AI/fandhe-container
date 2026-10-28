@@ -394,7 +394,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -454,6 +454,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
   - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
   - `GuestFileCreator` 内: IO-5 の規則（大文字小文字・NFC / NFD の衝突、ホストパス長）を適用する。ディスクの状態に依存するため、ここで行う
 - ホストパス長（260）: Windows ホストではエラー（Nack `INVALID_ARGUMENT`、reason `HostPathTooLong`）。その他の OS では観測イベント（警告）のみで作成を続ける（npm の深いパスを Linux / macOS で拒否しないため）
+  - 状態: #3160 で `GuestFileCreator` に実装済み（`crates/io/src/guest_files.rs`）。構文検証の直後・ロックと走査の前に、共有ルート（設定値）に検証済みのコンポーネントを足した計測用のパスで測る。警告は内部の戻り値に持つだけで、観測への配線は #3163。reason の値表と `create_file` の失敗の分類関数は `crates/io/src/nack_reason.rs` と `guest_files.rs`（crate 内）
 - 閉じ込め: 既存の `*_beneath`（`openat` + `O_NOFOLLOW`）だけを使い、ワイヤーのパスを `Path::join` に渡さない。祖先が symlink、またはディレクトリでなかった場合は Nack `INVALID_ARGUMENT`（reason `EscapesRoot` / `NotADirectory`）
 
 ### F6 ハンドル
@@ -580,7 +581,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | issue | 内容 | 依存 |
 | ----- | ---- | ---- |
 | #3159 | `GuestPath` の切り出し（IO-5・REPAIR-2） | #1886。実装済み（`crates/io/src/guest_path.rs`） |
-| #3160 | ホストパス長の検査（IO-5） | #3159 |
+| #3160 | ホストパス長の検査（IO-5） | #3159。実装済み（`crates/io/src/guest_files.rs`・`crates/io/src/nack_reason.rs`） |
 | #3161 | v2 の符号化と復号（IO-1・REPAIR-2。BREAKING CHANGE） | #3159 |
 | #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4） | #3161 |
 | #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |

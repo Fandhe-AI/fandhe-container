@@ -138,8 +138,8 @@ mod linux {
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
     /// 成功行は veth の作成通知（`NLM_F_ECHO`。Issue #3205）が届く v6.2 以上か、届かない戻し経路かで 2 通り。
     /// `check-success-lines.sh` が試験ソースの文字列リテラルから導出するため、`format!` で組み立てず 2 つのリテラルで持つ。
-    const OK_LINE_ECHO_INDEX: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=index";
-    const OK_LINE_ECHO_FALLBACK: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=fallback";
+    const OK_LINE_ECHO_INDEX: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=index";
+    const OK_LINE_ECHO_FALLBACK: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=fallback";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -1019,6 +1019,32 @@ mod linux {
             }
         })?;
 
+        // --- masquerade（#3073・NET-1・NET-11）---
+        // postrouting にちょうど 1 件。カーネルが受理した形を nft の解釈で読み戻し、サブネットと
+        // 出口 bridge の除外（oifname の 16 バイト比較）が意図どおりに読めることを確かめる。
+        let listing = run_cmd("nft", &["list", "table", "ip", net.table.as_str()])?;
+        let masq_lines: Vec<&str> = listing
+            .lines()
+            .filter(|l| l.contains("masquerade"))
+            .collect();
+        let [masq_line] = masq_lines.as_slice() else {
+            return Err(fail(format!(
+                "expected exactly one masquerade rule in {listing}"
+            )));
+        };
+        let want_oif = format!("oifname != \"{}\"", net.bridge.as_str());
+        if !masq_line.contains("ip saddr 10.213.0.0/24") || !masq_line.contains(&want_oif) {
+            return Err(fail(format!("unexpected masquerade rule: {masq_line}")));
+        }
+        let post = listing
+            .split("chain postrouting")
+            .nth(1)
+            .and_then(|r| r.split("chain ").next())
+            .unwrap_or("");
+        if !post.contains("masquerade") {
+            return Err(fail("masquerade rule is not in the postrouting chain"));
+        }
+
         // --- 成功経路 ---
         let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
         let mut ipam = StaticIpam::for_network(&net)?;
@@ -1637,6 +1663,13 @@ mod linux {
         }
         if run_cmd("nft", &["list", "table", "ip", net.table.as_str()]).is_ok() {
             return Err(fail("nft table still exists after delete_network"));
+        }
+        // masquerade はテーブルごと消える（ruleset 全体に残らない）。
+        let ruleset = run_cmd("nft", &["list", "ruleset"])?;
+        if ruleset.contains(net.table.as_str()) {
+            return Err(fail(
+                "nft ruleset still mentions the network table after delete_network",
+            ));
         }
         for pin in &pins {
             if pin.exists() {

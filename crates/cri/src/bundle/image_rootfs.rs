@@ -71,7 +71,7 @@ use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_bounded,
-    remove_extracted_tree,
+    remove_extracted_tree, remove_extracted_tree_bounded,
 };
 use fandhe_container_oci::layer::{
     BlobFileFacts, VerifiedLayerBlob, check_blob_trust, open_blob_nofollow, read_rootfs_file,
@@ -81,6 +81,7 @@ use fandhe_container_oci::reference::Digest;
 
 use super::provider::{RootfsSource, UserResolveRequest};
 use super::spec::{ImageDefaults, ResolvedImage};
+use crate::adapter::ReleaseBudget;
 use crate::error::CriError;
 use crate::image_pull::{
     DEFAULT_MAX_IMAGE_BYTES, PullConfig, PullError, RECORD_FILE, canonical_reference,
@@ -858,9 +859,20 @@ impl RootfsSource for ImageRootfsSource {
     }
 
     fn release(&self, rootfs: &Path) -> Result<(), CriError> {
+        self.release_bounded(rootfs, &ReleaseBudget::new())
+    }
+
+    fn release_bounded(&self, rootfs: &Path, budget: &ReleaseBudget<'_>) -> Result<(), CriError> {
         match std::fs::symlink_metadata(rootfs) {
-            Ok(m) if m.file_type().is_dir() => remove_extracted_tree(rootfs)
-                .map_err(|_| CriError::internal("failed to remove rootfs")),
+            Ok(m) if m.file_type().is_dir() => {
+                remove_extracted_tree_bounded(rootfs, &budget.to_extract_budget()).map_err(|e| {
+                    if e.code() == OciErrorCode::Timeout {
+                        CriError::timeout("bundle release exceeded its deadline")
+                    } else {
+                        CriError::internal("failed to remove rootfs")
+                    }
+                })
+            }
             // symlink・通常ファイル等は辿らず消さない（リンク先の削除を防ぐ。fail-closed）。
             Ok(_) => Err(CriError::internal("rootfs path is not a directory")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

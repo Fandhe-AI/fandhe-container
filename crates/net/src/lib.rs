@@ -23,7 +23,7 @@
 //! pasta（rootless のユーザー定義ネットワークの外部ヘルパー）のバイナリの探索と検証（`pasta`。絶対パス・所有者・権限・版数。
 //! 検証済みの型 `pasta::binary::PastaBinary` と opt-in の `PATH` 探索、`--version` の解釈。NET-9・PLUG-11・#1936）と、
 //! ポート公開指定の検証と引数配列への変換（`pasta::port_forward`。OS 非依存。NET-9・#1937）も持つ。
-//! ネットワーク定義の状態ストア（`network_store`。`@networks`・FCNET1・ロック・権限・上限。Linux のみ。NET-6・CORE-1・REPAIR-5・#3059。メンバー記録・IPAM は #3067）も持つ。
+//! ネットワーク定義の状態ストア（`network_store`。`@networks`・FCNET1・ロック・権限・上限。Linux のみ。NET-6・CORE-1・REPAIR-5・#3059）と、メンバー記録・`realized`・記録からの IPAM の組み直し・回収待ちの請求書（`network_store::member`・`realized`・`ipam_rebuild`、記録つきの合成 `network::recorded`。NET-1・NET-7・#3067。残った意図記録のカーネル照合は後続）も持つ。
 //! pasta 構成の netns holder（`netns_holder`。supervisor が `/proc/self/exe netns-holder` として exec し直す専用プロセスの本体
 //! `run_netns_holder_main`・supervisor 側の端 `NetnsHolderChannel`・固定長フレーム。Linux 以外は本体が `UNIMPLEMENTED`。
 //! NET-9・CORE-6・#3197。supervisor の振り分けと launch への組み込みは後続）も持つ。

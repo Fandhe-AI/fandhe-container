@@ -174,7 +174,9 @@
     ├── definition                 FCNET1（FCOPT1 と同じ長さ接頭辞のテキスト・閉じた語彙。符号化と復号を同じ型に置く。REPAIR-2）
     ├── @lock
     ├── members/<container-id>
+    ├── members-intent/<container-id>   attach 前の意図記録（D11）
     ├── realized
+    ├── realized.intent                 作成・削除のカーネル操作中の意図記録（D11）
     ├── pending-reclaim/           既存の ReclaimStore の形を流用
     └── dns-helper
 ```
@@ -350,7 +352,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
 | #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 未実装 |
-| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 未実装 |
+| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 実装済み（記録と合成。残った意図記録のカーネル照合・実体の無い意図記録の掃除は後続。下の注） |
 | #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 未実装 |
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
 | #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
@@ -364,6 +366,8 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3062 | net: attach 済みコンテナ単体の切り離し（D11） | net-builder | なし | 実装済み（PR #3192） |
 | #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし | 実装済み（PR #3193。共有ロックと投入後の事後確認は #3191） |
 | #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 | 未実装 |
+
+Issue #3067 の実装メモ: 記録は `crates/net/src/network_store/`（`member`・`realized`・`ipam_rebuild`・`imp/records.rs`）、記録つきの合成は `crates/net/src/network/recorded.rs`。D11 の列挙に、メンバー記録へ `token`（host veth の所有トークン）・`netns-dir`・`netns-dir-id` を補助項目として足した（組み直した IPAM に `NetnsDirRecord` を戻し、`delete_network` が復元した払い出しの pin を判定不能として扱う劣化を避けるため）。`CreatedNetwork::name_resolution` は記録せず、復元時に呼び出し側が渡す。残った `realized.intent` のカーネル照合（昇格または巻き戻し）、実体の無い `members-intent/*` の掃除、`--dns` 上流をヘルパーが消費する部分（#3071・#3072）は後続で、それまで `realized.intent` が残るネットワークの次の操作は `FailedPrecondition` で拒否し、意図記録のアドレスは使用中として数え続ける。
 
 既存の #1871（D1〜D3）・#1872（D9）・#1873（D4・D6〜D9・D14）・#1939（D6）・#1940（D5・D10）・#1935（D1・D10）は、本書の該当項を参照する。コード内のドキュメントコメントの陳腐化（`crates/net/src/lib.rs` の「PLUG-1 区分は検討中」、`network_plugin.rs` の「host / none は #19 で確定」）は本 PR では直さず、#3059 と #3058 の受け入れ条件に入れた。
 

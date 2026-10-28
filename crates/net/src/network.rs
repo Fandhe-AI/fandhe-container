@@ -135,6 +135,8 @@ pub mod delete;
 pub mod ipam;
 pub mod listener_dump;
 pub mod publish;
+#[cfg(target_os = "linux")]
+pub mod recorded;
 pub mod unpublish;
 
 use std::fmt;
@@ -755,7 +757,7 @@ fn is_definitely_rejected(code: NetErrorCode) -> bool {
 
 /// 作成ごとに一意な所有トークン（bridge の `IFLA_IFALIAS` に作成後の `RTM_SETLINK` で付ける）。プロセス ID・時刻・連番を含み、
 /// 他者が推測して同名 link に付け替えることは想定しない（そもそも `CAP_NET_ADMIN` が必要）。
-fn ownership_token(network: &NetworkName) -> String {
+pub(crate) fn ownership_token(network: &NetworkName) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -875,7 +877,17 @@ pub(crate) fn create_network_with(
 ) -> Result<CreatedNetwork, NetworkCreateError> {
     // 所有トークンは名前の導出より前に発行し、DeriveNames 以外の全失敗経路で回収用の請求書
     // （`NetworkCreateError::reclaim_claim`。#2467）へ引き継ぐ。
-    let token = ownership_token(spec.name());
+    create_network_with_token(ops, spec, ownership_token(spec.name()))
+}
+
+/// [`create_network_with`] の本体。所有トークンを呼び出し側から受ける（`network::recorded` が、カーネル操作の前に
+/// `realized.intent` へトークンを書き残すため。NET-1・#3067）。トークンは [`ownership_token`] の出力に限る。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn create_network_with_token(
+    ops: &impl NetworkOps,
+    spec: &NetworkCreateSpec,
+    token: String,
+) -> Result<CreatedNetwork, NetworkCreateError> {
     let fail = |error, step, rollback| NetworkCreateError {
         error,
         step,

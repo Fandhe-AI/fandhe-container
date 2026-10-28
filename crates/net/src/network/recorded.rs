@@ -599,20 +599,24 @@ pub(crate) fn restore_published_ports_recorded(
 /// 書き直せなかったときは [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。その状態や
 /// DELRULE 成功後のプロセス終了からは、DELRULE の直前に記録へ残す解除の意図の印で回復する: 再試行で DELRULE が
 /// `NotFound`（バッチは all-or-nothing で何も消えていない）になっても、印があり生きたテーブルのハンドルが一致して
-/// いれば消えたとみなして記録の更新だけを再開する。印が無い ENOENT は成功扱いにしない。残余: ルールの一覧照会
-/// （GETRULE）は未実装のため、2 本のうち片方だけが外部で消えた状態は区別できない（REPAIR-3）。
+/// いれば、2 本を `delete_one` で 1 本ずつ削除する（各 1 本の ENOENT はそのルールが既に無い確認とみなし、
+/// 残っているルールは確実に消す）。どちらかが ENOENT 以外で失敗すれば記録と予約を保つ。印が無い ENOENT は成功扱いに
+/// しない。記録の書き直しの rename 後に失敗した場合（新しい記録が残り公開が無い）の再試行は、同じメンバー・
+/// 同じ endpoint・同じネットワークの公開で記録に当該の受け口が無ければ、解除が確定済みとみなして予約の解放だけを行う。
 /// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
-pub(crate) fn unpublish_port_recorded_with<G, D>(
+pub(crate) fn unpublish_port_recorded_with<G, D, S>(
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
     published: PublishedPort,
     registry: &mut PortRegistry,
     table_info: G,
     delete: D,
+    mut delete_one: S,
 ) -> Result<(), RecordedError<Box<UnpublishPortError>, ()>>
 where
     G: FnOnce(&NftName) -> Result<TableInfo, NetError>,
     D: FnOnce(&NftName, (NftRuleHandle, NftRuleHandle)) -> Result<(), NftApplyFailure>,
+    S: FnMut(&NftName, &'static str, NftRuleHandle) -> Result<(), NftApplyFailure>,
 {
     require_exclusive_guard(guard)?;
     let realized = require_settled(guard)?;
@@ -626,6 +630,22 @@ where
     // 別ネットワークのトークンを持つ記録は、DELRULE の前に DataLoss で断る（`published_ports` は
     // `realized` のトークンで値を作るため、後段の完全一致では検出できない）。
     check_member_owned(&realized, rec).map_err(RecordedError::Store)?;
+    // 記録の書き直し（公開を外した版）の rename が済んだ後に失敗した再試行: 記録に当該の受け口が無く、同じ
+    // メンバー・endpoint・ネットワークの公開なら、公開を外すのは DELRULE の成功後だけなので解除は確定済み。
+    // 予約の解放だけを行う（記録を変えない）。
+    if !rec.has_publish(published.publish())
+        && published.network() == realized.name()
+        && published.bridge_token() == realized.token()
+        && published.endpoint() == rec.endpoint()
+    {
+        // 予約が実際に残っている（この呼び出し側が公開した）ときだけ成功扱いにする。予約が無い（0 件）なら、
+        // 記録に無い別の公開なので下の照合で断る。
+        match published.release_committed(registry) {
+            Ok(0) => {}
+            Ok(_) => return Ok(()),
+            Err(e) => return Err(RecordedError::Op(Box::new(e))),
+        }
+    }
     // 記録と食い違う公開（別メンバーのもの・ハンドル違い）では、カーネル操作の前に断る。
     if !rec.published_ports(&realized).contains(&published) {
         return Err(RecordedError::Op(Box::new(UnpublishPortError {
@@ -654,12 +674,19 @@ where
                 });
             marked?;
         }
+        let is_absent = |f: &NftApplyFailure| {
+            f.outcome == NftBatchOutcome::Aborted && f.error.code() == NetErrorCode::NotFound
+        };
         match delete(table, handles) {
-            Err(f)
-                if was_marked
-                    && f.outcome == NftBatchOutcome::Aborted
-                    && f.error.code() == NetErrorCode::NotFound =>
-            {
+            // 2 本の一括削除は片方の ENOENT で全体が中止される。印があるときは 1 本ずつ削除し、各 ENOENT だけを
+            // そのルールが既に無いこととみなす。残っているルールの削除に失敗すれば、記録と予約を保つ。
+            Err(f) if was_marked && is_absent(&f) => {
+                for (chain, handle) in [("prerouting", handles.0), ("output", handles.1)] {
+                    match delete_one(table, chain, handle) {
+                        Err(f) if !is_absent(&f) => return Err(f),
+                        _ => {}
+                    }
+                }
                 Ok(())
             }
             other => other,
@@ -693,7 +720,7 @@ mod linux {
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
-    use crate::network::unpublish::{linux_delete_rules, linux_table_info};
+    use crate::network::unpublish::{linux_delete_rule, linux_delete_rules, linux_table_info};
     use crate::network::{
         LinuxAttachOps, LinuxNetworkOps, NetworkCreateSpec, PortRegistry, PublishedPort,
         attach_container_with_generation, create_network_with_token, delete_network,
@@ -768,6 +795,7 @@ mod linux {
             registry,
             |table| linux_table_info(nft, table, timeout),
             |table, handles| linux_delete_rules(nft, timeout, table, handles),
+            |table, chain, handle| linux_delete_rule(nft, timeout, table, chain, handle),
         )
     }
 
@@ -1657,6 +1685,7 @@ mod tests {
                     .push(format!("{} {} {}", t.as_str(), a.get(), b.get()));
                 Ok(())
             },
+            |_, _, _| unreachable!("delete_one must not be called"),
         );
         (r, calls.into_inner(), count.get())
     }
@@ -1857,6 +1886,8 @@ mod tests {
                 reg,
                 |_| table_info_reply(42, BRIDGE_TOKEN),
                 |_, _| fail.map_or(Ok(()), Err),
+                // 1 本ずつの削除では 2 本とも既に無い（ENOENT）。
+                |_, _, _| Err(enoent()),
             )
         };
         let mut reg = PortRegistry::new();
@@ -1902,12 +1933,96 @@ mod tests {
                     outcome: NftBatchOutcome::Unknown,
                 })
             },
+            |_, _, _| unreachable!("delete_one must not be called"),
         );
         let Err(RecordedError::Op(e)) = r else {
             panic!("expected Op error");
         };
         assert_eq!(e.rules, UnpublishRules::Unknown);
         assert_eq!(n.members().unwrap()[0].publishes().len(), 1);
+    }
+
+    /// NET-3・SEC-1・#3068: 印があり一括削除が ENOENT で中止されても、片方のルールだけが残っていればそれを 1 本ずつ
+    /// 確実に消す。残りの削除が失敗すれば記録（公開と印）を保ち、成功なら記録を更新する。
+    #[test]
+    fn net3_3068_unpublish_marked_enoent_deletes_remaining_rule_individually() {
+        let t = Tmp::new("unpublish-partial");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let rec = n.members().unwrap().remove(0);
+        n.replace_member(&rec.with_unpublishing(&web_publish()).unwrap())
+            .unwrap();
+        let enoent = || NftApplyFailure {
+            error: NetError::new(NetErrorCode::NotFound, "no such rule"),
+            outcome: NftBatchOutcome::Aborted,
+        };
+        let run = |one_out: Result<(), NftApplyFailure>| {
+            let p = restore_published_ports_recorded(&n, &mid("c1"))
+                .unwrap()
+                .remove(0);
+            let calls = std::cell::RefCell::new(Vec::new());
+            let r = unpublish_port_recorded_with(
+                &n,
+                &mid("c1"),
+                p,
+                &mut PortRegistry::new(),
+                |_| table_info_reply(42, BRIDGE_TOKEN),
+                |_, _| Err(enoent()),
+                |_, chain, h| {
+                    calls.borrow_mut().push(format!("{chain} {}", h.get()));
+                    if chain == "prerouting" {
+                        Err(enoent())
+                    } else {
+                        one_out.clone()
+                    }
+                },
+            );
+            (r, calls.into_inner())
+        };
+        // 残った output の削除が失敗: 記録と印を保ち、予約も保つ。
+        let (r, calls) = run(Err(NftApplyFailure {
+            error: NetError::new(NetErrorCode::Internal, "timeout"),
+            outcome: NftBatchOutcome::Unknown,
+        }));
+        assert!(matches!(r, Err(RecordedError::Op(_))));
+        assert_eq!(calls, ["prerouting 2", "output 3"]);
+        let m = n.members().unwrap();
+        assert_eq!(m[0].publishes().len(), 1);
+        assert!(m[0].is_unpublishing(&web_publish()));
+        // output の削除が成功: 記録から公開が外れる。
+        let (r, _) = run(Ok(()));
+        r.unwrap();
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 0);
+    }
+
+    /// NET-3・#3068: 記録の書き直しが済んだ後（公開が記録に無い）の再試行は、DELRULE を送らず予約の解放だけで成功する。
+    #[test]
+    fn net3_3068_unpublish_retry_after_record_already_rewritten() {
+        let t = Tmp::new("unpublish-rewritten");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let p = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let rec = n.members().unwrap().remove(0);
+        n.replace_member(&rec.without_publish(&web_publish()).unwrap())
+            .unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), p.endpoint(), &[*p.publish()]).unwrap();
+        unpublish_port_recorded_with(
+            &n,
+            &mid("c1"),
+            p,
+            &mut reg,
+            |_| unreachable!("table_info must not be called"),
+            |_, _| unreachable!("delete must not be called"),
+            |_, _, _| unreachable!("delete_one must not be called"),
+        )
+        .unwrap();
     }
 
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。

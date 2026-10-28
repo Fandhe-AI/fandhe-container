@@ -345,6 +345,13 @@ impl MemberRecord {
         Ok(next)
     }
 
+    /// 指定した受け口の公開が記録にあるか。
+    pub fn has_publish(&self, publish: &PortPublish) -> bool {
+        self.publishes
+            .iter()
+            .any(|p| p.publish.same_listener(publish))
+    }
+
     /// 指定した受け口の公開に解除の意図の印が付いているか。
     pub fn is_unpublishing(&self, publish: &PortPublish) -> bool {
         self.publishes

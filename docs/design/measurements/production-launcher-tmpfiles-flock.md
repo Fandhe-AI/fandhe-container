@@ -185,7 +185,7 @@ issue #3026 の残余だった `crates/supervisor/src`・`crates/cli/src` の `#
 利用者が Linux 限定であり、`cross-target-check` の macOS・Windows 向け `clippy --all-targets` へ利用者 0 の補助を
 持ち込まないため Linux に絞る。bundle・状態ルート・image root は `ScratchDir` の **子** に作る。
 
-### 適用（保護が要る 5 fixture）
+### 適用（保護が要る 6 fixture）
 
 | crate | ファイル・fixture | 当たる経路 |
 | ----- | ----------------- | ---------- |
@@ -193,6 +193,7 @@ issue #3026 の残余だった `crates/supervisor/src`・`crates/cli/src` の `#
 | cli | `commands/create_start.rs` の `tests::linux::TmpDir` | `create_container*`（`BundleLock` と image rootfs の `try_lock`） |
 | cli | `commands/list_logs.rs` の `tests::linux::TmpDir` | `oci_runtime::create` |
 | cli | `commands/stop_delete.rs` の `tests::linux::TmpDir` | create・start・delete・`create_with_image` |
+| cli | `setup.rs` の `tests::TmpDir`（`cli2_daily_commands_do_not_request_os_setup`。Linux のみ `ScratchDir` の子） | `invoke` → create・delete（`BundleLock`） |
 | supervisor | `start_client.rs` の `tests::TmpDir`（`Fixture`） | `Fixture::new` の `oci_runtime::create` |
 
 ### 対象外
@@ -204,7 +205,7 @@ issue #3026 の残余だった `crates/supervisor/src`・`crates/cli/src` の `#
   （cli の `create_start.rs` の op log 系と `reclaim_tests`、`image*`・`ref_reconcile`・`stop_delete.rs` の状態ストア系、
   supervisor の `container_options/*`・`logs/*`・`deadline_store`・`supervisor_log`）
 - flock を取らない経路: `pin_bundle_rootfs`（`exec.rs`）、config の読み取りのみ（`start_entry.rs`）、UDS の bind
-  （`control/listener.rs`）、xattr（`sys/linux.rs`）、`doctor*`・`setup`・`plugin_backend`・`create_options` の設定ファイル系
+  （`control/listener.rs`）、xattr（`sys/linux.rs`）、`doctor*`・`setup` の出力系（`setup.rs` の `tests::TmpDir` は上表）・`plugin_backend`・`create_options` の設定ファイル系
 
 ### 残余
 

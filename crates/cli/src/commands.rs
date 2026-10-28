@@ -924,11 +924,14 @@ mod tests {
                 "{:?}",
                 o.stdout
             );
+            // Linux の create は既定の `network none` を文書に書くため、作成世代の注釈だけを持つ(#1873・D4)。
             assert!(
-                o.stdout.ends_with(",\"annotations\":{}}\n"),
+                o.stdout
+                    .contains(",\"annotations\":{\"io.fandhe.container.options-generation\":\""),
                 "{:?}",
                 o.stdout
             );
+            assert!(o.stdout.ends_with("\"}}\n"), "{:?}", o.stdout);
             assert!(!o.stdout.contains("\"pid\""), "{:?}", o.stdout);
             // 読み取りだけなので 2 回目も同じ出力(revision を進めない)。
             let again = invoke(&root, &["state", "s1"]);
@@ -1413,6 +1416,14 @@ mod net12_argv_tests {
 
     /// `create` を実行し (終了コード, code, stderr) を返す。状態ルートが作られていないことも確かめる。
     fn create(extra: &[&str]) -> (u8, Option<&'static str>, String) {
+        create_checked(extra, true)
+    }
+
+    /// `create` の本体。`root_must_be_absent` が偽なら状態ルートの有無を問わない(検証を通った指定は後段で作られ得る)。
+    fn create_checked(
+        extra: &[&str],
+        root_must_be_absent: bool,
+    ) -> (u8, Option<&'static str>, String) {
         let root = fresh_root();
         let mut full: Vec<OsString> = vec!["--root".into(), root.clone().into(), "create".into()];
         full.extend(extra.iter().map(OsString::from));
@@ -1422,7 +1433,11 @@ mod net12_argv_tests {
         let mut buf = Vec::new();
         r.write_stderr(&mut buf).expect("write");
         let stderr = String::from_utf8(buf).expect("utf8");
-        assert!(!root.exists(), "state root must not be created: {extra:?}");
+        if root_must_be_absent {
+            assert!(!root.exists(), "state root must not be created: {extra:?}");
+        } else {
+            let _ = std::fs::remove_dir_all(&root);
+        }
         (r.exit_code(), r.code(), stderr)
     }
 
@@ -1441,6 +1456,18 @@ mod net12_argv_tests {
         let (exit, code, stderr) = create(extra);
         assert_eq!(exit, 8, "{extra:?}: {stderr}");
         assert_eq!(code, Some("UNIMPLEMENTED"), "{extra:?}");
+    }
+
+    /// 形式の検証と結線の拒否を通ったこと。Linux は後段(存在しない bundle)で止まり `UNIMPLEMENTED` ではない。
+    /// 非 Linux は network 系の指定を固定文言で `UNIMPLEMENTED` にする(状態ルートは作られない)。
+    fn assert_past_network_validation(extra: &[&str]) {
+        let (exit, code, stderr) = create_checked(extra, !cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            assert_ne!(code, Some("UNIMPLEMENTED"), "{extra:?}: {stderr}");
+            assert_ne!(code, Some("INVALID_ARGUMENT"), "{extra:?}: {stderr}");
+        } else {
+            assert_eq!((exit, code), (8, Some("UNIMPLEMENTED")), "{extra:?}");
+        }
     }
 
     /// TASK-186 の不正入力 8 種(空値・IP でない・空白・ハイフン・ラベル長・総長・改行・制御文字)。
@@ -1463,7 +1490,7 @@ mod net12_argv_tests {
         assert_invalid(&["--add-host", "web-:192.0.2.1"], "web-");
         assert_invalid(&["--add-host", &label64], &l64);
         assert_invalid(&["--add-host", &host254], &l63);
-        assert_unimplemented(&["--add-host", &host253]);
+        assert_past_network_validation(&["--add-host", &host253]);
         assert_invalid(&["--add-host", "web:192.0.2.1\n10.0.0.9 evil"], "evil");
         assert_invalid(&["--dns", "127.0.0.1\nnameserver 8.8.8.8"], "8.8.8.8");
         assert_invalid(&["--add-host", "web\t:192.0.2.1"], "web");
@@ -1473,7 +1500,7 @@ mod net12_argv_tests {
     /// `name:::1` は最初の `:` で分割され IPv6 として受理される(検証後に UNIMPLEMENTED)。
     #[test]
     fn net12_add_host_splits_at_first_colon() {
-        assert_unimplemented(&["--add-host", "name:::1"]);
+        assert_past_network_validation(&["--add-host", "name:::1"]);
         assert_invalid(&["--add-host", "name::::1"], "");
     }
 
@@ -1481,7 +1508,9 @@ mod net12_argv_tests {
     #[test]
     fn net12_none_rejects_non_loopback_dns() {
         assert_invalid(&["--network", "none", "--dns", "192.0.2.1"], "192.0.2.1");
-        assert_unimplemented(&["--network", "none", "--dns", "127.0.0.1"]);
+        assert_past_network_validation(&["--network", "none", "--dns", "127.0.0.1"]);
+        // 省略は none 扱い(D4)。非 loopback の `--dns` は create の時点で拒否する。
+        assert_invalid(&["--dns", "192.0.2.1"], "192.0.2.1");
     }
 
     /// `--network` の判定と使い方エラー、値が正しくても UNIMPLEMENTED。
@@ -1489,7 +1518,8 @@ mod net12_argv_tests {
     fn net12_network_flag_cases() {
         assert_invalid(&["--network", "bridge"], "");
         assert_unimplemented(&["--network", "container:x"]);
-        assert_unimplemented(&["--network", "host"]);
+        assert_past_network_validation(&["--network", "host"]);
+        assert_past_network_validation(&["--network", "none"]);
         // 使い方エラーは exit 2 の INVALID_ARGUMENT(状態ルートは作られない)。
         assert_invalid(&["--network", "a", "--network", "b"], "");
         assert_invalid(&["--add-host"], "");

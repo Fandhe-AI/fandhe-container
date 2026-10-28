@@ -133,7 +133,8 @@
   - **ワイヤー**: listener 用とは別の `SOCK_SEQPACKET` の socketpair。子 → C は本文 `N` ＋ `SCM_RIGHTS` の fd 1 本（C の端は `SO_PASSCRED`）、C → 子は本文 `A`。受信側は期待する fd の種別の列（`[Net]` か `[Net, User]`）を取り、#1939 の `Attachable` は netns・user namespace の 2 本を渡す（実装済み。`rootless-network.md` 12.2「実装（#1939）」）。検証は切り詰め・本文・本数・送信元 pid・close-on-exec・nsfs（`fstatfs`）・`readlink` が `net:[<ino>]` であること、そのうえで (dev, ino) を期待と照合する。
   - **期限と fail-closed**: 子の ACK 待ちは 60 秒（開始ゲートと同じ）、C の受信は launch の単一期限の残りまで。EOF・期限切れ・`A` 以外では子は exec せずに終了し、C は PID 1 を kill して回収する。C の端は中間プロセスで閉じ（PID 1 へ継承させない）、親の死は EOF で子に届く。
   - **監査（SEC-4）**: 不一致（理由 `netns_identity_mismatch`）と形式違反（`netns_handoff_invalid`）は、段 `netns_verify`・層 `mount`・パスなしで 1 件記録する（`FailedPrecondition`）。EOF・期限切れ・errno・子の `E` 通知は系のエラーで記録しない。message は固定の英文で、inode の値を含めない。
-  - **範囲外**: `network_mode=host` の構造化ログ 1 行と、net の `HostNetns::verify_ns_identity` の切り出し・結線は #1873、pasta 構成の fd 2 本と合図は #1939 で実装済み（フックの実装は #1940）。
+  - **範囲外**: pasta 構成の fd 2 本と合図は #1939 で実装済み（フックの実装は #1940）。
+  - 追記（#1873 で実装済み）: net に `HostNetns::verify_ns_identity`（識別子の純粋照合）と `current_thread_netns()` を足した。supervisor は `ProductionStartDeps::with_container_options` の時点（start の入口の単一スレッド区間）で host モードのときだけ自分の netns を基準として取り、手順 4b で作業スレッドが同じ netns にいることを `HostNetns::detect` で照合する（多重防御。基準が取れない・不一致は `FAILED_PRECONDITION`）。子（PID 1）の照合は core の同期点（#3206）が担う。成功報告の後に構造化ログ 1 行 `{"component":"supervisor","event":"network_mode","network_mode":"host"}` を出す（固定語彙のみ。監査ログには書かない。restart の再 launch では出さない）。
 - 追記（#1935）: pasta 構成の同期点では netns と user namespace の fd を 2 本、この順で受ける（[rootless-network.md](rootless-network.md) 12.2）。Loopback・Host は 1 本のまま。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
@@ -153,7 +154,8 @@
   - `create_etc_files` は `<id>` が既にあれば `ALREADY_EXISTS` で拒否する。「start のたびに作り直す」は呼び出し側（supervisor。#1873・#3065）が `remove_etc_files` の後に `create_etc_files` を呼んで実現する
   - mount のモード: 既定は rw（D9 のとおり）。実効の `root.readonly=true` では ro で載せる（containerd の `containerMounts` が `readonly_rootfs` を hosts / resolv.conf の `Readonly` に写す挙動に揃えた、閉じた側の選択。一次情報の確認は #2859 に残し、違えば緩める）。ro のときに先が無いなら rootfs へ書かず `FailedPrecondition`
   - 元の検証は 2 段: launcher が fork 前に所有者・権限・nlink を検査して `(st_dev, st_ino)` を記録し、子（新しい mount namespace）が同じ正規化済みパスを辿り直して `(st_dev, st_ino)` と nlink 1 の一致を要求する（user namespace の中では uid が写像後の値になるため）
-  - 未実装: supervisor の start からの呼び出し・start 失敗時の巻き戻し（#1873・#3065）、rootful bridge の resolv.conf（D13・#3074）、`RootfulHostRoot`（launcher が拒否。#2241）
+  - 実装済み（#1873）: supervisor の start の手順 4b（`prepare_cgroup`・`build_launcher`・`claim_start` の後、世代の照合の前。起動権の予約〔所有ロック〕を握った後でなければ並行する同じ ID の start の生成物を消し得るため）の `prepare_network` が `remove_etc_files` → `create_etc_files` → net の `append_add_hosts` / `apply_dns` を行い、失敗時はその場で巻き戻す。予約を握ったままの失敗（`DiscardClaim`）では、予約を手放す前に `release_network` で生成ファイルを消し、その後に cgroup を消す。予約を手放した後の失敗では別世代の生成物を守るため生成ファイルを消さず残す。cgroup の削除を確かめられない経路でも bind 元を消さない。生成と bind の選択は `NetworkOptions::etc_file_selection` の 1 関数で決まる
+- 未実装: rootful bridge の resolv.conf（D13・#3074）、`RootfulHostRoot`（launcher が拒否。#2241）
 - **先が symlink の扱い（#3210。NET-12・SEC-1）**: 解決せず拒否を続ける。理由:
   1. systemd-resolved 形（`/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf`）は、解決しても救えない。`/run` は実行時の tmpfs でイメージの tarball では空のため、解決先の親ディレクトリを作らない制約の下では結局拒否になる。救えるのは rootfs 内にある通常ファイルを指す symlink だけで、まれな場面と見込む（実イメージでの確認はしていない）
   2. 利用者の bind（`mounts[]`）は先の symlink を解決せずに拒否する（`bind_mounts.rs`）。etc の bind だけ解決すると方針が混ざる
@@ -307,7 +309,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | hosts / resolv.conf の生成と bind | core（新規 `etc_files`）・`exec/rootfs.rs` | #349 条件 1（host / none）・3 | #1872 |
 | none の netns と `lo` の up | `crates/core/src/exec.rs`・`oci_runtime/start.rs` | #349 条件 1（none）・4（loopback の反映） | #3058・#3064 |
 | 文書の kind と `supervisor` → `net` | `crates/supervisor/src/container_options/document.rs` | #349 条件 1・3 | #3065 |
-| host / none の結線と既定の none | cli・supervisor | #349 条件 1（host / none）・3・4 | #1873 |
+| host / none の結線と既定の none | cli・supervisor | #349 条件 1（host / none）・3・4 | #1873（実装済み。実機前提の結合試験と CI への組み込みは後続） |
 | ネットワーク定義・`CreatedNetwork` の永続化 | `crates/net/src/network.rs` | #349 条件 1（ユーザー定義）・2、#319 条件 2〜4 | #3059・#3067 |
 | `network create/rm/ls` | cli | #319 条件 4 | #3066 |
 | 静的 IPAM の永続化 | `crates/net/src/network/ipam.rs` | #349 条件 2、#319 条件 2〜4 | #3067 |
@@ -347,7 +349,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | issue | 内容 | 担当 | 依存 | 状態 |
 | ----- | ---- | ---- | ---- | ---- |
 | #3058 | core: `LaunchOptions` の network モードと config との突き合わせ（D7） | runtime-builder | なし | 実装済み（PR #3187） |
-| #3206 | core: entrypoint の exec 直前の同期点と netns の素性の照合（D8。親 #3032） | runtime-builder | #3058・#3064 | 未実装 |
+| #3206 | core: entrypoint の exec 直前の同期点と netns の素性の照合（D8。親 #3032） | runtime-builder | #3058・#3064 | 実装済み |
 | #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 | 実装済み（PR #3195） |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |

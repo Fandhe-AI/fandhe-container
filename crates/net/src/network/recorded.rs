@@ -20,9 +20,22 @@
 //! - 残った `realized.intent` は未完了の操作を示す。カーネル照合は後続の担当で、それまで次の操作は
 //!   `FailedPrecondition`（`network has an unreconciled operation`）で拒否する
 //!
+//! # 公開の記録と再起動後の個別解除（NET-3・#3068）
+//! create は成功の直後に GETTABLE で専用テーブルを照会し、`NFTA_TABLE_USERDATA` が所有トークンと一致することを
+//! 確かめたうえでテーブルのカーネル採番ハンドルを `realized` に記録する（確かめられなければ [`RecordedError::Uncommitted`]
+//! で意図記録を残す）。attach は公開の受け口と rule handle 2 本を、そのテーブルハンドルとともに `members/<id>` に記録する
+//! （返す `AttachedContainer::published_ports` にもテーブルハンドルを束縛する）。再起動後は
+//! `restore_published_ports_recorded` が dump を使わず記録から [`PublishedPort`] を復元し、
+//! `unpublish_port_recorded_with` が復元した値を記録と照合して個別に解除する。解除は rule handle を使う前に毎回
+//! 生きたテーブルのハンドルと照合し、食い違えば（テーブルが作り直されている）DELRULE を送らず
+//! [`UnpublishRules::StaleHandles`] で断る。解除の成功後は、そのメンバー記録から該当の公開を外して書き直す。
+//!
 //! # 未実装範囲（REPAIR-3）
 //! - 残った `realized.intent` / `members-intent/*` のカーネル照合による昇格・巻き戻し（link の dump API が前提）
-//! - 公開（受け口・rule handle）とテーブル handle の記録（#3068）。`PortRegistry` は呼び出し側が持つ
+//! - 生きた `AttachedContainer` を持たない detach（veth・pin の回収）と、detach の失敗の請求書へのルールハンドルの
+//!   記載（#3285）。再起動後の detach の公開の解除は本モジュールの個別解除を先に呼ぶ
+//! - 記録から `PortRegistry`（ポート予約）を組み直すこと。再起動直後は空の予約表を渡すと、解除はルールの削除だけを
+//!   行い、予約の解放は 0 件で成功する
 //! - 検証で拒否した detach は渡された `AttachedContainer` を返さず破棄する（netns の pin は残る。記録から
 //!   請求書を作って回収する経路は #3075）
 
@@ -41,8 +54,15 @@ use crate::network_store::MAX_MEMBERS_PER_NETWORK;
 use crate::network_store::realized::check_gateway;
 use crate::network_store::{
     InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkLockGuard,
-    RealizedIntent, RealizedOp, RealizedRecord, rebuild_ipam,
+    RealizedIntent, RealizedOp, RealizedRecord, RecordedPublish, rebuild_ipam,
 };
+use crate::nftables_batch::{NftName, TableInfo};
+use crate::nftables_rules::NftRuleHandle;
+
+use super::NftApplyFailure;
+use super::delete::require_table_owned;
+use super::unpublish::unpublish_ports_with;
+use super::{PortRegistry, PublishedPort, UnpublishPortError, UnpublishRules};
 
 /// 記録つきの操作の失敗。
 #[derive(Debug)]
@@ -89,22 +109,21 @@ fn unreconciled() -> NetError {
 }
 
 /// `realized` を読み、未完了の操作が無いことを確かめる。
+fn settled_realized(guard: &NetworkLockGuard<'_>) -> Result<RealizedRecord, NetError> {
+    let realized = guard
+        .realized()?
+        .ok_or_else(|| precondition("network is not realized"))?;
+    if guard.realized_intent()?.is_some() {
+        return Err(unreconciled());
+    }
+    Ok(realized)
+}
+
+/// [`settled_realized`] の `RecordedError` 版。
 fn require_settled<E, T>(
     guard: &NetworkLockGuard<'_>,
 ) -> Result<RealizedRecord, RecordedError<E, T>> {
-    let store = RecordedError::Store;
-    let realized = guard
-        .realized()
-        .map_err(store)?
-        .ok_or_else(|| RecordedError::Store(precondition("network is not realized")))?;
-    if guard
-        .realized_intent()
-        .map_err(RecordedError::Store)?
-        .is_some()
-    {
-        return Err(RecordedError::Store(unreconciled()));
-    }
-    Ok(realized)
+    settled_realized(guard).map_err(RecordedError::Store)
 }
 
 /// 排他ロックのガードであることを、カーネル操作の前に確かめる。
@@ -201,7 +220,15 @@ where
         .map_err(RecordedError::Store)?;
 
     match run(&mut ipam, &generation) {
-        Ok(att) => commit_attached(guard, member_id, dns, &ipam, address, &host_token, att),
+        Ok(att) => commit_attached(
+            guard,
+            member_id,
+            dns,
+            &ipam,
+            (address, &host_token),
+            &realized,
+            att,
+        ),
         Err(e) => {
             let claim = e.reclaim_claim();
             if let Some(c) = &claim
@@ -230,9 +257,9 @@ fn commit_attached<N>(
     member_id: &MemberId,
     dns: &[IpAddr],
     ipam: &StaticIpam,
-    address: IpPrefix,
-    host_token: &str,
-    att: AttachedContainer<N>,
+    (address, host_token): (IpPrefix, &str),
+    realized: &RealizedRecord,
+    mut att: AttachedContainer<N>,
 ) -> AttachResult<N> {
     let uncommitted = |error: NetError, att: AttachedContainer<N>| RecordedError::Uncommitted {
         error,
@@ -256,6 +283,17 @@ fn commit_attached<N>(
             att,
         ));
     };
+    // 公開は realized に記録したテーブルのハンドルに束縛する（返す値の個別解除も生きたテーブルと照合できる）。
+    let table_handle = realized.table_handle();
+    att.published_ports = std::mem::take(&mut att.published_ports)
+        .into_iter()
+        .map(|p| p.with_table_handle(table_handle))
+        .collect();
+    let recorded: Vec<RecordedPublish> = att
+        .published_ports
+        .iter()
+        .map(|p| RecordedPublish::new(*p.publish(), p.prerouting_handle(), p.output_handle()))
+        .collect();
     let rec = MemberRecord::new(
         member_id.clone(),
         att.endpoint.clone(),
@@ -264,7 +302,8 @@ fn commit_attached<N>(
         dir.path(),
         dir.dir_id(),
         dns,
-    );
+    )
+    .and_then(|r| r.with_publishes(table_handle, recorded));
     match rec.and_then(|r| guard.commit_member(&r)) {
         Ok(()) => Ok(att),
         Err(e) => Err(uncommitted(e, att)),
@@ -353,15 +392,19 @@ impl<N> DetachClaim for Box<super::ContainerDetachError<N>> {
 /// create を記録つきで行う本体。`run` は発行済みの所有トークンを受けて作成する。
 ///
 /// 定義が `Bridge` でなければ `FailedPrecondition`。`gateway` は定義の subnet に属する必要がある
-/// （カーネル操作の前に検査する）。
-pub(crate) fn create_recorded_with<F>(
+/// （カーネル操作の前に検査する）。`table_info` は `run` の成功後に専用テーブルを照会する（読み取りのみ）。
+/// userdata が所有トークンと一致するテーブルのハンドルを確かめられなければ、`realized` を書かず
+/// [`RecordedError::Uncommitted`] を返す（意図記録は残す。NET-3・#3068）。
+pub(crate) fn create_recorded_with<F, G>(
     guard: &NetworkLockGuard<'_>,
     definition: &NetworkDefinition,
     gateway: IpPrefix,
     run: F,
+    table_info: G,
 ) -> Result<CreatedNetwork, RecordedError<Box<NetworkCreateError>, CreatedNetwork>>
 where
     F: FnOnce(&str) -> Result<CreatedNetwork, NetworkCreateError>,
+    G: FnOnce(&NftName) -> Result<TableInfo, NetError>,
 {
     let InstallMode::Bridge { subnet } = *definition.install() else {
         return Err(RecordedError::Store(precondition(
@@ -421,7 +464,8 @@ where
         .map_err(RecordedError::Store)?;
     match run(&token) {
         Ok(created) => {
-            let committed = RealizedRecord::from_created(&created, subnet)
+            let committed = require_table_owned(table_info(&created.table), &created.bridge_token)
+                .and_then(|h| RealizedRecord::from_created(&created, subnet, h))
                 .and_then(|r| guard.commit_realized(&r));
             match committed {
                 Ok(()) => Ok(created),
@@ -498,6 +542,75 @@ where
     }
 }
 
+/// 記録から、メンバーの公開を [`PublishedPort`] として復元する（dump は使わない。再起動後の経路。NET-3・#3068）。
+///
+/// 読み取りだけなので共有ロックのガードでもよい。未完了の操作が残るネットワーク・`realized` の無いネットワーク・
+/// 記録に無いメンバーは `FailedPrecondition` / `NotFound`。公開の無いメンバーは空の列を返す。復元した値は
+/// 記録したテーブルハンドルを束縛しており、`unpublish_port_recorded_with` が解除の前に生きたテーブルと照合する。
+pub(crate) fn restore_published_ports_recorded(
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+) -> Result<Vec<PublishedPort>, NetError> {
+    let realized = settled_realized(guard)?;
+    let members = guard.members()?;
+    let rec = members
+        .iter()
+        .find(|m| m.id() == member_id)
+        .ok_or_else(|| NetError::new(NetErrorCode::NotFound, "member not found"))?;
+    Ok(rec.published_ports(&realized))
+}
+
+/// 公開 1 件を記録つきで個別に解除する本体（OS 非依存。カーネル操作は呼び出し側が渡す。NET-3・SEC-1・#3068）。
+///
+/// 手順: 排他ロックと未完了の操作が無いことを確かめる → `published` が当該メンバーの記録の 1 件と完全に一致する
+/// こと（受け口・rule handle・テーブルハンドル・ネットワーク・トークン）を照合する → `unpublish_ports_with` で
+/// 生きたテーブルのハンドルと照合したうえで DELRULE → 成功したらメンバー記録から該当の公開を外して書き直す。
+/// 照合で拒否・失敗したときは記録を変えず、`published` を [`UnpublishPortError`] に入れて返す。解除が成功しても記録を
+/// 書き直せなかったときは [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。
+/// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
+pub(crate) fn unpublish_port_recorded_with<G, D>(
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+    published: PublishedPort,
+    registry: &mut PortRegistry,
+    table_info: G,
+    delete: D,
+) -> Result<(), RecordedError<Box<UnpublishPortError>, ()>>
+where
+    G: FnOnce(&NftName) -> Result<TableInfo, NetError>,
+    D: FnOnce(&NftName, (NftRuleHandle, NftRuleHandle)) -> Result<(), NftApplyFailure>,
+{
+    require_exclusive_guard(guard)?;
+    let realized = require_settled(guard)?;
+    let members = guard.members().map_err(RecordedError::Store)?;
+    let Some(rec) = members.iter().find(|m| m.id() == member_id) else {
+        return Err(RecordedError::Store(NetError::new(
+            NetErrorCode::NotFound,
+            "member not found",
+        )));
+    };
+    // 記録と食い違う公開（別メンバーのもの・ハンドル違い）では、カーネル操作の前に断る。
+    if !rec.published_ports(&realized).contains(&published) {
+        return Err(RecordedError::Op(Box::new(UnpublishPortError {
+            error: precondition("published port does not match the member record"),
+            rules: UnpublishRules::Unknown,
+            reservation_held: true,
+            published: Some(Box::new(published)),
+        })));
+    }
+    let publish = *published.publish();
+    let created = realized.to_created(NameResolution::default());
+    unpublish_ports_with(table_info, delete, &created, published, registry)
+        .map_err(|e| RecordedError::Op(Box::new(e)))?;
+    // ルールは消えた。記録から外せなければ呼び出し側へ知らせる（古い公開が記録に残る）。
+    rec.without_publish(&publish)
+        .and_then(|next| guard.replace_member(&next))
+        .map_err(|error| RecordedError::Uncommitted {
+            error,
+            value: Box::new(()),
+        })
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::time::Duration;
@@ -506,6 +619,7 @@ mod linux {
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
+    use crate::network::unpublish::{linux_delete_rules, linux_table_info};
     use crate::network::{
         LinuxAttachOps, LinuxNetworkOps, NetworkCreateSpec, PortRegistry, PublishedPort,
         attach_container_with_generation, create_network_with_token, delete_network,
@@ -531,17 +645,56 @@ mod linux {
                 "spec and definition name differ",
             )));
         }
-        create_recorded_with(guard, definition, spec.gateway(), |token| {
-            create_network_with_token(
-                &LinuxNetworkOps {
-                    route,
-                    nft,
-                    timeout,
-                },
-                spec,
-                token.to_owned(),
-            )
-        })
+        create_recorded_with(
+            guard,
+            definition,
+            spec.gateway(),
+            |token| {
+                create_network_with_token(
+                    &LinuxNetworkOps {
+                        route,
+                        nft,
+                        timeout,
+                    },
+                    spec,
+                    token.to_owned(),
+                )
+            },
+            |table| linux_table_info(nft, table, timeout),
+        )
+    }
+
+    /// 記録から、メンバーの公開を [`PublishedPort`] として復元する（再起動後の経路。dump は使わない）。
+    ///
+    /// 復元した値は [`unpublish_port_recorded`] に渡す。契約は `restore_published_ports_recorded`。
+    pub fn restore_published_ports(
+        guard: &NetworkLockGuard<'_>,
+        member_id: &MemberId,
+    ) -> Result<Vec<PublishedPort>, NetError> {
+        restore_published_ports_recorded(guard, member_id)
+    }
+
+    /// 公開 1 件を記録つきで個別に解除する（`unpublish_container_port` の記録つき版。NET-3・#3068）。
+    ///
+    /// `published` は同じメンバーの記録から復元した値（または同じプロセスで attach した結果）に限る。
+    /// 生きたテーブルのハンドルが記録と食い違えば DELRULE を送らず断る。`CAP_NET_ADMIN` は呼び出し側の責務。
+    /// 失敗時の規則は `unpublish_port_recorded_with`。
+    pub fn unpublish_port_recorded(
+        nft: &NetlinkNetfilterSocket,
+        guard: &NetworkLockGuard<'_>,
+        member_id: &MemberId,
+        published: PublishedPort,
+        registry: &mut PortRegistry,
+        timeout: Duration,
+    ) -> Result<(), RecordedError<Box<UnpublishPortError>, ()>> {
+        unpublish_port_recorded_with(
+            guard,
+            member_id,
+            published,
+            registry,
+            |table| linux_table_info(nft, table, timeout),
+            |table, handles| linux_delete_rules(nft, timeout, table, handles),
+        )
     }
 
     /// コンテナを接続して `members/<id>` に記録する（`attach_container` の記録つき版）。
@@ -638,7 +791,7 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{
     attach_container_recorded, create_network_recorded, delete_network_recorded,
-    detach_container_recorded,
+    detach_container_recorded, restore_published_ports, unpublish_port_recorded,
 };
 
 #[cfg(test)]
@@ -650,7 +803,9 @@ mod tests {
         NetnsDirRecord, NetworkName, NetworkResource, NetworkResourceNames, ResourceState,
         RollbackReport, VethNames,
     };
+    use crate::network::{PortProtocol, PortPublish};
     use crate::network_store::NetworkStore;
+    use crate::nftables_batch::NftTableHandle;
     use std::net::Ipv4Addr;
     use std::path::{Path, PathBuf};
 
@@ -706,12 +861,32 @@ mod tests {
         store.create(&def()).unwrap();
         store
     }
+    /// テーブルハンドル 42 で `realized` を書く。
     fn realize(guard: &NetworkLockGuard<'_>) {
         guard
             .commit_realized(
-                &RealizedRecord::from_created(&created(), pfx([10, 0, 0, 0], 24)).unwrap(),
+                &RealizedRecord::from_created(
+                    &created(),
+                    pfx([10, 0, 0, 0], 24),
+                    NftTableHandle::new(42).unwrap(),
+                )
+                .unwrap(),
             )
             .unwrap();
+    }
+
+    /// GETTABLE の応答の代役（handle 属性 4 と userdata 属性 6）。
+    fn table_info_reply(handle: u64, userdata: &str) -> Result<TableInfo, NetError> {
+        let mut p = vec![2u8, 0, 0, 0];
+        for (ty, data) in [(4u16, &handle.to_be_bytes()[..]), (6, userdata.as_bytes())] {
+            p.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            p.extend_from_slice(&ty.to_ne_bytes());
+            p.extend_from_slice(data);
+            while p.len() % 4 != 0 {
+                p.push(0);
+            }
+        }
+        TableInfo::decode(&p)
     }
     fn spec(ep: &str) -> ContainerAttachSpec {
         ContainerAttachSpec::new(
@@ -1129,25 +1304,42 @@ mod tests {
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
         let seen = std::cell::RefCell::new(String::new());
-        let out = create_recorded_with(&n, &def(), pfx([10, 0, 0, 1], 24), |token| {
-            *seen.borrow_mut() = token.to_owned();
-            // 実行中は意図記録が読める。
-            assert_eq!(
-                n.realized_intent().unwrap().unwrap().token(),
-                token,
-                "カーネル操作の前に意図記録がある"
-            );
-            let mut c = created();
-            c.bridge_token = token.to_owned();
-            Ok(c)
-        })
+        let out = create_recorded_with(
+            &n,
+            &def(),
+            pfx([10, 0, 0, 1], 24),
+            |token| {
+                *seen.borrow_mut() = token.to_owned();
+                // 実行中は意図記録が読める。
+                assert_eq!(
+                    n.realized_intent().unwrap().unwrap().token(),
+                    token,
+                    "カーネル操作の前に意図記録がある"
+                );
+                let mut c = created();
+                c.bridge_token = token.to_owned();
+                Ok(c)
+            },
+            |_| table_info_reply(42, &seen.borrow()),
+        )
         .unwrap();
         assert_eq!(out.bridge_token, *seen.borrow());
         let rec = n.realized().unwrap().unwrap();
+        assert_eq!(
+            rec.table_handle().get(),
+            42,
+            "作成直後に照会したハンドルを記録する"
+        );
         assert_eq!(rec.gateway(), pfx([10, 0, 0, 1], 24));
         assert_eq!(rec.subnet(), pfx([10, 0, 0, 0], 24));
         assert_eq!(n.realized_intent().unwrap(), None);
-        let again = create_recorded_with(&n, &def(), pfx([10, 0, 0, 1], 24), |_| Ok(created()));
+        let again = create_recorded_with(
+            &n,
+            &def(),
+            pfx([10, 0, 0, 1], 24),
+            |_| Ok(created()),
+            |_| table_info_reply(42, BRIDGE_TOKEN),
+        );
         assert_eq!(
             again.unwrap_err().store_code(),
             Some(NetErrorCode::AlreadyExists)
@@ -1164,9 +1356,13 @@ mod tests {
         let other_subnet = NetworkDefinition::bridge("web", pfx([10, 1, 0, 0], 24)).unwrap();
         let pasta = NetworkDefinition::pasta("web").unwrap();
         for d in [other_subnet, pasta] {
-            let r = create_recorded_with(&n, &d, pfx([10, 1, 0, 1], 24), |_| {
-                panic!("カーネル操作は始めない")
-            });
+            let r = create_recorded_with(
+                &n,
+                &d,
+                pfx([10, 1, 0, 1], 24),
+                |_| panic!("カーネル操作は始めない"),
+                |_| panic!("照会も始めない"),
+            );
             assert_eq!(
                 r.unwrap_err().store_code(),
                 Some(NetErrorCode::FailedPrecondition)
@@ -1186,9 +1382,13 @@ mod tests {
             NetworkResource::Bridge(IfName::new("fcbr0").unwrap()),
             ResourceState::Unknown,
         )];
-        let r = create_recorded_with(&n, &def(), pfx([10, 0, 0, 1], 24), |_| {
-            Err(create_err(leftover))
-        });
+        let r = create_recorded_with(
+            &n,
+            &def(),
+            pfx([10, 0, 0, 1], 24),
+            |_| Err(create_err(leftover)),
+            |_| panic!("失敗した作成では照会しない"),
+        );
         assert!(matches!(r, Err(RecordedError::Op(_))));
         assert_eq!(n.realized().unwrap(), None);
         assert_eq!(n.realized_intent().unwrap(), None);
@@ -1196,9 +1396,13 @@ mod tests {
         assert!(claim.includes_bridge());
         assert!(!claim.includes_table());
         // gateway が subnet の外なら、カーネル操作の前に拒否する。
-        let r = create_recorded_with(&n, &def(), pfx([10, 9, 0, 1], 24), |_| {
-            panic!("must not run")
-        });
+        let r = create_recorded_with(
+            &n,
+            &def(),
+            pfx([10, 9, 0, 1], 24),
+            |_| panic!("must not run"),
+            |_| panic!("must not run"),
+        );
         assert_eq!(
             r.unwrap_err().store_code(),
             Some(NetErrorCode::InvalidArgument)
@@ -1266,5 +1470,256 @@ mod tests {
         .unwrap();
         assert_eq!(n.realized().unwrap(), None);
         assert_eq!(n.realized_intent().unwrap(), None);
+    }
+
+    // ---- #3068: 公開ハンドルとテーブルハンドルの記録・再起動後の個別解除 ----
+
+    fn rule(n: u64) -> NftRuleHandle {
+        NftRuleHandle::new(n).unwrap()
+    }
+
+    fn web_publish() -> PortPublish {
+        PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 8080, 80).unwrap()
+    }
+
+    /// 公開 1 件（handle 2・3）を返す attach の代役。
+    fn run_with_publish(
+        spec: &ContainerAttachSpec,
+    ) -> impl FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<()>, ContainerAttachError> + '_
+    {
+        move |ipam, generation| {
+            let mut att = ok_run(spec)(ipam, generation)?;
+            att.published_ports = vec![PublishedPort::new(
+                &name(),
+                BRIDGE_TOKEN,
+                spec.endpoint(),
+                web_publish(),
+                (rule(2), rule(3)),
+            )];
+            Ok(att)
+        }
+    }
+
+    /// 解除の試験の結果: (結果, DELRULE に渡った (table, pre, out), delete の回数)。
+    type UnpubOut = (
+        Result<(), RecordedError<Box<UnpublishPortError>, ()>>,
+        Vec<String>,
+        u32,
+    );
+
+    fn unpublish_with(
+        n: &NetworkLockGuard<'_>,
+        published: PublishedPort,
+        reg: &mut PortRegistry,
+        live_handle: u64,
+    ) -> UnpubOut {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let count = std::cell::Cell::new(0u32);
+        let r = unpublish_port_recorded_with(
+            n,
+            &mid("c1"),
+            published,
+            reg,
+            |_| table_info_reply(live_handle, BRIDGE_TOKEN),
+            |t, (a, b)| {
+                count.set(count.get() + 1);
+                calls
+                    .borrow_mut()
+                    .push(format!("{} {} {}", t.as_str(), a.get(), b.get()));
+                Ok(())
+            },
+        );
+        (r, calls.into_inner(), count.get())
+    }
+
+    /// 公開 1 件つきで attach し、ストアを閉じて開き直す（再起動の模擬）ための準備。
+    fn attach_published(t: &Tmp) {
+        let store = setup(t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s = spec("c1");
+        let att = attach_recorded_with(&n, &mid("c1"), &s, &[], run_with_publish(&s)).unwrap();
+        // 同じプロセスで返す値にも、記録したテーブルハンドルが束縛される。
+        assert_eq!(att.published_ports.len(), 1);
+        assert_eq!(
+            att.published_ports[0]
+                .table_handle()
+                .map(NftTableHandle::get),
+            Some(42)
+        );
+        let m = n.members().unwrap();
+        assert_eq!(m[0].table_handle().map(NftTableHandle::get), Some(42));
+        assert_eq!(m[0].publishes().len(), 1);
+        assert_eq!(m[0].publishes()[0].prerouting().get(), 2);
+        assert_eq!(m[0].publishes()[0].output().get(), 3);
+        assert_eq!(*m[0].publishes()[0].publish(), web_publish());
+    }
+
+    /// NET-3・#3068: create は作成直後に照会したテーブルハンドルを記録する。userdata が他者のもの・照会失敗なら
+    /// `realized` を書かず `Uncommitted`（意図記録は残る）。
+    #[test]
+    fn net3_3068_create_requires_owned_table_handle() {
+        for reply in [
+            table_info_reply(42, "someone-else"),
+            Err(NetError::new(NetErrorCode::Timeout, "slow")),
+        ] {
+            let t = Tmp::new("create-handle");
+            let store = setup(&t);
+            let g = store.lock_global_exclusive().unwrap();
+            let n = g.lock_network(&name()).unwrap();
+            let r = create_recorded_with(
+                &n,
+                &def(),
+                pfx([10, 0, 0, 1], 24),
+                |token| {
+                    let mut c = created();
+                    c.bridge_token = token.to_owned();
+                    Ok(c)
+                },
+                |_| reply,
+            );
+            assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+            assert_eq!(n.realized().unwrap(), None);
+            assert!(n.realized_intent().unwrap().is_some());
+        }
+    }
+
+    /// NET-3・#3068: attach の成功で公開（受け口と rule handle 2 本）とテーブルハンドルがメンバー記録に載る。
+    #[test]
+    fn net3_3068_attach_records_publish_and_table_handle() {
+        let t = Tmp::new("attach-publish");
+        attach_published(&t);
+    }
+
+    /// NET-3・#3068（受け入れ条件 2）: 再起動を模して（ストアを開き直し）記録から公開を復元し、空の `PortRegistry` で
+    /// 個別解除が成功する。DELRULE に記録した handle（2・3）が渡り、メンバー記録から公開が消える。
+    #[test]
+    fn net3_3068_restart_restore_then_unpublish_succeeds() {
+        let t = Tmp::new("restart-ok");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let mut restored = restore_published_ports_recorded(&n, &mid("c1")).unwrap();
+        assert_eq!(restored.len(), 1);
+        let p = restored.remove(0);
+        assert_eq!(p.table_handle().map(NftTableHandle::get), Some(42));
+        assert_eq!(*p.publish(), web_publish());
+        assert_eq!(p.endpoint().as_str(), "c1");
+        let mut reg = PortRegistry::new();
+        let (r, calls, count) = unpublish_with(&n, p, &mut reg, 42);
+        r.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(calls, vec![format!("{} 2 3", created().table.as_str())]);
+        // 空の予約表では解放が 0 件で、それでも成功する。記録からは公開とテーブルハンドルが消える。
+        assert_eq!(reg.len(), 0);
+        let m = n.members().unwrap();
+        assert_eq!((m[0].table_handle(), m[0].publishes().len()), (None, 0));
+        assert!(
+            restore_published_ports_recorded(&n, &mid("c1"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// NET-3・SEC-1・#3068（受け入れ条件 1）: 再起動後、テーブルが作り直されて生きたハンドルが 77 になっていれば、
+    /// userdata が一致していても DELRULE を送らず `StaleHandles` で断り、メンバー記録は変わらない。
+    #[test]
+    fn net3_3068_restart_recreated_table_refuses_without_deleting() {
+        let t = Tmp::new("restart-stale");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let before = std::fs::read(t.0.join("@networks/web/members/c1")).unwrap();
+        let p = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let mut reg = PortRegistry::new();
+        let (r, calls, count) = unpublish_with(&n, p, &mut reg, 77);
+        assert_eq!(count, 0, "他者のルールを消さない");
+        assert!(calls.is_empty());
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.rules, UnpublishRules::StaleHandles);
+        assert!(e.published.is_some());
+        let after = std::fs::read(t.0.join("@networks/web/members/c1")).unwrap();
+        assert_eq!(before, after, "記録は書き換えない");
+    }
+
+    /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。
+    #[test]
+    fn net3_3068_unpublish_rejects_port_not_in_record() {
+        let t = Tmp::new("unpublish-mismatch");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let good = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let other_handle = PublishedPort::new(
+            &name(),
+            BRIDGE_TOKEN,
+            good.endpoint(),
+            *good.publish(),
+            (good.prerouting_handle(), good.output_handle()),
+        )
+        .with_table_handle(NftTableHandle::new(41).unwrap());
+        let other_port = PublishedPort::new(
+            &name(),
+            BRIDGE_TOKEN,
+            good.endpoint(),
+            PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 9090, 80).unwrap(),
+            (rule(2), rule(3)),
+        )
+        .with_table_handle(NftTableHandle::new(42).unwrap());
+        let unbound = PublishedPort::new(
+            &name(),
+            BRIDGE_TOKEN,
+            good.endpoint(),
+            *good.publish(),
+            (rule(2), rule(3)),
+        );
+        for p in [other_handle, other_port, unbound] {
+            let mut reg = PortRegistry::new();
+            let (r, _, count) = unpublish_with(&n, p, &mut reg, 42);
+            assert_eq!(count, 0);
+            let Err(RecordedError::Op(e)) = r else {
+                panic!("expected Op error");
+            };
+            assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+            assert!(e.reservation_held && e.published.is_some());
+        }
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 1);
+    }
+
+    /// NET-3・#3068: 共有ロックのガードでは解除せず（カーネル操作の前に拒否）、復元（読み取り）はできる。
+    #[test]
+    fn net3_3068_shared_guard_restores_but_cannot_unpublish() {
+        let t = Tmp::new("unpublish-shared");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_shared().unwrap();
+        let n = g.lock_network_shared(&name()).unwrap();
+        let p = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let mut reg = PortRegistry::new();
+        let (r, _, count) = unpublish_with(&n, p, &mut reg, 42);
+        assert_eq!(count, 0);
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
+        );
+        assert_eq!(
+            restore_published_ports_recorded(&n, &mid("zz"))
+                .unwrap_err()
+                .code(),
+            NetErrorCode::NotFound
+        );
     }
 }

@@ -311,7 +311,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | ネットワーク定義・`CreatedNetwork` の永続化 | `crates/net/src/network.rs` | #349 条件 1（ユーザー定義）・2、#319 条件 2〜4 | #3059・#3067 |
 | `network create/rm/ls` | cli | #319 条件 4 | #3066 |
 | 静的 IPAM の永続化 | `crates/net/src/network/ipam.rs` | #349 条件 2、#319 条件 2〜4 | #3067 |
-| 公開ハンドルの復元 | `crates/net/src/network/unpublish.rs` | なし（NET-3 の残余） | #3068 |
+| 公開ハンドルの復元 | `crates/net/src/network/recorded.rs`・`unpublish.rs`・`network_store/member.rs` | なし（NET-3 の残余。実装済み） | #3068 |
 | rootful の実行主体（承認） | — | #349 条件 1（rootful）・2、#319 条件 2〜4 | #3207（判断シートは #3057〔close 済み〕） |
 | init user namespace 所有の netns への参加 | `crates/core/src/oci_runtime/namespace_join.rs` | 同上 | #3069 |
 | plugin の起動と attach / detach の結線 | supervisor | 同上 | #3074 |
@@ -353,7 +353,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
 | #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 実装済み（記録と合成。残った意図記録のカーネル照合・実体の無い意図記録の掃除は後続。下の注） |
 | #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 実装済み（rootful の create は D13 待ちで `UNIMPLEMENTED`） |
-| #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 未実装 |
+| #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 実装済み（個別解除まで。記録だけでの detach・`PortRegistry` の組み直しは後続。下の注） |
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
 | #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
 | #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 | 未実装 |
@@ -368,6 +368,8 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 | 未実装 |
 
 Issue #3067 の実装メモ: 記録は `crates/net/src/network_store/`（`member`・`realized`・`ipam_rebuild`・`imp/records.rs`）、記録つきの合成は `crates/net/src/network/recorded.rs`。D11 の列挙に、メンバー記録へ `token`（host veth の所有トークン）・`netns-dir`・`netns-dir-id` を補助項目として足した（組み直した IPAM に `NetnsDirRecord` を戻し、`delete_network` が復元した払い出しの pin を判定不能として扱う劣化を避けるため）。`CreatedNetwork::name_resolution` は記録せず、復元時に呼び出し側が渡す。残った `realized.intent` のカーネル照合（昇格または巻き戻し）、実体の無い `members-intent/*` の掃除、`--dns` 上流をヘルパーが消費する部分（#3071・#3072）は後続で、それまで `realized.intent` が残るネットワークの次の操作は `FailedPrecondition` で拒否し、意図記録のアドレスは使用中として数え続ける。
+
+Issue #3068 の実装メモ: テーブル handle は create の成功直後に GETTABLE（userdata が所有トークンと一致するテーブルだけ）で取り、`realized`（FCREA1）に必須項目 `table-handle` として記録する（取れなければ `Uncommitted` で意図記録を残す。FCREA1 の書き込み側が未着手で出荷済みの環境が無いため magic は変えず必須にした）。公開は attach の成功時に、受け口と rule handle 2 本を `publish` 項目（0〜64 件）、投入先のテーブル handle を `table-handle` 項目として `members/<id>`（FCMEM1）へ記録する（公開が 1 件以上のときだけ `table-handle` を置く。旧形式はそのまま読める）。記録 1 件の上限は最悪値の見積もり（約 7 KB）に合わせ 16 KiB に上げた。再起動後は `restore_published_ports` が dump を使わず記録から `PublishedPort` を復元し、`unpublish_port_recorded` が記録との完全一致を確かめ、生きたテーブルの handle と照合してから DELRULE を送る。userdata が同じでも、ルールセットの退避・復元でテーブルが作り直されると handle が変わり、記録した rule handle は別のルールを指しうるため、食い違えば DELRULE を送らず `StaleHandles` で断る（他者のルールを消さない。NET-3・SEC-1）。解除の成功後は、メンバー記録から該当の公開を外して原子的に書き直す。対象外: 生きた `AttachedContainer` を持たない記録だけでの detach（veth・pin の回収）、detach 失敗の請求書へのルール handle の記載（#3285）、記録からの `PortRegistry` の組み直し（空の予約表では解放は 0 件で成功する）、実カーネルでの handle の作り直しの照合（root と nft が必要な実機前提の試験は未追加）。
 
 既存の #1871（D1〜D3）・#1872（D9）・#1873（D4・D6〜D9・D14）・#1939（D6）・#1940（D5・D10）・#1935（D1・D10）は、本書の該当項を参照する。コード内のドキュメントコメントの陳腐化（`crates/net/src/lib.rs` の「PLUG-1 区分は検討中」、`network_plugin.rs` の「host / none は #19 で確定」）は本 PR では直さず、#3059 と #3058 の受け入れ条件に入れた。
 

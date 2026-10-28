@@ -12,7 +12,10 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::IpPrefix;
 
 /// 記録 1 件の最大バイト数。解析の前にサイズで拒否する（無制限確保の防止）。
-pub const RECORD_MAX_BYTES: usize = 4096;
+///
+/// メンバー記録の最悪値（token 256・netns-dir 1024・dns 3 件・公開 64 件・テーブル handle）が約 7 KB に
+/// なるため 16 KiB とする（`member` の最悪値の試験で固定する。#3068）。
+pub const RECORD_MAX_BYTES: usize = 16384;
 
 pub(super) fn bad(msg: &'static str) -> NetError {
     NetError::new(NetErrorCode::DataLoss, msg)

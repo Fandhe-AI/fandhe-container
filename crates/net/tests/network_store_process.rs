@@ -212,6 +212,7 @@ fn realized_record() -> RealizedRecord {
         ("ifindex", "7".to_owned()),
         ("token", BRIDGE_TOKEN.to_owned()),
         ("table", names.table().as_str().to_owned()),
+        ("table-handle", "42".to_owned()),
         ("gateway", "10.0.0.1/24".to_owned()),
         ("subnet", "10.0.0.0/24".to_owned()),
     ] {

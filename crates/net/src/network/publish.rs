@@ -30,8 +30,9 @@
 //!   照会から投入までを排他する共有ロックと、投入後の再 dump による事後確認が残る（照会から投入までの間に別の
 //!   状態ルートが割り込むと二重に投入できる窓がある。REPAIR-3。D11 の全体はまだ満たしていない。#3191）
 //! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除は
-//!   `network::unpublish_container_port`（NEWRULE の echo 応答のハンドル指定。NET-3・#2839）。プロセス再起動後の
-//!   ハンドル復元は未対応で、ネットワーク削除時はテーブルごと解放する（`PortRegistry::release_network`。TASK-139.4）
+//!   `network::unpublish_container_port`（NEWRULE の echo 応答のハンドル指定。NET-3・#2839）。プロセス再起動後は
+//!   `network::recorded` がメンバー記録に永続化したハンドルから復元して個別に解除する（#3068）。記録の無い公開と
+//!   ネットワーク削除時はテーブルごと解放する（`PortRegistry::release_network`。TASK-139.4）
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

@@ -367,7 +367,7 @@ impl NetlinkNetfilterSocket {
     ///
     /// 要求にテーブル名を付けてカーネル側で絞り込む。応答の各ルールの family・テーブル名が要求と
     /// 一致することを確かめ、1 件でも復号できなければ `DataLoss`。期限・seq・`NLM_F_DUMP_INTR` の扱いは
-    /// [`Self::dump_table_names`] と同じ。ルールのハンドルは読まない（#3068 の担当）。
+    /// [`Self::dump_table_names`] と同じ。ルールのハンドルは読まない（再起動後のハンドルは記録から復元する。#3068）。
     pub fn dump_rules(
         &self,
         req: &RuleDump,

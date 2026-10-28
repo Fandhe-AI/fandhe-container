@@ -14,13 +14,18 @@
 //! ifindex <len>\n<10 進>\n                   bridge <len>\n<bridge 名>\n
 //! token <len>\n<所有トークン>\n               token <len>\n<所有トークン>\n
 //! table <len>\n<nft テーブル名>\n             subnet <len>\n<a.b.c.d/nn>\n
+//! table-handle <len>\n<10 進・非 0>\n
 //! gateway <len>\n<a.b.c.d/nn>\n
 //! subnet <len>\n<a.b.c.d/nn>\n
 //! ```
 //! 復号は `bridge`・`table` がネットワーク名から導出した名前と一致すること、`token` がそのネットワークの発行形式で
 //! あること、`gateway` が `subnet` に属すること（prefix 長一致・network / broadcast でない）を検査する。
-//! `CreatedNetwork::name_resolution` は列挙に無いため記録しない（復元時は呼び出し側が渡す）。nft テーブルの handle と
-//! 公開の記録は #3068。
+//! `CreatedNetwork::name_resolution` は列挙に無いため記録しない（復元時は呼び出し側が渡す）。
+//!
+//! `table-handle` は作成直後に GETTABLE で確かめた nft テーブルのカーネル採番ハンドルで必須項目（#3068・NET-3）。
+//! 再起動後の公開の個別解除が、`members/<id>` に記録したルールハンドルを使う前に生きたテーブルのハンドルと照合する鍵で、
+//! テーブルが作り直されていれば値が変わる。書き込み側（supervisor #3074・plugin-cri #3075）が未着手で FCREA1 の出荷済みの
+//! 環境が無いため、magic は変えず必須にした（旧形式の記録は `DataLoss`）。公開の記録は `member`。
 
 use super::codec::{
     bad, finish, format_prefix, open, parse_prefix, push_field, take_field, token_is_sane,
@@ -29,7 +34,7 @@ use crate::error::NetError;
 use crate::etc_hosts::NameResolution;
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 use crate::network::{CreatedNetwork, NetworkName, NetworkResourceNames, token_names_network};
-use crate::nftables_batch::NftName;
+use crate::nftables_batch::{NftName, NftTableHandle};
 
 const REALIZED_MAGIC: &str = "FCREA1\n";
 const INTENT_MAGIC: &str = "FCRIN1\n";
@@ -77,19 +82,26 @@ pub struct RealizedRecord {
     ifindex: IfIndex,
     token: String,
     table: NftName,
+    table_handle: NftTableHandle,
     gateway: IpPrefix,
     subnet: IpPrefix,
 }
 
 impl RealizedRecord {
-    /// 作成結果と定義の subnet から作る。名前の導出・トークン・gateway の所属が食い違えば `DataLoss`。
-    pub fn from_created(created: &CreatedNetwork, subnet: IpPrefix) -> Result<Self, NetError> {
+    /// 作成結果と定義の subnet、作成直後に確かめたテーブルハンドルから作る。名前の導出・トークン・gateway の
+    /// 所属が食い違えば `DataLoss`。
+    pub fn from_created(
+        created: &CreatedNetwork,
+        subnet: IpPrefix,
+        table_handle: NftTableHandle,
+    ) -> Result<Self, NetError> {
         let rec = Self {
             name: created.name.clone(),
             bridge: created.bridge.clone(),
             ifindex: created.bridge_index,
             token: created.bridge_token.clone(),
             table: created.table.clone(),
+            table_handle,
             gateway: created.gateway,
             subnet,
         };
@@ -133,6 +145,11 @@ impl RealizedRecord {
         &self.token
     }
 
+    /// 作成時に確かめた nft テーブルのハンドル（公開の解除の照合に使う。#3068）。
+    pub fn table_handle(&self) -> NftTableHandle {
+        self.table_handle
+    }
+
     /// gateway（prefix 長つき）。
     pub fn gateway(&self) -> IpPrefix {
         self.gateway
@@ -151,6 +168,11 @@ impl RealizedRecord {
         push_field(&mut out, "ifindex", &self.ifindex.get().to_string());
         push_field(&mut out, "token", &self.token);
         push_field(&mut out, "table", self.table.as_str());
+        push_field(
+            &mut out,
+            "table-handle",
+            &self.table_handle.get().to_string(),
+        );
         push_field(&mut out, "gateway", &format_prefix(&self.gateway));
         push_field(&mut out, "subnet", &format_prefix(&self.subnet));
         out.into_bytes()
@@ -171,6 +193,13 @@ impl RealizedRecord {
             .ok_or_else(|| bad("realized record ifindex is malformed"))?;
         let token = take_field(&mut rest, "token")?.to_owned();
         let table = NftName::new(take_field(&mut rest, "table")?).map_err(invalid_value)?;
+        let handle = take_field(&mut rest, "table-handle")?;
+        let table_handle = handle
+            .parse::<u64>()
+            .ok()
+            .filter(|n| n.to_string() == handle)
+            .and_then(|n| NftTableHandle::new(n).ok())
+            .ok_or_else(|| bad("realized record table handle is malformed"))?;
         let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
         let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
         finish(rest)?;
@@ -180,6 +209,7 @@ impl RealizedRecord {
             ifindex,
             token,
             table,
+            table_handle,
             gateway,
             subnet,
         };
@@ -325,6 +355,10 @@ mod tests {
         }
     }
 
+    fn th(n: u64) -> NftTableHandle {
+        NftTableHandle::new(n).unwrap()
+    }
+
     fn code<T: std::fmt::Debug>(r: Result<T, NetError>) -> NetErrorCode {
         r.unwrap_err().code()
     }
@@ -333,10 +367,11 @@ mod tests {
     #[test]
     fn net1_3067_realized_encode_exact_and_roundtrip() {
         let c = created();
-        let r = RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24)).unwrap();
+        let r = RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24), th(42)).unwrap();
+        assert_eq!(r.table_handle().get(), 42);
         let text = String::from_utf8(r.encode()).unwrap();
         let expected = format!(
-            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
+            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ntable-handle 2\n42\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
             c.bridge.as_str().len(),
             c.bridge.as_str(),
             c.table.as_str().len(),
@@ -353,7 +388,7 @@ mod tests {
     fn net1_3067_realized_decode_rejects_malformed() {
         let c = created();
         let good = String::from_utf8(
-            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24))
+            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24), th(42))
                 .unwrap()
                 .encode(),
         )
@@ -362,6 +397,16 @@ mod tests {
             good.replace("FCREA1", "FCREA2"),
             good.replace("ifindex 1\n7", "ifindex 1\n0"),
             good.replace("ifindex 1\n7", "ifindex 2\n07"),
+            // #3068: テーブルハンドルの欠落・0・先頭 0・符号・範囲外・順序違い。
+            good.replace("table-handle 2\n42\n", ""),
+            good.replace("table-handle 2\n42", "table-handle 1\n0"),
+            good.replace("table-handle 2\n42", "table-handle 3\n042"),
+            good.replace("table-handle 2\n42", "table-handle 3\n+42"),
+            good.replace(
+                "table-handle 2\n42",
+                "table-handle 20\n18446744073709551616",
+            ),
+            good.replace("table-handle 2\n42", "table-handle 0\n"),
             good.replace(TOKEN, "fandhe-net:other:1:0:0"),
             good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.1.1/24"),
             good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.0.0/24"),

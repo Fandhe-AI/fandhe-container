@@ -344,14 +344,19 @@ impl SupervisedLifecycle {
         }
         let term = self.signalers.for_stop(store);
         let first = KillRequest::new(id.clone(), req.signal());
-        send_or_observe_exit(store, recorder, &term, &first, &budget)?;
+        // 送信の失敗後の読み直しで Stopped を観測済みなら、追加の読み取りをせずそれを返す（#3143）。
+        if let Some(s) = send_or_observe_exit(store, recorder, &term, &first, &budget)? {
+            return Ok(s);
+        }
         if let Some(s) = wait_stopped(store, id, req.grace(), &budget)? {
             return Ok(s);
         }
         // 意図は最初のシグナルの段階で記録済みのため、SIGKILL は意図なしの signaler で送る。
         let plain = self.signalers.plain(store);
         let sigkill = KillRequest::new(id.clone(), Signal::SIGKILL);
-        send_or_observe_exit(store, recorder, &plain, &sigkill, &budget)?;
+        if let Some(s) = send_or_observe_exit(store, recorder, &plain, &sigkill, &budget)? {
+            return Ok(s);
+        }
         match wait_stopped(store, id, STOP_KILL_WAIT, &budget)? {
             Some(s) => Ok(s),
             None => Err(TraitError::new(ErrorCode::Timeout, MSG_STOP_DEADLINE)),
@@ -418,16 +423,17 @@ fn read_status_admitted(
 ///
 /// 送信の前に [`KILL_NEED`] を、失敗後の読み直しの前に [`GET_NEED`] を予算に照らす。読み直しを許されなければ
 /// 元の失敗をそのまま返す（#3143）。
+/// 戻り値の `Some` は読み直しで観測済みの Stopped（呼び出し元は追加の読み取りなしでそれを返す）。
 fn send_or_observe_exit(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     signaler: &Arc<dyn ProcessSignaler>,
     req: &KillRequest,
     budget: &StopBudget,
-) -> Result<(), TraitError> {
+) -> Result<Option<ContainerStatus>, TraitError> {
     budget.admit(KILL_NEED)?;
     match kill(store, recorder, signaler, req, &KillTimeout::default()) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(None),
         Err(e) => {
             let e = to_trait_error(e);
             // 直前に終了した場合、core は FAILED_PRECONDITION を返し、本番の制御チャネルは supervisor が
@@ -435,10 +441,11 @@ fn send_or_observe_exit(
             if matches!(
                 e.code(),
                 ErrorCode::FailedPrecondition | ErrorCode::Unavailable
-            ) && read_status_admitted(store, req.id(), budget)
-                .is_ok_and(|s| s.state() == ContainerState::Stopped)
+            ) && let Ok(s) = read_status_admitted(store, req.id(), budget)
+                && s.state() == ContainerState::Stopped
             {
-                return Ok(());
+                // 観測済みの Stopped を呼び出し元へ返し、追加の読み取りを省く。
+                return Ok(Some(s));
             }
             Err(e)
         }

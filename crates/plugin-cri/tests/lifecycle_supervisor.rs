@@ -689,6 +689,26 @@ fn sup9_stop_race_exit_before_delivery_is_ok() {
     assert_eq!(h.sim.state(), ContainerState::Stopped);
 }
 
+/// REPAIR-5・CRI-2・#3143: 送信が終了との競合（FAILED_PRECONDITION / UNAVAILABLE）で失敗し、読み直しで Stopped を観測済みなら、
+/// 予算つきの stop は追加の状態読み取りをせずに成功する（読み取りは入口・core の kill・読み直しの 3 回だけ）。
+#[test]
+fn repair5_3143_stop_within_observed_stopped_skips_extra_read() {
+    for code in [ErrorCode::FailedPrecondition, ErrorCode::Unavailable] {
+        let sim = running("c1", 4242);
+        *sim.race.lock().expect("lock") = Some(code);
+        let lifecycle =
+            SupervisedLifecycle::new(starter(LONG), Arc::new(SimSignalers(Arc::clone(&sim))));
+        let store = SimStore(Arc::clone(&sim));
+        let rec = OpRecorder::new();
+        let stop = StopRequest::new(cid("c1"), Duration::ZERO).expect("stop");
+        let status = lifecycle
+            .stop_within(&store, &rec, &stop, Some(Duration::from_secs(22)))
+            .expect("stop");
+        assert_eq!(status.state(), ContainerState::Stopped);
+        assert_eq!(sim.gets.load(Ordering::SeqCst), 3, "{code:?}");
+    }
+}
+
 /// 制御チャネルが消えた（signaler が UNAVAILABLE を返し、記録は Stopped）場合も成功として扱う（CRI-2）。
 #[test]
 fn cri2_stop_race_channel_gone_unavailable_is_ok() {

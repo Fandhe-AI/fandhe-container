@@ -12,7 +12,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::NetworkName;
@@ -21,6 +21,7 @@ use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
 const ENV_ROOT: &str = "FC_STORE_HELPER_ROOT";
 const ENV_MODE: &str = "FC_STORE_HELPER_MODE";
 const READY: &str = "FC_STORE_HELPER_LOCKED";
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -78,16 +79,39 @@ fn spawn_holder(root: &Path, mode: &str) -> Child {
         }
     });
     if rx.recv_timeout(Duration::from_secs(20)).is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("holder did not report the lock within 20s");
+        let reaped = reap_with_deadline(&mut child);
+        panic!("holder did not report the lock within 20s (reap result: {reaped:?})");
     }
     child
 }
 
+/// 子を kill して期限内に回収する（REPAIR-5）。kill 失敗・期限超過は明示的なエラーで返す。
+fn reap_with_deadline(child: &mut Child) -> Result<(), String> {
+    // 既に終了済みの子への kill は失敗しうるため、回収できるかを先に見る。
+    if let Err(e) = child.kill() {
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(format!("kill failed: {e}"));
+        }
+        return Ok(());
+    }
+    let deadline = Instant::now() + REAP_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait failed: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("child not reaped within {REAP_DEADLINE:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(e) = reap_with_deadline(&mut child) {
+        panic!("failed to stop holder: {e}");
+    }
 }
 
 fn store(root: &Path) -> NetworkStore {

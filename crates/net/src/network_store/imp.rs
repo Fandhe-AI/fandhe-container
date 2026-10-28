@@ -332,15 +332,16 @@ impl NetworkStore {
             Err(e) if e.raw_os_error() == Some(sys::EEXIST) => false,
             Err(e) => return Err(map_io(&e, "failed to create network store directory")),
         };
+        if created {
+            // umask が読み取りビットを落としていても開けるよう、open より先にパスで権限を整える。
+            fs::set_permissions(&path, fs::Permissions::from_mode(DIR_MODE))
+                .map_err(|e| map_io(&e, "failed to set network store directory mode"))?;
+        }
         let f = OpenOptions::new()
             .read(true)
             .custom_flags(FLAGS_DIR)
             .open(&path)
             .map_err(|e| map_io(&e, "failed to open network store directory"))?;
-        if created {
-            f.set_permissions(fs::Permissions::from_mode(DIR_MODE))
-                .map_err(|e| map_io(&e, "failed to set network store directory mode"))?;
-        }
         let m = f
             .metadata()
             .map_err(|e| map_io(&e, "failed to stat network store directory"))?;
@@ -472,17 +473,10 @@ impl NetworkStore {
             .mode(DIR_MODE)
             .create(self.dir.path(stage))
             .map_err(|e| map_io(&e, msg))?;
-        let sd = self.dir.open_subdir(stage).or_else(|_| {
-            // umask で 0700 より狭くなった場合に備え、明示的に整えてから検査し直す。
-            let f = OpenOptions::new()
-                .read(true)
-                .custom_flags(FLAGS_DIR)
-                .open(self.dir.path(stage))
-                .map_err(|e| map_io(&e, msg))?;
-            f.set_permissions(fs::Permissions::from_mode(DIR_MODE))
-                .map_err(|e| map_io(&e, msg))?;
-            self.dir.open_subdir(stage)
-        })?;
+        // umask が読み取りビットを落としていても開けるよう、open より先にパスで権限を整える。
+        fs::set_permissions(self.dir.path(stage), fs::Permissions::from_mode(DIR_MODE))
+            .map_err(|e| map_io(&e, msg))?;
+        let sd = self.dir.open_subdir(stage)?;
         let mut f = sd.open_regular(DEFINITION_FILE, true, u64::MAX)?;
         f.write_all(&def.encode()).map_err(|e| map_io(&e, msg))?;
         f.sync_all().map_err(|e| map_io(&e, msg))?;

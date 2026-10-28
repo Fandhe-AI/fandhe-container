@@ -6,7 +6,7 @@
 //! させない）へ置き、動的ローダ（ELF の `PT_INTERP`）と読み込み済みの共有ライブラリを同じ絶対パスへコピーする。
 //!
 //! 置き場所の判断: 組み立て部品の本体は core の `tests/support/minimal_rootfs.rs`（組み立て）と `loader_deps.rs`
-//! （ELF の `PT_INTERP`・maps の解析）に集約済みで、core・supervisor・cli・benches が `#[path]` で共有する
+//! （ELF の `PT_INTERP`・maps の解析）と `file_copy.rs`（`create_new` のコピー。#3041）に集約済みで、core・supervisor・cli・benches が `#[path]` で共有する
 //! （`scratch_root.rs` の前例どおり。依存は増えない）。本ファイルはその薄い包みで、supervisor の 2 本の試験に固有の
 //! `/probe` の命名と `proc/` の有無（`ProcDir`）だけを持つ（#2963・REPAIR-1）。
 //!

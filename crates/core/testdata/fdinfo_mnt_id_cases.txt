@@ -1,0 +1,31 @@
+# fdinfo の mnt_id 解析の共有 fixture（core・net・gpu の 3 か所が同じ入力に同じ結果を返すことの機械照合用）。
+# 出典: #3140・GPU-2・SEC-1・REPAIR-1。判断記録は docs/design/fdinfo-mnt-id-parsing.md。
+# 読み手: crates/core の mountinfo_identity.rs・crates/net の netns.rs・crates/gpu の cdi_apply/hooks/run.rs の各試験
+# （include_str! でコンパイル時に埋め込む。実行時には読まない）。
+#
+# 形式（# 始まりの行と空行は無視する）:
+#   max_bytes <整数>                       3 か所が共有する fdinfo 読み取り上限（各 crate の定数と一致を照合する）
+#   <名前> <入力の16進 | -> <期待> [net=<期待>]
+#     入力は 16 進（"-" は空の入力）。期待は ok:<u64> / missing / duplicate / invalid / read / too_large。
+#     read は「読み取りの段で拒否」（UTF-8 でない本文）を表す。
+#
+# 許容する差は「UTF-8 でない本文」の 1 種類だけ。core・gpu は &str で受けるため読み取りの段で read として拒否し、
+# net はバイト列で受けるため値の部分は invalid、値以外の行は無視する。実機の fdinfo は ASCII のみで実害は無い。
+# net= による上書きはこの差の事例（入力に 0x80 以上のバイトを含む行）にだけ書ける。試験が検査する。
+max_bytes 65536
+ok_basic 706f733a09300a666c6167733a093031323630303030300a6d6e745f69643a0935320a696e6f3a09310a ok:52
+ok_prefixed_other_line 66616e6f74696679206d6e745f69643a09390a6d6e745f69643a09370a ok:7
+ok_u64_max 6d6e745f69643a0931383434363734343037333730393535313631350a ok:18446744073709551615
+ok_crlf 6d6e745f69643a0935320d0a696e6f3a09310d0a ok:52
+ok_plus_sign 6d6e745f69643a092b350a ok:5
+missing_other_lines_only 706f733a09300a666c6167733a09300a missing
+missing_empty_input - missing
+duplicate_different_values 6d6e745f69643a0935320a6d6e745f69643a0935330a duplicate
+duplicate_same_values 6d6e745f69643a0935320a6d6e745f69643a0935320a duplicate
+duplicate_first_invalid 6d6e745f69643a09780a6d6e745f69643a09370a duplicate
+invalid_non_numeric 6d6e745f69643a09780a invalid
+invalid_negative 6d6e745f69643a092d310a invalid
+invalid_empty_value 6d6e745f69643a090a invalid
+invalid_u64_overflow 6d6e745f69643a0931383434363734343037333730393535313631360a invalid
+non_utf8_in_value 6d6e745f69643a09ff0a read net=invalid
+non_utf8_in_other_line 706f733a09ff0a6d6e745f69643a09370a read net=ok:7

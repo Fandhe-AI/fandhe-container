@@ -85,8 +85,7 @@ mod linux {
                 break st;
             }
             if started.elapsed() > within {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap(&mut child);
                 panic!("holder did not exit within {within:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -268,12 +267,27 @@ mod linux {
             .spawn()
             .expect("spawn sh");
         // fd 3・4 を開いた後に出る合図を待ってから観測する（開く前の 0〜2 だけの状態を誤って合格にしない）。
+        // 読みは別スレッドに逃がし、期限は読み始める前に作る（sh が合図の前に止まっても無期限に待たない。REPAIR-5）。
+        let deadline = Instant::now() + limit();
         let mut stderr = child.stderr.take().expect("stderr");
-        let mut ready = [0u8; 6];
-        stderr.read_exact(&mut ready).expect("ready marker");
+        let (tx, rx) = mpsc::channel::<std::io::Result<[u8; 6]>>();
+        std::thread::spawn(move || {
+            let mut ready = [0u8; 6];
+            let _ = tx.send(stderr.read_exact(&mut ready).map(|()| ready));
+        });
+        let ready = match rx.recv_timeout(limit()) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                reap(&mut child);
+                panic!("reading the ready marker failed: {e}");
+            }
+            Err(_) => {
+                reap(&mut child);
+                panic!("ready marker was not received within {:?}", limit());
+            }
+        };
         assert_eq!(&ready, b"ready\n");
         let dir = format!("/proc/{}/fd", child.id());
-        let deadline = Instant::now() + limit();
         // exec 後の holder が fd を閉じ終えるまで観測を繰り返し、0〜2 だけになることを確かめる。
         let observed = loop {
             let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -289,8 +303,7 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let _ = child.kill();
-        let _ = child.wait();
+        reap(&mut child);
         drop(ch);
         assert_eq!(
             observed,
@@ -326,7 +339,19 @@ mod linux {
             "holder outlived its parent until its own deadline: {text:?}"
         );
         assert!(started.elapsed() < Duration::from_millis(1500));
-        let _ = mid.wait();
+        reap(&mut mid);
+    }
+
+    /// 子を kill し、期限つきで回収する（kill 後も無期限の wait はしない。REPAIR-5）。
+    fn reap(child: &mut Child) {
+        let _ = child.kill();
+        let until = Instant::now() + limit();
+        while Instant::now() < until {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// `--pdeath-mid`: socketpair を作って holder を起動し、端を別プロセス（sleep）に持たせて即座に終了する。

@@ -111,6 +111,18 @@ const PLUGIN_PEER_REJECTIONS: [PluginPeerRejection; 5] = [
     PluginPeerRejection::Unknown,
 ];
 
+/// pasta の検証拒否（`AuditEvent::PastaVerify`。SEC-4・NET-9・PLUG-11・#3330）の記録を示す先頭バイト。コンテナ ID の後に
+/// 理由の添字（`PASTA_VERIFY_REJECTIONS` の位置 1）が付く。supervisor の start が、構築済みの relay 経由で期限つきに配送する。
+const TAG_PASTA_VERIFY: u8 = 0x86;
+/// pasta_verify の枠だけが持つ追加部の長さ（理由の添字 1）。
+const PASTA_VERIFY_EXTRA_LEN: usize = 1;
+
+/// pasta_verify で運べる拒否理由（枠の添字）。
+const PASTA_VERIFY_REJECTIONS: [super::PastaVerifyRejection; 2] = [
+    super::PastaVerifyRejection::RecordChanged,
+    super::PastaVerifyRejection::PermissionDenied,
+];
+
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
@@ -119,6 +131,7 @@ const fn extra_len(tag: u8) -> usize {
         TAG_MOUNT => MOUNT_EXTRA_LEN,
         TAG_PLUGIN_PEER => PLUGIN_PEER_EXTRA_LEN,
         TAG_MOUNT_REASON => MOUNT_REASON_EXTRA_LEN,
+        TAG_PASTA_VERIFY => PASTA_VERIFY_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -161,6 +174,22 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
             };
             (tag, None, None)
         }
+        AuditEvent::PastaVerify { reason } => {
+            let Some(index) = PASTA_VERIFY_REJECTIONS
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this pasta rejection reason",
+                ));
+            };
+            let mut frame = Vec::with_capacity(FIXED_LEN + 1 + PASTA_VERIFY_EXTRA_LEN);
+            push_head(&mut frame, TAG_PASTA_VERIFY, record)?;
+            frame.push(index);
+            return Ok(frame);
+        }
         AuditEvent::Seccomp { syscall, arch } => {
             (TAG_SECCOMP, Some((syscall.get(), arch.get())), None)
         }
@@ -172,7 +201,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, plugin peer, seccomp, exit signal and mount records",
+                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal and mount records",
             ));
         }
     };
@@ -425,6 +454,13 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
         decode_mount_reason(rest, id_len)?
     } else if tag == TAG_PLUGIN_PEER {
         decode_plugin_peer(rest, id_len)?
+    } else if tag == TAG_PASTA_VERIFY {
+        if rest.len() != id_len.checked_add(PASTA_VERIFY_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let rejection = PASTA_VERIFY_REJECTIONS.get(usize::from(*extra.first()?))?;
+        (id, rejection.audit_event())
     } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
@@ -1198,6 +1234,47 @@ mod tests {
         match id {
             Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
             None => r,
+        }
+    }
+
+    /// SEC-4・NET-9・PLUG-11・#3330: pasta_verify の枠は理由・コンテナ ID・PID・時刻が往復で一致し、
+    /// 壊れた枠(不足・余り・未知の理由の添字)は記録にしない。
+    #[test]
+    fn sec4_3330_pasta_verify_frame_round_trips() {
+        for (rejection, token) in [
+            (
+                super::super::PastaVerifyRejection::RecordChanged,
+                "pasta_record_changed",
+            ),
+            (
+                super::super::PastaVerifyRejection::PermissionDenied,
+                "pasta_permission_denied",
+            ),
+        ] {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+                AuditPid::new(77).unwrap(),
+                rejection.audit_event(),
+            )
+            .with_container_id(ContainerId::new("web-1").unwrap());
+            let frame = encode(&rec).unwrap();
+            assert_eq!(frame.len(), FIXED_LEN + 5 + PASTA_VERIFY_EXTRA_LEN);
+            assert_eq!(extra_len(frame[0]), PASTA_VERIFY_EXTRA_LEN);
+            let back = decode(&frame).unwrap();
+            assert_eq!(
+                back.reason().map(super::super::AuditReason::as_str),
+                Some(token)
+            );
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+            assert!(decode(&frame[..frame.len() - 1]).is_none());
+            let mut longer = frame.clone();
+            longer.push(0);
+            assert!(decode(&longer).is_none());
+            let mut unknown = frame.clone();
+            *unknown.last_mut().unwrap() = 2;
+            assert!(decode(&unknown).is_none());
         }
     }
 

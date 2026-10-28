@@ -2557,12 +2557,16 @@ mod linux {
             let config = crate::pasta_attach::PastaAttachConfig {
                 binary: binary.clone(),
                 forwards: self.container_options.network().publish().clone(),
-                state_root: crate::pasta_attach::open_state_root(root)?,
+                state_root: open_state_root_bounded(root)?,
                 container: container.clone(),
                 ready_timeout: crate::pasta_attach::READY_TIMEOUT_DEFAULT,
             };
-            crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))
-                .map(Some)
+            let wiring =
+                crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))?;
+            // 置き場所(`@pasta/<id>/`)は launch の前のこの準備段階で期限つきに作る。launch 内のフックは準備済みの
+            // ものを使い、状態ルートの I/O を同期で行わない(REPAIR-5)。
+            wiring.prepare(Instant::now() + PASTA_PREPARE_BUDGET)?;
+            Ok(Some(wiring))
         }
 
         /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
@@ -3289,7 +3293,7 @@ mod linux {
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
         // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
-        record_pasta_tamper(&args.root, &args.id, &pasta_logs);
+        record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
         let running = match run_start_until(
             deps,
             &store,
@@ -3320,36 +3324,65 @@ mod linux {
         ExitCode::from(code)
     }
 
-    /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、監査の記録先(`@audit.log`)へ 1 件配送する(SEC-4・PLUG-11・#3330)。
+    /// pasta 構成の準備段階(状態ルートの open と `@pasta/<id>/` の作成)の予算。
+    const PASTA_PREPARE_BUDGET: Duration = Duration::from_secs(5);
+
+    /// 状態ルートを作業スレッドで開く(止まった I/O で無期限に塞がらない。REPAIR-5)。
+    fn open_state_root_bounded(root: &std::path::Path) -> Result<std::os::fd::OwnedFd, TraitError> {
+        let root = root.to_path_buf();
+        match crate::supervisor_log::run_bounded_classified(
+            move || crate::pasta_attach::open_state_root(&root),
+            PASTA_PREPARE_BUDGET,
+        ) {
+            Ok(r) => r,
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "opening the state root timed out",
+            )),
+        }
+    }
+
+    /// 改ざんの疑いの監査配送の予算(起動の期限の残りと小さい方。REPAIR-5)。
+    const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
+
+    /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、入口が構築済みの監査 relay 経由で `@audit.log` へ 1 件配送する
+    /// (SEC-4・PLUG-11・#3330)。
     ///
-    /// 作業スレッドの join 後の単一スレッドから呼ぶので `FileAuditSink` の隔離(fork)が使える。記録できなければ
-    /// `pasta_audit_unavailable` を構造化ログへ積む(起動の拒否は 2c の結果のままで覆らない)。疑いが無ければ何もしない。
+    /// relay は入口で作って確認済みの別プロセスの記録者で、配送は `record_until` の期限つき(起動の期限の残りと
+    /// [`TAMPER_AUDIT_BUDGET`] の小さい方)。ここで状態ルートを開き直したり fork したりしないので、配送全体が有界になる
+    /// (作業スレッドが残っていても影響しない)。relay が無い・記録できなければ `pasta_audit_unavailable` を構造化ログへ積む
+    /// (起動の拒否は 2c の結果のままで覆らない)。疑いが無ければ何もしない。
     fn record_pasta_tamper(
-        root: &std::path::Path,
+        audit: Option<&Arc<dyn AuditSink>>,
         id: &ContainerId,
         logs: &crate::pasta_attach::PastaLogBuffer,
+        start_deadline: Option<Instant>,
     ) {
         use fandhe_container_core::audit_log::{AuditRecord, AuditTimestamp, current_pid};
         let Some(rejection) = logs.take_tamper() else {
             return;
         };
-        // 2c の作業スレッドが生きたままだと fork がハングするか記録を失うため、fork せず構造化ログだけに残す。
-        if logs.worker_unjoined() {
-            crate::pasta_attach::log_pasta_audit_unavailable(logs, id.as_str(), ErrorCode::Timeout);
+        let Some(sink) = audit else {
+            crate::pasta_attach::log_pasta_audit_unavailable(
+                logs,
+                id.as_str(),
+                ErrorCode::NotFound,
+            );
             return;
-        }
-        let result = crate::exec::default_audit_sink(Some(root.to_path_buf())).and_then(|sink| {
-            let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
-                return Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to build the pasta audit record",
-                ));
-            };
-            let record =
-                AuditRecord::new(ts, pid, rejection.audit_event()).with_container_id(id.clone());
-            sink.record(&record)
-        });
-        if let Err(e) = result {
+        };
+        let budget_end = Instant::now() + TAMPER_AUDIT_BUDGET;
+        let until = start_deadline.map_or(budget_end, |d| d.min(budget_end));
+        let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
+            crate::pasta_attach::log_pasta_audit_unavailable(
+                logs,
+                id.as_str(),
+                ErrorCode::Internal,
+            );
+            return;
+        };
+        let record =
+            AuditRecord::new(ts, pid, rejection.audit_event()).with_container_id(id.clone());
+        if let Err(e) = sink.record_until(&record, until) {
             crate::pasta_attach::log_pasta_audit_unavailable(logs, id.as_str(), e.code());
         }
     }

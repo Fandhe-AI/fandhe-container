@@ -1138,3 +1138,49 @@ fn net9_helper_death_is_signaled_even_when_wait_consumes_its_timeout() {
     assert_eq!(g.wait(Duration::from_millis(100)).expect("wait"), None);
     assert_eq!(events(&ev), ["container signal 15", "container signal 9"]);
 }
+
+/// REPAIR-5・NET-9: 状態ルートの I/O の期限つき実行は、止まった job を待ち続けず `Timeout` で戻り、
+/// 終わった job の値はそのまま返す。
+#[test]
+fn repair5_run_dir_io_is_bounded() {
+    let t = Instant::now();
+    let r = run_dir_io_bounded(Duration::from_millis(50), || {
+        std::thread::sleep(Duration::from_millis(600));
+        7u32
+    });
+    assert!(
+        t.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(r.expect_err("timed out").code(), ErrorCode::Timeout);
+    assert_eq!(
+        run_dir_io_bounded(Duration::from_secs(5), || 42u32).expect("done"),
+        42
+    );
+}
+
+/// REPAIR-5・CORE-2: 後始末が終わらない間も、drop は上限(`reap_cap`)で戻る(無期限に join しない)。
+#[test]
+fn repair5_drop_does_not_join_a_stuck_teardown_forever() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    *backend.stop_delay.lock().unwrap() = Duration::from_millis(1500);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    let mut g = PastaGuardedProcess::new(
+        FakeProcess::new(&ev, vec![Some(ProcessExit::Exited(0))]),
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    g.reap_cap = Duration::from_millis(100);
+    // 期限内に後始末が終わらず、worker が追跡される。
+    assert_eq!(g.wait(Duration::ZERO).expect("wait"), None);
+    let t = Instant::now();
+    drop(g);
+    assert!(
+        t.elapsed() < Duration::from_millis(1000),
+        "{:?}",
+        t.elapsed()
+    );
+}

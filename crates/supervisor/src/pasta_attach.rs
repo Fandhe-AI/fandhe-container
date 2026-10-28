@@ -69,6 +69,9 @@ pub const READY_TIMEOUT_DEFAULT: Duration = PASTA_READY_TIMEOUT_DEFAULT;
 pub const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// 途中死の検出で `signal` に渡す期限（送信直前の確認用）。
+/// drop が継続中の teardown のスレッドを待つ上限。teardown の各停止(pasta 最大 3 秒＋holder 最大 2 秒＋
+/// 状態ルートの I/O の上限 [`RUN_DIR_IO_TIMEOUT`])を覆う。
+const TEARDOWN_REAP_CAP: Duration = Duration::from_secs(10);
 const SIGNAL_DEADLINE: Duration = Duration::from_secs(1);
 
 /// `terminate` の後始末に使う、PID 1 を回収できなかったときの待ち。
@@ -342,6 +345,12 @@ pub trait PastaAttachBackend: Send + Sync {
     /// holder の pid を対象に pasta を起動し、準備完了を `deadline` までに待つ。
     fn spawn_pasta(&self, holder_pid: u32, deadline: Instant) -> Result<Spawned, TraitError>;
 
+    /// `@pasta/<id>/` を launch の前の準備段階で作っておく(期限つき。launch 内の `spawn_pasta` は準備済みのものを使い、
+    /// 状態ルートの I/O を同期で行わない。REPAIR-5)。既定は何もしない(フェイクの backend 用)。
+    fn prepare_run_dir(&self, _deadline: Instant) -> Result<(), TraitError> {
+        Ok(())
+    }
+
     /// `@pasta/<id>/` を消す（無ければ成功）。`generation` が `Some` のときは、その世代が最新のときだけ消す
     /// (再作成された新しい置き場所を旧い後始末が消さない。`None` は起動の巻き戻しで、無条件に消す)。
     fn remove_run_dir(&self, generation: Option<u64>) -> Result<(), TraitError>;
@@ -391,20 +400,57 @@ pub fn remove_pasta_leftovers(state_root: &Path, id: &ContainerId) -> Result<(),
 }
 
 /// 本番の backend。holder は [`spawn_netns_holder`]、pasta は net の `spawn_pasta` を呼ぶ。
+///
+/// `@pasta/<id>/` の作成・削除(状態ルートの I/O)は作業スレッドで期限つきに行う(止まった I/O で呼び出し元を
+/// 無期限に止めない。REPAIR-5)。作成は launch の前の [`PastaAttachBackend::prepare_run_dir`] で済ませ、
+/// `spawn_pasta` は準備済みのものを取り出して使う。
 pub struct ProductionBackend {
-    config: PastaAttachConfig,
+    binary: PastaBinary,
+    forwards: PastaPortForwards,
+    container: ContainerId,
+    ready_timeout: Duration,
+    state_root: Arc<OwnedFd>,
     logger: Logger,
-    run_dirs: RunDirGenerations,
+    run_dirs: Arc<RunDirGenerations>,
+    /// 準備段階で作った置き場所(世代つき)。期限切れの後に作業スレッドが作り終えた分もここへ残る。
+    prepared: Arc<Mutex<Option<(u64, PastaRunDir)>>>,
 }
 
 impl ProductionBackend {
     fn new(config: PastaAttachConfig, logger: Logger) -> Self {
         Self {
-            config,
+            binary: config.binary,
+            forwards: config.forwards,
+            container: config.container,
+            ready_timeout: config.ready_timeout,
+            state_root: Arc::new(config.state_root),
             logger,
-            run_dirs: RunDirGenerations::default(),
+            run_dirs: Arc::new(RunDirGenerations::default()),
+            prepared: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// 状態ルートの I/O(作成・削除)の待ちの上限。超えたら待ちを打ち切る(作業スレッドは残り、枠は実終了まで保持する)。
+const RUN_DIR_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `job`(状態ルートの同期 I/O)を作業スレッドで実行し、`timeout` までだけ待つ(REPAIR-5)。
+/// 期限切れは `Timeout`、同時実行枠の満杯は `ResourceExhausted`(何も実行していない)。
+fn run_dir_io_bounded<T: Send + 'static>(
+    timeout: Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, TraitError> {
+    use crate::supervisor_log::{BoundedFailure, run_bounded_classified};
+    run_bounded_classified(job, timeout).map_err(|f| match f {
+        BoundedFailure::Busy => TraitError::new(
+            ErrorCode::ResourceExhausted,
+            "too many pending state root operations",
+        ),
+        BoundedFailure::Unfinished => TraitError::new(
+            ErrorCode::Timeout,
+            "the pasta run directory operation timed out",
+        ),
+    })
 }
 
 /// `@pasta/<id>/` の世代と、作成・削除を直列化するロック(CORE-2)。
@@ -496,7 +542,7 @@ impl PastaAttachBackend for ProductionBackend {
     fn spawn_pasta(&self, holder_pid: u32, deadline: Instant) -> Result<Spawned, TraitError> {
         require_main_thread()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout = self.config.ready_timeout.min(remaining);
+        let timeout = self.ready_timeout.min(remaining);
         if timeout.is_zero() {
             return Err(TraitError::new(
                 ErrorCode::Timeout,
@@ -504,21 +550,15 @@ impl PastaAttachBackend for ProductionBackend {
             ));
         }
         check_ready_timeout(timeout).map_err(|e| net_to_trait(&e))?;
-        let (generation, run_dir) = self.run_dirs.advance_with(|| {
-            PastaRunDir::prepare(
-                self.config.state_root.as_fd(),
-                self.config.container.as_str(),
-            )
-        });
-        let run_dir = run_dir.map_err(|e| net_to_trait(&e))?;
+        // 置き場所は準備段階(`prepare_run_dir`)で作ってある。launch 内では状態ルートの I/O を同期で行わない。
+        let Some((generation, run_dir)) = lock(&self.prepared).take() else {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the pasta run directory was not prepared",
+            ));
+        };
         let target = PastaTarget::from_pid(holder_pid).map_err(|e| net_to_trait(&e))?;
-        match spawn_pasta(
-            &self.config.binary,
-            &run_dir,
-            &self.config.forwards,
-            target,
-            timeout,
-        ) {
+        match spawn_pasta(&self.binary, &run_dir, &self.forwards, target, timeout) {
             Ok((proc, ready)) => {
                 let pid = proc.pid();
                 Ok(Spawned {
@@ -548,13 +588,39 @@ impl PastaAttachBackend for ProductionBackend {
         }
     }
 
+    fn prepare_run_dir(&self, deadline: Instant) -> Result<(), TraitError> {
+        let timeout = RUN_DIR_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        if timeout.is_zero() {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "the deadline was exceeded before the pasta run directory was prepared",
+            ));
+        }
+        let (fd, id) = (
+            Arc::clone(&self.state_root),
+            self.container.as_str().to_owned(),
+        );
+        let (run_dirs, prepared) = (Arc::clone(&self.run_dirs), Arc::clone(&self.prepared));
+        // 期限切れの後に作業スレッドが作り終えた分も `prepared` に残る(取り残しは次の準備か delete が回収する)。
+        run_dir_io_bounded(timeout, move || {
+            let (generation, made) =
+                run_dirs.advance_with(|| PastaRunDir::prepare(fd.as_fd(), &id));
+            made.map(|dir| *lock(&prepared) = Some((generation, dir)))
+        })?
+        .map_err(|e| net_to_trait(&e))
+    }
+
     fn remove_run_dir(&self, generation: Option<u64>) -> Result<(), TraitError> {
-        let removed = self.run_dirs.remove_if_current(generation, || {
-            remove_pasta_run_dir(
-                self.config.state_root.as_fd(),
-                self.config.container.as_str(),
-            )
-        });
+        // 未使用の準備済み置き場所は、この削除が一緒に消す(fd を持ったまま残さない)。
+        drop(lock(&self.prepared).take());
+        let (fd, id) = (
+            Arc::clone(&self.state_root),
+            self.container.as_str().to_owned(),
+        );
+        let run_dirs = Arc::clone(&self.run_dirs);
+        let removed = run_dir_io_bounded(RUN_DIR_IO_TIMEOUT, move || {
+            run_dirs.remove_if_current(generation, || remove_pasta_run_dir(fd.as_fd(), &id))
+        })?;
         match removed {
             Ok(true) => {}
             Ok(false) => self.logger.log(
@@ -807,6 +873,11 @@ impl PastaWiring {
         }
     }
 
+    /// launch の前の準備段階で `@pasta/<id>/` を期限つきに作っておく(launch 内では準備済みのものを使う。REPAIR-5)。
+    pub fn prepare(&self, deadline: Instant) -> Result<(), TraitError> {
+        self.backend.prepare_run_dir(deadline)
+    }
+
     /// core の launcher 構築器へ渡すフック。
     pub fn hook(&self) -> Arc<dyn NetnsAttachHook> {
         Arc::clone(&self.hook) as Arc<dyn NetnsAttachHook>
@@ -1021,6 +1092,8 @@ pub struct PastaGuardedProcess {
     unexpected: AtomicBool,
     /// SIGTERM から SIGKILL へ上げるまでの猶予(既定 [`TERM_GRACE`]。試験が縮める)。
     term_grace: Duration,
+    /// drop が継続中の teardown を待つ上限(既定 [`TEARDOWN_REAP_CAP`]。試験が縮める)。
+    reap_cap: Duration,
     logger: Logger,
 }
 
@@ -1054,6 +1127,21 @@ impl PastaGuardedProcess {
         let _ = handle.join();
     }
 
+    /// 継続中の teardown のスレッドを `cap` までだけ待って回収する。終わらなければ join せず手放す(スレッドは
+    /// 各停止の有限の期限で自力で終わる。Drop が無期限に塞がらないようにする。REPAIR-5)。
+    fn reap_teardown_worker_bounded(&self, cap: Duration) {
+        let until = Instant::now() + cap;
+        loop {
+            self.reap_teardown_worker(false);
+            if lock(&self.teardown_worker).is_none() || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 上限に達したら追跡を手放す(JoinHandle の drop は detach)。
+        drop(lock(&self.teardown_worker).take());
+    }
+
     /// helper の後始末が残っているか(attachment が未消費、または teardown のスレッドが継続中)。
     fn teardown_pending(&self) -> bool {
         lock(&self.attachment).is_some() || lock(&self.teardown_worker).is_some()
@@ -1068,6 +1156,7 @@ impl PastaGuardedProcess {
             pending_exit: Mutex::new(None),
             unexpected: AtomicBool::new(false),
             term_grace: TERM_GRACE,
+            reap_cap: TEARDOWN_REAP_CAP,
             logger,
         }
     }
@@ -1224,7 +1313,7 @@ impl Drop for PastaGuardedProcess {
         // 回収前に手放された場合も helper を残さない（単一スレッドの区間かもしれないので回収スレッドは作らない）。
         self.teardown("drop", false);
         // 期限を超えて継続中の teardown は、プロセスの終了で打ち切られないようここで回収する（各停止は有限時間）。
-        self.reap_teardown_worker(true);
+        self.reap_teardown_worker_bounded(self.reap_cap);
     }
 }
 

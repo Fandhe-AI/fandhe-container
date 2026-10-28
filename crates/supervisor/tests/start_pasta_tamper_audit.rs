@@ -93,7 +93,7 @@ fn prepare(env: &Env, id: &ContainerId, pasta_path: &Path) {
 }
 
 /// bin の `start` を期限つきで実行する(終了コード・stdout)。
-fn run_start(env: &Env, id: &str) -> (Option<i32>, String) {
+fn run_start(env: &Env, id: &str) -> (Option<i32>, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_fandhe-container-supervisor"));
     let mut child = c
         .env_clear()
@@ -102,15 +102,23 @@ fn run_start(env: &Env, id: &str) -> (Option<i32>, String) {
         .arg(id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut s = String::new();
         let _ = std::io::Read::read_to_string(&mut { out }, &mut s);
         let _ = tx.send(s);
+    });
+    // 失敗時の診断のため stderr(構造化ログ)も集める。
+    let (etx, erx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut err, &mut s);
+        let _ = etx.send(s);
     });
     let start = Instant::now();
     let status = loop {
@@ -125,7 +133,8 @@ fn run_start(env: &Env, id: &str) -> (Option<i32>, String) {
         std::thread::sleep(Duration::from_millis(10));
     };
     let stdout = rx.recv_timeout(CHILD_DEADLINE).unwrap();
-    (status.code(), stdout)
+    let stderr = erx.recv_timeout(CHILD_DEADLINE).unwrap_or_default();
+    (status.code(), stdout, stderr)
 }
 
 fn audit_lines(env: &Env) -> Vec<String> {
@@ -137,7 +146,7 @@ fn audit_lines(env: &Env) -> Vec<String> {
 }
 
 fn assert_rejected_once(env: &Env, id: &ContainerId, reason: &str) {
-    let (code, stdout) = run_start(env, id.as_str());
+    let (code, stdout, stderr) = run_start(env, id.as_str());
     assert_ne!(code, Some(0), "start must be refused: {stdout}");
     assert_eq!(stdout.lines().count(), 1, "one report line: {stdout}");
     // 起動は拒否され、状態は Created のまま(cgroup にも launch にも進まない)。
@@ -149,7 +158,11 @@ fn assert_rejected_once(env: &Env, id: &ContainerId, reason: &str) {
         .iter()
         .filter(|l| l.contains(r#""layer":"pasta_verify""#))
         .collect();
-    assert_eq!(pasta.len(), 1, "exactly one pasta_verify record: {lines:?}");
+    assert_eq!(
+        pasta.len(),
+        1,
+        "exactly one pasta_verify record: {lines:?}\nstdout: {stdout}\nstderr: {stderr}"
+    );
     let line = pasta[0];
     assert!(line.contains(&format!(r#""reason":"{reason}""#)), "{line}");
     assert!(
@@ -190,7 +203,7 @@ fn sec4_start_with_unwritable_audit_log_is_still_refused() {
     let sh = std::fs::canonicalize("/bin/sh").expect("canonical /bin/sh");
     prepare(&env, &id, &sh);
     std::fs::create_dir(env.root.join("@audit.log")).unwrap();
-    let (code, stdout) = run_start(&env, id.as_str());
+    let (code, stdout, _stderr) = run_start(&env, id.as_str());
     assert_ne!(code, Some(0), "{stdout}");
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     let store = open_default_store(Some(env.root.clone())).unwrap();

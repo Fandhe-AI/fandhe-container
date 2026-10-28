@@ -214,7 +214,9 @@ use tar::{Archive, EntryType};
 pub use super::idmap::{IdMap, IdRange};
 use sha2::{Digest as _, Sha256};
 
-use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree};
+use super::anchored::{
+    AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree, remove_path_tree_checked,
+};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
     VerifiedLayerBlob, oci_error_from_layer_io,
@@ -443,6 +445,21 @@ impl<'a> ExtractBudget<'a> {
     pub fn with_cancel(mut self, cancel: &'a AtomicBool) -> Self {
         self.cancel = Some(cancel);
         self
+    }
+
+    /// 木の削除用の確認（文言のみ違う。`remove_extracted_tree_bounded` から呼ぶ。#3142）。
+    fn check_removal(&self) -> Result<(), OciError> {
+        self.check().map_err(|_| {
+            let cancelled = self.cancel.is_some_and(|c| c.load(AtomicOrdering::Acquire));
+            err(
+                OciErrorCode::Timeout,
+                if cancelled {
+                    "tree removal was cancelled"
+                } else {
+                    "tree removal exceeded its deadline"
+                },
+            )
+        })
     }
 
     /// 期限超過か取り消しなら `Timeout`。メッセージにエントリ名・パスは含めない（ERR-3）。
@@ -997,6 +1014,19 @@ fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<Extracte
 /// 使用までの TOCTOU を防げない（モジュール冒頭「未実装」）。
 pub fn remove_extracted_tree(path: &Path) -> Result<(), OciError> {
     remove_path_tree(path)
+}
+
+/// `remove_extracted_tree` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5・OCI-7）。
+///
+/// 呼び出し元は cri の bundle 解放（`RemoveContainer` の worker と `CreateContainer` の巻き戻し）。`budget` の
+/// 期限超過・取り消しはエントリ 1 件を消す前に確かめ、`Timeout` で止まる。止まるまでに消した分は残り、同じ
+/// `path` への再実行（冪等）が続きから消す。分割できない区間（`unlinkat` 1 回・`getdents64` 1 回分）は打ち切れない。
+/// symlink・マウント越えの拒否と深さ・走査回数の上限は `remove_extracted_tree` と同じ。
+pub fn remove_extracted_tree_bounded(
+    path: &Path,
+    budget: &ExtractBudget<'_>,
+) -> Result<(), OciError> {
+    remove_path_tree_checked(path, &|| budget.check_removal())
 }
 
 /// 件数と対応の照合つきで `ImageLayer` の列を作る補助（#2017・#2309・OCI-1）。
@@ -8115,5 +8145,67 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].entries, b[0].entries);
         assert_eq!(fs::read(sb1.root.join("d/f")).unwrap(), b"F");
+    }
+
+    /// 削除用の木（`n` 個のファイルを持つ 2 階層）を作る。
+    fn removal_tree(sb: &Sandbox, n: usize) -> PathBuf {
+        let t = sb.root.join("t");
+        fs::create_dir_all(t.join("d")).unwrap();
+        for i in 0..n {
+            fs::write(t.join("d").join(format!("f{i}")), b"x").unwrap();
+        }
+        t
+    }
+
+    /// OCI-7・REPAIR-5・#3142: 取り消しの旗が立っていれば何も消さずに `Timeout`、旗を下ろした再実行で消え切る。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_stops_on_cancel() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 3);
+        let flag = AtomicBool::new(true);
+        let e = remove_extracted_tree_bounded(&t, &ExtractBudget::new().with_cancel(&flag))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "tree removal was cancelled");
+        assert_eq!(fs::read_dir(t.join("d")).unwrap().count(), 3);
+        flag.store(false, AtomicOrdering::Release);
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new().with_cancel(&flag)).unwrap();
+        assert!(!t.exists());
+    }
+
+    /// OCI-7・REPAIR-5・#3142: 期限は途中で切れ、木の一部が残る。期限なしの再実行（冪等）が続きから消し切る。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_stops_at_deadline_and_resumes() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 5);
+        CLOCK_CALLS.with(|c| c.set(0));
+        // 確認 0 = t、1 = 最初の走査、2.. = d・その中のファイル。8 回目の確認で期限。
+        let mut budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(8));
+        budget.now = tick_clock;
+        let e = remove_extracted_tree_bounded(&t, &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "tree removal exceeded its deadline");
+        assert!(t.exists());
+        let left = fs::read_dir(t.join("d")).unwrap().count();
+        assert!(left > 0 && left < 5, "left={left}");
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new()).unwrap();
+        assert!(!t.exists());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-7・SEC-5・#3142: 予算つきでも差し替えられた symlink は追従せず、外を消さない。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_keeps_symlink_untouched_outside() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 1);
+        let out = sb.root.join("outside_target");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("keep"), b"k").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&out, t.join("lnk")).unwrap();
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new()).unwrap();
+        assert!(!t.exists());
+        assert_eq!(fs::read(out.join("keep")).unwrap(), b"k");
     }
 }

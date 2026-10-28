@@ -120,7 +120,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
@@ -131,8 +131,9 @@ use fandhe_container_core::traits::ContainerLogPath;
 
 use crate::adapter::{
     BundleProvider, BundleRequest, PodNetns, PodNetworkProvider, PodNetworkRequest, PreparedBundle,
-    RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
+    ReleaseBudget, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
 };
+use crate::image_service::CancelOnDrop;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::port_mapping::{PodPortPublish, parse_port_mappings};
 use crate::runtime::v1::{
@@ -421,7 +422,7 @@ fn is_definite_failure(code: CriErrorCode) -> bool {
 /// 実行層の呼び出し中に立てた `in_flight` を、確定されないまま破棄されたら巻き戻す番人（TASK-59.2）。
 ///
 /// worker（専用スレッド上のクロージャ）が所有する。RPC の future が中断・タイムアウトしても
-/// worker は走り続け（Create は dispatch 前なら `AbandonOnDrop` で打ち切られ、dispatch 後は最後まで走る。#2899）、その終了時（失敗・panic を含む）に `Drop` で巻き戻すため、実行層が処理中の間に
+/// worker は走り続け（Create は dispatch 前なら `AbandonOnDrop` で、Remove は `CancelOnDrop` の旗で解放が打ち切られる。#2899・#3142）、その終了時（失敗・panic を含む）に `Drop` で巻き戻すため、実行層が処理中の間に
 /// 記録・件数枠・bundle だけが先に解放されることはない。確定は [`InFlightGuard::commit`]。
 struct InFlightGuard {
     registry: Arc<Mutex<SandboxRegistry>>,
@@ -430,6 +431,8 @@ struct InFlightGuard {
     committed: bool,
     /// Create の巻き戻しで `release` を呼ぶ bundle の供給元。
     bundles: Option<Arc<dyn BundleProvider>>,
+    /// 巻き戻しの `release` に与える期限の長さ（`arm_bundles` で設定。#3142・REPAIR-5）。
+    release_timeout: Duration,
     /// 実行層の結果が不明（呼び出し後で、確定失敗・削除完了が確認できていない）か。
     /// 真のまま破棄されたら、Start は実行層で running かもしれないため created へ戻さず exited にし、
     /// Create は実行層に資源が残るかもしれないため記録と bundle を保持する（exited にして追跡を残す）。
@@ -452,6 +455,7 @@ impl InFlightGuard {
             kind,
             committed: false,
             bundles: None,
+            release_timeout: Duration::ZERO,
             outcome_unknown: false,
             confirmed_exited: false,
             exit: ExitReport::default(),
@@ -545,8 +549,12 @@ impl InFlightGuard {
     /// 起動前（スレッド生成の失敗でクロージャが RPC スレッド上で破棄される場合）の guard は解放責務を持たず、
     /// `release`（外部処理）が RPC スレッドで走って期限を無視するのを防ぐ。起動前は `prepare` も未実行で、
     /// 解放すべき bundle が無いためリークにならない（REPAIR-5・CRI-2）。
-    fn arm_bundles(&mut self, bundles: Arc<dyn BundleProvider>) {
+    ///
+    /// `release_timeout` は巻き戻しの `release` の上限（Drop の開始時刻からの長さ。#3142・REPAIR-5）。
+    /// 取り消しの旗は渡さない: 手放した Create の旗で巻き戻しが即座に止まると、bundle が必ず残るため。
+    fn arm_bundles(&mut self, bundles: Arc<dyn BundleProvider>, release_timeout: Duration) {
         self.bundles = Some(bundles);
+        self.release_timeout = release_timeout;
     }
 
     /// 実行層の呼び出しを開始した（以後、中断・commit 失敗では結果が不明になる）。
@@ -596,8 +604,15 @@ impl Drop for InFlightGuard {
             if self.kind == InFlightKind::Create
                 && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
-                && bundles.release(&self.id).is_err()
+                && bundles
+                    .release_bounded(
+                        &self.id,
+                        &ReleaseBudget::new().with_deadline(Instant::now() + self.release_timeout),
+                    )
+                    .is_err()
             {
+                // 期限切れでも失敗でも結果不明として記録と write-ahead の記録ファイルを残す。回収は
+                // RemoveContainer（delete〔NOT_FOUND〕→ 続きから release）か再起動時の readopt（stale_create）。
                 self.outcome_unknown = true;
             }
             // bundle の解放まで済んだら、write-ahead の記録ファイルを消す（無ければ成功）。消せなければ資源の
@@ -658,6 +673,41 @@ impl Drop for PendingMarks {
             }
         }
     }
+}
+
+/// `RemovePodSandbox` 1 回の RPC に共通の絶対期限（#3142・CRI-2・REPAIR-5）。
+///
+/// 配下のコンテナの停止・回収、pod network の回収、記録ファイルの削除を逐次に回すとき、各段の待ちの上限を
+/// `min(段の上限, 残り)` にして、合計を `runtime_timeout` 1 回分で頭打ちにする（N 件 × `runtime_timeout` に
+/// ならない。kubelet の `--runtime-request-timeout` の既定 2 分に収める）。残りが 0 なら新しい段を始めない。
+/// 単独の StopPodSandbox・RemoveContainer 等は `None` を渡し、従来どおり段ごとの上限だけを使う。
+struct OpDeadline {
+    at: Instant,
+}
+
+impl OpDeadline {
+    fn new(total: Duration) -> Self {
+        Self {
+            at: Instant::now() + total,
+        }
+    }
+
+    /// 段の上限 `cap` を残りで頭打ちにする。残りが 0 なら固定文言の `Timeout`。
+    fn step(&self, cap: Duration) -> Result<Duration, CriError> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(CriError::timeout(POD_REMOVAL_DEADLINE));
+        }
+        Ok(left.min(cap))
+    }
+}
+
+/// pod 単位の期限切れの固定文言。
+const POD_REMOVAL_DEADLINE: &str = "pod sandbox removal exceeded its deadline";
+
+/// 期限があれば残りで頭打ちにした上限、無ければ `cap` そのまま。
+fn step_within(deadline: Option<&OpDeadline>, cap: Duration) -> Result<Duration, CriError> {
+    deadline.map_or(Ok(cap), |d| d.step(cap))
 }
 
 /// 実行層からコンテナの削除完了（または不在）を確認できたか。成功と `NOT_FOUND` を確認済みとする。
@@ -1136,8 +1186,9 @@ const SANDBOX_RECORD_BUSY: &str = "sandbox record update is in progress";
 
 /// 実行層の呼び出しを専用スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
 ///
-/// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker はここからは打ち切れない（`CreateContainer` だけは
-/// 呼び出し側が `AbandonOnDrop` で dispatch 前の worker を打ち切る。#2899）。worker は自分の
+/// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker はここからは打ち切れない（`CreateContainer` は
+/// 呼び出し側が `AbandonOnDrop` で dispatch 前の worker を、`RemoveContainer` は `CancelOnDrop` で bundle の解放を打ち切る。
+/// #2899・#3142）。worker は自分の
 /// [`InFlightGuard`] で記録を最後まで確定・巻き戻すため、呼び出し側は結果不明として扱ってよい。
 /// worker も期限の監視も tokio の blocking pool を使わない。実行層のハングで pool が埋まっても、
 /// 期限の監視は開始され、`timeout` で応答を返す。
@@ -1962,9 +2013,10 @@ impl CriRuntimeService {
                     false
                 } else {
                     match self.reserve_tear_down(&id) {
-                        Ok(Some(guard)) => {
-                            self.tear_down_bounded(provider, &id, guard).await.is_ok()
-                        }
+                        Ok(Some(guard)) => self
+                            .tear_down_bounded(provider, &id, guard, self.runtime_timeout)
+                            .await
+                            .is_ok(),
                         _ => false,
                     }
                 };
@@ -2051,11 +2103,12 @@ impl CriRuntimeService {
         provider: &Arc<dyn PodNetworkProvider>,
         sandbox_id: &str,
         guard: NetworkTearDownGuard,
+        timeout: Duration,
     ) -> Result<(), CriError> {
         let provider = Arc::clone(provider);
         let id = sandbox_id.to_owned();
         let registry = Arc::clone(&self.registry);
-        run_bounded(self.runtime_timeout, move || {
+        run_bounded(timeout, move || {
             let _guard = guard;
             let result = provider.tear_down(&id);
             if result.is_ok()
@@ -2075,7 +2128,11 @@ impl CriRuntimeService {
     ///
     /// 注入が無い・印が無い場合は何もしない。set_up の最中は `FAILED_PRECONDITION`。失敗時は印を残して
     /// 再試行できるようにする（#2675・CRI-2・NET-1）。
-    async fn release_pod_network(&self, sandbox_id: &str) -> Result<(), CriError> {
+    async fn release_pod_network(
+        &self,
+        sandbox_id: &str,
+        deadline: Option<&OpDeadline>,
+    ) -> Result<(), CriError> {
         let Some(provider) = &self.pod_network else {
             return Ok(());
         };
@@ -2096,10 +2153,12 @@ impl CriRuntimeService {
                 return Ok(());
             }
         }
+        let timeout = step_within(deadline, self.runtime_timeout)?;
         let Some(guard) = self.reserve_tear_down(sandbox_id)? else {
             return Ok(());
         };
-        self.tear_down_bounded(provider, sandbox_id, guard).await
+        self.tear_down_bounded(provider, sandbox_id, guard, timeout)
+            .await
     }
 
     /// provider 未注入のまま、回収待ち（`network_owned=true`）の記録を Stop・Remove させない（CRI-2 の fail-closed）。
@@ -2132,6 +2191,16 @@ impl CriRuntimeService {
         &self,
         req: v1::StopPodSandboxRequest,
     ) -> Result<v1::StopPodSandboxResponse, CriError> {
+        self.stop_sandbox_within(req, None).await
+    }
+
+    /// `stop_sandbox_with_network` の本体。`deadline` があれば各段の上限を残りで頭打ちにする
+    /// （RemovePodSandbox が埋め込みで呼ぶとき。#3142）。
+    async fn stop_sandbox_within(
+        &self,
+        req: v1::StopPodSandboxRequest,
+        deadline: Option<&OpDeadline>,
+    ) -> Result<v1::StopPodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
         self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
@@ -2139,10 +2208,10 @@ impl CriRuntimeService {
         }
         let id = req.pod_sandbox_id.clone();
         let resp = match &self.runtime {
-            Some(binding) => self.stop_sandbox_runtime(binding, req).await,
+            Some(binding) => self.stop_sandbox_runtime(binding, req, deadline).await,
             None => self.stop_sandbox(req),
         }?;
-        self.release_pod_network(&id).await?;
+        self.release_pod_network(&id, deadline).await?;
         // 停止とネットワークの回収が済んだ時点の状態を書く（途中の失敗では書かない: ディスクの古い ready は
         // 安全側で、R6 は常に NotReady として再採用する）。失敗してもメモリは Stop 後のまま INTERNAL を返す。
         // 記録が無い（並行する Remove が完了した・未知 ID）ときは書く対象が無く、成功のまま返す。
@@ -2162,6 +2231,9 @@ impl CriRuntimeService {
         &self,
         req: v1::RemovePodSandboxRequest,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
+        // RPC 1 回の合計期限（#3142）。入口で 1 回だけ求め、以降のすべての段へ渡す。
+        let deadline = OpDeadline::new(self.runtime_timeout);
+        let deadline = Some(&deadline);
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
         self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
@@ -2174,15 +2246,18 @@ impl CriRuntimeService {
                 .get(&req.pod_sandbox_id)
                 .is_some_and(|r| r.network_owned);
             if owned {
-                self.stop_sandbox_with_network(v1::StopPodSandboxRequest {
-                    pod_sandbox_id: req.pod_sandbox_id.clone(),
-                })
+                self.stop_sandbox_within(
+                    v1::StopPodSandboxRequest {
+                        pod_sandbox_id: req.pod_sandbox_id.clone(),
+                    },
+                    deadline,
+                )
                 .await?;
             }
         }
         match &self.runtime {
-            Some(binding) => self.remove_sandbox_runtime(binding, req).await,
-            None => self.remove_sandbox(req).await,
+            Some(binding) => self.remove_sandbox_runtime(binding, req, deadline).await,
+            None => self.remove_sandbox(req, deadline).await,
         }
     }
 
@@ -2324,7 +2399,11 @@ impl CriRuntimeService {
             extra_guard,
         };
         let result = self
-            .store_io_bounded(StoreCall::Put(record_id, bytes, rollback.clone()), guard)
+            .store_io_bounded(
+                StoreCall::Put(record_id, bytes, rollback.clone()),
+                guard,
+                self.runtime_timeout,
+            )
             .await;
         if let Some(rb) = rollback.as_ref().filter(|rb| !rb.confirm) {
             if result.is_ok() {
@@ -2376,6 +2455,7 @@ impl CriRuntimeService {
         id: &str,
         guard: &mut Option<SandboxRecordWriteGuard>,
         finalize: bool,
+        timeout: Duration,
     ) -> Result<(), CriError> {
         if self.record_store.is_none() {
             return Ok(());
@@ -2386,7 +2466,7 @@ impl CriRuntimeService {
             registry: Arc::clone(&self.registry),
             sandbox_id: id.to_owned(),
         });
-        self.store_io_bounded(StoreCall::Remove(record_id, finalize), guard)
+        self.store_io_bounded(StoreCall::Remove(record_id, finalize), guard, timeout)
             .await
     }
 
@@ -2399,6 +2479,7 @@ impl CriRuntimeService {
         &self,
         call: StoreCall,
         guard: &mut Option<SandboxRecordWriteGuard>,
+        timeout: Duration,
     ) -> Result<(), CriError> {
         let Some(store) = self.record_store.as_ref().map(Arc::clone) else {
             return Ok(());
@@ -2412,7 +2493,7 @@ impl CriRuntimeService {
             StoreCall::Put(_, _, Some(rb)) => Some(Arc::clone(&rb.spawn_failed)),
             _ => None,
         };
-        let outcome = run_bounded(self.runtime_timeout, move || {
+        let outcome = run_bounded(timeout, move || {
             let result = match &call {
                 StoreCall::Put(id, bytes, rollback) => {
                     // panic したら予約を回復可能な状態へ倒す（スロットを塞いだままにしない）。後始末の削除も
@@ -2499,7 +2580,9 @@ impl CriRuntimeService {
                 return;
             }
         }
-        let _ = self.unpersist_sandbox(id, guard, true).await;
+        let _ = self
+            .unpersist_sandbox(id, guard, true, self.runtime_timeout)
+            .await;
     }
 
     /// ネットワークなしの `RunPodSandbox`。予約 → 確定版を 1 回書く。
@@ -2594,6 +2677,7 @@ impl CriRuntimeService {
     async fn remove_sandbox(
         &self,
         req: v1::RemovePodSandboxRequest,
+        deadline: Option<&OpDeadline>,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
@@ -2609,6 +2693,8 @@ impl CriRuntimeService {
             }
             return Ok(v1::RemovePodSandboxResponse {});
         }
+        // 期限が尽きていたら記録ファイルに触れない（sandbox は notready のまま残り、再試行が続きから進める。#3142）。
+        let unpersist_timeout = step_within(deadline, self.runtime_timeout)?;
         // 検査を通ったときだけ record_write を立てる（拒否の応答でフラグを残さない）。
         let mut write_guard = {
             let mut registry = self
@@ -2631,7 +2717,8 @@ impl CriRuntimeService {
         // 遅れて完了した削除が「ファイルは無いのにメモリは Ready」を残さず、その間は `record_write` が
         // CreateContainer・Stop・Remove を拒否する（#2933・CRI-2）。再検査の失敗時は worker がファイルを
         // 書き直す（best effort）。
-        self.unpersist_sandbox(id, &mut write_guard, true).await?;
+        self.unpersist_sandbox(id, &mut write_guard, true, unpersist_timeout)
+            .await?;
         Ok(v1::RemovePodSandboxResponse {})
     }
 
@@ -2808,7 +2895,7 @@ impl CriRuntimeService {
         };
         let outcome = run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
-            guard.arm_bundles(Arc::clone(&bundles));
+            guard.arm_bundles(Arc::clone(&bundles), timeout);
             guard.arm_record_store(record_store);
             // 起動前に手放されていたら prepare もしない（guard の Drop が release と記録の巻き戻しを行う）。
             if settlement.is_abandoned() {
@@ -3065,7 +3152,7 @@ impl CriRuntimeService {
             )
         };
         let (guard, signal) = guard;
-        self.runtime_stop_one(binding, guard, req.timeout, signal)
+        self.runtime_stop_one(binding, guard, req.timeout, signal, None)
             .await?;
         Ok(v1::StopContainerResponse {})
     }
@@ -3081,32 +3168,31 @@ impl CriRuntimeService {
         mut guard: InFlightGuard,
         grace_secs: i64,
         signal: u8,
+        deadline: Option<&OpDeadline>,
     ) -> Result<(), CriError> {
         let adapter = binding.adapter.clone();
         let id = guard.id.clone();
         let record_store = self.record_store.clone();
         let grace = Duration::from_secs(u64::try_from(grace_secs).unwrap_or(0));
-        run_bounded(
-            self.runtime_timeout.saturating_add(grace),
-            move || -> Result<(), CriError> {
-                guard.arm_record_store(record_store);
-                guard.mark_dispatched();
-                match adapter.stop_with_signal(&id, grace_secs, signal) {
-                    Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
-                        guard.set_exit(&status);
-                        guard.commit()
-                    }
-                    Ok(_) => Err(CriError::internal("runtime returned an unexpected state")),
-                    Err(status) if status.code() == CriErrorCode::NotFound => guard.commit(),
-                    Err(status) => {
-                        if is_definite_failure(status.code()) {
-                            guard.mark_definitely_failed();
-                        }
-                        Err(status)
-                    }
+        let step = step_within(deadline, self.runtime_timeout.saturating_add(grace))?;
+        run_bounded(step, move || -> Result<(), CriError> {
+            guard.arm_record_store(record_store);
+            guard.mark_dispatched();
+            match adapter.stop_with_signal(&id, grace_secs, signal) {
+                Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
+                    guard.set_exit(&status);
+                    guard.commit()
                 }
-            },
-        )
+                Ok(_) => Err(CriError::internal("runtime returned an unexpected state")),
+                Err(status) if status.code() == CriErrorCode::NotFound => guard.commit(),
+                Err(status) => {
+                    if is_definite_failure(status.code()) {
+                        guard.mark_definitely_failed();
+                    }
+                    Err(status)
+                }
+            }
+        })
         .await?
     }
 
@@ -3150,7 +3236,8 @@ impl CriRuntimeService {
             )
         };
         let (guard, call_core) = guard;
-        self.runtime_remove_one(binding, guard, call_core).await?;
+        self.runtime_remove_one(binding, guard, call_core, self.runtime_timeout)
+            .await?;
         Ok(v1::RemoveContainerResponse {})
     }
 
@@ -3160,10 +3247,11 @@ impl CriRuntimeService {
     /// 確定失敗・解放の失敗は記録を保持して再試行できるようにし（再試行では delete が `NOT_FOUND` になる）、
     /// 結果不明は unknown で保持する（REPAIR-5）。
     ///
-    /// 待ちの上限（#3027・REPAIR-5）: `adapter.remove` の実行層側（plugin-cri は全体の期限 `PLUGIN_FORCE_DELETE_DEADLINE` で
-    /// 後始末を頭打ちにする）と、`bundles.release` はどちらも worker 内で動く。`release` にはロックの待ちが無く、I/O の量は
-    /// 件数の上限で抑えられているが、時間の定数の上限は無い。RPC の応答は `run_bounded` が `runtime_timeout` で打ち切り、
-    /// worker は取り消されず走り続ける（記録は `in_flight` のままで、再試行は worker が終わるまで `FAILED_PRECONDITION`）。
+    /// 待ちの上限（#3027・#3142・REPAIR-5）: `adapter.remove` の実行層側（plugin-cri は全体の期限 `PLUGIN_FORCE_DELETE_DEADLINE` で
+    /// 後始末を頭打ちにする。この区間は打ち切れない）と、`bundles.release_bounded` はどちらも worker 内で動く。
+    /// 解放は `step` の期限と取り消しの旗（RPC の期限切れ・future の破棄で立つ）でエントリごとに打ち切り、`Timeout` は
+    /// 解放の失敗と同じ分岐（exited・`runtime_owned` で保持）に入る。再試行は delete〔NOT_FOUND〕→ 続きから release へ進む。
+    /// `step` は RemoveContainer では `runtime_timeout`、RemovePodSandbox では pod の合計期限の残りで頭打ちにした値。
     /// 設計と kubelet の `--runtime-request-timeout` との関係は `docs/design/container-log-removal-wait.md`。
     ///
     /// `call_core` が偽（再採用した `runtime_owned=false` の記録。core に資源が無いと照合済み。R8 #2937）のときは
@@ -3174,14 +3262,27 @@ impl CriRuntimeService {
         binding: &RuntimeBinding,
         mut guard: InFlightGuard,
         call_core: bool,
+        step: Duration,
     ) -> Result<(), CriError> {
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
         let id = guard.id.clone();
         let record_store = self.record_store.clone();
-        run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
+        // RPC の期限切れ・future の破棄で worker を取り消す（#3142）。結果を受け取れたときだけ disarm する。
+        // `Drop` は atomic の store だけ（RPC スレッドで I/O をしない）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = CancelOnDrop {
+            cancel: Arc::clone(&cancel),
+            armed: true,
+        };
+        let deadline = Instant::now() + step;
+        let outcome = run_bounded(step, move || -> Result<(), CriError> {
             guard.arm_record_store(record_store);
             if call_core {
+                // 起動前に手放されていたら delete を呼ばない（guard の Drop が `in_flight` を外すだけ）。
+                if cancel.load(Ordering::Acquire) {
+                    return Err(CriError::timeout("runtime operation timed out"));
+                }
                 guard.mark_dispatched();
                 match adapter.remove(&id, true) {
                     Ok(_) => {}
@@ -3195,7 +3296,12 @@ impl CriRuntimeService {
                 }
             }
             // 実行層の資源は無い。bundle の解放に失敗したら記録を保持して再試行できるようにする。
-            if let Err(status) = bundles.release(&id) {
+            // 解放は期限と取り消しの旗で打ち切る。打ち切りも解放の失敗と同じ分岐に入る（消した分は残り、
+            // 再試行の release が続きから消す。#3142）。
+            let budget = ReleaseBudget::new()
+                .with_deadline(deadline)
+                .with_cancel(&cancel);
+            if let Err(status) = bundles.release_bounded(&id, &budget) {
                 // 実行層の削除は完了している。状態は exited（終了時刻つき）にして記録と件数枠だけを
                 // 再試行用に保持する（実プロセスが消えたのに running と公開し続けない）。
                 guard.mark_confirmed_exited();
@@ -3209,9 +3315,14 @@ impl CriRuntimeService {
                 guard.mark_definitely_failed();
                 return Err(status);
             }
+            // 解放が済んだ後は、旗が立っていても記録の削除と確定まで進める（小さな I/O で、省くと再試行が 1 回余る）。
             guard.commit()
         })
-        .await?
+        .await;
+        if outcome.is_ok() {
+            cancel_on_drop.disarm();
+        }
+        outcome?
     }
 
     /// 実行層接続時の `StopPodSandbox`（TASK-59.3・CRI-2）。
@@ -3226,6 +3337,7 @@ impl CriRuntimeService {
         &self,
         binding: &RuntimeBinding,
         req: v1::StopPodSandboxRequest,
+        deadline: Option<&OpDeadline>,
     ) -> Result<v1::StopPodSandboxResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
@@ -3299,7 +3411,7 @@ impl CriRuntimeService {
                 }
             };
             if let Err(status) = self
-                .runtime_stop_one(binding, guard, SANDBOX_STOP_GRACE_SECS, signal)
+                .runtime_stop_one(binding, guard, SANDBOX_STOP_GRACE_SECS, signal, deadline)
                 .await
             {
                 first_error.get_or_insert(status);
@@ -3314,10 +3426,15 @@ impl CriRuntimeService {
     /// `delete(force)` と bundle の解放、再採用した `runtime_owned=false` のものは core を呼ばず bundle の解放と
     /// 記録ファイルの削除だけ。R8 #2937）。全件が成功したときだけ sandbox と残りの記録を除去する。1 件でも失敗したら
     /// sandbox と未回収の記録を保持して最初のエラーを返す（成功した分は個別に解放済み）。
+    ///
+    /// 全体は `deadline`（RPC の入口で求めた `runtime_timeout` 1 回分）で頭打ちになる。尽きたら新しい配下を始めず
+    /// `Timeout` で戻り、sandbox は notready のまま残る（#3142・CRI-2・REPAIR-5。設計は
+    /// `docs/design/container-log-removal-wait.md`）。
     async fn remove_sandbox_runtime(
         &self,
         binding: &RuntimeBinding,
         req: v1::RemovePodSandboxRequest,
+        deadline: Option<&OpDeadline>,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
@@ -3363,14 +3480,27 @@ impl CriRuntimeService {
         let mut first_error = None;
         while let Some(guard) = pending.next_guard(InFlightKind::Remove) {
             let call_core = !no_core.contains(&guard.id);
-            if let Err(status) = self.runtime_remove_one(binding, guard, call_core).await {
+            // pod の合計期限が尽きたら新しい段を始めない。未処理の配下は `PendingMarks` の Drop が `in_flight` を外し、
+            // sandbox は notready のまま残る（kubelet の再試行が続きから進める。#3142）。
+            let step = match step_within(deadline, self.runtime_timeout) {
+                Ok(step) => step,
+                Err(status) => {
+                    drop(guard);
+                    first_error.get_or_insert(status);
+                    break;
+                }
+            };
+            if let Err(status) = self
+                .runtime_remove_one(binding, guard, call_core, step)
+                .await
+            {
                 first_error.get_or_insert(status);
             }
         }
         if let Some(status) = first_error {
             return Err(status);
         }
-        self.remove_sandbox(req).await
+        self.remove_sandbox(req, deadline).await
     }
 
     /// `StopContainer` の本体。running を exited へ遷移させる（CRI-1・ERR-3・TASK-58.2）。

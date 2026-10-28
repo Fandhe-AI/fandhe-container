@@ -422,6 +422,67 @@ impl PreparedBundle {
     }
 }
 
+/// bundle 解放に付ける期限と取り消しの旗（#3142・CRI-2・REPAIR-5・OCI-7）。
+///
+/// `RemoveContainer` の worker と `CreateContainer` の巻き戻しが `BundleProvider::release_bounded` へ渡す。
+/// 期限は絶対時刻、旗は RPC の期限切れ・future の破棄で立つ。尽きたら実装は次のエントリの前で止まり
+/// `Timeout` を返す（消した分は残り、再実行が続きから消す）。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct ReleaseBudget<'a> {
+    /// この時刻以降は尽きたとみなす（`None` は期限なし）。
+    pub deadline: Option<std::time::Instant>,
+    /// 立ったら尽きたとみなす（`None` は取り消しなし）。
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl<'a> ReleaseBudget<'a> {
+    /// 期限も取り消しも無い予算（従来の `release` と同じ）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 期限（絶対時刻）を足す。
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// 取り消しの旗を足す。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a std::sync::atomic::AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 尽きていれば固定文言の `Timeout`（ID・パスを含めない。ERR-3）。
+    pub fn check(&self) -> Result<(), CriError> {
+        if self
+            .cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(CriError::timeout("bundle release exceeded its deadline"));
+        }
+        Ok(())
+    }
+
+    /// oci の削除用の予算へ写す（`RootfsSource` の実装が使う）。
+    pub fn to_extract_budget(&self) -> fandhe_container_oci::layer::extract::ExtractBudget<'a> {
+        let mut b = fandhe_container_oci::layer::extract::ExtractBudget::new();
+        if let Some(d) = self.deadline {
+            b = b.with_deadline(d);
+        }
+        if let Some(c) = self.cancel {
+            b = b.with_cancel(c);
+        }
+        b
+    }
+}
+
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
 ///
 /// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
@@ -445,6 +506,18 @@ pub trait BundleProvider: Send + Sync {
     /// 削除・解除に失敗したら `Err` を返す。呼び出し側は `Err` のとき資源が残っているとみなし、
     /// コンテナの記録と件数枠を保持して追跡を失わない（fail-closed）。不在は `Ok` としてよい。
     fn release(&self, container_id: &str) -> Result<(), CriError>;
+
+    /// `release` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5）。尽きたら `Timeout` を返し、残りは再実行が消す。
+    ///
+    /// 既定は予算を無視して `release` を呼ぶ（時間で打ち切れない実装向け。REPAIR-3: 打ち切れる実装だけが上書きする）。
+    fn release_bounded(
+        &self,
+        container_id: &str,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        let _ = budget;
+        self.release(container_id)
+    }
 }
 
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。

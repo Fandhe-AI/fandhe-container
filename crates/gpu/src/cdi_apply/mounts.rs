@@ -24,7 +24,8 @@
 //! エラーの `message` は固定文言で、パスもオプションの値も載せない（A09）。
 //!
 //! 既知の前提と残余（REPAIR-3。本層では解決しない）:
-//! 1. `ro` の bind は書き込み可能な root では core に拒否される（#1917）。NVIDIA の mount は全件 `ro`。
+//! 1. `ro` の bind は書き込み可能な root でも core が受理する（#1917。start が検証した集合と一致するものに限り、
+//!    書き込みの禁止は VFS の読み取り専用属性が担う）。NVIDIA の mount は全件 `ro`。
 //! 2. core の bind 経路は rootless の起動経路が対象。rootful との差は #2241 の範囲。
 //! 3. 元が UNIX ソケット（PoC-14 の `/run/nvidia-persistenced/socket`）は core が種別で拒否する。本層は
 //!    FS に触れないため検出しない。

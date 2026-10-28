@@ -39,11 +39,12 @@
 //! - macOS（#1539 のオーナー判断 2026-10-12・#1863）: system は
 //!   `/usr/local/libexec/fandhe-container/plugins`、user は絶対パスの `XDG_DATA_HOME` があれば
 //!   `<XDG_DATA_HOME>/fandhe-container/plugins`、無ければ絶対パスの `HOME` から
-//!   `<HOME>/Library/Application Support/fandhe-container/plugins`。ただし信頼性検証は非 Linux では
-//!   `Unsupported` で常に拒否されるため（#1865 が担当）、探索先を返しても plugin は登録されない
-//!   （fail-closed）。実機での権限の実態は未確認で、`/usr/local` がグループ書き込み可の環境（古い
-//!   Homebrew 等）では祖先検査の導入後に拒否され得る。確認先は #1628 の環境。spec の PLUG-11 には
-//!   macOS の記述がまだ無い
+//!   `<HOME>/Library/Application Support/fandhe-container/plugins`。信頼性検証は実装済み
+//!   （#1865。所有者・モード・全祖先・symlink 実体・拡張 ACL。`plugin_trust`）。ただし許可済みハッシュ一覧が
+//!   未配線で空のため全件拒否となり（#1868）、探索先を返しても現状は plugin が登録されない（fail-closed）。
+//!   `/usr/local` がグループ書き込み可の環境（古い Homebrew 等）では祖先検査で `GroupOrOtherWritable` により
+//!   拒否される。実機での権限の実態は未確認で、確認先は #1628 の環境。PLUG-11 の macOS の規則は
+//!   2026-10-12 の決定（#1539）で spec に入っている
 //! - Windows（#1415・#1539）: Windows ホストでは plugin の発見も信頼性検証も行わないため空の
 //!   探索先一覧を返す（エラーにしない。PLUG-11）
 //!

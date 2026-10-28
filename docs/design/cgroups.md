@@ -140,7 +140,7 @@ supervisor の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自
 
 - 簡易実装（REPAIR-3）: 結果の 1 行が無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない（`INTERNAL`）。制御チャネル（#2058）の後の課題とする
 - 上記の「systemd cgroup driver 非対応」との関係: CLI は systemd-run を起動して scope を 1 つ作らせるだけで、D-Bus を自分では話さない。scope の中の cgroup 操作はすべて cgroupfs へ直接行う。CORE-4 の言い回しとの整合は spec 側の判断事項として報告する
-- 実機での実行は人間担当で、結果は #2062 に記録する（手順は [rootless-start-cgroup.md](../verification/rootless-start-cgroup.md)。`AGENTS.md`「実機前提テスト」の `start_scope_real`・`supervisor_bin_real`）
+- CI では platform-ci の ubuntu が `start_scope_real` も回す（#3105）。実機の OS・カーネル版での実行は人間担当で、結果は #2062 に記録する（手順は [rootless-start-cgroup.md](../verification/rootless-start-cgroup.md)。`AGENTS.md`「実機前提テスト」の `start_scope_real`・`supervisor_bin_real`）
 
 ## 関連・後続
 

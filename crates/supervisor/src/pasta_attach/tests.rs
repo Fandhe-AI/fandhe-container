@@ -85,6 +85,7 @@ impl PastaAttachBackend for FakeBackend {
                 stop_delay: *self.stop_delay.lock().unwrap(),
             }),
             ready_ms: 7,
+            generation: None,
         })
     }
     fn spawn_pasta(&self, holder_pid: u32, _d: Instant) -> Result<Spawned, TraitError> {
@@ -101,9 +102,10 @@ impl PastaAttachBackend for FakeBackend {
                 stop_delay: *self.stop_delay.lock().unwrap(),
             }),
             ready_ms: 11,
+            generation: Some(1),
         })
     }
-    fn remove_run_dir(&self) -> Result<(), TraitError> {
+    fn remove_run_dir(&self, _g: Option<u64>) -> Result<(), TraitError> {
         push(&self.ev, "remove run_dir");
         Ok(())
     }
@@ -805,6 +807,7 @@ impl RealProcBackend {
         Spawned {
             handle: Box::new(ChildHelper(c)),
             ready_ms: 1,
+            generation: None,
         }
     }
 }
@@ -820,7 +823,7 @@ impl PastaAttachBackend for RealProcBackend {
         }
         Ok(self.child())
     }
-    fn remove_run_dir(&self) -> Result<(), TraitError> {
+    fn remove_run_dir(&self, _g: Option<u64>) -> Result<(), TraitError> {
         let _ = std::fs::remove_dir_all(&self.run_dir);
         Ok(())
     }
@@ -925,4 +928,104 @@ fn net9_real_helper_mid_death_signals_container_and_reaps_the_rest() {
     let pids = b.pids.lock().unwrap().clone();
     assert!(pids.iter().all(|p| gone(*p)));
     assert!(!b.run_dir.exists());
+}
+
+/// CORE-2: 世代が古い後始末は、再作成された新しい置き場所を消さない。最新の世代・無条件(巻き戻し)は消す。
+#[test]
+fn core2_stale_generation_does_not_remove_newer_run_dir() {
+    let gens = RunDirGenerations::default();
+    let (g1, ()) = gens.advance_with(|| ());
+    let (g2, ()) = gens.advance_with(|| ());
+    assert_eq!((g1, g2), (1, 2));
+    let mut removed = 0;
+    let stale: Result<bool, ()> = gens.remove_if_current(Some(g1), || {
+        removed += 1;
+        Ok(())
+    });
+    assert_eq!(stale, Ok(false));
+    assert_eq!(removed, 0);
+    let current: Result<bool, ()> = gens.remove_if_current(Some(g2), || {
+        removed += 1;
+        Ok(())
+    });
+    assert_eq!(current, Ok(true));
+    let rollback: Result<bool, ()> = gens.remove_if_current(None, || {
+        removed += 1;
+        Ok(())
+    });
+    assert_eq!(rollback, Ok(true));
+    assert_eq!(removed, 2);
+}
+
+/// CORE-2: 本物の `@pasta/<id>/` に対しても、旧い世代の削除は新しい置き場所(pid ファイルつき)を残す。
+#[test]
+fn core2_stale_generation_keeps_real_recreated_dir() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("fc-gen-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    let fd = open_state_root(&root).expect("open");
+    let gens = RunDirGenerations::default();
+    let (g1, r1) = gens.advance_with(|| PastaRunDir::prepare(fd.as_fd(), "web1"));
+    drop(r1.expect("prepare 1"));
+    let (_g2, r2) = gens.advance_with(|| PastaRunDir::prepare(fd.as_fd(), "web1"));
+    let run2 = r2.expect("prepare 2");
+    std::fs::write(run2.pid_path(), b"1\n").expect("pid");
+    let skipped = gens.remove_if_current(Some(g1), || remove_pasta_run_dir(fd.as_fd(), "web1"));
+    assert!(matches!(skipped, Ok(false)));
+    assert!(run2.pid_path().exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// NET-9: terminate の失敗は完了扱いにせず、SIGKILL の再試行へ戻る。
+#[test]
+fn net9_failed_final_terminate_is_not_marked_done() {
+    struct FailTerminate(Events);
+    impl LaunchedProcess for FailTerminate {
+        fn pid(&self) -> NonZeroU32 {
+            NonZeroU32::new(77).unwrap()
+        }
+        fn wait(&self, _t: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _t: Duration) -> Result<(), TraitError> {
+            push(&self.0, "container terminate");
+            Err(TraitError::new(ErrorCode::Internal, "terminate failed"))
+        }
+        fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
+            if signal == Signal::SIGKILL {
+                push(&self.0, "container signal 9 failed");
+                Err(TraitError::new(ErrorCode::Internal, "kill failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let attachment = lock(&w.slot).take().expect("attachment");
+    let mut g = PastaGuardedProcess::new(
+        Box::new(FailTerminate(Arc::clone(&ev))),
+        attachment,
+        w.logger.clone(),
+    );
+    g.term_grace = Duration::ZERO;
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    for _ in 0..12 {
+        g.wait(Duration::ZERO).expect("wait");
+    }
+    let e = events(&ev);
+    let terminates = e.iter().filter(|x| *x == "container terminate").count();
+    assert!(terminates >= 2, "terminate must be retried: {e:?}");
+    assert!(!lock(&g.signals).killed);
 }

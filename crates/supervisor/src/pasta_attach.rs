@@ -324,6 +324,9 @@ pub struct Spawned {
     pub handle: Box<dyn HelperHandle>,
     /// 準備完了までの時間（ミリ秒）。
     pub ready_ms: u64,
+    /// pasta の `@pasta/<id>/` の世代(pasta の起動だけが `Some`。後始末の削除が、再作成後の新しい置き場所を
+    /// 消さないための照合に使う。CORE-2)。
+    pub generation: Option<u64>,
 }
 
 /// holder と pasta を実際に起動する層（本番は [`ProductionBackend`]、試験はフェイク）。
@@ -339,8 +342,9 @@ pub trait PastaAttachBackend: Send + Sync {
     /// holder の pid を対象に pasta を起動し、準備完了を `deadline` までに待つ。
     fn spawn_pasta(&self, holder_pid: u32, deadline: Instant) -> Result<Spawned, TraitError>;
 
-    /// `@pasta/<id>/` を消す（無ければ成功）。
-    fn remove_run_dir(&self) -> Result<(), TraitError>;
+    /// `@pasta/<id>/` を消す（無ければ成功）。`generation` が `Some` のときは、その世代が最新のときだけ消す
+    /// (再作成された新しい置き場所を旧い後始末が消さない。`None` は起動の巻き戻しで、無条件に消す)。
+    fn remove_run_dir(&self, generation: Option<u64>) -> Result<(), TraitError>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -390,11 +394,48 @@ pub fn remove_pasta_leftovers(state_root: &Path, id: &ContainerId) -> Result<(),
 pub struct ProductionBackend {
     config: PastaAttachConfig,
     logger: Logger,
+    run_dirs: RunDirGenerations,
 }
 
 impl ProductionBackend {
     fn new(config: PastaAttachConfig, logger: Logger) -> Self {
-        Self { config, logger }
+        Self {
+            config,
+            logger,
+            run_dirs: RunDirGenerations::default(),
+        }
+    }
+}
+
+/// `@pasta/<id>/` の世代と、作成・削除を直列化するロック(CORE-2)。
+///
+/// 期限内に終わらなかった旧い teardown が、同じコンテナ ID で再作成された新しい置き場所を開き直して消さないよう、
+/// 作成(世代の更新)と削除(世代の照合)を同じロックの下で行う。
+#[derive(Debug, Default)]
+struct RunDirGenerations {
+    current: Mutex<u64>,
+}
+
+impl RunDirGenerations {
+    /// ロックの下で世代を進め、`create` を実行する。新しい世代を返す。
+    fn advance_with<T>(&self, create: impl FnOnce() -> T) -> (u64, T) {
+        let mut g = lock(&self.current);
+        *g += 1;
+        let generation = *g;
+        (generation, create())
+    }
+
+    /// ロックの下で `remove` を実行する。`generation` が最新でなければ何もしない(`Ok(false)`)。
+    fn remove_if_current<E>(
+        &self,
+        generation: Option<u64>,
+        remove: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let g = lock(&self.current);
+        if generation.is_some_and(|want| want != *g) {
+            return Ok(false);
+        }
+        remove().map(|()| true)
     }
 }
 
@@ -433,6 +474,7 @@ impl PastaAttachBackend for ProductionBackend {
                         exited: None,
                     }),
                     ready_ms: millis(started.elapsed()),
+                    generation: None,
                 })
             }
             Err(e) => {
@@ -462,11 +504,13 @@ impl PastaAttachBackend for ProductionBackend {
             ));
         }
         check_ready_timeout(timeout).map_err(|e| net_to_trait(&e))?;
-        let run_dir = PastaRunDir::prepare(
-            self.config.state_root.as_fd(),
-            self.config.container.as_str(),
-        )
-        .map_err(|e| net_to_trait(&e))?;
+        let (generation, run_dir) = self.run_dirs.advance_with(|| {
+            PastaRunDir::prepare(
+                self.config.state_root.as_fd(),
+                self.config.container.as_str(),
+            )
+        });
+        let run_dir = run_dir.map_err(|e| net_to_trait(&e))?;
         let target = PastaTarget::from_pid(holder_pid).map_err(|e| net_to_trait(&e))?;
         match spawn_pasta(
             &self.config.binary,
@@ -483,6 +527,7 @@ impl PastaAttachBackend for ProductionBackend {
                         pid,
                     }),
                     ready_ms: millis(ready.elapsed()),
+                    generation: Some(generation),
                 })
             }
             Err(mut e) => {
@@ -503,12 +548,23 @@ impl PastaAttachBackend for ProductionBackend {
         }
     }
 
-    fn remove_run_dir(&self) -> Result<(), TraitError> {
-        remove_pasta_run_dir(
-            self.config.state_root.as_fd(),
-            self.config.container.as_str(),
-        )
-        .map_err(|e| net_to_trait(&e))
+    fn remove_run_dir(&self, generation: Option<u64>) -> Result<(), TraitError> {
+        let removed = self.run_dirs.remove_if_current(generation, || {
+            remove_pasta_run_dir(
+                self.config.state_root.as_fd(),
+                self.config.container.as_str(),
+            )
+        });
+        match removed {
+            Ok(true) => {}
+            Ok(false) => self.logger.log(
+                false,
+                "pasta_run_dir_remove_skipped",
+                &[("reason", Val::S("newer_generation"))],
+            ),
+            Err(e) => return Err(net_to_trait(&e)),
+        }
+        Ok(())
     }
 }
 
@@ -647,6 +703,8 @@ impl HelperHandle for PastaAdapter {
 struct Attachment {
     holder: Box<dyn HelperHandle>,
     pasta: Box<dyn HelperHandle>,
+    /// pasta の置き場所の世代(削除の照合用)。
+    generation: Option<u64>,
     backend: Arc<dyn PastaAttachBackend>,
     logger: Logger,
 }
@@ -669,7 +727,7 @@ impl Attachment {
         self.log_exit("pasta_exit", reason, &rep, deferred);
         let rep = self.holder.stop(detach_ok);
         self.log_exit("netns_holder_exit", reason, &rep, deferred);
-        if let Err(e) = self.backend.remove_run_dir() {
+        if let Err(e) = self.backend.remove_run_dir(self.generation) {
             self.logger.log(
                 deferred,
                 "pasta_run_dir_remove_failed",
@@ -808,7 +866,7 @@ impl PastaAttachHook {
             Ok(p) => p,
             Err(e) => {
                 // 逆順の巻き戻し: pasta は自分で片付けて戻る。run dir を消してから holder を止める。
-                if let Err(re) = self.backend.remove_run_dir() {
+                if let Err(re) = self.backend.remove_run_dir(None) {
                     self.logger.log(
                         true,
                         "pasta_run_dir_remove_failed",
@@ -841,6 +899,7 @@ impl PastaAttachHook {
         *lock(&self.slot) = Some(Attachment {
             holder: holder.handle,
             pasta: pasta.handle,
+            generation: pasta.generation,
             backend: Arc::clone(&self.backend),
             logger: self.logger.clone(),
         });
@@ -1050,9 +1109,16 @@ impl PastaGuardedProcess {
                 }
             }
             Err(_) => {
+                // スレッドを作れない。ここで止めると pasta と holder の停止の猶予で期限を超えうるため実行しない。
+                // 所有権を戻し、後続の `wait` / `terminate` の再試行と drop(最終手段の同期停止)に任せる。
                 let taken = lock(&cell).take();
                 if let Some(a) = taken {
-                    a.teardown(reason, true, false);
+                    self.logger.log(
+                        false,
+                        "pasta_teardown_deferred",
+                        &[("reason", Val::S(reason))],
+                    );
+                    *lock(&self.attachment) = Some(a);
                 }
             }
         }
@@ -1118,10 +1184,19 @@ impl PastaGuardedProcess {
                         ],
                     );
                     if st.kill_failures >= MAX_SIGNAL_FAILURES {
-                        // 最終手段: 内側の terminate（自身の期限つき）で回収に進める。以後は繰り返さない。
-                        st.killed = true;
-                        drop(st);
-                        let _ = self.inner.terminate(SIGNAL_DEADLINE);
+                        // 最終手段: 内側の terminate（自身の期限つき）で回収に進める。成功を確認できたときだけ
+                        // 完了扱いにし、失敗なら次の周期から SIGKILL の再試行に戻る(生存したまま監視だけ続けない。NET-9)。
+                        match self.inner.terminate(SIGNAL_DEADLINE) {
+                            Ok(()) => st.killed = true,
+                            Err(e) => {
+                                st.kill_failures = 0;
+                                self.logger.log(
+                                    false,
+                                    "pasta_terminate_failed",
+                                    &[("code", Val::S(e.code().as_str()))],
+                                );
+                            }
+                        }
                     }
                 }
             }

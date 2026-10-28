@@ -21,7 +21,7 @@ TASK-70 準備（#1880・MAC-3・MS-5）。macOS で小ファイルを多数扱�
 | 内容 | `x\n`（2 バイト） | 下記「spec の食い違い」を参照 |
 | 操作の列 | `mkdir` → N 個の作成（busybox ash の組み込み `echo x > f_$i`。fork を排除） → `ls \| wc -l` で件数確認 → `rm -rf` | 件数が N と違えば試行は失敗 |
 | 試行数 | 5（`--trials` は 5〜20） | 有効な試行が 5 回未満なら失敗 |
-| 壁時計時間 | `docker run --rm` 全体（method `docker-run-rm-total`） | 中央値。各試行の生の値を `samples` に残す |
+| 壁時計時間 | `docker run --rm` 全体（method `docker-run-rm-total`。時刻源は下記「時刻源」） | 中央値。各試行の生の値を `samples` に残す |
 | メタデータ p95 | **暫定**（method `batch-boundary-provisional`） | 下記「オーナー確認待ち」 |
 | マウント | bind mount（`-v <host-dir>:/data`）のみ | VM 越境を測るため。最初に書き戻りを確認する（PoC-11 の `verify_bind` 相当） |
 
@@ -50,6 +50,37 @@ PoC-11 の本文は「4KB ファイル 2000 個」と書くが、実測したス
 - #1906: TASK-191.h1。macOS 既定方式（常駐 VM 共用）の設計の承認。MAC-3 は既定方式の共有ルート配下の bind mount の上で測る想定
   （`macos-shared-vm.md` の項目 5）。共有ルートの構成は #1906 の承認後に本書の手順へ足す（承認前は確定扱いにしない）
 
+## 時刻源（壁時計。#3104・MAC-3・REPAIR-5）
+
+決定: 各試行の壁時計は、perl の `Time::HiRes` を使う 1 プロセスのラッパーで測る。bash の版に関係なく時刻源は 1 経路で、
+bash 5 の `EPOCHREALTIME` は使わない。前提ツールは bash 3.2 以上（macOS 標準の `/bin/bash` で動く）・perl（`Time::HiRes`）・jq。
+
+- ラッパーは 1 回の perl 起動の中で、時刻ファイルを開く → t0（`gettimeofday` のマイクロ秒）→ `fork` → `exec`（シェルを介さない）
+  → `waitpid` → t1 → `<t0_us> <t1_us>` を書く、の順に動く。perl の起動は t0 の前、終了処理は t1 の後に起きるため、
+  起動・終了の遅れは区間に入らない。区間は docker CLI の fork から終了までで、従来の `EPOCHREALTIME` の区間と同等かそれより狭い
+- 時刻の意味は従来と同じ壁時計（`gettimeofday`）のため、`metrics.wall_clock_median_ms.method` は `docker-run-rm-total` のまま、
+  schema `fandhe-container.mac-small-files/v1` も変えない
+- 時刻ファイルは非信頼の入力として読む。正規ファイル（symlink 不可）・64 バイトまで・数字 2 つちょうど・各 18 桁以内・t1 が t0 以上。
+  不正なら試行を失敗に数え、有効な試行が 5 回未満なら全体を失敗にする（fail-closed）
+- 期限（REPAIR-5）: ラッパーと docker CLI は `run_limited` の同じプロセスグループに入り、期限切れでは両方に TERM から KILL が届く。
+  時刻源の確認（`perl -MTime::HiRes -e 1`）も `run_limited` で包み、docker を呼ぶ前に終了コード 3（`code=missing-tool`）で止まる
+  （Debian 系では `Time::HiRes` が perl-base に無いことがあるため、perl の存在でなく実際の読み込みで確かめる）
+
+不採用の案:
+
+- python3: macOS 12.3 以降の `/usr/bin/python3` は Command Line Tools の導入を促す shim で、標準で使えるとは限らない
+- BSD `date`: `%N`（ナノ秒）に対応していない
+- bash 5 を必須のまま導入手順を書く案: 実測者の環境（Homebrew 等）を変える必要があり、本件の目的に反する
+
+一次情報と観測:
+
+- Apple の macOS Catalina 10.15 Release Notes は、Python・Ruby・Perl などのスクリプト言語ランタイムを互換のために同梱し、
+  将来は既定で含めないとしている。macOS Monterey 12.3 Release Notes は Python 2.7 の削除を記載している。
+  perl の同梱が将来も続くかは Apple の保証の範囲外で、外れた場合は本節の決定を見直す（その場合は終了コード 3 で止まり、誤った値は出さない）
+- `Time::HiRes` は perl の core module（perldoc Time::HiRes）
+- 観測値: Linux のローカルでは perl v5.40.1・Time::HiRes 1.9777。macOS の `/usr/bin/perl` の版は未観測
+  （`make mac-small-files-selftest` の冒頭の `perl=... hires=...` 行を platform-ci の macOS のログで確認し、ここへ反映する）
+
 ## 計測衛生
 
 - 他のランタイムの VM（Docker Desktop 以外・Colima 等）は計測中に停止する（PoC-11）
@@ -60,4 +91,5 @@ PoC-11 の本文は「4KB ファイル 2000 個」と書くが、実測したス
 ## 実行
 
 実行コマンド・出力の読み方は `AGENTS.md`「実機前提テスト」の MAC-3 の行を参照。自己テストは `make mac-small-files-selftest`
-（スタブの docker のみ。CI の `bench-regression` の並列グループ）。
+（スタブの docker のみ。CI の `bench-regression` の並列グループ。platform-ci の macOS〔main への push と workflow_dispatch〕では
+`/bin/bash` 3.2 でも回す）。

@@ -96,8 +96,9 @@
 //! `<状態ルート>/.cri/records/` に 1 件 1 ファイルで置く層が `record_store` サブモジュール
 //! （トレイト [`RecordStore`] とファイル実装 `FileRecordStore`〔unix のみ〕）。
 //! sandbox 記録の書く・消す時点は [`CriRuntimeService::with_record_store`] で注入すると有効になる（R4 #2933）。
+//! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。
 //! コンテナ記録の書く・消す時点は、実行層接続時（`with_runtime` も注入）の経路に限って有効になる（R5 #2934）。
-//! 起動時の再採用（R6・R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
+//! コンテナの再採用と照合（R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
 //!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
@@ -106,6 +107,7 @@
 
 mod config_limits;
 mod container;
+mod readopt;
 mod record;
 mod record_store;
 mod runtime_config;
@@ -144,6 +146,7 @@ use container::{
 use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
 
+pub use readopt::{BrokenRecordCounts, SandboxReadoption};
 #[cfg(unix)]
 pub use record_store::FileRecordStore;
 pub use record_store::{
@@ -1634,6 +1637,8 @@ impl CriRuntimeService {
     /// 遅れて書けた worker が自分で記録を消す（別 worker の削除と競合させない）。副作用の前に future が破棄
     /// されたときも、予約（件数・保持量）は put の worker が終わって記録を消すまで保たれる。
     ///
+    /// 起動時の sandbox の再採用は [`Self::readopt_sandboxes`]（R6 #2935。実装済み）。
+    ///
     /// コンテナ記録（R5 #2934）は、実行層接続時（`with_runtime` も注入）の経路だけが書く。スタブ経路
     /// （`with_runtime` 未注入）は core に所有者の無い記録で、起動時の照合の対象にならないため書かない。
     /// - `CreateContainer`: 実行層を呼ぶ前に `in_flight=create` で書き（write-ahead）、成功したら確定版へ置き換える。
@@ -1643,7 +1648,7 @@ impl CriRuntimeService {
     ///   書けなければメモリを確定したまま `INTERNAL`（次回起動時は core の状態で照合される）
     /// - `RemoveContainer`・`RemovePodSandbox` の配下: `delete` と bundle の解放の成功後に記録を消す
     ///
-    /// 未実装（REPAIR-3）: 起動時の読み込みと再採用は R6 #2935・R7 #2936、本番の配線は R9 #2938。
+    /// 未実装（REPAIR-3）: コンテナの再採用と照合は R7 #2936、本番の配線は R9 #2938。
     pub fn with_record_store(mut self, store: Arc<dyn RecordStore>) -> Self {
         self.record_store = Some(store);
         self
@@ -2085,6 +2090,29 @@ impl CriRuntimeService {
         self.tear_down_bounded(provider, sandbox_id, guard).await
     }
 
+    /// provider 未注入のまま、回収待ち（`network_owned=true`）の記録を Stop・Remove させない（CRI-2 の fail-closed）。
+    ///
+    /// 再採用した記録は provider 無しでも登録できるが、回収できないまま記録を消すと残存資源の追跡情報が
+    /// 失われる。固定文言の `FAILED_PRECONDITION` を返し、永続記録を保持する。
+    fn ensure_owned_network_reclaimable(&self, id: &str) -> Result<(), CriError> {
+        if self.pod_network.is_some() || id.is_empty() {
+            return Ok(());
+        }
+        let owned = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
+            .records
+            .get(id)
+            .is_some_and(|r| r.network_owned);
+        if owned {
+            return Err(CriError::failed_precondition(
+                "sandbox network cannot be reclaimed without a pod network provider",
+            ));
+        }
+        Ok(())
+    }
+
     /// `StopPodSandbox` 本体（実行層の有無で分岐）に、pod network の回収を足したもの。
     ///
     /// 配下の停止が成功したときだけネットワークを回収する（失敗時は配下が生きているため触れない）。
@@ -2093,6 +2121,7 @@ impl CriRuntimeService {
         req: v1::StopPodSandboxRequest,
     ) -> Result<v1::StopPodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
+        self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
             self.ensure_network_not_pending(&req.pod_sandbox_id)?;
         }
@@ -2122,6 +2151,7 @@ impl CriRuntimeService {
         req: v1::RemovePodSandboxRequest,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
+        self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
             self.ensure_network_not_pending(&req.pod_sandbox_id)?;
             let owned = self

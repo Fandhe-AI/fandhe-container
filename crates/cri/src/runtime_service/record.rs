@@ -4,7 +4,7 @@
 //! CRI 層の項目（config・状態・時刻・`resolved_image`・`applied_user`・`stop_signal` 等）が失われる。
 //! 設計 `docs/design/cri-record-readoption.md`（#2902）の実装単位 R1 として、記録 1 件分のバイト列を作る
 //! 符号化と、壊れた入力・改ざんされた入力を untrusted として拒否する復号を提供する。ファイルの置き場・排他・
-//! fsync（R2 #2932）、registry との変換と書く / 消す時点（R4 #2933・R5 #2934）、起動時の再採用（R6 #2935・
+//! fsync（R2 #2932）、registry との変換と書く / 消す時点（R4 #2933・R5 #2934）、起動時の再採用（R6 #2935 は実装済みで `readopt` が呼ぶ・
 //! R7 #2936）は範囲外で、本モジュールは純粋な関数だけを持つ（ファイル I/O なし）。
 //!
 //! # 形式 v1
@@ -117,8 +117,6 @@ pub(super) struct ContainerRecordData {
 }
 
 /// 復号した sandbox 記録と、数え直した config の保持量見積もり。
-// R6 #2935（起動時の再採用）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct DecodedSandbox {
     pub(super) data: SandboxRecordData,
@@ -402,8 +400,6 @@ impl SandboxRecordData {
 
     /// 記録のバイト列を厳密に復号する。`expect_id` は記録のファイル名由来の ID。
     /// どの違反も固定文言の `INVALID_ARGUMENT` で、入力値を含めない。
-    // R6 #2935（起動時の再採用）が呼ぶまでは試験からしか呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-    #[allow(dead_code)]
     pub(super) fn decode(bytes: &[u8], expect_id: &str) -> Result<DecodedSandbox, CriError> {
         let malformed = || CriError::invalid_argument(SANDBOX_MALFORMED);
         if bytes.len() > MAX_SANDBOX_RECORD_BYTES {

@@ -48,7 +48,9 @@
 //! # 実機前提テストとしての分離
 //! 上記の環境は既定のテスト集合では保証できないため、`-- --ignored` 指定時のみ実行する（`platform-ci` の ubuntu が実行し
 //! 成功行を照合する。ci.md「実機前提テスト」）。前提が欠けた場合は 1 行目が
-//! `exec_subordinate_e2e: PRECONDITION FAILED (test environment: <理由>)` の失敗にし、検証せずに成功する分岐は持たない。
+//! `exec_subordinate_e2e: PRECONDITION FAILED (test environment, not a <cgroup delegation|subordinate id mapping|landlock> regression): ...`
+//! の失敗にし、検証せずに成功する分岐は持たない。分類は core の `tests/support/precondition.rs`（正本。#3144・REPAIR-12）。
+//! setuid ビットと subuid / subgid の件数の閾値（uid 1000 件以上・gid 3000 件以上）は正本に無い試験固有の条件として残す。
 //!
 //! ```text
 //! cargo test -p fandhe-container-supervisor --test exec_subordinate_e2e --no-run
@@ -92,8 +94,10 @@ fn main() {
     } else if let Some(pos) = args.iter().position(|a| a == "--exec-probe") {
         linux::exec_probe(args.get(pos + 1).map(String::as_str));
     } else if args.iter().any(|a| a == "--ignored") {
+        precondition::self_check();
         linux::run();
     } else {
+        precondition::self_check();
         println!(
             "exec_subordinate_e2e: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
         );
@@ -120,6 +124,18 @@ mod rootfs;
 #[path = "../../core/tests/support/scratch_root.rs"]
 mod scratch_root;
 
+/// 前提欠如（委譲 cgroup・範囲写像・Landlock）を `PRECONDITION FAILED` の 1 行目で報告する共有部品
+/// （core の `tests/support/precondition.rs` の正本を取り込む。#3144・REPAIR-12）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "../../core/tests/support/precondition.rs"]
+mod precondition;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -134,11 +150,10 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
-    use fandhe_container_core::cgroups::{CgroupLimitPlan, DelegatedCgroup};
+    use fandhe_container_core::cgroups::CgroupLimitPlan;
     use fandhe_container_core::exec::{
         ChildExit, ExecExit, IsolationPrivilege, SupplementaryGroups,
     };
-    use fandhe_container_core::landlock::detect_landlock_abi;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
         ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource, create, start,
@@ -343,16 +358,6 @@ mod linux {
         out
     }
 
-    /// 前提欠如の失敗（1 行目で前提欠如と回帰を判別する。#2788）。`reason` はホストのパス・subuid の生の値を含めない。
-    fn precondition_failed(reason: &str) -> ! {
-        panic!(
-            "exec_subordinate_e2e: PRECONDITION FAILED (test environment: {reason}).\n\
-             Run it on the host: cargo test -p fandhe-container-supervisor --test exec_subordinate_e2e --no-run, then \
-             FANDHE_CONTAINER_TEST_ID_HELPER=1 USER=$(id -un) systemd-run --user --scope -p Delegate=yes <binary> --ignored. \
-             See AGENTS.md exec_subordinate_e2e."
-        );
-    }
-
     /// 範囲の合計件数（uid・gid とも同じ読み方）。
     fn range_total(path: &str, owner: &SubIdOwner) -> u64 {
         match load_subordinate_ids(Path::new(path), owner) {
@@ -404,7 +409,10 @@ mod linux {
             std::process::exit(1);
         }
         if std::env::var("USER").map_or(true, |u| u.is_empty()) {
-            precondition_failed("USER is not set");
+            crate::precondition::failed(
+                crate::precondition::Kind::SubordinateIds,
+                "USER is not set",
+            );
         }
         let (euid, _) = own_ids();
         if euid == 0 {
@@ -419,24 +427,25 @@ mod linux {
         for helper in ["/usr/bin/newuidmap", "/usr/bin/newgidmap"] {
             match std::fs::metadata(helper) {
                 Ok(m) if m.mode() & 0o4000 != 0 => {}
-                _ => precondition_failed("newuidmap / newgidmap is missing or not setuid"),
+                _ => crate::precondition::failed(
+                    crate::precondition::Kind::SubordinateIds,
+                    "newuidmap / newgidmap is missing or not setuid",
+                ),
             }
         }
+        // 分類は正本（解析失敗は回帰側に残す）。setuid と件数の閾値は試験固有の条件として下に残す。
+        crate::precondition::require_subordinate_ids(euid);
         let owner = SubIdOwner::new(euid, std::env::var("USER").ok()).expect("owner");
         let uid_total = range_total("/etc/subuid", &owner);
         let gid_total = range_total("/etc/subgid", &owner);
         if uid_total < NEED_UIDS || gid_total < NEED_GIDS {
-            precondition_failed("/etc/subuid or /etc/subgid has too few ids for the current user");
+            crate::precondition::failed(
+                crate::precondition::Kind::SubordinateIds,
+                "/etc/subuid or /etc/subgid has too few ids for the current user",
+            );
         }
-        if detect_landlock_abi().is_err() {
-            precondition_failed("Landlock is not available (ABI 6 or newer is required)");
-        }
-        let delegated = match DelegatedCgroup::detect() {
-            Ok(d) => d,
-            Err(_) => precondition_failed(
-                "no delegated cgroup v2 (use systemd-run --user --scope -p Delegate=yes)",
-            ),
-        };
+        let _landlock = crate::precondition::landlock_support();
+        let delegated = crate::precondition::delegated_cgroup();
 
         // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
         let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;

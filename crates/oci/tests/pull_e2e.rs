@@ -42,9 +42,11 @@
 //! - registry-1.docker.io への外向き HTTPS（匿名 pull。Docker Hub のレート制限で失敗しうる）
 //! - exec 可能で十分な空きのある作業ディレクトリ
 //!
-//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。委譲 cgroup の欠如と、opt-in 時の
-//! 範囲写像の前提欠如（`uidmap`・subuid / subgid）は、1 行目が
-//! `pull_e2e: PRECONDITION FAILED (test environment, not a cgroup delegation regression): ...` になる（分類は core の
+//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。Landlock ABI 6 以上の欠如・委譲 cgroup の欠如と、
+//! opt-in 時の範囲写像の前提欠如（`uidmap`・subuid / subgid）は、1 行目が
+//! `pull_e2e: PRECONDITION FAILED (test environment, not a <landlock|cgroup delegation|...> regression): ...` になる
+//! （Landlock は事前検出が無かったころ、全イメージの pull・展開の後に run 段の `FAILED_PRECONDITION` で落ちていた。
+//! 今は通信の前に失敗する。#3144）（分類は core の
 //! `tests/support/precondition.rs`。#3028・REPAIR-12）。非 root の要求（root での実行の拒否）は従来どおり
 //! `pull_e2e: FAILED setup: ...` のままで、前提欠如の新種別にするかはオーナー判断待ち。GitHub ホステッド runner では
 //! 保証できないため CI には組み込まない（ci.md「実機前提テスト」）。
@@ -100,7 +102,7 @@ fn main() {
     linux::main();
 }
 
-/// 前提欠如（委譲 cgroup・opt-in 時の範囲写像）を `PRECONDITION FAILED` の 1 行目で報告する共有部品
+/// 前提欠如（Landlock・委譲 cgroup・opt-in 時の範囲写像）を `PRECONDITION FAILED` の 1 行目で報告する共有部品
 /// （core の `tests/support/precondition.rs` の正本を取り込む。`#[path]` は `mod linux` の外に置く。#3028）。
 #[cfg(all(
     target_os = "linux",
@@ -1133,6 +1135,10 @@ mod linux {
                 "pull_e2e: FAILED setup: refusing to run as root (SEC-5); run as a regular user"
             );
             return 1;
+        }
+        // Landlock が無いとどのイメージも run 段で落ちるため、通信・展開の前に分類する（#3144）。
+        if let Err(f) = crate::precondition::try_landlock_support() {
+            return report_setup_failure(f);
         }
         let delegated = match crate::precondition::try_delegated_cgroup() {
             Ok(d) => d,

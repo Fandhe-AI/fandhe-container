@@ -80,7 +80,7 @@ fandhe-container/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   ├── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ・#2313）
-│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・CORE-2・CORE-5・REPAIR-12）
+│   │   │   └── production-launcher-tmpfiles-flock.md  # production_launcher の create が間欠的に「start is in progress in another process」で失敗した原因（systemd-tmpfiles の aging 走査の flock との競合）と対策の記録。他の実機前提試験への展開と共通補助 `crates/core/tests/support/scratch_root.rs`、既定のテスト集合への展開〔試験ごとの `ScratchDir`〕（#2840・#2887・#2958・#3026・#3141・CORE-2・CORE-5・REPAIR-12）
 │   │   ├── io-power-loss-verification.md  # 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証方式の比較と推奨（dm-flakey。#1965・オーナー承認待ち）。実機前提試験 crates/io/tests/power_loss.rs
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── macos-vm-cold-start-bench.md  # 実 VM の cold start 計測ハーネスの計測区間・分解能・出力（crates/platform-macos/tests/vm_cold_start.rs。実機前提・合否は出さない。TASK-70 準備・#1879・MAC-2。区間はオーナー確認待ち）

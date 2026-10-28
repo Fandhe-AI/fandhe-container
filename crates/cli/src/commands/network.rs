@@ -28,10 +28,14 @@
 //! - rootful（bridge）の `create` は subnet の pool 予約（D13）が決まるまで `UNIMPLEMENTED`。
 //! - メンバー記録（#3067）が入るまで `rm` が拒否するのは、`definition` と `@lock` 以外の項目がある場合（net の `remove` の契約）。
 //! - `create --network <名前>` での定義の存在照合は #1873 の範囲で、ここでは触れない。
-//! - net の `NetOpRecorder` の CLI の `OpRecorder` への結線（REPAIR-4）は未配線。
+//! - 計測（REPAIR-4）: `net_recorder::CliNetRecorder` で定義ストアの操作を `network.store.*`、コマンド全体を `network_create` /
+//!   `network_rm` / `network_ls` の名前で記録し、`FANDHE_CONTAINER_OP_LOG` へ出す。
 
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Instant;
 
+use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::traits::{ErrorCode, StateStore, TraitError};
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::NetworkName;
@@ -42,8 +46,9 @@ use fandhe_container_net::network_store::{
 use super::CliExit;
 use super::args::{GlobalArgs, NetworkArgs};
 use super::create_network::{PublishPrivilege, resolve_publish_privilege};
-use super::create_start::open_store;
-use super::list_logs::store_open_failure;
+use super::create_start::{OP_LOG_ENV, export_ops, open_store};
+use super::list_logs::{record_op, store_open_failure};
+use super::net_recorder::CliNetRecorder;
 use crate::error::CliError;
 
 /// `ls` の固定ヘッダ行（LF 終端）。
@@ -88,6 +93,32 @@ pub(super) fn run_network_with(
     stdout: &mut dyn Write,
     resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
 ) -> CliExit {
+    let started = Instant::now();
+    let recorder = Arc::new(OpRecorder::new());
+    let exit = run_network_recorded(global, args, stdout, resolve_privilege, &recorder);
+    let op_name = match args {
+        NetworkArgs::Create(_) => "network_create",
+        NetworkArgs::Rm(_) => "network_rm",
+        NetworkArgs::Ls => "network_ls",
+    };
+    record_op(
+        &recorder,
+        op_name,
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
+}
+
+/// 記録器を外から渡せる本体（`network.store.*` がその記録器へ入る。試験で内容を固定するための入口）。
+fn run_network_recorded(
+    global: &GlobalArgs,
+    args: &NetworkArgs,
+    stdout: &mut dyn Write,
+    resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
+    recorder: &Arc<OpRecorder>,
+) -> CliExit {
     match args {
         NetworkArgs::Create(name) => {
             let name = match validate_name(name) {
@@ -107,7 +138,7 @@ pub(super) fn run_network_with(
                 Ok(d) => d,
                 Err(e) => return net_failure(e.code(), Op::Create),
             };
-            let store = match open_net_store(global, Op::Create) {
+            let store = match open_net_store(global, Op::Create, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -124,7 +155,7 @@ pub(super) fn run_network_with(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let store = match open_net_store(global, Op::Rm) {
+            let store = match open_net_store(global, Op::Rm, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -137,7 +168,7 @@ pub(super) fn run_network_with(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let store = match open_net_store(global, Op::Ls) {
+            let store = match open_net_store(global, Op::Ls, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -196,12 +227,17 @@ fn corrupted(code: ErrorCode) -> CliExit {
 }
 
 /// 状態ルートを開き、その配下の定義ストアを開く。
-fn open_net_store(global: &GlobalArgs, op: Op) -> Result<NetworkStore, CliExit> {
+fn open_net_store(
+    global: &GlobalArgs,
+    op: Op,
+    recorder: &Arc<OpRecorder>,
+) -> Result<NetworkStore, CliExit> {
     let state = open_store(global).map_err(|e| store_open_failure(&e))?;
     let root = state
         .host_state_root()
         .ok_or_else(|| CliExit::failed(ErrorCode::Internal))?;
-    NetworkStore::open(root).map_err(|e| net_failure(e.code(), op))
+    NetworkStore::open_with_recorder(root, Arc::new(CliNetRecorder::new(Arc::clone(recorder))))
+        .map_err(|e| net_failure(e.code(), op))
 }
 
 /// net の分類を core の `ErrorCode` へ写す（`DataLoss`・未知は `Internal`）。
@@ -467,6 +503,32 @@ mod tests {
                 ok(&g, NetworkArgs::Ls),
                 "NAME\tMODE\tSUBNET\nn1\tpasta\t-\n"
             );
+        }
+
+        /// REPAIR-4・NET-6: 成功と失敗の両方で `network.store.*` が記録器へ入る（具体値）。
+        #[test]
+        fn repair4_net6_network_ops_are_recorded_on_success_and_failure() {
+            let base = Base::new();
+            let g = base.global();
+            let rec = Arc::new(OpRecorder::new());
+            let mut out = Vec::new();
+            let mut go =
+                |a: NetworkArgs| run_network_recorded(&g, &a, &mut out, rootless, &rec).exit_code();
+            assert_eq!(go(NetworkArgs::Create("n1".into())), 0);
+            assert_eq!(go(NetworkArgs::Create("n1".into())), 4);
+            assert_eq!(go(NetworkArgs::Ls), 0);
+            assert_eq!(go(NetworkArgs::Rm("n1".into())), 0);
+            assert_eq!(go(NetworkArgs::Rm("n1".into())), 3);
+            let snap = rec.snapshot();
+            let count = |name: &str| {
+                snap.iter()
+                    .find(|s| s.name().as_str() == name)
+                    .map(|s| (s.success(), s.failure()))
+            };
+            assert_eq!(count("network.store.open"), Some((5, 0)));
+            assert_eq!(count("network.store.create"), Some((1, 1)));
+            assert_eq!(count("network.store.list"), Some((1, 0)));
+            assert_eq!(count("network.store.remove"), Some((1, 1)));
         }
 
         /// NET-6・D2: 名前の違反は状態ルートを作る前に拒否する。

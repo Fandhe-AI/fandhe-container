@@ -64,6 +64,7 @@ mod image;
 mod image_refs;
 mod kill_signal;
 mod list_logs;
+mod net_recorder;
 mod network;
 mod oci_recorder;
 mod ref_reconcile;

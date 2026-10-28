@@ -37,6 +37,7 @@ use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
 use crate::netlink_route::IpPrefix;
+use crate::network_store::MAX_MEMBERS_PER_NETWORK;
 use crate::network_store::realized::check_gateway;
 use crate::network_store::{
     InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkLockGuard,
@@ -164,6 +165,13 @@ where
         return Err(RecordedError::Store(NetError::new(
             NetErrorCode::AlreadyExists,
             "member already exists",
+        )));
+    }
+    // 上限はカーネル操作の前に検査する（超過で確定記録だけ書けず生きたコンテナが残るのを防ぐ）。
+    if members.len() + intents.len() >= MAX_MEMBERS_PER_NETWORK {
+        return Err(RecordedError::Store(NetError::new(
+            NetErrorCode::ResourceExhausted,
+            "too many members",
         )));
     }
     let mut ipam = rebuild_ipam(&realized, &members, &intents).map_err(RecordedError::Store)?;
@@ -517,6 +525,8 @@ mod linux {
     ///
     /// IPAM は記録から組み直すため、呼び出し側は `StaticIpam` を持たない。`ports` は呼び出し側の予約表
     /// （公開の記録は #3068）。`CAP_NET_ADMIN`・`CAP_SYS_ADMIN` は呼び出し側の責務。
+    // 理由: 非記録版 `attach_container` と同じく、netlink の 2 本のソケット・ロードガード・要求 ID・仕様・DNS・
+    // ポート予約表・期限は別の所有者のもので、まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
     #[allow(clippy::too_many_arguments)]
     pub fn attach_container_recorded(
         route: &NetlinkRouteSocket,
@@ -549,6 +559,8 @@ mod linux {
     /// コンテナを切り離して `members/<id>` を消す（`detach_container` の記録つき版）。
     ///
     /// 記録の検証で拒否した場合、渡した `container` は破棄される（pin は残る。モジュール doc の未実装範囲）。
+    // 理由: 下位の `detach_container` の引数（ソケット 2 本・接続済みコンテナ・公開ポート・予約表・期限）に
+    // ガードと ID を足した形で、所有者がばらばらの借用をまとめる型を作ると寿命が呼び出し側へ漏れるため引数で受ける。
     #[allow(clippy::too_many_arguments)]
     pub fn detach_container_recorded(
         route: &NetlinkRouteSocket,

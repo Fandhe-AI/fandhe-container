@@ -119,6 +119,23 @@ impl Dir {
         sync(self)
     }
 
+    /// [`write_new`](Self::write_new) の再試行可能版。既に同じ内容の記録があれば（前回は rename 後の親 fsync で
+    /// 失敗した可能性があるため）同期だけをやり直して成功とし、内容が違えば `AlreadyExists` を返す（D11）。
+    fn write_new_idempotent(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        sync: SyncFn<'_>,
+    ) -> Result<(), NetError> {
+        match self.write_new(name, bytes, sync) {
+            Err(e) if e.code() == NetErrorCode::AlreadyExists => match self.read_record(name)? {
+                Some(old) if old == bytes => sync(self),
+                _ => Err(e),
+            },
+            other => other,
+        }
+    }
+
     /// 消す。無ければ `Ok(false)`。消したら親を fsync する。
     fn remove_record(&self, name: &str, sync: SyncFn<'_>) -> Result<bool, NetError> {
         match fs::remove_file(self.path(name)) {
@@ -335,10 +352,14 @@ impl NetworkLockGuard<'_> {
             self.require_exclusive()?;
             let members = self.dir.ensure_subdir(MEMBERS_DIR)?;
             members.sweep_tmp();
-            if members.record_names()?.len() >= MAX_MEMBERS_PER_NETWORK {
+            let names = members.record_names()?;
+            // 再試行（同じ ID の確定記録が既にある）は件数の上限に数えない。
+            if names.len() >= MAX_MEMBERS_PER_NETWORK
+                && !names.iter().any(|n| n == rec.id().as_str())
+            {
                 return Err(err(NetErrorCode::ResourceExhausted, "too many members"));
             }
-            members.write_new(rec.id().as_str(), &rec.encode(), sync)?;
+            members.write_new_idempotent(rec.id().as_str(), &rec.encode(), sync)?;
             if let Some(intents) = self.dir.open_subdir_opt(MEMBER_INTENTS_DIR)? {
                 intents.remove_record(rec.id().as_str(), &Dir::sync)?;
             }
@@ -395,7 +416,7 @@ impl NetworkLockGuard<'_> {
             || {
                 self.require_exclusive()?;
                 self.dir
-                    .write_new(REALIZED_FILE, &rec.encode(), &Dir::sync)?;
+                    .write_new_idempotent(REALIZED_FILE, &rec.encode(), &Dir::sync)?;
                 self.dir.remove_record(REALIZED_INTENT_FILE, &Dir::sync)?;
                 Ok(())
             },
@@ -688,6 +709,38 @@ mod tests {
             NetErrorCode::Internal
         );
         assert_eq!(n.member_intents().unwrap(), vec![intent("c1", 2)]);
+        // 同期の失敗後に同じ内容で再試行すると、同期をやり直して意図記録まで消せる。
+        n.commit_member(&member("c1", 2)).unwrap();
+        assert!(n.member_intents().unwrap().is_empty());
+        assert_eq!(n.members().unwrap(), vec![member("c1", 2)]);
+        // 内容が違う確定記録は拒否する。
+        assert_eq!(
+            code(n.commit_member(&member("c1", 3))),
+            NetErrorCode::AlreadyExists
+        );
+    }
+
+    /// 確定記録 `realized` が残ったまま意図記録も残る状態（同期失敗後）で、同じ内容の再試行が意図記録を消す。
+    #[test]
+    fn net1_3067_store_commit_realized_is_retryable() {
+        let t = Tmp::new("realizedretry");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&nn()).unwrap();
+        let ri = RealizedIntent::new(
+            crate::network_store::RealizedOp::Create,
+            nn(),
+            BRIDGE_TOKEN,
+            pfx([10, 0, 0, 0], 24),
+        )
+        .unwrap();
+        n.write_realized_intent(&ri).unwrap();
+        n.dir
+            .write_new(REALIZED_FILE, &realized_rec().encode(), &Dir::sync)
+            .unwrap();
+        n.commit_realized(&realized_rec()).unwrap();
+        assert_eq!(n.realized_intent().unwrap(), None);
+        assert_eq!(n.realized().unwrap(), Some(realized_rec()));
     }
 
     /// realized と realized.intent の書き込みと、組み直し。

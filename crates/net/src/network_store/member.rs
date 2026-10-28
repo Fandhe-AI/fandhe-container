@@ -81,7 +81,9 @@ fn check_netns_dir(path: &Path) -> Result<String, NetError> {
     let s = path
         .to_str()
         .ok_or_else(|| invalid("netns directory must be UTF-8"))?;
-    if !path.is_absolute()
+    // 記録は OS 非依存（FCNET1 と同じ）なので、Windows で `/run/ns` を拒む `Path::is_absolute` ではなく
+    // 先頭が `/` かどうかで判定する。
+    if !s.starts_with('/')
         || s.len() > NETNS_DIR_MAX_BYTES
         || s.chars().any(char::is_control)
         || path

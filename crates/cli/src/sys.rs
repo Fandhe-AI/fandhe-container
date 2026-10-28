@@ -196,6 +196,7 @@ mod layout {
 ))]
 mod imp {
     use super::{ChildSignal, Disposition, FORWARDED_SIGNALS, layout};
+    #[cfg(feature = "plugin")]
     use fandhe_container_plugin::{ForwardSignal, forward_to_running_plugins};
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -227,6 +228,7 @@ mod imp {
     static OWNER_PID: AtomicU32 = AtomicU32::new(0);
 
     /// 登録したプロセス自身のときだけ転送してよいか。未登録（0）は転送しない側に倒す（fail-closed）。
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))] // 転送は plugin feature のときだけ（#3204）
     fn is_owner(owner: u32, current: u32) -> bool {
         owner != 0 && owner == current
     }
@@ -241,6 +243,9 @@ mod imp {
     /// 転送対象が割り込むことはない（保留されて復帰後に既定動作で配送される）。
     extern "C" fn forward_and_reraise(sig: i32) {
         // `std::process::id()` は `getpid(2)` の直接呼び出しで async-signal-safe（割り当て・ロックなし）。
+        // plugin feature が無効なら転送先が無く、再送だけを行う（PLUG-3・#3204）。ハンドラの登録と継承した
+        // SIGCHLD の SIG_IGN の解除は feature に関係なく残す（子の自動回収で wait できなくなるのを防ぐ）。
+        #[cfg(feature = "plugin")]
         if is_owner(OWNER_PID.load(Ordering::SeqCst), std::process::id())
             && let Some(forward) = ForwardSignal::from_raw(sig)
         {

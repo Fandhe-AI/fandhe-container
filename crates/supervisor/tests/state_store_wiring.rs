@@ -13,7 +13,8 @@ fn task_157_3_supervisor_has_no_own_serialization() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     const STATE_RS: &str = include_str!("../src/state.rs");
     assert!(
-        MANIFEST.contains("fandhe-container-core = { path = \"../core\" }"),
+        MANIFEST
+            .contains("fandhe-container-core = { path = \"../core\", default-features = false }"),
         "supervisor must depend on core via a path dependency"
     );
     assert!(

@@ -13,7 +13,8 @@
 //! 呼ぶ配線は未実装（#1869）。macOS 等は起動直前に dev / ino を照合する（#1866。実装済み）。
 //! plugin の発見・登録（TASK-109）はこのゲート配下に置く予定だが未実装で、現時点では軽量化の効果はほぼない。
 //! CI への組み込みとサイズ記録は TASK-111.2（#263）で導入済み（`make plugin-feature-size`・docs/design/plugin-feature-size-record.md）。
-//! 最終バイナリでの効果の実測は TASK-79・TASK-109・TASK-110 の後に行う。
+//! `make plugin-feature-size` は CLI の実行ファイルの既定 / 除外を比べる（cli の `plugin` feature・supervisor の
+//! `default-features = false` で feature 伝播を設計済み。#3204）。ゲート配下に実装が入る TASK-109・TASK-110 の後に再計測する。
 //!
 //! # 注意
 //!

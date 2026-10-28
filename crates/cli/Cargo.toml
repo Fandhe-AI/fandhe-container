@@ -19,9 +19,11 @@ path = "src/main.rs"
 [dependencies]
 fandhe-container-net = { path = "../net" }
 # create / start が core の oci_runtime を直接呼ぶ workspace 内 path 依存（TASK-79.2.1。外部クレートの追加ではない）。
-fandhe-container-core = { path = "../core" }
+# core の plugin feature は下の cli の `plugin` feature が連動して有効にする（PLUG-3・#3204）。
+fandhe-container-core = { path = "../core", default-features = false }
 # 親が受けた SIGINT・SIGTERM・SIGHUP を起動中の plugin へ転送する API を使う workspace 内 path 依存（#1513・PLUG-7。外部クレートの追加ではない）。
-fandhe-container-plugin = { path = "../plugin" }
+# `plugin` feature の下の optional 依存（PLUG-3・#3204。無効なら plugin 境界基盤をリンクしない）。
+fandhe-container-plugin = { path = "../plugin", optional = true }
 # start が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号するための workspace 内 path 依存
 # （#1718・REPAIR-2。外部クレートの追加ではない。循環なし: supervisor は core にのみ依存する）。
 fandhe-container-supervisor = { path = "../supervisor" }
@@ -36,6 +38,11 @@ fandhe-container-oci = { path = "../oci" }
 # #1605）と、環境変数 `FANDHE_CONTAINER_TEST_SIGNAL_INSTALL_FAILURE` による登録失敗の注入（#1778）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
 # 含めない。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 [features]
+# plugin: plugin 境界基盤（シグナル転送・延期した後始末の記録）と core の `plugin` feature を有効にする（既定で有効。PLUG-3・#3204）。
+# 無効（`--no-default-features`）なら plugin crate がリンクされず、起動対象を構築する経路自体が無い（fail-open にならない）。
+# `make plugin-feature-size` が CLI の実行ファイルの既定 / 除外を比べる。
+default = ["plugin"]
+plugin = ["dep:fandhe-container-plugin", "fandhe-container-core/plugin"]
 signal-test-support = []
 # start-test-support: start が systemd-run を解決する入口に、環境変数 `FANDHE_CONTAINER_TEST_SYSTEMD_RUN`（絶対パス）による
 # 差し替えを足す（偽の systemd-run で既定集合の結合試験を動かすため。#2081・CORE-3）。既定のビルドには含めず、

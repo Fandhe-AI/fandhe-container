@@ -126,7 +126,7 @@
   - 要約行: 何かを再採用・回収したときだけ、4 段の `summary_line()` を ` | ` でつないだ 1 行を stderr へ出す。4 段とも空（初回起動など）なら出さない。固定語彙で ID・パス・config を含まない。
   - 計測: 再採用は既存の `cri.record_store_load`（採用 1 件ごとに成功、壊れた記録 1 件ごとに失敗）。記録ストアの操作は `CoreRecordStoreRecorder` が共有 `OpRecorder` へ `cri.record_store.{put,remove,list}` の 3 名で成功 / 失敗に縮約して流す（結果区分・種別は名前に混ぜず、`MAX_TRACKED_OPS` の枠を使い切らない）。
   - 試験: `crates/plugin-cri/tests/container_grpc.rs` の段 D（実バイナリを同じ状態ルートで 2 回、さらに 3 回起動。SIGKILL 後に sandbox が `SANDBOX_NOTREADY`・コンテナが `CONTAINER_CREATED` で見えること、壊れた記録と孤児 bundle の注入、Remove での所有の復元、1025 件の記録での起動失敗）と `tests/record_readoption.rs`（4 段の順序・要約行・`Err` の素通し・ロックの要求）。いずれも root 不要の既定の集合。
-  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した再起動の自動試験は #3225（実機前提。`production_binary_restart_readopts_running_container_real`）、人間の crictl での実機確認は R13 #2942。SIGTERM の正常停止は未実装のため、試験は SIGKILL で止める。
+  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した再起動の自動試験は #3225（実機前提。`production_binary_restart_readopts_running_container_real`）、人間の crictl での実機確認は R13 #2942。SIGTERM の正常停止は #3226 で実装済み（下記「停止の契約」）。試験は 1 回目をクラッシュ経路として SIGKILL、2 回目を SIGTERM で止める。
 - core に状態があるが CRI 記録の無いコンテナは触らない（CLI と状態ルートを共有するため所有を証明できない）
 - 孤児 bundle（`.cri/bundles/<id>` で CRI 記録が無く core が Absent〔`NotFound` だけ〕）は、インスタンスロックの下でだけ回収する。Undetermined は残す
 
@@ -195,6 +195,16 @@
 | R11 | #2940 | cri: 保持役の素性の記録と再採用時の扱い | #2871・#2877・R6 |
 | R12 | #2941 | cri / plugin-cri: `network_owned`・`pod_netns` の永続と再起動後の `tear_down` | #1870・#2879・R6 |
 | R13 | #2942 | 実機確認（人間担当）: running のコンテナを残した再起動と再採用（手順書: [plugin-cri-restart-readoption.md](../verification/plugin-cri-restart-readoption.md)） | R9 |
+
+## 停止の契約（#3226・CRI-1・CORE-1・PLUG-12・REPAIR-3・REPAIR-4・REPAIR-5）
+
+- 対象シグナル: SIGTERM・SIGINT（同じ扱い）。SIGHUP は対象外（既定動作で即終了）。最初の 1 つだけを記録し、2 回目以降は何もしない
+- 受け方の判断: `crates/plugin-cri/src/sys.rs` の自前 `signal(3)` 宣言（ハンドラは `static AtomicI32` の compare_exchange のみ）。tokio の `signal` feature は workspace 依存の feature 変更で承認が要るため不採用。`signalfd` は exec 後の子へマスクが継承されるため、self-pipe は FFI が増えるため不採用（検知は 100ms 周期の atomic ポーリング）。ハンドラは監査 relay の fork の直後に登録し（helper は既定動作のまま）、登録失敗・未確認の Linux アーキテクチャは起動しない（fail-closed）
+- 受付の停止: シグナルを受けたら listener を即座に閉じる（tonic はドレイン中も incoming を持ち続けるため、`server::StopOnShutdown` が drop する）。socket は `UdsListener::drop` が bind 時の dev/ino と一致する場合だけ検証済みディレクトリの fd 基点で unlink する。起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見て、受けていれば bind せずに終了コード 0 で終える
+- 実行中の RPC: `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待つ。超えたら接続を強制的に閉じ（回収の上限 2 秒）、`error: TIMEOUT: ...`・終了コード 1 で終える。打ち切った RPC・`spawn_blocking`（`shutdown_timeout` 1 秒で置き去り）は結果不明のまま残り、再起動時に R7 の照合表・`recover_stale_image_pulls`（OCI-7）が扱う。記録は rename による不可分の置き換えなので半端なファイルは残らない
+- インスタンスロック: fd の close で外れる。ロックファイルは消さない（unlink すると二重に取得され得る）。確定はプロセスの終了。新しいインスタンスは `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了を待ってから起動する運用を前提とする
+- 終了コードと stderr: 正常停止は終了コード 0 と固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>`（パス・pid・ID を含めない）。停止の全体の上限は 13.7 秒（検知 0.1 + 猶予 10 + 強制回収 2 + 書き出し 0.6〔serve_with_audit の sink・forwarder と終了行の 3 回 × 0.2〕+ ランタイム 1。`shutdown::SHUTDOWN_TOTAL_BOUND` を試験で固定）
+- 残余（REPAIR-3）: 起動段の途中では段の予算まで待つ。relay の fork より前に届いたシグナルは既定動作で即終了する（SIGKILL と同じく再採用が扱う）。監査 helper は既定動作のままで、プロセスグループ宛ての SIGTERM では helper が先に死に、ドレイン中の peer 認証の拒否が `@audit.log` に残らないことがある（stderr には残る）。libc との機械照合は plugin-cri に dev-dependency の `libc` が無いため未導入（依存の追加は承認事項）。running のコンテナを残した実機での SIGTERM 再起動の確認は R13 #2942（人間担当）
 
 ## セキュリティ上の要点
 

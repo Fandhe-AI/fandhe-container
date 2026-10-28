@@ -16,7 +16,7 @@ use fandhe_container_core::traits::{
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName, PortPublish};
 use fandhe_container_plugin_cri::netsetup::{
-    AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, MAX_NETWORKS,
+    AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, DetachFailure, MAX_NETWORKS,
     MSG_RECOVERED_NETWORK_UNTRACKED, NetsetupBackend, NetsetupContainer, NetsetupNetwork,
     PublishFailure, RECLAIM_DIR, ReclaimStore,
 };
@@ -31,8 +31,23 @@ impl NetsetupContainer for FakeContainer {
     }
 }
 
+/// `Fake::detach` の次の呼び出しの結果（1 回で `None` に戻る）。
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum DetachFail {
+    #[default]
+    None,
+    /// 何も変えずに失敗し、ハンドルを返す。
+    Retry,
+    /// 取り残し 1 件と請求書つきで失敗する。
+    Leftover,
+    /// 取り残しも請求書も無いのに失敗する。
+    Silent,
+}
+
 #[derive(Default)]
 struct Script {
+    /// 次の `detach` の結果。
+    detach_fail: DetachFail,
     calls: Vec<String>,
     fail_create: bool,
     /// create 失敗時に取り残す資源の件数。
@@ -284,6 +299,38 @@ impl NetsetupBackend for Fake {
         Ok(())
     }
 
+    fn detach(
+        &self,
+        network: &mut String,
+        container: FakeContainer,
+    ) -> Result<(), DetachFailure<FakeContainer, (String, String)>> {
+        let mut s = self.0.lock().expect("lock");
+        s.calls.push(format!("detach {network} {}", container.0));
+        let mode = std::mem::take(&mut s.detach_fail);
+        let error = TraitError::new(ErrorCode::Internal, "detach failed");
+        match mode {
+            DetachFail::None => Ok(()),
+            DetachFail::Retry => Err(DetachFailure {
+                error,
+                leftover: 0,
+                retry: Some(container),
+                reclaim: None,
+            }),
+            DetachFail::Leftover => Err(DetachFailure {
+                error,
+                leftover: 1,
+                retry: None,
+                reclaim: Some((network.clone(), container.0)),
+            }),
+            DetachFail::Silent => Err(DetachFailure {
+                error,
+                leftover: 0,
+                retry: None,
+                reclaim: None,
+            }),
+        }
+    }
+
     fn delete_network(
         &self,
         network: &mut String,
@@ -460,18 +507,121 @@ fn contract8_detach_behaviour() {
             .code(),
         ErrorCode::NotFound
     );
+    // attach 済みの detach は backend の単体の切り離しに届き（#3062）、成功すれば記録が外れる。
     pod_network::set_up_container(&net, &nname("a"), &cid("c2")).expect("c2");
+    pod_network::set_up_container(&net, &nname("a"), &cid("c3")).expect("c3");
+    net.detach(&DetachRequest::new(nname("a"), cid("c2")))
+        .expect("detach attached");
     assert_eq!(
         net.detach(&DetachRequest::new(nname("a"), cid("c2")))
-            .expect_err("attached")
+            .expect_err("twice")
             .code(),
-        ErrorCode::Unimplemented
+        ErrorCode::NotFound
     );
-    // 状態は変わらず、削除時に c2 が渡される。
+    // 削除時に渡されるのは兄弟の c3 だけ。
     pod_network::tear_down_pod(&net, &nname("a")).expect("delete");
+    let calls = fake.calls();
+    assert!(calls.contains(&"detach a c2".to_owned()), "{calls:?}");
+    assert!(!calls.contains(&"detach a c3".to_owned()), "{calls:?}");
     assert_eq!(
-        fake.calls().last().map(String::as_str),
-        Some("delete_network a [c2]")
+        calls.last().map(String::as_str),
+        Some("delete_network a [c3]")
+    );
+}
+
+/// NET-1・NET-3・#3062: 何も変えずに失敗した detach は attach 済みの記録を保ち、再試行で成功する。
+#[test]
+fn net1_detach_attached_retry_keeps_record() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    pod_network::set_up_container(&net, &nname("a"), &cid("c1")).expect("c1");
+    fake.0.lock().expect("lock").detach_fail = DetachFail::Retry;
+    let e = net
+        .detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect_err("fails");
+    assert_eq!(e.message(), "detach failed");
+    // 状態は変わらない（attach 済みのまま。二重 attach は AlreadyExists）。
+    assert_eq!(
+        net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+            .expect_err("still attached")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
+    net.detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect("retry");
+    assert_eq!(
+        net.detach(&DetachRequest::new(nname("a"), cid("c1")))
+            .expect_err("gone")
+            .code(),
+        ErrorCode::NotFound
+    );
+}
+
+/// NET-1・NET-3・#3062: 取り残しつきで失敗した detach は請求書を永続化して回収待ちで保持し、次の detach の既存の
+/// 回収経路で記録とファイルが消える。兄弟の c2 は影響を受けない。
+#[test]
+fn net1_detach_attached_leftover_is_reclaimed_by_next_detach() {
+    let root = temp_state_root("detach-attached");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect("pod");
+    pod_network::set_up_container(&net, &nname("n0"), &cid("c1")).expect("c1");
+    pod_network::set_up_container(&net, &nname("n0"), &cid("c2")).expect("c2");
+    fake.0.lock().expect("lock").detach_fail = DetachFail::Leftover;
+    let e = net
+        .detach(&DetachRequest::new(nname("n0"), cid("c1")))
+        .expect_err("leftover");
+    assert_eq!(e.message(), "detach failed");
+    let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("record"),
+        "arec:n0:c1"
+    );
+    // 回収待ちのネットワークへの新しい attach は拒否される（attach の取り残しと同じ）。
+    assert_eq!(
+        pod_network::set_up_container(&net, &nname("n0"), &cid("c9"))
+            .expect_err("blocked")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    // 兄弟は影響を受けず切り離せる。
+    net.detach(&DetachRequest::new(nname("n0"), cid("c2")))
+        .expect("sibling");
+    // 回収に成功すると記録とファイルが消える。
+    fake.0.lock().expect("lock").reclaim_attach_ok = true;
+    net.detach(&DetachRequest::new(nname("n0"), cid("c1")))
+        .expect("reclaimed");
+    assert!(!file.exists());
+    assert_eq!(
+        net.detach(&DetachRequest::new(nname("n0"), cid("c1")))
+            .expect_err("gone")
+            .code(),
+        ErrorCode::NotFound
+    );
+    let calls = fake.calls();
+    assert!(
+        calls.contains(&"reclaim_attach n0 c1".to_owned()),
+        "{calls:?}"
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#3062: 取り残しの申告も請求書も無い失敗は成功を装わず、記録を外す（回収の手掛かりが無い）。
+#[test]
+fn net1_detach_attached_silent_failure_drops_record() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    pod_network::set_up_container(&net, &nname("a"), &cid("c1")).expect("c1");
+    fake.0.lock().expect("lock").detach_fail = DetachFail::Silent;
+    let e = net
+        .detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect_err("fails");
+    assert_eq!(e.message(), "detach failed");
+    assert_eq!(
+        net.detach(&DetachRequest::new(nname("a"), cid("c1")))
+            .expect_err("record dropped")
+            .code(),
+        ErrorCode::NotFound
     );
 }
 

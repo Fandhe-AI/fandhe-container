@@ -117,7 +117,7 @@
 //!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
 //!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
 //!   再起動後のハンドル復元は未実装）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
+//! - IPAM 状態の永続化。担当 Issue 未確定（コンテナ単体の切り離しは `detach_container` で追加済み。#3062。作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
 //!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで。再起動後のネットワーク本体は手動。
 //!   所有記録の無い pin（旧い請求書・none モード）も手動。write-ahead は #1870 の後に再検討）
@@ -147,10 +147,14 @@ pub use attach_fault::{AttachFault, AttachFaultPoint, attach_container_with_faul
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
 #[cfg(target_os = "linux")]
+pub use delete::detach_container;
+#[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_attach;
 #[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_create;
-pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
+pub use delete::{
+    ContainerDetachError, DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport,
+};
 pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
 pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
@@ -1286,6 +1290,9 @@ pub struct AttachedContainer<N> {
     /// attach 時のポート公開で投入した DNAT ルールのハンドル（`ContainerAttachSpec` の公開指定の順。
     /// 個別の解除は `unpublish_container_port`。指定が無ければ空。NET-3・#2839）。
     pub published_ports: Vec<PublishedPort>,
+    /// 接続時に固定した pin の識別子（回収用。切り離しの請求書はこれを使い、現在のパスから採り直さない。
+    /// pin が作り直された場合に新世代の pin を指さないため。NET-1・#3062）。特定できなければ `None`。
+    pub(crate) pin_identity: Option<attach_claim::PinIdentity>,
 }
 
 impl<N> AttachedContainer<N> {
@@ -1996,6 +2003,7 @@ fn attach_with_source<O: AttachOps>(
     };
     ops.release_netns_socket(&mut netns);
 
+    let pin_identity = attach_claim::pin_identity_of(&pin);
     Ok(AttachedContainer {
         endpoint: spec.endpoint.clone(),
         host_veth: names.host().clone(),
@@ -2007,6 +2015,7 @@ fn attach_with_source<O: AttachOps>(
         address,
         netns,
         published_ports,
+        pin_identity,
     })
 }
 
@@ -2515,7 +2524,7 @@ fn send_dnat_batch(
 /// # 未実装範囲（REPAIR-3）
 /// masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
 /// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
-/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）。
+/// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）、コンテナ 1 件だけの切り離しは `detach_container`（#3062）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
     route: &NetlinkRouteSocket,

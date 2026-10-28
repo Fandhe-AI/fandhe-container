@@ -136,7 +136,7 @@ fn with_rollback_errors(orig: TraitError, rollback: &[(&str, TraitError)]) -> Tr
 /// ネットワーク名・コンテナ ID・netns 名は `sandbox_id` を使う。途中で失敗したら逆順に戻す: `attach` の失敗は
 /// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。
 /// `publish_port` の失敗は、公開済みの分を逆順に `unpublish_port` で個別に解除してから、必ず `delete_network` を
-/// 呼ぶ（attach 済みのコンテナの `detach` は未対応。専用テーブルの削除が DNAT ルールと受け口の予約をまとめて消し、
+/// 呼ぶ（attach 済みのコンテナの `detach` は呼ばない。pod 専用ネットワークなので `delete_network` が覆う。専用テーブルの削除が DNAT ルールと受け口の予約をまとめて消し、
 /// 結果不明で残った受け口の予約もここで回収される。#2676・#2904・NET-3・NET-4）。個別解除の失敗は残りの解除と
 /// `delete_network` を止めず、`rolled_back` を偽にする。`Unimplemented`（個別解除に対応しない plugin）は
 /// `delete_network` が覆うため失敗に数えない。`attach` の失敗時は公開が無い（公開は最後の段）ので解除しない。
@@ -171,7 +171,7 @@ pub fn set_up_sandbox(
         Ok(status) => match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
             Ok(_) => match publish_all(net, &name, &container, ports) {
                 Ok(()) => return Ok(status),
-                // attach 済みのため detach は呼ばない（未対応）。公開済みを逆順に個別解除し、
+                // attach 済みでも detach は呼ばない（pod 専用ネットワークなので delete_network が覆う）。公開済みを逆順に個別解除し、
                 // delete_network は必ず呼ぶ（テーブル単位の解放。結果不明の受け口の予約もここで回収する）。
                 Err((e, published)) => {
                     for mapping in published.iter().rev() {

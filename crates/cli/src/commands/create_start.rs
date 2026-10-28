@@ -876,10 +876,13 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let recorder = OpRecorder::new();
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
-        super::create_network::validate_network_options(&args.options.network)?;
+        let named = super::create_network::check_network_options(&args.options.network)?;
+        // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
+        let pasta = super::create_pasta::resolve_for_create(global, named)?;
+        super::create_network::reject_not_wired(&args.options.network)?;
         let (req, image) = build_create(global, args)?;
         // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
-        let document = create_options::document_of(&args.options)?;
+        let document = create_options::document_of(&args.options, pasta.as_ref())?;
         Ok((req, image, document))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
@@ -1702,6 +1705,7 @@ mod tests {
         GlobalArgs {
             root: Some(std::env::temp_dir().join("fc-cli-state-root")),
             plugin_path_search: false,
+            pasta: None,
         }
     }
 
@@ -1874,7 +1878,7 @@ mod tests {
             let rt = runtime(&base);
             let args = options_args(&bundle, "c1");
             let req = build_create_request(&args).expect("req");
-            let doc = create_options::document_of(&args.options).expect("doc");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
             let rec = create_with_options(&rt, &req, None, &doc).expect("create");
             assert_eq!(rec.annotations().get("tier"), Some("web"));
             let root = rt.store.host_state_root().expect("root").to_path_buf();
@@ -1913,7 +1917,7 @@ mod tests {
             let rt = runtime(&base);
             let args = options_args(&missing, "c1");
             let req = build_create_request(&args).expect("req");
-            let doc = create_options::document_of(&args.options).expect("doc");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
             let e = create_with_options(&rt, &req, None, &doc).expect_err("must fail");
             assert_eq!(e.code(), ErrorCode::NotFound);
             let root = rt.store.host_state_root().expect("root").to_path_buf();
@@ -1932,7 +1936,7 @@ mod tests {
             std::fs::write(options_store::options_dir(&root), b"x").expect("blocker");
             let args = options_args(&bundle, "c1");
             let req = build_create_request(&args).expect("req");
-            let doc = create_options::document_of(&args.options).expect("doc");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
             create_with_options(&rt, &req, None, &doc).expect_err("must fail");
             let name = OpName::new("create").expect("name");
             let stats = rt.recorder.snapshot_op(&name).expect("recorded");
@@ -1955,10 +1959,13 @@ mod tests {
             let rt = runtime(&base);
             let root = rt.store.host_state_root().expect("root").to_path_buf();
             let id = ContainerId::new("c1").expect("id");
-            let stale = create_options::document_of(&CreateOptionArgs {
-                env: vec!["OLD=1".into()],
-                ..CreateOptionArgs::default()
-            })
+            let stale = create_options::document_of(
+                &CreateOptionArgs {
+                    env: vec!["OLD=1".into()],
+                    ..CreateOptionArgs::default()
+                },
+                None,
+            )
             .expect("doc");
             options_store::write_new(&root, &id, &stale).expect("stale");
             let args = CreateArgs {
@@ -1968,7 +1975,7 @@ mod tests {
                 image: None,
             };
             let req = build_create_request(&args).expect("req");
-            let doc = create_options::document_of(&args.options).expect("doc");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
             create_with_options(&rt, &req, None, &doc).expect("create");
             assert!(!options_store::options_path(&root, &id).exists());
         }

@@ -20,6 +20,11 @@
 //!    `ResolvConfPlan::for_mode` を呼び、none の非 loopback を拒否する。
 //! 4. 上記をすべて通り、かつ 3 つのどれかが指定されていれば `UNIMPLEMENTED`(D3)。
 //!
+//! # pasta の段(#3199)
+//!
+//! `--network` がユーザー定義名のとき、手順 1〜3 の後・手順 4 の前に `create_pasta`(`--pasta-path` / `--pasta-path-search` の
+//! 判定と作成時の検証。NET-9)が入る。pasta の不備(`FAILED_PRECONDITION`・`NOT_FOUND` 等)は `UNIMPLEMENTED` より前に返る。
+//!
 //! # 未実装の将来仕様(REPAIR-3)
 //!
 //! 検証を通っても起動経路へ結線されていないため、受理して黙って捨てずに `UNIMPLEMENTED` で拒否する。
@@ -87,7 +92,16 @@ fn choose(network: &str) -> Result<Choice, TraitError> {
 
 /// 3 つのフラグを作成前に検証する。指定が無ければ `Ok(())`、不正は `InvalidArgument`、
 /// 正しくても指定があれば `Unimplemented`(D3)。
+#[cfg(test)]
 pub(super) fn validate_network_options(args: &CreateNetworkArgs) -> Result<(), TraitError> {
+    check_network_options(args)?;
+    reject_not_wired(args)
+}
+
+/// 3 つのフラグの形式検証だけを行い、`--network` がユーザー定義名かを返す(`Unimplemented` にはしない)。
+///
+/// `run_create` が pasta の段(`create_pasta`。#3199)を `InvalidArgument` の後・`Unimplemented` の前に挟むために分けてある。
+pub(super) fn check_network_options(args: &CreateNetworkArgs) -> Result<bool, TraitError> {
     let choice = args.network.as_deref().map(choose).transpose()?;
     if !args.add_hosts.is_empty() {
         parse_add_hosts(args.add_hosts.iter().map(String::as_str))
@@ -106,6 +120,11 @@ pub(super) fn validate_network_options(args: &CreateNetworkArgs) -> Result<(), T
         let dns: Vec<&str> = args.dns.iter().map(String::as_str).collect();
         ResolvConfPlan::for_mode(mode, &dns).map_err(|e| net_error_to_trait(&e))?;
     }
+    Ok(matches!(choice, Some(Choice::Named)))
+}
+
+/// 検証を通った指定があれば `Unimplemented`(D3。起動経路への結線は #1873)。
+pub(super) fn reject_not_wired(args: &CreateNetworkArgs) -> Result<(), TraitError> {
     if args.network.is_some() || !args.add_hosts.is_empty() || !args.dns.is_empty() {
         return Err(TraitError::new(ErrorCode::Unimplemented, NOT_WIRED_MESSAGE));
     }

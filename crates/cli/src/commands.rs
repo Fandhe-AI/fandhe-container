@@ -58,6 +58,7 @@ use crate::error::CliError;
 mod args;
 mod create_network;
 mod create_options;
+mod create_pasta;
 mod create_start;
 mod image;
 mod image_refs;
@@ -378,6 +379,14 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
         return usage();
     };
     let tail: Vec<OsString> = it.collect();
+    // `--pasta-path` / `--pasta-path-search` は create だけに効く。他のサブコマンド（setup・doctor を含む）では
+    // 黙って受けずに拒否する（rootless-network.md 12.4・NET-9・CLI-1・#3199）。
+    if global.pasta.is_some() && !matches!(command, Command::Create) {
+        return CliExit::Error(CliError::new(
+            ErrorCode::InvalidArgument,
+            create_pasta::MSG_FLAG_NOT_CREATE,
+        ));
+    }
     match command {
         Command::Create => match parse_create(tail) {
             Ok(a) => create_start::run_create(&global, &a),

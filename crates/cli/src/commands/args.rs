@@ -1,6 +1,6 @@
 //! `create` / `start` / `stop` / `kill` / `delete` / `list` / `logs` / `inspect` / `state` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
-//! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
+//! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`・`--pasta-path`・`--pasta-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
@@ -19,6 +19,18 @@ pub(super) struct GlobalArgs {
     ///
     /// 3 OS で同一構文を受理する（CLI-1）が、Linux は plugin を介さず core を直接呼ぶため効果はない。
     pub(super) plugin_path_search: bool,
+    /// `--pasta-path <絶対パス>` / `--pasta-path-search`（rootless のユーザー定義ネットワークで使う pasta の指定。
+    /// NET-9・PLUG-11・CLI-1・#3199。両方の指定は使い方エラー）。効くのは `create` だけ（`create_pasta` が判定する）。
+    pub(super) pasta: Option<PastaSource>,
+}
+
+/// pasta の場所の指定（2 つのグローバルフラグは排他）。値の形の検証は net の `verify_pasta_binary` に任せる（二重実装を避ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PastaSource {
+    /// `--pasta-path <path>`（絶対パス。相対パスなどは net が `INVALID_ARGUMENT` にする）。
+    Path(PathBuf),
+    /// `--pasta-path-search`（CLI 自身の `PATH` を探索する opt-in。採ったパスは警告 1 行で出す）。
+    PathSearch,
 }
 
 /// `create` の引数。
@@ -232,7 +244,8 @@ pub(super) struct UsageError;
 
 /// 先頭のグローバルオプションを読み、残り（サブコマンド名以降）を返す。
 ///
-/// 現状のグローバルオプションは `--root <dir>` のみ。重複・値欠落は使い方エラー。
+/// グローバルオプションは `--root <dir>`・`--plugin-path-search`・`--pasta-path <path>`・`--pasta-path-search`（順不同・各 1 回まで。
+/// `--pasta-path` と `--pasta-path-search` の併用も不可）。重複・値欠落は使い方エラー。
 pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsString>), UsageError> {
     let mut global = GlobalArgs::default();
     let mut it = args.into_iter().peekable();
@@ -250,6 +263,19 @@ pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsStr
                 return Err(UsageError);
             }
             global.plugin_path_search = true;
+        } else if it.peek().is_some_and(|a| a == "--pasta-path") {
+            it.next();
+            let value = it.next().ok_or(UsageError)?;
+            if global.pasta.is_some() {
+                return Err(UsageError);
+            }
+            global.pasta = Some(PastaSource::Path(PathBuf::from(value)));
+        } else if it.peek().is_some_and(|a| a == "--pasta-path-search") {
+            it.next();
+            if global.pasta.is_some() {
+                return Err(UsageError);
+            }
+            global.pasta = Some(PastaSource::PathSearch);
         } else {
             break;
         }
@@ -847,6 +873,38 @@ mod tests {
             parse_global(v(&["--root", "/a", "--root", "/b", "start"])),
             Err(UsageError)
         );
+    }
+
+    /// NET-9・PLUG-11・CLI-1(#3199): pasta の 2 フラグは他のグローバルオプションと順不同で受理し、重複・併用・値欠落は使い方エラー。
+    #[test]
+    fn cli1_plug11_parse_global_pasta_flags() {
+        let (g, rest) = parse_global(v(&[
+            "--pasta-path",
+            "/usr/bin/pasta",
+            "--root",
+            "/r",
+            "--plugin-path-search",
+            "list",
+        ]))
+        .expect("ok");
+        assert_eq!(g.pasta, Some(PastaSource::Path("/usr/bin/pasta".into())));
+        assert_eq!(g.root, Some(PathBuf::from("/r")));
+        assert!(g.plugin_path_search);
+        assert_eq!(rest, v(&["list"]));
+        let (g, rest) =
+            parse_global(v(&["--root", "/r", "--pasta-path-search", "create"])).expect("ok");
+        assert_eq!(g.pasta, Some(PastaSource::PathSearch));
+        assert_eq!(rest, v(&["create"]));
+        assert_eq!(parse_global(v(&["list"])).expect("ok").0.pasta, None);
+        for bad in [
+            &["--pasta-path"][..],
+            &["--pasta-path", "/a", "--pasta-path", "/b", "list"],
+            &["--pasta-path-search", "--pasta-path-search", "list"],
+            &["--pasta-path", "/a", "--pasta-path-search", "list"],
+            &["--pasta-path-search", "--pasta-path", "/a", "list"],
+        ] {
+            assert_eq!(parse_global(v(bad)), Err(UsageError), "{bad:?}");
+        }
     }
 
     /// PLUG-11・CLI-1: `--plugin-path-search` は `--root` と順不同で受理し、重複は使い方エラー。

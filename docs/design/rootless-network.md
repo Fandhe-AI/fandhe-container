@@ -214,6 +214,7 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - 実行は検証したパスで行い、`argv[0]` は常に `pasta` に固定する（12.7）
   - 版の固定は 12.12
 - **理由**: 特権ランチャーの `sanitize_env` は環境を許可リストで作り直し、supervisor は契約の値を環境から読まず、argv は `StartArgs::parse` で固定されている。どちらも変えずに済む経路は既存の文書 FCOPT1 だけである（[container-options-delivery.md](container-options-delivery.md) の却下理由と同じ）。`--plugin-path-search` とは信頼の対象が違うので opt-in は別のフラグにする
+- **実装（#3199）**: 2 フラグの解析は `crates/cli/src/commands/args.rs`、`create` での判定・解決・検証は `commands/create_pasta.rs`（判定表は同ファイルの doc）、`create` 以外への指定の拒否は `commands.rs`。FCOPT1 の kind `pasta` は `crates/supervisor/src/container_options/document.rs`、本文の符号化・復号（`<YYYYMMDD> <dev> <ino> <size> <mtime_sec> <mtime_nsec> <ctime_sec> <ctime_nsec> <uid> <mode(8 進)>\n<絶対パス>`・本文 4096 バイト以下）と `reverify` は `crates/net/src/pasta/record.rs`。復号は本文の形だけを検証し（副作用なし）、バイナリの辿り直しと識別の照合は `reverify_recorded_pasta`（`container_options/pasta.rs`）が行う。**残余**: (1) `--network` のユーザー定義名は #1873 まで `UNIMPLEMENTED` で拒否されるため、本番の `create` が `pasta` を書くのはその後。(2) start 経路からの `reverify_recorded_pasta` の呼び出しと SEC-4 の監査の記録（作成時の `PermissionDenied`・起動時の識別の不一致）は #1940。作成時の記録先は状態ストアを開いた後にしか作れず D2（状態ルートを作る前の拒否）と両立せず、core の `AuditLayer` に pasta の語彙も無いため、本実装は分類（`PastaReverifyError::tamper_suspected`）だけを返す。(3) pasta の解決・検証の子（`--version`）が、`UNIMPLEMENTED` の拒否より前に 1 回起動される（`FailedPrecondition` と検証失敗の分類を作成前に返すため）。
 - **却下した案**: 環境変数・設定ファイル（オーナー決定で不採用）、`--plugin-path-search` を pasta にも効かせる（plugin と pasta の opt-in が結合する）、supervisor の argv に足す（`MAX_ARGS` と契約が変わる）、core の `StateRecord` に同梱する（plugin 境界の型が変わる）
 
 ### 12.5 opt-in の `PATH` 探索

@@ -36,6 +36,7 @@ mod linux {
         MSG_VERSION_TIMEOUT, MSG_VERSION_TOO_LONG, PastaBinary, search_pasta_in_path_below,
         verify_pasta_binary_below,
     };
+    use fandhe_container_net::pasta::record::{MSG_RECORD_CHANGED, PastaRecord};
     use fandhe_container_net::pasta::version::{
         MSG_VERSION_EXIT, MSG_VERSION_TOO_OLD, MSG_VERSION_UNPARSABLE,
     };
@@ -289,5 +290,39 @@ mod linux {
             (C::PermissionDenied, MSG_UNTRUSTED),
             "最初の候補の失敗で止まり後ろへ進まない"
         );
+
+        // 記録と起動時の再検証（#3199・NET-9・SEC-4）: 一致すれば同じバイナリ、変われば FailedPrecondition。
+        let rec_bin = verify(&place_exe(base, "ok", 0o755)).expect("rec");
+        let rec = rec_bin.record();
+        let parsed = PastaRecord::parse_body(&rec.to_body()).expect("round trip");
+        assert_eq!(parsed, rec);
+        assert_eq!(parsed.reverify_below(anchor).expect("same"), rec_bin);
+        let mode_changed = base.join("ok/pasta");
+        std::fs::set_permissions(&mode_changed, std::fs::Permissions::from_mode(0o750))
+            .expect("chmod");
+        let e = parsed.reverify_below(anchor).map(|_| ()).unwrap_err();
+        assert_eq!(
+            (e.code(), e.message()),
+            (C::FailedPrecondition, MSG_RECORD_CHANGED),
+            "権限の変更は差し替えとみなす"
+        );
+        // 別 inode への置き換え（同じパス）。
+        std::fs::set_permissions(&mode_changed, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let rec2 = verify(&mode_changed).expect("rec2").record();
+        let replaced = base.join("ok/pasta.new");
+        std::fs::copy(std::env::current_exe().expect("exe"), &replaced).expect("copy");
+        std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::rename(&replaced, &mode_changed).expect("rename");
+        let e = rec2.reverify_below(anchor).map(|_| ()).unwrap_err();
+        assert_eq!(
+            (e.code(), e.message()),
+            (C::FailedPrecondition, MSG_RECORD_CHANGED),
+            "別 inode への置き換え"
+        );
+        // 消えたら NotFound（差し替えとは区別する）。
+        std::fs::remove_file(&mode_changed).expect("rm");
+        let e = rec2.reverify_below(anchor).map(|_| ()).unwrap_err();
+        assert_eq!((e.code(), e.message()), (C::NotFound, MSG_NOT_FOUND));
     }
 }

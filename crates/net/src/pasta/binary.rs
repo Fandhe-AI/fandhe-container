@@ -231,6 +231,23 @@ pub fn search_pasta_in_path_below(
     imp::search(path_env, Some(anchor))
 }
 
+/// パスの形の検査（相対・`.` / `..`・非 UTF-8・制御文字・長さ）。入口と readlink の結果の両方に課す。
+///
+/// OS 非依存（FCOPT1 の記録 [`super::record`] の復号も同じ規則を課す。二重に書かない）。
+pub(super) fn check_shape(path: &Path) -> Result<(), NetError> {
+    if path.as_os_str().len() > PASTA_PATH_MAX_BYTES {
+        return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_TOO_LONG));
+    }
+    let s = path
+        .to_str()
+        .ok_or_else(|| err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID))?;
+    let dot = s.split('/').skip(1).any(|c| c == "." || c == "..");
+    if !s.starts_with('/') || s.chars().any(char::is_control) || dot {
+        return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID));
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use super::*;
@@ -282,21 +299,6 @@ mod imp {
         fd.try_clone()
             .and_then(|c| File::from(c).metadata())
             .map_err(|_| err(NetErrorCode::Internal, MSG_INTERNAL))
-    }
-
-    /// パスの形の検査（相対・`.` / `..`・非 UTF-8・制御文字・長さ）。入口と readlink の結果の両方に課す。
-    fn check_shape(path: &Path) -> Result<(), NetError> {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.len() > PASTA_PATH_MAX_BYTES {
-            return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_TOO_LONG));
-        }
-        let s = std::str::from_utf8(bytes)
-            .map_err(|_| err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID))?;
-        let dot = s.split('/').skip(1).any(|c| c == "." || c == "..");
-        if !s.starts_with('/') || s.chars().any(char::is_control) || dot {
-            return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID));
-        }
-        Ok(())
     }
 
     struct Verified {

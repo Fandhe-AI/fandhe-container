@@ -18,17 +18,27 @@
 //!
 //! fork は単一スレッドの呼び出し元を要求するため、libtest ではなく `harness = false` の単一スレッド `main` で動かす。
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 fn main() {
     println!("exec_seccomp_listener: Linux only, not applicable on this OS");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn main() {
     linux::run();
 }
 
-#[cfg(target_os = "linux")]
+// KCMP の syscall 番号・AUDIT_ARCH は x86_64 / aarch64 の値だけを持つため、同じ対象に閉じる（#3202・MVM-4）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
     use std::cell::Cell;
     use std::io::BufRead as _;

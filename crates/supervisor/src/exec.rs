@@ -173,7 +173,7 @@
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
 //!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
 //!   層 `mount` のレコード（パスなし・理由コード `rootfs_is_host_root` つき。#1701）として
-//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 14 種（core の
+//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 16 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
 //!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595）、結果は [`AuditedOutcome::audit`] で返す
@@ -3482,11 +3482,11 @@ mod tests {
     /// 違反の subject に持たせるホスト側パス（結果行・記録に現れてはならない）。
     const HOST_SUBJECT: &str = "/srv/fandhe/bundles/c1/rootfs";
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 14 理由すべてが結果行へ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 16 理由すべてが結果行へ
     /// `<種別>/<理由>` として載り、往復で同じ理由に戻る。期待 cgroup パス・rootfs のパスはメッセージにも結果行にも載らない。
     #[test]
     fn sec4_sup6_task163_worker_line_carries_worker_violation_reason() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 14);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 16);
         for reason in ViolationReason::EXEC_WORKER_REASONS {
             for err in [
                 exec_target_failure(reason),
@@ -3544,7 +3544,7 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 14 理由それぞれ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 16 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
     /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]

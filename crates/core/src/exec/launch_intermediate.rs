@@ -78,9 +78,10 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    ExecPhaseOutcome, ExecPhaseStep, LaunchAudit, PrePivotStatusError, read_exec_phase_until_close,
-    read_line_bounded, read_pre_pivot_status, read_pre_pivot_status_leaving_tail,
-    resolve_exec_phase_status, resolve_pre_pivot_status,
+    ExecPhaseOutcome, ExecPhaseStep, LaunchAudit, PrePivotStatus, PrePivotStatusError,
+    read_exec_phase_until_close, read_line_bounded, read_mount_identity_block,
+    read_pre_pivot_status, read_pre_pivot_status_leaving_tail, resolve_exec_phase_status,
+    resolve_pre_pivot_status,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
@@ -94,6 +95,7 @@ use super::{
     ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
     SubordinateIsolationPlan, isolate, isolate_rootless_subordinate_no_flush,
 };
+use crate::launch_isolation::RecordedMountIdentity;
 
 /// 報告行の最大バイト数(LF を含む)。最長の行(`R FAILED_PRECONDITION isolate\n` 約 30 バイト)より大きい固定上限。
 pub(super) const REPORT_MAX_BYTES: usize = 48;
@@ -558,6 +560,8 @@ pub(crate) fn spawn_container_via_intermediate(
         setup,
     } = spec;
     let tag = LaunchTag::fresh();
+    // 子が状態 pipe で返す識別子のブロックの期待列（Mount 由来のルールの位置）。fork の前に ruleset から計算する（#3201）。
+    let expected_mounts = stages.mount_rule_positions();
     launch_via_intermediate(
         sys::self_is_single_threaded,
         |status, report, gate_r, listener_end| {
@@ -576,7 +580,7 @@ pub(crate) fn spawn_container_via_intermediate(
             };
             intermediate_body(&mut ops)
         },
-        true,
+        Some(&expected_mounts),
         subreaper,
         audit,
         timeout,
@@ -605,6 +609,10 @@ pub(crate) struct LaunchedChild {
     /// 検証済みの listener。本番の入口(`spawn_container_via_intermediate`)は必ず `Some`(受け取れなければ
     /// 起動失敗)。受け渡し無しの試験用経路だけが `None`。
     pub(crate) listener: Option<SeccompListener>,
+    /// 子が pivot 前段の直後に返した Mount 由来のルールの launch 時の識別子（`(ルール位置, 識別子)`。昇順。親が fork の前に
+    /// 計算した期待列と完全一致を確認済み）。launcher が分離の記録へ添える（SEC-1・SEC-4・#3201）。受け渡し無しの
+    /// 試験用経路は空。
+    pub(crate) mount_identities: Vec<(usize, RecordedMountIdentity)>,
 }
 
 /// [`spawn_container_via_intermediate`] の本体。中間プロセスの動作(`intermediate`)と fork 前のスレッド数判定を
@@ -613,16 +621,17 @@ pub(crate) struct LaunchedChild {
 /// `intermediate` は fork した中間プロセスの中で `(状態 pipe の書き込み側, 報告 pipe の書き込み側, 開始ゲートの
 /// 読み取り側, listener socketpair の子の端)` を受けて呼ばれ、戻り値が `_exit` の終了コードになる。
 ///
-/// `with_listener` が真なら、状態の判定が成功した後に PID 1 から seccomp の listener を期限つきで受け取って検証し
-/// (EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗。fail-closed)、ACK を返す。偽は受け渡しの無い試験用の
-/// 立て替え PID 1 のためだけに使い、本番の入口は常に真。
+/// `listener_handoff` が `Some(expected_mounts)` なら、状態の判定（`P`）が成功した後に、子が返す識別子のブロック
+/// （`launch_status` の `L`/`M`。ルール位置が `expected_mounts` と完全一致すること。#3201）を読み切り、そのあと PID 1 から
+/// seccomp の listener を期限つきで受け取って検証し(EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗。
+/// fail-closed)、ACK を返す。`None` は受け渡しの無い試験用の立て替え PID 1 のためだけに使い、本番の入口は常に `Some`。
 // 理由: 注入点(スレッド判定・中間プロセス・listener の有無)と、期限・監査・識別子・警告の出力先は独立に差し替える値で、
 // 束ねる型を作ると試験側の組み立てが増えるだけのため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn launch_via_intermediate(
     is_single_threaded: impl FnOnce() -> bool,
     intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File, &OwnedFd) -> i32,
-    with_listener: bool,
+    listener_handoff: Option<&[usize]>,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -754,15 +763,36 @@ fn launch_via_intermediate(
     }
 
     // listener を受け取る経路(本番)は、後ろのバイト(Landlock 段の `E`)を取り込まない版で 1 行目を読む(#2130)。
-    let status = if with_listener {
+    let status = if listener_handoff.is_some() {
         read_pre_pivot_status_leaving_tail(&status_r, remaining())
     } else {
         read_pre_pivot_status(&status_r, remaining())
     };
+    // `P` の直後の識別子のブロックは、listener を受け取る前に読み切る(PID 1 は `P` の後に先にこれを書く。#3201)。
+    // 欠落・形式違反・期限切れは listener を受け取らず PID 1 を回収する(記録できない識別子で走らせない。fail-closed)。
+    let mut mount_identities = Vec::new();
+    let status = match (status, listener_handoff) {
+        (Ok(PrePivotStatus::Ready), Some(expected)) => {
+            match read_mount_identity_block(&status_r, expected, remaining()) {
+                Ok(ids) => {
+                    mount_identities = ids;
+                    Ok(PrePivotStatus::Ready)
+                }
+                Err(e) => {
+                    return Err(kill_pid1_failure(
+                        child,
+                        AuditedRejection::not_applicable(e.to_exec_error()),
+                    ));
+                }
+            }
+        }
+        (other, _) => other,
+    };
     match resolve_pre_pivot_status(status, audit) {
-        Ok(()) if !with_listener => Ok(LaunchedChild {
+        Ok(()) if listener_handoff.is_none() => Ok(LaunchedChild {
             child,
             listener: None,
+            mount_identities: Vec::new(),
         }),
         Ok(()) => match receive_listener_or_closed(parent_end.as_fd(), pid1.get(), deadline) {
             // listener を受け取って ACK を返した後に、PID 1 が書く exec 前の 2 行目(`R`/`E`)を読む(SEC-4・#2624)。
@@ -774,6 +804,7 @@ fn launch_via_intermediate(
                     Ok(()) => Ok(LaunchedChild {
                         child,
                         listener: Some(listener),
+                        mount_identities,
                     }),
                     Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
                 }
@@ -1412,7 +1443,7 @@ mod tests {
     use crate::exec::ViolationReason;
     use crate::exec::launch_status::{
         ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
-        report_exec_returned, report_failure, report_ready,
+        report_exec_returned, report_failure, report_mount_identities, report_ready,
     };
     use crate::exec::process::ChildExit;
     use crate::traits::{ContainerId, TraitError};
@@ -1895,7 +1926,7 @@ mod tests {
                 }
                 0
             },
-            false,
+            None,
             &subreaper,
             audit,
             timeout,
@@ -1946,6 +1977,18 @@ mod tests {
         WrongSender,
         /// listener を得る前の適用失敗(`EBUSY` 相当の `FailedPrecondition`)を構造化して送り、0 で終了する。
         ReportBusy,
+        /// `P` の直後に Mount 由来のルール 2 本(位置 1・3)の識別子のブロックを書き、`Good` と同じに進む(#3201)。
+        MountIdentitiesGood,
+        /// 上と同じだが、2 本目のルール位置が期待(3)と食い違う 4 を書く(`Malformed`。listener は受け取らない)。
+        MountIdentitiesWrongRule,
+    }
+
+    /// `MountIdentitiesGood` が書く識別子(位置 1・3)。
+    fn fake_mount_identities() -> Vec<(usize, RecordedMountIdentity)> {
+        vec![
+            (1, RecordedMountIdentity::new(11, 2, 3, false).unwrap()),
+            (3, RecordedMountIdentity::new(13, 4, 5, true).unwrap()),
+        ]
     }
 
     /// 実 listener を載せた状態の fd を作る(forked 単一スレッドの子の中でだけ呼ぶ。filter は子に残る)。
@@ -1999,9 +2042,25 @@ mod tests {
                         return EXIT_SETUP_FAILED;
                     }
                     let _ = report_ready(s);
+                    // `P` の直後に識別子のブロックを書く(`NoSend` は書かずに終了する。#3201)。
+                    let block = match mode {
+                        Handoff::NoSend => None,
+                        Handoff::MountIdentitiesGood => Some(fake_mount_identities()),
+                        Handoff::MountIdentitiesWrongRule => {
+                            let mut ids = fake_mount_identities();
+                            ids[1].0 = 4;
+                            Some(ids)
+                        }
+                        _ => Some(Vec::new()),
+                    };
+                    if let Some(entries) = block {
+                        let _ = report_mount_identities(s, &entries);
+                    }
                     let sender = ListenerSender::new(end);
                     match mode {
-                        Handoff::Good => {
+                        Handoff::Good
+                        | Handoff::MountIdentitiesGood
+                        | Handoff::MountIdentitiesWrongRule => {
                             match sender.hand_over(child_listener(), Duration::from_secs(10)) {
                                 Ok(()) => {
                                     let _ = report_exec_ready(s);
@@ -2132,7 +2191,10 @@ mod tests {
                 }
                 0
             },
-            true,
+            Some(match mode {
+                Handoff::MountIdentitiesGood | Handoff::MountIdentitiesWrongRule => &[1, 3],
+                _ => &[],
+            }),
             &subreaper,
             audit,
             timeout,
@@ -2282,6 +2344,33 @@ mod tests {
         assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
     }
 
+    /// SEC-1・SEC-4・#3201: `P` の直後に子が返した Mount 由来のルールの識別子が、期待列(位置 1・3)と一致すれば
+    /// `LaunchedChild::mount_identities` に載る。位置が期待と食い違えば listener を受け取らず PID 1 を回収して
+    /// 起動失敗にする(fail-closed)。
+    #[test]
+    fn sec1_3201_launch_carries_mount_identities_and_rejects_a_mismatch() {
+        let _serial = serialize_forks();
+        let (result, _, _) = run_handoff(Handoff::MountIdentitiesGood, Duration::from_secs(20));
+        let launched = result.expect("launch must succeed");
+        assert_eq!(launched.mount_identities, fake_mount_identities());
+        assert!(launched.listener.is_some());
+
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::MountIdentitiesWrongRule, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.error.message,
+            "the pre-pivot status is malformed"
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
     /// SEC-4・#2024: PID 1 が載せた実 listener を C が受け取り、種別・close-on-exec を満たす。PID 1 は ACK を
     /// 受けて 0 で終了する。
     #[test]
@@ -2310,7 +2399,7 @@ mod tests {
         let (result, elapsed, _) = run_handoff(Handoff::NoSend, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
-        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Spawn);
         assert!(failure.unreaped.is_empty());
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
@@ -2372,7 +2461,7 @@ mod tests {
             crate::audit_log::AuditDelivery::NotApplicable
         );
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
-        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Spawn);
         assert!(records.is_empty());
     }
 
@@ -3151,7 +3240,7 @@ mod tests {
                 // 報告せずに終了する。
                 EXIT_SETUP_FAILED
             },
-            false,
+            None,
             &_subreaper,
             audit,
             Duration::from_secs(5),
@@ -3402,7 +3491,7 @@ mod tests {
         let result = launch_via_intermediate(
             || false,
             |_, _, _, _| panic!("the intermediate must not run"),
-            false,
+            None,
             &subreaper,
             audit,
             Duration::from_secs(1),

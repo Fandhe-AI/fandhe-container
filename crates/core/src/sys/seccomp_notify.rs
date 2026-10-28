@@ -39,9 +39,7 @@
 //!
 //! `SO_PEERCRED` は socketpair では作成者（呼び出し元自身）を両端で返し検証の意味が無いため使わない。
 
-use super::{
-    ArchSysNo, EINVAL, PollFd, SockFprog, SysError, consts, fcntl, ioctl, last_error, poll, syscall,
-};
+use super::{ArchSysNo, EINVAL, PollFd, SockFprog, SysError, consts, fcntl, last_error, poll};
 use crate::seccomp::SeccompProgram;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
@@ -342,7 +340,7 @@ pub(crate) fn seccomp_set_filter_new_listener(
     // 呼び出し後にポインタを保持しない。`len` は実際の命令数と一致する（`SeccompProgram` の型保証）。
     // 成功時の戻り値はカーネルが新規に確保した listener fd で、他に所有者がいない。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             SECCOMP_SET_MODE_FILTER,
             SECCOMP_FILTER_FLAG_NEW_LISTENER,
@@ -793,7 +791,7 @@ pub(crate) fn notif_recv(fd: BorrowedFd<'_>) -> Result<Option<RawNotification>, 
     // SAFETY: `notif` は 80 バイトの `#[repr(C)]` で初期化済み・書き込み可能。`RECV` の要求サイズ(80)と一致し、
     // カーネルは呼び出しの間だけそれへ書く。`fd` は生存中の `BorrowedFd`。
     let rc = unsafe {
-        ioctl(
+        ffi_ioctl!(
             fd.as_raw_fd(),
             SECCOMP_IOCTL_NOTIF_RECV,
             &raw mut notif as usize as u64,
@@ -823,7 +821,7 @@ pub(crate) fn notif_id_valid(fd: BorrowedFd<'_>, id: u64) -> Result<bool, SysErr
     let mut id = id;
     // SAFETY: `id` はスタック上の `u64` で、`ID_VALID` が読む 8 バイトと一致する。読み取りのみで状態を変えない。
     let rc = unsafe {
-        ioctl(
+        ffi_ioctl!(
             fd.as_raw_fd(),
             SECCOMP_IOCTL_NOTIF_ID_VALID,
             &raw mut id as usize as u64,
@@ -858,7 +856,7 @@ pub(crate) fn notif_send_eperm(fd: BorrowedFd<'_>, id: u64) -> Result<bool, SysE
         // SAFETY: `resp` はスタック上の 24 バイトの `#[repr(C)]` で、`SEND` が読むサイズ（24）と一致する。
         // カーネルは呼び出しの間だけ読み、ポインタを保持しない。
         let rc = unsafe {
-            ioctl(
+            ffi_ioctl!(
                 fd.as_raw_fd(),
                 SECCOMP_IOCTL_NOTIF_SEND,
                 &raw mut resp as usize as u64,

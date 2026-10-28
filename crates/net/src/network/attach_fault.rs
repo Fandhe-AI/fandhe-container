@@ -21,7 +21,7 @@ use std::path::Path;
 
 use super::{
     AttachOps, AttachStep, EndpointId, NetnsFailure, NftApplyFailure, PortPublish,
-    PublishedListeners, RuleHandlePair, UnpinFailure,
+    PublishedListeners, RuleHandlePair, UnpinFailure, VethCreated,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
@@ -135,7 +135,7 @@ impl<O: AttachOps> AttachOps for FaultyAttachOps<O> {
             None => self.inner.unpin_netns(ns),
         }
     }
-    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError> {
+    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<VethCreated, NetError> {
         self.inner.create_veth(host, peer)
     }
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {

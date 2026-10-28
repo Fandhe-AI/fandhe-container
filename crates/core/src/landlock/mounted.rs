@@ -22,11 +22,12 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - exec の再適用（SUP-6）は launch 時の記録を持たない（`LaunchIsolationRecord` がマウントの識別子を持たず、
-//!   マウント ID は restart で変わる）ため [`MountCheck::NotRecorded`] で、従来どおり暗黙のマウントの
-//!   fs 種別・独立性の確認だけを行う。永続化と照合は後続作業
-//! - 読み取り専用の記録（`MountedTarget::read_only`。#1917）は bind の段の事後検証済みの値だけを持つ。exec の再適用は
-//!   記録を持たないため、`ro` の bind に頼るルールは開いた fd の `fstatfs` だけで確かめる
+//! - exec の再適用（SUP-6）は、`state.json` に永続化した launch 時の識別子（`RecordedMountIdentity`）を
+//!   [`MountedTargets::from_recorded`] で組み直して [`MountCheck::Recorded`] で照合する（#3201）。識別子の無い旧記録は
+//!   exec の入口が `FailedPrecondition` で拒否するため、本モジュールの [`MountCheck::NotRecorded`] に落ちない。
+//!   マウント ID は restart で変わるが、restart は Running(新 pid) の更新で記録を新しい識別子へ置き換える（契約 12）
+//! - 読み取り専用の記録（`MountedTarget::read_only`。#1917）は bind の段の事後検証済みの値だけを持ち、exec の再適用も
+//!   永続化した値で照合する
 //! - 利用者の tmpfs・注入の宛先には今は Landlock のルールが無い。識別子は記録するが、照合の対象は
 //!   今あるルール（暗黙の `/dev` 系 3 本と bind）だけ
 //! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）は使わない（#2130 の判断）。`mnt_id` の再利用による取り違えは
@@ -111,6 +112,44 @@ impl MountedTargets {
         Ok(())
     }
 
+    /// 分離の記録（`state.json` の `launch_isolation`）に残した launch 時の識別子から、exec の再適用が照合に使う
+    /// 記録を組み直す（SEC-1・SEC-4・#3201）。
+    ///
+    /// [`Self::target_for`] の引き方と鏡写しにする: 暗黙の `/dev`・`/dev/pts` は専用 `/dev` の段、`/dev/shm` は
+    /// **tmpfs の段**（宛先 `/dev/shm`。`DefaultDevices` にしない）、`Mount` は bind の段の同じ `index`、利用者 tmpfs は
+    /// tmpfs の段の同じ宛先。識別子の無い規則（`Root`・旧記録）は載せない。
+    pub(crate) fn from_recorded(
+        recorded: &crate::launch_isolation::RecordedLandlock,
+    ) -> Result<Self, MountedTargetsFull> {
+        use crate::launch_isolation::RecordedTarget;
+        let mut out = Self::new();
+        for rule in recorded.rules() {
+            let Some(id) = rule.mount() else { continue };
+            let (by, destination) = match rule.target() {
+                RecordedTarget::Root => continue,
+                RecordedTarget::Implicit(ImplicitDevMount::DevShm) => {
+                    (MountedBy::Tmpfs, ImplicitDevMount::DevShm.destination())
+                }
+                RecordedTarget::Implicit(m) => (MountedBy::DefaultDevices(*m), m.destination()),
+                RecordedTarget::Mount { destination, index } => {
+                    (MountedBy::Bind { index: *index }, destination.as_str())
+                }
+                RecordedTarget::Tmpfs { destination } => (MountedBy::Tmpfs, destination.as_str()),
+            };
+            out.push(MountedTarget {
+                by,
+                destination: destination.to_string(),
+                identity: MountIdentity {
+                    mnt_id: id.mnt_id(),
+                    dev: id.dev(),
+                    ino: id.ino(),
+                },
+                read_only: id.read_only(),
+            })?;
+        }
+        Ok(out)
+    }
+
     /// 件数。
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -161,7 +200,7 @@ impl MountedTargets {
 pub(crate) enum MountCheck<'a> {
     /// launch 経路。pivot 前段が記録した識別子と照合する。ルールが Mount 由来で記録が引けなければ拒否する。
     Recorded(&'a MountedTargets),
-    /// launch 時の記録を照合に使えない経路（exec の再適用と結合試験専用の観測関数）。暗黙のマウントの
+    /// launch 時の記録を照合に使えない経路（結合試験専用の観測関数。exec の再適用は #3201 で `Recorded` になった）。暗黙のマウントの
     /// fs 種別・独立性の確認は従来どおり行い、識別子の照合はしない（弱めない。REPAIR-3 の例外。launch の入口
     /// 〔`StagePipeline`〕はこの variant を構築しない）。
     NotRecorded,

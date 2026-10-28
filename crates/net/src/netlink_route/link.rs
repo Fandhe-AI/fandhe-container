@@ -96,6 +96,13 @@ pub const IFLA_NET_NS_FD: u16 = 28;
 pub const IFF_UP: u32 = 0x1;
 /// 所属先の master（bridge）の ifindex を指す属性（`linux/if_link.h` の `IFLA_MASTER`。u32）。
 pub const IFLA_MASTER: u16 = 10;
+/// veth の peer の ifindex を指す属性（`linux/if_link.h` の `IFLA_LINK`。u32）。veth の
+/// `ndo_get_iflink` は peer の ifindex を返すため、作成通知から peer 側の ifindex を取るのに使う
+/// （Issue #3205・NET-1）。
+pub const IFLA_LINK: u16 = 5;
+/// `IFLA_LINK` が別 netns の link を指すときに付く netns ID の属性（`linux/if_link.h`）。作成通知に
+/// 付いていれば `IFLA_LINK` の ifindex は別 netns のものになるため、拒否する（Issue #3205）。
+pub const IFLA_LINK_NETNSID: u16 = 37;
 /// リンク種別情報のネスト属性（`linux/if_link.h`）。
 pub const IFLA_LINKINFO: u16 = 18;
 /// リンク種別名（`bridge`・`veth` 等。`linux/if_link.h`）。
@@ -188,9 +195,10 @@ impl LinkCreate {
     }
 
     /// 作成要求に `NLM_F_ECHO` を付け、カーネルが返す作成通知（`RTM_NEWLINK`）を `NetlinkReply::messages`
-    /// に集める指定にする（Issue #1972・NET-1）。
+    /// に集める指定にする（Issue #1972・#3205・NET-1）。bridge と veth のどちらにも使える。
     ///
-    /// 呼び出し元は通知を [`decode_created_link`] で検証して作成した link 自身の ifindex を得る。名前での
+    /// 呼び出し元は通知を bridge なら [`decode_created_link`]、veth なら [`decode_created_veth`] で検証して
+    /// 作成した link 自身の ifindex を得る（veth の peer は同じ通知の `IFLA_LINK` から取る）。名前での
     /// 引き直しをなくし、所有トークンを付ける相手を「自分が作った link」に固定するのが目的。
     /// 通知を返すのは Linux v6.2 以降（`rtnl_configure_link` が portid・`nlh` を受けて `NLM_F_ECHO` を
     /// 守る）。それより前のカーネルでは ACK だけが返るため、呼び出し側は通知なしを戻し経路で扱うこと。
@@ -550,6 +558,75 @@ pub fn decode_created_link<'a>(
     messages: impl IntoIterator<Item = (u16, &'a [u8])>,
     expected: &IfName,
 ) -> Result<Option<IfIndex>, NetError> {
+    Ok(decode_created_payload(messages, expected)?.map(|(index, _)| index))
+}
+
+/// `NLM_F_ECHO` 付きの veth 作成要求に対する作成通知から取り出した、ペアの両端の ifindex
+/// （Issue #3205・NET-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedVeth {
+    host: IfIndex,
+    peer: IfIndex,
+}
+
+impl CreatedVeth {
+    /// 主側（`IFLA_IFNAME` の host 名）の ifindex。
+    pub fn host(&self) -> IfIndex {
+        self.host
+    }
+
+    /// peer 側の ifindex（通知の `IFLA_LINK`）。
+    pub fn peer(&self) -> IfIndex {
+        self.peer
+    }
+}
+
+/// `NLM_F_ECHO` 付きの veth 作成要求に対する応答メッセージから、ペアの両端の ifindex を取り出す
+/// （Issue #3205・NET-1）。
+///
+/// echo されるのは主側（`host`）の通知 1 件だけで、peer の ifindex は同じ通知の `IFLA_LINK` に載る
+/// （veth の `ndo_get_iflink` が peer の ifindex を返す）。判定は [`decode_created_link`] と同じ
+/// （0 件 → `Ok(None)`。2 件以上・破損・名前不一致・別名あり → `DataLoss`）に加えて、`IFLA_LINK` が
+/// 4 バイトの正の値で自分の ifindex と異なること、`IFLA_LINK_NETNSID`（peer が別 netns にいる印）が
+/// 無いことを要求し、満たさなければ `DataLoss`。
+pub fn decode_created_veth<'a>(
+    messages: impl IntoIterator<Item = (u16, &'a [u8])>,
+    host: &IfName,
+) -> Result<Option<CreatedVeth>, NetError> {
+    let Some((host_index, payload)) = decode_created_payload(messages, host)? else {
+        return Ok(None);
+    };
+    let (link, has_netnsid) = decode_ifinfomsg_link(payload)?;
+    if has_netnsid {
+        return Err(NetError::new(
+            NetErrorCode::DataLoss,
+            "veth creation notification points at a peer in another netns",
+        ));
+    }
+    let peer = link.ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "veth creation notification has no IFLA_LINK",
+        )
+    })?;
+    if peer == host_index {
+        return Err(NetError::new(
+            NetErrorCode::DataLoss,
+            "veth creation notification has the same ifindex for both ends",
+        ));
+    }
+    Ok(Some(CreatedVeth {
+        host: host_index,
+        peer,
+    }))
+}
+
+/// 作成通知の共通検証。`RTM_NEWLINK` がちょうど 1 件で、ifindex が正・名前が `expected` と一致・別名なし
+/// のとき、その ifindex とペイロードを返す。0 件は `Ok(None)`。
+fn decode_created_payload<'a>(
+    messages: impl IntoIterator<Item = (u16, &'a [u8])>,
+    expected: &IfName,
+) -> Result<Option<(IfIndex, &'a [u8])>, NetError> {
     let mut found: Option<&[u8]> = None;
     for (msg_type, payload) in messages {
         if msg_type != RTM_NEWLINK {
@@ -583,7 +660,35 @@ pub fn decode_created_link<'a>(
             "link creation notification already has an alias",
         ));
     }
-    Ok(Some(index))
+    Ok(Some((index, payload)))
+}
+
+/// `RTM_NEWLINK` 応答のペイロードから `IFLA_LINK`（veth なら peer の ifindex）と、`IFLA_LINK_NETNSID` の
+/// 有無を取り出す。長さが 4 バイトでない `IFLA_LINK`・0 以下の値は `DataLoss`（Issue #3205）。
+fn decode_ifinfomsg_link(payload: &[u8]) -> Result<(Option<IfIndex>, bool), NetError> {
+    let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::DataLoss,
+            "link reply is shorter than ifinfomsg",
+        )
+    })?;
+    let mut link = None;
+    let mut has_netnsid = false;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() == IFLA_LINK && link.is_none() {
+            let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_LINK has an invalid length")
+            })?;
+            let index = IfIndex::new(u32::from_ne_bytes(raw)).map_err(|_| {
+                NetError::new(NetErrorCode::DataLoss, "IFLA_LINK is not a valid ifindex")
+            })?;
+            link = Some(index);
+        } else if attr.attr_type() == IFLA_LINK_NETNSID {
+            has_netnsid = true;
+        }
+    }
+    Ok((link, has_netnsid))
 }
 
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFALIAS` を取り出す（無ければ `None`）。
@@ -677,6 +782,16 @@ mod tests {
     }
 
     fn link_payload(index: i32, name: Option<&[u8]>, alias: Option<&[u8]>) -> Vec<u8> {
+        link_payload_ext(index, name, alias, &[])
+    }
+
+    /// `extra` は `(属性型, ペイロード)` を追加する（`IFLA_LINK`・`IFLA_LINK_NETNSID` 用）。
+    fn link_payload_ext(
+        index: i32,
+        name: Option<&[u8]>,
+        alias: Option<&[u8]>,
+        extra: &[(u16, &[u8])],
+    ) -> Vec<u8> {
         let mut b = NlMsgBuilder::new(RTM_NEWLINK, 0, 1, 0);
         b.put_fixed(&ifinfomsg(index, 0, 0)).unwrap();
         if let Some(n) = name {
@@ -684,6 +799,9 @@ mod tests {
         }
         if let Some(a) = alias {
             b.put_attr(IFLA_IFALIAS, a).unwrap();
+        }
+        for (t, p) in extra {
+            b.put_attr(*t, p).unwrap();
         }
         let data = b.finish().unwrap();
         let msg = crate::netlink::NlMsgIter::new(&data)
@@ -1189,6 +1307,11 @@ mod tests {
     fn net1_with_echo_adds_only_echo_flag() {
         let echo = LinkCreate::bridge(name("br0")).with_echo();
         assert_eq!(echo.flags(), 0x0608);
+        // veth（Issue #3205）も同じ flags になる。
+        let veth_echo = LinkCreate::veth(name("fcvh0"), name("fcvp0"))
+            .unwrap()
+            .with_echo();
+        assert_eq!(veth_echo.flags(), 0x0608);
         assert_eq!(echo.flags() & (NLM_F_REQUEST | NLM_F_ACK), 0);
         assert_eq!(LinkCreate::bridge(name("br0")).flags(), 0x0600);
         assert_eq!(
@@ -1240,6 +1363,80 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::DataLoss);
     }
 
+    /// NET-1・Issue #3205: veth の作成通知から host / peer の ifindex を取り出す。
+    #[test]
+    fn net1_decode_created_veth_cases() {
+        let host = name("fcvh0");
+        let link = |v: u32| v.to_ne_bytes();
+        let ok = link_payload_ext(7, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &link(8))]);
+        let none: [(u16, &[u8]); 0] = [];
+        assert_eq!(decode_created_veth(none, &host).unwrap(), None);
+        assert_eq!(
+            decode_created_veth([(RTM_DELLINK, ok.as_slice())], &host).unwrap(),
+            None
+        );
+        let got = decode_created_veth([(RTM_NEWLINK, ok.as_slice())], &host)
+            .unwrap()
+            .unwrap();
+        assert_eq!((got.host().get(), got.peer().get()), (7, 8));
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "name mismatch",
+                link_payload_ext(7, Some(b"other\0"), None, &[(IFLA_LINK, &link(8))]),
+            ),
+            (
+                "no name",
+                link_payload_ext(7, None, None, &[(IFLA_LINK, &link(8))]),
+            ),
+            (
+                "alias",
+                link_payload_ext(
+                    7,
+                    Some(b"fcvh0\0"),
+                    Some(b"tok\0"),
+                    &[(IFLA_LINK, &link(8))],
+                ),
+            ),
+            (
+                "index 0",
+                link_payload_ext(0, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &link(8))]),
+            ),
+            ("no IFLA_LINK", link_payload(7, Some(b"fcvh0\0"), None)),
+            (
+                "IFLA_LINK length 3",
+                link_payload_ext(7, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &[1, 0, 0])]),
+            ),
+            (
+                "IFLA_LINK zero",
+                link_payload_ext(7, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &link(0))]),
+            ),
+            (
+                "IFLA_LINK same as self",
+                link_payload_ext(7, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &link(7))]),
+            ),
+            (
+                "IFLA_LINK_NETNSID",
+                link_payload_ext(
+                    7,
+                    Some(b"fcvh0\0"),
+                    None,
+                    &[(IFLA_LINK, &link(8)), (IFLA_LINK_NETNSID, &link(1))],
+                ),
+            ),
+            ("short", vec![0u8; 8]),
+        ];
+        for (label, p) in &bad {
+            let e = decode_created_veth([(RTM_NEWLINK, p.as_slice())], &host).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
+        }
+        let e = decode_created_veth(
+            [(RTM_NEWLINK, ok.as_slice()), (RTM_NEWLINK, ok.as_slice())],
+            &host,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+    }
+
     /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。
     #[test]
     fn net1_decode_ifinfomsg_name_cases() {
@@ -1277,6 +1474,8 @@ mod libc_abi {
         libc_const_eq!(IFLA_NET_NS_PID, u16, c_ushort);
         libc_const_eq!(IFLA_NET_NS_FD, u16, c_ushort);
         libc_const_eq!(IFLA_MASTER, u16, c_ushort);
+        libc_const_eq!(IFLA_LINK, u16, c_ushort);
+        libc_const_eq!(IFLA_LINK_NETNSID, u16, c_ushort);
         libc_const_eq!(IFLA_LINKINFO, u16, c_ushort);
         libc_const_eq!(IFLA_INFO_KIND, u16, c_ushort);
         libc_const_eq!(IFLA_INFO_DATA, u16, c_ushort);

@@ -5,7 +5,7 @@
 //! `minimal_rootfs.rs`（core・supervisor・cli の実機前提試験の rootfs 組み立て）と
 //! `benches/src/startup_latency/bundle.rs`（起動 p95 ベンチの bundle 構築）が `#[path]` で取り込む。
 //! ELF の `PT_INTERP` の解析・`/proc/self/maps` の解釈・`LD_LIBRARY_PATH` の組み立てを 1 か所に集め、
-//! 修正が 4 か所へ波及するのを避ける。
+//! 修正が 4 か所へ波及するのを避ける。ファイル操作（コピー）は別ファイルの `file_copy.rs` が担う（#3041）。
 //!
 //! # 契約
 //! - std のみに依存し、`fandhe_container_*` を use しない。panic もしない（エラーの形は呼び出し側が決める）

@@ -174,9 +174,9 @@ cat <<'EOF'
   fio-baseline-ratio                  scripts/targets/fio-baseline-ratio.sh
                                         fio ベースライン比を算出する（BASELINE/CANDIDATE に results.json のパスを指定）
   startup-latency                     scripts/targets/startup-latency.sh
-                                        起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+                                        起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL OUTPUT）
   startup-latency-docker              scripts/targets/startup-latency-docker.sh
-                                        Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。TASK-46.2）
+                                        Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL IMAGE OUTPUT。TASK-46.2）
   startup-latency-report              scripts/targets/startup-latency-report.sh
                                         own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）
   net-setup-timing                    scripts/targets/net-setup-timing.sh

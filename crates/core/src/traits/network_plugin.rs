@@ -41,10 +41,12 @@
 //! # 未対応（スコープ外。#19・TASK-4.h1 と後続タスクへ引き継ぐ）
 //!
 //! - NET-6 の host / none モードは `NetworkPlugin` を経由しない。core の `LaunchNetworkMode`（`Host` / `Loopback`）と
-//!   supervisor の起動経路が扱う（`docs/design/network-wiring.md` D5〜D8・#1870。config との突き合わせは #3058、
-//!   Loopback の netns は #3064〔実装済み〕、netns 素性の照合は #1873）
+//!   supervisor の起動経路が扱う（`docs/design/network-wiring.md` D5〜D8・#1870。config との突き合わせは #3058〔実装済み〕、
+//!   Loopback の netns は #3064〔実装済み〕、exec 直前の同期点での netns 素性の照合は #3206、host モードの結線と構造化ログは #1873）
+//! - NET-9 の rootless ネットワーク（pasta 構成。確定済み〔Fandhe-AI/fandhe-container-spec#18〕）も `NetworkPlugin` を経由しない。
+//!   supervisor（core 側）が `crates/net` の関数で pasta を起動・監視・回収する（`docs/design/rootless-network.md`・#1935。実装は #1936〜#1940）
 //! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、
-//!   `--add-host` / `--dns`（NET-12）、rootless ネットワーク（NET-9・検討中）、
+//!   `--add-host` / `--dns`（NET-12）、
 //!   ホスト側 bind IP の解釈（運ぶ口は任意指定の `host_ip` として足した。#2676）
 //! - 実装（TASK-114・G7 の net crate）と proxy（G8・TASK-107/114）
 //!

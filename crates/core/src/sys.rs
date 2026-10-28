@@ -6922,11 +6922,6 @@ mod tests {
         );
     }
 
-    /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
-    #[cfg(all(
-        target_pointer_width = "64",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
     /// NET-6・#3064: `lo` の up に使う定数・構造体の固定値。
     #[test]
     fn net6_loopback_ioctl_constants_and_layout() {
@@ -6953,6 +6948,11 @@ mod tests {
         assert_eq!(flags & consts::IFF_LOOPBACK, consts::IFF_LOOPBACK);
     }
 
+    /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec4_task41_5_2_netlink_consts_and_layout_are_exact() {
         assert_eq!((consts::AF_NETLINK, consts::SOCK_RAW), (16, 3));

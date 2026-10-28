@@ -11,7 +11,11 @@
 //! 1. 束縛の確認: [`PublishedPort`] が記録したネットワーク名・所有トークンが `network` と一致すること
 //! 2. テーブルの所有の証明: 専用テーブルの `NFTA_TABLE_USERDATA` が所有トークンと一致すること。ルールの
 //!    ハンドルはテーブルごとに採番されるため、同名で作り直された別のテーブルで古いハンドルが別のルールを
-//!    消す事故をここで防ぐ（不一致・不在・照会失敗は何も変えずに `FailedPrecondition` 等で断る）
+//!    消す事故をここで防ぐ（不一致・不在・照会失敗は何も変えずに `FailedPrecondition` 等で断る）。
+//!    [`PublishedPort`] が公開時のテーブルハンドルを持つ（記録つき経路・再起動後の復元。#3068）ときは、生きた
+//!    テーブルのハンドルとも照合する。userdata が同じでもルールセットの退避・復元でテーブルが作り直されると
+//!    ハンドルが変わり、記録したルールハンドルは別のルールを指しうるため、食い違えば DELRULE を送らず
+//!    `FailedPrecondition`（[`UnpublishRules::StaleHandles`]）で断る
 //! 3. `DELRULE` 2 本を 1 バッチ（all-or-nothing）で送る
 //! 4. 結果: 成功なら受け口の予約を戻す。`Aborted` / `NotSent` ならルールは残っている（確定）ので予約を
 //!    保持し [`PublishedPort`] を返して再試行できるようにする。結果不明（`Unknown`）も予約を保持する
@@ -23,8 +27,9 @@
 //! - `CAP_NET_ADMIN` は呼び出し側の責務で、本 crate は権限を上げない。期限は `timeout`（REPAIR-5）
 //! - 所有の証明から DELRULE までの間に、同じ権限を持つ者がテーブルを差し替える窓が残る
 //!   （`delete_network` と同じ水準。nft にテーブルハンドルを条件にした削除は無い）
-//! - [`PublishedPort`] はプロセス内のメモリ上の値で、再起動後の復元（GETRULE dump・永続化。#1870 の後続）は
-//!   無い。再起動後の解放は `delete_network` によるテーブル単位の一括解放だけ
+//! - [`PublishedPort`] 自体はメモリ上の値で、再起動後は `network::recorded` が `members/<id>` の記録
+//!   （受け口・ルールハンドル・テーブルハンドル。#3068）から復元する。dump は使わない。記録の無い公開
+//!   （`table_handle` が `None`）の再起動後の解放は `delete_network` によるテーブル単位の一括解放だけ
 //! - `NetworkPlugin::unpublish_port`（#2904・PLUG-1）は追加済みで、plugin-cri の `netsetup` が本 API を呼ぶ。
 //!   呼び出し元は `set_up_sandbox` の公開途中の失敗の巻き戻し（`pod_network`）。attach 済みコンテナの `detach` は `detach_container`（#3062）が本モジュールの本体 `unpublish_ports_with` を再利用して公開を個別に解除する
 
@@ -33,7 +38,7 @@ use std::fmt;
 use super::delete::require_table_owned;
 use super::{CreatedNetwork, EndpointId, NetworkName, NftApplyFailure, PortPublish, PortRegistry};
 use crate::error::{NetError, NetErrorCode};
-use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
+use crate::nftables_batch::{NftBatchOutcome, NftName, NftTableHandle, TableInfo};
 use crate::nftables_rules::NftRuleHandle;
 
 /// 公開 1 件で投入した DNAT ルール 2 本（`prerouting`・`output`）のハンドル。
@@ -50,6 +55,8 @@ pub struct PublishedPort {
     publish: PortPublish,
     prerouting: NftRuleHandle,
     output: NftRuleHandle,
+    /// ルールを投入したテーブルのハンドル（記録つきの経路だけが持つ。`None` は userdata だけで照合する）。
+    table_handle: Option<NftTableHandle>,
 }
 
 impl PublishedPort {
@@ -68,7 +75,21 @@ impl PublishedPort {
             publish,
             prerouting: handles.0,
             output: handles.1,
+            table_handle: None,
         }
+    }
+
+    /// ルールを投入したテーブルのハンドルを束縛する（記録つき経路の attach 結果と、記録からの復元が使う。#3068）。
+    // 呼び出し元の `network::recorded` と `MemberRecord::published_ports` は Linux 限定（単体試験は全 OS で使う）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_table_handle(mut self, handle: NftTableHandle) -> Self {
+        self.table_handle = Some(handle);
+        self
+    }
+
+    /// 公開時のテーブルハンドル（束縛が無ければ `None`）。解除の前に生きたテーブルのハンドルと照合する。
+    pub fn table_handle(&self) -> Option<NftTableHandle> {
+        self.table_handle
     }
 
     /// 公開したネットワーク。
@@ -107,6 +128,10 @@ pub enum UnpublishRules {
     Unknown,
     /// ルールは消えた（予約の解放だけが失敗した）。
     Removed,
+    /// 記録したテーブルハンドルが生きたテーブルと食い違う（テーブルが作り直された）。DELRULE は送っておらず、
+    /// 記録したルールハンドルは古い。ルールが残っているかは判らないので `Unknown` と同じ扱い（quarantine）にする
+    /// （NET-3・SEC-1・#3068）。
+    StaleHandles,
 }
 
 /// 公開の個別解除の失敗。形は `PublishPortsError` に揃える。
@@ -161,8 +186,21 @@ pub(crate) fn unpublish_ports_with(
             published,
         ));
     }
-    if let Err(e) = require_table_owned(table_info(&network.table), &network.bridge_token) {
-        return Err(refuse(e, published));
+    let live = match require_table_owned(table_info(&network.table), &network.bridge_token) {
+        Ok(h) => h,
+        Err(e) => return Err(refuse(e, published)),
+    };
+    // 記録したテーブルハンドルが生きたものと食い違えば、記録したルールハンドルは別のテーブルのもの。
+    if published.table_handle.is_some_and(|rec| rec != live) {
+        return Err(UnpublishPortError {
+            error: NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "nft table was recreated; recorded rule handles are stale",
+            ),
+            rules: UnpublishRules::StaleHandles,
+            reservation_held: true,
+            published: Some(Box::new(published)),
+        });
     }
     let handles = (published.prerouting, published.output);
     if let Err(f) = delete(&network.table, handles) {
@@ -210,33 +248,74 @@ pub fn unpublish_container_port(
     registry: &mut PortRegistry,
     timeout: std::time::Duration,
 ) -> Result<(), UnpublishPortError> {
-    use crate::nftables_batch::{NftFamily, TableGet};
-    use crate::nftables_rules::RuleDelete;
     unpublish_ports_with(
-        |table| nft.table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), timeout),
-        |table, (prerouting, output)| {
-            nft.send_batch(timeout, |batch| {
-                for (chain, handle) in [("prerouting", prerouting), ("output", output)] {
-                    let rule = RuleDelete::new(
-                        NftFamily::Ipv4,
-                        table.clone(),
-                        NftName::new(chain)?,
-                        handle,
-                    );
-                    batch.push_with(|seq| rule.build(seq))?;
-                }
-                Ok(())
-            })
-            .map(|_| ())
-            .map_err(|e| NftApplyFailure {
-                outcome: e.outcome(),
-                error: e.into(),
-            })
-        },
+        |table| linux_table_info(nft, table, timeout),
+        |table, handles| linux_delete_rules(nft, timeout, table, handles),
         network,
         published,
         registry,
     )
+}
+
+/// 専用テーブルの照会（GETTABLE。読み取りのみ）。記録つきの解除（`network::recorded`）と共用する。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_table_info(
+    nft: &crate::nftables_batch::NetlinkNetfilterSocket,
+    table: &NftName,
+    timeout: std::time::Duration,
+) -> Result<TableInfo, NetError> {
+    use crate::nftables_batch::{NftFamily, TableGet};
+    nft.table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), timeout)
+}
+
+/// `(prerouting, output)` のルールハンドルを指定した DELRULE 2 本を 1 バッチ（all-or-nothing）で送る。
+/// 記録つきの解除（`network::recorded`）と共用する。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_delete_rules(
+    nft: &crate::nftables_batch::NetlinkNetfilterSocket,
+    timeout: std::time::Duration,
+    table: &NftName,
+    (prerouting, output): (NftRuleHandle, NftRuleHandle),
+) -> Result<(), NftApplyFailure> {
+    use crate::nftables_batch::NftFamily;
+    use crate::nftables_rules::RuleDelete;
+    nft.send_batch(timeout, |batch| {
+        for (chain, handle) in [("prerouting", prerouting), ("output", output)] {
+            let rule =
+                RuleDelete::new(NftFamily::Ipv4, table.clone(), NftName::new(chain)?, handle);
+            batch.push_with(|seq| rule.build(seq))?;
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| NftApplyFailure {
+        outcome: e.outcome(),
+        error: e.into(),
+    })
+}
+
+/// 指定したチェインのルール 1 本だけを DELRULE する（1 バッチ）。記録つきの解除が、2 本の一括削除が ENOENT で
+/// 中止された後に、残っているルールを 1 本ずつ確実に消すために使う（NET-3・SEC-1・#3068）。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_delete_rule(
+    nft: &crate::nftables_batch::NetlinkNetfilterSocket,
+    timeout: std::time::Duration,
+    table: &NftName,
+    chain: &'static str,
+    handle: NftRuleHandle,
+) -> Result<(), NftApplyFailure> {
+    use crate::nftables_batch::NftFamily;
+    use crate::nftables_rules::RuleDelete;
+    nft.send_batch(timeout, |batch| {
+        let rule = RuleDelete::new(NftFamily::Ipv4, table.clone(), NftName::new(chain)?, handle);
+        batch.push_with(|seq| rule.build(seq))?;
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| NftApplyFailure {
+        outcome: e.outcome(),
+        error: e.into(),
+    })
 }
 
 #[cfg(test)]
@@ -403,6 +482,75 @@ mod tests {
             (e.rules, e.reservation_held, e.published.is_some()),
             (UnpublishRules::Unknown, true, true)
         );
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// テーブルハンドルを束縛した公開。
+    fn published_at(table_handle: u64) -> PublishedPort {
+        published(TOKEN, "web").with_table_handle(NftTableHandle::new(table_handle).unwrap())
+    }
+
+    /// NET-3・#3068: 記録のテーブルハンドルが生きたもの（99）と一致すれば、DELRULE に (2, 3) が渡り予約が解放される。
+    #[test]
+    fn net3_3068_matching_table_handle_deletes() {
+        let mut reg = reserved();
+        let (r, calls, n) = run(info(TOKEN.as_bytes()), Ok(()), published_at(99), &mut reg);
+        r.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(calls, vec![format!("{} 2 3", network().table.as_str())]);
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// NET-3・SEC-1・#3068: 記録のテーブルハンドル（98）が生きたもの（99）と違えば、userdata が一致していても
+    /// DELRULE を送らず、予約と記録を保って `StaleHandles` で断る。
+    #[test]
+    fn net3_3068_stale_table_handle_refuses_without_deleting() {
+        let mut reg = reserved();
+        let (r, calls, n) = run(info(TOKEN.as_bytes()), Ok(()), published_at(98), &mut reg);
+        let e = r.unwrap_err();
+        assert_eq!(n, 0, "delete must not be called");
+        assert!(calls.is_empty());
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.rules, UnpublishRules::StaleHandles);
+        assert!(e.reservation_held);
+        assert_eq!(reg.len(), 1);
+        let kept = e.published.unwrap();
+        assert_eq!(kept.table_handle().map(NftTableHandle::get), Some(98));
+        assert_eq!(kept.prerouting_handle().get(), 2);
+    }
+
+    /// NET-3・#3068: 束縛の無い公開（メモリ上の経路）は従来どおり userdata だけで判定する。
+    #[test]
+    fn net3_3068_unbound_table_handle_keeps_userdata_only_check() {
+        assert_eq!(published(TOKEN, "web").table_handle(), None);
+        let mut reg = reserved();
+        let (r, _, n) = run(
+            info(TOKEN.as_bytes()),
+            Ok(()),
+            published(TOKEN, "web"),
+            &mut reg,
+        );
+        r.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// NET-3・SEC-1・#3068: 照会の応答にテーブルハンドルが無ければ、記録があっても断って delete を呼ばない。
+    #[test]
+    fn net3_3068_missing_live_handle_refuses() {
+        let mut p = vec![2u8, 0, 0, 0];
+        let ud = TOKEN.as_bytes();
+        p.extend_from_slice(&((4 + ud.len()) as u16).to_ne_bytes());
+        p.extend_from_slice(&6u16.to_ne_bytes());
+        p.extend_from_slice(ud);
+        while p.len() % 4 != 0 {
+            p.push(0);
+        }
+        let mut reg = reserved();
+        let (r, _, n) = run(TableInfo::decode(&p), Ok(()), published_at(99), &mut reg);
+        let e = r.unwrap_err();
+        assert_eq!(n, 0);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert!(e.reservation_held && e.published.is_some());
         assert_eq!(reg.len(), 1);
     }
 

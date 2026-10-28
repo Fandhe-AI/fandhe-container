@@ -109,7 +109,7 @@ aging（30d）が消さないため対象外。
 ### 残余
 
 - 既定のテスト集合の core の試験は #2958、supervisor・cli の既定集合と `#[ignore]` の `cgroup_*`・
-  `confirm_recorded_cgroup` は #3026 で対応済み（下の節）。両 crate の `src` の単体試験は未判定
+  `confirm_recorded_cgroup` は #3026 で対応済み（下の節）。両 crate の `src` の単体試験は #3141 で判定・対応済み（下の節）
 - `linux-env-probe.yml` への tmpfiles 設定・timer の観測ステップ（任意項目）は未実施
 - CI 外の 3 件（cli）はビルドと clippy までの確認で、実機実行は人手
 
@@ -167,4 +167,46 @@ image rootfs を持つ delete）に、`temp_dir()` 直下の **実在する** bu
 
 ### 残余
 
-- `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験は未判定（後続 issue で追跡）
+- `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験は #3141 で判定・対応済み（下の節）
+
+## supervisor・cli の src の単体試験への展開（#3141・CORE-5・REPAIR-12）
+
+issue #3026 の残余だった `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験の `temp_dir()` 使用を判定し、
+保護が要る箇所を試験ごとの `ScratchDir` へ移した。照合内容（アサーション）は変えていない。tmpfiles の走査との重なりは
+再現できないため、直接の実証ではない（#2958・#3026 と同じ扱い）。
+
+判定基準は #3026 と同じ。製品がディレクトリへ待たない flock を取る経路（`oci_runtime::{create,start,delete,create_with_image}`・
+`recover_interrupted_start` の `BundleLock`、image rootfs の `try_lock`）に、`temp_dir()` 直下の **実在する** ディレクトリ
+（またはその子孫）を bundle・rootfs として通すか。aging による削除（30d。atime・mtime・ctime がすべて古い場合だけ）は、
+作成直後のエントリの ctime が新しく、単体試験は数秒〜数十秒で終わるため、どの箇所でも起きない（長時間保持もしない）。
+
+取り込み方: 各 crate の `src/lib.rs` に `#[cfg(all(test, target_os = "linux"))]` の
+`#[path = "../../core/tests/support/scratch_root.rs"] mod scratch_root;` を置き、同じ正本を参照する（複製しない）。
+利用者が Linux 限定であり、`cross-target-check` の macOS・Windows 向け `clippy --all-targets` へ利用者 0 の補助を
+持ち込まないため Linux に絞る。bundle・状態ルート・image root は `ScratchDir` の **子** に作る。
+
+### 適用（保護が要る 6 fixture）
+
+| crate | ファイル・fixture | 当たる経路 |
+| ----- | ----------------- | ---------- |
+| cli | `commands.rs` の `tests::linux::TmpDir` | `invoke` → create・start・delete（`BundleLock`） |
+| cli | `commands/create_start.rs` の `tests::linux::TmpDir` | `create_container*`（`BundleLock` と image rootfs の `try_lock`） |
+| cli | `commands/list_logs.rs` の `tests::linux::TmpDir` | `oci_runtime::create` |
+| cli | `commands/stop_delete.rs` の `tests::linux::TmpDir` | create・start・delete・`create_with_image` |
+| cli | `setup.rs` の `tests::TmpDir`（`cli2_daily_commands_do_not_request_os_setup`。Linux のみ `ScratchDir` の子） | `invoke` → create・delete（`BundleLock`） |
+| supervisor | `start_client.rs` の `tests::TmpDir`（`Fixture`） | `Fixture::new` の `oci_runtime::create` |
+
+### 対象外
+
+- パス文字列だけでディレクトリを作らない: cli の `commands/args.rs`・`image_refs.rs` の引数解析系、`net12_argv_tests`、
+  supervisor の `exec`・`health`・`healthcheck/periodic`・`inspect`・`restart`・`run`・`state`・`start_entry` の大半
+- ロックがファイル（tmpfiles はディレクトリしか flock しない）: 状態ストアの `@lock`、container options の `@locks/<id>`、
+  ログの `.log.lock`・CRI ログ、image store の `@lock`・create gate、pull の `@pull.lock`
+  （cli の `create_start.rs` の op log 系と `reclaim_tests`、`image*`・`ref_reconcile`・`stop_delete.rs` の状態ストア系、
+  supervisor の `container_options/*`・`logs/*`・`deadline_store`・`supervisor_log`）
+- flock を取らない経路: `pin_bundle_rootfs`（`exec.rs`）、config の読み取りのみ（`start_entry.rs`）、UDS の bind
+  （`control/listener.rs`）、xattr（`sys/linux.rs`）、`doctor*`・`setup` の出力系（`setup.rs` の `tests::TmpDir` は上表）・`plugin_backend`・`create_options` の設定ファイル系
+
+### 残余
+
+- 製品の `BundleLock` を待つ設計へ変える案と `linux-env-probe.yml` への観測ステップは本 issue に含めない（既存の追跡のまま）

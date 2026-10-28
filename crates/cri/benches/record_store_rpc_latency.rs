@@ -492,7 +492,7 @@ mod bench {
 
     // ---- 副: put / remove の直接計測 ----
 
-    fn micro(root: &Path, n: usize) -> Result<Value, String> {
+    fn micro(root: &Path, n: usize, started: Instant, limit: Duration) -> Result<Value, String> {
         let store = FileRecordStore::open(root)
             .map_err(|_| "failed to open the record store".to_owned())?;
         let mut out = Vec::new();
@@ -500,6 +500,7 @@ mod bench {
             let bytes = vec![b'x'; size];
             let (mut puts, mut removes) = (Vec::with_capacity(n), Vec::with_capacity(n));
             for i in 0..n {
+                check_deadline(started, limit)?;
                 let id = RecordId::new(&format!("{i:064x}"))
                     .map_err(|_| "invalid micro id".to_owned())?;
                 let t = Instant::now();
@@ -518,6 +519,14 @@ mod bench {
         Ok(Value::Array(out))
     }
 
+    /// 全体の期限（`--timeout-secs`）を超えていれば失敗にする。
+    fn check_deadline(started: Instant, limit: Duration) -> Result<(), String> {
+        if started.elapsed() > limit {
+            return Err("overall deadline exceeded".into());
+        }
+        Ok(())
+    }
+
     // ---- 全体 ----
 
     fn measure(args: &Args) -> Result<Value, String> {
@@ -530,9 +539,7 @@ mod bench {
             .map_err(|_| "failed to build the runtime".to_owned())?;
         let started = Instant::now();
         for n in 0..total {
-            if started.elapsed() > args.timeout {
-                return Err("overall deadline exceeded".into());
-            }
+            check_deadline(started, args.timeout)?;
             let m = n >= args.warmup;
             // 時間による偏りを打ち消すため、試行ごとに構成の順序を入れ替える。
             if n % 2 == 0 {
@@ -543,6 +550,7 @@ mod bench {
                 rt.block_on(without.trial(n, m))?;
             }
         }
+        check_deadline(started, args.timeout)?;
         let rpcs: Vec<Value> = RPCS
             .iter()
             .enumerate()
@@ -563,7 +571,8 @@ mod bench {
             .iter()
             .map(|((op, kind), v)| json!({ "op": op, "kind": kind, "stats": summary(v) }))
             .collect();
-        let direct = micro(&work.0, args.trials.min(500))?;
+        let direct = micro(&work.0, args.trials.min(500), started, args.timeout)?;
+        check_deadline(started, args.timeout)?;
         let kernel = read_capped("/proc/sys/kernel/osrelease", 256)
             .map_or_else(|| "unknown".into(), |s| s.trim().to_owned());
         Ok(json!({

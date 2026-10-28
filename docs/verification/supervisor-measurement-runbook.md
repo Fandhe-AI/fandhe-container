@@ -29,12 +29,17 @@
 
 ```bash
 cargo build --release -p fandhe-container-cli -p fandhe-container-supervisor
-chmod g-w target/release/fandhe-container target/release/fandhe-container-supervisor
-export BIN_DIR="$PWD/target/release"
+# fandhe-container-launcher を CLI の隣に置かない（置くと #2442 以降 start がランチャー経由の rootful 経路を選ぶ。
+# start_client.rs の classify_launcher_beside）。CLI と supervisor の 2 つだけを利用者所有の使い捨てディレクトリへ置く
+BIN_DIR="$(mktemp -d)" && chmod 0755 "$BIN_DIR"
+install -m 0755 target/release/fandhe-container "$BIN_DIR/fandhe-container"
+install -m 0755 target/release/fandhe-container-supervisor "$BIN_DIR/fandhe-container-supervisor"
+test ! -e "$BIN_DIR/fandhe-container-launcher"
+export BIN_DIR
 ```
 
 - `BIN_DIR` は `fandhe-container` と `fandhe-container-supervisor` を置いたディレクトリの絶対パス。スクリプトは固定名で解決し PATH 探索をしない
-- スクリプトはバイナリが symlink でなく、所有者が実行ユーザーか root で、group / other に書き込み権が無く、祖先ディレクトリも安全であることを検査する。umask 002 のビルドで拒否されたら `chmod g-w` する
+- スクリプトはバイナリが symlink でなく、所有者が実行ユーザーか root で、group / other に書き込み権が無く、祖先ディレクトリも安全であることを検査する。`install -m 0755` で group 書き込み権は付かないため umask 002 のビルドでも通る。`BIN_DIR` は `mktemp -d`（既定 `/tmp` は sticky）で、`RUN_AS` の利用者が辿れるよう 0755 にする。`target/release` を直接 `BIN_DIR` にしない（`cargo build` が `fandhe-container-launcher` も作るため）
 - `systemd-run` は既定 `/usr/bin/systemd-run`。違う場合は `SYSTEMD_RUN=<絶対パス>` を渡す
 
 ## bundle の用意

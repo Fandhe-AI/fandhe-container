@@ -194,7 +194,7 @@
 | R10 | #2939 | docs: 照合できない記録の見分け方と手動回収の手順 | R9 |
 | R11 | #2940 | cri: 保持役の素性の記録と再採用時の扱い | #2871・#2877・R6 |
 | R12 | #2941 | cri / plugin-cri: `network_owned`・`pod_netns` の永続と再起動後の `tear_down` | #1870・#2879・R6 |
-| R13 | #2942 | 実機確認（人間担当）: running のコンテナを残した再起動と再採用 | R9 |
+| R13 | #2942 | 実機確認（人間担当）: running のコンテナを残した再起動と再採用（手順書: [plugin-cri-restart-readoption.md](../verification/plugin-cri-restart-readoption.md)） | R9 |
 
 ## セキュリティ上の要点
 

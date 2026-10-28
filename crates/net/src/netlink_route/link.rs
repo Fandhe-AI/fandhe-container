@@ -1445,7 +1445,6 @@ mod tests {
         assert_eq!(e.code(), NetErrorCode::DataLoss);
     }
 
-    /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。
     /// NET-1・#3258: `IFLA_IFNAME` が重複した応答は、値が同じでも違っても `DataLoss`（カーネル応答は外部入力）。
     #[test]
     fn net1_decode_ifinfomsg_name_rejects_duplicate() {
@@ -1464,6 +1463,7 @@ mod tests {
         assert_eq!(decode_ifinfomsg_name(&p).unwrap().as_deref(), Some("br0"));
     }
 
+    /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。
     #[test]
     fn net1_decode_ifinfomsg_name_cases() {
         let p = link_payload(3, Some(b"br0\0"), None);

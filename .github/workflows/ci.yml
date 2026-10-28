@@ -1007,6 +1007,14 @@ jobs:
         timeout-minutes: 5
         run: make lib-selftest
 
+      # mac_small_files.sh の自己テストを macOS で回す（#3104・MAC-3・REPAIR-12）。macOS 標準の /bin/bash 3.2 でも
+      # 全ケースを回すのが目的（ubuntu は bench-regression で実行済み。Windows は macOS の Docker Desktop 向けの
+      # 計測で対象外）。スタブの docker と一時ディレクトリだけを使う。既存ジョブのステップ（check-run 件数は不変）
+      - name: mac-small-files 自己テスト（/bin/bash 3.2 を含む。#3104・MAC-3・REPAIR-12。macos）
+        if: env.HANG_PROBE != 'true' && runner.os == 'macOS'
+        timeout-minutes: 10
+        run: make mac-small-files-selftest
+
       # plugin 起動対象の構築箇所の判定スクリプトの自己テスト（#1857・REPAIR-12）。fixture の一時ツリーだけを使い、
       # BSD と Windows のシェルでのツール差（awk・find・grep）を確かめるため 3 OS で回す。
       # 既存ジョブのステップ（check-run 件数は不変）

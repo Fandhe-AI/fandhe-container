@@ -62,6 +62,7 @@ pub mod ipc;
 pub mod labels;
 pub mod mounts;
 pub mod network;
+pub mod pasta;
 pub mod secrets;
 pub mod store;
 

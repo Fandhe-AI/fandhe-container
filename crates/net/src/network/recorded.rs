@@ -555,6 +555,22 @@ where
     }
 }
 
+/// メンバー記録の所有トークンがこのネットワークのものか照合する（`rebuild_ipam` と同じ `host_token_is_for`）。
+/// 復元・解除は IPAM の組み直しを通らないため、ここで DataLoss として断る（NET-3・SEC-1・#3068）。
+fn check_member_owned(
+    realized: &RealizedRecord,
+    rec: &crate::network_store::MemberRecord,
+) -> Result<(), NetError> {
+    if super::host_token_is_for(realized.token(), rec.endpoint(), rec.token()) {
+        Ok(())
+    } else {
+        Err(NetError::new(
+            NetErrorCode::DataLoss,
+            "member token does not belong to the network",
+        ))
+    }
+}
+
 /// 記録から、メンバーの公開を [`PublishedPort`] として復元する（dump は使わない。再起動後の経路。NET-3・#3068）。
 ///
 /// 読み取りだけなので共有ロックのガードでもよい。未完了の操作が残るネットワーク・`realized` の無いネットワーク・
@@ -570,6 +586,7 @@ pub(crate) fn restore_published_ports_recorded(
         .iter()
         .find(|m| m.id() == member_id)
         .ok_or_else(|| NetError::new(NetErrorCode::NotFound, "member not found"))?;
+    check_member_owned(&realized, rec)?;
     Ok(rec.published_ports(&realized))
 }
 
@@ -602,6 +619,9 @@ where
             "member not found",
         )));
     };
+    // 別ネットワークのトークンを持つ記録は、DELRULE の前に DataLoss で断る（`published_ports` は
+    // `realized` のトークンで値を作るため、後段の完全一致では検出できない）。
+    check_member_owned(&realized, rec).map_err(RecordedError::Store)?;
     // 記録と食い違う公開（別メンバーのもの・ハンドル違い）では、カーネル操作の前に断る。
     if !rec.published_ports(&realized).contains(&published) {
         return Err(RecordedError::Op(Box::new(UnpublishPortError {
@@ -1826,6 +1846,42 @@ mod tests {
             assert!(e.reservation_held && e.published.is_some());
         }
         assert_eq!(n.members().unwrap()[0].publishes().len(), 1);
+    }
+
+    /// NET-3・SEC-1・#3068: 別ネットワークのトークンを持つメンバー記録は、復元も解除も DataLoss で断り、
+    /// DELRULE を送らず記録も変えない。
+    #[test]
+    fn net3_3068_foreign_token_record_refused_on_restore_and_unpublish() {
+        let t = Tmp::new("foreign-token");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let good = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let path = t.0.join("@networks/web/members/c1");
+        let bytes = std::fs::read(&path).unwrap();
+        let alt: String = BRIDGE_TOKEN
+            .chars()
+            .map(|c| if c == 'a' { 'b' } else { 'a' })
+            .collect();
+        assert_ne!(alt, BRIDGE_TOKEN);
+        let mut text = String::from_utf8(bytes).unwrap();
+        text = text.replace(BRIDGE_TOKEN, &alt);
+        std::fs::write(&path, text.as_bytes()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let e = restore_published_ports_recorded(&n, &mid("c1")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        let mut reg = PortRegistry::new();
+        let (r, calls, count) = unpublish_with(&n, good, &mut reg, 42);
+        assert_eq!(count, 0, "他者のルールを消さない");
+        assert!(calls.is_empty());
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(before, std::fs::read(&path).unwrap());
     }
 
     /// NET-3・#3068: 共有ロックのガードでは解除せず（カーネル操作の前に拒否）、復元（読み取り）はできる。

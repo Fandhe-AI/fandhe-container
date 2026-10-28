@@ -159,14 +159,16 @@ fn check_dns(dns: &[IpAddr], gateway: IpAddr) -> Result<(), NetError> {
 ///
 /// 手順: 記録から IPAM を組み直す → 世代とアドレスを決める → 意図記録を書く → `run` → 成功なら確定記録、
 /// 失敗なら請求書（取り残しがあるとき）と意図記録の後始末。`dns` は確定記録にだけ載せる（`--dns` の上流。NET-12）。
-pub(crate) fn attach_recorded_with<N, F>(
+pub(crate) fn attach_recorded_with<N, G, F>(
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
     spec: &ContainerAttachSpec,
     dns: &[IpAddr],
+    table_info: G,
     run: F,
 ) -> Result<AttachedContainer<N>, RecordedError<Box<ContainerAttachError>, AttachedContainer<N>>>
 where
+    G: FnOnce(&NftName) -> Result<TableInfo, NetError>,
     F: FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<N>, ContainerAttachError>,
 {
     require_exclusive_guard(guard)?;
@@ -175,6 +177,17 @@ where
     if &spec.network != realized.name() || spec.bridge_token != realized.token() {
         return Err(RecordedError::Store(precondition(
             "attach spec does not belong to the network",
+        )));
+    }
+    // 生きたテーブルのハンドルが `realized` の記録と一致しなければ、カーネル資源を作る前に断る。食い違うまま
+    // attach すると新しいルールに古いハンドルが束縛され、個別解除も detach も `StaleHandles` で拒否され続ける
+    // （NET-3・SEC-1・#3068）。照会はテーブルの所有トークンの照合も兼ねる（読み取りのみ）。
+    let table = realized.to_created(NameResolution::default()).table;
+    let live =
+        require_table_owned(table_info(&table), realized.token()).map_err(RecordedError::Store)?;
+    if live != realized.table_handle() {
+        return Err(RecordedError::Store(precondition(
+            "nft table was recreated; recorded table handle is stale",
         )));
     }
     let store = RecordedError::Store;
@@ -717,19 +730,26 @@ mod linux {
         AttachedContainer<ContainerNetns>,
         RecordedError<Box<ContainerAttachError>, AttachedContainer<ContainerNetns>>,
     > {
-        attach_recorded_with(guard, member_id, spec, dns, |ipam, generation| {
-            attach_container_with_generation(
-                &LinuxAttachOps {
-                    route,
-                    nft,
-                    timeout,
-                },
-                spec,
-                ipam,
-                ports,
-                generation,
-            )
-        })
+        attach_recorded_with(
+            guard,
+            member_id,
+            spec,
+            dns,
+            |table| linux_table_info(nft, table, timeout),
+            |ipam, generation| {
+                attach_container_with_generation(
+                    &LinuxAttachOps {
+                        route,
+                        nft,
+                        timeout,
+                    },
+                    spec,
+                    ipam,
+                    ports,
+                    generation,
+                )
+            },
+        )
     }
 
     /// コンテナを切り離して `members/<id>` を消す（`detach_container` の記録つき版）。
@@ -888,6 +908,10 @@ mod tests {
         }
         TableInfo::decode(&p)
     }
+    /// 生きたテーブルのハンドルが `handle` で、所有トークンが一致する照会の代役。
+    fn live_table(handle: u64) -> impl FnOnce(&NftName) -> Result<TableInfo, NetError> {
+        move |_| table_info_reply(handle, BRIDGE_TOKEN)
+    }
     fn spec(ep: &str) -> ContainerAttachSpec {
         ContainerAttachSpec::new(
             EndpointId::new(ep).unwrap(),
@@ -994,7 +1018,8 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let dns: Vec<IpAddr> = vec!["1.1.1.1".parse().unwrap()];
-        let att = attach_recorded_with(&n, &mid("c1"), &s, &dns, ok_run(&s)).unwrap();
+        let att =
+            attach_recorded_with(&n, &mid("c1"), &s, &dns, live_table(42), ok_run(&s)).unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
         let members = n.members().unwrap();
         assert_eq!(members.len(), 1);
@@ -1004,7 +1029,7 @@ mod tests {
         assert_eq!(members[0].token(), att.host_token);
         assert!(n.member_intents().unwrap().is_empty());
         // 二重の attach は拒否される。
-        let again = attach_recorded_with(&n, &mid("c1"), &s, &[], ok_run(&s));
+        let again = attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
         assert_eq!(
             again.unwrap_err().store_code(),
             Some(NetErrorCode::AlreadyExists)
@@ -1020,7 +1045,14 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s = spec("c1");
-        let r = attach_recorded_with(&n, &mid("c1"), &s, &[], failing_run(&s, veth_leftover()));
+        let r = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(42),
+            failing_run(&s, veth_leftover()),
+        );
         assert!(matches!(r, Err(RecordedError::Op(_))));
         assert!(n.members().unwrap().is_empty());
         assert!(n.member_intents().unwrap().is_empty());
@@ -1030,7 +1062,14 @@ mod tests {
         assert!(claims.attach[0].includes_veth());
         // 取り残しが無い失敗は請求書を作らない。
         let s2 = spec("c2");
-        let r = attach_recorded_with(&n, &mid("c2"), &s2, &[], failing_run(&s2, Vec::new()));
+        let r = attach_recorded_with(
+            &n,
+            &mid("c2"),
+            &s2,
+            &[],
+            live_table(42),
+            failing_run(&s2, Vec::new()),
+        );
         assert!(matches!(r, Err(RecordedError::Op(_))));
         assert_eq!(n.reclaim_records().unwrap().attach.len(), 1);
         assert!(n.member_intents().unwrap().is_empty());
@@ -1049,10 +1088,18 @@ mod tests {
             AttachResource::Address(pfx([10, 0, 0, 2], 24)),
             ResourceState::Unknown,
         )];
-        let _ = attach_recorded_with(&n, &mid("c1"), &s, &[], failing_run(&s, leftover));
+        let _ = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(42),
+            failing_run(&s, leftover),
+        );
         assert_eq!(n.member_intents().unwrap().len(), 1);
         let s2 = spec("c2");
-        let att = attach_recorded_with(&n, &mid("c2"), &s2, &[], ok_run(&s2)).unwrap();
+        let att =
+            attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 3], 24));
     }
 
@@ -1080,7 +1127,8 @@ mod tests {
         )
         .unwrap();
         let s = spec("c2");
-        let att = attach_recorded_with(&n, &mid("c2"), &s, &[], ok_run(&s)).unwrap();
+        let att =
+            attach_recorded_with(&n, &mid("c2"), &s, &[], live_table(42), ok_run(&s)).unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 3], 24));
     }
 
@@ -1093,11 +1141,18 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s = spec("c1");
-        let r = attach_recorded_with(&n, &mid("c1"), &s, &[], |ipam, generation| {
-            let mut att = ok_run(&s)(ipam, generation)?;
-            att.address = pfx([10, 0, 0, 9], 24);
-            Ok(att)
-        });
+        let r = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(42),
+            |ipam, generation| {
+                let mut att = ok_run(&s)(ipam, generation)?;
+                att.address = pfx([10, 0, 0, 9], 24);
+                Ok(att)
+            },
+        );
         assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
         assert_eq!(n.member_intents().unwrap().len(), 1);
         assert!(n.members().unwrap().is_empty());
@@ -1112,9 +1167,9 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s1 = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
+        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
         let s2 = spec("c2");
-        attach_recorded_with(&n, &mid("c2"), &s2, &[], ok_run(&s2)).unwrap();
+        attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
         assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 2);
         let seen = std::cell::Cell::new(0usize);
         let o1 = own(&n, "c1");
@@ -1132,7 +1187,8 @@ mod tests {
         assert_eq!(n.members().unwrap().len(), 1);
         assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 1);
         let s3 = spec("c3");
-        let att = attach_recorded_with(&n, &mid("c3"), &s3, &[], ok_run(&s3)).unwrap();
+        let att =
+            attach_recorded_with(&n, &mid("c3"), &s3, &[], live_table(42), ok_run(&s3)).unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
         // 記録に無いメンバーの detach は NotFound。
         let o3 = own(&n, "c3");
@@ -1154,8 +1210,8 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let (s1, s2) = (spec("c1"), spec("c2"));
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
-        attach_recorded_with(&n, &mid("c2"), &s2, &[], ok_run(&s2)).unwrap();
+        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
+        attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
         let o2 = own(&n, "c2");
         let ran = std::cell::Cell::new(false);
         let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
@@ -1185,7 +1241,7 @@ mod tests {
             let n = g.lock_network(&name()).unwrap();
             realize(&n);
             let s1 = spec("c1");
-            attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
+            attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
         }
         let g = store.lock_global_shared().unwrap();
         let n = g.lock_network_shared(&name()).unwrap();
@@ -1227,9 +1283,14 @@ mod tests {
         let gw = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ext = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         for dns in [vec![gw], vec![ext, ext]] {
-            let r = attach_recorded_with::<(), _>(&n, &mid("c1"), &s1, &dns, |_i, _g| {
-                panic!("カーネル操作は始めない")
-            });
+            let r = attach_recorded_with::<(), _, _>(
+                &n,
+                &mid("c1"),
+                &s1,
+                &dns,
+                live_table(42),
+                |_i, _g| panic!("カーネル操作は始めない"),
+            );
             assert_eq!(
                 r.unwrap_err().store_code(),
                 Some(NetErrorCode::InvalidArgument)
@@ -1247,7 +1308,14 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s1 = spec("c1");
-        let r = attach_recorded_with(&n, &mid("c1"), &s1, &[], failing_run(&s1, veth_leftover()));
+        let r = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            failing_run(&s1, veth_leftover()),
+        );
         assert!(matches!(r, Err(RecordedError::Op(_))));
         assert!(!n.reclaim_records().unwrap().attach.is_empty());
         let r = delete_recorded_with::<(), (), _>(&n, |_c, _i| panic!("カーネル操作は始めない"));
@@ -1266,7 +1334,7 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s1 = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], ok_run(&s1)).unwrap();
+        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
         let o1 = own(&n, "c1");
         let r = detach_recorded_with(&n, &mid("c1"), ident(&o1), |_c, _i| {
             Err::<NetworkDeleteReport, _>(Box::new(ContainerDetachErrorUnit))
@@ -1428,7 +1496,7 @@ mod tests {
         )
         .unwrap();
         let s = spec("c1");
-        let r = attach_recorded_with(&n, &mid("c1"), &s, &[], ok_run(&s));
+        let r = attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
         assert_eq!(
             r.unwrap_err().store_code(),
             Some(NetErrorCode::FailedPrecondition)
@@ -1445,7 +1513,7 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s, &[], ok_run(&s)).unwrap();
+        attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s)).unwrap();
         let r = delete_recorded_with::<(), (), _>(&n, |_c, _i| Ok(()));
         assert_eq!(
             r.unwrap_err().store_code(),
@@ -1539,7 +1607,15 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s = spec("c1");
-        let att = attach_recorded_with(&n, &mid("c1"), &s, &[], run_with_publish(&s)).unwrap();
+        let att = attach_recorded_with(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(42),
+            run_with_publish(&s),
+        )
+        .unwrap();
         // 同じプロセスで返す値にも、記録したテーブルハンドルが束縛される。
         assert_eq!(att.published_ports.len(), 1);
         assert_eq!(
@@ -1648,6 +1724,52 @@ mod tests {
         assert!(e.published.is_some());
         let after = std::fs::read(t.0.join("@networks/web/members/c1")).unwrap();
         assert_eq!(before, after, "記録は書き換えない");
+    }
+
+    /// NET-3・SEC-1・#3068: テーブルが作り直されて生きたハンドルが記録と違うとき、attach はカーネル資源を作る前
+    /// （`run` と意図記録の前）に断り、メンバー記録を書かない。
+    #[test]
+    fn net3_3068_attach_refuses_recreated_table_before_kernel_ops() {
+        let t = Tmp::new("attach-stale-table");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s = spec("c1");
+        let ran = std::cell::Cell::new(false);
+        let r =
+            attach_recorded_with::<(), _, _>(&n, &mid("c1"), &s, &[], live_table(77), |_, _| {
+                ran.set(true);
+                unreachable!("run must not be called")
+            });
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(!ran.get());
+        assert!(n.members().unwrap().is_empty());
+        assert!(n.member_intents().unwrap().is_empty());
+    }
+
+    /// NET-3・SEC-1・#3068: 他者のテーブル（userdata 不一致）でも attach を断る。
+    #[test]
+    fn net3_3068_attach_refuses_foreign_table() {
+        let t = Tmp::new("attach-foreign-table");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s = spec("c1");
+        let r = attach_recorded_with::<(), _, _>(
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            |_| table_info_reply(42, "someone-else"),
+            |_, _| unreachable!("run must not be called"),
+        );
+        assert!(matches!(r, Err(RecordedError::Store(_))));
+        assert!(n.member_intents().unwrap().is_empty());
     }
 
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。

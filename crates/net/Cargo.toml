@@ -193,6 +193,14 @@ name = "netns_holder_userns"
 path = "tests/netns_holder_userns.rs"
 harness = false
 
+# 公開ハンドルとテーブル handle の記録・再起動後の復元と個別解除・テーブル再作成時の拒否の実機結合試験
+# （NET-3・SEC-1・REPAIR-12・#3068）。root と `unshare --net`、`nft`、`ip` が要るため harness = false。
+# `-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_publish_record_privileged"
+path = "tests/network_publish_record_privileged.rs"
+harness = false
+
 # ネットワーク定義ストアのプロセス間結合試験（排他・共有ロック・期限・保持プロセス終了後の再取得。
 # NET-6・REPAIR-5・REPAIR-12・#3059）。自分自身を子として再実行する。root 不要・Linux のみ（他 OS は空の試験）。
 [[test]]

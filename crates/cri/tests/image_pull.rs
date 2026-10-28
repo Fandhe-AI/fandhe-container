@@ -759,6 +759,66 @@ async fn cri4_tag_moves_and_tags_merge() {
     assert_eq!(new.repo_tags, vec!["docker.io/library/alpine:1".to_owned()]);
 }
 
+/// CRI-2・OCI-1: 複数 pull の統合後、repo_tags と repo_digests は取り込み順によらず辞書順で返る
+/// （containerd と同じ並び）。タグを逆順に pull し、別の top-level digest も後から足して
+/// ImageStatus と ListImages の応答順を具体値で確認する。
+#[tokio::test]
+async fn cri2_merged_refs_are_sorted_regardless_of_pull_order() {
+    let dir = TempDir::new("sorted");
+    let cfg = config(&dir);
+    let store = Arc::new(InMemoryImageStore::new());
+    let svc = {
+        let puller = OciImagePuller::new(
+            Arc::new(FakeClient::new(manifest_json(
+                SHA_CONFIG_L1,
+                &[(SHA_LAYER1, SIZE_LAYER1)],
+            ))),
+            cfg.clone(),
+        );
+        CriImageService::with_store(store.clone()).with_puller(Arc::new(puller))
+    };
+    // 辞書順の逆（3 -> 2 -> 1）で取り込む。
+    for tag in ["alpine:3", "alpine:2", "alpine:1"] {
+        ImageService::pull_image(&svc, Request::new(pull_req(tag)))
+            .await
+            .expect("pull");
+    }
+    // 同じイメージ（config 同一）を別の top-level digest で取り込む。
+    let mut other = FakeClient::new(manifest_json(SHA_CONFIG_L1, &[(SHA_LAYER1, SIZE_LAYER1)]));
+    other.manifest_digest = Digest::parse(&format!("sha256:{}", "0".repeat(64))).expect("digest");
+    let svc2 = CriImageService::with_store(store.clone())
+        .with_puller(Arc::new(OciImagePuller::new(Arc::new(other), cfg)));
+    ImageService::pull_image(&svc2, Request::new(pull_req("alpine:0")))
+        .await
+        .expect("pull other digest");
+
+    let expected_tags: Vec<String> = ["0", "1", "2", "3"]
+        .iter()
+        .map(|t| format!("docker.io/library/alpine:{t}"))
+        .collect();
+
+    let listed = ImageService::list_images(&svc2, Request::new(Default::default()))
+        .await
+        .expect("list")
+        .into_inner()
+        .images;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].repo_tags, expected_tags);
+    let mut sorted_digests = listed[0].repo_digests.clone();
+    sorted_digests.sort();
+    assert_eq!(listed[0].repo_digests.len(), 2);
+    assert_eq!(listed[0].repo_digests, sorted_digests);
+
+    let status = ImageService::image_status(&svc2, Request::new(status_req("alpine:1")))
+        .await
+        .expect("status")
+        .into_inner()
+        .image
+        .expect("image");
+    assert_eq!(status.repo_tags, expected_tags);
+    assert_eq!(status.repo_digests, sorted_digests);
+}
+
 /// CRI-4・ERR-3: 入力検証（空・過大・不正な参照）はネットワークに触れず INVALID_ARGUMENT。
 /// トークン系の資格情報は UNIMPLEMENTED。puller 未設定は従来どおり UNIMPLEMENTED。
 #[tokio::test]

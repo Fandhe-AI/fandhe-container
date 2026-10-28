@@ -1322,6 +1322,28 @@ jobs:
             --select '^etc_files_mount: content, read-only' --subst root=false \
             --forbid 'etc_files_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
+      # bind_mounts_real（`crates/core/tests/bind_mounts_real.rs`。
+      # CORE-1・CORE-2・OCI-4・SEC-1・SEC-5・TASK-29 追補・#1916・#3088）:
+      # bind mount の適用の段（exec::mount_binds）を、実マウント API での属性・private 伝播・巻き戻し・疑似 FS や overlay の拒否・
+      # ホストへ伝播しないことまで実カーネルで検証する実機前提テスト（harness = false）。Linux 5.12 以降が要る。
+      # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証・#1621）。
+      # 成功行は `(root=false)` まで固定のリテラルのため --subst は付けず、成功行を共通スクリプトで照合する（REPAIR-12）。
+      - name: bind_mounts_real のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test bind_mounts_real --no-run
+
+      - name: bind_mounts_real の実行（実機前提テスト・--ignored。SEC-1・SEC-5・#1916）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/bind_mounts_real.log"
+          cargo test -p fandhe-container-core --test bind_mounts_real -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name bind_mounts_real \
+            --src crates/core/tests/bind_mounts_real.rs --log "${log}" \
+            --select '^bind_mounts_real: binds applied' \
+            --forbid 'bind_mounts_real: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
       # lo_self_delivery（`crates/net/tests/lo_self_delivery.rs`。NET-2・NET-11・TASK-140 追補・#2077）:
       # 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れ
       # （#1927 の場面）と up 後の配送を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、

@@ -233,6 +233,11 @@ impl<N: std::fmt::Debug> std::error::Error for NetworkDeleteError<N> {}
 pub(crate) trait DeleteOps {
     /// netns ハンドル（Linux では fd と pin パス）。
     type Netns;
+    /// 手順全体の期限（REPAIR-5）を過ぎたか。期限を持たない実装（`delete_network` 等）は常に `false`。
+    /// `detach_container_with` が、カーネル要求を出す前に確かめる（#3258）。
+    fn deadline_exceeded(&self) -> bool {
+        false
+    }
     /// 名前から ifindex を引く。
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
     /// 名前から ifindex・所属先 master（bridge）の ifindex・別名（所有トークン）を引く。veth の所有確認に使う。
@@ -1107,24 +1112,44 @@ fn delete_bridge<O: DeleteOps>(
     }
 }
 
-/// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。
+/// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。`deadline` があれば手順全体の
+/// 期限で、各要求の期限をその残り時間で切り詰める（`detach_container`。#3258）。
 #[cfg(target_os = "linux")]
 struct LinuxDeleteOps<'a> {
     route: &'a NetlinkRouteSocket,
     nft: &'a NetlinkNetfilterSocket,
     timeout: Duration,
+    deadline: Option<crate::sys::Deadline>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDeleteOps<'_> {
+    /// 1 件のカーネル要求に渡す期限（全体の期限があれば残り時間を超えない。残りが 0 なら送信側が `Timeout`）。
+    fn request_timeout(&self) -> Duration {
+        self.deadline
+            .as_ref()
+            .map_or(self.timeout, |d| self.timeout.min(d.remaining()))
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl DeleteOps for LinuxDeleteOps<'_> {
     type Netns = ContainerNetns;
 
+    fn deadline_exceeded(&self) -> bool {
+        self.deadline
+            .as_ref()
+            .is_some_and(|d| d.remaining().is_zero())
+    }
+
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
-        self.route.link_index(name, self.timeout)
+        self.route.link_index(name, self.request_timeout())
     }
 
     fn link_attachment(&self, name: &IfName) -> Result<LinkAttachment, NetError> {
-        let (index, master, alias) = self.route.link_index_master_alias(name, self.timeout)?;
+        let (index, master, alias) = self
+            .route
+            .link_index_master_alias(name, self.request_timeout())?;
         Ok(LinkAttachment {
             index,
             master,
@@ -1133,12 +1158,13 @@ impl DeleteOps for LinuxDeleteOps<'_> {
     }
 
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
-        self.route.link_index_owned(name, token, self.timeout)
+        self.route
+            .link_index_owned(name, token, self.request_timeout())
     }
 
     fn delete_link(&self, link: IfIndex) -> Result<(), NetError> {
         self.route
-            .delete_link(&LinkDelete::new(link_ref(link)?), self.timeout)
+            .delete_link(&LinkDelete::new(link_ref(link)?), self.request_timeout())
             .map(|_| ())
     }
 
@@ -1163,13 +1189,15 @@ impl DeleteOps for LinuxDeleteOps<'_> {
     }
 
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
-        self.nft
-            .table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), self.timeout)
+        self.nft.table_info(
+            &TableGet::new(NftFamily::Ipv4, table.clone()),
+            self.request_timeout(),
+        )
     }
 
     fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure> {
         self.nft
-            .send_batch(self.timeout, |batch| {
+            .send_batch(self.request_timeout(), |batch| {
                 batch.push_with(|seq| {
                     TableDelete::by_handle(NftFamily::Ipv4, table.clone(), handle).build(seq)
                 })?;
@@ -1188,7 +1216,7 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         (prerouting, output): (NftRuleHandle, NftRuleHandle),
     ) -> Result<(), NftApplyFailure> {
         self.nft
-            .send_batch(self.timeout, |batch| {
+            .send_batch(self.request_timeout(), |batch| {
                 for (chain, handle) in [("prerouting", prerouting), ("output", output)] {
                     let rule = RuleDelete::new(
                         NftFamily::Ipv4,
@@ -1233,6 +1261,7 @@ pub fn delete_network(
             route,
             nft,
             timeout,
+            deadline: None,
         },
         network,
         containers,
@@ -1260,6 +1289,7 @@ pub fn reclaim_failed_create(
             route,
             nft,
             timeout,
+            deadline: None,
         },
         claim,
     )
@@ -1287,6 +1317,7 @@ pub fn reclaim_failed_attach(
             route,
             nft,
             timeout,
+            deadline: None,
         },
         claim,
         netns_dir,
@@ -1366,6 +1397,8 @@ mod tests {
         bridge_lookup_err: Option<NetErrorCode>,
         bridge_index: Option<u32>,
         bridge_delete_err: Option<NetErrorCode>,
+        /// 記録した呼び出しがこの件数に達したら全体の期限が切れたとみなす（#3258・REPAIR-5）。
+        expire_after_calls: Option<usize>,
     }
 
     impl Fake {
@@ -1388,6 +1421,11 @@ mod tests {
 
     impl DeleteOps for Fake {
         type Netns = ();
+
+        fn deadline_exceeded(&self) -> bool {
+            self.expire_after_calls
+                .is_some_and(|n| self.calls.borrow().len() >= n)
+        }
 
         fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
             self.rec(format!("link_index {}", name.as_str()));

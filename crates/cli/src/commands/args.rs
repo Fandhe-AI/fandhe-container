@@ -1774,8 +1774,6 @@ mod tests {
         }
     }
 
-    /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。
-    #[cfg(unix)]
     /// NET-6・CLI-1（#3066）: `network` の正常系（`--` 以降は位置引数）。
     #[test]
     fn cli1_net6_parse_network_accepts_valid() {
@@ -1822,6 +1820,8 @@ mod tests {
         }
     }
 
+    /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。
+    #[cfg(unix)]
     #[test]
     fn cli1_parse_image_tag_rejects_non_utf8() {
         use std::os::unix::ffi::OsStringExt;

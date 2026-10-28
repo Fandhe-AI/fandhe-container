@@ -202,6 +202,7 @@ fn net12_delivery_add_host_and_dns_reach_etc_files() {
 /// `--add-host` があれば hosts も載せる(loopback の拒否は `net12_named_dns_rejects_loopback`)。
 #[test]
 fn net12_delivery_named_network_binds_resolv_conf() {
+    #[cfg(target_os = "linux")]
     use fandhe_container_core::etc_files::EtcFileKind;
     let none = deliver(&net_doc("g1", "mynet", &[], &[]));
     let dns = deliver(&net_doc("g1", "mynet", &["db:10.0.0.5"], &["8.8.8.8"]));
@@ -218,7 +219,9 @@ fn net12_delivery_named_network_binds_resolv_conf() {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (none, dns, EtcFileKind::Hosts);
+        // 非 Linux にはユーザー定義名の結線が無いので、DNS の有無に依らず Unimplemented で拒否する。
+        assert_eq!(none.unwrap_err().code(), ErrorCode::Unimplemented);
+        assert_eq!(dns.unwrap_err().code(), ErrorCode::Unimplemented);
     }
 }
 

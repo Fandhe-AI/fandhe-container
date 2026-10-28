@@ -1938,20 +1938,22 @@ fn cri3_repair5_pull_cancelled_before_start_does_not_contact_registry() {
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
 }
 
-/// CRI-3・REPAIR-5・#2967: 展開の期限は pull 全体の期限と共有する（取得で使った残りだけが展開に渡る）。
-/// 3 blob の取得で約 1.5 秒を使い、最初の層の展開後の 700ms の待ちで 2 秒を超えるため、2 層目は展開されない
-/// （展開に別の予算があれば 2 層とも通る値の組）。
+/// CRI-3・REPAIR-5・#2967・#3227: 展開の期限は pull 全体の期限と共有する（取得で使った残りだけが展開に渡る）。
+/// 3 blob の取得で 600ms 以上を使い、最初の層の展開後の 2500ms の待ちで 3 秒を超えるため、2 層目は展開されない
+/// （待ち 2500ms は期限 3 秒より短いので、展開に別の予算があれば 2 層とも通る値の組）。
+/// 脆いのは「1 層目が期限内に展開される」側だけで、その余裕は約 2.4 秒ある（macOS の共有ランナーの遅延で
+/// 1 層目の前に期限切れになった #3227 の再発防止）。「2 層目が展開されない」側は sleep の下限保証で遅延に対し単調に安全。
 #[test]
 fn cri3_repair5_extraction_shares_the_pull_deadline() {
     let mut client = FakeClient::new(two_layer_manifest());
-    client.blob_delay = Duration::from_millis(500);
+    client.blob_delay = Duration::from_millis(200);
     let probe = Arc::new(ExtractProbe {
         extracted: AtomicUsize::new(0),
-        on_extract: Box::new(|| std::thread::sleep(Duration::from_millis(700))),
+        on_extract: Box::new(|| std::thread::sleep(Duration::from_millis(2500))),
     });
     let dir = TempDir::new("share-deadline");
     let mut cfg = config(&dir);
-    cfg.pull_deadline = Duration::from_secs(2);
+    cfg.pull_deadline = Duration::from_secs(3);
     let puller = OciImagePuller::new(Arc::new(client), cfg).with_recorder(probe.clone());
     let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
     assert_eq!(err.code(), OciErrorCode::Timeout);

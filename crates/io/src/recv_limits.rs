@@ -85,6 +85,9 @@ use std::num::NonZeroUsize;
 
 use crate::batch::{BatchConfig, MAX_BATCH_SIZE};
 use crate::error::{IoError, IoErrorCode};
+use crate::payload::{
+    CLOSE_PAYLOAD_LEN, CREATE_FIXED_LEN, MAX_CREATE_PAYLOAD_LEN, NACK_PAYLOAD_LEN,
+};
 use crate::protocol::{Frame, FrameHeader, FrameKind, MAX_PAYLOAD_LEN};
 
 /// 受信経路で滞留を許す最大フレーム件数の暫定上限（REPAIR-3: 実装済みを
@@ -317,6 +320,26 @@ impl ReceiveLimits {
             | FrameKind::Create
             | FrameKind::Close
             | FrameKind::Nack => {
+                // v2 の新種別はレイアウトが固定長 / 有界のため、本体を確保する前に
+                // ヘッダの申告長を種別ごとの範囲で検証する（io-protocol.md F4・
+                // TASK-83.2・#3161）。Create の path_len と実長の照合は本体が
+                // 最大 4106 バイトに収まった後に復号が行う（確保量は有界）。
+                let accepted = match header.kind() {
+                    FrameKind::Close => payload_len as usize == CLOSE_PAYLOAD_LEN,
+                    FrameKind::Nack => payload_len as usize == NACK_PAYLOAD_LEN,
+                    FrameKind::Create => (CREATE_FIXED_LEN + 1..=MAX_CREATE_PAYLOAD_LEN)
+                        .contains(&(payload_len as usize)),
+                    _ => true,
+                };
+                if !accepted {
+                    return Err(IoError::new(
+                        IoErrorCode::InvalidArgument,
+                        format!(
+                            "frame payload length {payload_len} is not valid for kind {:?}",
+                            header.kind()
+                        ),
+                    ));
+                }
                 if payload_len > MAX_CONTROL_PAYLOAD_LEN {
                     return Err(IoError::new(
                         IoErrorCode::ResourceExhausted,
@@ -445,6 +468,32 @@ mod tests {
 
     fn flush_header() -> FrameHeader {
         FrameHeader::new(FrameKind::Flush, 0).expect("header must be valid")
+    }
+
+    /// IO-1・REPAIR-2・TASK-83.2・#3161: Close・Nack・Create は本体確保前に
+    /// ヘッダの申告長を種別ごとの範囲で検証する。
+    #[test]
+    fn io1_admit_rejects_v2_kind_length_mismatch_before_allocation() {
+        let limits = ReceiveLimits::default();
+        let cases: [(FrameKind, u32, bool); 9] = [
+            (FrameKind::Close, CLOSE_PAYLOAD_LEN as u32, true),
+            (FrameKind::Close, 65536, false),
+            (FrameKind::Close, CLOSE_PAYLOAD_LEN as u32 + 1, false),
+            (FrameKind::Nack, NACK_PAYLOAD_LEN as u32, true),
+            (FrameKind::Nack, NACK_PAYLOAD_LEN as u32 - 1, false),
+            (FrameKind::Create, CREATE_FIXED_LEN as u32, false),
+            (FrameKind::Create, CREATE_FIXED_LEN as u32 + 1, true),
+            (FrameKind::Create, MAX_CREATE_PAYLOAD_LEN as u32, true),
+            (FrameKind::Create, MAX_CREATE_PAYLOAD_LEN as u32 + 1, false),
+        ];
+        for (kind, len, ok) in cases {
+            let header = FrameHeader::new(kind, len).expect("header must be valid");
+            assert_eq!(
+                limits.admit(header, 0).is_ok(),
+                ok,
+                "kind={kind:?} len={len}"
+            );
+        }
     }
 
     /// IO-1・REPAIR-2: `0`・`MAX_PAYLOAD_LEN + 1`・`MAX_RECV_PENDING_FRAMES + 1` は
@@ -717,16 +766,13 @@ mod tests {
             .admit(header, 0)
             .expect("WriteFile within max_payload_len must be accepted");
 
+        // Create・Close・Nack は 64 KiB 級の申告長を種別ごとの範囲検証で拒否する。
         for kind in [FrameKind::Create, FrameKind::Close, FrameKind::Nack] {
-            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN + 1).expect("header");
+            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN).expect("header");
             let err = limits
                 .admit(header, 0)
-                .expect_err("control-limit kinds over 64 KiB must be rejected");
-            assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
-            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN).expect("header");
-            let _admitted = limits
-                .admit(header, 0)
-                .expect("exactly at the limit is accepted");
+                .expect_err("v2 control kinds with oversized length must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         }
         assert_eq!(allocation_count(), 0, "admit must not allocate a body");
     }

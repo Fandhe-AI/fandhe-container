@@ -51,7 +51,9 @@ pub const DNS_HELPER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DNS_HELPER_STOP_GRACE: Duration = Duration::from_secs(2);
 /// SIGKILL を送った後、pidfd の可読化（終了）を待つ期限（`REAP_TIMEOUT_DEFAULT` と同じ 2 秒）。
 pub const DNS_HELPER_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-/// 段 1 の終了を待つ期限。
+/// 起動窓の回収（`recover_dns_helper_intent`）全体の期限。候補の走査が超えたら意図記録を残して `Timeout`。
+pub const DNS_HELPER_RECOVER_TIMEOUT: Duration = Duration::from_secs(30);
+/// 段 1 の終了を待つ上限。
 pub const DNS_HELPER_STAGE1_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 識別行の最大バイト数。
 pub const IDENT_LINE_MAX: usize = 128;

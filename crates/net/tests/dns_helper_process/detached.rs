@@ -280,7 +280,8 @@ fn recover_intent(exe: &Path) {
 
     // 意図記録なし。
     assert_eq!(
-        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
         IntentRecovery::NoIntent
     );
 
@@ -288,7 +289,8 @@ fn recover_intent(exe: &Path) {
     n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
         .expect("intent");
     assert_eq!(
-        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
         IntentRecovery::IntentDiscarded
     );
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
@@ -301,7 +303,8 @@ fn recover_intent(exe: &Path) {
     n.write_dns_helper_intent(&intent_of(HelperNonce::generate().expect("nonce")))
         .expect("intent");
     assert_eq!(
-        recover_dns_helper_intent(&n, &mut std::iter::once(pid)).expect("recover"),
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
         IntentRecovery::Recovered { stopped: 0 }
     );
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
@@ -311,7 +314,7 @@ fn recover_intent(exe: &Path) {
     n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
         .expect("intent");
     let mut many = std::iter::repeat_n(0u32, MAX_RECOVERY_CANDIDATES + 1);
-    let e = recover_dns_helper_intent(&n, &mut many).expect_err("too many");
+    let e = recover_dns_helper_intent(&n, &mut many, &NoopNetOpRecorder).expect_err("too many");
     assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
     assert!(n.read_dns_helper_intent().expect("intent").is_some());
     assert!(
@@ -321,7 +324,8 @@ fn recover_intent(exe: &Path) {
 
     // nonce が一致する子だけを停止し、意図記録を消す。
     assert_eq!(
-        recover_dns_helper_intent(&n, &mut [0u32, pid].into_iter()).expect("recover"),
+        recover_dns_helper_intent(&n, &mut [0u32, pid].into_iter(), &NoopNetOpRecorder)
+            .expect("recover"),
         IntentRecovery::Recovered { stopped: 1 }
     );
     assert!(gone(pid), "the matching helper must be stopped");
@@ -364,7 +368,8 @@ fn start_failure_records(_exe: &Path) {
         assert_eq!(n.read_dns_helper().expect("record"), None);
         // 回収（候補なし）で意図記録が消え、再び起動できる状態に戻る。
         assert_eq!(
-            recover_dns_helper_intent(&n, &mut std::iter::empty()).expect("recover"),
+            recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+                .expect("recover"),
             IntentRecovery::Recovered { stopped: 0 }
         );
         assert_eq!(n.read_dns_helper_intent().expect("intent"), None);

@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use super::{
     ACK, ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DNS_HELPER_KILL_REAP_TIMEOUT,
-    DNS_HELPER_STAGE1_EXIT_TIMEOUT, DNS_HELPER_STOP_GRACE, DnsHelperStopRequest, HelperProcessOps,
-    IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX,
-    StopOutcome, StopStage, run_stop_sequence,
+    DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT, DNS_HELPER_STOP_GRACE,
+    DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES,
+    RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage, run_stop_sequence,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -689,20 +689,42 @@ pub enum IntentRecovery {
 pub fn recover_dns_helper_intent(
     guard: &NetworkLockGuard<'_>,
     candidates: &mut dyn Iterator<Item = u32>,
+    recorder: &dyn NetOpRecorder,
+) -> Result<IntentRecovery, NetError> {
+    record_net_op(recorder, NetOpKind::DnsHelperRecover, || {
+        recover_inner(guard, candidates)
+    })
+}
+
+fn recover_inner(
+    guard: &NetworkLockGuard<'_>,
+    candidates: &mut dyn Iterator<Item = u32>,
 ) -> Result<IntentRecovery, NetError> {
     guard.require_exclusive()?;
     guard.discard_stale_temps()?;
     let Some(intent) = guard.read_dns_helper_intent()? else {
         return Ok(IntentRecovery::NoIntent);
     };
-    if guard.read_dns_helper()?.is_some() {
+    // 確定記録の nonce が意図記録と同じときだけ「記録が正」。違えば別の起動の意図記録なので、記録の
+    // ヘルパーには触れずに、意図記録の nonce を持つ子を探す。
+    if guard
+        .read_dns_helper()?
+        .is_some_and(|r| r.nonce() == intent.nonce())
+    {
         guard.remove_dns_helper_intent()?;
         return Ok(IntentRecovery::IntentDiscarded);
     }
+    let deadline = Instant::now() + DNS_HELPER_RECOVER_TIMEOUT;
     let mut stopped = 0usize;
     let mut seen = 0usize;
     for pid in (&mut *candidates).take(MAX_RECOVERY_CANDIDATES) {
         seen += 1;
+        if Instant::now() >= deadline {
+            return Err(err(
+                NetErrorCode::Timeout,
+                "dns helper recovery exceeded its deadline; intent record kept",
+            ));
+        }
         // 消滅（NotFound）を確認できたものだけ読み飛ばす。確認できないエラーは意図記録（再試行に要る nonce）を
         // 残したまま失敗にする。
         if pid == 0 || !cmdline_has_nonce(pid, intent.nonce())? {

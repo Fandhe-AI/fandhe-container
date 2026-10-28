@@ -19,6 +19,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use super::{FILE_MODE, FLAGS_FILE, NetworkLockGuard, err, map_io};
 use crate::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, RECORD_MAX_BYTES};
 use crate::error::{NetError, NetErrorCode};
+use crate::instrument::{NetOpKind, record_net_op};
 
 /// 起動済みヘルパーの記録のファイル名。
 pub const DNS_HELPER_FILE: &str = "dns-helper";
@@ -138,29 +139,64 @@ impl NetworkLockGuard<'_> {
 
     /// 起動済みヘルパーの記録を新規に書く（fsync まで）。既にあれば `AlreadyExists`。排他ロックの下に限る。
     pub fn write_dns_helper(&self, rec: &DnsHelperRecord) -> Result<(), NetError> {
-        self.write_record_bytes(DNS_HELPER_FILE, &rec.encode())
+        record_net_op(
+            &*self.recorder,
+            NetOpKind::NetworkStoreDnsHelperWrite,
+            || self.write_record_bytes(DNS_HELPER_FILE, &rec.encode()),
+        )
     }
 
     /// 起動済みヘルパーの記録を消す（無ければ成功）。排他ロックの下に限る。
     pub fn remove_dns_helper(&self) -> Result<(), NetError> {
-        self.remove_record(DNS_HELPER_FILE)
+        record_net_op(
+            &*self.recorder,
+            NetOpKind::NetworkStoreDnsHelperRemove,
+            || self.remove_record(DNS_HELPER_FILE),
+        )
     }
 
     /// 起動窓の意図記録を読む。無ければ `None`。壊れていれば `DataLoss`。
+    /// 記録のネットワーク名がこのロックの対象と違えば `DataLoss`（別ネットワークの nonce を採用させない。fail-closed）。
     pub fn read_dns_helper_intent(&self) -> Result<Option<DnsHelperIntent>, NetError> {
-        self.read_record_bytes(DNS_HELPER_INTENT_FILE)?
+        let Some(rec) = self
+            .read_record_bytes(DNS_HELPER_INTENT_FILE)?
             .map(|b| DnsHelperIntent::decode(&b))
-            .transpose()
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        if rec.network() != &self.name {
+            return Err(err(
+                NetErrorCode::DataLoss,
+                "dns helper intent record belongs to a different network",
+            ));
+        }
+        Ok(Some(rec))
     }
 
     /// 起動窓の意図記録を新規に書く（fsync まで）。既にあれば `AlreadyExists`。排他ロックの下に限る。
+    /// 記録のネットワーク名がロック対象と違えば、何も書かず `InvalidArgument`。
     pub fn write_dns_helper_intent(&self, rec: &DnsHelperIntent) -> Result<(), NetError> {
-        self.write_record_bytes(DNS_HELPER_INTENT_FILE, &rec.encode())
+        if rec.network() != &self.name {
+            return Err(err(
+                NetErrorCode::InvalidArgument,
+                "dns helper intent record names a different network",
+            ));
+        }
+        record_net_op(
+            &*self.recorder,
+            NetOpKind::NetworkStoreDnsHelperWrite,
+            || self.write_record_bytes(DNS_HELPER_INTENT_FILE, &rec.encode()),
+        )
     }
 
     /// 起動窓の意図記録を消す（無ければ成功）。排他ロックの下に限る。
     pub fn remove_dns_helper_intent(&self) -> Result<(), NetError> {
-        self.remove_record(DNS_HELPER_INTENT_FILE)
+        record_net_op(
+            &*self.recorder,
+            NetOpKind::NetworkStoreDnsHelperRemove,
+            || self.remove_record(DNS_HELPER_INTENT_FILE),
+        )
     }
 }
 
@@ -381,6 +417,107 @@ mod tests {
                 .nlink(),
             1
         );
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-5・NET-7・SEC-1: 意図記録のネットワーク名がロック対象と違えば、読み取りは `DataLoss`、書き込みは
+    /// `InvalidArgument`（別ネットワークの nonce を採用させない。fail-closed）。
+    #[test]
+    fn net7_3070_intent_network_mismatch_is_rejected() {
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        let other = DnsHelperIntent::new(
+            NetworkName::new("other").expect("name"),
+            HelperNonce::new("00112233445566778899aabbccddeeff").expect("nonce"),
+            DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5353).expect("listen"),
+        );
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        assert_eq!(
+            n.write_dns_helper_intent(&other).expect_err("write").code(),
+            NetErrorCode::InvalidArgument
+        );
+        assert_eq!(n.read_dns_helper_intent().expect("read"), None);
+        // 別ネットワーク名の記録がディスクに置かれていた場合。
+        n.write_record_bytes(DNS_HELPER_INTENT_FILE, &other.encode())
+            .expect("plant");
+        assert_eq!(
+            n.read_dns_helper_intent().expect_err("read").code(),
+            NetErrorCode::DataLoss
+        );
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-5・NET-7・REPAIR-4: 記録の書き込み・削除と回収は `record_net_op` を通り、種別と結果が具体値で記録される。
+    #[test]
+    fn net7_3070_record_ops_and_recovery_are_instrumented() {
+        use crate::dns_helper::detach::{IntentRecovery, recover_dns_helper_intent};
+        use crate::instrument::NetOpOutcome;
+        use crate::instrument::testing::Collect;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-dnsh-store-{}-{}",
+            std::process::id(),
+            super::super::stage_name("i")
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let col = Arc::new(Collect::default());
+        let st = NetworkStore::open_with_recorder(&dir, col.clone()).expect("open");
+        st.create(&NetworkDefinition::pasta("web").expect("def"))
+            .expect("create");
+        let name = NetworkName::new("web").expect("name");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        let before = col.kinds().len();
+        n.write_dns_helper_intent(&intent()).expect("write");
+        let r = recover_dns_helper_intent(&n, &mut std::iter::empty(), &*col).expect("recover");
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
+        let got: Vec<_> = col.kinds().into_iter().skip(before).collect();
+        assert_eq!(
+            got,
+            vec![
+                (NetOpKind::NetworkStoreDnsHelperWrite, NetOpOutcome::Success),
+                (
+                    NetOpKind::NetworkStoreDnsHelperRemove,
+                    NetOpOutcome::Success
+                ),
+                (NetOpKind::DnsHelperRecover, NetOpOutcome::Success),
+            ]
+        );
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-5・NET-7: 確定記録の nonce が意図記録と違えば「記録が正」とはせず、意図記録の nonce で候補を調べる
+    /// （候補なしなら意図記録だけ消え、確定記録のヘルパーの記録は残る）。
+    #[test]
+    fn net7_3070_recovery_ignores_record_with_different_nonce() {
+        use crate::dns_helper::detach::{IntentRecovery, recover_dns_helper_intent};
+        use crate::instrument::NoopNetOpRecorder;
+
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        let other_nonce = DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::new("ffeeddccbbaa99887766554433221100").expect("nonce"),
+            DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5353).expect("listen"),
+        );
+        n.write_dns_helper(&rec()).expect("record");
+        n.write_dns_helper_intent(&other_nonce).expect("intent");
+        let r = recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover");
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
+        assert_eq!(n.read_dns_helper().expect("read"), Some(rec()));
+        assert_eq!(n.read_dns_helper_intent().expect("read"), None);
         drop(n);
         drop(g);
         let _ = fs::remove_dir_all(dir);

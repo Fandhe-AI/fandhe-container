@@ -10,7 +10,8 @@
 //! - ホスト netns の基準は runtime が渡す信頼済み識別子（[`NsId`]）のみ。`/proc/1/ns/net` は基準に使わない
 //!   （PID namespace 内では PID 1 がホストと別 netns になり得て、誤った基準で判定してしまうため）。
 //!   runtime はホスト側で取得した参照（起動時に保持した netns の (dev, ino) 等）を渡す責務を持つ。
-//!   rootless の host モードは NET-9・TASK-147 の領域で未対応
+//!   rootless の本番経路の照合は core の fd 方式（exec 直前の同期点。#3206）が担い、pasta 構成（NET-9・TASK-147）は
+//!   core の同期点（fd 2 本と呼び出し側の合図。#1939）と holder（#3197）が担う。本モジュールの判定はそれらを置き換えない
 //! - 呼び出しスレッドが基準の netns 以外にいる場合は `FailedPrecondition`。setns による加入
 //!   （runtime 自体がホスト以外の netns で動く構成）は未実装の将来仕様（REPAIR-3）
 //! - netns はスレッド単位の属性で、`/proc/<pid>/ns/net` はそのうち 1 スレッド（`pid` 自身）しか示さない。

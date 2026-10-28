@@ -557,7 +557,7 @@ impl LaunchSpec {
         self
     }
 
-    /// network の実効の扱い(NET-6・SEC-1)。`NewLoopback` は新しい netns の作成を要求する(実体は #3064 で実装済み)。
+    /// network の実効の扱い(NET-6・SEC-1)。`NewLoopback` は新しい netns の作成を要求する(実体は #3064 で実装済み。`Attachable` モードも同じ実効値で、同期点が fd 2 本を渡す差だけ。#1939)。
     pub fn network(&self) -> EffectiveNetwork {
         self.network
     }

@@ -1115,13 +1115,14 @@ fn net6_start_rejected(name: &str, cfg: &Value, mode: LaunchNetworkMode) -> OciR
     err
 }
 
-/// NET-6・SEC-1（#3058）: `Host` / `Loopback` と path 付きの network エントリの衝突は `InvalidArgument`。
+/// NET-6・NET-9・SEC-1（#3058・#1939）: `Host` / `Loopback` / `Attachable` と path 付きの network エントリの衝突は `InvalidArgument`。
 #[test]
 fn net6_sec1_start_rejects_network_mode_conflicting_with_path() {
     let cfg = config_with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
     for (name, mode) in [
         ("it-net6-host-path", LaunchNetworkMode::Host),
         ("it-net6-loop-path", LaunchNetworkMode::Loopback),
+        ("it-net9-attach-path", LaunchNetworkMode::Attachable),
     ] {
         let err = net6_start_rejected(name, &cfg, mode);
         assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
@@ -1159,7 +1160,7 @@ fn net6_start_from_config_with_network_entry_is_unimplemented() {
 }
 
 /// NET-6（#3058）: `Host` + path 無しの network エントリは受理され、spec の実効 network は `HostShared`。
-/// `Loopback` + path 無しは `NewLoopback`（実体の作成は #3064 で実装済み）。
+/// `Loopback` / `Attachable` + path 無しは `NewLoopback`（実体の作成は #3064 で実装済み。`Attachable` は #1939）。
 #[cfg(target_os = "linux")]
 #[test]
 fn net6_start_accepts_pathless_entry_and_reports_effective_network() {
@@ -1172,6 +1173,11 @@ fn net6_start_accepts_pathless_entry_and_reports_effective_network() {
         (
             "it-net6-loop-ok",
             LaunchNetworkMode::Loopback,
+            EffectiveNetwork::NewLoopback,
+        ),
+        (
+            "it-net9-attach-ok",
+            LaunchNetworkMode::Attachable,
             EffectiveNetwork::NewLoopback,
         ),
     ] {

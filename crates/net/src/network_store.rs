@@ -13,8 +13,17 @@
 //! ├── @removing-<一意値>/         削除途中（同上）
 //! └── <name>/                    0700
 //!     ├── definition             0600。FCNET1
-//!     └── @lock                  0600。ネットワークのロック
+//!     ├── @lock                  0600。ネットワークのロック
+//!     ├── realized               0600。FCREA1（作成済みのカーネル資源。#3067）
+//!     ├── realized.intent        0600。FCRIN1（作成・削除の操作中。残っていれば未完了）
+//!     ├── members/<id>           0700 のディレクトリ。0600 の FCMEM1（attach 成功後の確定記録）
+//!     ├── members-intent/<id>    0700 のディレクトリ。0600 の FCMIN1（attach 前の意図記録）
+//!     └── pending-reclaim/       0700。`create`（FailedCreateClaim）と `attach/<endpoint>`（FailedAttachClaim）の請求書
 //! ```
+//! 記録の書き込みは `@tmp-<一意値>` に書いて fsync し、rename してから親ディレクトリを fsync する。`@` は
+//! メンバー ID にもネットワーク名にも現れないため、一時ファイルは正規の項目と衝突しない。書き込み系の操作は
+//! ネットワークの排他ロックのガードでだけ許す（共有ロックでは `FailedPrecondition`）。IPAM は独立したカウンタを
+//! 持たず、記録から `rebuild_ipam` で操作のたびに組み直す。
 //! `NetworkName` は先頭が `[a-z0-9]` のため、`@lock`・`@staging-*`・`@removing-*` はネットワーク名と衝突しない。
 //! ディレクトリには flock を掛けず、ロックは通常ファイルの `@lock` だけに掛ける（systemd-tmpfiles の
 //! aging が掛ける flock と競合した前例の回避。`docs/design/measurements/production-launcher-tmpfiles-flock.md`）。
@@ -31,19 +40,40 @@
 //! 解放から [`LOCK_HANDOFF_GAP`] 経つまで次の取得を待つ（`docs/design/measurements/state-lock-contention.md`）。
 //!
 //! # 未実装（REPAIR-3）
-//! メンバー記録・`realized`・IPAM は #3067、DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
-//! `remove` は `definition` と `@lock` 以外の項目があれば拒否するため、それらが増えても誤って消さない。
+//! 残った `realized.intent` のカーネル照合（所有トークンでの昇格または巻き戻し）は後続で、それまでは
+//! `network::recorded` が次の操作を拒否する。公開の記録は #3068、DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
+//! `remove` は `definition`・`@lock` と空の既知ディレクトリ以外の項目があれば拒否するため、記録を誤って消さない。
 //! Linux 以外ではストアの全操作が `Unimplemented`（FCNET1 コーデックは 3 OS で動く）。
 
+mod codec;
 pub mod definition;
+pub mod ipam_rebuild;
+pub mod member;
+pub mod realized;
 
 use std::time::Duration;
 
 use crate::error::{NetError, NetErrorCode};
+pub use codec::RECORD_MAX_BYTES;
 pub use definition::{
     DEFINITION_MAX_BYTES, InstallMode, MAX_NETWORKS, NetworkDefinition, RESERVED_NETWORK_NAMES,
     is_reserved_network_name,
 };
+pub use ipam_rebuild::rebuild_ipam;
+pub use member::{MemberId, MemberIntent, MemberRecord};
+pub use realized::{RealizedIntent, RealizedOp, RealizedRecord};
+
+/// 1 ネットワークに置けるメンバー記録（確定と意図の各々）の最大件数（D13 の /24 と plugin-cri の上限に合わせる）。
+pub const MAX_MEMBERS_PER_NETWORK: usize = 256;
+
+/// 取り残しの回収待ちの請求書（`pending-reclaim/`）の読み出し結果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReclaimRecords {
+    /// 作成失敗の請求書（`pending-reclaim/create`）。
+    pub create: Option<crate::network::FailedCreateClaim>,
+    /// attach 失敗・切り離し失敗の請求書（endpoint 順）。
+    pub attach: Vec<crate::network::FailedAttachClaim>,
+}
 
 /// ロック待ちの既定の期限（D15・REPAIR-5）。
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);

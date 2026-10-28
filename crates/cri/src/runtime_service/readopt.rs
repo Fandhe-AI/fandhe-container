@@ -417,6 +417,37 @@ mod tests {
         );
     }
 
+    /// CRI-2: provider 未注入では、回収待ちの再採用記録を Stop・Remove が成功させず、記録（メモリと永続）を保持する。
+    #[test]
+    fn cri2_readopt_owned_record_survives_remove_without_provider() {
+        let mut d = data('a', "p");
+        d.network_owned = true;
+        let store = Fake::with(vec![ok(&d)], 0);
+        let s = svc(store.clone(), Arc::default());
+        s.readopt_sandboxes(ListBudget::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let rm = rt.block_on(s.remove_sandbox_with_network(
+            crate::runtime::v1::RemovePodSandboxRequest {
+                pod_sandbox_id: id('a'),
+            },
+        ));
+        let stop = rt.block_on(s.stop_sandbox_with_network(
+            crate::runtime::v1::StopPodSandboxRequest {
+                pod_sandbox_id: id('a'),
+            },
+        ));
+        for e in [rm.unwrap_err(), stop.unwrap_err()] {
+            assert_eq!(e.code().grpc_code(), Code::FailedPrecondition);
+        }
+        assert_eq!(
+            snapshot(&s),
+            vec![(id('a'), SandboxState::NotReady, true, false)]
+        );
+        assert_eq!(*store.calls.lock().unwrap(), (0, 0));
+    }
+
     /// CRI-2: pending / network_pending は回収待ち（network_owned=true）へ正規化し、ファイルに触れない。
     #[test]
     fn cri2_readopt_normalizes_pending_to_reclaimable() {

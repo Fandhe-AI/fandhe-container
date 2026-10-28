@@ -1980,6 +1980,29 @@ impl CriRuntimeService {
         self.tear_down_bounded(provider, sandbox_id, guard).await
     }
 
+    /// provider 未注入のまま、回収待ち（`network_owned=true`）の記録を Stop・Remove させない（CRI-2 の fail-closed）。
+    ///
+    /// 再採用した記録は provider 無しでも登録できるが、回収できないまま記録を消すと残存資源の追跡情報が
+    /// 失われる。固定文言の `FAILED_PRECONDITION` を返し、永続記録を保持する。
+    fn ensure_owned_network_reclaimable(&self, id: &str) -> Result<(), CriError> {
+        if self.pod_network.is_some() || id.is_empty() {
+            return Ok(());
+        }
+        let owned = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
+            .records
+            .get(id)
+            .is_some_and(|r| r.network_owned);
+        if owned {
+            return Err(CriError::failed_precondition(
+                "sandbox network cannot be reclaimed without a pod network provider",
+            ));
+        }
+        Ok(())
+    }
+
     /// `StopPodSandbox` 本体（実行層の有無で分岐）に、pod network の回収を足したもの。
     ///
     /// 配下の停止が成功したときだけネットワークを回収する（失敗時は配下が生きているため触れない）。
@@ -1988,6 +2011,7 @@ impl CriRuntimeService {
         req: v1::StopPodSandboxRequest,
     ) -> Result<v1::StopPodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
+        self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
             self.ensure_network_not_pending(&req.pod_sandbox_id)?;
         }
@@ -2017,6 +2041,7 @@ impl CriRuntimeService {
         req: v1::RemovePodSandboxRequest,
     ) -> Result<v1::RemovePodSandboxResponse, CriError> {
         self.ensure_record_not_writing(&req.pod_sandbox_id)?;
+        self.ensure_owned_network_reclaimable(&req.pod_sandbox_id)?;
         if self.pod_network.is_some() && !req.pod_sandbox_id.is_empty() {
             self.ensure_network_not_pending(&req.pod_sandbox_id)?;
             let owned = self

@@ -24,6 +24,9 @@
 //! 検証済みの型 `pasta::binary::PastaBinary` と opt-in の `PATH` 探索、`--version` の解釈。NET-9・PLUG-11・#1936）と、
 //! ポート公開指定の検証と引数配列への変換（`pasta::port_forward`。OS 非依存。NET-9・#1937）も持つ。
 //! ネットワーク定義の状態ストア（`network_store`。`@networks`・FCNET1・ロック・権限・上限。Linux のみ。NET-6・CORE-1・REPAIR-5・#3059。メンバー記録・IPAM は #3067）も持つ。
+//! pasta 構成の netns holder（`netns_holder`。supervisor が `/proc/self/exe netns-holder` として exec し直す専用プロセスの本体
+//! `run_netns_holder_main`・supervisor 側の端 `NetnsHolderChannel`・固定長フレーム。Linux 以外は本体が `UNIMPLEMENTED`。
+//! NET-9・CORE-6・#3197。supervisor の振り分けと launch への組み込みは後続）も持つ。
 //! pasta の起動・監視・回収は supervisor（core 側）が `crates/net` の関数で行う。DNS ヘルパー（NET-5）は
 //! plugin 側の `NetworkPlugin` の実装が起動する（PLUG-1 の区分。2026-10-12 のオーナー決定・#4。`docs/design/rootless-network.md` 12 章）。
 
@@ -39,6 +42,13 @@ compile_error!(
 #[cfg(all(feature = "pasta-test-support", not(debug_assertions)))]
 compile_error!(
     "the `pasta-test-support` feature skips ancestor trust checks and must not be enabled in release builds"
+);
+
+// 試験専用の入口（holder へ任意のバイト列・fd を送る `send_raw_for_test`）を製品のリリースビルドへ入れない
+// （NET-9・REPAIR-2・#3197）。
+#[cfg(all(feature = "netns-holder-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `netns-holder-test-support` feature exposes raw frame injection and must not be enabled in release builds"
 );
 
 /// uapi 定数を `libc` と `const` 評価で照合するマクロ（Linux の試験ビルド限定。#3102・#1318・MVM-4・REPAIR-12）。
@@ -72,6 +82,7 @@ pub mod netlink;
 pub mod netlink_route;
 #[cfg(target_os = "linux")]
 pub mod netns;
+pub mod netns_holder;
 pub mod network;
 pub mod network_mode;
 pub mod network_store;

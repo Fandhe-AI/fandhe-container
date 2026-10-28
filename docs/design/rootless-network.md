@@ -197,6 +197,9 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - holder を fork だけで作る（supervisor のメモリを継承する）
 - **残る露出**: 同じ uid のホスト側プロセスは holder の ns を開いてコンテナの user namespace と netns に入れる。これは exec 後の PID 1（dumpable で owner は全 capability を持つ）から owner が元々できることと同じで、新しい権限は与えない。holder は capability を落としているので乗っ取られても netns を書き換える権限が残らず、fd 3 以上と secret を持たない
 
+- **実装（#3197）**: `crates/net/src/netns_holder.rs`（入口 `run_netns_holder_main`・期限の定数）と子モジュール `holder`（holder 側の手順）・`channel`（supervisor 側の端 `NetnsHolderChannel`・`NetnsHolderFds`）・`frame`（固定長 32 バイトのフレーム。magic `FCNH`・version 1・kind・LE の 3 欄。OS 非依存）。syscall は `sys/holder.rs` の薄いラッパーと libc 照合。supervisor の bin の振り分け・起動と回収は 12.14 の次の単位、fd 2 本の送出は #1939、pasta の起動は #1938・#1940 の担当で、本実装には含まない。実機の確認は `netns_holder_userns`（CI の `platform-ci` ubuntu）で行う
+- **実装で決めた細部（自動運転で安全側に選んだ。承認は未取得）**: (1) 親の確認は argv が固定で期待値を受けられないため、stdin が `SOCK_SEQPACKET` であることと、`SO_PEERCRED` の pid（socketpair の作成者）が `getppid` と一致し 1 でないことで行う。(2) fd の待ちに期限を付ける（2 秒。親が送る前に壊れても残らないため。スレッドは使わず `poll`）。(3) 参加の後、capability を落とし `NO_NEW_PRIVS` を立てた後に PDEATHSIG を設定し直し、PDEATHSIG が SIGKILL のままであることと dumpable が 1 のままであることを READY の前に自己確認する（崩れたら `FailedPrecondition` で止まる。回避しない）。(4) 参加前後の失敗は固定の英文と code だけの stderr 1 行と、ワイヤー上の `Error` フレームで返す。(5) nsfs であることの `fstatfs` 確認は足さず、型の最終照合は `setns` の `EINVAL` と参加後の (dev, ino) 照合に任せる。(6) 受信の制御バッファは fd ちょうど 2 本分で、3 本目以降はカーネルが閉じて `MSG_CTRUNC` になり拒否する。(7) READY の後の待ちは期限なし（終わる経路は PDEATHSIG・EOF・STOP）。READY の後に fd や STOP 以外を受けたら fail-closed で終了する
+
 ### 12.3 #1870 との分担
 
 - **決定**: rootful の netns の渡し方（D12）と Host・Loopback の照合（D8）は変えない。pasta 構成は rootless のユーザー定義名だけに限り、D8 の同期点を「fd を 2 本」に拡張して使う。config.json との突き合わせは D7 の Loopback の行と同じ規則にする（path の無い network エントリは受け、path 付きは `InvalidArgument`）。#1870 は close 済みなので、記録は network-wiring.md の D4・D7・D8・D15 と残余の参照の行で行う

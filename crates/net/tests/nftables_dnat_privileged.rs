@@ -48,6 +48,9 @@
 //! （`nf_tables_alloc_handle` が `++table->hgenerator`）の想定どおり、新規テーブルへ chain → rule の順で
 //! 作ったルールのハンドルが [`EXPECTED_RULE_HANDLE`] に一致することを照合する（外れたら名指しして失敗する）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("nftables_dnat_privileged: Linux only, not applicable on this OS");
@@ -210,8 +213,7 @@ mod linux {
             match child.try_wait().expect("wait router") {
                 Some(st) => std::process::exit(st.code().unwrap_or(1)),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("nftables_dnat_privileged: router did not finish before deadline");
                     std::process::exit(1);
                 }
@@ -386,8 +388,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 

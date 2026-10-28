@@ -24,6 +24,9 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・外部コマンド）を
 //! 満たさない場合は skip せず失敗する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("static_dns_privileged: Linux only, not applicable on this OS");
@@ -213,8 +216,7 @@ mod linux {
                 None if Instant::now() >= deadline => {
                     // --inner と run_cmd 配下の nsenter・probe 等、セッション内の全プロセスを SIGKILL して回収する。
                     kill_session(sid);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("static_dns_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -302,8 +304,7 @@ mod linux {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
         };
         let (out_rx, out_over) = spawn_capped_reader(child.stdout.take());
         let (err_rx, err_over) = spawn_capped_reader(child.stderr.take());

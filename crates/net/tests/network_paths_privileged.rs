@@ -71,6 +71,9 @@
 //! masquerade 本体は未実装、ホスト役は実ホストでなく隔離 netns。値は暫定（`provisional`）で NET-2・NET-3 の
 //! 判定には使わない。詳細は `docs/design/net-tcp-rtt-bench.md`。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("network_paths_privileged: Linux only, not applicable on this OS");
@@ -470,8 +473,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -698,8 +700,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 
@@ -1183,7 +1184,14 @@ mod linux {
                 "hold-check[{case}]: unexpected released line"
             );
             drop(stdin);
-            let status = child.wait().expect("wait --hold");
+            let status =
+                match crate::reap::wait_within(&mut child, std::time::Duration::from_secs(60)) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                        panic!("hold-check[{case}]: {e}");
+                    }
+                };
             assert!(status.success(), "hold-check[{case}]: exit status {status}");
         }
         println!("network_paths_privileged: hold verified release/eof/deadline (NET-3)");

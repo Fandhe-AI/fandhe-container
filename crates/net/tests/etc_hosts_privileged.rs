@@ -15,6 +15,9 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・外部コマンド・
 //! `/etc/nsswitch.conf` の `hosts:` に `files` を含むこと・hosts キャッシュが無いこと）を満たさない場合は skip せず失敗する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("etc_hosts_privileged: Linux only, not applicable on this OS");
@@ -140,8 +143,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("etc_hosts_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -202,8 +204,7 @@ mod linux {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
         };
         let mut out_pipe = child.stdout.take();
         let mut err_pipe = child.stderr.take();

@@ -1159,7 +1159,7 @@ fn net6_start_from_config_with_network_entry_is_unimplemented() {
 }
 
 /// NET-6（#3058）: `Host` + path 無しの network エントリは受理され、spec の実効 network は `HostShared`。
-/// `Loopback` + path 無しは `NewLoopback`（実体の作成は #3064 で、本番 launcher は未実装として拒否する）。
+/// `Loopback` + path 無しは `NewLoopback`（実体の作成は #3064 で実装済み）。
 #[cfg(target_os = "linux")]
 #[test]
 fn net6_start_accepts_pathless_entry_and_reports_effective_network() {

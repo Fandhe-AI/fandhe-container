@@ -87,7 +87,7 @@
 //! 必須とする namespace は CORE-1 の最小分離（PID・mount・UTS・IPC）と user（SEC-5）。network は
 //! `FromConfig` で指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
 //! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。起動オプションの
-//! `Host` / `Loopback` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064）。
+//! `Host` / `Loopback` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064 で実装済み）。
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
@@ -1353,7 +1353,7 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
 /// `net.*` の sysctl は network namespace が無いとホストの値を書き換えるため拒否する（CRI-2・CORE-3・SEC-1・#2670）。
 ///
 /// 実効の network が `HostShared`（ホストの netns を共有）なら `net.*` を拒否する。`NewLoopback`（新しい netns。
-/// 実体は #3064）なら通す。`FromConfig` で network エントリがある構成は `reconcile_network` が先に `Unimplemented`
+/// 実体は #3064 で実装済み）なら通す。`FromConfig` で network エントリがある構成は `reconcile_network` が先に `Unimplemented`
 /// で拒否する（pod の netns の結線は #2675）。起動オプションの network モードとの突き合わせは NET-6・#3058。
 /// IPC 系は IPC namespace の必須検査（本関数の呼び出し側）と、launcher の実効の名前空間との照合
 /// （`--ipc=host` との組み合わせの拒否）が担う。

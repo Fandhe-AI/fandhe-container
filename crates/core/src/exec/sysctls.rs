@@ -19,8 +19,8 @@
 //!
 //! 起動前に launcher が、実効の名前空間（`--ipc=host` で IPC namespace を外した場合を含む）と
 //! [`SysctlPlan::new`] で照合する。必要な名前空間が無ければ plan を作れないため、ホストの名前空間へ向かう書き込みは
-//! 子へ渡る値として表現できない。network namespace は launcher が未対応（`isolation_config_of` が拒否）で、`net.*` は
-//! 常に plan を作れない（pod の netns の結線は #2675。REPAIR-3）。
+//! 子へ渡る値として表現できない。network namespace は Loopback モード（NET-6・#3064）で子が新しく作る netns が実効の集合に
+//! 入るときだけ `net.*` の plan を作れる（ホストの netns のままなら作れない）。pod の netns の結線は未対応（#2675。REPAIR-3）。
 //!
 //! # 契約
 //!
@@ -63,8 +63,8 @@ impl<'a> SysctlPlan<'a> {
     /// 名前空間のまま残すものは含まない）にあるときだけ計画を作る。
     ///
     /// 空集合は `Ok(None)`（何も適用しない）。足りない名前空間があれば、その種別を `Err` で返す
-    /// （IPC 系は IPC namespace、`net.*` は network namespace が要る。network namespace は launcher が未対応のため
-    /// `net.*` は常に `Err(Net)`）。
+    /// （IPC 系は IPC namespace、`net.*` は network namespace が要る。`net.*` は実効の集合に `Net` が無ければ `Err(Net)`。
+    /// `Net` は Loopback モードで子が新しく作る netns に限る。NET-6・#3064）。
     pub(crate) fn new(
         set: &'a SysctlSet,
         effective: NamespaceSet,
@@ -75,7 +75,7 @@ impl<'a> SysctlPlan<'a> {
         if set.has_namespace(SysctlNamespace::Ipc) && !effective.contains(Namespace::Ipc) {
             return Err(SysctlNamespace::Ipc);
         }
-        if set.has_namespace(SysctlNamespace::Net) {
+        if set.has_namespace(SysctlNamespace::Net) && !effective.contains(Namespace::Net) {
             return Err(SysctlNamespace::Net);
         }
         Ok(Some(Self { set }))
@@ -348,8 +348,17 @@ mod tests {
                 .is_none()
         );
         let net = set_of(&[("net.ipv4.ip_forward", "1")]);
+        assert!(
+            SysctlPlan::new(&net, NamespaceSet::all())
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
-            SysctlPlan::new(&net, NamespaceSet::all()).unwrap_err(),
+            SysctlPlan::new(&net, NamespaceSet::all().without(Namespace::Net)).unwrap_err(),
+            SysctlNamespace::Net
+        );
+        assert_eq!(
+            SysctlPlan::new(&net, NamespaceSet::empty()).unwrap_err(),
             SysctlNamespace::Net
         );
     }

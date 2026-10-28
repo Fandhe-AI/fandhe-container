@@ -3120,11 +3120,24 @@ fn sup14_doctor_reports_launcher_mount_state() {
 fn record_image_root(state_root: &std::path::Path, image_root: &std::path::Path) {
     let path = state_root.join("c1").join("state.json");
     let text = std::fs::read_to_string(&path).expect("read state");
-    let body = text.strip_prefix('{').expect("json object");
-    let patched = format!(
-        "{{\"annotations\":{{\"io.fandhe.container.image-root\":\"{}\"}},{body}",
+    let entry = format!(
+        "\"io.fandhe.container.image-root\":\"{}\"",
         image_root.to_str().expect("utf8")
     );
+    // Linux の create は既定の `network none` の文書に伴う作成世代の注釈を残す(#1873)ため、
+    // `annotations` が既にあれば先頭へ足し、無ければ新設する(キーの重複は状態ファイルの破損になる)。
+    let patched = if let Some(at) = text.find("\"annotations\":{") {
+        let open = at + "\"annotations\":{".len();
+        let sep = if text[open..].starts_with('}') {
+            ""
+        } else {
+            ","
+        };
+        format!("{}{entry}{sep}{}", &text[..open], &text[open..])
+    } else {
+        let body = text.strip_prefix('{').expect("json object");
+        format!("{{\"annotations\":{{{entry}}},{body}")
+    };
     std::fs::write(&path, patched).expect("write state");
 }
 

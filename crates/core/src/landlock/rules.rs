@@ -220,6 +220,17 @@ pub enum RuleOrigin {
     },
 }
 
+impl RuleOrigin {
+    /// ランタイムが載せたマウント由来のルール（`Root` 以外）か。適用時の識別子の照合、launch の子の識別子の報告、
+    /// 親の期待列の 3 か所が共有する唯一の述語（`RecordedTarget::is_mount_origin` と同じ集合。REPAIR-1・#3201）。
+    pub fn is_mount_origin(&self) -> bool {
+        matches!(
+            self,
+            Self::Implicit { .. } | Self::Mount { .. } | Self::UserTmpfs
+        )
+    }
+}
+
 /// パス 1 件分の許可ルール。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

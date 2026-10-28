@@ -292,7 +292,10 @@ pub use reapply::{
 /// `exec-test-support` feature を付けたビルドにだけ存在する（TASK-163 追補・#1460）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
-pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
+pub use reapply::{
+    ExecReapplyObservation, ObservedMountRecording, observe_exec_restriction_reapply,
+    observe_exec_restriction_reapply_recorded,
+};
 pub use rlimits::launch_rlimits_from_self;
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use sealed_copy::MAX_SEALED_COPY_BYTES;

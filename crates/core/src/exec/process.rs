@@ -122,7 +122,7 @@ use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{
     ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
-    report_exec_returned, report_failure, report_ready,
+    report_exec_returned, report_failure, report_mount_identities, report_ready,
 };
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
@@ -3116,13 +3116,17 @@ fn run_child_then<T>(
     };
     // pivot 後・終端前にステージ列を固定順で実行する。pivot 前段が記録したマウントの識別子を Landlock 段へ渡す
     // （Mount 由来のルールの対象がマウントのルートであることの照合。#2071）。
+    let stages = stages.with_mounted_targets(ops.into_mounted());
+    // 成功の報告（`P`）の直後に、Mount 由来のルールの識別子を親へ返す（exec の再適用が `state.json` の識別子で
+    // 重ねられたマウントを検出する元。SEC-1・SEC-4・#3201）。書けなければ先へ進まない（fail-closed）。
+    if let Some(status) = status {
+        report_mount_identities(status, &stages.mount_identity_report())?;
+    }
     let mut terminal_ran = false;
-    let result = stages.with_mounted_targets(ops.into_mounted()).run_then(
-        |_stage_report, _capability_report, evidence| {
-            terminal_ran = true;
-            terminal(&isolation, &report, evidence)
-        },
-    );
+    let result = stages.run_then(|_stage_report, _capability_report, evidence| {
+        terminal_ran = true;
+        terminal(&isolation, &report, evidence)
+    });
     // Landlock 段の失敗は seccomp の listener を送る前に起きるため、親は listener の EOF しか見えない。
     // 照合の違反を親の監査へ届けられるよう、状態 pipe に `E landlock ...` を書く（SEC-1・SEC-4・CORE-5・#2130）。
     // 他の段の失敗は従来どおり何も書かない。書けなくても失敗は変わらない（best-effort）。

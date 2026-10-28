@@ -954,6 +954,9 @@ struct Spawned {
     stderr: std::io::PipeReader,
     /// PID 1 から受け取った seccomp の listener(SEC-4・#2024)。本番の入口は必ず `Some`。偽の launcher は `None`。
     listener: Option<crate::exec::SeccompListener>,
+    /// 子が返した Mount 由来のルールの launch 時の識別子(`(ルール位置, 識別子)`。SEC-1・SEC-4・#3201)。本番の入口は
+    /// 必ず `Some`(空もあり得る)。`None` は識別子を持たない偽の launcher だけで、分離の記録は識別子なしのまま残る。
+    mount_identities: Option<Vec<(usize, crate::launch_isolation::RecordedMountIdentity)>>,
 }
 
 /// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
@@ -1553,6 +1556,7 @@ impl Inner {
             stdout,
             stderr,
             listener,
+            mount_identities,
         } = spawned;
         // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
         if child.pid() == 0 {
@@ -1566,6 +1570,23 @@ impl Inner {
         if child.pidfd().is_none() {
             return Err(self.reject_unusable_child(id, child));
         }
+        // 子が返した Mount 由来のルールの識別子を分離の記録へ添える(exec の再適用の照合の元。start の Running 更新と
+        // restart の Running(新 pid)更新が `state.json` へ書く。SEC-1・SEC-4・#3201)。添えられない(不整合)なら、
+        // 識別子なしの記録で走らせず PID 1 を回収して拒否する(握りつぶさない。CORE-2)。
+        let isolation_record = match mount_identities {
+            Some(entries) => match isolation_record.with_mount_identities(entries) {
+                Ok(record) => record,
+                Err(e) => {
+                    return Err(self.reject_child_with(
+                        id,
+                        child,
+                        ErrorCode::Internal,
+                        e.message(),
+                    ));
+                }
+            },
+            None => isolation_record,
+        };
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         // ハンドルの terminate が成功した（PID 1 の消滅を回収で確かめた）ら、同じ世代の Handed を Clean へ進める。
         // 遅れて成功した状態更新の後始末が confirm_no_process で回収済みを確かめられるようにする（CORE-2）。
@@ -1705,13 +1726,27 @@ impl Inner {
 
     /// pidfd の無い子を回収して拒否する(回収できなければ台帳に `Pending` で残す)。
     fn reject_unusable_child(&self, id: &ContainerId, child: ContainerChild) -> TraitError {
+        self.reject_child_with(
+            id,
+            child,
+            ErrorCode::FailedPrecondition,
+            "the launched process has no pidfd",
+        )
+    }
+
+    /// 使えない子(`what` が理由の固定文言)を回収して `code` で拒否する。回収できなければ台帳に `Pending` で残し、
+    /// 文言に未確認の注記を足す(握りつぶさない。CORE-2)。
+    fn reject_child_with(
+        &self,
+        id: &ContainerId,
+        child: ContainerChild,
+        code: ErrorCode,
+        what: &str,
+    ) -> TraitError {
         match child.kill_and_reap(POST_SPAWN_REAP_TIMEOUT) {
             Ok(_) => {
                 self.ledger().set(id, LaunchRecord::Clean);
-                TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "the launched process has no pidfd and was terminated",
-                )
+                TraitError::new(code, format!("{what} and was terminated"))
             }
             Err(_) => {
                 self.left_process.store(true, Ordering::SeqCst);
@@ -1722,10 +1757,7 @@ impl Inner {
                         rescans: Vec::new(),
                     }),
                 );
-                TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    format!("the launched process has no pidfd{UNCONFIRMED_SUFFIX}"),
-                )
+                TraitError::new(code, format!("{what}{UNCONFIRMED_SUFFIX}"))
             }
         }
     }
@@ -2131,6 +2163,7 @@ impl LaunchOps for RealOps {
             stdout,
             stderr,
             listener: launched.listener,
+            mount_identities: Some(launched.mount_identities),
         })
     }
 
@@ -2427,6 +2460,7 @@ mod tests {
                 stdout,
                 stderr,
                 listener: None,
+                mount_identities: None,
             })
         }
 

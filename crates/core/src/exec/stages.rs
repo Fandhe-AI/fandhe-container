@@ -461,6 +461,46 @@ impl StagePipeline {
         self
     }
 
+    /// 登録した ruleset の Mount 由来のルールの位置（`rules()` 内の添字。昇順）。親が fork の前に計算し、子が状態 pipe で
+    /// 返す識別子のブロックの期待列として使う（登録が無ければ空。SEC-1・SEC-4・#3201）。
+    pub(crate) fn mount_rule_positions(&self) -> Vec<usize> {
+        self.landlock.as_ref().map_or_else(Vec::new, |rs| {
+            rs.rules()
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.origin.is_mount_origin())
+                .map(|(i, _)| i)
+                .collect()
+        })
+    }
+
+    /// pivot 前段が記録した識別子から、Mount 由来のルールごとの launch 時の識別子を作る（`(ルール位置, 識別子)`。
+    /// 位置は昇順）。記録が引けないルールは載せない（親の期待列との不一致として拒否される。fail-closed）。
+    /// `run_child_then` が `with_mounted_targets` の後・Landlock 段より前に呼び、状態 pipe へ書く（#3201）。
+    pub(crate) fn mount_identity_report(
+        &self,
+    ) -> Vec<(usize, crate::launch_isolation::RecordedMountIdentity)> {
+        let Some(rs) = self.landlock.as_ref() else {
+            return Vec::new();
+        };
+        rs.rules()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.origin.is_mount_origin())
+            .filter_map(|(i, r)| {
+                let t = self.mounts.target_for(&r.origin, r.path.as_str())?;
+                let id = crate::launch_isolation::RecordedMountIdentity::new(
+                    t.identity.mnt_id,
+                    t.identity.dev,
+                    t.identity.ino,
+                    t.read_only,
+                )
+                .ok()?;
+                Some((i, id))
+            })
+            .collect()
+    }
+
     /// core の Landlock 適用処理（TASK-39.4・#184・CORE-5）を Landlock 段へ登録する。
     ///
     /// `ruleset` は fork 前に親で `landlock_ruleset_from_config` 等で作り、クロージャへ move する

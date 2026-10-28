@@ -328,6 +328,9 @@ struct RealKernel<'a> {
     /// ルールのパスを辿る起点。`None` は呼び出しプロセスの `/`（launch 経路。pivot 後）。`Some` は
     /// 呼び出し側が検証済みのディレクトリの fd（exec 経路。`setns` 後にコンテナの rootfs と照合した `/`）。
     root: Option<BorrowedFd<'a>>,
+    /// `mnt_id` を読む fdinfo の起点（保持した自プロセスの `/proc/<pid>`）。`None` は `/proc/thread-self`（launch 経路）。
+    /// exec の再適用は `setns` の後に `thread-self` が解決できないため `Some` を渡す（#3201）。
+    fdinfo_dir: Option<BorrowedFd<'a>>,
 }
 
 impl LandlockKernel for RealKernel<'_> {
@@ -370,7 +373,10 @@ impl LandlockKernel for RealKernel<'_> {
     }
 
     fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
-        MountIdentity::of_fd(path)
+        match self.fdinfo_dir {
+            Some(dir) => MountIdentity::of_fd_in(dir, path),
+            None => MountIdentity::of_fd(path),
+        }
     }
 
     fn mount_flags(&self, path: &OwnedFd) -> Result<sys::MountFlags, SysError> {
@@ -458,11 +464,27 @@ impl MountIdentity {
     /// `(st_dev, st_ino)` は `fstat`。pivot 前段の記録と適用時の照合が同じ関数を使い、出どころを揃える
     /// （#2071）。fdinfo は上限つきで読む。
     pub(crate) fn of_fd(fd: &OwnedFd) -> Result<Self, SysError> {
+        Self::of_fd_with(fd, None)
+    }
+
+    /// [`Self::of_fd`] の、`mnt_id` を保持した procfs ディレクトリ `fdinfo_dir`（`/proc/<自分の pid>`）の
+    /// `fdinfo/N` から読む版（exec の再適用。`setns` の後に `thread-self` が解決できないため。#3201）。
+    pub(crate) fn of_fd_in(fdinfo_dir: BorrowedFd<'_>, fd: &OwnedFd) -> Result<Self, SysError> {
+        Self::of_fd_with(fd, Some(fdinfo_dir))
+    }
+
+    fn of_fd_with(fd: &OwnedFd, fdinfo_dir: Option<BorrowedFd<'_>>) -> Result<Self, SysError> {
         use std::os::fd::AsFd as _;
         use std::os::unix::fs::MetadataExt as _;
         let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
-        use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
-        let mnt_id = read_fd_mnt_id(fd.as_fd()).map_err(|e| match e {
+        use crate::oci_runtime::mountinfo_identity::{
+            FdinfoMountIdError, read_fd_mnt_id, read_fd_mnt_id_at,
+        };
+        let mnt_id = match fdinfo_dir {
+            Some(dir) => read_fd_mnt_id_at(dir, fd.as_fd()),
+            None => read_fd_mnt_id(fd.as_fd()),
+        }
+        .map_err(|e| match e {
             FdinfoMountIdError::Read(e) => io(e),
             _ => SysError::Os(sys::EINVAL),
         })?;
@@ -544,25 +566,28 @@ pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,
     check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
-    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None, check)
+    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None, None, check)
 }
 
 /// [`apply_landlock_ruleset`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
 ///
 /// exec の再適用が、`setns` の前に開いた status fd と、`setns` の後に開いてコンテナの rootfs と照合した
 /// `/` の fd（`root`）を渡すために使う。`root` が `None` なら呼び出しプロセスの `/` を起点にする
-/// （[`apply_landlock_ruleset`] と同じ）。前提検査（NNP・適用前後の `Threads: 1`）と、パスの辿り方
+/// （[`apply_landlock_ruleset`] と同じ）。`fdinfo_dir` は `mnt_id` を読む fdinfo の起点（保持した自プロセスの
+/// `/proc/<pid>`）で、`None` は `/proc/thread-self`（#3201）。前提検査（NNP・適用前後の `Threads: 1`）と、パスの辿り方
 /// （1 要素ずつ symlink 非追従・解決できないパスは拒否）は [`apply_landlock_ruleset`] と同一。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_ruleset_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
     root: Option<BorrowedFd<'_>>,
+    fdinfo_dir: Option<BorrowedFd<'_>>,
     check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
     let kernel = RealKernel {
         threads: std::cell::RefCell::new(threads),
         root,
+        fdinfo_dir,
     };
     apply_with(&kernel, ruleset, check)
 }
@@ -674,10 +699,7 @@ fn apply_with<K: LandlockKernel>(
         // Mount 由来のルール（暗黙の `/dev` 系と bind）は、pivot 前段が載せた直後に記録した識別子と、いま開いた fd
         // の識別子が一致することを要求する。`add_rule` の前に拒否するため、誤った木には権利が付かない（#2071）。
         if let MountCheck::Recorded(recorded) = check
-            && matches!(
-                rule.origin,
-                RuleOrigin::Implicit { .. } | RuleOrigin::Mount { .. } | RuleOrigin::UserTmpfs
-            )
+            && rule.origin.is_mount_origin()
         {
             let Some(expected) = recorded.expected_for(&rule.origin, rule.path.as_str()) else {
                 return Err(LandlockApplyError::new(
@@ -1083,6 +1105,7 @@ mod tests {
         let kernel = RealKernel {
             threads: std::cell::RefCell::new(&mut threads),
             root: Some(root_fd.as_fd()),
+            fdinfo_dir: None,
         };
         let meta = |p: &std::path::Path| {
             let m = std::fs::metadata(p).expect("metadata");
@@ -1450,6 +1473,7 @@ mod tests {
         let kernel = RealKernel {
             threads: std::cell::RefCell::new(&mut threads),
             root: Some(root_fd.as_fd()),
+            fdinfo_dir: None,
         };
         let (fd, kind) = kernel
             .open_rule_path(&RulePath::ImplicitDev(ImplicitDevMount::Dev))

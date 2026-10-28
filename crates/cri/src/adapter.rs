@@ -149,6 +149,8 @@ pub enum RuntimeCleanupOutcome {
     Removed,
     /// 既に無かった。
     AlreadyAbsent,
+    /// 同じ ID が再作成済みで、新しいインスタンスの資源として消さずに残した（失敗ではない。SUP-7・#3143）。
+    Superseded,
     /// 消せずに残した。
     Kept {
         /// 残した理由の分類。
@@ -163,6 +165,7 @@ impl RuntimeCleanupOutcome {
             CleanupOutcome::NotApplicable => Self::NotApplicable,
             CleanupOutcome::Removed => Self::Removed,
             CleanupOutcome::AlreadyAbsent => Self::AlreadyAbsent,
+            CleanupOutcome::Superseded => Self::Superseded,
             CleanupOutcome::Kept { code } => Self::Kept {
                 code: CriError::from(&TraitError::new(code, "")).code(),
             },
@@ -665,6 +668,11 @@ mod tests {
             .with_container_log(CleanupOutcome::Kept {
                 code: ErrorCode::FailedPrecondition,
             });
+        let superseded = DeleteResponse::new().with_container_log(CleanupOutcome::Superseded);
+        assert_eq!(
+            RuntimeDeleteResult::from(&superseded).container_log,
+            RuntimeCleanupOutcome::Superseded
+        );
         let got = RuntimeDeleteResult::from(&resp);
         assert_eq!(got.image_rootfs, RuntimeCleanupOutcome::AlreadyAbsent);
         assert_eq!(

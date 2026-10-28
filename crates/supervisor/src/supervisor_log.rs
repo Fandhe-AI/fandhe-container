@@ -153,7 +153,7 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
 
 /// [`remove`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2892・SUP-7・REPAIR-5）。
 ///
-/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する。確認はロック保持中に行うため、待ちの間に
+/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する（`RemovedLogs::guard_declined()` が真。#3143）。確認はロック保持中に行うため、待ちの間に
 /// 再作成された別インスタンスの supervisor ログを消さない。ディレクトリが無ければ 0 件で成功する。
 pub fn remove_guarded(
     root: &Path,

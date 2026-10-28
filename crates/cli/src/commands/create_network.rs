@@ -55,7 +55,7 @@ const NOT_WIRED_MESSAGE: &str = "network options (--network, --add-host, --dns, 
 /// `-p` がユーザー定義名の `--network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "port publishing requires a user-defined network";
 /// rootful の `-p` の固定拒否文言(D13 の判断待ち)。
-const PUBLISH_ROOTFUL_MESSAGE: &str =
+pub(super) const PUBLISH_ROOTFUL_MESSAGE: &str =
     "port publishing on rootful installations is not supported yet";
 /// `-p` の権限モデルを解決できない環境の固定拒否文言(非 Linux)。
 const PUBLISH_UNAVAILABLE_MESSAGE: &str = "port publishing is not supported on this platform yet";

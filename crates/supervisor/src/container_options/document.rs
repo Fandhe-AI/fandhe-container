@@ -270,6 +270,8 @@ impl ContainerOptionsDocument {
         self.network = network;
         self.add_hosts = add_hosts;
         self.dns = dns;
+        // pasta の記録があるのにユーザー定義名でなくなる変更は、encode できても decode で拒否されるため、ここで拒否する(REPAIR-2)。
+        self.check_pasta_network()?;
         if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
             return Err(invalid("options document is too large"));
         }
@@ -1210,6 +1212,48 @@ tmpfs 14\n/run:rw,noexec\n";
         assert_eq!(
             decode_err(over.as_bytes()).message(),
             "an options record is too long"
+        );
+    }
+
+    /// NET-9・REPAIR-2(#3199): `pasta` を持つ文書の `network` を後から非ユーザー定義名へ変える呼び出しは、その場で拒否する。
+    /// 構築に成功した文書は必ず復号できる(往復)。
+    #[test]
+    fn sup12_net9_pasta_then_network_change_is_rejected_and_round_trips() {
+        let msg = "a pasta record requires a user-defined network";
+        for (net, hosts) in [
+            (Some("none"), vec![]),
+            (Some("host"), vec![]),
+            (None, vec![]),
+        ] {
+            let e = pasta_doc("web", PASTA_BODY)
+                .expect("doc")
+                .with_network(net.map(str::to_owned), hosts, vec![])
+                .expect_err("must reject");
+            assert_eq!((e.code(), e.message()), (ErrorCode::InvalidArgument, msg));
+        }
+        // 別のユーザー定義名への変更は整合するので成功し、往復できる。
+        let ok = pasta_doc("web", PASTA_BODY)
+            .expect("doc")
+            .with_network(Some("db".into()), vec![], vec![])
+            .expect("named stays valid");
+        assert_eq!(
+            ContainerOptionsDocument::decode(&ok.encode()).expect("decode"),
+            ok
+        );
+        // publish と組の network も同様(publish が要るユーザー定義名を外す変更は拒否される)。
+        let with_pub = pasta_doc("web", PASTA_BODY)
+            .expect("doc")
+            .with_publish(vec!["8080:80".into()])
+            .expect("publish");
+        assert!(
+            with_pub
+                .clone()
+                .with_network(Some("none".into()), vec![], vec![])
+                .is_err()
+        );
+        assert_eq!(
+            ContainerOptionsDocument::decode(&with_pub.encode()).expect("decode"),
+            with_pub
         );
     }
 

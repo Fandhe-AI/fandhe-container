@@ -1501,22 +1501,34 @@ mod net12_argv_tests {
     /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、結線(#1873・#1940)まで UNIMPLEMENTED(受理して捨てない)。
     #[test]
     fn net9_publish_valid_is_unimplemented_until_wired() {
-        // rootless のユーザー定義名は pasta の場所の判定(#3199・12.4)が `UNIMPLEMENTED` より前に走り、フラグが無ければ
-        // `FAILED_PRECONDITION` になる。root で走る環境(rootful 扱い)では従来どおり `UNIMPLEMENTED`。
-        let rootful = std::fs::read_to_string("/proc/self/status")
-            .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")));
+        // 判定順は `check_network_options`(権限モデルの解決: publish が使えない場合の拒否)→ pasta の場所 →
+        // `UNIMPLEMENTED`。組み合わせごとに具体値で期待する(NET-9・#3199・#3200)。
+        // 非 Linux は権限モデルが `Unavailable` で、pasta の判定より前に `UNIMPLEMENTED` になる。
+        // Linux の root は rootful で `UNIMPLEMENTED`、非 root は rootless で pasta 未指定の `FAILED_PRECONDITION`。
+        #[cfg(not(target_os = "linux"))]
+        let want = (
+            "UNIMPLEMENTED",
+            "port publishing is not supported on this platform yet",
+        );
+        #[cfg(target_os = "linux")]
+        let want = if std::fs::read_to_string("/proc/self/status")
+            .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")))
+        {
+            (
+                "UNIMPLEMENTED",
+                super::create_network::PUBLISH_ROOTFUL_MESSAGE,
+            )
+        } else {
+            ("FAILED_PRECONDITION", "pasta path is not configured")
+        };
         for extra in [
             ["--network", "mynet", "-p", "8080:80"],
             ["--network", "mynet", "--publish", "127.0.0.1:8080:80/udp"],
         ] {
-            if rootful {
-                assert_unimplemented(&extra);
-            } else {
-                let (exit, code, stderr) = create(&extra);
-                assert_eq!(code, Some("FAILED_PRECONDITION"), "{extra:?}: {stderr}");
-                assert_ne!(exit, 0, "{extra:?}");
-                assert!(stderr.contains("pasta path is not configured"), "{stderr}");
-            }
+            let (exit, code, stderr) = create(&extra);
+            assert_eq!(code, Some(want.0), "{extra:?}: {stderr}");
+            assert_ne!(exit, 0, "{extra:?}");
+            assert!(stderr.contains(want.1), "{extra:?}: {stderr}");
         }
     }
 

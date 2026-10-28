@@ -110,10 +110,12 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - masquerade ルール本体（`bitwise` / `meta` expr が `nftables_rules` に未実装のため `postrouting`
-//!   チェインは空。saddr のみの masq は `bridge-nf-call-iptables` 有効環境で bridge 内通信まで書き換える）。
-//!   このため default route を張っても、コンテナ発の通信を host 外部へ届けるには masquerade と host の
-//!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
+//! - host の `ip_forward`（masquerade は `create_network` が `postrouting` へ投入済み。`masquerade` モジュール。
+//!   #3073・NET-1・NET-11。出口が bridge のときは除外する。saddr のみの masq は `bridge-nf-call-iptables`
+//!   有効環境で bridge 内通信まで書き換えるため）。コンテナ発の通信を host 外部へ届けるには `ip_forward` が
+//!   別途必要で、本 crate は host のグローバル設定を変更しない（D11。NET-10 の診断で案内する）。
+//!   外向きの実トラフィックの変換は実機で未検証。ネットワーク削除後も既存の conntrack の NAT エントリは
+//!   timeout まで残る
 //! - コンテナ単位のポート公開解除
 //!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
 //!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
@@ -134,6 +136,7 @@ mod attach_fault;
 pub mod delete;
 pub mod ipam;
 pub mod listener_dump;
+mod masquerade;
 pub mod publish;
 pub mod unpublish;
 
@@ -179,13 +182,12 @@ use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 #[cfg(target_os = "linux")]
 use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
+use crate::nftables_batch::NetlinkNetfilterSocket;
 use crate::nftables_batch::{
-    BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NF_IP_PRI_NAT_SRC,
-    NetlinkNetfilterSocket, NfInetHook, NftFamily, TableCreate,
+    BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NF_IP_PRI_NAT_SRC, NfInetHook, NftBatch,
+    NftBatchOutcome, NftFamily, NftName, TableCreate,
 };
-use crate::nftables_batch::{NftBatchOutcome, NftName};
 use crate::nftables_rules::NftRuleHandle;
-#[cfg(target_os = "linux")]
 use crate::nftables_rules::RuleCreate;
 
 /// bridge 名のプレフィックス。
@@ -718,8 +720,15 @@ pub(crate) trait NetworkOps {
     /// 取得済みの ifindex で削除する。外部で bridge が消され同名の別 link ができても巻き込まない。
     fn delete_bridge(&self, index: IfIndex) -> Result<(), NetError>;
     /// 専用テーブルと NAT base chain を作る。テーブルには所有トークン（`token`）を `NFTA_TABLE_USERDATA` で
-    /// 載せ、削除時に照合できるようにする（TASK-139.4・#317）。
-    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure>;
+    /// 載せ、削除時に照合できるようにする（TASK-139.4・#317）。同じバッチの末尾で `postrouting` に
+    /// masquerade（`gateway` のサブネット発で出口が `bridge` 以外）を 1 件積む（all-or-nothing。#3073・NET-1）。
+    fn apply_nft(
+        &self,
+        table: &NftName,
+        token: &str,
+        bridge: &IfName,
+        gateway: &IpPrefix,
+    ) -> Result<(), NftApplyFailure>;
 }
 
 const COLLISION_MSG: &str =
@@ -979,7 +988,7 @@ pub(crate) fn create_network_with(
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
     // 8. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
-    if let Err(f) = ops.apply_nft(&table, &token) {
+    if let Err(f) = ops.apply_nft(&table, &token, &bridge, &spec.gateway()) {
         let mut report = RollbackReport::default();
         rollback_bridge(ops, &bridge, &token, index, &mut report);
         if !matches!(
@@ -1089,36 +1098,16 @@ impl NetworkOps for LinuxNetworkOps<'_> {
             .map(|_| ())
     }
 
-    fn apply_nft(&self, table: &NftName, token: &str) -> Result<(), NftApplyFailure> {
+    fn apply_nft(
+        &self,
+        table: &NftName,
+        token: &str,
+        bridge: &IfName,
+        gateway: &IpPrefix,
+    ) -> Result<(), NftApplyFailure> {
         self.nft
             .send_batch(self.timeout, |batch| {
-                batch.push_with(|seq| {
-                    TableCreate::new(NftFamily::Ipv4, table.clone())
-                        .exclusive()
-                        .with_userdata(token.as_bytes())?
-                        .build(seq)
-                })?;
-                for (name, hook, priority) in [
-                    ("postrouting", NfInetHook::PostRouting, NF_IP_PRI_NAT_SRC),
-                    ("prerouting", NfInetHook::PreRouting, NF_IP_PRI_NAT_DST),
-                    ("output", NfInetHook::LocalOut, NF_IP_PRI_NAT_DST),
-                ] {
-                    batch.push_with(|seq| {
-                        ChainCreate::base(
-                            NftFamily::Ipv4,
-                            table.clone(),
-                            NftName::new(name)?,
-                            BaseChain {
-                                chain_type: ChainType::Nat,
-                                hook,
-                                priority,
-                            },
-                        )?
-                        .exclusive()
-                        .build(seq)
-                    })?;
-                }
-                Ok(())
+                fill_create_batch(batch, table, token, bridge, gateway)
             })
             .map(|_| ())
             .map_err(|e| NftApplyFailure {
@@ -1126,6 +1115,55 @@ impl NetworkOps for LinuxNetworkOps<'_> {
                 error: e.into(),
             })
     }
+}
+
+/// `create_network` の nft バッチ（テーブル・NAT base chain 3 本・`postrouting` の masquerade）を積む。
+///
+/// 全部を 1 バッチに入れるのは all-or-nothing にするため。カーネルがルールを拒否すればテーブルごと
+/// 何も残らず、テーブルがあればルールも必ずある。削除はテーブル単位なのでルールのハンドルは取らない
+/// （echo なし）。OS 非依存にして 3 OS の単体試験でバッチの中身を照合する（NET-1・NET-11・#3073）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn fill_create_batch(
+    batch: &mut NftBatch,
+    table: &NftName,
+    token: &str,
+    bridge: &IfName,
+    gateway: &IpPrefix,
+) -> Result<(), NetError> {
+    batch.push_with(|seq| {
+        TableCreate::new(NftFamily::Ipv4, table.clone())
+            .exclusive()
+            .with_userdata(token.as_bytes())?
+            .build(seq)
+    })?;
+    for (name, hook, priority) in [
+        ("postrouting", NfInetHook::PostRouting, NF_IP_PRI_NAT_SRC),
+        ("prerouting", NfInetHook::PreRouting, NF_IP_PRI_NAT_DST),
+        ("output", NfInetHook::LocalOut, NF_IP_PRI_NAT_DST),
+    ] {
+        batch.push_with(|seq| {
+            ChainCreate::base(
+                NftFamily::Ipv4,
+                table.clone(),
+                NftName::new(name)?,
+                BaseChain {
+                    chain_type: ChainType::Nat,
+                    hook,
+                    priority,
+                },
+            )?
+            .exclusive()
+            .build(seq)
+        })?;
+    }
+    let rule = RuleCreate::new(
+        NftFamily::Ipv4,
+        table.clone(),
+        NftName::new("postrouting")?,
+        masquerade::masquerade_rule_exprs(gateway, bridge)?,
+    );
+    batch.push_with(|seq| rule.build(seq))?;
+    Ok(())
 }
 
 /// ネットワークを作成する（bridge・gateway・up・専用 nft テーブルと NAT base chain）。
@@ -2329,7 +2367,7 @@ fn publish_failed(
 ///
 /// # 未実装範囲（REPAIR-3）
 /// [`PublishedPort`] のプロセス再起動後の復元は無い（`delete_network` がテーブルごと解放する）。
-/// masquerade と host の `ip_forward` は別途必要。dump から投入までの間に別の状態ルートが割り込む窓は
+/// host の `ip_forward` は別途必要（masquerade は `create_network` が投入済み）。dump から投入までの間に別の状態ルートが割り込む窓は
 /// 残る（共有ロックと事後確認は未実装。`listener_dump` の未実装範囲）。
 #[cfg(target_os = "linux")]
 pub fn publish_container_ports<N>(
@@ -2612,8 +2650,8 @@ fn send_dnat_batch(
 /// `timeout` は各カーネル要求と netns 作成スレッドの待ちの期限（REPAIR-5）。
 ///
 /// # 未実装範囲（REPAIR-3）
-/// masquerade・コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
-/// ホストの外へ届けるには masquerade と host の `ip_forward` が別途必要。IPAM 状態の永続化は呼び出し側・
+/// コンテナ単位のポート公開解除は含まない（モジュール doc「未実装範囲」）。
+/// ホストの外へ届けるには host の `ip_forward` が別途必要（masquerade は `create_network` が投入済み）。IPAM 状態の永続化は呼び出し側・
 /// 後続 Issue の責務。ネットワーク・コンテナ側資源の削除は `delete_network`（TASK-139.4・#317）、コンテナ 1 件だけの切り離しは `detach_container`（#3062）。
 #[cfg(target_os = "linux")]
 pub fn attach_container(
@@ -2955,6 +2993,8 @@ mod tests {
         fail_addr: bool,
         fail_up: bool,
         fail_nft: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// apply_nft が受け取った (bridge 名, gateway)。
+        nft_args: RefCell<Vec<(String, IpPrefix)>>,
         fail_delete: bool,
         delete_code: Option<NetErrorCode>,
         /// 指定回数の verify_owned 成功後に FailedPrecondition を返す（差し替えの注入）。
@@ -3090,8 +3130,17 @@ mod tests {
             }
             Ok(())
         }
-        fn apply_nft(&self, _: &NftName, _: &str) -> Result<(), NftApplyFailure> {
+        fn apply_nft(
+            &self,
+            _: &NftName,
+            _: &str,
+            bridge: &IfName,
+            gateway: &IpPrefix,
+        ) -> Result<(), NftApplyFailure> {
             self.rec("apply_nft");
+            self.nft_args
+                .borrow_mut()
+                .push((bridge.as_str().to_owned(), *gateway));
             match self.fail_nft {
                 Some((c, o)) => Err(NftApplyFailure {
                     error: err(c),
@@ -3120,6 +3169,54 @@ mod tests {
         assert_eq!(s.name_resolution(), NameResolution::StaticHosts);
         let c = create_network_with(&Fake::default(), &s).unwrap();
         assert_eq!(c.name_resolution, NameResolution::StaticHosts);
+    }
+
+    /// NET-1・NET-11・#3073: apply_nft へ bridge と gateway が渡る。
+    #[test]
+    fn net1_create_passes_bridge_and_gateway_to_nft() {
+        let f = Fake::default();
+        let c = create_network_with(&f, &spec("web")).unwrap();
+        assert_eq!(
+            *f.nft_args.borrow(),
+            [(bridge_of("web").as_str().to_owned(), c.gateway)]
+        );
+    }
+
+    /// NET-1・NET-11・#3073: nft バッチはテーブル 1・チェイン 3・masquerade ルール 1 の順で、
+    /// ルールは postrouting に入り echo なし。
+    #[test]
+    fn net1_create_batch_ends_with_masquerade_rule() {
+        use crate::netlink::NlMsgIter;
+        use crate::nftables_batch::{NFNL_SUBSYS_NFTABLES, nfnl_msg_type};
+        use crate::nftables_rules::{DumpedRule, NFT_MSG_NEWRULE};
+
+        let table = NftName::new("fandhe_net_web").unwrap();
+        let bridge = bridge_of("web");
+        let gateway = gw([10, 88, 0, 1], 24);
+        let mut batch = NftBatch::new(1).unwrap();
+        fill_create_batch(&mut batch, &table, "tok", &bridge, &gateway).unwrap();
+        let sealed = batch.finish().unwrap();
+        assert_eq!(sealed.body_seqs().len(), 5);
+        assert!((0..5).all(|i| !sealed.body_echo(i)));
+        let newrule = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        let nft_types: Vec<u16> = NlMsgIter::new(sealed.bytes())
+            .map(|m| m.unwrap())
+            .filter(|m| m.header().msg_type() >> 8 == NFNL_SUBSYS_NFTABLES.into())
+            .map(|m| m.header().msg_type())
+            .collect();
+        assert_eq!(nft_types.len(), 5);
+        assert_eq!(nft_types.iter().filter(|t| **t == newrule).count(), 1);
+        assert_eq!(nft_types.last(), Some(&newrule));
+        let msg = NlMsgIter::new(sealed.bytes())
+            .map(|m| m.unwrap())
+            .find(|m| m.header().msg_type() == newrule)
+            .unwrap();
+        let rule = DumpedRule::decode(msg.payload(), NftFamily::Ipv4, &table).unwrap();
+        assert_eq!(rule.chain().as_str(), "postrouting");
+        assert_eq!(
+            rule.exprs(),
+            &masquerade::masquerade_rule_exprs(&gateway, &bridge).unwrap()
+        );
     }
 
     /// NET-1・TASK-139.1: 全手順成功。
@@ -3902,8 +3999,14 @@ mod tests {
         fn delete_bridge(&self, i: IfIndex) -> Result<(), NetError> {
             self.inner.delete_bridge(i)
         }
-        fn apply_nft(&self, t: &NftName, k: &str) -> Result<(), NftApplyFailure> {
-            self.inner.apply_nft(t, k)
+        fn apply_nft(
+            &self,
+            t: &NftName,
+            k: &str,
+            b: &IfName,
+            g: &IpPrefix,
+        ) -> Result<(), NftApplyFailure> {
+            self.inner.apply_nft(t, k, b, g)
         }
     }
 }

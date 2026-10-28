@@ -316,7 +316,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | DNS の参照カウントと切り離し | `crates/net/src/dns_helper/refcount.rs`・`dns_helper.rs` | #349 条件 2 | #3070 |
 | 名前の登録経路 | `crates/net/src/dns_helper.rs` | #349 条件 2 | #3071 |
 | `--dns` の上流転送（製品の経路） | `crates/net/src/dns_helper/upstream.rs` | #349 条件 2 | #3072 |
-| masquerade 本体 | `crates/net/src/network.rs`・`nftables_rules` | なし（NET-1 の期待の一部。#349 の上流 DNS はヘルパーが host の netns から送るため不要。#319 の 3 経路の (c) も DNAT のみ） | #3060・#3073 |
+| masquerade 本体 | `crates/net/src/network.rs`・`nftables_rules` | なし（NET-1 の期待の一部。#349 の上流 DNS はヘルパーが host の netns から送るため不要。#319 の 3 経路の (c) も DNAT のみ） | #3060・#3073（実装済み。postrouting の masquerade を `create_network` のバッチへ投入。外向きの実トラフィックは未検証） |
 | `eth0` へのリネーム | `netlink_route/link.rs` | なし | #3061 |
 | コンテナ単体の detach | `crates/net/src/network/delete.rs` | #319 条件 4（削除）・CLI の stop | #3062 |
 | 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/listener_dump.rs`・`publish.rs` | なし | #3063（公開前の DNAT の dump と照合は実装済み。共有ロックと投入後の事後確認は未実装で、#3191 で追跡する） |
@@ -359,7 +359,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 未実装 |
 | #3072 | net: `--dns` の上流転送を製品のヘルパーで有効化（D11） | net-builder | #3071 | 未実装 |
 | #3060 | net: nftables の `bitwise`・`meta` expr（D11） | net-builder | なし | 実装済み（PR #3189） |
-| #3073 | net: postrouting の masquerade（D11） | net-builder | #3060 | 未実装 |
+| #3073 | net: postrouting の masquerade（D11） | net-builder | #3060 | 実装済み |
 | #3061 | net: attach で peer を `eth0` へリネーム（D11） | net-builder | なし | 実装済み（PR #3190） |
 | #3062 | net: attach 済みコンテナ単体の切り離し（D11） | net-builder | なし | 実装済み（PR #3192） |
 | #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし | 実装済み（PR #3193。共有ロックと投入後の事後確認は #3191） |

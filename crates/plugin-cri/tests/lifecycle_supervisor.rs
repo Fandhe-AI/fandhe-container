@@ -139,6 +139,10 @@ struct Sim {
     delete_delay_ms: std::sync::atomic::AtomicU64,
     /// true なら `delete` の後も `get` が記録を返し続ける（同じ ID が再作成済みの場面の再現。guard が偽になる。#3027）。
     recreate_after_delete: AtomicBool,
+    /// 状態ストアの `get` が呼ばれた回数（`StateStore` の呼び出し回数の数え方の照合。#3143）。
+    gets: AtomicU32,
+    /// 状態ストアの `get` に入れる遅延（ミリ秒。状態ロックの待ちが予算を食う場面の再現。#3143）。
+    get_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Sim {
@@ -155,6 +159,8 @@ impl Sim {
             deleted: AtomicBool::new(false),
             delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
             recreate_after_delete: AtomicBool::new(false),
+            gets: AtomicU32::new(0),
+            get_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -172,6 +178,8 @@ impl Sim {
             deleted: AtomicBool::new(false),
             delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
             recreate_after_delete: AtomicBool::new(false),
+            gets: AtomicU32::new(0),
+            get_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -188,6 +196,8 @@ impl Sim {
             deleted: AtomicBool::new(false),
             delete_delay_ms: std::sync::atomic::AtomicU64::new(0),
             recreate_after_delete: AtomicBool::new(false),
+            gets: AtomicU32::new(0),
+            get_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -212,6 +222,11 @@ impl StateStore for SimStore {
         Err(unused())
     }
     fn get(&self, _r: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        self.0.gets.fetch_add(1, Ordering::SeqCst);
+        let delay = self.0.get_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         if self.0.deleted.load(Ordering::SeqCst) {
             return Err(TraitError::new(ErrorCode::NotFound, "deleted"));
         }
@@ -674,6 +689,26 @@ fn sup9_stop_race_exit_before_delivery_is_ok() {
     assert_eq!(h.sim.state(), ContainerState::Stopped);
 }
 
+/// REPAIR-5・CRI-2・#3143: 送信が終了との競合（FAILED_PRECONDITION / UNAVAILABLE）で失敗し、読み直しで Stopped を観測済みなら、
+/// 予算つきの stop は追加の状態読み取りをせずに成功する（読み取りは入口・core の kill・読み直しの 3 回だけ）。
+#[test]
+fn repair5_3143_stop_within_observed_stopped_skips_extra_read() {
+    for code in [ErrorCode::FailedPrecondition, ErrorCode::Unavailable] {
+        let sim = running("c1", 4242);
+        *sim.race.lock().expect("lock") = Some(code);
+        let lifecycle =
+            SupervisedLifecycle::new(starter(LONG), Arc::new(SimSignalers(Arc::clone(&sim))));
+        let store = SimStore(Arc::clone(&sim));
+        let rec = OpRecorder::new();
+        let stop = StopRequest::new(cid("c1"), Duration::ZERO).expect("stop");
+        let status = lifecycle
+            .stop_within(&store, &rec, &stop, Some(Duration::from_secs(22)))
+            .expect("stop");
+        assert_eq!(status.state(), ContainerState::Stopped);
+        assert_eq!(sim.gets.load(Ordering::SeqCst), 3, "{code:?}");
+    }
+}
+
 /// 制御チャネルが消えた（signaler が UNAVAILABLE を返し、記録は Stopped）場合も成功として扱う（CRI-2）。
 #[test]
 fn cri2_stop_race_channel_gone_unavailable_is_ok() {
@@ -988,20 +1023,46 @@ fn repair5_2964_force_delete_shares_wait_between_both_logs() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// REPAIR-5・#2634・#2760・#3027: 後始末（ログ 2 件〔待ちは共有〕+ 起動オプション文書の掃除）の最悪は 30 秒で、
-/// stop の 17 秒と足すと `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）にちょうど一致する。
+/// REPAIR-5・#2634・#2760・#3027・#3143: 後始末（ログ 2 件〔待ちは共有〕+ 起動オプション文書の掃除）の最悪は 30 秒で、
+/// force delete の stop の予算（22 秒）と、前置きの読み取り 5 秒・core の delete 20 秒を足すと
+/// `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）にちょうど一致する。
+///
+/// 17 秒は signaler の期限だけを数えた名目で、状態ロックの待ちを含めた stop の厳密な最悪は 42 秒である。
+/// 厳密な値のまま前置きと core の delete を足すと 67 秒になり `PLUGIN_RUNTIME_TIMEOUT` を超える（予算を持たせる理由の証跡）。
 #[test]
 fn repair5_force_delete_worst_case_fits_runtime_timeout() {
-    use fandhe_container_core::oci_runtime::KillTimeout;
+    use fandhe_container_core::cgroups::EXEC_SWEEP_DELETE_TIMEOUT;
+    use fandhe_container_core::oci_runtime::{KillTimeout, LAUNCHER_REPLY_GRACE};
+    use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
     use fandhe_container_plugin_cri::adapter::PLUGIN_FORCE_DELETE_DEADLINE;
-    use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
+    use fandhe_container_plugin_cri::supervised::{FORCE_DELETE_STOP_BUDGET, STOP_KILL_WAIT};
     use fandhe_container_supervisor::container_options::store::OPTIONS_REMOVE_TIMEOUT;
     use fandhe_container_supervisor::logs::{
         CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT,
     };
     use fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT;
-    let stop = (KillTimeout::DEFAULT + Duration::from_secs(1)) * 2 + STOP_KILL_WAIT;
-    assert_eq!(stop, Duration::from_secs(17));
+    // 名目: signaler の期限だけを数えた stop。
+    let nominal = (KillTimeout::DEFAULT + LAUNCHER_REPLY_GRACE) * 2 + STOP_KILL_WAIT;
+    assert_eq!(nominal, Duration::from_secs(17));
+    // 厳密: 入口の読み取り 5 + 送信 11 + 読み取り 5 + 送信 11 + 期限つきの待ち 10。
+    let send = STATE_LOCK_TIMEOUT + KillTimeout::DEFAULT + LAUNCHER_REPLY_GRACE;
+    assert_eq!(send, Duration::from_secs(11));
+    let strict = STATE_LOCK_TIMEOUT
+        + send
+        + STATE_LOCK_TIMEOUT
+        + send
+        + (STOP_KILL_WAIT + STATE_LOCK_TIMEOUT);
+    assert_eq!(strict, Duration::from_secs(42));
+    let core = STATE_LOCK_TIMEOUT * 3 + EXEC_SWEEP_DELETE_TIMEOUT;
+    assert_eq!(core, Duration::from_secs(20));
+    assert_eq!(strict + STATE_LOCK_TIMEOUT + core, Duration::from_secs(67));
+    assert!(strict + STATE_LOCK_TIMEOUT + core > PLUGIN_RUNTIME_TIMEOUT);
+    // 予算: 47 - 前置き 5 - core 20 = 22 秒。
+    assert_eq!(
+        PLUGIN_FORCE_DELETE_DEADLINE - STATE_LOCK_TIMEOUT - core,
+        FORCE_DELETE_STOP_BUDGET
+    );
+    assert_eq!(FORCE_DELETE_STOP_BUDGET, Duration::from_secs(22));
     // ログ 2 件は待ち（CONTAINER_LOG_LOCK_WAIT）を共有する: 共有の待ち + 各ログの最後の試行（#2964）。
     assert_eq!(CONTAINER_LOG_LOCK_WAIT, Duration::from_secs(10));
     let logs =
@@ -1010,42 +1071,118 @@ fn repair5_force_delete_worst_case_fits_runtime_timeout() {
     assert_eq!(OPTIONS_REMOVE_TIMEOUT, Duration::from_secs(10));
     let cleanup = logs + OPTIONS_REMOVE_TIMEOUT;
     assert_eq!(cleanup, Duration::from_secs(30));
-    assert_eq!(stop + cleanup, PLUGIN_FORCE_DELETE_DEADLINE);
+    assert_eq!(
+        FORCE_DELETE_STOP_BUDGET + STATE_LOCK_TIMEOUT + core,
+        PLUGIN_FORCE_DELETE_DEADLINE
+    );
     assert_eq!(PLUGIN_FORCE_DELETE_DEADLINE, Duration::from_secs(47));
     assert!(PLUGIN_FORCE_DELETE_DEADLINE < PLUGIN_RUNTIME_TIMEOUT);
 }
 
-/// REPAIR-5・CRI-2・#3027: `RemoveContainer`（running への force delete）の最悪を、core の delete を含めて数える。
-/// 数え方の規則は「`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT` を 1 回」。後始末の前の合計（42 秒）は
-/// 打ち切れないが、全体の期限（47 秒）より先に終わり、全体の最悪は期限で決まる。期限を共有しない場合の合計（72 秒）は
-/// `PLUGIN_RUNTIME_TIMEOUT` を超える（採らない形が崩れることの証跡）。
+/// REPAIR-5・CRI-2・#3027・#3143: `RemoveContainer`（running への force delete）の最悪を、core の delete を含めて数える。
+/// 数え方の規則は「`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT` を 1 回」。後始末の前の合計は
+/// 前置きの読み取り 5 + stop の予算 22 + core の delete 20 = 47 秒で、全体の期限（47 秒）に一致し、全体の最悪は期限で決まる。
+/// 期限を共有しない場合の合計（77 秒）は `PLUGIN_RUNTIME_TIMEOUT` を超える（採らない形が崩れることの証跡）。
 #[test]
 fn repair5_cri2_3027_remove_container_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::cgroups::EXEC_SWEEP_DELETE_TIMEOUT;
-    use fandhe_container_core::oci_runtime::KillTimeout;
     use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
     use fandhe_container_plugin_cri::adapter::PLUGIN_FORCE_DELETE_DEADLINE;
-    use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
-    let stop = (KillTimeout::DEFAULT + Duration::from_secs(1)) * 2 + STOP_KILL_WAIT;
-    assert_eq!(stop, Duration::from_secs(17));
+    use fandhe_container_plugin_cri::supervised::FORCE_DELETE_STOP_BUDGET;
     // stop_live_before_force_delete の状態の読み取り（1 回）。
     let pre_get = STATE_LOCK_TIMEOUT;
     assert_eq!(pre_get, Duration::from_secs(5));
+    assert_eq!(FORCE_DELETE_STOP_BUDGET, Duration::from_secs(22));
     // core の delete: get 2 回 + StateStore::delete 1 回 + exec 掃除（oci_runtime::delete の module doc「待ちの上限」）。
     assert_eq!(EXEC_SWEEP_DELETE_TIMEOUT, Duration::from_secs(5));
     let core = STATE_LOCK_TIMEOUT * 3 + EXEC_SWEEP_DELETE_TIMEOUT;
     assert_eq!(core, Duration::from_secs(20));
-    let before_cleanup = stop + pre_get + core;
-    assert_eq!(before_cleanup, Duration::from_secs(42));
+    let before_cleanup = pre_get + FORCE_DELETE_STOP_BUDGET + core;
+    assert_eq!(before_cleanup, Duration::from_secs(47));
     assert_eq!(PLUGIN_FORCE_DELETE_DEADLINE, Duration::from_secs(47));
-    // 後始末は期限までの残りで頭打ちなので、全体は max(42, 47) = 47 秒。
+    // 後始末は期限までの残りで頭打ちなので、全体は max(47, 47) = 47 秒。
     let worst = before_cleanup.max(PLUGIN_FORCE_DELETE_DEADLINE);
     assert_eq!(worst, Duration::from_secs(47));
     assert!(worst < PLUGIN_RUNTIME_TIMEOUT);
     // 期限を共有しない場合（後始末 30 秒をそのまま足す）は収まらない。
     let unshared = before_cleanup + Duration::from_secs(30);
-    assert_eq!(unshared, Duration::from_secs(72));
+    assert_eq!(unshared, Duration::from_secs(77));
     assert!(unshared > PLUGIN_RUNTIME_TIMEOUT);
+}
+
+/// REPAIR-5・#3143: `StopContainer`（予算なしの stop）の厳密な最悪は `grace + 42 秒` で、CRI 側の待ち
+/// （`PLUGIN_RUNTIME_TIMEOUT + grace`）に収まる。
+#[test]
+fn repair5_3143_stop_strict_count_fits_stop_container_timeout() {
+    use fandhe_container_core::oci_runtime::{KillTimeout, LAUNCHER_REPLY_GRACE};
+    use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
+    use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
+    let send = STATE_LOCK_TIMEOUT + KillTimeout::DEFAULT + LAUNCHER_REPLY_GRACE;
+    let strict = STATE_LOCK_TIMEOUT
+        + send
+        + STATE_LOCK_TIMEOUT
+        + send
+        + (STOP_KILL_WAIT + STATE_LOCK_TIMEOUT);
+    assert_eq!(strict, Duration::from_secs(42));
+    for (grace, expect) in [(0u64, 42u64), (30, 72)] {
+        let grace = Duration::from_secs(grace);
+        assert_eq!(strict + grace, Duration::from_secs(expect));
+        assert!(strict + grace < PLUGIN_RUNTIME_TIMEOUT + grace);
+    }
+}
+
+/// REPAIR-5・#3143: 最悪の分岐（SIGTERM で止まらず SIGKILL で止まる）の stop が `StateStore::get` を 5 回だけ呼ぶ
+/// （入口・SIGTERM の core kill・猶予 0 の確認・SIGKILL の core kill・SIGKILL 後の確認）。数え方の規則の照合。
+#[test]
+fn repair5_3143_force_delete_stop_store_calls_are_bounded() {
+    let sim = running("c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGKILL);
+    let lifecycle =
+        SupervisedLifecycle::new(starter(LONG), Arc::new(SimSignalers(Arc::clone(&sim))));
+    let store = SimStore(Arc::clone(&sim));
+    let rec = OpRecorder::new();
+    let stop = StopRequest::new(cid("c1"), Duration::ZERO).expect("stop");
+    let status = lifecycle
+        .stop_within(&store, &rec, &stop, Some(Duration::from_secs(22)))
+        .expect("stop");
+    assert_eq!(status.state(), ContainerState::Stopped);
+    assert_eq!(sim.gets.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        sim.calls(),
+        [
+            (Kind::Stop, Signal::SIGTERM),
+            (Kind::Plain, Signal::SIGKILL)
+        ]
+    );
+}
+
+/// REPAIR-5・#3143: 予算の残りがその段の最悪の所要（送信 11 秒）に満たなければ、その段を始めずに固定文言の `Timeout` で止める。
+/// 状態の読み取りに 200ms かかる世界で予算 11.3 秒 → 入口の読み取りと SIGTERM は始められ、SIGKILL は始められない。
+#[test]
+fn repair5_3143_force_delete_refuses_stop_stage_when_budget_short() {
+    let sim = running("c1", 4242);
+    sim.get_delay_ms.store(200, Ordering::SeqCst);
+    let lifecycle =
+        SupervisedLifecycle::new(starter(LONG), Arc::new(SimSignalers(Arc::clone(&sim))));
+    let store = SimStore(Arc::clone(&sim));
+    let rec = OpRecorder::new();
+    let stop = StopRequest::new(cid("c1"), Duration::ZERO).expect("stop");
+    let started = Instant::now();
+    let err = lifecycle
+        .stop_within(&store, &rec, &stop, Some(Duration::from_millis(11_300)))
+        .expect_err("budget short");
+    assert_eq!(err.code(), ErrorCode::Timeout);
+    assert_eq!(
+        err.message(),
+        "container stop did not fit in the delete budget"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(sim.calls(), [(Kind::Stop, Signal::SIGTERM)]);
+    assert_eq!(sim.state(), ContainerState::Running);
 }
 
 /// REPAIR-5・CRI-2・SUP-7・#3027: core の delete が長引いて全体の期限までの残りが少ないとき、後始末の各段は残りで
@@ -1126,11 +1263,21 @@ fn repair5_cri2_3027_force_delete_skips_cleanup_when_deadline_exhausted() {
             "{lines:?}"
         );
     }
+    // 試さなかった起動オプション文書の段は、存在を確かめていないことを `existence` で示す（#3143）。
+    let options: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("\"target\":\"container_options\""))
+        .collect();
+    assert_eq!(options.len(), 1, "{lines:?}");
+    assert!(
+        options[0].contains("\"code\":\"TIMEOUT\",\"existence\":\"unverified\""),
+        "{lines:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// SUP-7・CRI-2・SEC-1・#3027: 同じ ID が再作成済み（guard が偽）のとき、plugin-cri の経路でも supervisor ログを消さない。
-/// 警告行は出さない。なお 0 件で成功した結果は `Removed` と報告される（観測のずれ。設計文書の残余）。
+/// SUP-7・CRI-2・SEC-1・#3027・#3143: 同じ ID が再作成済み（guard が偽）のとき、plugin-cri の経路でも supervisor ログを消さない。
+/// 結果は `Superseded`（`Removed` と報告しない）で、警告行は出さない。
 #[test]
 fn sup7_cri2_3027_force_delete_keeps_supervisor_log_when_id_recreated() {
     let root = temp_root("recreated");
@@ -1148,7 +1295,7 @@ fn sup7_cri2_3027_force_delete_keeps_supervisor_log_when_id_recreated() {
         .expect("force delete");
     assert_eq!(sim.deletes.load(Ordering::SeqCst), 1);
     assert_eq!(supervisor_log_names(&root), ["c1.log"]);
-    assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+    assert_eq!(resp.supervisor_log(), CleanupOutcome::Superseded);
     assert!(warnings.lock().expect("lock").is_empty());
     assert_eq!(op_counts(&rec, "supervisor_log_remove"), Some((1, 0)));
     let _ = std::fs::remove_dir_all(&root);
@@ -1157,6 +1304,11 @@ fn sup7_cri2_3027_force_delete_keeps_supervisor_log_when_id_recreated() {
 /// REPAIR-5・#2760: `create` の最悪所要（ログ回収 + 起動オプション文書の掃除 + 状態ロック + 監査記録 2 回）は
 /// `PLUGIN_RUNTIME_TIMEOUT` に収まる（RPC 側の内訳）。bundle の用意は worker 側の上限
 /// （`repair5_create_worker_residual_is_bounded`）で別に示す。
+///
+/// 状態ロックを 1 回と数えるのは、#3027 の規則（`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT` を 1 回）に照らして
+/// 正しい（#3143）: create の経路は `lock_for_create`（`try_lock` で待たない）、検証、`StateStore::create` の順で、
+/// `StateStore` の呼び出しは 1 回だけ（`tests/adapter.rs` の `repair5_3143_create_calls_state_store_once`）。
+/// 回収の guard の `get` は期限つきの作業スレッド（ログ 5 秒・文書 10 秒）の中で評価され、その期限に含まれる。
 #[test]
 fn repair5_create_worst_case_fits_runtime_timeout() {
     use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;

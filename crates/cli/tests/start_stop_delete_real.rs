@@ -55,6 +55,17 @@
 //! `OPT_ROOT_RO <errno>` として出し、親が `logs` で `stdout OPT_ROOT_RO 30`（`EROFS`。Landlock の `EACCES` = 13 ではなく
 //! mount の RDONLY が効いたことの観測）を完全一致で照合する。あわせて `inspect` の出力に `"rootReadonly":true` が出ることも照合する。
 //!
+//! # `state` と `kill` の照合（#3097・CLI-1・SUP-11・SUP-4）
+//! 1 つ目のコンテナで create 後・start 後・stop 後の `state <id>` を 1 行 JSON の完全一致（キー順込み）で照合する。
+//! status は created / running / stopped で、`pid` は running の間だけ出て `list` の pid と一致する（created・stopped は `pid` キーを出さない）。
+//! 1 つ目のコンテナは起動オプションを持つため、CLI の create が annotations に作成世代
+//! （`io.fandhe.container.options-generation`。`bind_generation`）を足し、`state` の annotations はその 1 件になる。
+//! 世代の値は状態記録から読み、32 桁の小文字 16 進であることと 3 時点で変わらないことも確かめる。
+//! 3 つ目のコンテナ（オプション無し。annotations は `{}`）では、実行中に `kill <id> TERM` を送り、終了を待って `state` が stopped
+//! になることを照合する。`start` は `--restart` を渡さず restart 方針は既定の `no` のため、意図を立てない kill の現状
+//! （#3087 の対象外の残余）に結果が左右されない。記録の `explicit_stop` が `NotRecorded` のままであることを stop との区別に使い、
+//! 終了コードは 43（寿命切れの 8 と区別できる）、停止済みへの 2 回目の kill は `FAILED_PRECONDITION`（終了コード 5）で拒否されることも照合する。
+//!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
 //! 前提欠如（委譲 cgroup・Landlock ABI）は 1 行目が `start_stop_delete_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `start_stop_delete_real: FAILED: ...`（分類元は core の `tests/support/precondition.rs`（cli は薄いアダプタ経由）。#2957・CLI-1・REPAIR-12）。CI は両方を禁止行にする。
 //! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
@@ -141,8 +152,9 @@ mod linux {
     use fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
-        ContainerId, ContainerState, GetStateRequest, StateRecord, StateStore,
+        ContainerId, ContainerState, ExplicitStop, GetStateRequest, StateRecord, StateStore,
     };
+    use fandhe_container_supervisor::container_options::store::GENERATION_ANNOTATION;
 
     /// `start` を待つ上限（CLI 自身の受信期限より長く取る。REPAIR-5）。
     const START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -180,6 +192,10 @@ mod linux {
     const OPT_ROOT_RO_LINE: &str = "stdout OPT_ROOT_RO 30";
     /// `/proc/<pid>/status` の `SigCgt` で SIGTERM（15）に当たるビット（1 << 14）。
     const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
+    /// `state` の `ociVersion` の期待値（リテラル）。supervisor の `OCI_STATE_VERSION` と二重に照合する（#3097）。
+    const OCI_STATE_VERSION_LITERAL: &str = "1.3.0";
+    /// `kill` に渡すシグナル。TERM はプローブのハンドラが終了コード 43 で終わるため、init への到達が終了コードで分かる（#3097）。
+    const KILL_SIGNAL: &str = "TERM";
 
     /// コンテナ内で動くプローブ。SIGTERM のハンドラ（`_exit(43)` のみ）を登録してから `READY_TERM` を出して待つ。
     pub fn probe() -> ! {
@@ -287,6 +303,12 @@ mod linux {
                     "start_stop_delete_real: create --cap-drop ALL observed in the container: CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty; stop recorded Stopped(43); delete left no state dir"
                 );
                 println!(
+                    "start_stop_delete_real: state printed one-line OCI state JSON: created without pid, running with the list pid, stopped without pid after stop"
+                );
+                println!(
+                    "start_stop_delete_real: kill TERM ended the running container under restart policy no: state stopped without pid; recorded Stopped(43) without an explicit stop intent; second kill refused with FAILED_PRECONDITION; delete left no state dir"
+                );
+                println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
                 );
                 println!(
@@ -378,6 +400,109 @@ mod linux {
             out.stdout.contains(want),
             &format!("inspect lacks {want}: {:?}", out.stdout),
         )
+    }
+
+    /// `state` が出すべき 1 行（末尾 LF 込み）を固定のキー順で組み立てる（#3097）。
+    /// `pid` は `Some` のときだけ出す。値のエスケープは行わない（`check_json_plain` で不要な値に限る）。
+    fn oci_state_line(
+        id: &str,
+        status: &str,
+        pid: Option<u32>,
+        bundle: &str,
+        annotations: &[(&str, &str)],
+    ) -> String {
+        let mut s = format!(
+            "{{\"ociVersion\":\"{OCI_STATE_VERSION_LITERAL}\",\"id\":\"{id}\",\"status\":\"{status}\""
+        );
+        if let Some(p) = pid {
+            s.push_str(&format!(",\"pid\":{p}"));
+        }
+        s.push_str(&format!(",\"bundle\":\"{bundle}\",\"annotations\":{{"));
+        for (i, (k, v)) in annotations.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":\"{v}\""));
+        }
+        s.push_str("}}\n");
+        s
+    }
+
+    /// JSON のエスケープが要る文字（`"`・バックスラッシュ・U+0020 未満）を含まないこと。含む値は試験側にエスケープを
+    /// 再実装せず失敗にする（fail-closed）。
+    fn check_json_plain(v: &str, what: &str) -> Result<(), String> {
+        expect(
+            !v.chars()
+                .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20),
+            &format!("{what} needs JSON escaping: {v:?}"),
+        )
+    }
+
+    /// `state <id>` を呼び、終了コード 0・stderr 空・stdout が `want` と完全一致することを照合する（#3097）。
+    fn expect_state(cli: &Path, root_s: &str, id_s: &str, want: &str) -> Result<(), String> {
+        let out = run_cli(cli, &["--root", root_s, "state", id_s], CLI_TIMEOUT)?;
+        if out.code != Some(0) || !out.stderr.is_empty() || out.stdout != want {
+            return Err(format!(
+                "state: want exit 0, empty stderr, stdout {want:?}; got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        Ok(())
+    }
+
+    /// 記録の annotations がちょうど作成世代の 1 件で、値が 32 桁の小文字 16 進であることを確かめて値を返す（#3097）。
+    fn options_generation(rec: &StateRecord) -> Result<String, String> {
+        let ann = rec.annotations();
+        expect(
+            ann.len() == 1,
+            &format!(
+                "annotations must hold only the generation: {} entries",
+                ann.len()
+            ),
+        )?;
+        let generation = ann
+            .get(GENERATION_ANNOTATION)
+            .ok_or("record lacks the options-generation annotation")?
+            .to_string();
+        expect(
+            generation.len() == 32
+                && generation
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            &format!("generation is not 32 lowercase hex digits: {generation:?}"),
+        )?;
+        Ok(generation)
+    }
+
+    /// `/proc/<pid>/status` の `SigCgt` に SIGTERM のビットが立つまで待つ（登録前に TERM を送ると PID 1 では捨てられる）。
+    fn wait_sigterm_handler(pid: u32, what: &str) -> Result<(), String> {
+        wait_until(STATE_TIMEOUT, what, || {
+            fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.strip_prefix("SigCgt:"))
+                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                })
+                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
+        })
+    }
+
+    /// この状態ルートの supervisor が全員終わるまで待つ。delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、
+    /// sink のロックを手放す（プロセス終了）まで待つ。
+    fn wait_supervisor_exit(
+        sup_needle: &[u8],
+        root_needle: &[u8],
+        what: &str,
+    ) -> Result<(), String> {
+        wait_until(REAP_TIMEOUT, what, || {
+            count_processes(|dir| {
+                fs::read(dir.join("cmdline")).is_ok_and(|c| {
+                    c.starts_with(sup_needle)
+                        && c.windows(root_needle.len()).any(|w| w == root_needle)
+                })
+            }) == 0
+        })
     }
 
     /// 子を kill し、`REAP_TIMEOUT` 内に `try_wait` で回収する（無期限の `wait` を避ける。REPAIR-5）。
@@ -500,6 +625,10 @@ mod linux {
     /// 前提の検査を終えた後の本体。ここでの失敗は回帰として扱う。
     fn scenario_body() -> Result<bool, String> {
         check_expected_masks()?;
+        expect(
+            fandhe_container_supervisor::inspect::OCI_STATE_VERSION == OCI_STATE_VERSION_LITERAL,
+            "OCI state version literal differs from the supervisor's OCI_STATE_VERSION",
+        )?;
         let cli_src = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-container"));
         let sup_src = cli_src
             .parent()
@@ -578,6 +707,21 @@ mod linux {
         expect_ok(&out, "create")?;
         cleanup.armed = true;
 
+        // 1b. state（created）。起動オプションを持つため annotations は作成世代の 1 件（#3097・CLI-1・SUP-11）
+        check_json_plain(bundle_s, "bundle path")?;
+        let generation = {
+            let store = open_store(&root)?;
+            options_generation(&get_record(&store, &id)?)?
+        };
+        check_json_plain(&generation, "generation")?;
+        let ann = [(GENERATION_ANNOTATION, generation.as_str())];
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "created", None, bundle_s, &ann),
+        )?;
+
         // 2. start
         let out = run_cli(
             &cli,
@@ -606,6 +750,17 @@ mod linux {
             rec.status().pid().map(|p| p.get()) == Some(pid),
             "state record pid differs from list pid",
         )?;
+        expect(
+            options_generation(&rec)? == generation,
+            "generation changed between create and start",
+        )?;
+        // state（running）: pid は list の pid と一致（#3097）
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "running", Some(pid), bundle_s, &ann),
+        )?;
         let placement = rec.cgroup().ok_or("record has no cgroup placement")?;
         let scope = placement.scope().as_str().to_string();
         let name = CgroupName::for_instance(&id, placement.instance())
@@ -626,16 +781,7 @@ mod linux {
         }
 
         // 4. SIGTERM のハンドラ登録を待つ（登録前に stop すると PID 1 では捨てられる）
-        wait_until(STATE_TIMEOUT, "SIGTERM handler registration", || {
-            fs::read_to_string(format!("/proc/{pid}/status"))
-                .ok()
-                .and_then(|t| {
-                    t.lines()
-                        .find_map(|l| l.strip_prefix("SigCgt:"))
-                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-                })
-                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
-        })?;
+        wait_sigterm_handler(pid, "SIGTERM handler registration")?;
 
         // 5. logs
         // ハンドラ登録後でも supervisor の非同期ログ捕捉・flush は未完のことがあるため、期限内で再取得する（REPAIR-5）。
@@ -715,7 +861,18 @@ mod linux {
                 rec.status().exit_code()
             ));
         }
+        expect(
+            options_generation(&rec)? == generation,
+            "generation changed after stop",
+        )?;
         drop(store);
+        // state（stopped）: pid キーは出ない（#3097）
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "stopped", None, bundle_s, &ann),
+        )?;
 
         // 8. プロセスの消滅とソケット
         wait_until(REAP_TIMEOUT, "the container process to vanish", || {
@@ -733,14 +890,7 @@ mod linux {
         })?;
         let sup_needle = supervisor.to_string_lossy().into_owned().into_bytes();
         let root_needle = root_s.clone().into_bytes();
-        wait_until(REAP_TIMEOUT, "the supervisor to exit", || {
-            count_processes(|dir| {
-                fs::read(dir.join("cmdline")).is_ok_and(|c| {
-                    c.starts_with(&sup_needle)
-                        && c.windows(root_needle.len()).any(|w| w == root_needle)
-                })
-            }) == 0
-        })?;
+        wait_supervisor_exit(&sup_needle, &root_needle, "the supervisor to exit")?;
         expect(
             !control_socket.exists(),
             "supervisor.sock remains after the supervisor exited",
@@ -833,16 +983,7 @@ mod linux {
         expect_ok(&out, "start (cap-drop ALL)")?;
         let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
         let all_pid = parse_running_list(&out, &all_id_s)?;
-        wait_until(STATE_TIMEOUT, "SIGTERM handler registration (ALL)", || {
-            fs::read_to_string(format!("/proc/{all_pid}/status"))
-                .ok()
-                .and_then(|t| {
-                    t.lines()
-                        .find_map(|l| l.strip_prefix("SigCgt:"))
-                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-                })
-                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
-        })?;
+        wait_sigterm_handler(all_pid, "SIGTERM handler registration (ALL)")?;
         let mut last_logs = String::new();
         wait_until(
             STATE_TIMEOUT,
@@ -889,19 +1030,119 @@ mod linux {
         })?;
         // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
         // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
-        wait_until(REAP_TIMEOUT, "the ALL supervisor to exit", || {
-            count_processes(|dir| {
-                fs::read(dir.join("cmdline")).is_ok_and(|c| {
-                    c.starts_with(&sup_needle)
-                        && c.windows(root_needle.len()).any(|w| w == root_needle)
-                })
-            }) == 0
-        })?;
+        wait_supervisor_exit(&sup_needle, &root_needle, "the ALL supervisor to exit")?;
         let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
         expect_ok(&out, "delete (cap-drop ALL)")?;
         expect(
             !root.join(&all_id_s).exists(),
             "state dir remains after delete (ALL)",
+        )?;
+        cleanup.armed = false;
+
+        // 14. kill TERM の一連（#3097・CLI-1・SUP-11・SUP-4）。オプション無しのため annotations は `{}`。
+        // start は `--restart` を渡さず restart 方針は既定の `no`。意図を立てない kill の現状に結果が左右されない。
+        let kill_id_s = format!("ssd{}kill", std::process::id());
+        cleanup.id = kill_id_s.clone();
+        let out = run_cli(
+            &cli,
+            &[
+                "--root", &root_s, "create", "--bundle", bundle_s, &kill_id_s,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create (kill)")?;
+        cleanup.armed = true;
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "created", None, bundle_s, &[]),
+        )?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &kill_id_s],
+            START_TIMEOUT,
+        )?;
+        expect_ok(&out, "start (kill)")?;
+        let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
+        let kill_pid = parse_running_list(&out, &kill_id_s)?;
+        wait_sigterm_handler(kill_pid, "SIGTERM handler registration (kill)")?;
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "running", Some(kill_pid), bundle_s, &[]),
+        )?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "kill", &kill_id_s, KILL_SIGNAL],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "kill")?;
+        let want = format!("ID\tSTATUS\tPID\n{kill_id_s}\tstopped\t-\n");
+        wait_until(STATE_TIMEOUT, "list to report stopped (kill)", || {
+            run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
+                .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
+        })?;
+        let kill_cid =
+            ContainerId::new(kill_id_s.clone()).map_err(|e| format!("id (kill): {e:?}"))?;
+        let store = open_store(&root)?;
+        let rec = get_record(&store, &kill_cid)?;
+        if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
+            return Err(format!(
+                "exit code after kill: want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
+                rec.status().exit_code()
+            ));
+        }
+        expect(
+            rec.explicit_stop() == ExplicitStop::NotRecorded,
+            &format!(
+                "kill must not record an explicit stop, got {:?}",
+                rec.explicit_stop()
+            ),
+        )?;
+        expect(
+            rec.restart_count() == 0,
+            &format!("restart_count after kill: {}", rec.restart_count()),
+        )?;
+        drop(store);
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "stopped", None, bundle_s, &[]),
+        )?;
+        // 停止済みへの kill は core が `FAILED_PRECONDITION` で拒否する（終了コード 5・op は kill）
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "kill", &kill_id_s, KILL_SIGNAL],
+            CLI_TIMEOUT,
+        )?;
+        if out.code != Some(5) || !out.stdout.is_empty() {
+            return Err(format!(
+                "kill after stop: want exit 5, got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        let (op, code) = op_and_code(&out.stderr)?;
+        if op != "kill" || code != "FAILED_PRECONDITION" {
+            return Err(format!(
+                "kill after stop: want op=kill code=FAILED_PRECONDITION, got op={op} code={code}"
+            ));
+        }
+        wait_until(REAP_TIMEOUT, "the kill container process to vanish", || {
+            !Path::new(&format!("/proc/{kill_pid}")).exists()
+        })?;
+        wait_supervisor_exit(&sup_needle, &root_needle, "the kill supervisor to exit")?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "delete", &kill_id_s],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "delete (kill)")?;
+        expect(
+            !root.join(&kill_id_s).exists(),
+            "state dir remains after delete (kill)",
         )?;
         cleanup.armed = false;
         Ok(scope_present)

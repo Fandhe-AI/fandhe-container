@@ -233,11 +233,18 @@ impl CriPluginBackends {
         Ok(backends)
     }
 
+    /// `production()` が取ったインスタンスロック（注入で組んだときは `None`。R8 #2937 の孤児 bundle の回収が使う）。
+    pub(crate) fn instance_lock(&self) -> Option<&crate::instance_lock::InstanceLock> {
+        self._instance_lock.as_deref()
+    }
+
     /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。
     ///
     /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。詳細は `bundle_provider_in`。
     #[cfg(unix)]
-    pub fn production_bundle_provider(&self) -> Result<Arc<dyn BundleProvider>, CriError> {
+    pub fn production_bundle_provider(
+        &self,
+    ) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
         match &self.state_root {
             Some(root) => bundle_provider_with(
                 root,
@@ -1399,7 +1406,7 @@ const IMAGES_DIR: &str = ".cri/images";
 #[cfg(unix)]
 pub fn bundle_provider_in(
     state_root: &std::path::Path,
-) -> Result<Arc<dyn BundleProvider>, CriError> {
+) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
     bundle_provider_with(state_root, None, None)
 }
 
@@ -1413,7 +1420,7 @@ pub fn bundle_provider_with(
     state_root: &std::path::Path,
     store: Option<Arc<dyn ImageStore>>,
     recorder: Option<Arc<dyn OciOpRecorder>>,
-) -> Result<Arc<dyn BundleProvider>, CriError> {
+) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
     use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 

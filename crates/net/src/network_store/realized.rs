@@ -1,0 +1,416 @@
+//! 作成済みネットワークの記録 `realized`（FCREA1）と操作中の意図記録 `realized.intent`（FCRIN1）（NET-1・NET-6・REPAIR-2・#3067）。
+//!
+//! 役割: `network::create_network` が返す `CreatedNetwork`（bridge・ifindex・所有トークン・nft テーブル・gateway）を
+//! プロセスをまたいで引き継ぐための記録。`<name>/realized` はカーネル資源の作成に成功した後に書き、
+//! `<name>/realized.intent` は作成・削除のカーネル操作の前に書いて完了後に消す（D11）。残った `realized.intent` は
+//! 「操作の途中で落ちた」ことを示し、カーネル照合（所有トークンでの昇格または巻き戻し）は後続の担当で、
+//! それまでは `network::recorded` が fail-closed で次の操作を拒否する。OS 非依存でファイルには触れない。
+//!
+//! # 形式
+//! ```text
+//! FCREA1\n                                  FCRIN1\n
+//! name <len>\n<ネットワーク名>\n              op <len>\n<create|delete>\n
+//! bridge <len>\n<bridge 名>\n                name <len>\n<ネットワーク名>\n
+//! ifindex <len>\n<10 進>\n                   bridge <len>\n<bridge 名>\n
+//! token <len>\n<所有トークン>\n               token <len>\n<所有トークン>\n
+//! table <len>\n<nft テーブル名>\n             subnet <len>\n<a.b.c.d/nn>\n
+//! gateway <len>\n<a.b.c.d/nn>\n
+//! subnet <len>\n<a.b.c.d/nn>\n
+//! ```
+//! 復号は `bridge`・`table` がネットワーク名から導出した名前と一致すること、`token` がそのネットワークの発行形式で
+//! あること、`gateway` が `subnet` に属すること（prefix 長一致・network / broadcast でない）を検査する。
+//! `CreatedNetwork::name_resolution` は列挙に無いため記録しない（復元時は呼び出し側が渡す）。nft テーブルの handle と
+//! 公開の記録は #3068。
+
+use super::codec::{
+    bad, finish, format_prefix, open, parse_prefix, push_field, take_field, token_is_sane,
+};
+use crate::error::NetError;
+use crate::etc_hosts::NameResolution;
+use crate::netlink_route::{IfIndex, IfName, IpPrefix};
+use crate::network::{CreatedNetwork, NetworkName, NetworkResourceNames, token_names_network};
+use crate::nftables_batch::NftName;
+
+const REALIZED_MAGIC: &str = "FCREA1\n";
+const INTENT_MAGIC: &str = "FCRIN1\n";
+
+fn derived_names(name: &NetworkName) -> Result<(IfName, NftName), NetError> {
+    let names = NetworkResourceNames::derive(name)
+        .map_err(|_| bad("network record name cannot derive resource names"))?;
+    Ok((names.bridge().clone(), names.table().clone()))
+}
+
+fn check_subnet(subnet: &IpPrefix) -> Result<u32, NetError> {
+    let std::net::IpAddr::V4(a) = subnet.addr() else {
+        return Err(bad("network record subnet must be IPv4"));
+    };
+    if !(1..=30).contains(&subnet.prefix_len()) || !subnet.is_network() {
+        return Err(bad("network record subnet is not a network address"));
+    }
+    Ok(u32::from(a))
+}
+
+/// gateway が subnet に属し（prefix 長一致・network / broadcast でない）、subnet が妥当かを検査する。
+/// 記録の復号と、`network::recorded` の作成前の検査が共有する。違反は `DataLoss`。
+pub(crate) fn check_gateway(gateway: &IpPrefix, subnet: &IpPrefix) -> Result<(), NetError> {
+    let base = check_subnet(subnet)?;
+    let std::net::IpAddr::V4(g) = gateway.addr() else {
+        return Err(bad("network record gateway must be IPv4"));
+    };
+    let mask = u32::MAX << (32 - u32::from(subnet.prefix_len()));
+    let g = u32::from(g);
+    if gateway.prefix_len() != subnet.prefix_len()
+        || g & mask != base
+        || g == base
+        || g == base | !mask
+    {
+        return Err(bad("network record gateway is outside the subnet"));
+    }
+    Ok(())
+}
+
+/// カーネル資源の作成に成功したネットワークの記録（FCREA1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealizedRecord {
+    name: NetworkName,
+    bridge: IfName,
+    ifindex: IfIndex,
+    token: String,
+    table: NftName,
+    gateway: IpPrefix,
+    subnet: IpPrefix,
+}
+
+impl RealizedRecord {
+    /// 作成結果と定義の subnet から作る。名前の導出・トークン・gateway の所属が食い違えば `DataLoss`。
+    pub fn from_created(created: &CreatedNetwork, subnet: IpPrefix) -> Result<Self, NetError> {
+        let rec = Self {
+            name: created.name.clone(),
+            bridge: created.bridge.clone(),
+            ifindex: created.bridge_index,
+            token: created.bridge_token.clone(),
+            table: created.table.clone(),
+            gateway: created.gateway,
+            subnet,
+        };
+        rec.validate()?;
+        Ok(rec)
+    }
+
+    fn validate(&self) -> Result<(), NetError> {
+        let (bridge, table) = derived_names(&self.name)?;
+        if self.bridge != bridge || self.table != table {
+            return Err(bad(
+                "network record resource names do not match the network",
+            ));
+        }
+        if !token_is_sane(&self.token) || !token_names_network(&self.token, &self.name) {
+            return Err(bad("network record token does not name the network"));
+        }
+        check_gateway(&self.gateway, &self.subnet)
+    }
+
+    /// `CreatedNetwork` へ戻す。`name_resolution` は記録に無いため呼び出し側が渡す。
+    pub fn to_created(&self, name_resolution: NameResolution) -> CreatedNetwork {
+        CreatedNetwork {
+            name: self.name.clone(),
+            bridge: self.bridge.clone(),
+            bridge_index: self.ifindex,
+            bridge_token: self.token.clone(),
+            table: self.table.clone(),
+            gateway: self.gateway,
+            name_resolution,
+        }
+    }
+
+    /// ネットワーク名。
+    pub fn name(&self) -> &NetworkName {
+        &self.name
+    }
+
+    /// bridge の所有トークン。
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// gateway（prefix 長つき）。
+    pub fn gateway(&self) -> IpPrefix {
+        self.gateway
+    }
+
+    /// subnet（ネットワークアドレス）。
+    pub fn subnet(&self) -> IpPrefix {
+        self.subnet
+    }
+
+    /// 正準形の FCREA1 へ符号化する。
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = String::from(REALIZED_MAGIC);
+        push_field(&mut out, "name", self.name.as_str());
+        push_field(&mut out, "bridge", self.bridge.as_str());
+        push_field(&mut out, "ifindex", &self.ifindex.get().to_string());
+        push_field(&mut out, "token", &self.token);
+        push_field(&mut out, "table", self.table.as_str());
+        push_field(&mut out, "gateway", &format_prefix(&self.gateway));
+        push_field(&mut out, "subnet", &format_prefix(&self.subnet));
+        out.into_bytes()
+    }
+
+    /// FCREA1 を復号する。違反はすべて `DataLoss`。
+    pub fn decode(bytes: &[u8]) -> Result<Self, NetError> {
+        let mut rest = open(bytes, REALIZED_MAGIC)?;
+        let invalid_value = |_: NetError| bad("realized record holds an invalid value");
+        let name = NetworkName::new(take_field(&mut rest, "name")?).map_err(invalid_value)?;
+        let bridge = IfName::new(take_field(&mut rest, "bridge")?).map_err(invalid_value)?;
+        let index = take_field(&mut rest, "ifindex")?;
+        let ifindex = index
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.to_string() == index)
+            .and_then(|n| IfIndex::new(n).ok())
+            .ok_or_else(|| bad("realized record ifindex is malformed"))?;
+        let token = take_field(&mut rest, "token")?.to_owned();
+        let table = NftName::new(take_field(&mut rest, "table")?).map_err(invalid_value)?;
+        let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
+        let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
+        finish(rest)?;
+        let rec = Self {
+            name,
+            bridge,
+            ifindex,
+            token,
+            table,
+            gateway,
+            subnet,
+        };
+        rec.validate()?;
+        Ok(rec)
+    }
+}
+
+/// 操作中の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealizedOp {
+    /// 作成中。
+    Create,
+    /// 削除中。
+    Delete,
+}
+
+impl RealizedOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// 作成・削除のカーネル操作の前に書く意図記録（FCRIN1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealizedIntent {
+    op: RealizedOp,
+    name: NetworkName,
+    bridge: IfName,
+    token: String,
+    subnet: IpPrefix,
+}
+
+impl RealizedIntent {
+    /// 検証して作る。bridge は名前から導出した名前に固定し、トークンはそのネットワークの発行形式に限る。
+    pub fn new(
+        op: RealizedOp,
+        name: NetworkName,
+        token: &str,
+        subnet: IpPrefix,
+    ) -> Result<Self, NetError> {
+        let (bridge, _) = derived_names(&name)?;
+        let rec = Self {
+            op,
+            name,
+            bridge,
+            token: token.to_owned(),
+            subnet,
+        };
+        rec.validate()?;
+        Ok(rec)
+    }
+
+    fn validate(&self) -> Result<(), NetError> {
+        let (bridge, _) = derived_names(&self.name)?;
+        if self.bridge != bridge {
+            return Err(bad("realized intent bridge does not match the network"));
+        }
+        if !token_is_sane(&self.token) || !token_names_network(&self.token, &self.name) {
+            return Err(bad("realized intent token does not name the network"));
+        }
+        check_subnet(&self.subnet).map(|_| ())
+    }
+
+    /// 操作の種別。
+    pub fn op(&self) -> RealizedOp {
+        self.op
+    }
+
+    /// ネットワーク名。
+    pub fn name(&self) -> &NetworkName {
+        &self.name
+    }
+
+    /// 刻む（または刻んだ）所有トークン。
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// 正準形の FCRIN1 へ符号化する。
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = String::from(INTENT_MAGIC);
+        push_field(&mut out, "op", self.op.as_str());
+        push_field(&mut out, "name", self.name.as_str());
+        push_field(&mut out, "bridge", self.bridge.as_str());
+        push_field(&mut out, "token", &self.token);
+        push_field(&mut out, "subnet", &format_prefix(&self.subnet));
+        out.into_bytes()
+    }
+
+    /// FCRIN1 を復号する。違反はすべて `DataLoss`。
+    pub fn decode(bytes: &[u8]) -> Result<Self, NetError> {
+        let mut rest = open(bytes, INTENT_MAGIC)?;
+        let invalid_value = |_: NetError| bad("realized intent holds an invalid value");
+        let op = match take_field(&mut rest, "op")? {
+            "create" => RealizedOp::Create,
+            "delete" => RealizedOp::Delete,
+            _ => return Err(bad("realized intent op is unknown")),
+        };
+        let name = NetworkName::new(take_field(&mut rest, "name")?).map_err(invalid_value)?;
+        let bridge = IfName::new(take_field(&mut rest, "bridge")?).map_err(invalid_value)?;
+        let token = take_field(&mut rest, "token")?.to_owned();
+        let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
+        finish(rest)?;
+        let rec = Self {
+            op,
+            name,
+            bridge,
+            token,
+            subnet,
+        };
+        rec.validate()?;
+        Ok(rec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::NetErrorCode;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const TOKEN: &str = "fandhe-net:web:1:0:0";
+
+    fn pfx(a: [u8; 4], len: u8) -> IpPrefix {
+        IpPrefix::new(IpAddr::V4(Ipv4Addr::from(a)), len).unwrap()
+    }
+
+    fn created() -> CreatedNetwork {
+        let name = NetworkName::new("web").unwrap();
+        let names = NetworkResourceNames::derive(&name).unwrap();
+        CreatedNetwork {
+            bridge: names.bridge().clone(),
+            bridge_index: IfIndex::new(7).unwrap(),
+            bridge_token: TOKEN.to_owned(),
+            table: names.table().clone(),
+            gateway: pfx([10, 0, 0, 1], 24),
+            name_resolution: NameResolution::default(),
+            name,
+        }
+    }
+
+    fn code<T: std::fmt::Debug>(r: Result<T, NetError>) -> NetErrorCode {
+        r.unwrap_err().code()
+    }
+
+    /// NET-1・#3067: 具体バイト列・往復・CreatedNetwork への復元。
+    #[test]
+    fn net1_3067_realized_encode_exact_and_roundtrip() {
+        let c = created();
+        let r = RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24)).unwrap();
+        let text = String::from_utf8(r.encode()).unwrap();
+        let expected = format!(
+            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
+            c.bridge.as_str().len(),
+            c.bridge.as_str(),
+            c.table.as_str().len(),
+            c.table.as_str()
+        );
+        assert_eq!(text, expected);
+        let back = RealizedRecord::decode(&r.encode()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.to_created(NameResolution::default()), c);
+        assert_eq!(back.subnet(), pfx([10, 0, 0, 0], 24));
+    }
+
+    #[test]
+    fn net1_3067_realized_decode_rejects_malformed() {
+        let c = created();
+        let good = String::from_utf8(
+            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24))
+                .unwrap()
+                .encode(),
+        )
+        .unwrap();
+        let cases = vec![
+            good.replace("FCREA1", "FCREA2"),
+            good.replace("ifindex 1\n7", "ifindex 1\n0"),
+            good.replace("ifindex 1\n7", "ifindex 2\n07"),
+            good.replace(TOKEN, "fandhe-net:other:1:0:0"),
+            good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.1.1/24"),
+            good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.0.0/24"),
+            good.replace("gateway 11\n10.0.0.1/24", "gateway 13\n10.0.0.255/24"),
+            good.replace("subnet 11\n10.0.0.0/24", "subnet 11\n10.0.0.1/24"),
+            format!("{good}x"),
+        ];
+        for bad_case in &cases {
+            assert_eq!(
+                code(RealizedRecord::decode(bad_case.as_bytes())),
+                NetErrorCode::DataLoss,
+                "{bad_case:?}"
+            );
+        }
+        // bridge 名がネットワーク名の導出と一致しない。
+        let swapped = good.replace(c.bridge.as_str(), "fcbr0000000000");
+        assert_eq!(
+            code(RealizedRecord::decode(swapped.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    #[test]
+    fn net1_3067_realized_intent_exact_and_roundtrip() {
+        let i = RealizedIntent::new(
+            RealizedOp::Create,
+            NetworkName::new("web").unwrap(),
+            TOKEN,
+            pfx([10, 0, 0, 0], 24),
+        )
+        .unwrap();
+        let text = String::from_utf8(i.encode()).unwrap();
+        assert!(text.starts_with("FCRIN1\nop 6\ncreate\nname 3\nweb\nbridge "));
+        assert!(text.ends_with("subnet 11\n10.0.0.0/24\n"));
+        assert_eq!(RealizedIntent::decode(&i.encode()).unwrap(), i);
+        assert_eq!(i.op(), RealizedOp::Create);
+        let bad_op = text.replace("op 6\ncreate", "op 4\nkeep");
+        assert_eq!(
+            code(RealizedIntent::decode(bad_op.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(
+            code(RealizedIntent::new(
+                RealizedOp::Delete,
+                NetworkName::new("web").unwrap(),
+                "fandhe-net:other:1:0:0",
+                pfx([10, 0, 0, 0], 24)
+            )),
+            NetErrorCode::DataLoss
+        );
+    }
+}

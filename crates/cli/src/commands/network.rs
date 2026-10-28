@@ -490,6 +490,8 @@ mod tests {
                 .mode(0o700)
                 .create(&members)
                 .expect("members");
+            // 空の既知ディレクトリは許されるため、中身のある状態にする。
+            std::fs::write(members.join("c1"), b"x").expect("member record");
             let (exit, _) = run(&g, NetworkArgs::Rm("n1".into()));
             assert_eq!(
                 stderr_of(&exit),

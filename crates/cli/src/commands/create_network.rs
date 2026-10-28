@@ -59,8 +59,11 @@ const PUBLISH_UNAVAILABLE_MESSAGE: &str = "port publishing is not supported on t
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublishPrivilege {
     /// rootless のインストール(CLI の隣に特権ランチャーが無い)。
+    // 非 Linux の本番解決は構築しない(Linux の解決と試験が使う)。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Rootless,
     /// rootful のインストール(uid 0、または信頼できるランチャーが隣にある)。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Rootful,
     /// 権限モデルを判定できない環境(network 系の結線が無い OS)。
     // Linux の本番解決は構築しない(非 Linux の解決と試験が使う)。

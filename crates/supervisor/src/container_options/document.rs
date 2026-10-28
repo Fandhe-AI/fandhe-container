@@ -573,6 +573,9 @@ impl ContainerOptionsDocument {
                 return Err(invalid("too many options records"));
             }
         }
+        // publish の規則(user-defined network が要る等)を `with_network` の Unimplemented より先に適用する
+        // (`NetworkOptions::parse` と CLI 経路と同じ順序。NET-9・#3200)。
+        NetworkOptions::parse(network.as_deref(), &add_hosts, &dns, &publish)?;
         let doc = Self::new(ulimits, env, ipc, shm_size, tmpfs)?
             .with_cap_drop(cap_drop)?
             .with_read_only(read_only)?
@@ -1174,5 +1177,16 @@ tmpfs 14\n/run:rw,noexec\n";
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{specs:?}");
             assert!(!e.message().contains("8080"), "{}", e.message());
         }
+    }
+
+    /// NET-9(#3200): `container:` ネットワークと publish の組は、復号でも publish の規則(InvalidArgument)を先に返す。
+    #[test]
+    fn net9_decode_publish_rule_precedes_container_network() {
+        let e = decode_err(b"FCOPT1\nnetwork 11\ncontainer:x\npublish 7\n8080:80\n");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "publish records require a user-defined network"
+        );
     }
 }

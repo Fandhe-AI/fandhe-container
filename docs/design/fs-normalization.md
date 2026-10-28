@@ -46,7 +46,7 @@ IO-5 と TASK-21 の見出しは spec PR #12（`18386e7`）で改訂済み。詳
 
 ## 実装の詳細（TASK-21.1・PR #1733）
 
-- 実装箇所: `crates/io/src/fs_normalize.rs`（`fold_component`・`CaseCollisionSet`）と `crates/io/src/guest_files.rs`（`GuestFileCreator::create_file`）
+- 実装箇所: `crates/io/src/fs_normalize.rs`（`fold_component`・`CaseCollisionSet`）、`crates/io/src/guest_path.rs`（パスの構文検証 `GuestPath`。#3159）と `crates/io/src/guest_files.rs`（`GuestFileCreator::create_file`）
 - 衝突キー: `fold_component` が `NFD → 大文字小文字の畳み込み（case_fold_chars。lower→upper→lower）→ NFD` の順に適用する。Unicode の canonical caseless matching と同じ形である
   - 末尾の NFD は、Unicode 17.0.0 の全スカラー値で外しても結果が変わらないことを実測で確かめている（`io5_trailing_nfd_difference_is_pinned`）。表の更新に備えた過検出側の安全策として残している
 - 互換分解（NFKC / NFKD）は扱わない。`①` と `1` は衝突しない。ただし、大文字小文字の畳み込みで展開される合字（`ﬁ` → `FI`）は `fi` と衝突する

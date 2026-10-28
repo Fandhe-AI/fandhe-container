@@ -31,24 +31,13 @@ fn temp_name(name: &str) -> String {
 }
 
 impl NetworkLockGuard<'_> {
-    /// 排他ロックでなければ `FailedPrecondition`。副作用（停止・SIGKILL）の前に呼ぶ入口の検査にも使う。
-    pub(crate) fn require_exclusive(&self) -> Result<(), NetError> {
-        if self.shared {
-            return Err(err(
-                NetErrorCode::FailedPrecondition,
-                "network record can be changed only under the exclusive lock",
-            ));
-        }
-        Ok(())
-    }
-
     /// 書き込み途中で起動元が中断されて残った一時ファイルを消す（排他ロックの下だけ。共有では何もしない）。
     ///
     /// 一時名は記録ごとに固定で、排他ロックの下では同時に書く者がいないため、残っていれば必ず中断の残骸。
     /// 最終名へ公開する前に fsync 済みなので、最終名は常に完全な内容で、一時名の側だけを捨てればよい
     /// （公開後・一時名の削除前の中断では最終名の nlink が 2 になるため、ここで 1 に戻す）。
     pub(crate) fn discard_stale_temps(&self) -> Result<(), NetError> {
-        if self.shared {
+        if !self.exclusive {
             return Ok(());
         }
         let mut removed = false;

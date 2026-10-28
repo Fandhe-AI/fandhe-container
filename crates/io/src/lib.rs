@@ -53,10 +53,14 @@
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
-//! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
-//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証関数は
-//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）。NFC / NFD の別表記も、名前は
-//! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
+//! ワイヤー形式は変えないサーバー側 API。ワイヤー上の作成要求は v2 の符号化と復号
+//! [`payload::encode_create`] 等が #3161 で実装済みで、サーバーの処理〔#3163〕と
+//! クライアント API〔#3162〕は未実装〔REPAIR-3〕）
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
+//! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
+//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
+//! （Windows ホストはエラー、その他の OS は警告だけで作成を続ける。警告と拒否理由の観測への配線は
+//! #3163〔REPAIR-3〕）。NFC / NFD の別表記も、名前は書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
 //! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は
@@ -78,7 +82,9 @@ mod display_sanitize;
 pub mod error;
 pub mod fs_normalize;
 pub mod guest_files;
+pub mod guest_path;
 pub mod instrument;
+mod nack_reason;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -114,7 +120,11 @@ pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
     check_case_collisions, check_host_path_length, measure_host_path_length,
 };
-pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
+pub use guest_files::{GuestFileCreator, MAX_TRACKED_GUEST_PATHS};
+pub use guest_path::{
+    GuestPath, GuestPathError, MAX_GUEST_NAME_BYTES, MAX_GUEST_PATH_BYTES,
+    MAX_GUEST_PATH_COMPONENTS,
+};
 pub use instrument::{
     IoOpKind, IoOpOutcome, IoOpRecorder, IoOpSample, IoOpTimer, NoopIoOpRecorder, record_io_op,
 };
@@ -126,8 +136,13 @@ pub use observe::{
     SendObserver, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
-    ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
-    WireRequestId, decode_ack, decode_request, encode_ack, encode_request,
+    ACK_PAYLOAD_LEN, AckEnvelope, CLOSE_PAYLOAD_LEN, CREATE_FIXED_LEN, CloseEnvelope,
+    CreateEnvelope, FILE_HANDLE_WIRE_LEN, MAX_CREATE_PAYLOAD_LEN, MAX_WRITE_BODY_LEN,
+    MAX_WRITE_FILE_BODY_LEN, NACK_PAYLOAD_LEN, NackCode, NackEnvelope, NackReason,
+    REQUEST_ID_WIRE_LEN, RequestEnvelope, UnknownNackReason, WRITE_FILE_FIXED_LEN, WireRequestId,
+    WriteFileEnvelope, decode_ack, decode_close, decode_create, decode_nack, decode_request,
+    decode_write_file, encode_ack, encode_close, encode_create, encode_nack, encode_request,
+    encode_write_file,
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,

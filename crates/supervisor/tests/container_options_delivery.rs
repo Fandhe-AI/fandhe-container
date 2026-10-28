@@ -185,14 +185,20 @@ fn net6_delivery_network_host_and_none_reach_launch_options() {
     assert_eq!(none.network(), LaunchNetworkMode::Loopback);
 }
 
-/// NET-12・REPAIR-3: `--add-host` は反映経路が無いため、配送後の `launch_options` が Unimplemented で拒否する。
+/// NET-12・#1873: `--add-host` / `--dns` は配送後の `launch_options` で hosts / resolv.conf の bind 対象になる。
 #[test]
-fn net12_delivery_add_host_is_rejected_as_unimplemented() {
-    let e = deliver(&net_doc("g1", "host", &["db:10.0.0.5"], &[])).unwrap_err();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+fn net12_delivery_add_host_and_dns_reach_etc_files() {
+    use fandhe_container_core::etc_files::EtcFileKind;
+    let o = deliver(&net_doc("g1", "host", &["db:10.0.0.5"], &[])).unwrap();
+    assert_eq!(o.etc_files().kinds(), vec![EtcFileKind::Hosts]);
+    let o = deliver(&net_doc("g1", "none", &["db:10.0.0.5"], &["127.0.0.1"])).unwrap();
+    assert_eq!(
+        o.etc_files().kinds(),
+        vec![EtcFileKind::Hosts, EtcFileKind::ResolvConf]
+    );
 }
 
-/// NET-12・REPAIR-3: `--dns` も同様に Unimplemented で拒否する。
+/// NET-12・REPAIR-3: ユーザー定義名との組の `--dns` は結線前のため Unimplemented で拒否する。
 #[test]
 fn net12_delivery_dns_is_rejected_as_unimplemented() {
     let e = deliver(&net_doc("g1", "mynet", &[], &["8.8.8.8"])).unwrap_err();

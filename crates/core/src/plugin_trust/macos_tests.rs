@@ -294,8 +294,11 @@ fn plug11_3096_rejects_unreadable_fifo_without_open() {
 #[test]
 fn plug11_3096_rejects_socket_without_open() {
     let tmp = Tmp::new("sock");
+    // macOS の temp_dir は長く sun_path（104 バイト）を超えるため、短い名前で bind してから NAME へ rename する。
+    let short = tmp.0.join("s");
+    let _l = std::os::unix::net::UnixListener::bind(&short).expect("bind");
     let sock = tmp.0.join(NAME);
-    let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    fs::rename(&short, &sock).expect("rename");
     let err = verify_with_deadline(&tmp.0, NAME).expect_err("reject");
     assert_eq!(err.kind(), PluginTrustErrorKind::NotRegularFile);
     assert_eq!(err.path(), sock);

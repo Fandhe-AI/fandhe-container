@@ -35,6 +35,7 @@ const REMOVING_PREFIX: &str = "@removing-";
 /// `@networks` の走査で許す項目数（定義の上限 + 残骸の余裕分）。
 const SCAN_LIMIT: usize = MAX_NETWORKS + 64;
 /// ネットワークのディレクトリの走査で許す項目数（これを超えれば確実に余分な項目がある）。
+/// 正規の項目は definition・@lock・realized・realized.intent・members・members-intent・pending-reclaim の 7 つ。
 const NET_DIR_SCAN_LIMIT: usize = 16;
 /// 期限の上限（`Instant` の加算が溢れないよう丸める）。
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -277,15 +278,23 @@ pub struct GlobalLockGuard<'a> {
 }
 
 /// ネットワークのロックのガード。[`GlobalLockGuard`] を借用してしか作れない（順序「全体 → ネットワーク」の強制）。
-#[derive(Debug)]
 pub struct NetworkLockGuard<'g> {
     _global: PhantomData<&'g ()>,
+    name: NetworkName,
+    /// 排他ロックか。記録の書き込みは排他ロックでだけ許す（#3067）。
+    exclusive: bool,
+    recorder: Arc<dyn NetOpRecorder>,
     dir: Dir,
     file: File,
-    /// 共有ロックか。共有ロックからの記録の書き込み・削除は拒否する（`dns_helper_store`）。
-    shared: bool,
-    /// このロックが指すネットワーク名（意図記録に載せる名前を、呼び出し側の取り違えなく得るため）。
-    name: NetworkName,
+}
+
+impl std::fmt::Debug for NetworkLockGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkLockGuard")
+            .field("name", &self.name)
+            .field("exclusive", &self.exclusive)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for GlobalLockGuard<'_> {
@@ -523,51 +532,59 @@ impl NetworkStore {
 
     fn read_one(&self, name: &str) -> Result<NetworkDefinition, NetError> {
         let sub = self.dir.open_subdir(name)?;
-        // 読み取りでも @lock を検査する（欠落・symlink・権限不正・複数ハードリンクは破損として扱う）。
-        sub.open_regular_ro(LOCK_FILE, u64::MAX).map_err(|e| {
+        read_definition_in(&sub, name)
+    }
+}
+
+/// ネットワークのディレクトリ `sub` から定義を読む（`read_one` と、ロック保持中の再読み込みの共通本体）。
+/// `name` はディレクトリ名で、定義の名前と一致しなければ `DataLoss`。
+fn read_definition_in(sub: &Dir, name: &str) -> Result<NetworkDefinition, NetError> {
+    // 読み取りでも @lock を検査する（欠落・symlink・権限不正・複数ハードリンクは破損として扱う）。
+    sub.open_regular_ro(LOCK_FILE, u64::MAX).map_err(|e| {
+        if e.code() == NetErrorCode::NotFound {
+            err(NetErrorCode::DataLoss, "network lock file is missing")
+        } else {
+            e
+        }
+    })?;
+    let mut f = sub
+        .open_regular_ro(DEFINITION_FILE, DEFINITION_MAX_BYTES as u64)
+        .map_err(|e| {
             if e.code() == NetErrorCode::NotFound {
-                err(NetErrorCode::DataLoss, "network lock file is missing")
+                err(NetErrorCode::DataLoss, "network definition file is missing")
             } else {
                 e
             }
         })?;
-        let mut f = sub
-            .open_regular_ro(DEFINITION_FILE, DEFINITION_MAX_BYTES as u64)
-            .map_err(|e| {
-                if e.code() == NetErrorCode::NotFound {
-                    err(NetErrorCode::DataLoss, "network definition file is missing")
-                } else {
-                    e
-                }
-            })?;
-        let len = usize::try_from(
-            f.metadata()
-                .map_err(|e| map_io(&e, "failed to stat network definition"))?
-                .len(),
-        )
-        .map_err(|_| err(NetErrorCode::DataLoss, "network definition is too large"))?;
-        // metadata は検査時と別の取得で拡張されうるため、確保は固定上限で頭打ちにする。
-        let mut buf = Vec::with_capacity(len.min(DEFINITION_MAX_BYTES));
-        (&mut f)
-            .take(DEFINITION_MAX_BYTES as u64 + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| map_io(&e, "failed to read network definition"))?;
-        if buf.len() != len {
-            return Err(err(
-                NetErrorCode::DataLoss,
-                "network definition changed while reading",
-            ));
-        }
-        let def = NetworkDefinition::decode(&buf)?;
-        if def.name().as_str() != name {
-            return Err(err(
-                NetErrorCode::DataLoss,
-                "network definition name does not match its directory",
-            ));
-        }
-        Ok(def)
+    let len = usize::try_from(
+        f.metadata()
+            .map_err(|e| map_io(&e, "failed to stat network definition"))?
+            .len(),
+    )
+    .map_err(|_| err(NetErrorCode::DataLoss, "network definition is too large"))?;
+    // metadata は検査時と別の取得で拡張されうるため、確保は固定上限で頭打ちにする。
+    let mut buf = Vec::with_capacity(len.min(DEFINITION_MAX_BYTES));
+    (&mut f)
+        .take(DEFINITION_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| map_io(&e, "failed to read network definition"))?;
+    if buf.len() != len {
+        return Err(err(
+            NetErrorCode::DataLoss,
+            "network definition changed while reading",
+        ));
     }
+    let def = NetworkDefinition::decode(&buf)?;
+    if def.name().as_str() != name {
+        return Err(err(
+            NetErrorCode::DataLoss,
+            "network definition name does not match its directory",
+        ));
+    }
+    Ok(def)
+}
 
+impl NetworkStore {
     /// 定義を 1 件読む。無ければ `NotFound`。
     pub fn get(&self, name: &NetworkName) -> Result<NetworkDefinition, NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreGet, || {
@@ -620,6 +637,8 @@ impl NetworkStore {
             let g = self.lock_global_exclusive()?;
             let n = g.lock_network(name)?;
             n.discard_stale_temps()?;
+            // 排他ロックの下で、realized / realized.intent の書き込み残骸（`@tmp-*`）を先に掃除する。
+            n.dir.sweep_tmp();
             let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
                 if e.code() == NetErrorCode::ResourceExhausted {
                     err(
@@ -630,7 +649,12 @@ impl NetworkStore {
                     e
                 }
             })?;
-            if items.iter().any(|i| i != DEFINITION_FILE && i != LOCK_FILE) {
+            // 空の既知ディレクトリ（記録が全部消えた後の残り）は許す。`realized` と中身のあるものは拒否する。
+            if items.iter().any(|i| {
+                i != DEFINITION_FILE
+                    && i != LOCK_FILE
+                    && !matches!(records::is_empty_known_dir(&n.dir, i), Ok(true))
+            }) {
                 return Err(err(
                     NetErrorCode::FailedPrecondition,
                     "network has members or pending records",
@@ -657,6 +681,7 @@ fn remove_tree(parent: &Dir, name: &str) {
     if let Ok(sub) = parent.open_subdir(name) {
         let _ = fs::remove_file(sub.path(DEFINITION_FILE));
         let _ = fs::remove_file(sub.path(LOCK_FILE));
+        records::remove_known_dirs(&sub);
     }
     let _ = fs::remove_dir(parent.path(name));
 }
@@ -687,10 +712,11 @@ impl GlobalLockGuard<'_> {
         }
         Ok(NetworkLockGuard {
             _global: PhantomData,
+            name: name.clone(),
+            exclusive: !shared,
+            recorder: Arc::clone(&self.store.recorder),
             dir,
             file,
-            shared,
-            name: name.clone(),
         })
     }
 
@@ -708,15 +734,12 @@ impl GlobalLockGuard<'_> {
     }
 }
 
+mod records;
+
 impl NetworkLockGuard<'_> {
     /// ロックを保持している fd（保持の証跡。ドロップで解放される）。
     pub fn is_held(&self) -> bool {
         self.file.as_raw_fd() >= 0
-    }
-
-    /// このガードが指すネットワーク名。
-    pub fn network(&self) -> &NetworkName {
-        &self.name
     }
 }
 

@@ -59,6 +59,7 @@ fandhe-container/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
 │   ├── api/                       # 利用者向け API 契約
 │   │   ├── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
+│   │   ├── network.md             # `create` の `--network`（none / host）・`--add-host`・`--dns` の書き方・既定が none であること・host の扱い・未結線の指定（ユーザー定義名・`container:`・`-p`）の `UNIMPLEMENTED`（#1873・NET-6・NET-12・SEC-1・CLI-1）
 │   │   ├── port-publish.md        # `create` の `-p` / `--publish`（rootless の pasta のみ）の書き方・rootful の `PortPublish` との差・現状の `UNIMPLEMENTED`（#3200・NET-9・NET-3・CLI-1）
 │   │   └── bind-mounts.md         # `config.json` の `mounts[]` の bind mount の書き方・受けるオプション・Docker / runc との差（TASK-29 追補・#1915・OCI-4）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標

@@ -316,7 +316,28 @@ pub fn classify_host_netns(thread: NsId, trusted_host: NsId) -> Result<NsId, Net
     }
 }
 
+/// 呼び出しスレッドの netns の識別子を返す（`/proc/thread-self/ns/net` の stat）。
+///
+/// supervisor が start の入口（単一スレッド区間）で自身の netns を信頼済み基準として取り、
+/// 後段の `HostNetns::detect` で手順 3〜7 の作業スレッドが同じ netns にいることを照合するために使う
+/// （#1873・NET-6・docs/design/network-wiring.md D8）。
+pub fn current_thread_netns() -> Result<NsId, NetError> {
+    stat_ns(Path::new("/proc/thread-self/ns/net"))
+}
+
 impl HostNetns {
+    /// 観測した netns の識別子 `observed` がホスト netns と一致するかを返す純粋関数（#1873・NET-6・D8）。
+    ///
+    /// 一致なら `Member`、不一致なら `Other { observed }`。fd 起点の照合など呼び出し側が識別子を
+    /// 取得済みの場合に使い、`/proc` の読み取りは行わない。
+    pub fn verify_ns_identity(&self, observed: NsId) -> HostNetnsMembership {
+        if observed == self.id {
+            HostNetnsMembership::Member
+        } else {
+            HostNetnsMembership::Other { observed }
+        }
+    }
+
     /// 呼び出しスレッドが、runtime の渡した信頼済みホスト netns `trusted_host` にいることを確認する。
     ///
     /// `trusted_host` は runtime がホスト側で取得した識別子で、`/proc/1/ns/net` からは導出しない
@@ -392,6 +413,35 @@ mod tests {
         assert_eq!(e.code().as_str(), "FAILED_PRECONDITION");
         let e = classify_host_netns(NsId::new(5, 100), a).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+    }
+
+    /// NET-6・#1873: 識別子の純粋照合。一致は Member、dev 違い・ino 違いは Other。
+    #[test]
+    fn net6_verify_ns_identity() {
+        let h = HostNetns {
+            id: NsId::new(4, 100),
+        };
+        assert_eq!(
+            h.verify_ns_identity(NsId::new(4, 100)),
+            HostNetnsMembership::Member
+        );
+        let o = NsId::new(4, 101);
+        assert_eq!(
+            h.verify_ns_identity(o),
+            HostNetnsMembership::Other { observed: o }
+        );
+        let o = NsId::new(5, 100);
+        assert_eq!(
+            h.verify_ns_identity(o),
+            HostNetnsMembership::Other { observed: o }
+        );
+    }
+
+    /// NET-6・#1873: 呼び出しスレッドの基準は自分自身の `detect` を通る。
+    #[test]
+    fn net6_current_thread_netns_is_detectable() {
+        let base = current_thread_netns().unwrap();
+        assert_eq!(HostNetns::detect(base).unwrap().id(), base);
     }
 
     /// NET-6: pid 範囲外は INVALID_ARGUMENT。

@@ -15,8 +15,14 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_net::error::NetErrorCode;
-use fandhe_container_net::network::NetworkName;
-use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+use std::net::{IpAddr, Ipv4Addr};
+
+use fandhe_container_net::netlink_route::IpPrefix;
+use fandhe_container_net::network::{EndpointId, NetworkName, NetworkResourceNames};
+use fandhe_container_net::network_store::{
+    MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkStore, RealizedIntent,
+    RealizedOp, RealizedRecord, rebuild_ipam,
+};
 
 const ENV_ROOT: &str = "FC_STORE_HELPER_ROOT";
 const ENV_MODE: &str = "FC_STORE_HELPER_MODE";
@@ -180,4 +186,131 @@ fn net6_definition_visible_across_store_handles() {
     assert_eq!(b.get(&name).unwrap().name().as_str(), "alpha");
     b.remove(&name).unwrap();
     assert_eq!(a.get(&name).unwrap_err().code(), NetErrorCode::NotFound);
+}
+
+// ---- メンバー記録・realized の別プロセス間の永続（NET-1・REPAIR-12・#3067） ----
+
+const ENV_RECORDS_ROOT: &str = "FC_STORE_RECORDS_ROOT";
+const RECORDS_DONE: &str = "FC_STORE_RECORDS_WRITTEN";
+const BRIDGE_TOKEN: &str = "fandhe-net:web:1:0:0";
+
+fn pfx(last: u8, len: u8) -> IpPrefix {
+    IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), len).unwrap()
+}
+
+fn ep_token(ep: &str) -> String {
+    format!("{BRIDGE_TOKEN}/ep/{ep}/g/00000000000000000000000000000001")
+}
+
+/// `realized` を FCREA1 の正準形で組む（`CreatedNetwork` は外から作れないため復号経由）。
+fn realized_record() -> RealizedRecord {
+    let names = NetworkResourceNames::derive(&NetworkName::new("web").unwrap()).unwrap();
+    let mut text = String::from("FCREA1\n");
+    for (k, v) in [
+        ("name", "web".to_owned()),
+        ("bridge", names.bridge().as_str().to_owned()),
+        ("ifindex", "7".to_owned()),
+        ("token", BRIDGE_TOKEN.to_owned()),
+        ("table", names.table().as_str().to_owned()),
+        ("gateway", "10.0.0.1/24".to_owned()),
+        ("subnet", "10.0.0.0/24".to_owned()),
+    ] {
+        text.push_str(&format!("{k} {}\n{v}\n", v.len()));
+    }
+    RealizedRecord::decode(text.as_bytes()).unwrap()
+}
+
+/// 子として動く入口。記録を書いて（意図記録 1 件を取り残して）終了する。
+#[test]
+fn helper_write_records() {
+    let Ok(root) = std::env::var(ENV_RECORDS_ROOT) else {
+        return;
+    };
+    let store = NetworkStore::open(Path::new(&root)).unwrap();
+    let name = NetworkName::new("web").unwrap();
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name).unwrap();
+    n.write_realized_intent(
+        &RealizedIntent::new(RealizedOp::Create, name, BRIDGE_TOKEN, pfx(0, 24)).unwrap(),
+    )
+    .unwrap();
+    n.commit_realized(&realized_record()).unwrap();
+    let member_intent = |id: &str, last: u8| {
+        MemberIntent::new(
+            MemberId::new(id).unwrap(),
+            EndpointId::new(id).unwrap(),
+            pfx(last, 24),
+            &ep_token(id),
+        )
+        .unwrap()
+    };
+    n.write_member_intent(&member_intent("a", 2)).unwrap();
+    let member = MemberRecord::new(
+        MemberId::new("a").unwrap(),
+        EndpointId::new("a").unwrap(),
+        pfx(2, 24),
+        &ep_token("a"),
+        Path::new("/run/ns"),
+        (8, 9),
+        &[],
+    )
+    .unwrap();
+    n.commit_member(&member).unwrap();
+    // 確定しないまま終わる attach（意図記録だけ残る）。
+    n.write_member_intent(&member_intent("b", 3)).unwrap();
+    println!("{RECORDS_DONE}");
+}
+
+/// NET-1・REPAIR-12・#3067: 別プロセスが書いて終了した記録を別の `NetworkStore` が読み直し、確定記録の .2 と
+/// 取り残した意図記録の .3 が予約されたまま、次の払い出しが .4 になる（再払い出しされない）。
+#[test]
+fn net1_3067_records_persist_across_processes_and_reserve_addresses() {
+    let t = Tmp::new("records");
+    let writer = store(&t.0);
+    writer
+        .create(&NetworkDefinition::bridge("web", pfx(0, 24)).unwrap())
+        .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "helper_write_records",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ENV_RECORDS_ROOT, &t.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let wrote = BufReader::new(out)
+            .lines()
+            .map_while(Result::ok)
+            .any(|l| l.contains(RECORDS_DONE));
+        let _ = tx.send(wrote);
+    });
+    let wrote = rx.recv_timeout(Duration::from_secs(30));
+    let reaped = reap_with_deadline(&mut child);
+    assert_eq!(wrote, Ok(true), "writer did not finish (reap: {reaped:?})");
+
+    let reader = store(&t.0);
+    let name = NetworkName::new("web").unwrap();
+    let g = reader.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name).unwrap();
+    let realized = n.realized().unwrap().expect("realized must persist");
+    assert_eq!(realized.gateway(), pfx(1, 24));
+    assert!(n.realized_intent().unwrap().is_none());
+    let members = n.members().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].address(), pfx(2, 24));
+    let intents = n.member_intents().unwrap();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].address(), pfx(3, 24));
+    let mut ipam = rebuild_ipam(&realized, &members, &intents).unwrap();
+    assert_eq!(
+        ipam.allocate(&EndpointId::new("c").unwrap()).unwrap(),
+        pfx(4, 24)
+    );
 }

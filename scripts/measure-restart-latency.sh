@@ -91,14 +91,14 @@
 #   - 証明できない生存 pid（state.json にあるが子孫でも (c)(d) でもない）にはシグナルを送らず、警告を出して
 #     終了コード 4 にする（結果は公開しない）。launcher より前から動いていたプロセスは無関係と確定するので 4 にしない。
 # CLI の stop は後始末に使わない（#2163・SUP-9・CLI-1）: --restart の下では stop による終了が restart の対象になる
-#   （stop の意図の伝達は SUP-9・#2162 待ち）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、stop 経由にしない。
+#   （stop の意図の伝達 SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、stop 経由にしない。
 # 後始末の delete（OCI-6・#2157）: 正常系（--policy on-failure で、最後の試行の再起動で再起動回数を使い切っているため、
 #   最後のコンテナ側プロセスへ SIGKILL を 1 回送って supervisor が RetriesExhausted で Stopped を記録して自分で終わる）は、
 #   計測値を確定した後（計測区間の外）に、プロセスの回収を確認してから CLI の delete を呼んで状態を消す。
 #   呼び出しは本番の start と同じ包み込み（<systemd-run> --user --scope --quiet -p Delegate=yes -- <cli> --root <状態ルート>
 #   delete <id>。配列で直接 exec）で、CLI 自身を委譲スコープの中に入れる。こうすると core の delete は記録済みスコープを
 #   fd 起点で開く経路（remove_recorded。#2096）で試行スコープの外からでも cgroup を消せる。
-#   stopped にならない場合（--policy always は SUP-9〔#2408〕の明示 stop の意図が入るまで自然に止まらず、on-failure でも
+#   stopped にならない場合（--policy always は本スクリプトが stop ではなく SIGKILL で終わらせるため再起動されて自然に止まらず、on-failure でも
 #   期限内に stopped にならなければ）delete は呼ばず（必ず FAILED_PRECONDITION になるため）、従来どおりプロセスを回収して
 #   一時ディレクトリを rm -rf する。結果 JSON の cleanup.delete に ok / skipped（reason: state-not-stopped）を載せて隠さない。
 #   delete の拒否・期限超過は後始末失敗（終了コード 4）にし、状態を残す（結果は公開しない契約のため、拒否は stderr の

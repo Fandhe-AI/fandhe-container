@@ -16,14 +16,14 @@
 //!   (rootless の pasta は #1940、rootful の参加指定は #3069・#3074)。
 //! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持するだけで、pasta への反映(`pasta_args()` の連結)は
 //!   #1940(NET-9・NET-3。#3200 で kind を足した)。
-//! - `add-host`・`dns` は検証済みの型として保持するだけで、hosts / resolv.conf への反映は #1873(D9)。
-//!   反映されるまで `ContainerOptions::launch_options` が拒否する。
-//! - D8 の host netns の照合と `network_mode=host` のログは #1873。CLI が kind を書く処理と既定の `none` も #1873。
+//! - `add-host`・`dns` の hosts / resolv.conf への反映は start の手順 4b(`etc_files`。#1873・D9)。
+//!   `none` / `host` だけが対象で、種別の決定は [`NetworkOptions::etc_file_selection`]。
 //!
 //! OS 非依存で、3 OS でビルド・テストする。エラーは固定の英語文言で、入力値を含めない。
 
 use std::net::IpAddr;
 
+use fandhe_container_core::etc_files::{EtcFileKind, EtcFileSelection};
 use fandhe_container_core::oci_runtime::LaunchNetworkMode;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_net::add_host_dns::resolv_conf::{MAX_DNS_SERVERS, ResolvConfPlan};
@@ -70,6 +70,7 @@ pub fn net_error_to_trait(e: &NetError) -> TraitError {
         NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
         NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
         NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
+        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
         _ => ErrorCode::Internal,
     };
     TraitError::new(code, e.message())
@@ -180,6 +181,27 @@ impl NetworkOptions {
         }
     }
 
+    /// `/etc/hosts`・`/etc/resolv.conf` を生成して載せる種別(#1873・NET-12・D9)。
+    ///
+    /// `none` / `host` で `--add-host` があれば hosts、`--dns` があれば resolv.conf。それ以外(文書なし・
+    /// ユーザー定義名)は空。生成(start の手順 4b)と bind(`LaunchOptions::with_etc_files`)が同じ関数で決まり、食い違わない。
+    pub fn etc_file_selection(&self) -> EtcFileSelection {
+        if !matches!(
+            self.selection,
+            Some(NetworkSelection::None | NetworkSelection::Host)
+        ) {
+            return EtcFileSelection::default();
+        }
+        let mut sel = EtcFileSelection::default();
+        if !self.add_hosts.is_empty() {
+            sel = sel.with(EtcFileKind::Hosts);
+        }
+        if !self.dns.is_empty() {
+            sel = sel.with(EtcFileKind::ResolvConf);
+        }
+        sel
+    }
+
     /// 検証済みの `--network` の選択(文書に無ければ `None`)。
     pub fn selection(&self) -> Option<&NetworkSelection> {
         self.selection.as_ref()
@@ -232,8 +254,40 @@ mod tests {
         r.err().map(|e| e.code())
     }
 
+    /// NET-6・D8: net の `FailedPrecondition`(host netns の不一致等)は `FailedPrecondition` のまま写り、Internal に畳まれない。
+    #[test]
+    fn net6_net_error_to_trait_keeps_failed_precondition() {
+        let e = NetError::new(NetErrorCode::FailedPrecondition, "host netns mismatch");
+        let t = net_error_to_trait(&e);
+        assert_eq!(t.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(t.message(), "host netns mismatch");
+    }
+
     const INV: Option<ErrorCode> = Some(ErrorCode::InvalidArgument);
     const UNI: Option<ErrorCode> = Some(ErrorCode::Unimplemented);
+
+    /// NET-12・#1873: 生成する種別の判定表(none / host のみ。hosts は add-host、resolv.conf は dns)。
+    #[test]
+    fn net12_etc_file_selection_table() {
+        let sel = |n: Option<&str>, h: &[&str], d: &[&str]| {
+            p(n, h, d).expect("parse").etc_file_selection().kinds()
+        };
+        assert_eq!(
+            sel(Some("none"), &["a:192.0.2.1"], &[]),
+            vec![EtcFileKind::Hosts]
+        );
+        assert_eq!(
+            sel(Some("host"), &[], &["192.0.2.53"]),
+            vec![EtcFileKind::ResolvConf]
+        );
+        assert_eq!(
+            sel(Some("none"), &["a:192.0.2.1"], &["127.0.0.1"]),
+            vec![EtcFileKind::Hosts, EtcFileKind::ResolvConf]
+        );
+        assert!(sel(Some("host"), &[], &[]).is_empty());
+        assert!(sel(None, &[], &[]).is_empty());
+        assert!(sel(Some("web"), &[], &[]).is_empty());
+    }
 
     /// NET-6・D1: `--network` の判定表。
     #[test]

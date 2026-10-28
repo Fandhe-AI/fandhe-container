@@ -393,13 +393,13 @@ impl Drop for PullSlot {
 ///
 /// RPC スレッド（tokio）で `Drop` が走るため、atomic の store だけを行い I/O もロックも持たない。
 /// 旗は `ImagePuller::pull_cancellable` が次の確認点で読み、`Timeout` で止まる。
-struct CancelOnDrop {
-    cancel: Arc<AtomicBool>,
-    armed: bool,
+pub(crate) struct CancelOnDrop {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) armed: bool,
 }
 
 impl CancelOnDrop {
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }

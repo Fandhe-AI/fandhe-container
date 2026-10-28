@@ -11,6 +11,7 @@
 //! - `fsync(2)`（ディレクトリ fd への `F_FULLFSYNC` が `EINVAL` / `ENOTSUP` になる場合の代替。`sync_dir` 用）
 //! - 追補（#1864・TASK-122 追補・PLUG-11）: plugin の信頼性検証の macOS 実装（#1865）向けに、
 //!   サブモジュール `plugin_fs`（呼び出し元は `plugin_trust`〔#1865〕）が symlink 非追従の fd 相対 open・fd の実体パス取得・fd の拡張 ACL 検出を提供する
+//! - 追補（#3096・PLUG-11・SEC-1）: `plugin_fs` に `fstatat(2)` の安全なラッパーを足し、open の前に種別を確かめる
 //!
 //! # 契約
 //! - `unsafe fn` は外へ公開しない。すべての `unsafe` に `// SAFETY:` を付ける
@@ -203,8 +204,9 @@ pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
 ///   それを合図に `open_read_nonblock_follow_at`（カーネルが 1 回だけ辿る）へ切り替え、その戻り fd を保持 fd とする
 /// - 所有者・モード・dev/ino・種別は開いた fd への `File::metadata`（std）で取る（unsafe を足さない）
 /// - パス要素は `&CStr`（NUL を含まない）で受ける。単一要素であることの検証は呼び出し側の責務
-/// - 種別のプローブ（`O_PATH` 相当）は無い。FIFO は `O_NONBLOCK`・端末は `O_NOCTTY` で止めないが、
-///   デバイスの open の副作用は避けられないため、検証済みディレクトリの下だけを開く前提で使う
+/// - 種別のプローブは `fstatat(2)`（`lstat_at`・`stat_follow_at`）で open の前に行う（#3096）。呼び出し側は
+///   通常ファイル以外を open せずに拒否し、open 後の fd の種別と dev/ino を probe と照合して差し替えを検出する。
+///   FIFO は `O_NONBLOCK`・端末は `O_NOCTTY` で、差し替えられた場合にも止めない
 pub(crate) mod plugin_fs {
     use super::{EINVAL, SysError, last_errno};
     use std::ffi::{CStr, c_char, c_int, c_void};
@@ -250,8 +252,80 @@ pub(crate) mod plugin_fs {
     /// `ACL_FIRST_ENTRY`（`sys/acl.h`）。
     const ACL_FIRST_ENTRY: c_int = 0;
 
+    /// `AT_SYMLINK_NOFOLLOW`（`sys/fcntl.h`）。
+    const AT_SYMLINK_NOFOLLOW: c_int = 0x0020;
+    /// `S_IFMT`（`sys/stat.h`）。`st_mode` の種別ビットのマスク。
+    const S_IFMT: u16 = 0o170000;
+    /// `S_IFREG`（`sys/stat.h`）。
+    const S_IFREG: u16 = 0o100000;
+    /// `S_IFDIR`（`sys/stat.h`）。
+    const S_IFDIR: u16 = 0o040000;
+    /// `S_IFLNK`（`sys/stat.h`）。
+    const S_IFLNK: u16 = 0o120000;
+
     /// 定数を確認済みのアーキテクチャか。それ以外の関数は `Unsupported` で拒否する。
     const SUPPORTED_ARCH: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+    /// `struct stat`（64 bit inode 版。`sys/stat.h` の `__DARWIN_STRUCT_STAT64`）。aarch64 は `fstatat`、
+    /// x86_64 は `fstatat$INODE64` がこの配置を使う。読まないフィールドも配置のために宣言する
+    /// （サイズ・オフセットは `libc_abi` で `libc::stat` と照合する）。
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Stat {
+        st_dev: i32,
+        st_mode: u16,
+        st_nlink: u16,
+        st_ino: u64,
+        st_uid: u32,
+        st_gid: u32,
+        st_rdev: i32,
+        st_atime: i64,
+        st_atime_nsec: i64,
+        st_mtime: i64,
+        st_mtime_nsec: i64,
+        st_ctime: i64,
+        st_ctime_nsec: i64,
+        st_birthtime: i64,
+        st_birthtime_nsec: i64,
+        st_size: i64,
+        st_blocks: i64,
+        st_blksize: i32,
+        st_flags: u32,
+        st_gen: u32,
+        st_lspare: i32,
+        st_qspare: [i64; 2],
+    }
+
+    /// 開く前に `fstatat` で得た種別。通常ファイル・ディレクトリ・symlink 以外（デバイス・FIFO・ソケット等）は
+    /// `Other` に束ね、呼び出し側は open せずに拒否する（#3096・PLUG-11・SEC-1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum EntryKind {
+        Regular,
+        Directory,
+        Symlink,
+        Other,
+    }
+
+    /// `fstatat` の結果のうち検証に使う部分（種別と、open 後の fd と照合する dev/ino）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct EntryStat {
+        kind: EntryKind,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl EntryStat {
+        pub(crate) fn kind(&self) -> EntryKind {
+            self.kind
+        }
+        /// std の `MetadataExt::dev()` と同じ変換（`st_dev as u64`）。
+        pub(crate) fn dev(&self) -> u64 {
+            self.dev
+        }
+        pub(crate) fn ino(&self) -> u64 {
+            self.ino
+        }
+    }
 
     // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`int openat(int, const char *, int, ...)` と
     // `int fcntl(int, int, ...)` は可変長引数で、Apple arm64 ABI は可変長部をスタックに積むため、
@@ -260,6 +334,11 @@ pub(crate) mod plugin_fs {
     unsafe extern "C" {
         fn openat(dirfd: c_int, path: *const c_char, oflag: c_int, ...) -> c_int;
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        // `int fstatat(int, const char *, struct stat *, int)`。Apple の `sys/stat.h` は `__DARWIN_INODE64(fstatat)`
+        // で宣言し、x86_64 は `fstatat$INODE64`（64 bit inode の `struct stat`）に解決される。aarch64 は接尾辞なし
+        // （64 bit inode のみ）。`libc` も `not(aarch64)` で同じ `link_name` を使う。型照合では検査できない。
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstatat$INODE64")]
+        fn fstatat(dirfd: c_int, path: *const c_char, buf: *mut Stat, flags: c_int) -> c_int;
         fn acl_get_fd_np(fd: c_int, acl_type: u32) -> *mut c_void;
         fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry_p: *mut *mut c_void) -> c_int;
         fn acl_free(obj: *mut c_void) -> c_int;
@@ -278,6 +357,54 @@ pub(crate) mod plugin_fs {
         }
         // SAFETY: `openat` が返した新しい fd で、他に所有者がいない。`OwnedFd` が唯一の所有者になる。
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `fstatat` の薄い包み。成功時のみ `Stat` を初期化済みとして読み、種別へ分類する。
+    pub(super) fn fstatat_raw(
+        dirfd: c_int,
+        name: &CStr,
+        flags: c_int,
+    ) -> Result<EntryStat, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let mut buf = std::mem::MaybeUninit::<Stat>::uninit();
+        // SAFETY: `name` は NUL 終端で呼び出しの間生存する。`buf` は `Stat` 1 個分の有効な書き込み先で、
+        // カーネルは `sizeof(struct stat)` を超えて書かない（`libc_abi` でサイズ・配置を照合）。`dirfd` が
+        // 無効でも `EBADF` が返るだけでメモリ安全性に影響しない。
+        let rc = unsafe { fstatat(dirfd, name.as_ptr(), buf.as_mut_ptr(), flags) };
+        if rc != 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        // SAFETY: `fstatat` が 0 を返した場合に限りカーネルが `buf` 全体を書き込んでいる。
+        let st = unsafe { buf.assume_init() };
+        let kind = match st.st_mode & S_IFMT {
+            S_IFREG => EntryKind::Regular,
+            S_IFDIR => EntryKind::Directory,
+            S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        };
+        Ok(EntryStat {
+            kind,
+            dev: i64::from(st.st_dev) as u64,
+            ino: st.st_ino,
+        })
+    }
+
+    /// `parent` の下の `name` を open せずに種別を得る（`AT_SYMLINK_NOFOLLOW`。最終要素の symlink は辿らず
+    /// `Symlink`）。デバイス・FIFO・ソケットを開く副作用が無い。呼び出し側は probe と open の間の差し替えに
+    /// 備え、open 後の fd の種別と dev/ino を本結果と照合すること（#3096・PLUG-11・SEC-1）。
+    pub(crate) fn lstat_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<EntryStat, SysError> {
+        fstatat_raw(parent.as_raw_fd(), name, AT_SYMLINK_NOFOLLOW)
+    }
+
+    /// `lstat_at` の追従版。最終要素の symlink をカーネルが辿った先の種別を返す（ループ・ホップ超過は
+    /// `Os(ELOOP)`）。open しないため副作用が無い。照合の責務は `lstat_at` と同じ。
+    pub(crate) fn stat_follow_at(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Result<EntryStat, SysError> {
+        fstatat_raw(parent.as_raw_fd(), name, 0)
     }
 
     /// `parent`（`None` なら `AT_FDCWD`）の下の `name` を symlink を辿らずディレクトリとして開く。
@@ -411,6 +538,49 @@ pub(crate) mod plugin_fs {
             libc_const_eq!(AT_FDCWD, c_int, c_int);
             libc_const_eq!(F_GETPATH, c_int, c_int);
             libc_const_eq!(MAXPATHLEN, usize, c_int);
+            libc_const_eq!(AT_SYMLINK_NOFOLLOW, c_int, c_int);
+            libc_const_eq!(S_IFMT, u16, libc::mode_t);
+            libc_const_eq!(S_IFREG, u16, libc::mode_t);
+            libc_const_eq!(S_IFDIR, u16, libc::mode_t);
+            libc_const_eq!(S_IFLNK, u16, libc::mode_t);
+        };
+
+        // `struct stat`（64 bit inode 版）のサイズ・配置を `libc::stat` と照合する（#3096）。
+        const _: () = {
+            use core::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<super::Stat>() == size_of::<libc::stat>());
+            assert!(align_of::<super::Stat>() == align_of::<libc::stat>());
+            assert!(offset_of!(super::Stat, st_dev) == offset_of!(libc::stat, st_dev));
+            assert!(offset_of!(super::Stat, st_mode) == offset_of!(libc::stat, st_mode));
+            assert!(offset_of!(super::Stat, st_nlink) == offset_of!(libc::stat, st_nlink));
+            assert!(offset_of!(super::Stat, st_ino) == offset_of!(libc::stat, st_ino));
+            assert!(offset_of!(super::Stat, st_uid) == offset_of!(libc::stat, st_uid));
+            assert!(offset_of!(super::Stat, st_gid) == offset_of!(libc::stat, st_gid));
+            assert!(offset_of!(super::Stat, st_rdev) == offset_of!(libc::stat, st_rdev));
+            assert!(offset_of!(super::Stat, st_atime) == offset_of!(libc::stat, st_atime));
+            assert!(
+                offset_of!(super::Stat, st_atime_nsec) == offset_of!(libc::stat, st_atime_nsec)
+            );
+            assert!(offset_of!(super::Stat, st_mtime) == offset_of!(libc::stat, st_mtime));
+            assert!(
+                offset_of!(super::Stat, st_mtime_nsec) == offset_of!(libc::stat, st_mtime_nsec)
+            );
+            assert!(offset_of!(super::Stat, st_ctime) == offset_of!(libc::stat, st_ctime));
+            assert!(
+                offset_of!(super::Stat, st_ctime_nsec) == offset_of!(libc::stat, st_ctime_nsec)
+            );
+            assert!(offset_of!(super::Stat, st_birthtime) == offset_of!(libc::stat, st_birthtime));
+            assert!(
+                offset_of!(super::Stat, st_birthtime_nsec)
+                    == offset_of!(libc::stat, st_birthtime_nsec)
+            );
+            assert!(offset_of!(super::Stat, st_size) == offset_of!(libc::stat, st_size));
+            assert!(offset_of!(super::Stat, st_blocks) == offset_of!(libc::stat, st_blocks));
+            assert!(offset_of!(super::Stat, st_blksize) == offset_of!(libc::stat, st_blksize));
+            assert!(offset_of!(super::Stat, st_flags) == offset_of!(libc::stat, st_flags));
+            assert!(offset_of!(super::Stat, st_gen) == offset_of!(libc::stat, st_gen));
+            assert!(offset_of!(super::Stat, st_lspare) == offset_of!(libc::stat, st_lspare));
+            assert!(offset_of!(super::Stat, st_qspare) == offset_of!(libc::stat, st_qspare));
         };
 
         // `extern "C"` 関数の型の照合（#1849・#1837）。`openat`・`fcntl` はどちらも可変長で、`libc` も可変長
@@ -424,6 +594,16 @@ pub(crate) mod plugin_fs {
             libc::openat;
         const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = super::fcntl;
         const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = libc::fcntl;
+        // `fstatat`（#3096）。ポインタ先は別名で、配置は上の `offset_of!` が担う。x86_64 の `fstatat$INODE64` の
+        // `link_name` は型照合で検査できない（`libc` も `not(aarch64)` で同じ名前。本 crate は 2 アーキに限る）。
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const libc::c_char,
+            *mut super::Stat,
+            c_int,
+        ) -> c_int = super::fstatat;
+        const _: unsafe extern "C" fn(c_int, *const libc::c_char, *mut libc::stat, c_int) -> c_int =
+            libc::fstatat;
     }
 
     #[cfg(test)]
@@ -462,6 +642,26 @@ pub(crate) mod plugin_fs {
         }
 
         /// 期限つきで `chmod +a` を実行する（REPAIR-5。超過時は kill して回収し失敗させる）。
+        /// 子プロセスを 10 秒の期限つきで待つ。超過時は kill し、回収も 5 秒で打ち切って panic する（REPAIR-5）。
+        fn wait_child_limited(child: &mut std::process::Child, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(st) = child.try_wait().expect("try_wait") {
+                    assert!(st.success(), "{what} failed: {st}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let reap = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < reap && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    panic!("{what} timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         fn add_acl(path: &Path) {
             let mut child = Command::new("chmod")
                 .arg("+a")
@@ -470,19 +670,7 @@ pub(crate) mod plugin_fs {
                 .stdin(Stdio::null())
                 .spawn()
                 .expect("spawn chmod");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(st) = child.try_wait().expect("try_wait") {
-                    assert!(st.success(), "chmod +a failed: {st}");
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("chmod +a timed out");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            wait_child_limited(&mut child, "chmod +a");
         }
 
         #[test]
@@ -588,9 +776,69 @@ pub(crate) mod plugin_fs {
             assert_eq!(super::super::has_extended_acl(&t.0.join("f")), Ok(true));
         }
 
+        /// 期限つきで `mkfifo` を実行する（REPAIR-5）。
+        fn mkfifo(path: &Path) {
+            let mut child = Command::new("mkfifo")
+                .arg(path)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn mkfifo");
+            wait_child_limited(&mut child, "mkfifo");
+        }
+
+        #[test]
+        fn plug11_3096_lstat_at_classifies_entries() {
+            let t = Tmp::new("lstat");
+            let dir = open_dir(&t.0);
+            std::fs::write(t.0.join("f"), b"x").expect("write");
+            std::fs::create_dir(t.0.join("d")).expect("mkdir");
+            symlink("f", t.0.join("l")).expect("symlink");
+            mkfifo(&t.0.join("p"));
+            let _sock = std::os::unix::net::UnixListener::bind(t.0.join("s")).expect("bind");
+            let kind = |n: &str| lstat_at(dir.as_fd(), &c(n)).expect(n).kind();
+            assert_eq!(kind("f"), EntryKind::Regular);
+            assert_eq!(kind("d"), EntryKind::Directory);
+            assert_eq!(kind("l"), EntryKind::Symlink);
+            assert_eq!(kind("p"), EntryKind::Other);
+            assert_eq!(kind("s"), EntryKind::Other);
+            let devdir = open_dir_nofollow_at(None, &c("/dev")).expect("/dev");
+            assert_eq!(
+                lstat_at(devdir.as_fd(), &c("null")).expect("null").kind(),
+                EntryKind::Other
+            );
+            assert_eq!(
+                lstat_at(dir.as_fd(), &c("nope")).err(),
+                Some(SysError::Os(ENOENT))
+            );
+            let md = std::fs::symlink_metadata(t.0.join("f")).expect("md");
+            let st = lstat_at(dir.as_fd(), &c("f")).expect("f");
+            assert_eq!((st.dev(), st.ino()), (md.dev(), md.ino()));
+        }
+
+        #[test]
+        fn plug11_3096_stat_follow_at_resolves_symlink() {
+            let t = Tmp::new("sfollow");
+            let dir = open_dir(&t.0);
+            std::fs::write(t.0.join("real"), b"x").expect("write");
+            symlink("real", t.0.join("l")).expect("symlink");
+            symlink("a", t.0.join("a")).expect("symlink");
+            let st = stat_follow_at(dir.as_fd(), &c("l")).expect("l");
+            let real = std::fs::metadata(t.0.join("real")).expect("md");
+            assert_eq!(st.kind(), EntryKind::Regular);
+            assert_eq!((st.dev(), st.ino()), (real.dev(), real.ino()));
+            assert_eq!(
+                stat_follow_at(dir.as_fd(), &c("a")).err(),
+                Some(SysError::Os(ELOOP))
+            );
+        }
+
         #[test]
         fn plug11_1864_invalid_fd_is_ebadf() {
             let bad = c_int::MAX;
+            assert_eq!(
+                fstatat_raw(bad, &c("x"), 0).err(),
+                Some(SysError::Os(EBADF))
+            );
             assert_eq!(real_path_of_raw(bad), Err(SysError::Os(EBADF)));
             assert_eq!(extended_acl_of_raw(bad), Err(SysError::Os(EBADF)));
             assert_eq!(

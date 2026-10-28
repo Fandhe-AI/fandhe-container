@@ -1959,7 +1959,7 @@ jobs:
           check --select '^supervisor_bin_real: id mapping verified ' \
             --subst-pos subordinate --subst-pos-re '[1-9][0-9]*' --subst-pos-re '[1-9][0-9]*' --summary
 
-      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・SUP-12・SEC-4・CORE-3・OCI-6・#2596・#2761）: CLI は同じ
+      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・SUP-12・SEC-4・OCI-6・#2596・#2761・#3097）: CLI は
       # ディレクトリの supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
       # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
       # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
@@ -1979,7 +1979,7 @@ jobs:
           fi
           echo "SSD_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・SEC-1・#2596・#2833）
+      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・SEC-1・#2596・#2833・#3097）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
@@ -1987,12 +1987,12 @@ jobs:
           log="${RUNNER_TEMP}/start_stop_delete_real.log"
           USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
-          # create の起動オプション（#2761）・--cap-drop NET_RAW / ALL（#2833）・最終行を、ソースの文字列リテラルから導出して照合する
+          # create の起動オプション・--cap-drop・state の 3 時点と kill TERM（#2761・#2833・#3097）・最終行を、ソースから導出して照合する
           # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_stop_delete_real: FAILED`。両方を禁止（#2957）
           scripts/check-success-lines.sh --name start_stop_delete_real \
             --src crates/cli/tests/start_stop_delete_real.rs \
-            --log "${log}" --select '^start_stop_delete_real: (create |scenario ok |cli start )' \
-            --subst-re scope_present='(true|false)' --min 5 \
+            --log "${log}" --select '^start_stop_delete_real: (create |state |kill |scenario ok |cli start )' \
+            --subst-re scope_present='(true|false)' --min 7 \
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 

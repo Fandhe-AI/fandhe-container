@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|inspect|state|image|system|network|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -335,6 +335,28 @@ fn cli1_stop_delete_usage_errors() {
     ] {
         assert_failure(&run(a), 2, USAGE_JSON);
     }
+}
+
+/// CLI-1・NET-6（#3066）: network は引数の過不足・未知のサブコマンド・未知オプションで使い方エラー（2）。
+/// グローバルの `--pasta-path` は create 以外では使い方エラーのまま。
+#[test]
+fn cli1_net6_network_usage_errors() {
+    for a in [
+        &["network"][..],
+        &["network", "bogus"],
+        &["network", "create"],
+        &["network", "create", "a", "b"],
+        &["network", "create", "--x", "a"],
+        &["network", "rm"],
+        &["network", "ls", "x"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+    // create 以外へのグローバル `--pasta-path` は別の固定文言で使い方エラー（既存の規則）。
+    assert_eq!(
+        run(&["--pasta-path", "/x", "network", "ls"]).status.code(),
+        Some(2)
+    );
 }
 
 /// `parent` 配下に一意名のディレクトリを排他的に作る（既存パスは削除も採用もしない）。
@@ -3538,4 +3560,69 @@ mod pasta_flags {
         ]);
         assert_rejected(&out, "UNIMPLEMENTED", "pasta is only supported on Linux");
     }
+}
+
+/// NET-6・CLI-1・ERR-1（#3066）: 実バイナリで network create → ls → 重複 create → rm → ls を通す。
+/// 権限モデルは CLI の隣に特権ランチャーが無い rootless（uid 0 の実行は rootful 扱いで create が UNIMPLEMENTED）。
+#[cfg(target_os = "linux")]
+#[test]
+fn net6_network_create_ls_rm_flow_on_linux() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TmpDir::new("net6");
+    let dir = isolated_cli_dir("net6");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\tMODE\tSUBNET\n");
+
+    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+    if is_root {
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+
+    for n in ["n2", "n1"] {
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", n]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+    assert_failure(
+        &out,
+        4,
+        "{\"code\":\"ALREADY_EXISTS\",\"message\":\"network already exists\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn1\tpasta\t-\nn2\tpasta\t-\n"
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_failure(
+        &out,
+        3,
+        "{\"code\":\"NOT_FOUND\",\"message\":\"network not found\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn2\tpasta\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

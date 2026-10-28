@@ -277,6 +277,14 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
   - 準備完了は、`pid` が現れ、32 バイト以下の 10 進で spawn した子の PID と一致することで判定し、並行して pidfd で子の生存も見る。期限 `ready_timeout` は既定 5 秒・上限 10 秒で、0 は `InvalidArgument`
   - stop・delete でディレクトリを消し、CLI の delete も残骸を消す（`@container-options` と同じ扱い）
   - 既定の rootless の状態ルートは `/run/user/<uid>/` の下にあり AppArmor が許す。`--root` を許可外（`/tmp`・`$HOME`・`/run/user/<uid>` 以外）に置き、プロファイルが enforce のときは、pasta が書けず準備完了前に終わる（`FailedPrecondition`）。黙って別の場所へ逃がさない（fail-closed）。注意は #1941 の手順と setup の doc に書く
+- **実装（#1938。`crates/net/src/pasta/process.rs`・`run_dir.rs`・`sys/pasta.rs`。承認は未取得の自動運転での判断）**:
+  - 置き場所は `PastaRunDir::prepare(state_root_fd, id)`。パス文字列を受けず、状態ルートの fd から `/proc/thread-self/fd/N` と `openat(O_NOFOLLOW)` で `@pasta`・`<id>` を作って検査する（種別・所有者 euid・`mode & 0o077 == 0`。基準外は直さず `FailedPrecondition`）。既存の `pid` は通常ファイル・所有者 euid・nlink 1 のときだけ消す。CLI の delete は `remove_pasta_run_dir`（記録の pid でのプロセス操作はしない）
+  - 準備完了は `pid` を `O_NOFOLLOW | O_NONBLOCK` で開き、通常ファイル・所有者 euid・nlink 1 を確かめてから 33 バイトまで読み、10 進（末尾の改行 1 個は可）が spawn した子の PID と**完全一致**したときに限る。空・書き込み途中・別の値は「まだ」、10 進以外・32 バイト超は `FailedPrecondition`。並行して `try_wait` で子の生存を見る（pidfd ではなく未回収の `Child`。pid の再利用に影響されない）
+  - argv は `pasta_argv` の固定の並び（`-f --quiet -P <pid> --config-net -4 -I eth0 --map-host-loopback none --map-guest-addr none --dns-forward 169.254.1.1 <#1937 の引数> <対象 PID>`）。`--host-lo-to-ns-lo` は付けない。`PastaTarget` は 0・1・自分自身を拒否する
+  - 起動は env 空・cwd `/`・stdin / stdout null・stderr pipe。pre_exec は `sys::pasta::set_pdeathsig_on_spawn`（`PR_SET_PDEATHSIG=SIGKILL` と `getppid` の照合。不一致は `FailedPrecondition`）
+  - stderr は先頭 4 KiB（エスケープ後）だけ保持し以降は読み捨てる。準備完了の待ちの間と `is_alive` / `stop*` のたびに読めるだけ読む（待たない）。準備完了後の定期呼び出しは #1940 の監視の責務（長時間呼ばれないと 64 KiB の pipe が満ちて pasta の書き込みが止まりうる）
+  - スレッドを作らない（launch の手順 8 が単一スレッドの区間のため。issue の「回収スレッドへ移す」から変更）。期限切れの `stop_checked` は `Timeout` を返して子を手元に残し、`stop` は未回収のハンドルをエラーに入れて返す。`Drop` は SIGKILL と 1 秒の回収待ちで、回収できなければ zombie のまま残す（zombie の間は pid が再利用されない）。スレッドへ移す `detach_reaper` は単一スレッドの区間の外から呼ぶ明示の opt-in（生成失敗は子を `unreaped` に戻して構造化エラーで返し、回収は 30 秒の期限つきで超えたらハンドルを手放す）
+  - 計装は `NetOpKind::PastaStart` / `PastaStop`（`spawn_pasta_with_recorder`・`stop_with_recorder`）。構造化ログの `pasta_ready` / `pasta_exit` と SEC-4 の監査は、`PastaReady` / `PastaStopOutcome` / `PastaDiagnostics` を材料に supervisor（#1940）が書く
 - **却下した案**: `/tmp` の固定の場所（名前の衝突と symlink を仕込まれる余地）、pipe を `-P /proc/self/fd/N` で渡す（fd は閉じられる）、stderr の文言で判定する（契約ではない）
 
 ### 12.9 失敗の分類（ERR-1・NetErrorCode）・監査・期限
@@ -339,7 +347,7 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | `--netns <パス>` | 設計で使わないので確認しない |
 | `-T none -U none` と `--dns-forward 169.254.1.1` で名前解決できるか | #1941 |
 | Ubuntu 26.04 のプロファイルの exec 規則 | PID の形では pasta がコマンドを起動しないので該当しない |
-| `-f` のときの PID ファイルの書き込みの時点 | #1938（man の確認）・#1941 |
+| `-f` のときの PID ファイルの書き込みの時点 | #1938 で man を確認済み: `-P` は「初期化が終わった後、バックグラウンド化の前に自分の PID を書く」、`-f` は「バックグラウンド化せず PID が変わらない」（pasta 0.0~git20260120）。PID ファイルを引数の解析時に空で作るかは man に記述が無く未確認のため、準備完了は「中身が子の PID と完全一致」で判定し（空・部分読みは「まだ」）、古い `pid` を spawn の前に消す。実機での書き込み時点の確認は #1941 |
 | `argv[0]` とモード（名前を変えたファイル・リンク数 2） | #1936 は検証の入口の実装まで（`--version` は `argv[0]` を常に `pasta` にして実行する）。上流の一次情報での確認は未実施のため #1941 に残す |
 | 他のディストリビューション・上流の版の表記 | #1936 では一次情報を確かめていないため、Debian / Ubuntu の形式のみを受け、他は拒否する（12.12）。足すときは `pasta::version` に確かめた形を足す |
 | 明示の `-t` の bind に失敗したとき pasta が終わるか、警告だけで続けるか | #1941。続ける場合は準備完了後に待ち受けを確かめる後続 issue を起こす |

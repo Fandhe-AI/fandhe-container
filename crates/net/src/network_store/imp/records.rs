@@ -166,7 +166,7 @@ impl Dir {
     }
 
     /// クラッシュの残りの一時ファイルを消す（ベストエフォート。排他ロックの下でだけ呼ぶ）。
-    fn sweep_tmp(&self) {
+    pub(super) fn sweep_tmp(&self) {
         if let Ok(names) = self.entries(LIST_LIMIT) {
             for n in names.into_iter().filter(|n| n.starts_with(TMP_PREFIX)) {
                 let _ = fs::remove_file(self.path(&n));

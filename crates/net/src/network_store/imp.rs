@@ -634,6 +634,8 @@ impl NetworkStore {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
             let g = self.lock_global_exclusive()?;
             let n = g.lock_network(name)?;
+            // 排他ロックの下で、realized / realized.intent の書き込み残骸（`@tmp-*`）を先に掃除する。
+            n.dir.sweep_tmp();
             let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
                 if e.code() == NetErrorCode::ResourceExhausted {
                     err(

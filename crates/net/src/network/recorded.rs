@@ -400,6 +400,14 @@ where
     {
         return Err(RecordedError::Store(unreconciled()));
     }
+    // 作成失敗の請求書が回収待ちで残る間は再作成しない（新しい所有トークンの bridge と古い請求書が併存し、
+    // delete も reclaim も所有を証明できなくなる）。回収完了（請求書の削除）まで拒否する。
+    let pending = guard.reclaim_records().map_err(RecordedError::Store)?;
+    if pending.create.is_some() {
+        return Err(RecordedError::Store(precondition(
+            "network has a pending create reclaim record",
+        )));
+    }
     let token = ownership_token(definition.name());
     let intent = RealizedIntent::new(
         RealizedOp::Create,

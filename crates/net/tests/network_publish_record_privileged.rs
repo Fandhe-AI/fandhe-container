@@ -286,7 +286,7 @@ mod linux {
         let store = NetworkStore::open(dir).map_err(e)?;
         let g = store.lock_global_exclusive().map_err(e)?;
         let n = g.lock_network(&name).map_err(e)?;
-        let mut restored = restore_published_ports(&n, &mid).map_err(e)?;
+        let mut restored = restore_published_ports(nft, &n, &mid).map_err(e)?;
         if restored.len() != 1
             || *restored[0].publish() != publish
             || restored[0].table_handle().map(|h| h.get()) != Some(recorded_handle)
@@ -297,7 +297,7 @@ mod linux {
         let before = fs::read(&member_path).map_err(e)?;
 
         // (2b) 再起動後に c0 の公開を復元し、記録の rule handle が attach の結果と一致することを確かめる。
-        let mut c0_ports = restore_published_ports(&n, &c0).map_err(e)?;
+        let mut c0_ports = restore_published_ports(nft, &n, &c0).map_err(e)?;
         if c0_ports.len() != 2 {
             return Err(format!("c0 restored {} ports, expected 2", c0_ports.len()));
         }
@@ -337,7 +337,7 @@ mod linux {
         if dnat("dport 8081")? != 0 || dnat("dport 8082")? != 2 {
             return Err("only the 8081 DNAT rules must be removed".to_owned());
         }
-        let left = restore_published_ports(&n, &c0).map_err(e)?;
+        let left = restore_published_ports(nft, &n, &c0).map_err(e)?;
         if left.len() != 1 || *left[0].publish() != pub_b {
             return Err(format!("c0 record must keep only 8082, has {}", left.len()));
         }

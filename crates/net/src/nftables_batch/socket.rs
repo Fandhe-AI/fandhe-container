@@ -38,6 +38,7 @@ use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgBuilder};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
+use crate::network_store::NetnsIdentity;
 use crate::nftables_rules::{DumpedRule, NFT_MSG_NEWRULE, RuleDump};
 use crate::sys::Deadline;
 
@@ -51,6 +52,9 @@ pub struct NetlinkNetfilterSocket {
     gate: RequestGate,
     /// 次のバッチの BEGIN の seq（0 は使わない）。`gate` 保持中だけ読み書きする。
     next_seq: AtomicU32,
+    /// ソケットを開いたスレッドの network namespace（開いた時点の値。`/proc/self` はメインスレッドの値なので
+    /// 使わない。読めなければ `None` で、世代の取得は fail-closed に拒否する）。
+    netns: Option<NetnsIdentity>,
 }
 
 /// `end_seq` の次に使う seq（0 は飛ばす）。
@@ -247,11 +251,28 @@ impl NetlinkNetfilterSocket {
     /// ソケットを開いて bind し、以後の open / send / recv / バッチ往復の結果と所要時間を
     /// `recorder` へ渡す（REPAIR-4）。
     pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+        // ソケットは作成したスレッドの netns に束縛される。作成の直前に同じスレッドの値を採る。
+        let netns = NetnsIdentity::of_current_thread().ok();
         Ok(Self {
             inner: NetlinkRouteSocket::open_netfilter_with_recorder(recorder)?,
             gate: RequestGate::default(),
             next_seq: AtomicU32::new(1),
+            netns,
         })
+    }
+
+    /// このソケットが束縛された network namespace と現在の boot ID から、nft ハンドルの世代を作る。
+    ///
+    /// ソケットを開いたスレッドの namespace を使う（プロセス既定の `/proc/self` ではない）。記録の書き込みと
+    /// 照合はこの値で行う。namespace を採れていないソケットは `FailedPrecondition`（fail-closed。NET-3・SEC-1・#3068）。
+    pub fn host_generation(&self) -> Result<crate::network_store::HostGeneration, NetError> {
+        let netns = self.netns.ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "netfilter socket network namespace is unknown",
+            )
+        })?;
+        crate::network_store::HostGeneration::for_netns(netns)
     }
 
     /// 専用テーブルの識別情報（ハンドル・ユーザーデータ）を `NFT_MSG_GETTABLE` で照会する
@@ -460,6 +481,36 @@ impl NetlinkNetfilterSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-3・SEC-1・#3068: ソケットの世代は、ソケットを開いたスレッドの network namespace を指す
+    /// （`/proc/self` ではない）。別スレッドが unshare した後に開いたソケットを別スレッドへ渡しても、
+    /// 開いた時点の namespace のままで、メインスレッドで開いたソケットとは異なる。
+    /// `CAP_SYS_ADMIN` が要るため既定では実行しない。実行: `unshare --map-root-user --net -- \
+    /// cargo test -p fandhe-container-net --lib -- --ignored net3_3068_socket_generation_follows_opening_thread`
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN (unshare --map-root-user --net)"]
+    fn net3_3068_socket_generation_follows_opening_thread() {
+        let main_ns = crate::network_store::NetnsIdentity::of_current_thread().unwrap();
+        let main_sock = NetlinkNetfilterSocket::open().unwrap();
+        assert_eq!(main_sock.host_generation().unwrap().netns(), main_ns);
+        let other = std::thread::spawn(|| {
+            crate::sys::unshare_net().unwrap();
+            let ns = crate::network_store::NetnsIdentity::of_current_thread().unwrap();
+            (ns, NetlinkNetfilterSocket::open().unwrap())
+        })
+        .join()
+        .unwrap();
+        let (other_ns, other_sock) = other;
+        assert_ne!(other_ns, main_ns);
+        // スレッドを越えて渡しても、開いた時点の namespace のまま。
+        let moved = std::thread::spawn(move || other_sock.host_generation().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(moved.netns(), other_ns);
+        assert_ne!(moved, main_sock.host_generation().unwrap());
+        // `/proc/self`（メインスレッド）の値には戻らない。
+        assert_eq!(main_sock.host_generation().unwrap().netns(), main_ns);
+    }
     use crate::instrument::NetOpOutcome;
     use crate::instrument::testing::Collect;
     use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NLMSG_ERROR, NlMsgBuilder};

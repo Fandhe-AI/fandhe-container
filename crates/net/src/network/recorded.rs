@@ -124,9 +124,8 @@ fn settled_realized(guard: &NetworkLockGuard<'_>) -> Result<RealizedRecord, NetE
 /// nft のテーブルハンドルは再起動や namespace の再作成後に同じ数値が再利用されうるため、世代を確認できない
 /// 記録のハンドルは使わない（DELRULE 等の前に `FailedPrecondition` で断る。NET-3・SEC-1・#3068）。
 /// `delete_recorded_with` には適用しない（再起動後の残骸の回収を妨げないため。所有はトークンで証明する）。
-fn check_generation(realized: &RealizedRecord) -> Result<(), NetError> {
-    let now = HostGeneration::current()?;
-    if realized.generation() != &now {
+fn check_generation(realized: &RealizedRecord, now: &HostGeneration) -> Result<(), NetError> {
+    if realized.generation() != now {
         return Err(precondition(
             "recorded nft handles belong to another boot or network namespace",
         ));
@@ -144,9 +143,10 @@ fn require_settled<E, T>(
 /// [`require_settled`] に世代の確認を足したもの（ルールハンドルを使う経路用）。
 fn require_settled_current<E, T>(
     guard: &NetworkLockGuard<'_>,
+    host: &HostGeneration,
 ) -> Result<RealizedRecord, RecordedError<E, T>> {
     let realized = require_settled(guard)?;
-    check_generation(&realized).map_err(RecordedError::Store)?;
+    check_generation(&realized, host).map_err(RecordedError::Store)?;
     Ok(realized)
 }
 
@@ -184,6 +184,7 @@ fn check_dns(dns: &[IpAddr], gateway: IpAddr) -> Result<(), NetError> {
 /// 手順: 記録から IPAM を組み直す → 世代とアドレスを決める → 意図記録を書く → `run` → 成功なら確定記録、
 /// 失敗なら請求書（取り残しがあるとき）と意図記録の後始末。`dns` は確定記録にだけ載せる（`--dns` の上流。NET-12）。
 pub(crate) fn attach_recorded_with<N, G, F>(
+    host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
     spec: &ContainerAttachSpec,
@@ -196,7 +197,7 @@ where
     F: FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<N>, ContainerAttachError>,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled_current(guard)?;
+    let realized = require_settled_current(guard, host)?;
     check_dns(dns, realized.gateway().addr()).map_err(RecordedError::Store)?;
     if &spec.network != realized.name() || spec.bridge_token != realized.token() {
         return Err(RecordedError::Store(precondition(
@@ -353,6 +354,7 @@ fn commit_attached<N>(
 /// （切り離しが完了していないため）。`CreatedNetwork::name_resolution` は記録に無いので既定値で復元する
 /// （切り離しは参照しない）。
 pub(crate) fn detach_recorded_with<E, F>(
+    host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
     container: ContainerIdentity<'_>,
@@ -363,7 +365,7 @@ where
     E: DetachClaim,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled_current(guard)?;
+    let realized = require_settled_current(guard, host)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let intents = guard.member_intents().map_err(RecordedError::Store)?;
     let Some(recorded) = members.iter().find(|m| m.id() == member_id) else {
@@ -433,6 +435,7 @@ impl<N> DetachClaim for Box<super::ContainerDetachError<N>> {
 /// userdata が所有トークンと一致するテーブルのハンドルを確かめられなければ、`realized` を書かず
 /// [`RecordedError::Uncommitted`] を返す（意図記録は残す。NET-3・#3068）。
 pub(crate) fn create_recorded_with<F, G>(
+    host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     definition: &NetworkDefinition,
     gateway: IpPrefix,
@@ -502,9 +505,7 @@ where
     match run(&token) {
         Ok(created) => {
             let committed = require_table_owned(table_info(&created.table), &created.bridge_token)
-                .and_then(|h| {
-                    RealizedRecord::from_created(&created, subnet, h, HostGeneration::current()?)
-                })
+                .and_then(|h| RealizedRecord::from_created(&created, subnet, h, host.clone()))
                 .and_then(|r| guard.commit_realized(&r));
             match committed {
                 Ok(()) => Ok(created),
@@ -603,11 +604,12 @@ fn check_member_owned(
 /// 記録に無いメンバーは `FailedPrecondition` / `NotFound`。公開の無いメンバーは空の列を返す。復元した値は
 /// 記録したテーブルハンドルを束縛しており、`unpublish_port_recorded_with` が解除の前に生きたテーブルと照合する。
 pub(crate) fn restore_published_ports_recorded(
+    host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
 ) -> Result<Vec<PublishedPort>, NetError> {
     let realized = settled_realized(guard)?;
-    check_generation(&realized)?;
+    check_generation(&realized, host)?;
     let members = guard.members()?;
     let rec = members
         .iter()
@@ -631,7 +633,11 @@ pub(crate) fn restore_published_ports_recorded(
 /// しない。記録に当該の公開が無い値（記録の書き直しの rename 後に失敗した場合の再試行を含む）は、解除済みを示す永続記録が
 /// 無いので受け付けず、DELRULE も予約の解放も行わない（予約は `delete_network` まで保持する）。
 /// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
+// 理由: 世代・ガード・メンバー・公開・予約表に、カーネル操作の 3 本の注入（照会・一括削除・1 本削除）を足した形で、
+// まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unpublish_port_recorded_with<G, D, S>(
+    host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
     published: PublishedPort,
@@ -646,7 +652,7 @@ where
     S: FnMut(&NftName, &'static str, NftRuleHandle) -> Result<(), NftApplyFailure>,
 {
     require_exclusive_guard(guard)?;
-    let realized = require_settled_current(guard)?;
+    let realized = require_settled_current(guard, host)?;
     let members = guard.members().map_err(RecordedError::Store)?;
     let Some(rec) = members.iter().find(|m| m.id() == member_id) else {
         return Err(RecordedError::Store(NetError::new(
@@ -760,7 +766,9 @@ mod linux {
                 "spec and definition name differ",
             )));
         }
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
         create_recorded_with(
+            &host,
             guard,
             definition,
             spec.gateway(),
@@ -783,10 +791,11 @@ mod linux {
     ///
     /// 復元した値は [`unpublish_port_recorded`] に渡す。契約は `restore_published_ports_recorded`。
     pub fn restore_published_ports(
+        nft: &NetlinkNetfilterSocket,
         guard: &NetworkLockGuard<'_>,
         member_id: &MemberId,
     ) -> Result<Vec<PublishedPort>, NetError> {
-        restore_published_ports_recorded(guard, member_id)
+        restore_published_ports_recorded(&nft.host_generation()?, guard, member_id)
     }
 
     /// 公開 1 件を記録つきで個別に解除する（`unpublish_container_port` の記録つき版。NET-3・#3068）。
@@ -802,7 +811,9 @@ mod linux {
         registry: &mut PortRegistry,
         timeout: Duration,
     ) -> Result<(), RecordedError<Box<UnpublishPortError>, ()>> {
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
         unpublish_port_recorded_with(
+            &host,
             guard,
             member_id,
             published,
@@ -833,7 +844,9 @@ mod linux {
         AttachedContainer<ContainerNetns>,
         RecordedError<Box<ContainerAttachError>, AttachedContainer<ContainerNetns>>,
     > {
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
         attach_recorded_with(
+            &host,
             guard,
             member_id,
             spec,
@@ -880,7 +893,8 @@ mod linux {
             address: container.address,
             host_token: &host_token,
         };
-        detach_recorded_with(guard, member_id, identity, |created, ipam| {
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
+        detach_recorded_with(&host, guard, member_id, identity, |created, ipam| {
             detach_container(
                 route,
                 nft,
@@ -960,6 +974,11 @@ mod tests {
     fn pfx(a: [u8; 4], len: u8) -> IpPrefix {
         IpPrefix::new(IpAddr::V4(Ipv4Addr::from(a)), len).unwrap()
     }
+    /// 試験用の世代（呼び出したスレッドの現在値）。
+    fn host() -> HostGeneration {
+        HostGeneration::current().unwrap()
+    }
+
     fn name() -> NetworkName {
         NetworkName::new("web").unwrap()
     }
@@ -1126,8 +1145,16 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let dns: Vec<IpAddr> = vec!["1.1.1.1".parse().unwrap()];
-        let att =
-            attach_recorded_with(&n, &mid("c1"), &s, &dns, live_table(42), ok_run(&s)).unwrap();
+        let att = attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s,
+            &dns,
+            live_table(42),
+            ok_run(&s),
+        )
+        .unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
         let members = n.members().unwrap();
         assert_eq!(members.len(), 1);
@@ -1137,7 +1164,8 @@ mod tests {
         assert_eq!(members[0].token(), att.host_token);
         assert!(n.member_intents().unwrap().is_empty());
         // 二重の attach は拒否される。
-        let again = attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
+        let again =
+            attach_recorded_with(&host(), &n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
         assert_eq!(
             again.unwrap_err().store_code(),
             Some(NetErrorCode::AlreadyExists)
@@ -1154,6 +1182,7 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let r = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -1171,6 +1200,7 @@ mod tests {
         // 取り残しが無い失敗は請求書を作らない。
         let s2 = spec("c2");
         let r = attach_recorded_with(
+            &host(),
             &n,
             &mid("c2"),
             &s2,
@@ -1197,6 +1227,7 @@ mod tests {
             ResourceState::Unknown,
         )];
         let _ = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -1206,8 +1237,16 @@ mod tests {
         );
         assert_eq!(n.member_intents().unwrap().len(), 1);
         let s2 = spec("c2");
-        let att =
-            attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
+        let att = attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c2"),
+            &s2,
+            &[],
+            live_table(42),
+            ok_run(&s2),
+        )
+        .unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 3], 24));
     }
 
@@ -1236,7 +1275,8 @@ mod tests {
         .unwrap();
         let s = spec("c2");
         let att =
-            attach_recorded_with(&n, &mid("c2"), &s, &[], live_table(42), ok_run(&s)).unwrap();
+            attach_recorded_with(&host(), &n, &mid("c2"), &s, &[], live_table(42), ok_run(&s))
+                .unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 3], 24));
     }
 
@@ -1250,6 +1290,7 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let r = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -1275,13 +1316,32 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s1 = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
         let s2 = spec("c2");
-        attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c2"),
+            &s2,
+            &[],
+            live_table(42),
+            ok_run(&s2),
+        )
+        .unwrap();
         assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 2);
         let seen = std::cell::Cell::new(0usize);
         let o1 = own(&n, "c1");
         let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &host(),
             &n,
             &mid("c1"),
             ident(&o1),
@@ -1295,12 +1355,21 @@ mod tests {
         assert_eq!(n.members().unwrap().len(), 1);
         assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 1);
         let s3 = spec("c3");
-        let att =
-            attach_recorded_with(&n, &mid("c3"), &s3, &[], live_table(42), ok_run(&s3)).unwrap();
+        let att = attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c3"),
+            &s3,
+            &[],
+            live_table(42),
+            ok_run(&s3),
+        )
+        .unwrap();
         assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
         // 記録に無いメンバーの detach は NotFound。
         let o3 = own(&n, "c3");
         let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &host(),
             &n,
             &mid("zz"),
             ident(&o3),
@@ -1318,11 +1387,30 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let (s1, s2) = (spec("c1"), spec("c2"));
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
-        attach_recorded_with(&n, &mid("c2"), &s2, &[], live_table(42), ok_run(&s2)).unwrap();
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c2"),
+            &s2,
+            &[],
+            live_table(42),
+            ok_run(&s2),
+        )
+        .unwrap();
         let o2 = own(&n, "c2");
         let ran = std::cell::Cell::new(false);
         let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &host(),
             &n,
             &mid("c1"),
             ident(&o2),
@@ -1349,13 +1437,23 @@ mod tests {
             let n = g.lock_network(&name()).unwrap();
             realize(&n);
             let s1 = spec("c1");
-            attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
+            attach_recorded_with(
+                &host(),
+                &n,
+                &mid("c1"),
+                &s1,
+                &[],
+                live_table(42),
+                ok_run(&s1),
+            )
+            .unwrap();
         }
         let g = store.lock_global_shared().unwrap();
         let n = g.lock_network_shared(&name()).unwrap();
         let o1 = own(&n, "c1");
         let ran = std::cell::Cell::new(false);
         let r = detach_recorded_with::<Box<ContainerDetachErrorUnit>, _>(
+            &host(),
             &n,
             &mid("c1"),
             ident(&o1),
@@ -1392,6 +1490,7 @@ mod tests {
         let ext = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         for dns in [vec![gw], vec![ext, ext]] {
             let r = attach_recorded_with::<(), _, _>(
+                &host(),
                 &n,
                 &mid("c1"),
                 &s1,
@@ -1417,6 +1516,7 @@ mod tests {
         realize(&n);
         let s1 = spec("c1");
         let r = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s1,
@@ -1442,9 +1542,18 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s1 = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s1, &[], live_table(42), ok_run(&s1)).unwrap();
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
         let o1 = own(&n, "c1");
-        let r = detach_recorded_with(&n, &mid("c1"), ident(&o1), |_c, _i| {
+        let r = detach_recorded_with(&host(), &n, &mid("c1"), ident(&o1), |_c, _i| {
             Err::<NetworkDeleteReport, _>(Box::new(ContainerDetachErrorUnit))
         });
         assert!(matches!(r, Err(RecordedError::Op(_))));
@@ -1481,6 +1590,7 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         let seen = std::cell::RefCell::new(String::new());
         let out = create_recorded_with(
+            &host(),
             &n,
             &def(),
             pfx([10, 0, 0, 1], 24),
@@ -1510,6 +1620,7 @@ mod tests {
         assert_eq!(rec.subnet(), pfx([10, 0, 0, 0], 24));
         assert_eq!(n.realized_intent().unwrap(), None);
         let again = create_recorded_with(
+            &host(),
             &n,
             &def(),
             pfx([10, 0, 0, 1], 24),
@@ -1533,6 +1644,7 @@ mod tests {
         let pasta = NetworkDefinition::pasta("web").unwrap();
         for d in [other_subnet, pasta] {
             let r = create_recorded_with(
+                &host(),
                 &n,
                 &d,
                 pfx([10, 1, 0, 1], 24),
@@ -1559,6 +1671,7 @@ mod tests {
             ResourceState::Unknown,
         )];
         let r = create_recorded_with(
+            &host(),
             &n,
             &def(),
             pfx([10, 0, 0, 1], 24),
@@ -1573,6 +1686,7 @@ mod tests {
         assert!(!claim.includes_table());
         // gateway が subnet の外なら、カーネル操作の前に拒否する。
         let r = create_recorded_with(
+            &host(),
             &n,
             &def(),
             pfx([10, 9, 0, 1], 24),
@@ -1604,7 +1718,7 @@ mod tests {
         )
         .unwrap();
         let s = spec("c1");
-        let r = attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
+        let r = attach_recorded_with(&host(), &n, &mid("c1"), &s, &[], live_table(42), ok_run(&s));
         assert_eq!(
             r.unwrap_err().store_code(),
             Some(NetErrorCode::FailedPrecondition)
@@ -1621,7 +1735,7 @@ mod tests {
         let n = g.lock_network(&name()).unwrap();
         realize(&n);
         let s = spec("c1");
-        attach_recorded_with(&n, &mid("c1"), &s, &[], live_table(42), ok_run(&s)).unwrap();
+        attach_recorded_with(&host(), &n, &mid("c1"), &s, &[], live_table(42), ok_run(&s)).unwrap();
         let r = delete_recorded_with::<(), (), _>(&n, |_c, _i| Ok(()));
         assert_eq!(
             r.unwrap_err().store_code(),
@@ -1692,6 +1806,7 @@ mod tests {
         let calls = std::cell::RefCell::new(Vec::new());
         let count = std::cell::Cell::new(0u32);
         let r = unpublish_port_recorded_with(
+            &host(),
             n,
             &mid("c1"),
             published,
@@ -1717,6 +1832,7 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let att = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -1754,6 +1870,7 @@ mod tests {
             let g = store.lock_global_exclusive().unwrap();
             let n = g.lock_network(&name()).unwrap();
             let r = create_recorded_with(
+                &host(),
                 &n,
                 &def(),
                 pfx([10, 0, 0, 1], 24),
@@ -1786,7 +1903,7 @@ mod tests {
         let store = NetworkStore::open(&t.0).unwrap();
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
-        let mut restored = restore_published_ports_recorded(&n, &mid("c1")).unwrap();
+        let mut restored = restore_published_ports_recorded(&host(), &n, &mid("c1")).unwrap();
         assert_eq!(restored.len(), 1);
         let p = restored.remove(0);
         assert_eq!(p.table_handle().map(NftTableHandle::get), Some(42));
@@ -1802,7 +1919,7 @@ mod tests {
         let m = n.members().unwrap();
         assert_eq!((m[0].table_handle(), m[0].publishes().len()), (None, 0));
         assert!(
-            restore_published_ports_recorded(&n, &mid("c1"))
+            restore_published_ports_recorded(&host(), &n, &mid("c1"))
                 .unwrap()
                 .is_empty()
         );
@@ -1818,7 +1935,7 @@ mod tests {
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
         let before = std::fs::read(t.0.join("@networks/web/members/c1")).unwrap();
-        let p = restore_published_ports_recorded(&n, &mid("c1"))
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let mut reg = PortRegistry::new();
@@ -1846,11 +1963,18 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let ran = std::cell::Cell::new(false);
-        let r =
-            attach_recorded_with::<(), _, _>(&n, &mid("c1"), &s, &[], live_table(77), |_, _| {
+        let r = attach_recorded_with::<(), _, _>(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s,
+            &[],
+            live_table(77),
+            |_, _| {
                 ran.set(true);
                 unreachable!("run must not be called")
-            });
+            },
+        );
         let Err(RecordedError::Store(e)) = r else {
             panic!("expected Store error");
         };
@@ -1870,6 +1994,7 @@ mod tests {
         realize(&n);
         let s = spec("c1");
         let r = attach_recorded_with::<(), _, _>(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -1895,10 +2020,11 @@ mod tests {
             outcome: NftBatchOutcome::Aborted,
         };
         let run = |reg: &mut PortRegistry, fail: Option<NftApplyFailure>| {
-            let p = restore_published_ports_recorded(&n, &mid("c1"))
+            let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
                 .unwrap()
                 .remove(0);
             unpublish_port_recorded_with(
+                &host(),
                 &n,
                 &mid("c1"),
                 p,
@@ -1936,11 +2062,12 @@ mod tests {
         let rec = n.members().unwrap().remove(0);
         n.replace_member(&rec.with_unpublishing(&web_publish()).unwrap())
             .unwrap();
-        let p = restore_published_ports_recorded(&n, &mid("c1"))
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let mut reg = PortRegistry::new();
         let r = unpublish_port_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             p,
@@ -1978,11 +2105,12 @@ mod tests {
             outcome: NftBatchOutcome::Aborted,
         };
         let run = |one_out: Result<(), NftApplyFailure>| {
-            let p = restore_published_ports_recorded(&n, &mid("c1"))
+            let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
                 .unwrap()
                 .remove(0);
             let calls = std::cell::RefCell::new(Vec::new());
             let r = unpublish_port_recorded_with(
+                &host(),
                 &n,
                 &mid("c1"),
                 p,
@@ -2025,7 +2153,7 @@ mod tests {
         let store = NetworkStore::open(&t.0).unwrap();
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
-        let p = restore_published_ports_recorded(&n, &mid("c1"))
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let rec = n.members().unwrap().remove(0);
@@ -2034,6 +2162,7 @@ mod tests {
         let mut reg = PortRegistry::new();
         reg.reserve(&name(), p.endpoint(), &[*p.publish()]).unwrap();
         let r = unpublish_port_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             p,
@@ -2060,11 +2189,15 @@ mod tests {
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
         let now = HostGeneration::current().unwrap();
-        let other_boot = HostGeneration::new("ffffffff-ffff-ffff-ffff-ffffffffffff", 5, 1).unwrap();
+        let other_boot = HostGeneration::new(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            crate::network_store::NetnsIdentity::new(5, 1),
+        )
+        .unwrap();
         assert_ne!(now, other_boot);
         realize_in(&n, other_boot);
         let msg = "recorded nft handles belong to another boot or network namespace";
-        let r = restore_published_ports_recorded(&n, &mid("c1"));
+        let r = restore_published_ports_recorded(&host(), &n, &mid("c1"));
         assert_eq!(r.unwrap_err().message(), msg);
         let p = PublishedPort::new(
             &name(),
@@ -2076,6 +2209,7 @@ mod tests {
         .with_table_handle(NftTableHandle::new(42).unwrap());
         let mut reg = PortRegistry::new();
         let r = unpublish_port_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             p,
@@ -2091,6 +2225,7 @@ mod tests {
         assert_eq!(e.message(), msg);
         let s = spec("c1");
         let r = attach_recorded_with(
+            &host(),
             &n,
             &mid("c1"),
             &s,
@@ -2103,6 +2238,37 @@ mod tests {
         assert!(n.members().unwrap().is_empty());
     }
 
+    /// NET-3・SEC-1・#3068: 世代の照合は、呼び出し側が渡す（操作対象のソケットの）世代と行う。boot ID が同じでも
+    /// network namespace の同一性が違えば、プロセス既定の値が記録と一致していても断る。
+    #[test]
+    fn net3_3068_same_boot_other_netns_refused() {
+        let t = Tmp::new("other-netns");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        // 記録はこのスレッドの現在値で書く。
+        realize(&n);
+        let cur = host();
+        assert!(
+            restore_published_ports_recorded(&cur, &n, &mid("c1"))
+                .is_err_and(|e| e.code() == NetErrorCode::NotFound)
+        );
+        let other = HostGeneration::new(
+            cur.boot_id(),
+            crate::network_store::NetnsIdentity::new(
+                cur.netns().dev().wrapping_add(1),
+                cur.netns().ino(),
+            ),
+        )
+        .unwrap();
+        let e = restore_published_ports_recorded(&other, &n, &mid("c1")).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "recorded nft handles belong to another boot or network namespace"
+        );
+    }
+
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。
     #[test]
     fn net3_3068_unpublish_rejects_port_not_in_record() {
@@ -2111,7 +2277,7 @@ mod tests {
         let store = NetworkStore::open(&t.0).unwrap();
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
-        let good = restore_published_ports_recorded(&n, &mid("c1"))
+        let good = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let other_handle = PublishedPort::new(
@@ -2159,7 +2325,7 @@ mod tests {
         let store = NetworkStore::open(&t.0).unwrap();
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
-        let good = restore_published_ports_recorded(&n, &mid("c1"))
+        let good = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let path = t.0.join("@networks/web/members/c1");
@@ -2173,7 +2339,7 @@ mod tests {
         text = text.replace(BRIDGE_TOKEN, &alt);
         std::fs::write(&path, text.as_bytes()).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let e = restore_published_ports_recorded(&n, &mid("c1")).unwrap_err();
+        let e = restore_published_ports_recorded(&host(), &n, &mid("c1")).unwrap_err();
         assert_eq!(e.code(), NetErrorCode::DataLoss);
         let mut reg = PortRegistry::new();
         let (r, calls, count) = unpublish_with(&n, good, &mut reg, 42);
@@ -2194,7 +2360,7 @@ mod tests {
         let store = NetworkStore::open(&t.0).unwrap();
         let g = store.lock_global_shared().unwrap();
         let n = g.lock_network_shared(&name()).unwrap();
-        let p = restore_published_ports_recorded(&n, &mid("c1"))
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
             .unwrap()
             .remove(0);
         let mut reg = PortRegistry::new();
@@ -2205,7 +2371,7 @@ mod tests {
             Some(NetErrorCode::FailedPrecondition)
         );
         assert_eq!(
-            restore_published_ports_recorded(&n, &mid("zz"))
+            restore_published_ports_recorded(&host(), &n, &mid("zz"))
                 .unwrap_err()
                 .code(),
             NetErrorCode::NotFound

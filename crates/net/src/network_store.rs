@@ -61,7 +61,7 @@ pub use definition::{
 };
 pub use ipam_rebuild::rebuild_ipam;
 pub use member::{MemberId, MemberIntent, MemberRecord, RecordedPublish};
-pub use realized::{HostGeneration, RealizedIntent, RealizedOp, RealizedRecord};
+pub use realized::{HostGeneration, NetnsIdentity, RealizedIntent, RealizedOp, RealizedRecord};
 
 /// 1 ネットワークに置けるメンバー記録（確定と意図の各々）の最大件数（D13 の /24 と plugin-cri の上限に合わせる）。
 pub const MAX_MEMBERS_PER_NETWORK: usize = 256;

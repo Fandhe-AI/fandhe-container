@@ -91,9 +91,9 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 | 試験 | パッケージ | 起動の仕方 | 成功時の最終行 | CI での実行 |
 | ---- | ---------- | ---------- | -------------- | ----------- |
-| `start_scope_real`（#2081） | `fandhe-container-cli` | **包まず**直接 `<bin> --ignored`（同居する cgroup から実行しないと感度の確認が逆になる） | `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted` | なし（人間が実行） |
-| `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` | なし（人間が実行） |
-| `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor` で CLI の隣に supervisor だけを置き、`target/debug/fandhe-container-launcher` が無いことを確かめる（残っていたら消す。あると `start` がランチャーの経路に入る）。`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` | なし（人間が実行） |
+| `start_scope_real`（#2081） | `fandhe-container-cli` | **包まず**直接 `<bin> --ignored`（同居する cgroup から実行しないと感度の確認が逆になる） | `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted` | あり（platform-ci の ubuntu。#3105） |
+| `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` | あり（platform-ci の ubuntu。#3105） |
+| `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor` で supervisor をビルドする（試験が専用の `bin/` へ CLI と supervisor だけを複製し、launcher が無いことを確かめるので、`target/debug` の launcher を消す必要は無い）。`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` | あり（platform-ci の ubuntu。#3105） |
 | `start_stop_delete_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored`（CLI の実バイナリだけで create → start → list → logs → stop → delete を通す。#2450） | `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs` | あり（platform-ci の ubuntu。#2596） |
 | `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | AGENTS.md の該当行を参照 | あり（platform-ci の ubuntu。#2596） |
 
@@ -116,7 +116,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 | `start_recover_real`（任意） | (記入) |
 | `start_stop_delete_real`（任意） | 一致 / 不一致（出力の末尾。`scope_present_before_delete` の値も記入） |
 | 後始末で残骸が無いこと | (記入) |
-| CI の先行観測（参考。判定には使わない） | 直近の main の CI の `start_stop_delete_real` 最終行の一致 / 不一致 |
+| CI の先行観測（参考。判定には使わない） | 直近の main の CI の `start_stop_delete_real`・`start_scope_real`・`delete_cgroup_real`・`start_recover_real` 最終行の一致 / 不一致 |
 | 判定 | 成功 / prepare で拒否 / その他の失敗 |
 
 ## 拒否・失敗したときの扱い

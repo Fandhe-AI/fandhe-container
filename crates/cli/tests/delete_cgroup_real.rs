@@ -30,7 +30,7 @@
 //!
 //! # 実機前提テストとしての分離
 //! 委譲 cgroup の前提欠如は 1 行目が `delete_cgroup_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `delete_cgroup_real: FAILED: ...`（分類元は core の `tests/support/precondition.rs`（cli は薄いアダプタ経由）。#2957・CLI-1・REPAIR-12）。
-//! GitHub ホステッド runner では委譲 cgroup を前提にできないため、`-- --ignored` 指定時のみ実行する（ci.md
+//! 委譲 cgroup を要するため、`-- --ignored` 指定時のみ実行する（ci.md
 //! 「実機前提テスト」。既定集合の試験を移したものではない。既定集合ではフェイクの remover を使う `stop_delete.rs` の
 //! 単体テストが照合する）。実行された場合は、前提が欠けていても失敗として扱い、検証せずに成功する分岐は持たない。
 //!
@@ -40,7 +40,8 @@
 //! ```
 //!
 //! 成功時の最終行: `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing`。
-//! 実行と結果の記録は人間担当（#2062）。本試験は作成時に未実行で、Agent はホストに cgroup を作るため実行しない。
+//! CI では platform-ci の ubuntu が委譲スコープの中で実行する（#3105）。Agent は手元のホストでは cgroup を作るため実行しない。
+//! 実機の OS・カーネル版での記録は #2062。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

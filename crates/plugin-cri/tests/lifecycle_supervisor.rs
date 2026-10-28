@@ -1346,7 +1346,44 @@ fn repair5_create_worker_residual_is_bounded() {
         Duration::from_millis(103_800)
     );
     assert!(core_create + PLUGIN_RUNTIME_TIMEOUT < PLUGIN_ROOTFS_DEADLINE);
+    // #3142: 巻き戻しの release も `PLUGIN_RUNTIME_TIMEOUT` で打ち切られる（従来は上限が無かった）。
+    assert_eq!(
+        core_create + PLUGIN_RUNTIME_TIMEOUT + PLUGIN_RUNTIME_TIMEOUT,
+        Duration::from_millis(164_700)
+    );
+    assert!(core_create + PLUGIN_RUNTIME_TIMEOUT * 2 < PLUGIN_ROOTFS_DEADLINE);
     assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 16 * 1024 * 1024 * 1024);
     assert_eq!(DEFAULT_MAX_LAYER_ENTRIES, 1_000_000);
     assert_eq!(DEFAULT_MAX_EXTRACTED_BYTES, 8 * 1024 * 1024 * 1024);
+}
+
+/// REPAIR-5・CRI-2・#3142: RemovePodSandbox の最悪は pod 単位の合計期限（`PLUGIN_RUNTIME_TIMEOUT` 1 回分）で決まり、
+/// 配下の数によらず kubelet の `--runtime-request-timeout` の既定（2 分。`defaults.go`）に収まる。従来の逐次
+/// （配下 1 件ごとに `PLUGIN_RUNTIME_TIMEOUT`）は 2 件で既定を超えていた（採らない形が崩れることの証跡）。
+#[test]
+fn repair5_cri2_3142_remove_pod_sandbox_worst_case_fits_kubelet_timeout() {
+    let kubelet_default = Duration::from_secs(120);
+    assert_eq!(PLUGIN_RUNTIME_TIMEOUT, Duration::from_millis(60_900));
+    // 従来: 2 件の配下で 2 × 60.9 = 121.8 秒。
+    let sequential_two = PLUGIN_RUNTIME_TIMEOUT * 2;
+    assert_eq!(sequential_two, Duration::from_millis(121_800));
+    assert!(sequential_two > kubelet_default);
+    // 新: 合計期限 1 回分。余裕は 59.1 秒（同期部分の ε を含めても収まる）。
+    assert!(PLUGIN_RUNTIME_TIMEOUT < kubelet_default);
+    assert_eq!(
+        kubelet_default - PLUGIN_RUNTIME_TIMEOUT,
+        Duration::from_millis(59_100)
+    );
+}
+
+/// REPAIR-5・CRI-2・#3142: RemoveContainer の bundle 解放は RPC と同じ `PLUGIN_RUNTIME_TIMEOUT` の期限を共有する。
+/// core の後始末までの最悪（`PLUGIN_FORCE_DELETE_DEADLINE` 47 秒）の残りが解放の取り分で、RPC の期限を超えない。
+#[test]
+fn repair5_cri2_3142_remove_container_release_within_runtime_timeout() {
+    use fandhe_container_plugin_cri::adapter::PLUGIN_FORCE_DELETE_DEADLINE;
+    assert_eq!(PLUGIN_FORCE_DELETE_DEADLINE, Duration::from_secs(47));
+    assert_eq!(
+        PLUGIN_RUNTIME_TIMEOUT - PLUGIN_FORCE_DELETE_DEADLINE,
+        Duration::from_millis(13_900)
+    );
 }

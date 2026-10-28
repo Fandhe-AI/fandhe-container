@@ -150,6 +150,8 @@ fn stop_inner(
     guard: &NetworkLockGuard<'_>,
     request: &dyn DnsHelperStopRequest,
 ) -> Result<StopOutcome, NetError> {
+    // 副作用（停止要求・SIGKILL）の前に排他ロックを確かめる（共有ロックの下で止めてから記録の削除で失敗しない）。
+    guard.require_exclusive()?;
     let Some(record) = guard.read_dns_helper()? else {
         return Ok(StopOutcome::NoRecord);
     };
@@ -465,11 +467,14 @@ pub enum IntentRecovery {
 /// `dns-helper` の記録があれば記録が正なので意図記録だけを消す。無ければ、`candidates`（`net-helpers` の cgroup に
 /// 居るプロセスの pid。列挙は呼び出し側。#3074）のうち、`/proc/<pid>/cmdline` に意図記録の nonce を持つものを、
 /// pidfd 取得後に開始時刻を再確認して pidfd 経由で停止し、意図記録を消す。停止を確認できなければ意図記録を
-/// 残して `Timeout`。候補は [`MAX_RECOVERY_CANDIDATES`] 件まで調べる。
+/// 残して `Timeout`。候補は [`MAX_RECOVERY_CANDIDATES`] 件まで調べ、残りがあれば意図記録を残して
+/// `ResourceExhausted`。消滅を確認できない失敗（権限・fd 枯渇等）も意図記録を残して失敗にする。排他ロックでなければ
+/// 副作用の前に `FailedPrecondition`。
 pub fn recover_dns_helper_intent(
     guard: &NetworkLockGuard<'_>,
     candidates: &mut dyn Iterator<Item = u32>,
 ) -> Result<IntentRecovery, NetError> {
+    guard.require_exclusive()?;
     let Some(intent) = guard.read_dns_helper_intent()? else {
         return Ok(IntentRecovery::NoIntent);
     };
@@ -478,18 +483,26 @@ pub fn recover_dns_helper_intent(
         return Ok(IntentRecovery::IntentDiscarded);
     }
     let mut stopped = 0usize;
-    for pid in candidates.take(MAX_RECOVERY_CANDIDATES) {
-        if pid == 0 || !cmdline_has_nonce(pid, intent.nonce()) {
+    let mut seen = 0usize;
+    for pid in (&mut *candidates).take(MAX_RECOVERY_CANDIDATES) {
+        seen += 1;
+        // 消滅（NotFound）を確認できたものだけ読み飛ばす。確認できないエラーは意図記録（再試行に要る nonce）を
+        // 残したまま失敗にする。
+        if pid == 0 || !cmdline_has_nonce(pid, intent.nonce())? {
             continue;
         }
-        let Ok(pidfd) = open_pidfd(pid) else {
-            continue;
+        let pidfd = match open_pidfd(pid) {
+            Ok(fd) => fd,
+            Err(e) if e.code() == NetErrorCode::NotFound => continue,
+            Err(e) => return Err(with_note(e, "intent record kept")),
         };
-        let Ok(identity) = read_identity(pid) else {
-            continue;
+        let identity = match read_identity(pid) {
+            Ok(i) => i,
+            Err(e) if e.code() == NetErrorCode::NotFound => continue,
+            Err(e) => return Err(with_note(e, "intent record kept")),
         };
         // pidfd 取得後の再確認: 同じ nonce を持ち、開始時刻が変わっておらず、まだ終了していない。
-        if !cmdline_has_nonce(pid, intent.nonce())
+        if !cmdline_has_nonce(pid, intent.nonce())?
             || verify_pidfd_target(pidfd.as_fd(), &identity)? != Verify::Same
         {
             continue;
@@ -502,23 +515,35 @@ pub fn recover_dns_helper_intent(
         }
         stopped += 1;
     }
+    // 上限に達したのに候補が残っていれば、走査を終えていない。意図記録を消すと生存したヘルパーの nonce を失う。
+    if seen >= MAX_RECOVERY_CANDIDATES && candidates.next().is_some() {
+        return Err(err(
+            NetErrorCode::ResourceExhausted,
+            "too many recovery candidates; intent record kept",
+        ));
+    }
     guard.remove_dns_helper_intent()?;
     Ok(IntentRecovery::Recovered { stopped })
 }
 
-/// `/proc/<pid>/cmdline` が `--nonce <nonce>` を持つか。読めない・上限超過は「持たない」。
-fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> bool {
-    let Ok(raw) = read_limited(
+/// `/proc/<pid>/cmdline` が `--nonce <nonce>` を持つか。プロセスが無い（消滅）・上限超過（ヘルパーの
+/// 引数列ではない）は `false`。それ以外の読み取り失敗（権限・fd 枯渇等）は確認不能として `Err`。
+fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> Result<bool, NetError> {
+    let raw = match read_limited(
         PathBuf::from(format!("/proc/{pid}/cmdline")),
         CMDLINE_MAX_BYTES,
-    ) else {
-        return false;
+    ) {
+        Ok(r) => r,
+        Err(e) if matches!(e.code(), NetErrorCode::NotFound | NetErrorCode::DataLoss) => {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
     };
     let args: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
-    args.windows(2).any(|w| {
+    Ok(args.windows(2).any(|w| {
         w.first().copied() == Some(ARG_NONCE.as_bytes())
             && w.get(1).copied() == Some(nonce.as_str().as_bytes())
-    })
+    }))
 }
 
 /// 段 1（`--dns-helper-detach`）の本体: 新しいセッションを作り、段 2 を起動して待たずに戻る。

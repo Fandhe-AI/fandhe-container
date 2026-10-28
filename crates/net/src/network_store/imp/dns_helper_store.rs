@@ -5,8 +5,9 @@
 //! `dns_helper::detach` が、ネットワークの排他ロック（[`NetworkLockGuard`]）を持ったまま呼ぶ。形式は
 //! `dns_helper::record` が持ち、ここは置き場の検査（fd 起点・`O_NOFOLLOW`・0600・所有者・nlink 1・通常ファイル）と
 //! 永続化（ファイルの fsync の後にディレクトリの fsync）を担う。
-//! - 書き込みは新規作成だけ（`create_new`）で、既存の記録を上書きしない。古い記録は停止の経路で消してから書く
-//! - 書き込みの途中で失敗したら、中途半端なファイルを消してから失敗を返す（正準形以外を読ませない）
+//! - 書き込みは一時名（`<名前>.tmp`）へ完全に書いて fsync した後、上書き禁止の `link(2)` で最終名へ公開する。
+//!   既存の記録は上書きしない（`AlreadyExists`）。起動元が SIGKILL されても最終名には空・不完全な内容が現れず、
+//!   残った一時名は排他ロックを持つ次の操作（読み取り・書き込み・ネットワーク削除）が回収する
 //! - 共有ロックの guard からの書き込み・削除は `FailedPrecondition`（排他の下でしか変えない）
 //! - 読み取りは 4096 バイトを上限にし、サイズを検証してから確保する。壊れた記録は `DataLoss` で、自動修復しない
 //! - エラー文言に pid・ネットワーク名・アドレスを含めない
@@ -24,8 +25,14 @@ pub const DNS_HELPER_FILE: &str = "dns-helper";
 /// 起動窓の意図記録のファイル名。
 pub const DNS_HELPER_INTENT_FILE: &str = "dns-helper.intent";
 
+/// 記録の書き込みに使う一時名（記録ごとに固定。排他ロックの下でだけ作る）。
+fn temp_name(name: &str) -> String {
+    format!("{name}.tmp")
+}
+
 impl NetworkLockGuard<'_> {
-    fn require_exclusive(&self) -> Result<(), NetError> {
+    /// 排他ロックでなければ `FailedPrecondition`。副作用（停止・SIGKILL）の前に呼ぶ入口の検査にも使う。
+    pub(crate) fn require_exclusive(&self) -> Result<(), NetError> {
         if self.shared {
             return Err(err(
                 NetErrorCode::FailedPrecondition,
@@ -35,7 +42,31 @@ impl NetworkLockGuard<'_> {
         Ok(())
     }
 
+    /// 書き込み途中で起動元が中断されて残った一時ファイルを消す（排他ロックの下だけ。共有では何もしない）。
+    ///
+    /// 一時名は記録ごとに固定で、排他ロックの下では同時に書く者がいないため、残っていれば必ず中断の残骸。
+    /// 最終名へ公開する前に fsync 済みなので、最終名は常に完全な内容で、一時名の側だけを捨てればよい
+    /// （公開後・一時名の削除前の中断では最終名の nlink が 2 になるため、ここで 1 に戻す）。
+    pub(super) fn discard_stale_temps(&self) -> Result<(), NetError> {
+        if self.shared {
+            return Ok(());
+        }
+        let mut removed = false;
+        for name in [DNS_HELPER_FILE, DNS_HELPER_INTENT_FILE] {
+            match fs::remove_file(self.dir.path(&temp_name(name))) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(map_io(&e, "failed to remove stale network record")),
+            }
+        }
+        if removed {
+            self.dir.sync()?;
+        }
+        Ok(())
+    }
+
     fn read_record_bytes(&self, name: &str) -> Result<Option<Vec<u8>>, NetError> {
+        self.discard_stale_temps()?;
         let f = match self.dir.open_regular_ro(name, RECORD_MAX_BYTES as u64) {
             Ok(f) => f,
             Err(e) if e.code() == NetErrorCode::NotFound => return Ok(None),
@@ -54,6 +85,8 @@ impl NetworkLockGuard<'_> {
         Ok(Some(buf))
     }
 
+    /// 一時名へ完全に書いて fsync し、上書き禁止の `link(2)` で最終名として公開する。公開の途中で中断されても
+    /// 最終名には空・不完全な内容が現れない（残るのは一時名だけで、[`discard_stale_temps`] が回収する）。
     fn write_record_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), NetError> {
         self.require_exclusive()?;
         if bytes.len() > RECORD_MAX_BYTES {
@@ -62,26 +95,35 @@ impl NetworkLockGuard<'_> {
                 "network record exceeds the size limit",
             ));
         }
-        let path = self.dir.path(name);
+        self.discard_stale_temps()?;
+        let final_path = self.dir.path(name);
+        let tmp_path = self.dir.path(&temp_name(name));
         let msg = "failed to write network record";
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(FILE_MODE)
             .custom_flags(FLAGS_FILE)
-            .open(&path)
+            .open(&tmp_path)
             .map_err(|e| map_io(&e, msg))?;
         let written = f
             .set_permissions(fs::Permissions::from_mode(FILE_MODE))
             .and_then(|()| f.write_all(bytes))
             .and_then(|()| f.sync_all());
+        drop(f);
         if let Err(e) = written {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(map_io(&e, msg));
+        }
+        // 上書き禁止の公開。最終名が既にあれば AlreadyExists。
+        let linked = fs::hard_link(&tmp_path, &final_path);
+        let _ = fs::remove_file(&tmp_path);
+        if let Err(e) = linked {
             return Err(map_io(&e, msg));
         }
         // 名前の永続化。失敗したら記録としては扱えないため消して失敗を返す。
         if let Err(e) = self.dir.sync() {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&final_path);
             return Err(e);
         }
         Ok(())
@@ -291,6 +333,40 @@ mod tests {
             n.remove_dns_helper().expect("rm");
         }
         st.remove(&name).expect("remove after record is gone");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-7・REPAIR-5・#3070: 書き込み途中で中断され一時名だけが残っても、最終名は現れず、
+    /// 排他ロックの次の操作が一時名を回収して書き直せる。公開後の一時名の取り残し（nlink 2）も戻る。
+    #[test]
+    fn net7_3070_stale_temp_is_recovered() {
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        let net = dir.join("@networks/web");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        // 空の一時ファイル（作成直後の中断）。
+        fs::write(net.join("dns-helper.tmp"), b"").expect("tmp");
+        assert_eq!(n.read_dns_helper().expect("read"), None);
+        assert!(!net.join("dns-helper.tmp").exists());
+        fs::write(net.join("dns-helper.intent.tmp"), b"part").expect("tmp");
+        n.write_dns_helper_intent(&intent()).expect("write");
+        assert_eq!(n.read_dns_helper_intent().expect("read"), Some(intent()));
+        // 公開後・一時名の削除前の中断（最終名の nlink が 2）。
+        fs::hard_link(
+            net.join("dns-helper.intent"),
+            net.join("dns-helper.intent.tmp"),
+        )
+        .expect("link");
+        assert_eq!(n.read_dns_helper_intent().expect("read"), Some(intent()));
+        assert_eq!(
+            fs::metadata(net.join("dns-helper.intent"))
+                .expect("meta")
+                .nlink(),
+            1
+        );
+        drop(n);
+        drop(g);
         let _ = fs::remove_dir_all(dir);
     }
 }

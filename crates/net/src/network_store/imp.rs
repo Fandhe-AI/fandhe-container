@@ -619,6 +619,7 @@ impl NetworkStore {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
             let g = self.lock_global_exclusive()?;
             let n = g.lock_network(name)?;
+            n.discard_stale_temps()?;
             let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
                 if e.code() == NetErrorCode::ResourceExhausted {
                     err(

@@ -240,10 +240,24 @@ mod tests {
     #[test]
     fn net7_3070_sigkill_via_pidfd_then_reap() {
         let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
-        let Ok(pidfd) = pidfd_open(child.id()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return; // pidfd 非対応のカーネル
+        let pidfd = match pidfd_open(child.id()) {
+            Ok(fd) => fd,
+            // 検証を省いてよいのは「非対応」と確定したときだけ。EPERM・EMFILE 等は失敗として扱う。
+            Err(SysError::Os(e)) if e == ENOSYS => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Err(SysError::Unsupported) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pidfd_open failed: {e:?}");
+            }
         };
         assert_eq!(
             wait_readable(pidfd.as_fd(), &Deadline::after(Duration::ZERO)).expect("poll"),

@@ -276,8 +276,13 @@ mod tests {
         use std::os::fd::AsFd as _;
         let me = read_self_identity().expect("self");
         assert_eq!(me.pid, std::process::id());
-        let Ok(fd) = pidfd_open(me.pid) else {
-            return; // pidfd 非対応のカーネル
+        use crate::sys::SysError;
+        let fd = match pidfd_open(me.pid) {
+            Ok(fd) => fd,
+            // 非対応と確定したときだけ省く。EPERM・EMFILE 等は失敗として扱う。
+            Err(SysError::Os(e)) if e == crate::sys::process::ENOSYS => return,
+            Err(SysError::Unsupported) => return,
+            Err(e) => panic!("pidfd_open failed: {e:?}"),
         };
         assert_eq!(
             verify_pidfd_target(fd.as_fd(), &me).expect("verify"),

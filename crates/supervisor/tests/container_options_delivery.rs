@@ -1,5 +1,5 @@
 //! CLI の create が保存した起動オプション文書と世代注釈を、supervisor の start 側が読んで検証済みの
-//! 入力へ変換する境界の結合照合（SUP-12・CLI-1・SEC-1・#2713・REPAIR-12）。
+//! 入力へ変換する境界の結合照合（SUP-12・CLI-1・SEC-1・NET-6・NET-12・#2713・#3065・REPAIR-12）。
 //!
 //! 実コンテナは起動しない。実ストア（`open_default_store`）の状態記録と実ファイルの文書を使い、
 //! 保存（`store::write_new`）→ 読み取り（`store::read`）→ 世代照合（`select_document`）→ 変換
@@ -137,4 +137,71 @@ fn sup12_delivery_record_without_generation_ignores_leftover_document() {
         launch_env_for(t.path(), &rec).unwrap(),
         Vec::<String>::new()
     );
+}
+/// network 系を載せた文書(世代つき)。
+fn net_doc(
+    generation: &str,
+    network: &str,
+    add_hosts: &[&str],
+    dns: &[&str],
+) -> ContainerOptionsDocument {
+    ContainerOptionsDocument::new(vec![], vec![], None, None, vec![])
+        .unwrap()
+        .with_network(
+            Some(network.to_owned()),
+            add_hosts.iter().map(|s| (*s).to_owned()).collect(),
+            dns.iter().map(|s| (*s).to_owned()).collect(),
+        )
+        .unwrap()
+        .with_generation(generation.to_owned())
+        .unwrap()
+}
+
+/// 保存→読み取り→世代照合→`ContainerOptions`→`LaunchOptions` までを通した結果を返す。
+fn deliver(
+    d: &ContainerOptionsDocument,
+) -> Result<
+    fandhe_container_core::oci_runtime::LaunchOptions,
+    fandhe_container_core::traits::TraitError,
+> {
+    let t = TmpDir::new();
+    let id = ContainerId::new("web").unwrap();
+    let _rec = record(t.path(), &id, Some("g1"));
+    write_new(t.path(), &id, d).unwrap();
+    let picked = select_document(read(t.path(), &id).unwrap(), Some("g1"))
+        .unwrap()
+        .expect("adopted");
+    assert_eq!(picked.network(), d.network());
+    picked.to_container_options()?.launch_options()
+}
+
+/// NET-6・SUP-12・#3065: `--network=host` / `none` は配送経路を通って core の `LaunchNetworkMode` になる。
+#[test]
+fn net6_delivery_network_host_and_none_reach_launch_options() {
+    use fandhe_container_core::oci_runtime::LaunchNetworkMode;
+    let host = deliver(&net_doc("g1", "host", &[], &[])).unwrap();
+    assert_eq!(host.network(), LaunchNetworkMode::Host);
+    let none = deliver(&net_doc("g1", "none", &[], &[])).unwrap();
+    assert_eq!(none.network(), LaunchNetworkMode::Loopback);
+}
+
+/// NET-12・REPAIR-3: `--add-host` は反映経路が無いため、配送後の `launch_options` が Unimplemented で拒否する。
+#[test]
+fn net12_delivery_add_host_is_rejected_as_unimplemented() {
+    let e = deliver(&net_doc("g1", "host", &["db:10.0.0.5"], &[])).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Unimplemented);
+}
+
+/// NET-12・REPAIR-3: `--dns` も同様に Unimplemented で拒否する。
+#[test]
+fn net12_delivery_dns_is_rejected_as_unimplemented() {
+    let e = deliver(&net_doc("g1", "mynet", &[], &["8.8.8.8"])).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Unimplemented);
+}
+
+/// NET-6: ユーザー定義名のみ(add-host・dns なし)は結線前のため Unimplemented で拒否する。
+#[test]
+fn net6_delivery_named_network_is_rejected_as_unimplemented() {
+    let e = deliver(&net_doc("g1", "mynet", &[], &[])).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Unimplemented);
 }

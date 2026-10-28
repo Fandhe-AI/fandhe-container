@@ -26,7 +26,8 @@
 //! 公開の個別解除を復元する（#3068・NET-3・D11）。`table-handle` は公開を投入した nft テーブルのカーネル採番ハンドルで、解除の
 //! 前に生きたテーブルのハンドルと照合する（テーブルが作り直されていれば rule handle は古く、削除に使わない）。`publish` が
 //! 1 件以上あるときだけ `table-handle` を置く。`publish` の値は `tcp|udp <ipv4>:<host-port> <container-port> <prerouting> <output>`
-//! の正準形だけを受ける。公開の無い旧形式（#3067）はそのまま読める。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
+//! の正準形だけを受ける（解除の意図を DELRULE の前に残した公開には末尾に ` unpublishing` が付く。再起動後に ENOENT を
+//! 「既に消えた」と扱う唯一の根拠で、テーブルハンドルの照合後にだけ使う）。公開の無い旧形式（#3067）はそのまま読める。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
 
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -132,6 +133,8 @@ pub struct RecordedPublish {
     publish: PortPublish,
     prerouting: NftRuleHandle,
     output: NftRuleHandle,
+    /// 解除の意図を DELRULE の前に残した印（再起動後に ENOENT を「既に消えた」と扱ってよい根拠。NET-3・#3068）。
+    unpublishing: bool,
 }
 
 impl RecordedPublish {
@@ -141,7 +144,13 @@ impl RecordedPublish {
             publish,
             prerouting,
             output,
+            unpublishing: false,
         }
+    }
+
+    /// 解除の意図の印が付いているか（DELRULE の前に記録される。付いた記録は再起動後の解除の回復に使う）。
+    pub fn unpublishing(&self) -> bool {
+        self.unpublishing
     }
 
     /// 公開の指定（受け口とコンテナ側ポート）。
@@ -165,12 +174,17 @@ impl RecordedPublish {
             PortProtocol::Udp => "udp",
         };
         format!(
-            "{proto} {}:{} {} {} {}",
+            "{proto} {}:{} {} {} {}{}",
             self.publish.host_addr(),
             self.publish.host_port(),
             self.publish.container_port(),
             self.prerouting.get(),
-            self.output.get()
+            self.output.get(),
+            if self.unpublishing {
+                " unpublishing"
+            } else {
+                ""
+            }
         )
     }
 
@@ -178,8 +192,10 @@ impl RecordedPublish {
     fn decode(v: &str) -> Result<Self, NetError> {
         let malformed = || bad("member publish is malformed");
         let parts: Vec<&str> = v.split(' ').collect();
-        let [proto, listener, cport, pre, out] = parts.as_slice() else {
-            return Err(malformed());
+        let (proto, listener, cport, pre, out, unpublishing) = match parts.as_slice() {
+            [a, b, c, d, e] => (a, b, c, d, e, false),
+            [a, b, c, d, e, "unpublishing"] => (a, b, c, d, e, true),
+            _ => return Err(malformed()),
         };
         let protocol = match *proto {
             "tcp" => PortProtocol::Tcp,
@@ -193,11 +209,12 @@ impl RecordedPublish {
         let pre: u64 = pre.parse().map_err(|_| malformed())?;
         let out: u64 = out.parse().map_err(|_| malformed())?;
         let publish = PortPublish::new(protocol, addr, hport, cport).map_err(|_| malformed())?;
-        let rec = Self::new(
+        let mut rec = Self::new(
             publish,
             NftRuleHandle::new(pre).map_err(|_| malformed())?,
             NftRuleHandle::new(out).map_err(|_| malformed())?,
         );
+        rec.unpublishing = unpublishing;
         if rec.encode() != v {
             return Err(bad("member publish is not canonical"));
         }
@@ -308,6 +325,31 @@ impl MemberRecord {
     /// 記録した公開。
     pub fn publishes(&self) -> &[RecordedPublish] {
         &self.publishes
+    }
+
+    /// 指定した受け口の公開に「解除の意図」の印を付けた記録を返す（DELRULE の前に永続化する。NET-3・#3068）。
+    /// 記録に無ければ `NotFound`。
+    pub fn with_unpublishing(&self, publish: &PortPublish) -> Result<Self, NetError> {
+        let mut next = self.clone();
+        let Some(p) = next
+            .publishes
+            .iter_mut()
+            .find(|p| p.publish.same_listener(publish))
+        else {
+            return Err(NetError::new(
+                NetErrorCode::NotFound,
+                "publish is not recorded for the member",
+            ));
+        };
+        p.unpublishing = true;
+        Ok(next)
+    }
+
+    /// 指定した受け口の公開に解除の意図の印が付いているか。
+    pub fn is_unpublishing(&self, publish: &PortPublish) -> bool {
+        self.publishes
+            .iter()
+            .any(|p| p.unpublishing && p.publish.same_listener(publish))
     }
 
     /// 指定した受け口の公開を外した記録を返す。最後の 1 件を外したら `table-handle` も外す。
@@ -667,6 +709,28 @@ mod tests {
         // 公開の無い旧形式（#3067 の形）はそのまま読め、公開は空。
         let old = MemberRecord::decode(base.as_bytes()).unwrap();
         assert_eq!((old.table_handle(), old.publishes().len()), (None, 0));
+    }
+
+    /// NET-3・REPAIR-1・#3068: 解除の意図の印は ` unpublishing` として符号化され往復し、他の公開に波及しない。
+    #[test]
+    fn net3_3068_member_unpublishing_mark_roundtrip() {
+        let m = with_two()
+            .with_unpublishing(&publish(PortProtocol::Udp, 5353, 80))
+            .unwrap();
+        let base = String::from_utf8(member(&[]).encode()).unwrap();
+        let expected = format!(
+            "{base}table-handle 2\n42\npublish 26\ntcp 192.0.2.10:8080 80 2 3\npublish 39\nudp 192.0.2.10:5353 80 4 5 unpublishing\n"
+        );
+        assert_eq!(m.encode(), expected.as_bytes());
+        let back = MemberRecord::decode(&m.encode()).unwrap();
+        assert_eq!(back, m);
+        assert!(back.is_unpublishing(&publish(PortProtocol::Udp, 5353, 80)));
+        assert!(!back.is_unpublishing(&publish(PortProtocol::Tcp, 8080, 80)));
+        let none = member(&[]);
+        assert!(
+            none.with_unpublishing(&publish(PortProtocol::Tcp, 1, 80))
+                .is_err()
+        );
     }
 
     /// NET-3・REPAIR-2・#3068: 公開まわりの不正な記録はすべて `DataLoss`。

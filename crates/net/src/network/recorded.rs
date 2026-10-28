@@ -56,7 +56,7 @@ use crate::network_store::{
     InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkLockGuard,
     RealizedIntent, RealizedOp, RealizedRecord, RecordedPublish, rebuild_ipam,
 };
-use crate::nftables_batch::{NftName, TableInfo};
+use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 use crate::nftables_rules::NftRuleHandle;
 
 use super::NftApplyFailure;
@@ -596,7 +596,11 @@ pub(crate) fn restore_published_ports_recorded(
 /// こと（受け口・rule handle・テーブルハンドル・ネットワーク・トークン）を照合する → `unpublish_ports_with` で
 /// 生きたテーブルのハンドルと照合したうえで DELRULE → 成功したらメンバー記録から該当の公開を外して書き直す。
 /// 照合で拒否・失敗したときは記録を変えず、`published` を [`UnpublishPortError`] に入れて返す。解除が成功しても記録を
-/// 書き直せなかったときは [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。
+/// 書き直せなかったときは [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。その状態や
+/// DELRULE 成功後のプロセス終了からは、DELRULE の直前に記録へ残す解除の意図の印で回復する: 再試行で DELRULE が
+/// `NotFound`（バッチは all-or-nothing で何も消えていない）になっても、印があり生きたテーブルのハンドルが一致して
+/// いれば消えたとみなして記録の更新だけを再開する。印が無い ENOENT は成功扱いにしない。残余: ルールの一覧照会
+/// （GETRULE）は未実装のため、2 本のうち片方だけが外部で消えた状態は区別できない（REPAIR-3）。
 /// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
 pub(crate) fn unpublish_port_recorded_with<G, D>(
     guard: &NetworkLockGuard<'_>,
@@ -633,9 +637,37 @@ where
     }
     let publish = *published.publish();
     let created = realized.to_created(NameResolution::default());
+    // 前回の試行が DELRULE の前に残した解除の意図の印（再起動をまたいで DELRULE 成功後の記録更新失敗から回復する根拠）。
+    let was_marked = rec.is_unpublishing(&publish);
+    // 印は生きたテーブルのハンドルとの照合を通った後、DELRULE の直前に書く（照合で断る経路では記録を変えない）。
+    // 印を書けなければ DELRULE を送らない。印があれば、DELRULE の ENOENT（失敗のバッチは all-or-nothing で何も
+    // 消えていない）は、前回の DELRULE が成功した後に記録の更新だけが失敗した状態とみなして続行する。
+    // 印が無い初回の ENOENT は外部要因なので成功扱いにせず断る（fail-closed）。
+    let delete = |table: &NftName, handles| {
+        if !was_marked {
+            let marked = rec
+                .with_unpublishing(&publish)
+                .and_then(|next| guard.replace_member(&next))
+                .map_err(|error| NftApplyFailure {
+                    error,
+                    outcome: NftBatchOutcome::NotSent,
+                });
+            marked?;
+        }
+        match delete(table, handles) {
+            Err(f)
+                if was_marked
+                    && f.outcome == NftBatchOutcome::Aborted
+                    && f.error.code() == NetErrorCode::NotFound =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    };
     let outcome = unpublish_ports_with(table_info, delete, &created, published, registry);
-    // DELRULE が成功した後の失敗（予約の解放失敗）では、ルールは消えているのでハンドルを記録に残さない
-    // （残すと再試行が ENOENT で記録を除去できない）。予約解放の失敗は記録を直した後に別途返す。
+    // DELRULE が成功した後の失敗（予約の解放失敗）では、ルールは消えているので記録から外す。予約解放の失敗は
+    // 記録を直した後に別途返す。記録の更新自体が失敗・中断した場合は、上の解除の意図の印で次回に回復する。
     let removed = match &outcome {
         Ok(()) => true,
         Err(e) => e.rules == UnpublishRules::Removed,
@@ -1799,6 +1831,83 @@ mod tests {
         );
         assert!(matches!(r, Err(RecordedError::Store(_))));
         assert!(n.member_intents().unwrap().is_empty());
+    }
+
+    /// NET-3・REPAIR-1・#3068: DELRULE の成功後に記録の更新が済まないまま再起動した状態（意図の印が残り、ルールは
+    /// 既に無い）から、DELRULE の ENOENT を許して記録の更新だけを再開できる。印の無い初回の ENOENT は断る。
+    #[test]
+    fn net3_3068_unpublish_recovers_after_delrule_succeeded_but_record_stale() {
+        let t = Tmp::new("unpublish-recover");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let enoent = || NftApplyFailure {
+            error: NetError::new(NetErrorCode::NotFound, "no such rule"),
+            outcome: NftBatchOutcome::Aborted,
+        };
+        let run = |reg: &mut PortRegistry, fail: Option<NftApplyFailure>| {
+            let p = restore_published_ports_recorded(&n, &mid("c1"))
+                .unwrap()
+                .remove(0);
+            unpublish_port_recorded_with(
+                &n,
+                &mid("c1"),
+                p,
+                reg,
+                |_| table_info_reply(42, BRIDGE_TOKEN),
+                |_, _| fail.map_or(Ok(()), Err),
+            )
+        };
+        let mut reg = PortRegistry::new();
+        // 初回: 印を書いてから DELRULE を送る。ENOENT は断り、公開と印が記録に残る。
+        let Err(RecordedError::Op(e)) = run(&mut reg, Some(enoent())) else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.error.code(), NetErrorCode::NotFound);
+        assert_eq!(e.rules, UnpublishRules::Present);
+        let m = n.members().unwrap();
+        assert_eq!(m[0].publishes().len(), 1);
+        assert!(m[0].is_unpublishing(&web_publish()));
+        // 再起動後の再試行: 印があるので ENOENT でも記録の更新だけが進む。
+        run(&mut reg, Some(enoent())).unwrap();
+        let m = n.members().unwrap();
+        assert_eq!((m[0].table_handle(), m[0].publishes().len()), (None, 0));
+    }
+
+    /// NET-3・REPAIR-1・#3068: 印があっても、ENOENT 以外の失敗（結果不明など）は成功扱いにしない。
+    #[test]
+    fn net3_3068_unpublish_marked_non_enoent_failure_stays_refused() {
+        let t = Tmp::new("unpublish-marked-fail");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let rec = n.members().unwrap().remove(0);
+        n.replace_member(&rec.with_unpublishing(&web_publish()).unwrap())
+            .unwrap();
+        let p = restore_published_ports_recorded(&n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let mut reg = PortRegistry::new();
+        let r = unpublish_port_recorded_with(
+            &n,
+            &mid("c1"),
+            p,
+            &mut reg,
+            |_| table_info_reply(42, BRIDGE_TOKEN),
+            |_, _| {
+                Err(NftApplyFailure {
+                    error: NetError::new(NetErrorCode::Internal, "timeout"),
+                    outcome: NftBatchOutcome::Unknown,
+                })
+            },
+        );
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.rules, UnpublishRules::Unknown);
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 1);
     }
 
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。

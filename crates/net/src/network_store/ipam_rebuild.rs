@@ -9,7 +9,7 @@
 //! - 確定記録は netns pin 置き場の記録つきで戻す（`delete_network` が pin を判定できるまま）
 //! - 意図記録は使用中のアドレスとして数える（カーネル側に資源が残りうるため再割り当てしない）
 //! - 同じ ID の確定記録と意図記録が endpoint もアドレスも同じなら 1 回だけ数える（確定記録を書いた後、
-//!   意図記録を消す前に落ちた窓）
+//!   意図記録を消す前に落ちた窓）。所有トークンの世代まで一致しない場合は別の操作として `DataLoss`
 //! - 食い違い（アドレス・endpoint の衝突、サブネット外、トークン不整合、dns が gateway）は `DataLoss`。
 //!   組み直せないときは払い出さない
 
@@ -45,7 +45,8 @@ pub fn rebuild_ipam(
             return Err(bad("member intent token does not belong to the network"));
         }
         if let Some(m) = members.iter().find(|m| m.id() == i.id()) {
-            if m.endpoint() == i.endpoint() && m.address() == i.address() {
+            if m.endpoint() == i.endpoint() && m.address() == i.address() && m.token() == i.token()
+            {
                 continue;
             }
             return Err(bad("member intent conflicts with the member record"));
@@ -165,6 +166,19 @@ mod tests {
             (vec![member("a", "a", 2)], vec![intent("a", "a", 3)]),
             // 別 ID の意図記録とアドレスが衝突。
             (vec![member("a", "a", 2)], vec![intent("b", "b", 2)]),
+            // 同じ ID・endpoint・アドレスでも所有トークンの世代が違う。
+            (
+                vec![member("a", "a", 2)],
+                vec![
+                    MemberIntent::new(
+                        MemberId::new("a").unwrap(),
+                        eid("a"),
+                        pfx([10, 0, 0, 2], 24),
+                        &format!("{BRIDGE_TOKEN}/ep/a/g/00000000000000000000000000000002"),
+                    )
+                    .unwrap(),
+                ],
+            ),
             // gateway と同じアドレス。
             (vec![member("a", "a", 1)], vec![]),
         ];

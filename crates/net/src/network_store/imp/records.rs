@@ -235,6 +235,14 @@ impl NetworkLockGuard<'_> {
         self.dir.read_record(file)
     }
 
+    /// ロック保持中のネットワークの定義を、保持しているディレクトリから読み直す（NET-1・D10・#3067）。
+    ///
+    /// 定義の取得後、ロックを取る前に同名のネットワークが削除・再作成された窓を塞ぐため、記録つきの create は
+    /// 渡された定義をこの値と照合してからカーネル操作へ進む。破損は `DataLoss`。
+    pub fn definition(&self) -> Result<NetworkDefinition, NetError> {
+        read_definition_in(&self.dir, self.name.as_str())
+    }
+
     /// `realized` を読む。無ければ `None`。名前がこのネットワークと違えば `DataLoss`。
     pub fn realized(&self) -> Result<Option<RealizedRecord>, NetError> {
         let Some(bytes) = self.read_realized_file(REALIZED_FILE)? else {
@@ -490,7 +498,11 @@ impl NetworkLockGuard<'_> {
             let reclaim = self.dir.ensure_subdir(RECLAIM_DIR)?;
             let attach = reclaim.ensure_subdir(RECLAIM_ATTACH_DIR)?;
             attach.sweep_tmp();
-            if attach.record_names()?.len() >= MAX_MEMBERS_PER_NETWORK {
+            let names = attach.record_names()?;
+            // 再試行（同じ endpoint の請求書が既にある）は件数の上限に数えず、内容照合と再同期へ進める（D11）。
+            if names.len() >= MAX_MEMBERS_PER_NETWORK
+                && !names.iter().any(|n| n == claim.endpoint().as_str())
+            {
                 return Err(err(
                     NetErrorCode::ResourceExhausted,
                     "too many pending reclaim records",
@@ -841,6 +853,34 @@ mod tests {
     }
 
     /// 請求書は保存・読み出し・一致時削除ができ、他のネットワークの請求書は拒否する。
+    /// 請求書が上限件数あっても、既存 endpoint の同一内容の再保存は成功する（D11 の冪等な再試行）。
+    #[test]
+    fn net1_3067_store_reclaim_attach_retry_at_limit() {
+        let t = Tmp::new("claim-limit");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&nn()).unwrap();
+        let claim = |i: usize| {
+            FailedAttachClaim::for_test(
+                nn(),
+                EndpointId::new(&format!("c{i}")).unwrap(),
+                BRIDGE_TOKEN,
+                "00000000000000000000000000000001",
+                true,
+                false,
+                false,
+            )
+        };
+        for i in 0..MAX_MEMBERS_PER_NETWORK {
+            n.save_reclaim_attach(&claim(i)).unwrap();
+        }
+        n.save_reclaim_attach(&claim(0)).unwrap();
+        assert_eq!(
+            code(n.save_reclaim_attach(&claim(MAX_MEMBERS_PER_NETWORK))),
+            NetErrorCode::ResourceExhausted
+        );
+    }
+
     #[test]
     fn net1_3067_store_reclaim_claims() {
         let t = Tmp::new("reclaim");

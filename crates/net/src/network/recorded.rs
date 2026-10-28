@@ -167,14 +167,21 @@ where
             "member already exists",
         )));
     }
+    let mut ipam = rebuild_ipam(&realized, &members, &intents).map_err(RecordedError::Store)?;
     // 上限はカーネル操作の前に検査する（超過で確定記録だけ書けず生きたコンテナが残るのを防ぐ）。
-    if members.len() + intents.len() >= MAX_MEMBERS_PER_NETWORK {
+    // 確定記録を書いた後、意図記録を消す前に落ちた窓では同じメンバーが両方に残る。整合性の検証
+    // （`rebuild_ipam`）の後に、重複を除いた数で判定する。
+    let distinct = members.len()
+        + intents
+            .iter()
+            .filter(|i| !members.iter().any(|m| m.id() == i.id()))
+            .count();
+    if distinct >= MAX_MEMBERS_PER_NETWORK {
         return Err(RecordedError::Store(NetError::new(
             NetErrorCode::ResourceExhausted,
             "too many members",
         )));
     }
-    let mut ipam = rebuild_ipam(&realized, &members, &intents).map_err(RecordedError::Store)?;
     let generation = new_generation();
     let host_token = host_owner_token(realized.token(), spec.endpoint(), &generation);
     // 払い出しは決定的（最小の空き）なので、複製で先に決めた値を意図記録に書き、本番の ipam が同じ値を出す。
@@ -364,6 +371,14 @@ where
     if definition.name() != guard.network() {
         return Err(RecordedError::Store(precondition(
             "definition does not belong to the locked network",
+        )));
+    }
+    // ロック保持中の定義を読み直し、渡された定義（方式・subnet を含む）と一致することを確かめる（D10）。
+    // 取得後・ロック前に同名のネットワークが削除・再作成された場合や、別方式の定義での呼び出しを拒否する。
+    let stored = guard.definition().map_err(RecordedError::Store)?;
+    if &stored != definition {
+        return Err(RecordedError::Store(precondition(
+            "definition differs from the stored definition",
         )));
     }
     check_gateway(&gateway, &subnet).map_err(|_| {
@@ -1129,6 +1144,27 @@ mod tests {
             again.unwrap_err().store_code(),
             Some(NetErrorCode::AlreadyExists)
         );
+    }
+
+    /// 保存済みの定義と方式・subnet が違う定義での create は、意図記録もカーネル操作も無しで拒否する（D10）。
+    #[test]
+    fn net1_3067_create_rejects_definition_differing_from_stored() {
+        let t = Tmp::new("create-def-mismatch");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let other_subnet = NetworkDefinition::bridge("web", pfx([10, 1, 0, 0], 24)).unwrap();
+        let pasta = NetworkDefinition::pasta("web").unwrap();
+        for d in [other_subnet, pasta] {
+            let r = create_recorded_with(&n, &d, pfx([10, 1, 0, 1], 24), |_| {
+                panic!("カーネル操作は始めない")
+            });
+            assert_eq!(
+                r.unwrap_err().store_code(),
+                Some(NetErrorCode::FailedPrecondition)
+            );
+            assert_eq!(n.realized_intent().unwrap(), None);
+        }
     }
 
     /// create が取り残しつきで失敗したら請求書を残し、意図記録は消える。保存できなければ意図記録が残る。

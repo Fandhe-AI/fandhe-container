@@ -530,51 +530,59 @@ impl NetworkStore {
 
     fn read_one(&self, name: &str) -> Result<NetworkDefinition, NetError> {
         let sub = self.dir.open_subdir(name)?;
-        // 読み取りでも @lock を検査する（欠落・symlink・権限不正・複数ハードリンクは破損として扱う）。
-        sub.open_regular_ro(LOCK_FILE, u64::MAX).map_err(|e| {
+        read_definition_in(&sub, name)
+    }
+}
+
+/// ネットワークのディレクトリ `sub` から定義を読む（`read_one` と、ロック保持中の再読み込みの共通本体）。
+/// `name` はディレクトリ名で、定義の名前と一致しなければ `DataLoss`。
+fn read_definition_in(sub: &Dir, name: &str) -> Result<NetworkDefinition, NetError> {
+    // 読み取りでも @lock を検査する（欠落・symlink・権限不正・複数ハードリンクは破損として扱う）。
+    sub.open_regular_ro(LOCK_FILE, u64::MAX).map_err(|e| {
+        if e.code() == NetErrorCode::NotFound {
+            err(NetErrorCode::DataLoss, "network lock file is missing")
+        } else {
+            e
+        }
+    })?;
+    let mut f = sub
+        .open_regular_ro(DEFINITION_FILE, DEFINITION_MAX_BYTES as u64)
+        .map_err(|e| {
             if e.code() == NetErrorCode::NotFound {
-                err(NetErrorCode::DataLoss, "network lock file is missing")
+                err(NetErrorCode::DataLoss, "network definition file is missing")
             } else {
                 e
             }
         })?;
-        let mut f = sub
-            .open_regular_ro(DEFINITION_FILE, DEFINITION_MAX_BYTES as u64)
-            .map_err(|e| {
-                if e.code() == NetErrorCode::NotFound {
-                    err(NetErrorCode::DataLoss, "network definition file is missing")
-                } else {
-                    e
-                }
-            })?;
-        let len = usize::try_from(
-            f.metadata()
-                .map_err(|e| map_io(&e, "failed to stat network definition"))?
-                .len(),
-        )
-        .map_err(|_| err(NetErrorCode::DataLoss, "network definition is too large"))?;
-        // metadata は検査時と別の取得で拡張されうるため、確保は固定上限で頭打ちにする。
-        let mut buf = Vec::with_capacity(len.min(DEFINITION_MAX_BYTES));
-        (&mut f)
-            .take(DEFINITION_MAX_BYTES as u64 + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| map_io(&e, "failed to read network definition"))?;
-        if buf.len() != len {
-            return Err(err(
-                NetErrorCode::DataLoss,
-                "network definition changed while reading",
-            ));
-        }
-        let def = NetworkDefinition::decode(&buf)?;
-        if def.name().as_str() != name {
-            return Err(err(
-                NetErrorCode::DataLoss,
-                "network definition name does not match its directory",
-            ));
-        }
-        Ok(def)
+    let len = usize::try_from(
+        f.metadata()
+            .map_err(|e| map_io(&e, "failed to stat network definition"))?
+            .len(),
+    )
+    .map_err(|_| err(NetErrorCode::DataLoss, "network definition is too large"))?;
+    // metadata は検査時と別の取得で拡張されうるため、確保は固定上限で頭打ちにする。
+    let mut buf = Vec::with_capacity(len.min(DEFINITION_MAX_BYTES));
+    (&mut f)
+        .take(DEFINITION_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| map_io(&e, "failed to read network definition"))?;
+    if buf.len() != len {
+        return Err(err(
+            NetErrorCode::DataLoss,
+            "network definition changed while reading",
+        ));
     }
+    let def = NetworkDefinition::decode(&buf)?;
+    if def.name().as_str() != name {
+        return Err(err(
+            NetErrorCode::DataLoss,
+            "network definition name does not match its directory",
+        ));
+    }
+    Ok(def)
+}
 
+impl NetworkStore {
     /// 定義を 1 件読む。無ければ `NotFound`。
     pub fn get(&self, name: &NetworkName) -> Result<NetworkDefinition, NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreGet, || {

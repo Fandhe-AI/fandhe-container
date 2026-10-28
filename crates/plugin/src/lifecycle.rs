@@ -364,7 +364,7 @@ struct StderrCapture {
     state: Arc<Mutex<PluginStderr>>,
     done: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
-    /// ブロック中の読み取りを起こす操作（停止用 pipe の書き込み端を閉じる。`POLLHUP` で起こす。`poll` 非対応の構成はソケットの
+    /// ブロック中の読み取りを起こす操作（停止用 pipe の書き込み端を閉じる。`poll` 非対応の構成はソケットの
     /// shutdown）。1 回だけ実行する。
     wake: Option<Box<dyn FnOnce() + Send>>,
     /// 停止用 pipe の起床でも [`PLUGIN_STDERR_STOP_TIMEOUT`] 内に止まらなかったときだけ実行する最後の
@@ -383,13 +383,22 @@ impl StderrCapture {
         source: R,
         wake: Box<dyn FnOnce() + Send>,
     ) -> io::Result<Self> {
+        Self::start_with_stop(source, wake, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`Self::start`] の本体。停止フラグを外から受け取る（`PolledStderr` が停止用 pipe の起床の理由を
+    /// 判別するため、読み取り入力と収集器でフラグを共有する。#3256）。
+    fn start_with_stop<R: Read + Send + 'static>(
+        source: R,
+        wake: Box<dyn FnOnce() + Send>,
+        stop_requested: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(PluginStderr {
             bytes: Vec::new(),
             total_bytes: 0,
             complete: false,
             reader_stopped: false,
         }));
-        let stop_requested = Arc::new(AtomicBool::new(false));
         let (tx, done) = mpsc::channel();
         let shared = Arc::clone(&state);
         let stop = Arc::clone(&stop_requested);
@@ -412,7 +421,7 @@ impl StderrCapture {
     /// 子の stderr を受けるソケットの読み取り側から収集を始める。
     ///
     /// `poll` 対応の構成では、読み取りスレッドが「ソケット」と「停止用 pipe」を `poll` で待つ。停止時は
-    /// pipe の書き込み端を閉じて（`drop(stop_tx)`）`POLLHUP` で起こし、pipe へは書かず（理由は `attach` 内のコメント参照）、`shutdown` も呼ばない（macOS で `shutdown` が別スレッドの `recv` と
+    /// pipe の書き込み端を閉じて `POLLHUP` で起こし、`shutdown` は呼ばない（macOS で `shutdown` が別スレッドの `recv` と
     /// 競合して読み取りが戻らない場面の回避。REPAIR-5・#3003）。それでも止まらなかった場合に限り、最後の
     /// 手段として `shutdown` する。対応外の構成は従来どおり受信期限と `shutdown` で止める。
     #[cfg(unix)]
@@ -428,16 +437,19 @@ impl StderrCapture {
         reader.set_nonblocking(true)?;
         // ゲート待ちは呼び出し元の合計期限までに限る（REPAIR-5）。
         let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(deadline, io::pipe)?;
-        let mut capture = Self::start(
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut capture = Self::start_with_stop(
             PolledStderr {
                 sock: reader,
                 stop: stop_rx,
+                stop_requested: Arc::clone(&stop_requested),
             },
             Box::new(move || {
                 // 書き込み端を閉じて `POLLHUP` で起こす。pipe へは書かない（読み手が先に去っていると `EPIPE` と
                 // `SIGPIPE` になり、ホストの signal 設定が既定のままだとプロセスごと落ちるため。REPAIR-5・#3003）。
                 drop(stop_tx);
             }),
+            stop_requested,
         )?;
         capture.last_resort = Some(Box::new(shutdown));
         Ok(capture)
@@ -534,13 +546,19 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &Atom
 /// ソケットと停止用 pipe を `poll` で同時に待つ stderr 入力（unix。`poll` 対応の構成のみ。#3003）。
 ///
 /// [`StderrCapture::attach`] が作り、読み取りスレッド（[`drain_stderr`]）の `read` として呼ばれる。
-/// 1 回の待ちは [`STDERR_READ_POLL`] で有限。停止用 pipe が読めれば `Interrupted` を返し、呼び出し側が
-/// 停止フラグ（pipe より先に立つ）を見て抜ける。ソケット側は `sock` が非ブロッキングなので、起床後の
+/// 1 回の待ちは [`STDERR_READ_POLL`] で有限。停止用 pipe が ready（書き込み端の close による `POLLHUP`）に
+/// なったとき、停止フラグが立っていれば `Interrupted` を返し、呼び出し側が停止フラグ（pipe より先に
+/// 立つ）を見て抜ける。フラグが立っていないのに ready（`POLLERR`・`POLLNVAL`・書き込み端の予期しない
+/// close）ならエラーで抜ける（`Interrupted` のままだと `drain_stderr` の再試行と即戻る `poll` で CPU を
+/// 空回しするため。REPAIR-5・#3256）。ソケット側は `sock` が非ブロッキングなので、起床後の
 /// `read` が待つことはない。
 #[cfg(unix)]
 struct PolledStderr {
     sock: std::os::unix::net::UnixStream,
     stop: io::PipeReader,
+    /// 収集器と共有する停止フラグ。`request_stop` がフラグを立ててから pipe の書き込み端を閉じるので、
+    /// 正規の停止による起床ではここが真になっている。
+    stop_requested: Arc<AtomicBool>,
 }
 
 #[cfg(unix)]
@@ -549,9 +567,19 @@ impl Read for PolledStderr {
         let ms = i32::try_from(STDERR_READ_POLL.as_millis()).unwrap_or(100);
         match crate::sys::poll_two(&self.sock, &self.stop, ms)? {
             crate::sys::PollOutcome::TimedOut => Err(io::ErrorKind::WouldBlock.into()),
-            crate::sys::PollOutcome::Ready { second: true, .. } => {
+            // 正規の停止。`drain_stderr` がループ先頭でフラグを見て抜ける。
+            crate::sys::PollOutcome::Ready { second: true, .. }
+                if self.stop_requested.load(Ordering::SeqCst) =>
+            {
                 Err(io::ErrorKind::Interrupted.into())
             }
+            // フラグ未設定で pipe 側が ready。`Interrupted` を返すと再試行されて busy loop になるため、
+            // 再試行されない種類のエラーで抜ける。`drain_stderr` 側で一律に抜けないのは、`Interrupted` が
+            // 本物の `EINTR` でも来るため（signal で出力を落とさない）。
+            crate::sys::PollOutcome::Ready { second: true, .. } => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "plugin stderr stop pipe became ready without a stop request",
+            )),
             crate::sys::PollOutcome::Ready { .. } => self.sock.read(buf),
         }
     }
@@ -3088,6 +3116,103 @@ mod tests {
         assert!(!got.is_complete());
         assert!(got.reader_stopped());
         assert!(holder.kill_and_reap().is_reaped());
+    }
+
+    /// 停止用 pipe の書き込み端を閉じた `PolledStderr` を作る（フラグは `stop_requested` を共有）。
+    /// 返す `UnixStream` は相手側で、試験の終わりまで持ち続ける（EOF で抜ける経路と区別するため）。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    fn polled_with_closed_stop_pipe(
+        stop_requested: &Arc<AtomicBool>,
+    ) -> (PolledStderr, std::os::unix::net::UnixStream) {
+        let (peer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        // 素の `io::pipe()` は並行する試験の子へ書き込み端が漏れ、`POLLHUP` が遅れうるため使わない。
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(far_deadline(), io::pipe).unwrap();
+        drop(stop_tx);
+        (
+            PolledStderr {
+                sock: reader,
+                stop: stop_rx,
+                stop_requested: Arc::clone(stop_requested),
+            },
+            peer,
+        )
+    }
+
+    /// REPAIR-5・PLUG-7・#3256: 停止フラグが未設定のまま停止用 pipe が ready になったら、`Interrupted`
+    /// （再試行されて busy loop になる）ではなく `BrokenPipe` で抜ける。フラグが立っていれば従来どおり
+    /// `Interrupted`。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    #[test]
+    fn repair5_polled_stderr_read_errors_when_stop_pipe_ready_without_stop_request() {
+        let read_kind = |flag: &Arc<AtomicBool>| {
+            let (mut polled, _peer) = polled_with_closed_stop_pipe(flag);
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut buf = [0u8; 16];
+            loop {
+                match polled.read(&mut buf) {
+                    // fork から exec までの窓で `POLLHUP` が遅れる間は待つ。
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {}
+                    other => return other.map_err(|e| e.kind()),
+                }
+            }
+        };
+        assert_eq!(
+            read_kind(&Arc::new(AtomicBool::new(false))),
+            Err(io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(
+            read_kind(&Arc::new(AtomicBool::new(true))),
+            Err(io::ErrorKind::Interrupted)
+        );
+    }
+
+    /// REPAIR-5・PLUG-7・#3256: 停止フラグ未設定で停止用 pipe が ready になっても、読み取りスレッドは
+    /// 空回しせず自分で抜ける。`finish` は期限後に停止を指示するので、期限より十分早く戻れば自力で
+    /// 抜けたことになる（修正前は期限まで空回しする）。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    #[test]
+    fn repair5_stderr_capture_reader_exits_when_stop_pipe_ready_without_stop_request() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (polled, _peer) = polled_with_closed_stop_pipe(&flag);
+        let capture = StderrCapture::start_with_stop(polled, Box::new(|| {}), flag).unwrap();
+        let started = Instant::now();
+        let got = capture.finish(Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(got.reader_stopped());
+        assert!(!got.is_complete());
+        assert_eq!(got.total_bytes(), 0);
     }
 
     /// REPAIR-5・PLUG-7・#3003: 書き込み端を保持する別プロセスがいても、`shutdown` を使わない通常の

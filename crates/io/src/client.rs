@@ -224,14 +224,22 @@ impl InFlightRequest {
 
 /// [`FrameKind::Write`] / [`FrameKind::Flush`] だけを未 ACK 追跡の対象として受理する。
 ///
-/// [`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり、これらに対応する
-/// ACK は来ない。追跡対象に含めると未 ACK キューの枠を占有し続け、二度と解放されない
+/// [`FrameKind::Ack`] / [`FrameKind::FlushAck`] / [`FrameKind::Nack`] は応答フレームで
+/// あり、これらに対応する ACK は来ない。v2 のファイル操作要求
+/// （[`FrameKind::Create`]・[`FrameKind::WriteFile`]・[`FrameKind::Close`]）の型つき
+/// 送信 API は #3162 が足すまで未実装で、汎用の `send` では fail-closed に拒否する
+/// （F12。REPAIR-3）。追跡対象に含めると未 ACK キューの枠を占有し続け、二度と解放されない
 /// （[`SendQueue::register`]・[`PipelineClient::send`] の両方で共有する検証。
 /// codex レビュー指摘: `register` は本検証を経ずに `Ack`/`FlushAck` を受理していた）。
 fn ensure_trackable_frame_kind(kind: FrameKind) -> Result<(), IoError> {
     match kind {
         FrameKind::Write | FrameKind::Flush => Ok(()),
-        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+        FrameKind::Ack
+        | FrameKind::FlushAck
+        | FrameKind::Create
+        | FrameKind::WriteFile
+        | FrameKind::Close
+        | FrameKind::Nack => Err(IoError::new(
             IoErrorCode::InvalidArgument,
             "only Write/Flush frames can be tracked as in-flight requests",
         )),
@@ -1501,7 +1509,12 @@ where
             // `SendQueue::register`（`ensure_trackable_frame_kind` 経由）は
             // `Write`/`Flush` 以外を受理しないため到達しないが、`unwrap`・
             // `expect` を避け、フォールバックとして安全側（拒否）に倒す。
-            FrameKind::Ack | FrameKind::FlushAck => {
+            FrameKind::Ack
+            | FrameKind::FlushAck
+            | FrameKind::Create
+            | FrameKind::WriteFile
+            | FrameKind::Close
+            | FrameKind::Nack => {
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
                 let err = IoError::new(
@@ -2654,6 +2667,28 @@ mod tests {
 
         let peeked_again = queue.peek_next_id().expect("peek must succeed again");
         assert_eq!(peeked_again.get(), 1);
+    }
+
+    /// IO-1・REPAIR-2・#3161（F12）: 汎用の `send` に v2 のファイル操作の種別や
+    /// Nack が来たら `InvalidArgument` で拒否し、キューへ登録しない
+    /// （型つき API は #3162）。
+    #[test]
+    fn io1_send_rejects_v2_file_kinds_and_does_not_register() {
+        let limit = InFlightLimit::new(2).expect("2 must be valid");
+        let mut client = PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver);
+
+        for kind in [
+            FrameKind::Create,
+            FrameKind::WriteFile,
+            FrameKind::Close,
+            FrameKind::Nack,
+        ] {
+            let err = client
+                .send(kind, &[0u8; 16], test_timeout())
+                .expect_err("v2 kinds must be rejected by the generic send");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert_eq!(client.queue().len(), 0);
+        }
     }
 
     /// TASK-12.2・IO-1: `Flush` に空でない body を渡すと `send` は

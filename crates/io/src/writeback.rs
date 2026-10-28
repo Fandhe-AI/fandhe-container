@@ -35,9 +35,10 @@
 //!
 //! `body` を不透明なバイト列として追記するのはスタブの意味論であり
 //! （REPAIR-3）、ファイル操作（パス・rename・truncate 等。TASK-14 の整合性
-//! スイートが要する）をペイロードで表す形式は、今後のプロトコル拡張
-//! （IO-1 の I/O 契約変更。`PROTOCOL_VERSION` の繰り上げを伴いうる）として
-//! 別途扱う。
+//! スイートが要する）をペイロードで表す形式のうち作成・追記・Close・Nack は v2
+//! （`PROTOCOL_VERSION` 2。#3161）の符号化と復号が実装済みで、その処理は別モード
+//! （ファイル操作モード。#3163）が担う予定で未実装。本関数は単一 sink モードで、
+//! v2 のファイル操作の種別を受けたら接続全体を `InvalidArgument` で終える（F3）。
 //!
 //! パスを持つ作成の入口は [`crate::guest_files::GuestFileCreator`]（TASK-19.2・
 //! IO-5・#100）で、サーバー側 API が大文字小文字衝突を検査したうえでファイルを
@@ -1103,10 +1104,19 @@ where
                 }
                 stats.flush_acks_sent = stats.flush_acks_sent.saturating_add(1);
             }
-            FrameKind::Ack | FrameKind::FlushAck => {
+            FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => {
                 let err = IoError::new(
                     IoErrorCode::InvalidArgument,
-                    "client must not send Ack/FlushAck frames to the writeback server",
+                    "client must not send Ack/FlushAck/Nack frames to the writeback server",
+                );
+                return finish(stats, &buffer, err);
+            }
+            // ファイル操作の種別はファイル操作モード（#3163）専用で、単一 sink モード
+            // には合わない（F3）。接続全体の InvalidArgument として終える。
+            FrameKind::Create | FrameKind::WriteFile | FrameKind::Close => {
+                let err = IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    "file operation frames are not accepted in single-sink mode",
                 );
                 return finish(stats, &buffer, err);
             }
@@ -1327,6 +1337,30 @@ mod tests {
         assert_eq!(sink.calls, 0, "malformed flush must not trigger a write");
         assert_eq!(report.stats.discarded_pending_frames, 1);
         assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// IO-1・REPAIR-2・#3161（F3）: 単一 sink モードにファイル操作の種別
+    /// （Create・WriteFile・Close）が届いたら、応答 0 件で接続全体が
+    /// `InvalidArgument` として終わる。
+    #[test]
+    fn io1_single_sink_mode_rejects_file_operation_frames() {
+        let frames_per_kind = [
+            Frame::new(FrameKind::Create, vec![0u8; 12]).expect("frame"),
+            Frame::new(FrameKind::WriteFile, vec![0u8; 17]).expect("frame"),
+            Frame::new(FrameKind::Close, vec![0u8; 16]).expect("frame"),
+        ];
+        for frame in frames_per_kind {
+            let mut conn = FakeTransport::new(vec![frame]);
+            let mut sink = FakeSink::new();
+            let config = BatchConfig::new(4).expect("4 must be valid");
+
+            let report = serve_connection(&mut conn, config, &mut sink, timeouts());
+
+            assert_eq!(report.stats.acks_sent, 0);
+            assert_eq!(sink.calls, 0);
+            assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+            assert!(report.end.message().contains("single-sink"));
+        }
     }
 
     /// IO-1・REPAIR-2（Codex #822 レビュー指摘）: request id に続けて余分な

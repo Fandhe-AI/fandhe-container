@@ -25,9 +25,9 @@
 //! 方針」）。
 //!
 //! request id・ACK status はヘッダに含めない。それらのペイロード側レイアウトと、
-//! 種別ごとのペイロード長制約（例: 制御フレームは長さ 0）は、本モジュールでは扱わず
-//! TASK-12・TASK-13（またはそれらの後続 sub-issue）が定める（REPAIR-3: 実装済みを
-//! 装わない）。[`FrameHeader::from_bytes`] が検証するのは (a) `header_crc` が
+//! 種別ごとのペイロード長制約は、本モジュールでは扱わず [`crate::payload`] が定める
+//! （v1 の Write / Ack / Flush / FlushAck は TASK-12.2・#74、v2 の Create /
+//! WriteFile / Close / Nack は #3161・IO-1・REPAIR-2）。[`FrameHeader::from_bytes`] が検証するのは (a) `header_crc` が
 //! `bytes[0..6]` の再計算値と一致すること（不一致なら化けたヘッダの他フィールドを
 //! 一切信用せず即座に拒否する）、(b) `version` が [`PROTOCOL_VERSION`] と一致する
 //! こと、(c) 種別が既知の値であること、(d) ペイロード長が [`MAX_PAYLOAD_LEN`]
@@ -98,7 +98,13 @@ const _: () = assert!(MAX_PAYLOAD_LEN < u32::MAX);
 /// io-protocol.md`「バージョン方針」）。MVP ではネゴシエーション（Hello 交換）は
 /// 行わず、[`FrameHeader::from_bytes`] が受信側の値と比較して不一致を
 /// [`IoErrorCode::Unimplemented`] として返す。
-pub const PROTOCOL_VERSION: u8 = 1;
+///
+/// v2: ファイル操作の種別 5〜8（[`FrameKind::Create`]・[`FrameKind::WriteFile`]・
+/// [`FrameKind::Close`]・[`FrameKind::Nack`]）の追加で 1 から繰り上げた
+/// （`docs/design/io-protocol.md` の F2・IO-1・REPAIR-2・#1886・#3161）。
+/// ヘッダ 10 バイトとトレーラのレイアウトは v1 と同じで、v1 のヘッダは
+/// `Unimplemented` になる。
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// 固定長ヘッダのバイト数（version 1 バイト + 種別 1 バイト + ペイロード長
 /// 4 バイト + ヘッダ CRC 4 バイト）。
@@ -154,6 +160,17 @@ pub enum FrameKind {
     /// 実証済みなのは SIGKILL 耐性までで、電源断・OS クラッシュへの耐性は
     /// 未検証（IO-3）。詳細は `docs/api/io-barrier.md`（TASK-17）を参照。
     FlushAck = 4,
+    /// ゲスト相対パスのファイルを新規作成する要求（`O_EXCL` 相当。クライアント →
+    /// サーバー）。ハンドルはこのフレームの request id。ファイル操作モードの接続
+    /// だけで受理する（v2。`docs/design/io-protocol.md` の F3・F4・IO-1・#3161）。
+    Create = 5,
+    /// ハンドルが指すファイルへ追記する要求（クライアント → サーバー。v2・F4）。
+    WriteFile = 6,
+    /// ハンドルを解放する要求（クライアント → サーバー。fsync はしない。v2・F4）。
+    Close = 7,
+    /// 要求単位の失敗の通知（サーバー → クライアント）。その要求は効果を持たない。
+    /// ファイル操作モードの要求に限って返す（v2・F8・F10）。
+    Nack = 8,
 }
 
 impl FrameKind {
@@ -180,6 +197,10 @@ impl TryFrom<u8> for FrameKind {
             2 => Ok(Self::Ack),
             3 => Ok(Self::Flush),
             4 => Ok(Self::FlushAck),
+            5 => Ok(Self::Create),
+            6 => Ok(Self::WriteFile),
+            7 => Ok(Self::Close),
+            8 => Ok(Self::Nack),
             other => Err(IoError::new(
                 IoErrorCode::InvalidArgument,
                 format!("unknown frame kind byte: {other}"),
@@ -758,6 +779,14 @@ mod tests {
         assert_eq!(FrameKind::Ack.as_u8(), 2);
         assert_eq!(FrameKind::Flush.as_u8(), 3);
         assert_eq!(FrameKind::FlushAck.as_u8(), 4);
+        assert_eq!(FrameKind::Create.as_u8(), 5);
+        assert_eq!(FrameKind::WriteFile.as_u8(), 6);
+        assert_eq!(FrameKind::Close.as_u8(), 7);
+        assert_eq!(FrameKind::Nack.as_u8(), 8);
+        for byte in 5u8..=8 {
+            let kind = FrameKind::try_from(byte).expect("5..=8 are file operation kinds");
+            assert_eq!(kind.as_u8(), byte);
+        }
 
         assert_eq!(
             FrameKind::try_from(1u8).expect("1 is Write"),
@@ -776,10 +805,10 @@ mod tests {
         assert_ne!(FrameKind::Ack.as_u8(), FrameKind::FlushAck.as_u8());
     }
 
-    /// IO-1: 予約値 `0`・未知値 `5`・`0xFF` は `InvalidArgument` として拒否される。
+    /// IO-1: 予約値 `0`・未知値 `9`・`0xFF` は `InvalidArgument` として拒否される。
     #[test]
     fn io1_frame_kind_rejects_unknown_bytes() {
-        for byte in [0u8, 5, 0xFF] {
+        for byte in [0u8, 9, 0xFF] {
             let err = FrameKind::try_from(byte).expect_err("unknown byte must be rejected");
             assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         }
@@ -807,8 +836,8 @@ mod tests {
 
     /// IO-1・REPAIR-5: `to_bytes()` が
     /// `[version][kind][payload_len: LE][header_crc: LE]` のレイアウトになる
-    /// （version=1・kind=Write=1・payload_len=0x0102_0304 → LE で 04 03 02 01）。
-    /// `header_crc` は `crc32c([1, 1, 0x04, 0x03, 0x02, 0x01])` の LE 表現
+    /// （version=2・kind=Write=1・payload_len=0x0102_0304 → LE で 04 03 02 01）。
+    /// `header_crc` は `crc32c([2, 1, 0x04, 0x03, 0x02, 0x01])` の LE 表現
     /// （独立計算による golden 値。テスト自身が `header_crc` を再計算すると
     /// 実装のバグを見逃すため、実装から独立した固定値で照合する）。
     #[test]
@@ -817,7 +846,7 @@ mod tests {
             .expect("valid header must be constructed");
         assert_eq!(
             header.to_bytes(),
-            [0x01, 0x01, 0x04, 0x03, 0x02, 0x01, 0x52, 0x3a, 0x29, 0xc4]
+            [0x02, 0x01, 0x04, 0x03, 0x02, 0x01, 0x88, 0xf1, 0x95, 0xf0]
         );
     }
 
@@ -829,6 +858,10 @@ mod tests {
             FrameKind::Ack,
             FrameKind::Flush,
             FrameKind::FlushAck,
+            FrameKind::Create,
+            FrameKind::WriteFile,
+            FrameKind::Close,
+            FrameKind::Nack,
         ] {
             for len in [0u32, MAX_PAYLOAD_LEN] {
                 let header = FrameHeader::new(kind, len).expect("valid header");
@@ -928,6 +961,17 @@ mod tests {
         }
     }
 
+    /// IO-1・REPAIR-2・#3161: v1 のヘッダ（`header_crc` は正しい）は
+    /// `Unimplemented` になり、message に受信 `1` とこのビルドの `2` が含まれる。
+    #[test]
+    fn io1_v1_header_is_unimplemented() {
+        let bytes = raw_header(1, FrameKind::Write.as_u8(), 0);
+        let err = FrameHeader::from_bytes(bytes).expect_err("v1 header must be rejected");
+        assert_eq!(err.code(), IoErrorCode::Unimplemented);
+        assert!(err.message().contains("received 1"));
+        assert!(err.message().contains("supports 2"));
+    }
+
     /// IO-1・REPAIR-5: `header_crc` を正しく再計算した上で `version` だけを
     /// 不一致にすると `Unimplemented` になり、message に受信 `version` と
     /// このビルドの `PROTOCOL_VERSION` の両方が含まれる。
@@ -951,6 +995,10 @@ mod tests {
             FrameKind::Ack,
             FrameKind::Flush,
             FrameKind::FlushAck,
+            FrameKind::Create,
+            FrameKind::WriteFile,
+            FrameKind::Close,
+            FrameKind::Nack,
         ] {
             for payload in [Vec::new(), b"abc12".to_vec()] {
                 let frame = Frame::new(kind, payload.clone()).expect("Frame::new must succeed");
@@ -973,17 +1021,17 @@ mod tests {
         let frame = Frame::new(FrameKind::Write, b"abc".to_vec()).expect("Frame::new");
         let encoded = frame.encode();
 
-        // ヘッダ: version=1, kind=1(Write), payload_len=3(LE), header_crc(LE)
+        // ヘッダ: version=2, kind=1(Write), payload_len=3(LE), header_crc(LE)
         assert_eq!(
             &encoded[0..FRAME_HEADER_LEN],
-            &[1, 1, 3, 0, 0, 0, 0x06, 0xf1, 0x29, 0xe2]
+            &[2, 1, 3, 0, 0, 0, 0xdc, 0x3a, 0x95, 0xd6]
         );
         // ペイロード
         assert_eq!(&encoded[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 3], b"abc");
         // チェックサム: ヘッダの意味あるフィールド（6B: version‖kind‖payload_len。
         // `header_crc` は対象外。`Frame::compute_checksum` のドキュメンテーション
         // コメント〔CRC 残差性質〕参照） ‖ ペイロード(3B) に対する CRC-32C の LE 表現
-        assert_eq!(&encoded[FRAME_HEADER_LEN + 3..], &[0x59, 0x2a, 0xcd, 0xe8]);
+        assert_eq!(&encoded[FRAME_HEADER_LEN + 3..], &[0x70, 0x26, 0x62, 0xf1]);
         assert_eq!(encoded.len(), FRAME_HEADER_LEN + 3 + CHECKSUM_LEN);
     }
 

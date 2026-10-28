@@ -611,6 +611,10 @@ fn frame_kind_str(kind: FrameKind) -> &'static str {
         FrameKind::Ack => "ACK",
         FrameKind::Flush => "FLUSH",
         FrameKind::FlushAck => "FLUSH_ACK",
+        FrameKind::Create => "CREATE",
+        FrameKind::WriteFile => "WRITE_FILE",
+        FrameKind::Close => "CLOSE",
+        FrameKind::Nack => "NACK",
     }
 }
 

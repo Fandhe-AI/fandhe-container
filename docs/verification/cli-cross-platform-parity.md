@@ -282,6 +282,35 @@ CLI に `pull` は無いため、plugin-cri の `PullImage` で在庫を埋め�
 
 追従の遅延は、LF で終わる行について最大で 1 ポーリング間隔（200 ms）と読み出しの時間で、短縮はしない（`list_logs` module の doc）。世代数 1 の設定の追従は 9 / `UNAVAILABLE` で拒否する（本番は固定の 3 世代で到達しない）。
 
+## E 層: network（`network create`・`network rm`・`network ls`。#3066・NET-6・CLI-1）
+
+ユーザー定義ネットワークの定義管理。構文は 3 OS で同じ（オプションなし・位置引数のみ）。名前の検証（予約名 `none` / `host` / `bridge` / `default`、文字種、長さ）は OS の判定より前で、3 OS で `INVALID_ARGUMENT`（2）になる。Linux 以外は検証を通った後に `UNIMPLEMENTED`（8）を返し、状態ルートも作らない。本層は `scripts/cli-parity-check.sh` の自動収集の対象外で、手動で結果欄を記入する。挙動は `crates/cli/src/commands/network.rs` の単体試験と `crates/cli/tests/binary_entry.rs` の結合試験で機械照合している。
+
+### E 層の構文ケース（3 OS で 2 / `INVALID_ARGUMENT` を期待）
+
+| ID | 構文 | 期待 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | ---- | ---- | ----- | ----- | ------- | ---- | ---- |
+| E01 | `network`（サブコマンドなし） / `network bogus` | 2 / `INVALID_ARGUMENT` | | | | | |
+| E02 | `network create`（名前欠落） / `network create a b`（余剰） | 2 / `INVALID_ARGUMENT` | | | | | |
+| E03 | `network rm`（名前欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
+| E04 | `network ls x`（余剰） | 2 / `INVALID_ARGUMENT` | | | | | |
+| E05 | `network create --x a`（未知オプション） | 2 / `INVALID_ARGUMENT` | | | | | |
+| E06 | `network create none` / `network create Bad!` | 2 / `INVALID_ARGUMENT` | | | | | 予約名・文字種。状態ルートを作る前に拒否 |
+
+### E 層の挙動ケース（Linux の参考期待値。非 Linux は 8 / `UNIMPLEMENTED`）
+
+前提: 非 root・CLI の隣に特権ランチャーが無い rootless の構成。
+
+| ID | コマンド | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | -------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
+| E20 | `network ls`（空） | 0 / `NAME\tMODE\tSUBNET` のヘッダのみ | | 8 / `UNIMPLEMENTED` | 8 / `UNIMPLEMENTED` | | |
+| E21 | `network create n1` | 0 / stdout 空 | | 8 / `UNIMPLEMENTED` | 8 / `UNIMPLEMENTED` | | |
+| E22 | `network create n1`（重複） | 4 / `ALREADY_EXISTS` | | 8 / `UNIMPLEMENTED` | 8 / `UNIMPLEMENTED` | | |
+| E23 | `network ls` | 0 / ヘッダ + `n1\tpasta\t-` | | 8 / `UNIMPLEMENTED` | 8 / `UNIMPLEMENTED` | | |
+| E24 | `network rm n1` / もう一度 `network rm n1` | 0 / 3 `NOT_FOUND` | | 8 / `UNIMPLEMENTED` | 8 / `UNIMPLEMENTED` | | メンバーのあるネットワークは 5 / `FAILED_PRECONDITION` |
+
+rootful（root または信頼できる特権ランチャーが隣にある構成）の `network create` は、subnet の pool 予約（D13・#3207 のオーナー判断待ち）が決まるまで 8 / `UNIMPLEMENTED`。
+
 ## 差異のフィードバック先
 
 起票・追記は人間の承認後に行う（Agent は自動で起票しない）。

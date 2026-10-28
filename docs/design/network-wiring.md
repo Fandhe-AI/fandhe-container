@@ -349,7 +349,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 | 実装済み（PR #3195） |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
-| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 未実装 |
+| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 実装済み（rootful の create は D13 待ちで `UNIMPLEMENTED`） |
 | #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 未実装 |
 | #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 未実装 |
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |

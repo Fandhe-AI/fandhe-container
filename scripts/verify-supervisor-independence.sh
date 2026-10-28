@@ -40,7 +40,7 @@
 # 後始末の第 1 段: 既定（--check-restart なし・restart ポリシー no）では、生存している監視プロセス（対象を除く）へ
 # CLI の stop（制御チャネル経由。Linux で結線済み・#2059・#2142）を期限付きで送る。対象は SIGKILL 済みで制御チャネルの
 # 相手がいないため stop を呼ばず、記録した pid での回収に任せる。--check-restart では stop の SIGTERM が restart の対象に
-# なる（SUP-9・#2162 待ち）ため呼ばない。stop は SIGTERM のみ（猶予後の SIGKILL は #1545 で未実装）で、init が SIGTERM を
+# なる。SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施のため呼ばない。stop は SIGTERM のみ（猶予後の SIGKILL は #1545 で未実装）で、init が SIGTERM を
 # 捨てうるため、以降の同一性照合つき回収を fallback として必ず残す。stop の成否は後始末の成否に影響しない。
 # 計測の起点（対象への SIGKILL）は変えない。CLI の delete は呼ばない（委譲スコープ外では cgroup 検出に失敗する・#2133）。
 # 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
@@ -486,7 +486,7 @@ tracked_alive() {
 # チャネルの相手がいない）以外へ `fandhe-container stop <id>` を送り、監視プロセスの終了を待つ。stop は SIGTERM を
 # 渡すだけで猶予後の SIGKILL を持たず（#1545）、PID 1 の init が SIGTERM を捨てる場合もあるため、成否に関わらず
 # 後続の同一性照合つき SIGTERM／SIGKILL を fallback として必ず残す（失敗は後始末の失敗にしない）。--check-restart
-# （--restart always）では stop の SIGTERM が restart の対象になる（SUP-9・#2162 待ち）ため呼ばない。
+# （--restart always）では stop の SIGTERM が restart の対象になる。SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施のため呼ばない。
 # 呼び出しごと・段全体に期限を付ける（REPAIR-5）。各 stop の上限・強制終了猶予・終了待機はすべて段全体 deadline の
 # 残り時間で制限し、段全体（既定 30 秒）を超えない。引数は検証済みの id_prefix と連番から配列で組み、出力は捨てる。
 cli_stop_survivors() {

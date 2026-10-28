@@ -200,7 +200,22 @@ fn check_owner_mode_exec(uid: u32, mode: u32, euid: u32) -> Result<(), NetError>
 /// `path` は絶対パスのみ。検証を通ったときだけ [`PastaBinary`] を返す。副作用は `--version` の子の実行だけ。
 /// Linux 以外では `Unimplemented`。
 pub fn verify_pasta_binary(path: &Path) -> Result<PastaBinary, NetError> {
-    imp::verify(path, None)
+    imp::verify(path, None, None)
+}
+
+/// 識別の事前照合つきの検証（起動時の再検証用。[`super::record::PastaRecord::reverify`]）。
+///
+/// パスを辿って得た実体の正規パスと識別を `gate` で保存した記録と比べ、不一致なら `--version` を実行する前に
+/// `gate` の失敗を返す（差し替えの検出を版のエラーへ埋もれさせない。12.4・SEC-4）。
+pub(super) type IdentityGate<'a> = &'a dyn Fn(&Path, &PastaBinaryIdentity) -> Result<(), NetError>;
+
+/// [`verify_pasta_binary`] に `gate` を足したもの（`anchor` は試験専用の緩和）。
+pub(super) fn verify_gated(
+    path: &Path,
+    anchor: Option<&Path>,
+    gate: IdentityGate<'_>,
+) -> Result<PastaBinary, NetError> {
+    imp::verify(path, anchor, Some(gate))
 }
 
 /// opt-in の `PATH` 探索（12.5）。`path_env` は `PATH` の値（呼び出し側が `std::env::var_os("PATH")` を渡す）。
@@ -219,7 +234,7 @@ pub fn search_pasta_in_path(
 /// （feature `pasta-test-support` はリリースビルドで有効にできない。lib.rs）。
 #[cfg(any(test, feature = "pasta-test-support"))]
 pub fn verify_pasta_binary_below(anchor: &Path, path: &Path) -> Result<PastaBinary, NetError> {
-    imp::verify(path, Some(anchor))
+    imp::verify(path, Some(anchor), None)
 }
 
 /// 試験専用: [`search_pasta_in_path`] の `anchor` 版（[`verify_pasta_binary_below`] と同じ緩和）。
@@ -231,11 +246,32 @@ pub fn search_pasta_in_path_below(
     imp::search(path_env, Some(anchor))
 }
 
+/// パスの形の検査（相対・`.` / `..`・非 UTF-8・制御文字・長さ）。入口と readlink の結果の両方に課す。
+///
+/// OS 非依存（FCOPT1 の記録 [`super::record`] の復号も同じ規則を課す。二重に書かない）。
+pub(super) fn check_shape(path: &Path) -> Result<(), NetError> {
+    if path.as_os_str().len() > PASTA_PATH_MAX_BYTES {
+        return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_TOO_LONG));
+    }
+    let s = path
+        .to_str()
+        .ok_or_else(|| err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID))?;
+    let dot = s.split('/').skip(1).any(|c| c == "." || c == "..");
+    if !s.starts_with('/') || s.chars().any(char::is_control) || dot {
+        return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID));
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use super::*;
 
-    pub(super) fn verify(_path: &Path, _anchor: Option<&Path>) -> Result<PastaBinary, NetError> {
+    pub(super) fn verify(
+        _path: &Path,
+        _anchor: Option<&Path>,
+        _gate: Option<IdentityGate<'_>>,
+    ) -> Result<PastaBinary, NetError> {
         Err(err(NetErrorCode::Unimplemented, MSG_UNSUPPORTED_OS))
     }
 
@@ -282,21 +318,6 @@ mod imp {
         fd.try_clone()
             .and_then(|c| File::from(c).metadata())
             .map_err(|_| err(NetErrorCode::Internal, MSG_INTERNAL))
-    }
-
-    /// パスの形の検査（相対・`.` / `..`・非 UTF-8・制御文字・長さ）。入口と readlink の結果の両方に課す。
-    fn check_shape(path: &Path) -> Result<(), NetError> {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.len() > PASTA_PATH_MAX_BYTES {
-            return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_TOO_LONG));
-        }
-        let s = std::str::from_utf8(bytes)
-            .map_err(|_| err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID))?;
-        let dot = s.split('/').skip(1).any(|c| c == "." || c == "..");
-        if !s.starts_with('/') || s.chars().any(char::is_control) || dot {
-            return Err(err(NetErrorCode::InvalidArgument, MSG_PATH_INVALID));
-        }
-        Ok(())
     }
 
     struct Verified {
@@ -409,7 +430,11 @@ mod imp {
         })
     }
 
-    pub(super) fn verify(path: &Path, anchor: Option<&Path>) -> Result<PastaBinary, NetError> {
+    pub(super) fn verify(
+        path: &Path,
+        anchor: Option<&Path>,
+        gate: Option<IdentityGate<'_>>,
+    ) -> Result<PastaBinary, NetError> {
         check_shape(path)?;
         if let Some(a) = anchor
             && !path.starts_with(a)
@@ -418,6 +443,10 @@ mod imp {
         }
         let euid = sys::effective_uid();
         let first = verify_path(path, anchor, euid, true)?;
+        // 記録との識別の照合は子の実行より前に行う（不一致を版のエラーより先に固定の変更エラーで返す）。
+        if let Some(g) = gate {
+            g(&first.canonical, &identity_of(&first.meta))?;
+        }
         let version = run_version(&first.canonical)?;
         // 版を確かめた実体と記録する識別を結びつける: 取り直して一致しなければ差し替えとみなす。
         let again = verify_path(
@@ -452,7 +481,7 @@ mod imp {
             // 候補の選定だけに使う。判定は verify の fd 相対の検証で行う。
             match std::fs::symlink_metadata(&cand) {
                 Ok(_) => {
-                    let bin = verify(&cand, anchor)?;
+                    let bin = verify(&cand, anchor, None)?;
                     return Ok((bin, PastaPathSearchWarning { path: cand }));
                 }
                 Err(e)

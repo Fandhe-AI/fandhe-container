@@ -3355,3 +3355,174 @@ fn core5_doctor_reports_landlock_line() {
         "{line}"
     );
 }
+/// `--pasta-path` / `--pasta-path-search` の拒否の分類を実バイナリで照合する（NET-9・CLI-1・PLUG-11・#3199）。
+///
+/// 結果の stderr の 1 行 JSON から `code` と `message` を取り出し、状態ルートが作られていないことも確かめる。
+mod pasta_flags {
+    use super::*;
+
+    const NOT_CREATE: &str =
+        "--pasta-path and --pasta-path-search apply only to the create command";
+    const NOT_APPLICABLE: &str = "--pasta-path and --pasta-path-search apply only to a user-defined network on a rootless install";
+
+    fn assert_rejected(out: &Output, code: &str, message: &str) {
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            err.contains(&format!("\"code\":\"{code}\"")),
+            "unexpected stderr: {err}"
+        );
+        assert!(
+            err.contains(&format!("\"message\":\"{message}\"")),
+            "unexpected stderr: {err}"
+        );
+        assert!(out.stdout.is_empty(), "stdout must be empty");
+    }
+
+    /// create 以外のサブコマンドに pasta のフラグがあれば、専用の文言で `INVALID_ARGUMENT`（終了コード 2）。
+    #[test]
+    fn net9_cli1_pasta_flags_rejected_outside_create() {
+        for args in [
+            &["--pasta-path", "/usr/bin/pasta", "list"][..],
+            &["--pasta-path-search", "setup"],
+            &["--pasta-path-search", "doctor"],
+            &[
+                "--root",
+                "/x",
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "start",
+                "c1",
+            ],
+        ] {
+            let out = run(args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert_rejected(&out, "INVALID_ARGUMENT", NOT_CREATE);
+        }
+    }
+
+    /// 重複・併用・値の欠落は使い方エラー。
+    #[test]
+    fn net9_cli1_pasta_flags_usage_errors() {
+        for args in [
+            &["--pasta-path", "/a", "--pasta-path-search", "list"][..],
+            &["--pasta-path-search", "--pasta-path-search", "list"],
+            &["--pasta-path", "/a", "--pasta-path", "/b", "list"],
+            &["--pasta-path"],
+        ] {
+            let out = run(args);
+            assert_failure(&out, 2, USAGE_JSON);
+        }
+    }
+
+    /// ユーザー定義名でない create に pasta のフラグがあれば `INVALID_ARGUMENT`。状態ルートは作らない。
+    #[test]
+    fn net9_cli1_pasta_flag_with_non_user_defined_network_is_rejected() {
+        let tmp = TmpDir::new("pasta-none");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        for network in [&["--network", "none"][..], &["--network", "host"], &[]] {
+            let mut args = vec![
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+            ];
+            args.extend_from_slice(network);
+            args.push("c1");
+            let out = run(&args);
+            assert_eq!(out.status.code(), Some(2), "{network:?}");
+            assert_rejected(&out, "INVALID_ARGUMENT", NOT_APPLICABLE);
+            assert!(!root.exists(), "state root must not be created");
+        }
+    }
+
+    /// rootless（隣にランチャーが無い）のユーザー定義名: フラグなしは `FAILED_PRECONDITION`、
+    /// 不正・不在のパスは net の分類のまま。いずれも `UNIMPLEMENTED` より前で、状態ルートを作らない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_cli1_pasta_rootless_named_network_classification() {
+        let tmp = TmpDir::new("pasta-named");
+        let cli = isolated_cli_dir("pasta-named").join("fandhe-container");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        let create = |extra: &[&str]| {
+            let mut args = vec!["--root", root_s];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ]);
+            run_isolated(&cli, &args)
+        };
+        let out = create(&[]);
+        assert_rejected(&out, "FAILED_PRECONDITION", "pasta path is not configured");
+        let out = create(&["--pasta-path", "relative/pasta"]);
+        assert_rejected(
+            &out,
+            "INVALID_ARGUMENT",
+            "pasta path must be an absolute UTF-8 path without control characters or dot components",
+        );
+        let out = create(&["--pasta-path", "/nonexistent-dir/pasta"]);
+        assert_rejected(&out, "NOT_FOUND", "pasta binary was not found");
+        assert!(!root.exists(), "state root must not be created");
+    }
+
+    /// 隣に信頼できないランチャーがあれば、直接経路へ落とさず `FAILED_PRECONDITION`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_sup14_pasta_untrusted_launcher_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("pasta-untrusted");
+        let dir = isolated_cli_dir("pasta-untrusted");
+        let launcher = dir.join("fandhe-container-launcher");
+        std::fs::write(&launcher, b"#!/bin/sh\nexit 0\n").expect("launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        let out = run_isolated(
+            &dir.join("fandhe-container"),
+            &[
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ],
+        );
+        assert_rejected(
+            &out,
+            "FAILED_PRECONDITION",
+            "privileged launcher is not a trusted executable (must be a regular file owned by root or the current user, not writable by group or others)",
+        );
+        assert!(!root.exists(), "state root must not be created");
+    }
+
+    /// Linux 以外ではユーザー定義名 + フラグは net の固定文言で `UNIMPLEMENTED`。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn net9_cli1_pasta_flag_is_unimplemented_off_linux() {
+        let out = run(&[
+            "--pasta-path",
+            "/usr/bin/pasta",
+            "create",
+            "--bundle",
+            "/nonexistent-bundle",
+            "--network",
+            "web",
+            "c1",
+        ]);
+        assert_rejected(&out, "UNIMPLEMENTED", "pasta is only supported on Linux");
+    }
+}

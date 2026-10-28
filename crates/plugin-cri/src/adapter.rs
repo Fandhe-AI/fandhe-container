@@ -96,6 +96,11 @@ use fandhe_container_cri::image_service::{ImageStore, InMemoryImageStore};
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 #[cfg(unix)]
+use fandhe_container_cri::runtime_service::{
+    FileRecordStore, RecordStore, RecordStoreOp, RecordStoreOpRecorder, RecordStoreOpSample,
+    RecordStoreOutcome,
+};
+#[cfg(unix)]
 use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
 #[cfg(unix)]
 use fandhe_container_oci::registry::RegistryClientConfig;
@@ -349,6 +354,32 @@ impl CriPluginBackends {
         Arc::new(CoreOciRecorder(Arc::clone(&self.oci_recorder)))
     }
 
+    /// 本番の記録ストア（`<状態ルート>/.cri/records`）を開く（R9 #2938。CRI-1・OCI-7・CORE-1）。
+    ///
+    /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。インスタンスロックの取得後に
+    /// 呼ぶ（`production_inner` の後。受付の前）。操作の統計は `cri.record_store.{put,remove,list}` として共有記録器へ流す。
+    #[cfg(unix)]
+    pub fn production_record_store(&self) -> Result<Arc<FileRecordStore>, CriError> {
+        match &self.state_root {
+            Some(root) => Ok(Arc::new(FileRecordStore::open(root)?.with_recorder(
+                Arc::new(CoreRecordStoreRecorder(Arc::clone(&self.recorder))),
+            ))),
+            None => Err(CriError::failed_precondition(
+                "state root is not configured",
+            )),
+        }
+    }
+
+    /// [`Self::runtime_service`] に記録ストアを注入したもの（R9 #2938。書く・消す時点と再採用が有効になる）。
+    #[cfg(unix)]
+    pub fn runtime_service_with_record_store(
+        &self,
+        bundles: Arc<dyn BundleProvider>,
+        records: Arc<dyn RecordStore>,
+    ) -> CriRuntimeService {
+        self.runtime_service(bundles).with_record_store(records)
+    }
+
     /// 実行層を接続した `CriRuntimeService` を作る。サーブは `server::serve` が担う（#849）。
     ///
     /// CRI 側の計測は共有記録器（[`Self::op_recorder`]）へ `cri.*` の操作名で記録する。
@@ -475,6 +506,17 @@ pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) ->
 /// 起動時の pull 回収 GC の全体の期限（#2819・REPAIR-5）。超えたら起動しない（取り残した worker が `@lock` を握ったまま受け付けないため）。
 #[cfg(unix)]
 pub const STARTUP_PULL_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// 起動時の記録の再採用（sandbox・コンテナ・stale create・孤児 bundle の 4 段）の全体の期限（R9 #2938・REPAIR-5）。
+///
+/// 1 件の期限は 10 秒（containerd の 10 秒/件を参考にした値）、4 段で全体の残りを分け合う。超えたら起動しない
+/// （registry は空のまま）。起動の最悪時間は [`STARTUP_PULL_RECOVERY_BUDGET`]（60 秒）+ 本予算（120 秒）。
+#[cfg(unix)]
+pub const STARTUP_RECORD_READOPTION_BUDGET: fandhe_container_cri::runtime_service::ListBudget =
+    fandhe_container_cri::runtime_service::ListBudget {
+        per_record: Duration::from_secs(10),
+        total: Duration::from_secs(120),
+    };
 
 /// 起動時の pull 回収 GC の結果の件数（パス・pull ID は含めない。REPAIR-4）。
 #[cfg(unix)]
@@ -780,6 +822,33 @@ impl CriOpRecorder for CoreCriRecorder {
             let _ = self
                 .pull
                 .record(&name, OpOutcome::Failure, sample.latency());
+        }
+    }
+}
+
+/// 記録ストアの操作の計測結果を共有 `OpRecorder` へ流す橋渡し（R9 #2938・REPAIR-4）。
+///
+/// 操作名は `cri.record_store.{put,remove,list}` の 3 種に固定し、結果は Success / Failure に縮約する
+/// （`MAX_TRACKED_OPS` の枠を結果区分・種別で増やさないため）。未知の操作は記録しない。記録の失敗は無視する。
+#[cfg(unix)]
+struct CoreRecordStoreRecorder(Arc<OpRecorder>);
+
+#[cfg(unix)]
+impl RecordStoreOpRecorder for CoreRecordStoreRecorder {
+    fn record_store_op(&self, sample: &RecordStoreOpSample) {
+        let name = match sample.op {
+            RecordStoreOp::Put => "cri.record_store.put",
+            RecordStoreOp::Remove => "cri.record_store.remove",
+            RecordStoreOp::List => "cri.record_store.list",
+            _ => return,
+        };
+        let outcome = if sample.outcome == RecordStoreOutcome::Ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        if let Ok(name) = OpName::new(name) {
+            let _ = self.0.record(&name, outcome, sample.latency);
         }
     }
 }
@@ -1802,7 +1871,7 @@ mod tests {
         use fandhe_container_cri::instrument::RegistryHttpClass;
         const {
             assert!(
-                22 + RegistryHttpClass::ALL.len()
+                (22 + 3) + RegistryHttpClass::ALL.len()
                     <= fandhe_container_core::observability::MAX_TRACKED_OPS
             )
         };
@@ -1868,6 +1937,47 @@ mod tests {
             (OciOpKind::RecoverPendingDeletion, "oci.image.gc_recover"),
             (OciOpKind::RecoverStalePulls, "oci.pull.gc_recover"),
         ]
+    }
+
+    /// REPAIR-4・CRI-1（#2938）: 記録ストアの操作は `cri.record_store.{put,remove,list}` の 3 名へ成功 / 失敗で計上される。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_2938_record_store_ops_reach_shared_recorder() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-plugin-cri-rsrec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let recorder = Arc::new(OpRecorder::new());
+        let store = FileRecordStore::open(&dir)
+            .expect("open")
+            .with_recorder(Arc::new(CoreRecordStoreRecorder(Arc::clone(&recorder))));
+        let kind = fandhe_container_cri::runtime_service::RecordKind::Sandbox;
+        let id = fandhe_container_cri::runtime_service::RecordId::new(&"a".repeat(64)).unwrap();
+        store.put(kind, &id, b"x").expect("put");
+        store
+            .list(
+                kind,
+                fandhe_container_cri::runtime_service::ListBudget::default(),
+                fandhe_container_cri::runtime_service::ListLimits::for_kind(kind),
+            )
+            .expect("list");
+        store.remove(kind, &id).expect("remove");
+        let get = |n: &str| {
+            recorder
+                .snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get("cri.record_store.put"), Some((1, 0)));
+        assert_eq!(get("cri.record_store.list"), Some((1, 0)));
+        assert_eq!(get("cri.record_store.remove"), Some((1, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-4・OCI-1: 写像の名前は 22 種で重複なく、`as_str` と一致し、`OpName` として有効で、記録器の枠に収まる。

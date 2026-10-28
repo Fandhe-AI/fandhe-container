@@ -8,6 +8,10 @@
 //! Linux では peer 認証の拒否と、create の `mounts[].destination` の拒否（#2594）を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
 //! 起動時に `<状態ルート>/.cri/@instance.lock` を期限つきで排他ロックし、取れなければ `TIMEOUT` の固定文言で起動しない（二重起動の拒否。#2931・CRI-2・CORE-1）。
 //! 次に `<状態ルート>/.cri/images` の残り pull を回収してから受け付ける（`recover_stale_image_pulls`。失敗・期限超過は起動しない。#2819・OCI-7）。
+//! 続けて記録ストア（`<状態ルート>/.cri/records`）を開いて `CriRuntimeService` へ注入し、受付の前に 1 回だけ記録を再採用する
+//! （sandbox → コンテナと core の照合 → 作成途中の取り残しの解放 → 孤児 bundle の回収。`CriPluginBackends::readopt_records`。#2938・CRI-1・CRI-2・CORE-1）。
+//! 列挙の失敗・件数または保持量の上限超過・期限切れは `error: <CODE>: failed to readopt cri records` で起動しない。壊れた記録は消さず数えるだけで起動は止めない。
+//! 何かを再採用・回収したときだけ、固定語彙の要約 1 行を stderr へ出す（初回起動は静か）。
 //! SIGTERM の正常停止は未実装（SIGKILL で止まる。`server` の未実装の注記を参照）。
 //!
 //! 終了コード: 0 = `--help`、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
@@ -102,6 +106,17 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    // 記録ストア（`<状態ルート>/.cri/records`）。インスタンスロックの取得後・受付の前に開く（CRI-1・CRI-2・#2938）。
+    let records = match backends.production_record_store() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "error: {}: failed to prepare the record store",
+                e.code().as_str()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     // ImageService（PullImage と create のタグ解決で同じ在庫・キャッシュ設定を共有。#2592）。fail-closed:
     // レジストリクライアントを作れなければ起動しない（固定文言のコードだけ出す）。
     let images = match backends.image_service() {
@@ -136,7 +151,34 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             );
         }
     }
-    let svc = backends.runtime_service(bundles);
+    // 記録ストアを注入した CRI サービスを組み、受付の前に 1 回だけ記録を再採用する（CRI-1・CRI-2・CORE-1・#2938）。
+    // 列挙の失敗・上限超過・期限切れは fail-closed で起動しない（壊れた記録は数えるだけで止めない）。
+    let svc = backends.runtime_service_with_record_store(
+        std::sync::Arc::clone(&bundles)
+            as std::sync::Arc<dyn fandhe_container_cri::adapter::BundleProvider>,
+        std::sync::Arc::clone(&records)
+            as std::sync::Arc<dyn fandhe_container_cri::runtime_service::RecordStore>,
+    );
+    match backends.readopt_records(
+        &svc,
+        &bundles,
+        &*records,
+        adapter::STARTUP_RECORD_READOPTION_BUDGET,
+    ) {
+        Ok(report) => {
+            // 何も無かった（初回起動・空の置き場）ときは出さない。起動の失敗時の stderr を静かに保つ。
+            if !report.is_empty() {
+                let _ = telemetry::stderr_sink().submit(report.summary_line());
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "error: {}: failed to readopt cri records",
+                e.code().as_str()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    }
     // 1 リクエストの待ち上限は PullImage・StartContainer が収まる値に引き上げる（既定 10 秒では途中で切れる。REPAIR-5）。
     let grpc_config = match GrpcServerConfig::new().with_request_timeout(PLUGIN_REQUEST_TIMEOUT) {
         Ok(c) => c,

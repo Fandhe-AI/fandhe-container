@@ -3,7 +3,7 @@
 //!
 //! 役割: plugin-cri の再起動で失われた `SandboxRegistry` を、記録ストア（`with_record_store` で注入）の
 //! sandbox 記録から復元する。呼び出し元は plugin-cri の `serve` が受付を始める前に 1 回だけ呼ぶ想定
-//! （本番の配線と stderr への要約行の出力は R9 #2938）。呼び先は [`RecordStore::list`] と `record` の
+//! （本番の配線と stderr への要約行の出力は plugin-cri の `serve`。R9 #2938。実装済み）。呼び先は [`RecordStore::list`] と `record` の
 //! 厳密な復号だけで、実行層・`PodNetworkProvider` は呼ばない。
 //!
 //! 契約:
@@ -65,11 +65,11 @@
 //! - 孤児 bundle（CRI 記録が無く core にも無い `.cri/bundles/<id>`）の回収は、インスタンスロックの型が要るため plugin-cri の
 //!   `orphan_bundles`。core の照会の写し方は [`probe_core_presence`] を共有する。
 //!
-//! 呼び出し順（R9 #2938 が受付の開始前に配線する）: `readopt_sandboxes` → `readopt_containers` → `release_stale_creates`
+//! 呼び出し順（R9 #2938 が plugin-cri の `serve` で受付の開始前に配線済み）: `readopt_sandboxes` → `readopt_containers` → `release_stale_creates`
 //! → 孤児 bundle の回収。解放に失敗した `stale_create` の記録が残る間はその bundle が孤児扱いにならないため、この順が要る。
 //!
 //! 未実装（REPAIR-3）: 保持役の素性による pending の解決は R11 #2940、`pod_netns`・provider 識別子の永続と再起動後の
-//! `tear_down` は R12 #2941、本番の配線は R9 #2938、手動回収の手順は R10 #2939。
+//! `tear_down` は R12 #2941、手動回収の手順は R10 #2939。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -133,7 +133,7 @@ pub struct SandboxReadoption {
 }
 
 impl SandboxReadoption {
-    /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は R9 #2938 が行う。
+    /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は plugin-cri の `serve`（R9 #2938）が行う。
     pub fn summary_line(&self) -> String {
         format!(
             "cri record readoption: kind=sandbox adopted={} pending_unresolved={} broken={} malformed={} not_regular_file={} too_long={} unreadable={} unrecognized={} duplicate_metadata={}",
@@ -177,7 +177,7 @@ impl ContainerReadoption {
         &self.stale_create_ids
     }
 
-    /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は R9 #2938 が行う。
+    /// 固定語彙の 1 行要約（ID・パス・config を含めない）。stderr への出力は plugin-cri の `serve`（R9 #2938）が行う。
     pub fn summary_line(&self) -> String {
         format!(
             "cri record readoption: kind=container adopted={} present={} absent_exited={} remove_pending={} undetermined={} stale_create={} broken={} malformed={} not_regular_file={} too_long={} unreadable={} unrecognized={} duplicate_metadata={} parentless={}",
@@ -247,7 +247,7 @@ pub struct StaleCreateRelease {
 }
 
 impl StaleCreateRelease {
-    /// 固定語彙の 1 行要約（ID・パスを含めない）。stderr への出力は R9 #2938 が行う。
+    /// 固定語彙の 1 行要約（ID・パスを含めない）。stderr への出力は plugin-cri の `serve`（R9 #2938）が行う。
     pub fn summary_line(&self) -> String {
         format!(
             "cri stale create release: released={} kept={} release_failed={} record_remove_failed={} not_attempted={} skipped={}",

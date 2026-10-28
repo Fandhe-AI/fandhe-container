@@ -426,7 +426,10 @@ impl StderrCapture {
         }
         // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
         reader.set_nonblocking(true)?;
-        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(io::pipe)?;
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(
+            Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+            io::pipe,
+        )?;
         let mut capture = Self::start(
             PolledStderr {
                 sock: reader,
@@ -574,7 +577,10 @@ type StderrReader = io::Empty;
 fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
     // macOS の std は close-on-exec を作成後に別 syscall で立てるため、並行する spawn と排他にする
     // （`spawn_gate`。PLUG-7・SEC-1・#3139）。
-    let (reader, writer) = crate::spawn_gate::create_fds(std::os::unix::net::UnixStream::pair)?;
+    let (reader, writer) = crate::spawn_gate::create_fds(
+        Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+        std::os::unix::net::UnixStream::pair,
+    )?;
     // 相手が健在なうちに期限を設定する（macOS は相手切断後の設定が EINVAL になる）。
     reader.set_read_timeout(Some(STDERR_READ_POLL))?;
     Ok((Stdio::from(std::os::fd::OwnedFd::from(writer)), reader))
@@ -1191,6 +1197,10 @@ fn spawn_error(e: &io::Error) -> PluginError {
             PluginErrorCode::PermissionDenied,
             "permission denied spawning plugin program",
         ),
+        io::ErrorKind::TimedOut => (
+            PluginErrorCode::Timeout,
+            "timed out waiting to spawn plugin program",
+        ),
         _ => (
             PluginErrorCode::Unavailable,
             "failed to spawn plugin program",
@@ -1496,7 +1506,8 @@ fn spawn_registered(
     }
     // 非原子の fd 生成と排他で spawn する（`spawn_gate`。PLUG-7・SEC-1・#3139）。非 unix は fd を作らない。
     #[cfg(unix)]
-    let spawned = crate::spawn_gate::spawn(cmd);
+    let spawned =
+        crate::spawn_gate::spawn(Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT, cmd);
     #[cfg(not(unix))]
     let spawned = cmd.spawn();
     let child = spawned.map_err(|e| spawn_error(&e))?;

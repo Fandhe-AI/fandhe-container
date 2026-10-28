@@ -561,6 +561,7 @@ fn map_bind_error(kind: io::ErrorKind) -> PluginError {
             "socket parent directory does not exist",
         ),
         io::ErrorKind::InvalidInput => (PluginErrorCode::InvalidArgument, "invalid socket path"),
+        io::ErrorKind::TimedOut => (PluginErrorCode::Timeout, "timed out waiting to bind socket"),
         _ => (PluginErrorCode::Internal, "failed to bind socket"),
     };
     PluginError::new(code, message)
@@ -774,8 +775,11 @@ mod imp {
             crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
             // macOS の std は socket の close-on-exec を作成後に立てるため、並行する spawn と排他にする
             // （別 plugin の子へ listener が漏れない。`spawn_gate`。PLUG-12・SEC-1・#3139）。
-            let listener = crate::spawn_gate::create_fds(|| UnixListener::bind(&target))
-                .map_err(|e| map_bind_error(e.kind()))?;
+            let listener = crate::spawn_gate::create_fds(
+                Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+                || UnixListener::bind(&target),
+            )
+            .map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name).ok();
             let inner = Self {
@@ -990,7 +994,7 @@ mod imp {
             let mut continued: u32 = 0;
             loop {
                 // listener は非ブロッキング（1 回の accept で戻る）ため、ゲートを長く持たない。
-                match crate::spawn_gate::create_fds(|| self.listener.accept()) {
+                match crate::spawn_gate::create_fds(deadline, || self.listener.accept()) {
                     Ok((stream, _)) => {
                         // 期限後に到着した接続は受理せず閉じて Timeout を返す（REPAIR-5。
                         // 期限直前のポーリング後のスリープ中に到着した接続が成功する経路を塞ぐ）。
@@ -1103,6 +1107,7 @@ mod imp {
                             io::ErrorKind::WouldBlock
                                 | io::ErrorKind::Interrupted
                                 | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::TimedOut
                         ) =>
                     {
                         let now = Instant::now();

@@ -147,7 +147,10 @@ use container::{
 use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
 
-pub use readopt::{BrokenRecordCounts, ContainerReadoption, SandboxReadoption};
+pub use readopt::{
+    BrokenRecordCounts, ContainerReadoption, CorePresence, SandboxReadoption, StaleCreateRelease,
+    probe_core_presence,
+};
 #[cfg(unix)]
 pub use record_store::FileRecordStore;
 pub use record_store::{
@@ -3127,23 +3130,27 @@ impl CriRuntimeService {
             let Some(record) = registry.containers.get_mut(&req.container_id) else {
                 return Ok(v1::RemoveContainerResponse {});
             };
-            if !record.runtime_owned {
-                drop(registry);
-                return self.remove_container_impl(req);
-            }
             if record.in_flight {
                 return Err(CriError::failed_precondition(
                     "container operation in progress",
                 ));
             }
+            // 実行層接続時に `runtime_owned=false` の記録が生じるのは、再採用した「確定 × core に無い」だけ
+            // （R7 #2936。Create の巻き戻しは記録を消すか `runtime_owned=true` にする）。core の資源が無いため
+            // `delete` は呼ばず、bundle の解放と記録ファイルの削除だけを行う（R8 #2937・OCI-7・CRI-1）。
+            let call_core = record.runtime_owned;
             record.in_flight = true;
-            InFlightGuard::new(
-                Arc::clone(&self.registry),
-                req.container_id.clone(),
-                InFlightKind::Remove,
+            (
+                InFlightGuard::new(
+                    Arc::clone(&self.registry),
+                    req.container_id.clone(),
+                    InFlightKind::Remove,
+                ),
+                call_core,
             )
         };
-        self.runtime_remove_one(binding, guard).await?;
+        let (guard, call_core) = guard;
+        self.runtime_remove_one(binding, guard, call_core).await?;
         Ok(v1::RemoveContainerResponse {})
     }
 
@@ -3158,10 +3165,15 @@ impl CriRuntimeService {
     /// 件数の上限で抑えられているが、時間の定数の上限は無い。RPC の応答は `run_bounded` が `runtime_timeout` で打ち切り、
     /// worker は取り消されず走り続ける（記録は `in_flight` のままで、再試行は worker が終わるまで `FAILED_PRECONDITION`）。
     /// 設計と kubelet の `--runtime-request-timeout` との関係は `docs/design/container-log-removal-wait.md`。
+    ///
+    /// `call_core` が偽（再採用した `runtime_owned=false` の記録。core に資源が無いと照合済み。R8 #2937）のときは
+    /// `delete` を呼ばず `mark_dispatched` もせず、bundle の解放 → 記録ファイルの削除 → 確定だけを行う。
+    /// 解放も記録の削除も不在は成功の冪等な操作で、失敗時は exited で保持して再試行できる。
     async fn runtime_remove_one(
         &self,
         binding: &RuntimeBinding,
         mut guard: InFlightGuard,
+        call_core: bool,
     ) -> Result<(), CriError> {
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
@@ -3169,15 +3181,17 @@ impl CriRuntimeService {
         let record_store = self.record_store.clone();
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             guard.arm_record_store(record_store);
-            guard.mark_dispatched();
-            match adapter.remove(&id, true) {
-                Ok(_) => {}
-                Err(status) if status.code() == CriErrorCode::NotFound => {}
-                Err(status) => {
-                    if is_definite_failure(status.code()) {
-                        guard.mark_definitely_failed();
+            if call_core {
+                guard.mark_dispatched();
+                match adapter.remove(&id, true) {
+                    Ok(_) => {}
+                    Err(status) if status.code() == CriErrorCode::NotFound => {}
+                    Err(status) => {
+                        if is_definite_failure(status.code()) {
+                            guard.mark_definitely_failed();
+                        }
+                        return Err(status);
                     }
-                    return Err(status);
                 }
             }
             // 実行層の資源は無い。bundle の解放に失敗したら記録を保持して再試行できるようにする。
@@ -3296,8 +3310,9 @@ impl CriRuntimeService {
 
     /// 実行層接続時の `RemovePodSandbox`（TASK-59.3・CRI-2）。
     ///
-    /// 配下に実行中の操作があれば拒否する。実行層の資源を持つ配下のコンテナを 1 件ずつ `delete(force)` と
-    /// bundle の解放で回収し、全件が成功したときだけ sandbox と残りの記録を除去する。1 件でも失敗したら
+    /// 配下に実行中の操作があれば拒否する。配下のコンテナを 1 件ずつ回収する（実行層の資源を持つものは
+    /// `delete(force)` と bundle の解放、再採用した `runtime_owned=false` のものは core を呼ばず bundle の解放と
+    /// 記録ファイルの削除だけ。R8 #2937）。全件が成功したときだけ sandbox と残りの記録を除去する。1 件でも失敗したら
     /// sandbox と未回収の記録を保持して最初のエラーを返す（成功した分は個別に解放済み）。
     async fn remove_sandbox_runtime(
         &self,
@@ -3307,7 +3322,7 @@ impl CriRuntimeService {
         if req.pod_sandbox_id.is_empty() {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
-        let mut pending = {
+        let pending = {
             let mut registry = self
                 .registry
                 .lock()
@@ -3329,19 +3344,26 @@ impl CriRuntimeService {
                 record.state = SandboxState::NotReady;
             }
             let mut ids = Vec::new();
+            // core を呼ばない配下（再採用した `runtime_owned=false`）。bundle と記録ファイルだけ回収する（R8 #2937）。
+            let mut no_core: HashSet<String> = HashSet::new();
             for (id, c) in registry
                 .containers
                 .iter_mut()
-                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_owned)
+                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id)
             {
                 c.in_flight = true;
                 ids.push(id.clone());
+                if !c.runtime_owned {
+                    no_core.insert(id.clone());
+                }
             }
-            PendingMarks::new(Arc::clone(&self.registry), ids)
+            (PendingMarks::new(Arc::clone(&self.registry), ids), no_core)
         };
+        let (mut pending, no_core) = pending;
         let mut first_error = None;
         while let Some(guard) = pending.next_guard(InFlightKind::Remove) {
-            if let Err(status) = self.runtime_remove_one(binding, guard).await {
+            let call_core = !no_core.contains(&guard.id);
+            if let Err(status) = self.runtime_remove_one(binding, guard, call_core).await {
                 first_error.get_or_insert(status);
             }
         }

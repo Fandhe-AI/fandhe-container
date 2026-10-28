@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-use fandhe_container_cri::adapter::BundleRequest;
+use fandhe_container_cri::adapter::{BundleProvider as _, BundleRequest};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
     ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig,

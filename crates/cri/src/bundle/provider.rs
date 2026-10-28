@@ -113,6 +113,18 @@ pub trait RootfsSource: Send + Sync {
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
 }
 
+/// `SpecBundleProvider::list_bundle_ids` の結果（R8 #2937）。ID 以外は件数のみ。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct BundleListing {
+    /// サービス採番の形のディレクトリ名（昇順）。
+    pub ids: Vec<String>,
+    /// サービス採番の形でない名前（触らない）。
+    pub skipped_unrecognized: usize,
+    /// 採番の形だがディレクトリでない（symlink・通常ファイル等。触らない）。
+    pub skipped_not_dir: usize,
+}
+
 /// `<root>/<container_id>/{config.json,rootfs/}` を作る [`BundleProvider`]。
 pub struct SpecBundleProvider {
     root: PathBuf,
@@ -211,6 +223,51 @@ impl SpecBundleProvider {
             }
         }
         Ok(())
+    }
+
+    /// bundle の置き場 `root` 直下の ID を列挙する（孤児 bundle の回収の候補作り。R8 #2937・OCI-7・CRI-1）。
+    ///
+    /// plugin-cri の `reclaim_orphan_bundles`（インスタンスロックの下）が呼ぶ。列挙の前に `verify_root` で
+    /// root の (dev, ino) を確かめ、各エントリは `symlink_metadata` だけで判定する（symlink は辿らない）。サービス採番の
+    /// ID（64 文字の小文字 16 進。`RecordId` と同じ形）でない名前は [`BundleListing::skipped_unrecognized`]、
+    /// ディレクトリでないもの（symlink・通常ファイル等）は [`BundleListing::skipped_not_dir`] に数え、どちらも
+    /// 触らない。走査数が `max_entries` を超えたら何も返さず `FAILED_PRECONDITION`（無制限確保の防止）。
+    /// ID は昇順。パス・OS のエラー文字列は文言に含めない（REPAIR-4）。
+    #[cfg(unix)]
+    pub fn list_bundle_ids(&self, max_entries: usize) -> Result<BundleListing, CriError> {
+        self.verify_root()?;
+        let entries = fs::read_dir(&self.root)
+            .map_err(|_| CriError::internal("failed to list bundle root"))?;
+        let mut listing = BundleListing::default();
+        for (scanned, entry) in entries.enumerate() {
+            if scanned >= max_entries {
+                return Err(CriError::failed_precondition(
+                    "bundle root has too many entries",
+                ));
+            }
+            let entry = entry.map_err(|_| CriError::internal("failed to list bundle root"))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                listing.skipped_unrecognized += 1;
+                continue;
+            };
+            if crate::runtime_service::RecordId::new(name).is_err() {
+                listing.skipped_unrecognized += 1;
+                continue;
+            }
+            let is_dir = fs::symlink_metadata(entry.path())
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                listing.ids.push(name.to_owned());
+            } else {
+                listing.skipped_not_dir += 1;
+            }
+        }
+        // 列挙の途中で root が差し替わっていないことを再確認する。
+        self.verify_root()?;
+        listing.ids.sort();
+        Ok(listing)
     }
 
     fn lock_refused(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {

@@ -19,6 +19,8 @@
 pub mod adapter;
 pub mod instance_lock;
 pub mod netsetup;
+#[cfg(unix)]
+pub mod orphan_bundles;
 pub mod pod_network;
 #[cfg(unix)]
 pub mod server;

@@ -175,6 +175,14 @@ name = "netns_holder_process"
 path = "tests/netns_holder_process.rs"
 harness = false
 
+# pasta の起動・準備完了の待ち・タイムアウト・途中死の検出・段階を上げた停止と回収・PDEATHSIG の非特権結合試験
+# （NET-9・REPAIR-5・ERR-1・#1938）。自身を偽の pasta として再実行する（第 1 引数 `-f`）ため harness = false。
+# root 不要・pasta 不要で、Linux 以外は Unimplemented と純関数だけを照合する。既定の集合で実行する。
+[[test]]
+name = "pasta_process"
+path = "tests/pasta_process.rs"
+harness = false
+
 # 非特権 user + network namespace（`unshare --user --map-root-user --net`）へ holder が実際に参加し、capability を落とし、
 # 同じ uid の別プロセスが `/proc/<holder>/ns/*` を開けること（pasta の前提。12.2）を照合する実機前提テスト
 # （NET-9・CORE-6・SEC-5・REPAIR-5・#3197）。子の再入のため harness = false。非特権 user namespace が要るため

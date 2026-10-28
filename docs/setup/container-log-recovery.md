@@ -1,8 +1,10 @@
-# 残ったコンテナログの見分け方と手動削除（SUP-7・CLI-1・REPAIR-4・REPAIR-5）
+# 残ったコンテナログ・supervisor ログの見分け方と手動削除（SUP-7・CRI-2・CLI-1・REPAIR-4・REPAIR-5）
 
 `delete` の後にコンテナログ（`<state_root>/@container-logs/<encoded-id>.log`・`.log.<n>`・`.log.lock`）が残ることがある。
 supervisor が `terminate` の既定（5 秒）を超えて sink を閉じなかったときで、delete 自体は成功のまま終わる
 （`docs/design/container-log-removal-wait.md`・#2698）。
+supervisor の構造化ログ（`<state_root>/@supervisor-logs/<encoded-id>.log`・`.log.<n>`・`.log.lock`）も同様に残り得る（#2892・#2964）。
+supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて書く（#3034）。以降の「見分け方」「自動回収」「手動の手順」はコンテナログの記述である。
 
 ## 見分け方
 
@@ -28,7 +30,7 @@ supervisor が `terminate` の既定（5 秒）を超えて sink を閉じなか
 ## 手動の手順
 
 1. その ID の状態が無いことを確かめる（`fandhe-container list` に出ない）。状態がある ID のログは消さない
-2. そのログのロックを持つプロセス（古い supervisor）が居ないことを確かめる（Linux・macOS は `lsof <state_root>/@container-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。居る場合はそのプロセスが終わるのを待つ
+2. そのログのロックを持つプロセス（古い supervisor）が居ないことを確かめる（Linux・macOS は `lsof <state_root>/@container-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。居る場合はそのプロセスが終わるのを待つ。非特権の `lsof` / `fuser` が何も出さなくても「居ない」とは限らない（supervisor は `PR_SET_DUMPABLE=0` のため）。観測できないときの扱いは、末尾の「supervisor ログの手動の手順」の手順 2（非ブロッキングの排他確認。取れなければ中止）と同じにする
 3. 削除候補を先に確認する。対象は次の正確な名前だけで、`<encoded-id>.log*` のような glob は使わない（ID はドットを含み得るため、ID `a` の `a.log*` が別 ID `a.logger` の `a.logger.log` やロックにも一致する）:
    - `<encoded-id>.log`
    - `<encoded-id>.log.lock`
@@ -40,3 +42,36 @@ supervisor が `terminate` の既定（5 秒）を超えて sink を閉じなか
    ```
 
 4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。他の ID のファイルには触れない
+
+## supervisor ログ（`@supervisor-logs`。#3034・SUP-7・CRI-2・CLI-1・REPAIR-4）
+
+### supervisor ログの見分け方
+
+- CLI の `delete` が stderr に `"message":"supervisor log removal failed; leftover logs may remain"` の警告を出した。待ちを使い切っても古い supervisor がロックを持ち続けた場合は `"code":"FAILED_PRECONDITION","reason":"sink_open_after_wait"` が付く。`INTERNAL`・`RESOURCE_EXHAUSTED` など他の失敗には `reason` が付かない
+- 期限切れは `"code":"TIMEOUT"` で、文言は `supervisor log removal did not finish within the deadline; leftover logs may remain`（コンテナログとは文言が違い、`reason` は付かない）
+- plugin-cri の `{"event":"container_delete_cleanup","id":"<id>","target":"supervisor_log",...}` の行（待ち切れなかった場合は `"reason":"sink_open_after_wait"`）。`id` が対象のコンテナ ID。記録器の op 名 `supervisor_log_remove` の Failure も同じ意味である（コード別の op 名は無い。`container_log_remove.<code>` はコンテナログ専用）
+- 置き場所は `<state_root>/@supervisor-logs/`（unix では 0700）。ファイル名と ID の符号化はコンテナログと同じで、1 ID あたり最大 `.log`・`.log.1`・`.log.2`・`.log.lock` の 4 ファイル（1 MiB × 3 世代 = 3 MiB 以内）
+
+### supervisor ログの自動回収
+
+自動では回収されない。同じ ID の次の `start` で世代として回るだけで、`create` 前の回収と plugin-cri の起動時の走査（`container_log_sweep`）は `@container-logs` だけを対象にする。`container_log_sweep` の件数に supervisor ログは含まれない。CRI は ID を使い回さないため、plugin-cri の残りは次の手順で手動で消す。
+
+### supervisor ログの手動の手順
+
+1. その ID の状態が無いことを確かめる（`fandhe-container list` に出ない。plugin-cri の場合は同じ `--root` を指定する）。状態がある ID（稼働中・再作成済み）のログは消さない
+2. そのログのロックを持つプロセスが居ないことを確かめる。**非特権の `lsof` / `fuser` が何も表示しないことを「持ち主が居ない」の根拠にしない**。Linux の supervisor は `PR_SET_DUMPABLE=0` で動くため、同じ UID の非特権ユーザーでも `/proc/<pid>/fd` を読めず、持ち主が居ても `lsof` / `fuser` に出ないことがある。次の順で進める:
+   1. 観測できる場合（Linux・macOS は `lsof <state_root>/@supervisor-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可。root なら持ち主を観測できる）に持ち主が出たら、消さずにそのプロセスが終わるのを待つ。supervisor はコンテナが生きている間ロックを持ち続けるため、居る場合はそのコンテナのログである
+   2. 何も出ない場合も「居ない」と結論しない。まず同じ ID の再作成と `start`（CLI の `create`・`start`、plugin-cri の `CreateContainer`・`StartContainer`）を止める。そのうえで、ロックが `flock(2)` であることを前提に、非ブロッキングで排他を取れるかを確かめる（Linux: `flock -n <state_root>/@supervisor-logs/<encoded-id>.log.lock -c true`。成功〔終了コード 0〕なら誰も保持していない。`flock` が無い環境ではこの確認ができない）
+   3. 排他が取れない（終了コード 1）、または観測も排他の確認もできない場合は、持ち主が居る扱いにして手順を中止する。何も削除しない。プロセスが終わるのを待つか、観測できる権限で持ち主を確かめてからやり直す
+
+3. 削除候補を先に確認する。対象は次の正確な名前だけで、`<encoded-id>.log*` のような glob は使わない（ID `a` の `a.log*` が別 ID `a.logger` のファイルにも一致するため）:
+   - `<encoded-id>.log`
+   - `<encoded-id>.log.lock`
+   - `<encoded-id>.log.<n>`（`<n>` は数字だけの世代接尾辞）
+
+   ```sh
+   cd <state_root>/@supervisor-logs
+   ls -1 | grep -E '^<encoded-id>\.log(\.lock|\.[0-9]+)?$'   # 候補の確認（<encoded-id> 中のドットは \. にする）
+   ```
+
+4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。ディレクトリ `@supervisor-logs` 自体は消さない（0700 のまま残す）。`rm -rf` は使わない。削除に root は要らない（rootless の状態ルートは利用者の所有）。ただし持ち主の観測には権限が要り得るため、削除の権限と観測の権限は別に考える（手順 2 の確認が済んでいない限り削除しない）

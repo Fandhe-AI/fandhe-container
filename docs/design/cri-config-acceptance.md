@@ -491,10 +491,42 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 残る差（意図的）:
 
 - 件数: 本実装はプラットフォーム manifest digest も併記する（CRI-4 の `name@<platform>` での引き当てと oci 在庫のキーのため）。containerd は 1 件
-- 複数 pull の統合順: `merged_with` は既存を先に保つ挿入順（試験 `cri2_upsert_keeps_existing_digest_order_first` で固定）。containerd は辞書順。例: プラットフォーム digest で pull した後にタグ pull すると `[platform, index]` で、先頭が index になるとは限らない
-- `repo_tags` の並び: containerd は同じ `docker.Sort` で辞書順、本実装は挿入順（ContainerStatus の `image` は `repo_tags[0]`）。本 issue の対象外
+- 複数 pull の統合順・`repo_tags` の並び: #3038 で揃えた（次の小節）
 
 却下案:
 
 - プラットフォーム digest を落として containerd と件数まで一致させる: CRI-4 の引き当て試験と oci 在庫のキーに反する
-- `PulledImage`・`ImageRecord` に top-level digest と補助 digest を分けて持たせ、統合時も辞書順で先頭を保つ: 公開構造体の変更が試験と plugin-cri に波及するため見送り。必要になれば別 issue
+- `PulledImage`・`ImageRecord` に top-level digest と補助 digest を分けて持たせ、統合時も辞書順で先頭を保つ: 当初は見送ったが #3038 で採用した。`ImageRecord::new` の署名は変えず、内部表現（`top_level_len`）で分けた
+
+### 複数 pull の統合順と repo_tags の並び（CRI-2・OCI-1。#3038）
+
+確認日 2026-10-28。cri-tools `v1.37.0`、kubernetes `v1.37.1`、containerd `v2.4.2`（`b7a25261e029d68978bbf290df0a62fc819b3c51`）、distribution/reference v0.6.0。
+
+| 主張 | 一次情報 |
+| ---- | ---- |
+| crictl は `repo_digests[0]` を `crictl images` の DIGEST 列と、タグが無い場合の名前の列に使う | cri-tools `cmd/crictl/image.go` `normalizeRepoDigest` |
+| crictl は一覧を `repo_tags[0]`（無ければ `repo_digests[0]`）で整列し、`--filter before/since` の照合にも先頭を使う | 同 `image.go` の `slices.SortFunc`・`filterByBeforeSince` |
+| crictl の `ps --resolve-image-path` は `repo_tags[0]` を表示に使う | cri-tools `cmd/crictl/util.go` `getRepoImage` |
+| kubelet は ContainerStatus の `image`（ランタイムが `repo_tags[0]` から選ぶ）を Pod status の `image` へ、`image_ref`（`repo_digests[0]` から選ぶ）を `imageID` へ写す | kubelet `kuberuntime_container.go`・`kubelet_pods.go` L2322 |
+| Node status の `images[].names` は RepoDigests の後に RepoTags を並べて上限件数で切るので、並びで載る名前が変わる | kubelet `nodestatus/setters.go` |
+| 同じ rank の参照は `String()` のバイト順で整列する。CRI の `repo_tags` と `repo_digests` は別配列に分かれ、配列内の rank は揃う | distribution/reference `sort.go`・containerd `ParseImageReferences` |
+
+**判定: 揃える。** crictl が先頭要素を直接使い、kubelet が先頭から選ばれた値を Pod の公開 status と Node status に載せるため、並びに依存がある。
+
+規則: `repo_tags` は重複を除いて辞書順。`repo_digests` は「top-level digest 群（辞書順）」の後ろに「補助のプラットフォーム manifest digest 群（top-level と重なるものを除き辞書順）」を続ける。先頭は常に top-level digest で、複数 pull の統合後は辞書順で最小の top-level digest になり containerd と一致する。
+
+| 場面 | 変化 |
+| ---- | ---- |
+| 統合（プラットフォーム digest の pull の後にタグ pull） | `[platform, index]` の挿入順から、両方が top-level として辞書順へ。pull の順に依らない |
+| タグ追加 | 挿入順から辞書順へ |
+| 再 pull | 並びも件数も不変 |
+| 単一 pull | 不変（先頭は top-level。index digest が辞書順で大きくても先頭） |
+| ContainerStatus の `image`・`image_ref` | create 時の `repo_tags[0]`・`repo_digests[0]` が containerd と一致する |
+| 絞り込み | 集合照合なので不変 |
+
+互換:
+
+- `InMemoryImageStore` は永続化されておらず読み替え不要。永続在庫（#2945）では `top_level_digests()`・`auxiliary_digests()` を分けて保存し、`ImageRecord::from_parts` で読み戻すこと。`repo_digests()` を `ImageRecord::new` へ渡し直すと、2 件目以降の top-level が補助として扱われる
+- コンテナの記録は create 時のスナップショットなので読み替えない
+
+残る差（意図的）: 補助 digest の併記による件数の差、タグのスナップショット（上記）。

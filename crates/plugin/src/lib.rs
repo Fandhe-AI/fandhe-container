@@ -37,6 +37,9 @@ pub mod lifecycle;
 pub mod message;
 pub mod rss;
 pub mod signal_forward;
+// fd の生成と spawn の直列化（macOS の std の close-on-exec 非原子化の窓。PLUG-7・SEC-1・#3139）。
+#[cfg(unix)]
+pub(crate) mod spawn_gate;
 // syscall・FFI の薄いラッパーの置き場で、`unsafe` を許すのはここだけ（#4 の事前承認は `sys` に限る。
 // `unsafe fn` を外へ公開せず安全な `pub(crate)` 関数だけを出す契約は `sys` の冒頭 doc を参照）。
 #[cfg(unix)]

@@ -772,7 +772,10 @@ mod imp {
             // （削除と取得の競合は取得側の同一性確認で排除する。`BindLock` の doc 参照）。
             let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
             crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
-            let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
+            // macOS の std は socket の close-on-exec を作成後に立てるため、並行する spawn と排他にする
+            // （別 plugin の子へ listener が漏れない。`spawn_gate`。PLUG-12・SEC-1・#3139）。
+            let listener = crate::spawn_gate::create_fds(|| UnixListener::bind(&target))
+                .map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name).ok();
             let inner = Self {
@@ -986,7 +989,8 @@ mod imp {
             // `UDS_ACCEPT_PEER_REJECTION_LIMIT`（#1861）。
             let mut continued: u32 = 0;
             loop {
-                match self.listener.accept() {
+                // listener は非ブロッキング（1 回の accept で戻る）ため、ゲートを長く持たない。
+                match crate::spawn_gate::create_fds(|| self.listener.accept()) {
                     Ok((stream, _)) => {
                         // 期限後に到着した接続は受理せず閉じて Timeout を返す（REPAIR-5。
                         // 期限直前のポーリング後のスリープ中に到着した接続が成功する経路を塞ぐ）。

@@ -426,7 +426,7 @@ impl StderrCapture {
         }
         // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
         reader.set_nonblocking(true)?;
-        let (stop_rx, stop_tx) = io::pipe()?;
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(io::pipe)?;
         let mut capture = Self::start(
             PolledStderr {
                 sock: reader,
@@ -568,9 +568,13 @@ type StderrReader = io::Empty;
 /// している間は読み取りスレッドを止められない。ソケットなら `poll` の期限と停止用 pipe（対応外の構成は
 /// 受信期限と shutdown）で確実に止められる。子から見た書き込みは pipe と同様（端末ではなく、読み手が
 /// 閉じれば `EPIPE`）。どちらの端も close-on-exec で、子へ渡るのは fd 2 に複製した書き込み端のみ。
+/// macOS では作成と close-on-exec の設定が別 syscall のため、並行する spawn へ漏れないよう
+/// `spawn_gate` で排他する（#3139）。
 #[cfg(unix)]
 fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
-    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    // macOS の std は close-on-exec を作成後に別 syscall で立てるため、並行する spawn と排他にする
+    // （`spawn_gate`。PLUG-7・SEC-1・#3139）。
+    let (reader, writer) = crate::spawn_gate::create_fds(std::os::unix::net::UnixStream::pair)?;
     // 相手が健在なうちに期限を設定する（macOS は相手切断後の設定が EINVAL になる）。
     reader.set_read_timeout(Some(STDERR_READ_POLL))?;
     Ok((Stdio::from(std::os::fd::OwnedFd::from(writer)), reader))
@@ -1490,7 +1494,12 @@ fn spawn_registered(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    // 非原子の fd 生成と排他で spawn する（`spawn_gate`。PLUG-7・SEC-1・#3139）。非 unix は fd を作らない。
+    #[cfg(unix)]
+    let spawned = crate::spawn_gate::spawn(cmd);
+    #[cfg(not(unix))]
+    let spawned = cmd.spawn();
+    let child = spawned.map_err(|e| spawn_error(&e))?;
     let pid = child.id();
     // activate が失敗した場合は guard の Drop が子を kill・回収する。
     let guard = ChildGuard::new(child);

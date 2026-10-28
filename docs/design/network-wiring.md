@@ -2,7 +2,7 @@
 
 `crates/net` に実装済みの `--add-host`・`--dns`・host / none モード・ユーザー定義ネットワーク・DNS ヘルパーを、統一 CLI と supervisor の起動経路から呼べるようにするための結線を設計として確定する。呼び出し主体・順序・後始末・netns への参加方法・hosts / resolv.conf・プロセスをまたぐ状態・排他と期限を決め、残りの実装 issue を起票する。
 
-> **位置づけ**: 本書は #1870 の設計確定である。D1〜D12・D14〜D16 は main（opus）が確定した設計で、実装 issue の入力になる。**D13（rootful のユーザー定義ネットワークの実行主体）だけはオーナー承認待ち**で、決定扱いにしない（人間担当の判断 issue は #3057）。D13 に依存する実装は #3057 の判断が出るまで着手しない。判断シートは D13 節の末尾「D13 の承認事項（判断シート）」にある。
+> **位置づけ**: 本書は #1870 の設計確定である。D1〜D12・D14〜D16 は main（opus）が確定した設計で、実装 issue の入力になる。**D13（rootful のユーザー定義ネットワークの実行主体）だけはオーナー承認待ち**で、決定扱いにしない（人間担当の判断 issue は #3207。判断シートを足した #3057 は PR #3186 で close 済み）。D13 に依存する実装は #3207 の判断が出るまで着手しない。判断シートは D13 節の末尾「D13 の承認事項（判断シート）」にある。
 
 - 対象ビヘイビア: NET-6・NET-12（関連: NET-1〜NET-5・NET-7・NET-9・NET-11・CLI-1・CORE-1・CORE-6・SEC-1・SEC-4・SEC-5・SUP-12・SUP-14・PLUG-1・PLUG-12・REPAIR-2〜REPAIR-5・ERR-1）
 - タスク: TASK-185・TASK-143 の追補（MS-6・MS-8）
@@ -36,7 +36,7 @@
   - `--dns <ip>`: 繰り返し可。最大 `MAX_DNS_SERVERS`=32 件、1 件 45 バイト
   - 上限は確保の前に検証し、超過は使い方エラー
   - ユーザー定義ネットワーク（bridge）では `--dns` の転送先が DNS ヘルパーの上流転送（D11）に渡るため、上記の件数上限とは別に、上流転送の制約（最大 3 件・loopback・link-local・ヘルパー自身の gateway アドレスの拒否。net の `DnsUpstreamMap::set` と同じ検証）を D2 の検証で作成前に適用する。`ResolvConfPlan::for_mode` が bridge の非空指定を `Unimplemented` にする経路は、この検証を通った値を記録経由で渡す形に結線の側で置き換える（bridge で `--dns` を受けて start 時に初めて失敗する形にしない。NET-12）
-  - `--network` の解釈: `none` / `host` は完全一致。`container:` で始まる値は `UNIMPLEMENTED`（spec で将来扱い）。それ以外は net の `NetworkName::parse` で検証する。予約名 `none`・`host`・`bridge`・`default` は名前として使えず `InvalidArgument`（net の `NetworkMode::parse` は `bridge` を受けるが、spec の値は 3 種で `bridge` モードは無いため CLI は使わない）
+  - `--network` の解釈: `none` / `host` は完全一致。`container:` で始まる値は `UNIMPLEMENTED`（spec で将来扱い）。それ以外は net の `NetworkName::new`（`crates/net/src/network.rs`）で検証する。予約名 `none`・`host`・`bridge`・`default` は名前として使えず `InvalidArgument`（net の `NetworkMode::parse` は `bridge` を受けるが、spec の値は 3 種で `bridge` モードは無いため CLI は使わない）
   - `network create <name>`・`network rm <name>`・`network ls` は位置引数のみでオプションを持たない（spec に無い。subnet 等を足すなら spec 側の課題）
   - 3 OS で構文は同じ（CLI-1）。Linux 以外は検証を通した後に `UNIMPLEMENTED`（platform の結線は MAC / WIN 系の後続）
 - **理由**: NET-12 は「コンテナ作成前に拒否」を求める。作成時の指定は状態として残り、start が使う（D4）。
@@ -103,7 +103,7 @@
 
 ### D8 host モード
 
-- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3058 の core の変更に含める。pasta の同期点〔#1939〕と共有する）で、次の方式で確かめる（本番の supervisor は `start_entry.rs` で `PR_SET_DUMPABLE=0` にしており、中間プロセスと exec 前の子もこれを継承する。non-dumpable のプロセスの `/proc/<pid>/ns/*` と `/proc/<pid>/task/<tid>/ns/net` は ptrace アクセス検査で非特権の親から `PermissionDenied` になるため、親が procfs で子の netns を参照する `HostNetns::verify_process(pid)` は本番経路では使わない。既存の non-dumpable 防御〔SEC-1〕は緩めず、`PR_SET_DUMPABLE` を 1 に戻さず、`CAP_SYS_PTRACE` も足さない）。子は同期点で、自分の `/proc/self/ns/net` を `O_RDONLY|O_CLOEXEC` で開き（自分自身の参照は dumpable に依らず許される）、その fd を同期用の `socketpair(AF_UNIX, SOCK_SEQPACKET)` で `SCM_RIGHTS` により親へ渡す。親は受け取った fd を `fstat` し、(dev, ino) を基準と比較する。netns の fd は inode が netns を一意に表すため、procfs の参照と同じ判定になる。fd は 1 本だけを受け、control メッセージ長・fd 数・種別を検証し（余分な fd は閉じて `FailedPrecondition`）、受信には期限を付ける（REPAIR-5）。net 側の判定（Host / Loopback / Other の分類）は pid ではなく (dev, ino) を取る関数 `HostNetns::verify_ns_identity` として切り出し、`verify_process` はその薄い呼び出し元に保つ（実装は #3058 と net の担当 issue で足す）。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。照合は資格情報を落とす前に行う（fd 渡しなので、資格情報の前後に依らず成立するが、順序は変えない）: 同期点は子が `process.user` の setuid / setgid / `setgroups` を行う前（子がまだ supervisor と同じ実 UID の間）に置き、照合の完了を pipe で親子同期してから子が資格情報を切り替えて exec する。これにより RootlessSubordinateIds で `process.user` が非 root（子のホスト UID が supervisor と異なる）でも、`/proc/<pid>/task/<tid>/ns/net` の stat に要る ptrace 相当の権限を増やさずに照合でき、非特権の supervisor が `PermissionDenied` で正常な起動を拒否する（既定の none でも起きる）ことがない。資格情報を落とした後の再照合はしない（netns は setns / unshare 済みで、以後 exec までに変わる経路が無い。エラーの意味は SEC-5 の `FailedPrecondition` に統一し、`PermissionDenied` を照合の失敗として黙って握りつぶさない）。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
+- **決定**: supervisor は start の入口で自分の netns の (dev, ino) を基準として取る（基準は「supervisor の netns」と定義する）。launch の中の「entrypoint の exec 直前の同期点」（子が exec 前に pipe で待ち、supervisor の検証が済むまで進まない。#3206 で足す。#3058〔PR #3187〕は受け入れ条件に無く `sys` の新しい `unsafe` を伴うため実装しなかった。pasta の同期点〔#1939〕は #3206 の上に fd 2 本への拡張として作る）で、次の方式で確かめる（本番の supervisor は `start_entry.rs` で `PR_SET_DUMPABLE=0` にしており、中間プロセスと exec 前の子もこれを継承する。non-dumpable のプロセスの `/proc/<pid>/ns/*` と `/proc/<pid>/task/<tid>/ns/net` は ptrace アクセス検査で非特権の親から `PermissionDenied` になるため、親が procfs で子の netns を参照する `HostNetns::verify_process(pid)` は本番経路では使わない。既存の non-dumpable 防御〔SEC-1〕は緩めず、`PR_SET_DUMPABLE` を 1 に戻さず、`CAP_SYS_PTRACE` も足さない）。子は同期点で、自分の `/proc/self/ns/net` を `O_RDONLY|O_CLOEXEC` で開き（自分自身の参照は dumpable に依らず許される）、その fd を同期用の `socketpair(AF_UNIX, SOCK_SEQPACKET)` で `SCM_RIGHTS` により親へ渡す。親は受け取った fd を `fstat` し、(dev, ino) を基準と比較する。netns の fd は inode が netns を一意に表すため、procfs の参照と同じ判定になる。fd は 1 本だけを受け、control メッセージ長・fd 数・種別を検証し（余分な fd は閉じて `FailedPrecondition`）、受信には期限を付ける（REPAIR-5）。net 側の判定（Host / Loopback / Other の分類）は pid ではなく (dev, ino) を取る関数 `HostNetns::verify_ns_identity` として切り出し、`verify_process` はその薄い呼び出し元に保つ（実装は #3206 で足す。net 側の切り出しも #3206 の照合に含める。host モードの結線と構造化ログ `network_mode=host` は #1873）。子は同期点で生存が保証されるため、`/bin/true` のように検証前に終了するコンテナでも `NotFound` にならない（verify_process はゾンビを含め生存スレッドが 0 件なら `NotFound` を返す契約で、既定の none にも適用される）。検証後に同期点を解放して exec する。照合は資格情報を落とす前に行う（fd 渡しなので、資格情報の前後に依らず成立するが、順序は変えない）: 同期点は子が `process.user` の setuid / setgid / `setgroups` を行う前（子がまだ supervisor と同じ実 UID の間）に置き、照合の完了を pipe で親子同期してから子が資格情報を切り替えて exec する。これにより RootlessSubordinateIds で `process.user` が非 root（子のホスト UID が supervisor と異なる）でも、`/proc/<pid>/task/<tid>/ns/net` の stat に要る ptrace 相当の権限を増やさずに照合でき、非特権の supervisor が `PermissionDenied` で正常な起動を拒否する（既定の none でも起きる）ことがない。資格情報を落とした後の再照合はしない（netns は setns / unshare 済みで、以後 exec までに変わる経路が無い。エラーの意味は SEC-5 の `FailedPrecondition` に統一し、`PermissionDenied` を照合の失敗として黙って握りつぶさない）。Host は子の全スレッドが基準の netns にいること、Loopback は子が基準と別の netns にいること（`Other`）。違えば子を止めて（同期点で待っているので exec 前に確実に止まる）fail-closed（`FailedPrecondition`）。分離を緩める指定なので、start 時に構造化ログ（REPAIR-4）で `network_mode=host` を 1 行出す。監査ログ（SEC-4）には書かない（分離違反の試行ではないため）。
 - 追記（#1935）: pasta 構成の同期点では netns と user namespace の fd を 2 本、この順で受ける（[rootless-network.md](rootless-network.md) 12.2）。Loopback・Host は 1 本のまま。
 - **却下した案**: 照合を省く（設定誤りを検出できず、#1873 の受け入れ条件にも合わない）。
 
@@ -182,7 +182,7 @@
 
 ### D13 rootful のユーザー定義ネットワークの実行主体（オーナー承認待ち）
 
-**決定扱いにしない。推奨と案を並べ、判断は #3057（人間担当）で行う。**
+**決定扱いにしない。推奨と案を並べ、判断は #3207（人間担当。判断シートは #3057）で行う。**
 
 - 前提: CLI は特権を持たない。特権を持つのはランチャー経由の supervisor だけ。2026-10-15 の決定で、設定は `NetworkPlugin` の実装（plugin 側）が行う。
 - 推奨の流れ:
@@ -199,7 +199,7 @@
 
 #### D13 の承認事項（判断シート）
 
-すべて未決である（2026-10-27 時点）。窓口は #3057（open のまま）。返答は「D13-1: A / D13-2: 推奨どおり / D13-3: (a)、spec へ持ち込む / D13-4: 推奨どおり」の形で受ける。回答を受けたら #3057 にコメントで記録して close し、下の棚卸しに沿って設計文書を更新する。
+すべて未決である（2026-10-27 時点）。窓口は #3207（#3057 は判断シートを足した PR #3186 で close 済み）。返答は「D13-1: A / D13-2: 推奨どおり / D13-3: (a)、spec へ持ち込む / D13-4: 推奨どおり」の形で受ける。回答を受けたら #3207 にコメントで記録して（#3057 にも参照を残し）close し、下の棚卸しに沿って設計文書を更新する。
 
 | 番号 | 判断事項 | 選択肢 | 推奨 | 影響 | 判断 |
 | ---- | -------- | ------ | ---- | ---- | ---- |
@@ -273,7 +273,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | `network create/rm/ls` | cli | #319 条件 4 | #3066 |
 | 静的 IPAM の永続化 | `crates/net/src/network/ipam.rs` | #349 条件 2、#319 条件 2〜4 | #3067 |
 | 公開ハンドルの復元 | `crates/net/src/network/unpublish.rs` | なし（NET-3 の残余） | #3068 |
-| rootful の実行主体（承認） | — | #349 条件 1（rootful）・2、#319 条件 2〜4 | #3057 |
+| rootful の実行主体（承認） | — | #349 条件 1（rootful）・2、#319 条件 2〜4 | #3207（判断シートは #3057〔close 済み〕） |
 | init user namespace 所有の netns への参加 | `crates/core/src/oci_runtime/namespace_join.rs` | 同上 | #3069 |
 | plugin の起動と attach / detach の結線 | supervisor | 同上 | #3074 |
 | DNS の参照カウントと切り離し | `crates/net/src/dns_helper/refcount.rs`・`dns_helper.rs` | #349 条件 2 | #3070 |
@@ -303,29 +303,30 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 
 ## 実装 issue
 
-親: #3056。依存欄は各 issue の本文を正とする。
+親: #3056（#3206 の親は #3032）。依存欄は各 issue の本文を正とする。状態は 2026-10-28 時点で、正は各 issue の状態。
 
-| issue | 内容 | 担当 | 依存 |
-| ----- | ---- | ---- | ---- |
-| #3058 | core: `LaunchOptions` の network モードと config との突き合わせ（D7） | runtime-builder | なし |
-| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6。実装済み） | runtime-builder | #3058 |
-| #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 |
-| #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし |
-| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 |
-| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 |
-| #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 |
-| #3057 | 人間担当: rootful の実行主体の判断（D13） | 人間 | なし |
-| #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 |
-| #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 |
-| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 |
-| #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 |
-| #3072 | net: `--dns` の上流転送を製品のヘルパーで有効化（D11） | net-builder | #3071 |
-| #3060 | net: nftables の `bitwise`・`meta` expr（D11） | net-builder | なし |
-| #3073 | net: postrouting の masquerade（D11） | net-builder | #3060 |
-| #3061 | net: attach で peer を `eth0` へリネーム（D11） | net-builder | なし |
-| #3062 | net: attach 済みコンテナ単体の切り離し（D11） | net-builder | なし |
-| #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし |
-| #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 |
+| issue | 内容 | 担当 | 依存 | 状態 |
+| ----- | ---- | ---- | ---- | ---- |
+| #3058 | core: `LaunchOptions` の network モードと config との突き合わせ（D7） | runtime-builder | なし | 実装済み（PR #3187） |
+| #3206 | core: entrypoint の exec 直前の同期点と netns の素性の照合（D8。親 #3032） | runtime-builder | #3058・#3064 | 未実装 |
+| #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 | 実装済み（PR #3195） |
+| #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
+| #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
+| #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 未実装 |
+| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 未実装 |
+| #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 未実装 |
+| #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
+| #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
+| #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 | 未実装 |
+| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 未実装 |
+| #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 未実装 |
+| #3072 | net: `--dns` の上流転送を製品のヘルパーで有効化（D11） | net-builder | #3071 | 未実装 |
+| #3060 | net: nftables の `bitwise`・`meta` expr（D11） | net-builder | なし | 実装済み（PR #3189） |
+| #3073 | net: postrouting の masquerade（D11） | net-builder | #3060 | 未実装 |
+| #3061 | net: attach で peer を `eth0` へリネーム（D11） | net-builder | なし | 実装済み（PR #3190） |
+| #3062 | net: attach 済みコンテナ単体の切り離し（D11） | net-builder | なし | 実装済み（PR #3192） |
+| #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし | 実装済み（PR #3193。共有ロックと投入後の事後確認は #3191） |
+| #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 | 未実装 |
 
 既存の #1871（D1〜D3）・#1872（D9）・#1873（D4・D6〜D9・D14）・#1939（D6）・#1940（D5・D10）・#1935（D1・D10）は、本書の該当項を参照する。コード内のドキュメントコメントの陳腐化（`crates/net/src/lib.rs` の「PLUG-1 区分は検討中」、`network_plugin.rs` の「host / none は #19 で確定」）は本 PR では直さず、#3059 と #3058 の受け入れ条件に入れた。
 
@@ -335,7 +336,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 - アクセス制御: 状態ストアと生成ファイルは 0700 / 0600（hosts / resolv.conf は 0644）・所有者 euid・fd 起点・`O_NOFOLLOW`・nlink 1。DNS の制御 UDS は 0600 で `SO_PEERCRED` が別 uid なら切断する（PLUG-12）。host モードは明示した場合だけ使い、ログに残す
 - 不安全な設計の防止: 件数・長さは確保の前に検証する。ロック・ack・RPC・照合はすべて期限つき（REPAIR-5）。失敗時は逆順に巻き戻す。既定は `none`（閉じた側）。指定の衝突は `InvalidArgument`
 - 完全性: netns への参加はパスを 1 回だけ開いて fd に固定し、nsfs・種別・(dev, ino)・所有 user namespace・配下性を照合する（SEC-1）。pid の再利用は、pidfd を先に取得してから開始時刻と boot id を照合し、待機と強制停止をその pidfd に対して行うことで除く。公開の rule handle はテーブル handle と照合し、古い handle で他者のルールを消さない
-- コンテナ分離: bind mount の先は rootfs の fd から辿り、symlink・`..`・外への脱出を拒否する。init user namespace 所有の netns への参加は承認（#3057）まで実装しない。コンテナ内の root は init user namespace 所有の netns に対して `CAP_NET_ADMIN` を持たない
+- コンテナ分離: bind mount の先は rootfs の fd から辿り、symlink・`..`・外への脱出を拒否する。init user namespace 所有の netns への参加は承認（#3207）まで実装しない。コンテナ内の root は init user namespace 所有の netns に対して `CAP_NET_ADMIN` を持たない
 - 依存: 新規依存なし。serde / toml を supervisor へ足さない。`lo` の up の ioctl は core の `sys` の事前承認の範囲で、PR 記録の条件は #3064 の受け入れ条件に入れた
 
 ## spec 側への報告事項（本リポで決めない）
@@ -343,10 +344,10 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 - CLI のポート公開フラグ（`-p` / `--publish`）が CLI-1・NET-6 に無い。pasta（NET-9）と rootful のどちらでも入口が要る
 - `network create` のオプション（subnet 等）が spec に無い。本設計では持たず、subnet は pool から自動で予約する（D13 の推奨）
 - rootless で `--network <名前>` に事前の `network create` を要するか。本設計は「要る」と読む（NET-6 の入口の定義から）。確認を求める
-- rootful で作成・削除を最初の attach / 最後の detach に遅らせると、NET-4 の作成・削除時間の意味が変わる（D13 と #3057 で判断する）。判断シートの D13-3 を参照
+- rootful で作成・削除を最初の attach / 最後の detach に遅らせると、NET-4 の作成・削除時間の意味が変わる（D13 と #3207 で判断する）。判断シートの D13-3 を参照
 
 ## 残余・見直し条件
 
 - bind mount の先が symlink の場合の `RESOLVE_IN_ROOT` による解決は未対応（D9）
 - #1935（pasta の設計。[rootless-network.md](rootless-network.md) 12 章）は予約名と名前の照合を変えなかった。D1・D10 の見直しは不要。今後変わったら見直す
-- #3057 の判断が出たら D13 を確定し、本書の位置づけの注記と `docs/architecture.md` の設計ドラフトの行を更新する
+- #3207 の判断が出たら D13 を確定し、本書の位置づけの注記と `docs/architecture.md` の設計ドラフトの行を更新する

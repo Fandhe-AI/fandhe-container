@@ -59,6 +59,11 @@
 //! `NotFound`、`nft list table` の失敗、pin ファイルの消滅、IPAM・ポート予約が空であることを具体値で照合する
 //! （渡していない c2 の事前作成 veth は IPAM に無く、削除の対象外）。続けて空の `containers` での再実行が成功する（冪等）。
 //!
+//! veth の作成通知（`NLM_F_ECHO`。Issue #3205）も確かめる。専用の名前の veth を echo 付きで作り、`decode_created_veth` の
+//! host / peer の ifindex が実カーネルの link と一致することを照合する（v6.2 以上。それより前は通知なしで、
+//! `attach_container` は名前引きの戻し経路で成功する）。成功行は `veth_echo=index` / `veth_echo=fallback` の 2 通り。
+//! 実機（root）での実行は #1626（人間担当）で未実行。
+//!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! 外部コマンド）を満たさない場合は skip せず失敗する。
 //!
@@ -102,7 +107,7 @@ mod linux {
     use fandhe_container_net::netlink::AttrIter;
     use fandhe_container_net::netlink_route::{
         IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_MASTER, IfName, IpPrefix, LinkCreate, LinkDelete,
-        LinkRef, NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK,
+        LinkRef, NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK, decode_created_veth,
     };
     #[cfg(feature = "attach-fault-test-support")]
     use fandhe_container_net::network::{
@@ -128,7 +133,10 @@ mod linux {
     const CLAIM_HEX_MAX_LEN: usize = 4096;
     /// attach 子が標準出力へ出す行の接頭辞。
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
-    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept";
+    /// 成功行は veth の作成通知（`NLM_F_ECHO`。Issue #3205）が届く v6.2 以上か、届かない戻し経路かで 2 通り。
+    /// `check-success-lines.sh` が試験ソースの文字列リテラルから導出するため、`format!` で組み立てず 2 つのリテラルで持つ。
+    const OK_LINE_ECHO_INDEX: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=index";
+    const OK_LINE_ECHO_FALLBACK: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=fallback";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -963,7 +971,8 @@ mod linux {
 
     pub fn inner() {
         match inner_checked() {
-            Ok(()) => println!("{OK_LINE}"),
+            Ok(true) => println!("{OK_LINE_ECHO_INDEX}"),
+            Ok(false) => println!("{OK_LINE_ECHO_FALLBACK}"),
             Err(e) => {
                 println!("network_attach_privileged: failed: {e}");
                 std::process::exit(1);
@@ -971,7 +980,8 @@ mod linux {
         }
     }
 
-    fn inner_checked() -> Result<(), NetError> {
+    /// 成功時は veth の作成通知が届く経路（v6.2 以上）だったかを返す。
+    fn inner_checked() -> Result<bool, NetError> {
         ensure_launched_by_launcher()?;
         ensure_isolated_netns()?;
         let base =
@@ -1109,6 +1119,31 @@ mod linux {
             return Err(fail(format!(
                 "expected exactly one default route via 10.213.0.1 on {ifname}, got {default_routes:?}"
             )));
+        }
+
+        // --- veth の作成通知（NLM_F_ECHO）の ifindex（Issue #3205）---
+        // v6.2 以降は通知が届き、host / peer の ifindex が実カーネルの link と一致する。それより前は通知が無く
+        // （上の attach_container は戻し経路で成功している）。版を読めない・期待と違う場合は skip せず失敗する。
+        let echo_supported = kernel_supports_create_echo()?;
+        let eh = IfName::new("fxech0")?;
+        let ep = IfName::new("fxech1")?;
+        let reply = route.create_link(&LinkCreate::veth(eh.clone(), ep.clone())?.with_echo(), t)?;
+        let echoed = decode_created_veth(
+            reply.messages().iter().map(|m| (m.msg_type(), m.payload())),
+            &eh,
+        )?;
+        let actual_host = link_state(&route, eh.as_str())?.0;
+        let actual_peer = link_state(&route, ep.as_str())?.0;
+        route.delete_link(&LinkDelete::new(LinkRef::Name(eh.clone())), t)?;
+        match (echo_supported, echoed) {
+            (true, Some(c)) if c.host().get() == actual_host && c.peer().get() == actual_peer => {}
+            (false, None) => {}
+            (supported, got) => {
+                return Err(fail(format!(
+                    "unexpected veth echo result: supported={supported} echoed={:?} actual=({actual_host}, {actual_peer})",
+                    got.map(|c| (c.host().get(), c.peer().get()))
+                )));
+            }
         }
 
         // --- ロールバック経路: host 側 veth 名を先に塞ぎ、AlreadyExists で失敗させる ---
@@ -1626,6 +1661,22 @@ mod linux {
                 e.step
             ))
         })?;
-        Ok(())
+        Ok(echo_supported)
+    }
+
+    /// カーネルが `NLM_F_ECHO` 付きの link 作成に作成通知を返す版（v6.2 以上）かを `osrelease` から判定する。
+    /// 版を読めなければ skip せず失敗する。
+    fn kernel_supports_create_echo() -> Result<bool, NetError> {
+        let release = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map_err(|e| fail(format!("read osrelease: {e}")))?;
+        let mut nums = release
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u32>().ok());
+        match (nums.next().flatten(), nums.next().flatten()) {
+            (Some(major), Some(minor)) => Ok((major, minor) >= (6, 2)),
+            _ => Err(fail(format!("cannot parse kernel release {release:?}"))),
+        }
     }
 }

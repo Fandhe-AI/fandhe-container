@@ -226,7 +226,8 @@ mod linux {
                 mid.clone(),
                 ep.clone(),
                 IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 231, 0, 2)), 24).map_err(e)?,
-                "fandhe-net:pubrec:c1:token",
+                // 所有トークンは `<bridge_token>/ep/<endpoint>/g/<世代>` の形でなければ構築段階で拒否される。
+                &format!("{token}/ep/c1/g/{:032x}", 1u8),
                 Path::new("/run/fc-pubrec-ns"),
                 (8, 9),
                 &[],

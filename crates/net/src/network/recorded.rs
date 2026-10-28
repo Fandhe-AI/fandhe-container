@@ -613,15 +613,24 @@ where
     }
     let publish = *published.publish();
     let created = realized.to_created(NameResolution::default());
-    unpublish_ports_with(table_info, delete, &created, published, registry)
-        .map_err(|e| RecordedError::Op(Box::new(e)))?;
+    let outcome = unpublish_ports_with(table_info, delete, &created, published, registry);
+    // DELRULE が成功した後の失敗（予約の解放失敗）では、ルールは消えているのでハンドルを記録に残さない
+    // （残すと再試行が ENOENT で記録を除去できない）。予約解放の失敗は記録を直した後に別途返す。
+    let removed = match &outcome {
+        Ok(()) => true,
+        Err(e) => e.rules == UnpublishRules::Removed,
+    };
+    if !removed {
+        return outcome.map_err(|e| RecordedError::Op(Box::new(e)));
+    }
     // ルールは消えた。記録から外せなければ呼び出し側へ知らせる（古い公開が記録に残る）。
     rec.without_publish(&publish)
         .and_then(|next| guard.replace_member(&next))
         .map_err(|error| RecordedError::Uncommitted {
             error,
             value: Box::new(()),
-        })
+        })?;
+    outcome.map_err(|e| RecordedError::Op(Box::new(e)))
 }
 
 #[cfg(target_os = "linux")]

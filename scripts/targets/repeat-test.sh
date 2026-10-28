@@ -222,7 +222,7 @@ fi
 
 # プリフライト（#3036）: libtest が `--logfile` を受理するかをループの前に 1 回だけ確かめる。`--list` は試験を走らせない
 # （委譲スコープも TEST_ENV も不要）。削除後は未知のオプションで rc≠0 になるため、COUNT 回の汎用 `reason=exit` ではなく
-# 原因の分かる固定行で fail-closed に止める。ラベルは文言で決めるだけで、失敗にするかは rc とログの有無で決める。
+# 原因の分かる固定行で fail-closed に止める。ラベルは文言で決めるだけで、失敗にするかは rc だけで決める（`--list` は logfile を生成しないため存在は要求しない。ログの照合は各回の成功判定が担う）。
 preflight_run() {
   if [ -n "${SCOPE_BIN}" ]; then
     "${SCOPE_BIN}" --list --logfile "${log_arg}" >"${pre_o}" 2>"${pre_e}"
@@ -238,7 +238,7 @@ if [ "${#LOGARGS[@]}" -gt 0 ]; then
   pre_rc=0
   rm -f "${logf}"
   run_limited "${RUN_TIMEOUT}" preflight_run || pre_rc=$?
-  if [ "${pre_rc}" -eq 0 ] && [ -f "${logf}" ]; then
+  if [ "${pre_rc}" -eq 0 ]; then
     echo "info: libtest_logfile=accepted"
     rm -f "${logf}"
   else

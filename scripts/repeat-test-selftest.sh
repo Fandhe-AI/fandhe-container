@@ -36,7 +36,6 @@ case " $* " in
     for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; prev="${a}"; done
     if [ -n "${STUB_NO_LOGFILE:-}" ] && [ -n "${lf}" ]; then echo "error: Unrecognized option: 'logfile'" >&2; exit 101; fi
     [ -z "${STUB_PREFLIGHT_RC:-}" ] || exit "${STUB_PREFLIGHT_RC}"
-    [ -z "${lf}" ] || : >"${lf}"
     exit 0 ;;
 esac
 case " $* " in
@@ -100,7 +99,6 @@ case " \$* " in
     lf=""; prev=""
     for a in "\$@"; do [ "\${prev}" = --logfile ] && lf="\${a}"; prev="\${a}"; done
     if [ -n "\${STUB_NO_LOGFILE:-}" ] && [ -n "\${lf}" ]; then echo "error: Unrecognized option: 'logfile'" >&2; exit 101; fi
-    [ -z "\${lf}" ] || : >"\${lf}"
     exit 0 ;;
 esac
 echo "env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=\${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}"

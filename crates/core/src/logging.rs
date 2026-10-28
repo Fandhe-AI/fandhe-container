@@ -6,7 +6,7 @@
 //!
 //! # 位置づけと呼び出し元
 //!
-//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）と `observability` の op_stats は移行済み。残りの既存出力（
+//! 本モジュールは型と書き出しの仕組みだけを持つ。`audit_log` の `AuditLineDto`（#3115）・`audit_write_failure` の行（#3209）と `observability` の op_stats は移行済み。残りの既存出力（
 //! `oci_runtime::error`・`plugin_discovery`）は
 //! まだ本型を使っておらず、移行は TASK-98.2（#653）で行う（REPAIR-3: 実装済みを装わない）。
 //! `legacy_tiocsti` の警告行は移行済み（#3117）。`observability` の op_stats の行も移行済み（#3116）。

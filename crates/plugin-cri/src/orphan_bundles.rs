@@ -176,19 +176,31 @@ pub fn reclaim_orphan_bundles(
     }
 
     // 2. 記録ファイルのある ID（読めたかどうかを問わず所有の証明として扱う）。列挙の失敗は何も回収しない。
+    // 候補の列挙に使った時間を引いた残りだけを渡す。尽きていれば何も始めない（REPAIR-5）。
+    let list_remaining = budget.total.saturating_sub(start.elapsed());
+    if list_remaining.is_zero() {
+        result.scan = OrphanScan::TimedOut;
+        result.not_attempted = ids.len();
+        return result;
+    }
+    let list_budget = ListBudget {
+        per_record: budget.per_record.min(list_remaining),
+        total: list_remaining,
+    };
     let limits = ListLimits::for_kind(RecordKind::Container)
         .with_max_records(RecordKind::Container, MAX_CONTAINERS);
-    let with_record: HashSet<String> = match records.list(RecordKind::Container, budget, limits) {
-        Ok(l) => l
-            .records
-            .into_iter()
-            .map(|r| r.id.as_str().to_owned())
-            .collect(),
-        Err(e) => {
-            result.scan = OrphanScan::ListFailed(e.code().as_str());
-            return result;
-        }
-    };
+    let with_record: HashSet<String> =
+        match records.list(RecordKind::Container, list_budget, limits) {
+            Ok(l) => l
+                .records
+                .into_iter()
+                .map(|r| r.id.as_str().to_owned())
+                .collect(),
+            Err(e) => {
+                result.scan = OrphanScan::ListFailed(e.code().as_str());
+                return result;
+            }
+        };
 
     // 3. 記録の無い ID だけ core を照会し、`NOT_FOUND` のときだけ解放する。
     for (index, id) in ids.iter().enumerate() {
@@ -199,6 +211,7 @@ pub fn reclaim_orphan_bundles(
         let remaining = budget.total.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             result.not_attempted = count_without_record(&ids[index..], &with_record);
+            result.kept_has_record += ids.len() - index - result.not_attempted;
             break;
         }
         match probe_core_presence(runtime, id, budget.per_record.min(remaining)) {
@@ -213,9 +226,12 @@ pub fn reclaim_orphan_bundles(
             }
         }
         let remaining = budget.total.saturating_sub(start.elapsed());
-        let per = budget
-            .per_record
-            .min(remaining.max(Duration::from_millis(1)));
+        if remaining.is_zero() {
+            result.not_attempted = count_without_record(&ids[index..], &with_record);
+            result.kept_has_record += ids.len() - index - result.not_attempted;
+            break;
+        }
+        let per = budget.per_record.min(remaining);
         let b = Arc::clone(bundles);
         let release_id = id.clone();
         match with_deadline(per, move || b.release(&release_id)) {
@@ -225,6 +241,7 @@ pub fn reclaim_orphan_bundles(
                 // 切り離したスレッドが解放を続けても無害（消えるか残るかのどちらか）。以後は打ち切る。
                 result.release_timed_out += 1;
                 result.not_attempted = count_without_record(&ids[index + 1..], &with_record);
+                result.kept_has_record += ids.len() - index - 1 - result.not_attempted;
                 break;
             }
         }

@@ -713,9 +713,17 @@ impl CriRuntimeService {
                 result.kept += 1;
                 continue;
             }
+            // 各段階の直前に全体期限の残りを再計算する。尽きていれば新たな処理を始めない（REPAIR-5）。
+            let remaining = budget.total.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                result.not_attempted = ids.len() - index;
+                break;
+            }
             let bundles = Arc::clone(&binding.bundles);
             let release_id = id.clone();
-            let released = call_with_deadline(per, move || bundles.release(&release_id));
+            let released = call_with_deadline(budget.per_record.min(remaining), move || {
+                bundles.release(&release_id)
+            });
             if !matches!(released, Some(Ok(()))) {
                 result.release_failed += 1;
                 continue;
@@ -725,11 +733,16 @@ impl CriRuntimeService {
                 continue;
             };
             let remaining = budget.total.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                // bundle は解放済みで記録だけ残る。次回起動で再び拾われ release は冪等。
+                result.record_remove_failed += 1;
+                result.not_attempted = ids.len() - index - 1;
+                break;
+            }
             let store = Arc::clone(store);
-            let removed = call_with_deadline(
-                per.min(remaining.max(Duration::from_millis(1))),
-                move || store.remove(RecordKind::Container, &record_id),
-            );
+            let removed = call_with_deadline(budget.per_record.min(remaining), move || {
+                store.remove(RecordKind::Container, &record_id)
+            });
             if matches!(removed, Some(Ok(()))) {
                 result.released += 1;
             } else {

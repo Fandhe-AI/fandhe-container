@@ -234,6 +234,7 @@ impl CriPluginBackends {
     }
 
     /// `production()` が取ったインスタンスロック（注入で組んだときは `None`。R8 #2937 の孤児 bundle の回収が使う）。
+    #[cfg(unix)]
     pub(crate) fn instance_lock(&self) -> Option<&crate::instance_lock::InstanceLock> {
         self._instance_lock.as_deref()
     }

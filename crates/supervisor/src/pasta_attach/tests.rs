@@ -356,13 +356,14 @@ fn net9_container_exit_stops_pasta_then_holder_once() {
     // 生きている間は何も止めない。
     assert!(p.wait(Duration::ZERO).expect("wait").is_none());
     assert!(events(&ev).is_empty());
-    let exit = p.wait(Duration::ZERO).expect("wait").expect("exited");
-    assert_eq!(exit, ProcessExit::Exited(3));
-    // 期限が 0 のときの後始末は専用スレッドで継続する(REPAIR-5)。完了を有限時間だけ待つ。
+    // 期限が 0 のときの後始末は専用スレッドで継続する(REPAIR-5)。終了は後始末の完了後にだけ返る(CORE-2)。
     let until = Instant::now() + Duration::from_secs(5);
-    while events(&ev).len() < 3 && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(5));
+    let mut exit = None;
+    while exit.is_none() && Instant::now() < until {
+        exit = p.wait(Duration::ZERO).expect("wait");
+        std::thread::sleep(Duration::from_millis(2));
     }
+    assert_eq!(exit, Some(ProcessExit::Exited(3)));
     assert_eq!(
         events(&ev),
         [
@@ -746,11 +747,16 @@ fn repair1_slow_teardown_is_joined_before_drop_returns() {
         w.logger.clone(),
     );
     let t = Instant::now();
-    assert_eq!(
-        g.wait(Duration::ZERO).expect("wait"),
-        Some(ProcessExit::Exited(0))
-    );
-    assert!(t.elapsed() < Duration::from_millis(250));
+    // 期限内に後始末が終わらないときは終了を返さない(Stopped の記録が後始末より先に起きない。CORE-2)。
+    assert_eq!(g.wait(Duration::ZERO).expect("wait"), None);
+    assert!(t.elapsed() < Duration::from_millis(100));
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut exit = None;
+    while exit.is_none() && Instant::now() < until {
+        exit = g.wait(Duration::from_millis(20)).expect("wait");
+    }
+    assert_eq!(exit, Some(ProcessExit::Exited(0)));
+    assert_eq!(events(&ev).len(), 3);
     drop(g);
     assert_eq!(
         events(&ev),

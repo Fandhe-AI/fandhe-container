@@ -1014,6 +1014,10 @@ pub struct PastaGuardedProcess {
     signals: Mutex<SignalState>,
     /// 期限内に終わらなかった teardown のスレッド。回収まで追跡し、`wait` / `terminate` / drop で join する（REPAIR-1）。
     teardown_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// PID 1 の終了を観測したが helper の後始末が未完了のため、まだ呼び出し元へ返していない終了状態。
+    /// 後始末の完了後にだけ `Some(exit)` を返す(旧 supervisor の遅れた teardown が、同じ ID で再作成された
+    /// 新しい `@pasta/<id>` を消す窓を作らない。CORE-2・NET-9)。
+    pending_exit: Mutex<Option<ProcessExit>>,
     unexpected: AtomicBool,
     /// SIGTERM から SIGKILL へ上げるまでの猶予(既定 [`TERM_GRACE`]。試験が縮める)。
     term_grace: Duration,
@@ -1050,12 +1054,18 @@ impl PastaGuardedProcess {
         let _ = handle.join();
     }
 
+    /// helper の後始末が残っているか(attachment が未消費、または teardown のスレッドが継続中)。
+    fn teardown_pending(&self) -> bool {
+        lock(&self.attachment).is_some() || lock(&self.teardown_worker).is_some()
+    }
+
     fn new(inner: Box<dyn LaunchedProcess>, attachment: Attachment, logger: Logger) -> Self {
         Self {
             inner,
             attachment: Mutex::new(Some(attachment)),
             signals: Mutex::new(SignalState::default()),
             teardown_worker: Mutex::new(None),
+            pending_exit: Mutex::new(None),
             unexpected: AtomicBool::new(false),
             term_grace: TERM_GRACE,
             logger,
@@ -1221,12 +1231,35 @@ impl LaunchedProcess for PastaGuardedProcess {
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
         let deadline = Instant::now() + timeout;
         self.reap_teardown_worker(false);
-        let result = self.inner.wait(timeout)?;
+        let cached = lock(&self.pending_exit).take();
+        let result = match cached {
+            Some(exit) => {
+                // 後始末の完了待ち。期限まで短い周期で回収を試みる(REPAIR-5)。
+                while self.teardown_pending() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5).min(timeout));
+                    self.reap_teardown_worker(false);
+                }
+                Some(exit)
+            }
+            None => self.inner.wait(timeout)?,
+        };
         match result {
-            Some(_) => self.teardown_bounded("container_exit", deadline),
-            None => self.check_helpers(),
+            Some(exit) => {
+                self.teardown_bounded("container_exit", deadline);
+                self.reap_teardown_worker(false);
+                if self.teardown_pending() {
+                    // 後始末が終わるまで終了を返さない。呼び出し元(monitor)は Stopped を記録せず次の周期で再度呼ぶ。
+                    *lock(&self.pending_exit) = Some(exit);
+                    Ok(None)
+                } else {
+                    Ok(Some(exit))
+                }
+            }
+            None => {
+                self.check_helpers();
+                Ok(None)
+            }
         }
-        Ok(result)
     }
 
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {

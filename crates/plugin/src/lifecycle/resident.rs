@@ -340,8 +340,13 @@ impl ResidentPlugin {
         );
         let listener = UdsListener::bind_before(&plugin.socket_dir.join(name), deadline)?;
 
-        let (child_stderr, reader) = stderr_channel(deadline)
-            .map_err(|e| stderr_prepare_error(&e, "failed to prepare capturing plugin stderr"))?;
+        let (child_stderr, reader) = stderr_channel(deadline).map_err(|e| {
+            stderr_prepare_error(
+                &e,
+                "failed to prepare capturing plugin stderr",
+                start_timeout_error,
+            )
+        })?;
         // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
         let mut guard = {
             // spawn 前の失敗なので子は存在しない。
@@ -356,7 +361,11 @@ impl ResidentPlugin {
                 drop(listener);
                 return Err(reap_after_failure(
                     &mut guard,
-                    stderr_prepare_error(&e, "failed to start capturing plugin stderr"),
+                    stderr_prepare_error(
+                        &e,
+                        "failed to start capturing plugin stderr",
+                        start_timeout_error,
+                    ),
                 ));
             }
         };

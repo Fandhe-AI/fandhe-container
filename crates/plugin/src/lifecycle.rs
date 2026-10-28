@@ -1189,9 +1189,14 @@ fn rpc_timeout(remaining: Duration) -> Result<RpcTimeout, PluginError> {
 
 /// stderr 収集の準備で失敗した `io::Error` を写す。ゲート待ちの期限切れ（`TimedOut`）は `Timeout`、
 /// それ以外は `Internal`（`message` 付き）にする（REPAIR-5。`spawn_gate::create_fds` の契約）。
-fn stderr_prepare_error(e: &io::Error, message: &'static str) -> PluginError {
+/// 期限切れ時の `Timeout` の文言は呼び出し側（都度起動・常駐）が `on_timeout` で与える。
+fn stderr_prepare_error(
+    e: &io::Error,
+    message: &'static str,
+    on_timeout: fn() -> PluginError,
+) -> PluginError {
     if e.kind() == io::ErrorKind::TimedOut {
-        return timeout_error();
+        return on_timeout();
     }
     PluginError::new(PluginErrorCode::Internal, message)
 }
@@ -1441,6 +1446,7 @@ fn call_once_inner(
                 Err(stderr_prepare_error(
                     &e,
                     "failed to prepare capturing plugin stderr",
+                    timeout_error,
                 )),
                 PluginStderr::empty(),
             );
@@ -1467,7 +1473,7 @@ fn call_once_inner(
             drop(listener);
             let error = reap_after_failure(
                 &mut guard,
-                stderr_prepare_error(&e, "failed to start capturing plugin stderr"),
+                stderr_prepare_error(&e, "failed to start capturing plugin stderr", timeout_error),
             );
             return (Err(error), PluginStderr::empty());
         }
@@ -1666,12 +1672,12 @@ mod tests {
     fn repair5_stderr_prepare_timeout_maps_to_timeout() {
         let e = io::Error::new(io::ErrorKind::TimedOut, "gate");
         assert_eq!(
-            stderr_prepare_error(&e, "m").code(),
+            stderr_prepare_error(&e, "m", timeout_error).code(),
             PluginErrorCode::Timeout
         );
         let e = io::Error::other("x");
         assert_eq!(
-            stderr_prepare_error(&e, "m").code(),
+            stderr_prepare_error(&e, "m", timeout_error).code(),
             PluginErrorCode::Internal
         );
     }

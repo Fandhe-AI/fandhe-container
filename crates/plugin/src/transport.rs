@@ -185,7 +185,12 @@ impl UdsListener {
     /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
     /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
-        Self::bind_before(path, Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT)
+        #[cfg(unix)]
+        let wait = crate::spawn_gate::GATE_WAIT_DEFAULT;
+        // 非 unix ではゲートが無く `bind` は常に `Unimplemented` を返すため、待ち時間は使われない。
+        #[cfg(not(unix))]
+        let wait = Duration::ZERO;
+        Self::bind_before(path, Instant::now() + wait)
     }
 
     /// [`Self::bind`] の、`spawn_gate` の待ちを `deadline` までに限る版（期限切れは `Timeout`。REPAIR-5）。
@@ -1518,7 +1523,7 @@ mod imp {
     use crate::frame::Frame;
     use std::io;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// 構築不能（非 unix では listener を作れない）。
     #[derive(Debug)]

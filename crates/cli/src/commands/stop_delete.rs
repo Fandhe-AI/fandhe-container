@@ -807,9 +807,8 @@ fn remove_pasta_leftovers_after_delete(store: &dyn StateStore, req: &DeleteReque
     };
     let root = root.to_path_buf();
     let id = req.id().clone();
-    if !id_is_still_deleted(&root, &id) {
-        return;
-    }
+    // 不在の再確認は ID ロックの下(`remove_pasta_leftovers_locked`)の作業スレッドで行う。ここで同期のストア open を
+    // しない(止まった状態ルートで delete が戻らなくならないよう、全体を期限つきの待ちに収める。REPAIR-5)。
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(remove_pasta_leftovers_locked(&root, &id));

@@ -889,8 +889,32 @@ jobs:
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
-        timeout-minutes: 5
-        run: make cli-parity-selftest
+        # 本ステップだけ timeout-minutes 10（他の自己テストは 5。#3238）。Windows の Git Bash はプロセス生成が遅く、
+        # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限 60 分の範囲内
+        timeout-minutes: 10
+        run: |
+          date +%s > "$RUNNER_TEMP/cli-parity-selftest.start"
+          make cli-parity-selftest
+
+      # 上の自己テストの所要時間と上限（600 秒）との比を Step Summary に残し、余裕を可視化する（#3238）。
+      # 70% 超は警告のみ（失敗にしない。超過そのものは本体ステップが落とす）。値は整数と OS 名だけ
+      - name: CLI 3 OS 比較スクリプトの自己テストの所要時間（#3238）
+        if: always() && env.HANG_PROBE != 'true'
+        timeout-minutes: 1
+        run: |
+          f="$RUNNER_TEMP/cli-parity-selftest.start"
+          if [ ! -f "$f" ]; then
+            echo "cli-parity-selftest duration: not run on $RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          elapsed=$(( $(date +%s) - $(cat "$f") ))
+          limit=600
+          ratio=$(( elapsed * 100 / limit ))
+          msg="os=$RUNNER_OS elapsed=${elapsed}s limit=${limit}s ratio=${ratio}%"
+          echo "cli-parity-selftest duration: $msg" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ratio" -gt 70 ]; then
+            echo "::warning::cli-parity-selftest took ${ratio}% of its timeout on $RUNNER_OS"
+          fi
 
       # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125・CLI-1・REPAIR-5）。
       # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）。

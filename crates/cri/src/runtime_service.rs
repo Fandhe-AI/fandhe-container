@@ -96,7 +96,8 @@
 //! `<状態ルート>/.cri/records/` に 1 件 1 ファイルで置く層が `record_store` サブモジュール
 //! （トレイト [`RecordStore`] とファイル実装 `FileRecordStore`〔unix のみ〕）。
 //! sandbox 記録の書く・消す時点は [`CriRuntimeService::with_record_store`] で注入すると有効になる（R4 #2933）。
-//! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。コンテナ記録（R5）・
+//! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。
+//! コンテナ記録の書く・消す時点は、実行層接続時（`with_runtime` も注入）の経路に限って有効になる（R5 #2934）。
 //! コンテナの再採用と照合（R7）・本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
 //!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
@@ -142,7 +143,7 @@ use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
     initial_stop_signal, validate_create_request,
 };
-use record::SandboxRecordData;
+use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
 
 pub use readopt::{BrokenRecordCounts, SandboxReadoption};
@@ -434,6 +435,9 @@ struct InFlightGuard {
     /// 実行層が報告した終了の内容（終了コードと OOM 等の終了理由。Stop の commit と Start の終了済み応答の
     /// 後始末で記録へ反映する。不明は None のままで、reason を空にする。CRI-2・CORE-4・REPAIR-3）。
     exit: ExitReport,
+    /// コンテナ記録の書き込み先（実行層接続時かつ記録ストア注入時だけ、worker の先頭で `arm_record_store` する。
+    /// R5 #2934）。`None` の間は何も書かない。
+    store: Option<Arc<dyn RecordStore>>,
 }
 
 impl InFlightGuard {
@@ -447,7 +451,75 @@ impl InFlightGuard {
             outcome_unknown: false,
             confirmed_exited: false,
             exit: ExitReport::default(),
+            store: None,
         }
+    }
+
+    /// コンテナ記録の書き込み先を持たせる。`arm_bundles` と同じ理由で、worker スレッドの先頭でだけ呼ぶ
+    /// （起動前のクロージャ破棄が RPC スレッドで fsync を伴う I/O を走らせて期限を無視しない。REPAIR-5）。
+    fn arm_record_store(&mut self, store: Option<Arc<dyn RecordStore>>) {
+        self.store = store;
+    }
+
+    /// 記録の複製を取り、`at_nanos` を確定時刻として遷移後の内容へ投影してバイト列にする（ロックは符号化の前に
+    /// 外す）。`write_ahead` なら `in_flight=create` つきで、遷移は適用しない。R5 #2934。
+    fn container_bytes(
+        &self,
+        at_nanos: i64,
+        write_ahead: bool,
+    ) -> Result<(RecordId, Vec<u8>), CriError> {
+        let fail = || CriError::internal(CONTAINER_PERSIST_FAILED);
+        let (mut record, in_flight) = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry.containers.get(&self.id).ok_or_else(fail)?.clone();
+            (record, write_ahead.then_some(InFlightKind::Create))
+        };
+        if !write_ahead {
+            match self.kind {
+                InFlightKind::Start => {
+                    record.state = ContainerState::Running;
+                    record.started_at_nanos = at_nanos;
+                }
+                InFlightKind::Stop => {
+                    record.state = ContainerState::Exited;
+                    record.finished_at_nanos = at_nanos;
+                    record.exit_code = self.exit.code;
+                    record.termination = self.exit.termination;
+                }
+                InFlightKind::Create | InFlightKind::Remove => {}
+            }
+        }
+        let bytes = ContainerRecordData::from_registry(&self.id, &record, in_flight).encode()?;
+        let record_id = RecordId::new(&self.id).map_err(|_| fail())?;
+        Ok((record_id, bytes))
+    }
+
+    /// 実行層を呼ぶ前の write-ahead（`in_flight=create`）。ストア未注入なら何もしない。失敗は固定文言の
+    /// `INTERNAL` で、呼び出し側は実行層を呼ばずに返す（巻き戻しは `Drop` が記録の削除まで行う）。
+    fn write_ahead(&self) -> Result<(), CriError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let (record_id, bytes) = self.container_bytes(now_nanos()?, true)?;
+        store
+            .put(RecordKind::Container, &record_id, &bytes)
+            .map_err(|_| CriError::internal(CONTAINER_PERSIST_FAILED))
+    }
+
+    /// 実行層での削除と bundle の解放が済んだ後に記録ファイルを消す（Remove 専用。無ければ成功）。
+    /// 失敗したら呼び出し側は bundle の解放失敗と同じ扱い（記録を保持して再試行できる）にする。
+    fn remove_record(&self) -> Result<(), CriError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let record_id =
+            RecordId::new(&self.id).map_err(|_| CriError::internal(CONTAINER_UNPERSIST_FAILED))?;
+        store
+            .remove(RecordKind::Container, &record_id)
+            .map_err(|_| CriError::internal(CONTAINER_UNPERSIST_FAILED))
     }
 
     /// 実行層が報告した終了コードと終了理由を、commit または破棄時の exited 反映で記録へ書くよう保持する（CRI-2・CORE-4）。
@@ -484,10 +556,27 @@ impl InFlightGuard {
     }
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
+    ///
+    /// コンテナ記録の確定版は、`in_flight` が立っている間に書いてからメモリを確定する（put→commit）。確定後に
+    /// 書くと、`in_flight` が外れた後で並行する Remove がファイルを消し、遅れた put が所有者の無い記録を作り直す。
+    /// 書けなかったときはメモリを確定したまま固定文言の `INTERNAL` を返す（実行層に結果があるため巻き戻さない。
+    /// 次回起動時は古い記録と core の状態で照合され安全側に倒れる。R5 #2934）。メモリの確定自体の失敗は
+    /// `committed` が偽のまま返り、`Drop` が巻き戻す。
     fn commit(&mut self) -> Result<(), CriError> {
-        commit_in_flight(&self.registry, &self.id, self.kind, self.exit)?;
+        let at_nanos = now_nanos()?;
+        let persisted = match &self.store {
+            Some(store) if self.kind != InFlightKind::Remove => self
+                .container_bytes(at_nanos, false)
+                .and_then(|(record_id, bytes)| {
+                    store
+                        .put(RecordKind::Container, &record_id, &bytes)
+                        .map_err(|_| CriError::internal(CONTAINER_PERSIST_FAILED))
+                }),
+            _ => Ok(()),
+        };
+        commit_in_flight(&self.registry, &self.id, self.kind, self.exit, at_nanos)?;
         self.committed = true;
-        Ok(())
+        persisted
     }
 }
 
@@ -504,6 +593,15 @@ impl Drop for InFlightGuard {
                 && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
                 && bundles.release(&self.id).is_err()
+            {
+                self.outcome_unknown = true;
+            }
+            // bundle の解放まで済んだら、write-ahead の記録ファイルを消す（無ければ成功）。消せなければ資源の
+            // 所有者の証明が残るため結果不明と同じ扱い（メモリの記録と件数枠を保持し、RemoveContainer の
+            // delete〔NOT_FOUND〕→ release〔冪等〕→ 記録の削除で回収する。R5 #2934・CRI-2）。
+            if self.kind == InFlightKind::Create
+                && !self.outcome_unknown
+                && self.remove_record().is_err()
             {
                 self.outcome_unknown = true;
             }
@@ -1023,6 +1121,10 @@ impl Drop for SandboxRecordWriteGuard {
 
 /// 記録ストアの書き込み失敗の固定文言（ID・パス・errno を載せない。REPAIR-4）。
 const SANDBOX_PERSIST_FAILED: &str = "sandbox record could not be persisted";
+/// コンテナ記録の書き込み失敗の固定文言（ID・パス・errno を載せない。REPAIR-4）。
+const CONTAINER_PERSIST_FAILED: &str = "container record could not be persisted";
+/// コンテナ記録の削除失敗の固定文言。
+const CONTAINER_UNPERSIST_FAILED: &str = "container record could not be removed";
 /// 記録ストアの削除失敗の固定文言。
 const SANDBOX_UNPERSIST_FAILED: &str = "sandbox record could not be removed";
 /// 記録の書き込み中の並行操作を拒否する固定文言。
@@ -1176,8 +1278,8 @@ fn commit_in_flight(
     id: &str,
     kind: InFlightKind,
     exit: ExitReport,
+    at_nanos: i64,
 ) -> Result<(), CriError> {
-    let at_nanos = now_nanos()?;
     if kind == InFlightKind::Remove {
         // 実行層の削除と bundle の解放を終えた。記録・名前キー・件数枠を解放する（ロックは中で取る）。
         return drop_container_in(registry, id, true);
@@ -1537,8 +1639,16 @@ impl CriRuntimeService {
     ///
     /// 起動時の sandbox の再採用は [`Self::readopt_sandboxes`]（R6 #2935。実装済み）。
     ///
-    /// 未実装（REPAIR-3）: コンテナ記録の書く・消す時点は R5 #2934、コンテナの再採用と照合は R7 #2936、
-    /// 本番の配線は R9 #2938。
+    /// コンテナ記録（R5 #2934）は、実行層接続時（`with_runtime` も注入）の経路だけが書く。スタブ経路
+    /// （`with_runtime` 未注入）は core に所有者の無い記録で、起動時の照合の対象にならないため書かない。
+    /// - `CreateContainer`: 実行層を呼ぶ前に `in_flight=create` で書き（write-ahead）、成功したら確定版へ置き換える。
+    ///   書けなければ副作用を起こさず `INTERNAL`。巻き戻しは「未作成」または「削除完了と bundle の解放を確認できた」
+    ///   ときに限って記録を消し、結果不明・解放失敗では保持する（fail-closed）
+    /// - `StartContainer`・`StopContainer`・`StopPodSandbox` の配下: 実行層の成功後に状態と時刻を書く。
+    ///   書けなければメモリを確定したまま `INTERNAL`（次回起動時は core の状態で照合される）
+    /// - `RemoveContainer`・`RemovePodSandbox` の配下: `delete` と bundle の解放の成功後に記録を消す
+    ///
+    /// 未実装（REPAIR-3）: コンテナの再採用と照合は R7 #2936、本番の配線は R9 #2938。
     pub fn with_record_store(mut self, store: Arc<dyn RecordStore>) -> Self {
         self.record_store = Some(store);
         self
@@ -2673,6 +2783,7 @@ impl CriRuntimeService {
         let id = container_id.clone();
         let timeout = self.runtime_timeout;
         let registry = Arc::clone(&self.registry);
+        let record_store = self.record_store.clone();
         let max_retained_bytes = self.container_limits.max_retained_bytes();
         // RPC の期限切れ・future の破棄で、dispatch 前の worker を打ち切る（#2899）。dispatch 後は打ち切らない
         // （core の create は外部プロセスとファイル I/O を伴い、途中で止める口が無い。docs/design/container-log-removal-wait.md）。
@@ -2686,7 +2797,14 @@ impl CriRuntimeService {
         let outcome = run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
+            guard.arm_record_store(record_store);
             // 起動前に手放されていたら prepare もしない（guard の Drop が release と記録の巻き戻しを行う）。
+            if settlement.is_abandoned() {
+                return Err(CriError::timeout("runtime operation timed out"));
+            }
+            // 実行層に資源を作る前に、`in_flight=create` で記録を書く（write-ahead）。書けなければ prepare も
+            // create も呼ばない。書き込み中に手放されたら、続く prepare をしない（Drop が記録を消す）。
+            guard.write_ahead()?;
             if settlement.is_abandoned() {
                 return Err(CriError::timeout("runtime operation timed out"));
             }
@@ -2727,7 +2845,9 @@ impl CriRuntimeService {
                 return Err(CriError::internal("runtime returned an unexpected state"));
             }
             if let Err(status) = guard.commit() {
-                if confirm_removed(&adapter, &id, timeout) {
+                // メモリを確定済みで記録の書き込みだけが失敗した場合は、実行層に作成済みの資源があるまま
+                // 確定している。削除の確認も巻き戻しもしない（R5 #2934）。
+                if !guard.committed && confirm_removed(&adapter, &id, timeout) {
                     guard.mark_definitely_failed();
                 }
                 return Err(status);
@@ -2827,9 +2947,11 @@ impl CriRuntimeService {
         let log_path = self.start_log_path(&id)?;
         let adapter = binding.adapter.clone();
         let timeout = self.runtime_timeout;
+        let record_store = self.record_store.clone();
         // 結果の確定と巻き戻しは worker が所有する。期限超過・中断では結果不明のまま worker が終わるのを待ち、
         // その間 `in_flight` が残る（新たな Start・Remove は拒否される）。
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
+            guard.arm_record_store(record_store);
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
             let status = match adapter.start_with_log_path(&id, log_path) {
@@ -2950,10 +3072,12 @@ impl CriRuntimeService {
     ) -> Result<(), CriError> {
         let adapter = binding.adapter.clone();
         let id = guard.id.clone();
+        let record_store = self.record_store.clone();
         let grace = Duration::from_secs(u64::try_from(grace_secs).unwrap_or(0));
         run_bounded(
             self.runtime_timeout.saturating_add(grace),
             move || -> Result<(), CriError> {
+                guard.arm_record_store(record_store);
                 guard.mark_dispatched();
                 match adapter.stop_with_signal(&id, grace_secs, signal) {
                     Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
@@ -3033,7 +3157,9 @@ impl CriRuntimeService {
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
         let id = guard.id.clone();
+        let record_store = self.record_store.clone();
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
+            guard.arm_record_store(record_store);
             guard.mark_dispatched();
             match adapter.remove(&id, true) {
                 Ok(_) => {}
@@ -3049,6 +3175,13 @@ impl CriRuntimeService {
             if let Err(status) = bundles.release(&id) {
                 // 実行層の削除は完了している。状態は exited（終了時刻つき）にして記録と件数枠だけを
                 // 再試行用に保持する（実プロセスが消えたのに running と公開し続けない）。
+                guard.mark_confirmed_exited();
+                guard.mark_definitely_failed();
+                return Err(status);
+            }
+            // 記録ファイルは delete と解放の成功後に消す。消せなければ解放の失敗と同じ扱い（記録は exited・
+            // `runtime_owned` のまま保持し、再試行は delete〔NOT_FOUND〕→ 解放〔冪等〕→ 記録の削除へ進む。R5 #2934）。
+            if let Err(status) = guard.remove_record() {
                 guard.mark_confirmed_exited();
                 guard.mark_definitely_failed();
                 return Err(status);

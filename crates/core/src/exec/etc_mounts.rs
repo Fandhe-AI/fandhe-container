@@ -25,7 +25,7 @@
 //!
 //! 1. **先の固定**: rootfs の fd から `etc` を `O_PATH|O_NOFOLLOW|O_DIRECTORY` で開く。無い・symlink・非ディレクトリは
 //!    `InvalidArgument`。続けて `etc` の fd の下の `hosts` / `resolv.conf` を `O_PATH|O_NOFOLLOW` で開く。symlink や
-//!    通常ファイル以外は `InvalidArgument`（`RESOLVE_IN_ROOT` での解決は未対応。D9 の残余）。親ディレクトリは作らない
+//!    通常ファイル以外は `InvalidArgument`（symlink は解決せず拒否を続ける。D9 の決定・#3210）。親ディレクトリは作らない
 //! 2. **先が無いとき**: 書き込み可能な rootfs なら空の通常ファイル（0644）を `O_EXCL|O_NOFOLLOW` で作る。実効の
 //!    `root.readonly=true`（`read_only`）や `EROFS` では rootfs へ書かず `FailedPrecondition` で拒否する
 //! 3. **shared の上には載せない**: 先の属するマウントが shared なら `FailedPrecondition`
@@ -46,8 +46,8 @@
 //! - 本番の起動経路は `RootfulHostRoot` を launcher が `UNIMPLEMENTED` で拒否している（#2241・SEC-5）ため、動くのは rootless の
 //!   2 モデルだけ。rootful 固有の分岐は持たない
 //! - 範囲写像でコンテナの uid 0 が実効 uid に写らない構成では、元の辿り直しが `EACCES` になり `FailedPrecondition` で拒否する
-//! - 先が symlink の場合の `RESOLVE_IN_ROOT` での解決は未対応（拒否のみ。監査 sink への記録もしない。ホストへの脱出が成立する
-//!   前に fd 起点の辿りで止まるため）
+//! - 先が symlink の場合は解決せず拒否する（D9 の決定・#3210。再検討の条件は D9 の「残余・見直し条件」）。違反記録は付けて
+//!   親へ渡すが、本番の sink への配線は `violation.rs` の記述どおり未実装
 //! - `/etc/hostname` は対象外（D9）
 
 use std::ffi::CString;
@@ -378,8 +378,21 @@ pub(super) enum TargetAction {
     CreateThenMount,
 }
 
+/// 先が symlink のときの利用者向けの固定文言（NET-12・SEC-1・D9）。rootfs から読んだ値は入れない。
+fn symlink_message(kind: EtcFileKind) -> &'static str {
+    match kind {
+        EtcFileKind::Hosts => {
+            "/etc/hosts in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image)"
+        }
+        EtcFileKind::ResolvConf => {
+            "/etc/resolv.conf in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image, or remove it when the rootfs is writable)"
+        }
+    }
+}
+
 /// 先の規則の判定（純関数。モジュール doc の契約 1・2）。
 pub(super) fn judge_target(
+    kind: EtcFileKind,
     etc: EtcDirState,
     target: TargetState,
     read_only: bool,
@@ -407,7 +420,7 @@ pub(super) fn judge_target(
         TargetState::Missing => Ok(TargetAction::CreateThenMount),
         TargetState::Symlink => Err(violation(
             ViolationReason::PathSymlinkOrNotDirectory,
-            "the container etc mount destination is a symbolic link",
+            symlink_message(kind),
         )),
         TargetState::Other => Err(violation(
             ViolationReason::BindTargetKindMismatch,
@@ -536,7 +549,7 @@ fn apply_one(
         },
         None => TargetState::Missing,
     };
-    let action = judge_target(etc_state, target_state, read_only)?;
+    let action = judge_target(kind, etc_state, target_state, read_only)?;
     let Some(etc) = etc_fd else {
         return Err(fail(
             ErrorCode::Internal,
@@ -798,51 +811,66 @@ mod tests {
     #[test]
     fn net12_judge_target_follows_the_d9_rules() {
         use EtcDirState as E;
+        use EtcFileKind as K;
         use TargetState as T;
         assert_eq!(
-            judge_target(E::Directory, T::Regular, false).expect("mount"),
+            judge_target(K::Hosts, E::Directory, T::Regular, false).expect("mount"),
             TargetAction::Mount
         );
         assert_eq!(
-            judge_target(E::Directory, T::Regular, true).expect("mount ro"),
+            judge_target(K::Hosts, E::Directory, T::Regular, true).expect("mount ro"),
             TargetAction::Mount
         );
         assert_eq!(
-            judge_target(E::Directory, T::Missing, false).expect("create"),
+            judge_target(K::Hosts, E::Directory, T::Missing, false).expect("create"),
             TargetAction::CreateThenMount
         );
         assert_eq!(
-            judge_target(E::Directory, T::Missing, true)
+            judge_target(K::Hosts, E::Directory, T::Missing, true)
                 .expect_err("ro missing")
                 .code,
             ErrorCode::FailedPrecondition
         );
         for t in [T::Symlink, T::Other] {
             assert_eq!(
-                judge_target(E::Directory, t, false).expect_err("bad").code,
+                judge_target(K::Hosts, E::Directory, t, false)
+                    .expect_err("bad")
+                    .code,
                 ErrorCode::InvalidArgument,
                 "{t:?}"
             );
         }
+        // #3210: symlink の文言は種別ごとの固定文字列（rootfs の値を含めない）。
+        let hosts = judge_target(K::Hosts, E::Directory, T::Symlink, false).expect_err("symlink");
+        assert_eq!(
+            hosts.message,
+            "/etc/hosts in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image)"
+        );
+        let resolv =
+            judge_target(K::ResolvConf, E::Directory, T::Symlink, false).expect_err("symlink");
+        assert_eq!(
+            resolv.message,
+            "/etc/resolv.conf in the rootfs is a symbolic link; the container etc mount does not follow symbolic links (replace it with a regular file in the image, or remove it when the rootfs is writable)"
+        );
         // SEC-4: 境界違反は違反記録を持ち、親の監査経路へ渡る。
         for (t, want) in [
             (T::Symlink, ViolationReason::PathSymlinkOrNotDirectory),
             (T::Other, ViolationReason::BindTargetKindMismatch),
         ] {
-            let v = judge_target(E::Directory, t, false)
+            let v = judge_target(K::Hosts, E::Directory, t, false)
                 .expect_err("bad")
                 .violation
                 .expect("violation record");
             assert_eq!(v.reason, want, "{t:?}");
         }
-        let v = judge_target(E::Other, T::Regular, false)
+        let v = judge_target(K::Hosts, E::Other, T::Regular, false)
             .expect_err("bad etc")
             .violation
             .expect("violation record");
         assert_eq!(v.reason, ViolationReason::PathSymlinkOrNotDirectory);
         for e in [E::Missing, E::Other] {
             assert_eq!(
-                judge_target(e, T::Regular, false)
+                judge_target(K::Hosts, e, T::Regular, false)
                     .expect_err("bad etc")
                     .code,
                 ErrorCode::InvalidArgument,

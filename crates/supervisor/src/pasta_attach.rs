@@ -951,22 +951,52 @@ impl ProcessLauncher for PastaAttachingLauncher {
 pub struct PastaGuardedProcess {
     inner: Box<dyn LaunchedProcess>,
     attachment: Mutex<Option<Attachment>>,
-    /// SIGTERM を送った時刻（途中死の検出後）。
-    term_sent_at: Mutex<Option<Instant>>,
-    killed: AtomicBool,
+    /// 途中死の検出後のシグナル送信の状態（成功した送信だけを送信済みとして記録する。REPAIR-5）。
+    signals: Mutex<SignalState>,
+    /// 期限内に終わらなかった teardown のスレッド。回収まで追跡し、`wait` / `terminate` / drop で join する（REPAIR-1）。
+    teardown_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     unexpected: AtomicBool,
     /// SIGTERM から SIGKILL へ上げるまでの猶予(既定 [`TERM_GRACE`]。試験が縮める)。
     term_grace: Duration,
     logger: Logger,
 }
 
+/// 途中死の検出後のシグナル送信の進行。失敗は送信済みに数えず、有限回の再試行の後に段階を上げる。
+#[derive(Default)]
+struct SignalState {
+    /// SIGTERM の送信に成功した時刻（猶予の起点。SIGTERM が送れず上限に達したときは猶予が経過済みの時刻）。
+    term_sent_at: Option<Instant>,
+    term_failures: u32,
+    kill_failures: u32,
+    /// SIGKILL の送信に成功した、または最終手段の terminate まで進めた。
+    killed: bool,
+}
+
+/// シグナル送信の失敗を許す回数（`wait` の周期ごとに 1 回試す）。超えたら次の段階（SIGKILL / terminate）へ進む。
+const MAX_SIGNAL_FAILURES: u32 = 3;
+
 impl PastaGuardedProcess {
+    /// 期限を超えて継続中だった teardown のスレッドを回収する。`block` が偽なら終了済みのときだけ join する。
+    fn reap_teardown_worker(&self, block: bool) {
+        let handle = {
+            let mut g = lock(&self.teardown_worker);
+            match g.take() {
+                Some(h) if block || h.is_finished() => h,
+                other => {
+                    *g = other;
+                    return;
+                }
+            }
+        };
+        let _ = handle.join();
+    }
+
     fn new(inner: Box<dyn LaunchedProcess>, attachment: Attachment, logger: Logger) -> Self {
         Self {
             inner,
             attachment: Mutex::new(Some(attachment)),
-            term_sent_at: Mutex::new(None),
-            killed: AtomicBool::new(false),
+            signals: Mutex::new(SignalState::default()),
+            teardown_worker: Mutex::new(None),
             unexpected: AtomicBool::new(false),
             term_grace: TERM_GRACE,
             logger,
@@ -1010,10 +1040,14 @@ impl PastaGuardedProcess {
                 let _ = tx.send(());
             });
         match spawned {
-            Ok(_) => {
+            Ok(handle) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                // 期限切れでもスレッドは止めずに継続させる（所有権はスレッド側）。
-                let _ = rx.recv_timeout(remaining);
+                if rx.recv_timeout(remaining).is_ok() {
+                    let _ = handle.join();
+                } else {
+                    // 期限切れでも止めず、ハンドルを保持して後続の呼び出しと drop で回収する（未追跡で手放さない）。
+                    *lock(&self.teardown_worker) = Some(handle);
+                }
             }
             Err(_) => {
                 let taken = lock(&cell).take();
@@ -1038,19 +1072,59 @@ impl PastaGuardedProcess {
             self.logger
                 .log(false, "pasta_helper_died", &[("helper", Val::S(which))]);
         }
-        let mut sent = lock(&self.term_sent_at);
+        let mut st = lock(&self.signals);
         let deadline = Instant::now() + SIGNAL_DEADLINE;
-        match *sent {
-            None => {
-                let _ = self.inner.signal(Signal::SIGTERM, deadline);
-                *sent = Some(Instant::now());
+        if st.killed {
+            return;
+        }
+        let kill_due = match st.term_sent_at {
+            Some(at) => at.elapsed() >= self.term_grace,
+            None => false,
+        };
+        if st.term_sent_at.is_none() {
+            match self.inner.signal(Signal::SIGTERM, deadline) {
+                Ok(()) => st.term_sent_at = Some(Instant::now()),
+                Err(e) => {
+                    st.term_failures += 1;
+                    self.logger.log(
+                        false,
+                        "pasta_signal_failed",
+                        &[
+                            ("signal", Val::S("SIGTERM")),
+                            ("code", Val::S(e.code().as_str())),
+                        ],
+                    );
+                    if st.term_failures >= MAX_SIGNAL_FAILURES {
+                        // SIGTERM が届かないまま待ち続けない。次の周期で SIGKILL へ上げる。
+                        st.term_sent_at = Some(
+                            Instant::now()
+                                .checked_sub(self.term_grace)
+                                .unwrap_or_else(Instant::now),
+                        );
+                    }
+                }
             }
-            Some(at)
-                if at.elapsed() >= self.term_grace && !self.killed.swap(true, Ordering::SeqCst) =>
-            {
-                let _ = self.inner.signal(Signal::SIGKILL, deadline);
+        } else if kill_due {
+            match self.inner.signal(Signal::SIGKILL, deadline) {
+                Ok(()) => st.killed = true,
+                Err(e) => {
+                    st.kill_failures += 1;
+                    self.logger.log(
+                        false,
+                        "pasta_signal_failed",
+                        &[
+                            ("signal", Val::S("SIGKILL")),
+                            ("code", Val::S(e.code().as_str())),
+                        ],
+                    );
+                    if st.kill_failures >= MAX_SIGNAL_FAILURES {
+                        // 最終手段: 内側の terminate（自身の期限つき）で回収に進める。以後は繰り返さない。
+                        st.killed = true;
+                        drop(st);
+                        let _ = self.inner.terminate(SIGNAL_DEADLINE);
+                    }
+                }
             }
-            Some(_) => {}
         }
     }
 }
@@ -1059,6 +1133,8 @@ impl Drop for PastaGuardedProcess {
     fn drop(&mut self) {
         // 回収前に手放された場合も helper を残さない（単一スレッドの区間かもしれないので回収スレッドは作らない）。
         self.teardown("drop", false);
+        // 期限を超えて継続中の teardown は、プロセスの終了で打ち切られないようここで回収する（各停止は有限時間）。
+        self.reap_teardown_worker(true);
     }
 }
 
@@ -1069,6 +1145,7 @@ impl LaunchedProcess for PastaGuardedProcess {
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
         let deadline = Instant::now() + timeout;
+        self.reap_teardown_worker(false);
         let result = self.inner.wait(timeout)?;
         match result {
             Some(_) => self.teardown_bounded("container_exit", deadline),
@@ -1081,6 +1158,7 @@ impl LaunchedProcess for PastaGuardedProcess {
         let deadline = Instant::now() + timeout;
         let result = self.inner.terminate(timeout);
         self.teardown_bounded("terminate", deadline);
+        self.reap_teardown_worker(false);
         result
     }
 

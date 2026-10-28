@@ -23,6 +23,7 @@ struct FakeHelper {
     pid: u32,
     alive: Arc<AtomicBool>,
     ev: Events,
+    stop_delay: Duration,
 }
 
 impl HelperHandle for FakeHelper {
@@ -33,6 +34,7 @@ impl HelperHandle for FakeHelper {
         Ok(self.alive.load(Ordering::SeqCst))
     }
     fn stop(&mut self, detach_ok: bool) -> StopReport {
+        std::thread::sleep(self.stop_delay);
         push(&self.ev, format!("stop {} detach={detach_ok}", self.name));
         StopReport {
             kind: StopKind::Stopped,
@@ -52,6 +54,7 @@ struct FakeBackend {
     pasta_result: Mutex<Option<TraitError>>,
     holder_alive: Arc<AtomicBool>,
     pasta_alive: Arc<AtomicBool>,
+    stop_delay: Mutex<Duration>,
 }
 
 impl FakeBackend {
@@ -62,6 +65,7 @@ impl FakeBackend {
             pasta_result: Mutex::new(None),
             holder_alive: Arc::new(AtomicBool::new(true)),
             pasta_alive: Arc::new(AtomicBool::new(true)),
+            stop_delay: Mutex::new(Duration::ZERO),
         })
     }
 }
@@ -78,6 +82,7 @@ impl PastaAttachBackend for FakeBackend {
                 pid: 4242,
                 alive: Arc::clone(&self.holder_alive),
                 ev: Arc::clone(&self.ev),
+                stop_delay: *self.stop_delay.lock().unwrap(),
             }),
             ready_ms: 7,
         })
@@ -93,6 +98,7 @@ impl PastaAttachBackend for FakeBackend {
                 pid: 4343,
                 alive: Arc::clone(&self.pasta_alive),
                 ev: Arc::clone(&self.ev),
+                stop_delay: *self.stop_delay.lock().unwrap(),
             }),
             ready_ms: 11,
         })
@@ -593,4 +599,330 @@ fn sec4_3330_tamper_slot_keeps_first_and_drains() {
     b.set_tamper(R::PermissionDenied);
     assert_eq!(b.take_tamper(), Some(R::RecordChanged));
     assert_eq!(b.take_tamper(), None);
+}
+// ---------------------------------------------------------------------------------------------
+// #3334 のレビュー指摘への試験(後始末の追跡・シグナル失敗の再試行・実プロセスの回収)
+// ---------------------------------------------------------------------------------------------
+
+/// 送信の成否を制御できるコンテナのフェイク。
+struct FlakySignalProcess {
+    ev: Events,
+    fail_term: std::sync::atomic::AtomicU32,
+    fail_kill: std::sync::atomic::AtomicU32,
+}
+
+impl LaunchedProcess for FlakySignalProcess {
+    fn pid(&self) -> NonZeroU32 {
+        NonZeroU32::new(78).unwrap()
+    }
+    fn wait(&self, _t: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        Ok(None)
+    }
+    fn terminate(&self, _t: Duration) -> Result<(), TraitError> {
+        push(&self.ev, "container terminate");
+        Ok(())
+    }
+    fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
+        let counter = if signal == Signal::SIGKILL {
+            &self.fail_kill
+        } else {
+            &self.fail_term
+        };
+        let left = counter.load(Ordering::SeqCst);
+        if left > 0 {
+            counter.store(left - 1, Ordering::SeqCst);
+            push(
+                &self.ev,
+                format!("container signal {} failed", signal.as_u8()),
+            );
+            return Err(TraitError::new(ErrorCode::Timeout, "send timeout"));
+        }
+        push(&self.ev, format!("container signal {}", signal.as_u8()));
+        Ok(())
+    }
+}
+
+fn guarded_flaky(
+    w: &PastaWiring,
+    ev: &Events,
+    fail_term: u32,
+    fail_kill: u32,
+) -> PastaGuardedProcess {
+    let mut g = PastaGuardedProcess::new(
+        Box::new(FlakySignalProcess {
+            ev: Arc::clone(ev),
+            fail_term: fail_term.into(),
+            fail_kill: fail_kill.into(),
+        }),
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    g.term_grace = Duration::from_millis(10);
+    g
+}
+
+/// REPAIR-5: SIGTERM の送信失敗は送信済みに数えず、次の周期で再試行する。
+#[test]
+fn repair5_failed_sigterm_is_retried_not_counted_as_sent() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = guarded_flaky(&w, &ev, 1, 0);
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    g.wait(Duration::ZERO).expect("wait");
+    g.wait(Duration::ZERO).expect("wait");
+    assert_eq!(
+        events(&ev),
+        ["container signal 15 failed", "container signal 15"]
+    );
+}
+
+/// REPAIR-5: SIGKILL の送信失敗は再試行し、成功するまで killed にしない。
+#[test]
+fn repair5_failed_sigkill_is_retried() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = guarded_flaky(&w, &ev, 0, 1);
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    g.wait(Duration::ZERO).expect("wait");
+    std::thread::sleep(Duration::from_millis(30));
+    g.wait(Duration::ZERO).expect("wait");
+    g.wait(Duration::ZERO).expect("wait");
+    g.wait(Duration::ZERO).expect("wait");
+    assert_eq!(
+        events(&ev),
+        [
+            "container signal 15",
+            "container signal 9 failed",
+            "container signal 9"
+        ]
+    );
+}
+
+/// REPAIR-5: SIGKILL が上限回数失敗したら terminate で回収へ進める。
+#[test]
+fn repair5_persistent_sigkill_failure_falls_back_to_terminate() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = guarded_flaky(&w, &ev, 0, 100);
+    backend.pasta_alive.store(false, Ordering::SeqCst);
+    g.wait(Duration::ZERO).expect("wait");
+    std::thread::sleep(Duration::from_millis(30));
+    for _ in 0..6 {
+        g.wait(Duration::ZERO).expect("wait");
+    }
+    let e = events(&ev);
+    assert_eq!(
+        e.iter()
+            .filter(|x| *x == "container signal 9 failed")
+            .count(),
+        3
+    );
+    assert_eq!(e.iter().filter(|x| *x == "container terminate").count(), 1);
+}
+
+/// REPAIR-1・REPAIR-5: 期限内に終わらない後始末は追跡され、drop が完了まで回収する。
+#[test]
+fn repair1_slow_teardown_is_joined_before_drop_returns() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    *backend.stop_delay.lock().unwrap() = Duration::from_millis(150);
+    let (w, _b) = wiring(&backend);
+    attach(&w).expect("attach");
+    ev.lock().unwrap().clear();
+    let g = PastaGuardedProcess::new(
+        FakeProcess::new(&ev, vec![Some(ProcessExit::Exited(0))]),
+        lock(&w.slot).take().expect("attachment"),
+        w.logger.clone(),
+    );
+    let t = Instant::now();
+    assert_eq!(
+        g.wait(Duration::ZERO).expect("wait"),
+        Some(ProcessExit::Exited(0))
+    );
+    assert!(t.elapsed() < Duration::from_millis(250));
+    drop(g);
+    assert_eq!(
+        events(&ev),
+        [
+            "stop pasta detach=true",
+            "stop holder detach=true",
+            "remove run_dir"
+        ]
+    );
+}
+
+/// 実プロセス(sleep)を helper にする backend。回収と run dir の削除を OS 上で照合する。
+struct RealProcBackend {
+    run_dir: std::path::PathBuf,
+    fail_pasta: bool,
+    pids: Mutex<Vec<u32>>,
+}
+
+struct ChildHelper(std::process::Child);
+
+impl HelperHandle for ChildHelper {
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    fn is_alive(&mut self) -> Result<bool, TraitError> {
+        match self.0.try_wait() {
+            Ok(None) => Ok(true),
+            Ok(Some(_)) => Ok(false),
+            Err(_) => Err(TraitError::new(ErrorCode::Internal, "try_wait")),
+        }
+    }
+    fn stop(&mut self, _detach_ok: bool) -> StopReport {
+        let _ = self.0.kill();
+        let st = self.0.wait().ok();
+        StopReport {
+            kind: StopKind::Killed,
+            exit: ExitInfo {
+                code: st.and_then(|s| s.code()),
+                signal: None,
+                stderr: String::new(),
+            },
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+impl RealProcBackend {
+    fn child(&self) -> Spawned {
+        let c = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        self.pids.lock().unwrap().push(c.id());
+        Spawned {
+            handle: Box::new(ChildHelper(c)),
+            ready_ms: 1,
+        }
+    }
+}
+
+impl PastaAttachBackend for RealProcBackend {
+    fn spawn_holder(&self, _u: OwnedFd, _n: OwnedFd, _d: Instant) -> Result<Spawned, TraitError> {
+        std::fs::create_dir_all(&self.run_dir).expect("mkdir");
+        Ok(self.child())
+    }
+    fn spawn_pasta(&self, _h: u32, _d: Instant) -> Result<Spawned, TraitError> {
+        if self.fail_pasta {
+            return Err(TraitError::new(ErrorCode::Internal, "pasta failed"));
+        }
+        Ok(self.child())
+    }
+    fn remove_run_dir(&self) -> Result<(), TraitError> {
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+        Ok(())
+    }
+}
+
+fn real_wiring(tag: &str, fail_pasta: bool) -> (PastaWiring, Arc<RealProcBackend>) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let run_dir = std::env::temp_dir().join(format!(
+        "fc-pasta-attach-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    let backend = Arc::new(RealProcBackend {
+        run_dir,
+        fail_pasta,
+        pids: Mutex::new(Vec::new()),
+    });
+    let logger = Logger {
+        container: Arc::from("web1"),
+        buffer: Arc::new(PastaLogBuffer::new()),
+    };
+    let dynb: Arc<dyn PastaAttachBackend> = Arc::clone(&backend) as Arc<dyn PastaAttachBackend>;
+    (PastaWiring::with_backend(dynb, logger), backend)
+}
+
+fn gone(pid: u32) -> bool {
+    !std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn gone_or_zombie(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(s) => s
+            .rsplit(')')
+            .next()
+            .is_some_and(|r| r.trim_start().starts_with('Z')),
+    }
+}
+
+/// NET-9・REPAIR-12: 実プロセスの helper が、コンテナの正常終了で回収され、run dir が消える。
+#[test]
+fn net9_real_helpers_are_reaped_on_container_exit() {
+    let (w, b) = real_wiring("exit", false);
+    attach(&w).expect("attach");
+    let ev: Events = Arc::default();
+    let g = launcher(&w)
+        .adopt(Ok(FakeProcess::new(
+            &ev,
+            vec![Some(ProcessExit::Exited(0))],
+        )))
+        .unwrap_or_else(|e| panic!("guarded: {:?}", e.code()));
+    g.wait(Duration::from_secs(5)).expect("wait");
+    drop(g);
+    let pids = b.pids.lock().unwrap().clone();
+    assert_eq!(pids.len(), 2);
+    assert!(pids.iter().all(|p| gone(*p)));
+    assert!(!b.run_dir.exists());
+}
+
+/// NET-9・REPAIR-12: 起動失敗(pasta)で、起動済みの holder が回収され、run dir が消える。
+#[test]
+fn net9_real_helpers_are_reaped_on_spawn_failure() {
+    let (w, b) = real_wiring("fail", true);
+    assert!(attach(&w).is_err());
+    let pids = b.pids.lock().unwrap().clone();
+    assert_eq!(pids.len(), 1);
+    assert!(gone(pids[0]));
+    assert!(!b.run_dir.exists());
+    assert!(lock(&w.slot).is_none());
+}
+
+/// NET-9・REPAIR-12: helper が途中で死んだら SIGTERM が送られ、終了後に残りの helper も回収される。
+#[test]
+fn net9_real_helper_mid_death_signals_container_and_reaps_the_rest() {
+    let (w, b) = real_wiring("mid", false);
+    attach(&w).expect("attach");
+    let ev: Events = Arc::default();
+    let g = launcher(&w)
+        .adopt(Ok(FakeProcess::new(
+            &ev,
+            vec![None, None, Some(ProcessExit::Signaled(15))],
+        )))
+        .unwrap_or_else(|e| panic!("guarded: {:?}", e.code()));
+    let pasta_pid = b.pids.lock().unwrap()[1];
+    // 試験が起動した sleep を外部コマンドで終了させる(unsafe を使わない)。
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pasta_pid.to_string()])
+        .status()
+        .expect("kill");
+    assert!(status.success());
+    let until = Instant::now() + Duration::from_secs(5);
+    while !gone_or_zombie(pasta_pid) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    g.wait(Duration::ZERO).expect("wait");
+    assert_eq!(events(&ev), ["container signal 15"]);
+    g.wait(Duration::ZERO).expect("wait");
+    g.wait(Duration::from_secs(5)).expect("wait");
+    drop(g);
+    let pids = b.pids.lock().unwrap().clone();
+    assert!(pids.iter().all(|p| gone(*p)));
+    assert!(!b.run_dir.exists());
 }

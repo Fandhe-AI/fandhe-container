@@ -199,9 +199,16 @@ fn net12_delivery_dns_is_rejected_as_unimplemented() {
     assert_eq!(e.code(), ErrorCode::Unimplemented);
 }
 
-/// NET-6: ユーザー定義名のみ(add-host・dns なし)は結線前のため Unimplemented で拒否する。
+/// NET-6・NET-9(#1940): ユーザー定義名のみ(add-host・dns なし)は、Linux では `Attachable`(rootless の pasta 構成)へ
+/// 写り、それ以外の OS では結線が無いため Unimplemented で拒否する。
 #[test]
-fn net6_delivery_named_network_is_rejected_as_unimplemented() {
-    let e = deliver(&net_doc("g1", "mynet", &[], &[])).unwrap_err();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+fn net6_delivery_named_network_maps_to_attachable_on_linux() {
+    let got = deliver(&net_doc("g1", "mynet", &[], &[]));
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        got.expect("attachable").network(),
+        fandhe_container_core::oci_runtime::LaunchNetworkMode::Attachable
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(got.unwrap_err().code(), ErrorCode::Unimplemented);
 }

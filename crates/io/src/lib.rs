@@ -54,7 +54,8 @@
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
 //! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
-//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証関数は
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
+//! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
 //! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）。NFC / NFD の別表記も、名前は
 //! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
@@ -78,6 +79,7 @@ mod display_sanitize;
 pub mod error;
 pub mod fs_normalize;
 pub mod guest_files;
+pub mod guest_path;
 pub mod instrument;
 pub mod observe;
 pub mod payload;
@@ -114,7 +116,11 @@ pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
     check_case_collisions, check_host_path_length, measure_host_path_length,
 };
-pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
+pub use guest_files::{GuestFileCreator, MAX_TRACKED_GUEST_PATHS};
+pub use guest_path::{
+    GuestPath, GuestPathError, MAX_GUEST_NAME_BYTES, MAX_GUEST_PATH_BYTES,
+    MAX_GUEST_PATH_COMPONENTS,
+};
 pub use instrument::{
     IoOpKind, IoOpOutcome, IoOpRecorder, IoOpSample, IoOpTimer, NoopIoOpRecorder, record_io_op,
 };

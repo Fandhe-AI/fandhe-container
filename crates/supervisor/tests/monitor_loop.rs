@@ -30,6 +30,9 @@ fn sup1_task157_4_run_rs_has_no_global_state_or_raw_pid_access() {
 }
 
 /// AC2: 依存は workspace 内の path 依存（core と、#3065 で足した net の一方向）のみ。外部クレート・中央デーモン用の仕組みを持たない。
+/// core は `default-features = false` で引く。supervisor は core の plugin 境界基盤を使わず、既定 feature のままだと
+/// CLI など依存元の実行ファイルで feature 統合により core の `plugin` が再有効化され、PLUG-3・CORE-7 の
+/// 実行ファイル計測（#3204）が成り立たないため。
 #[test]
 fn sup1_task157_4_manifest_has_only_workspace_path_dependencies() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
@@ -44,7 +47,7 @@ fn sup1_task157_4_manifest_has_only_workspace_path_dependencies() {
     assert_eq!(
         entries,
         [
-            "fandhe-container-core = { path = \"../core\" }",
+            "fandhe-container-core = { path = \"../core\", default-features = false }",
             "fandhe-container-net = { path = \"../net\" }",
         ]
     );

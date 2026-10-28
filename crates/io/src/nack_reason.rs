@@ -8,18 +8,34 @@
 //! # 呼び出し文脈
 //! - `crate::guest_files` の分類関数が `GuestFileCreator::create_file` の失敗を
 //!   この値へ写す（#3160）
-//! - Nack のワイヤー符号化・復号（#3161）と `serve_file_connection` の観測（#3163）は
-//!   本型を import して使い、値表を再定義しない
+//! - Nack のワイヤー符号化・復号（`crate::payload`。#3161）は本型を再公開して使い、
+//!   `serve_file_connection` の観測（#3163）も同じ型を使う。値表は再定義しない
 //!
 //! # 契約
 //! 値は追加しても版を上げない。未知の値は [`NackReason::Other`] として受理し、
-//! そのまま往復できる（情報目的の値のため）。
+//! そのまま往復できる（情報目的の値のため）。[`UnknownNackReason`] は既知の値
+//! （1〜11）を持てないので、`Other(5)` のような別表現は作れない（REPAIR-2）。
 
 use crate::error::IoErrorCode;
 
-/// Nack の `reason`（F10 の値表。1〜11）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NackReason {
+/// 既知の値表（1〜11）に無い [`NackReason`] の数値。
+///
+/// フィールドは非公開で、[`NackReason::from_wire`] だけが既知でない値から作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnknownNackReason(u16);
+
+impl UnknownNackReason {
+    /// ワイヤー上の数値。
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Nack の `reason`（F10 の値表。1〜11）。reason の追加では版を上げないため
+/// `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NackReason {
     /// 1: パスの構文違反（`GuestPath`・IO-5 の形式検査）。
     PathSyntax,
     /// 2: ホストパスが 260 UTF-16 単位を超える（Windows ホストのみ）。
@@ -43,12 +59,12 @@ pub(crate) enum NackReason {
     /// 11: 索引へ取り込む実在項目の件数上限。
     TrackedPathsLimit,
     /// 未知の値（受理して往復する）。
-    Other(u16),
+    Other(UnknownNackReason),
 }
 
 impl NackReason {
     /// ワイヤー上の値。
-    pub(crate) fn wire_value(self) -> u16 {
+    pub fn wire_value(self) -> u16 {
         match self {
             Self::PathSyntax => 1,
             Self::HostPathTooLong => 2,
@@ -61,12 +77,12 @@ impl NackReason {
             Self::OpenFilesLimit => 9,
             Self::DeviceLimit => 10,
             Self::TrackedPathsLimit => 11,
-            Self::Other(value) => value,
+            Self::Other(unknown) => unknown.get(),
         }
     }
 
     /// ワイヤー上の値から復元する（未知の値は [`Self::Other`]）。
-    pub(crate) fn from_wire(value: u16) -> Self {
+    pub fn from_wire(value: u16) -> Self {
         match value {
             1 => Self::PathSyntax,
             2 => Self::HostPathTooLong,
@@ -79,12 +95,12 @@ impl NackReason {
             9 => Self::OpenFilesLimit,
             10 => Self::DeviceLimit,
             11 => Self::TrackedPathsLimit,
-            other => Self::Other(other),
+            other => Self::Other(UnknownNackReason(other)),
         }
     }
 
     /// F10 の分類（Nack の `code` の元になる `IoErrorCode`）。未知の値は `None`。
-    pub(crate) fn code(self) -> Option<IoErrorCode> {
+    pub fn code(self) -> Option<IoErrorCode> {
         match self {
             Self::PathSyntax
             | Self::HostPathTooLong
@@ -147,7 +163,7 @@ mod tests {
     fn io5_nack_reason_unknown_values_round_trip() {
         for value in [0u16, 12, 1000, u16::MAX] {
             let reason = NackReason::from_wire(value);
-            assert_eq!(reason, NackReason::Other(value));
+            assert!(matches!(reason, NackReason::Other(u) if u.get() == value));
             assert_eq!(reason.wire_value(), value);
             assert_eq!(reason.code(), None);
         }

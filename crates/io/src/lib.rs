@@ -84,13 +84,6 @@ pub mod fs_normalize;
 pub mod guest_files;
 pub mod guest_path;
 pub mod instrument;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the Nack codec (#3161) and serve_file_connection (#3163)"
-    )
-)]
 mod nack_reason;
 pub mod observe;
 pub mod payload;

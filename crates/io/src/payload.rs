@@ -83,6 +83,7 @@
 use crate::client::RequestId;
 use crate::error::{IoError, IoErrorCode};
 use crate::guest_path::{GuestPath, MAX_GUEST_PATH_BYTES};
+pub use crate::nack_reason::{NackReason, UnknownNackReason};
 use crate::protocol::{Frame, FrameKind, MAX_PAYLOAD_LEN};
 
 /// ペイロード先頭に置く request id のワイヤー上のバイト数（`u64` LE）。
@@ -624,92 +625,6 @@ impl TryFrom<u8> for NackCode {
     }
 }
 
-/// 既知の値表（1〜11）に無い [`NackReason`] の数値。
-///
-/// フィールドは非公開で、[`NackReason::from_u16`] だけが既知でない値から作る。
-/// これにより `Other(5)` のように既知の reason と同じ値の別表現は作れない
-/// （REPAIR-2）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UnknownNackReason(u16);
-
-impl UnknownNackReason {
-    /// ワイヤー上の数値。
-    pub fn get(self) -> u16 {
-        self.0
-    }
-}
-
-/// [`FrameKind::Nack`] の理由（情報目的。F10 の値表）。
-///
-/// 未知の値（0・12 以上）は [`Self::Other`] として受理する。reason の追加では版を
-/// 上げないため `#[non_exhaustive]`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum NackReason {
-    /// 1: パスの構文違反。
-    PathSyntax,
-    /// 2: ホストパス長の超過（Windows ホスト）。
-    HostPathTooLong,
-    /// 3: 大文字小文字の衝突。
-    CaseCollision,
-    /// 4: NFC / NFD の別表記の衝突。
-    NormalizationCollision,
-    /// 5: 既に存在する。
-    Exists,
-    /// 6: ルートの外へ出る経路。
-    EscapesRoot,
-    /// 7: 祖先がディレクトリでない。
-    NotADirectory,
-    /// 8: 未知のハンドル。
-    UnknownHandle,
-    /// 9: 同時に開けるファイル数の上限。
-    OpenFilesLimit,
-    /// 10: デバイス数の上限。
-    DeviceLimit,
-    /// 11: 追跡パス数の上限。
-    TrackedPathsLimit,
-    /// 上記以外の値（前方互換）。
-    Other(UnknownNackReason),
-}
-
-impl NackReason {
-    /// ワイヤー上の数値から復元する。失敗せず、未知の値は [`Self::Other`] になる。
-    pub fn from_u16(value: u16) -> Self {
-        match value {
-            1 => Self::PathSyntax,
-            2 => Self::HostPathTooLong,
-            3 => Self::CaseCollision,
-            4 => Self::NormalizationCollision,
-            5 => Self::Exists,
-            6 => Self::EscapesRoot,
-            7 => Self::NotADirectory,
-            8 => Self::UnknownHandle,
-            9 => Self::OpenFilesLimit,
-            10 => Self::DeviceLimit,
-            11 => Self::TrackedPathsLimit,
-            other => Self::Other(UnknownNackReason(other)),
-        }
-    }
-
-    /// ワイヤー上の数値。
-    pub fn as_u16(self) -> u16 {
-        match self {
-            Self::PathSyntax => 1,
-            Self::HostPathTooLong => 2,
-            Self::CaseCollision => 3,
-            Self::NormalizationCollision => 4,
-            Self::Exists => 5,
-            Self::EscapesRoot => 6,
-            Self::NotADirectory => 7,
-            Self::UnknownHandle => 8,
-            Self::OpenFilesLimit => 9,
-            Self::DeviceLimit => 10,
-            Self::TrackedPathsLimit => 11,
-            Self::Other(unknown) => unknown.get(),
-        }
-    }
-}
-
 /// [`FrameKind::Nack`] フレームを組み立てる（サーバー側。#3163 が使う予定）。
 /// 自由文字列を持たない（パス等をワイヤーへ返さない。F10）。
 pub fn encode_nack(
@@ -720,7 +635,7 @@ pub fn encode_nack(
     let mut payload = Vec::with_capacity(NACK_PAYLOAD_LEN);
     payload.extend_from_slice(&id.get().to_le_bytes());
     payload.push(code.as_u8());
-    payload.extend_from_slice(&reason.as_u16().to_le_bytes());
+    payload.extend_from_slice(&reason.wire_value().to_le_bytes());
     Frame::new(FrameKind::Nack, payload)
 }
 
@@ -768,7 +683,7 @@ pub fn decode_nack(frame: &Frame) -> Result<NackEnvelope, IoError> {
     let reason_bytes =
         <[u8; 2]>::try_from(reason_bytes).map_err(|_| invalid("nack payload missing reason"))?;
     let code = NackCode::try_from(*code_byte)?;
-    let reason = NackReason::from_u16(u16::from_le_bytes(reason_bytes));
+    let reason = NackReason::from_wire(u16::from_le_bytes(reason_bytes));
     Ok(NackEnvelope { id, code, reason })
 }
 
@@ -1109,14 +1024,14 @@ mod tests {
         for reason in [0u16, 12, 0xFFFF] {
             let env = decode_nack(&nack_frame(1, reason)).expect("unknown reason is accepted");
             assert!(matches!(env.reason(), NackReason::Other(_)));
-            assert_eq!(env.reason().as_u16(), reason);
+            assert_eq!(env.reason().wire_value(), reason);
         }
         for reason in 1u16..=11 {
-            let parsed = NackReason::from_u16(reason);
+            let parsed = NackReason::from_wire(reason);
             assert!(!matches!(parsed, NackReason::Other(_)), "reason {reason}");
-            assert_eq!(parsed.as_u16(), reason);
+            assert_eq!(parsed.wire_value(), reason);
         }
-        assert_eq!(NackReason::from_u16(5), NackReason::Exists);
+        assert_eq!(NackReason::from_wire(5), NackReason::Exists);
         assert_eq!(NackCode::try_from(2).expect("2"), NackCode::AlreadyExists);
     }
 

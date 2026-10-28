@@ -3151,7 +3151,7 @@ mod poll_abi {
 /// 「ソケットの到着」と「停止用 pipe」を同時に待つために使う。REPAIR-5・PLUG-7・#3003）。
 ///
 /// macOS ではソケットの `shutdown` が別スレッドの `recv` の起床・受信期限と競合して読み取りが戻らない
-/// 場面を観測した（#3003）ため、停止指示を `shutdown` ではなく pipe への書き込みで届け、待ち自体を
+/// 場面を観測した（#3003）ため、停止指示を `shutdown` ではなく停止用 pipe の書き込み端を閉じること（`POLLHUP`）で届け、待ち自体を
 /// `poll` の期限で必ず有限にする。`EINTR` は `TimedOut` として返す（呼び出し側が再度呼ぶ）。
 #[cfg(any(
     target_os = "macos",
@@ -3799,6 +3799,10 @@ mod libc_abi {
         assert!(poll_abi::POLLERR == libc::POLLERR);
         assert!(poll_abi::POLLHUP == libc::POLLHUP);
         assert!(poll_abi::POLLNVAL == libc::POLLNVAL);
+        // `poll` の nfds 引数の幅（Linux は unsigned long、macOS は unsigned int）。関数ポインタの照合は
+        // 自前の型どうしでしか見ないため、`NfdsT` と `libc::nfds_t` の幅はここで直接突き合わせる（#3003・#3145）。
+        assert!(size_of::<poll_abi::NfdsT>() == size_of::<libc::nfds_t>());
+        assert!(align_of::<poll_abi::NfdsT>() == align_of::<libc::nfds_t>());
     };
     #[cfg(any(
         target_os = "macos",

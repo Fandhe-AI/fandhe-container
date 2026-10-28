@@ -764,21 +764,27 @@ mod tests {
         /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
         const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
 
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-cmd-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-cmd",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
 
             fn state_root(&self) -> PathBuf {

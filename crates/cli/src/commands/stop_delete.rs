@@ -1298,21 +1298,27 @@ mod tests {
         use fandhe_container_core::traits::{ContainerState, CreateRequest, GetStateRequest};
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-sd-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-sd",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
         }
 

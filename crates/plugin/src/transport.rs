@@ -67,7 +67,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audit::PeerAuthObserver;
 use crate::error::{PluginError, PluginErrorCode};
@@ -185,6 +185,17 @@ impl UdsListener {
     /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
     /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
+        #[cfg(unix)]
+        let wait = crate::spawn_gate::GATE_WAIT_DEFAULT;
+        // 非 unix ではゲートが無く `bind` は常に `Unimplemented` を返すため、待ち時間は使われない。
+        #[cfg(not(unix))]
+        let wait = Duration::ZERO;
+        Self::bind_before(path, Instant::now() + wait)
+    }
+
+    /// [`Self::bind`] の、`spawn_gate` の待ちを `deadline` までに限る版（期限切れは `Timeout`。REPAIR-5）。
+    /// 都度起動の合計期限の内側から呼ばれる（`lifecycle`）。
+    pub(crate) fn bind_before(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
         if path
@@ -199,7 +210,7 @@ impl UdsListener {
         let abs = std::path::absolute(path).map_err(|_| {
             PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
         })?;
-        let inner = imp::ListenerInner::bind(&abs)?;
+        let inner = imp::ListenerInner::bind(&abs, deadline)?;
         Ok(Self { inner })
     }
 
@@ -561,6 +572,7 @@ fn map_bind_error(kind: io::ErrorKind) -> PluginError {
             "socket parent directory does not exist",
         ),
         io::ErrorKind::InvalidInput => (PluginErrorCode::InvalidArgument, "invalid socket path"),
+        io::ErrorKind::TimedOut => (PluginErrorCode::Timeout, "timed out waiting to bind socket"),
         _ => (PluginErrorCode::Internal, "failed to bind socket"),
     };
     PluginError::new(code, message)
@@ -750,7 +762,7 @@ mod imp {
 
     impl ListenerInner {
         /// `path` は `..` を含まない絶対パス（`UdsListener::bind` が検証・変換済み）。
-        pub(super) fn bind(path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
             let euid = sys::effective_uid();
             let (dir, canonical) = open_parent_dir(path, euid)?;
             let file_name = path.file_name().ok_or_else(|| {
@@ -774,7 +786,7 @@ mod imp {
             crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
             // macOS の std は socket の close-on-exec を作成後に立てるため、並行する spawn と排他にする
             // （別 plugin の子へ listener が漏れない。`spawn_gate`。PLUG-12・SEC-1・#3139）。
-            let listener = crate::spawn_gate::create_fds(|| UnixListener::bind(&target))
+            let listener = crate::spawn_gate::create_fds(deadline, || UnixListener::bind(&target))
                 .map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name).ok();
@@ -990,7 +1002,7 @@ mod imp {
             let mut continued: u32 = 0;
             loop {
                 // listener は非ブロッキング（1 回の accept で戻る）ため、ゲートを長く持たない。
-                match crate::spawn_gate::create_fds(|| self.listener.accept()) {
+                match crate::spawn_gate::create_fds(deadline, || self.listener.accept()) {
                     Ok((stream, _)) => {
                         // 期限後に到着した接続は受理せず閉じて Timeout を返す（REPAIR-5。
                         // 期限直前のポーリング後のスリープ中に到着した接続が成功する経路を塞ぐ）。
@@ -1103,6 +1115,7 @@ mod imp {
                             io::ErrorKind::WouldBlock
                                 | io::ErrorKind::Interrupted
                                 | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::TimedOut
                         ) =>
                     {
                         let now = Instant::now();
@@ -1510,7 +1523,7 @@ mod imp {
     use crate::frame::Frame;
     use std::io;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// 構築不能（非 unix では listener を作れない）。
     #[derive(Debug)]
@@ -1520,7 +1533,7 @@ mod imp {
     pub(super) enum StreamInner {}
 
     impl ListenerInner {
-        pub(super) fn bind(_path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(_path: &Path, _deadline: Instant) -> Result<Self, PluginError> {
             Err(PluginError::new(
                 PluginErrorCode::Unimplemented,
                 "unix domain socket listener is not supported on this platform",

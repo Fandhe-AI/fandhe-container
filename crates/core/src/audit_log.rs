@@ -456,6 +456,8 @@ pub enum AuditLayer {
     ExitSignal,
     /// 監査の記録を 100% 満たせない環境で起動を続けた縮退の記録（SEC-4・#2027）。
     AuditCoverage,
+    /// start の起動時に行う pasta バイナリの再検証が改ざんの疑いで拒否した記録（SEC-4・PLUG-11・NET-9・#3330）。
+    PastaVerify,
 }
 
 impl AuditLayer {
@@ -472,6 +474,7 @@ impl AuditLayer {
             AuditLayer::ControlChannel => "control_channel",
             AuditLayer::ExitSignal => "exit_signal",
             AuditLayer::AuditCoverage => "audit_coverage",
+            AuditLayer::PastaVerify => "pasta_verify",
         }
     }
 }
@@ -553,6 +556,14 @@ pub enum AuditEvent {
         /// 拒否理由トークン（`entrypoint_*` 等の静的トークン。[`AuditReason`] 参照）。
         reason: AuditReason,
     },
+    /// start の起動時の pasta バイナリの再検証が改ざんの疑いで拒否した記録（SEC-4・PLUG-11・NET-9・#3330）。
+    ///
+    /// 理由トークンだけを持ち、**パスは持たない**（型で保証する。REPAIR-2）。構築は
+    /// [`PastaVerifyRejection::audit_event`] で行う。
+    PastaVerify {
+        /// 拒否理由トークン（[`PastaVerifyRejection::as_str`]）。
+        reason: AuditReason,
+    },
     /// supervisor の制御チャネルが接続元を拒否した記録（SEC-4・SEC-1・SUP-1・#2058）。
     ///
     /// 理由トークンだけを持ち、パス・接続元の uid・pid は持たない（型で保証する。REPAIR-2）。
@@ -586,6 +597,33 @@ pub enum AuditEvent {
         /// Landlock の `AUDIT_LANDLOCK_*` が縮退している場合の理由。
         landlock: Option<AuditReason>,
     },
+}
+
+/// pasta バイナリの起動時の再検証が改ざんの疑いで拒否した理由（SEC-4・PLUG-11・NET-9・#3330）。固定語彙で、入力値を載せない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PastaVerifyRejection {
+    /// 記録した識別（所有者・inode・サイズ・ハッシュ等）と今のバイナリが一致しない。
+    RecordChanged,
+    /// バイナリまたは祖先ディレクトリの権限・所有者の検査に通らない。
+    PermissionDenied,
+}
+
+impl PastaVerifyRejection {
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordChanged => "pasta_record_changed",
+            Self::PermissionDenied => "pasta_permission_denied",
+        }
+    }
+
+    /// 対応する監査イベントを返す。
+    pub fn audit_event(self) -> AuditEvent {
+        AuditEvent::PastaVerify {
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
 }
 
 /// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
@@ -666,6 +704,7 @@ impl AuditEvent {
             AuditEvent::PluginPeer { .. } => AuditLayer::PluginPeer,
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
+            AuditEvent::PastaVerify { .. } => AuditLayer::PastaVerify,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
             AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
             AuditEvent::AuditCoverageDegraded { .. } => AuditLayer::AuditCoverage,
@@ -779,6 +818,7 @@ impl AuditRecord {
             | AuditEvent::PluginPeer { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
+            | AuditEvent::PastaVerify { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -815,6 +855,7 @@ impl AuditRecord {
             AuditEvent::Seccomp { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
+            | AuditEvent::PastaVerify { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -846,6 +887,7 @@ impl AuditRecord {
             | AuditEvent::PluginPeer { reason, .. }
             | AuditEvent::ExecTarget { reason }
             | AuditEvent::Entrypoint { reason }
+            | AuditEvent::PastaVerify { reason }
             | AuditEvent::ControlPeer { reason } => Some(*reason),
             _ => None,
         }
@@ -1015,6 +1057,32 @@ mod tests {
                 .layer(),
             AuditLayer::ControlChannel
         );
+    }
+
+    /// SEC-4・NET-9・#3330: pasta_verify の層トークン・理由トークン・レコードのアクセサ（パスを持たない）。
+    #[test]
+    fn sec4_3330_pasta_verify_tokens_and_accessors() {
+        assert_eq!(AuditLayer::PastaVerify.as_str(), "pasta_verify");
+        assert_eq!(
+            PastaVerifyRejection::RecordChanged.as_str(),
+            "pasta_record_changed"
+        );
+        assert_eq!(
+            PastaVerifyRejection::PermissionDenied.as_str(),
+            "pasta_permission_denied"
+        );
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            PastaVerifyRejection::PermissionDenied.audit_event(),
+        );
+        assert_eq!(r.layer(), AuditLayer::PastaVerify);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("pasta_permission_denied")
+        );
+        assert!(r.path().is_none());
+        assert!(r.syscall().is_none());
     }
 
     /// SEC-4・PLUG-12・#2484: plugin_peer の理由トークン 5 種・層トークン・パスと理由のアクセサ。

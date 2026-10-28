@@ -278,6 +278,7 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         AuditEvent::Seccomp { .. }
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
+        | AuditEvent::PastaVerify { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => None,

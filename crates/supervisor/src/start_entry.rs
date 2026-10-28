@@ -2881,6 +2881,9 @@ mod linux {
             }
             Err(e) => {
                 let te = e.trait_error();
+                if let Some(rejection) = e.tamper_rejection() {
+                    logs.set_tamper(rejection);
+                }
                 crate::pasta_attach::log_pasta_verify(
                     logs,
                     id.as_str(),
@@ -3142,6 +3145,8 @@ mod linux {
             Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
+        // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
+        record_pasta_tamper(&args.root, &args.id, &pasta_logs);
         let running = match run_start_until(
             deps,
             &store,
@@ -3170,6 +3175,35 @@ mod linux {
         // サーバスレッドを止めてからソケットを消す（RAII）。
         drop(control);
         ExitCode::from(code)
+    }
+
+    /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、監査の記録先(`@audit.log`)へ 1 件配送する(SEC-4・PLUG-11・#3330)。
+    ///
+    /// 作業スレッドの join 後の単一スレッドから呼ぶので `FileAuditSink` の隔離(fork)が使える。記録できなければ
+    /// `pasta_audit_unavailable` を構造化ログへ積む(起動の拒否は 2c の結果のままで覆らない)。疑いが無ければ何もしない。
+    fn record_pasta_tamper(
+        root: &std::path::Path,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+    ) {
+        use fandhe_container_core::audit_log::{AuditRecord, AuditTimestamp, current_pid};
+        let Some(rejection) = logs.take_tamper() else {
+            return;
+        };
+        let result = crate::exec::default_audit_sink(Some(root.to_path_buf())).and_then(|sink| {
+            let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to build the pasta audit record",
+                ));
+            };
+            let record =
+                AuditRecord::new(ts, pid, rejection.audit_event()).with_container_id(id.clone());
+            sink.record(&record)
+        });
+        if let Err(e) = result {
+            crate::pasta_attach::log_pasta_audit_unavailable(logs, id.as_str(), e.code());
+        }
     }
 
     /// 手順 5 で `config.json` を読み直し、`linux.resources` を取り出す（#2019）。`rejection_audit` があれば

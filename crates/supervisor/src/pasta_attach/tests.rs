@@ -560,3 +560,32 @@ fn net9_remove_leftovers_is_idempotent() {
     assert!(!run.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// REPAIR-4・#1940: helper の stderr(二重引用符・バックスラッシュ・`\xNN`・制御文字)を含んでも 1 行になり、
+/// JSON のエスケープが完全一致で付く。
+#[test]
+fn repair4_text_value_is_json_encoded() {
+    let raw = "bad \"quote\" \\x80 tab\t nl\n ctl\u{1} end";
+    let line = json_line(
+        "pasta_failed",
+        "web1",
+        &[("stderr", Val::Text(raw.to_owned()))],
+    );
+    assert_eq!(
+        line,
+        "{\"component\":\"supervisor\",\"event\":\"pasta_failed\",\"container\":\"web1\",\"stderr\":\"bad \\\"quote\\\" \\\\x80 tab\\t nl\\n ctl\\u0001 end\"}\n"
+    );
+    assert_eq!(line.matches('\n').count(), 1);
+}
+
+/// SEC-4・#3330: 改ざんの疑いは最初の 1 件を残し、取り出すと空になる。
+#[test]
+fn sec4_3330_tamper_slot_keeps_first_and_drains() {
+    use fandhe_container_core::audit_log::PastaVerifyRejection as R;
+    let b = PastaLogBuffer::new();
+    assert_eq!(b.take_tamper(), None);
+    b.set_tamper(R::RecordChanged);
+    b.set_tamper(R::PermissionDenied);
+    assert_eq!(b.take_tamper(), Some(R::RecordChanged));
+    assert_eq!(b.take_tamper(), None);
+}

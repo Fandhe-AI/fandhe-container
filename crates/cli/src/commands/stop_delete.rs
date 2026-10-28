@@ -768,6 +768,31 @@ pub(super) fn pasta_removal_warning(code: ErrorCode) -> String {
     )
 }
 
+/// ID 単位のロック(`remove_etc_files_locked` と同じ `@container-options/@locks/<id>`)を保持したまま、不在の再確認から
+/// pasta の置き場所(`@pasta/<id>`)の削除までを直列化する(#1940・NET-9)。
+///
+/// 起動前の 1 回の不在確認だけでは、worker の実行までに同じ ID が `create` / start されて新インスタンスの
+/// `@pasta/<id>/pid` とディレクトリを消し、pasta の準備完了判定を壊す競合が残る。ロックを取ってから再確認し、
+/// 再作成済みなら見送る。削除したときだけロックファイルを回収する。
+fn remove_pasta_leftovers_locked(
+    root: &std::path::Path,
+    id: &ContainerId,
+) -> Result<(), fandhe_container_core::traits::types::TraitError> {
+    use fandhe_container_supervisor::container_options::store as options_store;
+    let lock = options_store::acquire_lock(root, id, ETC_FILES_LOCK_WAIT)?;
+    if !id_is_still_deleted(root, id) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    let result = fandhe_container_supervisor::pasta_attach::remove_pasta_leftovers(root, id);
+    #[cfg(not(target_os = "linux"))]
+    let result: Result<(), fandhe_container_core::traits::types::TraitError> = Ok(());
+    if result.is_ok() && id_is_still_deleted(root, id) {
+        lock.remove_lock_file();
+    }
+    result
+}
+
 /// core の `delete` が成功した後に、pasta の置き場所の残骸(`<root>/@pasta/<id>`。NET-9・#1940)を消す。
 ///
 /// 通常は supervisor がコンテナの終了時に消す。supervisor が異常終了して残った PID ファイルだけを消し、記録の pid での
@@ -787,11 +812,7 @@ fn remove_pasta_leftovers_after_delete(store: &dyn StateStore, req: &DeleteReque
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        #[cfg(target_os = "linux")]
-        let result = fandhe_container_supervisor::pasta_attach::remove_pasta_leftovers(&root, &id);
-        #[cfg(not(target_os = "linux"))]
-        let result: Result<(), fandhe_container_core::traits::types::TraitError> = Ok(());
-        let _ = tx.send(result);
+        let _ = tx.send(remove_pasta_leftovers_locked(&root, &id));
     });
     let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
         Ok(Ok(())) => return,
@@ -1056,6 +1077,43 @@ mod tests {
             pasta_removal_warning(ErrorCode::Timeout),
             r#"{"level":"warn","code":"TIMEOUT","message":"pasta run directory removal failed; leftover files may remain"}"#
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-9(#1940): pasta の残骸の削除は ID 単位のロックの下で再確認し、ロックを他者が持つ間は消さず、
+    /// 再作成済みの ID は見送る(新インスタンスの `@pasta/<id>` を巻き込まない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_pasta_leftover_removal_is_serialized_with_recreation() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use fandhe_container_supervisor::container_options::store as options_store;
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("fc-cli-del-pasta-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        let root = StateRoot::from_override(dir.join("state")).expect("root");
+        let fs_store = FileStateStore::open(root).expect("open");
+        let state_root = fs_store.host_state_root().expect("root").to_path_buf();
+        let a = ContainerId::new("c1").expect("id");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(state_root.join("@pasta"))
+            .expect("pasta dir");
+        let run = state_root.join("@pasta").join("c1");
+        builder.create(&run).expect("run dir");
+        // ロックを他者(create 側)が持つ間は消さずに失敗する。
+        let held =
+            options_store::acquire_lock(&state_root, &a, Duration::from_secs(1)).expect("lock");
+        assert!(remove_pasta_leftovers_locked(&state_root, &a).is_err());
+        assert!(run.exists());
+        drop(held);
+        // 解放後は(不在なので)消せる。
+        remove_pasta_leftovers_locked(&state_root, &a).expect("removed");
+        assert!(!run.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

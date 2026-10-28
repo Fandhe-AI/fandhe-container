@@ -407,6 +407,7 @@ fn audit_line_dto(record: &AuditRecord) -> AuditLineDto<'_> {
         }
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
+        | AuditEvent::PastaVerify { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
@@ -1897,6 +1898,7 @@ mod tests {
             AuditEvent::Entrypoint {
                 reason: AuditReason::new("entrypoint_is_runtime_binary"),
             },
+            crate::audit_log::PastaVerifyRejection::RecordChanged.audit_event(),
             ControlPeerRejection::PeerUidMismatch.audit_event(),
             AuditEvent::ExitSignal {
                 signal: AuditSignal::new(31).unwrap(),
@@ -1918,6 +1920,7 @@ mod tests {
                     AuditEvent::PluginPeer { .. } => "plugin_peer",
                     AuditEvent::ExecTarget { .. } => "exec_target",
                     AuditEvent::Entrypoint { .. } => "entrypoint",
+                    AuditEvent::PastaVerify { .. } => "pasta_verify",
                     AuditEvent::ControlPeer { .. } => "control_peer",
                     AuditEvent::ExitSignal { .. } => "exit_signal",
                     AuditEvent::AuditCoverageDegraded { .. } => "audit_coverage",
@@ -1932,7 +1935,7 @@ mod tests {
     fn err4_sec4_3115_body_has_no_reserved_keys() {
         let kinds = every_kind();
         let names: std::collections::BTreeSet<_> = kinds.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         for (name, e) in kinds {
             for cid_opt in [None, Some(cid("c1"))] {
                 let mut r = rec(5, e.clone());

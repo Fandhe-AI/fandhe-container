@@ -78,11 +78,34 @@ const MISSING_ATTACHMENT_TERMINATE: Duration = Duration::from_secs(1);
 // 構造化ログ
 // ---------------------------------------------------------------------------------------------
 
-/// 構造化ログの値。`Raw` は呼び出し側がエスケープ済みの文字列（helper の stderr）。
+/// 構造化ログの値。`Text` は helper の stderr など任意の文字列で、JSON の文字列として必ずエンコードして出す。
+///
+/// helper の stderr は net の `StderrExcerpt` が診断用に整形したもの(二重引用符・バックスラッシュをそのまま保持し、
+/// 非 ASCII バイトは `\xNN` の文字列にする)で、JSON のエスケープ済みではない。直接挿入すると行が壊れるため
+/// [`push_json_string`] で値ごとにエンコードする(REPAIR-4)。
 enum Val {
     U(u64),
     S(&'static str),
-    Raw(String),
+    Text(String),
+}
+
+/// `s` を JSON の文字列リテラル(両端の二重引用符を除く本体)として `out` へ足す。
+/// `"`・`\`・制御文字(U+0000〜U+001F)をエスケープする。
+fn push_json_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 /// 1 行の構造化ログを組む（`component` / `event` / `container` と固定語彙の項目。REPAIR-4）。
@@ -94,7 +117,11 @@ fn json_line(event: &str, container: &str, fields: &[(&str, Val)]) -> String {
         match val {
             Val::U(n) => line.push_str(&format!(",\"{key}\":{n}")),
             Val::S(s) => line.push_str(&format!(",\"{key}\":\"{s}\"")),
-            Val::Raw(s) => line.push_str(&format!(",\"{key}\":\"{s}\"")),
+            Val::Text(s) => {
+                line.push_str(&format!(",\"{key}\":\""));
+                push_json_string(&mut line, s);
+                line.push('"');
+            }
         }
     }
     line.push_str("}\n");
@@ -105,6 +132,9 @@ fn json_line(event: &str, container: &str, fields: &[(&str, Val)]) -> String {
 #[derive(Debug, Default)]
 pub struct PastaLogBuffer {
     lines: Mutex<Vec<String>>,
+    /// 手順 2c の再検証が見つけた改ざんの疑い(作業スレッドが置き、単一スレッドの入口が取り出して監査へ配送する。
+    /// SEC-4・#3330。作業スレッドは監査の `FileAuditSink`〔fork 隔離〕を使えないため、記録は入口に任せる)。
+    tamper: Mutex<Option<fandhe_container_core::audit_log::PastaVerifyRejection>>,
 }
 
 impl PastaLogBuffer {
@@ -119,6 +149,20 @@ impl PastaLogBuffer {
         if g.len() < 64 {
             g.push(line);
         }
+    }
+
+    /// 再検証が見つけた改ざんの疑いを置く(最初の 1 件を残す)。
+    pub fn set_tamper(&self, rejection: fandhe_container_core::audit_log::PastaVerifyRejection) {
+        let mut g = self.tamper.lock().unwrap_or_else(PoisonError::into_inner);
+        g.get_or_insert(rejection);
+    }
+
+    /// 置かれた改ざんの疑いを取り出す。
+    pub fn take_tamper(&self) -> Option<fandhe_container_core::audit_log::PastaVerifyRejection> {
+        self.tamper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// 積んだ行を取り出す（試験と flush が使う）。
@@ -160,7 +204,7 @@ impl Logger {
 /// start の手順 2c の再検証の結果を `pasta_verify` として遅延バッファへ積む(NET-9・REPAIR-4)。
 ///
 /// `Ok(日付)` は検証に通った版の日付(`YYYYMMDD`)、`Err((code, tamper))` は拒否の分類と改ざんの疑いの有無。
-/// パス・出力は載せない(ERR-1)。実際の SEC-4 の監査への記録は #3330。
+/// パス・出力は載せない(ERR-1)。SEC-4 の監査への記録は入口が `PastaLogBuffer::take_tamper` を配送する(#3330)。
 pub(crate) fn log_pasta_verify(
     buffer: &PastaLogBuffer,
     container: &str,
@@ -185,6 +229,20 @@ pub(crate) fn log_pasta_verify(
     buffer.push(json_line("pasta_verify", container, &f));
 }
 
+/// 改ざんの疑いを監査の記録先へ書けなかったことを `pasta_audit_unavailable` として遅延バッファへ積む(SEC-4・#3330)。
+/// 起動の拒否は覆らない(fail-closed)。パス・出力は載せない(ERR-1)。
+pub(crate) fn log_pasta_audit_unavailable(
+    buffer: &PastaLogBuffer,
+    container: &str,
+    code: ErrorCode,
+) {
+    buffer.push(json_line(
+        "pasta_audit_unavailable",
+        container,
+        &[("code", Val::S(code.as_str()))],
+    ));
+}
+
 // ---------------------------------------------------------------------------------------------
 // helper の抽象（試験のための差し替え点）
 // ---------------------------------------------------------------------------------------------
@@ -196,7 +254,7 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     /// 終了シグナル。
     pub signal: Option<i32>,
-    /// stderr（エスケープ済み・4 KiB 以下）。
+    /// stderr（診断用に整形済み・4 KiB 以下。JSON のエスケープはログの出力時に `Val::Text` が行う）。
     pub stderr: String,
 }
 
@@ -369,7 +427,7 @@ impl PastaAttachBackend for ProductionBackend {
                         "netns_holder_failed",
                         &[
                             ("code", Val::S(e.code().as_str())),
-                            ("stderr", Val::Raw(e.holder_stderr.clone())),
+                            ("stderr", Val::Text(e.holder_stderr.clone())),
                         ],
                     );
                 }
@@ -420,7 +478,7 @@ impl PastaAttachBackend for ProductionBackend {
                     &[
                         ("code", Val::S(trait_code(e.code()).as_str())),
                         ("elapsed_ms", Val::U(millis(d.elapsed))),
-                        ("stderr", Val::Raw(d.stderr_excerpt)),
+                        ("stderr", Val::Text(d.stderr_excerpt)),
                     ],
                 );
                 // 未回収の子は drop が kill と回収を試みる（単一スレッドの区間なので回収スレッドは作らない）。
@@ -618,7 +676,7 @@ impl Attachment {
             f.push(("signal", Val::U(s)));
         }
         if !rep.exit.stderr.is_empty() {
-            f.push(("stderr", Val::Raw(rep.exit.stderr.clone())));
+            f.push(("stderr", Val::Text(rep.exit.stderr.clone())));
         }
         self.logger.log(deferred, event, &f);
     }

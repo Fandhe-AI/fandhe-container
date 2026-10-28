@@ -194,6 +194,15 @@ impl Dir {
     }
 }
 
+/// 全体の @lock の欠落は「定義が無い」ではなく破損なので `NotFound` を `DataLoss` へ直す。
+fn global_lock_missing_as_data_loss(e: NetError) -> NetError {
+    if e.code() == NetErrorCode::NotFound {
+        err(NetErrorCode::DataLoss, "network store lock file is missing")
+    } else {
+        e
+    }
+}
+
 fn check_file(f: &File, max_len: u64) -> Result<(), NetError> {
     let m = f
         .metadata()
@@ -350,7 +359,8 @@ impl NetworkStore {
         // 全体のロックファイルを検査する（以降の取得は検査つきで開き直す）。作るのは初期化時（新規作成、
         // または中身が空）だけで、項目があるのに欠落している既存ストアは破損として拒否する（fail-closed）。
         let initializing = created || dir.entries(SCAN_LIMIT)?.is_empty();
-        dir.open_regular(LOCK_FILE, initializing, u64::MAX)?;
+        dir.open_regular(LOCK_FILE, initializing, u64::MAX)
+            .map_err(global_lock_missing_as_data_loss)?;
         // 新規作成した `@networks` のエントリと `@lock` を永続化してから使う。既存でも（別プロセスが
         // 作った直後の可能性があるため）同期する。失敗は握りつぶさず返す（NET-6）。
         sync_init(&root, &dir)?;
@@ -369,7 +379,10 @@ impl NetworkStore {
 
     fn lock_global(&self, shared: bool) -> Result<GlobalLockGuard<'_>, NetError> {
         // 欠落を作り直すと旧 inode の保持者と排他が破れるため、通常の取得では作らない。
-        let file = self.dir.open_regular(LOCK_FILE, false, u64::MAX)?;
+        let file = self
+            .dir
+            .open_regular(LOCK_FILE, false, u64::MAX)
+            .map_err(global_lock_missing_as_data_loss)?;
         acquire(
             &file,
             shared,
@@ -1089,8 +1102,8 @@ mod tests {
         s.create(&NetworkDefinition::pasta("alpha").unwrap())
             .unwrap();
         fs::remove_file(s.dir.path(LOCK_FILE)).unwrap();
-        assert!(s.lock_global_exclusive().is_err());
-        assert!(NetworkStore::open(&t.0).is_err());
+        assert_eq!(code(s.lock_global_exclusive()), NetErrorCode::DataLoss);
+        assert_eq!(code(NetworkStore::open(&t.0)), NetErrorCode::DataLoss);
         assert!(!s.dir.path(LOCK_FILE).exists());
     }
 }

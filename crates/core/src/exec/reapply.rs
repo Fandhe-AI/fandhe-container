@@ -1403,6 +1403,81 @@ pub fn observe_exec_restriction_reapply(
     expected_root: &Path,
     probes: &[LandlockAccessProbe],
 ) -> Result<ExecReapplyObservation, ExecError> {
+    observe_reapply_inner(config, expected_root, probes, None)
+}
+
+/// 観測用の launch 時の識別子の記録の作り方（SEC-1・SEC-4・#3201。結合試験専用）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedMountRecording {
+    /// 適用の直前に開いた対象の実際の識別子をそのまま記録する（launch が記録した値を読み戻した正常系）。
+    Faithful,
+    /// 記録した `mnt_id` を 1 ずらす（マウントの差し替え・overmount で `mnt_id` が変わった状態の再現）。
+    MountIdShifted,
+}
+
+/// [`observe_exec_restriction_reapply`] に、Mount 由来のルールの識別子つきの記録で `MountCheck::Recorded` の
+/// 照合を通させる版（SEC-1・SEC-4・#3201。結合試験専用）。
+///
+/// 記録は launch の代わりに、`config` から導いた ruleset の Mount 由来のルール（暗黙の `/dev` 系）の対象を
+/// 自プロセスの `/` から開いて読んだ `(mnt_id, st_dev, st_ino)` で作り、`state.json` と同じ
+/// [`LaunchIsolationRecord`] へ添えて本番の `recorded_mounts_for_exec` を通す。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn observe_exec_restriction_reapply_recorded(
+    config: &OciConfig,
+    expected_root: &Path,
+    probes: &[LandlockAccessProbe],
+    recording: ObservedMountRecording,
+) -> Result<ExecReapplyObservation, ExecError> {
+    observe_reapply_inner(config, expected_root, probes, Some(recording))
+}
+
+/// Mount 由来のルールの識別子を、対象を開いて読んだ値で作る（観測用）。
+#[cfg(feature = "exec-test-support")]
+fn observed_mount_identities(
+    ruleset: &LandlockRuleset,
+    launch: LaunchIsolationRecord,
+    recording: ObservedMountRecording,
+) -> Result<LaunchIsolationRecord, ExecError> {
+    use crate::launch_isolation::RecordedMountIdentity;
+    use std::os::unix::fs::MetadataExt as _;
+    let internal = |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, m);
+    let mut entries = Vec::new();
+    for i in launch.landlock().mount_rule_positions() {
+        let rule = ruleset
+            .rules()
+            .get(i)
+            .ok_or_else(|| internal("mount rule position out of range"))?;
+        let file = std::fs::File::open(rule.path.as_str())
+            .map_err(|_| internal("cannot open mount rule target"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| internal("cannot stat mount rule target"))?;
+        let fd = OwnedFd::from(file);
+        let mnt_id = crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(fd.as_fd())
+            .map_err(|_| internal("cannot read mount id"))?;
+        let mnt_id = match recording {
+            ObservedMountRecording::Faithful => mnt_id,
+            ObservedMountRecording::MountIdShifted => mnt_id.saturating_add(1),
+        };
+        let id = RecordedMountIdentity::new(mnt_id, meta.dev(), meta.ino(), false)
+            .map_err(|_| internal("invalid mount identity"))?;
+        entries.push((i, id));
+    }
+    launch
+        .with_mount_identities(entries)
+        .map_err(|e| internal(e.message()))
+}
+
+#[cfg(feature = "exec-test-support")]
+fn observe_reapply_inner(
+    config: &OciConfig,
+    expected_root: &Path,
+    probes: &[LandlockAccessProbe],
+    recording: Option<ObservedMountRecording>,
+) -> Result<ExecReapplyObservation, ExecError> {
     let internal = |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Validate, m);
     if probes.len() > MAX_REAPPLY_PROBES {
         return Err(ExecError::new(
@@ -1454,7 +1529,16 @@ pub fn observe_exec_restriction_reapply(
         let launch = LaunchIsolationRecord::new(expected_identity, &ruleset).map_err(|e| {
             ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message())
         })?;
-        prepare_with_launch(&launch, expected_identity, Rlimits::default(), binding)
+        let launch = match recording {
+            Some(r) => observed_mount_identities(&ruleset, launch, r)?,
+            None => launch,
+        };
+        let mut restrictions =
+            prepare_with_launch(&launch, expected_identity, Rlimits::default(), binding)?;
+        if recording.is_some() {
+            restrictions.mounts = Some(recorded_mounts_for_exec(&launch)?);
+        }
+        Ok(restrictions)
     });
     match prepared {
         Err(e) => obs.prepare_error = Some(e),

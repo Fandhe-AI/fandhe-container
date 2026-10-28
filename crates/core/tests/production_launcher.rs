@@ -144,6 +144,16 @@
 //! with audit and no process (scenario=Z)`。Loopback の拒否は実機で作れない（子の netns は起動の時点まで未知）ため、
 //! `judge` と立て替えの PID 1 を使う単体試験が受け持つ。
 //!
+//! シナリオ A-attach（Attachable モード。rootless の pasta 構成向けの同期点。NET-9・CORE-6・SEC-1・REPAIR-5・#1939）は
+//! `LaunchNetworkMode::Attachable` とフック（`NetnsAttachHook`）の組で起動する。フックは受け取った netns・user namespace の fd の
+//! 素性がホストと異なること（`/proc/self/ns/{net,user}` との比較）と、合図の前（フックの中。約 200 ms 待つ）に PID 1 が exec して
+//! いないこと（子の `/proc/<pid>/status` の `Name:` が exec 後のエントリ名 `probe` でない）を確かめ、Ok を返す。受理の後は
+//! コンテナ内プローブの `NETNS` がフックで受けた netns と一致しホストと異なること、`NETDEV_LO=true`・`NETDEV_EXTRA=none`・
+//! `UDP_SELF=ok` を照合する。拒否の側は Err を返すフックで起動し、`start` の code が保たれ、メッセージが launcher の固定文言
+//! `container launch failed in the NetnsAttach stage` で、状態が Created のまま子が残らないことを照合する。成功行は
+//! `production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable)`。
+//! 範囲写像の経路は `(scenario=attachable-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
+//!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
 //! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
 //!
@@ -250,8 +260,9 @@ mod linux {
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        LaunchIpcMode, LaunchNetworkMode, LaunchOptions, ProcessExit, ProcessLauncher,
-        ProductionLauncher, StartTimeouts, SubordinateIdSource, create, start,
+        AttachableNamespaces, LaunchIpcMode, LaunchNetworkMode, LaunchOptions, NetnsAttachHook,
+        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
+        create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
@@ -1186,8 +1197,10 @@ mod linux {
         scenario_y_readonly_root(&env, tag);
         scenario_n_network_loopback(&env, tag, false);
         scenario_z_network_host_netns_sync(&env, tag);
+        scenario_attachable_network(&env, tag, false);
         if subordinate_requested() {
             scenario_n_network_loopback(&env, tag, true);
+            scenario_attachable_network(&env, tag, true);
             scenario_i_subordinate_ids(&env, tag);
             scenario_s_subordinate_sealed_inject(&env, tag);
         } else {
@@ -3078,6 +3091,195 @@ mod linux {
         println!(
             "production_launcher: network host netns sync accepted; forged baseline rejected with audit and no process (scenario=Z)"
         );
+    }
+
+    /// シナリオ A-attach の試験用フック。受け取った fd の素性と、合図の前に exec が起きていないことを記録して、`result` を返す。
+    struct AttachProbeHook {
+        /// 受け取った (net の ino, user の ino)。
+        seen: std::sync::Mutex<Option<(u64, u64)>>,
+        /// フックの中で「PID 1 がまだ exec していない」を確かめられたか。
+        not_exec_yet: std::sync::atomic::AtomicBool,
+        result: Result<(), ErrorCode>,
+    }
+
+    impl NetnsAttachHook for AttachProbeHook {
+        fn attach(
+            &self,
+            namespaces: AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), TraitError> {
+            let ino_of = |fd: std::os::fd::BorrowedFd<'_>| {
+                std::fs::File::from(fd.try_clone_to_owned().expect("dup ns fd"))
+                    .metadata()
+                    .expect("ns fd metadata")
+                    .ino()
+            };
+            let seen = (ino_of(namespaces.net()), ino_of(namespaces.user()));
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seen);
+            // 合図の前に PID 1 は exec していない: 子の `Name:` が exec 後のエントリ名 `probe` になるのは exec の後だけ。
+            let exec_started = || {
+                children_of_self().iter().any(|pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .ok()
+                        .and_then(|s| s.lines().next().map(str::to_owned))
+                        .is_some_and(|l| l.trim_end() == "Name:\tprobe")
+                })
+            };
+            let before = exec_started();
+            std::thread::sleep(Duration::from_millis(200));
+            let after = exec_started();
+            self.not_exec_yet
+                .store(!before && !after, std::sync::atomic::Ordering::SeqCst);
+            self.result
+                .map_err(|code| TraitError::new(code, "attach hook detail"))
+        }
+    }
+
+    /// シナリオ A-attach(NET-9・CORE-6・SEC-1・REPAIR-5・#1939): `Attachable` モードの同期点。受理の側は、フックが netns と
+    /// user namespace の fd(ホストと異なる素性)を合図の前に受け取り、その時点で PID 1 が exec しておらず、合図の後に
+    /// コンテナがフックで受けた netns の中で `lo` だけ up の状態で動くことを照合する。拒否の側は Err を返すフックで起動し、
+    /// `start` の code と固定文言・状態 Created・子が残らないことを照合する。
+    /// `subordinate` が真なら範囲写像の経路で回す。
+    fn scenario_attachable_network(env: &Env, tag: u32, subordinate: bool) {
+        use std::sync::atomic::Ordering;
+        let make_launcher = |hook: Arc<AttachProbeHook>| -> Arc<dyn ProcessLauncher> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs.ensure_default_dev_shm().expect("default dev shm");
+            let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+                .expect("launch options")
+                .with_network(LaunchNetworkMode::Attachable);
+            let builder = if subordinate {
+                ProductionLauncher::builder()
+                    .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                    .subordinate_ids(
+                        SubordinateIdSource::system(std::env::var("USER").ok())
+                            .expect("subordinate ids"),
+                    )
+            } else {
+                ProductionLauncher::builder().privilege(IsolationPrivilege::RootlessSingleId)
+            };
+            Arc::new(
+                builder
+                    .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                    .launch_options(options)
+                    .netns_attach_hook(hook)
+                    .build()
+                    .expect("build launcher for attachable network"),
+            )
+        };
+        let host_net_ino = std::fs::metadata("/proc/self/ns/net")
+            .expect("host net ns")
+            .ino();
+        let host_user_ino = std::fs::metadata("/proc/self/ns/user")
+            .expect("host user ns")
+            .ino();
+        let suffix = if subordinate { "sub" } else { "own" };
+
+        // 受理。
+        let hook = Arc::new(AttachProbeHook {
+            seen: std::sync::Mutex::new(None),
+            not_exec_yet: std::sync::atomic::AtomicBool::new(false),
+            result: Ok(()),
+        });
+        let launcher = make_launcher(Arc::clone(&hook));
+        let bundle = Bundle::new(if subordinate { "nasub" } else { "na" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plattach{suffix}{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let seen = *hook
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (hook_net, hook_user) = seen.expect("the hook must have been called once before exec");
+        assert_ne!(hook_net, host_net_ino, "the handed netns must be new");
+        assert_ne!(hook_user, host_user_ino, "the handed userns must be new");
+        assert!(
+            hook.not_exec_yet.load(Ordering::SeqCst),
+            "the container must not exec before the launcher's acknowledgement"
+        );
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "NETNS"),
+                format!("net:[{hook_net}]"),
+                "the container must run in the netns handed to the hook"
+            );
+            assert_eq!(value_of(&lines, "NETDEV_LO"), "true");
+            assert_eq!(value_of(&lines, "NETDEV_EXTRA"), "none");
+            assert_eq!(value_of(&lines, "UDP_SELF"), "ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain after terminate"
+        );
+
+        // 拒否: フックが Err なら exec させず、code を保ち、固定文言で、状態は Created のまま子が残らない。
+        let hook = Arc::new(AttachProbeHook {
+            seen: std::sync::Mutex::new(None),
+            not_exec_yet: std::sync::atomic::AtomicBool::new(false),
+            result: Err(ErrorCode::Unavailable),
+        });
+        let launcher = make_launcher(Arc::clone(&hook));
+        let bundle = Bundle::new(if subordinate { "narsub" } else { "nar" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plattachrej{suffix}{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("a failing attach hook must reject the start"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), ErrorCode::Unavailable, "{}", err.message());
+        assert_eq!(
+            err.message(),
+            "container launch failed in the NetnsAttach stage"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(hook.not_exec_yet.load(Ordering::SeqCst));
+        assert!(!launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "a rejected launch must leave no process: {:?}",
+            children_of_self()
+        );
+        // 成功行は固定文言(CI の照合が試験ソースの文字列リテラルから期待行を導出するため、プレースホルダを持たせない)。
+        if subordinate {
+            println!(
+                "production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable-subordinate)"
+            );
+        } else {
+            println!(
+                "production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable)"
+            );
+        }
     }
 
     /// シナリオ V: `linux.sysctl` の namespaced キー(IPC 系 `kernel.shmmax`)が実際の IPC namespace と procfs を通って

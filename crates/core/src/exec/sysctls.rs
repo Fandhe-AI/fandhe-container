@@ -19,7 +19,7 @@
 //!
 //! 起動前に launcher が、実効の名前空間（`--ipc=host` で IPC namespace を外した場合を含む）と
 //! [`SysctlPlan::new`] で照合する。必要な名前空間が無ければ plan を作れないため、ホストの名前空間へ向かう書き込みは
-//! 子へ渡る値として表現できない。network namespace は Loopback モード（NET-6・#3064）で子が新しく作る netns が実効の集合に
+//! 子へ渡る値として表現できない。network namespace は Loopback / Attachable モード（NET-6・NET-9・#3064・#1939）で子が新しく作る netns が実効の集合に
 //! 入るときだけ `net.*` の plan を作れる（ホストの netns のままなら作れない）。pod の netns の結線は未対応（#2675。REPAIR-3）。
 //!
 //! # 契約
@@ -64,7 +64,7 @@ impl<'a> SysctlPlan<'a> {
     ///
     /// 空集合は `Ok(None)`（何も適用しない）。足りない名前空間があれば、その種別を `Err` で返す
     /// （IPC 系は IPC namespace、`net.*` は network namespace が要る。`net.*` は実効の集合に `Net` が無ければ `Err(Net)`。
-    /// `Net` は Loopback モードで子が新しく作る netns に限る。NET-6・#3064）。
+    /// `Net` は Loopback / Attachable モードで子が新しく作る netns に限る。NET-6・NET-9・#3064・#1939）。
     pub(crate) fn new(
         set: &'a SysctlSet,
         effective: NamespaceSet,

@@ -13,13 +13,15 @@
 //! | `FromConfig` | 有り | `Unimplemented`(現行どおり) |
 //! | `Loopback` | 無し、または path 無し | `NewLoopback`(新しい netns と lo の up) |
 //! | `Loopback` | path 付き / 重複 | `InvalidArgument` |
+//! | `Attachable` | 無し、または path 無し | `NewLoopback`(`Loopback` と同じ。exec 前の同期点で netns と user namespace の fd を呼び出し側へ渡す。#1939) |
+//! | `Attachable` | path 付き / 重複 | `InvalidArgument` |
 //! | `Host` | 無し、または path 無し | `HostShared`(config のエントリより起動オプションを優先。`--ipc host` と同じ) |
 //! | `Host` | path 付き / 重複 | `InvalidArgument` |
 //!
 //! # 実体と未実装(REPAIR-3)
 //!
 //! `NewLoopback` の実体(CLONE_NEWNET と lo の up)は #3064 で入った。rootless の中間プロセスが netns を作り、
-//! exec の前に `exec::unshare_and_configure` が `lo` を up にする。exec 直前の同期点での netns 素性の照合(D8)は core に実装済み(#3206。`exec::netns_sync`。`Host` と `Loopback` の起動だけが通る)。`network_mode=host` の構造化ログと net crate の `HostNetns` を使う結線は未実装(#1873)。
+//! exec の前に `exec::unshare_and_configure` が `lo` を up にする。exec 直前の同期点での netns 素性の照合(D8)は core に実装済み(#3206。`exec::netns_sync`。`Host`・`Loopback`・`Attachable` の起動だけが通り、`Attachable` は fd 2 本と呼び出し側の合図を伴う〔#1939〕)。`network_mode=host` の構造化ログと net crate の `HostNetns` を使う結線は未実装(#1873)。
 
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::types::{ErrorCode, TraitError};
@@ -34,6 +36,11 @@ pub enum LaunchNetworkMode {
     Loopback,
     /// ホストの network namespace を共有する(`host`)。起動オプションだけで許し、config からは選べない。
     Host,
+    /// 外から付ける netns(rootless の pasta 構成。NET-9・CORE-6・#1939)。新しい netns と `lo` の up は `Loopback` と同じ。
+    /// 違いは、exec 直前の同期点で子が netns と user namespace の fd を**この順で**呼び出し側へ渡し、呼び出し側が注入した
+    /// 準備処理(`NetnsAttachHook`。holder の保持と pasta の起動は supervisor が #1940 で担う)が成功してから合図を受けて
+    /// exec する点だけ。rootless の権限モデルに限り、ビルドの時点で他は拒否される(`ProductionLauncherBuilder::build`)。
+    Attachable,
 }
 
 /// 突き合わせの結果(実効の network の扱い)。
@@ -65,7 +72,7 @@ pub(super) fn reconcile_network(
                 "start does not support yet: network / cgroup / time namespace",
             )),
         },
-        LaunchNetworkMode::Loopback | LaunchNetworkMode::Host => {
+        LaunchNetworkMode::Loopback | LaunchNetworkMode::Attachable | LaunchNetworkMode::Host => {
             if has_second {
                 return Err(TraitError::new(
                     ErrorCode::InvalidArgument,
@@ -78,10 +85,10 @@ pub(super) fn reconcile_network(
                     "the network mode conflicts with a linux.namespaces network path",
                 ));
             }
-            Ok(if mode == LaunchNetworkMode::Loopback {
-                EffectiveNetwork::NewLoopback
-            } else {
+            Ok(if mode == LaunchNetworkMode::Host {
                 EffectiveNetwork::HostShared
+            } else {
+                EffectiveNetwork::NewLoopback
             })
         }
     }
@@ -141,7 +148,11 @@ mod tests {
 
     #[test]
     fn net6_sec1_loopback_and_host_reject_path_without_leaking_it() {
-        for mode in [LaunchNetworkMode::Loopback, LaunchNetworkMode::Host] {
+        for mode in [
+            LaunchNetworkMode::Loopback,
+            LaunchNetworkMode::Attachable,
+            LaunchNetworkMode::Host,
+        ] {
             let err = run(NET_PATH, mode).unwrap_err();
             assert_eq!(err.code(), ErrorCode::InvalidArgument);
             assert_eq!(
@@ -149,6 +160,17 @@ mod tests {
                 "the network mode conflicts with a linux.namespaces network path"
             );
             assert!(!err.message().contains("/run/netns"));
+        }
+    }
+
+    /// NET-9・CORE-6(#1939): `Attachable` は `Loopback` と同じ行(エントリ無し・path 無しは `NewLoopback`)。
+    #[test]
+    fn net9_attachable_accepts_no_entry_and_pathless_entry() {
+        for ns in [NONE, NET] {
+            assert_eq!(
+                run(ns, LaunchNetworkMode::Attachable).unwrap(),
+                EffectiveNetwork::NewLoopback
+            );
         }
     }
 
@@ -164,7 +186,11 @@ mod tests {
 
     #[test]
     fn net6_sec1_loopback_and_host_reject_duplicate_entries() {
-        for mode in [LaunchNetworkMode::Loopback, LaunchNetworkMode::Host] {
+        for mode in [
+            LaunchNetworkMode::Loopback,
+            LaunchNetworkMode::Attachable,
+            LaunchNetworkMode::Host,
+        ] {
             let err = run(NET_TWICE, mode).unwrap_err();
             assert_eq!(err.code(), ErrorCode::InvalidArgument);
             assert_eq!(

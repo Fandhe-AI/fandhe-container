@@ -1034,6 +1034,11 @@ mod tests {
     }
 
     /// SUP-14・TASK-171.1.3: prctl の番号と capability ABI の値を固定する（include/uapi の値との照合）。
+    /// 定数は LP64 の x86_64・aarch64 に限って宣言するため、試験も同じ対象に閉じる（#3202）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
     #[test]
     fn sup14_task171_1_3_constants_are_fixed() {
         assert_eq!(PR_GET_KEEPCAPS, 7);

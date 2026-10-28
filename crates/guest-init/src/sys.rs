@@ -29,8 +29,14 @@ const MS_NOSUID: u64 = 2;
 const MS_NODEV: u64 = 4;
 /// 実行を禁止する。
 const MS_NOEXEC: u64 = 8;
-/// `open(2)` で制御端末にしない。
+/// `open(2)` で制御端末にしない。値は asm-generic（x86_64・aarch64）のもので、`SUPPORTED` と同じ
+/// 対象に cfg で閉じる（他 arch の値を流用しない。#3202・MVM-4）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub const O_NOCTTY: i32 = 0o400;
+/// 対象外 arch では値を確かめていないため flag を付けない（0）。この arch では mount 系が `ENOSYS` を返し
+/// init は先へ進まないので、コンソールの開き方の差は実害を生まない。
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const O_NOCTTY: i32 = 0;
 
 /// `ENOSYS`（Linux 共通）。
 const ENOSYS: i32 = 38;
@@ -184,6 +190,7 @@ mod tests {
         assert_eq!(MS_NOSUID, 2);
         assert_eq!(MS_NODEV, 4);
         assert_eq!(MS_NOEXEC, 8);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert_eq!(O_NOCTTY, 0o400);
     }
 

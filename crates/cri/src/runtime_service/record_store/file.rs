@@ -4,7 +4,7 @@
 //! 0700・symlink 拒否・所有者照合・`O_EXCL` の一時ファイル → fsync → rename → ディレクトリの fsync・
 //! `.lock` の期限つき `try_lock`。契約の全体は親モジュール（`record_store`）を参照。
 //!
-//! 呼び出し元になる予定: R4〜R9（#2933〜#2938）。本単位では試験からのみ呼ばれる。
+//! 呼び出し元: R4〜R9（#2933〜#2938。本番の配線は plugin-cri の `serve`。実装済み）。
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};

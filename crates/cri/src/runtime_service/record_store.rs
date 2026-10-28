@@ -7,7 +7,7 @@
 //! 呼び出し元: R4（#2933。sandbox の書く・消す時点。`CriRuntimeService::with_record_store` で注入。実装済み）。
 //! 呼び出し元: R5（#2934。コンテナの書く・消す時点。実装済み）・R6（#2935。sandbox の起動時の列挙と再採用。
 //! `readopt`。実装済み）・R7（#2936。コンテナの再採用と core の状態との照合。実装済み）。呼び出し元になる予定:
-//! R9（#2938。plugin-cri の本番配線）。本単位ではトレイトと
+//! R9（#2938。plugin-cri の本番配線。実装済み）。本単位ではトレイトと
 //! ファイル実装（`FileRecordStore`。unix のみ）までを置く。
 //!
 //! 置き場: `<状態ルート>/.cri/records/{sandboxes,containers}/<id>.rec`。ファイル名は検証済みの
@@ -195,7 +195,7 @@ pub struct RecordStoreOpSample {
 /// 契約: 呼び出し側の操作の経路から同期的に呼ばれるため、有界時間で戻り、panic しないこと
 /// （相手応答待ち・無期限のロック待ちをしない。REPAIR-5）。ストアの内部ロックを解放してから呼ばれる。
 /// 戻り値を `()` にしているのは、計測の失敗で本来の操作結果を変えないため。
-/// 本番の配線（plugin-cri の `OpRecorder` への橋渡し）は R9（#2938）で行う。
+/// 本番の配線（plugin-cri の `OpRecorder` への橋渡し。`cri.record_store.{put,remove,list}`）は R9（#2938）で実装済み。
 pub trait RecordStoreOpRecorder: Send + Sync {
     /// 1 件の計測結果を記録する。
     fn record_store_op(&self, sample: &RecordStoreOpSample);

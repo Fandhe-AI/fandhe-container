@@ -23,6 +23,8 @@ pub mod netsetup;
 pub mod orphan_bundles;
 pub mod pod_network;
 #[cfg(unix)]
+pub mod record_readoption;
+#[cfg(unix)]
 pub mod server;
 pub mod startup;
 #[cfg(target_os = "linux")]

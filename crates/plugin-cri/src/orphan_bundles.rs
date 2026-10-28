@@ -4,7 +4,7 @@
 //! core にもコンテナが無い）を消す（containerd の `cleanupOrphanedIDDirs` に相当）。`CreateContainer` の write-ahead
 //! 記録より前に bundle を作る経路や、記録の削除後・bundle の解放前のクラッシュで生じる。
 //!
-//! 呼び出し元: 本番の `serve` が受付の開始前に 1 回だけ呼ぶ（配線は R9 #2938。常駐ループは作らない。CORE-1）。
+//! 呼び出し元: 本番の `serve` が受付の開始前に 1 回だけ呼ぶ（配線は R9 #2938 で実装済み。`record_readoption`。常駐ループは作らない。CORE-1）。
 //! 順序は `readopt_sandboxes` → `readopt_containers` → `release_stale_creates` → 本関数。解放に失敗した `stale_create`
 //! の記録が残っている間は、その bundle が「記録あり」として孤児扱いにならないため、この順が要る。
 //!
@@ -97,7 +97,7 @@ impl OrphanBundleReclamation {
         }
     }
 
-    /// 固定語彙の 1 行要約（ID・パスを含めない）。stderr への出力は R9 #2938 が行う。
+    /// 固定語彙の 1 行要約（ID・パスを含めない）。`serve` が `record_readoption` 経由で stderr へ出す（R9 #2938）。
     pub fn summary_line(&self) -> String {
         let scan = match self.scan {
             OrphanScan::Completed => "completed".to_owned(),

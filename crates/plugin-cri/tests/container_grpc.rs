@@ -1153,3 +1153,190 @@ async fn production_binary_full_lifecycle_real() {
     .await
     .expect("watchdog");
 }
+// ---- 段 D: 同じ状態ルートで 2 回起動する再起動（R9 #2938。CRI-1・CRI-2・CORE-1・REPAIR-4・REPAIR-5）----
+
+/// 子を kill して回収し、そこまでの stderr 全体を返す（読み手は別スレッドで期限つき。pipe を詰まらせない）。
+fn kill_and_collect_stderr(mut guard: ChildGuard) -> String {
+    let stderr = guard.0.stderr.take();
+    let _ = guard.0.kill();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        if let Some(mut s) = stderr {
+            use std::io::Read as _;
+            let _ = s.read_to_string(&mut out);
+        }
+        let _ = tx.send(out);
+    });
+    // `guard` の Drop が期限つきで回収する。
+    rx.recv_timeout(REAP_GRACE).unwrap_or_default()
+}
+
+/// 状態ルート配下の記録の置き場（`<XDG>/fandhe-container/.cri/records/<kind>`）。
+fn records_dir(xdg: &Path, kind: &str) -> PathBuf {
+    xdg.join("fandhe-container/.cri/records").join(kind)
+}
+
+/// 0600 の記録ファイルを置く（中身は固定のゴミ。復号に失敗する）。
+fn write_garbage_record(dir: &Path, name_hex: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(format!("{name_hex}.rec")))
+        .expect("create garbage record");
+    f.write_all(b"garbage").expect("write garbage record");
+}
+
+/// 段 D（CRI-1・CRI-2・CORE-1・REPAIR-4）: 1 回目の起動で作った sandbox とコンテナが、SIGKILL 後の同じ状態ルートでの
+/// 2 回目の起動で見える。sandbox は `SANDBOX_NOTREADY`、コンテナは core の状態どおり（Created）。壊れた記録は起動を止めず
+/// 件数に出て、記録の無い孤児 bundle は回収される。root 不要・ネットワーク不要。
+#[tokio::test]
+async fn cri1_cri2_core1_records_survive_plugin_restart() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("sock-rs");
+        let xdg = TempDir::new("xdg-rs");
+        let sock_a = dir.0.join("a.sock");
+        let sock_b = dir.0.join("b.sock");
+        let sock_c = dir.0.join("c.sock");
+        let state_root = xdg.0.join("fandhe-container");
+
+        // 1 回目: sandbox とコンテナを作り、記録が書かれたことを確かめて SIGKILL する。
+        let mut guard = spawn_server(&sock_a, &xdg.0);
+        let ch = connect_when_ready(&sock_a, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let sb = run_sandbox(&mut c, "pod-restart").await;
+        let image_id = pull_fixture_image(&state_root.join(".cri/images"));
+        let cid = create_container(&mut c, &sb, "c-restart", &image_id)
+            .await
+            .expect("create by image id");
+        let before = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(before.state, cri::ContainerState::ContainerCreated as i32);
+        assert!(records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec")).is_file());
+        assert!(records_dir(&xdg.0, "containers").join(format!("{cid}.rec")).is_file());
+        drop((c, ch));
+        let first_stderr = kill_and_collect_stderr(guard);
+        // 初回起動は何も再採用しないので要約行は出ない（静かな起動）。
+        assert!(
+            !first_stderr.contains("cri record readoption"),
+            "first start must be quiet: {first_stderr}"
+        );
+
+        // 故障の注入（root 不要）: 壊れたコンテナ記録 1 件と、記録の無い孤児 bundle 1 件。
+        let garbage = format!("{:064x}", 0xdead_u32);
+        write_garbage_record(&records_dir(&xdg.0, "containers"), &garbage);
+        let orphan = format!("{:064x}", 0xbeef_u32);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state_root.join(".cri/bundles").join(&orphan))
+            .expect("orphan bundle dir");
+
+        // 2 回目: 同じ状態ルート・別 socket。
+        let mut guard = spawn_server(&sock_b, &xdg.0);
+        let ch = connect_when_ready(&sock_b, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        assert_eq!(
+            sandbox_state(&mut c, &sb).await.expect("sandbox status"),
+            cri::PodSandboxState::SandboxNotready as i32
+        );
+        assert_eq!(list_containers_len(&mut c).await, 1);
+        let after = container_status(&mut c, &cid).await.expect("status");
+        assert_eq!(after.state, cri::ContainerState::ContainerCreated as i32);
+        assert_eq!(after.image_id, before.image_id);
+        assert_eq!(after.image_ref, before.image_ref);
+        assert_eq!(
+            after.metadata.as_ref().map(|m| m.name.as_str()),
+            Some("c-restart")
+        );
+        // 親 sandbox が NotReady なので start は拒否される。
+        let err = start_container(&mut c, &cid).await.expect_err("start");
+        assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+        // 孤児 bundle は回収済み。再採用したコンテナの bundle は残る。
+        assert!(!state_root.join(".cri/bundles").join(&orphan).exists());
+        assert!(state_root.join(".cri/bundles").join(&cid).is_dir());
+
+        // 後片付け: 所有が復元されているので Remove が通り、記録が消える。壊れた記録は消さない。
+        remove_container(&mut c, &cid).await.expect("remove container");
+        assert_eq!(list_containers_len(&mut c).await, 0);
+        stop_sandbox(&mut c, &sb).await.expect("stop sandbox");
+        remove_sandbox(&mut c, &sb).await.expect("remove sandbox");
+        assert!(!state_root.join(".cri/bundles").join(&cid).exists());
+        assert!(!records_dir(&xdg.0, "containers").join(format!("{cid}.rec")).exists());
+        assert!(!records_dir(&xdg.0, "sandboxes").join(format!("{sb}.rec")).exists());
+        assert!(records_dir(&xdg.0, "containers").join(format!("{garbage}.rec")).is_file());
+        drop((c, ch));
+        let second_stderr = kill_and_collect_stderr(guard);
+        for want in [
+            "cri record readoption: kind=sandbox adopted=1 pending_unresolved=0 broken=0 ",
+            "cri record readoption: kind=container adopted=1 present=1 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 ",
+            "cri stale create release: released=0 kept=0 release_failed=0 record_remove_failed=0 not_attempted=0 skipped=0",
+            "cri orphan bundle reclamation: scan=completed scanned=2 reclaimed=1 kept_has_record=1 ",
+        ] {
+            assert!(second_stderr.contains(want), "missing {want:?} in: {second_stderr}");
+        }
+        assert!(!second_stderr.contains(&sb) && !second_stderr.contains(&cid));
+
+        // 3 回目: 壊れた記録だけが残っていても起動は止まらず、件数だけが出る。
+        let mut guard = spawn_server(&sock_c, &xdg.0);
+        let ch = connect_when_ready(&sock_c, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        assert_eq!(list_containers_len(&mut c).await, 0);
+        drop((c, ch));
+        let third_stderr = kill_and_collect_stderr(guard);
+        assert!(
+            third_stderr.contains(
+                "cri record readoption: kind=container adopted=0 present=0 absent_exited=0 remove_pending=0 undetermined=0 stale_create=0 broken=1 malformed=1 "
+            ),
+            "{third_stderr}"
+        );
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 段 D（CRI-2・REPAIR-5）: 記録の件数が上限を超えていたら、起動を止める（fail-closed。socket も作らない）。
+#[tokio::test]
+async fn cri2_record_limit_exceeded_stops_startup() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("sock-lim");
+        let xdg = TempDir::new("xdg-lim");
+        let sock_a = dir.0.join("a.sock");
+        let sock_b = dir.0.join("b.sock");
+
+        // 1 回目で置き場を正規の権限で作らせてから止める。
+        let mut guard = spawn_server(&sock_a, &xdg.0);
+        let ch = connect_when_ready(&sock_a, Some(&mut guard)).await;
+        drop(ch);
+        let _ = kill_and_collect_stderr(guard);
+
+        // sandbox の件数の上限（1024）を 1 件超える壊れた記録。
+        let sandboxes = records_dir(&xdg.0, "sandboxes");
+        for i in 0..=1024u32 {
+            write_garbage_record(&sandboxes, &format!("{i:064x}"));
+        }
+
+        let mut guard = spawn_server(&sock_b, &xdg.0);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(s) = guard.exited() {
+                break s;
+            }
+            assert!(start.elapsed() < Duration::from_secs(30), "must exit");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(status.code(), Some(1));
+        assert!(!sock_b.exists());
+        let mut err = String::new();
+        if let Some(mut s) = guard.0.stderr.take() {
+            use std::io::Read as _;
+            let _ = s.read_to_string(&mut err);
+        }
+        assert!(
+            err.contains("error: FAILED_PRECONDITION: failed to readopt cri records"),
+            "{err}"
+        );
+    })
+    .await
+    .expect("watchdog");
+}

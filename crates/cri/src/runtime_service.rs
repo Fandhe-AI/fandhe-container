@@ -99,7 +99,7 @@
 //! 起動時の sandbox の再採用は [`CriRuntimeService::readopt_sandboxes`]（R6 #2935。実装済み）。
 //! コンテナ記録の書く・消す時点は、実行層接続時（`with_runtime` も注入）の経路に限って有効になる（R5 #2934）。
 //! 起動時のコンテナの再採用と core の状態との照合は [`CriRuntimeService::readopt_containers`]（R7 #2936。実装済み）。
-//! 本番の配線（R9）は後続の単位で、未実装（REPAIR-3）。
+//! 本番の配線（R9 #2938）は plugin-cri の `serve` で実装済み。
 //!
 //! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
@@ -1660,7 +1660,7 @@ impl CriRuntimeService {
     /// - `RemoveContainer`・`RemovePodSandbox` の配下: `delete` と bundle の解放の成功後に記録を消す
     ///
     /// 起動時のコンテナ記録の再採用と core の状態との照合は [`Self::readopt_containers`]（R7 #2936。実装済み）。
-    /// 未実装（REPAIR-3）: 本番の配線は R9 #2938。
+    /// 本番の配線は plugin-cri の `serve`（R9 #2938。実装済み）。
     pub fn with_record_store(mut self, store: Arc<dyn RecordStore>) -> Self {
         self.record_store = Some(store);
         self

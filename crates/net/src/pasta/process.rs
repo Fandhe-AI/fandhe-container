@@ -10,7 +10,7 @@
 //!   親が `getppid` と一致することを確かめる（12.10 の (1)。`sys::pasta`）。
 //! - 準備完了: pasta は `-f -P <pid>` で、初期化が終わった後に自分の PID をファイルへ書く（`man pasta` の `-P`・`-f`）。
 //!   よって `pid` の中身が spawn した子の PID と 10 進で完全一致したときを準備完了とする（ファイルが現れただけでは
-//!   判定しない。書き込みの途中の部分読みは「まだ」）。事前に古い `pid` は [`PastaRunDir::prepare`] が消している。
+//!   判定しない。書き込みの途中の部分読みは「まだ」）。事前に古い `pid` は `PastaRunDir::prepare` が消している。
 //!   並行して `try_wait` で子の生存を見て、準備完了前の終了は `FailedPrecondition`、期限切れは `Timeout`。
 //!   失敗時は必ず kill して期限つきで回収してから返す。
 //! - 停止: SIGTERM → [`PASTA_STOP_GRACE`] → SIGKILL → [`PASTA_REAP_TIMEOUT`]。回収済みの pid にはシグナルを送らない。
@@ -48,6 +48,8 @@ pub const PASTA_READY_TIMEOUT_MAX: Duration = Duration::from_secs(10);
 pub const PASTA_STOP_GRACE: Duration = Duration::from_secs(2);
 /// SIGKILL の後、回収までの待ち。
 pub const PASTA_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+/// 回収スレッドが SIGKILL の後に回収を試みる上限（超えたら子のハンドルを手放す）。
+pub const PASTA_DETACHED_REAP_DEADLINE: Duration = Duration::from_secs(30);
 /// 保持する stderr の上限バイト数（エスケープ後）。
 pub const PASTA_STDERR_CAP: usize = 4096;
 /// PID ファイルとして受ける最大バイト数（10 進 + 改行 1 個）。
@@ -85,6 +87,8 @@ pub const MSG_PASTA_PID_FILE: &str =
 pub const MSG_PASTA_WAIT: &str = "pasta process state could not be determined";
 /// 停止が期限内に終わらない。
 pub const MSG_PASTA_STOP_TIMEOUT: &str = "pasta did not stop before the deadline";
+/// 回収スレッドを作れない。
+pub const MSG_PASTA_REAPER_SPAWN: &str = "pasta reaper thread could not be started";
 /// 既に停止済み。
 pub const MSG_PASTA_STOPPED: &str = "pasta has already been stopped";
 /// Linux 以外では使えない。
@@ -493,12 +497,41 @@ impl PastaProcess {
 
     /// kill して回収を専用スレッドへ移す。**単一スレッドの区間の外から明示的に呼ぶこと**（暗黙には使わない）。
     /// 期限内に回収できなかった子を zombie にしないための最終手段。
-    pub fn detach_reaper(mut self) {
-        if let Some(mut child) = self.child.take() {
-            std::thread::spawn(move || {
-                let _ = child.kill();
-                let _ = child.wait();
+    ///
+    /// スレッドの生成に失敗したときは子の所有権を `self` へ戻して `unreaped` に入れて返す（呼び出し側が
+    /// 再試行でき、捨てれば `Drop` が kill と回収を試みる。panic しない）。回収スレッドは SIGKILL の後
+    /// [`PASTA_DETACHED_REAP_DEADLINE`] まで有限時間だけ回収を試み、超えたら子のハンドルを手放して終わる
+    /// （zombie のまま残り、プロセスの終了で init が回収する。REPAIR-5）。
+    pub fn detach_reaper(mut self) -> Result<(), PastaStopError> {
+        let Some(child) = self.child.take() else {
+            return Ok(());
+        };
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+        let thread_slot = std::sync::Arc::clone(&slot);
+        let spawned = std::thread::Builder::new()
+            .name("pasta-reaper".to_string())
+            .spawn(move || {
+                let taken = thread_slot.lock().ok().and_then(|mut g| g.take());
+                if let Some(mut child) = taken {
+                    let _ = child.kill();
+                    let _ = wait_exit(&mut child, PASTA_DETACHED_REAP_DEADLINE);
+                }
             });
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // 生成失敗: スレッドは動いていないので子を取り戻す（毒化していても中身は取り出す）。
+                let back = match slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(p) => p.into_inner().take(),
+                };
+                self.child = back;
+                let unreaped = self.child.is_some().then(|| Box::new(self));
+                Err(PastaStopError {
+                    error: err(NetErrorCode::Internal, MSG_PASTA_REAPER_SPAWN),
+                    unreaped,
+                })
+            }
         }
     }
 }

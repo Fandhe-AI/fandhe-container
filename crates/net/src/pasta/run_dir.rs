@@ -1,9 +1,9 @@
 //! pasta の PID ファイルの置き場所 `<state_root>/@pasta/<container-id>/` の作成・古い `pid` の掃除・削除
 //! （NET-9・SEC-1・REPAIR-5・#1938。`docs/design/rootless-network.md` 12.8）。
 //!
-//! - 呼び出し元: supervisor の launch（手順 8。#1940）が [`PastaRunDir::prepare`] で作り、
-//!   [`super::process::spawn_pasta`] に渡す。stop では [`PastaRunDir::remove`]、CLI の delete は残骸だけを
-//!   [`remove_pasta_run_dir`] で消す（記録の pid でのプロセスの探索・kill はしない。pid の再利用を避ける。12.10）。
+//! - 呼び出し元: supervisor の launch（手順 8。#1940）が `PastaRunDir::prepare` で作り、
+//!   [`super::process::spawn_pasta`] に渡す。stop では `PastaRunDir::remove`、CLI の delete は残骸だけを
+//!   `remove_pasta_run_dir` で消す（記録の pid でのプロセスの探索・kill はしない。pid の再利用を避ける。12.10）。
 //! - 状態ルートは `BorrowedFd` で受ける（パス文字列を受けない）。作成・検査・削除はすべて fd 起点
 //!   （`/proc/thread-self/fd/<N>/…` の magic link と `openat(O_NOFOLLOW)`）で行い、パスを再解決しない。
 //!   最終要素の symlink は mkdir でも unlink でも辿らない。
@@ -69,7 +69,7 @@ pub fn validate_container_id(id: &str) -> Result<(), NetError> {
 
 /// 作成済みの置き場所（`@pasta/<id>/`）。
 ///
-/// spawn の前に [`PastaRunDir::prepare`] で作る。`pid_path` を pasta の `-P` に渡し、準備完了の判定はこの型が
+/// spawn の前に `PastaRunDir::prepare` で作る。`pid_path` を pasta の `-P` に渡し、準備完了の判定はこの型が
 /// 保持するディレクトリ fd 経由で `pid` を読む。
 #[derive(Debug)]
 pub struct PastaRunDir {

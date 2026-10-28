@@ -411,13 +411,26 @@ mod linux {
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn intermediate");
-        let mut out = String::new();
-        mid.stdout
-            .take()
-            .expect("stdout")
-            .read_to_string(&mut out)
-            .expect("read pid");
-        let st = wait_exit(&mut mid, Duration::from_secs(10));
+        // 出力取得も終了確認も共通の期限（10 秒）の中で行う。超えたら強制終了して有限時間で回収する。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pipe = mid.stdout.take().expect("stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let r = pipe.read_to_string(&mut out).map(|_| out);
+            let _ = tx.send(r);
+        });
+        let got = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let out = match got {
+            Ok(r) => r.expect("read pid"),
+            Err(_) => {
+                let _ = mid.kill();
+                wait_exit(&mut mid, Duration::from_secs(2));
+                panic!("intermediate produced no pid before the deadline");
+            }
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let st = wait_exit(&mut mid, left);
         assert!(st, "intermediate did not exit");
         let pid: u32 = out.trim().parse().expect("pasta pid");
         let until = Instant::now() + Duration::from_secs(2);
@@ -442,7 +455,11 @@ mod linux {
             }
             if Instant::now() >= until {
                 let _ = c.kill();
-                let _ = c.wait();
+                // 強制終了後の回収も有限時間で打ち切る。
+                let reap = Instant::now() + Duration::from_secs(2);
+                while !matches!(c.try_wait(), Ok(Some(_))) && Instant::now() < reap {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));

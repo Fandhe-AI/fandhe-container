@@ -126,7 +126,7 @@
   - 要約行: 何かを再採用・回収したときだけ、4 段の `summary_line()` を ` | ` でつないだ 1 行を stderr へ出す。4 段とも空（初回起動など）なら出さない。固定語彙で ID・パス・config を含まない。
   - 計測: 再採用は既存の `cri.record_store_load`（採用 1 件ごとに成功、壊れた記録 1 件ごとに失敗）。記録ストアの操作は `CoreRecordStoreRecorder` が共有 `OpRecorder` へ `cri.record_store.{put,remove,list}` の 3 名で成功 / 失敗に縮約して流す（結果区分・種別は名前に混ぜず、`MAX_TRACKED_OPS` の枠を使い切らない）。
   - 試験: `crates/plugin-cri/tests/container_grpc.rs` の段 D（実バイナリを同じ状態ルートで 2 回、さらに 3 回起動。SIGKILL 後に sandbox が `SANDBOX_NOTREADY`・コンテナが `CONTAINER_CREATED` で見えること、壊れた記録と孤児 bundle の注入、Remove での所有の復元、1025 件の記録での起動失敗）と `tests/record_readoption.rs`（4 段の順序・要約行・`Err` の素通し・ロックの要求）。いずれも root 不要の既定の集合。
-  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した実機での再起動確認は R13 #2942。SIGTERM の正常停止は未実装のため、試験は SIGKILL で止める。
+  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した再起動の自動試験は #3225（実機前提。`production_binary_restart_readopts_running_container_real`）、人間の crictl での実機確認は R13 #2942。SIGTERM の正常停止は未実装のため、試験は SIGKILL で止める。
 - core に状態があるが CRI 記録の無いコンテナは触らない（CLI と状態ルートを共有するため所有を証明できない）
 - 孤児 bundle（`.cri/bundles/<id>` で CRI 記録が無く core が Absent〔`NotFound` だけ〕）は、インスタンスロックの下でだけ回収する。Undetermined は残す
 

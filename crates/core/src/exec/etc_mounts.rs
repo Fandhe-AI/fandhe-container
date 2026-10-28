@@ -454,13 +454,16 @@ struct Deps<'a> {
     attach: &'a dyn Fn(BorrowedFd<'_>, BorrowedFd<'_>) -> Result<(), SysError>,
     mnt_id: &'a dyn Fn(&OwnedFd) -> Result<u64, ExecError>,
     umount: &'a dyn Fn(BorrowedFd<'_>) -> Result<(), SysError>,
+    /// 作った直後の空ファイルを fstat で確かめる（本番は `meta_of`。単体テストで失敗を注入する）。
+    inspect_created: &'a dyn Fn(BorrowedFd<'_>) -> Result<(), ExecError>,
 }
 
 /// 載せた 1 件の後始末情報。
 struct Applied {
     clone: Option<OwnedFd>,
-    /// 自分が作った空ファイル `(名前, (dev, ino))`。
-    created: Option<(CString, (u64, u64))>,
+    /// 自分が作った空ファイル `(名前, 作成時に開いた fd)`。ロールバックは、この fd の `(dev, ino)` と
+    /// 名前で開き直した先が一致したときだけ消す（作成直後のどの失敗でも記録済みにするため fd を保持する。SEC-1・NET-12）。
+    created: Option<(CString, std::fs::File)>,
     /// この件の `etc` ディレクトリ（作ったファイルを消すため）。
     etc: OwnedFd,
 }
@@ -474,16 +477,16 @@ fn rollback(applied: &mut Vec<Applied>, deps: &Deps<'_>) -> Vec<String> {
             failures.push(format!("umount: {e:?}"));
         }
         drop(a.clone);
-        if let Some((name, ident)) = &a.created {
+        if let Some((name, held)) = &a.created {
             match sys::open_path_nofollow(a.etc.as_fd(), name) {
-                Ok(fd) => match meta_of(fd.as_fd()) {
-                    Ok(m) if (m.dev(), m.ino()) == *ident => {
+                Ok(fd) => match (meta_of(held.as_fd()), meta_of(fd.as_fd())) {
+                    (Ok(h), Ok(m)) if (m.dev(), m.ino()) == (h.dev(), h.ino()) => {
                         if let Err(e) = sys::remove_file_at(a.etc.as_fd(), name) {
                             failures.push(format!("unlink: {e:?}"));
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => failures.push(format!("fstat: {}", e.message)),
+                    (Ok(_), Ok(_)) => {}
+                    (Err(e), _) | (_, Err(e)) => failures.push(format!("fstat: {}", e.message)),
                 },
                 Err(SysError::Os(sys::ENOENT)) => {}
                 Err(e) => failures.push(format!("open: {e:?}")),
@@ -566,16 +569,15 @@ fn apply_one(
         match sys::create_file_excl_at(entry.etc.as_fd(), &name, FILE_MODE) {
             Ok(fd) => {
                 let file = std::fs::File::from(fd);
-                let m = file.metadata().map_err(|_| {
-                    fail(
-                        ErrorCode::Internal,
-                        "cannot inspect the created container etc target",
-                    )
-                })?;
-                entry.created = Some((name.clone(), (m.dev(), m.ino())));
-                created_target = true;
+                // 作った直後に記録する。以降のどの失敗でも `applied` に積んでから返し、空ファイルを残さない。
+                let inspected = (deps.inspect_created)(file.as_fd());
                 let r = file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE));
-                // 後始末のため、失敗しても先に記録してから返す。
+                entry.created = Some((name.clone(), file));
+                created_target = true;
+                if let Err(e) = inspected {
+                    applied.push(entry);
+                    return Err(e);
+                }
                 if r.is_err() {
                     applied.push(entry);
                     return Err(fail(
@@ -754,6 +756,14 @@ pub fn mount_etc_files(
         attach: &sys::move_mount_empty_path,
         mnt_id: &|fd| fd_mount_id(fd, STAGE),
         umount: &umount_fd,
+        inspect_created: &|fd| {
+            meta_of(fd).map(|_| ()).map_err(|_| {
+                fail(
+                    ErrorCode::Internal,
+                    "cannot inspect the created container etc target",
+                )
+            })
+        },
     };
     mount_etc_files_at(root, &host_root, sources, mounts.read_only(), &deps)
 }
@@ -898,6 +908,7 @@ mod tests {
         fail_attach_at: Cell<Option<usize>>,
         attach_count: Cell<usize>,
         shared: Cell<bool>,
+        fail_inspect: Cell<bool>,
     }
 
     impl Fx {
@@ -912,6 +923,7 @@ mod tests {
                 fail_attach_at: Cell::new(None),
                 attach_count: Cell::new(0),
                 shared: Cell::new(false),
+                fail_inspect: Cell::new(false),
             }
         }
 
@@ -979,6 +991,15 @@ mod tests {
                 mnt_id: &|_| Ok(if self.attached.get() { 100 } else { 1 }),
                 umount: &|_| {
                     self.calls.borrow_mut().push("umount".into());
+                    Ok(())
+                },
+                inspect_created: &|_| {
+                    if self.fail_inspect.get() {
+                        return Err(fail(
+                            ErrorCode::Internal,
+                            "cannot inspect the created container etc target",
+                        ));
+                    }
                     Ok(())
                 },
             };
@@ -1066,6 +1087,20 @@ mod tests {
             .expect_err("symlink etc");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert_eq!(std::fs::read_dir(&outside).expect("rd").count(), 0);
+    }
+
+    /// SEC-1・NET-12: 作成直後の確認が失敗しても、作った空ファイルは残らず何も載せない。
+    #[test]
+    fn sec1_net12_created_target_is_removed_when_inspection_fails() {
+        let fx = Fx::new();
+        fx.fail_inspect.set(true);
+        let src = fx.source("hosts");
+        let err = fx
+            .run(&[(EtcFileKind::Hosts, src)], false)
+            .expect_err("inspect fails");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(!fx.root().join("etc/hosts").exists());
+        assert!(fx.calls.borrow().is_empty());
     }
 
     /// rw で先が無ければ空ファイル(0644)を作る。ro で先が無ければ FailedPrecondition で何も作らない。

@@ -520,7 +520,8 @@ impl LinkDelete {
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFNAME` を取り出す（無ければ `None`）。
 ///
 /// 応答はカーネル由来の外部入力として属性走査で検証する。NUL 終端を除いた部分が UTF-8 でなければ
-/// `DataLoss`（Issue #1972）。
+/// `DataLoss`（Issue #1972）。`IFLA_IFNAME` が重複した応答も `DataLoss`（どちらの名前を信じるかが曖昧に
+/// なるため。カーネル応答は外部入力で、`decode_table_name` と同じ扱い。NET-1・#3258）。
 pub fn decode_ifinfomsg_name(payload: &[u8]) -> Result<Option<String>, NetError> {
     let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
         NetError::new(
@@ -528,19 +529,26 @@ pub fn decode_ifinfomsg_name(payload: &[u8]) -> Result<Option<String>, NetError>
             "link reply is shorter than ifinfomsg",
         )
     })?;
+    let mut found: Option<String> = None;
     for attr in crate::netlink::AttrIter::new(attrs) {
         let attr = attr?;
         if attr.attr_type() == IFLA_IFNAME {
+            if found.is_some() {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "duplicate IFLA_IFNAME attribute",
+                ));
+            }
             let raw = attr.payload();
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
             let bytes = raw.get(..end).unwrap_or_default();
             let name = std::str::from_utf8(bytes).map_err(|_| {
                 NetError::new(NetErrorCode::DataLoss, "IFLA_IFNAME is not valid UTF-8")
             })?;
-            return Ok(Some(name.to_owned()));
+            found = Some(name.to_owned());
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// `NLM_F_ECHO` 付きの bridge 作成要求に対する応答メッセージ（`(nlmsg_type, payload)`）から、作成した
@@ -1435,6 +1443,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.code(), NetErrorCode::DataLoss);
+    }
+
+    /// NET-1・#3258: `IFLA_IFNAME` が重複した応答は、値が同じでも違っても `DataLoss`（カーネル応答は外部入力）。
+    #[test]
+    fn net1_decode_ifinfomsg_name_rejects_duplicate() {
+        for dup in [&b"br1\0"[..], &b"br0\0"[..]] {
+            let p = link_payload_ext(3, Some(b"br0\0"), None, &[(IFLA_IFNAME, dup)]);
+            let e = decode_ifinfomsg_name(&p).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.message(), "duplicate IFLA_IFNAME attribute");
+            let msgs = [(RTM_NEWLINK, p.as_slice())];
+            assert_eq!(
+                decode_created_link(msgs, &name("br0")).unwrap_err().code(),
+                NetErrorCode::DataLoss
+            );
+        }
+        let p = link_payload_ext(3, Some(b"br0\0"), None, &[]);
+        assert_eq!(decode_ifinfomsg_name(&p).unwrap().as_deref(), Some("br0"));
     }
 
     /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。

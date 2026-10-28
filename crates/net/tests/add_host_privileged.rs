@@ -18,6 +18,9 @@
 //! 外部コマンド・`/etc/nsswitch.conf` の `hosts:` に `files` を含むこと・hosts キャッシュが無いこと）を満たさない
 //! 場合は skip せず失敗する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("add_host_privileged: Linux only, not applicable on this OS");
@@ -121,8 +124,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     println!("add_host_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -183,8 +185,7 @@ mod linux {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
         };
         let mut out_pipe = child.stdout.take();
         let mut err_pipe = child.stderr.take();

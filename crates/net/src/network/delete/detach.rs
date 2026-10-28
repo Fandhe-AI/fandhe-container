@@ -10,9 +10,11 @@
 //!
 //! 0. 入力検証（何も変更しない。失敗はコンテナと公開ハンドルを返す）: ネットワーク・IPAM・コンテナの整合
 //!    （`delete_network` と同じ照合）、公開ハンドルの endpoint・network の束縛、受け口の重複、件数の上限
-//! 1. 公開の個別解除（`unpublish_ports_with`。逆順。1 件の失敗で止めず残りも続ける）
+//! 1. 公開の個別解除（`unpublish_ports_with`。逆順。1 件の失敗で止めず残りも続ける。全体の期限が切れたら
+//!    残りの件は要求を出さずに取り残し〔`Present`〕として報告する）
 //! 2. 結果不明の公開が残した予約の確認（残っていればアドレスを保持する）
-//! 3. veth の所有確認と削除（`delete_veth`。`delete_network` と同じ規則）
+//! 3. veth の所有確認と削除（`delete_veth`。`delete_network` と同じ規則。期限が切れていれば要求を出さず
+//!    `Present` の取り残しとして報告する）
 //! 4. veth が消えたときだけ netns の pin を外す
 //! 5. veth・pin が消え、予約も残っていないときだけ IPAM のアドレスを解放する
 //!
@@ -23,6 +25,12 @@
 //!
 //! # 契約・未実装範囲（REPAIR-3）
 //!
+//! - 期限（REPAIR-5・#3258）: [`detach_container`] の `timeout` は切り離し全体の 1 つの期限で、各カーネル要求は
+//!   その残り時間で打ち切る。切れたら以降のカーネル要求（公開の解除・veth の削除）は出さず、取り残しを
+//!   `Present` で報告して fail-closed にする（アドレスと予約は保持）。判定と送信の間に切れた場合は送信側が
+//!   `Timeout` を返し、既存の経路で `Unknown` になる。pin の解除と IPAM の解放は netlink 要求ではないため対象外
+//! - DNAT ルールのハンドルは請求書に載せない（#3258 の判断・NET-1・NET-6）。同じプロセスでは `delete_network` の
+//!   テーブル削除で消えるが、再起動後に復元したネットワークでは手動回収になる。担当は #3285
 //! - アドレスと受け口の予約は、DNAT ルールが残りうる間は解放しない（quarantine。解放は `delete_network`）。
 //!   ルールの残存が確定しているか不明かは [`NetworkDeleteReport::leftover`] の状態で区別する
 //! - メンバー記録（`members/<id>`）の削除・DNS ヘルパーの参照カウント・公開ハンドルの永続化は別の担当
@@ -174,6 +182,19 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
     // 1. 公開の個別解除（逆順。1 件の失敗で止めず残りも続ける）。
     for published in published_ports.into_iter().chain(extra_published).rev() {
         let publish = *published.publish();
+        if ops.deadline_exceeded() {
+            // 全体の期限切れ。DELRULE を送っていないのでルールは確実に残っている（予約も戻さない）。
+            quarantine = true;
+            report.leftover.push((
+                DeleteResource::PortRules(endpoint.clone(), publish),
+                ResourceState::Present,
+            ));
+            failures.note(
+                NetError::new(NetErrorCode::Timeout, "detach deadline exceeded"),
+                DeleteStep::UnpublishPorts,
+            );
+            continue;
+        }
         let result = unpublish_ports_with(
             |t| ops.table_info(t),
             |t, h| ops.delete_rules(t, h),
@@ -187,7 +208,8 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
                 .push(DeleteResource::PortRules(endpoint.clone(), publish)),
             Err(e) => {
                 quarantine = true;
-                // ハンドルは破棄する（DNAT ルールはテーブルごと `delete_network` が消す）。
+                // ハンドルは破棄する（DNAT ルールはテーブルごと `delete_network` が消す。再起動後は
+                // 手動回収で、請求書へ載せる担当は #3285）。
                 let (resource, state) = match e.rules {
                     UnpublishRules::Present => (
                         DeleteResource::PortRules(endpoint.clone(), publish),
@@ -224,15 +246,28 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
 
     // 3. veth。pin の識別子は接続時に固定したものを使う（現在のパスから採り直すと、pin が作り直された
     //    ときに新世代の識別子を請求書へ取り込み、新世代の pin を回収で外せてしまう。NET-1）。
-    let veth_gone = delete_veth(
-        ops,
-        &host_veth,
-        host_index,
-        &host_token,
-        network.bridge_index,
-        &mut report,
-        &mut failures,
-    );
+    let veth_gone = if ops.deadline_exceeded() {
+        // 全体の期限切れ。要求を出さず、veth は残るものとして報告する（pin も外さない）。
+        report.leftover.push((
+            DeleteResource::Veth(host_veth.clone()),
+            ResourceState::Present,
+        ));
+        failures.note(
+            NetError::new(NetErrorCode::Timeout, "detach deadline exceeded"),
+            DeleteStep::DeleteVeth,
+        );
+        false
+    } else {
+        delete_veth(
+            ops,
+            &host_veth,
+            host_index,
+            &host_token,
+            network.bridge_index,
+            &mut report,
+            &mut failures,
+        )
+    };
 
     // 4. pin。veth が残るあいだは外さない（所有の証明を残し、回収で収束させる）。ハンドルは手放し、
     //    請求書の識別子と所有記録の照合で回収できる（`netns::unpin_path` の doc）。
@@ -330,7 +365,8 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
 /// 手順・失敗時の扱いはモジュール doc と [`ContainerDetachError`]。`extra_published` は attach 後の
 /// `publish_container_ports` で得たハンドル（attach 時の公開は `container.published_ports`）。他のコンテナの
 /// 資源・bridge・専用テーブルには触れない。`CAP_NET_ADMIN` と pin の解除に必要な `CAP_SYS_ADMIN` は
-/// 呼び出し側の責務で、本 crate は権限を上げない。`timeout` は各カーネル要求の期限（REPAIR-5）。
+/// 呼び出し側の責務で、本 crate は権限を上げない。`timeout` は切り離し全体の 1 つの期限で、各カーネル要求は
+/// その残り時間で打ち切る（REPAIR-5・#3258。モジュール doc の期限）。
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn detach_container(
@@ -348,6 +384,7 @@ pub fn detach_container(
             route,
             nft,
             timeout,
+            deadline: Some(crate::sys::Deadline::after(timeout)),
         },
         network,
         container,

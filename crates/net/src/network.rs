@@ -2383,10 +2383,8 @@ impl LinuxAttachOps<'_> {
     }
 }
 
-/// `IfIndex` を netlink のリンク番号 `LinkIndex` へ変換する（NET-1）。
-///
-/// `LinkSet::rename` のように番号だけを受ける呼び出しが、`LinkRef` の分岐（到達しない腕）を経ずに
-/// 取り出すための入口。範囲外は `InvalidArgument`（panic しない）。
+/// `IfIndex` を netlink の `LinkIndex` へ変換する。`LinkRef` を介さず、`netns_rename` のように index が
+/// 要る呼び出しが到達不能な分岐（panic）を持たずに済むよう切り出した（NET-1・#3258）。
 #[cfg(target_os = "linux")]
 pub(crate) fn link_index_of(index: IfIndex) -> Result<LinkIndex, NetError> {
     let raw = i32::try_from(index.get())
@@ -2396,7 +2394,7 @@ pub(crate) fn link_index_of(index: IfIndex) -> Result<LinkIndex, NetError> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn link_ref(index: IfIndex) -> Result<LinkRef, NetError> {
-    Ok(LinkRef::Index(link_index_of(index)?))
+    link_index_of(index).map(LinkRef::Index)
 }
 
 #[cfg(target_os = "linux")]
@@ -2813,6 +2811,27 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// NET-1・#3258: `IfIndex` → `LinkIndex` の変換は正の値をそのまま写し、`i32::MAX` 超は拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net1_link_index_of_converts_and_rejects() {
+        let seven = IfIndex::new(7).unwrap();
+        assert_eq!(link_index_of(seven).unwrap(), LinkIndex::new(7).unwrap());
+        assert_eq!(
+            link_ref(seven).unwrap(),
+            LinkRef::Index(LinkIndex::new(7).unwrap())
+        );
+        // 上限（i32::MAX）の値も変換できる。超過は `IfIndex` の構築時点で拒否され、変換へは届かない。
+        let max = IfIndex::new(i32::MAX as u32).unwrap();
+        assert_eq!(
+            link_index_of(max).unwrap(),
+            LinkIndex::new(i32::MAX).unwrap()
+        );
+        let e = IfIndex::new(i32::MAX as u32 + 1).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "ifindex exceeds i32::MAX");
+    }
 
     fn nname(s: &str) -> NetworkName {
         NetworkName::new(s).unwrap()

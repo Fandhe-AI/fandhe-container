@@ -364,3 +364,139 @@ fn net1_detach_claim_uses_pin_identity_fixed_at_attach() {
         .unwrap_err();
     assert_eq!(e.reclaim_claim().unwrap().pin(), None);
 }
+
+/// 期限切れの切り離しの共通照合: c2 は不変で、請求書は veth・netns・quarantine を持つ。
+fn assert_deadline_claim(e: &detach::ContainerDetachError<()>) {
+    assert_eq!(e.code(), NetErrorCode::Timeout);
+    assert_eq!(e.message(), "detach deadline exceeded");
+    let rec = e.reclaim_claim().unwrap().to_record();
+    assert!(
+        rec.contains("veth=1\nnetns=1\n") && rec.contains("quarantine=1\n"),
+        "{rec}"
+    );
+}
+
+/// REPAIR-5・NET-1・#3258: 1 件解除した後に全体の期限が切れると、残りの公開と veth の要求を出さず、
+/// 公開・veth・pin・アドレスを `Present` の取り残しとして報告し、アドレスと予約を保持する。
+#[test]
+fn repair5_detach_deadline_exceeded_stops_remaining_ports() {
+    let mut t = two_containers();
+    let c1 = t.c1.take().unwrap();
+    let extra = std::mem::take(&mut t.extra);
+    let fake = Fake {
+        expire_after_calls: Some(2),
+        ..Fake::default()
+    };
+    let e = detach(&fake, &mut t, c1, extra).unwrap_err();
+    let tbl = t.net.table.as_str();
+    assert_eq!(
+        fake.calls(),
+        vec![
+            format!("table_info {tbl}"),
+            format!("delete_rules {tbl} 4/5")
+        ]
+    );
+    assert_eq!(e.step, DeleteStep::UnpublishPorts);
+    assert_deadline_claim(&e);
+    assert_eq!(
+        e.report.removed,
+        vec![DeleteResource::PortRules(eid("c1"), pub_of(8081))]
+    );
+    assert_eq!(
+        e.report.leftover,
+        vec![
+            (
+                DeleteResource::PortRules(eid("c1"), pub_of(8080)),
+                ResourceState::Present
+            ),
+            (DeleteResource::Veth(host_of("c1")), ResourceState::Present),
+            (DeleteResource::Netns(pin("c1")), ResourceState::Present),
+            (
+                DeleteResource::Address(eid("c1"), t.a1),
+                ResourceState::Present
+            ),
+        ]
+    );
+    assert_eq!(t.ipam.address_of(&eid("c1")), Some(t.a1));
+    assert_eq!(held(&mut t.ports, "c1"), 1);
+    assert_eq!(t.ipam.address_of(&eid("c2")), Some(t.a2));
+    assert_eq!(held(&mut t.ports, "c2"), 1);
+}
+
+/// REPAIR-5・NET-1・#3258: 公開の解除が済んだ後に期限が切れると、veth の要求を出さずに取り残す。
+#[test]
+fn repair5_detach_deadline_exceeded_before_veth() {
+    let mut t = two_containers();
+    let c1 = t.c1.take().unwrap();
+    let extra = std::mem::take(&mut t.extra);
+    let fake = Fake {
+        expire_after_calls: Some(4),
+        ..Fake::default()
+    };
+    let e = detach(&fake, &mut t, c1, extra).unwrap_err();
+    assert_eq!(fake.calls().len(), 4);
+    assert!(
+        !fake.calls().iter().any(|c| c.starts_with("link_attachment")
+            || c.starts_with("delete_link")
+            || c == "unpin_netns")
+    );
+    assert_eq!(e.step, DeleteStep::DeleteVeth);
+    assert_deadline_claim(&e);
+    assert_eq!(
+        e.report.removed,
+        vec![
+            DeleteResource::PortRules(eid("c1"), pub_of(8081)),
+            DeleteResource::PortRules(eid("c1"), pub_of(8080)),
+        ]
+    );
+    assert_eq!(
+        e.report.leftover,
+        vec![
+            (DeleteResource::Veth(host_of("c1")), ResourceState::Present),
+            (DeleteResource::Netns(pin("c1")), ResourceState::Present),
+            (
+                DeleteResource::Address(eid("c1"), t.a1),
+                ResourceState::Present
+            ),
+        ]
+    );
+    assert_eq!(t.ipam.address_of(&eid("c1")), Some(t.a1));
+    assert_eq!(held(&mut t.ports, "c1"), 0);
+}
+
+/// REPAIR-5・NET-1・#3258: 最初から期限が切れていれば、カーネル要求は 1 件も出さない。
+#[test]
+fn repair5_detach_deadline_exceeded_before_any_request() {
+    let mut t = two_containers();
+    let c1 = t.c1.take().unwrap();
+    let extra = std::mem::take(&mut t.extra);
+    let fake = Fake {
+        expire_after_calls: Some(0),
+        ..Fake::default()
+    };
+    let e = detach(&fake, &mut t, c1, extra).unwrap_err();
+    assert!(fake.calls().is_empty());
+    assert_eq!(e.step, DeleteStep::UnpublishPorts);
+    assert_deadline_claim(&e);
+    assert!(e.report.removed.is_empty());
+    assert_eq!(
+        e.report.leftover,
+        vec![
+            (
+                DeleteResource::PortRules(eid("c1"), pub_of(8081)),
+                ResourceState::Present
+            ),
+            (
+                DeleteResource::PortRules(eid("c1"), pub_of(8080)),
+                ResourceState::Present
+            ),
+            (DeleteResource::Veth(host_of("c1")), ResourceState::Present),
+            (DeleteResource::Netns(pin("c1")), ResourceState::Present),
+            (
+                DeleteResource::Address(eid("c1"), t.a1),
+                ResourceState::Present
+            ),
+        ]
+    );
+    assert_eq!(held(&mut t.ports, "c1"), 2);
+}

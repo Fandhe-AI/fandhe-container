@@ -24,8 +24,12 @@
 //! - 値は暫定値（`provisional: true`）。計測の場所（隔離 netns・コンテナ役が製品の起動経路を通らない等）の
 //!   制約は `docs/design/net-tcp-rtt-bench.md` と保持入口の `method` を参照
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const ROUNDS_MAX: u32 = 100_000;
@@ -411,8 +415,7 @@ fn sv(a: &[&str]) -> Vec<String> {
 struct Guard(std::process::Child);
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        reap::reap_on_drop(&mut self.0);
     }
 }
 
@@ -424,6 +427,7 @@ fn self_test() {
     net3_desync();
     net3_overall_deadline();
     net3_loopback_via_processes();
+    net3_wait_within_reports_expiry();
 }
 
 fn net3_percentiles() {
@@ -619,7 +623,7 @@ fn wait_exit(child: &mut std::process::Child, limit: Duration) -> std::process::
 
 fn net3_loopback_via_processes() {
     use std::io::{BufRead as _, BufReader};
-    use std::process::{Command, Stdio};
+
     use std::sync::mpsc;
 
     let exe = std::env::current_exe().expect("current_exe");
@@ -697,4 +701,24 @@ fn net3_loopback_via_processes() {
     assert_eq!(served, "{\"tcp_rtt_probe\":\"served\",\"rounds\":105}");
     let st = wait_exit(&mut server.0, Duration::from_secs(10));
     assert_eq!(st.code(), Some(0));
+}
+
+/// 期限切れが失敗として表に出ることの照合（REPAIR-5・REPAIR-12）。終わらない子（`--serve`）に対し
+/// `wait_within` が具体的なメッセージの `Err` を返し、続く `reap` で回収できることを確かめる。
+fn net3_wait_within_reports_expiry() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let child = Command::new(exe)
+        .args(["--serve", "127.0.0.1:0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    let mut g = Guard(child);
+    let pid = g.0.id();
+    let r = reap::wait_within(&mut g.0, Duration::from_millis(200));
+    assert_eq!(
+        r.unwrap_err(),
+        format!("child {pid} did not exit within 200ms")
+    );
+    assert_eq!(reap::reap(&mut g.0, Duration::from_secs(10)), Ok(()));
 }

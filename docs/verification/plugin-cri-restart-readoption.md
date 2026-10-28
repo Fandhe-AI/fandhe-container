@@ -81,7 +81,7 @@ systemd-run --user --scope -p Delegate=yes \
 kill -KILL "<plugin の pid>"
 ```
 
-- SIGTERM の正常停止は未実装のため SIGKILL を使う。scope 単位の停止（`systemctl --user stop` 等）は使わない（操作を plugin プロセスに限定するため）
+- SIGTERM の正常停止は #3226 で実装済み。クラッシュ経路の確認には SIGKILL を使う（SIGTERM では実行中の RPC を待って終わる）。scope 単位の停止（`systemctl --user stop` 等）は使わない（操作を plugin プロセスに限定するため）
 - kill 後も supervisor とコンテナのプロセスが生きていること、`state.json` が running のままであることを記録する（SUP-5・CORE-1）
 
 ### 4. 2 回目の起動（壊れた記録なし）

@@ -659,6 +659,13 @@ where
 /// 引き上げる。クライアントが付ける `grpc-timeout` はこれより短ければそちらが効く。
 pub const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// 停止シグナルを受けてから、実行中の RPC の完了を待つ猶予（REPAIR-5・CRI-1・#3226）。`GrpcServerConfig::with_shutdown_grace` へ渡す。
+/// 値は `GRPC_SHUTDOWN_GRACE_DEFAULT` と同じ 10 秒で、systemd の既定の停止猶予（90 秒）より十分短い。超えた RPC
+/// （PullImage の最大 540 秒や StartContainer 等）は意図して打ち切り、接続を強制的に閉じて結果不明のまま終える
+/// （記録は再起動時の再採用〔R7〕、pull は `recover_stale_image_pulls`〔OCI-7〕が扱う）。新しいインスタンスは
+/// `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了（プロセスの消滅）を待ってから起動する運用を前提とする。
+pub const PLUGIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 /// `PullImage` 全体の期限（[`PLUGIN_REQUEST_TIMEOUT`] より短くする）。gRPC 側が先に切れても、裏の `spawn_blocking` の取り込みが
 /// 有界時間で終わるようにするため（oci の既定は pull 1 時間・blob 30 分で、request timeout より長い）。
 /// 展開の `ExtractBudget` にも pull の開始時に求めた同じ絶対時刻を渡して期限を共有する（展開に別の予算は持たせない。

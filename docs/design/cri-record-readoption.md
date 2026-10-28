@@ -62,7 +62,7 @@
 - コンテナ: `CreateContainer` が core の `create` を呼ぶ前に `in_flight=create` 付きで書き（`reserve_container` の後）、`commit_in_flight` で確定版へ、`rollback_in_flight` で、削除してよい場合に限り削除する。削除してよいのは、未作成、または core の削除完了と bundle の解放成功を確認できた Create の巻き戻しだけである。Create の結果が不明な場合や bundle の解放に失敗した場合は、既存の `rollback_in_flight` と同じく記録を `CONTAINER_UNKNOWN` として保持する（消すと core に資源が残っても所有情報を失い、再起動後に回収できなくなる。CRI-2 の fail-closed）。Start / Stop / Remove の巻き戻しでは記録を削除せず、`in_flight` を戻すか unknown で保持する。Start/Stop の遷移で状態と時刻を更新し、`RemoveContainer`（core の delete と bundle の release の成功後）で削除する
 - write-ahead を採る理由: #2681 で net が write-ahead を採らなかった理由（成功後か途中かを見分けられない）は、ここでは core の状態（Present/Absent）で見分けられる。逆に後書きにすると「core にコンテナがあるのに CRI 記録が無い」状態が生じ、状態ルートを CLI と共有するため plugin-cri 由来かを証明できず回収できない
 - 書けなかった場合: 副作用の前なら RPC を `Internal` で失敗させる（成功を装わない）。確定・更新の書き込み失敗はメモリの記録を保持して `Internal` を返し、次の起動では古い記録と core の状態で照合される（次節の表で安全側に倒れる）
-- 性能: RPC ごとに fsync が 1〜2 回増える。CORE-10 の起動 p95 への影響は実装単位の試験で計測項目に挙げる
+- 性能: RPC ごとに fsync が 1〜2 回増える。CORE-10 の起動 p95 への影響は #3224 で計測した（下記「計測」。暫定値）
 - R4 の実装（#2933。`crates/cri/src/runtime_service.rs` の `with_record_store`・`persist_sandbox`・`remove_sandbox`）: sandbox 記録だけを書く（コンテナは R5）。注入しなければ何も書かない
   - 書く時点: ネットワークなしの Run は予約後に確定版を 1 回書く（現時点で副作用が無く、pending を書くと R6 が所有情報不足として保持し続けるため。保持役の起動を入れる #2871 がその前に pending の書き込みを足す）。pod network ありの Run は、予約後に `pending=1`・notready・`network_pending=1` を書き、`set_up` 成功後に `pending=0`・ready・`network_owned=1` へ置き換える。Stop は配下の停止とネットワークの回収が済んだ後に状態を書く（途中の失敗では書かない。ディスクの古い ready は安全側で、R6 は常に NotReady で再採用する）。Remove は資源の回収と除去条件の検査が済んだ後に、先にファイルを消してからメモリを除去する
   - ファイルを先に消す理由: この時点で資源は回収済みで、所有の証明を消しても回収不能な資源は残らない。メモリを先に消すと、削除に失敗した後の再試行が「未知 ID は成功」でファイルに触れず、孤児が再起動まで残る。削除に失敗したらメモリを残して `INTERNAL` を返す
@@ -76,6 +76,56 @@
   - 失敗の写し方: write-ahead の失敗は `prepare`・`create` を呼ばず固定文言の `INTERNAL`（guard の `Drop` が bundle の解放の後に記録の削除を試みる）。確定・更新の put の失敗はメモリを確定したまま固定文言の `INTERNAL`（Start の確定が親 sandbox の notready で失敗した場合は、ディスクに running が先に書かれるが、再採用時の状態は core を正とするため許容する）。Create の巻き戻しは「未作成」または「削除完了と bundle の解放を確認できた」場合に限って記録を消し、記録の削除に失敗したときは結果不明と同じ扱い（unknown・`runtime_owned` で保持し、RemoveContainer の delete〔NOT_FOUND〕→ 解放〔冪等〕→ 削除で回収する）。Remove の記録の削除に失敗したときは bundle の解放失敗と同じ扱い（exited で保持して再試行）
   - 書かないもの: `in_flight=start` / `stop` / `remove` の write-ahead（再採用時の状態は core を正とするため不要。必要になれば R7 で判断）。結果不明（unknown）に倒すときはファイルを書き直さない（最後に書いた内容のまま。`in_flight=create` で core が Present なら R7 の表で `CONTAINER_UNKNOWN`＋`runtime_owned` になる）
   - 連鎖削除: 実行層接続時の RemovePodSandbox は `runtime_owned` の配下を `runtime_remove_one` が 1 件ずつ処理し、その中で記録ファイルが消える。連鎖（`apply_sandbox_removal`）で消えるのは `runtime_owned` でない配下だけで、ファイルを持たない（ファイルを書く時点より前に `runtime_owned` が立つか、巻き戻しの失敗で `runtime_owned` を立てるため）。配下の記録ファイルを sandbox ファイルより先に消す追加の処理は、この不変条件により不要と判断した
+
+## 計測（#3224・暫定値）
+
+CRI 記録の fsync が RPC のレイテンシと CORE-10 の起動 p95 に与える影響の計測。CI の数値は使っておらず、手元の実測による**暫定値**である。基準値の確定（#230）とは別のもので、`benches/metrics.json`・`BENCH_NAMES`・baseline には登録せず、CI のゲートにも接続しない（REPAIR-8）。
+
+- ハーネス: `crates/cri/benches/record_store_rpc_latency.rs`（`harness = false`。依存の追加なし）。実行は `cargo bench -p fandhe-container-cri --bench record_store_rpc_latency -- --state-root <既存ディレクトリの絶対パス> --trials 1000 --warmup 50 --host-kind <bare-metal|vm|wsl2> --output <新規ファイル>`。引数なしは I/O をしないスモーク（終了コード 0）
+- 方法: フェイクの `ContainerRuntime`・`BundleProvider` を `with_runtime` で注入した同一構成で、記録ストア（`FileRecordStore`）を注入した構成（with）と注入しない構成（without）を、試行ごとに順序を入れ替えて回す。1 試行は RunPodSandbox → CreateContainer → StartContainer → StopContainer → RemoveContainer → StopPodSandbox → RemovePodSandbox。RPC の `.await` の前後を計り、p50・p95 は nearest-rank。with では RPC ごとの記録ストアの操作件数（Run 1 put、Create 2 put、Start 1 put、Stop 1 put、Remove 1 remove、StopPod 1 put、RemovePod 1 remove）を機械照合し、不一致は失敗にする
+- 読み方: 実行層がフェイクのため、絶対値は CRI 層の費用だけで core の起動費用を含まない。with − without の差は、fsync に加え、sandbox 側の `store_io_bounded`（期限つき実行の専用スレッド生成）の費用を含む。本番でも払う費用なので差の全部を fsync とは呼ばない
+- 条件（共通）: release（bench profile）・1000 試行（ウォームアップ 50）・Intel Core i7-13700K（10 コア）・KVM ゲスト（`systemd-detect-virt` = kvm、`--host-kind vm`）・カーネル 7.0.0-34-generic・実行中の load average は約 3〜4（他の並列ビルドあり）・計測日 2026-10-28・base コミット `18c6897f`
+- 状態ルートの FS: tmpfs（`/run/user/1000`。rootless の既定の状態ルート `$XDG_RUNTIME_DIR/fandhe-container` と同じ種類。rootful の `/run/fandhe-container` も通常は tmpfs）と ext4（`/dev/sda1` 上の `$HOME/.cache` 配下。ディスク上の FS の例）
+
+RPC のレイテンシ（µs。p50 / p95。差は with − without）:
+
+| RPC | tmpfs without | tmpfs with | tmpfs 差 | ext4 without | ext4 with | ext4 差 |
+| --- | --- | --- | --- | --- | --- | --- |
+| RunPodSandbox | 1 / 3 | 51 / 90 | 49 / 86 | 3 / 6 | 1511 / 2136 | 1507 / 2130 |
+| CreateContainer | 37 / 65 | 69 / 123 | 31 / 58 | 51 / 86 | 2970 / 3780 | 2918 / 3694 |
+| StartContainer | 35 / 62 | 56 / 105 | 21 / 43 | 45 / 80 | 1514 / 2171 | 1468 / 2091 |
+| StopContainer | 33 / 62 | 51 / 92 | 18 / 29 | 44 / 73 | 1509 / 2170 | 1465 / 2097 |
+| RemoveContainer | 35 / 63 | 44 / 75 | 9 / 11 | 43 / 67 | 762 / 875 | 718 / 807 |
+| StopPodSandbox（参考） | 0 / 1 | 49 / 90 | 48 / 88 | 1 / 2 | 1506 / 2124 | 1505 / 2122 |
+| RemovePodSandbox（参考） | 0 / 1 | 43 / 78 | 43 / 76 | 1 / 1 | 759 / 867 | 758 / 865 |
+
+`put` / `remove` 1 回の所要時間（µs。p50 / p95）。上段は RPC 経由で記録器が受けた値（1000 試行分の件数: container put 4000・sandbox put 2000・remove 各 1000）、下段は `FileRecordStore` を直接呼んだ値（container 記録・同一内容の 1 KiB / 4 KiB・各 500 回）:
+
+| 操作 | tmpfs | ext4 |
+| --- | --- | --- |
+| put（container・RPC 経由） | 10 / 28 | 1431 / 2093 |
+| put（sandbox・RPC 経由） | 10 / 29 | 1444 / 2076 |
+| remove（container・RPC 経由） | 6 / 18 | 696 / 807 |
+| remove（sandbox・RPC 経由） | 5 / 17 | 696 / 799 |
+| put（直接・1 KiB / 4 KiB） | 6 / 17、6 / 10 | 1369 / 1802、1380 / 1732 |
+| remove（直接・1 KiB / 4 KiB） | 4 / 9、4 / 4 | 659 / 777、668 / 750 |
+
+CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.290 秒）: 起動経路（Run → Create → Start）で増えるのは、sandbox の put 1 回と container の put 3 回、RPC の差の合計は Run + Create + Start。いずれも p95 の単純な足し算で、実際の p95 の合成ではない。
+
+| FS | put 4 回の p95 合計 | RPC 差の p95 合計 | 目標 0.136 秒に対する割合 | Docker 0.290 秒に対する割合 |
+| --- | --- | --- | --- | --- |
+| tmpfs | 約 113 µs | 約 187 µs | 約 0.08〜0.14% | 約 0.04〜0.06% |
+| ext4 | 約 8.4 ms | 約 7.9 ms | 約 5.8〜6.1% | 約 2.7〜2.9% |
+
+判断:
+
+- 先に決めた閾値は、tmpfs で目標の 1% 以上、またはディスク上の FS で目標の 5% 以上なら後続の案を書く。tmpfs（既定の状態ルート）は閾値を大きく下回り、現時点で後続は不要。ディスク上の FS（ext4）は閾値の 5% をわずかに超える
+- 状態ルートがディスク上にあるのは、`--state-root` の明示や `XDG_RUNTIME_DIR` を持たない環境など既定から外れた運用に限られる。この計測だけでは、そうした運用を CORE-10 の対象に含めるかは決まらない。オーナーの判断を待つ選択肢として、次を並べる（決定ではない）
+  1. 状態ルートを tmpfs に置く運用を前提として明記する（コードの変更なし）
+  2. CreateContainer の write-ahead と確定版の fsync を、安全が崩れない範囲で 1 組にまとめる（put 4 → 3 回）
+  3. 一時ファイルの fsync を `fdatasync` 相当にする。ディレクトリの fsync と合わせた耐久性の保証を再確認してから決める
+  4. 安全と言える箇所（write-ahead の後始末など）でディレクトリの fsync を省く
+- 再計測は上記コマンドで手元で行える。値は FS・ホストの種類・負荷で大きく変わるため、他の環境では取り直す
 
 ## 起動時の読み込みと照合（fail-closed）
 
@@ -126,7 +176,7 @@
   - 要約行: 何かを再採用・回収したときだけ、4 段の `summary_line()` を ` | ` でつないだ 1 行を stderr へ出す。4 段とも空（初回起動など）なら出さない。固定語彙で ID・パス・config を含まない。
   - 計測: 再採用は既存の `cri.record_store_load`（採用 1 件ごとに成功、壊れた記録 1 件ごとに失敗）。記録ストアの操作は `CoreRecordStoreRecorder` が共有 `OpRecorder` へ `cri.record_store.{put,remove,list}` の 3 名で成功 / 失敗に縮約して流す（結果区分・種別は名前に混ぜず、`MAX_TRACKED_OPS` の枠を使い切らない）。
   - 試験: `crates/plugin-cri/tests/container_grpc.rs` の段 D（実バイナリを同じ状態ルートで 2 回、さらに 3 回起動。SIGKILL 後に sandbox が `SANDBOX_NOTREADY`・コンテナが `CONTAINER_CREATED` で見えること、壊れた記録と孤児 bundle の注入、Remove での所有の復元、1025 件の記録での起動失敗）と `tests/record_readoption.rs`（4 段の順序・要約行・`Err` の素通し・ロックの要求）。いずれも root 不要の既定の集合。
-  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した再起動の自動試験は #3225（実機前提。`production_binary_restart_readopts_running_container_real`）、人間の crictl での実機確認は R13 #2942。SIGTERM の正常停止は未実装のため、試験は SIGKILL で止める。
+  - 残余: 手動回収の手順書は R10 #2939、保持役の素性による pending の解決は R11 #2940、`pod_netns` の永続と再起動後の `tear_down` は R12 #2941、running のコンテナを残した再起動の自動試験は #3225（実機前提。`production_binary_restart_readopts_running_container_real`）、人間の crictl での実機確認は R13 #2942。SIGTERM の正常停止は #3226 で実装済み（下記「停止の契約」）。試験は 1 回目をクラッシュ経路として SIGKILL、2 回目を SIGTERM で止める。
 - core に状態があるが CRI 記録の無いコンテナは触らない（CLI と状態ルートを共有するため所有を証明できない）
 - 孤児 bundle（`.cri/bundles/<id>` で CRI 記録が無く core が Absent〔`NotFound` だけ〕）は、インスタンスロックの下でだけ回収する。Undetermined は残す
 
@@ -195,6 +245,16 @@
 | R11 | #2940 | cri: 保持役の素性の記録と再採用時の扱い | #2871・#2877・R6 |
 | R12 | #2941 | cri / plugin-cri: `network_owned`・`pod_netns` の永続と再起動後の `tear_down` | #1870・#2879・R6 |
 | R13 | #2942 | 実機確認（人間担当）: running のコンテナを残した再起動と再採用（手順書: [plugin-cri-restart-readoption.md](../verification/plugin-cri-restart-readoption.md)） | R9 |
+
+## 停止の契約（#3226・CRI-1・CORE-1・PLUG-12・REPAIR-3・REPAIR-4・REPAIR-5）
+
+- 対象シグナル: SIGTERM・SIGINT（同じ扱い）。SIGHUP は対象外（既定動作で即終了）。最初の 1 つだけを記録し、2 回目以降は何もしない
+- 受け方の判断: `crates/plugin-cri/src/sys.rs` の自前 `signal(3)` 宣言（ハンドラは `static AtomicI32` の compare_exchange のみ）。tokio の `signal` feature は workspace 依存の feature 変更で承認が要るため不採用。`signalfd` は exec 後の子へマスクが継承されるため、self-pipe は FFI が増えるため不採用（検知は 100ms 周期の atomic ポーリング）。ハンドラは監査 relay の fork の直後に登録し（helper は既定動作のまま）、登録失敗・未確認の Linux アーキテクチャは起動しない（fail-closed）
+- 受付の停止: シグナルを受けたら listener を即座に閉じる（tonic はドレイン中も incoming を持ち続けるため、`server::StopOnShutdown` が drop する）。socket は `UdsListener::drop` が bind 時の dev/ino と一致する場合だけ検証済みディレクトリの fd 基点で unlink する。起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見て、受けていれば bind せずに終了コード 0 で終える
+- 実行中の RPC: `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待つ。超えたら接続を強制的に閉じ（回収の上限 2 秒）、`error: TIMEOUT: ...`・終了コード 1 で終える。打ち切った RPC・`spawn_blocking`（`shutdown_timeout` 1 秒で置き去り）は結果不明のまま残り、再起動時に R7 の照合表・`recover_stale_image_pulls`（OCI-7）が扱う。記録は rename による不可分の置き換えなので半端なファイルは残らない
+- インスタンスロック: fd の close で外れる。ロックファイルは消さない（unlink すると二重に取得され得る）。確定はプロセスの終了。新しいインスタンスは `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了を待ってから起動する運用を前提とする
+- 終了コードと stderr: 正常停止は終了コード 0 と固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>`（パス・pid・ID を含めない）。停止の全体の上限は 13.7 秒（検知 0.1 + 猶予 10 + 強制回収 2 + 書き出し 0.6〔serve_with_audit の sink・forwarder と終了行の 3 回 × 0.2〕+ ランタイム 1。`shutdown::SHUTDOWN_TOTAL_BOUND` を試験で固定）
+- 残余（REPAIR-3）: 起動段の途中では段の予算まで待つ。relay の fork より前に届いたシグナルは既定動作で即終了する（SIGKILL と同じく再採用が扱う）。監査 helper は既定動作のままで、プロセスグループ宛ての SIGTERM では helper が先に死に、ドレイン中の peer 認証の拒否が `@audit.log` に残らないことがある（stderr には残る）。libc との機械照合は plugin-cri に dev-dependency の `libc` が無いため未導入（依存の追加は承認事項）。running のコンテナを残した実機での SIGTERM 再起動の確認は R13 #2942（人間担当）
 
 ## セキュリティ上の要点
 

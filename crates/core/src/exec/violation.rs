@@ -20,8 +20,9 @@
 //! `path_symlink_or_not_directory`・`path_missing`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
 //! （`exec_target` は `ExecTarget`、他の 3 理由は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査・#1702）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
-//! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
-//! （REPAIR-3: 実装済みを装わない）。launch 経路の pivot 前段の失敗は、子が状態 pipe で理由を親へ返し親が
+//! 本モジュールの記録を実際の sink へ流す本番経路は配線済み（CLI の create / start・delete は
+//! `FileAuditSink::in_state_store`、本番 launcher `oci_runtime::ProductionLauncher` は `audit_sink`・`rejection_audit_sink`、
+//! supervisor の exec は `default_audit_sink`。SEC-4・REPAIR-3）。launch 経路の pivot 前段の失敗は、子が状態 pipe で理由を親へ返し親が
 //! `exec::record_launch_mount_rejection` で記録する入口まで実装済み（`exec/launch_status.rs`。#1815）で、
 //! 本番 launcher（`oci_runtime::ProductionLauncher`）からの呼び出しは実装済み（#1816・#2130）。
 //!
@@ -1139,8 +1140,8 @@ impl ViolationSubject {
 ///
 /// `ExecError::violation` から取り出す。生成は `crate::exec` の拒否経路のみ。
 ///
-/// - **記録の経路のみ**: ファイルへの永続化は `audit_log` に実装済みだが、本番経路への sink の
-///   配線は未実装（REPAIR-3）。呼び出し側は受け取った記録を必要に応じて自分で扱う
+/// - **記録の型のみ**: 永続化は `audit_log` が担い、本番経路（CLI・本番 launcher・supervisor の exec）への
+///   sink の配線は実装済み（SEC-4・REPAIR-3）。個別の呼び出し側は受け取った記録を必要に応じて自分で扱う
 /// - **違反**（構成・呼び出し文脈・パスが分離の前提を満たさず fail-closed で拒否したもの）
 ///   にだけ付く。**システムエラー**（syscall 失敗・procfs の読み取り失敗・mountinfo の書式
 ///   不正・権限不足）と hostname の書式エラーには付かない

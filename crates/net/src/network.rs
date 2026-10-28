@@ -69,7 +69,8 @@
 //! host 側の bridge 接続（`IFLA_MASTER`）と up → peer 側の netns 移動までを行い、途中で失敗したら
 //! 自分が作った veth と netns だけを戻す。veth は host 側 `fcvh` / peer 側 `fcvp` + [`EndpointId`] の
 //! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
-//! ため `NLM_F_EXCL` 作成 + 直後の ifindex 確保 + ifindex 指定の削除で運用する（`attach_container_with` の doc）。
+//! ため `NLM_F_EXCL | NLM_F_ECHO` 作成 + 作成通知からの ifindex 確保（v6.2 未満は名前での引き直しへ戻す。#3205）+
+//! ifindex 指定の削除で運用する（`attach_container_with` の doc）。
 //!
 //! 失敗して取り残した veth・pin は `ContainerAttachError::reclaim_claim` の請求書（[`FailedAttachClaim`]）で
 //! `reclaim_failed_attach`（Linux のみ。#2681）から回収できる（`delete` モジュール doc「attach の取り残しの回収」）。
@@ -172,6 +173,7 @@ use crate::etc_hosts::NameResolution;
 use crate::netlink_route::{
     AddrScope, AddressSpec, LinkCreate, LinkDelete, LinkIndex, LinkRef, LinkSet,
     NetlinkRouteSocket, NetnsFd, NetnsTarget, RouteNextHop, RouteSpec, decode_created_link,
+    decode_created_veth,
 };
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 #[cfg(target_os = "linux")]
@@ -668,6 +670,29 @@ pub(crate) enum EchoedIndex {
     /// 通知が返らなかった（v6.2 より前のカーネルなど）。名前で引き直す戻し経路に移る。
     Absent,
     /// 通知は届いたが内容が不正。ACK は成功しているため bridge は作成済みで、自分のものと確定できない。
+    Invalid(NetError),
+}
+
+/// veth ペア作成の ACK 後に、`NLM_F_ECHO` の作成通知から得られた結果（Issue #3205・NET-1）。
+///
+/// `attach_with_source` が後続の操作（所有トークン・bridge 接続・up・netns への移動）の対象 ifindex を、
+/// 名前の引き直しなしで決めるために使う。`AttachOps::create_veth` と接続手順の間の契約で、crate 外には出さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VethCreated {
+    /// 作成通知の読み取り結果。
+    pub(crate) echo: EchoedVeth,
+}
+
+/// veth の `NLM_F_ECHO` の作成通知の読み取り結果（bridge 側の [`EchoedIndex`] に対応する）。
+/// 構築するのは Linux の `LinuxAttachOps` だけ（他 OS では参照のみで dead_code になるため局所的に許す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum EchoedVeth {
+    /// 検証済みの作成通知から得た、host 側と peer 側の ifindex。
+    Index { host: IfIndex, peer: IfIndex },
+    /// 通知が返らなかった（v6.2 より前のカーネルなど）。名前で引き直す戻し経路に移る。
+    Absent,
+    /// 通知は届いたが内容が不正。ACK は成功しているため veth は作成済みで、自分のものと確定できない。
     Invalid(NetError),
 }
 
@@ -1319,7 +1344,7 @@ pub enum AttachStep {
     CreateNetns,
     /// veth ペアの作成。
     CreateVeth,
-    /// 作成直後の veth の ifindex 解決。
+    /// 作成直後の veth の ifindex 解決（作成通知の読み取り、または戻し経路の名前引き）。
     ResolveIndex,
     /// host 側 veth への所有トークン（`IFLA_IFALIAS`）の付与。
     SetOwnerToken,
@@ -1585,8 +1610,9 @@ pub(crate) trait AttachOps {
     /// pin を外す（umount → ファイル削除）。失敗時は `ns` を [`UnpinFailure`] で返し、呼び出し側が
     /// 再試行できるようにする。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
-    /// veth ペアを `NLM_F_EXCL` で作る。
-    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError>;
+    /// veth ペアを `NLM_F_EXCL | NLM_F_ECHO` で作る。戻り値の [`VethCreated`] は作成通知から得た両端の
+    /// ifindex を持つ（Issue #3205）。
+    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<VethCreated, NetError>;
     /// 名前から ifindex を引く。
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
     /// bridge の名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link）
@@ -1880,26 +1906,36 @@ fn attach_with_source<O: AttachOps>(
             Box::new((fail(error, step, report), back))
         };
 
-    if let Err(e) = ops.create_veth(names.host(), names.peer()) {
-        let mut report = AttachRollbackReport::default();
-        // 確定的な拒否（`AlreadyExists` 含む）以外は作成済みの可能性があるため Unknown で報告する。
-        if !is_definitely_rejected(e.code()) {
-            report.leftover.push((
-                AttachResource::Veth(names.host().clone()),
-                ResourceState::Unknown,
+    let veth_created = match ops.create_veth(names.host(), names.peer()) {
+        Ok(created) => created,
+        Err(e) => {
+            let mut report = AttachRollbackReport::default();
+            // 確定的な拒否（`AlreadyExists` 含む）以外は作成済みの可能性があるため Unknown で報告する。
+            if !is_definitely_rejected(e.code()) {
+                report.leftover.push((
+                    AttachResource::Veth(names.host().clone()),
+                    ResourceState::Unknown,
+                ));
+            }
+            return Err(abort(
+                netns,
+                report,
+                veth_collision_or(e),
+                AttachStep::CreateVeth,
             ));
         }
-        return Err(abort(
-            netns,
-            report,
-            veth_collision_or(e),
-            AttachStep::CreateVeth,
-        ));
-    }
+    };
 
-    let resolved = ops
-        .link_index(names.host())
-        .and_then(|host| ops.link_index(names.peer()).map(|peer| (host, peer)));
+    // 作成通知が検証できたら、名前で引き直さずその ifindex を使う（引き直しの間に同名の link へ差し替えられる
+    // 窓をなくす。Issue #3205）。通知が無ければ従来の名前引きに戻し、通知が不正なら何も操作せず Unknown で
+    // 報告する（名前での削除は窓を戻すため行わない）。
+    let resolved = match veth_created.echo {
+        EchoedVeth::Index { host, peer } => Ok((host, peer)),
+        EchoedVeth::Invalid(e) => Err(e),
+        EchoedVeth::Absent => ops
+            .link_index(names.host())
+            .and_then(|host| ops.link_index(names.peer()).map(|peer| (host, peer))),
+    };
     let (host_index, peer_index) = match resolved {
         Ok(pair) => pair,
         Err(e) => {
@@ -2370,10 +2406,24 @@ impl AttachOps for LinuxAttachOps<'_> {
         netns::unpin(ns)
     }
 
-    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError> {
-        self.route
-            .create_link(&LinkCreate::veth(host.clone(), peer.clone())?, self.timeout)
-            .map(|_| ())
+    fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<VethCreated, NetError> {
+        let reply = self.route.create_link(
+            &LinkCreate::veth(host.clone(), peer.clone())?.with_echo(),
+            self.timeout,
+        )?;
+        // ACK は成功済み。通知の検証失敗は create の失敗ではなく Invalid として呼び出し元へ返す。
+        let echo = match decode_created_veth(
+            reply.messages().iter().map(|m| (m.msg_type(), m.payload())),
+            host,
+        ) {
+            Ok(Some(c)) => EchoedVeth::Index {
+                host: c.host(),
+                peer: c.peer(),
+            },
+            Ok(None) => EchoedVeth::Absent,
+            Err(e) => EchoedVeth::Invalid(e),
+        };
+        Ok(VethCreated { echo })
     }
 
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
@@ -3886,6 +3936,8 @@ mod attach_tests {
         fail_bridge_lookup: bool,
         fail_netns: Option<(NetErrorCode, Option<ResourceState>)>,
         fail_veth: Option<NetErrorCode>,
+        /// veth の作成通知の模型（None は通知なし = `Absent`。Issue #3205）。
+        veth_echo: Option<EchoedVeth>,
         fail_host_lookup: bool,
         fail_peer_lookup: bool,
         fail_master: bool,
@@ -3944,9 +3996,16 @@ mod attach_tests {
                 Ok(())
             }
         }
-        fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<(), NetError> {
+        fn create_veth(&self, host: &IfName, peer: &IfName) -> Result<VethCreated, NetError> {
             self.rec(format!("create_veth {} {}", host.as_str(), peer.as_str()));
-            self.fail_veth.map_or(Ok(()), |c| Err(err(c)))
+            self.fail_veth.map_or_else(
+                || {
+                    Ok(VethCreated {
+                        echo: self.veth_echo.clone().unwrap_or(EchoedVeth::Absent),
+                    })
+                },
+                |c| Err(err(c)),
+            )
         }
         fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
             self.rec(format!("link_index {}", name.as_str()));
@@ -4482,6 +4541,75 @@ mod attach_tests {
             assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
             assert!(!f.calls().iter().any(|c| c.starts_with("delete_link")));
         }
+    }
+
+    /// NET-1・Issue #3205: 作成通知から ifindex が取れたら名前で引き直さず、その値で以降を操作する。
+    #[test]
+    fn net1_attach_veth_echo_index_skips_lookup() {
+        let f = Fake {
+            veth_echo: Some(EchoedVeth::Index {
+                host: IfIndex::new(31).unwrap(),
+                peer: IfIndex::new(32).unwrap(),
+            }),
+            ..Default::default()
+        };
+        let a =
+            attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new()).unwrap();
+        let calls = f.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("link_index fcvh") || c.starts_with("link_index fcvp")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"set_master 31 7".to_owned()), "{calls:?}");
+        assert!(calls.contains(&"set_up 31".to_owned()), "{calls:?}");
+        assert!(calls.contains(&"move_to_netns 32".to_owned()), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("set_owner_token 31 fandhe-net:")),
+            "{calls:?}"
+        );
+        assert_eq!(a.host_index.get(), 31);
+    }
+
+    /// NET-1・Issue #3205: 通知が返らない（v6.2 より前など）ときは従来どおり名前で引き直す。
+    #[test]
+    fn net1_attach_veth_echo_absent_falls_back() {
+        let f = Fake {
+            veth_echo: Some(EchoedVeth::Absent),
+            ..Default::default()
+        };
+        let a =
+            attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new()).unwrap();
+        let n = VethNames::derive(&eid("c1")).unwrap();
+        let calls = f.calls();
+        assert!(calls.contains(&format!("link_index {}", n.host().as_str())));
+        assert!(calls.contains(&format!("link_index {}", n.peer().as_str())));
+        assert_eq!(a.host_index.get(), 21);
+    }
+
+    /// NET-1・Issue #3205: 通知が不正なら何も操作せず、veth を Unknown で報告し、名前では削除しない。
+    #[test]
+    fn net1_attach_veth_echo_invalid_reports_unknown() {
+        let f = Fake {
+            veth_echo: Some(EchoedVeth::Invalid(err(NetErrorCode::DataLoss))),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        assert_eq!(e.step, AttachStep::ResolveIndex);
+        assert_eq!(e.error.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.rollback.leftover,
+            [(AttachResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert_eq!(e.rollback.removed, [AttachResource::Netns(pin_of("c1"))]);
+        let calls = f.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("delete_link")));
+        assert!(!calls.iter().any(|c| c.starts_with("link_index fcv")));
+        assert!(!calls.iter().any(|c| c.starts_with("set_")));
     }
 
     /// NET-1: 接続以降の失敗は ifindex 指定で veth を削除してから netns を戻す。

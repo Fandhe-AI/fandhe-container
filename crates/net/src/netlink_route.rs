@@ -734,7 +734,7 @@ mod socket {
         /// （推奨 5〜10 秒）。`Timeout` / `DataLoss` ではカーネル側で作成済みか不明なため、状態を再照会すること。
         /// 同名が既にあれば `AlreadyExists`、権限不足は `PermissionDenied`。
         /// `LinkCreate::with_echo` の要求では `reply.messages()` に作成通知（`RTM_NEWLINK`）が入る（v6.2 以降。
-        /// 検証は `decode_created_link`。Issue #1972）。
+        /// 検証は bridge が `decode_created_link`、veth が `decode_created_veth`。Issue #1972・#3205）。
         pub fn create_link(
             &self,
             req: &LinkCreate,

@@ -6,9 +6,9 @@
 
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::netlink_route::{
-    AttrIter, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINKINFO, IfName,
-    LinkCreate, NLM_F_ACK, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_REQUEST, NlMsgBuilder,
-    NlMsgIter, RTM_NEWLINK, VETH_INFO_PEER, decode_created_link,
+    AttrIter, IFINFOMSG_LEN, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINK, IFLA_LINKINFO,
+    IfName, LinkCreate, NLM_F_ACK, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_REQUEST,
+    NlMsgBuilder, NlMsgIter, RTM_NEWLINK, VETH_INFO_PEER, decode_created_link, decode_created_veth,
 };
 
 const SEQ: u32 = 0x2468_ace0;
@@ -171,5 +171,56 @@ fn net1_decode_created_link_from_synthetic_notification() {
     assert_eq!(decode_created_link(none, &name("fcbr1")).expect("ok"), None);
     let e = decode_created_link([(RTM_NEWLINK, payload.as_slice())], &name("fcbr2"))
         .expect_err("mismatch");
+    assert_eq!(e.code(), NetErrorCode::DataLoss);
+}
+
+/// NET-1・Issue #3205: veth + echo の要求は flags 0x0608 で、属性は echo なしと同じ。
+#[test]
+fn net1_veth_echo_message_flags_and_attrs() {
+    let plain = build(&LinkCreate::veth(name("fcvh0"), name("fcvp0")).expect("veth"));
+    let echo = build(
+        &LinkCreate::veth(name("fcvh0"), name("fcvp0"))
+            .expect("veth")
+            .with_echo(),
+    );
+    let msg = NlMsgIter::new(&echo).next().expect("msg").expect("decode");
+    assert_eq!(msg.header().msg_type(), RTM_NEWLINK);
+    assert_eq!(msg.header().flags(), 0x0608);
+    let plain_msg = NlMsgIter::new(&plain).next().expect("msg").expect("decode");
+    assert_eq!(plain_msg.header().flags(), NLM_F_CREATE | NLM_F_EXCL);
+    assert_eq!(msg.payload(), plain_msg.payload());
+}
+
+/// NET-1・Issue #3205: 合成した veth 作成通知から host / peer の ifindex を取り出す。
+/// `IFLA_LINK` が無い通知と通知なしの扱いも確認する。
+#[test]
+fn net1_decode_created_veth_from_synthetic_notification() {
+    let make = |with_link: bool| {
+        let mut b = NlMsgBuilder::new(RTM_NEWLINK, 0, 1, 0);
+        let mut ifinfo = [0u8; IFINFOMSG_LEN];
+        ifinfo[4..8].copy_from_slice(&42i32.to_ne_bytes());
+        b.put_fixed(&ifinfo).expect("fixed");
+        b.put_attr(IFLA_IFNAME, b"fcvh1\0").expect("name");
+        if with_link {
+            b.put_attr(IFLA_LINK, &43u32.to_ne_bytes()).expect("link");
+        }
+        let data = b.finish().expect("finish");
+        NlMsgIter::new(&data)
+            .next()
+            .expect("msg")
+            .expect("decode")
+            .payload()
+            .to_vec()
+    };
+    let payload = make(true);
+    let got = decode_created_veth([(RTM_NEWLINK, payload.as_slice())], &name("fcvh1"))
+        .expect("decode")
+        .expect("some");
+    assert_eq!((got.host().get(), got.peer().get()), (42, 43));
+    let none: [(u16, &[u8]); 0] = [];
+    assert_eq!(decode_created_veth(none, &name("fcvh1")).expect("ok"), None);
+    let no_link = make(false);
+    let e = decode_created_veth([(RTM_NEWLINK, no_link.as_slice())], &name("fcvh1"))
+        .expect_err("no link");
     assert_eq!(e.code(), NetErrorCode::DataLoss);
 }

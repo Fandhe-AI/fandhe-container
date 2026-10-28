@@ -13,7 +13,7 @@
 | ---- | -------------- |
 | 作成失敗の回収待ちの記録（請求書） | 決定し、実装する（#2604） |
 | attach の取り残しの記録（請求書） | 決定し、実装する（#2681。下の「attach の取り残しの記録」） |
-| write-ahead（作成前・attach 前の記録） | 採らないと判断した（#2681。下の「write-ahead の判断」） |
+| write-ahead（作成前・attach 前の記録） | #2681 では採らないと判断し、#3067 で意図記録として実装した（下の「write-ahead の判断」） |
 | IPAM 状態（`StaticIpam`・`NetnsDirRecord`）、作成に成功したネットワーク（`CreatedNetwork`）、削除中の印 | 置き場所と形式の方針だけを決め、実装は後続（#1870 の network 結線の設計と一緒に決める。CLI の経路と共有しうるため） |
 
 （#1870 の設計で、CLI と共有する置き場は `<状態ルート>/@networks/` に決まった。[network-wiring.md](network-wiring.md) D10・D11、実装は #3059・#3067・#3075。以下は決定前の記述。）後続で実装するときの置き場は、同じ階層の `<状態ルート>/.cri/net/networks/<名前>/`（`ipam`・`netns-dir` の記録）とする。#1870 で CLI と共有する置き場に決まった場合は、そちらへ移す手順を後続 issue に書く。
@@ -79,8 +79,8 @@ table=<0|1>
 
 ## 未対応（後続）
 
-- IPAM 状態・`CreatedNetwork`・削除中の印の永続化（#1870 の設計の後）
-- write-ahead（作成前・attach 前の記録。net がトークンを先に発行する API が要る）。#1870 の後に再検討する（#2681 の判断）
+- IPAM 状態・`CreatedNetwork`・削除中の印の永続化は #3067 で `@networks` に実装済み（plugin-cri の利用と旧置き場からの移行は #3075。下の「`@networks` への移行」）
+- write-ahead は #3067 で意図記録として実装済み（カーネル照合は後続。下の「write-ahead の判断」）
 - 再起動後に復元したネットワークの bridge・nft テーブルの自動回収（link の dump API か、#1870 の永続化の後）
 
 ## attach の取り残しの記録（#2681）
@@ -121,11 +121,26 @@ table=<0|1>
 - 試験: 単体試験（非 root。`crates/net/src/netns.rs`・`netns/owner_record.rs`）で、記録と一致する pin を外すこと、記録の欠落・壊れ・symlink・mode 違反・識別子の 1 項目の不一致で拒否すること、作り直された新しい pin を古い請求書で外さないこと（AC3）を具体値で確かめる。実機（root）でのプロセスをまたぐ回収は未確認で、実機前提の試験は人間が実行する。その試験は `crates/net/tests/network_attach_privileged.rs` に準備済み（#2906。子プロセスを SIGKILL した後の別プロセスによる回収と、作り直した新しい pin を古い請求書で外さないこと。成功行 `reclaim_xproc=ok reclaim_xproc_newer=kept`）に加え、試験用 feature `attach-fault-test-support` の故障注入（`attach_container_with_fault_for_test`。#2971）で巻き戻しの失敗を作り、取り残しの請求書を別プロセスが回収すること（S3。成功行 `reclaim_fault=ok`）と、別名の無い veth は回収が拒否して残すこと（S4。成功行 `reclaim_fault_unowned=kept`）も同じ試験に準備済み。IPAM 払い出し後の段は、回収後も quarantine（アドレス・予約）が `delete_network` まで残ること（S5。成功行 `reclaim_fault_post_ipam=ok`）と、巻き戻しが成功すれば即時に解放されること（S6。成功行 `rollback_post_ipam=released`。#3040）を確かめる。事前作成 netns の経路は単体試験（`net1_attach_fault_prepared_*`）で扱う。段ごとの残る資源と請求書の記録は単体試験（`net1_attach_fault_*`）で具体値照合する。実行は #1626
 - 残余リスク: 同じ UID の利用者による手動操作（pin を消し、所有記録を残したまま inode を再利用した空ファイルを置く等）は排除できない（置き場は実効 UID の所有で group / other の書き込みを検査済み）。記録の比較から削除までの間に新しい世代の記録を消す競合は、拒否側（照合不能）に倒れる。時計が戻ると連番が衝突しうるが、照合は `dev:ino` の一致も要る。旧いバイナリの請求書と、記録の書き込みが無かった pin（期限切れ後に完了したワーカーの pin は `ns=-` のまま）は手動回収に残る
 
-## write-ahead の判断（#2681）
+## write-ahead の判断（#2681。#3067 で更新）
 
-作成前・attach 前に記録を書く方式（write-ahead）は、今回は採らない。#1870 でネットワークの作成結果と IPAM を永続化した後に再検討する。
+作成前・attach 前に記録を書く方式（write-ahead）は、#2681 の時点では採らなかった。#1870 の設計（network-wiring.md D11）で、作成結果（`realized`）とメンバーを永続化し、カーネル操作の前に意図記録（`realized.intent`・`members-intent/<id>`）を書く方式に転じた。#3067 で意図記録の書き込みと後始末、記録から IPAM を組み直すことを実装した（`crates/net/src/network/recorded.rs`）。残った意図記録のカーネル照合（所有トークンでの昇格または巻き戻し）は後続で、それまで残った `realized.intent` は次の操作を `FailedPrecondition` で止め、残った `members-intent/*` のアドレスは使用中として数え続ける。以下は #2681 の時点の判断の記録である。
 
 - 理由: `CreatedNetwork` が永続化されていないと、再起動後に残った作成前の記録が「作成の途中で落ちた」のか「作成に成功した後、記録を消す前に落ちた」のかを見分けられない。後者を自動回収すると、繋がっている veth の所有の証明（bridge）を消し、生きているコンテナの通信も断ちうる
 - 2 段の記録（作成前に手動のみの記録を置く）も検討した。自動回収できないなら、今の挙動（カーネルの `AlreadyExists` による再作成の拒否と手動回収）に比べて得るものが小さく、作成のたびに fsync が 2 回増える（NET-4 の所要時間に響く）ため採らない
 - 再検討の条件: #1870 で作成に成功したネットワークの記録を永続化した後。「成功の記録がある」と「作成前の記録しかない」を見分けられるようになり、トークンを先に発行する net の API（例: `OwnerToken::issue(&NetworkName)` と、それを受ける `create_network`）と一緒に入れられる
 - attach の途中でのクラッシュも、`AttachedContainer` と IPAM が永続化されていないため同じ理由で採らない
+
+## `@networks` への移行（#3067・#3075）
+
+plugin-cri の請求書は、現在 `<状態ルート>/.cri/net/pending-reclaim/` にある。CLI と共有する状態ストア（network-wiring.md D10）では、同じ請求書をネットワークごとの `<状態ルート>/@networks/<名前>/pending-reclaim/{create,attach/<endpoint>}` に置く（#3067 で `NetworkLockGuard::save_reclaim_create` / `save_reclaim_attach` / `reclaim_records` / `remove_reclaim_*_if` を実装済み）。記録の形式は v1 のまま（`FailedCreateClaim::to_record` / `FailedAttachClaim::to_record`）で、ファイル名にネットワーク名は入れず、拡張子で判別しない。ファイルは 0600、ディレクトリは 0700 で、一時ファイル（`@tmp-` 接頭辞）→ fsync → rename → 親ディレクトリの fsync の順に書く。
+
+前提: 移行先にネットワークの定義（bridge）があること。plugin-cri が使うネットワークの定義の作成は #3075 で行う。移行の実装も #3075 の担当で、手順は次のとおり。
+
+1. 全体の排他ロックとネットワークの排他ロックを取り、旧置き場の `.lock` も取る
+2. 旧記録を `from_record` で検証し、ファイル名と記録内のネットワーク名・endpoint が一致するものだけを移行先へ書く（一時ファイル → fsync → rename → ディレクトリの fsync）
+3. 書けたことを読み戻して確かめてから、中身の一致を条件に旧記録を消す
+4. 両方にあって中身が異なる記録は消さずに残し、手動回収として扱う（fail-closed）
+5. 壊れた旧記録は移さずに残し、`net.reclaim_store_load` の失敗件数に数える
+6. 旧置き場が空になったら消す。途中で落ちても再実行は冪等で、移行が済むまでは両方の置き場を読む
+
+Issue #3067 の範囲外（後続）: 残った `realized.intent` のカーネル照合、実体の無い `members-intent/*` の掃除、`.cri/net` の `CreatedNetwork`・IPAM の移行（#3075）。

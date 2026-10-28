@@ -77,6 +77,18 @@ pub enum NetOpKind {
     NetworkStoreList,
     /// ネットワーク定義の削除（`NetworkStore::remove`）。
     NetworkStoreRemove,
+    /// メンバー記録・意図記録の書き込み（`NetworkLockGuard::write_member_intent` / `commit_member`。NET-1・#3067）。
+    NetworkStoreMemberWrite,
+    /// メンバー記録・意図記録の削除（`NetworkLockGuard::remove_member` / `remove_member_intent`。NET-1・#3067）。
+    NetworkStoreMemberRemove,
+    /// `realized`・`realized.intent` の書き込み（NET-1・#3067）。
+    NetworkStoreRealizedWrite,
+    /// `realized`・`realized.intent` の削除（NET-1・#3067）。
+    NetworkStoreRealizedRemove,
+    /// 記録からの IPAM の組み直し（`NetworkLockGuard::rebuild_ipam`。NET-1・#3067）。
+    NetworkStoreIpamRebuild,
+    /// 回収待ちの請求書の書き込み・削除（`pending-reclaim/`。NET-1・REPAIR-4・#3067）。
+    NetworkStoreReclaimWrite,
 }
 
 impl NetOpKind {
@@ -103,6 +115,12 @@ impl NetOpKind {
             NetOpKind::NetworkStoreGet => "network.store.get",
             NetOpKind::NetworkStoreList => "network.store.list",
             NetOpKind::NetworkStoreRemove => "network.store.remove",
+            NetOpKind::NetworkStoreMemberWrite => "network.store.member_write",
+            NetOpKind::NetworkStoreMemberRemove => "network.store.member_remove",
+            NetOpKind::NetworkStoreRealizedWrite => "network.store.realized_write",
+            NetOpKind::NetworkStoreRealizedRemove => "network.store.realized_remove",
+            NetOpKind::NetworkStoreIpamRebuild => "network.store.ipam_rebuild",
+            NetOpKind::NetworkStoreReclaimWrite => "network.store.reclaim_write",
         }
     }
 }
@@ -277,7 +295,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 20] = [
+    const ALL_KINDS: [NetOpKind; 26] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -298,6 +316,12 @@ mod tests {
         NetOpKind::NetworkStoreGet,
         NetOpKind::NetworkStoreList,
         NetOpKind::NetworkStoreRemove,
+        NetOpKind::NetworkStoreMemberWrite,
+        NetOpKind::NetworkStoreMemberRemove,
+        NetOpKind::NetworkStoreRealizedWrite,
+        NetOpKind::NetworkStoreRealizedRemove,
+        NetOpKind::NetworkStoreIpamRebuild,
+        NetOpKind::NetworkStoreReclaimWrite,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -319,6 +343,30 @@ mod tests {
             "dns.resolv_conf.write"
         );
         assert_eq!(NetOpKind::StaticHostsInject.as_str(), "hosts.static.inject");
+        assert_eq!(
+            NetOpKind::NetworkStoreMemberWrite.as_str(),
+            "network.store.member_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreMemberRemove.as_str(),
+            "network.store.member_remove"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreRealizedWrite.as_str(),
+            "network.store.realized_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreRealizedRemove.as_str(),
+            "network.store.realized_remove"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreIpamRebuild.as_str(),
+            "network.store.ipam_rebuild"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreReclaimWrite.as_str(),
+            "network.store.reclaim_write"
+        );
         assert_eq!(NetOpKind::PastaStart.as_str(), "pasta.start");
         assert_eq!(NetOpKind::PastaStop.as_str(), "pasta.stop");
     }

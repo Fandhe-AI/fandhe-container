@@ -380,7 +380,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・未実装（REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -434,6 +434,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 - 表現はゲスト相対パス。区切りは `/`、UTF-8 必須
 - 構文の上限（新設の定数）: `MAX_GUEST_PATH_BYTES` = 4096（既存）、`MAX_GUEST_PATH_COMPONENTS` = 256、`MAX_GUEST_NAME_BYTES` = 255
 - 構文規則は新設の newtype `GuestPath` に 1 か所で集める（REPAIR-2）。拒否するもの: NUL、先頭の `/`（絶対パス）、空のコンポーネント、`.`・`..`、`\` と `:`（`guest_files.rs` の既存規則を移す）、上限超過。`GuestPath` は client・payload・`GuestFileCreator::create_file` の 3 者が同じ関数で検証する
+- 状態: `GuestPath` と 3 定数は #3159 で実装済み（`crates/io/src/guest_path.rs`）。`create_file` が利用中で、payload と client からの利用は #3161・#3162
 - 検証の層
   - 復号時（純関数・OS 非依存）: 長さと UTF-8 だけを見る。違反はフレーム構造の違反として接続全体を失効させる
   - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
@@ -564,7 +565,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 
 | issue | 内容 | 依存 |
 | ----- | ---- | ---- |
-| #3159 | `GuestPath` の切り出し（IO-5・REPAIR-2） | #1886 |
+| #3159 | `GuestPath` の切り出し（IO-5・REPAIR-2） | #1886。実装済み（`crates/io/src/guest_path.rs`） |
 | #3160 | ホストパス長の検査（IO-5） | #3159 |
 | #3161 | v2 の符号化と復号（IO-1・REPAIR-2。BREAKING CHANGE） | #3159 |
 | #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4） | #3161 |

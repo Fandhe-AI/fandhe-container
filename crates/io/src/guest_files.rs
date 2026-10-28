@@ -25,12 +25,14 @@
 //! 作成要求を受ける経路はまだない。フレーム種別・ペイロードの拡張は IO-1 の
 //! I/O 契約変更（`PROTOCOL_VERSION` の繰り上げを伴いうる）であり、本モジュールは
 //! ワイヤー形式を変えずにサーバー側 API として組み込む。ワイヤーからの作成要求
-//! （IO-1・TASK-14 のファイル操作ペイロード拡張）は後続。
+//! （IO-1・TASK-14 のファイル操作ペイロード拡張）は後続。パスの構文検証は
+//! [`crate::guest_path::GuestPath`]（F5・#3159）に集約済みで、ワイヤー上の作成
+//! （#3161・#3163）も同じ関数で検証する予定。260 文字の検証の組み込みは未実装（#3160）。
 //!
 //! # 契約と既知の限界
-//! - 閉じ込め: ゲストパスを `Path::join` へ渡さず、検証済みコンポーネント
-//!   （ホスト上でちょうど 1 個の `Normal`。`\` と `:` は 3 OS とも拒否して挙動を
-//!   揃える）だけを扱う。Linux / macOS では共有ルートのディレクトリ fd を起点に
+//! - 閉じ込め: ゲストパスを `Path::join` へ渡さず、`GuestPath` の OS 非依存の規則で
+//!   検証したコンポーネント（`.`・`..`・空・`\`・`:`・NUL を拒否するため、どの OS でも
+//!   ホスト上でちょうど 1 個の `Normal`）だけを扱う。Linux / macOS では共有ルートのディレクトリ fd を起点に
 //!   `mkdirat` / `openat`（`O_DIRECTORY|O_NOFOLLOW`）で祖先を 1 個ずつ辿り、末端は
 //!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（`crate::sys::mkdir_beneath`・
 //!   `crate::sys::open_dir_beneath`・`crate::sys::create_leaf_beneath`）。
@@ -151,16 +153,15 @@ use std::fs::File;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{IoError, IoErrorCode};
 use crate::fs_normalize::{CaseCollisionSet, collision_error, quote_for_message};
+use crate::guest_path::GuestPath;
 use crate::writeback::AppendFileSink;
 
-/// ゲスト相対パスのバイト長の上限（Linux の PATH_MAX 相当。DoS 防止のため
-/// 畳み込みやアロケーションの前に検証する）。
-pub const MAX_GUEST_PATH_BYTES: usize = 4096;
+pub use crate::guest_path::MAX_GUEST_PATH_BYTES;
 
 /// 索引へ登録できるパス件数の上限の最大値（`fs_normalize` は件数上限を呼び出し側の
 /// 責務としているため本型が持つ）。
@@ -201,21 +202,6 @@ fn too_many() -> IoError {
         IoErrorCode::ResourceExhausted,
         "too many tracked guest paths",
     )
-}
-
-/// 単一のゲストパスコンポーネントがホスト上でちょうど 1 個の `Normal` に
-/// なることを確かめる（`..`・空・`.`・`\`・`:`・NUL を拒否する）。
-fn validate_host_component(component: &str) -> Result<(), IoError> {
-    if component.contains(['\\', ':', '\0']) {
-        return Err(invalid(
-            "guest path component must not contain '\\', ':' or NUL",
-        ));
-    }
-    let mut parts = Path::new(component).components();
-    match (parts.next(), parts.next()) {
-        (Some(Component::Normal(_)), None) => Ok(()),
-        _ => Err(invalid("guest path component must be a single normal name")),
-    }
 }
 
 impl GuestFileCreator {
@@ -278,14 +264,12 @@ impl GuestFileCreator {
     /// 走査・再検証・取り消しの失敗は `Internal`
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
-        if guest_path.len() > MAX_GUEST_PATH_BYTES {
-            return Err(invalid("guest path is too long"));
-        }
-        // ロックと走査の前にホスト側の検証を済ませる。
-        let components: Vec<&str> = guest_path.split('/').collect();
-        for component in &components {
-            validate_host_component(component)?;
-        }
+        // ロックと走査の前に構文検証を済ませる（OS 非依存の規則は GuestPath に集約。
+        // F5・#3159。受理した各コンポーネントはどの OS でもホスト上でちょうど 1 個の
+        // `Normal` になる）。
+        let path = GuestPath::parse(guest_path)?;
+        let guest_path = path.as_str();
+        let components: Vec<&str> = path.components().collect();
 
         // 走査から作成・再検証までを同じガードで直列化する。
         let _guard = self.lock.lock().map_err(|_| poisoned())?;
@@ -737,7 +721,7 @@ fn create_beneath(
     let root = root_dir
         .try_clone()
         .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?;
-    // 祖先数は MAX_GUEST_PATH_BYTES で検証済みのパス長で抑えられている。
+    // 祖先数は GuestPath::parse で検証済みの MAX_GUEST_PATH_COMPONENTS で抑えられている。
     let mut dirs = Vec::with_capacity(ancestors.len().saturating_add(1));
     dirs.push(root);
     let mut made = Vec::with_capacity(ancestors.len());
@@ -771,7 +755,14 @@ fn create_beneath(
     };
     #[cfg(test)]
     fault::run_hook(fault::Hook::BeforeLeaf);
-    match create_leaf_beneath(parent, leaf) {
+    #[cfg(test)]
+    let leaf_result = match fault::take_leaf_failure() {
+        Some(kind) => Err(BeneathError::Io(kind)),
+        None => create_leaf_beneath(parent, leaf),
+    };
+    #[cfg(not(test))]
+    let leaf_result = create_leaf_beneath(parent, leaf);
+    match leaf_result {
         Ok(file) => Ok(Created { file, dirs, made }),
         Err(BeneathError::AlreadyExists) => {
             // 実在する表記を確かめる（大文字小文字を区別しないホストでは、走査の後に
@@ -1335,6 +1326,7 @@ mod fault {
     thread_local! {
         static SCAN_CALLS: Cell<usize> = const { Cell::new(0) };
         static FAIL_SCAN_AT: Cell<Option<usize>> = const { Cell::new(None) };
+        static FAIL_LEAF: Cell<Option<std::io::ErrorKind>> = const { Cell::new(None) };
         static BEFORE_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         static AFTER_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1349,6 +1341,7 @@ mod fault {
     pub(super) fn reset() {
         SCAN_CALLS.with(|c| c.set(0));
         FAIL_SCAN_AT.with(|f| f.set(None));
+        FAIL_LEAF.with(|f| f.set(None));
         BEFORE_CREATE.with(|h| h.borrow_mut().take());
         AFTER_CREATE.with(|h| h.borrow_mut().take());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1363,6 +1356,18 @@ mod fault {
     pub(super) fn fail_scan_at(n: usize) {
         SCAN_CALLS.with(|c| c.set(0));
         FAIL_SCAN_AT.with(|f| f.set(Some(n)));
+    }
+
+    /// 以降の葉の作成を `kind` の I/O エラーで失敗させる（Linux / macOS）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn fail_leaf_with(kind: std::io::ErrorKind) {
+        FAIL_LEAF.with(|f| f.set(Some(kind)));
+    }
+
+    /// 葉の作成口から呼ばれ、注入された失敗があれば取り出す。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn take_leaf_failure() -> Option<std::io::ErrorKind> {
+        FAIL_LEAF.with(|f| f.take())
     }
 
     /// 走査の読み取り口から呼ばれ、失敗させる回なら `true`。
@@ -1583,27 +1588,40 @@ mod tests {
         let t = Tmp::new();
         std::fs::create_dir(t.0.join("keep")).expect("keep");
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
-        // 葉が長すぎて作成に失敗する（祖先 `a`・`a/b` は新設後に取り除かれる）。
-        let long = "x".repeat(300);
-        let err = c
-            .create_file(&format!("a/b/{long}"))
-            .err()
-            .expect("must fail");
+        // 葉の作成が失敗する（祖先 `a`・`a/b` は新設後に取り除かれる）。
+        fault::fail_leaf_with(ErrorKind::InvalidFilename);
+        let err = c.create_file("a/b/leaf").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(
             err.message(),
             "failed to create guest file (InvalidFilename)"
         );
         assert!(!t.0.join("a").exists());
-        let err = c
-            .create_file(&format!("keep/{long}"))
-            .err()
-            .expect("must fail");
+        fault::fail_leaf_with(ErrorKind::InvalidFilename);
+        let err = c.create_file("keep/leaf").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert!(t.0.join("keep").is_dir());
         assert_eq!(entries(&t.0), 1);
         // 取り除かれた `a` は索引にも実体にも残らないため、表記違いも作れる。
         c.create_file("A/b").expect("no leftover ancestor");
+    }
+
+    /// 名前長の超過は FS に触れる前（mkdir の前）に拒否される（F5・IO-5・REPAIR-2）。
+    #[test]
+    fn io5_overlong_name_is_rejected_before_any_mkdir() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let long = "x".repeat(256);
+        let err = c
+            .create_file(&format!("a/b/{long}"))
+            .err()
+            .expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(entries(&t.0), 0);
+        let many = vec!["a"; 257].join("/");
+        let err = c.create_file(&many).err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(entries(&t.0), 0);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

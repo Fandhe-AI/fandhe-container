@@ -601,8 +601,8 @@ pub(crate) fn restore_published_ports_recorded(
 /// `NotFound`（バッチは all-or-nothing で何も消えていない）になっても、印があり生きたテーブルのハンドルが一致して
 /// いれば、2 本を `delete_one` で 1 本ずつ削除する（各 1 本の ENOENT はそのルールが既に無い確認とみなし、
 /// 残っているルールは確実に消す）。どちらかが ENOENT 以外で失敗すれば記録と予約を保つ。印が無い ENOENT は成功扱いに
-/// しない。記録の書き直しの rename 後に失敗した場合（新しい記録が残り公開が無い）の再試行は、同じメンバー・
-/// 同じ endpoint・同じネットワークの公開で記録に当該の受け口が無ければ、解除が確定済みとみなして予約の解放だけを行う。
+/// しない。記録に当該の公開が無い値（記録の書き直しの rename 後に失敗した場合の再試行を含む）は、解除済みを示す永続記録が
+/// 無いので受け付けず、DELRULE も予約の解放も行わない（予約は `delete_network` まで保持する）。
 /// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
 pub(crate) fn unpublish_port_recorded_with<G, D, S>(
     guard: &NetworkLockGuard<'_>,
@@ -630,22 +630,9 @@ where
     // 別ネットワークのトークンを持つ記録は、DELRULE の前に DataLoss で断る（`published_ports` は
     // `realized` のトークンで値を作るため、後段の完全一致では検出できない）。
     check_member_owned(&realized, rec).map_err(RecordedError::Store)?;
-    // 記録の書き直し（公開を外した版）の rename が済んだ後に失敗した再試行: 記録に当該の受け口が無く、同じ
-    // メンバー・endpoint・ネットワークの公開なら、公開を外すのは DELRULE の成功後だけなので解除は確定済み。
-    // 予約の解放だけを行う（記録を変えない）。
-    if !rec.has_publish(published.publish())
-        && published.network() == realized.name()
-        && published.bridge_token() == realized.token()
-        && published.endpoint() == rec.endpoint()
-    {
-        // 予約が実際に残っている（この呼び出し側が公開した）ときだけ成功扱いにする。予約が無い（0 件）なら、
-        // 記録に無い別の公開なので下の照合で断る。
-        match published.release_committed(registry) {
-            Ok(0) => {}
-            Ok(_) => return Ok(()),
-            Err(e) => return Err(RecordedError::Op(Box::new(e))),
-        }
-    }
+    // 記録に無い公開は、予約の存在だけでは解除済みと証明できない（recorded attach 後の `publish_container_ports` で
+    // 足した公開や、古い値と再公開の取り違えを区別できない）。DELRULE も予約の解放もせず、下の完全一致で断る
+    // （予約は delete_network まで保持する。fail-closed。NET-3・SEC-1）。
     // 記録と食い違う公開（別メンバーのもの・ハンドル違い）では、カーネル操作の前に断る。
     if !rec.published_ports(&realized).contains(&published) {
         return Err(RecordedError::Op(Box::new(UnpublishPortError {
@@ -1997,9 +1984,10 @@ mod tests {
         assert_eq!(n.members().unwrap()[0].publishes().len(), 0);
     }
 
-    /// NET-3・#3068: 記録の書き直しが済んだ後（公開が記録に無い）の再試行は、DELRULE を送らず予約の解放だけで成功する。
+    /// NET-3・SEC-1・#3068: 記録に無い公開は、予約があっても解除済みとは証明できないので、DELRULE も予約の解放もせず
+    /// 断る（recorded attach 後の追加公開や古い値での再試行が、別の公開の予約を外さない）。
     #[test]
-    fn net3_3068_unpublish_retry_after_record_already_rewritten() {
+    fn net3_3068_unpublish_not_in_record_keeps_reservation() {
         let t = Tmp::new("unpublish-rewritten");
         attach_published(&t);
         let store = NetworkStore::open(&t.0).unwrap();
@@ -2013,7 +2001,7 @@ mod tests {
             .unwrap();
         let mut reg = PortRegistry::new();
         reg.reserve(&name(), p.endpoint(), &[*p.publish()]).unwrap();
-        unpublish_port_recorded_with(
+        let r = unpublish_port_recorded_with(
             &n,
             &mid("c1"),
             p,
@@ -2021,8 +2009,14 @@ mod tests {
             |_| unreachable!("table_info must not be called"),
             |_, _| unreachable!("delete must not be called"),
             |_, _, _| unreachable!("delete_one must not be called"),
-        )
-        .unwrap();
+        );
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert!(e.reservation_held && e.published.is_some());
+        // 予約は 1 件のまま残る。
+        assert_eq!(reg.held_by(&name(), &EndpointId::new("c1").unwrap()), Ok(1));
     }
 
     /// NET-3・SEC-1・#3068: 記録と一致しない公開（テーブルハンドル違い・受け口違い）は、カーネル操作の前に断る。

@@ -92,31 +92,6 @@ impl PublishedPort {
         self.table_handle
     }
 
-    /// 公開時のネットワークの bridge 所有トークン（記録との照合用）。
-    pub(crate) fn bridge_token(&self) -> &str {
-        &self.bridge_token
-    }
-
-    /// 記録の書き直しが済んだ後の再試行で、予約の解放だけを行う（DELRULE は送らない。NET-3・#3068）。
-    /// 呼び出し側が、記録に当該の受け口が無いことと同一メンバー・ネットワークであることを確認済みの経路だけが呼ぶ。
-    pub(crate) fn release_committed(
-        &self,
-        registry: &mut PortRegistry,
-    ) -> Result<usize, UnpublishPortError> {
-        registry
-            .release_listeners(
-                &self.network,
-                &self.endpoint,
-                std::slice::from_ref(&self.publish),
-            )
-            .map_err(|error| UnpublishPortError {
-                error,
-                rules: UnpublishRules::Removed,
-                reservation_held: true,
-                published: None,
-            })
-    }
-
     /// 公開したネットワーク。
     pub fn network(&self) -> &NetworkName {
         &self.network

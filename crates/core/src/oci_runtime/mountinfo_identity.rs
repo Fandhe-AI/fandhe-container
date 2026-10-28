@@ -86,6 +86,9 @@ pub(crate) enum FdinfoMountIdError {
 /// fdinfo の本文から行頭が `mnt_id:` の行の値（fd が属するマウントの ID）を取り出す純関数。
 /// 重複行は拒否する（`setns::parse_fdinfo_pid` と同じ。カーネルは 1 行しか出さない）。
 /// 呼び出しは [`read_fd_mnt_id`] 経由が基本で、crates/core で fdinfo の `mnt_id` を解析する唯一の実装（REPAIR-1）。
+/// crates/net・crates/gpu に同じ規則の別実装がある（依存方向のため共有しない。判断は
+/// `docs/design/fdinfo-mnt-id-parsing.md`・#3140）。規則を変えるときは `testdata/fdinfo_mnt_id_cases.txt` と
+/// 3 か所を同じ PR で直す（一致は 3 crate の `*_fdinfo_mnt_id_shared_cases` 試験が機械照合する）。
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Result<u64, FdinfoMountIdError> {
     let mut found: Option<&str> = None;
@@ -657,6 +660,74 @@ mod tests {
             got,
             vec![("8:3", "/state/x/y", 30), ("8:1", "/state/x", 35)]
         );
+    }
+
+    /// REPAIR-1・SEC-1・#3140: 共有 fixture（`testdata/fdinfo_mnt_id_cases.txt`）の全事例で、解析結果が期待と完全一致する。net・gpu の同名の照合試験と同じ fixture を読む。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_fdinfo_mnt_id_shared_cases() {
+        use std::io::Cursor;
+        const CASES: &str = include_str!("../../testdata/fdinfo_mnt_id_cases.txt");
+
+        fn hex(s: &str) -> Vec<u8> {
+            if s == "-" {
+                return Vec::new();
+            }
+            assert!(s.len().is_multiple_of(2), "odd hex: {s}");
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        let classify = |bytes: &[u8]| -> String {
+            match read_fdinfo_bounded(Cursor::new(bytes)).and_then(|t| parse_fdinfo_mnt_id(&t)) {
+                Ok(n) => format!("ok:{n}"),
+                Err(FdinfoMountIdError::Read(_)) => "read".into(),
+                Err(FdinfoMountIdError::TooLarge) => "too_large".into(),
+                Err(FdinfoMountIdError::Missing) => "missing".into(),
+                Err(FdinfoMountIdError::Duplicate) => "duplicate".into(),
+                Err(FdinfoMountIdError::Invalid) => "invalid".into(),
+            }
+        };
+        let mut max_bytes = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut count = 0usize;
+        for line in CASES
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f[0] == "max_bytes" {
+                max_bytes = Some(f[1].parse::<u64>().expect("max_bytes"));
+                continue;
+            }
+            let bytes = hex(f[1]);
+            let shared = f[2];
+            // 第 4 列の `net=` は net 側だけの上書き期待なので、この試験では読み飛ばす。
+            // 解析部・fixture の形式は crates/core・net・gpu の 3 か所の試験で同じ形に保つ（変更時は 3 か所を同期する。REPAIR-1）。
+            let want = shared;
+            let got = classify(&bytes);
+            assert_eq!(
+                got,
+                want,
+                "case {}: input {:?}",
+                f[0],
+                String::from_utf8_lossy(&bytes)
+            );
+            seen.insert(shared.split(':').next().unwrap().to_string());
+            count += 1;
+        }
+        assert!(count >= 16, "fixture is too small: {count}");
+        for k in ["ok", "missing", "duplicate", "invalid", "read"] {
+            assert!(seen.contains(k), "fixture has no {k} case");
+        }
+        let max = max_bytes.expect("max_bytes line");
+        assert_eq!(max, FDINFO_MAX_BYTES, "limit constant differs from fixture");
+        let n = usize::try_from(max).unwrap();
+        assert_eq!(classify(&vec![b'a'; n]), "missing");
+        assert_eq!(classify(&vec![b'a'; n + 1]), "too_large");
     }
 
     /// REPAIR-1・CORE-2（#2762）: fdinfo の `mnt_id` 解析の正常系と、欠落・重複・非数値・上限超えの拒否。

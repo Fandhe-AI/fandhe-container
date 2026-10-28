@@ -29,6 +29,18 @@ case " $* " in
     exit 0 ;;
 esac
 case " $* " in *" --no-run "*) exit 0 ;; esac
+# プリフライト（--list --logfile。#3036）。カウンタは進めない。STUB_NO_LOGFILE=1 は削除後の libtest を模す。
+case " $* " in
+  *" --list "*)
+    lf=""; prev=""
+    for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; prev="${a}"; done
+    if [ -n "${STUB_NO_LOGFILE:-}" ] && [ -n "${lf}" ]; then echo "error: Unrecognized option: 'logfile'" >&2; exit 101; fi
+    [ -z "${STUB_PREFLIGHT_RC:-}" ] || exit "${STUB_PREFLIGHT_RC}"
+    exit 0 ;;
+esac
+case " $* " in
+  *" --logfile "*) [ -z "${STUB_NO_LOGFILE:-}" ] || { echo "error: Unrecognized option: 'logfile'" >&2; exit 101; } ;;
+esac
 [ -z "${STUB_ENV_LOG:-}" ] || echo "cargo-env: ${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}" >>"${STUB_ENV_LOG}"
 n=0
 [ ! -f "${STUB_COUNTER}" ] || n="$(cat "${STUB_COUNTER}")"
@@ -82,6 +94,13 @@ FINAL_LINE='production_launcher: pid1, default /dev nodes, landlock evidence, cg
 cat >"${work}/bin/exec_x_bin" <<STUB
 #!/usr/bin/env bash
 echo "args: \$*"
+case " \$* " in
+  *" --list "*)
+    lf=""; prev=""
+    for a in "\$@"; do [ "\${prev}" = --logfile ] && lf="\${a}"; prev="\${a}"; done
+    if [ -n "\${STUB_NO_LOGFILE:-}" ] && [ -n "\${lf}" ]; then echo "error: Unrecognized option: 'logfile'" >&2; exit 101; fi
+    exit 0 ;;
+esac
 echo "env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=\${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}"
 echo "user-seen: \${USER:-unset}"
 case "\${STUB_MODE}" in
@@ -177,7 +196,7 @@ check features-pass 0 "passed=2 failed=0 count=2" ok "${P}" "${T}" FEATURES=grpc
 rm -f "${work}/args" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
   "${P}" "${T}" FEATURES=grpc COUNT=1 "${target}" >/dev/null 2>&1
-if [ "$(grep -cF -- "--features grpc" "${work}/args")" -eq 2 ]; then
+if [ "$(grep -cF -- "--features grpc" "${work}/args")" -eq 3 ]; then
   echo "OK: features-args"
 else
   echo "NG: features-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
@@ -280,6 +299,23 @@ else
   echo "NG: libtest-ignored-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
 fi
 
+# --- logfile 非対応のプリフライト（#3036）---
+check logfile-unsupported-lib 1 "FAIL: preflight rc=101 reason=logfile-unsupported" ok "${P}" "${T}" STUB_NO_LOGFILE=1 COUNT=3
+check logfile-unsupported-lib-count 1 "passed=0 failed=3 count=3 test=a::b::c" ok "${P}" "${T}" STUB_NO_LOGFILE=1 COUNT=3
+check logfile-unsupported-libtest 1 "reason=logfile-unsupported" gen "${P}" "${B}" "${LN}" STUB_NO_LOGFILE=1 COUNT=2
+check logfile-unsupported-libtest-count 1 "passed=0 failed=2 count=2 test_bin=exec_x" gen "${P}" "${B}" "${LN}" STUB_NO_LOGFILE=1 COUNT=2
+check preflight-other-failure 1 "FAIL: preflight rc=3 reason=preflight-failed" ok "${P}" "${T}" STUB_PREFLIGHT_RC=3 COUNT=2
+check preflight-accepted-info 0 "info: libtest_logfile=accepted" ok "${P}" "${T}" COUNT=1
+check success-line-no-preflight 0 "passed=2 failed=0 count=2 test_bin=exec_x" bin-ok "${P}" "${B}" "${S}" STUB_NO_LOGFILE=1 COUNT=2
+check success-line-unrecognized-is-exit 1 "reason=exit" gen "${P}" "${B}" "${S}" "STUB_STDERR=Unrecognized option: 'logfile'\n" STUB_RC=1 COUNT=1
+# プリフライトで止まったときは本番のループが 1 回も走らない（カウンタが作られない）。
+rm -f "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_NO_LOGFILE=1 STUB_COUNTER="${work}/counter" "${P}" "${T}" COUNT=2 "${target}" >/dev/null 2>&1
+if [ ! -f "${work}/counter" ]; then echo "OK: logfile-unsupported-no-runs"; else echo "NG: logfile-unsupported-no-runs" >&2; fails=$((fails + 1)); fi
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" "${P}" "${T}" COUNT=1 "${target}" >/dev/null 2>&1
+if grep -qE -- "-- --list --logfile [^ ]+libtest.log$" "${work}/args"; then echo "OK: lib-preflight-args"; else echo "NG: lib-preflight-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1)); fi
+
 # --- 委譲スコープモード（USER_SCOPE=1）と TEST_ENV（#2886）---
 SB="STUB_BIN=${work}/bin/exec_x_bin"
 FL="SUCCESS_LINE=${FINAL_LINE}"
@@ -326,6 +362,7 @@ check scope-success-line-forbidden 1 "passed=0 failed=1 count=1" scope-ok "${P}"
 check scope-binary-none 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=none
 check scope-binary-two 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=two
 check scope-binary-null 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=null
+check logfile-unsupported-scope 1 "reason=logfile-unsupported" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 STUB_NO_LOGFILE=1 COUNT=1
 check scope-with-lib 2 "usage:" ok "${P}" "${T}" USER_SCOPE=1
 check scope-without-bin 2 "usage:" ok "${P}" USER_SCOPE=1
 check scope-invalid-value 2 "usage:" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=yes

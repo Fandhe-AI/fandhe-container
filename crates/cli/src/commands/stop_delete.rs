@@ -387,6 +387,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
             }
             remove_container_options(rt.store.as_ref(), &req);
             remove_etc_files_after_delete(rt.store.as_ref(), &req);
+            remove_pasta_leftovers_after_delete(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -759,6 +760,51 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
     );
 }
 
+/// pasta の置き場所の削除失敗の警告(stderr に 1 行の JSON。ERR-1)。パス・errno・ID は含めない。
+pub(super) fn pasta_removal_warning(code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"pasta run directory removal failed; leftover files may remain\"}}",
+        code.as_str()
+    )
+}
+
+/// core の `delete` が成功した後に、pasta の置き場所の残骸(`<root>/@pasta/<id>`。NET-9・#1940)を消す。
+///
+/// 通常は supervisor がコンテナの終了時に消す。supervisor が異常終了して残った PID ファイルだけを消し、記録の pid での
+/// プロセスの探索・kill はしない(pid の再利用で無関係なプロセスを撃たないため。12.10)。失敗・期限切れでも delete の結果は
+/// 変えず警告を 1 行だけ出す。再作成済みの ID は見送る。Linux 以外は pasta 構成が無いので何もしない。
+fn remove_pasta_leftovers_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let root = root.to_path_buf();
+    let id = req.id().clone();
+    if !id_is_still_deleted(&root, &id) {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        let result = fandhe_container_supervisor::pasta_attach::remove_pasta_leftovers(&root, &id);
+        #[cfg(not(target_os = "linux"))]
+        let result: Result<(), fandhe_container_core::traits::types::TraitError> = Ok(());
+        let _ = tx.send(result);
+    });
+    let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.code(),
+        Err(_) => ErrorCode::Timeout,
+    };
+    emit_warning_bounded(
+        pasta_removal_warning(code),
+        write_warning_to_stderr,
+        WARNING_WRITE_TIMEOUT,
+    );
+}
+
 /// ID 単位のロック(`create` が起動オプション文書の書き込みで取るものと同じ `@container-options/@locks/<id>`)を
 /// 保持したまま、不在確認から削除までを直列化する(#1872・NET-12)。
 ///
@@ -970,6 +1016,46 @@ mod tests {
         store::write_new(&state_root, &id, &doc).expect("write");
         remove_container_options(&fs_store, &DeleteRequest::new(id.clone()));
         assert!(!store::options_path(&state_root, &id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-9(#1940): delete の後に pasta の置き場所の残骸(`@pasta/<id>`)が消え、他の ID は残る。残骸が無くても成功する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_delete_removes_pasta_leftovers_and_keeps_other_ids() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = std::env::temp_dir().join(format!("fc-cli-del-pasta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        let root = StateRoot::from_override(dir.join("state")).expect("root");
+        let fs_store = FileStateStore::open(root).expect("open");
+        let state_root = fs_store.host_state_root().expect("root").to_path_buf();
+        let (a, b) = (
+            ContainerId::new("c1").expect("id"),
+            ContainerId::new("c2").expect("id"),
+        );
+        // 残骸が無いときも成功(警告も出さない)。
+        remove_pasta_leftovers_after_delete(&fs_store, &DeleteRequest::new(a.clone()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(state_root.join("@pasta"))
+            .expect("pasta dir");
+        for id in [&a, &b] {
+            let run = state_root.join("@pasta").join(id.as_str());
+            builder.create(&run).expect("run dir");
+            std::fs::write(run.join("pid"), "123\n").expect("pid");
+        }
+        remove_pasta_leftovers_after_delete(&fs_store, &DeleteRequest::new(a.clone()));
+        assert!(!state_root.join("@pasta").join("c1").exists());
+        assert!(state_root.join("@pasta").join("c2").exists());
+        assert_eq!(
+            pasta_removal_warning(ErrorCode::Timeout),
+            r#"{"level":"warn","code":"TIMEOUT","message":"pasta run directory removal failed; leftover files may remain"}"#
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

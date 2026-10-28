@@ -8,7 +8,9 @@
 #   - lib モード（TEST）: `--exact` の名前を誤ると 0 件実行でも exit 0 になるため、libtest の `--logfile` に
 #     書かれた結果が「ちょうど 1 行で `ok <TEST>`」であることを照合する（false-green の防止）。
 #   - 結合試験モード（TEST_BIN）: 次のどちらか一方で判定する（排他・どちらか必須）。いずれも終了コード 0 を要求する。
-#     - LIBTEST_NAME: libtest ハーネスの `[[test]]`。`--logfile` の `ok <LIBTEST_NAME>` 行で判定する。
+#     - LIBTEST_NAME: libtest ハーネスの `[[test]]`。`--exact <LIBTEST_NAME>` で単独の試験へ絞り（#3037）、`--logfile` が
+#       ちょうど 1 行で `ok <LIBTEST_NAME>` であることで判定する。`TEST_IGNORED` と名前の組が合わない場合（0 件実行・
+#       `ignored <name>`）も missing-libtest-ok で失敗する（fail-closed）。ハーネス全体を競合込みで回すなら SUCCESS_LINE を使う。
 #     - SUCCESS_LINE: `harness = false` の試験（libtest の出力も `--exact` も持たない）。試験固有の成功行を
 #       stdout か stderr のどちらかで行全体の完全一致として要求する。非 Linux で `not applicable` を出して
 #       exit 0 する試験は成功行が無いので失敗として数える。
@@ -215,6 +217,8 @@ one_run() {
     return
   fi
   [ "${TEST_IGNORED}" != 1 ] || extra+=(--ignored)
+  # LIBTEST_NAME は --exact で単独の試験へ絞る（#3037）。SUCCESS_LINE（harness = false）には --exact を渡さない。
+  [ -z "${LIBTEST_NAME}" ] || extra+=(--exact "${LIBTEST_NAME}")
   extra+=(${LOGARGS[@]+"${LOGARGS[@]}"})
   if [ -n "${SCOPE_BIN}" ]; then
     env ${TEST_ENV_ARGS[@]+"${TEST_ENV_ARGS[@]}"} USER="${SCOPE_USER}" \
@@ -239,7 +243,9 @@ output_ok() {
     [ "$(crless "${logf}" | wc -l | tr -d ' ')" -eq 1 ] || return 1
     crless "${logf}" | grep -xF -- "ok ${TEST}" >/dev/null
   elif [ -n "${LIBTEST_NAME}" ]; then
+    # lib と同じく、--exact で絞った結果がちょうど 1 行の `ok <LIBTEST_NAME>`（#3037）。
     [ -f "${logf}" ] || return 1
+    [ "$(crless "${logf}" | wc -l | tr -d ' ')" -eq 1 ] || return 1
     crless "${logf}" | grep -xF -- "ok ${LIBTEST_NAME}" >/dev/null
   else
     crless "${out_o}" | grep -xF -- "${SUCCESS_LINE}" >/dev/null || crless "${out_e}" | grep -xF -- "${SUCCESS_LINE}" >/dev/null

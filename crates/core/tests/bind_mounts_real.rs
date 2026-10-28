@@ -1112,7 +1112,10 @@ mod linux {
         assert!(missing(&ctx.rootfs("pfs")));
 
         // `/dev` の rbind は、付け替えた木の中の疑似 FS（devtmpfs・devpts 等）で付け替えの後に拒否され、巻き戻る。
-        let set = bind_set(&[("/dev", "/devx", &["rbind"])]);
+        // GitHub ホステッド runner のように `/dev` が noexec のホストでは、noexec を指定しないと付け替えの前に
+        // `specify noexec` の前提不成立で止まり疑似 FS の拒否に届かない。どのホストでも同じ経路を観測できるよう
+        // noexec を明示する（exec 可のホストでも noexec は要求どおり載る）。
+        let set = bind_set(&[("/dev", "/devx", &["rbind", "noexec"])]);
         let err = ctx.expect_violation(
             "/dev rbind",
             &set,
@@ -1129,7 +1132,8 @@ mod linux {
         );
 
         // `/dev` を非再帰で元にすると、ホストから引き継いだ配下のマウントがロックされており EINVAL になる（#2064 (a)）。
-        let set = bind_set(&[("/dev", "/devx", &["bind"])]);
+        // noexec の明示の理由は上の rbind と同じ（noexec の `/dev` で noexec の前提不成立が先に出るのを避ける）。
+        let set = bind_set(&[("/dev", "/devx", &["bind", "noexec"])]);
         ctx.expect_precondition("/dev non-recursive", &set, "use rbind");
         assert!(missing(&ctx.rootfs("devx")));
 

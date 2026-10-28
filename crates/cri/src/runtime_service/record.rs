@@ -23,7 +23,7 @@
 //! `RunPodSandbox` / `CreateContainer` と同じ上限検証（`config_limits`）を通す。
 //!
 //! 呼び出し元になる予定: R2（バイト列の読み書き。上限は [`MAX_SANDBOX_RECORD_BYTES`] /
-//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4（sandbox の書く時点。実装済み）・R5（コンテナの書く時点）・R6 / R7（起動時の再採用）。
+//! [`MAX_CONTAINER_RECORD_BYTES`]）・R4（sandbox の書く時点。実装済み）・R5（コンテナの書く時点。実装済み）・R6 / R7（起動時の再採用）。
 
 use std::collections::HashSet;
 
@@ -32,7 +32,8 @@ use prost::Message;
 use super::config_limits::MAX_CONFIG_ENCODED_BYTES;
 use super::container::{ContainerState, validate_container_config};
 use super::{
-    InFlightKind, SUPPORTED_RUNTIME_HANDLERS, SandboxRecord, SandboxState, validate_sandbox_config,
+    ContainerRecord, InFlightKind, SUPPORTED_RUNTIME_HANDLERS, SandboxRecord, SandboxState,
+    validate_sandbox_config,
 };
 use crate::adapter::RuntimeTerminationReason;
 use crate::bundle::spec::{MAX_ADDITIONAL_GIDS, is_valid_image_reference, is_valid_image_tag};
@@ -96,8 +97,6 @@ pub(super) struct SandboxRecordData {
 }
 
 /// コンテナ記録 1 件分の内容（registry の `ContainerRecord` との変換は R5 #2934）。
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ContainerRecordData {
     pub(super) id: String,
@@ -510,9 +509,33 @@ fn is_concrete_signal(v: i32) -> bool {
     matches!(Signal::try_from(v), Ok(s) if s != Signal::RuntimeDefault)
 }
 
-// R4 / R5 / R6 / R7（#2933〜#2936）が呼ぶまでは本番の経路から呼ばれないスタブ（REPAIR-3）。呼び出しが入ったら外す。
-#[allow(dead_code)]
 impl ContainerRecordData {
+    /// registry の記録 1 件から、ディスクへ書く内容を作る（`CriRuntimeService` が書く時点ごとに、ロック下で
+    /// 複製した記録から呼ぶ。R5 #2934）。`retained_bytes`・`runtime_owned` は記録に載せない
+    /// （再採用側が数え直す・core の状態から導く。R7 #2936）。`envs` は [`Self::encode`] が消す。
+    pub(super) fn from_registry(
+        id: &str,
+        record: &ContainerRecord,
+        in_flight: Option<InFlightKind>,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            pod_sandbox_id: record.pod_sandbox_id.clone(),
+            config: record.config.clone(),
+            state: record.state,
+            in_flight,
+            created_at_nanos: record.created_at_nanos,
+            started_at_nanos: record.started_at_nanos,
+            finished_at_nanos: record.finished_at_nanos,
+            exit_code: record.exit_code,
+            termination: record.termination,
+            stop_signal: record.stop_signal,
+            resolved_log_path: record.resolved_log_path.clone(),
+            applied_user: record.applied_user.clone(),
+            resolved_image: record.resolved_image.clone(),
+        }
+    }
+
     /// 記録のバイト列を作る。`config.envs` は複製の側で消してから符号化する（呼び出し元の値は変えない）。
     /// 形式に載せられない値は `INTERNAL`（成功を装わない）。
     pub(super) fn encode(&self) -> Result<Vec<u8>, CriError> {
@@ -579,6 +602,8 @@ impl ContainerRecordData {
     }
 
     /// 記録のバイト列を厳密に復号する。`expect_id` は記録のファイル名由来の ID。
+    // R6 / R7（#2935・#2936）の起動時の再採用が呼ぶまでは本番の経路から呼ばれない（REPAIR-3）。
+    #[allow(dead_code)]
     pub(super) fn decode(bytes: &[u8], expect_id: &str) -> Result<DecodedContainer, CriError> {
         let malformed = || CriError::invalid_argument(CONTAINER_MALFORMED);
         if bytes.len() > MAX_CONTAINER_RECORD_BYTES {

@@ -159,7 +159,7 @@ pub(super) struct ContainerRecord {
     ///
     /// 作成時は config の値（`RUNTIME_DEFAULT` なら `SIGTERM`）で、`BundleProvider` が解決済みの値を報告したら
     /// イメージ config の `StopSignal` を反映した値で上書きされる。`ContainerStatus.stop_signal` と
-    /// StopContainer / StopPodSandbox が使う。プロセス内メモリにあるだけで、plugin-cri の再起動で失われる
+    /// StopContainer / StopPodSandbox が使う。記録ストア注入時はコンテナ記録へも書く（R5 #2934。再採用は R7 #2936 で未実装のため、現状は再起動で失われる）
     /// （`exit_code`・`resolved_log_path` と同じ寿命。config の annotations には書かない）。
     pub(super) stop_signal: i32,
     /// 起動時に適用する識別情報（`ContainerStatus.user.linux` の元。#2771・CRI-2・SEC-5・KEP-3619）。
@@ -170,7 +170,7 @@ pub(super) struct ContainerRecord {
     /// CreateContainer 時に解決したイメージ（`image_ref`・`image_id` の元。#2831・CRI-2・OCI-1）。
     ///
     /// 置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも
-    /// `StateStore` にも書かない。plugin-cri の再起動で失われる）。報告の無い経路（スタブ・外部 bundle）は `None`。
+    /// `StateStore` にも書かない。記録ストア注入時はコンテナ記録へも書く。再採用は R7 #2936 で未実装のため現状は再起動で失われる）。報告の無い経路（スタブ・外部 bundle）は `None`。
     pub(super) resolved_image: Option<ResolvedImage>,
 }
 

@@ -152,6 +152,7 @@ fn stop_inner(
 ) -> Result<StopOutcome, NetError> {
     // 副作用（停止要求・SIGKILL）の前に排他ロックを確かめる（共有ロックの下で止めてから記録の削除で失敗しない）。
     guard.require_exclusive()?;
+    guard.discard_stale_temps()?;
     let Some(record) = guard.read_dns_helper()? else {
         return Ok(StopOutcome::NoRecord);
     };
@@ -274,6 +275,7 @@ fn spawn_inner(
             "helper program path must be absolute",
         ));
     }
+    guard.discard_stale_temps()?;
     if guard.read_dns_helper()?.is_some() || guard.read_dns_helper_intent()?.is_some() {
         return Err(err(
             NetErrorCode::AlreadyExists,
@@ -487,6 +489,7 @@ pub fn recover_dns_helper_intent(
     candidates: &mut dyn Iterator<Item = u32>,
 ) -> Result<IntentRecovery, NetError> {
     guard.require_exclusive()?;
+    guard.discard_stale_temps()?;
     let Some(intent) = guard.read_dns_helper_intent()? else {
         return Ok(IntentRecovery::NoIntent);
     };
@@ -584,7 +587,6 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
 /// 段 2（`--dns-helper-stage2`）の握手: 識別行を stdout へ送り、stdin の `ACK` を [`DNS_HELPER_ACK_TIMEOUT`] まで待つ。
 /// 期限切れ・EOF・不一致は失敗（呼び出し元は bind せずに終了する。D14 (ii)）。
 pub(crate) fn run_stage2_handshake(nonce: &HelperNonce) -> Result<(), NetError> {
-    use std::io::Read as _;
     let me = identity::read_self_identity()?;
     let mut stdout = std::io::stdout();
     writeln!(
@@ -595,25 +597,89 @@ pub(crate) fn run_stage2_handshake(nonce: &HelperNonce) -> Result<(), NetError> 
     .and_then(|()| stdout.flush())
     .map_err(|_| err(NetErrorCode::Internal, "cannot write identity line"))?;
     let stdin = std::io::stdin();
-    match sys::wait_readable(stdin.as_fd(), &Deadline::after(DNS_HELPER_ACK_TIMEOUT)) {
-        Ok(Readiness::Readable) => {}
-        Ok(Readiness::TimedOut) => {
-            return Err(err(
-                NetErrorCode::Timeout,
-                "ack was not received before the deadline",
-            ));
+    read_ack_within(&mut stdin.lock(), &Deadline::after(DNS_HELPER_ACK_TIMEOUT))
+}
+
+/// `ACK`（4 バイト）を共有の絶対期限 `deadline` までに読み切る（REPAIR-5）。
+/// 部分読みのたびに残り時間で再び待つため、先頭だけ送って止まる相手でも期限で `Timeout` になる。
+fn read_ack_within<R: std::io::Read + std::os::fd::AsFd>(
+    r: &mut R,
+    deadline: &Deadline,
+) -> Result<(), NetError> {
+    let mut buf = [0u8; 4];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match sys::wait_readable(r.as_fd(), deadline) {
+            Ok(Readiness::Readable) => {}
+            Ok(Readiness::TimedOut) => {
+                return Err(err(
+                    NetErrorCode::Timeout,
+                    "ack was not received before the deadline",
+                ));
+            }
+            Ok(Readiness::Exceptional) | Err(_) => {
+                return Err(err(NetErrorCode::FailedPrecondition, "ack channel closed"));
+            }
         }
-        Ok(Readiness::Exceptional) | Err(_) => {
-            return Err(err(NetErrorCode::FailedPrecondition, "ack channel closed"));
+        let Some(rest) = buf.get_mut(filled..) else {
+            break;
+        };
+        match r.read(rest) {
+            Ok(0) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "ack was not received",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "ack was not received",
+                ));
+            }
         }
     }
-    let mut buf = [0u8; 4];
-    // 部分読み・EINTR で有効な ACK を取り逃さないよう read_exact（EINTR は再試行される）で読む。
-    match stdin.lock().read_exact(&mut buf) {
-        Ok(()) if &buf == ACK => Ok(()),
-        _ => Err(err(
+    if &buf == ACK {
+        Ok(())
+    } else {
+        Err(err(
             NetErrorCode::FailedPrecondition,
             "ack was not received",
-        )),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    /// REPAIR-5: ACK の一部だけ届いて止まっても期限で Timeout になる。
+    #[test]
+    fn net5_3070_partial_ack_times_out() {
+        let (mut tx, mut rx) = UnixStream::pair().expect("pair");
+        tx.write_all(b"A").expect("write");
+        let started = std::time::Instant::now();
+        let e = read_ack_within(&mut rx, &Deadline::after(Duration::from_millis(200)))
+            .expect_err("timeout");
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(tx);
+    }
+
+    /// 分割して届いた完全な ACK は受理される。
+    #[test]
+    fn net5_3070_split_ack_is_accepted() {
+        let (mut tx, mut rx) = UnixStream::pair().expect("pair");
+        tx.write_all(&ACK[..2]).expect("write");
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.write_all(&ACK[2..]).expect("write");
+            tx
+        });
+        read_ack_within(&mut rx, &Deadline::after(Duration::from_secs(5))).expect("ack");
+        drop(h.join());
     }
 }

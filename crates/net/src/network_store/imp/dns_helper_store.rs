@@ -47,7 +47,7 @@ impl NetworkLockGuard<'_> {
     /// 一時名は記録ごとに固定で、排他ロックの下では同時に書く者がいないため、残っていれば必ず中断の残骸。
     /// 最終名へ公開する前に fsync 済みなので、最終名は常に完全な内容で、一時名の側だけを捨てればよい
     /// （公開後・一時名の削除前の中断では最終名の nlink が 2 になるため、ここで 1 に戻す）。
-    pub(super) fn discard_stale_temps(&self) -> Result<(), NetError> {
+    pub(crate) fn discard_stale_temps(&self) -> Result<(), NetError> {
         if self.shared {
             return Ok(());
         }
@@ -337,6 +337,29 @@ mod tests {
     }
 
     /// NET-7・REPAIR-5・#3070: 書き込み途中で中断され一時名だけが残っても、最終名は現れず、
+    /// 公開後・一時名の削除前の中断（nlink 2）の記録が残っていても、`discard_stale_temps` の後なら読める。
+    /// 回収前の読み取りは `FailedPrecondition`（open_regular_ro の検査）。
+    #[test]
+    fn net7_3070_nlink2_record_recovers_after_discard() {
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        let net = dir.join("@networks/web");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        n.write_dns_helper_intent(&intent()).expect("write");
+        fs::hard_link(
+            net.join("dns-helper.intent"),
+            net.join("dns-helper.intent.tmp"),
+        )
+        .expect("link");
+        assert!(n.read_dns_helper_intent().is_err());
+        n.discard_stale_temps().expect("discard");
+        assert_eq!(n.read_dns_helper_intent().expect("read"), Some(intent()));
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// 排他ロックの書き込み経路が一時名を回収して書き直せる。公開後の一時名の取り残し（nlink 2）も戻る。
     #[test]
     fn net7_3070_stale_temp_is_recovered() {

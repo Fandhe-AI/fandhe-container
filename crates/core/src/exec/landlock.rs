@@ -38,7 +38,7 @@ use crate::landlock::{
     LandlockRuleError, LandlockRuleset, LandlockSupport, build_path_rules_with_user_tmpfs,
     detect_landlock_abi,
 };
-use crate::landlock::{MountCheck, handled_for_abi};
+use crate::landlock::{MountCheck, MountedTargets, handled_for_abi};
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
 use crate::oci_runtime::{BindMountSet, OciConfig, OciMount, RootfsDir};
 use crate::sys;
@@ -65,14 +65,24 @@ pub(super) fn apply_landlock_stage_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
     root: std::os::fd::BorrowedFd<'_>,
+    fdinfo_dir: std::os::fd::BorrowedFd<'_>,
+    mounts: Option<&MountedTargets>,
 ) -> Result<LandlockApplyReport, ExecError> {
-    // launch 時のマウントの識別子の記録は `state.json` に無い（未実装範囲）ため `NotRecorded`。暗黙のマウントの
-    // fs 種別・独立性の確認は従来どおり行い、弱めない（#2071。後続: 記録の永続化と照合）。
+    // `state.json` に残した launch 時の識別子（`mounts`）と、適用時に開いた fd の識別子を照合する（SEC-1・SEC-4・
+    // #3201）。`mnt_id` は `setns` の後に `thread-self` が解決できないため、保持した自プロセスの procfs
+    // （`fdinfo_dir`）の `fdinfo/N` から読む。暗黙のマウントの fs 種別・独立性の確認も従来どおり行う（#2071）。
+    // `mounts` が `None` なのは結合試験用の観測関数（launch の記録を持たない `setns` なしの経路）だけで、
+    // 本番の入口（`reapply_restrictions` の `Complete`）は `None` を適用の前に拒否する。
+    let check = match mounts {
+        Some(m) => MountCheck::Recorded(m),
+        None => MountCheck::NotRecorded,
+    };
     crate::landlock::apply_landlock_ruleset_with(
         ruleset,
         threads,
         Some(root),
-        MountCheck::NotRecorded,
+        Some(fdinfo_dir),
+        check,
     )
     .map_err(from_landlock_apply)
 }
@@ -427,17 +437,21 @@ fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
 ///
 /// 配送の状況（REPAIR-3）: launch 経路は配線済み（#2130）。適用は pivot 後の PID 1 で行われ、失敗した段が
 /// `run_child_then` で状態 pipe に `E landlock ...` を書き、親（`launch_intermediate`）が listener の EOF の後に
-/// 読んで層 `mount` へ 1 件記録する。**未実装**: 稼働中コンテナへの exec の再適用（`NotRecorded`）は
-/// Mount 由来のルールの識別子を照合しないため、`LandlockMountIdentityMismatch`・`LandlockMountNotRoot` は届かない
-/// （`LandlockMountNotReadOnly` は worker の経路で届く。#1917）。識別子の永続化と exec での照合は後続 issue。
+/// 読んで層 `mount` へ 1 件記録する。稼働中コンテナへの exec の再適用も、`state.json` に残した識別子で照合し
+/// （`MountCheck::Recorded`。#3201）、3 理由（`LandlockMountIdentityMismatch`・`LandlockMountNotRoot`・
+/// `LandlockMountNotReadOnly`）が worker の結果行で親へ届く。
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
-    // 読み取り専用属性の照合の拒否は再適用（worker の経路。`NotRecorded`）でも生じるため、`EXEC_WORKER_REASONS` との
-    // ソース照合（`violation_scan`）が字面で拾えるよう明示的に書く（CORE-5・SEC-4・#1917）。
+    // 3 理由は launch 経路にも exec の再適用（worker の経路）にも生じるため、`EXEC_WORKER_REASONS` とのソース照合
+    // （`violation_scan`）が字面で拾えるよう明示的に書く（CORE-5・SEC-4・#1917・#3201）。
     let reason = match &e.kind {
+        LandlockApplyErrorKind::MountIdentityMismatch { .. } => {
+            Some(ViolationReason::LandlockMountIdentityMismatch)
+        }
+        LandlockApplyErrorKind::MountNotRoot { .. } => Some(ViolationReason::LandlockMountNotRoot),
         LandlockApplyErrorKind::MountNotReadOnly { .. } => {
             Some(ViolationReason::LandlockMountNotReadOnly)
         }
-        kind => super::violation::landlock_apply_violation(kind),
+        _ => None,
     };
     if let Some(reason) = reason {
         let mut err = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
@@ -523,8 +537,13 @@ pub(super) mod testing {
         ruleset: &LandlockRuleset,
         _threads: &mut ThreadCountSource,
         _root: std::os::fd::BorrowedFd<'_>,
+        _fdinfo_dir: std::os::fd::BorrowedFd<'_>,
+        mounts: Option<&crate::landlock::MountedTargets>,
     ) -> Result<LandlockApplyReport, ExecError> {
-        apply_landlock_stage(ruleset, MountCheck::NotRecorded)
+        apply_landlock_stage(
+            ruleset,
+            mounts.map_or(MountCheck::NotRecorded, MountCheck::Recorded),
+        )
     }
 }
 

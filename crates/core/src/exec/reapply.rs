@@ -173,12 +173,13 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - Mount 由来のルールの対象がマウントのルートであることのマウント ID での照合（#2071）。launch は
-//!   `MountCheck::Recorded` で行うが、再適用は `MountCheck::NotRecorded`（暗黙のマウントの fs 種別・独立性の確認だけ）。
-//!   `LaunchIsolationRecord` がマウントの識別子を持たず、本番 launcher が記録を `state.json` へ書く結線も無く、マウント ID は
-//!   restart で変わるため。必要なもの: 記録へ識別子を足す（トレイト契約 12 の拡張）・子が pivot 前段の識別子を状態 pipe で
-//!   親へ返す・親が記録し restart で更新する・`TargetBinding.proc_dir` から `fdinfo/N` を読む（`setns` の後は
-//!   `/proc/thread-self` が使えないため）
+//! - Mount 由来のルールの対象がマウントのルートであることのマウント ID での照合は、#3201 で実装済み: 再適用は
+//!   `state.json` に残した launch 時の識別子（`mnt_id`・`st_dev`・`st_ino`・`read_only`）を `MountCheck::Recorded` で照合し、
+//!   `mnt_id` は `setns` の後に `/proc/thread-self` が使えないため `TargetBinding.proc_dir` の `fdinfo/N` から読む。
+//!   識別子の無い旧記録（Mount 由来のルールがあるもの）は、`setns` と補助グループの消去より前に `FailedPrecondition`
+//!   （段 `Landlock`）で拒否する（作り直しの手順は `docs/setup/exec-mount-identity-recovery.md`）。
+//!   restart の再 launch は Running(新 pid) の更新で識別子を置き換える（契約 12）が、本番 launcher の再 launch は #2043 まで
+//!   拒否される。記録を持たない偽の launcher が前の記録を引き継ぐと識別子が古くなり、照合で拒否される（fail-closed）
 //! - 同じ user namespace（`Shared`。rootful 相当で本番では到達しない）での root 以外の `process.user` と
 //!   `additionalGids`（`Unimplemented` で拒否。`RootfulHostRoot` の判断待ち。#2241）。別の user namespace
 //!   （既定の rootless）では写像と照合して適用する（#2770）
@@ -190,7 +191,6 @@
 //! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
 //!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
 //!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す
-//! - ルールの対象ごとの `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る。#1468）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
@@ -213,8 +213,8 @@ use super::{
     ThreadCountSource, ViolationReason, no_new_privs,
 };
 use crate::capabilities::ContainerCapabilities;
-use crate::landlock::LandlockRuleset;
-use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
+use crate::landlock::{LandlockRuleset, MountedTargets};
+use crate::launch_isolation::{LaunchIsolationRecord, RecordedMountIdentities, RootIdentity};
 use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::sys;
@@ -274,6 +274,10 @@ pub struct ExecRestrictions {
     /// launch と同じにする。SEC-1・CRI-2・#2666）。記録が無い旧記録・観測用の経路は OCI 既定集合
     /// （導入前の launch は必ず OCI 既定集合で起動したため、これが旧記録の正しい値）。
     capabilities: ContainerCapabilities,
+    /// launch 時に記録した Mount 由来のルールの識別子（`state.json`。SEC-1・SEC-4・#3201）。Landlock の適用時に
+    /// 開いた fd の識別子と照合する。`prepare_exec_restrictions`（本番の入口）が必ず `Some` にし、`None` は
+    /// 識別子を持たない結合試験用の観測関数だけ（`Complete` の再適用は `None` を何も適用する前に拒否する）。
+    mounts: Option<MountedTargets>,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -649,7 +653,10 @@ pub fn prepare_exec_restrictions(
         UserNsRelation::Distinct { .. } => Some(target.user_id_maps()?),
     };
     let user = exec_user_from_config(config, &relation, maps.as_ref())?;
+    // 旧記録（識別子なし）の拒否は、不可逆な補助グループの消去より前に行う（#3201）。
+    let mounts = recorded_mounts_for_exec(launch)?;
     let mut restrictions = prepare_with_launch(launch, launch.root(), rlimits, binding)?;
+    restrictions.mounts = Some(mounts);
     restrictions.ids = user.ids;
     restrictions.groups = user.groups;
     // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
@@ -1053,6 +1060,31 @@ fn prepare_with_launch(
         capabilities: launch
             .capabilities()
             .unwrap_or_else(ContainerCapabilities::oci_default),
+        mounts: None,
+    })
+}
+
+/// launch 時のマウントの識別子を記録から取り出す（本番の入口 [`prepare_exec_restrictions`] 専用。SEC-1・SEC-4・#3201）。
+///
+/// Mount 由来のルールがあるのに識別子が無い旧記録（この版より前に作ったコンテナ）は、重ねられたマウントを検出できない
+/// ため `FailedPrecondition`（段 `Landlock`）で拒否する（`NotRecorded` へ縮退して続けない。fail-closed）。違反の試行では
+/// ないので監査には記録しない。作り直しの手順は `docs/setup/exec-mount-identity-recovery.md`。
+/// Mount 由来のルールが無い記録（rootfs だけ）は空の記録で通す。
+/// `setns` と補助グループの消去（不可逆）より前に呼ぶ。
+fn recorded_mounts_for_exec(launch: &LaunchIsolationRecord) -> Result<MountedTargets, ExecError> {
+    if launch.landlock().mount_identities() == RecordedMountIdentities::Absent {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Landlock,
+            "launch isolation record has no mount identities; recreate the container",
+        ));
+    }
+    MountedTargets::from_recorded(launch.landlock()).map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Landlock,
+            "too many recorded mount identities",
+        )
     })
 }
 
@@ -1175,6 +1207,7 @@ fn reapply_inner(
         seal_policy,
         seccomp_listener,
         capabilities: allowed_capabilities,
+        mounts,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -1186,6 +1219,14 @@ fn reapply_inner(
     // 本番は rlimit の空集合を、何も適用する前に拒否する（未適用の一覧へ載らないまま省かれる経路を塞ぐ。#1460）。
     if mode == ReapplyMode::Complete {
         require_rlimits(&rlimits)?;
+    }
+    // 本番は launch 時の識別子の無い再適用を、何も適用する前に拒否する（照合を省く経路を残さない。SEC-1・SEC-4・#3201）。
+    if mode == ReapplyMode::Complete && mounts.is_none() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Landlock,
+            "exec restrictions have no recorded mount identities; refusing to reapply",
+        ));
     }
     verify_target_binding(&binding)?;
     let root = open_verified_root(expected_root)?;
@@ -1237,8 +1278,14 @@ fn reapply_inner(
             .map(|report| report.supplementary_groups),
     );
     no_new_privs::apply_no_new_privs()?;
-    let landlock = apply_landlock_stage_with(&landlock, &mut threads, root.as_fd())
-        .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
+    let landlock = apply_landlock_stage_with(
+        &landlock,
+        &mut threads,
+        root.as_fd(),
+        binding.proc_dir.as_fd(),
+        mounts.as_ref(),
+    )
+    .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
     let seccomp = match seccomp_listener {
         Some(sender) => {
             let (sender, ack_timeout) = sender.into_parts();
@@ -1482,6 +1529,7 @@ mod tests {
             seal_policy: SealPolicy::unrestricted(),
             seccomp_listener: Some(test_listener_sender()),
             capabilities: ContainerCapabilities::oci_default(),
+            mounts: Some(MountedTargets::new()),
         }
     }
 
@@ -2694,6 +2742,45 @@ mod tests {
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":{readonly}}},"mounts":{mounts}}}"#
         );
         crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
+    }
+
+    /// SEC-1・SEC-4・#3201: Mount 由来のルールがあるのに識別子の無い旧記録は `FailedPrecondition`(段 `Landlock`)で
+    /// 拒否し、Mount 由来のルールが無い記録(rootfs だけ)は通す。
+    #[test]
+    fn sec1_3201_old_record_without_mount_identities_is_rejected() {
+        use crate::launch_isolation::{RecordedLandlock, RecordedRule, RecordedTarget};
+        use crate::oci_runtime::MountDestination;
+        let old = LaunchIsolationRecord::from_parts(
+            RootIdentity::new(1, 2),
+            RecordedLandlock::new(
+                0xFFFF,
+                vec![
+                    RecordedRule::new(RecordedTarget::Root, 0x7),
+                    RecordedRule::new(
+                        RecordedTarget::Mount {
+                            destination: MountDestination::parse("/data").expect("destination"),
+                            index: 0,
+                        },
+                        0x7,
+                    ),
+                ],
+            )
+            .expect("landlock"),
+        );
+        let e = recorded_mounts_for_exec(&old).expect_err("must be rejected");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Landlock);
+        assert_eq!(
+            e.message,
+            "launch isolation record has no mount identities; recreate the container"
+        );
+
+        let root_only = LaunchIsolationRecord::from_parts(
+            RootIdentity::new(1, 2),
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .expect("landlock"),
+        );
+        assert!(recorded_mounts_for_exec(&root_only).is_ok());
     }
 
     /// SUP-6・TASK-163.3・CORE-5・#1468: 書き込み制限が祖先ルールで無効になる構成は、launch の記録の作成が

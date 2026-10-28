@@ -1325,6 +1325,28 @@ jobs:
             --log "${log}" --select '^netns_holder_userns: holder joined' \
             --forbid 'netns_holder_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
+      # netns_holder_launch_userns（`crates/supervisor/tests/netns_holder_launch_userns.rs`。NET-9・CORE-1・CORE-6・SUP-12・SEC-5・
+      # REPAIR-5・#3198）: supervisor の本番の spawn（`netns_holder::spawn_netns_holder`）で起動した holder が非特権の
+      # user + network namespace へ参加し、fd・環境・capability が最小で、supervisor のメモリを継承せず（陽性対照つき）、
+      # stop・drop・中間 supervisor の SIGKILL で回収されることを照合する実機前提テスト（harness = false）。
+      # 上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
+      - name: netns_holder_launch_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns --no-run
+
+      - name: netns_holder_launch_userns の実行（実機前提テスト・--ignored。NET-9・CORE-1・#3198）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/netns_holder_launch_userns.log"
+          cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name netns_holder_launch_userns --src crates/supervisor/tests/netns_holder_launch_userns.rs \
+            --log "${log}" --select '^netns_holder_launch_userns: holder spawned' \
+            --forbid 'netns_holder_launch_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
+
       # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
       # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、
       # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する

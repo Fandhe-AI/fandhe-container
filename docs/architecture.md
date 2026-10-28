@@ -295,6 +295,7 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 - 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路。SEC-4・REPAIR-3）: [audit-non-linux.md](design/audit-non-linux.md)（#2430。判断シートあり・オーナー承認待ち）
 - 電源断・カーネルクラッシュ後の媒体永続化の検証方式（IO-2・IO-3）: [io-power-loss-verification.md](design/io-power-loss-verification.md)（#1965。オーナー承認待ち。実機前提の試験 `power_loss` は用意済みで実行は人間）
 - ランタイム自身の封印複製（方式 B。CORE-5・CORE-7〜9・REPAIR-3）: [runtime-self-sealed-copy.md](design/runtime-self-sealed-copy.md)（#2686。オーナー承認待ち。決まるまで現行の A・B'・C を保つ）
+- fdinfo の `mnt_id` 解析（core・net・gpu の 3 か所）の置き場所（GPU-2・SEC-1・REPAIR-1）: [fdinfo-mnt-id-parsing.md](design/fdinfo-mnt-id-parsing.md)（#3140。共有せず共有 fixture の照合試験で一致を担保する案 C を採用。新しい辺は無い。共有下位 crate の案 B はオーナー承認待ち）
 
 ## 見直し
 

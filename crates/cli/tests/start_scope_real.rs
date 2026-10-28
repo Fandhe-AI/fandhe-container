@@ -20,7 +20,7 @@
 //! （`FANDHE_CONTAINER_TEST_SYSTEMD_RUN`）は使わず、本番の解決経路（`/usr/bin/systemd-run` 等）を通す。
 //!
 //! # 実機前提テストとしての分離
-//! GitHub ホステッド runner と `make docker-ci` には user マネージャが無いため、`-- --ignored` 指定時のみ実行する
+//! `make docker-ci` には user マネージャが無いため、`-- --ignored` 指定時のみ実行する
 //! （ci.md「実機前提テスト」。既定集合の試験を移したものではない。既定集合の包み込みの検証は偽の systemd-run を使う
 //! `binary_entry.rs` が行う）。実行された場合は、前提が欠けていても失敗として扱い、検証せずに成功する分岐は持たない。
 //!
@@ -30,7 +30,9 @@
 //! ```
 //!
 //! 成功時の最終行: `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted`。
-//! 実行と結果の記録は人間担当（#2062）。Agent はホストに transient scope と cgroup を作るため実行しない。Linux 限定。
+//! CI では platform-ci の ubuntu が前提確認ステップの後に、委譲スコープで包まずに直接実行する（シナリオ B の感度は
+//! 試験プロセスが非委譲 cgroup にいることに依存するため。#3105）。Agent は手元のホストに transient scope と cgroup を
+//! 作るため実行しない。実機の OS・カーネル版での記録は #2062。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

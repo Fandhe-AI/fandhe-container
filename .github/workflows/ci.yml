@@ -1007,6 +1007,14 @@ jobs:
         timeout-minutes: 5
         run: make lib-selftest
 
+      # mac_small_files.sh の自己テストを macOS で回す（#3104・MAC-3・REPAIR-12）。macOS 標準の /bin/bash 3.2 でも
+      # 全ケースを回すのが目的（ubuntu は bench-regression で実行済み。Windows は macOS の Docker Desktop 向けの
+      # 計測で対象外）。スタブの docker と一時ディレクトリだけを使う。既存ジョブのステップ（check-run 件数は不変）
+      - name: mac-small-files 自己テスト（/bin/bash 3.2 を含む。#3104・MAC-3・REPAIR-12。macos）
+        if: env.HANG_PROBE != 'true' && runner.os == 'macOS'
+        timeout-minutes: 10
+        run: make mac-small-files-selftest
+
       # plugin 起動対象の構築箇所の判定スクリプトの自己テスト（#1857・REPAIR-12）。fixture の一時ツリーだけを使い、
       # BSD と Windows のシェルでのツール差（awk・find・grep）を確かめるため 3 OS で回す。
       # 既存ジョブのステップ（check-run 件数は不変）
@@ -1494,7 +1502,8 @@ jobs:
 
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
-      # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
+      # start_stop_delete_real（cli）と、start_scope_real・delete_cgroup_real・start_recover_real（cli・#3105。下の専用ステップ）
+      # （CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
       # private ソケットは前提確認ステップで fail-closed にする）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
       # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
@@ -1995,6 +2004,83 @@ jobs:
             --subst-re scope_present='(true|false)' --min 7 \
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
+      # start_scope_real・delete_cgroup_real・start_recover_real（`crates/cli/tests/`。CORE-2・CORE-3・CORE-4・CORE-6・SUP-1・CLI-1・
+      # SEC-1・OCI-6・REPAIR-7・#2081・#2061・#2011・#3105）: 委譲 cgroup の CLI 実機前提テスト。前提（非 root・user manager の
+      # private ソケット・cgroup v2・Landlock ABI 6 以上）は上の前提確認ステップが fail-closed で確かめる。root の分岐は無い
+      # （3 本とも root を拒否する）。新しい check-run・sudo・permissions は追加しない。
+      # - start_scope_real は委譲スコープで**包まない**: シナリオ A は CLI が自分で `systemd-run --user --scope` を呼ぶ経路を通し、
+      #   シナリオ B（試験の感度）は試験プロセスが非委譲 cgroup にいて、同居した代役の detect / prepare が拒否されることを期待する。
+      #   包むと B の確認が逆になるため、「直す」つもりで包まないこと。
+      # - delete_cgroup_real・start_recover_real は委譲スコープの中で直接実行する（自分の cgroup = 検出する委譲 cgroup）。
+      # - start_recover_real は CLI と supervisor を試験本体が専用の bin/ へ複製し、launcher が無いことを確かめる
+      #   （target/debug の launcher が隣にあると rootful とみなされるため。CI のファイル削除では回避しない）。
+      - name: 委譲 cgroup の CLI 実機前提テスト 3 本のビルド（バイナリの特定。実行の時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/cli-cgroup-real-build.json"
+          cargo test -p fandhe-container-cli \
+            --test start_scope_real --test delete_cgroup_real --test start_recover_real \
+            --no-run --message-format=json > "${json}"
+          for pair in start_scope_real:SCR_BIN delete_cgroup_real:DCR_BIN start_recover_real:SRR_BIN; do
+            name="${pair%%:*}"
+            var="${pair##*:}"
+            sel="select(.profile.test == true and .target.name == \"${name}\") | .executable"
+            bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+            if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+              echo "::error::${name} test binary not uniquely identified" >&2
+              exit 1
+            fi
+            echo "${var}=${bins}" >> "$GITHUB_ENV"
+          done
+
+      - name: start_scope_real の実行（実機前提テスト・--ignored・包まない。CORE-3・CORE-4・SUP-1・CLI-1・#2081・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/start_scope_real.log"
+          USER="$(id -un)" "${SCR_BIN}" --ignored 2>&1 | tee "${log}"
+          # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_scope_real: FAILED`
+          scripts/check-success-lines.sh --name start_scope_real \
+            --src crates/cli/tests/start_scope_real.rs \
+            --log "${log}" --select '^start_scope_real: supervisor ran alone' \
+            --forbid 'start_scope_real: skipped' --forbid 'start_scope_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' \
+            --summary
+
+      - name: delete_cgroup_real の実行（実機前提テスト・--ignored・委譲スコープ。OCI-6・CORE-3・SEC-1・#2061・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/delete_cgroup_real.log"
+          USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${DCR_BIN}" --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name delete_cgroup_real \
+            --src crates/cli/tests/delete_cgroup_real.rs \
+            --log "${log}" --select '^delete_cgroup_real: cli delete removed' \
+            --forbid 'delete_cgroup_real: skipped' --forbid 'delete_cgroup_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'delete_cgroup_real: cleanup incomplete' \
+            --summary
+
+      - name: start_recover_real の実行（実機前提テスト・--ignored・委譲スコープ。CORE-2・SEC-1・OCI-6・#2011・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/start_recover_real.log"
+          USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${SRR_BIN}" --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name start_recover_real \
+            --src crates/cli/tests/start_recover_real.rs \
+            --log "${log}" --select '^start_recover_real: a second cli start' \
+            --forbid 'start_recover_real: skipped' --forbid 'start_recover_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'start_recover_real: cleanup failed' \
+            --summary
 
       # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
       # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、

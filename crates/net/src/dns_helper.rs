@@ -1162,7 +1162,7 @@ fn kill_and_reap(child: &mut Child, timeout: Duration) -> bool {
 
 /// kill して期限内に回収し、できなければ回収権をバックグラウンドの回収スレッドへ移す（ゾンビを残さない）。
 /// 期限内に回収できたら true。kill 済みのため、回収スレッドの `wait` は子の終了後に必ず戻る。
-fn kill_reap_or_detach(mut child: Child, timeout: Duration) -> bool {
+pub(crate) fn kill_reap_or_detach(mut child: Child, timeout: Duration) -> bool {
     if kill_and_reap(&mut child, timeout) {
         return true;
     }

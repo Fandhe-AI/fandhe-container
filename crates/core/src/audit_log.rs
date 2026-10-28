@@ -55,11 +55,24 @@
 //! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。landlock への配線は未実装。plugin_trust は
 //! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
 //! 拒否した段は #3121 で [`AuditRecord::stage`] として追加済み（`IsolationStage` と同じ固定語彙の [`AuditStage`]）。
-//! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）だけが
-//! 載せ、理由コードだけを持つ公開ヘルパ（supervisor の exec の親が使う `record_*_rejection`）と他の層は載せない
-//! （キー自体を出さない）。制御チャネルの中継は枠が段を運ばない（REPAIR-3）。
+//! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）と、
+//! supervisor の exec の親の entrypoint の記録（`exec::record_entrypoint_rejection_at`。worker の結果行で届いた
+//! `ExecChildStep` を `ExecChildStep::stage` で写す。届かなければ載せない。#3209）が載せる。他の層は載せない
+//! （キー自体を出さない）。
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
+//!
+//! # 段を載せない記録点と理由（未実装。#3209・REPAIR-3）
+//!
+//! - **制御チャネルの中継**（`ControlAuditRelay`）: 枠が段を運ばず、段つきの記録を通すと段は落ちる（拒否せず記録は
+//!   残す。試験で固定）。現行の配線では段つきの記録（単一スレッドの launch と pre-pivot）は `FileAuditSink` へ直接
+//!   書かれ中継を通らず、exec の親も中継ではなく `FileAuditSink` を使うため、段を運ぶ必要が生じていない。拡張が
+//!   要るのは、複数スレッドの文脈（例: supervisor 内の healthcheck。#2441）から中継経由で段つきの層を記録する
+//!   経路を足すとき。そのときは段だけでなく Entrypoint・ExecTarget などの層ごと運べるようにする
+//! - **`exec::record_exec_worker_rejection`**（worker の `err` 行）: 親の手元に段は無く、`TraitError` の自由文の
+//!   中にしか無い。理由コードから段を引く表は `from_violation_at` が上書きする段（例: pin の `path_missing` は既定で
+//!   `MountProc` だが実際は Landlock の段）と食い違い、誤った段を記録する。自由文の解析も採らない（REPAIR-2）。
+//!   正しく載せるには worker の `err` 行に段のトークンの欄を足す（worker プロトコルの変更）必要がある
 
 #[cfg(target_os = "linux")]
 mod control_relay;
@@ -705,7 +718,8 @@ impl AuditRecord {
     /// 経路検査の拒否は汎用の理由トークンで記録されるため、どの段（readonly_paths か masked_paths か等）
     /// の拒否かは `ExecError::stage` にしか無かった。段を知る呼び出し側（`exec` の記録点）だけがこれで足す。
     /// 段を持たない記録ではワイヤーにキー自体を出さず、既存の行は変わらない。
-    /// 制御チャネルの中継（`ControlAuditRelay`）は枠が段を運ばないので、通すと段は落ちる（REPAIR-3）。
+    /// 制御チャネルの中継（`ControlAuditRelay`）は枠が段を運ばないので、通すと段は落ちる（REPAIR-3。試験で固定、
+    /// 理由はモジュール doc の「段を載せない記録点と理由」。#3209）。
     #[must_use]
     pub(crate) fn with_stage(mut self, stage: AuditStage) -> Self {
         self.stage = Some(stage);

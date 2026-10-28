@@ -39,9 +39,9 @@
 //!   （soft 256 / hard 512。継承 hard が低ければそれ以下）と CORE（0 / 0）を子へ適用することを、Landlock スロットのフックが
 //!   記録した `/proc/self/limits` との完全一致で照合する。exec は `LaunchReady` 不在で `Exited(126)`・`PERMISSION_DENIED`
 //! - シナリオ `rlimit-fail`（同上）: `fs.nr_open` を超える NOFILE の hard 指定は root でも rootless でも `EPERM` となり、
-//!   `Exited(125)`・stderr に `at Rlimits` と `PERMISSION_DENIED`、後段のフックが実行されないことを照合する
+//!   `Exited(125)`・stderr に `at rlimits` と `PERMISSION_DENIED`、後段のフックが実行されないことを照合する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
-//!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
+//!   （setup 失敗）、stderr に失敗した段（`at landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
 //! - シナリオ `landlock-apply-ro` / `landlock-apply-rw` / `landlock-fail`（#184・TASK-39.4・CORE-5。
 //!   `with_landlock` + `spawn_container_probe`）: 実カーネルの Landlock を fork した子で適用する。
@@ -62,7 +62,7 @@
 //!   非 root は `Rootless`（単一 ID 写像）で起動する
 //! - シナリオ `landlock-missing`（#2012・CORE-6・REPAIR-12。`landlock-exec` と同じ構成で不在のエントリポイントを指す）:
 //!   `LaunchReady` がそろった経路では、不在のエントリポイントが `Exited(127)`（`EXIT_EXEC_NOT_FOUND`）・stderr の
-//!   `NOT_FOUND at Exec` になる。`missing`（126）との対で、fail-closed が不在の判定より先に効くことも示す
+//!   `NOT_FOUND at exec` になる。`missing`（126）との対で、fail-closed が不在の判定より先に効くことも示す
 //!   `landlock-*` 系は実カーネルの Landlock を使うため ABI 6 以上（Linux 6.12 以上）が必要
 //!
 //! # 実機前提テストとしての分離
@@ -151,9 +151,9 @@ mod linux {
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
         ("stages-order", "PERMISSION_DENIED"),
-        ("stage-fail", "at Landlock"),
+        ("stage-fail", "at landlock"),
         ("rlimits-apply", "PERMISSION_DENIED"),
-        ("rlimit-fail", "at Rlimits"),
+        ("rlimit-fail", "at rlimits"),
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
@@ -370,7 +370,7 @@ mod linux {
             if name == "landlock-missing" {
                 // 別の段の NOT_FOUND と取り違えないよう、exec の段であることまで照合する。
                 assert!(
-                    stderr.contains("at Exec"),
+                    stderr.contains("at exec"),
                     "the NOT_FOUND of scenario {name} must come from the Exec stage; got:\n{stderr}"
                 );
             }

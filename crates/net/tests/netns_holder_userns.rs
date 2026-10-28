@@ -43,7 +43,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use super::reap;
     use std::fs::File;
     use std::io::Read as _;
     use std::os::fd::OwnedFd;
@@ -100,8 +105,7 @@ mod linux {
                 ));
             }
             if started.elapsed() > limit() {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap::reap(&mut child, limit())?;
                 return Err("target namespaces were not created in time".into());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -191,8 +195,7 @@ mod linux {
                 return Ok((st.code(), started.elapsed(), text));
             }
             if started.elapsed() > within {
-                let _ = h.child.kill();
-                let _ = h.child.wait();
+                reap::reap(&mut h.child, limit())?;
                 return Err(format!("holder did not exit within {within:?}"));
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -279,8 +282,8 @@ mod linux {
             }
         };
         let result = scenario(target.id());
-        let _ = target.kill();
-        let _ = target.wait();
+        let reaped = reap::reap(&mut target, limit());
+        let result = result.and(reaped);
         match result {
             Ok(()) => {
                 println!("{OK_LINE}");

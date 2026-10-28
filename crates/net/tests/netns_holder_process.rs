@@ -28,7 +28,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use super::reap;
     use std::fs::File;
     use std::io::Read as _;
     use std::os::fd::{AsFd as _, OwnedFd};
@@ -85,7 +90,7 @@ mod linux {
                 break st;
             }
             if started.elapsed() > within {
-                reap(&mut child);
+                reap_or_panic(&mut child);
                 panic!("holder did not exit within {within:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -93,6 +98,13 @@ mod linux {
         let elapsed = started.elapsed();
         let text = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
         (status, text, elapsed)
+    }
+
+    /// 共有の `reap` を `limit()` の期限で呼び、回収できなければ試験を失敗させる。
+    fn reap_or_panic(child: &mut Child) {
+        if let Err(e) = reap::reap(child, limit()) {
+            panic!("{e}");
+        }
     }
 
     fn stderr_line(code: &str, message: &str) -> String {
@@ -278,11 +290,11 @@ mod linux {
         let ready = match rx.recv_timeout(limit()) {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                reap(&mut child);
+                reap_or_panic(&mut child);
                 panic!("reading the ready marker failed: {e}");
             }
             Err(_) => {
-                reap(&mut child);
+                reap_or_panic(&mut child);
                 panic!("ready marker was not received within {:?}", limit());
             }
         };
@@ -303,7 +315,7 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        reap(&mut child);
+        reap_or_panic(&mut child);
         drop(ch);
         assert_eq!(
             observed,
@@ -339,19 +351,7 @@ mod linux {
             "holder outlived its parent until its own deadline: {text:?}"
         );
         assert!(started.elapsed() < Duration::from_millis(1500));
-        reap(&mut mid);
-    }
-
-    /// 子を kill し、期限つきで回収する（kill 後も無期限の wait はしない。REPAIR-5）。
-    fn reap(child: &mut Child) {
-        let _ = child.kill();
-        let until = Instant::now() + limit();
-        while Instant::now() < until {
-            if !matches!(child.try_wait(), Ok(None)) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        reap_or_panic(&mut mid);
     }
 
     /// `--pdeath-mid`: socketpair を作って holder を起動し、端を別プロセス（sleep）に持たせて即座に終了する。

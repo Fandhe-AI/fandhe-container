@@ -7,10 +7,13 @@
 //! 変換（`port_forward`。OS 非依存の純粋関数。#1937）を持つ。起動・準備完了待ち（#1938）は兄弟の
 //! 子モジュールとして後続が足す。
 //!
+//! FCOPT1 への記録の本文と起動時の再検証は [`record`]（#3199）。
+//!
 //! 呼び出し元は cli（作成時の検証と FCOPT1 への記録。12.14）と supervisor（起動時の再検証・#1940）。
 
 pub mod binary;
 pub mod port_forward;
+pub mod record;
 pub mod version;
 
 pub use port_forward::{

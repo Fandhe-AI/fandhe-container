@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::Annotations;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+use fandhe_container_net::pasta::record::PastaRecord;
 use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
 use fandhe_container_supervisor::container_options::env::{EnvFile, EnvSet, EnvVar};
 use fandhe_container_supervisor::container_options::{Label, Labels};
@@ -32,8 +33,12 @@ use fandhe_container_supervisor::container_options::{Label, Labels};
 use super::args::CreateOptionArgs;
 
 /// 起動オプション文書を作る(空なら `is_empty()`。その場合 CLI は文書を書かない)。
+///
+/// `pasta` は作成時に検証した pasta の記録(NET-9・#3199)。あるときだけ `--network`・`--add-host`・`--dns` も文書へ
+/// 載せる(`pasta` は `network` がユーザー定義名のときだけ置けるため)。`pasta` が無いときの挙動は従来どおり。
 pub(super) fn document_of(
     options: &CreateOptionArgs,
+    pasta: Option<&PastaRecord>,
 ) -> Result<ContainerOptionsDocument, TraitError> {
     let vars = options
         .env
@@ -51,6 +56,21 @@ pub(super) fn document_of(
     )?
     .with_cap_drop(options.cap_drop.clone())
     .and_then(|doc| doc.with_read_only(options.read_only))
+    .and_then(|doc| match pasta {
+        None => Ok(doc),
+        Some(record) => doc
+            .with_network(
+                options.network.network.clone(),
+                options.network.add_hosts.clone(),
+                options.network.dns.clone(),
+            )?
+            .with_pasta(Some(record.to_body())),
+    })
+    // `network` を書く pasta の段の後ろに `publish` を並べる(`with_publish` はユーザー定義名の `network` を要する)。
+    // 継ぎ目(REPAIR-3・NET-9・#3200): `publish` はユーザー定義名の `network` と組で書く。`with_network` を文書へ書く処理は
+    // #1873 が足し、その後ろに並べる。現状は `validate_network_options` が `-p` を `UNIMPLEMENTED` で止めるため、
+    // 空でない `publish` はここへ届かない(届いても `network` が無いので文書にできず `InvalidArgument`)。
+    .and_then(|doc| doc.with_publish(options.network.publish.clone()))
 }
 
 /// `--env-file` を読む待ちの上限(REPAIR-5)。
@@ -124,8 +144,21 @@ mod tests {
     /// SUP-12・CLI-1: 指定なしは空の文書・空の label。
     #[test]
     fn sup12_create_options_empty() {
-        assert!(document_of(&args()).expect("doc").is_empty());
+        assert!(document_of(&args(), None).expect("doc").is_empty());
         assert_eq!(labels_of(&args()).expect("labels"), Annotations::default());
+    }
+
+    /// NET-9(#3200): `network` の無い `publish` は文書にできない(継ぎ目の固定)。
+    #[test]
+    fn net9_document_of_rejects_publish_without_network() {
+        let mut a = args();
+        a.network.publish.push("8080:80".into());
+        let e = document_of(&a, None).expect_err("publish alone");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "publish records require a user-defined network"
+        );
     }
 
     /// SUP-12・CLI-1: `--env-file` は `-e` より優先順位が低く、統合後の `KEY=VALUE` が文書に入る。
@@ -140,7 +173,7 @@ mod tests {
         a.env.push("B=flag".into());
         a.env.push("C=3".into());
         a.ulimits.push("nofile=1024:2048".into());
-        let doc = document_of(&a).expect("doc");
+        let doc = document_of(&a, None).expect("doc");
         assert_eq!(doc.env(), ["A=file", "B=flag", "C=3"]);
         assert_eq!(doc.ulimits(), ["nofile=1024:2048"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -151,9 +184,9 @@ mod tests {
     #[test]
     fn cli1_sup12_create_options_read_only() {
         let mut a = CreateOptionArgs::default();
-        assert!(document_of(&a).expect("doc").is_empty());
+        assert!(document_of(&a, None).expect("doc").is_empty());
         a.read_only = true;
-        let doc = document_of(&a).expect("doc");
+        let doc = document_of(&a, None).expect("doc");
         assert!(!doc.is_empty());
         assert!(doc.read_only());
     }
@@ -163,11 +196,11 @@ mod tests {
     fn cli1_create_options_cap_drop() {
         let mut a = args();
         a.cap_drop = vec!["ALL".into(), "chown".into()];
-        let doc = document_of(&a).expect("doc");
+        let doc = document_of(&a, None).expect("doc");
         assert_eq!(doc.cap_drop(), ["ALL", "chown"]);
         assert!(!doc.is_empty());
         a.cap_drop = vec!["CAP_BOGUS".into()];
-        let e = document_of(&a).expect_err("unknown");
+        let e = document_of(&a, None).expect_err("unknown");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "a cap-drop record is invalid");
     }
@@ -207,7 +240,7 @@ mod tests {
             ),
         ];
         for (a, message) in cases {
-            let e = document_of(&a).expect_err("rejected");
+            let e = document_of(&a, None).expect_err("rejected");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
             assert_eq!(e.message(), message);
         }
@@ -254,5 +287,38 @@ mod tests {
         let e = labels_of(&a).expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "the label key is reserved");
+    }
+
+    /// NET-9・SUP-12(#3199): pasta の記録があるときだけ network 系も文書へ載り、本文は記録のとおりになる。
+    #[test]
+    fn net9_sup12_document_of_carries_pasta_record() {
+        const BODY: &str =
+            "20260120 2049 131074 1234567 1760000000 123456789 -5 0 0 755\n/usr/bin/pasta";
+        let record = PastaRecord::parse_body(BODY).expect("record");
+        let a = CreateOptionArgs {
+            network: crate::commands::args::CreateNetworkArgs {
+                network: Some("web".into()),
+                add_hosts: vec![],
+                dns: vec![],
+                publish: vec![],
+            },
+            ..args()
+        };
+        let doc = document_of(&a, Some(&record)).expect("doc");
+        assert_eq!(doc.pasta(), Some(BODY));
+        assert_eq!(doc.network(), Some("web"));
+        // pasta が無ければ従来どおり network は文書に載らない。
+        let doc = document_of(&a, None).expect("doc");
+        assert!(doc.pasta().is_none() && doc.network().is_none());
+        // ユーザー定義名でなければ pasta は置けない(fail-closed)。
+        let none = CreateOptionArgs {
+            network: crate::commands::args::CreateNetworkArgs {
+                network: Some("none".into()),
+                ..Default::default()
+            },
+            ..args()
+        };
+        let e = document_of(&none, Some(&record)).expect_err("none");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 }

@@ -50,6 +50,8 @@
 //! - Linux・macOS: `fcntl(F_DUPFD_CLOEXEC, 3)`（`dup_cloexec_min3`。検証済みファイルの fd を 3 以上かつ close-on-exec で複製する）。
 //!   それ以外の unix は `try_clone`。`lifecycle/launch_target.rs` の `PluginLaunchTarget::from_verified_file` から呼ばれる
 //!   （PLUG-11・#1856）
+//! - Linux・macOS（試験専用 `#[cfg(test)]`）: `fcntl(F_GETFD / F_SETFD)`（`fd_cloexec`・`set_fd_cloexec`。`spawn_gate` の試験が
+//!   close-on-exec の有無を観測・操作する。#3139）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -2214,6 +2216,13 @@ mod dupfd_abi {
     pub(super) const F_DUPFD_CLOEXEC: i32 = 1030;
     #[cfg(target_os = "macos")]
     pub(super) const F_DUPFD_CLOEXEC: i32 = 67;
+    /// `F_GETFD` / `F_SETFD` / `FD_CLOEXEC`（Linux・macOS で同値。試験専用の `fd_cloexec` が使う。#3139）。
+    #[cfg(test)]
+    pub(super) const F_GETFD: i32 = 1;
+    #[cfg(test)]
+    pub(super) const F_SETFD: i32 = 2;
+    #[cfg(test)]
+    pub(super) const FD_CLOEXEC: i32 = 1;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int fcntl(int, int, ...)` と同じ型・幅。
@@ -2237,6 +2246,31 @@ pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
     }
     // SAFETY: `fd` は直前の fcntl が返した、他に所有者のいない有効な fd（非負を確認済み）。
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 試験専用: `fd` の `FD_CLOEXEC` が立っているかを返す（`fcntl(F_GETFD)`。`spawn_gate` の試験が使う。#3139）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn fd_cloexec(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` は借用中で有効な fd。F_GETFD は追加引数を取らず、成否は戻り値で確認する。
+    let flags = unsafe { dupfd_abi::fcntl(fd.as_raw_fd(), dupfd_abi::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & dupfd_abi::FD_CLOEXEC != 0)
+}
+
+/// 試験専用: `fd` の `FD_CLOEXEC` を `on` にする（`fcntl(F_SETFD)`。非原子の窓の再現に使う。#3139）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_fd_cloexec(fd: std::os::fd::BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = if on { dupfd_abi::FD_CLOEXEC } else { 0 };
+    // SAFETY: `fd` は借用中で有効な fd。F_SETFD は int 引数 1 つ（フラグ）を取り、成否は戻り値で確認する。
+    let rc = unsafe { dupfd_abi::fcntl(fd.as_raw_fd(), dupfd_abi::F_SETFD, flags) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Linux・macOS 以外の unix 向け。`File::try_clone` に縮退する（呼び出し側が 3 未満を拒否する）。
@@ -3799,6 +3833,9 @@ mod libc_abi {
     const _: () = {
         assert!(AT_SYMLINK_NOFOLLOW == libc::AT_SYMLINK_NOFOLLOW);
         assert!(dupfd_abi::F_DUPFD_CLOEXEC == libc::F_DUPFD_CLOEXEC);
+        assert!(dupfd_abi::F_GETFD == libc::F_GETFD);
+        assert!(dupfd_abi::F_SETFD == libc::F_SETFD);
+        assert!(dupfd_abi::FD_CLOEXEC == libc::FD_CLOEXEC);
     };
     // `killpg` は `link_name` が同名（`c_killpg` は Rust 側の名前だけ）。`ModeT` の幅は `mode_t` との
     // 型の一致で確かめる（Linux `u32`・macOS `u16`）。`fcntl` は両方とも可変長。
@@ -4299,7 +4336,8 @@ mod poll_two_tests {
             }
         );
         // 2 本目の書き込み端を閉じる（EOF = POLLHUP）と second も ready。
-        // 並行する別テストの fork から exec までの間は、子が複製した書き込み端を保持して EOF が遅れ得るため、
+        // 並行する別テストの fork から exec までの間は（macOS ではさらに fd の作成から close-on-exec の設定までの
+        // 窓でも。後者は `spawn_gate` の試験で扱う。#3139）、子が複製した書き込み端を保持して EOF が遅れ得るため、
         // 期限つきで待つ（本番も停止フラグと `poll` の期限で有限に止まる。REPAIR-5・#3003）。
         drop(w2);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

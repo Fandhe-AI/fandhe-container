@@ -112,7 +112,7 @@ pub fn remove_container_logs(
 
 /// [`remove_container_logs`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2446・SUP-7）。
 ///
-/// `guard` が `false` なら何も消さずに 0 件で成功する。CLI の `delete` は「同じ ID が再作成されていない」ことを
+/// `guard` が `false` なら何も消さずに 0 件で成功する（`RemovedLogs::guard_declined()` が真。#3143）。CLI の `delete` は「同じ ID が再作成されていない」ことを
 /// 返す。確認はロック保持中で、以後に同じ ID の sink は開けない（同じロックが要る）ため、削除待ちの間に再作成・
 /// 起動・終了した別インスタンスのログを消さない。
 pub fn remove_container_logs_guarded(

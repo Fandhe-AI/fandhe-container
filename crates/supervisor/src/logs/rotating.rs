@@ -545,7 +545,8 @@ impl RotatingFileSink {
             Err(e) => return (0, Err(e)),
         };
         // ロック保持中に確認する（削除待ちの間に同じ ID が再作成されていたら、新しいインスタンスのログを消さない）。
-        let (removed, log_result) = if guard() {
+        let guard_ok = guard();
+        let (removed, log_result) = if guard_ok {
             remove_log_files(&dir, &base)
         } else {
             (0, Ok(()))
@@ -558,7 +559,13 @@ impl RotatingFileSink {
         if lock_removed.is_err() {
             return (removed, Err(internal("log lock removal failed")));
         }
-        (removed, Ok(RemovedLogs { log_files: removed }))
+        (
+            removed,
+            Ok(RemovedLogs {
+                log_files: removed,
+                guard_declined: !guard_ok,
+            }),
+        )
     }
 
     /// これまでのローテーション回数（観測用。REPAIR-4）。open 時の退避は数えない。
@@ -1275,12 +1282,21 @@ fn collect_log_names(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RemovedLogs {
     log_files: u32,
+    guard_declined: bool,
 }
 
 impl RemovedLogs {
     /// 消した現在ログ + 世代ファイルの数（ロックファイルは含まない）。
     pub fn log_files(&self) -> u32 {
         self.log_files
+    }
+
+    /// guard が偽で何も消さずに成功した（同じ ID が再作成済みで、新しいインスタンスのログとして残した）とき `true`。
+    ///
+    /// ファイルが無くて 0 件だった成功とは区別される。呼び出し側は `CleanupOutcome::Superseded` へ写す
+    /// （SUP-7・REPAIR-4・#3143）。
+    pub fn guard_declined(&self) -> bool {
+        self.guard_declined
     }
 }
 

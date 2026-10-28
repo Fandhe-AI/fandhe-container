@@ -668,6 +668,8 @@ fn remove_supervisor_log(
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
         Arc::new(move || id_is_still_deleted(&guard_root, &guard_id)),
     ) {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
         Ok(_) => CleanupOutcome::Removed,
         Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
@@ -860,6 +862,8 @@ fn remove_container_log(
         CONTAINER_LOG_REMOVE_TIMEOUT,
         Arc::new(move || id_is_still_deleted(&guard_root, &guard_id)),
     ) {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
         Ok(_) => CleanupOutcome::Removed,
         Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
@@ -1751,7 +1755,7 @@ mod tests {
                 DeleteResponse::new(),
                 Duration::from_millis(50),
             );
-            assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.supervisor_log(), CleanupOutcome::Superseded);
             assert!(supervisor_log_names(&base).contains(&"s4.log".to_string()));
         }
 
@@ -1767,7 +1771,7 @@ mod tests {
             assert_eq!(resp.container_log(), CleanupOutcome::Removed);
         }
 
-        /// SUP-7・#2698: 同じ ID が再作成済み（guard が false）ならログは消さずに成功（0 件）で返す。
+        /// SUP-7・#2698・#3143: 同じ ID が再作成済み（guard が false）ならログは消さず `Superseded` で返す（`Removed` と報告しない）。
         #[test]
         fn sup7_delete_does_not_remove_recreated_instance_logs() {
             let base = TmpDir::new("recreated2");
@@ -1780,7 +1784,7 @@ mod tests {
                 DeleteResponse::new(),
                 Duration::from_millis(50),
             );
-            assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.container_log(), CleanupOutcome::Superseded);
             assert!(!log_names(&base).is_empty());
         }
 

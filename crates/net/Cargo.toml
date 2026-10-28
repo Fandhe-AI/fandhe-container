@@ -17,12 +17,15 @@ attach-fault-test-support = []
 # 試験専用: pasta のバイナリ検証で anchor より上の所有者・権限の検査を省く入口（`/tmp` が 1777 のため。NET-9・#1936）。
 # リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 pasta_binary が使う。依存は増えない。
 pasta-test-support = []
+# 試験専用: netns holder へ任意のバイト列と任意本数の fd を送る入口 `send_raw_for_test`（負の場面の試験用。NET-9・REPAIR-2・#3197）。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 netns_holder_process が使う。依存は増えない。
+netns-holder-test-support = []
 
 [dev-dependencies]
 # core・supervisor・cli と同じ方式の自己参照（外部クレートの追加ではない）。dev-dependency は通常のビルドでは
 # 解決されないため、製品の既定ビルドでは feature は無効のまま。`required-features` は使わない（既定の
 # `cargo test` から結合試験が外れないようにするため）。
-fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support"] }
+fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support", "netns-holder-test-support"] }
 
 # pasta のバイナリの検証（パスの表・偽の pasta を子として実行する --version の振る舞い。NET-9・PLUG-11・#1936）。
 # 自身を偽の pasta として再実行するため harness = false。root 不要で 3 OS の既定集合で実行する。
@@ -162,6 +165,24 @@ harness = false
 [[test]]
 name = "lo_self_delivery"
 path = "tests/lo_self_delivery.rs"
+harness = false
+
+# netns holder の起動・fd の受け渡し・READY / STOP・期限・PDEATHSIG の非特権結合試験（NET-9・CORE-6・REPAIR-5・#3197）。
+# 自身を holder として再実行する（`netns-holder` を第 1 引数に起動されたら `run_netns_holder_main`）ため harness = false。
+# root 不要で Linux のみ（他 OS は not applicable を出して成功終了）。既定の集合で実行する。
+[[test]]
+name = "netns_holder_process"
+path = "tests/netns_holder_process.rs"
+harness = false
+
+# 非特権 user + network namespace（`unshare --user --map-root-user --net`）へ holder が実際に参加し、capability を落とし、
+# 同じ uid の別プロセスが `/proc/<holder>/ns/*` を開けること（pasta の前提。12.2）を照合する実機前提テスト
+# （NET-9・CORE-6・SEC-5・REPAIR-5・#3197）。子の再入のため harness = false。非特権 user namespace が要るため
+# `-- --ignored` 指定時のみ実行する。CI では platform-ci（ubuntu）が AppArmor 緩和ステップの後に実行し、成功行を
+# 照合する（AGENTS.md）。
+[[test]]
+name = "netns_holder_userns"
+path = "tests/netns_holder_userns.rs"
 harness = false
 
 # ネットワーク定義ストアのプロセス間結合試験（排他・共有ロック・期限・保持プロセス終了後の再取得。

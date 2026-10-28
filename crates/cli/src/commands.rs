@@ -58,6 +58,7 @@ use crate::error::CliError;
 mod args;
 mod create_network;
 mod create_options;
+mod create_pasta;
 mod create_start;
 mod image;
 mod image_refs;
@@ -378,6 +379,14 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
         return usage();
     };
     let tail: Vec<OsString> = it.collect();
+    // `--pasta-path` / `--pasta-path-search` は create だけに効く。他のサブコマンド（setup・doctor を含む）では
+    // 黙って受けずに拒否する（rootless-network.md 12.4・NET-9・CLI-1・#3199）。
+    if global.pasta.is_some() && !matches!(command, Command::Create) {
+        return CliExit::Error(CliError::new(
+            ErrorCode::InvalidArgument,
+            create_pasta::MSG_FLAG_NOT_CREATE,
+        ));
+    }
     match command {
         Command::Create => match parse_create(tail) {
             Ok(a) => create_start::run_create(&global, &a),
@@ -1468,5 +1477,70 @@ mod net12_argv_tests {
         // 使い方エラーは exit 2 の INVALID_ARGUMENT(状態ルートは作られない)。
         assert_invalid(&["--network", "a", "--network", "b"], "");
         assert_invalid(&["--add-host"], "");
+    }
+
+    /// NET-9・NET-3(#3200): 不正な `-p` は作成前に INVALID_ARGUMENT(状態ルートは作られず、入力値は出ない)。
+    #[test]
+    fn net9_publish_invalid_specs_rejected() {
+        let n = ["--network", "mynet"];
+        for bad in ["[::1]:80:80", "::1:80:80", "80:80/sctp", "0:80", "1-2:80"] {
+            let leak = bad.split(':').next().unwrap_or("");
+            let argv = [n[0], n[1], "-p", bad];
+            assert_invalid(&argv, if leak.len() > 2 { leak } else { "sctp" });
+        }
+    }
+
+    /// NET-9(#3200): ユーザー定義名と組でない `-p` は INVALID_ARGUMENT(none / host / 指定なし)。
+    #[test]
+    fn net9_publish_requires_user_defined_network() {
+        assert_invalid(&["-p", "8080:80"], "");
+        assert_invalid(&["--network", "none", "-p", "8080:80"], "");
+        assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
+    }
+
+    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、結線(#1873・#1940)まで UNIMPLEMENTED(受理して捨てない)。
+    #[test]
+    fn net9_publish_valid_is_unimplemented_until_wired() {
+        // 判定順は `check_network_options`(権限モデルの解決: publish が使えない場合の拒否)→ pasta の場所 →
+        // `UNIMPLEMENTED`。組み合わせごとに具体値で期待する(NET-9・#3199・#3200)。
+        // 非 Linux は権限モデルが `Unavailable` で、pasta の判定より前に `UNIMPLEMENTED` になる。
+        // Linux の root は rootful で `UNIMPLEMENTED`、非 root は rootless で pasta 未指定の `FAILED_PRECONDITION`。
+        #[cfg(not(target_os = "linux"))]
+        let want = (
+            "UNIMPLEMENTED",
+            "port publishing is not supported on this platform yet",
+        );
+        #[cfg(target_os = "linux")]
+        let want = if std::fs::read_to_string("/proc/self/status")
+            .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")))
+        {
+            (
+                "UNIMPLEMENTED",
+                super::create_network::PUBLISH_ROOTFUL_MESSAGE,
+            )
+        } else {
+            ("FAILED_PRECONDITION", "pasta path is not configured")
+        };
+        for extra in [
+            ["--network", "mynet", "-p", "8080:80"],
+            ["--network", "mynet", "--publish", "127.0.0.1:8080:80/udp"],
+        ] {
+            let (exit, code, stderr) = create(&extra);
+            assert_eq!(code, Some(want.0), "{extra:?}: {stderr}");
+            assert_ne!(exit, 0, "{extra:?}");
+            assert!(stderr.contains(want.1), "{extra:?}: {stderr}");
+        }
+    }
+
+    /// NET-9(#3200): 件数と 1 件の長さの超過は使い方エラー。
+    #[test]
+    fn net9_publish_usage_limits() {
+        let long = "1".repeat(65);
+        assert_invalid(&["--network", "mynet", "-p", long.as_str()], "");
+        let mut many: Vec<&str> = vec!["--network", "mynet"];
+        for _ in 0..65 {
+            many.extend(["-p", "8080:80"]);
+        }
+        assert_invalid(&many, "");
     }
 }

@@ -876,7 +876,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let recorder = OpRecorder::new();
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
-        super::create_network::validate_network_options(&args.options.network)?;
+        super::create_network::validate_network_options(
+            &args.options.network,
+            super::create_network::resolve_publish_privilege,
+        )?;
         let (req, image) = build_create(global, args)?;
         // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
         let document = create_options::document_of(&args.options)?;

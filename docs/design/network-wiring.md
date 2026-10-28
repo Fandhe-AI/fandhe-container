@@ -355,7 +355,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
 | #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
 | #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 | 未実装 |
-| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 未実装 |
+| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 実装済み（切り離し起動・記録・pidfd 経由の停止・起動窓の回収の判定。停止要求の UDS は #3071、`members/*` の件数による起動・停止の配線は #3067・#3074、回収の候補 pid を出す `net-helpers` の cgroup の列挙は #3074 が残る） |
 | #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 未実装 |
 | #3072 | net: `--dns` の上流転送を製品のヘルパーで有効化（D11） | net-builder | #3071 | 未実装 |
 | #3060 | net: nftables の `bitwise`・`meta` expr（D11） | net-builder | なし | 実装済み（PR #3189） |

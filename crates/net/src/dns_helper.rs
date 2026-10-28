@@ -8,8 +8,10 @@
 //!   （TASK-141.2・#322）。上流 DNS への転送（コンテナ別の `--dns` マッピング）は [`upstream`]
 //!   （NET-12・TASK-185.3・#346）、参照カウントによるオンデマンド起動・終了は
 //!   [`refcount`]（NET-7・TASK-144.1・#329）が持つ。SIGTERM による正常終了は未実装（REPAIR-3）
-//! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
-//!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
+//! - 製品の経路は [`detach`]（#3070・NET-5・NET-7）: ヘルパーを `setsid` と二重 fork 相当で親から切り離して起動し、
+//!   `dns-helper` に pid・開始時刻・boot id を記録し（[`record`]・[`identity`]）、別プロセスから pidfd 経由で停止する
+//! - [`spawn_dns_helper`] と [`DnsHelperProcess`] は `Child` を握り `Drop` で止める**試験専用**の形（D11）。
+//!   [`refcount::ProcessLauncher`] と結合試験が使う。ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
 //!
 //! # netns の解釈
 //! 現行の bridge は `create_network` の呼び出し元の netns に作られる。ヘルパーは起動元の netns を継承し、
@@ -63,6 +65,11 @@ use std::time::{Duration, Instant};
 use crate::error::{NetError, NetErrorCode};
 use crate::network::CreatedNetwork;
 
+use self::record::HelperNonce;
+
+pub mod detach;
+pub mod identity;
+pub mod record;
 pub mod refcount;
 pub mod upstream;
 
@@ -110,7 +117,7 @@ fn invalid(msg: &str) -> NetError {
 }
 
 /// `io::Error` を `NetError` の分類へ写す（OS 非依存。メッセージは OS のエラー文言のみで、パケット内容を含めない）。
-fn map_io(context: &str, e: &io::Error) -> NetError {
+pub(crate) fn map_io(context: &str, e: &io::Error) -> NetError {
     let code = match e.kind() {
         io::ErrorKind::PermissionDenied => NetErrorCode::PermissionDenied,
         io::ErrorKind::AddrInUse => NetErrorCode::AlreadyExists,
@@ -1072,37 +1079,105 @@ impl DnsHelperServer {
     }
 }
 
-/// ヘルパープロセスの入口（`--listen <ipv4:port>` のみ受理）。bind 後に stdout へ `READY <ip:port>` を 1 行だけ
-/// 出し、以後 stdout には書かない（親が pipe を閉じても EPIPE で落ちないため）。失敗は stderr に英語 1 行
-/// （code / message。ERR-1）を出して非ゼロで終了する（引数エラーは 2）。
+/// 起動方式（`run_dns_helper_main` の引数から決まる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperMode {
+    /// `--listen` のみ（試験専用の従来の起動。親の `Child` として動く）。
+    Plain,
+    /// 切り離し起動の段 1（`--dns-helper-detach --listen A --nonce N`）。`setsid` して段 2 を起動し即終了する。
+    Detach,
+    /// 切り離し起動の段 2（`--dns-helper-stage2 --listen A --nonce N`）。ack を受けてから bind する。
+    Stage2,
+}
+
+/// ヘルパープロセスの入口。受理する引数は次のとおり（それ以外は終了コード 2）。
+/// - `--listen <ipv4:port>` のみ: 従来の起動（試験専用。D11）。bind 後に stdout へ `READY <ip:port>` を 1 行だけ
+///   出し、以後 stdout には書かない（親が pipe を閉じても EPIPE で落ちないため）
+/// - `--dns-helper-detach --listen A --nonce N`: 切り離し起動の段 1（Linux のみ。`detach` の doc）
+/// - `--dns-helper-stage2 --listen A --nonce N`: 段 2。識別行を stdout へ送り、stdin の ack を 2 秒まで待ち、
+///   受けたら従来どおり bind → `READY`。受けられなければ bind せずに終了する
+///
+/// 失敗は stderr に英語 1 行（code / message。ERR-1）を出して非ゼロで終了する。
 pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
     fn fail_line(code: &str, message: &str) {
         let _ = writeln!(io::stderr(), "error code={code} message={message}");
     }
     let mut listen: Option<DnsListenAddr> = None;
+    let mut nonce: Option<HelperNonce> = None;
+    let mut mode = HelperMode::Plain;
     let mut args = args;
     while let Some(arg) = args.next() {
-        if arg != "--listen" || listen.is_some() {
+        if arg == "--listen" && listen.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| s.parse::<SocketAddrV4>().ok())
+                .and_then(|a| DnsListenAddr::new(*a.ip(), a.port()).ok());
+            match parsed {
+                Some(a) => listen = Some(a),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid listen address");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if arg == detach::ARG_NONCE && nonce.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| HelperNonce::new(&s).ok());
+            match parsed {
+                Some(n) => nonce = Some(n),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid nonce");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if mode == HelperMode::Plain && arg == detach::ARG_DETACH {
+            mode = HelperMode::Detach;
+        } else if mode == HelperMode::Plain && arg == detach::ARG_STAGE2 {
+            mode = HelperMode::Stage2;
+        } else {
             fail_line("INVALID_ARGUMENT", "unexpected or duplicate argument");
             return ExitCode::from(2);
-        }
-        let parsed = args
-            .next()
-            .and_then(|v| v.into_string().ok())
-            .and_then(|s| s.parse::<SocketAddrV4>().ok())
-            .and_then(|a| DnsListenAddr::new(*a.ip(), a.port()).ok());
-        match parsed {
-            Some(a) => listen = Some(a),
-            None => {
-                fail_line("INVALID_ARGUMENT", "invalid listen address");
-                return ExitCode::from(2);
-            }
         }
     }
     let Some(listen) = listen else {
         fail_line("INVALID_ARGUMENT", "missing --listen");
         return ExitCode::from(2);
     };
+    // nonce は切り離し起動の 2 段（段 1・段 2）でだけ受け、単独の `--listen` では受けない。
+    if (mode == HelperMode::Plain) != nonce.is_none() {
+        fail_line(
+            "INVALID_ARGUMENT",
+            "--nonce is required with, and only with, a detach mode",
+        );
+        return ExitCode::from(2);
+    }
+    #[cfg(target_os = "linux")]
+    match (mode, nonce.as_ref()) {
+        (HelperMode::Detach, Some(n)) => {
+            return match detach::run_stage1(listen, n) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    fail_line(e.code().as_str(), e.message());
+                    ExitCode::from(1)
+                }
+            };
+        }
+        (HelperMode::Stage2, Some(n)) => {
+            // ack を受けるまで bind しない（D14 (ii)。起動元が記録の前に死んでも孤児が残らない）。
+            if let Err(e) = detach::run_stage2_handshake(n) {
+                fail_line(e.code().as_str(), e.message());
+                return ExitCode::from(1);
+            }
+        }
+        _ => {}
+    }
+    #[cfg(not(target_os = "linux"))]
+    if mode != HelperMode::Plain {
+        fail_line("UNIMPLEMENTED", "detached start is supported only on Linux");
+        return ExitCode::from(1);
+    }
     let mut server = match DnsHelperServer::bind(listen) {
         Ok(s) => s,
         Err(e) => {
@@ -1138,7 +1213,7 @@ pub struct DnsHelperProcess {
     listen: SocketAddrV4,
 }
 
-fn check_timeout(t: Duration) -> Result<(), NetError> {
+pub(crate) fn check_timeout(t: Duration) -> Result<(), NetError> {
     if t.is_zero() || t > TIMEOUT_MAX {
         return Err(invalid(
             "timeout must be greater than 0 and at most 10 seconds",
@@ -1245,9 +1320,13 @@ impl Drop for DnsHelperProcess {
     }
 }
 
-/// stdout から準備完了行を最大 [`READY_LINE_MAX`] バイト、改行まで読む。
-fn read_ready_line(mut out: impl io::Read) -> Result<String, &'static str> {
-    let mut line = Vec::with_capacity(READY_LINE_MAX);
+/// stdout から 1 行を最大 `max` バイト、改行まで読む（バッファリングしない読み出しで、続く行を食べない）。
+/// 切り離し起動（[`detach`]）は識別行と準備完了行を同じ pipe から順に読むため、共通化している。
+pub(crate) fn read_line_limited(
+    mut out: impl io::Read,
+    max: usize,
+) -> Result<String, &'static str> {
+    let mut line = Vec::with_capacity(max);
     let mut byte = [0u8; 1];
     loop {
         match out.read(&mut byte) {
@@ -1257,14 +1336,19 @@ fn read_ready_line(mut out: impl io::Read) -> Result<String, &'static str> {
         }
         match byte.first().copied() {
             Some(b'\n') => break,
-            Some(b) if line.len() < READY_LINE_MAX => line.push(b),
+            Some(b) if line.len() < max => line.push(b),
             _ => return Err("readiness line too long"),
         }
     }
     String::from_utf8(line).map_err(|_| "readiness line is not UTF-8")
 }
 
-fn parse_ready(line: &str, want: SocketAddrV4) -> Result<SocketAddrV4, NetError> {
+/// stdout から準備完了行を最大 [`READY_LINE_MAX`] バイト、改行まで読む。
+fn read_ready_line(out: impl io::Read) -> Result<String, &'static str> {
+    read_line_limited(out, READY_LINE_MAX)
+}
+
+pub(crate) fn parse_ready(line: &str, want: SocketAddrV4) -> Result<SocketAddrV4, NetError> {
     let bad = || NetError::new(NetErrorCode::FailedPrecondition, "malformed readiness line");
     let addr: SocketAddrV4 = line
         .strip_prefix(READY_PREFIX)

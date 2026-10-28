@@ -18,6 +18,10 @@ use fandhe_container_net::dns_helper::{
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::{EndpointId, NetworkName};
 
+#[cfg(target_os = "linux")]
+#[path = "dns_helper_process/detached.rs"]
+mod detached;
+
 fn query(id: u16, flags: u16, qd: u16) -> Vec<u8> {
     let mut v = id.to_be_bytes().to_vec();
     v.extend_from_slice(&flags.to_be_bytes());
@@ -86,6 +90,11 @@ fn main() -> std::process::ExitCode {
     if args.get(1).is_some_and(|a| a == "--listen") {
         return run_dns_helper_main(args.into_iter().skip(1));
     }
+    // 切り離し起動の段 1・段 2 としての再実行（NET-5・NET-7・#3070）。
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|a| detached::is_helper_arg(a)) {
+        return run_dns_helper_main(args.into_iter().skip(1));
+    }
     let exe = std::env::current_exe().expect("current_exe");
     let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen addr");
 
@@ -134,6 +143,8 @@ fn main() -> std::process::ExitCode {
     assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
 
     refcount_roundtrip(&exe);
+    #[cfg(target_os = "linux")]
+    detached::run(&exe);
     println!("dns_helper_process: ok");
     std::process::ExitCode::SUCCESS
 }

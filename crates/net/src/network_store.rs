@@ -13,6 +13,8 @@
 //! ├── @removing-<一意値>/         削除途中（同上）
 //! └── <name>/                    0700
 //!     ├── definition             0600。FCNET1
+//!     ├── dns-helper             0600。起動済み DNS ヘルパーの記録 FCDNSH1（pid・開始時刻・boot id。#3070）
+//!     ├── dns-helper.intent      0600。起動窓の意図記録 FCDNSI1（起動の前に書き、記録の確定後に消す。#3070）
 //!     └── @lock                  0600。ネットワークのロック
 //! ```
 //! `NetworkName` は先頭が `[a-z0-9]` のため、`@lock`・`@staging-*`・`@removing-*` はネットワーク名と衝突しない。
@@ -31,7 +33,7 @@
 //! 解放から [`LOCK_HANDOFF_GAP`] 経つまで次の取得を待つ（`docs/design/measurements/state-lock-contention.md`）。
 //!
 //! # 未実装（REPAIR-3）
-//! メンバー記録・`realized`・IPAM は #3067、DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
+//! メンバー記録・`realized`・IPAM は #3067、subnet の pool 予約は D13（#3057）。
 //! `remove` は `definition` と `@lock` 以外の項目があれば拒否するため、それらが増えても誤って消さない。
 //! Linux 以外ではストアの全操作が `Unimplemented`（FCNET1 コーデックは 3 OS で動く）。
 

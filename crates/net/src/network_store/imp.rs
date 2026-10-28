@@ -25,6 +25,8 @@ use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_
 use crate::network::NetworkName;
 use crate::sys;
 
+mod dns_helper_store;
+
 const NETWORKS_DIR: &str = "@networks";
 const LOCK_FILE: &str = "@lock";
 const DEFINITION_FILE: &str = "definition";
@@ -280,6 +282,10 @@ pub struct NetworkLockGuard<'g> {
     _global: PhantomData<&'g ()>,
     dir: Dir,
     file: File,
+    /// 共有ロックか。共有ロックからの記録の書き込み・削除は拒否する（`dns_helper_store`）。
+    shared: bool,
+    /// このロックが指すネットワーク名（意図記録に載せる名前を、呼び出し側の取り違えなく得るため）。
+    name: NetworkName,
 }
 
 impl Drop for GlobalLockGuard<'_> {
@@ -682,6 +688,8 @@ impl GlobalLockGuard<'_> {
             _global: PhantomData,
             dir,
             file,
+            shared,
+            name: name.clone(),
         })
     }
 
@@ -703,6 +711,11 @@ impl NetworkLockGuard<'_> {
     /// ロックを保持している fd（保持の証跡。ドロップで解放される）。
     pub fn is_held(&self) -> bool {
         self.file.as_raw_fd() >= 0
+    }
+
+    /// このガードが指すネットワーク名。
+    pub fn network(&self) -> &NetworkName {
+        &self.name
     }
 }
 

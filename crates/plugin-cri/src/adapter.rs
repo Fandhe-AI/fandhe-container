@@ -735,6 +735,48 @@ fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode
     )
 }
 
+/// 試さなかった supervisor ログ・コンテナログの段の警告行（#3260・SUP-7・CRI-2・REPAIR-4・REPAIR-5）。
+///
+/// 全体の期限を使い切って段を試さなかったときだけ使う。ファイルの有無を確かめていないため、警告行だけを見た読み手が
+/// 「ファイルが残った」と誤読しないよう `existence: unverified` を足す（起動オプション文書の行と同じ規則。`reason` の語彙は
+/// 増やさない）。コードは `Timeout` 固定で、試して失敗した行（[`cleanup_warning_line`]）は変えない。期限後に存在を確かめる
+/// I/O は足さない（REPAIR-5）。値は `ContainerId`・`CleanupTarget::as_str`・固定語彙だけ（ERR-1・ERR-2）。
+fn skipped_log_cleanup_warning_line(id: &ContainerId, target: CleanupTarget) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}}",
+        id.as_str(),
+        target.as_str(),
+        ErrorCode::Timeout.as_str()
+    )
+}
+
+/// ログ 1 段の後始末の結果。全体の期限を使い切って試さなかった段を、試して期限切れになった段と区別する（#3260・REPAIR-4）。
+///
+/// `delete` が応答（`outcome`）と警告行の出し分け（`is_skipped`）に使う。core の `CleanupOutcome` は変えない（plugin 境界の型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogStage {
+    /// 試した（成功・guard 見送り・失敗を含む）。
+    Attempted(CleanupOutcome),
+    /// 全体の期限を使い切り、存在を確かめずに試さなかった（コードは `Timeout` 固定）。
+    Skipped,
+}
+
+impl LogStage {
+    /// 応答へ載せる `CleanupOutcome`。`Skipped` は `Kept { Timeout }`。
+    fn outcome(&self) -> CleanupOutcome {
+        match self {
+            Self::Attempted(o) => *o,
+            Self::Skipped => CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            },
+        }
+    }
+
+    fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+}
+
 /// `delete` の後の起動オプション文書の掃除に失敗した旨の構造化ログ 1 行（#2760・SUP-12・REPAIR-4）。
 ///
 /// `CleanupTarget`（plugin 境界の型）には語彙を足さないため、`target` はこの module の固定文字列 `container_options` を使う。
@@ -1064,18 +1106,20 @@ impl CoreLifecycleRuntime {
     ///
     /// `remaining` は `delete` 全体の期限までの残り。`lock_wait` と 1 回の試行の期限をこの残りで頭打ちにし
     /// （最悪の所要は `lock_wait` + 試行の期限）、残りが 0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
+    /// 試さなかったときは [`LogStage::Skipped`] を返し、`delete` が警告行に `existence: unverified` を足す（#3260）。
     fn remove_supervisor_log(
         &self,
         id: &ContainerId,
         lock_wait: Duration,
         remaining: Duration,
-    ) -> CleanupOutcome {
+    ) -> LogStage {
         let Some(root) = self.store.host_state_root() else {
-            return CleanupOutcome::NotApplicable;
+            return LogStage::Attempted(CleanupOutcome::NotApplicable);
         };
         let started = Instant::now();
         let store = Arc::clone(&self.store);
         let guard_id = id.clone();
+        let mut skipped = false;
         let removed = match stage_budget(remaining, lock_wait, SUPERVISOR_LOG_REMOVE_TIMEOUT) {
             Some((lock_wait, attempt)) => remove_guarded_bounded_waiting(
                 root,
@@ -1084,7 +1128,10 @@ impl CoreLifecycleRuntime {
                 attempt,
                 Arc::new(move || Self::id_is_absent(&store, &guard_id)),
             ),
-            None => Err(delete_deadline_exhausted()),
+            None => {
+                skipped = true;
+                Err(delete_deadline_exhausted())
+            }
         };
         if let Ok(name) = OpName::new("supervisor_log_remove") {
             let result = match &removed {
@@ -1093,7 +1140,11 @@ impl CoreLifecycleRuntime {
             };
             let _ = self.recorder.record(&name, result, started.elapsed());
         }
-        cleanup_outcome_of(&removed)
+        if skipped {
+            LogStage::Skipped
+        } else {
+            LogStage::Attempted(cleanup_outcome_of(&removed))
+        }
     }
 
     /// コンテナログ（現在ログ・全世代・ロック）を消す。core の `delete` が成功した後にだけ呼ぶ（失敗した delete で
@@ -1148,19 +1199,24 @@ impl CoreLifecycleRuntime {
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
     ///
     /// `remaining` は `delete` 全体の期限までの残り。0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
+    /// 試さなかったときは [`LogStage::Skipped`]（警告行に `existence: unverified`。#3260）。
     fn record_container_log_removal(
         &self,
         id: &ContainerId,
         lock_wait: Duration,
         remaining: Duration,
-    ) -> CleanupOutcome {
+    ) -> LogStage {
         if self.store.host_state_root().is_none() {
-            return CleanupOutcome::NotApplicable;
+            return LogStage::Attempted(CleanupOutcome::NotApplicable);
         }
         let started = Instant::now();
+        let mut skipped = false;
         let removed = match stage_budget(remaining, lock_wait, CONTAINER_LOG_REMOVE_TIMEOUT) {
             Some((lock_wait, attempt)) => self.remove_container_log_within(id, lock_wait, attempt),
-            None => Err(delete_deadline_exhausted()),
+            None => {
+                skipped = true;
+                Err(delete_deadline_exhausted())
+            }
         };
         let elapsed = started.elapsed();
         let result = match &removed {
@@ -1176,7 +1232,11 @@ impl CoreLifecycleRuntime {
         {
             let _ = self.recorder.record(&name, OpOutcome::Failure, elapsed);
         }
-        cleanup_outcome_of(&removed)
+        if skipped {
+            LogStage::Skipped
+        } else {
+            LogStage::Attempted(cleanup_outcome_of(&removed))
+        }
     }
 }
 
@@ -1445,11 +1505,22 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             (self.cleanup_warn)(options_cleanup_warning_line(req.id(), failure));
         }
         let response = response
-            .with_supervisor_log(supervisor_log)
-            .with_container_log(container_log);
+            .with_supervisor_log(supervisor_log.outcome())
+            .with_container_log(container_log.outcome());
         // 残した資源は `Err` にせず、応答と構造化ログで知らせる（再試行は core の `NOT_FOUND` で止まるため。#2633）。
         for (target, code) in response.kept() {
-            (self.cleanup_warn)(cleanup_warning_line(req.id(), target, code));
+            // 期限切れで試さなかったログの段だけ `existence: unverified` を足す（#3260）。
+            let skipped = match target {
+                CleanupTarget::SupervisorLog => supervisor_log.is_skipped(),
+                CleanupTarget::ContainerLog => container_log.is_skipped(),
+                _ => false,
+            };
+            let line = if skipped {
+                skipped_log_cleanup_warning_line(req.id(), target)
+            } else {
+                cleanup_warning_line(req.id(), target, code)
+            };
+            (self.cleanup_warn)(line);
         }
         Ok(response)
     }
@@ -1872,6 +1943,47 @@ mod tests {
             options_cleanup_warning_line(&id, OptionsCleanupFailure::Skipped),
             "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
         );
+    }
+
+    /// #3260・REPAIR-4: 試さなかったログ 2 段の警告行だけ `existence` を持ち、試して失敗した行・段の写像は従来のまま。
+    #[test]
+    fn repair4_sup7_3260_skipped_log_warning_has_unverified_existence() {
+        let id = cid("c1");
+        assert_eq!(
+            skipped_log_cleanup_warning_line(&id, CleanupTarget::SupervisorLog),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            skipped_log_cleanup_warning_line(&id, CleanupTarget::ContainerLog),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        // 試して期限切れになった行は変えない（existence も reason も無い）。
+        assert_eq!(
+            cleanup_warning_line(&id, CleanupTarget::SupervisorLog, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            cleanup_warning_line(&id, CleanupTarget::ContainerLog, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            LogStage::Skipped.outcome(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Timeout
+            }
+        );
+        assert!(LogStage::Skipped.is_skipped());
+        for o in [
+            CleanupOutcome::Removed,
+            CleanupOutcome::Superseded,
+            CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition,
+            },
+        ] {
+            let stage = LogStage::Attempted(o);
+            assert_eq!(stage.outcome(), o);
+            assert!(!stage.is_skipped());
+        }
     }
 
     /// #2894・#2964・ERR-1: ログ削除の `Err` は code をそのまま `Kept` に載せ、枠の満杯は `RESOURCE_EXHAUSTED` で警告行に出る。

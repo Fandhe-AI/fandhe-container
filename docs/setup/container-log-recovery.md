@@ -9,7 +9,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 ## 見分け方
 
 - CLI の `delete` が stderr に `{"level":"warn","code":"FAILED_PRECONDITION"|"TIMEOUT",...,"message":"container log removal failed; leftover logs may remain"}` を出した。`FAILED_PRECONDITION` の行には `"reason":"sink_open_after_wait"` が付く（待ちを使い切っても古い supervisor が sink を閉じなかった。`TIMEOUT` など他の失敗には付かない）
-- plugin-cri の `{"event":"container_delete_cleanup","target":"container_log",...}` の行（同じく待ち切れなかった場合は `"reason":"sink_open_after_wait"`）、または op 名 `container_log_remove.<code>` の Failure が計上された（`container_log_remove.failed_precondition` が「待ち切れなかった」）
+- plugin-cri の `{"event":"container_delete_cleanup","target":"container_log",...}` の行（同じく待ち切れなかった場合は `"reason":"sink_open_after_wait"`）、行に `"existence":"unverified"` があれば、`delete` の期限を使い切って段を試しておらず、ファイルがあるかは確かめていない（手動で確かめてから消す。#3260）、または op 名 `container_log_remove.<code>` の Failure が計上された（`container_log_remove.failed_precondition` が「待ち切れなかった」）
 - plugin-cri の起動時に `{"event":"container_log_sweep",...}` の 1 行が出る。`skipped_live`・`skipped_present`・`skipped_undecodable`・`failed` が 0 でなければ、その件数ぶんの残りが自動では消えていない
 - ID の符号化の規則: 大文字 `X` は `_x`、`_` は `__`、Windows の予約名には先頭に `_0` が付く
 
@@ -49,7 +49,7 @@ supervisor ログの扱いは末尾の「supervisor ログ」の節に分けて�
 
 - CLI の `delete` が stderr に `"message":"supervisor log removal failed; leftover logs may remain"` の警告を出した。待ちを使い切っても古い supervisor がロックを持ち続けた場合は `"code":"FAILED_PRECONDITION","reason":"sink_open_after_wait"` が付く。`INTERNAL`・`RESOURCE_EXHAUSTED` など他の失敗には `reason` が付かない
 - 期限切れは `"code":"TIMEOUT"` で、文言は `supervisor log removal did not finish within the deadline; leftover logs may remain`（コンテナログとは文言が違い、`reason` は付かない）
-- plugin-cri の `{"event":"container_delete_cleanup","id":"<id>","target":"supervisor_log",...}` の行（待ち切れなかった場合は `"reason":"sink_open_after_wait"`）。`id` が対象のコンテナ ID。記録器の op 名 `supervisor_log_remove` の Failure も同じ意味である（コード別の op 名は無い。`container_log_remove.<code>` はコンテナログ専用）
+- plugin-cri の `{"event":"container_delete_cleanup","id":"<id>","target":"supervisor_log",...}` の行（待ち切れなかった場合は `"reason":"sink_open_after_wait"`）。行に `"existence":"unverified"` があれば、期限を使い切って段を試しておらず、ファイルの有無は未確認（#3260）。`id` が対象のコンテナ ID。記録器の op 名 `supervisor_log_remove` の Failure も同じ意味である（コード別の op 名は無い。`container_log_remove.<code>` はコンテナログ専用）
 - 置き場所は `<state_root>/@supervisor-logs/`（unix では 0700）。ファイル名と ID の符号化はコンテナログと同じで、1 ID あたり最大 `.log`・`.log.1`・`.log.2`・`.log.lock` の 4 ファイル（1 MiB × 3 世代 = 3 MiB 以内）
 
 ### supervisor ログの自動回収

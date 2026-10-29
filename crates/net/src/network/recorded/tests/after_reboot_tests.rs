@@ -522,11 +522,93 @@ fn find_members_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// NET-3・#3412: メンバー記録の削除が失敗したら、予約を解放せず `Uncommitted` を返す（3 件のまま）。
-/// 書き込めるようにして再実行すると収束し、c1 の 2 件だけが解放されて 1 件になる。
-#[test]
-fn net3_3412_after_reboot_keeps_reservations_when_record_removal_fails() {
+/// c1 の publish 行（web が Active・api が墓標の 2 件）のうち、墓標の件数。
+fn c1_tombstones(n: &NetworkLockGuard<'_>) -> usize {
+    let m = n.members().unwrap();
+    let c1 = m.iter().find(|r| r.id() == &mid("c1")).unwrap();
+    assert_eq!(c1.publishes().len(), 2);
+    c1.publishes().iter().filter(|p| p.unpublished()).count()
+}
+
+/// 関門を通った後（`run` の中）で `inject` を実行し、失敗を作る detach を行う。
+fn after_reboot_injecting(
+    n: &NetworkLockGuard<'_>,
+    id: &str,
+    reg: &mut PortRegistry,
+    inject: impl FnOnce(),
+) -> RebootOut {
+    detach_member_after_reboot_with(&host(), n, &mid(id), Path::new(NETNS_DIR), reg, |_, _| {
+        inject();
+        Ok::<_, ()>(NetworkDeleteReport::default())
+    })
+}
+
+fn set_mode(p: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// NET-3・REPAIR-4・#3412: 解放中の印を書けなければ、何も解放せず `Uncommitted`。c1 の web は Active のまま、
+/// 予約は 3 件のまま。権限を戻した再実行で収束し、c1 の記録が消えて予約は c2 の 1 件になる。
+#[test]
+fn net3_repair4_3412_after_reboot_mark_write_failure_releases_nothing() {
+    let t = Tmp::new("reboot-markfail");
+    attach_two_in_old_boot(&t);
+    let store = NetworkStore::open(&t.0).unwrap();
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    let mut reg = reserved();
+    let members = find_members_dir(&t.0).expect("members dir");
+    assert_eq!(c1_tombstones(&n), 1);
+    let r = after_reboot_injecting(&n, "c1", &mut reg, || set_mode(&members, 0o500));
+    set_mode(&members, 0o700);
+    assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+    assert_eq!(c1_tombstones(&n), 1, "印は書かれていない");
+    assert_eq!(reg.len(), 3);
+    let r = after_reboot_injecting(&n, "c1", &mut reg, || {});
+    assert!(r.is_ok());
+    assert_eq!(n.members().unwrap().len(), 1);
+    assert_eq!(reg.len(), 1);
+}
+
+/// NET-3・REPAIR-4・#3412: 共有ファイルの予約の解放が失敗したら、印（c1 の 2 件とも墓標）つきの記録と予約が残り、
+/// ファイルを直した再実行で収束する（c1 の 2 件が解放されて c2 の 1 件が残る）。
+#[test]
+fn net3_repair4_3412_after_reboot_release_failure_keeps_mark_and_converges() {
+    let t = Tmp::new("reboot-relfail");
+    attach_two_in_old_boot(&t);
+    let store = NetworkStore::open(&t.0).unwrap();
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    let shared = t.0.join("ports.reg");
+    let mut reg = PortRegistry::with_shared_file(shared.clone());
+    let c1 = EndpointId::new("c1").unwrap();
+    reg.reserve(&name(), &c1, &[web_publish(), api_publish()])
+        .unwrap();
+    let other =
+        PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 9191, 80).unwrap();
+    reg.reserve(&name(), &EndpointId::new("c2").unwrap(), &[other])
+        .unwrap();
+    let good = std::fs::read(&shared).unwrap();
+    let r = after_reboot_injecting(&n, "c1", &mut reg, || {
+        std::fs::write(&shared, b"junk").unwrap();
+        set_mode(&shared, 0o600);
+    });
+    assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+    assert_eq!(n.members().unwrap().len(), 2, "記録は残る");
+    assert_eq!(c1_tombstones(&n), 2, "解放中の印が残る");
+    std::fs::write(&shared, &good).unwrap();
+    set_mode(&shared, 0o600);
+    let r = after_reboot_injecting(&n, "c1", &mut reg, || {});
+    assert!(r.is_ok());
+    assert_eq!(n.members().unwrap().len(), 1);
+    assert_eq!(reg.len(), 1);
+}
+
+/// NET-3・REPAIR-4・#3412: 記録の削除だけが失敗したら（c2 は publish 行が無く印は不要）、予約は解放済みで記録が残り
+/// （c2 の予約 1 件が減って 2 件）、再実行で記録が消える。
+#[test]
+fn net3_repair4_3412_after_reboot_record_removal_failure_converges() {
     let t = Tmp::new("reboot-rmfail");
     attach_two_in_old_boot(&t);
     let store = NetworkStore::open(&t.0).unwrap();
@@ -534,24 +616,13 @@ fn net3_3412_after_reboot_keeps_reservations_when_record_removal_fails() {
     let n = g.lock_network(&name()).unwrap();
     let mut reg = reserved();
     let members = find_members_dir(&t.0).expect("members dir");
-    // 関門を通った後（`run` の中）で members ディレクトリの権限を壊し、記録の削除だけを失敗させる。
-    let r = detach_member_after_reboot_with(
-        &host(),
-        &n,
-        &mid("c1"),
-        Path::new(NETNS_DIR),
-        &mut reg,
-        |_, _| {
-            std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o500)).unwrap();
-            Ok::<_, ()>(NetworkDeleteReport::default())
-        },
-    );
-    std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let r = after_reboot_injecting(&n, "c2", &mut reg, || set_mode(&members, 0o500));
+    set_mode(&members, 0o700);
     assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
     assert_eq!(n.members().unwrap().len(), 2);
-    assert_eq!(reg.len(), 3, "記録が残る間は予約を保つ");
-    let (r, _) = after_reboot(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+    assert_eq!(reg.len(), 2);
+    let r = after_reboot_injecting(&n, "c2", &mut reg, || {});
     assert!(r.is_ok());
     assert_eq!(n.members().unwrap().len(), 1);
-    assert_eq!(reg.len(), 1);
+    assert_eq!(reg.len(), 2);
 }

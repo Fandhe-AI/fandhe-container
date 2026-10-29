@@ -34,7 +34,7 @@
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
 //!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。信頼性検証（PLUG-11）は macOS が実装済み（拒否は
 //!   `PERMISSION_DENIED`（6））、Windows はホストで検証しない（`--plugin-path-search` で候補があると `UNIMPLEMENTED`（8））。
-//!   許可済みハッシュ一覧（#1868）と plugin の起動と RPC（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち〕・TASK-125）は
+//!   許可済みハッシュ一覧（設計は #1868、承認と実装 issue の起票は #2231）と plugin の起動と RPC（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125）は
 //!   未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
 //!   候補ありでも `PERMISSION_DENIED`（6）か `UNIMPLEMENTED`（8）で fail-closed に失敗する。plugin 解決の失敗の
 //!   `message` は `plugin_backend` の固定文言表で、「未導入」と「信頼性検証の拒否」を区別できる。create 系はそのまま、
@@ -1544,7 +1544,7 @@ mod net12_argv_tests {
         assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
     }
 
-    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、結線(#1873・#1940)まで UNIMPLEMENTED(受理して捨てない)。
+    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、CLI の解除(#3329)まで UNIMPLEMENTED(受理して捨てない)。
     #[test]
     fn net9_publish_valid_is_unimplemented_until_wired() {
         // 判定順は `check_network_options`(権限モデルの解決: publish が使えない場合の拒否)→ pasta の場所 →

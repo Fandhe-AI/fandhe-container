@@ -42,7 +42,7 @@
 //!
 //! - NET-6 の host / none モードは `NetworkPlugin` を経由しない。core の `LaunchNetworkMode`（`Host` / `Loopback` / `Attachable`）と
 //!   supervisor の起動経路が扱う（`docs/design/network-wiring.md` D5〜D8・#1870。config との突き合わせは #3058〔実装済み〕、
-//!   Loopback の netns は #3064〔実装済み〕、exec 直前の同期点での netns 素性の照合は #3206、pasta 構成の fd 2 本と合図は #1939〔実装済み〕、host モードの結線と構造化ログは #1873）
+//!   Loopback の netns は #3064〔実装済み〕、exec 直前の同期点での netns 素性の照合は #3206〔実装済み〕、pasta 構成の fd 2 本と合図は #1939〔実装済み〕、host モードの結線と構造化ログは #1873〔実装済み〕）
 //! - NET-9 の rootless ネットワーク（pasta 構成。確定済み〔Fandhe-AI/fandhe-container-spec#18〕）も `NetworkPlugin` を経由しない。
 //!   supervisor（core 側）が `crates/net` の関数で pasta を起動・監視・回収する（`docs/design/rootless-network.md`・#1935。実装は #1936〜#1940）
 //! - DNS ヘルパーのライフサイクルとレジストリ更新の詳細（NET-5・NET-7）、

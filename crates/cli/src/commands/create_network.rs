@@ -33,11 +33,13 @@
 //!
 //! # 未実装の将来仕様(REPAIR-3)
 //!
-//! 検証を通っても起動経路へ結線されていないため、受理して黙って捨てずに `UNIMPLEMENTED` で拒否する。
-//! `-p` は pasta の結線(#1940)と文書への記録(#1873)まで受理しても反映できないため、同じく `UNIMPLEMENTED`。
-//! Linux での解除は #1873(文書 `FCOPT1` への記録と既定 `none` の導入。D4)、Linux 以外は MAC / WIN 系の結線の後続。
+//! Linux の `none` / `host` / `--add-host` / `--dns` は #1873(PR #3322。文書 `FCOPT1` への記録と既定 `none` の導入。D4)で
+//! 結線済み。残る未結線の指定(ユーザー定義名・`container:`・`-p`、非 Linux の network 系の指定すべて)は、検証を通っても
+//! 受理して黙って捨てずに `UNIMPLEMENTED` で拒否する(`reject_unwired_network`)。`-p` は pasta の結線(#1940 で
+//! supervisor 側は実装済み)があっても、CLI がユーザー定義名を解除するまで反映できないため同じく `UNIMPLEMENTED`。
+//! ユーザー定義名の解除は rootless が #3329、rootful が D13、Linux 以外は MAC / WIN 系の結線の後続。
 //! ユーザー定義名の存在確認と bridge 向け上流転送の制約(3 件以下・loopback / link-local の拒否・gateway との一致の拒否)は、
-//! 定義ストア(D10・#3059)が要るため #3059・#3066・#1873 の段で入れる。`--network` を省略しても #1871 では none 扱いにしない。
+//! 定義ストア(D10・#3059 で実装済み)を使って #3329 の段で入れる(`network create` 側は #3066)。`--network` を省略しても #1871 では none 扱いにしない。
 //!
 //! エラーは固定の英語文言で、入力値を含めない。
 

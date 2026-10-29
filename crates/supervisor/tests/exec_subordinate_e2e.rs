@@ -1,5 +1,5 @@
 //! 範囲写像（subordinate ids）の rootless コンテナへ、本番の入口だけで create → start → exec を通す実機前提の結合試験
-//! （SEC-5・CORE-6・SUP-6・CRI-2・REPAIR-12。#2835・#2811）。
+//! （SEC-5・CORE-6・SUP-6・CRI-2・SEC-1・SEC-4・REPAIR-12。#2835・#2811・#3291）。
 //!
 //! #2811（#2770）で、稼働中コンテナへの exec が範囲写像の対象に対して `config.json` の `process.user` の非 root と
 //! `additionalGids` を受けるようになった。ただし試験は `exec_setns_join` の credential 段（実 syscall の照合）に絞られ、
@@ -21,6 +21,12 @@
 //!   `ExecOutcome` も出力を持たないため、観測値は bind mount したホストのディレクトリ経由で受ける）
 //!
 //! # 照合項目
+//! - シナリオ C（重ねたマウントの拒否。SEC-1・SEC-4・CORE-5・#3201・#3291）: 実カーネルで bind 先 `/data` に tmpfs を
+//!   重ね（`nsenter --user --mount --root=/ --wd=/proc/<pid>/root/data -- mount -t tmpfs ... .`。root は host のまま、
+//!   cwd だけがコンテナの `/data` のマウント）、`/proc/<pid>/mountinfo` で重なり（マウント ID が launch の記録の `mnt_id`
+//!   と異なる tmpfs が上に載ること）を確かめたうえで exec し、`FailedPrecondition`・
+//!   `exec stage Landlock: landlock_mount_identity_mismatch ...`・監査 1 件（層 `mount`・理由
+//!   `landlock_mount_identity_mismatch`・path なし・container_id 一致）・コマンド未起動を照合する
 //! - シナリオ A（成功経路）: `config.json` の `process.user` が uid 1000・gid 1000・`additionalGids` [3000, 2000] の
 //!   コンテナを start し、Running の記録に cgroup の配置・`launch_isolation`・`rlimits` が載ることを確かめる。そのうえで
 //!   `run_command_with_pidfd` の `ExecOutcome` が、終了 `Command(Exited(0))`・補助グループ `Applied { count: 2 }`・seccomp
@@ -43,6 +49,7 @@
 //!   （uid 側 1000 件以上・gid 側 3000 件以上）
 //! - 非特権ユーザーに委譲された cgroup v2（`systemd-run --user --scope -p Delegate=yes`）・Landlock ABI 6 以上（Linux 6.12 以上）・
 //!   非特権 user namespace を許可するホスト
+//! - util-linux の `nsenter`・`mount`（`/usr/bin`。シナリオ C。無ければ失敗にする）
 //! - 動的リンクのためホストの共有ライブラリを rootfs へコピーする（ネットワークは不要）
 //!
 //! # 実機前提テストとしての分離
@@ -149,11 +156,12 @@ mod linux {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
+    use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::CgroupLimitPlan;
     use fandhe_container_core::exec::{
         ChildExit, ExecExit, IsolationPrivilege, SupplementaryGroups,
     };
+    use fandhe_container_core::launch_isolation::RecordedTarget;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
         ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource, create, start,
@@ -178,6 +186,10 @@ mod linux {
     /// exec したコマンドが観測値を書くファイル名（シナリオ A・B）。
     const STATUS_FILE_A: &str = "exec-status";
     const STATUS_FILE_B: &str = "exec-status-b";
+    const STATUS_FILE_C: &str = "exec-status-c";
+    /// 前提とする util-linux のコマンド（シナリオ C のマウントの重ね合わせに使う）。
+    const NSENTER: &str = "/usr/bin/nsenter";
+    const MOUNT: &str = "/usr/bin/mount";
     /// config の `process.user`（シナリオ A の成功経路）。
     const USER_UID: u32 = 1000;
     const USER_GID: u32 = 1000;
@@ -284,15 +296,19 @@ mod linux {
         }
     }
 
-    /// 監査レコードをメモリへ追記するだけの sink（件数だけを照合する）。
-    struct MemSink(std::sync::Mutex<Vec<String>>);
+    /// 監査レコードをメモリへ追記するだけの sink（件数と、シナリオ C では記録の中身を照合する）。
+    struct MemSink(std::sync::Mutex<Vec<AuditRecord>>);
 
     impl MemSink {
         fn count(&self) -> usize {
+            self.snapshot().len()
+        }
+
+        fn snapshot(&self) -> Vec<AuditRecord> {
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len()
+                .clone()
         }
     }
 
@@ -301,7 +317,7 @@ mod linux {
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(format!("{record:?}"));
+                .push(record.clone());
             Ok(())
         }
     }
@@ -445,6 +461,13 @@ mod linux {
             );
         }
         let _landlock = crate::precondition::landlock_support();
+        // シナリオ C が使う util-linux のコマンド。環境の欠落は検証せずに成功させず、副作用の前に失敗にする。
+        for tool in [NSENTER, MOUNT] {
+            assert!(
+                std::fs::metadata(tool).is_ok_and(|m| m.is_file()),
+                "exec_subordinate_e2e: util-linux nsenter and mount are required ({tool} is missing)"
+            );
+        }
         let delegated = crate::precondition::delegated_cgroup();
 
         // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
@@ -525,6 +548,47 @@ mod linux {
             eventually(|| std::fs::read_to_string(&path).is_ok_and(|s| s == READY_CONTENT)),
             "the container probe must report READY"
         );
+    }
+
+    /// `/proc/<pid>/mountinfo` のうち、マウントポイントが `mountpoint` の行の `(マウント ID, 親 ID, fstype)`（出現順）。
+    /// 空白区切りで読み、添字アクセスはしない。fstype は ` - ` の区切りの後ろから取る。
+    fn mountinfo_entries(pid: u32, mountpoint: &str) -> Vec<(u64, u64, String)> {
+        let text =
+            std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).expect("read mountinfo");
+        text.lines()
+            .filter_map(|line| {
+                let (head, tail) = line.split_once(" - ")?;
+                let mut f = head.split_whitespace();
+                let id = f.next()?.parse::<u64>().ok()?;
+                let parent = f.next()?.parse::<u64>().ok()?;
+                let mp = f.nth(2)?;
+                let fstype = tail.split_whitespace().next()?;
+                (mp == mountpoint).then(|| (id, parent, fstype.to_string()))
+            })
+            .collect()
+    }
+
+    /// 期限つきで外部コマンドを実行して回収する（超えたら kill して回収し panic。REPAIR-5）。
+    fn run_limited(mut cmd: std::process::Command) -> std::process::Output {
+        use std::process::Stdio;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn command");
+        let deadline = Instant::now() + timeout();
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                return child.wait_with_output().expect("collect output");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("command timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// OCI 既定の bounding set（moby の非 root コンテナの既定と同じ 14 個）の `/proc/<pid>/status` 表記。
@@ -685,6 +749,109 @@ mod linux {
             );
             println!(
                 "exec_subordinate_e2e: scenario=exec-user-outside-mapping-refused code=InvalidArgument command_started=false"
+            );
+
+            // シナリオ C: bind 先 `/data` に別のマウント（tmpfs）を重ねた後の exec は、launch 時のマウント識別子との
+            // 照合（`MountCheck::Recorded`）で拒否され、コマンドは起動しない（SEC-1・SEC-4・CORE-5・#3201・#3291）。
+            // 重ねたマウントは pid1 の mount namespace に残り戻せないので最後に置く（terminate で namespace ごと消える）。
+            let recorded_mnt_id = record
+                .launch_isolation()
+                .and_then(|l| {
+                    assert_eq!(
+                        l.landlock().mount_identities(),
+                        fandhe_container_core::launch_isolation::RecordedMountIdentities::Complete
+                    );
+                    l.landlock().rules().iter().find_map(|r| match r.target() {
+                        RecordedTarget::Mount { destination, .. }
+                            if destination.as_str() == DATA_DEST =>
+                        {
+                            r.mount().map(|m| m.mnt_id())
+                        }
+                        _ => None,
+                    })
+                })
+                .expect("the /data bind must have a recorded mount identity");
+            let pid_u32 = pid.get();
+            let before = mountinfo_entries(pid_u32, DATA_DEST);
+            assert_eq!(before.len(), 1, "one mount at /data before: {before:?}");
+            assert_eq!(
+                before.first().map(|e| e.0),
+                Some(recorded_mnt_id),
+                "launch's recorded mnt_id must equal the kernel's mount id"
+            );
+            assert_eq!(
+                std::fs::read_to_string(format!("/proc/{pid_u32}/root{DATA_DEST}/{READY_FILE}"))
+                    .ok()
+                    .as_deref(),
+                Some(READY_CONTENT)
+            );
+            let mut overmount = std::process::Command::new(NSENTER);
+            overmount
+                .arg("--target")
+                .arg(pid_u32.to_string())
+                .args(["--user", "--mount", "--root=/"])
+                .arg(format!("--wd=/proc/{pid_u32}/root{DATA_DEST}"))
+                .args(["--", MOUNT, "--no-canonicalize", "-t", "tmpfs"])
+                .args(["-o", "size=64k", "fandhe-overmount", "."]);
+            let out = run_limited(overmount);
+            assert!(
+                out.status.success(),
+                "overmount failed: {:?} stdout={:?} stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let after = mountinfo_entries(pid_u32, DATA_DEST);
+            assert_eq!(after.len(), 2, "two mounts at /data after: {after:?}");
+            let top = after.last().expect("top mount");
+            assert_eq!(top.1, recorded_mnt_id, "{after:?}");
+            assert_eq!(top.2, "tmpfs", "{after:?}");
+            assert_ne!(top.0, recorded_mnt_id, "{after:?}");
+            assert!(
+                !Path::new(&format!("/proc/{pid_u32}/root{DATA_DEST}/{READY_FILE}")).exists(),
+                "the overmounted tmpfs must hide the bind"
+            );
+
+            let sink_c = MemSink(std::sync::Mutex::new(Vec::new()));
+            wait_single_thread();
+            let request_c = ExecRequest::new("/probe", ["/probe", "--exec-probe", STATUS_FILE_C])
+                .expect("exec request c");
+            let rejected =
+                match run_command_with_pidfd(&record, pidfd, &request_c, timeout(), &sink_c) {
+                    Ok(o) => panic!("an overmounted bind must be refused, got {o:?}"),
+                    Err(r) => r,
+                };
+            assert_eq!(rejected.error.code(), ErrorCode::FailedPrecondition);
+            let message = rejected.error.message();
+            assert!(
+                message.starts_with("exec stage Landlock: landlock_mount_identity_mismatch")
+                    && message.ends_with(
+                        "(violation: mount_target/landlock_mount_identity_mismatch, CORE-5)"
+                    ),
+                "{message:?}"
+            );
+            assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+            let records = sink_c.snapshot();
+            assert_eq!(records.len(), 1, "{records:?}");
+            let rec = records.first().expect("one record");
+            assert_eq!(rec.layer(), AuditLayer::Mount);
+            assert_eq!(
+                rec.reason().map(|r| r.as_str()),
+                Some("landlock_mount_identity_mismatch")
+            );
+            assert_eq!(rec.path(), None, "no host path in the record (SEC-4)");
+            assert_eq!(rec.container_id(), Some(id));
+            assert_eq!(rec.pid().get(), std::process::id());
+            assert!(
+                !hostdata.join(STATUS_FILE_C).exists(),
+                "the command must not start (host side)"
+            );
+            assert!(
+                !Path::new(&format!("/proc/{pid_u32}/root{DATA_DEST}/{STATUS_FILE_C}")).exists(),
+                "the command must not start (overmounted side)"
+            );
+            println!(
+                "exec_subordinate_e2e: scenario=exec-overmounted-bind-refused code=FailedPrecondition reason=landlock_mount_identity_mismatch audit=mount records=1 command_started=false"
             );
         }));
         let (_record, process) = started.into_parts();

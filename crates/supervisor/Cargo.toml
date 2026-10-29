@@ -34,7 +34,7 @@
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
 # TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
 # #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
-# #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。
+# #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。#3291 で bind 先へ別のマウントを重ねた exec の拒否と監査の場面を足した（依存は不変）。
 # #1840 で sys の自前 FFI 宣言と libc の照合試験を追加した（dev-dependencies に workspace の libc =0.2.189。Linux のみ）。
 # #3065 で fandhe-container-net への workspace 内 path 依存（supervisor -> net の一方向。network-wiring.md D5）を追加した（外部クレートの追加なし）。
 # #3198 で netns holder の起動・回収（src/netns_holder.rs）と bin の振り分けを追加した（依存は不変）。

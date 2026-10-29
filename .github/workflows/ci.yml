@@ -1773,7 +1773,7 @@ jobs:
           fi
           echo "ESE_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: exec_subordinate_e2e の実行（実機前提テスト・--ignored・委譲スコープ。SEC-5・CORE-6・SUP-6・#2835）
+      - name: exec_subordinate_e2e の実行（実機前提テスト・--ignored・委譲スコープ。SEC-5・CORE-6・SUP-6・SEC-1・SEC-4・#2835・#3291。重ねた bind mount の exec 拒否と監査 1 件を含む）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
@@ -1783,7 +1783,7 @@ jobs:
             systemd-run --user --scope --quiet -p Delegate=yes -- "${ESE_BIN}" --ignored 2>&1 | tee "${log}"
           scripts/check-success-lines.sh --name exec_subordinate_e2e \
             --src crates/supervisor/tests/exec_subordinate_e2e.rs --log "${log}" \
-            --select '^exec_subordinate_e2e: (scenario=|create, start and exec)' --subst root=false --min 4 \
+            --select '^exec_subordinate_e2e: (scenario=|create, start and exec)' --subst root=false --min 5 \
             --forbid 'exec_subordinate_e2e: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 

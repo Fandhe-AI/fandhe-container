@@ -132,6 +132,11 @@ impl NetworkStore {
 }
 
 impl GlobalLockGuard<'_> {
+    /// 常に `Unimplemented`（Linux 実装と同じシグネチャ。#3362）。
+    pub fn list(&self) -> Result<NetworkListing, NetError> {
+        Err(unsupported())
+    }
+
     /// 常に `Unimplemented`。
     pub fn lock_network(&self, _name: &NetworkName) -> Result<NetworkLockGuard<'_>, NetError> {
         Err(unsupported())

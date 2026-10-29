@@ -606,25 +606,29 @@ impl NetworkStore {
     pub fn list(&self) -> Result<NetworkListing, NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreList, || {
             let _g = self.lock_global_shared()?;
-            let mut names = self.dir.entries(SCAN_LIMIT)?;
-            names.sort();
-            let mut out = NetworkListing::default();
-            for n in names {
-                if n == LOCK_FILE || n.starts_with(STAGING_PREFIX) || n.starts_with(REMOVING_PREFIX)
-                {
-                    continue;
-                }
-                if NetworkName::new(&n).is_err() || is_reserved_network_name(&n) {
-                    out.unrecognized += 1;
-                    continue;
-                }
-                match self.read_one(&n) {
-                    Ok(d) => out.definitions.push(d),
-                    Err(e) => out.broken.push((n, e.code())),
-                }
-            }
-            Ok(out)
+            self.list_locked()
         })
+    }
+
+    /// [`list`](Self::list) の本体。全体のロックを保持している呼び出し元（`GlobalLockGuard::list`）が使う。
+    fn list_locked(&self) -> Result<NetworkListing, NetError> {
+        let mut names = self.dir.entries(SCAN_LIMIT)?;
+        names.sort();
+        let mut out = NetworkListing::default();
+        for n in names {
+            if n == LOCK_FILE || n.starts_with(STAGING_PREFIX) || n.starts_with(REMOVING_PREFIX) {
+                continue;
+            }
+            if NetworkName::new(&n).is_err() || is_reserved_network_name(&n) {
+                out.unrecognized += 1;
+                continue;
+            }
+            match self.read_one(&n) {
+                Ok(d) => out.definitions.push(d),
+                Err(e) => out.broken.push((n, e.code())),
+            }
+        }
+        Ok(out)
     }
 
     /// 定義を消す。`definition` と `@lock` 以外の項目（メンバー等）があれば `FailedPrecondition`。
@@ -726,6 +730,15 @@ impl GlobalLockGuard<'_> {
             recorder: Arc::clone(&self.store.recorder),
             dir,
             file,
+        })
+    }
+
+    /// 全定義を名前順に返す（[`NetworkStore::list`] と同じ結果）。すでに全体のロックを持つ呼び出し元用で、
+    /// ロックを取り直さない（排他ロックの下で `NetworkStore::list` を呼ぶと自分のロックを待って `Timeout` になる。
+    /// 再起動後の `PortRegistry` の組み直しが使う。NET-3・#3362）。
+    pub fn list(&self) -> Result<NetworkListing, NetError> {
+        record_net_op(&*self.store.recorder, NetOpKind::NetworkStoreList, || {
+            self.store.list_locked()
         })
     }
 

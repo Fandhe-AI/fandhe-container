@@ -137,6 +137,22 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 - 記録が無い（`member not found`）・ホストの再起動をまたいで世代が違う場合は、記録から回収できない。「照合できない netns の pin の手動回収」の手順で、パスと endpoint を確認してから `umount` と `rm` を行い、veth は別名を確認して削除する
 - 旧形式の記録（`pin` 項目が無い）は pin が残っていると `Unknown` の取り残しで断られる。手動回収の後に、同じ入口を再実行すると記録が消える
 
+## 予約表の組み直しが不完全なとき（NET-3・REPAIR-4・REPAIR-5・#3362）
+
+再起動後、`rebuild_port_registry_recorded` が記録から `PortRegistry` を組み直す。読めない記録・食い違う記録が 1 件でもあると、予約表に「不完全」の印が立ち、受け口を伴う新規の公開と attach の公開が `FailedPrecondition`（`message` が `port registry is incomplete; rebuild from records failed`）で拒否される。公開なしの attach・detach・解除・ネットワーク削除は止まらない（解放は安全側のため）。
+
+見分け方:
+
+1. 拒否のメッセージが上記と一致する
+2. 組み直しの結果（`PortRegistryRebuild`）の `broken` に、壊れたネットワークの名前と分類が載っている。`DataLoss` はメンバー記録・請求書・`realized` の破損か所有トークンの食い違い、`FailedPrecondition` は `realized` が無いのにメンバー記録がある状態。`Timeout` はロック待ちの期限切れで、再実行で直ることが多い。`conflicts` が 1 以上なら、同じ受け口を複数の持ち主の記録が主張している
+3. `<状態ルート>/@networks/<ネットワーク名>/` の `members/`・`pending-reclaim/attach/`・`realized` を確認する（所有者・権限 0600 / 0700 も検査の対象）
+
+回復:
+
+- 壊れた記録が回収待ちの取り残しを表すなら、「attach の取り残し」「記録の検証で拒否された detach の見分け方と、記録からの回収」の手順で資源を回収し、記録を消す。記録を直せない場合は、残っている DNAT ルール・veth・pin を確認して手で外してから記録を消す
+- 修正または回収の後に、組み直しを再実行する（plugin / supervisor の再起動）。完全に成功すると印が外れる。印はメモリ上の値なので、プロセスの再起動でも消えるが、再起動後の組み直しでも同じ記録が壊れていれば再び立つ
+- 受け口を特定できない保持（`members-intent`・ルールの一覧が無い quarantine の請求書）は組み直しでは登録されない。残った DNAT は公開時のカーネル dump が検出して拒否する
+
 ## 削除後に残る conntrack の NAT エントリ（NET-1・NET-10・NET-11・#3348）
 
 `delete_network` は専用の nft テーブル（masquerade を含む）をテーブルごと消すが、カーネルの conntrack に既にあるエントリ（変換済みの接続の記録）は flush しない。masquerade の仕組みが conntrack を消すのは出口 interface の down・アドレス削除に紐づくエントリだけで、bridge の削除では消えない。残ったエントリはプロトコルごとのタイムアウト（`net.netfilter.nf_conntrack_*_timeout` の sysctl）まで生きる。

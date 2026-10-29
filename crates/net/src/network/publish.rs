@@ -194,6 +194,10 @@ type ListenerOwner = (NetworkName, EndpointId);
 /// 読み直し、競合検査と書き戻しを同じロックの中で行う。デーモンレス構成で別プロセスから接続した
 /// コンテナとも競合を検出できる。ロックの待ちには期限を設ける（REPAIR-5）。ファイルは所有者のみ
 /// 読み書き可（0600）で作り、symlink・通常ファイル以外・過大なファイル・壊れた内容は fail-closed で拒否する。
+///
+/// 組み直しの「不完全」の印は共有ファイルに載せず、プロセスごとに持つ。共有ファイルを使うプロセスも、最初の
+/// `reserve` の前に自分で `rebuild_port_registry_recorded` を呼ぶこと。`reserve` の製品の呼び出し元は、直前に
+/// カーネル dump の照合（`ensure_no_listener_conflict`）を通すこと（NET-3・REPAIR-4・#3433）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortRegistry {
     owners: HashMap<ListenerKey, ListenerOwner>,
@@ -201,7 +205,8 @@ pub struct PortRegistry {
     shared: Option<PathBuf>,
     /// 記録からの組み直しが不完全だった印。立っている間、受け口を伴う `reserve` は `FailedPrecondition` で拒否する
     /// （予約が足りないまま新規公開を通すと二重投入になりうるため。fail-closed。NET-3・REPAIR-4・#3362）。
-    /// 解放系（`release*`）は止めない。呼び出し側のメモリ上の値で、共有ファイルを使う他プロセスには伝わらない。
+    /// 解放系（`release*`）は止めない。呼び出し側のメモリ上の値で、他プロセスへは伝えない。各プロセスが自分で
+    /// 組み直す契約（#3433。同じ記録から同じ判定に至る）。
     incomplete: bool,
 }
 
@@ -563,6 +568,7 @@ impl PortRegistry {
     /// 共有ファイル使用時は、予約後の内容がサイズ上限を超えるなら書き込まず `ResourceExhausted`、
     /// 破損は `Internal`、ロック待ちの期限切れは `Timeout`（いずれも予約は増えない）。`ports` が空なら常に `Ok`。
     /// 組み直しが不完全な印（[`PortRegistry::is_incomplete`]）がある間、受け口を伴う予約は `FailedPrecondition`。
+    /// 製品の呼び出し元は直前にカーネル dump の照合を通すこと（受け口不明の保持の防御はそれに依る。#3433）。
     pub(crate) fn reserve(
         &mut self,
         network: &NetworkName,

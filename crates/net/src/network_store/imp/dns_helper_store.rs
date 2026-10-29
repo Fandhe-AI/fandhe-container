@@ -594,10 +594,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// REPAIR-5・NET-5: 回収前に終了してゾンビになった自分の子の候補は、回収されたうえで意図記録が消える。
+    /// NET-5・SEC-1・REPAIR-4・#3414: nonce も同一性も一致しない終了済みの自分の子の候補は、`waitid` で回収せず
+    /// 終了状態を奪わない（試験自身の `wait` が成功し SIGKILL を観測する）。意図記録は消える。
     #[test]
-    #[allow(clippy::zombie_processes)]
-    fn net7_3070_recovery_reaps_zombie_candidate() {
+    fn net7_3414_recovery_leaves_unattributed_zombie_candidate() {
         use crate::dns_helper::detach::{IntentRecovery, recover_dns_helper_intent};
         use crate::instrument::NoopNetOpRecorder;
         use std::process::{Command, Stdio};
@@ -629,8 +629,11 @@ mod tests {
         let r = recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
             .expect("recover");
         assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
-        assert!(!std::path::Path::new(&stat).exists(), "zombie reaped");
+        assert!(std::path::Path::new(&stat).exists(), "zombie left alone");
         assert_eq!(n.read_dns_helper_intent().expect("read"), None);
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = child.wait().expect("the exit status was not stolen");
+        assert_eq!(status.signal(), Some(9));
         drop(n);
         drop(g);
         let _ = fs::remove_dir_all(dir);

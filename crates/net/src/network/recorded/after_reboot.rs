@@ -34,8 +34,8 @@ use super::{
 
 /// 記録だけからメンバー 1 件を、再起動をまたいで切り離す本体（OS 非依存。カーネルの照会・pin の除去は `run`）。
 ///
-/// 手順は、関門 → 請求書の合成（veth・netns のみ。ルール無し・quarantine 無し）→ `run` → ポート予約の解放 →
-/// メンバー記録（と残っていれば意図記録）の削除。`run` が失敗したら記録と予約を残して [`RecordedError::Op`]。
+/// 手順は、関門 → 請求書の合成（veth・netns のみ。ルール無し・quarantine 無し）→ `run` →
+/// メンバー記録の削除 → ポート予約の解放 → 意図記録の削除（記録の削除が失敗したら予約は解放しない）。`run` が失敗したら記録と予約を残して [`RecordedError::Op`]。
 /// 成功したのに予約の解放・記録の削除に失敗したときは [`RecordedError::Uncommitted`]（再実行で収束する）。
 /// 1 件の操作として結果と所要時間を記録する（REPAIR-4）。
 // 実機の呼び出し（公開ラッパー）は Linux 限定。他 OS では試験だけが使う。
@@ -128,11 +128,16 @@ where
     })?;
     let report = run(&claim, &dir).map_err(RecordedError::Op)?;
     let endpoint = rec.endpoint().clone();
-    let finished = ports
-        .release(realized.name(), &endpoint)
-        .map(|_| ())
-        .and_then(|()| guard.remove_member(member_id))
-        .and_then(|_| guard.remove_member_intent(member_id).map(|_| ()));
+    // 先にメンバー記録を消し、成功してから予約を解放する（NET-3「記録に受け口の行がある間は予約を保つ」）。
+    // 記録の削除が失敗したら予約を解放せずに返す（fail-closed。再実行は同じ手順で収束する）。逆順だと、
+    // 解放済みの予約と publish 行を持つ記録が食い違い、別メンバーの予約で次回の再構築が衝突になる。
+    // 記録の削除後に共有ファイルの予約の解放だけが失敗した場合、記録は既に無いので再実行では NotFound になるが、
+    // 予約表は `rebuild_port_registry_recorded` が記録から組み直すため、取り残した予約は次の再構築で消える。
+    // メモリ上の予約表の `release` は失敗しない。
+    let finished = guard
+        .remove_member(member_id)
+        .and_then(|_| ports.release(realized.name(), &endpoint).map(|_| ()))
+        .and_then(|()| guard.remove_member_intent(member_id).map(|_| ()));
     match finished {
         Ok(()) => Ok(report),
         Err(error) => Err(RecordedError::Uncommitted {

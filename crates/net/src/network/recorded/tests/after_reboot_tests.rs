@@ -505,3 +505,53 @@ fn repair4_3412_after_reboot_records_every_outcome() {
         ]
     );
 }
+
+/// `dir` 配下から名前が `members` のディレクトリを探す。
+fn find_members_dir(dir: &Path) -> Option<PathBuf> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if e.file_name() == "members" {
+                return Some(p);
+            }
+            if let Some(f) = find_members_dir(&p) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// NET-3・#3412: メンバー記録の削除が失敗したら、予約を解放せず `Uncommitted` を返す（3 件のまま）。
+/// 書き込めるようにして再実行すると収束し、c1 の 2 件だけが解放されて 1 件になる。
+#[test]
+fn net3_3412_after_reboot_keeps_reservations_when_record_removal_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new("reboot-rmfail");
+    attach_two_in_old_boot(&t);
+    let store = NetworkStore::open(&t.0).unwrap();
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    let mut reg = reserved();
+    let members = find_members_dir(&t.0).expect("members dir");
+    // 関門を通った後（`run` の中）で members ディレクトリの権限を壊し、記録の削除だけを失敗させる。
+    let r = detach_member_after_reboot_with(
+        &host(),
+        &n,
+        &mid("c1"),
+        Path::new(NETNS_DIR),
+        &mut reg,
+        |_, _| {
+            std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o500)).unwrap();
+            Ok::<_, ()>(NetworkDeleteReport::default())
+        },
+    );
+    std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+    assert_eq!(n.members().unwrap().len(), 2);
+    assert_eq!(reg.len(), 3, "記録が残る間は予約を保つ");
+    let (r, _) = after_reboot(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+    assert!(r.is_ok());
+    assert_eq!(n.members().unwrap().len(), 1);
+    assert_eq!(reg.len(), 1);
+}

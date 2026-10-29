@@ -121,10 +121,17 @@ mod linux {
         EndpointId, FailedAttachClaim, FailedCreateClaim, NetworkCreateSpec, NetworkName,
         PortProtocol, PortPublish, PortRegistry, ResourceState, StaticIpam, VethNames,
         attach_container, attach_prepared_container, create_container_netns, create_network,
-        delete_network, detach_container, publish_container_ports, reclaim_failed_attach,
-        reclaim_failed_create, release_container_netns, unpublish_container_port,
+        delete_network, detach_container, publish_container_ports, published_dnat_listeners,
+        reclaim_failed_attach, reclaim_failed_create, release_container_netns,
+        unpublish_container_port,
     };
-    use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
+    use fandhe_container_net::nftables_batch::{
+        NetlinkNetfilterSocket, NftFamily, NftName, TableGet,
+    };
+    use fandhe_container_net::nftables_rules::{
+        DumpedRule, NftBitwise, NftCmp, NftCmpOp, NftMasq, NftMeta, NftMetaKey, NftPayload,
+        NftRegister, RuleDump,
+    };
 
     const LAUNCHER_PID_ENV: &str = "FANDHE_ATTACH_TEST_LAUNCHER_PID";
     const DIR_ENV: &str = "FANDHE_ATTACH_TEST_DIR";
@@ -138,8 +145,8 @@ mod linux {
     const ATTACH_CHILD_PREFIX: &str = "XATTACH_CHILD ";
     /// 成功行は veth の作成通知（`NLM_F_ECHO`。Issue #3205）が届く v6.2 以上か、届かない戻し経路かで 2 通り。
     /// `check-success-lines.sh` が試験ソースの文字列リテラルから導出するため、`format!` で組み立てず 2 つのリテラルで持つ。
-    const OK_LINE_ECHO_INDEX: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=index";
-    const OK_LINE_ECHO_FALLBACK: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=fallback";
+    const OK_LINE_ECHO_INDEX: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok masq_dump=ok masq_foreign=kept pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=index";
+    const OK_LINE_ECHO_FALLBACK: &str = "network_attach_privileged: ok master=bridge host=up peer=moved ifname=eth0 masq=ok masq_dump=ok masq_foreign=kept pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept unpublish=ok reclaim_xproc=ok reclaim_xproc_newer=kept reclaim_fault=ok reclaim_fault_unowned=kept reclaim_fault_post_ipam=ok rollback_post_ipam=released detach=ok detach_sibling=kept veth_echo=fallback";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -1000,6 +1007,10 @@ mod linux {
         let nft = NetlinkNetfilterSocket::open()?;
         let t = timeout();
 
+        // 他者のテーブル（`fandhe_net_` 接頭辞なし）を製品の符号化器を通さず nft コマンドで先に置き、
+        // create / delete が触れないことを後で照合する（NET-1・NET-11・#3348）。
+        let foreign = foreign_table_setup(&nft, t)?;
+
         let net = create_network(
             &route,
             &nft,
@@ -1044,6 +1055,10 @@ mod linux {
         if !post.contains("masquerade") {
             return Err(fail("masquerade rule is not in the postrouting chain"));
         }
+
+        // 製品の符号化とは別経路（公開の復号器で dump を読む）での照合（#3348）。期待値は定数から組み立てる。
+        verify_masquerade_dump(&nft, &net.table, &net.bridge, t)?;
+        foreign.assert_unchanged(&nft, t, "after create_network")?;
 
         // --- 成功経路 ---
         let spec = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?;
@@ -1671,6 +1686,21 @@ mod linux {
                 "nft ruleset still mentions the network table after delete_network",
             ));
         }
+        // テーブルごと消えたことを netlink でも確かめ、他者のテーブルは変わらない（#3348）。
+        match nft.table_info(&TableGet::new(NftFamily::Ipv4, net.table.clone()), t) {
+            Err(e) if e.code() == NetErrorCode::NotFound => {}
+            other => {
+                return Err(fail(format!(
+                    "network table is still readable after delete_network: {other:?}"
+                )));
+            }
+        }
+        let left = nft.dump_table_names(NftFamily::Ipv4, "fandhe_net_", 1024, t)?;
+        if left.contains(&net.table) {
+            return Err(fail("dump_table_names still lists the deleted table"));
+        }
+        foreign.assert_unchanged(&nft, t, "after delete_network")?;
+        foreign.cleanup();
         for pin in &pins {
             if pin.exists() {
                 return Err(fail(format!("pin {} still exists", pin.display())));
@@ -1695,6 +1725,160 @@ mod linux {
             ))
         })?;
         Ok(echo_supported)
+    }
+
+    /// 他者のテーブルの名前。`fandhe_net_` で始まらない。
+    const FOREIGN_TABLE: &str = "fcforeign";
+
+    /// 事前に置いた他者のテーブルの退避（dump と handle・userdata）。
+    struct Foreign {
+        name: NftName,
+        rules: Vec<DumpedRule>,
+        handle: Option<u64>,
+        userdata: Option<Vec<u8>>,
+    }
+
+    impl Foreign {
+        fn snapshot(nft: &NetlinkNetfilterSocket, t: Duration) -> Result<Self, NetError> {
+            let name = NftName::new(FOREIGN_TABLE)?;
+            let info = nft.table_info(&TableGet::new(NftFamily::Ipv4, name.clone()), t)?;
+            let rules = nft.dump_rules(&RuleDump::new(NftFamily::Ipv4, name.clone()), t)?;
+            Ok(Self {
+                name,
+                rules,
+                handle: info.handle(),
+                userdata: info.userdata().map(<[u8]>::to_vec),
+            })
+        }
+
+        /// 事前のスナップショットと dump・handle・userdata が一致する（他者のテーブルを触っていない）。
+        fn assert_unchanged(
+            &self,
+            nft: &NetlinkNetfilterSocket,
+            t: Duration,
+            when: &str,
+        ) -> Result<(), NetError> {
+            let now = Self::snapshot(nft, t)?;
+            if now.rules != self.rules || now.handle != self.handle || now.userdata != self.userdata
+            {
+                return Err(fail(format!("foreign table changed {when}")));
+            }
+            Ok(())
+        }
+
+        /// ベストエフォートで片づける（netns は終了で消えるため失敗しても影響しない）。
+        fn cleanup(&self) {
+            let _ = run_cmd("nft", &["delete", "table", "ip", self.name.as_str()]);
+        }
+    }
+
+    /// 他者のテーブル（nat の postrouting に masquerade とカウンタ）を `nft` コマンドで作って退避する。
+    fn foreign_table_setup(nft: &NetlinkNetfilterSocket, t: Duration) -> Result<Foreign, NetError> {
+        run_cmd("nft", &["add", "table", "ip", FOREIGN_TABLE])?;
+        run_cmd(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                FOREIGN_TABLE,
+                "postrouting",
+                "{ type nat hook postrouting priority 100 ; }",
+            ],
+        )?;
+        run_cmd(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                FOREIGN_TABLE,
+                "postrouting",
+                "ip saddr 192.0.2.0/24 masquerade",
+            ],
+        )?;
+        run_cmd(
+            "nft",
+            &["add", "rule", "ip", FOREIGN_TABLE, "postrouting", "counter"],
+        )?;
+        let snap = Foreign::snapshot(nft, t)?;
+        if snap.rules.len() != 2 {
+            return Err(fail(format!(
+                "foreign table must hold 2 rules, got {}",
+                snap.rules.len()
+            )));
+        }
+        Ok(snap)
+    }
+
+    /// bridge 名を NUL 詰めの 16 バイトにする（`oifname` の比較の形。製品の補助関数とは独立に書く）。
+    fn oifname_bytes(name: &str) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for (dst, src) in out.iter_mut().take(15).zip(name.as_bytes()) {
+            *dst = *src;
+        }
+        out
+    }
+
+    /// `create_network` 直後の dump を公開の復号器で読み、postrouting の masquerade が
+    /// ちょうど 1 件で 6 個の expr の具体値が期待どおりであることを照合する（NET-1・NET-11・#3348）。
+    fn verify_masquerade_dump(
+        nft: &NetlinkNetfilterSocket,
+        table: &NftName,
+        bridge: &IfName,
+        t: Duration,
+    ) -> Result<(), NetError> {
+        let rules = nft.dump_rules(&RuleDump::new(NftFamily::Ipv4, table.clone()), t)?;
+        let count = |chain: &str| rules.iter().filter(|r| r.chain().as_str() == chain).count();
+        if count("postrouting") != 1 || count("prerouting") != 0 || count("output") != 0 {
+            return Err(fail(format!(
+                "unexpected rule layout: postrouting={} prerouting={} output={}",
+                count("postrouting"),
+                count("prerouting"),
+                count("output")
+            )));
+        }
+        let rule = rules
+            .iter()
+            .find(|r| r.chain().as_str() == "postrouting")
+            .ok_or_else(|| fail("postrouting rule missing"))?;
+        let e = rule.exprs().exprs();
+        let [e0, e1, e2, e3, e4, e5] = e else {
+            return Err(fail(format!(
+                "masquerade rule has {} exprs, want 6",
+                e.len()
+            )));
+        };
+        if NftPayload::from_expr(e0)? != NftPayload::ipv4_saddr(NftRegister::REG_1)? {
+            return Err(fail("expr 0 is not the ipv4 saddr load"));
+        }
+        if NftBitwise::from_expr(e1)?.mask().as_bytes() != [255, 255, 255, 0] {
+            return Err(fail("expr 1 mask is not /24"));
+        }
+        let c2 = NftCmp::from_expr(e2)?;
+        if c2.op() != NftCmpOp::Eq || c2.data().as_bytes() != [10, 213, 0, 0] {
+            return Err(fail("expr 2 is not saddr == 10.213.0.0"));
+        }
+        if NftMeta::from_expr(e3)?.key() != NftMetaKey::OifName {
+            return Err(fail("expr 3 is not the oifname load"));
+        }
+        let c4 = NftCmp::from_expr(e4)?;
+        if c4.op() != NftCmpOp::Neq || c4.data().as_bytes() != oifname_bytes(bridge.as_str()) {
+            return Err(fail("expr 4 is not oifname != bridge"));
+        }
+        if NftMasq::from_expr(e5)? != NftMasq::new() {
+            return Err(fail("expr 5 is not a plain masquerade"));
+        }
+        // masquerade は DNAT の受け口として数えられない（NET-3 との整合）。
+        let listeners = published_dnat_listeners(nft, t)?;
+        if !listeners.is_empty() {
+            return Err(fail("masquerade was recognized as a DNAT listener"));
+        }
+        let names = nft.dump_table_names(NftFamily::Ipv4, "fandhe_net_", 1024, t)?;
+        if !names.contains(table) {
+            return Err(fail("dump_table_names does not list the network table"));
+        }
+        Ok(())
     }
 
     /// カーネルが `NLM_F_ECHO` 付きの link 作成に作成通知を返す版（v6.2 以上）かを `osrelease` から判定する。

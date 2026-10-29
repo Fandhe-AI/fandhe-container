@@ -1516,6 +1516,10 @@ pub struct ContainerAttachError {
 impl ContainerAttachError {
     /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無ければ `None`。
     /// quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、カーネル側の回収対象ではない。
+    ///
+    /// 請求書は DNAT ルールのハンドルを載せず、常に v1 になる（#3413）。結果不明の投入は `NftApplyFailure` が
+    /// ハンドルを持たず、記録の無い attach の経路はテーブルハンドルも持たないため、信頼できるハンドルが無い。
+    /// 残った DNAT ルールの回収は `delete_network`（テーブルごと）か手動（`docs/setup/network-reclaim-recovery.md`）。
     pub fn reclaim_claim(&self) -> Option<FailedAttachClaim> {
         let o = &**self.owner.as_ref()?;
         FailedAttachClaim::from_error(
@@ -5241,6 +5245,43 @@ mod attach_tests {
                 assert_eq!(pool.allocate(&eid("c2")).unwrap(), ip(3));
             }
         }
+    }
+
+    /// NET-1・NET-3・REPAIR-3・#3413: attach の巻き戻しの請求書は DNAT ルールのハンドルを載せず、常に v1 で符号化する。
+    /// 結果不明のバッチ（`Unknown`）は `NftApplyFailure` がハンドルを持たず、記録の無い attach の経路は
+    /// テーブルハンドルも持たないため、信頼できるハンドルが存在しない。確定的な失敗（`Aborted` / `NotSent`）は
+    /// ルールが残らないので請求書自体が無い。再起動後の回収側は
+    /// `delete::tests::net1_3285_reclaim_v1_claim_never_queries_the_table` が担保する。
+    #[test]
+    fn net1_3413_attach_rollback_claim_carries_no_rule_handles() {
+        for outcome in [NftBatchOutcome::Aborted, NftBatchOutcome::NotSent] {
+            let f = Fake {
+                fail_publish: Some((NetErrorCode::Timeout, outcome)),
+                ..Default::default()
+            };
+            let (mut pool, mut reg) = (ipam(), PortRegistry::new());
+            let s = spec_with_ports("c1", vec![port(8080)]);
+            let e = attach_container_with(&f, &s, &mut pool, &mut reg).unwrap_err();
+            assert_eq!(e.reclaim_claim(), None, "{outcome:?}");
+        }
+        let f = Fake {
+            fail_publish: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
+            ..Default::default()
+        };
+        let (mut pool, mut reg) = (ipam(), PortRegistry::new());
+        let s = spec_with_ports("c1", vec![port(8080)]);
+        let e = attach_container_with(&f, &s, &mut pool, &mut reg).unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert!(claim.port_rules().is_none());
+        let record = claim.to_record();
+        let lines: Vec<&str> = record.lines().collect();
+        assert_eq!(lines[0], "fandhe-net-attach-claim v1");
+        assert_eq!(&lines[5..], ["veth=0", "netns=0", "pin=-", "quarantine=1"]);
+        assert!(!record.contains("table-handle=") && !record.contains("rule="));
+        // 再起動をまたいだ読み込みの模擬: 復号して再符号化してもバイト単位で同じ。
+        let back = FailedAttachClaim::from_record(&record).unwrap();
+        assert_eq!(back, claim);
+        assert_eq!(back.to_record(), record);
     }
 
     /// NET-1・TASK-139.3: 既に公開済みの受け口（別コンテナ・別ネットワーク）を指定した接続は、veth・netns・IPAM を戻して `AlreadyExists`（`PublishPorts`）で失敗し、DNAT は投入しない。

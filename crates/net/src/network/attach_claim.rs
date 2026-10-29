@@ -16,6 +16,10 @@
 //!   公開の個別解除が失敗して DNAT ルールが残りうるときだけ載り、再起動後も `reclaim_failed_attach` が
 //!   テーブルの所有と実体の同一性を確かめてからハンドル指定で消す。旧バイナリは v2 を版の不一致として拒否する
 //!   （fail-closed。v2 から v1 への引き戻しは非対応）。
+//! - attach の巻き戻し（`from_error`）の請求書は常に v1（#3413・NET-1・NET-3）。投入が成功すれば attach は
+//!   `Ok` で、巻き戻す後段の手順が無い。結果不明の投入は `NftApplyFailure` がハンドルを持たず、記録の無い
+//!   経路はテーブルハンドルも持たない（`ClaimedRules` はテーブルハンドルが必須）。世代を証明できない
+//!   ハンドルで DELRULE を送ると別のルールを消しうるため、自動回収はせず quarantine と手動回収に倒す。
 //!
 //! 記録は信頼しない入力として扱い、最終的な所有の判定はカーネル側の別名（`host_owner_token`）と
 //! master の一致で行う。netns の pin の置き場は記録に載せず、呼び出し側の固定設定から受ける。
@@ -132,6 +136,7 @@ pub struct FailedAttachClaim {
 
 impl FailedAttachClaim {
     /// 取り残しの請求書を組む（`ContainerAttachError::reclaim_claim` から）。取り残しが無ければ `None`。
+    /// `rules: None` は漏れではなく構造上の結論（#3413）。理由はモジュール doc の「記録の版」を参照。
     pub(super) fn from_error(
         network: &NetworkName,
         token: &str,

@@ -30,7 +30,8 @@
 # lib・LIBTEST_NAME モードでも `require_cmd jq` を足す）。見直しのきっかけ: (a) libtest の cli.rs から logfile を消す PR が
 # マージされた・Compatibility Notes に載った (b) #140805 がマージされ stable になった (c) #49359 が stable になった
 # (d) repeat-test が `reason=logfile-unsupported` で失敗した。SUCCESS_LINE モード（harness = false）は `--logfile` を
-# 渡さないため削除の影響を受けない。なお `--nocapture` も 1.88.0 で deprecated（`--no-capture` が推奨。置き換えは別件）。
+# 渡さないため削除の影響を受けない。なお FORBIDDEN_LINE 指定時の `--no-capture` は 1.88.0 で導入（`--nocapture` は deprecated。rust-lang/rust#139224。#3263 で置換）。
+# 1.99.0 の cli.rs では両者とも同じ nocapture 設定。MSRV 指定が無く stable 追従のため 1.88.0 未満は支えない（非受理なら非 0 で reason=exit の fail-closed）。
 # stdout と stderr は別ファイルに取り、成功行・禁止行はストリームごとに照合する（試験自身の println と子の stderr が
 # 互いに割り込まない）。失敗時のダンプは見出しつきで 2 本を別に出すため、時系列の並びは失われる。
 # 残余: 同じストリームの別プロセスの書き込みが SUCCESS_LINE の途中に入る場合は救えない（libtest ハーネスは LIBTEST_NAME へ）。
@@ -192,8 +193,8 @@ if [ -n "${TEST}" ] || [ -n "${LIBTEST_NAME}" ]; then
   if command -v cygpath >/dev/null 2>&1; then log_arg="$(cygpath -m "${logf}")"; fi
   LOGARGS=(--logfile "${log_arg}")
   # 成功した試験の println!/eprintln! は既定でキャプチャされ、禁止行の照合に届かない。FORBIDDEN_LINE 指定時は
-  # --nocapture で出力を stdout/stderr へ流す（lib・LIBTEST_NAME・USER_SCOPE のすべてで LOGARGS が `--` 以降に渡る。P1）。
-  if [ "${#FORBIDDEN_ITEMS[@]}" -gt 0 ]; then LOGARGS+=(--nocapture); fi
+  # --no-capture で出力を stdout/stderr へ流す（lib・LIBTEST_NAME・USER_SCOPE のすべてで LOGARGS が `--` 以降に渡る。P1）。
+  if [ "${#FORBIDDEN_ITEMS[@]}" -gt 0 ]; then LOGARGS+=(--no-capture); fi
 fi
 
 # ビルドは 1 回だけ（以降は同じバイナリを繰り返す）。結合試験の名前誤り・required-features 不足もここで落ちる。

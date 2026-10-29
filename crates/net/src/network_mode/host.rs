@@ -10,14 +10,23 @@
 //! - ホスト netns の基準は runtime が渡す信頼済み識別子（[`NsId`]）のみ。`/proc/1/ns/net` は基準に使わない
 //!   （PID namespace 内では PID 1 がホストと別 netns になり得て、誤った基準で判定してしまうため）。
 //!   runtime はホスト側で取得した参照（起動時に保持した netns の (dev, ino) 等）を渡す責務を持つ。
-//!   rootless の本番経路の照合は core の fd 方式（exec 直前の同期点。#3206）が担い、pasta 構成（NET-9・TASK-147）は
-//!   core の同期点（fd 2 本と呼び出し側の合図。#1939）と holder（#3197）が担う。本モジュールの判定はそれらを置き換えない
+//!   rootless の host モード（NET-6）の本番経路は次の 2 段で、設計の出典は `docs/design/network-wiring.md` D8。
+//!   supervisor は start の入口（単一スレッド区間）で [`current_thread_netns`] により基準を取り、手順 4b で
+//!   作業スレッドが同じ netns にいることを [`HostNetns::detect`] で照合する（多重防御。基準が取れない、または
+//!   不一致なら `FailedPrecondition`。#1873）。子（PID 1）の照合は core の exec 直前の同期点（fd 方式。#3206）が
+//!   担い、(dev, ino) を core 自身が比べる。[`HostNetns::verify_ns_identity`] は fd 起点の照合用の純粋関数で、
+//!   現状の本番経路には呼び出し元が無い。rootless のユーザー定義名（pasta 構成。NET-9・TASK-147）は host モードとは
+//!   別の経路で、core の同期点（fd 2 本と呼び出し側の合図。#1939）と holder（#3197）が担う
+//!   （`docs/design/rootless-network.md`）。本モジュールの判定はそれらを置き換えない
 //! - 呼び出しスレッドが基準の netns 以外にいる場合は `FailedPrecondition`。setns による加入
 //!   （runtime 自体がホスト以外の netns で動く構成）は未実装の将来仕様（REPAIR-3）
 //! - netns はスレッド単位の属性で、`/proc/<pid>/ns/net` はそのうち 1 スレッド（`pid` 自身）しか示さない。
 //!   [`HostNetns::verify_process`] は `/proc/<pid>/task/` の全スレッドを照合し、1 つでも別 netns なら
 //!   `Other` を返す。判定は列挙時点のスナップショットで、列挙後に作られたスレッドや列挙後の
-//!   `setns(2)` は対象外。想定する呼び出し元は、exec 直後の自分の子を検証する runtime
+//!   `setns(2)` は対象外。本番の起動経路では使わない
+//!   （supervisor と exec 前の子は non-dumpable なので、親が procfs から子の netns を参照すると `PermissionDenied` に
+//!   なる。子の照合は core の同期点が担う。D8）。想定する呼び出し元は、子の procfs を読める（dumpable な）親が自分の子を
+//!   検証する場面で、実機前提の試験 `crates/net/tests/host_mode_privileged.rs` で照合している
 //! - procfs の `/proc/<pid>/task/` の 1 回の列挙は、列挙中に対象の別スレッドが終了すると生存スレッドを
 //!   1 つ取りこぼし得る（カーネルの readdir は、既に返したスレッドが `release_task` でスレッド一覧から
 //!   外れると、次の `getdents` をスレッドグループリーダーからの件数で再開するため、詰まった分だけ飛ぶ）。

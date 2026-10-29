@@ -211,7 +211,7 @@ pub fn create_etc_files(
 ) -> Result<CreatedEtcFiles, TraitError> {
     #[cfg(target_os = "linux")]
     {
-        linux::create(root, id, sel, &|_| Ok(()))
+        linux::create(root, id, sel, &linux::stat, &|_| Ok(()))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -280,7 +280,7 @@ mod linux {
     }
 
     /// fd の fstat（O_PATH fd でも可）。fd は複製して見るだけ。
-    fn stat(fd: BorrowedFd<'_>) -> Result<std::fs::Metadata, TraitError> {
+    pub(super) fn stat(fd: BorrowedFd<'_>) -> Result<std::fs::Metadata, TraitError> {
         let dup = fd
             .try_clone_to_owned()
             .map_err(|_| err(ErrorCode::Internal, "container etc files operation failed"))?;
@@ -360,10 +360,18 @@ mod linux {
         }
     }
 
+    /// `<state_root>/@container-etc/<id>/` を作り、選択したファイルを排他作成する。
+    ///
+    /// 失敗時は、この呼び出しが作ったものだけを消して `<id>` ごと巻き戻す（SEC-1・NET-12・REPAIR-3）。
+    /// 作成した fd は作成直後に `created` へ積み、metadata 取得などその後のどの手順が失敗しても
+    /// 巻き戻しの対象から漏れないようにする（取り残すと次の create が `AlreadyExists` で固まる）。
+    /// `inspect_created` は作成直後の metadata 取得の差し込み点（試験で失敗を注入する）、
+    /// `after_file` は 1 件完成するごとの差し込み点。
     pub(super) fn create(
         root: &Path,
         id: &ContainerId,
         sel: EtcFileSelection,
+        inspect_created: &dyn Fn(BorrowedFd<'_>) -> Result<std::fs::Metadata, TraitError>,
         after_file: &dyn Fn(usize) -> Result<(), TraitError>,
     ) -> Result<CreatedEtcFiles, TraitError> {
         if sel.is_empty() {
@@ -388,7 +396,8 @@ mod linux {
             Err(e) => return Err(sys_err(e)),
         }
         // 以降の失敗は、`<id>` を消すところまで巻き戻す。
-        let mut created: Vec<(EtcFileKind, (u64, u64))> = Vec::new();
+        let mut created: Vec<(EtcFileKind, std::fs::File)> = Vec::new();
+        let mut idents: Vec<(EtcFileKind, (u64, u64))> = Vec::new();
         let result = (|| -> Result<(), TraitError> {
             let dir_fd =
                 sys::open_dir_path_nofollow(Some(etc_fd.as_fd()), &id_name).map_err(sys_err)?;
@@ -405,11 +414,16 @@ mod linux {
                         e => sys_err(e),
                     },
                 )?;
-                let mut file = std::fs::File::from(fd);
-                let meta = file.metadata().map_err(|_| {
-                    err(ErrorCode::Internal, "container etc files operation failed")
-                })?;
-                created.push((kind, (meta.dev(), meta.ino())));
+                // 作った直後に積む。以降の失敗でも巻き戻しがこの fd から同一性を取れる。
+                created.push((kind, std::fs::File::from(fd)));
+                let Some((_, file)) = created.last_mut() else {
+                    return Err(err(
+                        ErrorCode::Internal,
+                        "container etc files operation failed",
+                    ));
+                };
+                let meta = inspect_created(file.as_fd())?;
+                idents.push((kind, (meta.dev(), meta.ino())));
                 let io = |_: std::io::Error| {
                     err(ErrorCode::Internal, "container etc files operation failed")
                 };
@@ -427,12 +441,19 @@ mod linux {
             Ok(()) => {
                 sync_dir(&etc_dir(root, id));
                 sync_dir(&root.join(ETC_DIR_NAME));
-                Ok(CreatedEtcFiles { files: created })
+                Ok(CreatedEtcFiles { files: idents })
             }
             Err(e) => {
                 if let Ok(dir_fd) = sys::open_dir_path_nofollow(Some(etc_fd.as_fd()), &id_name) {
-                    for (kind, ident) in &created {
-                        remove_if_same(dir_fd.as_fd(), kind.file_name(), *ident);
+                    for (kind, file) in &created {
+                        // 同一性を確かめられないものは消さない（fail-safe）。
+                        if let Ok(meta) = stat(file.as_fd()) {
+                            remove_if_same(
+                                dir_fd.as_fd(),
+                                kind.file_name(),
+                                (meta.dev(), meta.ino()),
+                            );
+                        }
                     }
                 }
                 let _ = sys::remove_dir_at(etc_fd.as_fd(), &id_name);
@@ -498,13 +519,39 @@ mod linux {
         sel: EtcFileSelection,
         fail_after: usize,
     ) -> Result<CreatedEtcFiles, TraitError> {
-        create(root, id, sel, &|n| {
+        create(root, id, sel, &stat, &|n| {
             if n == fail_after {
                 Err(err(ErrorCode::Internal, "injected failure"))
             } else {
                 Ok(())
             }
         })
+    }
+
+    /// 試験用: `fail_at` 番目のファイルの作成直後の metadata 取得だけを失敗させる（REPAIR-3・NET-12）。
+    #[cfg(test)]
+    pub(super) fn create_failing_metadata(
+        root: &Path,
+        id: &ContainerId,
+        sel: EtcFileSelection,
+        fail_at: usize,
+    ) -> Result<CreatedEtcFiles, TraitError> {
+        let calls = std::cell::Cell::new(0usize);
+        create(
+            root,
+            id,
+            sel,
+            &|fd| {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n == fail_at {
+                    Err(err(ErrorCode::Internal, "injected failure"))
+                } else {
+                    stat(fd)
+                }
+            },
+            &|_| Ok(()),
+        )
     }
 }
 
@@ -771,6 +818,31 @@ mod tests {
             assert!(etc_file_path(dir.path(), &id("other"), EtcFileKind::Hosts).exists());
             // 巻き戻し後に同じ ID を作り直せる。
             create_etc_files(dir.path(), &cid, both()).expect("recreate");
+        }
+
+        /// REPAIR-3・NET-12・SEC-1: 作成直後の metadata 取得が失敗しても、空ファイルも `<id>` も残さない。
+        #[test]
+        fn net12_metadata_failure_rolls_back_without_leftovers() {
+            for fail_at in [0usize, 1] {
+                let dir = state_root();
+                create_etc_files(dir.path(), &id("other"), both()).expect("other");
+                let cid = id("c1");
+                let e = linux::create_failing_metadata(dir.path(), &cid, both(), fail_at)
+                    .expect_err("inject");
+                assert_eq!(e.code(), ErrorCode::Internal);
+                for kind in [EtcFileKind::Hosts, EtcFileKind::ResolvConf] {
+                    let p = etc_file_path(dir.path(), &cid, kind);
+                    assert_eq!(
+                        std::fs::symlink_metadata(&p).expect_err("gone").kind(),
+                        std::io::ErrorKind::NotFound,
+                        "fail_at={fail_at}"
+                    );
+                }
+                assert!(!etc_dir(dir.path(), &cid).exists(), "fail_at={fail_at}");
+                assert!(etc_file_path(dir.path(), &id("other"), EtcFileKind::Hosts).exists());
+                assert!(etc_file_path(dir.path(), &id("other"), EtcFileKind::ResolvConf).exists());
+                create_etc_files(dir.path(), &cid, both()).expect("recreate");
+            }
         }
 
         /// NET-12: remove は `<id>` の中身（`apply_dns` の一時ファイルを含む）を消し、2 回目は NotPresent。

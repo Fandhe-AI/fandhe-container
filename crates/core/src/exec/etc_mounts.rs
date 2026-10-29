@@ -47,7 +47,8 @@
 //!   2 モデルだけ。rootful 固有の分岐は持たない
 //! - 範囲写像でコンテナの uid 0 が実効 uid に写らない構成では、元の辿り直しが `EACCES` になり `FailedPrecondition` で拒否する
 //! - 先が symlink の場合は解決せず拒否する（D9 の決定・#3210。再検討の条件は D9 の「残余・見直し条件」）。違反記録は付けて
-//!   親へ渡すが、本番の sink への配線は `violation.rs` の記述どおり未実装
+//!   親へ渡し、状態 pipe の段 `etc_files` → 親の `resolve_pre_pivot_status` → `record_launch_mount_rejection_at`
+//!   （段 `mount_etc_files`）→ 本番 launcher の `audit_sink` の順で監査の記録先へ届く（配線済み。#1815・#1816・#1819・SEC-4）
 //! - `/etc/hostname` は対象外（D9）
 
 use std::ffi::CString;

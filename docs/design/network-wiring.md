@@ -345,7 +345,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 
 ## 実装 issue
 
-親: #3056（#3206 の親は #3032）。依存欄は各 issue の本文を正とする。状態は 2026-10-28 時点で、正は各 issue の状態。
+親: #3056（#3206 の親は #3032）。依存欄は各 issue の本文を正とする。状態は 2026-10-29 時点で、正は各 issue の状態。
 
 | issue | 内容 | 担当 | 依存 | 状態 |
 | ----- | ---- | ---- | ---- | ---- |
@@ -368,6 +368,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3061 | net: attach で peer を `eth0` へリネーム（D11） | net-builder | なし | 実装済み（PR #3190） |
 | #3062 | net: attach 済みコンテナ単体の切り離し（D11） | net-builder | なし | 実装済み（PR #3192） |
 | #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし | 実装済み（PR #3193。共有ロックと投入後の事後確認は #3191） |
+| #3191 | net: 公開の共有ロックと投入後の事後確認（D11。#3063 の残り） | net-builder | #3207・#3074 | 未実装（#3207 の判断と #3074 の結線待ち） |
 | #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 | 未実装 |
 
 Issue #3067 の実装メモ: 記録は `crates/net/src/network_store/`（`member`・`realized`・`ipam_rebuild`・`imp/records.rs`）、記録つきの合成は `crates/net/src/network/recorded.rs`。D11 の列挙に、メンバー記録へ `token`（host veth の所有トークン）・`netns-dir`・`netns-dir-id` を補助項目として足した（組み直した IPAM に `NetnsDirRecord` を戻し、`delete_network` が復元した払い出しの pin を判定不能として扱う劣化を避けるため）。`CreatedNetwork::name_resolution` は記録せず、復元時に呼び出し側が渡す。残った `realized.intent` のカーネル照合（昇格または巻き戻し）、実体の無い `members-intent/*` の掃除、`--dns` 上流をヘルパーが消費する部分（#3071・#3072）は後続で、それまで `realized.intent` が残るネットワークの次の操作は `FailedPrecondition` で拒否し、意図記録のアドレスは使用中として数え続ける。

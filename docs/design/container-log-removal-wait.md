@@ -453,12 +453,34 @@ plugin-cri の再起動をまたぐときは readopt の `stale_create`（`relea
 readopt の表の行は増えない。記録ファイルを書く・消す時点（write-ahead・commit の put・`remove_record`・sandbox の `record_write` の guard）は動かしていない。
 pod の期限で `unpersist_sandbox` に入れなかったときも、sandbox の記録ファイルとメモリは notready で残る。
 
+### Create の巻き戻し中の期限切れのコード（#3307・CRI-2・REPAIR-4・REPAIR-5）
+
+**競争の仕組み**: `create_container_runtime` の worker は、失敗の出口で `InFlightGuard` の Drop が `release_bounded`（期限は Drop 開始 + `runtime_timeout`）を実行してから結果を送る。
+待ち手の期限（待ち始め + `runtime_timeout`）は送信より先に切れうるため、prepare が即座に失敗し解放が期限まで掛かると、RPC のコードは「待ち手の `DEADLINE_EXCEEDED`」と「worker が送る prepare のコード」のどちらかになり、OS のタイマー粒度で決まっていた（#3257。macOS・Windows で `ResourceExhausted`）。
+prepare 以外でも、write-ahead・`attach_prepared`・確定失敗の `create`・Created 以外の応答・commit 前の失敗など、巻き戻しの解放が打ち切られる出口はすべて同じ競争に入っていた。
+
+**決定（採用）**: 巻き戻しの解放が期限で打ち切られたときは、worker も待ち手と同じ `DEADLINE_EXCEEDED`・固定文言（`runtime operation timed out`）を返す。
+Create の失敗の出口を 1 か所にまとめ、送信より前に `InFlightGuard::rollback` を明示的に呼び、結果（`RollbackOutcome::ReleaseCut`）を `create_error_after_rollback` でエラーへ写す。Drop は panic・起動前の破棄の予備として残し、`rolled_back` で二重実行を防ぐ。
+
+| 案 | 採否 | 理由 |
+| -- | ---- | ---- |
+| A: 打ち切られたら worker も `DEADLINE_EXCEEDED` | 採用 | どちらが勝っても同じ Status になる。記録は Unknown（`runtime_owned`）で残るため、確定失敗に見えるコードは状態と食い違う。新しい数値を足さない |
+| B: 結果を先に送り、巻き戻しは後で続ける | 不採用 | エラーが返った時点で記録が消えている性質が崩れ、kubelet の即時の再試行で名前が衝突する窓が広がる |
+| C: 解放の期限を RPC の残りから余裕を引いた値にする | 不採用 | 新しい数値が要り、数値の見直しはオーナー判断 |
+| D: prepare のコードを優先し、巻き戻しの結果は別の欄で出す | 不採用 | 応答にもエラーにも使える欄が無い（kubelet は Message しか見ない） |
+| E: 採らず文書化だけ | 不採用 | メッセージと REPAIR-4 の観測が揺れたまま残る |
+
+- 解放の失敗が期限切れ以外（`Internal` 等）のときは元のコードを返す（`RollbackOutcome::Kept`）。対象は Create のみ（Remove の解放は既に `Timeout` を返す。Start・Stop は解放しない）
+- kubelet の扱い（kubernetes v1.37.1。`cri-client/pkg/remote_runtime.go` の `CreateContainer`、`kuberuntime_container.go` の `startContainer`）: エラーのコードでは分岐せず、Message をイベント（`FailedToCreateContainer`）に出して後退つきで再試行する。このため揺れていたのは利用者に見えるメッセージと plugin-cri の `CriOpRecorder`（REPAIR-4）が記録するコードで、決定的にする価値は観測と試験の再現性にある
+- 照合: `cri2_repair5_3307_create_rollback_cut_returns_deadline_exceeded`（旧来の競争の場面そのもの。3 OS で同じコード）・`cri2_repair5_3307_create_rollback_release_failure_keeps_original_code`・lib の `create_error_after_rollback_maps_only_a_cut_release` ほか
+- 残余（REPAIR-3）: 打ち切り時は prepare 等の元のコードが応答から失われる（CRI に欄が無い。記録は `ContainerStatus` で Unknown として見える）。解放が打ち切られずに RPC の期限の直後に終わる通常の期限際の競争は、新しい数値を足さずには消せない
+
 ### 残余（#3142 の後）
 
 - core の delete の区間（外部プロセスとファイル I/O）と記録ストアの fsync の停止は打ち切らない
 - 起動時の `release_stale_creates` は `call_with_deadline` で release を切り離す方式のまま（`release_bounded` への移行は別 issue）
 - `network_owned` の埋め込みの Stop の経路で期限が効くことの専用試験は無い（各段が同じ `step_within` を通る）
-- Create の RPC の期限と巻き戻しの解放の期限は同じ `runtime_timeout` のため、prepare が即座に失敗し解放が期限まで掛かると、RPC が返すコード（`DEADLINE_EXCEEDED` か prepare のコード）はタイマー粒度の競争で決まる（macOS・Windows で後者になる）。どちらでも記録は Unknown で残り RemoveContainer で回収できる。試験は prepare を保留して RPC の期限切れを先に確定させる（#3257・CRI-2・REPAIR-5）。製品側でコードを決定的にするかは未判断
+- Create の RPC の期限と巻き戻しの解放の期限は同じ `runtime_timeout` のため、prepare が即座に失敗し解放が期限まで掛かると、RPC が返すコード（`DEADLINE_EXCEEDED` か prepare のコード）はタイマー粒度の競争で決まる（macOS・Windows で後者になる）。どちらでも記録は Unknown で残り RemoveContainer で回収できる。試験は prepare を保留して RPC の期限切れを先に確定させる（#3257・CRI-2・REPAIR-5）。#3307 で解放の打ち切りは `DEADLINE_EXCEEDED` に揃えた（上の節）
 
 ### macOS・Windows の繰り返し実行の記録（#3296・CRI-2・CRI-3・REPAIR-5・REPAIR-12）
 

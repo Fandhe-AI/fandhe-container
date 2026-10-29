@@ -236,6 +236,16 @@ pub(crate) fn drain_output_file(path: &std::path::Path, cap: u64) -> Result<Vec<
     result
 }
 
+/// `drain_output_file` のエラーを、上限超過なら `check_cap`・pipe 方式と同じ `<name> exceeded the <cap> byte
+/// capture cap` に揃える（どの経路で検出しても同じ文言にする）。それ以外は `<name>: <e>`。
+fn file_err(name: &str, e: String, cap: u64) -> String {
+    if e.starts_with("output exceeded the ") {
+        format!("{name} exceeded the {cap} byte capture cap")
+    } else {
+        format!("{name}: {e}")
+    }
+}
+
 /// 出力ファイルが `cap` バイトを超えて大きいか。メタデータが読めないときは `Err`。
 fn exceeds_cap(path: &std::path::Path, cap: u64) -> Result<bool, String> {
     std::fs::metadata(path)
@@ -339,8 +349,9 @@ impl Pipes {
         }
     }
 
-    /// 両方の読み手が終わる（EOF・上限・エラー）のを `PIPE_EOF_GRACE` まで待ち、貯まった分を取り出す。
-    fn take(&self, cap: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+    /// 両方の読み手が終わる（EOF・上限・エラー）のを `PIPE_EOF_GRACE` まで待つ。子が上限超過の pipe 閉鎖で
+    /// 書き込みエラーになり終了した場合に、終了の検出より先に超過の印を確実に見るために使う。
+    fn wait_finished(&self) {
         let until = Instant::now() + PIPE_EOF_GRACE;
         let finished = |s: &Stream| {
             s.lock()
@@ -350,6 +361,11 @@ impl Pipes {
         while !(finished(&self.out) && finished(&self.err)) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// 読み手が終わるのを待ち（`wait_finished`）、貯まった分を取り出す。
+    fn take(&self, cap: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.wait_finished();
         let mut res = Vec::new();
         for (name, s) in [("stdout", &self.out), ("stderr", &self.err)] {
             let g = s.lock().map_err(|_| format!("{name}: reader panicked"))?;
@@ -403,8 +419,8 @@ impl Captured {
         killed?;
         Ok(Output {
             status,
-            stdout: stdout.map_err(|e| format!("stdout: {e}"))?,
-            stderr: stderr.map_err(|e| format!("stderr: {e}"))?,
+            stdout: stdout.map_err(|e| file_err("stdout", e, self.cap))?,
+            stderr: stderr.map_err(|e| file_err("stderr", e, self.cap))?,
         })
     }
 
@@ -443,7 +459,16 @@ impl Captured {
         };
         loop {
             match child.try_wait() {
-                Ok(Some(st)) => return Ok(st),
+                Ok(Some(st)) => {
+                    // 終了を検出したときも上限超過を確かめ、検出経路によらず同じ `Err` にする。
+                    if let Some(p) = &self.pipes {
+                        p.wait_finished();
+                    }
+                    return match self.check_cap() {
+                        Ok(()) => Ok(st),
+                        Err(e) => stop(child, e),
+                    };
+                }
                 Ok(None) => {}
                 Err(e) => return stop(child, format!("try_wait on child {pid} failed: {e}")),
             }
@@ -622,9 +647,13 @@ pub(crate) fn output_within_mode(
     let program = cmd.get_program().to_string_lossy().into_owned();
     let (mut child, captured) = spawn_captured_mode(cmd, cap, mode)?;
     match captured.wait_within(&mut child, within) {
-        Ok(status) => captured
-            .finish(status)
-            .map_err(|e| format!("{program}: {e}")),
+        Ok(status) => captured.finish(status).map_err(|e| {
+            if e.starts_with("stdout exceeded") || e.starts_with("stderr exceeded") {
+                format!("{program} {e}")
+            } else {
+                format!("{program}: {e}")
+            }
+        }),
         Err(e) => {
             let e = match captured.discard() {
                 Ok(()) => e,

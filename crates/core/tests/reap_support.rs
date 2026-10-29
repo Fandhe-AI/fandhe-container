@@ -220,10 +220,9 @@ fn repair5_repair12_output_over_cap_is_err() {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let err = reap::output_within_capped(&mut cmd, Duration::from_secs(30), 4096)
         .expect_err("over cap must fail");
-    assert!(
-        err == format!("{program} stdout exceeded the 4096 byte capture cap")
-            || err == format!("{program}: stdout: output exceeded the 4096 byte capture cap"),
-        "unexpected message: {err}"
+    assert_eq!(
+        err,
+        format!("{program} stdout exceeded the 4096 byte capture cap")
     );
 }
 
@@ -255,7 +254,7 @@ fn repair5_repair12_captured_finish_rejects_over_cap_and_removes_files() {
     let st = reap::wait_within(&mut child, Duration::from_secs(30)).expect("exit");
     let out_path = captured.out_path.clone();
     let err = captured.finish(st).expect_err("over cap");
-    assert_eq!(err, "stdout: output exceeded the 1024 byte capture cap");
+    assert_eq!(err, "stdout exceeded the 1024 byte capture cap");
     assert!(!out_path.exists(), "temp file left: {}", out_path.display());
 }
 
@@ -400,11 +399,10 @@ fn repair5_repair12_pipe_mode_cuts_endless_output_at_cap() {
         reap::CaptureMode::Pipes,
     )
     .expect_err("endless output must fail");
-    // 読み手が pipe を閉じた直後に子が SIGPIPE 等で終わると、finish 側の文言になる（どちらも上限超過）。
-    assert!(
-        err == format!("{program} stdout exceeded the 65536 byte capture cap")
-            || err == format!("{program}: stdout: output exceeded the 65536 byte capture cap"),
-        "unexpected message: {err}"
+    // 子が先に終わっても（読み手の閉鎖で書き込みエラー）、終了の検出時に上限超過を確かめて同じ文言にする。
+    assert_eq!(
+        err,
+        format!("{program} stdout exceeded the 65536 byte capture cap")
     );
     assert!(
         start.elapsed() < Duration::from_secs(20),
@@ -448,5 +446,24 @@ fn repair5_repair12_pipe_mode_descendant_flood_is_cut() {
     match err {
         Ok(out) => assert!(out.stdout.len() <= 64 * 1024),
         Err(e) => assert!(e.contains("exceeded the 65536 byte capture cap"), "{e}"),
+    }
+}
+
+/// 検出経路によらず上限超過の文言は 1 通り（子が出力後すぐ終了する場面を、ファイル・pipe の両方式で）。
+/// `flood:N` は N バイトを書いて直ちに終わるため、終了の検出と上限超過が同じポーリングに重なる。
+#[test]
+fn repair5_repair12_over_cap_error_is_same_when_child_exits_immediately() {
+    for mode in [reap::CaptureMode::Files, reap::CaptureMode::Pipes] {
+        for _ in 0..5 {
+            let mut cmd = self_cmd(FLOOD_TEST, "flood:200000");
+            let program = cmd.get_program().to_string_lossy().into_owned();
+            let err = reap::output_within_mode(&mut cmd, Duration::from_secs(30), 4096, mode)
+                .expect_err("over cap must fail");
+            assert_eq!(
+                err,
+                format!("{program} stdout exceeded the 4096 byte capture cap"),
+                "mode {mode:?}"
+            );
+        }
     }
 }

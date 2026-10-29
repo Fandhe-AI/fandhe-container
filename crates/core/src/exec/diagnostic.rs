@@ -217,14 +217,15 @@ mod tests {
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, Vec::<u8>::new());
 
-        let dir = std::env::temp_dir().join(format!("fandhe-diag-1697-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("stderr.log");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-diag-1697",
+            std::time::Duration::from_secs(10),
+        );
+        let path = scratch.path().join("stderr.log");
         let file = std::fs::File::create(&path).unwrap();
         assert_eq!(emit_diagnostic_line_to(file.as_fd(), DEVPTS_LINE), dropped);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(file);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         // `O_NOCTTY`（Linux の x86_64・aarch64 とも 0o400）で制御端末を取得しない。
         let ptmx = std::fs::OpenOptions::new()

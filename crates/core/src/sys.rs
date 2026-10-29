@@ -7835,6 +7835,12 @@ mod tests {
             devpts_real_mount_inner();
             return;
         }
+        // マウント先の親は pid だけの名前にせず `ScratchDir` にする（残骸との衝突を避ける。#3373・REPAIR-12）。
+        // 内側は子の `mnt` にだけマウントし、親自体にはマウントしない（drop の rmdir が EBUSY にならない）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-devpts",
+            std::time::Duration::from_secs(10),
+        );
         let exe = std::env::current_exe().unwrap();
         let mut child = std::process::Command::new("unshare")
             .args([
@@ -7853,6 +7859,7 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(INNER_ENV, "1")
+            .env(DEVPTS_DIR_ENV, scratch.path())
             .spawn()
             .expect("spawn unshare (util-linux required)");
         // 相手の終了待ちには必ず期限を設ける（REPAIR-5）。
@@ -7870,14 +7877,20 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        // 内側が作った空のマウント先（子の pid 名）を後始末する。マウントは namespace と共に消えている。
-        let _ =
-            std::fs::remove_dir(std::env::temp_dir().join(format!("fandhe-devpts-{}", child.id())));
+        // 内側が作った空のマウント先は `scratch` の drop が消す。マウントは namespace と共に消えている。
         assert!(
             status.success(),
             "inner devpts mount test failed: {status:?}"
         );
     }
+
+    /// 外側の試験が内側へマウント先の親（`ScratchDir`）を渡す環境変数名（試験専用）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const DEVPTS_DIR_ENV: &str = "FANDHE_DEVPTS_MOUNT_DIR";
 
     /// [`core1_sec1_task29_devpts_real_mount`] の内側（新しい user + mount namespace の中）。
     #[cfg(all(
@@ -7887,7 +7900,15 @@ mod tests {
     ))]
     fn devpts_real_mount_inner() {
         use std::os::unix::fs::MetadataExt as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-devpts-{}", std::process::id()));
+        // 外側が渡した `ScratchDir` の子へマウントする。未設定・不在は fail-closed で panic する。
+        let parent = std::path::PathBuf::from(
+            std::env::var_os(DEVPTS_DIR_ENV).expect("FANDHE_DEVPTS_MOUNT_DIR must be set"),
+        );
+        assert!(
+            parent.is_dir(),
+            "FANDHE_DEVPTS_MOUNT_DIR must be a directory"
+        );
+        let dir = parent.join("mnt");
         std::fs::create_dir(&dir).unwrap();
         let cdir = CString::new(dir.to_str().unwrap()).unwrap();
         let target = open_dir_path_nofollow(None, &cdir).unwrap();

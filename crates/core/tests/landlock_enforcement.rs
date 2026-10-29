@@ -13,6 +13,8 @@
 
 #[path = "support/reap.rs"]
 mod reap;
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -114,12 +116,10 @@ fn main() {
 
     let exe = std::env::current_exe().expect("current_exe");
     for mode in ["--child-nnp-unset", "--child-enforce"] {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-landlock-enf-{}-{}",
-            std::process::id(),
-            mode.trim_start_matches('-')
-        ));
-        std::fs::create_dir_all(&dir).expect("create probe dir");
+        // pid だけの名前の残骸と衝突しないよう `ScratchDir` の下に置く（#3373・REPAIR-12）。
+        let scratch = scratch_root::ScratchDir::new("fandhe-landlock-enf", Duration::from_secs(10));
+        let dir = scratch.path().join(mode.trim_start_matches('-'));
+        std::fs::create_dir(&dir).expect("create probe dir");
         let mut child = Command::new(&exe)
             .arg(mode)
             .arg("--probe-dir")
@@ -135,13 +135,11 @@ fn main() {
             }
             if Instant::now() >= deadline {
                 crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
-                let _ = std::fs::remove_dir_all(&dir);
                 panic!("landlock_enforcement child {mode} timed out");
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         let out = child.wait_with_output().expect("wait_with_output");
-        let _ = std::fs::remove_dir_all(&dir);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             status.success(),

@@ -2169,13 +2169,10 @@ mod tests {
         }
     }
 
-    /// 書き手のいない FIFO でブロックせず、非通常ファイルとして拒否する（REPAIR-5・ERR-1）。
-    /// Linux / macOS の双方で実行する（`mkfifo` の失敗は skip せずテスト失敗にする）。
+    /// `dir` の下に書き手のいない FIFO `config.json` を作り、ブロックせず非通常ファイルとして拒否されることを照合する。
+    /// 一時領域の確保は呼び出し側（`ScratchDir` の子）が担う。
     #[cfg(unix)]
-    #[test]
-    fn repair5_load_config_rejects_fifo_without_blocking() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    fn fifo_config_rejected_in(dir: &std::path::Path) {
         let fifo = dir.join("config.json");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -2190,7 +2187,54 @@ mod tests {
                 field: "config.json"
             }
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 書き手のいない FIFO でブロックせず、非通常ファイルとして拒否する（REPAIR-5・ERR-1）。
+    /// Linux / macOS の双方で実行する（`mkfifo` の失敗は skip せずテスト失敗にする）。
+    /// 一時領域は pid だけの名前にせず `ScratchDir` の下に置く（残骸との衝突を避ける。#3373・REPAIR-12）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_load_config_rejects_fifo_without_blocking() {
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        fifo_config_rejected_in(scratch.path());
+    }
+
+    /// 旧方式の pid だけの名前の残骸（FIFO）が残っていても、`ScratchDir` 上の FIFO 試験が通る（#3373・REPAIR-12）。
+    /// 残骸は排他作成できた場合だけ自分で消す（既にあれば本物の残骸として使い、消さない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair12_3373_fifo_config_test_survives_legacy_residue() {
+        let legacy = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
+        let created = std::fs::create_dir(&legacy).is_ok();
+        let status = std::process::Command::new("mkfifo")
+            .arg(legacy.join("config.json"))
+            .status()
+            .expect("run mkfifo");
+        // 本物の残骸なら FIFO が既にあるため失敗してよい。ここでは存在だけを要求する。
+        let _ = status;
+        assert!(
+            std::fs::symlink_metadata(legacy.join("config.json")).is_ok(),
+            "legacy residue must exist"
+        );
+        struct Cleanup(std::path::PathBuf, bool);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+        }
+        let _cleanup = Cleanup(legacy.clone(), created);
+
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        assert_ne!(scratch.path(), legacy.as_path());
+        fifo_config_rejected_in(scratch.path());
     }
 
     /// 既知フィールドが存在して `null` の場合は省略とみなさず `Data` で拒否する（OCI-4）。
@@ -2249,8 +2293,11 @@ mod tests {
     /// 非通常ファイル（ディレクトリ）は 3 OS で同じ分類になる（ERR-1・REPAIR-5）。
     #[test]
     fn err1_directory_config_is_invalid_on_all_os() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-dir-{}", std::process::id()));
-        let target = dir.join("config.json");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-dir",
+            std::time::Duration::from_secs(10),
+        );
+        let target = scratch.path().join("config.json");
         std::fs::create_dir_all(&target).expect("mkdir");
         let e = load_config(&target).expect_err("directory");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
@@ -2264,20 +2311,20 @@ mod tests {
             e.message(),
             "config.json has an invalid value for `config.json`"
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// 途中の要素が通常ファイルのパス（`<file>/config.json`）は 3 OS で `NotFound` になる（ERR-1）。
     #[test]
     fn err1_path_through_regular_file_is_not_found_on_all_os() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-notdir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let file = dir.join("bundle");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-notdir",
+            std::time::Duration::from_secs(10),
+        );
+        let file = scratch.path().join("bundle");
         std::fs::write(&file, b"{}").expect("write");
         let e = load_config(&file.join("config.json")).expect_err("not a directory");
         assert_eq!(e.code(), ErrorCode::NotFound);
         assert_eq!(*e.kind(), OciConfigErrorKind::Io);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
@@ -3262,8 +3309,11 @@ mod tests {
 
     #[test]
     fn oci4_load_config_reads_file_and_reports_errors() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-config",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().to_path_buf();
 
         let ok = dir.join("config.json");
         std::fs::write(&ok, serde_json::to_vec(&base()).expect("ser")).expect("write");
@@ -3282,8 +3332,6 @@ mod tests {
         let missing = load_config(&dir.join("missing.json")).expect_err("missing");
         assert_eq!(missing.code(), ErrorCode::NotFound);
         assert_eq!(*missing.kind(), OciConfigErrorKind::Io);
-
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// `args` / `env` の 1 要素は上限ちょうどを受理し、1 バイト超過を拒否する（OCI-4・CORE-2）。

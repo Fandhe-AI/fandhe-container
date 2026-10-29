@@ -2516,13 +2516,15 @@ mod platform_tests {
         r.unwrap_err().code().as_str()
     }
 
-    fn scratch_lock_file(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-state-lockfile-{tag}-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir.join(LOCK_FILE_NAME)
+    /// 一時領域（`ScratchDir`。drop で消える）とその下のロックファイルのパスを返す。
+    /// 呼び出し側は試験の最後まで guard を束縛する（pid だけの名前の残骸を避ける。#3373・REPAIR-12）。
+    fn scratch_lock_file(tag: &str) -> (crate::scratch_root::ScratchDir, PathBuf) {
+        let scratch = crate::scratch_root::ScratchDir::new(
+            &format!("fandhe-state-lockfile-{tag}"),
+            Duration::from_secs(10),
+        );
+        let path = scratch.path().join(LOCK_FILE_NAME);
+        (scratch, path)
     }
 
     fn open_lock(path: &Path) -> File {
@@ -2538,7 +2540,7 @@ mod platform_tests {
     /// REPAIR-5・TASK-157.9: 別の記述子が保持するロックは期限で打ち切り、`Timeout` で失敗する（3 OS）。
     #[test]
     fn repair5_task157_9_lock_file_until_times_out_when_held() {
-        let path = scratch_lock_file("timeout");
+        let (_scratch, path) = scratch_lock_file("timeout");
         let holder = open_lock(&path);
         holder.try_lock().unwrap();
         let waiter = open_lock(&path);
@@ -2551,13 +2553,12 @@ mod platform_tests {
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
         drop(holder);
         drop(waiter);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// TASK-157.9: 保持側が解放すれば（即時でも期限内の遅延でも）取得できる（3 OS）。
     #[test]
     fn repair5_task157_9_lock_file_until_acquires_after_release() {
-        let path = scratch_lock_file("acquire");
+        let (_scratch, path) = scratch_lock_file("acquire");
         let holder = open_lock(&path);
         holder.try_lock().unwrap();
         let releaser = std::thread::spawn(move || {
@@ -2572,7 +2573,6 @@ mod platform_tests {
         let again = open_lock(&path);
         lock_file_until(&again, Instant::now() + Duration::from_secs(1)).unwrap();
         drop(again);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

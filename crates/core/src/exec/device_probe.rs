@@ -137,12 +137,13 @@ mod tests {
             eprintln!("skipped: running as root (CAP_MKNOD present)");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("fandhe-devprobe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let node = dir.join("n");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-devprobe",
+            std::time::Duration::from_secs(10),
+        );
+        let node = scratch.path().join("n");
         assert_eq!(make_char_device_errno(&node, 1, 3), Some(1));
         assert!(std::fs::symlink_metadata(&node).is_err());
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// 範囲外の番号・相対パスは `-1` で拒否する（試験用の入口）。

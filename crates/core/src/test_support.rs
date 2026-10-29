@@ -493,4 +493,49 @@ mod private_fs_tests {
         assert_eq!(inner, std::path::PathBuf::from("/"));
         assert_eq!(std::env::current_dir().expect("cwd after"), before);
     }
+
+    /// REPAIR-12・#3373: 旧方式の pid だけの名前の残骸（FIFO を含む）が残っていても、`ScratchDir` は別名の空の
+    /// ディレクトリを排他作成し、残骸には触れない。drop は自分のパスだけを消す。
+    /// 残骸は排他作成できた場合だけ自分で消す（既に存在すれば本物の残骸として使い、消さない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair12_3373_scratch_dir_ignores_legacy_pid_residue() {
+        use std::os::unix::fs::FileTypeExt as _;
+        struct Cleanup(std::path::PathBuf, bool);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+        }
+        let legacy =
+            std::env::temp_dir().join(format!("fandhe-repair12-3373-{}", std::process::id()));
+        let created = std::fs::create_dir(&legacy).is_ok();
+        let _cleanup = Cleanup(legacy.clone(), created);
+        if created {
+            let status = std::process::Command::new("mkfifo")
+                .arg(legacy.join("config.json"))
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed: {status:?}");
+            std::fs::write(legacy.join("file"), b"x").expect("write residue");
+        }
+
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-repair12-3373",
+            std::time::Duration::from_secs(10),
+        );
+        let path = scratch.path().to_path_buf();
+        assert_ne!(path, legacy);
+        assert_eq!(std::fs::read_dir(&path).expect("read_dir").count(), 0);
+        let fifo = std::fs::symlink_metadata(legacy.join("config.json")).expect("residue fifo");
+        assert!(fifo.file_type().is_fifo(), "{:?}", fifo.file_type());
+        drop(scratch);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(std::fs::symlink_metadata(legacy.join("config.json")).is_ok());
+    }
 }

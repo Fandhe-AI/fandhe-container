@@ -13,6 +13,9 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use fandhe_container_core::exec::{
     DiagnosticDelivery, DiagnosticDropReason, emit_diagnostic_line_to,
 };
@@ -74,14 +77,12 @@ fn diagnostic_line_is_not_written_to_non_sockets() {
     r.read_to_end(&mut got).unwrap();
     assert_eq!(got, Vec::<u8>::new());
 
-    let dir = std::env::temp_dir().join(format!("fandhe-diag-it-1697-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("stderr.log");
+    let scratch = scratch_root::ScratchDir::new("fandhe-diag-it-1697", Duration::from_secs(10));
+    let path = scratch.path().join("stderr.log");
     let file = std::fs::File::create(&path).unwrap();
     assert_eq!(emit_diagnostic_line_to(file.as_fd(), LINE), dropped);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     drop(file);
-    std::fs::remove_dir_all(&dir).unwrap();
 
     let null = std::fs::OpenOptions::new()
         .write(true)

@@ -325,16 +325,15 @@ mod tests {
     /// nsfs でない通常ファイルは `InvalidArgument`。
     #[test]
     fn regular_file_is_invalid_argument() {
-        let dir = std::env::temp_dir().join(format!("ns-join-reg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let file = dir.join("f");
+        let scratch =
+            crate::scratch_root::ScratchDir::new("ns-join-reg", std::time::Duration::from_secs(10));
+        let file = scratch.path().join("f");
         std::fs::write(&file, b"x").expect("write");
         let f = file.to_str().expect("utf8");
         assert_eq!(
             code(pin(f, "/proc/self/ns/ipc")),
             ErrorCode::InvalidArgument
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// 不在のパスは `FailedPrecondition`（終了済みの pod の保持役など）。

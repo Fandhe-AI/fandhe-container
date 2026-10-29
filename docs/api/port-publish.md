@@ -4,7 +4,7 @@ rootless のユーザー定義ネットワーク（pasta 構成）では、`crea
 
 ## 現状（重要）
 
-`-p` の解析と作成前の検証、起動オプション文書 `FCOPT1` の kind `publish` は実装済みだが、文書への記録（#1873）と pasta の起動経路への結線（#1940）が済むまで、検証を通った `-p` も `UNIMPLEMENTED` で拒否する（受理して黙って捨てない。REPAIR-3）。
+`-p` の解析と作成前の検証、起動オプション文書 `FCOPT1` の kind `publish` は実装済みで、supervisor 側の pasta の結線と `publish` の反映も #1940 で実装済みだが、CLI が rootless のユーザー定義名を受けて文書へ記録する #3329 が済むまで、検証を通った `-p` も `UNIMPLEMENTED` で拒否する（受理して黙って捨てない。REPAIR-3）。
 
 ## 書き方
 

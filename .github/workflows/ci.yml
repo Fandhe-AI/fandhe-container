@@ -898,6 +898,7 @@ jobs:
         if: env.HANG_PROBE != 'true'
         # 本ステップだけ timeout-minutes 10（他の自己テストは 5。#3238）。Windows の Git Bash はプロセス生成が遅く、
         # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限 60 分の範囲内
+        # #3378・#3399 の後の main の Windows は 149〜152 秒（上限比 25%。件数 92。#3378 単体は 76 秒・件数 84）。監視の刻みの変更（Phase B）は未採用（#3421）
         timeout-minutes: 10
         run: |
           date +%s > "$RUNNER_TEMP/cli-parity-selftest.start"
@@ -1739,6 +1740,27 @@ jobs:
             --select '^fork_exec_isolation: fork/exec verified' --subst is_root=false \
             --forbid 'root=true' --forbid 'fork_exec_isolation: ignored' --forbid 'not applicable' \
             --forbid 'not verified' --summary
+
+      # capabilities（`crates/core/tests/capabilities.rs`。SEC-1・CORE-5・REPAIR-12・#3422）: fork した実コンテナプロセスの
+      # exec 前の capability を親の /proc/<pid>/status で照合する実機前提テスト（harness = false）。前提の AppArmor の緩和は
+      # 上のステップを再利用する（Landlock は使わない）。`--ignored` が届かなくても exit 0 になるため成功行を試験ソースから
+      # 導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: capabilities のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test capabilities --no-run
+
+      - name: capabilities の実行（実機前提テスト・--ignored。SEC-1・CORE-5・#3422）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/capabilities.log"
+          cargo test -p fandhe-container-core --test capabilities -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name capabilities \
+            --src crates/core/tests/capabilities.rs --log "${log}" \
+            --select '^capabilities: SEC-1 ' --subst-pos false --min 2 \
+            --forbid 'root=true' --forbid 'capabilities: ignored' --forbid 'not applicable' --summary
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

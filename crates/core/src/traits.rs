@@ -6,7 +6,7 @@
 //!
 //! | トレイト | 実装の置き場所 |
 //! | -------- | -------------- |
-//! | `ContainerRuntime` | plugin（別プロセス＋UDS。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114） |
+//! | `ContainerRuntime` | plugin（別プロセス＋UDS。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114） |
 //! | `NetworkPlugin` | plugin（別プロセス＋UDS） |
 //! | `StateStore` | core に既定実装（ファイルベース）。plugin で差し替え可能 |
 //! | `VolumeProvider` | core（データパス。トレイト定義・実装とも core 側） |

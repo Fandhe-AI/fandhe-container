@@ -2162,7 +2162,7 @@ mod tests {
                     "--exact",
                     "cdi_apply::hooks::run::tests::bundle_remove_refuses_bind_mount_boundary",
                     "--ignored",
-                    "--nocapture",
+                    "--no-capture",
                 ])
                 .env("FANDHE_GPU_NS_INNER", "1")
                 .status()

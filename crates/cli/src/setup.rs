@@ -19,7 +19,7 @@
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
 //!
-//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
+//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
 //! 日常操作コマンドからの切り離しは TASK-80.2 で確立済み（参照点は `commands::run_setup` のみ）。分離の単体テストは `tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 
 use std::io::Write;

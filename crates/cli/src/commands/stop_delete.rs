@@ -83,7 +83,7 @@
 //!   （`systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>`。検出が成功し、スコープの不一致から
 //!   記録の経路へ入る）。検出の失敗を記録の経路へ回すかはオーナー判断待ち（core の契約の変更になる）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では `production_runtime` が
-//!   `plugin_backend` を呼び、現状は必ず fail-closed で失敗する（起動と RPC は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125）。
+//!   `plugin_backend` を呼び、現状は必ず fail-closed で失敗する（起動と RPC は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125）。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

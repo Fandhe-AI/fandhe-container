@@ -57,7 +57,7 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 | 照合できない netns の pin（旧いバイナリの請求書、置き場の `.owned/<endpoint>` の欠落・破損・不一致、`ns=-` のままの pin、none モードの pin） | 請求書と永続の所有記録とカーネルの実状態の三者が一致する pin しか外さない（一致する pin は plugin の再起動後も自動回収される。#2824） | 下の手順 |
 | 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>/g/<32 桁の 16 進>` で終わるものだけが対象。`<32 桁の 16 進>` は接続ごとの世代で、同じ endpoint の再接続では変わる。請求書の `generation` と一致しない veth は別の接続のもので消さない） |
 | 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 下の「手順（所有トークンを持つ bridge）」 |
-| アドレス・ポート予約と、ルールのハンドルを持てなかった DNAT ルール（quarantine）がカーネル側の回収後も残るとき（`detach` の失敗でルールのハンドルを請求書に載せられた DNAT ルールは、`detach` の回収が消す。#3285） | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される |
+| アドレス・ポート予約と、ルールのハンドルを持てなかった DNAT ルール（quarantine）がカーネル側の回収後も残るとき（`detach` の失敗でルールのハンドルを請求書に載せられた DNAT ルールは、`detach` の回収が消す。#3285） | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される。ネットワークを残す場合は下の「ハンドルを持たない DNAT ルール」 |
 | 壊れた attach の記録 | 復号できない（ファイルは消えずに残り、同じコンテナの再 attach は `AlreadyExists` で拒否される） | 資源を確認・削除したうえで、記録ファイルを手で消して plugin を再起動する |
 
 復元したネットワークで `delete_network` が `attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim` の `FailedPrecondition` を返したら、取り残しの回収は済み、ネットワーク本体（bridge・nft テーブル）は手動回収が必要という意味である。
@@ -71,6 +71,45 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 5. `ip -o link show` で、その endpoint の host veth（世代が請求書と一致するもの）と pin の両方が無いことを確認してから、`attach/<endpoint>.attach` を手で消す（請求書は全対象資源の回収を確認した後にだけ消す。veth が残ったまま消すと追跡できなくなり、再 attach が `AlreadyExists` になる）
 
 root を要する操作で、ホストの他の netns を巻き込まないよう、必ずパスと endpoint を確認してから実行する。
+
+## ハンドルを持たない DNAT ルールの quarantine と手動回収（NET-1・NET-3・REPAIR-4・#3413）
+
+次の公開は、ルールのハンドルがどのテーブルの世代のものか証明できないため、再起動後も自動回収されない（テーブルを作り直すとハンドルの採番がやり直しになり、古いハンドルの削除は別のルールを消しうる）。
+
+- `attach` の巻き戻しで DNAT の投入結果が不明だった公開（請求書は v1 で `quarantine=1`。veth・netns を戻せていれば `veth=0`・`netns=0`）
+- `detach` の失敗でテーブルハンドルを持たなかった公開、テーブルハンドルが食い違う公開
+
+見分け方:
+
+1. `pending-reclaim/attach/<endpoint>.attach` が `fandhe-net-attach-claim v1` で `quarantine=1`（`head -1` と `grep quarantine`）。記録つきの attach なら `members-intent/<id>` も残る
+2. `nft -a list table ip fandhe_net_<名前>` に、該当 endpoint のアドレス宛ての `dnat to <アドレス>:<ポート>` が見える
+
+回収:
+
+経路で手段が違う。`@networks/<名前>/` の状態ストアにネットワークの記録がある（記録つきの）ネットワークかどうかで分ける。
+
+- 記録の無い経路（プロセス内の保持だけのネットワーク）: 第一の手段は `delete_network`。テーブルごと消え、アドレスと予約も解放される。quarantine の解放は `delete_network` の後（または plugin の再起動の後）である
+- 記録つきの経路（`@networks/<名前>/pending-reclaim/attach/` の請求書や `members-intent/<id>` が残るもの）: `delete_network` は第一の手段にならない。回収待ちの請求書または意図記録が残る間、`network has pending reclaim records`（または `network has an unreconciled operation` / `network still has members`）の `FailedPrecondition` で拒否される。先に対象資源を手動で回収し、請求書と意図記録を整理してから進める（下の手順）
+- ネットワークを残すとき、および記録つきの経路では、下の「B. メンバー単体の回復」の手順 3 と同じく、宛先が該当アドレスのルールだけを `nft -a` のハンドルを指定して消す。確定メンバーの DNAT・masquerade・テーブルは消さない。判別できなければ消さない
+- 消したあと、全資源（ルール・veth・pin）が無いことを確かめてから請求書（`pending-reclaim/attach/<endpoint>.attach`）と該当の `members-intent/<id>` を手で消し、plugin を再起動する。そのうえで、ネットワークが不要なら `delete_network` を呼ぶ
+
+root と `CAP_NET_ADMIN` を要する操作で、名前・ハンドル・アドレスを確かめてから実行する。
+
+## v2 の請求書が残ったまま旧バイナリへ戻した場合（NET-1・REPAIR-4・#3285・#3413）
+
+attach の請求書の先頭行が `fandhe-net-attach-claim v2`（`head -1`）の記録は、DNAT ルールのハンドルを載せた記録である。旧バイナリはこれを版の不一致（`attach claim record version mismatch`）として拒否する（fail-closed）。plugin-cri では壊れた記録と同じ扱いで、`net.reclaim_store_load` の失敗件数と stderr の `unusable pending-reclaim record(s)` に現れ、ファイルは消えず、同じ endpoint の再 attach は `AlreadyExists` になる。`@networks/<名前>/pending-reclaim/attach/` の請求書も同じ符号化のため同様に読めない。
+
+推奨: v2 を読めるバイナリへ戻し、`detach`・`delete_network` で自動回収させてから、改めてダウングレードする。
+
+戻せない場合の手動回収:
+
+1. 記録の `table-handle=` と `rule=<proto addr:port cport pre out>` を読む
+2. `nft -a list table ip fandhe_net_<名前>` で、テーブルの所有（別名・トークン）と、生きたテーブルのハンドルが `table-handle` と一致することを確かめる。一致しなければテーブルは作り直されておりルールは既に無いので、何も消さない
+3. 一致すれば `nft delete rule ip fandhe_net_<名前> prerouting handle <pre>` と `nft delete rule ip fandhe_net_<名前> output handle <out>` を実行する
+4. veth・pin が残っていれば、上の「attach の取り残し」の手動回収に従う
+5. 全資源が無いことを確かめてから請求書を手で消し、plugin を再起動する
+
+root と `CAP_NET_ADMIN` を要する操作で、名前・ハンドルを確かめてから実行する。
 
 ## 未完了の操作の記録（`realized.intent`）と接続の意図記録（`members-intent`）（#3346）
 
@@ -134,8 +173,49 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 回収:
 
 - メンバー記録が残っている場合は、`detach_member_recorded`（記録だけから行う入口）を同じメンバー ID で呼ぶ。排他ロック・世代の一致・回収待ちの請求書が無いことが前提で、`netns_dir` は接続時と同じ固定設定を渡す。失敗しても記録は残り、再実行で収束する。`pending-reclaim/attach` に同じ endpoint の請求書があるときは先に `reclaim_failed_attach` で回収する。公開に解除の印が残るときは先に `unpublish_port_recorded` を呼ぶ
-- 記録が無い（`member not found`）・ホストの再起動をまたいで世代が違う場合は、記録から回収できない。「照合できない netns の pin の手動回収」の手順で、パスと endpoint を確認してから `umount` と `rm` を行い、veth は別名を確認して削除する
+- メンバー記録が残っている場合は、`detach_member_recorded`（記録だけから行う入口）を同じメンバー ID で呼ぶ。排他ロック・世代の一致・回収待ちの請求書が無いことが前提で、`netns_dir` は接続時と同じ固定設定を渡す。失敗しても記録は残り、再実行で収束する。`pending-reclaim/attach` に同じ endpoint の請求書があるときは先に `reclaim_failed_attach` で回収する。公開に解除の印が残るときは先に `unpublish_port_recorded` を呼ぶ
+- ホストの再起動をまたいで世代が違う場合（`realized` の boot ID が現在と違う）は、`detach_member_recorded_after_reboot` を呼ぶ（次の「再起動をまたいだ記録の回収」）。同じ boot で network namespace だけ違う場合、カーネルに同名の資源が残る場合、置き場に pin が残る場合は、入口が断るので手動回収のままにする
+- 記録が無い（`member not found`）場合は、記録から回収できない。「記録の無いコンテナの手動回収」の手順で回収する
 - 旧形式の記録（`pin` 項目が無い）は pin が残っていると `Unknown` の取り残しで断られる。手動回収の後に、同じ入口を再実行すると記録が消える
+
+## 再起動をまたいだ記録の回収（NET-1・NET-3・SEC-1・REPAIR-4・#3412）
+
+ホストを再起動すると、bridge・host veth・nsfs のマウント・nft テーブルはカーネルから消え、`@networks` の記録（`realized`・`members/<id>`）、ポート予約、`<netns_dir>/<endpoint>` の空ファイルと `.owned/<endpoint>` だけが残る。この状態は通常の `detach_member_recorded` では抜けられない（世代の照合で断られる）。
+
+見分け方:
+
+1. `@networks/<ネットワーク名>/realized` の boot ID が `/proc/sys/kernel/random/boot_id` と違う
+2. 通常の入口の戻り値が `recorded nft handles belong to another boot or network namespace`
+3. `ip -o link show` に host veth（別名 `<token>/ep/<endpoint>/g/<世代>`）・bridge が無く、`nft list tables` に `fandhe_net_<名前>` が無い
+
+回収: `detach_member_recorded_after_reboot`（記録だけから行う再起動後の入口）を、メンバーごとに同じメンバー ID と `netns_dir`（接続時と同じ固定設定）で呼ぶ。
+
+- 前提: 排他ロック、`realized.intent` と `members-intent/<id>` の残りが無いこと、同じ endpoint の `pending-reclaim/attach` の請求書が無いこと（あれば先に `reclaim_failed_attach`）。解除の印や墓標が残る公開もこの入口が予約ごと解放する
+- この入口はカーネル資源を消さない。bridge・テーブル・host veth が今の boot に無いことを照会で確かめ、残った空の pin ファイルと `.owned/<endpoint>`、ポート予約、メンバー記録（= アドレス）だけを片付ける。DELRULE は送らない
+- 全メンバーを片付けたら `delete_network_recorded` を呼ぶと `realized` が消え、同じ名前で作り直せる
+- 失敗しても記録は残り、再実行で収束する
+
+断られたとき（手動回収）:
+
+| 拒否の文言（`message`） | 意味 | 手動の手順 |
+| ---- | ---- | ---- |
+| `member belongs to the current boot; use detach_member_recorded` | boot ID が同じ（再起動をまたいでいない） | 通常の `detach_member_recorded` を使う |
+| `record is from another network namespace of the same boot` | 同じ boot で netns だけ違う。資源が別の namespace で生きている可能性がある | 該当の namespace を確かめてから、下の「記録の無いコンテナの手動回収」の手順で個別に回収する |
+| `resources of the recorded network exist in this boot` / `host veth of the member exists in this boot` | 同名のテーブル・bridge・veth が今の boot にある（ルールセットの復元・同名の再作成） | `nft list tables`・`ip -o link show` で所有を確かめ、他者のものは触れない。自分のものだけ `nft delete table ip <テーブル名>`、`ip link delete <名前>` で消してから再実行する |
+| `netns pin remains in a directory that differs from the record` | 置き場が作り直されたのに同名の pin が残っている | 「照合できない netns の pin の手動回収」の手順でパスと endpoint を確認し、`umount`（マウントがあれば）と `rm` を行ってから再実行する |
+| `netns pin is mounted in this boot` / `claim has no pin identity; netns pin left in place` | pin にマウントがある、または識別子の無い旧形式で pin が残っている | 同上。マウントは今の boot の別の利用者のものかもしれないので、`findmnt` で確認してから `umount` する |
+| `endpoint has a pending reclaim record` | 回収待ちの請求書がある | 先に `reclaim_failed_attach` で回収する（再起動前の請求書は世代を照合しないため、ルールハンドルの再利用に注意し、テーブルが作り直されているなら `nft -a list table` でルールを確かめる） |
+
+## 記録の無いコンテナの手動回収（`member not found`。#3412）
+
+`detach_container_recorded` が `member not found` で拒否した場合、渡されたコンテナは破棄され、記録も請求書も無い。破棄された pin を自動では回収しない（`.owned/<endpoint>` はネットワーク・メンバー・接続の世代に結びつかず、記録の無い生きた利用者を除外できないため）。手動で次を行う。
+
+1. 全ネットワークの `members/*`・`members-intent/*`・`pending-reclaim/attach/*` と、旧置き場 `.cri/net/pending-reclaim/attach/` に、その endpoint を参照するものが無いことを確かめる（あれば上の入口や `reclaim_failed_attach` で回収する）
+2. `lsns -t net`・`findmnt` で、その netns の利用者（生きたコンテナ）がいないことを確かめる
+3. host veth の別名（`ip -o link show` の `alias`。`.../ep/<endpoint>/g/<世代>`）と master を確かめてから `ip link delete <host veth 名>` で消す
+4. `nft -a list table ip fandhe_net_<名前>` で、宛先がそのコンテナのアドレスの DNAT ルールだけをハンドル指定で消す（`nft delete rule ip <テーブル> <チェイン> handle <番号>`）
+5. `umount <netns_dir>/<endpoint>` してから、pin ファイルと `<netns_dir>/.owned/<endpoint>` を `rm` で消す
+6. プロセス内の予約表には予約が残る。plugin / supervisor を再起動して、記録から組み直す
 
 ## 予約表の組み直しが不完全なとき（NET-3・REPAIR-4・REPAIR-5・#3362）
 

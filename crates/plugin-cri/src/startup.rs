@@ -5,7 +5,7 @@
 //! 診断は固定文言のみで、引数の値は含めない。
 //! 受ける形は `--help`（単独）・`--socket <PATH>`・`--socket=<PATH>`。socket パスは絶対パスで `..` を含まないこと
 //! だけをここで検証し、配置ディレクトリの所有者・0700・symlink・`sun_path` 長は bind 側（`UdsListener::bind`）に任せる。
-//! 既定の socket パスの解決は未定義（spec に定めが無い。#459・#1869 で決める）ため、引数なしは成功を装わず失敗させる（REPAIR-3）。
+//! 既定の socket パスの解決は未定義（spec に定めが無い。#459 と #1869 の設計〔承認と実装 issue の起票は #2232〕で決める）ため、引数なしは成功を装わず失敗させる（REPAIR-3）。
 
 use std::ffi::OsString;
 use std::path::{Component, PathBuf};

@@ -33,7 +33,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 検証後の起動と RPC の本番配線（#1869）。
+//! - 検証後の起動と RPC の本番配線（#1869 の設計。承認と実装 issue の起票は #2232）。
 
 use crate::error::{PluginError, PluginErrorCode};
 use std::fs::File;

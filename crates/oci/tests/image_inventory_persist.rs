@@ -108,7 +108,7 @@ fn oci7_inventory_child_leaves_lease() {
 
 fn run_child(test: &str, root: &Path) {
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .args(["--exact", test, "--test-threads=1", "--no-capture"])
         .env(ROOT_ENV, root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

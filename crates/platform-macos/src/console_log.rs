@@ -35,7 +35,7 @@
 //!   現在のログが無い・空なら世代を消費しない。世代ファイルや保護入力に異常があれば何も動かさず拒否する。
 //! - 削除: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete では
 //!   `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。delete からの呼び出しの配線は
-//!   plugin-macos の delete 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）待ちで、本 crate では部品の提供までである。
+//!   plugin-macos の delete 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）待ちで、本 crate では部品の提供までである。
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};

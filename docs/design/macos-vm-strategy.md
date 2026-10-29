@@ -68,7 +68,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 - I/O 共有プロトコル（IO-1）のクライアント側 UDS `connect`（`PipelineClient` の本番結合）は未実装である。plugin 境界の `UdsStream::connect`（`fandhe-container-plugin`。plugin-macos が core へ接続する経路）は実装済みで、別物である。io crate の vsock は Linux では実装済み（#1119）だが、macOS の VZ vsock（`VZVirtioSocketDevice`）は `Unimplemented` である
 - ゲスト init（指示を読んで mount し報告するもの）は `crates/guest-init` のソース（#1875）と initrd の梱包スクリプト（#1878）が済み、実機確認（#1628）が未実施である。mount 指定つきの `Vm::launch` は、実機で報告が届くかが未確認である
 - plugin 境界越しの配線（TASK-115。#384〜#390 は完了）は plugin 側で配線済みである: 起動引数と socket の解決（`startup`）・長さ接頭辞フレームの送受信ループ（`frame_loop`）・peer 認証つき `UdsStream::connect` による core への接続（socket は core が bind する。PLUG-12）・`adapter` による create / start / stop の platform-macos への委譲と `ping`・SIGTERM での `stop_all`・E2E 結合テスト
-- 未実装: kill / delete / state（`UNIMPLEMENTED` を返す）。要求本体は `Vec<String>` の暫定ワイヤー契約で、型つき本体への置き換えが要る。core 側から plugin-macos を起動して RPC する配線（発見・検証・spawn・型つきの `ContainerRuntime` proxy）は無い（コード doc は TASK-114 と書くが、配線の設計は #1869 で決める）。`VirtiofsIoClient` / `ReconnectingVirtiofsIoClient` は plugin-macos から使われていない。コンソールログの削除（`remove_console_logs`）を呼ぶ箇所が無い。状態はプロセス内のメモリだけに持つ。動作は 1 コンテナ = 1 VM である
+- 未実装: kill / delete / state（`UNIMPLEMENTED` を返す）。要求本体は `Vec<String>` の暫定ワイヤー契約で、型つき本体への置き換えが要る。core 側から plugin-macos を起動して RPC する配線（発見・検証・spawn・型つきの `ContainerRuntime` proxy）は無い（コード doc は TASK-114 と書くが、配線の設計は #1869 で書かれ、承認と実装 issue の起票は #2232）。`VirtiofsIoClient` / `ReconnectingVirtiofsIoClient` は plugin-macos から使われていない。コンソールログの削除（`remove_console_logs`）を呼ぶ箇所が無い。状態はプロセス内のメモリだけに持つ。動作は 1 コンテナ = 1 VM である
 
 ## plugin 境界との関係
 

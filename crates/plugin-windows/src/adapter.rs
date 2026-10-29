@@ -6,7 +6,7 @@
 //! 共有マウントの準備・解除へ対応づける。platform-windows の失敗は [`to_plugin_error`] で 1 箇所に集約し、
 //! plugin のエラーフレーム（`code` / `message`）として core へ返す。
 //!
-//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕 で確定）
+//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕 で確定）
 //! | 操作 | 要求本体 | 成功応答本体 |
 //! | ---- | -------- | ------------ |
 //! | create | `["create", id, distro, policy, (mount_name, host_dir, mode)*]` | `["created", "", ""]` |
@@ -52,7 +52,7 @@
 //! マウントを行う。したがって本 plugin は Windows ホスト側プロセスとして動く前提である。非 Windows
 //! ビルド（WSL2 ゲスト内の Linux 等）では `wsl.exe` を解決できず、create は `UNIMPLEMENTED` で
 //! fail-closed になる（成功を装わない）。Windows ホスト上の UDS 接続は plugin 境界機構側が未対応で、
-//! #1869 の設計で確定する（REPAIR-3）。
+//! #1869 の設計（承認と実装 issue の起票は #2232）で確定する（REPAIR-3）。
 //!
 //! # 外部入力の扱い
 //! 受信文字列はすべて untrusted。platform-windows へは検証済み newtype（`DistroName`・`MountName`・
@@ -88,7 +88,7 @@ pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
 /// 要求元（core 側 proxy）の plugin RPC 既定期限 `UDS_RPC_TIMEOUT_DEFAULT`（上限も同じ値）から
 /// [`RESPONSE_MARGIN`] を引いた値で、起点は要求の処理開始時。検出・マウント準備・回復・解除の各段には
 /// この期限の残り時間から配分するため、成功応答も失敗時の解除結果も RPC 期限内に要求元へ届く。
-/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計で確定。
+/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計〔起票は #2232〕で確定。
 /// REPAIR-3）。期限切れになった `wsl.exe` を kill して回収する猶予（platform-windows 側）は含まない。
 pub const REQUEST_BUDGET: Duration = UDS_RPC_TIMEOUT_DEFAULT.saturating_sub(RESPONSE_MARGIN);
 

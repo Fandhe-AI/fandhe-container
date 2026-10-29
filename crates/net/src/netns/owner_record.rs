@@ -341,7 +341,7 @@ mod tests {
             cmd
                 .arg("-c")
                 .arg(format!(
-                    "umask {umask}; exec \"$0\" --exact --nocapture --test-threads=1 netns::owner_record::tests::net1_owned_dir_umask_child"
+                    "umask {umask}; exec \"$0\" --exact --no-capture --test-threads=1 netns::owner_record::tests::net1_owned_dir_umask_child"
                 ))
                 .arg(std::env::current_exe().unwrap())
                 .env("FANDHE_OWNED_UMASK_BASE", &base);

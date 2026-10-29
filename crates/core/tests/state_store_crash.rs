@@ -121,7 +121,7 @@ mod linux {
     fn spawn_child(root: &Path, log: &Path) -> Child {
         let log_file = File::create(log).unwrap();
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+            .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
             .env(ROOT_ENV, root)
             .stdout(Stdio::null())
             .stderr(log_file)

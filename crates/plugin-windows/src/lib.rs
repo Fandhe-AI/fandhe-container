@@ -2,7 +2,7 @@
 //!
 //! 本 crate は lib（起動設定の解決ロジック。本ファイル）と bin（`src/main.rs`。薄い入口）で構成する。
 //! バイナリ名 `fandhe-container-plugin-windows` は発見規約の接頭辞に一致する（PLUG-4・PLUG-11）。
-//! 起動経路は未確定。Windows ホストでは plugin の発見をしない（#1539）。起動対象（`PluginLaunchTarget`。#1856）の経路は windows-execution-layout.md〔#1862。承認待ち〕と #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕の 4.9 で決める。
+//! 起動経路は未確定。Windows ホストでは plugin の発見をしない（#1539）。起動対象（`PluginLaunchTarget`。#1856）の経路は windows-execution-layout.md〔#1862。承認待ち〕と #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕の 4.9 で決める。
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //!
 //! # 未実装範囲（REPAIR-3）

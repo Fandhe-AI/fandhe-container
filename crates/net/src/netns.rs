@@ -691,7 +691,7 @@ pub(crate) fn create_pinned(
                     drop(fd);
                     drop(guard);
                     // `base` を再解決せず、固定済みの `dir` 経由で所有照合・解除する。
-                    let leftover = match unpin_in_dir(&dir, name, None) {
+                    let leftover = match unpin_in_dir(&dir, name, None, MountPolicy::Unmount) {
                         Ok(()) => None,
                         Err(_) => Some(ResourceState::Present),
                     };
@@ -789,7 +789,7 @@ pub(crate) fn unpin(ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetn
 /// 残る隙間: 親ディレクトリ内の最終要素の差し替えは、同ディレクトリへ書ける実効 UID 本人（検証で他者の
 /// 書き込みは排除済み）にしかできず、stat から umount / unlink までの数命令の間に限られる。
 pub fn unpin_path(pin: &Path) -> Result<(), NetError> {
-    unpin_path_checked(pin, None)
+    unpin_path_checked(pin, None, MountPolicy::Unmount)
 }
 
 /// 現在の pin の識別子（本プロセスの作成記録）を返す。記録が無い・pin が無いときは `None`。何も変更しない。
@@ -811,10 +811,36 @@ pub(crate) fn pin_identity(pin: &Path) -> Result<Option<PinIdentity>, NetError> 
 /// 解除の直前に所有記録と照合する。別世代の pin（同じ名前に作り直されたもの）は `FailedPrecondition` で
 /// 拒否し何も解除しない（NET-1・#2681）。pin が既に無ければ成功（冪等）。
 pub(crate) fn unpin_path_expecting(pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
-    unpin_path_checked(pin, Some(expected))
+    unpin_path_checked(pin, Some(expected), MountPolicy::Unmount)
 }
 
-fn unpin_path_checked(pin: &Path, expected: Option<PinIdentity>) -> Result<(), NetError> {
+/// [`unpin_path_expecting`] と同じ照合に加え、マウントが 1 つでもあれば umount せずに拒否する
+/// （ホストの再起動をまたぐ記録だけの detach 用。NET-1・SEC-1・#3412）。
+///
+/// 前の boot の nsfs マウントは再起動で残らないので、マウントが見えるなら今の boot の別の利用者のものである。
+/// nsfs の inode 番号は boot をまたいで再利用されうるため、識別子の照合だけで umount させない。
+/// 消せるのは、未マウントで、所有記録と請求書の識別子が一致する空の pin ファイルだけ。
+pub(crate) fn unpin_stale_path_expecting(
+    pin: &Path,
+    expected: PinIdentity,
+) -> Result<(), NetError> {
+    unpin_path_checked(pin, Some(expected), MountPolicy::Refuse)
+}
+
+/// pin にマウントがあったときの扱い。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MountPolicy {
+    /// 所有を証明できれば umount してから消す（通常の解除）。
+    Unmount,
+    /// マウントがあれば umount の前に拒否する（前の boot の残骸の回収）。
+    Refuse,
+}
+
+fn unpin_path_checked(
+    pin: &Path,
+    expected: Option<PinIdentity>,
+    policy: MountPolicy,
+) -> Result<(), NetError> {
     if !pin.is_absolute() {
         return Err(NetError::new(
             NetErrorCode::InvalidArgument,
@@ -833,7 +859,7 @@ fn unpin_path_checked(pin: &Path, expected: Option<PinIdentity>) -> Result<(), N
         Err(e) => return Err(io_error("stat netns pin", &e)),
     }
     let dir = open_pin_dir(parent)?;
-    unpin_in_dir(&dir, name, expected)
+    unpin_in_dir(&dir, name, expected, policy)
 }
 
 /// 固定済みの置き場ディレクトリ `dir` 配下の `name` の pin を解除する（[`unpin_path`] の本体）。
@@ -845,6 +871,7 @@ fn unpin_in_dir(
     dir: &PinDir,
     name: &std::ffi::OsStr,
     expected: Option<PinIdentity>,
+    policy: MountPolicy,
 ) -> Result<(), NetError> {
     let via = dir.entry(name);
     let euid = sys::effective_uid();
@@ -921,6 +948,12 @@ fn unpin_in_dir(
             "mount of netns pin is malformed or duplicated in mountinfo",
         ),
     })?;
+    if policy == MountPolicy::Refuse && state != PinMount::None {
+        return Err(NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns pin is mounted in this boot",
+        ));
+    }
     // アンマウント後に現れるべき pin ファイルの識別子。
     let expected_file: Option<FileId> = match state {
         PinMount::None => {
@@ -1466,6 +1499,51 @@ mod tests {
         unpin_path_expecting(&pin, want).unwrap();
         assert!(!pin.exists());
         assert!(!ledger_path(&base, "web-1").exists());
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・SEC-1・#3412: 再起動後の回収用の解除は、未マウントで所有記録と識別子が一致する空の pin だけを消し、
+    /// pin ファイルと所有記録の両方が無くなる。無ければ冪等に成功する。
+    #[test]
+    fn net1_3412_unpin_stale_removes_unmounted_recorded_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("stale-ok");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let want = make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        unpin_stale_path_expecting(&pin, want).unwrap();
+        assert!(!pin.exists());
+        assert!(!ledger_path(&base, "web-1").exists());
+        unpin_stale_path_expecting(&pin, want).unwrap();
+        cleanup_scratch(&base);
+    }
+
+    /// NET-1・SEC-1・#3412: 識別子が違う（別世代）・所有記録が無い pin は消さずに拒否する。
+    #[test]
+    fn net1_3412_unpin_stale_refuses_foreign_or_unrecorded_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch_dir("stale-bad");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let want = make_ledgered_pin(&base, "web-1");
+        let pin = base.join("web-1");
+        simulate_restart(&pin);
+        let other = PinIdentity {
+            serial: want.serial + 1,
+            ..want
+        };
+        let e = unpin_stale_path_expecting(&pin, other).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "netns pin is not the one this claim was issued for"
+        );
+        assert!(pin.exists());
+        fs::remove_file(ledger_path(&base, "web-1")).unwrap();
+        let e = unpin_stale_path_expecting(&pin, want).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "netns pin has no valid ownership record");
+        assert!(pin.exists());
         cleanup_scratch(&base);
     }
 
@@ -2227,7 +2305,7 @@ mod tests {
         cmd.args([
             "--ignored",
             "--exact",
-            "--nocapture",
+            "--no-capture",
             "--test-threads=1",
             "netns::tests::net1_xproc_child_create_pin",
         ])

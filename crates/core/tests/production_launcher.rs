@@ -164,7 +164,7 @@
 //! - seccomp の識別は、シナリオ J の exec 後の `kcmp` の `EPERM`（test 限定の入口 `probe_denied_syscalls_for_test`。
 //!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗（1 行目 `production_launcher: PRECONDITION FAILED (test environment ...)`・#2788）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
 //! - bind 以外の `mounts[]` の種類、`ro` の bind の実機での `EROFS` の観測（ルール生成と適用の段は #1917 で実装済み、実機の確認は #1916）、段ごとの個別観測（#1916）、`linux.resources`、
-//!   supervisor 経由の起動（#1819）は対象外
+//!   supervisor 経由の起動は本試験の対象外で、`crates/supervisor/tests/supervisor_bin_real.rs`（#1819）が照合する
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
 
 #[cfg(not(target_os = "linux"))]

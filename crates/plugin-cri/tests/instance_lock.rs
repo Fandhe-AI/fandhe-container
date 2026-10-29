@@ -110,7 +110,12 @@ fn cri2_lock_held_by_other_process_until_it_is_killed() {
     let ready = root.0.join("ready-marker");
     let exe = std::env::current_exe().expect("current exe");
     let child = Command::new(exe)
-        .args(["--exact", "child_holder", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "child_holder",
+            "--no-capture",
+            "--test-threads=1",
+        ])
         .env(ENV_ROOT, &root.0)
         .env(ENV_READY, &ready)
         .stdin(Stdio::null())

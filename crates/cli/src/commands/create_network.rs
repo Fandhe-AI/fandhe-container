@@ -189,7 +189,7 @@ pub(super) fn check_network_options(
 /// 起動経路に結線されていない指定を `Unimplemented` で拒否する(D3・#1873。形式の検証は済んでいる前提)。
 ///
 /// Linux は `none` / `host` と `--add-host` / `--dns` を受ける(supervisor の start が反映する)。
-/// ユーザー定義名・`container:`・`-p` は将来仕様で `UNIMPLEMENTED`(rootless の pasta は #1936〜#1940・NET-9、
+/// ユーザー定義名・`container:`・`-p` は将来仕様で `UNIMPLEMENTED`(rootless の pasta は #3329〔supervisor 側の pasta は #1940 で実装済み〕・NET-9、
 /// rootful は D13〔#3207・#3069・#3074〕、定義の存在確認は #3066)。非 Linux は network 系の指定すべてを拒否する
 /// (MAC / WIN 系の結線の後続。`linux` は試験で差し替えるための引数)。
 pub(super) fn reject_unwired_network(

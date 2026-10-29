@@ -3,7 +3,7 @@
 //!
 //! 連続側（子プロセス。CLI が間を空けず操作し続ける役）が自分の ID の `update` を sleep なしで回し続け、
 //! 待ち側（親。supervisor の役）が別の ID の `update` を一定間隔で行う。待ち側の各操作の所要時間と
-//! `TIMEOUT` 件数を測り、`--nocapture` で読める形で stderr に出す。判定は百分位ではなく緩い上限
+//! `TIMEOUT` 件数を測り、`--no-capture` で読める形で stderr に出す。判定は百分位ではなく緩い上限
 //! （全操作成功・最大待ちが `STATE_LOCK_TIMEOUT` の半分未満）に留め、間欠失敗を避ける（#2214 の轍）。
 //!
 //! 別プロセスはこのテストバイナリ自身を `--exact` で再実行して用意する（追加依存なし）。子の待機には
@@ -132,7 +132,7 @@ mod linux {
         let out = fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+            .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
             .env(ROOT_ENV, &root)
             .env(GO_ENV, &go)
             .env(STOP_ENV, &stop)

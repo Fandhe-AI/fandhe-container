@@ -4885,7 +4885,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::sup7_1471_install_routes_fd1_and_fd2_to_separate_pipes",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(STDIO_INSTALL_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -6131,7 +6131,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -6231,7 +6231,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::rep5_1697_diagnostic_emit_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_EMIT_CHILD_ENV, "1")
             .stdin(Stdio::null())

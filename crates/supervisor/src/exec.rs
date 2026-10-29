@@ -2625,7 +2625,7 @@ mod tests {
                 "--exact",
                 "exec::tests::rep5_sup6_1698_entrypoint_mode_log_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_CHILD_ENV, "1")
             .stdin(Stdio::null())

@@ -3,7 +3,7 @@
 //!
 //! 接続方向は既存契約（core = ハーネスが `UdsListener` で bind、plugin が `FANDHE_CONTAINER_PLUGIN_SOCKET`
 //! の socket へ `UdsStream::connect` で接続）。UDS 上のフレーミングは改行区切りの JSON-RPC 2.0
-//! （暫定契約。確定は別 issue で行う。#1869 の設計の 4.9 では入口の対象外で、追跡 issue は未起票）。既定集合のテストは同一 UID で `initialize` → `tools/list` →
+//! （暫定契約。確定は別 issue で行う。#1869 で設計した plugin-backend-wiring.md 4.9 では入口の対象外で、追跡 issue は未起票。起票の要否は #3417 のコメントでユーザーに諮った）。既定集合のテストは同一 UID で `initialize` → `tools/list` →
 //! `tools/call` の 3 要求の応答を具体値で照合する。
 //!
 //! 別 UID の listener の拒否は root なしに用意できないため `#[ignore]` の実機前提テスト（準備手順は

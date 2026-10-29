@@ -5,7 +5,7 @@
 //! plugin-cri（TASK-108）と同じ立場で生成された `RuntimeService` トレイト経由で、PodSandbox 作成から
 //! コンテナの作成・起動・停止・削除・サンドボックスの停止・削除までを 1 本で通して各段階の状態を具体値で確かめる。
 //! RPC ごとの個別検証は `runtime_service_runtime.rs`、namespace 分離の実機前提試験は
-//! `runtime_service_namespaces.rs` が担う。本番の launcher との結線は本試験の範囲外（#1819・TASK-114）。
+//! `runtime_service_namespaces.rs` が担う。本番経路（plugin-cri が supervisor 経由で core の本番 launcher を使う。#2434）の通しは `crates/plugin-cri/tests/container_grpc.rs` の `production_binary_full_lifecycle_real`（実機前提）が担い、本試験の範囲外。
 //!
 //! CRI 層がホストのプロセスを直接起動せず、実行層（plugin 側の実装）だけが起動・回収することは、
 //! 静的照合（src に `Command::new` が無い）と Linux の実プロセス試験の両方で確かめる。

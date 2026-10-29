@@ -23,7 +23,7 @@ pub use process::{
     PastaStopError, PastaStopOutcome, PastaStopPath, PastaTarget, pasta_argv, spawn_pasta,
     spawn_pasta_with_recorder,
 };
-pub use run_dir::{PastaRunDir, RunDirExpectation, RunDirIdentity};
+pub use run_dir::{PastaRunDir, RunDirExpectation, RunDirIdentity, RunDirRemoval};
 
 pub use port_forward::{
     DEFAULT_LISTEN_ADDR, MAX_PORT_FORWARD_SPEC_LEN, PastaPortForward, PastaPortForwards,

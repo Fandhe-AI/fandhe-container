@@ -6,7 +6,7 @@
 //! 後続がこのファイルへ追記する。常駐 plugin の RSS 計測（TASK-112.3・#267）は
 //! `supported::resident` にあり、環境依存のため `#[ignore]` の実機前提テストとして既定集合から分離している
 //! （実行: `cargo test --release -p fandhe-container-plugin --test rss_comparison -- --ignored
-//! plug9_resident_plugin_rss_is_measured --nocapture`。Linux / macOS のみ）。
+//! plug9_resident_plugin_rss_is_measured --no-capture`。Linux / macOS のみ）。
 //! ここでは増加方向の下限だけを検査し、絶対値の比較は行わない（並列テストによる揺れを避ける）。
 //! RSS を読むテストは `RSS_LOCK` で直列化する。
 
@@ -457,7 +457,7 @@ mod supported {
             "{c1:?} {c2:?}"
         );
         // PLUG-8: println!/eprintln! は libtest に捕捉され、成功時の既定実行
-        // （`make test`・CI は --nocapture を付けない）では表示されない。
+        // （`make test`・CI は --no-capture を付けない）では表示されない。
         // 捕捉対象外の stderr ハンドル直書きと、成果物ファイルの両方へ出す。
         let line = report_line(median(c1), median(c2));
         {

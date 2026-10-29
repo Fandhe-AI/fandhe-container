@@ -56,7 +56,8 @@ use fandhe_container_net::pasta::process::{
     PASTA_READY_TIMEOUT_DEFAULT, PastaExit, PastaStopPath, check_ready_timeout,
 };
 use fandhe_container_net::pasta::run_dir::{
-    observe_run_dir, remove_pasta_run_dir, validate_container_id,
+    RunDirIdentity, RunDirRemoval, observe_run_dir, remove_pasta_run_dir,
+    remove_pasta_run_dir_expecting, validate_container_id,
 };
 use fandhe_container_net::pasta::{
     PastaPortForwards, PastaProcess, PastaRunDir, PastaTarget, spawn_pasta,
@@ -444,51 +445,30 @@ impl ProductionBackend {
     }
 }
 
-/// 置き場所(`@pasta/<id>`)の同一性(`st_dev`, `st_ino`)。期限切れの旧い操作が、別の起動が作った新しい置き場所に
-/// 触れないよう、削除の前に照合する(CORE-2 の世代保護。プロセス間でも効く)。
-type DirId = (u64, u64);
-
-/// 準備段階の成果物。`ready` は `spawn_pasta` が取り出す。`ours` は自分が作った置き場所の同一性で、後始末の照合に使う。
+/// 準備段階の成果物。`ready` は `spawn_pasta` が取り出す。`ours` は自分が作った置き場所の同一性
+/// (`st_dev`, `st_ino`)で、後始末の照合に使う。期限切れの旧い操作が、別の起動が作った新しい置き場所に
+/// 触れないよう、削除は net の `remove_pasta_run_dir_expecting` がこの同一性に束縛して行う(CORE-2 の世代保護。
+/// プロセス間でも効く。#3411)。
 #[derive(Default)]
 struct PreparedSlot {
     ready: Option<(u64, PastaRunDir)>,
-    ours: Option<DirId>,
+    ours: Option<RunDirIdentity>,
 }
 
-/// 状態ルート直下の `@pasta/<id>` の同一性。無ければ `None`。symlink・ディレクトリでないものは別物として
-/// 一致しない値(`Some((0, 0))`)にし、呼び出し側が「自分のものではない」と扱えるようにする。
-fn run_dir_identity(root: std::os::fd::BorrowedFd<'_>, id: &str) -> std::io::Result<Option<DirId>> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let path = format!("/proc/thread-self/fd/{}/@pasta/{id}", root.as_raw_fd());
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => Ok(Some((m.dev(), m.ino()))),
-        Ok(_) => Ok(Some((0, 0))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// 自分が作った置き場所(`ours`)と同一のときだけ削除する。別物(削除・再作成された新しい置き場所)・自分のものが
-/// 無い(`ours` が `None`)ときは何も触れず `Ok(false)`。消す対象が無ければ `Ok(true)`。
+/// 自分が作った置き場所(`ours`)と同一のときだけ削除する。別物(削除・再作成された新しい置き場所・symlink)・
+/// 自分のものが無い(`ours` が `None`)ときは何も触れず `Ok(false)`。消す対象が無ければ `Ok(true)`。
+///
+/// 名前の引き直しや別の照合はせず、net の束縛した削除を 1 回だけ呼ぶ(中身は照合済み fd 起点・`rmdir` の直前に
+/// 親 fd 起点で取り直す。再照合から `rmdir` までの窓は net の doc の残余で、コンテナ単位のロックが担う)。
 fn remove_run_dir_if_ours(
     root: std::os::fd::BorrowedFd<'_>,
     id: &str,
-    ours: Option<DirId>,
+    ours: Option<RunDirIdentity>,
 ) -> Result<bool, TraitError> {
     let Some(ours) = ours else { return Ok(false) };
-    let now = run_dir_identity(root, id).map_err(|_| {
-        TraitError::new(
-            ErrorCode::Internal,
-            "failed to inspect the pasta run directory",
-        )
-    })?;
-    match now {
-        None => Ok(true),
-        Some(cur) if cur == ours => remove_pasta_run_dir(root, id)
-            .map(|()| true)
-            .map_err(|e| net_to_trait(&e)),
-        Some(_) => Ok(false),
+    match remove_pasta_run_dir_expecting(root, id, ours).map_err(|e| net_to_trait(&e))? {
+        RunDirRemoval::Removed | RunDirRemoval::Absent => Ok(true),
+        RunDirRemoval::NotOurs => Ok(false),
     }
 }
 
@@ -499,7 +479,7 @@ fn deliver_prepared(
     abandoned: &AtomicBool,
     generation: u64,
     dir: PastaRunDir,
-    ours: Option<DirId>,
+    ours: Option<RunDirIdentity>,
 ) -> bool {
     let mut g = lock(slot);
     if abandoned.load(Ordering::SeqCst) {
@@ -567,8 +547,7 @@ fn prepare_run_dir_job(
     let dir = made.map_err(|e| net_to_trait(&e))?;
     // 名前を引き直さず、保持している fd の同一性を記録する。
     let identity = dir.identity();
-    let ours = Some((identity.dev(), identity.ino()));
-    deliver_prepared(prepared, abandoned, generation, dir, ours);
+    deliver_prepared(prepared, abandoned, generation, dir, Some(identity));
     Ok(())
 }
 
@@ -578,7 +557,7 @@ fn remove_run_dir_job(
     wait: Duration,
     run_dirs: &RunDirGenerations,
     generation: Option<u64>,
-    ours: Option<DirId>,
+    ours: Option<RunDirIdentity>,
     abandoned: &AtomicBool,
 ) -> Result<bool, TraitError> {
     let _guard = job.lock(wait)?;

@@ -105,9 +105,58 @@ table=<0|1>
   - 載せる公開: 解除に失敗して残りうる（`Present`・`Unknown`）もので、テーブルハンドルを持つもの。期限切れで要求を送らなかった公開を含む。テーブルハンドルは公開の時点で取れたものだけを載せ、未束縛の公開（ハンドルを取れなかったもの）は請求書に載せない。テーブルのハンドルが 0 のときは同一性を比べられないため、作り直しと読まず DELRULE を送らずに `Unknown` の取り残しにして請求書を保つ。載せない公開: 解除済み、`StaleHandles`（記録した実体はもう無い）、テーブルハンドルが無いもの、載せる公開のテーブルハンドルが食い違うとき（手動回収と quarantine）
   - 回収（`reclaim_failed_attach`。veth より前）: テーブルの `NFTA_TABLE_USERDATA` がトークンと一致（所有）し、生きたテーブルのハンドルが請求書と一致（実体の同一性）するときだけ、ハンドル指定で DELRULE する。テーブルが無い・作り直された場合はルールも無いので回収済み、所有を証明できない場合は何も送らず `Unknown`。2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直し、片方だけ残る場合も残りを消す（ハンドルはテーブルの寿命の中で再利用されず、実体の同一性を確かめた後なので、ENOENT は「既に無い」と読める）。アドレス・予約の quarantine は `delete_network` が解放する
   - 残余リスク: 所有の証明と DELRULE の間に、同じ権限の者がテーブルを差し替える窓が残る（`unpublish` と同じ水準）。1 件ごとに最大 3 要求を送り、各要求は `timeout` で打ち切る（REPAIR-5）
-- 回収できる（条件つき）: 記録だけからの detach（`network::recorded::detach_member_recorded`。#3347・NET-1・NET-6・REPAIR-4）。`@networks` の `members/<id>`（FCMEM1）から請求書を合成し、上の DNAT ルール・veth・pin の回収に流す。条件は、世代（boot ID と network namespace）が `realized` と一致すること、同じ endpoint の `pending-reclaim/attach` の請求書が無いこと（あれば先に `reclaim_failed_attach`。detach の失敗で残る請求書は記録に無い追加公開のルールを載せうるため合成で代えない）、解除の印つきの公開が無いこと（先に `unpublish_port_recorded`）、`netns_dir` が記録と一致すること。pin の識別子はメンバー記録の `pin` 項目から取る（無い旧形式は pin が残っていれば `Unknown` で手動回収）。ホストの再起動をまたぐ場合は世代が違うため断り、手動回収に回す
+  - attach の巻き戻しの請求書は DNAT のハンドルを載せず常に v1（#3413）: 投入が成功すれば attach は `Ok` で巻き戻す後段が無く、結果不明の投入は `NftApplyFailure` がハンドルを持たず、記録の無い attach の経路はテーブルハンドルも持たない（`ClaimedRules` はテーブルハンドル必須）。確定的な失敗（`Aborted`・`NotSent`）ではルールが残らず請求書も無い。具体値は `net1_3413_attach_rollback_claim_carries_no_rule_handles` で固定する。部分的な echo ハンドルを Err 側へ出す案は ACK 判定の契約（REPAIR-2・SEC-1 #2905）に関わるため採らない
+  - テーブルハンドルを持たない公開（記録の無い経路・照合前に断られた公開・テーブルハンドルが食い違う公開）は自動回収しない（#3413）: テーブルを作り直すとルールのハンドルの採番もやり直しになり、古いハンドルの DELRULE は別のルールを消しうる（fail-closed）。quarantine のまま手動回収（`docs/setup/network-reclaim-recovery.md`）に倒す。記録の無い経路は `delete_network` でも解放できるが、記録つきの経路は請求書が残る間 `delete_recorded_with` が `network has pending reclaim records` で拒否するため、対象資源の手動回収と請求書・意図記録の整理を先に行う
+- 回収できる（条件つき）: 記録だけからの detach（`network::recorded::detach_member_recorded`。#3347・NET-1・NET-6・REPAIR-4）。`@networks` の `members/<id>`（FCMEM1）から請求書を合成し、上の DNAT ルール・veth・pin の回収に流す。条件は、世代（boot ID と network namespace）が `realized` と一致すること、同じ endpoint の `pending-reclaim/attach` の請求書が無いこと（あれば先に `reclaim_failed_attach`。detach の失敗で残る請求書は記録に無い追加公開のルールを載せうるため合成で代えない）、解除の印つきの公開が無いこと（先に `unpublish_port_recorded`）、`netns_dir` が記録と一致すること。pin の識別子はメンバー記録の `pin` 項目から取る（無い旧形式は pin が残っていれば `Unknown` で手動回収）。ホストの再起動をまたぐ場合（boot ID が違う記録）は世代が違うため断り、次節の入口（#3412）で回収する。同じ boot で netns だけ違う記録は手動回収に回す
 - 復元したネットワークへの `create_netns`・`attach` は拒否する
 - 壊れた記録（復号の失敗・ファイル名と記録の不一致・不正なファイル名）は、ファイルを消さず、登録もしない。件数は `net.reclaim_store_load` の失敗件数と stderr の 1 行に足す。同じコンテナの再 attach は、カーネルの `NLM_F_EXCL` による `AlreadyExists` で fail-closed になる。件数の上限を超える場合は起動を失敗させる
+
+## ホストの再起動をまたぐ記録の回収（#3412・NET-1・NET-3・NET-6・REPAIR-4）
+
+PR #3396（#3347）で記録だけの detach、PR #3392（#3343）で公開の墓標が入った。両 PR の対象外に残った 3 項目の採否を決めた。再起動で veth・nsfs のマウント・nft テーブル・bridge はカーネルから消え、記録（`@networks/<名前>/members/<id>`・`realized`）と予約・pin ファイルだけが残る。
+
+| 項目 | 採否 | 要点 |
+| ---- | ---- | ---- |
+| 1. 再起動（boot ID の違い）をまたぐ記録だけの detach | 採る（範囲を絞る） | boot ID が違うときだけ受ける。同じ boot で netns だけ違う場合は従来どおり断る。カーネルに資源が無いことを照会で確かめてから、記録・予約・残った空の pin ファイルだけを片付ける。DELRULE は送らない |
+| 2. 再起動後に残る前の世代の予約（Active・解除中・墓標の `publish` 行） | 採る（1 に含める。別の仕組みは作らない） | 1 の入口がメンバーの `ports.release(name, endpoint)` とメンバー記録の削除を行い、予約をすべて解放する。`unpublish_port_recorded`・`restore_unpublished_ports` の世代の照合は変えない |
+| 3. `detach_container_recorded` が `member not found` で拒否して破棄した pin | 採らない（手動回収のまま） | 所有記録 `.owned/<endpoint>` は「このモジュールが作った」ことしか示さず、ネットワーク・メンバー・接続の世代に結びつかない。記録の無い生きた利用者（attach 前の `create_netns` の pin、none モード、移行中の `.cri/net` の経路、複数ネットワーク）を除外できない。veth の別名で帰属させても、接続の世代を持っていたのは消えた記録だけである |
+
+PR #3392 は前の世代の予約を「`delete_network` の回収に委ねる」と書いたが、`delete_recorded_with` はメンバー記録が残る間 `network still has members` で断るため、実際は詰まっていて手動でしか抜けられなかった。2 はこの詰まりを 1 の入口で解く。
+
+### 入口
+
+`network::recorded::detach_member_recorded_after_reboot`（本体は OS 非依存の `detach_member_after_reboot_with`）。生きた `AttachedContainer` を取らず、記録だけから行う。請求書は veth・netns のみで合成し、**ルールは載せない（`rules = None`）・quarantine も立てない**。nft のルールハンドルはテーブルごとの採番で、新しい boot で作り直されたテーブルでは同じ番号が再利用されうるため、DELRULE を一切送らない。カーネル資源は消さない（照会と、残った空の pin ファイルの除去だけ）。
+
+### 関門（カーネル照会の前に、何も変えずに断る）
+
+通常の `detach_member_recorded_with` から引き継ぐもの: 排他ロックのガード、`realized` があり `realized.intent` が無いこと、メンバー記録があり所有トークンがこのネットワークのもの（`DataLoss`）、同じ endpoint の `pending-reclaim/attach` の請求書が無いこと、`netns_dir` が記録とバイト単位で一致すること。
+
+違う点:
+
+- **boot ID が同じなら断る**。netns も同じなら `member belongs to the current boot; use detach_member_recorded`、netns だけ違えば `record is from another network namespace of the same boot`（資源が別 namespace で生きている可能性があるため。`reconcile` が `GenerationMismatch` で据え置くのと同じ理由）
+- **解除の印（`unpublishing`）では断らない**。前の boot のルールは残っておらず、`unpublish_port_recorded` は世代の照合で必ず断るため、断ると抜けられなくなる
+
+### カーネル照会（`delete::member_after_reboot`。fail-closed）
+
+boot ID の不一致だけは信用しない。記録の改ざんや、nftables.service によるルールセットの復元（userdata が往復で残りうる。#3361 の (9) で観測中）に備え、次をすべて確かめてから進む。満たさなければ `DeleteStep::Validate` の `FailedPrecondition` で何も変えずに断る。
+
+1. 専用テーブル `fandhe_net_<名前>` の照会が `NotFound`（所有トークンの一致・不一致を問わず、あれば断る。`NotFound` 以外のエラーも断る）
+2. bridge（導出名）の照会が `NotFound`
+3. host 側 veth の照会が `NotFound`
+4. pin:
+   - 記録の置き場（`NetnsDirRecord` の dev:ino）が今の置き場と一致する場合は、マウントされていない空ファイルで、`.owned/<endpoint>` と請求書の `pin` 識別子が一致するときだけ消す（所有記録も消す）。マウントされていれば種別を問わず umount せず断る（前の boot のマウントは残らないので、マウントがあれば今の boot のものである。nsfs の inode 番号は boot をまたいで再利用されうるため、識別子の照合だけで umount させない）
+   - 置き場の識別子が違う場合（tmpfs の作り直し、btrfs などで st_dev が変わる）は、設定の置き場に同名の pin が無いと確かめられたときだけ進む。あれば断る（手動）
+   - 記録に `pin` 項目の無い旧形式は、pin が無ければ進み、あれば断る
+
+全体で 1 つの期限を持つ（REPAIR-5）。`realized` には触れない。全メンバーを片付けた後は既存の `delete_network_recorded`（`delete_recorded_with` は意図して世代を照合しない。bridge・テーブルの `NotFound` を冪等な完了として扱う）が `realized` を消し、同じ名前で作り直せる。
+
+### 残余（この Issue では直さない）
+
+- (a) 再起動前に残った `pending-reclaim/attach` の請求書は、`reclaim_failed_attach` が `HostGeneration` を照合せず、作り直されたテーブルに対してルールハンドルを比べうる（ハンドル再利用の同じ危険）。請求書がある endpoint は、再起動モードでも従来どおり関門で断る
+- (b) 再起動後の請求書（`pending-reclaim/*`）と、前の世代の `members-intent/*` が残ると `delete_recorded_with` は断る（reconcile は世代が違うと掃除しない）。請求書を消費する結線は #3075 系
+- (c) 同じ boot で netns が違う記録、置き場に pin が残る場合、カーネルに同名の資源がある場合は手動回収のまま（`docs/setup/network-reclaim-recovery.md`）
+- 3 の代案「`member not found` のとき、生きた `AttachedContainer` から請求書を作って保存してから破棄する」も検討したが、採らない。保存した請求書は消費する結線（#3075 系）が無いまま `delete_network` とその endpoint の `detach_member_recorded` を止めるうえ、誤った ID の呼び出しで生きたメンバーの資源を消しうる。再評価の条件は、#3075 系で `@networks` の請求書の回収が結線された後とする
+- supervisor（#3074）・plugin-cri（#3075）から本入口を呼ぶ結線は後続。実機（root）での照合は `network_publish_record_privileged` の (10)。実行は #1626 に足す（人間担当）
 
 ## netns の pin の所有記録（#2824）
 

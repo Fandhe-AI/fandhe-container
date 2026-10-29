@@ -10,7 +10,7 @@
 
 use crate::error::{NetError, NetErrorCode};
 use crate::network::NetworkName;
-use crate::network_store::definition::is_reserved_network_name;
+use crate::network_store::definition::{MSG_RESERVED_NETWORK_NAME, is_reserved_network_name};
 
 #[cfg(target_os = "linux")]
 pub mod host;
@@ -113,7 +113,7 @@ impl NetworkChoice {
             "host" => Ok(Self::Host),
             n if is_reserved_network_name(n) => Err(NetError::new(
                 NetErrorCode::InvalidArgument,
-                "reserved network name",
+                MSG_RESERVED_NETWORK_NAME,
             )),
             n if n.starts_with("container:") => Ok(Self::ContainerRef),
             n => NetworkName::new(n).map(Self::Named),
@@ -177,7 +177,7 @@ mod tests {
         for n in ["bridge", "default"] {
             let e = NetworkChoice::parse(n).unwrap_err();
             assert_eq!(e.code(), NetErrorCode::InvalidArgument);
-            assert_eq!(e.message(), "reserved network name");
+            assert_eq!(e.message(), "network name is reserved");
         }
         for n in ["container:x", "container:"] {
             assert_eq!(

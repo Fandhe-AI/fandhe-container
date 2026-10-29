@@ -63,19 +63,9 @@ pub fn is_holder_invocation(first: Option<&OsStr>) -> bool {
     first == Some(OsStr::new(NETNS_HOLDER_SUBCOMMAND))
 }
 
-/// `NetErrorCode` を `ErrorCode` へ写す（コードを潰さない。未知のコードだけ `Internal`）。
+/// `NetErrorCode` を `ErrorCode` へ写す（コードを潰さない。写像の実体は `net_error::net_code_to_trait`）。
 pub fn trait_code(code: NetErrorCode) -> ErrorCode {
-    match code {
-        NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-        NetErrorCode::NotFound => ErrorCode::NotFound,
-        NetErrorCode::AlreadyExists => ErrorCode::AlreadyExists,
-        NetErrorCode::PermissionDenied => ErrorCode::PermissionDenied,
-        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-        NetErrorCode::Timeout => ErrorCode::Timeout,
-        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-        NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-        _ => ErrorCode::Internal,
-    }
+    crate::net_error::net_code_to_trait(code)
 }
 
 /// 起動の失敗。コードを保ったまま [`TraitError`] へ写せ、holder の stderr（エスケープ済み）を材料として持つ。

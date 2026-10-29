@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::definition::{DEFINITION_MAX_BYTES, MAX_NETWORKS, is_reserved_network_name};
+use super::definition::{
+    DEFINITION_MAX_BYTES, MAX_NETWORKS, MSG_RESERVED_NETWORK_NAME, is_reserved_network_name,
+};
 use super::{
     DEFAULT_LOCK_TIMEOUT, DIR_MODE, FILE_MODE, LOCK_HANDOFF_GAP, LOCK_RETRY, NetworkDefinition,
     NetworkListing, check_dir_meta, check_file_meta,
@@ -448,7 +450,7 @@ impl NetworkStore {
             if is_reserved_network_name(name) {
                 return Err(err(
                     NetErrorCode::InvalidArgument,
-                    "network name is reserved",
+                    MSG_RESERVED_NETWORK_NAME,
                 ));
             }
             let _g = self.lock_global_exclusive()?;

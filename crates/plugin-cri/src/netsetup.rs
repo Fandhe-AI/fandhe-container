@@ -104,7 +104,6 @@ use fandhe_container_core::traits::{
     NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol,
     PublishPortRequest, TraitError, UnpublishPortRequest, UnpublishPortResponse,
 };
-use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{
     EndpointId, MAX_PORT_PUBLISHES, NetworkName as NetName, PortProtocol, PortPublish,
@@ -137,30 +136,9 @@ pub const MSG_NETNS_NOT_PREPARED: &str = "netns was not prepared for the contain
 pub const MSG_STATIC_ADDRESS_UNAVAILABLE: &str =
     "static container addresses are not available yet: net allocates addresses at attach time";
 
-/// net のエラーをトレイトのエラーへ写す（同名のコードはそのまま。net のメッセージは入力値を含まない）。
-///
-/// `ResourceExhausted` は `ErrorCode::ResourceExhausted` へ写す（#2609）。`DataLoss` は `ErrorCode` に
-/// 対応が無いため `Internal` にし、元のコードを `message` の先頭へ残す。
-pub fn net_error_to_trait(e: &NetError) -> TraitError {
-    let code = match e.code() {
-        NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-        NetErrorCode::Timeout => ErrorCode::Timeout,
-        NetErrorCode::PermissionDenied => ErrorCode::PermissionDenied,
-        NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-        NetErrorCode::NotFound => ErrorCode::NotFound,
-        NetErrorCode::AlreadyExists => ErrorCode::AlreadyExists,
-        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-        NetErrorCode::DataLoss => {
-            return TraitError::new(
-                ErrorCode::Internal,
-                format!("{}: {}", e.code().as_str(), e.message()),
-            );
-        }
-        _ => ErrorCode::Internal,
-    };
-    TraitError::new(code, e.message())
-}
+/// net のエラーをトレイトのエラーへ写す（実体は supervisor の `net_error`。同名のコードはそのまま、`DataLoss` は
+/// `Internal` にして元のコードを `message` の先頭へ残す。#2609・REPAIR-1）。
+pub use fandhe_container_supervisor::net_error::net_error_to_trait_keeping_code as net_error_to_trait;
 
 /// 取り残しの件数を載せたエラー（契約 6・9 の fail-closed の表現。残存資源の詳細は入力値を含み得るため載せない）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1762,7 +1740,7 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxNetsetup, NETSETUP_REQUEST_TIMEOUT};
+pub use linux::{LinuxNetsetup, NETSETUP_OPERATION_BUDGET, NETSETUP_REQUEST_TIMEOUT};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -1788,7 +1766,18 @@ mod linux {
     use super::*;
 
     /// netlink の 1 要求ごとの期限（REPAIR-5。トレイトの契約 2）。
+    ///
+    /// net の API のうち `timeout` が各カーネル要求の期限になるもの（`create_network`・`delete_network`・
+    /// `reclaim_failed_*`・`create_container_netns`・`release_container_netns`・`attach_prepared_container`・
+    /// `unpublish_container_port`）へ渡す。操作全体で 1 つの期限になるものは [`NETSETUP_OPERATION_BUDGET`]。
     pub const NETSETUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// 1 操作全体で共有する 1 つの期限（REPAIR-5。トレイトの契約 2）。
+    ///
+    /// net の `timeout` が操作全体の期限として扱われる API へ渡す: `detach_container`（切り離し全体。#3258）と
+    /// `publish_container_ports`（受け口の dump と DNAT の投入が共有）。値は暫定で
+    /// [`NETSETUP_REQUEST_TIMEOUT`] と同じ 5 秒（挙動は変えない。切り離し全体に足りるかの見直しは #3258 側の論点）。
+    pub const NETSETUP_OPERATION_BUDGET: Duration = Duration::from_secs(5);
 
     impl NetsetupContainer for AttachedContainer<ContainerNetns> {
         fn endpoint_id(&self) -> &str {
@@ -2135,7 +2124,7 @@ mod linux {
                 container,
                 std::slice::from_ref(publish),
                 &mut network.ports,
-                NETSETUP_REQUEST_TIMEOUT,
+                NETSETUP_OPERATION_BUDGET,
             )
             .map_err(|e| PublishFailure {
                 error: net_error_to_trait(&e.error),
@@ -2217,7 +2206,7 @@ mod linux {
                 extra,
                 &mut network.ipam,
                 &mut network.ports,
-                NETSETUP_REQUEST_TIMEOUT,
+                NETSETUP_OPERATION_BUDGET,
             ) {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -2285,6 +2274,7 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_net::error::{NetError, NetErrorCode};
 
     /// REPAIR-1・ERR-1: `NetErrorCode::ALL` の全件を照合する。net にだけある名前は `DATA_LOSS`
     /// （`Internal` に写り message の先頭へ残る）、core にだけある名前は `UNAVAILABLE`。
@@ -2386,5 +2376,13 @@ mod tests {
             derive_netns_name(&dotted).expect_err("dotted").code(),
             ErrorCode::InvalidArgument
         );
+    }
+
+    /// REPAIR-5: 期限の定数の値の固定（1 要求ごとと操作全体は別名で、現状はどちらも 5 秒）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_netsetup_deadline_constants_are_pinned() {
+        assert_eq!(NETSETUP_REQUEST_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(NETSETUP_OPERATION_BUDGET, std::time::Duration::from_secs(5));
     }
 }

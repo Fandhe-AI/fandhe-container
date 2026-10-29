@@ -44,7 +44,6 @@ use std::ffi::OsStr;
 use fandhe_container_core::oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES;
 use fandhe_container_core::sanitize::sanitize_display_bounded;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
-use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::pasta::binary::{PastaBinary, search_pasta_in_path, verify_pasta_binary};
 use fandhe_container_net::pasta::record::PastaRecord;
 
@@ -119,20 +118,8 @@ pub(super) fn decide(
     }
 }
 
-/// net のエラーをコードを保ったまま写す（`NetErrorCode` は `#[non_exhaustive]`。未知は `Internal`）。
-pub(super) fn net_error_to_trait(e: &NetError) -> TraitError {
-    let code = match e.code() {
-        NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-        NetErrorCode::NotFound => ErrorCode::NotFound,
-        NetErrorCode::PermissionDenied => ErrorCode::PermissionDenied,
-        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-        NetErrorCode::Timeout => ErrorCode::Timeout,
-        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-        NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-        _ => ErrorCode::Internal,
-    };
-    TraitError::new(code, e.message())
-}
+/// net のエラーをコードを保ったまま写す（実体は supervisor の `net_error`。cli と plugin-cri で共有。REPAIR-1）。
+use fandhe_container_supervisor::net_error::net_error_to_trait_keeping_code as net_error_to_trait;
 
 /// `PATH` 探索の警告 1 行（JSON。`path` は無害化して上限を置く。12.5・PLUG-11）。
 pub(super) fn path_warning_line(bin: &PastaBinary) -> String {
@@ -218,6 +205,7 @@ pub(super) fn resolve_for_create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_net::error::{NetError, NetErrorCode};
     use std::path::PathBuf;
 
     fn path_src() -> PastaSource {

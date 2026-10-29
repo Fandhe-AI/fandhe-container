@@ -1809,6 +1809,40 @@ jobs:
             --forbid 'exec_subordinate_e2e: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
+      # exec_launch_netns_rootless（`crates/supervisor/tests/exec_launch_netns_rootless.rs`。
+      # SUP-6・NET-9・CORE-6・SEC-5・REPAIR-12・#3349）: rootless の exec が起動経路（ProductionLauncher の Loopback と、
+      # 本番の spawn_netns_holder を使う Attachable）で作った netns へ参加して通ることを inode の一致で照合する。
+      # pasta は使わない（#3331）。前提は試験自身が fail-closed に確認する。新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: exec_launch_netns_rootless のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/elnr-build.json"
+          cargo test -p fandhe-container-supervisor --test exec_launch_netns_rootless --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "exec_launch_netns_rootless") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::exec_launch_netns_rootless test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "ELNR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: exec_launch_netns_rootless の実行（実機前提・--ignored・委譲スコープ。SUP-6・NET-9・CORE-6・#3349）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/exec_launch_netns_rootless.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${ELNR_BIN}" --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name exec_launch_netns_rootless \
+            --src crates/supervisor/tests/exec_launch_netns_rootless.rs --log "${log}" \
+            --select '^exec_launch_netns_rootless: (scenario=|rootless exec joined)' --subst root=false --min 5 \
+            --forbid 'exec_launch_netns_rootless: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
+
       - name: rootless_file_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10

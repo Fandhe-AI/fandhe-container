@@ -403,6 +403,35 @@ const STOP_GRACE_MAX_SECS: i64 = 24 * 60 * 60;
 /// 強制停止するのが CRI の意味であるため 0（即時 SIGKILL）とする（CRI-2）。
 const SANDBOX_STOP_GRACE_SECS: i64 = 0;
 
+/// 実行層の呼び出しが期限を超えたときに返す固定文言（待ち手と worker の両方が同じ Status を返すための定数。
+/// ID・パスを含めない。ERR-3・REPAIR-5・#3307）。
+const RUNTIME_OPERATION_TIMED_OUT: &str = "runtime operation timed out";
+
+/// Create の巻き戻し（[`InFlightGuard::rollback`]）の結果（CRI-2・REPAIR-5・#3307）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RollbackOutcome {
+    /// 確定済みまたは巻き戻し済みで、何もしなかった。
+    NotNeeded,
+    /// 解放と記録の除去まで完了した。
+    Released,
+    /// bundle の解放が期限で打ち切られ、記録は結果不明で残した。
+    ReleaseCut,
+    /// 期限以外の理由で解放や記録の削除に失敗し、記録は結果不明で残した。
+    Kept,
+}
+
+/// Create の失敗を返す前の巻き戻しの結果に応じて、返すエラーを決める（CRI-2・REPAIR-4・REPAIR-5・#3307）。
+///
+/// 解放が期限で打ち切られたときは、待ち手の期限切れと同じ `DEADLINE_EXCEEDED`・固定文言に揃える。
+/// 記録は結果不明で残るため、確定失敗に見えるコードを返さず、worker の送信と待ち手の期限のどちらが先に
+/// 届いても利用者に同じ Status が見えるようにする。元のコードは CRI に載せる欄が無く失われる。
+fn create_error_after_rollback(original: CriError, outcome: RollbackOutcome) -> CriError {
+    match outcome {
+        RollbackOutcome::ReleaseCut => CriError::timeout(RUNTIME_OPERATION_TIMED_OUT),
+        _ => original,
+    }
+}
+
 /// `ContainerRuntime::create`・`start` のエラーコードのうち「何も起きていない」と確定できるものか（REPAIR-5）。
 ///
 /// 入力・状態・権限の拒否は実行層が処理前に弾いた確定失敗。`DeadlineExceeded`・`Unavailable`・
@@ -429,6 +458,8 @@ struct InFlightGuard {
     id: String,
     kind: InFlightKind,
     committed: bool,
+    /// 巻き戻し（[`InFlightGuard::rollback`]）を実行済みか。二重実行を防ぐ（#3307）。
+    rolled_back: bool,
     /// Create の巻き戻しで `release` を呼ぶ bundle の供給元。
     bundles: Option<Arc<dyn BundleProvider>>,
     /// 巻き戻しの `release` に与える期限の長さ（`arm_bundles` で設定。#3142・REPAIR-5）。
@@ -454,6 +485,7 @@ impl InFlightGuard {
             id,
             kind,
             committed: false,
+            rolled_back: false,
             bundles: None,
             release_timeout: Duration::ZERO,
             outcome_unknown: false,
@@ -592,9 +624,19 @@ impl InFlightGuard {
     }
 }
 
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if !self.committed {
+impl InFlightGuard {
+    /// 確定されていない in_flight を巻き戻す（Drop と、Create の失敗の出口からの明示呼び出しの共通本体）。
+    ///
+    /// Create の失敗では送信（`tx.send`）より前に呼び、エラーが返った時点で記録が消えている性質を保つ。
+    /// 打ち切られた解放は [`RollbackOutcome::ReleaseCut`] で返し、呼び出し側が応答のコードを揃える（#3307）。
+    fn rollback(&mut self) -> RollbackOutcome {
+        if self.committed || self.rolled_back {
+            return RollbackOutcome::NotNeeded;
+        }
+        self.rolled_back = true;
+        let mut cut = false;
+        let was_unknown = self.outcome_unknown;
+        {
             // 確定失敗の Create は、bundle の解放を終えてから記録（件数枠・名前キー）を除去する。
             // `release` が停止しても記録は `in_flight` のまま残り、枠は空かない。停止した worker の数は
             // 件数の上限（MAX_CONTAINERS）で有界になり、枠を超えて worker や未解放資源が溜まらない
@@ -604,13 +646,12 @@ impl Drop for InFlightGuard {
             if self.kind == InFlightKind::Create
                 && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
-                && bundles
-                    .release_bounded(
-                        &self.id,
-                        &ReleaseBudget::new().with_deadline(Instant::now() + self.release_timeout),
-                    )
-                    .is_err()
+                && let Err(err) = bundles.release_bounded(
+                    &self.id,
+                    &ReleaseBudget::new().with_deadline(Instant::now() + self.release_timeout),
+                )
             {
+                cut = err.code() == CriErrorCode::Timeout;
                 // 期限切れでも失敗でも結果不明として記録と write-ahead の記録ファイルを残す。回収は
                 // RemoveContainer（delete〔NOT_FOUND〕→ 続きから release）か再起動時の readopt（stale_create）。
                 self.outcome_unknown = true;
@@ -633,6 +674,22 @@ impl Drop for InFlightGuard {
                 self.exit,
             );
         }
+        if self.kind == InFlightKind::Create && !was_unknown && self.outcome_unknown {
+            if cut {
+                RollbackOutcome::ReleaseCut
+            } else {
+                RollbackOutcome::Kept
+            }
+        } else {
+            RollbackOutcome::Released
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // panic・起動前の破棄の予備。Create の失敗の出口は送信前に明示的に巻き戻し済み（#3307）。
+        let _ = self.rollback();
     }
 }
 
@@ -1207,7 +1264,7 @@ where
     spawn_runtime_thread("cri-runtime-wait", move || {
         let result = match rx.recv_timeout(timeout) {
             Ok(value) => Ok(value),
-            Err(RecvTimeoutError::Timeout) => Err(CriError::timeout("runtime operation timed out")),
+            Err(RecvTimeoutError::Timeout) => Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT)),
             // worker の panic（guard の Drop が後始末する）。
             Err(RecvTimeoutError::Disconnected) => Err(CriError::internal("runtime task failed")),
         };
@@ -2908,64 +2965,76 @@ impl CriRuntimeService {
             armed: true,
         };
         let outcome = run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
-            // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
-            guard.arm_bundles(Arc::clone(&bundles), timeout);
-            guard.arm_record_store(record_store);
-            // 起動前に手放されていたら prepare もしない（guard の Drop が release と記録の巻き戻しを行う）。
-            if settlement.is_abandoned() {
-                return Err(CriError::timeout("runtime operation timed out"));
-            }
-            // 実行層に資源を作る前に、`in_flight=create` で記録を書く（write-ahead）。書けなければ prepare も
-            // create も呼ばない。書き込み中に手放されたら、続く prepare をしない（Drop が記録を消す）。
-            guard.write_ahead()?;
-            if settlement.is_abandoned() {
-                return Err(CriError::timeout("runtime operation timed out"));
-            }
-            // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
-            // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
-            // 結線するときは sandbox の記録の保持役の pid から PodNamespacePaths::for_holder_pid で作る（#2776）。
-            let bundle = bundles.prepare(
-                &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
-                    .with_pod_netns_path(pod_netns.as_deref())
-                    .with_cancel(&cancel),
-            )?;
-            // 実行層へ渡す前に、報告された識別情報と解決済みの stop signal を記録へ反映する。保持量の上限を
-            // 超えたらここで失敗し、guard が bundle の解放と記録の巻き戻しを行う（#2771）。
-            attach_prepared(&registry, &id, &bundle, max_retained_bytes)?;
-            // dispatch の可否は呼び出し側との compare_exchange 1 回で決める。負けたら（手放し済み）まだ何も
-            // 実行層へ渡していないため、`outcome_unknown` は偽のまま guard が bundle を解放し記録を除去する。
-            if !settlement.settle_by_worker() {
-                return Err(CriError::timeout("runtime operation timed out"));
-            }
-            // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
-            guard.mark_dispatched();
-            let status = match adapter.create(&id, bundle.path().to_path_buf()) {
-                Ok(status) => status,
-                Err(status) => {
-                    if is_definite_failure(status.code()) || confirm_removed(&adapter, &id, timeout)
-                    {
+            // 失敗の出口を 1 か所に集め、送信（`tx.send`）より前に明示的に巻き戻す。解放が期限で打ち切られたときは
+            // 待ち手の期限切れと同じ Status に揃える（競争に左右されない。#3307・CRI-2・REPAIR-5）。
+            let result = (|| -> Result<(), CriError> {
+                // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
+                guard.arm_bundles(Arc::clone(&bundles), timeout);
+                guard.arm_record_store(record_store);
+                // 起動前に手放されていたら prepare もしない（guard の Drop が release と記録の巻き戻しを行う）。
+                if settlement.is_abandoned() {
+                    return Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT));
+                }
+                // 実行層に資源を作る前に、`in_flight=create` で記録を書く（write-ahead）。書けなければ prepare も
+                // create も呼ばない。書き込み中に手放されたら、続く prepare をしない（Drop が記録を消す）。
+                guard.write_ahead()?;
+                if settlement.is_abandoned() {
+                    return Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT));
+                }
+                // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
+                // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
+                // 結線するときは sandbox の記録の保持役の pid から PodNamespacePaths::for_holder_pid で作る（#2776）。
+                let bundle = bundles.prepare(
+                    &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
+                        .with_pod_netns_path(pod_netns.as_deref())
+                        .with_cancel(&cancel),
+                )?;
+                // 実行層へ渡す前に、報告された識別情報と解決済みの stop signal を記録へ反映する。保持量の上限を
+                // 超えたらここで失敗し、guard が bundle の解放と記録の巻き戻しを行う（#2771）。
+                attach_prepared(&registry, &id, &bundle, max_retained_bytes)?;
+                // dispatch の可否は呼び出し側との compare_exchange 1 回で決める。負けたら（手放し済み）まだ何も
+                // 実行層へ渡していないため、`outcome_unknown` は偽のまま guard が bundle を解放し記録を除去する。
+                if !settlement.settle_by_worker() {
+                    return Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT));
+                }
+                // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
+                guard.mark_dispatched();
+                let status = match adapter.create(&id, bundle.path().to_path_buf()) {
+                    Ok(status) => status,
+                    Err(status) => {
+                        if is_definite_failure(status.code())
+                            || confirm_removed(&adapter, &id, timeout)
+                        {
+                            guard.mark_definitely_failed();
+                        }
+                        return Err(status);
+                    }
+                };
+                // 完了契約: 厳密に Created のときだけ成功とする（Creating は CRI 上 ContainerCreated に写るが、
+                // 作成途中で未完了のため成功にせず、削除を確認できるまで資源を保持する。REPAIR-5・CRI-2）。
+                if status.lifecycle != RuntimeLifecycle::Created {
+                    if confirm_removed(&adapter, &id, timeout) {
+                        guard.mark_definitely_failed();
+                    }
+                    return Err(CriError::internal("runtime returned an unexpected state"));
+                }
+                if let Err(status) = guard.commit() {
+                    // メモリを確定済みで記録の書き込みだけが失敗した場合は、実行層に作成済みの資源があるまま
+                    // 確定している。削除の確認も巻き戻しもしない（R5 #2934）。
+                    if !guard.committed && confirm_removed(&adapter, &id, timeout) {
                         guard.mark_definitely_failed();
                     }
                     return Err(status);
                 }
-            };
-            // 完了契約: 厳密に Created のときだけ成功とする（Creating は CRI 上 ContainerCreated に写るが、
-            // 作成途中で未完了のため成功にせず、削除を確認できるまで資源を保持する。REPAIR-5・CRI-2）。
-            if status.lifecycle != RuntimeLifecycle::Created {
-                if confirm_removed(&adapter, &id, timeout) {
-                    guard.mark_definitely_failed();
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let rollback = guard.rollback();
+                    Err(create_error_after_rollback(err, rollback))
                 }
-                return Err(CriError::internal("runtime returned an unexpected state"));
             }
-            if let Err(status) = guard.commit() {
-                // メモリを確定済みで記録の書き込みだけが失敗した場合は、実行層に作成済みの資源があるまま
-                // 確定している。削除の確認も巻き戻しもしない（R5 #2934）。
-                if !guard.committed && confirm_removed(&adapter, &id, timeout) {
-                    guard.mark_definitely_failed();
-                }
-                return Err(status);
-            }
-            Ok(())
         })
         .await;
         // 結果を受け取れた（worker が最後まで走った）ときだけ手放さない。期限切れ・worker の失敗は手放す。
@@ -3295,7 +3364,7 @@ impl CriRuntimeService {
             if call_core {
                 // 起動前に手放されていたら delete を呼ばない（guard の Drop が `in_flight` を外すだけ）。
                 if cancel.load(Ordering::Acquire) {
-                    return Err(CriError::timeout("runtime operation timed out"));
+                    return Err(CriError::timeout(RUNTIME_OPERATION_TIMED_OUT));
                 }
                 guard.mark_dispatched();
                 match adapter.remove(&id, true) {
@@ -4257,6 +4326,80 @@ impl RuntimeService for CriRuntimeService {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 常に指定のコードで解放に失敗し、呼び出し回数を数える試験用の供給元。
+    struct FailingRelease {
+        code: CriErrorCode,
+        calls: AtomicUsize,
+    }
+
+    impl BundleProvider for FailingRelease {
+        fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
+            Err(CriError::internal("unused"))
+        }
+        fn release(&self, _container_id: &str) -> Result<(), CriError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(match self.code {
+                CriErrorCode::Timeout => CriError::timeout("cut"),
+                _ => CriError::internal("failed"),
+            })
+        }
+    }
+
+    fn create_guard(provider: Arc<FailingRelease>) -> InFlightGuard {
+        let mut guard = InFlightGuard::new(
+            Arc::new(Mutex::new(SandboxRegistry::default())),
+            "c1".to_string(),
+            InFlightKind::Create,
+        );
+        guard.arm_bundles(provider, Duration::from_millis(50));
+        guard
+    }
+
+    /// CRI-2・REPAIR-5（#3307）: 解放の打ち切りだけが `DEADLINE_EXCEEDED`・固定文言になり、他の結果は元のエラーを保つ。
+    #[test]
+    fn create_error_after_rollback_maps_only_a_cut_release() {
+        let original = || CriError::resource_exhausted("no space");
+        let cut = create_error_after_rollback(original(), RollbackOutcome::ReleaseCut);
+        assert_eq!(cut.code(), CriErrorCode::Timeout);
+        assert_eq!(cut.message(), "runtime operation timed out");
+        for outcome in [
+            RollbackOutcome::NotNeeded,
+            RollbackOutcome::Released,
+            RollbackOutcome::Kept,
+        ] {
+            let kept = create_error_after_rollback(original(), outcome);
+            assert_eq!(kept.code(), CriErrorCode::ResourceExhausted);
+            assert_eq!(kept.message(), "no space");
+        }
+    }
+
+    /// CRI-2・REPAIR-5（#3307）: 巻き戻しは 1 回だけ。打ち切りは `ReleaseCut`、2 回目と drop は解放を再実行しない。
+    #[test]
+    fn rollback_runs_once_and_reports_a_cut_release() {
+        let provider = Arc::new(FailingRelease {
+            code: CriErrorCode::Timeout,
+            calls: AtomicUsize::new(0),
+        });
+        let mut guard = create_guard(Arc::clone(&provider));
+        assert_eq!(guard.rollback(), RollbackOutcome::ReleaseCut);
+        assert_eq!(guard.rollback(), RollbackOutcome::NotNeeded);
+        drop(guard);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// CRI-2・REPAIR-5（#3307）: 期限以外の解放の失敗は `Kept`（元のコードを保つ側）になる。
+    #[test]
+    fn rollback_reports_kept_for_a_non_deadline_release_failure() {
+        let provider = Arc::new(FailingRelease {
+            code: CriErrorCode::Internal,
+            calls: AtomicUsize::new(0),
+        });
+        let mut guard = create_guard(Arc::clone(&provider));
+        assert_eq!(guard.rollback(), RollbackOutcome::Kept);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
 
     /// CRI-2・NET-1（#2675）: set_up の結果の確定権は先に遷移した側だけが得る。worker が先なら呼び出し側は
     /// 手放せず（成功として返す）、呼び出し側が先なら worker は確定できない（Ready を公開しない）。

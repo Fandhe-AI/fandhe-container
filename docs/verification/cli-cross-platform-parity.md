@@ -35,9 +35,9 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
    終了コード 0 = 全ケース一致 / 1 = 不一致・欠落・タイムアウト・start 前提未達（`NOT_STARTED`） / 2 = 引数・入力エラー / 3 = 前提欠如。1 は機械照合の事実報告で、合否は人間が判定する。`BASELINE` は Linux で取った capture、`CANDIDATE` は別 OS で取った capture でなければならず、それ以外（非 Linux 基準・同じ OS 同士）は比較せず終了コード 3 で止まる
 4. 下のチェックリストの結果欄を記入する（A 層は capture の値を転記。B 層の非 Linux は前提が整うまで「前提未達」のまま）
-5. Windows でスクリプトが動かない場合の手動手順: 下のケース表の引数を PowerShell 等で 1 件ずつ実行し、終了コードと stderr 1 行 JSON の `code` を転記する。状態ルートは `--root` に専用の一時ディレクトリを指定し、既定の状態ルートに触れない。B 層は表の順（上から。B18〜B25 と B31〜B34 も同じ連鎖として順に）に実行する
+5. Windows でスクリプトが動かない場合の手動手順: 下のケース表の引数を PowerShell 等で 1 件ずつ実行し、終了コードと stderr 1 行 JSON の `code` を転記する。状態ルートは `--root` に専用の一時ディレクトリを指定し、既定の状態ルートに触れない。B 層は表の順（上から。B18〜B25・B31〜B34・B35〜B42 も同じ連鎖として順に）に実行する
 
-**Linux で start の連鎖（B18〜B25）を通す前提（#2891）**: 次を満たさないと B21・B23・B31・B33・B34 は `<start-failed>` になり、compare は `NOT_STARTED` を出して終了コード 1 になる（合格に見せない）。
+**Linux で start の連鎖（B18〜B25）を通す前提（#2891）**: 次を満たさないと B21・B23・B31・B33・B34・B37・B39 は `<start-failed>` になり、compare は `NOT_STARTED` を出して終了コード 1 になる（合格に見せない）。
 
 - ビルド: `cargo build -p fandhe-container-cli -p fandhe-container-supervisor`。`fandhe-container-supervisor` を CLI と同じディレクトリに置く。`fandhe-container-launcher` は置かない
 - 非 root で実行し、capture 全体を操作者が `systemd-run --user --scope -p Delegate=yes -- make cli-parity CLI=... OUTPUT=...` のように包む（`delete` は自分の cgroup から委譲を検出するため。スクリプト自身は systemd-run も sudo も呼ばない）
@@ -139,8 +139,8 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | `delete` | `delete [--force] <id>` | 終了コード・`code`・stdout 空・直後の `list` から ID が消える |
 | `list` | `list` | 終了コード・stdout の形式（ヘッダ `ID<TAB>STATUS<TAB>PID`、ID 昇順、0 件はヘッダのみで 0）・状態ルート不在は `NOT_FOUND`（3） |
 | `inspect` | `inspect <id>` | 終了コード・`code`・正規化した 1 行 JSON（B17。種別 `i`）・不在 ID は `NOT_FOUND`（3）。構文は A24・A25 |
-| `kill` | `kill <id> [<signal>]` | 終了コード・`code`・stdout 空・実行中の対象への成功は 0（B32）・不在 ID は `NOT_FOUND`（3）・実行中でなければ `FAILED_PRECONDITION`（5。B27・B28）。シグナルの語彙は標準 31 個の名前（`SIG` 接頭辞は任意）と 1〜64 の番号で、名前は大文字小文字を区別する。構文は A32〜A38 |
-| `state` | `state <id>` | 終了コード・`code`・正規化した 1 行 JSON（B26。種別 `o`）・不在 ID は `NOT_FOUND`（3。B29）。構文は A28〜A31・start 済みの対象は B31・B33・B34（種別 `p` / `q`） |
+| `kill` | `kill <id> [<signal>]` | 終了コード・`code`・stdout 空・実行中の対象への成功は 0（B32・B38 の KILL による停止）・停止後は 5（B40）・不在 ID は `NOT_FOUND`（3）・実行中でなければ `FAILED_PRECONDITION`（5。B27・B28）。シグナルの語彙は標準 31 個の名前（`SIG` 接頭辞は任意）と 1〜64 の番号で、名前は大文字小文字を区別する。構文は A32〜A38 |
+| `state` | `state <id>` | 終了コード・`code`・正規化した 1 行 JSON（B26。種別 `o`）・不在 ID は `NOT_FOUND`（3。B29）。構文は A28〜A31・start 済みの対象は B31・B33・B34・B37・B39（種別 `p` / `q`） |
 | `logs` | `logs [--follow] [--tail <N>] [--stream <stdout\|stderr>] [--escape] <id>` | 終了コード・`code`・不在 ID は `NOT_FOUND`（3）。オプションの構文は D 層（#2447・SUP-7） |
 
 ### ケース別チェックリスト
@@ -187,8 +187,18 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B34 | `state c2`（B23 の後。running でなくなるまで期限つきで繰り返す。種別 `q`） | 0 / `-` / `state:c2,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-` | | 前提未達 | 前提未達 | | 期限切れは `<timeout>`。#3098 で追加 |
 | B24 | `delete c2` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | `delete --force` は Running で 8 になるため使わない |
 | B25 | `list`（連鎖の後） | 0 / `-` / `list:H` | | 前提未達 | 前提未達 | | 片付いたことの確認 |
+| B35 | `create --bundle <起動用 bundle> c3` | 0 / `-` / `-` | | | | | #3350。kill による停止の連鎖（c3） |
+| B36 | `start c3` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | 非 Linux は 5 / `FAILED_PRECONDITION` |
+| B37 | `state c3`（kill の前。種別 `p`） | 0 / `-` / `state:c3,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-` | | 前提未達 | 前提未達 | | running であることの証跡 |
+| B38 | `kill c3 KILL` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | SIGKILL は pid namespace の init も止める。非 Linux は 5 / `FAILED_PRECONDITION` |
+| B39 | `state c3`（種別 `q`。stopped になるまで期限つきで繰り返す） | 0 / `-` / `state:c3,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-` | | 前提未達 | 前提未達 | | 期限切れは `<timeout>`。kill による停止の確認 |
+| B40 | `kill c3 TERM`（停止後） | 5 / `FAILED_PRECONDITION` / `-` | | 5 / `FAILED_PRECONDITION` | 5 / `FAILED_PRECONDITION` | | 停止後の kill の拒否。非 Linux の 5 は plugin 解決失敗との偶然の一致で、合格を意味しない |
+| B41 | `delete c3` | 0 / `-` / `-` | | | | | |
+| B42 | `list`（c3 の連鎖の後） | 0 / `-` / `list:H` | | | | | 片付いたことの確認 |
 
 **start 済みの state・kill の自動収集（#3098）**: 種別 `p` は start 済みの `state`（`o` と同じ正規化。直前の start が失敗したときは `<start-failed>`）、`q` は `p` と同じ形で running でなくなるまで期限つきで繰り返す。停止後の state（B34）を `kill c2 TERM` の直後でなく B23 の後に置くのは、PID 1 が SIGTERM を受けず kill が状態を変えないため（TERM の直後に停止を待つと健全な Linux でも毎回期限切れになる）。`pid` の値・bundle は記録しない。
+
+**kill による停止と停止後の拒否（#3350・CLI-1・SUP-11）**: c2 の kill TERM は PID 1 を止めないため、kill による停止は別コンテナ c3 の `kill c3 KILL`（B38）で観測する。SIGKILL は祖先の pid namespace から送れば子 namespace の init も止まる。`kill` は `stop` と違い明示 stop の意図を立てず、restart 方針は既定 `no` のため stopped で終わる。停止後の `kill`（B40）は 5 / `FAILED_PRECONDITION` で拒否される。
 
 **start 済みの inspect の自動収集（#2891）**: created の `inspect <id>` は B17・B19、start 済みの `inspect <id>` は B21（start 直後）・B23（停止後）で自動収集する。種別 `s` / `w` の記録は `started:<id>,<status>,pid=<pid|->,sup=<pid|->,cg=<set|->,health=<語彙|->,audit=<set|->,idmap=<set|->,stop=<語彙>,caps=<件数|->,ro=<true|false|->` で、`norm_inspect` と同じ検証を通した値だけを書く。記録しない値は revision・exitCode・restartCount（状態の書き込み回数・時機で変わる）、中身を落として有無だけにする値は audit（policy・mode はカーネルの seccomp・Landlock の版数で変わる）・idmap（model と件数はホストの subuid 設定で変わる）。`create --read-only` の後の `rootReadonly` は `ro=true`、`--cap-drop NET_RAW` の反映は `caps=13` で照合する。start が成功しない環境では出力を解析せず `<start-failed>` を記録し、compare は `NOT_STARTED`（基準と候補の値を表示）として扱って終了コードを 1 にする。MATCH にも MISMATCH にも数えず、集計に `not started (start precondition unmet): N` の行が出る。
 

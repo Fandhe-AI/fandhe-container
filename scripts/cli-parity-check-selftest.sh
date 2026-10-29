@@ -13,7 +13,7 @@
 # CI の時間枠を圧迫するため。同時実行の負荷は、CLI が即座に終わるときの監視サブシェル停止の競合
 # （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない
 # （本数を減らした分、この副次効果は弱まる。アサーションは減らしていない）。
-# inspect（B17）・state（B26）の fixture は、1 行を照合するだけのために 84 ケースを流す capture を避け、
+# inspect（B17）・state（B26）の fixture は、1 行を照合するだけのために 92 ケースを流す capture を避け、
 # compare や漏えい検査に使う full / order の 2 種ずつ（計 4 本）だけを capture（e2e）に残す。残りは
 # cli-parity-check.sh を source して norm_stdout を関数境界で呼び、同じ期待文字列を照合する（#3299）。
 # 関数境界の結果が e2e の capture と一致することも full で照合する。
@@ -53,7 +53,7 @@ expect_eq() {
 #   noisy    = ok と同じ終了コードで、stderr / stdout にパス風文字列・制御文字を流す
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
 #   nostart  = ok と同じだが、起動用 bundle の start も失敗する（supervisor 未配置など start の前提が無い環境。#2891）
-#   stuck    = ok と同じだが、stop しても running のまま（B23・B34 の終了待ちが期限切れになる。#2891・#3098）
+#   stuck    = ok と同じだが、stop しても running のまま（B23・B34・B39 の終了待ちが期限切れになる。#2891・#3098・#3350）
 #   delfail  = ok と同じだが、c2 の delete が失敗し c2 が残る（後始末の inspect は成功する。#2891）
 #   delgone  = c2 の delete は失敗するが c2 は消える（後始末の inspect は NOT_FOUND。#2891）
 #   sigdel   = c2 の delete が止まる（1 回目 = 連鎖中、2 回目 = 後始末中。印は STUB_SIGDEL_DIR の m1 / m2。#2891 の再入）
@@ -294,6 +294,10 @@ case "$cmd" in
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill
     # pid の無い（start されていない）対象は FAILED_PRECONDITION。実行中への送出はスタブでは状態を変えない。
     [ -e "$root/$id.started" ] || fail_op 5 FAILED_PRECONDITION kill
+    # KILL・SIGKILL・9 は PID 1 も止める（B38。#3350）。TERM・省略は状態を変えない。stuck は止まらない。
+    case "${sig:-}" in
+      KILL | SIGKILL | 9) [ "$mode" = "stuck" ] || mv "$root/$id.started" "$root/$id.stopped" ;;
+    esac
     ;;
   stop)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill
@@ -628,7 +632,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 84 cases" 84 "$count"
+expect_eq "capture records 92 cases" 92 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -647,7 +651,7 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 84 "$loc_n"
+expect_eq "lcall stub invocations" 92 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -739,12 +743,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=34 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=42 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
 cmp_has "lcall layer A summary" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=34 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=42 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -754,7 +758,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
 cmp_has "non-linux layer A all match" 'layer A (syntax): match=43 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21, B23, B31, B33 and B34 are not started; B32 differs 0 vs 5)" 'layer B (behavior): match=4 mismatch=25 missing=0'
+cmp_has "non-linux layer B mismatches (B05, B08, B27 and B28 coincide at 5; B21, B23, B31, B33, B34, B37 and B39 are not started; B32 differs 0 vs 5; B40 coincides at 5)" 'layer B (behavior): match=5 mismatch=30 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -771,7 +775,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=33 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=41 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"
@@ -955,6 +959,15 @@ expect_line "B22 stop --signal KILL" ok "B22${tab}B${tab}0${tab}-${tab}-"
 expect_line "B23 inspect after the stop" ok "B23${tab}B${tab}0${tab}-${tab}started:c2,stopped,pid=-,sup=<pid>,cg=<set>,health=-,audit=<set>,idmap=<set>,stop=recorded,caps=13,ro=true"
 expect_line "B24 delete" ok "B24${tab}B${tab}0${tab}-${tab}-"
 expect_line "B25 list after the chain" ok "B25${tab}B${tab}0${tab}-${tab}list:H"
+# kill による停止と停止後の kill の拒否（c3。B35〜B42。#3350・CLI-1・SUP-11）
+expect_line "B35 create of the kill bundle" ok "B35${tab}B${tab}0${tab}-${tab}-"
+expect_line "B36 start of c3" ok "B36${tab}B${tab}0${tab}-${tab}-"
+expect_line "B37 state of c3 before kill (running, pid key present)" ok "B37${tab}B${tab}0${tab}-${tab}state:c3,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-"
+expect_line "B38 kill KILL on the running c3" ok "B38${tab}B${tab}0${tab}-${tab}-"
+expect_line "B39 state of c3 after kill KILL (stopped, no pid key)" ok "B39${tab}B${tab}0${tab}-${tab}state:c3,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-"
+expect_line "B40 kill TERM on the stopped c3 is rejected" ok "B40${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "B41 delete of c3" ok "B41${tab}B${tab}0${tab}-${tab}-"
+expect_line "B42 list after the c3 chain" ok "B42${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B05 start of the empty rootfs bundle fails" ok "B05${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
 # start が成功しない環境（nostart）は印だけを残す。
 expect_line "nostart B20 start fails" nostart "B20${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
@@ -966,14 +979,25 @@ expect_line "nostart B33 is start-failed" nostart "B33${tab}B${tab}0${tab}-${tab
 expect_line "nostart B34 is start-failed" nostart "B34${tab}B${tab}0${tab}-${tab}<start-failed>"
 expect_line "nostart B24 delete of the created container" nostart "B24${tab}B${tab}0${tab}-${tab}-"
 expect_line "nostart B25 list is empty again" nostart "B25${tab}B${tab}0${tab}-${tab}list:H"
+expect_line "nostart B35 create of c3" nostart "B35${tab}B${tab}0${tab}-${tab}-"
+expect_line "nostart B36 start of c3 fails" nostart "B36${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "nostart B37 is start-failed" nostart "B37${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B38 kill KILL is FAILED_PRECONDITION" nostart "B38${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "nostart B39 is start-failed" nostart "B39${tab}B${tab}0${tab}-${tab}<start-failed>"
+expect_line "nostart B40 kill TERM is FAILED_PRECONDITION" nostart "B40${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-"
+expect_line "nostart B41 delete of the created c3" nostart "B41${tab}B${tab}0${tab}-${tab}-"
+expect_line "nostart B42 list is empty again" nostart "B42${tab}B${tab}0${tab}-${tab}list:H"
 compare ok nostart
 expect_rc "compare with a not started side is rc 1" 1 $?
 cmp_has_prefix "B21 reported as NOT_STARTED" 'B21 NOT_STARTED'
 cmp_has_prefix "B23 reported as NOT_STARTED" 'B23 NOT_STARTED'
 cmp_has_prefix "B31 reported as NOT_STARTED" 'B31 NOT_STARTED'
 cmp_has_prefix "B34 reported as NOT_STARTED" 'B34 NOT_STARTED'
+cmp_has_prefix "B37 reported as NOT_STARTED" 'B37 NOT_STARTED'
+cmp_has_prefix "B39 reported as NOT_STARTED" 'B39 NOT_STARTED'
+cmp_has_prefix "B38 kill mismatch is reported" 'B38 MISMATCH'
 cmp_has_prefix "B32 kill mismatch is reported" 'B32 MISMATCH'
-cmp_has "not started count" 'not started (start precondition unmet): 5'
+cmp_has "not started count" 'not started (start precondition unmet): 7'
 compare nostart nostart
 expect_rc "matching <start-failed> records are rc 1" 1 $?
 cmp_has_prefix "B21 not started on both sides is NOT_STARTED" 'B21 NOT_STARTED'
@@ -993,6 +1017,12 @@ case "$(line_of stuck B34)" in
 esac
 expect_line "stuck B33 stays running" stuck "B33${tab}B${tab}0${tab}-${tab}state:c2,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-"
 expect_line "stuck B24 still deletes" stuck "B24${tab}B${tab}0${tab}-${tab}-"
+case "$(line_of stuck B39)" in
+  "B39${tab}B${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>") pass "B39 recorded as timeout" ;;
+  *) fail "B39 recorded as timeout (got '$(line_of stuck B39)')" ;;
+esac
+expect_line "stuck B38 kill KILL is accepted but c3 stays running" stuck "B38${tab}B${tab}0${tab}-${tab}-"
+expect_line "stuck B41 still deletes c3" stuck "B41${tab}B${tab}0${tab}-${tab}-"
 # 漏えい検査: bundle・cgroup・hostId・reason は started の記録に現れない
 leak=0
 for n in nostart stuck; do
@@ -1032,6 +1062,21 @@ done
 sed "s/^B34${tab}B${tab}0${tab}-${tab}.*/B34${tab}B${tab}0${tab}-${tab}state:garbage/" "$work/ok.txt" >"$work/k7.txt"
 compare k7 k7
 expect_rc "state:garbage on B34 is rejected" 2 $?
+# kill による停止（c3。#3350）: B39 が running のまま・B40 の拒否が退行（0）すると不一致、型違いは拒否
+sed "s/^B39${tab}B${tab}0${tab}-${tab}.*/B39${tab}B${tab}0${tab}-${tab}state:c3,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/k8.txt"
+compare ok k8
+expect_rc "B39 still running after kill KILL is rc 1" 1 $?
+cmp_has_prefix "B39 running after kill KILL is MISMATCH" 'B39 MISMATCH'
+sed "s/^B40${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-/B40${tab}B${tab}0${tab}-${tab}-/" "$work/ok.txt" >"$work/k9.txt"
+compare ok k9
+expect_rc "B40 kill of a stopped container accepted is rc 1" 1 $?
+cmp_has_prefix "B40 accepted kill after stop is MISMATCH" 'B40 MISMATCH'
+sed "s/^B40${tab}B${tab}5${tab}FAILED_PRECONDITION${tab}-/B40${tab}B${tab}0${tab}-${tab}state:c3,stopped,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-/" "$work/ok.txt" >"$work/k10.txt"
+compare k10 k10
+expect_rc "state form on the B40 kill case is rejected" 2 $?
+sed "s/^B39${tab}B${tab}0${tab}-${tab}.*/B39${tab}B${tab}0${tab}-${tab}<start-failed>/" "$work/ok.txt" >"$work/k11.txt"
+compare k11 k11
+expect_rc "<start-failed> on B39 is accepted (rc 1, not input error 2)" 1 $?
 # 漏えい検査: state の pid の値と bundle のパスは記録に現れない
 if grep -qE '4242|secret-user' "$work/ok.txt"; then fail "state pid / bundle leaked into the capture"; else pass "state pid / bundle not in the capture"; fi
 # load_capture: started 形式・<start-failed> は種別 s / w にだけ置ける

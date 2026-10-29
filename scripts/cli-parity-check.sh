@@ -36,6 +36,11 @@
 # SIGTERM を受けず、kill は送るだけで状態を変えないため、B33 は running のまま（停止は B22 の stop --signal KILL が担う）。
 # 停止後の state（B34。種別 q）は B23 の後に置き、running でなくなるまで期限つきで繰り返す（stopped・pid キーなし）。
 # start が成功しない環境では B31・B33・B34 は <start-failed>（NOT_STARTED）、B32 は 5 / FAILED_PRECONDITION の実データになる。
+# kill による停止と停止後の kill の拒否（B35〜B42。#3350・CLI-1・SUP-11）: B25 の後に別コンテナ c3 の連鎖を通す。
+# start（B36）→ state（B37。running）→ kill c3 KILL（B38。SIGKILL は pid namespace の init も止める。kill は明示 stop の
+# 意図を立てず restart 方針は既定 no）→ state（B39。種別 q。stopped になるまで期限つきで繰り返す）→ 停止後の kill c3 TERM
+# （B40。5 / FAILED_PRECONDITION で拒否）→ delete（B41）→ list（B42）。start が成功しない環境では B37・B39 は
+# <start-failed>、B38・B40 は 5 / FAILED_PRECONDITION の実データになる（B40 の非 Linux の 5 は plugin 解決失敗との偶然の一致）。
 #
 # start 済みの inspect（B18〜B25・種別 s / w。#2891・SEC-1・CLI-1）: B18 で `--read-only --cap-drop NET_RAW` つきの
 # コンテナ c2 を起動用 bundle（Linux だけホストの sleep と依存ライブラリを集めた最小 rootfs を持つ）で作り、
@@ -109,6 +114,7 @@ usage() {
 # p = start 済みコンテナの state（o と同じ正規化。直前の start が失敗したときは <start-failed>。#3098）、
 # q = p と同じ形で、状態が running でなくなるまで期限つきで繰り返す。
 # kill c2 TERM は PID 1 が SIGTERM を受けず止まらないため、停止は B22 が担い、停止後の state（q）は B23 の後に置く。
+# kill による停止は c3 の kill c3 KILL（B38）で観測する（#3350）。
 # B 層は上から順に実行する（状態遷移を観測する）。ID・層はドキュメントのチェックリストと一致させる。
 # --------------------------------------------------
 CASES=(
@@ -189,6 +195,14 @@ CASES=(
   'B34|B|q|--root @R@ state c2'
   'B24|B|n|--root @R@ delete c2'
   'B25|B|l|--root @R@ list'
+  'B35|B|n|--root @R@ create --bundle @S@ c3'
+  'B36|B|n|--root @R@ start c3'
+  'B37|B|p|--root @R@ state c3'
+  'B38|B|n|--root @R@ kill c3 KILL'
+  'B39|B|q|--root @R@ state c3'
+  'B40|B|n|--root @R@ kill c3 TERM'
+  'B41|B|n|--root @R@ delete c3'
+  'B42|B|l|--root @R@ list'
   'D01|D|n|--root @R@ logs --tail'
   'D02|D|n|--root @R@ logs --tail x c1'
   'D03|D|n|--root @R@ logs --tail 1000001 c1'
@@ -251,11 +265,11 @@ kill_unreaped_child() {
   fi
 }
 
-# start 済みの連鎖（B20〜B24）の後始末に使う CLI と状態ルート、連鎖が生きているか（1 = start 成功後で
-# delete 前）。中断・タイムアウトで連鎖の途中に居るときに、コンテナを残さないために使う（#2891・REPAIR-5）。
+# start 済みの連鎖（c2: B20〜B24、c3: B36〜B41）の後始末に使う CLI と状態ルート、生きている連鎖のコンテナ ID
+# （空白区切り。start の呼び出し前に追加し、delete 成功の確認後に取り除く。bash 3.2 互換の文字列操作）。中断・タイムアウトで連鎖の途中に居るときに、コンテナを残さないために使う（#2891・REPAIR-5）。
 chain_cli=""
 chain_state=""
-chain_live=0
+chain_ids=""
 # 回収に失敗して状態ルートを残すと決めたか。シグナル trap の cleanup の後に EXIT trap が cleanup を再実行しても
 # 保持の判断を維持する（再入で rm -rf に到達させない。REPAIR-5）。
 keep_state=0
@@ -276,31 +290,39 @@ cleanup() {
   fi
   # start 済みのコンテナを best effort で止めて消す（各呼び出しは 10 秒の期限つき。失敗は握る）。
   # supervisor・委譲 scope が残る場合の限界は docs/verification/cli-cross-platform-parity.md に書く。
-  if [ "$chain_live" -eq 1 ] && [ -n "$chain_cli" ] && [ -d "$tmp_dir" ]; then
-    chain_live=0
+  if [ -n "$chain_ids" ] && [ -n "$chain_cli" ] && [ -d "$tmp_dir" ]; then
+    local cid pending="$chain_ids"
+    chain_ids=""
     # 回収の開始前に保持を立てる。stop / delete / 不在確認の途中で TERM・INT・HUP を受けて trap から再入しても、
-    # chain_live=0 かつ keep_state=0 で rm -rf に到達しないようにする。不在を確認できた後だけ下で解除する（REPAIR-5）。
-    keep_state=1
-    run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL c2 || true
-    sleep 0.5
-    run_cli "$chain_cli" 10 --root "$chain_state" delete c2 || true
-    # delete が成功しなかった（状態が残る可能性がある）なら、手動回収に必要な状態ルートを消さずに残す。
-    # 消してよいのは、delete が成功したとき、または inspect が構造化エラー code=NOT_FOUND で終わり
-    # c2 の不在を確認できたときだけである。inspect が成功（c2 が残存）・NOT_FOUND 以外の失敗・期限切れ・
-    # 取得不能は、不在を確認できていないので inspect の結果で delete の失敗を上書きせず状態ルートを保持する
+    # chain_ids が空かつ keep_state=0 で rm -rf に到達しないようにする。全 ID の不在を確認できた後だけ下で解除する
     # （REPAIR-5）。
-    if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
-      run_cli "$chain_cli" 10 --root "$chain_state" inspect c2 || true
-      if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" != "0" ] && [ "$run_exit" != "" ] \
-        && grep -q '"code":"NOT_FOUND"' "$tmp_dir/err" 2>/dev/null; then
-        run_exit=0
-        run_timed_out=0
-      else
-        run_exit=1
+    keep_state=1
+    local all_reclaimed=1
+    for cid in $pending; do
+      run_cli "$chain_cli" 10 --root "$chain_state" stop --signal KILL "$cid" || true
+      sleep 0.5
+      run_cli "$chain_cli" 10 --root "$chain_state" delete "$cid" || true
+      # delete が成功しなかった（状態が残る可能性がある）なら、手動回収に必要な状態ルートを消さずに残す。
+      # 消してよいのは、delete が成功したとき、または inspect が構造化エラー code=NOT_FOUND で終わり
+      # 当該 ID の不在を確認できたときだけである。inspect が成功（残存）・NOT_FOUND 以外の失敗・期限切れ・
+      # 取得不能は、不在を確認できていないので inspect の結果で delete の失敗を上書きせず状態ルートを保持する
+      # （REPAIR-5）。
+      if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
+        run_cli "$chain_cli" 10 --root "$chain_state" inspect "$cid" || true
+        if [ "$run_timed_out" -eq 0 ] && [ "$run_exit" != "0" ] && [ "$run_exit" != "" ] \
+          && grep -q '"code":"NOT_FOUND"' "$tmp_dir/err" 2>/dev/null; then
+          run_exit=0
+          run_timed_out=0
+        else
+          run_exit=1
+        fi
       fi
-    fi
-    if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
-      err warning "container c2 could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
+      if [ "$run_timed_out" -ne 0 ] || [ "$run_exit" != "0" ]; then
+        err warning "container $cid could not be reclaimed; keeping state root for manual cleanup: $tmp_dir"
+        all_reclaimed=0
+      fi
+    done
+    if [ "$all_reclaimed" -eq 0 ]; then
       return 0
     fi
     keep_state=0
@@ -819,7 +841,8 @@ do_capture() {
     done
     # B20 の start は結果が返る前に supervisor が別プロセスグループで起動を続けるため、呼び出しの前から
     # 後始末の対象にする（待機中の TERM / HUP でコンテナを残さない。起動結果が不明なため）。
-    if [ "$id" = "B20" ]; then chain_live=1; fi
+    if [ "$id" = "B20" ]; then chain_ids="$chain_ids c2"; fi
+    if [ "$id" = "B36" ]; then chain_ids="$chain_ids c3"; fi
     run_cli "$cli" "$limit" "${argv[@]}"
     # w は状態が running でなくなるまで期限つきで繰り返す（stop 直後の delete が Running で失敗する競合を避ける）。
     # start が成功していなければ待っても変わらないので 1 回で済ませる。
@@ -849,7 +872,8 @@ do_capture() {
     fi
     norm_code
     norm_stdout "$kind"
-    if [ "$id" = "B24" ] && [ "$run_exit" = "0" ]; then chain_live=0; fi
+    if [ "$id" = "B24" ] && [ "$run_exit" = "0" ]; then chain_ids=" ${chain_ids} "; chain_ids="${chain_ids// c2 / }"; fi
+    if [ "$id" = "B41" ] && [ "$run_exit" = "0" ]; then chain_ids=" ${chain_ids} "; chain_ids="${chain_ids// c3 / }"; fi
     lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}${norm_code_out}${TAB}${norm_stdout_out}")
   done
 

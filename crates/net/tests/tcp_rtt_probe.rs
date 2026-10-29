@@ -428,6 +428,7 @@ fn self_test() {
     net3_overall_deadline();
     net3_loopback_via_processes();
     net3_wait_within_reports_expiry();
+    net3_run_within_reports_expiry();
 }
 
 fn net3_percentiles() {
@@ -721,4 +722,38 @@ fn net3_wait_within_reports_expiry() {
         format!("child {pid} did not exit within 200ms")
     );
     assert_eq!(reap::reap(&mut g.0, Duration::from_secs(10)), Ok(()));
+}
+
+/// 外部コマンドの期限つき実行が期限切れを失敗として表に出すことの照合（REPAIR-5・REPAIR-12・#3306）。
+/// 終わらない子（`--serve`）は具体的なメッセージの `Err` になり（子は補助が回収する）、すぐ終わる子
+/// （`--list`）は `Ok` で成功終了する。存在しないコマンドの起動失敗も `Err` になる。
+fn net3_run_within_reports_expiry() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let program = exe.to_string_lossy().into_owned();
+    let r = reap::run_within(
+        Command::new(&exe)
+            .args(["--serve", "127.0.0.1:0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_millis(200),
+    );
+    assert_eq!(
+        r.unwrap_err(),
+        format!("{program} did not finish within 200ms")
+    );
+    let st = reap::run_within(
+        Command::new(&exe)
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_secs(10),
+    )
+    .expect("--list finishes");
+    assert_eq!(st.code(), Some(0));
+    let missing = "/nonexistent/fandhe-no-such-command";
+    let e = reap::run_within(&mut Command::new(missing), Duration::from_secs(1)).unwrap_err();
+    assert!(
+        e.starts_with(&format!("spawn {missing} failed: ")),
+        "unexpected: {e}"
+    );
 }

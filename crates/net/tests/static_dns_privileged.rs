@@ -177,13 +177,17 @@ mod linux {
             if pids.is_empty() {
                 return;
             }
-            let _ = Command::new("kill")
-                .args(["-KILL", "--"])
-                .args(&pids)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Err(e) = crate::reap::run_within(
+                Command::new("kill")
+                    .args(["-KILL", "--"])
+                    .args(&pids)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            ) {
+                eprintln!("kill failure: {e}");
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -216,7 +220,7 @@ mod linux {
                 None if Instant::now() >= deadline => {
                     // --inner と run_cmd 配下の nsenter・probe 等、セッション内の全プロセスを SIGKILL して回収する。
                     kill_session(sid);
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("static_dns_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -298,13 +302,18 @@ mod linux {
             .map_err(|e| fail(format!("spawn {program}: {e}")))?;
         let pgid = child.id();
         let kill_group = |child: &mut std::process::Child| {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pgid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
+            // 期限つきで kill を実行する。失敗は握り潰さず stderr に出す（呼び出し元は既に失敗を返す経路。REPAIR-5）。
+            if let Err(e) = crate::reap::run_within(
+                Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pgid}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            ) {
+                eprintln!("kill failure: {e}");
+            }
+            crate::reap::reap_or_report(child, crate::reap::reap_within());
         };
         let (out_rx, out_over) = spawn_capped_reader(child.stdout.take());
         let (err_rx, err_over) = spawn_capped_reader(child.stderr.take());

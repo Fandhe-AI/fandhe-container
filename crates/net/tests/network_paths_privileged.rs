@@ -300,25 +300,40 @@ mod linux {
 
     /// プロセスグループ `pgid` の全員に SIGKILL を送り、グループが空になる（`kill -0` が失敗する）まで
     /// 期限つきで待つ。空になったことを確認できたら true（外部 `kill` コマンド経由で `sys` 外の unsafe を避ける）。
+    /// 外部 `kill` 自体にも期限を付ける（1 回の上限は全体の残り期限。下限 100ms）。`kill` が期限内に
+    /// 戻らない場合は stderr に出して false を返す（REPAIR-5・#3306）。
     fn kill_group(pgid: u32, leader: &mut std::process::Child) -> bool {
         let target = format!("-{pgid}");
-        let signal = |sig: &str| {
-            Command::new("kill")
-                .args([sig, "--", &target])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-        let _ = signal("-KILL");
         let deadline = Instant::now() + timeout();
+        // `Ok(true)`: シグナル送達に成功、`Ok(false)`: kill が失敗終了（対象なし）、`Err`: 期限切れ・起動失敗。
+        let signal = |sig: &str| -> Result<bool, String> {
+            let per_call = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(100));
+            crate::reap::run_within(
+                Command::new("kill")
+                    .args([sig, "--", &target])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                per_call,
+            )
+            .map(|s| s.success())
+        };
+        let report = |e: String| {
+            eprintln!("kill failure: {e}");
+            false
+        };
+        if let Err(e) = signal("-KILL") {
+            return report(e);
+        }
         loop {
             // グループリーダー（unshare）が未回収のゾンビのままだと `kill -0` が成功し続けるため、先に回収する。
             let _ = leader.try_wait();
-            if !signal("-0") {
-                return true;
+            match signal("-0") {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(e) => return report(e),
             }
             if Instant::now() >= deadline {
                 eprintln!(
@@ -326,7 +341,9 @@ mod linux {
                 );
                 return false;
             }
-            let _ = signal("-KILL");
+            if let Err(e) = signal("-KILL") {
+                return report(e);
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -473,7 +490,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -526,12 +543,16 @@ mod linux {
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 if expected != Some(std::os::unix::process::parent_id()) {
-                    let _ = Command::new("kill")
-                        .args(["-KILL", "--", &format!("-{}", std::process::id())])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                    if let Err(e) = crate::reap::run_within(
+                        Command::new("kill")
+                            .args(["-KILL", "--", &format!("-{}", std::process::id())])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null()),
+                        crate::reap::reap_within(),
+                    ) {
+                        eprintln!("kill failure: {e}");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -1188,7 +1209,7 @@ mod linux {
                 match crate::reap::wait_within(&mut child, std::time::Duration::from_secs(60)) {
                     Ok(st) => st,
                     Err(e) => {
-                        crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                        crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                         panic!("hold-check[{case}]: {e}");
                     }
                 };

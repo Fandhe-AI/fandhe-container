@@ -60,7 +60,8 @@ mod linux {
         PortRegistry, VethNames,
     };
     use fandhe_container_net::network_store::{
-        MemberId, MemberIntent, NetworkDefinition, NetworkStore, RealizedIntent, RealizedOp,
+        HostGeneration, MemberId, MemberIntent, NetworkDefinition, NetworkStore, RealizedIntent,
+        RealizedOp,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -211,7 +212,16 @@ mod linux {
         gateway: IpPrefix,
         op: RealizedOp,
     ) -> Result<RealizedIntent, String> {
-        RealizedIntent::new(op, nn.clone(), &created.bridge_token, subnet, gateway).map_err(e)
+        let generation = HostGeneration::current().map_err(e)?;
+        RealizedIntent::new(
+            op,
+            nn.clone(),
+            &created.bridge_token,
+            subnet,
+            gateway,
+            generation,
+        )
+        .map_err(e)
     }
 
     fn link_exists(name: &str) -> bool {

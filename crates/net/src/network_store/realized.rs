@@ -16,8 +16,8 @@
 //! token <len>\n<所有トークン>\n               token <len>\n<所有トークン>\n
 //! table <len>\n<nft テーブル名>\n             subnet <len>\n<a.b.c.d/nn>\n
 //! table-handle <len>\n<10 進・非 0>\n         gateway <len>\n<a.b.c.d/nn>\n
-//! boot-id <len>\n<UUID>\n
-//! netns <len>\n<dev:ino>\n
+//! boot-id <len>\n<UUID>\n                    boot-id <len>\n<UUID>\n（操作開始時の世代。#3346）
+//! netns <len>\n<dev:ino>\n                    netns <len>\n<dev:ino>\n
 //! gateway <len>\n<a.b.c.d/nn>\n
 //! subnet <len>\n<a.b.c.d/nn>\n
 //! ```
@@ -195,6 +195,28 @@ impl HostGeneration {
     }
 }
 
+/// `boot-id`・`netns` の 2 行を書く（FCREA1・FCRIN1 共通）。
+fn push_generation(out: &mut String, generation: &HostGeneration) {
+    push_field(out, "boot-id", &generation.boot_id);
+    push_field(
+        out,
+        "netns",
+        &format!("{}:{}", generation.netns.dev, generation.netns.ino),
+    );
+}
+
+/// `boot-id`・`netns` の 2 行を読む。欠落・不正値は `DataLoss`。
+fn take_generation(rest: &mut &str) -> Result<HostGeneration, NetError> {
+    let boot_id = take_field(rest, "boot-id")?;
+    let netns = take_field(rest, "netns")?;
+    netns
+        .split_once(':')
+        .and_then(|(d, i)| Some((d.parse::<u64>().ok()?, i.parse::<u64>().ok()?)))
+        .filter(|(d, i)| format!("{d}:{i}") == netns)
+        .ok_or_else(|| bad("network record netns identity is malformed"))
+        .and_then(|(d, i)| HostGeneration::new(boot_id, NetnsIdentity::new(d, i)))
+}
+
 /// カーネル資源の作成に成功したネットワークの記録（FCREA1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealizedRecord {
@@ -302,15 +324,7 @@ impl RealizedRecord {
             "table-handle",
             &self.table_handle.get().to_string(),
         );
-        push_field(&mut out, "boot-id", &self.generation.boot_id);
-        push_field(
-            &mut out,
-            "netns",
-            &format!(
-                "{}:{}",
-                self.generation.netns.dev, self.generation.netns.ino
-            ),
-        );
+        push_generation(&mut out, &self.generation);
         push_field(&mut out, "gateway", &format_prefix(&self.gateway));
         push_field(&mut out, "subnet", &format_prefix(&self.subnet));
         out.into_bytes()
@@ -338,14 +352,7 @@ impl RealizedRecord {
             .filter(|n| n.to_string() == handle)
             .and_then(|n| NftTableHandle::new(n).ok())
             .ok_or_else(|| bad("realized record table handle is malformed"))?;
-        let boot_id = take_field(&mut rest, "boot-id")?;
-        let netns = take_field(&mut rest, "netns")?;
-        let generation = netns
-            .split_once(':')
-            .and_then(|(d, i)| Some((d.parse::<u64>().ok()?, i.parse::<u64>().ok()?)))
-            .filter(|(d, i)| format!("{d}:{i}") == netns)
-            .ok_or_else(|| bad("realized record netns identity is malformed"))
-            .and_then(|(d, i)| HostGeneration::new(boot_id, NetnsIdentity::new(d, i)))?;
+        let generation = take_generation(&mut rest)?;
         let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
         let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
         finish(rest)?;
@@ -392,16 +399,20 @@ pub struct RealizedIntent {
     token: String,
     subnet: IpPrefix,
     gateway: IpPrefix,
+    generation: HostGeneration,
 }
 
 impl RealizedIntent {
     /// 検証して作る。bridge は名前から導出した名前に固定し、トークンはそのネットワークの発行形式に限る。
+    /// `generation` は操作を始めた時点の世代（boot ID・操作対象の network namespace）で、照合が別の namespace から
+    /// 開かれたストアで「不在」を信用して意図記録を消すことを防ぐ（#3346・NET-1・SEC-1）。
     pub fn new(
         op: RealizedOp,
         name: NetworkName,
         token: &str,
         subnet: IpPrefix,
         gateway: IpPrefix,
+        generation: HostGeneration,
     ) -> Result<Self, NetError> {
         let (bridge, _) = derived_names(&name)?;
         let rec = Self {
@@ -411,6 +422,7 @@ impl RealizedIntent {
             token: token.to_owned(),
             subnet,
             gateway,
+            generation,
         };
         rec.validate()?;
         Ok(rec)
@@ -452,6 +464,11 @@ impl RealizedIntent {
         self.gateway
     }
 
+    /// 操作を始めた時点の世代。
+    pub fn generation(&self) -> &HostGeneration {
+        &self.generation
+    }
+
     /// 正準形の FCRIN1 へ符号化する。
     pub fn encode(&self) -> Vec<u8> {
         let mut out = String::from(INTENT_MAGIC);
@@ -461,6 +478,7 @@ impl RealizedIntent {
         push_field(&mut out, "token", &self.token);
         push_field(&mut out, "subnet", &format_prefix(&self.subnet));
         push_field(&mut out, "gateway", &format_prefix(&self.gateway));
+        push_generation(&mut out, &self.generation);
         out.into_bytes()
     }
 
@@ -478,6 +496,7 @@ impl RealizedIntent {
         let token = take_field(&mut rest, "token")?.to_owned();
         let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
         let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
+        let generation = take_generation(&mut rest)?;
         finish(rest)?;
         let rec = Self {
             op,
@@ -486,6 +505,7 @@ impl RealizedIntent {
             token,
             subnet,
             gateway,
+            generation,
         };
         rec.validate()?;
         Ok(rec)
@@ -647,11 +667,29 @@ mod tests {
             TOKEN,
             pfx([10, 0, 0, 0], 24),
             pfx([10, 0, 0, 1], 24),
+            fixed_generation(),
         )
         .unwrap();
         let text = String::from_utf8(i.encode()).unwrap();
         assert!(text.starts_with("FCRIN1\nop 6\ncreate\nname 3\nweb\nbridge "));
-        assert!(text.ends_with("subnet 11\n10.0.0.0/24\ngateway 11\n10.0.0.1/24\n"));
+        assert!(text.ends_with(&format!(
+            "subnet 11\n10.0.0.0/24\ngateway 11\n10.0.0.1/24\nboot-id 36\n{}\nnetns 12\n5:4026531833\n",
+            fixed_generation().boot_id()
+        )));
+        // 世代の欠落（boot-id・netns 行が無い形式）は DataLoss。
+        let no_gen = text.replace(
+            &format!(
+                "boot-id 36\n{}\nnetns 12\n5:4026531833\n",
+                fixed_generation().boot_id()
+            ),
+            "",
+        );
+        assert_ne!(no_gen, text);
+        assert_eq!(
+            code(RealizedIntent::decode(no_gen.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+        assert_eq!(i.generation(), &fixed_generation());
         assert_eq!(i.gateway(), pfx([10, 0, 0, 1], 24));
         assert_eq!(i.subnet(), pfx([10, 0, 0, 0], 24));
         // 旧形式（gateway 無し）・subnet 外・network アドレスは DataLoss。
@@ -679,7 +717,8 @@ mod tests {
                 NetworkName::new("web").unwrap(),
                 "fandhe-net:other:1:0:0",
                 pfx([10, 0, 0, 0], 24),
-                pfx([10, 0, 0, 1], 24)
+                pfx([10, 0, 0, 1], 24),
+                fixed_generation()
             )),
             NetErrorCode::DataLoss
         );

@@ -504,6 +504,7 @@ where
         &token,
         subnet,
         gateway,
+        host.clone(),
     )
     .map_err(RecordedError::Store)?;
     guard
@@ -573,6 +574,7 @@ where
         realized.token(),
         realized.subnet(),
         realized.gateway(),
+        realized.generation().clone(),
     )
     .map_err(RecordedError::Store)?;
     guard
@@ -1812,6 +1814,7 @@ mod tests {
                 BRIDGE_TOKEN,
                 pfx([10, 0, 0, 0], 24),
                 pfx([10, 0, 0, 1], 24),
+                host(),
             )
             .unwrap(),
         )

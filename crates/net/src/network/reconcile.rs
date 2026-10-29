@@ -19,6 +19,7 @@
 //! | create | なし | 所有と不在の混在 | 所有する資源だけを `reclaim_failed_create_with` で巻き戻して意図記録を消す |
 //! | delete | あり / なし | 両方不在 | 削除は完了済み。`realized`（あれば）と意図記録を消す |
 //! | delete | あり / なし | 所有あり・証明不能なし | 所有する資源を巻き戻して削除を完了する |
+//! | create / delete | なし | 意図記録の世代が現在と違う | 据え置き（別の namespace から開いた可能性。意図記録と請求書を消さない） |
 //! | いずれも | | 1 つでも証明不能 | 据え置き（従来どおり次の操作は `FailedPrecondition`） |
 //!
 //! 巻き戻しに失敗したときは意図記録を消さず、次の照合が再試行する。請求書（`pending-reclaim/create`）へ移さない理由は、
@@ -110,7 +111,7 @@ pub enum Unresolved {
     Unproven,
     /// 巻き戻しで取り残しがあった（次の照合が再試行する）。
     RollbackIncomplete,
-    /// 記録した `realized` の世代（boot ID・network namespace）が現在と違う。別の namespace から開いた可能性があり、
+    /// 記録した `realized` または意図記録の世代（boot ID・network namespace）が現在と違う。別の namespace から開いた可能性があり、
     /// カーネル側の不在を信用できないため何も変えない。
     GenerationMismatch,
 }
@@ -255,6 +256,14 @@ fn reconcile_intent<O: ReconcileOps>(
                 return Err(data_loss("realized intent differs from realized"));
             }
         }
+        (RealizedOp::Create | RealizedOp::Delete, None) if intent.generation() != host => {
+            // `realized` が無い操作は、不在の判定を信用する前に、操作を始めた namespace と同じであることを確かめる。
+            // 別の namespace から開くと bridge・テーブルが両方不在に見え、元の資源が残ったまま意図記録と同じトークンの
+            // 請求書を消して追跡不能にしてしまう（#3346）。
+            return Ok(RealizedReconcile::Unresolved(
+                Unresolved::GenerationMismatch,
+            ));
+        }
         (RealizedOp::Create, None) => {
             let definition = guard.definition()?;
             let InstallMode::Bridge { subnet } = *definition.install() else {
@@ -331,6 +340,12 @@ fn expected_listeners(
     let mut out: HashMap<(PortProtocol, Ipv4Addr, u16), usize> = HashMap::new();
     for m in guard.members()? {
         for p in m.publishes() {
+            // 墓標（ルール 2 本の消失を確かめ済み）は説明に数えない。数えると、予約が残る同じ受け口へ
+            // 再起動後に別の attach が DNAT を入れて落ちたとき、その DNAT を説明済みと誤認して
+            // 掃除（アドレスの解放）をしてしまう。解除中（意図の印のみ）はルールが残りうるため数える。
+            if p.unpublished() {
+                continue;
+            }
             let port = p.publish();
             let n = out
                 .entry((port.protocol(), port.host_addr(), port.host_port()))

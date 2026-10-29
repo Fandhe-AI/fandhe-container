@@ -69,6 +69,7 @@ fn intent(op: RealizedOp, token: &str) -> RealizedIntent {
         token,
         pfx([10, 0, 0, 0], 24),
         pfx([10, 0, 0, 1], 24),
+        host(),
     )
     .unwrap()
 }
@@ -486,6 +487,7 @@ fn net1_3346_delete_intent_completes_delete() {
             TOKEN,
             pfx([10, 0, 0, 0], 24),
             pfx([10, 0, 0, 2], 24),
+            host(),
         )
         .unwrap(),
     )
@@ -857,4 +859,64 @@ fn net1_3346_generation_mismatch_keeps_records() {
     let report = reconcile_recorded_with(&other_host(), &n, &Fake::owned()).unwrap();
     assert!(report.removed_intents.is_empty());
     assert_eq!(n.member_intents().unwrap().len(), 1);
+}
+
+/// NET-7・SEC-1・#3346: 墓標（解除済みの公開）は DNAT の説明に数えない。墓標だけが説明する受け口の DNAT が
+/// 残っていれば、実体の無い意図記録も掃除せず `DnatUnaccounted` で残す。
+#[test]
+fn net7_3346_sweep_does_not_count_tombstones_as_live_dnat() {
+    let published = port(8080);
+    let h = |n: u64| NftRuleHandle::new(n).unwrap();
+    let both = PublishedListeners::from_ports_for_test(&[published, published])
+        .listeners()
+        .to_vec();
+    let t = Tmp::new("tombstone");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    ready(&n);
+    let owner = member_rec("c9", 5)
+        .with_publishes(
+            NftTableHandle::new(42).unwrap(),
+            vec![RecordedPublish::new(published, h(1), h(2))],
+        )
+        .unwrap()
+        .with_unpublished(&published)
+        .unwrap();
+    n.commit_member(&owner).unwrap();
+    n.write_member_intent(&member_intent("c1", 2)).unwrap();
+    let fake = Fake::owned();
+    *fake.dnat.borrow_mut() = Ok(both);
+    let report = run(&n, &fake).unwrap();
+    assert!(report.removed_intents.is_empty());
+    assert_eq!(
+        report.kept_intents,
+        vec![(mid("c1"), IntentKeep::DnatUnaccounted)]
+    );
+}
+
+/// NET-1・SEC-1・#3346: `realized` の無い意図記録は、別の namespace から開いたストアでは不在を信用せず据え置く
+/// （bridge・テーブルが両方不在に見えても、意図記録と同じトークンの請求書を消さない）。
+#[test]
+fn net1_3346_create_intent_without_realized_checks_generation() {
+    let t = Tmp::new("create-gen");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    crashed_create(&n);
+    n.save_reclaim_create(&FailedCreateClaim::for_reconcile(name(), TOKEN, true, true).unwrap())
+        .unwrap();
+    let fake = Fake::absent();
+    let report = reconcile_recorded_with(&other_host(), &n, &fake).unwrap();
+    assert_eq!(
+        report.realized,
+        RealizedReconcile::Unresolved(Unresolved::GenerationMismatch)
+    );
+    assert!(n.realized_intent().unwrap().is_some());
+    assert!(n.reclaim_records().unwrap().create.is_some());
+    assert_eq!(fake.rollback_count(), 0);
+    // 同じ世代なら従来どおり扱う。
+    let report = run(&n, &fake).unwrap();
+    assert_eq!(report.realized, RealizedReconcile::Discarded);
+    assert!(n.reclaim_records().unwrap().create.is_none());
 }

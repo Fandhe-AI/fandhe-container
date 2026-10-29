@@ -68,8 +68,8 @@ fn main() {
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::ErrorCode;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     /// Linux の `EACCES` / `EPERM`（x86_64・aarch64 共通）。
     const EACCES: i32 = 13;
@@ -360,17 +360,27 @@ fn main() {
 
     /// 子（テストバイナリ自身の再実行）を `mode` で起動し、タイムアウト付きで待って標準出力を返す。
     fn spawn_and_wait(exe: &Path, mode: &str, dir: &Path) -> String {
-        let mut cmd = Command::new(exe);
-        cmd.arg(mode).arg("--probe-dir").arg(dir);
-        // spawn・期限・出力回収を一括で期限つきにする（REPAIR-5・#3409）。
-        let out = match crate::reap::output_within(&mut cmd, Duration::from_secs(30)) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(dir);
-                panic!("exec_restrictions_reapply child ({mode}): {e}");
+        let mut child = Command::new(exe)
+            .arg(mode)
+            .arg("--probe-dir")
+            .arg(dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
             }
+            if Instant::now() >= deadline {
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                let _ = std::fs::remove_dir_all(dir);
+                panic!("exec_restrictions_reapply child ({mode}) timed out");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         };
-        let status = out.status;
+        let out = child.wait_with_output().expect("wait_with_output");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !status.success() {
             let _ = std::fs::remove_dir_all(dir);

@@ -21,6 +21,7 @@ use fandhe_container_net::network::{EndpointId, NetworkName};
 #[cfg(target_os = "linux")]
 #[path = "dns_helper_process/detached.rs"]
 mod detached;
+// #3467 の試験（`launcher_killed_after_spawn_line`）が期限つき回収を使うため、取り込みを残す（REPAIR-5）。
 #[cfg(target_os = "linux")]
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;

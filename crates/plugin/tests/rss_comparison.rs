@@ -340,7 +340,7 @@ mod supported {
             if Instant::now() >= deadline {
                 kill_process_group(&child);
                 let _ = child.kill();
-                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("subject ({condition}) did not finish before its deadline");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -360,17 +360,15 @@ mod supported {
         let arg_forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
         for bin in ["/bin/kill", "/usr/bin/kill"] {
             for args in arg_forms {
-                let mut cmd = Command::new(bin);
-                cmd.args(args)
+                let status = Command::new(bin)
+                    .args(args)
                     .env_clear()
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                // 期限なしの `status()` を避ける（REPAIR-5・#3409）。期限切れ・spawn 失敗は次の形式へ進む。
-                match crate::reap::run_within(&mut cmd, crate::reap::reap_within()) {
-                    Ok(s) if s.success() => return,
-                    Ok(_) => {}
-                    Err(e) => eprintln!("kill_process_group: {e}"),
+                    .stderr(Stdio::null())
+                    .status();
+                if status.is_ok_and(|s| s.success()) {
+                    return;
                 }
             }
         }

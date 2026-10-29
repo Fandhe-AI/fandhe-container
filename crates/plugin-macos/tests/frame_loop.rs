@@ -93,7 +93,7 @@ impl Harness {
             }
             if start.elapsed() > WAIT {
                 let _ = self.child.kill();
-                crate::reap::reap_or_report(&mut self.child, crate::reap::reap_within());
+                crate::reap::reap_or_report(&mut self.child, crate::reap::REAP_WITHIN);
                 panic!("plugin binary did not exit within deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -381,10 +381,10 @@ fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
 }
 /// 子へ SIGTERM を送る（テスト側に FFI・依存を足さないため `kill` コマンドを使う）。
 fn sigterm(h: &Harness) {
-    let mut cmd = Command::new("kill");
-    cmd.args(["-TERM", &h.child.id().to_string()]);
-    let st = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
-        .unwrap_or_else(|e| panic!("sigterm to plugin child: {e}"));
+    let st = Command::new("kill")
+        .args(["-TERM", &h.child.id().to_string()])
+        .status()
+        .expect("kill");
     assert!(st.success());
 }
 

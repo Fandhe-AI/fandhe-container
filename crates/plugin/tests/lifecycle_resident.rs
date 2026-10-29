@@ -12,9 +12,6 @@
 mod exclusive_dir;
 
 #[cfg(unix)]
-#[path = "../../core/tests/support/reap.rs"]
-mod reap;
-#[cfg(unix)]
 #[path = "support/swap.rs"]
 mod swap;
 
@@ -267,16 +264,15 @@ mod unix {
 
     /// 子プロセスと同じ UID の別プロセス（このテストバイナリの `decoy_entry`）を起動し、終了まで待つ。
     fn spawn_decoy_and_wait(sock: &std::path::Path) {
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", "unix::decoy_entry", "--test-threads=1"])
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix::decoy_entry", "--test-threads=1"])
             .env("FCOS_DECOY_SOCK", sock)
             .env_remove(PLUGIN_SOCKET_ENV)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // 期限なしの `status()` を避け、止まったら kill して回収し場所つきで失敗させる（REPAIR-5・#3409）。
-        let status = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
-            .unwrap_or_else(|e| panic!("decoy process: {e}"));
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
         assert!(status.success());
     }
 

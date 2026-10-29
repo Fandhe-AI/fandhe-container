@@ -48,8 +48,8 @@ fn main() {
 ))]
 fn main() {
     use std::os::unix::process::ExitStatusExt as _;
-    use std::process::Command;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     /// Linux の `EPERM`（x86_64・aarch64 共通で 1）。
     const EPERM: i32 = 1;
@@ -218,22 +218,26 @@ fn main() {
 
     let exe = std::env::current_exe().expect("current_exe");
     let run = |extra: &[&str]| {
-        let mut cmd = Command::new(&exe);
-        cmd.args(extra);
-        // 出力は一時ファイルへ向ける（孫が pipe を持っても戻る。REPAIR-5・#3409）。期限切れでは子の状態を診断に残す。
-        let (mut child, captured) = crate::reap::spawn_captured(&mut cmd).expect("spawn child");
-        // 待ちは出力サイズも監視する `Captured::wait_within_diag`（上限超過・期限切れは kill して `Err`）。期限切れでは
-        // kill の前に子の状態を診断へ残す。
-        let status = match captured.wait_within_diag(&mut child, Duration::from_secs(30), &|pid| {
-            crate::proc_status::excerpt(pid)
-        }) {
-            Ok(st) => st,
-            Err(e) => {
-                let discarded = captured.discard();
-                panic!("seccomp_enforcement child failed: {e}; discard: {discarded:?}");
+        let mut child = Command::new(&exe)
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let child_pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
             }
+            if Instant::now() >= deadline {
+                let diag = crate::proc_status::excerpt(child_pid);
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                panic!("seccomp_enforcement child timed out ({diag})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         };
-        let out = captured.finish(status).expect("collect child output");
+        let out = child.wait_with_output().expect("wait_with_output");
         (status, out)
     };
 

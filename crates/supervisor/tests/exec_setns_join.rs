@@ -503,7 +503,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut joiner, crate::reap::reap_within());
+                crate::reap::reap_or_report(&mut joiner, crate::reap::REAP_WITHIN);
                 panic!("joiner {joiner_flag} did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -861,11 +861,11 @@ mod linux {
             .expect("open the identity file before pivoting");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         // 自分の mount namespace（`establish` が `/` を再帰 private にした後）の中でだけ tmpfs をマウントする。
-        // PID 1 の単一スレッド前提を保つため、スレッドを立てない `run_within` を使う（REPAIR-5・#3409）。
-        let mut mount = Command::new("mount");
-        mount.args(["-n", "-t", "tmpfs", "tmpfs"]).arg(rootfs);
-        let mounted = crate::reap::run_within(&mut mount, crate::reap::reap_within())
-            .unwrap_or_else(|e| panic!("run mount: {e}"));
+        let mounted = Command::new("mount")
+            .args(["-n", "-t", "tmpfs", "tmpfs"])
+            .arg(rootfs)
+            .status()
+            .expect("run mount");
         assert!(mounted.success(), "mount tmpfs over the rootfs directory");
         fs::create_dir(rootfs.join("proc")).expect("mkdir proc in the tmpfs rootfs");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");

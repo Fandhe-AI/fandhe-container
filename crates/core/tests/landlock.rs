@@ -62,8 +62,8 @@ fn main() {
     use fandhe_container_core::oci_runtime::{OciConfig, parse_config_bytes};
     use fandhe_container_core::traits::ErrorCode;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     /// Linux の `EACCES`（x86_64・aarch64 共通で 13）。
     const EACCES: i32 = 13;
@@ -293,17 +293,27 @@ fn main() {
                 std::fs::write(dir.join(sub).join(f), b"probe").expect("create fixture");
             }
         }
-        let mut cmd = Command::new(&exe);
-        cmd.arg(mode).arg("--probe-dir").arg(&dir);
-        // spawn・期限・出力回収を一括で期限つきにする（REPAIR-5・#3409）。
-        let out = match crate::reap::output_within(&mut cmd, Duration::from_secs(30)) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                panic!("landlock child {mode}: {e}");
+        let mut child = Command::new(&exe)
+            .arg(mode)
+            .arg("--probe-dir")
+            .arg(&dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
             }
+            if Instant::now() >= deadline {
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("landlock child {mode} timed out");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         };
-        let status = out.status;
+        let out = child.wait_with_output().expect("wait_with_output");
         let _ = std::fs::remove_dir_all(&dir);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(

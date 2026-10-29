@@ -1128,12 +1128,27 @@ exec "$2" "$3" "$1""#;
         for closed in ["0", "0,1", "0,1,2"] {
             let label = closed.replace(',', "");
             let exe = std::env::current_exe().expect("current exe");
-            let mut cmd = Command::new(exe);
-            cmd.arg(CLOSED_STDIO_CHILD).arg(work).arg(closed);
-            // spawn・期限・出力回収を一括で期限つきにする（スレッドを立てない。REPAIR-5・#3409）。
-            let output = crate::reap::output_within(&mut cmd, timeout())
-                .unwrap_or_else(|e| panic!("closed {closed}: {e}"));
-            let status = output.status;
+            let mut child = Command::new(exe)
+                .arg(CLOSED_STDIO_CHILD)
+                .arg(work)
+                .arg(closed)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the closed-stdio child");
+            let deadline = Instant::now() + timeout();
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll the child") {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    panic!("closed {closed}: the child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().expect("collect the child output");
             let result = fs::read_to_string(closed_stdio_result(work, &label)).unwrap_or_default();
             assert!(
                 status.success() && result == "ok\n",

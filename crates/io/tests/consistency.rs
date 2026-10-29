@@ -114,6 +114,14 @@
 //! [`interleave`] のモジュール doc に記す。3 OS で動く。
 //! 合計は Linux 56 件・macOS 55 件・Windows 51 件。
 
+// 残骸・PID 再利用との衝突を避ける一時ディレクトリの補助（REPAIR-12・#3435）。harness は作成前削除（A）、
+// uds_concurrent は排他作成（B。UDS の短いパス）を使う。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 #[path = "consistency/harness.rs"]
 mod harness;
 

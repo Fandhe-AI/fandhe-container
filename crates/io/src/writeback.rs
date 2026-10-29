@@ -2060,23 +2060,15 @@ mod tests {
     }
 
     /// 一時ディレクトリ（テストごとに一意）を作り、drop で消す。
-    struct TempDirGuard(std::path::PathBuf);
+    struct TempDirGuard(
+        std::path::PathBuf,
+        #[allow(dead_code)] crate::test_root::TestRoot,
+    );
     impl TempDirGuard {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "fcio-open-in-{tag}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).expect("temp dir");
-            Self(path)
-        }
-    }
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root("fcio-open-in", tag);
+            Self(root.to_path_buf(), root)
         }
     }
 

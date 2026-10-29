@@ -6,6 +6,10 @@
 //! 作成した sink が `serve_connection` の書き込み経路でそのまま使えることを
 //! 確かめる。応答を待つ処理にはすべて期限を付ける（REPAIR-5）。
 
+// harness の一時ディレクトリが使う残骸に強い補助（REPAIR-12・#3435）。
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 #[allow(dead_code)]
 #[path = "consistency/harness.rs"]
 mod harness;

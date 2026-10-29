@@ -31,7 +31,7 @@
 //! 1. 同じ ID の確定記録があり同一性が一致する: 冗長な意図記録（`commit_member` の後に落ちた窓）。確定記録は残す
 //! 2. `pending-reclaim/attach/<endpoint>` の請求書が無い（quarantine・取り残しの追跡中は残す）
 //! 3. host 側 veth が不在と確かめられる（生きた veth・照会の失敗は残す）
-//! 4. netns の pin が不在と確かめられる（置き場が与えられない呼び出しでは掃除しない）
+//! 4. netns の pin が不在と確かめられる（置き場は意図記録に記録した接続時のもの。無い旧形式は掃除しない）
 //! 5. DNAT の帳尻が合う: 専用テーブルの DNAT の受け口が、全メンバー記録の公開（解除中を含む。1 件 2 ルール）で
 //!    説明できる。説明できない DNAT が残っていれば、`ReclaimUnsaved` の quarantine のようにそのアドレスへ
 //!    転送しうるため、候補をすべて残す
@@ -347,7 +347,6 @@ fn sweep_member_intents<O: ReconcileOps>(
     guard: &NetworkLockGuard<'_>,
     ops: &O,
     realized: &RealizedRecord,
-    netns_dir: Option<&Path>,
     report: &mut ReconcileReport,
 ) -> Result<(), NetError> {
     let intents = guard.member_intents()?;
@@ -395,8 +394,9 @@ fn sweep_member_intents<O: ReconcileOps>(
                 continue;
             }
         }
-        // 4. netns の pin。
-        let Some(dir) = netns_dir else {
+        // 4. netns の pin。置き場は意図記録が持つ（接続ごとに違いうるため、呼び出しごとの単一の置き場では
+        //    確かめない）。記録の無い旧形式は判定不能として残す。
+        let Some(dir) = it.netns_dir() else {
             report
                 .kept_intents
                 .push((it.id().clone(), IntentKeep::PinUnknown));
@@ -441,7 +441,6 @@ fn sweep_member_intents<O: ReconcileOps>(
 pub(crate) fn reconcile_recorded_with<O: ReconcileOps>(
     host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
-    netns_dir: Option<&Path>,
     ops: &O,
 ) -> Result<ReconcileReport, NetError> {
     if !guard.is_exclusive() {
@@ -460,22 +459,20 @@ pub(crate) fn reconcile_recorded_with<O: ReconcileOps>(
         return Ok(report);
     }
     if let Some(realized) = guard.realized()? {
-        sweep_member_intents(guard, ops, &realized, netns_dir, &mut report)?;
+        sweep_member_intents(guard, ops, &realized, &mut report)?;
     }
     Ok(report)
 }
 
-/// ロックの記録から、メンバーの netns の置き場を引く（detach の照合の入力。記録が無ければ `None`）。
-pub(crate) fn member_netns_dir(
+/// 照合が、前回途中で落ちた削除を完了させたか（`realized` が無くなった `Completed`）。
+///
+/// 完了していれば、記録つき削除の呼び出し側は本体（`realized` を要する）に進まず成功として返す。
+/// 確定済みの作成の意図記録だけを消した `Completed` では `realized` が残るため `false`。
+pub(crate) fn delete_completed_by_reconcile(
+    report: &ReconcileReport,
     guard: &NetworkLockGuard<'_>,
-    id: &MemberId,
-) -> Option<std::path::PathBuf> {
-    guard
-        .members()
-        .ok()?
-        .into_iter()
-        .find(|m| m.id() == id)
-        .map(|m| m.netns_dir_record().path().to_path_buf())
+) -> Result<bool, NetError> {
+    Ok(report.realized == RealizedReconcile::Completed && guard.realized()?.is_none())
 }
 
 /// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。
@@ -531,14 +528,12 @@ pub(crate) fn reconcile_with_sockets(
     route: &NetlinkRouteSocket,
     nft: &NetlinkNetfilterSocket,
     guard: &NetworkLockGuard<'_>,
-    netns_dir: Option<&Path>,
     timeout: Duration,
 ) -> Result<ReconcileReport, NetError> {
     let host = nft.host_generation()?;
     reconcile_recorded_with(
         &host,
         guard,
-        netns_dir,
         &LinuxReconcileOps {
             inner: LinuxDeleteOps {
                 route,
@@ -553,18 +548,17 @@ pub(crate) fn reconcile_with_sockets(
 /// 残った `realized.intent` をカーネルと照合して昇格・巻き戻しし、実体の無い `members-intent/*` を掃除する
 /// （NET-1・NET-7・#3346）。判定表と残余はモジュール doc。
 ///
-/// 排他ロックのガードが必要（共有ロックは `FailedPrecondition`）。`netns_dir` は接続時の pin の置き場で、
-/// `None` のときは pin の不存在を確かめられないため `members-intent` を掃除しない。`CAP_NET_ADMIN` は呼び出し側の
+/// 排他ロックのガードが必要（共有ロックは `FailedPrecondition`）。pin の置き場は各 `members-intent` が記録して
+/// おり、置き場の無い旧形式の意図記録は pin の不存在を確かめられないため掃除しない。`CAP_NET_ADMIN` は呼び出し側の
 /// 責務（netns の pin の検査は読み取りのみ）。`timeout` は各カーネル要求の期限（REPAIR-5）。
 pub fn reconcile_network_recorded(
     route: &NetlinkRouteSocket,
     nft: &NetlinkNetfilterSocket,
     guard: &NetworkLockGuard<'_>,
-    netns_dir: Option<&Path>,
     timeout: Duration,
 ) -> Result<ReconcileReport, NetError> {
     guard.require_exclusive()?;
-    reconcile_with_sockets(route, nft, guard, netns_dir, timeout)
+    reconcile_with_sockets(route, nft, guard, timeout)
 }
 
 #[cfg(test)]

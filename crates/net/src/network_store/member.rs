@@ -514,6 +514,8 @@ pub struct MemberIntent {
     endpoint: EndpointId,
     address: IpPrefix,
     token: String,
+    /// 接続時の netns pin の置き場（掃除が pin の不存在を元の場所で確かめるため。無ければ判定不能として残す）。
+    netns_dir: Option<std::path::PathBuf>,
 }
 
 impl MemberIntent {
@@ -531,7 +533,20 @@ impl MemberIntent {
             endpoint,
             address,
             token: token.to_owned(),
+            netns_dir: None,
         })
+    }
+
+    /// pin の置き場を付けた意図記録を返す（絶対パスのみ。NET-1・#3346）。
+    pub fn with_netns_dir(mut self, dir: &Path) -> Result<Self, NetError> {
+        check_netns_dir(dir)?;
+        self.netns_dir = Some(dir.to_path_buf());
+        Ok(self)
+    }
+
+    /// 記録した pin の置き場。旧形式・未記録は `None`。
+    pub fn netns_dir(&self) -> Option<&Path> {
+        self.netns_dir.as_deref()
     }
 
     /// メンバー ID。
@@ -561,6 +576,9 @@ impl MemberIntent {
         push_field(&mut out, "endpoint", self.endpoint.as_str());
         push_field(&mut out, "address", &format_prefix(&self.address));
         push_field(&mut out, "token", &self.token);
+        if let Some(d) = &self.netns_dir {
+            push_field(&mut out, "netns-dir", &d.to_string_lossy());
+        }
         out.into_bytes()
     }
 
@@ -573,8 +591,13 @@ impl MemberIntent {
             EndpointId::new(take_field(&mut rest, "endpoint")?).map_err(invalid_value)?;
         let address = parse_prefix(take_field(&mut rest, "address")?)?;
         let token = take_field(&mut rest, "token")?;
+        let dir = take_optional(&mut rest, "netns-dir")?;
         finish(rest)?;
-        Self::new(id, endpoint, address, token).map_err(invalid_value)
+        let intent = Self::new(id, endpoint, address, token).map_err(invalid_value)?;
+        match dir {
+            Some(d) => intent.with_netns_dir(Path::new(d)).map_err(invalid_value),
+            None => Ok(intent),
+        }
     }
 }
 
@@ -641,6 +664,36 @@ mod tests {
         );
         assert_eq!(i.encode(), expected.as_bytes());
         assert_eq!(MemberIntent::decode(&i.encode()).unwrap(), i);
+    }
+
+    /// NET-1・#3346: pin の置き場つきの意図記録の具体バイト列と往復。旧形式（置き場なし）も復号できる。
+    #[test]
+    fn net1_3346_intent_with_netns_dir_roundtrip_and_legacy() {
+        let base = MemberIntent::new(
+            MemberId::new("c1").unwrap(),
+            EndpointId::new("c1").unwrap(),
+            pfx([10, 0, 0, 4], 24),
+            TOKEN,
+        )
+        .unwrap();
+        assert_eq!(base.netns_dir(), None);
+        let i = base.clone().with_netns_dir(Path::new("/run/ns")).unwrap();
+        let expected = format!(
+            "FCMIN1\nid 2\nc1\nendpoint 2\nc1\naddress 11\n10.0.0.4/24\ntoken {}\n{TOKEN}\nnetns-dir 7\n/run/ns\n",
+            TOKEN.len()
+        );
+        assert_eq!(i.encode(), expected.as_bytes());
+        assert_eq!(MemberIntent::decode(&i.encode()).unwrap(), i);
+        assert_eq!(MemberIntent::decode(&base.encode()).unwrap(), base);
+        assert_eq!(
+            code(base.with_netns_dir(Path::new("run/ns"))),
+            NetErrorCode::InvalidArgument
+        );
+        let bad = expected.replace("netns-dir 7\n/run/ns", "netns-dir 6\nrun/ns");
+        assert_eq!(
+            code(MemberIntent::decode(bad.as_bytes())),
+            NetErrorCode::DataLoss
+        );
     }
 
     #[test]

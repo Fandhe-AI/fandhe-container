@@ -256,6 +256,7 @@ where
         address,
         &host_token,
     )
+    .and_then(|i| i.with_netns_dir(spec.netns_dir()))
     .map_err(RecordedError::Store)?;
     guard
         .write_member_intent(&intent)
@@ -746,7 +747,7 @@ mod linux {
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
-    use crate::network::reconcile::{member_netns_dir, reconcile_with_sockets};
+    use crate::network::reconcile::{delete_completed_by_reconcile, reconcile_with_sockets};
     use crate::network::unpublish::{linux_delete_rule, linux_delete_rules, linux_table_info};
     use crate::network::{
         LinuxAttachOps, LinuxNetworkOps, NetworkCreateSpec, PortRegistry, PublishedPort,
@@ -754,7 +755,6 @@ mod linux {
         detach_container,
     };
     use crate::nftables_batch::NetlinkNetfilterSocket;
-    use std::path::Path;
 
     /// ネットワークを作って `realized` に記録する（`create_network` の記録つき版）。
     ///
@@ -776,7 +776,7 @@ mod linux {
         }
         let host = nft.host_generation().map_err(RecordedError::Store)?;
         // realized が無いので掃除の対象（members-intent）も無い。pin の置き場は要らない。
-        reconcile_with_sockets(route, nft, guard, None, timeout).map_err(RecordedError::Store)?;
+        reconcile_with_sockets(route, nft, guard, timeout).map_err(RecordedError::Store)?;
         create_recorded_with(
             &host,
             guard,
@@ -855,8 +855,7 @@ mod linux {
         RecordedError<Box<ContainerAttachError>, AttachedContainer<ContainerNetns>>,
     > {
         let host = nft.host_generation().map_err(RecordedError::Store)?;
-        reconcile_with_sockets(route, nft, guard, Some(spec.netns_dir()), timeout)
-            .map_err(RecordedError::Store)?;
+        reconcile_with_sockets(route, nft, guard, timeout).map_err(RecordedError::Store)?;
         attach_recorded_with(
             &host,
             guard,
@@ -906,9 +905,7 @@ mod linux {
             host_token: &host_token,
         };
         let host = nft.host_generation().map_err(RecordedError::Store)?;
-        let netns_dir = member_netns_dir(guard, member_id);
-        reconcile_with_sockets(route, nft, guard, netns_dir.as_deref(), timeout)
-            .map_err(RecordedError::Store)?;
+        reconcile_with_sockets(route, nft, guard, timeout).map_err(RecordedError::Store)?;
         detach_recorded_with(&host, guard, member_id, identity, |created, ipam| {
             detach_container(
                 route,
@@ -925,21 +922,24 @@ mod linux {
 
     /// メンバーのいないネットワークを削除して `realized` を消す（`delete_network` の記録つき版）。
     ///
-    /// `netns_dir` は接続時の pin の置き場（固定設定）。先頭の照合が、実体の無い `members-intent` を掃除して
-    /// 「`network still has members`」で止まらないようにするために使う（#3346）。
+    /// 先頭の照合が、実体の無い `members-intent` を掃除して「`network still has members`」で止まらないようにする
+    /// （pin の置き場は各意図記録に記録済み。#3346）。照合が前回途中で落ちた削除を完了させたときは、
+    /// それを成功として返す（`realized` が無く再実行できないため。再試行を失敗にしない）。
     pub fn delete_network_recorded(
         route: &NetlinkRouteSocket,
         nft: &NetlinkNetfilterSocket,
         guard: &NetworkLockGuard<'_>,
-        netns_dir: &Path,
         ports: &mut PortRegistry,
         timeout: Duration,
     ) -> Result<
         NetworkDeleteReport,
         RecordedError<Box<NetworkDeleteError<ContainerNetns>>, NetworkDeleteReport>,
     > {
-        reconcile_with_sockets(route, nft, guard, Some(netns_dir), timeout)
-            .map_err(RecordedError::Store)?;
+        let report =
+            reconcile_with_sockets(route, nft, guard, timeout).map_err(RecordedError::Store)?;
+        if delete_completed_by_reconcile(&report, guard).map_err(RecordedError::Store)? {
+            return Ok(NetworkDeleteReport::default());
+        }
         delete_recorded_with(guard, |created, ipam| {
             delete_network(route, nft, created, Vec::new(), ipam, ports, timeout).map_err(Box::new)
         })

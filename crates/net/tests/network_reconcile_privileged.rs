@@ -242,7 +242,7 @@ mod linux {
                 RealizedOp::Create,
             )?)
             .map_err(e)?;
-            let report = reconcile_network_recorded(route, nft, &n, None, t).map_err(e)?;
+            let report = reconcile_network_recorded(route, nft, &n, t).map_err(e)?;
             if report.realized != RealizedReconcile::Promoted {
                 return Err(format!("promote: unexpected {:?}", report.realized));
             }
@@ -268,7 +268,7 @@ mod linux {
             )?)
             .map_err(e)?;
             run("nft", &["delete", "table", "ip", created.table.as_str()])?;
-            let report = reconcile_network_recorded(route, nft, &n, None, t).map_err(e)?;
+            let report = reconcile_network_recorded(route, nft, &n, t).map_err(e)?;
             if report.realized != RealizedReconcile::RolledBack {
                 return Err(format!("rollback: unexpected {:?}", report.realized));
             }
@@ -298,7 +298,7 @@ mod linux {
                 "ip",
                 &["link", "set", "dev", created.bridge.as_str(), "alias", ""],
             )?;
-            let report = reconcile_network_recorded(route, nft, &n, None, t).map_err(e)?;
+            let report = reconcile_network_recorded(route, nft, &n, t).map_err(e)?;
             if report.realized != RealizedReconcile::Unresolved(Unresolved::Unproven) {
                 return Err(format!("unproven: unexpected {:?}", report.realized));
             }
@@ -342,7 +342,7 @@ mod linux {
             .map_err(e)?;
             run("nft", &["delete", "table", "ip", created.table.as_str()])?;
             run("ip", &["link", "del", created.bridge.as_str()])?;
-            let report = reconcile_network_recorded(route, nft, &n, None, t).map_err(e)?;
+            let report = reconcile_network_recorded(route, nft, &n, t).map_err(e)?;
             if report.realized != RealizedReconcile::Completed {
                 return Err(format!("delete: unexpected {:?}", report.realized));
             }
@@ -363,6 +363,7 @@ mod linux {
                 let token = format!("{}/ep/{id}/g/{:032x}", created.bridge_token, 1u8);
                 n.write_member_intent(
                     &MemberIntent::new(MemberId::new(id).map_err(e)?, ep, addr, &token)
+                        .and_then(|i| i.with_netns_dir(&ns_dir))
                         .map_err(e)?,
                 )
                 .map_err(e)?;
@@ -372,7 +373,7 @@ mod linux {
                 "ip",
                 &["link", "add", live.host().as_str(), "type", "dummy"],
             )?;
-            let report = reconcile_network_recorded(route, nft, &n, Some(&ns_dir), t).map_err(e)?;
+            let report = reconcile_network_recorded(route, nft, &n, t).map_err(e)?;
             let c1 = MemberId::new("c1").map_err(e)?;
             let c2 = MemberId::new("c2").map_err(e)?;
             if report.removed_intents != vec![c1] {

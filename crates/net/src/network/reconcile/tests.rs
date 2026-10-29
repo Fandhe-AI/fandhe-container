@@ -92,6 +92,12 @@ fn realized_rec() -> RealizedRecord {
     .unwrap()
 }
 fn member_intent(id: &str, last: u8) -> MemberIntent {
+    member_intent_nodir(id, last)
+        .with_netns_dir(std::path::Path::new(NETNS_DIR))
+        .unwrap()
+}
+/// 置き場を記録しない旧形式の意図記録。
+fn member_intent_nodir(id: &str, last: u8) -> MemberIntent {
     MemberIntent::new(
         mid(id),
         ep(id),
@@ -164,6 +170,10 @@ struct Fake {
     /// 巻き戻しの請求書の (bridge, table) の組。
     rollbacks: RefCell<Vec<(bool, bool)>>,
     dnat_calls: Cell<usize>,
+    /// pin が残っている置き場（この置き場への照会だけ `Ok(false)`）。
+    pin_present_dir: RefCell<Option<PathBuf>>,
+    /// 照会された置き場。
+    pin_dirs: RefCell<Vec<PathBuf>>,
 }
 
 impl Fake {
@@ -178,6 +188,8 @@ impl Fake {
             rollback_ok: Cell::new(true),
             rollbacks: RefCell::new(Vec::new()),
             dnat_calls: Cell::new(0),
+            pin_present_dir: RefCell::new(None),
+            pin_dirs: RefCell::new(Vec::new()),
         }
     }
     fn owned() -> Self {
@@ -246,7 +258,11 @@ impl ReconcileOps for Fake {
         }
         Ok(())
     }
-    fn pin_absent(&self, _dir: &Path, _endpoint: &EndpointId) -> Result<bool, NetError> {
+    fn pin_absent(&self, dir: &Path, _endpoint: &EndpointId) -> Result<bool, NetError> {
+        self.pin_dirs.borrow_mut().push(dir.to_path_buf());
+        if self.pin_present_dir.borrow().as_deref() == Some(dir) {
+            return Ok(false);
+        }
         (*self.pin.borrow()).map_err(err)
     }
     fn dnat_listeners(&self, _table: &NftName) -> Result<Vec<PublishedListener>, NetError> {
@@ -255,12 +271,8 @@ impl ReconcileOps for Fake {
     }
 }
 
-fn run(
-    guard: &NetworkLockGuard<'_>,
-    fake: &Fake,
-    dir: Option<&Path>,
-) -> Result<ReconcileReport, NetError> {
-    reconcile_recorded_with(&host(), guard, dir, fake)
+fn run(guard: &NetworkLockGuard<'_>, fake: &Fake) -> Result<ReconcileReport, NetError> {
+    reconcile_recorded_with(&host(), guard, fake)
 }
 
 fn code<T: std::fmt::Debug>(r: Result<T, NetError>) -> NetErrorCode {
@@ -282,7 +294,7 @@ fn net1_3346_create_intent_absent_kernel_discards_intent() {
     let n = g.lock_network(&name()).unwrap();
     crashed_create(&n);
     let fake = Fake::absent();
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::Discarded);
     assert_eq!(n.realized_intent().unwrap(), None);
     assert_eq!(n.realized().unwrap(), None);
@@ -298,7 +310,7 @@ fn net1_3346_create_intent_complete_promotes() {
     let n = g.lock_network(&name()).unwrap();
     crashed_create(&n);
     let fake = Fake::owned();
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::Promoted);
     assert_eq!(n.realized_intent().unwrap(), None);
     assert_eq!(n.realized().unwrap(), Some(realized_rec()));
@@ -314,7 +326,7 @@ fn net1_3346_create_intent_partial_rolls_back_owned_only() {
     let n = g.lock_network(&name()).unwrap();
     crashed_create(&n);
     let fake = Fake::new(Br::Alias(Some(TOKEN.to_owned())), Tb::Absent);
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::RolledBack);
     assert_eq!(*fake.rollbacks.borrow(), vec![(true, false)]);
     assert_eq!(n.realized_intent().unwrap(), None);
@@ -359,7 +371,7 @@ fn net1_3346_create_intent_unproven_is_fail_closed() {
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
         crashed_create(&n);
-        let report = run(&n, &fake, None).unwrap();
+        let report = run(&n, &fake).unwrap();
         assert_eq!(
             report.realized,
             RealizedReconcile::Unresolved(Unresolved::Unproven),
@@ -405,14 +417,14 @@ fn net1_3346_rollback_failure_keeps_intent() {
     crashed_create(&n);
     let fake = Fake::new(Br::Alias(Some(TOKEN.into())), Tb::Absent);
     fake.rollback_ok.set(false);
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(
         report.realized,
         RealizedReconcile::Unresolved(Unresolved::RollbackIncomplete)
     );
     assert!(n.realized_intent().unwrap().is_some());
     fake.rollback_ok.set(true);
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::RolledBack);
     assert_eq!(fake.rollback_count(), 2);
     assert_eq!(n.realized_intent().unwrap(), None);
@@ -429,14 +441,14 @@ fn net1_3346_create_intent_with_realized_removes_intent() {
     n.write_realized_intent(&intent(RealizedOp::Create, TOKEN))
         .unwrap();
     let fake = Fake::owned();
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::Completed);
     assert_eq!(n.realized_intent().unwrap(), None);
     assert_eq!(n.realized().unwrap(), Some(realized_rec()));
     // 不一致。
     n.write_realized_intent(&intent(RealizedOp::Create, OTHER_TOKEN))
         .unwrap();
-    assert_eq!(code(run(&n, &fake, None)), NetErrorCode::DataLoss);
+    assert_eq!(code(run(&n, &fake)), NetErrorCode::DataLoss);
     assert!(n.realized_intent().unwrap().is_some());
 }
 
@@ -455,7 +467,7 @@ fn net1_3346_delete_intent_completes_delete() {
         n.commit_realized(&realized_rec()).unwrap();
         n.write_realized_intent(&intent(RealizedOp::Delete, TOKEN))
             .unwrap();
-        let report = run(&n, &fake, None).unwrap();
+        let report = run(&n, &fake).unwrap();
         assert_eq!(report.realized, RealizedReconcile::Completed, "{tag}");
         assert_eq!(n.realized().unwrap(), None, "{tag}");
         assert_eq!(n.realized_intent().unwrap(), None, "{tag}");
@@ -478,7 +490,7 @@ fn net1_3346_delete_intent_completes_delete() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(code(run(&n, &Fake::absent(), None)), NetErrorCode::DataLoss);
+    assert_eq!(code(run(&n, &Fake::absent())), NetErrorCode::DataLoss);
 }
 
 /// #3346: `realized` を消した後に落ちた delete（意図記録のみ）は意図記録を消す。
@@ -490,7 +502,7 @@ fn net1_3346_delete_intent_without_realized_removes_intent() {
     let n = g.lock_network(&name()).unwrap();
     n.write_realized_intent(&intent(RealizedOp::Delete, TOKEN))
         .unwrap();
-    let report = run(&n, &Fake::absent(), None).unwrap();
+    let report = run(&n, &Fake::absent()).unwrap();
     assert_eq!(report.realized, RealizedReconcile::Completed);
     assert_eq!(n.realized_intent().unwrap(), None);
 }
@@ -509,7 +521,7 @@ fn net1_3346_pending_create_claim_removed_after_rollback() {
         )
         .unwrap();
         let fake = Fake::new(Br::Alias(Some(TOKEN.into())), Tb::Absent);
-        let report = run(&n, &fake, None).unwrap();
+        let report = run(&n, &fake).unwrap();
         assert_eq!(report.realized, RealizedReconcile::RolledBack, "{tag}");
         assert_eq!(
             n.reclaim_records().unwrap().create.is_some(),
@@ -539,7 +551,7 @@ fn net7_3346_sweep_removes_orphan_intent_and_frees_address() {
         "意図記録のアドレスは使用中"
     );
     let fake = Fake::owned();
-    let report = run(&n, &fake, Some(Path::new(NETNS_DIR))).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::None);
     assert_eq!(report.removed_intents, vec![mid("c1")]);
     assert!(report.kept_intents.is_empty());
@@ -608,11 +620,15 @@ fn net7_3346_sweep_keeps_intents_with_substance() {
         let g = store.lock_global_exclusive().unwrap();
         let n = g.lock_network(&name()).unwrap();
         ready(&n);
-        n.write_member_intent(&member_intent("c1", 2)).unwrap();
+        let intent = if with_dir {
+            member_intent("c1", 2)
+        } else {
+            member_intent_nodir("c1", 2)
+        };
+        n.write_member_intent(&intent).unwrap();
         let fake = Fake::owned();
         setup_fake(&fake);
-        let dir = with_dir.then(|| Path::new(NETNS_DIR));
-        let report = run(&n, &fake, dir).unwrap();
+        let report = run(&n, &fake).unwrap();
         assert!(report.removed_intents.is_empty(), "{tag}");
         assert_eq!(report.kept_intents, vec![(mid("c1"), keep)], "{tag}");
         assert_eq!(n.member_intents().unwrap().len(), 1, "{tag}");
@@ -629,7 +645,7 @@ fn net7_3346_sweep_keeps_intents_with_substance() {
     ))
     .unwrap();
     n.save_reclaim_attach(&claim).unwrap();
-    let report = run(&n, &Fake::owned(), Some(Path::new(NETNS_DIR))).unwrap();
+    let report = run(&n, &Fake::owned()).unwrap();
     assert_eq!(
         report.kept_intents,
         vec![(mid("c1"), IntentKeep::AttachClaim)]
@@ -663,7 +679,7 @@ fn net7_3346_sweep_dnat_accounting_uses_published_records() {
         n.write_member_intent(&member_intent("c1", 2)).unwrap();
         let fake = Fake::owned();
         *fake.dnat.borrow_mut() = Ok(observed);
-        let report = run(&n, &fake, Some(Path::new(NETNS_DIR))).unwrap();
+        let report = run(&n, &fake).unwrap();
         assert_eq!(report.removed_intents.len(), usize::from(removed), "{tag}");
         assert_eq!(fake.dnat_calls.get(), 1, "{tag}");
         assert_eq!(n.members().unwrap().len(), 1, "確定記録は残る");
@@ -683,7 +699,7 @@ fn net7_3346_sweep_removes_redundant_intent_with_member() {
     // commit_member が意図記録を消す実装でも、残った場合の窓を模擬するため再度書く。
     let _ = n.write_member_intent(&member_intent("c1", 2));
     let fake = Fake::owned();
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(n.member_intents().unwrap().len(), 0);
     assert_eq!(n.members().unwrap().len(), 1);
     assert!(report.kept_intents.is_empty());
@@ -707,7 +723,7 @@ fn net1_3346_shared_guard_reconcile_is_noop() {
     let g = store.lock_global_shared().unwrap();
     let n = g.lock_network_shared(&name()).unwrap();
     let fake = Fake::owned();
-    let report = run(&n, &fake, None).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(report.realized, RealizedReconcile::None);
     assert_eq!(fake.rollback_count(), 0);
     assert!(n.realized_intent().unwrap().is_some());
@@ -725,11 +741,70 @@ fn net1_3346_unresolved_realized_skips_sweep() {
         .unwrap();
     n.write_member_intent(&member_intent("c1", 2)).unwrap();
     let fake = Fake::new(Br::Alias(None), Tb::Userdata(Some(TOKEN.into())));
-    let report = run(&n, &fake, Some(Path::new(NETNS_DIR))).unwrap();
+    let report = run(&n, &fake).unwrap();
     assert_eq!(
         report.realized,
         RealizedReconcile::Unresolved(Unresolved::Unproven)
     );
     assert_eq!(n.member_intents().unwrap().len(), 1);
     assert_eq!(fake.dnat_calls.get(), 0);
+}
+
+/// NET-7・#3346: pin の置き場は意図記録ごとに確かめる。置き場 A に pin が残る意図記録は、
+/// 別の置き場 B の attach があっても消さない（単一の置き場で全件を判定しない）。
+#[test]
+fn net7_3346_sweep_checks_pin_in_each_intents_own_dir() {
+    let t = Tmp::new("perdir");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    ready(&n);
+    let dir_a = std::path::Path::new("/run/fc-ns-a");
+    let dir_b = std::path::Path::new("/run/fc-ns-b");
+    n.write_member_intent(&member_intent("c1", 2).with_netns_dir(dir_a).unwrap())
+        .unwrap();
+    n.write_member_intent(&member_intent("c2", 3).with_netns_dir(dir_b).unwrap())
+        .unwrap();
+    let fake = Fake::owned();
+    *fake.pin_present_dir.borrow_mut() = Some(dir_a.to_path_buf());
+    let report = run(&n, &fake).unwrap();
+    assert_eq!(report.removed_intents, vec![mid("c2")]);
+    assert_eq!(
+        report.kept_intents,
+        vec![(mid("c1"), IntentKeep::PinPresent)]
+    );
+    let mut dirs = fake.pin_dirs.borrow().clone();
+    dirs.sort();
+    assert_eq!(dirs, vec![dir_a.to_path_buf(), dir_b.to_path_buf()]);
+    assert_eq!(n.member_intents().unwrap().len(), 1);
+}
+
+/// NET-1・#3346: 前回途中で落ちた削除を照合が完了させたときだけ、記録つき削除は成功として返せる。
+/// 再試行しても `realized` が無く再実行できないため、呼び出し側はこの判定で本体へ進まない。
+#[test]
+fn net1_3346_delete_completed_by_reconcile_only_when_realized_gone() {
+    let t = Tmp::new("delcomplete");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    ready(&n);
+    n.write_realized_intent(&intent(RealizedOp::Delete, TOKEN))
+        .unwrap();
+    let report = run(&n, &Fake::absent()).unwrap();
+    assert_eq!(report.realized, RealizedReconcile::Completed);
+    assert!(delete_completed_by_reconcile(&report, &n).unwrap());
+    assert_eq!(n.realized().unwrap(), None);
+
+    // 確定済みの作成の意図記録だけを消した Completed では realized が残るので、削除は完了していない。
+    let t2 = Tmp::new("delcomplete2");
+    let store2 = setup(&t2);
+    let g2 = store2.lock_global_exclusive().unwrap();
+    let n2 = g2.lock_network(&name()).unwrap();
+    ready(&n2);
+    n2.write_realized_intent(&intent(RealizedOp::Create, TOKEN))
+        .unwrap();
+    let report2 = run(&n2, &Fake::owned()).unwrap();
+    assert_eq!(report2.realized, RealizedReconcile::Completed);
+    assert!(!delete_completed_by_reconcile(&report2, &n2).unwrap());
+    assert!(n2.realized().unwrap().is_some());
 }

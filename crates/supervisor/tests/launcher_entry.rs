@@ -68,7 +68,7 @@ fn run_with(args: &[&str], envs: &[(&str, &str)], new_process_group: bool) -> Ou
             break s;
         }
         if Instant::now() >= deadline {
-            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
             panic!("launcher did not exit within {CHILD_TIMEOUT:?}");
         }
         std::thread::sleep(Duration::from_millis(10));

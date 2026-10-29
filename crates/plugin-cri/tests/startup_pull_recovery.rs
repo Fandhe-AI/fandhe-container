@@ -141,7 +141,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
         .spawn()
         .expect("spawn child");
     if !wait_for(&ready) {
-        reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+        reap::reap_or_report(&mut child, reap::reap_within());
         panic!("child did not become ready in time");
     }
 
@@ -185,7 +185,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
     let status = match reap::wait_within(&mut child, WAIT) {
         Ok(st) => st,
         Err(e) => {
-            reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+            reap::reap_or_report(&mut child, reap::reap_within());
             panic!("child did not finish after done: {e}");
         }
     };

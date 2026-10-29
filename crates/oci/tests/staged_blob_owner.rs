@@ -152,7 +152,7 @@ mod linux {
                 Some(st) if st.success() => return Ok(()),
                 Some(st) => return Err(format!("chown child failed: {st}")),
                 None if start.elapsed() > CASE_TIMEOUT => {
-                    crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut c, crate::reap::reap_within());
                     return Err("chown child timed out".into());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

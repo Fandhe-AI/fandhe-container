@@ -244,7 +244,7 @@ mod linux {
             match child.try_wait().map_err(|e| format!("wait: {e}"))? {
                 Some(_) => break,
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err("child timed out".into());
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),

@@ -67,6 +67,6 @@ mod linux {
         );
 
         delegated.remove_child(&child).expect("remove child");
-        crate::reap::reap(&mut helper, crate::reap::REAP_WITHIN).expect("reap helper");
+        crate::reap::reap(&mut helper, crate::reap::reap_within()).expect("reap helper");
     }
 }

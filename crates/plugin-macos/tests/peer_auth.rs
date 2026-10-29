@@ -75,7 +75,7 @@ fn wait_exit(mut child: Child) -> (i32, String) {
         }
         if start.elapsed() > WAIT {
             let _ = child.kill();
-            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
             panic!("plugin binary did not exit within deadline");
         }
         std::thread::sleep(Duration::from_millis(10));

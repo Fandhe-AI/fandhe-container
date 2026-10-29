@@ -350,7 +350,7 @@ mod linux {
                 Some(st) if st.success() => return Ok(()),
                 Some(st) => return Err(format!("case {case} failed: {st}")),
                 None if start.elapsed() > CASE_TIMEOUT => {
-                    crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut c, crate::reap::reap_within());
                     return Err(format!("case {case} timed out"));
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

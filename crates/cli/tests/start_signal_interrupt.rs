@@ -67,7 +67,7 @@ struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         // 回収の失敗でスタブの KILL が抜けないよう、先にスタブを片付けてから失敗を表に出す。
-        let reaped = reap::reap(&mut self.cli, reap::REAP_WITHIN);
+        let reaped = reap::reap(&mut self.cli, reap::reap_within());
         if let Some(pid) = self.stub_pid {
             send("KILL", pid, false);
         }
@@ -110,7 +110,7 @@ fn send(sig: &str, pid: u32, group: bool) {
         }
         thread::sleep(POLL);
     }
-    reap::reap_or_report(&mut c, reap::REAP_WITHIN);
+    reap::reap_or_report(&mut c, reap::reap_within());
     panic!("kill command did not finish (REPAIR-5)");
 }
 
@@ -133,7 +133,7 @@ fn wait_ok(mut c: Child, what: &str) {
             return;
         }
         if Instant::now() >= deadline {
-            reap::reap_or_report(&mut c, reap::REAP_WITHIN);
+            reap::reap_or_report(&mut c, reap::reap_within());
             panic!("{what} timed out (REPAIR-5)");
         }
         thread::sleep(POLL);

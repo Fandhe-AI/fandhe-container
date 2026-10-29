@@ -818,7 +818,7 @@ mod linux {
             match child.try_wait().expect("try_wait") {
                 Some(status) => return Some(status),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(child, crate::reap::reap_within());
                     return None;
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

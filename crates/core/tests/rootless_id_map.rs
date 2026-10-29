@@ -142,13 +142,13 @@ mod linux {
         let result = drive(&mut child, uid, gid, writer, euid);
         match result {
             Ok(_) => {
-                if let Err(e) = crate::reap::wait_within(&mut child, crate::reap::REAP_WITHIN) {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                if let Err(e) = crate::reap::wait_within(&mut child, crate::reap::reap_within()) {
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     panic!("case child did not exit after the case: {e}");
                 }
             }
             Err(msg) => {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("{msg}");
             }
         }

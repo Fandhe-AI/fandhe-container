@@ -141,7 +141,7 @@ mod linux {
             match child.try_wait().expect("try_wait") {
                 Some(status) => return status.code(),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     panic!("child did not exit within the timeout");
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

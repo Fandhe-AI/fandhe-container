@@ -272,7 +272,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut script, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut script, crate::reap::reap_within());
                 panic!("`script` did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -661,7 +661,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the fsize child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -802,7 +802,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the noexec mount child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1030,7 +1030,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the groups child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));

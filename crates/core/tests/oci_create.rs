@@ -389,7 +389,7 @@ fn sec1_create_rejects_junction_rootfs() {
         .arg(b.dir.join("link"))
         .arg(&outside.dir);
     // 期限なしの `output()` を避ける（REPAIR-5・#3409）。
-    let status = reap::output_within(&mut mklink, reap::REAP_WITHIN)
+    let status = reap::output_within(&mut mklink, reap::reap_within())
         .unwrap_or_else(|e| panic!("mklink /J: {e}"))
         .status;
     assert!(status.success(), "mklink /J failed");

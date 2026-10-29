@@ -109,7 +109,7 @@ fn main() {
             .env("LANG", "C")
             .stdout(Stdio::null())
             .stderr(Stdio::from(sh_stderr));
-        let status = crate::reap::run_within(&mut sh, crate::reap::REAP_WITHIN)
+        let status = crate::reap::run_within(&mut sh, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("exec'd sh: {e}"));
         let mut stderr = String::new();
         err_file

@@ -477,7 +477,7 @@ fn sec1_err2_kill_without_supervisor_is_unavailable_and_does_not_kill() {
     let env = running_container("killnosup", child.id());
     let (code, _out, err) = kill_cmd(&env, &[]);
     let alive = child.try_wait().unwrap().is_none();
-    if let Err(e) = reap::reap(&mut child, reap::REAP_WITHIN) {
+    if let Err(e) = reap::reap(&mut child, reap::reap_within()) {
         panic!("{e}");
     }
     assert_eq!(code, 9);
@@ -523,7 +523,7 @@ fn sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill() {
     let env = running_container("stopnosup", child.id());
     let (code, _out, err) = stop(&env);
     let alive = child.try_wait().unwrap().is_none();
-    if let Err(e) = reap::reap(&mut child, reap::REAP_WITHIN) {
+    if let Err(e) = reap::reap(&mut child, reap::reap_within()) {
         panic!("{e}");
     }
     assert_eq!(code, 9);

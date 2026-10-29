@@ -39,9 +39,11 @@ use fandhe_container_platform_macos::virtiofs::{
 
 #[path = "support/common.rs"]
 mod common;
-use common::{COUNTER, Scratch, env_path, tail_lossy};
+use common::{COUNTER, Scratch, tail_lossy};
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
+#[path = "support/vm_guest.rs"]
+mod vm_guest;
 use harness::{launch_until_done, resolve_probe_timeout};
 
 const MAX_OUT_ENTRIES: usize = 16;
@@ -168,19 +170,14 @@ struct ProbeOutcome {
     write_check: Result<(), String>,
 }
 
+/// kernel 未設定時の panic 文言（必須・任意の環境変数の一覧）。
+const KERNEL_HELP: &str = "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
+             FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
+             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md.";
+
 /// 実機で VM を起動してプローブを走らせ、停止後に結果を集める。
 fn boot_and_probe(tag: &str) -> ProbeOutcome {
-    let kernel = env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
-        panic!(
-            "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
-             FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
-             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
-        )
-    });
-    let initrd = env_path("FANDHE_CONTAINER_MACOS_VM_INITRD");
-    let disk = env_path("FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE");
-    let cmdline = std::env::var("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
-        .unwrap_or_else(|_| "console=hvc0".to_string());
+    let assets = vm_guest::GuestAssets::from_env(KERNEL_HELP);
     let timeout =
         resolve_probe_timeout(std::env::var("FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS").ok())
             .unwrap_or_else(|e| panic!("{e}"));
@@ -190,10 +187,10 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     let spec = probe_spec(
         &s,
         &fixture,
-        &kernel,
-        initrd.as_deref(),
-        disk.as_deref(),
-        &cmdline,
+        &assets.kernel,
+        assets.initrd.as_deref(),
+        assets.disk.as_deref(),
+        &assets.cmdline,
     );
     let log_path = s.dir.join("console.log");
     eprintln!("virtiofs_io: console log at {}", log_path.display());

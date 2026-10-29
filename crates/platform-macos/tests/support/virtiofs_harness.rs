@@ -19,8 +19,9 @@
 //! 関数単位で `cfg(target_os = "macos")` を付ける（`Vm` は macOS 限定で、本ファイルは Linux の単体試験
 //! target からも取り込まれるため）。期限・ポーリング間隔・失敗 message の文言は寄せる前から変えていない。
 //!
-//! 各試験に残すもの: 環境変数の読み取りと help 文（`virtiofs_link` は disk を使わず help 文も異なり、
-//! `vm_guest.rs` の `GuestAssets` へ寄せると挙動差になる）、fixture・spec の組み立て、ログの復号
+//! ゲスト資産（kernel・initrd・disk・cmdline）の環境変数の読み取りは `vm_guest.rs` の `GuestAssets` に
+//! 寄せた（#3456。help 文は引数で渡せ、`virtiofs_link` が disk を読んで使わないだけで挙動差は無い）。
+//! 各試験に残すもの: help 文の文言と probe timeout の読み取り、fixture・spec の組み立て、ログの復号
 //! （`parse_probe_log` / `parse_link_log`）、停止後の共有の検証・観測。ゲスト出力は untrusted で、
 //! 検証責務は試験固有のため。`vm_boot` の 100 ms ポーリングと `vm_cold_start` の 1 ms watcher は
 //! 計測の意味が違うため統合しない（#3400）。

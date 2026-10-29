@@ -133,7 +133,7 @@ fn make_fifo(path: &Path) {
                 return;
             }
             None if start.elapsed() > MKFIFO_DEADLINE => {
-                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+                reap::reap_or_report(&mut child, reap::reap_within());
                 panic!("mkfifo did not finish within {MKFIFO_DEADLINE:?}");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(10)),

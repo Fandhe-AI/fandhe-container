@@ -148,7 +148,7 @@ exec "$0" "$@""#;
                 break s;
             }
             if start.elapsed() > CHILD_TIMEOUT {
-                crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut c, crate::reap::reap_within());
                 panic!("inherited_fds: child timed out ({scenario})");
             }
             std::thread::sleep(Duration::from_millis(20));

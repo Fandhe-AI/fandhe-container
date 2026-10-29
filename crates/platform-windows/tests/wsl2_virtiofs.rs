@@ -211,7 +211,7 @@ fn guest_sh(distro: &str, script: &str, timeout: Duration) -> (bool, String) {
             Some(s) => break s,
             None if start.elapsed() > timeout => {
                 let _ = child.kill();
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("wsl.exe timed out: {script}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),

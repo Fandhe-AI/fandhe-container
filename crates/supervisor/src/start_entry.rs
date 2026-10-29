@@ -3403,7 +3403,11 @@ mod linux {
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
         // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
-        record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
+        // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
+        // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
+        if unjoined_options.is_none() {
+            record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
+        }
         let running = match run_start_until(
             deps,
             &store,
@@ -3480,9 +3484,9 @@ mod linux {
         logs: &crate::pasta_attach::PastaLogBuffer,
         budget: Duration,
     ) {
-        if let Some(w) = unjoined
-            && w.drain(budget)
-        {
+        if let Some(w) = unjoined {
+            // 回収できなくても、期限超過より前に置かれていた印は拾う(取り出しは空なら何もしない)。
+            let _ = w.drain(budget);
             record_pasta_tamper(audit, id, logs, None);
         }
         logs.flush();
@@ -3714,6 +3718,28 @@ mod linux {
             assert_eq!(recs[0].container_id(), Some(&id));
             assert!(logs.take().is_empty(), "flushed");
             assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・REPAIR-5・#3431: 期限超過より前に置かれた改ざんの印は、回収できなくても報告後の始末で配送される
+        /// (報告前に取り出さない経路の回帰)。
+        #[test]
+        fn sec4_3431_finish_delivers_tamper_placed_before_timeout_even_if_undrained() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            logs.set_tamper(PastaVerifyRejection::PermissionDenied);
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert_eq!(sink.0.lock().unwrap().len(), 1);
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
         }
 
         /// #3431: 回収できなければ(戻らない作業スレッド)監査へは何も送らず、遅延ログだけ flush する。

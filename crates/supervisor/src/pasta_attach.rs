@@ -79,6 +79,8 @@ const TEARDOWN_REAP_CAP: Duration = Duration::from_secs(10);
 const SIGNAL_DEADLINE: Duration = Duration::from_secs(1);
 
 /// `terminate` の後始末に使う、PID 1 を回収できなかったときの待ち。
+/// 超過・失敗したときは回収を確かめられないため、`last_launch_may_have_left_process` を true にする
+/// (fail-closed。CORE-2・REPAIR-5・#3360)。
 const MISSING_ATTACHMENT_TERMINATE: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------------------------
@@ -1089,6 +1091,7 @@ impl PastaWiring {
             slot: Arc::clone(&self.slot),
             _backend: Arc::clone(&self.backend),
             logger: self.logger.clone(),
+            left_process: AtomicBool::new(false),
         })
     }
 }
@@ -1185,23 +1188,31 @@ impl NetnsAttachHook for PastaAttachHook {
 }
 
 /// `ProcessLauncher` の包み。内側の launch が成功したら受け渡し口の attachment を [`PastaGuardedProcess`] に載せ、
-/// 失敗したら残った分を逆順に止める。他のメソッドはすべて内側へ転送する（転送の漏れは降格・監査の欠落になる）。
+/// 失敗したら残った分を逆順に止める。他のメソッドは内側へ転送する（転送の漏れは降格・監査の欠落になる）。
+/// 例外は `last_launch_may_have_left_process` で、内側の判定に自前の状態を OR する
+/// (内側の `Ok` を本ラッパーが `Err` に変えるため、trait の「Ok のときは呼ばれない」前提が崩れる。CORE-2・REPAIR-5・SUP-3)。
 pub struct PastaAttachingLauncher {
     inner: Arc<dyn ProcessLauncher>,
     slot: Slot,
     _backend: Arc<dyn PastaAttachBackend>,
     logger: Logger,
+    /// 直近の launch で、attachment なしの拒否時に PID 1 の terminate を確かめられず、プロセスが残り得るか
+    /// (core の start / restart が起動予約を保持して確認つき回復へ回す判断材料。CORE-2・REPAIR-5・#3360)。
+    left_process: AtomicBool,
 }
 
 impl PastaAttachingLauncher {
     /// 内側の launch の結果に、フックが残した attachment を結びつける(`LaunchSpec` を作れない試験のため分けた本体)。
     ///
-    /// - `Ok`: attachment を [`PastaGuardedProcess`] に載せる。無ければ(フックが走っていない)プロセスを止めて `Err`
+    /// - `Ok`: attachment を [`PastaGuardedProcess`] に載せる。無ければ(フックが走っていない)プロセスを止めて `Err`。
+    ///   止められなかった・期限を超えたときは `last_launch_may_have_left_process` が true(予約を保持させる)
     /// - `Err`: フックが `Ok` を返した後の launch の失敗(合図の失敗など)。残った分を逆順に止める(core の契約)
     fn adopt(
         &self,
         result: Result<Box<dyn LaunchedProcess>, TraitError>,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        // launch ごとに 1 回だけ呼ばれ、間に読み手が無いため launch 冒頭でのリセットと等価(core の launcher と同じ意味論)。
+        self.left_process.store(false, Ordering::SeqCst);
         match result {
             Ok(process) => {
                 let taken = lock(&self.slot).take();
@@ -1213,7 +1224,15 @@ impl PastaAttachingLauncher {
                     ))),
                     None => {
                         // フックが走らなかった(network のモードとフックの組が崩れた)。ネットワーク無しで走らせない。
-                        let _ = process.terminate(MISSING_ATTACHMENT_TERMINATE);
+                        if let Err(te) = process.terminate(MISSING_ATTACHMENT_TERMINATE) {
+                            // 回収を確かめられない。予約を戻させず確認つき回復に回す(fail-closed)。
+                            self.left_process.store(true, Ordering::SeqCst);
+                            self.logger.log(
+                                true,
+                                "pasta_missing_attachment_terminate_failed",
+                                &[("code", Val::S(te.code().as_str()))],
+                            );
+                        }
                         // 準備済みの置き場所も回収する(失敗経路で所有物を残さない。NET-9)。
                         let _ = self._backend.remove_run_dir(None);
                         Err(TraitError::new(
@@ -1260,7 +1279,7 @@ impl ProcessLauncher for PastaAttachingLauncher {
     }
 
     fn last_launch_may_have_left_process(&self) -> bool {
-        self.inner.last_launch_may_have_left_process()
+        self.left_process.load(Ordering::SeqCst) || self.inner.last_launch_may_have_left_process()
     }
 
     fn launch(

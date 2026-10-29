@@ -115,6 +115,8 @@ impl PastaAttachBackend for FakeBackend {
 struct FakeProcess {
     ev: Events,
     waits: Mutex<Vec<Option<ProcessExit>>>,
+    /// 次の `terminate` が返すエラー(一度だけ。#3360)。
+    terminate_err: Mutex<Option<TraitError>>,
 }
 
 impl FakeProcess {
@@ -122,7 +124,15 @@ impl FakeProcess {
         Box::new(Self {
             ev: Arc::clone(ev),
             waits: Mutex::new(waits),
+            terminate_err: Mutex::new(None),
         })
+    }
+
+    /// `terminate` が `err` で失敗するフェイク(#3360)。
+    fn failing_terminate(ev: &Events, err: TraitError) -> Box<Self> {
+        let p = Self::new(ev, vec![]);
+        *p.terminate_err.lock().unwrap() = Some(err);
+        p
     }
 }
 
@@ -140,7 +150,10 @@ impl LaunchedProcess for FakeProcess {
     }
     fn terminate(&self, _t: Duration) -> Result<(), TraitError> {
         push(&self.ev, "container terminate");
-        Ok(())
+        match self.terminate_err.lock().unwrap().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
     fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
         push(&self.ev, format!("container signal {}", signal.as_u8()));
@@ -180,6 +193,7 @@ fn launcher(w: &PastaWiring) -> PastaAttachingLauncher {
         slot: Arc::clone(&w.slot),
         _backend: Arc::clone(&w.backend),
         logger: w.logger.clone(),
+        left_process: AtomicBool::new(false),
     }
 }
 
@@ -348,6 +362,68 @@ fn net9_launch_ok_without_attachment_terminates_process() {
         .expect("refused");
     assert_eq!(e.code(), ErrorCode::Internal);
     assert_eq!(events(&ev), ["container terminate", "remove run_dir"]);
+    // terminate が成功したので残存扱いにしない(陽性対照。#3360)。
+    assert!(!l.last_launch_may_have_left_process());
+}
+
+/// NET-9・REPAIR-5・CORE-2・#3360: attachment なしの拒否で terminate が失敗・期限超過したら、
+/// 回収を確かめられないので `last_launch_may_have_left_process` が true(start / restart が予約を保持する)。
+#[test]
+fn net9_repair5_launch_ok_without_attachment_terminate_failure_reports_left_process() {
+    for (code, wire) in [
+        (ErrorCode::Timeout, "TIMEOUT"),
+        (ErrorCode::Internal, "INTERNAL"),
+    ] {
+        let ev: Events = Arc::default();
+        let backend = FakeBackend::new(&ev);
+        let (w, buffer) = wiring(&backend);
+        let l = launcher(&w);
+        let e = l
+            .adopt(Ok(FakeProcess::failing_terminate(
+                &ev,
+                TraitError::new(code, "terminate failed"),
+            )))
+            .err()
+            .expect("refused");
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(events(&ev), ["container terminate", "remove run_dir"]);
+        assert!(l.last_launch_may_have_left_process(), "{wire}");
+        let lines = buffer.take();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("\"event\":\"pasta_missing_attachment_terminate_failed\"")
+                && lines[0].contains(&format!("\"code\":\"{wire}\"")),
+            "{lines:?}"
+        );
+    }
+}
+
+/// #3360: 残存扱いは次の launch の結果で必ずリセットされる(失敗した起動の判定が次へ漏れない)。
+#[test]
+fn net9_left_process_flag_resets_on_next_adopt() {
+    let ev: Events = Arc::default();
+    let backend = FakeBackend::new(&ev);
+    let (w, _b) = wiring(&backend);
+    let l = launcher(&w);
+    let _ = l.adopt(Ok(FakeProcess::failing_terminate(
+        &ev,
+        TraitError::new(ErrorCode::Timeout, "terminate failed"),
+    )));
+    assert!(l.last_launch_may_have_left_process());
+    // 内側の Err(NullLauncher の判定は false)。
+    let _ = l.adopt(Err(TraitError::new(ErrorCode::Internal, "launch failed")));
+    assert!(!l.last_launch_may_have_left_process());
+    // 再び true にしてから、成功経路(attachment あり)でもリセットされる。
+    let _ = l.adopt(Ok(FakeProcess::failing_terminate(
+        &ev,
+        TraitError::new(ErrorCode::Timeout, "terminate failed"),
+    )));
+    assert!(l.last_launch_may_have_left_process());
+    attach(&w).expect("attach");
+    let _p = l
+        .adopt(Ok(FakeProcess::new(&ev, vec![])))
+        .unwrap_or_else(|e| panic!("guarded: {:?}", e.code()));
+    assert!(!l.last_launch_may_have_left_process());
 }
 
 /// 成功した launch は Guarded に載り、PID 1 の回収後に pasta → holder → run dir の順で 1 回だけ止める。

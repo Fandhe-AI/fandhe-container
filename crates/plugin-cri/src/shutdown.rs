@@ -64,9 +64,30 @@ pub const SHUTDOWN_TOTAL_BOUND: Duration = Duration::from_millis(
         + RUNTIME_SHUTDOWN_WAIT.as_millis() as u64,
 );
 
+/// 監査 relay の helper が本体の終了後に残る時間の上限（Linux）。helper は停止シグナルを無視し、本体の終了
+/// （socketpair の EOF）で終わる。処理中の 1 件を書き終えるまでが最悪 `RECORD_WAIT_LIMIT`（SEC-4・REPAIR-5・#3300）。
+#[cfg(target_os = "linux")]
+pub const AUDIT_HELPER_LINGER_BOUND: Duration = fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
+
+/// 単位全体（本体 + 監査 helper）の停止の最悪の上限。本体の [`SHUTDOWN_TOTAL_BOUND`] は延ばさない。
+/// systemd の既定の停止猶予 90 秒より十分短い。
+#[cfg(target_os = "linux")]
+pub const UNIT_STOP_BOUND: Duration = Duration::from_millis(
+    SHUTDOWN_TOTAL_BOUND.as_millis() as u64 + AUDIT_HELPER_LINGER_BOUND.as_millis() as u64,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit_stop_bound_is_pinned_and_below_systemd_default() {
+        assert_eq!(SHUTDOWN_TOTAL_BOUND, Duration::from_millis(13_700));
+        assert_eq!(AUDIT_HELPER_LINGER_BOUND, Duration::from_millis(11_450));
+        assert_eq!(UNIT_STOP_BOUND, Duration::from_millis(25_150));
+        assert!(UNIT_STOP_BOUND < Duration::from_secs(90));
+    }
 
     #[test]
     fn shutdown_line_is_fixed_vocabulary() {

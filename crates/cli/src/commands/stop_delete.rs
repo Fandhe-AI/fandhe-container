@@ -617,6 +617,9 @@ fn log_removal_timeout_warning() -> &'static str {
 /// `run_delete` から呼ばれる。警告の出力は呼び出し元が [`cleanup_warnings`] で行う。`lock_wait` はログのロック解放を
 /// 待つ上限（本番は [`CONTAINER_LOG_LOCK_WAIT`]。試験は短い値を渡す）。この期限は supervisor ログとコンテナログで
 /// 共有し、コンテナログには supervisor ログの待ちの残りを渡す（独立に待つと最悪 30 秒になるため。#2892・REPAIR-5）。
+///
+/// CLI には `delete` 全体の期限が無く、各段は必ず 1 回試す。このため `Kept { Timeout }` は常に「試して期限切れになった」ことを
+/// 表し、plugin-cri の警告行にある `existence: unverified`（試さなかった段）に当たる区別は要らない（#3260・REPAIR-4）。
 fn finish_delete(
     store: &dyn StateStore,
     req: &DeleteRequest,
@@ -1009,6 +1012,7 @@ mod tests {
             supervisor_log_removal_warning(ErrorCode::Timeout),
             log_removal_timeout_warning()
         );
+        assert!(!log_removal_timeout_warning().contains("existence"));
         assert_eq!(
             supervisor_log_removal_warning(ErrorCode::FailedPrecondition),
             "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}"
@@ -1211,8 +1215,12 @@ mod tests {
             "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}"
         );
         let w = container_log_removal_warning(ErrorCode::Timeout);
-        assert!(!w.contains("reason"));
-        assert!(w.contains("\"code\":\"TIMEOUT\"") && !w.contains('\n') && !w.contains('/'));
+        // 試して期限切れになった行は常にこの形で、`existence` を持たない（#3260）。
+        assert_eq!(
+            w,
+            "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+        );
+        assert!(!w.contains("existence") && !w.contains('\n') && !w.contains('/'));
     }
 
     /// ERR-1・OCI-7・#2633: rootfs の警告は code ごとに完全一致する 1 行 JSON で、`cleanup_warnings` は残した欄だけを

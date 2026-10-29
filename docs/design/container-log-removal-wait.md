@@ -370,11 +370,23 @@ issue 3027 の時点では `SpecBundleProvider::release` に時間の上限が�
 `"existence":"unverified"` を足し、試して失敗した行はバイト単位で従来のままにした（`reason` の語彙は足さない）。期限を使い切った後に呼び出し元の
 スレッドで存在を確かめる案は、期限のない I/O を足すことになる（REPAIR-5）ため採らない。
 
+### 試さなかった supervisor ログ・コンテナログの警告行（#3260・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
+
+plugin-cri の `delete` で、全体の期限を使い切って `stage_budget` が `None` になりログ 2 段を試さなかったときも、試して期限切れになった行と
+同じ `"code":"TIMEOUT"` の行が出ていた。試さなかった段の行にだけ `"existence":"unverified"` を足す（フィールドの順は起動オプション文書の行と同じ
+`code` → `existence` → `message`）。
+
+- 出し分けは plugin-cri の `delete` に閉じる（ローカル型 `LogStage`）。core の `CleanupOutcome`・cri の `RuntimeCleanupOutcome`・supervisor の型は変えない
+- 試して失敗した行（`reason` つきを含む）と、警告を出さない `Superseded`・`Removed` はバイト単位で従来のまま。`reason` の語彙は足さない
+- 記録器の計上（`supervisor_log_remove` / `container_log_remove` の Failure・`container_log_remove.timeout`）は変えない
+- 期限を使い切った後に存在を確かめる I/O は足さない（REPAIR-5）
+- CLI は `delete` 全体の期限を持たず各段を必ず 1 回試すため、試さない段が無く、警告行は変えない。`Kept { Timeout }` は常に「試して期限切れ」を表す
+- 照合: `repair4_sup7_3260_skipped_log_warning_has_unverified_existence`・`repair5_cri2_3027_force_delete_skips_cleanup_when_deadline_exhausted`・
+  `repair5_cri2_3027_force_delete_cuts_cleanup_at_deadline`（plugin-cri）、`err1_container_log_removal_warning_is_single_line_json`（cli）
+
 ### 残余（REPAIR-3）
 
 - bundle の解放・`RemoveContainer` の worker の取り消し・Create の巻き戻しの `release`・`RemovePodSandbox` の合計の上限は #3142 で入れた（下の節）
-- 試さなかった段のログ 2 件（supervisor ログ・コンテナログ）の `Kept { Timeout }` にも、起動オプション文書の `existence` のような「未確認」の区別は無い
-  （存在を確かめずに警告行を出す。#3143 では起動オプション文書のみ対応）
 
 ## `RemoveContainer`・`RemovePodSandbox` の残りの待ち（#3142・CRI-2・REPAIR-5・OCI-7）
 

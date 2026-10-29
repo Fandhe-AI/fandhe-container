@@ -1476,7 +1476,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/sec1_2823_overmount.log"
           cargo test -p fandhe-container-core --lib \
-            -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --nocapture 2>&1 | tee "${log}"
+            -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --no-capture 2>&1 | tee "${log}"
           m='oci_runtime::start::tests'
           scripts/check-success-lines.sh --name sec1_2823_overmount_hides_child_in_real_namespace \
             --src crates/core/src/oci_runtime/start.rs --log "${log}" \

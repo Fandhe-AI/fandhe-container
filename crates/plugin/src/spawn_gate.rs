@@ -18,6 +18,16 @@
 //!   unix の全 OS で同じ挙動にする（分岐を増やさない。REPAIR-1）。Linux の std は原子的に作るので実害はない。
 //! - 効かない範囲: 本 crate の外（core・cli 等）の `Command::spawn` との組。窓は std の内部にあり、
 //!   プロセス全体のロックが std に無いため crate 単独では塞げない。塞ぐ案の比較は #3139 を参照。
+//! - 効かない範囲（feature `grpc` と `connect_unix`。#3262）: macOS では次の fd 生成も close-on-exec が非原子で、
+//!   このゲートの外にある。tokio 1.53.3 / mio 1.2.4（`Cargo.lock` の固定版）の `accept`（`accept(2)` の後に
+//!   `fcntl(F_SETFD)`）と client connect（mio の `new_socket` が `socket(2)` の後に `fcntl`）、および
+//!   `sys::connect_unix` の macOS 分岐（`socket` の後に `fcntl`）。grpc の listener の bind は `transport` の
+//!   bind（ゲートの中）で作った fd を `F_DUPFD_CLOEXEC` で複製するので原子的で、対応済み。
+//!   載せない理由: これらを使うプロセス（plugin-cri・plugin-macos）に [`spawn`] を呼ぶ箇所が無く、載せても
+//!   排他する相手がいない。また [`create_fds`] はブロッキングな待ちを持つため、async の accept / connect の
+//!   poll の中に置くと tokio の worker を止める（REPAIR-5）。載せるには非ブロッキングの取得 API が要る。
+//!   見直す条件: 同じプロセスで grpc の accept / connect か `connect_unix` と [`spawn`] を併用する実装が
+//!   macOS に現れたとき。依存（tokio・mio）の版を更新したら該当箇所を再確認する。
 //!
 //! # 使い方の制約
 //! [`create_fds`] の中で [`spawn`] や再び [`create_fds`] を呼ばない（同じスレッドが読み取りロックを持ったまま

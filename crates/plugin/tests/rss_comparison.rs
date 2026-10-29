@@ -361,15 +361,17 @@ mod supported {
         let arg_forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
         for bin in ["/bin/kill", "/usr/bin/kill"] {
             for args in arg_forms {
-                let status = Command::new(bin)
-                    .args(args)
+                let mut cmd = Command::new(bin);
+                cmd.args(args)
                     .env_clear()
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if status.is_ok_and(|s| s.success()) {
-                    return;
+                    .stderr(Stdio::null());
+                // 期限なしの `status()` を避ける（REPAIR-5・#3409）。期限切れ・spawn 失敗は次の形式へ進む。
+                match crate::reap::run_within(&mut cmd, crate::reap::REAP_WITHIN) {
+                    Ok(s) if s.success() => return,
+                    Ok(_) => {}
+                    Err(e) => eprintln!("kill_process_group: {e}"),
                 }
             }
         }

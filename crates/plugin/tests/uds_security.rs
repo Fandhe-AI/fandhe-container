@@ -11,6 +11,10 @@ fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
 }
 
 #[cfg(unix)]
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+#[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{PluginErrorCode, RUNTIME_DIR_NAME, RuntimeDir, UdsListener};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -406,10 +410,10 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
         let fifo = d.path().join("s.sock.lock");
-        let st = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
+        let mut mkfifo = std::process::Command::new("mkfifo");
+        mkfifo.arg(&fifo);
+        let st = crate::reap::run_within(&mut mkfifo, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("mkfifo at lock name: {e}"));
         assert!(st.success());
         let (tx, rx) = std::sync::mpsc::channel();
         let path = p.clone();

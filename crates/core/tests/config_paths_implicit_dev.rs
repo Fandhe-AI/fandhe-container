@@ -302,9 +302,12 @@ mod linux {
                 Ok(Some(st)) => break (st.success(), format!("{st:?}")),
                 Ok(None) if Instant::now() >= deadline => {
                     // 子孫ごと終了させる（プロセスグループ宛の SIGKILL）。
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", "--", &format!("-{pgid}")])
-                        .status();
+                    // 期限なしの `status()` を避ける（REPAIR-5・#3409）。失敗は表に出すが、回収は続ける。
+                    let mut kill = std::process::Command::new("kill");
+                    kill.args(["-KILL", "--", &format!("-{pgid}")]);
+                    if let Err(e) = crate::reap::run_within(&mut kill, crate::reap::REAP_WITHIN) {
+                        eprintln!("group SIGKILL: {e}");
+                    }
                     crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     break (false, "killed: scenario exceeded its deadline".to_string());
                 }

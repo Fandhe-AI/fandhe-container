@@ -45,8 +45,8 @@ fn main() {
         observe_landlock_enforcement,
     };
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::process::Command;
+    use std::time::Duration;
 
     /// Linux の `EACCES`（x86_64・aarch64 共通で 13）。
     const EACCES: i32 = 13;
@@ -120,26 +120,12 @@ fn main() {
         let scratch = scratch_root::ScratchDir::new("fandhe-landlock-enf", Duration::from_secs(10));
         let dir = scratch.path().join(mode.trim_start_matches('-'));
         std::fs::create_dir(&dir).expect("create probe dir");
-        let mut child = Command::new(&exe)
-            .arg(mode)
-            .arg("--probe-dir")
-            .arg(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn child");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let status = loop {
-            if let Some(s) = child.try_wait().expect("try_wait") {
-                break s;
-            }
-            if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
-                panic!("landlock_enforcement child {mode} timed out");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let out = child.wait_with_output().expect("wait_with_output");
+        let mut cmd = Command::new(&exe);
+        cmd.arg(mode).arg("--probe-dir").arg(&dir);
+        // spawn・期限・出力回収を一括で期限つきにする（REPAIR-5・#3409）。
+        let out = crate::reap::output_within(&mut cmd, Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("landlock_enforcement child {mode}: {e}"));
+        let status = out.status;
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             status.success(),

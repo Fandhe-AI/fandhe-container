@@ -42,10 +42,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
     use std::os::fd::OwnedFd;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::traits::ErrorCode;
@@ -107,12 +111,11 @@ mod linux {
     /// supervisor の bin が `netns-holder` を `run_main` より前に holder へ振り分ける（stdout に start の結果が出ない）。
     fn bin_dispatch() {
         let bin = env!("CARGO_BIN_EXE_fandhe-container-supervisor");
-        let out = Command::new(bin)
-            .arg("netns-holder")
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()
-            .expect("run supervisor bin");
+        let mut cmd = Command::new(bin);
+        cmd.arg("netns-holder").env_clear();
+        // 期限なしの `output()` を避ける（REPAIR-5・#3409）。
+        let out = crate::reap::output_within(&mut cmd, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("run supervisor bin: {e}"));
         assert_eq!(
             out.status.code(),
             Some(1),
@@ -128,12 +131,10 @@ mod linux {
             out.stdout
         );
 
-        let out = Command::new(bin)
-            .args(["netns-holder", "extra"])
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()
-            .expect("run supervisor bin with an extra argument");
+        let mut cmd = Command::new(bin);
+        cmd.args(["netns-holder", "extra"]).env_clear();
+        let out = crate::reap::output_within(&mut cmd, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("run supervisor bin with an extra argument: {e}"));
         assert_eq!(out.status.code(), Some(2));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),

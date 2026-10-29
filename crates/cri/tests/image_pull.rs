@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_cri::image_pull::{
     ImagePuller, OciImagePuller, PullConfig, PullError, PullRequest, PulledImage, PulledManifest,
@@ -165,6 +165,37 @@ fn parse_image(json: &str) -> ImageManifest {
     }
 }
 
+/// 期限の試験用の擬似時計（#3297）。実時間では進まず、`advance` した分だけ進む。
+/// `OciImagePuller::with_clock` へ渡すと、pull の期限と展開の期限が同じ時計を見る。
+struct FakeClock {
+    base: Instant,
+    offset_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl FakeClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            offset_nanos: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn now(&self) -> Instant {
+        self.base + Duration::from_nanos(self.offset_nanos.load(Ordering::SeqCst))
+    }
+
+    fn advance(&self, d: Duration) {
+        let n = u64::try_from(d.as_nanos()).expect("duration fits u64");
+        self.offset_nanos.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// `OciImagePuller::with_clock` へ渡す時計の口。
+    fn source(self: &Arc<Self>) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+        let c = Arc::clone(self);
+        Arc::new(move || c.now())
+    }
+}
+
 /// 偽クライアント。private レジストリを模し、`require_credentials` なら資格情報なしを `PermissionDenied` にする。
 struct FakeClient {
     manifest_json: String,
@@ -174,7 +205,8 @@ struct FakeClient {
     manifest_digest: Digest,
     /// index 経由を模す場合の index 本文の偽ハッシュ。digest 参照はこの値と突合する。
     index_digest: Option<Digest>,
-    blob_delay: Duration,
+    /// 指定すると、blob 取得ごとにこの擬似時計をこの量だけ進める（実時間の sleep を使わない。#3297）。
+    blob_advance: Option<(Arc<FakeClock>, Duration)>,
     corrupt_digest: Option<&'static str>,
     blob_fetches: AtomicUsize,
     seen_credentials: Mutex<Vec<bool>>,
@@ -199,7 +231,7 @@ impl FakeClient {
             selected: None,
             manifest_digest: Digest::parse(&format!("sha256:{SHA_INDEX_PICK}")).expect("digest"),
             index_digest: None,
-            blob_delay: Duration::ZERO,
+            blob_advance: None,
             corrupt_digest: None,
             blob_fetches: AtomicUsize::new(0),
             seen_credentials: Mutex::new(Vec::new()),
@@ -279,7 +311,9 @@ impl RegistryPullClient for FakeClient {
                 "registry token has expired",
             ));
         }
-        std::thread::sleep(self.blob_delay);
+        if let Some((clock, step)) = &self.blob_advance {
+            clock.advance(*step);
+        }
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         let mut body = blob_body(hex);
         if self.corrupt_digest == Some(hex) {
@@ -517,17 +551,24 @@ fn oci1_digest_pull_with_mismatched_manifest_is_rejected() {
     assert!(!blob_path(&dir, SHA_CONFIG).exists());
 }
 
-/// REPAIR-5: 最後の blob の処理で期限を超えたら成功を返さない。
+/// REPAIR-5・#3297: 最後の blob の処理で期限を超えたら成功を返さない。
+/// 擬似時計で blob 取得ごとに 60ms 進め、期限は 90ms。config（60ms）は期限内、layer（120ms）で超える。
+/// 時計が配線されていなければ実時間はほぼ進まず pull が成功して `expect_err` が失敗する。
 #[test]
 fn repair5_deadline_is_checked_after_last_blob() {
     let dir = TempDir::new("lastblob");
+    let clock = FakeClock::new();
     let mut fake = FakeClient::new(manifest_json(SHA_CONFIG_L1, &[(SHA_LAYER1, SIZE_LAYER1)]));
-    fake.blob_delay = Duration::from_millis(60);
+    fake.blob_advance = Some((Arc::clone(&clock), Duration::from_millis(60)));
+    let fake = Arc::new(fake);
     let mut cfg = config(&dir);
     cfg.pull_deadline = Duration::from_millis(90);
-    let puller = OciImagePuller::new(Arc::new(fake), cfg);
+    let puller = OciImagePuller::new(Arc::clone(&fake), cfg).with_clock(clock.source());
     let err = puller.pull(&req("alpine")).expect_err("deadline");
     assert_eq!(err.code(), OciErrorCode::Timeout);
+    assert_eq!(err.message(), "image pull exceeded its deadline");
+    // 最後の blob まで取りに行ってから止まった。
+    assert_eq!(fake.blob_fetches.load(Ordering::SeqCst), 2);
 }
 
 /// CRI-4: 短縮名は PullImage が登録する正規名へ正規化される（ID 等の解釈不能な文字列は None）。
@@ -1807,28 +1848,27 @@ fn oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs() {
     assert_eq!(fs::read(&marker).expect("kept"), b"m");
 }
 
-/// OCI-1・REPAIR-5・#2534・#2967: 展開中に期限を過ぎたら、エントリ単位の確認で `Timeout` にし、公開も記録の書き込みもしない
-/// （期限は pull 全体で共有し、展開へ絶対時刻として渡す）。
+/// OCI-1・REPAIR-5・#2534・#2967・#3297: 展開中に期限を過ぎたら、エントリ単位の確認で `Timeout` にし、公開も記録の書き込みもしない
+/// （期限は pull 全体で共有し、展開へ絶対時刻として渡す）。擬似時計を展開 1 層ごとに 1300ms 進め、期限は 1 秒。
+/// 1 層目は期限内に展開され、2 層目の前で止まる。時計が配線されていなければ pull が成功して `expect_err` が失敗する。
 #[test]
 fn oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published() {
-    use fandhe_container_oci::instrument::{OciOpKind, OciOpRecorder, OciOpSample};
-    #[derive(Debug)]
-    struct SlowExtract;
-    impl OciOpRecorder for SlowExtract {
-        fn record_oci_op(&self, sample: &OciOpSample) {
-            if sample.kind() == OciOpKind::ExtractLayer {
-                std::thread::sleep(Duration::from_millis(1300));
-            }
-        }
-    }
+    let clock = FakeClock::new();
+    let c2 = Arc::clone(&clock);
+    let probe = Arc::new(ExtractProbe {
+        extracted: AtomicUsize::new(0),
+        on_extract: Box::new(move || c2.advance(Duration::from_millis(1300))),
+    });
     let dir = TempDir::new("deadline-extract");
     let mut cfg = config(&dir);
     cfg.pull_deadline = Duration::from_secs(1);
     let puller = OciImagePuller::new(Arc::new(FakeClient::new(two_layer_manifest())), cfg)
-        .with_recorder(Arc::new(SlowExtract));
+        .with_recorder(probe.clone())
+        .with_clock(clock.source());
     let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
     assert_eq!(err.code(), OciErrorCode::Timeout);
     assert_eq!(err.message(), "image pull exceeded its deadline");
+    assert_eq!(probe.extracted.load(Ordering::SeqCst), 1);
     assert!(!rootfs_exists(&dir, SHA_CONFIG));
     assert!(staging_is_empty(&dir));
 }
@@ -1938,23 +1978,26 @@ fn cri3_repair5_pull_cancelled_before_start_does_not_contact_registry() {
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
 }
 
-/// CRI-3・REPAIR-5・#2967・#3227: 展開の期限は pull 全体の期限と共有する（取得で使った残りだけが展開に渡る）。
-/// 3 blob の取得で 600ms 以上を使い、最初の層の展開後の 2500ms の待ちで 3 秒を超えるため、2 層目は展開されない
-/// （待ち 2500ms は期限 3 秒より短いので、展開に別の予算があれば 2 層とも通る値の組）。
-/// 脆いのは「1 層目が期限内に展開される」側だけで、その余裕は約 2.4 秒ある（macOS の共有ランナーの遅延で
-/// 1 層目の前に期限切れになった #3227 の再発防止）。「2 層目が展開されない」側は sleep の下限保証で遅延に対し単調に安全。
+/// CRI-3・REPAIR-5・#2967・#3227・#3297: 展開の期限は pull 全体の期限と共有する（取得で使った残りだけが展開に渡る）。
+/// 擬似時計で blob 取得ごとに 200ms（3 本で 600ms）、最初の層の展開後に 2500ms 進め、期限は 3 秒。
+/// 600 + 2500 = 3100 >= 3000 なので 2 層目は展開されない。展開に別の 3 秒の予算があれば 600 + 3000 > 3100 で
+/// 2 層とも通る値の組のため、期限の共有を判別できる。実時間に依らないので #3227 の間欠失敗は起きない。
 #[test]
 fn cri3_repair5_extraction_shares_the_pull_deadline() {
+    let clock = FakeClock::new();
     let mut client = FakeClient::new(two_layer_manifest());
-    client.blob_delay = Duration::from_millis(200);
+    client.blob_advance = Some((Arc::clone(&clock), Duration::from_millis(200)));
+    let c2 = Arc::clone(&clock);
     let probe = Arc::new(ExtractProbe {
         extracted: AtomicUsize::new(0),
-        on_extract: Box::new(|| std::thread::sleep(Duration::from_millis(2500))),
+        on_extract: Box::new(move || c2.advance(Duration::from_millis(2500))),
     });
     let dir = TempDir::new("share-deadline");
     let mut cfg = config(&dir);
     cfg.pull_deadline = Duration::from_secs(3);
-    let puller = OciImagePuller::new(Arc::new(client), cfg).with_recorder(probe.clone());
+    let puller = OciImagePuller::new(Arc::new(client), cfg)
+        .with_recorder(probe.clone())
+        .with_clock(clock.source());
     let err = puller.pull(&req("alpine:3.20")).expect_err("deadline");
     assert_eq!(err.code(), OciErrorCode::Timeout);
     assert_eq!(err.message(), "image pull exceeded its deadline");

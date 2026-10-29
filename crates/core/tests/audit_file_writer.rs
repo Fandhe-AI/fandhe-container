@@ -42,7 +42,11 @@ fn rec(n: i32) -> AuditRecord {
 /// 残骸は排他作成できた場合だけ自分で消す（既に存在すれば本物の残骸として使い、消さない）。
 #[test]
 fn repair12_3434_tmp_ignores_legacy_pid_residue() {
-    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    fn snap(p: &std::path::Path) -> Option<(u64, u64, bool)> {
+        let m = fs::symlink_metadata(p).ok()?;
+        Some((m.dev(), m.ino(), m.file_type().is_fifo()))
+    }
     struct Cleanup(std::path::PathBuf, bool);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -55,13 +59,35 @@ fn repair12_3434_tmp_ignores_legacy_pid_residue() {
     let created = fs::create_dir(&legacy).is_ok();
     let _cleanup = Cleanup(legacy.clone(), created);
     if created {
-        let status = std::process::Command::new("mkfifo")
+        // 期限つきで実行し、超過したら kill して期限つきで回収する（REPAIR-5）。
+        let mut child = std::process::Command::new("mkfifo")
             .arg(legacy.join("audit.log"))
-            .status()
-            .expect("run mkfifo");
-        assert!(status.success(), "mkfifo failed: {status:?}");
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn mkfifo");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait mkfifo") {
+                assert!(status.success(), "mkfifo failed: {status:?}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let reap = std::time::Instant::now() + Duration::from_secs(5);
+                while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < reap
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("mkfifo did not finish within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         fs::write(legacy.join("file"), b"x").expect("write residue");
     }
+    // 既存の残骸を使う場合は処理前の状態を記録し、不変性を比較する。
+    let before = snap(&legacy.join("audit.log"));
     let (scratch, d) = tmp("legacy3434");
     assert_ne!(d, legacy);
     assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
@@ -69,15 +95,19 @@ fn repair12_3434_tmp_ignores_legacy_pid_residue() {
     let mut w = AuditFileWriter::open(&p).unwrap();
     w.write_record(&rec(1)).unwrap();
     assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 1);
-    let fifo = fs::symlink_metadata(legacy.join("audit.log")).expect("residue fifo");
-    assert!(fifo.file_type().is_fifo(), "{:?}", fifo.file_type());
+    let now = snap(&legacy.join("audit.log"));
+    if created {
+        assert!(matches!(now, Some((_, _, true))), "{now:?}");
+    } else {
+        assert_eq!(now, before);
+    }
     drop(w);
     drop(scratch);
     assert_eq!(
         fs::symlink_metadata(&d).unwrap_err().kind(),
         std::io::ErrorKind::NotFound
     );
-    assert!(fs::symlink_metadata(legacy.join("audit.log")).is_ok());
+    assert_eq!(snap(&legacy.join("audit.log")), before);
 }
 
 /// SEC-4・TASK-41.5.1: 0600 で作成し追記する。既存内容は保持される。

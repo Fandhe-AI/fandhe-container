@@ -355,6 +355,45 @@ pub(crate) struct LegacyResidue {
     dir: std::path::PathBuf,
     fifo: std::path::PathBuf,
     created: bool,
+    /// 既存の残骸を使う場合の処理前の状態（dev・ino・FIFO か）。無ければ `None`。
+    before: Option<(u64, u64, bool)>,
+}
+
+/// 期限つきで `mkfifo` を実行する（REPAIR-5）。超過したら kill して期限つきで回収し panic する。
+#[cfg(unix)]
+fn mkfifo_limited(path: &std::path::Path) {
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new("mkfifo")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mkfifo");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait mkfifo") {
+            assert!(status.success(), "mkfifo failed: {status:?}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let reap = Instant::now() + Duration::from_secs(5);
+            while child.try_wait().ok().flatten().is_none() && Instant::now() < reap {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("mkfifo did not finish within 10s");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// パスの dev・ino・FIFO かを返す（無ければ `None`）。
+#[cfg(unix)]
+fn snapshot(path: &std::path::Path) -> Option<(u64, u64, bool)> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.dev(), meta.ino(), meta.file_type().is_fifo()))
 }
 
 #[cfg(unix)]
@@ -364,14 +403,16 @@ impl LegacyResidue {
         let fifo = dir.join(fifo_name);
         let created = std::fs::create_dir(&dir).is_ok();
         if created {
-            let status = std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("run mkfifo");
-            assert!(status.success(), "mkfifo failed: {status:?}");
+            mkfifo_limited(&fifo);
             std::fs::write(dir.join("file"), b"x").expect("write residue");
         }
-        Self { dir, fifo, created }
+        let before = if created { None } else { snapshot(&fifo) };
+        Self {
+            dir,
+            fifo,
+            created,
+            before,
+        }
     }
 
     /// 残骸の置き場そのもの。
@@ -379,11 +420,14 @@ impl LegacyResidue {
         &self.dir
     }
 
-    /// FIFO が FIFO のまま残っている（開いたり消したりされていない）。
+    /// 自分で作った FIFO は FIFO のまま残っている。既存の残骸は処理前と同じ（dev・ino・種別、無ければ無いまま）。
     pub(crate) fn assert_untouched(&self) {
-        use std::os::unix::fs::FileTypeExt as _;
-        let meta = std::fs::symlink_metadata(&self.fifo).expect("residue fifo");
-        assert!(meta.file_type().is_fifo(), "{:?}", meta.file_type());
+        let now = snapshot(&self.fifo);
+        if self.created {
+            assert!(matches!(now, Some((_, _, true))), "{now:?}");
+        } else {
+            assert_eq!(now, self.before);
+        }
     }
 }
 

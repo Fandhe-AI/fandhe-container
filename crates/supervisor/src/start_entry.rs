@@ -3738,7 +3738,11 @@ mod linux {
         #[cfg(unix)]
         #[test]
         fn repair12_3434_abandoned_cleanup_ignores_legacy_pid_residue() {
-            use std::os::unix::fs::FileTypeExt as _;
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            fn snap(p: &std::path::Path) -> Option<(u64, u64, bool)> {
+                let m = std::fs::symlink_metadata(p).ok()?;
+                Some((m.dev(), m.ino(), m.file_type().is_fifo()))
+            }
             struct Cleanup(std::path::PathBuf, bool);
             impl Drop for Cleanup {
                 fn drop(&mut self) {
@@ -3751,16 +3755,41 @@ mod linux {
             let created = std::fs::create_dir(&legacy).is_ok();
             let _cleanup = Cleanup(legacy.clone(), created);
             if created {
-                let status = std::process::Command::new("mkfifo")
+                // 期限つきで実行し、超過したら kill して期限つきで回収する（REPAIR-5）。
+                let mut child = std::process::Command::new("mkfifo")
                     .arg(legacy.join("@lock"))
-                    .status()
-                    .expect("run mkfifo");
-                assert!(status.success(), "mkfifo failed: {status:?}");
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn mkfifo");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().expect("try_wait mkfifo") {
+                        assert!(status.success(), "mkfifo failed: {status:?}");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let reap = Instant::now() + Duration::from_secs(5);
+                        while child.try_wait().ok().flatten().is_none() && Instant::now() < reap {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        panic!("mkfifo did not finish within 10s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 std::fs::write(legacy.join("file"), b"x").expect("write residue");
             }
+            // 既存の残骸を使う場合は処理前の状態を記録し、不変性を比較する。
+            let before = snap(&legacy.join("@lock"));
             run_3359_abandoned_cleanup();
-            let fifo = std::fs::symlink_metadata(legacy.join("@lock")).expect("residue fifo");
-            assert!(fifo.file_type().is_fifo(), "{:?}", fifo.file_type());
+            let now = snap(&legacy.join("@lock"));
+            if created {
+                assert!(matches!(now, Some((_, _, true))), "{now:?}");
+            } else {
+                assert_eq!(now, before);
+            }
         }
 
         /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。

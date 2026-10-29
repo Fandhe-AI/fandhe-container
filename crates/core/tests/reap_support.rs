@@ -75,6 +75,21 @@ fn reap_support_child_leaves_holder() {
     }
 }
 
+/// 子の役。出力先を継承した孫（`flood_forever`）を起こし、`holder_flood` は自身も眠って待つ。
+#[test]
+fn reap_support_child_leaves_flooder() {
+    if std::env::var(CHILD_ENV).as_deref() == Ok("holder_flood") {
+        let exe = std::env::current_exe().expect("current_exe");
+        // 孫は待たずに残すのが目的（子の終了後も書き続けさせる）。
+        #[allow(clippy::zombie_processes, reason = "孫を意図して待たずに残す")]
+        Command::new(exe)
+            .args(["--exact", "reap_support_child_floods", "--test-threads=1"])
+            .env(CHILD_ENV, "flood_forever")
+            .spawn()
+            .expect("spawn flooding grandchild");
+    }
+}
+
 fn self_cmd(test: &str, role: &str) -> Command {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = Command::new(exe);
@@ -265,4 +280,75 @@ fn repair5_repair12_drain_reports_open_and_read_failure() {
             || err.starts_with(&format!("read output file {}: ", sub.display())),
         "unexpected message: {err}"
     );
+}
+
+/// P1: 子が終了した後も出力先へ書き続ける孫は、`finish` の前にグループごと止められる。
+/// 孫の書き込み先は同じ inode のため、止まらなければ削除後も増え続ける。止めたことは、`finish` の後に孫の
+/// プロセスが居なくなること（`/proc` で pid が消える）で確かめる。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_repair12_finish_kills_descendant_that_keeps_writing() {
+    let mut cmd = self_cmd("reap_support_child_leaves_flooder", "holder_flood");
+    let (mut child, captured) =
+        reap::spawn_captured_capped(&mut cmd, 1 << 30).expect("spawn captured");
+    let pgid = child.id();
+    let st = reap::wait_within(&mut child, Duration::from_secs(30)).expect("child exit");
+    // 孫が同じグループに居る（子の pid を pgid とするメンバーが残っている）ことを確認する。
+    assert!(
+        group_members(pgid) >= 1,
+        "no flooding grandchild in group {pgid}"
+    );
+    let out_path = captured.out_path.clone();
+    let _ = captured.finish(st);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while group_members(pgid) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(group_members(pgid), 0, "grandchild survived finish");
+    assert!(!out_path.exists());
+}
+
+/// プロセスグループ `pgid` のメンバー数（/proc/<pid>/stat の第 5 フィールド pgrp で数える。ゾンビは除く）。
+#[cfg(target_os = "linux")]
+fn group_members(pgid: u32) -> usize {
+    let mut n = 0;
+    for e in std::fs::read_dir("/proc").expect("read /proc").flatten() {
+        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        // comm は括弧で囲まれ空白を含みうるため、最後の ')' の後ろから数える: state ppid pgrp ...
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        if f.first() != Some(&"Z") && f.get(2).and_then(|v| v.parse::<u32>().ok()) == Some(pgid) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// P2: `spawn_captured` の待機（`Captured::wait_within`）でも保存量を監視し、書き続ける子を期限前に `Err` にする。
+#[test]
+fn repair5_repair12_captured_wait_cuts_endless_output_before_deadline() {
+    let mut cmd = self_cmd(FLOOD_TEST, "flood_forever");
+    let (mut child, captured) =
+        reap::spawn_captured_capped(&mut cmd, 64 * 1024).expect("spawn captured");
+    let start = std::time::Instant::now();
+    let err = captured
+        .wait_within(&mut child, Duration::from_secs(40))
+        .expect_err("endless output must fail");
+    assert_eq!(err, "stdout exceeded the 65536 byte capture cap");
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "not cut early: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        child.try_wait().expect("try_wait").is_some(),
+        "child not reaped"
+    );
+    let out_path = captured.out_path.clone();
+    captured.discard();
+    assert!(!out_path.exists());
 }

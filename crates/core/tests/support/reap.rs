@@ -121,6 +121,30 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
     }
 }
 
+/// プロセスグループ `pgid` の全員へ SIGKILL を送る（`/bin/kill -KILL -- -<pgid>` を期限つきで起動する。
+/// この補助は `unsafe` を持たないため、`kill(2)` の直接呼び出しの代わりに外部コマンドを使う）。グループが
+/// すでに空の失敗（ESRCH）は正常として無視し、起動・期限切れの失敗は stderr に出す。`pgid` が 0 や 1 のときは
+/// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+fn kill_group(pgid: u32) {
+    #[cfg(unix)]
+    {
+        if pgid <= 1 {
+            return;
+        }
+        let mut cmd = Command::new("/bin/kill");
+        cmd.args(["-KILL", "--", &format!("-{pgid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Err(e) = run_within(&mut cmd, Duration::from_secs(10)) {
+            eprintln!("kill process group {pgid} failed: {e}");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
 /// `output_within` が各出力ファイルに許す最大バイト数。超えたら「出力が完全でない」として `Err` にする
 /// （先頭だけ返して後続の存在を隠さない。禁止文字列の不在を検証する試験が上限後の漏れを見逃すため。REPAIR-12）。
 const OUTPUT_CAP: u64 = 1 << 20;
@@ -183,6 +207,8 @@ pub struct Captured {
     pub(crate) out_path: std::path::PathBuf,
     err_path: std::path::PathBuf,
     cap: u64,
+    /// 子を先頭にしたプロセスグループ ID（0 は「グループなし」で kill しない。Unix 以外は常に 0）。
+    pgid: u32,
 }
 
 impl Captured {
@@ -190,6 +216,8 @@ impl Captured {
     /// 読み取りに失敗した場合は `Err`（途中までの出力は返さない）。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn finish(self, status: ExitStatus) -> Result<Output, String> {
+        // 出力先を継承した子孫が居残って書き続けないよう、読む前にグループの残りを止める。
+        kill_group(self.pgid);
         let stdout = drain_output_file(&self.out_path, self.cap);
         let stderr = drain_output_file(&self.err_path, self.cap);
         Ok(Output {
@@ -210,15 +238,52 @@ impl Captured {
         Ok(())
     }
 
-    /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。消す前に 0 へ切り詰めて、出力先を持ち続ける
-    /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
+    /// 子の終了を `within` まで待つ。待ちの最中に 5 ms ごとに出力の大きさを見て、上限超過・期限切れ・
+    /// `try_wait` の失敗では、子のグループを kill・回収し、出力を切り詰めてから `Err`（ファイルを消すのは
+    /// 呼び出し側の `discard`）。期限切れの文言は `wait_within` と同じ `child <pid> did not exit within <within>`。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-    pub fn discard(self) {
+    pub fn wait_within(&self, child: &mut Child, within: Duration) -> Result<ExitStatus, String> {
+        let pid = child.id();
+        let until = Instant::now() + within;
+        let stop = |child: &mut Child, msg: String| {
+            kill_group(self.pgid);
+            reap_or_report(child, REAP_WITHIN);
+            self.truncate();
+            Err(msg)
+        };
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => return Ok(st),
+                Ok(None) => {}
+                Err(e) => return stop(child, format!("try_wait on child {pid} failed: {e}")),
+            }
+            if let Err(e) = self.check_cap() {
+                return stop(child, e);
+            }
+            if Instant::now() >= until {
+                return stop(child, format!("child {pid} did not exit within {within:?}"));
+            }
+            std::thread::sleep(OUTPUT_POLL);
+        }
+    }
+
+    /// 出力ファイルを 0 へ切り詰める（残った書き手が居ても溜まった領域を解放する）。
+    fn truncate(&self) {
         for p in [&self.out_path, &self.err_path] {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .open(p);
+        }
+    }
+
+    /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。消す前に 0 へ切り詰めて、出力先を持ち続ける
+    /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
+    #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+    pub fn discard(self) {
+        kill_group(self.pgid);
+        self.truncate();
+        for p in [&self.out_path, &self.err_path] {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -227,7 +292,8 @@ impl Captured {
 /// `cmd` の stdin を null、stdout・stderr を一時ファイルへ向けて spawn する。子の終了待ちは呼び出し側が
 /// `wait_within` 等で行い、終了後に `Captured::finish` で出力を取り出す（子の実行中に診断を採りたい試験向け。
 /// 単純な場合は `output_within`）。spawn の失敗は `spawn <program> failed: <io error>`。
-/// この経路は待ちの最中に保存量を監視しない（上限超過は `finish` が `Err` にする）。監視つきは `output_within`。
+/// 待ちは `Captured::wait_within`（保存量を 5 ms ごとに監視し、上限超過で kill・切り詰め・`Err`）で行う。
+/// `wait_within`（自由関数）で待つと保存量は監視されず、上限超過は `finish` が `Err` にするだけになる。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn spawn_captured(cmd: &mut Command) -> Result<(Child, Captured), String> {
     spawn_captured_capped(cmd, OUTPUT_CAP)
@@ -251,14 +317,28 @@ pub(crate) fn spawn_captured_capped(
         out_path,
         err_path,
         cap,
+        pgid: 0,
     };
-    match cmd
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut cmd = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file))
-        .spawn()
+        .stderr(Stdio::from(err_file));
+    // 子を新しいプロセスグループの先頭にして、後始末でグループごと止められるようにする（P1: 出力先を
+    // 継承した孫の書き込みを止める）。setsid / setpgid で自分から抜けた子孫は止められない（限界）。
+    #[cfg(unix)]
     {
-        Ok(child) => Ok((child, captured)),
+        use std::os::unix::process::CommandExt as _;
+        cmd = cmd.process_group(0);
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            let captured = Captured {
+                pgid: if cfg!(unix) { child.id() } else { 0 },
+                ..captured
+            };
+            Ok((child, captured))
+        }
         Err(e) => {
             captured.discard();
             Err(format!("spawn {program} failed: {e}"))
@@ -276,9 +356,12 @@ pub(crate) fn spawn_captured_capped(
 /// 保存量の上限（各 `OUTPUT_CAP` = 1 MiB。REPAIR-5・REPAIR-12）: 待ちループ（5 ms 間隔）で出力ファイルの
 /// 大きさを監視し、超えたら子を kill・回収してファイルを切り詰めて消し、`<program> output exceeded ...` の
 /// `Err` を返す。終了後に上限を超えていた場合や読み取りの失敗も `Err`（先頭だけを正常値として返さない）。
-/// 残る限界: 監視は間隔ごとのため間隔内に書かれた分だけ上限を超えて溜まりうる。kill するのは起動した子だけで、
-/// 出力先を継承した孫はプロセスグループごとには止めない（std だけでは安全に実現できないため）。ただし
-/// 切り詰めてから unlink するので、孫が居残っても領域は解放され、孫の後続の書き込みは取り込まれない。
+/// 子は新しいプロセスグループの先頭として起動し、kill・終了後の読み取り前にはグループ全体へ SIGKILL を送る
+/// （出力先を継承した孫が書き続けて保存量を増やさない。REPAIR-5）。
+/// 残る限界: 監視は間隔ごとのため間隔内に書かれた分だけ上限を超えて溜まりうる。`setsid` / `setpgid` で
+/// グループを抜けた子孫は止められない（切り詰めてから unlink するので溜まった領域は解放され、孫の後続の
+/// 書き込みは取り込まれないが、削除済み inode への書き込みは続きうる）。グループ ID は子の回収後に送るため、
+/// グループが空で pid が再利用されていると誤送信しうるが、pid の再利用が一巡する間隔では実質起きない。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, String> {
     output_within_capped(cmd, within, OUTPUT_CAP)
@@ -292,39 +375,19 @@ pub(crate) fn output_within_capped(
 ) -> Result<Output, String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let (mut child, captured) = spawn_captured_capped(cmd, cap)?;
-    let pid = child.id();
-    let until = Instant::now() + within;
-    let fail = |child: &mut Child, captured: Captured, msg: String| {
-        reap_or_report(child, REAP_WITHIN);
-        captured.discard();
-        Err(msg)
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return captured
-                    .finish(status)
-                    .map_err(|e| format!("{program}: {e}"));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return fail(
-                    &mut child,
-                    captured,
-                    format!("{program}: try_wait on child {pid} failed: {e}"),
-                );
+    match captured.wait_within(&mut child, within) {
+        Ok(status) => captured
+            .finish(status)
+            .map_err(|e| format!("{program}: {e}")),
+        Err(e) => {
+            captured.discard();
+            if e.contains("did not exit within") {
+                Err(format!("{program} did not finish within {within:?}"))
+            } else if e.starts_with("try_wait ") {
+                Err(format!("{program}: {e}"))
+            } else {
+                Err(format!("{program} {e}"))
             }
         }
-        if let Err(e) = captured.check_cap() {
-            return fail(&mut child, captured, format!("{program} {e}"));
-        }
-        if Instant::now() >= until {
-            return fail(
-                &mut child,
-                captured,
-                format!("{program} did not finish within {within:?}"),
-            );
-        }
-        std::thread::sleep(OUTPUT_POLL);
     }
 }

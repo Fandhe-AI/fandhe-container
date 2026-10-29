@@ -198,16 +198,43 @@ fn net12_delivery_add_host_and_dns_reach_etc_files() {
     );
 }
 
-/// NET-12・REPAIR-3: ユーザー定義名との組の `--dns` は結線前のため Unimplemented で拒否する。
+/// NET-12・NET-9・D9(12.7): ユーザー定義名(pasta 構成)は Linux で `--dns` の有無に依らず resolv.conf を bind 対象にし、
+/// `--add-host` があれば hosts も載せる(loopback の拒否は `net12_named_dns_rejects_loopback`)。
 #[test]
-fn net12_delivery_dns_is_rejected_as_unimplemented() {
-    let e = deliver(&net_doc("g1", "mynet", &[], &["8.8.8.8"])).unwrap_err();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+fn net12_delivery_named_network_binds_resolv_conf() {
+    #[cfg(target_os = "linux")]
+    use fandhe_container_core::etc_files::EtcFileKind;
+    let none = deliver(&net_doc("g1", "mynet", &[], &[]));
+    let dns = deliver(&net_doc("g1", "mynet", &["db:10.0.0.5"], &["8.8.8.8"]));
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            none.expect("named").etc_files().kinds(),
+            vec![EtcFileKind::ResolvConf]
+        );
+        assert_eq!(
+            dns.expect("named").etc_files().kinds(),
+            vec![EtcFileKind::Hosts, EtcFileKind::ResolvConf]
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 非 Linux にはユーザー定義名の結線が無いので、DNS の有無に依らず Unimplemented で拒否する。
+        assert_eq!(none.unwrap_err().code(), ErrorCode::Unimplemented);
+        assert_eq!(dns.unwrap_err().code(), ErrorCode::Unimplemented);
+    }
 }
 
-/// NET-6: ユーザー定義名のみ(add-host・dns なし)は結線前のため Unimplemented で拒否する。
+/// NET-6・NET-9(#1940): ユーザー定義名のみ(add-host・dns なし)は、Linux では `Attachable`(rootless の pasta 構成)へ
+/// 写り、それ以外の OS では結線が無いため Unimplemented で拒否する。
 #[test]
-fn net6_delivery_named_network_is_rejected_as_unimplemented() {
-    let e = deliver(&net_doc("g1", "mynet", &[], &[])).unwrap_err();
-    assert_eq!(e.code(), ErrorCode::Unimplemented);
+fn net6_delivery_named_network_maps_to_attachable_on_linux() {
+    let got = deliver(&net_doc("g1", "mynet", &[], &[]));
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        got.expect("attachable").network(),
+        fandhe_container_core::oci_runtime::LaunchNetworkMode::Attachable
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(got.unwrap_err().code(), ErrorCode::Unimplemented);
 }

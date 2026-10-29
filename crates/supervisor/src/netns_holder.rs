@@ -8,11 +8,11 @@
 //! 本モジュールはその上に「プロセスとして起動し、期限つきで待ち、段階を上げて止め、必ず回収する」層を足す。
 //!
 //! # 呼び出し元（REPAIR-3）
-//! 本番の経路からはまだ呼ばれない。fd 2 本を作る core の同期点は #1939、launch・monitor からの呼び出し
-//! （起動途中の失敗で逆順に止める・PID 1 の回収後に pasta → holder の順で止める・restart で作り直す・途中死の検知）は
-//! #1940 が結線する。pidfd による監視も #1940 の項目で、本モジュールの生存確認は未回収の `Child` の `try_wait` で行う
-//! （std の `create_pidfd` は unstable で、`sys` に `pidfd_open` も無い。unsafe を足さない）。
-//!
+//! `crate::pasta_attach` の `PastaAttachHook` が、core の exec 直前の同期点（#1939）から呼ぶ（#1940）。起動途中の失敗での
+//! 逆順の停止・PID 1 の回収後の pasta → holder の停止・途中死の検知もそちらが行う。pidfd による監視は採らず、本モジュールの
+//! 生存確認は未回収の `Child` の `try_wait` で行う（std の `create_pidfd` は unstable で、`sys` に `pidfd_open` も無い。
+//! unsafe を足さない）。restart で作り直す経路は、本番 launcher の再 launch が #2043 まで拒否されるため未確認。
+
 //! # 起動の制約（12.10・fail-closed）
 //! - **main スレッドから呼ぶ**: holder の `PR_SET_PDEATHSIG` は spawn したスレッドの終了でも届く。start の手順 8
 //!   （launch を含む）は入口の main スレッドが直接行うため同じ寿命になる。main でなければ拒否する
@@ -28,7 +28,7 @@
 //!   以内に回収する。回収後の pid へシグナルを送らない（pid の再利用を避ける。#2545）
 //! - [`Drop`]: 端を閉じて EOF を伝え、SIGKILL と回収を試みる。回収できなければ zombie のまま残す（回収用のスレッドを
 //!   単一スレッド区間で作らないため。zombie の間は pid が再利用されず、supervisor の終了で init が回収する）
-//! - delete: holder はディスクに何も残さないので、すること自体が無い（`@pasta/<id>` の後始末は #1938・#1940）
+//! - delete: holder はディスクに何も残さないので、すること自体が無い（`@pasta/<id>` の後始末は pasta 側。#1938・#1940）
 //! - supervisor の異常終了: holder 自身の PDEATHSIG と socket の EOF で終わる。本モジュールに処理は無い
 //!   （`tests/netns_holder_launch_userns.rs` で照合する）
 
@@ -206,6 +206,14 @@ fn parse_caps_all_zero(status: &str) -> Result<bool, &'static str> {
         return Err("missing capability field");
     }
     Ok(zero)
+}
+
+/// 呼び出しスレッドが main スレッドか（`/proc/thread-self` の readlink。pasta の起動の前提確認も使う。#1940）。
+pub(crate) fn is_main_thread() -> Result<bool, TraitError> {
+    let internal = |m: &'static str| TraitError::new(ErrorCode::Internal, m);
+    let link = std::fs::read_link("/proc/thread-self")
+        .map_err(|_| internal("cannot read /proc/thread-self"))?;
+    parse_is_main_thread(&link.to_string_lossy()).map_err(internal)
 }
 
 /// 起動できる状況か（main スレッド・capability 0）を確かめる。

@@ -81,6 +81,7 @@ use fandhe_container_core::oci_runtime::{LaunchIpcMode, LaunchOptions};
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+use fandhe_container_net::pasta::binary::PastaBinary;
 
 /// `--ulimit` 1 件の最大バイト数（最長の名前 `sigpending` と u64 の 2 値に十分な余裕を持たせた上限）。
 const ULIMIT_MAX_LEN: usize = 64;
@@ -139,6 +140,8 @@ pub struct ContainerOptions {
     read_only: bool,
     /// `--network`・`--add-host`・`--dns`(net で再検証済み。NET-6・NET-12・#3065)。
     network: NetworkOptions,
+    /// 起動時の再検証を通した pasta のバイナリ(`pasta` の記録があるときだけ。exec に使えるのはこれだけ。NET-9・#1940)。
+    pasta: Option<PastaBinary>,
 }
 
 impl ContainerOptions {
@@ -179,6 +182,18 @@ impl ContainerOptions {
     /// `--network`・`--add-host`・`--dns` の検証済みの組。
     pub fn network(&self) -> &NetworkOptions {
         &self.network
+    }
+
+    /// 起動時の再検証(`reverify_recorded_pasta`)を通した pasta のバイナリを持たせる(NET-9・#1940)。
+    #[must_use]
+    pub fn with_pasta_binary(mut self, binary: PastaBinary) -> Self {
+        self.pasta = Some(binary);
+        self
+    }
+
+    /// 再検証済みの pasta のバイナリ(記録が無ければ `None`)。
+    pub fn pasta_binary(&self) -> Option<&PastaBinary> {
+        self.pasta.as_ref()
     }
 
     /// `--read-only` が指定されたか。

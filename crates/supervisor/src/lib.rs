@@ -81,6 +81,8 @@ pub mod log_pipeline;
 pub mod logs;
 #[cfg(target_os = "linux")]
 pub mod netns_holder;
+#[cfg(target_os = "linux")]
+pub mod pasta_attach;
 pub mod privilege;
 pub mod restart;
 pub mod run;

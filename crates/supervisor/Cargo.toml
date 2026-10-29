@@ -38,6 +38,7 @@
 # #1840 で sys の自前 FFI 宣言と libc の照合試験を追加した（dev-dependencies に workspace の libc =0.2.189。Linux のみ）。
 # #3065 で fandhe-container-net への workspace 内 path 依存（supervisor -> net の一方向。network-wiring.md D5）を追加した（外部クレートの追加なし）。
 # #3198 で netns holder の起動・回収（src/netns_holder.rs）と bin の振り分けを追加した（依存は不変）。
+# #1940 で rootless の pasta 構成の結線（src/pasta_attach.rs。holder → pasta の起動・コンテナの寿命への連動）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]

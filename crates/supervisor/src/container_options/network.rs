@@ -12,12 +12,14 @@
 //!
 //! # 未実装の範囲(REPAIR-3)
 //!
-//! - ユーザー定義名(`Named`)と `container:` 始まりは起動経路に結線されておらず `Unimplemented`
-//!   (rootless の pasta は #1940、rootful の参加指定は #3069・#3074)。
-//! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持するだけで、pasta への反映(`pasta_args()` の連結)は
-//!   #1940(NET-9・NET-3。#3200 で kind を足した)。
+//! - ユーザー定義名(`Named`)は Linux で `LaunchNetworkMode::Attachable` へ写り、supervisor の `pasta_attach` が
+//!   holder と pasta を結線する(#1940)。CLI が `network <名前>` と `pasta` を FCOPT1 に書く入口は #3329。Linux 以外は
+//!   `Unimplemented`。`container:` 始まりは結線されておらず `Unimplemented`(rootful の参加指定は #3069・#3074)。
+//! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持し、`pasta_attach` が pasta の引数へ連結する(#1940。
+//!   NET-9・NET-3。#3200 で kind を足した)。
 //! - `add-host`・`dns` の hosts / resolv.conf への反映は start の手順 4b(`etc_files`。#1873・D9)。
-//!   `none` / `host` だけが対象で、種別の決定は [`NetworkOptions::etc_file_selection`]。
+//!   種別の決定は [`NetworkOptions::etc_file_selection`]。ユーザー定義名(pasta 構成)は `--dns` の有無に依らず
+//!   resolv.conf を生成する(`--dns` が無ければ nameserver は [`PASTA_DEFAULT_NAMESERVER`]。D9・12.7)。
 //!
 //! OS 非依存で、3 OS でビルド・テストする。エラーは固定の英語文言で、入力値を含めない。
 
@@ -37,6 +39,32 @@ use fandhe_container_net::pasta::PastaPortForwards;
 /// `publish` がユーザー定義名の `network` と組でないときの固定拒否文言。
 const PUBLISH_NEEDS_NAMED_MESSAGE: &str = "publish records require a user-defined network";
 /// 結線されていない指定の固定拒否文言。
+/// resolver にできない loopback 系のアドレスか(127.0.0.0/8・`::1`・IPv4-mapped / IPv4-compatible の loopback・
+/// 未指定アドレス)。ユーザー定義名の `--dns` の検証と resolv.conf の書き込み時の再検証が同じ関数を使う
+/// (コンテナの netns の loopback は resolver ではない。D1・NET-12)。
+pub fn is_loopback_like(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // `::ffff:a.b.c.d`(mapped)と `::a.b.c.d`(compatible)の埋め込み IPv4。
+                || v6.to_ipv4().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+/// pasta 構成(ユーザー定義名)の既定の nameserver。pasta の `--dns-forward` と同じアドレス
+/// (rootless-network.md 12.7・network-wiring.md D9。net の `pasta_argv` の固定引数と同じ値)。
+pub const PASTA_DEFAULT_NAMESERVER: &str = "169.254.1.1";
+
+/// ユーザー定義名の `--dns` に loopback を指定したときの固定拒否文言(コンテナの loopback は resolver ではない。D1)。
+const NAMED_DNS_LOOPBACK_MESSAGE: &str =
+    "dns on a user-defined network must not be a loopback address";
+
+/// ユーザー定義名の `--dns` に IPv6 を指定したときの固定拒否文言(pasta 構成は IPv4 専用。NET-9)。
+const NAMED_DNS_IPV6_MESSAGE: &str = "dns on a user-defined network must be an IPv4 address";
+
 const NAMED_NOT_WIRED_MESSAGE: &str = "user-defined networks are not wired to the launch path yet";
 
 /// `--network` の検証済みの選択(NET-6)。
@@ -47,7 +75,7 @@ pub enum NetworkSelection {
     None,
     /// `host`(ホストの network namespace を共有する)。
     Host,
-    /// ユーザー定義名(検証済み。起動経路への結線は #1940・#3069・#3074)。
+    /// ユーザー定義名(検証済み。rootless の pasta 構成は #1940 で結線済み。rootful の参加指定は #3069・#3074)。
     Named(NetworkName),
 }
 
@@ -138,6 +166,21 @@ impl NetworkOptions {
             let raw: Vec<&str> = dns.iter().map(String::as_str).collect();
             ResolvConfPlan::for_mode(mode, &raw).map_err(|e| net_error_to_trait(&e))?;
         }
+        // pasta 構成の `--dns` は resolv.conf の nameserver になる。コンテナの netns の loopback は resolver ではない(D1)。
+        let named = matches!(selection, Some(NetworkSelection::Named(_)));
+        // pasta 構成は常に `-4`(IPv4 専用。NET-9)。IPv6 の nameserver だけでは名前解決できないため受けない。
+        if named && addrs.iter().any(IpAddr::is_ipv6) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                NAMED_DNS_IPV6_MESSAGE,
+            ));
+        }
+        if named && addrs.iter().any(is_loopback_like) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                NAMED_DNS_LOOPBACK_MESSAGE,
+            ));
+        }
         if network.is_none() && (!entries.is_empty() || !addrs.is_empty()) {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
@@ -168,12 +211,19 @@ impl NetworkOptions {
     }
 
     /// core の `LaunchNetworkMode` へ写す(D7)。指定なしは `FromConfig`、`none` は `Loopback`(実体は #3064 まで
-    /// core が `Unimplemented`)、`host` は `Host`、ユーザー定義名は `Unimplemented`。
+    /// core が `Unimplemented`)、`host` は `Host`、ユーザー定義名は Linux で `Attachable`(rootless の pasta 構成。#1940)、
+    /// それ以外の OS では `Unimplemented`。
     pub fn launch_network_mode(&self) -> Result<LaunchNetworkMode, TraitError> {
         match &self.selection {
             None => Ok(LaunchNetworkMode::FromConfig),
             Some(NetworkSelection::None) => Ok(LaunchNetworkMode::Loopback),
             Some(NetworkSelection::Host) => Ok(LaunchNetworkMode::Host),
+            // rootless の pasta 構成(exec 前の同期点で netns と user namespace の fd を supervisor へ渡す。#1940)。
+            // Linux 以外にはこの経路が無い(挙動の差は固定の文言で示す。CLI-1)。
+            // `--add-host` / `--dns` は手順 4b の hosts / resolv.conf の生成で反映する(`etc_file_selection`)。
+            #[cfg(target_os = "linux")]
+            Some(NetworkSelection::Named(_)) => Ok(LaunchNetworkMode::Attachable),
+            #[cfg(not(target_os = "linux"))]
             Some(NetworkSelection::Named(_)) => Err(TraitError::new(
                 ErrorCode::Unimplemented,
                 NAMED_NOT_WIRED_MESSAGE,
@@ -183,21 +233,23 @@ impl NetworkOptions {
 
     /// `/etc/hosts`・`/etc/resolv.conf` を生成して載せる種別(#1873・NET-12・D9)。
     ///
-    /// `none` / `host` で `--add-host` があれば hosts、`--dns` があれば resolv.conf。それ以外(文書なし・
-    /// ユーザー定義名)は空。生成(start の手順 4b)と bind(`LaunchOptions::with_etc_files`)が同じ関数で決まり、食い違わない。
+    /// `none` / `host` で `--add-host` があれば hosts、`--dns` があれば resolv.conf。ユーザー定義名(pasta 構成)は
+    /// `--add-host` があれば hosts、resolv.conf は `--dns` の有無に依らず常に生成する(pasta の `--dns-forward` だけでは
+    /// コンテナ内の resolver 設定は変わらないため。12.7・D9)。それ以外(文書なし)は空。生成(start の手順 4b)と
+    /// bind(`LaunchOptions::with_etc_files`)が同じ関数で決まり、食い違わない。
     pub fn etc_file_selection(&self) -> EtcFileSelection {
-        if !matches!(
-            self.selection,
-            Some(NetworkSelection::None | NetworkSelection::Host)
-        ) {
-            return EtcFileSelection::default();
-        }
         let mut sel = EtcFileSelection::default();
+        match self.selection {
+            Some(NetworkSelection::None | NetworkSelection::Host) => {
+                if !self.dns.is_empty() {
+                    sel = sel.with(EtcFileKind::ResolvConf);
+                }
+            }
+            Some(NetworkSelection::Named(_)) => sel = sel.with(EtcFileKind::ResolvConf),
+            None => return sel,
+        }
         if !self.add_hosts.is_empty() {
             sel = sel.with(EtcFileKind::Hosts);
-        }
-        if !self.dns.is_empty() {
-            sel = sel.with(EtcFileKind::ResolvConf);
         }
         sel
     }
@@ -286,7 +338,51 @@ mod tests {
         );
         assert!(sel(Some("host"), &[], &[]).is_empty());
         assert!(sel(None, &[], &[]).is_empty());
-        assert!(sel(Some("web"), &[], &[]).is_empty());
+        // ユーザー定義名(pasta 構成)は --dns が無くても resolv.conf を生成する(既定は 169.254.1.1。12.7・D9)。
+        assert_eq!(sel(Some("web"), &[], &[]), vec![EtcFileKind::ResolvConf]);
+        assert_eq!(
+            sel(Some("web"), &["a:192.0.2.1"], &["192.0.2.53"]),
+            vec![EtcFileKind::Hosts, EtcFileKind::ResolvConf]
+        );
+    }
+
+    /// NET-12・D1: ユーザー定義名の --dns に loopback 系(mapped・compatible・未指定を含む)は指定できない。
+    #[test]
+    fn net12_named_dns_rejects_loopback() {
+        for bad in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert_eq!(code(p(Some("web"), &[], &[bad])), INV, "{bad}");
+        }
+        for ok in ["169.254.1.1", "1.1.1.1", "192.0.2.53"] {
+            assert_eq!(code(p(Some("web"), &[], &[ok])), None, "{ok}");
+        }
+    }
+
+    /// NET-9・NET-12: ユーザー定義名(pasta 構成は IPv4 専用)の --dns は IPv6 を拒否し、IPv4 は受理する。
+    /// none / host の --dns は従来どおり IPv6 を受ける。
+    #[test]
+    fn net9_named_dns_rejects_ipv6_and_accepts_ipv4() {
+        for bad in ["2001:db8::53", "fe80::1", "::ffff:1.1.1.1"] {
+            let e = p(Some("web"), &[], &[bad]).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(
+                e.message(),
+                "dns on a user-defined network must be an IPv4 address"
+            );
+        }
+        // 1 件でも IPv6 が混じれば拒否する。
+        assert_eq!(code(p(Some("web"), &[], &["1.1.1.1", "2001:db8::53"])), INV);
+        for ok in ["1.1.1.1", "169.254.1.1", "192.0.2.53"] {
+            assert_eq!(code(p(Some("web"), &[], &[ok])), None, "{ok}");
+        }
+        assert_eq!(code(p(Some("host"), &[], &["2001:db8::53"])), None);
     }
 
     /// NET-6・D1: `--network` の判定表。
@@ -329,8 +425,17 @@ mod tests {
         assert_eq!(mode(None).expect("m"), LaunchNetworkMode::FromConfig);
         assert_eq!(mode(Some("none")).expect("m"), LaunchNetworkMode::Loopback);
         assert_eq!(mode(Some("host")).expect("m"), LaunchNetworkMode::Host);
-        let e = mode(Some("web")).expect_err("named");
-        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        // ユーザー定義名は Linux で Attachable(#1940)、それ以外の OS では Unimplemented。
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            mode(Some("web")).expect("named"),
+            LaunchNetworkMode::Attachable
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            mode(Some("web")).expect_err("named").code(),
+            ErrorCode::Unimplemented
+        );
         assert!(NetworkOptions::default().is_empty());
     }
 

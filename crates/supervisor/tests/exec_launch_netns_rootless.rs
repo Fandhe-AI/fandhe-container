@@ -562,7 +562,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!(
                     "scenario {}-{} exceeded {SCENARIO_DEADLINE:?}",
                     mode.label(),

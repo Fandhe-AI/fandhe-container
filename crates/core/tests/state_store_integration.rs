@@ -189,7 +189,7 @@ mod linux {
 
         /// kill して回収し、出力を返す。
         fn kill_and_output(&mut self) -> String {
-            crate::reap::reap_or_report(&mut self.child, crate::reap::REAP_WITHIN);
+            crate::reap::reap_or_report(&mut self.child, crate::reap::reap_within());
             self.output()
         }
     }
@@ -576,7 +576,7 @@ mod linux {
         assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
         assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
         // 保持側を終わらせると（OS がロックを解放）書ける。失敗した更新は反映されていない。
-        crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+        crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
         let cur = store.get(&GetStateRequest::new(cid("web"))).unwrap();
         assert_eq!(cur, rec);
         let next = store

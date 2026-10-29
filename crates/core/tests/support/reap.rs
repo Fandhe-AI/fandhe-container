@@ -22,10 +22,6 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// 回収期限の固定値。環境変数に連動しない（`reap_within()` の既定値と同じ 30 秒）。
-#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-pub const REAP_WITHIN: Duration = Duration::from_secs(30);
-
 /// 子を kill し、`within` 以内に `try_wait()` で回収する。回収できない（期限切れ・`try_wait` の失敗）なら
 /// 具体的なメッセージの `Err` を返す。すでに終了していた子の kill の失敗は無視する。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
@@ -49,6 +45,7 @@ pub fn reap(child: &mut Child, within: Duration) -> Result<(), String> {
 }
 
 /// 回収期限。各試験の `timeout()` と同じ規則で求めた期限の 3 倍（既定 30 秒。理由は冒頭の説明）。
+/// 回収期限の唯一のつまみで、固定値の定数は #3456 で廃止した。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn reap_within() -> Duration {
     let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -245,7 +242,7 @@ fn kill_once(pgid: u32) -> KillOnce {
                     attempts.push(format!("{bin} {args:?} exited with {st}: {}", msg.trim()));
                 }
                 Err(e) => {
-                    reap_or_report(&mut child, REAP_WITHIN);
+                    reap_or_report(&mut child, reap_within());
                     attempts.push(format!("{bin} {args:?}: {e}"));
                 }
             }
@@ -553,7 +550,7 @@ impl Captured {
         let stop = |child: &mut Child, msg: String| {
             // 先に子を回収してからグループを撃つ（終了済みで未回収の子だけのグループへの送信が macOS で
             // EPERM になりうるため。回収後は残りが孫だけで、`kill_group` が空 / ゾンビのみを成功扱いにできる）。
-            reap_or_report(child, REAP_WITHIN);
+            reap_or_report(child, reap_within());
             self.reaped.store(true, Ordering::Relaxed);
             let killed = kill_group(self.pgid, true);
             self.truncate();
@@ -705,7 +702,7 @@ pub(crate) fn spawn_captured_mode(
                 })
             }
             Err(e) => {
-                reap_or_report(&mut child, REAP_WITHIN);
+                reap_or_report(&mut child, reap_within());
                 kill_group_or_report(captured.pgid);
                 return Err(format!("{program}: {e}"));
             }

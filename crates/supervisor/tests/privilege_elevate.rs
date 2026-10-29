@@ -143,7 +143,7 @@ mod linux {
         // 期限なしの `status()` を避ける。スレッドを立てない `run_within` を使う（REPAIR-5・#3409）。
         let mut kill0 = Command::new("kill");
         kill0.args(["-0", "1"]);
-        let kill_ok = crate::reap::run_within(&mut kill0, crate::reap::REAP_WITHIN)
+        let kill_ok = crate::reap::run_within(&mut kill0, crate::reap::reap_within())
             .inspect_err(|e| eprintln!("kill -0 1: {e}"))
             .is_ok_and(|s| s.success());
         println!("kill_pid1={kill_ok}");

@@ -167,7 +167,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 let mut buf = String::new();
                 let _ = fs::File::open(&log)
                     .unwrap()

@@ -176,7 +176,7 @@ mod linux {
         // 期限なしの `status()` を避ける。スレッドを立てない `run_within` は単一スレッド前提を壊さない（#3409）。
         let mut kill = Command::new("kill");
         kill.args(["-s", "TERM", "--"]).arg(format!("-{child_pid}"));
-        let status = crate::reap::run_within(&mut kill, crate::reap::REAP_WITHIN)
+        let status = crate::reap::run_within(&mut kill, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("group SIGTERM: {e}"));
         assert!(status.success(), "kill -s TERM to the group failed");
 
@@ -186,7 +186,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the child did not exit within {CHILD_EXIT_WAIT:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -286,7 +286,7 @@ mod linux {
         });
         let cgt = sig_mask(sleeper_pid, "SigCgt:").expect("sleep SigCgt");
         let sleeper_ign = sig_mask(sleeper_pid, "SigIgn:").expect("sleep SigIgn");
-        crate::reap::reap(&mut sleeper, crate::reap::REAP_WITHIN)
+        crate::reap::reap(&mut sleeper, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("reap sleeper: {e}"));
         assert_eq!(
             cgt & (MASK_INT | MASK_TERM),

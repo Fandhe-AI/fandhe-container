@@ -522,7 +522,7 @@ mod real_wsl2 {
                 Ok(Some(s)) => return s.success(),
                 Ok(None) if start.elapsed() > timeout => {
                     let _ = child.kill();
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return false;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),

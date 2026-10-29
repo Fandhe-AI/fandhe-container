@@ -91,7 +91,7 @@ fn gpu2_task127_4_cdi_env_reaches_exec_child() {
             Some(st) => break st,
             None if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
             None => {
-                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+                reap::reap_or_report(&mut child, reap::reap_within());
                 panic!("/usr/bin/env did not exit within {limit:?}");
             }
         }

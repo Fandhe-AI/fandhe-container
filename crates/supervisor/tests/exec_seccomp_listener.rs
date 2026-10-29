@@ -241,7 +241,7 @@ mod linux {
                 break status;
             }
             if started.elapsed() > Duration::from_secs(60) {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the child did not finish within 60s");
             }
             std::thread::sleep(Duration::from_millis(20));

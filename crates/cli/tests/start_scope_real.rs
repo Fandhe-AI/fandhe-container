@@ -184,7 +184,7 @@ mod linux {
                 return Ok(st);
             }
             if Instant::now() >= deadline {
-                super::reap::reap_or_report(&mut c, super::reap::REAP_WITHIN);
+                super::reap::reap_or_report(&mut c, super::reap::reap_within());
                 return Err(format!("{what} timed out (REPAIR-5)"));
             }
             std::thread::sleep(POLL);

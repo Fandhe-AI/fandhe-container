@@ -231,7 +231,7 @@ mod linux {
         let mut setcap = Command::new("setcap");
         setcap.arg(caps).arg(&launcher);
         // 期限なしの `status()` を避ける。期限切れ・spawn 失敗も前提欠如（SetcapFailed）として扱う（REPAIR-5・#3409）。
-        let st = crate::reap::run_within(&mut setcap, crate::reap::REAP_WITHIN)
+        let st = crate::reap::run_within(&mut setcap, crate::reap::reap_within())
             .inspect_err(|e| eprintln!("setcap: {e}"));
         if !st.is_ok_and(|s| s.success()) {
             return Err(Precondition::SetcapFailed);
@@ -254,7 +254,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 let _ = std::fs::remove_dir_all(dir);
                 panic!("launcher did not exit within the timeout");
             }

@@ -125,7 +125,7 @@ mod linux {
         assert!(members.contains(&command.id()));
 
         command.kill().expect("kill the direct child only");
-        crate::reap::reap(&mut command, crate::reap::REAP_WITHIN)
+        crate::reap::reap(&mut command, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("reap the direct child: {e}"));
         wait_until("the direct child to leave the cgroup", || {
             !pids_in(&exec_dir).contains(&command.id())
@@ -174,8 +174,8 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &again, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::REAP_WITHIN) {
-            crate::reap::reap_or_report(&mut command, crate::reap::REAP_WITHIN);
+        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::reap_within()) {
+            crate::reap::reap_or_report(&mut command, crate::reap::reap_within());
             panic!("stubborn exec child did not exit after its cgroup was removed: {e}");
         }
         assert!(!container_dir.join(again.as_str()).exists());
@@ -235,8 +235,8 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &limited, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        if let Err(e) = crate::reap::wait_within(&mut forker, crate::reap::REAP_WITHIN) {
-            crate::reap::reap_or_report(&mut forker, crate::reap::REAP_WITHIN);
+        if let Err(e) = crate::reap::wait_within(&mut forker, crate::reap::reap_within()) {
+            crate::reap::reap_or_report(&mut forker, crate::reap::reap_within());
             panic!("forker did not exit after its cgroup was removed: {e}");
         }
 

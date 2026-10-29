@@ -114,7 +114,7 @@ mod linux {
         let mut cmd = Command::new(bin);
         cmd.arg("netns-holder").env_clear();
         // 期限なしの `output()` を避ける（REPAIR-5・#3409）。
-        let out = crate::reap::output_within(&mut cmd, crate::reap::REAP_WITHIN)
+        let out = crate::reap::output_within(&mut cmd, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("run supervisor bin: {e}"));
         assert_eq!(
             out.status.code(),
@@ -133,7 +133,7 @@ mod linux {
 
         let mut cmd = Command::new(bin);
         cmd.args(["netns-holder", "extra"]).env_clear();
-        let out = crate::reap::output_within(&mut cmd, crate::reap::REAP_WITHIN)
+        let out = crate::reap::output_within(&mut cmd, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("run supervisor bin with an extra argument: {e}"));
         assert_eq!(out.status.code(), Some(2));
         assert_eq!(

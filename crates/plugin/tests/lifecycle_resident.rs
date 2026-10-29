@@ -275,7 +275,7 @@ mod unix {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         // 期限なしの `status()` を避け、止まったら kill して回収し場所つきで失敗させる（REPAIR-5・#3409）。
-        let status = crate::reap::run_within(&mut cmd, crate::reap::REAP_WITHIN)
+        let status = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("decoy process: {e}"));
         assert!(status.success());
     }

@@ -227,7 +227,7 @@ mod unix {
         ) {
             Ok(_) => {
                 let _ = child.kill();
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("accept succeeded: the connector ran as the same UID as the test");
             }
             Err(e) => {
@@ -248,7 +248,7 @@ mod unix {
         }
         if !exited {
             let _ = child.kill();
-            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
             panic!("connector did not exit after the connection was rejected");
         }
         // 読み取り側にも期限を設ける。超過時は reader を待たずに失敗させる（reader は孫が

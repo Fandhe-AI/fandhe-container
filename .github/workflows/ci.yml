@@ -1522,6 +1522,43 @@ jobs:
             --libtest-ignored --libtest-module "${m}" \
             --select '^test [A-Za-z0-9_:]+ \.\.\. ' --min 2 --summary
 
+      # net の nft ソケットの世代が「開いたスレッドの netns」に従うことの実機前提テスト 1 件（`crates/net/src/nftables_batch/socket.rs`
+      # の lib 内 `#[ignore]` 試験 net3_3068_socket_generation_follows_opening_thread。NET-3・SEC-1・REPAIR-12・#3068・#3356）。
+      # スレッドの `unshare(CLONE_NEWNET)` には、そのスレッドの netns を所有する user namespace での CAP_SYS_ADMIN が要る。
+      # `unshare -r` だけだと netns は init user namespace 所有のままで EPERM になるため、`-r -n` で包む（新しい netns が
+      # 新しい user namespace の所有になり、その中の root が権限を持つ）。上で緩和した sysctl を使い回し、sudo・新しい
+      # check-run・permissions は増やさない。試験はバッチを送らずホストの nftables に触れない。`--ignored` が届かなくても
+      # exit 0 になるため、成功行を試験ソースから導出して照合する（`--libtest-module`）。
+      - name: net の socket 世代の namespace 試験のビルド（バイナリの特定。NET-3・SEC-1・#3356）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/net-lib-build.json"
+          cargo test -p fandhe-container-net --lib --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.kind == ["lib"]'
+          sel="${sel}"' and .target.name == "fandhe_container_net") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::net lib test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "NET_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: net の socket 世代の namespace 試験の実行（実機前提テスト・--ignored。NET-3・SEC-1・#3068・#3356）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/net_socket_generation_ns.log"
+          m='nftables_batch::socket::tests'
+          unshare -r -n -- "${NET_LIB_TEST_BIN}" --ignored --exact \
+            "${m}::net3_3068_socket_generation_follows_opening_thread" 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name net_socket_generation_ns \
+            --src crates/net/src/nftables_batch/socket.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --summary
+
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）と、start_scope_real・delete_cgroup_real・start_recover_real（cli・#3105。下の専用ステップ）

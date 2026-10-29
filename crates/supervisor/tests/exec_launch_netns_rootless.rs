@@ -36,6 +36,8 @@
 //! FANDHE_CONTAINER_TEST_ID_HELPER=1 USER=$(id -un) systemd-run --user --scope -p Delegate=yes <target/debug/deps/exec_launch_netns_rootless-XXXX> --ignored
 //! ```
 //!
+//! 各シナリオは `DelegatedCgroup::prepare` が自プロセスを退避リーフへ移すため、`systemd-run --user --scope -p Delegate=yes` の子プロセス（`--scenario`）で 1 つずつ実行する。
+//!
 //! 成功時の最終行: `exec_launch_netns_rootless: rootless exec joined the launch-path netns for loopback and attachable verified (root=false)`。
 
 #[cfg(not(target_os = "linux"))]
@@ -82,6 +84,11 @@ fn main() -> std::process::ExitCode {
         Some("--exec-probe") => {
             let name = args.next().and_then(|a| a.into_string().ok());
             linux::exec_probe(name.as_deref());
+        }
+        Some("--scenario") => {
+            precondition::self_check();
+            let rest: Vec<String> = args.filter_map(|a| a.into_string().ok()).collect();
+            return linux::scenario_main(&rest);
         }
         Some("--ignored") => {
             precondition::self_check();
@@ -468,7 +475,6 @@ mod linux {
             }
             crate::precondition::require_subordinate_ids(euid);
         }
-        let delegated = crate::precondition::delegated_cgroup();
 
         // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す。
         let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
@@ -478,10 +484,13 @@ mod linux {
         if subordinate_requested {
             models.push(true);
         }
+        // `DelegatedCgroup::prepare` は自プロセスを退避リーフへ移すため、1 プロセスで通せる起動は 1 回だけ
+        // （2 回目は「委譲 cgroup に居ない」で拒否される）。シナリオごとに専用の委譲スコープ内の子プロセス
+        // （この試験バイナリの `--scenario`）で実行する。親は cgroup に触れない。
         for mode in [Mode::Loopback, Mode::Attachable] {
             for &subordinate in &models {
                 sequence += 1;
-                scenario(&delegated, mode, subordinate, tag, sequence);
+                run_scenario_in_scope(mode, subordinate, tag, sequence);
             }
         }
 
@@ -495,6 +504,70 @@ mod linux {
             "exec_launch_netns_rootless: rootless exec joined the launch-path netns for loopback and attachable verified (root=false)"
         );
         ExitCode::SUCCESS
+    }
+
+    /// 子プロセス（`--scenario <mode> <0|1> <tag> <sequence>`）の入口。専用の委譲スコープ内で 1 シナリオだけ実行する。
+    pub fn scenario_main(args: &[String]) -> ExitCode {
+        let parsed = match args {
+            [mode, sub, tag, seq] => {
+                let mode = match mode.as_str() {
+                    "loopback" => Some(Mode::Loopback),
+                    "attachable" => Some(Mode::Attachable),
+                    _ => None,
+                };
+                match (mode, sub.as_str(), tag.parse::<u32>(), seq.parse::<u32>()) {
+                    (Some(m), "0" | "1", Ok(t), Ok(q)) => Some((m, sub == "1", t, q)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((mode, subordinate, tag, sequence)) = parsed else {
+            println!("exec_launch_netns_rootless: FAILED: invalid --scenario arguments");
+            return ExitCode::from(1);
+        };
+        let _landlock = crate::precondition::landlock_support();
+        let delegated = crate::precondition::delegated_cgroup();
+        scenario(&delegated, mode, subordinate, tag, sequence);
+        ExitCode::SUCCESS
+    }
+
+    /// 1 シナリオを `systemd-run --user --scope -p Delegate=yes` の子プロセスで実行し、期限つきで成功を確認する。
+    fn run_scenario_in_scope(mode: Mode, subordinate: bool, tag: u32, sequence: u32) {
+        const SCENARIO_DEADLINE: Duration = Duration::from_secs(240);
+        let exe = std::env::current_exe().expect("current exe");
+        let mut child = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"])
+            .arg(&exe)
+            .arg("--scenario")
+            .arg(mode.label())
+            .arg(if subordinate { "1" } else { "0" })
+            .arg(tag.to_string())
+            .arg(sequence.to_string())
+            .spawn()
+            .expect("spawn systemd-run for scenario");
+        let deadline = Instant::now() + SCENARIO_DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait scenario") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "scenario {}-{} exceeded {SCENARIO_DEADLINE:?}",
+                    mode.label(),
+                    privilege_label(subordinate)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(
+            status.success(),
+            "scenario {}-{} failed: {status}",
+            mode.label(),
+            privilege_label(subordinate)
+        );
     }
 
     /// `/data` の準備完了通知（`hostdata/ready` が `READY` になる）を期限つきで待つ。

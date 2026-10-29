@@ -11,6 +11,13 @@
 //!   `FailedPrecondition` とし、chmod で直さない（fail-closed）。
 //! - 既存の `pid` は通常ファイル・所有者 euid・nlink 1 のときだけ消す。それ以外（symlink・ディレクトリ・FIFO 等）は
 //!   `FailedPrecondition`。古い値が残ると準備完了の判定を誤らせるため、spawn の前に必ず消す。
+//! - 古い `pid` の削除は、呼び出し元が prepare の前に観測した同一性（[`RunDirExpectation`]。#3355・CORE-2・REPAIR-5）
+//!   と開いた fd の `(st_dev, st_ino)` が一致するときだけ行う。別物なら `FailedPrecondition` で何も消さない。
+//!   自分が今作ったディレクトリでは古い `pid` を消さない。`prepare` は観測と本処理を続けて行う薄い包みで、
+//!   観測と本処理の間を他者が書き換えうる文脈では排他の下で `prepare_expecting` を使う。
+//! - 残余（REPAIR-3。supervisor のコンテナ単位のプロセス間ロックが担う範囲）: 観測より前に止まった worker は
+//!   新しい世代を「既存」として観測する／同じ既存ディレクトリを 2 者が観測すると同一性が等しく判別できない／
+//!   照合から unlink までの間は原理的に窓が残る（unlink-if-inode の syscall が無い）。
 //! - 残余: 同じ UID による差し替えは信頼の範囲内（防がない）。
 //! - Linux 以外では [`PastaRunDir`] を作れない（`prepare` は Linux のみ。CLI-1）。
 //!
@@ -37,6 +44,8 @@ pub const MSG_PID_PATH: &str = "pasta pid file path is invalid";
 /// 置き場所のディレクトリが基準外（種別・所有者・権限）。
 pub const MSG_DIR_UNTRUSTED: &str =
     "pasta run directory must be a directory owned by the current user with mode 0700";
+/// 観測の後で置き場所が作り直された／作られた（別世代）。何も消さずに終える。
+pub const MSG_DIR_REPLACED: &str = "pasta run directory changed while it was being prepared";
 /// 既存の `pid` が消してよい形でない。
 pub const MSG_PID_ENTRY: &str =
     "existing pasta pid entry is not a regular file owned by the current user with one link";
@@ -67,6 +76,33 @@ pub fn validate_container_id(id: &str) -> Result<(), NetError> {
     }
 }
 
+/// 置き場所ディレクトリの同一性 `(st_dev, st_ino)`（#3355・CORE-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunDirIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl RunDirIdentity {
+    /// デバイス番号。
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+    /// inode 番号。
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
+/// 呼び出し元が prepare の前に観測した `@pasta/<id>` の状態（#3355・CORE-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDirExpectation {
+    /// 観測時点で無かった。
+    Absent,
+    /// 観測時点でこの同一性のディレクトリがあった。
+    Existing(RunDirIdentity),
+}
+
 /// 作成済みの置き場所（`@pasta/<id>/`）。
 ///
 /// spawn の前に `PastaRunDir::prepare` で作る。`pid_path` を pasta の `-P` に渡し、準備完了の判定はこの型が
@@ -88,11 +124,30 @@ impl PastaRunDir {
 #[cfg(target_os = "linux")]
 impl PastaRunDir {
     /// 置き場所を作る（既存なら検査して再利用し、古い `pid` を消す）。
+    ///
+    /// `observe_run_dir` と `prepare_expecting` を続けて呼ぶ薄い包み。観測と本処理の間を他者が書き換えうる
+    /// 文脈では、排他の下で `prepare_expecting` を使う（#3355）。
     pub fn prepare(
         state_root: std::os::fd::BorrowedFd<'_>,
         container_id: &str,
     ) -> Result<Self, NetError> {
-        imp::prepare(state_root, container_id)
+        let expected = observe_run_dir(state_root, container_id)?;
+        Self::prepare_expecting(state_root, container_id, expected)
+    }
+
+    /// 事前の観測 `expected` と照合しながら置き場所を作る。既存のディレクトリが観測と別物なら
+    /// `FailedPrecondition`（[`MSG_DIR_REPLACED`]）で何も消さない。作ったばかりなら古い `pid` は消さない。
+    pub fn prepare_expecting(
+        state_root: std::os::fd::BorrowedFd<'_>,
+        container_id: &str,
+        expected: RunDirExpectation,
+    ) -> Result<Self, NetError> {
+        imp::prepare_expecting(state_root, container_id, expected)
+    }
+
+    /// 保持している `<id>` ディレクトリ fd の同一性。
+    pub fn identity(&self) -> RunDirIdentity {
+        self.held.identity
     }
 
     /// `pid` と `<id>` ディレクトリを消す（存在しなければ成功扱い）。
@@ -104,6 +159,15 @@ impl PastaRunDir {
     pub(super) fn pid_open_path(&self) -> PathBuf {
         imp::pid_open_path(&self.held)
     }
+}
+
+/// prepare の前に `@pasta/<id>` の状態を観測する（無ければ `Absent`）。基準外は `FailedPrecondition`。
+#[cfg(target_os = "linux")]
+pub fn observe_run_dir(
+    state_root: std::os::fd::BorrowedFd<'_>,
+    container_id: &str,
+) -> Result<RunDirExpectation, NetError> {
+    imp::observe(state_root, container_id)
 }
 
 /// CLI の delete が残骸を消す入口。`@pasta/<id>/` が無ければ成功。記録の pid でのプロセスの探索・kill はしない。
@@ -134,6 +198,29 @@ mod imp {
         pasta_dir: OwnedFd,
         id_dir: OwnedFd,
         id: String,
+        pub(super) identity: RunDirIdentity,
+    }
+
+    fn identity_of(m: &Metadata) -> RunDirIdentity {
+        RunDirIdentity {
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
+
+    pub(super) fn observe(
+        state_root: BorrowedFd<'_>,
+        container_id: &str,
+    ) -> Result<RunDirExpectation, NetError> {
+        validate_container_id(container_id)?;
+        let euid = sys::effective_uid();
+        let Some(pasta_dir) = open_checked(state_root, PASTA_DIR_NAME, euid)? else {
+            return Ok(RunDirExpectation::Absent);
+        };
+        let Some(id_dir) = open_checked(pasta_dir.as_fd(), container_id, euid)? else {
+            return Ok(RunDirExpectation::Absent);
+        };
+        Ok(RunDirExpectation::Existing(identity_of(&stat(&id_dir)?)))
     }
 
     fn map_io(e: &io::Error) -> NetError {
@@ -194,16 +281,23 @@ mod imp {
         Ok(Some(fd))
     }
 
-    fn ensure_dir(parent: BorrowedFd<'_>, name: &str, euid: u32) -> Result<OwnedFd, NetError> {
-        match DirBuilder::new()
+    /// 無ければ作って開く。戻りの `bool` は「今回作ったか」。
+    fn ensure_dir(
+        parent: BorrowedFd<'_>,
+        name: &str,
+        euid: u32,
+    ) -> Result<(OwnedFd, bool), NetError> {
+        let created = match DirBuilder::new()
             .mode(0o700)
             .create(proc_path(parent, name))
         {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
             Err(e) => return Err(map_io(&e)),
-        }
-        open_checked(parent, name, euid)?.ok_or_else(|| err(NetErrorCode::Internal, MSG_INTERNAL))
+        };
+        let fd = open_checked(parent, name, euid)?
+            .ok_or_else(|| err(NetErrorCode::Internal, MSG_INTERNAL))?;
+        Ok((fd, created))
     }
 
     /// 既存の `pid` を、消してよい形のときだけ消す。無ければ何もしない。
@@ -226,9 +320,10 @@ mod imp {
         }
     }
 
-    pub(super) fn prepare(
+    pub(super) fn prepare_expecting(
         state_root: BorrowedFd<'_>,
         container_id: &str,
+        expected: RunDirExpectation,
     ) -> Result<PastaRunDir, NetError> {
         validate_container_id(container_id)?;
         let root_path =
@@ -246,15 +341,23 @@ mod imp {
             .map_err(|_| err(NetErrorCode::InvalidArgument, MSG_PID_PATH))?;
 
         let euid = sys::effective_uid();
-        let pasta_dir = ensure_dir(state_root, PASTA_DIR_NAME, euid)?;
-        let id_dir = ensure_dir(pasta_dir.as_fd(), container_id, euid)?;
-        remove_stale_pid(id_dir.as_fd(), euid)?;
+        let (pasta_dir, _) = ensure_dir(state_root, PASTA_DIR_NAME, euid)?;
+        let (id_dir, created) = ensure_dir(pasta_dir.as_fd(), container_id, euid)?;
+        let identity = identity_of(&stat(&id_dir)?);
+        if !created {
+            // 既存を再利用する場合だけ、観測と同一のときに限って古い pid を消す。
+            if expected != RunDirExpectation::Existing(identity) {
+                return Err(err(NetErrorCode::FailedPrecondition, MSG_DIR_REPLACED));
+            }
+            remove_stale_pid(id_dir.as_fd(), euid)?;
+        }
         Ok(PastaRunDir {
             pid_path,
             held: Held {
                 pasta_dir,
                 id_dir,
                 id: container_id.to_owned(),
+                identity,
             },
         })
     }
@@ -382,6 +485,94 @@ mod tests {
         std::fs::create_dir(p.join("elsewhere")).expect("mkdir");
         symlink(p.join("elsewhere"), p.join("@pasta/c1")).expect("symlink");
         let e = PastaRunDir::prepare(f.as_fd(), "c1").expect_err("symlinked id dir");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    fn write_pid(p: &Path, body: &[u8]) {
+        std::fs::write(p.join("@pasta/c1/pid"), body).expect("write pid");
+    }
+
+    /// NET-9・CORE-2: 観測が Absent なのに既存の dir があれば何も消さず拒否する。
+    #[test]
+    fn net9_core2_prepare_refuses_dir_created_after_absent_observation() {
+        let (p, f) = root();
+        let exp = observe_run_dir(f.as_fd(), "c1").expect("observe");
+        assert_eq!(exp, RunDirExpectation::Absent);
+        drop(PastaRunDir::prepare(f.as_fd(), "c1").expect("other generation"));
+        write_pid(&p, b"4242\n");
+        let e = PastaRunDir::prepare_expecting(f.as_fd(), "c1", exp).expect_err("replaced");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_DIR_REPLACED);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// NET-9・CORE-2: 旧い prepare が、作り直された dir の新しい pid を消さない。
+    #[test]
+    fn net9_core2_stale_prepare_keeps_pid_of_recreated_dir() {
+        let (p, f) = root();
+        drop(PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare"));
+        let exp = observe_run_dir(f.as_fd(), "c1").expect("observe");
+        // 旧 inode を退避して生かし、inode の再利用で同一に見えないようにする。
+        std::fs::rename(p.join("@pasta/c1"), p.join("@pasta/old")).expect("rename");
+        std::fs::create_dir(p.join("@pasta/c1")).expect("recreate");
+        std::fs::set_permissions(p.join("@pasta/c1"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        write_pid(&p, b"4242\n");
+        let e = PastaRunDir::prepare_expecting(f.as_fd(), "c1", exp).expect_err("stale");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_DIR_REPLACED);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_prepare_expecting_matching_identity_removes_stale_pid() {
+        let (p, f) = root();
+        drop(PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare"));
+        write_pid(&p, b"1\n");
+        let exp = observe_run_dir(f.as_fd(), "c1").expect("observe");
+        let d = PastaRunDir::prepare_expecting(f.as_fd(), "c1", exp).expect("prepare");
+        assert!(!p.join("@pasta/c1/pid").exists());
+        assert_eq!(RunDirExpectation::Existing(d.identity()), exp);
+        drop(d);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_prepare_on_absent_creates_private_dir_with_identity() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (p, f) = root();
+        let d = PastaRunDir::prepare_expecting(f.as_fd(), "c1", RunDirExpectation::Absent)
+            .expect("prepare");
+        let m = std::fs::symlink_metadata(p.join("@pasta/c1")).expect("md");
+        assert_eq!(m.permissions().mode() & 0o777, 0o700);
+        assert_eq!((d.identity().dev(), d.identity().ino()), (m.dev(), m.ino()));
+        drop(d);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_observe_rejects_symlinked_or_loose_dir() {
+        let (p, f) = root();
+        drop(PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare"));
+        std::fs::set_permissions(p.join("@pasta"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let e = observe_run_dir(f.as_fd(), "c1").expect_err("loose");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        std::fs::set_permissions(p.join("@pasta"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        std::fs::remove_dir_all(p.join("@pasta/c1")).expect("rm");
+        std::fs::create_dir(p.join("elsewhere")).expect("mkdir");
+        symlink(p.join("elsewhere"), p.join("@pasta/c1")).expect("symlink");
+        let e = observe_run_dir(f.as_fd(), "c1").expect_err("symlink");
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         let _ = std::fs::remove_dir_all(&p);
     }

@@ -218,18 +218,16 @@ mod tests {
     use std::io::Write as _;
     use std::os::windows::fs::OpenOptionsExt;
 
-    struct TmpDir(std::path::PathBuf);
+    struct TmpDir(
+        std::path::PathBuf,
+        #[allow(dead_code)] crate::test_root::TestRoot,
+    );
     impl TmpDir {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcio-win-{tag}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&p).expect("temp dir");
-            Self(p)
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            // 排他作成の補助は unix 限定のため、Windows は作成前の削除（A）を使う。
+            let root = crate::test_root::test_root("fcio-win", tag);
+            Self(root.to_path_buf(), root)
         }
         fn open(&self) -> File {
             std::fs::OpenOptions::new()
@@ -239,12 +237,6 @@ mod tests {
                 .expect("open dir")
         }
     }
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// IO-2・IO-3・TASK-15.3: `open_file_beneath` は mode ごとに作成・切り詰め・追記・
     /// 既存のみを使い分け、ディレクトリハンドル直下にだけ作る。
     #[test]

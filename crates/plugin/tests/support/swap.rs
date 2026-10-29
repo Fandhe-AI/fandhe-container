@@ -6,7 +6,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 pub struct Fixture {
     dir: PathBuf,
@@ -15,14 +14,11 @@ pub struct Fixture {
 }
 
 fn unique_dir() -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "swap-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+    // 残骸が残ると `new_rewritable` の `create_new` が衝突するため、取り込み元の試験が持つ
+    // `exclusive_dir` を使う。
+    crate::exclusive_dir::create_in(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")), "swap")
+        .unwrap()
 }
 
 impl Fixture {

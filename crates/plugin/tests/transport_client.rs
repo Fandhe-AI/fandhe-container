@@ -4,6 +4,12 @@
 //! peer UID 不一致（偽 listener）の拒否は別 UID が必要で既定のテスト集合では再現できないため、
 //! 本ファイルの対象外。実機前提テストとして `peer_auth.rs`（TASK-124.4・#295）で扱う。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[cfg(not(unix))]
 #[test]
 fn plug2_connect_is_unimplemented_on_non_unix() {
@@ -24,9 +30,7 @@ mod unix {
         UDS_CONNECT_TIMEOUT_MAX, UdsListener, UdsStream, decode_message, encode_message,
     };
     use std::io::{Read, Write};
-    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -34,13 +38,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcpc-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcpc").unwrap();
             Self(p)
         }
         fn sock(&self) -> PathBuf {

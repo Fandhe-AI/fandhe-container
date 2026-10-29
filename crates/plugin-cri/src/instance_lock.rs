@@ -184,7 +184,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    struct Tmp(std::path::PathBuf);
+    struct Tmp(
+        std::path::PathBuf,
+        #[allow(dead_code)] crate::test_root::TestRoot,
+    );
     impl Tmp {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
@@ -193,19 +196,35 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(&p).expect("mkdir");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-            }
-            Self(p)
+            Self::at(p)
+        }
+
+        /// 指定パスの残骸を消して作る（unix では 0700。REPAIR-12・#3435）。
+        fn at(p: std::path::PathBuf) -> Self {
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（非 root の単体試験）。
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(p, root)
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+
+    /// CRI-2・REPAIR-12・#3435: 残骸（古い `.cri/` の中身）があっても作り直しで空になり、drop で消える。
+    #[test]
+    fn cri2_repair12_ilock_tmp_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!(
+            "fcpc-ilock-residue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(p.join(".cri")).expect("mkdir");
+        fs::write(p.join(".cri").join("stale"), b"old").expect("write");
+        {
+            let t = Tmp::at(p.clone());
+            assert_eq!(fs::read_dir(&t.0).expect("read").count(), 0);
         }
+        assert!(!p.exists());
     }
 
     const SHORT: Duration = Duration::from_millis(200);

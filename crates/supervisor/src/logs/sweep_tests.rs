@@ -5,7 +5,11 @@ use super::*;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::AtomicU64;
 
-struct Tmp(std::path::PathBuf);
+/// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+struct Tmp(
+    std::path::PathBuf,
+    #[allow(dead_code)] crate::test_root::TestRoot,
+);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
@@ -15,9 +19,9 @@ impl Tmp {
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
-        std::fs::create_dir_all(&p).expect("tmp");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        Self(p)
+        // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+        let root = crate::test_root::test_root_at(p.clone());
+        Self(p, root)
     }
 
     fn names(&self) -> Vec<String> {
@@ -29,12 +33,6 @@ impl Tmp {
             .unwrap_or_default();
         v.sort();
         v
-    }
-}
-
-impl Drop for Tmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

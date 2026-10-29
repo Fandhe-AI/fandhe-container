@@ -29,11 +29,9 @@ use fandhe_container_plugin::{
     ResidentPlugin, ResidentStartTimeout, UdsStream, call_once,
 };
 use std::ffi::OsString;
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -189,23 +187,42 @@ fn plugin_spec(dir: &Path) -> PluginLaunchSpec {
     PluginLaunchSpec::new(crate::exe_target(), args, dir.to_path_buf()).unwrap()
 }
 
+// 残骸・PID 再利用と衝突しない排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fcsf-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-        Self(p)
+        Self(exclusive_dir::create("fcsf").expect("exclusive test dir"))
     }
 }
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// PLUG-7・REPAIR-12・#3435: 前回の残骸（`fcsf-<pid>-0` と中身）があっても、`exclusive_dir` は
+/// 残骸を消さずに連番を進め、新しい空の 0700 のディレクトリを返す。
+#[test]
+fn plug7_repair12_exclusive_dir_skips_stale_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = test_root::test_root("fcsf-residue", "parent");
+    let stale = parent.join(format!("fcsf-{}-0", std::process::id()));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("old"), b"stale").unwrap();
+    let fresh = exclusive_dir::create_in(&parent, "fcsf").unwrap();
+    assert_eq!(fresh, parent.join(format!("fcsf-{}-1", std::process::id())));
+    assert_eq!(std::fs::read(stale.join("old")).unwrap(), b"stale");
+    assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 /// 補助コマンド（`kill`）の待ち上限（REPAIR-5）。

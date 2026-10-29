@@ -9,6 +9,12 @@
 //! 往復シナリオと、待機処理が無期限ブロックへ退行した場合でもテスト自身が
 //! ハングせず失敗するためのウォッチドッグを担う。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[cfg(not(unix))]
 #[test]
 fn plug5_ack_timeout_requires_unix_transport() {
@@ -29,9 +35,7 @@ mod unix {
         decode_message, encode_message,
     };
     use std::io::Write;
-    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -41,13 +45,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcpt-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcpt").unwrap();
             Self(p)
         }
         fn sock(&self) -> PathBuf {

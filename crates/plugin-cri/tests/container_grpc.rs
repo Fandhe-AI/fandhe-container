@@ -28,6 +28,10 @@
 
 #![cfg(target_os = "linux")]
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -35,7 +39,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,17 +89,9 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fccg-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&p)
-            .expect("create temp dir");
-        Self(p)
+        // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+        // 別 UID（root）の `#[ignore]` の場面を持つ試験があるため、予測できる名前を消す補助は使わない。
+        Self(exclusive_dir::create(&format!("fccg-{tag}")).expect("create temp dir"))
     }
 }
 

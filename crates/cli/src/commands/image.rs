@@ -747,7 +747,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// 試験用の一時ディレクトリ（drop で削除）。
-    struct Tmp(PathBuf);
+    /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
@@ -756,14 +757,10 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root_at(p.clone());
             std::fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod");
-            }
-            Tmp(p)
+            Tmp(p, root)
         }
         fn path(&self) -> &Path {
             &self.0
@@ -781,12 +778,6 @@ mod tests {
             self.0.join("blobs").join("sha256").join(hex).exists()
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn dg(c: char) -> Digest {
         Digest::parse(&format!(
             "sha256:{}",

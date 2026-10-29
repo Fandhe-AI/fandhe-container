@@ -247,6 +247,10 @@ impl Relauncher for NoSpecRelauncher {
 /// 読み手が止まって pipe が満杯でも、呼び出し側は期限で次へ進める（起動済みプロセスの監視・回収を止めない）。
 /// 期限後も書き込みスレッドは残り得るが、完了すれば終わる。1 回の `write_all` を 1 スレッドで行うため、
 /// 単一スレッド前提の区間（`oci_runtime::start` より前）の成功経路では使わない。
+///
+/// 契約（SUP-1・#3453・#2070）: 書き込みが期限内に終わって戻った時点で、作業スレッドは書き手への参照を
+/// 手放し終えている。戻った後にこの値を drop すれば書き手（結果チャネルの複製 fd）は同期的に閉じる。
+/// 期限超過（`TimedOut`）のときは、作業スレッドの書き込みが終わるまで書き手は開いたまま残る（従来どおりの残余）。
 pub struct BoundedWriter<W: Write + Send + 'static> {
     inner: Arc<Mutex<W>>,
     deadline: Duration,
@@ -288,8 +292,14 @@ impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
         std::thread::Builder::new()
             .name("supervisor-write".into())
             .spawn(move || {
-                let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
-                let result = guard.write_all(&data).and_then(|()| guard.flush());
+                let result = {
+                    let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.write_all(&data).and_then(|()| guard.flush())
+                };
+                // 結果を送る前に書き手への参照を手放す。送った後まで持つと、呼び出し側が戻って
+                // `BoundedWriter` を drop しても書き手（結果チャネルの複製 fd）が閉じず、入口の後の
+                // fd 走査に fd 3 が見える窓ができる（#3453・#2070）。
+                drop(inner);
                 let _ = tx.send(result);
             })
             .map_err(|_| std::io::Error::other("failed to spawn the write thread"))?;

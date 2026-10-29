@@ -885,6 +885,43 @@ fn repair5_bounded_writer_times_out_on_stuck_reader() {
     let _ = release.send(());
 }
 
+/// drop されたことを印に残す書き手。
+struct DropFlagWriter(Arc<std::sync::atomic::AtomicBool>);
+
+impl Write for DropFlagWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DropFlagWriter {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// SUP-1・REPAIR-5・SEC-1（#3453・#2070）: 書き込みが成功して戻った後に `BoundedWriter` を drop すれば、
+/// 作業スレッドの完了を待たずに書き手が同期的に閉じる（入口の後に結果チャネルの複製 fd が残らない）。
+#[test]
+fn sup1_3453_bounded_writer_releases_inner_before_returning() {
+    for round in 0..300 {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut w = fandhe_container_supervisor::start_entry::BoundedWriter::new(
+            DropFlagWriter(Arc::clone(&dropped)),
+            Duration::from_secs(5),
+        );
+        w.write_all(b"FCSUP1 OK 1\n").unwrap();
+        drop(w);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "writer still alive after BoundedWriter drop (round {round})"
+        );
+    }
+}
+
 /// CORE-2・CORE-3・SEC-1: 準備した cgroup の世代と launch 時点（起動権の予約の後）のレコードが食い違えば
 /// （準備の後に同じ ID が削除・再作成された）launch せず、予約を Created へ戻して準備した cgroup を消す。
 #[test]

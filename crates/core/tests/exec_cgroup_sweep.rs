@@ -15,6 +15,9 @@
 //! プロセスの居るものを残す、(2) delete 前の掃除（`ContainerCgroupRemover::remove`）が空のものとプロセスの
 //! 居るものを両方消し、コンテナ cgroup の削除が成功し、その件数が注入した記録器に載る、の 2 点。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 // 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
@@ -144,7 +147,10 @@ mod linux {
         assert_eq!(counts("exec_cgroup_sweep_kill_all"), (1, 0));
         assert_eq!(counts("exec_cgroup_sweep_kill_all_child"), (2, 0));
         assert!(!container_dir.exists());
-        let _ = command.wait();
+        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::REAP_WITHIN) {
+            crate::reap::reap_or_report(&mut command, crate::reap::REAP_WITHIN);
+            panic!("exec child did not exit after the cgroup sweep: {e}");
+        }
         wait_until("all processes of D to be gone", || {
             members.iter().all(|p| !pid_exists(*p))
         });

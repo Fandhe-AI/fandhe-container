@@ -24,6 +24,9 @@
 //! 段階的な同期で必ず作る。子は途中の `SAME_ID_CHECKPOINT` 回で止まり、親が途中値を観測して
 //! resume マーカーを書いてから残りを再開する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 /// OCI-5・SEC-4・CLI-1（#2247）: macOS では `open` が通り、状態ルートが 0700 で作られる。
 #[cfg(target_os = "macos")]
 #[test]
@@ -186,8 +189,7 @@ mod linux {
 
         /// kill して回収し、出力を返す。
         fn kill_and_output(&mut self) -> String {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_or_report(&mut self.child, crate::reap::REAP_WITHIN);
             self.output()
         }
     }
@@ -574,8 +576,7 @@ mod linux {
         assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
         assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
         // 保持側を終わらせると（OS がロックを解放）書ける。失敗した更新は反映されていない。
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
         let cur = store.get(&GetStateRequest::new(cid("web"))).unwrap();
         assert_eq!(cur, rec);
         let next = store

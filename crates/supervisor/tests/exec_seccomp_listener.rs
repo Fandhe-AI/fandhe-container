@@ -18,6 +18,9 @@
 //!
 //! fork は単一スレッドの呼び出し元を要求するため、libtest ではなく `harness = false` の単一スレッド `main` で動かす。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -238,8 +241,7 @@ mod linux {
                 break status;
             }
             if started.elapsed() > Duration::from_secs(60) {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("the child did not finish within 60s");
             }
             std::thread::sleep(Duration::from_millis(20));

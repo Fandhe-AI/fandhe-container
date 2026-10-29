@@ -48,6 +48,9 @@
 //! `make test-integration`）で実行する。fork は呼び出しプロセスが単一スレッドであることを要求するため、
 //! libtest ではなく `harness = false` の単一スレッド `main` で動かす。非 Linux では対象外（OS 非該当）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("exec_child_setup: Linux only, not applicable on this OS");
@@ -269,8 +272,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = script.kill();
-                let _ = script.wait();
+                crate::reap::reap_or_report(&mut script, crate::reap::REAP_WITHIN);
                 panic!("`script` did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -659,8 +661,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("the fsize child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -801,8 +802,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("the noexec mount child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1030,8 +1030,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("the groups child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1144,8 +1143,7 @@ exec "$2" "$3" "$1""#;
                     break status;
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("closed {closed}: the child timed out");
                 }
                 std::thread::sleep(Duration::from_millis(10));

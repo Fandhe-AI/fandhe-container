@@ -17,6 +17,9 @@
 //! 参加は fork した子が `cgroup.procs` へ `0` を書く操作で、ここではシェルが同じ書き込みを行って再現する
 //! （`spawn_exec_command` の子での参加は、root を要する `fandhe-container-supervisor` の `tests/exec.rs` が通す）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 // 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
@@ -122,7 +125,8 @@ mod linux {
         assert!(members.contains(&command.id()));
 
         command.kill().expect("kill the direct child only");
-        command.wait().expect("reap the direct child");
+        crate::reap::reap(&mut command, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("reap the direct child: {e}"));
         wait_until("the direct child to leave the cgroup", || {
             !pids_in(&exec_dir).contains(&command.id())
         });
@@ -170,7 +174,10 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &again, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        let _ = command.wait();
+        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::REAP_WITHIN) {
+            crate::reap::reap_or_report(&mut command, crate::reap::REAP_WITHIN);
+            panic!("stubborn exec child did not exit after its cgroup was removed: {e}");
+        }
         assert!(!container_dir.join(again.as_str()).exists());
 
         // (3) 親（コンテナ cgroup）の pids.max が子 cgroup のプロセスにも掛かり、親の pids.current に計上される。
@@ -228,7 +235,10 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &limited, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        let _ = forker.wait();
+        if let Err(e) = crate::reap::wait_within(&mut forker, crate::reap::REAP_WITHIN) {
+            crate::reap::reap_or_report(&mut forker, crate::reap::REAP_WITHIN);
+            panic!("forker did not exit after its cgroup was removed: {e}");
+        }
 
         delegated
             .remove_child(&container)

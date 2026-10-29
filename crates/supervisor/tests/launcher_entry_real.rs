@@ -14,6 +14,9 @@
 //! `CapPrm`・`CapEff`・`CapAmb`・`CapBnd` が必要最小集合 `0000000028201122` ちょうどであることを照合する。
 //! 実行と結果の記録は人間担当（#538・#539）。Linux 限定。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("launcher_entry_real: Linux only, not applicable on this OS");
@@ -247,8 +250,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 let _ = std::fs::remove_dir_all(dir);
                 panic!("launcher did not exit within the timeout");
             }

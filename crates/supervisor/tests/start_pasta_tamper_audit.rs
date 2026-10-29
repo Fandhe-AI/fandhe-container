@@ -8,6 +8,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[path = "../../core/tests/support/scratch_root.rs"]
 mod scratch_root;
 
@@ -126,8 +129,7 @@ fn run_start(env: &Env, id: &str) -> (Option<i32>, String, String) {
             break s;
         }
         if start.elapsed() > CHILD_DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("supervisor did not exit within the deadline");
         }
         std::thread::sleep(Duration::from_millis(10));

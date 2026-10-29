@@ -10,6 +10,9 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroup_companions_evacuate-XXXX> --ignored
 //! ```
 
+#[path = "support/reap.rs"]
+mod reap;
+
 // 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
@@ -64,7 +67,6 @@ mod linux {
         );
 
         delegated.remove_child(&child).expect("remove child");
-        let _ = helper.kill();
-        let _ = helper.wait();
+        crate::reap::reap_or_report(&mut helper, crate::reap::REAP_WITHIN);
     }
 }

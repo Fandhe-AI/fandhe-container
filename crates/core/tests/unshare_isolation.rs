@@ -27,6 +27,9 @@
 //! 制限を緩めた上で `--ignored` 付きで実行する（#1159）。実行された場合は分離の拒否を含め
 //! あらゆる失敗を失敗として扱い、検証せずに成功終了する分岐は持たない。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("unshare_isolation: Linux only, not applicable on this OS");
@@ -163,8 +166,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -239,8 +241,7 @@ mod linux {
         let pid = child.id();
         let overall = Instant::now() + timeout() * 3;
         let fail = |child: &mut std::process::Child, msg: &str| -> ! {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
             let out = std::fs::read_to_string(&log).unwrap_or_default();
             let _ = std::fs::remove_file(&log);
             panic!("{msg}\n{out}");

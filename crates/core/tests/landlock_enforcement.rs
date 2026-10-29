@@ -11,6 +11,9 @@
 //!
 //! root・KVM 等は不要で、カーネル版数に依存しない形で既定のテスト集合で動く。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("landlock_enforcement: Linux only, not applicable on this OS");
@@ -131,8 +134,7 @@ fn main() {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 let _ = std::fs::remove_dir_all(&dir);
                 panic!("landlock_enforcement child {mode} timed out");
             }

@@ -75,6 +75,9 @@
 //! subuid / subgid）は、1 行目が `exec_setns_join: PRECONDITION FAILED (test environment, ...)` になる
 //! （分類元は core の `tests/support/precondition.rs`。#2957・SUP-6・REPAIR-12）。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 #[path = "../../core/tests/support/precondition.rs"]
 mod precondition;
@@ -209,8 +212,7 @@ mod linux {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = self.unshare.kill();
-            let _ = self.unshare.wait();
+            crate::reap::reap_on_drop(&mut self.unshare);
         }
     }
 
@@ -501,8 +503,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = joiner.kill();
-                let _ = joiner.wait();
+                crate::reap::reap_or_report(&mut joiner, crate::reap::REAP_WITHIN);
                 panic!("joiner {joiner_flag} did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));

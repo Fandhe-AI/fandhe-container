@@ -60,6 +60,9 @@
 //!   登録済みで、fork 子での観測は CI で継続して確かめられる
 //! - 移す条件（後続）: `config_paths` / `sysfs` を受け取る exec 経路の入口を足すときは、`platform-ci` の成功行の照合も同じ変更で更新する
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("sysfs_mount: Linux only, not applicable on this OS");
@@ -815,8 +818,7 @@ mod linux {
             match child.try_wait().expect("try_wait") {
                 Some(status) => return Some(status),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
                     return None;
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

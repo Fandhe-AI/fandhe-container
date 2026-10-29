@@ -6,6 +6,9 @@
 //! 前後で `/proc/self/fd` を記録する。閉じた fd 0〜2 は Rust std が `main` の前に `/dev/null` で埋める。fd 1 が埋まった
 //! 場合は結果チャネルの FIFO 検査が拒否する。Linux 限定。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("inherited_fds: Linux only, not applicable on this OS");
@@ -145,8 +148,7 @@ exec "$0" "$@""#;
                 break s;
             }
             if start.elapsed() > CHILD_TIMEOUT {
-                let _ = c.kill();
-                let _ = c.wait();
+                crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
                 panic!("inherited_fds: child timed out ({scenario})");
             }
             std::thread::sleep(Duration::from_millis(20));

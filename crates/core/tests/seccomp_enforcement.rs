@@ -16,6 +16,9 @@
 //! 判別できる文言で panic する（#2235・ESC-06。方針は `AGENTS.md` の `seccomp_enforcement`）。
 //! 終了コードとマーカーの両方が揃ったときだけ前提欠如として扱い、それ以外は汎用の失敗にする。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 #[path = "support/proc_status.rs"]
 mod proc_status;
@@ -229,8 +232,7 @@ fn main() {
             }
             if Instant::now() >= deadline {
                 let diag = crate::proc_status::excerpt(child_pid);
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("seccomp_enforcement child timed out ({diag})");
             }
             std::thread::sleep(Duration::from_millis(20));

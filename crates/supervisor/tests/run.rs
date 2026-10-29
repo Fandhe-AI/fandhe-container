@@ -12,6 +12,9 @@
 //! root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため、ストアを使う試験は
 //! `linux` モジュールに置く（非 Linux の fail-closed は `state_store_wiring.rs` が照合済み）。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -130,8 +133,7 @@ impl LaunchedProcess for ChildProcess {
 impl Drop for ChildProcess {
     fn drop(&mut self) {
         if let Ok(c) = self.child.get_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
+            crate::reap::reap_on_drop(c);
         }
     }
 }

@@ -48,6 +48,11 @@ fn main() -> std::process::ExitCode {
 #[path = "../../core/tests/support/scratch_root.rs"]
 mod scratch_root;
 
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Read;
@@ -179,8 +184,7 @@ mod linux {
                 return Ok(st);
             }
             if Instant::now() >= deadline {
-                let _ = c.kill();
-                let _ = c.wait();
+                super::reap::reap_or_report(&mut c, super::reap::REAP_WITHIN);
                 return Err(format!("{what} timed out (REPAIR-5)"));
             }
             std::thread::sleep(POLL);

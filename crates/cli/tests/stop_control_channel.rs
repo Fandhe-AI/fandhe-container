@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[path = "support/reap.rs"]
+mod reap;
+
 use fandhe_container_cli::commands::run_to;
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
@@ -473,8 +477,9 @@ fn sec1_err2_kill_without_supervisor_is_unavailable_and_does_not_kill() {
     let env = running_container("killnosup", child.id());
     let (code, _out, err) = kill_cmd(&env, &[]);
     let alive = child.try_wait().unwrap().is_none();
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(e) = reap::reap(&mut child, reap::REAP_WITHIN) {
+        panic!("{e}");
+    }
     assert_eq!(code, 9);
     assert_eq!(
         err,
@@ -518,8 +523,9 @@ fn sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill() {
     let env = running_container("stopnosup", child.id());
     let (code, _out, err) = stop(&env);
     let alive = child.try_wait().unwrap().is_none();
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(e) = reap::reap(&mut child, reap::REAP_WITHIN) {
+        panic!("{e}");
+    }
     assert_eq!(code, 9);
     assert_eq!(
         err,

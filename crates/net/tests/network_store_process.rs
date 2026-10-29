@@ -20,8 +20,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName, NetworkResourceNames};
 use fandhe_container_net::network_store::{
-    MemberId, MemberIntent, MemberRecord, NetworkDefinition, NetworkStore, RealizedIntent,
-    RealizedOp, RealizedRecord, rebuild_ipam,
+    HostGeneration, MemberId, MemberIntent, MemberRecord, NetnsIdentity, NetworkDefinition,
+    NetworkStore, RealizedIntent, RealizedOp, RealizedRecord, rebuild_ipam,
 };
 
 const ENV_ROOT: &str = "FC_STORE_HELPER_ROOT";
@@ -203,6 +203,14 @@ fn ep_token(ep: &str) -> String {
 }
 
 /// `realized` を FCREA1 の正準形で組む（`CreatedNetwork` は外から作れないため復号経由）。
+fn fixed_generation() -> HostGeneration {
+    HostGeneration::new(
+        "0123abcd-4567-89ab-cdef-0123456789ab",
+        NetnsIdentity::new(5, 4026531833),
+    )
+    .unwrap()
+}
+
 fn realized_record() -> RealizedRecord {
     let names = NetworkResourceNames::derive(&NetworkName::new("web").unwrap()).unwrap();
     let mut text = String::from("FCREA1\n");
@@ -234,7 +242,15 @@ fn helper_write_records() {
     let g = store.lock_global_exclusive().unwrap();
     let n = g.lock_network(&name).unwrap();
     n.write_realized_intent(
-        &RealizedIntent::new(RealizedOp::Create, name, BRIDGE_TOKEN, pfx(0, 24)).unwrap(),
+        &RealizedIntent::new(
+            RealizedOp::Create,
+            name,
+            BRIDGE_TOKEN,
+            pfx(0, 24),
+            pfx(1, 24),
+            fixed_generation(),
+        )
+        .unwrap(),
     )
     .unwrap();
     n.commit_realized(&realized_record()).unwrap();

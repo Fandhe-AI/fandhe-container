@@ -208,6 +208,14 @@ name = "network_publish_record_privileged"
 path = "tests/network_publish_record_privileged.rs"
 harness = false
 
+# 残った `realized.intent` のカーネル照合（昇格・巻き戻し・据え置き・削除の完了）と実体の無い `members-intent` の掃除の
+# 実機結合試験（NET-1・NET-7・REPAIR-4・REPAIR-12・#3346）。root と `unshare --net --mount`、`nft`、`ip` が要るため
+# harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_reconcile_privileged"
+path = "tests/network_reconcile_privileged.rs"
+harness = false
+
 # 実際の pasta を本番の API（検証・置き場所・ポート公開・起動・停止）と netns holder に通す実機前提テスト
 # （NET-9・SEC-5・CORE-6・REPAIR-5・REPAIR-12・#1941）。再入のため harness = false。root 不要・pasta と非特権 user
 # namespace が要るため `-- --ignored` 指定時のみ実行する。CI のランナーには pasta が無いため CI では実行せず、

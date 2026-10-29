@@ -210,6 +210,8 @@
 | masquerade と `ip_forward` | net に `bitwise` / `meta` の expr と、postrouting の masquerade（出口が bridge 以外）を足す。host の `ip_forward` は net が変更しない方針のまま（NET-10 の診断で案内する） |
 | `eth0` へのリネーム | attach で peer を netns へ移した後、`IFLA_IFNAME` で `eth0` に変える（`LinkSet` に足す） |
 
+D11 の実装状況（#3346・NET-1・NET-7・REPAIR-4）: 残った `realized.intent` のカーネル照合と実体の無い `members-intent/*` の掃除は `crates/net/src/network/reconcile.rs` が行い、`recorded` の Linux ラッパー 4 本の先頭と公開入口 `reconcile_network_recorded` から呼ぶ。判定表と残余は同ファイルのモジュール doc を正とする。表の記述との差は 3 点ある。(1) 巻き戻しに失敗したときは、`FailedCreateClaim` 相当の請求書へ移さず意図記録を残して次の照合が再試行する（`@networks` 経路で請求書を消費する結線が未実装で、移すと別の記録で同じく止まるだけのため）。(2) `RealizedIntent`（FCRIN1）に gateway を必須項目として足した（昇格で `realized` を組み直すため。出荷済みの書き込み側が無いので magic は変えず、旧形式は `DataLoss`）。(3) pin の不存在確認に置き場が要るため、`attach` が仕様の `netns_dir` を `members-intent`（FCMIN1 の任意項目 `netns-dir`）に記録し、掃除は意図記録ごとの置き場で確かめる（接続ごとに置き場が違いうるため、呼び出しごとの単一の置き場は使わない。置き場の無い旧形式は `PinUnknown` で残す）。`delete_network_recorded` の先頭の照合が前回途中で落ちた削除を完了させたときは、それを成功として返す。`members-intent` は、確定記録・attach の請求書・host veth・pin・DNAT の帳尻のいずれかで実体の存在を否定できないものを消さない。手動回収は `docs/setup/network-reclaim-recovery.md`。
+
 ### D12 netns への参加方法（rootful bridge）
 
 - **決定**: `NetworkPlugin::create_netns` が返す pin のパス（netns の置き場の配下）と (dev, ino) を、supervisor が launcher のオプション（参加指定）で core へ渡す。core は `NamespaceJoin` を network に広げて検証する（#2872・#2776 と同じ流儀）。
@@ -355,7 +357,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3064 | core: rootless の `CLONE_NEWNET` と `lo` の up（D6） | runtime-builder | #3058 | 実装済み（PR #3195） |
 | #3065 | supervisor: 起動オプション文書の kind 追加と net での再検証（D4・D5） | runtime-builder | #3058 | 実装済み（PR #3194） |
 | #3059 | net: ネットワーク定義の状態ストア（D10） | net-builder | なし | 実装済み（PR #3188） |
-| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 実装済み（記録と合成。残った意図記録のカーネル照合・実体の無い意図記録の掃除は後続。下の注） |
+| #3067 | net: メンバー記録・IPAM の再構成・`realized`（D11） | net-builder | #3059 | 実装済み（記録と合成。残った意図記録のカーネル照合・実体の無い意図記録の掃除は #3346 で実装済み。下の注） |
 | #3066 | cli: `network create/rm/ls`（D10） | cli-stack-builder | #3059 | 実装済み（rootful の create は D13 待ちで `UNIMPLEMENTED`） |
 | #3068 | net: 公開ハンドルとテーブル handle の記録と照合（D11） | net-builder | #3067 | 実装済み（個別解除まで。記録だけでの detach は #3347 で実装済み・`PortRegistry` の組み直しは後続。下の注） |
 | #3347 | net: 再起動後に記録だけから行う detach の入口（D11。#3068 の残り） | net-builder | #3067・#3068 | 実装済み（`detach_member_recorded`。ホストの再起動をまたぐ回収・supervisor / plugin-cri の結線は後続。下の注） |

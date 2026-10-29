@@ -141,6 +141,8 @@ pub mod listener_dump;
 mod masquerade;
 pub mod publish;
 #[cfg(target_os = "linux")]
+pub mod reconcile;
+#[cfg(target_os = "linux")]
 pub mod recorded;
 pub mod unpublish;
 
@@ -581,6 +583,26 @@ impl FailedCreateClaim {
     /// 回収側（`delete.rs`）が所有の証明に使うトークン。
     pub(crate) fn token(&self) -> &str {
         &self.token
+    }
+
+    /// 照合（`network::reconcile`）が、所有を証明できた資源だけを対象にした巻き戻しの請求書を作る。
+    /// トークンがネットワークの発行形式でない・対象が 0 件なら `InvalidArgument`。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn for_reconcile(
+        network: NetworkName,
+        token: &str,
+        bridge: bool,
+        table: bool,
+    ) -> Result<Self, NetError> {
+        if !(bridge || table) || !token_names_network(token, &network) {
+            return Err(invalid("reconcile claim is invalid"));
+        }
+        Ok(Self {
+            network,
+            token: token.to_owned(),
+            bridge,
+            table,
+        })
     }
 
     /// テスト用の組み立て（別ネットワークのトークン等の不正な請求書を作る）。
@@ -1336,6 +1358,12 @@ impl ContainerAttachSpec {
     /// エンドポイント ID。
     pub fn endpoint(&self) -> &EndpointId {
         &self.endpoint
+    }
+
+    /// netns の pin の置き場（照合の掃除が pin の不存在確認に使う。#3346）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn netns_dir(&self) -> &Path {
+        &self.netns_dir
     }
 
     /// netns の pin 先パス（`netns_dir` 直下に ID 名のファイル）。

@@ -374,7 +374,7 @@ fn prove_bridge<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> BridgeProof 
 }
 
 /// 専用 nft テーブルの所有確認の結果。作成時に `NFTA_TABLE_USERDATA` へ載せたトークンの一致で証明する。
-enum TableProof {
+pub(super) enum TableProof {
     /// トークンが一致した。削除に使うハンドル。
     Owned(u64),
     /// テーブルが無い（前回の削除で解放済み）。
@@ -393,7 +393,7 @@ fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> Tab
 }
 
 /// テーブル照会の結果を所有の証明へ写す（`prove_table_token` と、公開の個別解除の所有確認が共用する）。
-fn judge_table_info(info: Result<TableInfo, NetError>, token: &str) -> TableProof {
+pub(super) fn judge_table_info(info: Result<TableInfo, NetError>, token: &str) -> TableProof {
     match info {
         Err(e) if e.code() == NetErrorCode::NotFound => TableProof::Absent,
         Err(e) => TableProof::Unproven(e),
@@ -1238,11 +1238,11 @@ fn delete_bridge<O: DeleteOps>(
 /// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。`deadline` があれば手順全体の
 /// 期限で、各要求の期限をその残り時間で切り詰める（`detach_container`。#3258）。
 #[cfg(target_os = "linux")]
-struct LinuxDeleteOps<'a> {
-    route: &'a NetlinkRouteSocket,
-    nft: &'a NetlinkNetfilterSocket,
-    timeout: Duration,
-    deadline: Option<crate::sys::Deadline>,
+pub(super) struct LinuxDeleteOps<'a> {
+    pub(super) route: &'a NetlinkRouteSocket,
+    pub(super) nft: &'a NetlinkNetfilterSocket,
+    pub(super) timeout: Duration,
+    pub(super) deadline: Option<crate::sys::Deadline>,
 }
 
 #[cfg(target_os = "linux")]

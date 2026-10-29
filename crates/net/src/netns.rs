@@ -1158,6 +1158,13 @@ pub(crate) fn pin_exists_in(
         Err(e) => Err(PinCheckError::Pin(io_error("stat netns pin", &e))),
     }
 }
+/// 置き場 `dir` を [`open_pin_dir`] と同じ検査で開き、その識別子 (st_dev, st_ino) を返す。何も変更しない。
+/// attach の意図記録が接続前の置き場の同一性を控え、後の照合（`network::reconcile`）が置き場の移動・
+/// 差し替えを見分けるために使う（NET-1・SEC-1・#3346）。検査に通らない・開けない場合は `None`。
+pub(crate) fn pin_dir_identity(dir: &Path) -> Option<(u64, u64)> {
+    open_pin_dir(dir).ok().map(|p| p.id)
+}
+
 /// 固定設定の置き場 `dir` の直下に `id` 名の pin が無いことを確かめる（attach の取り残しの回収用。#2681）。
 ///
 /// 置き場は作成時と同じ検査（[`open_pin_dir`]）を通して fd で固定し、固定した fd 経由で `lstat` する。

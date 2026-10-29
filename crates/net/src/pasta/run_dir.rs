@@ -16,7 +16,7 @@
 //!   自分が今作ったディレクトリでは古い `pid` を消さない。`prepare` は観測と本処理を続けて行う薄い包みで、
 //!   観測と本処理の間を他者が書き換えうる文脈では排他の下で `prepare_expecting` を使う。
 //! - 削除も照合した置き場所に束縛する（#3411・CORE-2・REPAIR-5）。`PastaRunDir::remove` は保持 fd の同一性、
-//!   [`remove_pasta_run_dir_expecting`] は呼び出し元が控えた同一性、`remove_pasta_run_dir` は自分の観測に束縛する。
+//!   `remove_pasta_run_dir_expecting` は呼び出し元が控えた同一性、`remove_pasta_run_dir` は自分の観測に束縛する。
 //!   中身（`pid`）は照合済みの fd 起点で消し、最後の `rmdir` の直前に親の fd 起点で名前の先の同一性を取り直す。
 //!   別物（作り直された新しい世代・symlink・非ディレクトリ）なら [`RunDirRemoval::NotOurs`] で何も消さない。
 //! - 残余（REPAIR-3。supervisor のコンテナ単位のプロセス間ロックが担う範囲）: 観測より前に止まった worker は
@@ -202,7 +202,7 @@ pub fn remove_pasta_run_dir_expecting(
 
 /// CLI の delete が残骸を消す入口。`@pasta/<id>/` が無ければ成功。記録の pid でのプロセスの探索・kill はしない。
 ///
-/// 観測（`observe_run_dir`）と [`remove_pasta_run_dir_expecting`] を続けて呼ぶ薄い包み。観測から削除までの間に
+/// 観測（`observe_run_dir`）と `remove_pasta_run_dir_expecting` を続けて呼ぶ薄い包み。観測から削除までの間に
 /// 置き場所が替わったら `FailedPrecondition`（[`MSG_DIR_REPLACED`]）で何も消さない（#3411）。
 #[cfg(target_os = "linux")]
 pub fn remove_pasta_run_dir(

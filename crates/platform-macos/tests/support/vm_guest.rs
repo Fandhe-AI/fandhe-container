@@ -4,6 +4,9 @@
 //! （kernel・initrd・disk・cmdline）の読み取りと同じ `VmConfigSpec` の組み立てを複製していたため 1 本にまとめる。
 //! `Vm::launch` の呼び出し・待ちループ・期限は各試験に残す（計測の意味が違うため共通化しない）。
 //!
+//! 取り込み側は `vm_boot.rs`・`vm_cold_start.rs` に加え、`virtiofs_io.rs`・`virtiofs_link.rs`（#3456）。
+//! kernel 未設定時の panic 文言は呼び出し側が渡す。`virtiofs_link.rs` は disk を使わない（読むだけで無視する）。
+//!
 //! 取り込み側は macOS 限定にし、`#[path = "support/common.rs"] mod common;` を先にトップレベルで宣言すること
 //! （本ファイルは `super::common` を参照する）。
 
@@ -20,6 +23,10 @@ use super::common::env_path;
 pub struct GuestAssets {
     pub kernel: PathBuf,
     pub initrd: Option<PathBuf>,
+    #[allow(
+        dead_code,
+        reason = "取り込み側の試験 target によっては使わない（各 tests/*.rs は別 crate）"
+    )]
     pub disk: Option<PathBuf>,
     pub cmdline: String,
 }
@@ -41,6 +48,10 @@ impl GuestAssets {
 }
 
 /// ゲスト資産とコンソールログから `VmConfigSpec` を組み立てる。VM を持つ前なので設定誤りは panic でよい。
+#[allow(
+    dead_code,
+    reason = "取り込み側の試験 target によっては使わない（各 tests/*.rs は別 crate）"
+)]
 pub fn console_boot_spec(g: &GuestAssets, log: &Path) -> VmConfigSpec {
     let blocks = g
         .disk

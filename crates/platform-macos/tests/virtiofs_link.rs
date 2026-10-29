@@ -36,9 +36,11 @@ use fandhe_container_platform_macos::virtiofs::{
 
 #[path = "support/common.rs"]
 mod common;
-use common::{Scratch, env_path};
+use common::Scratch;
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
+#[path = "support/vm_guest.rs"]
+mod vm_guest;
 use harness::{launch_until_done, resolve_probe_timeout};
 
 /// ホストが `rw/` で観察するエントリ名の最大件数（想定外のエントリの列挙上限）。
@@ -229,25 +231,27 @@ fn mac1_sec4_link_fixture_layout() {
     );
 }
 
+/// kernel 未設定時の panic 文言（必須・任意の環境変数の一覧）。
+const KERNEL_HELP: &str = "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
+             FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
+             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md.";
+
 /// 実機で VM を起動して観測を走らせ、停止後に確定したログを返す。
 fn boot_and_observe(tag: &str) -> (Fixture, LinkLog, String) {
-    let kernel = env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
-        panic!(
-            "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
-             FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
-             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
-        )
-    });
-    let initrd = env_path("FANDHE_CONTAINER_MACOS_VM_INITRD");
-    let cmdline = std::env::var("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
-        .unwrap_or_else(|_| "console=hvc0".to_string());
+    let assets = vm_guest::GuestAssets::from_env(KERNEL_HELP);
     let timeout =
         resolve_probe_timeout(std::env::var("FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS").ok())
             .unwrap_or_else(|e| panic!("{e}"));
 
     let s = Scratch::new(tag, true);
     let fixture = prepare_fixture(&s);
-    let spec = link_spec(&s, &fixture, &kernel, initrd.as_deref(), &cmdline);
+    let spec = link_spec(
+        &s,
+        &fixture,
+        &assets.kernel,
+        assets.initrd.as_deref(),
+        &assets.cmdline,
+    );
     let log_path = s.dir.join("console.log");
     eprintln!("virtiofs_link: console log at {}", log_path.display());
     let last = launch_until_done(&spec, &log_path, "link", timeout, |b| {

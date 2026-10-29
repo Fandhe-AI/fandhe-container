@@ -1056,15 +1056,20 @@ do_compare() {
 # --------------------------------------------------
 # エントリ
 # --------------------------------------------------
-if [ $# -lt 1 ]; then
-  usage >&2
-  exit 2
+# 直接実行したときだけ振り分ける。source されたときは何も実行しない（自己テストが norm_stdout を
+# 関数境界で呼び、inspect / state の fixture を capture 抜きで照合するため。#3299・CLI-1・REPAIR-12）。
+# 直接実行時の挙動は変えない。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  if [ $# -lt 1 ]; then
+    usage >&2
+    exit 2
+  fi
+  sub="$1"
+  shift
+  case "$sub" in
+    capture) do_capture "$@" ;;
+    compare) do_compare "$@" ;;
+    --help | -h) usage ;;
+    *) err invalid-argument "unknown subcommand"; exit 2 ;;
+  esac
 fi
-sub="$1"
-shift
-case "$sub" in
-  capture) do_capture "$@" ;;
-  compare) do_compare "$@" ;;
-  --help | -h) usage ;;
-  *) err invalid-argument "unknown subcommand"; exit 2 ;;
-esac

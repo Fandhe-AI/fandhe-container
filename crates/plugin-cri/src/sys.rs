@@ -25,9 +25,27 @@
 //! 前提と帰結:
 //! - exec した子（`std::process::Command` 経由の supervisor・systemd-run・getent 等）は、`execve` で捕捉中のハンドラが
 //!   `SIG_DFL` に戻る（`SIG_IGN` は引き継がれる）ため問題にならない。
-//! - exec しない fork は core の `fork_single_threaded*` だけで、呼び出しプロセスが複数スレッドだと拒否される。
-//!   ランタイム・forwarder・`LineSink` のスレッドができた後は構造的に到達しない。残る窓はハンドラ登録後から最初の
-//!   スレッドができるまでの起動段だけで、そこで作られた子も期限（各段の予算）と SIGKILL で回収される。
+//! - exec しない fork の原始は core の `fork_single_threaded*`（`sys` の `fork` 宣言）だけで、plugin-cri の依存に
+//!   `fandhe-container-cli`（もう 1 つの `fork` 宣言）は無い。可否は **fork の瞬間の `Threads: 1`** で決まる（join 済み・
+//!   終了済みのスレッドは数えない）。だから窓は「ハンドラの登録から常駐スレッド（`LineSink`・forwarder・tokio の
+//!   blocking pool）ができるまでの間に、**メインスレッドが直接**呼ぶ処理」であり、スレッドで包んだ呼び出しの最中は
+//!   メインが待っていて `Threads >= 2` になるため `MultiThreaded` で拒否される。
+//! - 起動段の調査結果（#3415。調べた時点は main の 81577bce、静的な読解による）。窓の中でメインが直接呼ぶ処理は
+//!   fork に到達しない:
+//!
+//!   | 段 | 主な呼び出し | fork の呼び出し点への到達 |
+//!   | -- | ------------ | ------------------------- |
+//!   | backends の構築 | `StateRoot::resolve`・`FileStateStore::open`・インスタンスロック（sleep の再試行のみ）・`LinuxNetsetup::with_recorder`・`ReclaimStore::open`・`NetsetupNetwork::with_reclaim_store`・`CoreLifecycleRuntime::with_recorder` | 無し（ファイル操作と構築のみ。構築時に回収・netns 操作は走らない） |
+//!   | bundle・記録ストア・image service | `production_bundle_provider`（`bundle_provider_with`）・`production_record_store`・`image_service`（`OciRegistryClient::new`） | 無し（ディレクトリの作成・検証と設定の組み立てのみ） |
+//!   | pull の回収 | `recover_stale_image_pulls` | worker スレッドで包む（メインは待ち）。fork は `MultiThreaded` で拒否 |
+//!   | 記録の再採用 | `readopt_records`（core の呼び出しは cri の `call_with_deadline`、孤児 bundle は `orphan_bundles::with_deadline`） | 呼び出しはすべてスレッドで包まれ、メインは直接 core を呼ばない |
+//!   | ランタイム・forwarder | tokio の current_thread ランタイム・`PeerAuditForwarder::spawn` | 無し（以後は常駐スレッドができる） |
+//!
+//!   fork の呼び出し点（`audit_log` の隔離の子・launch の中間プロセス・mapper・exec・seccomp listener・image rootfs の
+//!   userns の子）は、CRI の RPC 経路（常駐スレッドの後）か、上のスレッドで包んだ経路からしか呼ばれない。よって届く経路は
+//!   見つかっていない。万一届いても、子が継承するのは捕捉中のハンドラ（atomic を立てるだけ）で停止シグナルでは死なず、
+//!   親の待ちは各段の期限と SIGKILL で回収される。常駐スレッドの後に image rootfs の userns の fork が `MultiThreaded`
+//!   で拒否される点は別件（#2315）で、ここでは扱わない。
 //! - 監査 relay の helper は fork の直後に自分で SIGTERM・SIGINT を `SIG_IGN` にする
 //!   （`ControlAuditRelay::spawn_ignoring_stop_signals`）。継承に頼らない。
 //!

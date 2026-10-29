@@ -45,10 +45,18 @@
 //! 外しうるため、あえて外さない。見分け方と回収は `docs/setup/network-reclaim-recovery.md` を参照。
 //! メンバー記録が残る拒否は `detach_member_recorded` で回収に収束できる。
 //!
+//! # ホストの再起動をまたぐ detach（記録だけ。NET-1・NET-3・SEC-1・REPAIR-4・#3412）
+//! `detach_member_recorded` は世代（boot ID・network namespace）が違うと断る。boot ID が違う記録（前の boot の
+//! 残り）は `detach_member_recorded_after_reboot` で回収する。ルールハンドルは使わず（DELRULE を送らない）、
+//! カーネルに同名の bridge・テーブル・host veth・pin のマウントが無いことを照会で確かめてから、残った空の
+//! pin ファイルと所有記録、ポート予約（Active・解除中・墓標）、メンバー記録（= アドレス）だけを片付ける
+//! （`after_reboot`・`delete::member_after_reboot`）。同じ boot で netns だけ違う記録、カーネルに資源が残る場合、
+//! 回収待ちの請求書が残る endpoint は従来どおり手動回収（`docs/setup/network-reclaim-recovery.md`）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //! - 記録の無い孤児 veth（意図記録も無いもの）の回収（link の全件 dump が前提）。残った `realized.intent` /
 //!   `members-intent/*` の照合は `network::reconcile` が Linux ラッパーの先頭で行う（#3346）
-//! - ホストの再起動（boot ID が変わる）をまたぐ記録だけからの detach。世代が違うと断り、手動回収に回す
+//! - 同じ boot で network namespace だけ違う記録の detach（資源が別 namespace で生きうる。手動回収）
 //! - `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
 //! - 受け口を特定できない保持（`members-intent/*`・ルールの一覧を持たない quarantine の請求書）の `PortRegistry` への
 //!   登録。残った DNAT は公開時のカーネル dump（`ensure_no_listener_conflict`）が検出する（下記）
@@ -61,7 +69,8 @@
 //! supervisor（#3074）と plugin-cri（#3075）の起動処理（結線は後続）。
 //!
 //! - 世代（boot ID・netns）は照合しない。再起動前の記録でも、行がある間は予約を保つ（不変条件）。回収は
-//!   `detach_member_recorded` か手動回収（`docs/setup/network-reclaim-recovery.md`）が予約ごと解放する。飛ばすと
+//!   `detach_member_recorded`・`detach_member_recorded_after_reboot`（#3412）か手動回収
+//!   （`docs/setup/network-reclaim-recovery.md`）が予約ごと解放する。飛ばすと
 //!   手動回収が済むまでの間に予約が抜ける
 //! - 登録しすぎは安全側（新規公開を余分に断るだけ）、足りないと二重投入になる。迷えば登録する側に倒す
 //! - fail-closed: 読めない・食い違う記録、定義が壊れたネットワーク、別の持ち主が持つ同じ受け口、関数全体の失敗が
@@ -74,6 +83,11 @@
 
 use std::net::IpAddr;
 use std::path::Path;
+
+#[cfg(any(target_os = "linux", test))]
+mod after_reboot;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) use after_reboot::detach_member_after_reboot_with;
 
 use super::attach_claim::ClaimedRules;
 use super::{
@@ -164,6 +178,7 @@ fn settled_realized(guard: &NetworkLockGuard<'_>) -> Result<RealizedRecord, NetE
 /// nft のテーブルハンドルは再起動や namespace の再作成後に同じ数値が再利用されうるため、世代を確認できない
 /// 記録のハンドルは使わない（DELRULE 等の前に `FailedPrecondition` で断る。NET-3・SEC-1・#3068）。
 /// `delete_recorded_with` には適用しない（再起動後の残骸の回収を妨げないため。所有はトークンで証明する）。
+/// boot ID が違う記録の detach は、ハンドルを使わない別の入口（`detach_member_after_reboot_with`。#3412）が受ける。
 fn check_generation(realized: &RealizedRecord, now: &HostGeneration) -> Result<(), NetError> {
     if realized.generation() != now {
         return Err(precondition(
@@ -1148,6 +1163,7 @@ mod linux {
     use super::*;
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
+    use crate::network::delete::member_after_reboot::reclaim_member_after_reboot;
     use crate::network::delete::member_detach::reclaim_member;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
     use crate::network::reconcile::{delete_completed_by_reconcile, reconcile_with_sockets};
@@ -1361,6 +1377,31 @@ mod linux {
         })
     }
 
+    /// ホストの再起動（boot ID の違い）をまたいで、記録だけからメンバー 1 件を切り離す（NET-1・NET-3・SEC-1・REPAIR-4・#3412）。
+    ///
+    /// カーネル資源は消さない（照会だけ。DELRULE も送らない）。前の boot の資源が今の boot に無いと確かめられた
+    /// ときだけ、残った pin・ポート予約・メンバー記録を片付ける。boot ID が同じ記録、カーネルに資源が残る場合、
+    /// 回収待ちの請求書が残る場合は何も変えずに断る（手動回収）。手順・関門は `detach_member_after_reboot_with`。
+    /// `timeout` は照会全体の 1 つの期限（REPAIR-5）。全メンバーを片付けた後は `delete_network_recorded` が
+    /// `realized` を消す。
+    pub fn detach_member_recorded_after_reboot(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        guard: &NetworkLockGuard<'_>,
+        member_id: &MemberId,
+        netns_dir: &Path,
+        ports: &mut PortRegistry,
+        timeout: Duration,
+    ) -> Result<
+        NetworkDeleteReport,
+        RecordedError<Box<NetworkDeleteError<ContainerNetns>>, NetworkDeleteReport>,
+    > {
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
+        detach_member_after_reboot_with(&host, guard, member_id, netns_dir, ports, |claim, dir| {
+            reclaim_member_after_reboot(route, nft, claim, dir, timeout).map_err(Box::new)
+        })
+    }
+
     /// メンバーのいないネットワークを削除して `realized` を消す（`delete_network` の記録つき版）。
     ///
     /// 先頭の照合が、実体の無い `members-intent` を掃除して「`network still has members`」で止まらないようにする
@@ -1390,8 +1431,8 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{
     attach_container_recorded, create_network_recorded, delete_network_recorded,
-    detach_container_recorded, detach_member_recorded, restore_published_ports,
-    restore_unpublished_ports, unpublish_port_recorded,
+    detach_container_recorded, detach_member_recorded, detach_member_recorded_after_reboot,
+    restore_published_ports, restore_unpublished_ports, unpublish_port_recorded,
 };
 
 #[cfg(test)]
@@ -3968,4 +4009,6 @@ mod tests {
         );
         assert!(report.is_complete());
     }
+
+    mod after_reboot_tests;
 }

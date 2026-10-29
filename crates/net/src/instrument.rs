@@ -98,6 +98,9 @@ pub enum NetOpKind {
     /// 記録だけからのメンバー 1 件の切り離し全体（検証拒否・回収・記録の削除を含む。
     /// `detach_member_recorded_with`。NET-1・NET-6・REPAIR-4・#3347）。
     MemberDetachRecorded,
+    /// ホストの再起動（boot ID の違い）をまたぐ記録だけからの切り離し全体
+    /// （`detach_member_after_reboot_with`。NET-1・NET-3・REPAIR-4・#3412）。
+    MemberDetachAfterReboot,
 }
 
 impl NetOpKind {
@@ -134,6 +137,7 @@ impl NetOpKind {
             NetOpKind::NetworkStoreDnsHelperRemove => "network.store.dns_helper_remove",
             NetOpKind::DnsHelperRecover => "dns.helper.recover",
             NetOpKind::MemberDetachRecorded => "network.member.detach_recorded",
+            NetOpKind::MemberDetachAfterReboot => "network.member.detach_after_reboot",
         }
     }
 }
@@ -308,7 +312,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 30] = [
+    const ALL_KINDS: [NetOpKind; 31] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -339,6 +343,7 @@ mod tests {
         NetOpKind::NetworkStoreDnsHelperRemove,
         NetOpKind::DnsHelperRecover,
         NetOpKind::MemberDetachRecorded,
+        NetOpKind::MemberDetachAfterReboot,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -396,6 +401,10 @@ mod tests {
         assert_eq!(
             NetOpKind::MemberDetachRecorded.as_str(),
             "network.member.detach_recorded"
+        );
+        assert_eq!(
+            NetOpKind::MemberDetachAfterReboot.as_str(),
+            "network.member.detach_after_reboot"
         );
         assert_eq!(NetOpKind::PastaStart.as_str(), "pasta.start");
         assert_eq!(NetOpKind::PastaStop.as_str(), "pasta.stop");

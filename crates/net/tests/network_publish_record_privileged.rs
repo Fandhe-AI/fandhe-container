@@ -42,9 +42,15 @@
 //!   残る場合は `StaleHandles`、失われる場合は `Unknown` で断られることだけを照合する。NET-3・SEC-1・
 //!   REPAIR-12・#3361）
 //!
+//! - (10) ホストの再起動をまたぐ記録だけの detach（`detach_member_recorded_after_reboot`。NET-1・NET-3・SEC-1・
+//!   REPAIR-4・#3412）。(8) が残した `memdet` の m2 を使う。(10a) `realized` を別の boot ID の世代へ書き換えただけで
+//!   資源が生きている状態では断り、veth・pin・DNAT・メンバー記録が変わらない。(10b) 再起動を模擬して
+//!   テーブル・bridge・veth を消し pin を umount して空ファイルだけ残すと、入口は pin ファイル・`.owned`・
+//!   メンバー記録を消し、他のテーブルは変わらない。続く `delete_network_recorded` が `realized` を消す
+//!
 //! 子は `unshare --net --mount` の中（netns の pin の bind mount を mount namespace に閉じる）。
 //! `nft flush ruleset` は子の新しい netns の中だけに効く（起動時に親の netns と異なることを検査済み）。
-//! 成功行は `network_publish_record_privileged: ok ruleset_restore=refused` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
+//! 成功行は `network_publish_record_privileged: ok ruleset_restore=refused reboot_live=refused reboot_detach=ok` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない場合は skip せず失敗する。
 
 #[cfg(not(target_os = "linux"))]
@@ -78,16 +84,17 @@ mod linux {
     use fandhe_container_net::error::NetErrorCode;
     use fandhe_container_net::netlink_route::{IpPrefix, NetlinkRouteSocket};
     use fandhe_container_net::network::recorded::{
-        RecordedError, attach_container_recorded, create_network_recorded,
-        detach_container_recorded, detach_member_recorded, restore_published_ports,
-        restore_unpublished_ports, unpublish_port_recorded,
+        RecordedError, attach_container_recorded, create_network_recorded, delete_network_recorded,
+        detach_container_recorded, detach_member_recorded, detach_member_recorded_after_reboot,
+        restore_published_ports, restore_unpublished_ports, unpublish_port_recorded,
     };
     use fandhe_container_net::network::{
-        ContainerAttachSpec, EndpointId, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish,
-        PortRegistry, UnpublishRules, reclaim_failed_attach,
+        ContainerAttachSpec, EndpointId, NetworkCreateSpec, NetworkName, NetworkResourceNames,
+        PortProtocol, PortPublish, PortRegistry, UnpublishRules, VethNames, reclaim_failed_attach,
     };
     use fandhe_container_net::network_store::{
-        MemberId, MemberRecord, NetworkDefinition, NetworkStore, RecordedPublish,
+        HostGeneration, MemberId, MemberRecord, NetworkDefinition, NetworkStore, RealizedRecord,
+        RecordedPublish,
     };
     use fandhe_container_net::nftables_batch::{
         NetlinkNetfilterSocket, NftFamily, NftName, TableCreate, TableDelete, TableGet,
@@ -212,12 +219,15 @@ mod linux {
             .and_then(|()| reclaim_scenario(&route, &nft, &base, t))
             .and_then(|()| tombstone_scenario(&route, &nft, &base, t))
             .and_then(|()| member_detach_scenario(&route, &nft, &base, t))
+            .and_then(|()| reboot_detach_scenario(&route, &nft, &base, t))
             // `nft flush ruleset` を使うため、他の場面のテーブルを巻き込まないよう必ず最後に実行する。
             .and_then(|()| ruleset_restore_scenario(&route, &nft, &base, t));
         if let Err(e) = result {
             fail(&e);
         }
-        println!("network_publish_record_privileged: ok ruleset_restore=refused");
+        println!(
+            "network_publish_record_privileged: ok ruleset_restore=refused reboot_live=refused reboot_detach=ok"
+        );
     }
 
     fn live_handle(
@@ -887,6 +897,111 @@ mod linux {
         Ok(())
     }
 
+    /// (10) ホストの再起動をまたぐ記録だけの detach（`detach_member_recorded_after_reboot`。NET-1・NET-3・SEC-1・
+    /// REPAIR-4・#3412）。(8) が残した `memdet` の m2 を使う。
+    ///
+    /// (10a) `realized` を別の boot ID の世代へ書き換えただけで資源が生きている状態では、入口は断り、veth・pin・DNAT・
+    /// テーブル・メンバー記録が変わらない（`reboot_live=refused`）。(10b) 再起動を模擬してテーブル・bridge・veth を
+    /// 消し、pin を umount して空ファイルだけ残すと、入口は pin ファイル・`.owned/<endpoint>`・メンバー記録を消す
+    /// （`reboot_detach=ok`）。続く `delete_network_recorded` が `realized` を消す。
+    fn reboot_detach_scenario(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let dir = &base.join("store");
+        let ns_dir = base.join("ns");
+        let name = NetworkName::new(MEMDET_NET).map_err(e)?;
+        let store = NetworkStore::open(dir).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let owned = ns_dir.join(".owned").join("m2");
+        let m2_path: PathBuf = dir.join(format!("@networks/{MEMDET_NET}/members/m2"));
+        let mid = MemberId::new("m2").map_err(e)?;
+        let names = NetworkResourceNames::derive(&name).map_err(e)?;
+        let host_veth = VethNames::derive(&EndpointId::new("m2").map_err(e)?)
+            .map_err(e)?
+            .host()
+            .clone();
+        let real = n.realized().map_err(e)?.ok_or("realized missing")?;
+        let table = names.table().clone();
+
+        // (10a) 別の boot ID の世代に書き換える（資源は生きている）。
+        let old_boot = HostGeneration::new(
+            "00000000-0000-4000-8000-000000000000",
+            real.generation().netns(),
+        )
+        .map_err(e)?;
+        let created = real.to_created(fandhe_container_net::etc_hosts::NameResolution::default());
+        let old_real =
+            RealizedRecord::from_created(&created, real.subnet(), real.table_handle(), old_boot)
+                .map_err(e)?;
+        n.commit_realized(&old_real).map_err(e)?;
+        let mut reg = PortRegistry::new();
+        let veth_before = run("ip", &["-o", "link", "show", "type", "veth"])?;
+        let dnat_before = dnat_count(&table, 8102)?;
+        match detach_member_recorded_after_reboot(route, nft, &n, &mid, &ns_dir, &mut reg, t) {
+            Err(RecordedError::Op(_)) => {}
+            other => {
+                return Err(format!(
+                    "after-reboot detach with live resources must be refused (ok={})",
+                    other.is_ok()
+                ));
+            }
+        }
+        let veth_after = run("ip", &["-o", "link", "show", "type", "veth"])?;
+        if veth_after != veth_before
+            || dnat_count(&table, 8102)? != dnat_before
+            || dnat_before != 2
+            || !ns_dir.join("m2").exists()
+            || !owned.exists()
+            || !m2_path.exists()
+        {
+            return Err("live resources and the member record must not change".to_owned());
+        }
+
+        // (10b) 再起動を模擬する: テーブル・bridge・veth を消し、pin を umount して空ファイルだけ残す。
+        let tables_before = run("nft", &["list", "tables"])?;
+        run("nft", &["delete", "table", "ip", table.as_str()])?;
+        run("ip", &["link", "del", host_veth.as_str()])?;
+        run("ip", &["link", "del", names.bridge().as_str()])?;
+        let pin_path = ns_dir.join("m2");
+        run("umount", &[&pin_path.display().to_string()])?;
+        if !pin_path.exists() {
+            return Err("the unmounted pin file must remain".to_owned());
+        }
+        detach_member_recorded_after_reboot(route, nft, &n, &mid, &ns_dir, &mut reg, t)
+            .map_err(|x| format!("detach_member_recorded_after_reboot(m2): {x:?}"))?;
+        if pin_path.exists() || owned.exists() || m2_path.exists() {
+            return Err("m2 pin, .owned record and member record must be gone".to_owned());
+        }
+        let members = n.members().map_err(e)?;
+        if !members.is_empty() {
+            return Err(format!("no member may remain: {}", members.len()));
+        }
+        // 他者のテーブル（このネットワーク以外）は変わらない。
+        let tables_after = run("nft", &["list", "tables"])?;
+        let expected: Vec<&str> = tables_before
+            .lines()
+            .filter(|l| !l.contains(table.as_str()))
+            .collect();
+        let actual: Vec<&str> = tables_after.lines().collect();
+        if expected != actual {
+            return Err(format!(
+                "other tables must be untouched: {expected:?} -> {actual:?}"
+            ));
+        }
+        delete_network_recorded(route, nft, &n, &mut reg, t)
+            .map_err(|x| format!("delete_network_recorded(memdet): {x:?}"))?;
+        if n.realized().map_err(e)?.is_some() {
+            return Err("realized must be gone after the network is deleted".to_owned());
+        }
+        Ok(())
+    }
     /// 墓標の保存・復元・予約だけの解放の完了（#3343）。
     fn tombstone_scenario(
         route: &NetlinkRouteSocket,

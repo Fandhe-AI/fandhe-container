@@ -2568,9 +2568,14 @@ mod tests {
     }
 
     /// マウント先つきで create し、backend の launch が `err` を返すようにして start の結果を返す。
+    /// `name` は試験ごとに異なる一時ディレクトリ名にする（並行実行する試験が同じ
+    /// ディレクトリを `tmp_dir` の削除で壊し合わないため。MAC-1・REPAIR-12）。
     #[cfg(unix)]
-    fn gm_started(err: PlatformError) -> (MacosRuntimeAdapter<Fake>, (PluginErrorCode, String)) {
-        let dir = tmp_dir("gm-launch");
+    fn gm_started(
+        name: &str,
+        err: PlatformError,
+    ) -> (MacosRuntimeAdapter<Fake>, (PluginErrorCode, String)) {
+        let dir = tmp_dir(name);
         let k = kernel(&dir);
         let d1 = gm_share_dir(&dir, "s1");
         let log = dir.join("console.log");
@@ -2592,10 +2597,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mac1_guest_mount_report_timeout_maps_to_timeout() {
-        let (mut a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Timeout {
-            after: LAUNCH_GUEST_MOUNT_TIMEOUT,
-            pending: vec!["SECRETTAG".into()],
-        }));
+        let (mut a, e) = gm_started(
+            "gm-launch-timeout",
+            PlatformError::GuestMount(GuestMountError::Timeout {
+                after: LAUNCH_GUEST_MOUNT_TIMEOUT,
+                pending: vec!["SECRETTAG".into()],
+            }),
+        );
         assert_eq!(
             e,
             (
@@ -2617,10 +2625,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mac1_guest_mount_failure_report_maps_to_internal() {
-        let (_a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Failed {
-            tag: "SECRETTAG".into(),
-            errno: 5,
-        }));
+        let (_a, e) = gm_started(
+            "gm-launch-failed",
+            PlatformError::GuestMount(GuestMountError::Failed {
+                tag: "SECRETTAG".into(),
+                errno: 5,
+            }),
+        );
         assert_eq!(
             e,
             (

@@ -271,9 +271,11 @@ mod tests {
     fn core2_late_update_commit_is_reported_to_the_cleanup() {
         use fandhe_container_core::state_store::{FileStateStore, StateRoot};
         use fandhe_container_core::traits::ContainerStatus;
-        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let dir = base.join(format!("fandhe-sup-deadline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 一意・排他作成の親の子を使う（pid だけの名前の残骸と衝突しない。#3374・REPAIR-12）。
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-sup-deadline", Duration::from_secs(10));
+        let dir = scratch.path().join("root");
+        std::fs::create_dir(&dir).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -297,7 +299,6 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert!(late.wait_settled(Duration::from_secs(5)));
         let commits = late.take_commits();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(commits.len(), 1);
         assert_eq!(
             commits[0].status().pid().map(std::num::NonZeroU32::get),

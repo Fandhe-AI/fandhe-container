@@ -407,6 +407,34 @@ fn invalid(msg: &'static str) -> TraitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// 試験用の一時ディレクトリ。pid だけの名前は PID 再利用や異常終了の残骸と衝突するため、
+    /// 作る前に残骸を消し、drop で消す（#3374・#3298・REPAIR-12。oci の `TestRoot` と同じ形）。
+    /// 3 OS で動く試験で使うため、Linux 限定の `ScratchDir` ではなくこの形にしている。
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn at(p: PathBuf) -> Self {
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+
+        fn new(tag: &str) -> Self {
+            Self::at(std::env::temp_dir().join(format!("fc-{tag}-{}", std::process::id())))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// SUP-14・#2426: `O_NOCTTY` の値（x86_64・aarch64 の Linux は asm-generic の 0o400）と、
     /// env ファイルの open フラグに含まれることを固定する。
@@ -576,8 +604,8 @@ mod tests {
     /// SUP-12・TASK-169.4: env ファイルの読み込み（上限ちょうど受理・超過拒否・ディレクトリ拒否・非 UTF-8 拒否）。
     #[test]
     fn sup12_env_file_read() {
-        let dir = std::env::temp_dir().join(format!("fc-envfile-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = TestDir::new("envfile");
+        let dir = guard.path().to_path_buf();
         let p = dir.join("a.env");
 
         std::fs::write(&p, "A=1\n").unwrap();
@@ -601,7 +629,6 @@ mod tests {
 
         assert!(EnvFile::read(&dir).is_err());
         assert!(EnvFile::read(&dir.join("missing")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-12・TASK-169.4: 先頭 BOM は除去し、2 行目以降の U+FEFF は KEY に残る（加工しない）。
@@ -616,9 +643,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sup12_env_file_read_rejects_fifo_without_blocking() {
-        let dir = std::env::temp_dir().join(format!("fc-envfifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("f.env");
+        let guard = TestDir::new("envfifo");
+        let p = guard.path().join("f.env");
         let ok = std::process::Command::new("mkfifo")
             .arg(&p)
             .status()
@@ -628,7 +654,6 @@ mod tests {
         let e = EnvFile::read(&p).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(e.message().contains("regular file"), "{}", e.message());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-12・TASK-169.4・REPAIR-5: metadata 検査後に FIFO へ差し替えられた場合を模し、
@@ -636,9 +661,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sup12_env_file_open_nonblocking_does_not_hang_on_fifo() {
-        let dir = std::env::temp_dir().join(format!("fc-envfifo2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("f.env");
+        let guard = TestDir::new("envfifo2");
+        let p = guard.path().join("f.env");
         let ok = std::process::Command::new("mkfifo")
             .arg(&p)
             .status()
@@ -647,6 +671,64 @@ mod tests {
         assert!(ok, "mkfifo must be available on unix test hosts");
         let f = open_nonblocking(&p).unwrap();
         assert!(!f.metadata().unwrap().is_file());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-12・REPAIR-12・#3374: 前回の残骸（FIFO・通常ファイル・サブディレクトリ）があっても、
+    /// 試験用ディレクトリは空で作り直され、同じ名前の `mkfifo` が成功し、drop で消える。
+    #[cfg(unix)]
+    #[test]
+    fn sup12_repair12_3374_test_dir_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!("fc-envfifo-residue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("d")).unwrap();
+        std::fs::write(p.join("stale"), "stale").unwrap();
+        std::fs::write(p.join("d").join("x"), "x").unwrap();
+        let ok = std::process::Command::new("mkfifo")
+            .arg(p.join("f.env"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo must be available on unix test hosts");
+
+        let guard = TestDir::at(p.clone());
+        assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
+        let again = std::process::Command::new("mkfifo")
+            .arg(guard.path().join("f.env"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(again, "mkfifo must succeed in a cleaned directory");
+        assert_eq!(
+            EnvFile::read(&guard.path().join("f.env"))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        drop(guard);
+        assert_eq!(
+            std::fs::symlink_metadata(&p).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// SUP-12・REPAIR-12・#3374: 3 OS 共通。通常ファイルとサブディレクトリの残骸が消え、書き込みと読み込みが通り、drop で消える。
+    #[test]
+    fn sup12_repair12_3374_test_dir_clears_stale_file_and_dir() {
+        let p = std::env::temp_dir().join(format!("fc-envfile-residue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("d")).unwrap();
+        std::fs::write(p.join("stale"), "stale").unwrap();
+        std::fs::write(p.join("d").join("x"), "x").unwrap();
+
+        let guard = TestDir::at(p.clone());
+        assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
+        let f = guard.path().join("a.env");
+        std::fs::write(&f, "A=1\n").unwrap();
+        assert_eq!(EnvFile::read(&f).unwrap().vars().len(), 1);
+        drop(guard);
+        assert_eq!(
+            std::fs::symlink_metadata(&p).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

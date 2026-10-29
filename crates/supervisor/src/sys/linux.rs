@@ -1020,8 +1020,11 @@ mod tests {
     fn sup14_xattr_errno_constants_and_read() {
         assert_eq!((ENODATA, EOPNOTSUPP, ERANGE), (61, 95, 34));
         assert_eq!(FILE_CAPS_BUF_LEN, 24);
-        let dir = std::env::temp_dir().join(format!("fc-xattr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 一意・排他作成の親の子を使う（pid だけの名前の残骸と衝突しない。#3374・REPAIR-12）。
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fc-xattr", std::time::Duration::from_secs(10));
+        let dir = scratch.path().join("root");
+        std::fs::create_dir(&dir).expect("mkdir");
         let f = dir.join("plain");
         std::fs::write(&f, b"x").expect("write");
         let err = read_security_capability(&f).expect_err("no file capability");
@@ -1033,7 +1036,6 @@ mod tests {
         assert_eq!(bad.kind(), io::ErrorKind::NotFound);
         let nul = read_security_capability(Path::new("a\0b")).expect_err("nul");
         assert_eq!(nul.kind(), io::ErrorKind::InvalidInput);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// SUP-14・#2426: `EPERM` の値と、`io::Error` 上で `PermissionDenied` になることを固定する。

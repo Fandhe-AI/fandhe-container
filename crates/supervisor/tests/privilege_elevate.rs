@@ -144,7 +144,14 @@ mod linux {
         println!("kill_pid1={kill_ok}");
         // 共有 /tmp 上の予測可能な名前でも、O_EXCL（create_new）は既存の symlink / ファイルを採用せず失敗し、
         // 以降の chown は作成した fd に対して行う。
-        let path = std::env::temp_dir().join(format!("fc-elevate-chown-{}", std::process::id()));
+        // 名前に nanos を足して、pid だけの名前の残骸との EEXIST を避ける（#3374・REPAIR-12）。
+        // 予測できる名前の既存物を消さず採用もしない（O_EXCL）性質は保つ。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("fc-elevate-chown-{}-{nanos}", std::process::id()));
         let chown = fs::OpenOptions::new()
             .write(true)
             .create_new(true)

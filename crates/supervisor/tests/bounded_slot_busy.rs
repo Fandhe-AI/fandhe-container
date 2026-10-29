@@ -12,6 +12,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
+
+// 一意・排他作成の試験用ディレクトリ（pid だけの名前の残骸と衝突しない。#3374・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
 use fandhe_container_supervisor::container_options::store::{acquire_lock, remove_stale_bounded};
 use fandhe_container_supervisor::logs::{SweepReport, sweep_stale_container_logs};
 use fandhe_container_supervisor::supervisor_log::{
@@ -23,8 +27,9 @@ const SLOTS: usize = 8;
 
 #[test]
 fn repair5_err1_2894_slot_busy_is_distinct_from_timeout() {
-    let tmp = std::env::temp_dir().join(format!("fc-sup-slotbusy-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let scratch = scratch_root::ScratchDir::new("fc-sup-slotbusy", Duration::from_secs(10));
+    let tmp = scratch.path().join("root");
+    std::fs::create_dir(&tmp).unwrap();
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
     let id = ContainerId::new("busy1").unwrap();
 
@@ -108,5 +113,4 @@ fn repair5_err1_2894_slot_busy_is_distinct_from_timeout() {
 
     drop(tx);
     drop(lock);
-    let _ = std::fs::remove_dir_all(&tmp);
 }

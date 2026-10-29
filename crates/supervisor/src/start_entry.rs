@@ -2992,42 +2992,116 @@ mod linux {
         id: &ContainerId,
         until: Option<Instant>,
         logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
-    ) -> Result<(Option<ContainerOptions>, Option<String>), TraitError> {
+    ) -> OptionsPrepared {
         let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
         let store = Arc::clone(store);
         let worker_logs = Arc::clone(logs);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::Builder::new()
-            .name("fandhe-supopt".into())
-            .spawn(move || {
-                let result =
-                    read_generation_checked_document(&store, &root, &id).and_then(|(doc, rec)| {
-                        doc.map(|d| options_with_verified_pasta(&d, &id, &worker_logs))
+        let worker_id = id.clone();
+        run_options_worker(
+            move || {
+                read_generation_checked_document(&store, &root, &worker_id).and_then(
+                    |(doc, rec)| {
+                        doc.map(|d| options_with_verified_pasta(&d, &worker_id, &worker_logs))
                             .transpose()
                             .map(|o| (o, rec))
-                    });
-                let _ = tx.send(result);
-            })
-            .map_err(|_| {
-                TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to spawn the container options worker",
+                    },
                 )
-            })?;
+            },
+            until,
+            logs,
+            &id,
+        )
+    }
+
+    /// 2c の作業スレッドの結果(文書から作った options と照合した世代)。
+    type OptionsOutcome = Result<(Option<ContainerOptions>, Option<String>), TraitError>;
+
+    /// 2c の作業スレッド `fandhe-supopt` を起動し、`until`(報告の予約を引いた値)まで待つ(試験で本体を差し替えられる)。
+    ///
+    /// 期限超過では `pasta_verify`(`result:"timeout"`)を遅延バッファへ 1 度だけ積み(報告の後に flush が出す)、
+    /// 未回収の作業スレッドを [`UnjoinedOptionsWorker`] で返す。ここで新しく待たないので報告の期限は延びない(REPAIR-5・#3431)。
+    fn run_options_worker<F>(
+        work: F,
+        until: Option<Instant>,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        id: &ContainerId,
+    ) -> OptionsPrepared
+    where
+        F: FnOnce() -> OptionsOutcome + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = match std::thread::Builder::new()
+            .name("fandhe-supopt".into())
+            .spawn(move || {
+                let _ = tx.send(work());
+            }) {
+            Ok(h) => h,
+            Err(_) => {
+                return OptionsPrepared {
+                    result: Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to spawn the container options worker",
+                    )),
+                    unjoined: None,
+                };
+            }
+        };
         let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
         let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
         match rx.recv_timeout(limit) {
             Ok(result) => {
                 let _ = handle.join();
-                result
+                OptionsPrepared {
+                    result,
+                    unjoined: None,
+                }
             }
             Err(_) => {
-                // 作業スレッドを join できない。以後の fork を伴う監査の配送を止める。
+                // 作業スレッドを join できない。報告後に有界で回収できるよう rx と handle を残す。
                 logs.mark_worker_unjoined();
-                Err(TraitError::new(
-                    ErrorCode::Timeout,
-                    "container options preparation timed out",
-                ))
+                crate::pasta_attach::log_pasta_verify_timeout(
+                    logs,
+                    id.as_str(),
+                    limit,
+                    logs.verify_started(),
+                );
+                OptionsPrepared {
+                    result: Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "container options preparation timed out",
+                    )),
+                    unjoined: Some(UnjoinedOptionsWorker { rx, handle }),
+                }
+            }
+        }
+    }
+
+    /// 手順 2c の結果(世代つき)と、期限超過で回収できなかった作業スレッド。
+    struct OptionsPrepared {
+        result: OptionsOutcome,
+        unjoined: Option<UnjoinedOptionsWorker>,
+    }
+
+    /// 期限超過で join できなかった 2c の作業スレッド。`run_main_inner` が報告の後に [`Self::drain`] で有界に回収する。
+    struct UnjoinedOptionsWorker {
+        rx: std::sync::mpsc::Receiver<OptionsOutcome>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    /// 報告の後に作業スレッドを待つ上限(再検証の `--version` の期限 2 秒に余裕 1 秒。REPAIR-5・#3431)。
+    const LATE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
+    impl UnjoinedOptionsWorker {
+        /// `budget` まで結果を待つ。届けば join して `true`(結果の値は捨てる。start は拒否済みで、改ざんの印と
+        /// 遅延ログは作業スレッドが `PastaLogBuffer` へ置き済み)。届かなければ `false`(残りの行・印は出せず、
+        /// 期限超過の行が終端の記録になる)。
+        fn drain(self, budget: Duration) -> bool {
+            match self.rx.recv_timeout(budget) {
+                Ok(_) => {
+                    let _ = self.handle.join();
+                    true
+                }
+                Err(_) => false,
             }
         }
     }
@@ -3044,6 +3118,10 @@ mod linux {
     ) -> Result<ContainerOptions, TraitError> {
         let options = doc.to_container_options()?;
         let started = Instant::now();
+        if doc.pasta().is_some() {
+            // 期限超過の行の `stage` を決める印(#3431)。
+            logs.mark_verify_started();
+        }
         match crate::container_options::pasta::reverify_recorded_pasta(doc) {
             Ok(None) => Ok(options),
             Ok(Some(binary)) => {
@@ -3305,13 +3383,17 @@ mod linux {
         // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
         // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
         // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
-        let deps = match prepare_container_options_with_generation(
+        let OptionsPrepared {
+            result: options_result,
+            unjoined: unjoined_options,
+        } = prepare_container_options_with_generation(
             &store,
             &args.root,
             &args.id,
             deadline,
             &pasta_logs,
-        ) {
+        );
+        let deps = match options_result {
             // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
             Ok((Some(options), recorded)) => Box::new(
                 deps.with_container_options(options)
@@ -3321,7 +3403,11 @@ mod linux {
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
         // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
-        record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
+        // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
+        // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
+        if unjoined_options.is_none() {
+            record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
+        }
         let running = match run_start_until(
             deps,
             &store,
@@ -3335,7 +3421,16 @@ mod linux {
             Err(code) => {
                 // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
                 // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
-                pasta_logs.flush();
+                // 2c が期限超過なら、報告の後に作業スレッドを `LATE_DRAIN_BUDGET` だけ待ち、遅れて置かれた改ざんの印と
+                // 行を拾う(報告の期限は延びない。launch しない経路なので単一スレッド要求にも触れない。#3431)。
+                // 回収できなければ期限超過の行が終端の記録になる(残余。docs/design/rootless-network.md)。
+                finish_after_refused_start(
+                    unjoined_options,
+                    audit.as_ref(),
+                    &args.id,
+                    &pasta_logs,
+                    LATE_DRAIN_BUDGET,
+                );
                 return ExitCode::from(code.get());
             }
         };
@@ -3377,6 +3472,25 @@ mod linux {
 
     /// 改ざんの疑いの監査配送の予算(起動の期限の残りと小さい方。REPAIR-5)。
     const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
+
+    /// 拒否の報告を書いた後の始末: 未回収の 2c 作業スレッドを `budget` まで待ち、届けば遅れて置かれた改ざんの印を
+    /// 監査へ配送し、最後に遅延ログを flush する(SEC-4・NET-9・REPAIR-5・#3431)。
+    ///
+    /// 報告の後に呼ぶので報告の期限は延びない。launch しない経路のため単一スレッド要求にも触れない。
+    fn finish_after_refused_start(
+        unjoined: Option<UnjoinedOptionsWorker>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+        budget: Duration,
+    ) {
+        if let Some(w) = unjoined {
+            // 回収できなくても、期限超過より前に置かれていた印は拾う(取り出しは空なら何もしない)。
+            let _ = w.drain(budget);
+            record_pasta_tamper(audit, id, logs, None);
+        }
+        logs.flush();
+    }
 
     /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、入口が構築済みの監査 relay 経由で `@audit.log` へ 1 件配送する
     /// (SEC-4・PLUG-11・#3330)。
@@ -3448,10 +3562,224 @@ mod linux {
             until: Option<Instant>,
         ) -> Result<Option<ContainerOptions>, TraitError> {
             let logs = Arc::new(crate::pasta_attach::PastaLogBuffer::new());
-            prepare_container_options_with_generation(store, root, id, until, &logs).map(|(o, _)| o)
+            prepare_container_options_with_generation(store, root, id, until, &logs)
+                .result
+                .map(|(o, _)| o)
         }
 
         use super::*;
+
+        /// 2c の期限超過を作る: `work` が合図まで戻らない状態で `until` を短く取って呼ぶ。
+        fn timed_out_worker(
+            stage_verify: bool,
+            late: impl FnOnce(&crate::pasta_attach::PastaLogBuffer) + Send + 'static,
+        ) -> (
+            Arc<crate::pasta_attach::PastaLogBuffer>,
+            OptionsPrepared,
+            std::sync::mpsc::Sender<()>,
+            Duration,
+        ) {
+            let logs = Arc::new(crate::pasta_attach::PastaLogBuffer::new());
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let wl = Arc::clone(&logs);
+            let id = ContainerId::new("web1").expect("id");
+            let until = Instant::now() + REPORT_RESERVE + Duration::from_millis(300);
+            let started = Instant::now();
+            let prepared = run_options_worker(
+                move || {
+                    if stage_verify {
+                        wl.mark_verify_started();
+                    }
+                    let _ = go_rx.recv_timeout(Duration::from_secs(30));
+                    late(&wl);
+                    Ok((None, None))
+                },
+                Some(until),
+                &logs,
+                &id,
+            );
+            (logs, prepared, go_tx, started.elapsed())
+        }
+
+        /// SEC-4・NET-9・REPAIR-5・#3431: 2c の期限超過は固定の `pasta_verify`(timeout)を 1 行だけ積み、待ちは期限を超えない。
+        #[test]
+        fn sec4_3431_options_timeout_pushes_one_timeout_line() {
+            let (logs, prepared, go, elapsed) = timed_out_worker(true, |_| {});
+            let err = prepared.result.expect_err("timeout");
+            assert_eq!(err.code(), ErrorCode::Timeout);
+            assert_eq!(err.message(), "container options preparation timed out");
+            assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
+            assert!(logs.worker_unjoined());
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].starts_with(
+                    "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":"
+                ),
+                "{lines:?}"
+            );
+            assert!(
+                lines[0].ends_with(",\"result\":\"timeout\",\"stage\":\"verify\"}\n"),
+                "{lines:?}"
+            );
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+        }
+
+        /// #3431: 再検証に入る前に止まれば `stage` は `document`。
+        #[test]
+        fn sec4_3431_options_timeout_before_verify_is_document_stage() {
+            let (logs, prepared, go, _) = timed_out_worker(false, |_| {});
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].ends_with(",\"result\":\"timeout\",\"stage\":\"document\"}\n"));
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+        }
+
+        /// SEC-4・#3431: 期限超過の後に作業スレッドが置いた拒否行と改ざんの印は、報告後の有界の回収で拾える。
+        #[test]
+        fn sec4_3431_late_worker_result_is_drained() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |l| {
+                l.set_tamper(
+                    fandhe_container_core::audit_log::PastaVerifyRejection::PermissionDenied,
+                );
+                crate::pasta_attach::log_pasta_verify(
+                    l,
+                    "web1",
+                    Err((ErrorCode::PermissionDenied, true)),
+                    Duration::from_millis(1),
+                );
+            });
+            assert_eq!(logs.take().len(), 1);
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+            let lines = logs.take();
+            assert_eq!(
+                lines,
+                vec![
+                    "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":1,\"result\":\"rejected\",\"code\":\"PERMISSION_DENIED\",\"tamper_suspected\":\"true\"}\n".to_owned()
+                ]
+            );
+            let id = ContainerId::new("web1").expect("id");
+            record_pasta_tamper(None, &id, &logs, None);
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("\"event\":\"pasta_audit_unavailable\""));
+            assert!(lines[0].contains("\"code\":\"NOT_FOUND\""));
+            assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・NET-9・REPAIR-5・#3431: 入口の報告後の始末。2c を期限超過させ、遅れて置かれた改ざんの印が
+        /// 監査 sink へ 1 件届き、遅延ログ(期限超過の行・遅れた拒否の行)が flush で空になる。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_delivers_late_tamper_to_audit() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |l| {
+                l.set_tamper(PastaVerifyRejection::PermissionDenied);
+                crate::pasta_attach::log_pasta_verify(
+                    l,
+                    "web1",
+                    Err((ErrorCode::PermissionDenied, true)),
+                    Duration::from_millis(1),
+                );
+            });
+            // 報告の時点(回収前)では改ざんの印はまだ無く、期限超過の行が積まれているだけ。
+            assert!(logs.take_tamper().is_none());
+            assert!(prepared.result.is_err());
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let _ = go.send(());
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_secs(5),
+            );
+            let recs = sink.0.lock().unwrap();
+            assert_eq!(recs.len(), 1, "{recs:?}");
+            assert_eq!(recs[0].container_id(), Some(&id));
+            assert!(logs.take().is_empty(), "flushed");
+            assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・REPAIR-5・#3431: 期限超過より前に置かれた改ざんの印は、回収できなくても報告後の始末で配送される
+        /// (報告前に取り出さない経路の回帰)。
+        #[test]
+        fn sec4_3431_finish_delivers_tamper_placed_before_timeout_even_if_undrained() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            logs.set_tamper(PastaVerifyRejection::PermissionDenied);
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert_eq!(sink.0.lock().unwrap().len(), 1);
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
+        }
+
+        /// #3431: 回収できなければ(戻らない作業スレッド)監査へは何も送らず、遅延ログだけ flush する。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_unreachable_worker_sends_nothing() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let t = Instant::now();
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(sink.0.lock().unwrap().is_empty());
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
+        }
+
+        /// REPAIR-5・#3431: 戻らない作業スレッドの回収は予算で打ち切り、行を増やさない。
+        #[test]
+        fn sec4_3431_drain_is_bounded() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            let _ = logs.take();
+            let t = Instant::now();
+            // 合図前なので届かない。
+            assert!(
+                !prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_millis(200))
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(logs.take().is_empty());
+            let _ = go.send(());
+        }
 
         /// 一時ディレクトリに passwd / subuid / subgid を置き、`resolve_launch_privilege` を呼ぶ。
         fn resolve_with(

@@ -145,9 +145,11 @@ pub struct PastaLogBuffer {
     /// 手順 2c の再検証が見つけた改ざんの疑い(作業スレッドが置き、単一スレッドの入口が取り出して監査へ配送する。
     /// SEC-4・#3330。作業スレッドは監査の `FileAuditSink`〔fork 隔離〕を使えないため、記録は入口に任せる)。
     tamper: Mutex<Option<fandhe_container_core::audit_log::PastaVerifyRejection>>,
-    /// 2c の待ちが期限切れで、作業スレッドを join できないまま進んだ印。立っている間は fork を伴う監査の配送をしない
-    /// (作業スレッド生存中の fork によるハング・記録欠落を避ける。SEC-4・REPAIR-5)。
+    /// 2c の待ちが期限切れで、作業スレッドを join できないまま進んだ印。報告後に有界で回収する要否の判断と、
+    /// 試験の照合に使う(回収の本体は `start_entry` の `UnjoinedOptionsWorker::drain`。SEC-4・REPAIR-5・#3431)。
     worker_unjoined: std::sync::atomic::AtomicBool,
+    /// 2c の作業スレッドが pasta の再検証に入った印(記録があるときだけ立つ)。期限超過の行の `stage` を決める(#3431)。
+    verify_started: std::sync::atomic::AtomicBool,
 }
 
 impl PastaLogBuffer {
@@ -174,6 +176,18 @@ impl PastaLogBuffer {
     pub fn mark_worker_unjoined(&self) {
         self.worker_unjoined
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 再検証(pasta の記録がある場合)に入ったことを記す。
+    pub fn mark_verify_started(&self) {
+        self.verify_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 再検証に入ったか。
+    pub fn verify_started(&self) -> bool {
+        self.verify_started
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 作業スレッドを join できていないか。
@@ -254,6 +268,32 @@ pub(crate) fn log_pasta_verify(
         }
     }
     buffer.push(json_line("pasta_verify", container, &f));
+}
+
+/// 手順 2c の作業スレッドが期限内に戻らなかったことを `pasta_verify`(`result:"timeout"`)として遅延バッファへ積む
+/// (REPAIR-4・REPAIR-5・NET-9・#3431)。
+///
+/// `log_pasta_verify` の拒否(再検証の `--version` の期限超過)とは別の事実なので専用にした。`stage` は固定語彙で、
+/// `verify` は再検証に入っていた(pasta の記録あり)、`document` は文書の読み取り・照合の段階で止まったことを表す。
+/// 改ざんの疑いではないため SEC-4 の監査記録は出さない。パス・入力値は載せない(ERR-1)。
+pub(crate) fn log_pasta_verify_timeout(
+    buffer: &PastaLogBuffer,
+    container: &str,
+    waited: Duration,
+    verify_started: bool,
+) {
+    buffer.push(json_line(
+        "pasta_verify",
+        container,
+        &[
+            ("elapsed_ms", Val::U(millis(waited))),
+            ("result", Val::S("timeout")),
+            (
+                "stage",
+                Val::S(if verify_started { "verify" } else { "document" }),
+            ),
+        ],
+    ));
 }
 
 /// 改ざんの疑いを監査の記録先へ書けなかったことを `pasta_audit_unavailable` として遅延バッファへ積む(SEC-4・#3330)。

@@ -115,3 +115,48 @@ fn net12_prepare_failure_leaves_nothing() {
     assert!(!etc_dir(&root.0, &id()).exists());
     deps.release_network().expect("release");
 }
+
+/// NET-12・CORE-2・SEC-1・REPAIR-5(#3345): 並行する同じ ID の start で `claim_start` に負けた側は `prepare_network` を呼ばず、
+/// 巻き戻し(`release_network`)が勝った側の生成物(`@container-etc/<id>`)を消さない。
+///
+/// start の手順 4b は所有ロック(`claim_start`)を握った後にだけ生成・削除する順序で、`release_network` は自分が作った分
+/// (`etc_created`)だけを消す。この 2 点(`docs/design/network-wiring.md` D14)を、勝った側の生成物の inode と内容が
+/// 負けた側の巻き戻しの前後で不変であることで照合する。実機の補強は cli の `network_modes_real`(running への 2 回目の start)。
+#[test]
+fn net12_core2_loser_release_keeps_winner_etc_files() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = Root::new("loser");
+    let make = || {
+        let o = options(Some("none"), &["web:192.0.2.10"], &["127.0.0.1"]);
+        ProductionStartDeps::new(root.0.clone()).with_container_options(o)
+    };
+    let mut winner = make();
+    winner.prepare_network(&id()).expect("winner prepare");
+    let snapshot = || {
+        [EtcFileKind::Hosts, EtcFileKind::ResolvConf].map(|k| {
+            let p = etc_file_path(&root.0, &id(), k);
+            let md = std::fs::metadata(&p).expect("stat");
+            ((md.dev(), md.ino()), std::fs::read(&p).expect("read"))
+        })
+    };
+    let before = snapshot();
+    assert!(
+        String::from_utf8_lossy(&before[0].1).ends_with("192.0.2.10\tweb\n"),
+        "{:?}",
+        before[0].1
+    );
+
+    // 負けた側: claim_start に負けるため prepare_network は呼ばれず、失敗の巻き戻しで release_network だけが呼ばれる。
+    let mut loser = make();
+    loser.release_network().expect("loser release");
+    assert_eq!(
+        snapshot(),
+        before,
+        "loser release touched the winner's files"
+    );
+
+    // 勝った側の release で初めて消える。
+    winner.release_network().expect("winner release");
+    assert!(!etc_dir(&root.0, &id()).exists());
+}

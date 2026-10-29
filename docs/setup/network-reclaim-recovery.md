@@ -107,3 +107,12 @@ root を要する操作で、ホストの他の netns を巻き込まないよ�
 5. 資源を片付けたら、`realized.intent`（delete の途中なら `realized` も）と該当の `members-intent/<id>` を手で消し、plugin を再起動してメモリ上の登録を捨てる
 
 root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・veth・テーブルを巻き込まないよう、名前・別名・ifindex を確認してから実行する。
+
+## 削除後に残る conntrack の NAT エントリ（NET-1・NET-10・NET-11・#3348）
+
+`delete_network` は専用の nft テーブル（masquerade を含む）をテーブルごと消すが、カーネルの conntrack に既にあるエントリ（変換済みの接続の記録）は flush しない。masquerade の仕組みが conntrack を消すのは出口 interface の down・アドレス削除に紐づくエントリだけで、bridge の削除では消えない。残ったエントリはプロトコルごとのタイムアウト（`net.netfilter.nf_conntrack_*_timeout` の sysctl）まで生きる。
+
+- 影響: 同じサブネット・アドレスでネットワークを作り直した直後、残ったエントリに一致する通信が古い変換のまま扱われうる。NET-10 の診断で案内する前提である
+- 観測: `conntrack -L -s <サブネット>`（conntrack-tools）。モジュールの構成によっては `/proc/net/nf_conntrack`
+- 手動の消し方: `conntrack -D -s <サブネット>`。root と `CAP_NET_ADMIN` が要る。他のコンテナ基盤が同じホストにあるときは、そのエントリを巻き込まないようサブネットを確かめてから実行する
+- 本製品は conntrack を自動では flush しない（現状の範囲。REPAIR-3）。実機での確認は行っていない（#1626・人間担当）

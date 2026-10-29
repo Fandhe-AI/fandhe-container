@@ -92,6 +92,13 @@ harness = false
 # 1 バイト TCP 往復の p50・p99 計測プログラム（NET-3・TASK-140 準備・#1881）。root 不要・std のみで、引数なしは
 # loopback の自己試験（3 OS の既定のテスト集合）。--serve / --client は保持入口の netns 内で nsenter 越しに使う。
 # 自身を子プロセスとして再入するため harness = false。
+# 記録つき合成（create → attach → detach → delete）の実カーネルでの通しの照合（NET-1・NET-7・REPAIR-12・#3348）。
+# root と `unshare --net --mount` が要る実機前提のため、`--ignored` を付けたときだけ実行する。
+[[test]]
+name = "network_recorded_lifecycle_privileged"
+path = "tests/network_recorded_lifecycle_privileged.rs"
+harness = false
+
 [[test]]
 name = "tcp_rtt_probe"
 path = "tests/tcp_rtt_probe.rs"

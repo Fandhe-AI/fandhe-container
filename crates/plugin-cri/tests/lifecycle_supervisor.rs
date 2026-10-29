@@ -1216,7 +1216,20 @@ fn repair5_cri2_3027_force_delete_cuts_cleanup_at_deadline() {
     assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
     assert_eq!(supervisor_log_names(&root), ["c1.log", "c1.log.lock"]);
     assert_eq!(log_dir_names(&root), ["c1.log", "c1.log.lock"]);
-    assert_eq!(warnings.lock().expect("lock").len(), 2);
+    // 試して失敗した行には `existence` を付けない（#3260）。
+    let lines = warnings.lock().expect("lock").clone();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for target in ["supervisor_log", "container_log"] {
+        let expected = format!(
+            "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"{target}\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| **l == expected).count(),
+            1,
+            "{lines:?}"
+        );
+    }
+    assert!(lines.iter().all(|l| !l.contains("existence")), "{lines:?}");
     drop(_sink);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1256,6 +1269,15 @@ fn repair5_cri2_3027_force_delete_skips_cleanup_when_deadline_exhausted() {
     );
     let lines = warnings.lock().expect("lock").clone();
     for target in ["supervisor_log", "container_log"] {
+        // 試さなかったログの段は存在を確かめていないため `existence` を持つ（#3260）。
+        let needle = format!(
+            "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"{target}\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| **l == needle).count(),
+            1,
+            "{lines:?}"
+        );
         let needle = format!("\"target\":\"{target}\",\"code\":\"TIMEOUT\"");
         assert_eq!(
             lines.iter().filter(|l| l.contains(&needle)).count(),

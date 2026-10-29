@@ -1,86 +1,27 @@
-//! virtiofs 実機試験の補助関数の共通化（MAC-1・REPAIR-1・#3099）。
+//! virtiofs 実機試験の補助関数の共通化（MAC-1・REPAIR-1・#3099・#3351）。
 //!
-//! `virtiofs_io.rs`（IO-5・TASK-65.4）と `virtiofs_link.rs`（SEC-4・#1877）が、それぞれ複製していた
-//! スクラッチディレクトリ・コンソールログの確定待ち・期限の解決をここへ 1 本にまとめる。
-//! 片方だけ直して食い違うことを防ぐ（REPAIR-1）。
+//! `virtiofs_io.rs`（IO-5・TASK-65.4）と `virtiofs_link.rs`（SEC-4・#1877）が複製していた
+//! コンソールログの確定待ち・期限の解決をここへ 1 本にまとめる。スクラッチ・環境変数のパス読み・
+//! 末尾切り出しは std だけの `common.rs` に置く（#3351）。片方だけ直して食い違うことを防ぐ（REPAIR-1）。
 //!
 //! 呼び出し元は `virtiofs_io.rs`・`virtiofs_link.rs` と、本モジュールの単体試験 `virtiofs_harness.rs` の 3 つ。
-//! いずれも `#[path = "support/virtiofs_harness.rs"] mod harness;` で取り込む。
+//! いずれも `#[path = "support/common.rs"] mod common;` を先に、続けて
+//! `#[path = "support/virtiofs_harness.rs"] mod harness;` をトップレベルで取り込む
+//! （本ファイルは `super::common` を参照する）。
 //!
 //! `console_log::TRUNCATION_MARKER` と `std::os::unix` を使うため、取り込み側は unix 限定
 //! （`#![cfg(unix)]` か `#![cfg(target_os = "macos")]`）にすること。ファイル自体には cfg を付けない
-//! （`guest_markers.rs` と同じ流儀）。片方の試験だけが使う関数を足すときは、その関数にだけ理由付きの
-//! `allow(dead_code)` を付ける。
+//! （`guest_markers.rs` と同じ流儀）。
 //!
 //! `Vm` を使う起動・待ちループや、untrusted なゲスト出力を扱う検証・観測は各試験に残す（共通化しない）。
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::console_log::TRUNCATION_MARKER;
 
 /// VM 破棄後、コンソールログの書き出しスレッドが EOF で終わるのを待つ上限（REPAIR-5）。
 pub const CONSOLE_LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// スクラッチ名・fixture の nonce が衝突しないための通し番号。
-pub static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとの新規ディレクトリ（0700）。`keep` が false なら `Drop` で削除する。
-pub struct Scratch {
-    pub dir: PathBuf,
-    keep: bool,
-}
-
-impl Scratch {
-    pub fn new(tag: &str, keep: bool) -> Self {
-        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(base).expect("create tmp base");
-        let base = base.canonicalize().expect("canonicalize tmp base");
-        for _ in 0..100 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos());
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = base.join(format!("{tag}-{}-{nanos}-{n}", std::process::id()));
-            if std::fs::create_dir(&dir).is_ok() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod scratch dir");
-                return Self { dir, keep };
-            }
-        }
-        panic!("could not create a fresh scratch directory");
-    }
-
-    pub fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = self.dir.join(name);
-        std::fs::write(&p, bytes).expect("write fixture");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod fixture");
-        p
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-/// 環境変数をパスとして読む。未設定なら `None`。
-pub fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
-
-/// 末尾 `max` バイトを（不正な UTF-8 は置換して）文字列にする。失敗時の診断出力用。
-pub fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    let start = bytes.len().saturating_sub(max);
-    String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).into_owned()
-}
 
 /// コンソールログが書き出しスレッドの上限（`MAX_CONSOLE_LOG_BYTES`）で打ち切られたか。
 /// 区切り文は上限到達時に末尾へ 1 回だけ書かれ、以後ゲスト出力は破棄されるため、
@@ -118,16 +59,9 @@ pub fn wait_console_log_settled(path: &Path, timeout: Duration) -> Result<(), St
 
 /// 実機試験の期限（秒）を解決する。未指定は 60 秒、指定は 1..=600 のみ受け付ける。
 pub fn resolve_probe_timeout(raw: Option<String>) -> Result<Duration, String> {
-    match raw {
-        None => Ok(Duration::from_secs(60)),
-        Some(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| (1..=600).contains(n))
-            .map(Duration::from_secs)
-            .ok_or_else(|| {
-                "FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS must be an integer in 1..=600"
-                    .to_string()
-            }),
-    }
+    super::common::resolve_secs(raw, 60, (1, 600))
+        .map(Duration::from_secs)
+        .map_err(|_| {
+            "FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS must be an integer in 1..=600".to_string()
+        })
 }

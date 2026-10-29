@@ -38,11 +38,13 @@ use fandhe_container_platform_macos::virtiofs::{
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
 
+#[path = "support/common.rs"]
+mod common;
+use common::{COUNTER, Scratch, env_path, tail_lossy};
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
 use harness::{
-    CONSOLE_LOG_SETTLE_TIMEOUT, COUNTER, Scratch, env_path, log_truncated, resolve_probe_timeout,
-    tail_lossy, wait_console_log_settled,
+    CONSOLE_LOG_SETTLE_TIMEOUT, log_truncated, resolve_probe_timeout, wait_console_log_settled,
 };
 
 const MAX_OUT_ENTRIES: usize = 16;

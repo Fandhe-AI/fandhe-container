@@ -730,7 +730,13 @@ fn recover_inner(
         }
         // 消滅（NotFound）を確認できたものだけ読み飛ばす。確認できないエラーは意図記録（再試行に要る nonce）を
         // 残したまま失敗にする。
-        if pid == 0 || !cmdline_has_nonce(pid, intent.nonce())? {
+        if pid == 0 {
+            continue;
+        }
+        if !cmdline_has_nonce(pid, intent.nonce())? {
+            // 回収前に終了した自分の子はゾンビで cmdline が空になり、nonce では帰属できない。シグナルは
+            // 送らず、終了済みの自分の子だけを回収する（生存中の候補は従来どおり nonce の一致が要る）。
+            let _ = reap_exited_child(pid);
             continue;
         }
         let pidfd = match open_pidfd(pid) {
@@ -770,6 +776,16 @@ fn settle_candidate(
         }
         Err(e) => Err(with_note(e, "intent record kept")),
     }
+}
+
+/// `pid` が終了済みの自分の子なら pidfd で回収して true。生存中・自分の子でない・存在しないなら何もせず false。
+/// シグナルは送らない。呼び出し元が child subreaper のとき、回収前に終了した段 2 のゾンビを残さないために使う。
+fn reap_exited_child(pid: u32) -> bool {
+    let Ok(pidfd) = open_pidfd(pid) else {
+        return false;
+    };
+    matches!(wait_exit(pidfd.as_fd(), Duration::ZERO), Ok(true))
+        && matches!(process::reap_pidfd_nohang(pidfd.as_fd()), Ok(true))
 }
 
 /// pidfd の子が終了していれば（ゾンビの cmdline は空）、別のプロセスではなく子の終了として回収して true。
@@ -1139,5 +1155,24 @@ mod ack_tests {
         );
         assert!(line.len() <= IDENT_LINE_MAX, "{}", line.len());
         assert!(line.len() < crate::dns_helper::PIPE_ATOMIC_MAX);
+    }
+
+    /// REPAIR-5・NET-5: 回収前に終了した自分の子 (ゾンビ・cmdline が空) は nonce 検査の前に回収され、
+    /// 生存中の子には触れない。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3070_reap_exited_child_before_nonce_check() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        assert!(!reap_exited_child(pid));
+        assert!(child.try_wait().expect("try_wait").is_none());
+        child.kill().expect("kill");
+        let pidfd = open_pidfd(pid).expect("pidfd");
+        assert!(wait_exit(pidfd.as_fd(), Duration::from_secs(5)).expect("wait"));
+        let proc_stat = format!("/proc/{pid}/stat");
+        assert!(std::path::Path::new(&proc_stat).exists(), "zombie before");
+        assert!(reap_exited_child(pid));
+        assert!(!std::path::Path::new(&proc_stat).exists(), "reaped");
+        assert!(!reap_exited_child(pid));
     }
 }

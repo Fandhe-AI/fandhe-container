@@ -1275,7 +1275,7 @@ mod tests {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     /// テスト用の一時ディレクトリ（`std::env::temp_dir` 配下に一意名。終了時に削除）。
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new(tag: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
@@ -1283,8 +1283,11 @@ mod tests {
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-            Self(p)
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            // 作るのはホスト側の非特権 uid（namespace 試験の root は `unshare -r` の user namespace 内で、
+            // ホスト上では非特権）なので、予測できる名前の削除（A）でよい。
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(p, root)
         }
         fn script(&self, name: &str, body: &str) -> String {
             let p = self.0.join(name);
@@ -1296,11 +1299,6 @@ mod tests {
             let w = self.0.join("work");
             let _ = fs::DirBuilder::new().mode(0o700).create(&w);
             w
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 

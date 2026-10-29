@@ -957,6 +957,8 @@ pub fn write_with_fallback(
 mod tests {
     /// SEC-4・#2027: 別の open file description が排他 `flock` を保持していれば `probe_append` は `Lock` で失敗し、
     /// 解放後は監査ログへ 1 バイトも書かずに成功する(open できるだけでは記録経路の確認にならない)。
+    /// 並列の他の試験が fork した子が fd の複製を持っていても、明示解放(`LOCK_UN`)で通ることを毎回照合する
+    /// (並列の全件実行での間欠失敗の原因。REPAIR-12・#3292)。
     #[cfg(unix)]
     #[test]
     fn sec4_2027_probe_append_fails_while_locked_elsewhere() {
@@ -980,13 +982,18 @@ mod tests {
             .open(&path)
             .unwrap();
         other.lock().unwrap();
+        // 並列の他の試験が `|| true` で fork した子(exec しない)が引き継ぐ fd の代役。同じ OFD を指すため、
+        // `drop(other)`(close)だけでは flock が解放されない。
+        let inherited = other.try_clone().unwrap();
         let mut writer = AuditFileWriter::from_file_unchecked_in(holder, dir.clone());
         let e = writer
             .probe_append_with(&queue, Duration::from_millis(200))
             .unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::Lock);
+        // flock は OFD に付き、複製が残っていても `LOCK_UN` で解放される(flock(2))。close に頼ると
+        // 他の試験の fork 子が複製を持つ間は解放されない(#3292)。
+        other.unlock().unwrap();
         drop(other);
-        // 並行する他の試験の fork が fd の複製を持つ間は解放されないため、解放後は長めに待つ。
         let released = writer.probe_append_with(&queue, Duration::from_secs(5));
         #[cfg(target_os = "linux")]
         {
@@ -1001,6 +1008,7 @@ mod tests {
             );
         }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(inherited);
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);
     }

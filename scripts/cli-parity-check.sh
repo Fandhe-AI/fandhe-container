@@ -14,7 +14,7 @@
 #         使い方エラーと不在 ID だけ（#2605）。書き手のレコードが要る・--follow が期限まで終わらない
 #         ケースは手動のまま（docs/verification/cli-cross-platform-parity.md の D 層）。
 #   B 層: 挙動（Linux は core 直接、macOS / Windows は plugin 発見機構経由）。非 Linux の plugin 起動と
-#         RPC は未配線（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕。REPAIR-3）のため、現時点で非 Linux の B 層は Linux と一致しない。
+#         RPC は未配線（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕。REPAIR-3）のため、現時点で非 Linux の B 層は Linux と一致しない。
 #         不一致は「前提未達」の事実であり、合格に見せてはならない。
 #
 # 呼び出し元: Makefile の `cli-parity`（操作者が明示実行。make ci には含めない）。自己テストは

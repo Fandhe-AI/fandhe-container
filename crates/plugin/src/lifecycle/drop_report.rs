@@ -14,7 +14,7 @@
 //! 契約の限界（REPAIR-3）:
 //! - `push` と並行して取り出しが走った場合、その時点で積まれた記録だけを返す（後の記録は次回の取り出しで返る）
 //! - SIGKILL・abort・`signals` のシグナル再送出による終了と、取り出しを呼ばないホスト（core の plugin proxy は
-//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 で配線予定）では、延期した記録は残らない
+//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 で配線予定）では、延期した記録は残らない
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

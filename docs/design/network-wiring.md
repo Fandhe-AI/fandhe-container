@@ -60,7 +60,7 @@
   - `add-host`: 256 件以下、299 バイト以下
   - `dns`: 32 件以下、45 バイト以下
   - CLI は `--network` を省略しても `network none` を必ず書く（NET-6 の既定は CLI が適用する）。supervisor は復号のたびに net のパーサで再検証する（未信頼の入力）。文書に `network` kind が無い（plugin-cri・従来のコンテナ）ときは「config に従う」＝現行の挙動のまま
-- 追記（#1935）: rootless のユーザー定義名（pasta 構成）では kind `pasta` と `publish` を足す。詳細は [rootless-network.md](rootless-network.md) 12.4・12.6。`publish` の kind と CLI の `-p` の解析・検証は #3200 で実装済み。CLI が `network` とともに文書へ書くのは #1873 の後。
+- 追記（#1935）: rootless のユーザー定義名（pasta 構成）では kind `pasta` と `publish` を足す。詳細は [rootless-network.md](rootless-network.md) 12.4・12.6。`publish` の kind と CLI の `-p` の解析・検証は #3200 で実装済み。CLI が `network` とともに文書へ書くのは #3329 で行う（none / host 等の記録は #1873 で実装済み）。
 - **理由**: argv・特権ランチャー・`start_client` を変えずに済む。serde / toml を supervisor へ足さない（依存の承認が要る。既存文書でも却下済み）。
 - **却下した案**: argv / env で渡す（既存文書の却下理由と同じ）。core の `StateRecord` に同梱する（plugin 境界の型が変わる）。
 
@@ -238,7 +238,7 @@ D11 の実装状況（#3346・NET-1・NET-7・REPAIR-4）: 残った `realized.i
   - (A) **推奨**: 新 crate `fandhe-container-plugin-net`（bin）を作り、plugin-cri の `NetsetupNetwork` などをこの crate の lib へ移して plugin-cri と共有する。crate の追加なので [crate-naming.md](crate-naming.md) の改定とオーナー承認が要る
   - (B) plugin-cri のバイナリに `NetworkPlugin` の RPC を足す（CRI と CLI の結合が増える）
   - (C) supervisor の中で net を直接呼ぶ（2026-10-15 の決定に反する）
-- 関連する承認待ち: RootfulHostRoot（#2241）。plugin の起動の配線（#1869）は closed で、[plugin-backend-wiring.md](plugin-backend-wiring.md) の設計案に従う。
+- 関連する承認待ち: RootfulHostRoot（#2241）。plugin の起動の配線は #1869 で設計済み（承認と実装 issue の起票は #2232）で、[plugin-backend-wiring.md](plugin-backend-wiring.md) の設計案に従う。
 - spec 側への確認事項: 作成・削除を最初の attach / 最後の detach へ遅らせると、NET-4 の「ネットワーク作成・削除」の時間の意味が変わる。
 
 #### D13 の承認事項（判断シート）

@@ -275,7 +275,7 @@ impl NetworkOptions {
         &self.dns
     }
 
-    /// 検証済みの `-p` / `--publish`(pasta の引数への変換は `PastaPortForwards::pasta_args`。#1940 が連結する)。
+    /// 検証済みの `-p` / `--publish`(pasta の引数への変換は `PastaPortForwards::pasta_args`。`pasta_attach` が連結する（#1940 で実装済み）)。
     pub fn publish(&self) -> &PastaPortForwards {
         &self.publish
     }

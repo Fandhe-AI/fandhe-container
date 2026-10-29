@@ -2,11 +2,11 @@
 //!
 //! バイナリの入口（起動引数の解析と終了コードの規則。[`startup`]）と、実装の組み立て口（[`adapter`]。TASK-114.2・#458）、
 //! `--socket <PATH>` の UDS 上で `RuntimeService` を gRPC サーブする `server`（unix のみ。TASK-114.3.1・#849・PLUG-1・PLUG-2）がある。
-//! core との接続の向きは `docs/design/plugin-backend-wiring.md` 4.9（#1869。承認待ち）に従い、plugin-cri が gRPC サーバー、
+//! core との接続の向きは `docs/design/plugin-backend-wiring.md` 4.9（#1869。承認と実装 issue の起票は #2232）に従い、plugin-cri が gRPC サーバー、
 //! core 側（kubelet / crictl 相当）が `fandhe-container-plugin` の `connect_uds_channel` で接続するクライアントである。
 //! `ImageService` は同じ UDS・同じ listener でサーブする（`PullImage` の登録先の在庫を `CreateContainer` のタグ解決と共有する。#2592・CRI-3）。
 //! 在庫はプロセス内だけで、再起動でタグの対応は失われる（キャッシュは残る）。
-//! 未実装（REPAIR-3）: 既定の socket パスの解決と lifecycle からの起動（#459・#1869）、
+//! 未実装（REPAIR-3）: 既定の socket パスの解決と lifecycle からの起動（#459。配線の設計は #1869、承認と実装 issue の起票は #2232）、
 //! 在庫の永続化（TASK-183・#2315・#2380）。start / kill / stop と cgroup remover は supervisor 経由で本番結線済み
 //! （`supervised`。Linux のみ。#2434）。本番の `BundleProvider`（#2433）も結線済みで、タグ・digest・image ID で `CreateContainer` を受ける。
 //! crictl の通し（#442）の pod.json はホストの network namespace（NODE）を指定する（core が pod の network namespace の join を受けるまで。

@@ -2,7 +2,7 @@
 //!
 //! PLUG-12 は plugin との UDS を `$XDG_RUNTIME_DIR/fandhe-container/` 相当の、0700 かつ core 実行 UID
 //! 所有のディレクトリ配下にのみ作ることを求める。本モジュールはその「解決・作成・検証」を担い、
-//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
+//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
 //! [`crate::UdsListener::bind`] へ渡す入口になる。
 //!
 //! # 契約

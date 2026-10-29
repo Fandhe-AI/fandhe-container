@@ -26,7 +26,7 @@
 //!   （`run_isolated`）・`open_checked`・代替経路が Linux 専用のため、検証が常に返す `unsupported` の拒否の記録は
 //!   `SinkFailed` のまま。Windows は `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査が未実装）
 //!   で記録先を作れない。どちらも残りの実装待ち（SEC-4）
-//! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
+//! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
 //!
 //! # `container_id` を付けない理由（R4）
 //!

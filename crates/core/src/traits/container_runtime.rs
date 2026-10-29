@@ -2,7 +2,7 @@
 //!
 //! CRI サーバー層（`fandhe-container-cri`）・将来の containerd shim v2（CRI-5）は、
 //! この内部トレイトを呼ぶアダプタとなる想定（PoC-7 の原案）。実装は本 crate には置かず、
-//! 別プロセス plugin（`fandhe-container-plugin-cri` 等は TASK-114、バックエンド plugin は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）が担い、core 側の
+//! 別プロセス plugin（`fandhe-container-plugin-cri` 等は TASK-114、バックエンド plugin は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）が担い、core 側の
 //! proxy（G8・TASK-107。バックエンド plugin 向けは #1869 の設計の 4.1・4.3）が UDS＋長さ接頭辞フレームの RPC へ変換して
 //! `Box<dyn ContainerRuntime>` として呼び出し側へ渡す（PLUG-1）。
 //!
@@ -726,7 +726,7 @@ impl CleanupTarget {
 /// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`・CLI の `delete`）。
 ///   CLI も `finish_delete` で埋める（警告の 1 行 JSON は CLI 自前の形式。#2698）
 ///
-/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869）の DTO への追加は未実装。
+/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869 の設計。承認と実装 issue の起票は #2232）の DTO への追加は未実装。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeleteResponse {

@@ -1,7 +1,7 @@
 //! plugin プロセスの常駐モード（PLUG-7・TASK-110.2・#259）。
 //!
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
-//! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
+//! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
 //! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`PluginLaunchSpec`] を受け取る。
 //! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。共用する終了待ち等の定数・型は中立な名前〔`PLUGIN_EXIT_TIMEOUT`・`PluginStderr`・`PluginTermination` など。#2608〕）。
 //!

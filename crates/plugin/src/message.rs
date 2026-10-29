@@ -1,6 +1,6 @@
 //! 制御面メッセージの serde_json 符号化・復号（TASK-107.3・PLUG-2・PLUG-5・REPAIR-1・MS-3・#247）。
 //!
-//! core 側 proxy（`ContainerRuntime` 等の plugin 実装へ要求を送る側。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）と plugin
+//! core 側 proxy（`ContainerRuntime` 等の plugin 実装へ要求を送る側。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）と plugin
 //! バイナリ（受ける側）の双方が、[`Frame`] のペイロードへ載せる JSON を作る・読むための層。
 //! ペイロード方式は serde_json（#246 の決定。bincode は RUSTSEC-2025-0141 のため不採用）。
 //! 個々の RPC の型対応は core 側の責務で、本モジュールは汎用エンベロープ [`ControlMessage<T>`] と
@@ -61,7 +61,7 @@ impl MessageId {
     }
 }
 
-/// 制御面メッセージのエンベロープ。`T` は要求・応答の本体型（置き場所は #1869 の設計の 4.3 で検討中・承認待ち）。
+/// 制御面メッセージのエンベロープ。`T` は要求・応答の本体型（置き場所は #1869 の設計の 4.3 で検討中。承認と実装 issue の起票は #2232）。
 ///
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
 #[derive(Clone, PartialEq, Eq)]

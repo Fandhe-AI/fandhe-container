@@ -38,6 +38,12 @@ pub const RESERVED_NETWORK_NAMES: [&str; 4] = ["none", "host", "bridge", "defaul
 
 const MAGIC: &str = "FCNET1\n";
 
+/// 予約名の拒否の唯一の文言（NET-6・REPAIR-1）。
+///
+/// `check_name`・`create_with_sync`・`NetworkChoice::parse`（net 内の 3 経路）と cli の
+/// `network create` が同じ文言を返すよう共有する。入力値は含めない。コードは `InvalidArgument`。
+pub const MSG_RESERVED_NETWORK_NAME: &str = "network name is reserved";
+
 /// 予約名か。
 pub fn is_reserved_network_name(name: &str) -> bool {
     RESERVED_NETWORK_NAMES.contains(&name)
@@ -73,7 +79,7 @@ fn check_name(name: &str) -> Result<NetworkName, NetError> {
     if is_reserved_network_name(name) {
         return Err(err(
             NetErrorCode::InvalidArgument,
-            "network name is reserved",
+            MSG_RESERVED_NETWORK_NAME,
         ));
     }
     Ok(n)
@@ -350,5 +356,16 @@ mod tests {
         }
         assert!(is_reserved_network_name("bridge"));
         assert!(!is_reserved_network_name("web"));
+    }
+
+    /// NET-6・REPAIR-1: 予約名の拒否文言は 1 種類で、具体値を固定する。
+    #[test]
+    fn net6_reserved_name_message_is_single_wording() {
+        assert_eq!(MSG_RESERVED_NETWORK_NAME, "network name is reserved");
+        for n in ["bridge", "default"] {
+            let e = check_name(n).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "network name is reserved");
+        }
     }
 }

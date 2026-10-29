@@ -92,7 +92,13 @@ pub struct NetworkOptions {
 
 /// net の固定メッセージを保ったまま `TraitError` へ写す(`NetErrorCode` は `#[non_exhaustive]`)。
 ///
-/// CLI の create 検証(`create_network.rs`)も同じ写像を使う(REPAIR-1。写像を 2 か所に持たない)。
+/// 入力検証(FCOPT1 の再検証・CLI の create 検証 `create_network.rs`)と `start --network host` の netns 照合が
+/// 共有する写像(REPAIR-1)。返すコードは 4 種(`InvalidArgument`・`Unimplemented`・`ResourceExhausted`・
+/// `FailedPrecondition`)に絞り、残りは `Internal` に畳む。この出力は `net12_error_mapping` が固定している。
+///
+/// コードを保つ写像(cli の pasta 解決・plugin-cri の netsetup・holder の起動が使う)は別の契約で、
+/// [`crate::net_error::net_error_to_trait_keeping_code`] にある。本写像を広げると `HostNetns::detect` の
+/// `NotFound`・`PermissionDenied` の出力が変わるため、統合していない。
 pub fn net_error_to_trait(e: &NetError) -> TraitError {
     let code = match e.code() {
         NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
@@ -399,7 +405,7 @@ mod tests {
         for n in ["bridge", "default"] {
             let e = p(Some(n), &[], &[]).expect_err("reserved");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
-            assert_eq!(e.message(), "reserved network name");
+            assert_eq!(e.message(), "network name is reserved");
         }
         let long = "a".repeat(65);
         for n in ["Web", ".x", "", long.as_str()] {

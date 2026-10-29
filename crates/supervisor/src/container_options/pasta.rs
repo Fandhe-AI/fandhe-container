@@ -14,7 +14,7 @@
 //!   (`AuditEvent::PastaVerify`)として監査の記録先へ配送する(#3330)。構造化ログ(`pasta_verify`)にも残す。
 
 use fandhe_container_core::audit_log::PastaVerifyRejection;
-use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+use fandhe_container_core::traits::types::TraitError;
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::pasta::binary::PastaBinary;
 use fandhe_container_net::pasta::record::{MSG_RECORD_CHANGED, PastaRecord};
@@ -31,16 +31,7 @@ pub struct PastaReverifyError {
 impl PastaReverifyError {
     /// 呼び出し元のエラー型へ写す（固定の英文のまま。コードは保つ。未知のコードは `Internal`）。
     pub fn trait_error(&self) -> TraitError {
-        let code = match self.code {
-            NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-            NetErrorCode::NotFound => ErrorCode::NotFound,
-            NetErrorCode::PermissionDenied => ErrorCode::PermissionDenied,
-            NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-            NetErrorCode::Timeout => ErrorCode::Timeout,
-            NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-            NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-            _ => ErrorCode::Internal,
-        };
+        let code = crate::net_error::net_code_to_trait(self.code);
         TraitError::new(code, self.message.clone())
     }
 
@@ -89,6 +80,7 @@ pub fn reverify_recorded_pasta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::traits::types::ErrorCode;
 
     fn err(code: NetErrorCode, msg: &str) -> PastaReverifyError {
         NetError::new(code, msg.to_owned()).into()

@@ -3420,12 +3420,13 @@ mod linux {
                 // 2c が期限超過なら、報告の後に作業スレッドを `LATE_DRAIN_BUDGET` だけ待ち、遅れて置かれた改ざんの印と
                 // 行を拾う(報告の期限は延びない。launch しない経路なので単一スレッド要求にも触れない。#3431)。
                 // 回収できなければ期限超過の行が終端の記録になる(残余。docs/design/rootless-network.md)。
-                if let Some(w) = unjoined_options
-                    && w.drain(LATE_DRAIN_BUDGET)
-                {
-                    record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, None);
-                }
-                pasta_logs.flush();
+                finish_after_refused_start(
+                    unjoined_options,
+                    audit.as_ref(),
+                    &args.id,
+                    &pasta_logs,
+                    LATE_DRAIN_BUDGET,
+                );
                 return ExitCode::from(code.get());
             }
         };
@@ -3467,6 +3468,25 @@ mod linux {
 
     /// 改ざんの疑いの監査配送の予算(起動の期限の残りと小さい方。REPAIR-5)。
     const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
+
+    /// 拒否の報告を書いた後の始末: 未回収の 2c 作業スレッドを `budget` まで待ち、届けば遅れて置かれた改ざんの印を
+    /// 監査へ配送し、最後に遅延ログを flush する(SEC-4・NET-9・REPAIR-5・#3431)。
+    ///
+    /// 報告の後に呼ぶので報告の期限は延びない。launch しない経路のため単一スレッド要求にも触れない。
+    fn finish_after_refused_start(
+        unjoined: Option<UnjoinedOptionsWorker>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+        budget: Duration,
+    ) {
+        if let Some(w) = unjoined
+            && w.drain(budget)
+        {
+            record_pasta_tamper(audit, id, logs, None);
+        }
+        logs.flush();
+    }
 
     /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、入口が構築済みの監査 relay 経由で `@audit.log` へ 1 件配送する
     /// (SEC-4・PLUG-11・#3330)。
@@ -3659,6 +3679,62 @@ mod linux {
             assert!(lines[0].contains("\"event\":\"pasta_audit_unavailable\""));
             assert!(lines[0].contains("\"code\":\"NOT_FOUND\""));
             assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・NET-9・REPAIR-5・#3431: 入口の報告後の始末。2c を期限超過させ、遅れて置かれた改ざんの印が
+        /// 監査 sink へ 1 件届き、遅延ログ(期限超過の行・遅れた拒否の行)が flush で空になる。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_delivers_late_tamper_to_audit() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |l| {
+                l.set_tamper(PastaVerifyRejection::PermissionDenied);
+                crate::pasta_attach::log_pasta_verify(
+                    l,
+                    "web1",
+                    Err((ErrorCode::PermissionDenied, true)),
+                    Duration::from_millis(1),
+                );
+            });
+            // 報告の時点(回収前)では改ざんの印はまだ無く、期限超過の行が積まれているだけ。
+            assert!(logs.take_tamper().is_none());
+            assert!(prepared.result.is_err());
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let _ = go.send(());
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_secs(5),
+            );
+            let recs = sink.0.lock().unwrap();
+            assert_eq!(recs.len(), 1, "{recs:?}");
+            assert_eq!(recs[0].container_id(), Some(&id));
+            assert!(logs.take().is_empty(), "flushed");
+            assert!(logs.take_tamper().is_none());
+        }
+
+        /// #3431: 回収できなければ(戻らない作業スレッド)監査へは何も送らず、遅延ログだけ flush する。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_unreachable_worker_sends_nothing() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let t = Instant::now();
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(sink.0.lock().unwrap().is_empty());
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
         }
 
         /// REPAIR-5・#3431: 戻らない作業スレッドの回収は予算で打ち切り、行を増やさない。

@@ -19,6 +19,8 @@
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
+#[cfg(target_os = "linux")]
+pub mod audit_relay;
 pub mod instance_lock;
 pub mod netsetup;
 #[cfg(unix)]

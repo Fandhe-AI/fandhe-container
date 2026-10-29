@@ -405,6 +405,7 @@ macro_rules! libc_consts_checks {
             libc_const_eq!(WNOHANG, i32, c_int);
             libc_const_eq!(SIGKILL, i32, c_int);
             libc_const_eq!(SIGPIPE, i32, c_int);
+            libc_const_eq!(SIGINT, i32, c_int);
             libc_const_eq!(SIGCHLD, i32, c_int);
             libc_const_eq!(SIGTERM, i32, c_int);
             libc_const_eq!(O_DIRECTORY, i32, c_int);
@@ -632,6 +633,8 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（x86_64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGINT`（停止シグナルを無視する helper の構築口が使う。#3300）。
+    pub const SIGINT: i32 = 2;
     // arch/x86/include/uapi/asm/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
@@ -1054,6 +1057,8 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（arm64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGINT`（停止シグナルを無視する helper の構築口が使う。#3300）。
+    pub const SIGINT: i32 = 2;
     // include/uapi/asm-generic/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
@@ -1459,6 +1464,7 @@ mod consts {
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
     pub const SIGPIPE: i32 = 0;
+    pub const SIGINT: i32 = 0;
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 0;
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
@@ -5082,6 +5088,29 @@ pub(crate) fn ignore_sigpipe() -> Result<(), SysError> {
     } else {
         Ok(())
     }
+}
+
+/// `SIGTERM` と `SIGINT` の disposition を `SIG_IGN` にする。無視は `fork` の子へ継承される（#3300）。
+///
+/// 監査 relay の helper が、プロセスグループ宛て・cgroup 全体宛ての停止シグナルで本体より先に死なず、
+/// 本体の終了（socketpair の EOF）まで記録を書き続けられるようにする（SEC-4・REPAIR-5）。`SIGKILL` は
+/// 無視できないため、最終的な回収は妨げない。呼び出し元は exec しない fork の子（helper）に限る
+/// （`execve` を越えて無視が継承されるため、コンテナ内のコマンドへ持ち込まない）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの disposition を変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ignore_stop_signals() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    for sig in [consts::SIGTERM, consts::SIGINT] {
+        // SAFETY: 引数は整数（`SIG_IGN` = 1）のみでポインタを取らない。ハンドラ関数を登録しないため、
+        // シグナルハンドラの再入・非同期安全性の問題は生じない。単一スレッドから fork した子で呼ぶ。
+        let prev = unsafe { signal(sig, SIG_IGN) };
+        if prev == SIG_ERR {
+            return Err(last_error());
+        }
+    }
+    Ok(())
 }
 
 /// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。

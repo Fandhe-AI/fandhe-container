@@ -54,6 +54,13 @@ name = "create_destination_audit_relay"
 path = "tests/create_destination_audit_relay.rs"
 harness = false
 
+# #3300: プロセスグループ宛ての SIGTERM の後も監査 helper が生き、ドレイン中の拒否が @audit.log に届くことの結合試験
+# （SEC-4・PLUG-12・CRI-1・REPAIR-5）。relay の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの `main` で動かす。
+[[test]]
+name = "shutdown_audit_helper"
+path = "tests/shutdown_audit_helper.rs"
+harness = false
+
 [[bin]]
 name = "fandhe-container-plugin-cri"
 path = "src/main.rs"

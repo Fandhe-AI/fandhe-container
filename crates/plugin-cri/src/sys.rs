@@ -20,6 +20,20 @@
 //! 番号の出典は Linux `include/uapi/asm-generic/signal.h`〔SIGINT=2・SIGTERM=15。x86_64・aarch64 とも同じ〕と
 //! macOS `sys/signal.h`〔同値〕）。導入は後続（#1837 の子として起票候補）。
 //!
+//! # fork した子への継承（#3300）
+//! 登録したハンドラは exec しない `fork` の子へ引き継がれ、そうした子は停止シグナルでは死なない（atomic を立てるだけ）。
+//! 前提と帰結:
+//! - exec した子（`std::process::Command` 経由の supervisor・systemd-run・getent 等）は、`execve` で捕捉中のハンドラが
+//!   `SIG_DFL` に戻る（`SIG_IGN` は引き継がれる）ため問題にならない。
+//! - exec しない fork は core の `fork_single_threaded*` だけで、呼び出しプロセスが複数スレッドだと拒否される。
+//!   ランタイム・forwarder・`LineSink` のスレッドができた後は構造的に到達しない。残る窓はハンドラ登録後から最初の
+//!   スレッドができるまでの起動段だけで、そこで作られた子も期限（各段の予算）と SIGKILL で回収される。
+//! - 監査 relay の helper は fork の直後に自分で SIGTERM・SIGINT を `SIG_IGN` にする
+//!   （`ControlAuditRelay::spawn_ignoring_stop_signals`）。継承に頼らない。
+//!
+//! 固定する試験: 結合試験 `shutdown_audit_helper`（登録後に exec した子の `SigCgt` にビットが無いこと、helper の
+//! `SigIgn` にビットがあること）。
+//!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`install_shutdown_signals`] と [`received`] のみ。
 //! - ハンドラは `static AtomicI32` への compare_exchange だけを行う（async-signal-safe。確保・ロック・I/O・panic なし）。
@@ -189,9 +203,11 @@ mod tests {
     use super::*;
 
     /// 静的状態を共有するため 1 件にまとめる（CRI-1・REPAIR-5）。ハンドラは直接呼ぶ（自プロセスへ raise しない）。
+    /// `install_shutdown_signals()` は呼ばない: libtest のプロセスで SIGINT・SIGTERM が効かなくなり Ctrl-C で
+    /// 止まらなくなるため（#3300）。登録の成功は本番バイナリの試験（`container_grpc` の停止の段）と、別プロセスで
+    /// 登録する結合試験 `shutdown_audit_helper` が担う。
     #[test]
     fn handler_records_only_the_first_signal() {
-        install_shutdown_signals().expect("install");
         assert_eq!(received(), None);
         imp::on_signal(imp::SIGINT);
         assert_eq!(received(), Some(ShutdownSignal::Int));

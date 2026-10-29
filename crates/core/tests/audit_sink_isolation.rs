@@ -302,6 +302,7 @@ mod linux {
         control_relay_persists_from_a_multi_threaded_process();
         control_relay_keeps_exit_signal_records_from_many_threads();
         control_relay_exit_signal_times_out_then_is_unavailable();
+        control_relay_stop_signal_disposition_of_the_helper();
         // `SIGCHLD` の disposition を変えるため最後に実行する。
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
         sigchld_ignored_keeps_results_and_records_once();
@@ -624,6 +625,36 @@ mod linux {
             ErrorCode::Unavailable
         );
         drop(relay);
+        wait_single_threaded();
+    }
+
+    /// SIGTERM・SIGINT の `SigIgn` のビット（シグナル番号 n はビット n-1）。
+    const STOP_MASK: u64 = (1 << (2 - 1)) | (1 << (15 - 1));
+
+    fn sig_ign(pid: u32) -> u64 {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let line = text.lines().find(|l| l.starts_with("SigIgn:")).unwrap();
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    }
+
+    /// SEC-4・REPAIR-5・#3300: `spawn_ignoring_stop_signals` の helper は SIGTERM・SIGINT を無視し、従来の `spawn`
+    /// （supervisor が使う）の helper は無視しない（挙動不変の固定）。どちらも drop で SIGKILL され回収される。
+    fn control_relay_stop_signal_disposition_of_the_helper() {
+        // fork の直後は子がまだ closure を実行していない可能性があるため、probe の往復（結果は問わない）の後に読む。
+        let healthy = |tag: &str| {
+            let primary: Primary =
+                Arc::new(|path, _| std::fs::write(path, b"x").map_err(|_| unreachable_err()));
+            sink(primary, false, Notify::Discard, tmp_marker(tag)).0
+        };
+        let ignoring = ControlAuditRelay::spawn_ignoring_stop_signals(healthy("stop-ign")).unwrap();
+        let _ = ignoring.probe();
+        assert_eq!(sig_ign(ignoring.pid()) & STOP_MASK, STOP_MASK);
+        drop(ignoring);
+        wait_single_threaded();
+        let plain = ControlAuditRelay::spawn(healthy("stop-plain")).unwrap();
+        let _ = plain.probe();
+        assert_eq!(sig_ign(plain.pid()) & STOP_MASK, 0);
+        drop(plain);
         wait_single_threaded();
     }
 

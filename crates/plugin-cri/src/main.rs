@@ -17,7 +17,8 @@
 //! socket は listener の drop で削除し、ロックは終了時の fd の close で外れる（ロックファイルは消さない）。
 //! 起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見る（段の途中では各段の予算まで待つ）。
 //! 正常停止は stderr に固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>` を出し、終了コード 0。
-//! ハンドラは監査の relay の fork の直後に登録する（helper は既定動作のまま）。SIGHUP は対象外。
+//! 監査 relay の helper は SIGTERM・SIGINT を無視し、本体の終了（EOF）で終わる（グループ・cgroup 宛ての停止で先に死なず、ドレイン中の拒否も
+//! `@audit.log` に届く。#3300）。fork した子へのハンドラの継承は `sys` の doc「fork した子への継承」。SIGHUP は対象外。
 //!
 //! 終了コード: 0 = `--help` と正常停止、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
 //! （未実装・起動失敗・serve の失敗）。
@@ -95,15 +96,17 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     // `ControlAuditRelay::spawn` は単一スレッドのときだけ成功し、helper は fd 3 以上を閉じるため。
     // 作れなければ「記録されないまま受け付ける」状態を避けて起動しない（fail-closed。supervisor の #2027 と同じ）。
     #[cfg(target_os = "linux")]
-    let audit_sink = match open_audit_relay() {
-        Ok(sink) => sink,
-        Err(code) => {
+    let audit_sink = match fandhe_container_plugin_cri::audit_relay::open_audit_relay_in(None) {
+        Ok(relay) => relay as std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>,
+        Err(e) => {
+            let code = e.code().as_str();
             eprintln!("error: {code}: failed to open the audit log");
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    // 停止シグナルの受信記録は relay の fork の後（helper は既定動作のまま）、受付の前に登録する（#3226・CRI-1）。
-    // 以降の fork は exec しない経路を持たない前提（core の `fork_single_threaded*` は relay の前の単一スレッドが条件）。
+    // 停止シグナルの受信記録は relay の fork の後、受付の前に登録する（#3226・CRI-1）。helper は fork の直後に自分で
+    // SIGTERM・SIGINT を無視にしている（#3300）ので、登録の順序には依らない。exec しない fork の子へのハンドラの継承は
+    // `sys` の doc「fork した子への継承」と結合試験 `shutdown_audit_helper` が固定する。
     // 登録できなければ、後始末を経ずに死ぬ状態で動かさないため起動しない（fail-closed）。
     if let Err(e) = sys::install_shutdown_signals() {
         return fail(e.code(), e.message());
@@ -326,18 +329,6 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         // stderr が詰まっても終われるよう、書き出しは期限つきの `LineSink` 経由にする（REPAIR-5）。
         Err(e) => fail_err_bounded(&e),
     }
-}
-
-/// 監査専用の helper を fork して記録先を確かめる。失敗したら固定文言のエラーコードトークンを返す。
-#[cfg(target_os = "linux")]
-fn open_audit_relay()
--> Result<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>, &'static str> {
-    use fandhe_container_core::audit_log::{ControlAuditRelay, FileAuditSink};
-    let relay = FileAuditSink::open_in_state_root(None)
-        .and_then(ControlAuditRelay::spawn)
-        .and_then(|relay| relay.probe().map(|()| relay))
-        .map_err(|e| e.code().as_str())?;
-    Ok(std::sync::Arc::new(relay))
 }
 
 #[cfg(not(unix))]

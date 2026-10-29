@@ -1167,6 +1167,8 @@ mod tests {
         fn new() -> Self {
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
             let p = std::env::temp_dir().join(format!("fandhe-doctor-{}-{n}", std::process::id()));
+            // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).expect("mkdir");
             Self(p)
         }

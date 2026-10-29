@@ -201,8 +201,8 @@ mod tests {
     /// SUP-12・CLI-1: `--env-file` は `-e` より優先順位が低く、統合後の `KEY=VALUE` が文書に入る。
     #[test]
     fn sup12_create_options_env_file_then_flags() {
-        let dir = std::env::temp_dir().join(format!("fcopt-envf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        // pid だけの名前は残骸と衝突するため、連番つき・作成前削除の補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fcopt-envf", "env");
         let file = dir.join("a.env");
         std::fs::write(&file, "# c\nA=file\nB=file\n").expect("write");
         let mut a = args();
@@ -213,7 +213,31 @@ mod tests {
         let doc = document_of(&a, None).expect("doc");
         assert_eq!(doc.env(), ["A=file", "B=flag", "C=3"]);
         assert_eq!(doc.ulimits(), ["nofile=1024:2048"]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-12・REPAIR-12(#3375): 前回の残骸（古い `a.env` と余計なファイル）があっても `test_root_at` が
+    /// 空のディレクトリへ作り直し、`--env-file` の試験が古い内容を読まず、drop で消える。
+    #[test]
+    fn sup12_repair12_test_root_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!(
+            "fcopt-envf-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(p.join("sub")).expect("stale dir");
+        std::fs::write(p.join("a.env"), "A=stale\n").expect("stale file");
+        {
+            let root = crate::test_root::test_root_at(p.clone());
+            assert_eq!(std::fs::read_dir(&*root).expect("read_dir").count(), 0);
+            std::fs::write(root.join("a.env"), "A=new\n").expect("write");
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.env")).expect("read"),
+                "A=new\n"
+            );
+        }
+        assert!(!p.exists());
     }
 
     /// CLI-1・SUP-12(#2828): `--read-only` だけでも文書は空にならず(黙って効かなくなるのを防ぐ)、`read_only()` が true になる。

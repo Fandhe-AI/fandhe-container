@@ -697,7 +697,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sup14_launcher_mount_id_needs_openable_file() {
-        let missing = std::env::temp_dir().join(format!("fc-mi-missing-{}", std::process::id()));
+        // 「存在しない」ことが前提のため、補助で作った空ディレクトリの中の作らない子を使う（REPAIR-12・#3375）。
+        let root = crate::test_root::test_root("fc-mi-missing", "mid");
+        let missing = root.join("missing");
         assert_eq!(launcher_mount_id(&missing), None);
         let exe = std::env::current_exe().expect("exe");
         let id = launcher_mount_id(&exe).expect("mount id of the test binary");

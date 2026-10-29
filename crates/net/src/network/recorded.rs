@@ -450,6 +450,8 @@ where
 /// 入力で、再実行は冪等に収束する）。成功したのに予約の解放・記録の削除に失敗したときは [`RecordedError::Uncommitted`]
 /// （記録は残るので、再実行で収束する）。
 /// 記録に pin の識別子が無い旧形式は、pin が無ければ回収済み、残っていれば `Unknown` の取り残しで手動回収になる。
+// 実機の呼び出し（公開ラッパー）は Linux 限定。他 OS では試験だけが使う。
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn detach_member_recorded_with<E, F>(
     host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,

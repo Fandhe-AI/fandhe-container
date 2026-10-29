@@ -14,7 +14,7 @@
 //! | op | `realized` | bridge / テーブル | 処理 |
 //! | -- | ---------- | ------------------ | ---- |
 //! | create | あり | トークン一致 | `commit_realized` の後に意図記録だけ残った窓。意図記録を消す（不一致は `DataLoss`） |
-//! | create | なし | 両方所有 | 昇格。意図記録の gateway・subnet と照会で得た ifindex・ハンドルから `realized` を作る |
+//! | create | なし | 両方所有 | 昇格（同じトークンの `pending-reclaim/create` があれば昇格せず下の巻き戻し。世代の違う delete は据え置き）。意図記録の gateway・subnet と照会で得た ifindex・ハンドルから `realized` を作る |
 //! | create | なし | 両方不在 | カーネル操作の前に落ちた。意図記録を消す |
 //! | create | なし | 所有と不在の混在 | 所有する資源だけを `reclaim_failed_create_with` で巻き戻して意図記録を消す |
 //! | delete | あり / なし | 両方不在 | 削除は完了済み。`realized`（あれば）と意図記録を消す |
@@ -110,6 +110,9 @@ pub enum Unresolved {
     Unproven,
     /// 巻き戻しで取り残しがあった（次の照合が再試行する）。
     RollbackIncomplete,
+    /// 記録した `realized` の世代（boot ID・network namespace）が現在と違う。別の namespace から開いた可能性があり、
+    /// カーネル側の不在を信用できないため何も変えない。
+    GenerationMismatch,
 }
 
 /// 意図記録を残した理由。
@@ -188,6 +191,14 @@ fn drop_matching_create_claim(
     Ok(())
 }
 
+/// 同じトークンの `pending-reclaim/create` があるか。あれば作成は失敗として確定しており、昇格させず巻き戻す。
+fn has_matching_create_claim(guard: &NetworkLockGuard<'_>, token: &str) -> Result<bool, NetError> {
+    Ok(guard
+        .reclaim_records()?
+        .create
+        .is_some_and(|saved| saved.token() == token))
+}
+
 /// 所有を証明できた資源だけを巻き戻す。成功なら `true`、取り残しがあれば `false`。
 fn roll_back_owned<O: ReconcileOps>(
     guard: &NetworkLockGuard<'_>,
@@ -231,6 +242,12 @@ fn reconcile_intent<O: ReconcileOps>(
             return Ok(RealizedReconcile::Completed);
         }
         (RealizedOp::Delete, Some(r)) => {
+            // 不在の判定を信用する前に、操作対象の namespace が記録時と同じであることを確かめる。
+            if r.generation() != host {
+                return Ok(RealizedReconcile::Unresolved(
+                    Unresolved::GenerationMismatch,
+                ));
+            }
             if r.token() != token
                 || r.subnet() != intent.subnet()
                 || r.gateway() != intent.gateway()
@@ -257,7 +274,9 @@ fn reconcile_intent<O: ReconcileOps>(
             return Ok(RealizedReconcile::Unresolved(Unresolved::Unproven));
         }
         (Proof::Owned(index), Proof::Owned(handle))
-            if intent.op() == RealizedOp::Create && realized.is_none() =>
+            if intent.op() == RealizedOp::Create
+                && realized.is_none()
+                && !has_matching_create_claim(guard, token)? =>
         {
             // 昇格: 両方の所有が証明できた。bridge の別名とテーブルの userdata は、アドレス設定と up の後・
             // nft バッチの最後に作られる資源にしか付かないため、作成の手順は完了している。
@@ -459,6 +478,10 @@ pub(crate) fn reconcile_recorded_with<O: ReconcileOps>(
         return Ok(report);
     }
     if let Some(realized) = guard.realized()? {
+        // 別の boot・namespace から開いたストアでは veth・DNAT の不在を信用できないため掃除しない。
+        if realized.generation() != host {
+            return Ok(report);
+        }
         sweep_member_intents(guard, ops, &realized, &mut report)?;
     }
     Ok(report)

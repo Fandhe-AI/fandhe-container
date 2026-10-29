@@ -808,3 +808,53 @@ fn net1_3346_delete_completed_by_reconcile_only_when_realized_gone() {
     assert!(!delete_completed_by_reconcile(&report2, &n2).unwrap());
     assert!(n2.realized().unwrap().is_some());
 }
+
+fn other_host() -> HostGeneration {
+    let cur = host();
+    let netns = crate::network_store::NetnsIdentity::new(cur.netns().dev(), cur.netns().ino() + 1);
+    HostGeneration::new(cur.boot_id(), netns).unwrap()
+}
+
+/// NET-1・REPAIR-3・#3346: 同じトークンの作成回収請求書が残る両所有は昇格せず巻き戻し、請求書も消す。
+#[test]
+fn net1_3346_matching_create_claim_blocks_promotion() {
+    let t = Tmp::new("claim-promote");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    crashed_create(&n);
+    n.save_reclaim_create(&FailedCreateClaim::for_reconcile(name(), TOKEN, true, true).unwrap())
+        .unwrap();
+    let fake = Fake::owned();
+    let report = run(&n, &fake).unwrap();
+    assert_eq!(report.realized, RealizedReconcile::RolledBack);
+    assert_eq!(n.realized().unwrap(), None);
+    assert_eq!(n.realized_intent().unwrap(), None);
+    assert!(n.reclaim_records().unwrap().create.is_none());
+    assert_eq!(fake.rollback_count(), 1);
+}
+
+/// NET-1・NET-7・SEC-1・#3346: 世代が違う namespace からは削除の完了も掃除もしない。
+#[test]
+fn net1_3346_generation_mismatch_keeps_records() {
+    let t = Tmp::new("gen-mismatch");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    n.commit_realized(&realized_rec()).unwrap();
+    n.write_realized_intent(&intent(RealizedOp::Delete, TOKEN))
+        .unwrap();
+    let report = reconcile_recorded_with(&other_host(), &n, &Fake::absent()).unwrap();
+    assert_eq!(
+        report.realized,
+        RealizedReconcile::Unresolved(Unresolved::GenerationMismatch)
+    );
+    assert!(n.realized().unwrap().is_some());
+    assert!(n.realized_intent().unwrap().is_some());
+
+    n.remove_realized_intent().unwrap();
+    n.write_member_intent(&member_intent("c1", 2)).unwrap();
+    let report = reconcile_recorded_with(&other_host(), &n, &Fake::owned()).unwrap();
+    assert!(report.removed_intents.is_empty());
+    assert_eq!(n.member_intents().unwrap().len(), 1);
+}

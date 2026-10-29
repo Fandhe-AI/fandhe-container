@@ -59,9 +59,10 @@
 //! `harness = false` の単一スレッド `main` で、自身を次の役で再実行する。
 //! - 親（`--ignored`）: bundle を作り、コンテナ `A` / `B` を起動して観測する。`--ignored --rootless` は rootless の場面
 //! - `--container`: `isolate_rootful_host_root`（pid / mnt / uts / ipc）→ pid1 を子として生成して待機
-//! - rootless のコンテナ役は再入ではなく `unshare(1)` を直接起動する。core の単一 ID 経路（`plan` → `isolate`）を使わないのは、
-//!   `Namespace` に network が無く（rootless の起動経路への netns の追加は #1939）、core の `join_namespaces` が 5 種を必ず
-//!   `setns` するため、user namespace へ参加した後は初期 user namespace が所有する netns へ入れないから（`--net` が要る）
+//! - rootless のコンテナ役は再入ではなく `unshare(1)` を直接起動する。rootful と同じ照合項目と拒否経路を 1 ファイルで照合する
+//!   ため、launch と同じ手順の pid1 を手組みする試験として残している（`--net` で netns を自前に分離する）。起動経路
+//!   （`ProductionLauncher` の `Loopback` / `Attachable`。#1939）で作った netns への exec の参加は、本番の入口だけを通す
+//!   `exec_launch_netns_rootless.rs` が照合する（#3349）
 //! - `--pid1` / `--pid1-rootless`（後者は末尾に任意の差し替え指定 `tamper-symlink` / `tamper-bind-zero`）: 新しい PID namespace の PID 1。`establish` → `prepare_rootfs` → `create_default_devices` →
 //!   `pivot_root` の後、合図ファイルを置いて待機する（launch の exec は証跡未結線で拒否されるため exec しない）。
 //!   rootless は `DevptsGidSource::Rootless`（本番 launcher の単一 ID 経路と同じ。host の gid は argv で受ける）
@@ -677,9 +678,9 @@ mod linux {
     /// 非特権で行える。
     ///
     /// `rootless` のコンテナ役は `unshare(1)`（`--user --map-root-user --pid --fork --kill-child --mount --uts --ipc --net`）で、
-    /// `exec_setns_join` の rootless の場面と同じ構成。core の単一 ID 経路（`plan` → `isolate`）を使わないのは、
-    /// `Namespace` に network が無く（#1939）、user namespace へ参加した後は初期 user namespace が所有する netns へ
-    /// `setns` できない（core の `join_namespaces` は 5 種を必ず `setns` する）ため、netns を自前で分離する必要があるから。
+    /// `exec_setns_join` の rootless の場面と同じ構成。core の単一 ID 経路（`plan` → `isolate`）を使わず、
+    /// launch と同じ手順の pid1 を手組みする（rootful と同じ照合項目を 1 ファイルで照合するため。netns は `--net` で自前に分離する）。
+    /// 起動経路で作った netns への参加は `exec_launch_netns_rootless.rs` が照合する（#3349）。
     /// uid_map / gid_map は `0 <euid> 1` / `0 <egid> 1`（setgroups は deny）で、launcher の単一 ID 経路と同じ写像になる。
     /// pid1 の host 側 pid は、`unshare` の子のうち入れ子の PID 1（[`nested_pid1_child`]）として探す。
     fn start_container_as(bundle: &Bundle, tag: &str, instance: u64, rootless: bool) -> Container {

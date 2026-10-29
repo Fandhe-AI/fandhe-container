@@ -24,7 +24,7 @@
 //!   最も低い〔System < User < Path〕ため管理ディレクトリの同名を shadow しない。現状は許可済みハッシュ
 //!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-122）は、`PATH` 由来も
 //!   ハッシュ一致で採用され得るため、**登録前に除外するか採用するかを配線時に再評価し、明示的に決める**。設計案は
-//!   `docs/design/plugin-hash-allowlist.md` の 3.5。#1868・承認待ち）
+//!   `docs/design/plugin-hash-allowlist.md` の 3.5。設計は #1868、承認の追跡は #2231）
 //! - CLI フラグ（opt-in の CLI 側入口）の配線は CLI 実装（TASK-79）で行う。未実装（REPAIR-3）。
 //!   CLI は `PathSearchPolicy::Enabled` を [`DiscoveryOptions`] 経由で渡す想定
 //! - 探索先ディレクトリが存在しない場合はエラーにせず候補なしとする。それ以外の I/O エラーは
@@ -41,7 +41,7 @@
 //!   `<XDG_DATA_HOME>/fandhe-container/plugins`、無ければ絶対パスの `HOME` から
 //!   `<HOME>/Library/Application Support/fandhe-container/plugins`。信頼性検証は実装済み
 //!   （#1865。所有者・モード・全祖先・symlink 実体・拡張 ACL。`plugin_trust`）。ただし許可済みハッシュ一覧が
-//!   未配線で空のため全件拒否となり（#1868）、探索先を返しても現状は plugin が登録されない（fail-closed）。
+//!   未配線で空のため全件拒否となり（#2231）、探索先を返しても現状は plugin が登録されない（fail-closed）。
 //!   `/usr/local` がグループ書き込み可の環境（古い Homebrew 等）では祖先検査で `GroupOrOtherWritable` により
 //!   拒否される。実機での権限の実態は未確認で、確認先は #1628 の環境。PLUG-11 の macOS の規則は
 //!   2026-10-12 の決定（#1539）で spec に入っている
@@ -113,7 +113,7 @@ pub enum PluginDirKind {
     User,
     /// `PATH` 由来（opt-in 時のみ）。未検証で、名前一致のみでは登録しない（PLUG-11・TASK-122）。
     /// 許可一覧の配線時に採否を再評価する（モジュール doc の契約を参照。#1869 の設計。
-    /// 設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・#1868）。
+    /// 設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・設計は #1868、承認の追跡は #2231）。
     Path,
 }
 

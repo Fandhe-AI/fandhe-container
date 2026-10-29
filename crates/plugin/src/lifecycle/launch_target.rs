@@ -97,7 +97,7 @@ impl PluginLaunchTarget {
     /// 書き込み可能だと Linux の exec が `ETXTBSY` で失敗する（fail-closed）。
     ///
     /// 内容の同一性（hash）の確認は呼び出し側の責務。本関数の dev / ino の確認は同一 inode の
-    /// 書き換えを防がない（core の変換は `HashVerifiedPluginFile` だけを受ける。許可一覧の読み込みは #1868、本番の配線は #1869）。
+    /// 書き換えを防がない（core の変換は `HashVerifiedPluginFile` だけを受ける。許可一覧の読み込みの追跡は #2231、本番の配線の追跡は #2232。設計は #1868・#1869）。
     ///
     /// 通常ファイルでないもの・`#!` スクリプトは `InvalidArgument`。fd の検査の失敗は `Internal`。
     /// 固定の英語文言で、パスや内容は含めない。

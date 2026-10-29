@@ -259,6 +259,14 @@ name = "exec_subordinate_e2e"
 path = "tests/exec_subordinate_e2e.rs"
 harness = false
 
+# rootless の exec が起動経路（ProductionLauncher の Loopback / Attachable）で作った netns へ参加して通ることを、本番の入口
+# （create → start、run_command_with_pidfd、spawn_netns_holder）だけで照合する実機前提の結合試験（SUP-6・NET-9・CORE-6・#3349。依存は不変）。
+# spawn_netns_holder が自身を再実行するため独自 main（harness = false）で `netns-holder` を振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "exec_launch_netns_rootless"
+path = "tests/exec_launch_netns_rootless.rs"
+harness = false
+
 # supervisor の bin の `netns-holder` 振り分けと、holder の起動の失敗・期限・回収の結合試験（NET-9・CORE-1・REPAIR-5・#3198）。
 # 同じ実行ファイルが holder の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
 # root・user namespace 不要で既定のテスト集合で実行する（試験専用の入口は exec-test-support の下。依存は不変）。

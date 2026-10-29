@@ -105,6 +105,7 @@ table=<0|1>
   - 載せる公開: 解除に失敗して残りうる（`Present`・`Unknown`）もので、テーブルハンドルを持つもの。期限切れで要求を送らなかった公開を含む。テーブルハンドルは公開の時点で取れたものだけを載せ、未束縛の公開（ハンドルを取れなかったもの）は請求書に載せない。テーブルのハンドルが 0 のときは同一性を比べられないため、作り直しと読まず DELRULE を送らずに `Unknown` の取り残しにして請求書を保つ。載せない公開: 解除済み、`StaleHandles`（記録した実体はもう無い）、テーブルハンドルが無いもの、載せる公開のテーブルハンドルが食い違うとき（手動回収と quarantine）
   - 回収（`reclaim_failed_attach`。veth より前）: テーブルの `NFTA_TABLE_USERDATA` がトークンと一致（所有）し、生きたテーブルのハンドルが請求書と一致（実体の同一性）するときだけ、ハンドル指定で DELRULE する。テーブルが無い・作り直された場合はルールも無いので回収済み、所有を証明できない場合は何も送らず `Unknown`。2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直し、片方だけ残る場合も残りを消す（ハンドルはテーブルの寿命の中で再利用されず、実体の同一性を確かめた後なので、ENOENT は「既に無い」と読める）。アドレス・予約の quarantine は `delete_network` が解放する
   - 残余リスク: 所有の証明と DELRULE の間に、同じ権限の者がテーブルを差し替える窓が残る（`unpublish` と同じ水準）。1 件ごとに最大 3 要求を送り、各要求は `timeout` で打ち切る（REPAIR-5）
+- 回収できる（条件つき）: 記録だけからの detach（`network::recorded::detach_member_recorded`。#3347・NET-1・NET-6・REPAIR-4）。`@networks` の `members/<id>`（FCMEM1）から請求書を合成し、上の DNAT ルール・veth・pin の回収に流す。条件は、世代（boot ID と network namespace）が `realized` と一致すること、同じ endpoint の `pending-reclaim/attach` の請求書が無いこと（あれば先に `reclaim_failed_attach`。detach の失敗で残る請求書は記録に無い追加公開のルールを載せうるため合成で代えない）、解除の印つきの公開が無いこと（先に `unpublish_port_recorded`）、`netns_dir` が記録と一致すること。pin の識別子はメンバー記録の `pin` 項目から取る（無い旧形式は pin が残っていれば `Unknown` で手動回収）。ホストの再起動をまたぐ場合は世代が違うため断り、手動回収に回す
 - 復元したネットワークへの `create_netns`・`attach` は拒否する
 - 壊れた記録（復号の失敗・ファイル名と記録の不一致・不正なファイル名）は、ファイルを消さず、登録もしない。件数は `net.reclaim_store_load` の失敗件数と stderr の 1 行に足す。同じコンテナの再 attach は、カーネルの `NLM_F_EXCL` による `AlreadyExists` で fail-closed になる。件数の上限を超える場合は起動を失敗させる
 

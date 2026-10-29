@@ -9,9 +9,10 @@
 //!
 //! # 呼び出し文脈
 //! 現状の利用者は [`crate::guest_files::GuestFileCreator::create_file`]。ワイヤー
-//! ペイロードの復号（#3161）・`PipelineClient::create`（#3162）・サーバーの
-//! ディスパッチ時の Nack（`INVALID_ARGUMENT`。#3163）も同じ関数で検証する予定で、
-//! 本モジュールはその土台である（それらの結線は未実装。REPAIR-3）。
+//! ペイロードの復号（`payload::decode_create`。#3161 で実装済み）は長さと UTF-8 だけを
+//! 見て、構文検証（本型の `parse`）は呼ばず呼び出し側に委ねる。同じ関数で検証する予定なのは
+//! `PipelineClient::create`（#3162）とサーバーのディスパッチ時の Nack（`INVALID_ARGUMENT`。
+//! #3163）で、本モジュールはその土台である（どちらも未実装。REPAIR-3）。
 //!
 //! # 検証の層の分担
 //! 復号時は長さと UTF-8 だけ、構文は本型、IO-5 の大文字小文字衝突とホストパス長

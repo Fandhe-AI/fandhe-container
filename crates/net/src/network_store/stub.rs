@@ -70,6 +70,11 @@ impl NetworkLockGuard<'_> {
         Err(unsupported())
     }
 
+    /// 常に `Unimplemented`（意図記録への同一性の追記。#3344）。
+    pub fn replace_dns_helper_intent(&self, _rec: &DnsHelperIntent) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
     /// 常に `Unimplemented`。
     pub fn remove_dns_helper_intent(&self) -> Result<(), NetError> {
         Err(unsupported())

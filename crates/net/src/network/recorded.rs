@@ -65,8 +65,9 @@ use crate::nftables_rules::NftRuleHandle;
 
 use super::NftApplyFailure;
 use super::delete::require_table_owned;
-use super::unpublish::unpublish_ports_with;
+use super::unpublish::{delete_published_rules_with, release_published_listener};
 use super::{PortRegistry, PublishedPort, UnpublishPortError, UnpublishRules};
+use crate::network_store::member::PublishState;
 
 /// 記録つきの操作の失敗。
 #[derive(Debug)]
@@ -610,10 +611,39 @@ fn check_member_owned(
 /// 読み取りだけなので共有ロックのガードでもよい。未完了の操作が残るネットワーク・`realized` の無いネットワーク・
 /// 記録に無いメンバーは `FailedPrecondition` / `NotFound`。公開の無いメンバーは空の列を返す。復元した値は
 /// 記録したテーブルハンドルを束縛しており、`unpublish_port_recorded_with` が解除の前に生きたテーブルと照合する。
+/// 墓標（ルールの削除を確かめ済みで予約が残る公開。#3343）は含めない（`restore_unpublished_ports_recorded`）。
 pub(crate) fn restore_published_ports_recorded(
     host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
+) -> Result<Vec<PublishedPort>, NetError> {
+    restore_with(host, guard, member_id, |rec, realized| {
+        rec.published_ports(realized)
+    })
+}
+
+/// 記録から、メンバーの墓標（DELRULE で消えたことを確かめ済みで、予約の解放だけが残る公開）を復元する（#3343）。
+///
+/// 世代・所有の照合は `restore_published_ports_recorded` と同じ。返した値は `unpublish_port_recorded_with` にだけ
+/// 渡す（カーネル操作なしで予約の解放を完了する）。`detach_container` の `extra_published` に渡してはならない
+/// （消えたルールへ DELRULE する）。墓標の予約が残ったままの detach は、`held_by` が 1 以上になり quarantine される。
+// 実機の呼び出し（公開ラッパー）は Linux 限定。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn restore_unpublished_ports_recorded(
+    host: &HostGeneration,
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+) -> Result<Vec<PublishedPort>, NetError> {
+    restore_with(host, guard, member_id, |rec, realized| {
+        rec.unpublished_ports(realized)
+    })
+}
+
+fn restore_with(
+    host: &HostGeneration,
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+    pick: impl FnOnce(&crate::network_store::MemberRecord, &RealizedRecord) -> Vec<PublishedPort>,
 ) -> Result<Vec<PublishedPort>, NetError> {
     let realized = settled_realized(guard)?;
     check_generation(&realized, host)?;
@@ -623,27 +653,33 @@ pub(crate) fn restore_published_ports_recorded(
         .find(|m| m.id() == member_id)
         .ok_or_else(|| NetError::new(NetErrorCode::NotFound, "member not found"))?;
     check_member_owned(&realized, rec)?;
-    Ok(rec.published_ports(&realized))
+    Ok(pick(rec, &realized))
 }
 
-/// 公開 1 件を記録つきで個別に解除する本体（OS 非依存。カーネル操作は呼び出し側が渡す。NET-3・SEC-1・#3068）。
+/// 公開 1 件を記録つきで個別に解除する本体（OS 非依存。カーネル操作は呼び出し側が渡す。NET-3・SEC-1・#3068・#3343）。
 ///
 /// 手順: 排他ロックと未完了の操作が無いことを確かめる → `published` が当該メンバーの記録の 1 件と完全に一致する
-/// こと（受け口・rule handle・テーブルハンドル・ネットワーク・トークン）を照合する → `unpublish_ports_with` で
-/// 生きたテーブルのハンドルと照合したうえで DELRULE → 成功したらメンバー記録から該当の公開を外して書き直す。
-/// 照合で拒否・失敗したときは記録を変えず、`published` を [`UnpublishPortError`] に入れて返す。解除が成功しても記録を
-/// 書き直せなかったときは [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。その状態や
-/// DELRULE 成功後のプロセス終了からは、DELRULE の直前に記録へ残す解除の意図の印で回復する: 再試行で DELRULE が
-/// `NotFound`（バッチは all-or-nothing で何も消えていない）になっても、印があり生きたテーブルのハンドルが一致して
-/// いれば、2 本を `delete_one` で 1 本ずつ削除する（各 1 本の ENOENT はそのルールが既に無い確認とみなし、
-/// 残っているルールは確実に消す）。どちらかが ENOENT 以外で失敗すれば記録と予約を保つ。印が無い ENOENT は成功扱いに
-/// しない。記録に当該の公開が無い値（記録の書き直しの rename 後に失敗した場合の再試行を含む）は、解除済みを示す永続記録が
-/// 無いので受け付けず、DELRULE も予約の解放も行わない（予約は `delete_network` まで保持する）。
+/// こと（受け口・rule handle・テーブルハンドル・ネットワーク・トークン）を照合する → 生きたテーブルのハンドルと
+/// 照合したうえで DELRULE → 成功したらメンバー記録から該当の公開を外して書き直し、**その後に**受け口の予約を解放する。
+/// 記録に受け口の行がある間は予約を解放しない（取り残しは `delete_network` と detach の quarantine が回収する安全側）。
+/// 照合で拒否・失敗したときは記録を変えず、`published` を [`UnpublishPortError`] に入れて返す。
+///
+/// 記録の書き直しに失敗したときは記録を読み直す。行が残っていれば（rename の前の失敗）予約を解放せず
+/// [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。行が消えていれば（rename 後の失敗）
+/// 予約を解放したうえで `Uncommitted` を返す。予約の解放に失敗したときは、ルールの削除を確かめ済みの印として墓標
+/// （`unpublished` 印）を書き戻し（失敗しても取り残しの向き）、`rules: Removed`・`reservation_held: true` を返す。
+/// 墓標と完全に一致する値での再試行は、カーネル操作をせず（DELRULE を送らず）予約の解放だけを完了する。
+///
+/// DELRULE の直前に記録へ残す解除の意図の印でも回復できる: 再試行で DELRULE が `NotFound`（バッチは all-or-nothing で
+/// 何も消えていない）になっても、印があり生きたテーブルのハンドルが一致していれば、2 本を `delete_one` で 1 本ずつ
+/// 削除する（各 1 本の ENOENT はそのルールが既に無い確認とみなし、残っているルールは確実に消す）。どちらかが ENOENT
+/// 以外で失敗すれば記録と予約を保つ。印が無い ENOENT は成功扱いにしない。記録に当該の公開が無い値は、解除済みを示す
+/// 永続記録が無いので受け付けず、DELRULE も予約の解放も行わない（予約は `delete_network` まで保持する）。
 /// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
-// 理由: 世代・ガード・メンバー・公開・予約表に、カーネル操作の 3 本の注入（照会・一括削除・1 本削除）を足した形で、
-// まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
+// 理由: 世代・ガード・メンバー・公開・予約表に、カーネル操作の 3 本の注入（照会・一括削除・1 本削除）と記録の書き込みを
+// 足した形で、まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn unpublish_port_recorded_with<G, D, S>(
+pub(crate) fn unpublish_port_recorded_with<G, D, S, W>(
     host: &HostGeneration,
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
@@ -652,11 +688,13 @@ pub(crate) fn unpublish_port_recorded_with<G, D, S>(
     table_info: G,
     delete: D,
     mut delete_one: S,
+    mut write_member: W,
 ) -> Result<(), RecordedError<Box<UnpublishPortError>, ()>>
 where
     G: FnOnce(&NftName) -> Result<TableInfo, NetError>,
     D: FnOnce(&NftName, (NftRuleHandle, NftRuleHandle)) -> Result<(), NftApplyFailure>,
     S: FnMut(&NftName, &'static str, NftRuleHandle) -> Result<(), NftApplyFailure>,
+    W: FnMut(&crate::network_store::MemberRecord) -> Result<(), NetError>,
 {
     require_exclusive_guard(guard)?;
     let realized = require_settled_current(guard, host)?;
@@ -667,76 +705,101 @@ where
             "member not found",
         )));
     };
-    // 別ネットワークのトークンを持つ記録は、DELRULE の前に DataLoss で断る（`published_ports` は
-    // `realized` のトークンで値を作るため、後段の完全一致では検出できない）。
+    // 別ネットワークのトークンを持つ記録は、DELRULE の前に DataLoss で断る（復元は `realized` のトークンで値を
+    // 作るため、後段の完全一致では検出できない）。
     check_member_owned(&realized, rec).map_err(RecordedError::Store)?;
     // 記録に無い公開は、予約の存在だけでは解除済みと証明できない（recorded attach 後の `publish_container_ports` で
-    // 足した公開や、古い値と再公開の取り違えを区別できない）。DELRULE も予約の解放もせず、下の完全一致で断る
-    // （予約は delete_network まで保持する。fail-closed。NET-3・SEC-1）。
-    // 記録と食い違う公開（別メンバーのもの・ハンドル違い）では、カーネル操作の前に断る。
-    if !rec.published_ports(&realized).contains(&published) {
+    // 足した公開や、古い値と再公開の取り違えを区別できない）。DELRULE も予約の解放もせず断る（予約は delete_network
+    // まで保持する。fail-closed。NET-3・SEC-1）。記録と食い違う公開（別メンバーのもの・ハンドル違い）も同じ。
+    let Some(state) = rec.publish_state_of(&realized, &published) else {
         return Err(RecordedError::Op(Box::new(UnpublishPortError {
             error: precondition("published port does not match the member record"),
             rules: UnpublishRules::Unknown,
             reservation_held: true,
             published: Some(Box::new(published)),
         })));
-    }
+    };
     let publish = *published.publish();
     let created = realized.to_created(NameResolution::default());
-    // 前回の試行が DELRULE の前に残した解除の意図の印（再起動をまたいで DELRULE 成功後の記録更新失敗から回復する根拠）。
-    let was_marked = rec.is_unpublishing(&publish);
-    // 印は生きたテーブルのハンドルとの照合を通った後、DELRULE の直前に書く（照合で断る経路では記録を変えない）。
-    // 印を書けなければ DELRULE を送らない。印があれば、DELRULE の ENOENT（失敗のバッチは all-or-nothing で何も
-    // 消えていない）は、前回の DELRULE が成功した後に記録の更新だけが失敗した状態とみなして続行する。
-    // 印が無い初回の ENOENT は外部要因なので成功扱いにせず断る（fail-closed）。
-    let delete = |table: &NftName, handles| {
-        if !was_marked {
-            let marked = rec
-                .with_unpublishing(&publish)
-                .and_then(|next| guard.replace_member(&next))
-                .map_err(|error| NftApplyFailure {
-                    error,
-                    outcome: NftBatchOutcome::NotSent,
-                });
-            marked?;
-        }
-        let is_absent = |f: &NftApplyFailure| {
-            f.outcome == NftBatchOutcome::Aborted && f.error.code() == NetErrorCode::NotFound
-        };
-        match delete(table, handles) {
-            // 2 本の一括削除は片方の ENOENT で全体が中止される。印があるときは 1 本ずつ削除し、各 ENOENT だけを
-            // そのルールが既に無いこととみなす。残っているルールの削除に失敗すれば、記録と予約を保つ。
-            Err(f) if was_marked && is_absent(&f) => {
-                for (chain, handle) in [("prerouting", handles.0), ("output", handles.1)] {
-                    match delete_one(table, chain, handle) {
-                        Err(f) if !is_absent(&f) => return Err(f),
-                        _ => {}
-                    }
-                }
-                Ok(())
+    // 墓標: ルールの削除は確かめ済み。カーネル操作（照会・DELRULE）をせず、消えたルールの handle を再び使わない。
+    let published = if state == PublishState::Unpublished {
+        published
+    } else {
+        // 前回の試行が DELRULE の前に残した解除の意図の印（再起動をまたいで DELRULE 成功後の記録更新失敗から回復する根拠）。
+        let was_marked = state == PublishState::Unpublishing;
+        // 印は生きたテーブルのハンドルとの照合を通った後、DELRULE の直前に書く（照合で断る経路では記録を変えない）。
+        // 印を書けなければ DELRULE を送らない。印があれば、DELRULE の ENOENT（失敗のバッチは all-or-nothing で何も
+        // 消えていない）は、前回の DELRULE が成功した後に記録の更新だけが失敗した状態とみなして続行する。
+        // 印が無い初回の ENOENT は外部要因なので成功扱いにせず断る（fail-closed）。
+        let delete = |table: &NftName, handles| {
+            if !was_marked {
+                let marked = rec
+                    .with_unpublishing(&publish)
+                    .and_then(|next| write_member(&next))
+                    .map_err(|error| NftApplyFailure {
+                        error,
+                        outcome: NftBatchOutcome::NotSent,
+                    });
+                marked?;
             }
-            other => other,
+            let is_absent = |f: &NftApplyFailure| {
+                f.outcome == NftBatchOutcome::Aborted && f.error.code() == NetErrorCode::NotFound
+            };
+            match delete(table, handles) {
+                // 2 本の一括削除は片方の ENOENT で全体が中止される。印があるときは 1 本ずつ削除し、各 ENOENT だけを
+                // そのルールが既に無いこととみなす。残っているルールの削除に失敗すれば、記録と予約を保つ。
+                Err(f) if was_marked && is_absent(&f) => {
+                    for (chain, handle) in [("prerouting", handles.0), ("output", handles.1)] {
+                        match delete_one(table, chain, handle) {
+                            Err(f) if !is_absent(&f) => return Err(f),
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                }
+                other => other,
+            }
+        };
+        delete_published_rules_with(table_info, delete, &created, published)
+            .map_err(|e| RecordedError::Op(Box::new(e)))?
+    };
+    // ルールは消えた。記録から公開を外す（予約の解放より先。記録に行がある間は予約を解放しない。#3343）。
+    let uncommitted = |error: NetError| RecordedError::Uncommitted {
+        error,
+        value: Box::new(()),
+    };
+    let next = rec.without_publish(&publish).map_err(uncommitted)?;
+    let mut write_error = None;
+    if let Err(error) = write_member(&next) {
+        // 書き込みの失敗が rename の前か後か判らない。読み直し、行が見えている（または確かめられない）間は予約を
+        // 解放せず、次の再試行（印または墓標の経路）に委ねる。
+        match guard.members() {
+            Ok(ms)
+                if ms
+                    .iter()
+                    .any(|m| m.id() == member_id && !m.has_publish(&publish)) =>
+            {
+                write_error = Some(error);
+            }
+            _ => return Err(uncommitted(error)),
         }
-    };
-    let outcome = unpublish_ports_with(table_info, delete, &created, published, registry);
-    // DELRULE が成功した後の失敗（予約の解放失敗）では、ルールは消えているので記録から外す。予約解放の失敗は
-    // 記録を直した後に別途返す。記録の更新自体が失敗・中断した場合は、上の解除の意図の印で次回に回復する。
-    let removed = match &outcome {
-        Ok(()) => true,
-        Err(e) => e.rules == UnpublishRules::Removed,
-    };
-    if !removed {
-        return outcome.map_err(|e| RecordedError::Op(Box::new(e)));
     }
-    // ルールは消えた。記録から外せなければ呼び出し側へ知らせる（古い公開が記録に残る）。
-    rec.without_publish(&publish)
-        .and_then(|next| guard.replace_member(&next))
-        .map_err(|error| RecordedError::Uncommitted {
+    if let Err(error) = release_published_listener(registry, &published) {
+        // 予約は残っている。ルール削除の確認済みを墓標として残す（書き戻しに失敗しても取り残しの向きで安全）。
+        if let Ok(tomb) = rec.with_unpublished(&publish) {
+            let _ = write_member(&tomb);
+        }
+        return Err(RecordedError::Op(Box::new(UnpublishPortError {
             error,
-            value: Box::new(()),
-        })?;
-    outcome.map_err(|e| RecordedError::Op(Box::new(e)))
+            rules: UnpublishRules::Removed,
+            reservation_held: true,
+            published: None,
+        })));
+    }
+    match write_error {
+        Some(error) => Err(uncommitted(error)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -808,6 +871,18 @@ mod linux {
         restore_published_ports_recorded(&nft.host_generation()?, guard, member_id)
     }
 
+    /// 記録から、メンバーの墓標（ルールの削除を確かめ済みで予約が残る公開）を復元する（#3343）。
+    ///
+    /// 返した値は [`unpublish_port_recorded`] にだけ渡す（カーネル操作なしで予約の解放を完了する）。
+    /// `detach_container_recorded` の前に片付ける。契約は `restore_unpublished_ports_recorded`。
+    pub fn restore_unpublished_ports(
+        nft: &NetlinkNetfilterSocket,
+        guard: &NetworkLockGuard<'_>,
+        member_id: &MemberId,
+    ) -> Result<Vec<PublishedPort>, NetError> {
+        restore_unpublished_ports_recorded(&nft.host_generation()?, guard, member_id)
+    }
+
     /// 公開 1 件を記録つきで個別に解除する（`unpublish_container_port` の記録つき版。NET-3・#3068）。
     ///
     /// `published` は同じメンバーの記録から復元した値（または同じプロセスで attach した結果）に限る。
@@ -831,6 +906,7 @@ mod linux {
             |table| linux_table_info(nft, table, timeout),
             |table, handles| linux_delete_rules(nft, timeout, table, handles),
             |table, chain, handle| linux_delete_rule(nft, timeout, table, chain, handle),
+            |r| guard.replace_member(r),
         )
     }
 
@@ -949,7 +1025,8 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{
     attach_container_recorded, create_network_recorded, delete_network_recorded,
-    detach_container_recorded, restore_published_ports, unpublish_port_recorded,
+    detach_container_recorded, restore_published_ports, restore_unpublished_ports,
+    unpublish_port_recorded,
 };
 
 #[cfg(test)]
@@ -1842,6 +1919,7 @@ mod tests {
                 Ok(())
             },
             |_, _, _| unreachable!("delete_one must not be called"),
+            |r| n.replace_member(r),
         );
         (r, calls.into_inner(), count.get())
     }
@@ -2055,6 +2133,7 @@ mod tests {
                 |_, _| fail.map_or(Ok(()), Err),
                 // 1 本ずつの削除では 2 本とも既に無い（ENOENT）。
                 |_, _, _| Err(enoent()),
+                |r| n.replace_member(r),
             )
         };
         let mut reg = PortRegistry::new();
@@ -2102,6 +2181,7 @@ mod tests {
                 })
             },
             |_, _, _| unreachable!("delete_one must not be called"),
+            |r| n.replace_member(r),
         );
         let Err(RecordedError::Op(e)) = r else {
             panic!("expected Op error");
@@ -2147,6 +2227,7 @@ mod tests {
                         one_out.clone()
                     }
                 },
+                |r| n.replace_member(r),
             );
             (r, calls.into_inner())
         };
@@ -2192,6 +2273,7 @@ mod tests {
             |_| unreachable!("table_info must not be called"),
             |_, _| unreachable!("delete must not be called"),
             |_, _, _| unreachable!("delete_one must not be called"),
+            |r| n.replace_member(r),
         );
         let Err(RecordedError::Op(e)) = r else {
             panic!("expected Op error");
@@ -2239,6 +2321,7 @@ mod tests {
             |_| unreachable!("table_info must not be called"),
             |_, _| unreachable!("delete must not be called"),
             |_, _, _| unreachable!("delete_one must not be called"),
+            |r| n.replace_member(r),
         );
         let Err(RecordedError::Store(e)) = r else {
             panic!("expected Store error");
@@ -2398,5 +2481,374 @@ mod tests {
                 .code(),
             NetErrorCode::NotFound
         );
+    }
+    // ---- #3343: 解除済みを示す墓標（`unpublished` 印）と、記録を先に書いて予約を後に解放する順序 ----
+
+    use crate::network_store::MemberRecord;
+
+    type TombOut = (Result<(), RecordedError<Box<UnpublishPortError>, ()>>, u32);
+
+    /// 記録つきの解除を、カーネル操作の回数を数え `write_member` を差し込んで実行する。
+    /// `forbid_kernel` が真なら照会・削除の呼び出しで panic する（墓標の経路はカーネル操作をしない）。
+    fn unpublish_writing(
+        n: &NetworkLockGuard<'_>,
+        host: &HostGeneration,
+        published: PublishedPort,
+        reg: &mut PortRegistry,
+        forbid_kernel: bool,
+        write: impl FnMut(&MemberRecord) -> Result<(), NetError>,
+    ) -> TombOut {
+        let count = std::cell::Cell::new(0u32);
+        let enoent = || NftApplyFailure {
+            error: NetError::new(NetErrorCode::NotFound, "no such rule"),
+            outcome: NftBatchOutcome::Aborted,
+        };
+        let r = unpublish_port_recorded_with(
+            host,
+            n,
+            &mid("c1"),
+            published,
+            reg,
+            |_| {
+                assert!(!forbid_kernel, "table_info must not be called");
+                table_info_reply(42, BRIDGE_TOKEN)
+            },
+            |_, _| {
+                assert!(!forbid_kernel, "delete must not be called");
+                count.set(count.get() + 1);
+                Ok(())
+            },
+            |_, _, _| {
+                assert!(!forbid_kernel, "delete_one must not be called");
+                count.set(count.get() + 1);
+                Err(enoent())
+            },
+            write,
+        );
+        (r, count.get())
+    }
+
+    fn held(reg: &mut PortRegistry) -> usize {
+        reg.held_by(&name(), &EndpointId::new("c1").unwrap())
+            .unwrap()
+    }
+
+    /// 共有ファイルの予約表（予約済み）と、その正しい内容・壊した内容を返す。
+    fn shared_reg(t: &Tmp) -> (PortRegistry, PathBuf, Vec<u8>) {
+        let path = t.0.join("ports.reg");
+        let mut reg = PortRegistry::with_shared_file(path.clone());
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let good = std::fs::read(&path).unwrap();
+        (reg, path, good)
+    }
+
+    /// 予約の解放を失敗させ（共有ファイルを壊す）、墓標を残した状態にする。再試行用の復元値と共有ファイルの正しい内容を返す。
+    fn leave_tombstone(t: &Tmp) -> (PortRegistry, PathBuf, Vec<u8>, Vec<PublishedPort>) {
+        attach_published(t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let (mut reg, path, good) = shared_reg(t);
+        let retry = restore_published_ports_recorded(&host(), &n, &mid("c1")).unwrap();
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        std::fs::write(&path, b"garbage\n").unwrap();
+        let (r, count) =
+            unpublish_writing(&n, &host(), p, &mut reg, false, |r| n.replace_member(r));
+        assert_eq!(count, 1);
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.rules, UnpublishRules::Removed);
+        assert!(e.reservation_held && e.published.is_none());
+        std::fs::write(&path, &good).unwrap();
+        (reg, path, good, retry)
+    }
+
+    /// NET-3・SEC-1・#3343: DELRULE の成功後に予約の解放が失敗しても、墓標が永続化され、復元は墓標を
+    /// 通常の公開として返さない（detach に渡すと消えたルールへ DELRULE するため）。
+    #[test]
+    fn net3_3343_release_failure_leaves_tombstone_and_keeps_reservation() {
+        let t = Tmp::new("tomb-leave");
+        let (mut reg, _path, _good, _retry) = leave_tombstone(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let m = n.members().unwrap();
+        assert_eq!(m[0].publishes().len(), 1);
+        assert!(m[0].is_unpublished(&web_publish()));
+        assert!(!m[0].is_unpublishing(&web_publish()));
+        assert!(
+            restore_published_ports_recorded(&host(), &n, &mid("c1"))
+                .unwrap()
+                .is_empty()
+        );
+        let tomb = restore_unpublished_ports_recorded(&host(), &n, &mid("c1")).unwrap();
+        assert_eq!(tomb.len(), 1);
+        assert_eq!(
+            (
+                tomb[0].prerouting_handle().get(),
+                tomb[0].output_handle().get(),
+                tomb[0].table_handle().map(NftTableHandle::get)
+            ),
+            (2, 3, Some(42))
+        );
+        assert_eq!(held(&mut reg), 1);
+    }
+
+    /// NET-3・SEC-1・#3343: 墓標と完全に一致する値での再試行は、カーネル操作をせずに予約を解放して完了する。
+    #[test]
+    fn net3_3343_tombstone_retry_releases_without_kernel_ops() {
+        let t = Tmp::new("tomb-retry");
+        let (mut reg, _path, _good, mut retry) = leave_tombstone(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        assert_eq!(held(&mut reg), 1);
+        let tomb = restore_unpublished_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let (r, count) =
+            unpublish_writing(&n, &host(), tomb, &mut reg, true, |r| n.replace_member(r));
+        r.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(held(&mut reg), 0);
+        let m = n.members().unwrap();
+        assert_eq!((m[0].table_handle(), m[0].publishes().len()), (None, 0));
+        // 通常の公開として復元した値（記録の外れた古い値）は断る。
+        let stale = retry.remove(0);
+        let (r, count) =
+            unpublish_writing(&n, &host(), stale, &mut reg, true, |r| n.replace_member(r));
+        assert_eq!(count, 0);
+        assert!(matches!(r, Err(RecordedError::Op(_))));
+    }
+
+    /// NET-3・SEC-1・#3343: 墓標と一致しない値（別の rule handle・別のテーブルハンドル・別の受け口）は、
+    /// 記録も予約も変えず `FailedPrecondition` で断る。
+    #[test]
+    fn net3_3343_tombstone_mismatch_refused_keeps_reservation() {
+        let t = Tmp::new("tomb-mismatch");
+        let (mut reg, _path, _good, _retry) = leave_tombstone(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let before = n.members().unwrap();
+        let other_listener =
+            PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 9090, 80).unwrap();
+        let mk = |publish: PortPublish, h: (u64, u64), table: u64| {
+            PublishedPort::new(
+                &name(),
+                BRIDGE_TOKEN,
+                &EndpointId::new("c1").unwrap(),
+                publish,
+                (rule(h.0), rule(h.1)),
+            )
+            .with_table_handle(NftTableHandle::new(table).unwrap())
+        };
+        for p in [
+            mk(web_publish(), (2, 9), 42),
+            mk(web_publish(), (9, 3), 42),
+            mk(web_publish(), (2, 3), 43),
+            mk(other_listener, (2, 3), 42),
+        ] {
+            let (r, count) =
+                unpublish_writing(&n, &host(), p, &mut reg, true, |r| n.replace_member(r));
+            assert_eq!(count, 0);
+            let Err(RecordedError::Op(e)) = r else {
+                panic!("expected Op error");
+            };
+            assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+            assert!(e.reservation_held);
+            assert_eq!(n.members().unwrap(), before);
+            assert_eq!(held(&mut reg), 1);
+        }
+    }
+
+    /// NET-3・SEC-1・#3343: 行を外す書き込みが rename の前に失敗したら予約を解放せず `Uncommitted`。記録は印のまま残り、
+    /// その後の再試行（印の経路）で完了する。
+    #[test]
+    fn net3_3343_removal_write_failed_before_rename_keeps_reservation() {
+        let t = Tmp::new("removal-before-rename");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let calls = std::cell::Cell::new(0u32);
+        let (r, count) = unpublish_writing(&n, &host(), p, &mut reg, false, |r| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                n.replace_member(r)
+            } else {
+                Err(NetError::new(NetErrorCode::Internal, "write failed"))
+            }
+        });
+        assert_eq!(count, 1);
+        assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+        assert_eq!(held(&mut reg), 1);
+        let m = n.members().unwrap();
+        assert!(m[0].is_unpublishing(&web_publish()));
+        // 再試行: 印の経路（一括削除は ENOENT、1 本ずつの削除も ENOENT）。
+        let enoent = || NftApplyFailure {
+            error: NetError::new(NetErrorCode::NotFound, "no such rule"),
+            outcome: NftBatchOutcome::Aborted,
+        };
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        unpublish_port_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            p,
+            &mut reg,
+            |_| table_info_reply(42, BRIDGE_TOKEN),
+            |_, _| Err(enoent()),
+            |_, _, _| Err(enoent()),
+            |r| n.replace_member(r),
+        )
+        .unwrap();
+        assert_eq!(held(&mut reg), 0);
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 0);
+    }
+
+    /// NET-3・SEC-1・#3343: 行を外す書き込みが rename の後に失敗した（行は消えている）なら、予約は解放し、
+    /// 永続化を確認できていないので `Uncommitted` を返す。
+    #[test]
+    fn net3_3343_removal_renamed_then_failed_releases_and_reports_uncommitted() {
+        let t = Tmp::new("removal-after-rename");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let calls = std::cell::Cell::new(0u32);
+        let (r, _) = unpublish_writing(&n, &host(), p, &mut reg, false, |r| {
+            calls.set(calls.get() + 1);
+            n.replace_member(r)?;
+            if calls.get() == 2 {
+                Err(NetError::new(NetErrorCode::Internal, "fsync failed"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(r, Err(RecordedError::Uncommitted { .. })));
+        assert_eq!(held(&mut reg), 0);
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 0);
+    }
+
+    /// NET-3・SEC-1・#3343: 予約の解放も墓標の書き戻しも失敗したら、記録に行は無く予約が残る（取り残しの向き）。
+    /// その後の再試行は記録に無い値として断り、予約を外さない。
+    #[test]
+    fn net3_3343_tombstone_writeback_failure_keeps_reservation_fail_closed() {
+        let t = Tmp::new("tomb-writeback-fail");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let (mut reg, path, good) = shared_reg(&t);
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let again = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        std::fs::write(&path, b"garbage\n").unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let (r, _) = unpublish_writing(&n, &host(), p, &mut reg, false, |r| {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 2 {
+                n.replace_member(r)
+            } else {
+                Err(NetError::new(NetErrorCode::Internal, "write failed"))
+            }
+        });
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(
+            (e.rules, e.reservation_held),
+            (UnpublishRules::Removed, true)
+        );
+        assert_eq!(n.members().unwrap()[0].publishes().len(), 0);
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(held(&mut reg), 1);
+        let (r, count) =
+            unpublish_writing(&n, &host(), again, &mut reg, true, |r| n.replace_member(r));
+        assert_eq!(count, 0);
+        let Err(RecordedError::Op(e)) = r else {
+            panic!("expected Op error");
+        };
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(held(&mut reg), 1);
+    }
+
+    /// NET-3・SEC-1・#3343: 別の世代で見た墓標は、カーネル操作も予約の解放もせずに断る。
+    #[test]
+    fn net3_3343_tombstone_foreign_generation_refused() {
+        let t = Tmp::new("tomb-foreign-gen");
+        let (mut reg, _path, _good, _retry) = leave_tombstone(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let tomb = restore_unpublished_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let other = HostGeneration::new(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            crate::network_store::NetnsIdentity::new(5, 1),
+        )
+        .unwrap();
+        assert!(restore_unpublished_ports_recorded(&other, &n, &mid("c1")).is_err());
+        let (r, count) =
+            unpublish_writing(&n, &other, tomb, &mut reg, true, |r| n.replace_member(r));
+        assert_eq!(count, 0);
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(held(&mut reg), 1);
+        assert!(n.members().unwrap()[0].is_unpublished(&web_publish()));
+    }
+
+    /// NET-3・SEC-1・#3343: `published_ports` は墓標を返さず、`unpublished_ports` は墓標だけを返す（handle・テーブルハンドルは
+    /// 記録の値）。最後の墓標を外すと `table-handle` も外れる。
+    #[test]
+    fn net3_3343_member_published_ports_excludes_tombstone() {
+        let t = Tmp::new("tomb-member-ports");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let realized = settled_realized(&n).unwrap();
+        let rec = n.members().unwrap().remove(0);
+        assert_eq!(rec.published_ports(&realized).len(), 1);
+        assert!(rec.unpublished_ports(&realized).is_empty());
+        let tomb = rec.with_unpublished(&web_publish()).unwrap();
+        assert!(tomb.published_ports(&realized).is_empty());
+        let ports = tomb.unpublished_ports(&realized);
+        assert_eq!(ports.len(), 1);
+        assert_eq!(
+            (
+                ports[0].prerouting_handle().get(),
+                ports[0].output_handle().get(),
+                ports[0].table_handle().map(NftTableHandle::get)
+            ),
+            (2, 3, Some(42))
+        );
+        let gone = tomb.without_publish(&web_publish()).unwrap();
+        assert_eq!((gone.table_handle(), gone.publishes().len()), (None, 0));
     }
 }

@@ -78,8 +78,10 @@ bash 5 の `EPOCHREALTIME` は使わない。前提ツールは bash 3.2 以上�
   将来は既定で含めないとしている。macOS Monterey 12.3 Release Notes は Python 2.7 の削除を記載している。
   perl の同梱が将来も続くかは Apple の保証の範囲外で、外れた場合は本節の決定を見直す（その場合は終了コード 3 で止まり、誤った値は出さない）
 - `Time::HiRes` は perl の core module（perldoc Time::HiRes）
-- 観測値: Linux のローカルでは perl v5.40.1・Time::HiRes 1.9777。macOS の `/usr/bin/perl` の版は未観測
-  （`make mac-small-files-selftest` の冒頭の `perl=... hires=...` 行を platform-ci の macOS のログで確認し、ここへ反映する）
+- 観測値: Linux のローカルでは perl v5.40.1・Time::HiRes 1.9777。macOS の Homebrew 版は perl v5.44.0・Time::HiRes 1.978
+  （platform-ci macos-latest・run 40758633132）。macOS の `/usr/bin/perl` の版は未観測
+  （自己テストは macOS で `/usr/bin/perl` の回を必ず回す〔#3354〕。platform-ci の macOS のログの `perl-variant=system perl=... hires=...` 行を
+  確認してここへ反映する。実機の版は #381・#354〔人間担当〕で記入する）
 
 ## 計測衛生
 
@@ -92,4 +94,4 @@ bash 5 の `EPOCHREALTIME` は使わない。前提ツールは bash 3.2 以上�
 
 実行コマンド・出力の読み方は `AGENTS.md`「実機前提テスト」の MAC-3 の行を参照。自己テストは `make mac-small-files-selftest`
 （スタブの docker のみ。CI の `bench-regression` の並列グループ。platform-ci の macOS〔main への push と workflow_dispatch〕では
-`/bin/bash` 3.2 でも回す）。
+`/bin/bash` 3.2 と `/usr/bin/perl` でも回す。#3354）。

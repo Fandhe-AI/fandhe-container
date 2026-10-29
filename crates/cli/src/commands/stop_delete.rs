@@ -731,7 +731,9 @@ pub(super) fn etc_files_removal_warning(code: ErrorCode) -> String {
 /// core の `delete` が成功した後に、管理ルートの生成物(`<root>/@container-etc/<id>`。NET-12・#1872)を消す。
 ///
 /// 起動オプション文書の削除と同じく、失敗・期限切れでも delete の結果は変えず警告を 1 行だけ出す。再作成済みの ID は
-/// 見送り(`id_is_still_deleted`)、新しいインスタンスの生成物を消さない。削除は作業スレッドで期限つきに待つ(REPAIR-5)。
+/// 作業スレッド内で ID ロックを取った後の再確認(`remove_etc_files_locked`)で見送り、新しいインスタンスの生成物を
+/// 消さない。呼び出し元スレッドには状態ストアの I/O を置かず、削除も再確認も期限つきに待つ(REPAIR-5・#3357)。
+/// 並行の create / start が同じ ID のロックを長く持つ場合は、見送るだけでも警告が出うる。
 /// 期限切れの作業スレッドは CLI の終了で消え、残った生成物は次の start の `remove` → `create` で回収される。
 fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
     // 生成は Linux だけ(非 Linux の `remove_etc_files` は UNIMPLEMENTED のため、毎回警告を出さないよう呼ばない)。
@@ -743,13 +745,11 @@ fn remove_etc_files_after_delete(store: &dyn StateStore, req: &DeleteRequest) {
     };
     let root = root.to_path_buf();
     let id = req.id().clone();
-    if !id_is_still_deleted(&root, &id) {
-        return;
-    }
+    // 不在の再確認は ID ロックの下(`remove_etc_files_locked`)の作業スレッドで行う。ここで同期のストア open を
+    // しない(止まった状態ルートで delete が戻らなくならないよう、全体を期限つきの待ちに収める。REPAIR-5・#3357)。
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker_id = id.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(remove_etc_files_locked(&root, &worker_id));
+        let _ = tx.send(remove_etc_files_locked(&root, &id));
     });
     let code = match rx.recv_timeout(ETC_FILES_REMOVE_TIMEOUT) {
         Ok(Ok(_)) => return,
@@ -858,7 +858,8 @@ fn remove_etc_files_locked(
 const ETC_FILES_LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// 削除直前に ID が再作成されていないことを再確認して `remove` を呼ぶ(options の cleanup と同じ形。#1872・NET-12)。
-/// 起動前の確認から worker の実行までに再作成された新インスタンスの `@container-etc/<id>` を消さない。
+/// 再作成された新インスタンスの `@container-etc/<id>` を消さない。呼び出し元(`remove_etc_files_locked`)が ID ロックを
+/// 保持した状態で呼ぶ、唯一の不在確認である(#3357)。
 fn remove_etc_files_if_still_deleted(
     root: &std::path::Path,
     id: &ContainerId,
@@ -1980,6 +1981,56 @@ mod tests {
                 fandhe_container_core::etc_files::EtcRemoveOutcome::Removed
             );
             assert!(called.get());
+        }
+
+        /// NET-12・REPAIR-5・#3357: 公開の入口でも、再作成済み(状態に記録がある)ID の生成物は残り、記録の無い ID の生成物は消える。
+        #[test]
+        fn net12_repair5_delete_keeps_etc_files_of_recreated_id() {
+            use fandhe_container_core::etc_files::{
+                EtcFileKind, EtcFileSelection, create_etc_files, etc_dir,
+            };
+            let base = TmpDir::new("etc-delete-recreated");
+            let store = store(&base);
+            let root = state_root(&base);
+            let sel = EtcFileSelection::default().with(EtcFileKind::Hosts);
+            create_etc_files(&root, &id("e1"), sel).expect("create e1");
+            create_etc_files(&root, &id("e2"), sel).expect("create e2");
+            create_placed(&base, &store, "e1");
+            remove_etc_files_after_delete(&store, &DeleteRequest::new(id("e1")));
+            remove_etc_files_after_delete(&store, &DeleteRequest::new(id("e2")));
+            assert!(etc_dir(&root, &id("e1")).exists(), "recreated id is kept");
+            assert!(!etc_dir(&root, &id("e2")).exists(), "deleted id is removed");
+        }
+
+        /// NET-12・REPAIR-5・#3357: 生成物の削除は ID ロックの下で直列化され、他者が持つ間は消さず `TIMEOUT` で失敗し、
+        /// 解放後は消せる。
+        #[test]
+        fn net12_etc_files_removal_is_serialized_with_recreation() {
+            use fandhe_container_core::etc_files::{
+                EtcFileKind, EtcFileSelection, EtcRemoveOutcome, create_etc_files, etc_dir,
+            };
+            use fandhe_container_supervisor::container_options::store as options_store;
+            let base = TmpDir::new("etc-lock");
+            let _store = store(&base); // 状態ルートを作る
+            let root = state_root(&base);
+            let a = id("e1");
+            create_etc_files(
+                &root,
+                &a,
+                EtcFileSelection::default().with(EtcFileKind::Hosts),
+            )
+            .expect("create");
+            let held =
+                options_store::acquire_lock(&root, &a, Duration::from_secs(1)).expect("lock");
+            let err = remove_etc_files_locked(&root, &a).expect_err("locked");
+            assert_eq!(err.code(), ErrorCode::Timeout);
+            assert!(etc_dir(&root, &a).exists());
+            drop(held);
+            assert_eq!(
+                remove_etc_files_locked(&root, &a).expect("removed"),
+                EtcRemoveOutcome::Removed
+            );
+            assert!(!etc_dir(&root, &a).exists());
         }
 
         /// 検出の呼び出し回数を数えつつ `fake` を返す remover を作る。

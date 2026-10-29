@@ -399,7 +399,7 @@ mod tests {
         for n in ["bridge", "default"] {
             let e = p(Some(n), &[], &[]).expect_err("reserved");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
-            assert_eq!(e.message(), "reserved network name");
+            assert_eq!(e.message(), "network name is reserved");
         }
         let long = "a".repeat(65);
         for n in ["Web", ".x", "", long.as_str()] {

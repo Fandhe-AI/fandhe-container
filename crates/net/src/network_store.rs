@@ -58,8 +58,8 @@ use std::time::Duration;
 use crate::error::{NetError, NetErrorCode};
 pub use codec::RECORD_MAX_BYTES;
 pub use definition::{
-    DEFINITION_MAX_BYTES, InstallMode, MAX_NETWORKS, NetworkDefinition, RESERVED_NETWORK_NAMES,
-    is_reserved_network_name,
+    DEFINITION_MAX_BYTES, InstallMode, MAX_NETWORKS, MSG_RESERVED_NETWORK_NAME, NetworkDefinition,
+    RESERVED_NETWORK_NAMES, is_reserved_network_name,
 };
 pub use ipam_rebuild::rebuild_ipam;
 pub use member::{MemberId, MemberIntent, MemberRecord, RecordedPublish};

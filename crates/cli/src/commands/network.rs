@@ -40,7 +40,8 @@ use fandhe_container_core::traits::{ErrorCode, StateStore, TraitError};
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::network_store::{
-    InstallMode, NetworkDefinition, NetworkStore, is_reserved_network_name,
+    InstallMode, MSG_RESERVED_NETWORK_NAME, NetworkDefinition, NetworkStore,
+    is_reserved_network_name,
 };
 
 use super::CliExit;
@@ -54,7 +55,7 @@ use crate::error::CliError;
 /// `ls` の固定ヘッダ行（LF 終端）。
 const NETWORK_LS_HEADER: &str = "NAME\tMODE\tSUBNET\n";
 
-const MSG_RESERVED: &str = "network name is reserved";
+const MSG_RESERVED: &str = MSG_RESERVED_NETWORK_NAME;
 const MSG_INVALID: &str = "invalid network name";
 const MSG_ALREADY_EXISTS: &str = "network already exists";
 const MSG_NOT_FOUND: &str = "network not found";

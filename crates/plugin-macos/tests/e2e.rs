@@ -18,7 +18,7 @@
 //! start → `["running"]`、stop → `["stopped"]`、ping → `["pong"]`。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

@@ -3,7 +3,7 @@
 //! 接続先が存在しない場合は接続失敗（終了コード 3）で即終了するが、待機には期限を設け超過時は kill して失敗にする（REPAIR-5）。
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・WIN-1・REPAIR-3。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::io::Read;

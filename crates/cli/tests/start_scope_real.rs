@@ -50,7 +50,7 @@ mod scratch_root;
 
 // kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
 #[cfg(target_os = "linux")]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(target_os = "linux")]

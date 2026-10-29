@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use fandhe_container_cli::commands::run_to;

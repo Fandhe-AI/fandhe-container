@@ -37,7 +37,7 @@ fandhe-container/
 ├── Cargo.toml                     # workspace 定義（members は TASK-1.3 で有効化）
 ├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
-│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture）
+│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture。tests/support/ の reap.rs〔期限つき回収の正本〕・scratch_root.rs 等は他 crate の試験も `#[path]` で共有する。#3410）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
 │   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI

@@ -17,7 +17,7 @@
 //! `["created","",""]`、start → `["running", transport, warning]`、stop → `["stopped","",""]`。
 //! 待ちはすべて期限つき（REPAIR-5）。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(unix)]

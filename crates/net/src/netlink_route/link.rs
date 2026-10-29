@@ -705,6 +705,8 @@ fn decode_ifinfomsg_link(payload: &[u8]) -> Result<(Option<IfIndex>, bool), NetE
 /// 不正な属性列は `DataLoss`。UTF-8 でない別名は「別名なし」と区別するため、置換文字入りの非空文字列
 /// （`from_utf8_lossy`）で返す。所有トークン（ASCII）とは一致せず、空でもないので、呼び出し側は
 /// 所有者不明として扱い、上書きも削除もしない（Issue #1925・NET-1）。
+/// `IFLA_IFALIAS` が重複した応答も `DataLoss`（どの別名を所有トークンとして信じるかが曖昧になるため。
+/// カーネル応答は外部入力で、`decode_ifinfomsg_name`・`decode_table_name` と同じ扱い。NET-1・REPAIR-2・#3309）。
 pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError> {
     let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
         NetError::new(
@@ -712,16 +714,23 @@ pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError
             "link reply is shorter than ifinfomsg",
         )
     })?;
+    let mut found: Option<String> = None;
     for attr in crate::netlink::AttrIter::new(attrs) {
         let attr = attr?;
         if attr.attr_type() == IFLA_IFALIAS {
+            if found.is_some() {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "duplicate IFLA_IFALIAS attribute",
+                ));
+            }
             let raw = attr.payload();
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
             let bytes = raw.get(..end).unwrap_or_default();
-            return Ok(Some(String::from_utf8_lossy(bytes).into_owned()));
+            found = Some(String::from_utf8_lossy(bytes).into_owned());
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_MASTER`（所属先 bridge の ifindex）を取り出す（無ければ `None`）。
@@ -1461,6 +1470,36 @@ mod tests {
         }
         let p = link_payload_ext(3, Some(b"br0\0"), None, &[]);
         assert_eq!(decode_ifinfomsg_name(&p).unwrap().as_deref(), Some("br0"));
+    }
+
+    /// NET-1・REPAIR-2・#3309: `IFLA_IFALIAS` が重複した応答は、値が同じでも違っても `DataLoss`。
+    #[test]
+    fn net1_decode_ifinfomsg_alias_rejects_duplicate() {
+        let tok = &b"fandhe-net:web:tok\0"[..];
+        for (first, second) in [
+            (tok, tok),
+            (tok, &b"other\0"[..]),
+            (&b"\0"[..], tok),
+            (tok, &b"\0"[..]),
+            (&b"\0"[..], &b"\0"[..]),
+        ] {
+            let p = link_payload_ext(3, Some(b"br0\0"), Some(first), &[(IFLA_IFALIAS, second)]);
+            let e = decode_ifinfomsg_alias(&p).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.message(), "duplicate IFLA_IFALIAS attribute");
+            let msgs = [(RTM_NEWLINK, p.as_slice())];
+            assert_eq!(
+                decode_created_link(msgs, &name("br0")).unwrap_err().code(),
+                NetErrorCode::DataLoss
+            );
+        }
+        let p = link_payload_ext(3, Some(b"br0\0"), Some(tok), &[]);
+        assert_eq!(
+            decode_ifinfomsg_alias(&p).unwrap().as_deref(),
+            Some("fandhe-net:web:tok")
+        );
+        let p = link_payload_ext(3, Some(b"br0\0"), None, &[]);
+        assert_eq!(decode_ifinfomsg_alias(&p).unwrap(), None);
     }
 
     /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。

@@ -31,6 +31,8 @@
 //!   helper を SIGKILL して以後の `record` を `Unavailable` で拒否する（ずれた応答を次の要求へ取り違えない。fail-closed）。
 //!   拒否の判定自体は呼び出し側で既に確定しており、本中継の失敗は判定を覆さない
 //! - 親が終了すると socketpair が EOF になり helper も終了する。drop でも SIGKILL して回収を試みる
+//! - [`ControlAuditRelay::spawn_ignoring_stop_signals`]（#3300）の helper は SIGTERM・SIGINT を無視する（グループ・cgroup 宛ての
+//!   停止で先に死なない）。終わるのは本体の終了（EOF）か SIGKILL のとき。本体が死んだ後の残存は最悪 [`RECORD_WAIT_LIMIT`]
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -62,6 +64,8 @@ const ACK_OK: u8 = 1;
 const ACK_FAIL: u8 = 0;
 /// helper が fd 3 以上を閉じられなかったときの終了コード。
 const CLOSE_FDS_FAILED_EXIT: i32 = 3;
+/// helper が停止シグナル（SIGTERM・SIGINT）を無視にできなかったときの終了コード（親の `probe` が失敗として検出する）。
+const IGNORE_SIGNALS_FAILED_EXIT: i32 = 4;
 /// 回収待ちの上限（drop 時）。
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
@@ -585,12 +589,33 @@ impl ControlAuditRelay {
     ///
     /// 呼び出し元: supervisor の `start`（制御チャネルの `install` の前、スレッドを作る前）。
     pub fn spawn(sink: FileAuditSink) -> Result<Self, TraitError> {
+        Self::spawn_inner(sink, false)
+    }
+
+    /// [`ControlAuditRelay::spawn`] と同じだが、helper が SIGTERM・SIGINT を `SIG_IGN` にしてから動く（#3300）。
+    ///
+    /// プロセスグループ宛ての SIGTERM や systemd の `KillMode=control-group`（cgroup 全体宛て）で helper が本体より
+    /// 先に死ぬと、本体のドレイン中の拒否が `@audit.log` に届かない（SEC-4）。本口の helper は停止シグナルでは死なず、
+    /// 本体の終了（socketpair の EOF）で `serve` から戻って終わる。本体が先に死んだ後に残る時間は、処理中の 1 件を
+    /// 書き終えるまでで最悪 [`RECORD_WAIT_LIMIT`]（REPAIR-5）。`SIGKILL` は無視できないので最終の回収は妨げない。
+    /// helper は exec しない（`SIG_IGN` はコンテナ内のコマンドへ持ち込まれない）。helper の子（`FileAuditSink` の隔離の
+    /// 子）も無視を継承するが、期限と SIGKILL で回収される。
+    ///
+    /// 呼び出し元: plugin-cri の `open_audit_relay_in`。supervisor は従来の `spawn` のまま（挙動を変えない）。
+    pub fn spawn_ignoring_stop_signals(sink: FileAuditSink) -> Result<Self, TraitError> {
+        Self::spawn_inner(sink, true)
+    }
+
+    fn spawn_inner(sink: FileAuditSink, ignore_stop: bool) -> Result<Self, TraitError> {
         let unavailable = || err(ErrorCode::Unavailable, "failed to start the audit relay");
         let (parent, child) = UnixStream::pair().map_err(|_| unavailable())?;
         let parent = dup_high(parent).ok_or_else(unavailable)?;
         let child = dup_high(child).ok_or_else(unavailable)?;
         let forked = sys::fork_single_threaded_no_flush(
             || {
+                if ignore_stop && sys::ignore_stop_signals().is_err() {
+                    return IGNORE_SIGNALS_FAILED_EXIT;
+                }
                 if sys::close_fds_from_except(3, child.as_fd()).is_err() {
                     return CLOSE_FDS_FAILED_EXIT;
                 }

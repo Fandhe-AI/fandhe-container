@@ -502,7 +502,10 @@ pub(crate) fn full_fsync(file: &std::fs::File) -> io::Result<()> {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeneathError {
-    /// 辿ろうとした要素が symlink または非ディレクトリだった（symlink は辿らない）。
+    /// 辿ろうとした要素が symlink だった（辿らない。IO-5。呼び出し側で `EscapesRoot` に
+    /// 写す。#3352）。
+    AncestorSymlink,
+    /// 辿ろうとした要素が symlink 以外の非ディレクトリだった。
     AncestorNotDirectory,
     /// 作ろうとした末端が既に存在した（symlink を含む。辿らない）。
     AlreadyExists,
@@ -693,6 +696,15 @@ mod beneath {
             // （`mode_t` は Linux が u32、macOS が u16。`beneath_consts::ModeT`）。
             pub(super) fn mkdirat(dirfd: i32, path: *const c_char, mode: super::c::ModeT) -> i32;
             // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)`
+            // （Linux・macOS とも接尾辞なしの同名シンボル。`ssize_t` は `isize`）。
+            pub(super) fn readlinkat(
+                dirfd: i32,
+                path: *const c_char,
+                buf: *mut c_char,
+                bufsiz: usize,
+            ) -> isize;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
             // `int unlinkat(int dirfd, const char *path, int flags)`。
             pub(super) fn unlinkat(dirfd: i32, path: *const c_char, flags: i32) -> i32;
             // SAFETY（宣言そのものの妥当性）: POSIX の
@@ -804,8 +816,13 @@ mod beneath {
     }
 
     /// `dir` 直下のサブディレクトリ `name` を、ハンドル相対・symlink 非追従
-    /// （`openat` + `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`）で開く。symlink・
-    /// 非ディレクトリは `AncestorNotDirectory`、無ければ `Io(NotFound)`。
+    /// （`openat` + `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`）で開く。symlink は
+    /// `AncestorSymlink`、それ以外の非ディレクトリは `AncestorNotDirectory`、無ければ
+    /// `Io(NotFound)`。
+    ///
+    /// Linux では `O_DIRECTORY|O_NOFOLLOW` は末端が symlink でも `ENOTDIR` を返す
+    /// （`ELOOP` ではない）ため、`ENOTDIR` のときは [`is_symlink_beneath`] で種類を
+    /// 判別する（#3352）。分類が変わるだけで、どちらも拒否である（fail-closed）。
     pub(crate) fn open_dir_beneath(dir: &File, name: &str) -> Result<File, BeneathError> {
         let cname = cstr(name)?;
         // SAFETY: `dir`・`cname` は mkdir_beneath と同じ。O_CREAT を指定しない
@@ -818,12 +835,33 @@ mod beneath {
             )
         };
         own_fd(fd, |errno, kind| {
-            if errno == c::ELOOP || errno == c::ENOTDIR {
-                BeneathError::AncestorNotDirectory
+            if errno == c::ELOOP {
+                BeneathError::AncestorSymlink
+            } else if errno == c::ENOTDIR {
+                if is_symlink_beneath(dir, &cname) {
+                    BeneathError::AncestorSymlink
+                } else {
+                    BeneathError::AncestorNotDirectory
+                }
             } else {
                 BeneathError::Io(kind)
             }
         })
+    }
+
+    /// `dir` 直下の `name` が symlink か（`readlinkat`。リンクの中身は 1 バイトだけ
+    /// 受けて捨て、辿らない・書き込まない）。symlink 以外（`EINVAL`）・消えた等は
+    /// `false`。`openat` との間にすり替えられても変わるのは分類だけで、拒否は変わらない。
+    fn is_symlink_beneath(dir: &File, cname: &CString) -> bool {
+        let mut buf = [0 as core::ffi::c_char; 1];
+        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
+        // 間閉じられない。`cname` は NUL 終端の有効な C 文字列で呼び出しの間生きて
+        // いる。`buf` は長さ 1 のスタック配列で、`bufsiz = 1` を超えて書かれない。
+        // 戻り値（長さ、または -1）だけを読み、`buf` の中身は使わない。
+        let rc = unsafe {
+            raw::readlinkat(dir.as_raw_fd(), cname.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
+        rc >= 0
     }
 
     /// `dir` 直下に通常ファイル `name` を `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|
@@ -1173,6 +1211,19 @@ mod beneath {
             *const libc::c_char,
             libc::mode_t,
         ) -> libc::c_int = libc::mkdirat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut libc::c_char,
+            libc::size_t,
+        ) -> libc::ssize_t = raw::readlinkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut libc::c_char,
+            libc::size_t,
+        ) -> libc::ssize_t = libc::readlinkat;
 
         const _: unsafe extern "C" fn(
             libc::c_int,
@@ -1788,7 +1839,12 @@ mod tests {
             );
             assert_eq!(
                 open_dir_beneath(&root, "l").err(),
-                Some(BeneathError::AncestorNotDirectory)
+                Some(BeneathError::AncestorSymlink)
+            );
+            std::os::unix::fs::symlink(t.0.join("nowhere"), t.0.join("dl")).expect("dangling");
+            assert_eq!(
+                open_dir_beneath(&root, "dl").err(),
+                Some(BeneathError::AncestorSymlink)
             );
             assert_eq!(
                 open_dir_beneath(&root, "f").err(),

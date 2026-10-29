@@ -10,6 +10,12 @@
 //! ここでは増加方向の下限だけを検査し、絶対値の比較は行わない（並列テストによる揺れを避ける）。
 //! RSS を読むテストは `RSS_LOCK` で直列化する。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -111,11 +117,9 @@ mod supported {
     };
     use std::ffi::OsString;
     use std::io::Read;
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     /// PLUG-8 目標（TASK-112・MS-3）: 2 条件の差が 0.5 MiB 未満。PoC-13 の 3.375 は 3456 KiB ちょうどのため
@@ -197,13 +201,8 @@ mod supported {
     struct WorkDir(PathBuf);
     impl WorkDir {
         fn new(condition: &str) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcrc-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcrc").unwrap();
             std::fs::write(p.join("condition"), condition).unwrap();
             Self(p)
         }
@@ -486,7 +485,6 @@ mod supported {
             ResidentStartTimeout, ResidentState, RpcTimeout, UdsStream, rss,
         };
         use std::ffi::OsString;
-        use std::os::unix::fs::DirBuilderExt;
         use std::path::PathBuf;
         use std::sync::mpsc;
         use std::time::Duration;
@@ -512,8 +510,8 @@ mod supported {
         struct TempDir(PathBuf);
         impl TempDir {
             fn new() -> Self {
-                let p = std::env::temp_dir().join(format!("fcrs-rss-{}", std::process::id()));
-                std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+                // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+                let p = crate::exclusive_dir::create("fcrs-rss").unwrap();
                 Self(p)
             }
         }

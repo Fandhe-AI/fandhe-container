@@ -10,11 +10,17 @@
 // WIN-1: UDS 固有の実装は unix のみ。非 unix では本試験は空になる（黙って通すのではなく、この明示を残す）。
 #![cfg(unix)]
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 use std::convert::Infallible;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -106,13 +112,8 @@ async fn say(channel: Channel, text: String) -> Result<String, tonic::Status> {
 struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fcgu-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+        // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+        let p = crate::exclusive_dir::create("fcgu").unwrap();
         Self(p)
     }
     fn sock(&self) -> PathBuf {

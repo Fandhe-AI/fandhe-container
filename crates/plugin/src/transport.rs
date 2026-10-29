@@ -1633,35 +1633,24 @@ mod tests {
     mod plug12_order {
         use super::*;
         use std::io::{Read, Write};
-        use std::os::unix::fs::DirBuilderExt;
         use std::os::unix::net::{UnixListener, UnixStream};
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::mpsc;
 
         const WAIT: Duration = Duration::from_secs(5);
         const MISMATCH: &str = "peer credential does not match the current user";
 
         /// 0700 の一時ディレクトリ（socket の配置先。drop で削除）。
-        struct TempDir(PathBuf);
+        struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
         impl TempDir {
             fn new() -> Self {
-                static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fctr-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-                Self(p)
+                // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+                // 非 root の単体試験なので作成前の削除（A）でよい。名前は sun_path のため短く保つ。
+                let root = crate::test_root::test_root("fctr", "t");
+                Self(root.to_path_buf(), root)
             }
             fn sock(&self) -> PathBuf {
                 self.0.join("s.sock")
-            }
-        }
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 

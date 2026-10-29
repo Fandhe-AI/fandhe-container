@@ -345,6 +345,15 @@ fn spawn_inner(
         // 識別行と別の pid を名乗った SPAWN 行の相手は止めておく。
         let _ = kill_and_confirm(extra.as_fd());
     }
+    // 確定記録の前に、意図記録へ同一性を原子的に追記する（#3344）。回収前に段 2 が終了してゾンビになっても
+    // （cmdline が空・cgroup.procs にも現れない）、回収はこの同一性で pidfd を取って帰属できる。
+    // ack の期限（段 2 が識別行を書いた時点から数える）の中で fsync が 1 組増える。
+    let upgraded = DnsHelperIntent::new(guard.network().clone(), nonce.clone(), listen)
+        .with_identity(identity.clone())
+        .and_then(|i| guard.replace_dns_helper_intent(&i));
+    if let Err(e) = upgraded {
+        return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e));
+    }
     let record = match DnsHelperRecord::new(identity.clone(), nonce, listen) {
         Ok(r) => r,
         Err(e) => return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e)),
@@ -720,8 +729,18 @@ fn recover_inner(
     let deadline = Instant::now() + DNS_HELPER_RECOVER_TIMEOUT;
     let mut stopped = 0usize;
     let mut seen = 0usize;
+    // 追記済みの同一性があれば、候補の列挙に依らず先に帰属して片付ける（#3344。ゾンビは cgroup.procs に現れない）。
+    let recorded_pid = intent.identity().map(|i| i.pid);
+    if let Some(id) = intent.identity()
+        && settle_recorded_identity(id)?
+    {
+        stopped += 1;
+    }
     for pid in (&mut *candidates).take(MAX_RECOVERY_CANDIDATES) {
         seen += 1;
+        if Some(pid) == recorded_pid {
+            continue;
+        }
         if Instant::now() >= deadline {
             return Err(err(
                 NetErrorCode::Timeout,
@@ -757,6 +776,36 @@ fn recover_inner(
     }
     guard.remove_dns_helper_intent()?;
     Ok(IntentRecovery::Recovered { stopped })
+}
+
+/// 意図記録に追記された同一性（#3344）で pidfd を取って照合し、片付ける（止めた・回収したなら true）。
+///
+/// 生存していれば pidfd へ SIGKILL して終了を確認し、終了済み（subreaper の下のゾンビ。`/proc/<pid>/stat` の
+/// 開始時刻は残るので照合できる）なら pidfd の `waitid` で回収する（自分の子でなければ回収は親の仕事で成功扱い）。
+/// pid が再利用されている（開始時刻・boot id が違う）なら何も送らない。プロセスが無ければ回収済みで何もしない。
+/// 確認できないエラーは意図記録を残して失敗にする。
+fn settle_recorded_identity(identity: &ProcessIdentity) -> Result<bool, NetError> {
+    let pidfd = match open_pidfd(identity.pid) {
+        Ok(fd) => fd,
+        Err(e) if e.code() == NetErrorCode::NotFound => return Ok(false),
+        Err(e) => return Err(with_note(e, "intent record kept")),
+    };
+    match verify_pidfd_target(pidfd.as_fd(), identity)? {
+        Verify::Different => Ok(false),
+        Verify::Gone => {
+            let _ = process::reap_pidfd_nohang(pidfd.as_fd());
+            Ok(true)
+        }
+        Verify::Same => {
+            if !kill_and_confirm(pidfd.as_fd()) {
+                return Err(err(
+                    NetErrorCode::Timeout,
+                    "dns helper did not exit before the deadline; intent record kept",
+                ));
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// nonce の一致を確認して pidfd を取った候補を片付ける（止めた・回収したなら true）。
@@ -1174,5 +1223,101 @@ mod ack_tests {
         assert!(reap_exited_child(pid));
         assert!(!std::path::Path::new(&proc_stat).exists(), "reaped");
         assert!(!reap_exited_child(pid));
+    }
+
+    fn scratch_store() -> (std::path::PathBuf, crate::network_store::NetworkStore) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-dnsh-rec-{}-{}",
+            std::process::id(),
+            HelperNonce::generate().expect("nonce")
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let st = crate::network_store::NetworkStore::open(&dir).expect("open");
+        st.create(&crate::network_store::NetworkDefinition::pasta("web").expect("def"))
+            .expect("create");
+        (dir, st)
+    }
+
+    /// 同一性つき（`id` が `Some`）または無しの意図記録を書いて、候補なしで回収した結果を返す。
+    fn recover_with(id: Option<ProcessIdentity>) -> (IntentRecovery, bool) {
+        let (dir, st) = scratch_store();
+        let name = crate::network::NetworkName::new("web").expect("name");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        let mut intent = DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::generate().expect("nonce"),
+            DnsListenAddr::new(std::net::Ipv4Addr::LOCALHOST, 5353).expect("listen"),
+        );
+        if let Some(id) = id {
+            intent = intent.with_identity(id).expect("identity");
+        }
+        n.write_dns_helper_intent(&intent).expect("intent");
+        let r = recover_dns_helper_intent(
+            &n,
+            &mut std::iter::empty(),
+            &crate::instrument::NoopNetOpRecorder,
+        )
+        .expect("recover");
+        let kept = n.read_dns_helper_intent().expect("read").is_some();
+        drop(n);
+        drop(g);
+        let _ = std::fs::remove_dir_all(dir);
+        (r, kept)
+    }
+
+    /// NET-5・REPAIR-5・#3344: 回収前に終了してゾンビになった子は、候補なしでも意図記録の同一性で帰属して回収される。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3344_recover_reaps_zombie_by_recorded_identity() {
+        let child = spawn_sleeper();
+        let pid = child.id();
+        let pidfd = open_pidfd(pid).expect("pidfd");
+        let identity = read_identity(pid).expect("identity");
+        kill_via_pidfd(pidfd.as_fd()).expect("kill");
+        assert!(wait_exit(pidfd.as_fd(), Duration::from_secs(5)).expect("wait"));
+        let stat = format!("/proc/{pid}/stat");
+        assert!(std::path::Path::new(&stat).exists(), "zombie before");
+        let (r, kept) = recover_with(Some(identity));
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 1 });
+        assert!(!kept, "intent record is removed");
+        assert!(!std::path::Path::new(&stat).exists(), "zombie reaped");
+    }
+
+    /// NET-5・#3344: 生存中のヘルパーも候補なしで同一性により止まり、回収される。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3344_recover_kills_live_process_by_recorded_identity() {
+        let child = spawn_sleeper();
+        let pid = child.id();
+        let identity = read_identity(pid).expect("identity");
+        let (r, kept) = recover_with(Some(identity));
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 1 });
+        assert!(!kept);
+        assert!(!std::path::Path::new(&format!("/proc/{pid}/stat")).exists());
+    }
+
+    /// NET-5・SEC-1・#3344: 開始時刻が違う（pid の再利用）なら何も送らない。意図記録は消える。
+    #[test]
+    fn net5_3344_recover_ignores_reused_pid() {
+        let mut child = spawn_sleeper();
+        let mut identity = read_identity(child.id()).expect("identity");
+        identity.start_time_ticks += 1;
+        let (r, kept) = recover_with(Some(identity));
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
+        assert!(!kept);
+        assert!(child.try_wait().expect("try_wait").is_none(), "left alone");
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// NET-5・#3344: 同一性の無い旧形式の意図記録は従来どおり（候補なしなら 0 件で消える）。
+    #[test]
+    fn net5_3344_recover_without_identity_is_unchanged() {
+        let (r, kept) = recover_with(None);
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
+        assert!(!kept);
     }
 }

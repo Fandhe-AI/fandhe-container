@@ -18,7 +18,8 @@
 //! 3. 段 2 は自分の識別行 `IDENT <pid> <start> <boot> <nonce>` を stdout へ送り、stdin の `ACK` を
 //!    [`DNS_HELPER_ACK_TIMEOUT`]（2 秒。D15）まで待つ。期限内に ack が無ければ bind せずに自分で終了する
 //!    （起動元が記録の前に死んでも gateway:53 を握った孤児が残らない）
-//! 4. 起動元は識別行を nonce・boot id・pidfd 上の開始時刻で照合し、`dns-helper` を fsync して書いてから ack を返す
+//! 4. 起動元は識別行を nonce・boot id・pidfd 上の開始時刻で照合し、意図記録へ同一性（pid・開始時刻・boot id）を
+//!    原子的に追記し（#3344）、`dns-helper` を fsync して書いてから ack を返す
 //! 5. 段 2 が bind して `READY <addr>` を返したら、意図記録を消す
 //!
 //! # 停止の手順（D11）
@@ -35,6 +36,9 @@
 //! - 起動窓の回収の候補 pid（`net-helpers` の cgroup の `cgroup.procs`）は #3074 の呼び出し側が渡す。cgroup の
 //!   列挙は本モジュールでは行わない。子は ack の期限（2 秒）で自分から終了するため、通常はこの経路に入る前に
 //!   消えている（入るのは、ack を受けた後で起動元が記録を確定する前に死んだ場合）
+//! - 回収前に終了したゾンビは cmdline が空で、cgroup v2 では `cgroup.procs` にも現れない。識別行の照合後に意図記録へ
+//!   追記した同一性（#3344）があれば、回収は候補の列挙に依らずその同一性で pidfd を取って照合し、停止または
+//!   `waitid` で回収する。SPAWN 行も識別行も得られず pid が分からない窓は帰属できない（段 2 は ack の期限で終了する）
 //! - 呼び出し元が child subreaper のとき、切り離した孫は呼び出し元の子になる。停止後に `waitid(P_PIDFD, WNOHANG)`
 //!   で回収する。cgroup の配置（`net-helpers`）は #3074
 

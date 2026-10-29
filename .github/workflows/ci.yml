@@ -1797,11 +1797,11 @@ jobs:
           }
           code='[A-Z][A-Za-z]+'
           # 二者択一（rslave-bind・p2/r3/r4 の start refused）と root 専用の行は select に入れない。
-          # --min は導出件数の実測値（A 23・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
+          # --min は導出件数の実測値（A 24・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
           # 定数の出典は production_launcher.rs の const（HOSTNAME・BIND_DEST・LO_TMPFS_DEST・WANT・EXIT_CODE）と scenario_k の配列。
           # A: 位置プレースホルダの無い行（最終行・正常系・説明行）。rslave-bind は到達だけを --require で照合する
           sel_a='^production_launcher: (pid1, default |scenario=(ok|bind-mount|multithreaded-refused|j|k'
-          sel_a+='|working-dir'
+          sel_a+='|working-dir|dropped-handle-confirmed'
           sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
           sel_a+='|injected secret '
           sel_a+='|capabilities drop |sysctls applied |pod ipc |entrypoint violation |exit_signal '
@@ -1812,7 +1812,7 @@ jobs:
             --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
             --subst name=unshare,ptrace,kexec_load \
             --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
-            --require 'production_launcher: scenario=rslave-bind host=' --min 23 --summary
+            --require 'production_launcher: scenario=rslave-bind host=' --min 24 --summary
           # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
           ef='production_launcher: scenario=exec-failure'
           ef_tail='state=created audit=0 children=0'

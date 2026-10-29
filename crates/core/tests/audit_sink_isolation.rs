@@ -638,7 +638,7 @@ mod linux {
     }
 
     /// SEC-4・REPAIR-5・#3300: `spawn_ignoring_stop_signals` の helper は SIGTERM・SIGINT を無視し、従来の `spawn`
-    /// （supervisor が使う）の helper は無視しない（挙動不変の固定）。どちらも drop で SIGKILL され回収される。
+    /// の helper は無視しない（挙動不変の固定）。どちらも drop で SIGKILL され回収される。
     fn control_relay_stop_signal_disposition_of_the_helper() {
         // fork の直後は子がまだ closure を実行していない可能性があるため、probe の往復（結果は問わない）の後に読む。
         let healthy = |tag: &str| {

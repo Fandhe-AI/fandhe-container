@@ -15,6 +15,8 @@ use crate::nftables_rules::NftRuleHandle;
 const TOKEN: &str = "fandhe-net:web:1:0:0";
 const OTHER_TOKEN: &str = "fandhe-net:web:9:9:9";
 const NETNS_DIR: &str = "/run/fc-test-ns";
+/// 意図記録に控える置き場の識別子（fake の現在の置き場も既定で同じ）。
+const DIR_ID: (u64, u64) = (7, 11);
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -96,6 +98,8 @@ fn member_intent(id: &str, last: u8) -> MemberIntent {
     member_intent_nodir(id, last)
         .with_netns_dir(std::path::Path::new(NETNS_DIR))
         .unwrap()
+        .with_netns_dir_id(DIR_ID)
+        .unwrap()
 }
 /// 置き場を記録しない旧形式の意図記録。
 fn member_intent_nodir(id: &str, last: u8) -> MemberIntent {
@@ -173,6 +177,8 @@ struct Fake {
     dnat_calls: Cell<usize>,
     /// pin が残っている置き場（この置き場への照会だけ `Ok(false)`）。
     pin_present_dir: RefCell<Option<PathBuf>>,
+    /// 現在の置き場の識別子（記録の識別子と違えば置き場の差し替えとして `Err`）。
+    pin_dir_actual: Cell<(u64, u64)>,
     /// 照会された置き場。
     pin_dirs: RefCell<Vec<PathBuf>>,
 }
@@ -190,6 +196,7 @@ impl Fake {
             rollbacks: RefCell::new(Vec::new()),
             dnat_calls: Cell::new(0),
             pin_present_dir: RefCell::new(None),
+            pin_dir_actual: Cell::new(DIR_ID),
             pin_dirs: RefCell::new(Vec::new()),
         }
     }
@@ -259,8 +266,12 @@ impl ReconcileOps for Fake {
         }
         Ok(())
     }
-    fn pin_absent(&self, dir: &Path, _endpoint: &EndpointId) -> Result<bool, NetError> {
+    fn pin_absent(&self, rec: &NetnsDirRecord, _endpoint: &EndpointId) -> Result<bool, NetError> {
+        let dir = rec.path();
         self.pin_dirs.borrow_mut().push(dir.to_path_buf());
+        if rec.dir_id() != self.pin_dir_actual.get() {
+            return Err(err(NetErrorCode::FailedPrecondition));
+        }
         if self.pin_present_dir.borrow().as_deref() == Some(dir) {
             return Ok(false);
         }
@@ -779,6 +790,45 @@ fn net7_3346_sweep_checks_pin_in_each_intents_own_dir() {
     dirs.sort();
     assert_eq!(dirs, vec![dir_a.to_path_buf(), dir_b.to_path_buf()]);
     assert_eq!(n.member_intents().unwrap().len(), 1);
+}
+
+/// NET-1・SEC-1・#3346: 置き場が移動・差し替えられて識別子が記録と違うとき、元の置き場の pin の有無を
+/// 証明できないので意図記録を消さない（`PinUnknown`）。識別子の無い旧形式も同様に残す。
+#[test]
+fn net1_3346_sweep_keeps_intent_when_pin_dir_identity_differs_or_is_missing() {
+    let t = Tmp::new("dirid");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    ready(&n);
+    n.write_member_intent(&member_intent("c1", 2)).unwrap();
+    n.write_member_intent(
+        &member_intent_nodir("c2", 3)
+            .with_netns_dir(std::path::Path::new(NETNS_DIR))
+            .unwrap(),
+    )
+    .unwrap();
+    let fake = Fake::owned();
+    // 置き場が別のディレクトリに差し替わった（pin は元の置き場に残っているかもしれない）。
+    fake.pin_dir_actual.set((7, 12));
+    let report = run(&n, &fake).unwrap();
+    assert!(report.removed_intents.is_empty());
+    assert_eq!(
+        report.kept_intents,
+        vec![
+            (mid("c1"), IntentKeep::PinUnknown),
+            (mid("c2"), IntentKeep::PinUnknown)
+        ]
+    );
+    assert_eq!(n.member_intents().unwrap().len(), 2);
+    // 識別子の無い c2 は、置き場が同じでも判定不能のまま（fake は呼ばれない）。
+    fake.pin_dir_actual.set(DIR_ID);
+    let report = run(&n, &fake).unwrap();
+    assert_eq!(report.removed_intents, vec![mid("c1")]);
+    assert_eq!(
+        report.kept_intents,
+        vec![(mid("c2"), IntentKeep::PinUnknown)]
+    );
 }
 
 /// NET-1・#3346: 前回途中で落ちた削除を照合が完了させたときだけ、記録つき削除は成功として返せる。

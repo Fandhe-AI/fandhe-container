@@ -371,9 +371,15 @@ mod linux {
                 let addr =
                     IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 232, 5, last)), 24).map_err(e)?;
                 let token = format!("{}/ep/{id}/g/{:032x}", created.bridge_token, 1u8);
+                let dir_id = {
+                    use std::os::unix::fs::MetadataExt;
+                    let m = std::fs::metadata(&ns_dir).map_err(|x| x.to_string())?;
+                    (m.dev(), m.ino())
+                };
                 n.write_member_intent(
                     &MemberIntent::new(MemberId::new(id).map_err(e)?, ep, addr, &token)
                         .and_then(|i| i.with_netns_dir(&ns_dir))
+                        .and_then(|i| i.with_netns_dir_id(dir_id))
                         .map_err(e)?,
                 )
                 .map_err(e)?;

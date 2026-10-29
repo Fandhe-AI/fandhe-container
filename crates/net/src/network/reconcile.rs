@@ -45,13 +45,12 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::time::Duration;
 
 use super::delete::{LinkAttachment, LinuxDeleteOps, TableProof, judge_table_info};
 use super::{
-    CreatedNetwork, EndpointId, FailedCreateClaim, NetworkResourceNames, PortProtocol,
-    PublishedListener, VethNames,
+    CreatedNetwork, EndpointId, FailedCreateClaim, NetnsDirRecord, NetworkResourceNames,
+    PortProtocol, PublishedListener, VethNames,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
@@ -79,8 +78,10 @@ pub(crate) trait ReconcileOps {
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
     /// 請求書の対象を、所有を証明してから巻き戻す（`reclaim_failed_create_with`）。取り残しがあれば `Err`。
     fn rollback(&self, claim: &FailedCreateClaim) -> Result<(), NetError>;
-    /// 置き場 `dir` の直下に `endpoint` 名の pin が無いと確かめられるか（`Ok(true)` だけが不存在）。
-    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError>;
+    /// 接続時に記録した置き場 `dir`（パスと識別子）の直下に `endpoint` 名の pin が無いと確かめられるか
+    /// （`Ok(true)` だけが不存在）。現在の置き場が記録の識別子と違えば `Err`（置き場の移動・差し替えでは
+    /// 元の置き場の pin の有無を証明できない。NET-1・SEC-1）。
+    fn pin_absent(&self, dir: &NetnsDirRecord, endpoint: &EndpointId) -> Result<bool, NetError>;
     /// 専用テーブルの DNAT ルールが示す受け口（重複を含む。1 公開 2 ルール）。
     fn dnat_listeners(&self, table: &NftName) -> Result<Vec<PublishedListener>, NetError>;
 }
@@ -432,13 +433,13 @@ fn sweep_member_intents<O: ReconcileOps>(
         }
         // 4. netns の pin。置き場は意図記録が持つ（接続ごとに違いうるため、呼び出しごとの単一の置き場では
         //    確かめない）。記録の無い旧形式は判定不能として残す。
-        let Some(dir) = it.netns_dir() else {
+        let Some(dir) = it.netns_dir_record() else {
             report
                 .kept_intents
                 .push((it.id().clone(), IntentKeep::PinUnknown));
             continue;
         };
-        match ops.pin_absent(dir, it.endpoint()) {
+        match ops.pin_absent(&dir, it.endpoint()) {
             Ok(true) => candidates.push(it),
             Ok(false) => report
                 .kept_intents
@@ -537,9 +538,15 @@ impl ReconcileOps for LinuxReconcileOps<'_> {
             .map_err(|e| e.error)
     }
 
-    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError> {
+    fn pin_absent(&self, dir: &NetnsDirRecord, endpoint: &EndpointId) -> Result<bool, NetError> {
         use super::delete::DeleteOps;
-        self.inner.pin_absent(dir, endpoint)
+        // 置き場の識別子を照合してから pin を見る（`pin_exists` は差し替えを `PinCheckError::Dir` で拒否する）。
+        self.inner
+            .pin_exists(dir, endpoint)
+            .map(|exists| !exists)
+            .map_err(|e| match e {
+                super::delete::PinCheckError::Dir(e) | super::delete::PinCheckError::Pin(e) => e,
+            })
     }
 
     fn dnat_listeners(&self, table: &NftName) -> Result<Vec<PublishedListener>, NetError> {

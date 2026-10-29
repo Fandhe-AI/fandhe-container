@@ -83,11 +83,11 @@ pub(crate) struct PinIdentity {
 }
 
 impl PinIdentity {
-    fn encode(self) -> String {
+    pub(crate) fn encode(self) -> String {
         format!("{}:{}:{}", self.dev, self.ino, self.serial)
     }
 
-    fn decode(s: &str) -> Result<Self, NetError> {
+    pub(crate) fn decode(s: &str) -> Result<Self, NetError> {
         let bad = || invalid("attach claim record pin invalid");
         let mut it = s.split(':');
         let mut num = || -> Result<u64, NetError> {

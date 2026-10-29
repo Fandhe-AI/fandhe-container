@@ -16,6 +16,7 @@
 //! token <len>\n<host veth の所有トークン>\n         token <len>\n<host veth の所有トークン>\n
 //! netns-dir <len>\n<絶対パス>\n
 //! netns-dir-id <len>\n<dev:ino>\n
+//! pin <len>\n<dev:ino:serial>\n   (省略可。netns の pin の識別子。#3347)
 //! dns <len>\n<ip>\n                  (0〜3 回)
 //! table-handle <len>\n<10 進・非 0>\n   (公開が 1 件以上のときだけ 1 回)
 //! publish <len>\n<proto addr:host-port container-port prerouting output>\n   (0〜64 回)
@@ -42,6 +43,7 @@ use super::realized::RealizedRecord;
 use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::IpPrefix;
+use crate::network::attach_claim::PinIdentity;
 use crate::network::{
     EndpointId, MAX_PORT_PUBLISHES, NetnsDirRecord, PortProtocol, PortPublish, PublishedPort,
 };
@@ -276,6 +278,8 @@ pub struct MemberRecord {
     token: String,
     netns_dir: PathBuf,
     netns_dir_id: (u64, u64),
+    /// 接続時に作った netns の pin の実体の識別子（記録だけからの detach が三者照合に使う。#3347）。旧形式・識別子を控えられなかった接続では `None`。
+    pin: Option<PinIdentity>,
     dns: Vec<IpAddr>,
     table_handle: Option<NftTableHandle>,
     publishes: Vec<RecordedPublish>,
@@ -311,10 +315,25 @@ impl MemberRecord {
             token: token.to_owned(),
             netns_dir: netns_dir.to_path_buf(),
             netns_dir_id,
+            pin: None,
             dns: dns.to_vec(),
             table_handle: None,
             publishes: Vec::new(),
         })
+    }
+
+    /// netns の pin の識別子を載せる（#3347）。記録だけから detach するとき、請求書の `pin` として三者照合
+    /// （識別子 ↔ `.owned/<endpoint>` の所有記録 ↔ カーネルの実状態）に使う。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_pin(mut self, pin: PinIdentity) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    /// 記録した netns の pin の識別子（旧形式の記録・控えられなかった接続では `None`）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn pin(&self) -> Option<PinIdentity> {
+        self.pin
     }
 
     /// 公開（受け口と rule handle）と、それを投入したテーブルのハンドルを載せる（#3068）。
@@ -531,6 +550,9 @@ impl MemberRecord {
             "netns-dir-id",
             &format!("{}:{}", self.netns_dir_id.0, self.netns_dir_id.1),
         );
+        if let Some(pin) = self.pin {
+            push_field(&mut out, "pin", &pin.encode());
+        }
         for ip in &self.dns {
             push_field(&mut out, "dns", &ip.to_string());
         }
@@ -554,6 +576,15 @@ impl MemberRecord {
         let token = take_field(&mut rest, "token")?;
         let dir = take_field(&mut rest, "netns-dir")?;
         let dir_id = parse_dir_id(take_field(&mut rest, "netns-dir-id")?)?;
+        let pin = match take_optional(&mut rest, "pin")? {
+            Some(v) => Some(
+                PinIdentity::decode(v)
+                    .ok()
+                    .filter(|p| p.encode() == v)
+                    .ok_or_else(|| bad("member pin identity is malformed"))?,
+            ),
+            None => None,
+        };
         let mut dns = Vec::new();
         while let Some(v) = take_optional(&mut rest, "dns")? {
             let ip: IpAddr = v.parse().map_err(|_| bad("member dns is malformed"))?;
@@ -580,8 +611,9 @@ impl MemberRecord {
             publishes.push(RecordedPublish::decode(v)?);
         }
         finish(rest)?;
-        let rec = Self::new(id, endpoint, address, token, Path::new(dir), dir_id, &dns)
+        let mut rec = Self::new(id, endpoint, address, token, Path::new(dir), dir_id, &dns)
             .map_err(invalid_value)?;
+        rec.pin = pin;
         match (table_handle, publishes.is_empty()) {
             (None, true) => Ok(rec),
             (Some(h), false) => rec.with_publishes(h, publishes).map_err(invalid_value),
@@ -603,6 +635,8 @@ pub struct MemberIntent {
     token: String,
     /// 接続時の netns pin の置き場（掃除が pin の不存在を元の場所で確かめるため。無ければ判定不能として残す）。
     netns_dir: Option<std::path::PathBuf>,
+    /// 置き場を記録した時点の識別子 (st_dev, st_ino)。置き場の移動・差し替えを見分ける。無ければ判定不能として残す。
+    netns_dir_id: Option<(u64, u64)>,
 }
 
 impl MemberIntent {
@@ -621,6 +655,7 @@ impl MemberIntent {
             address,
             token: token.to_owned(),
             netns_dir: None,
+            netns_dir_id: None,
         })
     }
 
@@ -629,6 +664,28 @@ impl MemberIntent {
         check_netns_dir(dir)?;
         self.netns_dir = Some(dir.to_path_buf());
         Ok(self)
+    }
+
+    /// 置き場の識別子 (st_dev, st_ino) を付けた意図記録を返す。置き場（`with_netns_dir`）が先に付いている必要がある。
+    pub fn with_netns_dir_id(mut self, dir_id: (u64, u64)) -> Result<Self, NetError> {
+        if self.netns_dir.is_none() {
+            return Err(bad("member intent directory id needs a directory"));
+        }
+        self.netns_dir_id = Some(dir_id);
+        Ok(self)
+    }
+
+    /// 記録した置き場の識別子。旧形式・未記録は `None`（置き場の同一性を証明できない）。
+    pub fn netns_dir_id(&self) -> Option<(u64, u64)> {
+        self.netns_dir_id
+    }
+
+    /// 置き場とその識別子がそろっているときだけ返す（pin の不存在判定の前提）。
+    pub(crate) fn netns_dir_record(&self) -> Option<NetnsDirRecord> {
+        Some(NetnsDirRecord::new(
+            self.netns_dir.clone()?,
+            self.netns_dir_id?,
+        ))
     }
 
     /// 記録した pin の置き場。旧形式・未記録は `None`。
@@ -665,6 +722,9 @@ impl MemberIntent {
         push_field(&mut out, "token", &self.token);
         if let Some(d) = &self.netns_dir {
             push_field(&mut out, "netns-dir", &d.to_string_lossy());
+            if let Some((dev, ino)) = self.netns_dir_id {
+                push_field(&mut out, "netns-dir-id", &format!("{dev}:{ino}"));
+            }
         }
         out.into_bytes()
     }
@@ -679,10 +739,20 @@ impl MemberIntent {
         let address = parse_prefix(take_field(&mut rest, "address")?)?;
         let token = take_field(&mut rest, "token")?;
         let dir = take_optional(&mut rest, "netns-dir")?;
+        let dir_id = match dir {
+            Some(_) => take_optional(&mut rest, "netns-dir-id")?
+                .map(parse_dir_id)
+                .transpose()?,
+            None => None,
+        };
         finish(rest)?;
         let intent = Self::new(id, endpoint, address, token).map_err(invalid_value)?;
-        match dir {
-            Some(d) => intent.with_netns_dir(Path::new(d)).map_err(invalid_value),
+        let intent = match dir {
+            Some(d) => intent.with_netns_dir(Path::new(d)).map_err(invalid_value)?,
+            None => intent,
+        };
+        match dir_id {
+            Some(i) => intent.with_netns_dir_id(i).map_err(invalid_value),
             None => Ok(intent),
         }
     }
@@ -773,8 +843,28 @@ mod tests {
         assert_eq!(MemberIntent::decode(&i.encode()).unwrap(), i);
         assert_eq!(MemberIntent::decode(&base.encode()).unwrap(), base);
         assert_eq!(
-            code(base.with_netns_dir(Path::new("run/ns"))),
+            code(base.clone().with_netns_dir(Path::new("run/ns"))),
             NetErrorCode::InvalidArgument
+        );
+        // 置き場の識別子つき。識別子だけの記録（置き場なし）や壊れた識別子は復号できない。
+        let with_id = i.clone().with_netns_dir_id((8, 9)).unwrap();
+        assert!(with_id.encode().ends_with(b"netns-dir-id 3\n8:9\n"));
+        assert_eq!(MemberIntent::decode(&with_id.encode()).unwrap(), with_id);
+        assert_eq!(with_id.netns_dir_id(), Some((8, 9)));
+        assert_eq!(
+            MemberIntent::decode(&i.encode()).unwrap().netns_dir_id(),
+            None
+        );
+        assert_eq!(
+            code(base.clone().with_netns_dir_id((8, 9))),
+            NetErrorCode::DataLoss
+        );
+        let bad_id = String::from_utf8(with_id.encode())
+            .unwrap()
+            .replace("8:9", "8-9");
+        assert_eq!(
+            code(MemberIntent::decode(bad_id.as_bytes())),
+            NetErrorCode::DataLoss
         );
         let bad = expected.replace("netns-dir 7\n/run/ns", "netns-dir 6\nrun/ns");
         assert_eq!(
@@ -1099,6 +1189,79 @@ mod tests {
         assert_eq!(
             code(MemberId::new(&"a".repeat(256))),
             NetErrorCode::InvalidArgument
+        );
+    }
+
+    fn pin_id(dev: u64, ino: u64, serial: u64) -> PinIdentity {
+        PinIdentity { dev, ino, serial }
+    }
+
+    /// NET-1・NET-6・#3347: pin の識別子は `netns-dir-id` の直後・`dns` の前に正準形で符号化され、往復する。
+    #[test]
+    fn net1_3347_member_pin_encode_exact_and_roundtrip() {
+        let m =
+            member(&["1.1.1.1".parse().unwrap()]).with_pin(pin_id(8, 9, 1_700_000_000_000_000_001));
+        let expected = format!(
+            "FCMEM1\nid 2\nC1\nendpoint 2\nc1\naddress 11\n10.0.0.2/24\ntoken {}\n{TOKEN}\nnetns-dir 7\n/run/ns\nnetns-dir-id 3\n8:9\npin 23\n8:9:1700000000000000001\ndns 7\n1.1.1.1\n",
+            TOKEN.len()
+        );
+        assert_eq!(m.encode(), expected.as_bytes());
+        let back = MemberRecord::decode(&m.encode()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.pin(), Some(pin_id(8, 9, 1_700_000_000_000_000_001)));
+        // 公開と併用しても pin は保たれる（解除の印の書き直しでも落ちない）。
+        let with_pub = with_two().with_pin(pin_id(1, 2, 3));
+        assert_eq!(with_pub.pin(), Some(pin_id(1, 2, 3)));
+        let marked = with_pub
+            .with_unpublishing(&publish(PortProtocol::Tcp, 8080, 80))
+            .unwrap();
+        assert_eq!(
+            MemberRecord::decode(&marked.encode()).unwrap().pin(),
+            Some(pin_id(1, 2, 3))
+        );
+    }
+
+    /// NET-1・#3347: pin の無い旧形式はそのまま読め、`pin()` は `None`。
+    #[test]
+    fn net1_3347_member_without_pin_decodes_as_none() {
+        let old = member(&[]).encode();
+        assert!(!String::from_utf8(old.clone()).unwrap().contains("pin "));
+        assert_eq!(MemberRecord::decode(&old).unwrap().pin(), None);
+    }
+
+    /// REPAIR-2・#3347: 壊れた pin（桁超過・先頭の 0・区切りの過不足・非数字・空・重複・順序違反）は `DataLoss`。
+    #[test]
+    fn net1_3347_member_pin_rejects_malformed() {
+        let base = String::from_utf8(member(&[]).encode()).unwrap();
+        let with = |v: &str| format!("{base}pin {}\n{v}\n", v.len());
+        for bad in [
+            "1:2",
+            "1:2:3:4",
+            "1:2:",
+            ":2:3",
+            "1:x:3",
+            "01:2:3",
+            "1:2:+3",
+            "123456789012345678901:2:3",
+        ] {
+            assert_eq!(
+                code(MemberRecord::decode(with(bad).as_bytes())),
+                NetErrorCode::DataLoss,
+                "{bad}"
+            );
+        }
+        // 重複。
+        let dup = format!("{}pin 5\n1:2:3\n", with("1:2:3"));
+        assert_eq!(
+            code(MemberRecord::decode(dup.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+        // 順序違反（dns の後ろ）。
+        let m = member(&["1.1.1.1".parse().unwrap()]);
+        let late = format!("{}pin 5\n1:2:3\n", String::from_utf8(m.encode()).unwrap());
+        assert_eq!(
+            code(MemberRecord::decode(late.as_bytes())),
+            NetErrorCode::DataLoss
         );
     }
 }

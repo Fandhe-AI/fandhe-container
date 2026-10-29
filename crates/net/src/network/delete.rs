@@ -113,6 +113,7 @@
 //!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
 
 mod detach;
+pub(crate) mod member_detach;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -3593,4 +3594,5 @@ mod tests {
     }
 
     mod detach_tests;
+    mod member_detach_tests;
 }

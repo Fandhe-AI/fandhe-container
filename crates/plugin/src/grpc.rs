@@ -870,6 +870,11 @@ mod uds {
     /// accept の I/O エラー（fd 枯渇等）は `Err` として流し、tonic が記録して継続する。直後は 10ms の
     /// バックオフを挟み busy loop を避ける（REPAIR-5）。
     ///
+    /// close-on-exec（PLUG-7・SEC-1・#3262）: 待ち受け fd は `UdsListener::bind`（spawn ゲートの中）で作った fd の
+    /// `F_DUPFD_CLOEXEC` による複製で原子的。accept で得る接続は macOS では mio が `accept(2)` の後に
+    /// `fcntl` で立てるため非原子でゲート外。同じプロセスに `spawn_gate::spawn` が無い間は実害がない
+    /// （範囲と見直す条件は `spawn_gate` のモジュール doc を参照）。
+    ///
     /// `new` は tokio ランタイムの内側で呼ぶこと（reactor へ登録するため）。
     pub struct UdsIncoming {
         /// 非同期 accept 用（`listener` の fd を dup したもの）。
@@ -1080,6 +1085,9 @@ mod uds {
     /// `Channel` が再接続するたびに呼ばれるため、接続ごとに server の peer UID を検証する。不一致・取得不能は
     /// 何も送らず切断し、監査イベントを通知する。失敗の `PluginError` は `last_error` へ残し、
     /// [`connect_uds_channel`] が tonic の汎用エラーの代わりに返す（コード契約を `UdsStream::connect` と揃える）。
+    ///
+    /// close-on-exec（#3262）: client の socket は macOS では mio が `socket(2)` の後に `fcntl` で立てるため
+    /// 非原子でゲート外（`spawn_gate` のモジュール doc を参照）。
     #[derive(Clone)]
     struct UdsConnector {
         path: Arc<PathBuf>,

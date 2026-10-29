@@ -1297,6 +1297,18 @@ fn scratch_root(tag: &str) -> (std::path::PathBuf, OwnedFd) {
     (root, fd)
 }
 
+/// 試験用: `@pasta/<id>` の同一性を観測する(無ければ `None`)。
+fn run_dir_identity(
+    root: std::os::fd::BorrowedFd<'_>,
+    id: &str,
+) -> Result<Option<RunDirIdentity>, fandhe_container_net::error::NetError> {
+    use fandhe_container_net::pasta::RunDirExpectation;
+    Ok(match observe_run_dir(root, id)? {
+        RunDirExpectation::Absent => None,
+        RunDirExpectation::Existing(i) => Some(i),
+    })
+}
+
 /// CORE-2・REPAIR-5・NET-9: 期限切れで残った旧い削除は、別の起動が作り直した `@pasta/<id>` には触れない
 /// (同一性 `(st_dev, st_ino)` が違えば何もせず終える)。同一なら消す。pid ファイルつきの新しい置き場所が残ることを確かめる。
 #[test]
@@ -1328,6 +1340,44 @@ fn core2_stale_removal_keeps_recreated_run_dir_by_identity() {
     assert!(remove_run_dir_if_ours(fd.as_fd(), "web1", Some(new_id)).expect("own remove"));
     assert!(!root.join("@pasta/web1").exists());
     assert!(remove_run_dir_if_ours(fd.as_fd(), "web1", Some(new_id)).expect("already gone"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CORE-2・REPAIR-5・NET-9(#3411): 作り直された新しい置き場所が `pid` の無い空でも、旧い同一性の削除は消さない。
+#[test]
+fn core2_stale_removal_keeps_empty_recreated_run_dir() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("emptynew");
+    let old = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare old");
+    let old_id = old.identity();
+    drop(old);
+    std::fs::rename(root.join("@pasta/web1"), root.join("@pasta/old-keep")).expect("rename");
+    drop(PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare new"));
+    assert!(!remove_run_dir_if_ours(fd.as_fd(), "web1", Some(old_id)).expect("stale remove"));
+    assert!(root.join("@pasta/web1").is_dir());
+    assert!(root.join("@pasta/old-keep").is_dir());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CORE-2・NET-9(#3411): `@pasta/<id>` が symlink なら別物として触れない(`Ok(false)`)。
+#[test]
+fn core2_removal_leaves_symlinked_run_dir_untouched() {
+    use fandhe_container_net::pasta::PastaRunDir;
+    let (root, fd) = scratch_root("symlink");
+    let old = PastaRunDir::prepare(fd.as_fd(), "web1").expect("prepare");
+    let ours = old.identity();
+    drop(old);
+    std::fs::remove_dir(root.join("@pasta/web1")).expect("rm");
+    std::fs::create_dir(root.join("elsewhere")).expect("mkdir");
+    std::os::unix::fs::symlink(root.join("elsewhere"), root.join("@pasta/web1")).expect("symlink");
+    assert!(!remove_run_dir_if_ours(fd.as_fd(), "web1", Some(ours)).expect("symlink"));
+    assert!(
+        root.join("@pasta/web1")
+            .symlink_metadata()
+            .expect("md")
+            .is_symlink()
+    );
+    assert!(root.join("elsewhere").is_dir());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1483,7 +1533,7 @@ fn core2_prepare_job_records_identity_of_held_dir_and_clears_stale_pid() {
     };
     let md = std::fs::symlink_metadata(root.join("@pasta/web1")).expect("md");
     assert_eq!(generation, Some(1));
-    assert_eq!(ours, Some((md.dev(), md.ino())));
+    assert_eq!(ours.map(|i| (i.dev(), i.ino())), Some((md.dev(), md.ino())));
     assert!(!root.join("@pasta/web1/pid").exists());
     let _ = std::fs::remove_dir_all(&root);
 }

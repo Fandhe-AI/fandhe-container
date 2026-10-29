@@ -15,9 +15,16 @@
 //!   と開いた fd の `(st_dev, st_ino)` が一致するときだけ行う。別物なら `FailedPrecondition` で何も消さない。
 //!   自分が今作ったディレクトリでは古い `pid` を消さない。`prepare` は観測と本処理を続けて行う薄い包みで、
 //!   観測と本処理の間を他者が書き換えうる文脈では排他の下で `prepare_expecting` を使う。
+//! - 削除も照合した置き場所に束縛する（#3411・CORE-2・REPAIR-5）。`PastaRunDir::remove` は保持 fd の同一性、
+//!   [`remove_pasta_run_dir_expecting`] は呼び出し元が控えた同一性、`remove_pasta_run_dir` は自分の観測に束縛する。
+//!   中身（`pid`）は照合済みの fd 起点で消し、最後の `rmdir` の直前に親の fd 起点で名前の先の同一性を取り直す。
+//!   別物（作り直された新しい世代・symlink・非ディレクトリ）なら [`RunDirRemoval::NotOurs`] で何も消さない。
 //! - 残余（REPAIR-3。supervisor のコンテナ単位のプロセス間ロックが担う範囲）: 観測より前に止まった worker は
 //!   新しい世代を「既存」として観測する／同じ既存ディレクトリを 2 者が観測すると同一性が等しく判別できない／
 //!   照合から unlink までの間は原理的に窓が残る（unlink-if-inode の syscall が無い）。
+//!   削除側でも、`rmdir` の直前の再照合から `rmdir` までの窓は残る（rmdir-by-fd・rmdir-if-inode の syscall が無い）。
+//!   `rmdir` は空のディレクトリしか消さないため、影響はその窓の中で作られ、まだ `pid` の無い新しい
+//!   ディレクトリに限られる。この窓もコンテナ単位のプロセス間ロックが担う。
 //! - 残余: 同じ UID による差し替えは信頼の範囲内（防がない）。
 //! - Linux 以外では [`PastaRunDir`] を作れない（`prepare` は Linux のみ。CLI-1）。
 //!
@@ -103,6 +110,17 @@ pub enum RunDirExpectation {
     Existing(RunDirIdentity),
 }
 
+/// 削除の結果（#3411・CORE-2・REPAIR-5）。照合した置き場所だけを消し、別物には触れない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDirRemoval {
+    /// 照合した置き場所を消した。
+    Removed,
+    /// 消す対象が無かった（照合した置き場所は既に名前から外れていた）。
+    Absent,
+    /// 名前の先が照合した実体と別物（作り直された・symlink・ディレクトリでない）。何も消していない。
+    NotOurs,
+}
+
 /// 作成済みの置き場所（`@pasta/<id>/`）。
 ///
 /// spawn の前に `PastaRunDir::prepare` で作る。`pid_path` を pasta の `-P` に渡し、準備完了の判定はこの型が
@@ -150,8 +168,9 @@ impl PastaRunDir {
         self.held.identity
     }
 
-    /// `pid` と `<id>` ディレクトリを消す（存在しなければ成功扱い）。
-    pub fn remove(self) -> Result<(), NetError> {
+    /// `pid` と `<id>` ディレクトリを消す。保持している fd の同一性に束縛し、名前の先が別物なら
+    /// [`RunDirRemoval::NotOurs`] で何も消さない（#3411）。
+    pub fn remove(self) -> Result<RunDirRemoval, NetError> {
         imp::remove(&self.held)
     }
 
@@ -170,13 +189,27 @@ pub fn observe_run_dir(
     imp::observe(state_root, container_id)
 }
 
+/// 控えた同一性 `expected` と一致する `@pasta/<id>/` だけを消す（#3411・CORE-2・REPAIR-5）。
+/// 別物は [`RunDirRemoval::NotOurs`] で何も消さない（`pid` にも触れない）。supervisor の後始末が使う。
+#[cfg(target_os = "linux")]
+pub fn remove_pasta_run_dir_expecting(
+    state_root: std::os::fd::BorrowedFd<'_>,
+    container_id: &str,
+    expected: RunDirIdentity,
+) -> Result<RunDirRemoval, NetError> {
+    imp::remove_expecting(state_root, container_id, expected)
+}
+
 /// CLI の delete が残骸を消す入口。`@pasta/<id>/` が無ければ成功。記録の pid でのプロセスの探索・kill はしない。
+///
+/// 観測（`observe_run_dir`）と [`remove_pasta_run_dir_expecting`] を続けて呼ぶ薄い包み。観測から削除までの間に
+/// 置き場所が替わったら `FailedPrecondition`（[`MSG_DIR_REPLACED`]）で何も消さない（#3411）。
 #[cfg(target_os = "linux")]
 pub fn remove_pasta_run_dir(
     state_root: std::os::fd::BorrowedFd<'_>,
     container_id: &str,
 ) -> Result<(), NetError> {
-    imp::remove_existing(state_root, container_id)
+    imp::remove_existing(state_root, container_id, &mut || {})
 }
 
 #[cfg(target_os = "linux")]
@@ -366,10 +399,27 @@ mod imp {
         PathBuf::from(proc_path(h.id_dir.as_fd(), PASTA_PID_FILE_NAME))
     }
 
-    fn rmdir_id(pasta_dir: BorrowedFd<'_>, id: &str) -> Result<(), NetError> {
+    /// 照合済みの `id_dir` の中身を消し、親の fd 起点で名前の先の同一性を取り直してから `rmdir` する。
+    /// `before_rmdir` は試験が窓の中で置き場所を作り直すための差し込み口（製品経路は何もしない）。
+    fn remove_bound(
+        pasta_dir: BorrowedFd<'_>,
+        id_dir: BorrowedFd<'_>,
+        id: &str,
+        identity: RunDirIdentity,
+        euid: u32,
+        before_rmdir: &mut dyn FnMut(),
+    ) -> Result<RunDirRemoval, NetError> {
+        remove_stale_pid(id_dir, euid)?;
+        before_rmdir();
+        match std::fs::symlink_metadata(proc_path(pasta_dir, id)) {
+            Ok(m) if m.is_dir() && identity_of(&m) == identity => {}
+            Ok(_) => return Ok(RunDirRemoval::NotOurs),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RunDirRemoval::Absent),
+            Err(e) => return Err(map_io(&e)),
+        }
         match std::fs::remove_dir(proc_path(pasta_dir, id)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(RunDirRemoval::Removed),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RunDirRemoval::Absent),
             // ENOTEMPTY（39）
             Err(e) if e.raw_os_error() == Some(39) => {
                 Err(err(NetErrorCode::FailedPrecondition, MSG_NOT_EMPTY))
@@ -378,27 +428,87 @@ mod imp {
         }
     }
 
-    pub(super) fn remove(h: &Held) -> Result<(), NetError> {
+    pub(super) fn remove(h: &Held) -> Result<RunDirRemoval, NetError> {
+        remove_held_with_hook(h, &mut || {})
+    }
+
+    pub(super) fn remove_held_with_hook(
+        h: &Held,
+        hook: &mut dyn FnMut(),
+    ) -> Result<RunDirRemoval, NetError> {
+        remove_bound(
+            h.pasta_dir.as_fd(),
+            h.id_dir.as_fd(),
+            &h.id,
+            h.identity,
+            sys::effective_uid(),
+            hook,
+        )
+    }
+
+    pub(super) fn remove_expecting(
+        state_root: BorrowedFd<'_>,
+        container_id: &str,
+        expected: RunDirIdentity,
+    ) -> Result<RunDirRemoval, NetError> {
+        remove_expecting_with_hook(state_root, container_id, expected, &mut || {})
+    }
+
+    pub(super) fn remove_expecting_with_hook(
+        state_root: BorrowedFd<'_>,
+        container_id: &str,
+        expected: RunDirIdentity,
+        hook: &mut dyn FnMut(),
+    ) -> Result<RunDirRemoval, NetError> {
+        validate_container_id(container_id)?;
         let euid = sys::effective_uid();
-        remove_stale_pid(h.id_dir.as_fd(), euid)?;
-        rmdir_id(h.pasta_dir.as_fd(), &h.id)
+        let Some(pasta_dir) = open_checked(state_root, PASTA_DIR_NAME, euid)? else {
+            return Ok(RunDirRemoval::Absent);
+        };
+        let cname =
+            CString::new(container_id).map_err(|_| err(NetErrorCode::Internal, MSG_INTERNAL))?;
+        let id_dir = match sys::open_dir_nofollow_at(pasta_dir.as_fd(), &cname) {
+            Ok(fd) => fd,
+            Err(SysError::Os(x)) if x == sys::ENOENT => return Ok(RunDirRemoval::Absent),
+            // symlink・ディレクトリでないものは別物として触れない。
+            Err(SysError::Os(x)) if x == sys::ELOOP || x == sys::ENOTDIR => {
+                return Ok(RunDirRemoval::NotOurs);
+            }
+            Err(e) => return Err(map_sys(e)),
+        };
+        let m = stat(&id_dir)?;
+        if identity_of(&m) != expected {
+            return Ok(RunDirRemoval::NotOurs);
+        }
+        if !m.is_dir() || m.uid() != euid || m.mode() & 0o077 != 0 {
+            return Err(err(NetErrorCode::FailedPrecondition, MSG_DIR_UNTRUSTED));
+        }
+        remove_bound(
+            pasta_dir.as_fd(),
+            id_dir.as_fd(),
+            container_id,
+            expected,
+            euid,
+            hook,
+        )
     }
 
     pub(super) fn remove_existing(
         state_root: BorrowedFd<'_>,
         container_id: &str,
+        hook: &mut dyn FnMut(),
     ) -> Result<(), NetError> {
-        validate_container_id(container_id)?;
-        let euid = sys::effective_uid();
-        let Some(pasta_dir) = open_checked(state_root, PASTA_DIR_NAME, euid)? else {
-            return Ok(());
-        };
-        let Some(id_dir) = open_checked(pasta_dir.as_fd(), container_id, euid)? else {
-            return Ok(());
-        };
-        remove_stale_pid(id_dir.as_fd(), euid)?;
-        drop(id_dir);
-        rmdir_id(pasta_dir.as_fd(), container_id)
+        match observe(state_root, container_id)? {
+            RunDirExpectation::Absent => Ok(()),
+            RunDirExpectation::Existing(i) => {
+                match remove_expecting_with_hook(state_root, container_id, i, hook)? {
+                    RunDirRemoval::Removed | RunDirRemoval::Absent => Ok(()),
+                    RunDirRemoval::NotOurs => {
+                        Err(err(NetErrorCode::FailedPrecondition, MSG_DIR_REPLACED))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -437,7 +547,7 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o700, "{sub}");
         }
-        d.remove().expect("remove");
+        assert_eq!(d.remove().expect("remove"), RunDirRemoval::Removed);
         assert!(!p.join("@pasta/c1").exists());
         let _ = std::fs::remove_dir_all(&p);
     }
@@ -574,6 +684,134 @@ mod tests {
         symlink(p.join("elsewhere"), p.join("@pasta/c1")).expect("symlink");
         let e = observe_run_dir(f.as_fd(), "c1").expect_err("symlink");
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// 窓を再現する: 置き場所を退避し、同名の 0700 の空ディレクトリを作る。
+    fn replace_dir(p: &Path, keep: &str) {
+        std::fs::rename(p.join("@pasta/c1"), p.join("@pasta").join(keep)).expect("rename");
+        std::fs::create_dir(p.join("@pasta/c1")).expect("recreate");
+        std::fs::set_permissions(p.join("@pasta/c1"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+    }
+
+    #[test]
+    fn net9_core2_remove_keeps_empty_dir_recreated_after_prepare() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        replace_dir(&p, "old-keep");
+        assert_eq!(d.remove().expect("remove"), RunDirRemoval::NotOurs);
+        assert!(p.join("@pasta/c1").is_dir());
+        assert!(p.join("@pasta/old-keep").is_dir());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_core2_remove_keeps_pid_of_dir_recreated_after_prepare() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        replace_dir(&p, "old-keep");
+        write_pid(&p, b"4242\n");
+        assert_eq!(d.remove().expect("remove"), RunDirRemoval::NotOurs);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_core2_remove_rechecks_identity_just_before_rmdir() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        std::fs::write(p.join("@pasta/c1/pid"), b"1\n").expect("old pid");
+        let mut hook = || {
+            replace_dir(&p, "old-keep");
+            write_pid(&p, b"4242\n");
+        };
+        let r = imp::remove_held_with_hook(&d.held, &mut hook).expect("remove");
+        assert_eq!(r, RunDirRemoval::NotOurs);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
+        assert!(!p.join("@pasta/old-keep/pid").exists());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_core2_remove_expecting_stale_identity_keeps_new_dir_and_pid() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        let old = d.identity();
+        drop(d);
+        std::fs::write(p.join("@pasta/c1/pid"), b"1\n").expect("old pid");
+        replace_dir(&p, "old-keep");
+        write_pid(&p, b"4242\n");
+        let r = remove_pasta_run_dir_expecting(f.as_fd(), "c1", old).expect("remove");
+        assert_eq!(r, RunDirRemoval::NotOurs);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
+        assert_eq!(
+            std::fs::read(p.join("@pasta/old-keep/pid")).expect("old pid"),
+            b"1\n"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_core2_remove_expecting_matching_identity_removes() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        let id = d.identity();
+        drop(d);
+        write_pid(&p, b"1\n");
+        let r = remove_pasta_run_dir_expecting(f.as_fd(), "c1", id).expect("remove");
+        assert_eq!(r, RunDirRemoval::Removed);
+        assert!(!p.join("@pasta/c1").exists());
+        let r = remove_pasta_run_dir_expecting(f.as_fd(), "c1", id).expect("again");
+        assert_eq!(r, RunDirRemoval::Absent);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_remove_expecting_symlink_entry_is_not_ours() {
+        let (p, f) = root();
+        let d = PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare");
+        let id = d.identity();
+        drop(d);
+        std::fs::remove_dir(p.join("@pasta/c1")).expect("rm");
+        std::fs::create_dir(p.join("elsewhere")).expect("mkdir");
+        symlink(p.join("elsewhere"), p.join("@pasta/c1")).expect("symlink");
+        let r = remove_pasta_run_dir_expecting(f.as_fd(), "c1", id).expect("remove");
+        assert_eq!(r, RunDirRemoval::NotOurs);
+        assert!(
+            p.join("@pasta/c1")
+                .symlink_metadata()
+                .expect("md")
+                .is_symlink()
+        );
+        assert!(p.join("elsewhere").is_dir());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn net9_core2_cli_remove_refuses_dir_replaced_in_window() {
+        let (p, f) = root();
+        drop(PastaRunDir::prepare(f.as_fd(), "c1").expect("prepare"));
+        let mut hook = || {
+            replace_dir(&p, "old-keep");
+            write_pid(&p, b"4242\n");
+        };
+        let e = imp::remove_existing(f.as_fd(), "c1", &mut hook).expect_err("replaced");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_DIR_REPLACED);
+        assert_eq!(
+            std::fs::read(p.join("@pasta/c1/pid")).expect("pid"),
+            b"4242\n"
+        );
         let _ = std::fs::remove_dir_all(&p);
     }
 

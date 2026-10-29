@@ -93,3 +93,8 @@ harness = false
 [[test]]
 name = "start_stop_delete_real"
 harness = false
+
+# 実機前提の結合試験（#3345）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "network_modes_real"
+harness = false

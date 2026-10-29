@@ -32,4 +32,4 @@ Linux では `--network` を省略すると `none` になる(SEC-1「既定で�
 ## 制約
 
 - 起動オプション文書の上限(`OPTIONS_DOC_MAX_BYTES` = `--env` の合計上限 + 256 KiB)があり、`--env` を上限近くまで使った上で `--add-host` を多数(最大 256 件 × 299 バイト、約 76 KiB)指定すると、`create` が `options document is too large` で拒否されることがある。
-- 実機での結合試験(`--add-host` の名前解決・`lo` のみであること・host の resolv.conf)は未整備で、#349 の実機確認は後続(PR 本文の対象外を参照)。
+- 実機前提の結合試験 `network_modes_real`(`crates/cli/tests/network_modes_real.rs`。`--add-host` の名前解決・`lo` のみであること・host の resolv.conf・delete 後の残骸なし。#3345)を `platform-ci`(ubuntu)で実行する。手元の実機での実行と記録は #349(人間担当)。

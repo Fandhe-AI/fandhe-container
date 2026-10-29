@@ -443,6 +443,8 @@ impl MemberRecord {
     }
 
     /// 記録した公開（全状態）のうち、`published` と完全に一致するものの状態（一致が無ければ `None`。#3343）。
+    // 呼び出し元の `unpublish_port_recorded_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn publish_state_of(
         &self,
         realized: &RealizedRecord,

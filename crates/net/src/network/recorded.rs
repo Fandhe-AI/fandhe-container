@@ -661,7 +661,7 @@ fn restore_with(
 /// 記録の書き直しに失敗したときは記録を読み直す。行が残っていれば（rename の前の失敗）予約を解放せず
 /// [`RecordedError::Uncommitted`]（ルールは消えており、記録には古い公開が残る）。行が消えていれば（rename 後の失敗）
 /// 予約を解放したうえで `Uncommitted` を返す。予約の解放に失敗したときは、ルールの削除を確かめ済みの印として墓標
-/// （` unpublished`）を書き戻し（失敗しても取り残しの向き）、`rules: Removed`・`reservation_held: true` を返す。
+/// （`unpublished` 印）を書き戻し（失敗しても取り残しの向き）、`rules: Removed`・`reservation_held: true` を返す。
 /// 墓標と完全に一致する値での再試行は、カーネル操作をせず（DELRULE を送らず）予約の解放だけを完了する。
 ///
 /// DELRULE の直前に記録へ残す解除の意図の印でも回復できる: 再試行で DELRULE が `NotFound`（バッチは all-or-nothing で
@@ -2461,7 +2461,7 @@ mod tests {
             NetErrorCode::NotFound
         );
     }
-    // ---- #3343: 解除済みを示す墓標（` unpublished`）と、記録を先に書いて予約を後に解放する順序 ----
+    // ---- #3343: 解除済みを示す墓標（`unpublished` 印）と、記録を先に書いて予約を後に解放する順序 ----
 
     use crate::network_store::MemberRecord;
 

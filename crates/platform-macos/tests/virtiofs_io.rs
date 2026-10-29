@@ -9,7 +9,7 @@
 //! - 実機テスト（`#[ignore]`）: macOS 13 以上・`com.apple.security.virtualization` 付き署名・
 //!   `fandhe.virtiofs=` 指示と下記プローブ契約を実装したゲスト資産を要する。手順は AGENTS.md「実機前提テスト」節。
 //!
-//! 補助関数（Scratch・コンソールログの確定待ち・期限）は `tests/support/virtiofs_harness.rs` に共通化し、
+//! 補助関数（Scratch・VM 起動後の done 行待ち・停止・ログの確定待ち〔#3416〕・期限）は `tests/support/virtiofs_harness.rs` に共通化し、
 //! その単体試験は `tests/virtiofs_harness.rs`（MAC-1・REPAIR-1・#3099）。
 //!
 //! プローブ契約（行の形・名前空間・順序・起動条件）の SSOT は `guest_probe` モジュール。実装は
@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fandhe_container_platform_macos::config::{
     BlockDeviceSpec, ConsoleLogPath, DeviceConfigSpec, DiskImagePath, SerialConsoleSink,
@@ -36,16 +36,13 @@ use fandhe_container_platform_macos::guest_probe::{
 use fandhe_container_platform_macos::virtiofs::{
     ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
 };
-use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
 
 #[path = "support/common.rs"]
 mod common;
 use common::{COUNTER, Scratch, env_path, tail_lossy};
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
-use harness::{
-    CONSOLE_LOG_SETTLE_TIMEOUT, log_truncated, resolve_probe_timeout, wait_console_log_settled,
-};
+use harness::{launch_until_done, resolve_probe_timeout};
 
 const MAX_OUT_ENTRIES: usize = 16;
 /// ホストが起動前に共有へ置く fixture。
@@ -200,55 +197,9 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     );
     let log_path = s.dir.join("console.log");
     eprintln!("virtiofs_io: console log at {}", log_path.display());
-    let vm = match Vm::launch(&spec, OpTimeouts::default()) {
-        Ok(vm) => vm,
-        Err(e) => panic!("launch failed: code={} message={}", e.code(), e.message()),
-    };
-
-    // ログの大きさは書き出しスレッドが MAX_CONSOLE_LOG_BYTES で打ち切るため、読み込みは有界。
-    let deadline = Instant::now() + timeout;
-    let mut last = Vec::new();
-    loop {
-        if let Ok(bytes) = std::fs::read(&log_path) {
-            last = bytes;
-        }
-        if parse_probe_log(&last).done {
-            break;
-        }
-        if log_truncated(&last) {
-            // 上限後のゲスト出力は破棄されるため、待っても done は観測できない。明示的に失敗させる。
-            let _ = vm.stop();
-            panic!(
-                "console log hit the size limit before the probe done line; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        if Instant::now() >= deadline {
-            let _ = vm.stop();
-            panic!(
-                "probe done line not observed within {timeout:?}; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // ゲストとの TOCTOU を避けるため、停止を確認してから共有の中身を検証する。
-    vm.stop().expect("stop");
-    assert_eq!(vm.state(), VmState::Stopped);
-    // stop は VM の停止だけを待ち、pipe からログへの書き出しは非同期に続く。VM を破棄して書き込み端を
-    // 閉じ、書き出しスレッドの終了（lock の解放）を確認してから確定したログで最終判定する。
-    drop(vm);
-    if let Err(e) = wait_console_log_settled(&log_path, CONSOLE_LOG_SETTLE_TIMEOUT) {
-        panic!("{e}; console tail:\n{}", tail_lossy(&last, 4096));
-    }
-    last = std::fs::read(&log_path).expect("read settled console log");
-    // done 検出後〜停止までにゲスト出力が上限へ達すると、done の後の重複報告・エラーが破棄される。
-    // 停止後に読み直したログでも打ち切りを拒否する（fail-closed）。
-    assert!(
-        !log_truncated(&last),
-        "console log hit the size limit after the probe done line; later guest output was lost; console tail:\n{}",
-        tail_lossy(&last, 4096)
-    );
+    let last = launch_until_done(&spec, &log_path, "probe", timeout, |b| {
+        parse_probe_log(b).done
+    });
     let write_check = verify_write(&fixture.share_dir);
     ProbeOutcome {
         log: parse_probe_log(&last),

@@ -59,6 +59,6 @@ mod linux {
         assert!(pids.contains(&std::process::id()), "{pids:?}");
         assert!(!parent.join(name.as_str()).exists());
         assert!(!parent.join("fc-runtime").exists());
-        crate::reap::reap_or_report(&mut other, crate::reap::REAP_WITHIN);
+        crate::reap::reap(&mut other, crate::reap::REAP_WITHIN).expect("reap other");
     }
 }

@@ -98,6 +98,14 @@ fn main() -> std::process::ExitCode {
     if args.get(1).is_some_and(|a| detached::is_helper_arg(a)) {
         return run_dns_helper_main(args.into_iter().skip(1));
     }
+    // 起動元としての再実行（`launcher_killed_after_spawn_line`。#3455）。
+    #[cfg(target_os = "linux")]
+    if args
+        .get(1)
+        .is_some_and(|a| a == detached::ARG_LAUNCHER_CHILD)
+    {
+        return detached::launcher_child(args);
+    }
     let exe = std::env::current_exe().expect("current_exe");
     let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen addr");
 

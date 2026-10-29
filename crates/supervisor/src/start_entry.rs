@@ -3255,11 +3255,10 @@ mod linux {
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
         // `run_start_until` が `stderr_sink` の常駐スレッドを作る前のここで作る（launch の単一スレッド要求にも触れない。
         // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
-        let relay = crate::exec::default_audit_sink(Some(args.root.clone()))
-            .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
-            // sink と helper を作れただけでは記録できるとは限らない（`@audit.log` がディレクトリ等だと記録時に初めて失敗する）。
-            // 起動前に helper へ保存先を開かせ、期限つきで確かめる。開けなければ記録経路なしとして起動を拒否する（SEC-4・#2027）。
-            .and_then(|relay| relay.probe().map(|()| relay))
+        // helper は停止シグナル(SIGTERM・SIGINT)を無視する構築口で作る(#3415)。supervisor 本体はハンドラを持たず停止
+        // シグナルで即座に死ぬため、守れるのは到着時に helper が書いている途中の 1 件だけ(`audit_relay` の doc)。
+        // 起動前に helper へ保存先を開かせ期限つきで確かめ、開けなければ記録経路なしとして起動を拒否する(SEC-4・#2027)。
+        let relay = crate::audit_relay::open_control_audit_relay(Some(args.root.clone()))
             .map_err(|e| e.code());
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
@@ -3968,17 +3967,20 @@ mod linux {
                 .find("fn run_main_inner<")
                 .expect("run_main_inner in the entry");
             let entry = src[body..]
-                .find("let relay = crate::exec::default_audit_sink(")
+                .find("let relay = crate::audit_relay::open_control_audit_relay(")
                 .map(|p| p + body)
                 .expect("relay construction in the entry");
             assert!(
                 entry < src.find("mod tests").unwrap_or(usize::MAX),
                 "relay construction must be found in the production code"
             );
-            let spawn = src[entry..]
-                .find("ControlAuditRelay::spawn")
-                .map(|p| p + entry)
-                .expect("relay spawn in the entry");
+            let spawn = entry;
+            // 停止シグナルを無視する構築口を使うこと(#3415)。実体は audit_relay.rs。
+            let relay_src = include_str!("audit_relay.rs");
+            assert!(
+                relay_src.contains(".and_then(ControlAuditRelay::spawn_ignoring_stop_signals)"),
+                "the supervisor relay must use the stop-signal-ignoring constructor"
+            );
             let run = src[entry..]
                 .find("run_start_until(\n")
                 .map(|p| p + entry)

@@ -29,7 +29,7 @@ const POLL: Duration = Duration::from_millis(10);
 mod scratch_root;
 
 // kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 /// 状態ルートの祖先を 0700 にした一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る

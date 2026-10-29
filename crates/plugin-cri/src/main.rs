@@ -106,7 +106,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     };
     // 停止シグナルの受信記録は relay の fork の後、受付の前に登録する（#3226・CRI-1）。helper は fork の直後に自分で
     // SIGTERM・SIGINT を無視にしている（#3300）ので、登録の順序には依らない。exec しない fork の子へのハンドラの継承は
-    // `sys` の doc「fork した子への継承」と結合試験 `shutdown_audit_helper` が固定する。
+    // `sys` の doc「fork した子への継承」（起動段の到達性の調査結果を含む）と結合試験 `shutdown_audit_helper` が固定する。
     // 登録できなければ、後始末を経ずに死ぬ状態で動かさないため起動しない（fail-closed）。
     if let Err(e) = sys::install_shutdown_signals() {
         return fail(e.code(), e.message());

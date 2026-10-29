@@ -19,7 +19,7 @@
 //!   0666）ソケットへ接続し、2 層目の `SO_PEERCRED` 検査で拒否されて同じ 1 行が届くことを照合する。前提が満たせない
 //!   ときは skip せず非ゼロで失敗する
 //!
-//! `ControlAuditRelay::spawn` は単一スレッドの呼び出し元を要求するため、`harness = false` の単一スレッド `main`
+//! `open_control_audit_relay`（`ControlAuditRelay::spawn_ignoring_stop_signals`）は単一スレッドの呼び出し元を要求するため、`harness = false` の単一スレッド `main`
 //! で動かす（`exec_audit` と同じ）。待ちはすべて期限つき（REPAIR-5）。
 
 #[cfg(not(target_os = "linux"))]
@@ -43,13 +43,13 @@ mod linux {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{AuditSink, ControlAuditRelay, RECORD_WAIT_LIMIT};
+    use fandhe_container_core::audit_log::{AuditSink, RECORD_WAIT_LIMIT};
     use fandhe_container_core::traits::ContainerId;
+    use fandhe_container_supervisor::audit_relay::open_control_audit_relay;
     use fandhe_container_supervisor::control::listener::{ControlListener, effective_uid};
     use fandhe_container_supervisor::control::observe::ControlObserver;
     use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
     use fandhe_container_supervisor::control::target::SignalSlot;
-    use fandhe_container_supervisor::exec::default_audit_sink;
 
     const CHILD_ENV: &str = "FANDHE_CONTROL_AUDIT_DELIVERY_CHILD";
     const CONTAINER: &str = "audited-2140";
@@ -112,6 +112,8 @@ mod linux {
         server: ControlServer,
         listener: ControlListener,
         root: TempRoot,
+        /// 監査 helper の pid（停止シグナルの扱いの照合用。#3415）。
+        helper_pid: u32,
     }
 
     impl Rig {
@@ -123,9 +125,10 @@ mod linux {
                 .create(root.0.join(id.as_str()))
                 .expect("create state dir");
             // スレッドを作る前に relay を fork する（本番と同じ。以降の記録は helper へ渡る）。
-            let relay = default_audit_sink(Some(root.0.clone()))
-                .and_then(ControlAuditRelay::spawn)
-                .expect("spawn the audit relay");
+            // 本番（`start_entry`）と同じ組み立て口を通す。helper は停止シグナルを無視する（#3415）。
+            let relay =
+                open_control_audit_relay(Some(root.0.clone())).expect("spawn the audit relay");
+            let helper_pid = relay.pid();
             let listener = ControlListener::bind(&root.0, &id).expect("bind");
             let euid = effective_uid().expect("euid");
             let observer = Arc::new(ControlObserver::new(
@@ -145,6 +148,7 @@ mod linux {
                 server,
                 listener,
                 root,
+                helper_pid,
             }
         }
     }
@@ -202,8 +206,43 @@ mod linux {
         assert!(!line.contains("\"path\":\""), "no path expected: {line}");
     }
 
+    /// SIGTERM・SIGINT の `SigIgn` のビット（シグナル番号 n はビット n-1）。
+    const STOP_MASK: u64 = (1 << (2 - 1)) | (1 << (15 - 1));
+
+    /// `/proc/<pid>/status` の `SigIgn`（16 進）。
+    fn sig_ign(pid: u32) -> u64 {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read status");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("SigIgn:"))
+            .expect("SigIgn line");
+        u64::from_str_radix(line.split_whitespace().nth(1).expect("mask"), 16).expect("hex mask")
+    }
+
+    /// `/proc/<pid>/stat` の状態文字（コマンド名の `)` の後ろの最初の語）。
+    fn proc_state(pid: u32) -> char {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read stat");
+        let after = text.rsplit_once(')').expect("comm end").1;
+        after.trim_start().chars().next().expect("state char")
+    }
+
+    /// SEC-4・REPAIR-5・#3415: 本番の組み立て口の helper は SIGTERM・SIGINT を無視し（`SigIgn` のビットが両方立つ）、
+    /// helper だけへ SIGTERM を送っても死なない（未回収の子が `Z` にならない）。SIGKILL での回収は drop が担う。
+    fn assert_helper_ignores_stop_signals(pid: u32) {
+        assert_eq!(sig_ign(pid) & STOP_MASK, STOP_MASK, "SigIgn of the helper");
+        let status = Command::new("kill")
+            .args(["-s", "TERM", &pid.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -s TERM {pid}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_ne!(proc_state(pid), 'Z', "the helper must survive SIGTERM");
+        println!("control_audit_delivery: helper ignores SIGTERM and SIGINT (SigIgn mask 0x4002)");
+    }
+
     fn default_scenario() {
         let rig = Rig::start();
+        assert_helper_ignores_stop_signals(rig.helper_pid);
         assert_disconnected_without_a_byte(&rig.listener.socket_path());
         let lines = wait_for_audit_lines(&rig.root.0);
         assert_one_peer_mismatch_line(&lines);

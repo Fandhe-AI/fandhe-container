@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::ImageStore;
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 #[path = "support/test_root.rs"]
 mod test_root;

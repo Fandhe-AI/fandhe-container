@@ -323,11 +323,28 @@ fn spawn_inner(
     // 段 1 が書く `SPAWN <pid>` 行は段 2 の識別行と前後しうるため、識別行が得られるまで高々 2 行を読む。
     let mut stdout = stdout;
     let ident_deadline = Deadline::after(DNS_HELPER_ACK_TIMEOUT);
-    let pre = read_pre_ack_lines(&mut stdout, &ident_deadline);
-    let early: Option<OwnedFd> = pre
-        .spawn
-        .as_deref()
-        .and_then(|rest| adopt_spawned(rest, &nonce));
+    // `SPAWN` が識別行より先に届いたときは、識別行を待つ前に照合済みの同一性を意図記録へ残す（#3414）。
+    // 識別行が届く前に呼び出し元が止まっても、回収が記録で帰属できる。
+    let mut spawn_adopt: Option<SpawnAdopt> = None;
+    let mut spawn_recorded: Option<ProcessIdentity> = None;
+    let pre = read_pre_ack_lines(&mut stdout, &ident_deadline, &mut |rest| {
+        let adopt = adopt_spawned(rest, &nonce);
+        let recorded = match adopt.as_ref() {
+            Some(a) => record_spawn_identity(guard, &nonce, listen, a),
+            None => Ok(None),
+        };
+        spawn_adopt = adopt;
+        spawn_recorded = recorded?;
+        Ok(())
+    });
+    if !pre.spawn_first {
+        // 識別行が先: 続く `SPAWN` は失敗時の回収用の pidfd を取るだけ（識別行の直後に記録する）。
+        spawn_adopt = pre
+            .spawn
+            .as_deref()
+            .and_then(|rest| adopt_spawned(rest, &nonce));
+    }
+    let early: Option<OwnedFd> = spawn_adopt.map(|a| a.pidfd);
     let ident_line = match pre.ident {
         Ok(l) => l,
         Err(e) => return Err(fail_before_ack_any(guard, stdin, early.as_ref(), e)),
@@ -343,14 +360,31 @@ fn spawn_inner(
     let mut early = early;
     if let Some(extra) = early.take_if(|fd| !same_pidfd_pid(fd.as_fd(), identity.pid)) {
         // 識別行と別の pid を名乗った SPAWN 行の相手は止めておく。
-        let _ = kill_and_confirm(extra.as_fd());
+        let stopped = kill_and_confirm(extra.as_fd());
+        if !stopped && spawn_recorded.is_some() {
+            // 意図記録は SPAWN 側の同一性を持つ。止めたと確認できないまま識別行側の同一性で上書きすると、
+            // 帰属を失う。識別行側だけを止め、意図記録を残して失敗にする。
+            return Err(fail_keep_intent(
+                stdin,
+                pidfd.as_fd(),
+                err(
+                    NetErrorCode::FailedPrecondition,
+                    "dns helper reported a different pid than the spawn line",
+                ),
+            ));
+        }
     }
     // 確定記録の前に、意図記録へ同一性を原子的に追記する（#3344）。回収前に段 2 が終了してゾンビになっても
     // （cmdline が空・cgroup.procs にも現れない）、回収はこの同一性で pidfd を取って帰属できる。
     // ack の期限（段 2 が識別行を書いた時点から数える）の中で fsync が 1 組増える。
-    let upgraded = DnsHelperIntent::new(guard.network().clone(), nonce.clone(), listen)
-        .with_identity(identity.clone())
-        .and_then(|i| guard.replace_dns_helper_intent(&i));
+    // SPAWN の時点で同じ同一性を記録済みなら、二重の fsync を避けて置き換えを飛ばす（#3414）。
+    let upgraded = if spawn_recorded.as_ref() == Some(&identity) {
+        Ok(())
+    } else {
+        DnsHelperIntent::new(guard.network().clone(), nonce.clone(), listen)
+            .with_identity(identity.clone())
+            .and_then(|i| guard.replace_dns_helper_intent(&i))
+    };
     if let Err(e) = upgraded {
         return Err(fail_before_ack_reap(guard, stdin, pidfd.as_fd(), e));
     }
@@ -506,6 +540,8 @@ fn read_line_deadline(
 /// ack 前に読んだ行。`spawn` は `SPAWN` 行の `<pid>` 部分（無ければ `None`）。
 struct PreAck {
     spawn: Option<String>,
+    /// `SPAWN` 行が識別行より先に届き、フックを呼んだか。
+    spawn_first: bool,
     ident: Result<String, NetError>,
 }
 
@@ -518,6 +554,7 @@ struct PreAck {
 fn read_pre_ack_lines(
     out: &mut (impl std::io::Read + std::os::fd::AsFd),
     deadline: &Deadline,
+    on_spawn_first: &mut dyn FnMut(&str) -> Result<(), NetError>,
 ) -> PreAck {
     let malformed = || err(NetErrorCode::FailedPrecondition, "malformed identity line");
     let first = match read_line_deadline(out, IDENT_LINE_MAX, deadline) {
@@ -525,17 +562,27 @@ fn read_pre_ack_lines(
         Err(e) => {
             return PreAck {
                 spawn: None,
+                spawn_first: false,
                 ident: Err(e),
             };
         }
     };
     if let Some(rest) = first.strip_prefix(SPAWN_PREFIX) {
+        // 識別行を読む前に呼ぶ。失敗したら識別行は読まずに、そのエラーを返す（pipe に残す）。
+        if let Err(e) = on_spawn_first(rest) {
+            return PreAck {
+                spawn: Some(rest.to_owned()),
+                spawn_first: true,
+                ident: Err(e),
+            };
+        }
         let ident = match read_line_deadline(out, IDENT_LINE_MAX, deadline) {
             Ok(l) if l.starts_with(SPAWN_PREFIX) => Err(malformed()),
             other => other,
         };
         return PreAck {
             spawn: Some(rest.to_owned()),
+            spawn_first: true,
             ident,
         };
     }
@@ -546,6 +593,7 @@ fn read_pre_ack_lines(
             None => {
                 return PreAck {
                     spawn: None,
+                    spawn_first: false,
                     ident: Err(malformed()),
                 };
             }
@@ -554,6 +602,7 @@ fn read_pre_ack_lines(
     };
     PreAck {
         spawn,
+        spawn_first: false,
         ident: Ok(first),
     }
 }
@@ -564,14 +613,58 @@ fn read_pre_ack_lines(
 /// 生存中なら cmdline の nonce で別のプロセスでないことを確かめる。既に終了していれば（ゾンビは cmdline が
 /// 空）、pid は回収まで再利用されないため、その pidfd を回収に使う。取れなければ `None`（呼び出し側は
 /// 意図記録を残す）。
-fn adopt_spawned(rest: &str, nonce: &HelperNonce) -> Option<OwnedFd> {
+fn adopt_spawned(rest: &str, nonce: &HelperNonce) -> Option<SpawnAdopt> {
     let pid: u32 = rest.parse().ok().filter(|p| *p != 0)?;
     let pidfd = open_pidfd(pid).ok()?;
     let exited = matches!(wait_exit(pidfd.as_fd(), Duration::ZERO), Ok(true));
-    if !exited && !cmdline_has_nonce(pid, nonce).ok()? {
+    if exited {
+        return Some(SpawnAdopt {
+            pidfd,
+            identity: None,
+        });
+    }
+    if !cmdline_has_nonce(pid, nonce).ok()? {
         return None;
     }
-    Some(pidfd)
+    // 生存中で nonce を持つときだけ同一性を読み、pidfd の指す先と照合して初めて記録の候補にする（SEC-1）。
+    // 読み取りと照合の間に終了した場合は同一性なし（pidfd は回収用に返す）。
+    let identity = read_identity(pid)
+        .ok()
+        .filter(|id| matches!(verify_pidfd_target(pidfd.as_fd(), id), Ok(Verify::Same)));
+    Some(SpawnAdopt { pidfd, identity })
+}
+
+/// [`adopt_spawned`] の結果。`identity` は pidfd・nonce・開始時刻・boot id を照合済みのときだけ `Some`。
+struct SpawnAdopt {
+    pidfd: OwnedFd,
+    identity: Option<ProcessIdentity>,
+}
+
+/// 照合済みの `SPAWN` 相手の同一性を意図記録へ原子的に追記し、記録した同一性を返す（無ければ `None`）。
+///
+/// 識別行が届く前に呼び出し元が止まっても、回収が同一性で pidfd を取って帰属できる（#3414・#3344）。
+/// ack の期限の中で fsync が 1 組動くが、識別行の時点の置き換えはこの記録と同値なら飛ばすので、
+/// 成功した起動の `NetworkStoreDnsHelperWrite` の回数は変わらない。
+fn record_spawn_identity(
+    guard: &NetworkLockGuard<'_>,
+    nonce: &HelperNonce,
+    listen: DnsListenAddr,
+    adopt: &SpawnAdopt,
+) -> Result<Option<ProcessIdentity>, NetError> {
+    let Some(id) = adopt.identity.as_ref() else {
+        return Ok(None);
+    };
+    let intent = DnsHelperIntent::new(guard.network().clone(), nonce.clone(), listen)
+        .with_identity(id.clone())?;
+    guard.replace_dns_helper_intent(&intent)?;
+    Ok(Some(id.clone()))
+}
+
+/// 意図記録（帰属に要る同一性）を残したまま、`pidfd` の相手だけを止めて失敗にする。
+fn fail_keep_intent(stdin: Option<ChildStdin>, pidfd: BorrowedFd<'_>, e: NetError) -> NetError {
+    drop(stdin);
+    let _ = kill_and_confirm(pidfd);
+    with_note(e, "intent record kept")
 }
 
 /// pidfd の指す pid が `pid` と一致するか（`/proc/self/fdinfo` を読まず、pidfd を取った pid を使う代わりに
@@ -753,9 +846,8 @@ fn recover_inner(
             continue;
         }
         if !cmdline_has_nonce(pid, intent.nonce())? {
-            // 回収前に終了した自分の子はゾンビで cmdline が空になり、nonce では帰属できない。シグナルは
-            // 送らず、終了済みの自分の子だけを回収する（生存中の候補は従来どおり nonce の一致が要る）。
-            let _ = reap_exited_child(pid);
+            // nonce で帰属できない候補（終了済みで cmdline が空のものを含む）には触れない。`waitid` もしない
+            // （同じ呼び出し元の別の子の終了状態を奪うため。#3414）。帰属できるゾンビは記録済みの同一性が扱う。
             continue;
         }
         let pidfd = match open_pidfd(pid) {
@@ -825,16 +917,6 @@ fn settle_candidate(
         }
         Err(e) => Err(with_note(e, "intent record kept")),
     }
-}
-
-/// `pid` が終了済みの自分の子なら pidfd で回収して true。生存中・自分の子でない・存在しないなら何もせず false。
-/// シグナルは送らない。呼び出し元が child subreaper のとき、回収前に終了した段 2 のゾンビを残さないために使う。
-fn reap_exited_child(pid: u32) -> bool {
-    let Ok(pidfd) = open_pidfd(pid) else {
-        return false;
-    };
-    matches!(wait_exit(pidfd.as_fd(), Duration::ZERO), Ok(true))
-        && matches!(process::reap_pidfd_nohang(pidfd.as_fd()), Ok(true))
 }
 
 /// pidfd の子が終了していれば（ゾンビの cmdline は空）、別のプロセスではなく子の終了として回収して true。
@@ -1087,7 +1169,11 @@ mod ack_tests {
     #[test]
     fn net5_3070_spawn_then_ident_order() {
         let mut rx = pipe_with(b"SPAWN 4242\nIDENT 1 2 b n\n");
-        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |_| Ok(()),
+        );
         assert_eq!(pre.spawn.as_deref(), Some("4242"));
         assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
     }
@@ -1095,7 +1181,11 @@ mod ack_tests {
     #[test]
     fn net5_3070_ident_then_spawn_order() {
         let mut rx = pipe_with(b"IDENT 1 2 b n\nSPAWN 4242\n");
-        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |_| Ok(()),
+        );
         assert_eq!(pre.spawn.as_deref(), Some("4242"));
         assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
         // 何も残っていない (後続の準備完了行の読み取りに SPAWN が混ざらない)。
@@ -1109,7 +1199,11 @@ mod ack_tests {
         let (mut tx, mut rx) = UnixStream::pair().expect("pair");
         tx.write_all(b"IDENT 1 2 b n\n").expect("write");
         let t = Instant::now();
-        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(5)));
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(5)),
+            &mut |_| Ok(()),
+        );
         assert_eq!(pre.spawn, None);
         assert_eq!(pre.ident.expect("ident"), "IDENT 1 2 b n");
         assert!(t.elapsed() < Duration::from_secs(1));
@@ -1120,7 +1214,11 @@ mod ack_tests {
     #[test]
     fn net5_3070_extra_line_after_ident_is_malformed() {
         let mut rx = pipe_with(b"IDENT 1 2 b n\nREADY x\n");
-        let pre = read_pre_ack_lines(&mut rx, &Deadline::after(Duration::from_secs(2)));
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |_| Ok(()),
+        );
         assert_eq!(
             pre.ident.expect_err("malformed").code(),
             NetErrorCode::FailedPrecondition
@@ -1206,23 +1304,148 @@ mod ack_tests {
         assert!(line.len() < crate::dns_helper::PIPE_ATOMIC_MAX);
     }
 
-    /// REPAIR-5・NET-5: 回収前に終了した自分の子 (ゾンビ・cmdline が空) は nonce 検査の前に回収され、
-    /// 生存中の子には触れない。
+    /// 指定の nonce を `--nonce` に持つ生存中の子（`sh -c 'sleep 30' sh --nonce N`）。
+    fn spawn_nonce_sleeper(nonce: &HelperNonce) -> Child {
+        Command::new("sh")
+            .args(["-c", "kill -STOP $$", "sh", ARG_NONCE])
+            .arg(nonce.as_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    /// 子が exec 済みで cmdline に nonce が現れ、かつ停止（`T`）するまで待つ（上限 5 秒。REPAIR-5・#3414）。
+    fn wait_nonce_sleeper_stopped(pid: u32, nonce: &HelperNonce) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let has = cmdline_has_nonce(pid, nonce).unwrap_or(false);
+            let stopped = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, r)| r.trim_start().starts_with('T'))
+                })
+                .unwrap_or(false);
+            if has && stopped {
+                return;
+            }
+            assert!(Instant::now() < deadline, "sleeper not ready: pid {pid}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// NET-5・SEC-1・REPAIR-4・#3414: `SPAWN` 行の時点で、照合済みの同一性が意図記録へ残り、識別行が届かずに
+    /// 呼び出し元が止まっても（pidfd を捨てる）、候補なしの回収が帰属して止める。
     #[test]
     #[allow(clippy::zombie_processes)]
-    fn net5_3070_reap_exited_child_before_nonce_check() {
-        let mut child = spawn_sleeper();
+    fn net5_3414_spawn_identity_recorded_then_recovered_without_ident() {
+        let (dir, st) = scratch_store();
+        let name = crate::network::NetworkName::new("web").expect("name");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        let nonce = HelperNonce::generate().expect("nonce");
+        let listen = DnsListenAddr::new(std::net::Ipv4Addr::LOCALHOST, 5353).expect("listen");
+        n.write_dns_helper_intent(&DnsHelperIntent::new(name.clone(), nonce.clone(), listen))
+            .expect("intent");
+        let child = spawn_nonce_sleeper(&nonce);
         let pid = child.id();
-        assert!(!reap_exited_child(pid));
+        wait_nonce_sleeper_stopped(pid, &nonce);
+        let adopt = adopt_spawned(&pid.to_string(), &nonce).expect("adopt");
+        let expected = read_identity(pid).expect("identity");
+        assert_eq!(adopt.identity.as_ref(), Some(&expected));
+        let recorded = record_spawn_identity(&n, &nonce, listen, &adopt).expect("record");
+        assert_eq!(recorded.as_ref(), Some(&expected));
+        let intent = n.read_dns_helper_intent().expect("read").expect("intent");
+        let got = intent.identity().expect("identity recorded");
+        assert_eq!(got.pid, pid);
+        assert_eq!(got.start_time_ticks, expected.start_time_ticks);
+        assert_eq!(got.boot_id, expected.boot_id);
+        // 起動元が止まった状態（pidfd を失う）。
+        drop(adopt);
+        let r = recover_dns_helper_intent(
+            &n,
+            &mut std::iter::empty(),
+            &crate::instrument::NoopNetOpRecorder,
+        )
+        .expect("recover");
+        assert_eq!(r, IntentRecovery::Recovered { stopped: 1 });
+        assert!(n.read_dns_helper_intent().expect("read").is_none());
+        assert!(!std::path::Path::new(&format!("/proc/{pid}/stat")).exists());
+        drop(n);
+        drop(g);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// SEC-1・#3414: nonce を持たない生存中のプロセスの同一性は記録しない（意図記録は不変・相手は生存）。
+    #[test]
+    fn net5_3414_spawn_without_nonce_is_not_recorded() {
+        let mut child = spawn_sleeper();
+        let nonce = HelperNonce::generate().expect("nonce");
+        assert!(adopt_spawned(&child.id().to_string(), &nonce).is_none());
         assert!(child.try_wait().expect("try_wait").is_none());
         child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// #3414: 終了済み（ゾンビ）の相手は回収用の pidfd だけを返し、同一性は記録しない。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn net5_3414_spawn_exited_has_no_identity() {
+        let child = spawn_sleeper();
+        let pid = child.id();
         let pidfd = open_pidfd(pid).expect("pidfd");
+        kill_via_pidfd(pidfd.as_fd()).expect("kill");
         assert!(wait_exit(pidfd.as_fd(), Duration::from_secs(5)).expect("wait"));
-        let proc_stat = format!("/proc/{pid}/stat");
-        assert!(std::path::Path::new(&proc_stat).exists(), "zombie before");
-        assert!(reap_exited_child(pid));
-        assert!(!std::path::Path::new(&proc_stat).exists(), "reaped");
-        assert!(!reap_exited_child(pid));
+        let nonce = HelperNonce::generate().expect("nonce");
+        let adopt = adopt_spawned(&pid.to_string(), &nonce).expect("adopt");
+        assert!(adopt.identity.is_none());
+        assert!(process::reap_pidfd_nohang(adopt.pidfd.as_fd()).expect("reap"));
+    }
+
+    /// #3414: `SPAWN` が先ならフックが識別行の前に 1 回だけ呼ばれ、識別行が先なら呼ばれない。
+    /// フックが失敗したら識別行は読まずに戻る（pipe に残る）。
+    #[test]
+    fn net5_3414_spawn_hook_order_and_failure() {
+        let mut calls = Vec::new();
+        let mut rx = pipe_with(b"SPAWN 4242\nIDENT 1 2 b n\n");
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |r| {
+                calls.push(r.to_owned());
+                Ok(())
+            },
+        );
+        assert_eq!(calls, vec!["4242".to_owned()]);
+        assert!(pre.spawn_first);
+
+        let mut calls = 0;
+        let mut rx = pipe_with(b"IDENT 1 2 b n\nSPAWN 4242\n");
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |_| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(calls, 0);
+        assert!(!pre.spawn_first);
+
+        let mut rx = pipe_with(b"SPAWN 4242\nIDENT 1 2 b n\n");
+        let pre = read_pre_ack_lines(
+            &mut rx,
+            &Deadline::after(Duration::from_secs(2)),
+            &mut |_| Err(err(NetErrorCode::Internal, "hook failed")),
+        );
+        assert_eq!(
+            pre.ident.expect_err("hook error").code(),
+            NetErrorCode::Internal
+        );
+        let rest = read_line_deadline(&mut rx, 64, &Deadline::after(Duration::from_secs(2)));
+        assert_eq!(rest.expect("ident left in pipe"), "IDENT 1 2 b n");
     }
 
     fn scratch_store() -> (std::path::PathBuf, crate::network_store::NetworkStore) {

@@ -41,6 +41,10 @@ fn main() {
 }
 
 #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 mod linux {
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -279,15 +283,24 @@ mod linux {
         }
     }
 
+    /// 試験の標識ファイルを置くディレクトリ（`run` が排他作成した `ScratchDir`。#3434・REPAIR-12）。
+    /// 予測できる pid だけの名前を先に消す旧方式の置き換え。スレッドを作らないので単一スレッドの前提を崩さない。
+    static MARKER_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
     fn tmp_marker(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "fandhe-audit-isolation-{tag}-{}",
-            std::process::id()
-        ))
+        MARKER_DIR
+            .get()
+            .expect("MARKER_DIR is set by run()")
+            .join(tag)
     }
 
     pub(super) fn run() {
         assert_eq!(threads(), 1, "the test binary must start single-threaded");
+        let scratch =
+            super::scratch_root::ScratchDir::new("fandhe-audit-isolation", Duration::from_secs(10));
+        MARKER_DIR
+            .set(scratch.path().to_path_buf())
+            .expect("MARKER_DIR is set once");
         healthy_primary_is_persisted_by_the_child();
         stuck_primary_falls_back_within_the_limit();
         record_until_returns_within_the_deadline();
@@ -307,13 +320,13 @@ mod linux {
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
         sigchld_ignored_keeps_results_and_records_once();
         assert!(FileAuditSink::set_child_signal_ignored_for_test(false));
+        drop(scratch);
         println!("audit_sink_isolation: ok");
     }
 
     /// REPAIR-5・TASK-163: 子の書き込み結果が親から見え、親にスレッドが残らない。
     fn healthy_primary_is_persisted_by_the_child() {
         let marker = tmp_marker("ok");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, _| {
             std::fs::write(path, b"persisted-by-child").map_err(|_| unreachable_err())
         });
@@ -387,7 +400,6 @@ mod linux {
         let held_fd = held.as_raw_fd();
         assert!(held_fd >= 3);
         let marker = tmp_marker("fds");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, _| {
             // 開いている fd（3 以上）の一覧。`/proc/self/fd/N` の有無で調べ、列挙用の fd を開かない。
             let mut before: Vec<i32> = Vec::new();
@@ -443,7 +455,6 @@ mod linux {
             let _ = release_rx.recv();
         });
         let marker = tmp_marker("mt");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, _| {
             std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
         });
@@ -467,7 +478,6 @@ mod linux {
     /// スレッドを作った後の `spawn` は `FailedPrecondition` で拒否される。
     fn control_relay_persists_from_a_multi_threaded_process() {
         let marker = tmp_marker("relay");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, _| {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
@@ -551,7 +561,6 @@ mod linux {
         const THREADS: i32 = 4;
         const PER_THREAD: i32 = 8;
         let marker = tmp_marker("relay-exit-signal");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, rec| {
             let pid = rec.target_pid().map_or(0, AuditPid::get);
             let mut f = std::fs::OpenOptions::new()
@@ -668,14 +677,12 @@ mod linux {
     /// 子を解放すると回収され、続く `record` は再び子で主経路を書く。
     fn too_many_unreaped_still_emits_the_notice() {
         let notice = tmp_marker("unreaped-notice");
-        let _ = std::fs::remove_file(&notice);
         let release = FileAuditSink::hold_unreaped_children_for_test().unwrap();
         assert_eq!(FileAuditSink::unreaped_children_for_test(), 4);
         let primary: Primary = Arc::new(|path, _| {
             std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
         });
         let marker = tmp_marker("unreaped");
-        let _ = std::fs::remove_file(&marker);
         let (held, seen) = sink(primary, false, Notify::File(notice.clone()), marker.clone());
         let e = held.record(&record()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
@@ -706,7 +713,6 @@ mod linux {
     /// SEC-4・REPAIR-4・#1594: 通知の子が異常終了（panic）しても、通知 1 行はスレッドでの出し直しで 1 行だけ出る。
     fn panicking_notify_child_is_retried_on_a_thread() {
         let notice = tmp_marker("panic-notice");
-        let _ = std::fs::remove_file(&notice);
         let (sink, seen) = sink(
             relative_primary(),
             false,
@@ -728,7 +734,6 @@ mod linux {
     /// いないので通知 1 行をスレッドで出し直す（1 行だけ）。期限内に戻り、スレッドは残らない。
     fn notify_child_timed_out_before_writing_is_retried() {
         let notice = tmp_marker("before-start-notice");
-        let _ = std::fs::remove_file(&notice);
         let (sink, seen) = sink(
             relative_primary(),
             false,
@@ -756,7 +761,6 @@ mod linux {
     /// 付けてから 1 行を出す。断片と完全な行が 1 行に連結されない。
     fn notify_child_failing_mid_line_is_retried_after_a_newline() {
         let notice = tmp_marker("fragment-notice");
-        let _ = std::fs::remove_file(&notice);
         let (sink, _seen) = sink(
             relative_primary(),
             false,
@@ -784,7 +788,6 @@ mod linux {
         wait_unreaped_cleared();
         // 成功: 子が書き、代替経路は呼ばれない。
         let marker = tmp_marker("ign-ok");
-        let _ = std::fs::remove_file(&marker);
         let primary: Primary = Arc::new(|path, _| {
             std::fs::write(path, b"persisted-with-sigchld-ignored").map_err(|_| unreachable_err())
         });
@@ -834,7 +837,6 @@ mod linux {
 
         // 両経路失敗の通知は子で 1 行だけ出る（スレッドで出し直さない）。
         let notice = tmp_marker("ign-notice");
-        let _ = std::fs::remove_file(&notice);
         let (sink_fail, _) = sink(
             relative_primary(),
             false,

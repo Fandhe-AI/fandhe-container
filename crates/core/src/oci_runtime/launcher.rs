@@ -2677,9 +2677,10 @@ mod tests {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-launcher-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う。fd で pin した後は関数の終わりで消える
+        // （従来も終わりで消していた）。#3434・REPAIR-12。
+        let (_scratch, dir) =
+            crate::test_support::scratch_child(&format!("fandhe-launcher-{name}"), "d");
         std::fs::create_dir_all(dir.join("rootfs")).unwrap();
         let mut linux = serde_json::json!({"namespaces": [
             {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"}
@@ -2704,7 +2705,7 @@ mod tests {
         let namespaces = config.namespaces().iter().map(|n| n.kind()).collect();
         let binds = super::super::bind_mounts::BindMountSet::from_mounts(config.mounts())
             .expect("valid binds");
-        let spec = LaunchSpec::new(
+        LaunchSpec::new(
             rootfs,
             rootfs_dir,
             args.iter().map(|a| (*a).to_owned()).collect(),
@@ -2717,9 +2718,7 @@ mod tests {
             binds,
             super::super::working_dir::ContainerWorkingDir::root(),
             user,
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        spec
+        )
     }
 
     /// OCI-1（#2314）: `entrypoint_of` は名前だけの `args[0]` を `PATH` 探索の対象にし、絶対パスは従来どおり、
@@ -3480,13 +3479,19 @@ mod tests {
     }
 
     /// 試験用の subuid / subgid と helper(root 所有の実在ファイルで代用)の入力元を作る。
-    fn source_in(name: &str, subuid: &str, subgid: &str, helper: &str) -> SubordinateIdSource {
-        let dir = std::env::temp_dir().join(format!("fandhe-subids-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    ///
+    /// 入力元のファイルは遅延して読まれるため、guard を返して試験の終わりまで保つ（#3434・REPAIR-12）。
+    fn source_in(
+        name: &str,
+        subuid: &str,
+        subgid: &str,
+        helper: &str,
+    ) -> (crate::scratch_root::ScratchDir, SubordinateIdSource) {
+        let (scratch, dir) =
+            crate::test_support::scratch_child(&format!("fandhe-subids-{name}"), "d");
         std::fs::write(dir.join("subuid"), subuid).unwrap();
         std::fs::write(dir.join("subgid"), subgid).unwrap();
-        SubordinateIdSource::with_paths(
+        let source = SubordinateIdSource::with_paths(
             Some("tester".to_owned()),
             &dir.join("subuid"),
             &dir.join("subgid"),
@@ -3494,7 +3499,8 @@ mod tests {
             Path::new(helper),
             Duration::from_secs(5),
         )
-        .unwrap()
+        .unwrap();
+        (scratch, source)
     }
 
     /// root 所有で祖先も root のみ書き込み可の実在の通常ファイル(`HelperPaths` の検証を通す代用)。
@@ -3521,7 +3527,7 @@ mod tests {
     /// SEC-5(#2009): ホスト ID 0 を含む範囲は、構築(副作用なし)で `PermissionDenied` になる。
     #[test]
     fn sec5_subordinate_ids_reject_host_root_range_before_fork() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "hostroot",
             "tester:0:65536\n",
             "tester:100000:65536\n",
@@ -3544,7 +3550,7 @@ mod tests {
     /// CORE-6(#2009): helper が無ければ構築が拒否し、文言にパスを含めない。
     #[test]
     fn core6_subordinate_ids_reject_missing_helper_before_fork() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "nohelper",
             "tester:100000:65536\n",
             "tester:100000:65536\n",
@@ -3569,14 +3575,13 @@ mod tests {
     #[test]
     fn core6_subordinate_ids_reject_empty_range_root_and_mismatched_source() {
         let sub = IsolationPrivilege::RootlessSubordinateIds;
-        let src = || {
-            source_in(
-                "misc",
-                "other:100000:65536\n",
-                "tester:100000:65536\n",
-                helper_stand_in(),
-            )
-        };
+        let (_scratch, misc) = source_in(
+            "misc",
+            "other:100000:65536\n",
+            "tester:100000:65536\n",
+            helper_stand_in(),
+        );
+        let src = || misc.clone();
         let e = resolve_privilege(sub, Some(src()), 1000, 1000).expect_err("empty");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         let e = resolve_privilege(sub, Some(src()), 0, 1000).expect_err("root");
@@ -3596,7 +3601,7 @@ mod tests {
     /// CORE-6・SEC-5(#2389): `resolve_privilege` が返す写像は `resolve_id_maps` の結果と同じ行になる(具体値)。
     #[test]
     fn core6_resolve_id_maps_matches_resolve_privilege() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "idmaps",
             "tester:100000:65536\n",
             "tester:200000:65536\n",
@@ -3652,7 +3657,7 @@ mod tests {
     /// → subuid の範囲の具体的な写像が渡る(順序は 単一スレッド確認 → Landlock → spawn)。
     #[test]
     fn core6_subordinate_ids_launch_reaches_spawn_with_ranged_maps() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "launch",
             "tester:100000:65536\n",
             "tester:200000:65536\n",
@@ -4249,9 +4254,7 @@ mod tests {
     fn options_sealed(bytes: &[u8]) -> LaunchOptions {
         use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-sealed-opts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-sealed-opts", "d");
         let path = dir.join("secret");
         std::fs::File::create(&path)
             .and_then(|mut f| f.write_all(bytes))
@@ -4259,7 +4262,6 @@ mod tests {
         let file = std::fs::File::open(&path).expect("open");
         let content = InjectedContent::from_file(&file).expect("sealed");
         assert!(!content.is_caller_memory());
-        let _ = std::fs::remove_dir_all(&dir);
         let mut set = InjectedFileSet::new();
         set.push(
             InjectedFileSpec::new("/etc/secret-token", content, InjectedFileMode::DEFAULT)
@@ -4992,7 +4994,7 @@ mod tests {
     fn sec1_subordinate_privilege_with_inject_is_refused_before_fork() {
         let spec = spec_for("opts-sub-inject", serde_json::json!({}));
         let ev = events();
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "inject-refused",
             "tester:100000:65536\n",
             "tester:200000:65536\n",

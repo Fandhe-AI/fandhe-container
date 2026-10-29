@@ -323,6 +323,79 @@ fn create_unique_in(
     ))
 }
 
+/// 試験用の保護済み一時ディレクトリ（`ScratchDir`）とその子 `child`（0700）を作る。
+///
+/// pid だけの予測できる名前を `remove_dir_all` してから作る旧方式（panic で残骸が残り、共有 `/tmp` で
+/// 他ユーザーの先置きを辿りうる）の置き換え口（#3434・REPAIR-12）。製品コードへ渡すのは返した子にする
+/// （親は Linux で共有 flock を保持するため、親に排他 flock を取る `BundleLock` 等が失敗する）。
+/// 戻り値の guard は試験の終わりまで束縛し、drop で自分のパスだけが消える。
+pub(crate) fn scratch_child(
+    prefix: &str,
+    child: &str,
+) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+    let scratch = crate::scratch_root::ScratchDir::new(prefix, std::time::Duration::from_secs(10));
+    let dir = scratch.path().join(child);
+    std::fs::create_dir(&dir).expect("create scratch child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod scratch child");
+    }
+    (scratch, dir)
+}
+
+/// 旧方式（pid だけの名前を先に消して作る）の残骸を再現する補助（#3434・REPAIR-12）。
+///
+/// `temp_dir()/<old_name>` を排他作成でき、`<fifo_name>` の FIFO と通常ファイル `file` を置く。既に存在すれば
+/// 本物の残骸として使い、消さない（作れた場合だけ drop で消す。#3373 の `Cleanup(path, created)` と同じ規則）。
+/// 移行後の補助・試験が残骸と衝突せず、残骸に触れないことの照合（`assert_untouched`）に使う。
+#[cfg(unix)]
+pub(crate) struct LegacyResidue {
+    dir: std::path::PathBuf,
+    fifo: std::path::PathBuf,
+    created: bool,
+}
+
+#[cfg(unix)]
+impl LegacyResidue {
+    pub(crate) fn new(old_name: &str, fifo_name: &str) -> Self {
+        let dir = std::env::temp_dir().join(old_name);
+        let fifo = dir.join(fifo_name);
+        let created = std::fs::create_dir(&dir).is_ok();
+        if created {
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed: {status:?}");
+            std::fs::write(dir.join("file"), b"x").expect("write residue");
+        }
+        Self { dir, fifo, created }
+    }
+
+    /// 残骸の置き場そのもの。
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// FIFO が FIFO のまま残っている（開いたり消したりされていない）。
+    pub(crate) fn assert_untouched(&self) {
+        use std::os::unix::fs::FileTypeExt as _;
+        let meta = std::fs::symlink_metadata(&self.fifo).expect("residue fifo");
+        assert!(meta.file_type().is_fifo(), "{:?}", meta.file_type());
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LegacyResidue {
+    fn drop(&mut self) {
+        if self.created {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

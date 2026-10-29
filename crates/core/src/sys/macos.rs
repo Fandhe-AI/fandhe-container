@@ -615,19 +615,22 @@ pub(crate) mod plugin_fs {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
-        /// 試験ごとに一意な一時ディレクトリ（canonicalize 済み）。Drop で削除する。
-        struct Tmp(PathBuf);
+        /// 試験ごとに一意な一時ディレクトリ（canonicalize 済み）。排他作成した `ScratchDir` の子で、drop で消える。
+        /// pid だけの名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
+        struct Tmp(
+            PathBuf,
+            #[allow(dead_code)] // drop で後始末するための guard。
+            crate::scratch_root::ScratchDir,
+        );
         impl Tmp {
             fn new(tag: &str) -> Self {
-                let p = std::env::temp_dir().join(format!("fc-1864-{tag}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&p);
-                std::fs::create_dir_all(&p).expect("mkdir");
-                Tmp(std::fs::canonicalize(&p).expect("canonicalize"))
-            }
-        }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    &format!("fc-1864-{tag}"),
+                    Duration::from_secs(10),
+                );
+                let p = scratch.path().join("d");
+                std::fs::create_dir(&p).expect("mkdir");
+                Tmp(std::fs::canonicalize(&p).expect("canonicalize"), scratch)
             }
         }
 

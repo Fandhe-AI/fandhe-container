@@ -2917,24 +2917,16 @@ mod imp {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        // 呼び出しごとに固有（並行する試験が同じ名前を使っても相手のディレクトリを消さない。REPAIR-12）。
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-image-rootfs-{name}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        dir
+    fn tmp(name: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-image-rootfs-{name}"), "d")
     }
 
     /// OCI-7・SEC-1: 公開後の最終の経路が別の実体（同名の差し替え）なら展開した実体と見なさない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_is_unpacked_at_rejects_replaced_directory() {
-        let b = tmp("replaced");
+        let (_scratch, b) = tmp("replaced");
         std::fs::create_dir(b.join("p")).expect("parent");
         let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         c.publish().expect("publish");
@@ -2942,14 +2934,13 @@ mod tests {
         std::fs::rename(b.join("p"), b.join("moved")).expect("rename");
         std::fs::create_dir_all(b.join("p/rootfs")).expect("new");
         assert!(!c.is_unpacked_at(&b.join("p/rootfs")));
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 空の rootfs を作り、展開先の経路へ書いて公開し、remove で消せる。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_creates_empty_dir_publishes_and_remove_deletes_it() {
-        let b = tmp("basic");
+        let (_scratch, b) = tmp("basic");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
         // 公開前は最終の名前に存在しない（他の create から rootfs として見えない）。
@@ -2961,14 +2952,13 @@ mod tests {
         assert!(b.join("rootfs").join("f").exists());
         c.remove().expect("remove");
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 既存の rootfs・bundle 自身・`..` は拒否し、既存の中身に触れない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_rejects_existing_bundle_itself_and_parent_dir() {
-        let b = tmp("reject");
+        let (_scratch, b) = tmp("reject");
         std::fs::create_dir(b.join("rootfs")).expect("mk");
         std::fs::write(b.join("rootfs").join("keep"), b"x").expect("w");
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("exists");
@@ -2978,7 +2968,6 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         let e = prepare_rootfs_target(&b, Path::new("../x")).expect_err("parent");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 読み取り専用 mode の木も権限を補正して消せる。
@@ -2986,7 +2975,7 @@ mod tests {
     #[test]
     fn oci7_remove_restores_permissions_for_read_only_tree() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("ro");
+        let (_scratch, b) = tmp("ro");
         let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let sub = c.unpack_path().join("sub");
         std::fs::create_dir(&sub).expect("sub");
@@ -2994,7 +2983,6 @@ mod tests {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("ro");
         c.remove().expect("remove");
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 中間要素が symlink なら拒否し、bundle 外に何も作らない。
@@ -3002,22 +2990,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oci7_prepare_rejects_symlink_parent() {
-        let b = tmp("symparent");
-        let outside = tmp("symparent-out");
+        let (_scratch, b) = tmp("symparent");
+        let (_scratch, outside) = tmp("symparent-out");
         std::os::unix::fs::symlink(&outside, b.join("link")).expect("symlink");
         let e = prepare_rootfs_target(&b, Path::new("link/rootfs")).expect_err("symlink");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(std::fs::read_dir(&outside).expect("read").count(), 0);
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 差し替えられた rootfs（symlink）は消さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_refuses_replaced_rootfs() {
-        let b = tmp("replaced");
-        let outside = tmp("replaced-out");
+        let (_scratch, b) = tmp("replaced");
+        let (_scratch, outside) = tmp("replaced-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         c.publish().expect("publish");
@@ -3026,8 +3012,6 @@ mod tests {
         let e = c.remove().expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("marker").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 作成後に親ディレクトリが symlink へ差し替えられても、後始末は固定済みの親の下だけを消し、
@@ -3035,8 +3019,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_ignores_parent_swapped_for_symlink() {
-        let b = tmp("parentswap");
-        let outside = tmp("parentswap-out");
+        let (_scratch, b) = tmp("parentswap");
+        let (_scratch, outside) = tmp("parentswap-out");
         std::fs::create_dir(b.join("p")).expect("p");
         let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("mine"), b"x").expect("mine");
@@ -3048,16 +3032,14 @@ mod tests {
         c.remove().expect("remove");
         assert!(outside.join("rootfs").join("marker").exists());
         assert!(!b.join("p_moved").join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 後始末は木の内側の symlink を辿らず、リンク自体だけを消す。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_does_not_follow_symlinks_inside_tree() {
-        let b = tmp("innerlink");
-        let outside = tmp("innerlink-out");
+        let (_scratch, b) = tmp("innerlink");
+        let (_scratch, outside) = tmp("innerlink-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::os::unix::fs::symlink(&outside, c.unpack_path().join("dirlink")).expect("symlink");
@@ -3065,19 +3047,16 @@ mod tests {
         c.remove().expect("remove");
         assert!(outside.join("marker").exists());
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 展開中の非公開の名前（予約名）は root.path として拒否する。
     #[test]
     fn oci7_prepare_rejects_reserved_staging_name() {
-        let b = tmp("reserved");
+        let (_scratch, b) = tmp("reserved");
         let e = prepare_rootfs_target(&b, Path::new(".fandhe-unpack-1-0")).expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(has_staging_component(Path::new("a/.fandhe-unpack-x/b")));
         assert!(!has_staging_component(Path::new("a/rootfs")));
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: setgid の親の下で 02700 になる展開先も採用できる。
@@ -3085,32 +3064,30 @@ mod tests {
     #[test]
     fn oci7_prepare_accepts_setgid_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("setgid");
+        let (_scratch, b) = tmp("setgid");
         std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o2755)).expect("setgid");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         c.publish().expect("publish");
         assert!(c.is_published());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 返す経路は正規化済みで、等価な書き方の `root.path` でも同じ場所に作る。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_normalizes_path() {
-        let b = tmp("normalize");
+        let (_scratch, b) = tmp("normalize");
         let mut c = prepare_rootfs_target(&b, Path::new("./rootfs/")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
         c.publish().expect("publish");
         assert!(b.join("rootfs").is_dir());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1: 展開先は固定した rootfs の fd を指し、作成後に親を symlink へ差し替えても bundle 外へ書かない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_unpack_path_survives_parent_swap() {
-        let b = tmp("unpackswap");
-        let outside = tmp("unpackswap-out");
+        let (_scratch, b) = tmp("unpackswap");
+        let (_scratch, outside) = tmp("unpackswap-out");
         std::fs::create_dir(b.join("p")).expect("p");
         let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         std::fs::rename(b.join("p"), b.join("p_moved")).expect("move");
@@ -3121,15 +3098,13 @@ mod tests {
             std::fs::read_dir(b.join("p_moved")).expect("read").count(),
             1
         );
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 最終の名前が公開前に作られていたら、公開は置き換えずに拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_publish_refuses_when_final_name_appeared() {
-        let b = tmp("pubrace");
+        let (_scratch, b) = tmp("pubrace");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::create_dir(b.join("rootfs")).expect("mk");
         std::fs::write(b.join("rootfs").join("keep"), b"x").expect("w");
@@ -3138,7 +3113,6 @@ mod tests {
         assert!(b.join("rootfs").join("keep").exists());
         c.remove().expect("remove staging");
         assert!(b.join("rootfs").join("keep").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// 公開済みの rootfs を作り、記録を返す（`<b>/<rel>` に `f` を置く）。
@@ -3157,7 +3131,7 @@ mod tests {
     #[test]
     fn oci7_seal_works_on_read_only_rootfs_and_restores_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("seal-ro");
+        let (_scratch, b) = tmp("seal-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
@@ -3174,7 +3148,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7（#2378）: 展開器が rootfs 自身から所有者の search 権限まで外しても（0600・0000）、削除側は
@@ -3184,7 +3157,7 @@ mod tests {
     fn oci7_remove_recorded_rootfs_without_owner_search_permission() {
         use std::os::unix::fs::PermissionsExt;
         for (i, m) in [0o600u32, 0o000].into_iter().enumerate() {
-            let b = tmp(&format!("rec-nosearch-{i}"));
+            let (_scratch, b) = tmp(&format!("rec-nosearch-{i}"));
             let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
             std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
             std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(m))
@@ -3198,7 +3171,6 @@ mod tests {
                 "mode {m:o}"
             );
             assert!(!b.join("rootfs").exists());
-            let _ = std::fs::remove_dir_all(&b);
         }
     }
 
@@ -3207,7 +3179,7 @@ mod tests {
     #[test]
     fn sec1_remove_recorded_rootfs_restores_mode_on_token_mismatch() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("rec-nosearch-mismatch");
+        let (_scratch, b) = tmp("rec-nosearch-mismatch");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o000))
@@ -3230,7 +3202,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1（#2378）: 記録した rootfs を手で消して同名のディレクトリを作り直した（印が無い・別の印）
@@ -3238,7 +3209,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_recreated_dir_without_matching_token() {
-        let b = tmp("rec-token");
+        let (_scratch, b) = tmp("rec-token");
         let rec = published_record(&b, "rootfs");
         let token = rec.token().expect("token").to_owned();
         assert_eq!(token.len(), 32);
@@ -3267,14 +3238,13 @@ mod tests {
             .expect("symlink");
         assert!(remove_recorded_rootfs(&b, &rec).is_err());
         assert!(root.join("user-data").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1（#2378）: トークンの無い旧記録は、実体が一致しても消さない（fail-closed）。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_record_without_token() {
-        let b = tmp("rec-notoken");
+        let (_scratch, b) = tmp("rec-notoken");
         let rec = published_record(&b, "rootfs");
         let (dev, ino) = rec.identity();
         let legacy =
@@ -3287,27 +3257,25 @@ mod tests {
             remove_recorded_rootfs(&b, &rec).expect("matching"),
             RecordedRootfsRemoval::Removed
         );
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7（#2378）: 展開済みの木に同名の印のファイルがあれば（イメージ由来の偽の印）採用せず拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_seal_refuses_preexisting_marker() {
-        let b = tmp("seal-pre");
+        let (_scratch, b) = tmp("seal-pre");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join(super::OWNER_TOKEN_FILE), "x").expect("fake");
         let e = c.seal(None).expect_err("exists");
         assert_eq!(e.code(), ErrorCode::AlreadyExists);
         c.remove().expect("cleanup");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 記録から公開済みの rootfs を消せる。bundle と他のファイルは残る。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_deletes_tree() {
-        let b = tmp("rec-del");
+        let (_scratch, b) = tmp("rec-del");
         std::fs::write(b.join("config.json"), b"{}").expect("config");
         let rec = published_record(&b, "rootfs");
         assert_eq!(rec.relative_path(), Path::new("rootfs"));
@@ -3317,14 +3285,13 @@ mod tests {
         );
         assert!(!b.join("rootfs").exists());
         assert!(b.join("config.json").is_file());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 入れ子の `root.path` でも記録の経路で消せる。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_nested_path() {
-        let b = tmp("rec-nested");
+        let (_scratch, b) = tmp("rec-nested");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
         assert_eq!(
@@ -3333,14 +3300,13 @@ mod tests {
         );
         assert!(b.join("p").is_dir());
         assert!(!b.join("p/rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 既に無ければ `NotPresent`（冪等な再実行）。bundle・中間要素が無い場合も同じ。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_absent_is_not_present() {
-        let b = tmp("rec-absent");
+        let (_scratch, b) = tmp("rec-absent");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
         std::fs::remove_dir_all(b.join("p/rootfs")).expect("gone");
@@ -3364,7 +3330,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_replaced_dir() {
-        let b = tmp("rec-replaced");
+        let (_scratch, b) = tmp("rec-replaced");
         let rec = published_record(&b, "rootfs");
         std::fs::rename(b.join("rootfs"), b.join("moved")).expect("move");
         std::fs::create_dir(b.join("rootfs")).expect("replacement");
@@ -3374,24 +3340,22 @@ mod tests {
         assert!(b.join("rootfs/marker").is_file());
 
         std::fs::remove_dir_all(b.join("rootfs")).expect("rm replacement");
-        let outside = tmp("rec-replaced-out");
+        let (_scratch, outside) = tmp("rec-replaced-out");
         std::fs::write(outside.join("marker"), b"o").expect("marker");
         std::os::unix::fs::symlink(&outside, b.join("rootfs")).expect("symlink");
         let e = remove_recorded_rootfs(&b, &rec).expect_err("symlink");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("marker").is_file());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 中間要素が bundle 外への symlink に差し替えられても、外側は消さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_parent_symlink_untouched() {
-        let b = tmp("rec-parent");
+        let (_scratch, b) = tmp("rec-parent");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
-        let outside = tmp("rec-parent-out");
+        let (_scratch, outside) = tmp("rec-parent-out");
         std::fs::create_dir(outside.join("rootfs")).expect("outside rootfs");
         std::fs::write(outside.join("rootfs/marker"), b"o").expect("marker");
         std::fs::rename(b.join("p"), b.join("p-moved")).expect("move");
@@ -3399,8 +3363,6 @@ mod tests {
         let e = remove_recorded_rootfs(&b, &rec).expect_err("symlinked parent");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("rootfs/marker").is_file());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 展開時に読み取り専用にされたディレクトリを含む木も消せる。
@@ -3408,7 +3370,7 @@ mod tests {
     #[test]
     fn oci7_remove_recorded_rootfs_handles_read_only_dirs() {
         use std::os::unix::fs::PermissionsExt as _;
-        let b = tmp("rec-ro");
+        let (_scratch, b) = tmp("rec-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let up = c.unpack_path();
         std::fs::create_dir(up.join("ro")).expect("ro");
@@ -3423,18 +3385,16 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1: Linux 以外は展開先を固定できないため、作成の前に Unimplemented で拒否する。
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sec1_prepare_refuses_without_fd_pinning() {
-        let b = tmp("winrefuse");
+        let (_scratch, b) = tmp("winrefuse");
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// `mkfifo` の終了待ちの期限（REPAIR-5）。
@@ -3471,7 +3431,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_non_regular_marker() {
-        let b = tmp("marker-fifo");
+        let (_scratch, b) = tmp("marker-fifo");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let marker = root.join(super::OWNER_TOKEN_FILE);
@@ -3487,14 +3447,13 @@ mod tests {
             .expect("must not block");
         assert!(refused);
         assert!(root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・OCI-7: bundle が FIFO に差し替えられても delete は open でブロックせず拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_fifo_bundle_does_not_block() {
-        let b = tmp("fifo-bundle");
+        let (_scratch, b) = tmp("fifo-bundle");
         let fifo = b.join("fifo");
         make_fifo(&fifo);
         let rec = published_record(&b, "rootfs");
@@ -3507,7 +3466,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("must not block");
         assert!(refused);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// 持ち主のいない展開途中の木を `parent` の下に作る（`name` は予約名。中にファイルとサブディレクトリを置く）。
@@ -3527,7 +3485,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_reclaims_staging_left_by_crashed_create() {
-        let b = tmp("reap-crashed");
+        let (_scratch, b) = tmp("reap-crashed");
         let mut published = prepare_rootfs_target(&b, Path::new("rootfs")).expect("first");
         std::fs::write(published.unpack_path().join("keep"), b"x").expect("write");
         published.publish().expect("publish");
@@ -3553,14 +3511,13 @@ mod tests {
         let again = reap_stale_unpacks(&b, Path::new("third")).expect("public");
         assert!(again.reclaimed.is_empty());
         assert_eq!(again.kept_alive.len(), 1, "the live `third` staging");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2379: ロックを保持中の（生きている）create の展開先は回収せず、両方が共存する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_keeps_live_staging() {
-        let b = tmp("reap-live");
+        let (_scratch, b) = tmp("reap-live");
         let first = prepare_rootfs_target(&b, Path::new("a")).expect("first");
         std::fs::write(first.unpack_path().join("f"), b"x").expect("write");
         let second = prepare_rootfs_target(&b, Path::new("b")).expect("second");
@@ -3575,7 +3532,6 @@ mod tests {
         assert!(r.reclaimed.is_empty());
         first.remove().expect("rm first");
         second.remove().expect("rm second");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2379: PID が再利用されて同じ名前の持ち主のいない木が残っていても、次の create は
@@ -3583,7 +3539,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_resolves_pid_reuse_collision() {
-        let b = tmp("reap-pid-reuse");
+        let (_scratch, b) = tmp("reap-pid-reuse");
         let pid = std::process::id();
         for seq in 0..16 {
             plant_staging(&b, &format!("{STAGING_PREFIX}{pid}-{seq}"));
@@ -3593,7 +3549,6 @@ mod tests {
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         c.publish().expect("publish");
         assert!(b.join("rootfs/f").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・OCI-7・#2379: 回収は予約名の symlink・通常ファイル・mode が違うディレクトリを辿らず消さず、
@@ -3602,8 +3557,8 @@ mod tests {
     #[test]
     fn sec1_reap_does_not_follow_or_delete_foreign_entries() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-foreign");
-        let outside = tmp("reap-foreign-out");
+        let (_scratch, b) = tmp("reap-foreign");
+        let (_scratch, outside) = tmp("reap-foreign-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
         std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
@@ -3637,8 +3592,6 @@ mod tests {
         assert!(!wide.exists());
         assert!(b.join(".fandhe-unpack-4-").is_dir());
         assert!(b.join(".fandhe-unpack-99999999999-1").is_dir());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1・#2379: 持ち主のいない木の中の symlink は辿らず、リンクだけを消す。読み取り専用の木も消せる。
@@ -3646,8 +3599,8 @@ mod tests {
     #[test]
     fn sec1_reap_does_not_follow_symlinks_inside_tree() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-inner");
-        let outside = tmp("reap-inner-out");
+        let (_scratch, b) = tmp("reap-inner");
+        let (_scratch, outside) = tmp("reap-inner-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let t = plant_staging(&b, ".fandhe-unpack-5-5");
         std::os::unix::fs::symlink(&outside, t.join("dirlink")).expect("symlink");
@@ -3660,8 +3613,6 @@ mod tests {
         );
         assert!(!t.exists());
         assert!(outside.join("marker").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7・#2379: 別のプロセス（ここでは別の open file description）がロックを持つ木は生きていると
@@ -3669,7 +3620,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_lock_held_by_other_is_reported_as_alive_not_deleted() {
-        let b = tmp("reap-lock-other");
+        let (_scratch, b) = tmp("reap-lock-other");
         let t = plant_staging(&b, ".fandhe-unpack-6-6");
         let holder = std::fs::File::open(&t).expect("open");
         holder.try_lock().expect("lock");
@@ -3682,7 +3633,6 @@ mod tests {
         drop(holder);
         let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
         assert_eq!(r.reclaimed.len(), 1);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// REPAIR-4・#2379: 親が書込・探索可能だが読めない（走査できない）とき、create は成功するが回収は
@@ -3691,7 +3641,7 @@ mod tests {
     #[test]
     fn repair4_reap_reports_scan_failure_for_unreadable_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-unreadable");
+        let (_scratch, b) = tmp("reap-unreadable");
         std::fs::create_dir(b.join("p")).expect("p");
         std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o300))
             .expect("chmod");
@@ -3714,15 +3664,14 @@ mod tests {
         let clean = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
         assert!(!clean.scan_failed);
         assert!(!clean.is_incomplete());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・#2379: 公開入口は `prepare_rootfs_target` と同じ経路検査を通す（`..`・予約名・bundle 自身・symlink の親）。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_reap_stale_unpacks_validates_paths() {
-        let b = tmp("reap-paths");
-        let outside = tmp("reap-paths-out");
+        let (_scratch, b) = tmp("reap-paths");
+        let (_scratch, outside) = tmp("reap-paths-out");
         plant_staging(&outside, ".fandhe-unpack-7-7");
         std::os::unix::fs::symlink(&outside, b.join("link")).expect("symlink");
         for bad in ["../x", ".fandhe-unpack-1-0", ".", "link/rootfs"] {
@@ -3732,18 +3681,15 @@ mod tests {
         assert!(outside.join(".fandhe-unpack-7-7/sub/f").exists());
         let e = reap_stale_unpacks(&b.join("nope"), Path::new("rootfs")).expect_err("no bundle");
         assert_eq!(e.code(), ErrorCode::NotFound);
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7・SEC-1: Linux 以外は回収も `Unimplemented`（実装済みを装わない。REPAIR-3）。
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sec1_reap_stale_unpacks_is_unimplemented_outside_linux() {
-        let b = tmp("reap-nonlinux");
+        let (_scratch, b) = tmp("reap-nonlinux");
         let e = reap_stale_unpacks(&b, Path::new("rootfs")).expect_err("unimplemented");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[cfg(target_os = "linux")]
@@ -3760,7 +3706,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_marker_v2_is_written_and_v1_is_still_accepted_by_delete() {
-        let b = tmp("marker-v2");
+        let (_scratch, b) = tmp("marker-v2");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let token = rec.token().expect("token").to_owned();
@@ -3787,7 +3733,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2540: 削除の途中で失敗しても印は最後に消すので残り、次の孤児の回収が木を見分けられる。
@@ -3795,7 +3740,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_keeps_marker_until_the_rest_is_removed() {
-        let b = tmp("marker-last");
+        let (_scratch, b) = tmp("marker-last");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let deep: PathBuf = std::iter::repeat_n("d", 300).collect();
@@ -3803,7 +3748,6 @@ mod tests {
         let e = remove_recorded_rootfs(&b, &rec).expect_err("too deep");
         assert_eq!(e.code(), ErrorCode::Internal);
         assert!(root.join(super::OWNER_TOKEN_FILE).is_file());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// REPAIR-4・#2540: `reap_stale_unpacks_with` は確かめられず残した木を 1 件ずつ失敗として記録し、
@@ -3811,14 +3755,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn repair4_reap_with_records_each_kept_unverified_tree() {
-        let b = tmp("reap-with");
+        let (_scratch, b) = tmp("reap-with");
         let rec = OpRecorder::new();
         let r = reap_stale_unpacks_with(&b, Path::new("rootfs"), &ReapOptions::new(), &rec)
             .expect("empty");
         assert!(!r.is_noteworthy());
         assert!(rec.snapshot().is_empty());
 
-        let outside = tmp("reap-with-out");
+        let (_scratch, outside) = tmp("reap-with-out");
         std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
         std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
         plant_staging(&b, ".fandhe-unpack-3-3");
@@ -3836,8 +3780,6 @@ mod tests {
         assert_eq!(count("image_rootfs_reap"), (0, 1));
         assert_eq!(count("image_rootfs_reap_kept_unverified"), (0, 2));
         assert_eq!(count("image_rootfs_reap_failed"), (0, 0));
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
     /// 印 v3 の検証用の状態ルートの識別子（小文字 16 進 32 文字）。
     #[cfg(target_os = "linux")]
@@ -3862,7 +3804,7 @@ mod tests {
     #[test]
     fn oci7_2635_staging_uses_core_owned_wrapper() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let b = tmp("wrapper");
+        let (_scratch, b) = tmp("wrapper");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let wrappers = |dir: &Path| -> Vec<std::ffi::OsString> {
             let mut v: Vec<_> = std::fs::read_dir(dir)
@@ -3902,7 +3844,6 @@ mod tests {
         assert_eq!((published.dev(), published.ino()), child_id);
         let rec = c.record().expect("record");
         assert_eq!(rec.identity(), child_id);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 展開器が子の mode を 0 にしても（rootful で所有者が変わる場合の代役）、回収が判定するのは
@@ -3912,7 +3853,7 @@ mod tests {
     fn oci7_2635_reap_reclaims_wrapper_when_child_mode_changed() {
         use std::os::unix::fs::PermissionsExt;
         for child_mode in [0o000, 0o755] {
-            let b = tmp("wrapper-reap");
+            let (_scratch, b) = tmp("wrapper-reap");
             let w = b.join(".fandhe-unpack-1-0");
             std::fs::create_dir(&w).expect("wrapper");
             std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o700)).expect("0700");
@@ -3929,7 +3870,6 @@ mod tests {
             );
             assert!(r.kept_unverified.is_empty() && r.failed.is_empty());
             assert!(!w.exists());
-            let _ = std::fs::remove_dir_all(&b);
         }
     }
 
@@ -3937,12 +3877,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_2635_unpublished_remove_removes_wrapper() {
-        let b = tmp("wrapper-remove");
+        let (_scratch, b) = tmp("wrapper-remove");
         let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         c.remove().expect("remove");
         assert_eq!(std::fs::read_dir(&b).expect("read").count(), 0);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 展開器が子を 0555（write なし）にしても、公開（別ディレクトリへの改名）は成功し、公開後の
@@ -3951,7 +3890,7 @@ mod tests {
     #[test]
     fn oci7_2635_publish_works_when_child_has_no_write_permission() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("wrapper-ro");
+        let (_scratch, b) = tmp("wrapper-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
             .expect("ro");
@@ -3963,14 +3902,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o555);
         std::fs::set_permissions(b.join("rootfs"), std::fs::Permissions::from_mode(0o755))
             .expect("restore");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・OCI-5・#2635: 印 v3 は `トークン\n<dev>:<ino>\n識別子\n` と完全に一致し、識別子の無い seal は v2 を書く。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_2635_seal_writes_v3_with_scope_and_v2_without() {
-        let b = tmp("seal-v3");
+        let (_scratch, b) = tmp("seal-v3");
         let mut c = prepare_rootfs_target(&b, Path::new("a")).expect("prepare");
         c.seal(Some(SCOPE)).expect("seal");
         c.publish().expect("publish");
@@ -3994,7 +3932,6 @@ mod tests {
         let mut c3 = prepare_rootfs_target(&b, Path::new("c")).expect("prepare 3");
         let e = c3.seal(Some("NOT-HEX")).expect_err("invalid scope");
         assert_eq!(e.code(), ErrorCode::Internal);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 印の解析は v1・v2・v3 だけを受け、3 行目が小文字 16 進 32 文字でない・4 行目がある・

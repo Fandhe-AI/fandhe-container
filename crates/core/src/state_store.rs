@@ -2632,9 +2632,12 @@ mod platform_tests {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn oci5_open_is_unimplemented_outside_linux() {
-        let root =
-            std::env::temp_dir().join(format!("fandhe-state-store-nolinux-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        // 作られないことを照合するため、排他作成の `ScratchDir` の下の存在しない子を渡す（#3434・REPAIR-12）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-state-store-nolinux",
+            std::time::Duration::from_secs(10),
+        );
+        let root = scratch.path().join("root");
         let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(
@@ -2653,22 +2656,25 @@ mod macos_tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     /// 試験ごとの専用ディレクトリ（drop で削除）。
-    struct Dir(PathBuf);
+    ///
+    /// pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    struct Dir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl Dir {
         fn new(tag: &str) -> Self {
-            let base = fs::canonicalize(std::env::temp_dir()).expect("temp dir");
-            let dir = base.join(format!("fandhe-ss-macos-{tag}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-ss-macos-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let base = fs::canonicalize(scratch.path()).expect("temp dir");
+            let dir = base.join("root");
             fs::create_dir(&dir).expect("create");
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-            Self(dir)
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            Self(dir, scratch)
         }
     }
 
@@ -2851,23 +2857,30 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// テスト用一時ディレクトリ（drop で削除）。`tempfile` は依存に追加しない。
-    struct TmpDir(PathBuf);
+    ///
+    /// 状態ルートは `ScratchDir` の子にする（親は Linux で共有 flock を持つため親を渡さない）。pid と連番の
+    /// 名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
+    struct TmpDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir().join(format!(
-                "fandhe-state-store-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-store-{tag}-{n}"),
+                std::time::Duration::from_secs(10),
+            );
+            let p = scratch.path().join("root");
+            fs::create_dir(&p).unwrap();
             // umask に依存せず、状態ルートとして信頼できるモード（0700）に固定する。
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
             }
-            Self(p)
+            Self(p, scratch)
         }
         fn path(&self) -> &Path {
             &self.0
@@ -2877,10 +2890,29 @@ mod tests {
         }
     }
 
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// REPAIR-12・#3434: 旧方式の pid と連番の名前の残骸（FIFO を含む）があっても `TmpDir` は別名の状態ルートを
+    /// 作って `open` に成功し、残骸に触れない。drop は自分のパスだけを消す。
+    #[test]
+    fn repair12_3434_tmp_dir_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-state-store-legacy3434-{}-0", std::process::id()),
+            "@lock",
+        );
+        let t = TmpDir::new("legacy3434");
+        assert_ne!(t.path(), residue.dir());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+        let store = t.open();
+        create(&store, "web");
+        assert!(t.path().join("web").is_dir());
+        residue.assert_untouched();
+        let path = t.path().to_path_buf();
+        drop(store);
+        drop(t);
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
     }
 
     fn cid(s: &str) -> ContainerId {
@@ -2894,16 +2926,13 @@ mod tests {
     /// 残骸ディレクトリの再利用は実名が要求 ID と完全一致するときだけ（IO-5・OCI-5）。
     #[test]
     fn ensure_exact_dir_name_rejects_case_variant_leftover() {
-        let tmp = std::env::temp_dir().join(format!("fandhe-exact-name-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir(&tmp).unwrap();
+        let (_scratch, tmp) = crate::test_support::scratch_child("fandhe-exact-name", "d");
         fs::create_dir(tmp.join("Web")).unwrap();
         assert_eq!(
             code(ensure_exact_dir_name(&tmp, "web")),
             "FAILED_PRECONDITION"
         );
         assert!(ensure_exact_dir_name(&tmp, "Web").is_ok());
-        fs::remove_dir_all(&tmp).unwrap();
     }
 
     fn create(store: &FileStateStore, id: &str) -> StateRecord {

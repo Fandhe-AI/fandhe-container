@@ -1208,9 +1208,7 @@ mod tests {
         use std::os::fd::OwnedFd;
 
         take();
-        let dir = std::env::temp_dir().join(format!("fandhe-stages-cgjoin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-stages-cgjoin", "d");
         let procs = dir.join("cgroup.procs");
         std::fs::write(&procs, "").unwrap();
         let fd = OwnedFd::from(std::fs::File::open(&dir).unwrap());
@@ -1250,7 +1248,6 @@ mod tests {
                 "exec"
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-5・TASK-38.3・MS-2（受け入れ条件）: seccomp は Landlock の直後・exec の直前に走る。

@@ -753,7 +753,8 @@ fn keep_unreaped(process: Box<dyn LaunchedProcess>) {
 ///
 /// 返したハンドルの所有権は呼び出し元（監視側）へ移り、レジストリからは消える。呼び出し元は
 /// [`LaunchedProcess::terminate`]・[`LaunchedProcess::wait`] を再試行して回収する（ハンドルは `Drop` で
-/// 回収しないため、捨てるとゾンビが残り得る）。
+/// kill / 回収しない。本番 launcher のハンドルは drop で未回収の子を起動台帳へ戻す〔#3432〕が、それ以外の実装では
+/// 捨てるとゾンビが残り得る）。
 pub fn take_unreaped_processes() -> Vec<Box<dyn LaunchedProcess>> {
     std::mem::take(&mut *UNREAPED.lock().unwrap_or_else(PoisonError::into_inner))
 }

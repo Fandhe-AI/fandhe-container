@@ -7,6 +7,12 @@
 # 失敗が 1 件でもあれば非ゼロで終わる。docker モードは bash 3.2 以上・perl（Time::HiRes）・jq が必要（#3104）。
 # 全ケースを PATH の bash と、別にある場合は /bin/bash（macOS では 3.2）の両方で回す（lib-selftest と同じ方式）。
 # 各回の先頭に shell=<path> version=<版> を出す。この行が無いのに緑なら、3.2 で回っていない。
+# さらに perl の版の組（variant）を 2 つ回す。path は PATH の perl（macOS の CI では Homebrew 版のことがある）、
+# system は macOS 標準の /usr/bin/perl へ exec する wrapper を PATH の先頭へ置いた回（#3354）。system の回は
+# perl-variant=system perl=<版> hires=<版> path=<$^X> invoked=<wrapper> の観測行を出し、wrapper のログで
+# probe（-MTime::HiRes）と各試行の計測（-e）が /usr/bin/perl を通ったことを具体値で照合する。Darwin では
+# /usr/bin/perl に Time::HiRes が無ければ失敗させる（skip で緑にしない）。Darwin 以外では PATH の perl と
+# 実体が同じか /usr/bin/perl が無ければ perl-variant=system skipped reason=... の行を出して飛ばす。
 # 注意: ubuntu の /bin/bash は 5.x のため、bench-regression では 3.2 の実行は起きない。3.2 の実行は
 # platform-ci の macOS のステップ（main への push と workflow_dispatch）が担う。
 set -euo pipefail
@@ -25,6 +31,34 @@ perl -MTime::HiRes -e 'print "perl=$^V hires=$Time::HiRes::VERSION path=$^X\n"' 
   exit 2
 }
 
+# system variant（#3354）: /usr/bin/perl へ exec する wrapper。第 1 引数（-MTime::HiRes か -e）だけをログへ残し、
+# 計測コード本体は残さない。起動は t0 の前に終わるので計測区間には入らない。
+SYSPERL_DIR="${TMP_ROOT}/sysperl"
+SYSPERL_LOG="${TMP_ROOT}/sysperl.log"
+mkdir -p "$SYSPERL_DIR"
+: >"$SYSPERL_LOG"
+cat >"${SYSPERL_DIR}/perl" <<WRAP
+#!/bin/sh
+printf '%s\n' "\$1" >>"${SYSPERL_LOG}"
+exec /usr/bin/perl "\$@"
+WRAP
+chmod 755 "${SYSPERL_DIR}/perl"
+RUN_SYSTEM=0
+if [ -x /usr/bin/perl ] && /usr/bin/perl -MTime::HiRes -e 1 >/dev/null 2>&1; then
+  path_x="$(perl -e 'print $^X')"
+  sys_x="$(/usr/bin/perl -e 'print $^X')"
+  if [ "$(uname -s)" = Darwin ] || [ "$path_x" != "$sys_x" ]; then
+    RUN_SYSTEM=1
+  else
+    echo "perl-variant=system skipped reason=same-as-path"
+  fi
+elif [ "$(uname -s)" = Darwin ]; then
+  echo "error: /usr/bin/perl with Time::HiRes is required on macOS" >&2
+  exit 2
+else
+  echo "perl-variant=system skipped reason=absent"
+fi
+
 SHELLS=("$(command -v bash)")
 if [ -x /bin/bash ] && [ "$(command -v bash)" != "/bin/bash" ]; then SHELLS+=(/bin/bash); fi
 
@@ -40,12 +74,16 @@ check() {
   if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi
 }
 
-# run_cases <シェル> <通し番号>: 全ケースを指定のシェルで回す。作業ディレクトリは回ごとに作り直す。
+# run_cases <シェル> <通し番号> <perl variant: path|system>: 全ケースを指定のシェルで回す。作業ディレクトリは回ごとに作り直す。
 run_cases() {
 UNDER_SHELL="$1"
-SHELL_TAG="$(basename "$1")#$2"
+VARIANT="$3"
+SHELL_TAG="$(basename "$1")#$2/${VARIANT}"
+SAVED_PATH="$PATH"
+if [ "$VARIANT" = system ]; then PATH="${SYSPERL_DIR}:${PATH}"; fi
 echo "shell=$1 version=$("$1" -c 'echo $BASH_VERSION')"
-TMP="${TMP_ROOT}/$2"
+echo "perl-variant=${VARIANT} $(perl -MTime::HiRes -e 'print "perl=$^V hires=$Time::HiRes::VERSION path=$^X"') invoked=$(command -v perl)"
+TMP="${TMP_ROOT}/$2-${VARIANT}"
 mkdir -p "$TMP"
 HOST="${TMP}/host"
 mkdir -p "$HOST"
@@ -188,8 +226,15 @@ check "no docker call happened on input errors" empty_file "${STUB_DIR}/calls"
 
 # --- 正常系: 起動引数と集計の具体値 ---
 reset_stub ok
+: >"$SYSPERL_LOG"
 runit --mode docker --runtime "$DOCKER" --host-dir "$HOST" --label stub --output "${TMP}/res.json"
 check "ok run exits 0" rc_is 0
+if [ "$VARIANT" = system ]; then
+  # 既定の試行数 5 に対し、probe（-MTime::HiRes）が 1 回、計測ラッパー（-e）が docker 起動 6 回（試行 5＋bind 確認 1）分呼ばれたこと。
+  check "system perl: PATH resolves perl to the wrapper" test "$(command -v perl)" = "${SYSPERL_DIR}/perl"
+  check "system perl: probe went through /usr/bin/perl once" test "$(grep -c '^-MTime::HiRes$' "$SYSPERL_LOG" || true)" -eq 1
+  check "system perl: 6 timed docker runs went through /usr/bin/perl" test "$(grep -c '^-e$' "$SYSPERL_LOG" || true)" -eq 6
+fi
 if [ "$rc" -ne 0 ]; then cat "${TMP}/err"; fi
 runl="$(grep '^run ' "${STUB_DIR}/calls" | tail -1)"
 for want in '--pull never' '--rm' '--cidfile' '--label fandhe.mac-small-files.run=' ":/data sha256:$(printf 'a%.0s' $(seq 1 64)) "; do
@@ -416,13 +461,20 @@ for f in "$SCRIPT" "${SELF_DIR}/mac_small_files_selftest.sh" "${SELF_DIR}/../tar
   fi
 done
 check "no bash 4+ construct in the script, its self-test and the make wrappers" test "$scan_ok" -eq 1
+PATH="$SAVED_PATH"
 }
 
 i=0
 for sh in "${SHELLS[@]}"; do
   i=$((i + 1))
-  run_cases "$sh" "$i"
+  run_cases "$sh" "$i" path
 done
+if [ "$RUN_SYSTEM" -eq 1 ]; then
+  # macOS 標準の組（/bin/bash があればそれ）で /usr/bin/perl の経路を 1 回だけ回す。
+  sys_sh="$(command -v bash)"
+  if [ -x /bin/bash ]; then sys_sh=/bin/bash; fi
+  run_cases "$sys_sh" "$((i + 1))" system
+fi
 
 echo "passed=${PASS} failed=${FAIL}"
 [ "$FAIL" -eq 0 ]

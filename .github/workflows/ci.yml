@@ -1008,9 +1008,10 @@ jobs:
         run: make lib-selftest
 
       # mac_small_files.sh の自己テストを macOS で回す（#3104・MAC-3・REPAIR-12）。macOS 標準の /bin/bash 3.2 でも
-      # 全ケースを回すのが目的（ubuntu は bench-regression で実行済み。Windows は macOS の Docker Desktop 向けの
+      # 全ケースを回し、PATH の perl（Homebrew 版のことがある）とは別に /usr/bin/perl の経路も回すのが目的（#3354。
+      # ubuntu は bench-regression で実行済み。Windows は macOS の Docker Desktop 向けの
       # 計測で対象外）。スタブの docker と一時ディレクトリだけを使う。既存ジョブのステップ（check-run 件数は不変）
-      - name: mac-small-files 自己テスト（/bin/bash 3.2 を含む。#3104・MAC-3・REPAIR-12。macos）
+      - name: mac-small-files 自己テスト（/bin/bash 3.2 と /usr/bin/perl を含む。#3104・#3354・MAC-3・REPAIR-12。macos）
         if: env.HANG_PROBE != 'true' && runner.os == 'macOS'
         timeout-minutes: 10
         run: make mac-small-files-selftest

@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! sudo -E cargo test -p fandhe-container-io --features crash-test-server --test power_loss \
-//!     -- --ignored --exact linux::io2_flushed_data_survives_dm_flakey_drop_writes --nocapture
+//!     -- --ignored --exact linux::io2_flushed_data_survives_dm_flakey_drop_writes --no-capture
 //! ```
 //!
 //! # 対象の限定（破壊的操作の安全性）

@@ -65,7 +65,7 @@ fn spawn_holder(root: &Path, mode: &str) -> Child {
         .args([
             "helper_hold_lock",
             "--exact",
-            "--nocapture",
+            "--no-capture",
             "--test-threads=1",
         ])
         .env(ENV_ROOT, root)
@@ -293,7 +293,7 @@ fn net1_3067_records_persist_across_processes_and_reserve_addresses() {
         .args([
             "helper_write_records",
             "--exact",
-            "--nocapture",
+            "--no-capture",
             "--test-threads=1",
         ])
         .env(ENV_RECORDS_ROOT, &t.0)

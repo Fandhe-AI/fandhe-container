@@ -630,7 +630,7 @@ fn run_trial(trial: u32, work: &Path, cfg: &TrialCfg<'_>) -> (f64, String) {
             "--exact",
             TEST_NAME,
             "--ignored",
-            "--nocapture",
+            "--no-capture",
             "--test-threads=1",
         ])
         .env(ENV_INNER, "1")

@@ -7855,7 +7855,7 @@ mod tests {
                 "--exact",
                 "sys::tests::core1_sec1_task29_devpts_real_mount",
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(INNER_ENV, "1")
@@ -9844,7 +9844,7 @@ mod tests {
                 "--exact",
                 "sys::tests::core6_sec5_open_tree_binds_host_device_node_in_userns",
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(OPEN_TREE_CHILD_ENV, "1");

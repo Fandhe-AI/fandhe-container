@@ -5398,7 +5398,7 @@ mod tests {
                 "--exact",
                 "exec::bind_mounts::tests::sec1_2536_protected_root_on_real_overlay",
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(INNER_ENV, "1")

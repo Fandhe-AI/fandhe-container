@@ -333,7 +333,12 @@ fn wait_plugin_pids(dir: &Path) -> PluginPids {
 fn run_case(sig_name: &str, sig_num: i32) {
     let dir = TempDir::new();
     let parent = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .args([
+            "--exact",
+            "parent_entry",
+            "--test-threads=1",
+            "--no-capture",
+        ])
         .env(ROLE_ENV, "parent")
         .env(DIR_ENV, &dir.0)
         .stdin(Stdio::null())
@@ -418,7 +423,12 @@ fn run_direct_case_with(sig_num: i32, ignore_hup: bool) {
         Command::new(std::env::current_exe().unwrap())
     };
     let parent = cmd
-        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .args([
+            "--exact",
+            "parent_entry",
+            "--test-threads=1",
+            "--no-capture",
+        ])
         .env(ROLE_ENV, "parent")
         .env(DIRECT_ENV, "1")
         .env(DIR_ENV, &dir.0)
@@ -496,7 +506,12 @@ fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
     let parent = Command::new("sh")
         .args(["-c", "trap '' HUP; exec \"$0\" \"$@\""])
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .args([
+            "--exact",
+            "parent_entry",
+            "--test-threads=1",
+            "--no-capture",
+        ])
         .env(ROLE_ENV, "parent")
         .env(DIR_ENV, &dir.0)
         .stdin(Stdio::null())
@@ -551,7 +566,12 @@ fn plug7_sighup_forward_is_observable_when_ignored_at_startup() {
 fn plug7_forked_child_before_exec_does_not_forward() {
     let dir = TempDir::new();
     let parent = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .args([
+            "--exact",
+            "parent_entry",
+            "--test-threads=1",
+            "--no-capture",
+        ])
         .env(ROLE_ENV, "parent")
         .env(FORK_ENV, "1")
         .env(DIR_ENV, &dir.0)

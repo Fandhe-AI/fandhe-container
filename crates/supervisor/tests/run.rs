@@ -79,7 +79,7 @@ fn container_command(go: &Path, exit_code: i32) -> Command {
         "--exact",
         "child_container_role",
         "--test-threads=1",
-        "--nocapture",
+        "--no-capture",
     ])
     .env(ENV_GO, go)
     .env(ENV_EXIT, exit_code.to_string())
@@ -440,7 +440,7 @@ mod linux {
                 "--exact",
                 "linux::child_supervisor_role",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(ENV_ROOT, &root)
             .env(ENV_ID, "c1")

@@ -11,7 +11,7 @@
 //!   期限つきで受け、受けた 1 バイトをそのまま返し続ける。EOF で `served` 行を出して終了する
 //! - `--client <ip:port> [--rounds N] [--warmup W]`: 接続して W 回のウォームアップの後 N 回を計り、
 //!   結果を 1 行 JSON（`schema` = `fandhe-container.tcp-rtt/v1`、単位 us）で出す
-//! - 先頭が上記以外（引数なし・`--nocapture`・試験名フィルタ等）: loopback の自己試験（成功行 `tcp_rtt_probe: self-test passed (NET-3)`）
+//! - 先頭が上記以外（引数なし・`--no-capture`〔旧綴り `--nocapture` も同じ〕・試験名フィルタ等）: loopback の自己試験（成功行 `tcp_rtt_probe: self-test passed (NET-3)`）
 //!
 //! # 契約
 //!
@@ -383,7 +383,7 @@ fn is_probe_mode(args: &[String]) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // probe モードは先頭が `--serve` / `--client` のときだけ。それ以外（Cargo が足す `--nocapture`・
+    // probe モードは先頭が `--serve` / `--client` のときだけ。それ以外（Cargo が足す `--no-capture`（旧綴り `--nocapture` も）・
     // `--ignored`・試験名フィルタ等）は無視して自己試験を実行する（兄弟の dns_helper_process と同じ）。
     // `--list`（libtest 互換の列挙）は列挙する試験名が無いので何も出さず成功する。
     if args.iter().any(|a| a == "--list") {
@@ -471,7 +471,8 @@ fn net3_json_line() {
 fn net3_args() {
     // Cargo が足しうる引数は probe モードにしない（自己試験を実行する）。
     for a in [
-        &["--nocapture"][..],
+        &["--no-capture"][..],
+        &["--nocapture"],
         &["--ignored"],
         &["some_filter"],
         &["--bogus", "x"],

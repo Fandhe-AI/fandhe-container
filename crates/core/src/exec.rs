@@ -3426,7 +3426,7 @@ mod tests {
             .args([
                 "--exact",
                 "exec::tests::core6_sec5_standalone_keeps_non_dumpable_caller",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(MARK, "1")

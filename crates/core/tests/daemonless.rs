@@ -286,7 +286,7 @@ mod linux {
 
     fn role_command(nonce: &str, test: &str) -> Command {
         let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
-        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        cmd.args(["--exact", test, "--test-threads=1", "--no-capture"])
             .env(PROBE, nonce)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

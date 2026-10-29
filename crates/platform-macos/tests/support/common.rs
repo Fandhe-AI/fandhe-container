@@ -9,8 +9,8 @@
 //!
 //! 取り込み規約: 取り込み側は `#[path = "support/common.rs"] mod common;` とトップレベルで宣言する
 //! （`vm_guest.rs`・`virtiofs_harness.rs` が `super::common` を参照するため。守られなければコンパイルエラー）。
-//! 各 `tests/*.rs` は別 crate なので、未使用の項目は取り込み側の `mod common;` に理由付きの
-//! `allow(dead_code)` を付けて許容する（項目単位では付けない。他の取り込み側の検出を消さないため）。
+//! 各 `tests/*.rs` は別 crate なので、取り込み側によって未使用になる関数には、
+//! その関数にだけ理由付きの `allow(dead_code)` を付ける（`mod common;` 全体には付けない）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,10 @@ impl Scratch {
 
     /// 0600 のファイルを作る（unix のみ）。
     #[cfg(unix)]
+    #[allow(
+        dead_code,
+        reason = "取り込み側の試験 target によっては使わない（各 tests/*.rs は別 crate）"
+    )]
     pub fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let p = self.dir.join(name);
@@ -71,11 +75,19 @@ impl Drop for Scratch {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "取り込み側の試験 target によっては使わない（各 tests/*.rs は別 crate）"
+)]
 /// 環境変数をパスとして読む。未設定なら `None`。
 pub fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
+#[allow(
+    dead_code,
+    reason = "取り込み側の試験 target によっては使わない（各 tests/*.rs は別 crate）"
+)]
 /// 末尾 `max` バイトを（不正な UTF-8 は置換して）文字列にする。失敗時の診断出力用。
 pub fn tail_lossy(bytes: &[u8], max: usize) -> String {
     let start = bytes.len().saturating_sub(max);

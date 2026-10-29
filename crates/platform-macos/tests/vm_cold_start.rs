@@ -30,10 +30,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 // 利用箇所は macOS 限定の実 VM 試験だけなので、宣言自体を macOS に限る（dead_code の抑止を使わない）。
-#[allow(
-    dead_code,
-    reason = "vm_cold_start は Scratch::new・resolve_secs と、macOS では vm_guest 経由の env_path だけを使う"
-)]
 #[path = "support/common.rs"]
 mod common;
 #[cfg(target_os = "macos")]

@@ -149,9 +149,11 @@ mod linux {
                 break st;
             }
             if Instant::now() >= deadline {
-                let _ = c.kill();
-                let _ = c.wait();
-                return Err("child did not exit within the timeout".into());
+                return Err(reap_after_kill(
+                    &mut c,
+                    "unshare child",
+                    "child did not exit within the timeout",
+                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -186,6 +188,24 @@ mod linux {
         println!("network_recorded_lifecycle_privileged: guard selftest ok");
     }
 
+    /// kill 後に有限の期限（5 秒）で `try_wait` により回収する。回収できなければ失敗を文言に足す。
+    /// 無期限の `wait()` は D 状態の子で launcher を止め、一時領域の回収にも届かなくなるため使わない。
+    fn reap_after_kill(c: &mut std::process::Child, what: &str, msg: &str) -> String {
+        // 既に終了済みなら kill は Err になりうるため、成否は回収（try_wait）で判定する。
+        let _ = c.kill();
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match c.try_wait() {
+                Ok(Some(_)) => return msg.to_owned(),
+                Ok(None) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => return format!("{msg}; {what} was not reaped within 5s after SIGKILL"),
+                Err(x) => return format!("{msg}; {what} try_wait after kill failed: {x}"),
+            }
+        }
+    }
+
     /// 期限つきで外部コマンドを実行し、標準出力を返す（失敗は標準エラー）。
     fn run(program: &str, args: &[&str]) -> Result<String, String> {
         let mut c = Command::new(program)
@@ -201,9 +221,11 @@ mod linux {
                 break;
             }
             if Instant::now() >= deadline {
-                let _ = c.kill();
-                let _ = c.wait();
-                return Err(format!("{program} timed out"));
+                return Err(reap_after_kill(
+                    &mut c,
+                    program,
+                    &format!("{program} timed out"),
+                ));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -237,9 +259,14 @@ mod linux {
         println!("{OK_LINE}");
     }
 
-    /// `ip -o link show <name>` の 1 行。存在しなければ `None`。
-    fn link_line(name: &str) -> Option<String> {
-        run("ip", &["-o", "link", "show", name]).ok()
+    /// `ip -o link show <name>` の 1 行。デバイス不在（`does not exist`）だけを `None` とし、
+    /// spawn 失敗・期限超過・その他の異常は `Err` で伝播する（照会失敗を不存在と誤認しない）。
+    fn link_line(name: &str) -> Result<Option<String>, String> {
+        match run("ip", &["-o", "link", "show", name]) {
+            Ok(l) => Ok(Some(l)),
+            Err(x) if x.contains("does not exist") => Ok(None),
+            Err(x) => Err(format!("ip link show {name}: {x}")),
+        }
     }
 
     /// 行から `alias <値>` を取り出す。
@@ -316,7 +343,7 @@ mod linux {
             {
                 return Err("table handle or userdata differs from the record".into());
             }
-            let line = link_line(&bridge).ok_or("bridge is missing")?;
+            let line = link_line(&bridge)?.ok_or("bridge is missing")?;
             if alias_of(&line).as_deref() != Some(created.bridge_token.as_str()) {
                 return Err(format!("bridge alias is not the token: {line}"));
             }
@@ -362,7 +389,7 @@ mod linux {
                 {
                     return Err(format!("member record differs for {}", mid.as_str()));
                 }
-                let line = link_line(a.host_veth.as_str()).ok_or("host veth is missing")?;
+                let line = link_line(a.host_veth.as_str())?.ok_or("host veth is missing")?;
                 if alias_of(&line).as_deref() != Some(a.host_token.as_str())
                     || !line.contains(&format!("master {bridge}"))
                     || !line.contains("UP")
@@ -415,7 +442,7 @@ mod linux {
             if members.iter().any(|m| m.id() == &mid) {
                 return Err("detached member record remains".into());
             }
-            if link_line(&veth).is_some() || pin.exists() {
+            if link_line(&veth)?.is_some() || pin.exists() {
                 return Err("veth or pin remains after detach".into());
             }
             if dnat_count(table.as_str(), "dport 8091")? != 0 {
@@ -423,7 +450,7 @@ mod linux {
             }
             if let Some((sid, sveth, spin)) = sibling
                 && (!members.iter().any(|m| m.id() == &sid)
-                    || link_line(&sveth).is_none()
+                    || link_line(&sveth)?.is_none()
                     || !spin.exists())
             {
                 return Err("sibling record, veth or pin was removed by detach".into());
@@ -448,7 +475,7 @@ mod linux {
         if rc.create.is_some() || !rc.attach.is_empty() {
             return Err("pending-reclaim is not empty after delete".into());
         }
-        if link_line(&bridge).is_some() {
+        if link_line(&bridge)?.is_some() {
             return Err("bridge remains after delete".into());
         }
         match nft.table_info(&TableGet::new(NftFamily::Ipv4, table), t) {

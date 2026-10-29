@@ -1772,7 +1772,7 @@ mod linux {
         }
     }
 
-    /// 他者のテーブル（nat の postrouting に masquerade とカウンタ）を `nft` コマンドで作って退避する。
+    /// 他者のテーブル（nat の postrouting に masquerade と return。counter は packet / byte 属性がパケットで変化し厳密比較が間欠失敗するため使わない）を `nft` コマンドで作って退避する。
     fn foreign_table_setup(nft: &NetlinkNetfilterSocket, t: Duration) -> Result<Foreign, NetError> {
         run_cmd("nft", &["add", "table", "ip", FOREIGN_TABLE])?;
         run_cmd(
@@ -1799,7 +1799,14 @@ mod linux {
         )?;
         run_cmd(
             "nft",
-            &["add", "rule", "ip", FOREIGN_TABLE, "postrouting", "counter"],
+            &[
+                "add",
+                "rule",
+                "ip",
+                FOREIGN_TABLE,
+                "postrouting",
+                "ip saddr 198.51.100.0/24 return",
+            ],
         )?;
         let snap = Foreign::snapshot(nft, t)?;
         if snap.rules.len() != 2 {

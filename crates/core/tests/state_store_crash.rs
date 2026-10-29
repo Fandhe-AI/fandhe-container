@@ -26,6 +26,10 @@
 //! 本試験は Linux のみで実行する。
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -58,7 +62,14 @@ mod linux {
     }
 
     /// テスト用一時ディレクトリ（drop で削除。0700）。
-    struct TmpDir(PathBuf);
+    ///
+    /// `ScratchDir` の子（親は共有 flock を持つため親を渡さない）。pid だけの名前を先に消す旧方式の置き換え
+    /// （#3434・REPAIR-12）。
+    struct TmpDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new() -> Self {
@@ -66,20 +77,15 @@ mod linux {
         }
 
         fn named(prefix: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
+            let scratch =
+                crate::scratch_root::ScratchDir::new(prefix, std::time::Duration::from_secs(10));
+            let p = scratch.path().join("d");
+            fs::create_dir(&p).unwrap();
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
             }
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            Self(p, scratch)
         }
     }
 

@@ -58,8 +58,6 @@
 //!   `members-intent/*` の照合は `network::reconcile` が Linux ラッパーの先頭で行う（#3346）
 //! - 同じ boot で network namespace だけ違う記録の detach（資源が別 namespace で生きうる。手動回収）
 //! - `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
-//! - 受け口を特定できない保持（`members-intent/*`・ルールの一覧を持たない quarantine の請求書）の `PortRegistry` への
-//!   登録。残った DNAT は公開時のカーネル dump（`ensure_no_listener_conflict`）が検出する（下記）
 //!
 //! # 再起動後の PortRegistry の組み直し（NET-3・REPAIR-4・REPAIR-5・#3362）
 //! `rebuild_port_registry_recorded` が、全ネットワークのメンバー記録の `publish` 行（Active・解除中・墓標のすべて）と、
@@ -75,11 +73,22 @@
 //! - 登録しすぎは安全側（新規公開を余分に断るだけ）、足りないと二重投入になる。迷えば登録する側に倒す
 //! - fail-closed: 読めない・食い違う記録、定義が壊れたネットワーク、別の持ち主が持つ同じ受け口、関数全体の失敗が
 //!   あれば `PortRegistry` に「不完全」の印を立て、印がある間は受け口を伴う新規の予約を拒否する
-//!   （`FailedPrecondition`）。解放系は止めない。完全に成功した呼び出しで印を外す。印は呼び出し側のメモリ上の値で、
-//!   共有ファイルを使う他プロセスの予約表には伝わらない（残余）
-//! - 残余: 受け口を特定できない保持（`members-intent/*`・ルールの一覧が無い quarantine の請求書）は登録できず、
-//!   `PortRegistryRebuild::unknown_port_holders` に数えるだけで不完全にはしない。残った DNAT は公開時のカーネル dump が
-//!   検出する。呼び出し側が本関数を呼ばない限り効果は無い（`PortRegistry::new()` の既定は未印のまま）
+//!   （`FailedPrecondition`）。解放系は止めない。完全に成功した呼び出しで印を外す
+//!
+//! ## 決めた契約（NET-3・REPAIR-4・REPAIR-5・#3433。挙動は変えず、扱いを固定する）
+//! - 受け口を特定できない保持（`members-intent/*`・ルールの一覧が無い quarantine の請求書）は登録しない。
+//!   `PortRegistryRebuild::unknown_port_holders` に数えるだけで不完全にもしない。FCMIN1 も v1 の請求書も受け口を
+//!   持たず登録の材料が無い。残った DNAT は `fandhe_net_*` テーブルの静的なルールで、`PortRegistry::reserve` の
+//!   製品の呼び出し元（attach・attach 後の公開）はどれも直前にカーネル dump の照合
+//!   （`ensure_no_listener_conflict`）を通すため、同じ受け口の新規公開は `AlreadyExists` で断られる。不完全に
+//!   すると 1 件の取り残しで状態ルートの `-p` をすべて断つ。新しい `reserve` の呼び出し元を足すときもこの照合を必須とする
+//! - 不完全の印はプロセスごとの値で、他プロセスへ伝えない（共有ファイルにも載せない）。予約は DNAT の投入前に共有
+//!   ファイルへ書くため、共有ファイルがカーネルより遅れることは無い。印が表すのは「このプロセスが記録と照合しきれ
+//!   なかった」ことで、判定は記録だけで決まる。したがって `PortRegistry` を持つプロセスは、ストアを開いた後・最初の
+//!   `reserve` より前に、自分の予約表でそれぞれ本関数を 1 回呼ぶ。記録を直した後は各プロセスが組み直し直す
+//!   （再起動を含む）。呼び出し側（#3074・#3075）は `unknown_port_holders`・`broken`・`conflicts` を構造化ログに出す
+//! - 本関数を呼ばない限り効果は無い（`PortRegistry::new()` の既定は未印のまま）。組み直しの強制（型での拒否）や
+//!   印の共有ファイルへの記録（形式 v2）は、組み直さずに `reserve` する呼び出し元が必要になるまで採らない
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -1031,7 +1040,8 @@ pub struct PortRegistryRebuild {
     pub conflicts: usize,
     /// 読めない・食い違ったネットワーク（名前順）と分類。
     pub broken: Vec<(String, NetErrorCode)>,
-    /// 受け口を特定できない保持の数（`members-intent/*`・ルールの一覧が無い quarantine の請求書）。
+    /// 受け口を特定できない保持の数（`members-intent/*`・ルールの一覧が無い quarantine の請求書）。登録も不完全化も
+    /// しない。残った DNAT は公開前のカーネル dump が検出する（モジュール doc「決めた契約」・#3433）。
     pub unknown_port_holders: usize,
     /// `realized.intent` が残る（未照合の）ネットワーク数。
     pub unreconciled_networks: usize,
@@ -1041,6 +1051,7 @@ pub struct PortRegistryRebuild {
 
 impl PortRegistryRebuild {
     /// 予約表が記録と矛盾なく組み直せたか。偽なら `PortRegistry` に不完全の印が立っている。
+    /// `unknown_port_holders` は見ない（dump が防御する。#3433）。
     pub fn is_complete(&self) -> bool {
         self.broken.is_empty() && self.conflicts == 0
     }
@@ -3719,13 +3730,29 @@ mod tests {
         Result<Vec<PublishedPort>, crate::network::PublishPortsError>,
         u32,
     ) {
+        publish_from_c2_with_dump(
+            ports,
+            reg,
+            crate::network::listener_dump::PublishedListeners::default(),
+        )
+    }
+
+    /// [`publish_from_c2`] のカーネル側の dump を指定する版（#3433。残った DNAT を dump が検出する状況）。
+    fn publish_from_c2_with_dump(
+        ports: &[PortPublish],
+        reg: &mut PortRegistry,
+        dump: crate::network::listener_dump::PublishedListeners,
+    ) -> (
+        Result<Vec<PublishedPort>, crate::network::PublishPortsError>,
+        u32,
+    ) {
         let calls = std::cell::Cell::new(0u32);
         let r = crate::network::publish_ports_with(
             |_, _, _| {
                 calls.set(calls.get() + 1);
                 Ok(vec![(rule(5), rule(6))])
             },
-            || Ok(crate::network::listener_dump::PublishedListeners::default()),
+            || Ok(dump),
             &created(),
             &c2(),
             pfx([10, 0, 0, 3], 24),
@@ -4013,5 +4040,137 @@ mod tests {
         assert!(report.is_complete());
     }
 
+    /// 回収待ちの請求書（ルールの一覧なし）を 1 件保存する（#3433）。
+    fn save_quarantine_claim(g: &GlobalLockGuard<'_>, quarantine: bool) {
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        n.save_reclaim_attach(&super::super::FailedAttachClaim::for_test(
+            name(),
+            EndpointId::new("c1").unwrap(),
+            BRIDGE_TOKEN,
+            "0123456789abcdef0123456789abcdef",
+            true,
+            false,
+            quarantine,
+        ))
+        .unwrap();
+    }
+
+    /// NET-3・REPAIR-4・#3433（判断 1）: ルールの一覧を持たない quarantine の請求書は登録せず
+    /// `unknown_port_holders` に数えるだけで、不完全にしない。quarantine でない請求書は数えない（加算条件の固定）。
+    #[test]
+    fn net3_3433_rebuild_quarantine_claim_without_rules_is_counted_not_registered() {
+        for (quarantine, expected_unknown) in [(true, 1usize), (false, 0usize)] {
+            let t = Tmp::new("rebuild-quarantine");
+            let store = setup(&t);
+            let g = store.lock_global_exclusive().unwrap();
+            save_quarantine_claim(&g, quarantine);
+            let mut reg = PortRegistry::new();
+            let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+            assert_eq!(
+                (
+                    report.unknown_port_holders,
+                    report.registered,
+                    report.conflicts,
+                    reg.len()
+                ),
+                (expected_unknown, 0, 0, 0),
+                "quarantine={quarantine}"
+            );
+            assert!(report.is_complete() && !reg.is_incomplete());
+        }
+    }
+
+    /// NET-3・REPAIR-4・REPAIR-5・#3433（判断 1 の前提と fail-closed の向き）: 受け口不明の保持は予約表に載らないが、
+    /// 残った DNAT は公開前のカーネル dump が `AlreadyExists` で断り、投入しない。dump が空なら予約表だけでは検出しない。
+    /// `reserve` の前の dump を外す変更が入ると本試験が落ちる。
+    #[test]
+    fn net3_3433_unknown_holder_leftover_dnat_is_rejected_by_kernel_dump() {
+        let t = Tmp::new("unknown-holder-dump");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        save_quarantine_claim(&g, true);
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!((report.unknown_port_holders, reg.len()), (1, 0));
+        assert!(report.is_complete() && !reg.is_incomplete());
+        // 残った DNAT がカーネルに見える場合。
+        let (r, calls) = publish_from_c2_with_dump(
+            &[web_publish()],
+            &mut reg,
+            crate::network::listener_dump::PublishedListeners::from_ports_for_test(
+                &[web_publish()],
+            ),
+        );
+        let e = r.unwrap_err().error;
+        assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+        assert!(
+            e.to_string()
+                .contains("port listener is already published by a fandhe_net table in the kernel"),
+            "{e}"
+        );
+        assert_eq!((calls, reg.len()), (0, 0));
+        // 対照: dump が空なら予約表だけでは検出できず通る（防御は dump の層に依る）。
+        let (r, calls) = publish_from_c2(&[web_publish()], &mut reg);
+        r.unwrap();
+        assert_eq!((calls, reg.len()), (1, 1));
+    }
+
+    /// NET-3・REPAIR-4・REPAIR-5・#3433（判断 2）: 不完全の印はプロセスごとで、共有ファイルにも他プロセスの予約表にも
+    /// 伝わらない。印のあるプロセスは受け口を伴う予約を断ち続け、解放系は止まらない。各プロセスが自分で組み直すと
+    /// 同じ記録から同じ判定になる。
+    #[test]
+    fn net3_3433_incomplete_mark_is_per_process_and_not_shared() {
+        let t = Tmp::new("incomplete-per-process");
+        attach_published(&t);
+        let shared = t.0.join("ports.reg");
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut b = PortRegistry::with_shared_file(shared.clone());
+        assert!(
+            rebuild_port_registry_recorded(&g, &mut b)
+                .unwrap()
+                .is_complete()
+        );
+        assert!(!b.is_incomplete());
+        // メンバー記録を壊して A が組み直す。
+        let path = t.0.join("@networks/web/members/c1");
+        std::fs::write(&path, b"garbage").unwrap();
+        let mut a = PortRegistry::with_shared_file(shared.clone());
+        let report = rebuild_port_registry_recorded(&g, &mut a).unwrap();
+        assert_eq!(
+            report.broken,
+            vec![("web".to_owned(), NetErrorCode::DataLoss)]
+        );
+        assert!(a.is_incomplete());
+        assert_eq!(
+            a.reserve(&name(), &c2(), &[port_8081()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
+        // 印は B に伝わらず、共有の予約は B が通す。
+        assert!(!b.is_incomplete());
+        b.reserve(&name(), &c2(), &[port_8081()]).unwrap();
+        // その後も A は印が先に効いて断る。
+        assert_eq!(
+            a.reserve(&name(), &c2(), &[port_8081()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
+        // 共有ファイルの形式は変えていない。
+        let text = std::fs::read_to_string(&shared).unwrap();
+        assert_eq!(text.lines().next(), Some("fandhe-portreg v1"));
+        // 解放系は印があっても止まらない（共有ファイルの c2 の 8081 の 1 件）。
+        assert_eq!(a.release(&name(), &c2()).unwrap(), 1);
+        // B 自身が組み直しても同じ記録から同じ判定になる。
+        let report = rebuild_port_registry_recorded(&g, &mut b).unwrap();
+        assert_eq!(
+            report.broken,
+            vec![("web".to_owned(), NetErrorCode::DataLoss)]
+        );
+        assert!(b.is_incomplete());
+    }
     mod after_reboot_tests;
 }

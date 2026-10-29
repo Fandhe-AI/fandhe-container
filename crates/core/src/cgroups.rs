@@ -2051,21 +2051,19 @@ mod tests {
     }
 
     /// 一時ディレクトリ（std のみ）。drop で削除する。
-    struct TmpDir(std::path::PathBuf);
+    ///
+    /// pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    struct TmpDir(
+        std::path::PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new(label: &str) -> Self {
-            let p =
-                std::env::temp_dir().join(format!("fandhe-cgjoin-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let (scratch, p) =
+                crate::test_support::scratch_child(&format!("fandhe-cgjoin-{label}"), "d");
+            Self(p, scratch)
         }
     }
 

@@ -803,17 +803,22 @@ mod tests {
     }
 
     /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
+    ///
+    /// bundle は `ScratchDir` の子にする（親は Linux で共有 flock を持ち、`BundleLock` の排他 flock が失敗するため）。
+    /// pid だけの名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
     struct Bundle {
         dir: PathBuf,
+        _scratch: crate::scratch_root::ScratchDir,
     }
 
     impl Bundle {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-oci-create-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create bundle dir");
-            Self { dir }
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-oci-create-{name}"), "bundle");
+            Self {
+                dir,
+                _scratch: scratch,
+            }
         }
 
         fn write_config(&self, v: &Value) {
@@ -830,12 +835,6 @@ mod tests {
         }
     }
 
-    impl Drop for Bundle {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     fn valid_config() -> Value {
         json!({
             "ociVersion": "1.2.0",
@@ -846,6 +845,33 @@ mod tests {
                 "cwd": "/"
             }
         })
+    }
+
+    /// REPAIR-12・#3434: 旧方式の pid だけの名前の残骸（FIFO の `config.json`）があっても `Bundle::new` は別名の
+    /// bundle を作り、設定の書き込みと rootfs の検査が成功する。残骸に触れず、drop は自分のパスだけを消す。
+    #[cfg(unix)]
+    #[test]
+    fn repair12_3434_bundle_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-oci-create-legacy3434-{}", std::process::id()),
+            "config.json",
+        );
+        let b = ready_bundle("legacy3434");
+        assert_ne!(b.dir, residue.dir());
+        assert!(
+            std::fs::metadata(b.dir.join("config.json"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(check_rootfs(&b.dir, Path::new("rootfs")).is_ok());
+        residue.assert_untouched();
+        let path = b.dir.clone();
+        drop(b);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
     }
 
     fn ready_bundle(name: &str) -> Bundle {
@@ -1854,8 +1880,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oci7_check_rootfs_rejects_staging_dir_as_bundle() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci7-bundle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci7-bundle", "d");
         let staging = base.join(".fandhe-unpack-1-0");
         std::fs::create_dir_all(staging.join("sub")).expect("dirs");
         for root in [".", "sub"] {
@@ -1869,6 +1895,5 @@ mod tests {
         let ok = base.join("bundle");
         std::fs::create_dir_all(&ok).expect("ok");
         assert!(check_rootfs(&ok, Path::new(".")).is_ok());
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

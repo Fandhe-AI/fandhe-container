@@ -690,12 +690,9 @@ fn classify_unpopulated_removal(result: Result<(), CgroupError>) -> ChildDisposi
 mod tests {
     use super::*;
 
-    fn tmp(label: &str) -> std::path::PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("fandhe-execkill-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-execkill-{label}"), "d")
     }
 
     /// SUP-6・TASK-163 追補: 子 cgroup 名は `exec-` 接頭辞と `[a-z0-9-]` だけを通す。
@@ -746,7 +743,7 @@ mod tests {
     /// SUP-6・TASK-163 追補: `cgroup.kill` へ `1`、`cgroup.procs` へ `0` が書かれる。
     #[test]
     fn sup6_kill_and_join_write_expected_bytes() {
-        let d = tmp("write");
+        let (_scratch, d) = tmp("write");
         std::fs::write(d.join("cgroup.procs"), "").unwrap();
         std::fs::write(d.join("cgroup.kill"), "").unwrap();
         let fds =
@@ -758,18 +755,16 @@ mod tests {
             "0"
         );
         assert_eq!(std::fs::read_to_string(d.join("cgroup.kill")).unwrap(), "1");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・TASK-163 追補: `cgroup.kill` が無い（Linux 5.14 未満）構成は `Unimplemented` で拒否する（fail-closed）。
     #[test]
     fn sup6_missing_cgroup_kill_is_unimplemented() {
-        let d = tmp("nokill");
+        let (_scratch, d) = tmp("nokill");
         std::fs::write(d.join("cgroup.procs"), "").unwrap();
         let err = ExecChildCgroupFds::from_dir_for_test(OwnedFd::from(File::open(&d).unwrap()))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unimplemented);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・#1596: 持ち主 pid の解析は `exec-<u32>-<u64>` の厳密な形だけを通す。
@@ -793,26 +788,25 @@ mod tests {
     }
 
     /// 列挙の試験用に、検証を通る名前・通らない名前・symlink・通常ファイルを混在させる。
-    fn mixed_dir(label: &str) -> std::path::PathBuf {
-        let d = tmp(label);
+    fn mixed_dir(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        let (_scratch, d) = tmp(label);
         for dir in ["exec-1-1", "exec_1", "fc-x@1", "exec-..", "exec-A"] {
             std::fs::create_dir(d.join(dir)).unwrap();
         }
         std::fs::write(d.join("cgroup.procs"), "").unwrap();
         std::fs::write(d.join("exec-2-2"), "").unwrap();
         std::os::unix::fs::symlink(d.join("exec-1-1"), d.join("exec-3-3")).unwrap();
-        d
+        (_scratch, d)
     }
 
     /// SUP-6・#1596: 列挙は名前の検証を通ったものだけを返す（`exec-` で始まらない・不正文字は除く）。
     #[test]
     fn sup6_list_exec_child_names_returns_only_valid_names() {
-        let d = mixed_dir("list");
+        let (_scratch, d) = mixed_dir("list");
         let fd = OwnedFd::from(File::open(&d).unwrap());
         let (names, truncated) = list_exec_child_names(fd.as_fd()).unwrap();
         assert_eq!(names, ["exec-1-1", "exec-2-2", "exec-3-3"]);
         assert!(!truncated);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・SEC-1・#1596: 名前の検証を通っても cgroup2 でない・symlink・通常ファイルには触れず、
@@ -820,7 +814,7 @@ mod tests {
     #[test]
     fn sup6_sweep_does_not_touch_non_cgroup_entries() {
         for mode in [SweepMode::KillAll, SweepMode::UnpopulatedOnly] {
-            let d = mixed_dir("sweepmix");
+            let (_scratch, d) = mixed_dir("sweepmix");
             let fd = OwnedFd::from(File::open(&d).unwrap());
             let deadline = Instant::now() + Duration::from_millis(50);
             let recorder = OpRecorder::new();
@@ -854,7 +848,6 @@ mod tests {
                     "{kept} must remain ({mode:?})"
                 );
             }
-            let _ = std::fs::remove_dir_all(&d);
         }
     }
 
@@ -904,7 +897,7 @@ mod tests {
     /// SUP-6・REPAIR-5・#1596: 候補が上限を超えたら上限件数までを返し、打ち切りを示す。
     #[test]
     fn sup6_list_exec_child_names_truncates_at_limit() {
-        let d = tmp("trunc");
+        let (_scratch, d) = tmp("trunc");
         for n in 0..=EXEC_SWEEP_CANDIDATE_LIMIT {
             std::fs::create_dir(d.join(format!("exec-{n}-0"))).unwrap();
         }
@@ -912,7 +905,6 @@ mod tests {
         let (names, truncated) = list_exec_child_names(fd.as_fd()).unwrap();
         assert_eq!(names.len(), EXEC_SWEEP_CANDIDATE_LIMIT);
         assert!(truncated);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// REPAIR-4・SUP-6・#1596: 空と読んだ後の削除結果の分類。カーネルの `EBUSY` / `ENOTEMPTY`（`Cleanup` 段の
@@ -985,7 +977,7 @@ mod tests {
     #[test]
     fn oci6_sweep_of_removed_container_reports_zero_stale_children() {
         for mode in [SweepMode::KillAll, SweepMode::UnpopulatedOnly] {
-            let d = tmp("gone");
+            let (_scratch, d) = tmp("gone");
             std::fs::create_dir(d.join("exec-1-1")).unwrap();
             let fd = OwnedFd::from(File::open(&d).unwrap());
             std::fs::remove_dir_all(&d).unwrap();
@@ -999,11 +991,10 @@ mod tests {
     /// OCI-6・#1596: 生きているコンテナ cgroup（`cgroup.events` が開ける）は削除済みとみなさない。
     #[test]
     fn oci6_live_container_is_not_treated_as_removed() {
-        let d = tmp("live");
+        let (_scratch, d) = tmp("live");
         std::fs::write(d.join("cgroup.events"), "populated 0\n").unwrap();
         let fd = OwnedFd::from(File::open(&d).unwrap());
         assert!(!container_removed(fd.as_fd()));
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// OCI-6・CORE-2・SUP-6・#1596: `KillAll` はコンテナ cgroup 自身の `cgroup.procs` が空でなければ何も
@@ -1011,7 +1002,7 @@ mod tests {
     /// `UnpopulatedOnly` はこの前提を持たない。
     #[test]
     fn oci6_kill_all_refuses_while_container_cgroup_has_processes() {
-        let d = tmp("running");
+        let (_scratch, d) = tmp("running");
         std::fs::write(d.join("cgroup.procs"), "4242\n").unwrap();
         std::fs::create_dir(d.join("exec-1-1")).unwrap();
         let fd = OwnedFd::from(File::open(&d).unwrap());
@@ -1036,14 +1027,13 @@ mod tests {
         assert_eq!(stopped.failed, 1);
         assert_eq!(stopped.first_error, Some(ErrorCode::FailedPrecondition));
         assert!(d.join("exec-1-1").is_dir());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・TASK-163 追補: 存在しない子 cgroup の後始末は `Absent`（冪等）。cgroup2 でない場所の同名
     /// ディレクトリは cgroup2 検証で拒否し、消さない。
     #[test]
     fn sup6_remove_rejects_non_cgroup2_directory() {
-        let d = tmp("remove");
+        let (_scratch, d) = tmp("remove");
         std::fs::create_dir(d.join("exec-1-1")).unwrap();
         let parent = OwnedFd::from(File::open(&d).unwrap());
         let err =
@@ -1054,6 +1044,5 @@ mod tests {
         let absent =
             remove_exec_child_cgroup_at(parent.as_fd(), "exec-1-2", Duration::from_millis(10));
         assert_eq!(absent.unwrap(), ExecChildRemoval::Absent);
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -205,7 +205,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     panic!("purge child timed out");
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
@@ -261,7 +261,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     panic!("populate child timed out");
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),

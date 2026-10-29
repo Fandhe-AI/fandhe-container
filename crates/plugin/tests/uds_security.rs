@@ -413,7 +413,7 @@ mod unix {
         let fifo = d.path().join("s.sock.lock");
         let mut mkfifo = std::process::Command::new("mkfifo");
         mkfifo.arg(&fifo);
-        let st = crate::reap::run_within(&mut mkfifo, crate::reap::REAP_WITHIN)
+        let st = crate::reap::run_within(&mut mkfifo, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("mkfifo at lock name: {e}"));
         assert!(st.success());
         let (tx, rx) = std::sync::mpsc::channel();

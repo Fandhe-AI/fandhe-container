@@ -16,6 +16,10 @@
 mod reap;
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Read;
@@ -107,13 +111,11 @@ mod linux {
     /// （`TIMEOUT` 0 件）、最大待ちが `STATE_LOCK_TIMEOUT` の半分未満に収まる。連続側も進む。
     #[test]
     fn sup1_repair5_2229_tight_loop_writer_does_not_starve_other_process() {
-        let dir = std::env::temp_dir().join(format!("fandhe-lock-fair-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir`（0700）を使う。状態ルートはその子 `state`
+        // （親は共有 flock を持つため親を渡さない）。#3434・REPAIR-12。
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-lock-fair", Duration::from_secs(10));
+        let dir = scratch.path().to_path_buf();
         let root = dir.join("state");
         fs::create_dir(&root).unwrap();
         {
@@ -167,7 +169,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 let mut buf = String::new();
                 let _ = fs::File::open(&log)
                     .unwrap()
@@ -197,7 +199,6 @@ mod linux {
             pct(50),
             pct(99)
         );
-        let _ = fs::remove_dir_all(&dir);
 
         assert!(
             other_failures.is_empty(),

@@ -962,9 +962,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sec4_2027_probe_append_fails_while_locked_elsewhere() {
-        let dir = std::env::temp_dir().join(format!("fc-probe-append-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-append", "d");
         // 確認用の一時ファイルは信頼検査済みの親に作る(umask に依らず 0700 にする)。
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
@@ -1010,7 +1008,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(inherited);
         drop(file);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・#2027: 継承したファイルサイズ制限に 1 レコード分の余地が無ければ失敗し、あれば(無制限を含め)通る。
@@ -1031,9 +1028,7 @@ mod tests {
     #[test]
     fn sec4_2027_probe_reads_inherited_fsize_limit() {
         let (soft, _) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize).unwrap();
-        let dir = std::env::temp_dir().join(format!("fc-probe-fsize-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-fsize", "d");
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1042,7 +1037,6 @@ mod tests {
         // 現在の制限で、空のログには余地がある(無制限または十分大きい)ことだけを確かめる。
         assert_eq!(w.check_fsize_room().is_ok(), fits_fsize_limit(0, soft));
         w.probe_append().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・REPAIR-5・#2027: 書き込み確認の一時ファイルは名前を持たない(`O_TMPFILE`)。開いている間もディレクトリには
@@ -1052,9 +1046,7 @@ mod tests {
     fn sec4_repair5_probe_scratch_is_unnamed_while_open() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fc-probe-tmpfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-tmpfile", "d");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         match open_unnamed_scratch(&dir) {
             Ok(mut scratch) => {
@@ -1065,7 +1057,6 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), AuditWriteErrorKind::Unsupported),
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・REPAIR-5・#2027: 確認(`probe_append`)は共有ログを巻き戻さない。確認の前後で長さは変わらず(減らず)、
@@ -1074,9 +1065,7 @@ mod tests {
     #[test]
     fn sec4_repair5_probe_never_rewinds_shared_log() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fc-probe-mono-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-mono", "d");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("audit.log");
         let mut w = AuditFileWriter::open(&path).unwrap();
@@ -1099,7 +1088,6 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["audit.log".to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use super::*;
@@ -1625,7 +1613,7 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_no_blank_line_when_tail_is_lf() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("nolf");
+        let (_scratch, dir) = fresh_dir("nolf");
         let path = dir.join("audit.log");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1646,7 +1634,7 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_reopen_isolates_torn_tail() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("torn");
+        let (_scratch, dir) = fresh_dir("torn");
         let path = dir.join("audit.log");
         std::fs::write(&path, b"{\"torn\":").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1662,24 +1650,50 @@ mod tests {
         let got = std::fs::read_to_string(&path).unwrap();
         let line = text(&sample());
         assert_eq!(got, format!("{{\"torn\":\n{line}{line}"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
-    fn fresh_dir(tag: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fandhe-auditw-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+    fn fresh_dir(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-auditw-{tag}"), "d")
+    }
+
+    /// REPAIR-12・#3434: 旧方式の pid だけの名前の残骸（FIFO を含む）があっても `fresh_dir` は別名の空の
+    /// ディレクトリを使って書き込みに成功し、残骸に触れない。drop は自分のパスだけを消す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair12_3434_fresh_dir_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-auditw-legacy3434-{}", std::process::id()),
+            "audit.log",
+        );
+        let (scratch, dir) = fresh_dir("legacy3434");
+        assert_ne!(dir, residue.dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let mut w = AuditFileWriter::open(&dir.join("audit.log")).unwrap();
+        w.write_record(&sample()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        residue.assert_untouched();
+        drop(w);
+        drop(scratch);
+        assert_eq!(
+            std::fs::symlink_metadata(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
     }
 
     /// SEC-4・TASK-41.5.1: 親ディレクトリが symlink なら拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_symlinked_parent() {
-        let dir = fresh_dir("symparent");
+        let (_scratch, dir) = fresh_dir("symparent");
         let real = dir.join("real");
         std::fs::create_dir(&real).unwrap();
         let link = dir.join("link");
@@ -1687,7 +1701,6 @@ mod tests {
         let e = AuditFileWriter::open(&link.join("audit.log")).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::Open);
         assert!(!real.join("audit.log").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: group/other が書き込める親ディレクトリは拒否する。
@@ -1695,20 +1708,19 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_rejects_world_writable_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("wwparent");
+        let (_scratch, dir) = fresh_dir("wwparent");
         let parent = dir.join("p");
         std::fs::create_dir(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
         let e = AuditFileWriter::open(&parent.join("audit.log")).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: 他パスへのハードリンクになっている既存ファイルは拒否し、内容を改変しない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_hardlinked_file() {
-        let dir = fresh_dir("hardlink");
+        let (_scratch, dir) = fresh_dir("hardlink");
         let secret = dir.join("secret");
         std::fs::write(&secret, b"top-secret\n").unwrap();
         std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -1718,14 +1730,13 @@ mod tests {
         let e = AuditFileWriter::open(&audit).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
         assert_eq!(std::fs::read(&secret).unwrap(), b"top-secret\n");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: 既存の非通常ファイル（FIFO）は open せず NotRegularFile で拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_fifo_without_opening() {
-        let dir = fresh_dir("fifo");
+        let (_scratch, dir) = fresh_dir("fifo");
         let fifo = dir.join("audit.fifo");
         // unsafe を避けるため mkfifo(1) で作る（coreutils。無ければテスト環境不備として失敗させる）。
         let st = std::process::Command::new("mkfifo")
@@ -1735,7 +1746,6 @@ mod tests {
         assert!(st.success());
         let e = AuditFileWriter::open(&fifo).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::NotRegularFile);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TASK-41.5.1: 正当な非 UTF-8 ファイル名（Linux）でも開ける。
@@ -1743,13 +1753,12 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_accepts_non_utf8_file_name() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = fresh_dir("nonutf8");
+        let (_scratch, dir) = fresh_dir("nonutf8");
         let path = dir.join(std::ffi::OsStr::from_bytes(b"audit-\xff.log"));
         let mut w = AuditFileWriter::open(&path).unwrap();
         w.write_record(&sample()).unwrap();
         drop(w);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text(&sample()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ERR-4: ロック I/O 失敗はタイムアウトと区別され、Timeout コードにならない。
@@ -1766,7 +1775,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_concurrent_writers_do_not_interleave() {
-        let dir = fresh_dir("concurrent");
+        let (_scratch, dir) = fresh_dir("concurrent");
         let path = dir.join("audit.log");
         let long = format!("/{}", "a".repeat(3000));
         let handles: Vec<_> = (0..4)
@@ -1800,7 +1809,6 @@ mod tests {
                 "{l}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5・#1703: 解放直後に取り直す書き手より、先に並んだ待ち手が先に順番を得る。
@@ -1839,7 +1847,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_1703_queue_deadline_returns_lock_and_removes_ticket() {
-        let dir = fresh_dir("queue-deadline");
+        let (_scratch, dir) = fresh_dir("queue-deadline");
         let path = dir.join("audit.log");
         let queue = TurnQueue::new();
         let holder = queue
@@ -1854,14 +1862,13 @@ mod tests {
         assert_eq!(queue.len(), 1);
         drop(holder);
         assert_eq!(queue.len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5・#1703: 保持者が解放済みで期限切れの待ち手が先頭になった場合は拒否し、チケットを残さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_1703_expired_waiter_at_front_is_rejected() {
-        let dir = fresh_dir("queue-expired-front");
+        let (_scratch, dir) = fresh_dir("queue-expired-front");
         let path = dir.join("audit.log");
         let queue = TurnQueue::new();
         let w = AuditFileWriter::open(&path).unwrap();
@@ -1873,7 +1880,6 @@ mod tests {
         let err = w.lock_exclusive(&queue, past).err().unwrap();
         assert_eq!(err.kind, AuditWriteErrorKind::Lock);
         assert_eq!(queue.len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 全種別の代表レコード。ワイルドカード無しの match で、`AuditEvent` に種別を足すとここが落ちる。

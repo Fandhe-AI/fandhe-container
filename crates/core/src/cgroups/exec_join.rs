@@ -204,12 +204,9 @@ impl ExecJoinFds {
 mod tests {
     use super::*;
 
-    fn tmp(label: &str) -> std::path::PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("fandhe-execjoin-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-execjoin-{label}"), "d")
     }
 
     fn dir_fd(p: &std::path::Path) -> OwnedFd {
@@ -247,10 +244,33 @@ mod tests {
         }
     }
 
+    /// REPAIR-12・#3434: 旧方式の pid だけの名前の残骸（FIFO の `cgroup.procs`）があっても `tmp` は別名の空の
+    /// ディレクトリを返し、通常ファイルの `cgroup.procs` を置ける。残骸に触れず、drop は自分のパスだけを消す。
+    #[cfg(unix)]
+    #[test]
+    fn repair12_3434_tmp_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-execjoin-legacy3434-{}", std::process::id()),
+            "cgroup.procs",
+        );
+        let (scratch, d) = tmp("legacy3434");
+        assert_ne!(d, residue.dir());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        std::fs::write(d.join("cgroup.procs"), "").unwrap();
+        assert!(std::fs::metadata(d.join("cgroup.procs")).unwrap().is_file());
+        residue.assert_untouched();
+        drop(scratch);
+        assert_eq!(
+            std::fs::symlink_metadata(&d).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
+    }
+
     /// SUP-6・TASK-163.2: `cgroup.procs` へ自 PID を書いて読み戻し、自プロセスの cgroup 一覧を返す。
     #[test]
     fn sup6_task163_2_join_writes_own_pid_to_cgroup_procs() {
-        let d = tmp("ok");
+        let (_scratch, d) = tmp("ok");
         std::fs::write(d.join("cgroup.procs"), "").unwrap();
         std::fs::write(d.join("self"), "0::/a/b\n").unwrap();
         let fds = ExecJoinFds::from_parts_for_test(dir_fd(&d), File::open(d.join("self")).unwrap())
@@ -262,13 +282,12 @@ mod tests {
             std::fs::read_to_string(d.join("cgroup.procs")).unwrap(),
             std::process::id().to_string()
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・TASK-163.2: 読み戻しに自 PID が無い構成は成功扱いにしない（fail-closed）。
     #[test]
     fn sup6_task163_2_join_without_readback_is_failed_precondition() {
-        let d = tmp("noreadback");
+        let (_scratch, d) = tmp("noreadback");
         std::fs::write(d.join("cgroup.procs"), "").unwrap();
         std::fs::write(d.join("self"), "0::/a\n").unwrap();
         let fds = ExecJoinFds::from_parts_for_test(dir_fd(&d), File::open(d.join("self")).unwrap())
@@ -279,25 +298,23 @@ mod tests {
         let err = fds.join().unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.step, CgroupStep::JoinContainer);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・TASK-163.2: `cgroup.procs` が無いディレクトリは `NotFound`（段は `JoinContainer`）。
     #[test]
     fn sup6_task163_2_open_missing_procs_is_not_found() {
-        let d = tmp("missing");
+        let (_scratch, d) = tmp("missing");
         let err =
             ExecJoinFds::from_parts_for_test(dir_fd(&d), File::open("/proc/self/cgroup").unwrap())
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.step, CgroupStep::JoinContainer);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・SEC-1・TASK-163.2: `cgroup.procs` に対象 pid が載っているかを判定する。
     #[test]
     fn sup6_task163_2_contains_pid() {
-        let d = tmp("contains");
+        let (_scratch, d) = tmp("contains");
         std::fs::write(d.join("cgroup.procs"), "5\n123\n").unwrap();
         let fd = dir_fd(&d);
         assert!(contains_pid(&fd, 123).unwrap());
@@ -307,6 +324,5 @@ mod tests {
             contains_pid(&fd, 1).unwrap_err().code,
             ErrorCode::FailedPrecondition
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

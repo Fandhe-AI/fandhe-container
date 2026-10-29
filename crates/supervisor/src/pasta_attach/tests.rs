@@ -1556,3 +1556,18 @@ fn net9_launch_failure_without_attachment_reclaims_prepared_run_dir() {
     w.discard().expect("discard");
     assert_eq!(events(&ev), ["remove run_dir"]);
 }
+
+/// NET-9・SEC-4・REPAIR-4・#3431: 2c の期限超過の行は固定語彙(`result:"timeout"`・`stage` は 2 値)で、パスを含まない。
+#[test]
+fn net9_sec4_3431_timeout_line_is_fixed() {
+    let buf = PastaLogBuffer::new();
+    log_pasta_verify_timeout(&buf, "web1", Duration::from_millis(300), true);
+    log_pasta_verify_timeout(&buf, "web1", Duration::from_millis(300), false);
+    assert_eq!(
+        buf.take(),
+        vec![
+            "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":300,\"result\":\"timeout\",\"stage\":\"verify\"}\n".to_owned(),
+            "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":300,\"result\":\"timeout\",\"stage\":\"document\"}\n".to_owned(),
+        ]
+    );
+}

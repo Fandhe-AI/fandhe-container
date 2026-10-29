@@ -317,7 +317,7 @@ fn oci7_pull_in_another_process_is_listed_and_registrable() {
             break status;
         }
         if Instant::now() >= deadline {
-            reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+            reap::reap_or_report(&mut child, reap::reap_within());
             panic!("child pull did not finish in time");
         }
         std::thread::sleep(Duration::from_millis(20));

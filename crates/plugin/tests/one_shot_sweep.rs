@@ -101,14 +101,14 @@ mod unix {
         while !base.0.join(READY).exists() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("child did not become ready within {READY_WAIT:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         // unix の `kill` は SIGKILL。listener の後始末（drop）は走らない。
         child.kill().unwrap();
-        crate::reap::reap(&mut child, crate::reap::REAP_WITHIN).unwrap_or_else(|e| panic!("{e}"));
+        crate::reap::reap(&mut child, crate::reap::reap_within()).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// 期限つきの待ちの期限切れが、具体的なメッセージの `Err` として表に出ること、続く `reap` で

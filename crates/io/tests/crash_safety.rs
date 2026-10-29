@@ -947,7 +947,7 @@ mod other {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("crash_test_server must exit within the deadline");
             }
             std::thread::sleep(Duration::from_millis(20));

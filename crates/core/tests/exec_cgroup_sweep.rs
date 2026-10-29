@@ -147,8 +147,8 @@ mod linux {
         assert_eq!(counts("exec_cgroup_sweep_kill_all"), (1, 0));
         assert_eq!(counts("exec_cgroup_sweep_kill_all_child"), (2, 0));
         assert!(!container_dir.exists());
-        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::REAP_WITHIN) {
-            crate::reap::reap_or_report(&mut command, crate::reap::REAP_WITHIN);
+        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::reap_within()) {
+            crate::reap::reap_or_report(&mut command, crate::reap::reap_within());
             panic!("exec child did not exit after the cgroup sweep: {e}");
         }
         wait_until("all processes of D to be gone", || {

@@ -503,7 +503,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut joiner, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut joiner, crate::reap::reap_within());
                 panic!("joiner {joiner_flag} did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -864,7 +864,7 @@ mod linux {
         // PID 1 の単一スレッド前提を保つため、スレッドを立てない `run_within` を使う（REPAIR-5・#3409）。
         let mut mount = Command::new("mount");
         mount.args(["-n", "-t", "tmpfs", "tmpfs"]).arg(rootfs);
-        let mounted = crate::reap::run_within(&mut mount, crate::reap::REAP_WITHIN)
+        let mounted = crate::reap::run_within(&mut mount, crate::reap::reap_within())
             .unwrap_or_else(|e| panic!("run mount: {e}"));
         assert!(mounted.success(), "mount tmpfs over the rootfs directory");
         fs::create_dir(rootfs.join("proc")).expect("mkdir proc in the tmpfs rootfs");

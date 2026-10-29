@@ -1893,6 +1893,22 @@ mod tests {
         assert_eq!(fake.calls().len(), 1);
     }
 
+    /// NET-1・REPAIR-12・#3456: preflight の照会が復号の `DataLoss` で失敗しても、`Timeout` と同じく
+    /// 有無を判定できないので拒否する（何も消さない）。
+    #[test]
+    fn net1_3456_delete_preflight_dataloss_rejects() {
+        let (net, mut ipam, mut ports) = setup();
+        let _unpassed = attached(&mut ipam, "c1");
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.step, DeleteStep::Preflight);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
     /// NET-1・TASK-139.4: 渡されていない endpoint の veth が無ければ（quarantine 中のアドレス）、
     /// テーブルの削除後に IPAM と予約を解放する。
     #[test]
@@ -2177,6 +2193,63 @@ mod tests {
             );
             assert_eq!(ipam.allocated_count(), 1);
         }
+    }
+
+    /// NET-1・REPAIR-12・#3456: veth の所属照会が復号の `DataLoss`（重複 `IFLA_MASTER` 等。#3419）で
+    /// 失敗したら、所有を証明できないので `Unknown` で報告し、名前でも ifindex でも消さず pin も外さない。
+    /// アドレスと再試行の対象は保持する（fail-closed）。
+    #[test]
+    fn net1_3456_delete_veth_attachment_dataloss_is_unknown() {
+        let (net, mut ipam, mut ports) = setup();
+        let c1 = attached(&mut ipam, "c1");
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Present),
+                (
+                    DeleteResource::Bridge(net.bridge.clone()),
+                    ResourceState::Present
+                )
+            ]
+        );
+        let calls = fake.calls();
+        assert!(calls.contains(&format!("link_attachment {}", host_of("c1").as_str())));
+        assert!(!calls.iter().any(|c| c.starts_with("delete_link")));
+        assert!(!calls.iter().any(|c| c.starts_with("unpin_path")));
+        assert_eq!(ipam.allocated_count(), 1);
+        assert_eq!(e.retry.len(), 1);
+    }
+
+    /// NET-1・REPAIR-12・#3456: attach の取り残しの回収でも、veth の所属照会の `DataLoss` は
+    /// `Unknown` で報告し、veth を消さず、veth の消失を確認できないので netns の pin も外さない。
+    #[test]
+    fn net1_3456_reclaim_veth_attachment_dataloss_is_unknown() {
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(true, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.error.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Unknown),
+            ]
+        );
+        assert!(e.report.removed.is_empty());
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
     }
 
     /// NET-1・TASK-139.4: unpin の失敗は pin パスを `Present` で報告し、アドレスは保持する。

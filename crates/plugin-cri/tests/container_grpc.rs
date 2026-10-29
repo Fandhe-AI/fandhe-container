@@ -1203,7 +1203,7 @@ async fn terminate_and_collect_stderr(mut guard: ChildGuard, signal: &str) -> St
     let pid = guard.0.id().to_string();
     let mut kill = Command::new("kill");
     kill.args(["-s", signal, &pid]);
-    let sent = reap::run_within(&mut kill, reap::REAP_WITHIN)
+    let sent = reap::run_within(&mut kill, reap::reap_within())
         .unwrap_or_else(|e| panic!("send SIG{signal} to plugin {pid}: {e}"));
     assert!(sent.success(), "kill -s {signal} {pid}");
     let start = Instant::now();

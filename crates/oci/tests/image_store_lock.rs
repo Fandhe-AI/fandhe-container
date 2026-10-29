@@ -84,7 +84,7 @@ fn run_lock_excludes_other_process(root: TestRoot) {
                 break;
             }
             None if Instant::now() >= deadline => {
-                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+                reap::reap_or_report(&mut child, reap::reap_within());
                 panic!("child did not finish within the deadline");
             }
             None => std::thread::sleep(Duration::from_millis(20)),

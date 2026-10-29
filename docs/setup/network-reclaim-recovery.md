@@ -86,9 +86,12 @@ root を要する操作で、ホストの他の netns を巻き込まないよ�
 
 回収:
 
-- 第一の手段は `delete_network`。テーブルごと消え、アドレスと予約も解放される。quarantine の解放は `delete_network` の後（または plugin の再起動の後）である
-- ネットワークを残すときは、下の「B. メンバー単体の回復」の手順 3 と同じく、宛先が該当アドレスのルールだけを `nft -a` のハンドルを指定して消す。確定メンバーの DNAT・masquerade・テーブルは消さない。判別できなければ消さない
-- 消したあと、全資源が無いことを確かめてから請求書を手で消し、plugin を再起動する
+経路で手段が違う。`@networks/<名前>/` の状態ストアにネットワークの記録がある（記録つきの）ネットワークかどうかで分ける。
+
+- 記録の無い経路（プロセス内の保持だけのネットワーク）: 第一の手段は `delete_network`。テーブルごと消え、アドレスと予約も解放される。quarantine の解放は `delete_network` の後（または plugin の再起動の後）である
+- 記録つきの経路（`@networks/<名前>/pending-reclaim/attach/` の請求書や `members-intent/<id>` が残るもの）: `delete_network` は第一の手段にならない。回収待ちの請求書または意図記録が残る間、`network has pending reclaim records`（または `network has an unreconciled operation` / `network still has members`）の `FailedPrecondition` で拒否される。先に対象資源を手動で回収し、請求書と意図記録を整理してから進める（下の手順）
+- ネットワークを残すとき、および記録つきの経路では、下の「B. メンバー単体の回復」の手順 3 と同じく、宛先が該当アドレスのルールだけを `nft -a` のハンドルを指定して消す。確定メンバーの DNAT・masquerade・テーブルは消さない。判別できなければ消さない
+- 消したあと、全資源（ルール・veth・pin）が無いことを確かめてから請求書（`pending-reclaim/attach/<endpoint>.attach`）と該当の `members-intent/<id>` を手で消し、plugin を再起動する。そのうえで、ネットワークが不要なら `delete_network` を呼ぶ
 
 root と `CAP_NET_ADMIN` を要する操作で、名前・ハンドル・アドレスを確かめてから実行する。
 

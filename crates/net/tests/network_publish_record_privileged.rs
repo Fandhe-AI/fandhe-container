@@ -22,6 +22,12 @@
 //!   請求書（v2）をストアへ保存する（開き直して読み戻す）。`reclaim_failed_attach` がそのルールだけを消し、同じ
 //!   コンテナの別の公開・他コンテナの DNAT は残る（NET-1・NET-6・REPAIR-4・SEC-1・#3285）
 //! - (7) テーブルが作り直された後の回収は DELRULE を送らず、新テーブルの別ルールが残る
+//! - (8) 再起動後に記録だけから行う detach（`detach_member_recorded`。NET-1・NET-6・REPAIR-4・SEC-1・#3347）。
+//!   別プロセス（孫。detach せずに終了するため、プロセス内の pin の所有記録が消えた再起動後を模擬し、
+//!   `.owned/<endpoint>` の永続の所有記録を照合する経路を通す）が 2 件を attach（公開つき）して終わる。
+//!   ストアを開き直し、記録の pin の識別子を壊した状態では pin を外さず（veth は外れ、メンバー記録と pin が残る）、
+//!   復元すると同じ入口が収束する: host veth・pin・`.owned`・その DNAT 2 本・メンバー記録が消え、別メンバーの
+//!   veth・DNAT・記録は残る
 //!
 //! 子は `unshare --net --mount` の中（netns の pin の bind mount を mount namespace に閉じる）。
 //! 成功行は `network_publish_record_privileged: ok` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
@@ -59,7 +65,8 @@ mod linux {
     use fandhe_container_net::netlink_route::{IpPrefix, NetlinkRouteSocket};
     use fandhe_container_net::network::recorded::{
         RecordedError, attach_container_recorded, create_network_recorded,
-        detach_container_recorded, restore_published_ports, unpublish_port_recorded,
+        detach_container_recorded, detach_member_recorded, restore_published_ports,
+        unpublish_port_recorded,
     };
     use fandhe_container_net::network::{
         ContainerAttachSpec, EndpointId, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish,
@@ -180,8 +187,16 @@ mod linux {
         let base = std::env::args()
             .find_map(|a| a.strip_prefix("--base=").map(PathBuf::from))
             .unwrap_or_else(|| fail("missing --base (run via the launcher)"));
+        if std::env::args().any(|a| a == "--attach-only") {
+            // (8) の孫: 2 件を attach して detach せずに終わる（再起動の模擬）。成功行は出さない。
+            if let Err(e) = member_attach_only(&route, &nft, &base, t) {
+                fail(&e);
+            }
+            return;
+        }
         let result = scenario(&route, &nft, &base, t)
-            .and_then(|()| reclaim_scenario(&route, &nft, &base, t));
+            .and_then(|()| reclaim_scenario(&route, &nft, &base, t))
+            .and_then(|()| member_detach_scenario(&route, &nft, &base, t));
         if let Err(e) = result {
             fail(&e);
         }
@@ -675,6 +690,179 @@ mod linux {
             return Err(format!(
                 "the recreated table must be untouched: {before} -> {after}"
             ));
+        }
+        Ok(())
+    }
+
+    const MEMDET_NET: &str = "memdet";
+
+    /// (8) の孫: 作成済みの `memdet` に m1（公開 8101）と m2（公開 8102）を attach して、detach せずに終わる。
+    fn member_attach_only(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let name = NetworkName::new(MEMDET_NET).map_err(e)?;
+        let store = NetworkStore::open(&base.join("store")).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let created = n
+            .realized()
+            .map_err(e)?
+            .ok_or("realized missing")?
+            .to_created(fandhe_container_net::etc_hosts::NameResolution::default());
+        let mut ports = PortRegistry::new();
+        for (id, host_port) in [("m1", 8101u16), ("m2", 8102)] {
+            let publish = PortPublish::new(
+                PortProtocol::Tcp,
+                Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .map_err(e)?;
+            let spec = ContainerAttachSpec::new(
+                EndpointId::new(id).map_err(e)?,
+                &created,
+                base.join("ns"),
+            )
+            .and_then(|s| s.with_port_publishes(vec![publish]))
+            .map_err(e)?;
+            attach_container_recorded(
+                route,
+                nft,
+                &n,
+                &MemberId::new(id).map_err(e)?,
+                &spec,
+                &[],
+                &mut ports,
+                t,
+            )
+            .map_err(|x| format!("attach_container_recorded({id}): {x:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// 記録だけからの detach（再起動後の入口。#3347）。孫が attach した 2 件のうち m1 を外し、m2 は残す。
+    fn member_detach_scenario(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let dir = &base.join("store");
+        let ns_dir = base.join("ns");
+        let subnet = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 233, 0, 0)), 24).map_err(e)?;
+        let gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 233, 0, 1)), 24).map_err(e)?;
+        let name = NetworkName::new(MEMDET_NET).map_err(e)?;
+        let def = NetworkDefinition::bridge(MEMDET_NET, subnet).map_err(e)?;
+        let table = {
+            let store = NetworkStore::open(dir).map_err(e)?;
+            store.create(&def).map_err(e)?;
+            let g = store.lock_global_exclusive().map_err(e)?;
+            let n = g.lock_network(&name).map_err(e)?;
+            let spec = NetworkCreateSpec::new(name.clone(), gateway).map_err(e)?;
+            create_network_recorded(route, nft, &n, &def, &spec, t)
+                .map_err(|x| format!("create_network_recorded(memdet): {x:?}"))?
+                .table
+        };
+        // 孫が attach して終わる（ロックは孫が取る。ここでは保持しない）。
+        let exe = std::env::current_exe().map_err(e)?;
+        let exe = exe.to_string_lossy().into_owned();
+        let parent_ns = netns_id()?;
+        // 孫は同じ netns を共有するため、`--parent-netns` には別の値を渡して共有の検査を通す（孫は検査のみ）。
+        run(
+            &exe,
+            &[
+                "--child",
+                "--attach-only",
+                &format!("--base={}", base.display()),
+                &format!("--parent-netns=not-{parent_ns}"),
+            ],
+        )
+        .map_err(|x| format!("attach-only child: {x}"))?;
+        let veth_count = || -> Result<usize, String> {
+            Ok(run("ip", &["-o", "link", "show", "type", "veth"])?
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count())
+        };
+        // veth は host 側と container 側（netns pin の中）で、host 側 netns からは host 側の 2 本が見える。
+        if veth_count()? != 2 {
+            return Err("two host veths must exist after the attach-only child".to_owned());
+        }
+        if dnat_count(&table, 8101)? != 2 || dnat_count(&table, 8102)? != 2 {
+            return Err("both published ports must have 2 DNAT rules".to_owned());
+        }
+        let owned = |id: &str| ns_dir.join(".owned").join(id);
+        for id in ["m1", "m2"] {
+            if !ns_dir.join(id).exists() || !owned(id).exists() {
+                return Err(format!("pin or .owned record missing for {id}"));
+            }
+        }
+
+        // 再起動後: ストアを開き直し、記録だけから m1 を外す。まず記録の pin の識別子を壊す。
+        let store = NetworkStore::open(dir).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let m1_path: PathBuf = dir.join(format!("@networks/{MEMDET_NET}/members/m1"));
+        let good = fs::read_to_string(&m1_path).map_err(e)?;
+        let lines: Vec<&str> = good.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("pin "))
+            .ok_or("member record has no pin line")?;
+        let mut bad_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+        let value = &bad_lines[at + 1];
+        let last = value
+            .chars()
+            .last()
+            .and_then(|c| c.to_digit(10))
+            .ok_or("pin value")?;
+        bad_lines[at + 1] = format!("{}{}", &value[..value.len() - 1], (last + 1) % 10);
+        fs::write(&m1_path, format!("{}\n", bad_lines.join("\n"))).map_err(e)?;
+        let mid = MemberId::new("m1").map_err(e)?;
+        let mut reg = PortRegistry::new();
+        match detach_member_recorded(route, nft, &n, &mid, &ns_dir, &mut reg, t) {
+            Err(RecordedError::Op(_)) => {}
+            other => {
+                return Err(format!(
+                    "detach with a wrong pin identity must fail (ok={})",
+                    other.is_ok()
+                ));
+            }
+        }
+        if !ns_dir.join("m1").exists() || !owned("m1").exists() || !m1_path.exists() {
+            return Err("the pin and the member record must remain after the refusal".to_owned());
+        }
+        // 正しい記録に戻すと、同じ入口が収束する（veth は前回で外れ済み。DNAT は既に無い）。
+        fs::write(&m1_path, good.as_bytes()).map_err(e)?;
+        detach_member_recorded(route, nft, &n, &mid, &ns_dir, &mut reg, t)
+            .map_err(|x| format!("detach_member_recorded(m1): {x:?}"))?;
+        if m1_path.exists() || ns_dir.join("m1").exists() || owned("m1").exists() {
+            return Err("m1 record, pin and .owned record must be gone".to_owned());
+        }
+        if dnat_count(&table, 8101)? != 0 || dnat_count(&table, 8102)? != 2 {
+            return Err("only m1's DNAT rules must be removed".to_owned());
+        }
+        if veth_count()? != 1 {
+            return Err("exactly m2's host veth must remain".to_owned());
+        }
+        let members: Vec<String> = n
+            .members()
+            .map_err(e)?
+            .iter()
+            .map(|m| m.id().as_str().to_owned())
+            .collect();
+        if members != vec!["m2".to_owned()] || !ns_dir.join("m2").exists() || !owned("m2").exists()
+        {
+            return Err(format!("m2 must stay intact: {members:?}"));
         }
         Ok(())
     }

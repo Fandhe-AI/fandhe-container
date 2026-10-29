@@ -30,22 +30,34 @@
 //! 生きたテーブルのハンドルと照合し、食い違えば（テーブルが作り直されている）DELRULE を送らず
 //! [`UnpublishRules::StaleHandles`] で断る。解除の成功後は、そのメンバー記録から該当の公開を外して書き直す。
 //!
+//! # 再起動後の detach（記録だけからの切り離し。NET-1・NET-6・REPAIR-4・#3347）
+//! `detach_member_recorded` は生きた `AttachedContainer` を取らず、`members/<id>` から請求書を合成して
+//! 既存の回収（`reclaim_failed_attach` と同じ規則）で DNAT ルール → host veth → netns の pin を外し、ポート予約と
+//! メンバー記録（= IPAM のアドレス）を解放する。pin の三者照合のため、メンバー記録は pin の識別子を持つ
+//! （FCMEM1 の `pin`。無い旧形式は pin が残っていれば `Unknown` の取り残しで手動回収）。所有トークン・世代・
+//! 回収待ちの請求書・置き場・解除の印を、カーネル操作の前に fail-closed で確かめる（`detach_member_recorded_with`）。
+//!
+//! # 検証で拒否した `detach_container_recorded`（#3347）
+//! 記録との照合で拒否した場合、渡された `AttachedContainer` は破棄され、netns の pin・host veth・DNAT は残る
+//! （fd が閉じるだけ）。拒否の時点では渡されたコンテナと記録が同じものと証明できず、外すと別メンバーの pin を
+//! 外しうるため、あえて外さない。見分け方と回収は `docs/setup/network-reclaim-recovery.md` を参照。
+//! メンバー記録が残る拒否は `detach_member_recorded` で回収に収束できる。
+//!
 //! # 未実装範囲（REPAIR-3）
 //! - 残った `realized.intent` / `members-intent/*` のカーネル照合による昇格・巻き戻し（link の dump API が前提）
-//! - 生きた `AttachedContainer` を持たない detach（veth・pin の回収）。再起動後の detach の公開の解除は本モジュールの個別解除を先に呼ぶ。
-//!   `detach_container` の失敗の請求書へのルールハンドルの記載と `reclaim_failed_attach` での回収は済み（#3285）だが、
-//!   `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
+//! - ホストの再起動（boot ID が変わる）をまたぐ記録だけからの detach。世代が違うと断り、手動回収に回す
+//! - `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
 //! - 記録から `PortRegistry`（ポート予約）を組み直すこと。再起動直後は空の予約表を渡すと、解除はルールの削除だけを
 //!   行い、予約の解放は 0 件で成功する
-//! - 検証で拒否した detach は渡された `AttachedContainer` を返さず破棄する（netns の pin は残る。記録から
-//!   請求書を作って回収する経路は #3075）
 
 use std::net::IpAddr;
+use std::path::Path;
 
+use super::attach_claim::ClaimedRules;
 use super::{
     AttachedContainer, ContainerAttachError, ContainerAttachSpec, CreatedNetwork,
-    NetworkCreateError, NetworkDeleteReport, StaticIpam, host_owner_token, new_generation,
-    ownership_token,
+    FailedAttachClaim, NetnsDirRecord, NetworkCreateError, NetworkDeleteReport, StaticIpam,
+    host_owner_token, new_generation, ownership_token,
 };
 use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
@@ -342,7 +354,12 @@ fn commit_attached<N>(
         dir.dir_id(),
         dns,
     )
-    .and_then(|r| r.with_publishes(table_handle, recorded));
+    .and_then(|r| r.with_publishes(table_handle, recorded))
+    // pin の識別子も控える（再起動後の記録だけからの detach が三者照合に使う。#3347）。
+    .map(|r| match att.pin_identity {
+        Some(pin) => r.with_pin(pin),
+        None => r,
+    });
     match rec.and_then(|r| guard.commit_member(&r)) {
         Ok(()) => Ok(att),
         Err(e) => Err(uncommitted(e, att)),
@@ -407,6 +424,117 @@ where
             }
             Err(RecordedError::Op(e))
         }
+    }
+}
+
+/// 記録だけから、メンバー 1 件を切り離す本体（OS 非依存。カーネル操作は `run` で差し替える。NET-1・NET-6・REPAIR-4・#3347）。
+///
+/// 再起動後は生きた `AttachedContainer` を持てない。`members/<id>` から請求書（`FailedAttachClaim`）を合成し、
+/// `run` が既存の回収（DNAT ルール → host veth → netns の pin。所有はトークン・bridge への所属・pin の三者照合で
+/// 証明する）で外す。成功したらポート予約を解放し、メンバー記録（と残っていれば意図記録）を消す。アドレスは
+/// IPAM を記録から組み直すので、メンバー記録を消せば解放される。呼び出し元の想定は supervisor（#3074）と
+/// plugin-cri（#3075）の再起動後の経路。
+///
+/// カーネル操作の前に、次をすべて確かめ、満たさなければ何も変えずに断る（fail-closed）。
+/// - 排他ロックのガード・未完了の操作（`realized.intent`）が無い・世代（boot ID と network namespace）の一致
+///   （ホストの再起動をまたぐ回収は対象外で、`docs/setup/network-reclaim-recovery.md` の手動回収に回す）
+/// - メンバー記録があり、所有トークンがこのネットワークのもの（`DataLoss`）
+/// - 同じ endpoint の回収待ちの請求書（`pending-reclaim/attach`）が無い。切り離しの失敗で残る請求書は記録に無い
+///   `extra_published` のルールを載せうるため、合成した請求書で代えない。先に `reclaim_failed_attach` で回収する
+/// - `netns_dir`（呼び出し側の固定設定）が記録の置き場とバイト単位で一致する（実体の照合は `run` 側）
+/// - 解除の印つきの公開が無い。ルールの回収が黙って省かれないよう、先に `unpublish_port_recorded` で回復する
+///
+/// `run` が失敗したらメンバー記録を残して [`RecordedError::Op`] を返す（請求書は保存しない。記録自体が回収の
+/// 入力で、再実行は冪等に収束する）。成功したのに予約の解放・記録の削除に失敗したときは [`RecordedError::Uncommitted`]
+/// （記録は残るので、再実行で収束する）。
+/// 記録に pin の識別子が無い旧形式は、pin が無ければ回収済み、残っていれば `Unknown` の取り残しで手動回収になる。
+pub(crate) fn detach_member_recorded_with<E, F>(
+    host: &HostGeneration,
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+    netns_dir: &Path,
+    ports: &mut PortRegistry,
+    run: F,
+) -> Result<NetworkDeleteReport, RecordedError<E, NetworkDeleteReport>>
+where
+    F: FnOnce(&FailedAttachClaim, &NetnsDirRecord) -> Result<NetworkDeleteReport, E>,
+{
+    require_exclusive_guard(guard)?;
+    let realized = require_settled_current(guard, host)?;
+    let members = guard.members().map_err(RecordedError::Store)?;
+    let Some(rec) = members.iter().find(|m| m.id() == member_id) else {
+        return Err(RecordedError::Store(NetError::new(
+            NetErrorCode::NotFound,
+            "member not found",
+        )));
+    };
+    check_member_owned(&realized, rec).map_err(RecordedError::Store)?;
+    let reclaim = guard.reclaim_records().map_err(RecordedError::Store)?;
+    if reclaim
+        .attach
+        .iter()
+        .any(|c| c.endpoint() == rec.endpoint())
+    {
+        return Err(RecordedError::Store(precondition(
+            "endpoint has a pending reclaim record",
+        )));
+    }
+    let dir = rec.netns_dir_record();
+    if dir.path() != netns_dir {
+        return Err(RecordedError::Store(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "netns directory does not match the member record",
+        )));
+    }
+    if rec.publishes().iter().any(RecordedPublish::unpublishing) {
+        return Err(RecordedError::Store(precondition(
+            "member has an unpublishing mark; recover it with unpublish first",
+        )));
+    }
+    let rules = match rec.table_handle() {
+        Some(th) if !rec.publishes().is_empty() => {
+            // 空・上限超過・整合違反は `None`。ルールの回収が黙って省かれるので断る。
+            Some(
+                ClaimedRules::new(th, rec.publishes().to_vec()).ok_or_else(|| {
+                    RecordedError::Store(NetError::new(
+                        NetErrorCode::DataLoss,
+                        "member publish records are inconsistent",
+                    ))
+                })?,
+            )
+        }
+        _ => None,
+    };
+    let claim = FailedAttachClaim::from_detach(
+        realized.name(),
+        realized.token(),
+        rec.endpoint(),
+        rec.token(),
+        rec.pin(),
+        true,
+        true,
+        rules.is_some(),
+        rules,
+    )
+    .ok_or_else(|| {
+        RecordedError::Store(NetError::new(
+            NetErrorCode::Internal,
+            "cannot build a reclaim claim from the member record",
+        ))
+    })?;
+    let report = run(&claim, &dir).map_err(RecordedError::Op)?;
+    let endpoint = rec.endpoint().clone();
+    let finished = ports
+        .release(realized.name(), &endpoint)
+        .map(|_| ())
+        .and_then(|()| guard.remove_member(member_id))
+        .and_then(|_| guard.remove_member_intent(member_id).map(|_| ()));
+    match finished {
+        Ok(()) => Ok(report),
+        Err(error) => Err(RecordedError::Uncommitted {
+            error,
+            value: Box::new(report),
+        }),
     }
 }
 
@@ -740,6 +868,7 @@ mod linux {
     use super::*;
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
+    use crate::network::delete::member_detach::reclaim_member;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
     use crate::network::unpublish::{linux_delete_rule, linux_delete_rules, linux_table_info};
     use crate::network::{
@@ -871,7 +1000,9 @@ mod linux {
 
     /// コンテナを切り離して `members/<id>` を消す（`detach_container` の記録つき版）。
     ///
-    /// 記録の検証で拒否した場合、渡した `container` は破棄される（pin は残る。モジュール doc の未実装範囲）。
+    /// 記録の検証で拒否した場合、渡した `container` は破棄される（netns の pin・veth・DNAT は残る）。外さない理由、
+    /// 見分け方、`detach_member_recorded` での回収はモジュール doc「検証で拒否した `detach_container_recorded`」と
+    /// `docs/setup/network-reclaim-recovery.md`。
     // 理由: 下位の `detach_container` の引数（ソケット 2 本・接続済みコンテナ・公開ポート・予約表・期限）に
     // ガードと ID を足した形で、所有者がばらばらの借用をまとめる型を作ると寿命が呼び出し側へ漏れるため引数で受ける。
     #[allow(clippy::too_many_arguments)]
@@ -909,6 +1040,29 @@ mod linux {
         })
     }
 
+    /// 記録だけからメンバー 1 件を切り離して `members/<id>` を消す（再起動後の detach の入口。NET-1・NET-6・REPAIR-4・#3347）。
+    ///
+    /// 生きた `AttachedContainer` を取らない。`netns_dir` は接続時と同じ呼び出し側の固定設定で、記録の置き場と
+    /// 一致しなければ断る。手順・関門・失敗時の規則は `detach_member_recorded_with`。`timeout` は切り離し全体の
+    /// 1 つの期限（REPAIR-5）。`CAP_NET_ADMIN`・`CAP_SYS_ADMIN` は呼び出し側の責務。
+    pub fn detach_member_recorded(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        guard: &NetworkLockGuard<'_>,
+        member_id: &MemberId,
+        netns_dir: &Path,
+        ports: &mut PortRegistry,
+        timeout: Duration,
+    ) -> Result<
+        NetworkDeleteReport,
+        RecordedError<Box<NetworkDeleteError<ContainerNetns>>, NetworkDeleteReport>,
+    > {
+        let host = nft.host_generation().map_err(RecordedError::Store)?;
+        detach_member_recorded_with(&host, guard, member_id, netns_dir, ports, |claim, dir| {
+            reclaim_member(route, nft, claim, dir, timeout).map_err(Box::new)
+        })
+    }
+
     /// メンバーのいないネットワークを削除して `realized` を消す（`delete_network` の記録つき版）。
     pub fn delete_network_recorded(
         route: &NetlinkRouteSocket,
@@ -929,7 +1083,8 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{
     attach_container_recorded, create_network_recorded, delete_network_recorded,
-    detach_container_recorded, restore_published_ports, unpublish_port_recorded,
+    detach_container_recorded, detach_member_recorded, restore_published_ports,
+    unpublish_port_recorded,
 };
 
 #[cfg(test)]
@@ -2376,6 +2531,329 @@ mod tests {
                 .unwrap_err()
                 .code(),
             NetErrorCode::NotFound
+        );
+    }
+
+    const PIN: crate::network::attach_claim::PinIdentity =
+        crate::network::attach_claim::PinIdentity {
+            dev: 8,
+            ino: 9,
+            serial: 77,
+        };
+
+    /// 公開 1 件と pin の識別子を返す attach の代役（#3347）。
+    fn run_with_publish_and_pin(
+        spec: &ContainerAttachSpec,
+    ) -> impl FnOnce(&mut StaticIpam, &str) -> Result<AttachedContainer<()>, ContainerAttachError> + '_
+    {
+        move |ipam, generation| {
+            let mut att = run_with_publish(spec)(ipam, generation)?;
+            att.pin_identity = Some(PIN);
+            Ok(att)
+        }
+    }
+
+    /// c1（公開 1 件・pin つき）と c2（公開なし・pin なし）を attach したストアを用意する。
+    fn attach_two(t: &Tmp) {
+        let store = setup(t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = spec("c1");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            run_with_publish_and_pin(&s1),
+        )
+        .unwrap();
+        let s2 = spec("c2");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c2"),
+            &s2,
+            &[],
+            live_table(42),
+            ok_run(&s2),
+        )
+        .unwrap();
+    }
+
+    type DetachOut = Result<NetworkDeleteReport, RecordedError<(), NetworkDeleteReport>>;
+
+    /// 記録だけからの detach を、`run` に渡った請求書を控えて実行する。
+    fn detach_member(
+        n: &NetworkLockGuard<'_>,
+        id: &str,
+        dir: &str,
+        reg: &mut PortRegistry,
+        run_result: Result<(), ()>,
+    ) -> (DetachOut, Option<super::super::FailedAttachClaim>) {
+        let seen = std::cell::RefCell::new(None);
+        let r = detach_member_recorded_with(&host(), n, &mid(id), Path::new(dir), reg, |c, d| {
+            assert_eq!(d.path(), Path::new(NETNS_DIR));
+            assert_eq!(d.dir_id(), (8, 9));
+            *seen.borrow_mut() = Some(c.clone());
+            run_result.map(|()| NetworkDeleteReport::default())
+        });
+        (r, seen.into_inner())
+    }
+
+    /// NET-1・NET-6・REPAIR-4・#3347: 再起動後（開き直したストア）でも、記録だけから請求書を合成し、成功したら
+    /// メンバー記録・アドレス・ポート予約を解放する。兄弟の記録は変わらない。
+    #[test]
+    fn net1_3347_detach_member_synthesizes_claim_and_releases() {
+        let t = Tmp::new("member-detach");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 2);
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let other =
+            PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 9090, 80).unwrap();
+        reg.reserve(&name(), &EndpointId::new("c2").unwrap(), &[other])
+            .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+        assert!(r.is_ok());
+        let claim = claim.expect("run was called");
+        assert_eq!(claim.network(), &name());
+        assert_eq!(claim.endpoint().as_str(), "c1");
+        assert_eq!(claim.token(), BRIDGE_TOKEN);
+        assert!(claim.includes_veth() && claim.includes_netns() && claim.includes_quarantine());
+        assert_eq!(claim.pin(), Some(PIN));
+        assert!(
+            claim.to_record().contains("v2"),
+            "ルールつきなら v2 の記録: {}",
+            claim.to_record()
+        );
+        let rules = claim.port_rules().expect("rules from the member record");
+        assert_eq!(rules.table.get(), 42);
+        assert_eq!(rules.ports.len(), 1);
+        assert_eq!(*rules.ports[0].publish(), web_publish());
+        assert_eq!(
+            (
+                rules.ports[0].prerouting().get(),
+                rules.ports[0].output().get()
+            ),
+            (2, 3)
+        );
+        // 記録・アドレス・予約: c1 だけが消え、c2 は残る。
+        let ids: Vec<String> = n
+            .members()
+            .unwrap()
+            .iter()
+            .map(|m| m.id().as_str().to_owned())
+            .collect();
+        assert_eq!(ids, vec!["c2".to_owned()]);
+        assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 1);
+        assert_eq!(reg.len(), 1);
+        // 同じ endpoint を再 attach できる（アドレスが解放されている）。
+        let s = spec("c1");
+        let att =
+            attach_recorded_with(&host(), &n, &mid("c1"), &s, &[], live_table(42), ok_run(&s))
+                .unwrap();
+        assert_eq!(att.address, pfx([10, 0, 0, 2], 24));
+    }
+
+    /// NET-1・#3347: 公開も pin の識別子も無いメンバーは、ルール無し・pin 無しの請求書になる。
+    #[test]
+    fn net1_3347_detach_member_without_publish_or_pin() {
+        let t = Tmp::new("member-detach-plain");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let (r, claim) = detach_member(&n, "c2", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+        assert!(r.is_ok());
+        let claim = claim.unwrap();
+        assert_eq!(claim.pin(), None);
+        assert!(claim.port_rules().is_none());
+        assert!(!claim.includes_quarantine());
+    }
+
+    /// NET-1・REPAIR-4・#3347: `run` が失敗したらメンバー記録を残し、請求書は保存せず、アドレスは使用中のまま。
+    #[test]
+    fn net1_3347_detach_member_failure_keeps_record() {
+        let t = Tmp::new("member-detach-fail");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Err(()));
+        assert!(matches!(r, Err(RecordedError::Op(()))));
+        assert!(claim.is_some());
+        assert_eq!(n.members().unwrap().len(), 2);
+        assert_eq!(n.rebuild_ipam().unwrap().allocated_count(), 2);
+        assert!(n.reclaim_records().unwrap().attach.is_empty());
+        assert_eq!(reg.len(), 1, "予約は成功するまで解放しない");
+    }
+
+    /// NET-1・SEC-1・REPAIR-4・#3347: 関門を満たさないときは `run` を呼ばず、記録も変えずに断る。
+    #[test]
+    fn net1_3347_detach_member_gates_refuse_before_kernel_ops() {
+        let t = Tmp::new("member-detach-gates");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        {
+            // 共有ロックのガードでは断る。
+            let g = store.lock_global_shared().unwrap();
+            let n = g.lock_network_shared(&name()).unwrap();
+            let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+            assert_eq!(
+                r.unwrap_err().store_code(),
+                Some(NetErrorCode::FailedPrecondition)
+            );
+            assert!(claim.is_none());
+        }
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let refuse = |id: &str, dir: &str, code: NetErrorCode, msg: &str| {
+            let (r, claim) = detach_member(&n, id, dir, &mut PortRegistry::new(), Ok(()));
+            let Err(RecordedError::Store(e)) = r else {
+                panic!("expected Store error for {id} {dir}");
+            };
+            assert_eq!((e.code(), e.message()), (code, msg), "{id} {dir}");
+            assert!(claim.is_none(), "run must not be called: {id} {dir}");
+            assert_eq!(n.members().unwrap().len(), 2);
+        };
+        // 記録に無いメンバー。
+        refuse("zz", NETNS_DIR, NetErrorCode::NotFound, "member not found");
+        // 置き場が記録と違う。
+        refuse(
+            "c1",
+            "/run/other-ns",
+            NetErrorCode::InvalidArgument,
+            "netns directory does not match the member record",
+        );
+        // 同じ endpoint の回収待ちの請求書。
+        n.save_reclaim_attach(&super::super::FailedAttachClaim::for_test(
+            name(),
+            EndpointId::new("c1").unwrap(),
+            BRIDGE_TOKEN,
+            "0123456789abcdef0123456789abcdef",
+            true,
+            false,
+            false,
+        ))
+        .unwrap();
+        refuse(
+            "c1",
+            NETNS_DIR,
+            NetErrorCode::FailedPrecondition,
+            "endpoint has a pending reclaim record",
+        );
+        // 別 endpoint の請求書は妨げない。
+        let (r, claim) = detach_member(&n, "c2", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+        assert!(r.is_ok() && claim.is_some());
+    }
+
+    /// NET-3・SEC-1・#3347: 解除の印つきの公開が残るメンバーは、ルールの回収が黙って省かれないよう断る。
+    #[test]
+    fn net1_3347_detach_member_refuses_unpublishing_mark() {
+        let t = Tmp::new("member-detach-mark");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let rec = n
+            .members()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id().as_str() == "c1")
+            .unwrap();
+        n.replace_member(&rec.with_unpublishing(&web_publish()).unwrap())
+            .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "member has an unpublishing mark; recover it with unpublish first"
+        );
+        assert!(claim.is_none());
+        assert_eq!(n.members().unwrap().len(), 2);
+    }
+
+    /// NET-3・SEC-1・#3347: 別 netns の世代・別ネットワークのトークン・未完了の操作（`realized.intent`）では断る。
+    #[test]
+    fn net1_3347_detach_member_refuses_other_generation_foreign_token_and_unsettled() {
+        let t = Tmp::new("member-detach-gen");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        // 別 netns の世代。
+        let cur = host();
+        let other = HostGeneration::new(
+            cur.boot_id(),
+            crate::network_store::NetnsIdentity::new(
+                cur.netns().dev().wrapping_add(1),
+                cur.netns().ino(),
+            ),
+        )
+        .unwrap();
+        let ran = std::cell::Cell::new(false);
+        let r = detach_member_recorded_with::<(), _>(
+            &other,
+            &n,
+            &mid("c1"),
+            Path::new(NETNS_DIR),
+            &mut PortRegistry::new(),
+            |_, _| {
+                ran.set(true);
+                Ok(NetworkDeleteReport::default())
+            },
+        );
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(
+            e.message(),
+            "recorded nft handles belong to another boot or network namespace"
+        );
+        // 別ネットワークのトークン。
+        let path = t.0.join("@networks/web/members/c1");
+        let alt: String = BRIDGE_TOKEN
+            .chars()
+            .map(|c| if c == 'a' { 'b' } else { 'a' })
+            .collect();
+        let good = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        std::fs::write(&path, good.replace(BRIDGE_TOKEN, &alt).as_bytes()).unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+        assert!(claim.is_none());
+        let Err(RecordedError::Store(e)) = r else {
+            panic!("expected Store error");
+        };
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        // 未完了の操作。
+        std::fs::write(&path, good.as_bytes()).unwrap();
+        n.write_realized_intent(
+            &RealizedIntent::new(
+                RealizedOp::Delete,
+                name(),
+                BRIDGE_TOKEN,
+                pfx([10, 0, 0, 0], 24),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
+        assert!(claim.is_none() && !ran.get());
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::FailedPrecondition)
         );
     }
 }

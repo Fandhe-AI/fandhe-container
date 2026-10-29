@@ -285,6 +285,7 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
   - 起動は env 空・cwd `/`・stdin / stdout null・stderr pipe。pre_exec は `sys::pasta::set_pdeathsig_on_spawn`（`PR_SET_PDEATHSIG=SIGKILL` と `getppid` の照合。不一致は `FailedPrecondition`）
   - stderr は先頭 4 KiB（エスケープ後）だけ保持し以降は読み捨てる。準備完了の待ちの間と `is_alive` / `stop*` のたびに読めるだけ読む（待たない）。準備完了後の定期呼び出しは #1940 の監視の責務（長時間呼ばれないと 64 KiB の pipe が満ちて pasta の書き込みが止まりうる）
   - スレッドを作らない（launch の手順 8 が単一スレッドの区間のため。issue の「回収スレッドへ移す」から変更）。期限切れの `stop_checked` は `Timeout` を返して子を手元に残し、`stop` は未回収のハンドルをエラーに入れて返す。`Drop` は SIGKILL と 1 秒の回収待ちで、回収できなければ zombie のまま残す（zombie の間は pid が再利用されない）。スレッドへ移す `detach_reaper` は単一スレッドの区間の外から呼ぶ明示の opt-in（生成失敗は子を `unreaped` に戻して構造化エラーで返し、回収は 30 秒の期限つきで超えたらハンドルを手放す）
+  - prepare は事前の観測（`observe_run_dir` が返す `RunDirExpectation`）と、開いた fd の `(st_dev, st_ino)` を照合する（`prepare_expecting`）。別物なら `FailedPrecondition` で何も消さず、作ったばかりの dir では古い `pid` を消さない。supervisor は排他の下で観測と prepare を続けて行い、`ours` は保持 fd の同一性から得る。残余は観測前の停止と、同じ既存 dir を 2 者が観測した場合で、コンテナ単位のプロセス間ロックが担う（#3355・CORE-2・REPAIR-5）
   - 計装は `NetOpKind::PastaStart` / `PastaStop`（`spawn_pasta_with_recorder`・`stop_with_recorder`）。構造化ログの `pasta_ready` / `pasta_exit` と SEC-4 の監査は、`PastaReady` / `PastaStopOutcome` / `PastaDiagnostics` を材料に supervisor（#1940）が書く
 - **却下した案**: `/tmp` の固定の場所（名前の衝突と symlink を仕込まれる余地）、pipe を `-P /proc/self/fd/N` で渡す（fd は閉じられる）、stderr の文言で判定する（契約ではない）
 

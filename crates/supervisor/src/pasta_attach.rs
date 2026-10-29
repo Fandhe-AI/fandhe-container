@@ -53,7 +53,9 @@ use fandhe_container_net::pasta::binary::PastaBinary;
 use fandhe_container_net::pasta::process::{
     PASTA_READY_TIMEOUT_DEFAULT, PastaExit, PastaStopPath, check_ready_timeout,
 };
-use fandhe_container_net::pasta::run_dir::{remove_pasta_run_dir, validate_container_id};
+use fandhe_container_net::pasta::run_dir::{
+    observe_run_dir, remove_pasta_run_dir, validate_container_id,
+};
 use fandhe_container_net::pasta::{
     PastaPortForwards, PastaProcess, PastaRunDir, PastaTarget, spawn_pasta,
 };
@@ -551,9 +553,15 @@ fn prepare_run_dir_job(
         return Err(job.abandoned_error());
     }
     let fd = &job.state_root;
-    let (generation, made) = run_dirs.advance_with(|| PastaRunDir::prepare(fd.as_fd(), &job.id));
+    // 観測と prepare を同じ排他の下で続けて行い、別世代の dir の pid を消さない(#3355・CORE-2)。
+    let (generation, made) = run_dirs.advance_with(|| {
+        let expected = observe_run_dir(fd.as_fd(), &job.id)?;
+        PastaRunDir::prepare_expecting(fd.as_fd(), &job.id, expected)
+    });
     let dir = made.map_err(|e| net_to_trait(&e))?;
-    let ours = run_dir_identity(fd.as_fd(), &job.id).ok().flatten();
+    // 名前を引き直さず、保持している fd の同一性を記録する。
+    let identity = dir.identity();
+    let ours = Some((identity.dev(), identity.ino()));
     deliver_prepared(prepared, abandoned, generation, dir, ours);
     Ok(())
 }

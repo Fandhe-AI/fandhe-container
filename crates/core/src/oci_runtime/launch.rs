@@ -748,7 +748,8 @@ impl std::fmt::Debug for ContainerOutput {
 /// start が成功すると、ハンドルは `StartedContainer` として呼び出し元へ引き渡され、呼び出し元
 /// （supervisor〔TASK-157・SUP 系〕等）が監視・回収の所有者になる（[`Self::wait`]・[`Self::terminate`]）。
 /// 実装は `Drop` で kill / 回収しなくてよい（コンテナの寿命をハンドルに暗黙で縛らない）ため、所有者は
-/// 終了まで待って回収する責任を負う。
+/// 終了まで待って回収する責任を負う。なお本番 launcher のハンドルは drop 時に、シグナルも待ちも伴わずに子を起動台帳へ
+/// 戻す（未回収なら後続の `confirm_no_process` が止める。#3432）。
 pub trait LaunchedProcess: Send {
     /// 起動したコンテナプロセスの pid。**コンテナの PID 1**（launcher の PID namespace から見て `NSpid` が
     /// 2 要素で末尾 1）を指すこと。中間プロセス（fork 親・mapper・代役 init）を返してはならない。違反すると
@@ -846,7 +847,9 @@ pub trait LaunchedProcess: Send {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct ContainerChildProcess {
-    child: crate::exec::ContainerChild,
+    /// `Arc` なのは、Drop で未回収の子を起動台帳へ移す（`drop_notice`）ため。子のハンドル（pidfd と回収状態の
+    /// 排他）をそのまま渡し、pid の番号から作り直さない（pid 再利用で別のプロセスを止めない。SEC-1）。
+    child: Arc<crate::exec::ContainerChild>,
     pid: NonZeroU32,
     /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
     /// `&self` のため `Mutex` で保持する。
@@ -856,6 +859,10 @@ pub struct ContainerChildProcess {
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
+    /// ハンドルを drop したときに 1 回呼ぶ通知（子と、回収済みか）。本番 launcher が、`terminate` に失敗した
+    /// まま捨てられた子を起動台帳へ戻すために付ける（確認つき回復が `Handed` で詰まらないように。
+    /// CORE-2・NET-9・REPAIR-5・#3432）。
+    drop_notice: Option<DropNotice>,
     /// launch が確定した分離の記録（本番 launcher が付ける。[`LaunchedProcess::launch_isolation`]）。
     launch_isolation: Option<crate::launch_isolation::LaunchIsolationRecord>,
     /// launch が `Rlimits` 段へ渡した全 16 種の集合(本番 launcher が付ける。[`LaunchedProcess::launch_rlimits`])。
@@ -898,6 +905,34 @@ impl std::fmt::Debug for ReapNotice {
     }
 }
 
+/// [`ContainerChildProcess::with_drop_notice`] の通知（引数は子のハンドルと、drop 時点で回収済みか）。
+#[cfg(target_os = "linux")]
+type DropNoticeFn = Box<dyn Fn(Arc<crate::exec::ContainerChild>, bool) + Send + Sync>;
+
+/// drop 通知の入れ物（`Debug` を手で実装する。クロージャは `Debug` を持たないため）。
+#[cfg(target_os = "linux")]
+struct DropNotice(DropNoticeFn);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for DropNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropNotice")
+    }
+}
+
+/// 本番 launcher のハンドルは drop 時に、通知を付けていれば子を起動台帳へ戻す(シグナルも待ちも伴わない)。
+/// 回収済みなら `Clean`、未回収なら `Pending` として、後続の `confirm_no_process` と再 launch の `admit` が
+/// 期限つきで kill・回収する(#3432)。
+#[cfg(target_os = "linux")]
+impl Drop for ContainerChildProcess {
+    fn drop(&mut self) {
+        if let Some(notice) = &self.drop_notice {
+            let reaped = self.child.is_reaped();
+            (notice.0)(Arc::clone(&self.child), reaped);
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl ContainerChildProcess {
     /// fork した子のハンドルから作る。pid が 0 のハンドルは `InvalidArgument`（fork の戻り値では生じない）。
@@ -909,11 +944,12 @@ impl ContainerChildProcess {
             )
         })?;
         Ok(Self {
-            child,
+            child: Arc::new(child),
             pid,
             output: std::sync::Mutex::new(None),
             seccomp_listener: std::sync::Mutex::new(None),
             reap_notice: None,
+            drop_notice: None,
             launch_isolation: None,
             launch_rlimits: None,
             exit_audit: None,
@@ -996,6 +1032,14 @@ impl ContainerChildProcess {
     #[must_use]
     pub(crate) fn with_reap_notice(mut self, notice: ReapNoticeFn) -> Self {
         self.reap_notice = Some(ReapNotice(notice));
+        self
+    }
+
+    /// ハンドルを drop したときに呼ぶ通知を持たせる（起動台帳への子の引き継ぎ。CORE-2・#3432）。
+    /// 通知は台帳の Mutex を短く取るだけで、待たない・シグナルを送らない。
+    #[must_use]
+    pub(crate) fn with_drop_notice(mut self, notice: DropNoticeFn) -> Self {
+        self.drop_notice = Some(DropNotice(notice));
         self
     }
 

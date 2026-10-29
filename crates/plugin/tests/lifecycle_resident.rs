@@ -5,6 +5,12 @@
 //! 用意する（`lifecycle_one_shot.rs` と同方式）。子の環境は `env_clear()` されるため、振る舞いは
 //! socket ディレクトリ内の `behavior` ファイルで子へ伝える。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[cfg(unix)]
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
@@ -48,9 +54,7 @@ mod unix {
         UdsStream,
     };
     use std::ffi::OsString;
-    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -60,13 +64,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(behavior: &str) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcrs-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcrs").unwrap();
             std::fs::write(p.join("behavior"), behavior).unwrap();
             Self(p)
         }

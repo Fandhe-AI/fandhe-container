@@ -470,6 +470,10 @@ mod tests {
         #[cfg(target_os = "linux")]
         #[allow(dead_code)]
         crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        // 非 Linux は残骸を消して作った実体（Drop で後始末。REPAIR-12・#3435）。
+        #[cfg(not(target_os = "linux"))]
+        #[allow(dead_code)]
+        crate::test_root::TestRoot,
     );
 
     impl TmpDir {
@@ -486,23 +490,21 @@ mod tests {
             #[cfg(not(target_os = "linux"))]
             let p =
                 std::env::temp_dir().join(format!("fc-cli-setup-{tag}-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&p).expect("mkdir");
-            #[cfg(unix)]
+            // Linux は ScratchDir が作成前の削除を担う。他 OS は残骸・PID 再利用との衝突を避けるため
+            // 作成前に削除する（REPAIR-12・#3435）。
+            #[cfg(target_os = "linux")]
             {
+                std::fs::create_dir_all(&p).expect("mkdir");
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod");
+                Self(p, scratch)
             }
-            #[cfg(target_os = "linux")]
-            return Self(p, scratch);
             #[cfg(not(target_os = "linux"))]
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            {
+                let root = crate::test_root::test_root_at(p.clone());
+                Self(p, root)
+            }
         }
     }
 

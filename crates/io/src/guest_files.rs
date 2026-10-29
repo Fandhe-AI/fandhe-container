@@ -1658,24 +1658,13 @@ mod fault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcio-gf-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&p).expect("temp dir");
-            Self(p)
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root("fcio-gf", "t");
+            Self(root.to_path_buf(), root)
         }
     }
 

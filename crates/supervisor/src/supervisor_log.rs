@@ -444,7 +444,8 @@ mod tests {
     use crate::logs::rotating::MIN_LOG_FILE_BYTES;
     use crate::stderr_sink::{EmitOutcome, StderrSink};
 
-    struct TmpDir(PathBuf);
+    /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+    struct TmpDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
@@ -454,15 +455,9 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::SeqCst)
             ));
-            fs::create_dir_all(&p).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(p, root)
         }
     }
 

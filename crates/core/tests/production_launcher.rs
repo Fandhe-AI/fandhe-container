@@ -1187,6 +1187,7 @@ mod linux {
         scenario_a_normal(&env, expected_cgroup, tag);
         scenario_b_failed_launch_leaves_nothing(&env, tag);
         scenario_c_multithreaded_refused(&env, tag);
+        scenario_dropped_handle_confirmed(&env, tag);
         scenario_d_bind_mount(&env, tag);
         scenario_u_rslave_bind(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
@@ -1447,6 +1448,47 @@ mod linux {
             "a refused launch must not fork"
         );
         println!("production_launcher: scenario=multithreaded-refused code=FailedPrecondition");
+    }
+
+    /// シナリオ dropped-handle: 起動に成功したハンドルを terminate せずに捨てても、同じ launcher の
+    /// `confirm_no_process` が子（PID 1）を kill・回収して `Ok` になる（`Handed` のまま詰まらない。
+    /// pasta ラッパーが attachment 欠落で terminate に失敗して捨てた場合と同じ状態。CORE-2・NET-9・REPAIR-5・#3432）。
+    fn scenario_dropped_handle_confirmed(env: &Env, tag: u32) {
+        let bundle = Bundle::new("dh");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        let id = ContainerId::new(format!("pldh{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let (_record, process) = started.into_parts();
+        drop(process);
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "dropping the handle must not kill or reap the child"
+        );
+        env.launcher
+            .confirm_no_process(&id, timeout())
+            .expect("confirm_no_process must reap the child of the dropped handle");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after the confirmation"
+        );
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain: {:?}",
+            children_of_self()
+        );
+        println!("production_launcher: scenario=dropped-handle-confirmed pid gone");
     }
 
     /// シナリオ D: `mounts[]` の bind mount が start と本番 launcher を通って適用される（#1915・OCI-4・IO-8・SEC-1）。

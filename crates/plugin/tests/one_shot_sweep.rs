@@ -4,6 +4,12 @@
 //! 異常終了役の子プロセスはテストバイナリ自身を `--exact unix::sweep_child_entry` で再実行して
 //! 用意し、親が SIGKILL（`Child::kill`）で止めて残骸を作る。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -20,11 +26,10 @@ mod unix {
     use fandhe_container_plugin::{
         ONE_SHOT_SWEEP_MAX_ENTRIES, OneShotSweep, RuntimeDir, UdsListener,
     };
-    use std::os::unix::fs::{DirBuilderExt, symlink};
+    use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     /// 子へ基底ディレクトリを渡すテスト専用の環境変数。
@@ -38,16 +43,11 @@ mod unix {
     struct Base(PathBuf);
     impl Base {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
             // macOS の sun_path 上限（104 バイト）に収めるため、長い `TMPDIR`（/var/folders/...）ではなく
             // 短い /tmp 直下に作る（/tmp は macOS で /private/tmp への symlink のため正規化する）。
             let tmp = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::env::temp_dir());
-            let p = tmp.join(format!(
-                "fcsw-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create_in(&tmp, "fcsw").unwrap();
             Self(p)
         }
     }

@@ -19,6 +19,8 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! 外部コマンド）を満たさない場合は skip せず失敗する。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -124,8 +126,7 @@ mod linux {
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って子を起動する。
     pub fn launcher() {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-none-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-none-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")

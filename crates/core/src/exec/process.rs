@@ -3921,6 +3921,16 @@ impl ContainerChild {
         self.pid
     }
 
+    /// 子が回収済み（`Reaped`）か。syscall を伴わず、回収状態のロックだけで判定する（`Lost` は回収の証跡が
+    /// 無いため `false`）。
+    ///
+    /// 期限切れの `SIGKILL` を送る `wait_timeout(Duration::ZERO)` と違い、観測だけで状態を進めない。
+    /// `ContainerChildProcess` の Drop が、回収済みの子だけを起動台帳で `Clean` へ進める判断に使う
+    /// （CORE-2・#3432）。
+    pub(crate) fn is_reaped(&self) -> bool {
+        matches!(self.lock().state, ReapState::Reaped { .. })
+    }
+
     /// fork 直後（回収前）に開いた pidfd の借用（なければ `None`）。
     ///
     /// 回収前に開いているため、以後 pid が再利用されても元のプロセスを指し続ける。supervisor が exec の

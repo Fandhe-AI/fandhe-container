@@ -1411,7 +1411,37 @@ mod net12_argv_tests {
     fn fresh_root() -> std::path::PathBuf {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("fc-cli-net12-{}-{n}", std::process::id()))
+        fresh_root_at(std::env::temp_dir().join(format!("fc-cli-net12-{}-{n}", std::process::id())))
+    }
+
+    /// 指定パスに前回の残骸（異常終了・PID 再利用）があれば消してから返す。残骸が残ると
+    /// 「作られていないこと」の照合が偽の赤になるため、消せないときは進めず panic する
+    /// （fail-closed。REPAIR-12・#3435）。
+    fn fresh_root_at(p: std::path::PathBuf) -> std::path::PathBuf {
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("stale test dir could not be removed: {}: {e}", p.display()),
+        }
+        p
+    }
+
+    /// NET-12・REPAIR-12・#3435: 残骸があっても `fresh_root_at` は存在しない状態ルートを返す。
+    #[test]
+    fn net12_repair12_fresh_root_clears_stale_residue() {
+        let stale = std::env::temp_dir().join(format!(
+            "fc-cli-net12-residue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(stale.join("sub")).expect("mkdir");
+        std::fs::write(stale.join("sub").join("old"), b"stale").expect("write");
+        let p = fresh_root_at(stale.clone());
+        assert_eq!(p, stale);
+        assert!(!p.exists());
     }
 
     /// `create` を実行し (終了コード, code, stderr) を返す。状態ルートが作られていないことも確かめる。

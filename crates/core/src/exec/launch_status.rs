@@ -1651,6 +1651,16 @@ mod tests {
                 "target_on_shared_mount",
             ),
             (
+                PrePivotStep::EtcFiles,
+                ViolationReason::PathSymlinkOrNotDirectory,
+                "path_symlink_or_not_directory",
+            ),
+            (
+                PrePivotStep::EtcFiles,
+                ViolationReason::BindTargetKindMismatch,
+                "bind_target_kind_mismatch",
+            ),
+            (
                 PrePivotStep::PrepareRootfs,
                 ViolationReason::RootfsIsHostRoot,
                 "rootfs_is_host_root",

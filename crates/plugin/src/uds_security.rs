@@ -2454,8 +2454,8 @@ mod imp {
 
         #[test]
         fn plug12_clear_stale_socket_rejects_foreign_uid_and_keeps_file() {
-            let d = std::env::temp_dir().join(format!("fcst-{}", std::process::id()));
-            std::fs::create_dir_all(&d).unwrap();
+            // 残骸の socket の上で bind が EADDRINUSE にならないよう補助を使う（REPAIR-12・#3375）。
+            let d = crate::test_root::test_root("fcst", "stale");
             let sock = d.join("s");
             let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
             let dir = File::open(&d).unwrap();
@@ -2473,6 +2473,30 @@ mod imp {
             std::fs::remove_dir_all(&d).ok();
         }
 
+        /// PLUG-12・REPAIR-12(#3375): 前回の残骸（bind 済みの古い socket ファイル）が同じ位置に残っていても
+        /// `test_root_at` が空に作り直し、同じ位置への bind が `EADDRINUSE` にならず、drop で消える。
+        #[test]
+        fn plug12_repair12_test_root_clears_stale_socket_residue() {
+            let p = std::env::temp_dir().join(format!(
+                "fcst-stale-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(p.join("s")).unwrap());
+            // listener を閉じても socket ファイルは残り、再 bind は EADDRINUSE になる（元の失敗の再現）。
+            let e = std::os::unix::net::UnixListener::bind(p.join("s")).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+            {
+                let root = crate::test_root::test_root_at(p.clone());
+                assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+                let _l = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
+            }
+            assert!(!p.exists());
+        }
+
         struct Tmp(std::path::PathBuf);
         impl Tmp {
             fn new() -> Self {
@@ -2483,6 +2507,8 @@ mod imp {
                     std::process::id(),
                     N.fetch_add(1, Ordering::Relaxed)
                 ));
+                // 前回の残骸があれば消してから排他作成する（REPAIR-12・#3375）。
+                let _ = std::fs::remove_dir_all(&p);
                 DirBuilder::new().mode(0o700).create(&p).unwrap();
                 Self(p)
             }

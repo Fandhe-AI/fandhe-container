@@ -20,8 +20,9 @@
 //!
 //! # エラー写像（ERR-1）
 //!
-//! net の `NetErrorCode` を core の `ErrorCode` へ同名で写し、文言は本 module の固定表だけを使う。入力値・パス・
-//! `NetError::message` は出力へ流さない。supervisor の `net_error_to_trait` は `AlreadyExists` などを `Internal` に潰すため使わない。
+//! net の `NetErrorCode` を core の `ErrorCode` へ同名で写し（写像は supervisor の `net_error::net_code_to_trait` を共有）、
+//! 文言は本 module の固定表だけを使う。入力値・パス・`NetError::message` は出力へ流さない。
+//! `container_options::network::net_error_to_trait` は `AlreadyExists` などを `Internal` に潰す別の契約のため使わない。
 //!
 //! # 未実装・前提（REPAIR-3）
 //!
@@ -243,17 +244,7 @@ fn open_net_store(
 
 /// net の分類を core の `ErrorCode` へ写す（`DataLoss`・未知は `Internal`）。
 fn map_code(code: NetErrorCode) -> ErrorCode {
-    match code {
-        NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
-        NetErrorCode::AlreadyExists => ErrorCode::AlreadyExists,
-        NetErrorCode::NotFound => ErrorCode::NotFound,
-        NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
-        NetErrorCode::PermissionDenied => ErrorCode::PermissionDenied,
-        NetErrorCode::Timeout => ErrorCode::Timeout,
-        NetErrorCode::Unimplemented => ErrorCode::Unimplemented,
-        _ => ErrorCode::Internal,
-    }
+    fandhe_container_supervisor::net_error::net_code_to_trait(code)
 }
 
 /// net の失敗を ERR-1 の固定文言つきの終了値へ写す。

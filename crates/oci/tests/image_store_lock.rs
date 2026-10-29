@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::ImageStore;
 
+#[path = "support/reap.rs"]
+mod reap;
 #[path = "support/test_root.rs"]
 mod test_root;
 use test_root::{TestRoot, test_root, test_root_at};
@@ -82,8 +84,7 @@ fn run_lock_excludes_other_process(root: TestRoot) {
                 break;
             }
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
                 panic!("child did not finish within the deadline");
             }
             None => std::thread::sleep(Duration::from_millis(20)),
@@ -92,4 +93,31 @@ fn run_lock_excludes_other_process(root: TestRoot) {
 
     let store = store.with_timeout(Duration::from_secs(5));
     store.lock().expect("acquire after child released");
+}
+
+/// REPAIR-5・REPAIR-12（#3305）: 期限つきの終了待ち `wait_within` は、子が終わらないとき無期限に
+/// 止まらず、pid と期限を含む具体的なメッセージの `Err` で期限切れを表に出し、続く `reap` で回収できる。
+#[test]
+fn repair5_wait_within_reports_expiry() {
+    let root = test_root("fc-oci-store-it", "reap-expiry");
+    let mut child = Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .env(ROOT_ENV, &*root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+
+    // 子は `release` が現れるまで排他区間を保持して終わらない。照合の失敗で子を残さないよう、
+    // 結果を変数に取り、回収してから assert する。
+    wait_for(&root.join("ready"));
+    let expired = reap::wait_within(&mut child, Duration::from_millis(200));
+    let reaped = reap::reap(&mut child, Duration::from_secs(10));
+
+    assert_eq!(
+        expired,
+        Err(format!("child {pid} did not exit within 200ms"))
+    );
+    assert_eq!(reaped, Ok(()));
 }

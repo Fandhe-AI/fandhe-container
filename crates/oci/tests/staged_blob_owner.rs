@@ -32,6 +32,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Write as _;
@@ -148,8 +152,7 @@ mod linux {
                 Some(st) if st.success() => return Ok(()),
                 Some(st) => return Err(format!("chown child failed: {st}")),
                 None if start.elapsed() > CASE_TIMEOUT => {
-                    let _ = c.kill();
-                    let _ = c.wait();
+                    crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
                     return Err("chown child timed out".into());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

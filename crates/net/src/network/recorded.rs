@@ -50,8 +50,27 @@
 //!   `members-intent/*` の照合は `network::reconcile` が Linux ラッパーの先頭で行う（#3346）
 //! - ホストの再起動（boot ID が変わる）をまたぐ記録だけからの detach。世代が違うと断り、手動回収に回す
 //! - `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
-//! - 記録から `PortRegistry`（ポート予約）を組み直すこと。再起動直後は空の予約表を渡すと、解除はルールの削除だけを
-//!   行い、予約の解放は 0 件で成功する
+//! - 受け口を特定できない保持（`members-intent/*`・ルールの一覧を持たない quarantine の請求書）の `PortRegistry` への
+//!   登録。残った DNAT は公開時のカーネル dump（`ensure_no_listener_conflict`）が検出する（下記）
+//!
+//! # 再起動後の PortRegistry の組み直し（NET-3・REPAIR-4・REPAIR-5・#3362）
+//! `rebuild_port_registry_recorded` が、全ネットワークのメンバー記録の `publish` 行（Active・解除中・墓標のすべて）と、
+//! 回収待ちの請求書の DNAT ルールの受け口を、持ち主 `(ネットワーク名, endpoint)` で `PortRegistry` へ登録する。
+//! カーネル操作は無く記録を読むだけ（nft ソケットは取らない）。想定する呼び出し順は、起動時に `reconcile` →
+//! 本関数 → 以降の attach / publish / `restore_published_ports` → `unpublish_port_recorded`。呼び出し元は
+//! supervisor（#3074）と plugin-cri（#3075）の起動処理（結線は後続）。
+//!
+//! - 世代（boot ID・netns）は照合しない。再起動前の記録でも、行がある間は予約を保つ（不変条件）。回収は
+//!   `detach_member_recorded` か手動回収（`docs/setup/network-reclaim-recovery.md`）が予約ごと解放する。飛ばすと
+//!   手動回収が済むまでの間に予約が抜ける
+//! - 登録しすぎは安全側（新規公開を余分に断るだけ）、足りないと二重投入になる。迷えば登録する側に倒す
+//! - fail-closed: 読めない・食い違う記録、定義が壊れたネットワーク、別の持ち主が持つ同じ受け口、関数全体の失敗が
+//!   あれば `PortRegistry` に「不完全」の印を立て、印がある間は受け口を伴う新規の予約を拒否する
+//!   （`FailedPrecondition`）。解放系は止めない。完全に成功した呼び出しで印を外す。印は呼び出し側のメモリ上の値で、
+//!   共有ファイルを使う他プロセスの予約表には伝わらない（残余）
+//! - 残余: 受け口を特定できない保持（`members-intent/*`・ルールの一覧が無い quarantine の請求書）は登録できず、
+//!   `PortRegistryRebuild::unknown_port_holders` に数えるだけで不完全にはしない。残った DNAT は公開時のカーネル dump が
+//!   検出する。呼び出し側が本関数を呼ばない限り効果は無い（`PortRegistry::new()` の既定は未印のまま）
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -67,8 +86,8 @@ use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
 use crate::instrument::{NetOpKind, record_net_op};
 use crate::netlink_route::IpPrefix;
-use crate::network_store::MAX_MEMBERS_PER_NETWORK;
 use crate::network_store::realized::check_gateway;
+use crate::network_store::{GlobalLockGuard, MAX_MEMBERS_PER_NETWORK};
 use crate::network_store::{
     HostGeneration, InstallMode, MemberId, MemberIntent, MemberRecord, NetworkDefinition,
     NetworkLockGuard, RealizedIntent, RealizedOp, RealizedRecord, RecordedPublish, rebuild_ipam,
@@ -79,7 +98,10 @@ use crate::nftables_rules::NftRuleHandle;
 use super::NftApplyFailure;
 use super::delete::require_table_owned;
 use super::unpublish::{delete_published_rules_with, release_published_listener};
-use super::{PortRegistry, PublishedPort, UnpublishPortError, UnpublishRules};
+use super::{
+    EndpointId, NetworkName, PortPublish, PortRegistry, PublishedPort, UnpublishPortError,
+    UnpublishRules,
+};
 use crate::network_store::member::PublishState;
 
 /// 記録つきの操作の失敗。
@@ -851,7 +873,8 @@ fn restore_with(
 /// 削除する（各 1 本の ENOENT はそのルールが既に無い確認とみなし、残っているルールは確実に消す）。どちらかが ENOENT
 /// 以外で失敗すれば記録と予約を保つ。印が無い ENOENT は成功扱いにしない。記録に当該の公開が無い値は、解除済みを示す
 /// 永続記録が無いので受け付けず、DELRULE も予約の解放も行わない（予約は `delete_network` まで保持する）。
-/// `registry` が空（再起動直後）なら予約の解放は 0 件で成功する。
+/// `registry` が空（再起動直後で `rebuild_port_registry_recorded` を呼んでいない）なら予約の解放は 0 件で成功する
+/// （組み直した予約表なら、記録した公開の予約を 1 件解放する。#3362）。
 // 理由: 世代・ガード・メンバー・公開・予約表に、カーネル操作の 3 本の注入（照会・一括削除・1 本削除）と記録の書き込みを
 // 足した形で、まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
 #[allow(clippy::too_many_arguments)]
@@ -975,6 +998,146 @@ where
     match write_error {
         Some(error) => Err(uncommitted(error)),
         None => Ok(()),
+    }
+}
+
+/// [`rebuild_port_registry_recorded`] の診断レポート（REPAIR-4）。ログは出さない（net は葉 crate。呼び出し側が
+/// 件数と分類を構造化ログに出す）。所有トークンは載せない。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PortRegistryRebuild {
+    /// 走査したネットワーク数（定義が壊れたものを含む）。
+    pub networks: usize,
+    /// 新たに登録した受け口の数。
+    pub registered: usize,
+    /// 同じ持ち主で既に予約済みだった受け口の数（再実行・共有ファイル）。
+    pub already_held: usize,
+    /// 別の持ち主が持っていたため登録しなかった受け口の数。
+    pub conflicts: usize,
+    /// 読めない・食い違ったネットワーク（名前順）と分類。
+    pub broken: Vec<(String, NetErrorCode)>,
+    /// 受け口を特定できない保持の数（`members-intent/*`・ルールの一覧が無い quarantine の請求書）。
+    pub unknown_port_holders: usize,
+    /// `realized.intent` が残る（未照合の）ネットワーク数。
+    pub unreconciled_networks: usize,
+    /// 名前として不正な項目の数（自分の記録ではない）。
+    pub unrecognized: usize,
+}
+
+impl PortRegistryRebuild {
+    /// 予約表が記録と矛盾なく組み直せたか。偽なら `PortRegistry` に不完全の印が立っている。
+    pub fn is_complete(&self) -> bool {
+        self.broken.is_empty() && self.conflicts == 0
+    }
+}
+
+/// 記録から、再起動後の `PortRegistry` を組み直す（NET-3・REPAIR-4・#3362。方針はモジュール doc）。
+///
+/// `global` は共有・排他のどちらでもよい（各ネットワークは共有ロックで順に読む）。どの失敗経路でも、`Err` を返す前に
+/// `registry` へ不完全の印を立てる。読めないネットワークがあっても、他のネットワークの登録は続ける。
+pub fn rebuild_port_registry_recorded(
+    global: &GlobalLockGuard<'_>,
+    registry: &mut PortRegistry,
+) -> Result<PortRegistryRebuild, NetError> {
+    let mut report = PortRegistryRebuild::default();
+    let result = collect_recorded_listeners(global, &mut report)
+        .and_then(|entries| registry.adopt(&entries));
+    match result {
+        Ok(outcome) => {
+            report.registered = outcome.registered;
+            report.already_held = outcome.already_held;
+            report.conflicts = outcome.conflicts;
+            if report.is_complete() {
+                registry.clear_incomplete();
+            } else {
+                registry.mark_incomplete();
+            }
+            Ok(report)
+        }
+        Err(e) => {
+            registry.mark_incomplete();
+            Err(e)
+        }
+    }
+}
+
+type RecordedListener = (NetworkName, EndpointId, PortPublish);
+
+/// 全ネットワークの記録から登録すべき受け口を集める（レポートの診断欄も埋める）。
+fn collect_recorded_listeners(
+    global: &GlobalLockGuard<'_>,
+    report: &mut PortRegistryRebuild,
+) -> Result<Vec<RecordedListener>, NetError> {
+    let listing = global.list()?;
+    report.unrecognized = listing.unrecognized;
+    report.networks = listing.definitions.len() + listing.broken.len();
+    report.broken = listing.broken;
+    let mut entries = Vec::new();
+    for def in &listing.definitions {
+        let name = def.name();
+        let guard = match global.lock_network_shared(name) {
+            Ok(g) => g,
+            // 列挙から施錠までの間に消えた。`remove` はメンバーが残るネットワークを消さないので予約すべき行は無い。
+            Err(e) if e.code() == NetErrorCode::NotFound => continue,
+            Err(e) => {
+                report.broken.push((name.as_str().to_owned(), e.code()));
+                continue;
+            }
+        };
+        if let Err(e) = collect_network(&guard, report, &mut entries) {
+            report.broken.push((name.as_str().to_owned(), e.code()));
+        }
+    }
+    report.broken.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+/// 1 ネットワークの記録から受け口を集める。登録した後に見つけた不整合（所有トークン）は `Err` で返し、
+/// 集めた分は保つ（登録しすぎは安全側）。
+fn collect_network(
+    guard: &NetworkLockGuard<'_>,
+    report: &mut PortRegistryRebuild,
+    entries: &mut Vec<RecordedListener>,
+) -> Result<(), NetError> {
+    let name = guard.network().clone();
+    let realized = guard.realized()?;
+    if guard.realized_intent()?.is_some() {
+        report.unreconciled_networks += 1;
+    }
+    let members = guard.members()?;
+    let intents = guard.member_intents()?;
+    let reclaim = guard.reclaim_records()?;
+    report.unknown_port_holders += intents.len();
+    for claim in &reclaim.attach {
+        match claim.port_rules() {
+            Some(rules) => {
+                for rp in &rules.ports {
+                    entries.push((
+                        claim.network().clone(),
+                        claim.endpoint().clone(),
+                        *rp.publish(),
+                    ));
+                }
+            }
+            None if claim.includes_quarantine() => report.unknown_port_holders += 1,
+            None => {}
+        }
+    }
+    let mut mismatch = None;
+    for rec in &members {
+        for rp in rec.publishes() {
+            entries.push((name.clone(), rec.endpoint().clone(), *rp.publish()));
+        }
+        if let Some(r) = &realized
+            && let Err(e) = check_member_owned(r, rec)
+        {
+            mismatch.get_or_insert(e);
+        }
+    }
+    match (&realized, members.is_empty(), mismatch) {
+        (_, _, Some(e)) => Err(e),
+        (None, false, None) => Err(precondition("network is not realized")),
+        _ => Ok(()),
     }
 }
 
@@ -3492,5 +3655,317 @@ mod tests {
             r.unwrap_err().store_code(),
             Some(NetErrorCode::FailedPrecondition)
         );
+    }
+
+    // ---- #3362: 再起動後の PortRegistry の組み直し ----
+
+    fn c2() -> EndpointId {
+        EndpointId::new("c2").unwrap()
+    }
+
+    fn port_8081() -> PortPublish {
+        PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 8081, 80).unwrap()
+    }
+
+    /// `ports` を c2 から公開する試験。カーネル側の dump は空（予約表だけが検出する状況）で、公開の呼び出し回数を返す。
+    fn publish_from_c2(
+        ports: &[PortPublish],
+        reg: &mut PortRegistry,
+    ) -> (
+        Result<Vec<PublishedPort>, crate::network::PublishPortsError>,
+        u32,
+    ) {
+        let calls = std::cell::Cell::new(0u32);
+        let r = crate::network::publish_ports_with(
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(vec![(rule(5), rule(6))])
+            },
+            || Ok(crate::network::listener_dump::PublishedListeners::default()),
+            &created(),
+            &c2(),
+            pfx([10, 0, 0, 3], 24),
+            ports,
+            reg,
+        );
+        (r, calls.get())
+    }
+
+    /// NET-3・REPAIR-4・#3362（受け入れ条件 2）: 再起動を模して（ストアを開き直し）組み直すと、記録済みの公開と同じ
+    /// 受け口の新しい公開は `AlreadyExists` で拒否され、投入されない。無関係な受け口（8081）は通る。
+    #[test]
+    fn net3_3362_restart_rebuild_rejects_same_host_port() {
+        let t = Tmp::new("rebuild-reject");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        // 全体の排他ロックの下で呼べる（`GlobalLockGuard::list` を使うため自分のロックを待たない）。
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(
+            report,
+            PortRegistryRebuild {
+                networks: 1,
+                registered: 1,
+                ..Default::default()
+            }
+        );
+        assert!(report.is_complete() && !reg.is_incomplete());
+        assert_eq!(reg.len(), 1);
+        let (r, calls) = publish_from_c2(&[web_publish()], &mut reg);
+        assert_eq!(r.unwrap_err().error.code(), NetErrorCode::AlreadyExists);
+        assert_eq!(calls, 0, "重複は投入前に拒否する");
+        assert_eq!(reg.len(), 1);
+        let (r, calls) = publish_from_c2(&[port_8081()], &mut reg);
+        r.unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(reg.len(), 2);
+        // 再実行は冪等（同じ持ち主の予約は already_held）。
+        let again = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!((again.registered, again.already_held), (0, 1));
+    }
+
+    /// NET-3・#3362: 組み直した予約表で復元 → 個別解除すると予約が 1 件解放され（1 → 0）、同じ受け口を別の
+    /// endpoint が予約できる。
+    #[test]
+    fn net3_3362_rebuild_then_restore_unpublish_releases_reservation() {
+        let t = Tmp::new("rebuild-release");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::new();
+        rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(reg.len(), 1);
+        let n = g.lock_network(&name()).unwrap();
+        let p = restore_published_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let (r, _, count) = unpublish_with(&n, p, &mut reg, 42);
+        r.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(reg.len(), 0);
+        reg.reserve(&name(), &c2(), &[web_publish()]).unwrap();
+    }
+
+    /// NET-3・#3343・#3362: 墓標（ルールは消えたが予約が残る公開）も登録し、墓標の解除で予約が解放される。
+    #[test]
+    fn net3_3362_rebuild_registers_tombstone() {
+        let t = Tmp::new("rebuild-tomb");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        {
+            let n = g.lock_network(&name()).unwrap();
+            let rec = n.members().unwrap().remove(0);
+            n.replace_member(&rec.with_unpublished(&web_publish()).unwrap())
+                .unwrap();
+        }
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!((report.registered, reg.len()), (1, 1));
+        let n = g.lock_network(&name()).unwrap();
+        let p = restore_unpublished_ports_recorded(&host(), &n, &mid("c1"))
+            .unwrap()
+            .remove(0);
+        let (r, _, count) = unpublish_with(&n, p, &mut reg, 42);
+        r.unwrap();
+        assert_eq!((count, reg.len()), (0, 0));
+    }
+
+    /// NET-3・REPAIR-4・REPAIR-5・#3362（受け入れ条件 3）: メンバー記録が壊れていれば `broken` に分類つきで載せ、
+    /// 予約表は不完全の印を持ち、受け口を伴う予約を `FailedPrecondition` で拒否する（空の予約と解放は通る）。
+    /// 記録を直して組み直すと印が外れる。
+    #[test]
+    fn net3_3362_rebuild_corrupt_member_is_fail_closed() {
+        let t = Tmp::new("rebuild-corrupt");
+        attach_published(&t);
+        let path = t.0.join("@networks/web/members/c1");
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"garbage").unwrap();
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(
+            report.broken,
+            vec![("web".to_owned(), NetErrorCode::DataLoss)]
+        );
+        assert!(!report.is_complete() && reg.is_incomplete());
+        let e = reg.reserve(&name(), &c2(), &[port_8081()]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(reg.len(), 0);
+        reg.reserve(&name(), &c2(), &[]).unwrap();
+        assert_eq!(reg.release(&name(), &c2()).unwrap(), 0);
+        std::fs::write(&path, &good).unwrap();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert!(report.is_complete() && !reg.is_incomplete());
+        reg.reserve(&name(), &c2(), &[port_8081()]).unwrap();
+    }
+
+    /// NET-3・SEC-1・#3362: 所有トークンが別ネットワークのものになっているメンバー記録は、行を登録したうえで
+    /// `DataLoss` として不完全にする。
+    #[test]
+    fn net3_3362_rebuild_foreign_token_registers_and_marks_incomplete() {
+        let t = Tmp::new("rebuild-token");
+        attach_published(&t);
+        let path = t.0.join("@networks/web/members/c1");
+        let alt: String = BRIDGE_TOKEN
+            .chars()
+            .map(|c| if c == 'a' { 'b' } else { 'a' })
+            .collect();
+        let good = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        std::fs::write(&path, good.replace(BRIDGE_TOKEN, &alt).as_bytes()).unwrap();
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(
+            report.broken,
+            vec![("web".to_owned(), NetErrorCode::DataLoss)]
+        );
+        assert_eq!((report.registered, reg.len()), (1, 1));
+        assert!(reg.is_incomplete());
+    }
+
+    /// NET-3・#3362: 別の持ち主が先に予約していた受け口は `conflicts` に数え、持ち主を書き換えず不完全にする。
+    #[test]
+    fn net3_3362_rebuild_conflict_marks_incomplete() {
+        let t = Tmp::new("rebuild-conflict");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &c2(), &[web_publish()]).unwrap();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!((report.registered, report.conflicts), (0, 1));
+        assert!(reg.is_incomplete());
+        assert_eq!(reg.release(&name(), &c2()).unwrap(), 1);
+    }
+
+    /// NET-3・#3362: 共有ファイルの失敗（破損）は `Err` で返し、その前に不完全の印を立てる。
+    #[test]
+    fn net3_3362_rebuild_shared_file_failure_marks_incomplete() {
+        let t = Tmp::new("rebuild-shared-bad");
+        attach_published(&t);
+        let shared = t.0.join("ports.reg");
+        std::fs::write(&shared, b"junk").unwrap();
+        std::fs::set_permissions(&shared, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::with_shared_file(shared);
+        assert!(rebuild_port_registry_recorded(&g, &mut reg).is_err());
+        assert!(reg.is_incomplete());
+    }
+
+    /// NET-3・REPAIR-4・#3362: 受け口を特定できない保持（`members-intent`）は登録せず `unknown_port_holders` に数え、
+    /// 不完全にはしない。
+    #[test]
+    fn net3_3362_rebuild_member_intent_is_counted_not_registered() {
+        let t = Tmp::new("rebuild-intent");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        {
+            let n = g.lock_network(&name()).unwrap();
+            realize(&n);
+            let host_token = host_owner_token(
+                BRIDGE_TOKEN,
+                &EndpointId::new("c1").unwrap(),
+                "00000000000000000000000000000001",
+            );
+            n.write_member_intent(
+                &MemberIntent::new(
+                    mid("c1"),
+                    EndpointId::new("c1").unwrap(),
+                    pfx([10, 0, 0, 2], 24),
+                    &host_token,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(
+            (report.unknown_port_holders, report.registered, reg.len()),
+            (1, 0, 0)
+        );
+        assert!(report.is_complete() && !reg.is_incomplete());
+    }
+
+    /// NET-3・NET-1・#3285・#3362: ルールの一覧を持つ回収待ちの請求書の受け口を、請求書の endpoint の持ち主で登録する。
+    #[test]
+    fn net3_3362_rebuild_registers_claimed_rules() {
+        let t = Tmp::new("rebuild-claim");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        {
+            let n = g.lock_network(&name()).unwrap();
+            realize(&n);
+            let rules = ClaimedRules::new(
+                NftTableHandle::new(42).unwrap(),
+                vec![RecordedPublish::new(web_publish(), rule(2), rule(3))],
+            )
+            .unwrap();
+            n.save_reclaim_attach(
+                &super::super::FailedAttachClaim::for_test(
+                    name(),
+                    EndpointId::new("c1").unwrap(),
+                    BRIDGE_TOKEN,
+                    "0123456789abcdef0123456789abcdef",
+                    true,
+                    false,
+                    false,
+                )
+                .with_rules_for_test(rules),
+            )
+            .unwrap();
+        }
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!((report.registered, report.unknown_port_holders), (1, 0));
+        assert_eq!(
+            reg.reserve(&name(), &c2(), &[web_publish()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::AlreadyExists
+        );
+        assert_eq!(
+            reg.release(&name(), &EndpointId::new("c1").unwrap())
+                .unwrap(),
+            1
+        );
+    }
+
+    /// NET-3・#3362: 残った `realized.intent`（未照合）のネットワークも、メンバー記録は有効なので登録し、
+    /// `unreconciled_networks` に数える。
+    #[test]
+    fn net3_3362_rebuild_counts_unreconciled_network() {
+        let t = Tmp::new("rebuild-unreconciled");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        {
+            let n = g.lock_network(&name()).unwrap();
+            n.write_realized_intent(
+                &RealizedIntent::new(
+                    RealizedOp::Delete,
+                    name(),
+                    BRIDGE_TOKEN,
+                    pfx([10, 0, 0, 0], 24),
+                    pfx([10, 0, 0, 1], 24),
+                    host(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut reg = PortRegistry::new();
+        let report = rebuild_port_registry_recorded(&g, &mut reg).unwrap();
+        assert_eq!(
+            (report.registered, report.unreconciled_networks, reg.len()),
+            (1, 1, 1)
+        );
+        assert!(report.is_complete());
     }
 }

@@ -19,7 +19,9 @@ use fandhe_container_net::dns_helper::identity::read_identity;
 use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
 use fandhe_container_net::dns_helper::{DnsListenAddr, READY_TIMEOUT_DEFAULT};
 use fandhe_container_net::error::NetErrorCode;
-use fandhe_container_net::instrument::NoopNetOpRecorder;
+use fandhe_container_net::instrument::{
+    NetOpKind, NetOpOutcome, NetOpRecorder, NetOpSample, NoopNetOpRecorder,
+};
 use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
 
@@ -121,6 +123,7 @@ pub fn run(exe: &Path) {
     recover_intent_by_nonce(exe);
     start_failure_records(exe);
     stopped_stage2_is_reaped(exe);
+    spawn_write_count(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -480,6 +483,55 @@ fn stopped_stage2_is_reaped(_exe: &Path) {
         .parse()
         .expect("pid");
     assert!(gone(pid), "the stopped stage 2 must be killed");
+    drop(n);
+    drop(g);
+}
+
+/// 記録先に渡されたサンプルを溜める。
+#[derive(Default)]
+struct Collect(std::sync::Mutex<Vec<NetOpSample>>);
+impl NetOpRecorder for Collect {
+    fn record_net_op(&self, sample: &NetOpSample) {
+        self.0.lock().expect("lock").push(sample.clone());
+    }
+}
+
+/// #3414: `SPAWN` 行の時点で同一性を記録しても、成功した起動の `NetworkStoreDnsHelperWrite` は 3 回
+/// （意図記録の新規・同一性つきへの置き換え 1 回・`dns-helper`）のまま。レイテンシは PR 本文用に stderr へ出す。
+fn spawn_write_count(exe: &Path) {
+    let tmp = Tmp::new("wcount");
+    let rec = std::sync::Arc::new(Collect::default());
+    let store = NetworkStore::open_with_recorder(&tmp.0, rec.clone()).expect("open");
+    store
+        .create(&NetworkDefinition::pasta("dnsh").expect("def"))
+        .expect("create");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let lat: Vec<u128> = rec
+        .0
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|s| {
+            s.kind() == NetOpKind::NetworkStoreDnsHelperWrite
+                && s.outcome() == NetOpOutcome::Success
+        })
+        .map(|s| s.latency().as_micros())
+        .collect();
+    eprintln!(
+        "dns_helper_process: dns_helper_write samples={} latencies_us={lat:?}",
+        lat.len()
+    );
+    assert_eq!(lat.len(), 3, "intent, intent replace, dns-helper");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::Killed
+    );
+    assert!(gone(h.identity.pid));
     drop(n);
     drop(g);
 }

@@ -19,7 +19,6 @@ mod reap;
 
 use child_process::ChildProcess;
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -119,6 +118,7 @@ fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
 mod linux {
     use super::*;
     use std::fs;
+    use std::num::NonZeroU32;
     use std::sync::Arc;
 
     use fandhe_container_core::traits::{

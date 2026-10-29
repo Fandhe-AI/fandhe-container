@@ -7,18 +7,66 @@
 //! 再起動後は `network::reclaim_failed_attach`（Linux のみ）が所有を確かめてから回収する。
 //! 置き場所・排他は呼び出し側の責務（`docs/design/network-reclaim-persistence.md`）。
 //!
+//! # 記録の版（#3285）
+//!
+//! - v1: 資源のフラグ（veth・netns の pin・quarantine）だけ。DNAT ルールを持たない請求書は常に v1 で符号化し、
+//!   保存済みの v1 を復号して再び符号化してもバイト単位で同じになる（内容照合の削除・比較交換を壊さない）。
+//! - v2: v1 の 9 行に、`table-handle=`（DNAT ルールを投入した専用テーブルのハンドル）と `rule=`（公開 1 件の
+//!   受け口と `prerouting`・`output` のルールハンドル。1〜`MAX_PORT_PUBLISHES` 行）を足す。`detach_container` の
+//!   公開の個別解除が失敗して DNAT ルールが残りうるときだけ載り、再起動後も `reclaim_failed_attach` が
+//!   テーブルの所有と実体の同一性を確かめてからハンドル指定で消す。旧バイナリは v2 を版の不一致として拒否する
+//!   （fail-closed。v2 から v1 への引き戻しは非対応）。
+//!
 //! 記録は信頼しない入力として扱い、最終的な所有の判定はカーネル側の別名（`host_owner_token`）と
 //! master の一致で行う。netns の pin の置き場は記録に載せず、呼び出し側の固定設定から受ける。
 
 use crate::error::NetError;
+use crate::network_store::member::{RecordedPublish, check_publishes};
+use crate::nftables_batch::NftTableHandle;
 
 use super::{
     AttachResource, CLAIM_RECORD_MAX_LEN, CLAIM_TOKEN_MAX_LEN, ContainerAttachError, EndpointId,
-    NetworkName, invalid, is_valid_generation, parse_flag, token_names_network,
+    MAX_PORT_PUBLISHES, NetworkName, invalid, is_valid_generation, parse_flag, token_names_network,
 };
 
 /// 記録の先頭行（版）。
 const ATTACH_RECORD_VERSION_LINE: &str = "fandhe-net-attach-claim v1";
+/// DNAT ルールのハンドルを持つ記録の先頭行（版。#3285）。
+const ATTACH_RECORD_VERSION_LINE_V2: &str = "fandhe-net-attach-claim v2";
+
+/// 請求書が指す、取り残した DNAT ルール（公開 1 件ごとの受け口とルールハンドル）と、それを投入した専用
+/// テーブルのハンドル（NET-1・NET-3・#3285）。
+///
+/// 回収側（`reclaim_failed_attach`）は、テーブルの所有（`NFTA_TABLE_USERDATA` が請求書のトークンと一致）と
+/// 実体の同一性（生きたテーブルのハンドルが `table` と一致）を確かめてから、`ports` のハンドルを DELRULE する。
+/// `ports` は空にならず、受け口・ルールハンドルは重複しない（`new` が保つ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimedRules {
+    pub(crate) table: NftTableHandle,
+    pub(crate) ports: Vec<RecordedPublish>,
+}
+
+impl ClaimedRules {
+    /// 組み立てる。空・上限超過・整合違反（受け口やハンドルの重複、解除の印つき）は `None`
+    /// （呼び出し側は規則なしの請求書として扱い、quarantine と手動回収に委ねる）。
+    pub(crate) fn new(table: NftTableHandle, ports: Vec<RecordedPublish>) -> Option<Self> {
+        let sound = !ports.is_empty()
+            && ports.len() <= MAX_PORT_PUBLISHES
+            && !ports.iter().any(RecordedPublish::unpublishing)
+            && check_publishes(&ports).is_ok();
+        sound.then_some(Self { table, ports })
+    }
+}
+
+/// `table-handle=` の値（先頭の 0 なしの非 0 の 10 進。1〜20 桁）。
+fn decode_table_handle(v: &str) -> Result<NftTableHandle, NetError> {
+    let bad = || invalid("attach claim record table handle invalid");
+    if v.is_empty() || v.len() > 20 || v.starts_with('0') || !v.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    NftTableHandle::new(v.parse().map_err(|_| bad())?).map_err(|_| bad())
+}
 
 /// netns の pin の実体の識別子（作成時の `st_dev`・`st_ino` と、プロセス内で単調増加する作成の連番）。
 ///
@@ -78,6 +126,8 @@ pub struct FailedAttachClaim {
     /// netns の pin の実体の識別子。`netns` を含む請求書で、作成した pin を特定できたときだけ持つ。
     pin: Option<PinIdentity>,
     quarantine: bool,
+    /// 取り残した DNAT ルール（`detach_container` の公開の解除の失敗だけが載せる。あれば `quarantine` は真。#3285）。
+    rules: Option<ClaimedRules>,
 }
 
 impl FailedAttachClaim {
@@ -112,6 +162,7 @@ impl FailedAttachClaim {
             netns,
             pin,
             quarantine,
+            rules: None,
         })
     }
 
@@ -119,7 +170,8 @@ impl FailedAttachClaim {
     ///
     /// 世代は veth の所有トークン `host_token` の末尾 `/g/<世代>` から取る（入力検証で `host_token_is_for` を
     /// 通した値だけを渡す）。取れない・3 つのフラグがすべて偽なら `None`（`from_record` が資源なしの記録を
-    /// 拒否する規則と揃える）。`pin` は `netns` のときだけ持つ。
+    /// 拒否する規則と揃える）。`pin` は `netns` のときだけ持つ。`rules` があれば DNAT ルールが残りうるので
+    /// `quarantine` を真にする（#3285）。
     // 呼び出し元の `detach_container_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_detach(
@@ -131,7 +183,9 @@ impl FailedAttachClaim {
         veth: bool,
         netns: bool,
         quarantine: bool,
+        rules: Option<ClaimedRules>,
     ) -> Option<Self> {
+        let quarantine = quarantine || rules.is_some();
         if !(veth || netns || quarantine) {
             return None;
         }
@@ -148,13 +202,21 @@ impl FailedAttachClaim {
             netns,
             pin: if netns { pin } else { None },
             quarantine,
+            rules,
         })
     }
 
     /// 永続化記録（固定のテキスト。LF・ASCII）へ符号化する。
+    ///
+    /// DNAT ルールを持たない請求書は v1、持つ請求書だけ v2（モジュール doc）。
     pub fn to_record(&self) -> String {
-        format!(
-            "{ATTACH_RECORD_VERSION_LINE}\nnetwork={}\nendpoint={}\ntoken={}\ngeneration={}\nveth={}\nnetns={}\npin={}\nquarantine={}\n",
+        let version = if self.rules.is_some() {
+            ATTACH_RECORD_VERSION_LINE_V2
+        } else {
+            ATTACH_RECORD_VERSION_LINE
+        };
+        let mut out = format!(
+            "{version}\nnetwork={}\nendpoint={}\ntoken={}\ngeneration={}\nveth={}\nnetns={}\npin={}\nquarantine={}\n",
             self.network.as_str(),
             self.endpoint.as_str(),
             self.token,
@@ -163,7 +225,14 @@ impl FailedAttachClaim {
             u8::from(self.netns),
             self.pin.map_or_else(|| "-".to_owned(), PinIdentity::encode),
             u8::from(self.quarantine),
-        )
+        );
+        if let Some(rules) = &self.rules {
+            out.push_str(&format!("table-handle={}\n", rules.table.get()));
+            for p in &rules.ports {
+                out.push_str(&format!("rule={}\n", p.encode()));
+            }
+        }
+        out
     }
 
     /// [`FailedAttachClaim::to_record`] の記録を復号する。版・キーの順序・名前・トークン形式・フラグを
@@ -173,9 +242,11 @@ impl FailedAttachClaim {
             return Err(invalid("attach claim record too long"));
         }
         let mut lines = record.strip_suffix('\n').unwrap_or("").split('\n');
-        if !record.ends_with('\n') || lines.next() != Some(ATTACH_RECORD_VERSION_LINE) {
-            return Err(invalid("attach claim record version mismatch"));
-        }
+        let v2 = match lines.next() {
+            Some(ATTACH_RECORD_VERSION_LINE) if record.ends_with('\n') => false,
+            Some(ATTACH_RECORD_VERSION_LINE_V2) if record.ends_with('\n') => true,
+            _ => return Err(invalid("attach claim record version mismatch")),
+        };
         let mut field = |key: &str| -> Result<&str, NetError> {
             lines
                 .next()
@@ -194,9 +265,40 @@ impl FailedAttachClaim {
             v => Some(PinIdentity::decode(v)?),
         };
         let quarantine = parse_flag(field("quarantine")?)?;
-        if lines.next().is_some() {
-            return Err(invalid("attach claim record malformed"));
-        }
+        let table_handle = if v2 {
+            Some(decode_table_handle(field("table-handle")?)?)
+        } else {
+            None
+        };
+        let rules = match table_handle {
+            None => {
+                if lines.next().is_some() {
+                    return Err(invalid("attach claim record malformed"));
+                }
+                None
+            }
+            Some(table) => {
+                let mut ports = Vec::new();
+                for line in lines {
+                    let v = line
+                        .strip_prefix("rule=")
+                        .ok_or_else(|| invalid("attach claim record malformed"))?;
+                    if ports.len() >= MAX_PORT_PUBLISHES {
+                        return Err(invalid("attach claim record has too many rules"));
+                    }
+                    let p = RecordedPublish::decode(v)
+                        .map_err(|_| invalid("attach claim record rule invalid"))?;
+                    ports.push(p);
+                }
+                // 空・重複・解除の印つき・quarantine なしは拒否する（正準形を 1 つに保つ）。
+                let rules = ClaimedRules::new(table, ports)
+                    .ok_or_else(|| invalid("attach claim record rules invalid"))?;
+                if !quarantine {
+                    return Err(invalid("attach claim record rules without quarantine"));
+                }
+                Some(rules)
+            }
+        };
         if token.len() > CLAIM_TOKEN_MAX_LEN
             || !token.bytes().all(|b| b.is_ascii_graphic())
             || !token_names_network(token, &network)
@@ -221,6 +323,7 @@ impl FailedAttachClaim {
             netns,
             pin,
             quarantine,
+            rules,
         })
     }
 
@@ -244,8 +347,8 @@ impl FailedAttachClaim {
         self.netns
     }
 
-    /// プロセス内にだけ残る quarantine（アドレス・DNAT ルール・ポート予約）を含むか。カーネル側で個別に
-    /// 回収する対象は無く、解放は `delete_network` が行う。
+    /// quarantine（アドレス・ポート予約と、ルールのハンドルを持てなかった DNAT ルール）を含むか。解放は
+    /// `delete_network` が行う。ハンドルを請求書に載せた DNAT ルールは `reclaim_failed_attach` が消す（#3285）。
     pub fn includes_quarantine(&self) -> bool {
         self.quarantine
     }
@@ -257,6 +360,7 @@ impl FailedAttachClaim {
             veth: false,
             netns: false,
             pin: None,
+            rules: None,
             ..self.clone()
         })
     }
@@ -271,6 +375,12 @@ impl FailedAttachClaim {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn pin(&self) -> Option<PinIdentity> {
         self.pin
+    }
+
+    /// 回収側（`delete.rs`）が消す DNAT ルール（無ければ `None`。#3285）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn port_rules(&self) -> Option<&ClaimedRules> {
+        self.rules.as_ref()
     }
 
     /// 回収側（`delete.rs`）が所有の証明に使う bridge のトークン。
@@ -299,7 +409,16 @@ impl FailedAttachClaim {
             netns,
             pin: netns.then_some(TEST_PIN),
             quarantine,
+            rules: None,
         }
+    }
+
+    /// テスト用: DNAT ルールを持たせる（`quarantine` も真にする）。
+    #[cfg(test)]
+    pub(crate) fn with_rules_for_test(mut self, rules: ClaimedRules) -> Self {
+        self.quarantine = true;
+        self.rules = Some(rules);
+        self
     }
 
     /// テスト用: pin の識別子を差し替える。
@@ -419,5 +538,168 @@ mod tests {
             let err = FailedAttachClaim::from_record(&r).unwrap_err();
             assert_eq!(err.code(), NetErrorCode::InvalidArgument, "{r:?}");
         }
+    }
+
+    fn rp(host_port: u16, pre: u64, out: u64) -> RecordedPublish {
+        use crate::network::{PortProtocol, PortPublish};
+        use crate::nftables_rules::NftRuleHandle;
+        RecordedPublish::new(
+            PortPublish::new(
+                PortProtocol::Tcp,
+                std::net::Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .unwrap(),
+            NftRuleHandle::new(pre).unwrap(),
+            NftRuleHandle::new(out).unwrap(),
+        )
+    }
+
+    fn th(h: u64) -> NftTableHandle {
+        NftTableHandle::new(h).unwrap()
+    }
+
+    fn v2_claim() -> FailedAttachClaim {
+        FailedAttachClaim::for_test(
+            n("web"),
+            e("c1"),
+            "fandhe-net:web:1:2:3",
+            GEN,
+            false,
+            false,
+            true,
+        )
+        .with_rules_for_test(
+            ClaimedRules::new(th(99), vec![rp(8080, 2, 3), rp(8081, 4, 5)]).unwrap(),
+        )
+    }
+
+    const V2_REC: &str = "fandhe-net-attach-claim v2\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=0\nnetns=0\npin=-\nquarantine=1\ntable-handle=99\nrule=tcp 192.0.2.10:8080 80 2 3\nrule=tcp 192.0.2.10:8081 80 4 5\n";
+
+    /// NET-1・#3285: DNAT ルールを持つ請求書は v2 で符号化され、完全一致し、往復で等しくなる。
+    #[test]
+    fn net1_3285_attach_claim_v2_record_roundtrip() {
+        let c = v2_claim();
+        let rec = c.to_record();
+        assert_eq!(rec, V2_REC);
+        let back = FailedAttachClaim::from_record(&rec).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.to_record(), rec);
+        assert_eq!(back.port_rules().unwrap().table, th(99));
+        assert_eq!(back.port_rules().unwrap().ports.len(), 2);
+    }
+
+    /// NET-1・#3285: 規則を持たない請求書は従来どおり v1 のままで、`quarantine_only` は規則を落として v1 を返す。
+    #[test]
+    fn net1_3285_attach_claim_v1_unchanged_and_quarantine_only_drops_rules() {
+        let c = FailedAttachClaim::for_test(
+            n("web"),
+            e("c1"),
+            "fandhe-net:web:1:2:3",
+            GEN,
+            false,
+            false,
+            true,
+        );
+        assert!(c.to_record().starts_with("fandhe-net-attach-claim v1\n"));
+        let q = v2_claim().quarantine_only().unwrap();
+        assert_eq!(q.port_rules(), None);
+        assert_eq!(q.to_record(), c.to_record());
+    }
+
+    /// NET-1・SEC-1・#3285: 不正な v2 の記録は `InvalidArgument` で拒否する。
+    #[test]
+    fn net1_3285_attach_claim_v2_rejects_malformed() {
+        let r1 = "rule=tcp 192.0.2.10:8080 80 2 3\n";
+        let r2 = "rule=tcp 192.0.2.10:8081 80 4 5\n";
+        let head = V2_REC.split("table-handle=").next().unwrap().to_owned();
+        let many = |k: usize| {
+            (0..k)
+                .map(|i| {
+                    format!(
+                        "rule=tcp 192.0.2.10:{} 80 {} {}\n",
+                        1000 + i,
+                        10 + 2 * i,
+                        11 + 2 * i
+                    )
+                })
+                .collect::<String>()
+        };
+        let cases: Vec<String> = vec![
+            // 規則が空。
+            format!("{head}table-handle=99\n"),
+            // quarantine=0。
+            format!(
+                "{}table-handle=99\n{r1}",
+                head.replace("quarantine=1", "quarantine=0")
+            ),
+            // table-handle の欠落・0・先頭の 0・21 桁・非数字。
+            format!("{head}{r1}"),
+            format!("{head}table-handle=0\n{r1}"),
+            format!("{head}table-handle=099\n{r1}"),
+            format!("{head}table-handle=123456789012345678901\n{r1}"),
+            format!("{head}table-handle=9x\n{r1}"),
+            // 規則が非正準・解除の印・pre と out が同じ。
+            format!("{head}table-handle=99\nrule=tcp 192.0.2.10:8080 80 02 3\n"),
+            format!("{head}table-handle=99\nrule=tcp 192.0.2.10:8080 80 2 3 unpublishing\n"),
+            format!("{head}table-handle=99\nrule=tcp 192.0.2.10:8080 80 2 2\n"),
+            // 受け口の重複・ハンドルの重複。
+            format!("{head}table-handle=99\n{r1}{r1}"),
+            format!("{head}table-handle=99\n{r1}rule=tcp 192.0.2.10:8081 80 3 9\n"),
+            // 65 件。
+            format!("{head}table-handle=99\n{}", many(65)),
+            // 余分な行・順序違い・CRLF。
+            format!("{head}table-handle=99\n{r1}{r2}extra=1\n"),
+            format!("{head}{r1}table-handle=99\n"),
+            V2_REC.replace('\n', "\r\n"),
+        ];
+        for r in cases {
+            let err = FailedAttachClaim::from_record(&r).unwrap_err();
+            assert_eq!(err.code(), NetErrorCode::InvalidArgument, "{r:?}");
+        }
+        // 64 件は受理され、往復で一致する。
+        let ok = format!("{head}table-handle=99\n{}", many(64));
+        assert_eq!(FailedAttachClaim::from_record(&ok).unwrap().to_record(), ok);
+    }
+
+    /// NET-1・REPAIR-12・#3285: 最悪値の v2 の記録が `CLAIM_RECORD_MAX_LEN` に収まり、復号できる。
+    #[test]
+    fn net1_3285_attach_claim_worst_case_fits() {
+        use crate::network::{CLAIM_RECORD_MAX_LEN, PortProtocol, PortPublish};
+        let name = "a".repeat(64);
+        let endpoint = "b".repeat(64);
+        // トークンは `token_names_network` を満たす最長（256 バイト）。
+        let prefix = format!("fandhe-net:{name}:");
+        let token = format!("{prefix}{}", "1".repeat(256 - prefix.len()));
+        assert_eq!(token.len(), 256);
+        let max = u64::MAX;
+        let ports: Vec<RecordedPublish> = (0..64u64)
+            .map(|i| {
+                RecordedPublish::new(
+                    PortPublish::new(
+                        PortProtocol::Udp,
+                        std::net::Ipv4Addr::new(223, 255, 255, 255),
+                        65000 + i as u16,
+                        65535,
+                    )
+                    .unwrap(),
+                    crate::nftables_rules::NftRuleHandle::new(max - 2 * i).unwrap(),
+                    crate::nftables_rules::NftRuleHandle::new(max - 2 * i - 1).unwrap(),
+                )
+            })
+            .collect();
+        let mut c =
+            FailedAttachClaim::for_test(n(&name), e(&endpoint), &token, GEN, true, true, true)
+                .with_rules_for_test(ClaimedRules::new(th(max), ports).unwrap());
+        c.pin = Some(PinIdentity {
+            dev: max,
+            ino: max,
+            serial: max,
+        });
+        let rec = c.to_record();
+        assert!(rec.len() <= CLAIM_RECORD_MAX_LEN, "{}", rec.len());
+        assert_eq!(rec.len(), 5666, "最悪値の長さ（上限の根拠の確認）");
+        assert_eq!(FailedAttachClaim::from_record(&rec), Ok(c));
     }
 }

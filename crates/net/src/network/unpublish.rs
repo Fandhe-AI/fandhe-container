@@ -17,6 +17,9 @@
 //!    ハンドルが変わり、記録したルールハンドルは別のルールを指しうるため、食い違えば DELRULE を送らず
 //!    `FailedPrecondition`（[`UnpublishRules::StaleHandles`]）で断る
 //! 3. `DELRULE` 2 本を 1 バッチ（all-or-nothing）で送る
+//!    DELRULE が失敗しても、未束縛の [`PublishedPort`] へ生きたテーブルのハンドルを束ねない（公開時の実体を
+//!    証明できない値を、同名で作り直されたテーブルのハンドルで埋めて請求書に載せると、回収が別の公開ルールを
+//!    消しうる。テーブルハンドルは公開時に取得した値だけが請求書に載る。#3285）
 //! 4. 結果: 成功なら受け口の予約を戻す。`Aborted` / `NotSent` ならルールは残っている（確定）ので予約を
 //!    保持し [`PublishedPort`] を返して再試行できるようにする。結果不明（`Unknown`）も予約を保持する
 //!    （quarantine。残ったルールが同じ受け口で別のコンテナへ転送する事故を防ぐ）。ENOENT を「既に消えた」と
@@ -462,9 +465,42 @@ mod tests {
             assert_eq!(e.error.code(), NetErrorCode::NotFound);
             assert_eq!(e.rules, UnpublishRules::Present);
             assert!(e.reservation_held);
+            // 未束縛の公開は生きたテーブルのハンドルを束ねられずに返る（#3285）。
             assert_eq!(e.published, Some(Box::new(published(TOKEN, "web"))));
             assert_eq!(reg.len(), 1, "no inference from ENOENT");
         }
+    }
+
+    /// NET-3・NET-1・#3285: DELRULE が失敗しても、未束縛の公開へ生きたテーブルのハンドルを束ねない
+    /// （同名で作り直されたテーブルの値を請求書へ載せない）。束縛済みの値は変えない。
+    #[test]
+    fn net1_3285_unpublish_failure_never_binds_live_table_handle() {
+        for (code, outcome) in [
+            (NetErrorCode::Internal, NftBatchOutcome::Aborted),
+            (NetErrorCode::Timeout, NftBatchOutcome::Unknown),
+        ] {
+            let mut reg = reserved();
+            let (r, _, _) = run(
+                info(TOKEN.as_bytes()),
+                Err(fail(code, outcome)),
+                published(TOKEN, "web"),
+                &mut reg,
+            );
+            let p = r.unwrap_err().published.unwrap();
+            assert_eq!(p.table_handle(), None);
+        }
+        // 束縛済み（生きたものと一致する 99）はそのまま。
+        let mut reg = reserved();
+        let (r, _, _) = run(
+            info(TOKEN.as_bytes()),
+            Err(fail(NetErrorCode::Internal, NftBatchOutcome::Aborted)),
+            published_at(99),
+            &mut reg,
+        );
+        assert_eq!(
+            r.unwrap_err().published.unwrap().table_handle(),
+            NftTableHandle::new(99).ok()
+        );
     }
 
     /// NET-3: 結果不明は予約を保持して quarantine（ルールは Unknown）。

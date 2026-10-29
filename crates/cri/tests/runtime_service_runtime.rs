@@ -2197,9 +2197,9 @@ async fn cri2_repair5_3142_remove_container_future_drop_cancels_worker() {
 /// `runtime_owned`）で記録を保持し、続く RemoveContainer（delete → 続きから解放）で回収できる。
 ///
 /// RPC の期限と巻き戻しの解放の期限はどちらも同じ `runtime_timeout` のため、prepare が即座に失敗すると RPC の
-/// コードが OS のタイマー粒度の競争で決まる（macOS・Windows で `ResourceExhausted` になった。#3257）。そこで
-/// prepare を保留して RPC の期限切れ（`DeadlineExceeded`）を先に確定させ、保留を解いた後の巻き戻しの解放が
-/// 期限で打ち切られることを照合する。
+/// コードが OS のタイマー粒度の競争で決まっていた（macOS・Windows で `ResourceExhausted` になった。#3257）。
+/// #3307 で解放の打ち切りは `DeadlineExceeded` に揃えた（競争の場面は下の `cri2_repair5_3307_*` が照合する）。
+/// 本試験は prepare を保留して RPC の期限切れを先に確定させる経路の照合として残す。
 #[tokio::test]
 async fn cri2_repair5_3142_create_rollback_release_is_bounded() {
     let h = harness();
@@ -2240,6 +2240,48 @@ async fn cri2_repair5_3142_create_rollback_release_is_bounded() {
     assert_eq!(only_container_id(&service).await, id);
     retry_remove_until_ok(&service, &bundles, &id).await;
     assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-4・REPAIR-5（#3307）: prepare が即座に失敗し、巻き戻しの解放が期限で打ち切られる場面（#3257 で
+/// OS により `ResourceExhausted` と `DeadlineExceeded` に揺れた競争そのもの）でも、3 OS で常に `DeadlineExceeded`
+/// と固定文言を返す。記録は結果不明で残り、続く RemoveContainer で回収できる。
+#[tokio::test]
+async fn cri2_repair5_3307_create_rollback_cut_returns_deadline_exceeded() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.slow_release_ms.store(5_000, Ordering::SeqCst);
+    let bundles = h.bundles.clone();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(300));
+    let sb = run_sandbox(&service).await;
+    let started = std::time::Instant::now();
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert_eq!(err.message(), "runtime operation timed out");
+    assert!(started.elapsed() < Duration::from_millis(900));
+    wait_cuts(&bundles, 1, Duration::from_millis(600)).await;
+    assert_eq!(list_count(&service).await, 1);
+    let id = only_container_id(&service).await;
+    assert_eq!(state_of(&service, &id).await, S::ContainerUnknown as i32);
+    retry_remove_until_ok(&service, &bundles, &id).await;
+    assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-5（#3307）: 解放が期限以外の理由で失敗したときは、元のコード（prepare の `ResourceExhausted`）を
+/// 保つ。記録は結果不明で残る。
+#[tokio::test]
+async fn cri2_repair5_3307_create_rollback_release_failure_keeps_original_code() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.fail_release.store(true, Ordering::SeqCst);
+    let service = h.service;
+    let sb = run_sandbox(&service).await;
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::ResourceExhausted);
+    assert_eq!(list_count(&service).await, 1);
+    let id = only_container_id(&service).await;
+    assert_eq!(state_of(&service, &id).await, S::ContainerUnknown as i32);
 }
 
 /// CRI-2・REPAIR-5（#3142）: 手放した Create（RPC の期限切れで取り消しの旗が立った後）の巻き戻しの解放は、その旗で

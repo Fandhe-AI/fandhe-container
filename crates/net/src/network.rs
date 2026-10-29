@@ -119,7 +119,7 @@
 //! - コンテナ単位のポート公開解除
 //!   （公開は attach 後にも `publish_container_ports` で追加でき、NEWRULE の echo 応答から取ったルールハンドルを
 //!   [`PublishedPort`] で返す。個別の解除は `unpublish_container_port`。#2676・#2839・NET-3・NET-4。
-//!   再起動後のハンドル復元は未実装）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
+//!   再起動後のハンドルは `recorded` のメンバー記録から復元する。#3068）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
 //! - IPAM 状態の永続化。担当 Issue 未確定（コンテナ単体の切り離しは `detach_container` で追加済み。#3062。作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
 //!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで。再起動後のネットワーク本体は手動。
@@ -2378,7 +2378,8 @@ fn publish_failed(
 /// DNAT の投入は `timeout` の 1 つの期限を共有する。
 ///
 /// # 未実装範囲（REPAIR-3）
-/// [`PublishedPort`] のプロセス再起動後の復元は無い（`delete_network` がテーブルごと解放する）。
+/// [`PublishedPort`] のプロセス再起動後の復元は、記録つきの経路（`recorded` の attach が `members/<id>` に記録する。#3068）
+/// だけ。この関数単独の結果は記録されず、記録の無い公開は `delete_network` がテーブルごと解放する。
 /// host の `ip_forward` は別途必要（masquerade は `create_network` が投入済み）。dump から投入までの間に別の状態ルートが割り込む窓は
 /// 残る（共有ロックと事後確認は未実装。`listener_dump` の未実装範囲）。
 #[cfg(target_os = "linux")]

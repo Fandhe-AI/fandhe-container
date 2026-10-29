@@ -14,13 +14,18 @@
 //! ifindex <len>\n<10 進>\n                   bridge <len>\n<bridge 名>\n
 //! token <len>\n<所有トークン>\n               token <len>\n<所有トークン>\n
 //! table <len>\n<nft テーブル名>\n             subnet <len>\n<a.b.c.d/nn>\n
+//! table-handle <len>\n<10 進・非 0>\n
 //! gateway <len>\n<a.b.c.d/nn>\n
 //! subnet <len>\n<a.b.c.d/nn>\n
 //! ```
 //! 復号は `bridge`・`table` がネットワーク名から導出した名前と一致すること、`token` がそのネットワークの発行形式で
 //! あること、`gateway` が `subnet` に属すること（prefix 長一致・network / broadcast でない）を検査する。
-//! `CreatedNetwork::name_resolution` は列挙に無いため記録しない（復元時は呼び出し側が渡す）。nft テーブルの handle と
-//! 公開の記録は #3068。
+//! `CreatedNetwork::name_resolution` は列挙に無いため記録しない（復元時は呼び出し側が渡す）。
+//!
+//! `table-handle` は作成直後に GETTABLE で確かめた nft テーブルのカーネル採番ハンドルで必須項目（#3068・NET-3）。
+//! 再起動後の公開の個別解除が、`members/<id>` に記録したルールハンドルを使う前に生きたテーブルのハンドルと照合する鍵で、
+//! テーブルが作り直されていれば値が変わる。書き込み側（supervisor #3074・plugin-cri #3075）が未着手で FCREA1 の出荷済みの
+//! 環境が無いため、magic は変えず必須にした（旧形式の記録は `DataLoss`）。公開の記録は `member`。
 
 use super::codec::{
     bad, finish, format_prefix, open, parse_prefix, push_field, take_field, token_is_sane,
@@ -29,7 +34,7 @@ use crate::error::NetError;
 use crate::etc_hosts::NameResolution;
 use crate::netlink_route::{IfIndex, IfName, IpPrefix};
 use crate::network::{CreatedNetwork, NetworkName, NetworkResourceNames, token_names_network};
-use crate::nftables_batch::NftName;
+use crate::nftables_batch::{NftName, NftTableHandle};
 
 const REALIZED_MAGIC: &str = "FCREA1\n";
 const INTENT_MAGIC: &str = "FCRIN1\n";
@@ -69,27 +74,155 @@ pub(crate) fn check_gateway(gateway: &IpPrefix, subnet: &IpPrefix) -> Result<(),
     Ok(())
 }
 
+/// network namespace の同一性（`/proc/<..>/ns/net` の st_dev・st_ino）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetnsIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl NetnsIdentity {
+    /// 値から作る。
+    pub fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    /// st_dev。
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    /// st_ino。
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// 呼び出したスレッド自身の network namespace（`/proc/thread-self/ns/net`）。
+    ///
+    /// `/proc/self` はメインスレッドの namespace を指すため使わない。netlink ソケットは作成したスレッドの
+    /// namespace に束縛されるので、ソケットを開く直前にこの値を採ってソケット型へ持たせ、記録の書き込みと
+    /// 照合はソケットの値で行う（別スレッドが unshare / setns した後に開いたソケットを取り違えない。
+    /// NET-3・SEC-1・#3068）。
+    #[cfg(target_os = "linux")]
+    pub fn of_current_thread() -> Result<Self, NetError> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata("/proc/thread-self/ns/net").map_err(|_| {
+            NetError::new(
+                crate::error::NetErrorCode::Internal,
+                "cannot read the thread network namespace identity",
+            )
+        })?;
+        Ok(Self::new(meta.dev(), meta.ino()))
+    }
+
+    /// 非 Linux には nft が無く意味が無い。OS 非依存の本体を試験できるよう固定値を返す。
+    #[cfg(not(target_os = "linux"))]
+    pub fn of_current_thread() -> Result<Self, NetError> {
+        Ok(Self::new(0, 0))
+    }
+}
+
+/// nft のテーブルハンドルが有効な「ホストの世代」: boot ID と、nft 要求を送るソケットの network namespace の
+/// 同一性。ハンドルは永続的な識別子ではなく、再起動や namespace の再作成後に同じ数値が再利用されうるため、
+/// 記録したハンドルを使う前に現在の世代と一致することを確かめる（NET-3・SEC-1・#3068）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGeneration {
+    boot_id: String,
+    netns: NetnsIdentity,
+}
+
+impl HostGeneration {
+    /// boot ID は UUID 形式（36 文字の小文字 16 進とハイフン）に限る。
+    pub fn new(boot_id: &str, netns: NetnsIdentity) -> Result<Self, NetError> {
+        let ok = boot_id.len() == 36
+            && boot_id
+                .bytes()
+                .all(|b| b == b'-' || b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !ok {
+            return Err(bad("host generation boot id is malformed"));
+        }
+        Ok(Self {
+            boot_id: boot_id.to_owned(),
+            netns,
+        })
+    }
+
+    /// 現在の boot ID と、操作対象の（ソケットが束縛された）namespace の世代を作る。
+    #[cfg(target_os = "linux")]
+    pub fn for_netns(netns: NetnsIdentity) -> Result<Self, NetError> {
+        use std::io::Read;
+        let io = |_: std::io::Error| {
+            NetError::new(
+                crate::error::NetErrorCode::Internal,
+                "cannot read the host generation",
+            )
+        };
+        // boot_id は 37 バイト（UUID と改行）。上限つきで読む。
+        let mut buf = Vec::new();
+        std::fs::File::open("/proc/sys/kernel/random/boot_id")
+            .map_err(io)?
+            .take(64)
+            .read_to_end(&mut buf)
+            .map_err(io)?;
+        let text = std::str::from_utf8(&buf)
+            .map_err(|_| bad("host generation boot id is not UTF-8"))?
+            .trim_end_matches('\n');
+        Self::new(text, netns)
+    }
+
+    /// 非 Linux には nft が無く世代の意味が無い。OS 非依存の本体を試験できるよう固定値を返す。
+    #[cfg(not(target_os = "linux"))]
+    pub fn for_netns(netns: NetnsIdentity) -> Result<Self, NetError> {
+        Self::new("00000000-0000-0000-0000-000000000000", netns)
+    }
+
+    /// 呼び出したスレッドの namespace の世代（試験と、ソケットを使わない呼び出しの用）。
+    pub fn current() -> Result<Self, NetError> {
+        Self::for_netns(NetnsIdentity::of_current_thread()?)
+    }
+
+    /// boot ID。
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    /// namespace の同一性。
+    pub fn netns(&self) -> NetnsIdentity {
+        self.netns
+    }
+}
+
 /// カーネル資源の作成に成功したネットワークの記録（FCREA1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealizedRecord {
+    generation: HostGeneration,
     name: NetworkName,
     bridge: IfName,
     ifindex: IfIndex,
     token: String,
     table: NftName,
+    table_handle: NftTableHandle,
     gateway: IpPrefix,
     subnet: IpPrefix,
 }
 
 impl RealizedRecord {
-    /// 作成結果と定義の subnet から作る。名前の導出・トークン・gateway の所属が食い違えば `DataLoss`。
-    pub fn from_created(created: &CreatedNetwork, subnet: IpPrefix) -> Result<Self, NetError> {
+    /// 作成結果と定義の subnet、作成直後に確かめたテーブルハンドルから作る。名前の導出・トークン・gateway の
+    /// 所属が食い違えば `DataLoss`。
+    pub fn from_created(
+        created: &CreatedNetwork,
+        subnet: IpPrefix,
+        table_handle: NftTableHandle,
+        generation: HostGeneration,
+    ) -> Result<Self, NetError> {
         let rec = Self {
+            generation,
             name: created.name.clone(),
             bridge: created.bridge.clone(),
             ifindex: created.bridge_index,
             token: created.bridge_token.clone(),
             table: created.table.clone(),
+            table_handle,
             gateway: created.gateway,
             subnet,
         };
@@ -133,6 +266,16 @@ impl RealizedRecord {
         &self.token
     }
 
+    /// テーブルハンドルを採った時点のホストの世代。
+    pub fn generation(&self) -> &HostGeneration {
+        &self.generation
+    }
+
+    /// 作成時に確かめた nft テーブルのハンドル（公開の解除の照合に使う。#3068）。
+    pub fn table_handle(&self) -> NftTableHandle {
+        self.table_handle
+    }
+
     /// gateway（prefix 長つき）。
     pub fn gateway(&self) -> IpPrefix {
         self.gateway
@@ -151,6 +294,20 @@ impl RealizedRecord {
         push_field(&mut out, "ifindex", &self.ifindex.get().to_string());
         push_field(&mut out, "token", &self.token);
         push_field(&mut out, "table", self.table.as_str());
+        push_field(
+            &mut out,
+            "table-handle",
+            &self.table_handle.get().to_string(),
+        );
+        push_field(&mut out, "boot-id", &self.generation.boot_id);
+        push_field(
+            &mut out,
+            "netns",
+            &format!(
+                "{}:{}",
+                self.generation.netns.dev, self.generation.netns.ino
+            ),
+        );
         push_field(&mut out, "gateway", &format_prefix(&self.gateway));
         push_field(&mut out, "subnet", &format_prefix(&self.subnet));
         out.into_bytes()
@@ -171,15 +328,32 @@ impl RealizedRecord {
             .ok_or_else(|| bad("realized record ifindex is malformed"))?;
         let token = take_field(&mut rest, "token")?.to_owned();
         let table = NftName::new(take_field(&mut rest, "table")?).map_err(invalid_value)?;
+        let handle = take_field(&mut rest, "table-handle")?;
+        let table_handle = handle
+            .parse::<u64>()
+            .ok()
+            .filter(|n| n.to_string() == handle)
+            .and_then(|n| NftTableHandle::new(n).ok())
+            .ok_or_else(|| bad("realized record table handle is malformed"))?;
+        let boot_id = take_field(&mut rest, "boot-id")?;
+        let netns = take_field(&mut rest, "netns")?;
+        let generation = netns
+            .split_once(':')
+            .and_then(|(d, i)| Some((d.parse::<u64>().ok()?, i.parse::<u64>().ok()?)))
+            .filter(|(d, i)| format!("{d}:{i}") == netns)
+            .ok_or_else(|| bad("realized record netns identity is malformed"))
+            .and_then(|(d, i)| HostGeneration::new(boot_id, NetnsIdentity::new(d, i)))?;
         let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
         let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
         finish(rest)?;
         let rec = Self {
+            generation,
             name,
             bridge,
             ifindex,
             token,
             table,
+            table_handle,
             gateway,
             subnet,
         };
@@ -325,6 +499,10 @@ mod tests {
         }
     }
 
+    fn th(n: u64) -> NftTableHandle {
+        NftTableHandle::new(n).unwrap()
+    }
+
     fn code<T: std::fmt::Debug>(r: Result<T, NetError>) -> NetErrorCode {
         r.unwrap_err().code()
     }
@@ -333,10 +511,21 @@ mod tests {
     #[test]
     fn net1_3067_realized_encode_exact_and_roundtrip() {
         let c = created();
-        let r = RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24)).unwrap();
+        let r = RealizedRecord::from_created(
+            &c,
+            pfx([10, 0, 0, 0], 24),
+            th(42),
+            HostGeneration::new(
+                "0123abcd-4567-89ab-cdef-0123456789ab",
+                NetnsIdentity::new(5, 4026531833),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.table_handle().get(), 42);
         let text = String::from_utf8(r.encode()).unwrap();
         let expected = format!(
-            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
+            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ntable-handle 2\n42\nboot-id 36\n0123abcd-4567-89ab-cdef-0123456789ab\nnetns 12\n5:4026531833\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
             c.bridge.as_str().len(),
             c.bridge.as_str(),
             c.table.as_str().len(),
@@ -349,11 +538,37 @@ mod tests {
         assert_eq!(back.subnet(), pfx([10, 0, 0, 0], 24));
     }
 
+    /// NET-3・SEC-1・#3068: 世代の無い旧形式（boot-id・netns 行が無い FCREA1）は DataLoss で拒否する。
+    #[test]
+    fn net3_3068_realized_without_generation_is_rejected() {
+        let c = created();
+        let old = format!(
+            "FCREA1\nname 3\nweb\nbridge {}\n{}\nifindex 1\n7\ntoken 20\n{TOKEN}\ntable {}\n{}\ntable-handle 2\n42\ngateway 11\n10.0.0.1/24\nsubnet 11\n10.0.0.0/24\n",
+            c.bridge.as_str().len(),
+            c.bridge.as_str(),
+            c.table.as_str().len(),
+            c.table.as_str()
+        );
+        assert_eq!(
+            code(RealizedRecord::decode(old.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// 環境に依らない固定の世代（netns の符号化長を固定: `5:4026531833` は 12 バイト）。
+    fn fixed_generation() -> HostGeneration {
+        HostGeneration::new(
+            "0123abcd-4567-89ab-cdef-0123456789ab",
+            NetnsIdentity::new(5, 4026531833),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn net1_3067_realized_decode_rejects_malformed() {
         let c = created();
         let good = String::from_utf8(
-            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24))
+            RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24), th(42), fixed_generation())
                 .unwrap()
                 .encode(),
         )
@@ -362,6 +577,23 @@ mod tests {
             good.replace("FCREA1", "FCREA2"),
             good.replace("ifindex 1\n7", "ifindex 1\n0"),
             good.replace("ifindex 1\n7", "ifindex 2\n07"),
+            // #3068: テーブルハンドルの欠落・0・先頭 0・符号・範囲外・順序違い。
+            good.replace("table-handle 2\n42\n", ""),
+            // NET-3・SEC-1・#3068: 世代（boot ID・netns）の欠落（旧形式）・不正値・順序違いは fail-closed。
+            good.replace(
+                &format!("boot-id 36\n{}\n", fixed_generation().boot_id()),
+                "",
+            ),
+            good.replace("netns 12\n", "netns 3\nx\n"),
+            good.replace("boot-id 36", "boot-id 35"),
+            good.replace("table-handle 2\n42", "table-handle 1\n0"),
+            good.replace("table-handle 2\n42", "table-handle 3\n042"),
+            good.replace("table-handle 2\n42", "table-handle 3\n+42"),
+            good.replace(
+                "table-handle 2\n42",
+                "table-handle 20\n18446744073709551616",
+            ),
+            good.replace("table-handle 2\n42", "table-handle 0\n"),
             good.replace(TOKEN, "fandhe-net:other:1:0:0"),
             good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.1.1/24"),
             good.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.0.0/24"),
@@ -370,6 +602,9 @@ mod tests {
             format!("{good}x"),
         ];
         for bad_case in &cases {
+            // 置換が実際に起きていること（no-op の置換で正常な記録が通るのを防ぐ）。`format!("{good}x")` 以外は
+            // 元の記録と異なる。
+            assert_ne!(bad_case, &good);
             assert_eq!(
                 code(RealizedRecord::decode(bad_case.as_bytes())),
                 NetErrorCode::DataLoss,
@@ -378,6 +613,7 @@ mod tests {
         }
         // bridge 名がネットワーク名の導出と一致しない。
         let swapped = good.replace(c.bridge.as_str(), "fcbr0000000000");
+        assert_ne!(swapped, good);
         assert_eq!(
             code(RealizedRecord::decode(swapped.as_bytes())),
             NetErrorCode::DataLoss

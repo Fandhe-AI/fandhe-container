@@ -119,6 +119,35 @@ impl Dir {
         sync(self)
     }
 
+    /// 既にある記録を原子的に置き換える（一時ファイル → fsync → rename → 親の fsync）。無ければ `NotFound`。
+    ///
+    /// 既存の記録は検査つきで開けること（symlink・権限違反は拒否）。rename は同じ名前を上書きするため、途中で落ちても
+    /// 古い記録か新しい記録のどちらかが完全な形で残る。公開の解除後にメンバー記録から公開を外すために使う（#3068）。
+    fn write_replace(&self, name: &str, bytes: &[u8], sync: SyncFn<'_>) -> Result<(), NetError> {
+        if bytes.len() > RECORD_MAX_BYTES {
+            return Err(err(
+                NetErrorCode::Internal,
+                "network record exceeds the size limit",
+            ));
+        }
+        if self.read_record(name)?.is_none() {
+            return Err(err(NetErrorCode::NotFound, "network record not found"));
+        }
+        let msg = "failed to write network record";
+        let tmp = stage_name(TMP_PREFIX);
+        let written = (|| {
+            let mut f = self.open_regular(&tmp, true, u64::MAX)?;
+            f.write_all(bytes).map_err(|e| map_io(&e, msg))?;
+            f.sync_all().map_err(|e| map_io(&e, msg))?;
+            fs::rename(self.path(&tmp), self.path(name)).map_err(|e| map_io(&e, msg))
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(self.path(&tmp));
+            return Err(e);
+        }
+        sync(self)
+    }
+
     /// [`write_new`](Self::write_new) の再試行可能版。既に同じ内容の記録があれば（前回は rename 後の親 fsync で
     /// 失敗した可能性があるため）同期だけをやり直して成功とし、内容が違えば `AlreadyExists` を返す（D11）。
     fn write_new_idempotent(
@@ -375,6 +404,19 @@ impl NetworkLockGuard<'_> {
         })
     }
 
+    /// 確定したメンバー記録を置き換える（公開を外した後の書き直し。#3068）。記録が無ければ `NotFound`。
+    ///
+    /// 排他ロックのガードでだけ許す。置き換えは原子的で、失敗したときは古い記録が残る。
+    pub fn replace_member(&self, rec: &MemberRecord) -> Result<(), NetError> {
+        record_net_op(&*self.recorder, NetOpKind::NetworkStoreMemberWrite, || {
+            self.require_exclusive()?;
+            let Some(members) = self.dir.open_subdir_opt(MEMBERS_DIR)? else {
+                return Err(err(NetErrorCode::NotFound, "member record not found"));
+            };
+            members.write_replace(rec.id().as_str(), &rec.encode(), &Dir::sync)
+        })
+    }
+
     /// 確定記録を消す（detach の成功後）。無ければ `Ok(false)`。
     pub fn remove_member(&self, id: &MemberId) -> Result<bool, NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreMemberRemove, || {
@@ -588,6 +630,7 @@ mod tests {
     use crate::netlink_route::{IfIndex, IpPrefix};
     use crate::network::{CreatedNetwork, EndpointId, NetworkResourceNames};
     use crate::network_store::NetworkDefinition;
+    use crate::nftables_batch::NftTableHandle;
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
@@ -633,7 +676,13 @@ mod tests {
             name_resolution: NameResolution::default(),
             name,
         };
-        RealizedRecord::from_created(&c, pfx([10, 0, 0, 0], 24)).unwrap()
+        RealizedRecord::from_created(
+            &c,
+            pfx([10, 0, 0, 0], 24),
+            NftTableHandle::new(42).unwrap(),
+            crate::network_store::HostGeneration::current().unwrap(),
+        )
+        .unwrap()
     }
     fn token(ep: &str) -> String {
         format!("{BRIDGE_TOKEN}/ep/{ep}/g/00000000000000000000000000000001")
@@ -691,6 +740,64 @@ mod tests {
         assert!(n.remove_member(&MemberId::new("c1").unwrap()).unwrap());
         assert!(!n.remove_member(&MemberId::new("c1").unwrap()).unwrap());
         assert!(n.members().unwrap().is_empty());
+    }
+
+    /// NET-3・#3068: `replace_member` は既存の確定記録を原子的に上書きし、読み戻せて 0600 のまま。記録が無ければ
+    /// `NotFound`、共有ロックでは `FailedPrecondition`。
+    #[test]
+    fn net3_3068_store_replace_member() {
+        let t = Tmp::new("replace");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&nn()).unwrap();
+        // members ディレクトリも記録も無い。
+        assert_eq!(
+            code(n.replace_member(&member("c1", 2))),
+            NetErrorCode::NotFound
+        );
+        n.commit_member(&member("c1", 2)).unwrap();
+        // 別の記録が members にあっても、自分の記録が無ければ NotFound。
+        assert_eq!(
+            code(n.replace_member(&member("c2", 3))),
+            NetErrorCode::NotFound
+        );
+        let publish = crate::network::PortPublish::new(
+            crate::network::PortProtocol::Tcp,
+            Ipv4Addr::new(192, 0, 2, 10),
+            8080,
+            80,
+        )
+        .unwrap();
+        let rule = |n| crate::nftables_rules::NftRuleHandle::new(n).unwrap();
+        let updated = member("c1", 2)
+            .with_publishes(
+                NftTableHandle::new(42).unwrap(),
+                vec![crate::network_store::RecordedPublish::new(
+                    publish,
+                    rule(2),
+                    rule(3),
+                )],
+            )
+            .unwrap();
+        n.replace_member(&updated).unwrap();
+        assert_eq!(n.members().unwrap(), vec![updated.clone()]);
+        assert_eq!(
+            mode(&t.0.join("@networks/web/members/c1")),
+            0o600,
+            "置き換え後も 0600"
+        );
+        // 公開を外して書き直すと、旧形式（公開なし）に戻る。
+        n.replace_member(&updated.without_publish(&publish).unwrap())
+            .unwrap();
+        assert_eq!(n.members().unwrap(), vec![member("c1", 2)]);
+        drop(n);
+        drop(g);
+        let g = store.lock_global_shared().unwrap();
+        let n = g.lock_network_shared(&nn()).unwrap();
+        assert_eq!(
+            code(n.replace_member(&member("c1", 2))),
+            NetErrorCode::FailedPrecondition
+        );
     }
 
     /// 共有ロックでは書けない。

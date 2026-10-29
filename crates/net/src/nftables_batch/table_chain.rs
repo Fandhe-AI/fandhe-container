@@ -146,6 +146,27 @@ impl NftFamily {
     }
 }
 
+/// カーネルが採番した nft テーブルのハンドル。0 は無効値で表現できない（REPAIR-2）。
+///
+/// ルールハンドルはテーブルごとに採番されるため、記録したルールハンドルが「記録時のテーブル」のものかを
+/// 解除の前に照合する鍵として使う（テーブルが作り直されるとハンドルが変わる。NET-3・SEC-1・#3068）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NftTableHandle(std::num::NonZeroU64);
+
+impl NftTableHandle {
+    /// 0 は `InvalidArgument`。
+    pub fn new(handle: u64) -> Result<Self, NetError> {
+        std::num::NonZeroU64::new(handle)
+            .map(Self)
+            .ok_or_else(|| invalid("nft table handle must be non-zero"))
+    }
+
+    /// ハンドル値。
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// テーブル名・チェイン名。1〜255 バイト、先頭 `[A-Za-z_]`、以降 `[A-Za-z0-9_.-]`（REPAIR-2）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftName(String);

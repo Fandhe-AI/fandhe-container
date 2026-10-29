@@ -39,9 +39,9 @@
 //!
 //! - `NFTA_RULE_POSITION`（挿入位置の指定）・`NFTA_RULE_USERDATA`・`NLM_F_REPLACE`
 //! - GETRULE dump によるハンドルの再照会（dump 自体は [`RuleDump`]・[`DumpedRule`] で実装済みだが、expr 列のみを読む。
-//!   ハンドルの復元は #3068 の担当で未実装。NET-3・#3063）。ハンドルの取得は [`RuleCreate::build_echo`]（NEWRULE の
+//!   ハンドルは dump で復元せず、`network::recorded` が記録した値（#3068）を使う。NET-3・#3063）。ハンドルの取得は [`RuleCreate::build_echo`]（NEWRULE の
 //!   `NLM_F_ECHO` 応答。バッチ層 `nftables_batch` の ACK 判定が回収し、[`NftRuleHandle::from_rule_attrs`]
-//!   で復号する。NET-3・CRI-2・#2839）だけで、プロセス再起動後のハンドル復元は無い
+//!   で復号する。NET-3・CRI-2・#2839）。プロセス再起動後は、メンバー記録に永続化した値から復元する（#3068）
 
 use std::num::NonZeroU64;
 
@@ -270,7 +270,8 @@ impl RuleDump {
 
 /// `NFT_MSG_GETRULE` dump の応答 1 件（`NFT_MSG_NEWRULE`）から読み取ったルール（NET-3・#3063）。
 ///
-/// ハンドルは読まない（ハンドルの復元は #3068 の担当で未実装）。expr 列だけを保持する。
+/// ハンドルは読まない（再起動後のハンドルは dump ではなく `network::recorded` の記録から復元する。#3068）。
+/// expr 列だけを保持する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DumpedRule {
     chain: NftName,

@@ -1316,6 +1316,26 @@ mod ack_tests {
             .expect("spawn sh")
     }
 
+    /// 子が exec 済みで cmdline に nonce が現れ、かつ停止（`T`）するまで待つ（上限 5 秒。REPAIR-5・#3414）。
+    fn wait_nonce_sleeper_stopped(pid: u32, nonce: &HelperNonce) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let has = cmdline_has_nonce(pid, nonce).unwrap_or(false);
+            let stopped = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, r)| r.trim_start().starts_with('T'))
+                })
+                .unwrap_or(false);
+            if has && stopped {
+                return;
+            }
+            assert!(Instant::now() < deadline, "sleeper not ready: pid {pid}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// NET-5・SEC-1・REPAIR-4・#3414: `SPAWN` 行の時点で、照合済みの同一性が意図記録へ残り、識別行が届かずに
     /// 呼び出し元が止まっても（pidfd を捨てる）、候補なしの回収が帰属して止める。
     #[test]
@@ -1331,6 +1351,7 @@ mod ack_tests {
             .expect("intent");
         let child = spawn_nonce_sleeper(&nonce);
         let pid = child.id();
+        wait_nonce_sleeper_stopped(pid, &nonce);
         let adopt = adopt_spawned(&pid.to_string(), &nonce).expect("adopt");
         let expected = read_identity(pid).expect("identity");
         assert_eq!(adopt.identity.as_ref(), Some(&expected));

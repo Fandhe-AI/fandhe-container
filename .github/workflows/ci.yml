@@ -898,7 +898,8 @@ jobs:
         if: env.HANG_PROBE != 'true'
         # 本ステップだけ timeout-minutes 10（他の自己テストは 5。#3238）。Windows の Git Bash はプロセス生成が遅く、
         # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限 60 分の範囲内
-        # #3378・#3399 の後の main の Windows は 149〜152 秒（上限比 25%。件数 92。#3378 単体は 76 秒・件数 84）。監視の刻みの変更（Phase B）は未採用（#3421）
+        # #3378・#3399 の後の main の Windows は 149〜152 秒（上限比 25%。件数 92。#3378 単体は 76 秒・件数 84）。
+        # 監視の刻みの変更（Phase B）は未決定（採否は 3 OS の dispatch 実測で決める。#3454）
         timeout-minutes: 10
         run: |
           date +%s > "$RUNNER_TEMP/cli-parity-selftest.start"

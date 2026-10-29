@@ -38,10 +38,6 @@
 //!
 //! 成功時の最終行: `exec_launch_netns_rootless: rootless exec joined the launch-path netns for loopback and attachable verified (root=false)`。
 
-#[path = "../../core/tests/support/reap.rs"]
-#[allow(dead_code)]
-mod reap;
-
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("exec_launch_netns_rootless: Linux only, not applicable on this OS");
@@ -593,16 +589,16 @@ mod linux {
 
         // 後始末は成否に関わらず行う（panic でも cgroup・holder・一時領域を残さない）。
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            verify(
-                &store,
-                &recorder,
-                &id,
-                &launcher,
-                &hostdata,
-                &hook,
+            verify(&VerifyCtx {
+                store: &store,
+                recorder: &recorder,
+                id: &id,
+                launcher: &launcher,
+                hostdata: &hostdata,
+                hook: &hook,
                 mode,
                 subordinate,
-            );
+            });
         }));
         // 失敗時に holder が残っていれば drop で EOF と SIGKILL・回収される。
         drop(
@@ -619,17 +615,29 @@ mod linux {
         drop(work);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn verify(
-        store: &FileStateStore,
-        recorder: &OpRecorder,
-        id: &ContainerId,
-        launcher: &Arc<dyn ProcessLauncher>,
-        hostdata: &Path,
-        hook: &Arc<HolderAttachHook>,
+    /// `verify` へ渡す検証対象一式（引数の数を抑えるためにまとめる）。
+    struct VerifyCtx<'a> {
+        store: &'a FileStateStore,
+        recorder: &'a OpRecorder,
+        id: &'a ContainerId,
+        launcher: &'a Arc<dyn ProcessLauncher>,
+        hostdata: &'a Path,
+        hook: &'a Arc<HolderAttachHook>,
         mode: Mode,
         subordinate: bool,
-    ) {
+    }
+
+    fn verify(ctx: &VerifyCtx<'_>) {
+        let VerifyCtx {
+            store,
+            recorder,
+            id,
+            launcher,
+            hostdata,
+            hook,
+            mode,
+            subordinate,
+        } = *ctx;
         let host_net = ns_ino("/proc/self/ns/net");
         let host_user = ns_ino("/proc/self/ns/user");
 

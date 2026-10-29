@@ -143,7 +143,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("etc_hosts_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -198,13 +198,18 @@ mod linux {
             .map_err(|e| fail(format!("spawn {program}: {e}")))?;
         let pgid = child.id();
         let kill_group = |child: &mut std::process::Child| {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pgid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
+            // 期限つきで kill を実行する。失敗は握り潰さず stderr に出す（呼び出し元は既に失敗を返す経路。REPAIR-5）。
+            if let Err(e) = crate::reap::run_within(
+                Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pgid}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            ) {
+                eprintln!("kill failure: {e}");
+            }
+            crate::reap::reap_or_report(child, crate::reap::reap_within());
         };
         let mut out_pipe = child.stdout.take();
         let mut err_pipe = child.stderr.take();

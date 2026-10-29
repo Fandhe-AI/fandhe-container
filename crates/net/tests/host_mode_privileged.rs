@@ -115,7 +115,7 @@ mod linux {
                 return st;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(child, crate::reap::reap_within());
                 panic!("child did not exit within the timeout");
             }
             std::thread::sleep(Duration::from_millis(20));

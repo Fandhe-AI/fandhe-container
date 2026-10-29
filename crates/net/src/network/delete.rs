@@ -75,7 +75,13 @@
 //! `Unknown` のまま触れない。netns の pin は、請求書に控えた識別子を `netns::unpin_path_expecting` で
 //! 所有記録と照合して外す。再起動後の pin も、置き場の `.owned/<endpoint>` に永続化した所有記録と請求書と
 //! カーネルの実状態の三者が一致すれば外せる（#2824）。所有記録が無い・壊れている・一致しない pin
-//! （旧い請求書・手動回収後に作り直された別世代など）は拒否されて取り残しになり、手動回収に回る。quarantine（アドレス・DNAT ルール・ポート予約）は
+//! （旧い請求書・手動回収後に作り直された別世代など）は拒否されて取り残しになり、手動回収に回る。
+//! `detach_container` の失敗の請求書（v2）が DNAT ルールのハンドルを載せているときは、veth より前に、
+//! 専用テーブルの所有（`NFTA_TABLE_USERDATA` がトークンと一致）と実体の同一性（生きたテーブルのハンドルが
+//! 請求書と一致）を確かめてからハンドル指定で消す（#3285。`reclaim_port_rules`）。テーブルが無い・作り直された
+//! 場合はルールも無いので回収済み、所有を証明できない場合は消さずに `Unknown`。一括削除が ENOENT で中止されたら
+//! 1 本ずつ消し直す。残余リスク: 所有の証明と DELRULE の間にテーブルが差し替えられる窓は `unpublish` と同じ水準で残る。
+//! quarantine（アドレス・ポート予約と、ハンドルを持てなかった DNAT ルール）は
 //! プロセス内の保持で、解放は `delete_network` が行う。pin の置き場 `netns_dir` は請求書ではなく呼び出し側の
 //! 固定設定から受ける。
 //!
@@ -139,6 +145,7 @@ use super::{
     ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, host_token_is_for,
     is_indeterminate, is_valid_generation, token_names_network,
 };
+use crate::network_store::member::RecordedPublish;
 
 /// 失敗した手順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +279,14 @@ pub(crate) trait DeleteOps {
         &self,
         table: &NftName,
         handles: (NftRuleHandle, NftRuleHandle),
+    ) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルの指定したチェインの DNAT ルール 1 本をハンドル指定で削除する（1 バッチ）。請求書の
+    /// 回収で、2 本の一括削除が ENOENT で中止された後に、残っている 1 本を確実に消すために使う（#3285）。
+    fn delete_rule(
+        &self,
+        table: &NftName,
+        chain: &'static str,
+        handle: NftRuleHandle,
     ) -> Result<(), NftApplyFailure>;
 }
 
@@ -846,7 +861,11 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
         Err(e) => return Err(fail(e, DeleteStep::Validate, report, Vec::new())),
     };
 
-    // 2. host 側 veth。別名が endpoint のトークンと一致し、master が所有を確かめた bridge と一致するときだけ、
+    // 2. DNAT ルール（請求書が載せたときだけ。v1 の請求書では何もしない）。detach の「公開 → veth → netns」と
+    //    同じ順で、veth より前に置く。ルールの回収の失敗でも、独立した資源の veth・pin の回収は続ける。
+    reclaim_port_rules(ops, claim, names.table(), token, &mut report, &mut failures);
+
+    // 3. host 側 veth。別名が endpoint のトークンと一致し、master が所有を確かめた bridge と一致するときだけ、
     //    照会で得た ifindex で消す。名前では消さない。
     if claim.includes_veth() {
         let host = veth_names.host();
@@ -895,7 +914,7 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
         }
     }
 
-    // 3. netns の pin。プロセス内または永続の所有記録（#2824）と請求書の識別子に照合できる pin だけを外せる。
+    // 4. netns の pin。プロセス内または永続の所有記録（#2824）と請求書の識別子に照合できる pin だけを外せる。
     //    照合できない pin は拒否されて取り残しになり、手動回収に回る（fail-closed）。
     //    解除は、請求書に控えた pin の実体の識別子（dev・ino・作成の連番）を解除の直前に所有記録と照合する
     //    `unpin_path` で行う。同じ endpoint・置き場に作り直された新しい pin は識別子が違うため、古い請求書では
@@ -984,6 +1003,91 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
     match failures.first {
         None => Ok(report),
         Some((error, step)) => Err(fail(error, step, report, Vec::new())),
+    }
+}
+
+/// 請求書（v2）が載せた DNAT ルールを、テーブルの所有と実体の同一性を確かめてから消す（NET-1・NET-3・SEC-1・#3285）。
+///
+/// - テーブルが無い: ルールも無いので、全件を回収済みにする（冪等）
+/// - 所有を証明できない（照会の失敗・userdata の不一致・ハンドル欠落）: DELRULE を送らず `Unknown` の取り残し
+/// - 生きたテーブルのハンドルが請求書と違う: 記録した実体はもう無く、記録したルールも無い（同名の作り直し）。
+///   送らずに回収済みにする。アドレスと予約の quarantine は請求書に残り、`delete_network` が解放する
+/// - 一致: 公開ごとにハンドル指定で削除する。ルールハンドルはテーブルの寿命の中で再利用されないため、実体が
+///   同一なら ENOENT は「既に無い」と読める。一括削除が ENOENT で中止されたら 1 本ずつ消し直し、片方だけ
+///   残る場合も残りを消す。それ以外の失敗は取り残し（`Aborted`・`NotSent` は `Present`、不明は `Unknown`）
+fn reclaim_port_rules<O: DeleteOps>(
+    ops: &O,
+    claim: &FailedAttachClaim,
+    table: &NftName,
+    token: &str,
+    report: &mut NetworkDeleteReport,
+    failures: &mut Failures,
+) {
+    let Some(rules) = claim.port_rules() else {
+        return;
+    };
+    let resource =
+        |p: &RecordedPublish| DeleteResource::PortRules(claim.endpoint().clone(), *p.publish());
+    match prove_table_token(ops, table, token) {
+        TableProof::Absent => {
+            report.removed.extend(rules.ports.iter().map(resource));
+        }
+        TableProof::Unproven(e) => {
+            report.leftover.extend(
+                rules
+                    .ports
+                    .iter()
+                    .map(|p| (resource(p), ResourceState::Unknown)),
+            );
+            failures.note(e, DeleteStep::UnpublishPorts);
+        }
+        TableProof::Owned(live) if live != rules.table.get() => {
+            report.removed.extend(rules.ports.iter().map(resource));
+        }
+        TableProof::Owned(_) => {
+            for p in &rules.ports {
+                match delete_rule_pair(ops, table, p) {
+                    Ok(()) => report.removed.push(resource(p)),
+                    Err(f) => {
+                        let state = if f.outcome == NftBatchOutcome::Unknown {
+                            ResourceState::Unknown
+                        } else {
+                            ResourceState::Present
+                        };
+                        report.leftover.push((resource(p), state));
+                        failures.note(f.error, DeleteStep::UnpublishPorts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 公開 1 件の DNAT ルール 2 本を消す。一括削除が ENOENT（`Aborted` かつ `NotFound`）で中止されたら、
+/// 1 本ずつ消し直す（片方だけ残るとき残りを確実に消す）。1 本ごとの ENOENT は「既に無い」とみなす。
+/// 失敗は最初の 1 件を返す。
+fn delete_rule_pair<O: DeleteOps>(
+    ops: &O,
+    table: &NftName,
+    p: &RecordedPublish,
+) -> Result<(), NftApplyFailure> {
+    let is_absent = |f: &NftApplyFailure| {
+        f.outcome == NftBatchOutcome::Aborted && f.error.code() == NetErrorCode::NotFound
+    };
+    match ops.delete_rules(table, (p.prerouting(), p.output())) {
+        Err(f) if is_absent(&f) => {
+            let mut first = None;
+            for (chain, handle) in [("prerouting", p.prerouting()), ("output", p.output())] {
+                if let Err(f) = ops.delete_rule(table, chain, handle)
+                    && !is_absent(&f)
+                    && first.is_none()
+                {
+                    first = Some(f);
+                }
+            }
+            first.map_or(Ok(()), Err)
+        }
+        other => other,
     }
 }
 
@@ -1238,6 +1342,21 @@ impl DeleteOps for LinuxDeleteOps<'_> {
                 error: e.into(),
             })
     }
+
+    fn delete_rule(
+        &self,
+        table: &NftName,
+        chain: &'static str,
+        handle: NftRuleHandle,
+    ) -> Result<(), NftApplyFailure> {
+        crate::network::unpublish::linux_delete_rule(
+            self.nft,
+            self.request_timeout(),
+            table,
+            chain,
+            handle,
+        )
+    }
 }
 
 /// ネットワークを削除する（コンテナ側の veth・netns pin → 専用 nft テーブル → bridge → IPAM・ポート予約）。
@@ -1385,6 +1504,10 @@ mod tests {
         table_err: Option<(NetErrorCode, NftBatchOutcome)>,
         /// `delete_rules`（公開の個別解除）の失敗。
         rules_err: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// `delete_rule`（1 本ずつの削除）の失敗。チェイン名で指定する。
+        rule_errs: Vec<(&'static str, NetErrorCode, NftBatchOutcome)>,
+        /// 照会（`table_info`）が返すテーブルのハンドル。`None` は 99。
+        table_handle_now: Option<u64>,
         /// 照会（`table_info`）で専用テーブルが存在しない（`NotFound`）とみなすか。
         table_absent: bool,
         /// 照会（`table_info`）の失敗。
@@ -1535,7 +1658,7 @@ mod tests {
                 }
             };
             if !self.table_no_handle {
-                put(4, &99u64.to_be_bytes());
+                put(4, &self.table_handle_now.unwrap_or(99).to_be_bytes());
             }
             put(
                 6,
@@ -1547,6 +1670,25 @@ mod tests {
             self.rec(format!("delete_table {} handle={handle}", table.as_str()));
             match self.table_err {
                 Some((c, outcome)) => Err(NftApplyFailure {
+                    error: err(c),
+                    outcome,
+                }),
+                None => Ok(()),
+            }
+        }
+        fn delete_rule(
+            &self,
+            table: &NftName,
+            chain: &'static str,
+            handle: NftRuleHandle,
+        ) -> Result<(), NftApplyFailure> {
+            self.rec(format!(
+                "delete_rule {} {chain} {}",
+                table.as_str(),
+                handle.get()
+            ));
+            match self.rule_errs.iter().find(|(c, ..)| *c == chain) {
+                Some(&(_, c, outcome)) => Err(NftApplyFailure {
                     error: err(c),
                     outcome,
                 }),
@@ -2741,6 +2883,249 @@ mod tests {
             netns,
             quarantine,
         )
+    }
+
+    fn rule_of(host_port: u16, pre: u64, out: u64) -> RecordedPublish {
+        RecordedPublish::new(
+            PortPublish::new(
+                crate::network::PortProtocol::Tcp,
+                Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .unwrap(),
+            NftRuleHandle::new(pre).unwrap(),
+            NftRuleHandle::new(out).unwrap(),
+        )
+    }
+
+    fn rule_port(host_port: u16) -> PortPublish {
+        *rule_of(host_port, 2, 3).publish()
+    }
+
+    /// DNAT ルール 2 件（8080: 2/3、8081: 4/5。テーブルハンドル 99）を持つ請求書。
+    fn rules_claim(veth: bool, netns: bool) -> FailedAttachClaim {
+        attach_claim(veth, netns, true).with_rules_for_test(
+            crate::network::attach_claim::ClaimedRules::new(
+                NftTableHandle::new(99).unwrap(),
+                vec![rule_of(8080, 2, 3), rule_of(8081, 4, 5)],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn port_res(host_port: u16) -> DeleteResource {
+        DeleteResource::PortRules(eid("c1"), rule_port(host_port))
+    }
+
+    /// NET-1・NET-3・#3285: 所有が証明でき、ハンドルが一致するときだけ、請求書のルールをハンドル指定で消す。
+    /// 呼び出し列は 照会 → 2 本の一括削除（公開ごと）の順。
+    #[test]
+    fn net1_3285_reclaim_deletes_rules_by_handle_after_proving_table() {
+        let fake = Fake::default();
+        let tbl = created().table;
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("table_info {}", tbl.as_str()),
+                format!("delete_rules {} 2/3", tbl.as_str()),
+                format!("delete_rules {} 4/5", tbl.as_str()),
+            ]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+        assert!(report.leftover.is_empty());
+    }
+
+    /// NET-1・#3285: テーブルが無ければルールも無い。DELRULE を送らず回収済みにする（冪等）。
+    #[test]
+    fn net1_3285_reclaim_absent_table_means_rules_gone() {
+        let fake = Fake {
+            table_absent: true,
+            ..Fake::default()
+        };
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![format!("table_info {}", created().table.as_str())]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+    }
+
+    /// NET-1・SEC-1・#3285: 所有を証明できない（userdata の不一致・照会の失敗・ハンドル欠落）なら DELRULE を送らず、
+    /// `Unknown` の取り残しにする。
+    #[test]
+    fn net1_3285_reclaim_unproven_table_sends_nothing() {
+        let cases = [
+            Fake {
+                table_userdata: Some(b"someone-else".to_vec()),
+                ..Fake::default()
+            },
+            Fake {
+                table_query_err: Some(NetErrorCode::Timeout),
+                ..Fake::default()
+            },
+            Fake {
+                table_no_handle: true,
+                ..Fake::default()
+            },
+        ];
+        for fake in cases {
+            let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+                .unwrap_err();
+            assert_eq!(e.step, DeleteStep::UnpublishPorts);
+            assert_eq!(
+                e.report.leftover,
+                vec![
+                    (port_res(8080), ResourceState::Unknown),
+                    (port_res(8081), ResourceState::Unknown),
+                ]
+            );
+            assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        }
+    }
+
+    /// NET-1・SEC-1・#3285: 生きたテーブルのハンドルが請求書と違う（同名で作り直された）なら、記録した実体はもう無い。
+    /// DELRULE を送らず回収済みにし、他の資源（veth・pin）の回収は続ける。
+    #[test]
+    fn net1_3285_reclaim_recreated_table_sends_no_delrule() {
+        let fake = Fake {
+            table_handle_now: Some(100),
+            ..Fake::default()
+        };
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(true, false), &netns_dir()).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_rule")));
+        assert!(report.removed.contains(&port_res(8080)));
+        assert!(report.removed.contains(&port_res(8081)));
+        assert!(
+            report
+                .removed
+                .contains(&DeleteResource::Veth(host_of("c1")))
+        );
+    }
+
+    /// NET-1・NET-3・#3285: 2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直す。片方が既に無く、
+    /// もう片方を消せたなら回収済み。
+    #[test]
+    fn net1_3285_reclaim_enoent_pair_falls_back_to_single_deletes() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
+            rule_errs: vec![(
+                "prerouting",
+                NetErrorCode::NotFound,
+                NftBatchOutcome::Aborted,
+            )],
+            ..Fake::default()
+        };
+        let tbl = created().table;
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("table_info {}", tbl.as_str()),
+                format!("delete_rules {} 2/3", tbl.as_str()),
+                format!("delete_rule {} prerouting 2", tbl.as_str()),
+                format!("delete_rule {} output 3", tbl.as_str()),
+                format!("delete_rules {} 4/5", tbl.as_str()),
+                format!("delete_rule {} prerouting 4", tbl.as_str()),
+                format!("delete_rule {} output 5", tbl.as_str()),
+            ]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+    }
+
+    /// NET-1・#3285: 一括削除が ENOENT で中止された後、残っている 1 本の削除が別の理由で失敗したら、
+    /// 取り残し（`Present`）として報告し、最初のエラーを保持する。
+    #[test]
+    fn net1_3285_reclaim_single_delete_failure_is_left_over() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
+            rule_errs: vec![
+                (
+                    "prerouting",
+                    NetErrorCode::NotFound,
+                    NftBatchOutcome::Aborted,
+                ),
+                ("output", NetErrorCode::Internal, NftBatchOutcome::Aborted),
+            ],
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (port_res(8080), ResourceState::Present),
+                (port_res(8081), ResourceState::Present),
+            ]
+        );
+    }
+
+    /// NET-1・REPAIR-5・#3285: 一括削除の確定的な失敗は `Present`、結果不明は `Unknown` の取り残しにする。
+    #[test]
+    fn net1_3285_reclaim_delete_failure_classification() {
+        for (code, outcome, state) in [
+            (
+                NetErrorCode::Internal,
+                NftBatchOutcome::Aborted,
+                ResourceState::Present,
+            ),
+            (
+                NetErrorCode::Timeout,
+                NftBatchOutcome::Unknown,
+                ResourceState::Unknown,
+            ),
+        ] {
+            let fake = Fake {
+                rules_err: Some((code, outcome)),
+                ..Fake::default()
+            };
+            let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+                .unwrap_err();
+            assert_eq!(e.step, DeleteStep::UnpublishPorts);
+            assert_eq!(
+                e.report.leftover,
+                vec![(port_res(8080), state), (port_res(8081), state)]
+            );
+        }
+    }
+
+    /// NET-1・#3285: ルールの回収は veth より前に行い、失敗しても veth と pin の回収は続ける。pin の識別子が
+    /// 無く早期に戻る請求書でも、ルールの回収は先に済んでいる。
+    #[test]
+    fn net1_3285_reclaim_rules_precede_veth_and_do_not_block_it() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
+            ..Fake::default()
+        };
+        let claim = rules_claim(true, true).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        let calls = fake.calls();
+        assert!(calls[0].starts_with("table_info"), "{calls:?}");
+        assert!(calls[1].starts_with("delete_rules"), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("link_attachment")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("pin_absent")),
+            "{calls:?}"
+        );
+    }
+
+    /// NET-1・#3285: ルールを持たない（v1 の）請求書では、テーブルを照会しない。
+    #[test]
+    fn net1_3285_reclaim_v1_claim_never_queries_the_table() {
+        let fake = Fake::default();
+        reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir()).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.starts_with("table_info")));
     }
 
     /// NET-1・#2681: 同じ endpoint・置き場に作り直された新しい pin（識別子が請求書と違う）は、veth が無くても

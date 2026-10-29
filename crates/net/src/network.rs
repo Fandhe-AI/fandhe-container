@@ -122,7 +122,9 @@
 //!   再起動後のハンドルは `recorded` のメンバー記録から復元する。#3068）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
 //! - IPAM 状態の永続化。担当 Issue 未確定（コンテナ単体の切り離しは `detach_container` で追加済み。#3062。作成失敗の請求書の永続化は #2604 で済み。
 //!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
-//!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで。再起動後のネットワーク本体は手動。
+//!   請求書と永続の所有記録（置き場の `.owned/<endpoint>`。#2824）に一致する pin まで、と
+//!   `detach_container` の失敗の請求書（v2）が載せたテーブルハンドルとルールハンドルの DNAT ルール（所有と実体の同一性を確かめてから消す。#3285）。
+//!   再起動後のネットワーク本体は手動。
 //!   所有記録の無い pin（旧い請求書・none モード）も手動。write-ahead は #1870 の後に再検討）
 //! - netns の事前作成（`create_container_netns`・`attach_prepared_container`・`release_container_netns`。#2675）は
 //!   作成と pin だけを切り出した入口で、コンテナがその netns へ入る側（core）は未実装。未 attach の
@@ -596,7 +598,11 @@ impl FailedCreateClaim {
 /// 請求書の記録の先頭行（版）。
 const RECORD_VERSION_LINE: &str = "fandhe-net-claim v1";
 /// 請求書の記録全体の長さの上限（バイト）。
-pub const CLAIM_RECORD_MAX_LEN: usize = 1024;
+///
+/// attach の請求書の v2（DNAT ルールのハンドルつき。#3285）の最悪値が収まる大きさ。最悪値は、ネットワーク名 64・
+/// endpoint 64・トークン 256・pin が u64 を 3 つ・テーブルハンドル u64・`rule=` 行 `MAX_PORT_PUBLISHES`（64）行
+/// （1 行は最大約 80 バイト）で約 5.6 KB（試験 `net1_3285_attach_claim_worst_case_fits`）。
+pub const CLAIM_RECORD_MAX_LEN: usize = 8192;
 /// 記録内のトークンの長さの上限（バイト）。
 const CLAIM_TOKEN_MAX_LEN: usize = 256;
 

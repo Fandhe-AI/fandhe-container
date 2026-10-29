@@ -43,7 +43,7 @@ table=<0|1>
 - `network` が `NetworkName` の規則を満たすこと
 - `token` が ASCII の可視文字だけで 256 バイト以下、かつ `fandhe-net:<network>:` で始まること
 - `bridge` / `table` が `0` か `1` で、少なくとも一方が `1` であること
-- 記録全体が 1024 バイト以下（読み込み側も先に確認する）
+- 記録全体が 8192 バイト以下（読み込み側も先に確認する。attach の請求書の v2 の最悪値は約 5.6 KB。#3285）
 
 トークン内の pid は発行したプロセスのもので、再起動後の照合は名前と接頭辞だけで成り立つため直さない。所有の最終的な判定は、これまでどおりカーネル側の別名・userdata とトークンの完全一致で行う。トークンは bridge の別名として誰でも読める公開情報で、記録の改ざん耐性は置き場の所有者と権限の検査で守る。
 
@@ -87,12 +87,12 @@ table=<0|1>
 
 `attach_container` の巻き戻しで取り残した host 側 veth・netns の pin も、作成失敗の請求書と同じ置き場と形式で永続化する。NET-1・REPAIR-5（あわせて REPAIR-3・REPAIR-4・NET-6・CORE-1）。
 
-- 置き場: `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach`。`attach/` は `open` が 0700 で作り、親と同じ検査（symlink でない・状態ルートと同じ所有者・group / other の権限なし）にかける。排他は親の `.lock` を共有する。一時ファイル（`O_EXCL`・0600）→ fsync → rename → ディレクトリの fsync、長さの上限 1024 バイト、読み込み時の件数の上限（`MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK`）は作成失敗の記録と同じ
+- 置き場: `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach`。`attach/` は `open` が 0700 で作り、親と同じ検査（symlink でない・状態ルートと同じ所有者・group / other の権限なし）にかける。排他は親の `.lock` を共有する。一時ファイル（`O_EXCL`・0600）→ fsync → rename → ディレクトリの fsync、長さの上限 8192 バイト（`CLAIM_RECORD_MAX_LEN`。#3285 で 1024 から引き上げ）、読み込み時の件数の上限（`MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK`）は作成失敗の記録と同じ
 - 形式（net の `FailedAttachClaim::to_record` / `from_record`）: 版の行 `fandhe-net-attach-claim v1` の後に `network` / `endpoint` / `token` / `generation` / `veth` / `netns` / `pin` / `quarantine` を固定順で書く。`pin` は取り残した netns の pin の実体の識別子（`dev:ino:作成の連番` または `-`）で、同じ endpoint・置き場に作り直された新しい pin を古い請求書で解除しないために、解除の直前に所有記録と照合する（不一致は解除せず fail-closed）。保存済みの記録の更新（quarantine だけへの置き換え）は、プロセス間ロックの下で現在の中身が元の請求書と一致するときだけ行う（比較交換。別世代の請求書を上書きしない）。現在の中身が既に置き換え先と一致するときは、前回の置き換えが `rename` 後のディレクトリの同期だけで失敗した再試行とみなし、同期だけをやり直して成功する（REPAIR-5）。`generation` は接続ごとの世代（小文字 16 進 32 桁）で、host 側 veth の別名 `<token>/ep/<endpoint>/g/<generation>` に含まれる。同じ endpoint の再接続で別の値になるため、古い請求書は新しい接続の veth の所有を証明できず、正常な veth を消さない。版・順序・LF・余分な行・名前の規則・トークンの形式（そのネットワークの発行形式で 256 バイト以下の可視 ASCII）・フラグ（`0` か `1`。すべて `0` は拒否）を厳密に検証し、違反は `InvalidArgument`（入力値は載せない）。所有の最終判定は記録ではなく、カーネル側の別名（`host_owner_token`）と master の一致で行う
 - 書く時点: attach が取り残し付きで失敗し、請求書があるとき。書けなくてもメモリの記録は保持し、元のエラーに `the reclaim record could not be persisted` を足した `Internal` を返す
 - 消す時点: `detach` または `delete_network` が回収に成功した後、記録ファイルを中身が一致するときだけ消し（別プロセスが書いた新しい記録を消さない）、そのあとでメモリの記録を外す。回収に失敗したら記録・ファイルとも保持して再試行できる
 - 回収の順序: `delete_network` は bridge を解放する前に、attach の取り残しを先に回収する（veth の所有の証明は bridge への所属で、bridge を消すと証明を失うため）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動回収）
-- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は請求書の識別子を `netns::unpin_path_expecting` で所有記録と照合して外し（再起動後の扱いは次節）、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
+- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は請求書の識別子を `netns::unpin_path_expecting` で所有記録と照合して外し（再起動後の扱いは次節）、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・ポート予約と、ハンドルを持てなかった DNAT ルール）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
 
 ### 再起動後に回収できるもの・できないもの
 
@@ -101,7 +101,10 @@ table=<0|1>
 - 回収できる: 所有を確かめた veth
 - 回収しない: bridge・nft テーブル（記録の無い健全なコンテナがまだ繋がっていないことを証明できず、消すと生きているコンテナの通信を断ち、veth の所有の証明も失うため）。復元したネットワークの `delete_network` は、取り残しを回収し終えたら記録を外し、固定の文言（`MSG_RECOVERED_NETWORK_UNTRACKED`）の `FailedPrecondition` を返して、ネットワーク本体が手動回収であることを知らせる。「ネットワークを丸ごと復旧できる」とは書かない
 - 回収できる（条件つき）: netns の pin。請求書の `pin=` と、置き場の永続の所有記録 `.owned/<endpoint>`（次節・#2824）と、カーネルの実状態の三者が一致するときだけ外す。所有記録が無い・壊れている・一致しない pin（旧い請求書・手動回収後に作り直された別世代・none モードの pin）は `FailedPrecondition` で拒否され、手動回収に残る（fail-closed）
-- 回収しない: detach（`detach_container`。#3062）の失敗時の DNAT ルール（#3258・NET-1・NET-6）。請求書は veth・pin・quarantine を載せるが、公開のルールのハンドルは載せない。請求書の記録の上限（`CLAIM_RECORD_MAX_LEN` 1024 バイト）に、最大 64 件 x ハンドル 2 本が収まらず、版（v1）の互換・テーブルの所有の証明の後のハンドルでの DELRULE・片方だけ残る場合の扱いの設計が別に要るため、同じ修正に混ぜない。同じプロセスでは `delete_network` のテーブル削除で消える。再起動後に復元したネットワークはテーブルを回収しないため手動回収になり、アドレスは quarantine で保持して誤転送は防ぐが、受け口は塞がったままになる。担当は #3285
+- 回収できる（条件つき）: detach（`detach_container`。#3062）の失敗時の DNAT ルール（#3285・NET-1・NET-6・REPAIR-4）。請求書は v1 の 9 行に、`table-handle=<u64>` と公開ごとの `rule=<tcp|udp addr:port cport pre out>`（1〜64 行）を足した v2 で符号化する。DNAT ルールを持たない請求書は従来どおり v1 で、保存済みの v1 は復号して再符号化してもバイト単位で同じになる（内容照合の削除・比較交換を壊さない）。旧バイナリは v2 を版の不一致として拒否する（fail-closed。v2 から v1 への引き戻しは非対応）。
+  - 載せる公開: 解除に失敗して残りうる（`Present`・`Unknown`）もので、テーブルハンドルを持つもの。期限切れで要求を送らなかった公開を含む。DELRULE の失敗時は、所有を証明した生きたテーブルのハンドルを未束縛の公開へ束ねる。載せない公開: 解除済み、`StaleHandles`（記録した実体はもう無い）、テーブルハンドルが無いもの、載せる公開のテーブルハンドルが食い違うとき（手動回収と quarantine）
+  - 回収（`reclaim_failed_attach`。veth より前）: テーブルの `NFTA_TABLE_USERDATA` がトークンと一致（所有）し、生きたテーブルのハンドルが請求書と一致（実体の同一性）するときだけ、ハンドル指定で DELRULE する。テーブルが無い・作り直された場合はルールも無いので回収済み、所有を証明できない場合は何も送らず `Unknown`。2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直し、片方だけ残る場合も残りを消す（ハンドルはテーブルの寿命の中で再利用されず、実体の同一性を確かめた後なので、ENOENT は「既に無い」と読める）。アドレス・予約の quarantine は `delete_network` が解放する
+  - 残余リスク: 所有の証明と DELRULE の間に、同じ権限の者がテーブルを差し替える窓が残る（`unpublish` と同じ水準）。1 件ごとに最大 3 要求を送り、各要求は `timeout` で打ち切る（REPAIR-5）
 - 復元したネットワークへの `create_netns`・`attach` は拒否する
 - 壊れた記録（復号の失敗・ファイル名と記録の不一致・不正なファイル名）は、ファイルを消さず、登録もしない。件数は `net.reclaim_store_load` の失敗件数と stderr の 1 行に足す。同じコンテナの再 attach は、カーネルの `NLM_F_EXCL` による `AlreadyExists` で fail-closed になる。件数の上限を超える場合は起動を失敗させる
 

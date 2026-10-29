@@ -21,7 +21,8 @@
 //! 公開 → veth → netns の逆順は `NetworkPlugin::detach` の契約（契約 9）に従う。取り残しがあれば `Err` で
 //! 返し、カーネル操作を始めた後の失敗では [`ContainerDetachError::reclaim_claim`] の請求書を返す。
 //! 請求書は `reclaim_failed_attach` で回収できる（同じ記録形式）。ハンドルは手放して請求書に一本化する
-//! （同じプロセスでの再試行も、再起動後の回収も、回収の 1 経路に収束させる）。
+//! （同じプロセスでの再試行も、再起動後の回収も、回収の 1 経路に収束させる）。DNAT ルールが残りうる公開は、
+//! テーブルハンドルとルールハンドルを請求書（v2）に載せる（#3285。下記の契約）。
 //!
 //! # 契約・未実装範囲（REPAIR-3）
 //!
@@ -29,8 +30,10 @@
 //!   その残り時間で打ち切る。切れたら以降のカーネル要求（公開の解除・veth の削除）は出さず、取り残しを
 //!   `Present` で報告して fail-closed にする（アドレスと予約は保持）。判定と送信の間に切れた場合は送信側が
 //!   `Timeout` を返し、既存の経路で `Unknown` になる。pin の解除と IPAM の解放は netlink 要求ではないため対象外
-//! - DNAT ルールのハンドルは請求書に載せない（#3258 の判断・NET-1・NET-6）。同じプロセスでは `delete_network` の
-//!   テーブル削除で消えるが、再起動後に復元したネットワークでは手動回収になる。担当は #3285
+//! - DNAT ルールのハンドル（#3285・NET-1・NET-6）: 解除に失敗して残りうる（`Present`・`Unknown`）公開のうち、
+//!   テーブルハンドルを持つもの（期限切れで要求を送らなかったものを含む）を請求書へ載せる。回収側は、テーブルの
+//!   所有と実体の同一性（ハンドルの一致）を確かめてからハンドル指定で消す。`Removed`・`StaleHandles`・
+//!   テーブルハンドルを持たない公開、テーブルハンドルが公開間で食い違う場合は載せず、quarantine と手動回収に委ねる
 //! - アドレスと受け口の予約は、DNAT ルールが残りうる間は解放しない（quarantine。解放は `delete_network`）。
 //!   ルールの残存が確定しているか不明かは [`NetworkDeleteReport::leftover`] の状態で区別する
 //! - メンバー記録（`members/<id>`）の削除は #3067、公開ハンドルとテーブルハンドルの記録は #3068（`network::recorded`）、
@@ -53,14 +56,16 @@ use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::NetlinkRouteSocket;
 #[cfg(target_os = "linux")]
 use crate::netns::ContainerNetns;
-use crate::network::attach_claim::FailedAttachClaim;
+use crate::network::attach_claim::{ClaimedRules, FailedAttachClaim};
 use crate::network::unpublish::{UnpublishRules, unpublish_ports_with};
 use crate::network::{
     AttachedContainer, CreatedNetwork, MAX_PORT_PUBLISHES, PortRegistry, PublishedPort,
     ResourceState, StaticIpam, UnpinFailure,
 };
+use crate::network_store::member::RecordedPublish;
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::NetlinkNetfilterSocket;
+use crate::nftables_batch::NftTableHandle;
 
 /// 単体の切り離しの失敗（最初の原因・失敗手順・解放の結果。ERR-1）。
 #[derive(Debug)]
@@ -105,6 +110,14 @@ impl<N> fmt::Display for ContainerDetachError<N> {
 }
 
 impl<N: fmt::Debug> std::error::Error for ContainerDetachError<N> {}
+
+/// 請求書に載せる公開 1 件（受け口とルールハンドル。テーブルハンドルは呼び出し側が束ねる）。
+fn claimed_rule(table: NftTableHandle, p: &PublishedPort) -> (NftTableHandle, RecordedPublish) {
+    (
+        table,
+        RecordedPublish::new(*p.publish(), p.prerouting_handle(), p.output_handle()),
+    )
+}
 
 /// 入力検証（何も変更しない）。公開ハンドルは本コンテナのものに限り、他のコンテナのハンドルで
 /// そのコンテナの DNAT を消せないようにする（`unpublish_ports_with` は network とトークンしか見ない）。
@@ -180,6 +193,8 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
     let mut failures = Failures::default();
     // DNAT ルールが残りうる（または受け口の予約が残る）ためアドレスと予約を保持するか。
     let mut quarantine = false;
+    // 請求書に載せる、取り残した DNAT ルール（テーブルハンドルつきの公開だけ。#3285）。
+    let mut left_rules: Vec<(NftTableHandle, RecordedPublish)> = Vec::new();
 
     // 1. 公開の個別解除（逆順。1 件の失敗で止めず残りも続ける）。
     for published in published_ports.into_iter().chain(extra_published).rev() {
@@ -187,6 +202,9 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
         if ops.deadline_exceeded() {
             // 全体の期限切れ。DELRULE を送っていないのでルールは確実に残っている（予約も戻さない）。
             quarantine = true;
+            if let Some(th) = published.table_handle() {
+                left_rules.push(claimed_rule(th, &published));
+            }
             report.leftover.push((
                 DeleteResource::PortRules(endpoint.clone(), publish),
                 ResourceState::Present,
@@ -210,8 +228,15 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
                 .push(DeleteResource::PortRules(endpoint.clone(), publish)),
             Err(e) => {
                 quarantine = true;
-                // ハンドルは破棄する（DNAT ルールはテーブルごと `delete_network` が消す。再起動後は
-                // 手動回収で、請求書へ載せる担当は #3285）。
+                // ルールが残りうる（`Present`・`Unknown`）公開は、テーブルハンドルがあれば請求書に載せる
+                // （再起動後も `reclaim_failed_attach` がテーブルの所有と同一性を確かめて消す。#3285）。
+                // `Removed`（ルールは消えた）と `StaleHandles`（記録したテーブルはもう無い）は載せない。
+                if matches!(e.rules, UnpublishRules::Present | UnpublishRules::Unknown)
+                    && let Some(p) = e.published.as_deref()
+                    && let Some(th) = p.table_handle()
+                {
+                    left_rules.push(claimed_rule(th, p));
+                }
                 let (resource, state) = match e.rules {
                     UnpublishRules::Present => (
                         DeleteResource::PortRules(endpoint.clone(), publish),
@@ -340,6 +365,15 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
     match failures.first {
         None => Ok(report),
         Some((error, step)) => {
+            // テーブルハンドルが全件で一致するときだけ載せる（不一致は detach の最中にテーブルが作り直された
+            // 場合で、どれが現行か決められない。載せず quarantine と手動回収に委ねる。fail-closed）。
+            let rules = left_rules.first().map(|(th, _)| *th).and_then(|th| {
+                left_rules
+                    .iter()
+                    .all(|(t, _)| *t == th)
+                    .then(|| left_rules.iter().map(|(_, p)| *p).collect())
+                    .and_then(|ports| ClaimedRules::new(th, ports))
+            });
             let claim = FailedAttachClaim::from_detach(
                 &network.name,
                 &network.bridge_token,
@@ -349,6 +383,7 @@ pub(crate) fn detach_container_with<O: DeleteOps>(
                 !veth_gone,
                 !unpinned,
                 quarantine,
+                rules,
             );
             Err(Box::new(ContainerDetachError {
                 error,

@@ -168,7 +168,7 @@ impl RecordedPublish {
         self.output
     }
 
-    fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         let proto = match self.publish.protocol() {
             PortProtocol::Tcp => "tcp",
             PortProtocol::Udp => "udp",
@@ -189,7 +189,7 @@ impl RecordedPublish {
     }
 
     /// 正準形だけを受ける。再符号化して一致しなければ `DataLoss`。
-    fn decode(v: &str) -> Result<Self, NetError> {
+    pub(crate) fn decode(v: &str) -> Result<Self, NetError> {
         let malformed = || bad("member publish is malformed");
         let parts: Vec<&str> = v.split(' ').collect();
         let (proto, listener, cport, pre, out, unpublishing) = match parts.as_slice() {
@@ -223,7 +223,7 @@ impl RecordedPublish {
 }
 
 /// 公開の記録の整合（件数・受け口の重複・rule handle の重複）を検査する。
-fn check_publishes(publishes: &[RecordedPublish]) -> Result<(), NetError> {
+pub(crate) fn check_publishes(publishes: &[RecordedPublish]) -> Result<(), NetError> {
     if publishes.len() > MAX_PORT_PUBLISHES {
         return Err(invalid("too many published ports for a member"));
     }

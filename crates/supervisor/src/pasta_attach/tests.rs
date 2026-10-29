@@ -1383,6 +1383,31 @@ fn core2_prepare_then_remove_under_the_id_lock_round_trips() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// CORE-2・NET-9(#3355): 準備の job は保持している fd の同一性を `ours` に記録し、既存の dir の古い pid は
+/// 観測と一致するので消す。
+#[test]
+fn core2_prepare_job_records_identity_of_held_dir_and_clears_stale_pid() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (root, fd) = scratch_root("heldid");
+    let fd = Arc::new(fd);
+    drop(PastaRunDir::prepare(fd.as_fd(), "web1").expect("seed"));
+    std::fs::write(root.join("@pasta/web1/pid"), b"4242\n").expect("pid");
+    let job = io_job(&root, &fd, "web1");
+    let gens = RunDirGenerations::default();
+    let slot = Mutex::new(PreparedSlot::default());
+    let never = AtomicBool::new(false);
+    prepare_run_dir_job(&job, Duration::from_secs(5), &gens, &slot, &never).expect("prepare");
+    let (ours, generation) = {
+        let g = lock(&slot);
+        (g.ours, g.ready.as_ref().map(|(n, _)| *n))
+    };
+    let md = std::fs::symlink_metadata(root.join("@pasta/web1")).expect("md");
+    assert_eq!(generation, Some(1));
+    assert_eq!(ours, Some((md.dev(), md.ino())));
+    assert!(!root.join("@pasta/web1/pid").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// NET-9・CORE-2: launch が attach の前に失敗した(フックが走らない・holder の起動失敗など)ときも、準備済みの
 /// 置き場所を回収する。`discard`(起動権の予約を握った後の後始末)も同じ回収を行う。
 #[test]

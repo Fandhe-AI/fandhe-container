@@ -18,6 +18,10 @@
 //! - (4) `attach_container_recorded` は veth を作る前に `FailedPrecondition` で断り、メンバー記録も意図記録も増えない
 //! - (5) 復元した公開の `unpublish_port_recorded` は DELRULE を送らず `StaleHandles` で断り、新テーブルの別ルールが
 //!   残り、メンバー記録は変わらない
+//! - (6) 別ネットワークで、片方のルールだけ残した公開の切り離し失敗が、テーブル handle とルール handle つきの
+//!   請求書（v2）をストアへ保存する（開き直して読み戻す）。`reclaim_failed_attach` がそのルールだけを消し、同じ
+//!   コンテナの別の公開・他コンテナの DNAT は残る（NET-1・NET-6・REPAIR-4・SEC-1・#3285）
+//! - (7) テーブルが作り直された後の回収は DELRULE を送らず、新テーブルの別ルールが残る
 //!
 //! 子は `unshare --net --mount` の中（netns の pin の bind mount を mount namespace に閉じる）。
 //! 成功行は `network_publish_record_privileged: ok` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
@@ -54,12 +58,12 @@ mod linux {
     use fandhe_container_net::error::NetErrorCode;
     use fandhe_container_net::netlink_route::{IpPrefix, NetlinkRouteSocket};
     use fandhe_container_net::network::recorded::{
-        RecordedError, attach_container_recorded, create_network_recorded, restore_published_ports,
-        unpublish_port_recorded,
+        RecordedError, attach_container_recorded, create_network_recorded,
+        detach_container_recorded, restore_published_ports, unpublish_port_recorded,
     };
     use fandhe_container_net::network::{
         ContainerAttachSpec, EndpointId, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish,
-        PortRegistry, UnpublishRules,
+        PortRegistry, UnpublishRules, reclaim_failed_attach,
     };
     use fandhe_container_net::network_store::{
         MemberId, MemberRecord, NetworkDefinition, NetworkStore, RecordedPublish,
@@ -176,7 +180,8 @@ mod linux {
         let base = std::env::args()
             .find_map(|a| a.strip_prefix("--base=").map(PathBuf::from))
             .unwrap_or_else(|| fail("missing --base (run via the launcher)"));
-        let result = scenario(&route, &nft, &base, t);
+        let result = scenario(&route, &nft, &base, t)
+            .and_then(|()| reclaim_scenario(&route, &nft, &base, t));
         if let Err(e) = result {
             fail(&e);
         }
@@ -425,6 +430,251 @@ mod linux {
         }
         if fs::read(&member_path).map_err(e)? != before {
             return Err("member record changed after the refusal".to_owned());
+        }
+        Ok(())
+    }
+
+    /// DNAT ルール（`dnat to` の行）のうち、`dport <port>` を含むものの数。
+    fn dnat_count(table: &NftName, port: u16) -> Result<usize, String> {
+        let rs = run("nft", &["list", "table", "ip", table.as_str()])?;
+        let needle = format!("dport {port}");
+        Ok(rs
+            .lines()
+            .filter(|l| l.contains("dnat to") && l.contains(&needle))
+            .count())
+    }
+
+    /// 公開の切り離し失敗の請求書（DNAT ルールのハンドルつき）の保存・読み戻し・回収（#3285）。
+    fn reclaim_scenario(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let dir = &base.join("store");
+        let ns_dir = base.join("ns");
+        let subnet = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 232, 0, 0)), 24).map_err(e)?;
+        let gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 232, 0, 1)), 24).map_err(e)?;
+        let name = NetworkName::new("dnatrc").map_err(e)?;
+        let def = NetworkDefinition::bridge("dnatrc", subnet).map_err(e)?;
+        let store = NetworkStore::open(dir).map_err(e)?;
+        store.create(&def).map_err(e)?;
+        let publish = |host_port: u16| {
+            PortPublish::new(
+                PortProtocol::Tcp,
+                Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .map_err(e)
+        };
+        let mut ports = PortRegistry::new();
+        let (table, token, table_handle);
+        let (mut r0, mut r2) = (None, None);
+        let (r0_handles, r2_handles);
+        {
+            let g = store.lock_global_exclusive().map_err(e)?;
+            let n = g.lock_network(&name).map_err(e)?;
+            let spec = NetworkCreateSpec::new(name.clone(), gateway).map_err(e)?;
+            let created = create_network_recorded(route, nft, &n, &def, &spec, t)
+                .map_err(|x| format!("create_network_recorded(dnatrc): {x:?}"))?;
+            table = created.table.clone();
+            token = created.bridge_token.clone();
+            table_handle = live_handle(nft, &table, t)?;
+            // r0: 8091・8092、r1: 8093（他コンテナ）、r2: 8094。
+            for (id, host_ports) in [
+                ("r0", vec![8091u16, 8092]),
+                ("r1", vec![8093]),
+                ("r2", vec![8094]),
+            ] {
+                let pubs = host_ports
+                    .into_iter()
+                    .map(publish)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let spec = ContainerAttachSpec::new(
+                    EndpointId::new(id).map_err(e)?,
+                    &created,
+                    ns_dir.clone(),
+                )
+                .and_then(|s| s.with_port_publishes(pubs))
+                .map_err(e)?;
+                let att = attach_container_recorded(
+                    route,
+                    nft,
+                    &n,
+                    &MemberId::new(id).map_err(e)?,
+                    &spec,
+                    &[],
+                    &mut ports,
+                    t,
+                )
+                .map_err(|x| format!("attach_container_recorded({id}): {x:?}"))?;
+                match id {
+                    "r0" => r0 = Some(att),
+                    "r2" => r2 = Some(att),
+                    _ => {}
+                }
+            }
+            let handles_of = |c: &Option<_>, port: u16| -> Result<(u64, u64), String> {
+                let c: &fandhe_container_net::network::AttachedContainer<_> =
+                    c.as_ref().ok_or("container missing")?;
+                c.published_ports
+                    .iter()
+                    .find(|p| p.publish().host_port() == port)
+                    .map(|p| (p.prerouting_handle().get(), p.output_handle().get()))
+                    .ok_or_else(|| format!("port {port} not published"))
+            };
+            r0_handles = handles_of(&r0, 8091)?;
+            r2_handles = handles_of(&r2, 8094)?;
+            for port in [8091, 8092, 8093, 8094] {
+                if dnat_count(&table, port)? != 2 {
+                    return Err(format!("port {port} must have 2 DNAT rules"));
+                }
+            }
+            // 片方だけ残す: 8091 と 8094 の output チェインのルールを先に消す（一括削除は ENOENT で中止される）。
+            for h in [r0_handles.1, r2_handles.1] {
+                run(
+                    "nft",
+                    &[
+                        "delete",
+                        "rule",
+                        "ip",
+                        table.as_str(),
+                        "output",
+                        "handle",
+                        &h.to_string(),
+                    ],
+                )?;
+            }
+            // r0 の切り離しは 8092（逆順で先）を消し、8091 で失敗する。請求書がストアへ保存される。
+            match detach_container_recorded(
+                route,
+                nft,
+                &n,
+                &MemberId::new("r0").map_err(e)?,
+                r0.take().ok_or("r0")?,
+                Vec::new(),
+                &mut ports,
+                t,
+            ) {
+                Err(RecordedError::Op(_)) => {}
+                other => {
+                    return Err(format!(
+                        "detach(r0) must fail with a saved claim (ok={})",
+                        other.is_ok()
+                    ));
+                }
+            }
+        }
+        // (6) ストアを開き直して請求書を読み戻す（永続化した記録そのもの）。
+        let store = NetworkStore::open(dir).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let claims = n.reclaim_records().map_err(e)?.attach;
+        let claim0 = claims
+            .iter()
+            .find(|c| c.endpoint().as_str() == "r0")
+            .ok_or("no saved claim for r0")?;
+        let rec = claim0.to_record();
+        let rule_lines: Vec<&str> = rec.lines().filter(|l| l.starts_with("rule=")).collect();
+        let want_rule = format!(
+            "rule=tcp 192.0.2.10:8091 80 {} {}",
+            r0_handles.0, r0_handles.1
+        );
+        if !rec.starts_with("fandhe-net-attach-claim v2\n")
+            || !rec.contains(&format!("table-handle={table_handle}\n"))
+            || rule_lines != vec![want_rule.as_str()]
+        {
+            return Err(format!("unexpected saved claim: {rec}"));
+        }
+        if dnat_count(&table, 8091)? != 1
+            || dnat_count(&table, 8092)? != 0
+            || dnat_count(&table, 8093)? != 2
+        {
+            return Err(
+                "before the reclaim: 8091 must keep 1 rule, 8092 none, 8093 both".to_owned(),
+            );
+        }
+        // 読み戻した請求書で回収する。残った 1 本だけが消え、他コンテナの公開は残る。
+        reclaim_failed_attach(route, nft, claim0, &ns_dir, t)
+            .map_err(|x| format!("reclaim_failed_attach(r0): {x}; report: {:?}", x.report))?;
+        if dnat_count(&table, 8091)? != 0 || dnat_count(&table, 8093)? != 2 {
+            return Err("after the reclaim: 8091 must be gone and 8093 untouched".to_owned());
+        }
+
+        // (7) r2 も請求書を保存させた後で、テーブルを作り直してから回収する。
+        match detach_container_recorded(
+            route,
+            nft,
+            &n,
+            &MemberId::new("r2").map_err(e)?,
+            r2.take().ok_or("r2")?,
+            Vec::new(),
+            &mut ports,
+            t,
+        ) {
+            Err(RecordedError::Op(_)) => {}
+            other => {
+                return Err(format!(
+                    "detach(r2) must fail with a saved claim (ok={})",
+                    other.is_ok()
+                ));
+            }
+        }
+        let claim2 = n
+            .reclaim_records()
+            .map_err(e)?
+            .attach
+            .into_iter()
+            .find(|c| c.endpoint().as_str() == "r2")
+            .ok_or("no saved claim for r2")?;
+        let rec2 = claim2.to_record();
+        if !rec2.contains(&format!("table-handle={table_handle}\n"))
+            || !rec2.contains(&format!(" {} {}\n", r2_handles.0, r2_handles.1))
+        {
+            return Err(format!("unexpected saved claim for r2: {rec2}"));
+        }
+        nft.send_batch(t, |b| {
+            b.push_with(|seq| {
+                TableDelete::by_handle(NftFamily::Ipv4, table.clone(), table_handle).build(seq)
+            })?;
+            b.push_with(|seq| {
+                TableCreate::new(NftFamily::Ipv4, table.clone())
+                    .with_userdata(token.as_bytes())?
+                    .build(seq)
+            })?;
+            Ok(())
+        })
+        .map_err(|x| format!("recreate table: {x}"))?;
+        if live_handle(nft, &table, t)? == table_handle {
+            return Err("table handle did not change after recreation".to_owned());
+        }
+        run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                table.as_str(),
+                "other",
+                "{ type filter hook input priority 0; }",
+            ],
+        )?;
+        run(
+            "nft",
+            &["add", "rule", "ip", table.as_str(), "other", "counter"],
+        )?;
+        let before = run("nft", &["-a", "list", "table", "ip", table.as_str()])?;
+        reclaim_failed_attach(route, nft, &claim2, &ns_dir, t)
+            .map_err(|x| format!("reclaim_failed_attach(r2): {x}; report: {:?}", x.report))?;
+        let after = run("nft", &["-a", "list", "table", "ip", table.as_str()])?;
+        if after != before || !after.contains("counter") {
+            return Err(format!(
+                "the recreated table must be untouched: {before} -> {after}"
+            ));
         }
         Ok(())
     }

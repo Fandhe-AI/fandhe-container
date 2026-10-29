@@ -190,8 +190,9 @@ fn net1_detach_validate_rejects_without_io() {
 #[test]
 fn net3_detach_rule_delete_failure_holds_address() {
     let mut t = two_containers();
-    let c1 = t.c1.take().unwrap();
-    let extra = std::mem::take(&mut t.extra);
+    let mut c1 = t.c1.take().unwrap();
+    c1.published_ports = bound_at(std::mem::take(&mut c1.published_ports), 99);
+    let extra = bound_at(std::mem::take(&mut t.extra), 99);
     let fake = Fake {
         rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
         ..Fake::default()
@@ -240,8 +241,9 @@ fn net3_detach_rule_delete_failure_holds_address() {
 #[test]
 fn net3_detach_rule_delete_unknown_is_reported() {
     let mut t = two_containers();
-    let c1 = t.c1.take().unwrap();
-    let extra = std::mem::take(&mut t.extra);
+    let mut c1 = t.c1.take().unwrap();
+    c1.published_ports = bound_at(std::mem::take(&mut c1.published_ports), 99);
+    let extra = bound_at(std::mem::take(&mut t.extra), 99);
     let fake = Fake {
         rules_err: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
         ..Fake::default()
@@ -539,17 +541,26 @@ fn repair5_detach_deadline_exceeded_before_any_request() {
     assert_eq!(held(&mut t.ports, "c1"), 2);
 }
 
+/// 公開時のテーブルハンドルを束縛した公開に直す（記録つき経路の公開。#3285）。
+fn bound_at(ports: Vec<PublishedPort>, handle: u64) -> Vec<PublishedPort> {
+    ports
+        .into_iter()
+        .map(|p| p.with_table_handle(crate::nftables_batch::NftTableHandle::new(handle).unwrap()))
+        .collect()
+}
+
 /// 請求書に載った DNAT ルールの記録行（c1 の 2 件。公開は逆順で解除するため 8081 が先）。
 const V2_RULES: &str =
     "table-handle=99\nrule=tcp 192.0.2.10:8081 80 4 5\nrule=tcp 192.0.2.10:8080 80 2 3\n";
 
-/// NET-1・NET-6・REPAIR-4・#3285: DELRULE が確定的に失敗（Aborted）した公開は、生きたテーブルのハンドル（99）と
+/// NET-1・NET-6・REPAIR-4・#3285: DELRULE が確定的に失敗（Aborted）した公開は、公開時のテーブルハンドル（99）と
 /// ルールハンドルつきで請求書（v2）に載り、記録は完全一致で往復する。
 #[test]
 fn net1_3285_detach_rule_failure_claim_carries_rule_handles() {
     let mut t = two_containers();
-    let c1 = t.c1.take().unwrap();
-    let extra = std::mem::take(&mut t.extra);
+    let mut c1 = t.c1.take().unwrap();
+    c1.published_ports = bound_at(std::mem::take(&mut c1.published_ports), 99);
+    let extra = bound_at(std::mem::take(&mut t.extra), 99);
     let fake = Fake {
         rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
         ..Fake::default()
@@ -570,8 +581,9 @@ fn net1_3285_detach_rule_failure_claim_carries_rule_handles() {
 #[test]
 fn net1_3285_detach_unknown_rule_failure_claim_carries_rule_handles() {
     let mut t = two_containers();
-    let c1 = t.c1.take().unwrap();
-    let extra = std::mem::take(&mut t.extra);
+    let mut c1 = t.c1.take().unwrap();
+    c1.published_ports = bound_at(std::mem::take(&mut c1.published_ports), 99);
+    let extra = bound_at(std::mem::take(&mut t.extra), 99);
     let fake = Fake {
         rules_err: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
         ..Fake::default()
@@ -626,12 +638,9 @@ fn net1_3285_detach_deadline_unsent_bound_port_is_in_claim() {
 fn net1_3285_detach_mixed_table_handles_carry_no_rules() {
     let mut t = two_containers();
     let mut c1 = t.c1.take().unwrap();
-    let extra = std::mem::take(&mut t.extra);
-    c1.published_ports = std::mem::take(&mut c1.published_ports)
-        .into_iter()
-        .map(|p| p.with_table_handle(crate::nftables_batch::NftTableHandle::new(98).unwrap()))
-        .collect();
-    // 1 件目（8081。生きたテーブル 99 を束ねて失敗）の直後に期限が切れ、2 件目（8080。98）は未送信になる。
+    let extra = bound_at(std::mem::take(&mut t.extra), 99);
+    c1.published_ports = bound_at(std::mem::take(&mut c1.published_ports), 98);
+    // 1 件目（8081。テーブル 99 で失敗）の直後に期限が切れ、2 件目（8080。98）は未送信になる。
     let fake = Fake {
         rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
         expire_after_calls: Some(2),
@@ -641,4 +650,21 @@ fn net1_3285_detach_mixed_table_handles_carry_no_rules() {
     let rec = e.reclaim_claim().unwrap().to_record();
     assert!(rec.starts_with("fandhe-net-attach-claim v1\n"), "{rec}");
     assert!(rec.contains("quarantine=1\n"), "{rec}");
+}
+
+/// NET-1・SEC-1・#3285: テーブルハンドルを束縛していない公開（公開時の実体を証明できない）は、解除に失敗しても
+/// 生きたテーブルのハンドルで埋めて請求書に載せない（同名で作り直されたテーブルの別ルールを消さない）。
+#[test]
+fn net1_3285_detach_unbound_port_failure_carries_no_rules() {
+    let mut t = two_containers();
+    let c1 = t.c1.take().unwrap();
+    let extra = std::mem::take(&mut t.extra);
+    let fake = Fake {
+        rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
+        ..Fake::default()
+    };
+    let e = detach(&fake, &mut t, c1, extra).unwrap_err();
+    let rec = e.reclaim_claim().unwrap().to_record();
+    assert!(rec.starts_with("fandhe-net-attach-claim v1\n"), "{rec}");
+    assert!(!rec.contains("rule="), "{rec}");
 }

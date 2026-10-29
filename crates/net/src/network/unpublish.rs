@@ -17,8 +17,9 @@
 //!    ハンドルが変わり、記録したルールハンドルは別のルールを指しうるため、食い違えば DELRULE を送らず
 //!    `FailedPrecondition`（[`UnpublishRules::StaleHandles`]）で断る
 //! 3. `DELRULE` 2 本を 1 バッチ（all-or-nothing）で送る
-//!    DELRULE が失敗したとき、未束縛の [`PublishedPort`] には所有を証明した生きたテーブルのハンドルを束ねて返す
-//!    （`detach_container` が請求書にルールのハンドルとして載せる。#3285）
+//!    DELRULE が失敗しても、未束縛の [`PublishedPort`] へ生きたテーブルのハンドルを束ねない（公開時の実体を
+//!    証明できない値を、同名で作り直されたテーブルのハンドルで埋めて請求書に載せると、回収が別の公開ルールを
+//!    消しうる。テーブルハンドルは公開時に取得した値だけが請求書に載る。#3285）
 //! 4. 結果: 成功なら受け口の予約を戻す。`Aborted` / `NotSent` ならルールは残っている（確定）ので予約を
 //!    保持し [`PublishedPort`] を返して再試行できるようにする。結果不明（`Unknown`）も予約を保持する
 //!    （quarantine。残ったルールが同じ受け口で別のコンテナへ転送する事故を防ぐ）。ENOENT を「既に消えた」と
@@ -169,7 +170,7 @@ pub(crate) fn unpublish_ports_with(
     table_info: impl FnOnce(&NftName) -> Result<TableInfo, NetError>,
     delete: impl FnOnce(&NftName, (NftRuleHandle, NftRuleHandle)) -> Result<(), NftApplyFailure>,
     network: &CreatedNetwork,
-    mut published: PublishedPort,
+    published: PublishedPort,
     registry: &mut PortRegistry,
 ) -> Result<(), UnpublishPortError> {
     // 何も変えずに断る失敗。ルールの状態は判らないので Unknown とし、予約と記録を保つ。
@@ -206,12 +207,6 @@ pub(crate) fn unpublish_ports_with(
     }
     let handles = (published.prerouting, published.output);
     if let Err(f) = delete(&network.table, handles) {
-        // 所有を証明した生きたテーブルのハンドルを、未束縛の公開に束ねて返す。記録の無い経路の公開でも、
-        // 呼び出し側（`detach_container`）が請求書へテーブルハンドルつきで載せ、再起動後も回収できる（#3285）。
-        // 束縛済みの値（記録つき経路）は変えない。
-        if published.table_handle.is_none() {
-            published.table_handle = Some(live);
-        }
         let rules = if matches!(
             f.outcome,
             NftBatchOutcome::Aborted | NftBatchOutcome::NotSent
@@ -470,16 +465,16 @@ mod tests {
             assert_eq!(e.error.code(), NetErrorCode::NotFound);
             assert_eq!(e.rules, UnpublishRules::Present);
             assert!(e.reservation_held);
-            // 所有を証明した生きたテーブルのハンドル（99）が束ねられて返る（#3285）。
-            assert_eq!(e.published, Some(Box::new(published_at(99))));
+            // 未束縛の公開は生きたテーブルのハンドルを束ねられずに返る（#3285）。
+            assert_eq!(e.published, Some(Box::new(published(TOKEN, "web"))));
             assert_eq!(reg.len(), 1, "no inference from ENOENT");
         }
     }
 
-    /// NET-3・NET-1・#3285: DELRULE が失敗したとき、未束縛の公開には生きたテーブルのハンドルを束ねて返し
-    /// （Present・Unknown とも）、束縛済みの値は変えない。照合で断った経路（所有の不一致）は束ねない。
+    /// NET-3・NET-1・#3285: DELRULE が失敗しても、未束縛の公開へ生きたテーブルのハンドルを束ねない
+    /// （同名で作り直されたテーブルの値を請求書へ載せない）。束縛済みの値は変えない。
     #[test]
-    fn net1_3285_unpublish_failure_binds_live_table_handle() {
+    fn net1_3285_unpublish_failure_never_binds_live_table_handle() {
         for (code, outcome) in [
             (NetErrorCode::Internal, NftBatchOutcome::Aborted),
             (NetErrorCode::Timeout, NftBatchOutcome::Unknown),
@@ -492,7 +487,7 @@ mod tests {
                 &mut reg,
             );
             let p = r.unwrap_err().published.unwrap();
-            assert_eq!(p.table_handle(), NftTableHandle::new(99).ok());
+            assert_eq!(p.table_handle(), None);
         }
         // 束縛済み（生きたものと一致する 99）はそのまま。
         let mut reg = reserved();
@@ -506,15 +501,6 @@ mod tests {
             r.unwrap_err().published.unwrap().table_handle(),
             NftTableHandle::new(99).ok()
         );
-        // 所有を証明できなかった経路は束ねない。
-        let mut reg = reserved();
-        let (r, _, _) = run(
-            info(b"someone-else"),
-            Ok(()),
-            published(TOKEN, "web"),
-            &mut reg,
-        );
-        assert_eq!(r.unwrap_err().published.unwrap().table_handle(), None);
     }
 
     /// NET-3: 結果不明は予約を保持して quarantine（ルールは Unknown）。

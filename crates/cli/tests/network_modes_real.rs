@@ -199,7 +199,23 @@ mod linux {
         std::process::exit(8);
     }
 
-    /// `/proc/self/net/dev` のインターフェース名（ソートしてカンマ区切り）。読めなければ `unreadable`。
+    /// 新しい netns でカーネルが自動生成するフォールバックトンネルデバイス名（モジュールのロード状況で有無が変わる）。
+    /// `core` の `production_launcher` と同じ集合で、隔離 netns の形の判定から除く（`lo` の完全一致は弱めない）。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+
+    /// `/proc/self/net/dev` のインターフェース名（フォールバックトンネルを除き、ソートしてカンマ区切り）。
+    /// 読めなければ `unreadable`。
     fn probe_ifaces() -> String {
         let mut text = String::new();
         let read = fs::File::open("/proc/self/net/dev")
@@ -211,6 +227,7 @@ mod linux {
             .lines()
             .skip(2)
             .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim()))
+            .filter(|n| !FALLBACK_TUNNEL_DEVICES.contains(n))
             .collect();
         names.sort_unstable();
         names.join(",")

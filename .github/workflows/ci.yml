@@ -2049,8 +2049,9 @@ jobs:
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
-      # network_modes_real（`crates/cli/tests/`。NET-6・NET-12・CLI-1・SEC-1・REPAIR-12・#3345）: `create` の `--network none|host`・
-      # `--add-host`・`--dns` が本番の rootless の start でコンテナに効くことと、delete 後に生成物の残骸が無いことを確かめる。
+      # network_modes_real（`crates/cli/tests/`。NET-6・NET-12・CLI-1・SEC-1・REPAIR-12・#3345）:
+      # `create` の `--network none|host`・`--add-host`・`--dns` が本番の rootless の start でコンテナに
+      # 効くことと、delete 後に生成物の残骸が無いことを確かめる。
       # 前提・実行方法は start_stop_delete_real と同じ（上の前提確認ステップ。supervisor の bin を先にビルドして置き、試験バイナリを
       # 委譲スコープの中で直接実行する）。host モードは runner の netns を共有するだけで、ホストのネットワーク設定を変えない。
       # 新しい check-run・sudo・permissions は追加しない。

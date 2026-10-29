@@ -569,8 +569,13 @@ fn net9_log_buffer_is_bounded() {
 /// CLI の delete が呼ぶ残骸の削除は、無ければ成功し、あれば消す(記録の pid でのプロセス操作はしない)。
 #[test]
 fn net9_remove_leftovers_is_idempotent() {
-    let dir = std::env::temp_dir().join(format!("fandhe-pasta-attach-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // 一意・排他作成の親の子を使う（pid だけの名前の残骸があると非再帰の create が失敗する。#3374・REPAIR-12）。
+    let scratch = crate::scratch_root::ScratchDir::new(
+        "fandhe-pasta-attach",
+        std::time::Duration::from_secs(10),
+    );
+    let dir = scratch.path().join("root");
+    std::fs::create_dir(&dir).unwrap();
     let id = ContainerId::new("web1".to_owned()).unwrap();
     remove_pasta_leftovers(&dir, &id).expect("absent is ok");
     let run = dir.join("@pasta").join("web1");
@@ -585,7 +590,6 @@ fn net9_remove_leftovers_is_idempotent() {
     std::fs::write(run.join("pid"), "123\n").unwrap();
     remove_pasta_leftovers(&dir, &id).expect("removes");
     assert!(!run.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// REPAIR-4・#1940: helper の stderr(二重引用符・バックスラッシュ・`\xNN`・制御文字)を含んでも 1 行になり、

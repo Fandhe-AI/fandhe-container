@@ -3854,8 +3854,11 @@ mod linux {
                     Ok(())
                 }
             }
-            let dir = std::env::temp_dir().join(format!("fc-rec-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            // 一意・排他作成の親の子を使う（pid だけの名前の残骸を拾わない。#3374・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-rec", std::time::Duration::from_secs(10));
+            let dir = scratch.path().join("root");
+            std::fs::create_dir(&dir).unwrap();
             let missing = dir.join("absent");
             let source = SubordinateIdSource::with_paths(
                 Some("alice".to_owned()),
@@ -3892,7 +3895,6 @@ mod linux {
             ));
             assert!(deps.launcher_builder(true).is_err());
             assert!(deps.launcher_builder(false).is_ok());
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SEC-1・SUP-1・#2132: fd 0〜2 のどれかが閉じていれば FAILED_PRECONDITION、すべて開いていれば通る。

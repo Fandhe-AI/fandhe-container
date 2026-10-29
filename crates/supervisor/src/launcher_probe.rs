@@ -447,13 +447,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sup14_read_launcher_file_caps_on_plain_file() {
-        let dir = std::env::temp_dir().join(format!("fc-launcher-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 一意・排他作成の親の子を使う（pid だけの名前の残骸と衝突しない。#3374・REPAIR-12）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fc-launcher-probe",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("root");
+        std::fs::create_dir(&dir).expect("mkdir");
         let f = dir.join("plain");
         std::fs::write(&f, b"x").expect("write");
         let got = read_launcher_file_caps(&f);
         let missing = read_launcher_file_caps(&dir.join("absent"));
-        std::fs::remove_dir_all(&dir).expect("cleanup");
         assert!(
             matches!(got, XattrRead::NoData | XattrRead::Unsupported),
             "{got:?}"

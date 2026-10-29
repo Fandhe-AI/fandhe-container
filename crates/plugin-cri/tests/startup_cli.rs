@@ -2,7 +2,7 @@
 //!
 //! 絶対パスで起動し（PATH 探索なし）、環境は `env_clear()`。子の待機は期限つき（REPAIR-5）。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::process::Command;

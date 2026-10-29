@@ -67,7 +67,7 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(target_os = "linux")]

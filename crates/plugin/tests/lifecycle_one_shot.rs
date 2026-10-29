@@ -6,7 +6,7 @@
 //! `behavior` ファイルで子へ伝える。
 
 #[cfg(unix)]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 #[cfg(unix)]
 #[path = "support/swap.rs"]

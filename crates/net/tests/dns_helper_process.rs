@@ -22,7 +22,7 @@ use fandhe_container_net::network::{EndpointId, NetworkName};
 #[path = "dns_helper_process/detached.rs"]
 mod detached;
 #[cfg(target_os = "linux")]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 fn query(id: u16, flags: u16, qd: u16) -> Vec<u8> {

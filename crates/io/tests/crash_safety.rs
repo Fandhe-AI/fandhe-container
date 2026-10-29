@@ -35,7 +35,7 @@
 //! Windows など UDS 未対応 OS では、未対応終了コード 5 を返すことだけを確かめる。
 
 // kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。unix・other の両 mod から使う。
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

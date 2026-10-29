@@ -4,7 +4,7 @@
 //! 異常終了役の子プロセスはテストバイナリ自身を `--exact unix::sweep_child_entry` で再実行して
 //! 用意し、親が SIGKILL（`Child::kill`）で止めて残骸を作る。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(not(unix))]

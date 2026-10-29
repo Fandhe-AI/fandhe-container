@@ -1,11 +1,12 @@
-//! 試験共有補助 `support/reap.rs` の期限切れ経路の照合（REPAIR-5・REPAIR-12・#3302）。
-//! core・supervisor の試験が使う期限つき回収が、止まった子に対して無期限に待たず、具体的な
-//! メッセージの `Err` で失敗を表に出すことを固定する（`run_within`・`output_within` は #3409）。
-//! libtest ハーネス・全 OS で動く。
+//! 試験共有補助 `support/reap.rs`（全 crate の正本。#3410）の期限切れ経路の照合（REPAIR-5・REPAIR-12・#3302・#3409）。
+//! 全 crate の試験が使う期限つき回収・期限つき実行（`run_within`・`output_within`）が、止まった子に対して無期限に待たず、具体的な
+//! メッセージの `Err` で失敗を表に出すことを固定する。libtest ハーネス・全 OS で動く。
 
 #[path = "support/reap.rs"]
 mod reap;
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -81,6 +82,11 @@ fn repair5_wait_within_reports_expiry() {
     assert_eq!(err, format!("child {pid} did not exit within 200ms"));
     reap::reap(&mut g.0, Duration::from_secs(10)).expect("reap after kill");
     assert!(g.0.try_wait().expect("try_wait").is_some());
+    #[cfg(unix)]
+    assert_eq!(
+        g.0.try_wait().expect("try_wait").expect("reaped").signal(),
+        Some(9)
+    );
 }
 
 #[test]
@@ -136,5 +142,17 @@ fn repair5_output_within_returns_when_descendant_holds_output() {
         start.elapsed() < Duration::from_secs(5),
         "returned late: {:?}",
         start.elapsed()
+    );
+}
+
+#[test]
+fn repair5_run_within_reports_spawn_failure() {
+    let missing = std::env::temp_dir().join("fandhe-container-reap-support-no-such-program");
+    let program = missing.to_string_lossy().into_owned();
+    let mut cmd = Command::new(&missing);
+    let err = reap::run_within(&mut cmd, Duration::from_secs(10)).expect_err("spawn must fail");
+    assert!(
+        err.starts_with(&format!("spawn {program} failed: ")),
+        "unexpected message: {err}"
     );
 }

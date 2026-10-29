@@ -63,6 +63,8 @@ compile_error!(
     "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
 );
 
+#[cfg(target_os = "linux")]
+pub mod audit_relay;
 pub mod cgroup_remover;
 pub mod container_options;
 pub mod control;

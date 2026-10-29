@@ -3,7 +3,7 @@
 //! 絶対パスで起動し（PATH 探索なし）、環境は `env_clear()` 後に必要分のみ渡す。
 //! 子の待機は期限つき（REPAIR-5）。期限超過は kill して失敗にする。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::path::PathBuf;

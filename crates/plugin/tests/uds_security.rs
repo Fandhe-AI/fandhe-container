@@ -11,7 +11,7 @@ fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
 }
 
 #[cfg(unix)]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(unix)]

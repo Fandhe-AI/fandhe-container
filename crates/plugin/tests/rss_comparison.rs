@@ -10,7 +10,7 @@
 //! ここでは増加方向の下限だけを検査し、絶対値の比較は行わない（並列テストによる揺れを避ける）。
 //! RSS を読むテストは `RSS_LOCK` で直列化する。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

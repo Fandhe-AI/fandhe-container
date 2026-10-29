@@ -2,7 +2,7 @@
 # scripts/cri/docker-hub-ratelimit-probe.sh の自己テスト（CRI-3・REPAIR-12・#2818）。
 #
 # 役割: PATH 先頭のスタブ curl だけで、残量あり・残量 0・429・ヘッダ無し・到達不能・トークン欠落・usage 誤りの
-# 終了コードと文言を具体値で照合する。ネットワークは使わない。トークンが出力に現れないことも確かめる。
+# 終了コードと文言（最低残量 PROBE_MIN_REMAINING の未満・ちょうど・超過の境界を含む。#3312）を具体値で照合する。ネットワークは使わない。トークンが出力に現れないことも確かめる。
 # 呼び出し元は Makefile の `docker-hub-ratelimit-probe-selftest`（CI の platform-ci でも実行）。1 件でも違えば非ゼロ（fail-closed）。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,6 +59,29 @@ run "status 429" 1 "anonymous pull rate limit exhausted (status=429 remaining=n/
 run "manifest 500" 1 "unreachable or returned an unexpected status (stage=manifest status=500)" STUB_MANIFEST_CODE=500
 run "token unreachable" 1 "(stage=token status=000)" STUB_TOKEN_CODE=000
 run "token missing" 1 "(stage=token status=no-token)" STUB_NO_TOKEN=1
+H1='STUB_HEADERS=ratelimit-limit: 100;w=21600\r\nratelimit-remaining: 1;w=21600\r\n'
+H2='STUB_HEADERS=ratelimit-limit: 100;w=21600\r\nratelimit-remaining: 2;w=21600\r\n'
+H3='STUB_HEADERS=ratelimit-limit: 100;w=21600\r\nratelimit-remaining: 3;w=21600\r\n'
+H0='STUB_HEADERS=ratelimit-limit: 100;w=21600\r\nratelimit-remaining: 0;w=21600\r\n'
+run "min 2 remaining 1 (below)" 1 "remaining below required minimum (remaining=1 min=2)" PROBE_MIN_REMAINING=2 "${H1}"
+run "min 2 remaining 2 (exact)" 0 "ok remaining=2 limit=100 min=2" PROBE_MIN_REMAINING=2 "${H2}"
+run "min 2 remaining 3 (above)" 0 "ok remaining=3 limit=100 min=2" PROBE_MIN_REMAINING=2 "${H3}"
+run "min 2 remaining 0 (exhausted wins)" 1 "anonymous pull rate limit exhausted (status=200 remaining=0)" PROBE_MIN_REMAINING=2 "${H0}"
+run "min 2 no headers" 0 "ok (no rate limit headers)" PROBE_MIN_REMAINING=2
+run "min 2 status 429" 1 "anonymous pull rate limit exhausted (status=429 remaining=n/a)" PROBE_MIN_REMAINING=2 STUB_MANIFEST_CODE=429
+run "default min remaining 1" 0 "ok remaining=1 limit=100 min=1" "${H1}"
+run "empty min is default" 0 "ok remaining=1 limit=100 min=1" PROBE_MIN_REMAINING= "${H1}"
+run "invalid min" 2 "usage: invalid PROBE_MIN_REMAINING" PROBE_MIN_REMAINING=abc
+run "min zero" 2 "usage: PROBE_MIN_REMAINING must be 1-100" PROBE_MIN_REMAINING=0
+run "min 101" 2 "usage: PROBE_MIN_REMAINING must be 1-100" PROBE_MIN_REMAINING=101
+rc=0
+out="$(env PATH="${work}/bin:${PATH}" PROBE_MIN_REMAINING=2 "${H1}" bash "${PROBE}" 2>&1)" || rc=$?
+if printf '%s' "${out}" | grep -qF exhausted; then
+  echo "FAIL: below-minimum message must not contain 'exhausted'"
+  FAILS=$((FAILS + 1))
+else
+  echo "PASS: below-minimum message distinct from exhausted"
+fi
 run "invalid repo" 2 "usage: invalid PROBE_REPO" "PROBE_REPO=a b;rm"
 run "invalid tag" 2 "usage: invalid PROBE_TAG" "PROBE_TAG=1.36&x"
 run "invalid timeout" 2 "usage: invalid PROBE_TIMEOUT_SECS" PROBE_TIMEOUT_SECS=abc

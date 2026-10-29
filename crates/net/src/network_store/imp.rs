@@ -290,6 +290,13 @@ pub struct NetworkLockGuard<'g> {
     file: File,
 }
 
+impl NetworkLockGuard<'_> {
+    /// 操作の結果と所要時間の記録先（REPAIR-4）。ストアに渡された記録先をそのまま返す。
+    pub(crate) fn net_op_recorder(&self) -> &dyn NetOpRecorder {
+        &*self.recorder
+    }
+}
+
 impl std::fmt::Debug for NetworkLockGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetworkLockGuard")

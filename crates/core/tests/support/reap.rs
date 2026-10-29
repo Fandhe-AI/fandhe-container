@@ -121,21 +121,72 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
     }
 }
 
+/// `kill` を 1 回（引数形式・実行ファイルの全試行）実行した結果（REPAIR-5）。
+#[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KillOnce {
+    /// 送信できた。
+    Sent,
+    /// グループが空（ESRCH。stderr が `No such process`）。
+    Gone,
+    /// 権限不足 / 終了済みで未回収のプロセスだけが残る場合の EPERM（stderr が `Operation not permitted`）。
+    /// 値は全試行の記録。
+    Eperm(String),
+    /// それ以外の失敗。値は全試行の記録。
+    Failed(String),
+}
+
+/// EPERM の再試行の間隔と合計上限（REPAIR-5）。
+#[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
+const KILL_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+#[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
+const KILL_RETRY_TOTAL: Duration = Duration::from_secs(2);
+
+/// 1 回の結果の並びからグループ kill の最終結果を決める判定（REPAIR-5・REPAIR-12）。`once` を呼び、
+/// - `Sent` / `Gone` → `Ok`。
+/// - `Eperm` → 直接の子を回収済み（`child_reaped`）なら `interval` 間隔で `total` まで再試行する。macOS で
+///   一時的に残る終了済みの孫（ゾンビ。回収されるまで EPERM になるとみられる）への対処で、空になって `Gone`
+///   （または `Sent`）になれば `Ok`。上限まで EPERM が続けば、生存する孫が資格情報を変えて残っている可能性が
+///   あるため最後の記録つきで `Err`（握り潰さない）。未回収のときの EPERM は再試行せず即 `Err`。
+/// - `Failed` → 即 `Err`。
+#[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
+pub(crate) fn kill_group_with(
+    pgid: u32,
+    child_reaped: bool,
+    interval: Duration,
+    total: Duration,
+    once: &mut dyn FnMut() -> KillOnce,
+) -> Result<(), String> {
+    let until = Instant::now() + total;
+    loop {
+        match once() {
+            KillOnce::Sent | KillOnce::Gone => return Ok(()),
+            KillOnce::Failed(m) => return Err(format!("kill process group {pgid} failed: {m}")),
+            KillOnce::Eperm(m) => {
+                if !child_reaped || Instant::now() >= until {
+                    return Err(format!(
+                        "kill process group {pgid} failed with EPERM{}: {m}",
+                        if child_reaped {
+                            " (still after retries; a live descendant may remain)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                std::thread::sleep(interval);
+            }
+        }
+    }
+}
+
 /// プロセスグループ `pgid` の全員へ SIGKILL を送る。この補助は `unsafe` を持たないため、`kill(2)` の直接
 /// 呼び出しの代わりに OS 同梱の `kill` を環境空・絶対パス・期限つき（10 秒）で起動する。引数形式は GNU
 /// （Linux）の `-s KILL -- -<pgid>` を先に、BSD（macOS）の kill が `--` を pid として拒否するため
 /// `-s KILL -<pgid>` を次に試す（`crates/plugin/tests/rss_comparison.rs` の `kill_process_group` と同じ）。
-/// 存在しない実行ファイル（NotFound）は試行から外す。どれかが成功すれば `Ok`。
-/// 全部失敗した場合の成功扱いは次の 2 つだけ:
-/// - いずれかの stderr が `No such process`（ESRCH。グループがすでに空）。
-/// - `child_reaped`（直接の子を回収済み）で、いずれかの stderr が `Operation not permitted`（EPERM）。
-///   macOS の `kill(2)` は、終了済みで未回収のプロセス（ゾンビ）だけが残るグループへの送信が EPERM になる
-///   とみられる（CI の macOS ログで、子が終了した直後の空に近いグループへの送信が失敗した事象からの推定で、
-///   Apple の man・XNU の一次情報では未確認）。直接の子が回収済みなら、残りうるのは孫のゾンビだけで
-///   止める対象が無いため成功扱いにする。子が未回収のときの EPERM は本物の権限不足かもしれないので `Err`。
-///
-/// それ以外は、全試行の実行ファイル・引数・終了ステータス・stderr を連ねた `Err`。`pgid` が 0 や 1 のときは
-/// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない。
+/// 存在しない実行ファイル（NotFound）は試行から外す。成功・`No such process`（ESRCH）は `Ok`。EPERM は
+/// `kill_group_with` の契約（直接の子を回収済みなら 20 ms 間隔・合計 2 秒の有界な再試行、続けば `Err`）。
+/// それ以外は全試行の実行ファイル・引数・終了ステータス・stderr を連ねた `Err`。`pgid` が 0 や 1 のときは
+/// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない（REPAIR-5）。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
     #[cfg(unix)]
@@ -143,61 +194,73 @@ fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
         if pgid <= 1 {
             return Ok(());
         }
-        let target = format!("-{pgid}");
-        let forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
-        let mut attempts: Vec<String> = Vec::new();
-        let (mut gone, mut eperm) = (false, false);
-        for bin in ["/bin/kill", "/usr/bin/kill"] {
-            for args in forms {
-                let mut cmd = Command::new(bin);
-                cmd.args(args)
-                    .env_clear()
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped());
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    // 存在しない実行ファイルは試行に数えない（エラーの根拠にしない）。
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        attempts.push(format!("spawn {bin} failed: {e}"));
-                        continue;
-                    }
-                };
-                match wait_within(&mut child, Duration::from_secs(10)) {
-                    Ok(st) if st.success() => return Ok(()),
-                    Ok(st) => {
-                        // kill の stderr は 1 行程度。終了後に上限つきで読む。
-                        let mut msg = String::new();
-                        if let Some(mut e) = child.stderr.take() {
-                            let _ = e.by_ref().take(4096).read_to_string(&mut msg);
-                        }
-                        gone |= msg.contains("No such process");
-                        eperm |= msg.contains("Operation not permitted");
-                        attempts.push(format!("{bin} {args:?} exited with {st}: {}", msg.trim()));
-                    }
-                    Err(e) => {
-                        reap_or_report(&mut child, REAP_WITHIN);
-                        attempts.push(format!("{bin} {args:?}: {e}"));
-                    }
-                }
-            }
-        }
-        if gone || (child_reaped && eperm) {
-            return Ok(());
-        }
-        if attempts.is_empty() {
-            attempts.push("no kill binary found".to_string());
-        }
-        Err(format!(
-            "kill process group {pgid} failed: {}",
-            attempts.join(" | ")
-        ))
+        kill_group_with(
+            pgid,
+            child_reaped,
+            KILL_RETRY_INTERVAL,
+            KILL_RETRY_TOTAL,
+            &mut || kill_once(pgid),
+        )
     }
     #[cfg(not(unix))]
     {
         let _ = (pgid, child_reaped);
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn kill_once(pgid: u32) -> KillOnce {
+    let target = format!("-{pgid}");
+    let forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
+    let mut attempts: Vec<String> = Vec::new();
+    let (mut gone, mut eperm) = (false, false);
+    for bin in ["/bin/kill", "/usr/bin/kill"] {
+        for args in forms {
+            let mut cmd = Command::new(bin);
+            cmd.args(args)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                // 存在しない実行ファイルは試行に数えない（エラーの根拠にしない）。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    attempts.push(format!("spawn {bin} failed: {e}"));
+                    continue;
+                }
+            };
+            match wait_within(&mut child, Duration::from_secs(10)) {
+                Ok(st) if st.success() => return KillOnce::Sent,
+                Ok(st) => {
+                    // kill の stderr は 1 行程度。終了後に上限つきで読む。
+                    let mut msg = String::new();
+                    if let Some(mut e) = child.stderr.take() {
+                        let _ = e.by_ref().take(4096).read_to_string(&mut msg);
+                    }
+                    gone |= msg.contains("No such process");
+                    eperm |= msg.contains("Operation not permitted");
+                    attempts.push(format!("{bin} {args:?} exited with {st}: {}", msg.trim()));
+                }
+                Err(e) => {
+                    reap_or_report(&mut child, REAP_WITHIN);
+                    attempts.push(format!("{bin} {args:?}: {e}"));
+                }
+            }
+        }
+    }
+    if attempts.is_empty() {
+        attempts.push("no kill binary found".to_string());
+    }
+    let rec = attempts.join(" | ");
+    if gone {
+        KillOnce::Gone
+    } else if eperm {
+        KillOnce::Eperm(rec)
+    } else {
+        KillOnce::Failed(rec)
     }
 }
 
@@ -473,6 +536,18 @@ impl Captured {
     /// 呼び出し側の `discard`）。期限切れの文言は `wait_within` と同じ `child <pid> did not exit within <within>`。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn wait_within(&self, child: &mut Child, within: Duration) -> Result<ExitStatus, String> {
+        self.wait_within_diag(child, within, &|_| String::new())
+    }
+
+    /// `wait_within` に、期限切れの直前（子を kill する前）に子の pid から診断文字列を採る `diag` を足した版。
+    /// 空でない診断は期限切れのエラーの末尾に ` (<diag>)` で付く（子が止まった理由を残したい試験向け）。
+    #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+    pub fn wait_within_diag(
+        &self,
+        child: &mut Child,
+        within: Duration,
+        diag: &dyn Fn(u32) -> String,
+    ) -> Result<ExitStatus, String> {
         let pid = child.id();
         let until = Instant::now() + within;
         let stop = |child: &mut Child, msg: String| {
@@ -507,7 +582,12 @@ impl Captured {
                 return stop(child, e);
             }
             if Instant::now() >= until {
-                return stop(child, format!("child {pid} did not exit within {within:?}"));
+                let d = diag(pid);
+                let d = if d.is_empty() { d } else { format!(" ({d})") };
+                return stop(
+                    child,
+                    format!("child {pid} did not exit within {within:?}{d}"),
+                );
             }
             std::thread::sleep(OUTPUT_POLL);
         }

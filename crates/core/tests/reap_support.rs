@@ -505,12 +505,12 @@ fn repair5_repair12_pipe_grace_is_shared_across_waits() {
     captured.discard().expect("discard");
 }
 
-/// 直接の子が終了して回収された後（グループは空か孫のゾンビのみ）の後始末が、どの OS でも `Ok` になる。
-/// macOS の CI で、子が終了した直後のグループへの送信が失敗した事象の再現（子の終了を待ってから回収し、
-/// その後に `discard` する）。回収の順序（回収後に kill）を固定するため、終了済みで未回収の間は触らない。
+/// 孫の居ないグループは、直接の子の回収後に空になる（ESRCH）ので、後始末がどの OS でも `Ok` になる
+/// （macOS で一時的に EPERM でも、空になるまでの有界な再試行で `Ok`。REPAIR-5）。終了済みで未回収の間を作り、
+/// 回収（`wait_within`）の後に `discard` する順序を固定する。
 #[cfg(unix)]
 #[test]
-fn repair5_repair12_group_kill_after_child_reaped_is_ok() {
+fn repair5_repair12_group_kill_of_empty_group_after_child_reaped_is_ok() {
     for mode in [reap::CaptureMode::Files, reap::CaptureMode::Pipes] {
         let mut cmd = self_cmd("reap_support_child_blocks", "");
         let (mut child, captured) =
@@ -522,4 +522,81 @@ fn repair5_repair12_group_kill_after_child_reaped_is_ok() {
             .expect("exit");
         captured.discard().expect("discard after reaped child");
     }
+}
+
+/// 判定の契約（REPAIR-5・REPAIR-12）: 回収済みの EPERM は有界に再試行して、空（ESRCH）になれば `Ok`。
+#[test]
+fn repair5_repair12_kill_eperm_then_gone_is_ok_when_child_reaped() {
+    let mut seq = vec![
+        reap::KillOnce::Eperm("a".into()),
+        reap::KillOnce::Eperm("b".into()),
+        reap::KillOnce::Gone,
+    ]
+    .into_iter();
+    let mut calls = 0;
+    let r = reap::kill_group_with(
+        42,
+        true,
+        Duration::from_millis(1),
+        Duration::from_secs(5),
+        &mut || {
+            calls += 1;
+            seq.next().expect("no extra call")
+        },
+    );
+    assert_eq!(r, Ok(()));
+    assert_eq!(calls, 3);
+}
+
+/// 上限まで EPERM が続けば `Err`（最後の記録を含む）。生存する孫を残したまま成功扱いにしない。
+#[test]
+fn repair5_repair12_kill_eperm_until_deadline_is_err_with_last_record() {
+    let mut calls = 0u32;
+    let r = reap::kill_group_with(
+        42,
+        true,
+        Duration::from_millis(5),
+        Duration::from_millis(100),
+        &mut || {
+            calls += 1;
+            reap::KillOnce::Eperm(format!("record {calls}"))
+        },
+    );
+    let err = r.expect_err("persistent EPERM must fail");
+    assert!(calls >= 2, "must retry: {calls}");
+    assert_eq!(
+        err,
+        format!(
+            "kill process group 42 failed with EPERM (still after retries; a live descendant may remain): record {calls}"
+        )
+    );
+}
+
+/// 子が未回収のときの EPERM は再試行せず即 `Err`。それ以外の失敗も即 `Err`。
+#[test]
+fn repair5_repair12_kill_eperm_unreaped_and_other_failures_are_immediate_errors() {
+    let mut calls = 0;
+    let r = reap::kill_group_with(
+        7,
+        false,
+        Duration::from_millis(1),
+        Duration::from_secs(5),
+        &mut || {
+            calls += 1;
+            reap::KillOnce::Eperm("denied".into())
+        },
+    );
+    assert_eq!(
+        r,
+        Err("kill process group 7 failed with EPERM: denied".to_string())
+    );
+    assert_eq!(calls, 1);
+    let r = reap::kill_group_with(
+        7,
+        true,
+        Duration::from_millis(1),
+        Duration::from_secs(5),
+        &mut || reap::KillOnce::Failed("boom".into()),
+    );
+    assert_eq!(r, Err("kill process group 7 failed: boom".to_string()));
 }

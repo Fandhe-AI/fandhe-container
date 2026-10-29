@@ -243,6 +243,132 @@ fn exceeds_cap(path: &std::path::Path, cap: u64) -> Result<bool, String> {
         .map_err(|e| format!("stat output file {}: {e}", path.display()))
 }
 
+/// 出力の受け方。Unix は一時ファイル（子の終了後に孫が出力先を持っていても戻れ、読み手スレッドも要らない）、
+/// それ以外（Windows）は pipe と読み手スレッド（グループ kill が無く、子孫の書き込みでファイルが増えるのを
+/// 防ぐため。pipe は読み手が上限で読むのをやめて閉じるので保存量が増えない。REPAIR-5・REPAIR-12）。
+/// 単体試験が両方の経路を Unix でも試せるよう、型としては全 OS で持つ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code, reason = "既定でない方式は単体試験からだけ選ばれる")]
+pub(crate) enum CaptureMode {
+    Files,
+    Pipes,
+}
+
+/// 既定の受け方（Unix はファイル、それ以外は pipe）。
+const DEFAULT_MODE: CaptureMode = if cfg!(unix) {
+    CaptureMode::Files
+} else {
+    CaptureMode::Pipes
+};
+
+/// pipe 方式で、子の終了後に読み手スレッドの EOF を待つ最長時間。孫が pipe を握ったままだと EOF は来ないので、
+/// 過ぎたらスレッドを切り離し、その時点までに読めた分を返す（切り離したスレッドの確保量は `cap + 読み取り
+/// 単位` 以下で、上限に達すれば自分で終わる）。
+const PIPE_EOF_GRACE: Duration = Duration::from_secs(2);
+
+/// 読み手スレッドが貯める 1 本分の出力。
+#[derive(Default)]
+struct StreamState {
+    buf: Vec<u8>,
+    /// 上限を超える出力を受けた（以降は読まずに pipe を閉じる）。
+    overflow: bool,
+    /// EOF または読み取りエラーで読み手が終わった。
+    done: Option<String>,
+    eof: bool,
+}
+
+type Stream = std::sync::Arc<std::sync::Mutex<StreamState>>;
+
+/// 1 本の pipe を上限つきで読むスレッドを起こす。上限を超える手前まで貯め、超えたら印を立てて読み手側の
+/// 端を閉じる（書き手は以後 broken pipe になり、保存量は増えない）。
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut r: R,
+    cap: u64,
+    name: &str,
+) -> Result<Stream, String> {
+    let st: Stream = Stream::default();
+    let st2 = st.clone();
+    std::thread::Builder::new()
+        .name(format!("reap-{name}"))
+        .spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let res = r.read(&mut chunk);
+                let Ok(mut g) = st2.lock() else { return };
+                match res {
+                    Ok(0) => {
+                        g.eof = true;
+                        return;
+                    }
+                    Ok(n) => {
+                        let room = (cap as usize).saturating_sub(g.buf.len());
+                        if n > room {
+                            g.buf.extend_from_slice(&chunk[..room]);
+                            g.overflow = true;
+                            return;
+                        }
+                        g.buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        g.done = Some(format!("read pipe: {e}"));
+                        return;
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("spawn pipe reader {name}: {e}"))?;
+    Ok(st)
+}
+
+/// pipe 方式の受け皿（stdout・stderr の読み手）。
+struct Pipes {
+    out: Stream,
+    err: Stream,
+}
+
+impl Pipes {
+    fn overflow(&self) -> Option<&'static str> {
+        let o = |s: &Stream| s.lock().map(|g| g.overflow).unwrap_or(false);
+        if o(&self.out) {
+            Some("stdout")
+        } else if o(&self.err) {
+            Some("stderr")
+        } else {
+            None
+        }
+    }
+
+    /// 両方の読み手が終わる（EOF・上限・エラー）のを `PIPE_EOF_GRACE` まで待ち、貯まった分を取り出す。
+    fn take(&self, cap: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let until = Instant::now() + PIPE_EOF_GRACE;
+        let finished = |s: &Stream| {
+            s.lock()
+                .map(|g| g.eof || g.overflow || g.done.is_some())
+                .unwrap_or(true)
+        };
+        while !(finished(&self.out) && finished(&self.err)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut res = Vec::new();
+        for (name, s) in [("stdout", &self.out), ("stderr", &self.err)] {
+            let g = s.lock().map_err(|_| format!("{name}: reader panicked"))?;
+            if g.overflow {
+                return Err(format!(
+                    "{name}: output exceeded the {cap} byte capture cap"
+                ));
+            }
+            if let Some(e) = &g.done {
+                return Err(format!("{name}: {e}"));
+            }
+            res.push(g.buf.clone());
+        }
+        let err = res.pop().unwrap_or_default();
+        let out = res.pop().unwrap_or_default();
+        Ok((out, err))
+    }
+}
+
 /// `spawn_captured` が作った出力の受け皿（一時ファイルの組）。`finish` で読んで消すか、`discard` で消す。
 pub struct Captured {
     pub(crate) out_path: std::path::PathBuf,
@@ -250,6 +376,8 @@ pub struct Captured {
     cap: u64,
     /// 子を先頭にしたプロセスグループ ID（0 は「グループなし」で kill しない。Unix 以外は常に 0）。
     pgid: u32,
+    /// pipe 方式のときの読み手（このとき上の 2 つのパスは空で使わない）。
+    pipes: Option<Pipes>,
 }
 
 impl Captured {
@@ -260,6 +388,16 @@ impl Captured {
         // 出力先を継承した子孫が居残って書き続けないよう、読む前にグループの残りを止める。
         // 失敗しても一時ファイルの回収は進め、止められなかったことを `Err` で表に出す。
         let killed = kill_group(self.pgid);
+        if let Some(p) = &self.pipes {
+            let got = p.take(self.cap);
+            killed?;
+            let (stdout, stderr) = got?;
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
         let stdout = drain_output_file(&self.out_path, self.cap);
         let stderr = drain_output_file(&self.err_path, self.cap);
         killed?;
@@ -272,6 +410,12 @@ impl Captured {
 
     /// いずれかの出力が上限を超えて書き込まれていれば `Err`（子の実行中に呼べる）。
     fn check_cap(&self) -> Result<(), String> {
+        if let Some(p) = &self.pipes {
+            return match p.overflow() {
+                Some(n) => Err(format!("{n} exceeded the {} byte capture cap", self.cap)),
+                None => Ok(()),
+            };
+        }
         if exceeds_cap(&self.out_path, self.cap)? {
             return Err(format!("stdout exceeded the {} byte capture cap", self.cap));
         }
@@ -315,6 +459,9 @@ impl Captured {
 
     /// 出力ファイルを 0 へ切り詰める（残った書き手が居ても溜まった領域を解放する）。
     fn truncate(&self) {
+        if self.pipes.is_some() {
+            return;
+        }
         for p in [&self.out_path, &self.err_path] {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
@@ -329,8 +476,10 @@ impl Captured {
     pub fn discard(self) -> Result<(), String> {
         let killed = kill_group(self.pgid);
         self.truncate();
-        for p in [&self.out_path, &self.err_path] {
-            let _ = std::fs::remove_file(p);
+        if self.pipes.is_none() {
+            for p in [&self.out_path, &self.err_path] {
+                let _ = std::fs::remove_file(p);
+            }
         }
         killed
     }
@@ -351,45 +500,81 @@ pub(crate) fn spawn_captured_capped(
     cmd: &mut Command,
     cap: u64,
 ) -> Result<(Child, Captured), String> {
+    spawn_captured_mode(cmd, cap, DEFAULT_MODE)
+}
+
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn spawn_captured_mode(
+    cmd: &mut Command,
+    cap: u64,
+    mode: CaptureMode,
+) -> Result<(Child, Captured), String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let (out_file, out_path) = create_output_file("out")?;
-    let (err_file, err_path) = match create_output_file("err") {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = std::fs::remove_file(&out_path);
-            return Err(e);
-        }
-    };
-    let captured = Captured {
-        out_path,
-        err_path,
+    let mut captured = Captured {
+        out_path: std::path::PathBuf::new(),
+        err_path: std::path::PathBuf::new(),
         cap,
         pgid: 0,
+        pipes: None,
     };
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut cmd = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(err_file));
-    // 子を新しいプロセスグループの先頭にして、後始末でグループごと止められるようにする（P1: 出力先を
-    // 継承した孫の書き込みを止める）。setsid / setpgid で自分から抜けた子孫は止められない（限界）。
+    cmd.stdin(Stdio::null());
+    match mode {
+        CaptureMode::Files => {
+            let (out_file, out_path) = create_output_file("out")?;
+            let (err_file, err_path) = match create_output_file("err") {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&out_path);
+                    return Err(e);
+                }
+            };
+            captured.out_path = out_path;
+            captured.err_path = err_path;
+            cmd.stdout(Stdio::from(out_file))
+                .stderr(Stdio::from(err_file));
+        }
+        CaptureMode::Pipes => {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+    }
+    // 子を新しいプロセスグループの先頭にして、後始末でグループごと止められるようにする（出力先を継承した
+    // 孫の書き込みを止める）。setsid / setpgid で自分から抜けた子孫は止められない（限界）。
+    // Windows にはこの手段が無い（Job Object は `unsafe` か依存が要る）ため pipe 方式で資源の増加だけを防ぐ。
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        cmd = cmd.process_group(0);
+        cmd.process_group(0);
     }
-    match cmd.spawn() {
-        Ok(child) => {
-            let captured = Captured {
-                pgid: if cfg!(unix) { child.id() } else { 0 },
-                ..captured
-            };
-            Ok((child, captured))
-        }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             let _ = captured.discard();
-            Err(format!("spawn {program} failed: {e}"))
+            return Err(format!("spawn {program} failed: {e}"));
         }
+    };
+    captured.pgid = if cfg!(unix) { child.id() } else { 0 };
+    if mode == CaptureMode::Pipes {
+        let readers = match (child.stdout.take(), child.stderr.take()) {
+            (Some(o), Some(e)) => spawn_pipe_reader(o, cap, "stdout")
+                .and_then(|o| spawn_pipe_reader(e, cap, "stderr").map(|e| (o, e))),
+            _ => Err("child pipes missing".to_string()),
+        };
+        match readers {
+            Ok((out, err)) => captured.pipes = Some(Pipes { out, err }),
+            Err(e) => {
+                kill_group_or_report(captured.pgid);
+                reap_or_report(&mut child, REAP_WITHIN);
+                return Err(format!("{program}: {e}"));
+            }
+        }
+    }
+    Ok((child, captured))
+}
+
+/// `kill_group` の失敗を stderr に出す（後始末の経路用）。
+fn kill_group_or_report(pgid: u32) {
+    if let Err(e) = kill_group(pgid) {
+        eprintln!("{e}");
     }
 }
 
@@ -405,6 +590,10 @@ pub(crate) fn spawn_captured_capped(
 /// `Err` を返す。終了後に上限を超えていた場合や読み取りの失敗も `Err`（先頭だけを正常値として返さない）。
 /// 子は新しいプロセスグループの先頭として起動し、kill・終了後の読み取り前にはグループ全体へ SIGKILL を送る
 /// （出力先を継承した孫が書き続けて保存量を増やさない。REPAIR-5）。
+/// Windows（`CaptureMode::Pipes`）: 一時ファイルではなく pipe と読み手スレッド 2 本で受け、上限に達したら読み手が
+/// 印を立てて読み端を閉じる（書き手は broken pipe になり保存量は増えない）。孫が pipe を握ったままでも、
+/// 子の終了後の EOF 待ちは `PIPE_EOF_GRACE`（2 秒）で切り上げ、読み手を切り離して戻る（切り離した読み手の
+/// 確保量は `cap` 以下）。限界: Windows では孫を止められない（孫は居残るが、資源は増えない）。
 /// 残る限界: 監視は間隔ごとのため間隔内に書かれた分だけ上限を超えて溜まりうる。`setsid` / `setpgid` で
 /// グループを抜けた子孫は止められない（切り詰めてから unlink するので溜まった領域は解放され、孫の後続の
 /// 書き込みは取り込まれないが、削除済み inode への書き込みは続きうる）。グループ ID は子の回収後に送るため、
@@ -420,8 +609,18 @@ pub(crate) fn output_within_capped(
     within: Duration,
     cap: u64,
 ) -> Result<Output, String> {
+    output_within_mode(cmd, within, cap, DEFAULT_MODE)
+}
+
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn output_within_mode(
+    cmd: &mut Command,
+    within: Duration,
+    cap: u64,
+    mode: CaptureMode,
+) -> Result<Output, String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let (mut child, captured) = spawn_captured_capped(cmd, cap)?;
+    let (mut child, captured) = spawn_captured_mode(cmd, cap, mode)?;
     match captured.wait_within(&mut child, within) {
         Ok(status) => captured
             .finish(status)

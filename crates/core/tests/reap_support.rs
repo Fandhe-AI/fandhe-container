@@ -372,3 +372,81 @@ fn repair5_repair12_group_kill_succeeds_for_live_and_empty_groups() {
     let out = captured.finish(st).expect("empty group is not an error");
     assert!(out.status.success());
 }
+
+/// Windows の既定方式（pipe と読み手スレッド）。Unix でも明示指定で同じ経路を試す（REPAIR-5・REPAIR-12）。
+#[test]
+fn repair5_repair12_pipe_mode_returns_output_under_cap() {
+    let mut cmd = self_cmd(FLOOD_TEST, "flood:1000");
+    let out = reap::output_within_mode(
+        &mut cmd,
+        Duration::from_secs(30),
+        1 << 20,
+        reap::CaptureMode::Pipes,
+    )
+    .expect("small output");
+    assert_eq!(out.stdout.iter().filter(|b| **b == b'x').count(), 1000);
+    assert!(out.status.success());
+}
+
+#[test]
+fn repair5_repair12_pipe_mode_cuts_endless_output_at_cap() {
+    let mut cmd = self_cmd(FLOOD_TEST, "flood_forever");
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let start = std::time::Instant::now();
+    let err = reap::output_within_mode(
+        &mut cmd,
+        Duration::from_secs(40),
+        64 * 1024,
+        reap::CaptureMode::Pipes,
+    )
+    .expect_err("endless output must fail");
+    // 読み手が pipe を閉じた直後に子が SIGPIPE 等で終わると、finish 側の文言になる（どちらも上限超過）。
+    assert!(
+        err == format!("{program} stdout exceeded the 65536 byte capture cap")
+            || err == format!("{program}: stdout: output exceeded the 65536 byte capture cap"),
+        "unexpected message: {err}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "not cut early: {:?}",
+        start.elapsed()
+    );
+}
+
+/// pipe を握ったままの孫が居ても、EOF 待ちは猶予（2 秒）で切り上げて戻り、子の出力は失わない。
+#[test]
+fn repair5_repair12_pipe_mode_returns_when_descendant_holds_pipe() {
+    let mut cmd = self_cmd("reap_support_child_leaves_holder", "holder");
+    let start = std::time::Instant::now();
+    let out = reap::output_within_mode(
+        &mut cmd,
+        Duration::from_secs(30),
+        1 << 20,
+        reap::CaptureMode::Pipes,
+    )
+    .expect("output");
+    assert!(out.status.success(), "status: {}", out.status);
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "returned late: {:?}",
+        start.elapsed()
+    );
+}
+
+/// 孫が書き続けても、読み手が上限で pipe を閉じるため待機中に `Err` になる（保存量は増えない）。
+#[test]
+fn repair5_repair12_pipe_mode_descendant_flood_is_cut() {
+    let mut cmd = self_cmd("reap_support_child_leaves_flooder", "holder_flood");
+    let err = reap::output_within_mode(
+        &mut cmd,
+        Duration::from_secs(40),
+        64 * 1024,
+        reap::CaptureMode::Pipes,
+    );
+    // 子は孫を残してすぐ終わる。孫の書き込みが上限を超える前に子の終了を見れば Ok、先に超えれば Err。
+    // どちらでも保存量は上限以下で、戻りは期限より十分前。Ok の場合は出力が上限以下であることを確かめる。
+    match err {
+        Ok(out) => assert!(out.stdout.len() <= 64 * 1024),
+        Err(e) => assert!(e.contains("exceeded the 65536 byte capture cap"), "{e}"),
+    }
+}

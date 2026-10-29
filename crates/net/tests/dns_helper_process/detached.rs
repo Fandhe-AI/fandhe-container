@@ -492,7 +492,7 @@ fn stopped_stage2_is_reaped(_exe: &Path) {
 struct Collect(std::sync::Mutex<Vec<NetOpSample>>);
 impl NetOpRecorder for Collect {
     fn record_net_op(&self, sample: &NetOpSample) {
-        self.0.lock().expect("lock").push(sample.clone());
+        self.0.lock().expect("lock").push(*sample);
     }
 }
 

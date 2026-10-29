@@ -17,8 +17,10 @@
 //! - カーネル操作が取り残しつきで失敗した場合は、請求書を `pending-reclaim/` に保存してから意図記録を消す。
 //!   保存に失敗したら意図記録を残し [`RecordedError::ReclaimUnsaved`] を返す。quarantine（アドレス・DNAT・ポート予約）を
 //!   伴う attach の失敗では意図記録を消さない（再割り当てしない）
-//! - 残った `realized.intent` は未完了の操作を示す。カーネル照合は後続の担当で、それまで次の操作は
-//!   `FailedPrecondition`（`network has an unreconciled operation`）で拒否する
+//! - 残った `realized.intent` は未完了の操作を示す。Linux ラッパーは先頭で `network::reconcile` の照合を行い、所有トークンで
+//!   昇格・巻き戻しできたものは解消する。証明できないもの（空・他者の別名、照会の失敗、取り残しのある巻き戻し）は据え置き、
+//!   次の操作は `FailedPrecondition`（`network has an unreconciled operation`）で拒否する。OS 非依存の
+//!   `*_recorded_with` 本体は照合せず、従来どおり拒否するだけ
 //!
 //! # 公開の記録と再起動後の個別解除（NET-3・#3068）
 //! create は成功の直後に GETTABLE で専用テーブルを照会し、`NFTA_TABLE_USERDATA` が所有トークンと一致することを
@@ -31,7 +33,8 @@
 //! [`UnpublishRules::StaleHandles`] で断る。解除の成功後は、そのメンバー記録から該当の公開を外して書き直す。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! - 残った `realized.intent` / `members-intent/*` のカーネル照合による昇格・巻き戻し（link の dump API が前提）
+//! - 記録の無い孤児 veth（意図記録も無いもの）の回収（link の全件 dump が前提）。残った `realized.intent` /
+//!   `members-intent/*` の照合は `network::reconcile` が Linux ラッパーの先頭で行う（#3346）
 //! - 生きた `AttachedContainer` を持たない detach（veth・pin の回収）。再起動後の detach の公開の解除は本モジュールの個別解除を先に呼ぶ。
 //!   `detach_container` の失敗の請求書へのルールハンドルの記載と `reclaim_failed_attach` での回収は済み（#3285）だが、
 //!   `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
@@ -498,6 +501,7 @@ where
         definition.name().clone(),
         &token,
         subnet,
+        gateway,
     )
     .map_err(RecordedError::Store)?;
     guard
@@ -566,6 +570,7 @@ where
         realized.name().clone(),
         realized.token(),
         realized.subnet(),
+        realized.gateway(),
     )
     .map_err(RecordedError::Store)?;
     guard
@@ -741,6 +746,7 @@ mod linux {
     use crate::netlink_route::NetlinkRouteSocket;
     use crate::netns::ContainerNetns;
     use crate::network::delete::{ContainerDetachError, NetworkDeleteError};
+    use crate::network::reconcile::{member_netns_dir, reconcile_with_sockets};
     use crate::network::unpublish::{linux_delete_rule, linux_delete_rules, linux_table_info};
     use crate::network::{
         LinuxAttachOps, LinuxNetworkOps, NetworkCreateSpec, PortRegistry, PublishedPort,
@@ -748,6 +754,7 @@ mod linux {
         detach_container,
     };
     use crate::nftables_batch::NetlinkNetfilterSocket;
+    use std::path::Path;
 
     /// ネットワークを作って `realized` に記録する（`create_network` の記録つき版）。
     ///
@@ -768,6 +775,8 @@ mod linux {
             )));
         }
         let host = nft.host_generation().map_err(RecordedError::Store)?;
+        // realized が無いので掃除の対象（members-intent）も無い。pin の置き場は要らない。
+        reconcile_with_sockets(route, nft, guard, None, timeout).map_err(RecordedError::Store)?;
         create_recorded_with(
             &host,
             guard,
@@ -846,6 +855,8 @@ mod linux {
         RecordedError<Box<ContainerAttachError>, AttachedContainer<ContainerNetns>>,
     > {
         let host = nft.host_generation().map_err(RecordedError::Store)?;
+        reconcile_with_sockets(route, nft, guard, Some(spec.netns_dir()), timeout)
+            .map_err(RecordedError::Store)?;
         attach_recorded_with(
             &host,
             guard,
@@ -895,6 +906,9 @@ mod linux {
             host_token: &host_token,
         };
         let host = nft.host_generation().map_err(RecordedError::Store)?;
+        let netns_dir = member_netns_dir(guard, member_id);
+        reconcile_with_sockets(route, nft, guard, netns_dir.as_deref(), timeout)
+            .map_err(RecordedError::Store)?;
         detach_recorded_with(&host, guard, member_id, identity, |created, ipam| {
             detach_container(
                 route,
@@ -910,16 +924,22 @@ mod linux {
     }
 
     /// メンバーのいないネットワークを削除して `realized` を消す（`delete_network` の記録つき版）。
+    ///
+    /// `netns_dir` は接続時の pin の置き場（固定設定）。先頭の照合が、実体の無い `members-intent` を掃除して
+    /// 「`network still has members`」で止まらないようにするために使う（#3346）。
     pub fn delete_network_recorded(
         route: &NetlinkRouteSocket,
         nft: &NetlinkNetfilterSocket,
         guard: &NetworkLockGuard<'_>,
+        netns_dir: &Path,
         ports: &mut PortRegistry,
         timeout: Duration,
     ) -> Result<
         NetworkDeleteReport,
         RecordedError<Box<NetworkDeleteError<ContainerNetns>>, NetworkDeleteReport>,
     > {
+        reconcile_with_sockets(route, nft, guard, Some(netns_dir), timeout)
+            .map_err(RecordedError::Store)?;
         delete_recorded_with(guard, |created, ipam| {
             delete_network(route, nft, created, Vec::new(), ipam, ports, timeout).map_err(Box::new)
         })
@@ -1714,6 +1734,7 @@ mod tests {
                 name(),
                 BRIDGE_TOKEN,
                 pfx([10, 0, 0, 0], 24),
+                pfx([10, 0, 0, 1], 24),
             )
             .unwrap(),
         )

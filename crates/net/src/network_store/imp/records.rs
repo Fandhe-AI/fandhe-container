@@ -852,6 +852,7 @@ mod tests {
             nn(),
             BRIDGE_TOKEN,
             pfx([10, 0, 0, 0], 24),
+            pfx([10, 0, 0, 1], 24),
         )
         .unwrap();
         n.write_realized_intent(&ri).unwrap();
@@ -880,6 +881,7 @@ mod tests {
             nn(),
             BRIDGE_TOKEN,
             pfx([10, 0, 0, 0], 24),
+            pfx([10, 0, 0, 1], 24),
         )
         .unwrap();
         n.write_realized_intent(&ri).unwrap();

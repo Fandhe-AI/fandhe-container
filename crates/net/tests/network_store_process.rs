@@ -234,7 +234,14 @@ fn helper_write_records() {
     let g = store.lock_global_exclusive().unwrap();
     let n = g.lock_network(&name).unwrap();
     n.write_realized_intent(
-        &RealizedIntent::new(RealizedOp::Create, name, BRIDGE_TOKEN, pfx(0, 24)).unwrap(),
+        &RealizedIntent::new(
+            RealizedOp::Create,
+            name,
+            BRIDGE_TOKEN,
+            pfx(0, 24),
+            pfx(1, 24),
+        )
+        .unwrap(),
     )
     .unwrap();
     n.commit_realized(&realized_record()).unwrap();

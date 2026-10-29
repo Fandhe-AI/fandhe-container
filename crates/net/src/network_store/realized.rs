@@ -3,8 +3,9 @@
 //! 役割: `network::create_network` が返す `CreatedNetwork`（bridge・ifindex・所有トークン・nft テーブル・gateway）を
 //! プロセスをまたいで引き継ぐための記録。`<name>/realized` はカーネル資源の作成に成功した後に書き、
 //! `<name>/realized.intent` は作成・削除のカーネル操作の前に書いて完了後に消す（D11）。残った `realized.intent` は
-//! 「操作の途中で落ちた」ことを示し、カーネル照合（所有トークンでの昇格または巻き戻し）は後続の担当で、
-//! それまでは `network::recorded` が fail-closed で次の操作を拒否する。OS 非依存でファイルには触れない。
+//! 「操作の途中で落ちた」ことを示し、カーネル照合（所有トークンでの昇格または巻き戻し）は
+//! `network::reconcile` が行う（#3346。判定できないものは `network::recorded` が fail-closed で次の操作を拒否する）。
+//! OS 非依存でファイルには触れない。
 //!
 //! # 形式
 //! ```text
@@ -14,7 +15,9 @@
 //! ifindex <len>\n<10 進>\n                   bridge <len>\n<bridge 名>\n
 //! token <len>\n<所有トークン>\n               token <len>\n<所有トークン>\n
 //! table <len>\n<nft テーブル名>\n             subnet <len>\n<a.b.c.d/nn>\n
-//! table-handle <len>\n<10 進・非 0>\n
+//! table-handle <len>\n<10 進・非 0>\n         gateway <len>\n<a.b.c.d/nn>\n
+//! boot-id <len>\n<UUID>\n
+//! netns <len>\n<dev:ino>\n
 //! gateway <len>\n<a.b.c.d/nn>\n
 //! subnet <len>\n<a.b.c.d/nn>\n
 //! ```
@@ -388,6 +391,7 @@ pub struct RealizedIntent {
     bridge: IfName,
     token: String,
     subnet: IpPrefix,
+    gateway: IpPrefix,
 }
 
 impl RealizedIntent {
@@ -397,6 +401,7 @@ impl RealizedIntent {
         name: NetworkName,
         token: &str,
         subnet: IpPrefix,
+        gateway: IpPrefix,
     ) -> Result<Self, NetError> {
         let (bridge, _) = derived_names(&name)?;
         let rec = Self {
@@ -405,6 +410,7 @@ impl RealizedIntent {
             bridge,
             token: token.to_owned(),
             subnet,
+            gateway,
         };
         rec.validate()?;
         Ok(rec)
@@ -418,7 +424,7 @@ impl RealizedIntent {
         if !token_is_sane(&self.token) || !token_names_network(&self.token, &self.name) {
             return Err(bad("realized intent token does not name the network"));
         }
-        check_subnet(&self.subnet).map(|_| ())
+        check_gateway(&self.gateway, &self.subnet)
     }
 
     /// 操作の種別。
@@ -436,6 +442,16 @@ impl RealizedIntent {
         &self.token
     }
 
+    /// subnet（ネットワークアドレス）。
+    pub fn subnet(&self) -> IpPrefix {
+        self.subnet
+    }
+
+    /// gateway（prefix 長つき）。昇格時に `RealizedRecord` を組み直す材料（#3346）。
+    pub fn gateway(&self) -> IpPrefix {
+        self.gateway
+    }
+
     /// 正準形の FCRIN1 へ符号化する。
     pub fn encode(&self) -> Vec<u8> {
         let mut out = String::from(INTENT_MAGIC);
@@ -444,6 +460,7 @@ impl RealizedIntent {
         push_field(&mut out, "bridge", self.bridge.as_str());
         push_field(&mut out, "token", &self.token);
         push_field(&mut out, "subnet", &format_prefix(&self.subnet));
+        push_field(&mut out, "gateway", &format_prefix(&self.gateway));
         out.into_bytes()
     }
 
@@ -460,6 +477,7 @@ impl RealizedIntent {
         let bridge = IfName::new(take_field(&mut rest, "bridge")?).map_err(invalid_value)?;
         let token = take_field(&mut rest, "token")?.to_owned();
         let subnet = parse_prefix(take_field(&mut rest, "subnet")?)?;
+        let gateway = parse_prefix(take_field(&mut rest, "gateway")?)?;
         finish(rest)?;
         let rec = Self {
             op,
@@ -467,6 +485,7 @@ impl RealizedIntent {
             bridge,
             token,
             subnet,
+            gateway,
         };
         rec.validate()?;
         Ok(rec)
@@ -627,11 +646,26 @@ mod tests {
             NetworkName::new("web").unwrap(),
             TOKEN,
             pfx([10, 0, 0, 0], 24),
+            pfx([10, 0, 0, 1], 24),
         )
         .unwrap();
         let text = String::from_utf8(i.encode()).unwrap();
         assert!(text.starts_with("FCRIN1\nop 6\ncreate\nname 3\nweb\nbridge "));
-        assert!(text.ends_with("subnet 11\n10.0.0.0/24\n"));
+        assert!(text.ends_with("subnet 11\n10.0.0.0/24\ngateway 11\n10.0.0.1/24\n"));
+        assert_eq!(i.gateway(), pfx([10, 0, 0, 1], 24));
+        assert_eq!(i.subnet(), pfx([10, 0, 0, 0], 24));
+        // 旧形式（gateway 無し）・subnet 外・network アドレスは DataLoss。
+        for bad_gw in [
+            text.replace("gateway 11\n10.0.0.1/24\n", ""),
+            text.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.1.1/24"),
+            text.replace("gateway 11\n10.0.0.1/24", "gateway 11\n10.0.0.0/24"),
+        ] {
+            assert_ne!(bad_gw, text);
+            assert_eq!(
+                code(RealizedIntent::decode(bad_gw.as_bytes())),
+                NetErrorCode::DataLoss
+            );
+        }
         assert_eq!(RealizedIntent::decode(&i.encode()).unwrap(), i);
         assert_eq!(i.op(), RealizedOp::Create);
         let bad_op = text.replace("op 6\ncreate", "op 4\nkeep");
@@ -644,7 +678,8 @@ mod tests {
                 RealizedOp::Delete,
                 NetworkName::new("web").unwrap(),
                 "fandhe-net:other:1:0:0",
-                pfx([10, 0, 0, 0], 24)
+                pfx([10, 0, 0, 0], 24),
+                pfx([10, 0, 0, 1], 24)
             )),
             NetErrorCode::DataLoss
         );

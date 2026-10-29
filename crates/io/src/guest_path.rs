@@ -15,7 +15,12 @@
 //!
 //! # 検証の層の分担
 //! 復号時は長さと UTF-8 だけ、構文は本型、IO-5 の大文字小文字衝突とホストパス長
-//! （260 文字）は `GuestFileCreator` 側が担う。なお `fandhe-container-core` の
+//! （260 文字）は `GuestFileCreator` 側が担う。
+//!
+//! 構文規則の本体は `check_rules` の 1 か所で、適用範囲は `GuestPathRules` の 3 定数
+//! で選ぶ（#3352・REPAIR-1）。`GUEST`（全規則。`GuestPath::parse`）・`STRUCTURAL`
+//! （構造規則だけ。`fs_normalize` の索引。ホストの実在名も入るため）・`HOST_NAME`
+//! （構造規則と禁止文字。`writeback` の sink 名。長さはホスト FS に任せる）。なお `fandhe-container-core` の
 //! `traits::volume_provider::GuestPath`（コンテナ内の絶対パス）とは別物である。
 
 use std::fmt;
@@ -92,6 +97,83 @@ impl From<GuestPathError> for IoError {
     }
 }
 
+/// コンポーネントに含められない文字（Windows の区切り・ドライブ・ADS）。禁止文字の
+/// 集合はここだけに置く（REPAIR-1）。
+pub(crate) const FORBIDDEN_COMPONENT_CHARS: [char; 2] = ['\\', ':'];
+
+/// 構文規則のうち、どれを適用するか（REPAIR-1・IO-5）。
+///
+/// 規則本体は [`check_rules`] の 1 か所にあり、利用者ごとの差は本型の定数で表す。
+/// 空・NUL・絶対・空コンポーネント・`.` / `..` の構造規則は全定数で共通。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GuestPathRules {
+    /// コンポーネントの禁止文字（`\` と `:`）を拒否するか。
+    forbidden_chars: bool,
+    /// 全体長・件数・名前長の上限を適用するか。
+    limits: bool,
+}
+
+impl GuestPathRules {
+    /// ゲスト入力（[`GuestPath::parse`]）。全規則。
+    pub(crate) const GUEST: Self = Self {
+        forbidden_chars: true,
+        limits: true,
+    };
+    /// 構造規則だけ。`fs_normalize` が使う。`index_existing` はホストから読んだ実在
+    /// エントリ名（`:` や `\` を含みうる・長さ上限を超えうる）も索引に入れて衝突を
+    /// 検出するため、禁止文字と上限を当てると実在項目が索引から落ちて衝突を見逃す。
+    pub(crate) const STRUCTURAL: Self = Self {
+        forbidden_chars: false,
+        limits: false,
+    };
+    /// ホスト側の単一名（`writeback` の sink 名）。構造規則と禁止文字。長さの上限は
+    /// 当てない（NTFS・APFS は 255 バイトを超える多バイト名を作れ、長さの判定は
+    /// ホスト FS に任せる）。
+    pub(crate) const HOST_NAME: Self = Self {
+        forbidden_chars: true,
+        limits: false,
+    };
+}
+
+/// `rules` の範囲で構文規則を検査する（アロケーションしない）。順序は
+/// （limits なら全体長）→ 空 → NUL → 絶対 → コンポーネントごとに（limits なら件数）→
+/// 空 → `.` / `..` →（禁止文字）→（limits なら名前長）で、違反が複数あるときに返す
+/// 変種はこの順で決まる。
+pub(crate) fn check_rules(path: &str, rules: GuestPathRules) -> Result<(), GuestPathError> {
+    if rules.limits && path.len() > MAX_GUEST_PATH_BYTES {
+        return Err(GuestPathError::TooLong);
+    }
+    if path.is_empty() {
+        return Err(GuestPathError::Empty);
+    }
+    if path.contains('\0') {
+        return Err(GuestPathError::ContainsNul);
+    }
+    if path.starts_with('/') {
+        return Err(GuestPathError::Absolute);
+    }
+    let mut count = 0usize;
+    for component in path.split('/') {
+        count = count.saturating_add(1);
+        if rules.limits && count > MAX_GUEST_PATH_COMPONENTS {
+            return Err(GuestPathError::TooManyComponents);
+        }
+        if component.is_empty() {
+            return Err(GuestPathError::EmptyComponent);
+        }
+        if component == "." || component == ".." {
+            return Err(GuestPathError::DotComponent);
+        }
+        if rules.forbidden_chars && component.contains(FORBIDDEN_COMPONENT_CHARS) {
+            return Err(GuestPathError::ForbiddenChar);
+        }
+        if rules.limits && component.len() > MAX_GUEST_NAME_BYTES {
+            return Err(GuestPathError::NameTooLong);
+        }
+    }
+    Ok(())
+}
+
 /// 構文検証済みのゲスト相対パス（モジュール doc 参照）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GuestPath(String);
@@ -100,37 +182,7 @@ impl GuestPath {
     /// `path` を検証して作る。上限（長さ → 件数 → 名前長）はアロケーションの前に
     /// 見る。通ったときだけ 4096 バイト以下の `String` を確保する。
     pub fn parse(path: &str) -> Result<Self, GuestPathError> {
-        if path.len() > MAX_GUEST_PATH_BYTES {
-            return Err(GuestPathError::TooLong);
-        }
-        if path.is_empty() {
-            return Err(GuestPathError::Empty);
-        }
-        if path.contains('\0') {
-            return Err(GuestPathError::ContainsNul);
-        }
-        if path.starts_with('/') {
-            return Err(GuestPathError::Absolute);
-        }
-        let mut count = 0usize;
-        for component in path.split('/') {
-            count = count.saturating_add(1);
-            if count > MAX_GUEST_PATH_COMPONENTS {
-                return Err(GuestPathError::TooManyComponents);
-            }
-            if component.is_empty() {
-                return Err(GuestPathError::EmptyComponent);
-            }
-            if component == "." || component == ".." {
-                return Err(GuestPathError::DotComponent);
-            }
-            if component.contains(['\\', ':']) {
-                return Err(GuestPathError::ForbiddenChar);
-            }
-            if component.len() > MAX_GUEST_NAME_BYTES {
-                return Err(GuestPathError::NameTooLong);
-            }
-        }
+        check_rules(path, GuestPathRules::GUEST)?;
         Ok(Self(path.to_owned()))
     }
 
@@ -161,6 +213,117 @@ mod tests {
             .components()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn io5_repair1_rule_sets_table() {
+        use GuestPathError as E;
+        let long_name = "x".repeat(256);
+        let long_path = format!("{}x", "x/".repeat(2048));
+        let many = vec!["a"; 257].join("/");
+        // (入力, GUEST, STRUCTURAL, HOST_NAME)
+        type Case = (String, Option<E>, Option<E>, Option<E>);
+        let cases: Vec<Case> = vec![
+            ("".into(), Some(E::Empty), Some(E::Empty), Some(E::Empty)),
+            (
+                "/a".into(),
+                Some(E::Absolute),
+                Some(E::Absolute),
+                Some(E::Absolute),
+            ),
+            (
+                "a//b".into(),
+                Some(E::EmptyComponent),
+                Some(E::EmptyComponent),
+                Some(E::EmptyComponent),
+            ),
+            (
+                "a/".into(),
+                Some(E::EmptyComponent),
+                Some(E::EmptyComponent),
+                Some(E::EmptyComponent),
+            ),
+            (
+                ".".into(),
+                Some(E::DotComponent),
+                Some(E::DotComponent),
+                Some(E::DotComponent),
+            ),
+            (
+                "a/../b".into(),
+                Some(E::DotComponent),
+                Some(E::DotComponent),
+                Some(E::DotComponent),
+            ),
+            (
+                "a\0b".into(),
+                Some(E::ContainsNul),
+                Some(E::ContainsNul),
+                Some(E::ContainsNul),
+            ),
+            (
+                "a\\b".into(),
+                Some(E::ForbiddenChar),
+                None,
+                Some(E::ForbiddenChar),
+            ),
+            (
+                "C:x".into(),
+                Some(E::ForbiddenChar),
+                None,
+                Some(E::ForbiddenChar),
+            ),
+            (
+                "a:b".into(),
+                Some(E::ForbiddenChar),
+                None,
+                Some(E::ForbiddenChar),
+            ),
+            (long_name.clone(), Some(E::NameTooLong), None, None),
+            (long_path, Some(E::TooLong), None, None),
+            (many, Some(E::TooManyComponents), None, None),
+            ("a/b".into(), None, None, None),
+            (".hidden".into(), None, None, None),
+            ("日本語/ファイル".into(), None, None, None),
+        ];
+        for (input, guest, structural, host) in cases {
+            let shown = if input.len() > 40 {
+                format!("<{} bytes>", input.len())
+            } else {
+                format!("{input:?}")
+            };
+            assert_eq!(
+                check_rules(&input, GuestPathRules::GUEST).err(),
+                guest,
+                "GUEST {shown}"
+            );
+            assert_eq!(
+                check_rules(&input, GuestPathRules::STRUCTURAL).err(),
+                structural,
+                "STRUCTURAL {shown}"
+            );
+            assert_eq!(
+                check_rules(&input, GuestPathRules::HOST_NAME).err(),
+                host,
+                "HOST_NAME {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn io5_repair1_rule_precedence_is_unchanged() {
+        use GuestPathError as E;
+        let g = |p: &str| check_rules(p, GuestPathRules::GUEST).err();
+        let s = |p: &str| check_rules(p, GuestPathRules::STRUCTURAL).err();
+        assert_eq!(g("a:b//c"), Some(E::ForbiddenChar));
+        assert_eq!(s("a:b//c"), Some(E::EmptyComponent));
+        assert_eq!(g("a:/b"), Some(E::ForbiddenChar));
+        assert_eq!(s("a:/b"), None);
+        assert_eq!(g("/a\0"), Some(E::ContainsNul));
+        assert_eq!(s("/a\0"), Some(E::ContainsNul));
+        let long_nul = format!("{}\0", "x".repeat(MAX_GUEST_PATH_BYTES));
+        assert_eq!(g(&long_nul), Some(E::TooLong));
+        assert_eq!(s(&long_nul), Some(E::ContainsNul));
     }
 
     #[test]

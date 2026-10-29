@@ -624,8 +624,14 @@ pub(crate) enum LeafOpen {
     CreateOrAppend,
 }
 
-/// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か（`GuestFileCreator` の
-/// コンポーネント検証と同じ基準。3 OS で挙動を揃えるため `\`・`:` も拒否する）。
+/// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か。
+///
+/// `guest_path::check_rules` の `HOST_NAME`（構造規則と禁止文字。3 OS で挙動を揃える
+/// ため `\`・`:` も拒否する）に加えて `/` を含まないことを求める（単一コンポーネント）。
+/// この条件を通る名前はどの OS でも `Path::components()` がちょうど 1 個の `Normal` に
+/// なる。`GUEST` の長さ上限（名前 255 バイト等）は意図して当てない: sink 名はホスト側の
+/// 信頼できる設定値で、NTFS・APFS は 255 バイトを超える多バイト名を作れ、長さの判定は
+/// ホスト FS に任せる（#3352・REPAIR-1）。
 fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
     let invalid = || {
         IoError::new(
@@ -633,14 +639,12 @@ fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
             "sink file name must be a single normal path component",
         )
     };
-    if name.contains(['\\', ':', '\0']) {
+    crate::guest_path::check_rules(name, crate::guest_path::GuestPathRules::HOST_NAME)
+        .map_err(|_| invalid())?;
+    if name.contains('/') {
         return Err(invalid());
     }
-    let mut parts = Path::new(name).components();
-    match (parts.next(), parts.next()) {
-        (Some(std::path::Component::Normal(_)), None) => Ok(()),
-        _ => Err(invalid()),
-    }
+    Ok(())
 }
 
 /// `dir` を開き、そのハンドル相対で `name` を開く（[`AppendFileSink::open_in`] の OS 別
@@ -654,7 +658,7 @@ fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, Fil
         BeneathError::AlreadyExists => {
             IoError::new(IoErrorCode::AlreadyExists, "sink file already exists")
         }
-        BeneathError::AncestorNotDirectory => IoError::new(
+        BeneathError::AncestorSymlink | BeneathError::AncestorNotDirectory => IoError::new(
             IoErrorCode::InvalidArgument,
             "sink directory is not a directory",
         ),
@@ -2115,7 +2119,9 @@ mod tests {
         let t = TempDirGuard::new("names");
         let inner = t.0.join("inner");
         std::fs::create_dir(&inner).expect("inner");
-        for name in ["", ".", "..", "../x", "a/b", "a\\b", "a:b", "a\0b"] {
+        for name in [
+            "", ".", "..", "../x", "a/b", "a\\b", "a:b", "a\0b", "a/", "a/.", "/a", "./a",
+        ] {
             assert_eq!(
                 AppendFileSink::open_in(&inner, name, SinkOpenMode::CreateOrTruncate)
                     .err()
@@ -2126,6 +2132,19 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&inner).expect("inner").count(), 0);
         assert_eq!(std::fs::read_dir(&t.0).expect("outer").count(), 1);
+    }
+
+    /// REPAIR-1: sink 名の規則集合（長さは見ない・禁止文字と構造規則と単一名）。
+    #[test]
+    fn io2_repair1_sink_name_rule_set() {
+        let long = "x".repeat(300);
+        for ok in ["out.bin", ".hidden", "...", "a b", "日本語", long.as_str()] {
+            assert!(validate_sink_file_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["", ".", "..", "a/b", "a/", "a\\b", "a:b", "a\0b"] {
+            let err = validate_sink_file_name(bad).expect_err(bad);
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{bad:?}");
+        }
     }
 
     /// IO-2・TASK-15.3: `open_in` は通常ファイル以外（ディレクトリ）を sink にしない。

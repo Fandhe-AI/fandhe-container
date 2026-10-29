@@ -33,7 +33,7 @@
 //! 2. `pending-reclaim/attach/<endpoint>` の請求書が無い（quarantine・取り残しの追跡中は残す）
 //! 3. host 側 veth が不在と確かめられる（生きた veth・照会の失敗は残す）
 //! 4. netns の pin が不在と確かめられる（置き場は意図記録に記録した接続時のもの。無い旧形式は掃除しない）
-//! 5. DNAT の帳尻が合う: 専用テーブルの DNAT の受け口が、全メンバー記録の公開（解除中を含む。1 件 2 ルール）で
+//! 5. DNAT の帳尻が合う: 専用テーブルの DNAT の受け口が、全メンバー記録の確定した公開（墓標・解除中は含めない。1 件 2 ルール）で
 //!    説明できる。説明できない DNAT が残っていれば、`ReclaimUnsaved` の quarantine のようにそのアドレスへ
 //!    転送しうるため、候補をすべて残す
 //!
@@ -340,10 +340,12 @@ fn expected_listeners(
     let mut out: HashMap<(PortProtocol, Ipv4Addr, u16), usize> = HashMap::new();
     for m in guard.members()? {
         for p in m.publishes() {
-            // 墓標（ルール 2 本の消失を確かめ済み）は説明に数えない。数えると、予約が残る同じ受け口へ
-            // 再起動後に別の attach が DNAT を入れて落ちたとき、その DNAT を説明済みと誤認して
-            // 掃除（アドレスの解放）をしてしまう。解除中（意図の印のみ）はルールが残りうるため数える。
-            if p.unpublished() {
+            // 墓標（ルール 2 本の消失を確かめ済み）と解除中（意図の印のみ）は説明に数えない。dump は受け口と
+            // 本数しか見えず転送先を区別できないため、数えると、DELRULE 後・記録更新前に止まった解除の印が
+            // 残る受け口へ、再起動後に別メンバーが DNAT を入れて落ちたとき、その DNAT を説明済みと誤認して
+            // 掃除（アドレスの解放）をしてしまう（再割り当て先への古い DNAT。SEC-1・NET-3）。数えない結果、
+            // 解除中のルールが実際に残る間も候補は据え置きになる（fail-closed。解除の回復が済めば次回に掃除する）。
+            if p.unpublished() || p.unpublishing() {
                 continue;
             }
             let port = p.publish();

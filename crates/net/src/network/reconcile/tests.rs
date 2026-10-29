@@ -920,3 +920,39 @@ fn net1_3346_create_intent_without_realized_checks_generation() {
     assert_eq!(report.realized, RealizedReconcile::Discarded);
     assert!(n.reclaim_records().unwrap().create.is_none());
 }
+
+/// NET-7・SEC-1・NET-3・#3346: 解除中（意図の印のみ）の公開は DNAT の説明に数えない。A の解除が DELRULE 後・
+/// 記録更新前に止まり、再起動後に同じ受け口を B が公開したルールが残ったとき、A の印で B のルールを
+/// 説明済みと扱って候補（B のアドレス）を解放しない。
+#[test]
+fn net7_3346_sweep_does_not_count_unpublishing_as_live_dnat() {
+    let published = port(8080);
+    let h = |n: u64| NftRuleHandle::new(n).unwrap();
+    let both = PublishedListeners::from_ports_for_test(&[published, published])
+        .listeners()
+        .to_vec();
+    let t = Tmp::new("unpublishing");
+    let store = setup(&t);
+    let g = store.lock_global_exclusive().unwrap();
+    let n = g.lock_network(&name()).unwrap();
+    ready(&n);
+    let owner = member_rec("c9", 5)
+        .with_publishes(
+            NftTableHandle::new(42).unwrap(),
+            vec![RecordedPublish::new(published, h(1), h(2))],
+        )
+        .unwrap()
+        .with_unpublishing(&published)
+        .unwrap();
+    n.commit_member(&owner).unwrap();
+    n.write_member_intent(&member_intent("c1", 2)).unwrap();
+    let fake = Fake::owned();
+    *fake.dnat.borrow_mut() = Ok(both);
+    let report = run(&n, &fake).unwrap();
+    assert!(report.removed_intents.is_empty());
+    assert_eq!(
+        report.kept_intents,
+        vec![(mid("c1"), IntentKeep::DnatUnaccounted)]
+    );
+    assert_eq!(n.member_intents().unwrap().len(), 1);
+}

@@ -44,7 +44,14 @@
 //! launch の失敗は、起動した全プロセス(中間プロセス I と PID 1)の消滅を確かめられたかを、コンテナ ID ごとの
 //! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
 //! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
-//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
+//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。
+//! ハンドルを drop したときも、同じ世代の項目だけを戻す(#3432)。回収済みなら `Clean`、未回収なら `Pending`(子の
+//! ハンドルを台帳へ移す)。drop はシグナルも待ちも伴わず、kill と回収は後続の `confirm_no_process` と再 launch の
+//! `admit` が期限つきで行う(`terminate` に失敗した pasta ラッパーが捨てたハンドルでも、同じ launcher の確認つき回復が
+//! `Handed` で詰まらない)。別の世代の `Handed`・`Clean`・`Pending`・`Settling` には触れず、項目が追い出されて
+//! いれば未回収の場合に限り `Pending` を入れる。生存中のハンドルを捨てると後続の確認・再 launch がその子を止める
+//! (所有者のいない子を残したまま二重に起動しないための意図した挙動)。記録済みの cgroup で確かめる経路へ回す案は、
+//! 台帳優先(#2011)と矛盾し、`recorded` が無い構成で詰まりが残るため採らなかった。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
 //! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID は
 //! `confirm_no_process` では確かめられない(`FailedPrecondition`)が、記録された cgroup の配置を受け取る
 //! `confirm_no_process_recorded` が別プロセスの残存を確かめる(下の「別プロセスの残存」)。回収前の `Handed`・
@@ -94,6 +101,10 @@
 //!   #2011)。残余は、記録が無い場合(`FailedPrecondition`)と、コンテナ内のプロセスが cgroup の外へ移った場合
 //!   (検出できない。delete と同じ限界)。成功の内訳の観測記録は未実装(REPAIR-4)
 //! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存は記録済みの cgroup で確かめる)
+//! - **ハンドル drop の引き継ぎ(#3432)の残余**: 再 launch の後に古い世代のハンドルを未回収のまま drop した子は台帳へ
+//!   戻せない。launcher がハンドルより先に drop された場合も戻せない。契約外の回収者に回収された子(`Lost`)は確かめ
+//!   ようがなく `Pending` のまま残る(fail-closed)。`Pending` は追い出されないため、生存中のハンドルを大量に捨てると
+//!   `LEDGER_MAX_ENTRIES` に達して新しい launch が拒否される
 //! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
@@ -1047,6 +1058,7 @@ enum LaunchRecord {
     Settling,
     /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
     /// 値は launch ごとの世代。そのハンドルの `terminate` が成功したら、同じ世代の項目だけを `Clean` へ進める
+    /// (ハンドルの drop でも同じ世代だけを、回収済みなら `Clean`、未回収なら `Pending` へ進める。#3432)
     /// (回収の証跡を台帳へ引き継ぐ。再 launch 後の古いハンドルが新しい項目を書き換えない。CORE-2)。
     Handed(u64),
 }
@@ -1057,7 +1069,7 @@ enum LaunchRecord {
 struct Pending {
     /// 回収できなかった子。順序は中間プロセス → PID 1(PID 1 は中間プロセスの回収後でないと C の子にならず、
     /// `waitpid` が `ECHILD` になるため、この順で再回収する)。
-    children: Vec<ContainerChild>,
+    children: Vec<Arc<ContainerChild>>,
     /// 報告前の PID 1 の再探索が要る起動識別子。
     rescans: Vec<LaunchTag>,
 }
@@ -1085,6 +1097,42 @@ struct Ledger {
 impl Ledger {
     fn position(&self, id: &ContainerId) -> Option<usize> {
         self.entries.iter().position(|(k, _)| k == id)
+    }
+
+    /// `Handed(generation)` のハンドルが drop されたとき、その子を台帳へ戻す(CORE-2・NET-9・REPAIR-5・#3432)。
+    ///
+    /// - 同じ世代の `Handed`: 回収済みなら `Clean`、未回収なら `Pending`(後続の確認が kill・回収する)
+    /// - 項目が無い(`Handed` は満杯時に追い出される): 未回収なら `Pending` を入れる。回収済みなら何もしない
+    /// - それ以外(別の世代の `Handed`・`Clean`・`Pending`・`Settling`)には触れない。再 launch が新しい項目を
+    ///   作った後に古いハンドルが drop されても、新しい項目を書き換えない
+    fn take_back_dropped(
+        &mut self,
+        id: &ContainerId,
+        generation: u64,
+        child: Arc<ContainerChild>,
+        reaped: bool,
+    ) {
+        let pending = |child| {
+            LaunchRecord::Pending(Pending {
+                children: vec![child],
+                rescans: Vec::new(),
+            })
+        };
+        match self.position(id) {
+            Some(i) => {
+                if let Some((_, record)) = self.entries.get_mut(i)
+                    && matches!(record, LaunchRecord::Handed(g) if *g == generation)
+                {
+                    *record = if reaped {
+                        LaunchRecord::Clean
+                    } else {
+                        pending(child)
+                    };
+                }
+            }
+            None if !reaped => self.set(id, pending(child)),
+            None => {}
+        }
     }
 
     fn has_pending(&self) -> bool {
@@ -1680,6 +1728,9 @@ impl Inner {
         // 遅れて成功した状態更新の後始末が confirm_no_process で回収済みを確かめられるようにする（CORE-2）。
         let ledger = Arc::downgrade(&self.ledger);
         let owner = id.clone();
+        // ハンドルを drop したときの引き継ぎ用(#3432)。上の回収通知とは別の所有権を持たせる。
+        let drop_ledger = Arc::downgrade(&self.ledger);
+        let drop_owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
             .with_seccomp_listener(listener)
@@ -1699,6 +1750,13 @@ impl Inner {
                 {
                     *record = LaunchRecord::Clean;
                 }
+            }))
+            .with_drop_notice(Box::new(move |child, reaped| {
+                let Some(ledger) = drop_ledger.upgrade() else {
+                    return;
+                };
+                let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                ledger.take_back_dropped(&drop_owner, generation, child, reaped);
             }));
         self.ledger().set(id, LaunchRecord::Handed(generation));
         Ok(Box::new(process))
@@ -1841,7 +1899,7 @@ impl Inner {
                 self.ledger().set(
                     id,
                     LaunchRecord::Pending(Pending {
-                        children: vec![child],
+                        children: vec![Arc::new(child)],
                         rescans: Vec::new(),
                     }),
                 );
@@ -1867,7 +1925,7 @@ impl Inner {
             self.ledger().set(
                 id,
                 LaunchRecord::Pending(Pending {
-                    children: unreaped,
+                    children: unreaped.into_iter().map(Arc::new).collect(),
                     rescans,
                 }),
             );
@@ -1901,7 +1959,9 @@ impl Inner {
                 if found.error.is_some() {
                     failed = true;
                 }
-                pending.children.extend(found.unreaped);
+                pending
+                    .children
+                    .extend(found.unreaped.into_iter().map(Arc::new));
             }
         }
         if !failed {
@@ -4056,6 +4116,118 @@ mod tests {
         second.terminate(Duration::from_secs(5)).expect("terminate");
         l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
             .expect("confirm after reap");
+    }
+
+    /// 子の `/proc/<pid>` が無い(回収済み)ことの確認。
+    fn proc_gone(pid: u32) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// CORE-2・NET-9・REPAIR-5・#3432: `terminate` に失敗した(または呼ばれなかった)まま未回収のハンドルを
+    /// drop しても、同じ launcher の `confirm_no_process` が子を kill・回収して `Ok` になる(`Handed` で詰まらない)。
+    #[test]
+    fn core2_issue3432_confirm_succeeds_after_unreaped_handle_is_dropped() {
+        let spec = spec_for("dropped-live", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        // 子が生きたままハンドルを捨てる(terminate が失敗した pasta ラッパーと同じ状態)。
+        drop(handle);
+        assert!(!proc_gone(pid), "drop must not kill or reap the child");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("confirm after drop");
+        assert!(proc_gone(pid), "confirm must reap the dropped child");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("second confirm sees Clean");
+    }
+
+    /// #3432: 台帳に ID がある限り、記録済みの配置があっても台帳で判定する(cgroup の継ぎ目は呼ばない。#2011)。
+    #[test]
+    fn core2_issue3432_recorded_confirm_uses_ledger_after_drop() {
+        let spec = spec_for("dropped-recorded", serde_json::json!({}));
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let calls = Arc::clone(&ops.recorded_calls);
+        let l = launcher(ops, rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        drop(handle);
+        l.confirm_no_process_recorded(
+            spec.container_id(),
+            Some(&placement()),
+            Duration::from_secs(5),
+        )
+        .expect("confirm after drop");
+        assert!(proc_gone(pid));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the recorded-cgroup seam must not be used"
+        );
+    }
+
+    /// #3432: terminate を期限 0 で呼んだ(成否は問わない)後に drop しても、確認は `Ok` になる。
+    #[test]
+    fn core2_issue3432_confirm_succeeds_after_failed_terminate_and_drop() {
+        let spec = spec_for("dropped-after-terminate", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        let _ = handle.terminate(Duration::ZERO);
+        drop(handle);
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("confirm after failed terminate and drop");
+        assert!(proc_gone(pid));
+    }
+
+    /// #3432: 回収済みのハンドルを drop すると台帳は `Clean` へ進む(これまでは `Handed` のまま残った)。
+    #[test]
+    fn core2_issue3432_reaped_handle_drop_makes_ledger_clean() {
+        let spec = spec_for("dropped-reaped", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        handle
+            .signal(
+                crate::traits::Signal::SIGKILL,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("kill");
+        assert_eq!(
+            handle.wait(Duration::from_secs(5)).expect("wait"),
+            Some(crate::oci_runtime::ProcessExit::Signaled(9))
+        );
+        drop(handle);
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after reaped drop");
+    }
+
+    /// #3432: 世代の照合。古いハンドルの drop は、再 launch が作った新しい `Handed` を書き換えない。
+    #[test]
+    fn core2_issue3432_stale_handle_drop_does_not_touch_newer_record() {
+        let spec = spec_for("dropped-stale", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let first = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let first_pid = first.pid().get();
+        let second = l.launch(&spec, Duration::from_secs(1)).expect("relaunch");
+        drop(first);
+        let err = l
+            .confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect_err("newer handed record must not be confirmed");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launched process is owned by its handle holder; cannot confirm"
+        );
+        second.terminate(Duration::from_secs(5)).expect("terminate");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after second reaped");
+        // 世代違いで台帳へ戻せなかった古い子は残る(doc の残余)。試験の後始末として直接止める。
+        let reaper = ContainerChild::from_pid_for_test(first_pid);
+        let _ = reaper.kill_and_reap(Duration::from_secs(5));
+        assert!(proc_gone(first_pid));
     }
 
     /// CORE-2: 確かめられていない起動が残る ID への再 launch は、spawn を呼ばずに拒否する(二重起動の防止)。

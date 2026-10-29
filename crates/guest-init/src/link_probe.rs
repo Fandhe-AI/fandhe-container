@@ -428,14 +428,15 @@ mod tests {
     static N: AtomicU64 = AtomicU64::new(0);
 
     /// テストごとの一時ディレクトリ（Drop で削除）。実体パスへ正規化する（macOS の `/var` 対策）。
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
             let n = N.fetch_add(1, Ordering::Relaxed);
             let p =
                 std::env::temp_dir().join(format!("fandhe-guest-link-{}-{n}", std::process::id()));
-            fs::create_dir_all(&p).unwrap();
-            Self(fs::canonicalize(&p).unwrap())
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(fs::canonicalize(&p).unwrap(), root)
         }
         fn dir(&self, name: &str) -> PathBuf {
             let p = self.0.join(name);
@@ -443,12 +444,6 @@ mod tests {
             p
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     const P: &str = "fandhe-guest-test: virtiofs-link v1 ";
 
     #[cfg(unix)]

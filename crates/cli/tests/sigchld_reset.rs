@@ -26,10 +26,8 @@ use fandhe_container_plugin::{
     ResidentPlugin, ResidentStartTimeout, RpcTimeout, UdsStream, call_once,
 };
 use std::ffi::OsString;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const ROLE_ENV: &str = "FCSC_ROLE";
@@ -148,17 +146,14 @@ fn role_entry() {
     std::fs::rename(&tmp, dir.join(RESULT_FILE)).unwrap();
 }
 
+// 残骸・PID 再利用と衝突しない排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fcsc-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-        Self(p)
+        Self(exclusive_dir::create("fcsc").expect("exclusive test dir"))
     }
 }
 impl Drop for TempDir {

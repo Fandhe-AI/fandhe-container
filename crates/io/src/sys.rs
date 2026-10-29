@@ -1716,26 +1716,18 @@ mod tests {
         use super::*;
 
         /// テスト用の一時ディレクトリ（drop で削除する）。
-        struct TmpDir(std::path::PathBuf);
+        struct TmpDir(
+            std::path::PathBuf,
+            #[allow(dead_code)] crate::test_root::TestRoot,
+        );
         impl TmpDir {
             fn new(tag: &str) -> Self {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fcio-sys-{tag}-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::create_dir_all(&p).expect("temp dir");
-                Self(p)
+                // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+                let root = crate::test_root::test_root("fcio-sys", tag);
+                Self(root.to_path_buf(), root)
             }
             fn open(&self) -> std::fs::File {
                 std::fs::File::open(&self.0).expect("open dir")
-            }
-        }
-        impl Drop for TmpDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 

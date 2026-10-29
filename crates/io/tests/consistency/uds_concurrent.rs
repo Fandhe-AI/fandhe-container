@@ -23,10 +23,9 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use std::io::{Read, Write};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
@@ -61,13 +60,8 @@ mod unix {
 
     impl SocketDir {
         fn new() -> Self {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let path = std::env::temp_dir().join(format!("fcio-uds-{pid}-{n}"));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&path)
+            // 残骸・PID 再利用との衝突を避ける排他作成（REPAIR-12・#3435）。
+            let path = crate::exclusive_dir::create("fcio-uds")
                 .expect("must be able to create a temp dir for the socket");
             // umask の影響を除き、bind の親ディレクトリ権限検証を満たす。
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))

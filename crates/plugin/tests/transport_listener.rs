@@ -1,6 +1,16 @@
 //! UDS listener の結合試験（PLUG-2・PLUG-12・REPAIR-5。TASK-107.4・#248）。
 //! root・特権不要。accept は期限付きでハングしない。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+// 残骸の回帰試験が専用の親を作るのに使う（REPAIR-12・#3435）。
+#[cfg(unix)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 #[cfg(not(unix))]
 #[test]
 fn plug2_bind_is_unimplemented_on_non_unix() {
@@ -16,7 +26,6 @@ mod unix {
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -24,13 +33,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcpl-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcpl").unwrap();
             Self(p)
         }
         fn sock(&self) -> PathBuf {
@@ -53,6 +57,25 @@ mod unix {
             c.read_exact(&mut buf).unwrap();
             buf.to_vec()
         })
+    }
+
+    /// PLUG-12・REPAIR-12・#3435: 前回の残骸（`fcpl-<pid>-0` と中身）があっても、排他作成は残骸を
+    /// 消さずに連番を進め、新しい空の 0700 のディレクトリを返す。
+    #[test]
+    fn plug12_repair12_exclusive_dir_skips_stale_residue() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = crate::test_root::test_root("fcpl-residue", "parent");
+        let stale = parent.join(format!("fcpl-{}-0", std::process::id()));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("old"), b"stale").unwrap();
+        let fresh = crate::exclusive_dir::create_in(&parent, "fcpl").unwrap();
+        assert_eq!(fresh, parent.join(format!("fcpl-{}-1", std::process::id())));
+        assert_eq!(std::fs::read(stale.join("old")).unwrap(), b"stale");
+        assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

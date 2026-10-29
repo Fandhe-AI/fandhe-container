@@ -128,6 +128,8 @@ impl FrameReceiver for DuplexEnd {
 /// の `TempSocketDir` と同じ方針）。
 pub struct TempDir {
     path: PathBuf,
+    /// 残骸を消して作った実体。保持が目的（Drop で再帰削除する）。
+    _root: crate::test_root::TestRoot,
 }
 
 impl TempDir {
@@ -137,21 +139,19 @@ impl TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("fcio-consistency-{tag}-{pid}-{n}"));
-        std::fs::create_dir_all(&dir).expect("must be able to create a temp dir for test output");
+        // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+        let root = crate::test_root::test_root_at(dir.clone());
         warm_up_persist(&dir);
-        Self { path: dir }
+        Self {
+            path: dir,
+            _root: root,
+        }
     }
 
     /// `name` をこのディレクトリの下のパスへ解決する（`Path::join` で組み立て、
     /// 文字列連結はしない。coding-rust「クロスプラットフォーム」節）。
     pub fn file_path(&self, name: &str) -> PathBuf {
         self.path.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 

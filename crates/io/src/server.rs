@@ -3255,40 +3255,30 @@ mod imp {
 /// （`crates/io/tests/server.rs` の `TempSocketDir` と同じ手順。テスト専用）。
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod test_support {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// テストごとに固有かつ短い `0700` のディレクトリを作り、`Drop` で削除する。
     /// macOS の sun_path 上限（104 バイト）に近づかないよう名前を短く保ち、
     /// umask の影響を受けないよう作成直後に `set_permissions` でモードを確定させる。
     pub(super) struct TempSocketDir {
         path: PathBuf,
+        /// 残骸を消して作った実体。保持が目的（Drop で再帰削除する）。
+        _root: crate::test_root::TestRoot,
     }
 
     impl TempSocketDir {
         pub(super) fn new() -> Self {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("fcu-{pid}-{n}"));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
-                .expect("must be able to create a temp dir for the socket");
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .expect("must be able to force the directory mode regardless of umask");
-            Self { path: dir }
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+            // 非 root の単体試験なので作成前の削除（A）でよい。名前は sun_path のため短く保つ。
+            let root = crate::test_root::test_root("fcu", "s");
+            Self {
+                path: root.to_path_buf(),
+                _root: root,
+            }
         }
 
         pub(super) fn socket_path(&self) -> PathBuf {
             self.path.join("s.sock")
-        }
-    }
-
-    impl Drop for TempSocketDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }

@@ -38,3 +38,9 @@ pub mod supervised;
 #[cfg(unix)]
 pub mod sys;
 pub mod telemetry;
+
+// pid と連番だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3435）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

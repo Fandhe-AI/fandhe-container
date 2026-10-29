@@ -16,6 +16,9 @@
 mod child_process;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
+// 残骸・PID 再利用との衝突を避ける作成前削除つきの一時ディレクトリ（REPAIR-12・#3435）。
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
 
 use child_process::ChildProcess;
 
@@ -99,7 +102,9 @@ fn spawn_container(go: &Path, exit_code: i32) -> ChildProcess {
 /// 起動ハンドルのアダプタ自体の検証（3 OS 共通）。生存中は `None`、終了後は具体の終了コードを返す。
 #[test]
 fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
-    let go = unique_path("smoke-go");
+    // 古い go マーカーが残っていると子がすぐ終わり偽の赤になるため、残骸を消した専用ディレクトリに置く（#3435）。
+    let root = test_root::test_root("fandhe-sup-run-it", "smoke");
+    let go = root.join("go");
     let p = spawn_container(&go, 3);
     assert_eq!(p.wait(Duration::from_millis(50)).unwrap(), None);
     std::fs::write(&go, b"").unwrap();
@@ -112,6 +117,17 @@ fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
     };
     let _ = std::fs::remove_file(&go);
     assert_eq!(exit, ProcessExit::Exited(3));
+}
+
+/// SUP-1・REPAIR-12・#3435: 前回の残骸（古い `go` マーカー）があっても作り直しで消える。
+#[test]
+fn sup1_repair12_smoke_marker_residue_is_cleared() {
+    let stale = unique_path("residue");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("go"), b"").unwrap();
+    let root = test_root::test_root_at(stale.clone());
+    assert!(!root.join("go").exists());
+    assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
 }
 
 #[cfg(target_os = "linux")]

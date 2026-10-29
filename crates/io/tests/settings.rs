@@ -97,13 +97,16 @@ fn io1_settings_receive_limits_match_batch_config() {
 /// Linux / macOS 限定: `WritebackSettings` から得た設定で UDS 経由の
 /// バッチ write-back を動かし、設定した件数でバッチが発火することを確認する
 /// （R1。`tests/writeback.rs` と同じ TempSocketDir・送受信ヘルパー構成）。
+// 残骸・PID 再利用と衝突しない排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use std::io::{Read, Write};
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
@@ -117,13 +120,8 @@ mod unix {
 
     impl TempSocketDir {
         fn new() -> Self {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("fcio-settings-{pid}-{n}"));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
+            // 残骸・PID 再利用との衝突を避ける排他作成（REPAIR-12・#3435）。
+            let dir = super::exclusive_dir::create("fcio-settings")
                 .expect("must be able to create a temp dir for the socket");
             Self { path: dir }
         }

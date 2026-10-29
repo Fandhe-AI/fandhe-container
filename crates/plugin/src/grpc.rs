@@ -1543,9 +1543,7 @@ mod uds_peer_auth_tests {
         PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection, UdsListener,
     };
     use std::io::{Read, Write};
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixStream as StdStream;
-    use std::sync::atomic::AtomicU32;
 
     type Events = Arc<Mutex<Vec<(PeerAuthOp, PeerAuthRejectReason)>>>;
     type BackoffEvents = Arc<Mutex<Vec<(Option<u32>, Option<u64>)>>>;
@@ -1567,22 +1565,13 @@ mod uds_peer_auth_tests {
         }
     }
 
-    struct TempDir(PathBuf);
+    struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl TempDir {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcgp-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-            Self(p)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+            // 非 root の単体試験なので作成前の削除（A）でよい。名前は sun_path のため短く保つ。
+            let root = crate::test_root::test_root("fcgp", "t");
+            Self(root.to_path_buf(), root)
         }
     }
 

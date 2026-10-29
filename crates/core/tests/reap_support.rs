@@ -349,6 +349,26 @@ fn repair5_repair12_captured_wait_cuts_endless_output_before_deadline() {
         "child not reaped"
     );
     let out_path = captured.out_path.clone();
-    captured.discard();
+    captured.discard().expect("discard after kill");
     assert!(!out_path.exists());
+}
+
+/// kill の引数形式（GNU の `--` つき / BSD の `--` なし）のどちらでも、すでに空のグループは成功扱いで、
+/// 生きているグループは実際に止まる。macOS でも同じ試験が通ること（`--` を pid と誤解する kill への対応）を見る。
+#[cfg(unix)]
+#[test]
+fn repair5_repair12_group_kill_succeeds_for_live_and_empty_groups() {
+    // 生きているグループ: 眠る子を止める。
+    let mut cmd = self_cmd("reap_support_child_blocks", "1");
+    let (mut child, captured) = reap::spawn_captured_capped(&mut cmd, 1 << 20).expect("spawn");
+    std::thread::sleep(Duration::from_millis(100));
+    captured.discard().expect("kill live group");
+    let st = reap::wait_within(&mut child, Duration::from_secs(10)).expect("child stopped");
+    assert_eq!(st.signal(), Some(9));
+    // 空のグループ（子はすでに回収済み）: ESRCH は成功扱い。
+    let mut cmd = self_cmd("reap_support_child_blocks", "");
+    let (mut child, captured) = reap::spawn_captured_capped(&mut cmd, 1 << 20).expect("spawn");
+    let st = reap::wait_within(&mut child, Duration::from_secs(30)).expect("exit");
+    let out = captured.finish(st).expect("empty group is not an error");
+    assert!(out.status.success());
 }

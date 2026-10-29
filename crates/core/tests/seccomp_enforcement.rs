@@ -231,8 +231,8 @@ fn main() {
             if Instant::now() >= deadline {
                 let diag = crate::proc_status::excerpt(child_pid);
                 crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
-                captured.discard();
-                panic!("seccomp_enforcement child timed out ({diag})");
+                let discarded = captured.discard();
+                panic!("seccomp_enforcement child timed out ({diag}); discard: {discarded:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         };

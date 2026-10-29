@@ -121,28 +121,69 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
     }
 }
 
-/// プロセスグループ `pgid` の全員へ SIGKILL を送る（`/bin/kill -KILL -- -<pgid>` を期限つきで起動する。
-/// この補助は `unsafe` を持たないため、`kill(2)` の直接呼び出しの代わりに外部コマンドを使う）。グループが
-/// すでに空の失敗（ESRCH）は正常として無視し、起動・期限切れの失敗は stderr に出す。`pgid` が 0 や 1 のときは
+/// プロセスグループ `pgid` の全員へ SIGKILL を送る。この補助は `unsafe` を持たないため、`kill(2)` の直接
+/// 呼び出しの代わりに OS 同梱の `kill` を環境空・絶対パス・期限つき（10 秒）で起動する。引数形式は GNU
+/// （Linux）の `-s KILL -- -<pgid>` を先に、BSD（macOS）の kill が `--` を pid として拒否するため
+/// `-s KILL -<pgid>` を次に試す（`crates/plugin/tests/rss_comparison.rs` の `kill_process_group` と同じ）。
+/// どれかが成功すれば `Ok`。全部失敗しても、いずれかの stderr が `No such process`（ESRCH。グループがすでに
+/// 空）なら `Ok`。それ以外（起動失敗・期限切れ・権限不足等）は具体的な `Err`。`pgid` が 0 や 1 のときは
 /// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-fn kill_group(pgid: u32) {
+fn kill_group(pgid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
         if pgid <= 1 {
-            return;
+            return Ok(());
         }
-        let mut cmd = Command::new("/bin/kill");
-        cmd.args(["-KILL", "--", &format!("-{pgid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Err(e) = run_within(&mut cmd, Duration::from_secs(10)) {
-            eprintln!("kill process group {pgid} failed: {e}");
+        let target = format!("-{pgid}");
+        let forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
+        let mut last = String::from("no kill binary found");
+        let mut gone = false;
+        for bin in ["/bin/kill", "/usr/bin/kill"] {
+            for args in forms {
+                let mut cmd = Command::new(bin);
+                cmd.args(args)
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last = format!("spawn {bin} failed: {e}");
+                        continue;
+                    }
+                };
+                match wait_within(&mut child, Duration::from_secs(10)) {
+                    Ok(st) if st.success() => return Ok(()),
+                    Ok(st) => {
+                        // kill の stderr は 1 行程度。終了後に上限つきで読む。
+                        let mut msg = String::new();
+                        if let Some(mut e) = child.stderr.take() {
+                            let _ = e.by_ref().take(4096).read_to_string(&mut msg);
+                        }
+                        if msg.contains("No such process") {
+                            gone = true;
+                        }
+                        last = format!("{bin} {args:?} exited with {st}: {}", msg.trim());
+                    }
+                    Err(e) => {
+                        reap_or_report(&mut child, REAP_WITHIN);
+                        last = format!("{bin}: {e}");
+                    }
+                }
+            }
         }
+        if gone {
+            return Ok(());
+        }
+        Err(format!("kill process group {pgid} failed: {last}"))
     }
     #[cfg(not(unix))]
-    let _ = pgid;
+    {
+        let _ = pgid;
+        Ok(())
+    }
 }
 
 /// `output_within` が各出力ファイルに許す最大バイト数。超えたら「出力が完全でない」として `Err` にする
@@ -217,9 +258,11 @@ impl Captured {
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn finish(self, status: ExitStatus) -> Result<Output, String> {
         // 出力先を継承した子孫が居残って書き続けないよう、読む前にグループの残りを止める。
-        kill_group(self.pgid);
+        // 失敗しても一時ファイルの回収は進め、止められなかったことを `Err` で表に出す。
+        let killed = kill_group(self.pgid);
         let stdout = drain_output_file(&self.out_path, self.cap);
         let stderr = drain_output_file(&self.err_path, self.cap);
+        killed?;
         Ok(Output {
             status,
             stdout: stdout.map_err(|e| format!("stdout: {e}"))?,
@@ -246,10 +289,13 @@ impl Captured {
         let pid = child.id();
         let until = Instant::now() + within;
         let stop = |child: &mut Child, msg: String| {
-            kill_group(self.pgid);
+            let killed = kill_group(self.pgid);
             reap_or_report(child, REAP_WITHIN);
             self.truncate();
-            Err(msg)
+            match killed {
+                Ok(()) => Err(msg),
+                Err(k) => Err(format!("{msg}; {k}")),
+            }
         };
         loop {
             match child.try_wait() {
@@ -280,12 +326,13 @@ impl Captured {
     /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。消す前に 0 へ切り詰めて、出力先を持ち続ける
     /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-    pub fn discard(self) {
-        kill_group(self.pgid);
+    pub fn discard(self) -> Result<(), String> {
+        let killed = kill_group(self.pgid);
         self.truncate();
         for p in [&self.out_path, &self.err_path] {
             let _ = std::fs::remove_file(p);
         }
+        killed
     }
 }
 
@@ -340,7 +387,7 @@ pub(crate) fn spawn_captured_capped(
             Ok((child, captured))
         }
         Err(e) => {
-            captured.discard();
+            let _ = captured.discard();
             Err(format!("spawn {program} failed: {e}"))
         }
     }
@@ -380,7 +427,10 @@ pub(crate) fn output_within_capped(
             .finish(status)
             .map_err(|e| format!("{program}: {e}")),
         Err(e) => {
-            captured.discard();
+            let e = match captured.discard() {
+                Ok(()) => e,
+                Err(k) => format!("{e}; {k}"),
+            };
             if e.contains("did not exit within") {
                 Err(format!("{program} did not finish within {within:?}"))
             } else if e.starts_with("try_wait ") {

@@ -40,6 +40,11 @@ pub struct NetworkLockGuard<'g> {
 }
 
 impl NetworkLockGuard<'_> {
+    /// 記録先（Linux 以外ではガードを作れないため、記録しない先を返す）。
+    pub(crate) fn net_op_recorder(&self) -> &dyn NetOpRecorder {
+        &crate::instrument::NoopNetOpRecorder
+    }
+
     /// Linux 以外ではガードを作れないため常に偽（Linux 実装と同じシグネチャ）。
     pub fn is_held(&self) -> bool {
         false

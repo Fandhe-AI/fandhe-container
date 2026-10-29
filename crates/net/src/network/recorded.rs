@@ -62,6 +62,7 @@ use super::{
 use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
+use crate::instrument::{NetOpKind, record_net_op};
 use crate::netlink_route::IpPrefix;
 use crate::network_store::MAX_MEMBERS_PER_NETWORK;
 use crate::network_store::realized::check_gateway;
@@ -460,6 +461,25 @@ pub(crate) fn detach_member_recorded_with<E, F>(
 where
     F: FnOnce(&FailedAttachClaim, &NetnsDirRecord) -> Result<NetworkDeleteReport, E>,
 {
+    // 検証拒否・回収失敗・記録の削除失敗・成功のすべてを 1 件の操作として結果と所要時間を記録する（REPAIR-4）。
+    record_net_op(
+        guard.net_op_recorder(),
+        NetOpKind::MemberDetachRecorded,
+        || detach_member_recorded_inner(host, guard, member_id, netns_dir, ports, run),
+    )
+}
+
+fn detach_member_recorded_inner<E, F>(
+    host: &HostGeneration,
+    guard: &NetworkLockGuard<'_>,
+    member_id: &MemberId,
+    netns_dir: &Path,
+    ports: &mut PortRegistry,
+    run: F,
+) -> Result<NetworkDeleteReport, RecordedError<E, NetworkDeleteReport>>
+where
+    F: FnOnce(&FailedAttachClaim, &NetnsDirRecord) -> Result<NetworkDeleteReport, E>,
+{
     require_exclusive_guard(guard)?;
     let realized = require_settled_current(guard, host)?;
     let members = guard.members().map_err(RecordedError::Store)?;
@@ -492,17 +512,23 @@ where
             "member has an unpublishing mark; recover it with unpublish first",
         )));
     }
+    // 墓標（`unpublished`。ルールの削除を確かめ済みで予約だけが残る公開。#3343）は回収するルールが無いので除く。
+    // 有効（Active）な公開だけを請求書のルールに載せ、墓標は記録の削除（と予約の解放）で片付く。
+    let active: Vec<RecordedPublish> = rec
+        .publishes()
+        .iter()
+        .filter(|p| !p.unpublished())
+        .cloned()
+        .collect();
     let rules = match rec.table_handle() {
-        Some(th) if !rec.publishes().is_empty() => {
+        Some(th) if !active.is_empty() => {
             // 空・上限超過・整合違反は `None`。ルールの回収が黙って省かれるので断る。
-            Some(
-                ClaimedRules::new(th, rec.publishes().to_vec()).ok_or_else(|| {
-                    RecordedError::Store(NetError::new(
-                        NetErrorCode::DataLoss,
-                        "member publish records are inconsistent",
-                    ))
-                })?,
-            )
+            Some(ClaimedRules::new(th, active).ok_or_else(|| {
+                RecordedError::Store(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "member publish records are inconsistent",
+                ))
+            })?)
         }
         _ => None,
     };
@@ -3206,6 +3232,120 @@ mod tests {
         // 別 endpoint の請求書は妨げない。
         let (r, claim) = detach_member(&n, "c2", NETNS_DIR, &mut PortRegistry::new(), Ok(()));
         assert!(r.is_ok() && claim.is_some());
+    }
+
+    fn api_publish() -> PortPublish {
+        PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), 9090, 81).unwrap()
+    }
+
+    /// 墓標のみのメンバー（ルールは回収済み）でも detach でき、請求書にルールを載せず記録を落とす（#3347・#3343）。
+    #[test]
+    fn net1_3347_detach_member_with_tombstone_only_has_no_rules() {
+        let t = Tmp::new("member-detach-tomb-only");
+        attach_two(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let rec = n
+            .members()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id().as_str() == "c1")
+            .unwrap();
+        n.replace_member(&rec.with_unpublished(&web_publish()).unwrap())
+            .unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&name(), &EndpointId::new("c1").unwrap(), &[web_publish()])
+            .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+        assert!(r.is_ok());
+        assert!(claim.expect("run was called").port_rules().is_none());
+        assert_eq!(n.members().unwrap().len(), 1);
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// Active と墓標が混在するメンバーは、Active のルールだけを請求書に載せる（#3347・#3343）。
+    #[test]
+    fn net1_3347_detach_member_with_active_and_tombstone_claims_only_active() {
+        let t = Tmp::new("member-detach-mixed");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = spec("c1");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            |ipam, generation| {
+                let mut att = run_with_publish_and_pin(&s1)(ipam, generation)?;
+                att.published_ports.push(PublishedPort::new(
+                    &name(),
+                    BRIDGE_TOKEN,
+                    s1.endpoint(),
+                    api_publish(),
+                    (rule(4), rule(5)),
+                ));
+                Ok(att)
+            },
+        )
+        .unwrap();
+        let rec = n.members().unwrap().remove(0);
+        n.replace_member(&rec.with_unpublished(&api_publish()).unwrap())
+            .unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(
+            &name(),
+            &EndpointId::new("c1").unwrap(),
+            &[web_publish(), api_publish()],
+        )
+        .unwrap();
+        let (r, claim) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+        assert!(r.is_ok());
+        let claim = claim.expect("run was called");
+        let rules = claim.port_rules().expect("active rule remains");
+        assert_eq!(rules.ports.len(), 1);
+        assert_eq!(*rules.ports[0].publish(), web_publish());
+        assert!(n.members().unwrap().is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// REPAIR-4・#3347: 成功・検証拒否・回収失敗のどれでも操作 1 件が記録される。
+    #[test]
+    fn repair4_3347_detach_member_records_every_outcome() {
+        use crate::instrument::NetOpOutcome;
+        use crate::instrument::testing::Collect;
+        let t = Tmp::new("member-detach-instr");
+        attach_two(&t);
+        let c = std::sync::Arc::new(Collect::default());
+        let store = NetworkStore::open_with_recorder(&t.0, c.clone()).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        let count = |c: &Collect| {
+            c.kinds()
+                .into_iter()
+                .filter(|(k, _)| *k == NetOpKind::MemberDetachRecorded)
+                .map(|(_, o)| o)
+                .collect::<Vec<_>>()
+        };
+        let mut reg = PortRegistry::new();
+        let (r, _) = detach_member(&n, "nope", NETNS_DIR, &mut reg, Ok(()));
+        assert!(r.is_err());
+        let (r, _) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Err(()));
+        assert!(r.is_err());
+        let (r, _) = detach_member(&n, "c1", NETNS_DIR, &mut reg, Ok(()));
+        assert!(r.is_ok());
+        assert_eq!(
+            count(&c),
+            vec![
+                NetOpOutcome::Failure,
+                NetOpOutcome::Failure,
+                NetOpOutcome::Success
+            ]
+        );
     }
 
     /// NET-3・SEC-1・#3347: 解除の印つきの公開が残るメンバーは、ルールの回収が黙って省かれないよう断る。

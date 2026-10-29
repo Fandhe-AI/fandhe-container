@@ -11,6 +11,9 @@ use fandhe_container_oci::image_management::{
 };
 use fandhe_container_oci::reference::{Digest, RegistryHost, Repository, Tag};
 
+#[path = "support/test_root.rs"]
+mod test_root;
+
 fn d(n: u8) -> Digest {
     Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).expect("digest")
 }
@@ -118,15 +121,9 @@ fn oci7_image_rm_force_through_store_guard() {
     };
     use std::fs;
 
-    let root = std::env::temp_dir().join(format!("fc-oci-it-rm-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = test_root::test_root("fc-oci-it-rm", "rm");
     let blobs = root.join("blobs").join("sha256");
     fs::create_dir_all(&blobs).expect("mkdir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
     let put = |dg: &Digest| {
         let hex = dg.as_str().trim_start_matches("sha256:");
         fs::write(blobs.join(hex), dg.as_str()).expect("write blob");
@@ -208,13 +205,7 @@ fn oci7_image_rm_force_through_store_guard() {
 /// OCI-7（TASK-183.4）: `ImageStore` 経由のタグ付与 → 付け替え → 未登録 digest の NotFound。
 #[test]
 fn oci7_image_store_tag_flow_through_public_api() {
-    let root = std::env::temp_dir().join(format!("fc-oci-it-tag-{}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("mkdir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
+    let root = test_root::test_root("fc-oci-it-tag", "tag");
     let mut t = ReferenceTable::new();
     for (m, c, l) in [(0xa0, 0xc1, 0x10), (0xb0, 0xc2, 0x11)] {
         t.register_manifest(

@@ -2078,6 +2078,55 @@ mod tests {
         }
     }
 
+    /// SEC-4・ERR-4・SUP-6・#3294: 段つきの版は worker の 16 理由すべてで記録の `stage` に段を載せ、`None` では載せない。
+    /// 一覧外の理由は段があっても 0 件。記録の JSON 行の末尾は `"container_id":...,"stage":"set_ns"}` になる。
+    #[test]
+    fn sec4_err4_record_exec_worker_rejection_at_carries_stage() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, encode_json_line};
+        use crate::exec::record_exec_worker_rejection_at;
+        use crate::traits::ContainerId;
+
+        let id = ContainerId::new("c1").unwrap();
+        for r in ViolationReason::EXEC_WORKER_REASONS {
+            let sink = VecSink::new(false);
+            let out = record_exec_worker_rejection_at(
+                "rejected",
+                r,
+                Some(IsolationStage::SetNs),
+                Some(&id),
+                &sink,
+            );
+            assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
+            assert_eq!(out.error, "rejected");
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{r:?}");
+            assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("set_ns"), "{r:?}");
+            let line = String::from_utf8(encode_json_line(&recs[0]).unwrap()).unwrap();
+            assert!(
+                line.ends_with(&format!(
+                    "\"reason\":\"{}\",\"container_id\":\"c1\",\"stage\":\"set_ns\"}}\n",
+                    r.as_str()
+                )),
+                "{line}"
+            );
+
+            let sink = VecSink::new(false);
+            record_exec_worker_rejection_at("rejected", r, None, Some(&id), &sink);
+            assert_eq!(sink.snapshot()[0].stage(), None, "{r:?}");
+        }
+        let sink = VecSink::new(false);
+        let out = record_exec_worker_rejection_at(
+            "x",
+            ViolationReason::RootfsMoved,
+            Some(IsolationStage::SetNs),
+            None,
+            &sink,
+        );
+        assert_eq!(out.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
+    }
+
     /// SEC-4・SUP-6・TASK-163 追補・#1595: ExecError 入口は種別 Entrypoint のときだけ 1 件記録する。
     #[test]
     fn sec4_sup6_task163_audit_entrypoint_violation_records_once() {

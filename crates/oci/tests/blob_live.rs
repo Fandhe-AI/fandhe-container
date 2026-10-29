@@ -8,6 +8,9 @@ use fandhe_container_oci::manifest::Platform;
 use fandhe_container_oci::reference::ImageReference;
 use fandhe_container_oci::registry::{RegistryClient, RegistryClientConfig, RegistryEndpoint};
 
+#[path = "support/test_root.rs"]
+mod test_root;
+
 /// 指定イメージの config と全レイヤーを取得し、各ファイル長が descriptor.size と一致することを確認する。
 fn fetch_all(image: &str) -> usize {
     let client = RegistryClient::new(&RegistryClientConfig::default()).expect("client");
@@ -20,17 +23,7 @@ fn fetch_all(image: &str) -> usize {
     let resolved = client
         .fetch_manifest(&ep, r.repository(), r.reference(), &auth, &platform)
         .expect("manifest");
-    let dir = std::env::temp_dir().join(format!(
-        "fandhe-oci-blob-live-{}-{}",
-        std::process::id(),
-        image.replace(['/', ':'], "_")
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
+    let dir = test_root::test_root("fandhe-oci-blob-live", &image.replace(['/', ':'], "_"));
     let mut descriptors = vec![resolved.manifest.config.clone()];
     descriptors.extend(resolved.manifest.layers.iter().cloned());
     // 書き込み先は検査済み root の fd 起点の writer（#2765）。同じ digest は 1 回だけ取得する。

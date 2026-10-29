@@ -32,8 +32,9 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //! - 残った `realized.intent` / `members-intent/*` のカーネル照合による昇格・巻き戻し（link の dump API が前提）
-//! - 生きた `AttachedContainer` を持たない detach（veth・pin の回収）と、detach の失敗の請求書へのルールハンドルの
-//!   記載（#3285）。再起動後の detach の公開の解除は本モジュールの個別解除を先に呼ぶ
+//! - 生きた `AttachedContainer` を持たない detach（veth・pin の回収）。再起動後の detach の公開の解除は本モジュールの個別解除を先に呼ぶ。
+//!   `detach_container` の失敗の請求書へのルールハンドルの記載と `reclaim_failed_attach` での回収は済み（#3285）だが、
+//!   `@networks` の経路で保留中の請求書を回収する結線は後続（#3075 系）
 //! - 記録から `PortRegistry`（ポート予約）を組み直すこと。再起動直後は空の予約表を渡すと、解除はルールの削除だけを
 //!   行い、予約の解放は 0 件で成功する
 //! - 検証で拒否した detach は渡された `AttachedContainer` を返さず破棄する（netns の pin は残る。記録から

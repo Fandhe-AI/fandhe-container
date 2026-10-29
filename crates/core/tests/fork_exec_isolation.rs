@@ -77,7 +77,7 @@
 //! - Landlock のドメインは execve をまたいで変わらないため、適用後の fork 子で観測した拒否は exec 後と同じ規則による
 //! - `landlock-fail` は終端より前（Landlock の適用）で失敗するので、fork 子でも exec でも結果は同じ
 //! - exec に到達することと Landlock の下での exec は `landlock-exec` / `landlock-missing` がすでに照合している
-//! - 本試験は `platform-ci` の `--ignored` 対象でなく、移行後の観測を CI で確かめる手段が無い
+//! - 本試験は `platform-ci`（ubuntu・非 root）で `--ignored` を実行し、成功行を試験ソースから導出して照合している（#3295。root の分岐は #1621）
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

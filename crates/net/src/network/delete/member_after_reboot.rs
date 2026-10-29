@@ -149,7 +149,9 @@ pub(crate) fn reclaim_member_after_reboot_with<O: DeleteOps>(
 
 /// [`reclaim_member_after_reboot_with`] の Linux 実装（全体で 1 つの期限を持つ。REPAIR-5）。
 ///
-/// 照会だけで、`CAP_NET_ADMIN` は要らない（pin の除去は置き場の所有者の権限）。
+/// 照会だけなので `CAP_SYS_ADMIN` による umount は要らない（pin の除去は置き場の所有者の権限）。ただし
+/// nftables の照会（`NFT_MSG_GETTABLE`）は読み取りでも対象 netns の `CAP_NET_ADMIN` を要し、無いと
+/// `PermissionDenied` になる（テーブルが無くても回収できない）。
 #[cfg(target_os = "linux")]
 pub(crate) fn reclaim_member_after_reboot(
     route: &NetlinkRouteSocket,

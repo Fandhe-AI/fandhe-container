@@ -1384,6 +1384,9 @@ mod linux {
     /// 回収待ちの請求書が残る場合は何も変えずに断る（手動回収）。手順・関門は `detach_member_after_reboot_with`。
     /// `timeout` は照会全体の 1 つの期限（REPAIR-5）。全メンバーを片付けた後は `delete_network_recorded` が
     /// `realized` を消す。
+    ///
+    /// 前提: `CAP_SYS_ADMIN` による umount は要らないが、nftables の照会は読み取りでも対象 netns の
+    /// `CAP_NET_ADMIN` を要する（無いと `PermissionDenied`）。
     pub fn detach_member_recorded_after_reboot(
         route: &NetlinkRouteSocket,
         nft: &NetlinkNetfilterSocket,

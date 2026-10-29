@@ -6,18 +6,22 @@
 # Docker Hub の pull 回数に数えられないため、残量を消費しない。試験側の CRI 境界では HTTP 429 が gRPC の UNAVAILABLE に
 # 潰れて他の 5xx と区別できないため、rate limit の識別はこのスクリプトが担う（試験失敗後の事後診断にも再実行する）。
 #
-# 入力（環境変数）: PROBE_REPO（既定 library/busybox）・PROBE_TAG（既定 1.36）・PROBE_TIMEOUT_SECS（既定 20。1〜600）。
-# 終了コード: 0 = 取得可（残量あり・またはヘッダ無し）、1 = rate limit（429・残量 0）または到達不能・想定外の応答、
-# 2 = usage 誤り・必須コマンド不足。トークン・応答本文は出力しない。出力文字列は英語。
+# 入力（環境変数）: PROBE_REPO（既定 library/busybox）・PROBE_TAG（既定 1.36）・PROBE_TIMEOUT_SECS（既定 20。1〜600）・
+# PROBE_MIN_REMAINING（最低残量。既定 1 = 従来どおり。1〜100。#3312）。container_grpc は 1 回の起動で 2 回 pull するため、
+# CI の事前確認では 2 を渡して 2 回目の pull の 429 も pull を消費する前に検出する。
+# 終了コード: 0 = 取得可（残量が最低以上・またはヘッダ無し。ヘッダが無ければ最低残量は評価できず従来の挙動を保つ）、
+# 1 = rate limit（429・残量 0）・残量が最低未満（"remaining below required minimum"。"exhausted" とは別文言）・
+# 到達不能・想定外の応答、2 = usage 誤り・必須コマンド不足。トークン・応答本文は出力しない。出力文字列は英語。
 set -euo pipefail
 
 if [ "$#" -ne 0 ]; then
-  echo "usage: docker-hub-ratelimit-probe.sh (no arguments; env: PROBE_REPO PROBE_TAG PROBE_TIMEOUT_SECS)" >&2
+  echo "usage: docker-hub-ratelimit-probe.sh (no arguments; env: PROBE_REPO PROBE_TAG PROBE_TIMEOUT_SECS PROBE_MIN_REMAINING)" >&2
   exit 2
 fi
 repo="${PROBE_REPO:-library/busybox}"
 tag="${PROBE_TAG:-1.36}"
 tmo="${PROBE_TIMEOUT_SECS:-20}"
+min="${PROBE_MIN_REMAINING:-1}"
 # URL へ組み込む前に許容文字を検証する（インジェクション対策）。
 case "${repo}" in '' | *[!a-z0-9._/-]* | /* | *..*)
   echo "usage: invalid PROBE_REPO" >&2
@@ -36,6 +40,15 @@ case "${tmo}" in '' | *[!0-9]* | ????*)
 esac
 if [ "${tmo}" -lt 1 ] || [ "${tmo}" -gt 600 ]; then
   echo "usage: PROBE_TIMEOUT_SECS must be 1-600" >&2
+  exit 2
+fi
+case "${min}" in '' | *[!0-9]* | ????*)
+  echo "usage: invalid PROBE_MIN_REMAINING" >&2
+  exit 2
+  ;;
+esac
+if [ "${min}" -lt 1 ] || [ "${min}" -gt 100 ]; then
+  echo "usage: PROBE_MIN_REMAINING must be 1-100" >&2
   exit 2
 fi
 command -v curl >/dev/null 2>&1 || {
@@ -77,8 +90,12 @@ if [ "${code}" = "429" ] || { [ "${code}" = "200" ] && [ "${remaining}" = "0" ];
   exit 1
 fi
 [ "${code}" = "200" ] || unreachable manifest "${code}"
+if [ -n "${remaining}" ] && [ "${remaining}" -lt "${min}" ]; then
+  echo "::error::docker hub anonymous pull remaining below required minimum (remaining=${remaining} min=${min})" >&2
+  exit 1
+fi
 if [ -n "${remaining}" ]; then
-  echo "docker-hub-ratelimit: ok remaining=${remaining} limit=${limit:-n/a}"
+  echo "docker-hub-ratelimit: ok remaining=${remaining} limit=${limit:-n/a} min=${min}"
 else
   echo "docker-hub-ratelimit: ok (no rate limit headers)"
 fi

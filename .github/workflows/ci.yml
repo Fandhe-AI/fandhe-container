@@ -2148,16 +2148,19 @@ jobs:
       #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
       #   pull を消費する前に fail-closed にする。試験自身も gRPC メタデータから 429 を識別して固定行を出す（#2966）が、
       #   試験が失敗したときも同じプローブを事後診断として再実行し、rate limit が原因なら文言で分かるようにする。
+      #   最低残量（#3312）: pull は 2 回なので事前確認は PROBE_MIN_REMAINING=2 を要求し、残量 1 以下は
+      #   `anonymous pull remaining below required minimum` で pull を消費する前に fail-closed にする。
+      #   事後診断は 2 回 pull した後で残量 1 が正当にあり得るため、既定の 1 のまま回す（誤診断を避ける）。
       # - 実行頻度: 他の `--ignored` 試験と揃えて PR と main の両方（ubuntu のみ）で回す。rate limit で頻繁に赤になる場合は
       #   main と workflow_dispatch のみへ絞る判断をオーナーへ上げる（Docker Hub のミラー切替は試験定数の変更が要るため別 issue）。
       # - timeout: 試験の watchdog が 900 秒と 600 秒（2 試験の和）・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 30 分にする
       #   （watchdog より先に step timeout が切れると試験側の診断が失われる）。
-      - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818）
+      - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818・#3312）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          line="$(make --no-print-directory docker-hub-ratelimit-probe)"
+          line="$(make --no-print-directory docker-hub-ratelimit-probe PROBE_MIN_REMAINING=2)"
           echo "${line}"
           echo "${line}" >> "$GITHUB_STEP_SUMMARY"
 

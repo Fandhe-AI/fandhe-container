@@ -374,7 +374,7 @@ repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<
 crictl-smoke: ## crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
 	@scripts/targets/crictl-smoke.sh
 
-docker-hub-ratelimit-probe: ## Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS=]。CRI-3・#2818）
+docker-hub-ratelimit-probe: ## Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS= PROBE_MIN_REMAINING=]。CRI-3・#2818・#3312）
 	@scripts/cri/docker-hub-ratelimit-probe.sh
 
 # --------------------------------------------------

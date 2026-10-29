@@ -86,27 +86,39 @@ fn main() {
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":true}},"mounts":[{{"destination":{allowed_json},"options":["rw"]}}]}}"#
         );
         let cfg = parse_config_bytes(json.as_bytes()).expect("valid config");
+        // sh の stderr は適用前に開いた一時ファイルへ向ける（fd は Landlock の対象外）。この段は適用後の単一スレッド
+        // 前提を保つため、読み手スレッドを立てる `output_within` ではなく `run_within` を使う（REPAIR-5・#3409）。
+        let mut err_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join("allowed").join("sh-stderr"))
+            .expect("open sh stderr file");
+        let sh_stderr = err_file.try_clone().expect("clone stderr file");
         let o = observe_landlock_path_access(&cfg, &[]).expect("observe");
         assert!(o.ruleset_error.is_none(), "{:?}", o.ruleset_error);
         assert!(o.apply_error.is_none(), "{:?}", o.apply_error);
         assert!(o.applied, "landlock must be applied");
-        let out = Command::new("/bin/sh")
-            .arg("-c")
+        let mut sh = Command::new("/bin/sh");
+        sh.arg("-c")
             .arg(": > \"$1\"")
             .arg("sh")
             .arg(dir.join("denied").join(MARKER))
             // strerror の文言はロケールに従うため C に固定する（非英語ロケールでの誤失敗を防ぐ）。
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("spawn /bin/sh");
-        let stderr = String::from_utf8_lossy(&out.stderr);
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(sh_stderr));
+        let status = crate::reap::run_within(&mut sh, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("exec'd sh: {e}"));
+        let mut stderr = String::new();
+        err_file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| err_file.read_to_string(&mut stderr))
+            .expect("read sh stderr");
         assert!(
-            !out.status.success() && stderr.contains("Permission denied"),
-            "exec'd sh must be denied by landlock: status={} stderr={stderr}",
-            out.status
+            !status.success() && stderr.contains("Permission denied"),
+            "exec'd sh must be denied by landlock: status={status} stderr={stderr}",
         );
         assert!(!dir.join("denied").join(MARKER).exists());
         println!("landlock_audit_exec child: ok");
@@ -153,26 +165,17 @@ fn main() {
         .expect("utf8 dir name")
         .to_owned();
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = Command::new(&exe)
-        .args(["--child-exec", "--probe-dir"])
-        .arg(&dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn child");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(s) = child.try_wait().expect("try_wait") {
-            break s;
-        }
-        if Instant::now() >= deadline {
-            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+    let mut child_cmd = Command::new(&exe);
+    child_cmd.args(["--child-exec", "--probe-dir"]).arg(&dir);
+    // spawn・期限・出力回収を一括で期限つきにする。孫が pipe を持ち続けても戻る（REPAIR-5・#3409）。
+    let out = match crate::reap::output_within(&mut child_cmd, Duration::from_secs(30)) {
+        Ok(o) => o,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            panic!("landlock_audit_exec child timed out");
+            panic!("landlock_audit_exec child: {e}");
         }
-        std::thread::sleep(Duration::from_millis(20));
     };
-    let out = child.wait_with_output().expect("wait_with_output");
+    let status = out.status;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

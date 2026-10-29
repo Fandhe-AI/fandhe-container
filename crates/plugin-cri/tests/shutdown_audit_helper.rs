@@ -21,6 +21,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::future::poll_fn;
     use std::io::{BufRead as _, Read as _};
@@ -169,11 +173,11 @@ mod linux {
             "the helper must share the child's process group for the group signal to reach it"
         );
 
-        let status = Command::new("kill")
-            .args(["-s", "TERM", "--"])
-            .arg(format!("-{child_pid}"))
-            .status()
-            .expect("run kill");
+        // 期限なしの `status()` を避ける。スレッドを立てない `run_within` は単一スレッド前提を壊さない（#3409）。
+        let mut kill = Command::new("kill");
+        kill.args(["-s", "TERM", "--"]).arg(format!("-{child_pid}"));
+        let status = crate::reap::run_within(&mut kill, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("group SIGTERM: {e}"));
         assert!(status.success(), "kill -s TERM to the group failed");
 
         let deadline = Instant::now() + CHILD_EXIT_WAIT;
@@ -182,8 +186,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("the child did not exit within {CHILD_EXIT_WAIT:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -283,8 +286,8 @@ mod linux {
         });
         let cgt = sig_mask(sleeper_pid, "SigCgt:").expect("sleep SigCgt");
         let sleeper_ign = sig_mask(sleeper_pid, "SigIgn:").expect("sleep SigIgn");
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
+        crate::reap::reap(&mut sleeper, crate::reap::REAP_WITHIN)
+            .unwrap_or_else(|e| panic!("reap sleeper: {e}"));
         assert_eq!(
             cgt & (MASK_INT | MASK_TERM),
             0,

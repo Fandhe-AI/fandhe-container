@@ -228,8 +228,12 @@ mod linux {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let caps = "cap_sys_admin,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_kill,cap_setgid+ep";
-        let st = Command::new("setcap").arg(caps).arg(&launcher).status();
-        if !st.map(|s| s.success()).unwrap_or(false) {
+        let mut setcap = Command::new("setcap");
+        setcap.arg(caps).arg(&launcher);
+        // 期限なしの `status()` を避ける。期限切れ・spawn 失敗も前提欠如（SetcapFailed）として扱う（REPAIR-5・#3409）。
+        let st = crate::reap::run_within(&mut setcap, crate::reap::REAP_WITHIN)
+            .inspect_err(|e| eprintln!("setcap: {e}"));
+        if !st.is_ok_and(|s| s.success()) {
             return Err(Precondition::SetcapFailed);
         }
         let mut child = Command::new(&launcher)

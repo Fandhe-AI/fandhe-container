@@ -88,10 +88,16 @@ fn notimp(target: std::net::SocketAddrV4) -> bool {
 struct TermRequest;
 impl DnsHelperStopRequest for TermRequest {
     fn request(&self, record: &DnsHelperRecord) -> RequestOutcome {
-        let ok = Command::new("kill")
-            .arg(record.identity().pid.to_string())
-            .status()
-            .is_ok_and(|s| s.success());
+        let mut kill = Command::new("kill");
+        kill.arg(record.identity().pid.to_string());
+        // 期限なしの `status()` を避ける。期限切れ・spawn 失敗は `Unavailable` として理由を残す（REPAIR-5・#3409）。
+        let ok = match crate::reap::run_within(&mut kill, crate::reap::reap_within()) {
+            Ok(s) => s.success(),
+            Err(e) => {
+                eprintln!("TermRequest: {e}");
+                false
+            }
+        };
         if ok {
             RequestOutcome::Sent
         } else {
@@ -236,8 +242,7 @@ fn ack_timeout(exe: &Path) {
     let line = match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(r) => r.expect("ident"),
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
             panic!("helper did not print its identity line before the deadline");
         }
     };

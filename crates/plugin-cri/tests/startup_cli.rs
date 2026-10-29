@@ -2,13 +2,14 @@
 //!
 //! 絶対パスで起動し（PATH 探索なし）、環境は `env_clear()`。子の待機は期限つき（REPAIR-5）。
 
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[path = "support/reap.rs"]
+mod reap;
+
+use std::process::Command;
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const DEADLINE: Duration = Duration::from_secs(10);
-/// kill 後の回収の猶予。
-const REAP_GRACE: Duration = Duration::from_secs(5);
 
 struct Out {
     code: Option<i32>,
@@ -32,36 +33,9 @@ fn run_inner(args: &[&str], xdg: Option<std::path::PathBuf>) -> Out {
     if let Some(x) = xdg {
         cmd.env("XDG_RUNTIME_DIR", x);
     }
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn plugin binary");
-    let start = Instant::now();
-    loop {
-        if child.try_wait().expect("try_wait").is_some() {
-            break;
-        }
-        if start.elapsed() > DEADLINE {
-            let kill_result = child.kill();
-            // 回収も有限の猶予で行う（期限なしの wait は割り込み不能な待ちで無期限に止まる。REPAIR-5）。
-            let reap_start = Instant::now();
-            let mut reaped = false;
-            while reap_start.elapsed() < REAP_GRACE {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    reaped = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!(
-                "plugin binary did not exit within deadline (kill: {kill_result:?}, reaped: {reaped})"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let o = child.wait_with_output().expect("collect output");
+    // spawn・期限・出力回収を一括で期限つきにする。孫が pipe を持ち続けても戻る（REPAIR-5・#3409）。
+    let o =
+        reap::output_within(&mut cmd, DEADLINE).unwrap_or_else(|e| panic!("plugin binary: {e}"));
     Out {
         code: o.status.code(),
         stdout: String::from_utf8_lossy(&o.stdout).into_owned(),

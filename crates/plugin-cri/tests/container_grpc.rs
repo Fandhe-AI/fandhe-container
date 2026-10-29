@@ -28,6 +28,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::collections::HashMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -1202,10 +1205,10 @@ fn kill_and_collect_stderr(mut guard: ChildGuard) -> String {
 /// 停止シグナルを送って正常停止を待ち、終了コード 0 を確かめて stderr 全体を返す（全体の期限つき。#3226・REPAIR-5）。
 async fn terminate_and_collect_stderr(mut guard: ChildGuard, signal: &str) -> String {
     let pid = guard.0.id().to_string();
-    let sent = Command::new("kill")
-        .args(["-s", signal, &pid])
-        .status()
-        .expect("run kill");
+    let mut kill = Command::new("kill");
+    kill.args(["-s", signal, &pid]);
+    let sent = reap::run_within(&mut kill, reap::REAP_WITHIN)
+        .unwrap_or_else(|e| panic!("send SIG{signal} to plugin {pid}: {e}"));
     assert!(sent.success(), "kill -s {signal} {pid}");
     let start = Instant::now();
     let status = loop {

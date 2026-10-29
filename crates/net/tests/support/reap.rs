@@ -13,7 +13,10 @@
 //! 規則を変えるときは各試験の `timeout()` と合わせること。
 //! 取り込み元によって使う項目が異なるため、dead_code の許可は項目ごとに理由つきで付ける。
 
-use std::process::{Child, Command, ExitStatus};
+use std::fs::File;
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 子を kill し、`within` 以内に `try_wait()` で回収する。回収できない（期限切れ・`try_wait` の失敗）なら
@@ -106,6 +109,119 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
             } else {
                 Err(format!("{program}: {e}"))
             }
+        }
+    }
+}
+/// `output_within` が各出力ファイルから取り込む最大バイト数（上限を超えた分は読み捨てる）。
+const OUTPUT_CAP: u64 = 1 << 20;
+
+/// 一時ファイルの連番（同一プロセス内の `output_within` の呼び出し間で名前が衝突しないようにする）。
+static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 出力の受け皿にする一時ファイルを排他的に作る（`create_new`。既存名は連番を進めて作り直す）。
+fn create_output_file(tag: &str) -> Result<(File, std::path::PathBuf), String> {
+    let dir = std::env::temp_dir();
+    for _ in 0..1000 {
+        let n = OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("fc-reap-{}-{n}-{tag}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((f, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create output file {}: {e}", path.display())),
+        }
+    }
+    Err("create output file: too many name collisions".to_string())
+}
+
+/// 一時ファイルを `OUTPUT_CAP` まで読んで消す。
+fn drain_output_file(path: &std::path::Path) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Ok(f) = File::open(path) {
+        let _ = f.take(OUTPUT_CAP).read_to_end(&mut buf);
+    }
+    let _ = std::fs::remove_file(path);
+    buf
+}
+
+/// `spawn_captured` が作った出力の受け皿（一時ファイルの組）。`finish` で読んで消すか、`discard` で消す。
+pub struct Captured {
+    out_path: std::path::PathBuf,
+    err_path: std::path::PathBuf,
+}
+
+impl Captured {
+    /// 終了した子の出力を読み（各 `OUTPUT_CAP` まで）、一時ファイルを消して `Output` にする。
+    #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+    pub fn finish(self, status: ExitStatus) -> Output {
+        Output {
+            status,
+            stdout: drain_output_file(&self.out_path),
+            stderr: drain_output_file(&self.err_path),
+        }
+    }
+
+    /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。
+    #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.out_path);
+        let _ = std::fs::remove_file(&self.err_path);
+    }
+}
+
+/// `cmd` の stdin を null、stdout・stderr を一時ファイルへ向けて spawn する。子の終了待ちは呼び出し側が
+/// `wait_within` 等で行い、終了後に `Captured::finish` で出力を取り出す（子の実行中に診断を採りたい試験向け。
+/// 単純な場合は `output_within`）。spawn の失敗は `spawn <program> failed: <io error>`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub fn spawn_captured(cmd: &mut Command) -> Result<(Child, Captured), String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let (out_file, out_path) = create_output_file("out")?;
+    let (err_file, err_path) = match create_output_file("err") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(e);
+        }
+    };
+    let captured = Captured { out_path, err_path };
+    match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file))
+        .spawn()
+    {
+        Ok(child) => Ok((child, captured)),
+        Err(e) => {
+            captured.discard();
+            Err(format!("spawn {program} failed: {e}"))
+        }
+    }
+}
+
+/// `cmd` を spawn して `within` 以内の終了を待ち、stdout・stderr を返す（`Command::output()` /
+/// `wait_with_output()` の期限つき版。REPAIR-5・#3409）。stdin は null に固定する。
+/// stdout・stderr は pipe ではなく一時ファイルへ向けて、終了後にファイルから読む。pipe の EOF を待たないため、
+/// 子の終了後に孫が出力先を持ち続けても戻る（その孫が後で書いた分は取り込まない）。読み手スレッドも立てない
+/// ので、fork・`unshare`・`setns` を後に控えた単一スレッド前提の段でも使える。
+/// 期限切れは `<program> did not finish within <within>` で、子を kill して回収してから返す。取り込みは各
+/// `OUTPUT_CAP`（1 MiB）まで。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let (mut child, captured) = spawn_captured(cmd)?;
+    match wait_within(&mut child, within) {
+        Ok(status) => Ok(captured.finish(status)),
+        Err(e) => {
+            reap_or_report(&mut child, reap_within());
+            captured.discard();
+            Err(if e.contains("did not exit within") {
+                format!("{program} did not finish within {within:?}")
+            } else {
+                format!("{program}: {e}")
+            })
         }
     }
 }

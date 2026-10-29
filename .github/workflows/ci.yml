@@ -1773,7 +1773,7 @@ jobs:
           fi
           echo "ESE_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: exec_subordinate_e2e の実行（実機前提テスト・--ignored・委譲スコープ。SEC-5・CORE-6・SUP-6・SEC-1・SEC-4・#2835・#3291。重ねた bind mount の exec 拒否と監査 1 件を含む）
+      - name: exec_subordinate_e2e の実行（実機前提・--ignored・委譲スコープ。SEC-5・SEC-1・SEC-4・#2835・#3291）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |

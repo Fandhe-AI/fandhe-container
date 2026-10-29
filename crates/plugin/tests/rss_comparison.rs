@@ -10,6 +10,9 @@
 //! ここでは増加方向の下限だけを検査し、絶対値の比較は行わない（並列テストによる揺れを避ける）。
 //! RSS を読むテストは `RSS_LOCK` で直列化する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supported {
     use fandhe_container_plugin::{RssSource, rss};
@@ -338,7 +341,7 @@ mod supported {
             if Instant::now() >= deadline {
                 kill_process_group(&child);
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("subject ({condition}) did not finish before its deadline");
             }
             std::thread::sleep(Duration::from_millis(20));

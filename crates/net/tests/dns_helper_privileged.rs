@@ -188,7 +188,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -221,7 +221,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("dns_helper_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -510,7 +510,7 @@ mod linux {
                 match child.try_wait() {
                     Ok(Some(st)) => return Some(st.code().unwrap_or(1)),
                     Ok(None) if Instant::now() >= deadline => {
-                        crate::reap::reap_or_report(child, crate::reap::REAP_WITHIN);
+                        crate::reap::reap_or_report(child, crate::reap::reap_within());
                         return None;
                     }
                     Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -838,7 +838,7 @@ mod linux {
                 .spawn()
                 .map_err(|e| fail(format!("spawn measure helper: {e}")))?;
             let Some(stdout) = child.stdout.take() else {
-                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 return Err(fail("helper stdout unavailable"));
             };
             let (tx, rx) = mpsc::channel();

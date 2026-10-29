@@ -4,6 +4,10 @@
 //! 構造化エラー・計測を具体値で確認する。
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::sync::Mutex;
 
 use fandhe_container_gpu::cdi_spec::{
@@ -129,8 +133,7 @@ fn make_fifo(path: &Path) {
                 return;
             }
             None if start.elapsed() > MKFIFO_DEADLINE => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
                 panic!("mkfifo did not finish within {MKFIFO_DEADLINE:?}");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(10)),

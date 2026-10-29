@@ -391,6 +391,10 @@ fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
 #[path = "../../core/tests/support/scratch_root.rs"]
 mod scratch_root;
 
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[path = "support/reap.rs"]
+mod reap;
+
 /// 一意な一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る親で、
 /// 最後のフィールドのため `Drop` の削除の後に消える（#3026）。
 struct TmpDir(
@@ -1708,8 +1712,7 @@ impl FollowChild {
 #[cfg(target_os = "linux")]
 impl Drop for FollowChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        reap::reap_on_drop(&mut self.child);
     }
 }
 

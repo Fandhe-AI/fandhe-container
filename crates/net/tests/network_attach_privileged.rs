@@ -209,7 +209,7 @@ mod linux {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("network_attach_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -306,7 +306,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -580,7 +580,7 @@ mod linux {
             .spawn()
             .map_err(|e| fail(format!("spawn {mode}: {e}")))?;
         let Some(stdout) = child.stdout.take() else {
-            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
             return Err(fail("child stdout is not piped"));
         };
         let (tx, rx) = std::sync::mpsc::channel::<String>();

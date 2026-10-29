@@ -7,6 +7,9 @@
 //! 実行環境は unix のみ（非 unix では UDS 実体がないため中身は空でコンパイルされる）。
 #![cfg(unix)]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -72,7 +75,7 @@ fn wait_exit(mut child: Child) -> (i32, String) {
         }
         if start.elapsed() > WAIT {
             let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("plugin binary did not exit within deadline");
         }
         std::thread::sleep(Duration::from_millis(10));

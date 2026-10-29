@@ -259,7 +259,7 @@ mod linux {
             match child.try_wait().expect("wait router") {
                 Some(st) => std::process::exit(st.code().unwrap_or(1)),
                 None if Instant::now() >= deadline => {
-                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("nftables_paths_privileged: router did not finish before deadline");
                     std::process::exit(1);
                 }

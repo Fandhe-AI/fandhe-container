@@ -3,6 +3,9 @@
 //! 絶対パスで起動し（PATH 探索なし）、環境は `env_clear()` 後に必要分のみ渡す。
 //! 子の待機は期限つき（REPAIR-5）。期限超過は kill して失敗にする。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,7 +39,7 @@ fn run(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Out {
         }
         if start.elapsed() > DEADLINE {
             let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("plugin binary did not exit within deadline");
         }
         std::thread::sleep(Duration::from_millis(20));

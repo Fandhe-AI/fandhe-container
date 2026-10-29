@@ -8,6 +8,10 @@ use fandhe_container_gpu::cdi_apply::env::apply_cdi_env;
 use fandhe_container_gpu::cdi_edits::aggregate_container_edits;
 use fandhe_container_gpu::cdi_spec::parse_cdi_spec;
 
+#[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
 const NODE4: &str = include_str!("fixtures/poc14-node4.json");
 const DEVBOX02: &str = include_str!("fixtures/poc14-devbox02.json");
 
@@ -87,8 +91,7 @@ fn gpu2_task127_4_cdi_env_reaches_exec_child() {
             Some(st) => break st,
             None if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap::reap_or_report(&mut child, reap::REAP_WITHIN);
                 panic!("/usr/bin/env did not exit within {limit:?}");
             }
         }

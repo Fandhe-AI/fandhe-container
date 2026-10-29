@@ -146,6 +146,11 @@ pub mod sysctl;
 mod sys;
 #[cfg(test)]
 mod test_support;
+// 単体試験の一時領域を残骸・tmpfiles の flock 走査から守る共有部品（#3373・#2958・REPAIR-12）。
+// 試験専用で製品・rlib に影響しない。3 OS の試験（`oci_runtime::config` 等）から使う。
+#[cfg(test)]
+#[path = "../tests/support/scratch_root.rs"]
+mod scratch_root;
 pub mod tmpfs;
 pub mod traits;
 

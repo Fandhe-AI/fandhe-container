@@ -3416,9 +3416,11 @@ mod tests {
             return;
         }
         // 期限なしの `output()` は子が止まると試験ごと止まる(REPAIR-5)。出力は一時ファイルへ向け、期限つきで待つ。
-        let dir = std::env::temp_dir().join(format!("fandhe-nondumpable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("child.log");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-nondumpable",
+            std::time::Duration::from_secs(10),
+        );
+        let log = scratch.path().join("child.log");
         let file = std::fs::File::create(&log).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -3446,7 +3448,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         let output = std::fs::read_to_string(&log).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
         let status = status.unwrap_or_else(|| panic!("child timed out (killed)\n{output}"));
         assert!(status.success(), "{output}");
     }

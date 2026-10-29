@@ -599,8 +599,9 @@ mod tests {
     /// バイト数の上限を超えるファイルは `TooLarge`、上限ちょうどは読める。
     #[test]
     fn read_mountinfo_bounded_enforces_byte_limit() {
-        let dir = std::env::temp_dir().join(format!("fandhe-mi-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-mi", std::time::Duration::from_secs(10));
+        let dir = scratch.path().to_path_buf();
         let path = dir.join("mountinfo");
         let at_cap = usize::try_from(MOUNTINFO_MAX_BYTES).expect("cap");
         std::fs::write(&path, "a".repeat(at_cap)).expect("write");
@@ -612,15 +613,17 @@ mod tests {
             read_mountinfo_bounded(dir.join("none").to_str().expect("utf8")),
             Err(MountinfoReadError::Unreadable)
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// REPAIR-5（#1915）: `path_mount_id` は FIFO を開かず（ブロックせず）`None` を返す。通常ファイルは特定できる。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_path_mount_id_does_not_block_on_fifo() {
-        let dir = std::env::temp_dir().join(format!("fandhe-mi-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-mi-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().to_path_buf();
         let fifo = dir.join("f");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -632,7 +635,6 @@ mod tests {
         assert_eq!(path_mount_id(fifo.to_str().expect("utf8")), None);
         assert!(path_mount_id(file.to_str().expect("utf8")).is_some());
         assert!(path_mount_id(dir.to_str().expect("utf8")).is_some());
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// SEC-1（#1915）: 再帰 bind の公開範囲のデバイスに子マウントも含み、rbind でなければ含まない。

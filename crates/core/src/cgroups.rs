@@ -2209,7 +2209,11 @@ mod tests {
     ))]
     #[test]
     fn core3_task32_1_lookup_under_removed_dir_is_enoent() {
-        let base = std::env::temp_dir().join(format!("fc-cgroups-rm-{}", std::process::id()));
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fc-cgroups-rm",
+            std::time::Duration::from_secs(10),
+        );
+        let base = scratch.path().to_path_buf();
         std::fs::create_dir_all(base.join("child")).unwrap();
         std::fs::write(base.join("child").join("cgroup.events"), b"populated 0\n").unwrap();
         let parent = File::open(&base).unwrap();
@@ -2222,7 +2226,6 @@ mod tests {
         let err = sys::open_read_at(held.as_fd(), &events).unwrap_err();
         assert_eq!(err, SysError::Os(sys::ENOENT));
         assert!(removal_confirmed(&err));
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// CORE-3・TASK-32.1: errno から `ErrorCode` への写像。

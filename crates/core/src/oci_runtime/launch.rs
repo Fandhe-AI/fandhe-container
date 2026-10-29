@@ -1244,9 +1244,13 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-bundle-lock-inherit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 製品の `BundleLock` は `ScratchDir` 自身ではなくその子の bundle にかける（親の共有 flock と衝突させない。#3373）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-bundle-lock-inherit",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
+        std::fs::create_dir(&dir).expect("mkdir");
         let lock = BundleLock::acquire(&dir).expect("acquire");
         // 子の stdin へ同じ OFD の dup を渡し、fork 継承で fd が残る状況を模す。
         let dup = lock._file.try_clone().expect("dup");
@@ -1272,7 +1276,6 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(dup);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5: 上限は 0 と `START_TIMEOUT_MAX` 超過を拒否し、境界値は受理する。

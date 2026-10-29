@@ -15,7 +15,8 @@
 //! 集合の `oci_*` 等へ展開した。Linux 以外は `BundleLock`（Linux 限定）が無く競合しないため保護せず、親の排他作成
 //! だけを行う。bundle 等は必ず `ScratchDir::path()` の **子** に作る（親自体を製品がロックすると共有 flock と衝突する）。
 //!
-//! 取り込み方: core の試験は `#[path = "support/scratch_root.rs"]`、supervisor・cli の試験は
+//! 取り込み方: core の結合試験は `#[path = "support/scratch_root.rs"]`、core の単体試験は `src/lib.rs` が
+//! `#[path = "../tests/support/scratch_root.rs"]` で取り込む（#3373）。supervisor・cli の試験はsupervisor・cli の試験は
 //! `#[path = "../../core/tests/support/scratch_root.rs"]` で同じファイルを取り込む（複製しない。保護条件の
 //! 修正を 1 箇所に保つため。試験専用で製品コード・rlib には影響しない）。`remove_scratch_root` は作成した
 //! プロセスでだけ削除する。成功行の照合を乱さないよう標準出力へは何も出さず、失敗は panic（英語）で表す。

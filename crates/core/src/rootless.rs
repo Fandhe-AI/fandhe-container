@@ -2130,16 +2130,17 @@ mod tests {
         assert!(HelperPaths::new(Path::new("newuidmap"), Path::new("/usr/bin/newgidmap")).is_err());
         // 一時ファイルは呼び出しユーザー所有（root 所有ではない）ため拒否される。
         if sys::effective_uid() != 0 {
-            let dir = std::env::temp_dir().join(format!("fandhe-rootless-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("mkdir");
-            let f = dir.join("helper");
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fandhe-rootless",
+                std::time::Duration::from_secs(10),
+            );
+            let f = scratch.path().join("helper");
             std::fs::write(&f, b"x").expect("write");
             let e = HelperPaths::new(&f, &f).expect_err("not root owned");
             assert_eq!(
                 (e.code, e.stage),
                 (ErrorCode::PermissionDenied, RootlessStage::ResolveHelper)
             );
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -2153,17 +2154,17 @@ mod tests {
         // /usr/bin/env は root 所有だが、親が非 root のディレクトリへ置いた場合の拒否を
         // 一時ディレクトリ配下の通常ファイルで確認する（ファイル自体も非 root のため
         // ResolveHelper 段で PermissionDenied になる）。
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-rootless-parent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let f = dir.join("helper");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-rootless-parent",
+            std::time::Duration::from_secs(10),
+        );
+        let f = scratch.path().join("helper");
         std::fs::write(&f, b"x").expect("write");
         let e = check_helper(&f).expect_err("non-root parent");
         assert_eq!(
             (e.code, e.stage),
             (ErrorCode::PermissionDenied, RootlessStage::ResolveHelper)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

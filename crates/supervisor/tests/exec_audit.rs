@@ -42,8 +42,9 @@ mod linux {
         StateRevision, TraitError,
     };
     use fandhe_container_supervisor::exec::{
-        ExecOutcome, ExecRequest, default_audit_sink, pin_exec_bundle_with_swap_for_test,
-        run_command, run_in_worker_audited_for_test, run_in_worker_trait_audited_for_test,
+        ExecOutcome, ExecRequest, TestWorkerError, default_audit_sink,
+        pin_exec_bundle_with_swap_for_test, run_command, run_in_worker_audited_for_test,
+        run_in_worker_trait_audited_for_test,
     };
 
     pub fn run() {
@@ -173,6 +174,8 @@ mod linux {
         assert_eq!(recs[0].pid().get(), std::process::id());
         // #1618: pid は記録した親プロセスのもの。対象のコンテナは検証済みの ID で示す。
         assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+        // #3294: worker の `err` 行で届いた段（`ExecError::stage`）が記録の `stage` に載る。
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("set_ns"));
     }
 
     /// 0700 の使い捨てディレクトリ（状態ルートとして使う。`FileAuditSink` の親ディレクトリ検査を満たす）。
@@ -259,7 +262,10 @@ mod linux {
             line.contains(&format!("\"pid\":{}", std::process::id())),
             "{line}"
         );
-        assert!(line.ends_with("\"container_id\":\"c1\"}"), "{line}");
+        assert!(
+            line.ends_with("\"container_id\":\"c1\",\"stage\":\"set_ns\"}"),
+            "{line}"
+        );
 
         let second =
             run_command(&record, &req, Duration::from_secs(30), &sink).expect_err("rejected");
@@ -344,6 +350,8 @@ mod linux {
         assert_eq!(recs[0].syscall(), None);
         assert_eq!(recs[0].pid().get(), std::process::id());
         assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+        // #3294: `ExecError::stage` が `err` 行を経て記録の `stage` に載る。
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("validate"));
 
         // 記録の失敗で拒否は覆らない（fail-closed）。
         let failing = VecSink::new(true);
@@ -374,10 +382,9 @@ mod linux {
                 line.contains(&format!("\"pid\":{}", std::process::id())),
                 "{line}"
             );
-            assert!(line.ends_with("\"container_id\":\"c1\"}"), "{line}");
             assert!(
                 line.ends_with(
-                    "\"path_original_len\":null,\"reason\":\"rootfs_is_host_root\",\"container_id\":\"c1\"}"
+                    "\"path_original_len\":null,\"reason\":\"rootfs_is_host_root\",\"container_id\":\"c1\",\"stage\":\"validate\"}"
                 ),
                 "{line}"
             );
@@ -412,7 +419,7 @@ mod linux {
     ) -> fandhe_container_core::audit_log::AuditedRejection<TraitError> {
         run_in_worker_trait_audited_for_test(
             Duration::from_secs(30),
-            || -> Result<ExecOutcome, TraitError> {
+            || -> Result<ExecOutcome, TestWorkerError> {
                 pin_exec_bundle_with_swap_for_test(bundle, || {
                     std::fs::remove_dir(bundle.join("rootfs")).expect("remove rootfs");
                     if to_symlink {
@@ -454,6 +461,8 @@ mod linux {
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
             assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+            // #3294: 固定の呼び出し点の段 `Validate`。
+            assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("validate"));
         }
     }
 
@@ -473,7 +482,7 @@ mod linux {
             assert!(line.contains("\"path\":null"), "{line}");
             assert!(
                 line.ends_with(
-                    "\"path_original_len\":null,\"reason\":\"path_symlink_or_not_directory\",\"container_id\":\"c1\"}"
+                    "\"path_original_len\":null,\"reason\":\"path_symlink_or_not_directory\",\"container_id\":\"c1\",\"stage\":\"validate\"}"
                 ),
                 "{line}"
             );

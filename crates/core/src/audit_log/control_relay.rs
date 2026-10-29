@@ -31,7 +31,7 @@
 //!   helper を SIGKILL して以後の `record` を `Unavailable` で拒否する（ずれた応答を次の要求へ取り違えない。fail-closed）。
 //!   拒否の判定自体は呼び出し側で既に確定しており、本中継の失敗は判定を覆さない
 //! - 親が終了すると socketpair が EOF になり helper も終了する。drop でも SIGKILL して回収を試みる
-//! - [`ControlAuditRelay::spawn_ignoring_stop_signals`]（#3300）の helper は SIGTERM・SIGINT を無視する（グループ・cgroup 宛ての
+//! - [`ControlAuditRelay::spawn_ignoring_stop_signals`]（#3300。plugin-cri と supervisor が使う〔#3415〕）の helper は SIGTERM・SIGINT を無視する（グループ・cgroup 宛ての
 //!   停止で先に死なない）。終わるのは本体の終了（EOF）か SIGKILL のとき。本体が死んだ後の残存は最悪 [`RECORD_WAIT_LIMIT`]
 //!
 //! # 未実装（REPAIR-3）
@@ -587,7 +587,8 @@ impl ControlAuditRelay {
     /// `sink` を持つ helper を fork する。呼び出しプロセスが複数スレッドなら `FailedPrecondition`。
     /// fork 直後に未回収の自分の子と確認できなければ `Unavailable`（pid を保持しない）。
     ///
-    /// 呼び出し元: supervisor の `start`（制御チャネルの `install` の前、スレッドを作る前）。
+    /// 本番の呼び出し元は無い（supervisor・plugin-cri とも停止シグナルを無視する [`ControlAuditRelay::spawn_ignoring_stop_signals`]
+    /// を使う。#3415）。停止シグナルで死んでよい用途（試験）向け。
     pub fn spawn(sink: FileAuditSink) -> Result<Self, TraitError> {
         Self::spawn_inner(sink, false)
     }
@@ -601,7 +602,8 @@ impl ControlAuditRelay {
     /// helper は exec しない（`SIG_IGN` はコンテナ内のコマンドへ持ち込まれない）。helper の子（`FileAuditSink` の隔離の
     /// 子）も無視を継承するが、期限と SIGKILL で回収される。
     ///
-    /// 呼び出し元: plugin-cri の `open_audit_relay_in`。supervisor は従来の `spawn` のまま（挙動を変えない）。
+    /// 呼び出し元: plugin-cri の `open_audit_relay_in` と supervisor の `open_control_audit_relay`（#3415）。supervisor は
+    /// 本体が停止シグナルのハンドラを持たず即座に死ぬため、守れるのは到着時に helper が書いている途中の 1 件に限る。
     pub fn spawn_ignoring_stop_signals(sink: FileAuditSink) -> Result<Self, TraitError> {
         Self::spawn_inner(sink, true)
     }

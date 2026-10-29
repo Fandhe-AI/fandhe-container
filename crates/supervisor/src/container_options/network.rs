@@ -62,6 +62,9 @@ pub const PASTA_DEFAULT_NAMESERVER: &str = "169.254.1.1";
 const NAMED_DNS_LOOPBACK_MESSAGE: &str =
     "dns on a user-defined network must not be a loopback address";
 
+/// ユーザー定義名の `--dns` に IPv6 を指定したときの固定拒否文言(pasta 構成は IPv4 専用。NET-9)。
+const NAMED_DNS_IPV6_MESSAGE: &str = "dns on a user-defined network must be an IPv4 address";
+
 const NAMED_NOT_WIRED_MESSAGE: &str = "user-defined networks are not wired to the launch path yet";
 
 /// `--network` の検証済みの選択(NET-6)。
@@ -164,9 +167,15 @@ impl NetworkOptions {
             ResolvConfPlan::for_mode(mode, &raw).map_err(|e| net_error_to_trait(&e))?;
         }
         // pasta 構成の `--dns` は resolv.conf の nameserver になる。コンテナの netns の loopback は resolver ではない(D1)。
-        if matches!(selection, Some(NetworkSelection::Named(_)))
-            && addrs.iter().any(is_loopback_like)
-        {
+        let named = matches!(selection, Some(NetworkSelection::Named(_)));
+        // pasta 構成は常に `-4`(IPv4 専用。NET-9)。IPv6 の nameserver だけでは名前解決できないため受けない。
+        if named && addrs.iter().any(IpAddr::is_ipv6) {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                NAMED_DNS_IPV6_MESSAGE,
+            ));
+        }
+        if named && addrs.iter().any(is_loopback_like) {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 NAMED_DNS_LOOPBACK_MESSAGE,
@@ -351,9 +360,29 @@ mod tests {
         ] {
             assert_eq!(code(p(Some("web"), &[], &[bad])), INV, "{bad}");
         }
-        for ok in ["169.254.1.1", "1.1.1.1", "192.0.2.53", "2001:db8::53"] {
+        for ok in ["169.254.1.1", "1.1.1.1", "192.0.2.53"] {
             assert_eq!(code(p(Some("web"), &[], &[ok])), None, "{ok}");
         }
+    }
+
+    /// NET-9・NET-12: ユーザー定義名(pasta 構成は IPv4 専用)の --dns は IPv6 を拒否し、IPv4 は受理する。
+    /// none / host の --dns は従来どおり IPv6 を受ける。
+    #[test]
+    fn net9_named_dns_rejects_ipv6_and_accepts_ipv4() {
+        for bad in ["2001:db8::53", "fe80::1", "::ffff:1.1.1.1"] {
+            let e = p(Some("web"), &[], &[bad]).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(
+                e.message(),
+                "dns on a user-defined network must be an IPv4 address"
+            );
+        }
+        // 1 件でも IPv6 が混じれば拒否する。
+        assert_eq!(code(p(Some("web"), &[], &["1.1.1.1", "2001:db8::53"])), INV);
+        for ok in ["1.1.1.1", "169.254.1.1", "192.0.2.53"] {
+            assert_eq!(code(p(Some("web"), &[], &[ok])), None, "{ok}");
+        }
+        assert_eq!(code(p(Some("host"), &[], &["2001:db8::53"])), None);
     }
 
     /// NET-6・D1: `--network` の判定表。

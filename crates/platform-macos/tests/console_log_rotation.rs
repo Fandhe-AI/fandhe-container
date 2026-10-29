@@ -22,6 +22,8 @@ impl Dir {
     fn new(tag: &str) -> Self {
         let dir =
             std::env::temp_dir().join(format!("fandhe-console-rot-{tag}-{}", std::process::id()));
+        // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create dir");
         let dir = std::fs::canonicalize(&dir).expect("canonicalize");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");

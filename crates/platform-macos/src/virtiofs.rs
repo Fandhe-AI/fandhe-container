@@ -320,6 +320,8 @@ mod tests {
                 "fandhe-macos-virtiofs-{tag}-{}",
                 std::process::id()
             ));
+            // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_dir_all(&raw);
             std::fs::create_dir_all(&raw).expect("create temp dir");
             Self(std::fs::canonicalize(&raw).expect("canonicalize temp dir"))
         }

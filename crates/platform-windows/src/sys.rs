@@ -811,6 +811,14 @@ mod windows {
         use std::path::{Path, PathBuf};
 
         struct TmpDir(PathBuf);
+        impl TmpDir {
+            /// 前回の残骸（古い DACL・整合性ラベル・ADS 付きのファイル）を消した状態の名前を返す。
+            /// 実体の作成は呼び出し側が行う（REPAIR-12・#3375）。
+            fn fresh(p: PathBuf) -> Self {
+                let _ = std::fs::remove_dir_all(&p);
+                Self(p)
+            }
+        }
         impl Drop for TmpDir {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
@@ -832,8 +840,9 @@ mod windows {
         /// （icacls の出力が一致する）。
         #[test]
         fn copy_security_reproduces_dacl_and_integrity_label() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-dacl-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-dacl-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("src"), b"x").expect("write src");
             std::fs::write(d.0.join("dst"), b"y").expect("write dst");
@@ -861,8 +870,9 @@ mod windows {
         /// WIN-2: 同じファイルを別々に開いたハンドルの `file_id` は一致し、別ファイルとは一致しない。
         #[test]
         fn file_id_identifies_the_same_file() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-fileid-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-fileid-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("a"), b"x").expect("write a");
             std::fs::write(d.0.join("b"), b"x").expect("write b");
@@ -896,8 +906,9 @@ mod windows {
         /// 再現できないため `Err`（PermissionDenied）。
         #[test]
         fn copy_security_rejects_inherited_label_mismatch() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-label-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-label-{}", std::process::id())),
+            );
             let plain = d.0.join("plain");
             let labeled = d.0.join("labeled");
             std::fs::create_dir_all(&plain).expect("mkdir plain");
@@ -921,8 +932,9 @@ mod windows {
         /// WIN-2: 同じファイルの SD スナップショットは一致し、DACL を変えると変わる。
         #[test]
         fn security_snapshot_detects_dacl_change() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-snap-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-snap-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("f"), b"x").expect("write");
             let f = File::open(d.0.join("f")).expect("open");
@@ -937,8 +949,9 @@ mod windows {
         /// トークンでは監査 SACL を観測できず `None`、観測できれば `Some(false)`）。
         #[test]
         fn has_unpreservable_sacl_without_entries_is_not_true() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-sacl-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-sacl-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("f"), b"x").expect("write");
             let f = File::open(d.0.join("f")).expect("open");
@@ -992,9 +1005,28 @@ mod windows {
         }
 
         /// WIN-2（レビュー指摘 P1）: 名前付きストリームの有無を検出する。
+        /// WIN-4・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと中身）があっても `TmpDir::fresh` が
+        /// 取り除き、drop で消える。
+        #[test]
+        fn win4_repair12_tmp_dir_fresh_clears_stale_residue() {
+            let p =
+                std::env::temp_dir().join(format!("fc-sys-stale-residue-{}", std::process::id()));
+            std::fs::create_dir_all(p.join("old")).expect("stale dir");
+            std::fs::write(p.join("old").join("f"), b"x").expect("stale file");
+            {
+                let d = TmpDir::fresh(p.clone());
+                assert!(!d.0.exists());
+                std::fs::create_dir_all(&d.0).expect("mkdir");
+                assert_eq!(std::fs::read_dir(&d.0).expect("read_dir").count(), 0);
+            }
+            assert!(!p.exists());
+        }
+
         #[test]
         fn has_named_streams_detects_alternate_data_stream() {
-            let d = TmpDir(std::env::temp_dir().join(format!("fc-sys-ads-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-ads-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             // 1 文字の名前に `:` を続けると `Path::join` がドライブ指定（`f:`）と解釈するため、2 文字以上の名前を使う。
             std::fs::write(d.0.join("data"), b"x").expect("write");
@@ -1008,8 +1040,9 @@ mod windows {
         /// WIN-2: WRITE_DAC なしで開いた宛先には写せず `Err`（失敗を握りつぶさない）。
         #[test]
         fn copy_security_without_write_dac_fails() {
-            let d =
-                TmpDir(std::env::temp_dir().join(format!("fc-sys-nodac-{}", std::process::id())));
+            let d = TmpDir::fresh(
+                std::env::temp_dir().join(format!("fc-sys-nodac-{}", std::process::id())),
+            );
             std::fs::create_dir_all(&d.0).expect("mkdir");
             std::fs::write(d.0.join("src"), b"x").expect("write src");
             std::fs::write(d.0.join("dst"), b"y").expect("write dst");
@@ -1305,6 +1338,8 @@ mod unix {
         #[test]
         fn security_labels_match_for_siblings() {
             let d = std::env::temp_dir().join(format!("fc-sys-label-{}", std::process::id()));
+            // 前回の残骸（古いラベルのファイル）を消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).expect("mkdir");
             std::fs::write(d.join("a"), b"x").expect("write a");
             std::fs::write(d.join("b"), b"y").expect("write b");
@@ -1324,6 +1359,8 @@ mod unix {
         #[test]
         fn plain_file_has_no_extended_acl() {
             let p = std::env::temp_dir().join(format!("fc-sys-noacl-{}", std::process::id()));
+            // 前回の ACL つきの残骸を消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_file(&p);
             std::fs::write(&p, b"x").expect("write");
             let r = has_extended_acl(&File::open(&p).expect("open"));
             let _ = std::fs::remove_file(&p);
@@ -1334,6 +1371,8 @@ mod unix {
         #[test]
         fn file_with_acl_entry_is_detected() {
             let p = std::env::temp_dir().join(format!("fc-sys-acl-{}", std::process::id()));
+            // 前回の ACL つきの残骸を消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_file(&p);
             std::fs::write(&p, b"x").expect("write");
             add_test_acl(&p);
             let r = has_extended_acl(&File::open(&p).expect("open"));

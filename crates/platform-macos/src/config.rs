@@ -2760,6 +2760,8 @@ mod tests {
         fn new(tag: &str) -> Self {
             let dir =
                 std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
+            // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("create temp dir");
             // macOS の一時ディレクトリ（/var/folders/...）は /private/var への symlink を含み、共有ディレクトリの
             // symlink 拒否検証（SharedDirSymlink）に掛かるため、正規化済みパスを使う。
@@ -2792,6 +2794,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// MAC-1・REPAIR-12(#3375): 同じ tag の前回の残骸（古いファイル）が残っていても `TempDir::new` が
+    /// 空のディレクトリを返し、drop で消える。
+    #[test]
+    fn mac1_repair12_temp_dir_clears_stale_residue() {
+        let stale = std::env::temp_dir().join(format!(
+            "fandhe-macos-cfg-stale-residue-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(stale.join("old")).expect("stale dir");
+        std::fs::write(stale.join("old.txt"), b"x").expect("stale file");
+        let path = {
+            let t = TempDir::new("stale-residue");
+            assert_eq!(std::fs::read_dir(&t.0).expect("read_dir").count(), 0);
+            t.0.clone()
+        };
+        assert!(!path.exists());
     }
 
     /// MAC-1・TASK-64.2: 正常な 3 入力で仕様が組み立てられ、既定の CPU・メモリが入る。

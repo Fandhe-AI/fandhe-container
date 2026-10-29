@@ -64,8 +64,9 @@ use super::publish::{PortProtocol, PortPublish};
 use crate::error::{NetError, NetErrorCode};
 use crate::nftables_batch::NftName;
 use crate::nftables_rules::{
-    DumpedRule, NFT_NAT_DNAT, NFT_NAT_SNAT, NFTA_NAT_TYPE, NftCmp, NftCmpOp, NftExpr, NftImmediate,
-    NftPayload, NftRuleExprs, PayloadBase,
+    DumpedRule, NFT_NAT_DNAT, NFT_NAT_SNAT, NFT_REG_1, NFT_REG32_00, NFTA_NAT_REG_ADDR_MAX,
+    NFTA_NAT_REG_ADDR_MIN, NFTA_NAT_TYPE, NftBitwise, NftCmp, NftCmpOp, NftExpr, NftImmediate,
+    NftPayload, NftRegister, NftRuleExprs, PayloadBase,
 };
 
 /// GETTABLE dump で受け取る ipv4 テーブルの総数の上限。
@@ -278,34 +279,105 @@ pub(crate) fn recognize_dnat_listener(
     }))
 }
 
-/// DNAT ルールの転送先アドレス（`immediate` の 4 バイト値）を返す。DNAT でないルールは `None`。
+/// レジスタ領域内のバイト範囲（16 バイト幅の `NFT_REG_1..` と 32bit の `NFT_REG32_00..` は同じ領域を共有する）。
+fn reg_span(reg: NftRegister, len: usize) -> std::ops::Range<usize> {
+    let w = reg.wire_value();
+    let start = if w < NFT_REG32_00 {
+        w.saturating_sub(NFT_REG_1).saturating_mul(16)
+    } else {
+        (w - NFT_REG32_00).saturating_mul(4)
+    } as usize;
+    start..start.saturating_add(len)
+}
+
+fn spans_overlap(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// nat より前の式列を遡り、レジスタ `reg` の 4 バイトへ最後に書いた式が `immediate` であることを証明して
+/// その値を返す。間に同じ領域を書き換える式（payload・bitwise）や、書き込みの有無を判定できない式が
+/// あれば `FailedPrecondition`（fail-closed。NET-1・NET-3・SEC-1・#3346）。
+fn proven_immediate(before_nat: &[NftExpr], reg: NftRegister) -> Result<Ipv4Addr, NetError> {
+    let target = reg_span(reg, 4);
+    let mut value: Option<Ipv4Addr> = None;
+    for e in before_nat {
+        match e.name().as_str() {
+            "immediate" => {
+                let imm = NftImmediate::from_expr(e).map_err(|_| unrecognized())?;
+                let span = reg_span(imm.dreg(), imm.data().as_bytes().len());
+                if !spans_overlap(&span, &target) {
+                    continue;
+                }
+                value = match <[u8; 4]>::try_from(imm.data().as_bytes()) {
+                    Ok(o) if span == target => Some(Ipv4Addr::from(o)),
+                    _ => None,
+                };
+            }
+            PAYLOAD_EXPR => {
+                let p = NftPayload::from_expr(e).map_err(|_| unrecognized())?;
+                if spans_overlap(&reg_span(p.dreg(), p.byte_len() as usize), &target) {
+                    value = None;
+                }
+            }
+            "bitwise" => {
+                let b = NftBitwise::from_expr(e).map_err(|_| unrecognized())?;
+                if spans_overlap(&reg_span(b.dreg(), b.byte_len()), &target) {
+                    value = None;
+                }
+            }
+            // レジスタを書かない式。
+            CMP_EXPR | "counter" => {}
+            _ => return Err(unrecognized()),
+        }
+    }
+    value.ok_or_else(unrecognized)
+}
+
+/// DNAT ルールの転送先アドレスを返す。DNAT でないルールは `None`。
 ///
-/// 転送先を読めない DNAT（4 バイトの immediate が無い・複数ある）は `FailedPrecondition` で fail-closed にする。
+/// nat 式が参照するアドレスレジスタ（`NFTA_NAT_REG_ADDR_MIN`・あれば `MAX`）を読み、そのレジスタへ最後に
+/// 書き込んだ式が `immediate` であると式の並びから証明できた場合に限りその値を転送先とする。証明できない
+/// 並び（途中の上書き・別レジスタの参照・nat が複数・未知の式）は `FailedPrecondition` で fail-closed にする。
 /// 掃除（アドレスの解放）が「そのアドレス宛ての DNAT が残っていない」ことを直接確かめるために使う
-/// （受け口と本数だけでは別メンバーの DNAT と区別できない。NET-3・SEC-1・#3346）。
+/// （受け口と本数だけでは別メンバーの DNAT と区別できない。NET-1・NET-3・SEC-1・#3346）。
 // reconcile（Linux 限定）のみが使う。他 OS の非 test ビルドでは未使用。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn recognize_dnat_target(exprs: &NftRuleExprs) -> Result<Option<Ipv4Addr>, NetError> {
-    let mut has_dnat = false;
-    for e in exprs.exprs() {
+    let all = exprs.exprs();
+    let mut nat_idx: Option<usize> = None;
+    for (i, e) in all.iter().enumerate() {
         if e.name().as_str() == NAT_EXPR && is_dnat(e)? {
-            has_dnat = true;
+            if nat_idx.is_some() {
+                return Err(unrecognized());
+            }
+            nat_idx = Some(i);
         }
     }
-    if !has_dnat {
+    let Some(i) = nat_idx else {
         return Ok(None);
-    }
-    let mut target: Option<Ipv4Addr> = None;
-    for e in exprs.exprs() {
-        if e.name().as_str() != "immediate" {
-            continue;
+    };
+    let (Some(nat), Some(before)) = (all.get(i), all.get(..i)) else {
+        return Err(unrecognized());
+    };
+    let reg_attr = |ty: u16| -> Result<Option<NftRegister>, NetError> {
+        match nat.data().iter().find(|a| a.attr_type() == ty) {
+            None => Ok(None),
+            Some(a) => {
+                let w = a.as_u32_be().ok_or_else(unrecognized)?;
+                NftRegister::from_wire(w)
+                    .map(Some)
+                    .map_err(|_| unrecognized())
+            }
         }
-        let imm = NftImmediate::from_expr(e).map_err(|_| unrecognized())?;
-        if let Ok(o) = <[u8; 4]>::try_from(imm.data().as_bytes()) {
-            set_once(&mut target, Ipv4Addr::from(o))?;
-        }
+    };
+    let min = reg_attr(NFTA_NAT_REG_ADDR_MIN)?.ok_or_else(unrecognized)?;
+    let target = proven_immediate(before, min)?;
+    if let Some(max) = reg_attr(NFTA_NAT_REG_ADDR_MAX)?
+        && proven_immediate(before, max)? != target
+    {
+        return Err(unrecognized());
     }
-    target.map(Some).ok_or_else(unrecognized)
+    Ok(Some(target))
 }
 
 fn exhausted(msg: &'static str) -> NetError {
@@ -419,9 +491,8 @@ mod tests {
     use crate::netlink::NlMsgBuilder;
     use crate::nftables_batch::{NFGENMSG_LEN, NfGenMsg, NftFamily};
     use crate::nftables_rules::{
-        NFTA_NAT_FAMILY, NFTA_NAT_FLAGS, NFTA_NAT_REG_ADDR_MIN, NFTA_NAT_REG_PROTO_MIN,
-        NFTA_RULE_CHAIN, NFTA_RULE_TABLE, NftDataValue, NftExprAttr, NftExprName, NftImmediate,
-        NftMasq, NftNat, NftRegister,
+        NFTA_NAT_FAMILY, NFTA_NAT_FLAGS, NFTA_NAT_REG_PROTO_MIN, NFTA_RULE_CHAIN, NFTA_RULE_TABLE,
+        NftDataValue, NftExprAttr, NftExprName, NftMasq, NftNat,
     };
 
     fn name(s: &str) -> NftName {
@@ -548,6 +619,86 @@ mod tests {
         let exprs =
             crate::network::masquerade::masquerade_rule_exprs(&gateway, &bridge).expect("exprs");
         assert_eq!(recognize_dnat_listener(&exprs).expect("ok"), None);
+    }
+
+    /// DNAT の expr 列を組み直す。`edit` が (index, expr) ごとに差し替え・挿入を決める。
+    fn rebuilt(p: &PortPublish, f: impl Fn(&NftExpr) -> Vec<NftExpr>) -> NftRuleExprs {
+        let mut out = NftRuleExprs::new();
+        for e in kernel_shaped(p).exprs() {
+            for x in f(e) {
+                out.push(x).expect("push");
+            }
+        }
+        out
+    }
+
+    /// NET-1・NET-3・SEC-1・#3346: immediate の直後に nat する正常な並びは転送先を返す。
+    #[test]
+    fn net3_dnat_target_from_immediate_then_nat() {
+        let p = port(PortProtocol::Tcp, [192, 0, 2, 10], 8080);
+        assert_eq!(
+            recognize_dnat_target(&kernel_shaped(&p)).expect("ok"),
+            Some(Ipv4Addr::new(10, 0, 0, 2))
+        );
+        let masq = {
+            let mut e = NftRuleExprs::new();
+            e.push(NftMasq::new().to_expr().expect("m")).expect("push");
+            e
+        };
+        assert_eq!(recognize_dnat_target(&masq).expect("ok"), None);
+    }
+
+    /// NET-1・NET-3・SEC-1・#3346: immediate 10.0.0.9 の後に bitwise（mask=0・xor=10.0.0.2）で同じレジスタを
+    /// 上書きする並びは、見かけの immediate を転送先にせず拒否する。
+    #[test]
+    fn net3_dnat_target_rejects_bitwise_overwrite() {
+        let p = port(PortProtocol::Tcp, [192, 0, 2, 10], 8080);
+        let r1 = NftRegister::REG_1;
+        let exprs = rebuilt(&p, |e| {
+            let is_addr_imm = e.name().as_str() == "immediate"
+                && NftImmediate::from_expr(e).is_ok_and(|i| i.data().as_bytes().len() == 4);
+            if is_addr_imm {
+                let imm = NftImmediate::ipv4_addr(r1, Ipv4Addr::new(10, 0, 0, 9)).expect("i");
+                let bw = NftBitwise::mask_xor(
+                    r1,
+                    r1,
+                    NftDataValue::new(&[0, 0, 0, 0]).expect("m"),
+                    NftDataValue::new(&[10, 0, 0, 2]).expect("x"),
+                )
+                .expect("bw");
+                vec![imm.to_expr().expect("e"), bw.to_expr().expect("e")]
+            } else {
+                vec![e.clone()]
+            }
+        });
+        let err = recognize_dnat_target(&exprs).expect_err("reject");
+        assert_eq!(err.code(), NetErrorCode::FailedPrecondition);
+    }
+
+    /// NET-1・NET-3・SEC-1・#3346: nat が immediate の書いていない別レジスタを参照する並びは拒否する。
+    #[test]
+    fn net3_dnat_target_rejects_nat_on_other_register() {
+        let p = port(PortProtocol::Tcp, [192, 0, 2, 10], 8080);
+        let r3 = NftRegister::REG_3.wire_value();
+        let exprs = rebuilt(&p, |e| {
+            if e.name().as_str() == NAT_EXPR {
+                vec![
+                    NftExpr::new(
+                        NftExprName::new(NAT_EXPR).expect("n"),
+                        vec![
+                            NftExprAttr::u32_be(NFTA_NAT_TYPE, NFT_NAT_DNAT).expect("a"),
+                            NftExprAttr::u32_be(NFTA_NAT_FAMILY, 2).expect("a"),
+                            NftExprAttr::u32_be(NFTA_NAT_REG_ADDR_MIN, r3).expect("a"),
+                        ],
+                    )
+                    .expect("nat"),
+                ]
+            } else {
+                vec![e.clone()]
+            }
+        });
+        let err = recognize_dnat_target(&exprs).expect_err("reject");
+        assert_eq!(err.code(), NetErrorCode::FailedPrecondition);
     }
 
     /// NET-3: SNAT は DNAT ではないので無視する。

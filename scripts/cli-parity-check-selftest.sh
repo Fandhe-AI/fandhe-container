@@ -9,9 +9,14 @@
 # ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）。make ci には含めない。
 # 失敗は `FAIL:` 行を出し、最後に非 0 で終了する。bash 3.2 以上で動く。
 #
-# 構成: capture は 40 本強を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
+# 構成: capture は約 20 本を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
 # CI の時間枠を圧迫するため。同時実行の負荷は、CLI が即座に終わるときの監視サブシェル停止の競合
-# （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない。
+# （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない
+# （本数を減らした分、この副次効果は弱まる。アサーションは減らしていない）。
+# inspect（B17）・state（B26）の fixture は、1 行を照合するだけのために 84 ケースを流す capture を避け、
+# compare や漏えい検査に使う full / order の 2 種ずつ（計 4 本）だけを capture（e2e）に残す。残りは
+# cli-parity-check.sh を source して norm_stdout を関数境界で呼び、同じ期待文字列を照合する（#3299）。
+# 関数境界の結果が e2e の capture と一致することも full で照合する。
 set -uo pipefail
 selftest_t0=$SECONDS
 
@@ -502,6 +507,17 @@ line_of() { # <名前> <case id>
   done <"$work/$1.txt"
   printf '%s' "$found"
 }
+norm_of() { # <i|o> <fixture 名>。関数境界の正規化結果（stdout 欄）
+  local k="$1" n="$2" line found=""
+  [ -f "$work/norm.txt" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in "$k$tab$n$tab"*) found="${line#"$k$tab$n$tab"}" ;; esac
+  done <"$work/norm.txt"
+  printf '%s' "$found"
+}
+expect_norm() { # <表示名> <i|o> <fixture 名> <期待する stdout 欄>
+  expect_eq "$1" "$4" "$(norm_of "$2" "$3")"
+}
 expect_line() { # <表示名> <名前> <期待する行>
   expect_eq "$1" "$3" "$(line_of "$2" "${3%%"$tab"*}")"
 }
@@ -540,13 +556,30 @@ STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
 STUB_OUT_DIR="$outdir" start_capture outtable ok
 insp_names="full rofalse noro badro extrarw order extra missing nolf crlf twolines badcap badstr big lead0pid lead0ext lead0cg besteffort empty"
-for n in $insp_names; do
-  STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
-done
 state_names="full withann missing extra order notjson nolf crlf twolines lead0pid badann badstr empty"
-for n in $state_names; do
+# e2e の capture に残すのは compare・漏えい検査が読む full / order だけ。他は関数境界で照合する。
+for n in full order; do
+  STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
   STUB_STATE_DIR="$statedir/$n" start_capture "state_$n" ok
 done
+# 関数境界の照合: 製品スクリプトを source し、fixture の out を norm_stdout へ直接渡す（capture と同じ
+# set -euo pipefail の下。サブシェルに閉じ、製品の set -e / LC_ALL を自己テスト本体へ漏らさない）。
+(
+  # shellcheck source=/dev/null # 製品スクリプトは追跡しない（変数の型を取り違えるため）
+  . "$target"
+  for n in $insp_names; do
+    tmp_dir="$inspdir/$n"
+    run_exit=0
+    norm_stdout i
+    printf 'i%s%s%s%s\n' "$tab" "$n" "$tab" "$norm_stdout_out"
+  done
+  for n in $state_names; do
+    tmp_dir="$statedir/$n"
+    run_exit=0
+    norm_stdout o
+    printf 'o%s%s%s%s\n' "$tab" "$n" "$tab" "$norm_stdout_out"
+  done
+) >"$work/norm.txt" 2>"$work/norm.err" &
 # sigdel: 連鎖中の delete（m1）で 1 回目の TERM、後始末中の delete（m2）で 2 回目の TERM を送る。
 wait_for_file() { # <パス>。最大 60 秒
   local n=0
@@ -581,8 +614,7 @@ if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
   expect_eq "ldd hang: stub ldd was reclaimed" 0 "$ldd_alive"
 fi
 all_caps="ok lcall nonlinux nostart diff noisy errtable errmax outtable"
-for n in $insp_names; do all_caps="$all_caps insp_$n"; done
-for n in $state_names; do all_caps="$all_caps state_$n"; done
+all_caps="$all_caps insp_full insp_order state_full state_order"
 for name in $all_caps; do
   expect_rc "capture $name exits 0" 0 "$(rc_of "$name")"
 done
@@ -821,7 +853,10 @@ expect_rc "list form on a non-list case is rejected" 2 $?
 
 # --- inspect の 1 行 JSON（種別 i。B17）---
 expect_line "B17 inspect of a created container" ok "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
-expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3,ro=true"
+want_insp_full="inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3,ro=true"
+expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}${want_insp_full}"
+expect_norm "B17 inspect with every object is normalized (norm_stdout)" i full "$want_insp_full"
+expect_eq "B17 norm_stdout matches the e2e capture (insp_full)" "$(line_of insp_full B17)" "B17${tab}B${tab}0${tab}-${tab}$(norm_of i full)"
 # 行数は case で先に決める（$( ) の中の case は macOS の /bin/bash 3.2 が `)` を取り違えて構文エラーにするため）
 for n in order extra noro badro extrarw missing nolf crlf twolines badcap badstr; do
   case $n in
@@ -829,15 +864,15 @@ for n in order extra noro badro extrarw missing nolf crlf twolines badcap badstr
     twolines) lines=2 ;;
     *) lines=1 ;;
   esac
-  expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:${lines}"
+  expect_norm "B17 malformed inspect ($n) is unexpected" i "$n" "<unexpected>:${lines}"
 done
 for n in lead0pid lead0ext lead0cg; do
-  expect_line "B17 leading-zero number ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:1"
+  expect_norm "B17 leading-zero number ($n) is unexpected" i "$n" "<unexpected>:1"
 done
-expect_line "B17 rootReadonly false is accepted" insp_rofalse "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=false"
-expect_line "B17 hyphenated audit policy is accepted" insp_besteffort "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-,ro=-"
-expect_line "B17 empty stdout on success is unexpected" insp_empty "B17${tab}B${tab}0${tab}-${tab}<unexpected>:0"
-expect_line "B17 oversized inspect is unexpected" insp_big "B17${tab}B${tab}0${tab}-${tab}<unexpected>:big"
+expect_norm "B17 rootReadonly false is accepted" i rofalse "inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=false"
+expect_norm "B17 hyphenated audit policy is accepted" i besteffort "inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-,ro=-"
+expect_norm "B17 empty stdout on success is unexpected" i empty "<unexpected>:0"
+expect_norm "B17 oversized inspect is unexpected" i big "<unexpected>:big"
 # 漏えい検査: bundle のパス・cgroup 名・ホストの id・reason は capture に現れない
 leak=0
 for n in ok insp_full; do
@@ -868,14 +903,17 @@ expect_rc "inspect:garbage stdout field is rejected" 2 $?
 # --- state の 1 行 JSON（種別 o。B26。#1904）---
 want_state_created="B26${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=-"
 expect_line "B26 state of a created container" ok "$want_state_created"
-expect_line "B26 state with pid and annotations is normalized" state_full "B26${tab}B${tab}0${tab}-${tab}state:c1,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=<set>"
-expect_line "B26 state with annotations only records the key set" state_withann "B26${tab}B${tab}0${tab}-${tab}state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=<set>"
+want_state_full="state:c1,running,ver=1.3.0,keys=ociVersion+id+status+pid+bundle+annotations,ann=<set>"
+expect_line "B26 state with pid and annotations is normalized" state_full "B26${tab}B${tab}0${tab}-${tab}${want_state_full}"
+expect_norm "B26 state with pid and annotations is normalized (norm_stdout)" o full "$want_state_full"
+expect_eq "B26 norm_stdout matches the e2e capture (state_full)" "$(line_of state_full B26)" "B26${tab}B${tab}0${tab}-${tab}$(norm_of o full)"
+expect_norm "B26 state with annotations only records the key set" o withann "state:c1,created,ver=1.3.0,keys=ociVersion+id+status+bundle+annotations,ann=<set>"
 for n in missing extra order notjson crlf lead0pid badann badstr; do
-  expect_line "B26 malformed state ($n) is unexpected" "state_$n" "B26${tab}B${tab}0${tab}-${tab}<unexpected>:1"
+  expect_norm "B26 malformed state ($n) is unexpected" o "$n" "<unexpected>:1"
 done
-expect_line "B26 state without LF is unexpected" state_nolf "B26${tab}B${tab}0${tab}-${tab}<unexpected>:0"
-expect_line "B26 two-line state is unexpected" state_twolines "B26${tab}B${tab}0${tab}-${tab}<unexpected>:2"
-expect_line "B26 empty stdout on success is unexpected" state_empty "B26${tab}B${tab}0${tab}-${tab}<unexpected>:0"
+expect_norm "B26 state without LF is unexpected" o nolf "<unexpected>:0"
+expect_norm "B26 two-line state is unexpected" o twolines "<unexpected>:2"
+expect_norm "B26 empty stdout on success is unexpected" o empty "<unexpected>:0"
 leak=0
 for n in ok state_full; do
   while IFS= read -r l; do

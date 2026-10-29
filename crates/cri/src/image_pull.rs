@@ -571,6 +571,18 @@ pub struct OciImagePuller<C: RegistryPullClient> {
     config: PullConfig,
     /// 展開（`ExtractLayer`）の計装の記録先。既定は何も記録しない（REPAIR-4）。
     recorder: Arc<dyn OciOpRecorder>,
+    /// 期限の判定に使う時計。既定は `Instant::now`（#3297）。
+    clock: PullClock,
+}
+
+/// pull の期限の時計（`Instant::now` の差し替え口）。`OciImagePuller` の `Debug` を保つための包み。
+#[derive(Clone)]
+struct PullClock(Arc<dyn Fn() -> Instant + Send + Sync>);
+
+impl std::fmt::Debug for PullClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PullClock(<clock>)")
+    }
 }
 
 impl<C: RegistryPullClient> OciImagePuller<C> {
@@ -580,7 +592,20 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             client,
             config,
             recorder: Arc::new(NoopOciOpRecorder),
+            clock: PullClock(Arc::new(Instant::now)),
         }
+    }
+
+    /// pull の期限（`pull_deadline`）の判定に使う時計を差し替える。既定は `Instant::now`。
+    ///
+    /// 試験が擬似時計で期限を決定的にするための口（#3297・CRI-3・OCI-1・REPAIR-5・REPAIR-12）。展開
+    /// （`ExtractBudget::with_clock`）にも同じ時計が渡り、pull と展開は 1 つの期限を共有し続ける。本番の呼び出し元
+    /// （plugin-cri・CreateContainer 経路）は呼ばない。戻り値は単調非減少でなければならず、止まった時計を渡すと
+    /// 期限が効かなくなる。Bearer token の失効判定（OCI-3）は pull の期限ではないため実時計のまま。
+    #[must_use]
+    pub fn with_clock(mut self, now: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        self.clock = PullClock(now);
+        self
     }
 
     /// 展開の計装（レイヤーごとの成否・エラー code・所要時間。REPAIR-4）の記録先を差し替える。
@@ -917,17 +942,26 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
 /// `pull_deadline` の絶対時刻 1 つで、展開（`ExtractBudget`）へも同じ時刻を渡す（展開に別の予算を持たせない）。
 /// 取り消しの旗は `CriImageService::pull` の番人が RPC の破棄時に立てる。どちらも `Timeout` になり gRPC では
 /// `DEADLINE_EXCEEDED`。文言は固定の英語でイメージ名等を含めない（ERR-3）。
+///
+/// 期限の判定は `now`（既定は `Instant::now`。試験は `OciImagePuller::with_clock` で擬似時計を注入。#3297）で行い、
+/// 展開へも同じ時計を渡す。`ensure_blob` の Bearer token の失効判定（OCI-3）は pull の期限ではないので実時計のまま。
 struct PullBudget<'a> {
     deadline: Option<Instant>,
     cancel: Option<&'a AtomicBool>,
+    now: &'a (dyn Fn() -> Instant + Sync),
 }
 
 impl<'a> PullBudget<'a> {
-    fn new(pull_deadline: Duration, cancel: Option<&'a AtomicBool>) -> Self {
+    fn new(
+        pull_deadline: Duration,
+        cancel: Option<&'a AtomicBool>,
+        now: &'a (dyn Fn() -> Instant + Sync),
+    ) -> Self {
         Self {
             // あふれたときは期限なし（`image_rootfs.rs` と同じ扱い）。
-            deadline: Instant::now().checked_add(pull_deadline),
+            deadline: now().checked_add(pull_deadline),
             cancel,
+            now,
         }
     }
 
@@ -944,7 +978,7 @@ impl<'a> PullBudget<'a> {
                 "image pull was cancelled",
             ));
         }
-        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+        if self.deadline.is_some_and(|d| (self.now)() >= d) {
             return Err(PullError::new(
                 OciErrorCode::Timeout,
                 "image pull exceeded its deadline",
@@ -955,7 +989,7 @@ impl<'a> PullBudget<'a> {
 
     /// 展開へ渡す予算（期限は共有、取り消しも同じ旗）。
     fn extract_budget(&self) -> ExtractBudget<'a> {
-        let mut b = ExtractBudget::new();
+        let mut b = ExtractBudget::new().with_clock(self.now);
         if let Some(d) = self.deadline {
             b = b.with_deadline(d);
         }
@@ -1016,7 +1050,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         request: &PullRequest,
         cancel: Option<&AtomicBool>,
     ) -> Result<PulledImage, PullError> {
-        let budget = PullBudget::new(self.config.pull_deadline, cancel);
+        let budget = PullBudget::new(self.config.pull_deadline, cancel, &*self.clock.0);
         // すでに取り消されていれば外部へ通信しない。
         budget.check()?;
         let image_ref =
@@ -1913,7 +1947,7 @@ mod tests {
     fn cri3_repair5_pull_budget_checks_cancel_then_deadline() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let flag = AtomicBool::new(false);
-        let b = super::PullBudget::new(Duration::from_secs(3600), Some(&flag));
+        let b = super::PullBudget::new(Duration::from_secs(3600), Some(&flag), &Instant::now);
         assert!(b.check().is_ok());
         flag.store(true, Ordering::Release);
         let e = b.check().unwrap_err();
@@ -1921,7 +1955,7 @@ mod tests {
         assert_eq!(e.message(), "image pull was cancelled");
         assert_eq!(b.timeout_error().message(), "image pull was cancelled");
 
-        let expired = super::PullBudget::new(Duration::ZERO, None);
+        let expired = super::PullBudget::new(Duration::ZERO, None, &Instant::now);
         let e = expired.check().unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Timeout);
         assert_eq!(e.message(), "image pull exceeded its deadline");
@@ -1934,8 +1968,24 @@ mod tests {
     /// REPAIR-5: 期限の加算があふれたときは期限なし（取り消しだけが効く）。
     #[test]
     fn cri3_repair5_pull_budget_overflow_means_no_deadline() {
-        let b = super::PullBudget::new(Duration::MAX, None);
+        let b = super::PullBudget::new(Duration::MAX, None, &Instant::now);
         assert!(b.check().is_ok());
+    }
+
+    /// CRI-3・REPAIR-5・#3297: 擬似時計で `>=` の境界を固定する（99ms は通り、100ms ちょうどで `Timeout`）。
+    #[test]
+    fn cri3_repair5_pull_budget_deadline_boundary_with_fake_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let base = Instant::now();
+        let ms = AtomicU64::new(0);
+        let clock = || base + Duration::from_millis(ms.load(Ordering::SeqCst));
+        let b = super::PullBudget::new(Duration::from_millis(100), None, &clock);
+        ms.store(99, Ordering::SeqCst);
+        assert!(b.check().is_ok());
+        ms.store(100, Ordering::SeqCst);
+        let e = b.check().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "image pull exceeded its deadline");
     }
 
     use super::*;

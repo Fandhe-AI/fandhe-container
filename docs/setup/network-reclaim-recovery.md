@@ -57,7 +57,7 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 | 照合できない netns の pin（旧いバイナリの請求書、置き場の `.owned/<endpoint>` の欠落・破損・不一致、`ns=-` のままの pin、none モードの pin） | 請求書と永続の所有記録とカーネルの実状態の三者が一致する pin しか外さない（一致する pin は plugin の再起動後も自動回収される。#2824） | 下の手順 |
 | 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>/g/<32 桁の 16 進>` で終わるものだけが対象。`<32 桁の 16 進>` は接続ごとの世代で、同じ endpoint の再接続では変わる。請求書の `generation` と一致しない veth は別の接続のもので消さない） |
 | 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 下の「手順（所有トークンを持つ bridge）」 |
-| アドレス・DNAT ルール・ポート予約（quarantine）がカーネル側の回収後も残るとき | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される |
+| アドレス・ポート予約と、ルールのハンドルを持てなかった DNAT ルール（quarantine）がカーネル側の回収後も残るとき（`detach` の失敗でルールのハンドルを請求書に載せられた DNAT ルールは、`detach` の回収が消す。#3285） | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される |
 | 壊れた attach の記録 | 復号できない（ファイルは消えずに残り、同じコンテナの再 attach は `AlreadyExists` で拒否される） | 資源を確認・削除したうえで、記録ファイルを手で消して plugin を再起動する |
 
 復元したネットワークで `delete_network` が `attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim` の `FailedPrecondition` を返したら、取り残しの回収は済み、ネットワーク本体（bridge・nft テーブル）は手動回収が必要という意味である。

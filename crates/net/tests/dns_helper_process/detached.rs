@@ -118,6 +118,7 @@ pub fn run(exe: &Path) {
     stop_on_request(exe);
     ack_timeout(exe);
     recover_intent(exe);
+    recover_intent_by_nonce(exe);
     start_failure_records(exe);
     stopped_stage2_is_reaped(exe);
 }
@@ -322,6 +323,54 @@ fn recover_intent(exe: &Path) {
         "an incomplete scan must not stop anything"
     );
 
+    // 同一性つきの意図記録は、候補なしでも同一性で帰属して止める。開始時刻が違えば何も送らない（#3344）。
+    let mut reused = h.identity.clone();
+    reused.start_time_ticks += 1;
+    n.remove_dns_helper_intent().expect("rm intent");
+    n.write_dns_helper_intent(
+        &intent_of(rec.nonce().clone())
+            .with_identity(reused)
+            .expect("identity"),
+    )
+    .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert!(notimp(h.listen), "a reused pid must not be stopped");
+    n.write_dns_helper_intent(
+        &intent_of(rec.nonce().clone())
+            .with_identity(h.identity.clone())
+            .expect("identity"),
+    )
+    .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the recorded identity must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+}
+
+/// 同一性の追記が無い従来の経路（#3070）: nonce が一致する子だけを停止し、意図記録を消す。
+fn recover_intent_by_nonce(exe: &Path) {
+    let tmp = Tmp::new("recover-nonce");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let pid = h.identity.pid;
+    let rec = n.read_dns_helper().expect("read").expect("record");
+    let intent_of = |nonce: HelperNonce| DnsHelperIntent::new(name.clone(), nonce, rec.listen());
+    n.remove_dns_helper().expect("rm");
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
     // nonce が一致する子だけを停止し、意図記録を消す。
     assert_eq!(
         recover_dns_helper_intent(&n, &mut [0u32, pid].into_iter(), &NoopNetOpRecorder)

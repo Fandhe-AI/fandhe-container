@@ -12,9 +12,11 @@
 //! pid <10 進>\n                 network <ネットワーク名>\n
 //! start <10 進>\n               nonce <32 桁の小文字 16 進>\n
 //! boot <36 文字の UUID>\n       listen <a.b.c.d:port>\n
-//! nonce <32 桁の小文字 16 進>\n
+//! nonce <32 桁の小文字 16 進>\n  [pid <10 進>\n start <10 進>\n boot <UUID>\n]
 //! listen <a.b.c.d:port>\n
 //! ```
+//! 意図記録の末尾の `pid`・`start`・`boot` の 3 行は任意で、3 行そろうか、どれも無いかのどちらか
+//! （識別行の照合後に追記する同一性。#3344）。magic は据え置く（FCDNSI1 は出荷前で、3 行なしの旧形式も読める）。
 //! 並びは固定で、正準形だけを受ける。復号は値を読み取った後に符号化し直し、入力とバイト単位で一致しなければ
 //! `DataLoss` にする（重複・未知の kind・順序違い・欠落・先頭 0・末尾のごみを一括で拒否）。文書全体は
 //! [`RECORD_MAX_BYTES`] 以下で、解析の前にサイズで拒否する（無制限確保の防止）。
@@ -23,6 +25,11 @@
 //! nonce は起動のたびに作る 128 ビットの乱数で、ヘルパーの起動引数（`/proc/<pid>/cmdline`）に載る。秘密ではなく、
 //! 意図記録と生存プロセスを結ぶ照合用の値である（起動窓の回収で、ネットワークの cgroup 内のプロセスのうち
 //! この nonce を持つものだけを停止の対象にする）。
+//!
+//! # 意図記録の同一性（#3344）
+//! 回収の前に段 2 が終了して subreaper の子のゾンビになると、`/proc/<pid>/cmdline` が空で nonce では帰属できず、
+//! cgroup v2 ではゾンビが `cgroup.procs` にも現れない。そこで識別行の照合後、`dns-helper` を書く前に、意図記録へ
+//! 同一性（pid・開始時刻・boot id）を原子的に追記する。回収はこの同一性で pidfd を取って照合する。
 
 use std::fmt;
 use std::net::SocketAddrV4;
@@ -195,6 +202,8 @@ pub struct DnsHelperIntent {
     network: NetworkName,
     nonce: HelperNonce,
     listen: DnsListenAddr,
+    /// 識別行の照合後に追記する同一性（無ければ起動窓のうち照合前）。
+    identity: Option<ProcessIdentity>,
 }
 
 impl DnsHelperIntent {
@@ -204,7 +213,25 @@ impl DnsHelperIntent {
             network,
             nonce,
             listen,
+            identity: None,
         }
+    }
+
+    /// 識別行の照合後の同一性を足す。pid 0 は拒否する。
+    pub fn with_identity(mut self, identity: ProcessIdentity) -> Result<Self, NetError> {
+        if identity.pid == 0 {
+            return Err(NetError::new(
+                NetErrorCode::InvalidArgument,
+                "pid must be positive",
+            ));
+        }
+        self.identity = Some(identity);
+        Ok(self)
+    }
+
+    /// 追記済みの同一性（照合前なら `None`）。
+    pub fn identity(&self) -> Option<&ProcessIdentity> {
+        self.identity.as_ref()
     }
 
     /// ネットワーク名。
@@ -224,13 +251,19 @@ impl DnsHelperIntent {
 
     /// 正準形へ符号化する。
     pub fn encode(&self) -> Vec<u8> {
-        format!(
+        let mut out = format!(
             "{INTENT_MAGIC}network {}\nnonce {}\nlisten {}\n",
             self.network.as_str(),
             self.nonce,
             self.listen
-        )
-        .into_bytes()
+        );
+        if let Some(id) = &self.identity {
+            out.push_str(&format!(
+                "pid {}\nstart {}\nboot {}\n",
+                id.pid, id.start_time_ticks, id.boot_id
+            ));
+        }
+        out.into_bytes()
     }
 
     /// 正準形だけを受けて復号する（`DataLoss` で拒否）。
@@ -245,7 +278,24 @@ impl DnsHelperIntent {
         let nonce =
             HelperNonce::new(field(&mut lines, "nonce")?).map_err(|_| data_loss("bad nonce"))?;
         let listen = parse_listen(field(&mut lines, "listen")?)?;
-        let rec = Self::new(network, nonce, listen);
+        let mut rec = Self::new(network, nonce, listen);
+        // 残りが空（"" 1 要素）でなければ、同一性の 3 行を順に読む（部分的な追記は正準形の照合で拒否）。
+        if lines.clone().next().is_some_and(|l| !l.is_empty()) {
+            let pid: u32 = field(&mut lines, "pid")?
+                .parse()
+                .map_err(|_| data_loss("bad pid"))?;
+            let start: u64 = field(&mut lines, "start")?
+                .parse()
+                .map_err(|_| data_loss("bad start time"))?;
+            let boot = BootId::new(field(&mut lines, "boot")?)?;
+            rec = rec
+                .with_identity(ProcessIdentity {
+                    pid,
+                    start_time_ticks: start,
+                    boot_id: boot,
+                })
+                .map_err(|_| data_loss("bad dns helper intent"))?;
+        }
         if rec.encode() != bytes {
             return Err(data_loss("dns helper intent is not canonical"));
         }
@@ -411,5 +461,64 @@ mod tests {
             assert_eq!(a.as_str().len(), 32);
             assert_ne!(a, b);
         }
+    }
+
+    fn identity_of(pid: u32, start: u64) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_time_ticks: start,
+            boot_id: BootId::new(BOOT).expect("boot"),
+        }
+    }
+
+    /// NET-7・REPAIR-2・#3344: 同一性つきの意図記録は固定の正準形で往復し、旧形式（3 行なし）も読める。
+    #[test]
+    fn net7_3344_intent_identity_roundtrip() {
+        let with = intent()
+            .with_identity(identity_of(4242, 987_654))
+            .expect("id");
+        let want = format!(
+            "FCDNSI1\nnetwork web\nnonce {NONCE}\nlisten 10.89.0.1:53\npid 4242\nstart 987654\nboot {BOOT}\n"
+        );
+        assert_eq!(with.encode(), want.as_bytes());
+        let back = DnsHelperIntent::decode(want.as_bytes()).expect("decode");
+        assert_eq!(back, with);
+        assert_eq!(back.identity(), Some(&identity_of(4242, 987_654)));
+        let old = format!("FCDNSI1\nnetwork web\nnonce {NONCE}\nlisten 10.89.0.1:53\n");
+        assert_eq!(
+            DnsHelperIntent::decode(old.as_bytes())
+                .expect("old")
+                .identity(),
+            None
+        );
+    }
+
+    /// REPAIR-2・SEC-1・#3344: 部分的な同一性・順序違い・pid 0・先頭 0・末尾のごみ・サイズ超過は `DataLoss`。
+    #[test]
+    fn net7_3344_intent_identity_rejects_noncanonical() {
+        let head = format!("FCDNSI1\nnetwork web\nnonce {NONCE}\nlisten 10.89.0.1:53\n");
+        let cases = [
+            format!("{head}pid 4242\n"),
+            format!("{head}pid 4242\nstart 987654\n"),
+            format!("{head}start 987654\npid 4242\nboot {BOOT}\n"),
+            format!("{head}pid 0\nstart 987654\nboot {BOOT}\n"),
+            format!("{head}pid 4242\nstart 0987654\nboot {BOOT}\n"),
+            format!("{head}pid 4242\nstart 987654\nboot {BOOT}\nextra\n"),
+            format!("{head}\npid 4242\nstart 987654\nboot {BOOT}\n"),
+        ];
+        for c in cases {
+            assert_eq!(
+                DnsHelperIntent::decode(c.as_bytes()).expect_err(&c).code(),
+                NetErrorCode::DataLoss,
+                "{c:?}"
+            );
+        }
+        assert_eq!(
+            intent()
+                .with_identity(identity_of(0, 1))
+                .expect_err("pid0")
+                .code(),
+            NetErrorCode::InvalidArgument
+        );
     }
 }

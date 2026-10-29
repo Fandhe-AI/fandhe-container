@@ -180,8 +180,10 @@ pub trait StartDeps {
         None
     }
 
-    /// 単一スレッドの区間（手順 3〜8）で積んだ構造化ログを、start の報告の後に出す（成功・失敗の両方で呼ばれる。
-    /// rootless の pasta 構成の `pasta_verify` / `pasta_ready` など。#1940・REPAIR-4）。既定は何もしない。
+    /// 単一スレッドの区間（手順 3〜8）で積んだ構造化ログを、start の報告の後に出す（成功・失敗の両方と、
+    /// 準備期限超過・放棄の後始末 `abandoned_cleanup` から呼ばれる。
+    /// rootless の pasta 構成の `pasta_verify` / `pasta_ready` など。#1940・#3359・REPAIR-4）。既定は何もしない。
+    /// 複数の経路から呼ばれうるため、実装は取り出しで空にする冪等なものでなければならない（各行は 1 度だけ出る）。
     fn flush_deferred_logs(&self) {}
 
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
@@ -1161,6 +1163,8 @@ fn discard_prepared(prepared: Prepared) -> Cleanup {
 ///
 /// launch はしない。準備が済んだ結果（`Ready`）は作った cgroup を消し、失敗の結果はその後始末を行う
 /// （best effort。プロセスの終了までに終われば行う）。
+/// 報告の後に積んだ遅延ログ（`pasta_verify` の拒否行など）を先に出す。`deps` はここで消費されるため、
+/// 期限超過経路の出口はこの 1 箇所に集約する（#3359・SEC-4・REPAIR-5。flush は待たない）。
 fn abandoned_cleanup(
     deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
@@ -1168,12 +1172,14 @@ fn abandoned_cleanup(
     timeouts: &StartTimeouts,
     outcome: PrepareOutcome,
 ) {
+    deps.flush_deferred_logs();
     let cleanup = match outcome {
         PrepareOutcome::Ready(prepared) => discard_prepared(prepared),
         PrepareOutcome::Failed { cleanup, .. } => cleanup,
     };
     let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
 }
+
 /// `f`（状態ストア・cgroup への I/O を含む後始末の全体）を作業スレッドで実行し、`limit` まで結果を待つ。
 /// `f` が `true` を返したと確認できたら `true`。
 ///
@@ -3327,7 +3333,12 @@ mod linux {
             &mut out,
         ) {
             Ok(r) => r,
-            Err(code) => return ExitCode::from(code.get()),
+            Err(code) => {
+                // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
+                // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
+                pasta_logs.flush();
+                return ExitCode::from(code.get());
+            }
         };
         // 報告は 1 行だけ書く契約。複製は閉じるが、fd 1 自体は std の stdout が持つため pipe は開いたまま
         // （CLI は EOF ではなく 1 行の受信で完了とみなす。fd を閉じるには unsafe が要るため行わない）。
@@ -3674,6 +3685,40 @@ mod linux {
             buffer.push("{}\n".to_owned());
             deps.flush_deferred_logs();
             assert!(buffer.take().is_empty());
+        }
+
+        /// SEC-4(#3359): 放棄・期限超過の後始末 `abandoned_cleanup` も遅延バッファを空にする。
+        #[test]
+        fn sec4_3359_abandoned_cleanup_drains_pasta_logs() {
+            let dir = std::env::temp_dir().join(format!("fc3359-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let deps = ProductionStartDeps::new(dir.clone());
+            let buffer = deps.pasta_log_buffer();
+            buffer.push("{}\n".to_owned());
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let store: Arc<dyn StateStore> = Arc::new(
+                fandhe_container_core::state_store::FileStateStore::open(
+                    fandhe_container_core::state_store::StateRoot::from_override(dir.clone())
+                        .expect("root"),
+                )
+                .expect("store"),
+            );
+            let id = ContainerId::new("c3359").expect("id");
+            let outcome = PrepareOutcome::Failed {
+                error: OciRuntimeError::new(LifecycleOp::Start, ErrorCode::Internal, "x"),
+                cleanup: Cleanup::Nothing,
+            };
+            abandoned_cleanup(
+                Box::new(deps),
+                &store,
+                &id,
+                &StartTimeouts::default(),
+                outcome,
+            );
+            assert!(buffer.take().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。

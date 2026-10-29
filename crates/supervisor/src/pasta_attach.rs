@@ -24,7 +24,9 @@
 //! # 単一スレッドの区間
 //!
 //! フックは core の launch の単一スレッドの区間から呼ばれる。スレッドを作らず、`stderr_sink` も呼ばない。この区間で
-//! 出すログは [`PastaLogBuffer`] に積み、start の報告の後に `StartDeps::flush_deferred_logs` が出す。
+//! 出すログは [`PastaLogBuffer`] に積み、start の報告の後に `StartDeps::flush_deferred_logs` が出す
+//! (準備期限超過・放棄の経路を含む全終端。deps が戻らない経路は入口の後ろ盾が同じバッファを出す。
+//! 取り出しで空にするので 1 度だけ。#3359)。
 //!
 //! # 将来仕様・残余（REPAIR-3）
 //!
@@ -191,6 +193,8 @@ impl PastaLogBuffer {
     }
 
     /// 積んだ行を supervisor の出力口へ待たずに流す（キュー満杯なら捨てる。REPAIR-5）。
+    ///
+    /// 取り出しで空にするので複数回（期限超過の経路と入口の後ろ盾など）呼んでも各行は 1 度だけ出る（#3359）。
     pub fn flush(&self) {
         for line in self.take() {
             emit_now(line);

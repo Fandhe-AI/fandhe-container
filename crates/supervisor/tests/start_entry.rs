@@ -287,6 +287,12 @@ struct FakeDeps {
     recover_fails: Option<ErrorCode>,
     /// `true` なら `prepare_network` / `release_network` / `network_log_mode` を実装して呼び出しを記録する(#1873・D14)。
     net_hooks: bool,
+    /// 遅延バッファに積まれた行（`flush_deferred_logs` が取り出す。#3359）。
+    deferred: Arc<Mutex<Vec<String>>>,
+    /// `flush_deferred_logs` が出した行と時刻（#3359）。
+    flushed: Arc<Mutex<Vec<(std::time::Instant, String)>>>,
+    /// `flush_deferred_logs` の呼び出し回数（#3359）。
+    flushes: Arc<AtomicUsize>,
 }
 
 impl FakeDeps {
@@ -353,6 +359,16 @@ impl StartDeps for FakeDeps {
         self.step("audit")
     }
 
+    fn flush_deferred_logs(&self) {
+        let lines = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
+        let now = std::time::Instant::now();
+        self.flushed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(lines.into_iter().map(|l| (now, l)));
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError> {
         self.step("build")?;
         Ok(self.launcher.clone())
@@ -394,6 +410,9 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             release_fails: false,
             recover_fails: None,
             net_hooks: false,
+            deferred: Arc::new(Mutex::new(Vec::new())),
+            flushed: Arc::new(Mutex::new(Vec::new())),
+            flushes: Arc::new(AtomicUsize::new(0)),
         },
         launcher,
     )
@@ -975,6 +994,65 @@ fn repair5_deadline_exceeded_in_prepare_reports_first_and_never_launches() {
     assert_eq!(rec.status().state(), ContainerState::Created);
     assert!(rec.status().pid().is_none());
     assert!(rec.supervision().supervisor_pid().is_none());
+}
+
+/// SEC-4・NET-9・REPAIR-5(#3359): 準備の期限を超えた start でも、積んだ `pasta_verify` の拒否行が報告の後に
+/// ちょうど 1 度だけ出る(`abandoned_cleanup` の先頭)。出す処理は報告の期限を延ばさない。
+#[test]
+fn sec4_3359_deadline_exceeded_flushes_pasta_verify_once() {
+    let env = Env::new("flushovr");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    d.record_scope = true;
+    d.prepare_delay = Duration::from_millis(1500);
+    let line = format!(
+        "{{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"{}\",\"elapsed_ms\":1,\"result\":\"rejected\",\"code\":\"PERMISSION_DENIED\",\"tamper_suspected\":\"true\"}}\n",
+        env.id
+    );
+    d.deferred.lock().unwrap().push(line.clone());
+    let (deferred, flushed, flushes) = (
+        Arc::clone(&d.deferred),
+        Arc::clone(&d.flushed),
+        Arc::clone(&d.flushes),
+    );
+    let store = env.store.clone();
+    let id = env.id.clone();
+    let t0 = std::time::Instant::now();
+    let deadline = t0.checked_add(Duration::from_millis(1300));
+    let mut out = TimedWriter::default();
+    let r = run_start_until(
+        Box::new(d),
+        &store,
+        &Arc::new(OpRecorder::new()),
+        &StartRequest::new(cid(&id)),
+        &short_timeouts(),
+        deadline,
+        &mut out,
+    );
+    assert_eq!(r.err(), Some(exit_code_for(ErrorCode::Internal)));
+    match report_of(&out.bytes()) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    let reported = out.reported_at().unwrap();
+    assert!(reported - t0 < Duration::from_millis(1300));
+    // 入口スレッドが待つ間は作業スレッドが deps を持つ。戻らなければ flush は後から(有限の期限で待つ)。
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while flushes.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let got = flushed.lock().unwrap().clone();
+    assert_eq!(
+        got.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+        [line.as_str()]
+    );
+    assert!(got[0].0 >= reported, "flush must follow the report");
+    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    assert!(deferred.lock().unwrap().is_empty());
 }
 
 /// REPAIR-5・#1819: 準備が済んでも手順 8 の見込み（`launch_step_budget`）が期限内に残らなければ、launch せず

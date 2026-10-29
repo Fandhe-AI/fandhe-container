@@ -38,11 +38,12 @@
 //!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（共通ログ型 `LogLine` 経由で書く。#3115・ERR-4）。
 //!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
 //!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
-//!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、
-//!   healthcheck・launch 経路（launcher）への配線は **未実装**（REPAIR-3: 実装済みを装わない）。plugin 信頼検証は
+//!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持は **未実装**（REPAIR-3: 実装済みを装わない。追跡先は #3417 のコメントで諮る）。
+//!   launch 経路（launcher）への配線は supervisor の start 経路から結線済み（#1819。`default_audit_sink` の sink を本番 launcher へ渡す）で、
+//!   healthcheck への配線は #2441、CLI の exec への配線は #2626 が追う（いずれも未実装）。plugin 信頼検証は
 //!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
 //!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、非 Linux では `FileStateStore` が未実装のため
-//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕
+//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する

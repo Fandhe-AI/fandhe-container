@@ -10,7 +10,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 | 項目 | 内容 |
 | ---- | ---- |
-| 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（#1869）。macOS / Windows ではバックエンド解決が必ず失敗する（macOS は候補なしで 5、候補ありで検証の拒否 6〔`platform backend plugin failed trust verification`〕。Windows は既定で 5、`--plugin-path-search` で候補があるとホストが検証しないため 8〔`plugin trust verification is not performed on this host`〕）。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
+| 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（設計は #1869、承認と実装 issue の起票は #2232）。macOS / Windows ではバックエンド解決が必ず失敗する（macOS は候補なしで 5、候補ありで検証の拒否 6〔`platform backend plugin failed trust verification`〕。Windows は既定で 5、`--plugin-path-search` で候補があるとホストが検証しないため 8〔`plugin trust verification is not performed on this host`〕）。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の `start` | `start` は supervisor 経由で本番 launcher まで配線済み（#2048・#1718・#1715・#1819・#2442。CLI は実体と同じディレクトリの `fandhe-container-supervisor` を `systemd-run --user --scope -p Delegate=yes` で包んで起動する）。cgroup 配置つき `delete` も実装済み（#2096。ただし Running のコンテナへの `delete --force` は 8 になる）。pid ありの `stop` は supervisor の制御チャネル経由（#2059。届かなければ `UNAVAILABLE`（9））。restart の再 launch は fail-closed（#2043）。**`start` の終了コードは環境（前提）で変わる**: supervisor が CLI の隣に無ければ 5 / `FAILED_PRECONDITION`、uid 0 は 8 / `UNIMPLEMENTED`（`RootfulHostRoot`・#2241 の判断待ち）、`systemd-run` や user マネージャが無ければ 5 / `FAILED_PRECONDITION`。成功には非 root・supervisor を CLI の隣に置く・特権ランチャー `fandhe-container-launcher` を置かない（置くと rootful のインストールとみなされる）・user マネージャと委譲 cgroup・Landlock ABI 6 以上が要る。Linux 側の値は環境で変わる参考値で、固定の合格基準にしない（REPAIR-3）。B05 の bundle は rootfs が空なので、前提が揃っていても起動に失敗する |
 | イメージ管理の現状（C 層） | コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みで、在庫は plugin-cri の `PullImage`（cri の `OciImagePuller::pull`）が登録する。plugin-cri のキャッシュは「plugin-cri が解決する既定の状態ルート（`StateRoot::resolve(None)`）の `.cri/images`」（#2539・#2800・#2592）。CLI に `pull` サブコマンドは無い（`docs/design/pull-inventory-wiring.md`）。同じ root を `--image-root` に渡せば、pull 済みの在庫に対して `image ls`・`image rm`・`image tag`・`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から解決。#2496）が成功する。未 pull の root（空のストア）では従来どおり `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image` は `NOT_FOUND`（3）で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する。pull 済み root の手順は C 層の節の「pull 済みの root の用意」 |
 | kill・state の自動収集の範囲（#1904・CLI-1） | `kill` の本番 signaler は supervisor の制御チャネル経由で実装済み（実行中の対象へは届かなければ `UNAVAILABLE`（9））。自動収集するのは、実行中でない対象（created の c1。pid の記録が無く 5 / `FAILED_PRECONDITION`。B27・B28）と不在の ID（3 / `NOT_FOUND`。B30）と構文（A32〜A38）だけで、さらに start 済みの c2 については、実行中の `state`（B31・B33。`pid` キーつき）・`kill c2 TERM`（B32。成功は 0・stdout 空）・停止後の `state`（B34。`pid` キーなし）を自動収集する（#3098）。c2 の PID 1 は SIGTERM を受けず kill は送るだけのため B33 は running のままで、停止は B22 が担う。start が成功しない環境では B31・B33・B34 は `<start-failed>`（compare は `NOT_STARTED`）、B32 は 5 / `FAILED_PRECONDITION` の実データになる。実機の値の記入は #661。`state` の `pid` は記録があるときだけ出る。B27・B28 の非 Linux の 5 は、バックエンド解決の失敗による偶然の一致で、parity の合格を意味しない |
@@ -127,7 +127,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 ## B 層: 挙動（macOS / Windows は plugin 発見機構経由）
 
-B 層は上から順に実行し、状態遷移を直後の `list` で観測する。Linux 欄の期待は現行実装の参考値（REPAIR-3）。macOS / Windows 欄は plugin 起動・RPC 配線（#1869）が整うまで「前提未達」を既定値とする。
+B 層は上から順に実行し、状態遷移を直後の `list` で観測する。Linux 欄の期待は現行実装の参考値（REPAIR-3）。macOS / Windows 欄は plugin 起動・RPC 配線（#1869 の設計、起票は #2232）が整うまで「前提未達」を既定値とする。
 
 ### コマンド別の比較項目
 
@@ -328,5 +328,5 @@ rootful（root または信頼できる特権ランチャーが隣にある構�
 | 差異の種類 | 戻し先 |
 | ---------- | ------ |
 | 構文（A 層）・Linux 経路の挙動 | TASK-79 系（CLI 本体） |
-| 非 Linux の plugin 経由の挙動 | #1869（plugin 起動・RPC）・TASK-115 / TASK-116（macOS / Windows バックエンド）の該当 Issue |
+| 非 Linux の plugin 経由の挙動 | #1869・#2232（plugin 起動・RPC）・TASK-115 / TASK-116（macOS / Windows バックエンド）の該当 Issue |
 | 本スクリプトの不具合 | TASK-125.1（#660）系 |

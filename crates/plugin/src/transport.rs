@@ -2,7 +2,7 @@
 //!
 //! core 側が plugin プロセスからの接続を待ち受ける `UdsListener`（bind / listen / accept）と、
 //! accept / connect で得た検証済み 1 接続を表す `UdsStream` を提供する。待ち受けは core 側
-//! （TASK-109・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
+//! （TASK-109・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
 //! の上に載る。
 //!
 //! # PLUG-12 の保護（本モジュールで実施する範囲）

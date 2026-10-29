@@ -4,7 +4,7 @@
 //! 返すエラーをここに集約する。core 側の `fandhe_container_core::traits::types::ErrorCode`
 //! と機械可読文字列を揃えるが、依存方向は `core → plugin`（`docs/architecture.md`）で
 //! plugin は core に依存できないため、本 crate 内で独立に定義する。`TraitError` への
-//! 変換は core 側の proxy 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）の責務である。
+//! 変換は core 側の proxy 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）の責務である。
 //! ワイヤー上の表現（serde）は `message` モジュール（TASK-107.3・#247）が非公開 DTO 経由で扱い、
 //! 本型自体には serde を持たせない（フィールド非公開・切り詰めの不変条件を保つため）。
 

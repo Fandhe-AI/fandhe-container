@@ -12,7 +12,7 @@ Linux では `--network` を省略すると `none` になる(SEC-1「既定で�
 | -- | ---- |
 | `none`(省略時) | 新しい network namespace を作り、`lo` だけを up にする |
 | `host` | ホストの network namespace を共有する。分離を緩める指定で、start の成功後に supervisor が構造化ログ 1 行(`"event":"network_mode","network_mode":"host"`)を残す。supervisor は起動前に自分の netns と同一であることを確かめ、一致しなければ起動しない |
-| ユーザー定義名・`container:<id>` | `UNIMPLEMENTED`(将来仕様。rootless は pasta〔NET-9・#1936〜#1940〕、rootful は D13〔#3207・#3069・#3074〕、定義の存在確認は #3066) |
+| ユーザー定義名・`container:<id>` | `UNIMPLEMENTED`(将来仕様。rootless は #3329〔supervisor 側の pasta は #1940 で実装済み。NET-9〕、rootful は D13〔#3207・#3069・#3074〕、定義の存在確認は #3066) |
 | `bridge`・`default` | `INVALID_ARGUMENT`(予約名) |
 
 非 Linux は `--network`・`--add-host`・`--dns` のどれかがあると `UNIMPLEMENTED`(MAC / WIN 系の結線の後続)。

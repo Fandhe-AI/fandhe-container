@@ -31,7 +31,7 @@
 //! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
 //!   （設計案は `docs/design/plugin-hash-allowlist.md`・設計は #1868、承認の追跡は #2231。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は
-//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち〕、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
+//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
 //!
 //! したがって [`backend_failure`] は現状必ず失敗を返す。
 //!

@@ -17,7 +17,7 @@
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
 //! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
 //! 別 UID 接続拒否の結合試験（TASK-124.4・#295。実機前提の 2 件は人間が実行）と peer 認証が最初の読み書きより前であることの照合テスト（TASK-124.6・#1389）も追加済みで、
-//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
+//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。

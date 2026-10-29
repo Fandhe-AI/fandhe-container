@@ -56,6 +56,7 @@ IO-5 と TASK-21 の見出しは spec PR #12（`18386e7`）で改訂済み。詳
   - 正規化を経て初めて一致する組: `differ only by case or Unicode normalization (NFC/NFD)`
   - パスは `quote_for_message` で衛生化（制御文字のエスケープ）と切り詰め（`MAX_COLLISION_MESSAGE_PATH_CHARS`・`MAX_COLLISION_MESSAGE_PATH_BYTES`）をしてから埋め込む。ログ注入と巨大メッセージを防ぐため
 - 書き込み経路: `GuestFileCreator::create_file` は、作成のたびに祖先の実在項目を読み直し、その場限りの `CaseCollisionSet` で検査する。`fold_component` を共有するため、ここも同じ判定になる。APFS で NFD の既存名に対して NFC の名前を `O_EXCL` で作ると EEXIST になり、衝突として扱う
+  - ホストパス長（260 UTF-16 単位。TASK-20.1・#3160）は構文検証の直後、ロックと走査の前に純計算で検査する。Windows ホストは何も作らず `InvalidArgument`（reason `HostPathTooLong`）で拒否し、その他の OS は作成を続けて警告を内部の戻り値に持つ（公開の `create_file` は警告を捨てる）。警告と拒否理由の観測への配線は #3163
 - 資源上限: 衝突キーの長さは入力の定数倍に収まる（NFD の展開は文字あたり有界）。索引の件数上限は `GuestFileCreator::with_max_tracked_paths` で、超えると `ResourceExhausted`
 - ホスト OS ごとの有効化（#103 で #104・#105 に委ねられた点）: 実装は OS で切り替えず、3 OS で同じ検出をする。これは本リポ側の実装判断であり、オーナーの個別判断ではない。理由は、過検出の方針に沿うことと、ゲストから見える挙動を 3 OS で揃えること
 - 本機能はパストラバーサル防止の本体ではない。rootfs への閉じ込めは `guest_files` の `openat` 系と `create_new` が担う
@@ -124,8 +125,7 @@ WSL2 の共有上で、ゲストから次の名前を作り、結果を「別フ
 
 ## 既知の限界・未実装（REPAIR-3）
 
-- ワイヤー上の作成要求からの呼び出しは未実装（`RequestEnvelope` にパスが無い。IO-1・TASK-14 の拡張が後続）
-- 260 文字検証（TASK-20.1）の書き込み経路への組み込みは未実装
+- ワイヤー上の作成要求からの呼び出しは未実装。Create フレームの符号化・復号は #3161 で実装済みで、サーバー側の接続処理（`serve_file_connection`）からの呼び出しは #3163（IO-1・TASK-14 の拡張）
 - 非 UTF-8 のファイル名は取り込めない
 - APFS / NTFS の実際の case folding 表とは厳密に一致しない
 - Win32 固有の名前の同一視（末尾の `.`・8.3 短縮名・予約デバイス名）は検出しない（#1317）。理由と再検討の条件は上の「Win32 固有の名前の同一視」節

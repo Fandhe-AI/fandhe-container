@@ -16,7 +16,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 | macOS backend plugin（`fandhe-container-plugin-macos`）の UDS 越しの create / start / stop | 実装済み（実機未確認） | create 要求ごとに kernel・initrd のパスを受け取る |
 | ゲストカーネル・initrd のビルドスクリプト | 実装済み（macOS ホストでのビルド・リンクと VM での起動は未確認） | `make guest-kernel-build`・`make guest-initrd-build` |
 | `fandhe-container setup` の手順表示 | 実装済み | 表示のみ。検出も適用もしない |
-| CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 は承認待ち） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
+| CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 の承認と実装 issue の起票は #2232） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
 | macOS の plugin の信頼性検証（PLUG-11） | core・CLI とも実装済み（#1865・#1867。所有者・モード・祖先・symlink 実体・拡張 ACL） | 拒否は `PERMISSION_DENIED`（6）・`platform backend plugin failed trust verification`、候補なしは `FAILED_PRECONDITION`（5）・`platform backend plugin is not installed`。許可済みハッシュ一覧は未配線（設計は #1868、承認の追跡は #2231）のため、現状は全件拒否される |
 | `setup` のステップの自動検出・適用 | 未実装（TASK-125） | |
 
@@ -87,7 +87,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 - カーネル: `make guest-kernel-build` で作る。出力は `target/guest-kernel/<guest/kernel/source.lock の版>/arm64/Image`（ほかに `config`・`build-info.txt`）。GPL-2.0 で、ソース提供の材料と取得物の sha256 照合は `guest/kernel/README.md` にある。tarball の署名検証は未確認
 - initrd: `make guest-initrd-build` で作る（`rustup target add aarch64-unknown-linux-musl` が要る）。出力は `target/guest-initrd/aarch64/initrd.cpio.gz` と `build-info.txt`
 - どちらの成果物もコミットしない。macOS ホストでのビルド・リンクと VM での起動は未確認である（#1628）
-- 配置は判断待ちである。製品として kernel・initrd を置く既定の場所は無い。plugin-macos は create 要求ごとにパスを受け取るが、CLI から渡す経路は未実装（#1869）。共用 VM の保持役とゲスト向けバイナリの配置は #1906 の判断待ち
+- 配置は判断待ちである。製品として kernel・initrd を置く既定の場所は無い。plugin-macos は create 要求ごとにパスを受け取るが、CLI から渡す経路は未実装（設計は #1869、承認と実装 issue の起票は #2232）。共用 VM の保持役とゲスト向けバイナリの配置は #1906 の判断待ち
 - 実機前提テストでは環境変数 `FANDHE_CONTAINER_MACOS_VM_KERNEL` などで渡す（`AGENTS.md`「実機前提テスト」の「ゲスト資産の用意」を参照）。試験専用で、製品の設定経路ではない
 
 ## plugin の配置と信頼性検証
@@ -117,5 +117,5 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
 | #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868・#2231 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
-| #1869 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |
+| #1869・#2232 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |
 | #2431 | 状態ルートの既定 | 状態ルート |

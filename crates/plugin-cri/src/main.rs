@@ -1,6 +1,6 @@
 //! `fandhe-container-plugin-cri` バイナリの入口（TASK-114.1・#457、TASK-114.3.1・#849。PLUG-1・CRI-2）。
 //!
-//! 呼び出し元: 将来は core 側 plugin proxy（#1869 の設計。承認待ち）が検証済みの起動対象として spawn する。
+//! 呼び出し元: 将来は core 側 plugin proxy（#1869 の設計。承認と実装 issue の起票は #2232）が検証済みの起動対象として spawn する。
 //! 役割は起動引数の解析（`startup::parse_args`）を終了コードと stderr の 1 行へ写すことと、`--socket <PATH>` で
 //! 受けた UDS 上で `CriRuntimeService` と `CriImageService` をサーブすること（`server::serve`。unix のみ）。
 //! 実装の組み立ては `adapter::CriPluginBackends::production`（失敗したら fail-closed で起動しない）。

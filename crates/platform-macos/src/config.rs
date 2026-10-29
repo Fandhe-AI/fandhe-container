@@ -2472,7 +2472,7 @@ impl VmConfigSpec {
     ///
     /// VM の stop・起動失敗では呼ばない（診断材料として残す）。使用中なら `ConsoleLogInUse`、世代ファイルや
     /// 現在のログに異常があれば何も消さずに拒否する。コンソールログ未指定なら 0 件。plugin-macos の delete
-    /// からの呼び出しの配線は delete の実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）待ちで、現時点で呼び出し元は無い。
+    /// からの呼び出しの配線は delete の実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）待ちで、現時点で呼び出し元は無い。
     #[cfg(unix)]
     pub fn remove_console_logs(&self) -> Result<RemovedConsoleLogs, ConfigError> {
         match self.devices.serial_console() {

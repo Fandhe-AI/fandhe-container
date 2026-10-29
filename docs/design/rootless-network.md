@@ -228,7 +228,7 @@ rootless の pasta 構成について、起動の時点と同期、pasta に渡�
   - 実行は検証したパスで行い、`argv[0]` は常に `pasta` に固定する（12.7）
   - 版の固定は 12.12
 - **理由**: 特権ランチャーの `sanitize_env` は環境を許可リストで作り直し、supervisor は契約の値を環境から読まず、argv は `StartArgs::parse` で固定されている。どちらも変えずに済む経路は既存の文書 FCOPT1 だけである（[container-options-delivery.md](container-options-delivery.md) の却下理由と同じ）。`--plugin-path-search` とは信頼の対象が違うので opt-in は別のフラグにする
-- **実装（#3199）**: 2 フラグの解析は `crates/cli/src/commands/args.rs`、`create` での判定・解決・検証は `commands/create_pasta.rs`（判定表は同ファイルの doc）、`create` 以外への指定の拒否は `commands.rs`。FCOPT1 の kind `pasta` は `crates/supervisor/src/container_options/document.rs`、本文の符号化・復号（`<YYYYMMDD> <dev> <ino> <size> <mtime_sec> <mtime_nsec> <ctime_sec> <ctime_nsec> <uid> <mode(8 進)>\n<絶対パス>`・本文 4096 バイト以下）と `reverify` は `crates/net/src/pasta/record.rs`。復号は本文の形だけを検証し（副作用なし）、バイナリの辿り直しと識別の照合は `reverify_recorded_pasta`（`container_options/pasta.rs`）が行う。**残余**: (1) `--network` のユーザー定義名は #1873 まで `UNIMPLEMENTED` で拒否されるため、本番の `create` が `pasta` を書くのはその後。(2) start 経路からの `reverify_recorded_pasta` の呼び出しと SEC-4 の監査の記録（作成時の `PermissionDenied`・起動時の識別の不一致）は #1940。作成時の記録先は状態ストアを開いた後にしか作れず D2（状態ルートを作る前の拒否）と両立せず、core の `AuditLayer` に pasta の語彙も無いため、本実装は分類（`PastaReverifyError::tamper_suspected`）だけを返す。(3) pasta の解決・検証の子（`--version`）が、`UNIMPLEMENTED` の拒否より前に 1 回起動される（`FailedPrecondition` と検証失敗の分類を作成前に返すため）。
+- **実装（#3199）**: 2 フラグの解析は `crates/cli/src/commands/args.rs`、`create` での判定・解決・検証は `commands/create_pasta.rs`（判定表は同ファイルの doc）、`create` 以外への指定の拒否は `commands.rs`。FCOPT1 の kind `pasta` は `crates/supervisor/src/container_options/document.rs`、本文の符号化・復号（`<YYYYMMDD> <dev> <ino> <size> <mtime_sec> <mtime_nsec> <ctime_sec> <ctime_nsec> <uid> <mode(8 進)>\n<絶対パス>`・本文 4096 バイト以下）と `reverify` は `crates/net/src/pasta/record.rs`。復号は本文の形だけを検証し（副作用なし）、バイナリの辿り直しと識別の照合は `reverify_recorded_pasta`（`container_options/pasta.rs`）が行う。**残余**: (1) `--network` のユーザー定義名は #3329 まで `UNIMPLEMENTED` で拒否されるため、本番の `create` が `pasta` を書くのはその後。(2) start 経路からの `reverify_recorded_pasta` の呼び出しは #1940 で実装済み（上の「実装（#1940）」の (3)）。SEC-4 の監査の記録のうち起動時の識別の不一致は #3330。作成時の `PermissionDenied` は記録先は状態ストアを開いた後にしか作れず D2（状態ルートを作る前の拒否）と両立せず、core の `AuditLayer` に pasta の語彙も無いため、記録しない（設計判断で、#3330 でも対象外）。本実装は分類（`PastaReverifyError::tamper_suspected`）だけを返す。(3) pasta の解決・検証の子（`--version`）が、`UNIMPLEMENTED` の拒否より前に 1 回起動される（`FailedPrecondition` と検証失敗の分類を作成前に返すため）。
 - **却下した案**: 環境変数・設定ファイル（オーナー決定で不採用）、`--plugin-path-search` を pasta にも効かせる（plugin と pasta の opt-in が結合する）、supervisor の argv に足す（`MAX_ARGS` と契約が変わる）、core の `StateRecord` に同梱する（plugin 境界の型が変わる）
 
 ### 12.5 opt-in の `PATH` 探索
@@ -283,10 +283,10 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
   - 準備完了は `pid` を `O_NOFOLLOW | O_NONBLOCK` で開き、通常ファイル・所有者 euid・nlink 1 を確かめてから 33 バイトまで読み、10 進（末尾の改行 1 個は可）が spawn した子の PID と**完全一致**したときに限る。空・書き込み途中・別の値は「まだ」、10 進以外・32 バイト超は `FailedPrecondition`。並行して `try_wait` で子の生存を見る（pidfd ではなく未回収の `Child`。pid の再利用に影響されない）
   - argv は `pasta_argv` の固定の並び（`-f --quiet -P <pid> --config-net -4 -I eth0 --map-host-loopback none --map-guest-addr none --dns-forward 169.254.1.1 <#1937 の引数> <対象 PID>`）。`--host-lo-to-ns-lo` は付けない。`PastaTarget` は 0・1・自分自身を拒否する
   - 起動は env 空・cwd `/`・stdin / stdout null・stderr pipe。pre_exec は `sys::pasta::set_pdeathsig_on_spawn`（`PR_SET_PDEATHSIG=SIGKILL` と `getppid` の照合。不一致は `FailedPrecondition`）
-  - stderr は先頭 4 KiB（エスケープ後）だけ保持し以降は読み捨てる。準備完了の待ちの間と `is_alive` / `stop*` のたびに読めるだけ読む（待たない）。準備完了後の定期呼び出しは #1940 の監視の責務（長時間呼ばれないと 64 KiB の pipe が満ちて pasta の書き込みが止まりうる）
+  - stderr は先頭 4 KiB（エスケープ後）だけ保持し以降は読み捨てる。準備完了の待ちの間と `is_alive` / `stop*` のたびに読めるだけ読む（待たない）。準備完了後の定期呼び出しは #1940 で実装済み（`PastaGuardedProcess` の `wait` の周期ごとに呼ぶ）（長時間呼ばれないと 64 KiB の pipe が満ちて pasta の書き込みが止まりうる）
   - スレッドを作らない（launch の手順 8 が単一スレッドの区間のため。issue の「回収スレッドへ移す」から変更）。期限切れの `stop_checked` は `Timeout` を返して子を手元に残し、`stop` は未回収のハンドルをエラーに入れて返す。`Drop` は SIGKILL と 1 秒の回収待ちで、回収できなければ zombie のまま残す（zombie の間は pid が再利用されない）。スレッドへ移す `detach_reaper` は単一スレッドの区間の外から呼ぶ明示の opt-in（生成失敗は子を `unreaped` に戻して構造化エラーで返し、回収は 30 秒の期限つきで超えたらハンドルを手放す）
   - prepare は事前の観測（`observe_run_dir` が返す `RunDirExpectation`）と、開いた fd の `(st_dev, st_ino)` を照合する（`prepare_expecting`）。別物なら `FailedPrecondition` で何も消さず、作ったばかりの dir では古い `pid` を消さない。supervisor は排他の下で観測と prepare を続けて行い、`ours` は保持 fd の同一性から得る。残余は観測前の停止と、同じ既存 dir を 2 者が観測した場合で、コンテナ単位のプロセス間ロックが担う（#3355・CORE-2・REPAIR-5）
-  - 計装は `NetOpKind::PastaStart` / `PastaStop`（`spawn_pasta_with_recorder`・`stop_with_recorder`）。構造化ログの `pasta_ready` / `pasta_exit` と SEC-4 の監査は、`PastaReady` / `PastaStopOutcome` / `PastaDiagnostics` を材料に supervisor（#1940）が書く
+  - 計装は `NetOpKind::PastaStart` / `PastaStop`（`spawn_pasta_with_recorder`・`stop_with_recorder`）。構造化ログの `pasta_ready` / `pasta_exit` は、`PastaReady` / `PastaStopOutcome` / `PastaDiagnostics` を材料に supervisor が書く（#1940 で実装済み）。SEC-4 の監査は #3330
 - **却下した案**: `/tmp` の固定の場所（名前の衝突と symlink を仕込まれる余地）、pipe を `-P /proc/self/fd/N` で渡す（fd は閉じられる）、stderr の文言で判定する（契約ではない）
 
 ### 12.9 失敗の分類（ERR-1・NetErrorCode）・監査・期限
@@ -333,9 +333,9 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | restart | 新しい netns に、同じ関数で holder と pasta を作り直す（起動の経路を 1 つに保つ） |
 | delete | stop 済みが前提。ディレクトリの残骸だけを消し、記録の pid でのプロセスの探索・kill はしない（pid の再利用を避ける） |
 | supervisor の異常終了 | (1) pasta は pre_exec で `PR_SET_PDEATHSIG=SIGKILL` を設定し `getppid` で確かめる。(2) holder は自分で設定した PDEATHSIG と socket の EOF で終わる。(3) 3 段目として pasta の netns-quit（holder が消えると約 1 秒）が効く。PDEATHSIG は spawn したスレッドの終了でも届くので、**pasta は supervisor と同じ寿命のスレッド（入口の main スレッド）から spawn する**。これは #1940 の受け入れ条件と試験に入れる。孤児になったコンテナは稼働を続けるが（SUP-5）、ネットワークの転送は失われる（12.13 で報告） |
-| pasta・holder の途中死 | supervisor が pidfd で検出して構造化ログに残し、コンテナを stop と同じ手順で止めて終了理由を記録する。その後は restart policy に従う。分離は緩めない |
+| pasta・holder の途中死 | supervisor が `wait` の周期ごとの `try_wait` で検出して（pidfd は新しい unsafe を避けて採らなかった。#1940）構造化ログに残し、コンテナへ SIGTERM を送り 10 秒を超えたら SIGKILL して終了理由を記録する（上の「実装（#1940）」の (5)(6)）。その後は restart policy に従う。分離は緩めない |
 
-- 配置: pasta と holder は launch の後に起動するので supervisor の退避リーフを継承する。companion には登録しない。コンテナの cgroup と委譲親のどちらにも入らないことを #1940 で確かめる
+- 配置: pasta と holder は launch の後に起動するので supervisor の退避リーフを継承する。companion には登録しない。コンテナの cgroup と委譲親のどちらにも入らないことの実機での確認は #3331
 - unsafe: pre_exec と holder の `setns`・capset・prctl は `crates/net/src/sys.rs` の薄いラッパーに置く。事前承認の範囲に収まるかは該当 PR で security-auditor が判断し、収まらなければユーザーの承認を求める。net は libc 照合が入っている crate なので、定数・宣言の照合も同じ PR で足す
 - **却下した案**: pasta の netns-quit だけに頼る（issue が禁じる）、pasta だけを再接続する（起動の経路が 2 つになる）、コンテナを止めずにネットワーク無しで続ける（公開ポートが黙って消える）、pasta を holder の子にする（holder に fork と exec の unsafe が増え、supervisor から監視できない）、pasta を companion にする（コンテナの cgroup の上限と OOM の巻き添え）
 

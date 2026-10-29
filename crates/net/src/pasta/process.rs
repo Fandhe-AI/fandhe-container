@@ -4,7 +4,7 @@
 //! - 呼び出し元: supervisor の launch 手順 8（#1940）。検証済みの [`super::binary::PastaBinary`]（#1936）、
 //!   ポート公開の検証済みの型 [`super::port_forward::PastaPortForwards`]（#1937）、置き場所
 //!   [`super::run_dir::PastaRunDir`]、対象の netns を保持する holder の pid（#3197・#3198）を受けて [`spawn_pasta`] を呼ぶ。
-//!   実行中は `is_alive`（定期の呼び出しは #1940 の監視の責務）、終了時は `stop` を呼ぶ。
+//!   実行中は `is_alive`（定期の呼び出しは supervisor の `pasta_attach` が `wait` の周期ごとに行う（#1940 で実装済み））、終了時は `stop` を呼ぶ。
 //! - 起動: `argv[0]` は常に `pasta`、env は空、cwd は `/`、stdin / stdout は null、stderr は pipe。argv は
 //!   [`pasta_argv`] の固定の並びで、シェルを介さない。pre_exec で `PR_SET_PDEATHSIG=SIGKILL` を設定し、
 //!   親が `getppid` と一致することを確かめる（12.10 の (1)。`sys::pasta`）。
@@ -19,7 +19,7 @@
 //!   単一スレッドの区間の外から明示的に呼ぶ opt-in。
 //! - stderr: pipe で受け、先頭の [`PASTA_STDERR_CAP`] バイト分をエスケープして保持し、以降は読み捨てる。
 //!   読み出しは準備完了の待ちの間と `is_alive` / `stop*` の呼び出しのたびに行う（REPAIR-3: 長時間呼ばれないと
-//!   pipe〔64 KiB〕が満ちて pasta の書き込みが止まりうる。定期呼び出しは #1940 の責務）。
+//!   pipe〔64 KiB〕が満ちて pasta の書き込みが止まりうる。定期呼び出しは supervisor の `pasta_attach` が行う。#1940 で実装済み）。
 //! - エラーの message は固定の英文で、パス・argv・pasta の出力を含まない（ERR-1）。診断の材料は
 //!   [`PastaDiagnostics`] として返し、構造化ログ（`pasta_ready` / `pasta_exit`）と監査（SEC-4）への記録は呼び出し側が行う。
 //! - Linux 以外では [`spawn_pasta`] は `Unimplemented`（置き場所の型を作れないため実際には到達しない。CLI-1）。

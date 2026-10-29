@@ -5,7 +5,7 @@
 //! create / start / stop を platform-macos へ委譲するアダプタ（[`adapter`]。TASK-115.3・#387）、
 //! SIGTERM でのグレースフルシャットダウン（[`sys`]・[`frame_loop::serve_until`]）と `ping` ヘルスチェック（[`adapter`]。
 //! TASK-115.5・#389。SIGKILL・非対応 OS では VM 残留の余地が残る。REPAIR-3）。
-//! 未実装（実装済みを装わない。REPAIR-3）: 型つき本体と core の `ContainerRuntime` への接続（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）・
+//! 未実装（実装済みを装わない。REPAIR-3）: 型つき本体と core の `ContainerRuntime` への接続（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）・
 //! 永続的な監査ログへの配線（core 側 #1869 の設計）・macOS Venus（GPU-6、TASK-172〜181）の大半。
 //! virtio-gpu デバイスモデル等は `src/gpu/` 配下に置く定義（crate-naming.md）。実装済みは
 //! venus wire のパース骨格のみ（[`gpu::venus`]。TASK-172.2・#723。コマンド引数のパース・ディスパッチは未実装）と capset 応答の最小実装（TASK-172.3・#724。配線なし）。

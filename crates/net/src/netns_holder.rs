@@ -33,7 +33,7 @@
 //! - READY は [`READY_TIMEOUT`] 以内に待つ。停止は `NetnsHolderChannel::send_stop` または端を閉じて
 //!   [`STOP_GRACE`] 待ち、超えたら SIGKILL し [`REAP_TIMEOUT`] 以内に回収する（12.9）
 //! - 起動・回収・構造化ログ（`netns_holder_ready` / `netns_holder_exit`）は supervisor の責務で
-//!   （実装は `fandhe_container_supervisor::netns_holder`。#3198）、pidfd での監視は #1940。
+//!   （実装は `fandhe_container_supervisor::netns_holder`。#3198）、途中死の検出は supervisor の `pasta_attach` が `try_wait` で行う（pidfd は採らなかった。#1940）。
 //!   本モジュールは所要時間（`HolderReady::elapsed`）などの材料を返すだけ
 //!
 //! # 範囲外

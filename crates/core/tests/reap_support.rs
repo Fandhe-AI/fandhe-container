@@ -467,3 +467,40 @@ fn repair5_repair12_over_cap_error_is_same_when_child_exits_immediately() {
         }
     }
 }
+
+/// Pipes 方式でも `finish` の上限超過の文言は Files 方式・`check_cap` と同じ（Windows の既定方式の文言差を
+/// Linux でも検出する）。
+#[test]
+fn repair5_repair12_pipe_mode_captured_finish_rejects_over_cap() {
+    let mut cmd = self_cmd(FLOOD_TEST, "flood:50000");
+    let (mut child, captured) =
+        reap::spawn_captured_mode(&mut cmd, 1024, reap::CaptureMode::Pipes).expect("spawn");
+    let st = reap::wait_within(&mut child, Duration::from_secs(30));
+    // 読み手の閉鎖で子が書き込みエラーになる場合があるため、終了の様子（成功・失敗）は問わず finish を見る。
+    let st = st.expect("exit");
+    let err = captured.finish(st).expect_err("over cap");
+    assert_eq!(err, "stdout exceeded the 1024 byte capture cap");
+}
+
+/// EOF 待ちの猶予は 1 回の操作で合計 1 回: 孫が pipe を握ったままでも、`wait_within` で待った後の
+/// `wait_finished` は残り時間だけで戻る（合計で猶予 2 秒 + 余裕以下）。
+#[cfg(unix)]
+#[test]
+fn repair5_repair12_pipe_grace_is_shared_across_waits() {
+    let mut cmd = self_cmd("reap_support_child_leaves_holder", "holder");
+    let (mut child, captured) =
+        reap::spawn_captured_mode(&mut cmd, 1 << 20, reap::CaptureMode::Pipes).expect("spawn");
+    let start = std::time::Instant::now();
+    captured
+        .wait_within(&mut child, Duration::from_secs(30))
+        .expect("exit");
+    let pipes = captured.pipes.as_ref().expect("pipe mode");
+    pipes.wait_finished();
+    pipes.wait_finished();
+    let el = start.elapsed();
+    assert!(
+        el < Duration::from_millis(3500),
+        "grace waited twice: {el:?}"
+    );
+    captured.discard().expect("discard");
+}

@@ -236,11 +236,17 @@ pub(crate) fn drain_output_file(path: &std::path::Path, cap: u64) -> Result<Vec<
     result
 }
 
+/// 上限超過のエラー文言の唯一の作り方。ファイル・pipe 方式の `check_cap`・`take`・`finish`・`output_within`
+/// のすべてがこれを使い、検出経路によらず同じ文言にする（`<name>` は `stdout` / `stderr`）。
+fn over_cap_msg(name: &str, cap: u64) -> String {
+    format!("{name} exceeded the {cap} byte capture cap")
+}
+
 /// `drain_output_file` のエラーを、上限超過なら `check_cap`・pipe 方式と同じ `<name> exceeded the <cap> byte
 /// capture cap` に揃える（どの経路で検出しても同じ文言にする）。それ以外は `<name>: <e>`。
 fn file_err(name: &str, e: String, cap: u64) -> String {
     if e.starts_with("output exceeded the ") {
-        format!("{name} exceeded the {cap} byte capture cap")
+        over_cap_msg(name, cap)
     } else {
         format!("{name}: {e}")
     }
@@ -332,9 +338,12 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
 }
 
 /// pipe 方式の受け皿（stdout・stderr の読み手）。
-struct Pipes {
+pub(crate) struct Pipes {
     out: Stream,
     err: Stream,
+    /// EOF 待ちの期限。最初の `wait_finished` で `now + PIPE_EOF_GRACE` に決め、以後の呼び出し（`take` 等）は
+    /// 同じ期限までの残りしか待たない（1 回の操作で合計 `PIPE_EOF_GRACE` 以下）。
+    deadline: std::sync::OnceLock<Instant>,
 }
 
 impl Pipes {
@@ -351,8 +360,10 @@ impl Pipes {
 
     /// 両方の読み手が終わる（EOF・上限・エラー）のを `PIPE_EOF_GRACE` まで待つ。子が上限超過の pipe 閉鎖で
     /// 書き込みエラーになり終了した場合に、終了の検出より先に超過の印を確実に見るために使う。
-    fn wait_finished(&self) {
-        let until = Instant::now() + PIPE_EOF_GRACE;
+    pub(crate) fn wait_finished(&self) {
+        let until = *self
+            .deadline
+            .get_or_init(|| Instant::now() + PIPE_EOF_GRACE);
         let finished = |s: &Stream| {
             s.lock()
                 .map(|g| g.eof || g.overflow || g.done.is_some())
@@ -370,9 +381,7 @@ impl Pipes {
         for (name, s) in [("stdout", &self.out), ("stderr", &self.err)] {
             let g = s.lock().map_err(|_| format!("{name}: reader panicked"))?;
             if g.overflow {
-                return Err(format!(
-                    "{name}: output exceeded the {cap} byte capture cap"
-                ));
+                return Err(over_cap_msg(name, cap));
             }
             if let Some(e) = &g.done {
                 return Err(format!("{name}: {e}"));
@@ -393,7 +402,7 @@ pub struct Captured {
     /// 子を先頭にしたプロセスグループ ID（0 は「グループなし」で kill しない。Unix 以外は常に 0）。
     pgid: u32,
     /// pipe 方式のときの読み手（このとき上の 2 つのパスは空で使わない）。
-    pipes: Option<Pipes>,
+    pub(crate) pipes: Option<Pipes>,
 }
 
 impl Captured {
@@ -428,15 +437,15 @@ impl Captured {
     fn check_cap(&self) -> Result<(), String> {
         if let Some(p) = &self.pipes {
             return match p.overflow() {
-                Some(n) => Err(format!("{n} exceeded the {} byte capture cap", self.cap)),
+                Some(n) => Err(over_cap_msg(n, self.cap)),
                 None => Ok(()),
             };
         }
         if exceeds_cap(&self.out_path, self.cap)? {
-            return Err(format!("stdout exceeded the {} byte capture cap", self.cap));
+            return Err(over_cap_msg("stdout", self.cap));
         }
         if exceeds_cap(&self.err_path, self.cap)? {
-            return Err(format!("stderr exceeded the {} byte capture cap", self.cap));
+            return Err(over_cap_msg("stderr", self.cap));
         }
         Ok(())
     }
@@ -585,7 +594,13 @@ pub(crate) fn spawn_captured_mode(
             _ => Err("child pipes missing".to_string()),
         };
         match readers {
-            Ok((out, err)) => captured.pipes = Some(Pipes { out, err }),
+            Ok((out, err)) => {
+                captured.pipes = Some(Pipes {
+                    out,
+                    err,
+                    deadline: std::sync::OnceLock::new(),
+                })
+            }
             Err(e) => {
                 kill_group_or_report(captured.pgid);
                 reap_or_report(&mut child, REAP_WITHIN);
@@ -611,7 +626,7 @@ fn kill_group_or_report(pgid: u32) {
 /// 期限切れは `<program> did not finish within <within>` で、子を kill して回収してから返す。
 ///
 /// 保存量の上限（各 `OUTPUT_CAP` = 1 MiB。REPAIR-5・REPAIR-12）: 待ちループ（5 ms 間隔）で出力ファイルの
-/// 大きさを監視し、超えたら子を kill・回収してファイルを切り詰めて消し、`<program> output exceeded ...` の
+/// 大きさを監視し、超えたら子を kill・回収してファイルを切り詰めて消し、`<program> stdout exceeded ...` の
 /// `Err` を返す。終了後に上限を超えていた場合や読み取りの失敗も `Err`（先頭だけを正常値として返さない）。
 /// 子は新しいプロセスグループの先頭として起動し、kill・終了後の読み取り前にはグループ全体へ SIGKILL を送る
 /// （出力先を継承した孫が書き続けて保存量を増やさない。REPAIR-5）。

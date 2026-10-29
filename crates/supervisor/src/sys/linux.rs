@@ -1003,6 +1003,16 @@ mod libc_abi {
 
 #[cfg(test)]
 mod tests {
+    /// 対応外 arch の失敗は `pre_exec`（fork 後）から返るため、ヒープを確保する custom error ではなく
+    /// `ErrorKind` だけの error である（inner が無く errno も持たない）。SUP-6・#3313・REPAIR-12。
+    #[test]
+    fn unsupported_error_is_allocation_free_simple_kind() {
+        let e = unsupported();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        assert!(e.get_ref().is_none(), "custom error would allocate");
+        assert_eq!(e.raw_os_error(), None);
+    }
+
     use super::*;
 
     /// SUP-14・#2599: errno の値（x86_64・aarch64 共通）と、実ファイルの `security.capability` 読み取り。

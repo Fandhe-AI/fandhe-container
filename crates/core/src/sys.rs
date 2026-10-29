@@ -2383,10 +2383,18 @@ pub(crate) fn open_ns_file(path: &CStr) -> Result<OwnedFd, SysError> {
 /// `extern` 宣言と `unsafe` が要り、非 LP64 では `libc_abi` の照合も働かないため採らない。
 /// 対応 arch では `SUPPORTED` が定数の真で分岐は消え、挙動は変わらない。
 fn last_error() -> SysError {
-    if !consts::SUPPORTED {
+    classify_last_error(consts::SUPPORTED, || {
+        io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    })
+}
+
+/// [`last_error`] の分類本体。`supported` が偽なら `read_errno` を呼ばず `Unsupported` を返す
+/// （非 LP64 でも x86_64 上で分岐を試験できるよう、`SUPPORTED` と errno の読み出しを引数で受ける。#3313・MVM-4）。
+fn classify_last_error(supported: bool, read_errno: impl FnOnce() -> i32) -> SysError {
+    if !supported {
         return SysError::Unsupported;
     }
-    SysError::Os(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    SysError::Os(read_errno())
 }
 
 /// 指定 namespace 群を 1 回の `unshare(2)` で分離する。
@@ -6863,6 +6871,38 @@ pub(crate) fn effective_gid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// 対応外 arch では古い errno（ここでは EACCES=13）が残っていても errno を読まず `Unsupported` になる
+    /// （#3313・MVM-4・REPAIR-12）。
+    #[test]
+    fn classify_last_error_unsupported_ignores_stale_errno() {
+        let mut read = false;
+        let e = classify_last_error(false, || {
+            read = true;
+            13
+        });
+        assert!(matches!(e, SysError::Unsupported), "got {e:?}");
+        assert!(!read, "errno must not be read on unsupported arch");
+    }
+
+    /// 対応 arch（x86_64・aarch64）では従来どおり errno が `Os(errno)` として維持される
+    /// （#3313・MVM-4・REPAIR-12）。
+    #[test]
+    fn classify_last_error_supported_keeps_errno() {
+        for errno in [1, 2, 13, 22] {
+            let e = classify_last_error(true, || errno);
+            assert!(matches!(e, SysError::Os(n) if n == errno), "got {e:?}");
+        }
+    }
+
+    /// 実際の `last_error()` は対応 arch で直前の errno を `Os` として返す（#3313・MVM-4・REPAIR-12）。
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn last_error_reads_errno_on_supported_arch() {
+        // SAFETY 不要: std 経由で errno を設定する。
+        let _ = std::fs::File::open("/nonexistent/fandhe-3313");
+        let e = last_error();
+        assert!(matches!(e, SysError::Os(2)), "got {e:?}");
+    }
     /// CORE-6・SEC-5(#2644): 自分の pidfd への検査の結果が、実際のグループ送信の対応可否(`EINVAL` かどうか)と一致する。
     #[cfg(target_os = "linux")]
     #[test]

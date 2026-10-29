@@ -49,7 +49,7 @@ echo "${n}" >"${STUB_COUNTER}"
 # libtest の --logfile を模す（#2962）。引数から経路を拾う。
 lf=""; prev=""
 nc=""
-for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; [ "${a}" = --nocapture ] && nc=1; prev="${a}"; done
+for a in "$@"; do [ "${prev}" = --logfile ] && lf="${a}"; [ "${a}" = --no-capture ] && nc=1; prev="${a}"; done
 case "${STUB_MODE}" in
   ok) echo "test result: ok. 1 passed; 0 failed"; [ -z "${lf}" ] || echo "ok a::b::c" >"${lf}" ;;
   zero) echo "test result: ok. 0 passed; 0 failed"; [ -z "${lf}" ] || : >"${lf}" ;;
@@ -60,7 +60,7 @@ case "${STUB_MODE}" in
     echo "test result: ok. 1 passed; 0 failed"; [ -z "${lf}" ] || echo "ok a::b::c" >"${lf}" ;;
   # 汎用: STUB_STDOUT / STUB_STDERR / STUB_LOG は printf %b で出す。STUB_LOG_FIRST_ONLY=1 は 1 回目だけログを書く。
   gen)
-    # 成功した試験の出力は --nocapture が無いと libtest にキャプチャされて出ない（P1）。それを模す。
+    # 成功した試験の出力は --no-capture が無いと libtest にキャプチャされて出ない（P1）。それを模す。
     [ -z "${STUB_NC_STDOUT:-}" ] || [ -z "${nc}" ] || printf '%b' "${STUB_NC_STDOUT}"
     [ -z "${STUB_STDOUT:-}" ] || printf '%b' "${STUB_STDOUT}"
     [ -z "${STUB_STDERR:-}" ] || printf '%b' "${STUB_STDERR}" >&2
@@ -112,7 +112,7 @@ case "\${STUB_MODE}" in
   scope-gen)
     lf=""; prev=""
     nc=""
-    for a in "\$@"; do [ "\${prev}" = --logfile ] && lf="\${a}"; [ "\${a}" = --nocapture ] && nc=1; prev="\${a}"; done
+    for a in "\$@"; do [ "\${prev}" = --logfile ] && lf="\${a}"; [ "\${a}" = --no-capture ] && nc=1; prev="\${a}"; done
     [ -z "\${STUB_NC_STDOUT:-}" ] || [ -z "\${nc}" ] || printf '%b' "\${STUB_NC_STDOUT}"
     [ -z "\${STUB_STDOUT:-}" ] || printf '%b' "\${STUB_STDOUT}"
     [ -z "\${STUB_STDERR:-}" ] || printf '%b' "\${STUB_STDERR}" >&2
@@ -269,10 +269,10 @@ check forbidden-total-1025 2 "usage:" ok "${P}" "${T}" "FORBIDDEN_LINE=$(printf 
 check forbidden-equals-success-line 2 "usage:" gen "${P}" "${B}" "${S}" "FORBIDDEN_LINE=exec_x: all scenarios passed"
 check forbidden-equals-libtest-ok 2 "usage:" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=ok sec1_x"
 check forbidden-equals-lib-ok 2 "usage:" ok "${P}" "${T}" "FORBIDDEN_LINE=ok a::b::c"
-# 成功した試験の出力（--nocapture のときだけ出る）の禁止行を検出する（P1）。FORBIDDEN_LINE 無しでは --nocapture を付けない。
-check forbidden-nocapture-libtest 1 "reason=forbidden-line forbidden='(root=true)'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
-check forbidden-nocapture-lib 1 "reason=forbidden-line" gen "${P}" "${T}" "FORBIDDEN_LINE=zzz" 'STUB_NC_STDOUT=zzz\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
-check nocapture-not-without-forbidden 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" 'STUB_NC_STDOUT=(root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+# 成功した試験の出力（--no-capture のときだけ出る）の禁止行を検出する（P1）。FORBIDDEN_LINE 無しでは --no-capture を付けない。
+check forbidden-no-capture-libtest 1 "reason=forbidden-line forbidden='(root=true)'" gen "${P}" "${B}" "${LN}" "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check forbidden-no-capture-lib 1 "reason=forbidden-line" gen "${P}" "${T}" "FORBIDDEN_LINE=zzz" 'STUB_NC_STDOUT=zzz\n' 'STUB_LOG=ok a::b::c\n' COUNT=1
+check no-capture-not-without-forbidden 0 "passed=1 failed=0" gen "${P}" "${B}" "${LN}" 'STUB_NC_STDOUT=(root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
 # 引数: --logfile は lib と LIBTEST_NAME にだけ付き、SUCCESS_LINE には付かない。
 rm -f "${work}/args" "${work}/counter"
 env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
@@ -357,7 +357,7 @@ done
 check scope-libtest-pass 0 "passed=1 failed=0 count=1 test_bin=exec_x" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 TEST_IGNORED=1 'STUB_LOG=ok sec1_x\n' COUNT=1
 check scope-libtest-missing 1 "reason=missing-libtest-ok" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 'STUB_LOG=' COUNT=1
 check scope-forbidden 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
-check scope-forbidden-nocapture 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
+check scope-forbidden-no-capture 1 "reason=forbidden-line forbidden='(root=true)'" scope-gen "${P}" "${B}" "${LN}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=true)" 'STUB_NC_STDOUT=x (root=true)\n' 'STUB_LOG=ok sec1_x\n' COUNT=1
 check scope-success-line-forbidden 1 "passed=0 failed=1 count=1" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 "FORBIDDEN_LINE=(root=false)" COUNT=1
 check scope-binary-none 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=none
 check scope-binary-two 1 "not uniquely identified" scope-ok "${P}" "${B}" "${FL}" "${SB}" USER_SCOPE=1 STUB_JSON_MODE=two

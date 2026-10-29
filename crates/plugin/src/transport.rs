@@ -1808,15 +1808,65 @@ mod tests {
     }
 
     /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
+    ///
+    /// 対の生成は `spawn_gate::create_fds` の下で行い、`spawn_gate::spawn` 経由の spawn が
+    /// close-on-exec 前の fd を継承する窓を塞ぐ（#3139・#3436）。ゲートを通らない試験の直接
+    /// `Command::spawn` には効かないため、相手の切断に依存する試験は `peer.shutdown` や
+    /// [`stream_pair_with_closed_peer`] で fd の複製の有無に依らない形にする。
     #[cfg(unix)]
     fn stream_pair() -> (UdsStream, std::os::unix::net::UnixStream) {
-        let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (ours, peer) = crate::spawn_gate::create_fds(
+            std::time::Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+            std::os::unix::net::UnixStream::pair,
+        )
+        .unwrap();
         let stream = UdsStream {
             inner: imp::StreamInner::from_std(ours),
             poisoned: false,
             io_timeout_unrestored: false,
         };
         (stream, peer)
+    }
+
+    /// 相手を `drop` し、その close が自分側へ届いたこと（EOF）を期限つきで確かめてから包む。
+    ///
+    /// 並行する試験の fork から exec までの間は、子が相手 fd の複製を持ち、`drop(peer)` だけでは
+    /// socket が閉じきらない。その状態の 1 回の write は成功してしまう（#3436）。`shutdown` を誰も
+    /// 呼ばないので、自分側の EOF は相手 socket の最後の参照が閉じたときにだけ起きる。Linux は
+    /// 閉鎖の際に相手を dead 化するため、EOF が見えれば以後の write は EPIPE になる。macOS も
+    /// 切断が両端にかかり同様。待ちは 10 秒で打ち切る（REPAIR-5）。
+    #[cfg(unix)]
+    fn stream_pair_with_closed_peer() -> UdsStream {
+        use std::io::Read as _;
+        let (ours, peer) = crate::spawn_gate::create_fds(
+            std::time::Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+            std::os::unix::net::UnixStream::pair,
+        )
+        .unwrap();
+        drop(peer);
+        ours.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut probe = [0u8; 1];
+        loop {
+            match (&ours).read(&mut probe) {
+                Ok(0) => break,
+                Ok(n) => panic!("unexpected {n} byte(s) from closed peer"),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "peer close was not observed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("probe read failed: {e:?}"),
+            }
+        }
+        ours.set_nonblocking(false).unwrap();
+        UdsStream {
+            inner: imp::StreamInner::from_std(ours),
+            poisoned: false,
+            io_timeout_unrestored: false,
+        }
     }
 
     /// PLUG-7・PLUG-2・REPAIR-5: 送信直後に相手が応答を書いて切断し、期限を復元できなかった
@@ -1827,6 +1877,8 @@ mod tests {
         let (mut stream, mut peer) = stream_pair();
         let response = Frame::new(b"pong".to_vec()).unwrap();
         peer.write_all(&response.encode()).unwrap();
+        // fd の複製が残っても EOF が即時かつ決定的になるよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
 
         // write_frame が成功し、期限の復元だけが相手切断で失敗した状態。
@@ -1858,6 +1910,8 @@ mod tests {
     fn repair5_einval_read_falls_back_to_nonblocking_read_until_eof() {
         let (stream, mut peer) = stream_pair();
         peer.write_all(b"tail").unwrap();
+        // fd の複製が残っても残りデータの後に EOF を返すよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
         let einval = || Err(io::Error::from(io::ErrorKind::InvalidInput));
         let mut buf = [0u8; 16];
@@ -1904,8 +1958,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair5_einval_write_to_closed_peer_returns_broken_pipe() {
-        let (stream, peer) = stream_pair();
-        drop(peer);
+        // 相手の close が届いたことを確かめてから 1 回だけ試す（#3436）。
+        let stream = stream_pair_with_closed_peer();
         let e = stream
             .inner
             .write_once_after(b"x", Err(io::Error::from(io::ErrorKind::InvalidInput)))
@@ -1948,6 +2002,8 @@ mod tests {
         assert_eq!(&got, b"ping");
 
         peer.write_all(b"pong").unwrap();
+        // fd の複製が残っても EOF が即時になるよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
         let n = stream.read_within(&mut buf, WITHIN).unwrap();
         assert_eq!(buf.get(..n), Some(&b"pong"[..]));

@@ -13,7 +13,7 @@
 //!   本番 sink `FileAuditSink`〔#1594〕は実装済み。CLI の create は destination 拒否を配線済み〔#2480〕。plugin-cri の peer 認証の拒否は層 `plugin_peer` として配線済み〔#2484〕。healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
-//!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`
+//!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection_at` で、種別 `rootfs_pivot`
 //!   の `rootfs_is_host_root` は層 `mount` のパスなし・理由コードつきの 1 件になる）。パスは持たない（型で保証）
 //! - エントリポイント検証の拒否（層 `entrypoint`。#1595）は `exec::audit_entrypoint_violation` /
 //!   `exec::record_entrypoint_rejection` が [`AuditEvent::Entrypoint`] として記録する。launch と exec の
@@ -56,9 +56,17 @@
 //! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
 //! 拒否した段は #3121 で [`AuditRecord::stage`] として追加済み（`IsolationStage` と同じ固定語彙の [`AuditStage`]）。
 //! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）と、
-//! supervisor の exec の親の entrypoint の記録（`exec::record_entrypoint_rejection_at`。worker の結果行で届いた
-//! `ExecChildStep` を `ExecChildStep::stage` で写す。届かなければ載せない。#3209）が載せる。他の層は載せない
-//! （キー自体を出さない）。
+//! supervisor の exec の親の記録が載せる。他の層は載せない（キー自体を出さない）。親の記録点の段の対応づけ（#3209・#3294）:
+//!
+//! - **entrypoint**（worker の `ok` 行。`exec::record_entrypoint_rejection_at`）: 結果行で届いた `ExecChildStep` を
+//!   `ExecChildStep::stage` で写す。届かなければ載せない
+//! - **worker の失敗**（worker の `err` 行。`exec::record_exec_worker_rejection_at`）: `err` 行の段の欄は
+//!   `IsolationStage::as_str` のトークンで、親は `IsolationStage::from_token` で引き直してそのまま記録の `stage` に載せる
+//!   （恒等の写像で、第 2 の対応表は持たない）。worker は違反を伴うときだけ `ExecError::stage` を運ぶ。bundle の rootfs の
+//!   固定の拒否〔`RootfsPinError`〕は段を持たないため、利用者向けメッセージ（`exec stage Validate:`）と同じ出所の
+//!   `Validate` を呼び出した段として運ぶ。欄の無い旧形式の行・未知のトークン・違反なしで段あり・違反ありで段なしは
+//!   壊れた行として拒否し、記録しない（fail-closed）
+//!
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 //!
@@ -69,10 +77,6 @@
 //!   書かれ中継を通らず、exec の親も中継ではなく `FileAuditSink` を使うため、段を運ぶ必要が生じていない。拡張が
 //!   要るのは、複数スレッドの文脈（例: supervisor 内の healthcheck。#2441）から中継経由で段つきの層を記録する
 //!   経路を足すとき。そのときは段だけでなく Entrypoint・ExecTarget などの層ごと運べるようにする
-//! - **`exec::record_exec_worker_rejection`**（worker の `err` 行）: 親の手元に段は無く、`TraitError` の自由文の
-//!   中にしか無い。理由コードから段を引く表は `from_violation_at` が上書きする段（例: pin の `path_missing` は既定で
-//!   `MountProc` だが実際は Landlock の段）と食い違い、誤った段を記録する。自由文の解析も採らない（REPAIR-2）。
-//!   正しく載せるには worker の `err` 行に段のトークンの欄を足す（worker プロトコルの変更）必要がある
 
 #[cfg(target_os = "linux")]
 mod control_relay;

@@ -65,7 +65,7 @@
 //!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）、
 //!   エントリポイント検証の拒否（層 `entrypoint`）は [`audit_entrypoint_violation`]・
 //!   [`record_entrypoint_rejection`]（#1595）、supervisor の exec の worker の経路の拒否（層 `exec_target`、
-//!   または種別 `rootfs_pivot` の `rootfs_is_host_root` を層 `mount` のパスなし）は [`record_exec_worker_rejection`] が担う。
+//!   または種別 `rootfs_pivot` の `rootfs_is_host_root` を層 `mount` のパスなし）は [`record_exec_worker_rejection_at`] が担う（段つき。#3294）。
 //!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
 //!   （REPAIR-3）。システムエラーには付かない
 //!
@@ -514,18 +514,39 @@ pub fn record_exec_target_rejection<E>(
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
 /// プロセスのもので、違反したプロセスや pid1 ではない。
 ///
-/// 段は載せない（#3209・REPAIR-3）: 親の手元に段は無く `TraitError` の自由文にしか無い。理由から段を引く表は
-/// `from_violation_at` が上書きする段と食い違い誤る。載せるには worker の `err` 行に段の欄を足す必要がある
-/// （`audit_log` のモジュール doc「段を載せない記録点と理由」）。
+/// 段は載せない版（出力は従来どおり）。段を持つ呼び出し側は [`record_exec_worker_rejection_at`] を使う（#3294）。
 pub fn record_exec_worker_rejection<E>(
     error: E,
     reason: ViolationReason,
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_exec_worker_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_exec_worker_rejection`] に拒否した段 `stage` を載せる版（SEC-4・ERR-4・SUP-6・#3294。#3209 の残り）。
+///
+/// 呼び出し元は supervisor の exec の親（`audit_worker_result`）で、worker の `err` 行の段の欄を
+/// [`IsolationStage::from_token`] で引き直した値を渡す。段は worker が `ExecError::stage` から運んだもので
+/// （bundle の rootfs の固定の拒否だけは呼び出した段 `Validate`）、理由から段を引く表は使わない
+/// （`from_violation_at` が上書きする段と食い違い誤るため）。`stage` が `None`（段を運べなかった）のときは
+/// 段を載せない（推測で捏造しない）。それ以外は [`record_exec_worker_rejection`] と同じ。
+pub fn record_exec_worker_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_worker_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -965,6 +986,14 @@ pub enum IsolationStage {
 }
 
 impl IsolationStage {
+    /// トークンから静的な値へ引き直す（`ALL` と `as_str` の照合。未知・綴り違い〔Debug 綴り等〕は `None`）。
+    ///
+    /// 呼び出し元: supervisor の exec の親が worker の `err` 行の段の欄を復号するとき。外部（worker の pipe）から
+    /// 届いた文字列を静的トークンへ変える唯一の入口で、記録へは引き直した静的値だけを入れる（SEC-4・#3294）。
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == token)
+    }
+
     /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
     pub const ALL: [Self; 35] = [
         Self::Validate,
@@ -3082,6 +3111,17 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-4・ERR-4・#3294: `IsolationStage::from_token` は `as_str` と往復し、綴り違い（Debug 綴り・空・空白つき）は拒否する。
+    #[test]
+    fn sec4_err4_isolation_stage_from_token_round_trips() {
+        for stage in IsolationStage::ALL {
+            assert_eq!(IsolationStage::from_token(stage.as_str()), Some(stage));
+        }
+        for bad in ["", "Exec", "SetNs", "exec ", " exec", "bogus", "set-ns"] {
+            assert_eq!(IsolationStage::from_token(bad), None, "{bad:?}");
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
 

@@ -2734,7 +2734,6 @@ mod peer_sentinel_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     /// 一時ディレクトリ（0700）に listener を bind し、実接続した (client, server) を返す。

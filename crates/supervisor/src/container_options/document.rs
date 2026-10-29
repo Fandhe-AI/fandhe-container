@@ -31,13 +31,13 @@
 //! `network`・`add-host`・`dns` は #3065(NET-6・NET-12・network-wiring.md D4)で足した kind で、版は上げない(同じ理由)。
 //! `network` は 1 レコード(64 バイト以下)、`add-host` は 256 件以下(1 件 299 バイト以下)、`dns` は 32 件以下
 //! (1 件 45 バイト以下)。復号のたびに net のパーサで再検証し([`NetworkOptions`])、`network` が無ければ
-//! core の `LaunchNetworkMode::FromConfig`(従来の挙動)になる。CLI が書く処理と既定の `none` は #1873。
+//! core の `LaunchNetworkMode::FromConfig`(従来の挙動)になる。CLI が書く処理と既定の `none` は #1873(PR #3322)で実装済み。
 //!
 //! `pasta` は #3199(NET-9・CLI-1・PLUG-11・SUP-12・rootless-network.md 12.4)で足した kind で、版は上げない(同じ理由)。
 //! 作成時に検証した pasta の実体の記録(net の `PastaRecord` の本文。4096 バイト以下・重複は拒否)で、`network` が
 //! ユーザー定義名のときだけ置ける(違えば `InvalidArgument`)。復号では本文の形だけを検証し(副作用なし)、バイナリの
 //! 再検証は [`super::pasta::reverify_recorded_pasta`] が起動の直前に行う(start 経路への結線と監査の記録は #1940)。
-//! CLI が書く処理は `--network` のユーザー定義名の解除(#1873)後に有効になる(現状は `UNIMPLEMENTED` で書かれない)。
+//! CLI が書く処理は `--network` のユーザー定義名の解除(#3329)後に有効になる(現状は `UNIMPLEMENTED` で書かれない)。
 //! `publish` は #3200(NET-9・NET-3)で足した kind で、版は上げない(同じ理由)。`-p` / `--publish` の生の文字列
 //! (`[<ipv4>:]<host>:<container>[/tcp|udp]`)を 1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下で持ち、復号のたびに
 //! net の `PastaPortForwards::parse_all` で検証し直す。ユーザー定義名の `network` と組でなければ拒否する

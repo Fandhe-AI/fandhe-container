@@ -406,7 +406,7 @@ pub use violation::{
 ///
 /// launch 経路（fork 後の子）は sink に触らない。子が失敗した段と理由を状態 pipe で親へ返し、親が
 /// [`record_launch_mount_rejection`] で記録する（#1815）。その親側の入口は実装済みで、本番 launcher
-/// （`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。supervisor への結線は未実装（#1819。REPAIR-3）。
+/// （`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。supervisor の start 経路も結線済みで、`default_audit_sink` の sink を本番 launcher の `audit_sink` へ渡す（#1819。SEC-4）。
 /// ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの

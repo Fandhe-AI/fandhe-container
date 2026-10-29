@@ -406,15 +406,29 @@ pub enum OwnershipPolicy {
 /// 確認はレイヤーの前・パス 1 のエントリごと・パス 2 のマーカーごと・パス 3 のエントリごと（書き込みの前）・
 /// 遅延ディレクトリ mode の適用の前に行い、期限超過か取り消しなら `OciErrorCode::Timeout` で止まる。分割できない区間は
 /// 1 エントリの本体の書き込み（最大 `max_total_bytes`）と 1 本の tar の終端後の読み捨て（入力上限で有界）。
-#[derive(Debug, Clone, Copy)]
+///
+/// 期限の判定に使う時計は `with_clock` で差し替えられる（#3297・REPAIR-5・REPAIR-12）。差し替えるのは cri の
+/// `PullBudget::extract_budget`（pull 全体の時計を展開と共有する）と試験だけで、CreateContainer 経路
+/// （cri の `adapter.rs`・`bundle/image_rootfs.rs`）は既定の `Instant::now` のまま使う。
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct ExtractBudget<'a> {
     /// この時刻以降は `Timeout`（`None` は期限なし）。
     deadline: Option<Instant>,
     /// 立ったら `Timeout`（RPC の期限切れで worker を手放したとき等。`None` は取り消しなし）。
     cancel: Option<&'a AtomicBool>,
-    /// 現在時刻の取得口（試験だけが差し替える）。
-    now: fn() -> Instant,
+    /// 現在時刻の取得口（既定は `Instant::now`。試験の擬似時計は `with_clock` で差し替える）。
+    now: &'a (dyn Fn() -> Instant + Sync),
+}
+
+impl std::fmt::Debug for ExtractBudget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractBudget")
+            .field("deadline", &self.deadline)
+            .field("cancel", &self.cancel)
+            .field("now", &"<clock>")
+            .finish()
+    }
 }
 
 impl Default for ExtractBudget<'_> {
@@ -429,7 +443,7 @@ impl<'a> ExtractBudget<'a> {
         Self {
             deadline: None,
             cancel: None,
-            now: Instant::now,
+            now: &Instant::now,
         }
     }
 
@@ -437,6 +451,17 @@ impl<'a> ExtractBudget<'a> {
     #[must_use]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// 期限の判定に使う現在時刻の取得口を差し替える（既定は `Instant::now`）。
+    ///
+    /// 試験が擬似時計で期限を決定的にするための口（#3297・REPAIR-5・REPAIR-12）。cri の `PullBudget` が pull の時計を
+    /// 展開と共有するためにも使う。本番の呼び出し元は既定のまま使うこと。戻り値は単調非減少でなければならず、
+    /// 止まった時計を渡すと期限が効かなくなる。
+    #[must_use]
+    pub fn with_clock(mut self, now: &'a (dyn Fn() -> Instant + Sync)) -> Self {
+        self.now = now;
         self
     }
 
@@ -8055,7 +8080,7 @@ mod tests {
         static CLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
-    /// 呼ぶたびに 1 秒進む試験用の時計（`ExtractBudget::now` へ注入する）。
+    /// 呼ぶたびに 1 秒進む試験用の時計（`ExtractBudget::with_clock` へ注入する）。
     fn tick_clock() -> Instant {
         let n = CLOCK_CALLS.with(|c| {
             let v = c.get();
@@ -8099,9 +8124,9 @@ mod tests {
         let sb = Sandbox::new();
         CLOCK_CALLS.with(|c| c.set(0));
         // 呼び出し 0 = レイヤー前、1..=5 = パス 1 の 5 エントリ、6.. = パス 3。8 回目の呼び出し（3 件目）で期限。
-        let mut budget = ExtractBudget::new()
-            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(8));
-        budget.now = tick_clock;
+        let budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(8))
+            .with_clock(&tick_clock);
         let entries = [
             file("a", 0o644, b"A"),
             file("b", 0o644, b"B"),
@@ -8181,9 +8206,9 @@ mod tests {
         CLOCK_CALLS.with(|c| c.set(0));
         // 確認回数は OS ごとの実装（Linux の fd 起点の走査と非 Linux の whiteout 経路）で異なる。
         // どちらでも木の 12 エントリ（t・d・ファイル 10 個）より十分手前の 4 回目の確認で期限になる値にする。
-        let mut budget = ExtractBudget::new()
-            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(4));
-        budget.now = tick_clock;
+        let budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(4))
+            .with_clock(&tick_clock);
         let e = remove_extracted_tree_bounded(&t, &budget).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Timeout);
         assert_eq!(e.message(), "tree removal exceeded its deadline");

@@ -14,15 +14,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fandhe_container_core::audit_log::{ControlAuditRelay, FileAuditSink};
+use fandhe_container_core::traits::TraitError;
 
 /// 監査専用の helper を fork して記録先を確かめる。`state_root` が `None` なら既定の状態ルート。
-/// 失敗したら固定文言のエラーコードトークンを返す。
+/// 失敗したら型付きの `TraitError` をそのまま返す（表示用のコードトークンへの変換は呼び出し側の `main.rs`）。
 pub fn open_audit_relay_in(
     state_root: Option<PathBuf>,
-) -> Result<Arc<ControlAuditRelay>, &'static str> {
+) -> Result<Arc<ControlAuditRelay>, TraitError> {
     let relay = FileAuditSink::open_in_state_root(state_root)
         .and_then(ControlAuditRelay::spawn_ignoring_stop_signals)
-        .and_then(|relay| relay.probe().map(|()| relay))
-        .map_err(|e| e.code().as_str())?;
+        .and_then(|relay| relay.probe().map(|()| relay))?;
     Ok(Arc::new(relay))
 }

@@ -190,6 +190,18 @@ mod linux {
         };
         let exited_at = Instant::now();
         assert!(exit.success(), "child exit status: {exit:?}");
+        // helper は子の stdout を継承しているため、helper が残る間は reader が EOF を受けない。join の前に
+        // 本体の終了時点からの期限つきで helper の終了を確かめる（REPAIR-5。残存は join の無期限待ちにしない）。
+        let bound = AUDIT_HELPER_LINGER_BOUND.max(RECORD_WAIT_LIMIT) + LINGER_MARGIN;
+        deadline_loop(bound, "the audit helper to exit", || {
+            match stat_fields(helper_pid) {
+                None => true,
+                Some(f) => {
+                    f.first().map(String::as_str) == Some("Z")
+                        || f.get(19).map(String::as_str) != Some(helper_start.as_str())
+                }
+            }
+        });
         reader.join().expect("reader thread");
         let lines: Vec<String> = rx.try_iter().collect();
         let child_ok = format!(
@@ -213,17 +225,6 @@ mod linux {
             assert!(!line.contains("uid\":"), "no uid value: {line}");
         }
 
-        // helper が残り続けず、期限つきで終わる（本体の終了で socketpair が EOF になる）。
-        let bound = AUDIT_HELPER_LINGER_BOUND.max(RECORD_WAIT_LIMIT) + LINGER_MARGIN;
-        deadline_loop(bound, "the audit helper to exit", || {
-            match stat_fields(helper_pid) {
-                None => true,
-                Some(f) => {
-                    f.first().map(String::as_str) == Some("Z")
-                        || f.get(19).map(String::as_str) != Some(helper_start.as_str())
-                }
-            }
-        });
         println!(
             "shutdown_audit_helper: {REJECTED} drain rejections reached @audit.log after group SIGTERM; helper exited within bound ({} ms after the child)",
             exited_at.elapsed().as_millis()

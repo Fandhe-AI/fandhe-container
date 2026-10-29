@@ -98,7 +98,8 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     #[cfg(target_os = "linux")]
     let audit_sink = match fandhe_container_plugin_cri::audit_relay::open_audit_relay_in(None) {
         Ok(relay) => relay as std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>,
-        Err(code) => {
+        Err(e) => {
+            let code = e.code().as_str();
             eprintln!("error: {code}: failed to open the audit log");
             return ExitCode::from(EXIT_FAILURE);
         }

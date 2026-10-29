@@ -8,7 +8,7 @@
 //! 本番の実行場所（Windows ホスト側か WSL2 内か）は未確定で、#1415 でオーナー判断待ち（WIN-1）。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::io::Read;

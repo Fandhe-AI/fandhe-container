@@ -16,7 +16,7 @@
 
 #![cfg(windows)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::path::{Path, PathBuf};

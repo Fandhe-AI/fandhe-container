@@ -22,7 +22,7 @@
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(not(all(

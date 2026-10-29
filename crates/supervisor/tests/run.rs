@@ -12,18 +12,20 @@
 //! root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため、ストアを使う試験は
 //! `linux` モジュールに置く（非 Linux の fail-closed は `state_store_wiring.rs` が照合済み）。
 
+#[path = "support/child_process.rs"]
+mod child_process;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
+use child_process::ChildProcess;
+
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
-use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 /// 期限つき待機の上限（AGENTS.md の推奨（子プロセス応答待ちは 5〜10 秒）に収める。REPAIR-5）。
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -44,98 +46,6 @@ fn unique_path(tag: &str) -> PathBuf {
         "fandhe-sup-run-it-{tag}-{}-{n}",
         std::process::id()
     ))
-}
-
-fn internal(msg: &'static str) -> TraitError {
-    TraitError::new(ErrorCode::Internal, msg)
-}
-
-/// 実プロセス（`std::process::Child`）を [`LaunchedProcess`] として扱うテスト用アダプタ。
-///
-/// 本番 launcher が未提供のため、監視ループ（`run::monitor`）へ注入する起動ハンドルの代役を務める。
-/// `Drop` で kill + 回収し、テスト失敗時にもプロセスを残さない。
-struct ChildProcess {
-    pid: NonZeroU32,
-    child: Mutex<Child>,
-}
-
-impl ChildProcess {
-    fn new(child: Child) -> Self {
-        let pid = NonZeroU32::new(child.id()).expect("child pid must be non-zero");
-        Self {
-            pid,
-            child: Mutex::new(child),
-        }
-    }
-
-    /// 強制終了（SIGKILL 相当）を送る。シグナル終了の試験用（Linux のテストだけが使う）。
-    #[cfg(target_os = "linux")]
-    fn kill(&self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-        }
-    }
-}
-
-fn map_exit(status: std::process::ExitStatus) -> Result<ProcessExit, TraitError> {
-    if let Some(code) = status.code() {
-        return Ok(ProcessExit::Exited(code));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return Ok(ProcessExit::Signaled(sig));
-        }
-    }
-    Err(internal("unrecognized exit status"))
-}
-
-impl LaunchedProcess for ChildProcess {
-    fn pid(&self) -> NonZeroU32 {
-        self.pid
-    }
-
-    fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
-        let end = Instant::now() + timeout;
-        loop {
-            {
-                let mut c = self
-                    .child
-                    .lock()
-                    .map_err(|_| internal("child lock poisoned"))?;
-                if let Some(status) = c.try_wait().map_err(|_| internal("try_wait failed"))? {
-                    return map_exit(status).map(Some);
-                }
-            }
-            if Instant::now() >= end {
-                return Ok(None);
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-
-    fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-        {
-            let mut c = self
-                .child
-                .lock()
-                .map_err(|_| internal("child lock poisoned"))?;
-            let _ = c.kill();
-        }
-        match self.wait(timeout)? {
-            Some(_) => Ok(()),
-            None => Err(TraitError::new(ErrorCode::Timeout, "terminate timed out")),
-        }
-    }
-}
-
-impl Drop for ChildProcess {
-    fn drop(&mut self) {
-        if let Ok(c) = self.child.get_mut() {
-            crate::reap::reap_on_drop(c);
-        }
-    }
 }
 
 /// コンテナ役の子プロセス本体。通常のテスト実行では環境変数が無く即 return する（no-op）。
@@ -184,7 +94,7 @@ fn spawn_container(go: &Path, exit_code: i32) -> ChildProcess {
     let child = container_command(go, exit_code)
         .spawn()
         .expect("spawn container role");
-    ChildProcess::new(child)
+    ChildProcess::new(child, POLL).expect("child pid must be non-zero")
 }
 
 /// 起動ハンドルのアダプタ自体の検証（3 OS 共通）。生存中は `None`、終了後は具体の終了コードを返す。
@@ -508,7 +418,8 @@ mod linux {
         cmd.env_remove(ENV_ROOT)
             .env_remove(ENV_ID)
             .env_remove(ENV_SUP_GO);
-        let child = ChildProcess::new(cmd.spawn().expect("spawn grandchild"));
+        let child = ChildProcess::new(cmd.spawn().expect("spawn grandchild"), POLL)
+            .expect("child pid must be non-zero");
         let mut state = mark_running(&root, &id, child.pid());
         let outcome = monitor(&mut state, &child, &cfg(), &StopToken::new()).expect("monitor");
         match outcome {
@@ -539,7 +450,7 @@ mod linux {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn supervisor role");
-        let sup = ChildProcess::new(child);
+        let sup = ChildProcess::new(child, POLL).expect("child pid must be non-zero");
 
         let release = Release(t.go());
         // コンテナ 1 個の間は supervisor が 1 個生存し、状態に監視権が記録される。

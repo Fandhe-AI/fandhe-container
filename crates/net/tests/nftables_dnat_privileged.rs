@@ -48,7 +48,7 @@
 //! （`nf_tables_alloc_handle` が `++table->hgenerator`）の想定どおり、新規テーブルへ chain → rule の順で
 //! 作ったルールのハンドルが [`EXPECTED_RULE_HANDLE`] に一致することを照合する（外れたら名指しして失敗する）。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(not(target_os = "linux"))]

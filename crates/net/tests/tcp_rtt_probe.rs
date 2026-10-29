@@ -24,7 +24,7 @@
 //! - 値は暫定値（`provisional: true`）。計測の場所（隔離 netns・コンテナ役が製品の起動経路を通らない等）の
 //!   制約は `docs/design/net-tcp-rtt-bench.md` と保持入口の `method` を参照
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::io::{Read as _, Write as _};

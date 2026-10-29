@@ -12,7 +12,7 @@
 // 非 Unix ではキャッシュのアクセス制御を検証できず fail-closed で拒否するため、本ファイルは Unix 限定。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::fs;

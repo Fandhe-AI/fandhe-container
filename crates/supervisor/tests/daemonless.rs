@@ -15,6 +15,9 @@
 //! 走査補助は別 crate のテストと共有できないため core 側と同等のものを複製している。root 不要で
 //! 既定のテスト集合で動く。
 
+#[cfg(target_os = "linux")]
+#[path = "support/child_process.rs"]
+mod child_process;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -46,20 +49,20 @@ fn sup1_task28_2_environ_marker_matching_is_exact() {
 mod linux {
     use super::environ_has_marker;
 
+    use super::child_process::ChildProcess;
     use std::fs;
     use std::io::Read;
     use std::num::NonZeroU32;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
     use fandhe_container_core::traits::{
-        ContainerId, ContainerState, ContainerStatus, CreateStateRequest, ErrorCode, StateStore,
-        SupervisionState, TraitError,
+        ContainerId, ContainerState, ContainerStatus, CreateStateRequest, StateStore,
+        SupervisionState,
     };
     use fandhe_container_supervisor::run::{MonitorConfig, MonitorOutcome, StopToken, monitor};
     use fandhe_container_supervisor::state::{SupervisedState, open_default_store};
@@ -135,84 +138,6 @@ mod linux {
         while !cond() {
             assert!(Instant::now() < end, "timed out waiting for {what}");
             std::thread::sleep(POLL);
-        }
-    }
-
-    fn internal(msg: &'static str) -> TraitError {
-        TraitError::new(ErrorCode::Internal, msg)
-    }
-
-    /// 実プロセスを [`LaunchedProcess`] として扱うアダプタ。`Drop` で kill + 回収する。
-    struct ChildProcess {
-        pid: NonZeroU32,
-        child: Mutex<Child>,
-    }
-
-    impl ChildProcess {
-        fn new(child: Child) -> Self {
-            let pid = NonZeroU32::new(child.id()).expect("child pid must be non-zero");
-            Self {
-                pid,
-                child: Mutex::new(child),
-            }
-        }
-    }
-
-    fn map_exit(status: std::process::ExitStatus) -> Result<ProcessExit, TraitError> {
-        if let Some(code) = status.code() {
-            return Ok(ProcessExit::Exited(code));
-        }
-        use std::os::unix::process::ExitStatusExt;
-        status
-            .signal()
-            .map(ProcessExit::Signaled)
-            .ok_or_else(|| internal("unrecognized exit status"))
-    }
-
-    impl LaunchedProcess for ChildProcess {
-        fn pid(&self) -> NonZeroU32 {
-            self.pid
-        }
-
-        fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
-            let end = Instant::now() + timeout;
-            loop {
-                {
-                    let mut c = self
-                        .child
-                        .lock()
-                        .map_err(|_| internal("child lock poisoned"))?;
-                    if let Some(s) = c.try_wait().map_err(|_| internal("try_wait failed"))? {
-                        return map_exit(s).map(Some);
-                    }
-                }
-                if Instant::now() >= end {
-                    return Ok(None);
-                }
-                std::thread::sleep(POLL);
-            }
-        }
-
-        fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-            {
-                let mut c = self
-                    .child
-                    .lock()
-                    .map_err(|_| internal("child lock poisoned"))?;
-                let _ = c.kill();
-            }
-            match self.wait(timeout)? {
-                Some(_) => Ok(()),
-                None => Err(TraitError::new(ErrorCode::Timeout, "terminate timed out")),
-            }
-        }
-    }
-
-    impl Drop for ChildProcess {
-        fn drop(&mut self) {
-            if let Ok(c) = self.child.get_mut() {
-                crate::reap::reap_on_drop(c);
-            }
         }
     }
 
@@ -315,7 +240,8 @@ mod linux {
         let root = PathBuf::from(root);
         let mut cmd = role_command(&nonce, "linux::child_container_role");
         cmd.env(ENV_GO, &go).env(ENV_ROLE, "container");
-        let child = ChildProcess::new(cmd.spawn().expect("spawn container role"));
+        let child = ChildProcess::new(cmd.spawn().expect("spawn container role"), POLL)
+            .expect("child pid must be non-zero");
         let mut state = SupervisedState::attach(open(&root), cid(&id)).expect("attach");
         state
             .write(
@@ -355,7 +281,8 @@ mod linux {
             .env(ENV_ID, id)
             .env(ENV_GO, t.go())
             .env(ENV_ROLE, "supervisor");
-        let sup = ChildProcess::new(cmd.spawn().expect("spawn supervisor role"));
+        let sup = ChildProcess::new(cmd.spawn().expect("spawn supervisor role"), POLL)
+            .expect("child pid must be non-zero");
         let sup_pid = sup.pid().get();
 
         // 稼働中: state.json に監視権とコンテナ pid が記録されるまで待つ。

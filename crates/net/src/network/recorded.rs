@@ -795,6 +795,7 @@ where
         None => Ok(()),
     }
 }
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::time::Duration;

@@ -2,9 +2,18 @@
 //! `*_privileged`・`tcp_rtt_probe`〕から `#[path]` で取り込む。REPAIR-5・NET-9）。kill の後も無期限の
 //! `Child::wait()` を呼ばず、`try_wait()` を有限の期限でポーリングする。`wait_within` は kill しない
 //! 正常終了待ちの期限つき版で、期限切れの扱い（reap して失敗させる）は呼び出し側が決める。
+//! `run_within` は外部コマンド（`kill` 等）を期限つきで実行する（`Command::status()` は spawn と無期限の wait を
+//! 兼ねるため使わない。#3306）。
+//!
+//! 回収期限（`reap_within`）の決め方: 各試験の `timeout()` と同じ規則（環境変数
+//! `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` を 1..=600 で解釈し、範囲外・非数値は 10 秒）の 3 倍とする。
+//! 既定では 30 秒。SIGKILL 後の回収は通常即時で、期限は D 状態などの異常時の上限であり、作業の期限より
+//! 短い回収期限で偽の失敗を出さないよう作業期限より長く取る。期限のつまみを 1 つの環境変数に揃えるため、
+//! 解釈の規則は各試験の `timeout()` と重複して持つ（`timeout()` の置き場が取り込み元ごとに違い共有できない）。
+//! 規則を変えるときは各試験の `timeout()` と合わせること。
 //! 取り込み元によって使う項目が異なるため、dead_code の許可は項目ごとに理由つきで付ける。
 
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// 子を kill し、`within` 以内に `try_wait()` で回収する。回収できない（期限切れ・`try_wait` の失敗）なら
@@ -29,9 +38,16 @@ pub fn reap(child: &mut Child, within: Duration) -> Result<(), String> {
     }
 }
 
-/// 既定の回収期限。各試験の期限切れ後の後始末で使う（SIGKILL 後の回収は通常即時）。
+/// 回収期限。各試験の `timeout()` と同じ規則で求めた期限の 3 倍（既定 30 秒。理由は冒頭の説明）。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-pub const REAP_WITHIN: Duration = Duration::from_secs(30);
+pub fn reap_within() -> Duration {
+    let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| (1..=600).contains(s))
+        .unwrap_or(10);
+    Duration::from_secs(secs * 3)
+}
 
 /// kill しない正常終了待ちの期限つき版。期限切れ・`try_wait` の失敗は具体的なメッセージの `Err`。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
@@ -62,11 +78,34 @@ pub fn reap_or_report(child: &mut Child, within: Duration) {
 /// `Drop` 用。回収失敗は通常時は panic で表に出し、巻き戻し中は abort を避けて stderr に出す。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn reap_on_drop(child: &mut Child) {
-    if let Err(e) = reap(child, REAP_WITHIN) {
+    if let Err(e) = reap(child, reap_within()) {
         if std::thread::panicking() {
             eprintln!("reap failure: {e}");
         } else {
             panic!("reap failure: {e}");
+        }
+    }
+}
+
+/// `cmd` を spawn し、`within` 以内の終了を待つ（外部 `kill` 等の期限つき実行。REPAIR-5）。
+/// spawn の失敗は `spawn <program> failed: <io error>`、期限切れは `<program> did not finish within <within>`
+/// （`<within>` は `Debug` 表記）の `Err`。期限切れでは起動した子を kill して回収してから返す
+/// （回収失敗は stderr に出す）。stdio は呼び出し側が設定する。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {program} failed: {e}"))?;
+    match wait_within(&mut child, within) {
+        Ok(st) => Ok(st),
+        Err(e) => {
+            reap_or_report(&mut child, reap_within());
+            if e.contains("did not exit within") {
+                Err(format!("{program} did not finish within {within:?}"))
+            } else {
+                Err(format!("{program}: {e}"))
+            }
         }
     }
 }

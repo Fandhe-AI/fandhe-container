@@ -34,6 +34,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::Cursor;
@@ -346,8 +350,7 @@ mod linux {
                 Some(st) if st.success() => return Ok(()),
                 Some(st) => return Err(format!("case {case} failed: {st}")),
                 None if start.elapsed() > CASE_TIMEOUT => {
-                    let _ = c.kill();
-                    let _ = c.wait();
+                    crate::reap::reap_or_report(&mut c, crate::reap::REAP_WITHIN);
                     return Err(format!("case {case} timed out"));
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

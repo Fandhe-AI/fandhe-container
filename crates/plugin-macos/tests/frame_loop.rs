@@ -6,7 +6,7 @@
 //! 対応 ID: TASK-115・PLUG-1・PLUG-12・MAC-1・REPAIR-5。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::io::{Read, Write};

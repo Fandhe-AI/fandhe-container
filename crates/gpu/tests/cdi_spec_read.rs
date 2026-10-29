@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::sync::Mutex;

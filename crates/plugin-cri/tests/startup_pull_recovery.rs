@@ -4,7 +4,7 @@
 //! 回収せず、drop 済み（クラッシュ相当）の pull だけを回収することを具体値で照合する。root 権限は不要。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::fs;

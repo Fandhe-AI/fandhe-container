@@ -596,7 +596,7 @@ impl CreatedVeth {
 /// （veth の `ndo_get_iflink` が peer の ifindex を返す）。判定は [`decode_created_link`] と同じ
 /// （0 件 → `Ok(None)`。2 件以上・破損・名前不一致・別名あり → `DataLoss`）に加えて、`IFLA_LINK` が
 /// 4 バイトの正の値で自分の ifindex と異なること、`IFLA_LINK_NETNSID`（peer が別 netns にいる印）が
-/// 無いことを要求し、満たさなければ `DataLoss`。
+/// 無いことを要求し、満たさなければ `DataLoss`。`IFLA_LINK` が重複した応答も `DataLoss`（#3419）。
 pub fn decode_created_veth<'a>(
     messages: impl IntoIterator<Item = (u16, &'a [u8])>,
     host: &IfName,
@@ -673,6 +673,9 @@ fn decode_created_payload<'a>(
 
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_LINK`（veth なら peer の ifindex）と、`IFLA_LINK_NETNSID` の
 /// 有無を取り出す。長さが 4 バイトでない `IFLA_LINK`・0 以下の値は `DataLoss`（Issue #3205）。
+/// `IFLA_LINK` が重複した応答も `DataLoss`（どちらを peer の ifindex と信じるかが曖昧になるため。
+/// `decode_ifinfomsg_name`・`decode_ifinfomsg_alias` と同じ扱い。NET-1・REPAIR-2・#3419）。
+/// `IFLA_LINK_NETNSID` は有無だけを見るので、重複しても意味が変わらず区別しない。
 fn decode_ifinfomsg_link(payload: &[u8]) -> Result<(Option<IfIndex>, bool), NetError> {
     let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
         NetError::new(
@@ -684,7 +687,13 @@ fn decode_ifinfomsg_link(payload: &[u8]) -> Result<(Option<IfIndex>, bool), NetE
     let mut has_netnsid = false;
     for attr in crate::netlink::AttrIter::new(attrs) {
         let attr = attr?;
-        if attr.attr_type() == IFLA_LINK && link.is_none() {
+        if attr.attr_type() == IFLA_LINK {
+            if link.is_some() {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "duplicate IFLA_LINK attribute",
+                ));
+            }
             let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
                 NetError::new(NetErrorCode::DataLoss, "IFLA_LINK has an invalid length")
             })?;
@@ -737,6 +746,9 @@ pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError
 ///
 /// 応答はカーネル由来の外部入力として属性走査で検証する。長さが 4 バイトでない属性・0 以下の値は
 /// `DataLoss`（TASK-139.4・#317）。
+/// `IFLA_MASTER` が重複した応答も `DataLoss`（bridge への所属の照合に使う値で、どちらを信じるかが
+/// 曖昧になるため。NET-1・REPAIR-2・#3419）。重複を見つけるため属性列を最後まで走査し、後ろの属性列が
+/// 壊れていた場合も `DataLoss` になる。
 pub fn decode_ifinfomsg_master(payload: &[u8]) -> Result<Option<IfIndex>, NetError> {
     let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
         NetError::new(
@@ -744,19 +756,26 @@ pub fn decode_ifinfomsg_master(payload: &[u8]) -> Result<Option<IfIndex>, NetErr
             "link reply is shorter than ifinfomsg",
         )
     })?;
+    let mut found: Option<IfIndex> = None;
     for attr in crate::netlink::AttrIter::new(attrs) {
         let attr = attr?;
         if attr.attr_type() == IFLA_MASTER {
+            if found.is_some() {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "duplicate IFLA_MASTER attribute",
+                ));
+            }
             let raw = <[u8; 4]>::try_from(attr.payload()).map_err(|_| {
                 NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER has an invalid length")
             })?;
             let index = IfIndex::new(u32::from_ne_bytes(raw)).map_err(|_| {
                 NetError::new(NetErrorCode::DataLoss, "IFLA_MASTER is not a valid ifindex")
             })?;
-            return Ok(Some(index));
+            found = Some(index);
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// `RTM_NEWLINK` 応答（`RTM_GETLINK` の返答）のペイロードから ifindex を取り出す。
@@ -1500,6 +1519,67 @@ mod tests {
         );
         let p = link_payload_ext(3, Some(b"br0\0"), None, &[]);
         assert_eq!(decode_ifinfomsg_alias(&p).unwrap(), None);
+    }
+
+    /// NET-1・REPAIR-2・#3419: `IFLA_LINK` が重複した応答は、値が同じでも違っても壊れていても `DataLoss`。
+    #[test]
+    fn net1_decode_ifinfomsg_link_rejects_duplicate() {
+        let l = |v: u32| v.to_ne_bytes();
+        let (l8, l9) = (l(8), l(9));
+        let bad = [1u8, 0, 0];
+        let dups: [(&[u8], &[u8]); 3] = [(&l8, &l8), (&l8, &l9), (&l8, &bad)];
+        for (first, second) in dups {
+            let p = link_payload_ext(
+                7,
+                Some(b"fcvh0\0"),
+                None,
+                &[(IFLA_LINK, first), (IFLA_LINK, second)],
+            );
+            let e = decode_ifinfomsg_link(&p).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.message(), "duplicate IFLA_LINK attribute");
+            let msgs = [(RTM_NEWLINK, p.as_slice())];
+            assert_eq!(
+                decode_created_veth(msgs, &name("fcvh0"))
+                    .unwrap_err()
+                    .code(),
+                NetErrorCode::DataLoss
+            );
+        }
+        let p = link_payload_ext(7, Some(b"fcvh0\0"), None, &[(IFLA_LINK, &l8)]);
+        assert_eq!(
+            decode_ifinfomsg_link(&p).unwrap(),
+            (Some(IfIndex::new(8).unwrap()), false)
+        );
+        let p = link_payload_ext(7, Some(b"fcvh0\0"), None, &[]);
+        assert_eq!(decode_ifinfomsg_link(&p).unwrap(), (None, false));
+    }
+
+    /// NET-1・REPAIR-2・#3419: `IFLA_MASTER` が重複した応答は `DataLoss`。
+    #[test]
+    fn net1_decode_ifinfomsg_master_rejects_duplicate() {
+        let l = |v: u32| v.to_ne_bytes();
+        let (l7, l9, l0) = (l(7), l(9), l(0));
+        let bad = [1u8, 0, 0];
+        let dups: [(&[u8], &[u8]); 4] = [(&l7, &l7), (&l7, &l9), (&l7, &bad), (&l7, &l0)];
+        for (first, second) in dups {
+            let p = link_payload_ext(
+                3,
+                Some(b"veth0\0"),
+                None,
+                &[(IFLA_MASTER, first), (IFLA_MASTER, second)],
+            );
+            let e = decode_ifinfomsg_master(&p).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss);
+            assert_eq!(e.message(), "duplicate IFLA_MASTER attribute");
+        }
+        let p = link_payload_ext(3, Some(b"veth0\0"), None, &[(IFLA_MASTER, &l7)]);
+        assert_eq!(
+            decode_ifinfomsg_master(&p).unwrap(),
+            Some(IfIndex::new(7).unwrap())
+        );
+        let p = link_payload_ext(3, Some(b"veth0\0"), None, &[]);
+        assert_eq!(decode_ifinfomsg_master(&p).unwrap(), None);
     }
 
     /// NET-1・Issue #1972: `IFLA_IFNAME` の取り出し（NUL 終端・無し・非 UTF-8）。

@@ -37,7 +37,7 @@ fandhe-container/
 ├── Cargo.toml                     # workspace 定義（members は TASK-1.3 で有効化）
 ├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
-│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture）
+│   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture。tests/support/ の reap.rs〔期限つき回収の正本〕・scratch_root.rs 等は他 crate の試験も `#[path]` で共有する。#3410）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
 │   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
@@ -137,7 +137,7 @@ fandhe-container/
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）
 │   │   ├── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   │   ├── macos.md               # macOS セットアップ前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネル / initrd の用意・plugin の配置と信頼性検証の要件と署名後のハッシュの注意。実装済み / 未実装・#1906 等の判断待ちを区別。#2602・MAC-1・CLI-2）
-│   │   ├── network-reclaim-recovery.md  # 作成失敗で残った資源の観測と、印を刻む前に失敗した別名なし bridge の手動回収の手順（#2604・NET-1・REPAIR-4）
+│   │   ├── network-reclaim-recovery.md  # 作成失敗で残った資源の観測と、印を刻む前に失敗した別名なし bridge の手動回収の手順（#2604・NET-1・REPAIR-4）・ハンドルを持たない DNAT ルールの手動回収と v2 請求書のダウングレード（#3413）
 │   │   ├── cri-record-recovery.md  # plugin-cri の再起動後に照合できない CRI 記録の見分け方と手動回収の手順（#2939・CRI-1・REPAIR-4）
 │   │   ├── container-log-recovery.md  # delete・RemoveContainer の後に残ったコンテナログ・supervisor ログの見分け方と手動削除の手順（#2698・#3034・SUP-7・CRI-2・CLI-1）
 │   │   ├── exec-mount-identity-recovery.md  # マウント識別子が無い旧コンテナで exec が拒否されたときの見分け方と作り直しの手順（#3201・SEC-1・SEC-4・CORE-5）

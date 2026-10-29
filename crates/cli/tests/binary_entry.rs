@@ -392,7 +392,7 @@ fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
 mod scratch_root;
 
 // kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 /// 一意な一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る親で、

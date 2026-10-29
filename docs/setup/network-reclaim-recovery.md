@@ -71,3 +71,20 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 5. `ip -o link show` で、その endpoint の host veth（世代が請求書と一致するもの）と pin の両方が無いことを確認してから、`attach/<endpoint>.attach` を手で消す（請求書は全対象資源の回収を確認した後にだけ消す。veth が残ったまま消すと追跡できなくなり、再 attach が `AlreadyExists` になる）
 
 root を要する操作で、ホストの他の netns を巻き込まないよう、必ずパスと endpoint を確認してから実行する。
+
+## 記録の検証で拒否された detach の見分け方と、記録からの回収（#3347）
+
+`detach_container_recorded` は、渡された `AttachedContainer` がメンバー記録と一致しないと、カーネル操作の前に拒否して渡されたコンテナを破棄する。破棄されるのは netns の fd だけで、netns の pin（nsfs のマウント）・host veth・DNAT ルールは残る。拒否の時点では渡されたコンテナと記録が同じものと証明できず、外すと別メンバーの pin を外しうるため、意図して外さない（fail-closed）。NET-1・NET-6・REPAIR-4・SEC-1。
+
+見分け方（すべてが当てはまると、この拒否で資源が残っている）:
+
+1. 戻り値が `RecordedError::Store` で、`message` が `container does not match the member record` / `network has an unreconciled operation` / `recorded nft handles belong to another boot or network namespace` / `network operations need the exclusive network lock` / `member not found` のいずれか
+2. `<状態ルート>/…/@networks/<ネットワーク名>/members/<メンバー ID>` が残っている（`member not found` は無い）
+3. `<netns_dir>/<endpoint>`（nsfs のマウント）と `<netns_dir>/.owned/<endpoint>` が残っている
+4. host veth の別名が `<token>/ep/<endpoint>/g/<世代>` のまま残っている（`ip -o link show` の `alias`）
+
+回収:
+
+- メンバー記録が残っている場合は、`detach_member_recorded`（記録だけから行う入口）を同じメンバー ID で呼ぶ。排他ロック・世代の一致・回収待ちの請求書が無いことが前提で、`netns_dir` は接続時と同じ固定設定を渡す。失敗しても記録は残り、再実行で収束する。`pending-reclaim/attach` に同じ endpoint の請求書があるときは先に `reclaim_failed_attach` で回収する。公開に解除の印が残るときは先に `unpublish_port_recorded` を呼ぶ
+- 記録が無い（`member not found`）・ホストの再起動をまたいで世代が違う場合は、記録から回収できない。「照合できない netns の pin の手動回収」の手順で、パスと endpoint を確認してから `umount` と `rm` を行い、veth は別名を確認して削除する
+- 旧形式の記録（`pin` 項目が無い）は pin が残っていると `Unknown` の取り残しで断られる。手動回収の後に、同じ入口を再実行すると記録が消える

@@ -2551,6 +2551,8 @@ mod platform_tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        // 明示 unlock で解放する（close だけでは並列の fork 子が fd の複製を持つ間は解放されない。#3292・#3420）。
+        holder.unlock().unwrap();
         drop(holder);
         drop(waiter);
     }
@@ -2563,6 +2565,8 @@ mod platform_tests {
         holder.try_lock().unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
+            // 並列の他の試験の fork 子が fd の複製を持っても `LOCK_UN` で解放される（REPAIR-12・#3292・#3420）。
+            holder.unlock().unwrap();
             drop(holder);
         });
         let waiter = open_lock(&path);
@@ -5287,6 +5291,8 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
         assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+        // 明示 unlock で解放する。close だけだと fork 子の fd 複製で解放が遅れ、直後の get が飢える（#3292・#3420）。
+        holder.unlock().unwrap();
         drop(holder);
         let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
         assert_eq!(got, rec);

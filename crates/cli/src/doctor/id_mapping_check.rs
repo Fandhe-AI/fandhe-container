@@ -1304,12 +1304,97 @@ mod tests {
             assert_eq!(r.exit_status().code(), 0);
         }
 
+        /// 実行ファイルを子プロセスに書かせて置く（#3358・REPAIR-12・CORE-6。#1686 と同じ型の問題の対策）。
+        ///
+        /// 試験プロセスが書き込み用 fd を開いたまま、並列の他の試験のスレッドが fork すると、
+        /// 子がその fd を exec / exit まで持ち続け、直後のスタブ getent の exec が ETXTBSY で失敗して
+        /// LookupFailed に読まれる。rename では inode が同じで窓は閉じないため、書き込みそのものを
+        /// 子に任せ、試験プロセスの fd 表に対象 inode の書き込み用 fd を一度も置かない。
+        /// 回収は期限つき（REPAIR-5）。パスは argv、内容は stdin で渡し、シェル文字列へ連結しない。
+        fn install_stub_in_child(path: &Path, content: &[u8]) {
+            install_stub_in_child_during(path, content, || {});
+        }
+
+        /// `install_stub_in_child` の本体。書き込みの最中（子が対象を開いて書き込み用 fd を持つ間）に
+        /// `during` を呼ぶ同期点を持つ。差し戻しの検出（親が書き込み用 fd を持たない）に使う。
+        fn install_stub_in_child_during(path: &Path, content: &[u8], during: impl FnOnce()) {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+            use std::time::Instant;
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "install-stub"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            // 先頭 1 バイトだけ渡し、子が開いて書き込み中の状態で同期点を作る。
+            let (head, tail) = content.split_at(1.min(content.len()));
+            stdin.write_all(head).unwrap();
+            stdin.flush().unwrap();
+            while std::fs::metadata(path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true)
+            {
+                assert!(Instant::now() < deadline, "stub not opened by child");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            during();
+            stdin.write_all(tail).unwrap();
+            drop(stdin);
+            let status = loop {
+                if let Some(st) = child.try_wait().unwrap() {
+                    break st;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("install stub timed out: {}", path.display());
+                }
+                std::thread::sleep(Duration::from_millis(3));
+            };
+            assert!(
+                status.success(),
+                "install stub failed: {} {status}",
+                path.display()
+            );
+        }
+
+        /// `/proc/self/fd` のうち (dev, ino) が一致する書き込み可能な fd の件数。
+        fn writable_fds_on(dev: u64, ino: u64) -> usize {
+            let mut n = 0;
+            for e in std::fs::read_dir("/proc/self/fd").unwrap() {
+                let name = e.unwrap().file_name();
+                let Ok(m) = std::fs::metadata(Path::new("/proc/self/fd").join(&name)) else {
+                    continue;
+                };
+                if m.dev() != dev || m.ino() != ino {
+                    continue;
+                }
+                let Ok(info) = std::fs::read_to_string(Path::new("/proc/self/fdinfo").join(&name))
+                else {
+                    continue;
+                };
+                let flags = info
+                    .lines()
+                    .find_map(|l| l.strip_prefix("flags:"))
+                    .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+                    .unwrap();
+                if flags & 0o3 != 0 {
+                    n += 1;
+                }
+            }
+            n
+        }
+
         /// 試験用の getent を置き、それを使う設定を返す。
         fn stub_lookup(d: &Dir, body: &str) -> UserDbLookup {
             let p = d.0.join("getent");
             let _ = std::fs::remove_file(&p);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_stub_in_child(&p, format!("#!/bin/sh\n{body}\n").as_bytes());
             let euid = std::fs::metadata("/proc/self").unwrap().uid();
             UserDbLookup::custom(vec![p], Duration::from_secs(5), Some(euid), d.0.clone())
         }
@@ -1357,6 +1442,39 @@ mod tests {
             assert_eq!(f.owner, OwnerState::Unresolved);
             assert_eq!(f.model, ModelState::Subordinate);
             assert!(codes(&r).contains(&"SUBID_OWNER_NAME_UNRESOLVED"));
+        }
+
+        /// REPAIR-12・CORE-6・#3358: スタブ作成後、試験プロセスに書き込み用 fd が残らない。
+        #[test]
+        fn core6_repair12_stub_lookup_leaves_no_writable_fd() {
+            let d = Dir::new("nowfd");
+            let mut s = sources(
+                &d,
+                "bob:x:2000:2000::/h:/bin/sh\n",
+                Some("1000:100000:65536\n"),
+                Some("1000:100000:65536\n"),
+            );
+            s.lookup = stub_lookup(&d, "exit 2");
+            let m = std::fs::metadata(d.0.join("getent")).unwrap();
+            assert_eq!(writable_fds_on(m.dev(), m.ino()), 0);
+            // 書き込みの最中（子が書き込み用 fd を持つ間）も親には無い。
+            // 旧実装（親が std::fs::write）へ戻すと、この同期点の前後で親が持つ窓が戻る。
+            let pm = d.0.join("mid-write");
+            let (mut dev_ino, mut seen) = ((0u64, 0u64), usize::MAX);
+            install_stub_in_child_during(&pm, b"#!/bin/sh\nexit 0\n", || {
+                let m = std::fs::metadata(&pm).unwrap();
+                dev_ino = (m.dev(), m.ino());
+                seen = writable_fds_on(dev_ino.0, dev_ino.1);
+            });
+            assert_eq!(seen, 0);
+            // 陽性対照: 書き込みで開いた fd は検出できる。
+            let other = d.0.join("probe-open");
+            let h = std::fs::File::create(&other).unwrap();
+            let om = std::fs::metadata(&other).unwrap();
+            assert_eq!(writable_fds_on(om.dev(), om.ino()), 1);
+            drop(h);
+            let (f, _) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::Unresolved);
         }
 
         /// CORE-6・#2545: 範囲写像で helper が無い → NOT_FOUND、利用者所有 → UNTRUSTED。1 本ずつ診断する。

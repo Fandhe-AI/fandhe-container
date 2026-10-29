@@ -84,6 +84,8 @@ fn scripts() -> &'static Scripts {
     static SCRIPTS: OnceLock<Scripts> = OnceLock::new();
     SCRIPTS.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("fc-2434-{}", std::process::id()));
+        // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let write = |name: &str, body: &str| {
@@ -816,6 +818,8 @@ fn temp_root(tag: &str) -> PathBuf {
         std::process::id(),
         N.fetch_add(1, Ordering::SeqCst)
     ));
+    // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+    let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("mkdir");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     p

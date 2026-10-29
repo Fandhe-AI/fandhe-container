@@ -2186,7 +2186,7 @@ mod tests {
             std::process::id(),
             STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&dir).expect("mkdir");
+        create_fresh_dir(&dir);
         let path = dir.join(RECORD_FILE);
         let record = UnpackRecord {
             settings: "s".repeat(MAX_RECORD_BYTES as usize),
@@ -2204,13 +2204,35 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 前回の残骸（古い record・blob 等）があれば消してから空のディレクトリを作る（REPAIR-12・#3375）。
+    pub(crate) fn create_fresh_dir(dir: &std::path::Path) {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    /// OCI-1・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと古いファイル）があっても `create_fresh_dir` が
+    /// 空のディレクトリへ作り直す。
+    #[test]
+    fn oci1_repair12_create_fresh_dir_clears_stale_residue() {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-cri-stale-residue-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("old")).expect("stale dir");
+        fs::write(dir.join(RECORD_FILE), b"stale").expect("stale file");
+        create_fresh_dir(&dir);
+        assert_eq!(fs::read_dir(&dir).expect("read_dir").count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn record_test_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "fandhe-cri-record-{tag}-{}-{}",
             std::process::id(),
             STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&dir).expect("mkdir");
+        create_fresh_dir(&dir);
         dir
     }
 
@@ -2300,7 +2322,7 @@ mod blob_trust_fs_tests {
                 std::process::id(),
                 STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(&path).expect("mkdir");
+            crate::image_pull::tests::create_fresh_dir(&path);
             Self(path)
         }
     }
@@ -2643,7 +2665,7 @@ mod non_unix_tests {
     #[test]
     fn sec_blobs_are_neither_reused_nor_published_without_metadata() {
         let dir = std::env::temp_dir().join(format!("fandhe-cri-blob-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("mkdir");
+        crate::image_pull::tests::create_fresh_dir(&dir);
         let path = dir.join("blob");
         fs::write(&path, b"abc").expect("write");
         let digest = Digest::parse(

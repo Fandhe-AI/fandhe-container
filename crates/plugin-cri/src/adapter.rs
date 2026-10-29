@@ -1684,13 +1684,34 @@ mod tests {
         assert_eq!(cfg.deadline, Duration::from_secs(600));
     }
 
+    /// 前回の残骸（古い lock ファイル等）があれば消してから空のディレクトリを作る。残骸があると
+    /// 「ロックを作らない」の照合が崩れる（REPAIR-12・#3375）。
+    #[cfg(unix)]
+    fn create_fresh_dir(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    /// CRI-2・REPAIR-12(#3375): 前回の残骸（古い `.cri/@instance.lock`）があっても `create_fresh_dir` が
+    /// 空のディレクトリへ作り直す。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_repair12_create_fresh_dir_clears_stale_residue() {
+        let dir = std::env::temp_dir().join(format!("fcpc-stale-residue-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".cri")).expect("stale dir");
+        std::fs::write(dir.join(".cri").join("@instance.lock"), b"x").expect("stale lock");
+        create_fresh_dir(&dir);
+        assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// CRI-2・CORE-1・REPAIR-12・#3035: 注入で組んだバックエンドはインスタンスロックを持たず、状態ルートも持たない
     /// （ロックファイル `.cri/@instance.lock` を作る経路が無い）。同じ状態ルートへの `production()` の排他を妨げない。
     #[cfg(unix)]
     #[test]
     fn cri2_injected_backends_hold_no_instance_lock_and_create_no_lock_file() {
         let dir = std::env::temp_dir().join(format!("fcpc-inj-nolock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        create_fresh_dir(&dir);
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
         let rt = Arc::new(CoreLifecycleRuntime::new(Arc::clone(&store)));
 

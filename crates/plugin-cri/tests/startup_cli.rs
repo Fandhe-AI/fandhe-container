@@ -119,6 +119,8 @@ fn relative_socket_exits_two_without_echoing_path() {
 fn insecure_socket_dir_exits_one_without_echoing_path() {
     use std::os::unix::fs::DirBuilderExt;
     let dir = std::env::temp_dir().join(format!("fcpc-insecure-{}", std::process::id()));
+    // 前回の残骸があると排他作成が AlreadyExists になるため、先に消す（REPAIR-12・#3375）。
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new()
         .mode(0o755)
         .create(&dir)
@@ -127,6 +129,7 @@ fn insecure_socket_dir_exits_one_without_echoing_path() {
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("chmod");
     let xdg = std::env::temp_dir().join(format!("fcpc-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&xdg)

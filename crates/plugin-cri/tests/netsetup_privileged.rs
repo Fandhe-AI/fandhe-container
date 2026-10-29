@@ -165,14 +165,22 @@ fn netsetup_unpublish_port_privileged() {
     );
     // pin の置き場は mount namespace の中の tmpfs に閉じる（host へ漏らさない）。
     run("mount", &["--make-rprivate", "/"]);
-    let dir = std::env::temp_dir().join(format!("fandhe-2904-{}", std::process::id()));
-    {
+    // root が予測できる名前を再帰削除すると先取りされる余地があるため、既存のパスは消さず、
+    // 排他作成（0700）で連番を進める（REPAIR-12・#3375）。後始末は下の DirGuard が行う。
+    let dir = {
         use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("mkdir");
-    }
+        (0..1000u32)
+            .find_map(|n| {
+                let p =
+                    std::env::temp_dir().join(format!("fandhe-2904-{}-{n}", std::process::id()));
+                match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                    Ok(()) => Some(p),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => panic!("mkdir: {e}"),
+                }
+            })
+            .expect("too many stale test directories")
+    };
     let _guard = DirGuard(dir.clone());
     let dir_str = dir.to_str().expect("utf8 path");
     run("mount", &["-t", "tmpfs", "tmpfs", dir_str]);

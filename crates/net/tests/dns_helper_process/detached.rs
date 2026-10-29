@@ -116,6 +116,9 @@ fn setup(tmp: &Tmp) -> (NetworkStore, NetworkName) {
     (store, NetworkName::new("dnsh").expect("name"))
 }
 
+/// 起動元（`spawn_detached_dns_helper` の呼び出し側）としての再実行の引数（`launcher_killed_after_spawn_line` 用）。
+pub const ARG_LAUNCHER_CHILD: &str = "--launcher-child";
+
 /// 段 1・段 2 としての再実行の引数か。
 pub fn is_helper_arg(a: &std::ffi::OsStr) -> bool {
     a == ARG_DETACH || a == ARG_STAGE2
@@ -130,6 +133,7 @@ pub fn run(exe: &Path) {
     start_failure_records(exe);
     stopped_stage2_is_reaped(exe);
     spawn_write_count(exe);
+    launcher_killed_after_spawn_line(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -539,4 +543,195 @@ fn spawn_write_count(exe: &Path) {
     assert!(gone(h.identity.pid));
     drop(n);
     drop(g);
+}
+
+/// 起動元の子モード（`--launcher-child <state_root> <program>`）。偽の段 1 `program` で
+/// `spawn_detached_dns_helper` を呼び、識別行の待ちの途中で親に SIGKILL されることを前提にする。
+/// 呼び出しが戻った時点で場面は不成立（起動元自身が期限切れで後始末して意図記録を消すため、回収の照合が
+/// 緑に見える誤判定になる）なので、固有の終了コード 3 で終わる（REPAIR-4）。
+pub fn launcher_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let (Some(root), Some(program)) = (args.get(2), args.get(3)) else {
+        eprintln!("launcher_child: usage: --launcher-child <state_root> <program>");
+        return std::process::ExitCode::from(2);
+    };
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let r = spawn_detached_dns_helper(
+        &n,
+        Path::new(program),
+        listen,
+        READY_TIMEOUT_DEFAULT,
+        &NoopNetOpRecorder,
+    );
+    match r {
+        Ok(_) => eprintln!("launcher_child: spawn returned before being killed: Ok"),
+        Err(e) => eprintln!(
+            "launcher_child: spawn returned before being killed: {:?} {}",
+            e.code(),
+            e.message()
+        ),
+    }
+    std::process::ExitCode::from(3)
+}
+
+/// 失敗時に起動元の子と段 2 相当を片付ける（プロセスを漏らさない。REPAIR-5）。
+struct KillGuard {
+    child: Option<std::process::Child>,
+    stage2: PathBuf,
+}
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.child.as_mut() {
+            crate::reap::reap_or_report(c, crate::reap::reap_within());
+        }
+        // pid 番号への kill は後始末に限る。cmdline に nonce 付きの `sh` であることを確かめてから送る。
+        if let Some(pid) = std::fs::read_to_string(&self.stage2)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            && std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|c| c.windows(8).any(|w| w == b"--nonce\0"))
+        {
+            let mut kill = Command::new("kill");
+            kill.args(["-KILL", &pid.to_string()]);
+            let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+        }
+    }
+}
+
+/// `/proc/<pid>/stat` の状態文字。
+fn proc_state(pid: u32) -> Option<char> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+/// #3455（#3414 の残り。NET-5・NET-7・REPAIR-4・REPAIR-5・REPAIR-12）: 段 1 の `SPAWN <pid>` 行が識別行より先に
+/// 届き、起動元が同一性を意図記録へ追記した後、識別行が届く前に起動元が SIGKILL されても、次の回収が
+/// 記録した同一性で帰属して止める。回収は候補なしで呼び、帰属が cgroup 走査でなく記録から来たことを固定する。
+fn launcher_killed_after_spawn_line(exe: &Path) {
+    use std::os::unix::process::ExitStatusExt;
+    let tmp = Tmp::new("killspawn");
+    let (store, name) = setup(&tmp);
+    let script = tmp.0.join("fake-stage1.sh");
+    let pidfile = tmp.0.join("stage2.pid");
+    // 本体は複合コマンドにする（単一の `sleep` だと sh が exec して argv の nonce が消える）。
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\nexit 0\n",
+            pidfile.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod");
+
+    let child = Command::new(exe)
+        .arg(ARG_LAUNCHER_CHILD)
+        .arg(&tmp.0)
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn launcher child");
+    let mut guard = KillGuard {
+        child: Some(child),
+        stage2: pidfile.clone(),
+    };
+
+    // 同一性つきの意図記録が現れるのを、起動元の ack 期限（2 秒）より短い期限で待つ。
+    let intent_path = tmp.0.join("@networks/dnsh/dns-helper.intent");
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let recorded = loop {
+        match std::fs::read(&intent_path) {
+            Ok(bytes) => {
+                let i = DnsHelperIntent::decode(&bytes).expect("decode intent");
+                if let Some(id) = i.identity() {
+                    break id.clone();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("read intent: {e}"),
+        }
+        if Instant::now() >= deadline {
+            let st = guard.child.as_mut().and_then(|c| c.try_wait().ok());
+            panic!("intent record with identity did not appear in time; launcher status {st:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut child = guard.child.take().expect("child");
+    child.kill().expect("SIGKILL launcher");
+    let status = match crate::reap::wait_within(&mut child, crate::reap::reap_within()) {
+        Ok(s) => s,
+        Err(e) => {
+            guard.child = Some(child);
+            panic!("launcher did not exit after SIGKILL: {e}");
+        }
+    };
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "launcher must die by our SIGKILL, not by itself (exit {:?}); see its stderr",
+        status.code()
+    );
+
+    // 窓が本物だったこと: 同一性は段 2 相当の実値で、識別行は出ておらず（停止中）、確定記録は無い。
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert_eq!(recorded.pid, pid);
+    assert_eq!(read_identity(pid).expect("identity"), recorded);
+    let stop_deadline = Instant::now() + Duration::from_secs(5);
+    while proc_state(pid) != Some('T') {
+        assert!(
+            Instant::now() < stop_deadline,
+            "stage 2 stand-in must be stopped, state {:?}",
+            proc_state(pid)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 起動元が死んだので flock はカーネルが解放済み。
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert_eq!(
+        n.read_dns_helper_intent()
+            .expect("intent")
+            .expect("kept")
+            .identity(),
+        Some(&recorded)
+    );
+    assert_eq!(n.read_dns_helper().expect("record"), None);
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the recorded identity must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::NoIntent
+    );
+    // 起動できる状態に戻っている。
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("respawn");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::Killed
+    );
+    assert!(gone(h.identity.pid));
+    drop(n);
+    drop(g);
+    drop(guard);
+    eprintln!(
+        "dns_helper_process: launcher_killed_after_spawn_line ok launcher_signal=9 stage2_state=T recovered_stopped=1 intent_after=none record_after=none"
+    );
 }

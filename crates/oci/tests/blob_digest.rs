@@ -9,6 +9,10 @@ use fandhe_container_oci::layer::{verify_blob_digest, verify_blob_digest_with};
 use fandhe_container_oci::reference::Digest;
 use std::sync::Mutex;
 
+#[path = "support/test_root.rs"]
+mod test_root;
+use test_root::{TestRoot, test_root, test_root_at};
+
 const ABC: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 #[derive(Debug, Default)]
@@ -22,10 +26,8 @@ impl OciOpRecorder for Collect {
     }
 }
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("fc-oci-digest-it-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&d).expect("mkdir");
-    d
+fn tmp_dir(tag: &str) -> TestRoot {
+    test_root("fc-oci-digest-it", tag)
 }
 
 /// OCI-1: 一致・改ざん・サイズ上限を公開 API だけで確認する。
@@ -74,4 +76,20 @@ fn oci1_public_api_records_samples() {
     assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
     drop(v);
     std::fs::remove_dir_all(&d).expect("cleanup");
+}
+
+/// OCI-7・REPAIR-12（#3298）: 前回の残骸（ファイルと入れ子のディレクトリ）があっても空で作り直され、
+/// 同名ファイルを排他作成でき、drop で消える。
+#[test]
+fn oci7_repair12_test_root_clears_stale_residue() {
+    let p = std::env::temp_dir().join(format!("fc-oci-digest-it-residue-{}", std::process::id()));
+    std::fs::create_dir_all(p.join("sub").join("inner")).expect("mkdir residue");
+    std::fs::write(p.join("blob"), b"stale").expect("stale blob");
+    std::fs::write(p.join("sub").join("inner").join("x"), b"stale").expect("stale inner");
+
+    let root = test_root_at(p.clone());
+    assert_eq!(std::fs::read_dir(&p).expect("read_dir").count(), 0);
+    std::fs::File::create_new(root.join("blob")).expect("exclusive create over stale name");
+    drop(root);
+    assert!(!p.exists());
 }

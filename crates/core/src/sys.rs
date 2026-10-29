@@ -100,6 +100,7 @@ pub(crate) enum SysError {
     /// 対応外として拒否した操作（縮退せず fail-closed）。`crate::exec` が `ErrorCode::Unimplemented` に写し、
     /// 表示文言は "not supported by the kernel or the target architecture"（#1690）。次の経路で返る:
     /// - 対応外アーキテクチャ: `consts::SUPPORTED` が偽、または `ArchSysNo::get` が番号を持たない（#1619）
+    /// - 対応外アーキテクチャ（非 LP64）で FFI スタブの `-1` を `last_error()` が写したもの（#3313）
     /// - 古いカーネル: 新マウント API（`fsopen`・`fsconfig`・`fsmount`・`move_mount`・`open_tree` は
     ///   Linux 5.2 未満、`mount_setattr` は 5.12 未満）が返した `ENOSYS` を `new_mount_api_error` が写す。
     ///   それ以外の syscall の `ENOSYS` は写さず [`SysError::Os`] のまま返す
@@ -1735,7 +1736,13 @@ unsafe extern "C" {
 /// 非 LP64（x32・ILP32 を含む）向けのスタブ群。`long` / `unsigned long` / `off_t` の幅が食い違う ABI で
 /// FFI を発行せず、`-1` を返して失敗させる（fail-closed）。呼び出し元は各ラッパー冒頭の `consts::SUPPORTED`
 /// 検査で先に `Unsupported` を返すため通常は到達しない。万一すり抜けても `-1` は失敗として扱われ、成功に倒れない
-/// （このとき `last_error()` は直前の errno を返し、`Unsupported` にはならない）。
+/// （スタブは errno を設定しないが、非 LP64 では `last_error()` が errno を読まず `SysError::Unsupported` を
+/// 返すため、`Unsupported` に倒れる。#3313・MVM-4）。
+///
+/// 各スタブを `unsafe fn` にしているのは、LP64 側の `unsafe extern "C"` 宣言と呼び出し側の
+/// `unsafe { ... }` の形を両 cfg で揃えるため（片側だけ安全な関数にすると呼び出し側の cfg 分岐が要る）。
+/// いずれも本体は引数（ポインタを含む）を読まず FFI・syscall を発行せず `-1` を返すだけで、呼び出し側に
+/// 追加の前提は無い（#3313・REPAIR-3）。
 /// `syscall` は [`SyscallNumber`] が非 LP64 では値を持たない型のため、型の上で呼べない（`ffi_syscall!`）。
 #[cfg(not(all(
     target_pointer_width = "64",
@@ -1745,6 +1752,10 @@ mod unsupported_ffi {
     use super::PollFd;
 
     /// `mount(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
     pub(super) unsafe fn mount(
         _source: *const core::ffi::c_char,
         _target: *const core::ffi::c_char,
@@ -1756,11 +1767,19 @@ mod unsupported_ffi {
     }
 
     /// `prctl(2)` の非 LP64 スタブ（呼び出しはすべて option + 4 引数）。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
     pub(super) unsafe fn prctl<A, B, C, D>(_option: i32, _a: A, _b: B, _c: C, _d: D) -> i32 {
         -1
     }
 
     /// `sendfile(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
     pub(super) unsafe fn sendfile(
         _out_fd: i32,
         _in_fd: i32,
@@ -1771,16 +1790,28 @@ mod unsupported_ffi {
     }
 
     /// `poll(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
     pub(super) unsafe fn poll(_fds: *mut PollFd, _nfds: u64, _timeout: i32) -> i32 {
         -1
     }
 
     /// `ioctl(2)` の非 LP64 スタブ（`ffi_ioctl!` が引数を評価して捨てたあとに呼ぶ）。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
     pub(in crate::sys) unsafe fn ioctl_unsupported() -> i32 {
         -1
     }
 
     /// `syscall(2)` の非 LP64 スタブ。[`SyscallNumber`](super::SyscallNumber) は値を持たない型なので呼べない。
+    ///
+    /// # Safety
+    ///
+    /// `SyscallNumber` は非 LP64 では値を持たない型で、この関数は呼べない（`match nr {}` に到達しない）ため前提も無い。
     pub(in crate::sys) unsafe fn syscall_unsupported(nr: super::SyscallNumber) -> i64 {
         match nr {}
     }
@@ -2344,7 +2375,17 @@ pub(crate) fn open_ns_file(path: &CStr) -> Result<OwnedFd, SysError> {
 }
 
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
+///
+/// 非 LP64（`consts::SUPPORTED` が偽）では errno を読まず `SysError::Unsupported` を返す。FFI スタブ
+/// （`unsupported_ffi`）は errno を設定しないため、直前の古い errno を拾って `Os(..)` に誤分類しないようにする
+/// （#3313・MVM-4）。代償として、`SUPPORTED` 検査を持たないラッパーも非 LP64 では実 errno の代わりに
+/// `Unsupported` を返すが、非 LP64 は arch ごと対応外なので許容する。スタブ側で errno を設定する案は、新しい
+/// `extern` 宣言と `unsafe` が要り、非 LP64 では `libc_abi` の照合も働かないため採らない。
+/// 対応 arch では `SUPPORTED` が定数の真で分岐は消え、挙動は変わらない。
 fn last_error() -> SysError {
+    if !consts::SUPPORTED {
+        return SysError::Unsupported;
+    }
     SysError::Os(io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 

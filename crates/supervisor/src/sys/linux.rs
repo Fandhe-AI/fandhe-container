@@ -152,11 +152,13 @@ pub(crate) struct ThreadCaps {
     pub(crate) inheritable: u64,
 }
 
+/// 対応外アーキテクチャ向けの失敗。非 LP64 では `pre_exec`（fork 後・exec 前）の `cap_ambient_clear_all` から
+/// 呼ばれるため、ヒープを確保しない `ErrorKind` だけの error にする（async-signal-safe を保つ。#3313・SUP-6）。
+///
+/// メッセージ文字列は持たない。std は `pre_exec` の失敗を親へ EINVAL として返すので、親の `spawn` は `Err`
+/// になる（fail-closed）。数値 errno（ENOSYS 等）は arch ごとに値が異なりうるため推測して使わない。
 fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "capability syscalls are not supported on this architecture",
-    )
+    io::Error::from(io::ErrorKind::Unsupported)
 }
 
 /// `-1` なら直後の errno を `io::Error` にする（`-1` の直後に呼ぶこと）。
@@ -199,7 +201,7 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
 pub(crate) fn clear_ambient_caps_on_exec(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt as _;
     // SAFETY: クロージャは fork 後・exec 前の子で実行される。呼ぶのは整数引数のみの `prctl` 1 回で、
-    // 確保・ロック・親との共有状態の操作をしない（async-signal-safe）。影響は子の ambient 集合の縮小のみ。
+    // 確保・ロック・親との共有状態の操作をしない（async-signal-safe。非 LP64 のスタブも確保しない `unsupported()` を返す）。影響は子の ambient 集合の縮小のみ。
     unsafe {
         cmd.pre_exec(cap_ambient_clear_all);
     }
@@ -799,6 +801,7 @@ mod control_ffi {
     use std::io;
     use std::os::unix::net::UnixStream;
 
+    /// `pre_exec` からは呼ばれない（fork 後の経路ではない）ため、メッセージ付きでヒープを確保してよい（#3313）。
     fn unsupported_control() -> io::Error {
         io::Error::new(
             io::ErrorKind::Unsupported,

@@ -21,6 +21,9 @@
 //! Helper ケースは env の opt-in 時のみ実行し、opt-in 時に前提（uidmap・subuid/subgid 行）が
 //! 無ければ失敗とする。root で実行された場合は euid 0 の自 ID 写像が SEC-5 で拒否されることを照合する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("rootless_id_map: Linux only, not applicable on this OS");
@@ -137,12 +140,17 @@ mod linux {
             .spawn()
             .expect("spawn child");
         let result = drive(&mut child, uid, gid, writer, euid);
-        if result.is_err() {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-        if let Err(msg) = result {
-            panic!("{msg}");
+        match result {
+            Ok(_) => {
+                if let Err(e) = crate::reap::wait_within(&mut child, crate::reap::REAP_WITHIN) {
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                    panic!("case child did not exit after the case: {e}");
+                }
+            }
+            Err(msg) => {
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
+                panic!("{msg}");
+            }
         }
     }
 

@@ -39,6 +39,9 @@
 //! `-- --ignored` 指定時のみ実行し、未指定時は「ignored」を出力して成功終了する（ci.md「実機前提テスト」）。
 //! 実行された場合は前提の欠落を含むあらゆる失敗を失敗として扱う。root では実行しない。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("rootless_image_rootfs_remove: Linux only, not applicable on this OS");
@@ -202,8 +205,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("purge child timed out");
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
@@ -259,8 +261,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("populate child timed out");
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),

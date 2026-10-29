@@ -8,6 +8,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -65,8 +68,7 @@ fn run_with(args: &[&str], envs: &[(&str, &str)], new_process_group: bool) -> Ou
             break s;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("launcher did not exit within {CHILD_TIMEOUT:?}");
         }
         std::thread::sleep(Duration::from_millis(10));

@@ -16,6 +16,9 @@
 //! 指定時のみ実行し、CI では `platform-ci`（ubuntu-latest）が実行する（AGENTS.md）。
 //! 実行された場合は分離の拒否を含むあらゆる失敗を失敗として扱い、検証せず成功する分岐は持たない。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("container_options_ipc: Linux only, not applicable on this OS");
@@ -93,8 +96,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("{what} did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

@@ -71,6 +71,9 @@
 //!   （`Shared`）での非 root と補助グループ（#2241 待ち）
 //! - 実機（root）での実行と記録は #1621（人間担当）
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("exec_subordinate_e2e: Linux only, not applicable on this OS");
@@ -583,8 +586,7 @@ mod linux {
                 return child.wait_with_output().expect("collect output");
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("command timed out");
             }
             std::thread::sleep(Duration::from_millis(10));

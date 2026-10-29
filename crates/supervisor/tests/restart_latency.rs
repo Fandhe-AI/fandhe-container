@@ -12,6 +12,9 @@
 //! 模している。したがって計測値は SUP-3 の実機での合否判定ではない（実機実測は #490・#491〔TASK-160・人間担当〕）。
 //! root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため、試験は `linux` モジュールに置く。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 const ENV_EXIT: &str = "FANDHE_SUP_RLAT_EXIT";
 
 /// コンテナ役の子プロセス本体。通常のテスト実行では環境変数が無く即 return する（no-op）。
@@ -141,8 +144,7 @@ mod linux {
     impl Drop for ChildProcess {
         fn drop(&mut self) {
             if let Ok(c) = self.child.get_mut() {
-                let _ = c.kill();
-                let _ = c.wait();
+                crate::reap::reap_on_drop(c);
             }
         }
     }

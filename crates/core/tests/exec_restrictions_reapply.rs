@@ -33,6 +33,9 @@
 //!   検出失敗を失敗として扱いフル照合を必須にする。実行:
 //!   `cargo test -p fandhe-container-core --test exec_restrictions_reapply -- --ignored`
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("exec_restrictions_reapply: Linux only, not applicable on this OS");
@@ -371,8 +374,7 @@ fn main() {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 let _ = std::fs::remove_dir_all(dir);
                 panic!("exec_restrictions_reapply child ({mode}) timed out");
             }

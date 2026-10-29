@@ -15,6 +15,9 @@
 //! 走査補助は別 crate のテストと共有できないため core 側と同等のものを複製している。root 不要で
 //! 既定のテスト集合で動く。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 /// `environ`（NUL 区切りの `KEY=VALUE` 列）に `KEY=nonce` が完全一致で含まれるかを判定する。OS 非依存。
 fn environ_has_marker(environ: &[u8], key: &str, nonce: &str) -> bool {
     let want = format!("{key}={nonce}");
@@ -208,8 +211,7 @@ mod linux {
     impl Drop for ChildProcess {
         fn drop(&mut self) {
             if let Ok(c) = self.child.get_mut() {
-                let _ = c.kill();
-                let _ = c.wait();
+                crate::reap::reap_on_drop(c);
             }
         }
     }

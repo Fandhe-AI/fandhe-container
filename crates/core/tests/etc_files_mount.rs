@@ -26,6 +26,9 @@
 //! root 権限コマンドのため明示指示のもとで行う（本番の起動経路は `RootfulHostRoot` を拒否しているため、この経路は
 //! 段の単体の確認に限る。#2241・SEC-5）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("etc_files_mount: Linux only, not applicable on this OS");
@@ -138,8 +141,7 @@ mod linux {
             match child.try_wait().expect("try_wait") {
                 Some(status) => return status.code(),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("child did not exit within the timeout");
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

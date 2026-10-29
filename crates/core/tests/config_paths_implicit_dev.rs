@@ -35,6 +35,9 @@
 //! 目的が「Landlock を載せない exec 層のマウントの結果」の観測にあるため。exec 経路は `LaunchReady` のために Landlock が
 //! 必須で、本番は同じ重なりを start で拒否する（Landlock 段の照合は #2071）。移すと観測の対象そのものが変わる。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]
 mod temp_rootfs;
@@ -302,8 +305,7 @@ mod linux {
                     let _ = std::process::Command::new("kill")
                         .args(["-KILL", "--", &format!("-{pgid}")])
                         .status();
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     break (false, "killed: scenario exceeded its deadline".to_string());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),

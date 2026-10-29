@@ -9,6 +9,9 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroup_companions_undeclared-XXXX> --ignored
 //! ```
 
+#[path = "support/reap.rs"]
+mod reap;
+
 // 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
 #[cfg(target_os = "linux")]
 #[path = "support/precondition.rs"]
@@ -56,7 +59,6 @@ mod linux {
         assert!(pids.contains(&std::process::id()), "{pids:?}");
         assert!(!parent.join(name.as_str()).exists());
         assert!(!parent.join("fc-runtime").exists());
-        let _ = other.kill();
-        let _ = other.wait();
+        crate::reap::reap(&mut other, crate::reap::REAP_WITHIN).expect("reap other");
     }
 }

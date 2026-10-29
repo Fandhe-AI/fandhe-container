@@ -12,6 +12,9 @@
 //! `state_store` のモジュール doc「対応プラットフォーム」）。root 不要で既定のテスト集合で動く。
 //! 計測結果は `docs/design/measurements/state-lock-contention.md` に記録する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
@@ -164,8 +167,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 let mut buf = String::new();
                 let _ = fs::File::open(&log)
                     .unwrap()

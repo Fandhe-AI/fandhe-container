@@ -30,6 +30,9 @@
 //! 成功行 `inject_files: content, read-only and rollback verified (root=false)` を照合する。rootful 経路
 //! （root）の実行は root 権限コマンドのため明示指示のもとで行い、結果を PR に記録する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("inject_files: Linux only, not applicable on this OS");
@@ -171,8 +174,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

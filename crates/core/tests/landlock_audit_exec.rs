@@ -22,6 +22,9 @@
 //!   `sudo cargo test -p fandhe-container-core --test landlock_audit_exec -- --ignored`
 //!   （Agent は root 権限のコマンドを実行しない。実機での実行と結果の記録は人間担当の #2306 で追跡する）
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("landlock_audit_exec: Linux only, not applicable on this OS");
@@ -163,8 +166,7 @@ fn main() {
             break s;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             let _ = std::fs::remove_dir_all(&dir);
             panic!("landlock_audit_exec child timed out");
         }

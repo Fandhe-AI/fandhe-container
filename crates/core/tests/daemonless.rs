@@ -17,6 +17,9 @@
 //! TASK-45・47・49 の担当で、本テストは保証しない。root・namespace 不要で既定のテスト集合で動く。
 //! 同等の走査補助は別 crate のテストと共有できないため `supervisor/tests/daemonless.rs` にも複製してある。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 /// `environ`（NUL 区切りの `KEY=VALUE` 列）に `KEY=nonce` が完全一致で含まれるかを判定する。OS 非依存。
 fn environ_has_marker(environ: &[u8], key: &str, nonce: &str) -> bool {
     let want = format!("{key}={nonce}");
@@ -222,8 +225,7 @@ mod linux {
 
     impl Drop for Role {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 

@@ -27,6 +27,9 @@
 //!   ため既定集合から分離している（CI 通過のための弱体化ではない）。実行:
 //!   `cargo test -p fandhe-container-core --test landlock -- --ignored`
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("landlock: Linux only, not applicable on this OS");
@@ -304,8 +307,7 @@ fn main() {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 let _ = std::fs::remove_dir_all(&dir);
                 panic!("landlock child {mode} timed out");
             }

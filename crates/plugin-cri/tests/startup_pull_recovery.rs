@@ -4,6 +4,9 @@
 //! 回収せず、drop 済み（クラッシュ相当）の pull だけを回収することを具体値で照合する。root 権限は不要。
 #![cfg(unix)]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -138,8 +141,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
         .spawn()
         .expect("spawn child");
     if !wait_for(&ready) {
-        let _ = child.kill();
-        let _ = child.wait();
+        reap::reap_or_report(&mut child, reap::REAP_WITHIN);
         panic!("child did not become ready in time");
     }
 
@@ -180,7 +182,13 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
 
     // 子が終われば、残っていたリースも次の回収で解放される。
     fs::write(&done, b"1").expect("done");
-    let status = child.wait().expect("wait child");
+    let status = match reap::wait_within(&mut child, WAIT) {
+        Ok(st) => st,
+        Err(e) => {
+            reap::reap_or_report(&mut child, reap::REAP_WITHIN);
+            panic!("child did not finish after done: {e}");
+        }
+    };
     assert!(status.success());
     let r2 = recover_stale_image_pulls_in(&root, &recorder, noop()).expect("recover again");
     assert_eq!(r2.reclaimed(), &[pid("livepull")]);

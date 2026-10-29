@@ -18,6 +18,13 @@
 //! 成功を装わず失敗する。Linux の x86_64 / aarch64 以外は fd 起点の実装が無い（`Unimplemented` で拒否）ため
 //! `not applicable` を出して成功する。
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -237,8 +244,7 @@ mod linux {
             match child.try_wait().map_err(|e| format!("wait: {e}"))? {
                 Some(_) => break,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     return Err("child timed out".into());
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),

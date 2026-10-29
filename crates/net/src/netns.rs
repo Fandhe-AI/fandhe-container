@@ -2227,7 +2227,7 @@ mod tests {
         cmd.args([
             "--ignored",
             "--exact",
-            "--nocapture",
+            "--no-capture",
             "--test-threads=1",
             "netns::tests::net1_xproc_child_create_pin",
         ])

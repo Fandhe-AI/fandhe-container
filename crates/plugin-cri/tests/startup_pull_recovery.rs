@@ -132,7 +132,7 @@ fn oci7_startup_recovery_keeps_live_cross_process_pull_and_reclaims_dead_one() {
     let done = tmp.0.join("done");
 
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args([CHILD_TEST, "--exact", "--test-threads=1", "--nocapture"])
+        .args([CHILD_TEST, "--exact", "--test-threads=1", "--no-capture"])
         .env(ENV_ROOT, &root)
         .env(ENV_READY, &ready)
         .env(ENV_DONE, &done)

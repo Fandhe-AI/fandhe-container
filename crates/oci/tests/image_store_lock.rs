@@ -61,7 +61,7 @@ fn oci7_repair12_lock_flow_passes_over_stale_ready_release() {
 fn run_lock_excludes_other_process(root: TestRoot) {
     assert!(!root.join("ready").exists() && !root.join("release").exists());
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
         .env(ROOT_ENV, &*root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -101,7 +101,7 @@ fn run_lock_excludes_other_process(root: TestRoot) {
 fn repair5_wait_within_reports_expiry() {
     let root = test_root("fc-oci-store-it", "reap-expiry");
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
         .env(ROOT_ENV, &*root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

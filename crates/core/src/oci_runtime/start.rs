@@ -4255,7 +4255,7 @@ mod tests {
                 "--exact",
                 NAME,
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env("FANDHE_2823_INNER", "1");

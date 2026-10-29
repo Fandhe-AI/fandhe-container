@@ -259,7 +259,7 @@ mod linux {
 
     fn spawn_child(root: &Path, prefix: &str) -> Worker {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        cmd.args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
             .env(ROOT_ENV, root)
             .env(PREFIX_ENV, prefix);
         Worker::start(cmd)
@@ -347,7 +347,7 @@ mod linux {
 
     fn spawn_worker(test: &str, envs: &[(&str, &Path)]) -> Worker {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"]);
+        cmd.args(["--exact", test, "--test-threads=1", "--no-capture"]);
         for (k, v) in envs {
             cmd.env(k, v);
         }

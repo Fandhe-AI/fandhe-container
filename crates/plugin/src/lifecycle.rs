@@ -2093,7 +2093,7 @@ mod tests {
     fn run_child_role(test: &str, env: &str, value: &str, stderr: Stdio) {
         let exe = std::env::current_exe().unwrap();
         let mut child = Command::new(exe)
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test, "--no-capture", "--test-threads=1"])
             .env(env, value)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

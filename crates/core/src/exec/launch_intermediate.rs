@@ -3470,7 +3470,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
                 "exec::launch_intermediate::tests::repair12_2249_stand_in_fork_ignores_stdio_locks_helper",
             ])
@@ -4039,7 +4039,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
                 "exec::launch_intermediate::tests::repair5_1816_child_stdout_full_helper",
             ])

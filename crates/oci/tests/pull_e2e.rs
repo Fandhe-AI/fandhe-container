@@ -268,7 +268,7 @@ mod linux {
         let mut i = 0usize;
         while let Some(arg) = argv.get(i) {
             match arg.as_str() {
-                "--ignored" | "--nocapture" => i += 1,
+                "--ignored" | "--nocapture" | "--no-capture" => i += 1,
                 "--work-dir" => {
                     let v = argv.get(i + 1).ok_or("--work-dir needs a value")?;
                     check_arg(v)?;
@@ -287,7 +287,11 @@ mod linux {
                         while let Some(a) = argv.get(i) {
                             if matches!(
                                 a.as_str(),
-                                "--image" | "--work-dir" | "--ignored" | "--nocapture"
+                                "--image"
+                                    | "--work-dir"
+                                    | "--ignored"
+                                    | "--nocapture"
+                                    | "--no-capture"
                             ) {
                                 break;
                             }
@@ -1352,23 +1356,42 @@ mod linux {
             let both = parse_args(&strs(&["--image", "busybox"]), Some("alpine")).expect("both");
             assert_eq!(both.images.len(), 1);
             // 不正入力。
-            // --cmd の後ろの --ignored / --nocapture は区切りで、コンテナの引数にしない。
-            let t = parse_args(
-                &strs(&[
-                    "--image",
-                    "x",
-                    "--cmd",
-                    "/bin/true",
-                    "--ignored",
-                    "--nocapture",
-                ]),
-                None,
-            )
-            .expect("args");
-            assert_eq!(
-                t.images.first().and_then(|i| i.cmd_override.clone()),
-                Some(strs(&["/bin/true"]))
-            );
+            // --cmd の後ろの --ignored / --no-capture（旧綴り --nocapture も同じ）は区切りで、
+            // コンテナの引数にしない。
+            for flag in ["--no-capture", "--nocapture"] {
+                let t = parse_args(
+                    &strs(&["--image", "x", "--cmd", "/bin/true", "--ignored", flag]),
+                    None,
+                )
+                .expect("args");
+                assert_eq!(
+                    t.images.first().and_then(|i| i.cmd_override.clone()),
+                    Some(strs(&["/bin/true"]))
+                );
+                // 先頭に置いても読み飛ばされる。
+                let h = parse_args(&strs(&[flag, "--image", "alpine"]), None).expect("head");
+                assert_eq!(h.images.len(), 1);
+                assert_eq!(h.images.first().and_then(|i| i.cmd_override.clone()), None);
+                // 区切りの後ろの --image は 2 件目として読まれる。
+                let two = parse_args(
+                    &strs(&[
+                        "--image",
+                        "x",
+                        "--cmd",
+                        "/bin/true",
+                        flag,
+                        "--image",
+                        "busybox",
+                    ]),
+                    None,
+                )
+                .expect("two");
+                assert_eq!(two.images.len(), 2);
+                assert_eq!(
+                    two.images.first().and_then(|i| i.cmd_override.clone()),
+                    Some(strs(&["/bin/true"]))
+                );
+            }
             assert!(parse_args(&strs(&["--cmd", "x"]), None).is_err());
             assert!(parse_args(&strs(&["--image", "alpine", "--cmd"]), None).is_err());
             assert!(parse_args(&strs(&["--image"]), None).is_err());

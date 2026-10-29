@@ -402,10 +402,7 @@ mod tests {
     fn core6_sec5_sealed_content_is_written_by_sendfile() {
         let tmp = Tmp::new("inject-sealed");
         reset();
-        let host =
-            std::env::temp_dir().join(format!("fandhe-inject-sealed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&host);
-        std::fs::create_dir_all(&host).expect("host dir");
+        let (_scratch, host) = crate::test_support::scratch_child("fandhe-inject-sealed", "d");
         std::fs::write(host.join("src"), SENTINEL).expect("write");
         let file = std::fs::File::open(host.join("src")).expect("open");
         let sealed = InjectedContent::from_file(&file).expect("sealed");
@@ -446,7 +443,6 @@ mod tests {
             std::fs::read_to_string(tmp.0.join("run/secrets/plain")).expect("read"),
             "k=v"
         );
-        let _ = std::fs::remove_dir_all(&host);
     }
 
     /// SUP-12・TASK-169.4.2・#1620: ディレクトリごとに rw マウント → 書き込み → `mount_setattr` で ro にし、

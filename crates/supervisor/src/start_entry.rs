@@ -3461,9 +3461,12 @@ mod linux {
             subgid: Option<&str>,
             uids: &str,
         ) -> Result<LaunchPrivilege, TraitError> {
-            let dir = std::env::temp_dir().join(format!("fc-idm-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir`（drop で消える）を使う（#3434・REPAIR-12）。
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fc-idm-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let dir = scratch.path().to_path_buf();
             let put = |name: &str, body: Option<&str>| {
                 let p = dir.join(name);
                 if let Some(b) = body {
@@ -3478,7 +3481,7 @@ mod linux {
             );
             let r =
                 resolve_launch_privilege(&status(uids, "1000\t1000\t1000\t1000"), &pw, &su, &sg);
-            let _ = std::fs::remove_dir_all(&dir);
+            drop(scratch);
             r
         }
 
@@ -3583,8 +3586,12 @@ mod linux {
             use fandhe_container_core::audit_log::AuditEvent;
             use fandhe_container_core::traits::ContainerId;
             for (i, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
-                let dir = std::env::temp_dir().join(format!("fc-2594-{}-{i}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
+                // 排他作成の `ScratchDir` の子を bundle にする（#3434・REPAIR-12）。
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    &format!("fc-2594-{i}"),
+                    std::time::Duration::from_secs(10),
+                );
+                let dir = scratch.path().join("bundle");
                 std::fs::create_dir_all(dir.join("rootfs")).unwrap();
                 let cfg = format!(
                     r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/true"],"cwd":"/"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/srv/x","options":["bind","rw"]}}]}}"#
@@ -3595,7 +3602,7 @@ mod linux {
                 let dynsink: Arc<dyn AuditSink> = sink.clone();
                 let err = resource_limits_for_start(&dir, &id, Some(&dynsink)).unwrap_err();
                 let plain = resource_limits_for_start(&dir, &id, None).unwrap_err();
-                let _ = std::fs::remove_dir_all(&dir);
+                drop(scratch);
                 assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
                 assert_eq!(err.code(), plain.code());
                 assert_eq!(err.message(), plain.message());
@@ -3689,9 +3696,16 @@ mod linux {
         /// SEC-4(#3359): 放棄・期限超過の後始末 `abandoned_cleanup` も遅延バッファを空にする。
         #[test]
         fn sec4_3359_abandoned_cleanup_drains_pasta_logs() {
-            let dir = std::env::temp_dir().join(format!("fc3359-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("dir");
+            run_3359_abandoned_cleanup();
+        }
+
+        /// `sec4_3359_*` と `repair12_3434_*` が共有する本体。状態ルートは排他作成の `ScratchDir` の子（#3434）。
+        fn run_3359_abandoned_cleanup() {
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子（0700）を状態ルートにする（#3434・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc3359", std::time::Duration::from_secs(10));
+            let dir = scratch.path().join("root");
+            std::fs::create_dir(&dir).expect("dir");
             let deps = ProductionStartDeps::new(dir.clone());
             let buffer = deps.pasta_log_buffer();
             buffer.push("{}\n".to_owned());
@@ -3717,7 +3731,65 @@ mod linux {
                 outcome,
             );
             assert!(buffer.take().is_empty());
-            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// REPAIR-12・#3434: 旧方式の pid だけの名前（`fc3359-<pid>`）の残骸（FIFO を含む）が残っていても、
+        /// 後始末の試験は残骸と衝突せず、残骸に触れない。残骸は排他作成できた場合だけ自分で消す。
+        #[cfg(unix)]
+        #[test]
+        fn repair12_3434_abandoned_cleanup_ignores_legacy_pid_residue() {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            fn snap(p: &std::path::Path) -> Option<(u64, u64, bool)> {
+                let m = std::fs::symlink_metadata(p).ok()?;
+                Some((m.dev(), m.ino(), m.file_type().is_fifo()))
+            }
+            struct Cleanup(std::path::PathBuf, bool);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                    }
+                }
+            }
+            let legacy = std::env::temp_dir().join(format!("fc3359-{}", std::process::id()));
+            let created = std::fs::create_dir(&legacy).is_ok();
+            let _cleanup = Cleanup(legacy.clone(), created);
+            if created {
+                // 期限つきで実行し、超過したら kill して期限つきで回収する（REPAIR-5）。
+                let mut child = std::process::Command::new("mkfifo")
+                    .arg(legacy.join("@lock"))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn mkfifo");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().expect("try_wait mkfifo") {
+                        assert!(status.success(), "mkfifo failed: {status:?}");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let reap = Instant::now() + Duration::from_secs(5);
+                        while child.try_wait().ok().flatten().is_none() && Instant::now() < reap {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        panic!("mkfifo did not finish within 10s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::write(legacy.join("file"), b"x").expect("write residue");
+            }
+            // 既存の残骸を使う場合は処理前の状態を記録し、不変性を比較する。
+            let before = snap(&legacy.join("@lock"));
+            run_3359_abandoned_cleanup();
+            let now = snap(&legacy.join("@lock"));
+            if created {
+                assert!(matches!(now, Some((_, _, true))), "{now:?}");
+            } else {
+                assert_eq!(now, before);
+            }
         }
 
         /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。
@@ -3726,9 +3798,13 @@ mod linux {
         fn sup12_2713_prepare_container_options_reads_document() {
             use crate::container_options::document::ContainerOptionsDocument;
             use crate::container_options::store;
-            let root = std::env::temp_dir().join(format!("fcopt-prep-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("root");
+            // 排他作成の `ScratchDir` の子を状態ルートにする（#3434・REPAIR-12）。
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-prep",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
             std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
                 .expect("chmod");
             let store_dyn: Arc<dyn StateStore> = Arc::new(
@@ -4180,9 +4256,11 @@ mod linux {
         #[cfg(unix)]
         #[test]
         fn repair4_log_root_follows_store_host_state_root_through_symlink() {
-            let base = std::env::temp_dir().join(format!("fc-slog-{}", std::process::id()));
+            // 排他作成の `ScratchDir` の子 `base`（0700）を使う（#3434・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-slog", std::time::Duration::from_secs(10));
+            let base = scratch.path().join("base");
             let real = base.join("real");
-            let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&real).expect("mkdir");
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -4198,7 +4276,6 @@ mod linux {
             let log_root = supervisor_log_root(&store, &raw_root).to_path_buf();
             let id = ContainerId::new("c1").expect("id");
             let opened = crate::supervisor_log::open(&log_root, &id);
-            let _ = std::fs::remove_dir_all(&base);
             assert!(
                 opened.is_ok(),
                 "log must open under the store root: {:?}",

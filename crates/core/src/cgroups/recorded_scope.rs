@@ -300,12 +300,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    fn tmp(label: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("fandhe-recscope-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("mkdir");
-        p
+    fn tmp(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-recscope-{label}"), "d")
     }
 
     /// 実 cgroup の代わりに tmpfs を `/sys/fs/cgroup` に見立てるルート。
@@ -374,7 +371,7 @@ mod tests {
     /// OCI-6（#2096）: 記録したスコープの要素が無い場合は `NotPresent`（何も作らない）。
     #[test]
     fn oci6_recorded_scope_absent_is_not_present() {
-        let root = tmp("absent");
+        let (_scratch, root) = tmp("absent");
         assert_eq!(
             run(&root, SCOPE, 7, real_euid()).expect("absent"),
             CgroupRemoval::NotPresent
@@ -385,13 +382,12 @@ mod tests {
             CgroupRemoval::NotPresent
         );
         assert!(!root.join("user.slice").join("x.scope").exists());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// SEC-1（#2096）: スコープの所有者が euid と違えば `PermissionDenied` で、何も触れない。
     #[test]
     fn sec1_recorded_scope_owner_mismatch_is_permission_denied() {
-        let root = tmp("owner");
+        let (_scratch, root) = tmp("owner");
         let scope = make_scope(&root, "domain");
         let ctr = scope.join("fc-c1@7");
         fs::create_dir(&ctr).expect("mkdir ctr");
@@ -404,26 +400,24 @@ mod tests {
             fs::read_to_string(ctr.join("exec-1-2").join("cgroup.kill")).expect("read"),
             ""
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// CORE-3（#2096）: `cgroup.type` が `domain` でなければ `FailedPrecondition` で、何も削除しない。
     #[test]
     fn core3_recorded_scope_wrong_cgroup_type_is_failed_precondition() {
-        let root = tmp("type");
+        let (_scratch, root) = tmp("type");
         let scope = make_scope(&root, "threaded");
         let ctr = scope.join("fc-c1@7");
         fs::create_dir(&ctr).expect("mkdir ctr");
         let err = run(&root, SCOPE, 7, real_euid()).expect_err("type");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert!(ctr.is_dir());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// OCI-6（#2096）: 記録の instance と名前が違うコンテナ cgroup（`fc-c1@8`）には触れず `NotPresent`。
     #[test]
     fn oci6_recorded_scope_other_instance_is_untouched() {
-        let root = tmp("instance");
+        let (_scratch, root) = tmp("instance");
         let scope = make_scope(&root, "domain");
         let other = scope.join("fc-c1@8");
         fs::create_dir(&other).expect("mkdir other");
@@ -432,14 +426,13 @@ mod tests {
             CgroupRemoval::NotPresent
         );
         assert!(other.is_dir());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// OCI-6・CORE-2（#2096）: コンテナ cgroup の `cgroup.procs` が空でなければ `FailedPrecondition` で、
     /// `exec-*` の `cgroup.kill` にも書かず、ディレクトリも残す。
     #[test]
     fn oci6_recorded_scope_nonempty_container_is_refused() {
-        let root = tmp("nonempty");
+        let (_scratch, root) = tmp("nonempty");
         let scope = make_scope(&root, "domain");
         let ctr = scope.join("fc-c1@7");
         fs::create_dir(&ctr).expect("mkdir ctr");
@@ -453,14 +446,12 @@ mod tests {
             ""
         );
         assert!(ctr.join("exec-1-2").is_dir());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// SEC-1（#2096）: ルート cgroup の記録は非 root では `PermissionDenied`、不正な要素・過大な深さは
     /// `FailedPrecondition`（`CgroupScope` を経由せず直接渡して多層防御を確かめる）。
     #[test]
     fn sec1_recorded_scope_rejects_invalid_components_and_non_root_root() {
-        let root = tmp("invalid");
         let never = || -> Result<OwnedFd, CgroupError> { panic!("must not open the root") };
         let err = open_with("/", 1000, &never, &open_plain).expect_err("root");
         assert_eq!(err.code, ErrorCode::PermissionDenied);
@@ -471,13 +462,12 @@ mod tests {
         let deep = format!("/{}", vec!["d"; MAX_PATH_DEPTH + 1].join("/"));
         let err = open_with(&deep, 0, &never, &open_plain).expect_err("deep");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// ERR-2（#2096）: `TraitError` の message は固定文言で、tmp のパス・errno の文字列を含まない。
     #[test]
     fn oci6_recorded_scope_errors_hide_paths() {
-        let root = tmp("hide");
+        let (_scratch, root) = tmp("hide");
         make_scope(&root, "threaded");
         let err = run(&root, SCOPE, 7, real_euid()).expect_err("type");
         assert_eq!(
@@ -491,7 +481,6 @@ mod tests {
             denied.message(),
             "container cgroup is not owned by the effective user"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     // ---- #2011: 別プロセスの残存の確認（ensure_no_process_with） ----
@@ -527,7 +516,7 @@ mod tests {
     /// CORE-2（#2011）: スコープが無い・コンテナ cgroup が無い・名前を作れない場合は `AlreadyAbsent`。
     #[test]
     fn core2_issue2011_absent_scope_or_container_is_already_absent() {
-        let root = tmp("ens-absent");
+        let (_scratch, root) = tmp("ens-absent");
         assert_eq!(
             ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("no scope"),
             RecordedCgroupOutcome::AlreadyAbsent
@@ -537,13 +526,12 @@ mod tests {
             ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("no container"),
             RecordedCgroupOutcome::AlreadyAbsent
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// CORE-2（#2011）: `populated 0` は `WasEmpty` で、`cgroup.kill` には書かない。
     #[test]
     fn core2_issue2011_unpopulated_is_was_empty_without_kill() {
-        let root = tmp("ens-empty");
+        let (_scratch, root) = tmp("ens-empty");
         let ctr = make_container(&root, "populated 0\nfrozen 0\n");
         fs::write(ctr.join("cgroup.kill"), "").expect("kill");
         assert_eq!(
@@ -551,13 +539,12 @@ mod tests {
             RecordedCgroupOutcome::WasEmpty
         );
         assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// CORE-2・SEC-1（#2011）: `populated 1` は `cgroup.kill` へ `1` を書き、`populated 0` を確かめて `Killed`。
     #[test]
     fn core2_issue2011_populated_is_killed_and_confirmed() {
-        let root = tmp("ens-kill");
+        let (_scratch, root) = tmp("ens-kill");
         let ctr = make_container(&root, "populated 1\n");
         fs::write(ctr.join("cgroup.kill"), "").expect("kill");
         let events = ctr.join("cgroup.events");
@@ -579,47 +566,43 @@ mod tests {
         flipper.join().expect("join");
         assert_eq!(out, RecordedCgroupOutcome::Killed);
         assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// REPAIR-5・CORE-2（#2011）: kill 後も `populated 1` のままなら期限で `Timeout`（`Ok` にしない）。
     #[test]
     fn core2_issue2011_still_populated_after_kill_times_out() {
-        let root = tmp("ens-timeout");
+        let (_scratch, root) = tmp("ens-timeout");
         let ctr = make_container(&root, "populated 1\n");
         fs::write(ctr.join("cgroup.kill"), "").expect("kill");
         let err = ensure(&root, SCOPE, 7, real_euid(), SHORT).expect_err("timeout");
         assert_eq!(err.code, ErrorCode::Timeout);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// CORE-2（#2011）: 期限切れで `populated 1` なら kill せずに `Timeout`。
     #[test]
     fn core2_issue2011_expired_deadline_does_not_kill() {
-        let root = tmp("ens-expired");
+        let (_scratch, root) = tmp("ens-expired");
         let ctr = make_container(&root, "populated 1\n");
         fs::write(ctr.join("cgroup.kill"), "").expect("kill");
         let err =
             ensure(&root, SCOPE, 7, real_euid(), std::time::Duration::ZERO).expect_err("expired");
         assert_eq!(err.code, ErrorCode::Timeout);
         assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// CORE-2（#2011）: `cgroup.kill` が無ければ `Ok` にせず `Unimplemented`。
     #[test]
     fn core2_issue2011_missing_cgroup_kill_is_unimplemented() {
-        let root = tmp("ens-nokill");
+        let (_scratch, root) = tmp("ens-nokill");
         make_container(&root, "populated 1\n");
         let err = ensure(&root, SCOPE, 7, real_euid(), SHORT).expect_err("no kill");
         assert_eq!(err.code, ErrorCode::Unimplemented);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// SEC-1（#2011）: スコープの所有者不一致は `PermissionDenied`、`cgroup.events` の欠落・解析不能は `Ok` にしない。
     #[test]
     fn sec1_issue2011_unverifiable_states_are_errors() {
-        let root = tmp("ens-err");
+        let (_scratch, root) = tmp("ens-err");
         let ctr = make_container(&root, "populated 1\n");
         fs::write(ctr.join("cgroup.kill"), "").expect("kill");
         let err = ensure(&root, SCOPE, 7, real_euid().wrapping_add(1), SHORT).expect_err("owner");
@@ -634,6 +617,5 @@ mod tests {
             ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("gone"),
             RecordedCgroupOutcome::AlreadyAbsent
         );
-        let _ = fs::remove_dir_all(&root);
     }
 }

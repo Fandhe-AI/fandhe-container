@@ -1848,18 +1848,23 @@ mod tests {
         .expect("timeouts")
     }
 
-    /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
+    /// テストごとに一意な bundle ディレクトリ（`ScratchDir` の子。終了時に親ごと削除される）。
+    ///
+    /// bundle は親の子にする。親は Linux で共有 flock を持つため、`BundleLock` の排他 flock を親に取ると失敗する
+    /// （pid だけの名前を先に消す旧方式の置き換え。#3434・REPAIR-12）。
     struct Bundle {
         dir: PathBuf,
+        _scratch: crate::scratch_root::ScratchDir,
     }
 
     impl Bundle {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-oci-start-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create bundle dir");
-            Self { dir }
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-oci-start-{name}"), "bundle");
+            Self {
+                dir,
+                _scratch: scratch,
+            }
         }
 
         fn write_config(&self, v: &Value) {
@@ -1873,12 +1878,6 @@ mod tests {
         fn create_req(&self, id: &str) -> CreateRequest {
             CreateRequest::new(ContainerId::new(id).expect("id"), self.dir.clone())
                 .expect("absolute bundle")
-        }
-    }
-
-    impl Drop for Bundle {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -3685,9 +3684,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_start_rejects_bundle_under_symlinked_ancestor() {
-        let base =
-            std::env::temp_dir().join(format!("fandhe-oci-start-anc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-start-anc", "d");
         let real = base.join("real");
         std::fs::create_dir_all(real.join("bundle").join("rootfs")).expect("mkdir");
         std::fs::write(
@@ -3715,7 +3713,6 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
         let got = store.get(&GetStateRequest::new(id)).expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1・CLI-1: Linux 以外は rootfs を fd で固定できないため、予約・launch の前に Unimplemented で拒否する。
@@ -4073,8 +4070,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_hard_link_scan_is_confined_to_each_protected_filesystem() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci-hl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-hl", "d");
         let state = base.join("state");
         let sub = state.join("sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
@@ -4115,15 +4112,14 @@ mod tests {
         )];
         let roots = build_protected_roots(&state_id, &state_s, &same, &|_, _| true);
         assert!(roots[0].has_hard_linked_files());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1（#1915）: 同じマウントポイントに複数のマウントが重なる子は走査で確定できないため「リンクあり」に固定する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_shared_mount_point_child_is_fixed_to_linked() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci-hl2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-hl2", "d");
         let sub = base.join("sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
         let state_s = base.to_str().expect("utf8").to_owned();
@@ -4150,7 +4146,6 @@ mod tests {
         );
         assert!(roots[1].has_hard_linked_files());
         assert!(roots[2].has_hard_linked_files());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子は走査せず「リンクあり」に固定し、他の走査の枝刈りから外す。
@@ -4201,9 +4196,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_2823_child_is_visible_matches_real_mount_id() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci-vis-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).expect("mkdir");
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-vis", "d");
         let point = base.to_str().expect("utf8").to_owned();
         let mnt = path_mount_id(&point).expect("mount id");
         assert!(child_is_visible(&point, mnt));
@@ -4228,7 +4221,6 @@ mod tests {
         assert!(!roots[1].has_hard_linked_files());
         let roots = build_protected_roots(&state_id, "/state", &child(mnt + 1), &child_is_visible);
         assert!(roots[1].has_hard_linked_files());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1・CORE-2（#2823）の実マウント結合試験（実機前提・`--ignored`）。非特権 user / mount namespace
@@ -4241,7 +4233,15 @@ mod tests {
     fn sec1_2823_overmount_hides_child_in_real_namespace() {
         const NAME: &str =
             "oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace";
+        // マウント先は外側が排他作成した `ScratchDir` の子にそろえる。外側は環境変数で親を渡し、内側は子 `base`
+        // にだけマウントする（親自体にはマウントしないので、外側の drop が EBUSY にならない）。旧方式の pid
+        // だけの名前の残骸に強いことは `repair12_3373_scratch_dir_ignores_legacy_pid_residue` が担保する（#3434・REPAIR-12）。
+        const OVERMOUNT_DIR_ENV: &str = "FANDHE_OCI_2823_DIR";
         if std::env::var_os("FANDHE_2823_INNER").is_none() {
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fandhe-oci-2823",
+                std::time::Duration::from_secs(10),
+            );
             let exe = std::env::current_exe().expect("current_exe");
             let mut cmd = std::process::Command::new("unshare");
             cmd.args([
@@ -4259,7 +4259,8 @@ mod tests {
                 "--no-capture",
                 "--test-threads=1",
             ])
-            .env("FANDHE_2823_INNER", "1");
+            .env("FANDHE_2823_INNER", "1")
+            .env(OVERMOUNT_DIR_ENV, scratch.path());
             // 外側の待機は期限つき（REPAIR-5）。内側の mount 3 回分より長く 30 秒とする。
             let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(30))
                 .expect("unshare must finish before the deadline");
@@ -4273,8 +4274,12 @@ mod tests {
             println!("ok: sec1_2823_overmount");
             return;
         }
-        let base = std::env::temp_dir().join(format!("fandhe-oci-2823-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let parent = std::path::PathBuf::from(
+            std::env::var_os(OVERMOUNT_DIR_ENV).expect("FANDHE_OCI_2823_DIR must be set"),
+        );
+        assert!(parent.is_dir(), "scratch parent must exist: {parent:?}");
+        let base = parent.join("base");
+        std::fs::create_dir(&base).expect("create base");
         let mount_tmpfs = |dir: &Path| {
             let mut cmd = std::process::Command::new("mount");
             cmd.args(["-t", "tmpfs", "tmpfs"]).arg(dir);
@@ -4327,7 +4332,6 @@ mod tests {
             + 1;
         assert!(!roots[xi].has_hard_linked_files());
         println!("ok: sec1_2823_overmount");
-        let _ = std::fs::remove_dir_all(&base);
 
         fn children_id(children: &[(FsIdentity, String, u64)], p: &str) -> u64 {
             children.iter().find(|c| c.1 == p).map_or(0, |c| c.2)

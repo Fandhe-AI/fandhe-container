@@ -729,18 +729,24 @@ mod tests {
         assert!(empty.groups().is_empty() && empty.is_empty());
     }
 
-    /// 一時ファイルに `bytes` を書いて開く（試験用。使い終わったら呼び出し側が消す。OS 共通）。
-    fn host_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::fs::File) {
+    /// 一時ファイルに `bytes` を書いて開く（試験用。OS 共通）。guard は drop で消えるので、開いた `File` より前の
+    /// 束縛にする（Windows では開いたハンドルが先に閉じる順にする）。#3434・REPAIR-12。
+    fn host_file(
+        tag: &str,
+        bytes: &[u8],
+    ) -> (
+        crate::scratch_root::ScratchDir,
+        std::path::PathBuf,
+        std::fs::File,
+    ) {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-inj-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let (scratch, dir) = crate::test_support::scratch_child(&format!("fandhe-inj-{tag}"), "d");
         let path = dir.join("host");
         std::fs::File::create(&path)
             .and_then(|mut f| f.write_all(bytes))
             .expect("write");
         let file = std::fs::File::open(&path).expect("open");
-        (dir, file)
+        (scratch, dir, file)
     }
 
     /// CORE-6・SEC-5(#2628): `from_file` は封印 memfd（fd 3 以上・close-on-exec・固定名・封印済み・長さ一致）に置き、
@@ -749,7 +755,7 @@ mod tests {
     #[test]
     fn core6_sec5_injected_content_from_file_is_sealed_memfd() {
         use std::io::Read as _;
-        let (dir, file) = host_file("sealed", SENTINEL);
+        let (_scratch, dir, file) = host_file("sealed", SENTINEL);
         let c = InjectedContent::from_file(&file).expect("from_file");
         assert!(!c.is_caller_memory());
         assert_eq!(c.len(), SENTINEL.len());
@@ -789,29 +795,25 @@ mod tests {
         let mut out2 = std::fs::File::create(&out2_path).expect("out2");
         c.clone().write_to(&mut out2).expect("write_to again");
         assert_eq!(std::fs::read(&out2_path).expect("read"), SENTINEL);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-6・SEC-5(#2628): `from_file` の上限は ちょうど 512 KiB まで成功、+1 は InvalidArgument。空は成功。
     #[cfg(target_os = "linux")]
     #[test]
     fn core6_sec5_injected_content_from_file_bounds() {
-        let (d1, f1) = host_file("max", &vec![b'a'; INJECTED_FILE_MAX_BYTES]);
+        let (_s1, _d1, f1) = host_file("max", &vec![b'a'; INJECTED_FILE_MAX_BYTES]);
         assert_eq!(
             InjectedContent::from_file(&f1).expect("max").len(),
             INJECTED_FILE_MAX_BYTES
         );
-        let (d2, f2) = host_file("over", &vec![b'a'; INJECTED_FILE_MAX_BYTES + 1]);
+        let (_s2, _d2, f2) = host_file("over", &vec![b'a'; INJECTED_FILE_MAX_BYTES + 1]);
         assert_eq!(
             err_of(InjectedContent::from_file(&f2)),
             invalid_msg("injected file content is too large")
         );
-        let (d3, f3) = host_file("empty", b"");
+        let (_s3, _d3, f3) = host_file("empty", b"");
         let c = InjectedContent::from_file(&f3).expect("empty");
         assert!(c.is_empty());
-        for d in [d1, d2, d3] {
-            let _ = std::fs::remove_dir_all(d);
-        }
     }
 
     /// CORE-6・SEC-5(#2759・#2728 P2-2): `from_file` は通常ファイル以外（文字デバイス `/dev/null`・ディレクトリ・
@@ -834,14 +836,13 @@ mod tests {
     #[test]
     fn core6_sec5_injected_content_from_file_ignores_cursor() {
         use std::io::{Seek as _, SeekFrom};
-        let (dir, mut file) = host_file("cursor", SENTINEL);
+        let (_scratch, _dir, mut file) = host_file("cursor", SENTINEL);
         file.seek(SeekFrom::Start(5)).expect("seek");
         let a = InjectedContent::from_file(&file).expect("a");
         let b = InjectedContent::from_file(&file).expect("b");
         assert_eq!(a.len(), SENTINEL.len());
         assert_eq!(b.len(), SENTINEL.len());
         assert_eq!(file.stream_position().expect("pos"), 5);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-6・SEC-5(#2628): 比較は同一性。clone 同士は等しく、同じ内容でも別々に作った封印 memfd や
@@ -849,7 +850,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn core6_sec5_injected_content_equality_is_identity_for_sealed() {
-        let (dir, file) = host_file("eq", SENTINEL);
+        let (_scratch, _dir, file) = host_file("eq", SENTINEL);
         let a = InjectedContent::from_file(&file).expect("a");
         let b = InjectedContent::from_file(&file).expect("b");
         assert_eq!(a, a.clone());
@@ -858,7 +859,6 @@ mod tests {
         assert_eq!(content(SENTINEL), content(SENTINEL));
         assert!(content(SENTINEL).is_caller_memory());
         assert_eq!(format!("{a:?}"), "InjectedContent(<redacted 20 bytes>)");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-12・TASK-169.4.2: どのエラー message にも内容・入力値が現れない。

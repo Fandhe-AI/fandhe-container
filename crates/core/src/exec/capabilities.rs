@@ -2006,12 +2006,13 @@ mod tests {
     fn sup6_task163_4_pre_opened_thread_source_is_enforced() {
         use std::io::{Seek as _, Write as _};
         let before = status_value("CapBnd:");
-        let path = std::env::temp_dir().join(format!("fandhe-cap-threads-{}", std::process::id()));
+        // 予測できる名前を作成・切り詰めせず、排他作成の `ScratchDir` の子へ `create_new` する（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-cap-threads", "d");
+        let path = dir.join("status");
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)
             .expect("create");
         std::fs::remove_file(&path).expect("unlink");

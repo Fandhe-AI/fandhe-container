@@ -32,6 +32,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -74,9 +78,13 @@ mod linux {
     }
 
     pub fn run() {
-        let dir = std::env::temp_dir().join(format!("fandhe-holder-memory-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let scratch = super::scratch_root::ScratchDir::new(
+            "fandhe-holder-memory",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("d");
+        std::fs::create_dir(&dir).expect("temp dir");
 
         // 陽性対照: 呼び出し元のメモリ(Vec)に secret を持つ中間プロセスから fork した holder には載る。
         let control = observe_holder_memory(
@@ -105,7 +113,6 @@ mod linux {
             !sealed.fd_targets.iter().any(|t| t.contains("memfd:")),
             "the holder must not hold the sealed memfd: {sealed:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
         println!(
             "rootless_holder_memory: holder memory has no injected secret (regions={}, hits={}, control_hits={})",
             sealed.regions_scanned, sealed.hits, control.hits

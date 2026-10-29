@@ -392,11 +392,9 @@ mod tests {
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("fc-ioweight-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        base
+    fn scratch(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fc-ioweight-{tag}"), "d")
     }
 
     /// SUP-13・TASK-170.4: 通常ファイル上で書き込みと読み戻しが具体値で一致する。
@@ -406,7 +404,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_4_io_weight_write_and_read_back() {
-        let base = scratch("ok");
+        let (_scratch, base) = scratch("ok");
         std::fs::write(base.join("io.weight"), b"").unwrap();
         let dir = File::open(&base).unwrap();
         let want = IoWeight::new(250).unwrap();
@@ -415,7 +413,6 @@ mod tests {
             std::fs::read_to_string(base.join("io.weight")).unwrap(),
             "default 250"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.4・REPAIR-4: 成功と失敗（open 失敗）の双方が件数として記録される。
@@ -427,17 +424,15 @@ mod tests {
     fn sup13_task170_4_io_weight_operations_are_recorded() {
         let name = OpName::new(SET_IO_WEIGHT_OP_NAME).unwrap();
         let rec = OpRecorder::new();
-        let ok = scratch("rec-ok");
+        let (_scratch, ok) = scratch("rec-ok");
         std::fs::write(ok.join("io.weight"), b"").unwrap();
         let dir = File::open(&ok).unwrap();
         write_io_weight_recorded(dir.as_fd(), &rec, &IoWeight::new(250).unwrap()).unwrap();
-        let ng = scratch("rec-ng");
+        let (_scratch, ng) = scratch("rec-ng");
         let dir2 = File::open(&ng).unwrap();
         write_io_weight_recorded(dir2.as_fd(), &rec, &IoWeight::default()).unwrap_err();
         let stats = rec.snapshot_op(&name).expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
-        std::fs::remove_dir_all(&ok).unwrap();
-        std::fs::remove_dir_all(&ng).unwrap();
     }
 
     /// SUP-13・TASK-170.4: `io.weight` が無い（controller 未有効等）場合は `FailedPrecondition`。
@@ -447,12 +442,11 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_4_io_weight_missing_file_is_failed_precondition() {
-        let base = scratch("missing");
+        let (_scratch, base) = scratch("missing");
         let dir = File::open(&base).unwrap();
         let e = write_io_weight_at(dir.as_fd(), &IoWeight::default()).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.step, CgroupStep::SetIoWeight);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.4: 読み戻した `default` 値が要求と食い違えば成功扱いにしない（不一致分岐）。
@@ -465,7 +459,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_4_io_weight_read_back_mismatch_fails() {
-        let base = scratch("mismatch");
+        let (_scratch, base) = scratch("mismatch");
         std::fs::write(base.join("io.weight"), b"default 9999\n").unwrap();
         let dir = File::open(&base).unwrap();
         let e = write_io_weight_at(dir.as_fd(), &IoWeight::new(1).unwrap()).unwrap_err();
@@ -479,7 +473,6 @@ mod tests {
             std::fs::read_to_string(base.join("io.weight")).unwrap(),
             "default 1999\n"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.4: 読み戻した内容が形式不正なら、値の比較より前に解析エラーで失敗する。
@@ -489,7 +482,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_4_io_weight_read_back_malformed_fails() {
-        let base = scratch("malformed");
+        let (_scratch, base) = scratch("malformed");
         std::fs::write(
             base.join("io.weight"),
             b"default 9999\n8:0 300\nxxxxxxxxxxxx",
@@ -503,7 +496,6 @@ mod tests {
             e.message,
             "unexpected io.weight content (expected `<key> <number>` lines): \"default 1999\\n8:0 300\\nxxxxxxxxxxxx\""
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.4: `io.weight` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
@@ -513,7 +505,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_4_io_weight_symlink_is_rejected() {
-        let base = scratch("symlink");
+        let (_scratch, base) = scratch("symlink");
         std::fs::write(base.join("target"), b"untouched").unwrap();
         std::os::unix::fs::symlink(base.join("target"), base.join("io.weight")).unwrap();
         let dir = File::open(&base).unwrap();
@@ -522,7 +514,6 @@ mod tests {
             std::fs::read_to_string(base.join("target")).unwrap(),
             "untouched"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn blkio(n: u16) -> BlkioWeight {
@@ -552,7 +543,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_present_writes_bfq_only() {
-        let base = scratch("bfq-ok");
+        let (_scratch, base) = scratch("bfq-ok");
         std::fs::write(base.join("io.bfq.weight"), b"").unwrap();
         std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
         let dir = File::open(&base).unwrap();
@@ -560,7 +551,6 @@ mod tests {
         assert_eq!(got, BlkioWeightTarget::Bfq(BfqWeight::new(500).unwrap()));
         assert_eq!(read(&base, "io.bfq.weight"), "500");
         assert_eq!(read(&base, "io.weight"), "default 100\n");
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: `io.bfq.weight` が無ければ変換して `io.weight` へ書く。
@@ -570,7 +560,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_absent_falls_back_to_io_weight() {
-        let base = scratch("bfq-absent");
+        let (_scratch, base) = scratch("bfq-absent");
         std::fs::write(base.join("io.weight"), b"").unwrap();
         let dir = File::open(&base).unwrap();
         let got = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap();
@@ -580,7 +570,6 @@ mod tests {
         );
         assert_eq!(read(&base, "io.weight"), "default 4950");
         assert!(!base.join("io.bfq.weight").exists());
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: 両方とも無ければ `io.weight` 側の `FailedPrecondition`。
@@ -590,12 +579,11 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_both_absent_is_failed_precondition() {
-        let base = scratch("both-absent");
+        let (_scratch, base) = scratch("both-absent");
         let dir = File::open(&base).unwrap();
         let e = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.step, CgroupStep::SetIoWeight);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: `io.bfq.weight` が ENOENT 以外（ここでは EISDIR）で開けないときは
@@ -606,14 +594,13 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_open_failure_does_not_fall_back() {
-        let base = scratch("bfq-eisdir");
+        let (_scratch, base) = scratch("bfq-eisdir");
         std::fs::create_dir(base.join("io.bfq.weight")).unwrap();
         std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
         let dir = File::open(&base).unwrap();
         let e = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap_err();
         assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
         assert_eq!(read(&base, "io.weight"), "default 100\n");
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: `io.bfq.weight` が symlink なら拒否し、リンク先も `io.weight` も変えない。
@@ -623,7 +610,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_symlink_is_rejected_without_fallback() {
-        let base = scratch("bfq-symlink");
+        let (_scratch, base) = scratch("bfq-symlink");
         std::fs::write(base.join("target"), b"untouched").unwrap();
         std::os::unix::fs::symlink(base.join("target"), base.join("io.bfq.weight")).unwrap();
         std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
@@ -632,7 +619,6 @@ mod tests {
         assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
         assert_eq!(read(&base, "target"), "untouched");
         assert_eq!(read(&base, "io.weight"), "default 100\n");
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: 読み戻しの不一致は成功扱いにせず、巻き戻さない。
@@ -643,7 +629,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_read_back_mismatch_fails() {
-        let base = scratch("bfq-mismatch");
+        let (_scratch, base) = scratch("bfq-mismatch");
         std::fs::write(base.join("io.bfq.weight"), b"999\n").unwrap();
         let dir = File::open(&base).unwrap();
         let e = write_blkio_weight_at(dir.as_fd(), &blkio(10)).unwrap_err();
@@ -654,7 +640,6 @@ mod tests {
             "io.bfq.weight read back as \"109\", expected \"10\""
         );
         assert_eq!(read(&base, "io.bfq.weight"), "109\n");
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534: 読み戻しが形式不正なら解析エラーで失敗する。
@@ -664,7 +649,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_issue1534_bfq_read_back_malformed_fails() {
-        let base = scratch("bfq-malformed");
+        let (_scratch, base) = scratch("bfq-malformed");
         std::fs::write(base.join("io.bfq.weight"), b"999\nxxxxxx").unwrap();
         let dir = File::open(&base).unwrap();
         let e = write_blkio_weight_at(dir.as_fd(), &blkio(10)).unwrap_err();
@@ -674,7 +659,6 @@ mod tests {
             e.message,
             "unexpected io.bfq.weight content (weight is not a decimal number): \"109\\nxxxxxx\""
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・#1534・REPAIR-4: `set_blkio_weight` の成功・失敗が `cgroup.set_blkio_weight` に記録される。
@@ -687,9 +671,9 @@ mod tests {
     fn sup13_issue1534_blkio_weight_operations_are_recorded() {
         let name = OpName::new(SET_BLKIO_WEIGHT_OP_NAME).unwrap();
         let rec = OpRecorder::new();
-        let ok = scratch("rec-bfq-ok");
+        let (_scratch, ok) = scratch("rec-bfq-ok");
         std::fs::write(ok.join("io.bfq.weight"), b"").unwrap();
-        let ng = scratch("rec-bfq-ng");
+        let (_scratch, ng) = scratch("rec-bfq-ng");
         std::fs::create_dir(ng.join("io.bfq.weight")).unwrap();
         for base in [&ok, &ng] {
             let dir = File::open(base).unwrap();
@@ -697,7 +681,5 @@ mod tests {
         }
         let stats = rec.snapshot_op(&name).expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
-        std::fs::remove_dir_all(&ok).unwrap();
-        std::fs::remove_dir_all(&ng).unwrap();
     }
 }

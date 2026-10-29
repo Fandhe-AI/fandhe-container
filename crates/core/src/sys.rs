@@ -8603,9 +8603,7 @@ mod tests {
     #[test]
     fn sup12_task169_4_2_create_file_excl_at_refuses_existing_names() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let dir = std::env::temp_dir().join(format!("fandhe-sys-excl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-sys-excl", "d");
         let parent =
             open_dir_path_nofollow(None, &CString::new(dir.to_str().expect("utf8")).expect("c"))
                 .expect("open dir");
@@ -8628,7 +8626,6 @@ mod tests {
             SysError::Os(EEXIST)
         );
         assert!(!dir.join("target-not-created").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OCI-4・SEC-1: 根の伝播の設定は 2 通りのフラグだけを作る。

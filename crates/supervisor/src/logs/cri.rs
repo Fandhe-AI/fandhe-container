@@ -662,7 +662,8 @@ mod tests {
         use std::path::{Path, PathBuf};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct Tmp(PathBuf);
+        /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+        struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
         impl Tmp {
             fn new(tag: &str) -> Self {
@@ -670,21 +671,17 @@ mod tests {
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
                 let p = std::env::temp_dir()
                     .join(format!("fc-crilog-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+                let root = crate::test_root::test_root_at(p.clone());
+                // check_dir の試験条件として 0750 にする（test_root_at は 0700）。
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o750))
                     .expect("chmod");
                 // 一時ディレクトリ自体が symlink 経由（macOS の /var 等）でも root 所有なら許される。
-                Self(std::fs::canonicalize(&p).expect("canon"))
+                Self(std::fs::canonicalize(&p).expect("canon"), root)
             }
 
             fn log(&self, rel: &str) -> ContainerLogPath {
                 ContainerLogPath::new(format!("{}/{rel}", self.0.display())).expect("log path")
-            }
-        }
-
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 

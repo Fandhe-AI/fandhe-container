@@ -748,16 +748,13 @@ mod tests {
 
     /// `Threads:` を固定した使い捨ての status 相当ファイル（名前を残さない）。
     fn status_with_threads(n: u64) -> ThreadCountSource {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-exec-command-{}-{n}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        // 予測できる名前を作成・切り詰めせず、排他作成の `ScratchDir` の子へ `create_new` する（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-exec-command", "d");
+        let path = dir.join(format!("status-{n}"));
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)
             .expect("create");
         std::fs::remove_file(&path).expect("unlink");
@@ -768,19 +765,12 @@ mod tests {
 
     /// `cgroup.procs` / `cgroup.kill` を置いた使い捨てのディレクトリから作った子 cgroup（fork 前に失敗する試験用）。
     fn child_cgroup() -> ExecChildCgroup {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-exec-command-cg-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 呼び出しの終わりで `ScratchDir` が消える（開いた fd は削除後も有効。従来と同じ）。#3434・REPAIR-12。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-exec-command-cg", "d");
         std::fs::write(dir.join("cgroup.procs"), "").expect("procs");
         std::fs::write(dir.join("cgroup.kill"), "").expect("kill");
         let fd = OwnedFd::from(std::fs::File::open(&dir).expect("open dir"));
-        let cgroup = ExecChildCgroup::from_dir_for_test(fd);
-        let _ = std::fs::remove_dir_all(&dir);
-        cgroup
+        ExecChildCgroup::from_dir_for_test(fd)
     }
 
     fn entry() -> ExecCommand {

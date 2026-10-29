@@ -18,6 +18,10 @@
 
 #![cfg(target_os = "linux")]
 
+// 残骸・PID 再利用との衝突を避ける作成前削除の補助（REPAIR-12・#3435）。
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -295,15 +299,21 @@ fn verify(expected: &Expected, before: &Snapshot, after: &Snapshot) -> SymlinkCo
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// 一時 rootfs。Drop で削除する。
-struct TempRoot(PathBuf);
+struct TempRoot(PathBuf, #[allow(dead_code)] test_root::TestRoot);
 
 impl TempRoot {
     fn new() -> Self {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let p =
-            std::env::temp_dir().join(format!("fandhe-gpu-symlink-cov-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(std::fs::canonicalize(&p).unwrap())
+        Self::at(
+            std::env::temp_dir().join(format!("fandhe-gpu-symlink-cov-{}-{n}", std::process::id())),
+        )
+    }
+
+    /// 指定パスの残骸（前回の symlink など）を消して作り直す。古いリンクが前後のスナップショットへ
+    /// 混ざるのを防ぐ（REPAIR-12・#3435）。
+    fn at(p: PathBuf) -> Self {
+        let root = test_root::test_root_at(p.clone());
+        Self(std::fs::canonicalize(&p).unwrap(), root)
     }
 
     fn path(&self) -> &Path {
@@ -318,10 +328,25 @@ impl TempRoot {
     }
 }
 
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+/// GPU-2・REPAIR-12・#3435: 残骸の symlink が残っていても、作り直した rootfs は空になる。
+#[test]
+fn gpu2_repair12_symlink_root_clears_stale_links() {
+    let p = std::env::temp_dir().join(format!(
+        "fandhe-gpu-symlink-residue-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(p.join("usr")).unwrap();
+    symlink("/etc/hostname", p.join("usr").join("stale-link")).unwrap();
+    {
+        let t = TempRoot::at(p.clone());
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 0);
+        assert!(std::fs::symlink_metadata(t.path().join("usr").join("stale-link")).is_err());
     }
+    assert!(!p.exists());
 }
 
 /// フックの役を務める: 期待どおりの全リンクを作る。

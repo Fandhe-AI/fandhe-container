@@ -86,6 +86,12 @@ pub use init::run;
 /// 一致・包含の関係にない（単体テストで照合）。
 pub const READY_MARKER: &str = "fandhe-guest: init ready v1";
 
+// pid と連番だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3435）。std だけの試験専用モジュールで、静的リンクのゲストバイナリには入らない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 #[cfg(test)]
 mod tests {
     use super::*;

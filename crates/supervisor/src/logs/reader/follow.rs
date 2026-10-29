@@ -272,24 +272,18 @@ mod tests {
 
     use crate::logs::StreamKind;
 
-    struct Tmp(PathBuf);
+    /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl Tmp {
         fn new(tag: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
             let p =
                 std::env::temp_dir().join(format!("fc-sup-fo-{tag}-{}-{n}", std::process::id()));
-            fs::create_dir_all(&p).expect("mkdir");
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-            Self(p)
-        }
-    }
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(p, root)
         }
     }
 

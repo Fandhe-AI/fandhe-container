@@ -1046,8 +1046,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_2027_probe_primary_fails_when_audit_log_is_a_directory() {
-        let dir = std::env::temp_dir().join(format!("fc-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe", "d");
         std::fs::create_dir_all(dir.join("dirlog")).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1064,7 +1064,6 @@ mod tests {
         let ok = FileAuditSink::with_parts(dir.join("audit.log"), fb, noop);
         ok.probe_primary().unwrap();
         assert_eq!(std::fs::metadata(dir.join("audit.log")).unwrap().len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn sample() -> AuditRecord {
@@ -1097,6 +1096,8 @@ mod tests {
         }
     }
 
+    /// 存在しないパスを返すだけで FS には触れない（作成も削除もしない）ため、予測できる名前のままでよい
+    /// （#3434・REPAIR-12）。
     fn missing_path() -> PathBuf {
         std::env::temp_dir()
             .join(format!("fandhe-auditsink-missing-{}", std::process::id()))
@@ -1187,15 +1188,11 @@ mod tests {
         use super::*;
         use crate::audit_log::encode_json_line;
         use crate::state_store::StateRoot;
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
 
-        fn fresh_dir(tag: &str) -> PathBuf {
-            let dir =
-                std::env::temp_dir().join(format!("fandhe-auditsink-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            dir
+        fn fresh_dir(tag: &str) -> (crate::scratch_root::ScratchDir, PathBuf) {
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+            crate::test_support::scratch_child(&format!("fandhe-auditsink-{tag}"), "d")
         }
 
         fn open_store(dir: &std::path::Path) -> FileStateStore {
@@ -1205,7 +1202,7 @@ mod tests {
         /// SEC-4・SUP-6・TASK-163: 拒否 1 件がファイルへ 1 行記録される。
         #[test]
         fn sec4_task163_production_sink_writes_one_line() {
-            let dir = fresh_dir("one");
+            let (_scratch, dir) = fresh_dir("one");
             let store = open_store(&dir);
             let (sink, _calls, _notes) = sink_with(store.root().join(AUDIT_LOG_FILE_NAME), false);
             sink.record(&sample()).unwrap();
@@ -1213,13 +1210,12 @@ mod tests {
             let expect = String::from_utf8(encode_json_line(&sample()).unwrap()).unwrap();
             assert_eq!(text, expect);
             assert_eq!(text.lines().count(), 1);
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SEC-4・TASK-163: symlink の @audit.log は主経路で拒否され代替経路へ回る。
         #[test]
         fn sec4_task163_symlinked_log_goes_to_fallback() {
-            let dir = fresh_dir("sym");
+            let (_scratch, dir) = fresh_dir("sym");
             let store = open_store(&dir);
             let target = dir.join("target");
             std::fs::write(&target, b"").unwrap();
@@ -1228,20 +1224,18 @@ mod tests {
             sink.record(&sample()).unwrap();
             assert_eq!(*calls.lock().unwrap(), vec![AuditWriteErrorKind::Open]);
             assert_eq!(std::fs::read(&target).unwrap(), b"");
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// OCI-5: sink が @audit.log を作った後でも、ストアの再 open で @revision が保たれる。
         #[test]
         fn oci5_task163_audit_log_does_not_break_store_reopen() {
-            let dir = fresh_dir("reopen");
+            let (_scratch, dir) = fresh_dir("reopen");
             let store = open_store(&dir);
             let (sink, _calls, _notes) = sink_with(store.root().join(AUDIT_LOG_FILE_NAME), false);
             sink.record(&sample()).unwrap();
             let rev = std::fs::read(store.root().join("@revision")).unwrap();
             let again = open_store(&dir);
             assert_eq!(std::fs::read(again.root().join("@revision")).unwrap(), rev);
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

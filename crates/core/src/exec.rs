@@ -3980,21 +3980,28 @@ mod tests {
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。
     /// `TMPDIR` に symlink があると rootfs の正規化検査が先に失敗して各ケースが意図と
     /// 違う理由で通るため、正規化したパスを起点にする。
+    ///
+    /// 根は排他作成した `ScratchDir` の子にする（pid だけの名前を先に消す旧方式の置き換え。#3434・REPAIR-12）。
+    /// `Drop` は権限を戻してから消し、その後 guard が親を消す。
     struct TempTree {
         base: std::path::PathBuf,
         restore: Vec<std::path::PathBuf>,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        scratch: crate::scratch_root::ScratchDir,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-exec-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-exec-{label}"),
+                std::time::Duration::from_secs(10),
+            );
+            let base = std::fs::canonicalize(scratch.path()).unwrap().join("d");
+            std::fs::create_dir(&base).unwrap();
             Self {
                 base,
                 restore: Vec::new(),
+                scratch,
             }
         }
     }

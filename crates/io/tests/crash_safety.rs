@@ -38,11 +38,15 @@
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
+// 残骸・PID 再利用と衝突しない排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "crash_safety/client_end.rs"]
 mod client_end;
 #[path = "crash_safety/disk_check.rs"]
 mod disk_check;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "crash_safety/trial.rs"]
 mod trial;
 
@@ -50,7 +54,6 @@ mod trial;
 mod unix {
     use std::io::Write as _;
     use std::io::{BufRead, BufReader, Read};
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::ExitStatusExt;
@@ -100,11 +103,8 @@ mod unix {
             // 並行テスト・複数試行で同じ tag が重なっても衝突しないよう連番を足す
             static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("fcio-cs-{}-{tag}-{n}", std::process::id()));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
+            // 残骸・PID 再利用との衝突を避ける排他作成（REPAIR-12・#3435）。sun_path のため接頭辞は短く保つ。
+            let dir = super::exclusive_dir::create(&format!("fcio-cs-{tag}-{n}"))
                 .expect("must be able to create a temp dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("must be able to force mode 0700 regardless of umask");

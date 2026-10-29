@@ -11,10 +11,12 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::DirBuilderExt;
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_cri::runtime::v1 as cri;
@@ -30,21 +32,39 @@ const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// 0700 の一時ディレクトリ（Drop で削除）。
+// 残骸の回帰試験が専用の親を作るのに使う（REPAIR-12・#3435）。
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+/// CRI-2・REPAIR-12・#3435: 前回の残骸（`fcpc-<tag>-<pid>-0` と中身）があっても、排他作成は残骸を
+/// 消さずに連番を進め、新しい空の 0700 のディレクトリを返す。
+#[test]
+fn cri2_repair12_exclusive_dir_skips_stale_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = test_root::test_root("fcpc-residue", "parent");
+    let stale = parent.join(format!("fcpc-t-{}-0", std::process::id()));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("old"), b"stale").unwrap();
+    let fresh = exclusive_dir::create_in(&parent, "fcpc-t").unwrap();
+    assert_eq!(
+        fresh,
+        parent.join(format!("fcpc-t-{}-1", std::process::id()))
+    );
+    assert_eq!(std::fs::read(stale.join("old")).unwrap(), b"stale");
+    assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fcpc-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&p)
-            .expect("create temp dir");
-        Self(p)
+        // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+        // 別 UID（root）の `#[ignore]` の場面を持つ試験があるため、予測できる名前を消す補助は使わない。
+        Self(exclusive_dir::create(&format!("fcpc-{tag}")).expect("create temp dir"))
     }
 }
 

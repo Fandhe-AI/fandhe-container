@@ -467,7 +467,7 @@ issue #3227（PR #3278）と #3257（PR #3286）の修正は、macOS・Windows �
 | 試験 | 対象 OS | 入力（`workflow_dispatch`） | 結果 |
 | ---- | ------- | --------------------------- | ---- |
 | `cri3_repair5_extraction_shares_the_pull_deadline`（`image_pull`。CRI-3・REPAIR-5） | macOS のみ | `repeat-package=fandhe-container-cri`・`repeat-test-bin=image_pull`・`repeat-libtest-name=<試験名>`・`repeat-os=macos-latest`・`repeat-count=150` | 未採取 |
-| `cri2_repair5_3142_create_rollback_release_is_bounded`（`runtime_service_runtime`。CRI-2・REPAIR-5） | macOS・Windows | `repeat-test-bin=runtime_service_runtime`・`repeat-libtest-name=<試験名>`・`repeat-os=all`・`repeat-count=150` | 未採取 |
+| `cri2_repair5_3142_create_rollback_release_is_bounded`（`runtime_service_runtime`。CRI-2・REPAIR-5） | macOS・Windows | `repeat-package=fandhe-container-cri`・`repeat-test-bin=runtime_service_runtime`・`repeat-libtest-name=<試験名>`・`repeat-os=all`・`repeat-count=150` | 未採取 |
 
 - `image_pull.rs` は `#![cfg(unix)]` のため Windows の leg は 0 件実行で `missing-libtest-ok` の赤になる。Windows は対象外で、非 Unix の拒否は lib の `non_unix_tests` が受け持つ
 - dispatch は作業ブランチ（または `ci-probe/*`）へ向ける。main へ向けると main への push の CI と concurrency group が同じになり、互いに取り消して `passed=` 行が残らない。2 本は同じ ref・group のため直列に投げる

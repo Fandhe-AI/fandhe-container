@@ -20,7 +20,8 @@
 //!    DELRULE が失敗しても、未束縛の [`PublishedPort`] へ生きたテーブルのハンドルを束ねない（公開時の実体を
 //!    証明できない値を、同名で作り直されたテーブルのハンドルで埋めて請求書に載せると、回収が別の公開ルールを
 //!    消しうる。テーブルハンドルは公開時に取得した値だけが請求書に載る。#3285）
-//! 4. 結果: 成功なら受け口の予約を戻す。`Aborted` / `NotSent` ならルールは残っている（確定）ので予約を
+//! 4. 結果（記録つきの解除〔`network::recorded`〕は、ルールの削除 `delete_published_rules_with` と予約の解放
+//!    `release_published_listener` を分け、記録から公開を外した後に予約を解放する。#3343）: 成功なら受け口の予約を戻す。`Aborted` / `NotSent` ならルールは残っている（確定）ので予約を
 //!    保持し [`PublishedPort`] を返して再試行できるようにする。結果不明（`Unknown`）も予約を保持する
 //!    （quarantine。残ったルールが同じ受け口で別のコンテナへ転送する事故を防ぐ）。ENOENT を「既に消えた」と
 //!    推測して予約を戻すことはしない
@@ -165,6 +166,7 @@ impl std::error::Error for UnpublishPortError {}
 /// 公開 1 件の解除の本体（OS 非依存。手順と方針はモジュール doc）。`table_info` はテーブルの
 /// ハンドルとユーザーデータの照会（読み取りのみ）、`delete` は `(prerouting, output)` のルールハンドルを
 /// 指定した DELRULE 2 本の 1 バッチ投入（Linux では `unpublish_container_port` が渡す）。
+/// ルールの削除（[`delete_published_rules_with`]）と予約の解放（[`release_published_listener`]）を続けて行う。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn unpublish_ports_with(
     table_info: impl FnOnce(&NftName) -> Result<TableInfo, NetError>,
@@ -173,6 +175,42 @@ pub(crate) fn unpublish_ports_with(
     published: PublishedPort,
     registry: &mut PortRegistry,
 ) -> Result<(), UnpublishPortError> {
+    let published = delete_published_rules_with(table_info, delete, network, published)?;
+    // ルールは消えた。予約を戻せなければ予約だけが残る（fail-closed。解放は delete_network）。
+    release_published_listener(registry, &published).map_err(|error| UnpublishPortError {
+        error,
+        rules: UnpublishRules::Removed,
+        reservation_held: true,
+        published: None,
+    })
+}
+
+/// 受け口の予約を戻す（`registry` が空なら 0 件で成功する）。ルールが消えたことを確かめた後にだけ呼ぶ。
+///
+/// 記録つきの解除（`network::recorded`）は、記録から公開を外した後にこれを呼ぶ（記録に行がある間は予約を
+/// 解放しない。#3343）。
+pub(crate) fn release_published_listener(
+    registry: &mut PortRegistry,
+    published: &PublishedPort,
+) -> Result<(), NetError> {
+    registry
+        .release_listeners(
+            &published.network,
+            &published.endpoint,
+            std::slice::from_ref(&published.publish),
+        )
+        .map(|_| ())
+}
+
+/// 公開 1 件の DNAT ルール 2 本の削除まで（予約は触らない）。成功したら検証済みの [`PublishedPort`] を返す。
+/// 失敗は [`UnpublishPortError`]（`rules` は `Present` / `Unknown` / `StaleHandles`。予約は保持）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn delete_published_rules_with(
+    table_info: impl FnOnce(&NftName) -> Result<TableInfo, NetError>,
+    delete: impl FnOnce(&NftName, (NftRuleHandle, NftRuleHandle)) -> Result<(), NftApplyFailure>,
+    network: &CreatedNetwork,
+    published: PublishedPort,
+) -> Result<PublishedPort, UnpublishPortError> {
     // 何も変えずに断る失敗。ルールの状態は判らないので Unknown とし、予約と記録を保つ。
     let refuse = |error: NetError, published: PublishedPort| UnpublishPortError {
         error,
@@ -222,20 +260,7 @@ pub(crate) fn unpublish_ports_with(
             published: Some(Box::new(published)),
         });
     }
-    // ルールは消えた。予約を戻せなければ予約だけが残る（fail-closed。解放は delete_network）。
-    registry
-        .release_listeners(
-            &published.network,
-            &published.endpoint,
-            std::slice::from_ref(&published.publish),
-        )
-        .map(|_| ())
-        .map_err(|error| UnpublishPortError {
-            error,
-            rules: UnpublishRules::Removed,
-            reservation_held: true,
-            published: None,
-        })
+    Ok(published)
 }
 
 /// 公開 1 件を解除する（DNAT ルール 2 本の削除と受け口の予約の解放。NET-3・NET-4）。

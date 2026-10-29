@@ -18,6 +18,9 @@
 //! start → `["running"]`、stop → `["stopped"]`、ping → `["pong"]`。
 #![cfg(unix)]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -614,7 +617,7 @@ mod real_vm {
     impl Drop for Child {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 

@@ -17,6 +17,9 @@
 //! `["created","",""]`、start → `["running", transport, warning]`、stop → `["stopped","",""]`。
 //! 待ちはすべて期限つき（REPAIR-5）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(unix)]
 mod mock_core {
     use std::os::unix::fs::DirBuilderExt;
@@ -519,7 +522,7 @@ mod real_wsl2 {
                 Ok(Some(s)) => return s.success(),
                 Ok(None) if start.elapsed() > timeout => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                     return false;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),

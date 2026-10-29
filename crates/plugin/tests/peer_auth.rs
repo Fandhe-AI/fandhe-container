@@ -23,6 +23,9 @@
 //! client が connect 直後に close した接続の peer UID 取得結果を JSON 行で出す（accept の結果・監査 reason と getpeereid の errno。UID は含まない）（#2252 P2-2。
 //! 結果の判断は人間担当の #2405）。手順は `AGENTS.md`「実機前提テスト」節。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(unix))]
 #[test]
 fn plug12_peer_auth_is_unimplemented_on_non_unix() {
@@ -224,7 +227,7 @@ mod unix {
         ) {
             Ok(_) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("accept succeeded: the connector ran as the same UID as the test");
             }
             Err(e) => {
@@ -245,7 +248,7 @@ mod unix {
         }
         if !exited {
             let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("connector did not exit after the connection was rejected");
         }
         // 読み取り側にも期限を設ける。超過時は reader を待たずに失敗させる（reader は孫が

@@ -3,6 +3,9 @@
 //! 接続先が存在しない場合は接続失敗（終了コード 3）で即終了するが、待機には期限を設け超過時は kill して失敗にする（REPAIR-5）。
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・WIN-1・REPAIR-3。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -32,7 +35,7 @@ fn run(args: &[&str], envs: &[(&str, &str)]) -> (i32, String) {
         }
         if start.elapsed() > DEADLINE {
             let _ = child.kill();
-            let _ = child.wait();
+            crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
             panic!("plugin binary did not exit within deadline");
         }
         std::thread::sleep(Duration::from_millis(10));

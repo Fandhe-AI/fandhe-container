@@ -16,6 +16,9 @@
 
 #![cfg(windows)]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,7 +211,7 @@ fn guest_sh(distro: &str, script: &str, timeout: Duration) -> (bool, String) {
             Some(s) => break s,
             None if start.elapsed() > timeout => {
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("wsl.exe timed out: {script}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),

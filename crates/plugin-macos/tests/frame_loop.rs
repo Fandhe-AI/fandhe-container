@@ -6,6 +6,9 @@
 //! 対応 ID: TASK-115・PLUG-1・PLUG-12・MAC-1・REPAIR-5。
 #![cfg(unix)]
 
+#[path = "support/reap.rs"]
+mod reap;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -90,7 +93,7 @@ impl Harness {
             }
             if start.elapsed() > WAIT {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                crate::reap::reap_or_report(&mut self.child, crate::reap::REAP_WITHIN);
                 panic!("plugin binary did not exit within deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -107,7 +110,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::reap::reap_on_drop(&mut self.child);
         let _ = std::fs::remove_dir_all(&self.dir); // 排他作成した自前のディレクトリのみ
     }
 }

@@ -950,10 +950,60 @@ mod tests {
     const ABC: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     const MSG: &str = "blob digest does not match the descriptor";
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fc-oci-layer-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// 試験用ディレクトリ。名前にプロセス内連番を入れ、作成前に残骸を消し、Drop で後始末する
+    /// （OCI-7・REPAIR-12・#3298。`image_management/inventory_persist.rs` の `TestRoot` と同じ形）。
+    struct TestRoot(PathBuf);
+
+    impl std::ops::Deref for TestRoot {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TestRoot {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 指定パスの残骸を消して空のディレクトリとして作り直す。削除に失敗したら panic（fail-closed）。
+    fn tmp_dir_at(p: PathBuf) -> TestRoot {
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => panic!("stale test dir could not be removed: {}: {e}", p.display()),
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        TestRoot(p)
+    }
+
+    fn tmp_dir(tag: &str) -> TestRoot {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tmp_dir_at(
+            std::env::temp_dir().join(format!("fc-oci-layer-{}-{seq}-{tag}", std::process::id())),
+        )
+    }
+
+    /// OCI-7・REPAIR-12（#3298）: 残骸（`fifo` 試験が mkfifo する名前 `f` を含む）があっても
+    /// 空で作り直され、同名ファイルを排他作成でき、drop で消える。
+    #[test]
+    fn oci7_repair12_tmp_dir_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!("fc-oci-layer-residue-{}", std::process::id()));
+        std::fs::create_dir_all(p.join("sub").join("inner")).unwrap();
+        std::fs::write(p.join("f"), b"stale").unwrap();
+        let d = tmp_dir_at(p.clone());
+        assert_eq!(std::fs::read_dir(&p).unwrap().count(), 0);
+        std::fs::File::create_new(d.join("f")).unwrap();
+        drop(d);
+        assert!(!p.exists());
     }
 
     fn digest_of(data: &[u8]) -> Digest {

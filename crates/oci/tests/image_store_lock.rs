@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::ImageStore;
 
+#[path = "support/test_root.rs"]
+mod test_root;
+use test_root::{TestRoot, test_root, test_root_at};
+
 const CHILD_TEST: &str = "oci7_child_holds_lock";
 const ROOT_ENV: &str = "FC_OCI_STORE_TEST_ROOT";
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -38,16 +42,25 @@ fn oci7_child_holds_lock() {
 /// OCI-7: 別プロセスの排他区間中は待機（Timeout）となり、解放後に取得できる。
 #[test]
 fn oci7_lock_excludes_other_process() {
-    let root = std::env::temp_dir().join(format!("fc-oci-store-it-{}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("mkdir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
+    run_lock_excludes_other_process(test_root("fc-oci-store-it", "lock"));
+}
+
+/// OCI-7・REPAIR-12（#3298）: 前回の `ready` / `release` の残骸があっても、子の排他区間中は
+/// `Timeout` になる本来の流れが通る（残骸で `wait_for` が即通って親が先に lock しない）。
+#[test]
+fn oci7_repair12_lock_flow_passes_over_stale_ready_release() {
+    let p = std::env::temp_dir().join(format!("fc-oci-store-it-residue-{}", std::process::id()));
+    std::fs::create_dir_all(&p).expect("mkdir residue");
+    std::fs::write(p.join("ready"), b"").expect("stale ready");
+    std::fs::write(p.join("release"), b"").expect("stale release");
+    run_lock_excludes_other_process(test_root_at(p));
+}
+
+fn run_lock_excludes_other_process(root: TestRoot) {
+    assert!(!root.join("ready").exists() && !root.join("release").exists());
     let mut child = Command::new(std::env::current_exe().expect("exe"))
         .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
-        .env(ROOT_ENV, &root)
+        .env(ROOT_ENV, &*root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -79,5 +92,4 @@ fn oci7_lock_excludes_other_process() {
 
     let store = store.with_timeout(Duration::from_secs(5));
     store.lock().expect("acquire after child released");
-    let _ = std::fs::remove_dir_all(&root);
 }

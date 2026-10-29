@@ -12,6 +12,9 @@
 //! 模している。したがって計測値は SUP-3 の実機での合否判定ではない（実機実測は #490・#491〔TASK-160・人間担当〕）。
 //! root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため、試験は `linux` モジュールに置く。
 
+#[cfg(target_os = "linux")]
+#[path = "support/child_process.rs"]
+mod child_process;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -37,6 +40,7 @@ fn sup3_task159_3_restart_latency_is_linux_only() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::child_process::ChildProcess;
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -54,11 +58,11 @@ mod linux {
     }
 
     use std::num::NonZeroU32;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
+    use fandhe_container_core::oci_runtime::LaunchedProcess;
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, ContainerStatus, CreateStateRequest, ErrorCode, StateStore,
         SupervisionState, TraitError,
@@ -85,70 +89,6 @@ mod linux {
         TraitError::new(ErrorCode::Internal, msg)
     }
 
-    /// 実プロセス（`std::process::Child`）を [`LaunchedProcess`] として扱うテスト用アダプタ。`Drop` で kill + 回収する。
-    struct ChildProcess {
-        pid: NonZeroU32,
-        child: Mutex<Child>,
-    }
-
-    impl ChildProcess {
-        fn new(child: Child) -> Result<Self, TraitError> {
-            let pid = NonZeroU32::new(child.id()).ok_or_else(|| internal("zero child pid"))?;
-            Ok(Self {
-                pid,
-                child: Mutex::new(child),
-            })
-        }
-    }
-
-    impl LaunchedProcess for ChildProcess {
-        fn pid(&self) -> NonZeroU32 {
-            self.pid
-        }
-
-        fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
-            use std::os::unix::process::ExitStatusExt;
-            let end = Instant::now() + timeout;
-            loop {
-                {
-                    let mut c = self
-                        .child
-                        .lock()
-                        .map_err(|_| internal("child lock poisoned"))?;
-                    if let Some(st) = c.try_wait().map_err(|_| internal("try_wait failed"))? {
-                        return match (st.code(), st.signal()) {
-                            (Some(code), _) => Ok(Some(ProcessExit::Exited(code))),
-                            (None, Some(sig)) => Ok(Some(ProcessExit::Signaled(sig))),
-                            _ => Err(internal("unrecognized exit status")),
-                        };
-                    }
-                }
-                if Instant::now() >= end {
-                    return Ok(None);
-                }
-                std::thread::sleep(POLL);
-            }
-        }
-
-        fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-            if let Ok(mut c) = self.child.lock() {
-                let _ = c.kill();
-            }
-            match self.wait(timeout)? {
-                Some(_) => Ok(()),
-                None => Err(TraitError::new(ErrorCode::Timeout, "terminate timed out")),
-            }
-        }
-    }
-
-    impl Drop for ChildProcess {
-        fn drop(&mut self) {
-            if let Ok(c) = self.child.get_mut() {
-                crate::reap::reap_on_drop(c);
-            }
-        }
-    }
-
     /// 即座に終了コード 1 で終わるコンテナ役の子を起動する。
     fn spawn_failing_container() -> Result<ChildProcess, TraitError> {
         let exe = std::env::current_exe().map_err(|_| internal("current_exe failed"))?;
@@ -160,7 +100,7 @@ mod linux {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| internal("spawn failed"))?;
-        ChildProcess::new(child)
+        ChildProcess::new(child, POLL)
     }
 
     /// 本番 launcher の代役: 同じ子を再 spawn する。

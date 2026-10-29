@@ -23,7 +23,7 @@
 //! client が connect 直後に close した接続の peer UID 取得結果を JSON 行で出す（accept の結果・監査 reason と getpeereid の errno。UID は含まない）（#2252 P2-2。
 //! 結果の判断は人間担当の #2405）。手順は `AGENTS.md`「実機前提テスト」節。
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(not(unix))]

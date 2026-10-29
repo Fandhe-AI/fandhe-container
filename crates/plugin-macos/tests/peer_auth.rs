@@ -7,7 +7,7 @@
 //! 実行環境は unix のみ（非 unix では UDS 実体がないため中身は空でコンパイルされる）。
 #![cfg(unix)]
 
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 use std::io::Read;

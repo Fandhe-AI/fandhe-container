@@ -9,7 +9,7 @@ use fandhe_container_gpu::cdi_edits::aggregate_container_edits;
 use fandhe_container_gpu::cdi_spec::parse_cdi_spec;
 
 #[cfg(target_os = "linux")]
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 const NODE4: &str = include_str!("fixtures/poc14-node4.json");

@@ -84,7 +84,7 @@
 
 #[path = "support/exclusive_dir.rs"]
 mod exclusive_dir;
-#[path = "support/reap.rs"]
+#[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
 #[cfg(not(target_os = "linux"))]

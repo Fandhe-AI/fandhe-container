@@ -113,6 +113,8 @@
 //!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
 
 mod detach;
+// 実機の呼び出しは Linux 限定。他 OS では試験だけがコンパイルする。
+#[cfg(any(target_os = "linux", test))]
 pub(crate) mod member_after_reboot;
 pub(crate) mod member_detach;
 
@@ -263,6 +265,7 @@ pub(crate) trait DeleteOps {
     fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError>;
     /// ホストの再起動をまたぐ回収用に、マウントの無い空の pin ファイルと所有記録だけを消す。マウントが
     /// あれば umount せず `FailedPrecondition` で拒否する（`netns::unpin_stale_path_expecting`。#3412）。
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     fn unpin_stale_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError>;
     /// 接続時に記録した置き場 `dir` の直下に `endpoint` 名の pin が残っているか（`NotFound` だけが `Ok(false)`）。
     /// 置き場が記録と同じ実体と確認できなければ [`PinCheckError::Dir`]。何も変更しない。

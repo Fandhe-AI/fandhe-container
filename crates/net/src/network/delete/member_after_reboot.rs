@@ -22,9 +22,6 @@
 //!
 //! 全体で 1 つの期限を持つ（REPAIR-5。Linux 実装の `deadline`）。
 
-// 実機の呼び出しは Linux 限定。他 OS では試験だけが使う。
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
 use super::{
     DeleteOps, DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport, PinCheckError,
     fail, precondition,

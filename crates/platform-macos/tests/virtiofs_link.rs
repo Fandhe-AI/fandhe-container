@@ -21,7 +21,6 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::config::{
     ConsoleLogPath, DeviceConfigSpec, SerialConsoleSink, VmConfigSpec, build_vz_configuration,
@@ -34,16 +33,13 @@ use fandhe_container_platform_macos::guest_mount::{GuestMountPoint, GuestTestMod
 use fandhe_container_platform_macos::virtiofs::{
     ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
 };
-use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
 
 #[path = "support/common.rs"]
 mod common;
-use common::{Scratch, env_path, tail_lossy};
+use common::{Scratch, env_path};
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
-use harness::{
-    CONSOLE_LOG_SETTLE_TIMEOUT, log_truncated, resolve_probe_timeout, wait_console_log_settled,
-};
+use harness::{launch_until_done, resolve_probe_timeout};
 
 /// ホストが `rw/` で観察するエントリ名の最大件数（想定外のエントリの列挙上限）。
 const MAX_RW_ENTRIES: usize = 16;
@@ -254,50 +250,9 @@ fn boot_and_observe(tag: &str) -> (Fixture, LinkLog, String) {
     let spec = link_spec(&s, &fixture, &kernel, initrd.as_deref(), &cmdline);
     let log_path = s.dir.join("console.log");
     eprintln!("virtiofs_link: console log at {}", log_path.display());
-    let vm = match Vm::launch(&spec, OpTimeouts::default()) {
-        Ok(vm) => vm,
-        Err(e) => panic!("launch failed: code={} message={}", e.code(), e.message()),
-    };
-
-    let deadline = Instant::now() + timeout;
-    let mut last = Vec::new();
-    loop {
-        if let Ok(bytes) = std::fs::read(&log_path) {
-            last = bytes;
-        }
-        if parse_link_log(&last).done {
-            break;
-        }
-        if log_truncated(&last) {
-            let _ = vm.stop();
-            panic!(
-                "console log hit the size limit before the link done line; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        if Instant::now() >= deadline {
-            let _ = vm.stop();
-            panic!(
-                "link done line not observed within {timeout:?}; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // ゲストとの TOCTOU を避けるため、停止を確認してから共有の中身を観察する。
-    vm.stop().expect("stop");
-    assert_eq!(vm.state(), VmState::Stopped);
-    // VM を破棄して書き出しスレッドの終了を確認してから、確定したログで最終判定する。
-    drop(vm);
-    if let Err(e) = wait_console_log_settled(&log_path, CONSOLE_LOG_SETTLE_TIMEOUT) {
-        panic!("{e}; console tail:\n{}", tail_lossy(&last, 4096));
-    }
-    last = std::fs::read(&log_path).expect("read settled console log");
-    assert!(
-        !log_truncated(&last),
-        "console log hit the size limit after the link done line; later guest output was lost; console tail:\n{}",
-        tail_lossy(&last, 4096)
-    );
+    let last = launch_until_done(&spec, &log_path, "link", timeout, |b| {
+        parse_link_log(b).done
+    });
     (
         fixture,
         parse_link_log(&last),

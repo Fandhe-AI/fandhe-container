@@ -681,6 +681,8 @@ impl MemberIntent {
     }
 
     /// 置き場とその識別子がそろっているときだけ返す（pin の不存在判定の前提）。
+    // 呼び出し元の reconcile は Linux 限定。他 OS の非 test ビルドでは未使用。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn netns_dir_record(&self) -> Option<NetnsDirRecord> {
         Some(NetnsDirRecord::new(
             self.netns_dir.clone()?,

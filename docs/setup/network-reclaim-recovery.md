@@ -85,7 +85,7 @@ root を要する操作で、ホストの他の netns を巻き込まないよ�
 | create の途中で落ち、カーネルに何も無い | 意図記録を消す |
 | delete の途中で落ちた | 残った資源を巻き戻して `realized` と意図記録を消す（削除済みなら記録だけ消す） |
 | 確定記録（`members/<id>`）と同一の `members-intent` | 意図記録だけ消す |
-| 実体の無い `members-intent`（attach の請求書・host veth・pin が無く、DNAT が公開の記録で説明できる） | 消す（アドレスは次の操作で再び払い出せる） |
+| 実体の無い `members-intent`（attach の請求書・host veth・pin が無く、DNAT が公開の記録で説明でき、そのアドレス宛ての DNAT が残っていない） | 消す（アドレスは次の操作で再び払い出せる） |
 
 自動で処理されないもの（意図記録を残す。見分け方は `ReconcileReport` の `Unresolved` / `IntentKeep` と、上のエラー）:
 
@@ -96,15 +96,27 @@ root を要する操作で、ホストの他の netns を巻き込まないよ�
 | 旧形式（gateway の無い）の `realized.intent` | 復号が `DataLoss` で失敗する。下の手順で手動回収する |
 | attach の請求書（`pending-reclaim/attach/<endpoint>`）が残る `members-intent`（`AttachClaim`） | quarantine または取り残しの追跡中。先に請求書の回収（上の「attach の取り残し」）を行う |
 | host veth が残る（`VethPresent`）・判定不能（`VethUnproven`）、pin が残る（`PinPresent`）・判定不能（`PinUnknown`、置き場が与えられない場合を含む） | 実体が生きている可能性がある |
-| DNAT の受け口が公開の記録で説明できない（`DnatUnaccounted`） | 残った DNAT がそのアドレスへ転送し続けうるため、再割り当てしない |
+| DNAT の受け口が公開の記録で説明できない、または候補のアドレス宛ての DNAT が残っている・転送先を読めない（`DnatUnaccounted`） | 残った DNAT がそのアドレスへ転送し続けうるため、再割り当てしない |
 
-手動回収の手順:
+手動回収の手順は、壊れているものによって 2 つに分ける。他の確定メンバーが稼働中のネットワークでは、ネットワーク全体の手順を使わない（テーブルと bridge の削除で、他メンバーの DNAT・masquerade・接続も失われる）。
 
-1. 記録を読む: `<状態ルート>/@networks/<名前>/realized.intent` の `op`（create / delete）と `token`、`members-intent/<id>` の `address`・`token` を確認する
-2. カーネルの状態を確認する: `ip -o link show` で bridge（`fcbr` + 11 桁の 16 進）の `alias` が記録の `token` と一致するか、`nft list table ip fandhe_net_<名前>` でテーブルが自分のものか、`ip -o link show master <bridge名>` で接続中の veth があるかを見る
-3. 別名がトークンと一致する資源だけを消す: DNAT ルールがあれば `nft delete table ip fandhe_net_<名前>` でテーブルごと、bridge は `ip link delete <bridge名>`。別名が空・他のトークンの link は触らない
-4. `members-intent/<id>` を消すのは、その endpoint の host veth と pin（`<netns置き場>/<endpoint>`）が無く、`nft list table ip fandhe_net_<名前>` に記録されていない DNAT（`dnat to <アドレス>` が意図記録のアドレスを指すもの）が残っていないことを確かめた後だけ。`pending-reclaim/attach/<endpoint>` が残る間は消さない
-5. 資源を片付けたら、`realized.intent`（delete の途中なら `realized` も）と該当の `members-intent/<id>` を手で消し、plugin を再起動してメモリ上の登録を捨てる
+### A. ネットワークの作成・削除の途中で落ちた場合（`realized.intent`）
+
+ネットワーク自体の回復で、メンバーが 1 つも稼働していないことを確かめてから行う（`ip -o link show master <bridge名>` が空、`members/` が空）。
+
+1. 記録を読む: `<状態ルート>/@networks/<名前>/realized.intent` の `op`（create / delete）と `token` を確認する
+2. カーネルの状態を確認する: `ip -o link show` で bridge（`fcbr` + 11 桁の 16 進）の `alias` が記録の `token` と一致するか、`nft list table ip fandhe_net_<名前>` でテーブルが自分のものか
+3. 別名がトークンと一致する資源だけを消す: `nft delete table ip fandhe_net_<名前>`、bridge は `ip link delete <bridge名>`。別名が空・他のトークンの link は触らない
+4. 資源を片付けたら、`realized.intent`（delete の途中なら `realized` も）を手で消し、plugin を再起動してメモリ上の登録を捨てる
+
+### B. メンバー単体の回復（`members-intent/<id>` だけが残った場合）
+
+ネットワーク（bridge・テーブル・他のメンバー）は削除しない。対象 endpoint の資源だけを回収する。
+
+1. `members-intent/<id>` の `endpoint`・`address`・`token` を読む
+2. 対象 endpoint の host 側 veth（`ip -o link show master <bridge名>` で別名が `/ep/<endpoint>/g/` を含むもの）と netns の pin（`<netns置き場>/<endpoint>`）だけを確認し、あれば消す。別名が一致しない veth・他の endpoint の資源は触らない
+3. `nft list table ip fandhe_net_<名前>` で `dnat to <意図記録のアドレス>` のルールが残っていないことを確かめる。残っていれば、そのルールだけを `nft -a` で出るハンドルを指定して `nft delete rule ip fandhe_net_<名前> <chain> handle <N>` で消す（確定メンバーの DNAT・masquerade・テーブルは消さない。宛先が意図記録のアドレスのものに限る）。判別できなければ消さず、意図記録も残す
+4. 上の確認がすべて済み、`pending-reclaim/attach/<endpoint>` が無いときだけ `members-intent/<id>` を手で消し、plugin を再起動してメモリ上の登録を捨てる
 
 root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・veth・テーブルを巻き込まないよう、名前・別名・ifindex を確認してから実行する。
 

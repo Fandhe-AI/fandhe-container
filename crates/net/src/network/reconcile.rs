@@ -34,7 +34,8 @@
 //! 3. host 側 veth が不在と確かめられる（生きた veth・照会の失敗は残す）
 //! 4. netns の pin が不在と確かめられる（置き場は意図記録に記録した接続時のもの。無い旧形式は掃除しない）
 //! 5. DNAT の帳尻が合う: 専用テーブルの DNAT の受け口が、全メンバー記録の確定した公開（墓標・解除中は含めない。1 件 2 ルール）で
-//!    説明できる。説明できない DNAT が残っていれば、`ReclaimUnsaved` の quarantine のようにそのアドレスへ
+//!    説明できる。加えて、どの DNAT も候補のアドレスへ転送していない（転送先を直接確かめる。受け口と本数だけでは
+//!    別メンバーの DNAT と区別できないため）。説明できない DNAT が残っていれば、`ReclaimUnsaved` の quarantine のようにそのアドレスへ
 //!    転送しうるため、候補をすべて残す
 //!
 //! # 残余（REPAIR-3）
@@ -55,7 +56,9 @@ use super::{
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
 use crate::netlink_route::{IfIndex, IfName, NetlinkRouteSocket};
-use crate::network::listener_dump::{MAX_DUMP_RULES, recognize_dnat_listener};
+use crate::network::listener_dump::{
+    MAX_DUMP_RULES, recognize_dnat_listener, recognize_dnat_target,
+};
 use crate::network_store::{
     HostGeneration, InstallMode, MemberId, NetworkLockGuard, RealizedIntent, RealizedOp,
     RealizedRecord,
@@ -84,6 +87,9 @@ pub(crate) trait ReconcileOps {
     fn pin_absent(&self, dir: &NetnsDirRecord, endpoint: &EndpointId) -> Result<bool, NetError>;
     /// 専用テーブルの DNAT ルールが示す受け口（重複を含む。1 公開 2 ルール）。
     fn dnat_listeners(&self, table: &NftName) -> Result<Vec<PublishedListener>, NetError>;
+    /// 専用テーブルの DNAT ルールの転送先アドレス（重複を含む）。受け口と本数だけでは別メンバーの DNAT と
+    /// 区別できないため、掃除は候補のアドレス宛ての DNAT が無いことをここで直接確かめる（NET-3・SEC-1）。
+    fn dnat_targets(&self, table: &NftName) -> Result<Vec<Ipv4Addr>, NetError>;
 }
 
 /// `realized.intent` の照合の結果。
@@ -452,9 +458,13 @@ fn sweep_member_intents<O: ReconcileOps>(
     if candidates.is_empty() {
         return Ok(());
     }
-    // 5. DNAT の帳尻（候補があるときだけ 1 回照会する）。
+    // 5. DNAT の帳尻（候補があるときだけ照会する）。受け口の説明に加え、候補のアドレス宛ての DNAT が
+    //    残っていないことを転送先から直接確かめる（受け口と本数だけでは、再起動後に別メンバーが同じ受け口を
+    //    公開して残した未確定の DNAT を説明済みと誤認し、残った DNAT の転送先アドレスを再割り当てしてしまう。
+    //    NET-3・SEC-1）。転送先を読めない場合も据え置く。
     let names = NetworkResourceNames::derive(realized.name())?;
-    if !dnat_accounted(guard, ops, names.table()) {
+    let targets = ops.dnat_targets(names.table());
+    if !dnat_accounted(guard, ops, names.table()) || targets.is_err() {
         for it in candidates {
             report
                 .kept_intents
@@ -462,8 +472,23 @@ fn sweep_member_intents<O: ReconcileOps>(
         }
         return Ok(());
     }
-    // 6. 消す。
+    let targets = targets.unwrap_or_default();
+    let mut clear = Vec::new();
     for it in candidates {
+        let targeted = match it.address().addr() {
+            std::net::IpAddr::V4(a) => targets.contains(&a),
+            std::net::IpAddr::V6(_) => true,
+        };
+        if targeted {
+            report
+                .kept_intents
+                .push((it.id().clone(), IntentKeep::DnatUnaccounted));
+        } else {
+            clear.push(it);
+        }
+    }
+    // 6. 消す。
+    for it in clear {
         if guard.remove_member_intent(it.id())? {
             report.removed_intents.push(it.id().clone());
         }
@@ -564,6 +589,26 @@ impl ReconcileOps for LinuxReconcileOps<'_> {
         for rule in &rules {
             if let Some(l) = recognize_dnat_listener(rule.exprs())? {
                 out.push(l);
+            }
+        }
+        Ok(out)
+    }
+
+    fn dnat_targets(&self, table: &NftName) -> Result<Vec<Ipv4Addr>, NetError> {
+        let rules = self.inner.nft.dump_rules(
+            &RuleDump::new(NftFamily::Ipv4, table.clone()),
+            self.inner.timeout,
+        )?;
+        if rules.len() > MAX_DUMP_RULES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many rules in the network table",
+            ));
+        }
+        let mut out = Vec::new();
+        for rule in &rules {
+            if let Some(a) = recognize_dnat_target(rule.exprs())? {
+                out.push(a);
             }
         }
         Ok(out)

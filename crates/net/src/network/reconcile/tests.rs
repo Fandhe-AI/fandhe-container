@@ -171,6 +171,8 @@ struct Fake {
     veth_fails: Cell<bool>,
     pin: RefCell<Result<bool, NetErrorCode>>,
     dnat: RefCell<Result<Vec<PublishedListener>, NetErrorCode>>,
+    /// DNAT ルールの転送先アドレス。
+    dnat_targets: RefCell<Result<Vec<Ipv4Addr>, NetErrorCode>>,
     rollback_ok: Cell<bool>,
     /// 巻き戻しの請求書の (bridge, table) の組。
     rollbacks: RefCell<Vec<(bool, bool)>>,
@@ -192,6 +194,7 @@ impl Fake {
             veth_fails: Cell::new(false),
             pin: RefCell::new(Ok(true)),
             dnat: RefCell::new(Ok(Vec::new())),
+            dnat_targets: RefCell::new(Ok(Vec::new())),
             rollback_ok: Cell::new(true),
             rollbacks: RefCell::new(Vec::new()),
             dnat_calls: Cell::new(0),
@@ -280,6 +283,9 @@ impl ReconcileOps for Fake {
     fn dnat_listeners(&self, _table: &NftName) -> Result<Vec<PublishedListener>, NetError> {
         self.dnat_calls.set(self.dnat_calls.get() + 1);
         self.dnat.borrow().clone().map_err(err)
+    }
+    fn dnat_targets(&self, _table: &NftName) -> Result<Vec<Ipv4Addr>, NetError> {
+        self.dnat_targets.borrow().clone().map_err(err)
     }
 }
 
@@ -613,6 +619,20 @@ fn net7_3346_sweep_keeps_intents_with_substance() {
         (
             "dnat-dump-fails",
             Box::new(|f: &Fake| *f.dnat.borrow_mut() = Err(NetErrorCode::Timeout)),
+            true,
+            IntentKeep::DnatUnaccounted,
+        ),
+        (
+            "dnat-targets-candidate-address",
+            Box::new(|f: &Fake| {
+                *f.dnat_targets.borrow_mut() = Ok(vec![Ipv4Addr::new(10, 0, 0, 2)]);
+            }),
+            true,
+            IntentKeep::DnatUnaccounted,
+        ),
+        (
+            "dnat-targets-dump-fails",
+            Box::new(|f: &Fake| *f.dnat_targets.borrow_mut() = Err(NetErrorCode::Timeout)),
             true,
             IntentKeep::DnatUnaccounted,
         ),

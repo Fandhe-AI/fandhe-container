@@ -64,8 +64,8 @@ use super::publish::{PortProtocol, PortPublish};
 use crate::error::{NetError, NetErrorCode};
 use crate::nftables_batch::NftName;
 use crate::nftables_rules::{
-    DumpedRule, NFT_NAT_DNAT, NFT_NAT_SNAT, NFTA_NAT_TYPE, NftCmp, NftCmpOp, NftExpr, NftPayload,
-    NftRuleExprs, PayloadBase,
+    DumpedRule, NFT_NAT_DNAT, NFT_NAT_SNAT, NFTA_NAT_TYPE, NftCmp, NftCmpOp, NftExpr, NftImmediate,
+    NftPayload, NftRuleExprs, PayloadBase,
 };
 
 /// GETTABLE dump で受け取る ipv4 テーブルの総数の上限。
@@ -276,6 +276,36 @@ pub(crate) fn recognize_dnat_listener(
         host_addr,
         host_port,
     }))
+}
+
+/// DNAT ルールの転送先アドレス（`immediate` の 4 バイト値）を返す。DNAT でないルールは `None`。
+///
+/// 転送先を読めない DNAT（4 バイトの immediate が無い・複数ある）は `FailedPrecondition` で fail-closed にする。
+/// 掃除（アドレスの解放）が「そのアドレス宛ての DNAT が残っていない」ことを直接確かめるために使う
+/// （受け口と本数だけでは別メンバーの DNAT と区別できない。NET-3・SEC-1・#3346）。
+// reconcile（Linux 限定）のみが使う。他 OS の非 test ビルドでは未使用。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn recognize_dnat_target(exprs: &NftRuleExprs) -> Result<Option<Ipv4Addr>, NetError> {
+    let mut has_dnat = false;
+    for e in exprs.exprs() {
+        if e.name().as_str() == NAT_EXPR && is_dnat(e)? {
+            has_dnat = true;
+        }
+    }
+    if !has_dnat {
+        return Ok(None);
+    }
+    let mut target: Option<Ipv4Addr> = None;
+    for e in exprs.exprs() {
+        if e.name().as_str() != "immediate" {
+            continue;
+        }
+        let imm = NftImmediate::from_expr(e).map_err(|_| unrecognized())?;
+        if let Ok(o) = <[u8; 4]>::try_from(imm.data().as_bytes()) {
+            set_once(&mut target, Ipv4Addr::from(o))?;
+        }
+    }
+    target.map(Some).ok_or_else(unrecognized)
 }
 
 fn exhausted(msg: &'static str) -> NetError {

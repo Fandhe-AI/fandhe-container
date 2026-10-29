@@ -6,6 +6,8 @@
 //! ここでは既存のパスを**消さず**、排他作成（0700）がぶつかったら連番を進める。
 //! 後始末は呼び出し側の `remove_dir`（またはガード）が行う。
 
+#![cfg(unix)]
+
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};

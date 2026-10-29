@@ -121,8 +121,12 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
     }
 }
 
-/// `output_within` が各出力ファイルから取り込む最大バイト数（上限を超えた分は読み捨てる）。
+/// `output_within` が各出力ファイルに許す最大バイト数。超えたら「出力が完全でない」として `Err` にする
+/// （先頭だけ返して後続の存在を隠さない。禁止文字列の不在を検証する試験が上限後の漏れを見逃すため。REPAIR-12）。
 const OUTPUT_CAP: u64 = 1 << 20;
+
+/// 出力ファイルの大きさを待ちループの中で監視する間隔。
+const OUTPUT_POLL: Duration = Duration::from_millis(5);
 
 /// 一時ファイルの連番（同一プロセス内の `output_within` の呼び出し間で名前が衝突しないようにする）。
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -146,46 +150,94 @@ fn create_output_file(tag: &str) -> Result<(File, std::path::PathBuf), String> {
     Err("create output file: too many name collisions".to_string())
 }
 
-/// 一時ファイルを `OUTPUT_CAP` まで読んで消す。
-fn drain_output_file(path: &std::path::Path) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Ok(f) = File::open(path) {
-        let _ = f.take(OUTPUT_CAP).read_to_end(&mut buf);
-    }
+/// 一時ファイルを読んで消す。`cap` バイトを超える出力・開く / 読むときの失敗は、空や途中までの出力を正常値
+/// として返さず `Err`（ファイルは常に消す）。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn drain_output_file(path: &std::path::Path, cap: u64) -> Result<Vec<u8>, String> {
+    let result = (|| {
+        let f =
+            File::open(path).map_err(|e| format!("open output file {}: {e}", path.display()))?;
+        let mut buf = Vec::new();
+        // cap + 1 まで読み、超過を検出する（確認から読みまでの間に伸びた分も拾う）。
+        f.take(cap.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("read output file {}: {e}", path.display()))?;
+        if buf.len() as u64 > cap {
+            return Err(format!("output exceeded the {cap} byte capture cap"));
+        }
+        Ok(buf)
+    })();
     let _ = std::fs::remove_file(path);
-    buf
+    result
+}
+
+/// 出力ファイルが `cap` バイトを超えて大きいか。メタデータが読めないときは `Err`。
+fn exceeds_cap(path: &std::path::Path, cap: u64) -> Result<bool, String> {
+    std::fs::metadata(path)
+        .map(|m| m.len() > cap)
+        .map_err(|e| format!("stat output file {}: {e}", path.display()))
 }
 
 /// `spawn_captured` が作った出力の受け皿（一時ファイルの組）。`finish` で読んで消すか、`discard` で消す。
 pub struct Captured {
-    out_path: std::path::PathBuf,
+    pub(crate) out_path: std::path::PathBuf,
     err_path: std::path::PathBuf,
+    cap: u64,
 }
 
 impl Captured {
-    /// 終了した子の出力を読み（各 `OUTPUT_CAP` まで）、一時ファイルを消して `Output` にする。
+    /// 終了した子の出力を読み、一時ファイルを消して `Output` にする。各出力が上限（`OUTPUT_CAP`）を超えた・
+    /// 読み取りに失敗した場合は `Err`（途中までの出力は返さない）。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-    pub fn finish(self, status: ExitStatus) -> Output {
-        Output {
+    pub fn finish(self, status: ExitStatus) -> Result<Output, String> {
+        let stdout = drain_output_file(&self.out_path, self.cap);
+        let stderr = drain_output_file(&self.err_path, self.cap);
+        Ok(Output {
             status,
-            stdout: drain_output_file(&self.out_path),
-            stderr: drain_output_file(&self.err_path),
-        }
+            stdout: stdout.map_err(|e| format!("stdout: {e}"))?,
+            stderr: stderr.map_err(|e| format!("stderr: {e}"))?,
+        })
     }
 
-    /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。
+    /// いずれかの出力が上限を超えて書き込まれていれば `Err`（子の実行中に呼べる）。
+    fn check_cap(&self) -> Result<(), String> {
+        if exceeds_cap(&self.out_path, self.cap)? {
+            return Err(format!("stdout exceeded the {} byte capture cap", self.cap));
+        }
+        if exceeds_cap(&self.err_path, self.cap)? {
+            return Err(format!("stderr exceeded the {} byte capture cap", self.cap));
+        }
+        Ok(())
+    }
+
+    /// 出力を読まずに一時ファイルを消す（期限切れ・失敗の経路）。消す前に 0 へ切り詰めて、出力先を持ち続ける
+    /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn discard(self) {
-        let _ = std::fs::remove_file(&self.out_path);
-        let _ = std::fs::remove_file(&self.err_path);
+        for p in [&self.out_path, &self.err_path] {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(p);
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
 /// `cmd` の stdin を null、stdout・stderr を一時ファイルへ向けて spawn する。子の終了待ちは呼び出し側が
 /// `wait_within` 等で行い、終了後に `Captured::finish` で出力を取り出す（子の実行中に診断を採りたい試験向け。
 /// 単純な場合は `output_within`）。spawn の失敗は `spawn <program> failed: <io error>`。
+/// この経路は待ちの最中に保存量を監視しない（上限超過は `finish` が `Err` にする）。監視つきは `output_within`。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn spawn_captured(cmd: &mut Command) -> Result<(Child, Captured), String> {
+    spawn_captured_capped(cmd, OUTPUT_CAP)
+}
+
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn spawn_captured_capped(
+    cmd: &mut Command,
+    cap: u64,
+) -> Result<(Child, Captured), String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let (out_file, out_path) = create_output_file("out")?;
     let (err_file, err_path) = match create_output_file("err") {
@@ -195,7 +247,11 @@ pub fn spawn_captured(cmd: &mut Command) -> Result<(Child, Captured), String> {
             return Err(e);
         }
     };
-    let captured = Captured { out_path, err_path };
+    let captured = Captured {
+        out_path,
+        err_path,
+        cap,
+    };
     match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -215,22 +271,60 @@ pub fn spawn_captured(cmd: &mut Command) -> Result<(Child, Captured), String> {
 /// stdout・stderr は pipe ではなく一時ファイルへ向けて、終了後にファイルから読む。pipe の EOF を待たないため、
 /// 子の終了後に孫が出力先を持ち続けても戻る（その孫が後で書いた分は取り込まない）。読み手スレッドも立てない
 /// ので、fork・`unshare`・`setns` を後に控えた単一スレッド前提の段でも使える。
-/// 期限切れは `<program> did not finish within <within>` で、子を kill して回収してから返す。取り込みは各
-/// `OUTPUT_CAP`（1 MiB）まで。
+/// 期限切れは `<program> did not finish within <within>` で、子を kill して回収してから返す。
+///
+/// 保存量の上限（各 `OUTPUT_CAP` = 1 MiB。REPAIR-5・REPAIR-12）: 待ちループ（5 ms 間隔）で出力ファイルの
+/// 大きさを監視し、超えたら子を kill・回収してファイルを切り詰めて消し、`<program> output exceeded ...` の
+/// `Err` を返す。終了後に上限を超えていた場合や読み取りの失敗も `Err`（先頭だけを正常値として返さない）。
+/// 残る限界: 監視は間隔ごとのため間隔内に書かれた分だけ上限を超えて溜まりうる。kill するのは起動した子だけで、
+/// 出力先を継承した孫はプロセスグループごとには止めない（std だけでは安全に実現できないため）。ただし
+/// 切り詰めてから unlink するので、孫が居残っても領域は解放され、孫の後続の書き込みは取り込まれない。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, String> {
+    output_within_capped(cmd, within, OUTPUT_CAP)
+}
+
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn output_within_capped(
+    cmd: &mut Command,
+    within: Duration,
+    cap: u64,
+) -> Result<Output, String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let (mut child, captured) = spawn_captured(cmd)?;
-    match wait_within(&mut child, within) {
-        Ok(status) => Ok(captured.finish(status)),
-        Err(e) => {
-            reap_or_report(&mut child, REAP_WITHIN);
-            captured.discard();
-            Err(if e.contains("did not exit within") {
-                format!("{program} did not finish within {within:?}")
-            } else {
-                format!("{program}: {e}")
-            })
+    let (mut child, captured) = spawn_captured_capped(cmd, cap)?;
+    let pid = child.id();
+    let until = Instant::now() + within;
+    let fail = |child: &mut Child, captured: Captured, msg: String| {
+        reap_or_report(child, REAP_WITHIN);
+        captured.discard();
+        Err(msg)
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return captured
+                    .finish(status)
+                    .map_err(|e| format!("{program}: {e}"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return fail(
+                    &mut child,
+                    captured,
+                    format!("{program}: try_wait on child {pid} failed: {e}"),
+                );
+            }
         }
+        if let Err(e) = captured.check_cap() {
+            return fail(&mut child, captured, format!("{program} {e}"));
+        }
+        if Instant::now() >= until {
+            return fail(
+                &mut child,
+                captured,
+                format!("{program} did not finish within {within:?}"),
+            );
+        }
+        std::thread::sleep(OUTPUT_POLL);
     }
 }

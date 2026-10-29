@@ -236,7 +236,7 @@ fn main() {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let out = captured.finish(status);
+        let out = captured.finish(status).expect("collect child output");
         (status, out)
     };
 

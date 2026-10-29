@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 後始末つきの一時ディレクトリ（unix では 0700 にして check_dir を通す）。
-struct TmpDir(PathBuf);
+/// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+struct TmpDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
@@ -15,20 +16,44 @@ impl TmpDir {
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
-        fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        Self(p)
+        Self::at(p)
+    }
+
+    /// 指定パスの残骸を消して作る（残骸の回帰試験が専用のパスで呼ぶ。unix では 0700）。
+    fn at(p: PathBuf) -> Self {
+        // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+        let root = crate::test_root::test_root_at(p.clone());
+        Self(p, root)
     }
 }
 
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+/// SUP-7・REPAIR-12・#3435: 前回の異常終了などで同名の残骸があっても、空の 0700 で作り直され、
+/// drop 後にパスが残らない。
+#[test]
+fn sup7_repair12_tmp_dir_clears_stale_residue() {
+    let p = std::env::temp_dir().join(format!(
+        "fc-sup7-residue-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(p.join("sub")).unwrap();
+    fs::write(p.join("c1.log"), b"stale").unwrap();
+    {
+        let t = TmpDir::at(p.clone());
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&t.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
+    assert!(!p.exists());
 }
 
 fn id() -> ContainerId {

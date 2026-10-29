@@ -6896,7 +6896,10 @@ mod tests {
 
     /// 実際の `last_error()` は対応 arch で直前の errno を `Os` として返す（#3313・MVM-4・REPAIR-12）。
     #[test]
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
     fn last_error_reads_errno_on_supported_arch() {
         // SAFETY 不要: std 経由で errno を設定する。
         let _ = std::fs::File::open("/nonexistent/fandhe-3313");

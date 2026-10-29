@@ -4,6 +4,9 @@
 //! 異常終了役の子プロセスはテストバイナリ自身を `--exact unix::sweep_child_entry` で再実行して
 //! 用意し、親が SIGKILL（`Child::kill`）で止めて残骸を作る。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(unix))]
 #[test]
 fn plug7_sweep_requires_unix_transport() {
@@ -98,14 +101,39 @@ mod unix {
         while !base.0.join(READY).exists() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("child did not become ready within {READY_WAIT:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         // unix の `kill` は SIGKILL。listener の後始末（drop）は走らない。
         child.kill().unwrap();
-        child.wait().unwrap();
+        crate::reap::reap(&mut child, crate::reap::REAP_WITHIN).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// 期限つきの待ちの期限切れが、具体的なメッセージの `Err` として表に出ること、続く `reap` で
+    /// 子を回収できる（ゾンビを残さない）ことの照合（REPAIR-5・REPAIR-12・#3304）。待機中の子は
+    /// 60 秒眠るため、200ms の期限では必ず切れる。
+    #[test]
+    fn repair5_wait_within_reports_expiry_and_reap_recovers() {
+        let base = Base::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix::sweep_child_entry", "--test-threads=1"])
+            .env(BASE_ENV, &base.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(
+            crate::reap::wait_within(&mut child, Duration::from_millis(200)),
+            Err(format!("child {pid} did not exit within 200ms"))
+        );
+        assert_eq!(
+            crate::reap::reap(&mut child, Duration::from_secs(10)),
+            Ok(())
+        );
     }
 
     /// 記録つきロックファイルを手で作る（実在しない同一性。socket とは一致しない）。

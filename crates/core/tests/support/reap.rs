@@ -125,11 +125,19 @@ pub fn run_within(cmd: &mut Command, within: Duration) -> Result<ExitStatus, Str
 /// 呼び出しの代わりに OS 同梱の `kill` を環境空・絶対パス・期限つき（10 秒）で起動する。引数形式は GNU
 /// （Linux）の `-s KILL -- -<pgid>` を先に、BSD（macOS）の kill が `--` を pid として拒否するため
 /// `-s KILL -<pgid>` を次に試す（`crates/plugin/tests/rss_comparison.rs` の `kill_process_group` と同じ）。
-/// どれかが成功すれば `Ok`。全部失敗しても、いずれかの stderr が `No such process`（ESRCH。グループがすでに
-/// 空）なら `Ok`。それ以外（起動失敗・期限切れ・権限不足等）は具体的な `Err`。`pgid` が 0 や 1 のときは
+/// 存在しない実行ファイル（NotFound）は試行から外す。どれかが成功すれば `Ok`。
+/// 全部失敗した場合の成功扱いは次の 2 つだけ:
+/// - いずれかの stderr が `No such process`（ESRCH。グループがすでに空）。
+/// - `child_reaped`（直接の子を回収済み）で、いずれかの stderr が `Operation not permitted`（EPERM）。
+///   macOS の `kill(2)` は、終了済みで未回収のプロセス（ゾンビ）だけが残るグループへの送信が EPERM になる
+///   とみられる（CI の macOS ログで、子が終了した直後の空に近いグループへの送信が失敗した事象からの推定で、
+///   Apple の man・XNU の一次情報では未確認）。直接の子が回収済みなら、残りうるのは孫のゾンビだけで
+///   止める対象が無いため成功扱いにする。子が未回収のときの EPERM は本物の権限不足かもしれないので `Err`。
+///
+/// それ以外は、全試行の実行ファイル・引数・終了ステータス・stderr を連ねた `Err`。`pgid` が 0 や 1 のときは
 /// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない。
 #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
-fn kill_group(pgid: u32) -> Result<(), String> {
+fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         if pgid <= 1 {
@@ -137,8 +145,8 @@ fn kill_group(pgid: u32) -> Result<(), String> {
         }
         let target = format!("-{pgid}");
         let forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
-        let mut last = String::from("no kill binary found");
-        let mut gone = false;
+        let mut attempts: Vec<String> = Vec::new();
+        let (mut gone, mut eperm) = (false, false);
         for bin in ["/bin/kill", "/usr/bin/kill"] {
             for args in forms {
                 let mut cmd = Command::new(bin);
@@ -149,8 +157,10 @@ fn kill_group(pgid: u32) -> Result<(), String> {
                     .stderr(Stdio::piped());
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
+                    // 存在しない実行ファイルは試行に数えない（エラーの根拠にしない）。
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
-                        last = format!("spawn {bin} failed: {e}");
+                        attempts.push(format!("spawn {bin} failed: {e}"));
                         continue;
                     }
                 };
@@ -162,26 +172,31 @@ fn kill_group(pgid: u32) -> Result<(), String> {
                         if let Some(mut e) = child.stderr.take() {
                             let _ = e.by_ref().take(4096).read_to_string(&mut msg);
                         }
-                        if msg.contains("No such process") {
-                            gone = true;
-                        }
-                        last = format!("{bin} {args:?} exited with {st}: {}", msg.trim());
+                        gone |= msg.contains("No such process");
+                        eperm |= msg.contains("Operation not permitted");
+                        attempts.push(format!("{bin} {args:?} exited with {st}: {}", msg.trim()));
                     }
                     Err(e) => {
                         reap_or_report(&mut child, REAP_WITHIN);
-                        last = format!("{bin}: {e}");
+                        attempts.push(format!("{bin} {args:?}: {e}"));
                     }
                 }
             }
         }
-        if gone {
+        if gone || (child_reaped && eperm) {
             return Ok(());
         }
-        Err(format!("kill process group {pgid} failed: {last}"))
+        if attempts.is_empty() {
+            attempts.push("no kill binary found".to_string());
+        }
+        Err(format!(
+            "kill process group {pgid} failed: {}",
+            attempts.join(" | ")
+        ))
     }
     #[cfg(not(unix))]
     {
-        let _ = pgid;
+        let _ = (pgid, child_reaped);
         Ok(())
     }
 }
@@ -403,6 +418,8 @@ pub struct Captured {
     pgid: u32,
     /// pipe 方式のときの読み手（このとき上の 2 つのパスは空で使わない）。
     pub(crate) pipes: Option<Pipes>,
+    /// 直接の子を回収済み（`finish` に渡された status か `wait_within` が回収した）。`kill_group` の EPERM 判断に使う。
+    reaped: std::sync::atomic::AtomicBool,
 }
 
 impl Captured {
@@ -412,7 +429,8 @@ impl Captured {
     pub fn finish(self, status: ExitStatus) -> Result<Output, String> {
         // 出力先を継承した子孫が居残って書き続けないよう、読む前にグループの残りを止める。
         // 失敗しても一時ファイルの回収は進め、止められなかったことを `Err` で表に出す。
-        let killed = kill_group(self.pgid);
+        // status を受け取っているので直接の子は回収済み。
+        let killed = kill_group(self.pgid, true);
         if let Some(p) = &self.pipes {
             let got = p.take(self.cap);
             killed?;
@@ -458,8 +476,11 @@ impl Captured {
         let pid = child.id();
         let until = Instant::now() + within;
         let stop = |child: &mut Child, msg: String| {
-            let killed = kill_group(self.pgid);
+            // 先に子を回収してからグループを撃つ（終了済みで未回収の子だけのグループへの送信が macOS で
+            // EPERM になりうるため。回収後は残りが孫だけで、`kill_group` が空 / ゾンビのみを成功扱いにできる）。
             reap_or_report(child, REAP_WITHIN);
+            self.reaped.store(true, Ordering::Relaxed);
+            let killed = kill_group(self.pgid, true);
             self.truncate();
             match killed {
                 Ok(()) => Err(msg),
@@ -469,6 +490,7 @@ impl Captured {
         loop {
             match child.try_wait() {
                 Ok(Some(st)) => {
+                    self.reaped.store(true, Ordering::Relaxed);
                     // 終了を検出したときも上限超過を確かめ、検出経路によらず同じ `Err` にする。
                     if let Some(p) = &self.pipes {
                         p.wait_finished();
@@ -508,7 +530,7 @@ impl Captured {
     /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn discard(self) -> Result<(), String> {
-        let killed = kill_group(self.pgid);
+        let killed = kill_group(self.pgid, self.reaped.load(Ordering::Relaxed));
         self.truncate();
         if self.pipes.is_none() {
             for p in [&self.out_path, &self.err_path] {
@@ -550,6 +572,7 @@ pub(crate) fn spawn_captured_mode(
         cap,
         pgid: 0,
         pipes: None,
+        reaped: std::sync::atomic::AtomicBool::new(false),
     };
     cmd.stdin(Stdio::null());
     match mode {
@@ -602,8 +625,8 @@ pub(crate) fn spawn_captured_mode(
                 })
             }
             Err(e) => {
-                kill_group_or_report(captured.pgid);
                 reap_or_report(&mut child, REAP_WITHIN);
+                kill_group_or_report(captured.pgid);
                 return Err(format!("{program}: {e}"));
             }
         }
@@ -613,7 +636,7 @@ pub(crate) fn spawn_captured_mode(
 
 /// `kill_group` の失敗を stderr に出す（後始末の経路用）。
 fn kill_group_or_report(pgid: u32) {
-    if let Err(e) = kill_group(pgid) {
+    if let Err(e) = kill_group(pgid, true) {
         eprintln!("{e}");
     }
 }

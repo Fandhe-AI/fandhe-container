@@ -504,3 +504,22 @@ fn repair5_repair12_pipe_grace_is_shared_across_waits() {
     );
     captured.discard().expect("discard");
 }
+
+/// 直接の子が終了して回収された後（グループは空か孫のゾンビのみ）の後始末が、どの OS でも `Ok` になる。
+/// macOS の CI で、子が終了した直後のグループへの送信が失敗した事象の再現（子の終了を待ってから回収し、
+/// その後に `discard` する）。回収の順序（回収後に kill）を固定するため、終了済みで未回収の間は触らない。
+#[cfg(unix)]
+#[test]
+fn repair5_repair12_group_kill_after_child_reaped_is_ok() {
+    for mode in [reap::CaptureMode::Files, reap::CaptureMode::Pipes] {
+        let mut cmd = self_cmd("reap_support_child_blocks", "");
+        let (mut child, captured) =
+            reap::spawn_captured_mode(&mut cmd, 1 << 20, mode).expect("spawn");
+        // 終了済みだが未回収（ゾンビ）の時間を作ってから、wait_within（try_wait）で回収させる。
+        std::thread::sleep(Duration::from_millis(300));
+        captured
+            .wait_within(&mut child, Duration::from_secs(30))
+            .expect("exit");
+        captured.discard().expect("discard after reaped child");
+    }
+}

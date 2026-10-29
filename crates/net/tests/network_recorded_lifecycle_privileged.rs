@@ -32,6 +32,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--child") {
         linux::child();
+    } else if args.iter().any(|a| a == "--selftest-guard") {
+        linux::selftest_guard();
     } else if args.iter().any(|a| a == "--ignored") {
         linux::launcher();
     } else {
@@ -104,6 +106,8 @@ mod linux {
         let exe = std::env::current_exe().expect("current_exe");
         let parent_ns = netns_id().expect("launcher netns id");
         let base = std::env::temp_dir().join(format!("fc-reclife-{}", std::process::id()));
+        // panic・期限切れ・spawn 失敗のどの経路でも root 所有の一時領域を回収する（特権操作の後始末）。
+        let guard = TempBase(base.clone());
         let _ = fs::remove_dir_all(&base);
         for d in [&base, &base.join("store"), &base.join("ns")] {
             fs::DirBuilder::new()
@@ -111,6 +115,25 @@ mod linux {
                 .create(d)
                 .expect("create temp dir");
         }
+        let outcome = run_child(&exe, &base, &parent_ns);
+        // 子の mount namespace が消えた後なので、pin のファイルも含めて消せる。失敗の報告より先に回収する。
+        drop(guard);
+        if let Err(msg) = outcome {
+            panic!("{msg}");
+        }
+    }
+
+    /// 一時ディレクトリの RAII 回収。launcher は root で動くため Drop も同じ特権で削除する。
+    struct TempBase(PathBuf);
+
+    impl Drop for TempBase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 子を起動して期限まで待つ。期限超過では kill・wait を終えてから `Err` を返す。
+    fn run_child(exe: &Path, base: &Path, parent_ns: &str) -> Result<(), String> {
         let mut c = Command::new("unshare")
             .args(["--net", "--mount", "--"])
             .arg(exe)
@@ -119,22 +142,48 @@ mod linux {
             .arg(format!("--parent-netns={parent_ns}"))
             .stdin(Stdio::null())
             .spawn()
-            .expect("spawn unshare child");
+            .map_err(|x| format!("spawn unshare child: {x}"))?;
         let deadline = Instant::now() + timeout() * 6;
         let st = loop {
-            if let Some(st) = c.try_wait().expect("try_wait") {
+            if let Some(st) = c.try_wait().map_err(|x| format!("try_wait: {x}"))? {
                 break st;
             }
             if Instant::now() >= deadline {
                 let _ = c.kill();
                 let _ = c.wait();
-                panic!("child did not exit within the timeout");
+                return Err("child did not exit within the timeout".into());
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        // 子の mount namespace が消えた後なので、pin のファイルも含めて消せる。
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("child failed: {st:?}"))
+        }
+    }
+
+    /// 非 root で動く自己検査。guard が panic の unwind 経路でも一時領域を消すことを確かめる。
+    pub fn selftest_guard() {
+        let base = std::env::temp_dir().join(format!("fc-reclife-selftest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
-        assert!(st.success(), "child failed: {st:?}");
+        fs::create_dir_all(base.join("store")).expect("create selftest dir");
+        fs::write(base.join("store").join("f"), b"x").expect("write selftest file");
+        let b2 = base.clone();
+        let r = std::panic::catch_unwind(move || {
+            let _g = TempBase(b2);
+            panic!("simulated timeout");
+        });
+        assert!(r.is_err(), "panic must propagate");
+        assert!(!base.exists(), "guard must remove the temp dir on panic");
+        // spawn 失敗経路: 存在しない実行ファイルでも Err で返り、guard が回収する。
+        let b3 = std::env::temp_dir().join(format!("fc-reclife-selftest2-{}", std::process::id()));
+        fs::create_dir_all(&b3).expect("create selftest dir 2");
+        let g = TempBase(b3.clone());
+        let out = Command::new("/nonexistent/fc-reclife-bin").spawn();
+        assert!(out.is_err());
+        drop(g);
+        assert!(!b3.exists(), "guard must remove the temp dir after failure");
+        println!("network_recorded_lifecycle_privileged: guard selftest ok");
     }
 
     /// 期限つきで外部コマンドを実行し、標準出力を返す（失敗は標準エラー）。

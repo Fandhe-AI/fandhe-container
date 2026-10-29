@@ -34,8 +34,17 @@
 //!   `unpublish_port_recorded` を再試行すると、DELRULE を送らず予約だけが解放される。他の公開の DNAT は変わらず、
 //!   解放された受け口は別コンテナが再び公開できる（NET-3・SEC-1・REPAIR-12）
 //!
+//! - (9) 運用者の退避・復元（`nft list ruleset` → `nft flush ruleset` → `nft -f`。nftables.service の reload 等）。
+//!   本リポの netlink による模擬ではなく nft CLI で往復し、テーブル handle が変わることと、記録からの
+//!   `unpublish_port_recorded`・`attach_container_recorded` が `FailedPrecondition` で断られ DELRULE を送らず、
+//!   他者のテーブル・テーブル内の他者のルール・残っている DNAT・メンバー記録・veth が変わらないことを照合する。
+//!   所有トークン（`NFTA_TABLE_USERDATA`）が往復で残るかは実機で観測して stderr に出す（成功判定には使わず、
+//!   残る場合は `StaleHandles`、失われる場合は `Unknown` で断られることだけを照合する。NET-3・SEC-1・
+//!   REPAIR-12・#3361）
+//!
 //! 子は `unshare --net --mount` の中（netns の pin の bind mount を mount namespace に閉じる）。
-//! 成功行は `network_publish_record_privileged: ok` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
+//! `nft flush ruleset` は子の新しい netns の中だけに効く（起動時に親の netns と異なることを検査済み）。
+//! 成功行は `network_publish_record_privileged: ok ruleset_restore=refused` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない場合は skip せず失敗する。
 
 #[cfg(not(target_os = "linux"))]
@@ -133,7 +142,7 @@ mod linux {
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn unshare child");
-        let deadline = Instant::now() + timeout() * 6;
+        let deadline = Instant::now() + timeout() * 12;
         let st = loop {
             if let Some(st) = c.try_wait().expect("try_wait") {
                 break st;
@@ -202,11 +211,13 @@ mod linux {
         let result = scenario(&route, &nft, &base, t)
             .and_then(|()| reclaim_scenario(&route, &nft, &base, t))
             .and_then(|()| tombstone_scenario(&route, &nft, &base, t))
-            .and_then(|()| member_detach_scenario(&route, &nft, &base, t));
+            .and_then(|()| member_detach_scenario(&route, &nft, &base, t))
+            // `nft flush ruleset` を使うため、他の場面のテーブルを巻き込まないよう必ず最後に実行する。
+            .and_then(|()| ruleset_restore_scenario(&route, &nft, &base, t));
         if let Err(e) = result {
             fail(&e);
         }
-        println!("network_publish_record_privileged: ok");
+        println!("network_publish_record_privileged: ok ruleset_restore=refused");
     }
 
     fn live_handle(
@@ -1018,6 +1029,271 @@ mod linux {
         .map_err(|x| format!("8101 must be reservable again after the retry: {x:?}"))?;
         if dnat_count(&table, 8101)? != 2 || dnat_count(&table, 8102)? != 2 {
             return Err("after re-publishing 8101: both must have 2 DNAT rules".to_owned());
+        }
+        Ok(())
+    }
+
+    /// `nft -a list` の出力から、`needle` を含む行の `# handle N` を集める（診断用。解析できない行は無視する）。
+    fn handles_in(listing: &str, needle: &str) -> Vec<u64> {
+        listing
+            .lines()
+            .filter(|l| l.contains(needle))
+            .filter_map(|l| l.rsplit_once("# handle "))
+            .filter_map(|(_, h)| h.trim().parse::<u64>().ok())
+            .collect()
+    }
+
+    /// (9) nft CLI によるルールセットの退避・復元の後、記録からの解除・attach が断られる（NET-3・SEC-1・REPAIR-12・
+    /// #3361）。`child()` の最後から呼ばれる。`nft flush ruleset` は子の netns の全テーブルを消すため最後に置く。
+    fn ruleset_restore_scenario(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let dir = &base.join("store");
+        let ns_dir = base.join("ns");
+        let subnet = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 234, 0, 0)), 24).map_err(e)?;
+        let gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 234, 0, 1)), 24).map_err(e)?;
+        let name = NetworkName::new("pubrst").map_err(e)?;
+        let def = NetworkDefinition::bridge("pubrst", subnet).map_err(e)?;
+        let store = NetworkStore::open(dir).map_err(e)?;
+        store.create(&def).map_err(e)?;
+        let c3 = MemberId::new("c3").map_err(e)?;
+        let pubs = [8201u16, 8202]
+            .into_iter()
+            .map(|hp| {
+                PortPublish::new(PortProtocol::Tcp, Ipv4Addr::new(192, 0, 2, 10), hp, 80).map_err(e)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (table, token, old_handle, created);
+        let mut recorded = Vec::new();
+        {
+            let g = store.lock_global_exclusive().map_err(e)?;
+            let n = g.lock_network(&name).map_err(e)?;
+            let spec = NetworkCreateSpec::new(name.clone(), gateway).map_err(e)?;
+            created = create_network_recorded(route, nft, &n, &def, &spec, t)
+                .map_err(|x| format!("create_network_recorded(pubrst): {x:?}"))?;
+            table = created.table.clone();
+            token = created.bridge_token.clone();
+            old_handle = live_handle(nft, &table, t)?;
+            let realized = n.realized().map_err(e)?.ok_or("realized missing")?;
+            if realized.table_handle().get() != old_handle {
+                return Err("pubrst: recorded table handle != live".to_owned());
+            }
+            let spec3 = ContainerAttachSpec::new(
+                EndpointId::new("c3").map_err(e)?,
+                &created,
+                ns_dir.clone(),
+            )
+            .and_then(|s| s.with_port_publishes(pubs))
+            .map_err(e)?;
+            let mut ports = PortRegistry::new();
+            let att = attach_container_recorded(route, nft, &n, &c3, &spec3, &[], &mut ports, t)
+                .map_err(|x| format!("attach_container_recorded(c3): {x:?}"))?;
+            for p in &att.published_ports {
+                recorded.push((
+                    p.publish().host_port(),
+                    p.prerouting_handle().get(),
+                    p.output_handle().get(),
+                ));
+            }
+            if recorded.len() != 2 {
+                return Err(format!("c3 must publish 2 ports, got {}", recorded.len()));
+            }
+        }
+        // 退避・復元を経由させる他者のテーブルとルール。
+        let foreign = "fcforeign";
+        run("nft", &["add", "table", "ip", foreign])?;
+        run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                foreign,
+                "c",
+                "{ type filter hook input priority 0; }",
+            ],
+        )?;
+        run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                foreign,
+                "c",
+                "counter",
+                "comment",
+                "\"fc-foreign\"",
+            ],
+        )?;
+        // 再起動の模擬: ストアを開き直し、記録だけから公開を復元する。
+        let store = NetworkStore::open(dir).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let mut restored = restore_published_ports(nft, &n, &c3).map_err(e)?;
+        if restored.len() != 2
+            || restored
+                .iter()
+                .any(|p| p.table_handle().map(|h| h.get()) != Some(old_handle))
+        {
+            return Err(format!(
+                "pubrst: unexpected restored ports: {}",
+                restored.len()
+            ));
+        }
+        for p in &restored {
+            let got = (
+                p.publish().host_port(),
+                p.prerouting_handle().get(),
+                p.output_handle().get(),
+            );
+            if !recorded.contains(&got) {
+                return Err(format!(
+                    "pubrst: restored port does not match attach: {got:?}"
+                ));
+            }
+        }
+        if dnat_count(&table, 8201)? != 2 || dnat_count(&table, 8202)? != 2 {
+            return Err("pubrst: each port must have 2 DNAT rules before the restore".to_owned());
+        }
+        let member_path: PathBuf = dir.join("@networks/pubrst/members/c3");
+        let member_before = fs::read(&member_path).map_err(e)?;
+        let veths_before = run("ip", &["-o", "link", "show", "type", "veth"])?;
+
+        // nft CLI による退避・復元。いずれの失敗も試験の失敗（skip しない）。
+        let saved = run("nft", &["list", "ruleset"])?;
+        if !saved.contains(table.as_str()) || !saved.contains(foreign) {
+            return Err("nft list ruleset lacks the network table or the foreign table".to_owned());
+        }
+        let file = base.join("ruleset.nft");
+        fs::write(&file, &saved).map_err(e)?;
+        let file_str = file.to_str().ok_or("ruleset path is not UTF-8")?;
+        run("nft", &["flush", "ruleset"])?;
+        run("nft", &["-f", file_str])?;
+        let new_handle = live_handle(nft, &table, t)?;
+        if new_handle == old_handle {
+            return Err(format!(
+                "table handle did not change after nft -f: {new_handle}"
+            ));
+        }
+        let kept = nft
+            .table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), t)
+            .map_err(e)?
+            .userdata()
+            == Some(token.as_bytes());
+        eprintln!(
+            "network_publish_record_privileged: diag userdata={} table_handle {old_handle} -> {new_handle}",
+            if kept { "kept" } else { "lost" }
+        );
+        // 復元後のテーブルに他者のルールを足す。
+        run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                table.as_str(),
+                "other",
+                "{ type filter hook input priority 0; }",
+            ],
+        )?;
+        run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                table.as_str(),
+                "other",
+                "counter",
+                "comment",
+                "\"fc-foreign-in-table\"",
+            ],
+        )?;
+        // 診断: 復元後の handle の採番と記録の rule handle の並び（数値上の一致はカーネルの採番の詳細なので assert しない）。
+        let listing = run("nft", &["-a", "list", "table", "ip", table.as_str()])?;
+        eprintln!(
+            "network_publish_record_privileged: diag recorded_rule_handles={recorded:?} dnat_now={:?} foreign_now={:?}",
+            handles_in(&listing, "dnat to"),
+            handles_in(&listing, "fc-foreign-in-table")
+        );
+
+        // 解除は DELRULE を送らず断る。所有トークンが残れば StaleHandles、失われれば Unknown。
+        let expected = if kept {
+            UnpublishRules::StaleHandles
+        } else {
+            UnpublishRules::Unknown
+        };
+        let p = restored.remove(0);
+        let mut reg = PortRegistry::new();
+        match unpublish_port_recorded(nft, &n, &c3, p, &mut reg, t) {
+            Err(RecordedError::Op(err))
+                if err.error.code() == NetErrorCode::FailedPrecondition
+                    && err.rules == expected
+                    && err.reservation_held => {}
+            Err(RecordedError::Op(err)) => {
+                return Err(format!(
+                    "unpublish refused unexpectedly: code={:?} rules={:?} held={}",
+                    err.error.code(),
+                    err.rules,
+                    err.reservation_held
+                ));
+            }
+            other => {
+                return Err(format!("unpublish must be refused (ok={})", other.is_ok()));
+            }
+        }
+        // attach は veth を作る前に断る。
+        let spec4 = ContainerAttachSpec::new(
+            EndpointId::new("c4").map_err(e)?,
+            &created,
+            PathBuf::from("/run/fc-pubrst-ns"),
+        )
+        .map_err(e)?;
+        let mut ports4 = PortRegistry::new();
+        match attach_container_recorded(
+            route,
+            nft,
+            &n,
+            &MemberId::new("c4").map_err(e)?,
+            &spec4,
+            &[],
+            &mut ports4,
+            t,
+        ) {
+            Err(RecordedError::Store(err)) if err.code() == NetErrorCode::FailedPrecondition => {}
+            other => return Err(format!("attach must be refused (ok={})", other.is_ok())),
+        }
+        // 観測値: DELRULE は送られず、他者のルールも記録も veth も変わらない。
+        if dnat_count(&table, 8201)? != 2 || dnat_count(&table, 8202)? != 2 {
+            return Err("a DNAT rule was removed by the refused unpublish".to_owned());
+        }
+        let foreign_listing = run("nft", &["list", "table", "ip", foreign])?;
+        if !foreign_listing.contains("fc-foreign") {
+            return Err(format!(
+                "the foreign table's rule was lost: {foreign_listing}"
+            ));
+        }
+        let after = run("nft", &["list", "table", "ip", table.as_str()])?;
+        if !after.contains("fc-foreign-in-table") {
+            return Err(format!(
+                "the other rule in the network table was lost: {after}"
+            ));
+        }
+        if fs::read(&member_path).map_err(e)? != member_before {
+            return Err("member record changed after the refusals".to_owned());
+        }
+        if run("ip", &["-o", "link", "show", "type", "veth"])? != veths_before {
+            return Err("a veth was created or removed around the refusals".to_owned());
+        }
+        if n.members().map_err(e)?.len() != 1 || !n.member_intents().map_err(e)?.is_empty() {
+            return Err("the refusals changed the member or intent records".to_owned());
         }
         Ok(())
     }

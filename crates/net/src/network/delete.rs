@@ -1009,7 +1009,7 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
 /// 請求書（v2）が載せた DNAT ルールを、テーブルの所有と実体の同一性を確かめてから消す（NET-1・NET-3・SEC-1・#3285）。
 ///
 /// - テーブルが無い: ルールも無いので、全件を回収済みにする（冪等）
-/// - 所有を証明できない（照会の失敗・userdata の不一致・ハンドル欠落）: DELRULE を送らず `Unknown` の取り残し
+/// - 所有を証明できない（照会の失敗・userdata の不一致・ハンドル欠落・ハンドル 0）: DELRULE を送らず `Unknown` の取り残し
 /// - 生きたテーブルのハンドルが請求書と違う: 記録した実体はもう無く、記録したルールも無い（同名の作り直し）。
 ///   送らずに回収済みにする。アドレスと予約の quarantine は請求書に残り、`delete_network` が解放する
 /// - 一致: 公開ごとにハンドル指定で削除する。ルールハンドルはテーブルの寿命の中で再利用されないため、実体が
@@ -1040,6 +1040,20 @@ fn reclaim_port_rules<O: DeleteOps>(
                     .map(|p| (resource(p), ResourceState::Unknown)),
             );
             failures.note(e, DeleteStep::UnpublishPorts);
+        }
+        // ハンドル 0 は実体の同一性を比べられない（`require_table_owned` と同じく使えない値）。作り直しと
+        // 読み替えて回収済みにすると請求書からルールのハンドルが落ちるため、DELRULE を送らず取り残しにする。
+        TableProof::Owned(0) => {
+            report.leftover.extend(
+                rules
+                    .ports
+                    .iter()
+                    .map(|p| (resource(p), ResourceState::Unknown)),
+            );
+            failures.note(
+                precondition("nft table handle is not usable"),
+                DeleteStep::UnpublishPorts,
+            );
         }
         TableProof::Owned(live) if live != rules.table.get() => {
             report.removed.extend(rules.ports.iter().map(resource));
@@ -3005,6 +3019,28 @@ mod tests {
                 .removed
                 .contains(&DeleteResource::Veth(host_of("c1")))
         );
+    }
+
+    /// NET-1・SEC-1・#3285: テーブルのハンドルが 0（userdata は一致）でも作り直しと読まない。DELRULE を送らず
+    /// `Unknown` の取り残しにし、請求書のルールのハンドルを保つ（fail-closed）。
+    #[test]
+    fn net1_3285_reclaim_zero_table_handle_is_unverifiable() {
+        let fake = Fake {
+            table_handle_now: Some(0),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (port_res(8080), ResourceState::Unknown),
+                (port_res(8081), ResourceState::Unknown),
+            ]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_rule")));
+        assert!(!e.report.removed.contains(&port_res(8080)));
     }
 
     /// NET-1・NET-3・#3285: 2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直す。片方が既に無く、

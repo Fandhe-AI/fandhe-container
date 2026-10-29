@@ -3007,15 +3007,19 @@ mod tests {
     }
 
     /// 疑似 `/proc`(一時ディレクトリ)に `<pid>/stat` を置く。
-    fn fake_proc(label: &str, stats: &[(u32, &str)]) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("core2-2394-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn fake_proc(
+        label: &str,
+        stats: &[(u32, &str)],
+    ) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (scratch, root) =
+            crate::test_support::scratch_child(&format!("core2-2394-{label}"), "d");
         for (pid, stat) in stats {
             let dir = root.join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("stat"), stat).unwrap();
         }
-        root
+        (scratch, root)
     }
 
     /// CORE-2・REPAIR-12(#2394): 探索処理そのものに fixture を渡す。終了処理中(`X` / `x`)の task は除外され
@@ -3025,7 +3029,7 @@ mod tests {
         let dying_x = "300 (a) X 0 -1 -1 0 -1 4227148\n";
         let dying_lx = "301 (b) x 0 -1 -1 0 -1 4227148\n";
         let child = "302 (c) S 100 100 100 0 -1 0\n";
-        let root = fake_proc(
+        let (_scratch, root) = fake_proc(
             "skip",
             &[
                 (300, dying_x),
@@ -3046,7 +3050,7 @@ mod tests {
     #[test]
     fn core2_descendants_unparsable_live_stat_marks_incomplete() {
         let broken = "303 (d) S 0 -1 -1 0 -1 4227148\n";
-        let root = fake_proc("broken", &[(303, broken)]);
+        let (_scratch, root) = fake_proc("broken", &[(303, broken)]);
         let mut out = Rescan::default();
         let found = descendants_in(&root, 100, 1, &mut out);
         let _ = std::fs::remove_dir_all(&root);
@@ -4031,11 +4035,10 @@ mod tests {
         }
         let (reader, writer) = std::io::pipe().unwrap();
         let filler_writer = writer.try_clone().unwrap();
-        let marker = std::env::temp_dir().join(format!("repair5-1816-{}", std::process::id()));
+        // 予測できる名前を先に消さず、排他作成の `ScratchDir` の子に置く（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("repair5-1816", "d");
+        let marker = dir.join("marker");
         let (ready, go) = (marker.with_extension("ready"), marker.with_extension("go"));
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -4069,9 +4072,6 @@ mod tests {
         let _ = child.wait();
         drop(reader);
         let _ = filler.join();
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
         assert!(finished, "launch blocked on a full stdout pipe");
     }
 }

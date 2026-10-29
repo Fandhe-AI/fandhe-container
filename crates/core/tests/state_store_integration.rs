@@ -27,22 +27,24 @@
 #[path = "support/reap.rs"]
 mod reap;
 
+// 試験専用の一時領域（排他作成の `ScratchDir`。#3434・REPAIR-12）。macOS / Windows の試験でも使う。
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 /// OCI-5・SEC-4・CLI-1（#2247）: macOS では `open` が通り、状態ルートが 0700 で作られる。
 #[cfg(target_os = "macos")]
 #[test]
 fn oci5_open_works_on_macos() {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use std::os::unix::fs::PermissionsExt as _;
-    let root = std::fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("fandhe-state-it-macos-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let scratch =
+        scratch_root::ScratchDir::new("fandhe-state-it-macos", std::time::Duration::from_secs(10));
+    let root = std::fs::canonicalize(scratch.path()).unwrap().join("root");
     FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap();
     assert_eq!(
         std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す。
@@ -51,8 +53,12 @@ fn oci5_open_works_on_macos() {
 fn oci5_open_is_unimplemented_outside_linux() {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::ErrorCode;
-    let root = std::env::temp_dir().join(format!("fandhe-state-it-nolinux-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    // 作られないことを照合するため、排他作成の `ScratchDir` の下の存在しない子を渡す（#3434・REPAIR-12）。
+    let scratch = scratch_root::ScratchDir::new(
+        "fandhe-state-it-nolinux",
+        std::time::Duration::from_secs(10),
+    );
+    let root = scratch.path().join("root");
     let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
     assert_eq!(e.code(), ErrorCode::Unimplemented);
     assert_eq!(
@@ -100,29 +106,31 @@ mod linux {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// テスト用一時ディレクトリ（drop で削除）。
-    struct TmpDir(PathBuf);
+    ///
+    /// 状態ルートは `ScratchDir` の子にする（親は共有 flock を持つため親を渡さない）。#3434・REPAIR-12。
+    struct TmpDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir()
-                .join(format!("fandhe-state-it-{tag}-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-it-{tag}-{n}"),
+                Duration::from_secs(10),
+            );
+            let p = scratch.path().join("root");
+            fs::create_dir(&p).unwrap();
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
             }
-            Self(p)
+            Self(p, scratch)
         }
         fn path(&self) -> &Path {
             &self.0
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -133,6 +141,8 @@ mod linux {
     struct Worker {
         child: Child,
         log: PathBuf,
+        /// ログの置き場（予測できる名前の先行削除をやめた排他作成の親。drop で消える）。#3434・REPAIR-12。
+        _scratch: crate::scratch_root::ScratchDir,
     }
 
     impl Deref for Worker {
@@ -153,11 +163,11 @@ mod linux {
         fn start(mut cmd: Command) -> Self {
             use std::os::unix::fs::OpenOptionsExt;
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let log = std::env::temp_dir().join(format!(
-                "fandhe-state-it-log-{}-{n}.txt",
-                std::process::id()
-            ));
-            let _ = fs::remove_file(&log);
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-it-log-{n}"),
+                Duration::from_secs(10),
+            );
+            let log = scratch.path().join("log.txt");
             let out = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -170,7 +180,11 @@ mod linux {
                 .stderr(Stdio::from(err))
                 .spawn()
                 .unwrap();
-            Self { child, log }
+            Self {
+                child,
+                log,
+                _scratch: scratch,
+            }
         }
 
         /// 子の出力を上限つきで読む（超過分は切り捨てる）。
@@ -191,12 +205,6 @@ mod linux {
         fn kill_and_output(&mut self) -> String {
             crate::reap::reap_or_report(&mut self.child, crate::reap::REAP_WITHIN);
             self.output()
-        }
-    }
-
-    impl Drop for Worker {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.log);
         }
     }
 

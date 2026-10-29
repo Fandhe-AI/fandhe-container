@@ -1521,23 +1521,19 @@ mod tests {
 
     /// テスト用の一意なディレクトリ（終了時に削除）。
     #[cfg(target_os = "linux")]
-    struct TempDir(PathBuf);
+    struct TempDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     #[cfg(target_os = "linux")]
     impl TempDir {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-oci-launch-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("mkdir");
-            Self(dir)
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-oci-launch-{name}"), "d");
+            Self(dir, scratch)
         }
     }
 

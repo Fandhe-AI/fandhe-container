@@ -812,9 +812,7 @@ mod tests {
     #[test]
     fn plug11_env_opt_in_enables_path_search_in_default_api() {
         use std::ffi::OsString;
-        let tmp = std::env::temp_dir().join(format!("fc-plug11-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let (_scratch, tmp) = crate::test_support::scratch_child("fc-plug11-env", "d");
         let fixture = format!(
             "fandhe-container-plugin-envtest{}",
             std::env::consts::EXE_SUFFIX
@@ -837,7 +835,6 @@ mod tests {
         let on = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
         let r = discover_default_with_env(&on, None, &[], get).unwrap();
         assert_eq!(r.candidates().len(), 1);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -911,9 +908,8 @@ mod tests {
 
     #[test]
     fn plug11_total_candidates_are_capped() {
-        let root = std::env::temp_dir().join(format!("fandhe-cap-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, root) = crate::test_support::scratch_child("fandhe-cap", "d");
         let mut out = Vec::new();
         let dir = PluginSearchDir::new(PluginDirKind::Path, root.clone());
         let ext = std::env::consts::EXE_SUFFIX;
@@ -924,7 +920,6 @@ mod tests {
         let err = scan_dir(&dir, MAX_SCANNED_ENTRIES_PER_PATH_DIR, &mut out).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(out.len(), MAX_TOTAL_CANDIDATES);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

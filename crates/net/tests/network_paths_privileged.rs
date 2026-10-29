@@ -39,9 +39,20 @@
 //!
 //! # 対象外の経路
 //!
-//! external netns から PREROUTING を通る DNAT と、コンテナ発の masquerade 経由の外向き通信は検証しない。masquerade の
-//! ルールは `create_network` が投入する（#3073）が、変換の実トラフィックは未検証（REPAIR-3）。PREROUTING 側のルール単位の検証は `nftables_paths_privileged` が行う。
-//! `ip_forward` は変更しない。
+//! external netns から PREROUTING を通る DNAT は検証しない（PREROUTING 側のルール単位の検証は
+//! `nftables_paths_privileged` が行う）。`--hold` / `--measure` の経路は外向き通信を扱わない。
+//!
+//! # 経路 (d)（コンテナ発の外向き通信。`--ignored` のみ。NET-1・NET-11・#3348）
+//!
+//! ```text
+//! c1 (10.214.0.2) -> bridge -> host（隔離 netns。ip_forward=1）-- fcex0 (10.214.2.1) <-> fcex1 (10.214.2.2) -- 外部 netns
+//! ```
+//!
+//! `create_network` が投入する masquerade（#3073）により、外部 netns の受信側が見る送信元 IP が出口の
+//! `10.214.2.1` に変わり、`C1_ADDR` のままではないことを確かめる。外部 netns は `unshare --net -- <exe> --ext-child`
+//! の子で、10.214.0.0/24 への戻り経路を持たない。`ip_forward` は隔離を確かめた後の inner の netns だけで 1 にする
+//! （netns ごとの値で host へは及ばない）。経路 (a)（出口が bridge のため変換しない）が除外 `oifname != bridge` の
+//! 陰性対照になる。実機（root）での実行は #1626（人間担当）で未実施。
 //!
 //! # 所要時間計測（`--measure --trials N --warmup W`）
 //!
@@ -85,6 +96,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--child") {
         linux::child(&args);
+    } else if args.iter().any(|a| a == "--ext-child") {
+        linux::ext_child();
     } else if args.iter().any(|a| a == "--inner") {
         linux::inner(&args);
     } else if args.iter().any(|a| a == "--ignored") {
@@ -120,6 +133,7 @@ mod linux {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink_route::{
         AddrScope, AddressSpec, IfName, IpPrefix, LinkCreate, LinkRef, LinkSet, NetlinkRouteSocket,
+        NetnsPid, NetnsTarget,
     };
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
@@ -133,6 +147,14 @@ mod linux {
     const INNER_PID_ENV: &str = "FANDHE_PATHS_TEST_INNER_PID";
     const DIR_ENV: &str = "FANDHE_PATHS_TEST_DIR";
     const OK_PREFIX: &str = "network_paths_privileged: three paths verified";
+    /// 経路 (d)（コンテナ発の外向き通信）の外部 netns 側。inner 側 `fcex0` が出口のアドレスで、
+    /// masquerade が変換する送信元になる。外部 netns には 10.214.0.0/24 への戻り経路を置かない。
+    const EXT_OUT0: &str = "fcex0";
+    const EXT_OUT1: &str = "fcex1";
+    const EXT_EGRESS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 214, 2, 1);
+    const EXT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 214, 2, 2);
+    /// 経路 (d) の外部 netns の待受ポート。
+    const PORT_D: u16 = 9104;
     const PAYLOAD: &[u8] = b"fandhe";
     /// 公開ポート（DNAT 前の宛先ポート）。
     const HOST_PORT: u16 = 18080;
@@ -667,9 +689,55 @@ mod linux {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| fail("missing or invalid child address"))?;
+        say("ready");
+        serve(addr)
+    }
+
+    /// `--ext-child` の入口。経路 (d) の「外部 netns」役。inner が `unshare --net` で起動したときだけ動く
+    /// （親 pid と netns の両方を確かめる fail-closed）。`setup` の行を受けたら移ってきた `fcex1` と `lo` を up にして
+    /// `EXT_ADDR` を付け、以降は `--child` と同じ行プロトコルで受信側を務める。戻り経路は付けない。
+    pub fn ext_child() {
+        if let Err(e) = ext_child_inner() {
+            println!("network_paths_privileged: ext-child failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    fn ext_child_inner() -> Result<(), NetError> {
+        let expected = std::env::var(INNER_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let parent = std::os::unix::process::parent_id();
+        if expected != Some(parent) {
+            return Err(fail("`--ext-child` must be started by `--inner`; refusing"));
+        }
+        let own = fs::read_link("/proc/self/ns/net").map_err(|e| fail(format!("readlink: {e}")))?;
+        let parent_ns = fs::read_link(format!("/proc/{parent}/ns/net"))
+            .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing")))?;
+        if own == parent_ns {
+            return Err(fail("`--ext-child` shares the parent netns; refusing"));
+        }
+        say("ready");
+        if read_line().as_deref() != Some("setup") {
+            return Err(fail("expected `setup`"));
+        }
+        let route = NetlinkRouteSocket::open()?;
+        let t = timeout();
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname("lo")?)), t)?;
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname(EXT_OUT1)?)), t)?;
+        let idx = route.link_index(&ifname(EXT_OUT1)?, t)?;
+        route.add_address(
+            &AddressSpec::new(idx, IpPrefix::new(v4(EXT_ADDR), 24)?, AddrScope::Universe),
+            t,
+        )?;
+        say("configured");
+        serve(EXT_ADDR)
+    }
+
+    /// `listen` / `recv` / `send` の行プロトコルを EOF まで処理する（`--child` と `--ext-child` で共有）。
+    fn serve(addr: Ipv4Addr) -> Result<(), NetError> {
         let mut listeners: Vec<(u16, UdpSocket)> = Vec::new();
         let mut held_senders: Vec<(u16, UdpSocket)> = Vec::new();
-        say("ready");
         while let Some(cmd) = read_line() {
             let mut parts = cmd.split_whitespace();
             match (parts.next(), parts.next(), parts.next()) {
@@ -731,16 +799,29 @@ mod linux {
             let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
             let mut netns_arg = std::ffi::OsString::from("--net=");
             netns_arg.push(netns_path);
-            let mut child = Command::new("nsenter")
-                .arg(netns_arg)
+            let mut cmd = Command::new("nsenter");
+            cmd.arg(netns_arg)
                 .arg("--")
                 .arg(exe)
-                .args(["--child", &addr.to_string()])
+                .args(["--child", &addr.to_string()]);
+            Self::spawn_command(role, cmd)
+        }
+
+        /// 新しい netns（`unshare --net`）で `--ext-child` を起動する。経路 (d) の外部 netns 役。
+        fn spawn_ext(role: &'static str) -> Result<Self, NetError> {
+            let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
+            let mut cmd = Command::new("unshare");
+            cmd.args(["--net", "--"]).arg(exe).arg("--ext-child");
+            Self::spawn_command(role, cmd)
+        }
+
+        fn spawn_command(role: &'static str, mut cmd: Command) -> Result<Self, NetError> {
+            let mut child = cmd
                 .env(INNER_PID_ENV, std::process::id().to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
-                .map_err(|e| fail(format!("spawn nsenter: {e}")))?;
+                .map_err(|e| fail(format!("spawn {role}: {e}")))?;
             let stdin = child.stdin.take();
             let stdout = child
                 .stdout
@@ -927,6 +1008,60 @@ mod linux {
         Ok(())
     }
 
+    /// 経路 (d) の照合。外部 netns 役の子へ `fcex1` を移し、c1 から送って受信側が見る送信元 IP が
+    /// 出口の `EXT_EGRESS_ADDR` であって `C1_ADDR` ではないことを確かめる（ポートは照合しない）。
+    /// `ip_forward` は隔離確認済みの inner の netns だけで有効にする（値は netns ごとで host へ及ばない。
+    /// 設計 D11 の「host の `ip_forward` は変更しない」とは矛盾しない）。
+    fn verify_egress(
+        route: &NetlinkRouteSocket,
+        c1: &mut ChildGuard,
+        c1_ports: &mut Vec<u16>,
+    ) -> Result<SocketAddr, NetError> {
+        let t = timeout();
+        // 隔離の確認は `prepare_isolation`（`ensure_isolated_netns`）が済ませている。ここでは再確認しない
+        // （bridge・veth が既にあるため「新規作成直後」の検査は通らない）が、親 netns と別であることだけは確かめる。
+        let own = fs::read_link("/proc/self/ns/net").map_err(|e| fail(format!("readlink: {e}")))?;
+        let parent = fs::read_link(format!(
+            "/proc/{}/ns/net",
+            std::os::unix::process::parent_id()
+        ))
+        .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing")))?;
+        if own == parent {
+            return Err(fail("refusing to enable ip_forward in the parent netns"));
+        }
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+            .map_err(|e| fail(format!("enable ip_forward in the isolated netns: {e}")))?;
+        let mut ext = ChildGuard::spawn_ext("ext")?;
+        ext.expect_prefix("ready")?;
+        route.create_link(&LinkCreate::veth(ifname(EXT_OUT0)?, ifname(EXT_OUT1)?)?, t)?;
+        let pid = NetnsPid::new(ext.child.id())?;
+        route.set_link(
+            &LinkSet::move_to_netns(LinkRef::Name(ifname(EXT_OUT1)?), NetnsTarget::Pid(pid)),
+            t,
+        )?;
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname(EXT_OUT0)?)), t)?;
+        let idx = route.link_index(&ifname(EXT_OUT0)?, t)?;
+        route.add_address(
+            &AddressSpec::new(
+                idx,
+                IpPrefix::new(v4(EXT_EGRESS_ADDR), 24)?,
+                AddrScope::Universe,
+            ),
+            t,
+        )?;
+        ext.send("setup")?;
+        ext.expect_prefix("configured")?;
+        ext.listen(PORT_D)?;
+        c1.send_to((EXT_ADDR, PORT_D), c1_ports)?;
+        let seen = ext.recv(PORT_D)?;
+        expect_eq(seen.ip(), v4(EXT_EGRESS_ADDR), "path (d) source address")?;
+        if seen.ip() == v4(C1_ADDR) {
+            return Err(fail("path (d): source address was not translated"));
+        }
+        ext.finish()?;
+        Ok(seen)
+    }
+
     /// 3 経路疎通の照合本体（`--ignored`）。
     fn verify_paths() -> Result<(), NetError> {
         let base = prepare_isolation()?;
@@ -994,6 +1129,10 @@ mod linux {
         let c = c1.recv(CONT_PORT)?;
         expect_eq(c, SocketAddr::new(v4(HOST_OUTER), pc), "path (c)")?;
 
+        // (d) コンテナ発の外向き通信: c1 -> 外部 netns。出口が bridge 以外のため masquerade が送信元を
+        // 出口のアドレスへ変換する（NET-1・NET-11・#3348）。経路 (a)（出口が bridge で変換しない）が陰性対照になる。
+        let d = verify_egress(&route, &mut c1, &mut c1_ports)?;
+
         c1.finish()?;
         c2.finish()?;
 
@@ -1013,7 +1152,7 @@ mod linux {
             &mut ports,
             (&bridge, &hosts, &pins),
         )?;
-        println!("{OK_PREFIX} a={a} b={b} c={c} (NET-1)");
+        println!("{OK_PREFIX} a={a} b={b} c={c} d={d} (NET-1 NET-11)");
         Ok(())
     }
 

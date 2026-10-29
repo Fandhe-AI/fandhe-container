@@ -2083,6 +2083,43 @@ jobs:
             --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
 
+      # network_modes_real（`crates/cli/tests/`。NET-6・NET-12・CLI-1・SEC-1・REPAIR-12・#3345）:
+      # `create` の `--network none|host`・`--add-host`・`--dns` が本番の rootless の start でコンテナに
+      # 効くことと、delete 後に生成物の残骸が無いことを確かめる。
+      # 前提・実行方法は start_stop_delete_real と同じ（上の前提確認ステップ。supervisor の bin を先にビルドして置き、試験バイナリを
+      # 委譲スコープの中で直接実行する）。host モードは runner の netns を共有するだけで、ホストのネットワーク設定を変えない。
+      # 新しい check-run・sudo・permissions は追加しない。
+      - name: network_modes_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor
+          json="${RUNNER_TEMP}/nmr-build.json"
+          cargo test -p fandhe-container-cli --test network_modes_real --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "network_modes_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::network_modes_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "NMR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: network_modes_real の実行（実機前提テスト・--ignored・委譲スコープ。NET-6・NET-12・CLI-1・#3345）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/network_modes_real.log"
+          USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${NMR_BIN}" --ignored 2>&1 | tee "${log}"
+          # 成功行 5 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `network_modes_real: FAILED`
+          scripts/check-success-lines.sh --name network_modes_real \
+            --src crates/cli/tests/network_modes_real.rs \
+            --log "${log}" --select '^network_modes_real: (default |none |a second start |host |delete )' --min 5 \
+            --forbid 'network_modes_real: skipped' --forbid 'network_modes_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
       # start_scope_real・delete_cgroup_real・start_recover_real（`crates/cli/tests/`。CORE-2・CORE-3・CORE-4・CORE-6・SUP-1・CLI-1・
       # SEC-1・OCI-6・REPAIR-7・#2081・#2061・#2011・#3105）: 委譲 cgroup の CLI 実機前提テスト。前提（非 root・user manager の
       # private ソケット・cgroup v2・Landlock ABI 6 以上）は上の前提確認ステップが fail-closed で確かめる。root の分岐は無い

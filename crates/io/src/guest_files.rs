@@ -76,8 +76,12 @@
 //! - ホストパス長は共有ルート（設定値 `root`）に検証済みのコンポーネントを足した計測用の
 //!   `PathBuf` で測る（I/O には使わない）。Windows の正規パス（`\\?\` 付きの `base`）や
 //!   `LongPathsEnabled` は考慮しない（REPAIR-3）。
-//! - 祖先が symlink の場合も、ディレクトリでない場合と同じ `NotADirectory` に分類する
-//!   （`sys` が ELOOP と ENOTDIR を区別しないため。`EscapesRoot` は未使用。REPAIR-3）。
+//! - 祖先が symlink または reparse point の場合は reason `EscapesRoot`、それ以外の
+//!   ディレクトリでない祖先は `NotADirectory` に分類する（#3352）。`EscapesRoot` は
+//!   「辿れば共有ルートの外へ出うる経路」の意で、リンク先が実際にルートの外かどうかは
+//!   見ない（辿らない）。Linux では `O_DIRECTORY|O_NOFOLLOW` が symlink にも `ENOTDIR`
+//!   を返すため、`sys` が `readlinkat` で種類を判別する。判別は分類だけで、拒否は
+//!   どちらの reason でも変わらない（fail-closed）。
 //!
 //! # プロセス間の競合（作成後の再検証と取り消し。Linux / macOS）
 //! `Mutex` はインスタンス内にしか効かないため、走査から作成までの間に別プロセス・
@@ -462,6 +466,9 @@ impl GuestFileCreator {
             Err(CreateError::NotADirectory(err)) => {
                 return Err(CreateFailure::with(err, NackReason::NotADirectory));
             }
+            Err(CreateError::EscapesRoot(err)) => {
+                return Err(CreateFailure::with(err, NackReason::EscapesRoot));
+            }
             Err(CreateError::Other(err)) => return Err(CreateFailure::from_io(err)),
         };
         #[cfg(test)]
@@ -665,7 +672,8 @@ impl ScanCursor {
         use crate::sys::{BeneathError, open_dir_beneath};
         match open_dir_beneath(&self.0, name) {
             Ok(dir) => Ok(Some(Self(dir))),
-            Err(BeneathError::AncestorNotDirectory) => Ok(None),
+            // symlink・非ディレクトリより下は読まない（作成側も拒否する）。
+            Err(BeneathError::AncestorSymlink | BeneathError::AncestorNotDirectory) => Ok(None),
             Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(None),
             Err(BeneathError::Io(kind)) => Err(internal("failed to inspect guest directory", kind)),
             Err(BeneathError::AlreadyExists) => Err(internal(
@@ -719,25 +727,38 @@ impl ScanCursor {
     fn descend(mut self, name: &str) -> Result<Option<Self>, IoError> {
         let next = self.path.join(name);
         match open_pinned_dir(&next) {
-            Ok(Some(dir)) => {
+            Ok(Pinned::Dir(dir)) => {
                 self.pinned.push(dir);
                 self.path = next;
                 Ok(Some(self))
             }
             // reparse point・非ディレクトリより下は読まない（作成側も拒否する）。
-            Ok(None) => Ok(None),
+            Ok(Pinned::Reparse | Pinned::NotDir) => Ok(None),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(internal("failed to inspect guest directory", err.kind())),
         }
     }
 }
 
+/// [`open_pinned_dir`] の結果（Windows）。reparse point の判定を非ディレクトリの判定より
+/// 先に行う（#3352。reason `EscapesRoot` と `NotADirectory` を分けるため）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+enum Pinned {
+    /// 通常ディレクトリ（保持用のハンドル）。
+    Dir(File),
+    /// reparse point（ジャンクション・symlink 等。辿らない）。
+    Reparse,
+    /// reparse point 以外のディレクトリでないもの。
+    NotDir,
+}
+
 /// Windows: `path` を reparse point を辿らず（`FILE_FLAG_OPEN_REPARSE_POINT`）・
 /// `FILE_SHARE_DELETE` なしで開き、通常ディレクトリ（reparse point でない）なら保持用の
-/// ハンドルを返す（そうでなければ `None`）。保持中は OS が改名・削除・差し替えを拒否
-/// する。走査（`ScanCursor::descend`）と作成（[`create_beneath`]）で同じ判定を使う。
+/// ハンドルを返す（そうでなければ [`Pinned::Reparse`] / [`Pinned::NotDir`]）。保持中は
+/// OS が改名・削除・差し替えを拒否する。走査（`ScanCursor::descend`）と作成
+/// （[`create_beneath`]）で同じ判定を使う。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
+fn open_pinned_dir(path: &Path) -> std::io::Result<Pinned> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
     const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
@@ -752,10 +773,13 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
         .share_mode(SHARE)
         .open(path)?;
     let meta = dir.metadata()?;
-    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
-        return Ok(None);
+    if meta.file_attributes() & REPARSE != 0 {
+        return Ok(Pinned::Reparse);
     }
-    Ok(Some(dir))
+    if !meta.is_dir() {
+        return Ok(Pinned::NotDir);
+    }
+    Ok(Pinned::Dir(dir))
 }
 
 /// 同期用（`FlushFileBuffers`。書き込み権限が必要）のディレクトリハンドルを開く。
@@ -781,7 +805,12 @@ fn open_sync_dir(path: &Path) -> Result<File, CreateError> {
         .open(path)
         .map_err(|err| fail(err.kind()))?;
     let meta = dir.metadata().map_err(|err| fail(err.kind()))?;
-    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+    if meta.file_attributes() & REPARSE != 0 {
+        return Err(CreateError::EscapesRoot(invalid(
+            "guest path ancestor is a symbolic link or reparse point",
+        )));
+    }
+    if !meta.is_dir() {
         return Err(CreateError::NotADirectory(invalid(
             "guest path ancestor is not a directory",
         )));
@@ -797,7 +826,10 @@ enum CreateError {
     /// 表記（値）のエントリがあった（大文字小文字を区別しないホストで、走査の後に
     /// 別の作成者が作った場合）。
     ExistsAs(String),
-    /// 祖先がディレクトリでない（symlink を含む）。reason `NotADirectory` に分類する。
+    /// 祖先が symlink または reparse point（辿らない。リンク先がルートの外かは見ない）。
+    /// reason `EscapesRoot` に分類する。
+    EscapesRoot(IoError),
+    /// 祖先が symlink 以外のディレクトリでないもの。reason `NotADirectory` に分類する。
     NotADirectory(IoError),
     /// 構造化済みのその他のエラー。
     Other(IoError),
@@ -880,6 +912,9 @@ fn create_beneath(
     fn map(err: BeneathError) -> CreateError {
         match err {
             BeneathError::AlreadyExists => CreateError::Exists,
+            BeneathError::AncestorSymlink => CreateError::EscapesRoot(invalid(
+                "guest path ancestor is a symbolic link or reparse point",
+            )),
             BeneathError::AncestorNotDirectory => {
                 CreateError::NotADirectory(invalid("guest path ancestor is not a directory"))
             }
@@ -1451,11 +1486,21 @@ fn create_beneath(
                 )));
             }
         }
-        let dir = open_pinned_dir(&path)
-            .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
-            .ok_or_else(|| {
-                CreateError::NotADirectory(invalid("guest path ancestor is not a directory"))
-            })?;
+        let dir = match open_pinned_dir(&path).map_err(|err| {
+            CreateError::Other(internal("failed to create guest file", err.kind()))
+        })? {
+            Pinned::Dir(dir) => dir,
+            Pinned::Reparse => {
+                return Err(CreateError::EscapesRoot(invalid(
+                    "guest path ancestor is a symbolic link or reparse point",
+                )));
+            }
+            Pinned::NotDir => {
+                return Err(CreateError::NotADirectory(invalid(
+                    "guest path ancestor is not a directory",
+                )));
+            }
+        };
         dir_paths.push(path.clone());
         needs_sync.push(false);
         pinned.push(dir);
@@ -1732,6 +1777,10 @@ mod tests {
         let c = GuestFileCreator::new(root).expect("creator");
         let err = c.create_file("link/f").err().expect("must reject");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "guest path ancestor is a symbolic link or reparse point"
+        );
         assert_eq!(entries(&outside.0), 0);
     }
 
@@ -2360,6 +2409,11 @@ mod tests {
         let err = c.create_file("j/foo").err().expect("must reject");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{err:?}");
         assert_eq!(entries(&outside.0), 1);
+        assert_eq!(
+            classified(&c, "j/foo"),
+            (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot))
+        );
+        assert_eq!(entries(&outside.0), 1);
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
@@ -2584,10 +2638,10 @@ mod tests {
         );
     }
 
-    /// 祖先が symlink の場合は `NotADirectory`（`EscapesRoot` は未使用。REPAIR-3）。
+    /// 祖先が symlink の場合は `EscapesRoot`（`NotADirectory` と分ける。#3352）。
     #[cfg(unix)]
     #[test]
-    fn io5_classify_symlink_ancestor_as_not_a_directory() {
+    fn io5_classify_symlink_ancestor_as_escapes_root() {
         let t = Tmp::new();
         let outside = Tmp::new();
         let root = t.0.join("root");
@@ -2596,12 +2650,32 @@ mod tests {
         let c = GuestFileCreator::new(root).expect("creator");
         assert_eq!(
             classified(&c, "link/f"),
-            (
-                IoErrorCode::InvalidArgument,
-                Some(NackReason::NotADirectory)
-            )
+            (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot))
         );
         assert_eq!(entries(&outside.0), 0);
+    }
+
+    /// 深い位置・ルート内を指す・宛先の無い symlink もすべて `EscapesRoot`（#3352）。
+    #[cfg(unix)]
+    #[test]
+    fn io5_classify_symlink_ancestor_variants_as_escapes_root() {
+        let t = Tmp::new();
+        let root = t.0.join("root");
+        std::fs::create_dir_all(root.join("d")).expect("d");
+        std::fs::create_dir(root.join("real")).expect("real");
+        std::os::unix::fs::symlink(root.join("real"), root.join("d/link")).expect("deep");
+        std::os::unix::fs::symlink(root.join("real"), root.join("inside")).expect("inside");
+        std::os::unix::fs::symlink(t.0.join("nowhere"), root.join("dangling")).expect("dangling");
+        let c = GuestFileCreator::new(root.clone()).expect("creator");
+        for path in ["d/link/f", "inside/f", "dangling/f"] {
+            assert_eq!(
+                classified(&c, path),
+                (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot)),
+                "{path}"
+            );
+        }
+        assert_eq!(entries(&root.join("real")), 0);
+        assert!(!t.0.join("nowhere").exists());
     }
 
     /// 件数上限は `TrackedPathsLimit`。

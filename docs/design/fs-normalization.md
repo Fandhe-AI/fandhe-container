@@ -59,12 +59,22 @@ IO-5 と TASK-21 の見出しは spec PR #12（`18386e7`）で改訂済み。詳
 - 資源上限: 衝突キーの長さは入力の定数倍に収まる（NFD の展開は文字あたり有界）。索引の件数上限は `GuestFileCreator::with_max_tracked_paths` で、超えると `ResourceExhausted`
 - ホスト OS ごとの有効化（#103 で #104・#105 に委ねられた点）: 実装は OS で切り替えず、3 OS で同じ検出をする。これは本リポ側の実装判断であり、オーナーの個別判断ではない。理由は、過検出の方針に沿うことと、ゲストから見える挙動を 3 OS で揃えること
 - 本機能はパストラバーサル防止の本体ではない。rootfs への閉じ込めは `guest_files` の `openat` 系と `create_new` が担う
+- 検証規則の分担（#3352・IO-5・REPAIR-1）: 構文規則の本体は `guest_path::check_rules` の 1 か所で、適用範囲を `GuestPathRules` の 3 定数で選ぶ
+  - `GUEST`（全規則）: `GuestPath::parse`。ゲスト入力に使う
+  - `STRUCTURAL`（空・NUL・絶対・空コンポーネント・`.` / `..` だけ）: `fs_normalize` の索引。`index_existing` がホストから読んだ実在名（`:` や `\` を含みうる・上限を超えうる）も入れ、不正を無視するため、全規則を当てると実在項目が落ちて衝突を見逃す。拒否の文言は `GuestPathError` のものに揃う
+  - `HOST_NAME`（構造規則と禁止文字。さらに `/` を含まない単一名）: `writeback` の sink 名。長さの上限は当てない（NTFS・APFS は 255 バイトを超える多バイト名を作れ、長さの判定はホスト FS に任せる）
+- 祖先の分類（#3352・IO-5・REPAIR-4）: 祖先が symlink または reparse point なら reason `EscapesRoot`、それ以外のディレクトリでない祖先なら `NotADirectory`（どちらも `InvalidArgument`。リンク先がルートの外かは見ず、辿らない）
+  - Linux では `openat(O_DIRECTORY|O_NOFOLLOW)` が symlink にも `ENOTDIR` を返すため、`sys::beneath::open_dir_beneath` は `readlinkat`（1 バイトだけ受けて捨てる）で種類を判別する。`openat` との間にすり替えられても変わるのは分類だけで、拒否は変わらない（fail-closed）
 
 ### 根拠となるテスト（REPAIR-12）
 
 | 場所 | テスト |
 | ---- | ------ |
 | `crates/io/src/fs_normalize.rs` | `io5_nfc_and_nfd_spellings_collide`・`io5_distinct_names_do_not_collide_under_normalization`・`io5_case_only_collision_keeps_legacy_message`・`io5_collision_message_keeps_original_spellings`・`io5_trailing_nfd_difference_is_pinned`・`io5_unicode_normalization_table_version_is_pinned` |
+| `crates/io/src/guest_path.rs` | `io5_repair1_rule_sets_table`・`io5_repair1_rule_precedence_is_unchanged` |
+| `crates/io/src/fs_normalize.rs`（規則の分担） | `io5_repair1_structural_rules_keep_host_names_indexable`・`io5_repair1_rejections_use_guest_path_error`・`io5_repair1_guest_path_accepts_imply_index_accepts` |
+| `crates/io/src/writeback.rs` | `io2_repair1_sink_name_rule_set`・`io2_open_in_rejects_names_outside_directory` |
+| `crates/io/src/guest_files.rs`・`crates/io/src/sys.rs`（祖先の分類） | `io5_classify_symlink_ancestor_as_escapes_root`・`io5_classify_symlink_ancestor_variants_as_escapes_root`・`io5_open_dir_beneath_rejects_symlink_and_file` |
 | `crates/io/tests/fs_normalize.rs` | `io5_public_api_detects_nfc_nfd_collision` |
 | `crates/io/tests/guest_files.rs` | `io5_nfc_then_nfd_create_is_rejected_without_creating_second_file` |
 

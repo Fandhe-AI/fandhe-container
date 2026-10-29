@@ -4,15 +4,17 @@
 //! Linux（ubuntu）でも実行できるようにする。Windows は `std::os::unix` が無いため `#![cfg(unix)]` で 0 件になる。
 #![cfg(unix)]
 
+#[path = "support/common.rs"]
+mod common;
 #[path = "support/virtiofs_harness.rs"]
 mod harness;
 
 use std::time::Duration;
 
+use common::{Scratch, env_path, tail_lossy};
 use fandhe_container_platform_macos::console_log::TRUNCATION_MARKER;
 use harness::{
-    CONSOLE_LOG_SETTLE_TIMEOUT, Scratch, env_path, log_truncated, resolve_probe_timeout,
-    tail_lossy, wait_console_log_settled,
+    CONSOLE_LOG_SETTLE_TIMEOUT, log_truncated, resolve_probe_timeout, wait_console_log_settled,
 };
 
 /// MAC-1・IO-5・SEC-4・TASK-65.4・#1877: 上限到達で打ち切られたログは末尾の区切り文で判別できる。

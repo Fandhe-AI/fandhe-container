@@ -22,17 +22,23 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // 利用箇所は macOS 限定の実 VM 試験だけなので、宣言自体を macOS に限る（dead_code の抑止を使わない）。
+#[path = "support/common.rs"]
+mod common;
 #[cfg(target_os = "macos")]
 #[path = "support/guest_markers.rs"]
 mod guest_markers;
+use common::{Scratch, resolve_secs};
+#[cfg(target_os = "macos")]
+#[path = "support/vm_guest.rs"]
+mod vm_guest;
 
 /// 出力 JSON の schema 名。
 const SCHEMA: &str = "fandhe-container.macos-vm-cold-start.v1";
@@ -68,8 +74,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// watcher の読み込み累計の上限（書き出しスレッドの上限 1 MiB に余裕を持たせた値。無制限読み込みの防止）。
 const WATCH_READ_LIMIT: usize = 2 * 1024 * 1024;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
 // ---- 環境変数の解決 -------------------------------------------------------------------------------
 
 /// 試行回数を決める。未指定は 5、5〜50 の整数以外（空・非数・範囲外）は拒否する（MAC-2 は 5 回以上）。
@@ -82,23 +86,6 @@ fn resolve_trials(raw: Option<String>) -> Result<u32, String> {
             .filter(|n| (TRIALS_MIN..=TRIALS_MAX).contains(n))
             .ok_or_else(|| {
                 format!("trials must be an integer in {TRIALS_MIN}..={TRIALS_MAX}, got {v:?}")
-            }),
-    }
-}
-
-/// 秒数の環境変数を決める。未指定は既定値、範囲外・非数は拒否する（VM 起動前に拒否するため）。
-fn resolve_secs(raw: Option<String>, default: u64, range: (u64, u64)) -> Result<u64, String> {
-    match raw {
-        None => Ok(default),
-        Some(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| (range.0..=range.1).contains(n))
-            .ok_or_else(|| {
-                format!(
-                    "seconds must be an integer in {}..={}, got {v:?}",
-                    range.0, range.1
-                )
             }),
     }
 }
@@ -412,55 +399,22 @@ fn render_json(requested: u32, trials: &[TrialResult]) -> String {
     )
 }
 
-/// `CARGO_TARGET_TMPDIR` 配下に新規ディレクトリを作る（既存を再利用・削除しない。Unix は 0700）。
-fn fresh_dir(tag: &str) -> PathBuf {
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    std::fs::create_dir_all(base).expect("create tmp base");
-    let base = base.canonicalize().expect("canonicalize tmp base");
-    for _ in 0..100 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("{tag}-{}-{nanos}-{n}", std::process::id()));
-        if std::fs::create_dir(&dir).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod scratch dir");
-            }
-            return dir;
-        }
-    }
-    panic!("could not create a fresh scratch directory");
-}
-
 // ---- 実機（macOS 限定・#[ignore]） ----------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
 mod real_vm {
+    use super::vm_guest::{GuestAssets, console_boot_spec};
     use super::*;
-    use fandhe_container_platform_macos::config::{
-        BlockDeviceSpec, ConsoleLogPath, DeviceConfigSpec, DiskImagePath, SerialConsoleSink,
-        VmConfigSpec,
-    };
     use fandhe_container_platform_macos::vm::{
         DEFAULT_STATE_QUERY_TIMEOUT, DEFAULT_STOP_TIMEOUT, OpTimeouts, Vm, VmState,
     };
+    use std::path::Path;
     use std::sync::mpsc::RecvTimeoutError;
 
     struct Guest {
-        kernel: PathBuf,
-        initrd: Option<PathBuf>,
-        disk: Option<PathBuf>,
-        cmdline: String,
+        assets: GuestAssets,
         boot: String,
         ready: String,
-    }
-
-    fn env_path(name: &str) -> Option<PathBuf> {
-        std::env::var_os(name).map(PathBuf::from)
     }
 
     fn env_opt(name: &str) -> Option<String> {
@@ -485,22 +439,7 @@ mod real_vm {
         let log = dir.join("console.log");
         eprintln!("vm_cold_start: trial {n} console log at {}", log.display());
         // spec の組み立てとパス検証は計測区間の外。VM を持つ前なので設定誤りは panic でよい。
-        let blocks = g
-            .disk
-            .iter()
-            .map(|p| BlockDeviceSpec::root(DiskImagePath::try_new(p).expect("disk image path")))
-            .collect();
-        let devices = DeviceConfigSpec::try_new(
-            blocks,
-            Some(SerialConsoleSink::LogFile(
-                ConsoleLogPath::try_new(&log).expect("console log path"),
-            )),
-        )
-        .expect("device spec");
-        let spec = VmConfigSpec::from_parts(&g.kernel, g.initrd.as_deref(), &g.cmdline)
-            .expect("spec")
-            .with_devices(devices)
-            .expect("with_devices");
+        let spec = console_boot_spec(&g.assets, &log);
         // 準備（ディレクトリ作成・検証・spec 構築）で使った時間を差し引き、起動直前に残予算を再計算する。
         // 100 ms 未満なら VM を起動しない（REPAIR-5）。
         let remaining = total_end.saturating_duration_since(Instant::now());
@@ -630,12 +569,10 @@ mod real_vm {
             TOTAL_TIMEOUT_RANGE_SECS,
         )
         .expect("invalid FANDHE_CONTAINER_MACOS_VM_COLD_START_TOTAL_TIMEOUT_SECS");
-        let kernel = env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
-            panic!(
-                "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) and \
-                 FANDHE_CONTAINER_MACOS_VM_READY_MARKER are required. See AGENTS.md."
-            )
-        });
+        let assets = GuestAssets::from_env(
+            "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) and \
+             FANDHE_CONTAINER_MACOS_VM_READY_MARKER are required. See AGENTS.md.",
+        );
         let boot =
             guest_markers::resolve_boot_marker(env_opt("FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER"))
                 .expect("invalid FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER");
@@ -644,17 +581,14 @@ mod real_vm {
                 .expect("invalid FANDHE_CONTAINER_MACOS_VM_READY_MARKER");
         guest_markers::validate_marker_pair(&boot, &ready).expect("invalid marker pair");
         let g = Guest {
-            kernel,
-            initrd: env_path("FANDHE_CONTAINER_MACOS_VM_INITRD"),
-            disk: env_path("FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE"),
-            cmdline: env_opt("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
-                .unwrap_or_else(|| "console=hvc0".to_string()),
+            assets,
             boot,
             ready,
         };
 
         // 診断のため scratch は残す。パスは stderr にだけ出す（JSON に載せない）。
-        let root = fresh_dir("vm-cold-start");
+        let scratch = Scratch::new("vm-cold-start", true);
+        let root = scratch.dir.clone();
         eprintln!("vm_cold_start: scratch at {}", root.display());
         let total_end = Instant::now() + Duration::from_secs(total_secs);
         let mut results = Vec::new();
@@ -900,7 +834,7 @@ mod tests {
 
     #[test]
     fn mac2_watcher_reports_boot_then_ready_from_real_file() {
-        let dir = fresh_dir("watcher-ok");
+        let dir = Scratch::new("watcher-ok", true).dir.clone();
         let path = dir.join("console.log");
         let stop = Arc::new(AtomicBool::new(false));
         let (h, rx) = spawn_watcher(
@@ -940,7 +874,7 @@ mod tests {
 
     #[test]
     fn mac2_watcher_stops_at_deadline_without_ready() {
-        let dir = fresh_dir("watcher-deadline");
+        let dir = Scratch::new("watcher-deadline", true).dir.clone();
         let path = dir.join("console.log");
         std::fs::write(&path, b"Linux version 6.1\n").expect("write boot");
         let stop = Arc::new(AtomicBool::new(false));

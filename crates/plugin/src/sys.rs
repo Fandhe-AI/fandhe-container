@@ -30,7 +30,7 @@
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
 //!   （排他ロック自体は std の `File::try_lock`。fork 用のコールバック登録は行わない。PLUG-12・TASK-123.2）
-//! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
+//! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も。macOS では非原子で `spawn_gate` の外。plugin 側で spawn する実装が現れたらゲートに載せる。#3262）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
@@ -2409,6 +2409,11 @@ fn connected_within_deadline(
 /// `InvalidInput`、期限超過は `TimedOut`、listener の backlog 満杯（Linux の `EAGAIN`）・`EINTR`・
 /// `EINPROGRESS` は期限までリトライする。connect 成功時も期限超過なら `TimedOut`。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
 /// fd は socket 作成直後に `UnixStream` へ所有させ、どの失敗経路でも close される。
+///
+/// close-on-exec（macOS。PLUG-7・SEC-1）: `socket` の後に `fcntl(F_SETFD)` で立てるため非原子で、`spawn_gate` の外。
+/// 今の利用者は plugin 側（`plugin-macos` の main）だけで、そこには spawn が無くホスト側のゲートも効かない。
+/// plugin 側で子を spawn する実装が現れたら、`socket` と `fcntl` を `spawn_gate::create_fds` で包み、その spawn を
+/// `spawn_gate::spawn` に載せること。https://github.com/Fandhe-AI/fandhe-container/issues/3262
 pub(crate) fn connect_unix(
     path: &std::path::Path,
     deadline: std::time::Instant,
@@ -2467,6 +2472,7 @@ pub(crate) fn connect_unix(
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
         #[cfg(target_os = "macos")]
         {
+            // 非原子（socket との間に窓がある）。spawn ゲートに載せない理由は関数 doc と #3262 を参照。
             // SAFETY: `fd` は `stream` が所有する有効な fd。F_SETFD は int 引数 1 つを取る。
             let rc = unsafe { abi::fcntl(fd, abi::F_SETFD, abi::FD_CLOEXEC) };
             if rc != 0 {

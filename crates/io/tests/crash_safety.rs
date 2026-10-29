@@ -34,6 +34,10 @@
 //! ここの小さい目標数の結合試験（`io3_harness_*`）は試行ループの挙動だけを確かめる（REPAIR-3）。
 //! Windows など UDS 未対応 OS では、未対応終了コード 5 を返すことだけを確かめる。
 
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。unix・other の両 mod から使う。
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "crash_safety/client_end.rs"]
 mod client_end;
@@ -119,8 +123,7 @@ mod unix {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 
@@ -944,8 +947,7 @@ mod other {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::REAP_WITHIN);
                 panic!("crash_test_server must exit within the deadline");
             }
             std::thread::sleep(Duration::from_millis(20));

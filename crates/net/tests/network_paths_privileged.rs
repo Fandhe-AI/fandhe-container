@@ -82,6 +82,8 @@
 //! masquerade 経由の外向き通信は未検証、ホスト役は実ホストでなく隔離 netns。値は暫定（`provisional`）で NET-2・NET-3 の
 //! 判定には使わない。詳細は `docs/design/net-tcp-rtt-bench.md`。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -374,8 +376,7 @@ mod linux {
     /// `extra_deadline` は保持モードの保持秒数（それ以外は 0）。ランチャの期限に上乗せする。
     pub fn launcher(extra: Vec<String>, extra_deadline: Duration) {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-paths-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-paths-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         // 専用プロセスグループで起動し、期限切れ時に inner・nsenter・その配下の子孫をまとめて停止できるようにする。

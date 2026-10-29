@@ -91,3 +91,9 @@ pub mod nftables_rules;
 pub mod pasta;
 #[cfg(target_os = "linux")]
 mod sys;
+
+// pid だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3375）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

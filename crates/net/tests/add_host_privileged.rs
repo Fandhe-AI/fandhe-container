@@ -18,6 +18,8 @@
 //! 外部コマンド・`/etc/nsswitch.conf` の `hosts:` に `files` を含むこと・hosts キャッシュが無いこと）を満たさない
 //! 場合は skip せず失敗する。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -105,8 +107,7 @@ mod linux {
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って子を起動する。
     pub fn launcher() {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-addhost-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-addhost-test").expect("create temp dir");
         // 管理ルートは symlink を含まない絶対パスで渡す契約（`apply_add_hosts` は正規化しない）。
         let dir = fs::canonicalize(&dir).expect("canonicalize temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");

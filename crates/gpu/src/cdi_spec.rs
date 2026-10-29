@@ -1457,8 +1457,8 @@ containerEdits:
     #[cfg(unix)]
     #[test]
     fn gpu1_reads_regular_and_rejects_device_via_symlink() {
-        let dir = std::env::temp_dir().join(format!("fandhe-cdi-spec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 前回の残骸（古い symlink 等）の上で進めない（連番・作成前削除・Drop。REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fandhe-cdi-spec", "regular");
         let file = dir.join("spec.yaml");
         std::fs::write(&file, "cdiVersion: '0.5.0'\nkind: a.b/c\n").unwrap();
         let link_ok = dir.join("ok.yaml");

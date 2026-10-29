@@ -1,4 +1,5 @@
-//! oci の結合試験が使う、残骸に強い一時ディレクトリの補助（OCI-7・REPAIR-12・#3237・#3298）。
+//! oci の結合試験と、`#[path]` で取り込む他 crate の試験（#3375）が使う、残骸に強い一時ディレクトリの補助
+//! （OCI-7・REPAIR-12・#3237・#3298）。
 //!
 //! 名前が pid だけの一時ディレクトリは、Windows の PID 再利用や panic で残った前回の残骸と衝突する。
 //! `image_management/inventory_persist.rs`（#3279）の `TestRoot` と同じ形で、

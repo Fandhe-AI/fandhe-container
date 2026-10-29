@@ -55,3 +55,9 @@ pub(crate) mod user_scope;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../../core/tests/support/scratch_root.rs"]
 mod scratch_root;
+
+// pid だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3375）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

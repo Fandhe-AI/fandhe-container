@@ -961,12 +961,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// NET-1・REPAIR-12(#3375): 前回の残骸（古い `ports.reg` と余計なディレクトリ）が同じ名前に残っていても
+    /// `test_root_at` が空に作り直し、共有ファイルの試験が古い予約を読まず、drop で消える。
+    #[test]
+    fn net1_repair12_test_root_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!(
+            "fc-portreg-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        std::fs::write(
+            p.join("ports.reg"),
+            "fandhe-portreg v1\ntcp 192.0.2.10 80 web c9\n",
+        )
+        .unwrap();
+        {
+            let root = crate::test_root::test_root_at(p.clone());
+            assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+            assert!(!root.join("ports.reg").exists());
+            // 元の失敗（排他作成）と同じ作成が通る。
+            std::fs::create_dir(root.join("sub")).unwrap();
+        }
+        assert!(!p.exists());
+    }
+
     /// NET-1・TASK-139.3: 共有ファイルの予約は別インスタンス（別プロセス相当）との競合を検出し、
     /// 解放は他方から見える。壊れた内容は fail-closed。
     #[test]
     fn net1_shared_registry_detects_cross_instance_conflicts() {
-        let dir = std::env::temp_dir().join(format!("fc-portreg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 残骸の上で進めないよう、連番つき・作成前削除・Drop 後始末の補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fc-portreg", "xinst");
         let path = dir.join("ports.reg");
         let _ = std::fs::remove_file(&path);
         let web = NetworkName::new("web").unwrap();

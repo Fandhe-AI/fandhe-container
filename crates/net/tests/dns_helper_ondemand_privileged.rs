@@ -34,6 +34,8 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない
 //! 場合は skip せず失敗する。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -200,8 +202,7 @@ mod linux {
     pub fn launcher() {
         require_root_and_tools();
         let dir =
-            std::env::temp_dir().join(format!("fandhe-dns-ondemand-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+            crate::exclusive_dir::create("fandhe-dns-ondemand-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")

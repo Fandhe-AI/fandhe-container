@@ -3306,9 +3306,8 @@ mod tests {
     #[test]
     fn plug7_accept_rejects_other_pid_and_accepts_expected() {
         use crate::transport::UdsStream;
-        use std::os::unix::fs::DirBuilderExt;
-        let dir = std::env::temp_dir().join(format!("fcos-unit-{}", std::process::id()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        // 残骸の socket / ディレクトリの上で進めない（連番・作成前削除・0700。REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fcos-unit", "unit");
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
@@ -3352,9 +3351,7 @@ mod tests {
     #[test]
     fn plug7_abort_is_checked_after_pid_mismatch() {
         use crate::transport::UdsStream;
-        use std::os::unix::fs::DirBuilderExt;
-        let dir = std::env::temp_dir().join(format!("fcos-abort-{}", std::process::id()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let dir = crate::test_root::test_root("fcos-abort", "abort");
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();

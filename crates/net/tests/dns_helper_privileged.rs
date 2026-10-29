@@ -32,6 +32,8 @@
 //!
 //! 実機（root）での実行結果は TASK-142（人間）が記録する。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -204,8 +206,7 @@ mod linux {
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、子を新しい netns・mount namespace で起動する。
     pub fn launcher() {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-dns-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-dns-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")
@@ -542,15 +543,10 @@ mod linux {
                 return ExitCode::from(2);
             };
             require_root_and_tools();
-            let dir =
-                std::env::temp_dir().join(format!("fandhe-dns-measure-{}", std::process::id()));
-            if fs::create_dir(&dir)
-                .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
-                .is_err()
-            {
+            let Ok(dir) = crate::exclusive_dir::create("fandhe-dns-measure") else {
                 err_line("INTERNAL", "cannot create temp dir");
                 return ExitCode::from(1);
-            }
+            };
             let Ok(exe) = std::env::current_exe() else {
                 err_line("INTERNAL", "current_exe failed");
                 return ExitCode::from(1);

@@ -250,8 +250,8 @@ mod tests {
         let (r, w) = create_fds(far(), std::io::pipe).unwrap();
         assert!(sys::fd_cloexec(r.as_fd()).unwrap());
         assert!(sys::fd_cloexec(w.as_fd()).unwrap());
-        let dir = std::env::temp_dir().join(format!("sg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 残骸の socket の上で bind が EADDRINUSE にならないよう補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("sg", "cloexec");
         let sock = dir.join("s");
         let l = create_fds(far(), || std::os::unix::net::UnixListener::bind(&sock)).unwrap();
         assert!(sys::fd_cloexec(l.as_fd()).unwrap());

@@ -276,11 +276,8 @@ mod linux {
                 effective_uid(&status) == Some(0),
                 "must run as root (euid 0)",
             )?;
-            let root = std::env::temp_dir().join(format!("fcio-pl-{}", std::process::id()));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+            let root = create_exclusive_dir("fcio-pl")
+                .map_err(|e| format!("cannot create fcio-pl dir under temp_dir: {e}"))?;
             let mnt = root.join("mnt");
             let dm_name = format!("fcio-pl-{}", std::process::id());
             require(is_valid_dm_name(&dm_name), "dm name charset")?;
@@ -508,14 +505,27 @@ mod linux {
         exact: bool,
     }
 
+    /// `temp_dir()/<prefix>-<pid>-<n>` を排他的に（0700 で）作る。root が予測できる名前を再帰削除すると
+    /// 削除と作成の間に先取りされる（マウントを伴う木もある）ため、既存のパスは消さず、`AlreadyExists` なら
+    /// 連番を進める。後始末は呼び出し側が行う（REPAIR-12・#3375）。
+    fn create_exclusive_dir(prefix: &str) -> std::io::Result<PathBuf> {
+        for n in 0..1000u32 {
+            let p = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => return Ok(p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "too many stale test directories",
+        ))
+    }
+
     /// 1 試行: 書く → (flush) → table を drop へ → SIGKILL → umount → 戻して mount → 照合。
     fn run_trial(rig: &mut Rig, index: usize, flush: bool) -> Result<Outcome, String> {
-        let sock_dir =
-            std::env::temp_dir().join(format!("fcio-pl-s-{}-{index}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&sock_dir)
-            .map_err(|e| e.to_string())?;
+        let sock_dir = create_exclusive_dir("fcio-pl-s").map_err(|e| e.to_string())?;
         let result = trial_inner(rig, index, flush, &sock_dir);
         let _ = std::fs::remove_dir_all(&sock_dir);
         result

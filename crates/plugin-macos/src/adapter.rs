@@ -1101,8 +1101,23 @@ mod tests {
 
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id()));
+        // 前回の残骸（古い kernel / initrd 等）があれば消してから作る（REPAIR-12・#3375）。
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d.canonicalize().expect("canon")
+    }
+
+    /// MAC-1・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと古い kernel）があっても `tmp_dir` が
+    /// 空のディレクトリを返す。
+    #[test]
+    fn mac1_repair12_tmp_dir_clears_stale_residue() {
+        let stale =
+            std::env::temp_dir().join(format!("fc-adapter-{}-stale-residue", std::process::id()));
+        std::fs::create_dir_all(stale.join("old")).expect("stale dir");
+        std::fs::write(stale.join("vmlinuz"), b"old").expect("stale file");
+        let d = tmp_dir("stale-residue");
+        assert_eq!(std::fs::read_dir(&d).expect("read_dir").count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn kernel(dir: &Path) -> String {
@@ -1612,6 +1627,7 @@ mod tests {
         let raw = std::env::temp_dir()
             .join(format!("fc-adapter-{}-share-temp", std::process::id()))
             .join("share");
+        // 親は `tmp_dir` が作成前に消して作り直した同じ場所（kernel を置いている）。ここでは消さない。
         std::fs::create_dir_all(&raw).expect("mkdir");
         let (mut a, f) = adapter();
         assert_eq!(

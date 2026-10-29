@@ -476,6 +476,8 @@ mod app {
 
         fn temp_dir(tag: &str) -> PathBuf {
             let dir = std::env::temp_dir().join(format!("fcio-dps-{}-{tag}", std::process::id()));
+            // 前回の残骸の上で進めない（REPAIR-12・#3375）。
+            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             dir
         }

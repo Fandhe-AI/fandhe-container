@@ -593,17 +593,11 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn io1_writeback_settings_bind_uses_own_receive_limits() {
-        use std::os::unix::fs::DirBuilderExt;
-
         let settings =
             WritebackSettings::from_batch_size_arg("8").expect("8 must be a valid batch size");
 
-        let dir =
-            std::env::temp_dir().join(format!("fcu-settings-bind-test-{}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("must be able to create a 0700 temp dir for the socket");
+        // 残骸の socket の上で bind が失敗しないよう、連番・作成前削除・0700 の補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fcu-settings-bind-test", "bind");
         let path = dir.join("sock");
 
         let server = settings

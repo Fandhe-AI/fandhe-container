@@ -2703,8 +2703,8 @@ mod tests {
     /// NET-1・TASK-139.4: 共有予約ファイルの解放に失敗したら `PortReservation` を `Present` で報告する。
     #[test]
     fn net1_delete_reservation_release_failure_is_reported() {
-        let dir = std::env::temp_dir().join(format!("fc-delete-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 前回の残骸の `ports.reg` ディレクトリ等の上で進めない（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fc-delete", "relfail");
         // ファイルの代わりにディレクトリを共有パスに指定し、ロックの open を失敗させる。
         let path = dir.join("ports.reg");
         std::fs::create_dir_all(&path).unwrap();

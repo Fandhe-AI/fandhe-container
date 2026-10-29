@@ -120,6 +120,8 @@ mod tests {
     #[test]
     fn mount_identity_distinguishes_mounts() {
         let dir = std::env::temp_dir().join(format!("fandhe-macos-sys-mnt-{}", std::process::id()));
+        // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).expect("create fixture");
         let a = mount_identity(&dir).expect("statfs dir");
         let b = mount_identity(&dir.join("sub")).expect("statfs sub");

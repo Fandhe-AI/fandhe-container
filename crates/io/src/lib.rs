@@ -170,3 +170,9 @@ pub use writeback::{
     WritebackStats, WritebackTimeouts, serve_connection, serve_connection_with_limit,
     serve_connection_with_recorder,
 };
+
+// pid だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3375）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

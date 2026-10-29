@@ -71,6 +71,8 @@
 //! 疑いとして名指しで失敗する。作成時の `IFLA_IFALIAS` はカーネルが反映しなかったため、作成後の
 //! `RTM_SETLINK` で付ける方式に直した（Issue #1925。実機での再確認は `bridge_owner_token_privileged`）。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "support/reap.rs"]
 mod reap;
 
@@ -198,8 +200,7 @@ mod linux {
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って子を起動する。
     pub fn launcher() {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-attach-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-attach-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")

@@ -210,14 +210,18 @@ mod tests {
     static N: AtomicU64 = AtomicU64::new(0);
 
     /// テストごとの一時ディレクトリ（Drop で削除）。
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
             let n = N.fetch_add(1, Ordering::Relaxed);
             let p =
                 std::env::temp_dir().join(format!("fandhe-guest-probe-{}-{n}", std::process::id()));
-            fs::create_dir_all(&p).unwrap();
-            Self(p)
+            Self::at(p)
+        }
+        /// 指定パスの残骸を消して作る（REPAIR-12・#3435）。
+        fn at(p: PathBuf) -> Self {
+            let root = crate::test_root::test_root_at(p.clone());
+            Self(p, root)
         }
         fn layout(&self) {
             fs::create_dir_all(self.0.join("in").join("dir")).unwrap();
@@ -228,10 +232,24 @@ mod tests {
             }
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+    /// MAC-1・REPAIR-12・#3435: 残骸（古い `out/` の中身）があっても作り直しで消え、drop で後始末される。
+    #[test]
+    fn mac1_repair12_tmp_clears_stale_residue() {
+        let p = std::env::temp_dir().join(format!(
+            "fandhe-guest-probe-residue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(p.join("out")).unwrap();
+        fs::write(p.join("out").join("stale.txt"), "old").unwrap();
+        {
+            let t = Tmp::at(p.clone());
+            assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
         }
+        assert!(!p.exists());
     }
 
     fn run(plan: ProbePlan, root: &Path) -> Vec<String> {

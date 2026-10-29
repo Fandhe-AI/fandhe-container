@@ -7,7 +7,9 @@
 //! 永続化（ファイルの fsync の後にディレクトリの fsync）を担う。
 //! - 書き込みは一時名（`<名前>.tmp`）へ完全に書いて fsync した後、上書き禁止の `link(2)` で最終名へ公開する。
 //!   既存の記録は上書きしない（`AlreadyExists`）。起動元が SIGKILL されても最終名には空・不完全な内容が現れず、
-//!   残った一時名は排他ロックを持つ次の操作（読み取り・書き込み・ネットワーク削除）が回収する
+//!   残った一時名は排他ロックを持つ次の操作（読み取り・書き込み・ネットワーク削除）が回収する。
+//!   唯一の例外が意図記録の置き換え（`replace_dns_helper_intent`。#3344）で、識別行の照合後に同一性を足すため、
+//!   同じ一時名へ書いて fsync し `rename(2)` で原子的に置き換える（消してから書くと nonce を失う窓ができる）
 //! - 共有ロックの guard からの書き込み・削除は `FailedPrecondition`（排他の下でしか変えない）
 //! - 読み取りは 4096 バイトを上限にし、サイズを検証してから確保する。壊れた記録は `DataLoss` で、自動修復しない
 //! - エラー文言に pid・ネットワーク名・アドレスを含めない
@@ -119,6 +121,45 @@ impl NetworkLockGuard<'_> {
         Ok(())
     }
 
+    /// 既存の記録を、一時名へ完全に書いて fsync した後の `rename(2)` で原子的に置き換える（#3344）。
+    /// 途中で中断されても、最終名には古い内容か新しい内容のどちらかが完全に残る。一時名は固定名のままなので
+    /// [`discard_stale_temps`] が残骸を回収する。
+    fn replace_record_bytes(&self, name: &str, bytes: &[u8]) -> Result<(), NetError> {
+        self.require_exclusive()?;
+        if bytes.len() > RECORD_MAX_BYTES {
+            return Err(err(
+                NetErrorCode::InvalidArgument,
+                "network record exceeds the size limit",
+            ));
+        }
+        self.discard_stale_temps()?;
+        let final_path = self.dir.path(name);
+        let tmp_path = self.dir.path(&temp_name(name));
+        let msg = "failed to replace network record";
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .custom_flags(FLAGS_FILE)
+            .open(&tmp_path)
+            .map_err(|e| map_io(&e, msg))?;
+        let written = f
+            .set_permissions(fs::Permissions::from_mode(FILE_MODE))
+            .and_then(|()| f.write_all(bytes))
+            .and_then(|()| f.sync_all());
+        drop(f);
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(map_io(&e, msg));
+        }
+        if let Err(e) = fs::rename(&tmp_path, &final_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(map_io(&e, msg));
+        }
+        // 置き換え後の名前の永続化。失敗しても古い内容か新しい内容のどちらかが完全に残るので消さずに返す。
+        self.dir.sync()
+    }
+
     fn remove_record(&self, name: &str) -> Result<(), NetError> {
         self.require_exclusive()?;
         match fs::remove_file(self.dir.path(name)) {
@@ -187,6 +228,36 @@ impl NetworkLockGuard<'_> {
             &*self.recorder,
             NetOpKind::NetworkStoreDnsHelperWrite,
             || self.write_record_bytes(DNS_HELPER_INTENT_FILE, &rec.encode()),
+        )
+    }
+
+    /// 既存の意図記録を、同一性つきの記録へ原子的に置き換える（#3344。識別行の照合後、`dns-helper` を書く前）。
+    /// 排他ロックの下に限る。意図記録が無ければ `NotFound`、ネットワーク名が違えば `InvalidArgument`、
+    /// nonce・待受アドレスが既存と違えば（別の起動の記録）何も書かず `FailedPrecondition`。
+    pub fn replace_dns_helper_intent(&self, rec: &DnsHelperIntent) -> Result<(), NetError> {
+        self.require_exclusive()?;
+        if rec.network() != &self.name {
+            return Err(err(
+                NetErrorCode::InvalidArgument,
+                "dns helper intent record names a different network",
+            ));
+        }
+        let Some(cur) = self.read_dns_helper_intent()? else {
+            return Err(err(
+                NetErrorCode::NotFound,
+                "dns helper intent record does not exist",
+            ));
+        };
+        if cur.nonce() != rec.nonce() || cur.listen() != rec.listen() {
+            return Err(err(
+                NetErrorCode::FailedPrecondition,
+                "dns helper intent record belongs to a different launch",
+            ));
+        }
+        record_net_op(
+            &*self.recorder,
+            NetOpKind::NetworkStoreDnsHelperWrite,
+            || self.replace_record_bytes(DNS_HELPER_INTENT_FILE, &rec.encode()),
         )
     }
 
@@ -560,6 +631,86 @@ mod tests {
         assert_eq!(r, IntentRecovery::Recovered { stopped: 0 });
         assert!(!std::path::Path::new(&stat).exists(), "zombie reaped");
         assert_eq!(n.read_dns_helper_intent().expect("read"), None);
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-7・REPAIR-2・SEC-1・#3344: 意図記録は同一性つきに原子的に置き換わり、0600・nlink 1 のまま。
+    /// 無ければ `NotFound`、別の起動（nonce・listen 違い）と共有ロックは拒否して元の記録を残す。
+    #[test]
+    fn net7_3344_replace_intent_adds_identity() {
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        let id = ProcessIdentity {
+            pid: 77,
+            start_time_ticks: 12345,
+            boot_id: BootId::new("0a1b2c3d-4e5f-6789-abcd-ef0123456789").expect("boot"),
+        };
+        let upgraded = intent().with_identity(id.clone()).expect("id");
+        let g = st.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        assert_eq!(
+            n.replace_dns_helper_intent(&upgraded)
+                .expect_err("none")
+                .code(),
+            NetErrorCode::NotFound
+        );
+        n.write_dns_helper_intent(&intent()).expect("intent");
+        let other_nonce = DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::new("ffeeddccbbaa99887766554433221100").expect("nonce"),
+            DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5353).expect("listen"),
+        );
+        let other_listen = DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::new("00112233445566778899aabbccddeeff").expect("nonce"),
+            DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5354).expect("listen"),
+        );
+        for bad in [other_nonce, other_listen] {
+            assert_eq!(
+                n.replace_dns_helper_intent(&bad)
+                    .expect_err("mismatch")
+                    .code(),
+                NetErrorCode::FailedPrecondition
+            );
+            assert_eq!(n.read_dns_helper_intent().expect("read"), Some(intent()));
+        }
+        n.replace_dns_helper_intent(&upgraded).expect("replace");
+        assert_eq!(n.read_dns_helper_intent().expect("read"), Some(upgraded));
+        let p = dir.join("@networks/web/dns-helper.intent");
+        let m = fs::metadata(&p).expect("meta");
+        assert_eq!(m.mode() & 0o7777, 0o600);
+        assert_eq!(m.nlink(), 1);
+        assert!(!dir.join("@networks/web/dns-helper.intent.tmp").exists());
+        // 一時名の残骸は次の排他操作が回収する。
+        fs::write(dir.join("@networks/web/dns-helper.intent.tmp"), b"junk").expect("junk");
+        n.replace_dns_helper_intent(&intent().with_identity(id).expect("id"))
+            .expect("replace again");
+        assert!(!dir.join("@networks/web/dns-helper.intent.tmp").exists());
+        drop(n);
+        drop(g);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// NET-7・SEC-1・#3344: 共有ロックからは意図記録を置き換えられない。
+    #[test]
+    fn net7_3344_replace_intent_requires_exclusive() {
+        let (dir, st) = store();
+        let name = NetworkName::new("web").expect("name");
+        {
+            let g = st.lock_global_exclusive().expect("global");
+            let n = g.lock_network(&name).expect("net");
+            n.write_dns_helper_intent(&intent()).expect("intent");
+        }
+        let g = st.lock_global_shared().expect("global");
+        let n = g.lock_network_shared(&name).expect("net");
+        assert_eq!(
+            n.replace_dns_helper_intent(&intent())
+                .expect_err("shared")
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
         drop(n);
         drop(g);
         let _ = fs::remove_dir_all(dir);

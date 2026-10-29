@@ -28,7 +28,9 @@
 //! 前に生きたテーブルのハンドルと照合する（テーブルが作り直されていれば rule handle は古く、削除に使わない）。`publish` が
 //! 1 件以上あるときだけ `table-handle` を置く。`publish` の値は `tcp|udp <ipv4>:<host-port> <container-port> <prerouting> <output>`
 //! の正準形だけを受ける（解除の意図を DELRULE の前に残した公開には末尾に ` unpublishing` が付く。再起動後に ENOENT を
-//! 「既に消えた」と扱う唯一の根拠で、テーブルハンドルの照合後にだけ使う）。公開の無い旧形式（#3067）はそのまま読める。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
+//! 「既に消えた」と扱う唯一の根拠で、テーブルハンドルの照合後にだけ使う。DELRULE で 2 本が消えたことを確かめたが
+//! 予約をまだ解放していない公開〔墓標〕には末尾に ` unpublished` が付く。墓標と完全に一致する値だけが、カーネル操作なしで
+//! 予約の解放を完了できる。#3343）。不変条件: 記録に受け口の行がある間は、その予約を解放しない（解放は行を外した後）。公開の無い旧形式（#3067）はそのまま読める。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
 
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -135,8 +137,19 @@ pub struct RecordedPublish {
     publish: PortPublish,
     prerouting: NftRuleHandle,
     output: NftRuleHandle,
-    /// 解除の意図を DELRULE の前に残した印（再起動後に ENOENT を「既に消えた」と扱ってよい根拠。NET-3・#3068）。
-    unpublishing: bool,
+    /// 公開の状態（解除の意図の印・墓標。NET-3・#3068・#3343）。
+    state: PublishState,
+}
+
+/// 記録した公開の状態（`publish` 行の末尾の token に対応。NET-3・#3068・#3343）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishState {
+    /// 公開中（token なし）。
+    Active,
+    /// 解除の意図を DELRULE の前に残した（` unpublishing`）。再起動後に ENOENT を「既に消えた」と扱ってよい根拠。
+    Unpublishing,
+    /// DELRULE でルール 2 本が消えたことを確かめた墓標（` unpublished`）。予約はまだ解放していない。
+    Unpublished,
 }
 
 impl RecordedPublish {
@@ -146,13 +159,22 @@ impl RecordedPublish {
             publish,
             prerouting,
             output,
-            unpublishing: false,
+            state: PublishState::Active,
         }
     }
 
     /// 解除の意図の印が付いているか（DELRULE の前に記録される。付いた記録は再起動後の解除の回復に使う）。
     pub fn unpublishing(&self) -> bool {
-        self.unpublishing
+        self.state == PublishState::Unpublishing
+    }
+
+    /// 墓標（ルールの削除を確かめ済みで、予約の解放だけが残る）か。
+    pub fn unpublished(&self) -> bool {
+        self.state == PublishState::Unpublished
+    }
+
+    pub(crate) fn state(&self) -> PublishState {
+        self.state
     }
 
     /// 公開の指定（受け口とコンテナ側ポート）。
@@ -182,10 +204,10 @@ impl RecordedPublish {
             self.publish.container_port(),
             self.prerouting.get(),
             self.output.get(),
-            if self.unpublishing {
-                " unpublishing"
-            } else {
-                ""
+            match self.state {
+                PublishState::Active => "",
+                PublishState::Unpublishing => " unpublishing",
+                PublishState::Unpublished => " unpublished",
             }
         )
     }
@@ -194,9 +216,10 @@ impl RecordedPublish {
     pub(crate) fn decode(v: &str) -> Result<Self, NetError> {
         let malformed = || bad("member publish is malformed");
         let parts: Vec<&str> = v.split(' ').collect();
-        let (proto, listener, cport, pre, out, unpublishing) = match parts.as_slice() {
-            [a, b, c, d, e] => (a, b, c, d, e, false),
-            [a, b, c, d, e, "unpublishing"] => (a, b, c, d, e, true),
+        let (proto, listener, cport, pre, out, state) = match parts.as_slice() {
+            [a, b, c, d, e] => (a, b, c, d, e, PublishState::Active),
+            [a, b, c, d, e, "unpublishing"] => (a, b, c, d, e, PublishState::Unpublishing),
+            [a, b, c, d, e, "unpublished"] => (a, b, c, d, e, PublishState::Unpublished),
             _ => return Err(malformed()),
         };
         let protocol = match *proto {
@@ -216,7 +239,7 @@ impl RecordedPublish {
             NftRuleHandle::new(pre).map_err(|_| malformed())?,
             NftRuleHandle::new(out).map_err(|_| malformed())?,
         );
-        rec.unpublishing = unpublishing;
+        rec.state = state;
         if rec.encode() != v {
             return Err(bad("member publish is not canonical"));
         }
@@ -301,12 +324,14 @@ impl MemberRecord {
 
     /// netns の pin の識別子を載せる（#3347）。記録だけから detach するとき、請求書の `pin` として三者照合
     /// （識別子 ↔ `.owned/<endpoint>` の所有記録 ↔ カーネルの実状態）に使う。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn with_pin(mut self, pin: PinIdentity) -> Self {
         self.pin = Some(pin);
         self
     }
 
     /// 記録した netns の pin の識別子（旧形式の記録・控えられなかった接続では `None`）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn pin(&self) -> Option<PinIdentity> {
         self.pin
     }
@@ -358,7 +383,25 @@ impl MemberRecord {
                 "publish is not recorded for the member",
             ));
         };
-        p.unpublishing = true;
+        p.state = PublishState::Unpublishing;
+        Ok(next)
+    }
+
+    /// 指定した受け口の公開を墓標（ルールの削除を確かめ済みで予約が残る状態）にした記録を返す（#3343）。
+    /// 記録に無ければ `NotFound`。
+    pub fn with_unpublished(&self, publish: &PortPublish) -> Result<Self, NetError> {
+        let mut next = self.clone();
+        let Some(p) = next
+            .publishes
+            .iter_mut()
+            .find(|p| p.publish.same_listener(publish))
+        else {
+            return Err(NetError::new(
+                NetErrorCode::NotFound,
+                "publish is not recorded for the member",
+            ));
+        };
+        p.state = PublishState::Unpublished;
         Ok(next)
     }
 
@@ -373,7 +416,14 @@ impl MemberRecord {
     pub fn is_unpublishing(&self, publish: &PortPublish) -> bool {
         self.publishes
             .iter()
-            .any(|p| p.unpublishing && p.publish.same_listener(publish))
+            .any(|p| p.state == PublishState::Unpublishing && p.publish.same_listener(publish))
+    }
+
+    /// 指定した受け口の公開が墓標か。
+    pub fn is_unpublished(&self, publish: &PortPublish) -> bool {
+        self.publishes
+            .iter()
+            .any(|p| p.state == PublishState::Unpublished && p.publish.same_listener(publish))
     }
 
     /// 指定した受け口の公開を外した記録を返す。最後の 1 件を外したら `table-handle` も外す。
@@ -396,25 +446,64 @@ impl MemberRecord {
     /// 記録から公開の個別解除に使う [`PublishedPort`] を復元する（dump は使わない。再起動後の経路。#3068）。
     ///
     /// ネットワーク名と所有トークンは同じネットワークの `realized` から、テーブルハンドルは記録から取る。
-    /// 解除（`unpublish_ports_with`）が生きたテーブルのハンドルと照合する。
+    /// 解除（`unpublish_ports_with`）が生きたテーブルのハンドルと照合する。墓標（#3343）は含めない
+    /// （ルールは既に無く、`detach_container` へ渡すと消えたルールへ DELRULE する。墓標は `unpublished_ports`）。
     // 呼び出し元の `network::recorded` の復元口は OS 非依存の本体だが、実機の呼び出しは Linux 限定。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn published_ports(&self, realized: &RealizedRecord) -> Vec<PublishedPort> {
+        self.restore(realized, |s| s != PublishState::Unpublished)
+    }
+
+    /// 墓標（ルールの削除を確かめ済みで予約の解放だけが残る公開）を [`PublishedPort`] として復元する（#3343）。
+    /// 返した値は `unpublish_port_recorded` にだけ渡す（カーネル操作なしで予約の解放を完了する）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn unpublished_ports(&self, realized: &RealizedRecord) -> Vec<PublishedPort> {
+        self.restore(realized, |s| s == PublishState::Unpublished)
+    }
+
+    /// 記録した公開（全状態）のうち、`published` と完全に一致するものの状態（一致が無ければ `None`。#3343）。
+    // 呼び出し元の `unpublish_port_recorded_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn publish_state_of(
+        &self,
+        realized: &RealizedRecord,
+        published: &PublishedPort,
+    ) -> Option<PublishState> {
+        let handle = self.table_handle?;
+        self.publishes
+            .iter()
+            .find(|p| self.to_published(realized, p, handle) == *published)
+            .map(|p| p.state)
+    }
+
+    fn to_published(
+        &self,
+        realized: &RealizedRecord,
+        p: &RecordedPublish,
+        handle: NftTableHandle,
+    ) -> PublishedPort {
+        PublishedPort::new(
+            realized.name(),
+            realized.token(),
+            &self.endpoint,
+            p.publish,
+            (p.prerouting, p.output),
+        )
+        .with_table_handle(handle)
+    }
+
+    fn restore(
+        &self,
+        realized: &RealizedRecord,
+        keep: impl Fn(PublishState) -> bool,
+    ) -> Vec<PublishedPort> {
         let Some(handle) = self.table_handle else {
             return Vec::new();
         };
         self.publishes
             .iter()
-            .map(|p| {
-                PublishedPort::new(
-                    realized.name(),
-                    realized.token(),
-                    &self.endpoint,
-                    p.publish,
-                    (p.prerouting, p.output),
-                )
-                .with_table_handle(handle)
-            })
+            .filter(|p| keep(p.state))
+            .map(|p| self.to_published(realized, p, handle))
             .collect()
     }
 
@@ -770,6 +859,44 @@ mod tests {
         );
     }
 
+    /// NET-3・SEC-1・#3343: 墓標は ` unpublished` として符号化され往復し、他の公開に波及しない。2 つの token の併記・
+    /// 未知の token・大文字は `DataLoss`。
+    #[test]
+    fn net3_3343_member_unpublished_tombstone_roundtrip() {
+        let m = with_two()
+            .with_unpublished(&publish(PortProtocol::Udp, 5353, 80))
+            .unwrap();
+        let base = String::from_utf8(member(&[]).encode()).unwrap();
+        let expected = format!(
+            "{base}table-handle 2\n42\npublish 26\ntcp 192.0.2.10:8080 80 2 3\npublish 38\nudp 192.0.2.10:5353 80 4 5 unpublished\n"
+        );
+        assert_eq!(m.encode(), expected.as_bytes());
+        let back = MemberRecord::decode(&m.encode()).unwrap();
+        assert_eq!(back, m);
+        assert!(back.is_unpublished(&publish(PortProtocol::Udp, 5353, 80)));
+        assert!(!back.is_unpublishing(&publish(PortProtocol::Udp, 5353, 80)));
+        assert!(!back.is_unpublished(&publish(PortProtocol::Tcp, 8080, 80)));
+        assert!(
+            member(&[])
+                .with_unpublished(&publish(PortProtocol::Tcp, 1, 80))
+                .is_err()
+        );
+        for bad in [
+            "unpublishing unpublished",
+            "unpublished unpublishing",
+            "unpublished unpublished",
+            "Unpublished",
+            "unpublish",
+        ] {
+            let text = format!(
+                "{base}table-handle 2\n42\npublish {}\ntcp 192.0.2.10:8080 80 2 3 {bad}\n",
+                "tcp 192.0.2.10:8080 80 2 3 ".len() + bad.len()
+            );
+            let e = MemberRecord::decode(text.as_bytes()).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{bad}");
+        }
+    }
+
     /// NET-3・REPAIR-2・#3068: 公開まわりの不正な記録はすべて `DataLoss`。
     #[test]
     fn net3_3068_member_publish_decode_rejects_malformed() {
@@ -909,6 +1036,17 @@ mod tests {
             bytes.len()
         );
         assert_eq!(MemberRecord::decode(&bytes).unwrap(), m);
+        // 全件に最長の印（` unpublishing`）を付けても収まる（#3343。墓標 ` unpublished` はそれより 1 バイト短い）。
+        let marked = m.publishes().to_vec().iter().fold(m.clone(), |acc, p| {
+            acc.with_unpublishing(p.publish()).unwrap()
+        });
+        let bytes = marked.encode();
+        assert!(
+            bytes.len() <= RECORD_MAX_BYTES,
+            "{} > {RECORD_MAX_BYTES}",
+            bytes.len()
+        );
+        assert_eq!(MemberRecord::decode(&bytes).unwrap(), marked);
     }
 
     #[test]

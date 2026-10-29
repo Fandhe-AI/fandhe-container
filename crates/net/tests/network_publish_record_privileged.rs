@@ -29,6 +29,11 @@
 //!   復元すると同じ入口が収束する: host veth・pin・`.owned`・その DNAT 2 本・メンバー記録が消え、別メンバーの
 //!   veth・DNAT・記録は残る
 //!
+//! - (8) 墓標（#3343）: 共有の予約ファイルを壊して解放を失敗させ、DELRULE 成功後の墓標を永続化する。ストアを
+//!   開き直して `restore_unpublished_ports` で墓標を復元し（通常の復元には含まれない）、予約ファイルを直して
+//!   `unpublish_port_recorded` を再試行すると、DELRULE を送らず予約だけが解放される。他の公開の DNAT は変わらず、
+//!   解放された受け口は別コンテナが再び公開できる（NET-3・SEC-1・REPAIR-12）
+//!
 //! 子は `unshare --net --mount` の中（netns の pin の bind mount を mount namespace に閉じる）。
 //! 成功行は `network_publish_record_privileged: ok` の 1 行。待ちは `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない場合は skip せず失敗する。
@@ -66,7 +71,7 @@ mod linux {
     use fandhe_container_net::network::recorded::{
         RecordedError, attach_container_recorded, create_network_recorded,
         detach_container_recorded, detach_member_recorded, restore_published_ports,
-        unpublish_port_recorded,
+        restore_unpublished_ports, unpublish_port_recorded,
     };
     use fandhe_container_net::network::{
         ContainerAttachSpec, EndpointId, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish,
@@ -196,6 +201,7 @@ mod linux {
         }
         let result = scenario(&route, &nft, &base, t)
             .and_then(|()| reclaim_scenario(&route, &nft, &base, t))
+            .and_then(|()| tombstone_scenario(&route, &nft, &base, t))
             .and_then(|()| member_detach_scenario(&route, &nft, &base, t));
         if let Err(e) = result {
             fail(&e);
@@ -773,6 +779,15 @@ mod linux {
                 .table
         };
         // 孫が attach して終わる（ロックは孫が取る。ここでは保持しない）。
+        let veth_count = || -> Result<usize, String> {
+            Ok(run("ip", &["-o", "link", "show", "type", "veth"])?
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count())
+        };
+        // 先行の場面（scenario・reclaim_scenario）が同じ netns に残した host veth があるため、
+        // 絶対数ではなく孫の attach 前からの増分で数える。
+        let veth_before = veth_count()?;
         let exe = std::env::current_exe().map_err(e)?;
         let exe = exe.to_string_lossy().into_owned();
         let parent_ns = netns_id()?;
@@ -787,14 +802,8 @@ mod linux {
             ],
         )
         .map_err(|x| format!("attach-only child: {x}"))?;
-        let veth_count = || -> Result<usize, String> {
-            Ok(run("ip", &["-o", "link", "show", "type", "veth"])?
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count())
-        };
         // veth は host 側と container 側（netns pin の中）で、host 側 netns からは host 側の 2 本が見える。
-        if veth_count()? != 2 {
+        if veth_count()? != veth_before + 2 {
             return Err("two host veths must exist after the attach-only child".to_owned());
         }
         if dnat_count(&table, 8101)? != 2 || dnat_count(&table, 8102)? != 2 {
@@ -851,7 +860,7 @@ mod linux {
         if dnat_count(&table, 8101)? != 0 || dnat_count(&table, 8102)? != 2 {
             return Err("only m1's DNAT rules must be removed".to_owned());
         }
-        if veth_count()? != 1 {
+        if veth_count()? != veth_before + 1 {
             return Err("exactly m2's host veth must remain".to_owned());
         }
         let members: Vec<String> = n
@@ -863,6 +872,152 @@ mod linux {
         if members != vec!["m2".to_owned()] || !ns_dir.join("m2").exists() || !owned("m2").exists()
         {
             return Err(format!("m2 must stay intact: {members:?}"));
+        }
+        Ok(())
+    }
+
+    /// 墓標の保存・復元・予約だけの解放の完了（#3343）。
+    fn tombstone_scenario(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        base: &Path,
+        t: Duration,
+    ) -> Result<(), String> {
+        fn e(x: impl std::fmt::Display) -> String {
+            x.to_string()
+        }
+        let dir = &base.join("store");
+        let ns_dir = base.join("ns");
+        let reg_dir = base.join("reg");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&reg_dir)
+            .map_err(e)?;
+        let reg_path = reg_dir.join("ports.reg");
+        let subnet = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 233, 0, 0)), 24).map_err(e)?;
+        let gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 233, 0, 1)), 24).map_err(e)?;
+        let name = NetworkName::new("tomb").map_err(e)?;
+        let def = NetworkDefinition::bridge("tomb", subnet).map_err(e)?;
+        let store = NetworkStore::open(dir).map_err(e)?;
+        store.create(&def).map_err(e)?;
+        let publish = |host_port: u16| {
+            PortPublish::new(
+                PortProtocol::Tcp,
+                Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .map_err(e)
+        };
+        let (pub_a, pub_b) = (publish(8101)?, publish(8102)?);
+        let t0 = MemberId::new("t0").map_err(e)?;
+        let table;
+        let created;
+        let good;
+        {
+            let g = store.lock_global_exclusive().map_err(e)?;
+            let n = g.lock_network(&name).map_err(e)?;
+            let spec = NetworkCreateSpec::new(name.clone(), gateway).map_err(e)?;
+            created = create_network_recorded(route, nft, &n, &def, &spec, t)
+                .map_err(|x| format!("create_network_recorded(tomb): {x:?}"))?;
+            table = created.table.clone();
+            let spec0 = ContainerAttachSpec::new(
+                EndpointId::new("t0").map_err(e)?,
+                &created,
+                ns_dir.clone(),
+            )
+            .and_then(|s| s.with_port_publishes(vec![pub_a, pub_b]))
+            .map_err(e)?;
+            let mut ports = PortRegistry::with_shared_file(reg_path.clone());
+            attach_container_recorded(route, nft, &n, &t0, &spec0, &[], &mut ports, t)
+                .map_err(|x| format!("attach_container_recorded(t0): {x:?}"))?;
+            good = fs::read(&reg_path).map_err(e)?;
+            if dnat_count(&table, 8101)? != 2 || dnat_count(&table, 8102)? != 2 {
+                return Err("t0 must have 2 DNAT rules per published port".to_owned());
+            }
+            // 予約ファイルを壊して解放だけを失敗させる。DELRULE は成功し、墓標が書かれる。
+            let mut restored = restore_published_ports(nft, &n, &t0).map_err(e)?;
+            let idx = restored
+                .iter()
+                .position(|p| *p.publish() == pub_a)
+                .ok_or("restored t0 lacks 8101")?;
+            let target = restored.remove(idx);
+            fs::write(&reg_path, b"garbage\n").map_err(e)?;
+            match unpublish_port_recorded(nft, &n, &t0, target, &mut ports, t) {
+                Err(RecordedError::Op(err))
+                    if err.rules == UnpublishRules::Removed && err.reservation_held => {}
+                other => {
+                    return Err(format!(
+                        "unpublish must fail with Removed and a held reservation (ok={})",
+                        other.is_ok()
+                    ));
+                }
+            }
+        }
+        if dnat_count(&table, 8101)? != 0 || dnat_count(&table, 8102)? != 2 {
+            return Err("after the failed release: 8101 gone, 8102 untouched".to_owned());
+        }
+        // 再起動の模擬: 予約ファイルを直し、ストアを開き直して墓標を復元する。
+        fs::write(&reg_path, &good).map_err(e)?;
+        let store = NetworkStore::open(dir).map_err(e)?;
+        let g = store.lock_global_exclusive().map_err(e)?;
+        let n = g.lock_network(&name).map_err(e)?;
+        let live = restore_published_ports(nft, &n, &t0).map_err(e)?;
+        if live.len() != 1 || *live[0].publish() != pub_b {
+            return Err(format!(
+                "only 8102 may be a live publish, got {}",
+                live.len()
+            ));
+        }
+        let mut tomb = restore_unpublished_ports(nft, &n, &t0).map_err(e)?;
+        if tomb.len() != 1 || *tomb[0].publish() != pub_a {
+            return Err(format!(
+                "expected one tombstone for 8101, got {}",
+                tomb.len()
+            ));
+        }
+        let members_before = n.members().map_err(e)?;
+        if members_before.len() != 1 || !members_before[0].is_unpublished(&pub_a) {
+            return Err("the member record must hold the tombstone".to_owned());
+        }
+        // 再試行: DELRULE を送らず予約だけを解放する。
+        let mut ports = PortRegistry::with_shared_file(reg_path.clone());
+        unpublish_port_recorded(nft, &n, &t0, tomb.remove(0), &mut ports, t)
+            .map_err(|x| format!("tombstone retry: {x:?}"))?;
+        if dnat_count(&table, 8101)? != 0 || dnat_count(&table, 8102)? != 2 {
+            return Err("the retry must not change any DNAT rule".to_owned());
+        }
+        let after = n.members().map_err(e)?;
+        if after.len() != 1
+            || after[0].publishes().len() != 1
+            || !after[0].has_publish(&pub_b)
+            || after[0].has_publish(&pub_a)
+        {
+            return Err("the record must keep only 8102 after the retry".to_owned());
+        }
+        if !restore_unpublished_ports(nft, &n, &t0)
+            .map_err(e)?
+            .is_empty()
+        {
+            return Err("the tombstone must be gone after the retry".to_owned());
+        }
+        // 解放の確認: 8101 は別コンテナが再び公開でき、8102 の予約は残る。
+        let spec1 = ContainerAttachSpec::new(EndpointId::new("t1").map_err(e)?, &created, ns_dir)
+            .and_then(|s| s.with_port_publishes(vec![pub_a]))
+            .map_err(e)?;
+        attach_container_recorded(
+            route,
+            nft,
+            &n,
+            &MemberId::new("t1").map_err(e)?,
+            &spec1,
+            &[],
+            &mut ports,
+            t,
+        )
+        .map_err(|x| format!("8101 must be reservable again after the retry: {x:?}"))?;
+        if dnat_count(&table, 8101)? != 2 || dnat_count(&table, 8102)? != 2 {
+            return Err("after re-publishing 8101: both must have 2 DNAT rules".to_owned());
         }
         Ok(())
     }

@@ -21,7 +21,7 @@
 //! master の一致で行う。netns の pin の置き場は記録に載せず、呼び出し側の固定設定から受ける。
 
 use crate::error::NetError;
-use crate::network_store::member::{RecordedPublish, check_publishes};
+use crate::network_store::member::{PublishState, RecordedPublish, check_publishes};
 use crate::nftables_batch::NftTableHandle;
 
 use super::{
@@ -52,7 +52,7 @@ impl ClaimedRules {
     pub(crate) fn new(table: NftTableHandle, ports: Vec<RecordedPublish>) -> Option<Self> {
         let sound = !ports.is_empty()
             && ports.len() <= MAX_PORT_PUBLISHES
-            && !ports.iter().any(RecordedPublish::unpublishing)
+            && ports.iter().all(|p| p.state() == PublishState::Active)
             && check_publishes(&ports).is_ok();
         sound.then_some(Self { table, ports })
     }

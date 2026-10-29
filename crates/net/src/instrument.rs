@@ -89,6 +89,12 @@ pub enum NetOpKind {
     NetworkStoreIpamRebuild,
     /// 回収待ちの請求書の書き込み・削除（`pending-reclaim/`。NET-1・REPAIR-4・#3067）。
     NetworkStoreReclaimWrite,
+    /// DNS ヘルパーの記録（`dns-helper`・`dns-helper.intent`）の書き込み（NET-5・NET-7・REPAIR-4・#3070）。
+    NetworkStoreDnsHelperWrite,
+    /// DNS ヘルパーの記録の削除（NET-5・NET-7・REPAIR-4・#3070）。
+    NetworkStoreDnsHelperRemove,
+    /// 起動窓の意図記録の回収（`recover_dns_helper_intent`。NET-5・NET-7・REPAIR-4・#3070）。
+    DnsHelperRecover,
 }
 
 impl NetOpKind {
@@ -121,6 +127,9 @@ impl NetOpKind {
             NetOpKind::NetworkStoreRealizedRemove => "network.store.realized_remove",
             NetOpKind::NetworkStoreIpamRebuild => "network.store.ipam_rebuild",
             NetOpKind::NetworkStoreReclaimWrite => "network.store.reclaim_write",
+            NetOpKind::NetworkStoreDnsHelperWrite => "network.store.dns_helper_write",
+            NetOpKind::NetworkStoreDnsHelperRemove => "network.store.dns_helper_remove",
+            NetOpKind::DnsHelperRecover => "dns.helper.recover",
         }
     }
 }
@@ -295,7 +304,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 26] = [
+    const ALL_KINDS: [NetOpKind; 29] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -322,6 +331,9 @@ mod tests {
         NetOpKind::NetworkStoreRealizedRemove,
         NetOpKind::NetworkStoreIpamRebuild,
         NetOpKind::NetworkStoreReclaimWrite,
+        NetOpKind::NetworkStoreDnsHelperWrite,
+        NetOpKind::NetworkStoreDnsHelperRemove,
+        NetOpKind::DnsHelperRecover,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -367,6 +379,15 @@ mod tests {
             NetOpKind::NetworkStoreReclaimWrite.as_str(),
             "network.store.reclaim_write"
         );
+        assert_eq!(
+            NetOpKind::NetworkStoreDnsHelperWrite.as_str(),
+            "network.store.dns_helper_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreDnsHelperRemove.as_str(),
+            "network.store.dns_helper_remove"
+        );
+        assert_eq!(NetOpKind::DnsHelperRecover.as_str(), "dns.helper.recover");
         assert_eq!(NetOpKind::PastaStart.as_str(), "pasta.start");
         assert_eq!(NetOpKind::PastaStop.as_str(), "pasta.stop");
     }

@@ -13,6 +13,8 @@
 //! ├── @removing-<一意値>/         削除途中（同上）
 //! └── <name>/                    0700
 //!     ├── definition             0600。FCNET1
+//!     ├── dns-helper             0600。起動済み DNS ヘルパーの記録 FCDNSH1（pid・開始時刻・boot id。#3070）
+//!     ├── dns-helper.intent      0600。起動窓の意図記録 FCDNSI1（起動の前に書き、記録の確定後に消す。#3070）
 //!     ├── @lock                  0600。ネットワークのロック
 //!     ├── realized               0600。FCREA1（作成済みのカーネル資源。#3067）
 //!     ├── realized.intent        0600。FCRIN1（作成・削除の操作中。残っていれば未完了）
@@ -41,7 +43,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! 残った `realized.intent` のカーネル照合（所有トークンでの昇格または巻き戻し）は後続で、それまでは
-//! `network::recorded` が次の操作を拒否する。DNS ヘルパーの記録は #3070、subnet の pool 予約は D13（#3057）。
+//! `network::recorded` が次の操作を拒否する。DNS ヘルパーの記録（`dns-helper`・`dns-helper.intent`）は #3070 で実装済み、subnet の pool 予約は D13（#3057）。
 //! `remove` は `definition`・`@lock` と空の既知ディレクトリ以外の項目があれば拒否するため、記録を誤って消さない。
 //! Linux 以外ではストアの全操作が `Unimplemented`（FCNET1 コーデックは 3 OS で動く）。
 

@@ -25,6 +25,8 @@ use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_
 use crate::network::NetworkName;
 use crate::sys;
 
+mod dns_helper_store;
+
 const NETWORKS_DIR: &str = "@networks";
 const LOCK_FILE: &str = "@lock";
 const DEFINITION_FILE: &str = "definition";
@@ -634,6 +636,7 @@ impl NetworkStore {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
             let g = self.lock_global_exclusive()?;
             let n = g.lock_network(name)?;
+            n.discard_stale_temps()?;
             // 排他ロックの下で、realized / realized.intent の書き込み残骸（`@tmp-*`）を先に掃除する。
             n.dir.sweep_tmp();
             let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {

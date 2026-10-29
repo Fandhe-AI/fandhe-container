@@ -239,7 +239,8 @@ fn data_loss(msg: &'static str) -> NetError {
 }
 
 impl NetworkLockGuard<'_> {
-    fn require_exclusive(&self) -> Result<(), NetError> {
+    /// 排他ロックでなければ `FailedPrecondition`。副作用の前に呼ぶ入口の検査にも使う。
+    pub(crate) fn require_exclusive(&self) -> Result<(), NetError> {
         if self.exclusive {
             Ok(())
         } else {

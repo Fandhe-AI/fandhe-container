@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{NetworkDefinition, NetworkListing};
+use crate::dns_helper::record::{DnsHelperIntent, DnsHelperRecord};
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::NetOpRecorder;
 use crate::network::NetworkName;
@@ -42,6 +43,36 @@ impl NetworkLockGuard<'_> {
     /// Linux 以外ではガードを作れないため常に偽（Linux 実装と同じシグネチャ）。
     pub fn is_held(&self) -> bool {
         false
+    }
+
+    /// 常に `Unimplemented`（DNS ヘルパーの記録。Linux 実装と同じシグネチャ。NET-7・#3070）。
+    pub fn read_dns_helper(&self) -> Result<Option<DnsHelperRecord>, NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`。
+    pub fn write_dns_helper(&self, _rec: &DnsHelperRecord) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`。
+    pub fn remove_dns_helper(&self) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`（起動窓の意図記録）。
+    pub fn read_dns_helper_intent(&self) -> Result<Option<DnsHelperIntent>, NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`。
+    pub fn write_dns_helper_intent(&self, _rec: &DnsHelperIntent) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`。
+    pub fn remove_dns_helper_intent(&self) -> Result<(), NetError> {
+        Err(unsupported())
     }
 }
 

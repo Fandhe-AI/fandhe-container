@@ -60,7 +60,7 @@
 //!   通常の `StopPodSandbox` / `RemovePodSandbox` は pod 専用ネットワークを `delete_network` で一括解放する。
 //!   結果不明で記録した公開（ハンドルを持たない）は個別に解除できず `FailedPrecondition` で、`delete_network` が
 //!   解放する。attach 済みコンテナの `detach`（共有ネットワークを使う CLI / stack）は `network::detach_container`（#3062）。保持したハンドルは
-//!   プロセスのメモリ上だけで、再起動後は `delete_network` の一括解放に頼る。他プロセスとの受け口の衝突は検出しない
+//!   プロセスのメモリ上だけで、再起動後は `delete_network` の一括解放に頼る（`detach` の失敗の請求書に載せたルールは再起動後も回収する。#3285）。他プロセスとの受け口の衝突は検出しない
 //! - `detach`（attach 済み。#3062）: net の `detach_container` で当該コンテナだけを解放する。カーネル操作を始めた後の失敗はハンドルを
 //!   手放して請求書（`FailedAttachClaim`）に一本化し、`unreclaimed` の回収待ちとして保持する（`attach` の取り残しと同じ経路で、
 //!   次の `detach` が回収し、quarantine は `delete_network` が解放する。回収待ちの間、そのネットワークへの新しい `attach` は

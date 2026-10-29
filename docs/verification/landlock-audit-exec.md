@@ -7,7 +7,7 @@ ABI 7 以上の実カーネルで `landlock_restrict_self` に `LANDLOCK_RESTRIC
 ## 背景
 
 - 本番の適用（`crates/core/src/landlock/apply.rs`）は ABI 7 以上で flags 2 を渡す。失敗しても flags 0 でやり直さず起動を拒否する（fail-closed）。監査が無効なホストで flags 2 が拒否されると、そのホストで起動できなくなるおそれがある
-- Agent の事前確認（非 root）: `cargo test -p fandhe-container-core --test landlock_enforcement -- --nocapture` は ABI 7 以上のホストで flags 2 を通す。出力に `abi=<n> restrict_self_flags=<0|2> audit_mode=<語彙>` の行が出る
+- Agent の事前確認（非 root）: `cargo test -p fandhe-container-core --test landlock_enforcement -- --no-capture` は ABI 7 以上のホストで flags 2 を通す。出力に `abi=<n> restrict_self_flags=<0|2> audit_mode=<語彙>` の行が出る
 
 ## カーネルソースでの確認（Agent。実機未確認）
 
@@ -47,7 +47,7 @@ ABI 7 以上のホストで [rootless-start-cgroup.md](rootless-start-cgroup.md)
 `CONFIG_AUDIT=n` のカーネル、または監査が無効なホスト（auditd 停止・`audit=0`）で、非 root のまま次を実行する。
 
 ```bash
-cargo test -p fandhe-container-core --test landlock_enforcement -- --nocapture
+cargo test -p fandhe-container-core --test landlock_enforcement -- --no-capture
 ```
 
 `abi=` と `restrict_self_flags=` の行と成否を記録する。拒否された場合は `landlock_restrict_self_failed` と errno を記録する。

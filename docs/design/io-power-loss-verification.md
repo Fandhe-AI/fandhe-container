@@ -30,7 +30,7 @@
 - `crates/io/tests/power_loss.rs`（`required-features = ["crash-test-server"]`）。root を要する本体 `linux::io2_flushed_data_survives_dm_flakey_drop_writes` は `#[ignore]` で既定のテスト集合から外してある。table 組み立て・名前検証・mountinfo 解析などの純粋ロジックは既定の集合で走る
 - 手順: 一時ディレクトリの疎イメージ（64 MiB）を loop に接続、dm-flakey（up）を載せて ext4 を作り mount。各試行で `crash_test_server` を起動して 30 件の Write と Flush を送り、FLUSH ACK の観測後に `dmsetup suspend --nolockfs` → `load`（`drop_writes`）→ `resume`、SIGKILL、umount、table を up に戻して再 mount、`check_disk_records` で seq 0..30 と照合する
 - 対照: 製品 sink で通常 ACK だけを受け Flush せずに同じ手順を行う試行は、損失件数を `power_loss_summary` に出すだけで合否にしない（期待値はオーナー判断待ち）
-- 実行（人間が root で）: `sudo -E cargo test -p fandhe-container-io --features crash-test-server --test power_loss -- --ignored --exact linux::io2_flushed_data_survives_dm_flakey_drop_writes --nocapture`。成功行は `io2_flushed_data_survives_dm_flakey_drop_writes: ok`
+- 実行（人間が root で）: `sudo -E cargo test -p fandhe-container-io --features crash-test-server --test power_loss -- --ignored --exact linux::io2_flushed_data_survives_dm_flakey_drop_writes --no-capture`。成功行は `io2_flushed_data_survives_dm_flakey_drop_writes: ok`
 - fail-closed: root でない・外部コマンドが無い・mount 先が ext4 でない等は skip せず失敗にする。外部コマンドはシェルを経由せず期限つき（60 秒）で実行する
 - 安全: 操作対象は試験が作った一時ディレクトリのイメージと、その loop・dm・mount だけ。loop は `/sys/block/loopN/loop/backing_file` で自分のイメージと照合する。後始末は Drop で逆順（umount、`dmsetup remove`、`losetup -d`）に行い、失敗は stderr に出す
 - UDS クライアント端点は `crash_safety` と共有する（`crates/io/tests/crash_safety/client_end.rs`）

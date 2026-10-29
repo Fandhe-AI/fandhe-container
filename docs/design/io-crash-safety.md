@@ -57,7 +57,7 @@ I/O 共有層の SIGKILL 耐性試験（`crates/io/tests/crash_safety.rs`）を�
 - 実行コマンド（3 ケースそれぞれを `--exact` で 1 件ずつ、各条件 3 回実行。全 18 実行で成功）:
 
 ```bash
-TMPDIR=<dir> cargo test -p fandhe-container-io --features crash-test-server --test crash_safety -- --exact unix::<テスト名> --nocapture
+TMPDIR=<dir> cargo test -p fandhe-container-io --features crash-test-server --test crash_safety -- --exact unix::<テスト名> --no-capture
 ```
 
 ## 実測結果（Linux ローカル）

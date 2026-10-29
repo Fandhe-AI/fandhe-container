@@ -1177,6 +1177,7 @@ pub struct PastaAttachingLauncher {
     logger: Logger,
     /// 直近の launch で、attachment なしの拒否時に PID 1 の terminate を確かめられず、プロセスが残り得るか
     /// (core の start / restart が起動予約を保持して確認つき回復へ回す判断材料。CORE-2・REPAIR-5・#3360)。
+    /// 捨てた未回収のハンドルの子は内側の起動台帳へ戻り、確認つき回復が回収する(#3432)。
     left_process: AtomicBool,
 }
 
@@ -1205,6 +1206,9 @@ impl PastaAttachingLauncher {
                         // フックが走らなかった(network のモードとフックの組が崩れた)。ネットワーク無しで走らせない。
                         if let Err(te) = process.terminate(MISSING_ATTACHMENT_TERMINATE) {
                             // 回収を確かめられない。予約を戻させず確認つき回復に回す(fail-closed)。
+                            // この腕の末尾で `process` を drop すると、内側の本番 launcher のハンドルが未回収の子を
+                            // 起動台帳へ `Pending` で戻し、`recover_interrupted_start` の確認が kill・回収する
+                            // (`Handed` のまま詰まらない。#3432)。
                             self.left_process.store(true, Ordering::SeqCst);
                             self.logger.log(
                                 true,

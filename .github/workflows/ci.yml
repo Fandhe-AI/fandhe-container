@@ -1680,6 +1680,28 @@ jobs:
             --select '^landlock_implicit_dev: /dev/null write' --subst root=false \
             --forbid 'root=true' --forbid 'landlock_implicit_dev: ignored' --forbid 'not applicable' --summary
 
+      # fork_exec_isolation（`crates/core/tests/fork_exec_isolation.rs`。CORE-1・CORE-5・REPAIR-12・#3295）: fork / exec 前段の
+      # 到達と fail-closed を非特権 user namespace で照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock
+      # ABI 6 以上の fail-closed 確認は上のステップを再利用する。`--ignored` が届かなくても exit 0 になるため成功行を試験
+      # ソースから導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: fork_exec_isolation のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test fork_exec_isolation --no-run
+
+      - name: fork_exec_isolation の実行（実機前提テスト・--ignored。CORE-1・CORE-5・#3295）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/fork_exec_isolation.log"
+          cargo test -p fandhe-container-core --test fork_exec_isolation -- --ignored 2>&1 | tee "${log}"
+          scripts/check-success-lines.sh --name fork_exec_isolation \
+            --src crates/core/tests/fork_exec_isolation.rs --log "${log}" \
+            --select '^fork_exec_isolation: fork/exec verified' --subst is_root=false \
+            --forbid 'root=true' --forbid 'fork_exec_isolation: ignored' --forbid 'not applicable' \
+            --forbid 'not verified' --summary
+
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10

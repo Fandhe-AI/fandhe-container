@@ -386,7 +386,7 @@ argv[0]=pasta  -f  --quiet  -P <@pasta/<id>/pid の絶対パス>  --config-net  
 | netns holder（`run_netns_holder_main`・fd の受信・setns・capset・READY / STOP・PDEATHSIG） | net | #1936 |
 | bin の `netns-holder` の振り分けと holder の起動・回収 | supervisor | 上の holder・#3065 |
 | `--pasta-path` / `--pasta-path-search` と作成時の検証・FCOPT1 の `pasta` の書き込み | cli | #1936・#3065 |
-| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065。実装は #3200。CLI が `publish` を文書へ書くのは `network`（ユーザー定義名）を書く #1873 の後（それまでは検証済みの `-p` も `UNIMPLEMENTED`） |
+| `-p` / `--publish` と FCOPT1 の `publish`（rootless の pasta のみ） | cli | #1937・#3065。実装は #3200。CLI が `publish` を文書へ書くのは `network`（ユーザー定義名）を書く #3329 の後（それまでは検証済みの `-p` も `UNIMPLEMENTED`） |
 
 ### 12.15 オーナー確認事項（実装は止めない）
 

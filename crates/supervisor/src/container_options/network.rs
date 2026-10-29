@@ -216,8 +216,8 @@ impl NetworkOptions {
         })
     }
 
-    /// core の `LaunchNetworkMode` へ写す(D7)。指定なしは `FromConfig`、`none` は `Loopback`(実体は #3064 まで
-    /// core が `Unimplemented`)、`host` は `Host`、ユーザー定義名は Linux で `Attachable`(rootless の pasta 構成。#1940)、
+    /// core の `LaunchNetworkMode` へ写す(D7)。指定なしは `FromConfig`、`none` は `Loopback`(実体の CLONE_NEWNET と
+    /// `lo` の up は #3064 で実装済み)、`host` は `Host`、ユーザー定義名は Linux で `Attachable`(rootless の pasta 構成。#1940)、
     /// それ以外の OS では `Unimplemented`。
     pub fn launch_network_mode(&self) -> Result<LaunchNetworkMode, TraitError> {
         match &self.selection {

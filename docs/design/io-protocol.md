@@ -522,7 +522,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | 10 | `DeviceLimit` |
 | 11 | `TrackedPathsLimit` |
 
-- reason は情報目的で、未知の値は `Other(u16)` として受理する。追加しても版は上げない
+- reason は情報目的で、未知の値は `Other(u16)` として受理する。追加しても版は上げない。値表は 1 から始まり 0 は割り当てていない。受信した 0 もほかの未知の値と同じく `Other(0)` として受理する（`NackReason::from_wire`。#3161。試験は `nack_reason.rs` の未知値試験と `payload.rs` の `io1_v2_nack_code_and_reason_handling`）
 - Nack は自由文字列を持たず、ホストのパスや入力のパスをワイヤーへ返さない。詳細はサーバー側の観測へ、既存のサニタイズと上限（`display_sanitize`・`MAX_COLLISION_MESSAGE_PATH_*`）の範囲で出す
 
 ### F11 サーバー側の構造

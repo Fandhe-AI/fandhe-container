@@ -34,9 +34,10 @@
 //! - **fd 起点**: 状態ルートから 1 要素ずつ `O_PATH|O_NOFOLLOW` で辿り、symlink・他者所有・グループ/他者に開いた
 //!   ディレクトリは `PERMISSION_DENIED` で拒否する
 //!
-//! # 未実装（REPAIR-3: 実装済みを装わない）
+//! # 呼び出し元と未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - supervisor の start からの呼び出しと start 失敗時の巻き戻しは #1873・#3065（D14）。本モジュールは API のみ
+//! - supervisor の start からの呼び出しと start 失敗時の巻き戻しは supervisor の `container_options::etc_files`
+//!   （start の手順 4b。#1873・#3065・D14 で実装済み）。本モジュールは API のみ
 //! - 実際の bind mount は `crate::exec::etc_mounts`。本番の起動経路は `RootfulHostRoot` を launcher が `UNIMPLEMENTED` で
 //!   拒否している（#2241・SEC-5）ため、動くのは rootless の 2 モデル（`RootlessSingleId`・`RootlessSubordinateIds`）だけ
 //! - 非 Linux は `UNIMPLEMENTED`（macOS・Windows の管理ルートの扱いは MAC・WIN 系で別に決める）

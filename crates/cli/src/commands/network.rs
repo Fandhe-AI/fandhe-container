@@ -28,7 +28,7 @@
 //!
 //! - rootful（bridge）の `create` は subnet の pool 予約（D13）が決まるまで `UNIMPLEMENTED`。
 //! - メンバー記録（#3067）が入るまで `rm` が拒否するのは、`definition` と `@lock` 以外の項目がある場合（net の `remove` の契約）。
-//! - `create --network <名前>` での定義の存在照合は #1873 の範囲で、ここでは触れない。
+//! - `create --network <名前>` での定義の存在照合は #3329 の範囲で、ここでは触れない。
 //! - 計測（REPAIR-4）: `net_recorder::CliNetRecorder` で定義ストアの操作を `network.store.*`、コマンド全体を `network_create` /
 //!   `network_rm` / `network_ls` の名前で記録し、`FANDHE_CONTAINER_OP_LOG` へ出す。
 

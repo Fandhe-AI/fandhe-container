@@ -61,8 +61,8 @@
 //!
 //! - 同期点を通すのは `LaunchNetworkMode::Loopback`・`Attachable`・`Host` の起動だけ。`FromConfig`（CRI の経路）は通さない
 //!   （pod の netns への join〔#2838〕が入るときに見直す）
-//! - `network_mode=host` の構造化ログと、net crate の `HostNetns` を使う結線は #1873。pasta 構成のフックの実装
-//!   （holder の保持と pasta の起動）は #1940
+//! - `network_mode=host` の構造化ログと、net crate の `HostNetns` を使う結線は supervisor の start に実装済み
+//!   （#1873・PR #3322）。pasta 構成のフックの実装（holder の保持と pasta の起動）も #1940 で実装済み
 //! - user namespace と netns の所有関係は C では照合しない（`NS_GET_USERNS` の ioctl は新しい `unsafe`）。holder の
 //!   `setns(user)` → `setns(net)` が組の違いを `EPERM` / `EINVAL` で fail-closed にする
 //! - 基準は launch の入口で C 自身の netns から取る。C は `Threads: 1` の supervisor で、start の入口から launch までの間に

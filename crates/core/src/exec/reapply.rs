@@ -1692,16 +1692,9 @@ mod tests {
     }
 
     /// 使い捨ての空ディレクトリ（`/` とは別の inode）。
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-reapply-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    fn temp_dir(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid＋nanos の名前を create_dir_all せず、排他作成の ScratchDir の子を使う（#3478・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-reapply-{label}"), "d")
     }
 
     fn err(code: ErrorCode, stage: IsolationStage) -> ExecError {
@@ -2426,12 +2419,11 @@ mod tests {
     #[test]
     fn sup6_task163_4_binding_check_precedes_root_check() {
         let _ = take();
-        let dir = temp_dir("binding-first");
+        let (_scratch, dir) = temp_dir("binding-first");
         let mut r = restrictions_rooted_at(std::process::id(), &dir);
         let (dev, ino) = r.binding.target_mnt_ns;
         r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
         let e = reapply_restrictions(r).expect_err("both mismatch");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             e.violation.expect("violation").reason,
             ViolationReason::ExecJoinedNamespaceMismatch
@@ -2542,10 +2534,9 @@ mod tests {
     #[test]
     fn sup6_task163_3_root_mismatch_applies_nothing_and_records_violation() {
         let _ = take();
-        let dir = temp_dir("mismatch");
+        let (_scratch, dir) = temp_dir("mismatch");
         let e = reapply_restrictions(restrictions_rooted_at(std::process::id(), &dir))
             .expect_err("root mismatch");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.stage, IsolationStage::SetNs);
         assert_eq!(
@@ -2566,10 +2557,9 @@ mod tests {
     #[test]
     fn sup6_task163_3_owner_check_precedes_root_check() {
         let _ = take();
-        let dir = temp_dir("owner-first");
+        let (_scratch, dir) = temp_dir("owner-first");
         let other = std::process::id().wrapping_add(1);
         let e = reapply_restrictions(restrictions_rooted_at(other, &dir)).expect_err("mismatch");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(e.stage, IsolationStage::Validate);
         assert!(e.violation.is_none());
         assert_eq!(taken(), Vec::<&str>::new());
@@ -2579,7 +2569,7 @@ mod tests {
     /// 開いた fd は一致し、別のディレクトリ・親子は一致しない。ディレクトリでない fd は判定せずエラー。
     #[test]
     fn sup6_task163_3_same_directory_compares_dev_and_ino() {
-        let dir = temp_dir("same");
+        let (_scratch, dir) = temp_dir("same");
         let sub = dir.join("sub");
         std::fs::create_dir(&sub).expect("sub");
         std::fs::write(dir.join("file"), b"x").expect("file");
@@ -2591,7 +2581,6 @@ mod tests {
         let e = same_directory(a.as_fd(), file.as_fd()).expect_err("not a directory");
         assert_eq!(e.code, ErrorCode::Internal);
         assert_eq!(e.stage, IsolationStage::SetNs);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-6・SEC-1・SEC-4・TASK-163.3: 固定した rootfs が自プロセスの `/` と同じディレクトリなら、準備が
@@ -2767,9 +2756,8 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Validate);
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason.as_str(), "rootfs_is_host_root");
-        let dir = temp_dir("recorded-own");
+        let (_scratch, dir) = temp_dir("recorded-own");
         reject_recorded_own_root(identity_of(&dir), own.as_fd()).expect("different directory");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-6・SEC-1・#1468: 参加後の `/` の照合は記録した識別子との `st_dev`・`st_ino` の一致で決まる。
@@ -2783,9 +2771,8 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::SetNs);
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecRootNotContainerRootfs);
-        let dir = temp_dir("verified-root");
+        let (_scratch, dir) = temp_dir("verified-root");
         let e = open_verified_root(identity_of(&dir)).expect_err("host directory");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             e.message,
             "the root directory after joining is not the recorded container rootfs"
@@ -2800,16 +2787,20 @@ mod tests {
     }
 
     /// `config` の `root.path`（`rootfs`）を持つ使い捨ての bundle を作り、start と同じ経路で rootfs を固定する。
-    fn pinned_rootfs(label: &str, config: &OciConfig) -> (std::path::PathBuf, RootfsDir) {
-        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
-        let bundle = base.join(
-            temp_dir(label)
-                .file_name()
-                .expect("temp dir has a file name"),
-        );
+    fn pinned_rootfs(
+        label: &str,
+        config: &OciConfig,
+    ) -> (
+        crate::scratch_root::ScratchDir,
+        std::path::PathBuf,
+        RootfsDir,
+    ) {
+        // 親は Linux で canonicalize 済み。bundle は親の子にする（親の共有 flock と bundle のロックを干渉させない）。
+        let (scratch, bundle) =
+            crate::test_support::scratch_child(&format!("fandhe-reapply-{label}"), "bundle");
         std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
         let rootfs = crate::oci_runtime::pin_bundle_rootfs(&bundle, config).expect("pin rootfs");
-        (bundle, rootfs)
+        (scratch, bundle, rootfs)
     }
 
     /// launch の代わりに、`config` から導いた ruleset と固定済み rootfs の識別子で記録を作る
@@ -2872,9 +2863,8 @@ mod tests {
     #[test]
     fn sup6_task163_3_prepare_rejects_shadowed_write_restriction() {
         let c = config(false, r#"[{"destination":"/etc","options":["ro"]}]"#);
-        let (bundle, rootfs) = pinned_rootfs("shadowed", &c);
+        let (_scratch, _bundle, rootfs) = pinned_rootfs("shadowed", &c);
         let e = launch_record(&c, &rootfs).expect_err("must be rejected");
-        let _ = std::fs::remove_dir_all(&bundle);
         assert_eq!(e.stage, IsolationStage::Landlock);
         const DETECT: [&str; 6] = [
             "kernel_lacks_landlock",
@@ -2899,11 +2889,10 @@ mod tests {
     #[test]
     fn sup6_task163_3_prepare_records_pid_and_reads_threads() {
         let c = config(true, "[]");
-        let (bundle, rootfs) = pinned_rootfs("records", &c);
+        let (_scratch, _bundle, rootfs) = pinned_rootfs("records", &c);
         let prepared = launch_record(&c, &rootfs).and_then(|launch| {
             prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
         });
-        let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(mut r) => {
                 assert_eq!(r.owner_pid, std::process::id());
@@ -2925,11 +2914,10 @@ mod tests {
             true,
             &format!(r#"[{{"destination":"{dest}","options":["ro"]}}]"#),
         );
-        let (bundle, rootfs) = pinned_rootfs("unresolved", &c);
+        let (_scratch, _bundle, rootfs) = pinned_rootfs("unresolved", &c);
         let prepared = launch_record(&c, &rootfs).and_then(|launch| {
             prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
         });
-        let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(r) => {
                 let paths: Vec<&str> = r

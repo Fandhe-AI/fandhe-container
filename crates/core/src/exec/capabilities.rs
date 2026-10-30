@@ -1633,18 +1633,10 @@ mod tests {
         let own = sys::open_dir_path_nofollow(None, &own).unwrap();
         assert_eq!(read_setgroups_denied(Some(own.as_fd())), expected);
 
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-setgroups-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-setgroups", "d");
         std::fs::write(dir.join("setgroups"), "deny\n").unwrap();
         let fake = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
         assert_eq!(read_setgroups_denied(Some(fake.as_fd())), None);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// SUP-6・SEC-1・SEC-5・TASK-163 追補（#1457）: 参加前の消去は単一スレッドでだけ行い、capability には触れない。

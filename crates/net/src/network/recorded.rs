@@ -87,8 +87,18 @@
 //!   なかった」ことで、判定は記録だけで決まる。したがって `PortRegistry` を持つプロセスは、ストアを開いた後・最初の
 //!   `reserve` より前に、自分の予約表でそれぞれ本関数を 1 回呼ぶ。記録を直した後は各プロセスが組み直し直す
 //!   （再起動を含む）。呼び出し側（#3074・#3075）は `unknown_port_holders`・`broken`・`conflicts` を構造化ログに出す
-//! - 本関数を呼ばない限り効果は無い（`PortRegistry::new()` の既定は未印のまま）。組み直しの強制（型での拒否）や
-//!   印の共有ファイルへの記録（形式 v2）は、組み直さずに `reserve` する呼び出し元が必要になるまで採らない
+//! - 本関数を呼ばない限り効果は無い（`PortRegistry::new()` の既定は未印のまま）
+//!
+//! ## 組み直す前の `reserve` の扱い（NET-3・REPAIR-4・#3477。#3433 の残りの採否）
+//! - 状態での拒否は opt-in の構築口で採る。`PortRegistry::awaiting_rebuild()` /
+//!   `PortRegistry::with_shared_file_awaiting_rebuild()` で作った予約表は、本関数を 1 回通る（完全・不完全・`Err` の
+//!   いずれでも。不完全なら印が拒否を続ける）まで、受け口を伴う `reserve` を `FailedPrecondition` で断る。
+//!   結線する #3074・#3075 はこの構築口を使う（未結線。REPAIR-3）
+//! - 型での拒否（組み直し済みの証跡を引数に取る）と既定（`new()`・`with_shared_file()`）の待ち状態化は採らない。
+//!   公開関数の署名が広く変わり、plugin-cri の現行の本番経路が止まるため。再評価は #3074・#3075 の結線後
+//! - 印の共有ファイルへの記録（形式 v2）は採らない。待ち状態のプロセスは自分で組み直すまで通らないため、
+//!   他プロセスの判定を引き継ぐ必要が無い。判断と再評価の条件は `docs/design/network-wiring.md`
+//!   「Issue #3477 の実装メモ」
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -1060,7 +1070,8 @@ impl PortRegistryRebuild {
 /// 記録から、再起動後の `PortRegistry` を組み直す（NET-3・REPAIR-4・#3362。方針はモジュール doc）。
 ///
 /// `global` は共有・排他のどちらでもよい（各ネットワークは共有ロックで順に読む）。どの失敗経路でも、`Err` を返す前に
-/// `registry` へ不完全の印を立てる。読めないネットワークがあっても、他のネットワークの登録は続ける。
+/// `registry` へ不完全の印を立てる。組み直し待ち（`PortRegistry::awaiting_rebuild`。#3477）の予約表は、
+/// どの結果でも待ちが解ける（不完全なら印が拒否を続ける）。読めないネットワークがあっても、他のネットワークの登録は続ける。
 pub fn rebuild_port_registry_recorded(
     global: &GlobalLockGuard<'_>,
     registry: &mut PortRegistry,
@@ -4171,6 +4182,128 @@ mod tests {
             vec![("web".to_owned(), NetErrorCode::DataLoss)]
         );
         assert!(b.is_incomplete());
+    }
+
+    /// NET-3・REPAIR-4・#3477: 組み直し待ちの予約表は、完全な組み直しで待ちが解け、記録済みの受け口は
+    /// `AlreadyExists`、それ以外の予約は通る。
+    #[test]
+    fn net3_3477_rebuild_releases_awaiting_registry() {
+        let t = Tmp::new("awaiting-release");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::awaiting_rebuild();
+        assert_eq!(
+            reg.reserve(&name(), &c2(), &[port_8081()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
+        assert!(
+            rebuild_port_registry_recorded(&g, &mut reg)
+                .unwrap()
+                .is_complete()
+        );
+        assert!(!reg.is_awaiting_rebuild());
+        assert!(!reg.is_incomplete());
+        assert_eq!(
+            reg.reserve(&name(), &c2(), &[web_publish()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::AlreadyExists
+        );
+        reg.reserve(&name(), &c2(), &[port_8081()]).unwrap();
+    }
+
+    /// NET-3・REPAIR-4・#3477: 不完全な組み直しでも待ちは解けるが、不完全の印が拒否を続ける。記録を直して
+    /// 組み直し直すと通る。
+    #[test]
+    fn net3_3477_incomplete_rebuild_keeps_awaiting_registry_rejecting() {
+        let t = Tmp::new("awaiting-incomplete");
+        attach_published(&t);
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let path = t.0.join("@networks/web/members/c1");
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"garbage").unwrap();
+        let mut reg = PortRegistry::awaiting_rebuild();
+        assert!(
+            !rebuild_port_registry_recorded(&g, &mut reg)
+                .unwrap()
+                .is_complete()
+        );
+        assert!(!reg.is_awaiting_rebuild());
+        assert!(reg.is_incomplete());
+        let e = reg.reserve(&name(), &c2(), &[port_8081()]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "port registry is incomplete; rebuild from records failed"
+        );
+        std::fs::write(&path, good).unwrap();
+        assert!(
+            rebuild_port_registry_recorded(&g, &mut reg)
+                .unwrap()
+                .is_complete()
+        );
+        reg.reserve(&name(), &c2(), &[port_8081()]).unwrap();
+    }
+
+    /// NET-3・REPAIR-4・#3477: 共有ファイル上で他プロセスが組み直し済みでも、待ち状態のプロセスは自分で組み直すまで
+    /// 断られ、判定は自分の組み直しで決まる。共有ファイルの形式は v1 のまま（形式 v2 を採らない）。
+    #[test]
+    fn net3_3477_awaiting_registry_needs_own_rebuild_even_if_shared_file_rebuilt() {
+        let t = Tmp::new("awaiting-own-rebuild");
+        attach_published(&t);
+        let shared = t.0.join("ports.reg");
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut b = PortRegistry::with_shared_file(shared.clone());
+        assert!(
+            rebuild_port_registry_recorded(&g, &mut b)
+                .unwrap()
+                .is_complete()
+        );
+        let mut a = PortRegistry::with_shared_file_awaiting_rebuild(shared.clone());
+        assert_eq!(
+            a.reserve(&name(), &c2(), &[port_8081()])
+                .unwrap_err()
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
+        std::fs::write(t.0.join("@networks/web/members/c1"), b"garbage").unwrap();
+        let report = rebuild_port_registry_recorded(&g, &mut a).unwrap();
+        assert_eq!(
+            report.broken,
+            vec![("web".to_owned(), NetErrorCode::DataLoss)]
+        );
+        assert!(a.is_incomplete());
+        assert!(!b.is_incomplete());
+        let text = std::fs::read_to_string(&shared).unwrap();
+        assert_eq!(text.lines().next(), Some("fandhe-portreg v1"));
+    }
+
+    /// NET-3・REPAIR-4・#3477: 組み直しが `Err`（共有ファイルの破損）でも待ちは解け、不完全の印で拒否が続く。
+    #[test]
+    fn net3_3477_rebuild_error_clears_awaiting_and_marks_incomplete() {
+        let t = Tmp::new("awaiting-rebuild-err");
+        attach_published(&t);
+        let shared = t.0.join("ports.reg");
+        std::fs::write(&shared, b"junk").unwrap();
+        std::fs::set_permissions(&shared, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let store = NetworkStore::open(&t.0).unwrap();
+        let g = store.lock_global_exclusive().unwrap();
+        let mut reg = PortRegistry::with_shared_file_awaiting_rebuild(shared);
+        assert!(rebuild_port_registry_recorded(&g, &mut reg).is_err());
+        assert!(!reg.is_awaiting_rebuild());
+        assert!(reg.is_incomplete());
+        let e = reg.reserve(&name(), &c2(), &[port_8081()]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "port registry is incomplete; rebuild from records failed"
+        );
     }
     mod after_reboot_tests;
 }

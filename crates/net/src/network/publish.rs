@@ -198,6 +198,14 @@ type ListenerOwner = (NetworkName, EndpointId);
 /// 組み直しの「不完全」の印は共有ファイルに載せず、プロセスごとに持つ。共有ファイルを使うプロセスも、最初の
 /// `reserve` の前に自分で `rebuild_port_registry_recorded` を呼ぶこと。`reserve` の製品の呼び出し元は、直前に
 /// カーネル dump の照合（`ensure_no_listener_conflict`）を通すこと（NET-3・REPAIR-4・#3433）。
+///
+/// 結線する側（#3074 の supervisor・#3075 の plugin-cri）は [`PortRegistry::awaiting_rebuild`] または
+/// [`PortRegistry::with_shared_file_awaiting_rebuild`] で作る。この「組み直し待ち」の予約表は、
+/// `rebuild_port_registry_recorded`（Linux 限定）を 1 回通るまで、受け口を伴う `reserve` を
+/// `FailedPrecondition` で断る（#3477。状態での拒否。型での拒否・既定の変更・共有ファイルへの印の記録は採らない。
+/// 判断は `docs/design/network-wiring.md`「Issue #3477 の実装メモ」）。`new()`・`with_shared_file()` は待ち状態にしない。
+/// 非 Linux には組み直しの関数が無いため、待ち状態の予約表は受け口を伴う予約を通さない（net の DNAT 公開は Linux 限定）。
+/// 待ち状態の構築口はまだどの製品経路にも結線していない（REPAIR-3。結線は #3074・#3075）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortRegistry {
     owners: HashMap<ListenerKey, ListenerOwner>,
@@ -208,6 +216,9 @@ pub struct PortRegistry {
     /// 解放系（`release*`）は止めない。呼び出し側のメモリ上の値で、他プロセスへは伝えない。各プロセスが自分で
     /// 組み直す契約（#3433。同じ記録から同じ判定に至る）。
     incomplete: bool,
+    /// 組み直す前の待ち状態（#3477）。立っている間、受け口を伴う `reserve` は `FailedPrecondition`。
+    /// `mark_incomplete` / `clear_incomplete`（組み直しの完了時に必ず呼ばれる）で解ける。既定は `false`。
+    awaiting_rebuild: bool,
 }
 
 /// [`PortRegistry::adopt`] の結果（記録からの組み直しの件数。#3362）。
@@ -485,7 +496,31 @@ impl PortRegistry {
             owners: HashMap::new(),
             shared: Some(path),
             incomplete: false,
+            awaiting_rebuild: false,
         }
+    }
+
+    /// 組み直し待ちの空の予約表（構造体 doc。#3477）。`rebuild_port_registry_recorded` を通すまで、
+    /// 受け口を伴う `reserve` は `FailedPrecondition`。再起動後に記録から組み直す呼び出し元が使う。
+    pub fn awaiting_rebuild() -> Self {
+        Self {
+            awaiting_rebuild: true,
+            ..Self::default()
+        }
+    }
+
+    /// [`PortRegistry::with_shared_file`] の組み直し待ち版（#3477）。共有ファイル上で他のプロセスが
+    /// 組み直し済みでも、このプロセスが自分で組み直すまで待ちは解けない。
+    pub fn with_shared_file_awaiting_rebuild(path: PathBuf) -> Self {
+        Self {
+            awaiting_rebuild: true,
+            ..Self::with_shared_file(path)
+        }
+    }
+
+    /// 組み直す前の待ち状態で、受け口を伴う新規の予約を拒否しているか（診断用。#3477）。
+    pub fn is_awaiting_rebuild(&self) -> bool {
+        self.awaiting_rebuild
     }
 
     /// 予約済みの受け口の件数（共有ファイル使用時は、このプロセスが最後に読み書きした時点の件数）。
@@ -508,12 +543,14 @@ impl PortRegistry {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn mark_incomplete(&mut self) {
         self.incomplete = true;
+        self.awaiting_rebuild = false;
     }
 
     /// 組み直しが完全に成功したので印を外す。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn clear_incomplete(&mut self) {
         self.incomplete = false;
+        self.awaiting_rebuild = false;
     }
 
     /// 記録から読んだ公開 `entries` を予約として登録する（再起動後の組み直し。NET-3・REPAIR-4・#3362）。
@@ -568,6 +605,7 @@ impl PortRegistry {
     /// 共有ファイル使用時は、予約後の内容がサイズ上限を超えるなら書き込まず `ResourceExhausted`、
     /// 破損は `Internal`、ロック待ちの期限切れは `Timeout`（いずれも予約は増えない）。`ports` が空なら常に `Ok`。
     /// 組み直しが不完全な印（[`PortRegistry::is_incomplete`]）がある間、受け口を伴う予約は `FailedPrecondition`。
+    /// 組み直し待ち（[`PortRegistry::is_awaiting_rebuild`]）の間も同じく `FailedPrecondition`（#3477）。
     /// 製品の呼び出し元は直前にカーネル dump の照合を通すこと（受け口不明の保持の防御はそれに依る。#3433）。
     pub(crate) fn reserve(
         &mut self,
@@ -584,6 +622,13 @@ impl PortRegistry {
         if ports.is_empty() {
             // 公開なしの attach では共有予約表に触れない（ロック・解析の失敗で接続を落とさない）。
             return Ok(());
+        }
+        // 組み直す前の待ち状態なら断る（共有ファイルのロックより前。何も変えず、ファイルも作らない。NET-3・#3477）。
+        if self.awaiting_rebuild {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "port registry has not been rebuilt from records",
+            ));
         }
         // 組み直しが不完全なら新規の予約を断る（共有ファイルのロックより前。何も変えない。NET-3・#3362）。
         if self.incomplete {
@@ -1309,6 +1354,45 @@ mod tests {
         reg.clear_incomplete();
         reg.reserve(&web, &c2, &[p2]).unwrap();
         assert_eq!(reg.len(), 1);
+    }
+
+    /// NET-3・REPAIR-4・#3477: 組み直し待ちの予約表は受け口を伴う `reserve` を断り、空の `reserve` と解放は通す。
+    /// 既定（`new()`）は待ち状態にしない。
+    #[test]
+    fn net3_3477_awaiting_rebuild_rejects_reserve_with_ports() {
+        let (web, c1, c2, p) = adopt_fixture();
+        let mut reg = PortRegistry::awaiting_rebuild();
+        assert!(reg.is_awaiting_rebuild());
+        assert!(!reg.is_incomplete());
+        let e = reg.reserve(&web, &c1, &[p]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "port registry has not been rebuilt from records"
+        );
+        assert_eq!(reg.len(), 0);
+        reg.reserve(&web, &c2, &[]).unwrap();
+        assert_eq!(reg.release(&web, &c1).unwrap(), 0);
+        let mut plain = PortRegistry::new();
+        assert!(!plain.is_awaiting_rebuild());
+        plain.reserve(&web, &c1, &[p]).unwrap();
+        assert_eq!(plain.len(), 1);
+    }
+
+    /// NET-3・#3477: 共有ファイル版の待ち状態は、ロックより前に断るので共有ファイルもロックファイルも作らない。
+    #[test]
+    fn net3_3477_awaiting_shared_file_rejects_before_touching_file() {
+        let (web, c1, _c2, p) = adopt_fixture();
+        let dir = shared_dir("awaiting-shared");
+        let path = dir.join("ports.reg");
+        let mut reg = PortRegistry::with_shared_file_awaiting_rebuild(path.clone());
+        let e = reg.reserve(&web, &c1, &[p]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(!path.exists());
+        let mut lock = path.clone().into_os_string();
+        lock.push(".lock");
+        assert!(!std::path::Path::new(&lock).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// NET-3・#3362: 共有ファイルでは `adopt` の登録が別インスタンスの `reserve` に見える（同じ受け口は `AlreadyExists`）。

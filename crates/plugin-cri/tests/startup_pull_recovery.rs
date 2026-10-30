@@ -4,6 +4,8 @@
 //! 回収せず、drop 済み（クラッシュ相当）の pull だけを回収することを具体値で照合する。root 権限は不要。
 #![cfg(unix)]
 
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -64,10 +66,8 @@ impl Tmp {
         let base = std::env::temp_dir()
             .canonicalize()
             .expect("canonical temp dir");
-        let p = base.join(format!("fc-cri-pullrec-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("mkdir");
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        // 予測できる名前を消さずに排他作成する（0700。REPAIR-12・#3479）。
+        let p = exclusive_dir::create_in(&base, &format!("fc-cri-pullrec-{tag}")).expect("mkdir");
         Tmp(p)
     }
 

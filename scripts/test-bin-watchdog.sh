@@ -12,8 +12,11 @@
 #   1. 引数に `--bench` がある（cargo bench のバイナリ。各スクリプトの期限に任せる）→ 素通し
 #   2. FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS が `off` または `0` → 素通し
 #   3. 同変数が 1〜3600 の整数 → その秒数。それ以外の値は fail-closed（終了コード 2）
-#   4. 未設定で GITHUB_ACTIONS=true → 既定 300 秒（正常時の最長 33 秒の約 9 倍。根拠は .claude/rules/ci.md）
-#   5. 未設定で CI 外 → 素通し（手元の cargo run・デバッグを変えない）
+#   4. 未設定で引数に `--ignored` がある → 素通し（platform-ci の実機前提テスト。各ステップが 10 分前後の
+#      timeout-minutes・540 秒級の予算や試験自身の watchdog を持つため、一律 300 秒で偽陰性にしない。
+#      個別に包みたいときは変数で明示する）
+#   5. 未設定で GITHUB_ACTIONS=true → 既定 300 秒（正常時の最長 33 秒の約 9 倍。根拠は .claude/rules/ci.md）
+#   6. 未設定で CI 外 → 素通し（手元の cargo run・デバッグを変えない）
 #
 # 終了コードの契約: 子の終了コードをそのまま返す。子がシグナル N で死んだときは cargo に同じ「signal: N」と
 # 見えるよう、自分も同じシグナルで終わる（終わらないシグナルは 128+N で exit）。期限切れは 124（run_limited・
@@ -60,6 +63,11 @@ if [ "${FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS+set}" = "set" ]; then
   fi
   deadline="${v}"
 elif [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  for a in "$@"; do
+    if [ "${a}" = "--ignored" ]; then
+      exec "$@"
+    fi
+  done
   deadline=300
 else
   exec "$@"

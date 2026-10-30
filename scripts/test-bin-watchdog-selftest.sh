@@ -158,6 +158,12 @@ run "${D}=0" -- "${target}" bash -c 'exit 9'
 expect_eq gate-zero 9 "$(rc)"
 run "${D}=1" -- "${target}" bash -c 'sleep 2; exit 0' --bench
 expect_eq gate-bench 0 "$(rc)"
+# 未設定の GITHUB_ACTIONS=true でも --ignored は素通し（既定 300 秒で実機前提テストを打ち切らない）。
+# 変数で明示した場合は --ignored でも期限を使う（1 秒で 124）
+run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" bash -c 'exit 6' --ignored
+expect_eq gate-ignored 6 "$(rc)"
+run "${D}=1" -- "${target}" bash -c 'sleep 5; exit 0' --ignored
+expect_eq gate-ignored-explicit 124 "$(rc)"
 # 未設定で GITHUB_ACTIONS=true なら既定の期限を使う（その間に終われば子のコード）
 run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" bash -c 'exit 5'
 expect_eq gate-default 5 "$(rc)"

@@ -335,11 +335,12 @@ mod tests {
         assert_eq!(code(&a(Some("container:x"), &["bad"], &[])), INV);
         assert_eq!(code(&a(Some("none"), &[], &[])), WIRED);
         assert_eq!(code(&a(Some("host"), &[], &[])), WIRED);
-        // ユーザー定義名は形式の検証を通れば受理される(rootless の定義の照合は create_pasta の段。#3329)。
-        assert_eq!(code(&a(Some("web"), &[], &[])), None);
+        // ユーザー定義名は形式の検証を通れば Linux では受理される(rootless の定義の照合は create_pasta の段。#3329)。
+        // 非 Linux は network 系の指定すべてが UNIMPLEMENTED。
+        assert_eq!(code(&a(Some("web"), &[], &[])), WIRED);
         assert_eq!(
             code(&a(Some("web"), &["h:192.0.2.1"], &["192.0.2.53"])),
-            None
+            WIRED
         );
     }
 
@@ -349,7 +350,7 @@ mod tests {
         for bad in ["::1", "2001:db8::1", "127.0.0.1", "127.0.0.53"] {
             assert_eq!(code(&a(Some("web"), &[], &[bad])), INV, "{bad}");
         }
-        assert_eq!(code(&a(Some("web"), &[], &["192.0.2.53"])), None);
+        assert_eq!(code(&a(Some("web"), &[], &["192.0.2.53"])), WIRED);
     }
 
     /// NET-12(#3329): 名前つきなら名前そのものを返し、none / host / `container:` / 省略は `None`。
@@ -419,7 +420,7 @@ mod tests {
             &ap(Some("web"), &["8080:80", "127.0.0.1:8081:81/udp"]),
             rootless(),
         );
-        assert_eq!((c, n), (None, 1));
+        assert_eq!((c, n), (WIRED, 1));
     }
 
     /// NET-9・D13(#3200): rootful の `-p` は `UNIMPLEMENTED`(専用の文言)。
@@ -513,9 +514,10 @@ mod tests {
     /// 通常の create(`-p` なし)では権限モデルを解決しない。
     #[test]
     fn net9_no_publish_never_resolves_privilege() {
-        assert_eq!(run(&a(Some("web"), &[], &[]), rootless()), (None, 0));
+        assert_eq!(run(&a(Some("web"), &[], &[]), rootless()), (WIRED, 0));
     }
 
+    #[cfg(target_os = "linux")]
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
             "fc-cli-reqdef-{}-{tag}-{}",

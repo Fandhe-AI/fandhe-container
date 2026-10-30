@@ -3483,6 +3483,97 @@ mod tests {
         }
     }
 
+    /// attach の回収で bridge の照会が復号の失敗（重複 `IFLA_IFALIAS` 等。#3309）の `DataLoss` になる場合の
+    /// 期待される呼び出し列。bridge の照会は veth の所有証明の中だけで行うため 2 件で止まり、削除へ進まない。
+    fn dataloss_probe_calls() -> Vec<String> {
+        vec![
+            format!("link_attachment {}", host_of("c1").as_str()),
+            format!("owned_bridge_index {}", created().bridge.as_str()),
+        ]
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510（#3484 の残り）: attach の回収で bridge の照会が `DataLoss` になっても、
+    /// `NotFound`（bridge 無し）と混同せず、所有未証明の veth を `Unknown` で取り残して消さない。
+    /// この経路では bridge の `NotFound` も `Unknown` になるため、区別はエラーコードの照合で固定する。
+    /// attach の回収の bridge 照会は veth の所有証明の中で行うので、失敗した手順は `DeleteVeth`。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_keeps_veth() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.removed.is_empty());
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert_eq!(fake.calls(), dataloss_probe_calls());
+
+        // 対照: NotFound でも取り残しは同じ Unknown だが、コードは NotFound のまま運ばれ DataLoss と区別できる。
+        let nf = Fake {
+            bridge_lookup_err: Some(NetErrorCode::NotFound),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&nf, &attach_claim(true, false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert_eq!(nf.calls(), dataloss_probe_calls());
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510: bridge の照会が `DataLoss` のとき、veth・netns の pin・IPAM のいずれにも
+    /// 触れない。最初のエラー（DataLoss・DeleteVeth）は後続の pin 側の前提違反で上書きされない（ERR-1）。
+    /// 本関数は IPAM を受け取らず、アドレス・ポート予約の quarantine は請求書に残って `delete_network` が解放する。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_touches_nothing() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let claim = attach_claim(true, true, true);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.removed.is_empty());
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Unknown),
+            ]
+        );
+        // カーネル操作は照会 2 件だけ（delete_link・unpin_path・pin_absent を呼ばない）。
+        assert_eq!(fake.calls(), dataloss_probe_calls());
+        assert!(!e.report.leftover.iter().any(|(r, _)| matches!(
+            r,
+            DeleteResource::Address(..) | DeleteResource::PortReservation(..)
+        )));
+        assert!(claim.quarantine_only().is_some());
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510: DNAT ルールの回収は bridge の照会と独立で、照会が `DataLoss` でも
+    /// ルールは消え、veth だけが `Unknown` で残る。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_rules_still_reclaimed() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &rules_claim(true, false), &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.report.removed, vec![port_res(8080), port_res(8081)]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
     /// NET-1・#2681: トークンが別ネットワークのものなら、ops を呼ばずに Validate で拒否する。
     #[test]
     fn net1_reclaim_attach_rejects_foreign_token_before_io() {

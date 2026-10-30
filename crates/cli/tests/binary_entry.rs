@@ -3777,3 +3777,129 @@ fn net6_net9_cli1_3529_network_rm_refused_while_referenced_then_succeeds() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\tMODE\tSUBNET\n");
     let _ = std::fs::remove_dir_all(dir);
 }
+/// op ログを読み、行を `(op, success, failure)` の `op_stats` 行とメタ行（`ops=N`）の列として照合する。
+///
+/// `expected` の各要素は 1 組（`op_stats` 行の列 + 対応するメタ行）。組内は操作名の昇順で、行の形式
+/// （接頭辞・末尾 `}`・`{` が 1 つだけ）は壊れた行を見逃さないよう完全一致で見る（#3558）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn assert_op_log_groups(log: &std::path::Path, expected: &[&[(&str, u32, u32)]]) {
+    let text = std::fs::read_to_string(log).expect("read op log");
+    assert!(text.ends_with('\n'), "{text:?}");
+    let mut lines = text.lines();
+    for group in expected {
+        for (op, ok, ng) in *group {
+            let line = lines.next().unwrap_or_default();
+            let head = format!(
+                "{{\"event\":\"op_stats\",\"op\":\"{op}\",\"success\":{ok},\"failure\":{ng},\"count\":{},\"min_us\":",
+                ok + ng
+            );
+            assert!(line.starts_with(&head), "{line:?} vs {head:?}\n{text}");
+            assert!(line.ends_with('}'), "{line:?}");
+            assert_eq!(line.matches('{').count(), 1, "{line:?}");
+        }
+        let meta = format!(
+            "{{\"event\":\"op_stats_meta\",\"ops\":{},\"dropped_records\":0}}",
+            group.len()
+        );
+        assert_eq!(lines.next(), Some(meta.as_str()), "{text}");
+    }
+    assert_eq!(lines.next(), None, "unexpected extra lines:\n{text}");
+}
+
+/// REPAIR-4・NET-6・CLI-1（#3558）: 実バイナリで `FANDHE_CONTAINER_OP_LOG` を設定した `create --network <名前>` が、
+/// 本体の記録器の組（`create`）と定義照合の記録器の組（`network.store.open` / `network.store.get`）をこの順で
+/// 別々の組（メタ行つき）として追記し、定義照合が走らない失敗では 2 組目を出さないこと。
+/// 記録器を統合しない判断は `docs/design/network-wiring.md`。成功経路（core の create まで到達）は信頼検証を通る
+/// pasta の配置が環境依存のため扱わず、保持区間の記録は `create_network` の関数単位の試験が固定する。
+/// root の実行は rootful 扱いで名前つきネットワークが `UNIMPLEMENTED` のため試験しない。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[test]
+fn repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group() {
+    use std::os::unix::fs::MetadataExt as _;
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        return;
+    }
+    let tmp = TmpDir::new("net6-3558");
+    let dir = isolated_cli_dir("net6-3558");
+    let cli = dir.join("fandhe-container");
+    let state = tmp.0.join("state");
+    let state_s = state.to_str().expect("utf8");
+    let missing_pasta = "/nonexistent-dir/pasta";
+    let create = |log: &std::path::Path, root: &str, net: &str, pasta: bool| {
+        let mut args = vec!["--root", root];
+        if pasta {
+            args.extend(["--pasta-path", missing_pasta]);
+        }
+        args.extend([
+            "create",
+            "--bundle",
+            "/nonexistent-bundle",
+            "--network",
+            net,
+            "c1",
+        ]);
+        run_exe_env(&cli, &args, &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())])
+    };
+
+    // (a) 状態ルート未作成: 定義が無く NOT_FOUND。open は Ok(None) でも成功として数える。
+    let never = tmp.0.join("never-created");
+    let log = tmp.0.join("a.jsonl");
+    let out = create(&log, never.to_str().expect("utf8"), "web", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("network not found"));
+    assert!(!never.exists(), "state root must not be created");
+    assert_op_log_groups(
+        &log,
+        &[&[("create", 0, 1)], &[("network.store.open", 1, 0)]],
+    );
+
+    // 定義 web を作る（op ログなし）。
+    let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // (b) 別の名前: open 成功・get 失敗。
+    let log = tmp.0.join("b.jsonl");
+    let out = create(&log, state_s, "other", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("network not found"));
+    assert_op_log_groups(
+        &log,
+        &[
+            &[("create", 0, 1)],
+            &[("network.store.get", 0, 1), ("network.store.open", 1, 0)],
+        ],
+    );
+
+    // (c) 定義はあるが pasta が無い: 照合は成功し、その後の pasta の検証で失敗する。
+    let log = tmp.0.join("c.jsonl");
+    let out = create(&log, state_s, "web", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pasta binary was not found"));
+    assert_op_log_groups(
+        &log,
+        &[
+            &[("create", 0, 1)],
+            &[("network.store.get", 1, 0), ("network.store.open", 1, 0)],
+        ],
+    );
+
+    // (d) pasta の指定なし: decide の段で失敗し、定義照合は走らないので 2 組目は出ない。
+    let log = tmp.0.join("d.jsonl");
+    let out = create(&log, state_s, "web", false);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pasta path is not configured"));
+    assert_op_log_groups(&log, &[&[("create", 0, 1)]]);
+    let _ = std::fs::remove_dir_all(dir);
+}

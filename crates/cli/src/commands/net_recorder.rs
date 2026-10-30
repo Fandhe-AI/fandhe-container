@@ -1,7 +1,7 @@
 //! net の `NetOpRecorder` を CLI の `OpRecorder` へ橋渡しするアダプタ（REPAIR-4・NET-6・CLI-1・#3066）。
 //!
 //! 呼び出し元は `network.rs` の `network create` / `network rm` / `network ls` と、`create_start::run_create` の
-//! 定義照合(`require_named_definition`。#3329・#3530。本体の記録器とは別に持ち、末尾で別に `export_ops` する)。`NetworkStore::open_with_recorder` へ
+//! 定義照合(`require_named_definition`。#3329・#3530。本体の記録器とは別に持ち、op ログの 2 組目として末尾で別に `export_ops` する。契約は `docs/design/network-wiring.md`・#3558)。`NetworkStore::open_with_recorder` へ
 //! 渡し、定義ストアの open / create / list / remove の結果と所要時間を、1 回のコマンドごとに作る `OpRecorder` へ
 //! `network.store.*` の名前で記録する。記録はコマンド末尾の `export_ops` が構造化ログ（`FANDHE_CONTAINER_OP_LOG`）へ出す。
 //!

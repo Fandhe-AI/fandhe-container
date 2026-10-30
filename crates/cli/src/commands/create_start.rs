@@ -876,7 +876,9 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
     // 定義照合の定義ストア操作(`network.store.open` / `network.store.get`)の記録先(REPAIR-4・NET-6・#3329)。
-    // 本体の記録器は production_runtime が所有するため別に持ち、末尾で同じ出力先へ書く。
+    // 本体の記録器は production_runtime が所有するため別に持ち、末尾で同じ出力先へ書く。op ログには
+    // 「本体の組 → 定義照合の組」の最大 2 組(各組が自分のメタ行を持つ)が出る。照合が走らなければ 2 組目は無い。
+    // 統合しない理由と契約は docs/design/network-wiring.md(#3558)。
     let net_recorder = Arc::new(OpRecorder::new());
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
@@ -954,6 +956,7 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r
     });
+    // 2 組目(定義照合)。空なら出さない。本体の組の後に 1 回の write で追記する(#3558)。
     if !net_recorder.snapshot().is_empty() {
         export_ops(&net_recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     }

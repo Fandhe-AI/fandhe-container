@@ -359,15 +359,9 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
-    fn scratch() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fc-io-uds-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    /// 排他作成の専用ディレクトリ（drop で自分の分だけ消す。REPAIR-12）。
+    fn scratch() -> crate::test_temp_file::TempDir {
+        crate::test_temp_file::TempDir::new("fc-io-uds")
     }
 
     fn soon() -> Instant {
@@ -421,36 +415,36 @@ mod tests {
     /// IO-1・PLUG-12: 存在しないパス（ENOENT）は `Unavailable`。
     #[test]
     fn io1_uds_connect_missing_path_is_unavailable() {
-        let dir = scratch();
+        let guard = scratch();
+        let dir = guard.path().to_path_buf();
         let r = connect_unix_until(&dir.join("none.sock"), soon());
         assert_eq!(code(r), IoErrorCode::Unavailable);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// IO-1・PLUG-12: listener が閉じてパスだけ残る（ECONNREFUSED）場合は `Unavailable`。
     #[test]
     fn io1_uds_connect_refused_is_unavailable() {
-        let dir = scratch();
+        let guard = scratch();
+        let dir = guard.path().to_path_buf();
         let path = dir.join("stale.sock");
         drop(UnixListener::bind(&path).expect("bind"));
         assert_eq!(
             code(connect_unix_until(&path, soon())),
             IoErrorCode::Unavailable
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// IO-1・PLUG-12: 接続できる listener には `Some(stream)` を返す。
     #[test]
     fn io1_uds_connect_succeeds_against_listener() {
-        let dir = scratch();
+        let guard = scratch();
+        let dir = guard.path().to_path_buf();
         let path = dir.join("ok.sock");
         let _l = UnixListener::bind(&path).expect("bind");
         let s = connect_unix_until(&path, soon())
             .expect("connect")
             .expect("not timed out");
         drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5: backlog 満杯の listener への connect は、期限を過ぎたら `Ok(None)` で戻る。
@@ -462,7 +456,8 @@ mod tests {
     ))]
     #[test]
     fn repair5_uds_connect_times_out_on_full_backlog() {
-        let dir = scratch();
+        let guard = scratch();
+        let dir = guard.path().to_path_buf();
         let path = dir.join("full.sock");
         let l = UnixListener::bind(&path).expect("bind");
         // std の bind の backlog は大きいため、listen(2) を再発行して backlog を 0 に絞る
@@ -486,7 +481,6 @@ mod tests {
         assert!(timed_out, "backlog never filled");
         assert!(started.elapsed() < Duration::from_secs(30));
         drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// IO-1・PLUG-12: errno の写像（資源不足・パス起因・権限）が固定どおりであること。

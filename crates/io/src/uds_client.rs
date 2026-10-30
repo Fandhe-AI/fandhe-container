@@ -184,7 +184,7 @@ mod imp {
             PolicyKind::SameEffective => crate::sys::effective_uid(),
         };
 
-        precheck_server_path(path, expected_uid)?;
+        precheck_server_path(path, expected_uid, &mut observer, started)?;
 
         let stream = crate::sys::uds::connect_unix_until(path, deadline)?.ok_or_else(|| {
             IoError::new(
@@ -211,7 +211,34 @@ mod imp {
     }
 
     /// 接続前の補助検査（F12 手順 2）。サーバーの bind 検査に揃える。
-    pub(super) fn precheck_server_path(path: &Path, expected_uid: u32) -> Result<(), IoError> {
+    /// 親ディレクトリの不在は `Unavailable`（F12。ソケット不在と同じ分類）、権限・symlink
+    /// 違反は `InvalidArgument`。所有者の不一致（親ディレクトリ・ソケット）は接続後の照合と
+    /// 同様に観測へ `Connect` の拒否として 1 件通知する（F13・REPAIR-4）。
+    pub(super) fn precheck_server_path<C: ServerObserver>(
+        path: &Path,
+        expected_uid: u32,
+        observer: &mut C,
+        started: Instant,
+    ) -> Result<(), IoError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            match fs::symlink_metadata(parent) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(IoError::new(
+                        IoErrorCode::Unavailable,
+                        "parent directory of the socket path does not exist",
+                    ));
+                }
+                Ok(m) if !m.file_type().is_symlink() && m.is_dir() && m.uid() != expected_uid => {
+                    return Err(reject_owner(
+                        observer,
+                        started,
+                        m.uid(),
+                        "parent directory of the socket path is not owned by the expected uid",
+                    ));
+                }
+                _ => {}
+            }
+        }
         validate_socket_parent_dir(path, expected_uid)?;
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -241,12 +268,26 @@ mod imp {
             ));
         }
         if meta.uid() != expected_uid {
-            return Err(IoError::new(
-                IoErrorCode::InvalidArgument,
+            return Err(reject_owner(
+                observer,
+                started,
+                meta.uid(),
                 "socket file is not owned by the expected uid",
             ));
         }
         Ok(())
+    }
+
+    /// 接続前の所有者不一致を `InvalidArgument` にして観測へ通知する。
+    fn reject_owner<C: ServerObserver>(
+        observer: &mut C,
+        started: Instant,
+        found_uid: u32,
+        message: &'static str,
+    ) -> IoError {
+        let err = IoError::new(IoErrorCode::InvalidArgument, message);
+        notify_connect_rejected(observer, started, Some(found_uid), &err);
+        err
     }
 
     /// 接続後の peer uid の照合（正の検証。SEC-4・PLUG-12）。取得失敗も不一致も拒否し、
@@ -268,6 +309,17 @@ mod imp {
             ),
             Err(e) => (None, e),
         };
+        notify_connect_rejected(observer, started, peer_uid, &err);
+        Err(err)
+    }
+
+    /// `Connect` の拒否イベントを観測へ 1 件通知する。
+    fn notify_connect_rejected<C: ServerObserver>(
+        observer: &mut C,
+        started: Instant,
+        peer_uid: Option<u32>,
+        err: &IoError,
+    ) {
         observer.on_event(&ServerEvent {
             op: ServerOp::Connect,
             kind: None,
@@ -283,7 +335,6 @@ mod imp {
                 message: err.message(),
             }),
         });
-        Err(err)
     }
 
     #[cfg(test)]
@@ -320,9 +371,9 @@ mod tests {
     use super::imp::{precheck_server_path, verify_server_peer_for_test};
     use super::*;
     use crate::observe::{ServerEvent, ServerOp, ServerOutcome};
+    use crate::test_temp_file::TempDir;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
     use std::time::Instant;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,16 +404,11 @@ mod tests {
         crate::sys::effective_uid()
     }
 
-    /// 0700 の一時ディレクトリ（テストごとに固有）。
-    fn private_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fc-io-udsc-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    /// 0700 の一時ディレクトリ（排他作成。drop で自分の分だけ消す。REPAIR-12）。
+    fn private_dir(tag: &str) -> TempDir {
+        let dir = TempDir::new(&format!("fc-io-udsc-{tag}"));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
         dir
     }
 
@@ -423,49 +469,69 @@ mod tests {
     fn io1_plug12_precheck_server_path_cases() {
         let me = euid();
 
+        let mut rec = Recorder::default();
+        let log = rec.0.clone();
         // 正常: 自分所有の 0700 ディレクトリ内のソケット。
-        let dir = private_dir("ok");
+        let dir_guard = private_dir("ok");
+        let dir = dir_guard.path().to_path_buf();
         let sock = dir.join("s.sock");
         let _l = UnixListener::bind(&sock).expect("bind");
-        precheck_server_path(&sock, me).expect("owner socket is accepted");
+        precheck(&sock, me, &mut rec).expect("owner socket is accepted");
         // 所有者の不一致。
-        let err = precheck_server_path(&sock, me.wrapping_add(1)).expect_err("owner mismatch");
+        let err = precheck(&sock, me.wrapping_add(1), &mut rec).expect_err("owner mismatch");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        let events = log.lock().expect("lock").clone();
+        assert_eq!(events.len(), 1, "socket owner mismatch is notified");
+        assert_eq!(events[0].op, ServerOp::Connect);
+        assert_eq!(events[0].outcome, ServerOutcome::RejectedPeerCredential);
+        assert_eq!(events[0].code, Some(IoErrorCode::InvalidArgument));
+
+        // 親ディレクトリが存在しない（F12: ENOENT は Unavailable）。
+        let err = precheck(&dir.join("nodir").join("s.sock"), me, &mut rec).expect_err("no parent");
+        assert_eq!(err.code(), IoErrorCode::Unavailable);
 
         // 存在しない。
-        let err = precheck_server_path(&dir.join("none.sock"), me).expect_err("missing");
+        let err = precheck(&dir.join("none.sock"), me, &mut rec).expect_err("missing");
         assert_eq!(err.code(), IoErrorCode::Unavailable);
 
         // 通常ファイル。
         let file = dir.join("plain");
         std::fs::write(&file, b"x").expect("write");
-        let err = precheck_server_path(&file, me).expect_err("not a socket");
+        let err = precheck(&file, me, &mut rec).expect_err("not a socket");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         // ソケットへの symlink。
         let link = dir.join("link.sock");
         std::os::unix::fs::symlink(&sock, &link).expect("symlink");
-        let err = precheck_server_path(&link, me).expect_err("symlink");
+        let err = precheck(&link, me, &mut rec).expect_err("symlink");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        // 親ディレクトリの所有者の不一致も観測へ通知する（F13・REPAIR-4）。
+        log.lock().expect("lock").clear();
+        let err = precheck(&sock, me.wrapping_add(1), &mut rec).expect_err("parent owner");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(log.lock().expect("lock").len(), 1);
 
         // 親ディレクトリが group / other に開かれている。
         for mode in [0o720, 0o702, 0o770] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            let err = precheck_server_path(&sock, me).expect_err("open parent");
+            let err = precheck(&sock, me, &mut rec).expect_err("open parent");
             assert_eq!(err.code(), IoErrorCode::InvalidArgument, "mode={mode:o}");
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
         // 親ディレクトリが symlink。
-        let real = private_dir("real");
+        let real_guard = private_dir("real");
+        let real = real_guard.path().to_path_buf();
         let real_sock = real.join("s.sock");
         let _l2 = UnixListener::bind(&real_sock).expect("bind");
         let parent_link = dir.join("parent-link");
         std::os::unix::fs::symlink(&real, &parent_link).expect("symlink");
-        let err = precheck_server_path(&parent_link.join("s.sock"), me).expect_err("parent link");
+        let err = precheck(&parent_link.join("s.sock"), me, &mut rec).expect_err("parent link");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&real);
+    fn precheck(path: &Path, uid: u32, rec: &mut Recorder) -> Result<(), IoError> {
+        precheck_server_path(path, uid, rec, Instant::now())
     }
 }

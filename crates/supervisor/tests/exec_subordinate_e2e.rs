@@ -241,6 +241,9 @@ mod linux {
     /// 試験専用の停止の注入。値は `STAGES` の段名に限る。指定した段の開始行の直後で worker が止まり、watchdog の
     /// 期限切れ・回収・固定の失敗行を実証できる。未設定では何もしない。
     const HANG_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_HANG";
+    /// 試験専用の期限の短縮（秒。1..=30）。`HANG_ENV` が許可リストの値のときだけ効き、実機の期限を縮めない。
+    /// watchdog の自己照合が短い期限で期限切れの経路を実証するために使う。
+    const DEADLINE_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_DEADLINE_SECS";
     /// 段の名前の固定一覧（注入の許可リストを兼ねる）。
     const STAGES: [&str; 16] = [
         "preconditions",
@@ -278,6 +281,15 @@ mod linux {
     }
 
     fn deadline() -> Duration {
+        let injected = std::env::var(HANG_ENV).is_ok_and(|h| hang_is_valid(&h));
+        if injected
+            && let Some(secs) = std::env::var(DEADLINE_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|s| (1..=30).contains(s))
+        {
+            return Duration::from_secs(secs);
+        }
         deadline_for(timeout().as_secs())
     }
 
@@ -319,6 +331,53 @@ mod linux {
             STAGES.iter().all(|s| !s.is_empty() && !s.contains(' ')),
             "stage names must be single tokens"
         );
+        self_check_expiry();
+    }
+
+    /// watchdog の期限切れの経路を短い期限と停止する worker（`HANG_ENV`）で実証する（REPAIR-5・REPAIR-12）。
+    /// 自分自身を `--ignored` で子として起動し、終了コード 124・固定の失敗行・止まった段の行・worker の消滅を
+    /// 具体値で照合する。worker は最初の段（`preconditions`）の開始直後に止まるので、実機の前提は要らない。
+    fn self_check_expiry() {
+        let exe = std::env::current_exe().expect("current exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--ignored")
+            .env(HANG_ENV, "preconditions")
+            .env(DEADLINE_ENV, "2")
+            .stdin(std::process::Stdio::null());
+        let out = crate::reap::output_within(&mut cmd, Duration::from_secs(60))
+            .expect("the watchdog self-check child must finish");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_WATCHDOG_EXPIRED),
+            "stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("exec_subordinate_e2e: WATCHDOG EXPIRED (the test did not finish within the deadline; descendants were killed)"),
+            "stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("watchdog deadline_secs=2 reason="),
+            "stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("exec_subordinate_e2e: stage=preconditions begin"),
+            "stdout={stdout}"
+        );
+        assert!(!stdout.contains("LEFTOVER"), "stdout={stdout}");
+        // 止まった worker が watchdog の終了後に残っていないこと。
+        let marker = "injected hang at stage preconditions pid=";
+        let pid: u32 = stderr
+            .split(marker)
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("worker pid line missing: stderr={stderr}"));
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "worker {pid} must be gone after the watchdog exits"
+        );
     }
 
     fn watchdog_pid() -> u32 {
@@ -352,7 +411,10 @@ mod linux {
             panic!("the watchdog parent process is gone");
         }
         if std::env::var(HANG_ENV).as_deref() == Ok(name) {
-            eprintln!("exec_subordinate_e2e: injected hang at stage {name}");
+            eprintln!(
+                "exec_subordinate_e2e: injected hang at stage {name} pid={}",
+                std::process::id()
+            );
             loop {
                 std::thread::sleep(Duration::from_secs(1));
             }

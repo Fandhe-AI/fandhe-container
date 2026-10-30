@@ -156,6 +156,17 @@ mod tests {
     }
 }
 
+/// 自前の宣言・定数の `libc` との機械照合（#3319・#1837・REPAIR-12。方式は `docs/design/ffi-libc-check.md`）。
+///
+/// 照合するもの: `SIGTERM`・`ESRCH`・`EINVAL` と `kill` の関数型（自前と `libc::kill` の対）。
+///
+/// 照合しないもの:
+/// - 対応外アーキテクチャの `consts`（`SIGTERM = 0` などのプレースホルダ）: カーネルへ渡さず、意図して `libc` と
+///   一致させない。本モジュールの cfg を LP64 の x86_64・aarch64 に限ることで、照合対象だけを検査する
+/// - `set_pdeathsig_sigkill`（`prctl(PR_SET_PDEATHSIG)`）: `sys/holder.rs` から再利用しており、`prctl` と
+///   `PR_SET_PDEATHSIG` は holder の `libc_abi` で照合済みのため二重に照合しない
+/// - `getppid`: 自前の FFI 宣言が無く、`std::os::unix::process::parent_id` を使う
+/// - `Child::try_wait`・SIGKILL（`Child::kill`）: どちらも std の API で自前の宣言が無い
 #[cfg(all(
     test,
     target_pointer_width = "64",

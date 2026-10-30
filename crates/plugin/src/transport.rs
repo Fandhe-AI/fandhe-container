@@ -1644,8 +1644,8 @@ mod tests {
         struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
         impl TempDir {
             fn new() -> Self {
-                // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
-                // 非 root の単体試験なので作成前の削除（A）でよい。名前は sun_path のため短く保つ。
+                // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+                // 名前は sun_path のため短く保つ。
                 let root = crate::test_root::test_root("fctr", "t");
                 Self(root.to_path_buf(), root)
             }
@@ -1829,39 +1829,10 @@ mod tests {
     }
 
     /// 相手を `drop` し、その close が自分側へ届いたこと（EOF）を期限つきで確かめてから包む。
-    ///
-    /// 並行する試験の fork から exec までの間は、子が相手 fd の複製を持ち、`drop(peer)` だけでは
-    /// socket が閉じきらない。その状態の 1 回の write は成功してしまう（#3436）。`shutdown` を誰も
-    /// 呼ばないので、自分側の EOF は相手 socket の最後の参照が閉じたときにだけ起きる。Linux は
-    /// 閉鎖の際に相手を dead 化するため、EOF が見えれば以後の write は EPIPE になる。macOS も
-    /// 切断が両端にかかり同様。待ちは 10 秒で打ち切る（REPAIR-5）。
+    /// 確認の方式と理由は `spawn_gate::unix_pair_with_closed_peer`（#3436・#3474）。
     #[cfg(unix)]
     fn stream_pair_with_closed_peer() -> UdsStream {
-        use std::io::Read as _;
-        let (ours, peer) = crate::spawn_gate::create_fds(
-            std::time::Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
-            std::os::unix::net::UnixStream::pair,
-        )
-        .unwrap();
-        drop(peer);
-        ours.set_nonblocking(true).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut probe = [0u8; 1];
-        loop {
-            match (&ours).read(&mut probe) {
-                Ok(0) => break,
-                Ok(n) => panic!("unexpected {n} byte(s) from closed peer"),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "peer close was not observed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("probe read failed: {e:?}"),
-            }
-        }
-        ours.set_nonblocking(false).unwrap();
+        let ours = crate::spawn_gate::unix_pair_with_closed_peer();
         UdsStream {
             inner: imp::StreamInner::from_std(ours),
             poisoned: false,

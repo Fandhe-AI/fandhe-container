@@ -7,6 +7,12 @@
 //! 取り込み側は `vm_boot.rs`・`vm_cold_start.rs` に加え、`virtiofs_io.rs`・`virtiofs_link.rs`（#3456）。
 //! kernel 未設定時の panic 文言は呼び出し側が渡す。`virtiofs_link.rs` は disk を使わない（読むだけで無視する）。
 //!
+//! virtiofs 試験の `probe_spec`（`virtiofs_io.rs`）・`link_spec`（`virtiofs_link.rs`）は `console_boot_spec` の上に
+//! 組み直さない（#3484・REPAIR-1）。`link_spec` は意図して disk を付けず、組み直すと disk 無効化の上書きを
+//! 共有側へ足すことになり、`FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE` を設定した実機で挙動が変わりうる。重複は
+//! コンソール device の組み立て十数行に留まり、virtiofs・ゲスト mount・試験モードは試験ごとに違う。
+//! 実行時の確認は macOS のネイティブでしかできない（PR の CI は型検査のみ）ため、リスクに見合わない。
+//!
 //! 取り込み側は macOS 限定にし、`#[path = "support/common.rs"] mod common;` を先にトップレベルで宣言すること
 //! （本ファイルは `super::common` を参照する）。
 

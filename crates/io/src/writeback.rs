@@ -422,6 +422,59 @@ impl AppendFileSink {
         self
     }
 
+    /// 次の永続化の対象か（`serve_file_connection` の接続単位の FLUSH が使う。F9・IO-2）。
+    /// 書き込みが入った、または親ディレクトリのエントリが未同期なら真。
+    pub(crate) fn needs_persist(&self) -> bool {
+        self.dirty_since_persist || !self.parent_dirs_synced
+    }
+
+    /// 対象ファイルの複製ハンドル（接続単位の永続化に渡す。パスは再解決しない）。
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "macOS / Windows の接続単位の永続化だけが使う")
+    )]
+    pub(crate) fn clone_file_for_persist(&self) -> Result<File, IoError> {
+        self.file.try_clone().map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to duplicate handle for persist ({:?})", err.kind()),
+            )
+        })
+    }
+
+    /// 未同期の親ディレクトリの複製ハンドル。同期済みなら空。親ディレクトリを持たない sink は
+    /// 新規作成ファイルの名前を保証できないため `Unimplemented`（`persist` と同じ fail-closed）。
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "macOS / Windows の接続単位の永続化だけが使う")
+    )]
+    pub(crate) fn clone_unsynced_dirs_for_persist(&self) -> Result<Vec<File>, IoError> {
+        let Some(dirs) = self.parent_dirs.as_ref().filter(|dirs| !dirs.is_empty()) else {
+            return Err(IoError::new(
+                IoErrorCode::Unimplemented,
+                "parent directories are not configured; cannot persist the directory entry, refusing to send FlushAck",
+            ));
+        };
+        if self.parent_dirs_synced {
+            return Ok(Vec::new());
+        }
+        dirs.iter()
+            .map(File::try_clone)
+            .collect::<Result<Vec<File>, _>>()
+            .map_err(|err| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to duplicate directory handle ({:?})", err.kind()),
+                )
+            })
+    }
+
+    /// 接続単位の永続化が成功したことを記録する（以後の FLUSH は再同期しない）。
+    pub(crate) fn mark_persisted(&mut self) {
+        self.dirty_since_persist = false;
+        self.parent_dirs_synced = true;
+    }
+
     /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
     /// [`MAX_IO_TIMEOUT`]。REPAIR-5）。
     ///

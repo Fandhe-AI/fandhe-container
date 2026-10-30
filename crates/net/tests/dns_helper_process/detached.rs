@@ -959,11 +959,14 @@ pub fn foreign_uid(exe: &Path) {
     let tmp = Tmp::new("foreign");
     let nobody = 65534u32;
     std::os::unix::fs::chown(&tmp.0, Some(nobody), Some(nobody)).expect("chown tmp");
-    // 子（uid 65534）が実行できるよう、試験バイナリを専用ディレクトリへ複製する。
-    let bin = tmp.0.join("test-bin");
+    // 子（uid 65534）が実行できるよう、試験バイナリを複製する。複製先は root 所有で他 uid が変更できない別ディレクトリにし、
+    // uid 65534 に渡した状態ディレクトリとは分ける（同 uid による symlink 差し替えで root のファイル操作を
+    // 誘導されない。他 uid へ渡したディレクトリ内で root はファイル操作をしない）。
+    let bindir = Tmp::new("foreign-bin");
+    std::fs::set_permissions(&bindir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let bin = bindir.0.join("test-bin");
     std::fs::copy(exe, &bin).expect("copy exe");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    std::os::unix::fs::chown(&bin, Some(nobody), Some(nobody)).expect("chown bin");
     let mut child = Command::new("setpriv")
         .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
         .arg(&bin)
@@ -993,18 +996,39 @@ pub fn foreign_uid(exe: &Path) {
         }
     });
     let within = crate::reap::reap_within();
+    let helper = std::cell::Cell::new(None::<(u32, u64)>);
     let recv_line = |child: &mut std::process::Child, what: &str| -> String {
         match rx.recv_timeout(within) {
             Ok(l) => l,
             Err(e) => {
-                kill_helpers_under(&tmp.0);
+                if let Some(id) = helper.get() {
+                    kill_helper_if_same(id);
+                }
                 crate::reap::reap_or_report(child, within);
                 panic!("no {what} line from the foreign-uid child within {within:?}: {e}");
             }
         }
     };
     let line = recv_line(&mut child, "CHILD-READY");
-    assert_eq!(line.trim(), "CHILD-READY", "child did not start the helper");
+    // 子がヘルパーの同一性（pid・開始時刻）を知らせる。後始末の帰属確認に使う。
+    let helper_id = {
+        let mut it = line.split_whitespace();
+        assert_eq!(
+            it.next(),
+            Some("CHILD-READY"),
+            "child did not start the helper"
+        );
+        let pid = it
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("helper pid");
+        let start = it
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("helper start");
+        (pid, start)
+    };
+    helper.set(Some(helper_id));
 
     // root は DAC を越えて接続できるが、ヘルパーは uid 不一致として読まずに切断する。
     let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
@@ -1028,7 +1052,9 @@ pub fn foreign_uid(exe: &Path) {
             ) => {}
         Ok(_) => panic!("a foreign uid must not receive any frame"),
         Err(e) => {
-            kill_helpers_under(&tmp.0);
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
             crate::reap::reap_or_report(&mut child, within);
             panic!("foreign uid read was not a disconnect: {e:?}");
         }
@@ -1045,7 +1071,9 @@ pub fn foreign_uid(exe: &Path) {
     let status = match crate::reap::wait_within(&mut child, within) {
         Ok(st) => st,
         Err(e) => {
-            kill_helpers_under(&tmp.0);
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
             crate::reap::reap_or_report(&mut child, within);
             panic!("foreign-uid child did not exit: {e}");
         }
@@ -1054,29 +1082,21 @@ pub fn foreign_uid(exe: &Path) {
     println!("dns_helper_process: control_foreign_uid ok peer_uid=65534 foreign=dropped");
 }
 
-/// 状態ルート `root` を引数に持つ残存プロセス（`foreign_uid` の子が起こしたヘルパー）を `/proc` から探して
-/// `kill -KILL` する（期限切れ時の回収。外部 `kill` は期限つき実行）。
-fn kill_helpers_under(root: &Path) {
-    let needle = root.to_string_lossy().into_owned();
-    let me = std::process::id();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if String::from_utf8_lossy(&raw).contains(&needle) {
-            let mut kill = Command::new("kill");
-            kill.args(["-KILL", &pid.to_string()]);
-            let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
-        }
+/// 期限切れ時の回収。子が知らせたヘルパーの同一性（pid・開始時刻）と、実 uid が 65534 であることを確かめてから
+/// `kill -KILL` する（cmdline の部分文字列では選ばない。別プロセスや root のプロセスを止めない）。確認から kill までの
+/// pid 再利用の窓は残るが、開始時刻と uid の両方が一致する必要がある。外部 `kill` は期限つき実行。
+fn kill_helper_if_same((pid, start): (u32, u64)) {
+    let same_start = read_identity(pid).is_ok_and(|id| id.start_time_ticks == start);
+    let nobody_owned = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .is_some_and(|l| l.split_whitespace().nth(1) == Some("65534"));
+    if same_start && nobody_owned {
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", &pid.to_string()]);
+        let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+    } else {
+        eprintln!("kill helper: pid {pid} not attributed; not killing");
     }
 }
 
@@ -1099,9 +1119,12 @@ pub fn foreign_uid_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCod
     let n = g.lock_network(&name).expect("net");
     n.commit_member(&member("web", 2)).expect("web");
     let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
-    spawn_detached_dns_helper(&n, &exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+    let h = spawn_detached_dns_helper(&n, &exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
         .expect("spawn");
-    println!("CHILD-READY");
+    println!(
+        "CHILD-READY {} {}",
+        h.identity.pid, h.identity.start_time_ticks
+    );
     let mut go = String::new();
     std::io::stdin().read_line(&mut go).expect("go");
     assert_eq!(

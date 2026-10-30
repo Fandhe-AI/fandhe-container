@@ -2,7 +2,7 @@
 # scripts/targets/repeat-test.sh の自己テスト（REPAIR-12・#2538）。
 #
 # 役割: スタブの cargo だけで、成功・0 件実行（false-green）・途中 1 回の失敗・入力不正の終了コードと
-# 集計行を具体値で照合する。実際の試験は走らせない。呼び出し元: Makefile の `repeat-test-selftest`。
+# 集計行を具体値で照合する。試験バイナリ watchdog の期限の受け渡し（#3504・#3555）も照合する。実際の試験は走らせない。呼び出し元: Makefile の `repeat-test-selftest`。
 set -uo pipefail
 
 script_dir="$(cd "$(dirname -- "$0")" && pwd)"
@@ -42,6 +42,7 @@ case " $* " in
   *" --logfile "*) [ -z "${STUB_NO_LOGFILE:-}" ] || { echo "error: Unrecognized option: 'logfile'" >&2; exit 101; } ;;
 esac
 [ -z "${STUB_ENV_LOG:-}" ] || echo "cargo-env: ${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}" >>"${STUB_ENV_LOG}"
+[ -z "${STUB_ENV_LOG:-}" ] || echo "cargo-deadline: ${FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS:-unset}" >>"${STUB_ENV_LOG}"
 n=0
 [ ! -f "${STUB_COUNTER}" ] || n="$(cat "${STUB_COUNTER}")"
 n=$((n + 1))
@@ -102,6 +103,7 @@ case " \$* " in
     exit 0 ;;
 esac
 echo "env-seen: FANDHE_CONTAINER_TEST_ID_HELPER=\${FANDHE_CONTAINER_TEST_ID_HELPER:-unset}"
+echo "deadline-seen: \${FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS:-unset}"
 echo "user-seen: \${USER:-unset}"
 case "\${STUB_MODE}" in
   scope-ok) echo '${FINAL_LINE}' ;;
@@ -421,6 +423,34 @@ if grep -qxF 'cargo-env: unset' "${work}/envlog"; then
 else
   echo "NG: test-env-absent" >&2; cat "${work}/envlog" >&2; fails=$((fails + 1))
 fi
+# 試験バイナリ watchdog の期限（#3504）が RUN_TIMEOUT + 30（上限 3600）で cargo の子へ渡る（#3555・REPAIR-5）。
+# deadline_case <名前> <期待値> <行数> <呼び出し元が設定する値 or ""> <引数...>
+deadline_case() {
+  local name="$1" want="$2" lines="$3" caller="$4"
+  shift 4
+  rm -f "${work}/envlog" "${work}/counter"
+  if [ -n "${caller}" ]; then
+    env PATH="${work}/bin:${PATH}" STUB_MODE=bin-ok STUB_COUNTER="${work}/counter" STUB_ENV_LOG="${work}/envlog" \
+      FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS="${caller}" "$@" "${target}" >/dev/null 2>&1
+  else
+    env PATH="${work}/bin:${PATH}" STUB_MODE=bin-ok STUB_COUNTER="${work}/counter" STUB_ENV_LOG="${work}/envlog" \
+      "$@" "${target}" >/dev/null 2>&1
+  fi
+  if [ "$(grep -cxF "cargo-deadline: ${want}" "${work}/envlog")" -eq "${lines}" ]; then
+    echo "OK: ${name}"
+  else
+    echo "NG: ${name}: want ${lines} line(s) of 'cargo-deadline: ${want}'" >&2; cat "${work}/envlog" >&2; fails=$((fails + 1))
+  fi
+}
+deadline_case deadline-default 150 2 "" "${P}" "${B}" "${S}" COUNT=2
+deadline_case deadline-run-timeout-1 31 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=1
+deadline_case deadline-below-cap 3599 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=3569
+deadline_case deadline-cap-boundary-3570 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=3570
+deadline_case deadline-cap-3590 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=3590
+deadline_case deadline-cap-3600 3600 1 "" "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=3600
+deadline_case deadline-overrides-caller 150 1 off "${P}" "${B}" "${S}" COUNT=1
+deadline_case deadline-lib-mode 150 1 "" "${P}" "${T}" COUNT=1
+check deadline-scope-mode 0 "passed=1 failed=0" scope-ok "${P}" "${B}" "SUCCESS_LINE=deadline-seen: 150" "${SB}" USER_SCOPE=1 COUNT=1
 check count-zero 2 "usage:" ok "${P}" "${T}" COUNT=0
 check count-over 2 "usage:" ok "${P}" "${T}" COUNT=1001
 

@@ -220,6 +220,8 @@ mod imp {
         observer: &mut C,
         started: Instant,
     ) -> Result<(), IoError> {
+        // パスの形（空・NUL・sun_path 超過）は lstat より前に検査し、必ず InvalidArgument にする。
+        crate::sys::uds::validate_path_shape(path)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             match fs::symlink_metadata(parent) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -372,6 +374,7 @@ mod tests {
     use super::*;
     use crate::observe::{ServerEvent, ServerOp, ServerOutcome};
     use crate::test_temp_file::TempDir;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::Instant;
@@ -485,6 +488,16 @@ mod tests {
         assert_eq!(events[0].op, ServerOp::Connect);
         assert_eq!(events[0].outcome, ServerOutcome::RejectedPeerCredential);
         assert_eq!(events[0].code, Some(IoErrorCode::InvalidArgument));
+
+        // パスの形の不正は存在しない親・ソケットでも InvalidArgument（F12・#3165）。
+        let long = dir.join("a".repeat(120));
+        let err = precheck(&long, me, &mut rec).expect_err("too long");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        let nul = dir.join(std::ffi::OsStr::from_bytes(b"a\0b"));
+        let err = precheck(&nul, me, &mut rec).expect_err("nul");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        let err = precheck(Path::new(""), me, &mut rec).expect_err("empty");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
 
         // 親ディレクトリが存在しない（F12: ENOENT は Unavailable）。
         let err = precheck(&dir.join("nodir").join("s.sock"), me, &mut rec).expect_err("no parent");

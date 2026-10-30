@@ -157,18 +157,27 @@ mod imp {
         }
     }
 
+    /// パスの形の検査（空・NUL・先頭 NUL の抽象ソケット・`sun_path` 超過は `InvalidArgument`。F12）。
+    /// ファイルシステムの検査より前に呼び、不正なパスを `Unavailable` / `Internal` にしない。
+    pub(super) fn validate_path_shape(path: &Path) -> Result<(), IoError> {
+        let bytes = path.as_os_str().as_bytes();
+        // sun_path は終端 NUL を 1 バイト残す。
+        if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= SUN_PATH_LEN {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "socket path must be non-empty, free of NUL, and shorter than sun_path",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn connect_unix_until(
         path: &Path,
         deadline: Instant,
     ) -> Result<Option<UnixStream>, IoError> {
+        validate_path_shape(path)?;
         let invalid = |msg: &'static str| IoError::new(IoErrorCode::InvalidArgument, msg);
         let bytes = path.as_os_str().as_bytes();
-        // sun_path は終端 NUL を 1 バイト残す。先頭 NUL（抽象ソケット）もここで拒否する。
-        if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= SUN_PATH_LEN {
-            return Err(invalid(
-                "socket path must be non-empty, free of NUL, and shorter than sun_path",
-            ));
-        }
         let mut addr = SockaddrUn {
             #[cfg(target_os = "macos")]
             sun_len: 0,
@@ -245,6 +254,34 @@ mod imp {
                 errno => return Err(map_connect_errno(errno, &err)),
             }
         }
+    }
+}
+
+/// 接続前に呼ぶパスの形の検査（空・NUL・`sun_path` 超過は `InvalidArgument`。F12）。
+/// 未対応の OS・アーキテクチャでは何もしない（後段の connect が `Unimplemented`）。
+pub(crate) fn validate_path_shape(path: &Path) -> Result<(), IoError> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        imp::validate_path_shape(path)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 

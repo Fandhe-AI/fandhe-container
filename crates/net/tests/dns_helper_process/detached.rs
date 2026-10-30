@@ -935,7 +935,8 @@ fn control_reload(exe: &Path) {
 ///
 /// 非 root（uid 65534）の子にストアとヘルパーを作らせ、root の親が DAC を越えて `dns.ctl` へ接続して `Reload` を送る。
 /// `Loaded` も `Error` も返らず切断され、その後も同じ uid からの `Reload` は成功し、`Stop` で止まる。
-/// root でない・`setpriv` が無い場合は理由つきで ignored を出して成功終了する（AGENTS.md に実行方法）。
+/// root でない・`setpriv` が無い場合は fail-closed に panic（非ゼロ終了）する。明示実行（`--ignored`）で前提未達を
+/// 成功として通さない（AGENTS.md に実行方法・REPAIR-12）。
 pub fn foreign_uid(exe: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let uid_line = std::fs::read_to_string("/proc/self/status")
@@ -951,12 +952,10 @@ pub fn foreign_uid(exe: &Path) {
         crate::reap::reap_within(),
     )
     .is_ok_and(|s| s.success());
-    if !is_root || !have_setpriv {
-        println!(
-            "dns_helper_process: control_foreign_uid ignored (needs root and setpriv: root={is_root} setpriv={have_setpriv})"
-        );
-        return;
-    }
+    assert!(
+        is_root && have_setpriv,
+        "dns_helper_process: control_foreign_uid precondition failed (needs root and setpriv: root={is_root} setpriv={have_setpriv})"
+    );
     let tmp = Tmp::new("foreign");
     let nobody = 65534u32;
     std::os::unix::fs::chown(&tmp.0, Some(nobody), Some(nobody)).expect("chown tmp");

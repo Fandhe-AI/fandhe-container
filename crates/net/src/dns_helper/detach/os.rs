@@ -294,9 +294,10 @@ fn spawn_inner(
             "dns helper record already exists",
         ));
     }
-    // 記録も意図記録も無いので、残っている制御ソケットは死んだヘルパーの残骸（新しいヘルパーが bind できるよう消す。
-    // socket でない・他の所有者のものは消さずに失敗にする）。
-    guard.remove_dns_control_socket()?;
+    // 記録も意図記録も無くても、`StaleRecord` の停止は記録だけを消して生きたヘルパーの socket を残す。listener の
+    // 不在を確認できたときだけ残骸として消す（生存・判定不能なら起動を拒否。socket でない・他の所有者のものも
+    // 消さずに失敗にする）。
+    guard.remove_dns_control_socket_if_no_listener()?;
     let state_root = guard.state_root()?;
     let nonce = HelperNonce::generate()?;
     guard.write_dns_helper_intent(&DnsHelperIntent::new(

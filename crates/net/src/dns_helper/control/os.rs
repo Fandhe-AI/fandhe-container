@@ -531,15 +531,44 @@ mod tests {
         ReloadGeneration::new(v).expect("generation")
     }
 
+    /// 試験用の待ちの上限（REPAIR-5）。これを超える停止は回帰として panic にする。
+    const TEST_WAIT: Duration = Duration::from_secs(10);
+
+    /// `h` の終了を `TEST_WAIT` まで待って回収する。無期限の `join` でハングさせない（REPAIR-5）。
+    fn join_within<T>(h: thread::JoinHandle<T>) -> T {
+        let t = Instant::now();
+        while !h.is_finished() {
+            assert!(t.elapsed() < TEST_WAIT, "thread did not finish in time");
+            thread::sleep(Duration::from_millis(5));
+        }
+        h.join().expect("join")
+    }
+
     /// accept して 1 フレーム読み、`reply` を返す（None なら何も返さず保持するだけ）の 1 回限りのサーバー。
+    /// accept・受信・送信は有限の期限つき（REPAIR-5）。
     fn one_shot(
         listener: UnixListener,
         reply: Option<ControlMessage>,
         hold: Duration,
     ) -> thread::JoinHandle<()> {
+        listener.set_nonblocking(true).expect("nonblocking");
         thread::spawn(move || {
-            let (s, _) = listener.accept().expect("accept");
-            let mut s = s;
+            let t = Instant::now();
+            let mut s = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if t.elapsed() >= Duration::from_secs(5) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            let _ = s.set_nonblocking(false);
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
             let _ = ControlFrame::read_from(&mut s);
             if let Some(r) = reply {
                 let _ = ControlFrame::encode(r).write_to(&mut s);
@@ -564,7 +593,7 @@ mod tests {
             el >= Duration::from_secs(2) && el < Duration::from_secs(3),
             "elapsed {el:?}"
         );
-        h.join().expect("join");
+        join_within(h);
     }
 
     /// NET-5・REPAIR-2・#3071: 世代が食い違う `Loaded` は FailedPrecondition。
@@ -576,7 +605,7 @@ mod tests {
         let s = connect(&sock.0);
         let e = reload_over(&s, gen_(1), Duration::from_secs(2)).expect_err("mismatch");
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
-        h.join().expect("join");
+        join_within(h);
     }
 
     /// NET-5・#3071: ヘルパーの `Error{DataLoss}` はそのコードで返る。同じ世代の `Loaded` は成功。
@@ -592,14 +621,14 @@ mod tests {
         let s = connect(&sock.0);
         let e = reload_over(&s, gen_(1), Duration::from_secs(2)).expect_err("error");
         assert_eq!(e.code(), NetErrorCode::DataLoss);
-        h.join().expect("join");
+        join_within(h);
 
         let sock = Sock::new("loaded9");
         let l = UnixListener::bind(&sock.0).expect("bind");
         let h = one_shot(l, Some(ControlMessage::Loaded(gen_(9))), Duration::ZERO);
         let s = connect(&sock.0);
         reload_over(&s, gen_(9), Duration::from_secs(2)).expect("loaded");
-        h.join().expect("join");
+        join_within(h);
     }
 
     /// NET-5・#3071: 相手が何も返さず閉じた（EOF）なら FailedPrecondition（時間切れを待たない）。
@@ -613,7 +642,7 @@ mod tests {
         let e = reload_over(&s, gen_(1), Duration::from_secs(2)).expect_err("eof");
         assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
         assert!(t.elapsed() < Duration::from_secs(1));
-        h.join().expect("join");
+        join_within(h);
     }
 
     struct Served {
@@ -683,7 +712,7 @@ mod tests {
         }
         assert_eq!(s.reloads.load(Ordering::SeqCst), 0);
         s.stop.store(true, Ordering::SeqCst);
-        s.join.join().expect("join").expect("run");
+        join_within(s.join).expect("run");
     }
 
     /// NET-5・#3071: 正しい uid の `Reload` は `Loaded` を同じ世代で返し、失敗は `Error` で返す。`Stop` で止まる。
@@ -701,7 +730,7 @@ mod tests {
             .write_to(&mut w)
             .expect("stop");
         let t = Instant::now();
-        s.join.join().expect("join").expect("run");
+        join_within(s.join).expect("run");
         assert!(t.elapsed() < Duration::from_secs(2));
         assert!(s.stop.load(Ordering::SeqCst));
 
@@ -710,7 +739,7 @@ mod tests {
         let e = reload_over(&c, gen_(5), Duration::from_secs(2)).expect_err("error");
         assert_eq!(e.code(), NetErrorCode::DataLoss);
         s.stop.store(true, Ordering::SeqCst);
-        s.join.join().expect("join").expect("run");
+        join_within(s.join).expect("run");
     }
 
     /// NET-5・REPAIR-2・#3071: 壊れたフレーム・上限超過の長さの接続は読まれず切られ、次の接続は処理される。
@@ -741,7 +770,7 @@ mod tests {
         reload_over(&c, gen_(3), Duration::from_secs(2)).expect("still serving");
         assert_eq!(s.reloads.load(Ordering::SeqCst), 1);
         s.stop.store(true, Ordering::SeqCst);
-        s.join.join().expect("join").expect("run");
+        join_within(s.join).expect("run");
     }
 
     /// REPAIR-5・#3071: 1 バイトずつ送って居座る相手でも、1 接続は絶対期限（2 秒）で切られ、次の接続が処理される。
@@ -763,6 +792,6 @@ mod tests {
         );
         drop(slow);
         s.stop.store(true, Ordering::SeqCst);
-        s.join.join().expect("join").expect("run");
+        join_within(s.join).expect("run");
     }
 }

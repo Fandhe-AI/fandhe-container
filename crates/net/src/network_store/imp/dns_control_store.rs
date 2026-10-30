@@ -178,6 +178,36 @@ impl NetworkLockGuard<'_> {
         Ok(true)
     }
 
+    /// 制御ソケットの listener が居ないと確認できたときだけ、残った制御ソケットを消す（排他ロックの下だけ）。
+    ///
+    /// 記録が無いことは listener の死亡の根拠にならない（`StaleRecord` の停止は記録だけを消し、生きたヘルパーの
+    /// socket を残す）。そこで connect を試み、`ECONNREFUSED` / `ENOENT`（listener 不在）のときだけ消す。接続できた
+    /// （生存）・backlog 満杯・その他（判定不能）は消さず `FailedPrecondition` を返す（fail-closed。NET-5・SEC-1・
+    /// REPAIR-5）。接続は即座に閉じ、フレームは送らない（相手は読めず切断するだけ）。
+    pub(crate) fn remove_dns_control_socket_if_no_listener(&self) -> Result<bool, NetError> {
+        self.require_exclusive()?;
+        match sys::unix_socket::connect_unix_nonblocking(&self.control_socket_path()) {
+            Ok(_fd) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "dns control socket has a live listener; not removed",
+                ));
+            }
+            Err(sys::SysError::Os(c))
+                if matches!(
+                    std::io::Error::from_raw_os_error(c).kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(_) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "cannot confirm dns control socket has no listener; not removed",
+                ));
+            }
+        }
+        self.remove_dns_control_socket()
+    }
+
     /// `network rm` の前に、記録（`dns-helper`・`dns-helper.intent`）が両方無いときだけ、残った制御ソケットを消す
     /// （死んだヘルパーの残骸が削除を止めない。ベストエフォート。消せないものは既知項目の検査が拒否する）。
     pub(super) fn discard_orphan_dns_control_socket(&self) {
@@ -187,6 +217,7 @@ impl NetworkLockGuard<'_> {
         {
             return;
         }
-        let _ = self.remove_dns_control_socket();
+        // listener の不在を確認できたときだけ消す（生存・判定不能なら残す。`network rm` の既知項目検査が拒否する）。
+        let _ = self.remove_dns_control_socket_if_no_listener();
     }
 }

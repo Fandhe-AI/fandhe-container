@@ -676,6 +676,11 @@ impl FileServer<'_> {
         if let Some(batch) = buffer.take_pending() {
             self.run_batch(conn, &batch, send)?;
         }
+        // 明示 Flush の request id も単調増加の検証に含める（F6）。滞留分の実行後、永続化の前に
+        // 消費する（滞留分の id は実行時に消費済みで、Flush はそれより後でなければならない）。
+        if let Some(id) = ack {
+            self.admit_id(id.get())?;
+        }
         self.persist_all()?;
         match ack {
             Some(id) => {
@@ -846,6 +851,11 @@ impl FileServer<'_> {
                 "failed to re-decode a frame already accepted by BatchBuffer::push",
             )
         })?;
+        self.admit_id(id)
+    }
+
+    /// request id を単調増加の検証にかけて消費する（`admit_request_id` と明示 Flush が共有）。
+    fn admit_id(&mut self, id: u64) -> Result<(), IoError> {
         if self.last_request_id.is_some_and(|last| id <= last) {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
@@ -1492,6 +1502,30 @@ mod tests {
         assert_eq!(flush_ack_ids(&conn.sent), vec![1, 2]);
         assert_eq!(report.stats.persist_succeeded, 0);
         assert_eq!(report.stats.persist_failed, 0);
+    }
+
+    #[test]
+    fn io1_flush_request_id_must_increase() {
+        // F6: Flush の id も単調増加の検証に含まれる。Flush(100) の後の Create(1) は逆戻り。
+        let env = env_with(PersistSupport::Supported, &NO_SLOT);
+        let (_d, conn, report) = run_env(
+            vec![flush(100), create(1, "a"), flush(101)],
+            8,
+            FileServeLimits::default(),
+            env,
+        );
+        assert_eq!(flush_ack_ids(&conn.sent), vec![100]);
+        assert!(ack_only_ids(&conn.sent).is_empty());
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn io1_duplicate_flush_request_id_is_protocol_violation() {
+        let env = env_with(PersistSupport::Supported, &NO_SLOT);
+        let (_d, conn, report) =
+            run_env(vec![flush(7), flush(7)], 8, FileServeLimits::default(), env);
+        assert_eq!(flush_ack_ids(&conn.sent), vec![7]);
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
     }
 
     #[test]

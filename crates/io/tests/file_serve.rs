@@ -314,9 +314,12 @@ mod unix {
         } else {
             assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
         }
+        // 未対応環境では 3 件目の自動フラッシュが Unimplemented で接続を終えるため、4 件目は
+        // 実行されない。
+        let expected_content: &[u8] = if supported { b"xyz" } else { b"xy" };
         assert_eq!(
             std::fs::read(dir.share_root().join("a")).expect("read"),
-            b"xyz"
+            expected_content
         );
     }
 

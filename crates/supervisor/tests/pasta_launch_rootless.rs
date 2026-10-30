@@ -633,8 +633,9 @@ mod linux {
         } else {
             IsolationPrivilege::RootlessSingleId
         };
-        let work = TempDir::in_scratch(&format!("s{sequence}"));
-        let xdg = TempDir::in_xdg(&format!("s{sequence}"));
+        // 名前に親の tag を含める。親が失敗時に `reclaim_scenario` で前方一致により回収するため。
+        let work = TempDir::in_scratch(&format!("t{tag}-s{sequence}"));
+        let xdg = TempDir::in_xdg(&format!("t{tag}-s{sequence}"));
         let state_path = xdg.dir.join("state");
         let store =
             FileStateStore::open(StateRoot::from_override(state_path.clone()).expect("state root"))
@@ -1153,7 +1154,9 @@ mod linux {
     fn scope_command(kind: Kind, subordinate: bool, tag: u32, sequence: u32) -> Command {
         let exe = std::env::current_exe().expect("current exe");
         let mut cmd = Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"])
+        cmd.args(["--user", "--scope", "--quiet", "-p", "Delegate=yes"])
+            .arg(format!("--unit={}", unit_name(tag, sequence)))
+            .arg("--")
             .arg(&exe)
             .arg("--scenario")
             .arg(kind.label())
@@ -1161,6 +1164,72 @@ mod linux {
             .arg(tag.to_string())
             .arg(sequence.to_string());
         cmd
+    }
+
+    /// シナリオ専用の scope 名。期限超過・失敗時に scope 全体を止めるため名前を固定する。
+    fn unit_name(tag: u32, sequence: u32) -> String {
+        format!("fandhe-plr-{tag}-{sequence}.scope")
+    }
+
+    fn systemctl_user(args: &[&str]) -> Command {
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").args(args);
+        cmd
+    }
+
+    /// 期限超過・失敗時の回収（REPAIR-5 と資源回収の両立）。直接の子だけでなく scope 全体（起動途中で止まった
+    /// pid1・pasta・holder などの子孫）を SIGKILL して消滅を確認し、親側から一時領域も消す。
+    fn reclaim_scenario(child: &mut std::process::Child, tag: u32, sequence: u32) {
+        let unit = unit_name(tag, sequence);
+        let limit = crate::reap::reap_within();
+        if let Err(e) = crate::reap::run_within(
+            systemctl_user(&["kill", "--kill-whom=all", "--signal=SIGKILL", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            limit,
+        ) {
+            eprintln!("scope kill failure: {e}");
+        }
+        let _ = crate::reap::run_within(
+            systemctl_user(&["stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            limit,
+        );
+        crate::reap::reap_or_report(child, limit);
+        let gone = eventually_within(limit, || {
+            let out = crate::reap::output_within(
+                &mut systemctl_user(&["show", "-p", "ActiveState", "--value", &unit]),
+                Duration::from_secs(10),
+            );
+            match out {
+                Ok(o) => !matches!(
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    "active" | "activating" | "deactivating"
+                ),
+                Err(_) => false,
+            }
+        });
+        if !gone {
+            eprintln!("scope {unit} is still active after SIGKILL");
+        }
+        // 一時領域: 子の TempDir は Drop されないため、tag と sequence の前方一致で回収する。
+        let prefix = format!("fandhe-plr-t{tag}-s{sequence}-");
+        let roots = [
+            super::scratch_root::scratch_root("fandhe-plr-scratch", timeout()).to_path_buf(),
+            xdg_runtime_dir(),
+        ];
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        assert!(gone, "scenario scope {unit} must disappear after SIGKILL");
     }
 
     /// 1 シナリオを `systemd-run --user --scope -p Delegate=yes` の子プロセスで実行し、期限つきで成功を確認する。
@@ -1174,7 +1243,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                reclaim_scenario(&mut child, tag, sequence);
                 panic!(
                     "scenario {}-{} exceeded {SCENARIO_DEADLINE:?}",
                     kind.label(),
@@ -1183,6 +1252,10 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        if !status.success() {
+            // 失敗した子が残した子孫・一時領域も回収する。
+            reclaim_scenario(&mut child, tag, sequence);
+        }
         assert!(
             status.success(),
             "scenario {}-{} failed: {status}",
@@ -1222,7 +1295,7 @@ mod linux {
         let line = match rx.recv_timeout(SCENARIO_DEADLINE) {
             Ok(l) => l,
             Err(_) => {
-                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                reclaim_scenario(&mut child, tag, sequence);
                 panic!("supervisor-sigkill scenario did not report its helpers in time");
             }
         };

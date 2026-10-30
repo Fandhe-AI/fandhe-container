@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use super::{
     ACK, ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
-    DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT, DnsHelperStopRequest,
-    HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome,
-    SPAWN_PREFIX, StopOutcome, StopStage, kill_reap_timeout, run_stop_sequence, stop_grace,
+    DNS_HELPER_STAGE1_EXIT_TIMEOUT, DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX,
+    IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage,
+    kill_reap_timeout, recover_timeout, run_stop_sequence, stop_grace,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -835,7 +835,7 @@ fn recover_inner(
         guard.remove_dns_helper_intent()?;
         return Ok(IntentRecovery::IntentDiscarded);
     }
-    let deadline = Instant::now() + DNS_HELPER_RECOVER_TIMEOUT;
+    let deadline = Instant::now() + recover_timeout();
     let mut stopped = 0usize;
     let mut seen = 0usize;
     // 追記済みの同一性があれば、候補の列挙に依らず先に帰属して片付ける（#3344。ゾンビは cgroup.procs に現れない）。

@@ -3446,40 +3446,63 @@ mod tests {
     }
 
     /// NET-1・#2681: 別名の不一致・master の不一致・bridge 無しは Unknown で、削除しない。
+    /// エラーコードも照合する（NET-1・REPAIR-12・#3559。#3536 の残り）。bridge の不存在（`NotFound`）は
+    /// そのまま運ばれ、所有の不一致は `FailedPrecondition` になる（ERR-1: 最初の原因を保つ）。
     #[test]
     fn net1_reclaim_attach_refuses_unproven_veth() {
         let cases = [
-            Fake {
-                veth_alias: Some(Some("forged".to_owned())),
-                ..Default::default()
-            },
-            Fake {
-                veth_alias: Some(None),
-                ..Default::default()
-            },
-            Fake {
-                veth_master: Some(Some(8)),
-                ..Default::default()
-            },
-            Fake {
-                veth_master: Some(None),
-                ..Default::default()
-            },
-            Fake {
-                bridge_lookup_err: Some(NetErrorCode::NotFound),
-                ..Default::default()
-            },
+            (
+                Fake {
+                    veth_alias: Some(Some("forged".to_owned())),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_alias: Some(None),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_master: Some(Some(8)),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_master: Some(None),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    bridge_lookup_err: Some(NetErrorCode::NotFound),
+                    ..Default::default()
+                },
+                NetErrorCode::NotFound,
+            ),
         ];
-        for fake in cases {
+        for (i, (fake, want)) in cases.into_iter().enumerate() {
             let e =
                 reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir())
                     .unwrap_err();
-            assert_eq!(e.step, DeleteStep::DeleteVeth);
+            assert_eq!(e.step, DeleteStep::DeleteVeth, "case {i}");
+            assert_eq!(e.code(), want, "case {i}");
+            assert!(e.report.removed.is_empty(), "case {i}");
             assert_eq!(
                 e.report.leftover,
-                vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+                vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)],
+                "case {i}"
             );
-            assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+            assert!(
+                !fake.calls().iter().any(|c| c.starts_with("delete_link")),
+                "case {i}"
+            );
         }
     }
 

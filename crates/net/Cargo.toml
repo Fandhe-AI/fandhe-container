@@ -21,7 +21,8 @@ pasta-test-support = []
 # リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 netns_holder_process が使う。依存は増えない。
 netns-holder-test-support = []
 # 試験専用: dns-helper の起動元の後始末の期限（停止の猶予・SIGKILL 後の終了待ち）を短くする入口 `override_stop_timeouts_for_test`
-# （`launcher_killed_after_spawn_line` の否定確認の感度のため。NET-5・REPAIR-5・REPAIR-12・#3508）。
+# （`launcher_killed_after_spawn_line` の否定確認の感度のため。NET-5・REPAIR-5・REPAIR-12・#3508）と、起動窓の回収全体の期限
+# `override_recover_timeout_for_test`（期限切れの Timeout と意図記録の保持の照合のため。#3559）。
 # リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 dns_helper_process が使う。依存は増えない。
 dns-helper-test-support = []
 

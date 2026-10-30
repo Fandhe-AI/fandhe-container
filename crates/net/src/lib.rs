@@ -51,10 +51,10 @@ compile_error!(
     "the `netns-holder-test-support` feature exposes raw frame injection and must not be enabled in release builds"
 );
 
-// dns-helper の後始末の期限を短縮する試験専用の入口（NET-5・REPAIR-5・#3508）。
+// dns-helper の後始末・回収の期限を短縮する試験専用の入口（NET-5・REPAIR-5・#3508・#3559）。
 #[cfg(all(feature = "dns-helper-test-support", not(debug_assertions)))]
 compile_error!(
-    "the `dns-helper-test-support` feature shortens dns helper cleanup deadlines and must not be enabled in release builds"
+    "the `dns-helper-test-support` feature shortens dns helper cleanup and recovery deadlines and must not be enabled in release builds"
 );
 
 /// uapi 定数を `libc` と `const` 評価で照合するマクロ（Linux の試験ビルド限定。#3102・#1318・MVM-4・REPAIR-12）。

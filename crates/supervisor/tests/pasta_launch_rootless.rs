@@ -1226,8 +1226,18 @@ mod linux {
     }
 
     /// 期限超過・失敗時の回収（REPAIR-5 と資源回収の両立）。直接の子だけでなく scope 全体（起動途中で止まった
-    /// pid1・pasta・holder などの子孫）を SIGKILL して消滅を確認し、親側から一時領域も消す。
+    /// pid1・pasta・holder などの子孫）を SIGKILL して消滅を確認し、親側から一時領域も消す。scope が消えなければ
+    /// panic する（消滅の確認を後始末の成否として表に出す）。
     fn reclaim_scenario(child: &mut std::process::Child, tag: u32, sequence: u32) {
+        let unit = unit_name(tag, sequence);
+        let gone = reclaim_scope(child, tag, sequence);
+        assert!(gone, "scenario scope {unit} must disappear after SIGKILL");
+    }
+
+    /// `reclaim_scenario` の本体。scope 全体の SIGKILL と停止・消滅の確認（期限つき）・一時領域の回収を行い、
+    /// scope が消えたかを返す。panic しないので、別の panic を再送出する前の後始末にも使える（元の panic を
+    /// 後始末の panic で上書きしない）。
+    fn reclaim_scope(child: &mut std::process::Child, tag: u32, sequence: u32) -> bool {
         let unit = unit_name(tag, sequence);
         let limit = crate::reap::reap_within();
         if let Err(e) = crate::reap::run_within(
@@ -1273,9 +1283,11 @@ mod linux {
             }
         }
         // 子は再実行された別プロセスで、自分の pid 入りの scratch ルートを作る（親の `scratch_root()` とは別）。
-        let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
-        reclaim_child_scratch(&temp, &prefix);
-        assert!(gone, "scenario scope {unit} must disappear after SIGKILL");
+        match std::fs::canonicalize(std::env::temp_dir()) {
+            Ok(temp) => reclaim_child_scratch(&temp, &prefix),
+            Err(e) => eprintln!("canonicalize temp_dir failed: {e}"),
+        }
+        gone
     }
 
     /// 1 シナリオを `systemd-run --user --scope -p Delegate=yes` の子プロセスで実行し、期限つきで成功を確認する。
@@ -1368,6 +1380,26 @@ mod linux {
                 "the orphaned container pid1 must keep running (SUP-5)"
             );
         }));
+
+        // 検証に失敗したとき（PDEATHSIG の回帰で holder・pasta が生き残った等）は、コンテナの cgroup だけでなく
+        // 退避リーフの holder・pasta を含む scope 全体を先に SIGKILL・停止し、消滅を確かめてから一時領域を消す。
+        // holder が netns を保持し続けると pasta の netns-quit も働かず、helper・公開ポート・scope が後続の試験に
+        // 残るため（REPAIR-5）。消えなければ stderr に出し、元の panic を優先して再送出する。
+        if checked.is_err() {
+            if !reclaim_scope(&mut child, tag, sequence) {
+                eprintln!(
+                    "scope {} was not reclaimed after the failed check",
+                    unit_name(tag, sequence)
+                );
+            }
+            if !eventually(|| h.1.gone() && h.2.gone()) {
+                eprintln!(
+                    "pasta {} or holder {} is still alive after the scope was reclaimed",
+                    h.1.label(),
+                    h.2.label()
+                );
+            }
+        }
 
         // 後始末（成否に関わらず）: pid1 を cgroup.kill で止め、cgroup を消し、残骸を回収する。
         let cg_dir = PathBuf::from(format!("/sys/fs/cgroup{cg}"));

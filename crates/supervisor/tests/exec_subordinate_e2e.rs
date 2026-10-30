@@ -338,12 +338,12 @@ mod linux {
         {
             let mut g = STAGE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((prev, t0)) = g.take() {
-                println!(
+                emit_stage_line(&format!(
                     "exec_subordinate_e2e: stage={prev} end elapsed_ms={}",
                     t0.elapsed().as_millis()
-                );
+                ));
             }
-            println!("exec_subordinate_e2e: stage={name} begin");
+            emit_stage_line(&format!("exec_subordinate_e2e: stage={name} begin"));
             *g = Some((name, Instant::now()));
         }
         if std::os::unix::process::parent_id() != watchdog_pid()
@@ -363,11 +363,20 @@ mod linux {
     fn finish() {
         let mut g = STAGE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((prev, t0)) = g.take() {
-            println!(
+            emit_stage_line(&format!(
                 "exec_subordinate_e2e: stage={prev} end elapsed_ms={}",
                 t0.elapsed().as_millis()
-            );
+            ));
         }
+    }
+
+    /// 段の行を出して直ちに flush する。出力が `tee` へのパイプでブロックバッファされても、watchdog の SIGKILL で
+    /// 最後の `begin` 行が失われず、止まった段を特定できる（REPAIR-5）。
+    fn emit_stage_line(line: &str) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     }
 
     /// worker の役。watchdog の子として起動された場合だけ実機シナリオを動かす。

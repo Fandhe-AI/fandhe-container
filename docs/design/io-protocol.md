@@ -383,7 +383,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
-- `PipelineClient` の型つき API と Nack の受信は #3162 で実装済み。クライアント側の UDS `connect` は #3165 で実装済み（`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`）。両者の本番結合（[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)）は未実装
+- `PipelineClient` の型つき API と Nack の受信は #3162 で実装済み。クライアント側の UDS `connect` は #3165 で実装済み（`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`）。両者の UDS 越しの結合（[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)）は #3166 の整合性スイートで確認済み
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み
@@ -394,7 +394,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信、#3163 のサーバー `serve_file_connection`、#3164 の FLUSH の永続化〔Linux の番兵 fd と `syncfs`・macOS / Windows のファイルとディレクトリの同期・保持表・IO-10 の自動フラッシュ〕。#3165 の UDS クライアント `UdsClientConnection::connect`〔`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`。接続前のパス検査はサーバーの bind 検査に揃え、親ディレクトリは `0o077` なし・所有者一致を要求する〕。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信、#3163 のサーバー `serve_file_connection`、#3164 の FLUSH の永続化〔Linux の番兵 fd と `syncfs`・macOS / Windows のファイルとディレクトリの同期・保持表・IO-10 の自動フラッシュ〕。#3165 の UDS クライアント `UdsClientConnection::connect`〔`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`。接続前のパス検査はサーバーの bind 検査に揃え、親ディレクトリは `0o077` なし・所有者一致を要求する〕、#3166 の整合性スイート〔`crates/io/tests/consistency/uds_file_ops.rs`〕。#3167〔crash_safety・break_detection〕は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -555,7 +555,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 
 テスト名にビヘイビア ID を付ける。
 
-- 整合性スイート（UDS の実ソケット越し）
+- 整合性スイート（UDS の実ソケット越し。状態: #3166 で実装済み〔`crates/io/tests/consistency/uds_file_ops.rs`〕）
   - IO-4: N ファイルの作成、write、FLUSH の後、close-to-open で内容が一致する
   - IO-1: Create の ACK より前に WriteFile を送れる
   - IO-5: `Foo` / `foo` の衝突が Nack になり、他のハンドルは影響を受けない
@@ -587,7 +587,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |
 | #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163（実装済み） |
 | #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5）。実装済み | #3161 |
-| #3166 | 整合性スイート（IO-4・TASK-14） | #3162・#3164・#3165 |
+| #3166 | 整合性スイート（IO-4・TASK-14）。実装済み | #3162・#3164・#3165 |
 | #3167 | crash_safety・break_detection（IO-3・REPAIR-7） | #3164・#3165 |
 
 下流の #2074（TASK-189 のワイヤー経路への切り替え）は #3162・#3164・#3165 に依存する。各 issue の受け入れ条件に、該当モジュールの REPAIR-3 の記述の更新を含める（`lib.rs`・`guest_files.rs`・`writeback.rs`・`client.rs`・`vsock.rs`）。

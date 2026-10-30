@@ -354,12 +354,11 @@ mod supported {
     /// `libc` は unix の dev-dependency だが宣言の照合専用で、試験コードでは `sys` の外の `unsafe` を使えない（coding-rust.md）ため、OS 同梱の `kill` コマンドを環境空・
     /// 絶対パスで起動する。失敗は無視し、呼び出し側が続けて計測対象本体を kill する。
     fn kill_process_group(child: &std::process::Child) {
-        let target = format!("-{}", child.id());
-        // GNU（Linux）は `--` つき、BSD（macOS）の kill は `--` を pid として拒否するため
-        // `--` なしの形式も順に試す。どちらかが成功した時点で戻る。
-        let arg_forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
+        // 引数形式は共有補助が OS ごとに決める（Linux は `--` つきだけ。`--` なしは ubuntu-24.04 の procps で
+        // `kill(-1)` になりうる。#3505）。どれかが成功した時点で戻る。
+        let arg_forms = crate::reap::group_kill_arg_forms(child.id());
         for bin in ["/bin/kill", "/usr/bin/kill"] {
-            for args in arg_forms {
+            for args in &arg_forms {
                 let mut cmd = Command::new(bin);
                 cmd.args(args)
                     .env_clear()

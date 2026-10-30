@@ -218,10 +218,10 @@ mod tests {
                 std::env::temp_dir().join(format!("fandhe-guest-probe-{}-{n}", std::process::id()));
             Self::at(p)
         }
-        /// 指定パスの残骸を消して作る（REPAIR-12・#3435）。
+        /// 指定パスを第 1 候補に排他作成する。残骸は消さず別名で作る（REPAIR-12・#3475）。
         fn at(p: PathBuf) -> Self {
-            let root = crate::test_root::test_root_at(p.clone());
-            Self(p, root)
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
         fn layout(&self) {
             fs::create_dir_all(self.0.join("in").join("dir")).unwrap();
@@ -232,24 +232,23 @@ mod tests {
             }
         }
     }
-    /// MAC-1・REPAIR-12・#3435: 残骸（古い `out/` の中身）があっても作り直しで消え、drop で後始末される。
+    /// MAC-1・REPAIR-12・#3475: 残骸（古い `out/` の中身）があっても消さず別名で作られ、
+    /// drop 後は別名だけが消えて残骸は無傷で残る。
     #[test]
-    fn mac1_repair12_tmp_clears_stale_residue() {
-        let p = std::env::temp_dir().join(format!(
-            "fandhe-guest-probe-residue-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn mac1_repair12_tmp_leaves_stale_residue_untouched() {
+        let parent = Tmp::new();
+        let p = parent.0.join("stale");
         fs::create_dir_all(p.join("out")).unwrap();
         fs::write(p.join("out").join("stale.txt"), "old").unwrap();
+        let rp;
         {
             let t = Tmp::at(p.clone());
+            rp = t.0.clone();
+            assert_ne!(t.0, p);
             assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
         }
-        assert!(!p.exists());
+        assert!(!rp.exists());
+        assert_eq!(fs::read(p.join("out").join("stale.txt")).unwrap(), b"old");
     }
 
     fn run(plan: ProbePlan, root: &Path) -> Vec<String> {

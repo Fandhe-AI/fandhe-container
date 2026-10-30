@@ -35,26 +35,22 @@ fn gpu2_relative_rootfs_is_rejected() {
     assert_eq!(err.code(), CdiApplyErrorCode::InvalidArgument);
 }
 
-/// GPU-2・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと中身）が残っていても、補助が空に作り直し、
-/// `gpu2_unmounted_rootfs_is_rejected` と同じ排他作成（`create_dir`）が通り、drop で消える。
+/// GPU-2・REPAIR-12(#3375・#3475): 前回の残骸（同名のディレクトリと中身）が残っていても、補助は消さず
+/// 別名の空ディレクトリを作り、`gpu2_unmounted_rootfs_is_rejected` と同じ判定が通る。残骸は無傷で残る。
 #[test]
-fn gpu2_repair12_test_root_clears_stale_residue() {
-    let p = std::env::temp_dir().join(format!(
-        "fandhe-gpu-stage-stale-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
+fn gpu2_repair12_test_root_leaves_stale_residue_untouched() {
+    let parent = test_root::test_root("fandhe-gpu-stage-stale", "parent");
+    let p = parent.join("stale");
     std::fs::create_dir_all(p.join("old")).unwrap();
     std::fs::write(p.join("old").join("f"), b"x").unwrap();
     assert!(std::fs::create_dir(&p).is_err(), "residue must collide");
     {
         let root = test_root::test_root_at(p.clone());
+        assert_ne!(&*root, p.as_path());
         assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
         let canon = std::fs::canonicalize(&*root).unwrap();
         let err = verify_hook_stage(&canon).unwrap_err();
         assert_eq!(err.code(), CdiApplyErrorCode::FailedPrecondition);
     }
-    assert!(!p.exists());
+    assert_eq!(std::fs::read(p.join("old").join("f")).unwrap(), b"x");
 }

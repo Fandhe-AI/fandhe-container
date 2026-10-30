@@ -1283,11 +1283,11 @@ mod tests {
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
             // 作るのはホスト側の非特権 uid（namespace 試験の root は `unshare -r` の user namespace 内で、
-            // ホスト上では非特権）なので、予測できる名前の削除（A）でよい。
-            let root = crate::test_root::test_root_at(p.clone());
-            Self(p, root)
+            // ホスト上では非特権）。予測できる名前でも先に消さず排他作成なので別ユーザーの symlink を辿らない。
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
         fn script(&self, name: &str, body: &str) -> String {
             let p = self.0.join(name);

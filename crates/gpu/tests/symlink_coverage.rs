@@ -309,11 +309,11 @@ impl TempRoot {
         )
     }
 
-    /// 指定パスの残骸（前回の symlink など）を消して作り直す。古いリンクが前後のスナップショットへ
-    /// 混ざるのを防ぐ（REPAIR-12・#3435）。
+    /// 指定パスを第 1 候補に排他作成する。残骸（前回の symlink など）は消さず別名で作るため、古いリンクが
+    /// 前後のスナップショットへ混ざらない（REPAIR-12・#3475）。
     fn at(p: PathBuf) -> Self {
-        let root = test_root::test_root_at(p.clone());
-        Self(std::fs::canonicalize(&p).unwrap(), root)
+        let root = test_root::test_root_at(p);
+        Self(std::fs::canonicalize(&*root).unwrap(), root)
     }
 
     fn path(&self) -> &Path {
@@ -328,25 +328,24 @@ impl TempRoot {
     }
 }
 
-/// GPU-2・REPAIR-12・#3435: 残骸の symlink が残っていても、作り直した rootfs は空になる。
+/// GPU-2・REPAIR-12・#3475: 残骸の symlink が残っていても消さず、別名の空の rootfs を作る。
+/// 残骸のリンクは無傷で残り、新しい rootfs には混ざらない。
 #[test]
-fn gpu2_repair12_symlink_root_clears_stale_links() {
-    let p = std::env::temp_dir().join(format!(
-        "fandhe-gpu-symlink-residue-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+fn gpu2_repair12_symlink_root_leaves_stale_links_untouched() {
+    let parent = test_root::test_root("fandhe-gpu-symlink-residue", "parent");
+    let p = parent.join("stale");
     std::fs::create_dir_all(p.join("usr")).unwrap();
     symlink("/etc/hostname", p.join("usr").join("stale-link")).unwrap();
     {
         let t = TempRoot::at(p.clone());
+        assert_ne!(t.path(), p.as_path());
         assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 0);
         assert!(std::fs::symlink_metadata(t.path().join("usr").join("stale-link")).is_err());
     }
-    assert!(!p.exists());
+    assert_eq!(
+        std::fs::read_link(p.join("usr").join("stale-link")).unwrap(),
+        Path::new("/etc/hostname")
+    );
 }
 
 /// フックの役を務める: 期待どおりの全リンクを作る。

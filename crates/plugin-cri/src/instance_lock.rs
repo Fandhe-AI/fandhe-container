@@ -199,32 +199,33 @@ mod tests {
             Self::at(p)
         }
 
-        /// 指定パスの残骸を消して作る（unix では 0700。REPAIR-12・#3435）。
+        /// 指定パスを第 1 候補に排他作成する（unix では 0700）。残骸は消さず別名で作る（REPAIR-12・#3475）。
         fn at(p: std::path::PathBuf) -> Self {
-            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（非 root の単体試験）。
-            let root = crate::test_root::test_root_at(p.clone());
-            Self(p, root)
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
     }
 
-    /// CRI-2・REPAIR-12・#3435: 残骸（古い `.cri/` の中身）があっても作り直しで空になり、drop で消える。
+    /// CRI-2・REPAIR-12・#3475: 残骸（古い `.cri/` の中身）があっても消さず別名の空ディレクトリを作り、
+    /// drop 後は別名だけが消えて残骸は無傷で残る。
     #[test]
-    fn cri2_repair12_ilock_tmp_clears_stale_residue() {
-        let p = std::env::temp_dir().join(format!(
-            "fcpc-ilock-residue-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+    fn cri2_repair12_ilock_tmp_leaves_stale_residue_untouched() {
+        let parent = Tmp::new();
+        let p = parent.0.join("stale");
         fs::create_dir_all(p.join(".cri")).expect("mkdir");
         fs::write(p.join(".cri").join("stale"), b"old").expect("write");
+        let rp;
         {
             let t = Tmp::at(p.clone());
+            rp = t.0.clone();
+            assert_ne!(t.0, p);
             assert_eq!(fs::read_dir(&t.0).expect("read").count(), 0);
         }
-        assert!(!p.exists());
+        assert!(!rp.exists());
+        assert_eq!(
+            fs::read(p.join(".cri").join("stale")).expect("read"),
+            b"old"
+        );
     }
 
     const SHORT: Duration = Duration::from_millis(200);

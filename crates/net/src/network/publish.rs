@@ -1012,31 +1012,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// NET-1・REPAIR-12(#3375): 前回の残骸（古い `ports.reg` と余計なディレクトリ）が同じ名前に残っていても
-    /// `test_root_at` が空に作り直し、共有ファイルの試験が古い予約を読まず、drop で消える。
+    /// NET-1・REPAIR-12(#3375・#3475): 前回の残骸（古い `ports.reg` と余計なディレクトリ）が同じ名前に残っていても
+    /// `test_root_at` は消さず別名の空ディレクトリを作り、共有ファイルの試験が古い予約を読まない。残骸は無傷で残る。
     #[test]
-    fn net1_repair12_test_root_clears_stale_residue() {
-        let p = std::env::temp_dir().join(format!(
-            "fc-portreg-stale-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+    fn net1_repair12_test_root_leaves_stale_residue_untouched() {
+        let parent = crate::test_root::test_root("fc-portreg-stale", "parent");
+        let p = parent.join("stale");
         std::fs::create_dir_all(p.join("sub")).unwrap();
-        std::fs::write(
-            p.join("ports.reg"),
-            "fandhe-portreg v1\ntcp 192.0.2.10 80 web c9\n",
-        )
-        .unwrap();
+        let reg = "fandhe-portreg v1\ntcp 192.0.2.10 80 web c9\n";
+        std::fs::write(p.join("ports.reg"), reg).unwrap();
         {
             let root = crate::test_root::test_root_at(p.clone());
+            assert_ne!(&*root, p.as_path());
             assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
             assert!(!root.join("ports.reg").exists());
             // 元の失敗（排他作成）と同じ作成が通る。
             std::fs::create_dir(root.join("sub")).unwrap();
         }
-        assert!(!p.exists());
+        assert_eq!(std::fs::read_to_string(p.join("ports.reg")).unwrap(), reg);
     }
 
     /// NET-1・TASK-139.3: 共有ファイルの予約は別インスタンス（別プロセス相当）との競合を検出し、

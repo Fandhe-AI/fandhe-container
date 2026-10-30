@@ -1703,27 +1703,23 @@ fn repair_12_doc_table_column_mismatch_is_detected() {
     );
 }
 
-/// IO-5・REPAIR-12(#3375): 前回の残骸（同名のファイル）があっても補助が空に作り直し、古い名前との
-/// 衝突で `create_file` の結果が変わらず、drop で消える。
+/// IO-5・REPAIR-12(#3375・#3475): 前回の残骸（同名のファイル）があっても補助は消さず別名の空ディレクトリを
+/// 作り、古い名前との衝突で `create_file` の結果が変わらない。残骸は無傷で残る。
 #[test]
-fn io5_repair12_test_root_clears_stale_residue() {
-    let p = std::env::temp_dir().join(format!(
-        "fcio-acc-io5-stale-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
+fn io5_repair12_test_root_leaves_stale_residue_untouched() {
+    let parent = test_root::test_root("fcio-acc-io5-stale", "parent");
+    let p = parent.join("stale");
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("Foo.txt"), b"old").unwrap();
     {
         let root = test_root::test_root_at(p.clone());
+        assert_ne!(&*root, p.as_path());
         assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
         let creator =
             fandhe_container_io::GuestFileCreator::new(root.to_path_buf()).expect("creator");
         creator.create_file("Foo.txt").expect("no stale collision");
     }
-    assert!(!p.exists());
+    assert_eq!(std::fs::read(p.join("Foo.txt")).unwrap(), b"old");
 }
 
 /// TASK-19（IO-5）: 大文字小文字の違いのみで衝突する 2 ファイル作成が

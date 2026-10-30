@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsName;
+use super::upstream::{UpstreamList, validated_list};
 use crate::network_store::MemberRecord;
 
 /// [`names_from_members`] の結果。
@@ -72,6 +73,67 @@ pub fn names_from_members(members: &[MemberRecord]) -> LoadedNames {
     out
 }
 
+/// [`upstreams_from_members`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoadedUpstreams {
+    /// 登録する (コンテナの IPv4, 上流リスト)。アドレスは互いに異なる。
+    pub entries: Vec<(Ipv4Addr, UpstreamList)>,
+    /// 上流の指定が無効（IPv6 のアドレス・loopback 等の拒否・gateway 指定）で登録しなかったメンバーの数。
+    pub skipped_invalid: usize,
+    /// 同じ IPv4 アドレスを持つ他のメンバーと衝突したため登録しなかったメンバーの数（衝突した全員を数える）。
+    pub dropped_collisions: usize,
+}
+
+/// メンバー記録の `--dns`（FCMEM1 の `dns` 項目）から、コンテナのアドレスごとの上流を導く（純関数。NET-12・D11・#3072）。
+///
+/// 記録は untrusted として扱い、decode 時の検証に加えて [`DnsUpstreamMap::set`](super::DnsUpstreamMap::set) と同じ
+/// 検証（`validated_list`）を通す。`gateway` はヘルパー自身の待ち受けアドレスで、上流に指定されたメンバーは飛ばす。
+/// `dns` が空のメンバーは結果に入れない（転送しない）。同じアドレスのメンバーが複数あれば、他コンテナの上流を
+/// 奪えないよう**どれも登録しない**（名前の衝突の扱いと同じ fail-closed）。
+pub fn upstreams_from_members(members: &[MemberRecord], gateway: Ipv4Addr) -> LoadedUpstreams {
+    let mut out = LoadedUpstreams::default();
+    let mut by_addr: HashMap<Ipv4Addr, (Option<UpstreamList>, usize)> = HashMap::new();
+    let mut order: Vec<Ipv4Addr> = Vec::new();
+    for m in members {
+        let IpAddr::V4(addr) = m.address().addr() else {
+            out.skipped_invalid += 1;
+            continue;
+        };
+        let servers = m.dns();
+        let list = if servers.is_empty() {
+            None
+        } else {
+            match validated_list(gateway, servers) {
+                Ok(l) => Some(l),
+                Err(_) => {
+                    out.skipped_invalid += 1;
+                    continue;
+                }
+            }
+        };
+        match by_addr.get_mut(&addr) {
+            Some((_, n)) => *n += 1,
+            None => {
+                order.push(addr);
+                by_addr.insert(addr, (list, 1));
+            }
+        }
+    }
+    for addr in order {
+        let Some((list, n)) = by_addr.remove(&addr) else {
+            continue;
+        };
+        if n > 1 {
+            out.dropped_collisions += n;
+            continue;
+        }
+        if let Some(list) = list {
+            out.entries.push((addr, list));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +143,10 @@ mod tests {
     use std::path::Path;
 
     fn member(id: &str, last: u8) -> MemberRecord {
+        member_dns(id, last, &[])
+    }
+
+    fn member_dns(id: &str, last: u8, dns: &[IpAddr]) -> MemberRecord {
         let ep = EndpointId::new("ep").expect("endpoint");
         let token = format!(
             "fandhe-net:web:1:0:0/ep/{}/g/00000000000000000000000000000001",
@@ -93,7 +159,7 @@ mod tests {
             &token,
             Path::new("/run/ns"),
             (8, 9),
-            &[],
+            dns,
         )
         .expect("member")
     }
@@ -131,5 +197,69 @@ mod tests {
     #[test]
     fn net5_3071_names_empty_input() {
         assert_eq!(names_from_members(&[]), LoadedNames::default());
+    }
+
+    const GW: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 1);
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// NET-12・#3072: メンバーの `--dns` が、そのコンテナのアドレスの上流として登録順どおりに組まれる。
+    #[test]
+    fn net12_3072_upstreams_from_member_dns() {
+        let m = member_dns("web", 2, &[ip(192, 0, 2, 53), ip(198, 51, 100, 7)]);
+        let l = upstreams_from_members(&[m], GW);
+        assert_eq!(l.skipped_invalid, 0);
+        assert_eq!(l.dropped_collisions, 0);
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.entries[0].0, Ipv4Addr::new(10, 89, 0, 2));
+        let got: Vec<String> = l.entries[0].1.iter().map(|a| a.to_string()).collect();
+        assert_eq!(got, vec!["192.0.2.53:53", "198.51.100.7:53"]);
+    }
+
+    /// NET-12・#3072: コンテナごとに別々の上流が割り当たる（混ざらない）。
+    #[test]
+    fn net12_3072_upstreams_are_per_container() {
+        let a = member_dns("a", 2, &[ip(192, 0, 2, 53)]);
+        let b = member_dns("b", 3, &[ip(198, 51, 100, 7)]);
+        let l = upstreams_from_members(&[a, b], GW);
+        assert_eq!(l.entries.len(), 2);
+        let first: Vec<String> = l.entries[0].1.iter().map(|x| x.to_string()).collect();
+        let second: Vec<String> = l.entries[1].1.iter().map(|x| x.to_string()).collect();
+        assert_eq!(l.entries[0].0, Ipv4Addr::new(10, 89, 0, 2));
+        assert_eq!(first, vec!["192.0.2.53:53"]);
+        assert_eq!(l.entries[1].0, Ipv4Addr::new(10, 89, 0, 3));
+        assert_eq!(second, vec!["198.51.100.7:53"]);
+    }
+
+    /// NET-12・#3072: `dns` が空のメンバーは結果に入らない（転送しない）。
+    #[test]
+    fn net12_3072_member_without_dns_is_absent() {
+        let l = upstreams_from_members(&[member("web", 2)], GW);
+        assert_eq!(l, LoadedUpstreams::default());
+    }
+
+    /// NET-12・SEC-1・#3072: gateway（ヘルパー自身）を上流にしたメンバーだけが飛ばされる。
+    #[test]
+    fn net12_3072_gateway_upstream_is_skipped() {
+        let bad = member_dns("bad", 2, &[IpAddr::V4(GW)]);
+        let good = member_dns("good", 3, &[ip(192, 0, 2, 53)]);
+        let l = upstreams_from_members(&[bad, good], GW);
+        assert_eq!(l.skipped_invalid, 1);
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.entries[0].0, Ipv4Addr::new(10, 89, 0, 3));
+    }
+
+    /// NET-12・SEC-1・#3072: 同じアドレスのメンバーが 2 件あればどちらも登録しない。
+    #[test]
+    fn net12_3072_duplicate_address_drops_both() {
+        let a = member_dns("a", 2, &[ip(192, 0, 2, 53)]);
+        let b = member_dns("b", 2, &[ip(198, 51, 100, 7)]);
+        let c = member_dns("c", 3, &[ip(192, 0, 2, 53)]);
+        let l = upstreams_from_members(&[a, b, c], GW);
+        assert_eq!(l.dropped_collisions, 2);
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.entries[0].0, Ipv4Addr::new(10, 89, 0, 3));
     }
 }

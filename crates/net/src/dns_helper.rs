@@ -1245,7 +1245,9 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
                 return ExitCode::from(1);
             }
             // 制御 UDS の bind と最初の名前の読み込みも UDP の bind の前に済ませる（失敗したら READY を出さない）。
-            match control::prepare_helper_control(root, net) {
+            // gateway は待ち受けアドレスの IPv4（製品では gateway:53。`--dns` に gateway を指定したメンバーを飛ばす基準）。
+            let gateway = *listen.socket_addr().ip();
+            match control::prepare_helper_control(root, net, gateway) {
                 Ok(c) => control = Some(c),
                 Err(e) => {
                     fail_line(e.code().as_str(), e.message());
@@ -1272,6 +1274,7 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         return ExitCode::from(1);
     }
     // 切り離し起動（段 2）は制御 UDS と並行して動かし、`Reload` で読み直した名前を `RegistryHandler` で答える。
+    // `--dns` の上流の割り当ても読み直すが、転送は `SourceVerified` の製品での証明が無いため有効にしない（#3072）。
     // `Stop` で正常終了する（#3071）。SIGTERM による正常終了は未実装（REPAIR-3）。
     #[cfg(target_os = "linux")]
     if let Some(c) = control {

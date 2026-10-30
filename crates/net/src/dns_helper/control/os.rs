@@ -5,6 +5,7 @@
 //! bind と accept は標準ライブラリを使い、経路は検査済みのネットワークのディレクトリの fd 起点で組む。
 
 use std::io::{self, Read, Write as _};
+use std::net::Ipv4Addr;
 use std::os::fd::AsFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -16,10 +17,12 @@ use std::time::{Duration, Instant};
 use super::frame::{ControlFrame, ControlMessage, ReadError, ReloadGeneration};
 use super::{CONTROL_READ_TIMEOUT, DNS_RELOAD_ACK_TIMEOUT, ReloadOutcome, authorize_peer};
 use crate::dns_helper::detach::{DnsHelperStopRequest, RequestOutcome};
-use crate::dns_helper::load::names_from_members;
+use crate::dns_helper::load::{names_from_members, upstreams_from_members};
 use crate::dns_helper::record::DnsHelperRecord;
+use crate::dns_helper::upstream::DnsUpstreamMap;
 use crate::dns_helper::{
-    DnsHelperServer, DnsRegistry, MAX_CONSECUTIVE_RECV_ERRORS, RECV_POLL_INTERVAL, RegistryHandler,
+    DnsHelperServer, DnsRegistry, MAX_CONSECUTIVE_RECV_ERRORS, MAX_REGISTRY_ENTRIES,
+    RECV_POLL_INTERVAL, RegistryHandler,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
@@ -97,18 +100,41 @@ fn bind_control(dir: &NetworkDir) -> Result<UnixListener, NetError> {
     Ok(listener)
 }
 
-/// メンバー記録を読み直してレジストリを一括に差し替える。食い違い（`DataLoss` 等）は前のレジストリを保ったまま
-/// `Err`。件数だけを stderr に出す（名前・アドレスは出さない）。
-fn load_into(dir: &NetworkDir, registry: &DnsRegistry) -> Result<(), NetError> {
+/// メンバー記録を読み直し、名前のレジストリと `--dns` の上流の割り当てを一括に差し替える（NET-5・NET-12・#3072）。
+///
+/// 両方を作り、件数の上限を先に検査してから差し替える。食い違い（`DataLoss` 等）や上限超過は、どちらも前の状態を
+/// 保ったまま `Err`（片方だけが新しくなる半端な状態を作らない）。`gateway` はヘルパーの待ち受けアドレスで、
+/// 上流に指定されたメンバーは飛ばす。件数だけを stderr に出す（名前・アドレスは出さない）。
+fn load_into(
+    dir: &NetworkDir,
+    registry: &DnsRegistry,
+    upstreams: &DnsUpstreamMap,
+    gateway: Ipv4Addr,
+) -> Result<(), NetError> {
     let members = dir.members()?;
-    let loaded = names_from_members(&members);
-    registry.replace_all(&loaded.entries)?;
+    let names = names_from_members(&members);
+    let ups = upstreams_from_members(&members, gateway);
+    if names.entries.len() > MAX_REGISTRY_ENTRIES || ups.entries.len() > MAX_REGISTRY_ENTRIES {
+        return Err(err(
+            NetErrorCode::ResourceExhausted,
+            "dns helper registry is full",
+        ));
+    }
+    registry.replace_all(&names.entries)?;
+    upstreams.replace_all(&ups.entries)?;
     let _ = writeln!(
         io::stderr(),
         "dns names loaded count={} skipped={} collisions={}",
-        loaded.entries.len(),
-        loaded.skipped_invalid,
-        loaded.dropped_collisions
+        names.entries.len(),
+        names.skipped_invalid,
+        names.dropped_collisions
+    );
+    let _ = writeln!(
+        io::stderr(),
+        "dns upstreams loaded count={} skipped={} collisions={}",
+        ups.entries.len(),
+        ups.skipped_invalid,
+        ups.dropped_collisions
     );
     Ok(())
 }
@@ -243,6 +269,10 @@ impl ControlServer {
 pub(crate) struct HelperControl {
     dir: Arc<NetworkDir>,
     registry: Arc<DnsRegistry>,
+    /// 記録の `--dns` から組んだ上流の割り当て。製品の待受は転送しないため参照側は無い（下の `serve` を参照）。
+    upstreams: Arc<DnsUpstreamMap>,
+    /// ヘルパーの待ち受けアドレスの IPv4（= ネットワークの gateway。上流に指定されたメンバーを飛ばす基準）。
+    gateway: Ipv4Addr,
     control: ControlServer,
 }
 
@@ -252,6 +282,7 @@ pub(crate) struct HelperControl {
 pub(crate) fn prepare_helper_control(
     state_root: &Path,
     network: &NetworkName,
+    gateway: Ipv4Addr,
 ) -> Result<HelperControl, NetError> {
     if !state_root.is_absolute() {
         return Err(err(
@@ -263,13 +294,16 @@ pub(crate) fn prepare_helper_control(
     let dir = store.open_network_dir(network)?;
     let listener = bind_control(&dir)?;
     let registry = Arc::new(DnsRegistry::new());
-    load_into(&dir, &registry)?;
+    let upstreams = Arc::new(DnsUpstreamMap::new());
+    load_into(&dir, &registry, &upstreams, gateway)?;
     let dir = Arc::new(dir);
     let control =
         ControlServer::new(listener, sys::effective_uid())?.with_audit_dir(Arc::clone(&dir));
     Ok(HelperControl {
         dir,
         registry,
+        upstreams,
+        gateway,
         control,
     })
 }
@@ -278,10 +312,15 @@ impl HelperControl {
     /// UDP の待受（`server`）と制御 UDS を並行して動かす。どちらかが終わったら（`Stop`・エラー）もう一方も止める。
     pub(crate) fn serve(self, server: &mut DnsHelperServer) -> Result<(), NetError> {
         let stop = AtomicBool::new(false);
+        // 上流の割り当ては組むが、ここでは `ForwardingHandler` に切り替えない。転送には `SourceVerified`
+        // （bridge 側の送信元詐称防止の証明。製品での作り方は未実装）が要り、無いまま有効にすると他コンテナの
+        // 上流を詐称で使えてしまう（fail-open）。切り替えは証明の実装後（NET-12・REPAIR-3）。
         let handler = RegistryHandler::new(Arc::clone(&self.registry));
         let dir = Arc::clone(&self.dir);
         let registry = Arc::clone(&self.registry);
-        let reload = move || load_into(&dir, &registry);
+        let upstreams = Arc::clone(&self.upstreams);
+        let gateway = self.gateway;
+        let reload = move || load_into(&dir, &registry, &upstreams, gateway);
         thread::scope(|scope| {
             // スレッド生成の失敗は panic でなく構造化エラーで返す（READY の後でも NetError で終われる）。
             let control = thread::Builder::new()
@@ -793,5 +832,144 @@ mod tests {
         drop(slow);
         s.stop.store(true, Ordering::SeqCst);
         join_within(s.join).expect("run");
+    }
+
+    // ---- 記録からの名前と上流の組み直し（NET-12・NET-5・#3072） ----
+
+    use crate::dns_helper::DnsName;
+    use crate::netlink_route::IpPrefix;
+    use crate::network::EndpointId;
+    use crate::network_store::{MemberId, MemberRecord, NetworkDefinition};
+    use std::net::IpAddr;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    const GW: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 1);
+
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("fcdns-ld-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&p)
+                .expect("root");
+            Self(p)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn prefix(last: u8, len: u8) -> IpPrefix {
+        IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), len).expect("prefix")
+    }
+
+    fn commit(store: &NetworkStore, net: &NetworkName, id: &str, last: u8, dns: &[IpAddr]) {
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(net).expect("network");
+        let token = format!("fandhe-net:web:1:0:0/ep/{id}/g/00000000000000000000000000000001");
+        let rec = MemberRecord::new(
+            MemberId::new(id).expect("id"),
+            EndpointId::new(id).expect("ep"),
+            prefix(last, 24),
+            &token,
+            Path::new("/run/ns"),
+            (8, 9),
+            dns,
+        )
+        .expect("member");
+        n.commit_member(&rec).expect("commit");
+    }
+
+    /// 状態ルート配下の `members/` にある記録ファイルを不正な内容に書き換える。
+    fn corrupt_member_files(dir: &Path) {
+        for e in std::fs::read_dir(dir).expect("read_dir") {
+            let path = e.expect("entry").path();
+            if path.is_dir() {
+                corrupt_member_files(&path);
+            } else if path.parent().and_then(Path::file_name) == Some("members".as_ref()) {
+                std::fs::write(&path, b"garbage").expect("corrupt");
+            }
+        }
+    }
+
+    fn upstream_strings(m: &DnsUpstreamMap, a: Ipv4Addr) -> Option<Vec<String>> {
+        m.lookup(a)
+            .map(|l| l.iter().map(|x| x.to_string()).collect())
+    }
+
+    /// NET-12・NET-5・#3072: 記録の `--dns` がコンテナのアドレスごとの上流として組まれ、名前も同時に登録される。
+    /// 次の読み込みで記録が増えれば反映される（具体値）。
+    #[test]
+    fn net12_3072_load_into_builds_upstreams_from_records() {
+        let root = Root::new("build");
+        let store = NetworkStore::open(&root.0).expect("store");
+        store
+            .create(&NetworkDefinition::bridge("web", prefix(0, 24)).expect("def"))
+            .expect("create");
+        let net = NetworkName::new("web").expect("name");
+        commit(
+            &store,
+            &net,
+            "web1",
+            2,
+            &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))],
+        );
+        let dir = store.open_network_dir(&net).expect("dir");
+        let reg = DnsRegistry::new();
+        let ups = DnsUpstreamMap::new();
+        load_into(&dir, &reg, &ups, GW).expect("load");
+        let a = Ipv4Addr::new(10, 89, 0, 2);
+        assert_eq!(
+            upstream_strings(&ups, a),
+            Some(vec!["192.0.2.53:53".to_owned()])
+        );
+        assert_eq!(reg.lookup("web1"), Some(a));
+        commit(
+            &store,
+            &net,
+            "db1",
+            3,
+            &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))],
+        );
+        load_into(&dir, &reg, &ups, GW).expect("reload");
+        assert_eq!(ups.len(), 2);
+        assert_eq!(
+            upstream_strings(&ups, Ipv4Addr::new(10, 89, 0, 3)),
+            Some(vec!["198.51.100.7:53".to_owned()])
+        );
+    }
+
+    /// NET-12・REPAIR-3・#3072: 上限超過で読み込みが失敗したとき、名前も上流も前の状態を保つ（半端に更新しない）。
+    #[test]
+    fn net12_3072_load_failure_keeps_previous_state() {
+        let root = Root::new("keep");
+        let store = NetworkStore::open(&root.0).expect("store");
+        store
+            .create(&NetworkDefinition::bridge("web", prefix(0, 24)).expect("def"))
+            .expect("create");
+        let net = NetworkName::new("web").expect("name");
+        let dir = store.open_network_dir(&net).expect("dir");
+        let reg = DnsRegistry::new();
+        let ups = DnsUpstreamMap::new();
+        let a = Ipv4Addr::new(10, 89, 0, 9);
+        let name = DnsName::new("old").expect("n");
+        reg.register(&name, a).expect("register");
+        ups.set(a, GW, &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))])
+            .expect("set");
+        // 記録を壊す: メンバーのディレクトリの記録ファイルを不正な内容にする。
+        commit(&store, &net, "web1", 2, &[]);
+        corrupt_member_files(&root.0);
+        assert!(load_into(&dir, &reg, &ups, GW).is_err());
+        assert_eq!(reg.lookup(name.as_str()), Some(a));
+        assert_eq!(
+            upstream_strings(&ups, a),
+            Some(vec!["192.0.2.53:53".to_owned()])
+        );
     }
 }

@@ -242,7 +242,7 @@ mod linux {
     /// 期限切れ・回収・固定の失敗行を実証できる。未設定では何もしない。
     const HANG_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_HANG";
     /// 段の名前の固定一覧（注入の許可リストを兼ねる）。
-    const STAGES: [&str; 15] = [
+    const STAGES: [&str; 16] = [
         "preconditions",
         "scratch-and-bundle",
         "create",
@@ -258,6 +258,7 @@ mod linux {
         "wait-proc-gone",
         "wait-no-children",
         "remove-cgroup",
+        "cleanup",
     ];
     /// 期限切れで終わるときの終了コード（`timeout(1)` と同じ値）。
     const EXIT_WATCHDOG_EXPIRED: i32 = 124;
@@ -297,6 +298,21 @@ mod linux {
             assert_eq!(deadline_for(secs), Duration::from_secs(want), "secs={secs}");
         }
         assert!(hang_is_valid("exec-a"));
+        assert!(hang_is_valid("cleanup"));
+        // 試験ソースが出す段名の全件が許可リストに入っていること（食い違うと注入が拒否される）。
+        let src = include_str!("exec_subordinate_e2e.rs");
+        let pat = concat!("begin", "(\"");
+        let mut seen = 0;
+        for part in src.split(pat).skip(1) {
+            if let Some(name) = part.split('"').next()
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            {
+                assert!(hang_is_valid(name), "stage {name} missing from STAGES");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 16, "expected to find every stage, found {seen}");
         assert!(!hang_is_valid("bogus"));
         assert!(!hang_is_valid(""));
         assert!(

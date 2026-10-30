@@ -1574,11 +1574,11 @@ mod net12_argv_tests {
         assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
     }
 
-    /// NET-9(#3200): 正しい `-p` + ユーザー定義名は、CLI の解除(#3329)まで UNIMPLEMENTED(受理して捨てない)。
+    /// NET-9(#3200・#3329): 正しい `-p` + ユーザー定義名は pasta の判定まで進む(rootful は UNIMPLEMENTED、rootless で pasta 未指定は FAILED_PRECONDITION)。
     #[test]
-    fn net9_publish_valid_is_unimplemented_until_wired() {
+    fn net9_publish_valid_reaches_pasta_decision() {
         // 判定順は `check_network_options`(権限モデルの解決: publish が使えない場合の拒否)→ pasta の場所 →
-        // `UNIMPLEMENTED`。組み合わせごとに具体値で期待する(NET-9・#3199・#3200)。
+        // 定義の照合。組み合わせごとに具体値で期待する(NET-9・#3199・#3200)。
         // 非 Linux は権限モデルが `Unavailable` で、pasta の判定より前に `UNIMPLEMENTED` になる。
         // Linux の root は rootful で `UNIMPLEMENTED`、非 root は rootless で pasta 未指定の `FAILED_PRECONDITION`。
         #[cfg(not(target_os = "linux"))]

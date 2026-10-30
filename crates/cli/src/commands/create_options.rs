@@ -80,9 +80,8 @@ pub(super) fn document_of(
             .with_pasta(Some(record.to_body())),
     })
     // `network` を書く pasta の段の後ろに `publish` を並べる(`with_publish` はユーザー定義名の `network` を要する)。
-    // 継ぎ目(REPAIR-3・NET-9・#3200): `publish` はユーザー定義名の `network` と組で書く。ユーザー定義名は
-    // `create_network::reject_unwired_network` が `UNIMPLEMENTED` で止めるため、空でない `publish` はここへ届かない
-    // (届いても `none` / `host` では文書にできず `InvalidArgument`)。
+    // 継ぎ目(NET-9・#3200・#3329): `publish` はユーザー定義名の `network` と pasta の記録と組で書く
+    // (rootless のユーザー定義名のときだけここへ届く。`none` / `host` では文書にできず `InvalidArgument`)。
     .and_then(|doc| doc.with_publish(options.network.publish.clone()))
 }
 
@@ -183,6 +182,53 @@ mod tests {
         let mut a = args();
         a.network.add_hosts = vec!["a:192.0.2.1".into()];
         assert_eq!(document_of(&a, None).expect("doc").network(), Some("none"));
+    }
+
+    /// NET-6・NET-9・NET-12(#3329): rootless のユーザー定義名は `network`・`pasta`・`publish`・`dns`・`add-host` を文書へ書き、
+    /// 復号した文書は resolv.conf を選ぶ(`--dns` が無くても。既定の nameserver は pasta の `169.254.1.1`)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_3329_document_of_writes_named_network_with_pasta() {
+        use fandhe_container_core::etc_files::EtcFileKind;
+        use fandhe_container_net::pasta::record::PastaRecord;
+        use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+        let record = PastaRecord::parse_body(
+            "20260120 2049 131074 1234567 1760000000 123456789 5 0 0 755\n/usr/bin/pasta",
+        )
+        .expect("record");
+        let mut a = args();
+        a.network.network = Some("web".into());
+        a.network.add_hosts = vec!["h:192.0.2.1".into()];
+        a.network.dns = vec!["192.0.2.53".into()];
+        a.network.publish = vec!["8080:80".into(), "127.0.0.1:8081:81/udp".into()];
+        let doc = document_of(&a, Some(&record)).expect("doc");
+        assert_eq!(doc.network(), Some("web"));
+        assert_eq!(doc.dns(), ["192.0.2.53"]);
+        assert_eq!(doc.publish(), ["8080:80", "127.0.0.1:8081:81/udp"]);
+        assert_eq!(doc.pasta(), Some(record.to_body().as_str()));
+        // 復号して意味づけし直しても、resolv.conf と hosts を選ぶ。
+        let back = ContainerOptionsDocument::decode(&doc.encode()).expect("decode");
+        let sel = back
+            .to_container_options()
+            .expect("options")
+            .network()
+            .etc_file_selection();
+        assert!(sel.contains(EtcFileKind::ResolvConf));
+        assert!(sel.contains(EtcFileKind::Hosts));
+        // `--dns` が無くても resolv.conf を選ぶ(既定の nameserver は supervisor の etc_files が決める)。
+        let mut b = args();
+        b.network.network = Some("web".into());
+        let doc = document_of(&b, Some(&record)).expect("doc");
+        let sel = doc
+            .to_container_options()
+            .expect("options")
+            .network()
+            .etc_file_selection();
+        assert!(sel.contains(EtcFileKind::ResolvConf));
+        assert_eq!(
+            fandhe_container_supervisor::container_options::network::PASTA_DEFAULT_NAMESERVER,
+            "169.254.1.1"
+        );
     }
 
     /// NET-9(#3200): `network` の無い `publish` は文書にできない(継ぎ目の固定)。

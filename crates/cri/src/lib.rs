@@ -41,3 +41,9 @@ pub mod runtime {
         include!(concat!(env!("OUT_DIR"), "/runtime.v1.rs"));
     }
 }
+
+// 先に消してから作る試験補助を排他作成へ揃えるための共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3506）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

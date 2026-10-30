@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
@@ -61,23 +60,14 @@ impl Drop for FailSave {
     }
 }
 
-struct Root(PathBuf);
+/// 試験ごとの root。既存の名前は消さず排他作成（unix は 0700）し、Drop で自分が作ったパスだけを消す
+/// （共有部品 `test_root`。REPAIR-12・#3506）。`.0` は排他作成した root のパス。
+struct Root(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 impl Root {
     fn new(label: &str) -> Self {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fc-oci-inv-ops-{}-{}-{label}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
-        Root(p)
+        let root = crate::test_root::test_root("fc-oci-inv-ops", label);
+        fs::create_dir_all(root.join("blobs").join("sha256")).expect("mkdir");
+        Root(root.to_path_buf(), root)
     }
     fn put(&self, dg: &Digest) {
         let p = blob_path(&self.0, dg).expect("path");
@@ -100,12 +90,6 @@ impl Root {
             .with_timeout(Duration::from_millis(500))
     }
 }
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A=0xa0（config 0xc1・layers 0x10 0x11）と B=0xb0（config 0xc2・layers 0x10 0x12）を永続化して在庫に入れる。
 fn seed(root: &Root) {
     for n in [0xc1, 0x10, 0x11, 0xc2, 0x12] {

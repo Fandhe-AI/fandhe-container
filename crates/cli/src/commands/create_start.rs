@@ -881,7 +881,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
             super::create_network::resolve_publish_privilege,
         )?;
         // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
-        let pasta = super::create_pasta::resolve_for_create(global, named)?;
+        // ユーザー定義名の定義は、インストールの種別の判定の後・pasta の解決の前に、何も作らずに照合する(D2・#3329)。
+        let pasta = super::create_pasta::resolve_for_create(global, named.as_ref(), |name| {
+            super::create_network::require_named_definition(global, name, None)
+        })?;
         super::create_network::reject_unwired_network(
             &args.options.network,
             cfg!(target_os = "linux"),

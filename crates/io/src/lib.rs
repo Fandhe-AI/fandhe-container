@@ -176,3 +176,7 @@ pub use writeback::{
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+
+// 試験用の一時ファイルを先行削除・上書きなしで排他作成する補助（REPAIR-12・#3479）。
+#[cfg(test)]
+mod test_temp_file;

@@ -2114,8 +2114,10 @@ fn supervise_running(
         }
     }
 }
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+pub use linux::run_start_after_options_worker_for_test;
 #[cfg(target_os = "linux")]
-pub use linux::{ProductionStartDeps, run_main};
+pub use linux::{LATE_DRAIN_BUDGET, ProductionStartDeps, TAMPER_AUDIT_BUDGET, run_main};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -3068,7 +3070,6 @@ mod linux {
             }
             Err(_) => {
                 // 作業スレッドを join できない。報告後に有界で回収できるよう rx と handle を残す。
-                logs.mark_worker_unjoined();
                 crate::pasta_attach::log_pasta_verify_timeout(
                     logs,
                     id.as_str(),
@@ -3099,7 +3100,8 @@ mod linux {
     }
 
     /// 報告の後に作業スレッドを待つ上限(再検証の `--version` の期限 2 秒に余裕 1 秒。REPAIR-5・#3431)。
-    const LATE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+    #[doc(hidden)]
+    pub const LATE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
     impl UnjoinedOptionsWorker {
         /// `budget` まで結果を待つ。届けば join して `true`(結果の値は捨てる。start は拒否済みで、改ざんの印と
@@ -3253,6 +3255,105 @@ mod linux {
         let code = run_main_inner(args);
         let _ = crate::stderr_sink::flush_stderr(STDERR_DEADLINE);
         code
+    }
+
+    /// 2c の結果から deps を作った後の共通経路: 改ざんの印の配送(2c が戻った場合)→ `run_start_until` →
+    /// 拒否時の報告後の始末(`finish_after_refused_start`)。本番の入口 `run_main_inner` と、試験用の継ぎ目
+    /// `run_start_after_options_worker_for_test` の両方がここだけを通る(順序と上限を 1 か所で保つ。
+    /// SEC-4・NET-9・REPAIR-5・REPAIR-3・#3431・#3473)。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "本番の入口と試験用の継ぎ目で共有する手順で、各引数は別の所有者の資源のため束ねない"
+    )]
+    fn start_after_options(
+        unjoined_options: Option<UnjoinedOptionsWorker>,
+        deps: Box<dyn StartDeps + Send>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        pasta_logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        store: &Arc<dyn StateStore>,
+        req: &StartRequest,
+        timeouts: &StartTimeouts,
+        deadline: Option<Instant>,
+        out: &mut dyn Write,
+    ) -> Result<Running, NonZeroU8> {
+        // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
+        // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
+        // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
+        if unjoined_options.is_none() {
+            record_pasta_tamper(audit, id, pasta_logs, deadline);
+        }
+        match run_start_until(
+            deps,
+            store,
+            &Arc::new(OpRecorder::new()),
+            req,
+            timeouts,
+            deadline,
+            out,
+        ) {
+            Ok(r) => Ok(r),
+            Err(code) => {
+                // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
+                // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
+                // 2c が期限超過なら、報告の後に作業スレッドを `LATE_DRAIN_BUDGET` だけ待ち、遅れて置かれた改ざんの印と
+                // 行を拾う(報告の期限は延びない。launch しない経路なので単一スレッド要求にも触れない。#3431)。
+                // 回収できなければ期限超過の行が終端の記録になる(残余。docs/design/rootless-network.md)。
+                finish_after_refused_start(
+                    unjoined_options,
+                    audit,
+                    id,
+                    pasta_logs,
+                    LATE_DRAIN_BUDGET,
+                );
+                Err(code)
+            }
+        }
+    }
+
+    /// 試験専用の継ぎ目: 2c の作業スレッドの本体 `work` と deps の組み立て `deps_for` だけを差し替え、期限超過の
+    /// 待ち・報告・報告後の回収・改ざんの印の監査配送・遅延ログの flush は本番と同じ `start_after_options` を通す。
+    /// `deps_for` には 2c の失敗(期限超過なら `Timeout`)が渡る。本番の入口には使わない(SEC-4・NET-9・REPAIR-5・#3473)。
+    #[cfg(feature = "exec-test-support")]
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "本番の入口と同じ資源を試験から差し替えるため束ねない"
+    )]
+    pub fn run_start_after_options_worker_for_test<W, D>(
+        work: W,
+        deps_for: D,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        store: &Arc<dyn StateStore>,
+        req: &StartRequest,
+        timeouts: &StartTimeouts,
+        deadline: Option<Instant>,
+        out: &mut dyn Write,
+    ) -> Result<Running, NonZeroU8>
+    where
+        W: FnOnce() -> Result<(), TraitError> + Send + 'static,
+        D: FnOnce(Option<TraitError>) -> Box<dyn StartDeps + Send>,
+    {
+        let OptionsPrepared { result, unjoined } = run_options_worker(
+            move || work().map(|()| (None, None)),
+            deadline,
+            logs,
+            req.id(),
+        );
+        let deps = deps_for(result.err());
+        start_after_options(
+            unjoined,
+            deps,
+            audit,
+            req.id(),
+            logs,
+            store,
+            req,
+            timeouts,
+            deadline,
+            out,
+        )
     }
 
     fn run_main_inner<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
@@ -3412,37 +3513,20 @@ mod linux {
             Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
-        // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
-        // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
-        // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
-        if unjoined_options.is_none() {
-            record_pasta_tamper(audit.as_ref(), &args.id, &pasta_logs, deadline);
-        }
-        let running = match run_start_until(
+        let running = match start_after_options(
+            unjoined_options,
             deps,
+            audit.as_ref(),
+            &args.id,
+            &pasta_logs,
             &store,
-            &Arc::new(OpRecorder::new()),
             &req,
             &timeouts,
             deadline,
             &mut out,
         ) {
             Ok(r) => r,
-            Err(code) => {
-                // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
-                // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
-                // 2c が期限超過なら、報告の後に作業スレッドを `LATE_DRAIN_BUDGET` だけ待ち、遅れて置かれた改ざんの印と
-                // 行を拾う(報告の期限は延びない。launch しない経路なので単一スレッド要求にも触れない。#3431)。
-                // 回収できなければ期限超過の行が終端の記録になる(残余。docs/design/rootless-network.md)。
-                finish_after_refused_start(
-                    unjoined_options,
-                    audit.as_ref(),
-                    &args.id,
-                    &pasta_logs,
-                    LATE_DRAIN_BUDGET,
-                );
-                return ExitCode::from(code.get());
-            }
+            Err(code) => return ExitCode::from(code.get()),
         };
         // 報告は 1 行だけ書く契約。複製は閉じるが、fd 1 自体は std の stdout が持つため pipe は開いたまま
         // （CLI は EOF ではなく 1 行の受信で完了とみなす。fd を閉じるには unsafe が要るため行わない）。
@@ -3481,7 +3565,8 @@ mod linux {
     }
 
     /// 改ざんの疑いの監査配送の予算(起動の期限の残りと小さい方。REPAIR-5)。
-    const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
+    #[doc(hidden)]
+    pub const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
 
     /// 拒否の報告を書いた後の始末: 未回収の 2c 作業スレッドを `budget` まで待ち、届けば遅れて置かれた改ざんの印を
     /// 監査へ配送し、最後に遅延ログを flush する(SEC-4・NET-9・REPAIR-5・#3431)。
@@ -3619,7 +3704,7 @@ mod linux {
             assert_eq!(err.code(), ErrorCode::Timeout);
             assert_eq!(err.message(), "container options preparation timed out");
             assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
-            assert!(logs.worker_unjoined());
+            assert!(prepared.unjoined.is_some());
             let lines = logs.take();
             assert_eq!(lines.len(), 1, "{lines:?}");
             assert!(
@@ -4396,9 +4481,9 @@ mod linux {
                 "the supervisor relay must use the stop-signal-ignoring constructor"
             );
             let run = src[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(spawn < run, "relay must be spawned before run_start_until");
             // CORE-3・SUP-1: helper は委譲 cgroup に属するため、deps へ同伴プロセスとして宣言してから起動する。
             let deps = src[entry..]
@@ -4425,9 +4510,9 @@ mod linux {
                 .map(|p| p + entry)
                 .expect("relay is passed as the exit audit sink");
             let run = production[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(wire < run, "relay must be wired before run_start_until");
             let build = production
                 .find("fn build_launcher(")
@@ -4465,9 +4550,9 @@ mod linux {
                 .map(|p| p + entry)
                 .expect("relay is passed as the rejection audit sink");
             let run = production[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(wire < run, "relay must be wired before run_start_until");
             let build = production
                 .find("fn build_launcher(")

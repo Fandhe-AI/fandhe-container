@@ -201,21 +201,16 @@ mod tests {
         set
     }
 
-    /// 偽の rootfs（`proc/sys/kernel/*` の空ファイル）。破棄時に削除する。
-    struct FakeRoot(PathBuf);
+    /// 偽の rootfs（`proc/sys/kernel/*` の空ファイル）。ScratchDir の drop で削除する。
+    struct FakeRoot(PathBuf, #[allow(dead_code)] crate::scratch_root::ScratchDir);
 
     impl FakeRoot {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "fandhe-sysctls-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
+            // pid＋nanos の名前を create_dir_all せず、排他作成の ScratchDir の子を使う（#3478・REPAIR-12）。
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-sysctls-{tag}"), "root");
             std::fs::create_dir_all(dir.join("proc/sys/kernel")).unwrap();
-            Self(dir)
+            Self(dir, scratch)
         }
         fn file(&self, rel: &str) -> PathBuf {
             self.0.join("proc/sys").join(rel)
@@ -223,12 +218,6 @@ mod tests {
         fn open(&self) -> OwnedFd {
             sys::open_dir_path_nofollow(None, &CString::new(self.0.to_str().unwrap()).unwrap())
                 .unwrap()
-        }
-    }
-
-    impl Drop for FakeRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

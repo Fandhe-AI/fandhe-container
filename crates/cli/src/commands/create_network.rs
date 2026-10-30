@@ -217,6 +217,9 @@ pub(super) fn check_network_options(
 ///
 /// 状態ルートは [`StateRoot::resolve`](パスを組み立てるだけで副作用なし)で求め、ストアは `open_existing` で
 /// 開くため、状態ルート・`@networks` を作らない。start も同じ照合をやり直す(supervisor の手順 2c)。
+///
+/// `recorder` は本番では `run_create` が `CliNetRecorder` を渡し、定義ストアの `network.store.open` / `get` が
+/// `FANDHE_CONTAINER_OP_LOG` へ出る(start の再照合と同じ操作名。REPAIR-4・#3530)。
 pub(super) fn require_named_definition(
     global: &GlobalArgs,
     name: &NetworkName,
@@ -573,6 +576,65 @@ mod tests {
         store.remove(&name).expect("rm");
         let e = require_named_definition_at(&root, &name, None).expect_err("removed");
         assert_eq!(e.code(), ErrorCode::NotFound);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REPAIR-4・NET-6・CLI-1(#3530): create 経路の定義照合(`run_create` が `CliNetRecorder` を渡す)が、
+    /// 定義ストアの操作を `network.store.open` / `network.store.get` として記録する。名前は start の
+    /// 再照合(supervisor の遅延ログ)と同じ固定文字列で、入力値(ネットワーク名)は含まない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_net6_3530_require_named_definition_records_store_ops() {
+        use super::super::net_recorder::CliNetRecorder;
+        use fandhe_container_core::observability::OpRecorder;
+        use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+
+        // 1 回の照合を新しい記録器で行い、(操作名, 成功数, 失敗数) と結果コードを返す。
+        fn check(root: &Path, name: &str) -> (Vec<(String, u64, u64)>, Option<ErrorCode>) {
+            let rec = Arc::new(OpRecorder::new());
+            let r: Arc<dyn NetOpRecorder> = Arc::new(CliNetRecorder::new(Arc::clone(&rec)));
+            let res =
+                require_named_definition_at(root, &NetworkName::new(name).expect("n"), Some(r));
+            let ops = rec
+                .snapshot()
+                .iter()
+                .map(|s| (s.name().as_str().to_string(), s.success(), s.failure()))
+                .collect();
+            (ops, res.err().map(|e| e.code()))
+        }
+        let row = |n: &str, s: u64, f: u64| (n.to_string(), s, f);
+
+        let root = tmp_root("rec");
+        // @networks が無い: open_existing は Ok(None) で成功として記録される。get は呼ばれない。
+        let (ops, code) = check(&root, "web");
+        assert_eq!(ops, vec![row("network.store.open", 1, 0)]);
+        assert_eq!(code, Some(ErrorCode::NotFound));
+        assert!(!root.join("@networks").exists());
+
+        let store = NetworkStore::open(&root).expect("open");
+        // store はあるが名前が無い: get が失敗として記録される。
+        let (ops, code) = check(&root, "web");
+        assert_eq!(
+            ops,
+            vec![
+                row("network.store.get", 0, 1),
+                row("network.store.open", 1, 0)
+            ]
+        );
+        assert_eq!(code, Some(ErrorCode::NotFound));
+
+        store
+            .create(&NetworkDefinition::pasta("web").expect("def"))
+            .expect("create");
+        let (ops, code) = check(&root, "web");
+        assert_eq!(
+            ops,
+            vec![
+                row("network.store.get", 1, 0),
+                row("network.store.open", 1, 0)
+            ]
+        );
+        assert_eq!(code, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

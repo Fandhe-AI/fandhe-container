@@ -2,9 +2,13 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）・エントリポイント検証（#1595）・pasta バイナリの起動時の再検証（#3330）など `AuditLayer` の各レイヤーで起きた分離違反の試行を、原因特定に必要な情報
-//! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
-//! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
+//! `AuditLayer` の 11 種（seccomp・landlock・mount・plugin_trust・plugin_peer・exec_target・entrypoint・
+//! control_channel・exit_signal・audit_coverage・pasta_verify）で起きた分離違反の試行と、それに付随する補助の記録を、
+//! 原因特定に必要な情報（syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
+//! `exit_signal` は違反そのものではなく回収点が見た終了シグナルの補助記録、`audit_coverage` は監査を 100% 満たせない
+//! 環境で起動を続けた縮退の記録である。
+//! 本モジュール本体（`audit_log.rs`）の型定義は syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
+//! I/O を持つのは下位モジュール（`file_writer`・`kernel_audit`・`control_relay`・`file_sink` など）である。
 //!
 //! # 呼び出し元・契約
 //!
@@ -26,6 +30,24 @@
 //!   [`AuditEvent::PastaVerify`] として中継 sink（`ControlAuditRelay`）経由で 1 拒否 1 件を配送する（実装済み）。理由は
 //!   [`PastaVerifyRejection`] の 2 種（`pasta_record_changed`・`pasta_permission_denied`）で、パスは持たない（型で保証）。
 //!   作成時（CLI の create）の `PermissionDenied` は D2 と両立しないため記録しない
+//! - supervisor の制御チャネルの接続元の拒否（層 `control_channel`。SEC-4・SEC-1・SUP-1・#2058）は、制御チャネルのサーバー
+//!   （`fandhe-container-supervisor` の `control/server.rs`）が `ControlObserver::record_peer_rejection`
+//!   （`control/observe.rs`）経由で [`AuditEvent::ControlPeer`] として記録する。理由は [`ControlPeerRejection`] の 2 種
+//!   （`control_peer_uid_mismatch`・`control_peer_credentials_unavailable`）で、パス・接続元の uid と pid は持たない。
+//!   コンテナ ID は observer が持っていれば付く。supervisor は複数スレッドのため配送は中継 `ControlAuditRelay` を通し、
+//!   記録先へ書けなければ構造化ログ（`control_peer_rejected`）に出す
+//! - 終了シグナルの補助記録（層 `exit_signal`。SEC-4・ESC-06・#2004）は、本番 launcher の回収点
+//!   （`oci_runtime::launch` の `with_exit_audit`・`record_exit_signal_once`）が、SIGSYS で終わったのを初めて見たときに
+//!   回収の後で 1 回だけ [`AuditEvent::ExitSignal`] として記録する。[`record_exit_signal_until`] を [`RECORD_WAIT_LIMIT`]
+//!   の期限つきで使い、記録先は supervisor が単一スレッドの間に作った `ControlAuditRelay`（`exit_audit_sink`。#2236）。
+//!   コンテナ ID・signal・target_pid（回収した側の PID namespace の値）を載せ、syscall・arch は持たない。
+//!   seccomp 由来とは断定できない補助の記録で、正の記録はカーネルの `AUDIT_SECCOMP`。pid 1 以外の子孫は観測できない
+//! - 監査の縮退の記録（層 `audit_coverage`。SEC-4・#2027）の判定は `coverage` モジュール（[`assess`]・[`AuditCoverage`]・
+//!   [`AuditCoveragePolicy`] の `best-effort`・`strict`）で行う。本番 launcher の `assess_audit_coverage` が fork の前に評価し、
+//!   厳格モードなら起動を拒否する。縮退していれば [`AuditEvent::AuditCoverageDegraded`] を `mount::deliver_until` で
+//!   コンテナ ID つき・launch の期限つきの 1 件として配送する。書けなければ [`AUDIT_COVERAGE_RECORD_FAILED_LINE`] を出し、
+//!   分離の記録（`state.json` の `launchIsolation`・inspect）にも失敗を載せる（#2468）。理由は `reason` ではなく
+//!   `seccomp_kill`・`landlock` の 2 欄（ワイヤーでは `seccomp_kill_reason`・`landlock_reason`。`coverage_reasons()`）で持つ
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）
@@ -57,8 +79,9 @@
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
 //! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
-//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。landlock への配線は未実装。plugin_trust は
-//! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
+//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。
+//! pasta_verify〔start の入口。#3330〕・control_channel〔observer が分かる場合〕・exit_signal〔#2004〕・audit_coverage〔#2027〕も載せる。landlock への配線は未実装。
+//! plugin_trust は検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕。plugin_peer も特定のコンテナに属さないため載せない）。
 //! 拒否した段は #3121 で [`AuditRecord::stage`] として追加済み（`IsolationStage` と同じ固定語彙の [`AuditStage`]）。
 //! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）と、
 //! supervisor の exec の親の記録が載せる。他の層は載せない（キー自体を出さない）。親の記録点の段の対応づけ（#3209・#3294）:
@@ -887,8 +910,9 @@ impl AuditRecord {
         }
     }
 
-    /// 拒否理由トークン（plugin 信頼検証・exec 対象・エントリポイント、および理由を持つ mount のレコード。
-    /// seccomp・landlock と理由なしの mount は `None`）。
+    /// 拒否理由トークン（plugin_trust・plugin_peer・exec_target・entrypoint・pasta_verify・control_channel、
+    /// および理由を持つ mount のレコード。seccomp・landlock・exit_signal・理由なしの mount は `None`。
+    /// audit_coverage の理由は 2 欄に分かれるため `coverage_reasons()` で得る）。
     pub fn reason(&self) -> Option<AuditReason> {
         match &self.event {
             AuditEvent::Mount { reason, .. } => *reason,

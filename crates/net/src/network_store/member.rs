@@ -17,6 +17,7 @@
 //! netns-dir <len>\n<絶対パス>\n
 //! netns-dir-id <len>\n<dev:ino>\n
 //! pin <len>\n<dev:ino:serial>\n   (省略可。netns の pin の識別子。#3347)
+//! dns-name <len>\n<RFC 1123 の正準形の名前>\n   (省略可。コンテナ名。DNS ヘルパーが ID に加えて引ける名前。#3531)
 //! dns <len>\n<ip>\n                  (0〜3 回)
 //! table-handle <len>\n<10 進・非 0>\n   (公開が 1 件以上のときだけ 1 回)
 //! publish <len>\n<proto addr:host-port container-port prerouting output>\n   (0〜64 回)
@@ -30,7 +31,9 @@
 //! の正準形だけを受ける（解除の意図を DELRULE の前に残した公開には末尾に ` unpublishing` が付く。再起動後に ENOENT を
 //! 「既に消えた」と扱う唯一の根拠で、テーブルハンドルの照合後にだけ使う。DELRULE で 2 本が消えたことを確かめたが
 //! 予約をまだ解放していない公開〔墓標〕には末尾に ` unpublished` が付く。墓標と完全に一致する値だけが、カーネル操作なしで
-//! 予約の解放を完了できる。#3343）。不変条件: 記録に受け口の行がある間は、その予約を解放しない（解放は行を外した後）。公開の無い旧形式（#3067）はそのまま読める。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
+//! 予約の解放を完了できる。#3343）。不変条件: 記録に受け口の行がある間は、その予約を解放しない（解放は行を外した後）。公開の無い旧形式（#3067）はそのまま読める。
+//! `dns-name` は省略可能で、無い旧形式は名前なし（ヘルパーはメンバー ID だけを登録する）として読む。magic は FCMEM1 のまま足した
+//! ため、`dns-name` を含む記録を旧バイナリが読むと末尾の余りとして `DataLoss` になる（出荷済みの書き込み側が無い間の許容。NET-5・#3531）。`len` の規則・並び・末尾のごみは `codec` を参照（違反は `DataLoss`）。
 
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -40,6 +43,7 @@ use super::codec::{
     take_field, take_optional, token_is_sane,
 };
 use super::realized::RealizedRecord;
+use crate::dns_helper::DnsName;
 use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::netlink_route::IpPrefix;
@@ -280,6 +284,8 @@ pub struct MemberRecord {
     netns_dir_id: (u64, u64),
     /// 接続時に作った netns の pin の実体の識別子（記録だけからの detach が三者照合に使う。#3347）。旧形式・識別子を控えられなかった接続では `None`。
     pin: Option<PinIdentity>,
+    /// DNS ヘルパーが ID に加えて引く名前（コンテナ名。NET-5・#3531）。旧形式・名前なしの接続では `None`。
+    dns_name: Option<DnsName>,
     dns: Vec<IpAddr>,
     table_handle: Option<NftTableHandle>,
     publishes: Vec<RecordedPublish>,
@@ -316,6 +322,7 @@ impl MemberRecord {
             netns_dir: netns_dir.to_path_buf(),
             netns_dir_id,
             pin: None,
+            dns_name: None,
             dns: dns.to_vec(),
             table_handle: None,
             publishes: Vec::new(),
@@ -334,6 +341,18 @@ impl MemberRecord {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn pin(&self) -> Option<PinIdentity> {
         self.pin
+    }
+
+    /// DNS ヘルパーが引く名前（コンテナ名）を載せる（NET-5・#3531）。検証は [`DnsName`] が済ませている。
+    /// 公開の書き直し（`with_unpublishing` 等）は記録を複製して作り直すため、名前は保たれる。
+    pub fn with_dns_name(mut self, name: DnsName) -> Self {
+        self.dns_name = Some(name);
+        self
+    }
+
+    /// 記録した DNS 名（旧形式・名前なしの接続では `None`。NET-5・#3531）。
+    pub fn dns_name(&self) -> Option<&DnsName> {
+        self.dns_name.as_ref()
     }
 
     /// 公開（受け口と rule handle）と、それを投入したテーブルのハンドルを載せる（#3068）。
@@ -553,6 +572,9 @@ impl MemberRecord {
         if let Some(pin) = self.pin {
             push_field(&mut out, "pin", &pin.encode());
         }
+        if let Some(name) = &self.dns_name {
+            push_field(&mut out, "dns-name", name.as_str());
+        }
         for ip in &self.dns {
             push_field(&mut out, "dns", &ip.to_string());
         }
@@ -585,6 +607,16 @@ impl MemberRecord {
             ),
             None => None,
         };
+        // 外部入力なので、検証に通るだけでなく正準形（小文字・末尾ドットなし）との一致も要る（REPAIR-2・#3531）。
+        let dns_name = match take_optional(&mut rest, "dns-name")? {
+            Some(v) => Some(
+                DnsName::new(v)
+                    .ok()
+                    .filter(|n| n.as_str() == v)
+                    .ok_or_else(|| bad("member dns name is malformed"))?,
+            ),
+            None => None,
+        };
         let mut dns = Vec::new();
         while let Some(v) = take_optional(&mut rest, "dns")? {
             let ip: IpAddr = v.parse().map_err(|_| bad("member dns is malformed"))?;
@@ -614,6 +646,7 @@ impl MemberRecord {
         let mut rec = Self::new(id, endpoint, address, token, Path::new(dir), dir_id, &dns)
             .map_err(invalid_value)?;
         rec.pin = pin;
+        rec.dns_name = dns_name;
         match (table_handle, publishes.is_empty()) {
             (None, true) => Ok(rec),
             (Some(h), false) => rec.with_publishes(h, publishes).map_err(invalid_value),
@@ -1140,8 +1173,13 @@ mod tests {
             &dns,
         )
         .unwrap()
+        .with_dns_name(
+            // 最長の 253 バイト（63.63.63.61）。#3531
+            DnsName::new(&format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(61))).unwrap(),
+        )
         .with_publishes(th(u64::MAX), publishes)
         .unwrap();
+        assert_eq!(m.dns_name().unwrap().as_str().len(), 253);
         let bytes = m.encode();
         assert!(
             bytes.len() <= RECORD_MAX_BYTES,
@@ -1264,6 +1302,111 @@ mod tests {
         assert_eq!(
             code(MemberRecord::decode(late.as_bytes())),
             NetErrorCode::DataLoss
+        );
+    }
+
+    /// NET-5・#3531: `dns-name` は `pin` の後・`dns` の前に正準形で符号化され、往復する（具体バイト列）。
+    #[test]
+    fn net5_3531_member_dns_name_round_trip_bytes() {
+        let m = member(&["1.1.1.1".parse().unwrap()]).with_dns_name(DnsName::new("Web.").unwrap());
+        let expected = format!(
+            "FCMEM1\nid 2\nC1\nendpoint 2\nc1\naddress 11\n10.0.0.2/24\ntoken {}\n{TOKEN}\nnetns-dir 7\n/run/ns\nnetns-dir-id 3\n8:9\ndns-name 3\nweb\ndns 7\n1.1.1.1\n",
+            TOKEN.len()
+        );
+        assert_eq!(m.encode(), expected.as_bytes());
+        let back = MemberRecord::decode(&m.encode()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.dns_name().map(DnsName::as_str), Some("web"));
+    }
+
+    /// NET-5・#3531: pin と併用すると `pin` → `dns-name` → `dns` の順。順序違反・重複は `DataLoss`。
+    #[test]
+    fn net5_3531_member_dns_name_with_pin_order() {
+        let m = member(&["1.1.1.1".parse().unwrap()])
+            .with_pin(pin_id(8, 9, 1))
+            .with_dns_name(DnsName::new("web").unwrap());
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(
+            text.contains("pin 5\n8:9:1\ndns-name 3\nweb\ndns 7\n"),
+            "{text}"
+        );
+        assert_eq!(MemberRecord::decode(text.as_bytes()).unwrap(), m);
+        // dns-name が pin の前。
+        let before = text.replace(
+            "pin 5\n8:9:1\ndns-name 3\nweb\n",
+            "dns-name 3\nweb\npin 5\n8:9:1\n",
+        );
+        assert_eq!(
+            code(MemberRecord::decode(before.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+        // dns の後ろ。
+        let after = text.replace(
+            "dns-name 3\nweb\ndns 7\n1.1.1.1\n",
+            "dns 7\n1.1.1.1\ndns-name 3\nweb\n",
+        );
+        assert_eq!(
+            code(MemberRecord::decode(after.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+        // 2 回。
+        let dup = text.replace("dns-name 3\nweb\n", "dns-name 3\nweb\ndns-name 3\nweb\n");
+        assert_eq!(
+            code(MemberRecord::decode(dup.as_bytes())),
+            NetErrorCode::DataLoss
+        );
+    }
+
+    /// REPAIR-2・NET-5・#3531: 正準形でない・RFC 1123 に通らない名前は `DataLoss`。
+    #[test]
+    fn net5_3531_member_dns_name_rejects_non_canonical() {
+        let base = String::from_utf8(member(&[]).encode()).unwrap();
+        let long_label = "a".repeat(64);
+        for bad in [
+            "Web",
+            "web.",
+            "my_app",
+            "-web",
+            "a..b",
+            long_label.as_str(),
+            "",
+        ] {
+            let doc = format!("{base}dns-name {}\n{bad}\n", bad.len());
+            assert_eq!(
+                code(MemberRecord::decode(doc.as_bytes())),
+                NetErrorCode::DataLoss,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// NET-5・#3531: 名前の無い旧形式はそのまま読め、`dns_name()` は `None`。
+    #[test]
+    fn net5_3531_member_old_format_has_no_dns_name() {
+        for m in [member(&[]), member(&[]).with_pin(pin_id(1, 2, 3))] {
+            let old = m.encode();
+            assert!(!String::from_utf8(old.clone()).unwrap().contains("dns-name"));
+            assert_eq!(MemberRecord::decode(&old).unwrap().dns_name(), None);
+        }
+    }
+
+    /// NET-5・#3531: 公開の印・墓標・解除で書き直しても名前は消えない。
+    #[test]
+    fn net5_3531_member_dns_name_survives_publish_rewrite() {
+        let m = with_two().with_dns_name(DnsName::new("web").unwrap());
+        let p = publish(PortProtocol::Tcp, 8080, 80);
+        let marked = m.with_unpublishing(&p).unwrap();
+        assert_eq!(marked.dns_name().map(DnsName::as_str), Some("web"));
+        let tomb = marked.with_unpublished(&p).unwrap();
+        assert_eq!(tomb.dns_name().map(DnsName::as_str), Some("web"));
+        let gone = tomb.without_publish(&p).unwrap();
+        assert_eq!(gone.dns_name().map(DnsName::as_str), Some("web"));
+        assert_eq!(
+            MemberRecord::decode(&gone.encode())
+                .unwrap()
+                .dns_name()
+                .map(DnsName::as_str),
+            Some("web")
         );
     }
 }

@@ -43,6 +43,32 @@ impl Dir {
         self.path(CONTROL_SOCKET_FILE)
     }
 
+    /// 制御 UDS の認証・照合の失敗（ヘルパー側の別 uid の接続・`SO_PEERCRED` の取得失敗、送り手側の uid / pid
+    /// の不一致）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限 [`CONTROL_AUDIT_MAX_BYTES`]）へ
+    /// 1 行の構造化記録として残す（SEC-4・PLUG-12・#3534）。detach 起動のヘルパーは stderr が捨てられ、`Stop` の
+    /// 失敗は `Unavailable` に潰れるため、これだけが痕跡になる。
+    ///
+    /// 書き手は 2 つ（ヘルパーはロックなし、送り手は排他ロックの下）なので `O_APPEND` で開き、1 行を 1 回の
+    /// write で書く（行どうしが上書きされない）。上限に達したら書かない（無制限の増加を防ぐ）。記録の失敗は
+    /// 拒否を妨げない（呼び出し側は結果を無視してよい）。上位の監査経路（core の `@audit.log`）への中継は
+    /// 依存方向（net は core に依存しない）のため行わない。
+    fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        use std::io::Write as _;
+        let mut f = self.open_regular_append(CONTROL_AUDIT_FILE, CONTROL_AUDIT_MAX_BYTES * 2)?;
+        let len = f
+            .metadata()
+            .map_err(|e| map_io(&e, "failed to stat dns control audit"))?
+            .len();
+        if len >= CONTROL_AUDIT_MAX_BYTES {
+            return Ok(());
+        }
+        let mut rec = line.trim_end().replace(['\n', '\r'], " ");
+        rec.truncate(512);
+        rec.push('\n');
+        f.write_all(rec.as_bytes())
+            .map_err(|e| map_io(&e, "failed to write dns control audit"))
+    }
+
     /// 制御ソケットを lstat で検査する（socket・所有者・0600・nlink 1）。無ければ `NotFound`。
     fn check_control_socket(&self) -> Result<(), NetError> {
         let m = fs::symlink_metadata(self.control_path())
@@ -94,26 +120,10 @@ impl NetworkDir {
         self.dir.check_control_socket()
     }
 
-    /// 制御 UDS の認証拒否（別 uid の接続）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限
-    /// [`CONTROL_AUDIT_MAX_BYTES`]）へ 1 行の構造化記録として残す（SEC-4・PLUG-12）。detach 起動のヘルパーは
-    /// stderr が捨てられるため、stderr だけでは記録が消える。上限に達したら書かない（無制限の増加を防ぐ）。
-    /// 記録の失敗は接続の拒否を妨げない（呼び出し側は結果を無視してよい）。
+    /// 制御 UDS の認証・照合の失敗の監査記録を追記する。実体は [`Dir::append_control_audit`]（記録先・上限・
+    /// 書き手の契約はそちらの doc）。ヘルパー側（ロックなし）が呼ぶ。
     pub(crate) fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
-        use std::io::{Seek as _, SeekFrom, Write as _};
-        let mut f = self
-            .dir
-            .open_regular(CONTROL_AUDIT_FILE, true, CONTROL_AUDIT_MAX_BYTES * 2)?;
-        let len = f
-            .seek(SeekFrom::End(0))
-            .map_err(|e| map_io(&e, "failed to seek dns control audit"))?;
-        if len >= CONTROL_AUDIT_MAX_BYTES {
-            return Ok(());
-        }
-        let mut rec = line.trim_end().replace(['\n', '\r'], " ");
-        rec.truncate(512);
-        rec.push('\n');
-        f.write_all(rec.as_bytes())
-            .map_err(|e| map_io(&e, "failed to write dns control audit"))
+        self.dir.append_control_audit(line)
     }
 
     /// 確定したメンバー記録を ID 順に読む（ロックを取らない。モジュール doc の前提を満たす呼び出し元に限る）。
@@ -138,6 +148,11 @@ impl NetworkLockGuard<'_> {
     /// 制御ソケットの経路。
     pub(crate) fn control_socket_path(&self) -> PathBuf {
         self.dir.control_path()
+    }
+
+    /// 送り手側の照合失敗の監査記録を追記する（排他ロックの下。契約は [`Dir::append_control_audit`]）。
+    pub(crate) fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        self.dir.append_control_audit(line)
     }
 
     /// 送り手が connect の前に行う検査（socket・所有者・0600・nlink 1）。無ければ `NotFound`。

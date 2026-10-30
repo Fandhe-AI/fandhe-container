@@ -70,7 +70,7 @@ musl に関係する分岐の一覧:
 
 - 製品コードに `cfg(target_env = "musl")` の分岐は無い。宣言は glibc の原型に合わせてあり、musl との差（`ioctl` の `request`、`renameat2` が musl 1.2.6 以降など）は各宣言のコメントに書いてある。
 - core の照合のうち `cfg(target_env = "gnu")` に限ったもの: `libc_consts_checks!` の gnu 節（`BINDERFS_SUPER_MAGIC`・`NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`・`RLIMIT_*`・`PTRACE_CONT`）、`seccomp_notify.rs` の ioctl 定数 3 件、`libc_abi` の `StatFs.f_flags`、`ioctl`・`prlimit`・`renameat2` の関数型、`MsgHdr`・`CmsgHdr`。
-- net に `target_env` の分岐は無い（`msghdr` を使わない設計で glibc / musl の差を避けており、照合は arch の cfg のみ）。
+- net の製品コードに `target_env` の分岐は無い。照合側では `sys/holder.rs` の `MsgHdr` の照合だけを `cfg(target_env = "gnu")` に限る（core の `seccomp_notify` と同じ扱い。musl の `msghdr` は非公開のパディングと型が glibc と違うため）。他の照合は arch の cfg のみ。
 
 gnu 限定の分岐を残す理由: 外すと musl では型の違い（`c_int`・非公開フィールド）で通らないか、`as` の読み替えで通すことになり照合の意味が無くなる。gnu に限る形は、将来 musl を採るときに musl の節を足す土台にもなる。`compile_error!` 等で musl のビルドを機械的に禁じることはしない（製品挙動の変更になり、本 issue の範囲外）。
 
@@ -111,7 +111,16 @@ crates/plugin-macos（#1845）は適用済み。照合は `sys.rs` の `imp::lib
 
 crates/plugin-windows（#1846）も適用済み。`sys` の `imp` にある `signal(3)` の宣言・`SIG_ERR`・`SIGTERM`（cfg 3 定義）・ハンドラ `on_sigterm` の引数型を `const` 検査で照合した（4 種すべて。対象外は FFI でない `SIGTERM_RECEIVED` と安全なラッパー群。理由は照合モジュールのコメント）。
 
-crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は定数 45 件（`AF_NETLINK` は `u16` に範囲検査して比較）・構造体 2 件・関数 12 件。
+crates/net の対象外（理由は照合モジュール `libc_abi` のコメント）: 対応外アーキテクチャの `consts`（カーネルへ渡さないプレースホルダ）・`SUPPORTED`・FFI でない項目、`SockaddrNl::nl_pad` のオフセット（`libc::sockaddr_nl` で非公開のため自前側のオフセットと `nl_family`・`nl_pid` の一致で代替）。`sockaddr` を取る 4 関数は自前が `SockaddrNl` を指すため、ポインタ型を別々に書いて照合する。照合は `sys.rs` と `sys/` 配下の 4 ファイルの `libc_abi` で行う（数え方: 定数は `consts::X == libc::X` の比較 1 件、構造体は `size_of`・`align_of`・`offset_of!` で照合する `#[repr(C)]` の型 1 件、関数は自前と `libc` の対 1 件。`sa_family_t`・`SUN_PATH_LEN`・`id_t`・`idtype_t` 等の型の幅だけの確認は件数に入れない）。
+
+| ファイル | 定数 | 構造体 | 関数 | 補足 |
+| -------- | ---- | ------ | ---- | ---- |
+| `sys.rs`（#1841・#3045） | 45（`AF_NETLINK` は `u16` に範囲検査） | 2（`sockaddr_nl`・`pollfd`） | 12 | 上記の対象外のとおり |
+| `sys/holder.rs`（#3249） | 20 | 3（`iovec`・`ucred`・`msghdr`。`msghdr` は gnu のみ） | 7 | `CapUserHeader`・`CapUserData` は `libc` に無く対象外。`sendmsg`・`recvmsg` の `msghdr` 引数は型を別々に書く |
+| `sys/pasta.rs`（#3319） | 3 | 0 | 1（`kill`） | なし |
+| `sys/process.rs`（#3320） | 9 | 0 | 3（`syscall`・`waitid`・`setsid_raw` と `setsid`） | `waitid` の `infop` と idtype の型は別々に書く |
+| `sys/unix_socket.rs`（#3517・#3071） | 4（`AF_UNIX` は `u16` に範囲検査） | 1（`sockaddr_un`） | 2（`socket`・`connect`） | `connect` の `sockaddr` 引数は型を別々に書く |
+| 合計 | 81 | 6 | 25 | |
 
 crates/net の uapi 定数（`sys.rs` の外にある netlink・rtnetlink・nfnetlink・nf_tables の定数。#3102・NET-1・MVM-4・REPAIR-12）は、宣言の隣の `libc_abi`（`#[cfg(all(test, target_os = "linux"))]`。uapi の値はアーキに依らないため arch の cfg は付けない）で照合する。`cfg(test)` だけにすると macOS・Windows の `cross-target-check` で `libc::` が解決できず落ちるため、Linux 限定にする。対象は `netlink.rs`・`netlink_route/link.rs`・`netlink_route/addr_route.rs`・`nftables_batch.rs`・`nftables_batch/table_chain.rs`・`nftables_batch/ack.rs`・`nftables_rules/{rule,nat,masq,payload,cmp,data,meta}.rs`（`nftables_rules/bitwise.rs` の `NFTA_BITWISE_*`・`NFT_BITWISE_*` は libc 0.2.189 に対応物が無く照合なし。#3060）・`network/publish.rs`。マクロ `libc_const_eq!` は `lib.rs` の `pub mod` 列より前に置く（core の同名マクロの複製。`macro_rules` はテキスト順にしか見えないため）。
 

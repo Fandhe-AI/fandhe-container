@@ -12,7 +12,7 @@ Linux では `--network` を省略すると `none` になる(SEC-1「既定で�
 | -- | ---- |
 | `none`(省略時) | 新しい network namespace を作り、`lo` だけを up にする |
 | `host` | ホストの network namespace を共有する。分離を緩める指定で、start の成功後に supervisor が構造化ログ 1 行(`"event":"network_mode","network_mode":"host"`)を残す。supervisor は起動前に自分の netns と同一であることを確かめ、一致しなければ起動しない |
-| ユーザー定義名 | rootless(Linux。隣に特権ランチャーが無い非 root)だけ受ける(#3329・NET-6・NET-9)。`network create` で作った定義(pasta 構成)が要り、`--pasta-path` か `--pasta-path-search` も要る。定義が無ければ `NOT_FOUND`(`network not found`)、定義が pasta 構成でなければ `FAILED_PRECONDITION`。いずれも状態ルート・イメージストアの作成より前に拒否する。`start` でも定義を照合し直し、`create` の後に `network rm` されていれば `FAILED_PRECONDITION`(`network definition no longer exists`)で起動しない。rootful は `UNIMPLEMENTED`(D13〔#3207・#3069・#3074〕の判断待ち)、非 Linux も `UNIMPLEMENTED` |
+| ユーザー定義名 | rootless(Linux。隣に特権ランチャーが無い非 root)だけ受ける(#3329・NET-6・NET-9)。`network create` で作った定義(pasta 構成)が要り、`--pasta-path` か `--pasta-path-search` も要る。定義が無ければ `NOT_FOUND`(`network not found`)、定義が pasta 構成でなければ `FAILED_PRECONDITION`。いずれも状態ルート・イメージストアの作成より前に拒否する。`start` でも定義を照合し直し、`create` の後に `network rm` されていれば `FAILED_PRECONDITION`(`network definition no longer exists`)で起動しない。参照するコンテナ(作成済み・停止中・実行中)がある間の `network rm` は `FAILED_PRECONDITION`(`network is in use by a container; delete the containers that use it first`、終了コード 5)で拒否する(#3529・CLI-1)。参照を判定できないコンテナ(起動オプションの文書の欠落・破損等)があるときも拒否し(`network references could not be verified; inspect or delete broken containers first`)、回復は該当コンテナの `delete`。rootful は `UNIMPLEMENTED`(D13〔#3207・#3069・#3074〕の判断待ち)、非 Linux も `UNIMPLEMENTED` |
 | `container:<id>` | `UNIMPLEMENTED`(将来仕様) |
 | `bridge`・`default` | `INVALID_ARGUMENT`(予約名) |
 

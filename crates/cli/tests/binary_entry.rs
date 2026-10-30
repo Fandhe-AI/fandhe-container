@@ -3681,3 +3681,99 @@ fn net6_network_create_ls_rm_flow_on_linux() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// NET-6・NET-9・CLI-1・ERR-1（#3529・D10）: 実バイナリで、pasta 構成のコンテナ（状態記録と起動オプション文書）が参照する
+/// ネットワークの `network rm` が `FAILED_PRECONDITION`（終了コード 5・構造化エラー）で拒否され、定義が残ること。
+/// 参照するコンテナの記録と文書を消せば `rm` は成功する。pasta の実起動は要らないため、記録は core・supervisor の
+/// 公開 API で直接作る（`create` の実起動は別の試験が担う）。
+#[cfg(target_os = "linux")]
+#[test]
+fn net6_net9_cli1_3529_network_rm_refused_while_referenced_then_succeeds() {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::traits::{
+        Annotations, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest,
+        GetStateRequest, StateStore,
+    };
+    use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+    use fandhe_container_supervisor::container_options::store::{
+        self as options_store, GENERATION_ANNOTATION,
+    };
+    use std::os::unix::fs::MetadataExt as _;
+
+    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+    if is_root {
+        // root の実行は rootful 扱いで user-defined network の create が UNIMPLEMENTED（net6 の試験と同じ前提）。
+        return;
+    }
+    let tmp = TmpDir::new("net6-3529");
+    let dir = isolated_cli_dir("net6-3529");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 参照するコンテナ c1（世代 g1・文書の network は n1）の記録を作る。
+    let store = FileStateStore::open(StateRoot::from_override(root.clone()).expect("root"))
+        .expect("open store");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(&bundle).expect("bundle");
+    let id = ContainerId::new("c1").expect("id");
+    let req = CreateStateRequest::new(ContainerStatus::created(id.clone(), None), bundle)
+        .expect("req")
+        .with_annotations(
+            Annotations::new([(GENERATION_ANNOTATION.to_owned(), "g1".to_owned())]).expect("ann"),
+        );
+    let rev = store.create(&req).expect("create record").revision();
+    let state_root = store.host_state_root().expect("root").to_path_buf();
+    let doc = ContainerOptionsDocument::default()
+        .with_network(Some("n1".to_owned()), vec![], vec![])
+        .expect("net")
+        .with_pasta(Some(
+            "20260120 2049 131074 1234567 1760000000 123456789 -5 0 0 755\n/usr/bin/pasta"
+                .to_owned(),
+        ))
+        .expect("pasta")
+        .with_generation("g1".to_owned())
+        .expect("gen");
+    options_store::write_new(&state_root, &id, &doc).expect("write doc");
+
+    // 参照中は拒否される。入力値とコンテナ ID は出力に出ず、定義は残る。
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_failure(
+        &out,
+        5,
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn1\tpasta\t-\n"
+    );
+
+    // 参照するコンテナを消せば rm は成功する。
+    let rev = store
+        .get(&GetStateRequest::new(id.clone()))
+        .map(|r| r.revision())
+        .unwrap_or(rev);
+    store
+        .delete(&DeleteStateRequest::new(id.clone(), rev))
+        .expect("delete record");
+    options_store::remove(&state_root, &id).expect("remove doc");
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\tMODE\tSUBNET\n");
+    let _ = std::fs::remove_dir_all(dir);
+}

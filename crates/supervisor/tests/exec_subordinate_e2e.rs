@@ -121,6 +121,7 @@ fn main() {
         linux::supervise();
     } else {
         precondition::self_check();
+        linux::guard_default_path();
         linux::self_check_watchdog();
         println!(
             "exec_subordinate_e2e: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
@@ -244,6 +245,12 @@ mod linux {
     /// 試験専用の期限の短縮（秒。1..=30）。`HANG_ENV` が許可リストの値のときだけ効き、実機の期限を縮めない。
     /// watchdog の自己照合が短い期限で期限切れの経路を実証するために使う。
     const DEADLINE_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_DEADLINE_SECS";
+    /// 試験専用の回収の抑止。自己照合（既定の経路）の子が cgroup の部分木を回収して、共有の scope（CI のステップ・
+    /// 利用者のセッション）を撃たないようにする。値が `1` のときだけ効き、`HANG_ENV` が許可リストの値のときに限る。
+    const NO_REAP_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_NO_REAP";
+    /// 既定の経路全体の上限（秒）。自己照合の子の上限（60 秒）に余裕を足した値で、超えたら固定の失敗行を出して
+    /// 終了コード 1 で終わる（待ちが解けない場合に `cargo test --workspace` を止めない。REPAIR-5・#3485）。
+    const DEFAULT_PATH_LIMIT: Duration = Duration::from_secs(120);
     /// 段の名前の固定一覧（注入の許可リストを兼ねる）。
     const STAGES: [&str; 16] = [
         "preconditions",
@@ -291,6 +298,25 @@ mod linux {
             return Duration::from_secs(secs);
         }
         deadline_for(timeout().as_secs())
+    }
+
+    /// 既定の経路（引数なし）が上限内に終わらなければ、固定の失敗行を出してプロセスごと終わらせる（REPAIR-5・#3485）。
+    pub fn guard_default_path() {
+        let _ = std::thread::Builder::new()
+            .name("ese-default-path-guard".into())
+            .spawn(|| {
+                std::thread::sleep(DEFAULT_PATH_LIMIT);
+                eprintln!(
+                    "exec_subordinate_e2e: DEFAULT PATH EXPIRED (the default-path self-check did not finish within {}s)",
+                    DEFAULT_PATH_LIMIT.as_secs()
+                );
+                std::process::exit(1);
+            });
+    }
+
+    fn no_reap() -> bool {
+        std::env::var(HANG_ENV).is_ok_and(|h| hang_is_valid(&h))
+            && std::env::var(NO_REAP_ENV).as_deref() == Ok("1")
     }
 
     fn hang_is_valid(v: &str) -> bool {
@@ -343,6 +369,7 @@ mod linux {
         cmd.arg("--ignored")
             .env(HANG_ENV, "preconditions")
             .env(DEADLINE_ENV, "2")
+            .env(NO_REAP_ENV, "1")
             .stdin(std::process::Stdio::null());
         let out = crate::reap::output_within(&mut cmd, Duration::from_secs(60))
             .expect("the watchdog self-check child must finish");
@@ -415,8 +442,12 @@ mod linux {
                 "exec_subordinate_e2e: injected hang at stage {name} pid={}",
                 std::process::id()
             );
+            // 親（watchdog）が消えたら自分で終わる（kill が届かなくても孤児のまま残らない）。
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(500));
+                if std::os::unix::process::parent_id() != watchdog_pid() {
+                    std::process::exit(3);
+                }
             }
         }
     }
@@ -697,7 +728,7 @@ mod linux {
             std::process::exit(1);
         }
         let scope = Scope::probe(me);
-        let reaping = scope.as_ref().filter(|s| s.reapable);
+        let reaping = scope.as_ref().filter(|s| s.reapable && !no_reap());
         let exe = std::env::current_exe().expect("current exe");
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--ignored-worker")

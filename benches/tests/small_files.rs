@@ -1,7 +1,9 @@
 //! `small_files` 計測ハーネスの結合試験（実ファイルを作る。TASK-189・IO-2・IO-6・REPAIR-3・REPAIR-5）。
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use fandhe_container_benches::small_files::wire::run_trial_in;
 use fandhe_container_benches::small_files::{
-    Config, Layout, Plan, guest_path, run, run_trial, run_with_deadline,
+    Config, Layout, Plan, Route, guest_path, run, run_trial, run_with_deadline,
 };
 use fandhe_container_io::{PersistSupport, persist_support};
 use std::path::{Path, PathBuf};
@@ -47,6 +49,7 @@ fn plan(count: u64, layout: Layout, batch_size: u64) -> Plan {
         file_size: 5,
         layout,
         config: Config::Bind,
+        route: Route::ServerApi,
         trials: 1,
         trial_timeout: Duration::from_secs(60),
         timeout: Duration::from_secs(120),
@@ -139,4 +142,107 @@ fn repair3_run_does_not_touch_outside_symlink_target() {
     run(&plan(8, Layout::Flat, 1), root.path()).expect("run");
     assert_eq!(outside.entries(), vec!["sentinel".to_string()]);
     assert_eq!(root.entries(), vec!["link".to_string()]);
+}
+
+/// wire 経路の試験用の計画（`plan` に経路だけ足したもの）。
+fn wire_plan(count: u64, layout: Layout, batch_size: u64) -> Plan {
+    Plan {
+        route: Route::Wire,
+        ..plan(count, layout, batch_size)
+    }
+}
+
+/// wire 経路を動かせない環境（FLUSH 未対応。Linux は syncfs が要る）かどうか。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wire_unavailable() -> bool {
+    if cfg!(target_os = "linux") {
+        persist_support() != PersistSupport::Supported
+    } else {
+        !persist_support().is_supported()
+    }
+}
+
+/// IO-1・IO-2・IO-6: wire 経路が期待どおりの件数と内容のファイルを作る（64 の境界をまたぐ）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn io1_io2_io6_wire_trial_creates_files_with_expected_content() {
+    if wire_unavailable() {
+        return;
+    }
+    let root = TestRoot::new("wire-content");
+    for (name, layout) in [("flat", Layout::Flat), ("tree", Layout::Tree)] {
+        let dir = root.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let p = wire_plan(70, layout, 1);
+        let elapsed = run_trial(&dir, &p, far(), far()).expect("wire trial");
+        assert!(elapsed > Duration::ZERO);
+        for i in 0..70 {
+            let path = dir.join(guest_path(layout, i));
+            assert_eq!(std::fs::read(&path).expect("file"), b"fffff");
+        }
+    }
+}
+
+/// IO-2: wire 経路の K ごとの FLUSH が、バッチ（64）の境界をまたぐ K でも成功し内容が一致する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn io2_wire_flush_every_k_crosses_batch_boundary() {
+    if wire_unavailable() {
+        return;
+    }
+    let root = TestRoot::new("wire-everyk");
+    for k in [5_u64, 64, 65] {
+        let dir = root.path().join(format!("k{k}"));
+        std::fs::create_dir(&dir).unwrap();
+        run_trial(&dir, &wire_plan(200, Layout::Flat, k), far(), far()).expect("wire every-k");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 200);
+        let last = dir.join(guest_path(Layout::Flat, 199));
+        assert_eq!(std::fs::read(last).unwrap(), b"fffff");
+    }
+}
+
+/// REPAIR-5: wire 経路の期限切れは値を出さず `timeout` で、専用ディレクトリも残さない。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn repair5_wire_expired_deadline_yields_timeout_without_value() {
+    if wire_unavailable() {
+        return;
+    }
+    let root = TestRoot::new("wire-deadline");
+    let err = run_with_deadline(&wire_plan(8, Layout::Flat, 1), root.path(), Instant::now())
+        .expect_err("deadline already passed");
+    assert_eq!(err.code, "timeout");
+    assert!(root.entries().is_empty());
+}
+
+/// REPAIR-3: wire 経路のソケット用ディレクトリは終了後に残らない。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn repair3_wire_cleanup_removes_socket_dir() {
+    if wire_unavailable() {
+        return;
+    }
+    let root = TestRoot::new("wire-cleanup");
+    let socket_parent = TestRoot::new("wire-sockparent");
+    let trial = root.path().join("trial");
+    std::fs::create_dir(&trial).unwrap();
+    run_trial_in(
+        socket_parent.path(),
+        &trial,
+        &wire_plan(8, Layout::Flat, 1),
+        far(),
+        far(),
+    )
+    .expect("wire trial");
+    assert!(socket_parent.entries().is_empty());
+}
+
+/// REPAIR-3: UDS の無い OS では wire 経路を副作用の前に拒否する。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn repair3_wire_route_is_rejected_on_unsupported_os() {
+    let root = TestRoot::new("wire-unsupported");
+    let err = run(&wire_plan(8, Layout::Flat, 1), root.path()).unwrap_err();
+    assert_eq!(err.code, "unsupported-route");
+    assert!(root.entries().is_empty());
 }

@@ -23,7 +23,21 @@ TASK-189・IO-6・IO-7・REPAIR-8（関連: IO-1・IO-2・REPAIR-3・REPAIR-5）
 
 ## 実装で決めた細部
 
-- **ワイヤー経路ではない**: いまのワイヤー形式（IO-1）の `Write` はパスを持たず、1 接続で多数のファイルを作る要求を表せない。`BatchSink::write_batch` と `BatchSink::persist` を直接呼ぶ。`serve_connection` を通さないのは、`create_file` が 1 ファイルにつき 1 つの sink を返すのに対し `serve_connection` は 1 接続で 1 つの sink しか扱えず、フレームの符号化・復号のコストが区間に混ざるため。ワイヤー経路への切り替えは #1886 の後に別 issue で行う
+- **経路（`--route`。#2074）**: 2 経路を持ち、`method`・`wire_path`・`params.route` で区別する。値の違う経路同士は比べない（`method` を必ず照合する）。
+
+  | `--route` | 内容 | `method` | `wire_path` |
+  | --------- | ---- | -------- | ----------- |
+  | `server-api`（既定） | `BatchSink::write_batch` と `BatchSink::persist` を直接呼ぶ。`serve_connection` を通さず、フレームの符号化・復号・UDS を含まない | `server-api-direct/...` | `false` |
+  | `wire` | UDS 越しに v2 のファイル操作（Create → WriteFile → Close → Flush。#1886 F6〜F9）を送る。client の符号化、UDS の往復、server の復号・実行・応答・FlushAck の待ちをすべて区間に含む。Linux と macOS のみ。それ以外は副作用の前に `unsupported-route` | `wire-uds/...` | `true` |
+
+  - 既定を `server-api` にしたのは、`scripts/bench/small_files_compare.sh`（server-api の `method` と `wire_path == false` を固定で照合する）と、UDS の無い Windows の引数なしスモークを壊さないため。回帰ゲートの引数（`scripts/lib.sh` の `bench_args_for`）は `--route wire`
+  - server-api 経路は残す。2 経路の差でワイヤーの上乗せ（フレーム化・UDS・ACK の往復）を分けて見られるため
+  - wire 経路の 1 試行: server を `UdsServer` + `serve_file_connection_with_limit` のスレッドで動かし、client は `UdsClientConnection`（`same_effective_uid` で接続先 uid を照合）+ `PipelineClient`。ソケットは `--root` ではなく `std::env::temp_dir()` 下の専用ディレクトリ（0700。`fcsf-<pid>-<nanos>`）に置く（`sun_path` の上限のため）。接続・server の起動・body の用意・後始末・server の report の照合は区間に入れない
+  - server の設定: バッチは `DEFAULT_BATCH_SIZE`（64。`params.server_batch_size`）、IO-10 の上限と保持表の上限は io crate の最大。K ごとの FLUSH が自動フラッシュで細かくならないよう、wire の `--batch-size` は 1..=4,095 に絞る（保持表の上限 4,096 に達すると明示 Flush の前に自動フラッシュが入るため）。超えたら `invalid-args`
+  - デッドロックしない不変条件: client は 64 フレーム送るたびと Flush のたびにその分の応答を受けるため、未読の応答は高々 64 件。崩れても `recv_ack` の期限で `timeout` になる
+  - 値を出す前に server の report を照合する（作成・書き込み・Close の件数、バイト数、Nack 0、自動フラッシュ 0、FlushAck の数、破棄 0、永続化失敗 0）。合わなければ `server-report-mismatch`（fail-closed）
+  - `io2_guaranteed`: wire の per-file は `true`。wire の every-k は **`false`**。F9 の複数ファイル FLUSH（同じ接続で Ack を返した要求すべてが対象）を IO-2 の範囲と読んでよいかは #1886 の spec 確認事項 (b) の回答待ちで、回答が出たら見直す。every-k は Linux（syncfs）と macOS（ファイルごとの `F_FULLFSYNC` とディレクトリの同期）で受け付ける
+  - 記録値との比較: #107・#110・#230 に small_files の記録値はまだ無く、失う比較は無い。#230 の基準値は、ゲートが測る wire 経路（`method == wire-uds/flush-per-file`）の値で作る。metric 名 `small_files_files_per_sec` は変えない（baseline に small_files の項目は無く、移行するものが無いため）
 - **Write フレーム**: `SendQueue`・`encode_request`・`BatchBuffer` の公開 API だけで組み立てる（REPAIR-2）。区間の外で 1 回だけ作り、全ファイルで使い回す。書き込み報告は `frames_written == 1`・`bytes_written == file_size` を照合する
 - **`method`**: `server-api-direct/flush-per-file`（`io2_guaranteed: true`）と `server-api-direct/flush-every-k`（`io2_guaranteed: false`）。後者は K 件ごと（と最後）にだけ永続化する。Linux の `syncfs` が file system 全体を書き戻すことに依存するため、`PersistSupport::Supported` の環境だけが受け付け、それ以外は副作用の前に `unsupported-flush-mode` で拒否する。macOS / Windows の永続化は sink のファイルと親ディレクトリしか同期しないため
 - **配置**: 平置きは `f{i:05}`、ツリーは `d{i/256:03}/f{i%256:03}`（例: 257 件目 = `d001/f001`、5 万件目 = `d195/f079`）。「2 階層」は「ディレクトリ 1 段＋ファイル」（パスの深さ 2）と解釈した。`--layout auto` は件数 2,000 以下なら平置き、それより多ければツリー
@@ -50,6 +64,7 @@ cargo bench -p fandhe-container-benches --bench small_files -- \
 | `--file-size`（バイト） | 1..=65,536 | 2 |
 | `--layout` | auto / flat / tree | auto |
 | `--config` | bind / named-volume | bind |
+| `--route` | wire / server-api（wire は K が 1..=4,095 かつ Linux / macOS のみ） | server-api |
 | `--trials` | 1..=20 | 5 |
 | `--root` | 既存のディレクトリ | 一時ディレクトリ |
 | `--trial-timeout-secs` | 1..=7,200 | 1,800 |
@@ -64,8 +79,8 @@ cargo bench -p fandhe-container-benches --bench small_files -- \
 
 ## #107・#110 での使い方
 
-- IO-6（#107）: `--count 50000` で実機の値を採る。Docker 側は同じ件数のフルサイクルの時間から `docker run` の起動時間を引いた「FS 操作のみ」の値と比べる。合否をこの値だけで出すかは未決
-- IO-7（#110）: bind / named volume の 2 構成で同じ引数を使い、中央値の比を出す
+- IO-6（#107）: `--route wire --count 50000` で実機の値を採る（ゲートと同じ経路。フレーム化と UDS の往復を含むため、Docker 側の「FS 操作のみ」と比べるときはこの上乗せを注記する）。Docker 側は同じ件数のフルサイクルの時間から `docker run` の起動時間を引いた「FS 操作のみ」の値と比べる。合否をこの値だけで出すかは未決
+- IO-7（#110）: bind / named volume の 2 構成で同じ引数を使い、中央値の比を出す。比較スクリプトは server-api 経路のまま（wire へ切り替えるかは #110 で決める。#2074 のスコープ外）
   - 2 構成の実行は `make small-files-compare BIND_ROOT=<絶対パス> VOLUME_ROOT=<絶対パス> [TRIALS=<5〜20>] [OUTPUT=<新規ファイル>]`（TASK-24.1。`scripts/bench/small_files_compare.sh`）。同一引数で `--config bind` → `--config named-volume` の順に各 5 試行以上回し、ハーネスの結果 JSON（`method`・`note`・`wire_path`・`io2_guaranteed` を含む）を `results.bind` / `results["named-volume"]` に丸ごと残した 1 つの JSON（schema `fandhe-container.small-files-compare/v1`）にまとめる。形式は CSV ではなく JSON にした（ハーネスの出力が JSON で、`method`・`note` の文字列を欠けなく運べるため）
   - このスクリプトは合否も中央値の比も出さない。比と 1.5 倍の判定は #110（TASK-24.2）で行う。実機での実測は #107（人間）
   - 既知の限界: 実行順は bind → named-volume で固定（順序の偏りは交互化していない。必要なら #110 で判断する）。2 つのルートは別ディレクトリであることだけを確かめ、別の file system かどうかは確かめない
@@ -73,6 +88,7 @@ cargo bench -p fandhe-container-benches --bench small_files -- \
 ## 既知の限界
 
 - 平置きでは `create_file` が作成のたびに祖先ディレクトリの実在エントリを読み直すため、N 件で約 N²/2 の走査になり、計測値に含まれる。ツリー配置では 1 回あたり高々約 452 件
-- K ファイルごとの FLUSH は IO-2 の保証外で、Linux のみ
+- K ファイルごとの FLUSH は IO-2 の保証外。server-api 経路は Linux のみ、wire 経路は Linux と macOS（`io2_guaranteed` の扱いは #1886 の spec 確認事項 (b) の回答待ち）
+- wire 経路: 1 回の FLUSH が `MAX_IO_TIMEOUT`（10 秒）を超えると値を出さずに失敗する。Linux では保持する `Close` 済みファイルが K 個の fd を持つため、`RLIMIT_NOFILE` が K に足りないと失敗する。server スレッドは強制停止できず、終わらなければプロセスの終了に任せる。Windows は非対応
 - 2 構成は置き場所の違いを呼び出し側が与えるラベルで、`VolumeProvider` の実装は対象外（担当と時期は [volume-provider-implementation.md](volume-provider-implementation.md) で判断待ち・#2451）
 - 期限は協調的で、`create_file` の内部で止まった syscall には割り込めない

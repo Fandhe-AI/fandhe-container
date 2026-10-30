@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "placeholder": true,
-  "note": "TASK-88（人間担当）が実測から確定させて置き換える暫定基準値。placeholder_* は TASK-113 の実ベンチと対応付けが確定していないプレースホルダ。plugin_boundary_* は TASK-113.1〜113.3 の実 metric（実測基準値は TASK-88.h1・TASK-113.h1 で確定する）。 small_files_files_per_sec は TASK-189（IO-6）の小ファイル多数ワークロードの files/s（試行の中央値。実測基準値は TASK-88.h1 で確定する）。 startup_create_to_supervisor_ok_p95_ms は TASK-190 の起動レイテンシ p95 で、実機前提のため CI では測らない（BENCH_NAMES 外。基準値は benches/baseline-manual.json に置く予定で、実測は #230。比較は make bench-check-manual）。",
+  "note": "TASK-88（人間担当）が実測から確定させて置き換える暫定基準値。placeholder_* は TASK-113 の実ベンチと対応付けが確定していないプレースホルダ。plugin_boundary_* は TASK-113.1〜113.3 の実 metric（実測基準値は TASK-88.h1・TASK-113.h1 で確定する）。 small_files_files_per_sec は TASK-189（IO-6）の小ファイル多数ワークロードの files/s（ゲートは UDS 越しのワイヤー経路 --route wire を測る。#2074。試行の中央値。実測基準値は TASK-88.h1 で確定する）。 startup_create_to_supervisor_ok_p95_ms は TASK-190 の起動レイテンシ p95 で、実機前提のため CI では測らない（BENCH_NAMES 外。基準値は benches/baseline-manual.json に置く予定で、実測は #230。比較は make bench-check-manual）。",
   "metrics": {
     "placeholder_throughput": {
       "unit": "ops/s",

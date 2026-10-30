@@ -89,9 +89,12 @@ pub(crate) fn connect_unix_nonblocking(path: &Path) -> Result<OwnedFd, SysError>
         sun_family: consts::AF_UNIX,
         sun_path: [0u8; SUN_PATH_LEN],
     };
-    if let Some(dst) = addr.sun_path.get_mut(..bytes.len()) {
-        dst.copy_from_slice(bytes);
-    }
+    // 上の長さ検査で到達しないが、到達しても `sun_path` が全 0（= 抽象ソケット扱い）のまま接続しないよう
+    // fail-closed にする（#3534・NET-5・PLUG-12）。
+    let Some(dst) = addr.sun_path.get_mut(..bytes.len()) else {
+        return Err(SysError::Os(super::EINVAL));
+    };
+    dst.copy_from_slice(bytes);
     // SAFETY: 引数はスタック上の整数定数のみで、ポインタを渡さない。成功時は新しい fd を返す。
     let raw = unsafe {
         socket(
@@ -177,6 +180,24 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// NET-5・PLUG-12・#3534: `sun_path` の境界。107 バイトは長さ検査を通って接続まで進み（存在しないので ENOENT）、
+    /// 108 バイトは EINVAL。
+    #[test]
+    fn net5_3534_connect_path_length_boundary() {
+        let ok = std::path::PathBuf::from(format!("/{}", "a".repeat(SUN_PATH_LEN - 2)));
+        assert_eq!(ok.as_os_str().len(), SUN_PATH_LEN - 1);
+        assert!(matches!(
+            connect_unix_nonblocking(&ok),
+            Err(SysError::Os(e)) if e == super::super::ENOENT
+        ));
+        let over = std::path::PathBuf::from(format!("/{}", "a".repeat(SUN_PATH_LEN - 1)));
+        assert_eq!(over.as_os_str().len(), SUN_PATH_LEN);
+        assert!(matches!(
+            connect_unix_nonblocking(&over),
+            Err(SysError::Os(e)) if e == super::super::EINVAL
+        ));
+    }
+
     /// NET-5・#3071: 長すぎる経路・NUL を含む経路・空は EINVAL（切り詰めて別の経路へ接続しない）。
     #[test]
     fn net5_3071_connect_rejects_bad_paths() {
@@ -223,7 +244,12 @@ mod libc_abi {
         assert!(align_of::<SockaddrUn>() == align_of::<libc::sockaddr_un>());
         assert!(offset_of!(SockaddrUn, sun_family) == offset_of!(libc::sockaddr_un, sun_family));
         assert!(offset_of!(SockaddrUn, sun_path) == offset_of!(libc::sockaddr_un, sun_path));
-        assert!(SUN_PATH_LEN == size_of::<[libc::c_char; 108]>());
+        // `sun_path` の長さを `libc` の構造体の全長から先頭のオフセットを引いて求める（110 - 2 = 108。
+        // 自前のリテラルとの比較では何も照合できないため。#3534）。
+        assert!(
+            SUN_PATH_LEN
+                == size_of::<libc::sockaddr_un>() - offset_of!(libc::sockaddr_un, sun_path)
+        );
     };
 
     const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int = socket;

@@ -602,8 +602,7 @@ mod unsupported {
             ReceiveLimits::default(),
             NoopServerObserver,
         )
-        .err()
-        .expect("connect must fail on an unsupported OS");
+        .expect_err("connect must fail on an unsupported OS");
         assert_eq!(err.code(), IoErrorCode::Unimplemented);
     }
 }

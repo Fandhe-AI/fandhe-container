@@ -78,8 +78,8 @@ fn oci1_public_api_records_samples() {
     std::fs::remove_dir_all(&d).expect("cleanup");
 }
 
-/// OCI-7・REPAIR-12（#3298）: 前回の残骸（ファイルと入れ子のディレクトリ）があっても空で作り直され、
-/// 同名ファイルを排他作成でき、drop で消える。
+/// OCI-7・REPAIR-12（#3298）: 前回の残骸（ファイルと入れ子のディレクトリ）があっても消さず、
+/// 別名の空ディレクトリを作る。そこで同名ファイルを排他作成でき、残骸は無傷で残る。
 #[test]
 fn oci7_repair12_test_root_leaves_stale_residue_untouched() {
     let parent = test_root("fc-oci-digest-it-residue", "parent");

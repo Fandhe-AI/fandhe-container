@@ -16,15 +16,21 @@
 //!
 //! - `--socket <path>`（必須）: bind する UDS。親ディレクトリは 0700、パスは未存在であること
 //!   （SIGKILL 後はソケットが残るため、試行ごとに新しいパスを使う）
-//! - `--data-dir <dir>` / `--file <name>`（必須）: 出力ファイル（`SinkOpenMode::CreateNew`）
+//! - `--data-dir <dir>`（必須）/ `--file <name>`（`append-file`・`deferred` では必須、`file-ops` では
+//!   指定すると拒否）: 出力ファイル（`SinkOpenMode::CreateNew`）。`file-ops` では `--data-dir` が
+//!   `GuestFileCreator` の共有ルートになる
 //! - `--batch-size` / `--unflushed-max-frames` / `--unflushed-max-bytes`（任意）
-//! - `--sink <append-file|deferred>`（任意。既定 `append-file`）: 書き込み先の sink。
+//! - `--sink <append-file|deferred|file-ops>`（任意。既定 `append-file`）: 書き込み先の sink。
 //!   `append-file` は製品の `AppendFileSink`（通常 ACK は `write()` 完了後に返る）。
 //!   `deferred` は試験専用の `DeferredPersistSink` で、`BatchSink::persist` が呼ばれるまで
 //!   書き込みをメモリに保持しファイルへは書かない（TASK-18 追補・#1832）。これにより
 //!   「ACK 済みだが未書き込み」の状態を作り、`persist` の有無で SIGKILL 後の結果が変わる
 //!   対照を成立させる。製品の ACK 順序・`serve_connection`・`AppendFileSink` は変えない
-//!   （試験専用 sink はこの bin の中だけにあり、リリース成果物には入らない）
+//!   （試験専用 sink はこの bin の中だけにあり、リリース成果物には入らない）。
+//!   `file-ops` は sink を使わず、製品の `serve_file_connection`（Create・WriteFile・Close の
+//!   ファイル操作モード。#3163・#3164）を `GuestFileCreator` に対して 1 接続だけ処理する
+//!   （複数ファイル・新設ディレクトリの FLUSH 後 SIGKILL を確かめる。IO-3・#3167）。
+//!   終了レポートの統計は `FileServeStats` から単一 sink モードと同じキー名で出す
 //!
 //! # 準備完了の合図
 //!
@@ -85,11 +91,12 @@ mod app {
     use std::time::Instant;
 
     use fandhe_container_io::{
-        AppendFileSink, BATCH_SIZE_OPTION, Batch, BatchSink, IoError, IoErrorCode, IoTimeout,
-        MAX_IO_TIMEOUT, NoopServerObserver, SinkOpenMode, SinkPersistReport, SinkWriteReport,
-        UNFLUSHED_MAX_BYTES_OPTION, UNFLUSHED_MAX_FRAMES_OPTION, WritebackSettings, WritebackStats,
-        WritebackTimeouts, decode_request, parse_batch_size, parse_unflushed_limit,
-        persist_support,
+        AppendFileSink, BATCH_SIZE_OPTION, Batch, BatchConfig, BatchSink, DEFAULT_MAX_OPEN_FILES,
+        FileServeLimits, FileServeStats, GuestFileCreator, IoError, IoErrorCode, IoTimeout,
+        MAX_IO_TIMEOUT, MaxOpenFiles, NoopServerObserver, SinkOpenMode, SinkPersistReport,
+        SinkWriteReport, UNFLUSHED_MAX_BYTES_OPTION, UNFLUSHED_MAX_FRAMES_OPTION, UdsServer,
+        UnflushedLimit, WritebackSettings, WritebackStats, WritebackTimeouts, decode_request,
+        parse_batch_size, parse_unflushed_limit, persist_support, serve_file_connection_with_limit,
     };
 
     use super::{EXIT_OK, EXIT_SERVE, EXIT_STARTUP, EXIT_USAGE, json_escape};
@@ -111,6 +118,8 @@ mod app {
         AppendFile,
         /// 試験専用の `DeferredPersistSink`（`persist` までファイルへ書かない）。
         Deferred,
+        /// 製品のファイル操作モード（`serve_file_connection`）。sink は使わない（#3167）。
+        FileOps,
     }
 
     /// 解析済みの起動引数。
@@ -118,7 +127,7 @@ mod app {
     pub struct ServerArgs {
         socket: PathBuf,
         data_dir: PathBuf,
-        file: String,
+        file: Option<String>,
         batch_size: Option<String>,
         unflushed_frames: Option<String>,
         unflushed_bytes: Option<String>,
@@ -169,6 +178,7 @@ mod app {
                     let kind = match value.to_str() {
                         Some("append-file") => SinkKind::AppendFile,
                         Some("deferred") => SinkKind::Deferred,
+                        Some("file-ops") => SinkKind::FileOps,
                         _ => return Err(invalid("unknown sink kind")),
                     };
                     if sink.replace(kind).is_some() {
@@ -196,14 +206,24 @@ mod app {
             }
         }
 
+        let sink = sink.unwrap_or(SinkKind::AppendFile);
+        // --file は単一 sink モードの出力名。file-ops はパスをワイヤーから受けるため指定を拒否する
+        match (sink, file.is_some()) {
+            (SinkKind::FileOps, true) => return Err(invalid("--file is not used with file-ops")),
+            (SinkKind::AppendFile | SinkKind::Deferred, false) => {
+                return Err(invalid("--file is required"));
+            }
+            _ => {}
+        }
+
         Ok(ServerArgs {
             socket: socket.ok_or_else(|| invalid("--socket is required"))?,
             data_dir: data_dir.ok_or_else(|| invalid("--data-dir is required"))?,
-            file: file.ok_or_else(|| invalid("--file is required"))?,
+            file,
             batch_size,
             unflushed_frames: frames,
             unflushed_bytes: bytes,
-            sink: sink.unwrap_or(SinkKind::AppendFile),
+            sink,
         })
     }
 
@@ -300,6 +320,12 @@ mod app {
         Deferred(DeferredPersistSink),
     }
 
+    /// 終了レポートへ載せる統計（単一 sink モードとファイル操作モードで型が違う）。
+    enum ExitStats {
+        Single(WritebackStats),
+        File(FileServeStats),
+    }
+
     fn stats_json(s: &WritebackStats) -> String {
         format!(
             "{{\"frames_received\":{},\"acks_sent\":{},\"flush_acks_sent\":{},\"persist_succeeded\":{},\"persist_failed\":{},\"auto_flushes\":{},\"discarded_pending_frames\":{}}}",
@@ -313,9 +339,32 @@ mod app {
         )
     }
 
+    /// ファイル操作モードの統計。`persist_failed` などのキー名は単一 sink モードと揃え、
+    /// 試験側の `text_reports_persist_failure` をそのまま使えるようにする（#3167）。
+    fn file_stats_json(s: &FileServeStats) -> String {
+        format!(
+            "{{\"frames_received\":{},\"creates_succeeded\":{},\"write_files_succeeded\":{},\"closes_succeeded\":{},\"acks_sent\":{},\"nacks_sent\":{},\"flush_acks_sent\":{},\"persist_succeeded\":{},\"persist_failed\":{},\"auto_flushes\":{},\"discarded_pending_frames\":{}}}",
+            s.frames_received,
+            s.creates_succeeded,
+            s.write_files_succeeded,
+            s.closes_succeeded,
+            s.acks_sent,
+            s.nacks_sent,
+            s.flush_acks_sent,
+            s.persist_succeeded,
+            s.persist_failed,
+            s.auto_flushes,
+            s.discarded_pending_frames
+        )
+    }
+
     /// 終了理由を標準エラーへ JSON 1 行で出す（機械可読な code / message。ERR 系）。
-    fn report_exit(err: &IoError, stats: Option<&WritebackStats>) {
-        let stats = stats.map_or_else(|| "null".to_string(), stats_json);
+    fn report_exit(err: &IoError, stats: Option<&ExitStats>) {
+        let stats = match stats {
+            None => "null".to_string(),
+            Some(ExitStats::Single(s)) => stats_json(s),
+            Some(ExitStats::File(s)) => file_stats_json(s),
+        };
         eprintln!(
             "{{\"event\":\"exit\",\"code\":\"{}\",\"message\":\"{}\",\"stats\":{}}}",
             err.code().as_str(),
@@ -329,7 +378,7 @@ mod app {
     struct Exit {
         code: u8,
         error: IoError,
-        stats: Option<WritebackStats>,
+        stats: Option<ExitStats>,
     }
 
     fn startup_failure(error: IoError) -> Exit {
@@ -379,20 +428,28 @@ mod app {
         };
         let settings = WritebackSettings::new(batch).with_unflushed_limit(limit);
 
+        if args.sink == SinkKind::FileOps {
+            return run_file_ops(args, &settings, batch, limit);
+        }
+        // parse_args が単一 sink モードでは --file を必須にしている
+        let Some(file) = args.file.as_deref() else {
+            return usage_failure(invalid("--file is required"));
+        };
+
         // READY を出す前に起動エラーをすべて確定させるため、sink を bind より先に開く。
         let mut sink = match args.sink {
             SinkKind::AppendFile => {
-                match AppendFileSink::open_in(&args.data_dir, &args.file, SinkOpenMode::CreateNew) {
+                match AppendFileSink::open_in(&args.data_dir, file, SinkOpenMode::CreateNew) {
                     Ok(s) => ServerSink::Append(s),
                     Err(e) => return startup_failure(e),
                 }
             }
-            SinkKind::Deferred => {
-                match DeferredPersistSink::create_in(&args.data_dir, &args.file) {
-                    Ok(s) => ServerSink::Deferred(s),
-                    Err(e) => return startup_failure(e),
-                }
-            }
+            SinkKind::Deferred => match DeferredPersistSink::create_in(&args.data_dir, file) {
+                Ok(s) => ServerSink::Deferred(s),
+                Err(e) => return startup_failure(e),
+            },
+            // 上で file-ops は分岐済み
+            SinkKind::FileOps => return usage_failure(invalid("unexpected sink kind")),
         };
         let mut bound = match settings.bind(&args.socket, NoopServerObserver) {
             Ok(b) => b,
@@ -428,7 +485,67 @@ mod app {
         Exit {
             code,
             error: report.end,
-            stats: Some(report.stats),
+            stats: Some(ExitStats::Single(report.stats)),
+        }
+    }
+
+    /// ファイル操作モード（`--sink file-ops`）。`BoundConnection::serve` は単一 sink 専用のため
+    /// 使わず、`UdsServer` を直接 bind して製品の `serve_file_connection_with_limit` を呼ぶ。
+    /// 受信上限は `WritebackSettings` から導き、単一 sink モードとずれないようにする。
+    fn run_file_ops(
+        args: &ServerArgs,
+        settings: &WritebackSettings,
+        batch: BatchConfig,
+        unflushed: UnflushedLimit,
+    ) -> Exit {
+        // READY の前に起動エラーを確定させる
+        let creator = match GuestFileCreator::new(args.data_dir.clone()) {
+            Ok(c) => c,
+            Err(e) => return startup_failure(e),
+        };
+        let max_open = match MaxOpenFiles::new(DEFAULT_MAX_OPEN_FILES) {
+            Ok(m) => m,
+            Err(e) => return startup_failure(e),
+        };
+        let mut server =
+            match UdsServer::bind(&args.socket, settings.receive_limits(), NoopServerObserver) {
+                Ok(s) => s,
+                Err(e) => return startup_failure(e),
+            };
+
+        let mut out = std::io::stdout();
+        if writeln!(out, "READY").and_then(|()| out.flush()).is_err() {
+            return startup_failure(IoError::new(IoErrorCode::Internal, "failed to write READY"));
+        }
+
+        let timeout = match IoTimeout::new(MAX_IO_TIMEOUT) {
+            Ok(t) => t,
+            Err(e) => return startup_failure(e),
+        };
+        let mut conn = match server.accept(timeout, NoopServerObserver) {
+            Ok(c) => c,
+            Err(e) => return startup_failure(e),
+        };
+        let timeouts = WritebackTimeouts {
+            recv: timeout,
+            send: timeout,
+        };
+        let report = serve_file_connection_with_limit(
+            &mut conn,
+            batch,
+            FileServeLimits::new(max_open, unflushed),
+            &creator,
+            timeouts,
+        );
+        let code = if is_clean_peer_disconnect(&report.end) {
+            EXIT_OK
+        } else {
+            EXIT_SERVE
+        };
+        Exit {
+            code,
+            error: report.end,
+            stats: Some(ExitStats::File(report.stats)),
         }
     }
 
@@ -458,6 +575,26 @@ mod app {
         }
 
         const BASE: [&str; 6] = ["--socket", "/x/s", "--data-dir", "/x", "--file", "d.bin"];
+
+        /// IO-3・#3167: `file-ops` は `--file` なしで受理され、`--file` を付けると拒否する。
+        /// 単一 sink モードでは `--file` が必須のまま。
+        #[test]
+        fn file_ops_sink_rejects_file_option_and_others_require_it() {
+            let ok = args(&["--socket", "/x/s", "--data-dir", "/x", "--sink", "file-ops"]).unwrap();
+            assert_eq!(ok.sink, SinkKind::FileOps);
+            assert_eq!(ok.file, None);
+            let mut with_file = BASE.to_vec();
+            with_file.extend(["--sink", "file-ops"]);
+            assert_eq!(
+                args(&with_file).unwrap_err().code(),
+                IoErrorCode::InvalidArgument
+            );
+            for sink in ["append-file", "deferred"] {
+                let e =
+                    args(&["--socket", "/x/s", "--data-dir", "/x", "--sink", sink]).unwrap_err();
+                assert_eq!(e.code(), IoErrorCode::InvalidArgument, "{sink}");
+            }
+        }
 
         /// IO-3・#1832: `--sink` の既定は append-file、指定・重複・不明値を検証する。
         #[test]

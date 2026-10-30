@@ -16,10 +16,13 @@ I/O 共有層の SIGKILL 耐性試験（`crates/io/tests/crash_safety.rs`）を�
 | `unix::io3_flushed_data_survives_10_valid_sigkills` | 製品の `AppendFileSink` | 30 件書き込み後、FLUSH ACK を観測した直後 | 有効試行 10 回・損失 0 |
 | `unix::io3_deferred_sink_unflushed_loses_all_acked_data_in_10_valid_sigkills` | 試験専用 `DeferredPersistSink` | `batch_size=30` で通常 ACK を 30 件観測した直後（Flush なし。`persist` は呼ばれない） | 有効試行 10 回・全試行で 30 件すべて欠落（`found` 空・`lost` 30・合計 300・損失ありの試行 10） |
 | `unix::io3_deferred_sink_flushed_keeps_all_data_in_10_valid_sigkills` | 試験専用 `DeferredPersistSink` | 30 件書き込み後、FLUSH ACK を観測した直後 | 有効試行 10 回・損失 0・`found` が 0..30（FLUSH ACK 非対応環境では全試行が FLUSH ACK 経路で無効になる契約確認） |
+| `unix::io3_file_ops_flushed_files_and_new_dirs_survive_10_valid_sigkills` | 製品のファイル操作モード（`serve_file_connection`。本番の `UdsClientConnection` + `PipelineClient`。#3167） | 4 ファイル（新設ディレクトリ `n0`・`n0/d`・`n1` 配下を含む）へ Create・WriteFile × 5・Close（計 28 要求）を送り Flush、全 ACK と FLUSH ACK を観測した直後 | 有効試行 10 回・損失 0・`found` が 0..20（ファイル・ディレクトリの欠落も損失として検出。FLUSH ACK 非対応環境では契約確認） |
+
+ファイル操作モードには未フラッシュの対照を置かない。製品の経路は `write()` の後に Ack を返し SIGKILL ではページキャッシュが残るため損失 0 になり、`serve_file_connection` に sink を差し込む口も無い。示せるのは SIGKILL 後の可視性までで、媒体への永続化（IO-2）は対象外。
 
 - 有効試行: 所定の ACK を観測したうえで SIGKILL によりサーバーが終了した試行。それ以外は無効試行として数え直す
 - 目標は有効 10 回、試行上限は 30 回（`trial.rs` の `TARGET_VALID_TRIALS` / `MAX_ATTEMPTS`）
-- 集計は `crash_summary`、試行ごとの記録は `crash_trial` として、いずれも stderr に JSON 1 行で出る（`crash_trial` には `sink` を含む）。`cargo test` は既定で出力を捕捉するため、件数の取得は環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR`（#1833）で行う。指定したディレクトリへ `crash_summary` 行を `<case>.json`（case は `flushed`・`deferred_unflushed`・`deferred_flushed`）として排他作成（0600）で書く。FLUSH ACK 非対応環境でも同じ形式で `persist_supported:false` が出る。CI の `platform-ci` は「結合試験の実行」の後の「crash_safety 件数の集計」ステップで `make crash-summary-check` を実行し、検証した結果を `GITHUB_STEP_SUMMARY` に表で出す。
+- 集計は `crash_summary`、試行ごとの記録は `crash_trial` として、いずれも stderr に JSON 1 行で出る（`crash_trial` には `sink` を含む）。`cargo test` は既定で出力を捕捉するため、件数の取得は環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR`（#1833）で行う。指定したディレクトリへ `crash_summary` 行を `<case>.json`（case は `flushed`・`deferred_unflushed`・`deferred_flushed`・`file_ops_flushed`）として排他作成（0600）で書く。FLUSH ACK 非対応環境でも同じ形式で `persist_supported:false` が出る。CI の `platform-ci` は「結合試験の実行」の後の「crash_safety 件数の集計」ステップで `make crash-summary-check` を実行し、検証した結果を `GITHUB_STEP_SUMMARY` に表で出す。
 
   ローカル手順（ディレクトリは毎回新規にする。排他作成のため既存ファイルがあるとテストが失敗する）:
 

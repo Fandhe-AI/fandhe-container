@@ -21,6 +21,15 @@
 //!   は FLUSH ACK の直後に kill して損失 0 を検証する。示せる範囲は「FLUSH ACK が `persist` 成功の
 //!   後にだけ返ること」と「計測が損失を検出できること」までで、媒体への永続化（IO-2）は対象外。
 //!
+//! 複数ファイルと新設ディレクトリ（#3167・IO-3）: `io3_file_ops_flushed_files_and_new_dirs_survive_10_valid_sigkills`
+//! は、`crash_test_server --sink file-ops`（製品の `serve_file_connection`。Create・WriteFile・Close）
+//! へ本番の `UdsClientConnection` + `PipelineClient` の型つき API で 4 ファイル（新設の多段
+//! ディレクトリ配下を含む）を書き、FLUSH ACK の直後に SIGKILL して、再読込で全ファイルと
+//! ディレクトリと内容が欠落も重複もなく見えること（損失 0）を検証する。保証範囲は上のフラッシュ済み
+//! ケースと同じく SIGKILL 後の可視性までで、媒体への永続化（IO-2 の電源断）は対象外。
+//! このモードには未フラッシュの対照を置かない（製品の経路は `write()` の後に Ack を返し、SIGKILL
+//! ではページキャッシュが残るため損失 0 になる。`serve_file_connection` に sink を差し込む口も無い）。
+//!
 //! 件数の可視化（#1833）: 環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR` に既存の実ディレクトリを
 //! 渡すと、各ケースの `crash_summary` 行を `<dir>/<case>.json` へ排他作成（0600）で書く
 //! （未設定なら書かない。空・symlink・不在は失敗）。CI の `platform-ci` はこれを
@@ -57,17 +66,18 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
-        AckReceipt, FrameKind, InFlightLimit, IoErrorCode, IoTimeout, NoopSendObserver,
-        PipelineClient, persist_support,
+        AckReceipt, FrameKind, GuestPath, InFlightLimit, IoErrorCode, IoTimeout, NoopSendObserver,
+        NoopServerObserver, PipelineClient, ReceiveLimits, UdsClientConnection, UdsServerPolicy,
+        persist_support,
     };
 
-    use crate::disk_check::{RECORD_LEN, check_disk_records};
+    use crate::disk_check::{DiskCheck, RECORD_LEN, check_disk_records};
     use crate::trial::{
         DiskObservation, InvalidReason, MAX_ATTEMPTS, ServerExit, TARGET_VALID_TRIALS, TrialLedger,
         TrialObservation, TrialSummary, TrialVerdict, classify_trial, loss_summary,
@@ -81,6 +91,8 @@ mod unix {
         Product,
         /// 試験専用の `DeferredPersistSink`（`persist` までファイルへ書かない。#1832）。
         Deferred,
+        /// 製品のファイル操作モード（`serve_file_connection`。複数ファイル・新設ディレクトリ。#3167）。
+        FileOps,
     }
 
     impl SinkChoice {
@@ -88,9 +100,23 @@ mod unix {
             match self {
                 Self::Product => "append-file",
                 Self::Deferred => "deferred",
+                Self::FileOps => "file-ops",
             }
         }
     }
+
+    /// ファイル操作モードの共有ルート（ソケットのディレクトリ配下）。
+    const SHARE_DIR: &str = "share";
+
+    /// ファイル操作モードで作る相対パス（ゲスト相対）。ファイル i が seq `i*K .. (i+1)*K` を持つ。
+    /// 新設ディレクトリは `n0`・`n0/d`・`n1`。
+    const FILE_PATHS: [&str; 4] = ["f0.bin", "n0/f1.bin", "n0/d/f2.bin", "n1/f3.bin"];
+    /// 1 ファイルあたりの WriteFile 件数（K）。
+    const WRITES_PER_FILE: u64 = 5;
+    /// ファイル操作モードの記録の総数（ディスク照合の期待件数）。
+    const FILE_RECORDS: u64 = FILE_PATHS.len() as u64 * WRITES_PER_FILE;
+    /// Create・WriteFile・Close の総要求数（Flush を除く。ACK の目標数）。
+    const FILE_REQUESTS: u64 = FILE_PATHS.len() as u64 * (WRITES_PER_FILE + 2);
 
     const READY_WAIT: Duration = Duration::from_secs(10);
     const EXIT_WAIT: Duration = Duration::from_secs(15);
@@ -135,13 +161,22 @@ mod unix {
         if let Some(n) = batch_size {
             command.arg("--batch-size").arg(n.to_string());
         }
+        command.arg("--socket").arg(dir.0.join("s.sock"));
+        if sink == SinkChoice::FileOps {
+            // 共有ルートはソケットのディレクトリとは別の 0700 サブディレクトリにする。
+            let share = dir.0.join(SHARE_DIR);
+            std::fs::create_dir(&share).expect("share root must be creatable");
+            std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o700))
+                .expect("must be able to force mode 0700 on the share root");
+            command.arg("--data-dir").arg(&share);
+        } else {
+            command
+                .arg("--data-dir")
+                .arg(&dir.0)
+                .arg("--file")
+                .arg("data.bin");
+        }
         let child = command
-            .arg("--socket")
-            .arg(dir.0.join("s.sock"))
-            .arg("--data-dir")
-            .arg(&dir.0)
-            .arg("--file")
-            .arg("data.bin")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -226,6 +261,9 @@ mod unix {
         /// FLUSH ACK を観測した直後に kill する。FLUSH ACK 非対応環境（Linux 5.8 未満等）では
         /// サーバーが接続を閉じるため、無効試行として分類される。
         AfterFlushAck { writes: u64 },
+        /// ファイル操作モード: 4 ファイル（新設ディレクトリ配下を含む）へ Create・WriteFile・Close を
+        /// 送り、Flush を送って、全要求の ACK と FLUSH ACK を観測した直後に kill する（#3167）。
+        AfterFileFlushAck,
         /// 何も送らずに切断し、サーバーが自然終了した後に kill する（サーバー早期終了の
         /// 無効試行の再現用。除外ロジックの検証専用）。
         DisconnectBeforeKill,
@@ -236,6 +274,7 @@ mod unix {
             match self {
                 Self::AfterWriteAcks(_) => "w",
                 Self::AfterFlushAck { .. } => "f",
+                Self::AfterFileFlushAck => "m",
                 Self::DisconnectBeforeKill => "d",
             }
         }
@@ -277,7 +316,9 @@ mod unix {
         let (writes, flush) = match kill_point {
             KillPoint::AfterWriteAcks(n) => (n, false),
             KillPoint::AfterFlushAck { writes } => (writes, true),
-            KillPoint::DisconnectBeforeKill => return Err(IoErrorCode::InvalidArgument),
+            KillPoint::AfterFileFlushAck | KillPoint::DisconnectBeforeKill => {
+                return Err(IoErrorCode::InvalidArgument);
+            }
         };
         let limit =
             InFlightLimit::new(usize::try_from(writes).unwrap_or(0) + 2).map_err(|e| e.code())?;
@@ -307,12 +348,68 @@ mod unix {
         Ok(client)
     }
 
+    /// ファイル操作モードのクライアント（本番の `UdsClientConnection` + `PipelineClient` の型つき API）。
+    /// 接続前のパス検査と peer uid の照合（`same_effective_uid`）を通し、ファイルごとに
+    /// Create → WriteFile × K → Close をパイプラインで送って Flush する。要求ごとの ACK がすべて
+    /// 通常 ACK であること（Nack は失敗）を確かめてから FLUSH ACK を待つ。各待ちは期限付き（REPAIR-5）。
+    /// 成功時は kill まで接続を生かすため client を返す。
+    fn drive_file_client(
+        sock: &Path,
+        obs: &mut TrialObservation,
+    ) -> Result<
+        PipelineClient<UdsClientConnection<NoopServerObserver>, NoopSendObserver>,
+        IoErrorCode,
+    > {
+        let conn = UdsClientConnection::connect(
+            sock,
+            io_timeout(5),
+            UdsServerPolicy::same_effective_uid(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .map_err(|e| e.code())?;
+        let limit = InFlightLimit::new(usize::try_from(FILE_REQUESTS).unwrap_or(0) + 2)
+            .map_err(|e| e.code())?;
+        let mut client = PipelineClient::new(conn, limit, NoopSendObserver);
+        let send_timeout = io_timeout(5);
+        let mut seq = 0u64;
+        for path in FILE_PATHS {
+            let guest = GuestPath::parse(path).map_err(|_| IoErrorCode::Internal)?;
+            let handle = client.create(&guest, send_timeout).map_err(|e| e.code())?;
+            for _ in 0..WRITES_PER_FILE {
+                client
+                    .write_file(handle, &seq.to_le_bytes(), send_timeout)
+                    .map_err(|e| e.code())?;
+                seq += 1;
+            }
+            client.close(handle, send_timeout).map_err(|e| e.code())?;
+        }
+        client
+            .send(FrameKind::Flush, &[], send_timeout)
+            .map_err(|e| e.code())?;
+        for _ in 0..FILE_REQUESTS {
+            match client.recv_ack(io_timeout(5)) {
+                Ok(AckReceipt::Write(_)) => obs.acks_observed += 1,
+                // Nack（Rejected）や想定外の種別は失敗として記録する
+                Ok(_) => return Err(IoErrorCode::Internal),
+                Err(e) => return Err(e.code()),
+            }
+        }
+        match client.recv_ack(io_timeout(10)) {
+            Ok(AckReceipt::Flush(_)) => obs.flush_ack_observed = true,
+            Ok(_) => return Err(IoErrorCode::Internal),
+            Err(e) => return Err(e.code()),
+        }
+        Ok(client)
+    }
+
     /// 1 試行を実行して観測値を返す（判定は [`classify_trial`] が行う）。
     /// 試行ごとに新しいパスを使う（SIGKILL 後はソケットが残るため。`crash_test_server` の doc 参照）。
     fn run_trial(index: usize, kill_point: KillPoint, sink: SinkChoice) -> TrialObservation {
         let (ack_target, flush_required, batch_size) = match kill_point {
             KillPoint::AfterWriteAcks(n) => (n, false, Some(n)),
             KillPoint::AfterFlushAck { writes } => (writes, true, None),
+            KillPoint::AfterFileFlushAck => (FILE_REQUESTS, true, None),
             KillPoint::DisconnectBeforeKill => (0, false, None),
         };
         let mut obs = TrialObservation {
@@ -329,15 +426,22 @@ mod unix {
         let dir = TempDir::new(&format!("{}{index}", kill_point.label()));
         let mut child = spawn_server(&dir, batch_size, sink);
         wait_ready(&mut child);
-        let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
-
-        let _client = if kill_point == KillPoint::DisconnectBeforeKill {
+        let mut _file_client = None;
+        let _client = if kill_point == KillPoint::AfterFileFlushAck {
+            match drive_file_client(&dir.0.join("s.sock"), &mut obs) {
+                Ok(client) => _file_client = Some(client),
+                Err(code) => obs.client_error = Some(code),
+            }
+            None
+        } else if kill_point == KillPoint::DisconnectBeforeKill {
+            let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
             // accept 済みで recv 待ちに入る猶予を与えてから切断し、サーバーの自然終了を待つ
             std::thread::sleep(Duration::from_millis(300));
             drop(stream);
             obs.server_exited_before_kill = try_reap(&mut child, EXIT_WAIT);
             None
         } else {
+            let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
             match drive_client(stream, kill_point, &mut obs) {
                 Ok(client) => Some(client),
                 Err(code) => {
@@ -372,10 +476,94 @@ mod unix {
         }
         // TempDir を破棄する前にディスク上の状態を照合する（IO-3・TASK-18.2）。
         // サーバーは回収済み（または kill 済み）なので、以降ファイルは変化しない。
-        if kill_point != KillPoint::DisconnectBeforeKill {
+        if kill_point == KillPoint::AfterFileFlushAck {
+            obs.disk = Some(observe_files_disk(&dir.0.join(SHARE_DIR)));
+        } else if kill_point != KillPoint::DisconnectBeforeKill {
             obs.disk = Some(observe_disk(&dir, ack_target));
         }
         obs
+    }
+
+    /// 共有ルート配下の `FILE_PATHS` を上限付きで読み、seq 0..`FILE_RECORDS` と照合する（#3167）。
+    /// 祖先ディレクトリと葉は `symlink_metadata` で実体を確かめ、symlink は辿らない。
+    /// 無い・実体でないファイルは「そのファイルの記録すべてを損失」として扱う
+    /// （FLUSH ACK の後で消えたことこそ検出したい損失）。その他の I/O エラーは `ReadFailed`。
+    fn observe_files_disk(root: &Path) -> DiskObservation {
+        const SLACK: u64 = 4096;
+        let cap = WRITES_PER_FILE
+            .saturating_mul(RECORD_LEN as u64)
+            .saturating_add(SLACK);
+        let mut found = Vec::new();
+        let mut unexpected = Vec::new();
+        let mut trailing = 0usize;
+        for (index, path) in FILE_PATHS.into_iter().enumerate() {
+            let mut cur = root.to_path_buf();
+            let mut components = path.split('/').peekable();
+            let mut lost = false;
+            while let Some(name) = components.next() {
+                cur.push(name);
+                let is_leaf = components.peek().is_none();
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(m) if is_leaf && m.file_type().is_file() => {}
+                    Ok(m) if !is_leaf && m.file_type().is_dir() => {}
+                    Ok(_) => {
+                        lost = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        lost = true;
+                        break;
+                    }
+                    Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+                }
+            }
+            if lost {
+                continue;
+            }
+            let file = match std::fs::File::open(&cur) {
+                Ok(f) => f,
+                Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+            };
+            match file.metadata() {
+                Ok(m) if m.len() > cap => return DiskObservation::TooLarge { len: m.len(), cap },
+                Ok(_) => {}
+                Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+            }
+            let mut bytes = Vec::new();
+            match file.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+                Ok(_) if bytes.len() as u64 > cap => {
+                    return DiskObservation::TooLarge {
+                        len: bytes.len() as u64,
+                        cap,
+                    };
+                }
+                Ok(_) => {}
+                Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
+            }
+            let one = check_disk_records(&bytes, FILE_RECORDS);
+            // ファイル i が持つべき範囲は i*K..(i+1)*K。範囲外の seq（他ファイルへの誤配送）は
+            // found に入れず unexpected にする。全件が 1 ファイルに偏っても完全一致にならない。
+            let first = (index as u64).saturating_mul(WRITES_PER_FILE);
+            let range = first..first.saturating_add(WRITES_PER_FILE);
+            for seq in one.found {
+                if range.contains(&seq) {
+                    found.push(seq);
+                } else if !one.unexpected.contains(&seq) {
+                    unexpected.push(seq);
+                }
+            }
+            unexpected.extend(one.unexpected);
+            trailing += one.trailing_partial_bytes;
+        }
+        let seen: std::collections::BTreeSet<u64> = found.iter().copied().collect();
+        let missing = (0..FILE_RECORDS).filter(|s| !seen.contains(s)).collect();
+        DiskObservation::Checked(DiskCheck {
+            expected: FILE_RECORDS,
+            found,
+            missing,
+            unexpected,
+            trailing_partial_bytes: trailing,
+        })
     }
 
     /// `data.bin` を上限付きで読み、seq 0..expected と照合する。
@@ -864,6 +1052,170 @@ mod unix {
                     rec.verdict
                 );
             }
+        }
+    }
+
+    /// IO-3・#3167: ファイル操作モード（複数ファイル・新設ディレクトリ）のフラッシュ済みケース。
+    /// 本番の `UdsClientConnection` + `PipelineClient` の型つき API で 4 ファイル（`n0`・`n0/d`・`n1` を
+    /// 新設）に Create・WriteFile × 5・Close を送って Flush し、全 28 要求の ACK と FLUSH ACK を観測した
+    /// 直後に SIGKILL する試行を有効 10 回集め、全試行で 20 件が欠落・重複なくディスクから再読込できる
+    /// （損失 0）ことを検証する。保証範囲は SIGKILL 後の可視性までで、媒体への永続化（IO-2）は対象外。
+    /// 未フラッシュの対照は置かない（製品の経路は `write()` の後に Ack を返し、SIGKILL では
+    /// ページキャッシュが残るため、損失検出力の対照にならない）。FLUSH ACK 非対応環境では
+    /// 他のフラッシュ済みケースと同じ契約確認（全試行が FLUSH ACK 経路で無効）に切り替える。
+    #[test]
+    fn io3_file_ops_flushed_files_and_new_dirs_survive_10_valid_sigkills() {
+        let (ledger, summary) = run_trials(
+            KillPoint::AfterFileFlushAck,
+            SinkChoice::FileOps,
+            TARGET_VALID_TRIALS,
+            MAX_ATTEMPTS,
+        );
+        let loss = loss_summary(&ledger);
+        log_case_summary(
+            "file_ops_flushed",
+            persist_support().is_supported(),
+            &ledger,
+            &summary,
+        );
+        if persist_support().is_supported() {
+            assert!(!summary.aborted, "summary: {summary:?}");
+            assert_eq!(summary.valid, 10);
+            let expected: Vec<u64> = (0..FILE_RECORDS).collect();
+            for rec in ledger.valid_trials() {
+                match &rec.observation.disk {
+                    Some(DiskObservation::Checked(c)) => {
+                        assert_eq!(c.found, expected, "trial {}", rec.index);
+                        assert!(c.missing.is_empty(), "trial {}", rec.index);
+                        assert!(c.unexpected.is_empty(), "trial {}", rec.index);
+                        assert_eq!(c.trailing_partial_bytes, 0, "trial {}", rec.index);
+                    }
+                    other => panic!("trial {} must be disk-checked, got {other:?}", rec.index),
+                }
+            }
+            assert_eq!(loss.checked_trials, 10);
+            assert_eq!(loss.total_lost, 0);
+            assert_eq!(loss.trials_with_loss, 0);
+            assert_eq!(loss.unexact_trials, 0);
+        } else {
+            assert!(summary.aborted);
+            assert_eq!(summary.valid, 0);
+            assert!(summary.invalid > 0, "summary: {summary:?}");
+            for rec in ledger.invalid_trials() {
+                assert_eq!(
+                    rec.observation.acks_observed, FILE_REQUESTS,
+                    "trial {}",
+                    rec.index
+                );
+                assert!(!rec.observation.flush_ack_observed, "trial {}", rec.index);
+                assert!(
+                    is_persist_unsupported_reason(&rec.observation, &rec.verdict),
+                    "trial {}: {:?}",
+                    rec.index,
+                    rec.verdict
+                );
+            }
+        }
+    }
+
+    /// IO-3・#3167: ファイル操作モードの 1 試行が `persist_support` で分類される（ハーネスの経路確認）。
+    /// 対応環境では有効（28 件の ACK + FLUSH ACK）でディスク照合が完全一致、非対応環境では
+    /// FLUSH ACK の経路で無効になる。
+    #[test]
+    fn io3_file_ops_trial_after_flush_ack_is_classified_by_persist_support() {
+        let obs = run_trial(0, KillPoint::AfterFileFlushAck, SinkChoice::FileOps);
+        let verdict = classify_trial(&obs);
+        if persist_support().is_supported() {
+            assert!(obs.flush_ack_observed);
+            assert_eq!(
+                verdict,
+                TrialVerdict::Valid {
+                    acks_observed: FILE_REQUESTS
+                }
+            );
+            match &obs.disk {
+                Some(DiskObservation::Checked(c)) => assert!(c.is_exact(), "disk: {c:?}"),
+                other => panic!("must be disk-checked, got {other:?}"),
+            }
+        } else {
+            assert!(!obs.flush_ack_observed);
+            assert_eq!(obs.acks_observed, FILE_REQUESTS);
+            assert!(
+                is_persist_unsupported_reason(&obs, &verdict),
+                "unsupported persist must be excluded by the FLUSH ACK path, got {verdict:?}"
+            );
+        }
+    }
+
+    /// IO-3・REPAIR-12・#3167: ファイル操作モードのディスク照合は、無いファイル・無いディレクトリ・
+    /// symlink を損失として検出し、全部そろっていれば完全一致になる（陽性対照）。
+    #[test]
+    fn observe_files_disk_detects_missing_files_dirs_and_symlinks() {
+        let dir = TempDir::new("ofd");
+        let root = dir.0.join(SHARE_DIR);
+        std::fs::create_dir_all(root.join("n0/d")).expect("mkdir");
+        std::fs::create_dir_all(root.join("n1")).expect("mkdir");
+        let write = |rel: &str, first: u64| {
+            let mut bytes = Vec::new();
+            for seq in first..first + WRITES_PER_FILE {
+                bytes.extend_from_slice(&seq.to_le_bytes());
+            }
+            std::fs::write(root.join(rel), bytes).expect("write");
+        };
+        write("f0.bin", 0);
+        write("n0/f1.bin", 5);
+        write("n0/d/f2.bin", 10);
+        write("n1/f3.bin", 15);
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => {
+                assert!(c.is_exact(), "disk: {c:?}");
+                assert_eq!(c.found, (0..20).collect::<Vec<u64>>());
+            }
+            other => panic!("must be checked, got {other:?}"),
+        }
+        // 全レコードが 1 ファイルに偏り、他ファイルは空（誤配送）は完全一致にならない
+        let all: Vec<u8> = (0..FILE_RECORDS).flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(root.join("f0.bin"), all).expect("write");
+        for rel in ["n0/f1.bin", "n0/d/f2.bin", "n1/f3.bin"] {
+            std::fs::write(root.join(rel), b"").expect("write");
+        }
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => {
+                assert!(!c.is_exact(), "misdelivery must not be exact: {c:?}");
+                assert_eq!(c.found, (0..5).collect::<Vec<u64>>());
+                assert_eq!(c.missing, (5..20).collect::<Vec<u64>>());
+                assert_eq!(c.unexpected, (5..20).collect::<Vec<u64>>());
+            }
+            other => panic!("must be checked, got {other:?}"),
+        }
+        write("f0.bin", 0);
+        write("n0/f1.bin", 5);
+        write("n0/d/f2.bin", 10);
+        write("n1/f3.bin", 15);
+        // ファイルが無い
+        std::fs::remove_file(root.join("n0/f1.bin")).expect("rm");
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => {
+                assert_eq!(c.missing, (5..10).collect::<Vec<u64>>());
+                assert_eq!(c.lost(), 5);
+            }
+            other => panic!("must be checked, got {other:?}"),
+        }
+        // ディレクトリが無い（配下のファイルすべてが損失）
+        std::fs::remove_dir_all(root.join("n1")).expect("rm dir");
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => assert_eq!(c.lost(), 10),
+            other => panic!("must be checked, got {other:?}"),
+        }
+        // 葉が symlink（辿らず損失）
+        std::fs::remove_file(root.join("n0/d/f2.bin")).expect("rm");
+        std::os::unix::fs::symlink(root.join("f0.bin"), root.join("n0/d/f2.bin")).expect("symlink");
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => {
+                assert_eq!(c.found, (0..5).collect::<Vec<u64>>());
+                assert_eq!(c.lost(), 15);
+            }
+            other => panic!("must be checked, got {other:?}"),
         }
     }
 

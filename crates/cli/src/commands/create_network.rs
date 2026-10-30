@@ -287,9 +287,7 @@ pub(super) fn with_named_definition_held<T>(
         .lock_global_shared()
         .map_err(|e| fail(definition_failure(DefinitionCheck::Store(e))))?;
     check_pasta_definition_locked(&guard, name).map_err(|c| fail(definition_failure(c)))?;
-    let result = body();
-    drop(guard);
-    result
+    body()
 }
 
 /// 起動経路に結線されていない指定を `Unimplemented` で拒否する(D3・#1873。形式の検証は済んでいる前提)。

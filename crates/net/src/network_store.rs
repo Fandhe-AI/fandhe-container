@@ -216,9 +216,9 @@ pub fn check_socket_meta(
 #[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]
-pub(crate) use imp::NetworkDir;
-#[cfg(target_os = "linux")]
 pub use imp::{GlobalLockGuard, NetworkLockGuard, NetworkStore};
+#[cfg(target_os = "linux")]
+pub(crate) use imp::{NetworkDir, PeerCredFn, peer_cred_errno_word};
 
 #[cfg(not(target_os = "linux"))]
 mod stub;

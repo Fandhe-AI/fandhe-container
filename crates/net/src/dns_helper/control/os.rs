@@ -6,7 +6,7 @@
 
 use std::io::{self, Read, Write as _};
 use std::net::Ipv4Addr;
-use std::os::fd::{AsFd as _, BorrowedFd};
+use std::os::fd::AsFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +27,9 @@ use crate::dns_helper::{
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
 use crate::network::NetworkName;
-use crate::network_store::{NetworkDir, NetworkLockGuard, NetworkStore};
+use crate::network_store::{
+    NetworkDir, NetworkLockGuard, NetworkStore, PeerCredFn, peer_cred_errno_word,
+};
 use crate::sys::{self, Deadline, Readiness, SysError, holder, unix_socket};
 
 fn err(code: NetErrorCode, msg: &'static str) -> NetError {
@@ -88,13 +90,19 @@ fn map_read_error(e: ReadError) -> NetError {
 
 /// ヘルパー側: `SO_PEERCRED` の取得失敗の監査行。errno 以外は固定の語にする（`{:?}` を使わない）。
 fn peer_cred_unavailable_line(e: &SysError) -> String {
-    match e {
-        SysError::Os(n) => format!("event=dns_control_peer_cred_unavailable errno={n}"),
-        SysError::Unsupported => {
-            "event=dns_control_peer_cred_unavailable errno=unsupported".to_owned()
-        }
-        _ => "event=dns_control_peer_cred_unavailable errno=other".to_owned(),
-    }
+    format!(
+        "event=dns_control_peer_cred_unavailable errno={}",
+        peer_cred_errno_word(e)
+    )
+}
+
+/// 送り手側: 接続先の `SO_PEERCRED` の取得失敗の監査行。ヘルパー側の行と形・errno の表し方を揃え、どちら側で
+/// 失敗したかを読み手が区別できるよう `sender` を挟む（SEC-4・PLUG-12・#3551）。
+fn sender_peer_cred_unavailable_line(e: &SysError) -> String {
+    format!(
+        "event=dns_control_sender_peer_cred_unavailable errno={}",
+        peer_cred_errno_word(e)
+    )
 }
 
 /// ヘルパー側: 別 uid の接続の監査行。
@@ -255,7 +263,7 @@ pub(crate) struct ControlServer {
     /// 認証拒否の監査記録の置き場（本番はネットワークのディレクトリ。無ければ stderr のみ）。
     audit_dir: Option<Arc<NetworkDir>>,
     /// 接続相手の (pid, uid) の取得口（本番は `SO_PEERCRED`。取得失敗の経路を試験で再現するため差し替えられる）。
-    peer_cred: for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>,
+    peer_cred: PeerCredFn,
 }
 
 impl ControlServer {
@@ -277,10 +285,7 @@ impl ControlServer {
 
     /// `peer_cred` の取得口を差し替える（試験専用。`SO_PEERCRED` の失敗を再現する）。
     #[cfg(test)]
-    fn with_peer_cred(
-        mut self,
-        f: for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>,
-    ) -> Self {
+    fn with_peer_cred(mut self, f: PeerCredFn) -> Self {
         self.peer_cred = f;
         self
     }
@@ -496,9 +501,20 @@ fn map_connect_error(e: SysError) -> NetError {
 /// 制御 UDS へ接続して相手を検査する（connect の前に lstat、後に peer の uid と pid を照合）。
 /// `expected_pid` は `dns-helper` の記録の pid。照合に失敗したら（`Reload`・`Stop` のどちらの経路でも）
 /// 同じネットワークの `dns.audit` に 1 行残す（SEC-4・PLUG-12・#3534。語彙は [`SenderPeerMismatch`]）。
+/// `SO_PEERCRED` の取得失敗も `event=dns_control_sender_peer_cred_unavailable` として残す（`Stop` では
+/// `Unavailable` に潰れるため。#3551）。返すエラーは `Internal` のまま。
 fn connect_checked(
     guard: &NetworkLockGuard<'_>,
     expected_pid: u32,
+) -> Result<UnixStream, NetError> {
+    connect_checked_with(guard, expected_pid, holder::peer_cred)
+}
+
+/// [`connect_checked`] の本体。`peer_cred` の取得口を注入できる（取得失敗の経路を試験で再現する）。
+fn connect_checked_with(
+    guard: &NetworkLockGuard<'_>,
+    expected_pid: u32,
+    peer_cred: PeerCredFn,
 ) -> Result<UnixStream, NetError> {
     guard.check_control_socket().map_err(|e| {
         if e.code() == NetErrorCode::NotFound {
@@ -519,7 +535,9 @@ fn connect_checked(
             "cannot configure dns control connection",
         )
     })?;
-    let (pid, uid) = holder::peer_cred(stream.as_fd()).map_err(|_| {
+    let (pid, uid) = peer_cred(stream.as_fd()).map_err(|e| {
+        // 記録の失敗は拒否を妨げない（SEC-4・#3551）。
+        let _ = guard.append_control_audit(&sender_peer_cred_unavailable_line(&e));
         err(
             NetErrorCode::Internal,
             "cannot read dns control peer credentials",
@@ -1299,6 +1317,119 @@ mod tests {
                 pid.wrapping_add(1)
             )
         );
+    }
+
+    /// SEC-4・PLUG-12・#3551: 送り手側の取得失敗の行の語彙（具体値）。受信側の行は変わらない。
+    #[test]
+    fn sec4_3551_sender_peer_cred_line_vocabulary() {
+        assert_eq!(
+            sender_peer_cred_unavailable_line(&SysError::Os(22)),
+            "event=dns_control_sender_peer_cred_unavailable errno=22"
+        );
+        assert_eq!(
+            sender_peer_cred_unavailable_line(&SysError::Unsupported),
+            "event=dns_control_sender_peer_cred_unavailable errno=unsupported"
+        );
+        assert_eq!(
+            sender_peer_cred_unavailable_line(&SysError::BadSenderAddress),
+            "event=dns_control_sender_peer_cred_unavailable errno=other"
+        );
+        assert_eq!(
+            peer_cred_unavailable_line(&SysError::Os(22)),
+            "event=dns_control_peer_cred_unavailable errno=22"
+        );
+    }
+
+    /// SEC-4・PLUG-12・#3551: 送り手側の `SO_PEERCRED` 取得失敗は `Internal` で拒否し、`dns.audit` に残す。
+    #[test]
+    fn sec4_3551_sender_peer_cred_failure_is_audited() {
+        let root = Root::new("aud-snd-cred");
+        let (store, net, _dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        let e = connect_checked_with(&n, std::process::id(), |_| Err(SysError::Os(sys::EINVAL)))
+            .expect_err("peer_cred failure");
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_sender_peer_cred_unavailable errno={}\n",
+                sys::EINVAL
+            )
+        );
+    }
+
+    /// PLUG-12・SEC-4・#3551: 掃除経路で同じ uid の生きた listener は消さず、監査も書かない。
+    #[test]
+    fn plug12_3551_cleanup_keeps_socket_with_same_uid_listener() {
+        let root = Root::new("clean-same");
+        let (store, net, _dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        let e = n
+            .remove_dns_control_socket_if_no_listener()
+            .expect_err("live listener");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(n.control_socket_path().exists());
+        assert!(!root.0.join("@networks/web/dns.audit").exists());
+    }
+
+    /// SEC-4・#3551: 別 uid の listener は消さず、uid の不一致を 1 行残す。
+    #[test]
+    fn sec4_3551_cleanup_audits_foreign_uid_listener() {
+        let root = Root::new("clean-uid");
+        let (store, net, _dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        let me = sys::effective_uid();
+        let e = n
+            .remove_dns_control_socket_if_no_listener_with(|_| Ok((1, sys::effective_uid() + 1)))
+            .expect_err("live listener");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(n.control_socket_path().exists());
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_cleanup_peer_uid_mismatch peer_uid={} expected_uid={me}\n",
+                me + 1
+            )
+        );
+    }
+
+    /// SEC-4・#3551: 掃除経路の取得失敗は消さず、errno つきで 1 行残す。
+    #[test]
+    fn sec4_3551_cleanup_audits_peer_cred_failure() {
+        let root = Root::new("clean-cred");
+        let (store, net, _dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        let e = n
+            .remove_dns_control_socket_if_no_listener_with(|_| Err(SysError::Os(sys::EINVAL)))
+            .expect_err("live listener");
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(n.control_socket_path().exists());
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_cleanup_peer_cred_unavailable errno={}\n",
+                sys::EINVAL
+            )
+        );
+    }
+
+    /// NET-5・#3551: listener が居ない残骸は消え、無ければ false。
+    #[test]
+    fn net5_3551_cleanup_removes_stale_socket_and_reports_missing() {
+        let root = Root::new("clean-stale");
+        let (store, net, _dir, listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        drop(listener);
+        assert!(n.control_socket_path().exists());
+        assert!(n.remove_dns_control_socket_if_no_listener().expect("stale"));
+        assert!(!n.control_socket_path().exists());
+        assert!(!n.remove_dns_control_socket_if_no_listener().expect("none"));
+        assert!(!root.0.join("@networks/web/dns.audit").exists());
     }
 
     /// SEC-4・#3534: 2 つの書き手（ヘルパー側のロックなしの口と送り手側のガード）の追記が `O_APPEND` で

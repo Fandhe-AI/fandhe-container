@@ -30,7 +30,7 @@ use crate::sys;
 mod dns_control_store;
 mod dns_helper_store;
 
-pub(crate) use dns_control_store::NetworkDir;
+pub(crate) use dns_control_store::{NetworkDir, PeerCredFn, peer_cred_errno_word};
 
 const NETWORKS_DIR: &str = "@networks";
 const LOCK_FILE: &str = "@lock";

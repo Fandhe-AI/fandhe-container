@@ -27,8 +27,11 @@
 //! - 認証・照合の失敗は両側とも同じネットワークのディレクトリの `dns.audit`（0600・`O_APPEND`・上限つき）へ
 //!   1 行残す（SEC-4・PLUG-12・#3534）。ヘルパー側は `event=dns_control_peer_uid_mismatch`・
 //!   `event=dns_control_peer_cred_unavailable errno=<n|unsupported|other>`、送り手側（`Reload`・`Stop` の両経路）は
-//!   `event=dns_control_sender_peer_uid_mismatch`・`event=dns_control_sender_peer_pid_mismatch`。値は数値と固定の語
-//!   だけで、uid・pid はこのファイルにだけ載せる。net は core に依存しないため core の `@audit.log` には書かない
+//!   `event=dns_control_sender_peer_uid_mismatch`・`event=dns_control_sender_peer_pid_mismatch`・
+//!   `event=dns_control_sender_peer_cred_unavailable errno=<n|unsupported|other>`（#3551）。掃除経路（生きた
+//!   listener があり消さないとき）は `event=dns_control_cleanup_peer_uid_mismatch`・
+//!   `event=dns_control_cleanup_peer_cred_unavailable errno=<...>`（uid だけ照合し削除の判断は変えない。#3551）。
+//!   値は数値と固定の語だけで、uid・pid はこのファイルにだけ載せる。net は core に依存しないため core の `@audit.log` には書かない
 //!   （上位の監査経路への中継は未実装）
 //!
 //! # 未実装（REPAIR-3）

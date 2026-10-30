@@ -19,6 +19,7 @@
 //! `Error` を返す。
 
 use std::fs;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,35 @@ use crate::error::{NetError, NetErrorCode};
 use crate::network::NetworkName;
 use crate::network_store::member::MemberRecord;
 use crate::network_store::{FILE_MODE, check_socket_meta};
-use crate::sys;
+use crate::sys::{self, SysError, holder};
+
+/// `SO_PEERCRED` の取得口の型（本番は `holder::peer_cred`。取得失敗の経路を試験で再現するため差し替えられる）。
+pub(crate) type PeerCredFn = for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>;
+
+/// 監査行に載せる errno の語（`Os(n)` は数値、`Unsupported` は `unsupported`、他は `other`。`{:?}` は使わず、
+/// 外部の文字列を行に入れない。送り手側・ヘルパー側・掃除経路の取得失敗の行が共有する。SEC-4・#3551）。
+pub(crate) fn peer_cred_errno_word(e: &SysError) -> String {
+    match e {
+        SysError::Os(n) => n.to_string(),
+        SysError::Unsupported => "unsupported".to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+/// 掃除経路: 生きた listener の uid が自分と違うときの監査行（値は数値だけ。SEC-4・PLUG-12・#3551）。
+fn cleanup_peer_uid_mismatch_line(peer_uid: u32, expected_uid: u32) -> String {
+    format!(
+        "event=dns_control_cleanup_peer_uid_mismatch peer_uid={peer_uid} expected_uid={expected_uid}"
+    )
+}
+
+/// 掃除経路: listener の `SO_PEERCRED` の取得失敗の監査行（SEC-4・#3551）。
+fn cleanup_peer_cred_unavailable_line(e: &SysError) -> String {
+    format!(
+        "event=dns_control_cleanup_peer_cred_unavailable errno={}",
+        peer_cred_errno_word(e)
+    )
+}
 
 /// 制御 UDS のファイル名（ネットワークのディレクトリ直下）。
 pub const CONTROL_SOCKET_FILE: &str = crate::dns_helper::control::CONTROL_SOCKET_NAME;
@@ -44,7 +73,7 @@ impl Dir {
     }
 
     /// 制御 UDS の認証・照合の失敗（ヘルパー側の別 uid の接続・`SO_PEERCRED` の取得失敗、送り手側の uid / pid
-    /// の不一致）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限 [`CONTROL_AUDIT_MAX_BYTES`]）へ
+    /// の不一致・`SO_PEERCRED` の取得失敗、掃除経路の生きた listener の別 uid・取得失敗。#3551）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限 [`CONTROL_AUDIT_MAX_BYTES`]）へ
     /// 1 行の構造化記録として残す（SEC-4・PLUG-12・#3534）。detach 起動のヘルパーは stderr が捨てられ、`Stop` の
     /// 失敗は `Unavailable` に潰れるため、これだけが痕跡になる。
     ///
@@ -199,10 +228,37 @@ impl NetworkLockGuard<'_> {
     /// socket を残す）。そこで connect を試み、`ECONNREFUSED` / `ENOENT`（listener 不在）のときだけ消す。接続できた
     /// （生存）・backlog 満杯・その他（判定不能）は消さず `FailedPrecondition` を返す（fail-closed。NET-5・SEC-1・
     /// REPAIR-5）。接続は即座に閉じ、フレームは送らない（相手は読めず切断するだけ）。
+    ///
+    /// 接続できた相手は `SO_PEERCRED` の uid だけを自分の実効 uid と照合し、違う場合と取得に失敗した場合は
+    /// `dns.audit` へ 1 行残す（`event=dns_control_cleanup_peer_uid_mismatch`・
+    /// `event=dns_control_cleanup_peer_cred_unavailable`。SEC-4・PLUG-12・#3551）。**照合は削除の判断を変えない**:
+    /// 生きた listener は相手が誰でも消さない（fail-closed）。pid は照合しない（呼び出し元の `spawn_inner` と
+    /// `discard_orphan_dns_control_socket` は記録が無い状態で呼ぶため、比べる pid が無い）。uid が一致する正常系
+    /// （自分のヘルパーが生きている）では何も書かない。
     pub(crate) fn remove_dns_control_socket_if_no_listener(&self) -> Result<bool, NetError> {
+        self.remove_dns_control_socket_if_no_listener_with(holder::peer_cred)
+    }
+
+    /// [`Self::remove_dns_control_socket_if_no_listener`] の本体。`peer_cred` の取得口を注入できる（試験用）。
+    pub(crate) fn remove_dns_control_socket_if_no_listener_with(
+        &self,
+        peer_cred: PeerCredFn,
+    ) -> Result<bool, NetError> {
         self.require_exclusive()?;
         match sys::unix_socket::connect_unix_nonblocking(&self.control_socket_path()) {
-            Ok(_fd) => {
+            Ok(fd) => {
+                let expected_uid = sys::effective_uid();
+                // 記録の失敗は拒否を妨げない。
+                let _ = match peer_cred(fd.as_fd()) {
+                    Ok((_, uid)) if uid == expected_uid => Ok(()),
+                    Ok((_, uid)) => self
+                        .dir
+                        .append_control_audit(&cleanup_peer_uid_mismatch_line(uid, expected_uid)),
+                    Err(e) => self
+                        .dir
+                        .append_control_audit(&cleanup_peer_cred_unavailable_line(&e)),
+                };
+                drop(fd);
                 return Err(err(
                     NetErrorCode::FailedPrecondition,
                     "dns control socket has a live listener; not removed",

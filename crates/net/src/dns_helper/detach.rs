@@ -26,13 +26,14 @@
 //!
 //! # 停止の手順（D11）
 //! 記録の pid で `pidfd_open` を先に行い、その後で開始時刻と boot id を照合する（照合と操作の間の pid の再利用で
-//! 別のプロセスに触れない）。一致しなければ何も送らず、記録を古いものとして消す。一致すれば、停止要求（制御 UDS は
-//! #3071。未接続の間は [`NoStopRequest`] が [`RequestOutcome::Unavailable`] を返し、猶予の待ちを飛ばす）→
+//! 別のプロセスに触れない）。一致しなければ何も送らず、記録を古いものとして消す。一致すれば、停止要求（制御 UDS の `Stop`。
+//! `control::ControlStopRequest`。#3071。要求できなければ [`RequestOutcome::Unavailable`] で猶予の待ちを飛ばす）→
 //! [`DNS_HELPER_STOP_GRACE`] の待機 → pidfd へ SIGKILL → [`DNS_HELPER_KILL_REAP_TIMEOUT`] の待機の順に進める。
 //! pid 番号へもシグナルを送らない。`pidfd_open` が使えないカーネル（Linux 5.3 未満）は記録を残して `Unimplemented`。
 //!
 //! # 未実装（REPAIR-3）
-//! - 停止要求（制御 UDS の `Reload`/`Stop`）は #3071。いまは要求できないため SIGKILL の段へ進む
+//! - 制御 UDS（`control`。`Reload` の ack と `Stop`）は #3071 で接続済み。呼び出し元の配線（0→1 の起動・1→0 の停止の
+//!   呼び出し）は #3074・#3075、`--dns` の上流転送は #3072
 //! - 参照カウントはメンバー記録 `members/*` の件数を正とする（#3067）。配線は #3067・#3074 で、本モジュールは
 //!   遷移の判定 [`helper_transition`] だけを持つ
 //! - 起動窓の回収の候補 pid（`net-helpers` の cgroup の `cgroup.procs`）は #3074 の呼び出し側が渡す。cgroup の
@@ -79,6 +80,11 @@ pub const ARG_DETACH: &str = "--dns-helper-detach";
 pub const ARG_STAGE2: &str = "--dns-helper-stage2";
 /// nonce を渡す起動引数。
 pub const ARG_NONCE: &str = "--nonce";
+/// 状態ルート（絶対パス）を渡す起動引数。ヘルパーが `NetworkStore::open` でストアを開き直し、メンバー記録を
+/// 読む（切り離し起動の 2 段でだけ受ける。#3071）。
+pub const ARG_STATE_ROOT: &str = "--state-root";
+/// ネットワーク名を渡す起動引数（`--state-root` と対）。
+pub const ARG_NETWORK: &str = "--network";
 
 #[cfg(target_os = "linux")]
 const IDENT_PREFIX: &str = "IDENT ";
@@ -121,13 +127,15 @@ pub enum RequestOutcome {
     Unavailable,
 }
 
-/// 停止要求の送り手（制御 UDS。#3071）。pid 番号へも pidfd 経由でもシグナルを送らない（D11）。
+/// 停止要求の送り手（制御 UDS。`control::ControlStopRequest`。#3071）。pid 番号へも pidfd 経由でもシグナルを送らない（D11）。
 pub trait DnsHelperStopRequest {
     /// 記録のヘルパーへ停止を要求する。
     fn request(&self, record: &DnsHelperRecord) -> RequestOutcome;
 }
 
-/// 制御 UDS（#3071）が未接続の間の既定。要求を送ったふりをせず `Unavailable` を返す（REPAIR-3）。
+/// 停止要求を送らない既定（制御 UDS を使わない呼び出し元・試験用）。要求を送ったふりをせず `Unavailable` を返す
+/// （REPAIR-3）ため、停止は猶予を飛ばして SIGKILL になる。制御 UDS の `Stop` を送るなら
+/// `control::ControlStopRequest`（#3071）を渡す。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoStopRequest;
 

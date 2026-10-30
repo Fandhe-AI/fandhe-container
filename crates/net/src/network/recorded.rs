@@ -159,6 +159,15 @@ pub enum RecordedError<E, T> {
         /// 成功した操作の結果。
         value: Box<T>,
     },
+    /// attach は成功し確定記録も書けたが、起動済みの DNS ヘルパーが名前を読み込んだ ack（`Loaded`）を
+    /// 期限内に返さなかった（D11・D15・NET-5・#3071）。メンバー記録は消さない（アドレスは使用中として数え続け、
+    /// 呼び出し側は `value` を `detach_container_recorded` に渡して後始末できる）。
+    DnsNotLoaded {
+        /// 再読込の失敗（ack の時間切れ・世代の不一致・ヘルパーの `Error`・接続先の不一致など）。
+        error: NetError,
+        /// 成功した attach の結果。
+        value: Box<T>,
+    },
 }
 
 impl<E, T> RecordedError<E, T> {
@@ -167,9 +176,34 @@ impl<E, T> RecordedError<E, T> {
         match self {
             Self::Store(e) => Some(e.code()),
             Self::Uncommitted { error, .. } => Some(error.code()),
+            Self::DnsNotLoaded { error, .. } => Some(error.code()),
             Self::ReclaimUnsaved { persist, .. } => Some(persist.code()),
             Self::Op(_) => None,
         }
+    }
+}
+
+/// attach の結果に、DNS ヘルパーへの再読込（`Reload` → `Loaded`）を合成する（OS 非依存。root なしで単体試験できる）。
+///
+/// attach が成功したときだけ `reload` を呼ぶ。`reload` が `Ok`（ヘルパー無し〔`NotRunning`〕または `Loaded`）なら
+/// そのまま `Ok`、失敗なら [`RecordedError::DnsNotLoaded`] に成功の値を載せて返す（メンバー記録は消さない）。
+/// attach 自体の失敗はそのまま返す（再読込しない）。
+///
+/// 残余（REPAIR-3）: detach の後の再読込は行わない。古い名前は、次の attach の再読込（アドレスを再び払い出すのは
+/// attach だけ）か、1→0 の停止（#3074）で消える。detach から次の再読込までの間、再利用されたアドレスを
+/// 古い名前が指しうる。attach はコンテナの起動より前に行われるため、実害は小さい。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn finish_attach_with_reload<E, T>(
+    result: Result<T, RecordedError<E, T>>,
+    reload: impl FnOnce() -> Result<crate::dns_helper::control::ReloadOutcome, NetError>,
+) -> Result<T, RecordedError<E, T>> {
+    let value = result?;
+    match reload() {
+        Ok(_) => Ok(value),
+        Err(error) => Err(RecordedError::DnsNotLoaded {
+            error,
+            value: Box::new(value),
+        }),
     }
 }
 
@@ -1292,6 +1326,10 @@ mod linux {
     ///
     /// IPAM は記録から組み直すため、呼び出し側は `StaticIpam` を持たない。`ports` は呼び出し側の予約表
     /// （公開の記録は #3068）。`CAP_NET_ADMIN`・`CAP_SYS_ADMIN` は呼び出し側の責務。
+    ///
+    /// 成功した attach の後で、起動済みの DNS ヘルパー（`dns-helper` の記録があるとき）へ `Reload` を送り、`Loaded` を
+    /// 2 秒まで待つ（NET-5・D11・D15・#3071）。ack が来なければ [`RecordedError::DnsNotLoaded`] で失敗にする。
+    /// この失敗ではメンバー記録を消さない（呼び出し側が返された値で `detach_container_recorded` を呼べる）。
     // 理由: 非記録版 `attach_container` と同じく、netlink の 2 本のソケット・ロードガード・要求 ID・仕様・DNS・
     // ポート予約表・期限は別の所有者のもので、まとめる型を作ると借用の寿命が呼び出し側へ漏れるため引数で受ける。
     #[allow(clippy::too_many_arguments)]
@@ -1310,7 +1348,7 @@ mod linux {
     > {
         let host = nft.host_generation().map_err(RecordedError::Store)?;
         reconcile_with_sockets(route, nft, guard, timeout).map_err(RecordedError::Store)?;
-        attach_recorded_with(
+        let attached = attach_recorded_with(
             &host,
             guard,
             member_id,
@@ -1330,7 +1368,12 @@ mod linux {
                     generation,
                 )
             },
-        )
+        );
+        // 確定記録を書いた後に、起動済みの DNS ヘルパーへ名前の再読込を頼み、ack（`Loaded`）を 2 秒まで待つ
+        // （D11・D15・#3071）。ヘルパーが無ければ何もしない。ack が来なければ `DnsNotLoaded` で失敗にする。
+        finish_attach_with_reload(attached, || {
+            crate::dns_helper::control::reload_dns_helper(guard, guard.net_op_recorder())
+        })
     }
 
     /// コンテナを切り離して `members/<id>` を消す（`detach_container` の記録つき版）。
@@ -4304,6 +4347,39 @@ mod tests {
             e.message(),
             "port registry is incomplete; rebuild from records failed"
         );
+    }
+
+    /// NET-5・D11・D15・#3071: attach 成功の後の再読込が失敗したら `DnsNotLoaded`（成功の値を返す）。
+    /// ヘルパー無し・`Loaded` ならそのまま成功。attach の失敗では再読込を呼ばない。
+    #[test]
+    fn net5_3071_finish_attach_with_reload_maps_ack_failures() {
+        use crate::dns_helper::control::ReloadOutcome;
+        type R = Result<u32, RecordedError<(), u32>>;
+        let timeout = || Err(NetError::new(NetErrorCode::Timeout, "no ack"));
+        let r: R = finish_attach_with_reload(Ok(7), timeout);
+        match r {
+            Err(RecordedError::DnsNotLoaded { error, value }) => {
+                assert_eq!(error.code(), NetErrorCode::Timeout);
+                assert_eq!(*value, 7);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let e: RecordedError<(), u32> = RecordedError::DnsNotLoaded {
+            error: NetError::new(NetErrorCode::Timeout, "x"),
+            value: Box::new(1),
+        };
+        assert_eq!(e.store_code(), Some(NetErrorCode::Timeout));
+        for outcome in [ReloadOutcome::NotRunning, ReloadOutcome::Loaded] {
+            let r: R = finish_attach_with_reload(Ok(9), || Ok(outcome));
+            assert_eq!(r.expect("ok"), 9);
+        }
+        let mut called = false;
+        let r: R = finish_attach_with_reload(Err(RecordedError::Op(())), || {
+            called = true;
+            Ok(ReloadOutcome::Loaded)
+        });
+        assert!(matches!(r, Err(RecordedError::Op(()))));
+        assert!(!called, "reload must not run when attach failed");
     }
     mod after_reboot_tests;
 }

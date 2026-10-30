@@ -27,7 +27,10 @@ use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_
 use crate::network::NetworkName;
 use crate::sys;
 
+mod dns_control_store;
 mod dns_helper_store;
+
+pub(crate) use dns_control_store::NetworkDir;
 
 const NETWORKS_DIR: &str = "@networks";
 const LOCK_FILE: &str = "@lock";
@@ -258,6 +261,9 @@ fn stage_name(prefix: &str) -> String {
 /// ネットワーク定義ストア（`<state_root>/@networks`）。
 pub struct NetworkStore {
     dir: Dir,
+    /// `open` に渡された状態ルート。DNS ヘルパーの切り離し起動が、ヘルパー自身にストアを開き直させるために
+    /// 引数で渡す（絶対パスのときだけ使える。NET-5・#3071）。
+    state_root: PathBuf,
     lock_timeout: Duration,
     /// 操作の結果と所要時間の記録先（REPAIR-4）。既定は記録しない。
     recorder: Arc<dyn NetOpRecorder>,
@@ -286,6 +292,8 @@ pub struct NetworkLockGuard<'g> {
     /// 排他ロックか。記録の書き込みは排他ロックでだけ許す（#3067）。
     exclusive: bool,
     recorder: Arc<dyn NetOpRecorder>,
+    /// ストアの状態ルート（[`NetworkStore::state_root`] と同じ）。
+    state_root: PathBuf,
     dir: Dir,
     file: File,
 }
@@ -390,6 +398,7 @@ impl NetworkStore {
         sync_init(&root, &dir)?;
         Ok(Self {
             dir,
+            state_root: state_root.to_path_buf(),
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
             recorder,
         })
@@ -652,6 +661,9 @@ impl NetworkStore {
             n.discard_stale_temps()?;
             // 排他ロックの下で、realized / realized.intent の書き込み残骸（`@tmp-*`）を先に掃除する。
             n.dir.sweep_tmp();
+            // 死んだ DNS ヘルパーの制御ソケット（`dns.ctl`）が残っていても、記録が両方無ければ消してから検査する
+            // （停止後の残骸が `network rm` を止めない。socket でない・所有者違いは消さず、下の検査が拒否する）。
+            n.discard_orphan_dns_control_socket();
             let items = n.dir.entries(NET_DIR_SCAN_LIMIT).map_err(|e| {
                 if e.code() == NetErrorCode::ResourceExhausted {
                     err(
@@ -728,6 +740,7 @@ impl GlobalLockGuard<'_> {
             name: name.clone(),
             exclusive: !shared,
             recorder: Arc::clone(&self.store.recorder),
+            state_root: self.store.state_root.clone(),
             dir,
             file,
         })

@@ -194,6 +194,28 @@ impl Dir {
         Ok(names)
     }
 
+    /// ネットワークのディレクトリ `self` の確定したメンバー記録を ID 順に読む（ロックを取らない本体。
+    /// [`NetworkLockGuard::members`] と、ロックを取らずに読む DNS ヘルパー側の `NetworkDir::members`
+    /// が共用する。NET-5・#3071）。1 件でも壊れていれば `DataLoss`。
+    pub(super) fn read_members(&self) -> Result<Vec<MemberRecord>, NetError> {
+        let Some(dir) = self.open_subdir_opt(MEMBERS_DIR)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for n in dir.record_names()? {
+            let id = MemberId::new(&n).map_err(|_| data_loss("member record name is invalid"))?;
+            let bytes = dir
+                .read_record(&n)?
+                .ok_or_else(|| data_loss("member record vanished"))?;
+            let rec = MemberRecord::decode(&bytes)?;
+            if rec.id() != &id {
+                return Err(data_loss("member record id does not match its file name"));
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
     /// クラッシュの残りの一時ファイルを消す（ベストエフォート。排他ロックの下でだけ呼ぶ）。
     pub(super) fn sweep_tmp(&self) {
         if let Ok(names) = self.entries(LIST_LIMIT) {
@@ -299,22 +321,7 @@ impl NetworkLockGuard<'_> {
 
     /// 確定したメンバー記録を ID 順に読む。1 件でも壊れていれば `DataLoss`（IPAM を組めないため全体を失敗にする）。
     pub fn members(&self) -> Result<Vec<MemberRecord>, NetError> {
-        let Some(dir) = self.dir.open_subdir_opt(MEMBERS_DIR)? else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for n in dir.record_names()? {
-            let id = MemberId::new(&n).map_err(|_| data_loss("member record name is invalid"))?;
-            let bytes = dir
-                .read_record(&n)?
-                .ok_or_else(|| data_loss("member record vanished"))?;
-            let rec = MemberRecord::decode(&bytes)?;
-            if rec.id() != &id {
-                return Err(data_loss("member record id does not match its file name"));
-            }
-            out.push(rec);
-        }
-        Ok(out)
+        self.dir.read_members()
     }
 
     /// 意図記録を ID 順に読む。壊れていれば `DataLoss`。

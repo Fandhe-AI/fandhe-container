@@ -368,8 +368,8 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3057 | 人間担当: rootful の実行主体の判断シート（D13） | 人間 | なし | 判断シートあり（PR #3186）・判断は #3207 |
 | #3069 | core: init user namespace 所有の netns への参加（D12） | runtime-builder | #3057・#3058 | 未実装 |
 | #3074 | supervisor: rootful の plugin 起動と attach / detach の結線（D13・D14） | runtime-builder | #3057・#3059・#3067・#3069・#3065 | 未実装 |
-| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 実装済み（切り離し起動・記録・pidfd 経由の停止・起動窓の回収の判定。停止要求の UDS は #3071、`members/*` の件数による起動・停止の配線は #3067・#3074、回収の候補 pid を出す `net-helpers` の cgroup の列挙は #3074 が残る） |
-| #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 未実装 |
+| #3070 | net: DNS ヘルパーの切り離し起動と停止（D11） | net-builder | #3059 | 実装済み（切り離し起動・記録・pidfd 経由の停止・起動窓の回収の判定。停止要求の UDS は #3071 で接続済み、`members/*` の件数による起動・停止の配線は #3067・#3074、回収の候補 pid を出す `net-helpers` の cgroup の列挙は #3074 が残る） |
+| #3071 | net: DNS ヘルパーの制御 UDS と記録からの名前の読み込み（D11） | net-builder | #3067・#3070 | 実装済み（制御 UDS `dns.ctl`・`Reload` / `Loaded` / `Stop` / `Error` のフレーム・メンバー記録からの名前の読み込み・attach の `Reload` の ack 待ちと失敗の結線・`Stop` による停止。呼び出し元の配線は #3074・#3075、`--dns` の上流は #3072、別 uid の実機確認は人間担当） |
 | #3072 | net: `--dns` の上流転送を製品のヘルパーで有効化（D11） | net-builder | #3071 | 未実装 |
 | #3060 | net: nftables の `bitwise`・`meta` expr（D11） | net-builder | なし | 実装済み（PR #3189） |
 | #3073 | net: postrouting の masquerade（D11） | net-builder | #3060 | 実装済み |
@@ -378,6 +378,8 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | #3063 | net: 公開前に `fandhe_net_*` の DNAT を dump して衝突検出（D11） | net-builder | なし | 実装済み（PR #3193。共有ロックと投入後の事後確認は #3191） |
 | #3191 | net: 公開の共有ロックと投入後の事後確認（D11。#3063 の残り） | net-builder | #3207・#3074 | 未実装（#3207 の判断と #3074 の結線待ち） |
 | #3075 | cri: netsetup の `CreatedNetwork`・IPAM の永続化 | oci-cri-builder | #3059・#3067・#3057 | 未実装 |
+
+Issue #3071 の実装メモ: 制御 UDS は `crates/net/src/dns_helper/control.rs`（フレームは `control/frame.rs`、サーバーと送り手は `control/os.rs`）、名前の導出は `dns_helper/load.rs`。D11 の決定は変えず、次の細部を埋めた。(1) ヘルパーはネットワークのロックを **取らずに** `members/*` を読む。`attach_recorded_with` も `spawn_inner` も排他ロックを持ったまま ack / `READY` を待つため、ヘルパーが共有ロックを取ると 5 秒待って 2 秒の `Loaded` の期限（D15）を必ず超える。読むのは rename / link で原子的に公開された完全なファイルだけで、読み込みは排他ロックの保持者からの `Reload`（と起動時の初回）に限る。食い違えば前のレジストリを保ったまま `Error{code}` を返す（`Error` は D11 の語彙への追加で、ack の不在を時間切れや EOF に頼らず即座に失敗にするため）。(2) FCMEM1 にホスト名が無いため、登録名はメンバー ID（コンテナ ID）を RFC 1123 のホスト名規則に通したもの。`_` を含む ID などは登録せず件数だけを数え、正規化（小文字化）で同名になる ID は **どちらも登録しない**（名前の乗っ取りの防止）。コンテナ名を使う拡張は記録形式の変更を伴うため別 issue。(3) ヘルパーへは `--state-root`（絶対パス）と `--network` を切り離し起動の 2 段で渡し、ヘルパー自身が `NetworkStore::open` で開き直す。単独の `--listen`（試験専用）は NOTIMP のまま。(4) `dns.ctl` の削除は排他ロックを持つ側（停止・起動・回収・`network rm`）だけが行い、ヘルパー自身は消さない。(5) attach の成功の後で `Reload` を送り、ack が来なければ `RecordedError::DnsNotLoaded`（メンバー記録は消さず、値を返して呼び出し側が `detach_container_recorded` できる）。detach の後の `Reload` は送らない（古い名前は次の attach の `Reload` か 1→0 の停止で消える。attach から ack までの最大 2 秒は再利用されたアドレスを古い名前が指しうるが、attach はコンテナの起動より前に行う）。
 
 Issue #3067 の実装メモ: 記録は `crates/net/src/network_store/`（`member`・`realized`・`ipam_rebuild`・`imp/records.rs`）、記録つきの合成は `crates/net/src/network/recorded.rs`。D11 の列挙に、メンバー記録へ `token`（host veth の所有トークン）・`netns-dir`・`netns-dir-id` を補助項目として足した（組み直した IPAM に `NetnsDirRecord` を戻し、`delete_network` が復元した払い出しの pin を判定不能として扱う劣化を避けるため）。`CreatedNetwork::name_resolution` は記録せず、復元時に呼び出し側が渡す。残った `realized.intent` のカーネル照合（昇格または巻き戻し）、実体の無い `members-intent/*` の掃除、`--dns` 上流をヘルパーが消費する部分（#3071・#3072）は後続で、それまで `realized.intent` が残るネットワークの次の操作は `FailedPrecondition` で拒否し、意図記録のアドレスは使用中として数え続ける。
 

@@ -17,10 +17,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::{
-    ACK, ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DNS_HELPER_KILL_REAP_TIMEOUT,
-    DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT, DNS_HELPER_STOP_GRACE,
-    DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES,
-    RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage, run_stop_sequence,
+    ACK, ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
+    DNS_HELPER_KILL_REAP_TIMEOUT, DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT,
+    DNS_HELPER_STOP_GRACE, DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX,
+    MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage,
+    run_stop_sequence,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -33,6 +34,7 @@ use crate::dns_helper::{
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
+use crate::network::NetworkName;
 use crate::network_store::NetworkLockGuard;
 use crate::sys::{self, Deadline, Readiness, SysError, process};
 
@@ -160,6 +162,8 @@ fn stop_inner(
     let pidfd = match open_pidfd(record.identity().pid) {
         Ok(fd) => fd,
         Err(e) if e.code() == NetErrorCode::NotFound => {
+            // 死んだヘルパーの制御ソケットは、記録を消す前に片付ける（記録が先に消えると socket だけが残る）。
+            guard.remove_dns_control_socket()?;
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::AlreadyGone);
         }
@@ -168,12 +172,15 @@ fn stop_inner(
     match verify_pidfd_target(pidfd.as_fd(), record.identity())? {
         Verify::Same => {}
         Verify::Different => {
+            // pid が別のプロセスに再利用されている。socket は元のヘルパーのもの（死んでいる）なので片付ける。
+            guard.remove_dns_control_socket()?;
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::StaleRecord);
         }
         Verify::Gone => {
             // subreaper の下では終了済みでもゾンビとして pidfd が開ける。記録を消す前に pidfd 経由で回収する。
             let _ = process::reap_pidfd_nohang(pidfd.as_fd());
+            guard.remove_dns_control_socket()?;
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::AlreadyGone);
         }
@@ -189,6 +196,8 @@ fn stop_inner(
         DNS_HELPER_KILL_REAP_TIMEOUT,
     )?;
     let _ = process::reap_pidfd_nohang(ops.pidfd.as_fd());
+    // 終了を確認できた後で、制御ソケットと記録を消す（`Timeout` で上の `?` が返ったときは両方残す）。
+    guard.remove_dns_control_socket()?;
     guard.remove_dns_helper()?;
     Ok(match stage {
         StopStage::StoppedOnRequest => StopOutcome::StoppedOnRequest,
@@ -284,6 +293,10 @@ fn spawn_inner(
             "dns helper record already exists",
         ));
     }
+    // 記録も意図記録も無いので、残っている制御ソケットは死んだヘルパーの残骸（新しいヘルパーが bind できるよう消す。
+    // socket でない・他の所有者のものは消さずに失敗にする）。
+    guard.remove_dns_control_socket()?;
+    let state_root = guard.state_root()?;
     let nonce = HelperNonce::generate()?;
     guard.write_dns_helper_intent(&DnsHelperIntent::new(
         guard.network().clone(),
@@ -297,6 +310,10 @@ fn spawn_inner(
         .arg(listen.to_string())
         .arg(ARG_NONCE)
         .arg(nonce.as_str())
+        .arg(ARG_STATE_ROOT)
+        .arg(state_root)
+        .arg(ARG_NETWORK)
+        .arg(guard.network().as_str())
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -759,7 +776,9 @@ fn fail_after_record(guard: &NetworkLockGuard<'_>, pidfd: BorrowedFd<'_>, e: Net
         return with_note(e, "dns helper could not be confirmed stopped; records kept");
     }
     let removed = guard
-        .remove_dns_helper()
+        .remove_dns_control_socket()
+        .map(|_| ())
+        .and_then(|()| guard.remove_dns_helper())
         .and_then(|()| guard.remove_dns_helper_intent());
     match removed {
         Ok(()) => e,
@@ -865,6 +884,13 @@ fn recover_inner(
             NetErrorCode::ResourceExhausted,
             "too many recovery candidates; intent record kept",
         ));
+    }
+    // 起動途中で止めたヘルパー（`stopped > 0`）が bind していた制御ソケットを片付ける。何も止めていないとき
+    // （子は ack の期限で bind せずに終了済み、または nonce が合わない別のプロセス）は触れない。`dns-helper` の
+    // 記録が別にあるときの socket はその生きたヘルパーのものなので消さない。bind 前に死んだ子の socket が
+    // 残っても、次の起動と `network rm` が消す。
+    if stopped > 0 && guard.read_dns_helper()?.is_none() {
+        guard.remove_dns_control_socket()?;
     }
     guard.remove_dns_helper_intent()?;
     Ok(IntentRecovery::Recovered { stopped })
@@ -985,7 +1011,12 @@ fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> Result<bool, NetError> {
 /// 段 1（`--dns-helper-detach`）の本体: 新しいセッションを作り、段 2 を起動して待たずに戻る。
 /// `setsid` に失敗したら（切り離せない）起動を続けず失敗にする（fail-closed）。段 2 は stdin・stdout を継承し、
 /// stderr を捨てる。
-pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(), NetError> {
+pub(crate) fn run_stage1(
+    listen: DnsListenAddr,
+    nonce: &HelperNonce,
+    state_root: &Path,
+    network: &NetworkName,
+) -> Result<(), NetError> {
     process::setsid().map_err(|_| err(NetErrorCode::Internal, "setsid failed"))?;
     let child = Command::new("/proc/self/exe")
         .arg(ARG_STAGE2)
@@ -993,6 +1024,10 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
         .arg(listen.to_string())
         .arg(ARG_NONCE)
         .arg(nonce.as_str())
+        .arg(ARG_STATE_ROOT)
+        .arg(state_root)
+        .arg(ARG_NETWORK)
+        .arg(network.as_str())
         .env_clear()
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

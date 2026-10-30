@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 pub(crate) mod holder;
 pub(crate) mod pasta;
 pub(crate) mod process;
+pub(crate) mod unix_socket;
 
 /// syscall 失敗の分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

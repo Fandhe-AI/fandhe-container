@@ -95,6 +95,8 @@ pub enum NetOpKind {
     NetworkStoreDnsHelperRemove,
     /// 起動窓の意図記録の回収（`recover_dns_helper_intent`。NET-5・NET-7・REPAIR-4・#3070）。
     DnsHelperRecover,
+    /// DNS ヘルパーへの `Reload` の送信と `Loaded` の待ち（`reload_dns_helper`。制御 UDS。NET-5・REPAIR-4・#3071）。
+    DnsHelperReload,
     /// 記録だけからのメンバー 1 件の切り離し全体（検証拒否・回収・記録の削除を含む。
     /// `detach_member_recorded_with`。NET-1・NET-6・REPAIR-4・#3347）。
     MemberDetachRecorded,
@@ -136,6 +138,7 @@ impl NetOpKind {
             NetOpKind::NetworkStoreDnsHelperWrite => "network.store.dns_helper_write",
             NetOpKind::NetworkStoreDnsHelperRemove => "network.store.dns_helper_remove",
             NetOpKind::DnsHelperRecover => "dns.helper.recover",
+            NetOpKind::DnsHelperReload => "dns.helper.reload",
             NetOpKind::MemberDetachRecorded => "network.member.detach_recorded",
             NetOpKind::MemberDetachAfterReboot => "network.member.detach_after_reboot",
         }
@@ -312,7 +315,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 31] = [
+    const ALL_KINDS: [NetOpKind; 32] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -342,6 +345,7 @@ mod tests {
         NetOpKind::NetworkStoreDnsHelperWrite,
         NetOpKind::NetworkStoreDnsHelperRemove,
         NetOpKind::DnsHelperRecover,
+        NetOpKind::DnsHelperReload,
         NetOpKind::MemberDetachRecorded,
         NetOpKind::MemberDetachAfterReboot,
     ];
@@ -398,6 +402,7 @@ mod tests {
             "network.store.dns_helper_remove"
         );
         assert_eq!(NetOpKind::DnsHelperRecover.as_str(), "dns.helper.recover");
+        assert_eq!(NetOpKind::DnsHelperReload.as_str(), "dns.helper.reload");
         assert_eq!(
             NetOpKind::MemberDetachRecorded.as_str(),
             "network.member.detach_recorded"

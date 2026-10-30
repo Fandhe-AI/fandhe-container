@@ -60,7 +60,7 @@ pub enum HolderMessage {
 pub struct HolderFrame([u8; FRAME_LEN]);
 
 /// `NetErrorCode` の固定のワイヤー値（`NetErrorCode::ALL` の並びに依存しない。`from_name` の文字列は使わない）。
-fn code_to_wire(code: NetErrorCode) -> u64 {
+pub(crate) fn code_to_wire(code: NetErrorCode) -> u64 {
     match code {
         NetErrorCode::InvalidArgument => 1,
         NetErrorCode::DataLoss => 2,
@@ -76,7 +76,7 @@ fn code_to_wire(code: NetErrorCode) -> u64 {
     }
 }
 
-fn code_from_wire(v: u64) -> Option<NetErrorCode> {
+pub(crate) fn code_from_wire(v: u64) -> Option<NetErrorCode> {
     Some(match v {
         1 => NetErrorCode::InvalidArgument,
         2 => NetErrorCode::DataLoss,

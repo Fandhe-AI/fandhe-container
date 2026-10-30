@@ -190,6 +190,37 @@ impl Dir {
         Ok(f)
     }
 
+    /// 追記専用（`O_APPEND`）で開く。無ければ 0600 で作る。検査は [`Self::open_regular`] と同じ
+    /// （`O_NOFOLLOW`・`O_NONBLOCK`・通常ファイル・所有者・0600・nlink・上限）。複数のプロセスが 1 行ずつ追記する
+    /// 監査記録用で、位置決めと書き込みがカーネルで原子的になり、行どうしが上書きされない（#3534・SEC-4）。
+    fn open_regular_append(&self, name: &str, max_len: u64) -> Result<File, NetError> {
+        let path = self.path(name);
+        let msg = "failed to open network store file";
+        match OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .custom_flags(FLAGS_FILE)
+            .open(&path)
+        {
+            Ok(f) => {
+                f.set_permissions(fs::Permissions::from_mode(FILE_MODE))
+                    .map_err(|e| map_io(&e, msg))?;
+                check_file(&f, max_len)?;
+                return Ok(f);
+            }
+            Err(e) if e.raw_os_error() == Some(sys::EEXIST) => {}
+            Err(e) => return Err(map_io(&e, msg)),
+        }
+        let f = OpenOptions::new()
+            .append(true)
+            .custom_flags(FLAGS_FILE)
+            .open(&path)
+            .map_err(|e| map_io(&e, msg))?;
+        check_file(&f, max_len)?;
+        Ok(f)
+    }
+
     /// 定義の読み取り専用で開く（FIFO 等でも止まらない）。
     fn open_regular_ro(&self, name: &str, max_len: u64) -> Result<File, NetError> {
         let f = OpenOptions::new()

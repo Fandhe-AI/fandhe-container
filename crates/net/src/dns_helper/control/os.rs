@@ -6,7 +6,7 @@
 
 use std::io::{self, Read, Write as _};
 use std::net::Ipv4Addr;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -80,6 +80,115 @@ fn map_read_error(e: ReadError) -> NetError {
 }
 
 // ---------------------------------------------------------------------------
+// 監査行の語彙（SEC-4・PLUG-12・#3534）
+// ---------------------------------------------------------------------------
+//
+// 値は u32 の数値か固定の語だけで、外部の文字列は入れない（ログ偽装の防止）。記録先は両側とも
+// ネットワークのディレクトリの `dns.audit`（0600）。uid・pid の値はこのファイルにだけ載せる。
+
+/// ヘルパー側: `SO_PEERCRED` の取得失敗の監査行。errno 以外は固定の語にする（`{:?}` を使わない）。
+fn peer_cred_unavailable_line(e: &SysError) -> String {
+    match e {
+        SysError::Os(n) => format!("event=dns_control_peer_cred_unavailable errno={n}"),
+        SysError::Unsupported => {
+            "event=dns_control_peer_cred_unavailable errno=unsupported".to_owned()
+        }
+        _ => "event=dns_control_peer_cred_unavailable errno=other".to_owned(),
+    }
+}
+
+/// ヘルパー側: 別 uid の接続の監査行。
+fn peer_uid_mismatch_line(peer_uid: u32, expected_uid: u32) -> String {
+    format!("event=dns_control_peer_uid_mismatch peer_uid={peer_uid} expected_uid={expected_uid}")
+}
+
+/// 送り手側の接続後の照合の不一致（記録された helper ではない相手）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderPeerMismatch {
+    Uid {
+        peer_uid: u32,
+        expected_uid: u32,
+        peer_pid: u32,
+        expected_pid: u32,
+    },
+    Pid {
+        peer_pid: u32,
+        expected_pid: u32,
+        peer_uid: u32,
+    },
+}
+
+impl SenderPeerMismatch {
+    fn audit_line(&self) -> String {
+        match *self {
+            Self::Uid {
+                peer_uid,
+                expected_uid,
+                peer_pid,
+                expected_pid,
+            } => format!(
+                "event=dns_control_sender_peer_uid_mismatch peer_uid={peer_uid} expected_uid={expected_uid} peer_pid={peer_pid} expected_pid={expected_pid}"
+            ),
+            Self::Pid {
+                peer_pid,
+                expected_pid,
+                peer_uid,
+            } => format!(
+                "event=dns_control_sender_peer_pid_mismatch peer_pid={peer_pid} expected_pid={expected_pid} peer_uid={peer_uid}"
+            ),
+        }
+    }
+
+    /// 呼び出し側へ返すエラー（文言に uid・pid を載せない）。
+    fn to_error(self) -> NetError {
+        match self {
+            Self::Uid {
+                peer_uid,
+                expected_uid,
+                ..
+            } => authorize_peer(peer_uid, expected_uid)
+                .err()
+                .unwrap_or_else(|| {
+                    // 構築上は不一致のときだけ来る。万一一致なら同じ固定文言の拒否に倒す。
+                    err(
+                        NetErrorCode::PermissionDenied,
+                        "dns control peer uid mismatch",
+                    )
+                }),
+            Self::Pid { .. } => err(
+                NetErrorCode::PermissionDenied,
+                "dns control peer is not the recorded helper",
+            ),
+        }
+    }
+}
+
+/// 送り手側の照合。uid を先に見る（両方不一致なら `Uid`）。root も例外にしない（[`authorize_peer`]）。
+fn sender_peer_check(
+    peer_pid: u32,
+    peer_uid: u32,
+    expected_pid: u32,
+    expected_uid: u32,
+) -> Result<(), SenderPeerMismatch> {
+    if authorize_peer(peer_uid, expected_uid).is_err() {
+        return Err(SenderPeerMismatch::Uid {
+            peer_uid,
+            expected_uid,
+            peer_pid,
+            expected_pid,
+        });
+    }
+    if peer_pid != expected_pid {
+        return Err(SenderPeerMismatch::Pid {
+            peer_pid,
+            expected_pid,
+            peer_uid,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ヘルパー側
 // ---------------------------------------------------------------------------
 
@@ -145,6 +254,8 @@ pub(crate) struct ControlServer {
     expected_uid: u32,
     /// 認証拒否の監査記録の置き場（本番はネットワークのディレクトリ。無ければ stderr のみ）。
     audit_dir: Option<Arc<NetworkDir>>,
+    /// 接続相手の (pid, uid) の取得口（本番は `SO_PEERCRED`。取得失敗の経路を試験で再現するため差し替えられる）。
+    peer_cred: for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>,
 }
 
 impl ControlServer {
@@ -160,7 +271,18 @@ impl ControlServer {
             listener,
             expected_uid,
             audit_dir: None,
+            peer_cred: holder::peer_cred,
         })
+    }
+
+    /// `peer_cred` の取得口を差し替える（試験専用。`SO_PEERCRED` の失敗を再現する）。
+    #[cfg(test)]
+    fn with_peer_cred(
+        mut self,
+        f: for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>,
+    ) -> Self {
+        self.peer_cred = f;
+        self
     }
 
     /// 認証拒否を `dns.audit` へも残す（SEC-4。detach 起動では stderr が捨てられるため）。
@@ -226,17 +348,21 @@ impl ControlServer {
             return;
         }
         // 相手の uid を、フレームを読む前に照合する（違えば何も読まず・書かずに切断する。PLUG-12）。
-        let uid = match holder::peer_cred(stream.as_fd()) {
+        // 取得に失敗した接続も拒否する。痕跡は stderr（detach では捨てられる）と `dns.audit` に残す（SEC-4・#3534）。
+        let uid = match (self.peer_cred)(stream.as_fd()) {
             Ok((_, uid)) => uid,
-            Err(_) => return,
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "dns control peer_cred_unavailable");
+                if let Some(dir) = &self.audit_dir {
+                    let _ = dir.append_control_audit(&peer_cred_unavailable_line(&e));
+                }
+                return;
+            }
         };
         if authorize_peer(uid, self.expected_uid).is_err() {
             let _ = writeln!(io::stderr(), "dns control peer_uid_mismatch");
             if let Some(dir) = &self.audit_dir {
-                let _ = dir.append_control_audit(&format!(
-                    "event=dns_control_peer_uid_mismatch peer_uid={uid} expected_uid={}",
-                    self.expected_uid
-                ));
+                let _ = dir.append_control_audit(&peer_uid_mismatch_line(uid, self.expected_uid));
             }
             return;
         }
@@ -368,7 +494,8 @@ fn map_connect_error(e: SysError) -> NetError {
 }
 
 /// 制御 UDS へ接続して相手を検査する（connect の前に lstat、後に peer の uid と pid を照合）。
-/// `expected_pid` は `dns-helper` の記録の pid。
+/// `expected_pid` は `dns-helper` の記録の pid。照合に失敗したら（`Reload`・`Stop` のどちらの経路でも）
+/// 同じネットワークの `dns.audit` に 1 行残す（SEC-4・PLUG-12・#3534。語彙は [`SenderPeerMismatch`]）。
 fn connect_checked(
     guard: &NetworkLockGuard<'_>,
     expected_pid: u32,
@@ -398,12 +525,11 @@ fn connect_checked(
             "cannot read dns control peer credentials",
         )
     })?;
-    authorize_peer(uid, sys::effective_uid())?;
-    if pid != expected_pid {
-        return Err(err(
-            NetErrorCode::PermissionDenied,
-            "dns control peer is not the recorded helper",
-        ));
+    if let Err(m) = sender_peer_check(pid, uid, expected_pid, sys::effective_uid()) {
+        // Reload / Stop の両経路で痕跡を残す（`Stop` は呼び出し側でエラーが `Unavailable` に潰れる）。
+        // 記録の失敗は拒否を妨げない（SEC-4・#3534）。
+        let _ = guard.append_control_audit(&m.audit_line());
+        return Err(m.to_error());
     }
     Ok(stream)
 }
@@ -1006,5 +1132,186 @@ mod tests {
             upstream_strings(&ups, a),
             Some(vec!["192.0.2.53:53".to_owned()])
         );
+    }
+
+    // ---- 監査行の語彙と記録（SEC-4・PLUG-12・#3534） ----
+
+    fn audit_text(root: &Root) -> String {
+        std::fs::read_to_string(root.0.join("@networks/web/dns.audit")).expect("dns.audit")
+    }
+
+    /// ネットワーク `web` を作り、制御 UDS を bind した状態を返す。
+    fn audited_network(root: &Root) -> (NetworkStore, NetworkName, NetworkDir, UnixListener) {
+        let store = NetworkStore::open(&root.0).expect("store");
+        store
+            .create(&NetworkDefinition::bridge("web", prefix(0, 24)).expect("def"))
+            .expect("create");
+        let net = NetworkName::new("web").expect("name");
+        let dir = store.open_network_dir(&net).expect("dir");
+        let listener = bind_control(&dir).expect("bind");
+        (store, net, dir, listener)
+    }
+
+    /// SEC-4・#3534: ヘルパー側の監査行の語彙（具体値）。
+    #[test]
+    fn sec4_3534_receiver_audit_line_vocabulary() {
+        assert_eq!(
+            peer_cred_unavailable_line(&SysError::Os(22)),
+            "event=dns_control_peer_cred_unavailable errno=22"
+        );
+        assert_eq!(
+            peer_cred_unavailable_line(&SysError::Unsupported),
+            "event=dns_control_peer_cred_unavailable errno=unsupported"
+        );
+        assert_eq!(
+            peer_cred_unavailable_line(&SysError::BadSenderAddress),
+            "event=dns_control_peer_cred_unavailable errno=other"
+        );
+        assert_eq!(
+            peer_uid_mismatch_line(1000, 1001),
+            "event=dns_control_peer_uid_mismatch peer_uid=1000 expected_uid=1001"
+        );
+    }
+
+    /// PLUG-12・SEC-4・#3534: 送り手側の照合の表（uid が先、root も例外にしない）。
+    #[test]
+    fn plug12_3534_sender_peer_check_table() {
+        assert_eq!(sender_peer_check(10, 1000, 10, 1000), Ok(()));
+        let m = sender_peer_check(10, 0, 10, 1000).expect_err("uid");
+        assert_eq!(
+            m.audit_line(),
+            "event=dns_control_sender_peer_uid_mismatch peer_uid=0 expected_uid=1000 peer_pid=10 expected_pid=10"
+        );
+        assert_eq!(m.to_error().code(), NetErrorCode::PermissionDenied);
+        let m = sender_peer_check(11, 1000, 10, 1000).expect_err("pid");
+        assert_eq!(
+            m.audit_line(),
+            "event=dns_control_sender_peer_pid_mismatch peer_pid=11 expected_pid=10 peer_uid=1000"
+        );
+        assert_eq!(m.to_error().code(), NetErrorCode::PermissionDenied);
+        // 両方不一致なら uid の行だけ。
+        assert!(matches!(
+            sender_peer_check(11, 0, 10, 1000),
+            Err(SenderPeerMismatch::Uid { .. })
+        ));
+    }
+
+    /// 接続して切断（EOF か reset）を観測する。
+    fn observe_drop(path: &Path) {
+        let c = connect(path);
+        let mut w = &c;
+        let _ = ControlFrame::encode(ControlMessage::Reload(gen_(1))).write_to(&mut w);
+        c.set_read_timeout(Some(Duration::from_secs(5))).expect("t");
+        let mut buf = [0u8; 1];
+        let mut r = &c;
+        match r.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if is_disconnect(&e) => {}
+            other => panic!("not a disconnect: {other:?}"),
+        }
+    }
+
+    type RunningServer = (
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        thread::JoinHandle<Result<(), NetError>>,
+    );
+
+    fn run_server(server: ControlServer) -> RunningServer {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let (s2, r2) = (Arc::clone(&stop), Arc::clone(&reloads));
+        let join = thread::spawn(move || {
+            let on_reload = move || {
+                r2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+            server.run(&s2, &on_reload)
+        });
+        (stop, reloads, join)
+    }
+
+    /// SEC-4・PLUG-12・#3534: ヘルパー側の uid 不一致が `dns.audit` に具体値で残る。
+    #[test]
+    fn sec4_3534_receiver_uid_mismatch_is_written_to_dns_audit() {
+        let root = Root::new("aud-uid");
+        let (_store, _net, dir, listener) = audited_network(&root);
+        let path = dir.control_socket_path();
+        let me = sys::effective_uid();
+        let server = ControlServer::new(listener, me.wrapping_add(1))
+            .expect("server")
+            .with_audit_dir(Arc::new(dir));
+        let (stop, reloads, join) = run_server(server);
+        observe_drop(&path);
+        assert_eq!(reloads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_peer_uid_mismatch peer_uid={me} expected_uid={}\n",
+                me.wrapping_add(1)
+            )
+        );
+        stop.store(true, Ordering::SeqCst);
+        join_within(join).expect("run");
+    }
+
+    /// SEC-4・PLUG-12・#3534: `SO_PEERCRED` の取得失敗は拒否され、`dns.audit` に errno つきで残る。
+    #[test]
+    fn sec4_3534_receiver_peer_cred_failure_is_audited() {
+        let root = Root::new("aud-cred");
+        let (_store, _net, dir, listener) = audited_network(&root);
+        let path = dir.control_socket_path();
+        let server = ControlServer::new(listener, sys::effective_uid())
+            .expect("server")
+            .with_peer_cred(|_| Err(SysError::Os(sys::EINVAL)))
+            .with_audit_dir(Arc::new(dir));
+        let (stop, reloads, join) = run_server(server);
+        observe_drop(&path);
+        assert_eq!(reloads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_peer_cred_unavailable errno={}\n",
+                sys::EINVAL
+            )
+        );
+        stop.store(true, Ordering::SeqCst);
+        join_within(join).expect("run");
+    }
+
+    /// SEC-4・PLUG-12・#3534: 送り手側の pid 不一致は拒否され、`dns.audit` に具体値で残る（`Stop` 経路も同じ
+    /// `connect_checked` を通り、`Unavailable` に潰れても記録は残る）。送り手側の uid 不一致は別 uid を作れない
+    /// （root が要る）ため実ファイルでは置かず、純関数の表と、記録経路がこれと共通であることで担保する。
+    #[test]
+    fn sec4_3534_sender_pid_mismatch_is_audited() {
+        let root = Root::new("aud-snd");
+        let (store, net, _dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        let pid = std::process::id();
+        let uid = sys::effective_uid();
+        let e = connect_checked(&n, pid.wrapping_add(1)).expect_err("pid mismatch");
+        assert_eq!(e.code(), NetErrorCode::PermissionDenied);
+        assert_eq!(
+            audit_text(&root),
+            format!(
+                "event=dns_control_sender_peer_pid_mismatch peer_pid={pid} expected_pid={} peer_uid={uid}\n",
+                pid.wrapping_add(1)
+            )
+        );
+    }
+
+    /// SEC-4・#3534: 2 つの書き手（ヘルパー側のロックなしの口と送り手側のガード）の追記が `O_APPEND` で
+    /// 順に揃って残る。
+    #[test]
+    fn sec4_3534_audit_appends_from_both_writers() {
+        let root = Root::new("aud-both");
+        let (store, net, dir, _listener) = audited_network(&root);
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&net).expect("network");
+        dir.append_control_audit("event=a").expect("a");
+        n.append_control_audit("event=b").expect("b");
+        dir.append_control_audit("event=c").expect("c");
+        assert_eq!(audit_text(&root), "event=a\nevent=b\nevent=c\n");
     }
 }

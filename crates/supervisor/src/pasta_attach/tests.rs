@@ -1,7 +1,7 @@
 //! `pasta_attach` の単体試験(NET-9・CORE-1・REPAIR-4・REPAIR-5・#1940)。
 //!
 //! フェイクの backend とフェイクのプロセスで、起動順序・拒否の分類・逆順の巻き戻し・途中死の扱い・回収の順序を
-//! 具体値で照合する。実 pasta と本番 launcher の通し確認は #3331(実機前提)。
+//! 具体値で照合する。実 pasta と本番 launcher の通し確認は `tests/pasta_launch_rootless.rs`(#3331。実機前提)。
 
 use super::*;
 use std::fs::File;

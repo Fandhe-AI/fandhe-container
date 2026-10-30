@@ -268,6 +268,13 @@ name = "exec_launch_netns_rootless"
 path = "tests/exec_launch_netns_rootless.rs"
 harness = false
 
+# 本番 launcher（ProductionLauncher）と実際の pasta を通した rootless の通し確認の実機前提の結合試験（NET-9・NET-3・CORE-1・SUP-2・#3331。依存は不変）。
+# holder と pasta を試験バイナリ自身の再実行で起動するため独自 main（harness = false）で `netns-holder` を振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "pasta_launch_rootless"
+path = "tests/pasta_launch_rootless.rs"
+harness = false
+
 # supervisor の bin の `netns-holder` 振り分けと、holder の起動の失敗・期限・回収の結合試験（NET-9・CORE-1・REPAIR-5・#3198）。
 # 同じ実行ファイルが holder の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
 # root・user namespace 不要で既定のテスト集合で実行する（試験専用の入口は exec-test-support の下。依存は不変）。

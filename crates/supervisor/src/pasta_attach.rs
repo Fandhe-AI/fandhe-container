@@ -35,7 +35,7 @@
 //! - **restart の再 launch**: 同じ launcher とフックを通る形（起動の経路を 1 つ）だが、本番 launcher の再 launch は
 //!   #2043 まで `FailedPrecondition` で拒否される。restart で動くことは本モジュールの時点では保証しない
 //! - SEC-4 の監査への記録（識別の不一致）は #3330、CLI の `--network` の受け口と start での D10 の再照合は #3329、
-//!   実機の通し確認は #3331
+//!   実機の通し確認は `tests/pasta_launch_rootless.rs`（#3331。実行と結果の記録は #341）
 //!
 //! Linux 専用（`lib.rs` で cfg）。エラーと構造化ログは固定語彙で、パス・argv・入力値を含めない（ERR-1）。
 

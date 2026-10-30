@@ -114,6 +114,7 @@ use super::{
     FailedAttachClaim, NetnsDirRecord, NetworkCreateError, NetworkDeleteReport, StaticIpam,
     host_owner_token, new_generation, ownership_token,
 };
+use crate::dns_helper::DnsName;
 use crate::dns_helper::upstream::{MAX_UPSTREAMS_PER_CONTAINER, UpstreamServer};
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
@@ -346,6 +347,10 @@ where
             "member already exists",
         )));
     }
+    // 名前は利用者が選ぶため、既存のメンバーの ID・名前と衝突する名前での接続を、意図記録とカーネル操作の前に断る
+    // （読み込み時の drop-both だけでは既存コンテナの名前解決が消える。NET-5・SEC-1・#3531）。
+    check_dns_names_free(member_id, spec.dns_name(), &members, &intents)
+        .map_err(RecordedError::Store)?;
     let mut ipam = rebuild_ipam(&realized, &members, &intents).map_err(RecordedError::Store)?;
     // 上限はカーネル操作の前に検査する（超過で確定記録だけ書けず生きたコンテナが残るのを防ぐ）。
     // 確定記録を書いた後、意図記録を消す前に落ちた窓では同じメンバーが両方に残る。整合性の検証
@@ -388,7 +393,7 @@ where
         Ok(att) => commit_attached(
             guard,
             member_id,
-            dns,
+            (dns, spec.dns_name()),
             &ipam,
             (address, &host_token),
             &realized,
@@ -414,13 +419,50 @@ where
     }
 }
 
+/// 新しいメンバーが DNS ヘルパーに登録される名前（ID の正規化名と `dns_name`）が、既存の名前と衝突しないことを確かめる。
+///
+/// 照合するのは「新しい名前 ↔ 既存の ID・名前」と「新しい ID ↔ 既存の名前」だけで、ID どうしの大文字小文字だけの
+/// 衝突は従来どおり受け付ける（読み込み時に両方を落とす。`dns_helper::load`）。既存側は確定記録の ID と名前、
+/// 意図記録の ID。違反は `AlreadyExists`（名前そのものはメッセージに載せない）。
+fn check_dns_names_free(
+    member_id: &MemberId,
+    dns_name: Option<&DnsName>,
+    members: &[MemberRecord],
+    intents: &[MemberIntent],
+) -> Result<(), NetError> {
+    let new_id_name = DnsName::new(member_id.as_str()).ok();
+    // 新しい名前の、既存の名前（ID の名前と記録の名前）との照合。ID の名前どうしだけは照合しない。
+    let clashes = |existing_id: Option<&DnsName>, existing_name: Option<&DnsName>| {
+        let by_name = dns_name.is_some_and(|n| {
+            existing_id.is_some_and(|e| e == n) || existing_name.is_some_and(|e| e == n)
+        });
+        let by_id = new_id_name
+            .as_ref()
+            .is_some_and(|n| existing_name.is_some_and(|e| e == n));
+        by_name || by_id
+    };
+    let clash = members
+        .iter()
+        .any(|m| clashes(DnsName::new(m.id().as_str()).ok().as_ref(), m.dns_name()))
+        || intents
+            .iter()
+            .any(|i| clashes(DnsName::new(i.id().as_str()).ok().as_ref(), None));
+    if clash {
+        return Err(NetError::new(
+            NetErrorCode::AlreadyExists,
+            "member dns name already in use",
+        ));
+    }
+    Ok(())
+}
+
 type AttachResult<N> =
     Result<AttachedContainer<N>, RecordedError<Box<ContainerAttachError>, AttachedContainer<N>>>;
 
 fn commit_attached<N>(
     guard: &NetworkLockGuard<'_>,
     member_id: &MemberId,
-    dns: &[IpAddr],
+    (dns, dns_name): (&[IpAddr], Option<&DnsName>),
     ipam: &StaticIpam,
     (address, host_token): (IpPrefix, &str),
     realized: &RealizedRecord,
@@ -469,6 +511,11 @@ fn commit_attached<N>(
         dns,
     )
     .and_then(|r| r.with_publishes(table_handle, recorded))
+    // コンテナ名があれば DNS ヘルパーが ID に加えて引けるよう記録する（NET-5・#3531）。
+    .map(|r| match dns_name {
+        Some(n) => r.with_dns_name(n.clone()),
+        None => r,
+    })
     // pin の識別子も控える（再起動後の記録だけからの detach が三者照合に使う。#3347）。
     .map(|r| match att.pin_identity {
         Some(pin) => r.with_pin(pin),
@@ -1742,6 +1789,142 @@ mod tests {
             again.unwrap_err().store_code(),
             Some(NetErrorCode::AlreadyExists)
         );
+    }
+
+    /// 名前つきの spec（NET-5・#3531）。
+    fn named_spec(ep: &str, dns_name: &str) -> ContainerAttachSpec {
+        spec(ep).with_dns_name(DnsName::new(dns_name).unwrap())
+    }
+
+    /// run が呼ばれたら失敗する代役（事前検査がカーネル操作の前に断ることの確認）。
+    fn never_run(
+        _: &mut StaticIpam,
+        _: &str,
+    ) -> Result<AttachedContainer<()>, ContainerAttachError> {
+        panic!("run must not be called when the dns name is taken");
+    }
+
+    /// NET-5・#3531: コンテナ名が確定記録に載る。
+    #[test]
+    fn net5_3531_attach_records_dns_name() {
+        let t = Tmp::new("dnsname-rec");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s = named_spec("c1", "Web");
+        attach_recorded_with(&host(), &n, &mid("c1"), &s, &[], live_table(42), ok_run(&s)).unwrap();
+        let members = n.members().unwrap();
+        assert_eq!(members[0].dns_name().map(DnsName::as_str), Some("web"));
+    }
+
+    /// NET-5・SEC-1・#3531: 既存メンバーの ID・名前、意図記録の ID と衝突する名前は、run も意図記録も作らず断る。
+    #[test]
+    fn net5_3531_attach_rejects_name_taken() {
+        let t = Tmp::new("dnsname-taken");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = named_spec("c1", "web");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
+        // 既存の名前 `web`・既存の ID `c1`（大文字小文字違い）を名乗る。
+        for (id, taken) in [("c2", "WEB"), ("c3", "C1")] {
+            let s = named_spec(id, taken);
+            let r = attach_recorded_with(&host(), &n, &mid(id), &s, &[], live_table(42), never_run);
+            assert_eq!(
+                r.unwrap_err().store_code(),
+                Some(NetErrorCode::AlreadyExists),
+                "{taken}"
+            );
+            assert_eq!(n.members().unwrap().len(), 1);
+            assert!(n.member_intents().unwrap().is_empty());
+        }
+        // 意図記録の ID と衝突する名前。
+        let intent = MemberIntent::new(
+            mid("pending"),
+            EndpointId::new("pending").unwrap(),
+            pfx([10, 0, 0, 9], 24),
+            &host_owner_token(BRIDGE_TOKEN, &EndpointId::new("pending").unwrap(), "g"),
+        )
+        .unwrap();
+        n.write_member_intent(&intent).unwrap();
+        let s = named_spec("c4", "pending");
+        let r = attach_recorded_with(&host(), &n, &mid("c4"), &s, &[], live_table(42), never_run);
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::AlreadyExists)
+        );
+        assert_eq!(n.member_intents().unwrap().len(), 1);
+    }
+
+    /// NET-5・SEC-1・#3531: 新しい ID が既存メンバーの名前と同じ正規化名なら断る（名前なしでも）。
+    #[test]
+    fn net5_3531_attach_rejects_id_taken_by_member_name() {
+        let t = Tmp::new("dnsname-idtaken");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = named_spec("c1", "c2");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("c1"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
+        let s2 = spec("c2");
+        let r = attach_recorded_with(&host(), &n, &mid("C2"), &s2, &[], live_table(42), never_run);
+        assert_eq!(
+            r.unwrap_err().store_code(),
+            Some(NetErrorCode::AlreadyExists)
+        );
+    }
+
+    /// NET-5・#3071・#3531: 名前を使わない ID どうしの大文字小文字だけの衝突は従来どおり受け付ける。
+    #[test]
+    fn net5_3531_attach_allows_case_only_id_collision_without_names() {
+        let t = Tmp::new("dnsname-idcase");
+        let store = setup(&t);
+        let g = store.lock_global_exclusive().unwrap();
+        let n = g.lock_network(&name()).unwrap();
+        realize(&n);
+        let s1 = spec("c1");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("Web"),
+            &s1,
+            &[],
+            live_table(42),
+            ok_run(&s1),
+        )
+        .unwrap();
+        let s2 = spec("c2");
+        attach_recorded_with(
+            &host(),
+            &n,
+            &mid("web"),
+            &s2,
+            &[],
+            live_table(42),
+            ok_run(&s2),
+        )
+        .unwrap();
+        assert_eq!(n.members().unwrap().len(), 2);
     }
 
     /// 取り残しつきの失敗: メンバー記録は無く、請求書が保存される。取り残しだけなら意図記録は消える。

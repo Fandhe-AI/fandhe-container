@@ -147,6 +147,8 @@ cat <<'EOF'
                                         run-in-user-scope.sh の自己テスト（#3486・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査をスタブで確認）
   test-bin-watchdog-selftest          scripts/test-bin-watchdog-selftest.sh
                                         試験バイナリ watchdog（.cargo/config.toml の runner）の自己テスト（#3504・REPAIR-5・REPAIR-12。期限切れ・終了コード・シグナルの透過。Linux のみ）
+  run-with-deadline-selftest          scripts/run-with-deadline-selftest.sh
+                                        run-with-deadline.sh の自己テスト（#3505・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査を実プロセスで確認）
   check-success-lines-selftest        scripts/check-success-lines-selftest.sh
                                         check-success-lines.sh の自己テスト（REPAIR-7・REPAIR-12・PLUG-12。ソース導出の期待行の照合・双方向照合・forbid の矛盾検査・fail-closed を fixture で確認）
   deny                                scripts/targets/deny.sh

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 委譲スコープ（systemd-run --user --scope -p Delegate=yes）で実機前提テストを全体期限つきで実行する補助（#3486・REPAIR-5・REPAIR-7）。
+# 兄弟の scripts/run-with-deadline.sh（scope を作らない版・#3505）と引数・終了コード・失敗行の契約を揃える（変えるときは両方）。
 # .github/workflows/ci.yml の platform-ci（ubuntu）の「委譲スコープで実行する実機前提テスト」ステップが呼ぶ。
 #
 # 背景: `systemd-run ... | tee` の形では、試験が別 cgroup / setsid の子孫に出力の書き込み端を残すと tee が EOF を受け取れず、

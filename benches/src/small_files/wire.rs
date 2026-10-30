@@ -162,17 +162,22 @@ fn run_with_socket_dir(
         send: io_max()?,
     };
     let (tx, rx) = mpsc::channel::<Result<FileServeReport, SmallFilesError>>();
-    let handle = std::thread::spawn(move || {
-        let outcome = match server.accept(accept_timeout, NoopServerObserver) {
-            Ok(mut conn) => Ok(serve_file_connection_with_limit(
-                &mut conn, batch, limits, &creator, timeouts,
-            )),
-            Err(e) => Err(from_io(&e)),
-        };
-        // ソケットファイルを先に片付けてから結果を返す。
-        drop(server);
-        let _ = tx.send(outcome);
-    });
+    let handle = std::thread::Builder::new()
+        .name("sf-wire-server".into())
+        .spawn(move || {
+            let outcome = match server.accept(accept_timeout, NoopServerObserver) {
+                Ok(mut conn) => Ok(serve_file_connection_with_limit(
+                    &mut conn, batch, limits, &creator, timeouts,
+                )),
+                Err(e) => Err(from_io(&e)),
+            };
+            // ソケットファイルを先に片付けてから結果を返す。
+            // Windows では UdsServer が Drop を持たない（UDS の wire 経路は Linux / macOS のみ実行）ため lint を許す。
+            #[allow(clippy::drop_non_drop)]
+            drop(server);
+            let _ = tx.send(outcome);
+        })
+        .map_err(|_| SmallFilesError::new("io-error", "failed to spawn the server thread"))?;
 
     let body = vec![
         b'f';

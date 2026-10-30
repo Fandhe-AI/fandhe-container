@@ -25,6 +25,27 @@ impl TestRoot {
         std::fs::create_dir(&p).expect("create test root");
         Self(p)
     }
+    /// ソケットの親用。sun_path の上限（wire.rs の 100 バイト）に収まるよう、
+    /// 短い接頭辞と短いルート（`/tmp` があればそれ）に置く。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn new_short() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = if Path::new("/tmp").is_dir() {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let p = base.join(format!(
+            "fsp-{}-{:x}",
+            std::process::id(),
+            nanos & 0xffff_ffff
+        ));
+        std::fs::create_dir(&p).expect("create short test root");
+        Self(p)
+    }
     fn path(&self) -> &Path {
         &self.0
     }
@@ -223,7 +244,7 @@ fn repair3_wire_cleanup_removes_socket_dir() {
         return;
     }
     let root = TestRoot::new("wire-cleanup");
-    let socket_parent = TestRoot::new("wire-sockparent");
+    let socket_parent = TestRoot::new_short();
     let trial = root.path().join("trial");
     std::fs::create_dir(&trial).unwrap();
     run_trial_in(

@@ -1645,6 +1645,8 @@ struct TimeoutRun {
     audit: Vec<(std::time::Instant, AuditRecord)>,
     tamper_placed_at: Option<std::time::Instant>,
     logs: Arc<PastaLogBuffer>,
+    /// 継ぎ目が戻った直後(作業スレッドの解放前)に logs に残っていた行。
+    logs_at_return: Vec<String>,
     calls: Vec<&'static str>,
     env: Env,
 }
@@ -1711,6 +1713,7 @@ fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
         &mut out,
     );
     let t_end = std::time::Instant::now();
+    let logs_at_return = logs.take();
     let _ = go_tx.send(());
     if let Some(h) = releaser {
         h.join().unwrap();
@@ -1728,6 +1731,7 @@ fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
         audit,
         tamper_placed_at,
         logs,
+        logs_at_return,
         calls: calls_of(&calls),
         env,
     }
@@ -1821,5 +1825,5 @@ fn repair5_3473_options_timeout_unreturned_worker_is_bounded_and_sends_no_audit(
         waited <= LATE_DRAIN_BUDGET + Duration::from_secs(2),
         "{waited:?}"
     );
-    assert!(r.logs.take().is_empty());
+    assert!(r.logs_at_return.is_empty(), "{:?}", r.logs_at_return);
 }

@@ -40,6 +40,8 @@ pub enum IoOpKind {
     Read,
     /// 書き込み（`writeback` の `BatchSink::write_batch` 経路で計装済み。TASK-84.7）。
     Write,
+    /// ファイル操作モードの作成（`file_serve` の `GuestFileCreator::create_file_inner`。#3163）。
+    Create,
 }
 
 impl IoOpKind {
@@ -48,6 +50,7 @@ impl IoOpKind {
         match self {
             IoOpKind::Read => "read",
             IoOpKind::Write => "write",
+            IoOpKind::Create => "create",
         }
     }
 }
@@ -221,12 +224,13 @@ mod tests {
     fn repair4_io_op_kind_as_str_is_stable() {
         assert_eq!(IoOpKind::Read.as_str(), "read");
         assert_eq!(IoOpKind::Write.as_str(), "write");
+        assert_eq!(IoOpKind::Create.as_str(), "create");
     }
 
     #[test]
     fn repair4_io_op_kind_names_fit_core_op_name_contract() {
         // core の OpName::new と同じ規則。io は core に依存できないため重複して固定する。
-        for kind in [IoOpKind::Read, IoOpKind::Write] {
+        for kind in [IoOpKind::Read, IoOpKind::Write, IoOpKind::Create] {
             let s = kind.as_str();
             assert!(!s.is_empty() && s.len() <= 64);
             assert!(

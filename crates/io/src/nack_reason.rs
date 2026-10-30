@@ -9,7 +9,7 @@
 //! - `crate::guest_files` の分類関数が `GuestFileCreator::create_file` の失敗を
 //!   この値へ写す（#3160）
 //! - Nack のワイヤー符号化・復号（`crate::payload`。#3161）は本型を再公開して使い、
-//!   `serve_file_connection` の観測（#3163）も同じ型を使う。値表は再定義しない
+//!   `serve_file_connection` の観測（`FileServeStats`。#3163）も同じ型を使う。値表は再定義しない
 //!
 //! # 契約
 //! 値は追加しても版を上げない。未知の値は [`NackReason::Other`] として受理し、

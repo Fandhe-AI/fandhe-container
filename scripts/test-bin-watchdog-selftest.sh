@@ -66,6 +66,14 @@ run "${D}=20" -- "${target}" bash -c 'exit 3'
 expect_eq exit3 3 "$(rc)"
 run "${D}=20" -- "${target}" bash -c 'exit 101'
 expect_eq exit101 101 "$(rc)"
+# 終了シグナルでない 128+N（SIGSTOP=147 等）は再送せず、そのままの終了コードで抜ける（止まり続けない）
+for n in 147 148 149 150 145 146; do
+  s0=$(date +%s)
+  run "${D}=20" -- "${target}" bash -c "exit ${n}"
+  e0=$(date +%s)
+  expect_eq "exit${n}" "${n}" "$(rc)"
+  [ $((e0 - s0)) -lt 5 ] || fail "exit${n}: took $((e0 - s0))s (wrapper stalled)"
+done
 
 # 3. シグナルの透過（perl の system は $? の下位 7 bit にシグナル番号を入れる）。core が cwd に出ないことも見る
 mkdir -p "${work}/cwd"

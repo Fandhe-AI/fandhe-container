@@ -211,12 +211,14 @@ stop_watchdog() {
 }
 
 # 128+N の終了状態を、同じシグナルで自分が死ぬことで cargo へ伝える。
+# 終了シグナルでないもの（CHLD・CONT・STOP・TSTP・TTIN・TTOU・URG・WINCH）は再送せず、そのままの終了コードで抜ける
+# （子の通常の終了コード 147 を SIGSTOP と誤解して自分を止めない）。
 reraise() {
   local status="$1" num
   if [ "${status}" -gt 128 ] && [ "${status}" -le 192 ]; then
     num=$((status - 128))
     case "${num}" in
-      17 | 18 | 23 | 28) exit "${status}" ;;
+      17 | 18 | 19 | 20 | 21 | 22 | 23 | 28) exit "${status}" ;;
     esac
     ulimit -c 0 2>/dev/null || true
     trap - "${num}" 2>/dev/null || true

@@ -97,6 +97,10 @@ trap 'exit 143' INT TERM
 
 : >"${log}"
 run_scope() {
+  # run_limited がこの関数を背景のコマンド子として起動するため、親の cleanup / INT / TERM の trap を引き継がない。
+  # 引き継ぐと子が finished=0 のまま scope_stop と RUN_LIMITED_DIR（期限切れの印）の削除を行い、
+  # 親が 124 でなく 143 を返す・残存警告が出ない（cleanup は親だけが実行する）。
+  trap - EXIT INT TERM
   systemd-run --user --scope --quiet -p Delegate=yes --unit="${unit}" -- "$@" >"${log}" 2>&1
 }
 

@@ -143,6 +143,8 @@ cat <<'EOF'
                                         Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
                                         repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合・委譲スコープモード・TEST_ENV の検証をスタブで確認。#2886）
+  run-in-user-scope-selftest          scripts/run-in-user-scope-selftest.sh
+                                        run-in-user-scope.sh の自己テスト（#3486・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査をスタブで確認）
   check-success-lines-selftest        scripts/check-success-lines-selftest.sh
                                         check-success-lines.sh の自己テスト（REPAIR-7・REPAIR-12・PLUG-12。ソース導出の期待行の照合・双方向照合・forbid の矛盾検査・fail-closed を fixture で確認）
   deny                                scripts/targets/deny.sh

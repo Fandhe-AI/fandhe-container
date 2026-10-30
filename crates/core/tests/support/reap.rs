@@ -138,6 +138,12 @@ pub(crate) enum KillOnce {
 const KILL_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 #[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
 const KILL_RETRY_TOTAL: Duration = Duration::from_secs(2);
+/// 外部の `kill(1)` プロセス自体が終わるまでの期限（REPAIR-5・#3483）。固定のまま残す。回収対象の子の期限
+/// ではなく、シグナルを送るだけで通常は数ミリ秒で終わるコマンドの上限であり、試験の作業量に応じて伸び縮み
+/// しない。作業期限のつまみ `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` に連動させると、すでに失敗している後始末の
+/// 経路が長くなるだけになる。期限切れのときの `kill` 子の回収は `reap_within()` を使う。
+#[allow(dead_code, reason = "取り込み元の試験や OS によっては使わない共有補助")]
+const KILL_CMD_WITHIN: Duration = Duration::from_secs(10);
 
 /// 1 回の結果の並びからグループ kill の最終結果を決める判定（REPAIR-5・REPAIR-12）。`once` を呼び、
 /// - `Sent` / `Gone` → `Ok`。
@@ -229,7 +235,7 @@ fn kill_once(pgid: u32) -> KillOnce {
                     continue;
                 }
             };
-            match wait_within(&mut child, Duration::from_secs(10)) {
+            match wait_within(&mut child, KILL_CMD_WITHIN) {
                 Ok(st) if st.success() => return KillOnce::Sent,
                 Ok(st) => {
                     // kill の stderr は 1 行程度。終了後に上限つきで読む。

@@ -62,6 +62,24 @@ on:
           - step-timeout
           - script-deadline
         default: none
+      scope-hang-probe:
+        description: >-
+          platform-ci（ubuntu）の委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5）。
+          scope-orphan-pipe = 現行の形（systemd-run | tee）で孫が出力の書き込み端を持ったまま残る /
+          scope-orphan-devnull = 同じだが孫の fd を /dev/null へ（早く戻れば原因は fd の保持）/
+          noscope-orphan-pipe = scope なしの同じ注入 / scope-main-hang = scope 内の主プロセスが眠る /
+          helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証。
+          どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
+          PR・push では存在しない（none 相当）
+        type: choice
+        options:
+          - none
+          - scope-orphan-pipe
+          - scope-orphan-devnull
+          - noscope-orphan-pipe
+          - scope-main-hang
+          - helper
+        default: none
       repeat-package:
         description: >-
           repeat-test と組で指定する Cargo パッケージ名（例: fandhe-container-supervisor）。間欠失敗の修正後に
@@ -465,6 +483,7 @@ jobs:
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
       # #1688: choice 入力も env 経由で受け渡す（run: へ ${{ }} を埋め込まない。HANG_PROBE と同じ対策）
       RECLAIM_HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.reclaim-hang-probe || 'none' }}
+      SCOPE_HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope-hang-probe || 'none' }}
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
       # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
       # 使う消費側は `crates/io/tests/responsiveness.rs` と
@@ -832,6 +851,53 @@ jobs:
           echo "reclaim hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
           exit 1
 
+      # 委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5。workflow_dispatch の scope-hang-probe 指定時のみ）。
+      # 実機前提ステップの形（systemd-run --user --scope ... | tee）に、孫が出力を持って残る等のハングを注入し、
+      # timeout-minutes が効くか・原因がどれか（fd の保持 / scope / 主プロセス）を切り分ける。helper は対策後の形が
+      # 期限内に失敗することの実証。戻った場合も false-green を防ぐため exit 1。新ジョブにしない（check-run 件数は不変）
+      - name: 委譲スコープ実行のハングプローブ（#3486。workflow_dispatch の scope-hang-probe 指定時のみ）
+        if: env.SCOPE_HANG_PROBE != 'none' && runner.os == 'Linux'
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          orphan='setsid sleep 3600 & exit 0'
+          sr="systemd-run --user --scope --quiet -p Delegate=yes"
+          pl="${RUNNER_TEMP}/scope-probe.log"
+          orphan_null='setsid sleep 3600 >/dev/null 2>&1 </dev/null & exit 0'
+          case "${SCOPE_HANG_PROBE}" in
+            scope-orphan-pipe)
+              ${sr} -- bash -c "${orphan}" 2>&1 | tee "${pl}"
+              ;;
+            scope-orphan-devnull)
+              ${sr} -- bash -c "${orphan_null}" 2>&1 | tee "${pl}"
+              ;;
+            noscope-orphan-pipe)
+              bash -c "${orphan}" 2>&1 | tee "${pl}"
+              ;;
+            scope-main-hang)
+              ${sr} -- sleep 3600 2>&1 | tee "${pl}"
+              ;;
+            helper)
+              scripts/run-in-user-scope.sh --name probe --deadline 60 --log "${RUNNER_TEMP}/scope-probe.log" -- \
+                bash -c 'setsid sleep 3600 & sleep 3600' 2>&1 | tee "${RUNNER_TEMP}/scope-probe-out.log"
+              if grep -q 'code=deadline_exceeded' "${RUNNER_TEMP}/scope-probe-out.log"; then
+                echo "::notice::scope probe: helper deadline fired (expected)"
+              fi
+              ;;
+            *)
+              echo "invalid scope-hang-probe: ${SCOPE_HANG_PROBE}" >&2
+              exit 1
+              ;;
+          esac
+          echo "scope hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
+          exit 1
+
+      - name: 委譲スコープ実行のハングプローブ（Linux 以外では実行しない）
+        if: env.SCOPE_HANG_PROBE != 'none' && runner.os != 'Linux'
+        run: |
+          echo "scope-hang-probe is linux only" >&2
+          exit 1
+
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
         timeout-minutes: 10
         env:
@@ -1039,6 +1105,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make repeat-test-selftest
+
+      # 委譲スコープ実行補助の自己テスト（#3486・REPAIR-5・REPAIR-12）。スタブの systemd-run / systemctl のみ。
+      # Linux のステップからしか呼ばれない補助（systemd の user manager 専用・setsid 使用）のため ubuntu のみ。
+      - name: 委譲スコープ実行補助の自己テスト（#3486。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make run-in-user-scope-selftest
 
       # 実機前提テストの成功行照合スクリプト（試験ソースから期待行を導出してログと双方向照合。#2768・REPAIR-12）の
       # 自己テスト。fixture のみ。既存ジョブのステップ（check-run 件数は不変）
@@ -1788,7 +1861,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/production_launcher.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${PL_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name production_launcher --deadline 540 --log "${log}" -- \
+              "${PL_BIN}" --ignored
           check() {
             scripts/check-success-lines.sh --name production_launcher \
               --src crates/core/tests/production_launcher.rs --log "${log}" \
@@ -1863,7 +1937,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/exec_subordinate_e2e.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${ESE_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name exec_subordinate_e2e --deadline 540 --log "${log}" -- \
+              "${ESE_BIN}" --ignored
           scripts/check-success-lines.sh --name exec_subordinate_e2e \
             --src crates/supervisor/tests/exec_subordinate_e2e.rs --log "${log}" \
             --select '^exec_subordinate_e2e: (scenario=|create, start and exec)' --subst root=false --min 5 \
@@ -1897,7 +1972,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/exec_launch_netns_rootless.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${ELNR_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name exec_launch_netns_rootless --deadline 540 --log "${log}" -- \
+              "${ELNR_BIN}" --ignored
           scripts/check-success-lines.sh --name exec_launch_netns_rootless \
             --src crates/supervisor/tests/exec_launch_netns_rootless.rs --log "${log}" \
             --select '^exec_launch_netns_rootless: (scenario=|rootless exec joined)' --subst root=false --min 5 \
@@ -2134,7 +2210,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/start_stop_delete_real.log"
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name start_stop_delete_real --deadline 540 --log "${log}" -- \
+              "${SSD_BIN}" --ignored
           # create の起動オプション・--cap-drop・state の 3 時点と kill TERM（#2761・#2833・#3097）・最終行を、ソースから導出して照合する
           # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_stop_delete_real: FAILED`。両方を禁止（#2957）
           scripts/check-success-lines.sh --name start_stop_delete_real \
@@ -2173,7 +2250,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/network_modes_real.log"
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${NMR_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name network_modes_real --deadline 540 --log "${log}" -- \
+              "${NMR_BIN}" --ignored
           # 成功行 5 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `network_modes_real: FAILED`
           scripts/check-success-lines.sh --name network_modes_real \
             --src crates/cli/tests/network_modes_real.rs \
@@ -2235,7 +2313,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/delete_cgroup_real.log"
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${DCR_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name delete_cgroup_real --deadline 540 --log "${log}" -- \
+              "${DCR_BIN}" --ignored
           scripts/check-success-lines.sh --name delete_cgroup_real \
             --src crates/cli/tests/delete_cgroup_real.rs \
             --log "${log}" --select '^delete_cgroup_real: cli delete removed' \
@@ -2250,7 +2329,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/start_recover_real.log"
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${SRR_BIN}" --ignored 2>&1 | tee "${log}"
+            scripts/run-in-user-scope.sh --name start_recover_real --deadline 540 --log "${log}" -- \
+              "${SRR_BIN}" --ignored
           scripts/check-success-lines.sh --name start_recover_real \
             --src crates/cli/tests/start_recover_real.rs \
             --log "${log}" --select '^start_recover_real: a second cli start' \
@@ -2314,14 +2394,15 @@ jobs:
 
       - name: container_grpc の実機前提試験 2 件の実行（--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818・#3225）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 30
+        # 全体期限 1860 秒 = timeout-minutes(32) × 60 - 60。2 試験の watchdog（各 900 秒）の和より後に効かせる（#3486・REPAIR-5）。
+        timeout-minutes: 32
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/production_binary_full_lifecycle_real.log"
           rc=0
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${PCRI_TEST_BIN}" \
-            --ignored --test-threads=1 2>&1 | tee "${log}" || rc=$?
+            scripts/run-in-user-scope.sh --name container_grpc --deadline 1860 --log "${log}" -- "${PCRI_TEST_BIN}" \
+            --ignored --test-threads=1 || rc=$?
           if [ "${rc}" -ne 0 ]; then
             # 事後診断: 試験の固定行（#2966）に加え、rate limit が原因ならここでも識別文言が出る。
             make --no-print-directory docker-hub-ratelimit-probe || true

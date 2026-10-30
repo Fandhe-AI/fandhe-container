@@ -704,7 +704,7 @@ struct PreparedOptions {
 ///
 /// 同時実行枠（プロセス共有）が期限まで空かなかったときは、何も実行していないので期限切れの `TIMEOUT` ではなく
 /// `RESOURCE_EXHAUSTED` を返す（ERR-2・REPAIR-4。#2834）。期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。
-fn run_options_io<T: Send + 'static>(
+pub(super) fn run_options_io<T: Send + 'static>(
     job: impl FnOnce() -> Result<T, TraitError> + Send + 'static,
 ) -> Result<T, TraitError> {
     use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};

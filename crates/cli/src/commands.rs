@@ -66,6 +66,7 @@ mod kill_signal;
 mod list_logs;
 mod net_recorder;
 mod network;
+mod network_refs;
 mod oci_recorder;
 mod ref_reconcile;
 // Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。

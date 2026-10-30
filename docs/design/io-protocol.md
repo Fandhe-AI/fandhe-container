@@ -63,7 +63,7 @@
 | `8` | `Nack` | 要求単位の失敗の通知（S→C。v2。#3161） |
 | `9..=255` | （未知値） | `INVALID_ARGUMENT` として拒否する |
 
-5〜8 は v2（#3161 で実装済み）。ペイロードのレイアウトは [F4](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886) と `crates/io/src/payload.rs` が定める。サーバー（#3163）とクライアントの型つき API（#3162）は未実装。
+5〜8 は v2（#3161 で実装済み）。ペイロードのレイアウトは [F4](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886) と `crates/io/src/payload.rs` が定める。クライアントの型つき API（#3162）は実装済み、サーバー（#3163）は未実装。
 
 ### エンコード例
 
@@ -383,7 +383,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
-- クライアント側の UDS `connect` と `PipelineClient` との本番結合（設計は確定済み・未実装。[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・実装は #3165・#3162）
+- クライアント側の UDS `connect` と `PipelineClient` との本番結合（設計は確定済み・未実装。[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・実装は #3165。`PipelineClient` の型つき API と Nack の受信は #3162 で実装済み）
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み
@@ -394,7 +394,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -448,7 +448,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 - 表現はゲスト相対パス。区切りは `/`、UTF-8 必須
 - 構文の上限（新設の定数）: `MAX_GUEST_PATH_BYTES` = 4096（既存）、`MAX_GUEST_PATH_COMPONENTS` = 256、`MAX_GUEST_NAME_BYTES` = 255
 - 構文規則は新設の newtype `GuestPath` に 1 か所で集める（REPAIR-2）。拒否するもの: NUL、先頭の `/`（絶対パス）、空のコンポーネント、`.`・`..`、`\` と `:`（`guest_files.rs` の既存規則を移す）、上限超過。`GuestPath` は client・payload・`GuestFileCreator::create_file` の 3 者が同じ関数で検証する
-- 状態: `GuestPath` と 3 定数は #3159 で実装済み（`crates/io/src/guest_path.rs`）。`create_file` が利用中で、payload の復号は長さと UTF-8 だけを見て構文を検証しない（#3161）。client からの利用は #3162
+- 状態: `GuestPath` と 3 定数は #3159 で実装済み（`crates/io/src/guest_path.rs`）。`create_file` が利用中で、payload の復号は長さと UTF-8 だけを見て構文を検証しない（#3161）。client からの利用（`PipelineClient::create`）は #3162 で実装済み
 - 検証の層
   - 復号時（純関数・OS 非依存）: 長さと UTF-8 だけを見る。違反はフレーム構造の違反として接続全体を失効させる
   - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
@@ -583,7 +583,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3159 | `GuestPath` の切り出し（IO-5・REPAIR-2） | #1886。実装済み（`crates/io/src/guest_path.rs`） |
 | #3160 | ホストパス長の検査（IO-5） | #3159。実装済み（`crates/io/src/guest_files.rs`・`crates/io/src/nack_reason.rs`） |
 | #3161 | v2 の符号化と復号（IO-1・REPAIR-2。BREAKING CHANGE） | #3159 |
-| #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4） | #3161 |
+| #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4）。実装済み | #3161 |
 | #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |
 | #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163 |
 | #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5） | #3161 |

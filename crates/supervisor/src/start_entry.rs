@@ -3124,7 +3124,7 @@ mod linux {
     ///
     /// 再検証(パスの辿り直し → 識別の照合 → `--version`)は作業スレッドの中で行い、期限は 2c の待ちに含まれる。
     /// 通ったバイナリだけを options に持たせる(exec に使えるのはこれだけ)。失敗は固定文言のまま返し、手順 4 が
-    /// cgroup に触れる前に止める。結果は `pasta_verify` として遅延バッファへ積む(監査への記録は #3330)。
+    /// cgroup に触れる前に止める。結果は `pasta_verify` として遅延バッファへ積む(改ざんの疑いの印は `PastaLogBuffer::set_tamper` に置き、監査への配送は入口の `record_pasta_tamper` が行う。#3330 で実装済み)。
     fn options_with_verified_pasta(
         doc: &crate::container_options::document::ContainerOptionsDocument,
         id: &ContainerId,

@@ -66,9 +66,9 @@
 
 クライアント側では、`recv_ack` が送信順（FIFO）で照合するため、FLUSH ACK はそれ以前の書き込みの通常 ACK をすべて受け取った後に届く。`PipelineClient::flush` が返す `FlushBarrier` と `FlushAck::barrier()` を突き合わせ、待っていたバリアの ACK かを確認する。
 
-### ファイル操作接続での ACK・Nack・FLUSH ACK（設計確定・未実装）
+### ファイル操作接続での ACK・Nack・FLUSH ACK（設計確定・クライアント側は実装済み・サーバー側は未実装）
 
-ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`）を受けるファイル操作接続は設計が確定しているが、未実装である（#1886・実装は #3158 配下。REPAIR-3）。設計の詳細は [io-protocol.md](../design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節を参照。この接続での契約は次のとおり。
+ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`）を受けるファイル操作接続は設計が確定している。クライアント側（`PipelineClient::create`・`write_file`・`close` と、`recv_ack` による Nack の `AckReceipt::Rejected` としての受信）は #3162 で実装済みで、サーバー側（#3163）・UDS `connect`（#3165）・FLUSH の多ファイル化（#3164）は未実装である（#1886・実装は #3158 配下。REPAIR-3）。設計の詳細は [io-protocol.md](../design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節を参照。この接続での契約は次のとおり。
 
 - 通常 ACK は従来と同じ「バッファリング時点」の保証で、永続化は保証しない。Create の ACK はファイルが名前空間に存在することまでを表す
 - 失敗した要求には `Nack`（code と reason の数値のみ。ホストのパスは返さない）が返り、接続は続く。Nack された要求は効果を持たない
@@ -141,8 +141,8 @@ loop {
 
 - クライアント側での滞留量計測・自動 Flush 送出、`--unflushed-max-*` の CLI / TOML 配線（TASK-79・TASK-82）
 - クラッシュ安全性テスト（TASK-18）
-- クライアント側の UDS `connect` と `PipelineClient` の本番結合（設計確定済み。実装は #3165・#3162）
-- ファイル操作要求のワイヤー形式とファイル操作接続（設計確定済み。実装は #3161・#3163・#3164）
+- クライアント側の UDS `connect` と `PipelineClient` の本番結合（設計確定済み。実装は #3165。型つき API は #3162 で実装済み）
+- ファイル操作接続のサーバー側と FLUSH の多ファイル化（設計確定済み。実装は #3163・#3164。ワイヤー形式は #3161、クライアント側は #3162 で実装済み）
 - named pipe のトランスポート（範囲外。設計節 F12）
 - 電源断への耐性の検証（方式の判断記録: [io-power-loss-verification.md](../design/io-power-loss-verification.md)。オーナー承認待ち）
 

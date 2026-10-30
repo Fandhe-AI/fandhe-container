@@ -145,9 +145,6 @@ pub struct PastaLogBuffer {
     /// 手順 2c の再検証が見つけた改ざんの疑い(作業スレッドが置き、単一スレッドの入口が取り出して監査へ配送する。
     /// SEC-4・#3330。作業スレッドは監査の `FileAuditSink`〔fork 隔離〕を使えないため、記録は入口に任せる)。
     tamper: Mutex<Option<fandhe_container_core::audit_log::PastaVerifyRejection>>,
-    /// 2c の待ちが期限切れで、作業スレッドを join できないまま進んだ印。報告後に有界で回収する要否の判断と、
-    /// 試験の照合に使う(回収の本体は `start_entry` の `UnjoinedOptionsWorker::drain`。SEC-4・REPAIR-5・#3431)。
-    worker_unjoined: std::sync::atomic::AtomicBool,
     /// 2c の作業スレッドが pasta の再検証に入った印(記録があるときだけ立つ)。期限超過の行の `stage` を決める(#3431)。
     verify_started: std::sync::atomic::AtomicBool,
 }
@@ -172,12 +169,6 @@ impl PastaLogBuffer {
         g.get_or_insert(rejection);
     }
 
-    /// 作業スレッドを join できないまま進んだことを記す。
-    pub fn mark_worker_unjoined(&self) {
-        self.worker_unjoined
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// 再検証(pasta の記録がある場合)に入ったことを記す。
     pub fn mark_verify_started(&self) {
         self.verify_started
@@ -187,12 +178,6 @@ impl PastaLogBuffer {
     /// 再検証に入ったか。
     pub fn verify_started(&self) -> bool {
         self.verify_started
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// 作業スレッドを join できていないか。
-    pub fn worker_unjoined(&self) -> bool {
-        self.worker_unjoined
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

@@ -969,6 +969,8 @@ mod linux {
             println!("pasta_launch_rootless: FAILED: invalid --scenario arguments");
             return ExitCode::from(1);
         };
+        // 子の scratch ルートは正常終了・失敗の両方で自分で消す（SIGKILL 時は親の `reclaim_scenario` が回収）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let _landlock = crate::precondition::landlock_support();
         let delegated = crate::precondition::delegated_cgroup();
         scenario(&delegated, kind, subordinate, tag, sequence);
@@ -1120,6 +1122,7 @@ mod linux {
         }
 
         let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
+        reclaim_child_scratch_selfcheck();
         let tag = std::process::id();
         let mut sequence = 0u32;
         let mut models = vec![false];
@@ -1177,6 +1180,51 @@ mod linux {
         cmd
     }
 
+    /// 子プロセスが作った scratch ルート（`fandhe-plr-scratch-<子の pid>-*`）の下の `prefix` 前方一致の作業領域を
+    /// 消し、空になったルートも消す。自プロセスのルートは対象外（親の別の作業領域を壊さない）。子が SIGKILL
+    /// されると `ScratchRootCleanup` が走らないため、親が tag・sequence で特定して回収する（REPAIR-5・REPAIR-12）。
+    fn reclaim_child_scratch(temp: &Path, prefix: &str) {
+        let own = super::scratch_root::scratch_root("fandhe-plr-scratch", timeout()).to_path_buf();
+        for root in std::fs::read_dir(temp).into_iter().flatten().flatten() {
+            let path = root.path();
+            if path == own
+                || !root
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fandhe-plr-scratch-")
+            {
+                continue;
+            }
+            let mut removed = false;
+            for e in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with(prefix) {
+                    removed |= std::fs::remove_dir_all(e.path()).is_ok();
+                }
+            }
+            if removed {
+                // 空のときだけ消える（他のシナリオの領域が残っていれば消さない）。
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+
+    /// `reclaim_child_scratch` の自己確認。子の pid 入りのルートを模した領域が、一致する作業領域だけ回収され、
+    /// 一致しない領域は残ることを具体的なパスで確かめる。
+    fn reclaim_child_scratch_selfcheck() {
+        let guard = super::scratch_root::ScratchDir::new("fandhe-plr-selfcheck", timeout());
+        let fake_root = guard.path().join("fandhe-plr-scratch-999999-1");
+        let hit = fake_root.join("fandhe-plr-t1-s1-work");
+        let keep = fake_root.join("fandhe-plr-t1-s2-work");
+        std::fs::create_dir_all(&hit).expect("create hit dir");
+        std::fs::create_dir_all(&keep).expect("create keep dir");
+        reclaim_child_scratch(guard.path(), "fandhe-plr-t1-s1-");
+        assert!(!hit.exists(), "matching child work dir must be reclaimed");
+        assert!(keep.exists(), "non-matching work dir must stay");
+        assert!(fake_root.exists(), "non-empty child root must stay");
+        reclaim_child_scratch(guard.path(), "fandhe-plr-t1-s2-");
+        assert!(!fake_root.exists(), "emptied child root must be removed");
+    }
+
     /// 期限超過・失敗時の回収（REPAIR-5 と資源回収の両立）。直接の子だけでなく scope 全体（起動途中で止まった
     /// pid1・pasta・holder などの子孫）を SIGKILL して消滅を確認し、親側から一時領域も消す。
     fn reclaim_scenario(child: &mut std::process::Child, tag: u32, sequence: u32) {
@@ -1215,20 +1263,18 @@ mod linux {
         }
         // 一時領域: 子の TempDir は Drop されないため、tag と sequence の前方一致で回収する。
         let prefix = format!("fandhe-plr-t{tag}-s{sequence}-");
-        let roots = [
-            super::scratch_root::scratch_root("fandhe-plr-scratch", timeout()).to_path_buf(),
-            xdg_runtime_dir(),
-        ];
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for e in entries.flatten() {
-                if e.file_name().to_string_lossy().starts_with(&prefix) {
-                    let _ = std::fs::remove_dir_all(e.path());
-                }
+        for e in std::fs::read_dir(xdg_runtime_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(e.path());
             }
         }
+        // 子は再実行された別プロセスで、自分の pid 入りの scratch ルートを作る（親の `scratch_root()` とは別）。
+        let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        reclaim_child_scratch(&temp, &prefix);
         assert!(gone, "scenario scope {unit} must disappear after SIGKILL");
     }
 

@@ -7,9 +7,9 @@
 //! - ヘルパー側（段 2）: 起動時に bind し、`Reload{generation}` を受けたらメンバー記録（`members/<id>`）を読み直して
 //!   レジストリを一括に差し替え、`Loaded{generation}` を返す。`Stop` を受けたら停止フラグを立てる。
 //!   接続してきた相手の uid を `SO_PEERCRED` で照合し、実効 uid と違えばフレームを読まずに切断する（PLUG-12）
-//! - 送り手側: 記録を書いた側（`network::recorded` の attach）が [`reload_dns_helper`] で `Reload` を送り、`Loaded` を
+//! - 送り手側: 記録を書いた側（`network::recorded` の attach）が `reload_dns_helper` で `Reload` を送り、`Loaded` を
 //!   [`DNS_RELOAD_ACK_TIMEOUT`]（2 秒。D15）まで待つ。来なければ attach を失敗にする。停止は
-//!   [`ControlStopRequest`] が `DnsHelperStopRequest` として `stop_recorded_dns_helper` に渡る
+//!   `ControlStopRequest` が `DnsHelperStopRequest` として `stop_recorded_dns_helper` に渡る
 //! - 呼び出し元の配線（0→1 の起動・1→0 の停止の呼び出し）は #3074・#3075。上流転送（`--dns`）は #3072
 //!
 //! # 構成

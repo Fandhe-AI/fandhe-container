@@ -136,7 +136,7 @@ impl HelperProcessOps for PidfdOps<'_> {
 /// 記録のヘルパーを停止する（ネットワークの排他ロックを持って呼ぶ）。
 ///
 /// 記録の pid から pidfd を先に取り、開始時刻と boot id を照合する。別のプロセスなら何も送らず記録を古いものとして
-/// 消す（[`StopOutcome::StaleRecord`]）。同一なら停止要求 → 猶予 → pidfd へ SIGKILL の順に進める。SIGKILL の後も
+/// 消す（制御 socket は終了を確認できないので保持する。[`StopOutcome::StaleRecord`]）。同一なら停止要求 → 猶予 → pidfd へ SIGKILL の順に進める。SIGKILL の後も
 /// 終了しなければ `Timeout` を返して記録を残す（次の操作で再試行できる）。`pidfd_open` が使えないカーネルでは
 /// 記録を残して `Unimplemented`。
 pub fn stop_recorded_dns_helper(
@@ -172,8 +172,9 @@ fn stop_inner(
     match verify_pidfd_target(pidfd.as_fd(), record.identity())? {
         Verify::Same => {}
         Verify::Different => {
-            // pid が別のプロセスに再利用されている。socket は元のヘルパーのもの（死んでいる）なので片付ける。
-            guard.remove_dns_control_socket()?;
+            // pid が別のプロセスに再利用されている。ただし同一性の不一致は記録の古さしか示さず、元のヘルパーの
+            // listener が死んだ根拠にならない（開始時刻の違う記録を渡されただけで生きたヘルパーの socket を
+            // 消すと Reload / Stop が届かなくなる）。終了を確認できないので制御 socket は消さず保持する。
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::StaleRecord);
         }

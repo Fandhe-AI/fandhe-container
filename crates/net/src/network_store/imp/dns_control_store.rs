@@ -32,6 +32,11 @@ use crate::sys;
 /// 制御 UDS のファイル名（ネットワークのディレクトリ直下）。
 pub const CONTROL_SOCKET_FILE: &str = crate::dns_helper::control::CONTROL_SOCKET_NAME;
 
+/// 認証拒否の監査記録のファイル名（ネットワークのディレクトリ直下）。
+pub(crate) const CONTROL_AUDIT_FILE: &str = "dns.audit";
+/// 監査記録ファイルの上限（超えたら追記しない）。
+pub(crate) const CONTROL_AUDIT_MAX_BYTES: u64 = 64 * 1024;
+
 impl Dir {
     /// 制御ソケットの経路（この `Dir` の fd 起点）。
     fn control_path(&self) -> PathBuf {
@@ -87,6 +92,28 @@ impl NetworkDir {
         )
         .map_err(|e| map_io(&e, "failed to set dns control socket mode"))?;
         self.dir.check_control_socket()
+    }
+
+    /// 制御 UDS の認証拒否（別 uid の接続）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限
+    /// [`CONTROL_AUDIT_MAX_BYTES`]）へ 1 行の構造化記録として残す（SEC-4・PLUG-12）。detach 起動のヘルパーは
+    /// stderr が捨てられるため、stderr だけでは記録が消える。上限に達したら書かない（無制限の増加を防ぐ）。
+    /// 記録の失敗は接続の拒否を妨げない（呼び出し側は結果を無視してよい）。
+    pub(crate) fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut f = self
+            .dir
+            .open_regular(CONTROL_AUDIT_FILE, true, CONTROL_AUDIT_MAX_BYTES * 2)?;
+        let len = f
+            .seek(SeekFrom::End(0))
+            .map_err(|e| map_io(&e, "failed to seek dns control audit"))?;
+        if len >= CONTROL_AUDIT_MAX_BYTES {
+            return Ok(());
+        }
+        let mut rec = line.trim_end().replace(['\n', '\r'], " ");
+        rec.truncate(512);
+        rec.push('\n');
+        f.write_all(rec.as_bytes())
+            .map_err(|e| map_io(&e, "failed to write dns control audit"))
     }
 
     /// 確定したメンバー記録を ID 順に読む（ロックを取らない。モジュール doc の前提を満たす呼び出し元に限る）。

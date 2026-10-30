@@ -117,6 +117,8 @@ fn load_into(dir: &NetworkDir, registry: &DnsRegistry) -> Result<(), NetError> {
 pub(crate) struct ControlServer {
     listener: UnixListener,
     expected_uid: u32,
+    /// 認証拒否の監査記録の置き場（本番はネットワークのディレクトリ。無ければ stderr のみ）。
+    audit_dir: Option<Arc<NetworkDir>>,
 }
 
 impl ControlServer {
@@ -131,7 +133,14 @@ impl ControlServer {
         Ok(Self {
             listener,
             expected_uid,
+            audit_dir: None,
         })
+    }
+
+    /// 認証拒否を `dns.audit` へも残す（SEC-4。detach 起動では stderr が捨てられるため）。
+    pub(crate) fn with_audit_dir(mut self, dir: Arc<NetworkDir>) -> Self {
+        self.audit_dir = Some(dir);
+        self
     }
 
     /// `stop` が立つまで接続を受ける。`Reload` では `on_reload` を呼んで `Loaded` / `Error` を返し、`Stop` では
@@ -197,6 +206,12 @@ impl ControlServer {
         };
         if authorize_peer(uid, self.expected_uid).is_err() {
             let _ = writeln!(io::stderr(), "dns control peer_uid_mismatch");
+            if let Some(dir) = &self.audit_dir {
+                let _ = dir.append_control_audit(&format!(
+                    "event=dns_control_peer_uid_mismatch peer_uid={uid} expected_uid={}",
+                    self.expected_uid
+                ));
+            }
             return;
         }
         let mut reader = DeadlineReader {
@@ -249,9 +264,11 @@ pub(crate) fn prepare_helper_control(
     let listener = bind_control(&dir)?;
     let registry = Arc::new(DnsRegistry::new());
     load_into(&dir, &registry)?;
-    let control = ControlServer::new(listener, sys::effective_uid())?;
+    let dir = Arc::new(dir);
+    let control =
+        ControlServer::new(listener, sys::effective_uid())?.with_audit_dir(Arc::clone(&dir));
     Ok(HelperControl {
-        dir: Arc::new(dir),
+        dir,
         registry,
         control,
     })
@@ -266,11 +283,15 @@ impl HelperControl {
         let registry = Arc::clone(&self.registry);
         let reload = move || load_into(&dir, &registry);
         thread::scope(|scope| {
-            let control = scope.spawn(|| {
-                let r = self.control.run(&stop, &reload);
-                stop.store(true, Ordering::Relaxed);
-                r
-            });
+            // スレッド生成の失敗は panic でなく構造化エラーで返す（READY の後でも NetError で終われる）。
+            let control = thread::Builder::new()
+                .name("dns-control".into())
+                .spawn_scoped(scope, || {
+                    let r = self.control.run(&stop, &reload);
+                    stop.store(true, Ordering::Relaxed);
+                    r
+                })
+                .map_err(|_| err(NetErrorCode::Internal, "cannot spawn dns control thread"))?;
             let served = server.serve(&handler, &stop);
             stop.store(true, Ordering::Relaxed);
             let controlled = control.join().unwrap_or_else(|_| {
@@ -631,6 +652,14 @@ mod tests {
         }
     }
 
+    /// 読み取りの結果が切断（EOF 以外では接続リセット・破損パイプ）か。`WouldBlock`・`TimedOut` は含めない。
+    fn is_disconnect(e: &io::Error) -> bool {
+        matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+        )
+    }
+
     /// PLUG-12・NET-5・#3071: 別 uid の接続は、フレームを読まずに切断される（`Loaded` も `Error` も返らず、
     /// 再読込は走らない）。
     #[test]
@@ -647,8 +676,10 @@ mod tests {
         let mut r = &c;
         // 読み取りは EOF（0 バイト）か ECONNRESET。いずれにせよフレームは返らない。
         match r.read(&mut buf) {
-            Ok(0) | Err(_) => {}
+            Ok(0) => {}
+            Err(e) if is_disconnect(&e) => {}
             Ok(n) => panic!("unexpected {n} bytes"),
+            Err(e) => panic!("read was not a disconnect: {e:?}"),
         }
         assert_eq!(s.reloads.load(Ordering::SeqCst), 0);
         s.stop.store(true, Ordering::SeqCst);
@@ -700,7 +731,11 @@ mod tests {
             c.set_read_timeout(Some(Duration::from_secs(2))).expect("t");
             let mut buf = [0u8; 1];
             let mut r = &c;
-            assert!(matches!(r.read(&mut buf), Ok(0) | Err(_)));
+            match r.read(&mut buf) {
+                Ok(0) => {}
+                Err(e) if is_disconnect(&e) => {}
+                other => panic!("expected a disconnect: {other:?}"),
+            }
         }
         let c = connect(&s.path);
         reload_over(&c, gen_(3), Duration::from_secs(2)).expect("still serving");

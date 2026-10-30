@@ -678,6 +678,7 @@ impl NetworkStore {
             if items.iter().any(|i| {
                 i != DEFINITION_FILE
                     && i != LOCK_FILE
+                    && i != dns_control_store::CONTROL_AUDIT_FILE
                     && !matches!(records::is_empty_known_dir(&n.dir, i), Ok(true))
             }) {
                 return Err(err(
@@ -706,6 +707,7 @@ fn remove_tree(parent: &Dir, name: &str) {
     if let Ok(sub) = parent.open_subdir(name) {
         let _ = fs::remove_file(sub.path(DEFINITION_FILE));
         let _ = fs::remove_file(sub.path(LOCK_FILE));
+        let _ = fs::remove_file(sub.path(dns_control_store::CONTROL_AUDIT_FILE));
         records::remove_known_dirs(&sub);
     }
     let _ = fs::remove_dir(parent.path(name));

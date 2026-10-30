@@ -943,12 +943,14 @@ pub fn foreign_uid(exe: &Path) {
         .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
         .unwrap_or_default();
     let is_root = uid_line.split_whitespace().nth(2) == Some("0");
-    let have_setpriv = Command::new("setpriv")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let have_setpriv = crate::reap::run_within(
+        Command::new("setpriv")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        crate::reap::reap_within(),
+    )
+    .is_ok_and(|s| s.success());
     if !is_root || !have_setpriv {
         println!(
             "dns_helper_process: control_foreign_uid ignored (needs root and setpriv: root={is_root} setpriv={have_setpriv})"
@@ -974,9 +976,35 @@ pub fn foreign_uid(exe: &Path) {
         .spawn()
         .expect("spawn child");
     let mut stdin = child.stdin.take().expect("stdin");
-    let mut out = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    out.read_line(&mut line).expect("child ready");
+    // 子の標準出力は読み手スレッド経由で受け、待ちには期限を付ける（REPAIR-5）。期限切れは子とヘルパーを回収して失敗。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let child_out = child.stdout.take().expect("stdout");
+    std::thread::spawn(move || {
+        let mut out = BufReader::new(child_out);
+        loop {
+            let mut l = String::new();
+            match out.read_line(&mut l) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if tx.send(l).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let within = crate::reap::reap_within();
+    let recv_line = |child: &mut std::process::Child, what: &str| -> String {
+        match rx.recv_timeout(within) {
+            Ok(l) => l,
+            Err(e) => {
+                kill_helpers_under(&tmp.0);
+                crate::reap::reap_or_report(child, within);
+                panic!("no {what} line from the foreign-uid child within {within:?}: {e}");
+            }
+        }
+    };
+    let line = recv_line(&mut child, "CHILD-READY");
     assert_eq!(line.trim(), "CHILD-READY", "child did not start the helper");
 
     // root は DAC を越えて接続できるが、ヘルパーは uid 不一致として読まずに切断する。
@@ -991,9 +1019,20 @@ pub fn foreign_uid(exe: &Path) {
     .write_to(&mut w);
     let mut r = &raw;
     let mut one = [0u8; 1];
+    // 許すのは EOF と接続の切断だけ。WouldBlock / TimedOut（読み取り期限切れ）は切断されなかった証拠なので失敗（PLUG-12）。
     match r.read(&mut one) {
-        Ok(0) | Err(_) => {}
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
         Ok(_) => panic!("a foreign uid must not receive any frame"),
+        Err(e) => {
+            kill_helpers_under(&tmp.0);
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign uid read was not a disconnect: {e:?}");
+        }
     }
     drop(raw);
 
@@ -1001,13 +1040,45 @@ pub fn foreign_uid(exe: &Path) {
     std::io::Write::write_all(&mut stdin, b"go\n").expect("go");
     drop(stdin);
     for want in ["CHILD-RELOADED", "CHILD-STOPPED"] {
-        line.clear();
-        out.read_line(&mut line).expect("child progress");
+        let line = recv_line(&mut child, want);
         assert_eq!(line.trim(), want);
     }
-    let status = child.wait().expect("child exit");
+    let status = match crate::reap::wait_within(&mut child, within) {
+        Ok(st) => st,
+        Err(e) => {
+            kill_helpers_under(&tmp.0);
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign-uid child did not exit: {e}");
+        }
+    };
     assert!(status.success(), "child failed: {status:?}");
     println!("dns_helper_process: control_foreign_uid ok peer_uid=65534 foreign=dropped");
+}
+
+/// 状態ルート `root` を引数に持つ残存プロセス（`foreign_uid` の子が起こしたヘルパー）を `/proc` から探して
+/// `kill -KILL` する（期限切れ時の回収。外部 `kill` は期限つき実行）。
+fn kill_helpers_under(root: &Path) {
+    let needle = root.to_string_lossy().into_owned();
+    let me = std::process::id();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&raw).contains(&needle) {
+            let mut kill = Command::new("kill");
+            kill.args(["-KILL", &pid.to_string()]);
+            let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+        }
+    }
 }
 
 /// `foreign_uid` の子の引数。

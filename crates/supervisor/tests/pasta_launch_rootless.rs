@@ -893,7 +893,8 @@ mod linux {
             }),
             "the published loopback port must reach the container listener"
         );
-        // 陰性対照: loopback 以外のアドレスの同じポートは接続拒否になる。
+        // 陰性対照: loopback 以外のアドレスの同じポートへは接続できない。
+        // ファイアウォールが DROP する環境では拒否でなく timeout になるため、それも不達として許容する。
         match non_loopback_addr() {
             Some(nl) => {
                 let e = TcpStream::connect_timeout(
@@ -901,8 +902,16 @@ mod linux {
                     Duration::from_secs(2),
                 );
                 assert!(
-                    matches!(&e, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
-                    "non-loopback connect must be refused: {:?}",
+                    matches!(
+                        &e,
+                        Err(e) if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                        )
+                    ),
+                    "non-loopback connect must not succeed (refused or dropped): {:?}",
                     e.as_ref()
                         .map(|_| "connected")
                         .map_err(std::io::Error::kind)

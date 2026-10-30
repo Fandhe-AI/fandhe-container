@@ -159,7 +159,7 @@ on:
         description: >-
           repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
           CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
-          ステップ全体は 55 分で打ち切られる（ジョブ上限 60 分）ため、遅い試験は repeat-count を分けて dispatch する
+          ステップ全体は 55 分で打ち切られる（ジョブ上限 60 分。繰り返しの dispatch では ubuntu も 60 分。#3505）ため、遅い試験は repeat-count を分けて dispatch する
         type: string
         default: '600'
       repeat-count:
@@ -368,7 +368,7 @@ jobs:
   # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
   # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
   #
-  # タイムアウトは二段構え: ジョブ全体 60 分（統合前の 2 ジョブ各 30 分の合計に見合う
+  # タイムアウトは二段構え: ジョブ全体 60 分（ubuntu は 35 分。#3505。下の timeout-minutes 参照。
   # 多層防御）、実行ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
   # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
   # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。main の 3 OS 実行
@@ -464,9 +464,23 @@ jobs:
           && '["ubuntu-latest"]'
           || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
-    # ハングしたジョブの無期限実行を防ぐ多層防御（統合前の 2 ジョブ各 30 分の合計に見合う値）。
-    # 実測（2026-10-10 時点）は統合前の 2 ジョブの合計で ubuntu 約 8 分・macOS 約 6 分
-    timeout-minutes: 60
+    # ハングしたジョブの無期限実行を防ぐ多層防御。ubuntu は 35 分、macOS・Windows は 60 分（#3505）。
+    # ubuntu ではランナー VM ごと止まる間欠事象があり、止まるとステップの timeout-minutes が効かず
+    # ジョブ上限まで動き続けて PR の CI を詰まらせるため、ubuntu だけ上限を下げる。成功した ubuntu の
+    # ジョブは 20〜26 分（2026-10-30 時点の直近 110 件）で、35 分なら約 9 分の余裕がある。
+    # 例外として、workflow_dispatch で繰り返し（repeat-test・repeat-test-bin・repeat-user-scope）か
+    # ハングプローブ（hang-probe・reclaim-hang-probe・scope-hang-probe）を指定したときは ubuntu も 60 分を
+    # 保つ（繰り返しのステップは 30 分・55 分で、プローブは止まり方の観測が従来の上限を前提にするため）。
+    # job の timeout-minutes では runner コンテキストを使えないため matrix.os で判定する。inputs は
+    # workflow_dispatch 以外で null になり `null != 'none'` が真になるため、github.event_name で先に絞る。
+    # 代償: ubuntu の最後の container_grpc のステップ（開始は約 21〜25 分、試験の watchdog 各 900 秒、
+    # 補助の期限 1860 秒）がハングすると、watchdog・補助より先にジョブの上限で取り消される
+    timeout-minutes: >-
+      ${{ matrix.os == 'ubuntu-latest'
+      && !(github.event_name == 'workflow_dispatch'
+      && (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope
+      || inputs.hang-probe || inputs.reclaim-hang-probe != 'none' || inputs.scope-hang-probe != 'none'))
+      && 35 || 60 }}
     permissions:
       contents: read
     defaults:
@@ -963,9 +977,10 @@ jobs:
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
         # 本ステップだけ timeout-minutes 10（他の自己テストは 5。#3238）。Windows の Git Bash はプロセス生成が遅く、
-        # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限 60 分の範囲内
+        # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限（Windows は 60 分）の範囲内
         # #3378・#3399 の後の main の Windows は 149〜152 秒（上限比 25%。件数 92。#3378 単体は 76 秒・件数 84）。
-        # 監視の刻みの変更（Phase B）は未決定（3 OS の dispatch 実測は #3480、採否は #3481 で決める）
+        # 監視の刻みの変更（Phase B）は未決定（3 OS の dispatch 実測は #3502 で採り #3299・#3481 に記録。採否は #3481 で決める）。
+        # 同じ実測で、変更前の Windows は 110〜152 秒の 2 群に分かれた（原因は未特定。#3502）
         timeout-minutes: 10
         run: |
           date +%s > "$RUNNER_TEMP/cli-parity-selftest.start"

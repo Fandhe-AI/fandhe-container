@@ -15,8 +15,8 @@
 //! - `UdsServer` は Linux / macOS 限定。Windows では
 //!   `io4_uds_concurrent_bind_is_unimplemented_on_unsupported_os` が bind の未対応を
 //!   明示する（黙って 0 件にしない）。
-//! - client 側 UDS の具象実装がまだ無いため、client 役は std の `UnixStream` で
-//!   フレームを手組みする（`tests/writeback.rs` と同じ方針）。
+//! - 単一 sink モードの並行性を、client 役の std の `UnixStream` でフレームを手組みして確かめる
+//!   （`tests/writeback.rs` と同じ方針）。本番クライアント経由のファイル操作は [`super::uds_file_ops`]。
 //! - 待ち合わせは `Barrier`・期限つき join・ソケットの read/write timeout で行い、
 //!   `sleep` による同期はしない（REPAIR-5）。
 

@@ -15,7 +15,8 @@
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
 //!    2c. 起動オプション文書(状態ルート配下の `@container-options/<id>`。CLI の create が書く。形式は
 //!    [`crate::container_options::document`])を同じ期限つき作業スレッドで読む。無ければ既定値。読めない・壊れている
-//!    ときは手順 4 の [`StartDeps::check_launcher_available`] が cgroup にも launch にも触れずに止める。#2713・SUP-12／
+//!    ときは手順 4 の [`StartDeps::check_launcher_available`] が cgroup にも launch にも触れずに止める。
+//!    期限超過だけは手順 3 に進まず `TIMEOUT` を報告して止まる(期限の配分に依らず固定。#3509・REPAIR-4)。#2713・SUP-12／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
 //!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
@@ -3027,6 +3028,10 @@ mod linux {
         )
     }
 
+    /// 手順 2c の期限超過で報告する固定の message。コードは `TIMEOUT` に固定し、残りの期限の配分で `INTERNAL` と
+    /// 揺らさない(SEC-4・REPAIR-4・REPAIR-5・#3509)。
+    const OPTIONS_PREPARE_TIMEOUT_MESSAGE: &str = "container options preparation timed out";
+
     /// 2c の作業スレッドの結果(文書から作った options と照合した世代)。
     type OptionsOutcome = Result<(Option<ContainerOptions>, Option<String>), TraitError>;
 
@@ -3081,7 +3086,7 @@ mod linux {
                 OptionsPrepared {
                     result: Err(TraitError::new(
                         ErrorCode::Timeout,
-                        "container options preparation timed out",
+                        OPTIONS_PREPARE_TIMEOUT_MESSAGE,
                     )),
                     unjoined: Some(UnjoinedOptionsWorker { rx, handle }),
                 }
@@ -3336,9 +3341,22 @@ mod linux {
         // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
         // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
         // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
-        if unjoined_options.is_none() {
-            record_pasta_tamper(audit, id, pasta_logs, deadline);
+        if let Some(w) = unjoined_options {
+            // 2c の期限超過は手順 3 以降へ進まず、残りの期限の配分に依らず `TIMEOUT` を 1 行報告して止まる
+            // (2b の期限超過と同じ形。未回収の作業スレッドを残したまま回復の launcher を組まない。
+            // 手順 3 の中断起動の回復は次の start が行う。計測行は 2b と揃えて出さない。
+            // SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
+            let err = op_err(TraitError::new(
+                ErrorCode::Timeout,
+                OPTIONS_PREPARE_TIMEOUT_MESSAGE,
+            ));
+            report(out, &StartReport::failed(&err));
+            deps.flush_deferred_logs();
+            drop(deps);
+            finish_after_refused_start(Some(w), audit, id, pasta_logs, LATE_DRAIN_BUDGET);
+            return Err(err.exit_code());
         }
+        record_pasta_tamper(audit, id, pasta_logs, deadline);
         match run_start_until(
             deps,
             store,
@@ -3352,16 +3370,8 @@ mod linux {
             Err(code) => {
                 // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
                 // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
-                // 2c が期限超過なら、報告の後に作業スレッドを `LATE_DRAIN_BUDGET` だけ待ち、遅れて置かれた改ざんの印と
-                // 行を拾う(報告の期限は延びない。launch しない経路なので単一スレッド要求にも触れない。#3431)。
-                // 回収できなければ期限超過の行が終端の記録になる(残余。docs/design/rootless-network.md)。
-                finish_after_refused_start(
-                    unjoined_options,
-                    audit,
-                    id,
-                    pasta_logs,
-                    LATE_DRAIN_BUDGET,
-                );
+                // 2c の期限超過は上で短絡済み(#3509)。ここへ来るのは作業スレッドが残っていない経路だけ。
+                finish_after_refused_start(None, audit, id, pasta_logs, LATE_DRAIN_BUDGET);
                 Err(code)
             }
         }
@@ -3549,7 +3559,7 @@ mod linux {
         }
         // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
         // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
-        // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る)。
+        // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る。期限超過は除く: 手順 3 へ進まず TIMEOUT。#3509)。
         let OptionsPrepared {
             result: options_result,
             unjoined: unjoined_options,

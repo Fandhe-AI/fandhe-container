@@ -1634,6 +1634,9 @@ impl AuditSink for RecordingSink {
 /// 2c の作業本体の `LOG_PREPARE_DEADLINE`(supervisor 内の非公開定数。5 秒)。
 const OPTIONS_WORKER_LIMIT: Duration = Duration::from_secs(5);
 
+/// 既存の試験の起動の期限(2c の待ちが本番の 5 秒で切れる配分)。
+const DEFAULT_DEADLINE_AFTER: Duration = Duration::from_secs(7);
+
 /// 期限超過した 2c の拒否の結果(#3473)。
 struct TimeoutRun {
     result: Result<Running, std::num::NonZeroU8>,
@@ -1649,11 +1652,17 @@ struct TimeoutRun {
     logs_at_return: Vec<String>,
     calls: Vec<&'static str>,
     env: Env,
+    /// 起動の期限(t0 からの相対)。
+    deadline_after: Duration,
 }
 
 /// 2c の作業スレッドが報告の後 `late_after` を待って改ざんの印を置く構成で、期限超過の拒否を通す。`late_after` が
 /// `None` なら作業スレッドは継ぎ目が戻るまで解放しない(戻らない作業スレッド)。
-fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
+fn run_options_timeout(
+    tag: &str,
+    late_after: Option<Duration>,
+    deadline_after: Duration,
+) -> TimeoutRun {
     let env = Env::new(tag);
     env.create(&env.id);
     let calls = new_calls();
@@ -1695,9 +1704,8 @@ fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
     };
 
     let t0 = std::time::Instant::now();
-    // 2c は本番の 5 秒で期限を超え、`run_start_until` には REPORT_RESERVE を引いてなお 1 秒残る
-    // (check の失敗が TIMEOUT で確定し、期限超過の INTERNAL と競合しない)。
-    let deadline = t0 + OPTIONS_WORKER_LIMIT + REPORT_RESERVE + REPORT_RESERVE;
+    // 期限の配分に依らず TIMEOUT で確定する(手順 3 以降へ進まない。#3509)。
+    let deadline = t0 + deadline_after;
     let result = run_start_after_options_worker_for_test(
         work,
         |e| {
@@ -1734,6 +1742,7 @@ fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
         logs_at_return,
         calls: calls_of(&calls),
         env,
+        deadline_after,
     }
 }
 
@@ -1750,10 +1759,11 @@ fn assert_timeout_report_and_flush(r: &TimeoutRun) -> std::time::Instant {
         other => panic!("unexpected report: {other:?}"),
     }
     let reported = r.out.reported_at().expect("reported");
+    let min_wait = OPTIONS_WORKER_LIMIT.min(r.deadline_after - REPORT_RESERVE);
+    assert!(reported - r.t0 >= min_wait, "{:?}", reported - r.t0);
     assert!(
-        reported - r.t0 >= OPTIONS_WORKER_LIMIT,
-        "{:?}",
-        reported - r.t0
+        reported <= r.t0 + r.deadline_after,
+        "report must fit the deadline"
     );
     // deps の flush は報告の後にちょうど 1 回で、期限超過の行が 1 度だけ出る。
     assert_eq!(r.flushes, 1);
@@ -1771,8 +1781,8 @@ fn assert_timeout_report_and_flush(r: &TimeoutRun) -> std::time::Instant {
         line.ends_with(",\"result\":\"timeout\",\"stage\":\"verify\"}\n"),
         "{line}"
     );
-    // check の失敗で止まり、副作用に進まない。
-    assert_eq!(r.calls, ["check"]);
+    // 手順 3 以降へ進まない(check も呼ばれない。#3509)。
+    assert_eq!(r.calls, Vec::<&str>::new());
     let rec = r.env.record(&r.env.id);
     assert_eq!(rec.status().state(), ContainerState::Created);
     assert!(rec.status().pid().is_none());
@@ -1786,7 +1796,7 @@ fn assert_timeout_report_and_flush(r: &TimeoutRun) -> std::time::Instant {
 fn sec4_repair5_3473_options_timeout_reports_then_flushes_once_and_audits_late_tamper() {
     const RELEASE_AFTER: Duration = Duration::from_millis(200);
     assert!(RELEASE_AFTER < LATE_DRAIN_BUDGET);
-    let r = run_options_timeout("opttmo", Some(RELEASE_AFTER));
+    let r = run_options_timeout("opttmo", Some(RELEASE_AFTER), DEFAULT_DEADLINE_AFTER);
     let reported = assert_timeout_report_and_flush(&r);
 
     let placed = r.tamper_placed_at.expect("tamper placed after the report");
@@ -1816,7 +1826,7 @@ fn sec4_repair5_3473_options_timeout_reports_then_flushes_once_and_audits_late_t
 /// 監査は配送されず、期限超過の行が終端の記録になる。
 #[test]
 fn repair5_3473_options_timeout_unreturned_worker_is_bounded_and_sends_no_audit() {
-    let r = run_options_timeout("optnoret", None);
+    let r = run_options_timeout("optnoret", None, DEFAULT_DEADLINE_AFTER);
     let reported = assert_timeout_report_and_flush(&r);
     assert!(r.audit.is_empty(), "{:?}", r.audit);
     let waited = r.t_end - reported;
@@ -1826,4 +1836,20 @@ fn repair5_3473_options_timeout_unreturned_worker_is_bounded_and_sends_no_audit(
         "{waited:?}"
     );
     assert!(r.logs_at_return.is_empty(), "{:?}", r.logs_at_return);
+}
+
+/// SEC-4・REPAIR-4・REPAIR-5(#3509): 起動の期限が先に尽きる配分(2c の待ちが `deadline - REPORT_RESERVE` で切れ、
+/// 手順 3 以降に残りが無い)でも、報告のコードは `INTERNAL` に揺れず `TIMEOUT` に固定される。
+#[test]
+fn repair4_sec4_3509_options_timeout_reports_timeout_when_deadline_runs_out_first() {
+    const RELEASE_AFTER: Duration = Duration::from_millis(200);
+    let r = run_options_timeout(
+        "opttmo3509",
+        Some(RELEASE_AFTER),
+        REPORT_RESERVE + Duration::from_millis(500),
+    );
+    let reported = assert_timeout_report_and_flush(&r);
+    assert_eq!(r.audit.len(), 1, "{:?}", r.audit);
+    let budget = LATE_DRAIN_BUDGET + TAMPER_AUDIT_BUDGET + Duration::from_secs(2);
+    assert!(r.t_end - reported <= budget, "{:?}", r.t_end - reported);
 }

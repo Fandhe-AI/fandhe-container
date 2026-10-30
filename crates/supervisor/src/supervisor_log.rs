@@ -868,24 +868,50 @@ mod tests {
         assert!(!crate::logs::container_log_dir(&t.0).exists());
     }
 
+    /// 同時実行枠は全試験で共有のため、並列の他試験が埋めている間は `Busy` になる。空くまで再試行する
+    /// （`Busy` 以外の結果は即返す。枠は有限時間で戻るので上限 30 秒で打ち切る。REPAIR-5・REPAIR-12）。
+    fn classified_retry_on_busy<T: Send + 'static>(
+        mut make_job: impl FnMut() -> Box<dyn FnOnce() -> T + Send>,
+        timeout: Duration,
+    ) -> Result<T, BoundedFailure> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let job = make_job();
+            match run_bounded_classified(job, timeout) {
+                Err(BoundedFailure::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// REPAIR-5・#2446・#2965: `run_bounded_classified` は結果を返し、止まった job は期限で `Unfinished` になる。
+    /// 枠の満杯（`Busy`）は別試験の並列実行で起きうるため、再試行して結果の分類だけを確かめる。
     #[test]
     fn repair5_run_bounded_classified_returns_result_or_unfinished() {
         assert_eq!(
-            run_bounded_classified(|| 7_u32, Duration::from_secs(10)),
+            classified_retry_on_busy(|| Box::new(|| 7_u32), Duration::from_secs(10)),
             Ok(7)
         );
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let started = Instant::now();
-        let out = run_bounded_classified(
-            move || {
-                let _ = release_rx.recv_timeout(Duration::from_secs(30));
-                1_u32
+        let out = classified_retry_on_busy(
+            || {
+                let rx = Arc::clone(&release_rx);
+                Box::new(move || {
+                    let _ = rx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .recv_timeout(Duration::from_secs(30));
+                    1_u32
+                })
             },
             Duration::from_millis(100),
         );
         assert_eq!(out, Err(BoundedFailure::Unfinished));
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(40));
         drop(release_tx);
     }
 

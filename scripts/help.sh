@@ -145,6 +145,8 @@ cat <<'EOF'
                                         repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合・委譲スコープモード・TEST_ENV の検証をスタブで確認。#2886）
   run-in-user-scope-selftest          scripts/run-in-user-scope-selftest.sh
                                         run-in-user-scope.sh の自己テスト（#3486・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査をスタブで確認）
+  test-bin-watchdog-selftest          scripts/test-bin-watchdog-selftest.sh
+                                        試験バイナリ watchdog（.cargo/config.toml の runner）の自己テスト（#3504・REPAIR-5・REPAIR-12。期限切れ・終了コード・シグナルの透過。Linux のみ）
   run-with-deadline-selftest          scripts/run-with-deadline-selftest.sh
                                         run-with-deadline.sh の自己テスト（#3505・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査を実プロセスで確認）
   check-success-lines-selftest        scripts/check-success-lines-selftest.sh

@@ -945,7 +945,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${HANG_PROBE}" = "true" ]; then
-            cargo test --manifest-path "${RUNNER_TEMP}/hang-probe/Cargo.toml"
+            # プローブの目的は「ステップの timeout-minutes で止まる」ことの実証のため、試験バイナリ単位の
+            # watchdog（.cargo/config.toml の runner。#3504）は外す。
+            FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS=off \
+              cargo test --manifest-path "${RUNNER_TEMP}/hang-probe/Cargo.toml"
             echo "hang probe test returned without timing out" >&2
             exit 1
           fi
@@ -1154,6 +1157,13 @@ jobs:
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make run-in-user-scope-selftest
+
+      # cargo の runner（.cargo/config.toml）に入れた試験バイナリ単位の watchdog の自己テスト（#3504・REPAIR-5・REPAIR-7）。
+      # 期限切れ・正常終了・終了コードとシグナルの透過。スタブの子のみ。既存ジョブのステップ（check-run 件数は不変）
+      - name: 試験バイナリ watchdog の自己テスト（#3504。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make test-bin-watchdog-selftest
 
       # 実機前提テストの成功行照合スクリプト（試験ソースから期待行を導出してログと双方向照合。#2768・REPAIR-12）の
       # 自己テスト。fixture のみ。既存ジョブのステップ（check-run 件数は不変）

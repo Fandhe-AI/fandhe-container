@@ -180,6 +180,11 @@ if [ -r /proc/sys/kernel/core_pattern ]; then
 fi
 echo "info: forbidden_count=${#FORBIDDEN_ITEMS[@]}"
 
+# 試験バイナリ単位の watchdog（.cargo/config.toml の runner。#3504）が、外側の 1 回の期限より先に発火しないようにする。
+FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS="$((RUN_TIMEOUT + 30))"
+if [ "${FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS}" -gt 3600 ]; then FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS=3600; fi
+export FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS
+
 RUN_LIMITED_DIR="$(mktemp -d)"
 trap 'run_limited_abort; rm -rf "${RUN_LIMITED_DIR}"' EXIT
 out_o="${RUN_LIMITED_DIR}/stdout.txt"

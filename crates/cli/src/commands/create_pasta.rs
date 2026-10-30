@@ -3,8 +3,9 @@
 //! # 役割と呼び出し文脈
 //!
 //! `create_start::run_create` が `production_runtime` へ渡す `build` クロージャの中で、`--network` の形式検証
-//! （`create_network::check_network_options`）の後・`UNIMPLEMENTED` の拒否（`reject_not_wired`）の前に
-//! [`resolve_for_create`] を呼ぶ。状態ルートの作成より前に拒否するため（D2）。結果の [`PastaRecord`] は
+//! （`create_network::check_network_options`）の後・`UNIMPLEMENTED` の拒否（`reject_unwired_network`）の前に
+//! [`resolve_for_create`] を呼ぶ。インストールの種別の判定の後・pasta の解決（`--version` の子の起動）の前に、
+//! 定義ストアでユーザー定義名の定義を照合する（`create_network::require_named_definition`。#3329）。状態ルートの作成より前に拒否するため（D2）。結果の [`PastaRecord`] は
 //! `create_options::document_of` が起動オプション文書 `FCOPT1` の kind `pasta` へ書き、supervisor が起動時に
 //! 辿り直して照合する（`docs/design/rootless-network.md` 12.4・12.5・12.14）。
 //!
@@ -15,12 +16,12 @@
 //! | ユーザー定義名でない | 問わない | あり | `InvalidArgument`（効かない指定を黙って受けない） |
 //! | ユーザー定義名でない | 問わない | なし | 何もしない（従来どおり） |
 //! | ユーザー定義名 | Linux 以外 | あり | `Unimplemented`（net の固定文言。CLI-1） |
-//! | ユーザー定義名 | Linux 以外 | なし | 何もしない（後段の `UNIMPLEMENTED` に任せる） |
+//! | ユーザー定義名 | Linux 以外 | なし | `Unimplemented`（network 系の固定文言。#3329） |
 //! | ユーザー定義名 | rootful（euid 0 または信頼できる隣のランチャー） | あり | `InvalidArgument`（rootful は pasta を使わない。D13） |
-//! | ユーザー定義名 | rootful | なし | 何もしない（後段の `UNIMPLEMENTED`） |
+//! | ユーザー定義名 | rootful | なし | `Unimplemented`（rootful のユーザー定義名は D13 の判断待ち。#3329） |
 //! | ユーザー定義名 | 隣のランチャーが信頼できない | 問わない | `FailedPrecondition`（直接経路へ落とさない。SUP-14） |
 //! | ユーザー定義名 | rootless | なし | `FailedPrecondition`（`pasta path is not configured`。既定のパスは持たない） |
-//! | ユーザー定義名 | rootless | あり | 解決して検証する |
+//! | ユーザー定義名 | rootless | あり | 定義を照合し（無ければ `NotFound`、pasta 構成でなければ `FailedPrecondition`）、解決して検証する |
 //!
 //! インストールの種別（`current_exe` と隣のランチャーの stat）は、フラグがあるか `--network` がユーザー定義名の
 //! ときだけ求める（それ以外の `create` には足さない）。種別は `start` と同じ `classify_launcher_beside` で決める。
@@ -34,8 +35,9 @@
 //!
 //! # 将来仕様・残余（REPAIR-3）
 //!
-//! - `--network` のユーザー定義名は #3329 まで最終的に `UNIMPLEMENTED` で拒否されるため、本番の `create` が `pasta` の記録を
-//!   書くのは #3329 で行う。記録の消費（起動時の再検証・pasta の起動）は supervisor 側で #1940 により実装済み。
+//! - rootless のユーザー定義名の `create` は `pasta` の記録を書く（#3329 で実装済み）。記録の消費（起動時の再検証・
+//!   pasta の起動）は supervisor 側で #1940 により実装済み。照合から pasta の起動までの間の `network rm` は防げない
+//!   （pasta の定義はカーネル資源を持たないラベルで、分離は弱まらない。`network-wiring.md` D10）。
 //! - SEC-4 の監査（作成時の `PermissionDenied`）は記録先が状態ストアを開いた後にしか作れず、D2（状態ルートを作る前の拒否）と
 //!   両立しないため、本段では記録しない（設計判断。#3330 の範囲でも対象外）。起動時の識別の不一致と権限違反の監査は supervisor の start が #3330 で実装済み。
 
@@ -44,6 +46,7 @@ use std::ffi::OsStr;
 use fandhe_container_core::oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES;
 use fandhe_container_core::sanitize::sanitize_display_bounded;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::pasta::binary::{PastaBinary, search_pasta_in_path, verify_pasta_binary};
 use fandhe_container_net::pasta::record::PastaRecord;
 
@@ -103,11 +106,18 @@ pub(super) fn decide(
             ErrorCode::Unimplemented,
             fandhe_container_net::pasta::binary::MSG_UNSUPPORTED_OS,
         )),
-        (InstallKind::NonLinux, None) => Ok(None),
+        (InstallKind::NonLinux, None) => Err(terr(
+            ErrorCode::Unimplemented,
+            super::create_network::PLATFORM_MESSAGE,
+        )),
         (InstallKind::Rootful, Some(_)) => {
             Err(terr(ErrorCode::InvalidArgument, MSG_NOT_APPLICABLE))
         }
-        (InstallKind::Rootful, None) => Ok(None),
+        // rootful のユーザー定義名は D13 の判断待ち。後段へ落とさず、作成前に明示的に拒否する（fail-closed。#3329）。
+        (InstallKind::Rootful, None) => Err(terr(
+            ErrorCode::Unimplemented,
+            super::create_network::MSG_ROOTFUL,
+        )),
         (InstallKind::UntrustedLauncher, _) => {
             Err(terr(ErrorCode::FailedPrecondition, MSG_UNTRUSTED_LAUNCHER))
         }
@@ -179,10 +189,14 @@ fn detect_install() -> Result<InstallKind, TraitError> {
 /// `create` で pasta の指定を判定し、必要なら解決・検証した記録を返す（モジュール doc）。
 ///
 /// フラグも無くユーザー定義名でもない `create` では何も調べない（`current_exe` も stat も足さない）。
+/// `recheck_definition` は判定を通った後・解決の前にだけ呼ぶ（ユーザー定義名の定義の照合。存在しないネットワークの
+/// ために `--version` の子を起動しない。#3329）。
 pub(super) fn resolve_for_create(
     global: &GlobalArgs,
-    named_network: bool,
+    named: Option<&NetworkName>,
+    recheck_definition: impl FnOnce(&NetworkName) -> Result<(), TraitError>,
 ) -> Result<Option<PastaRecord>, TraitError> {
+    let named_network = named.is_some();
     if global.pasta.is_none() && !named_network {
         return Ok(None);
     }
@@ -195,6 +209,9 @@ pub(super) fn resolve_for_create(
     let Some(source) = decide(global.pasta.as_ref(), named_network, install)? else {
         return Ok(None);
     };
+    if let Some(name) = named {
+        recheck_definition(name)?;
+    }
     let (bin, warning) = resolve_source(source, std::env::var_os("PATH").as_deref())?;
     if let Some(line) = warning {
         emit_warning_bounded(line, write_warning_to_stderr, WARNING_WRITE_TIMEOUT);
@@ -247,12 +264,24 @@ mod tests {
                 "pasta is only supported on Linux".to_owned()
             ))
         );
-        assert_eq!(outcome(None, true, I::NonLinux), Ok(false));
+        assert_eq!(
+            outcome(None, true, I::NonLinux),
+            Err((
+                C::Unimplemented,
+                "network options are not supported on this platform yet".to_owned()
+            ))
+        );
         assert_eq!(
             outcome(Some(&search), true, I::Rootful),
             Err((C::InvalidArgument, na))
         );
-        assert_eq!(outcome(None, true, I::Rootful), Ok(false));
+        assert_eq!(
+            outcome(None, true, I::Rootful),
+            Err((
+                C::Unimplemented,
+                "user-defined networks on rootful installations are not supported yet".to_owned()
+            ))
+        );
         for s in [None, Some(&src)] {
             assert_eq!(
                 outcome(s, true, I::UntrustedLauncher),

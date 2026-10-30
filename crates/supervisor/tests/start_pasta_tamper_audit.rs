@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::traits::{
     Annotations, ContainerId, ContainerState, ContainerStatus, CreateStateRequest, GetStateRequest,
 };
+use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
 use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
 use fandhe_container_supervisor::container_options::store::{GENERATION_ANNOTATION, write_new};
 use fandhe_container_supervisor::state::open_default_store;
@@ -93,6 +94,11 @@ fn prepare(env: &Env, id: &ContainerId, pasta_path: &Path) {
         .with_generation(GENERATION.into())
         .unwrap();
     write_new(&env.root, id, &doc).unwrap();
+    // 手順 2c は pasta の再検証の前にユーザー定義名の定義を照合し直す(#3329)ため、pasta 構成の定義を用意する。
+    NetworkStore::open(&env.root)
+        .unwrap()
+        .create(&NetworkDefinition::pasta("tamper-net").unwrap())
+        .unwrap();
 }
 
 /// bin の `start` を期限つきで実行する(終了コード・stdout)。

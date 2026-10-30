@@ -4,7 +4,7 @@ rootless のユーザー定義ネットワーク（pasta 構成）では、`crea
 
 ## 現状（重要）
 
-`-p` の解析と作成前の検証、起動オプション文書 `FCOPT1` の kind `publish` は実装済みで、supervisor 側の pasta の結線と `publish` の反映も #1940 で実装済みだが、CLI が rootless のユーザー定義名を受けて文書へ記録する #3329 が済むまで、検証を通った `-p` も `UNIMPLEMENTED` で拒否する（受理して黙って捨てない。REPAIR-3）。
+`-p` の解析と作成前の検証、起動オプション文書 `FCOPT1` の kind `publish`、supervisor 側の pasta の結線と `publish` の反映（#1940）に加え、CLI が rootless のユーザー定義名を受けて `network`・`pasta`・`publish` を文書へ記録する処理も #3329 で実装済み。定義の照合（`NOT_FOUND`）と pasta の解決は [network.md](network.md) を参照。実機での通し確認（pasta・ポート公開）は #3331 で人間が行う。
 
 ## 書き方
 
@@ -22,7 +22,7 @@ rootless のユーザー定義ネットワーク（pasta 構成）では、`crea
 
 | 指定 | 結果 |
 | ---- | ---- |
-| ユーザー定義名の `--network` と rootless | 検証後、結線まで `UNIMPLEMENTED` |
+| ユーザー定義名の `--network` と rootless | 受理して文書へ記録する（#3329）。定義が無ければ `NOT_FOUND` |
 | `--network` なし・`none`・`host`・`container:` | `INVALID_ARGUMENT`（モードによらず） |
 | rootful（uid 0、または信頼できる特権ランチャーが CLI の隣にある） | `UNIMPLEMENTED`（v1 では対象外。D13 の判断待ち） |
 

@@ -3013,9 +3013,11 @@ mod linux {
             move || {
                 read_generation_checked_document(&store, &root, &worker_id).and_then(
                     |(doc, rec)| {
-                        doc.map(|d| options_with_verified_pasta(&d, &worker_id, &worker_logs))
-                            .transpose()
-                            .map(|o| (o, rec))
+                        doc.map(|d| {
+                            options_with_verified_pasta(&d, &worker_id, &worker_logs, &root)
+                        })
+                        .transpose()
+                        .map(|o| (o, rec))
                     },
                 )
             },
@@ -3127,8 +3129,16 @@ mod linux {
         doc: &crate::container_options::document::ContainerOptionsDocument,
         id: &ContainerId,
         logs: &crate::pasta_attach::PastaLogBuffer,
+        state_root: &std::path::Path,
     ) -> Result<ContainerOptions, TraitError> {
         let options = doc.to_container_options()?;
+        // ユーザー定義名の定義が create 後に消えていないかを、pasta の再検証(子プロセスの起動)より前に確かめる
+        // (NET-6・NET-9・D10・#3329)。
+        if let Some(crate::container_options::network::NetworkSelection::Named(name)) =
+            options.network().selection()
+        {
+            recheck_named_definition(state_root, name, id, logs)?;
+        }
         let started = Instant::now();
         if doc.pasta().is_some() {
             // 期限超過の行の `stage` を決める印(#3431)。
@@ -3159,6 +3169,52 @@ mod linux {
                 Err(te)
             }
         }
+    }
+
+    /// 定義の照合の共有ロックの待ちの上限。2c の予算(5 秒 − 報告の予約 1 秒)に、pasta の `--version`(2 秒)と
+    /// 合わせて収める(REPAIR-5)。
+    const NETWORK_DEFINITION_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// 定義の照合の失敗を start の失敗へ写す。コンテナの記録はあるので、定義の消失は `FailedPrecondition`
+    /// (`NotFound` だとコンテナの不在と区別できない)。入力値を含めない固定文言。改ざんではないため SEC-4 の
+    /// 監査には記録しない。
+    fn map_definition_check(
+        c: crate::container_options::network_definition::DefinitionCheck,
+    ) -> TraitError {
+        use crate::container_options::network_definition::DefinitionCheck as D;
+        match c {
+            D::Missing => TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "network definition no longer exists",
+            ),
+            D::NotPasta => TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "network definition does not match the container",
+            ),
+            D::Store(e) => crate::net_error::net_error_to_trait_keeping_code(&e),
+        }
+    }
+
+    /// 文書の `network <名前>` の定義を照合し直す(読み取りのみ。`PastaAttachHook` には入れない)。
+    fn recheck_named_definition(
+        state_root: &std::path::Path,
+        name: &fandhe_container_net::network::NetworkName,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+    ) -> Result<(), TraitError> {
+        // 定義ストアの open / get の成否と所要時間を、照合の後に遅延ログへ積む(REPAIR-4)。
+        let collector = Arc::new(crate::pasta_attach::CollectNetOps::default());
+        let result =
+            crate::container_options::network_definition::check_pasta_definition(
+                state_root,
+                name,
+                NETWORK_DEFINITION_LOCK_TIMEOUT,
+                Some(Arc::clone(&collector)
+                    as Arc<dyn fandhe_container_net::instrument::NetOpRecorder>),
+            )
+            .map_err(map_definition_check);
+        crate::pasta_attach::log_network_store_ops(logs, id.as_str(), &collector.take());
+        result
     }
 
     /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
@@ -4317,6 +4373,64 @@ mod linux {
             let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
             assert_eq!(err.code(), ErrorCode::InvalidArgument);
             let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// NET-6・NET-9・CLI-1(#3329): 手順 2c は、ユーザー定義名の定義が消えていれば pasta の再検証より前に拒否する。
+        /// none / host の文書と文書なしは、定義ストアを開かない(何も作らない)。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn net6_3329_options_recheck_named_definition_before_pasta_verify() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-3329",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let id = ContainerId::new("c1").expect("id");
+            let logs = crate::pasta_attach::PastaLogBuffer::new();
+            let named = ContainerOptionsDocument::default()
+                .with_network(Some("web".into()), vec![], vec![])
+                .expect("doc");
+            // 定義が無い: 固定文言の FailedPrecondition。ストアも作らない。
+            let err = options_with_verified_pasta(&named, &id, &logs, &root).unwrap_err();
+            assert_eq!(
+                (err.code(), err.message()),
+                (
+                    ErrorCode::FailedPrecondition,
+                    "network definition no longer exists"
+                )
+            );
+            assert!(!root.join("@networks").exists());
+            // none / host は照合しない。
+            for mode in ["none", "host"] {
+                let d = ContainerOptionsDocument::default()
+                    .with_network(Some(mode.into()), vec![], vec![])
+                    .expect("doc");
+                options_with_verified_pasta(&d, &id, &logs, &root).expect(mode);
+            }
+            assert!(!root.join("@networks").exists());
+            // 定義がある(pasta)と通る(pasta の記録は無いので再検証は呼ばれない)。
+            let store = NetworkStore::open(&root).expect("open");
+            store
+                .create(&NetworkDefinition::pasta("web").expect("def"))
+                .expect("create");
+            let _ = logs.take();
+            options_with_verified_pasta(&named, &id, &logs, &root).expect("present");
+            // 定義ストアの open / get の成否と所要時間が遅延ログに積まれる(REPAIR-4)。
+            let lines = logs.take().join("");
+            assert!(lines.contains("\"event\":\"network_store_op\""), "{lines}");
+            assert!(lines.contains("\"op\":\"network.store.get\""), "{lines}");
+            assert!(lines.contains("\"result\":\"ok\""), "{lines}");
+            // 消されると再び拒否する。
+            store
+                .remove(&fandhe_container_net::network::NetworkName::new("web").expect("n"))
+                .expect("rm");
+            let err = options_with_verified_pasta(&named, &id, &logs, &root).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         }
 
         /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。

@@ -28,7 +28,7 @@
 //!
 //! - rootful（bridge）の `create` は subnet の pool 予約（D13）が決まるまで `UNIMPLEMENTED`。
 //! - メンバー記録（#3067）が入るまで `rm` が拒否するのは、`definition` と `@lock` 以外の項目がある場合（net の `remove` の契約）。
-//! - `create --network <名前>` での定義の存在照合は #3329 の範囲で、ここでは触れない。
+//! - `create --network <名前>` での定義の存在照合は `create_network::require_named_definition`(#3329)で、ここでは触れない。
 //! - 計測（REPAIR-4）: `net_recorder::CliNetRecorder` で定義ストアの操作を `network.store.*`、コマンド全体を `network_create` /
 //!   `network_rm` / `network_ls` の名前で記録し、`FANDHE_CONTAINER_OP_LOG` へ出す。
 
@@ -47,7 +47,9 @@ use fandhe_container_net::network_store::{
 
 use super::CliExit;
 use super::args::{GlobalArgs, NetworkArgs};
-use super::create_network::{PublishPrivilege, resolve_publish_privilege};
+use super::create_network::{
+    MSG_NOT_FOUND, MSG_ROOTFUL, PublishPrivilege, resolve_publish_privilege,
+};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
 use super::list_logs::{record_op, store_open_failure};
 use super::net_recorder::CliNetRecorder;
@@ -59,14 +61,12 @@ const NETWORK_LS_HEADER: &str = "NAME\tMODE\tSUBNET\n";
 const MSG_RESERVED: &str = MSG_RESERVED_NETWORK_NAME;
 const MSG_INVALID: &str = "invalid network name";
 const MSG_ALREADY_EXISTS: &str = "network already exists";
-const MSG_NOT_FOUND: &str = "network not found";
 const MSG_RM_PRECONDITION: &str = "network cannot be removed in its current state";
 const MSG_STORE_PRECONDITION: &str = "network store is not in the expected state";
 const MSG_LIMIT: &str = "network limit reached";
 const MSG_PERMISSION: &str = "network store permission denied";
 const MSG_TIMEOUT: &str = "network store lock timed out";
 const MSG_UNSUPPORTED_OS: &str = "network commands are not supported on this platform yet";
-const MSG_ROOTFUL: &str = "user-defined networks on rootful installations are not supported yet";
 const MSG_INTERNAL: &str = "network store operation failed";
 const MSG_CORRUPTED: &str =
     "network store has a corrupted entry; ask an administrator to inspect and repair it manually";

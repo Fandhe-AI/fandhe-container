@@ -61,6 +61,7 @@ on:
           - none
           - step-timeout
           - script-deadline
+        default: none
       scope-hang-probe:
         description: >-
           platform-ci（ubuntu）の委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5）。

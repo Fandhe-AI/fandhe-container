@@ -11,7 +11,9 @@
 //! 3. `create` のみ権限モデル。rootless は pasta の定義、rootful は subnet の pool 予約（D13・#3207 のオーナー判断待ち）が
 //!    無いため `UNIMPLEMENTED`
 //! 4. 状態ルートを開き（`open_store`）、定義ストアを開いて操作する
-//! 5. `rm` のみ、定義の存在確認（無ければ `NOT_FOUND`）→ 参照するコンテナの走査（`network_refs`。#3529）→ 定義ストアの `remove`
+//! 5. `rm` のみ、全体の排他ロックを取り、そのロックの下で定義の存在確認（無ければ `NOT_FOUND`）→ 参照するコンテナの走査
+//!    （`network_refs`。#3529）→ 定義ストアの `remove`（#3550。create は定義の照合から状態記録の作成まで共有ロックを持つので、
+//!    その間の rm は待たされ、期限で `TIMEOUT`。REPAIR-5）
 //!
 //! # 出力形式（`ls`・stdout・タブ区切り・LF 固定。`list` に揃える）
 //!
@@ -30,14 +32,14 @@
 //! - rootful（bridge）の `create` は subnet の pool 予約（D13）が決まるまで `UNIMPLEMENTED`。
 //! - `rm` は、net の `remove`（`definition` と `@lock` 以外の項目、つまり bridge のメンバー・孤児の記録があれば拒否）に加え、
 //!   rootless（pasta）のコンテナの起動オプション文書（FCOPT1）が対象を参照していれば、作成済み・停止中・実行中を問わず
-//!   `FAILED_PRECONDITION` で拒否する（#3529・D10）。残る窓は `network_refs` の doc を参照。
+//!   `FAILED_PRECONDITION` で拒否する（#3529・D10）。create との窓は #3550 で閉じた（`network_refs` の doc を参照）。
 //! - `create --network <名前>` での定義の存在照合は `create_network::require_named_definition`(#3329)で、ここでは触れない。
 //! - 計測（REPAIR-4）: `net_recorder::CliNetRecorder` で定義ストアの操作を `network.store.*`、コマンド全体を `network_create` /
 //!   `network_rm` / `network_ls` の名前で記録し、`FANDHE_CONTAINER_OP_LOG` へ出す。
 
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::state_store::FileStateStore;
@@ -45,7 +47,7 @@ use fandhe_container_core::traits::{ErrorCode, StateStore, TraitError};
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::network_store::{
-    InstallMode, MSG_RESERVED_NETWORK_NAME, NetworkDefinition, NetworkStore,
+    DEFAULT_LOCK_TIMEOUT, InstallMode, MSG_RESERVED_NETWORK_NAME, NetworkDefinition, NetworkStore,
     is_reserved_network_name,
 };
 
@@ -130,6 +132,26 @@ fn run_network_recorded(
     resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
     recorder: &Arc<OpRecorder>,
 ) -> CliExit {
+    run_network_recorded_with_timeout(
+        global,
+        args,
+        stdout,
+        resolve_privilege,
+        recorder,
+        DEFAULT_LOCK_TIMEOUT,
+    )
+}
+
+/// [`run_network_recorded`] の、定義ストアのロック待ちの期限を差し替えられる本体(REPAIR-5。本番は既定の期限。
+/// 試験が「保持中の create に rm が期限で `TIMEOUT` になる」ことを短い時間で確かめる入口。#3550)。
+fn run_network_recorded_with_timeout(
+    global: &GlobalArgs,
+    args: &NetworkArgs,
+    stdout: &mut dyn Write,
+    resolve_privilege: impl FnOnce() -> Result<PublishPrivilege, TraitError>,
+    recorder: &Arc<OpRecorder>,
+    lock_timeout: Duration,
+) -> CliExit {
     match args {
         NetworkArgs::Create(name) => {
             let name = match validate_name(name) {
@@ -149,7 +171,7 @@ fn run_network_recorded(
                 Ok(d) => d,
                 Err(e) => return net_failure(e.code(), Op::Create),
             };
-            let (_, store) = match open_net_store(global, Op::Create, recorder) {
+            let (_, store) = match open_net_store(global, Op::Create, recorder, lock_timeout) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -166,18 +188,24 @@ fn run_network_recorded(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let (state, store) = match open_net_store(global, Op::Rm, recorder) {
+            let (state, store) = match open_net_store(global, Op::Rm, recorder, lock_timeout) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
+            // 参照の判定から削除までを全体の排他ロックの下で行う(create は定義の照合から状態記録の作成までを共有
+            // ロックで持つので、その間の rm はここで待たされ、期限で TIMEOUT になる。D10・#3550)。
+            let guard = match store.lock_global_exclusive() {
+                Ok(g) => g,
+                Err(e) => return net_failure(e.code(), Op::Rm),
+            };
             // 定義が無い名前は、古いコンテナが参照していても NOT_FOUND(走査しない。#3529)。
-            if let Err(e) = store.get(&name) {
+            if let Err(e) = guard.get(&name) {
                 return net_failure(e.code(), Op::Rm);
             }
             if let Some(exit) = refuse_if_referenced(state, &name, recorder) {
                 return exit;
             }
-            match store.remove(&name) {
+            match guard.remove(&name) {
                 Ok(()) => CliExit::Success,
                 Err(e) => net_failure(e.code(), Op::Rm),
             }
@@ -186,7 +214,7 @@ fn run_network_recorded(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let (_, store) = match open_net_store(global, Op::Ls, recorder) {
+            let (_, store) = match open_net_store(global, Op::Ls, recorder, lock_timeout) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -249,6 +277,7 @@ fn open_net_store(
     global: &GlobalArgs,
     op: Op,
     recorder: &Arc<OpRecorder>,
+    lock_timeout: Duration,
 ) -> Result<(FileStateStore, NetworkStore), CliExit> {
     let state = open_store(global).map_err(|e| store_open_failure(&e))?;
     let root = state
@@ -256,7 +285,8 @@ fn open_net_store(
         .ok_or_else(|| CliExit::failed(ErrorCode::Internal))?;
     let net =
         NetworkStore::open_with_recorder(root, Arc::new(CliNetRecorder::new(Arc::clone(recorder))))
-            .map_err(|e| net_failure(e.code(), op))?;
+            .map_err(|e| net_failure(e.code(), op))?
+            .with_lock_timeout(lock_timeout);
     Ok((state, net))
 }
 
@@ -430,6 +460,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
+        use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError};
         use fandhe_container_core::state_store::StateRoot;
         use fandhe_container_core::traits::{
             Annotations, ContainerId, ContainerState, ContainerStatus, CreateStateRequest,
@@ -440,6 +471,7 @@ mod tests {
             self as options_store, GENERATION_ANNOTATION,
         };
         use std::path::PathBuf;
+        use std::time::Duration;
 
         /// 0700 の一時ディレクトリ（状態ルートの親。Drop で親ごと消える）。
         struct Base(
@@ -721,6 +753,159 @@ mod tests {
             let (code, err) = rm_exit(&g, "gone");
             assert_eq!(err, json("NOT_FOUND", "network not found"));
             assert_eq!(code, 3);
+        }
+
+        /// 窓の注入試験で使う: 2 回目の照合から状態記録の作成までを保持する本番の関数(`create` が使うもの)。
+        fn held_create<T>(
+            base: &Base,
+            name: &str,
+            timeout: Duration,
+            body: impl FnOnce() -> Result<T, OciRuntimeError>,
+        ) -> Result<T, OciRuntimeError> {
+            let store = open_state(base);
+            let root = store.host_state_root().expect("root").to_path_buf();
+            crate::commands::create_network::with_named_definition_held(
+                &root,
+                &NetworkName::new(name).expect("name"),
+                timeout,
+                None,
+                body,
+            )
+        }
+
+        /// NET-6・NET-9・CLI-1・REPAIR-5(#3550): create が定義の照合から状態記録の作成までを共有ロックで持つ間に
+        /// 始まった `network rm` は待たされ、create が記録を作った後に FAILED_PRECONDITION(終了コード 5)で拒否される。
+        /// 定義は消えない(窓が閉じている)。
+        #[test]
+        fn net6_net9_cli1_3550_rm_during_create_window_waits_then_refused() {
+            use std::sync::mpsc;
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            let (locked_tx, locked_rx) = mpsc::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let (rm_tx, rm_rx) = mpsc::channel::<(u8, String)>();
+            std::thread::scope(|sc| {
+                let base_ref = &base;
+                let create = sc.spawn(move || {
+                    let base = base_ref;
+                    held_create(base, "n1", Duration::from_secs(5), || {
+                        locked_tx.send(()).expect("locked");
+                        go_rx.recv_timeout(Duration::from_secs(20)).expect("go");
+                        // create が作る起動オプション文書と状態記録の代役。
+                        write_doc(base, "c1", "n1", "g1");
+                        add_record(base, "c1", Some("g1"), ContainerState::Created);
+                        Ok(())
+                    })
+                });
+                locked_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("create holds the lock");
+                sc.spawn(|| rm_tx.send(rm_exit(&g, "n1")).expect("send"));
+                assert!(
+                    matches!(
+                        rm_rx.recv_timeout(Duration::from_millis(300)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "rm must wait while create holds the shared lock"
+                );
+                go_tx.send(()).expect("go");
+                let (code, err) = rm_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("rm finishes");
+                assert_eq!(err, json("FAILED_PRECONDITION", IN_USE));
+                assert_eq!(code, 5);
+                assert!(create.join().expect("create thread").is_ok());
+            });
+            assert_eq!(ok(&g, NetworkArgs::Ls), LS_N1);
+        }
+
+        /// NET-6・CLI-1(#3550): create が窓の中で失敗して何も作らなければ、rm は拒否しすぎず成功する。
+        #[test]
+        fn net6_cli1_3550_rm_after_failed_create_succeeds() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            let r = held_create(&base, "n1", Duration::from_secs(5), || {
+                Err::<(), _>(OciRuntimeError::new(
+                    LifecycleOp::Create,
+                    ErrorCode::Internal,
+                    "injected failure",
+                ))
+            });
+            assert!(r.is_err());
+            assert_eq!(rm_exit(&g, "n1").0, 0);
+            assert_eq!(ok(&g, NetworkArgs::Ls), "NAME\tMODE\tSUBNET\n");
+        }
+
+        /// NET-6・REPAIR-5(#3550): create の保持が rm のロック待ちの期限を超えたら、rm は TIMEOUT で失敗し定義を消さない。
+        #[test]
+        fn net6_repair5_3550_rm_times_out_while_create_holds_lock() {
+            use std::sync::mpsc;
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            let (locked_tx, locked_rx) = mpsc::channel::<()>();
+            std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    held_create(&base, "n1", Duration::from_secs(5), || {
+                        locked_tx.send(()).expect("locked");
+                        std::thread::sleep(Duration::from_millis(1500));
+                        Ok(())
+                    })
+                });
+                locked_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("create holds the lock");
+                let mut out = Vec::new();
+                let exit = run_network_recorded_with_timeout(
+                    &g,
+                    &NetworkArgs::Rm("n1".into()),
+                    &mut out,
+                    rootless,
+                    &Arc::new(OpRecorder::new()),
+                    Duration::from_millis(300),
+                );
+                assert_eq!(
+                    stderr_of(&exit),
+                    json("TIMEOUT", "network store lock timed out")
+                );
+                assert_eq!(exit.exit_code(), 7);
+            });
+            assert_eq!(ok(&g, NetworkArgs::Ls), LS_N1);
+        }
+
+        /// NET-6・CLI-1・REPAIR-5(#3550): rm が排他ロックを持っている間の create の 2 回目の照合は、期限で TIMEOUT になり
+        /// `body`(状態記録の作成)を呼ばない。定義が既に無ければ NOT_FOUND で、やはり `body` を呼ばない。
+        #[test]
+        fn net6_cli1_3550_create_check_times_out_or_not_found_without_body() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            let store = open_state(&base);
+            let root = store.host_state_root().expect("root").to_path_buf();
+            {
+                let net = NetworkStore::open(&root).expect("net");
+                let _excl = net.lock_global_exclusive().expect("exclusive");
+                let called = std::cell::Cell::new(false);
+                let e = held_create(&base, "n1", Duration::from_millis(300), || {
+                    called.set(true);
+                    Ok(())
+                })
+                .expect_err("timeout");
+                assert_eq!(e.code(), ErrorCode::Timeout);
+                assert!(!called.get());
+            }
+            assert_eq!(rm_exit(&g, "n1").0, 0);
+            let called = std::cell::Cell::new(false);
+            let e = held_create(&base, "n1", Duration::from_secs(5), || {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("not found");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+            assert_eq!(e.message(), "network not found");
+            assert!(!called.get());
         }
 
         /// REPAIR-4・NET-6: 成功と失敗の両方で `network.store.*` が記録器へ入る（具体値）。

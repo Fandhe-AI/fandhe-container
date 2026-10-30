@@ -7,7 +7,9 @@
 //! (REPAIR-1)。
 //!
 //! - CLI の `create`: 状態ルート・`@networks` を作る前に、読み取りだけで確かめる
-//!   (`docs/design/network-wiring.md` D2)。
+//!   (`docs/design/network-wiring.md` D2)。加えて、状態記録の作成の直前に全体の共有ロックを保持したまま
+//!   [`check_pasta_definition_locked`] でもう一度確かめ、core の create が戻るまでロックを放さない
+//!   (`network rm` との窓を閉じる。D10・#3550)。
 //! - supervisor の start の手順 2c: create から start までの間に `network rm` された場合の起動を拒否する(D10)。
 //!
 //! 本関数は**分類だけ**を返す([`DefinitionCheck`])。コードと文言への写像は create と start で異なるため、
@@ -15,7 +17,7 @@
 //!
 //! # 残余(REPAIR-3)
 //!
-//! 照合の後、pasta の起動までの間の `network rm` は防げない。pasta の定義はカーネル資源を持たないラベルのため、
+//! start の手順 2c では、照合の後、pasta の起動までの間の `network rm` は防げない。pasta の定義はカーネル資源を持たないラベルのため、
 //! 分離は弱まらない(`network-wiring.md` D10)。
 
 use std::path::Path;
@@ -25,7 +27,9 @@ use std::time::Duration;
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::instrument::NetOpRecorder;
 use fandhe_container_net::network::NetworkName;
-use fandhe_container_net::network_store::{InstallMode, NetworkStore};
+use fandhe_container_net::network_store::{
+    GlobalLockGuard, InstallMode, NetworkDefinition, NetworkStore,
+};
 
 /// 照合の失敗の分類(入力値を含めない)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +60,24 @@ pub fn check_pasta_definition(
         Some(s) => s.with_lock_timeout(lock_timeout),
         None => return Err(DefinitionCheck::Missing),
     };
-    match store.get(name) {
+    classify(store.get(name))
+}
+
+/// [`check_pasta_definition`] の、全体のロックを保持したまま照合する版(NET-6・NET-9・CLI-1・REPAIR-5・#3550)。
+///
+/// CLI の `create` が、定義の照合から状態記録の作成までの間 `network rm` を待たせるために使う。`guard` の
+/// ロックは呼び出し側が保持し続ける(本関数はロックを取り直さない。取り直すと排他の待ちと自己デッドロックしうる)。
+/// 分類は [`check_pasta_definition`] と同じ規則を共有する(REPAIR-1)。
+pub fn check_pasta_definition_locked(
+    guard: &GlobalLockGuard<'_>,
+    name: &NetworkName,
+) -> Result<(), DefinitionCheck> {
+    classify(guard.get(name))
+}
+
+/// 定義の読み取り結果を分類へ写す(照合の規則の唯一の置き場)。
+fn classify(read: Result<NetworkDefinition, NetError>) -> Result<(), DefinitionCheck> {
+    match read {
         Ok(def) => match def.install() {
             InstallMode::Pasta => Ok(()),
             _ => Err(DefinitionCheck::NotPasta),
@@ -118,6 +139,28 @@ mod tests {
         assert_eq!(check(&t.0, "other"), Err(DefinitionCheck::Missing));
         s.remove(&nn("web")).expect("rm");
         assert_eq!(check(&t.0, "web"), Err(DefinitionCheck::Missing));
+    }
+
+    /// NET-6・NET-9・CLI-1・REPAIR-5(#3550): ロック保持版も同じ分類(Pasta は `Ok`・無いは `Missing`・bridge は `NotPasta`)。
+    #[test]
+    fn net6_net9_3550_locked_check_classifies_like_unlocked() {
+        let t = Tmp::new("locked");
+        let sub = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 2, 0)), 24).expect("prefix");
+        let s = NetworkStore::open(&t.0).expect("open");
+        s.create(&NetworkDefinition::pasta("web").expect("def"))
+            .expect("create");
+        s.create(&NetworkDefinition::bridge("br", sub).expect("def"))
+            .expect("create");
+        let g = s.lock_global_shared().expect("lock");
+        assert_eq!(check_pasta_definition_locked(&g, &nn("web")), Ok(()));
+        assert_eq!(
+            check_pasta_definition_locked(&g, &nn("br")),
+            Err(DefinitionCheck::NotPasta)
+        );
+        assert_eq!(
+            check_pasta_definition_locked(&g, &nn("none-such")),
+            Err(DefinitionCheck::Missing)
+        );
     }
 
     /// NET-6(#3329): bridge の定義は `NotPasta`。

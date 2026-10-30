@@ -36,8 +36,10 @@
 //! # 将来仕様・残余（REPAIR-3）
 //!
 //! - rootless のユーザー定義名の `create` は `pasta` の記録を書く（#3329 で実装済み）。記録の消費（起動時の再検証・
-//!   pasta の起動）は supervisor 側で #1940 により実装済み。照合から状態記録の作成までの間の `network rm` は防げない(作成後は `network_refs` が拒否する。#3529)
-//!   （pasta の定義はカーネル資源を持たないラベルで、分離は弱まらない。`network-wiring.md` D10）。
+//!   pasta の起動）は supervisor 側で #1940 により実装済み。照合から状態記録の作成までの間の `network rm` は、#3550 で
+//!   create の共有ロックの保持(`create_network::with_named_definition_held`)と rm の排他ロックで防ぐようにした(作成後は
+//!   `network_refs` が拒否する。#3529)。start の手順 2c の照合から pasta の起動までの間は防げないが、pasta の定義は
+//!   カーネル資源を持たないラベルで、分離は弱まらない(`network-wiring.md` D10)。
 //! - SEC-4 の監査（作成時の `PermissionDenied`）は記録先が状態ストアを開いた後にしか作れず、D2（状態ルートを作る前の拒否）と
 //!   両立しないため、本段では記録しない（設計判断。#3330 の範囲でも対象外）。起動時の識別の不一致と権限違反の監査は supervisor の start が #3330 で実装済み。
 

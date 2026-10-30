@@ -111,16 +111,6 @@ fn main() -> std::process::ExitCode {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
-#[path = "../../core/tests/support/reap.rs"]
-mod reap;
-
-#[cfg(all(
-    target_os = "linux",
-    all(
-        target_pointer_width = "64",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )
-))]
 #[path = "support/rootfs.rs"]
 mod rootfs;
 
@@ -562,7 +552,8 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!(
                     "scenario {}-{} exceeded {SCENARIO_DEADLINE:?}",
                     mode.label(),

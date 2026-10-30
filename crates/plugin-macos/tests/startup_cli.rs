@@ -7,8 +7,8 @@
 mod reap;
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use fandhe_container_plugin::PluginErrorCode;
 
@@ -23,13 +23,28 @@ struct Out {
 
 fn run(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Out {
     let mut cmd = Command::new(BIN);
-    cmd.args(args).env_clear();
+    cmd.args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    // spawn・期限・出力回収を一括で期限つきにする。孫が pipe を持ち続けても戻る（REPAIR-5・#3409）。
-    let o = crate::reap::output_within(&mut cmd, DEADLINE)
-        .unwrap_or_else(|e| panic!("plugin binary: {e}"));
+    let mut child = cmd.spawn().expect("spawn plugin binary");
+    let start = Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if start.elapsed() > DEADLINE {
+            let _ = child.kill();
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("plugin binary did not exit within deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().expect("collect output");
     Out {
         code: o.status.code(),
         stdout: String::from_utf8_lossy(&o.stdout).into_owned(),

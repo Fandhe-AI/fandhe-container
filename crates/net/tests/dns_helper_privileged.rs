@@ -153,15 +153,13 @@ mod linux {
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
         for tool in ["unshare", "nsenter", "mount"] {
-            let ok = crate::reap::run_within(
-                Command::new(tool)
-                    .arg("--help")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null()),
-                crate::reap::reap_within(),
-            )
-            .inspect_err(|e| eprintln!("precondition probe: {e}"))
-            .is_ok_and(|s| s.success());
+            let ok = Command::new(tool)
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
             assert!(ok, "util-linux `{tool}` is required; see AGENTS.md");
         }
     }

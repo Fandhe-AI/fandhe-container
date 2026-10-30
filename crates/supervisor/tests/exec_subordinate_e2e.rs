@@ -571,11 +571,26 @@ mod linux {
             .collect()
     }
 
-    /// 期限つきで外部コマンドを実行して回収する（超えたら kill して回収し panic。REPAIR-5）。出力は一時ファイル経由で、
-    /// 孫が pipe を持ち続けても戻る（#3409）。
+    /// 期限つきで外部コマンドを実行して回収する（超えたら kill して回収し panic。REPAIR-5）。
     fn run_limited(mut cmd: std::process::Command) -> std::process::Output {
-        crate::reap::output_within(&mut cmd, timeout())
-            .unwrap_or_else(|e| panic!("run_limited: {e}"))
+        use std::process::Stdio;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn command");
+        let deadline = Instant::now() + timeout();
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                return child.wait_with_output().expect("collect output");
+            }
+            if Instant::now() >= deadline {
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                panic!("command timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// OCI 既定の bounding set（moby の非 root コンテナの既定と同じ 14 個）の `/proc/<pid>/status` 表記。

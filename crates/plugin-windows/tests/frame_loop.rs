@@ -334,10 +334,11 @@ fn task116_3_plug1_adapter_delegates_and_maps_errors() {
 
 /// 子プロセスへ SIGTERM を送る（テスト側に FFI を足さないため `kill` コマンドを使う。自分が spawn した子の PID のみ）。
 fn sigterm(h: &Harness) {
-    let mut cmd = Command::new("kill");
-    cmd.arg("-TERM").arg(h.child.id().to_string());
-    let status = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
-        .unwrap_or_else(|e| panic!("sigterm to plugin child: {e}"));
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(h.child.id().to_string())
+        .status()
+        .expect("kill");
     assert!(status.success());
 }
 

@@ -23,10 +23,6 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-#[path = "../../core/tests/support/reap.rs"]
-mod reap;
-
-#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::io::{Read, Write};
@@ -140,12 +136,11 @@ mod linux {
             println!("{k}={}", status_field(k).replace('\t', " "));
         }
         // 縮退後の確認: 集合内の CAP_KILL は有効（pid 1 へ kill -0 が通る）、集合外の CAP_CHOWN は無効（EPERM）。
-        // 期限なしの `status()` を避ける。スレッドを立てない `run_within` を使う（REPAIR-5・#3409）。
-        let mut kill0 = Command::new("kill");
-        kill0.args(["-0", "1"]);
-        let kill_ok = crate::reap::run_within(&mut kill0, crate::reap::reap_within())
-            .inspect_err(|e| eprintln!("kill -0 1: {e}"))
-            .is_ok_and(|s| s.success());
+        let kill_ok = Command::new("kill")
+            .args(["-0", "1"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         println!("kill_pid1={kill_ok}");
         // 共有 /tmp 上の予測可能な名前でも、O_EXCL（create_new）は既存の symlink / ファイルを採用せず失敗し、
         // 以降の chown は作成した fd に対して行う。

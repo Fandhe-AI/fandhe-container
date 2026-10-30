@@ -73,10 +73,6 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-#[path = "../../core/tests/support/reap.rs"]
-mod reap;
-
-#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
@@ -159,7 +155,8 @@ mod linux {
                 break st;
             }
             if Instant::now() >= deadline {
-                crate::reap::reap_or_report(&mut c, crate::reap::reap_within());
+                let _ = c.kill();
+                let _ = c.wait();
                 panic!("child did not exit within the timeout");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -171,10 +168,26 @@ mod linux {
 
     /// 期限つきで外部コマンドを実行し、標準出力を返す。
     fn run(program: &str, args: &[&str]) -> Result<String, String> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        // spawn・期限・出力回収を一括で期限つきにする（`wait_with_output` の無期限待ちを避ける。REPAIR-5・#3409）。
-        let out = crate::reap::output_within(&mut cmd, timeout())?;
+        let mut c = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {program}: {e}"))?;
+        let deadline = Instant::now() + timeout();
+        loop {
+            if c.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = c.kill();
+                let _ = c.wait();
+                return Err(format!("{program} timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = c.wait_with_output().map_err(|e| e.to_string())?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {

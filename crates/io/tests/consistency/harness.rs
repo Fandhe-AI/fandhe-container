@@ -139,8 +139,9 @@ impl TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("fcio-consistency-{tag}-{pid}-{n}"));
-        // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
-        let root = crate::test_root::test_root_at(dir.clone());
+        // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
+        let root = crate::test_root::test_root_at(dir);
+        let dir = root.to_path_buf();
         warm_up_persist(&dir);
         Self {
             path: dir,

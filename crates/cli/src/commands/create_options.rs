@@ -215,21 +215,20 @@ mod tests {
         assert_eq!(doc.ulimits(), ["nofile=1024:2048"]);
     }
 
-    /// SUP-12・REPAIR-12(#3375): 前回の残骸（古い `a.env` と余計なファイル）があっても `test_root_at` が
-    /// 空のディレクトリへ作り直し、`--env-file` の試験が古い内容を読まず、drop で消える。
+    /// SUP-12・REPAIR-12(#3375・#3475): 前回の残骸（古い `a.env` と余計なファイル）が同名に残っていても
+    /// `test_root_at` は消さず別名の空ディレクトリを作り、`--env-file` の試験が古い内容を読まず、
+    /// 残骸は無傷で残る。
     #[test]
-    fn sup12_repair12_test_root_clears_stale_residue() {
-        let p = std::env::temp_dir().join(format!(
-            "fcopt-envf-stale-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+    fn sup12_repair12_test_root_leaves_stale_residue_untouched() {
+        let parent = crate::test_root::test_root("fcopt-envf-stale", "parent");
+        let p = parent.join("stale");
         std::fs::create_dir_all(p.join("sub")).expect("stale dir");
         std::fs::write(p.join("a.env"), "A=stale\n").expect("stale file");
+        let rp;
         {
             let root = crate::test_root::test_root_at(p.clone());
+            rp = root.to_path_buf();
+            assert_ne!(&*root, p.as_path());
             assert_eq!(std::fs::read_dir(&*root).expect("read_dir").count(), 0);
             std::fs::write(root.join("a.env"), "A=new\n").expect("write");
             assert_eq!(
@@ -237,7 +236,12 @@ mod tests {
                 "A=new\n"
             );
         }
-        assert!(!p.exists());
+        assert!(!rp.exists());
+        assert_eq!(
+            std::fs::read_to_string(p.join("a.env")).expect("read"),
+            "A=stale\n"
+        );
+        assert!(p.join("sub").is_dir());
     }
 
     /// CLI-1・SUP-12(#2828): `--read-only` だけでも文書は空にならず(黙って効かなくなるのを防ぐ)、`read_only()` が true になる。

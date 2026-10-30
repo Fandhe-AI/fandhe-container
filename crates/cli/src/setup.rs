@@ -502,8 +502,8 @@ mod tests {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let root = crate::test_root::test_root_at(p.clone());
-                Self(p, root)
+                let root = crate::test_root::test_root_at(p);
+                Self(root.to_path_buf(), root)
             }
         }
     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 後始末つきの一時ディレクトリ（unix では 0700 にして check_dir を通す）。
-/// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+/// 第 2 要素は排他作成した実体（Drop で後始末する。REPAIR-12・#3475）。
 struct TmpDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
 impl TmpDir {
@@ -19,30 +19,27 @@ impl TmpDir {
         Self::at(p)
     }
 
-    /// 指定パスの残骸を消して作る（残骸の回帰試験が専用のパスで呼ぶ。unix では 0700）。
+    /// 指定パスを第 1 候補に排他作成する（残骸の回帰試験が専用のパスで呼ぶ。unix では 0700）。
     fn at(p: PathBuf) -> Self {
-        // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
-        let root = crate::test_root::test_root_at(p.clone());
-        Self(p, root)
+        // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
+        let root = crate::test_root::test_root_at(p);
+        Self(root.to_path_buf(), root)
     }
 }
 
-/// SUP-7・REPAIR-12・#3435: 前回の異常終了などで同名の残骸があっても、空の 0700 で作り直され、
-/// drop 後にパスが残らない。
+/// SUP-7・REPAIR-12・#3475: 前回の異常終了などで同名の残骸があっても、消さず別名の空の 0700 で作られ、
+/// drop 後は別名のパスだけが消えて残骸は無傷で残る。
 #[test]
-fn sup7_repair12_tmp_dir_clears_stale_residue() {
-    let p = std::env::temp_dir().join(format!(
-        "fc-sup7-residue-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+fn sup7_repair12_tmp_dir_leaves_stale_residue_untouched() {
+    let parent = crate::test_root::test_root("fc-sup7-residue", "parent");
+    let p = parent.join("stale");
     fs::create_dir_all(p.join("sub")).unwrap();
     fs::write(p.join("c1.log"), b"stale").unwrap();
+    let rp;
     {
         let t = TmpDir::at(p.clone());
+        rp = t.0.clone();
+        assert_ne!(t.0, p);
         assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
         #[cfg(unix)]
         {
@@ -53,7 +50,9 @@ fn sup7_repair12_tmp_dir_clears_stale_residue() {
             );
         }
     }
-    assert!(!p.exists());
+    assert!(!rp.exists());
+    assert_eq!(fs::read(p.join("c1.log")).unwrap(), b"stale");
+    assert!(p.join("sub").is_dir());
 }
 
 fn id() -> ContainerId {

@@ -2473,17 +2473,13 @@ mod imp {
             std::fs::remove_dir_all(&d).ok();
         }
 
-        /// PLUG-12・REPAIR-12(#3375): 前回の残骸（bind 済みの古い socket ファイル）が同じ位置に残っていても
-        /// `test_root_at` が空に作り直し、同じ位置への bind が `EADDRINUSE` にならず、drop で消える。
+        /// PLUG-12・REPAIR-12(#3375・#3475): 前回の残骸（bind 済みの古い socket ファイル）が同じ位置に残っていても
+        /// `test_root_at` は消さず別名の空ディレクトリを作り、そこへの bind が `EADDRINUSE` にならない。
+        /// 残骸の socket は無傷で残る。
         #[test]
-        fn plug12_repair12_test_root_clears_stale_socket_residue() {
-            let p = std::env::temp_dir().join(format!(
-                "fcst-stale-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos())
-            ));
+        fn plug12_repair12_test_root_leaves_stale_socket_residue_untouched() {
+            let parent = crate::test_root::test_root("fcst-stale", "parent");
+            let p = parent.join("stale");
             std::fs::create_dir_all(&p).unwrap();
             drop(std::os::unix::net::UnixListener::bind(p.join("s")).unwrap());
             // listener を閉じても socket ファイルは残り、再 bind は EADDRINUSE になる（元の失敗の再現）。
@@ -2491,10 +2487,17 @@ mod imp {
             assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
             {
                 let root = crate::test_root::test_root_at(p.clone());
+                assert_ne!(&*root, p.as_path());
                 assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
                 let _l = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
             }
-            assert!(!p.exists());
+            use std::os::unix::fs::FileTypeExt as _;
+            assert!(
+                std::fs::symlink_metadata(p.join("s"))
+                    .unwrap()
+                    .file_type()
+                    .is_socket()
+            );
         }
 
         struct Tmp(std::path::PathBuf);

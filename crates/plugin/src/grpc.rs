@@ -1568,8 +1568,8 @@ mod uds_peer_auth_tests {
     struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl TempDir {
         fn new() -> Self {
-            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
-            // 非 root の単体試験なので作成前の削除（A）でよい。名前は sun_path のため短く保つ。
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+            // 名前は sun_path のため短く保つ。
             let root = crate::test_root::test_root("fcgp", "t");
             Self(root.to_path_buf(), root)
         }

@@ -3565,6 +3565,39 @@ mod tests {
         );
     }
 
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: 作成直後の ifindex 取得の復号の DataLoss は、
+    /// NotFound（空報告）と区別され、名前で削除せず Unknown で報告する。
+    #[test]
+    fn net1_3484_resolve_index_dataloss_reports_unknown() {
+        let f = Fake {
+            fail_index: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(f.calls(), ["create_bridge", "link_state"]);
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: SETLINK 失敗後の再照会の DataLoss は削除せず Unknown。
+    /// 返すエラーは最初の SETLINK のものを保つ。
+    #[test]
+    fn net1_3484_setlink_failure_requery_dataloss_keeps_bridge() {
+        let f = Fake {
+            fail_setlink: Some(NetErrorCode::Internal),
+            fail_requery: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::SetOwnerToken);
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+        assert!(!f.calls().contains(&"delete_bridge"));
+    }
+
     /// NET-1: nft の Aborted / NotSent は bridge だけ削除する。AlreadyExists は衝突として返す。
     #[test]
     fn net1_nft_aborted_rolls_back_bridge_only() {
@@ -4113,7 +4146,7 @@ mod attach_tests {
     struct Fake {
         calls: RefCell<Vec<String>>,
         bridge_index: Option<u32>,
-        fail_bridge_lookup: bool,
+        fail_bridge_lookup: Option<NetErrorCode>,
         fail_netns: Option<(NetErrorCode, Option<ResourceState>)>,
         fail_veth: Option<NetErrorCode>,
         /// veth の作成通知の模型（None は通知なし = `Absent`。Issue #3205）。
@@ -4190,8 +4223,8 @@ mod attach_tests {
         fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
             self.rec(format!("link_index {}", name.as_str()));
             if name.as_str().starts_with("fcbr") {
-                if self.fail_bridge_lookup {
-                    return Err(err(NetErrorCode::NotFound));
+                if let Some(c) = self.fail_bridge_lookup {
+                    return Err(err(c));
                 }
                 return IfIndex::new(self.bridge_index.unwrap_or(7));
             }
@@ -4575,7 +4608,7 @@ mod attach_tests {
         assert_eq!(e.rollback, AttachRollbackReport::default());
 
         let f = Fake {
-            fail_bridge_lookup: true,
+            fail_bridge_lookup: Some(NetErrorCode::NotFound),
             ..Default::default()
         };
         let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
@@ -4583,6 +4616,22 @@ mod attach_tests {
         assert_eq!(f.calls().len(), 1);
         assert_eq!(e.step, AttachStep::VerifyBridge);
         assert_eq!(e.code(), NetErrorCode::NotFound);
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: bridge の照会の復号の DataLoss（重複 IFLA_IFALIAS 等。
+    /// #3309）は NotFound と混同されず、そのコードのまま何も作らずに拒否される。
+    #[test]
+    fn net1_3484_attach_bridge_lookup_dataloss_creates_nothing() {
+        let f = Fake {
+            fail_bridge_lookup: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        assert_eq!(f.calls().len(), 1);
+        assert_eq!(e.step, AttachStep::VerifyBridge);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.rollback, AttachRollbackReport::default());
     }
 
     /// NET-1: bridge の所有トークンが一致しない（ifindex が同じでも別所有者の同名 bridge）なら拒否する。

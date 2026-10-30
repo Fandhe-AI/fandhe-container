@@ -482,16 +482,18 @@ Create の失敗の出口を 1 か所にまとめ、送信より前に `InFlight
 - `network_owned` の埋め込みの Stop の経路で期限が効くことの専用試験は無い（各段が同じ `step_within` を通る）
 - Create の RPC の期限と巻き戻しの解放の期限は同じ `runtime_timeout` のため、prepare が即座に失敗し解放が期限まで掛かると、RPC が返すコード（`DEADLINE_EXCEEDED` か prepare のコード）はタイマー粒度の競争で決まる（macOS・Windows で後者になる）。どちらでも記録は Unknown で残り RemoveContainer で回収できる。試験は prepare を保留して RPC の期限切れを先に確定させる（#3257・CRI-2・REPAIR-5）。#3307 で解放の打ち切りは `DEADLINE_EXCEEDED` に揃えた（上の節）
 
-### macOS・Windows の繰り返し実行の記録（#3296・CRI-2・CRI-3・REPAIR-5・REPAIR-12）
+### macOS・Windows の繰り返し実行の記録（#3296・#3307・#3469・CRI-2・CRI-3・REPAIR-5・REPAIR-12）
 
-issue #3227（PR #3278）と #3257（PR #3286）の修正は、macOS・Windows の繰り返し実行の証跡を残さずに閉じた。確かめる試験と手順を次に固定する。CI の証跡（run URL・`passed=N failed=0`）は **未採取**（本記録の時点では push せずローカル確認のみ。採取後に下の表へ記入する）。
+issue #3227（PR #3278）と #3257（PR #3286）の修正は、macOS・Windows の繰り返し実行の証跡を残さずに閉じた。確かめる試験と手順を次に固定する。CI の証跡（run URL・`passed=N failed=0`）は **未採取**（#3469 の実装工程は push・`workflow_dispatch` を行えないため、ローカル確認と spawn_gate の既存 run の照合のみ行った。採取は #3469 に残し、採取後に下の表へ記入する）。
 
 | 試験 | 対象 OS | 入力（`workflow_dispatch`） | 結果 |
 | ---- | ------- | --------------------------- | ---- |
 | `cri3_repair5_extraction_shares_the_pull_deadline`（`image_pull`。CRI-3・REPAIR-5） | macOS のみ | `repeat-package=fandhe-container-cri`・`repeat-test-bin=image_pull`・`repeat-libtest-name=<試験名>`・`repeat-os=macos-latest`・`repeat-count=150` | 未採取 |
 | `cri2_repair5_3142_create_rollback_release_is_bounded`（`runtime_service_runtime`。CRI-2・REPAIR-5） | macOS・Windows | `repeat-package=fandhe-container-cri`・`repeat-test-bin=runtime_service_runtime`・`repeat-libtest-name=<試験名>`・`repeat-os=all`・`repeat-count=150` | 未採取 |
+| `cri2_repair5_3307_create_rollback_cut_returns_deadline_exceeded`（`runtime_service_runtime`。#3307・CRI-2・REPAIR-5） | macOS・Windows | `repeat-package=fandhe-container-cri`・`repeat-test-bin=runtime_service_runtime`・`repeat-libtest-name=<試験名>`・`repeat-os=all`・`repeat-count=150` | 未採取 |
+| `cri2_repair5_3307_create_rollback_release_failure_keeps_original_code`（`runtime_service_runtime`。#3307・CRI-2・REPAIR-5） | macOS・Windows | `repeat-package=fandhe-container-cri`・`repeat-test-bin=runtime_service_runtime`・`repeat-libtest-name=<試験名>`・`repeat-os=all`・`repeat-count=150` | 未採取 |
 
 - `image_pull.rs` は `#![cfg(unix)]` のため Windows の leg は 0 件実行で `missing-libtest-ok` の赤になる。Windows は対象外で、非 Unix の拒否は lib の `non_unix_tests` が受け持つ
 - dispatch は作業ブランチ（または `ci-probe/*`）へ向ける。main へ向けると main への push の CI と concurrency group が同じになり、互いに取り消して `passed=` 行が残らない。2 本は同じ ref・group のため直列に投げる
-- ローカル（Linux）の確認: 2 試験とも `make repeat-test ... COUNT=3` で `passed=3 failed=0`（入力の名前解決と `--logfile` のプリフライトの確認。非 Linux の証跡ではない）
-- #3139 の `spawn_gate` の macOS の確認は main の `platform-ci (macos-latest)` の `spawn_gate::tests::` の ok 行で行う（未確認）
+- ローカル（Linux）の確認: 上の 4 試験（`image_pull` 1・`runtime_service_runtime` 3）とも `make repeat-test ... COUNT=3` で `passed=3 failed=0`（入力の名前解決と `--logfile` のプリフライトの確認。非 Linux の証跡ではない）
+- #3139 の `spawn_gate` の macOS の確認（#3469）: main への push の run 40831027811（commit `c271361b52a957e91094d6982f3eb4c8fc6fb231`・success）の `platform-ci (macos-latest)`（job 123305037402）のログで、`fandhe-container-plugin` の `spawn_gate::tests::` の 7 試験（`plug7_repair5_concurrent_spawn_does_not_inherit_stderr_writer`・`plug7_sec1_spawn_gate_blocks_spawn_while_fd_is_inheritable`・`plug7_spawn_gate_production_fds_are_cloexec`・`repair5_kill_reap_within_reaps_a_live_child`・`repair5_kill_reap_within_zero_limit_returns_without_blocking`・`repair5_spawn_after_deadline_does_not_spawn`・`repair5_spawn_gate_acquisition_times_out_at_deadline`）が `cargo test --workspace` と `cargo test --workspace --all-features` の 2 ステップで各 1 回、すべて `... ok` で出ていることを確認した

@@ -17,3 +17,8 @@ mod sys;
 #[cfg(test)]
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
+
+// 予測できる名前を消さずに排他作成する補助（net の試験補助を取り込む。REPAIR-12・#3479）。
+#[cfg(test)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;

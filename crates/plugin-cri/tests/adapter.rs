@@ -25,6 +25,11 @@ use fandhe_container_plugin_cri::adapter::{
     UnimplementedBundleProvider, UnimplementedNetwork,
 };
 
+// 予測できる名前を消さずに排他作成する補助（net の試験補助を取り込む。REPAIR-12・#3479）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).expect("valid id")
 }
@@ -245,23 +250,43 @@ fn cri2_production_unimplemented_off_linux() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod store_backed {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerState, CreateRequest};
 
     use super::*;
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fc-plugin-cri-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("tmp dir");
-        // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    /// 試験用の一時ディレクトリ。予測できる名前を消さずに排他作成し、drop で自分の分だけ消す
+    /// （REPAIR-12・#3479。pid だけの名前の先行削除を避ける）。
+    struct TmpDir(PathBuf);
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
         }
-        std::fs::canonicalize(&d).expect("canonicalize")
+    }
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> TmpDir {
+        tmp_dir_in(&std::env::temp_dir(), tag)
+    }
+
+    /// `parent` 直下に `fc-plugin-cri-<tag>-<pid>-<n>` を 0700 で排他作成する。macOS の `/var` →
+    /// `/private/var` のような別名を `StateRoot` が嫌うため、正規化したパスを持たせる。
+    fn tmp_dir_in(parent: &std::path::Path, tag: &str) -> TmpDir {
+        let d = crate::exclusive_dir::create_in(parent, &format!("fc-plugin-cri-{tag}"))
+            .expect("tmp dir");
+        TmpDir(std::fs::canonicalize(&d).expect("canonicalize"))
     }
 
     fn make_bundle(dir: &std::path::Path) -> PathBuf {
@@ -306,8 +331,6 @@ mod store_backed {
             .delete(&DeleteRequest::new(cid("c1")))
             .expect_err("second delete");
         assert_eq!(twice.code(), ErrorCode::NotFound);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 実ストアへ委譲し、呼び出し回数を数える（`StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT` の数え方の照合用。#3143）。
@@ -396,7 +419,6 @@ mod store_backed {
         rt.create(&CreateRequest::new(cid("c1"), bundle).expect("req"))
             .expect("create");
         assert_eq!(*counting.calls.lock().expect("lock"), ["create"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- コンテナログの後始末（#2593・SUP-7・CRI-2・CLI-1）----
@@ -529,7 +551,6 @@ mod store_backed {
         assert_eq!(log_remove_counts(&recorder), Some((1, 0)));
         let st = rt.state(&StateRequest::new(cid("c2"))).expect("c2 state");
         assert_eq!(st.state(), ContainerState::Created);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-7・CRI-2・#2593: sink が生きている間は `delete` は `Ok` のままログを残し、失敗を構造化エラーで観測できる。
@@ -583,7 +604,6 @@ mod store_backed {
         drop(sink);
         rt.remove_container_log(&cid("c1")).expect("removed");
         assert!(sorted_dir_names(&logs).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-7・CRI-2・#2593: 同じ ID が再作成されていたら（ガードが偽）ログを消さない。
@@ -601,6 +621,49 @@ mod store_backed {
         // 状態が残っている（再作成された扱い）間は成功しても現在ログは残る（ロックだけは片付く）。
         rt.remove_container_log(&cid("c1")).expect("skipped");
         assert_eq!(sorted_dir_names(&logs), ["c1.log"]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 残骸（同名のディレクトリ・symlink）を先に置いても消さず・辿らず連番を進めること
+    /// （CRI-2・REPAIR-12・#3479）。
+    #[test]
+    fn cri2_repair12_tmp_dir_skips_stale_residue() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let parent = tmp_dir("residue");
+        let canary = parent.join("canary");
+        std::fs::create_dir(&canary).unwrap();
+        std::fs::write(canary.join("keep"), b"canary").unwrap();
+        std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = std::process::id();
+        let stale0 = parent.join(format!("fc-plugin-cri-t-{pid}-0"));
+        std::fs::create_dir(&stale0).unwrap();
+        std::fs::write(stale0.join("stale"), b"stale").unwrap();
+        let link1 = parent.join(format!("fc-plugin-cri-t-{pid}-1"));
+        symlink(&canary, &link1).unwrap();
+        let new_path = {
+            let d = tmp_dir_in(&parent, "t");
+            assert_eq!(
+                &*d,
+                parent.join(format!("fc-plugin-cri-t-{pid}-2")).as_path()
+            );
+            assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::metadata(&*d).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            d.0.clone()
+        };
+        assert!(!new_path.exists(), "own dir must be removed on drop");
+        assert_eq!(std::fs::read(stale0.join("stale")).unwrap(), b"stale");
+        assert_eq!(std::fs::read(canary.join("keep")).unwrap(), b"canary");
+        assert_eq!(
+            std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            std::fs::symlink_metadata(&link1)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

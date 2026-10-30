@@ -173,6 +173,7 @@ pub fn run(exe: &Path) {
     spawn_write_count(exe);
     launcher_killed_after_spawn_line(exe);
     control_reload(exe);
+    upstream_load(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -944,6 +945,170 @@ fn control_reload(exe: &Path) {
     drop(n);
     drop(g);
     println!("dns_helper_process: control_reload ok registered=db refused=web stop=on_request");
+}
+
+/// `dns` つきのメンバー記録（`member` の上流指定つき版）。
+fn member_dns(id: &str, last: u8, dns: &[std::net::IpAddr]) -> MemberRecord {
+    let token = format!("fandhe-net:dnsh:1:0:0/ep/{id}/g/00000000000000000000000000000001");
+    MemberRecord::new(
+        MemberId::new(id).expect("member id"),
+        EndpointId::new(id).expect("endpoint"),
+        IpPrefix::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), 24).expect("prefix"),
+        &token,
+        Path::new("/run/fc-test-ns"),
+        (8, 9),
+        dns,
+    )
+    .expect("member record")
+}
+
+/// 子の出力 1 本を行ごとに読み、チャネルへ流す（読み手は子の終了で EOF になって終わる）。
+fn pump_lines<R: Read + Send + 'static>(r: R) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(r).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// `prefix` で始まる次の行を期限つきで待つ（REPAIR-5）。
+fn next_line_with(rx: &std::sync::mpsc::Receiver<String>, prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(l) if l.starts_with(prefix) => return l,
+            Ok(_) => {}
+            Err(e) => panic!("no line starting with {prefix:?} before the deadline: {e}"),
+        }
+    }
+}
+
+/// 記録の `--dns` から上流の割り当てを組む製品経路を、実ヘルパー（段 2 を直接起動して stderr を読む）で確かめる
+/// （NET-12・NET-5・#3072・REPAIR-12）。上流の割り当ては転送が無効の間は外から観測できないため、`load_into` が
+/// 出す件数の行（`dns upstreams loaded count= skipped= collisions=`）で、起動時の初回読み込みと制御 UDS の
+/// `Reload` 後の再構築を具体値で照合する。アドレスが衝突したメンバーは collisions に数えられる。
+fn upstream_load(exe: &Path) {
+    use std::io::Write as _;
+    use std::net::IpAddr;
+    let ip = |a: u8, b: u8, c: u8, d: u8| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    let tmp = Tmp::new("ups");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    n.commit_member(&member_dns("web", 2, &[ip(8, 8, 8, 8)]))
+        .expect("web");
+    n.commit_member(&member_dns("api", 3, &[ip(1, 1, 1, 1), ip(9, 9, 9, 9)]))
+        .expect("api");
+    // 同じアドレスのメンバーが 2 つあれば、他コンテナの上流を奪えないようどちらも登録しない（collisions）。
+    n.commit_member(&member_dns("dup1", 4, &[ip(8, 8, 8, 8)]))
+        .expect("dup1");
+    n.commit_member(&member_dns("dup2", 4, &[ip(1, 1, 1, 1)]))
+        .expect("dup2");
+    n.commit_member(&member("plain", 5)).expect("plain");
+
+    let nonce = HelperNonce::generate().expect("nonce");
+    let mut child = Command::new(exe)
+        .args([
+            ARG_STAGE2,
+            "--listen",
+            "127.0.0.1:0",
+            ARG_NONCE,
+            nonce.as_str(),
+            ARG_STATE_ROOT,
+        ])
+        .arg(&tmp.0)
+        .args([ARG_NETWORK, "dnsh"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stage 2");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let out = pump_lines(child.stdout.take().expect("stdout"));
+    let err = pump_lines(child.stderr.take().expect("stderr"));
+    next_line_with(&out, "IDENT ");
+    stdin.write_all(b"ACK\n").expect("ack");
+    stdin.flush().expect("flush");
+    next_line_with(&out, "READY ");
+
+    // 起動時の初回読み込み: web と api が登録、dup1・dup2 は衝突で落ち、plain は上流なし。
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=2 skipped=0 collisions=2"
+    );
+
+    // Reload 後の再構築: web を消し cache・solo を足すと api・cache・solo の 3 件、dup1・dup2 は衝突のまま。
+    assert!(
+        n.remove_member(&MemberId::new("web").expect("id"))
+            .expect("rm")
+    );
+    n.commit_member(&member_dns("cache", 6, &[ip(8, 8, 4, 4)]))
+        .expect("cache");
+    n.commit_member(&member_dns("solo", 7, &[ip(1, 0, 0, 1)]))
+        .expect("solo");
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+    let send = |msg: ControlMessage| {
+        let raw = connect_within(&ctl, Duration::from_secs(10)).expect("connect");
+        raw.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("t");
+        let mut w = &raw;
+        ControlFrame::encode(msg).write_to(&mut w).expect("write");
+        raw
+    };
+    let gen_ = ReloadGeneration::new(0xBEEF).expect("gen");
+    let raw = send(ControlMessage::Reload(gen_));
+    let mut r = &raw;
+    assert_eq!(
+        ControlFrame::read_from(&mut r).expect("loaded"),
+        ControlMessage::Loaded(gen_)
+    );
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=3 skipped=0 collisions=2"
+    );
+
+    // 衝突の片方を消して Reload すると、残った dup1 が登録され collisions が 0 になる。
+    assert!(
+        n.remove_member(&MemberId::new("dup2").expect("id"))
+            .expect("rm")
+    );
+    let gen2 = ReloadGeneration::new(0xCAFE).expect("gen");
+    let raw2 = send(ControlMessage::Reload(gen2));
+    let mut r2 = &raw2;
+    assert_eq!(
+        ControlFrame::read_from(&mut r2).expect("loaded"),
+        ControlMessage::Loaded(gen2)
+    );
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=4 skipped=0 collisions=0"
+    );
+
+    // Stop で自分で終了する。
+    drop(send(ControlMessage::Stop));
+    let t = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if t.elapsed() > Duration::from_secs(6) {
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("helper did not stop on request");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    drop(n);
+    drop(g);
+    println!(
+        "dns_helper_process: upstream_load ok initial=2/collide2 reload=3/collide2 resolved=4/0"
+    );
 }
 
 /// 実機前提（`--ignored`・root と util-linux の `setpriv`）: 別 uid の接続は、フレームを読まれずに切断される

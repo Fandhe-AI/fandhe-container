@@ -9,7 +9,14 @@ set -uo pipefail
 script_dir="$(cd "$(dirname -- "$0")" && pwd)"
 target="${script_dir}/run-in-user-scope.sh"
 work="$(mktemp -d)"
-trap 'pkill -f "sleep 4242" 2>/dev/null; rm -rf -- "${work}"' EXIT
+# 孤児ケースが起動した sleep だけを pid ファイル経由で回収する（pkill -f のパターン一致は並行実行の他プロセスを巻き込む）。
+cleanup_orphan() {
+  local p
+  p="$(cat "${work}/orphan.pid" 2>/dev/null || true)"
+  [ -n "${p}" ] && kill "${p}" 2>/dev/null
+  return 0
+}
+trap 'cleanup_orphan; rm -rf -- "${work}"' EXIT
 fails=0
 
 mkdir -p "${work}/bin"
@@ -79,13 +86,14 @@ grep -q 'systemctl --user stop fandhe-ci-dl-[0-9]*.scope' "${work}/calls" || fai
 
 # 4. 孤児が出力を持って残る（主プロセスは exit 0）: 待たずに戻り、残存を検出して stop を呼ぶ。
 start="$(date +%s)"
-STUB_ACTIVE=1 run_case orphan --name orphan --deadline 30 --log "${log}" -- bash -c 'setsid sleep 4242 & exit 0'
+STUB_ACTIVE=1 run_case orphan --name orphan --deadline 30 --log "${log}" -- bash -c "setsid bash -c 'echo \$\$ >\"${work}/orphan.pid\"; exec sleep 4242' & exit 0"
 elapsed=$(($(date +%s) - start))
 expect_eq orphan-rc 0 "${rc}"
 [ "${elapsed}" -le 10 ] || fail "orphan: took ${elapsed}s (limit 10)"
-grep -q 'leftover_processes name=orphan' "${work}/err" || fail "orphan: leftover warning missing"
+# GITHUB_ACTIONS=true のとき警告は stdout の ::warning:: 行になるため、out と err の両方を見る。
+cat "${work}/out" "${work}/err" | grep -q 'leftover_processes name=orphan' || fail "orphan: leftover warning missing"
 grep -q 'systemctl --user stop fandhe-ci-orphan-[0-9]*.scope' "${work}/calls" || fail "orphan: stop not called"
-pkill -f "sleep 4242" 2>/dev/null
+cleanup_orphan
 
 # 5. 入力不正は 2。
 for bad in \

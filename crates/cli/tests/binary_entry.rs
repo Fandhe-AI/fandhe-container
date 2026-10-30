@@ -3817,7 +3817,7 @@ fn assert_op_log_groups(log: &std::path::Path, expected: &[&[(&str, u32, u32)]])
 /// 別々の組（メタ行つき）として追記し、定義照合が走らない失敗では 2 組目を出さないこと。
 /// 記録器を統合しない判断は `docs/design/network-wiring.md`。成功経路（core の create まで到達）は信頼検証を通る
 /// pasta の配置が環境依存のため扱わず、保持区間の記録は `create_network` の関数単位の試験が固定する。
-/// root の実行は rootful 扱いで名前つきネットワークが `UNIMPLEMENTED` のため試験しない。
+/// root の実行は rootful 扱いで名前つきネットワークが `UNIMPLEMENTED` のため、4 場面は照合せず明示の拒否を照合する。
 #[cfg(all(
     target_os = "linux",
     all(
@@ -3828,12 +3828,31 @@ fn assert_op_log_groups(log: &std::path::Path, expected: &[&[(&str, u32, u32)]])
 #[test]
 fn repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group() {
     use std::os::unix::fs::MetadataExt as _;
-    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
-        return;
-    }
     let tmp = TmpDir::new("net6-3558");
     let dir = isolated_cli_dir("net6-3558");
     let cli = dir.join("fandhe-container");
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        // root は rootful 扱いで名前つきネットワークの create が UNIMPLEMENTED になる。何も照合せず成功させず、
+        // 明示的な拒否（net6 の試験と同じ固定値）を照合して終える。4 場面は非 root の実行で照合する。
+        let state = tmp.0.join("state");
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                state.to_str().expect("utf8"),
+                "network",
+                "create",
+                "web",
+            ],
+        );
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
     let state = tmp.0.join("state");
     let state_s = state.to_str().expect("utf8");
     let missing_pasta = "/nonexistent-dir/pasta";

@@ -8,6 +8,11 @@ mod reap;
 use std::process::Command;
 use std::time::Duration;
 
+// 予測できる名前を消さずに排他作成する補助（REPAIR-12・#3479）。
+#[cfg(target_os = "linux")]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -91,27 +96,20 @@ fn relative_socket_exits_two_without_echoing_path() {
 #[cfg(target_os = "linux")]
 #[test]
 fn insecure_socket_dir_exits_one_without_echoing_path() {
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = std::env::temp_dir().join(format!("fcpc-insecure-{}", std::process::id()));
-    // 前回の残骸があると排他作成が AlreadyExists になるため、先に消す（REPAIR-12・#3375）。
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::DirBuilder::new()
-        .mode(0o755)
-        .create(&dir)
-        .expect("mkdir");
-    // umask に依らず 0755 にする。
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .expect("chmod");
-    let xdg = std::env::temp_dir().join(format!("fcpc-xdg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&xdg);
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&xdg)
-        .expect("mkdir xdg");
-    let sock = dir.join("s.sock");
-    let o = run_with_env(&["--socket", sock.to_str().expect("utf8")], &xdg);
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&xdg);
+    use std::os::unix::fs::PermissionsExt as _;
+    // 予測できる名前を消さずに排他作成し、drop で自分の分だけ消す（REPAIR-12・#3479）。
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Guard(exclusive_dir::create("fcpc-insecure").expect("mkdir"));
+    // 排他作成は 0700。umask に依らず 0755 にする（安全でない配置ディレクトリの再現）。
+    std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let xdg = Guard(exclusive_dir::create("fcpc-xdg").expect("mkdir xdg"));
+    let sock = dir.0.join("s.sock");
+    let o = run_with_env(&["--socket", sock.to_str().expect("utf8")], &xdg.0);
     assert_eq!(o.code, Some(1));
     assert!(o.stderr.starts_with("error: "), "stderr: {}", o.stderr);
     assert!(!o.stderr.contains("fcpc-insecure"));

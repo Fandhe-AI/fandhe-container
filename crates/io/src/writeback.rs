@@ -1973,12 +1973,36 @@ mod tests {
     }
 
     fn temp_append_sink(tag: &str) -> AppendFileSink {
-        let dir = std::env::temp_dir();
-        let name = format!("fandhe-io-{tag}-{}", std::process::id());
-        let sink = AppendFileSink::open_in(&dir, &name, SinkOpenMode::CreateOrTruncate)
-            .expect("sink must construct");
-        let _ = std::fs::remove_file(dir.join(&name));
-        sink
+        temp_append_sink_in(&std::env::temp_dir(), tag).1
+    }
+
+    /// `dir/fandhe-io-<tag>-<pid>-<n>` を `CreateNew` で作り、直後に unlink する。既存のパス
+    /// （通常ファイル・symlink）は切り詰めず辿らず、連番を進める（REPAIR-12・#3479）。
+    fn temp_append_sink_in(dir: &std::path::Path, tag: &str) -> (String, AppendFileSink) {
+        for n in 0..1000u32 {
+            let name = format!("fandhe-io-{tag}-{}-{n}", std::process::id());
+            match AppendFileSink::open_in(dir, &name, SinkOpenMode::CreateNew) {
+                Ok(sink) => {
+                    let _ = std::fs::remove_file(dir.join(&name));
+                    return (name, sink);
+                }
+                Err(e) if e.code() == IoErrorCode::AlreadyExists => continue,
+                Err(e) => panic!("sink must construct: {e:?}"),
+            }
+        }
+        panic!("too many stale test files");
+    }
+
+    /// 残骸を先に置いても切り詰めず、連番を進めて排他作成すること（IO-2・REPAIR-12・#3479）。
+    #[test]
+    fn io2_repair12_temp_append_sink_skips_stale_residue() {
+        let parent = crate::test_temp_file::TempDir::new("fcio-wb-residue");
+        let pid = std::process::id();
+        let stale = parent.path().join(format!("fandhe-io-r-{pid}-0"));
+        std::fs::write(&stale, b"stale").expect("stale");
+        let (name, _sink) = temp_append_sink_in(parent.path(), "r");
+        assert_eq!(name, format!("fandhe-io-r-{pid}-1"));
+        assert_eq!(std::fs::read(&stale).expect("read"), b"stale");
     }
 
     /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず

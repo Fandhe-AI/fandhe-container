@@ -578,27 +578,46 @@ pub fn launcher_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
 }
 
 /// 失敗時に起動元の子と段 2 相当を片付ける（プロセスを漏らさない。REPAIR-5）。
+/// pid 番号への kill は後始末に限り、cmdline の `--nonce` の直後の引数が偽の段 1 の書いた nonce と
+/// 完全一致したときだけ送る（pid 再利用で別の試験のプロセスを止めない。#3482）。帰属できなければ送らない。
+/// 確認から kill までの再利用の窓は残るが、nonce は 128 bit の乱数で別プロセスに当たる確率は実質 0。
 struct KillGuard {
     child: Option<std::process::Child>,
     stage2: PathBuf,
+    nonce_file: PathBuf,
 }
 impl Drop for KillGuard {
     fn drop(&mut self) {
         if let Some(c) = self.child.as_mut() {
             crate::reap::reap_or_report(c, crate::reap::reap_within());
         }
-        // pid 番号への kill は後始末に限る。cmdline に nonce 付きの `sh` であることを確かめてから送る。
-        if let Some(pid) = std::fs::read_to_string(&self.stage2)
+        let Some(pid) = std::fs::read_to_string(&self.stage2)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
-            && std::fs::read(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|c| c.windows(8).any(|w| w == b"--nonce\0"))
-        {
+        else {
+            return;
+        };
+        let nonce = std::fs::read_to_string(&self.nonce_file)
+            .ok()
+            .and_then(|s| HelperNonce::new(s.trim()).ok());
+        if nonce.is_some_and(|n| cmdline_has_nonce(pid, &n)) {
             let mut kill = Command::new("kill");
             kill.args(["-KILL", &pid.to_string()]);
             let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+        } else {
+            eprintln!("kill guard: pid {pid} not attributed by nonce; not killing");
         }
     }
+}
+
+/// `/proc/<pid>/cmdline` に隣接する `--nonce`・`<nonce>` の引数対が完全一致であるか（読めなければ false）。
+fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    args.windows(2)
+        .any(|w| w[0] == b"--nonce" && w[1] == nonce.as_str().as_bytes())
 }
 
 /// `/proc/<pid>/stat` の状態文字。
@@ -616,11 +635,14 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
     let (store, name) = setup(&tmp);
     let script = tmp.0.join("fake-stage1.sh");
     let pidfile = tmp.0.join("stage2.pid");
+    let nonce_file = tmp.0.join("stage2.nonce");
     // 本体は複合コマンドにする（単一の `sleep` だと sh が exec して argv の nonce が消える）。
+    // nonce は KillGuard の帰属用に、段 2 相当の起動前に書く（試験が早期に panic しても帰属できる）。
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$5\" > '{}'\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\nexit 0\n",
+            nonce_file.display(),
             pidfile.display()
         ),
     )
@@ -639,6 +661,7 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
     let mut guard = KillGuard {
         child: Some(child),
         stage2: pidfile.clone(),
+        nonce_file: nonce_file.clone(),
     };
 
     // 同一性つきの意図記録が現れるのを、起動元の ack 期限（2 秒）より短い期限で待つ。
@@ -686,6 +709,18 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
         .expect("pid");
     assert_eq!(recorded.pid, pid);
     assert_eq!(read_identity(pid).expect("identity"), recorded);
+    // KillGuard の帰属の自己照合: 書かれた nonce は意図記録のものと一致し、cmdline の対にだけ一致する。
+    let written = HelperNonce::new(
+        std::fs::read_to_string(&nonce_file)
+            .expect("nonce file")
+            .trim(),
+    )
+    .expect("written nonce");
+    assert!(cmdline_has_nonce(pid, &written));
+    assert!(!cmdline_has_nonce(
+        pid,
+        &HelperNonce::generate().expect("other nonce")
+    ));
     let stop_deadline = Instant::now() + Duration::from_secs(5);
     while proc_state(pid) != Some('T') {
         assert!(

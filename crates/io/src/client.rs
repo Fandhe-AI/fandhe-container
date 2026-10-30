@@ -36,7 +36,7 @@
 //! `Nack` と未知の code はプロトコル違反として失効させる。サーバー側（#3163）・FLUSH の多ファイル化（#3164）・
 //! UDS connect（[`crate::uds_client::UdsClientConnection`]。#3165）は実装済みで、本番の UDS 上での結合は
 //! `tests/crash_safety.rs`（複数ファイルの FLUSH 後の SIGKILL）と `tests/break_detection.rs`
-//! （BREAK-1 / BREAK-2）が確かめる（#3167）。
+//! （BREAK-1 / BREAK-2）が、整合性スイート（`tests/consistency/uds_file_ops.rs`。#3166・IO-4）と併せて確かめる（#3167）。
 //!
 //! # #74（TASK-12.2）以降に残る範囲
 //!

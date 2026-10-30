@@ -13,7 +13,7 @@
 //! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` は
 //! [`uds_client::UdsClientConnection`]（#3165。期限つき connect と接続先 uid の照合）で実装済み。
 //! [`client::PipelineClient`] の型つき API との本番の UDS 上での結合（#3162・#3165）は
-//! `tests/crash_safety.rs`・`tests/break_detection.rs`（#3167）で確かめている。named pipe はまだない
+//! `tests/crash_safety.rs`・`tests/break_detection.rs`（#3167）と整合性スイート（`tests/consistency/uds_file_ops.rs`。#3166）で確かめている。named pipe はまだない
 //! （REPAIR-3。スタブの明示）。vsock は Linux（x86_64 / aarch64）のサーバー側・クライアント側を
 //! [`vsock`] が実装済み（#1119。macOS の Virtualization.framework・Windows の hvsock は
 //! 未実装で `Unimplemented`）。1 本の接続を送信側・受信側へ分けて並行に使う API は

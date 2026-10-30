@@ -970,7 +970,7 @@ fn core2_recreated_after_prepare_is_not_launched() {
     }
 }
 
-/// REPAIR-5・CORE-1・SUP-1・#1819: 準備（手順 3〜7）が期限までに終わらなければ、期限内に INTERNAL（期限超過）を
+/// REPAIR-5・CORE-1・SUP-1・#1819: 準備（手順 3〜7）が期限までに終わらなければ、期限内に TIMEOUT（期限超過。ERR-3・#3557）を
 /// 報告し、後始末は報告の後に行う。報告の後・後始末の前に同じ ID の start を試みても、記録済みのスコープ（予約）の
 /// 照合で FailedPrecondition として拒否される。準備が後から終わっても launch せず、作った cgroup を解放して状態は
 /// Created のままにする（launch は入口スレッドが準備の完了後に行うため、期限超過の後に新しいプロセスは作られない）。
@@ -1030,12 +1030,12 @@ fn repair5_deadline_exceeded_in_prepare_reports_first_and_never_launches() {
     assert!(at < Duration::from_millis(1500), "reported at {at:?}");
     match report_of(&out.bytes()) {
         StartReport::Failed { code, message, .. } => {
-            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(code, ErrorCode::Timeout);
             assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
         }
         other => panic!("unexpected report: {other:?}"),
     }
-    assert_eq!(code, Some(exit_code_for(ErrorCode::Internal)));
+    assert_eq!(code, Some(exit_code_for(ErrorCode::Timeout)));
     // 後から準備が終わっても launch せず、作った cgroup を解放する（子は作られず、terminate もしない）。
     assert!(l.specs.lock().unwrap().is_empty());
     assert_eq!(l.terminated.load(Ordering::SeqCst), 0);
@@ -1047,6 +1047,92 @@ fn repair5_deadline_exceeded_in_prepare_reports_first_and_never_launches() {
     assert_eq!(rec.status().state(), ContainerState::Created);
     assert!(rec.status().pid().is_none());
     assert!(rec.supervision().supervisor_pid().is_none());
+}
+
+/// ERR-3・REPAIR-5・SEC-4・#3557: 準備の期限超過の報告は、期限の配分(1300ms・2000ms。どちらも
+/// `deadline − REPORT_RESERVE` が準備の 1.5s より先に切れる)に依らず `TIMEOUT`(期限超過の message)で、
+/// 後始末を確かめられれば終了コードも `Timeout`。launch せず作った cgroup を解放する。
+#[test]
+fn repair4_sec4_3557_prepare_overdue_reports_timeout_regardless_of_deadline_split() {
+    for deadline_ms in [1300u64, 2000] {
+        let env = Env::new(&format!("ovtm{deadline_ms}"));
+        env.create(&env.id);
+        let calls = new_calls();
+        let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+        d.record_scope = true;
+        d.prepare_delay = Duration::from_millis(1500);
+        let t0 = std::time::Instant::now();
+        let deadline = t0.checked_add(Duration::from_millis(deadline_ms));
+        let mut out = TimedWriter::default();
+        let r = run_start_until(
+            Box::new(d),
+            &env.store,
+            &Arc::new(OpRecorder::new()),
+            &StartRequest::new(cid(&env.id)),
+            &short_timeouts(),
+            deadline,
+            &mut out,
+        );
+        assert_eq!(
+            r.err(),
+            Some(exit_code_for(ErrorCode::Timeout)),
+            "deadline={deadline_ms}"
+        );
+        match report_of(&out.bytes()) {
+            StartReport::Failed { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Timeout, "deadline={deadline_ms}");
+                assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
+            }
+            other => panic!("unexpected report: {other:?}"),
+        }
+        let at = out.reported_at().unwrap() - t0;
+        assert!(
+            at < Duration::from_millis(deadline_ms),
+            "reported at {at:?}"
+        );
+        assert!(l.specs.lock().unwrap().is_empty());
+        assert_eq!(
+            calls_of(&calls),
+            ["check", "prepare", "audit", "build", "release"]
+        );
+        assert_eq!(
+            env.record(&env.id).status().state(),
+            ContainerState::Created
+        );
+    }
+}
+
+/// ERR-3・CORE-3・#3557: 準備の期限超過で報告は `TIMEOUT` のまま、遅れて戻った準備の後始末(cgroup の解放)を
+/// 確かめられなければ終了コードだけ `Internal`(後始末の失敗を成功扱いにしない)。
+#[test]
+fn repair4_sec4_3557_prepare_overdue_unconfirmed_cleanup_exits_internal() {
+    let env = Env::new("ovint");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    d.record_scope = true;
+    d.prepare_delay = Duration::from_millis(1500);
+    d.release_fails = true;
+    let deadline = std::time::Instant::now().checked_add(Duration::from_millis(1300));
+    let mut out = TimedWriter::default();
+    let r = run_start_until(
+        Box::new(d),
+        &env.store,
+        &Arc::new(OpRecorder::new()),
+        &StartRequest::new(cid(&env.id)),
+        &short_timeouts(),
+        deadline,
+        &mut out,
+    );
+    assert_eq!(r.err(), Some(exit_code_for(ErrorCode::Internal)));
+    match report_of(&out.bytes()) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Timeout);
+            assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert!(l.specs.lock().unwrap().is_empty());
 }
 
 /// SEC-4・NET-9・REPAIR-5(#3359): 準備の期限を超えた start でも、積んだ `pasta_verify` の拒否行が報告の後に
@@ -1083,10 +1169,10 @@ fn sec4_3359_deadline_exceeded_flushes_pasta_verify_once() {
         deadline,
         &mut out,
     );
-    assert_eq!(r.err(), Some(exit_code_for(ErrorCode::Internal)));
+    assert_eq!(r.err(), Some(exit_code_for(ErrorCode::Timeout)));
     match report_of(&out.bytes()) {
         StartReport::Failed { code, message, .. } => {
-            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(code, ErrorCode::Timeout);
             assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
         }
         other => panic!("unexpected report: {other:?}"),
@@ -1109,7 +1195,7 @@ fn sec4_3359_deadline_exceeded_flushes_pasta_verify_once() {
 }
 
 /// REPAIR-5・#1819: 準備が済んでも手順 8 の見込み（`launch_step_budget`）が期限内に残らなければ、launch せず
-/// INTERNAL（期限超過）を報告し、作った cgroup を解放する（期限内に終わらない launch を始めない）。
+/// TIMEOUT（期限超過。ERR-3・#3557）を報告し、作った cgroup を解放する（期限内に終わらない launch を始めない）。
 #[test]
 fn repair5_insufficient_budget_skips_launch() {
     let env = Env::new("nobudget");
@@ -1133,7 +1219,7 @@ fn repair5_insufficient_budget_skips_launch() {
     )
     .err()
     .expect("start must fail");
-    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    assert_eq!(code, exit_code_for(ErrorCode::Timeout));
     assert!(l.specs.lock().unwrap().is_empty());
     assert_eq!(
         calls_of(&calls),
@@ -1146,7 +1232,7 @@ fn repair5_insufficient_budget_skips_launch() {
     assert_eq!(after.revision(), StateRevision::from_raw(2));
     match report_of(&out) {
         StartReport::Failed { code, message, .. } => {
-            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(code, ErrorCode::Timeout);
             assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
         }
         other => panic!("unexpected report: {other:?}"),

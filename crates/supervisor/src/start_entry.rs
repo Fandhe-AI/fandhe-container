@@ -51,8 +51,10 @@
 //!   - 予約（Running・pid なし）が残る（呼び出し境界の期限超過や、回収を確かめられなかった launch の失敗）:
 //!     `recover_interrupted_start` を約 50ms 刻みで再試行して Created へ戻し、`take_unreaped_processes` で
 //!     引き取ったハンドルを terminate する。戻せたら cgroup を消し、戻せなければ cgroup を消さない。
-//! - 手順 3〜7 の期限超過、または手順 8 の見込みが残らない: `INTERNAL`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する。
+//! - 手順 3〜7 の期限超過、または手順 8 の見込みが残らない: `TIMEOUT`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する
+//!   （ERR-3 の「期限内に完了しない操作」。2b・2c の期限超過と揃える。#3557）。
 //!   launch はしない。作業スレッドが後から準備を終えたら、launch せずに作った cgroup を消す。
+//! - 期限超過の後も、後始末を確かめられなければ・作業スレッドを放棄したときの終了コードは `INTERNAL`（報告は `TIMEOUT` のまま）。
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
 //! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
@@ -619,9 +621,14 @@ pub const START_OP: &str = "supervisor.start";
 /// 行う（REPAIR-5。core の API を変えずに起動処理全体へ期限を課す）。
 /// - 期限内に成功: `OK <pid>` を報告して `Ok(Running)`（報告の書き込みに失敗しても監視は続ける）。
 /// - 期限内に失敗: そのエラーを報告してから後始末する。後始末を確かめられなければ終了コードは `Internal`。
-/// - 準備の期限超過、または手順 8 の見込み（[`launch_step_budget`]）が残らない: `INTERNAL`
-///   （[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する。launch はしない。作業スレッドが後から準備を終えたら、作った
-///   cgroup を消す（`result_deadline` の長さまで待つ。それでも戻らなければ待つのをやめる）。終了コードは `Internal`。
+/// - 準備の期限超過、または手順 8 の見込み（[`launch_step_budget`]）が残らない: `TIMEOUT`
+///   （[`DEADLINE_EXCEEDED_MESSAGE`]。ERR-3。#3557）を報告する。launch はしない。作業スレッドが後から準備を終えたら、
+///   作った cgroup を消す（`result_deadline` の長さまで待つ。それでも戻らなければ待つのをやめる）。終了コードは
+///   後始末を確かめられれば `Timeout`、確かめられない・作業スレッドを放棄したときは `Internal`。
+///
+/// 計測行（`start_metrics`）の区間は手順 3〜8 の 1 回の呼び出しに限る。手順 3 より前の入口の失敗（0a〜2c。
+/// 2b・2c の期限超過を含む）は本関数を通らず、計測行を出さない。入口全体の件数が REPAIR-4 で要るなら
+/// `START_OP` に混ぜず別の操作名を足す（#3557）。
 ///
 /// 起動の成否とレイテンシは `recorder` の [`START_OP`] に記録し（準備と手順 8 を合わせた時間）、本関数の最後に
 /// 構造化ログ 1 行（[`start_metrics_line`]）で出す。
@@ -732,7 +739,7 @@ fn launch_after_prepare(
         return Attempt::Failed {
             error: OciRuntimeError::new(
                 LifecycleOp::Start,
-                ErrorCode::Internal,
+                ErrorCode::Timeout,
                 DEADLINE_EXCEEDED_MESSAGE,
             ),
             cleanup,
@@ -835,7 +842,7 @@ fn start_reporting(
     // 準備の期限超過: 先に報告し、作業スレッドの結果を有限の期限まで待ってから後始末する。launch はしない。
     let overdue = OciRuntimeError::new(
         LifecycleOp::Start,
-        ErrorCode::Internal,
+        ErrorCode::Timeout,
         DEADLINE_EXCEEDED_MESSAGE,
     );
     log_event("start_deadline_exceeded", Some(ErrorCode::Timeout));
@@ -844,7 +851,10 @@ fn start_reporting(
     let late_until = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
     match worker.wait_or_abandon(late_until) {
         Some((deps, outcome)) => {
-            abandoned_cleanup(deps, store, req.id(), timeouts, outcome);
+            // 報告は TIMEOUT のまま、後始末を確かめられなければ終了コードだけ INTERNAL にする（#3557）。
+            if abandoned_cleanup(deps, store, req.id(), timeouts, outcome) {
+                return Err(exit_code_for(ErrorCode::Timeout));
+            }
         }
         None => {
             // 作業スレッドがまだ戻らない（放棄は待ちの打ち切りと同じロックの下で記した）。以後に戻った結果は
@@ -1173,7 +1183,8 @@ fn discard_prepared(prepared: Prepared) -> Cleanup {
 /// 入口が待つのをやめた後に作業スレッドが戻ったとき（または期限超過の報告の後に結果が出たとき）の後始末。
 ///
 /// launch はしない。準備が済んだ結果（`Ready`）は作った cgroup を消し、失敗の結果はその後始末を行う
-/// （best effort。プロセスの終了までに終われば行う）。
+/// （best effort。プロセスの終了までに終われば行う）。戻り値は後始末を確かめられたか（期限超過経路の終了コードの
+/// 決定に使う。#3557）。
 /// 報告の後に積んだ遅延ログ（`pasta_verify` の拒否行など）を先に出す。`deps` はここで消費されるため、
 /// 期限超過経路の出口はこの 1 箇所に集約する（#3359・SEC-4・REPAIR-5。flush は待たない）。
 fn abandoned_cleanup(
@@ -1182,13 +1193,13 @@ fn abandoned_cleanup(
     id: &ContainerId,
     timeouts: &StartTimeouts,
     outcome: PrepareOutcome,
-) {
+) -> bool {
     deps.flush_deferred_logs();
     let cleanup = match outcome {
         PrepareOutcome::Ready(prepared) => discard_prepared(prepared),
         PrepareOutcome::Failed { cleanup, .. } => cleanup,
     };
-    let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
+    cleanup_after_report(deps, store, id, timeouts, cleanup)
 }
 
 /// `f`（状態ストア・cgroup への I/O を含む後始末の全体）を作業スレッドで実行し、`limit` まで結果を待つ。
@@ -3344,8 +3355,9 @@ mod linux {
         if let Some(w) = unjoined_options {
             // 2c の期限超過は手順 3 以降へ進まず、残りの期限の配分に依らず `TIMEOUT` を 1 行報告して止まる
             // (2b の期限超過と同じ形。未回収の作業スレッドを残したまま回復の launcher を組まない。
-            // 手順 3 の中断起動の回復は次の start が行う。計測行は 2b と揃えて出さない。
-            // SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
+            // 手順 3 の中断起動の回復は次の start が行う。計測行は 2b と揃えて出さない: `start_metrics` の区間は
+            // 手順 3〜8 で、手順 3 より前の失敗は混ぜない。2c の期限超過の記録は `pasta_verify`(timeout)の構造化ログと
+            // 報告行が担う。入口全体の件数が要るなら別の操作名を足す。SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
             let err = op_err(TraitError::new(
                 ErrorCode::Timeout,
                 OPTIONS_PREPARE_TIMEOUT_MESSAGE,

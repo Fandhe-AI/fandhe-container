@@ -74,7 +74,7 @@ fandhe-container/
 │   │   ├── license-deny-fail-closed-report.md  # 非許可ライセンス検出の fail-closed 確認記録（TASK-90.2・OSS-4・OSS-5・REPAIR-9）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）
-│   │   ├── small-files-bench.md   # 小ファイル多数の files/s 計測ハーネスの計測定義（TASK-189・IO-6・IO-7・REPAIR-8。metrics.json・BENCH_NAMES 登録済み・baseline 未登録）
+│   │   ├── small-files-bench.md   # 小ファイル多数の files/s 計測ハーネスの計測定義（TASK-189・IO-6・IO-7・REPAIR-8。2 経路 wire〔UDS〕/ server-api・ゲートは wire〔#2074〕。metrics.json・BENCH_NAMES 登録済み・baseline 未登録）
 │   │   ├── mac-small-files-bench.md  # MAC-3 小ファイル多数ワークロードの計測定義（Docker Desktop 基準。p95 の取り方はオーナー確認待ち・own 側は未実装。TASK-70 準備・#1880）
 │   │   ├── startup-latency-bench.md  # 起動レイテンシ p95 ベンチの計測定義（TASK-190・REPAIR-8・CORE-10。実機前提・ゲート未登録）
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）

@@ -56,7 +56,7 @@ name = "plugin_boundary_macos_cold_start"
 harness = false
 
 # [[bench]] small_files は TASK-189（IO-6・IO-7・REPAIR-8）の小ファイル多数 files/s 計測ハーネス。
-# サーバー側 API の直接呼び出し（ワイヤー経路ではない）。metrics.json・BENCH_NAMES へ登録済み（#1899）。baseline 未登録のため bench-check の比較対象外（基準値は #230）。
+# 経路は --route で選ぶ（wire〔UDS 越しのフレーム〕/ server-api〔サーバー側 API の直接呼び出し。既定〕。回帰ゲートは wire。#2074）。metrics.json・BENCH_NAMES へ登録済み（#1899）。baseline 未登録のため bench-check の比較対象外（基準値は #230）。
 [[bench]]
 name = "small_files"
 harness = false

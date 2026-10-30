@@ -1,7 +1,7 @@
 //! `fandhe-container-benches` の `small_files` ベンチ（`harness = false`。TASK-189・IO-6・IO-7・REPAIR-8）。
 //!
-//! 小ファイル多数ワークロードの files/s を、サーバー側 API の直接呼び出しで計測する
-//! （ワイヤー経路ではない。ワイヤー経路への切り替えは #1886 の後）。計測ロジックと計測定義は
+//! 小ファイル多数ワークロードの files/s を計測する。経路は `--route wire`（UDS 越しのフレーム。
+//! 回帰ゲートはこちら）か `--route server-api`（サーバー側 API の直接呼び出し。既定。#2074）。計測ロジックと計測定義は
 //! `fandhe_container_benches::small_files` と `docs/design/small-files-bench.md` にあり、
 //! ここは引数の振り分けと出力だけの薄い層。metrics.json・BENCH_NAMES へ登録済み（#1899）で、baseline 未登録の間は bench-check の比較対象外（基準値は #230）。
 //!

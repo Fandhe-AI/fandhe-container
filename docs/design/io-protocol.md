@@ -590,7 +590,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3166 | 整合性スイート（IO-4・TASK-14）。実装済み | #3162・#3164・#3165 |
 | #3167 | crash_safety・break_detection（IO-3・REPAIR-7）。実装済み（別ユーザーの実サーバーでの uid 照合は人間担当。手順は `docs/verification/io-uds-client-peer-uid.md`） | #3164・#3165 |
 
-下流の #2074（TASK-189 のワイヤー経路への切り替え）は #3162・#3164・#3165 に依存する。各 issue の受け入れ条件に、該当モジュールの REPAIR-3 の記述の更新を含める（`lib.rs`・`guest_files.rs`・`writeback.rs`・`client.rs`・`vsock.rs`）。
+下流の #2074（TASK-189 のワイヤー経路への切り替え。`--route wire` として実装済み）は #3162・#3164・#3165 に依存する。各 issue の受け入れ条件に、該当モジュールの REPAIR-3 の記述の更新を含める（`lib.rs`・`guest_files.rs`・`writeback.rs`・`client.rs`・`vsock.rs`）。
 
 ### spec への確認事項（オーナーへ報告。本リポでは決めない）
 

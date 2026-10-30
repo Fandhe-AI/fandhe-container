@@ -11,7 +11,7 @@
 
 | metric | 向き | 単位 | 状態 |
 | ---- | ---- | ---- | ---- |
-| 小ファイル多数ワークロードの files/s | `higher_is_better` | 未確定（実測で確定。TASK-88.h1） | ハーネス実装済み（TASK-189・#1898。metric は `small_files_files_per_sec`）。`metrics.json`・`BENCH_NAMES` へ登録済み（#1899）。baseline 未登録のため `bench-check` の比較対象外 |
+| 小ファイル多数ワークロードの files/s | `higher_is_better` | 未確定（実測で確定。TASK-88.h1） | ハーネス実装済み（TASK-189・#1898。metric は `small_files_files_per_sec`）。`metrics.json`・`BENCH_NAMES` へ登録済み（#1899）。ゲートは UDS 越しのワイヤー経路（`--route wire`・#2074）を測り、基準値（#230）もこの経路の値で作る。baseline 未登録のため `bench-check` の比較対象外 |
 | コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | ベンチ実装済み（TASK-190・#1900。metric は `startup_create_to_supervisor_ok_p95_ms`。`startup-latency-bench.md`）。実機前提で CI では実行しない。`metrics.json` へ登録済み（#1901。単位は ms）。`BENCH_NAMES` には入れず（`lib.sh` の `BENCH_MANUAL_NAMES`）、基準値は共有の `baseline.json` でなく `benches/baseline-manual.json`（未作成。実測は #230）。比較は人が実機で `make bench-check-manual`。CI では回帰を検出できない |
 | plugin 境界 代表操作 A の inproc / framed / Δp50（`plugin_boundary_op_a_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.1・113.3 で実装済み。metrics.json・`BENCH_NAMES` に登録済み。baseline 未登録 |
 | plugin 境界 代表操作 B の inproc / framed / Δp50（`plugin_boundary_list_images_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.2・113.3 で実装済み。登録状況は上と同じ |

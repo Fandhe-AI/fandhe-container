@@ -417,6 +417,7 @@ impl NetworkStore {
         }
         Ok(Some(Self {
             dir,
+            state_root: state_root.to_path_buf(),
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
             recorder,
         }))

@@ -86,6 +86,22 @@ fn answers(target: std::net::SocketAddrV4) -> bool {
     )
 }
 
+/// 制御 UDS へ期限つきで接続する（REPAIR-5）。`UnixStream::connect` は listener の backlog が満杯だと
+/// 無期限にブロックし、直後の `set_read_timeout` は効かないため、別スレッドで接続して受け取りを待つ。
+/// 期限切れのときは Err を返す（接続スレッドは置き去りになるが、呼び出し側が相手を回収して試験を落とす）。
+fn connect_within(path: &Path, within: Duration) -> Result<std::os::unix::net::UnixStream, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(&path));
+    });
+    match rx.recv_timeout(within) {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("connect failed: {e}")),
+        Err(e) => Err(format!("connect did not complete within {within:?}: {e}")),
+    }
+}
+
 /// `name` の A クエリ（ID 0xABCD）を送り、最初に届いた応答のバイト列を返す（届かなければ None）。
 fn query_a(target: std::net::SocketAddrV4, name: &str) -> Option<Vec<u8>> {
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
@@ -892,7 +908,7 @@ fn control_reload(exe: &Path) {
     assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
 
     // 実在しない世代の Loaded を返さない相手（生のフレームで Reload を直接送る）への応答は同じ世代。
-    let raw = std::os::unix::net::UnixStream::connect(&ctl).expect("connect");
+    let raw = connect_within(&ctl, Duration::from_secs(10)).expect("connect");
     raw.set_read_timeout(Some(Duration::from_secs(2)))
         .expect("t");
     let gen_ = ReloadGeneration::new(0xFEED).expect("gen");
@@ -1032,7 +1048,16 @@ pub fn foreign_uid(exe: &Path) {
 
     // root は DAC を越えて接続できるが、ヘルパーは uid 不一致として読まずに切断する。
     let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
-    let raw = std::os::unix::net::UnixStream::connect(&ctl).expect("root connect");
+    let raw = match connect_within(&ctl, within) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("root connect to the helper control socket: {e}");
+        }
+    };
     raw.set_read_timeout(Some(Duration::from_secs(3)))
         .expect("t");
     let mut w = &raw;

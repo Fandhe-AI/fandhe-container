@@ -37,8 +37,9 @@
 //! （REPAIR-3）、ファイル操作（パス・rename・truncate 等。TASK-14 の整合性
 //! スイートが要する）をペイロードで表す形式のうち作成・追記・Close・Nack は v2
 //! （`PROTOCOL_VERSION` 2。#3161）の符号化と復号が実装済みで、その処理は別モード
-//! （ファイル操作モード。#3163）が担う予定で未実装。本関数は単一 sink モードで、
-//! v2 のファイル操作の種別を受けたら接続全体を `InvalidArgument` で終える（F3）。
+//! （ファイル操作モード。[`crate::file_serve::serve_file_connection`]・#3163）が担う。
+//! 本関数は単一 sink モードで、v2 のファイル操作の種別を受けたら接続全体を
+//! `InvalidArgument` で終える（F3）。
 //!
 //! パスを持つ作成の入口は [`crate::guest_files::GuestFileCreator`]（TASK-19.2・
 //! IO-5・#100）で、サーバー側 API が大文字小文字衝突を検査したうえでファイルを
@@ -471,6 +472,32 @@ impl BatchSink for AppendFileSink {
 
     fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
         self.persist_with_support(crate::barrier::persist_support())
+    }
+}
+
+impl AppendFileSink {
+    /// `body` を現在の EOF へ 1 件追記し、書いたバイト数を返す（ファイル操作モード
+    /// `file_serve` の WriteFile 用。#3163）。
+    ///
+    /// `write_batch` と同じ契約を 1 件分で守る: 書き込み前に dirty を立て（途中失敗でも
+    /// 一部が書かれうる）、毎回 EOF へ位置合わせしてから書く（外部 truncate 後の穴を
+    /// 作らない。IO-4）。エラーにはパス・データの中身を載せない。
+    pub(crate) fn append_body(&mut self, body: &[u8]) -> Result<u64, IoError> {
+        self.dirty_since_persist = true;
+        self.file.seek(SeekFrom::End(0)).map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!(
+                    "sink seek to end failed ({:?}) before appending",
+                    err.kind()
+                ),
+            )
+        })?;
+        self.file
+            .write_all(body)
+            .map_err(|err| sink_error_from_io(&err, 1))?;
+        u64::try_from(body.len())
+            .map_err(|_| IoError::new(IoErrorCode::Internal, "body length does not fit in u64"))
     }
 }
 

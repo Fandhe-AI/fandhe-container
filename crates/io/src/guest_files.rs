@@ -23,20 +23,19 @@
 //! # スタブの明示（REPAIR-3）
 //! ワイヤー形式（[`crate::payload`]）の `Write` はパスを持たない。v2 の `Create`
 //! （`encode_create` / `decode_create`。#3161）の符号化と復号は実装済みだが、これを
-//! 受けて本モジュールを呼ぶサーバー（`serve_file_connection`。#3163）は未実装で、
-//! ワイヤー上から作成要求を受ける経路はまだない。本モジュールはワイヤー形式を
-//! 変えずにサーバー側 API として組み込む。パスの構文検証は
+//! 受けて本モジュールを呼ぶサーバーは [`crate::file_serve::serve_file_connection`]
+//! （#3163）で、内部入口 `create_file_inner` を呼ぶ。パスの構文検証は
 //! [`crate::guest_path::GuestPath`]（F5・#3159）に集約済みで、#3161 の復号は長さと
 //! UTF-8 だけを見る。ワイヤー上の作成の構文検証は、送信側（#3162 の
-//! `PipelineClient::create`。実装済み）が `GuestPath` で行い、#3163 のディスパッチが
-//! 同じ関数で行う予定（未実装。REPAIR-3）。
+//! `PipelineClient::create`。実装済み）が `GuestPath` で行い、サーバー側は
+//! `create_file_inner` が行う（構文違反は reason `PathSyntax` の Nack になる。#3163）。
 //!
 //! ホストパス長（260 UTF-16 単位。F5・IO-5・#3160）は構文検証の直後、ロックと走査の
 //! 前に純計算で検査する。Windows ホストは何も作らずに `InvalidArgument`（reason
 //! `HostPathTooLong`）で拒否し、その他の OS は作成を続けて警告（`host_path_warning`）
-//! を内部の戻り値に持つ（Linux / macOS で npm の深いパスを拒否しないため）。警告と
-//! 拒否理由 reason を観測（`FileServeStats` 等）へ流す配線は #3163（REPAIR-3）で、
-//! 公開の [`GuestFileCreator::create_file`] は警告を捨てる。reason の値表は
+//! を内部の戻り値に持つ（Linux / macOS で npm の深いパスを拒否しないため）。警告は
+//! `serve_file_connection` が件数として観測（`FileServeStats`）へ流し、拒否理由 reason は
+//! Nack と統計へ流す（#3163）。公開の [`GuestFileCreator::create_file`] は警告を捨てる。reason の値表は
 //! `crate::nack_reason`、失敗の分類は内部関数 `classify_create_failure`（F10・#3160）。
 //!
 //! # 契約と既知の限界
@@ -231,11 +230,7 @@ pub(crate) struct CreatedGuestFile {
     /// 検査済みの書き込み先。
     pub(crate) sink: AppendFileSink,
     /// ホストパス長が 260 を超えたが、Windows 以外のため作成を続けたときの計測結果
-    /// （F5。観測への配線は #3163。REPAIR-3）。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by serve_file_connection (#3163)")
-    )]
+    /// （F5。`file_serve` が件数として観測へ流す。#3163）。
     pub(crate) host_path_warning: Option<HostPathLength>,
 }
 
@@ -245,10 +240,6 @@ pub(crate) struct CreateFailure {
     /// 公開の `create_file` が返すエラー（code・文言は従来どおり）。
     pub(crate) error: IoError,
     /// 発生した箇所で付ける拒否理由（エラー文言の照合では分類しない）。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by classify_create_failure (#3163)")
-    )]
     pub(crate) reason: Option<NackReason>,
 }
 
@@ -293,10 +284,6 @@ impl CreateFailure {
 /// 実際のエラーの code と一致するときだけ `Some`（要求単位の Nack）。`None` は接続全体の
 /// 失敗（不一致は fail-closed でこちらに倒す）。#3163 の `serve_file_connection` が
 /// Nack と接続の失効を分けるのに使う。
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by serve_file_connection (#3163)")
-)]
 pub(crate) fn classify_create_failure(failure: &CreateFailure) -> Option<NackReason> {
     let reason = failure.reason?;
     (reason.code() == Some(failure.error.code())).then_some(reason)
@@ -376,7 +363,7 @@ impl GuestFileCreator {
     /// 走査・再検証・取り消しの失敗は `Internal`
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
-        // ホストパス長の警告は公開 API では捨てる（観測への配線は #3163。REPAIR-3）。
+        // ホストパス長の警告は公開 API では捨てる（観測への配線は file_serve が行う。#3163）。
         self.create_file_inner(guest_path)
             .map(|created| created.sink)
             .map_err(|failure| failure.error)
@@ -1654,6 +1641,13 @@ mod fault {
             f();
         }
     }
+}
+
+/// 他モジュールの試験（`file_serve`）が、次の葉の作成を I/O エラーで失敗させる継ぎ目
+/// （接続全体の失敗を決定的に作る。Linux / macOS。現スレッドにだけ効く）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn test_fail_next_leaf_creation() {
+    fault::fail_leaf_with(std::io::ErrorKind::Other);
 }
 
 #[cfg(test)]

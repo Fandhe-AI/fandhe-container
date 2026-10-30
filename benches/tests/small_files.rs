@@ -183,11 +183,39 @@ fn wire_unavailable() -> bool {
     }
 }
 
+/// wire 経路を動かせない環境では、試行と `run` がどちらも副作用（専用ディレクトリ・ソケット用
+/// ディレクトリ）の前に `persist-unsupported` で拒否されることを確かめて `true` を返す。動かせる環境では
+/// 何もせず `false` を返す（非対応環境で検証なしに成功扱いにしないため。IO-2・REPAIR-3・REPAIR-12）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wire_rejected_when_unavailable() -> bool {
+    if !wire_unavailable() {
+        return false;
+    }
+    let root = TestRoot::new("wire-rejected");
+    let socket_parent = TestRoot::new_short();
+    let err = run_trial_in(
+        socket_parent.path(),
+        root.path(),
+        &wire_plan(8, Layout::Flat, 1),
+        far(),
+        far(),
+    )
+    .expect_err("wire trial must be rejected without FLUSH support");
+    assert_eq!(err.code, "persist-unsupported");
+    assert!(root.entries().is_empty());
+    assert!(socket_parent.entries().is_empty());
+    let err = run(&wire_plan(8, Layout::Flat, 1), root.path())
+        .expect_err("wire run must be rejected without FLUSH support");
+    assert_eq!(err.code, "persist-unsupported");
+    assert!(root.entries().is_empty());
+    true
+}
+
 /// IO-1・IO-2・IO-6: wire 経路が期待どおりの件数と内容のファイルを作る（64 の境界をまたぐ）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn io1_io2_io6_wire_trial_creates_files_with_expected_content() {
-    if wire_unavailable() {
+    if wire_rejected_when_unavailable() {
         return;
     }
     let root = TestRoot::new("wire-content");
@@ -208,7 +236,7 @@ fn io1_io2_io6_wire_trial_creates_files_with_expected_content() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn io2_wire_flush_every_k_crosses_batch_boundary() {
-    if wire_unavailable() {
+    if wire_rejected_when_unavailable() {
         return;
     }
     let root = TestRoot::new("wire-everyk");
@@ -226,7 +254,7 @@ fn io2_wire_flush_every_k_crosses_batch_boundary() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn repair5_wire_expired_deadline_yields_timeout_without_value() {
-    if wire_unavailable() {
+    if wire_rejected_when_unavailable() {
         return;
     }
     let root = TestRoot::new("wire-deadline");
@@ -240,7 +268,7 @@ fn repair5_wire_expired_deadline_yields_timeout_without_value() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn repair3_wire_cleanup_removes_socket_dir() {
-    if wire_unavailable() {
+    if wire_rejected_when_unavailable() {
         return;
     }
     let root = TestRoot::new("wire-cleanup");

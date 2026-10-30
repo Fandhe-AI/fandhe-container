@@ -71,6 +71,7 @@ on:
           helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証 /
           helper-noscope = scripts/run-with-deadline.sh（scope を作らない版・#3505。期限 60 秒）の同じ実証。
           どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
+          プローブのステップは Linux の leg だけで実行する（macOS・Windows の leg は通常どおり 3 OS で回る・#3556）。
           PR・push では存在しない（none 相当）
         type: choice
         options:
@@ -925,12 +926,6 @@ jobs:
               ;;
           esac
           echo "scope hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
-          exit 1
-
-      - name: 委譲スコープ実行のハングプローブ（Linux 以外では実行しない）
-        if: env.SCOPE_HANG_PROBE != 'none' && runner.os != 'Linux'
-        run: |
-          echo "scope-hang-probe is linux only" >&2
           exit 1
 
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）

@@ -170,7 +170,7 @@ pub fn override_recover_timeout_for_test(timeout: Duration) -> Result<(), NetErr
 }
 
 /// 起動窓の回収（`recover_dns_helper_intent`）全体の期限。候補の走査が超えたら意図記録を残して `Timeout`。
-/// 実効値は [`recover_timeout`]（試験専用 feature では上書きできる。#3559）。
+/// 実効値は `recover_timeout`（試験専用 feature では上書きできる。#3559）。
 pub const DNS_HELPER_RECOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 段 1 の終了を待つ上限。
 pub const DNS_HELPER_STAGE1_EXIT_TIMEOUT: Duration = Duration::from_secs(2);

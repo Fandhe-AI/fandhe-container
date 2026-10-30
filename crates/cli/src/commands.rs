@@ -1408,41 +1408,84 @@ mod net12_argv_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// 存在しない状態ルートと、それを内包する私有の親。親は排他作成(unix は 0700)し Drop で消す。
+    /// 状態ルートはその子の未存在の名前なので、共有の `temp_dir()` 直下の名前を先に消す必要がない
+    /// (消してから使う方式の TOCTOU を避ける。REPAIR-12・#3435・#3506)。
+    struct FreshRoot {
+        _parent: crate::test_root::TestRoot,
+        root: std::path::PathBuf,
+    }
+
     /// 存在しない状態ルートを返す(作られていないことを後で照合する)。
-    fn fresh_root() -> std::path::PathBuf {
+    fn fresh_root() -> FreshRoot {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        fresh_root_at(std::env::temp_dir().join(format!("fc-cli-net12-{}-{n}", std::process::id())))
-    }
-
-    /// 指定パスに前回の残骸（異常終了・PID 再利用）があれば消してから返す。残骸が残ると
-    /// 「作られていないこと」の照合が偽の赤になるため、消せないときは進めず panic する
-    /// （fail-closed。REPAIR-12・#3435）。
-    fn fresh_root_at(p: std::path::PathBuf) -> std::path::PathBuf {
-        match std::fs::remove_dir_all(&p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("stale test dir could not be removed: {}: {e}", p.display()),
+        let parent = crate::test_root::test_root("fc-cli-net12", &n.to_string());
+        let root = parent.join("root");
+        FreshRoot {
+            _parent: parent,
+            root,
         }
-        p
     }
 
-    /// NET-12・REPAIR-12・#3435: 残骸があっても `fresh_root_at` は存在しない状態ルートを返す。
+    /// NET-12・REPAIR-12・#3506: `fresh_root` は未存在の状態ルートを返し、呼び出しごとに別の私有の親を使う。
+    /// 同じ位置の残骸(ディレクトリ・symlink)は消さず・辿らない。
     #[test]
-    fn net12_repair12_fresh_root_clears_stale_residue() {
-        let stale = std::env::temp_dir().join(format!(
-            "fc-cli-net12-residue-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+    fn net12_repair12_3506_fresh_root_leaves_stale_residue_untouched() {
+        let a = fresh_root();
+        let b = fresh_root();
+        assert!(!a.root.exists());
+        assert!(!b.root.exists());
+        assert_ne!(a.root, b.root);
+        assert!(a.root.parent().expect("parent").is_dir());
+
+        let stale = a.root.parent().expect("parent").join("stale");
         std::fs::create_dir_all(stale.join("sub")).expect("mkdir");
         std::fs::write(stale.join("sub").join("old"), b"stale").expect("write");
-        let p = fresh_root_at(stale.clone());
-        assert_eq!(p, stale);
-        assert!(!p.exists());
+        let fresh = crate::test_root::test_root_at(stale.clone());
+        assert_ne!(&*fresh, stale.as_path());
+        assert_eq!(std::fs::read_dir(&*fresh).expect("read_dir").count(), 0);
+        assert_eq!(
+            std::fs::read(stale.join("sub").join("old")).expect("read"),
+            b"stale"
+        );
+    }
+
+    /// NET-12・REPAIR-12・#3506: 残骸の symlink(実在ディレクトリ・宛先なし)を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn net12_repair12_3506_fresh_root_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let holder = fresh_root();
+        let parent = holder.root.parent().expect("parent").to_path_buf();
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let r1 = crate::test_root::test_root_at(link.clone());
+        let r2 = crate::test_root::test_root_at(dangling.clone());
+        assert_ne!(&*r1, link.as_path());
+        assert_ne!(&*r2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&*r1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim dir").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     /// `create` を実行し (終了コード, code, stderr) を返す。状態ルートが作られていないことも確かめる。
@@ -1455,7 +1498,8 @@ mod net12_argv_tests {
         extra: &[&str],
         root_must_be_absent: bool,
     ) -> (u8, Option<&'static str>, String) {
-        let root = fresh_root();
+        let fresh = fresh_root();
+        let root = fresh.root.clone();
         let mut full: Vec<OsString> = vec!["--root".into(), root.clone().into(), "create".into()];
         full.extend(extra.iter().map(OsString::from));
         full.extend(["--bundle", "/nonexistent-bundle", "c1"].map(OsString::from));

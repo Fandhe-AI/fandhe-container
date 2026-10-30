@@ -1684,25 +1684,63 @@ mod tests {
         assert_eq!(cfg.deadline, Duration::from_secs(600));
     }
 
-    /// 前回の残骸（古い lock ファイル等）があれば消してから空のディレクトリを作る。残骸があると
-    /// 「ロックを作らない」の照合が崩れる（REPAIR-12・#3375）。
-    #[cfg(unix)]
-    fn create_fresh_dir(dir: &std::path::Path) {
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).expect("mkdir");
-    }
-
-    /// CRI-2・REPAIR-12(#3375): 前回の残骸（古い `.cri/@instance.lock`）があっても `create_fresh_dir` が
-    /// 空のディレクトリへ作り直す。
+    /// CRI-2・REPAIR-12(#3506): 前回の残骸（古い `.cri/@instance.lock`）があっても消さず、別名の空のディレクトリを
+    /// 作る。残骸のロックファイルは無傷で残り、新しいディレクトリ上で `acquire_instance_lock_in` が取れる。
     #[cfg(unix)]
     #[test]
-    fn cri2_repair12_create_fresh_dir_clears_stale_residue() {
-        let dir = std::env::temp_dir().join(format!("fcpc-stale-residue-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".cri")).expect("stale dir");
-        std::fs::write(dir.join(".cri").join("@instance.lock"), b"x").expect("stale lock");
-        create_fresh_dir(&dir);
+    fn cri2_repair12_3506_fresh_dir_leaves_stale_lock_residue_untouched() {
+        let parent = crate::test_root::test_root("fcpc-stale-parent", "t");
+        let stale = parent.join("stale");
+        std::fs::create_dir_all(stale.join(".cri")).expect("stale dir");
+        let stale_lock = stale.join(".cri").join("@instance.lock");
+        std::fs::write(&stale_lock, b"x").expect("stale lock");
+        let dir = crate::test_root::test_root_at(stale.clone());
+        assert_ne!(&*dir, stale.as_path());
+        assert_eq!(dir.parent(), Some(&*parent));
         assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let lock = crate::instance_lock::acquire_instance_lock_in(
+            &dir,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("lock on the fresh directory");
+        drop(lock);
+        assert_eq!(std::fs::read(&stale_lock).expect("read"), b"x");
+    }
+
+    /// CRI-2・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_repair12_3506_fresh_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = crate::test_root::test_root("fcpc-symlink-parent", "t");
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let d1 = crate::test_root::test_root_at(link.clone());
+        let d2 = crate::test_root::test_root_at(dangling.clone());
+        assert_ne!(&*d1, link.as_path());
+        assert_ne!(&*d2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&d1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     /// CRI-2・CORE-1・REPAIR-12・#3035: 注入で組んだバックエンドはインスタンスロックを持たず、状態ルートも持たない
@@ -1710,8 +1748,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cri2_injected_backends_hold_no_instance_lock_and_create_no_lock_file() {
-        let dir = std::env::temp_dir().join(format!("fcpc-inj-nolock-{}", std::process::id()));
-        create_fresh_dir(&dir);
+        let dir = crate::test_root::test_root("fcpc-inj-nolock", "t");
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
         let rt = Arc::new(CoreLifecycleRuntime::new(Arc::clone(&store)));
 
@@ -1740,7 +1777,6 @@ mod tests {
         )
         .expect("lock is free for another acquirer");
         drop(lock);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn cid(s: &str) -> ContainerId {
@@ -2164,17 +2200,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair4_2938_record_store_ops_reach_shared_recorder() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-plugin-cri-rsrec-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        // 排他作成(0700)した私有ディレクトリ。既存の名前は消さず・辿らず・chmod しない(REPAIR-12・#3506)。
+        let dir = crate::test_root::test_root("fandhe-plugin-cri-rsrec", "t");
         let recorder = Arc::new(OpRecorder::new());
         let store = FileRecordStore::open(&dir)
             .expect("open")
@@ -2349,16 +2376,15 @@ mod tests {
                 Err(TraitError::new(ErrorCode::Internal, "sink down"))
             }
         }
-        let dir = std::env::temp_dir().join(format!("fc-cri-2594-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_root::test_root("fc-cri-2594", "t");
         std::fs::create_dir_all(dir.join("rootfs")).expect("rootfs");
         std::fs::write(
             dir.join("config.json"),
             r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/true"],"cwd":"/"},"mounts":[{"destination":"/../..","type":"bind","source":"/srv/x","options":["bind","rw"]}]}"#,
         )
         .expect("config");
-        let req =
-            CreateRequest::new(ContainerId::new("c1").expect("id"), dir.clone()).expect("req");
+        let req = CreateRequest::new(ContainerId::new("c1").expect("id"), dir.to_path_buf())
+            .expect("req");
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
         let plain = CoreLifecycleRuntime::new(Arc::clone(&store))
             .create(&req)
@@ -2367,7 +2393,6 @@ mod tests {
             .with_create_audit_sink(Arc::new(Failing))
             .create(&req)
             .expect_err("rejected");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(audited.code(), ErrorCode::InvalidArgument);
         assert_eq!(audited.code(), plain.code());
         assert_eq!(audited.message(), plain.message());

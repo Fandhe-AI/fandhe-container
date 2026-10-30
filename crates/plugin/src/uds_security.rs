@@ -2500,26 +2500,57 @@ mod imp {
             );
         }
 
-        struct Tmp(std::path::PathBuf);
+        /// 試験用ディレクトリ。`.0` は排他作成したパス、`.1` は Drop で自分が作ったパスだけを消す所有者。
+        /// 既存の名前は消さず・辿らず別名で作る（共有部品 `test_root`。REPAIR-12・#3375・#3506）。
+        struct Tmp(
+            std::path::PathBuf,
+            #[allow(dead_code)] crate::test_root::TestRoot,
+        );
         impl Tmp {
             fn new() -> Self {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fcus-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                // 前回の残骸があれば消してから排他作成する（REPAIR-12・#3375）。
-                let _ = std::fs::remove_dir_all(&p);
-                DirBuilder::new().mode(0o700).create(&p).unwrap();
-                Self(p)
+                let root = crate::test_root::test_root(
+                    "fcus",
+                    &N.fetch_add(1, Ordering::Relaxed).to_string(),
+                );
+                Self(root.to_path_buf(), root)
             }
         }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+
+        /// PLUG-12・REPAIR-12・#3506: 残骸の symlink（実在ディレクトリ・宛先なし）を辿らず、別名で作る。
+        /// 実在ディレクトリの mode と中身は変わらず、宛先なしの symlink の宛先は作られない。
+        #[test]
+        fn plug12_repair12_3506_tmp_root_does_not_follow_symlink_residue() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let parent = Tmp::new();
+            let victim = parent.0.join("victim");
+            DirBuilder::new().mode(0o755).create(&victim).unwrap();
+            std::fs::write(victim.join("keep"), b"keep").unwrap();
+            let link = parent.0.join("link");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let target = parent.0.join("nowhere");
+            let dangling = parent.0.join("dangling");
+            std::os::unix::fs::symlink(&target, &dangling).unwrap();
+
+            let r1 = crate::test_root::test_root_at(link.clone());
+            let r2 = crate::test_root::test_root_at(dangling.clone());
+            assert_ne!(&*r1, link.as_path());
+            assert_ne!(&*r2, dangling.as_path());
+            assert!(
+                !std::fs::symlink_metadata(&*r1)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_dir(&*r1).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+            assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"keep");
+            assert_eq!(
+                std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert!(!target.exists());
         }
 
         /// PLUG-12・REPAIR-12・#2228: 名前が別 inode を指す状態が `LOCK_ATTEMPTS` 回続くと、待たずに

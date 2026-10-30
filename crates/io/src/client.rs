@@ -26,6 +26,16 @@
 //! （[`QueueId`]）はメモリ内の区別のみに使い、ワイヤー上のバイト表現には一切
 //! 影響しない（TASK-12.1・#73 codex 再指摘対応。P1）。
 //!
+//! # ファイル操作の型つき API と Nack（#3162・IO-1・F6・F8・F12）
+//!
+//! [`PipelineClient::create`]・[`PipelineClient::write_file`]・[`PipelineClient::close`]
+//! は v2 のファイル操作要求（種別 5〜7）を送る。汎用の [`PipelineClient::send`] は
+//! `Write`・`Flush` 以外を [`SendOutcome::RejectedInvalidFrameKind`] で拒否する（F12）。
+//! [`PipelineClient::recv_ack`] は Create・WriteFile・Close への `Nack` を
+//! [`AckReceipt::Rejected`] として返し、接続は失効させない。`Write`・`Flush` への
+//! `Nack` と未知の code はプロトコル違反として失効させる。サーバー側（#3163）・UDS
+//! connect（#3165）・FLUSH の多ファイル化（#3164）は別 issue で未実装（REPAIR-3）。
+//!
 //! # #74（TASK-12.2）以降に残る範囲
 //!
 //! トランスポート層の分割は [`crate::transport::SplitTransport`]（#1118）で定義済みだが、
@@ -45,10 +55,11 @@ use std::time::{Duration, Instant};
 pub use crate::barrier::AckReceipt;
 use crate::barrier::FlushBarrier;
 use crate::error::{IoError, IoErrorCode};
+use crate::guest_path::GuestPath;
 #[cfg(test)]
 use crate::observe::NoopSendObserver;
 use crate::observe::{AckEvent, AckEventError, SendEvent, SendEventError, SendObserver};
-use crate::payload::{self, WireRequestId};
+use crate::payload::{self, AckEnvelope, NackCode, NackEnvelope, NackReason, WireRequestId};
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
 
@@ -222,27 +233,83 @@ impl InFlightRequest {
     }
 }
 
-/// [`FrameKind::Write`] / [`FrameKind::Flush`] だけを未 ACK 追跡の対象として受理する。
+/// 要求系の種別（`Write`・`Flush`・`Create`・`WriteFile`・`Close`）だけを未 ACK 追跡の
+/// 対象として受理する（[`SendQueue::register`] が使う。F12）。
 ///
 /// [`FrameKind::Ack`] / [`FrameKind::FlushAck`] / [`FrameKind::Nack`] は応答フレームで
-/// あり、これらに対応する ACK は来ない。v2 のファイル操作要求
-/// （[`FrameKind::Create`]・[`FrameKind::WriteFile`]・[`FrameKind::Close`]）の型つき
-/// 送信 API は #3162 が足すまで未実装で、汎用の `send` では fail-closed に拒否する
-/// （F12。REPAIR-3）。追跡対象に含めると未 ACK キューの枠を占有し続け、二度と解放されない
-/// （[`SendQueue::register`]・[`PipelineClient::send`] の両方で共有する検証。
-/// codex レビュー指摘: `register` は本検証を経ずに `Ack`/`FlushAck` を受理していた）。
+/// あり、これらに対応する ACK は来ない。追跡対象に含めると未 ACK キューの枠を占有し続け、
+/// 二度と解放されない（codex レビュー指摘: `register` は本検証を経ずに `Ack`/`FlushAck` を
+/// 受理していた）。汎用の [`PipelineClient::send`] が受ける種別はさらに狭い
+/// （`ensure_generic_send_kind`）。
 fn ensure_trackable_frame_kind(kind: FrameKind) -> Result<(), IoError> {
     match kind {
-        FrameKind::Write | FrameKind::Flush => Ok(()),
-        FrameKind::Ack
-        | FrameKind::FlushAck
+        FrameKind::Write
+        | FrameKind::Flush
         | FrameKind::Create
         | FrameKind::WriteFile
-        | FrameKind::Close
-        | FrameKind::Nack => Err(IoError::new(
+        | FrameKind::Close => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Err(IoError::new(
             IoErrorCode::InvalidArgument,
-            "only Write/Flush frames can be tracked as in-flight requests",
+            "only request frames can be tracked as in-flight requests",
         )),
+    }
+}
+
+/// 汎用の [`PipelineClient::send`] が受ける種別を `Write`・`Flush` に限る（F12）。
+///
+/// v2 のファイル操作要求はペイロードの組み立てにハンドルやパスが要るため、型つき API
+/// （[`PipelineClient::create`]・[`PipelineClient::write_file`]・[`PipelineClient::close`]）
+/// だけが送れる。
+fn ensure_generic_send_kind(kind: FrameKind) -> Result<(), IoError> {
+    match kind {
+        FrameKind::Write | FrameKind::Flush => Ok(()),
+        _ => Err(IoError::new(
+            IoErrorCode::InvalidArgument,
+            "PipelineClient::send only accepts Write/Flush frames; use create, write_file or \
+             close for file operations",
+        )),
+    }
+}
+
+/// [`PipelineClient::create`] が返す、開いたファイルのハンドル（F6・IO-1。#3162）。
+///
+/// ハンドルは Create 要求の request id そのもの。フィールドは非公開で、生成できるのは
+/// [`PipelineClient::create`] だけ。発行元のキュー識別子を持ち、別の [`PipelineClient`] の
+/// ハンドルは送信前に `InvalidArgument` で拒否される。開いているかどうかはクライアントでは
+/// 追跡しない。Close 済み・Create が Nack されたハンドルへの送信は、サーバーが
+/// `UnknownHandle` の Nack で返す（F6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileHandle {
+    id: RequestId,
+}
+
+impl FileHandle {
+    /// Create 要求の [`RequestId`]。Create の Ack・Nack
+    /// （[`crate::barrier::RejectedRequest::request`]）との突き合わせに使う。
+    pub fn id(&self) -> RequestId {
+        self.id
+    }
+}
+
+/// [`PipelineClient::recv_ack`] が復号した応答フレーム（Ack・FlushAck、または Nack）。
+enum Response {
+    Ack(AckEnvelope),
+    Nack(NackEnvelope),
+}
+
+impl Response {
+    fn id(&self) -> WireRequestId {
+        match self {
+            Self::Ack(ack) => ack.id(),
+            Self::Nack(nack) => nack.id(),
+        }
+    }
+
+    fn kind(&self) -> FrameKind {
+        match self {
+            Self::Ack(ack) => ack.kind(),
+            Self::Nack(_) => FrameKind::Nack,
+        }
     }
 }
 
@@ -362,6 +429,11 @@ impl SendQueue {
         Ok(())
     }
 
+    /// `id` がこのキューで発行されたものか（`queue_id` が `None` のキューは常に偽）。
+    fn owns(&self, id: RequestId) -> bool {
+        self.queue_id == Some(id.queue_id)
+    }
+
     /// 次に [`Self::register`] が採番するであろう id を、キューの状態を変更せずに
     /// 覗き見る（TASK-12.2・#74。[`PipelineClient::send`] が id を先に確保して
     /// フレームを組み立てるために使う）。
@@ -386,8 +458,8 @@ impl SendQueue {
 
     /// 新しい id を採番し、末尾に登録する。
     ///
-    /// `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
-    /// （[`FrameKind::Ack`] / [`FrameKind::FlushAck`]）の場合は
+    /// `kind` が要求系（`Write`・`Flush`・`Create`・`WriteFile`・`Close`）以外
+    /// （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] / [`FrameKind::Nack`]）の場合は
     /// [`IoErrorCode::InvalidArgument`] を返し、キューの状態を変更しない
     /// （`ensure_trackable_frame_kind`。codex レビュー指摘: これらは応答フレームで
     /// 対応する ACK が来ず、登録すると未 ACK キューの枠が解放されないまま残る）。
@@ -778,6 +850,37 @@ pub enum AckOutcome {
     /// 倒して拒否した。到達しない想定だが、`unwrap`・`expect` を避けるための
     /// フォールバック分岐（coding-rust「ライブラリコードでは panic させない」）。
     RejectedInternal,
+    /// Create・WriteFile・Close への `Nack` を受け、要求単位の拒否として
+    /// [`AckReceipt::Rejected`] を返した。接続は失効させず、未 ACK 枠は解放する
+    /// （F8・F12・F13。#3162）。
+    Rejected,
+}
+
+/// [`NackCode`] の件数配列での添字（網羅 match。値が増えたらコンパイルで気づける）。
+fn nack_code_index(code: NackCode) -> usize {
+    match code {
+        NackCode::InvalidArgument => 0,
+        NackCode::AlreadyExists => 1,
+        NackCode::ResourceExhausted => 2,
+    }
+}
+
+/// [`NackReason`] の件数配列での添字（0 は未知の値をまとめた `Other`、1〜11 は既知の値）。
+fn nack_reason_index(reason: NackReason) -> usize {
+    match reason {
+        NackReason::PathSyntax => 1,
+        NackReason::HostPathTooLong => 2,
+        NackReason::CaseCollision => 3,
+        NackReason::NormalizationCollision => 4,
+        NackReason::Exists => 5,
+        NackReason::EscapesRoot => 6,
+        NackReason::NotADirectory => 7,
+        NackReason::UnknownHandle => 8,
+        NackReason::OpenFilesLimit => 9,
+        NackReason::DeviceLimit => 10,
+        NackReason::TrackedPathsLimit => 11,
+        NackReason::Other(_) => 0,
+    }
 }
 
 /// [`PipelineClient::recv_ack`] の成功・失敗カウントと ACK 待機の所要時間分布を
@@ -796,6 +899,12 @@ pub struct AckMetrics {
     rejected_unknown_ack_id_count: u64,
     rejected_ack_kind_mismatch_count: u64,
     rejected_internal_count: u64,
+    /// `Nack` による要求単位の拒否（[`AckOutcome::Rejected`]）の件数。
+    rejected_count: u64,
+    /// 拒否の [`NackCode`] 別件数（添字は `nack_code_index`）。
+    rejected_by_code: [u64; 3],
+    /// 拒否の [`NackReason`] 別件数（添字は `nack_reason_index`。0 は未知の値）。
+    rejected_by_reason: [u64; 12],
     /// `receiver.recv_frame` を実際に呼び出した呼び出し（成功・失敗の両方）の
     /// 所要時間分布。`receiver` を呼ばずに早期拒否した呼び出し
     /// （`RejectedPoisoned`・`RejectedNoInFlight`）はここへ含めない（[`SendMetrics::write_latency`]
@@ -845,7 +954,43 @@ impl AckMetrics {
                 self.rejected_internal_count = self.rejected_internal_count.saturating_add(1);
                 self.wait_latency.record(elapsed);
             }
+            AckOutcome::Rejected => {
+                self.rejected_count = self.rejected_count.saturating_add(1);
+                self.wait_latency.record(elapsed);
+            }
         }
+    }
+
+    /// `Nack` の code・reason 別の件数を増やす（[`AckOutcome::Rejected`] の記録と対で呼ぶ）。
+    fn record_rejected_detail(&mut self, code: NackCode, reason: NackReason) {
+        if let Some(slot) = self.rejected_by_code.get_mut(nack_code_index(code)) {
+            *slot = slot.saturating_add(1);
+        }
+        if let Some(slot) = self.rejected_by_reason.get_mut(nack_reason_index(reason)) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// `Nack` による要求単位の拒否を受けた回数（接続は失効させない。F13）。
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_count
+    }
+
+    /// 拒否のうち、大分類が `code` だった回数。
+    pub fn rejected_count_by_code(&self, code: NackCode) -> u64 {
+        self.rejected_by_code
+            .get(nack_code_index(code))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 拒否のうち、理由が `reason` だった回数。未知の値（[`NackReason::Other`]）は
+    /// 値を問わず 1 つの区分にまとめて数える。
+    pub fn rejected_count_by_reason(&self, reason: NackReason) -> u64 {
+        self.rejected_by_reason
+            .get(nack_reason_index(reason))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 送信順・種別の対応付けまで検証し、未 ACK 枠を解放できた回数。
@@ -1094,12 +1239,10 @@ where
     /// 「不安全な設計」観点）:
     /// 1. すでに失効済み（[`Self::is_poisoned`]）なら [`IoErrorCode::Unavailable`]
     ///    を返す（トランスポートへは書き込まない）
-    /// 2. `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
-    ///    （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり
-    ///    対応する ACK が来ないため、未 ACK キューに載せると枠が解放されない。
-    ///    IO-1 の未 ACK リクエスト追跡契約の対象外）なら
-    ///    [`IoErrorCode::InvalidArgument`] を返す（`ensure_trackable_frame_kind`。
-    ///    [`SendQueue::register`] も同じ検証を共有する）
+    /// 2. `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外なら
+    ///    [`IoErrorCode::InvalidArgument`] を返す（`ensure_generic_send_kind`。応答系
+    ///    〔`Ack`・`FlushAck`・`Nack`〕は対応する ACK が来ず枠が解放されない。v2 の
+    ///    ファイル操作〔`Create`・`WriteFile`・`Close`〕は型つき API だけが送る。F12）
     /// 3. `SendQueue::ensure_can_register` で未 ACK 件数の上限到達・id 採番の
     ///    溢れを検証する。不可なら [`IoErrorCode::ResourceExhausted`] を返す
     ///    （この時点ではトランスポートへ書き込まない）
@@ -1139,17 +1282,8 @@ where
         body: &[u8],
         timeout: IoTimeout,
     ) -> Result<InFlightRequest, IoError> {
-        if self.poisoned {
-            self.metrics
-                .record(SendOutcome::RejectedPoisoned, Duration::ZERO);
-            let err = IoError::new(
-                IoErrorCode::Unavailable,
-                "pipeline client is poisoned after an ambiguous send failure; reconnect required",
-            );
-            self.notify(kind, SendOutcome::RejectedPoisoned, Duration::ZERO, &err);
-            return Err(err);
-        }
-        if let Err(err) = ensure_trackable_frame_kind(kind) {
+        self.ensure_not_poisoned(kind)?;
+        if let Err(err) = ensure_generic_send_kind(kind) {
             self.metrics
                 .record(SendOutcome::RejectedInvalidFrameKind, Duration::ZERO);
             self.notify(
@@ -1160,6 +1294,118 @@ where
             );
             return Err(err);
         }
+        self.send_with(kind, |id| payload::encode_request(kind, id, body), timeout)
+    }
+
+    /// Create を送り、開いたファイルのハンドルを返す（F6・F12・IO-1。#3162）。ACK は
+    /// 待たない。Create の ACK を待たずに [`Self::write_file`]・[`Self::close`] を
+    /// パイプライン送信できる。
+    ///
+    /// `path` は構文検証済みの [`GuestPath`]（NUL・`..`・絶対パス・`\`・`:` を含められない）。
+    /// 返ったハンドルは Create の request id そのもので、Create が Nack された場合は
+    /// 以降の `write_file`・`close` がサーバーの `UnknownHandle` の Nack で返る。
+    /// `timeout` は 1 回の書き込みの期限（[`Self::send`] と同じ契約。REPAIR-5）。
+    /// 失効・上限到達・書き込み失敗の扱いと観測は [`Self::send`] と同じ。
+    pub fn create(&mut self, path: &GuestPath, timeout: IoTimeout) -> Result<FileHandle, IoError> {
+        self.ensure_not_poisoned(FrameKind::Create)?;
+        let request = self.send_with(
+            FrameKind::Create,
+            |id| payload::encode_create(id, path),
+            timeout,
+        )?;
+        Ok(FileHandle { id: request.id() })
+    }
+
+    /// `handle` のファイルへ `body` を書く WriteFile を送る（F6・F12・IO-1。#3162）。
+    /// ACK は待たない。
+    ///
+    /// `body` は 1 バイト以上 [`crate::payload::MAX_WRITE_FILE_BODY_LEN`] 以下で、違反は
+    /// 確保の前に [`SendOutcome::RejectedInvalidPayload`] として拒否する（空ファイルは
+    /// Create と Close だけで作る）。別の [`PipelineClient`] が発行した `handle` は、
+    /// トランスポートへ書かずキューも変えずに [`IoErrorCode::InvalidArgument`] で拒否する
+    /// （同じく `RejectedInvalidPayload` に数える）。
+    pub fn write_file(
+        &mut self,
+        handle: FileHandle,
+        body: &[u8],
+        timeout: IoTimeout,
+    ) -> Result<InFlightRequest, IoError> {
+        self.ensure_not_poisoned(FrameKind::WriteFile)?;
+        self.ensure_owned_handle(FrameKind::WriteFile, handle)?;
+        let wire = WireRequestId::from(handle.id);
+        self.send_with(
+            FrameKind::WriteFile,
+            |id| payload::encode_write_file(id, wire, body),
+            timeout,
+        )
+    }
+
+    /// `handle` のファイルを閉じる Close を送る（F6・F12・IO-1。#3162）。ACK は待たない。
+    /// Close の ACK はハンドルの解放だけを意味し、永続化は保証しない（IO-2 は FLUSH）。
+    /// 別の [`PipelineClient`] の `handle` の扱いは [`Self::write_file`] と同じ。
+    pub fn close(
+        &mut self,
+        handle: FileHandle,
+        timeout: IoTimeout,
+    ) -> Result<InFlightRequest, IoError> {
+        self.ensure_not_poisoned(FrameKind::Close)?;
+        self.ensure_owned_handle(FrameKind::Close, handle)?;
+        let wire = WireRequestId::from(handle.id);
+        self.send_with(
+            FrameKind::Close,
+            |id| payload::encode_close(id, wire),
+            timeout,
+        )
+    }
+
+    /// 失効済みなら [`SendOutcome::RejectedPoisoned`] を数えて通知し、
+    /// [`IoErrorCode::Unavailable`] を返す（送信系の全入口の最初の検査）。
+    fn ensure_not_poisoned(&mut self, kind: FrameKind) -> Result<(), IoError> {
+        if self.poisoned {
+            self.metrics
+                .record(SendOutcome::RejectedPoisoned, Duration::ZERO);
+            let err = IoError::new(
+                IoErrorCode::Unavailable,
+                "pipeline client is poisoned after an ambiguous send failure; reconnect required",
+            );
+            self.notify(kind, SendOutcome::RejectedPoisoned, Duration::ZERO, &err);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// `handle` がこのクライアントのキューで発行されたものでなければ、送信前に
+    /// [`IoErrorCode::InvalidArgument`] で拒否する（別接続のファイルへ誤って書かない。
+    /// ハンドルはペイロードの一部のため `RejectedInvalidPayload` に数える）。
+    fn ensure_owned_handle(&mut self, kind: FrameKind, handle: FileHandle) -> Result<(), IoError> {
+        if self.queue.owns(handle.id) {
+            return Ok(());
+        }
+        let err = IoError::new(
+            IoErrorCode::InvalidArgument,
+            "file handle was issued by another pipeline client",
+        );
+        self.metrics
+            .record(SendOutcome::RejectedInvalidPayload, Duration::ZERO);
+        self.notify(
+            kind,
+            SendOutcome::RejectedInvalidPayload,
+            Duration::ZERO,
+            &err,
+        );
+        Err(err)
+    }
+
+    /// 送信の共通手順（上限検査 → id の覗き見 → `build` でフレーム組み立て → 登録 →
+    /// 書き込み）。失効の確認と種別・ハンドルの検査は呼び出し側が済ませる。
+    /// 手順と観測は [`Self::send`] のドキュメントのとおり。`build` の失敗は
+    /// [`SendOutcome::RejectedInvalidPayload`] に数える。
+    fn send_with(
+        &mut self,
+        kind: FrameKind,
+        build: impl FnOnce(WireRequestId) -> Result<Frame, IoError>,
+        timeout: IoTimeout,
+    ) -> Result<InFlightRequest, IoError> {
         if let Err(err) = self.queue.ensure_can_register() {
             self.metrics
                 .record(SendOutcome::RejectedResourceExhausted, Duration::ZERO);
@@ -1185,7 +1431,7 @@ where
                 return Err(err);
             }
         };
-        let frame = match payload::encode_request(kind, WireRequestId::from(peeked_id), body) {
+        let frame = match build(WireRequestId::from(peeked_id)) {
             Ok(frame) => frame,
             Err(err) => {
                 self.metrics
@@ -1295,6 +1541,7 @@ where
                 code: err.code(),
                 message: err.message(),
             }),
+            rejected: None,
         });
     }
 
@@ -1360,8 +1607,8 @@ where
     ///    （P1-3・`crate::transport` モジュールドキュメント）により、エラーを
     ///    返した接続は以後使用不可であり、「まだ ACK が来ていないので再試行」
     ///    という意味を持たない。同じ接続でポーリングする使い方は想定しない
-    /// 4. [`crate::payload::decode_ack`] でペイロードを検証する。失敗（種別違反・
-    ///    長さ違反）したら失効させて [`IoErrorCode::InvalidArgument`] を返す
+    /// 4. [`crate::payload::decode_ack`]（Nack は [`crate::payload::decode_nack`]）で
+    ///    ペイロードを検証する。失敗（種別違反・長さ違反・未知の Nack code）したら失効させて [`IoErrorCode::InvalidArgument`] を返す
     ///    （プロトコル違反）
     /// 5. **送信順の照合（厳格）**: 受け取った request id が
     ///    [`SendQueue::oldest`] の id と一致しなければ失効させて
@@ -1370,11 +1617,15 @@ where
     ///    "unknown ack id" とメッセージを区別する（[`SendQueue`] は FIFO であり、
     ///    サーバー側は送信順に ACK を返す設計〔TASK-13.2〕を前提とする。順序が
     ///    入れ替わる必要が生じた場合は TASK-13 側で本方針を見直す）
-    /// 6. 種別の対応を確かめる。[`FrameKind::Ack`] は [`FrameKind::Write`] に、
-    ///    [`FrameKind::FlushAck`] は [`FrameKind::Flush`] に対応しなければ
-    ///    ならない。ずれていれば失効させて [`IoErrorCode::InvalidArgument`] を返す
-    /// 7. `crate::barrier::AckReceipt::from_matched` で種別ごとの
-    ///    [`AckReceipt`]（[`AckReceipt::Write`] / [`AckReceipt::Flush`]）を
+    /// 6. 種別の対応を確かめる。[`FrameKind::Ack`] は [`FrameKind::Write`]・
+    ///    [`FrameKind::Create`]・[`FrameKind::WriteFile`]・[`FrameKind::Close`] に、
+    ///    [`FrameKind::FlushAck`] は [`FrameKind::Flush`] に対応しなければならない。
+    ///    [`FrameKind::Nack`] が許されるのは Create・WriteFile・Close だけで
+    ///    （[`AckReceipt::Rejected`]。接続は失効させない。F8・F12）、Write・Flush への
+    ///    Nack を含め、ずれていれば失効させて [`IoErrorCode::InvalidArgument`] を返す
+    /// 7. `crate::barrier::AckReceipt::from_matched` / `from_nack` で種別ごとの
+    ///    [`AckReceipt`]（[`AckReceipt::Write`] / [`AckReceipt::Flush`] /
+    ///    [`AckReceipt::Rejected`]）を
     ///    組み立ててから [`SendQueue::remove`] で自分のキューの id を使って
     ///    解放し、その [`AckReceipt`] を返す（[`crate::barrier`] モジュール
     ///    ドキュメント「構築経路」参照。TASK-15.1・#85）
@@ -1437,8 +1688,15 @@ where
             }
         };
 
-        let ack = match payload::decode_ack(&frame) {
-            Ok(ack) => ack,
+        // Nack（種別 8）だけ `decode_nack`、それ以外は `decode_ack` で復号する。どちらの
+        // 失敗（長さ違反・未知の code〔0 と 4 以上〕を含む）もプロトコル違反として失効させる。
+        let decoded = if frame.kind() == FrameKind::Nack {
+            payload::decode_nack(&frame).map(Response::Nack)
+        } else {
+            payload::decode_ack(&frame).map(Response::Ack)
+        };
+        let response = match decoded {
+            Ok(response) => response,
             Err(err) => {
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
@@ -1446,6 +1704,7 @@ where
                 return Err(err);
             }
         };
+        let response_kind = response.kind();
 
         // `is_empty` を上で確認済みだが、`oldest` は `Option` を返す契約のため
         // `unwrap`・`expect` は使わず `Result` 経由でフォールバックする
@@ -1462,7 +1721,7 @@ where
                 );
                 self.notify_ack(
                     AckOutcome::RejectedInternal,
-                    Some(ack.kind()),
+                    Some(response_kind),
                     elapsed,
                     &err,
                 );
@@ -1470,20 +1729,20 @@ where
             }
         };
 
-        if oldest.id().get() != ack.id().get() {
+        if oldest.id().get() != response.id().get() {
             self.poisoned = true;
             let elapsed = started_at.elapsed();
             let is_known_but_not_oldest = self
                 .queue
                 .iter()
-                .any(|entry| entry.id().get() == ack.id().get());
+                .any(|entry| entry.id().get() == response.id().get());
             let (outcome, message) = if is_known_but_not_oldest {
                 (
                     AckOutcome::RejectedOutOfOrder,
                     format!(
                         "out-of-order ack: received ack for request id {}, but the oldest \
                          unacknowledged request id is {}",
-                        ack.id().get(),
+                        response.id().get(),
                         oldest.id().get()
                     ),
                 )
@@ -1493,28 +1752,34 @@ where
                     format!(
                         "unknown ack id: received ack for request id {}, which is not among \
                          the {} in-flight request(s) tracked by this queue",
-                        ack.id().get(),
+                        response.id().get(),
                         self.queue.len()
                     ),
                 )
             };
             let err = IoError::new(IoErrorCode::InvalidArgument, message);
-            self.notify_ack(outcome, Some(ack.kind()), elapsed, &err);
+            self.notify_ack(outcome, Some(response_kind), elapsed, &err);
             return Err(err);
         }
 
-        let expected_ack_kind = match oldest.kind() {
-            FrameKind::Write => FrameKind::Ack,
-            FrameKind::Flush => FrameKind::FlushAck,
-            // `SendQueue::register`（`ensure_trackable_frame_kind` 経由）は
-            // `Write`/`Flush` 以外を受理しないため到達しないが、`unwrap`・
-            // `expect` を避け、フォールバックとして安全側（拒否）に倒す。
-            FrameKind::Ack
-            | FrameKind::FlushAck
-            | FrameKind::Create
-            | FrameKind::WriteFile
-            | FrameKind::Close
-            | FrameKind::Nack => {
+        // 種別の対応（F12）。`AckReceipt` は `SendQueue::remove`（枠の解放）より前に
+        // 組み立てる。ここまでの検証により `from_matched` / `from_nack` が `Err` を返すことは
+        // 到達しないはずだが、万一そうなってもまだ枠を解放していない状態で拒否できる
+        // （fail-closed。TASK-15.1・#85 セキュリティ考慮・IO-2 のデータ損失防止）。
+        let receipt_result = match (oldest.kind(), &response) {
+            (
+                FrameKind::Write | FrameKind::Create | FrameKind::WriteFile | FrameKind::Close,
+                Response::Ack(ack),
+            ) if ack.kind() == FrameKind::Ack => AckReceipt::from_matched(oldest, ack.kind()),
+            (FrameKind::Flush, Response::Ack(ack)) if ack.kind() == FrameKind::FlushAck => {
+                AckReceipt::from_matched(oldest, ack.kind())
+            }
+            (FrameKind::Create | FrameKind::WriteFile | FrameKind::Close, Response::Nack(nack)) => {
+                AckReceipt::from_nack(oldest, nack.code(), nack.reason())
+            }
+            // `SendQueue::register`（`ensure_trackable_frame_kind` 経由）は応答系を
+            // 受理しないため到達しないが、`unwrap`・`expect` を避け、安全側（拒否）に倒す。
+            (FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack, _) => {
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
                 let err = IoError::new(
@@ -1523,47 +1788,43 @@ where
                 );
                 self.notify_ack(
                     AckOutcome::RejectedInternal,
-                    Some(ack.kind()),
+                    Some(response_kind),
+                    elapsed,
+                    &err,
+                );
+                return Err(err);
+            }
+            // Write・Flush への Nack、Create 等への FlushAck、Flush への Ack など。
+            (request_kind, _) => {
+                self.poisoned = true;
+                let elapsed = started_at.elapsed();
+                let err = IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    format!(
+                        "ack kind mismatch: request id {} was sent as {:?} but the response \
+                         frame kind is {:?}",
+                        oldest.id().get(),
+                        request_kind,
+                        response_kind
+                    ),
+                );
+                self.notify_ack(
+                    AckOutcome::RejectedAckKindMismatch,
+                    Some(response_kind),
                     elapsed,
                     &err,
                 );
                 return Err(err);
             }
         };
-        if ack.kind() != expected_ack_kind {
-            self.poisoned = true;
-            let elapsed = started_at.elapsed();
-            let err = IoError::new(
-                IoErrorCode::InvalidArgument,
-                format!(
-                    "ack kind mismatch: request id {} was sent as {:?} but the ack frame kind is {:?}",
-                    oldest.id().get(),
-                    oldest.kind(),
-                    ack.kind()
-                ),
-            );
-            self.notify_ack(
-                AckOutcome::RejectedAckKindMismatch,
-                Some(ack.kind()),
-                elapsed,
-                &err,
-            );
-            return Err(err);
-        }
-
-        // `AckReceipt` を `SendQueue::remove`（枠の解放）より前に組み立てる。
-        // ここまでの検証（`expected_ack_kind` との一致）により
-        // `AckReceipt::from_matched` が `Err` を返すことは到達しないはずだが、
-        // 万一そうなった場合でもまだ枠を解放していない状態で拒否できる
-        // （fail-closed。TASK-15.1・#85 セキュリティ考慮・IO-2 のデータ損失防止）。
-        let receipt = match AckReceipt::from_matched(oldest, ack.kind()) {
+        let receipt = match receipt_result {
             Ok(receipt) => receipt,
             Err(err) => {
                 self.poisoned = true;
                 let elapsed = started_at.elapsed();
                 self.notify_ack(
                     AckOutcome::RejectedInternal,
-                    Some(ack.kind()),
+                    Some(response_kind),
                     elapsed,
                     &err,
                 );
@@ -1578,19 +1839,34 @@ where
             let elapsed = started_at.elapsed();
             self.notify_ack(
                 AckOutcome::RejectedInternal,
-                Some(ack.kind()),
+                Some(response_kind),
                 elapsed,
                 &err,
             );
             return Err(err);
         }
         let elapsed = started_at.elapsed();
+        if let AckReceipt::Rejected(rejected) = &receipt {
+            // 要求単位の拒否。接続は失効させない（F8・F12）。
+            self.ack_metrics.record(AckOutcome::Rejected, elapsed);
+            self.ack_metrics
+                .record_rejected_detail(rejected.code(), rejected.reason());
+            self.observer.on_ack(&AckEvent {
+                outcome: AckOutcome::Rejected,
+                ack_kind: Some(response_kind),
+                latency: elapsed,
+                error: None,
+                rejected: Some(*rejected),
+            });
+            return Ok(receipt);
+        }
         self.ack_metrics.record(AckOutcome::Success, elapsed);
         self.observer.on_ack(&AckEvent {
             outcome: AckOutcome::Success,
-            ack_kind: Some(ack.kind()),
+            ack_kind: Some(response_kind),
             latency: elapsed,
             error: None,
+            rejected: None,
         });
         Ok(receipt)
     }
@@ -1624,6 +1900,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::barrier::RejectedRequest;
     use crate::protocol::FrameKind;
     use std::time::Duration;
 
@@ -2671,7 +2948,7 @@ mod tests {
 
     /// IO-1・REPAIR-2・#3161（F12）: 汎用の `send` に v2 のファイル操作の種別や
     /// Nack が来たら `InvalidArgument` で拒否し、キューへ登録しない
-    /// （型つき API は #3162）。
+    /// （型つき API を使う。F12）。
     #[test]
     fn io1_send_rejects_v2_file_kinds_and_does_not_register() {
         let limit = InFlightLimit::new(2).expect("2 must be valid");
@@ -2771,5 +3048,326 @@ mod tests {
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
         assert_eq!(client.sender.recv_call_count(), 0);
         assert!(!client.is_poisoned());
+    }
+
+    fn gpath(path: &str) -> GuestPath {
+        GuestPath::parse(path).expect("test path must be valid")
+    }
+
+    fn new_client() -> PipelineClient<RecordingSender, NoopSendObserver> {
+        let limit = InFlightLimit::new(8).expect("8 must be valid");
+        PipelineClient::new(RecordingSender::default(), limit, NoopSendObserver)
+    }
+
+    fn push_ack(client: &mut PipelineClient<RecordingSender, NoopSendObserver>, id: RequestId) {
+        let ack = payload::encode_ack(FrameKind::Ack, WireRequestId::from(id))
+            .expect("encode_ack must succeed");
+        client.sender.recv_script.push_back(Ok(ack));
+    }
+
+    fn push_nack(
+        client: &mut PipelineClient<RecordingSender, NoopSendObserver>,
+        id: RequestId,
+        code: NackCode,
+        reason: NackReason,
+    ) {
+        let nack = payload::encode_nack(WireRequestId::from(id), code, reason)
+            .expect("encode_nack must succeed");
+        client.sender.recv_script.push_back(Ok(nack));
+    }
+
+    /// IO-1・F6・F12・#3162: 型つき API は Create・WriteFile・Close の v2 フレームを組み立て、
+    /// ハンドルは Create の request id そのものになる。
+    #[test]
+    fn io1_create_write_file_close_encode_typed_frames() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("a/b.txt"), test_timeout())
+            .expect("create must succeed");
+        let write = client
+            .write_file(handle, b"hello", test_timeout())
+            .expect("write_file must succeed");
+        let close = client
+            .close(handle, test_timeout())
+            .expect("close must succeed");
+
+        assert_eq!(handle.id().get(), 0);
+        assert_eq!(write.id().get(), 1);
+        assert_eq!(write.kind(), FrameKind::WriteFile);
+        assert_eq!(close.id().get(), 2);
+        assert_eq!(close.kind(), FrameKind::Close);
+
+        let sent = &client.sender.sent;
+        assert_eq!(sent.len(), 3);
+        let create = payload::decode_create(&sent[0]).expect("must decode as create");
+        assert_eq!(create.id().get(), 0);
+        assert_eq!(create.path(), "a/b.txt");
+        let wf = payload::decode_write_file(&sent[1]).expect("must decode as write_file");
+        assert_eq!(wf.id().get(), 1);
+        assert_eq!(wf.handle().get(), 0);
+        assert_eq!(wf.body(), b"hello");
+        let cl = payload::decode_close(&sent[2]).expect("must decode as close");
+        assert_eq!(cl.id().get(), 2);
+        assert_eq!(cl.handle().get(), 0);
+    }
+
+    /// IO-1・F12・#3162: Create の ACK を待たずに WriteFile と Close を送れ、Ack 3 件が
+    /// 送信順に通常 ACK として返る。
+    #[test]
+    fn io1_write_file_pipelined_before_create_ack() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("f"), test_timeout())
+            .expect("create must succeed");
+        let write = client
+            .write_file(handle, &[1, 2, 3], test_timeout())
+            .expect("write_file must succeed without waiting for the create ack");
+        let close = client
+            .close(handle, test_timeout())
+            .expect("close must succeed without waiting for the create ack");
+        assert_eq!(client.queue().len(), 3);
+
+        for id in [handle.id(), write.id(), close.id()] {
+            push_ack(&mut client, id);
+        }
+        for expected in [handle.id(), write.id(), close.id()] {
+            let receipt = client.recv_ack(test_timeout()).expect("ack must match");
+            assert!(matches!(receipt, AckReceipt::Write(_)));
+            assert_eq!(receipt.request().id(), expected);
+        }
+        assert!(client.queue().is_empty());
+        assert!(!client.is_poisoned());
+    }
+
+    /// IO-1・REPAIR-4・F8・F12・#3162: Create への Nack は `Rejected` として返り、code・reason が
+    /// そのまま見え、接続は失効せず枠が解放されて次の送受信が成功する。
+    #[test]
+    fn io1_repair4_nack_for_create_returns_rejected_without_poison() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("dup"), test_timeout())
+            .expect("create must succeed");
+        push_nack(
+            &mut client,
+            handle.id(),
+            NackCode::AlreadyExists,
+            NackReason::Exists,
+        );
+
+        let receipt = client
+            .recv_ack(test_timeout())
+            .expect("nack is not an error");
+        let rejected = RejectedRequest::try_from(receipt).expect("must be Rejected");
+        assert_eq!(rejected.code(), NackCode::AlreadyExists);
+        assert_eq!(rejected.reason(), NackReason::Exists);
+        assert_eq!(rejected.request().id(), handle.id());
+        assert_eq!(rejected.request().kind(), FrameKind::Create);
+        assert!(!client.is_poisoned());
+        assert!(client.queue().is_empty());
+        assert_eq!(client.ack_metrics().rejected_count(), 1);
+        assert_eq!(client.ack_metrics().success_count(), 0);
+
+        let next = client
+            .send(FrameKind::Write, &[9], test_timeout())
+            .expect("send must still work after a rejection");
+        push_ack(&mut client, next.id());
+        let receipt = client.recv_ack(test_timeout()).expect("ack must match");
+        assert!(matches!(receipt, AckReceipt::Write(_)));
+    }
+
+    /// IO-1・F12・#3162: Write・Flush への Nack はプロトコル違反として失効させる。
+    #[test]
+    fn io1_nack_for_write_or_flush_poisons() {
+        for kind in [FrameKind::Write, FrameKind::Flush] {
+            let mut client = new_client();
+            let body: &[u8] = if kind == FrameKind::Write { &[1] } else { &[] };
+            let request = client
+                .send(kind, body, test_timeout())
+                .expect("send must succeed");
+            push_nack(
+                &mut client,
+                request.id(),
+                NackCode::InvalidArgument,
+                NackReason::PathSyntax,
+            );
+            let err = client
+                .recv_ack(test_timeout())
+                .expect_err("nack for Write/Flush must be a protocol violation");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert!(client.is_poisoned());
+            assert_eq!(client.ack_metrics().rejected_ack_kind_mismatch_count(), 1);
+            assert_eq!(client.ack_metrics().rejected_count(), 0);
+        }
+    }
+
+    /// IO-1・F10・F12・#3162: 未知の code（0 と 4 以上）と長さ違反の Nack は失効させる。
+    #[test]
+    fn io1_nack_unknown_code_and_wrong_length_poison() {
+        for code in [0u8, 4, 255] {
+            let mut client = new_client();
+            let handle = client
+                .create(&gpath("x"), test_timeout())
+                .expect("create must succeed");
+            let mut payload_bytes = handle.id().get().to_le_bytes().to_vec();
+            payload_bytes.push(code);
+            payload_bytes.extend_from_slice(&1u16.to_le_bytes());
+            let frame = Frame::new(FrameKind::Nack, payload_bytes).expect("frame must build");
+            client.sender.recv_script.push_back(Ok(frame));
+            let err = client
+                .recv_ack(test_timeout())
+                .expect_err("unknown nack code must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+            assert!(client.is_poisoned());
+            assert_eq!(client.ack_metrics().rejected_invalid_payload_count(), 1);
+        }
+
+        let mut client = new_client();
+        client
+            .create(&gpath("x"), test_timeout())
+            .expect("create must succeed");
+        let frame = Frame::new(FrameKind::Nack, vec![0u8; 10]).expect("frame must build");
+        client.sender.recv_script.push_back(Ok(frame));
+        client
+            .recv_ack(test_timeout())
+            .expect_err("short nack must be rejected");
+        assert!(client.is_poisoned());
+        assert_eq!(client.ack_metrics().rejected_invalid_payload_count(), 1);
+    }
+
+    /// IO-1・F10・#3162: 未知の reason は `Other` として受理し、失効させない。
+    #[test]
+    fn io1_nack_unknown_reason_accepted_as_other() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("x"), test_timeout())
+            .expect("create must succeed");
+        push_nack(
+            &mut client,
+            handle.id(),
+            NackCode::ResourceExhausted,
+            NackReason::from_wire(777),
+        );
+        let receipt = client
+            .recv_ack(test_timeout())
+            .expect("nack is not an error");
+        let rejected = RejectedRequest::try_from(receipt).expect("must be Rejected");
+        assert_eq!(rejected.reason().wire_value(), 777);
+        assert!(!client.is_poisoned());
+        assert_eq!(
+            client
+                .ack_metrics()
+                .rejected_count_by_reason(NackReason::from_wire(12345)),
+            1
+        );
+    }
+
+    /// IO-1・F12・#3162: Create などへの FlushAck は種別違反として失効させる。
+    #[test]
+    fn io1_flush_ack_for_create_poisons() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("x"), test_timeout())
+            .expect("create must succeed");
+        let ack = payload::encode_ack(FrameKind::FlushAck, WireRequestId::from(handle.id()))
+            .expect("encode_ack must succeed");
+        client.sender.recv_script.push_back(Ok(ack));
+        client
+            .recv_ack(test_timeout())
+            .expect_err("FlushAck for Create must be rejected");
+        assert!(client.is_poisoned());
+        assert_eq!(client.ack_metrics().rejected_ack_kind_mismatch_count(), 1);
+    }
+
+    /// IO-1・F6・#3162: 別の `PipelineClient` のハンドルは、トランスポートへ書かず
+    /// キューも変えずに拒否する（write_file・close の両方）。
+    #[test]
+    fn io1_write_file_rejects_foreign_handle_before_send() {
+        let mut owner = new_client();
+        let foreign = owner
+            .create(&gpath("x"), test_timeout())
+            .expect("create must succeed");
+
+        let mut client = new_client();
+        let err = client
+            .write_file(foreign, b"data", test_timeout())
+            .expect_err("foreign handle must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        let err = client
+            .close(foreign, test_timeout())
+            .expect_err("foreign handle must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+
+        assert!(client.sender.sent.is_empty());
+        assert!(client.queue().is_empty());
+        assert!(!client.is_poisoned());
+        assert_eq!(client.metrics().rejected_invalid_payload_count(), 2);
+    }
+
+    /// IO-1・F6・#3162: 空の body と上限超過の body は確保の前に拒否される。
+    #[test]
+    fn io1_write_file_rejects_empty_and_oversized_body() {
+        let mut client = new_client();
+        let handle = client
+            .create(&gpath("x"), test_timeout())
+            .expect("create must succeed");
+        let err = client
+            .write_file(handle, &[], test_timeout())
+            .expect_err("empty body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        let big =
+            vec![0u8; usize::try_from(payload::MAX_WRITE_FILE_BODY_LEN).expect("fits usize") + 1];
+        let err = client
+            .write_file(handle, &big, test_timeout())
+            .expect_err("oversized body must be rejected");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(client.queue().len(), 1);
+        assert_eq!(client.sender.sent.len(), 1);
+        assert_eq!(client.metrics().rejected_invalid_payload_count(), 2);
+    }
+
+    /// IO-1・F12・#3162: `register` は要求系の種別を受理し、応答系（Nack を含む）を拒否する。
+    #[test]
+    fn io1_send_queue_register_accepts_file_kinds_and_rejects_nack() {
+        let mut queue = SendQueue::new(InFlightLimit::new(8).expect("8 must be valid"));
+        for kind in [FrameKind::Create, FrameKind::WriteFile, FrameKind::Close] {
+            queue
+                .register(kind)
+                .expect("file request kinds are trackable");
+        }
+        let err = queue
+            .register(FrameKind::Nack)
+            .expect_err("Nack must not be trackable");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(queue.len(), 3);
+    }
+
+    /// REPAIR-4・F13・#3162: 拒否の件数は code 別・reason 別に具体値で数える。
+    #[test]
+    fn repair4_ack_metrics_count_rejected_by_code_and_reason() {
+        let mut client = new_client();
+        let cases = [
+            (NackCode::AlreadyExists, NackReason::Exists),
+            (NackCode::AlreadyExists, NackReason::CaseCollision),
+            (NackCode::InvalidArgument, NackReason::UnknownHandle),
+        ];
+        for (code, reason) in cases {
+            let handle = client
+                .create(&gpath("p"), test_timeout())
+                .expect("create must succeed");
+            push_nack(&mut client, handle.id(), code, reason);
+            client
+                .recv_ack(test_timeout())
+                .expect("nack is not an error");
+        }
+        let m = client.ack_metrics();
+        assert_eq!(m.rejected_count(), 3);
+        assert_eq!(m.rejected_count_by_code(NackCode::AlreadyExists), 2);
+        assert_eq!(m.rejected_count_by_code(NackCode::InvalidArgument), 1);
+        assert_eq!(m.rejected_count_by_code(NackCode::ResourceExhausted), 0);
+        assert_eq!(m.rejected_count_by_reason(NackReason::Exists), 1);
+        assert_eq!(m.rejected_count_by_reason(NackReason::CaseCollision), 1);
+        assert_eq!(m.rejected_count_by_reason(NackReason::UnknownHandle), 1);
+        assert_eq!(m.rejected_count_by_reason(NackReason::PathSyntax), 0);
+        assert_eq!(m.wait_latency().count(), 3);
     }
 }

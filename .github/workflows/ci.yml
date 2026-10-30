@@ -161,7 +161,9 @@ on:
         description: >-
           repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
           CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
-          ステップ全体は 55 分で打ち切られる（ジョブ上限 60 分。繰り返しの dispatch では ubuntu も 60 分。#3505）ため、遅い試験は repeat-count を分けて dispatch する
+          ステップ全体は 55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。
+          ステップの開始はジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒が
+          ビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
         type: string
         default: '600'
       repeat-count:
@@ -472,17 +474,27 @@ jobs:
     # ジョブは 20〜26 分（2026-10-30 時点の直近 110 件）で、35 分なら約 9 分の余裕がある。
     # 例外として、workflow_dispatch で繰り返し（repeat-test・repeat-test-bin・repeat-user-scope）か
     # ハングプローブ（hang-probe・reclaim-hang-probe・scope-hang-probe）を指定したときは ubuntu も 60 分を
-    # 保つ（繰り返しのステップは 30 分・55 分で、プローブは止まり方の観測が従来の上限を前提にするため）。
+    # 保つ（プローブは止まり方の観測が従来の上限を前提にするため）。
+    # 委譲スコープの繰り返し（repeat-user-scope）の ubuntu だけは 90 分にする（#3528）。そのステップは
+    # ジョブ開始から 19.8〜24.2 分後（2026-10-30 時点の直近 15 件）に始まり 55 分の上限を持つため、
+    # 60 分では 55 分の上限より先にジョブが取り消され、reason=timeout や集計行が残らなかった。
+    # 守る関係: ステップ上限 55 分 <= ジョブ上限 90 分 - 開始までの最大経過 約 25 分 - 余裕 約 10 分。
+    # 前段のステップを飛ばして開始を早める案は、約 60 ステップに条件を足す差分が大きいため採らない。
+    # 通常の繰り返し（30 分）は約 11 分で始まるため 60 分で足りる。ランナーを長く占有する代償は、
+    # 明示した手動 dispatch の ubuntu の leg に閉じる。
     # job の timeout-minutes では runner コンテキストを使えないため matrix.os で判定する。inputs は
     # workflow_dispatch 以外で null になり `null != 'none'` が真になるため、github.event_name で先に絞る。
     # 代償: ubuntu の最後の container_grpc のステップ（開始は約 21〜25 分、試験の watchdog 各 900 秒、
     # 補助の期限 1860 秒）がハングすると、watchdog・補助より先にジョブの上限で取り消される
     timeout-minutes: >-
       ${{ matrix.os == 'ubuntu-latest'
+      && github.event_name == 'workflow_dispatch' && inputs.repeat-user-scope
+      && 90
+      || (matrix.os == 'ubuntu-latest'
       && !(github.event_name == 'workflow_dispatch'
       && (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope
       || inputs.hang-probe || inputs.reclaim-hang-probe != 'none' || inputs.scope-hang-probe != 'none'))
-      && 35 || 60 }}
+      && 35 || 60) }}
     permissions:
       contents: read
     defaults:
@@ -1729,6 +1741,8 @@ jobs:
       # この位置にある理由: 上の AppArmor の緩和ステップと前提確認の後でないと ubuntu の Unshare 段で失敗するため
       # （通常の「指定した試験の繰り返し」ステップはそれより前にあり、repeat-user-scope のときは飛ばす）。Linux 限定。
       # 入力は env 経由（run 内で式を展開しない）。新しいジョブ・check-run は追加しない。
+      # 上限 55 分を保つ理由（#3528）: ジョブ上限 90 分 - この位置までの最大経過 約 25 分 - 後続と余裕 約 10 分。
+      # この位置を前へ動かす・後ろに重いステップを足すと関係が変わるため、ジョブ上限の式と合わせて見直す。
       - name: 委譲スコープでの試験の繰り返し（workflow_dispatch のみ。#2886）
         if: >-
           github.event_name == 'workflow_dispatch' &&

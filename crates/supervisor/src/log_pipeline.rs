@@ -223,11 +223,8 @@ last-no-lf",
         let hub = CaptureHub::new(sink.clone());
         hub.attach(output("a1\n", "e1")).expect("attach");
         hub.quiesce();
-        // スレッド終了時の ReaderSlot 解放は drain 完了より僅かに遅れ得るため、期限付きで待つ（REPAIR-5）。
-        let start = std::time::Instant::now();
-        while hub.budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // #3507 の後、リーダーは送信の前に枠を手放すため、quiesce から戻った時点で枠は同期的に 0
+        // （待ちで補償しない。#3549・REPAIR-5）。
         assert_eq!(hub.budget.live(), 0);
         assert!(hub.finish(Duration::from_secs(1)).is_none());
         assert_eq!(lines_of(&sink, StreamKind::Stdout), vec![b"a1".to_vec()]);

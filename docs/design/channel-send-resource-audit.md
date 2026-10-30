@@ -1,6 +1,6 @@
 # チャネル send 後の資源保持の横断点検（supervisor・plugin）
 
-#3507・PLUG-2・REPAIR-5・SUP-1・SUP-7。#3453（`BoundedWriter::write_all` の作業スレッドが `send` の後も書き手の `Arc` を持ち、複製 fd の close が遅れた）と同じ型が他にないかの点検記録。
+Issue #3507・PLUG-2・REPAIR-5・SUP-1・SUP-7。#3453（`BoundedWriter::write_all` の作業スレッドが `send` の後も書き手の `Arc` を持ち、複製 fd の close が遅れた）と同じ型が他にないかの点検記録。
 
 ## 判定基準
 

@@ -7,7 +7,8 @@
 //! の前に呼ぶ。rootless のユーザー定義名(pasta 構成)のコンテナは `@networks/<name>/members/<id>` を持たないため、
 //! net の `remove` だけでは参照中でも定義を消せてしまう。そこで状態ストアの記録を一覧し、コンテナごとの起動オプション
 //! 文書(`@container-options/<id>`)の `network` が対象名を指すかを調べる(設計は `docs/design/network-wiring.md` D10)。
-//! 走査は net のロックの外で行う(全体の排他ロックを持ったまま状態ストアを読まない)。
+//! 走査は呼び出し側が net の全体の排他ロックを保持したまま行う(#3550。create が定義の照合から状態記録の作成までを
+//! 共有ロックで持つので、判定から削除までを排他ロックの下に置くと窓が無い。ロック順は net → 状態ストア)。
 //!
 //! # 判定表(1 記録ごと)
 //!
@@ -23,8 +24,9 @@
 //!
 //! # 残余(REPAIR-3)
 //!
-//! create の定義照合から状態記録の作成までの間は記録が無いため、この間の `network rm` は防げない(その後の `start` の
-//! 再照合が `FAILED_PRECONDITION` で拒否する。分離は弱まらない)。窓を閉じるには create の順序(D2)を変える必要がある。
+//! create の定義照合から状態記録の作成までの間の窓は、create の共有ロックの保持(`create_network::with_named_definition_held`)
+//! と rm の排他ロックで閉じた(#3550。`network-wiring.md` D10)。start の手順 2c の照合から pasta の起動までの間は防げない
+//! (定義はラベルで、分離は弱まらない)。
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;

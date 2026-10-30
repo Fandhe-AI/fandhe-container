@@ -150,6 +150,16 @@ impl GlobalLockGuard<'_> {
         Err(unsupported())
     }
 
+    /// 常に `Unimplemented`（Linux 実装と同じシグネチャ。#3550）。
+    pub fn get(&self, _name: &NetworkName) -> Result<NetworkDefinition, NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`（Linux 実装と同じシグネチャ。#3550）。
+    pub fn remove(&self, _name: &NetworkName) -> Result<(), NetError> {
+        Err(unsupported())
+    }
+
     /// 常に `Unimplemented`。
     pub fn lock_network(&self, _name: &NetworkName) -> Result<NetworkLockGuard<'_>, NetError> {
         Err(unsupported())

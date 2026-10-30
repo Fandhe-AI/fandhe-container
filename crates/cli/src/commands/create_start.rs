@@ -902,10 +902,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         let (req, image) = build_create(global, args)?;
         // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
         let document = create_options::document_of(&args.options, pasta.as_ref())?;
-        Ok((req, image, document))
+        Ok((req, image, document, named))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
-    .and_then(|(rt, (req, pending, document))| {
+    .and_then(|(rt, (req, pending, document, named))| {
         // 参照キーの scope は開いた状態ストアから求める（表記ゆれを畳んだ正規パス。#2499）。
         let image = match pending.map(|p| p.bind(rt.store.as_ref())).transpose() {
             Ok(i) => i,
@@ -915,6 +915,7 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
                 return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
             }
         };
+        let entered = std::cell::Cell::new(false);
         let r = match reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder) {
             // 回収の期限切れは core を呼ばずに create の失敗として計測する（REPAIR-4）。
             Err(e) => {
@@ -925,7 +926,30 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
                 }
                 Err(e)
             }
-            Ok(()) => create_with_options(&rt, &req, image.as_ref(), &document),
+            // ユーザー定義名のときは、2 回目の定義照合から状態記録の作成までを全体の共有ロックの下で行い、
+            // その間の `network rm` を待たせる(D10・#3550)。ロックの中は FCOPT1 の書き込みと core の create だけ。
+            Ok(()) => match (named.as_ref(), rt.store.host_state_root()) {
+                (Some(name), Some(root)) => super::create_network::with_named_definition_held(
+                    root,
+                    name,
+                    fandhe_container_net::network_store::DEFAULT_LOCK_TIMEOUT,
+                    Some(Arc::new(super::net_recorder::CliNetRecorder::new(
+                        Arc::clone(&net_recorder),
+                    ))),
+                    || {
+                        entered.set(true);
+                        create_with_options(&rt, &req, image.as_ref(), &document)
+                    },
+                )
+                // 照合・ロックの失敗は core に入らないので、ここで create の失敗として計測する(REPAIR-4)。
+                // `body` に入った後の失敗は `create_with_options` が計測済み。
+                .inspect_err(|_| {
+                    if !entered.get() {
+                        record_pre_core_failure(&rt.recorder, "create", started);
+                    }
+                }),
+                _ => create_with_options(&rt, &req, image.as_ref(), &document),
+            },
         };
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r

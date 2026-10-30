@@ -71,7 +71,7 @@ on:
           helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証 /
           helper-noscope = scripts/run-with-deadline.sh（scope を作らない版・#3505。期限 60 秒）の同じ実証。
           どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
-          scope-hang-probe を none 以外にした dispatch では platform-ci が ubuntu だけで回る（#3556）。
+          プローブのステップは Linux の leg だけで実行する（macOS・Windows の leg は通常どおり 3 OS で回る・#3556）。
           PR・push では存在しない（none 相当）
         type: choice
         options:
@@ -463,13 +463,9 @@ jobs:
       matrix:
         # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS（上記コメント参照）。
         # `&&` / `||` の三項相当は両分岐とも空でない文字列リテラルのため取り違えない。
-        # github.event_name は GitHub が設定する値で、利用者の入力を含まない。
-        # scope-hang-probe は choice 型で値が固定のため、run へ展開せず式の比較にだけ使う。
-        # dispatch でプローブを指定したときは ubuntu のみ: 非 Linux の leg は必ず失敗で終わり、
-        # macOS 枠を無駄に占有するため（#3556・#3505 計画 4.4。PR・push の matrix は不変）
+        # github.event_name は GitHub が設定する値で、利用者の入力を含まない
         os: >-
-          ${{ fromJSON((github.event_name == 'pull_request'
-          || (github.event_name == 'workflow_dispatch' && inputs.scope-hang-probe != 'none'))
+          ${{ fromJSON(github.event_name == 'pull_request'
           && '["ubuntu-latest"]'
           || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
@@ -930,12 +926,6 @@ jobs:
               ;;
           esac
           echo "scope hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
-          exit 1
-
-      - name: 委譲スコープ実行のハングプローブ（Linux 以外では実行しない）
-        if: env.SCOPE_HANG_PROBE != 'none' && runner.os != 'Linux'
-        run: |
-          echo "scope-hang-probe is linux only" >&2
           exit 1
 
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）

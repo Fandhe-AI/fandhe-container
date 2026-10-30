@@ -29,6 +29,7 @@
 //! 別のプロセスに触れない）。一致しなければ何も送らず、記録を古いものとして消す。一致すれば、停止要求（制御 UDS の `Stop`。
 //! `control::ControlStopRequest`。#3071。要求できなければ [`RequestOutcome::Unavailable`] で猶予の待ちを飛ばす）→
 //! [`DNS_HELPER_STOP_GRACE`] の待機 → pidfd へ SIGKILL → [`DNS_HELPER_KILL_REAP_TIMEOUT`] の待機の順に進める。
+//! 試験専用 feature `dns-helper-test-support` では、後始末の 2 つの期限を短縮する入口がある（#3508。製品の既定値は不変）。
 //! pid 番号へもシグナルを送らない。`pidfd_open` が使えないカーネル（Linux 5.3 未満）は記録を残して `Unimplemented`。
 //!
 //! # 未実装（REPAIR-3）
@@ -65,6 +66,66 @@ pub const DNS_HELPER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DNS_HELPER_STOP_GRACE: Duration = Duration::from_secs(2);
 /// SIGKILL を送った後、pidfd の可読化（終了）を待つ期限（`REAP_TIMEOUT_DEFAULT` と同じ 2 秒）。
 pub const DNS_HELPER_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 停止の猶予（[`DNS_HELPER_STOP_GRACE`]）の実効値。os.rs の後始末・停止の経路が呼ぶ。製品ビルド（feature 無効）では
+/// 定数そのもので、上書き用の状態を持たない。
+#[cfg(not(feature = "dns-helper-test-support"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const fn stop_grace() -> Duration {
+    DNS_HELPER_STOP_GRACE
+}
+/// SIGKILL 後の終了待ち（[`DNS_HELPER_KILL_REAP_TIMEOUT`]）の実効値。製品ビルドでは定数そのもの。
+#[cfg(not(feature = "dns-helper-test-support"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const fn kill_reap_timeout() -> Duration {
+    DNS_HELPER_KILL_REAP_TIMEOUT
+}
+
+#[cfg(feature = "dns-helper-test-support")]
+static TEST_STOP_TIMEOUTS: std::sync::OnceLock<(Duration, Duration)> = std::sync::OnceLock::new();
+
+/// 停止の猶予の実効値。試験専用 feature では [`override_stop_timeouts_for_test`] の上書きを返す。
+#[cfg(feature = "dns-helper-test-support")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn stop_grace() -> Duration {
+    TEST_STOP_TIMEOUTS
+        .get()
+        .map_or(DNS_HELPER_STOP_GRACE, |t| t.0)
+}
+/// SIGKILL 後の終了待ちの実効値。試験専用 feature では上書きを返す。
+#[cfg(feature = "dns-helper-test-support")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn kill_reap_timeout() -> Duration {
+    TEST_STOP_TIMEOUTS
+        .get()
+        .map_or(DNS_HELPER_KILL_REAP_TIMEOUT, |t| t.1)
+}
+
+/// 試験専用（feature `dns-helper-test-support`。リリースでは compile_error。NET-5・REPAIR-5・REPAIR-12・#3508）:
+/// 起動元の後始末の期限（停止の猶予と SIGKILL 後の終了待ち）を短くする。`launcher_killed_after_spawn_line` の
+/// 否定確認が見逃す窓（ack 期限の後、起動元が自分で終わるまで）を狭めるために使う。
+/// プロセス全体に効く大域状態なので、`--launcher-child` のような専用の子プロセスからだけ呼ぶこと。
+/// 0 と既定値を超える値は拒否する（期限を延ばさない）。2 回目の設定も拒否する。
+#[cfg(feature = "dns-helper-test-support")]
+#[doc(hidden)]
+pub fn override_stop_timeouts_for_test(
+    grace: Duration,
+    kill_reap: Duration,
+) -> Result<(), NetError> {
+    let ok = |t: Duration, max: Duration| !t.is_zero() && t <= max;
+    if !ok(grace, DNS_HELPER_STOP_GRACE) || !ok(kill_reap, DNS_HELPER_KILL_REAP_TIMEOUT) {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "test timeouts must be non-zero and not exceed the defaults",
+        ));
+    }
+    TEST_STOP_TIMEOUTS.set((grace, kill_reap)).map_err(|_| {
+        NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "test timeouts are already overridden",
+        )
+    })
+}
+
 /// 起動窓の回収（`recover_dns_helper_intent`）全体の期限。候補の走査が超えたら意図記録を残して `Timeout`。
 pub const DNS_HELPER_RECOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 段 1 の終了を待つ上限。

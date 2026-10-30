@@ -18,10 +18,9 @@ use std::time::{Duration, Instant};
 
 use super::{
     ACK, ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
-    DNS_HELPER_KILL_REAP_TIMEOUT, DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT,
-    DNS_HELPER_STOP_GRACE, DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX,
-    MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage,
-    run_stop_sequence,
+    DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT, DnsHelperStopRequest,
+    HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES, RequestOutcome,
+    SPAWN_PREFIX, StopOutcome, StopStage, kill_reap_timeout, run_stop_sequence, stop_grace,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -108,7 +107,7 @@ fn kill_and_confirm(pidfd: BorrowedFd<'_>) -> bool {
     if kill_via_pidfd(pidfd).is_err() {
         return false;
     }
-    let dead = matches!(wait_exit(pidfd, DNS_HELPER_KILL_REAP_TIMEOUT), Ok(true));
+    let dead = matches!(wait_exit(pidfd, kill_reap_timeout()), Ok(true));
     if dead {
         let _ = process::reap_pidfd_nohang(pidfd);
     }
@@ -191,11 +190,7 @@ fn stop_inner(
         request,
         record: &record,
     };
-    let stage = run_stop_sequence(
-        &mut ops,
-        DNS_HELPER_STOP_GRACE,
-        DNS_HELPER_KILL_REAP_TIMEOUT,
-    )?;
+    let stage = run_stop_sequence(&mut ops, stop_grace(), kill_reap_timeout())?;
     let _ = process::reap_pidfd_nohang(ops.pidfd.as_fd());
     // 終了を確認できた後で、制御ソケットと記録を消す（`Timeout` で上の `?` が返ったときは両方残す）。
     guard.remove_dns_control_socket()?;
@@ -238,14 +233,14 @@ fn wait_stage1(mut child: Child) -> Result<(), NetError> {
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = kill_reap_or_detach(child, DNS_HELPER_KILL_REAP_TIMEOUT);
+                let _ = kill_reap_or_detach(child, kill_reap_timeout());
                 return Err(err(
                     NetErrorCode::Timeout,
                     "dns helper stage 1 did not exit before the deadline",
                 ));
             }
             Err(_) => {
-                let _ = kill_reap_or_detach(child, DNS_HELPER_KILL_REAP_TIMEOUT);
+                let _ = kill_reap_or_detach(child, kill_reap_timeout());
                 return Err(err(
                     NetErrorCode::Internal,
                     "cannot wait for dns helper stage 1",
@@ -328,7 +323,7 @@ fn spawn_inner(
     };
     let stdin = stage1.stdin.take();
     let Some(stdout) = stage1.stdout.take() else {
-        let _ = kill_reap_or_detach(stage1, DNS_HELPER_KILL_REAP_TIMEOUT);
+        let _ = kill_reap_or_detach(stage1, kill_reap_timeout());
         return Err(fail_child_may_exist(
             stdin,
             err(NetErrorCode::Internal, "helper stdout unavailable"),
@@ -754,7 +749,7 @@ fn fail_before_ack_reap(
     e: NetError,
 ) -> NetError {
     drop(stdin);
-    let exited = if matches!(wait_exit(pidfd, DNS_HELPER_KILL_REAP_TIMEOUT), Ok(true)) {
+    let exited = if matches!(wait_exit(pidfd, kill_reap_timeout()), Ok(true)) {
         let _ = process::reap_pidfd_nohang(pidfd);
         true
     } else {

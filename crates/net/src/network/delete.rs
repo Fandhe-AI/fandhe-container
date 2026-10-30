@@ -2413,6 +2413,50 @@ mod tests {
         assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
     }
 
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: bridge の照会の復号の DataLoss（重複 IFLA_IFALIAS 等。
+    /// #3309）は NotFound（完了扱い）と混同せず、bridge に触れず Unknown で報告する。
+    #[test]
+    fn net1_3484_delete_bridge_lookup_dataloss_keeps_bridge() {
+        let (net, mut ipam, mut ports) = setup();
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteBridge);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.leftover.contains(&(
+            DeleteResource::Bridge(net.bridge.clone()),
+            ResourceState::Unknown
+        )));
+        assert!(
+            !e.report
+                .removed
+                .contains(&DeleteResource::Bridge(net.bridge))
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: 作成失敗の回収でも bridge の照会が DataLoss なら
+    /// bridge に触れず Unknown（テーブルは独立に消える）。
+    #[test]
+    fn net1_3484_reclaim_create_bridge_dataloss_refuses_bridge() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap_err();
+        let net = created();
+        assert_eq!(e.step, DeleteStep::DeleteBridge);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Bridge(net.bridge), ResourceState::Unknown)]
+        );
+        assert_eq!(e.report.removed, vec![DeleteResource::NftTable(net.table)]);
+        assert!(!fake.calls().iter().any(|c| c == "delete_link 7"));
+    }
+
     /// NET-1・TASK-139.4・ERR-1: 最初のエラーを後続の失敗で上書きしない。
     #[test]
     fn net1_delete_keeps_first_error() {

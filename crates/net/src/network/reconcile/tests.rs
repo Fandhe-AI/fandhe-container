@@ -154,21 +154,21 @@ fn table_reply(handle: u64, userdata: Option<&str>) -> TableInfo {
 enum Br {
     Absent,
     Alias(Option<String>),
-    Fail,
+    Fail(NetErrorCode),
 }
 /// テーブルの状態の代役。
 #[derive(Clone)]
 enum Tb {
     Absent,
     Userdata(Option<String>),
-    Fail,
+    Fail(NetErrorCode),
 }
 
 struct Fake {
     bridge: RefCell<Br>,
     table: RefCell<Tb>,
     live_veths: RefCell<Vec<String>>,
-    veth_fails: Cell<bool>,
+    veth_err: Cell<Option<NetErrorCode>>,
     pin: RefCell<Result<bool, NetErrorCode>>,
     dnat: RefCell<Result<Vec<PublishedListener>, NetErrorCode>>,
     /// DNAT ルールの転送先アドレス。
@@ -191,7 +191,7 @@ impl Fake {
             bridge: RefCell::new(bridge),
             table: RefCell::new(table),
             live_veths: RefCell::new(Vec::new()),
-            veth_fails: Cell::new(false),
+            veth_err: Cell::new(None),
             pin: RefCell::new(Ok(true)),
             dnat: RefCell::new(Ok(Vec::new())),
             dnat_targets: RefCell::new(Ok(Vec::new())),
@@ -232,11 +232,11 @@ impl ReconcileOps for Fake {
                     master: None,
                     alias: a.clone(),
                 }),
-                Br::Fail => Err(err(NetErrorCode::Timeout)),
+                Br::Fail(c) => Err(err(*c)),
             };
         }
-        if self.veth_fails.get() {
-            return Err(err(NetErrorCode::Timeout));
+        if let Some(c) = self.veth_err.get() {
+            return Err(err(c));
         }
         if self.live_veths.borrow().iter().any(|v| v == link.as_str()) {
             return Ok(LinkAttachment {
@@ -251,7 +251,7 @@ impl ReconcileOps for Fake {
         match &*self.table.borrow() {
             Tb::Absent => Err(err(NetErrorCode::NotFound)),
             Tb::Userdata(u) => Ok(table_reply(42, u.as_deref())),
-            Tb::Fail => Err(err(NetErrorCode::Timeout)),
+            Tb::Fail(c) => Err(err(*c)),
         }
     }
     fn rollback(&self, claim: &FailedCreateClaim) -> Result<(), NetError> {
@@ -366,10 +366,32 @@ fn net1_3346_create_intent_unproven_is_fail_closed() {
                 Tb::Userdata(Some(TOKEN.into())),
             ),
         ),
-        ("bridge-fail", Fake::new(Br::Fail, Tb::Absent)),
+        (
+            "bridge-fail",
+            Fake::new(Br::Fail(NetErrorCode::Timeout), Tb::Absent),
+        ),
+        // NET-1・REPAIR-4・#3484: 復号の DataLoss（重複 IFLA_IFALIAS 等。#3309）は
+        // 記録の破損の Err(DataLoss) ではなく Unproven に畳まれ、何も変えない。
+        (
+            "bridge-dataloss",
+            Fake::new(
+                Br::Fail(NetErrorCode::DataLoss),
+                Tb::Userdata(Some(TOKEN.into())),
+            ),
+        ),
+        (
+            "table-dataloss",
+            Fake::new(
+                Br::Alias(Some(TOKEN.into())),
+                Tb::Fail(NetErrorCode::DataLoss),
+            ),
+        ),
         (
             "table-timeout",
-            Fake::new(Br::Alias(Some(TOKEN.into())), Tb::Fail),
+            Fake::new(
+                Br::Alias(Some(TOKEN.into())),
+                Tb::Fail(NetErrorCode::Timeout),
+            ),
         ),
         (
             "table-userdata-mismatch",
@@ -594,7 +616,14 @@ fn net7_3346_sweep_keeps_intents_with_substance() {
         ),
         (
             "veth-query-fails",
-            Box::new(|f: &Fake| f.veth_fails.set(true)),
+            Box::new(|f: &Fake| f.veth_err.set(Some(NetErrorCode::Timeout))),
+            true,
+            IntentKeep::VethUnproven,
+        ),
+        // #3484: veth の復号の DataLoss も Err にならず VethUnproven で残す。
+        (
+            "veth-query-dataloss",
+            Box::new(|f: &Fake| f.veth_err.set(Some(NetErrorCode::DataLoss))),
             true,
             IntentKeep::VethUnproven,
         ),

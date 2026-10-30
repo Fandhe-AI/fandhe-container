@@ -37,6 +37,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
+use crate::barrier::RejectedRequest;
 use crate::client::{AckOutcome, SendOutcome};
 use crate::error::{IoError, IoErrorCode};
 use crate::protocol::FrameKind;
@@ -163,6 +164,9 @@ pub struct AckEvent<'a> {
     /// `outcome` が失敗系だった場合の詳細（エラーコード・メッセージ）。
     /// 成功時は `None`。
     pub error: Option<AckEventError<'a>>,
+    /// `outcome` が [`AckOutcome::Rejected`]（Nack による要求単位の拒否）のときの
+    /// code・reason（F13。#3162）。それ以外は `None`。自由文字列は持たない。
+    pub rejected: Option<RejectedRequest>,
 }
 
 /// 件数・破棄数等の要約のみを出す手書きの `Debug`（[`SendEvent`] と同じ理由）。
@@ -173,6 +177,7 @@ impl fmt::Debug for AckEvent<'_> {
             .field("ack_kind", &self.ack_kind)
             .field("latency", &self.latency)
             .field("error", &self.error)
+            .field("rejected", &self.rejected)
             .finish()
     }
 }
@@ -721,6 +726,7 @@ fn ack_outcome_reason_str(outcome: AckOutcome) -> &'static str {
         AckOutcome::RejectedUnknownAckId => "rejected_unknown_ack_id",
         AckOutcome::RejectedAckKindMismatch => "rejected_ack_kind_mismatch",
         AckOutcome::RejectedInternal => "rejected_internal",
+        AckOutcome::Rejected => "rejected",
     }
 }
 
@@ -754,6 +760,23 @@ fn encode_ack_event(event: &AckEvent<'_>) -> String {
                 "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"ok\",\"latency_us\":{latency_us}}}"
             )
         }
+        (AckOutcome::Rejected, _) => match &event.rejected {
+            Some(rejected) => {
+                let nack_code = rejected.code().io_error_code().as_str();
+                let nack_reason = rejected.reason().wire_value();
+                format!(
+                    "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"rejected\",\
+                     \"nack_code\":\"{nack_code}\",\"nack_reason\":{nack_reason},\
+                     \"latency_us\":{latency_us}}}"
+                )
+            }
+            // `Rejected` は `rejected` を伴う契約だが、型としては `Option` のため、万一
+            // `None` でも panic せず詳細を省いた行を出す。
+            None => format!(
+                "{{\"event\":\"io_recv_ack\",{ack_kind}\"outcome\":\"rejected\",\
+                 \"latency_us\":{latency_us}}}"
+            ),
+        },
         (outcome, Some(error)) => {
             let reason = ack_outcome_reason_str(*outcome);
             let code = error.code.as_str();
@@ -1979,6 +2002,7 @@ mod tests {
             ack_kind: Some(FrameKind::Ack),
             latency: Duration::from_micros(42),
             error: None,
+            rejected: None,
         };
 
         assert_eq!(
@@ -1997,6 +2021,7 @@ mod tests {
             ack_kind: Some(FrameKind::FlushAck),
             latency: Duration::from_micros(7),
             error: None,
+            rejected: None,
         };
 
         assert_eq!(
@@ -2019,6 +2044,7 @@ mod tests {
                 code: IoErrorCode::InvalidArgument,
                 message,
             }),
+            rejected: None,
         };
 
         let encoded = encode_ack_event(&event);
@@ -2031,6 +2057,38 @@ mod tests {
             "{\"event\":\"io_recv_ack\",\"outcome\":\"error\",\"reason\":\"rejected_no_in_flight\",\
              \"code\":\"INVALID_ARGUMENT\",\"message\":\"recv_ack called with no in-flight \
              requests to match against\",\"latency_us\":0}"
+        );
+    }
+
+    /// IO-1・REPAIR-4・F13・#3162: Nack による拒否は `nack_code`（IoErrorCode の文字列）と
+    /// `nack_reason`（数値）を出し、自由文字列を含まない。
+    #[test]
+    fn repair4_json_lines_encodes_rejected_ack_event() {
+        use crate::barrier::AckReceipt;
+        use crate::client::{InFlightLimit, SendQueue};
+        use crate::payload::{NackCode, NackReason};
+
+        let mut queue = SendQueue::new(InFlightLimit::default());
+        let request = queue
+            .register(FrameKind::Create)
+            .expect("Create must be trackable");
+        let receipt = AckReceipt::from_nack(request, NackCode::AlreadyExists, NackReason::Exists)
+            .expect("Create may be rejected");
+        let AckReceipt::Rejected(rejected) = receipt else {
+            panic!("expected Rejected variant");
+        };
+        let event = AckEvent {
+            outcome: AckOutcome::Rejected,
+            ack_kind: Some(FrameKind::Nack),
+            latency: Duration::from_micros(9),
+            error: None,
+            rejected: Some(rejected),
+        };
+
+        assert_eq!(
+            encode_ack_event(&event),
+            "{\"event\":\"io_recv_ack\",\"ack_kind\":\"NACK\",\"outcome\":\"rejected\",\
+             \"nack_code\":\"ALREADY_EXISTS\",\"nack_reason\":5,\"latency_us\":9}"
         );
     }
 

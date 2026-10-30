@@ -69,9 +69,9 @@
 //!   [`encode_request`] で id を埋め込んだフレームを組み立てる
 //! - [`crate::client::PipelineClient::recv_ack`]（TASK-12.2・#74）が
 //!   [`decode_ack`] で受信 ACK を検証する
-//! - v2 の [`encode_create`] 等は `PipelineClient` の型つき API（#3162）と
-//!   ファイル操作モードのサーバー（#3163）が使う予定で、本モジュールは符号化と
-//!   復号だけを提供する（それらの結線は未実装。REPAIR-3）
+//! - v2 の [`encode_create`] 等は `PipelineClient` の型つき API（#3162。実装済み）と
+//!   ファイル操作モードのサーバー（#3163。未実装。REPAIR-3）が使い、本モジュールは
+//!   符号化と復号だけを提供する
 //! - バッチ write-back サーバー本体（TASK-13.2・#77・#820）が [`decode_request`]・
 //!   [`encode_ack`] で同じ形式を読み書きする想定（本モジュールはクライアント・
 //!   サーバー双方から使われるため `client.rs` ではなく独立モジュールに置く）
@@ -405,7 +405,8 @@ fn split_wire_id<'a>(payload: &'a [u8], who: &str) -> Result<(WireRequestId, &'a
     ))
 }
 
-/// [`FrameKind::Create`] フレームを組み立てる（クライアント側。#3162 が使う予定）。
+/// [`FrameKind::Create`] フレームを組み立てる（クライアント側。`PipelineClient::create`
+/// が使う。#3162）。
 ///
 /// `path` は構文検証済みの [`GuestPath`] なので長さは 1〜[`MAX_GUEST_PATH_BYTES`] に
 /// 収まるが、防御として `u16` への変換と上限を再確認し、違反なら
@@ -609,6 +610,15 @@ impl NackCode {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// F10 の対応表どおりに写した [`IoErrorCode`]（観測の `nack_code` 用）。
+    pub fn io_error_code(self) -> IoErrorCode {
+        match self {
+            Self::InvalidArgument => IoErrorCode::InvalidArgument,
+            Self::AlreadyExists => IoErrorCode::AlreadyExists,
+            Self::ResourceExhausted => IoErrorCode::ResourceExhausted,
+        }
+    }
 }
 
 impl TryFrom<u8> for NackCode {
@@ -664,7 +674,8 @@ impl NackEnvelope {
     }
 }
 
-/// [`FrameKind::Nack`] フレームを復元する（クライアント側。#3162 が使う予定）。
+/// [`FrameKind::Nack`] フレームを復元する（クライアント側。`PipelineClient::recv_ack`
+/// が使う。#3162）。
 /// ペイロードはちょうど [`NACK_PAYLOAD_LEN`] バイト。未知の code は
 /// [`IoErrorCode::InvalidArgument`]（プロトコル違反として接続を失効させる根拠）。
 pub fn decode_nack(frame: &Frame) -> Result<NackEnvelope, IoError> {

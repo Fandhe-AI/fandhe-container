@@ -1023,3 +1023,71 @@ fn repair4_public_api_ack_observer_covers_protocol_violation_outcomes() {
     // 種別を記録することで通常 ACK と FlushAck を区別できる）。
     assert!(lines[0].contains("\"ack_kind\":\"FLUSH_ACK\""));
 }
+
+/// IO-1・REPAIR-4・F6・F8・F12・#3162: 公開 API だけで GuestPath → create → write_file →
+/// close を送り、Ack・Nack(UnknownHandle)・Ack の応答を `AckReceipt` の variant と
+/// `RejectedRequest` の code・reason で照合する。
+#[test]
+fn io1_public_api_create_write_close_and_nack_roundtrip() {
+    use fandhe_container_io::{GuestPath, NackCode, NackReason, RejectedRequest, encode_nack};
+
+    let limit = InFlightLimit::new(4).expect("4 must be valid");
+    let sender = RecordingSender::default();
+    let recv = sender.recv_handle();
+    let mut client = PipelineClient::new(sender, limit, NoopSendObserver);
+
+    let path = GuestPath::parse("dir/file.txt").expect("path must be valid");
+    let handle = client
+        .create(&path, test_timeout())
+        .expect("create must succeed");
+    let write = client
+        .write_file(handle, b"payload", test_timeout())
+        .expect("write_file must succeed");
+    let close = client
+        .close(handle, test_timeout())
+        .expect("close must succeed");
+    assert_eq!(client.queue().len(), 3);
+
+    recv.push_ack(Ok(encode_ack(
+        FrameKind::Ack,
+        WireRequestId::from(handle.id()),
+    )
+    .expect("encode_ack must succeed")));
+    recv.push_ack(Ok(encode_nack(
+        WireRequestId::from(write.id()),
+        NackCode::InvalidArgument,
+        NackReason::UnknownHandle,
+    )
+    .expect("encode_nack must succeed")));
+    recv.push_ack(Ok(encode_ack(
+        FrameKind::Ack,
+        WireRequestId::from(close.id()),
+    )
+    .expect("encode_ack must succeed")));
+
+    let first = client.recv_ack(test_timeout()).expect("create ack");
+    assert!(matches!(first, AckReceipt::Write(_)));
+    assert_eq!(first.request().id(), handle.id());
+    assert!(RejectedRequest::try_from(first).is_err());
+
+    let second = client.recv_ack(test_timeout()).expect("write_file nack");
+    let rejected = RejectedRequest::try_from(second).expect("must be Rejected");
+    assert_eq!(rejected.code(), NackCode::InvalidArgument);
+    assert_eq!(rejected.reason(), NackReason::UnknownHandle);
+    assert_eq!(rejected.request().id(), write.id());
+    assert_eq!(rejected.request().kind(), FrameKind::WriteFile);
+    assert!(!client.is_poisoned());
+
+    let third = client.recv_ack(test_timeout()).expect("close ack");
+    assert!(matches!(third, AckReceipt::Write(_)));
+    assert_eq!(third.request().id(), close.id());
+    assert!(client.queue().is_empty());
+    assert_eq!(client.ack_metrics().rejected_count(), 1);
+    assert_eq!(client.ack_metrics().success_count(), 2);
+
+    // 汎用 send は v2 のファイル操作の種別を拒否する（F12）。
+    let err = client
+        .send(FrameKind::Create, &[0u8; 8], test_timeout())
+        .expect_err("generic send must reject Create");
+    assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+}

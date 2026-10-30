@@ -2,7 +2,7 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）・エントリポイント検証（#1595）の 6 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
+//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）・エントリポイント検証（#1595）・pasta バイナリの起動時の再検証（#3330）など `AuditLayer` の各レイヤーで起きた分離違反の試行を、原因特定に必要な情報
 //! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
 //! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
 //!
@@ -21,7 +21,11 @@
 //!   `SetupFailed` は supervisor の `run_command*` が親側で 1 拒否 1 件を記録する。パスは持たない
 //!   （型で保証）。記録の PID と時刻は記録を行った親プロセスのもので、時刻は拒否から最大で exec の
 //!   上限時間ぶん遅れ得る。ワイヤー形式には安定値 `entrypoint` が `layer` に増える（既存の層の行は不変。
-//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路（本番 launcher の子）の entrypoint 違反は、子が状態 pipe の exec 前の 2 行目で返し、親〔launcher の呼び出し元〕が `exec::audit_entrypoint_violation` で記録して配線済み（#2624）。`R` の後の `execveat` の errno 由来の失敗は `X` 行で届き起動失敗になるが、違反ではないため記録しない（#2716）。状態 pipe を持たない `spawn_container` 系の子は、製品コードからの呼び出し元が無いため配線しないと決定（#2716。製品の入口を足すときは状態 pipe 付きの `spawn_container_via_intermediate` を通すこと。REPAIR-3）
+//!   `reason` を持つ層は plugin_trust・plugin_peer・exec_target・entrypoint・pasta_verify・control_channel と、理由つきの mount のレコード）。launch 経路（本番 launcher の子）の entrypoint 違反は、子が状態 pipe の exec 前の 2 行目で返し、親〔launcher の呼び出し元〕が `exec::audit_entrypoint_violation` で記録して配線済み（#2624）。`R` の後の `execveat` の errno 由来の失敗は `X` 行で届き起動失敗になるが、違反ではないため記録しない（#2716）。状態 pipe を持たない `spawn_container` 系の子は、製品コードからの呼び出し元が無いため配線しないと決定（#2716。製品の入口を足すときは状態 pipe 付きの `spawn_container_via_intermediate` を通すこと。REPAIR-3）
+//! - pasta バイナリの起動時の再検証の拒否（層 `pasta_verify`。SEC-4・PLUG-11・NET-9・#3330）は、supervisor の start の入口が
+//!   [`AuditEvent::PastaVerify`] として中継 sink（`ControlAuditRelay`）経由で 1 拒否 1 件を配送する（実装済み）。理由は
+//!   [`PastaVerifyRejection`] の 2 種（`pasta_record_changed`・`pasta_permission_denied`）で、パスは持たない（型で保証）。
+//!   作成時（CLI の create）の `PermissionDenied` は D2 と両立しないため記録しない
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）

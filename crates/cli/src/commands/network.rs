@@ -11,6 +11,7 @@
 //! 3. `create` のみ権限モデル。rootless は pasta の定義、rootful は subnet の pool 予約（D13・#3207 のオーナー判断待ち）が
 //!    無いため `UNIMPLEMENTED`
 //! 4. 状態ルートを開き（`open_store`）、定義ストアを開いて操作する
+//! 5. `rm` のみ、定義の存在確認（無ければ `NOT_FOUND`）→ 参照するコンテナの走査（`network_refs`。#3529）→ 定義ストアの `remove`
 //!
 //! # 出力形式（`ls`・stdout・タブ区切り・LF 固定。`list` に揃える）
 //!
@@ -27,7 +28,9 @@
 //! # 未実装・前提（REPAIR-3）
 //!
 //! - rootful（bridge）の `create` は subnet の pool 予約（D13）が決まるまで `UNIMPLEMENTED`。
-//! - メンバー記録（#3067）が入るまで `rm` が拒否するのは、`definition` と `@lock` 以外の項目がある場合（net の `remove` の契約）。
+//! - `rm` は、net の `remove`（`definition` と `@lock` 以外の項目、つまり bridge のメンバー・孤児の記録があれば拒否）に加え、
+//!   rootless（pasta）のコンテナの起動オプション文書（FCOPT1）が対象を参照していれば、作成済み・停止中・実行中を問わず
+//!   `FAILED_PRECONDITION` で拒否する（#3529・D10）。残る窓は `network_refs` の doc を参照。
 //! - `create --network <名前>` での定義の存在照合は `create_network::require_named_definition`(#3329)で、ここでは触れない。
 //! - 計測（REPAIR-4）: `net_recorder::CliNetRecorder` で定義ストアの操作を `network.store.*`、コマンド全体を `network_create` /
 //!   `network_rm` / `network_ls` の名前で記録し、`FANDHE_CONTAINER_OP_LOG` へ出す。
@@ -37,6 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fandhe_container_core::observability::OpRecorder;
+use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{ErrorCode, StateStore, TraitError};
 use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::network::NetworkName;
@@ -53,6 +57,7 @@ use super::create_network::{
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
 use super::list_logs::{record_op, store_open_failure};
 use super::net_recorder::CliNetRecorder;
+use super::network_refs;
 use crate::error::CliError;
 
 /// `ls` の固定ヘッダ行（LF 終端）。
@@ -62,6 +67,10 @@ const MSG_RESERVED: &str = MSG_RESERVED_NETWORK_NAME;
 const MSG_INVALID: &str = "invalid network name";
 const MSG_ALREADY_EXISTS: &str = "network already exists";
 const MSG_RM_PRECONDITION: &str = "network cannot be removed in its current state";
+const MSG_RM_IN_USE: &str =
+    "network is in use by a container; delete the containers that use it first";
+const MSG_RM_UNVERIFIED: &str =
+    "network references could not be verified; inspect or delete broken containers first";
 const MSG_STORE_PRECONDITION: &str = "network store is not in the expected state";
 const MSG_LIMIT: &str = "network limit reached";
 const MSG_PERMISSION: &str = "network store permission denied";
@@ -140,7 +149,7 @@ fn run_network_recorded(
                 Ok(d) => d,
                 Err(e) => return net_failure(e.code(), Op::Create),
             };
-            let store = match open_net_store(global, Op::Create, recorder) {
+            let (_, store) = match open_net_store(global, Op::Create, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -157,10 +166,17 @@ fn run_network_recorded(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let store = match open_net_store(global, Op::Rm, recorder) {
+            let (state, store) = match open_net_store(global, Op::Rm, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
+            // 定義が無い名前は、古いコンテナが参照していても NOT_FOUND(走査しない。#3529)。
+            if let Err(e) = store.get(&name) {
+                return net_failure(e.code(), Op::Rm);
+            }
+            if let Some(exit) = refuse_if_referenced(state, &name, recorder) {
+                return exit;
+            }
             match store.remove(&name) {
                 Ok(()) => CliExit::Success,
                 Err(e) => net_failure(e.code(), Op::Rm),
@@ -170,7 +186,7 @@ fn run_network_recorded(
             if !cfg!(target_os = "linux") {
                 return unsupported_os();
             }
-            let store = match open_net_store(global, Op::Ls, recorder) {
+            let (_, store) = match open_net_store(global, Op::Ls, recorder) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -228,18 +244,48 @@ fn corrupted(code: ErrorCode) -> CliExit {
     CliExit::Error(CliError::new(code, MSG_CORRUPTED))
 }
 
-/// 状態ルートを開き、その配下の定義ストアを開く。
+/// 状態ルートを開き、その状態ストアと配下の定義ストアを返す(`rm` の使用中判定が状態ストアを使う)。
 fn open_net_store(
     global: &GlobalArgs,
     op: Op,
     recorder: &Arc<OpRecorder>,
-) -> Result<NetworkStore, CliExit> {
+) -> Result<(FileStateStore, NetworkStore), CliExit> {
     let state = open_store(global).map_err(|e| store_open_failure(&e))?;
     let root = state
         .host_state_root()
         .ok_or_else(|| CliExit::failed(ErrorCode::Internal))?;
-    NetworkStore::open_with_recorder(root, Arc::new(CliNetRecorder::new(Arc::clone(recorder))))
-        .map_err(|e| net_failure(e.code(), op))
+    let net =
+        NetworkStore::open_with_recorder(root, Arc::new(CliNetRecorder::new(Arc::clone(recorder))))
+            .map_err(|e| net_failure(e.code(), op))?;
+    Ok((state, net))
+}
+
+/// `rm` の使用中判定(#3529・D10)。参照するコンテナがあれば `FAILED_PRECONDITION`、判定できなければ fail-closed。
+/// 走査は net のロックの外で、期限つきに行う。成否と所要時間は `network.refs.scan` で記録する(REPAIR-4)。
+fn refuse_if_referenced(
+    state: FileStateStore,
+    name: &NetworkName,
+    recorder: &Arc<OpRecorder>,
+) -> Option<CliExit> {
+    let started = Instant::now();
+    let root = match state.host_state_root() {
+        Some(r) => r.to_path_buf(),
+        None => return Some(CliExit::failed(ErrorCode::Internal)),
+    };
+    let result = network_refs::scan_bounded(state, root, name.clone());
+    record_op(recorder, "network.refs.scan", result.is_ok(), started);
+    match result {
+        Ok(network_refs::RefScan::Clear) => None,
+        Ok(network_refs::RefScan::Referenced { .. }) => Some(CliExit::Error(CliError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_RM_IN_USE,
+        ))),
+        Ok(_) => Some(CliExit::Error(CliError::new(
+            ErrorCode::FailedPrecondition,
+            MSG_RM_UNVERIFIED,
+        ))),
+        Err(e) => Some(CliExit::failed(e.code())),
+    }
 }
 
 /// net の分類を core の `ErrorCode` へ写す（`DataLoss`・未知は `Internal`）。
@@ -316,6 +362,8 @@ mod tests {
             MSG_ALREADY_EXISTS,
             MSG_NOT_FOUND,
             MSG_RM_PRECONDITION,
+            MSG_RM_IN_USE,
+            MSG_RM_UNVERIFIED,
             MSG_STORE_PRECONDITION,
             MSG_LIMIT,
             MSG_PERMISSION,
@@ -382,6 +430,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
+        use fandhe_container_core::state_store::StateRoot;
+        use fandhe_container_core::traits::{
+            Annotations, ContainerId, ContainerState, ContainerStatus, CreateStateRequest,
+            DeleteStateRequest, GetStateRequest, UpdateStateRequest,
+        };
+        use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+        use fandhe_container_supervisor::container_options::store::{
+            self as options_store, GENERATION_ANNOTATION,
+        };
         use std::path::PathBuf;
 
         /// 0700 の一時ディレクトリ（状態ルートの親。Drop で親ごと消える）。
@@ -499,6 +556,173 @@ mod tests {
             );
         }
 
+        const PASTA_BODY: &str =
+            "20260120 2049 131074 1234567 1760000000 123456789 -5 0 0 755\n/usr/bin/pasta";
+        const IN_USE: &str =
+            "network is in use by a container; delete the containers that use it first";
+        const UNVERIFIED: &str =
+            "network references could not be verified; inspect or delete broken containers first";
+
+        fn open_state(base: &Base) -> FileStateStore {
+            let root = StateRoot::from_override(base.0.join("state")).expect("root");
+            FileStateStore::open(root).expect("open")
+        }
+
+        /// 起動せずに状態記録だけを作る(世代注釈つき。`gen` が `None` なら plugin-cri 相当の注釈なし)。
+        fn add_record(base: &Base, name: &str, generation: Option<&str>, state: ContainerState) {
+            use std::num::NonZeroU32;
+            let store = open_state(base);
+            let bundle = base.0.join("bundle");
+            std::fs::create_dir_all(&bundle).expect("bundle");
+            let id = ContainerId::new(name).expect("id");
+            let mut req =
+                CreateStateRequest::new(ContainerStatus::created(id.clone(), None), bundle)
+                    .expect("req");
+            if let Some(g) = generation {
+                req = req.with_annotations(
+                    Annotations::new([(GENERATION_ANNOTATION.to_owned(), g.to_owned())])
+                        .expect("ann"),
+                );
+            }
+            let rev = store.create(&req).expect("create").revision();
+            let status = match state {
+                ContainerState::Running => ContainerStatus::running(id, NonZeroU32::new(4242)),
+                ContainerState::Stopped => ContainerStatus::stopped(id, Some(0)),
+                _ => return,
+            };
+            store
+                .update(&UpdateStateRequest::new(status, rev))
+                .expect("update");
+        }
+
+        /// 起動オプション文書(`--network <network>`・pasta の記録つき)を書く。
+        fn write_doc(base: &Base, name: &str, network: &str, generation: &str) {
+            let store = open_state(base);
+            let root = store.host_state_root().expect("root").to_path_buf();
+            let doc = ContainerOptionsDocument::default()
+                .with_network(Some(network.to_owned()), vec![], vec![])
+                .expect("net");
+            let doc = if network == "none" || network == "host" {
+                doc
+            } else {
+                doc.with_pasta(Some(PASTA_BODY.to_owned())).expect("pasta")
+            };
+            let doc = doc.with_generation(generation.to_owned()).expect("gen");
+            options_store::write_new(&root, &ContainerId::new(name).expect("id"), &doc)
+                .expect("write doc");
+        }
+
+        fn rm_exit(g: &GlobalArgs, name: &str) -> (u8, String) {
+            let (exit, _) = run(g, NetworkArgs::Rm(name.into()));
+            (exit.exit_code(), stderr_of(&exit))
+        }
+
+        const LS_N1: &str = "NAME\tMODE\tSUBNET\nn1\tpasta\t-\n";
+
+        /// NET-6・NET-9・CLI-1(#3529・D10): pasta のコンテナが参照するネットワークは、作成済み・停止中・実行中のどれでも
+        /// `network rm` が FAILED_PRECONDITION(終了コード 5)で拒否し、定義を消さない。入力値・コンテナ ID は出力に出ない。
+        #[test]
+        fn net6_net9_cli1_3529_rm_refused_for_created_stopped_running() {
+            for (state, label) in [
+                (ContainerState::Created, "created"),
+                (ContainerState::Stopped, "stopped"),
+                (ContainerState::Running, "running"),
+            ] {
+                let base = Base::new();
+                let g = base.global();
+                ok(&g, NetworkArgs::Create("n1".into()));
+                add_record(&base, "c1", Some("g1"), state);
+                write_doc(&base, "c1", "n1", "g1");
+                let (code, err) = rm_exit(&g, "n1");
+                assert_eq!(err, json("FAILED_PRECONDITION", IN_USE), "{label}");
+                assert_eq!(code, 5, "{label}");
+                assert!(!err.contains("c1") && !err.contains("n1"), "{label}");
+                assert_eq!(ok(&g, NetworkArgs::Ls), LS_N1, "{label}");
+            }
+        }
+
+        /// NET-6・NET-9・CLI-1(#3529): 参照するコンテナを delete(記録と文書を消す)すれば、rm は成功する。
+        #[test]
+        fn net6_net9_cli1_3529_rm_succeeds_after_referencing_container_deleted() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            add_record(&base, "c1", Some("g1"), ContainerState::Stopped);
+            write_doc(&base, "c1", "n1", "g1");
+            assert_eq!(rm_exit(&g, "n1").0, 5);
+            let store = open_state(&base);
+            let id = ContainerId::new("c1").expect("id");
+            let rev = store
+                .get(&GetStateRequest::new(id.clone()))
+                .expect("get")
+                .revision();
+            store
+                .delete(&DeleteStateRequest::new(id.clone(), rev))
+                .expect("delete");
+            let root = store.host_state_root().expect("root").to_path_buf();
+            options_store::remove(&root, &id).expect("remove doc");
+            assert_eq!(rm_exit(&g, "n1").0, 0);
+            assert_eq!(ok(&g, NetworkArgs::Ls), "NAME\tMODE\tSUBNET\n");
+        }
+
+        /// NET-6・NET-9・CLI-1(#3529): 別のネットワーク・`none`・世代注釈なしの記録・記録の無い文書は参照とみなさない。
+        #[test]
+        fn net6_net9_cli1_3529_rm_ignores_unrelated_records() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            ok(&g, NetworkArgs::Create("n2".into()));
+            add_record(&base, "c2", Some("g1"), ContainerState::Created);
+            write_doc(&base, "c2", "n2", "g1");
+            add_record(&base, "c3", Some("g1"), ContainerState::Created);
+            write_doc(&base, "c3", "none", "g1");
+            // plugin-cri 相当(世代注釈なし)の記録に、n1 を指す文書が残っていても参照とみなさない。
+            add_record(&base, "c4", None, ContainerState::Created);
+            write_doc(&base, "c4", "n1", "g1");
+            // 記録の無い文書だけ(create の残骸)。
+            write_doc(&base, "c5", "n1", "g1");
+            assert_eq!(rm_exit(&g, "n1").0, 0);
+            assert_eq!(
+                ok(&g, NetworkArgs::Ls),
+                "NAME\tMODE\tSUBNET\nn2\tpasta\t-\n"
+            );
+        }
+
+        /// NET-6・NET-9・CLI-1(#3529): 世代つきの記録で文書が無い・世代が不一致のときは判定不能で、fail-closed に拒否する。
+        #[test]
+        fn net6_net9_cli1_3529_rm_unverifiable_when_document_missing_or_mismatched() {
+            for mismatch in [false, true] {
+                let base = Base::new();
+                let g = base.global();
+                ok(&g, NetworkArgs::Create("n1".into()));
+                add_record(&base, "c1", Some("g1"), ContainerState::Created);
+                if mismatch {
+                    write_doc(&base, "c1", "n1", "g2");
+                }
+                let (code, err) = rm_exit(&g, "n1");
+                assert_eq!(
+                    err,
+                    json("FAILED_PRECONDITION", UNVERIFIED),
+                    "mismatch={mismatch}"
+                );
+                assert_eq!(code, 5);
+                assert_eq!(ok(&g, NetworkArgs::Ls), LS_N1);
+            }
+        }
+
+        /// NET-6・CLI-1(#3529): 定義が無い名前は、参照するコンテナが残っていても NOT_FOUND(終了コード 3)。走査の結果で変わらない。
+        #[test]
+        fn net6_net9_cli1_3529_rm_missing_network_is_not_found_without_scan() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            add_record(&base, "c1", Some("g1"), ContainerState::Created);
+            write_doc(&base, "c1", "n1", "g1");
+            let (code, err) = rm_exit(&g, "gone");
+            assert_eq!(err, json("NOT_FOUND", "network not found"));
+            assert_eq!(code, 3);
+        }
+
         /// REPAIR-4・NET-6: 成功と失敗の両方で `network.store.*` が記録器へ入る（具体値）。
         #[test]
         fn repair4_net6_network_ops_are_recorded_on_success_and_failure() {
@@ -522,7 +746,9 @@ mod tests {
             assert_eq!(count("network.store.open"), Some((5, 0)));
             assert_eq!(count("network.store.create"), Some((1, 1)));
             assert_eq!(count("network.store.list"), Some((1, 0)));
-            assert_eq!(count("network.store.remove"), Some((1, 1)));
+            assert_eq!(count("network.store.remove"), Some((1, 0)));
+            assert_eq!(count("network.store.get"), Some((1, 1)));
+            assert_eq!(count("network.refs.scan"), Some((1, 0)));
         }
 
         /// NET-6・D2: 名前の違反は状態ルートを作る前に拒否する。

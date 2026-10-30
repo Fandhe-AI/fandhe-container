@@ -34,7 +34,7 @@
 //!   [`SourceVerified`]（bridge 側の送信元詐称防止〔ether saddr と IPv4 saddr の対応固定。`nftables_rules` に必要な
 //!   expr が未実装〕を呼び出し側が保証する証明）を要求し、証明なしに転送を有効化できない形にする（fail-closed）。
 //!   この保証の実装は未着手のため、製品ビルドに [`SourceVerified`] を作る公開 API は無く、転送は有効化できない
-//!   （追跡 Issue 未起票。ユーザー承認後に起票し番号を追記する）
+//!   （追跡 Issue: #3523。オーナー承認待ち）
 //! - 上の保証があるため詐称による増幅反射は成立しない。転送応答には自前応答の `MAX_RESPONSE_GROWTH` ではなく UDP の上限
 //!   （[`MAX_DATAGRAM_LEN`] = 512 バイト。EDNS OPT を転送しないため上流も 512 以下で返す）を課し、複数 RR・CNAME 連鎖を含む
 //!   通常の応答を TCP 再試行なしで解決できるようにする。上流自身が TC=1 で返した応答は素通しで、クライアントの TCP 再試行は
@@ -49,8 +49,10 @@
 //!   処理する。同時に処理する転送は `dns_helper::MAX_INFLIGHT_DEFERRED` 件まで（暫定値）で、超過分は応答せず破棄する
 //!
 //! # 未実装（REPAIR-3）
-//! - プロセス外のヘルパープロセスへ上流マッピングを登録する経路は無い。名前の経路（`control`。#3071）は接続済みだが、
-//!   `--dns` の上流の記録からの組み立てと `ForwardingHandler` への切り替えは #3072。
+//! - ヘルパープロセスは `Reload` のたびにメンバー記録の `--dns` から上流マッピングを組み直す（`load::upstreams_from_members`・
+//!   [`DnsUpstreamMap::replace_all`]。#3072・NET-12）が、製品の待受は [`ForwardingHandler`] へ切り替えていない。
+//!   [`SourceVerified`] の製品での証明（bridge 側の送信元詐称防止）が無く、切り替えると fail-open になるため、
+//!   製品は `RegistryHandler`（転送しない）のままである。切り替えは証明の実装後（追跡 issue 起票待ち）。
 //!   [`ForwardingHandler`] は同一プロセス内の登録側（テスト・将来の組み込み）からのみ到達できる
 //! - TCP 再試行・EDNS0・上流応答の加工（TC=1 は素通し）は未対応
 
@@ -174,6 +176,31 @@ pub enum UpstreamRemoveOutcome {
     NotFound,
 }
 
+/// 上流の指定を検証して [`UpstreamList`] にする（件数 1〜3・[`UpstreamServer::new`] の拒否・gateway の拒否）。
+/// [`DnsUpstreamMap::set`] と、メンバー記録から組み直す `load::upstreams_from_members` が共有する（検証の二重実装を避ける）。
+pub(crate) fn validated_list(
+    gateway: Ipv4Addr,
+    servers: &[IpAddr],
+) -> Result<UpstreamList, NetError> {
+    if servers.is_empty() || servers.len() > MAX_UPSTREAMS_PER_CONTAINER {
+        return Err(invalid("upstream DNS server count must be between 1 and 3"));
+    }
+    let mut addrs =
+        [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); MAX_UPSTREAMS_PER_CONTAINER];
+    for (slot, ip) in addrs.iter_mut().zip(servers) {
+        let addr = UpstreamServer::new(*ip)?.socket_addr();
+        // ヘルパー自身（gateway）への転送は解決にならず転送ワーカーの枠を占有するだけのため拒否する。
+        if addr.ip() == IpAddr::V4(gateway) {
+            return Err(invalid(
+                "upstream DNS server must not be the DNS helper's own gateway address",
+            ));
+        }
+        *slot = addr;
+    }
+    UpstreamList::from_addrs(addrs.get(..servers.len()).unwrap_or(&[]))
+        .ok_or_else(|| invalid("upstream DNS server count must be between 1 and 3"))
+}
+
 /// コンテナ IPv4 → 上流リストのマッピング（NET-12）。`Arc` で `serve` 側と登録側が共有する。
 /// コンテナ間で上流が混ざらないよう、キーは送信元 IP のみで引く。
 #[derive(Debug, Default)]
@@ -196,23 +223,7 @@ impl DnsUpstreamMap {
         gateway: Ipv4Addr,
         servers: &[IpAddr],
     ) -> Result<UpstreamSetOutcome, NetError> {
-        if servers.is_empty() || servers.len() > MAX_UPSTREAMS_PER_CONTAINER {
-            return Err(invalid("upstream DNS server count must be between 1 and 3"));
-        }
-        let mut addrs =
-            [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); MAX_UPSTREAMS_PER_CONTAINER];
-        for (slot, ip) in addrs.iter_mut().zip(servers) {
-            let addr = UpstreamServer::new(*ip)?.socket_addr();
-            // ヘルパー自身（gateway）への転送は解決にならず転送ワーカーの枠を占有するだけのため拒否する。
-            if addr.ip() == IpAddr::V4(gateway) {
-                return Err(invalid(
-                    "upstream DNS server must not be the DNS helper's own gateway address",
-                ));
-            }
-            *slot = addr;
-        }
-        let list = UpstreamList::from_addrs(addrs.get(..servers.len()).unwrap_or(&[]))
-            .ok_or_else(|| invalid("upstream DNS server count must be between 1 and 3"))?;
+        let list = validated_list(gateway, servers)?;
         self.insert_list(container, list)
     }
 
@@ -251,6 +262,21 @@ impl DnsUpstreamMap {
     ) -> Result<UpstreamSetOutcome, NetError> {
         let list = UpstreamList::from_addrs(servers).ok_or_else(|| invalid("count"))?;
         self.insert_list(container, list)
+    }
+
+    /// 全登録を丸ごと差し替える（メンバー記録の再読み込み用。NET-12・#3072）。件数が [`MAX_REGISTRY_ENTRIES`] を超えれば
+    /// 何も変えず `ResourceExhausted`。それ以外は 1 回の書き込みロックで入れ替え、半端な状態を見せない。
+    /// 同じアドレスが重複していれば後の方が前を上書きする（呼び出し側の `load::upstreams_from_members` は重複を作らない）。
+    pub fn replace_all(&self, entries: &[(Ipv4Addr, UpstreamList)]) -> Result<(), NetError> {
+        if entries.len() > MAX_REGISTRY_ENTRIES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "upstream DNS map is full",
+            ));
+        }
+        let fresh: HashMap<Ipv4Addr, UpstreamList> = entries.iter().copied().collect();
+        *lock_poisoned(self.entries.write()) = fresh;
+        Ok(())
     }
 
     /// 登録を削除する。
@@ -1478,5 +1504,54 @@ mod tests {
         assert_eq!(std::mem::size_of::<Option<SourceVerified>>(), 1);
         assert_eq!(std::mem::size_of::<ForwardedProof>(), 1);
         assert_eq!(std::mem::size_of::<Option<ForwardedProof>>(), 1);
+    }
+
+    /// NET-12・#3072: `replace_all` は全登録を差し替える。再利用されたアドレスは新しい上流になり（`set` なら
+    /// `AlreadyExists`）、消えたメンバーは引けなくなる。
+    #[test]
+    fn net12_3072_replace_all_swaps_and_drops_stale() {
+        let gw = Ipv4Addr::new(10, 89, 0, 1);
+        let m = DnsUpstreamMap::new();
+        let a = Ipv4Addr::new(10, 89, 0, 2);
+        let b = Ipv4Addr::new(10, 89, 0, 3);
+        m.set(a, gw, &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))])
+            .expect("set a");
+        m.set(b, gw, &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 54))])
+            .expect("set b");
+        let fresh =
+            validated_list(gw, &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))]).expect("list");
+        m.replace_all(&[(a, fresh)]).expect("replace");
+        assert_eq!(m.len(), 1);
+        let got: Vec<String> = m
+            .lookup(a)
+            .expect("a")
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        assert_eq!(got, vec!["198.51.100.7:53"]);
+        assert!(m.lookup(b).is_none());
+    }
+
+    /// NET-12・#3072: 上限超過の `replace_all` は何も変えず `ResourceExhausted`。
+    #[test]
+    fn net12_3072_replace_all_over_limit_keeps_previous() {
+        let gw = Ipv4Addr::new(10, 89, 0, 1);
+        let m = DnsUpstreamMap::new();
+        let a = Ipv4Addr::new(10, 89, 0, 2);
+        m.set(a, gw, &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))])
+            .expect("set");
+        let list = validated_list(gw, &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))]).expect("list");
+        let many: Vec<(Ipv4Addr, UpstreamList)> = (0..=MAX_REGISTRY_ENTRIES as u32)
+            .map(|i| (Ipv4Addr::from(0x0a00_0000 + i), list))
+            .collect();
+        let e = m.replace_all(&many).expect_err("over limit");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        let got: Vec<String> = m
+            .lookup(a)
+            .expect("a")
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        assert_eq!(got, vec!["192.0.2.53:53"]);
     }
 }

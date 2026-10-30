@@ -29,7 +29,7 @@
 //! 別のプロセスに触れない）。一致しなければ何も送らず、記録を古いものとして消す。一致すれば、停止要求（制御 UDS の `Stop`。
 //! `control::ControlStopRequest`。#3071。要求できなければ [`RequestOutcome::Unavailable`] で猶予の待ちを飛ばす）→
 //! [`DNS_HELPER_STOP_GRACE`] の待機 → pidfd へ SIGKILL → [`DNS_HELPER_KILL_REAP_TIMEOUT`] の待機の順に進める。
-//! 試験専用 feature `dns-helper-test-support` では、後始末の 2 つの期限を短縮する入口がある（#3508。製品の既定値は不変）。
+//! 試験専用 feature `dns-helper-test-support` では、後始末の 2 つの期限と起動窓の回収の期限を短縮する入口がある（#3508・#3559。製品の既定値は不変）。
 //! pid 番号へもシグナルを送らない。`pidfd_open` が使えないカーネル（Linux 5.3 未満）は記録を残して `Unimplemented`。
 //!
 //! # 未実装（REPAIR-3）
@@ -126,7 +126,51 @@ pub fn override_stop_timeouts_for_test(
     })
 }
 
+/// 起動窓の回収の期限（[`DNS_HELPER_RECOVER_TIMEOUT`]）の実効値。os.rs の `recover_inner` が呼ぶ。
+/// 製品ビルド（feature 無効）では定数そのもので、上書き用の状態を持たない。
+#[cfg(not(feature = "dns-helper-test-support"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const fn recover_timeout() -> Duration {
+    DNS_HELPER_RECOVER_TIMEOUT
+}
+
+#[cfg(feature = "dns-helper-test-support")]
+static TEST_RECOVER_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// 回収の期限の実効値。試験専用 feature では [`override_recover_timeout_for_test`] の上書きを返す。
+#[cfg(feature = "dns-helper-test-support")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn recover_timeout() -> Duration {
+    TEST_RECOVER_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(DNS_HELPER_RECOVER_TIMEOUT)
+}
+
+/// 試験専用（feature `dns-helper-test-support`。リリースでは compile_error。NET-5・REPAIR-5・REPAIR-12・#3559）:
+/// 起動窓の回収全体の期限（既定 30 秒）を短くする。期限切れの `Timeout` と意図記録の保持（fail-closed）を
+/// 30 秒待たずに照合するために使う（#3540 の残り）。
+/// プロセス全体に効く大域状態なので、`--recover-deadline-child` のような専用の子プロセスからだけ呼ぶこと。
+/// 0 と既定値を超える値は拒否する（期限を延ばさない）。2 回目の設定も拒否する。
+#[cfg(feature = "dns-helper-test-support")]
+#[doc(hidden)]
+pub fn override_recover_timeout_for_test(timeout: Duration) -> Result<(), NetError> {
+    if timeout.is_zero() || timeout > DNS_HELPER_RECOVER_TIMEOUT {
+        return Err(NetError::new(
+            NetErrorCode::InvalidArgument,
+            "test recover timeout must be non-zero and not exceed the default",
+        ));
+    }
+    TEST_RECOVER_TIMEOUT.set(timeout).map_err(|_| {
+        NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "test recover timeout is already overridden",
+        )
+    })
+}
+
 /// 起動窓の回収（`recover_dns_helper_intent`）全体の期限。候補の走査が超えたら意図記録を残して `Timeout`。
+/// 実効値は [`recover_timeout`]（試験専用 feature では上書きできる。#3559）。
 pub const DNS_HELPER_RECOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 段 1 の終了を待つ上限。
 pub const DNS_HELPER_STAGE1_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -328,6 +372,24 @@ mod tests {
         assert_eq!(DNS_HELPER_KILL_REAP_TIMEOUT, Duration::from_secs(2));
         assert_eq!(DNS_HELPER_STAGE1_EXIT_TIMEOUT, Duration::from_secs(2));
         assert_eq!(IDENT_LINE_MAX, 128);
+        // 製品の既定値が不変であることの機械照合（#3559）。
+        assert_eq!(DNS_HELPER_RECOVER_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// NET-5・REPAIR-12・#3559: 回収の期限の上書きは 0 と既定値超を拒否する。有効な値での上書きは
+    /// 同一プロセスの回収試験（既定 30 秒の前提）に効いてしまうため、lib の単体試験では行わない
+    /// （有効値の上書きは結合試験 `dns_helper_process` の専用の子プロセスで照合する）。
+    #[cfg(feature = "dns-helper-test-support")]
+    #[test]
+    fn net5_3559_recover_timeout_override_rejects_zero_and_longer() {
+        for bad in [
+            Duration::ZERO,
+            DNS_HELPER_RECOVER_TIMEOUT + Duration::from_nanos(1),
+        ] {
+            let e = override_recover_timeout_for_test(bad).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument);
+        }
+        assert_eq!(recover_timeout(), DNS_HELPER_RECOVER_TIMEOUT);
     }
 
     /// D11・#3070: 要求が通り猶予内に終了したら SIGKILL を送らない。

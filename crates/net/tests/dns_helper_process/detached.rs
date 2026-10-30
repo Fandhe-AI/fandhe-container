@@ -19,8 +19,8 @@ use fandhe_container_net::dns_helper::control::{
 use fandhe_container_net::dns_helper::detach::{
     ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
     DnsHelperStopRequest, IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome,
-    StopOutcome, override_stop_timeouts_for_test, recover_dns_helper_intent,
-    spawn_detached_dns_helper, stop_recorded_dns_helper,
+    StopOutcome, override_recover_timeout_for_test, override_stop_timeouts_for_test,
+    recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
 };
 use fandhe_container_net::dns_helper::identity::{ProcessIdentity, read_identity};
 use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
@@ -158,6 +158,9 @@ fn setup(tmp: &Tmp) -> (NetworkStore, NetworkName) {
 /// 起動元（`spawn_detached_dns_helper` の呼び出し側）としての再実行の引数（`launcher_killed_after_spawn_line` 用）。
 pub const ARG_LAUNCHER_CHILD: &str = "--launcher-child";
 
+/// 回収の期限を短縮した子としての再実行の引数（`recover_deadline_keeps_intent` 用。#3559）。
+pub const ARG_RECOVER_DEADLINE_CHILD: &str = "--recover-deadline-child";
+
 /// 段 1・段 2 としての再実行の引数か。
 pub fn is_helper_arg(a: &std::ffi::OsStr) -> bool {
     a == ARG_DETACH || a == ARG_STAGE2
@@ -174,6 +177,7 @@ pub fn run(exe: &Path) {
     spawn_write_count(exe);
     launcher_killed_after_spawn_line(exe);
     launcher_self_exits_after_ack_deadline(exe);
+    recover_deadline_keeps_intent(exe);
     control_reload(exe);
     upstream_load(exe);
 }
@@ -939,6 +943,134 @@ fn launcher_self_exits_after_ack_deadline(exe: &Path) {
 }
 
 /// ネットワーク `dnsh` のメンバー記録（ID = コンテナ ID が DNS 名になる。10.89.0.`last`/24）。
+/// 取り出しに `delay` かかる候補の列。最初の 1 件（自プロセスの pid。nonce は持たない）だけを返し、以降は空。
+/// 回収の期限検査は取り出し直後に行われるため、`next()` の遅れで期限が過ぎる場面を作れる。
+fn slow_candidates(delay: Duration) -> impl Iterator<Item = u32> {
+    let mut first = true;
+    std::iter::from_fn(move || {
+        if std::mem::take(&mut first) {
+            std::thread::sleep(delay);
+            Some(std::process::id())
+        } else {
+            None
+        }
+    })
+}
+
+/// 回収の期限を `<ms>` に短縮した子（`recover_deadline_keeps_intent` の被験側。NET-5・REPAIR-5・REPAIR-12・#3559）:
+/// `override_recover_timeout_for_test` の後、期限より遅い候補の列で回収が `Timeout` になり意図記録が残ることを
+/// 照合する。上書きはプロセス全体に効く大域状態なので、試験の親では呼ばずこの専用の子でだけ呼ぶ。
+/// 期待どおりなら終了コード 0、使い方・上書きの失敗は 2、期待外れ（`Ok` や別のコード）は 3。
+pub fn recover_deadline_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let (Some(root), Some(ms)) = (args.get(2), args.get(3)) else {
+        eprintln!("recover_deadline_child: usage: --recover-deadline-child <state_root> <ms>");
+        return std::process::ExitCode::from(2);
+    };
+    let Some(ms) = ms.to_str().and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("recover_deadline_child: invalid deadline ms");
+        return std::process::ExitCode::from(2);
+    };
+    if let Err(e) = override_recover_timeout_for_test(Duration::from_millis(ms)) {
+        eprintln!(
+            "recover_deadline_child: override failed: {:?} {}",
+            e.code(),
+            e.message()
+        );
+        return std::process::ExitCode::from(2);
+    }
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    if n.read_dns_helper_intent().expect("intent").is_none() {
+        eprintln!("recover_deadline_child: no intent record");
+        return std::process::ExitCode::from(3);
+    }
+    let started = Instant::now();
+    // 候補の取り出しに期限の 4 倍かかる。取り出し直後の期限検査で Timeout になる。
+    let mut cands = slow_candidates(Duration::from_millis(ms * 4));
+    let r = recover_dns_helper_intent(&n, &mut cands, &NoopNetOpRecorder);
+    let elapsed = started.elapsed();
+    let kept = n.read_dns_helper_intent().expect("intent").is_some();
+    match r {
+        Err(e)
+            if e.code() == NetErrorCode::Timeout
+                && e.message().contains("intent record kept")
+                && kept
+                && elapsed < Duration::from_secs(5) =>
+        {
+            eprintln!(
+                "recover_deadline_child: timeout elapsed_ms={}",
+                elapsed.as_millis()
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!(
+                "recover_deadline_child: unexpected result {:?} kept={kept} elapsed={elapsed:?}",
+                other.map_err(|e| (e.code(), e.message().to_owned()))
+            );
+            std::process::ExitCode::from(3)
+        }
+    }
+}
+
+/// #3559（#3540 の残り。NET-5・REPAIR-5・REPAIR-12）: 回収全体の期限切れで `Timeout` になり、意図記録（再試行に
+/// 要る nonce）を消さないこと（fail-closed）を、期限を 50 ms に短縮した専用の子（`--recover-deadline-child`）で
+/// 30 秒待たずに照合する。陽性対照として、上書きしない親プロセス（既定 30 秒）では同じ遅延の列が
+/// `Recovered { stopped: 0 }` で終わり意図記録が消える（遅延だけでは `Timeout` にならず、子の `Timeout` が
+/// 期限の短縮から来たことの裏付けになる）。親では上書きを呼ばない。
+fn recover_deadline_keeps_intent(exe: &Path) {
+    let tmp = Tmp::new("recover-deadline");
+    let (store, name) = setup(&tmp);
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5353).expect("listen");
+    {
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        n.write_dns_helper_intent(&DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::generate().expect("nonce"),
+            listen,
+        ))
+        .expect("intent");
+        // 子が同じ排他ロックをとるため、起動の前にここで手放す。
+    }
+    let mut child = Command::new(exe)
+        .arg(ARG_RECOVER_DEADLINE_CHILD)
+        .arg(&tmp.0)
+        .arg("50")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let status = match crate::reap::wait_within(&mut child, crate::reap::reap_within()) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("recover deadline child did not finish: {e}");
+        }
+    };
+    assert_eq!(status.code(), Some(0), "child must observe Timeout");
+
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert!(
+        n.read_dns_helper_intent().expect("intent").is_some(),
+        "a timed-out recovery must keep the intent record"
+    );
+    // 陽性対照: 既定の期限では同じ遅延の列でも完了し、意図記録が消える。
+    let mut cands = slow_candidates(Duration::from_millis(200));
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut cands, &NoopNetOpRecorder).expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+    eprintln!(
+        "dns_helper_process: recover_deadline_keeps_intent ok child_exit=0 child_code=Timeout intent_kept=1 default_recovered_stopped=0 intent_after=none"
+    );
+}
+
 fn member(id: &str, last: u8) -> MemberRecord {
     let token = format!("fandhe-net:dnsh:1:0:0/ep/{id}/g/00000000000000000000000000000001");
     MemberRecord::new(

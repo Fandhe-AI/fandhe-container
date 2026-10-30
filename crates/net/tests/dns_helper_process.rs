@@ -106,6 +106,14 @@ fn main() -> std::process::ExitCode {
     {
         return detached::launcher_child(args);
     }
+    // 回収の期限を短縮した子としての再実行（`recover_deadline_keeps_intent`。#3559）。
+    #[cfg(target_os = "linux")]
+    if args
+        .get(1)
+        .is_some_and(|a| a == detached::ARG_RECOVER_DEADLINE_CHILD)
+    {
+        return detached::recover_deadline_child(args);
+    }
     // root と `setpriv` が要る別 uid の場面（PLUG-12・#3071）は `--ignored` のときだけ実行する。
     #[cfg(target_os = "linux")]
     if args

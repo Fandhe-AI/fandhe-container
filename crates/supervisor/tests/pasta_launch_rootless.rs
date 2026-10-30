@@ -1378,9 +1378,27 @@ mod linux {
         let pasta_dir_left = state.join("@pasta").join(id.as_str()).exists();
         // 子（SIGKILL された supervisor 役）が消せなかった一時領域の掃除。
         let _ = std::fs::remove_dir_all(&work);
+        // 子は SIGKILL で `ScratchRootCleanup` が走らないため、work の親（子の pid 入りの scratch ルート
+        // `fandhe-plr-scratch-<子の pid>-*`）が空で残る。空のときだけ消える `remove_dir` で回収する
+        // （自プロセスのルートと他シナリオの領域は対象外）。
+        if let Some(root) = work.parent() {
+            let own =
+                super::scratch_root::scratch_root("fandhe-plr-scratch", timeout()).to_path_buf();
+            let is_child_root = root != own
+                && root
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("fandhe-plr-scratch-"));
+            if is_child_root {
+                let _ = std::fs::remove_dir(root);
+            }
+        }
         if let Some(xdg) = state.parent() {
             let _ = std::fs::remove_dir_all(xdg);
         }
+        // work を消しても子の scratch ルート（`fandhe-plr-scratch-<子の pid>-*`）自体は空で残る。子は SIGKILL で
+        // `ScratchRootCleanup` が走らないため、親が tag・sequence の前方一致で作業領域と空のルートを回収する。
+        let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        reclaim_child_scratch(&temp, &format!("fandhe-plr-t{tag}-s{sequence}-"));
         if let Err(p) = checked {
             std::panic::resume_unwind(p);
         }

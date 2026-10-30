@@ -55,7 +55,7 @@ on:
           実質無効にしてステップの timeout-minutes だけで止まるかを見る / script-deadline =
           スクリプトの期限（150 秒）で止まることを見る。どちらもプローブ step は必ず失敗で終わる
           （期待どおり止まった証拠は job の時刻とログ）。PR ブランチへ --ref で dispatch すれば 3 OS で回り、
-          concurrency group が PR 自身の CI と衝突しない。PR・push では存在しない（none 相当）
+          concurrency group が PR 自身の CI と衝突しない。dispatch では platform-ci が ubuntu だけで回る（#3556）。PR・push では存在しない（none 相当）
         type: choice
         options:
           - none
@@ -462,9 +462,13 @@ jobs:
       matrix:
         # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS（上記コメント参照）。
         # `&&` / `||` の三項相当は両分岐とも空でない文字列リテラルのため取り違えない。
-        # github.event_name は GitHub が設定する値で、利用者の入力を含まない
+        # github.event_name は GitHub が設定する値で、利用者の入力を含まない。
+        # scope-hang-probe は choice 型で値が固定のため、run へ展開せず式の比較にだけ使う。
+        # dispatch でプローブを指定したときは ubuntu のみ: 非 Linux の leg は必ず失敗で終わり、
+        # macOS 枠を無駄に占有するため（#3556・#3505 計画 4.4。PR・push の matrix は不変）
         os: >-
-          ${{ fromJSON(github.event_name == 'pull_request'
+          ${{ fromJSON((github.event_name == 'pull_request'
+          || (github.event_name == 'workflow_dispatch' && inputs.scope-hang-probe != 'none'))
           && '["ubuntu-latest"]'
           || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}

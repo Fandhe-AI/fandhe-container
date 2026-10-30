@@ -63,7 +63,7 @@
 | `8` | `Nack` | 要求単位の失敗の通知（S→C。v2。#3161） |
 | `9..=255` | （未知値） | `INVALID_ARGUMENT` として拒否する |
 
-5〜8 は v2（#3161 で実装済み）。ペイロードのレイアウトは [F4](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886) と `crates/io/src/payload.rs` が定める。サーバー（#3163）とクライアントの型つき API（#3162）は未実装。
+5〜8 は v2（#3161 で実装済み）。ペイロードのレイアウトは [F4](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886) と `crates/io/src/payload.rs` が定める。サーバー（`serve_file_connection`）は #3163 で実装済み、クライアントの型つき API（#3162）は未実装。
 
 ### エンコード例
 
@@ -265,7 +265,7 @@ BREAK-2 検出経路の整理:
 
 - `WireRequestId`（非公開フィールド。`RequestId` からのみ構築できる）がワイヤー表現を担う。`RequestId` が内部に持つ発行元キュー識別子（`QueueId`）はメモリ内の区別にのみ使い、ワイヤー上には一切現れない（TASK-12.1 の契約を維持する）
 - `encode_request` / `decode_request`（`Write`・`Flush` 用）、`encode_ack` / `decode_ack`（`Ack`・`FlushAck` 用）が公開 API。種別違反・長さ違反は構築前に検証し、`Frame::decode` 系のアロケーション前検証（TASK-83.2）を壊さない
-- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）。ただしファイル操作モード（v2。ワイヤー形式は #3161 で実装済み、サーバーは #3163 で未実装）に限り、`Ack` 自体は status を持たないまま、失敗を別の種別 `Nack` で返す（F8）
+- ACK に status バイト（成功/失敗）は持たせない。サーバー側の失敗は接続再利用禁止契約（P1-3。上記「エラー後の接続再利用禁止」節）により接続断で伝わるため、ACK 自体に真偽値を足す必要がない。あとから追加する場合はワイヤー形式の変更（`PROTOCOL_VERSION` の繰り上げ）が要る（PoC-2 の `status(0=OK)` をあえて再現しない理由）。ただしファイル操作モード（v2。ワイヤー形式は #3161 で実装済み、サーバーは #3163 で実装済み）に限り、`Ack` 自体は status を持たないまま、失敗を別の種別 `Nack` で返す（F8）
 - `PROTOCOL_VERSION` は v1 ではペイロードが不透明なバイト列だったため `1` のまま据え置いた（ヘッダ・フレーム全体のレイアウトは変わらなかった）。v2（#3161）で種別 5〜8 を足したため `2` に上げた（F2）
 
 ### 送信（`PipelineClient::send`）
@@ -389,7 +389,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 - 件数未達分を時間ベースで追い出す仕組み
 - 未フラッシュ滞留量の上限のクライアント側計測・自動 Flush 送出、`--unflushed-max-*` の CLI バイナリ配線（TASK-79）・TOML 読み込み（TASK-82）
 - 実際の CLI バイナリ（`fandhe-container`）での `--batch-size` 引数の解釈・`crates/cli → crates/io` の依存追加（TASK-79）
-- ファイル操作を表すペイロード形式のうち、作成・追記・Close・Nack のワイヤー形式（符号化と復号）は #3161 で実装済み、サーバーの処理は未実装（上記の新しい節・実装は #3163）。rename・truncate・unlink・mkdir 単独・readdir・getattr は範囲外のまま（spec への確認事項 (a)）
+- ファイル操作を表すペイロード形式のうち、作成・追記・Close・Nack のワイヤー形式（符号化と復号）は #3161 で実装済み、サーバーの処理は #3163 で実装済み（`crates/io/src/file_serve.rs`。上記の新しい節）。rename・truncate・unlink・mkdir 単独・readdir・getattr は範囲外のまま（spec への確認事項 (a)）
 - Windows のトランスポート（`windows-sys` の依存承認が必要）
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
@@ -454,7 +454,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
   - サーバーのディスパッチ時: `GuestPath::parse` の構文違反は要求単位の Nack（`INVALID_ARGUMENT`）にする。フレームは健全なため接続は続ける
   - `GuestFileCreator` 内: IO-5 の規則（大文字小文字・NFC / NFD の衝突、ホストパス長）を適用する。ディスクの状態に依存するため、ここで行う
 - ホストパス長（260）: Windows ホストではエラー（Nack `INVALID_ARGUMENT`、reason `HostPathTooLong`）。その他の OS では観測イベント（警告）のみで作成を続ける（npm の深いパスを Linux / macOS で拒否しないため）
-  - 状態: #3160 で `GuestFileCreator` に実装済み（`crates/io/src/guest_files.rs`）。構文検証の直後・ロックと走査の前に、共有ルート（設定値）に検証済みのコンポーネントを足した計測用のパスで測る。警告は内部の戻り値に持つだけで、観測への配線は #3163。reason の値表と `create_file` の失敗の分類関数は `crates/io/src/nack_reason.rs` と `guest_files.rs`（crate 内）
+  - 状態: #3160 で `GuestFileCreator` に実装済み（`crates/io/src/guest_files.rs`）。構文検証の直後・ロックと走査の前に、共有ルート（設定値）に検証済みのコンポーネントを足した計測用のパスで測る。警告は内部の戻り値に持ち、#3163 で `FileServeStats::host_path_warnings`（件数のみ）へ配線済み。reason の値表と `create_file` の失敗の分類関数は `crates/io/src/nack_reason.rs` と `guest_files.rs`（crate 内）
 - 閉じ込め: 既存の `*_beneath`（`openat` + `O_NOFOLLOW`）だけを使い、ワイヤーのパスを `Path::join` に渡さない。祖先が symlink、またはディレクトリでなかった場合は Nack `INVALID_ARGUMENT`（reason `EscapesRoot` / `NotADirectory`）
 
 ### F6 ハンドル

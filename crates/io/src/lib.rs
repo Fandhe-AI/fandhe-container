@@ -54,13 +54,12 @@
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
 //! ワイヤー形式は変えないサーバー側 API。ワイヤー上の作成要求は v2 の符号化と復号
-//! [`payload::encode_create`] 等が #3161 で実装済みで、サーバーの処理〔#3163〕と
-//! クライアント API〔#3162〕は未実装〔REPAIR-3〕）
+//! [`payload::encode_create`] 等が #3161 で、サーバーの処理 [`file_serve::serve_file_connection`]
+//! が #3163 で実装済み。クライアント API〔#3162〕と永続化〔#3164〕は未実装〔REPAIR-3〕）
 //! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
 //! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
 //! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
-//! （Windows ホストはエラー、その他の OS は警告だけで作成を続ける。警告と拒否理由の観測への配線は
-//! #3163〔REPAIR-3〕）。NFC / NFD の別表記も、名前は書き換えず同じ衝突として検出する（TASK-21.1・#103）。
+//! （Windows ホストはエラー、その他の OS は警告だけで作成を続ける。警告は [`file_serve::FileServeStats`] の件数、拒否理由は Nack と統計へ流す。#3163）。NFC / NFD の別表記も、名前は書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
 //! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は
@@ -80,6 +79,7 @@ mod checksum;
 pub mod client;
 mod display_sanitize;
 pub mod error;
+pub mod file_serve;
 pub mod fs_normalize;
 pub mod guest_files;
 pub mod guest_path;
@@ -116,6 +116,11 @@ pub use client::{
     SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode, MAX_IO_ERROR_MESSAGE_BYTES};
+pub use file_serve::{
+    DEFAULT_MAX_OPEN_FILES, FileServeLimits, FileServeReport, FileServeStats, MAX_MAX_OPEN_FILES,
+    MaxOpenFiles, NackReasonCounts, serve_file_connection, serve_file_connection_with_limit,
+    serve_file_connection_with_recorder,
+};
 pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
     check_case_collisions, check_host_path_length, measure_host_path_length,

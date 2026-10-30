@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fandhe_container_core::audit_log::{AuditLayer, AuditRecord, AuditSink, PastaVerifyRejection};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create,
@@ -30,11 +31,13 @@ use fandhe_container_core::traits::{
     GetStateRequest, StartRequest, StateRecord, StateRevision, StateStore, TraitError,
     UpdateStateRequest,
 };
+use fandhe_container_supervisor::pasta_attach::PastaLogBuffer;
 use fandhe_container_supervisor::restart::RestartPolicy;
 use fandhe_container_supervisor::run::StopToken;
 use fandhe_container_supervisor::start_contract::{StartReport, result_deadline};
 use fandhe_container_supervisor::start_entry::{
-    DEADLINE_EXCEEDED_MESSAGE, Running, START_OP, StartDeps, run_start, run_start_until,
+    DEADLINE_EXCEEDED_MESSAGE, LATE_DRAIN_BUDGET, REPORT_RESERVE, Running, START_OP, StartDeps,
+    TAMPER_AUDIT_BUDGET, run_start, run_start_after_options_worker_for_test, run_start_until,
     run_supervised, start_metrics_line,
 };
 use fandhe_container_supervisor::state::open_default_store;
@@ -293,6 +296,10 @@ struct FakeDeps {
     flushed: Arc<Mutex<Vec<(std::time::Instant, String)>>>,
     /// `flush_deferred_logs` の呼び出し回数（#3359）。
     flushes: Arc<AtomicUsize>,
+    /// `check_launcher_available` が `unavailable` より先に返す 2c の失敗(本番の `container_options_error` と同じ位置。#3473)。
+    options_error: Option<TraitError>,
+    /// 設定すると `flush_deferred_logs` がこのバッファも取り出す(本番の `pasta_logs.flush()` と同じ。#3473)。
+    pasta_logs: Option<Arc<PastaLogBuffer>>,
 }
 
 impl FakeDeps {
@@ -311,6 +318,9 @@ impl FakeDeps {
 impl StartDeps for FakeDeps {
     fn check_launcher_available(&self) -> Result<(), TraitError> {
         self.step("check")?;
+        if let Some(e) = &self.options_error {
+            return Err(e.clone());
+        }
         if self.unavailable {
             return Err(TraitError::new(
                 ErrorCode::Unimplemented,
@@ -360,7 +370,11 @@ impl StartDeps for FakeDeps {
     }
 
     fn flush_deferred_logs(&self) {
-        let lines = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut lines =
+            std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(logs) = &self.pasta_logs {
+            lines.extend(logs.take());
+        }
         let now = std::time::Instant::now();
         self.flushed
             .lock()
@@ -413,6 +427,8 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             deferred: Arc::new(Mutex::new(Vec::new())),
             flushed: Arc::new(Mutex::new(Vec::new())),
             flushes: Arc::new(AtomicUsize::new(0)),
+            options_error: None,
+            pasta_logs: None,
         },
         launcher,
     )
@@ -1598,4 +1614,212 @@ fn net12_discard_claim_releases_network_before_cgroup() {
             "release"
         ]
     );
+}
+/// 記録した時刻つきで監査レコードを受ける試験用の記録先(#3473)。
+#[derive(Default)]
+struct RecordingSink {
+    got: Mutex<Vec<(std::time::Instant, AuditRecord)>>,
+}
+
+impl AuditSink for RecordingSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.got
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((std::time::Instant::now(), record.clone()));
+        Ok(())
+    }
+}
+
+/// 2c の作業本体の `LOG_PREPARE_DEADLINE`(supervisor 内の非公開定数。5 秒)。
+const OPTIONS_WORKER_LIMIT: Duration = Duration::from_secs(5);
+
+/// 期限超過した 2c の拒否の結果(#3473)。
+struct TimeoutRun {
+    result: Result<Running, std::num::NonZeroU8>,
+    t0: std::time::Instant,
+    t_end: std::time::Instant,
+    out: TimedWriter,
+    flushed: Vec<(std::time::Instant, String)>,
+    flushes: usize,
+    audit: Vec<(std::time::Instant, AuditRecord)>,
+    tamper_placed_at: Option<std::time::Instant>,
+    logs: Arc<PastaLogBuffer>,
+    calls: Vec<&'static str>,
+    env: Env,
+}
+
+/// 2c の作業スレッドが報告の後 `late_after` を待って改ざんの印を置く構成で、期限超過の拒否を通す。`late_after` が
+/// `None` なら作業スレッドは継ぎ目が戻るまで解放しない(戻らない作業スレッド)。
+fn run_options_timeout(tag: &str, late_after: Option<Duration>) -> TimeoutRun {
+    let env = Env::new(tag);
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    let logs = Arc::new(PastaLogBuffer::new());
+    d.pasta_logs = Some(Arc::clone(&logs));
+    let (flushed, flushes) = (Arc::clone(&d.flushed), Arc::clone(&d.flushes));
+    let sink = Arc::new(RecordingSink::default());
+    let sink_dyn: Arc<dyn AuditSink> = sink.clone();
+
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let placed = Arc::new(Mutex::new(None));
+    let (wl, wplaced, id) = (Arc::clone(&logs), Arc::clone(&placed), env.id.clone());
+    let work = move || {
+        wl.mark_verify_started();
+        let _ = go_rx.recv_timeout(Duration::from_secs(30));
+        wl.set_tamper(PastaVerifyRejection::PermissionDenied);
+        wl.push(format!(
+            "{{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"{id}\",\"elapsed_ms\":1,\"result\":\"rejected\",\"code\":\"PERMISSION_DENIED\",\"tamper_suspected\":\"true\"}}\n"
+        ));
+        *wplaced.lock().unwrap() = Some(std::time::Instant::now());
+        Ok(())
+    };
+
+    // 報告の flush を合図に、作業スレッドを `late_after` の後に解放する(報告の後に置かれた印の再現)。
+    let (sig_tx, sig_rx) = std::sync::mpsc::channel::<()>();
+    let releaser = late_after.map(|after| {
+        let go = go_tx.clone();
+        std::thread::spawn(move || {
+            if sig_rx.recv_timeout(Duration::from_secs(30)).is_ok() {
+                std::thread::sleep(after);
+                let _ = go.send(());
+            }
+        })
+    });
+    let mut out = TimedWriter {
+        signal: late_after.map(|_| sig_tx),
+        ..TimedWriter::default()
+    };
+
+    let t0 = std::time::Instant::now();
+    // 2c は本番の 5 秒で期限を超え、`run_start_until` には REPORT_RESERVE を引いてなお 1 秒残る
+    // (check の失敗が TIMEOUT で確定し、期限超過の INTERNAL と競合しない)。
+    let deadline = t0 + OPTIONS_WORKER_LIMIT + REPORT_RESERVE + REPORT_RESERVE;
+    let result = run_start_after_options_worker_for_test(
+        work,
+        |e| {
+            d.options_error = e;
+            Box::new(d)
+        },
+        &logs,
+        Some(&sink_dyn),
+        &env.store,
+        &StartRequest::new(cid(&env.id)),
+        &short_timeouts(),
+        Some(deadline),
+        &mut out,
+    );
+    let t_end = std::time::Instant::now();
+    let _ = go_tx.send(());
+    if let Some(h) = releaser {
+        h.join().unwrap();
+    }
+    let tamper_placed_at = *placed.lock().unwrap();
+    let flushed = flushed.lock().unwrap().clone();
+    let audit = sink.got.lock().unwrap().clone();
+    TimeoutRun {
+        result,
+        t0,
+        t_end,
+        out,
+        flushed,
+        flushes: flushes.load(Ordering::SeqCst),
+        audit,
+        tamper_placed_at,
+        logs,
+        calls: calls_of(&calls),
+        env,
+    }
+}
+
+fn assert_timeout_report_and_flush(r: &TimeoutRun) -> std::time::Instant {
+    assert_eq!(
+        r.result.as_ref().err(),
+        Some(&exit_code_for(ErrorCode::Timeout))
+    );
+    match report_of(&r.out.bytes()) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Timeout);
+            assert_eq!(message.as_str(), "container options preparation timed out");
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    let reported = r.out.reported_at().expect("reported");
+    assert!(
+        reported - r.t0 >= OPTIONS_WORKER_LIMIT,
+        "{:?}",
+        reported - r.t0
+    );
+    // deps の flush は報告の後にちょうど 1 回で、期限超過の行が 1 度だけ出る。
+    assert_eq!(r.flushes, 1);
+    assert_eq!(r.flushed.len(), 1, "{:?}", r.flushed);
+    let (at, line) = &r.flushed[0];
+    assert!(*at >= reported, "flush must follow the report");
+    assert!(
+        line.starts_with(&format!(
+            "{{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"{}\",\"elapsed_ms\":",
+            r.env.id
+        )),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(",\"result\":\"timeout\",\"stage\":\"verify\"}\n"),
+        "{line}"
+    );
+    // check の失敗で止まり、副作用に進まない。
+    assert_eq!(r.calls, ["check"]);
+    let rec = r.env.record(&r.env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+    reported
+}
+
+/// SEC-4・NET-9・REPAIR-5・REPAIR-12(#3473・#3431): 2c の期限超過で拒否した start は、拒否の報告 → deps の
+/// flush(ちょうど 1 回) → 報告の後に作業スレッドが置いた改ざんの印の監査 1 件、の順で進み、報告の後の
+/// 待ちは `LATE_DRAIN_BUDGET + TAMPER_AUDIT_BUDGET` に収まる。所要は約 5〜6 秒。
+#[test]
+fn sec4_repair5_3473_options_timeout_reports_then_flushes_once_and_audits_late_tamper() {
+    const RELEASE_AFTER: Duration = Duration::from_millis(200);
+    assert!(RELEASE_AFTER < LATE_DRAIN_BUDGET);
+    let r = run_options_timeout("opttmo", Some(RELEASE_AFTER));
+    let reported = assert_timeout_report_and_flush(&r);
+
+    let placed = r.tamper_placed_at.expect("tamper placed after the report");
+    assert!(placed >= reported + RELEASE_AFTER, "placed before release");
+    assert!(placed < reported + LATE_DRAIN_BUDGET);
+
+    assert_eq!(r.audit.len(), 1, "{:?}", r.audit);
+    let (at, rec) = &r.audit[0];
+    assert!(*at >= placed, "audit must follow the late tamper mark");
+    assert_eq!(rec.layer(), AuditLayer::PastaVerify);
+    assert_eq!(rec.layer().as_str(), "pasta_verify");
+    assert_eq!(
+        *rec.event(),
+        PastaVerifyRejection::PermissionDenied.audit_event()
+    );
+    assert_eq!(rec.container_id(), Some(&cid(&r.env.id)));
+
+    // 遅れて積まれた拒否行は報告の後始末の flush で出し済みで、印も取り出し済み。
+    assert!(r.logs.take().is_empty());
+    assert!(r.logs.take_tamper().is_none());
+
+    let budget = LATE_DRAIN_BUDGET + TAMPER_AUDIT_BUDGET + Duration::from_secs(2);
+    assert!(r.t_end - reported <= budget, "{:?}", r.t_end - reported);
+}
+
+/// REPAIR-5・SEC-4(#3473): 作業スレッドが戻らないときは、報告の後の待ちが `LATE_DRAIN_BUDGET` で打ち切られ、
+/// 監査は配送されず、期限超過の行が終端の記録になる。
+#[test]
+fn repair5_3473_options_timeout_unreturned_worker_is_bounded_and_sends_no_audit() {
+    let r = run_options_timeout("optnoret", None);
+    let reported = assert_timeout_report_and_flush(&r);
+    assert!(r.audit.is_empty(), "{:?}", r.audit);
+    let waited = r.t_end - reported;
+    assert!(waited >= LATE_DRAIN_BUDGET, "{waited:?}");
+    assert!(
+        waited <= LATE_DRAIN_BUDGET + Duration::from_secs(2),
+        "{waited:?}"
+    );
+    assert!(r.logs.take().is_empty());
 }

@@ -13,7 +13,8 @@
 //! # 未実装の範囲(REPAIR-3)
 //!
 //! - ユーザー定義名(`Named`)は Linux で `LaunchNetworkMode::Attachable` へ写り、supervisor の `pasta_attach` が
-//!   holder と pasta を結線する(#1940)。CLI が `network <名前>` と `pasta` を FCOPT1 に書く入口は #3329。Linux 以外は
+//!   holder と pasta を結線する(#1940)。CLI が `network <名前>` と `pasta` を FCOPT1 に書く入口は #3329 で実装済み(start の手順 2c が定義の存在を
+//!   `network_definition::check_pasta_definition` で照合し直す)。Linux 以外は
 //!   `Unimplemented`。`container:` 始まりは結線されておらず `Unimplemented`(rootful の参加指定は #3069・#3074)。
 //! - `publish`(`-p`)は検証済みの [`PastaPortForwards`] として保持し、`pasta_attach` が pasta の引数へ連結する(#1940。
 //!   NET-9・NET-3。#3200 で kind を足した)。

@@ -347,7 +347,28 @@ impl NetworkStore {
         })
     }
 
-    fn open_inner(state_root: &Path, recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+    /// 既存のストアだけを、何も作らずに開く(読み取り専用の事前確認用。NET-6・CLI-1・#3329)。
+    ///
+    /// `create` が副作用(状態ルート・`@networks`・`@lock` の作成)より前に定義の存在を確かめるための入口
+    /// (`docs/design/network-wiring.md` D2)。状態ルートまたは `@networks` が無い、または `@networks` が空で
+    /// `@lock` も無い場合は `Ok(None)`。それ以外は [`open`](Self::open) と同じ検査(0700・所有者・
+    /// `O_NOFOLLOW`)をかけ、違反は自動修復せず拒否する。項目があるのに `@lock` が無い既存ストアは `DataLoss`。
+    pub fn open_existing(state_root: &Path) -> Result<Option<Self>, NetError> {
+        Self::open_existing_with_recorder(state_root, Arc::new(NoopNetOpRecorder))
+    }
+
+    /// [`open_existing`](Self::open_existing) に記録先を渡す(以降の操作の記録は [`open_with_recorder`](Self::open_with_recorder) と同じ)。
+    pub fn open_existing_with_recorder(
+        state_root: &Path,
+        recorder: Arc<dyn NetOpRecorder>,
+    ) -> Result<Option<Self>, NetError> {
+        let rec = Arc::clone(&recorder);
+        record_net_op(&*rec, NetOpKind::NetworkStoreOpen, || {
+            Self::open_existing_inner(state_root, recorder)
+        })
+    }
+
+    fn check_platform() -> Result<(), NetError> {
         // 対応外アーキでは O_NOFOLLOW 等が 0 になり symlink 拒否が効かないため、fail-closed で拒否する。
         if sys::O_NOFOLLOW == 0 || sys::O_DIRECTORY == 0 {
             return Err(err(
@@ -361,6 +382,48 @@ impl NetworkStore {
                 "network store requires /proc/self/fd",
             ));
         }
+        Ok(())
+    }
+
+    fn open_existing_inner(
+        state_root: &Path,
+        recorder: Arc<dyn NetOpRecorder>,
+    ) -> Result<Option<Self>, NetError> {
+        Self::check_platform()?;
+        let root = match OpenOptions::new()
+            .read(true)
+            .custom_flags(sys::O_DIRECTORY)
+            .open(state_root)
+        {
+            Ok(f) => Dir { file: f },
+            Err(e) if e.raw_os_error() == Some(sys::ENOENT) => return Ok(None),
+            Err(e) => return Err(map_io(&e, "failed to open network store state root")),
+        };
+        let dir = match open_dir_checked(&root.path(NETWORKS_DIR)) {
+            Ok(d) => d,
+            Err(e) if e.code() == NetErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // 空の `@networks` で `@lock` も無いなら、まだ初期化されていないストア(定義は無い)として扱う。
+        match dir.open_regular(LOCK_FILE, false, u64::MAX) {
+            Ok(_) => {}
+            Err(e) if e.code() == NetErrorCode::NotFound => {
+                if dir.entries(SCAN_LIMIT)?.is_empty() {
+                    return Ok(None);
+                }
+                return Err(global_lock_missing_as_data_loss(e));
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            dir,
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
+            recorder,
+        }))
+    }
+
+    fn open_inner(state_root: &Path, recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+        Self::check_platform()?;
         let root = OpenOptions::new()
             .read(true)
             .custom_flags(sys::O_DIRECTORY)
@@ -378,16 +441,7 @@ impl NetworkStore {
             fs::set_permissions(&path, fs::Permissions::from_mode(DIR_MODE))
                 .map_err(|e| map_io(&e, "failed to set network store directory mode"))?;
         }
-        let f = OpenOptions::new()
-            .read(true)
-            .custom_flags(FLAGS_DIR)
-            .open(&path)
-            .map_err(|e| map_io(&e, "failed to open network store directory"))?;
-        let m = f
-            .metadata()
-            .map_err(|e| map_io(&e, "failed to stat network store directory"))?;
-        check_dir_meta(m.is_dir(), m.uid(), m.mode(), sys::effective_uid())?;
-        let dir = Dir { file: f };
+        let dir = open_dir_checked(&path)?;
         // 全体のロックファイルを検査する（以降の取得は検査つきで開き直す）。作るのは初期化時（新規作成、
         // または中身が空）だけで、項目があるのに欠落している既存ストアは破損として拒否する（fail-closed）。
         let initializing = created || dir.entries(SCAN_LIMIT)?.is_empty();
@@ -1179,5 +1233,63 @@ mod tests {
         assert_eq!(code(s.lock_global_exclusive()), NetErrorCode::DataLoss);
         assert_eq!(code(NetworkStore::open(&t.0)), NetErrorCode::DataLoss);
         assert!(!s.dir.path(LOCK_FILE).exists());
+    }
+
+    /// NET-6・CLI-1(#3329): 状態ルートも `@networks` も無ければ `None` で、何も作らない。
+    #[test]
+    fn net6_3329_open_existing_absent_creates_nothing() {
+        let t = Tmp::new("exabsent");
+        assert!(NetworkStore::open_existing(&t.0).unwrap().is_none());
+        assert!(fs::symlink_metadata(t.nets()).is_err());
+        let missing = t.0.join("no-such-root");
+        assert!(NetworkStore::open_existing(&missing).unwrap().is_none());
+        assert!(fs::symlink_metadata(&missing).is_err());
+        // 空の `@networks` で `@lock` が無いときも `None` で、`@lock` を作らない。
+        DirBuilder::new().mode(0o700).create(t.nets()).unwrap();
+        assert!(NetworkStore::open_existing(&t.0).unwrap().is_none());
+        assert!(fs::symlink_metadata(t.nets().join("@lock")).is_err());
+    }
+
+    /// NET-6(#3329): `open` で作った既存のストアは読める。
+    #[test]
+    fn net6_3329_open_existing_reads_definition() {
+        let t = Tmp::new("exread");
+        NetworkStore::open(&t.0)
+            .unwrap()
+            .create(&pasta("web"))
+            .unwrap();
+        let s = NetworkStore::open_existing(&t.0).unwrap().expect("some");
+        assert_eq!(s.get(&nn("web")).unwrap(), pasta("web"));
+        assert_eq!(code(s.get(&nn("nope"))), NetErrorCode::NotFound);
+    }
+
+    /// NET-6・SEC-1(#3329): 権限・symlink・`@lock` 欠落の違反は `open` と同じ分類で拒否する。
+    #[test]
+    fn net6_3329_open_existing_fail_closed_on_violations() {
+        let t = Tmp::new("exmode");
+        NetworkStore::open(&t.0).unwrap();
+        fs::set_permissions(t.nets(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            code(NetworkStore::open_existing(&t.0)),
+            NetErrorCode::PermissionDenied
+        );
+        let t = Tmp::new("exlink");
+        let other = Tmp::new("exlinkdst");
+        symlink(&other.0, t.nets()).unwrap();
+        assert_eq!(
+            code(NetworkStore::open_existing(&t.0)),
+            NetErrorCode::FailedPrecondition
+        );
+        // 項目があるのに `@lock` が無い。
+        let t = Tmp::new("exlock");
+        NetworkStore::open(&t.0)
+            .unwrap()
+            .create(&pasta("a"))
+            .unwrap();
+        fs::remove_file(t.nets().join("@lock")).unwrap();
+        assert_eq!(
+            code(NetworkStore::open_existing(&t.0)),
+            NetErrorCode::DataLoss
+        );
     }
 }

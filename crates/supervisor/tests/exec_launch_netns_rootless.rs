@@ -22,7 +22,7 @@
 //! netns を保持し、`stop()` が `Stopped`・終了コード 0 で終わる。
 //!
 //! # 範囲外（REPAIR-3）
-//! - pasta を含めた起動からの通し確認（`PastaAttachHook`）は #3331。ホステッド runner に pasta が無いため、本試験の
+//! - pasta を含めた起動からの通し確認（`PastaAttachHook`）は `pasta_launch_rootless`（#3331）。ホステッド runner に pasta が無いため、本試験の
 //!   フックは holder の起動だけを行う試験用実装
 //! - restart の再 launch は #2043 まで拒否される。rootful の Attachable は未実装（#3069）
 //!

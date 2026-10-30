@@ -55,7 +55,7 @@ on:
           実質無効にしてステップの timeout-minutes だけで止まるかを見る / script-deadline =
           スクリプトの期限（150 秒）で止まることを見る。どちらもプローブ step は必ず失敗で終わる
           （期待どおり止まった証拠は job の時刻とログ）。PR ブランチへ --ref で dispatch すれば 3 OS で回り、
-          concurrency group が PR 自身の CI と衝突しない。dispatch では platform-ci が ubuntu だけで回る（#3556）。PR・push では存在しない（none 相当）
+          concurrency group が PR 自身の CI と衝突しない。PR・push では存在しない（none 相当）
         type: choice
         options:
           - none
@@ -71,6 +71,7 @@ on:
           helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証 /
           helper-noscope = scripts/run-with-deadline.sh（scope を作らない版・#3505。期限 60 秒）の同じ実証。
           どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
+          scope-hang-probe を none 以外にした dispatch では platform-ci が ubuntu だけで回る（#3556）。
           PR・push では存在しない（none 相当）
         type: choice
         options:

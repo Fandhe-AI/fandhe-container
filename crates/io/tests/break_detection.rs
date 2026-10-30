@@ -32,15 +32,25 @@
 //! - 全 OS 共通: インメモリの双方向バイトパイプ（[`mem_pipe`]・[`MemEnd`]）。BREAK-1・
 //!   BREAK-2 の両方をこの上で確認する。UDS の `bind` が `Unimplemented` になる
 //!   Windows でも実行できる
-//! - unix 限定（`mod unix`）: 実 UDS 上で BREAK-2 のみ確認する（本番の
+//! - unix 限定（`mod unix`）: 実 UDS 上で BREAK-2 を確認する（本番の
 //!   [`crate::server::UdsServer`] / [`crate::server::UdsConnection`] を実際に使う
-//!   経路の確認。BREAK-1 の UDS 経路は既存の `tests/responsiveness.rs` でカバー
-//!   済みのため、ここでは複製しない）
+//!   経路の確認）。単一 sink モードの UDS の BREAK-1 は既存の `tests/responsiveness.rs` で
+//!   カバー済みのため、ここでは複製しない
+//! - unix 限定・UDS クライアント経路（#3167・F14）: 本番の `UdsClientConnection`（#3165）に
+//!   `PipelineClient` の型つき API（`create`。ファイル操作モード）を載せ、サーバー側は本番の
+//!   `serve_file_connection`（#3163）で、BREAK-1（ACK 未送信 → `Timeout`）と BREAK-2（応答
+//!   フレームの長さの破壊 → `DataLoss`）を確認する。`GuestFileCreator` の共有ルートは
+//!   ソケットのディレクトリ配下の 0700 のサブディレクトリにする
 //!
 //! ## 検出機構と本ファイルのビヘイビア対応
 //!
 //! - BREAK-2 →（申告長と実長の食い違いを `header_crc`＋本体チェックサムで検出。
-//!   REPAIR-2・IO-1。TASK-83 相当）→ [`IoErrorCode::DataLoss`]
+//!   REPAIR-2・IO-1。TASK-83 相当）→ [`IoErrorCode::DataLoss`]。UDS クライアント経路では、
+//!   `header_crc` を再計算しない長さの破壊は受信経路の `FrameHeader::from_bytes` が
+//!   `DataLoss` で拒否する。`header_crc` を合わせた自己整合的な長さの偽りは、応答系が固定長
+//!   （Ack・FlushAck は 8 B、Nack は 11 B。F12）のため本体を読む前に `ReceiveLimits::admit` が
+//!   `InvalidArgument` で拒否する（`tests/uds_client.rs` の
+//!   `io1_uds_client_rejects_oversized_ack_before_body_read` で確認済みのため複製しない）
 //! - BREAK-1 →（応答待ちの有限時間打ち切り。REPAIR-5・IO-1。TASK-85 相当）→
 //!   [`IoErrorCode::Timeout`]
 //!
@@ -351,7 +361,8 @@ impl BatchSink for MemSink {
 ///
 /// サーバー側の接続（`T: FrameSender<Frame = Frame> + FrameReceiver<Frame = Frame>`）
 /// を包み、[`FrameKind::Ack`] / [`FrameKind::FlushAck`] の [`FrameSender::send_frame`]
-/// 呼び出しだけを黙って捨てて `Ok(())` を返す。サーバーは ACK を送ったつもりでいるが
+/// 呼び出しだけを黙って捨てて `Ok(())` を返す（ファイル操作モードの応答 [`FrameKind::Nack`] も
+/// 同様に捨てる。#3167）。サーバーは ACK を送ったつもりでいるが
 /// （[`fandhe_container_io::writeback::WritebackStats::acks_sent`] は増える）、相手には
 /// 届かない。それ以外の種別（`Write`・`Flush`）はそのまま委譲し、[`FrameReceiver::recv_frame`]
 /// も一切変更せずに委譲する。
@@ -372,7 +383,10 @@ where
     type Frame = Frame;
 
     fn send_frame(&mut self, frame: &Frame, timeout: IoTimeout) -> Result<(), IoError> {
-        if matches!(frame.kind(), FrameKind::Ack | FrameKind::FlushAck) {
+        if matches!(
+            frame.kind(),
+            FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack
+        ) {
             // BREAK-1 相当: ACK フレームを実際には送らずに捨てる。
             return Ok(());
         }
@@ -712,15 +726,21 @@ mod exclusive_dir;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use std::io::{Read as _, Write as _};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::observe::NoopServerObserver;
-    use fandhe_container_io::payload::{decode_ack, encode_request};
+    use fandhe_container_io::payload::{decode_ack, decode_create, encode_ack, encode_request};
     use fandhe_container_io::protocol::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKind};
     use fandhe_container_io::writeback::WritebackTimeouts;
-    use fandhe_container_io::{BatchConfig, IoErrorCode, ReceiveLimits, UdsServer};
+    use fandhe_container_io::{
+        AckReceipt, BatchConfig, FileServeReport, GuestFileCreator, GuestPath, InFlightLimit,
+        IoErrorCode, NoopSendObserver, PipelineClient, ReceiveLimits, UdsClientConnection,
+        UdsConnection, UdsServer, UdsServerPolicy, serve_file_connection,
+    };
 
     /// `stream` からフレームを 1 つ読み取る（クライアント側の簡易受信ヘルパー。
     /// `tests/responsiveness.rs` の `UnixStreamTransport::recv_frame` と同じ
@@ -743,7 +763,8 @@ mod unix {
     }
 
     use super::{
-        HANG_GUARD_GRACE, MemSink, join_within, response_timeout, tamper_declared_len, wire_id,
+        AckDropping, HANG_GUARD_GRACE, MemSink, join_within, response_timeout, short_timeout,
+        tamper_declared_len, wire_id,
     };
 
     /// `tests/responsiveness.rs` / `tests/writeback.rs` の `TempSocketDir` と同じ
@@ -762,6 +783,16 @@ mod unix {
 
         fn socket_path(&self) -> PathBuf {
             self.path.join("s.sock")
+        }
+
+        /// `GuestFileCreator` の共有ルート（ソケットのディレクトリ配下の 0700 のサブディレクトリ。
+        /// ソケットのディレクトリ自体は `exclusive_dir` が 0700・自分の所有で作る）。
+        fn share_root(&self) -> PathBuf {
+            let root = self.path.join("share");
+            std::fs::create_dir(&root).expect("share root must be creatable");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("share root must be forced to mode 0700");
+            root
         }
     }
 
@@ -904,5 +935,283 @@ mod unix {
         assert_eq!(report.stats.frames_received, 0);
         assert_eq!(report.stats.batches_written, 0);
         assert_eq!(report.stats.acks_sent, 0);
+    }
+
+    // ---- UDS クライアント経路（#3167・F14・REPAIR-7）--------------------------------------
+
+    /// 本番の `UdsClientConnection` + `PipelineClient` を `path` に接続する（`same_effective_uid`。
+    /// 全許可の policy は使わない。PLUG-12）。
+    fn uds_pipeline_client(
+        path: &std::path::Path,
+    ) -> PipelineClient<UdsClientConnection<NoopServerObserver>, NoopSendObserver> {
+        let conn = UdsClientConnection::connect(
+            path,
+            response_timeout(),
+            UdsServerPolicy::same_effective_uid(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("client must connect to the private socket");
+        PipelineClient::new(conn, InFlightLimit::default(), NoopSendObserver)
+    }
+
+    /// 本番の `serve_file_connection` を 1 接続だけ処理するサーバースレッド。`wrap` で接続を包める
+    /// （BREAK-1 は `AckDropping`）。バッチは 1 件で発火させ、`Create` に即 Ack が返るようにする。
+    /// 受付は bind 済みの `server` で行う（クライアントは bind 後に接続できる）。
+    fn spawn_file_server<W>(
+        mut server: UdsServer<NoopServerObserver>,
+        root: PathBuf,
+        timeouts: WritebackTimeouts,
+        wrap: impl FnOnce(UdsConnection<NoopServerObserver>) -> W + Send + 'static,
+    ) -> JoinHandle<FileServeReport>
+    where
+        W: fandhe_container_io::FrameSender<Frame = Frame>
+            + fandhe_container_io::FrameReceiver<Frame = Frame>,
+    {
+        std::thread::spawn(move || {
+            let conn = server
+                .accept(response_timeout(), NoopServerObserver)
+                .expect("server must accept the client connection");
+            let mut wrapped = wrap(conn);
+            let creator = GuestFileCreator::new(root).expect("creator must open the share root");
+            serve_file_connection(
+                &mut wrapped,
+                BatchConfig::new(1).expect("1 must be a valid batch size"),
+                &creator,
+                timeouts,
+            )
+        })
+    }
+
+    fn file_server_timeouts() -> WritebackTimeouts {
+        WritebackTimeouts {
+            recv: response_timeout(),
+            send: response_timeout(),
+        }
+    }
+
+    /// TASK-89.1・REPAIR-7・BREAK-1・#3167（対照・UDS クライアント）: ACK を握りつぶさない本番の
+    /// ファイル操作サーバーに `create` を送ると、通常 ACK が届く。クライアントが接続を閉じると、
+    /// サーバーは `Unavailable` で終わる。
+    #[test]
+    fn repair7_repair5_break1_uds_client_control_ack_arrives_without_injection() {
+        let dir = TempSocketDir::new();
+        let root = dir.share_root();
+        let server = UdsServer::bind(
+            &dir.socket_path(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
+        let server_thread = spawn_file_server(server, root.clone(), file_server_timeouts(), |c| c);
+
+        let mut client = uds_pipeline_client(&dir.socket_path());
+        let path = GuestPath::parse("b1.bin").expect("valid guest path");
+        client
+            .create(&path, response_timeout())
+            .expect("create must be sent");
+        match client.recv_ack(response_timeout()) {
+            Ok(AckReceipt::Write(ack)) => assert_eq!(ack.request().kind(), FrameKind::Create),
+            other => panic!("expected a write ack for Create, got {other:?}"),
+        }
+        assert!(!client.is_poisoned());
+        drop(client);
+
+        let report = join_within(
+            server_thread,
+            response_timeout().as_duration() + HANG_GUARD_GRACE,
+        )
+        .expect("server thread must finish within the watchdog")
+        .expect("server thread must not panic");
+        assert_eq!(report.stats.creates_succeeded, 1);
+        assert_eq!(report.stats.acks_sent, 1);
+        assert_eq!(report.end.code(), IoErrorCode::Unavailable);
+        assert!(root.join("b1.bin").is_file());
+    }
+
+    /// TASK-89.1・REPAIR-7・REPAIR-5・BREAK-1・#3167（UDS クライアント）: サーバーが ACK を握りつぶすと
+    /// （[`AckDropping`]）、本番の `UdsClientConnection` 上の `PipelineClient::recv_ack` は期限どおり
+    /// [`IoErrorCode::Timeout`] を返し、接続は失効する。サーバーは `Create` を処理して Ack を送った
+    /// つもりでいる（`acks_sent == 1`）。実ソケットではサーバーが先に終わると EOF が届いて
+    /// `Unavailable` に見えてしまうため、クライアントの期限を短く（1 秒）、サーバーの受信期限を
+    /// 長く（`response_timeout`）する逆転構成にする。
+    #[test]
+    fn repair7_repair5_break1_uds_client_ack_dropping_server_detected_as_timeout() {
+        let dir = TempSocketDir::new();
+        let root = dir.share_root();
+        let server = UdsServer::bind(
+            &dir.socket_path(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
+        let server_thread =
+            spawn_file_server(server, root, file_server_timeouts(), AckDropping::new);
+
+        let mut client = uds_pipeline_client(&dir.socket_path());
+        let path = GuestPath::parse("b1.bin").expect("valid guest path");
+        client
+            .create(&path, response_timeout())
+            .expect("create must be sent");
+
+        let wait_started = Instant::now();
+        let first_err = client
+            .recv_ack(short_timeout())
+            .expect_err("recv_ack must fail once the ack wait exceeds the timeout")
+            .code();
+        let elapsed = wait_started.elapsed();
+        assert_eq!(first_err, IoErrorCode::Timeout);
+        assert!(
+            elapsed + Duration::from_millis(100) >= short_timeout().as_duration(),
+            "ack wait elapsed {elapsed:?} must be close to the {:?} timeout",
+            short_timeout().as_duration()
+        );
+        assert!(
+            elapsed < short_timeout().as_duration() + HANG_GUARD_GRACE,
+            "ack wait elapsed {elapsed:?} must not exceed timeout + grace"
+        );
+        assert!(client.is_poisoned());
+        // 失効後の呼び出しは待たずに Unavailable
+        assert_eq!(
+            client
+                .recv_ack(short_timeout())
+                .expect_err("poisoned client must fail")
+                .code(),
+            IoErrorCode::Unavailable
+        );
+        drop(client);
+
+        let report = join_within(
+            server_thread,
+            response_timeout().as_duration() + HANG_GUARD_GRACE,
+        )
+        .expect("server thread must finish within the watchdog")
+        .expect("server thread must not panic");
+        // BREAK-1 の本質: リクエストは届いて処理された（作成済み）が、ACK が届かない
+        assert_eq!(report.stats.creates_succeeded, 1);
+        assert_eq!(report.stats.acks_sent, 1);
+        assert_eq!(report.end.code(), IoErrorCode::Unavailable);
+    }
+
+    /// std の `UnixListener` を `socket_path` に bind し、本番の `UdsClientConnection` を接続して
+    /// 受け付けた側の `UnixStream` を返す（生のバイト列を返すための「サーバー」。接続前のパス検査は
+    /// ソケットであること・symlink でないこと・所有者・親ディレクトリの権限と所有者を見るため、
+    /// std で bind したソケットでも通る）。
+    fn raw_server_and_client(
+        dir: &TempSocketDir,
+    ) -> (
+        UnixStream,
+        PipelineClient<UdsClientConnection<NoopServerObserver>, NoopSendObserver>,
+    ) {
+        let listener = UnixListener::bind(dir.socket_path()).expect("bind must succeed");
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking must succeed");
+        // connect は待ち行列に入った時点で成功するため、同一スレッドで先に接続できる
+        let client = uds_pipeline_client(&dir.socket_path());
+        let deadline = Instant::now() + response_timeout().as_duration();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        // BSD 系では受け付けたソケットが非ブロッキングを引き継ぐため明示的に戻す
+        stream
+            .set_nonblocking(false)
+            .expect("set_nonblocking(false) must succeed");
+        (stream, client)
+    }
+
+    /// `client` から `create` を送り、「サーバー」側でその request id を読んで、同じ id の
+    /// Ack をエンコードしたバイト列（無傷）を返す。
+    fn create_and_encode_ack(
+        stream: &mut UnixStream,
+        client: &mut PipelineClient<UdsClientConnection<NoopServerObserver>, NoopSendObserver>,
+    ) -> Vec<u8> {
+        let path = GuestPath::parse("b2.bin").expect("valid guest path");
+        client
+            .create(&path, response_timeout())
+            .expect("create must be sent");
+        let frame = read_one_frame(stream, response_timeout().as_duration());
+        let id = decode_create(&frame)
+            .expect("create frame must decode")
+            .id();
+        encode_ack(FrameKind::Ack, id)
+            .expect("encode_ack must succeed")
+            .encode()
+    }
+
+    /// `encoded`（[`Frame::encode`] の出力）の `payload_len` フィールド（ヘッダの 2〜5 バイト目。
+    /// リトルエンディアン）だけを `declared` に書き換え、`header_crc` は再計算しないコピーを返す
+    /// （ワイヤー上で長さが壊れた状態の再現。`header_crc` まで合わせる [`tamper_declared_len`] とは別物）。
+    fn corrupt_declared_len_keep_crc(encoded: &[u8], declared: u32) -> Vec<u8> {
+        let mut out = encoded.to_vec();
+        out.get_mut(2..6)
+            .expect("an encoded frame must contain the payload_len field")
+            .copy_from_slice(&declared.to_le_bytes());
+        out
+    }
+
+    /// TASK-89.1・REPAIR-7・REPAIR-2・BREAK-2・#3167（対照・UDS クライアント）: 無傷の Ack を返す
+    /// 「サーバー」に対して、本番の `UdsClientConnection` 上の `recv_ack` が通常 ACK を受け取る。
+    #[test]
+    fn repair7_repair2_break2_uds_client_control_well_formed_ack_is_received() {
+        let dir = TempSocketDir::new();
+        let (mut stream, mut client) = raw_server_and_client(&dir);
+        let ack = create_and_encode_ack(&mut stream, &mut client);
+        stream
+            .set_write_timeout(Some(response_timeout().as_duration()))
+            .expect("set_write_timeout must succeed");
+        stream
+            .write_all(&ack)
+            .expect("write_all must succeed for a well-formed ack");
+        match client.recv_ack(response_timeout()) {
+            Ok(AckReceipt::Write(ack)) => assert_eq!(ack.request().kind(), FrameKind::Create),
+            other => panic!("expected a write ack for Create, got {other:?}"),
+        }
+        assert!(!client.is_poisoned());
+    }
+
+    /// TASK-89.1・REPAIR-7・REPAIR-2・BREAK-2・#3167（UDS クライアント）: Ack の `payload_len`
+    /// （8 → 7）だけを書き換えて送ると、本番の受信経路（`recv_frame_on`）が `header_crc` の不一致を
+    /// [`IoErrorCode::DataLoss`] として拒否する。接続は失効し、次の呼び出しは `Unavailable`。
+    /// エラーメッセージには本体の内容を含めない。
+    #[test]
+    fn repair7_repair2_break2_uds_client_corrupted_length_detected_as_data_loss() {
+        let dir = TempSocketDir::new();
+        let (mut stream, mut client) = raw_server_and_client(&dir);
+        let ack = create_and_encode_ack(&mut stream, &mut client);
+        let corrupted = corrupt_declared_len_keep_crc(&ack, 7);
+        assert_ne!(corrupted, ack);
+        stream
+            .set_write_timeout(Some(response_timeout().as_duration()))
+            .expect("set_write_timeout must succeed");
+        stream
+            .write_all(&corrupted)
+            .expect("write_all must succeed for the corrupted ack");
+
+        let err = client
+            .recv_ack(response_timeout())
+            .expect_err("a corrupted length must be rejected");
+        assert_eq!(err.code(), IoErrorCode::DataLoss);
+        assert!(
+            err.message().contains("crc mismatch"),
+            "message: {}",
+            err.message()
+        );
+        assert!(client.is_poisoned());
+        assert_eq!(
+            client
+                .recv_ack(response_timeout())
+                .expect_err("poisoned client must fail")
+                .code(),
+            IoErrorCode::Unavailable
+        );
     }
 }

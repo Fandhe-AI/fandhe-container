@@ -159,7 +159,9 @@ on:
         description: >-
           repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
           CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
-          ステップ全体は 55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。ステップの開始はジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒がビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
+          ステップ全体は 55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。
+          ステップの開始はジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒が
+          ビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
         type: string
         default: '600'
       repeat-count:

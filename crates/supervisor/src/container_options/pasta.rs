@@ -9,9 +9,9 @@
 //!
 //! - start の経路からの呼び出しは #1940 で結線済み(手順 2c の作業スレッドから `reverify_recorded_pasta` を呼び、
 //!   通った `PastaBinary` を `ContainerOptions` に持たせる。`start_entry::linux::options_with_verified_pasta`)。
-//! - SEC-4 の監査の記録(識別の不一致と `PermissionDenied`)は、本関数は分類
+//! - SEC-4 の監査の記録(識別の不一致と `PermissionDenied`。#3330 で実装済み)は、本関数は分類
 //!   ([`PastaReverifyError::tamper_rejection`])だけを返し、呼び出し側(start の入口)が core の `pasta_verify` 層
-//!   (`AuditEvent::PastaVerify`)として監査の記録先へ配送する(#3330)。構造化ログ(`pasta_verify`)にも残す。
+//!   (`AuditEvent::PastaVerify`)として監査の記録先へ配送する。構造化ログ(`pasta_verify`)にも残す。
 
 use fandhe_container_core::audit_log::PastaVerifyRejection;
 use fandhe_container_core::traits::types::TraitError;

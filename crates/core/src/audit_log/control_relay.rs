@@ -21,7 +21,9 @@
 //!   [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
 //!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
 //!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）・閉じた表（`MOUNT_REASONS`）の理由つきの `Mount`（#2623。start の
-//!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）の記録だけ（他の層と、表に無い理由の `Mount` は
+//!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）・[`AuditEvent::PastaVerify`]（#3330。
+//!   supervisor の `start` が構築済みの中継経由で期限つきに配送する pasta バイナリの再検証の拒否。理由は閉じた表
+//!   `PASTA_VERIFY_REJECTIONS` の 2 理由）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify` は
 //!   `InvalidArgument`。理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せるものだけを運ぶ。それ以外の
 //!   理由つきの記録は単一スレッドの launch が `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
@@ -150,7 +152,8 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
     TraitError::new(code, message)
 }
 
-/// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
+/// 記録を枠へ符号化する。運べる層（モジュール doc の「契約」の列挙）以外の層、運べない理由、長すぎるコンテナ ID は
+/// `InvalidArgument` で拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     let (tag, extra, exit_signal) = match record.event() {
         AuditEvent::Mount { path, reason: None } => {

@@ -119,6 +119,23 @@ fn last_os_error_to_ioerror(context: &str) -> IoError {
 #[cfg(target_os = "linux")]
 pub(crate) mod vsock;
 
+pub(crate) mod uds;
+
+/// `connect(2)` の FFI 宣言を 1 か所に集約する（vsock と UDS の両方が使う）。
+///
+/// 同じシンボル名を別々の引数型（`*const SockaddrVm` と `*const SockaddrUn`）で宣言すると
+/// `clashing_extern_declarations` が出るため、アドレスは型を消した `*const c_void` で受け、
+/// 呼び出し側が自分の `sockaddr_*` 構造体のポインタを渡す（IO-1・#3165）。
+mod sock_raw {
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int connect(int, const struct sockaddr *, socklen_t)` と同じ引数の型・幅
+        // （`socklen_t` は `u32`。アドレスはポインタ幅で ABI 上 `const struct sockaddr *` と同じ）。
+        // 呼び出し側の不変条件は各呼び出し箇所の SAFETY コメントを参照。
+        pub(super) fn connect(sockfd: i32, addr: *const core::ffi::c_void, addrlen: u32) -> i32;
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     //! Linux の `getsockopt(SOL_SOCKET, SO_PEERCRED)` 用の FFI 宣言・定数。

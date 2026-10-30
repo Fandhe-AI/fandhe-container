@@ -19,9 +19,10 @@ use fandhe_container_net::dns_helper::control::{
 use fandhe_container_net::dns_helper::detach::{
     ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
     DnsHelperStopRequest, IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome,
-    StopOutcome, recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
+    StopOutcome, override_stop_timeouts_for_test, recover_dns_helper_intent,
+    spawn_detached_dns_helper, stop_recorded_dns_helper,
 };
-use fandhe_container_net::dns_helper::identity::read_identity;
+use fandhe_container_net::dns_helper::identity::{ProcessIdentity, read_identity};
 use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
 use fandhe_container_net::dns_helper::{DnsListenAddr, READY_TIMEOUT_DEFAULT};
 use fandhe_container_net::error::NetErrorCode;
@@ -172,6 +173,7 @@ pub fn run(exe: &Path) {
     stopped_stage2_is_reaped(exe);
     spawn_write_count(exe);
     launcher_killed_after_spawn_line(exe);
+    launcher_self_exits_after_ack_deadline(exe);
     control_reload(exe);
     upstream_load(exe);
 }
@@ -595,9 +597,25 @@ fn spawn_write_count(exe: &Path) {
 /// 緑に見える誤判定になる）なので、固有の終了コード 3 で終わる（REPAIR-4）。
 pub fn launcher_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
     let (Some(root), Some(program)) = (args.get(2), args.get(3)) else {
-        eprintln!("launcher_child: usage: --launcher-child <state_root> <program>");
+        eprintln!("launcher_child: usage: --launcher-child <state_root> <program> [cleanup_ms]");
         return std::process::ExitCode::from(2);
     };
+    // 第 4 引数（ms）があれば後始末の期限を短縮する（#3508）。解釈・設定できなければ 2（呼び出しが戻った 3 と区別する）。
+    if let Some(ms) = args.get(4) {
+        let Some(ms) = ms.to_str().and_then(|v| v.parse::<u64>().ok()) else {
+            eprintln!("launcher_child: invalid cleanup deadline ms");
+            return std::process::ExitCode::from(2);
+        };
+        let d = Duration::from_millis(ms);
+        if let Err(e) = override_stop_timeouts_for_test(d, d) {
+            eprintln!(
+                "launcher_child: override failed: {:?} {}",
+                e.code(),
+                e.message()
+            );
+            return std::process::ExitCode::from(2);
+        }
+    }
     let store = NetworkStore::open(Path::new(root)).expect("open");
     let name = NetworkName::new("dnsh").expect("name");
     let g = store.lock_global_exclusive().expect("global");
@@ -670,12 +688,24 @@ fn proc_state(pid: u32) -> Option<char> {
     raw.rsplit_once(')')?.1.trim_start().chars().next()
 }
 
-/// #3455（#3414 の残り。NET-5・NET-7・REPAIR-4・REPAIR-5・REPAIR-12）: 段 1 の `SPAWN <pid>` 行が識別行より先に
-/// 届き、起動元が同一性を意図記録へ追記した後、識別行が届く前に起動元が SIGKILL されても、次の回収が
-/// 記録した同一性で帰属して止める。回収は候補なしで呼び、帰属が cgroup 走査でなく記録から来たことを固定する。
-fn launcher_killed_after_spawn_line(exe: &Path) {
-    use std::os::unix::process::ExitStatusExt;
-    let tmp = Tmp::new("killspawn");
+/// 後始末を短縮して起動する起動元の ms。ack 期限の後に kill が遅れて届く窓を「ack 期限 + 約 50 ms」まで狭める（#3508）。
+const SHORT_CLEANUP_MS: u64 = 50;
+
+/// 偽の段 1・起動元の子・`KillGuard`・同一性つきの意図記録の観測までをまとめた場面の準備（2 つの場面で共有）。
+struct LauncherScene {
+    tmp: Tmp,
+    store: NetworkStore,
+    name: NetworkName,
+    pidfile: PathBuf,
+    nonce_file: PathBuf,
+    guard: KillGuard,
+    recorded: ProcessIdentity,
+    /// 意図記録の同一性を観測した時刻。
+    seen_at: Instant,
+}
+
+fn launcher_scene(exe: &Path, tag: &str) -> LauncherScene {
+    let tmp = Tmp::new(tag);
     let (store, name) = setup(&tmp);
     let script = tmp.0.join("fake-stage1.sh");
     let pidfile = tmp.0.join("stage2.pid");
@@ -698,6 +728,7 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
         .arg(ARG_LAUNCHER_CHILD)
         .arg(&tmp.0)
         .arg(&script)
+        .arg(SHORT_CLEANUP_MS.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .spawn()
@@ -728,6 +759,33 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    LauncherScene {
+        tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file,
+        guard,
+        recorded,
+        seen_at: Instant::now(),
+    }
+}
+
+/// #3455（#3414 の残り。NET-5・NET-7・REPAIR-4・REPAIR-5・REPAIR-12）: 段 1 の `SPAWN <pid>` 行が識別行より先に
+/// 届き、起動元が同一性を意図記録へ追記した後、識別行が届く前に起動元が SIGKILL されても、次の回収が
+/// 記録した同一性で帰属して止める。回収は候補なしで呼び、帰属が cgroup 走査でなく記録から来たことを固定する。
+fn launcher_killed_after_spawn_line(exe: &Path) {
+    use std::os::unix::process::ExitStatusExt;
+    let LauncherScene {
+        tmp: _tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file,
+        mut guard,
+        recorded,
+        seen_at: _,
+    } = launcher_scene(exe, "killspawn");
 
     let mut child = guard.child.take().expect("child");
     child.kill().expect("SIGKILL launcher");
@@ -744,6 +802,8 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
         "launcher must die by our SIGKILL, not by itself (exit {:?}); see its stderr",
         status.code()
     );
+    // 起動元が ack 期限を過ぎて後始末へ進んでいたら、段 2 相当は起動元自身の pidfd 経由の kill で既に消えている。
+    // 下の停止中（T）の検査がその遅れ kill も検出する（#3508。短縮した後始末なら窓は ack 期限 + 約 50 ms）。
 
     // 窓が本物だったこと: 同一性は段 2 相当の実値で、識別行は出ておらず（停止中）、確定記録は無い。
     let pid: u32 = std::fs::read_to_string(&pidfile)
@@ -812,6 +872,69 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
     drop(guard);
     eprintln!(
         "dns_helper_process: launcher_killed_after_spawn_line ok launcher_signal=9 stage2_state=T recovered_stopped=1 intent_after=none record_after=none"
+    );
+}
+
+/// #3508（#3482 の否定確認の感度。NET-5・NET-7・REPAIR-5・REPAIR-12）の陽性対照: 起動元を kill せずに待つと、
+/// ack 期限の後に後始末（短縮済み）を終えて自分で終了コード 3 で終わる。`launcher_killed_after_spawn_line` の
+/// `signal == Some(9)` は、この自発終了より後に届いた kill では成り立たないため、見逃す窓が狭いことの裏付けになる。
+fn launcher_self_exits_after_ack_deadline(exe: &Path) {
+    use std::os::unix::process::ExitStatusExt;
+    let LauncherScene {
+        tmp: _tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file: _,
+        mut guard,
+        recorded,
+        seen_at,
+    } = launcher_scene(exe, "selfexit");
+
+    let mut child = guard.child.take().expect("child");
+    let limit = DNS_HELPER_ACK_TIMEOUT + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if seen_at.elapsed() >= limit => {
+                guard.child = Some(child);
+                panic!("launcher did not exit by itself within {limit:?} after the intent record");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let elapsed = seen_at.elapsed();
+    assert_eq!(status.code(), Some(3), "launcher must return by itself");
+    assert_eq!(status.signal(), None);
+    // 既定の後始末（猶予 + 終了待ちで約 4 秒）なら超える。短縮が効いていることの照合も兼ねる。
+    assert!(
+        elapsed <= DNS_HELPER_ACK_TIMEOUT + Duration::from_secs(1),
+        "cleanup must be shortened, elapsed {elapsed:?}"
+    );
+    eprintln!(
+        "dns_helper_process: launcher_self_exit_elapsed_ms={}",
+        elapsed.as_millis()
+    );
+
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert_eq!(recorded.pid, pid);
+    assert!(
+        gone(pid),
+        "the launcher must have stopped its stage 2 stand-in"
+    );
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert_eq!(n.read_dns_helper().expect("record"), None);
+    drop(n);
+    drop(g);
+    drop(guard);
+    eprintln!(
+        "dns_helper_process: launcher_self_exits_after_ack_deadline ok launcher_exit=3 stage2_gone=1 intent_after=none record_after=none"
     );
 }
 

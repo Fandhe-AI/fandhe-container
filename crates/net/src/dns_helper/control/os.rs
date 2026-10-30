@@ -146,7 +146,15 @@ impl SenderPeerMismatch {
                 peer_uid,
                 expected_uid,
                 ..
-            } => authorize_peer(peer_uid, expected_uid).expect_err("uid mismatch"),
+            } => authorize_peer(peer_uid, expected_uid)
+                .err()
+                .unwrap_or_else(|| {
+                    // 構築上は不一致のときだけ来る。万一一致なら同じ固定文言の拒否に倒す。
+                    err(
+                        NetErrorCode::PermissionDenied,
+                        "dns control peer uid mismatch",
+                    )
+                }),
             Self::Pid { .. } => err(
                 NetErrorCode::PermissionDenied,
                 "dns control peer is not the recorded helper",

@@ -28,8 +28,8 @@
 //!
 //! # 「並行 write」の定義（本ファイル・TASK-14.1・#80 の範囲）
 //!
-//! ワイヤー形式（[`fandhe_container_io::payload`]）はパスもオフセットも
-//! 持たず、サーバーは呼び出し側が開いた 1 つの [`std::fs::File`] へ body を
+//! 単一 sink モード（v1 の `Write`）のワイヤー形式（[`fandhe_container_io::payload`]）は
+//! パスもオフセットも持たず（v2 のファイル操作モードはパスを持つがオフセットは持たず、F1 の範囲外）、サーバーは呼び出し側が開いた 1 つの [`std::fs::File`] へ body を
 //! 到着順に追記するだけである（`writeback.rs` の D1）。したがって本スイートが
 //! 検証する「並行 write」は、**複数の接続（クライアント）が同時に write
 //! ストリームを流し、接続ごとに `serve_connection` がスレッド並行で書き込む
@@ -39,7 +39,8 @@
 //!
 //! # 「rename / truncate」の定義（TASK-14.2・#81 の範囲）
 //!
-//! ワイヤー形式はパスもオフセットも持たない（上記 D1 参照）。そこで本
+//! 単一 sink モード（v1 の `Write`）のワイヤー形式はパスもオフセットも持たない（上記 D1 参照。v2 の
+//! ファイル操作モードはパスを持つがオフセットは持たず、F1 の範囲外）。そこで本
 //! sub-issue（[`rename_truncate`]）のケースは、**[`fandhe_container_io::AppendFileSink`]
 //! が書き込む先のファイルに対して、呼び出し側（ホスト側）が
 //! `std::fs::rename` / `File::set_len` を実行する操作**と定義する。
@@ -112,7 +113,13 @@
 //! `write_batch` 中の並行 truncate（I7）も行う（静止点を作らない交錯）。差し込めない位置（1 回の
 //! `AppendFileSink::write_batch` 内のフレーム間）と成り立つ条件の表は
 //! [`interleave`] のモジュール doc に記す。3 OS で動く。
-//! 合計は Linux 56 件・macOS 55 件・Windows 51 件。
+//! [`uds_file_ops`]（#3166・F14）の 8 件は、本番の `UdsClientConnection` ＋ `PipelineClient` と
+//! ファイル操作モードのサーバー（`serve_file_connection_with_limit`）を UDS の実経路で組み、
+//! N ファイルの close-to-open・Create の ACK 前の WriteFile・大文字小文字の衝突・失敗ハンドル・
+//! K ファイルごとの FLUSH・開くファイル数の上限・パストラバーサル・バッチ途中の接続全体の失敗を
+//! 確かめる。Linux・macOS で動き、Windows は未対応を明示する 1 件。FLUSH を待つケースは永続化に
+//! 未対応の環境で `Unimplemented` を assert する。
+//! 合計は Linux 64 件・macOS 63 件・Windows 52 件。
 
 // 残骸・PID 再利用との衝突を避ける一時ディレクトリの補助（REPAIR-12・#3435）。harness は作成前削除（A）、
 // uds_concurrent は排他作成（B。UDS の短いパス）を使う。
@@ -145,3 +152,6 @@ mod interleave;
 
 #[path = "consistency/uds_concurrent.rs"]
 mod uds_concurrent;
+
+#[path = "consistency/uds_file_ops.rs"]
+mod uds_file_ops;

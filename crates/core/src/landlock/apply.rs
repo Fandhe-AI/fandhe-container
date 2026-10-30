@@ -1085,13 +1085,7 @@ mod tests {
     #[test]
     fn sup6_task163_3_rule_paths_resolve_beneath_the_given_root() {
         use std::os::unix::fs::MetadataExt as _;
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-landlock-root-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-landlock-root", "d");
         let root = base.join("root");
         let outside = base.join("outside");
         std::fs::create_dir_all(root.join("data/inner")).expect("tree");
@@ -1150,7 +1144,6 @@ mod tests {
             kernel.open_rule_path(&rule_path("/proc")).err(),
             Some(OpenError::Sys(SysError::Os(sys::ENOENT)))
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: NNP 未設定は何も呼ばずに `FailedPrecondition`（受入条件）。
@@ -1460,13 +1453,7 @@ mod tests {
     /// `..` と同じになり、暗黙のマウントとして通らない（イメージ同梱の `dev` に権利を付けない）。
     #[test]
     fn core5_sec1_real_probe_rejects_plain_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-landlock-probe-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-landlock-probe", "d");
         std::fs::create_dir_all(base.join("dev")).expect("tree");
         let root_fd = OwnedFd::from(std::fs::File::open(&base).expect("open root"));
         let mut threads = ThreadCountSource::ProcSelf;
@@ -1490,7 +1477,6 @@ mod tests {
                 mount: ImplicitDevMount::Dev
             }
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: add / restrict / create の errno がコードへ写る。

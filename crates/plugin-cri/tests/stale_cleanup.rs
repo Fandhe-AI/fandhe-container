@@ -25,16 +25,41 @@ use fandhe_container_supervisor::logs::{
     LogSink as _, RotatingFileSink, StreamKind, container_log_dir, container_log_rotation_config,
 };
 
+// 予測できる名前を消さずに排他作成する補助（net の試験補助を取り込む。REPAIR-12・#3479）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).expect("id")
 }
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("fc-cri-stale-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("tmp dir");
-    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    std::fs::canonicalize(&d).expect("canonicalize")
+/// 試験用の一時ディレクトリ。予測できる名前を消さずに排他作成し、drop で自分の分だけ消す
+/// （REPAIR-12・#3479。pid だけの名前の先行削除を避ける）。
+struct TmpDir(PathBuf);
+impl std::ops::Deref for TmpDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl AsRef<Path> for TmpDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmp_dir(tag: &str) -> TmpDir {
+    tmp_dir_in(&std::env::temp_dir(), tag)
+}
+
+fn tmp_dir_in(parent: &Path, tag: &str) -> TmpDir {
+    let d = exclusive_dir::create_in(parent, &format!("fc-cri-stale-{tag}")).expect("tmp dir");
+    TmpDir(std::fs::canonicalize(&d).expect("canonicalize"))
 }
 
 fn make_bundle(dir: &Path) -> PathBuf {
@@ -136,7 +161,6 @@ fn sup7_cri2_create_reclaims_leftover_logs_before_core() {
         .expect("create");
     assert_eq!(names(&logs), ["c2.log", "c2.log.lock"]);
     assert_eq!(counts(&recorder, "container_log_reclaim"), Some((1, 0)));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// CRI-2・SUP-7・#2760: 古い sink が生きている（ロック保持）間はログに触れず、失敗を 1 件計上して create は続ける。
@@ -153,7 +177,6 @@ fn sup7_cri2_create_keeps_logs_of_live_sink() {
     assert_eq!(names(&logs), ["c1.log", "c1.log.lock"]);
     assert_eq!(counts(&recorder, "container_log_reclaim"), Some((0, 1)));
     drop(sink);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// SUP-7・CRI-2・#2760: 状態が既にある ID（重複 create）のログは消さない。create は `AlreadyExists` のまま。
@@ -170,7 +193,6 @@ fn sup7_cri2_create_keeps_logs_when_state_present() {
     assert_eq!(dup.code(), ErrorCode::AlreadyExists);
     assert_eq!(names(&container_log_dir(&root)), ["c1.log"]);
     assert_eq!(counts(&recorder, "container_log_reclaim"), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// SUP-12・CRI-2・#2760: 状態の記録が無い ID の起動オプション文書（残骸）は `create` の前に消え、ロックファイルも残らない。
@@ -192,7 +214,6 @@ fn sup12_cri2_create_removes_stale_options_document() {
             .exists()
     );
     assert_eq!(counts(&recorder, "container_options_remove"), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// SUP-12・CRI-2・#2760: 状態の記録がある ID の文書は消さない（重複 create は `AlreadyExists` で、文書のバイト列は不変）。
@@ -211,7 +232,6 @@ fn sup12_cri2_create_keeps_options_document_when_state_present() {
         std::fs::read(options_store::options_path(&root, &cid("c1"))).expect("kept"),
         before
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// SUP-12・CRI-2・#2760: core の `delete` が成功した後、記録の無くなった ID の文書を消す。他の ID の文書は残る。
@@ -239,7 +259,6 @@ fn sup12_cri2_delete_removes_options_document_after_core_delete() {
         other
     );
     assert!(warnings.lock().expect("lock").is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// CRI-2・SUP-7・REPAIR-4・#2760: 起動時の走査は、閉じた残り・生きている sink・状態がある ID・帰属できない名前を区別し、
@@ -278,5 +297,47 @@ fn sup7_cri2_startup_sweep_removes_only_closed_unrecorded_logs() {
         ["Foo.log", "live1.log", "live1.log.lock", "present1.log"]
     );
     assert_eq!(counts(&recorder, "container_log_reclaim"), Some((1, 0)));
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 残骸（同名のディレクトリ・symlink）を先に置いても消さず・辿らず連番を進めること
+/// （CRI-2・REPAIR-12・#3479）。
+#[test]
+fn cri2_repair12_stale_tmp_dir_skips_stale_residue() {
+    let parent = tmp_dir("residue");
+    let canary = parent.join("canary");
+    std::fs::create_dir(&canary).unwrap();
+    std::fs::write(canary.join("keep"), b"canary").unwrap();
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pid = std::process::id();
+    let stale0 = parent.join(format!("fc-cri-stale-t-{pid}-0"));
+    std::fs::create_dir(&stale0).unwrap();
+    std::fs::write(stale0.join("stale"), b"stale").unwrap();
+    let link1 = parent.join(format!("fc-cri-stale-t-{pid}-1"));
+    std::os::unix::fs::symlink(&canary, &link1).unwrap();
+    let new_path = {
+        let d = tmp_dir_in(&parent, "t");
+        assert_eq!(
+            &*d,
+            parent.join(format!("fc-cri-stale-t-{pid}-2")).as_path()
+        );
+        assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&*d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        d.0.clone()
+    };
+    assert!(!new_path.exists(), "own dir must be removed on drop");
+    assert_eq!(std::fs::read(stale0.join("stale")).unwrap(), b"stale");
+    assert_eq!(std::fs::read(canary.join("keep")).unwrap(), b"canary");
+    assert_eq!(
+        std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(
+        std::fs::symlink_metadata(&link1)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }

@@ -54,6 +54,11 @@ fn main() {
 #[path = "support/temp_rootfs.rs"]
 mod temp_rootfs;
 
+// 予測できる名前の作成を避けるための排他作成の一時領域（#3478・#3434・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::temp_rootfs;
@@ -272,15 +277,22 @@ mod linux {
     /// 内容をホストの一時ファイル経由の封印 memfd(`InjectedContent::from_file`。本番の secret の経路。#2628)にして、
     /// 実 tmpfs へ `sendfile` で書かれる経路も通す。
     fn sealed(body: &str, index: usize) -> InjectedContent {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-inject-files-src-{}-{index}",
-            std::process::id()
-        ));
-        std::fs::write(&path, body).expect("write host source");
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // 共有 /tmp の予測できる名前へ書かず、排他作成した ScratchDir の子へ create_new する。rootful 分岐は
+        // root で動くため、先置きの symlink を辿らせない（#3478・SEC-1・REPAIR-12）。drop で消える。
+        let scratch = crate::scratch_root::ScratchDir::new("fandhe-inject-files-src", timeout());
+        let path = scratch.path().join(format!("src-{index}"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create host source")
+            .write_all(body.as_bytes())
+            .expect("write host source");
         let file = std::fs::File::open(&path).expect("open host source");
-        let content = InjectedContent::from_file(&file).expect("sealed content");
-        let _ = std::fs::remove_file(&path);
-        content
+        InjectedContent::from_file(&file).expect("sealed content")
     }
 
     fn set(files: &[(&str, &str, u32)]) -> InjectedFileSet {

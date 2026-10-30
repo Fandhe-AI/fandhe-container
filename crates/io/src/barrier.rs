@@ -1418,12 +1418,9 @@ mod tests {
     /// `Unimplemented`（`issued == false`）で拒否する。
     #[test]
     fn io2_persist_file_system_rejects_unsupported_without_issuing() {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-io-persist-unsupported-{}",
-            std::process::id()
-        ));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) = crate::test_temp_file::create("fandhe-io-persist-unsupported")
+            .expect("create temp file");
+        drop(guard);
         // 実行 OS と食い違う対応値（他 OS 用）も syscall を発行せず拒否する。
         #[cfg(target_os = "linux")]
         let mismatched = PersistSupport::SupportedFileSync;
@@ -1447,13 +1444,9 @@ mod tests {
     }
 
     fn tempfile_in_target() -> File {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-io-persist-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) =
+            crate::test_temp_file::create("fandhe-io-persist").expect("create temp file");
+        drop(guard);
         file
     }
 
@@ -1492,9 +1485,9 @@ mod tests {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[test]
     fn io2_persist_file_system_unimplemented_on_other_os() {
-        let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) =
+            crate::test_temp_file::create("fandhe-io-persist").expect("create temp file");
+        drop(guard);
         assert_eq!(persist_support(), PersistSupport::UnsupportedOs);
         let failure = persist_file_system(
             persist_support(),
@@ -1514,10 +1507,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn io2_persist_file_system_read_only_handle_fails_issued_on_windows() {
-        let path =
-            std::env::temp_dir().join(format!("fandhe-io-persist-ro-{}", std::process::id()));
-        File::create(&path).expect("create temp file");
-        let file = File::open(&path).expect("open read-only");
+        // guard を先に宣言するので、開いたハンドル（file）が先に閉じてから消える。
+        let (guard, created) =
+            crate::test_temp_file::create("fandhe-io-persist-ro").expect("create temp file");
+        drop(created);
+        let file = File::open(guard.path()).expect("open read-only");
         let failure = persist_file_system(
             PersistSupport::SupportedFileSync,
             default_persist_limiter(),
@@ -1529,7 +1523,6 @@ mod tests {
         assert!(failure.issued);
         assert_eq!(failure.error.code(), IoErrorCode::Internal);
         drop(file);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// テスト専用: 指定した種別の [`InFlightRequest`] を、公開 API

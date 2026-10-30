@@ -989,15 +989,22 @@ impl LogCapture {
             let spawned = std::thread::Builder::new()
                 .name(format!("supervisor-log-{}", kind.as_str()))
                 .spawn(move || {
-                    // スレッド終了時（正常・中止とも）に枠を返す。
-                    let _reader_slot = reader_slot;
+                    // 中止・早期 return・panic の巻き戻しでもスコープ終了時に枠を返す。正常系は下で送信前に明示的に手放す。
+                    let reader_slot = reader_slot;
                     // ゲートが解放されずに閉じた（部分起動の中止）なら、stream に触れず終わる。
                     if gate_rx.recv().is_err() {
                         return;
                     }
                     let stream = slot.lock().ok().and_then(|mut g| g.take());
                     let Some(stream) = stream else { return };
+                    drop(slot);
                     let summary = pump(stream, kind, sink.as_ref(), &cancel);
+                    // 結果を送ってから資源を持ち続けると、drain が Ok で戻った時点で枠が戻っておらず
+                    // quiesce 後の budget.live() が 0 にならない窓ができる（#3453 と同じ型。#3507・SUP-7・REPAIR-5）。
+                    // そのため送信の前に枠と sink / cancel の参照を手放す。
+                    drop(sink);
+                    drop(cancel);
+                    drop(reader_slot);
                     // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
                     let _ = tx.send((kind, summary));
                 });
@@ -1040,6 +1047,9 @@ impl LogCapture {
     ///
     /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
     /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。
+    ///
+    /// `Ok` で戻った時点で、EOF まで読み切ったリーダーは読み取り枠と sink への参照を手放し終えている
+    /// （スレッド自体の終了は保証しない。SUP-7・REPAIR-5・#3507）。
     ///
     /// EOF は `timeout` いっぱいまで待つ（期限内に届いた EOF は成功）。sink の追記が止まっていても `timeout` 以内に
     /// 返る（REPAIR-5）ため、期限切れでは実行中の追記の完了を待たない。その時点で実行中だった追記
@@ -1393,9 +1403,29 @@ mod tests {
         let cap =
             LogCapture::start(OutputStreams::new(&budget, stdout, stderr), sink.clone()).unwrap();
         let sum = cap.drain(Duration::from_secs(10)).unwrap();
-        // EOF まで読み切ったリーダーは枠を返す（送信後のスレッド終了を待つ）。
-        assert_eq!(wait_live(&budget, 0), 0);
+        // EOF まで読み切ったリーダーは結果の送信前に枠を返す（待たずに照合する。#3507）。
+        assert_eq!(budget.live(), 0);
         (sink, sum)
+    }
+
+    /// SUP-7・SUP-1・REPAIR-5・#3507（#3453 と同じ型）: リーダーは結果の送信前に読み取り枠と sink の
+    /// 参照を手放す。`drain` が `Ok` で戻った直後に、待たずに同期的に照合する（300 回繰り返す）。
+    #[test]
+    fn sup7_3507_reader_releases_slot_and_sink_before_reporting() {
+        for i in 0..300 {
+            let budget = ReaderBudget::new(2).unwrap();
+            let sink = Arc::new(MemoryLogSink::default());
+            let cap = LogCapture::start(
+                OutputStreams::new(&budget, boxed(b"a\n"), boxed(b"b\n")),
+                sink.clone(),
+            )
+            .unwrap();
+            let sum = cap.drain(Duration::from_secs(10)).unwrap();
+            assert_eq!(budget.live(), 0, "round {i}");
+            assert_eq!(Arc::strong_count(&sink), 1, "round {i}");
+            assert_eq!(sum.stdout().unwrap().lines(), 1_u64, "round {i}");
+            assert_eq!(sum.stderr().unwrap().lines(), 1_u64, "round {i}");
+        }
     }
 
     /// `budget.live()` が `want` になるのを最大 10 秒待ち、最後に観測した値を返す。

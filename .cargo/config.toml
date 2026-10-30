@@ -5,6 +5,7 @@
 # .claude/rules/ci.md。CI 外・cargo bench は素通しのため、手元の cargo run / cargo test は変わらない。
 # x86_64 Linux に限る理由: 止まる症状は ubuntu の rust-ci でしか観測されておらず、wrapper は /proc と procps に依存し、
 # Windows は .sh を直接起動できず、macOS・Windows の cargo test は main の platform-ci のステップ期限で既に有界。
+# runner の相対パスは cargo が `.cargo` の親（ワークスペースルート）基準で解決する（crates/ 配下の cwd からの cargo test で実測済み）。
 # aarch64 Linux はネイティブ CI ができたら triple を足す。
 [target.x86_64-unknown-linux-gnu]
 runner = "scripts/test-bin-watchdog.sh"

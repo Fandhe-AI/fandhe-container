@@ -26,7 +26,8 @@
 #   - プロセスグループは変えない（set -m を使わない）。試験本体がグループリーダーになると setsid が EPERM になるため
 #   - 見張り役は stdin / stdout / stderr を /dev/null にする。孤児の sleep が cargo の出力 pipe の書き込み端を
 #     持って待ちを戻さなくなる事故（#3486）を避ける
-#   - bash はジョブ制御なしの背景子に SIGINT を無視させる。INT は子へ転送するが、子が既定動作に戻さない限り効かない
+#   - bash はジョブ制御なしの背景子に SIGINT / SIGQUIT を無視させ、exec 後も引き継がれる。子は副シェルで trap - して
+#     既定動作へ戻してから exec する（戻さないと cli の logs --follow 等が INT で止まらない）。INT は子へ転送する
 #   - 「本当に 128+N で exit した子」と「シグナルで死んだ子」は区別できず、どちらもシグナルとして送り直す
 #   - 残余: D 状態で KILL が効かない子は wait が戻らない（最終の歯止めはジョブ上限）。列挙前に init へ付け替わった孤児は捕まえられない
 #   - lib.sh は source しない（source 時の cd と set -e の影響を避け、起動を軽く保つため）
@@ -234,7 +235,12 @@ trap 'forward_signal 15' TERM
 trap 'forward_signal 1' HUP
 
 # stdin は明示的に引き継ぐ（ジョブ制御なしの背景起動は既定で /dev/null になる）。
-"$@" <&0 &
+# bash はジョブ制御なしの背景子の SIGINT / SIGQUIT を無視に設定し、exec 後の試験バイナリと孫まで引き継がれる
+# （cli の `logs --follow` が SIGINT で止まらなくなる。#3504）。子の副シェルで trap - により既定動作へ戻してから exec する。
+(
+  trap - INT QUIT
+  exec "$@"
+) <&0 &
 child=$!
 
 (

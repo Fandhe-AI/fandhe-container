@@ -160,13 +160,48 @@ run "${D}=1" -- "${target}" bash -c 'sleep 2; exit 0' --bench
 expect_eq gate-bench 0 "$(rc)"
 # 未設定の GITHUB_ACTIONS=true でも --ignored は素通し（既定 300 秒で実機前提テストを打ち切らない）。
 # 変数で明示した場合は --ignored でも期限を使う（1 秒で 124）
-run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" bash -c 'exit 6' --ignored
+# 素通しは「子の親が wrapper でない」ことで照合する（即終了の子では既定 300 秒を適用しても同じ結果で偽陽性になるため）
+cat >"${work}/parent.sh" <<STUB
+#!/usr/bin/env bash
+tr '\\0' ' ' </proc/\$PPID/cmdline > "${work}/parent.cmd"
+exit 6
+STUB
+chmod +x "${work}/parent.sh"
+rm -f "${work}/parent.cmd"
+run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" "${work}/parent.sh" --ignored
 expect_eq gate-ignored 6 "$(rc)"
+if grep -qF "test-bin-watchdog.sh" "${work}/parent.cmd"; then fail "gate-ignored: wrapped by the watchdog"; fi
+# 陽性対照: --ignored なしでは既定の期限を使うので、子の親が wrapper になる
+rm -f "${work}/parent.cmd"
+run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" "${work}/parent.sh"
+expect_contains gate-default-wrapped "${work}/parent.cmd" "test-bin-watchdog.sh"
 run "${D}=1" -- "${target}" bash -c 'sleep 5; exit 0' --ignored
 expect_eq gate-ignored-explicit 124 "$(rc)"
 # 未設定で GITHUB_ACTIONS=true なら既定の期限を使う（その間に終われば子のコード）
 run GITHUB_ACTIONS=true -- env -u "${D}" "${target}" bash -c 'exit 5'
 expect_eq gate-default 5 "$(rc)"
+
+# 12. SIGINT が試験バイナリと孫へ届く（bash の背景子は INT を無視で始まるため、既定動作へ戻す。#3504）
+cat >"${work}/int-main.sh" <<STUB
+#!/usr/bin/env bash
+grep -m1 '^SigIgn:' /proc/self/status > "${work}/int.sigign"
+exec sleep 30
+STUB
+chmod +x "${work}/int-main.sh"
+# 背景起動した自分の子は INT 無視で始まり、非対話 bash は無視済みを戻せない。cargo の起動と同じ（無視なし）にするため perl で既定へ戻して起動する
+# shellcheck disable=SC2016 # perl のコード
+"${perl_bin}" -e '$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; exec @ARGV' -- env "${D}=30" "${target}" "${work}/int-main.sh" >/dev/null 2>&1 &
+wp=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -s "${work}/int.sigign" ] && break
+  sleep 0.2
+done
+# SigIgn の bit1（INT）と bit2（QUIT）が立っていない（下位 16 進桁の 6 が 0）こと
+mask=$(awk '{print $2}' "${work}/int.sigign" 2>/dev/null)
+expect_eq int-not-ignored 0 "$(( 0x${mask:-6} & 6 ))"
+kill -INT "${wp}"
+wait "${wp}" 2>/dev/null
+expect_eq int-rc 130 "$?"
 
 # 11. 入力検査
 for v in abc 3601 -1 ""; do

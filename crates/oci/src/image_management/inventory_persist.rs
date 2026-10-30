@@ -755,7 +755,6 @@ mod tests {
     use crate::image_management::ImageStore;
     use crate::image_management::root_handle::rh;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
     fn d(n: u8) -> Digest {
@@ -774,76 +773,86 @@ mod tests {
         PullId::new(s).expect("pull id")
     }
 
-    /// 試験ごとに一意な一時 root。作る前に残骸を消し、drop で消す（#3237・OCI-7・REPAIR-12）。
-    /// Windows は PID の再利用が速く、前回の実行の残骸と名前が衝突して排他作成が
-    /// `AlreadyExists` になるのを防ぐ。
-    struct TestRoot(PathBuf);
+    /// 試験ごとに一意な一時 root。既存の名前は消さず・辿らず、排他作成（unix は 0700）で作り、
+    /// drop で自分が作ったパスだけを消す（共有部品 `test_root`。#3237・#3506・OCI-7・REPAIR-12）。
+    use crate::test_root::TestRoot;
 
-    impl std::ops::Deref for TestRoot {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl AsRef<Path> for TestRoot {
-        fn as_ref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            // 試験本体が root を先に消している場合の NotFound などは無視する。
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// 指定パスの root を残骸ごと作り直す。パスは試験補助が組み立てた一時領域配下に限る。
+    /// 指定パスを第 1 候補に root を排他作成する。既にあれば別名になるため、呼び出し側は返り値を使う。
     fn root_at(p: PathBuf) -> TestRoot {
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("mkdir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
-        TestRoot(p)
+        crate::test_root::test_root_at(p)
     }
 
     fn root(label: &str) -> TestRoot {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        root_at(std::env::temp_dir().join(format!(
-            "fc-oci-inv-persist-{}-{}-{label}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        )))
+        crate::test_root::test_root("fc-oci-inv-persist", label)
     }
 
-    /// OCI-7・REPAIR-12・#3237: 前回の実行の残骸（同名ディレクトリとその中身）があっても
-    /// root が空の状態から始まり、後始末も働く。
+    /// OCI-7・REPAIR-12・#3506: 前回の実行の残骸（同名ディレクトリとその中身）があっても消さず辿らず、
+    /// 別名の空の root から始まり、後始末は新しい root だけを消す。
     #[test]
-    fn oci7_repair12_root_at_clears_stale_residue() {
-        let p =
-            std::env::temp_dir().join(format!("fc-oci-inv-persist-residue-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
+    fn oci7_repair12_3506_root_at_leaves_stale_residue_untouched() {
+        let parent = root("residue-parent");
+        let p = parent.join("stale");
         fs::create_dir_all(p.join(IMAGE_INVENTORY_FILE_NAME)).expect("residue dir");
-        fs::write(
-            p.join(format!("{IMAGE_INVENTORY_TMP_PREFIX}stale")),
-            b"stale",
-        )
-        .expect("residue tmp");
+        let stale_tmp = p.join(format!("{IMAGE_INVENTORY_TMP_PREFIX}stale"));
+        fs::write(&stale_tmp, b"stale").expect("residue tmp");
 
         let r = root_at(p.clone());
+        assert_ne!(&*r, p.as_path());
+        assert_eq!(r.parent(), Some(&*parent));
         assert_eq!(fs::read_dir(&r).expect("read_dir").count(), 0);
-        // 失敗した呼び出しと同じ排他作成が残骸の上でも成功する。
+        // 残骸は無傷で残る。
+        assert!(p.join(IMAGE_INVENTORY_FILE_NAME).is_dir());
+        assert_eq!(fs::read(&stale_tmp).expect("read"), b"stale");
+        // 失敗した呼び出しと同じ排他作成が新しい root 上で成功する。
         fs::create_dir(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("create_dir");
         let err = load_image_inventory(&rh(&r)).expect_err("dir is not a file");
         assert_eq!(err.code(), OciErrorCode::Internal);
 
+        let new_path = r.to_path_buf();
         drop(r);
-        let gone = fs::symlink_metadata(&p).expect_err("removed on drop");
+        let gone = fs::symlink_metadata(&new_path).expect_err("removed on drop");
         assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
+        assert!(p.join(IMAGE_INVENTORY_FILE_NAME).is_dir());
+    }
+
+    /// OCI-7・REPAIR-12・#3506: 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_repair12_3506_root_at_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let parent = root("symlink-parent");
+        let victim = parent.join("victim");
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let dangling = parent.join("dangling");
+        let target = parent.join("nowhere");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let r1 = root_at(link.clone());
+        let r2 = root_at(dangling.clone());
+        assert_ne!(&*r1, link.as_path());
+        assert_ne!(&*r2, dangling.as_path());
+        assert!(
+            !fs::symlink_metadata(&r1)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&r1).expect("read_dir").count(), 0);
+        assert_eq!(fs::read_dir(&victim).expect("victim dir").count(), 1);
+        assert_eq!(fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            fs::metadata(&victim).expect("meta").permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(fs::symlink_metadata(&dangling).is_ok());
     }
 
     fn open(root: &Path) -> ImageStore {

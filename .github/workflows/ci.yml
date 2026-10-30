@@ -68,7 +68,8 @@ on:
           scope-orphan-pipe = 現行の形（systemd-run | tee）で孫が出力の書き込み端を持ったまま残る /
           scope-orphan-devnull = 同じだが孫の fd を /dev/null へ（早く戻れば原因は fd の保持）/
           noscope-orphan-pipe = scope なしの同じ注入 / scope-main-hang = scope 内の主プロセスが眠る /
-          helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証。
+          helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証 /
+          helper-noscope = scripts/run-with-deadline.sh（scope を作らない版・#3505。期限 60 秒）の同じ実証。
           どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
           PR・push では存在しない（none 相当）
         type: choice
@@ -79,6 +80,7 @@ on:
           - noscope-orphan-pipe
           - scope-main-hang
           - helper
+          - helper-noscope
         default: none
       repeat-package:
         description: >-
@@ -866,7 +868,7 @@ jobs:
           exit 1
 
       # 委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5。workflow_dispatch の scope-hang-probe 指定時のみ）。
-      # 実機前提ステップの形（systemd-run --user --scope ... | tee）に、孫が出力を持って残る等のハングを注入し、
+      # 旧い実機前提ステップの形（systemd-run --user --scope ... | tee）に、孫が出力を持って残る等のハングを注入し、
       # timeout-minutes が効くか・原因がどれか（fd の保持 / scope / 主プロセス）を切り分ける。helper は対策後の形が
       # 期限内に失敗することの実証。戻った場合も false-green を防ぐため exit 1。新ジョブにしない（check-run 件数は不変）
       - name: 委譲スコープ実行のハングプローブ（#3486。workflow_dispatch の scope-hang-probe 指定時のみ）
@@ -896,6 +898,13 @@ jobs:
                 bash -c 'setsid sleep 3600 & sleep 3600' 2>&1 | tee "${RUNNER_TEMP}/scope-probe-out.log"
               if grep -q 'code=deadline_exceeded' "${RUNNER_TEMP}/scope-probe-out.log"; then
                 echo "::notice::scope probe: helper deadline fired (expected)"
+              fi
+              ;;
+            helper-noscope)
+              scripts/run-with-deadline.sh --name probe --deadline 60 --log "${RUNNER_TEMP}/scope-probe.log" -- \
+                bash -c 'setsid sleep 3600 & sleep 3600' 2>&1 | tee "${RUNNER_TEMP}/scope-probe-out.log"
+              if grep -q 'code=deadline_exceeded' "${RUNNER_TEMP}/scope-probe-out.log"; then
+                echo "::notice::scope probe: no-scope helper deadline fired (expected)"
               fi
               ;;
             *)
@@ -1121,6 +1130,12 @@ jobs:
         timeout-minutes: 5
         run: make repeat-test-selftest
 
+      # scope を作らない期限つき実行補助の自己テスト（#3505・REPAIR-5・REPAIR-12）。実プロセスのみ（setsid を使うため Linux のみ）。
+      - name: 期限つき実行補助の自己テスト（#3505。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make run-with-deadline-selftest
+
       # 委譲スコープ実行補助の自己テスト（#3486・REPAIR-5・REPAIR-12）。スタブの systemd-run / systemctl のみ。
       # Linux のステップからしか呼ばれない補助（systemd の user manager 専用・setsid 使用）のため ubuntu のみ。
       - name: 委譲スコープ実行補助の自己テスト（#3486。ubuntu のみ）
@@ -1169,7 +1184,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/unshare_isolation.log"
-          cargo test -p fandhe-container-core --test unshare_isolation -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name unshare_isolation --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test unshare_isolation -- --ignored
           # 期待行は試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
           scripts/check-success-lines.sh --name unshare_isolation --src crates/core/tests/unshare_isolation.rs \
             --log "${log}" \
@@ -1198,8 +1214,9 @@ jobs:
           # /etc/subuid・/etc/subgid の自ユーザー行を要するため FANDHE_CONTAINER_TEST_ID_HELPER=1 を付ける
           # （前提は production_launcher の準備ステップが fail-closed に確認済み）。
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-supervisor --features exec-test-support \
-            --test exec_setns_join -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name exec_setns_join --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-supervisor --features exec-test-support \
+              --test exec_setns_join -- --ignored
           # 各シナリオの成功行を試験ソースから導出して双方向に照合する（シナリオが黙って外れた場合を成功にしない。
           # TASK-163 追補・#1460。共通スクリプト化は #2825・REPAIR-12）。
           scn='supplementary groups|exec user|namespace join'
@@ -1233,7 +1250,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/container_options_ipc.log"
-          cargo test -p fandhe-container-supervisor --test container_options_ipc -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name container_options_ipc --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-supervisor --test container_options_ipc -- --ignored
           scripts/check-success-lines.sh --name container_options_ipc \
             --src crates/supervisor/tests/container_options_ipc.rs --log "${log}" \
             --select '^container_options_ipc: host shared' --subst-pos false \
@@ -1256,7 +1274,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/tmpfs_mount.log"
-          cargo test -p fandhe-container-core --test tmpfs_mount -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name tmpfs_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test tmpfs_mount -- --ignored
           scripts/check-success-lines.sh --name tmpfs_mount --src crates/core/tests/tmpfs_mount.rs --log "${log}" \
             --select '^tmpfs_mount: mounts, flags' --subst root=false \
             --forbid 'tmpfs_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
@@ -1288,7 +1307,8 @@ jobs:
             exit 1
           fi
           log="${RUNNER_TEMP}/exec_child_setup.log"
-          cargo test -p fandhe-container-core --test exec_child_setup -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name exec_child_setup --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test exec_child_setup -- --ignored
           scripts/check-success-lines.sh --name exec_child_setup --src crates/core/tests/exec_child_setup.rs \
             --log "${log}" \
             --select '^exec_child_setup: (all scenarios passed|noexec tmpfs scenario passed)$' --min 2 \
@@ -1310,7 +1330,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/readonly_paths.log"
-          cargo test -p fandhe-container-core --test readonly_paths -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name readonly_paths --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test readonly_paths -- --ignored
           scripts/check-success-lines.sh --name readonly_paths --src crates/core/tests/readonly_paths.rs \
             --log "${log}" \
             --select '^readonly_paths: /proc bus,fs' --subst root=false \
@@ -1326,7 +1347,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/config_paths_implicit_dev.log"
-          cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name config_paths_implicit_dev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored
           scripts/check-success-lines.sh --name config_paths_implicit_dev \
             --src crates/core/tests/config_paths_implicit_dev.rs --log "${log}" \
             --select '^config_paths_implicit_dev: [^ ]+ overlaps with the implicit' \
@@ -1352,7 +1374,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/sysfs_mount.log"
-          cargo test -p fandhe-container-core --test sysfs_mount -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name sysfs_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test sysfs_mount -- --ignored
           check() {
             scripts/check-success-lines.sh --name sysfs_mount --src crates/core/tests/sysfs_mount.rs --log "${log}" \
               --subst root=false --forbid 'ro-clear not applicable' --forbid 'root=true' \
@@ -1386,7 +1409,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/inject_files.log"
-          cargo test -p fandhe-container-core --test inject_files -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name inject_files --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test inject_files -- --ignored
           scripts/check-success-lines.sh --name inject_files --src crates/core/tests/inject_files.rs --log "${log}" \
             --select '^inject_files: content, read-only' --subst root=false \
             --forbid 'inject_files: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
@@ -1407,7 +1431,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/etc_files_mount.log"
-          cargo test -p fandhe-container-core --test etc_files_mount -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name etc_files_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test etc_files_mount -- --ignored
           scripts/check-success-lines.sh --name etc_files_mount \
             --src crates/core/tests/etc_files_mount.rs --log "${log}" \
             --select '^etc_files_mount: content, read-only' --subst root=false \
@@ -1429,7 +1454,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/bind_mounts_real.log"
-          cargo test -p fandhe-container-core --test bind_mounts_real -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name bind_mounts_real --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test bind_mounts_real -- --ignored
           scripts/check-success-lines.sh --name bind_mounts_real \
             --src crates/core/tests/bind_mounts_real.rs --log "${log}" \
             --select '^bind_mounts_real: binds applied' \
@@ -1451,7 +1477,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/lo_self_delivery.log"
-          cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name lo_self_delivery --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored
           scripts/check-success-lines.sh --name lo_self_delivery --src crates/net/tests/lo_self_delivery.rs \
             --log "${log}" --select '^lo_self_delivery: lo down timed out' --subst root=false \
             --forbid 'lo_self_delivery: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
@@ -1472,7 +1499,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/netns_holder_userns.log"
-          cargo test -p fandhe-container-net --test netns_holder_userns -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name netns_holder_userns --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-net --test netns_holder_userns -- --ignored
           scripts/check-success-lines.sh --name netns_holder_userns --src crates/net/tests/netns_holder_userns.rs \
             --log "${log}" --select '^netns_holder_userns: holder joined' \
             --forbid 'netns_holder_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
@@ -1494,7 +1522,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/netns_holder_launch_userns.log"
-          cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name netns_holder_launch_userns --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns -- --ignored
           scripts/check-success-lines.sh --name netns_holder_launch_userns \
             --src crates/supervisor/tests/netns_holder_launch_userns.rs \
             --log "${log}" --select '^netns_holder_launch_userns: holder spawned' \
@@ -1521,8 +1550,9 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/runtime_service_namespaces.log"
-          cargo test -p fandhe-container-cri --test runtime_service_namespaces \
-            -- --ignored --test-threads=1 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name runtime_service_namespaces --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-cri --test runtime_service_namespaces \
+              -- --ignored --test-threads=1
           scripts/check-success-lines.sh --name runtime_service_namespaces \
             --src crates/cri/tests/runtime_service_namespaces.rs --log "${log}" --libtest-ignored \
             --select '^test [A-Za-z0-9_]+ \.\.\. ' --min 2 --summary
@@ -1534,7 +1564,7 @@ jobs:
       # 変えない）。結果行は check-success-lines.sh の `--libtest-ignored --libtest-module` が `#[ignore]` 関数から導出し、
       # `1 passed; 0 failed;` と ignored / FAILED の不在を照合する（`--ignored` が届かないと `ignored` となり fail-closed）。
       # 外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ `ok` 行が 2 回出るが受理される
-      # （自己テストの「libtest module duplicated nested ok line」）。外側の成否は pipefail で cargo の終了コードが担う（#2959）。
+      # （自己テストの「libtest module duplicated nested ok line」）。外側の成否は補助 run-with-deadline.sh が子の終了コードを素通しして担う（#2959・#3505）。
       - name: sec1_2536_protected_root_on_real_overlay のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -1546,8 +1576,9 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/sec1_2536_real_overlay.log"
-          cargo test -p fandhe-container-core --lib \
-            -- --ignored sec1_2536_protected_root_on_real_overlay 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name sec1_2536_real_overlay --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --lib \
+              -- --ignored sec1_2536_protected_root_on_real_overlay
           m='exec::bind_mounts::tests'
           scripts/check-success-lines.sh --name sec1_2536_protected_root_on_real_overlay \
             --src crates/core/src/exec/bind_mounts.rs --log "${log}" \
@@ -1566,8 +1597,9 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/sec1_2823_overmount.log"
-          cargo test -p fandhe-container-core --lib \
-            -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --no-capture 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name sec1_2823_overmount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --lib \
+              -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --no-capture
           m='oci_runtime::start::tests'
           scripts/check-success-lines.sh --name sec1_2823_overmount_hides_child_in_real_namespace \
             --src crates/core/src/oci_runtime/start.rs --log "${log}" \
@@ -1605,9 +1637,10 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/gpu_cdi_hooks_ns.log"
           m='cdi_apply::hooks::run::tests'
-          unshare -r -m -- "${GPU_LIB_TEST_BIN}" --ignored --exact \
-            "${m}::stage_recheck_fails_after_unshare_in_thread" \
-            "${m}::bundle_remove_refuses_bind_mount_boundary" 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name gpu_cdi_hooks_ns --deadline 240 --log "${log}" -- \
+            unshare -r -m -- "${GPU_LIB_TEST_BIN}" --ignored --exact \
+              "${m}::stage_recheck_fails_after_unshare_in_thread" \
+              "${m}::bundle_remove_refuses_bind_mount_boundary"
           scripts/check-success-lines.sh --name gpu_cdi_hooks_ns \
             --src crates/gpu/src/cdi_apply/hooks/run.rs --log "${log}" \
             --libtest-ignored --libtest-module "${m}" \
@@ -1643,8 +1676,9 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/net_socket_generation_ns.log"
           m='nftables_batch::socket::tests'
-          unshare -r -n -- "${NET_LIB_TEST_BIN}" --ignored --exact \
-            "${m}::net3_3068_socket_generation_follows_opening_thread" 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name net_socket_generation_ns --deadline 240 --log "${log}" -- \
+            unshare -r -n -- "${NET_LIB_TEST_BIN}" --ignored --exact \
+              "${m}::net3_3068_socket_generation_follows_opening_thread"
           scripts/check-success-lines.sh --name net_socket_generation_ns \
             --src crates/net/src/nftables_batch/socket.rs --log "${log}" \
             --libtest-ignored --libtest-module "${m}" \
@@ -1736,7 +1770,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/userns_extract.log"
-          USER="$(id -un)" cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name userns_extract --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test userns_extract -- --ignored
           cases=extract_ok,outside_map,map_mismatch,subordinate_extract_ok
           cases+=,subordinate_outside_map,subordinate_map_mismatch,subordinate_cleanup
           # case の集合は実行条件として手で宣言する（試験の match の腕と食い違えば導出との照合で失敗する）
@@ -1760,7 +1795,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/image_store_xdev.log"
-          cargo test -p fandhe-container-oci --test image_store_xdev -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name image_store_xdev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test image_store_xdev -- --ignored
           # 成功行は試験ソースの println! から導出して双方向に照合する（#2768・REPAIR-12）
           scripts/check-success-lines.sh --name image_store_xdev --src crates/oci/tests/image_store_xdev.rs \
             --log "${log}" --select '^(ok: xdev_[a-z_]+|test image_store_xdev [.][.][.] ok)$' --min 5 \
@@ -1782,7 +1818,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/staged_blob_owner.log"
-          USER="$(id -un)" cargo test -p fandhe-container-oci --test staged_blob_owner -- --ignored 2>&1 | tee "${log}"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name staged_blob_owner --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test staged_blob_owner -- --ignored
           scripts/check-success-lines.sh --name staged_blob_owner --src crates/oci/tests/staged_blob_owner.rs \
             --log "${log}" --select '^(ok: [a-z_0-9]+|test staged_blob_owner [.][.][.] ok)$' --min 6 \
             --forbid 'staged_blob_owner: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
@@ -1802,7 +1839,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/landlock_implicit_dev.log"
-          cargo test -p fandhe-container-core --test landlock_implicit_dev -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name landlock_implicit_dev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test landlock_implicit_dev -- --ignored
           scripts/check-success-lines.sh --name landlock_implicit_dev \
             --src crates/core/tests/landlock_implicit_dev.rs --log "${log}" \
             --select '^landlock_implicit_dev: /dev/null write' --subst root=false \
@@ -1823,7 +1861,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/fork_exec_isolation.log"
-          cargo test -p fandhe-container-core --test fork_exec_isolation -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name fork_exec_isolation --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test fork_exec_isolation -- --ignored
           scripts/check-success-lines.sh --name fork_exec_isolation \
             --src crates/core/tests/fork_exec_isolation.rs --log "${log}" \
             --select '^fork_exec_isolation: fork/exec verified' --subst is_root=false \
@@ -1845,7 +1884,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/capabilities.log"
-          cargo test -p fandhe-container-core --test capabilities -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name capabilities --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test capabilities -- --ignored
           scripts/check-success-lines.sh --name capabilities \
             --src crates/core/tests/capabilities.rs --log "${log}" \
             --select '^capabilities: SEC-1 ' --subst-pos false --min 2 \
@@ -2007,7 +2047,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_file_owner.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name rootless_file_owner --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored
           scripts/check-success-lines.sh --name rootless_file_owner --src crates/core/tests/rootless_file_owner.rs \
             --log "${log}" --select '^rootless_file_owner: scenario ' --subst name=direct,helper \
             --subst-pos "$(id -u)" --subst-pos "$(id -g)" --min 2 \
@@ -2026,7 +2067,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_holder_expiry.log"
-          cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name rootless_holder_expiry --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored
           scripts/check-success-lines.sh --name rootless_holder_expiry \
             --src crates/core/tests/rootless_holder_expiry.rs \
             --log "${log}" --select '^rootless_holder_expiry: holder outlived' --subst-pos-re '[0-9]+' \
@@ -2046,7 +2088,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_holder_memory.log"
-          cargo test -p fandhe-container-core --test rootless_holder_memory -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name rootless_holder_memory --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test rootless_holder_memory -- --ignored
           scripts/check-success-lines.sh --name rootless_holder_memory \
             --src crates/core/tests/rootless_holder_memory.rs \
             --log "${log}" --select '^rootless_holder_memory: holder memory has no injected secret' \
@@ -2067,7 +2110,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
           USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name rootless_image_rootfs_remove --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored
           # 期待する成功行は試験ソースの println! から導出する（手書きの並びとシナリオ集合のずれで
           # 実行されない成功行を見逃さない。#2699・REPAIR-12）。集合は双方向で一致させる。
           # 共通スクリプトへ移した（#2768）。下限 12 件・ignored / Linux only の出現は失敗は従来どおり
@@ -2088,7 +2132,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/seccomp.log"
-          cargo test -p fandhe-container-core --test seccomp -- --ignored 2>&1 | tee "${log}"
+          scripts/run-with-deadline.sh --name seccomp --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test seccomp -- --ignored
           # 成功行は試験ソースから導出する（`(root={})` は is_root() の実行時の値で、CI は非 root なので false。#2768）
           scripts/check-success-lines.sh --name seccomp --src crates/core/tests/seccomp.rs --log "${log}" \
             --select '^seccomp: CORE-5 ' --subst-pos false --min 2 \
@@ -2111,7 +2156,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_launch.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_launch -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name rootless_launch --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_launch -- --ignored
           # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。文言はソースから導出（#2768）
           scripts/check-success-lines.sh --name rootless_launch --src crates/core/tests/rootless_launch.rs \
             --log "${log}" --select '^rootless_launch: scenario ' --subst name=direct,helper --min 2 \
@@ -2125,7 +2171,8 @@ jobs:
           log="${RUNNER_TEMP}/rootless.log"
           euid="$(id -u)"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name rootless --deadline 540 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless -- --ignored
           # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。
           # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED（変われば導出との照合で失敗する）
           scripts/check-success-lines.sh --name rootless --src crates/core/tests/rootless.rs --log "${log}" \
@@ -2140,7 +2187,8 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_uid_mapping.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored 2>&1 | tee "${log}"
+            scripts/run-with-deadline.sh --name rootless_uid_mapping --deadline 540 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored
           # host uid / gid は helper の case で subuid になるため正規表現で受け、verdict=pass は行のリテラルで照合する。
           # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED
           check() {
@@ -2179,7 +2227,9 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/supervisor_bin_real.log"
-          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" "${SBR_BIN}" --ignored 2>&1 | tee "${log}"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name supervisor_bin_real --deadline 540 --log "${log}" -- \
+            "${SBR_BIN}" --ignored
           check() {
             scripts/check-success-lines.sh --name supervisor_bin_real \
               --src crates/supervisor/tests/supervisor_bin_real.rs --log "${log}" \
@@ -2312,7 +2362,8 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/start_scope_real.log"
-          USER="$(id -un)" "${SCR_BIN}" --ignored 2>&1 | tee "${log}"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name start_scope_real --deadline 540 --log "${log}" -- \
+            "${SCR_BIN}" --ignored
           # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_scope_real: FAILED`
           scripts/check-success-lines.sh --name start_scope_real \
             --src crates/cli/tests/start_scope_real.rs \

@@ -77,7 +77,7 @@ pub(super) struct CreateOptionArgs {
 /// 意味検証は `create_network::validate_network_options` が net の検証関数で行う。Linux の `none` / `host` /
 /// `--add-host` / `--dns` は #1873(PR #3322)で結線済みで、ユーザー定義名・`container:`・`-p` と非 Linux の指定は
 /// 検証を通っても `UNIMPLEMENTED` で拒否する(判定は `create_network::reject_unwired_network`。
-/// ユーザー定義名の解除は #3329。NET-6・REPAIR-3)。
+/// rootless のユーザー定義名と `-p` は #3329 で結線済み〔rootful は D13 の判断待ちで `UNIMPLEMENTED`〕。NET-6・REPAIR-3)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct CreateNetworkArgs {
     /// `--network <none|host|名前>`(1 回まで。64 バイト以下)。

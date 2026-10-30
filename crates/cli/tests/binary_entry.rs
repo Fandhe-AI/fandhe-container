@@ -3477,11 +3477,12 @@ mod pasta_flags {
         }
     }
 
-    /// rootless（隣にランチャーが無い）のユーザー定義名: フラグなしは `FAILED_PRECONDITION`、
-    /// 不正・不在のパスは net の分類のまま。いずれも `UNIMPLEMENTED` より前で、状態ルートを作らない。
+    /// rootless（隣にランチャーが無い）のユーザー定義名で定義が無い場合: フラグなしは `FAILED_PRECONDITION`
+    /// （判定が先）、フラグがあれば pasta の解決より前に `NOT_FOUND`（存在しないネットワークのために子を起動しない）。
+    /// いずれも状態ルートを作らない（D2・#3329）。
     #[cfg(target_os = "linux")]
     #[test]
-    fn net9_cli1_pasta_rootless_named_network_classification() {
+    fn net9_cli1_pasta_rootless_named_network_without_definition() {
         let tmp = TmpDir::new("pasta-named");
         let cli = isolated_cli_dir("pasta-named").join("fandhe-container");
         let root = tmp.0.join("never-created");
@@ -3501,6 +3502,37 @@ mod pasta_flags {
         };
         let out = create(&[]);
         assert_rejected(&out, "FAILED_PRECONDITION", "pasta path is not configured");
+        for path in ["relative/pasta", "/nonexistent-dir/pasta"] {
+            let out = create(&["--pasta-path", path]);
+            assert_rejected(&out, "NOT_FOUND", "network not found");
+            assert!(!root.exists(), "state root must not be created");
+        }
+        assert!(!root.exists(), "state root must not be created");
+    }
+
+    /// 定義がある場合: 不正・不在のパスは net の分類のまま。いずれも `@container-options` と状態記録を作らない（#3329）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_cli1_pasta_rootless_named_network_with_definition() {
+        let tmp = TmpDir::new("pasta-defined");
+        let cli = isolated_cli_dir("pasta-defined").join("fandhe-container");
+        let root = tmp.0.join("state");
+        let root_s = root.to_str().expect("utf8");
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", "web"]);
+        assert_eq!(out.status.code(), Some(0), "{:?}", out);
+        let create = |extra: &[&str]| {
+            let mut args = vec!["--root", root_s];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ]);
+            run_isolated(&cli, &args)
+        };
         let out = create(&["--pasta-path", "relative/pasta"]);
         assert_rejected(
             &out,
@@ -3509,7 +3541,27 @@ mod pasta_flags {
         );
         let out = create(&["--pasta-path", "/nonexistent-dir/pasta"]);
         assert_rejected(&out, "NOT_FOUND", "pasta binary was not found");
-        assert!(!root.exists(), "state root must not be created");
+        // 別名のネットワーク（定義が無い）は pasta の解決より前に NOT_FOUND。
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/nonexistent-dir/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "other",
+                "c1",
+            ],
+        );
+        assert_rejected(&out, "NOT_FOUND", "network not found");
+        assert!(
+            !root.join("@container-options").exists(),
+            "options dir must not be created"
+        );
     }
 
     /// 隣に信頼できないランチャーがあれば、直接経路へ落とさず `FAILED_PRECONDITION`。

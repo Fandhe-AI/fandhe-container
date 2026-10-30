@@ -95,6 +95,19 @@ impl NetworkStore {
         Err(unsupported())
     }
 
+    /// 常に `Unimplemented`（Linux 実装と同じシグネチャ。#3329）。
+    pub fn open_existing(_state_root: &Path) -> Result<Option<Self>, NetError> {
+        Err(unsupported())
+    }
+
+    /// 常に `Unimplemented`（記録先は使わない）。
+    pub fn open_existing_with_recorder(
+        _state_root: &Path,
+        _recorder: Arc<dyn NetOpRecorder>,
+    ) -> Result<Option<Self>, NetError> {
+        Err(unsupported())
+    }
+
     /// ロック待ちの期限を差し替える（試験用）。
     pub fn with_lock_timeout(self, _timeout: Duration) -> Self {
         self

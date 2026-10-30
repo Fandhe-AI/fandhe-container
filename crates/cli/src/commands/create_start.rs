@@ -37,6 +37,7 @@
 //!   `production_runtime` が状態ストアの代わりに plugin の発見・信頼性検証を試み、現状は必ず fail-closed で
 //!   失敗する（起動と RPC は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125）。
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use fandhe_container_core::audit_log::{AuditCoveragePolicy, AuditSink, FileAuditSink};
@@ -874,6 +875,9 @@ fn create_with_options(
 pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
+    // 定義照合の定義ストア操作(`network.store.open` / `network.store.get`)の記録先(REPAIR-4・NET-6・#3329)。
+    // 本体の記録器は production_runtime が所有するため別に持ち、末尾で同じ出力先へ書く。
+    let net_recorder = Arc::new(OpRecorder::new());
     let result = production_runtime(global, recorder, "create", started, || {
         // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
         let named = super::create_network::check_network_options(
@@ -881,7 +885,16 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
             super::create_network::resolve_publish_privilege,
         )?;
         // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
-        let pasta = super::create_pasta::resolve_for_create(global, named)?;
+        // ユーザー定義名の定義は、インストールの種別の判定の後・pasta の解決の前に、何も作らずに照合する(D2・#3329)。
+        let pasta = super::create_pasta::resolve_for_create(global, named.as_ref(), |name| {
+            super::create_network::require_named_definition(
+                global,
+                name,
+                Some(Arc::new(super::net_recorder::CliNetRecorder::new(
+                    Arc::clone(&net_recorder),
+                ))),
+            )
+        })?;
         super::create_network::reject_unwired_network(
             &args.options.network,
             cfg!(target_os = "linux"),
@@ -917,6 +930,9 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r
     });
+    if !net_recorder.snapshot().is_empty() {
+        export_ops(&net_recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    }
     match result {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),

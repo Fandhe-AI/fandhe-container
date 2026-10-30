@@ -9,8 +9,21 @@
 #   2. 名前付きの unit（fandhe-ci-<name>-<pid>）にして、期限切れ時に scope ごと SIGKILL → stop する
 #   3. 期限切れは固定の失敗行（code=deadline_exceeded）と非 0（124）で終わる
 #
+# 資源の上限（#3504・#3485・REPAIR-5）: 2026-10-30 に exec_subordinate_e2e のステップでランナーごと応答しなくなり
+# （timeout-minutes も期限も効かず、ジョブ上限で cancelled・ログ欠落）、原因は確定していない（ubuntu だけの
+# dispatch では、より前の exec_child_setup の開始直後に VM 全体が応答しなくなり、資源の枯渇は観測されなかった）。
+# この上限は暴走（メモリ・fork・出力）がランナーを道連れにする経路だけを試験側の失敗（非 0）に変える防御で、
+# カーネル・VM の停止は防げない。
+#   - MemoryMax（既定 4G）・MemorySwapMax=0: 超えると scope の中だけが OOM kill される（ホスト全体の OOM で
+#     ランナーのプロセスが選ばれるのを避ける）
+#   - TasksMax（既定 4096）: fork の暴走を scope の中で止める
+#   - ファイルサイズ（既定 1048576 KiB = 1 GiB。`ulimit -f`）: ログを含む 1 ファイルへの書き込みの上限。超えると SIGXFSZ
+#   上限で止まったとみられる終了（SIGKILL の 137・SIGXFSZ の 153）は code=resource_limit の行を足す（合否は変えない）。
+#
 # 使い方:
-#   scripts/run-in-user-scope.sh --name <name> --deadline <秒> --log <絶対パス> -- <コマンド> [引数...]
+#   scripts/run-in-user-scope.sh --name <name> --deadline <秒> --log <絶対パス>
+#     [--memory-max <1〜65535 の整数 + K|M|G>] [--tasks-max <64〜65536>] [--file-size-kib <1024〜16777216>]
+#     -- <コマンド> [引数...]
 # 終了コード: 子の終了コードをそのまま返す。期限切れは 124。引数の誤りは 2。前提コマンド不在は 1。
 # 呼び出し側の環境変数（USER 等）はそのまま子へ渡る。外側の待ちの上限は期限 + 約 40 秒。
 # 残余: D 状態で KILL が効かない子は run_limited の wait を戻さない。CLI の start が別 scope へ逃がした子孫は
@@ -23,13 +36,17 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${DIR}/lib.sh"
 
 usage() {
-  echo "usage: run-in-user-scope.sh --name <[a-z0-9_]{1,48}> --deadline <1-3600> --log <absolute path> -- <command> [args...]" >&2
+  echo "usage: run-in-user-scope.sh --name <[a-z0-9_]{1,48}> --deadline <1-3600> --log <absolute path>" \
+    "[--memory-max <1-65535>{K|M|G}] [--tasks-max <64-65536>] [--file-size-kib <1024-16777216>] -- <command> [args...]" >&2
   exit 2
 }
 
 name=""
 deadline=""
 log=""
+memory_max="4G"
+tasks_max="4096"
+file_size_kib="1048576"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --name)
@@ -47,6 +64,21 @@ while [ "$#" -gt 0 ]; do
       log="$2"
       shift 2
       ;;
+    --memory-max)
+      [ "$#" -ge 2 ] || usage
+      memory_max="$2"
+      shift 2
+      ;;
+    --tasks-max)
+      [ "$#" -ge 2 ] || usage
+      tasks_max="$2"
+      shift 2
+      ;;
+    --file-size-kib)
+      [ "$#" -ge 2 ] || usage
+      file_size_kib="$2"
+      shift 2
+      ;;
     --)
       shift
       break
@@ -59,8 +91,18 @@ case "${name}" in *[!a-z0-9_]*) usage ;; esac
 [ "${#name}" -le 48 ] || usage
 int_in_range "${deadline}" 1 3600 || usage
 case "${log}" in /*) ;; *) usage ;; esac
+# MemoryMax は「先頭がゼロでない 1〜5 桁の整数 + K/M/G」だけを受ける（systemd へ渡す値を固定の形に限る）。
+case "${memory_max}" in
+  [1-9][KMG] | [1-9][0-9][KMG] | [1-9][0-9][0-9][KMG] | [1-9][0-9][0-9][0-9][KMG] | [1-9][0-9][0-9][0-9][0-9][KMG]) ;;
+  *) usage ;;
+esac
+[ "${memory_max%?}" -le 65535 ] || usage
+int_in_range "${tasks_max}" 64 65536 || usage
+int_in_range "${file_size_kib}" 1024 16777216 || usage
 # 先頭ゼロを 10 進にそろえる（表示のため）。
 while [ "${#deadline}" -gt 1 ] && [ "${deadline#0}" != "${deadline}" ]; do deadline="${deadline#0}"; done
+while [ "${#tasks_max}" -gt 1 ] && [ "${tasks_max#0}" != "${tasks_max}" ]; do tasks_max="${tasks_max#0}"; done
+while [ "${#file_size_kib}" -gt 1 ] && [ "${file_size_kib#0}" != "${file_size_kib}" ]; do file_size_kib="${file_size_kib#0}"; done
 
 # 前提は skip せず fail-closed にする。
 for c in systemd-run systemctl timeout; do
@@ -101,7 +143,12 @@ run_scope() {
   # 引き継ぐと子が finished=0 のまま scope_stop と RUN_LIMITED_DIR（期限切れの印）の削除を行い、
   # 親が 124 でなく 143 を返す・残存警告が出ない（cleanup は親だけが実行する）。
   trap - EXIT INT TERM
-  systemd-run --user --scope --quiet -p Delegate=yes --unit="${unit}" -- "$@" >"${log}" 2>&1
+  # `ulimit -f` は scope の中の bash で設定してから exec する（pid は変わらないため、scope に居るのは試験だけのまま）。
+  # bash の `ulimit -f` の単位は 1024 バイト。
+  # shellcheck disable=SC2016 # 内側の bash が展開する
+  systemd-run --user --scope --quiet -p Delegate=yes \
+    -p "MemoryMax=${memory_max}" -p MemorySwapMax=0 -p "TasksMax=${tasks_max}" --unit="${unit}" -- \
+    bash -c 'ulimit -f "$1" || exit 125; shift; exec "$@"' run-in-user-scope "${file_size_kib}" "$@" >"${log}" 2>&1
 }
 
 rc=0
@@ -117,6 +164,17 @@ if [ "${rc}" -eq 124 ]; then
   fi
   exit 124
 fi
+
+# 上限で止まったとみられる終了を固定の行で示す（合否は変えない）。137 は SIGKILL（MemoryMax の OOM kill を含む）、
+# 153 は SIGXFSZ（ファイルサイズの上限）。TasksMax は fork の失敗として試験側のエラーになる。
+case "${rc}" in
+  137 | 153)
+    err_code resource_limit "name=${name} rc=${rc} memory_max=${memory_max} tasks_max=${tasks_max} file_size_kib=${file_size_kib}"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+      echo "::error::run-in-user-scope resource_limit name=${name} rc=${rc} (137: SIGKILL incl. OOM in the scope, 153: SIGXFSZ)"
+    fi
+    ;;
+esac
 
 # 正常終了でも scope に子孫が残っていれば回収する。合否（rc）は変えない。
 if timeout 10 systemctl --user is-active "${unit}.scope" >/dev/null 2>&1; then

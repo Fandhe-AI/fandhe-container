@@ -3482,12 +3482,13 @@ mod write_nonblocking_flag_tests {
         assert_eq!(AF_UNIX, 1);
     }
 
-    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。試験プロセスは `SIGPIPE` を無視しているため、
+    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。相手の close が届く前の 1 回の
+    /// send は成功しうる（並行試験の fork、特に `write_to_shut_down_socket_in_child` の `Command` が
+    /// 相手 fd を一時的に複製するため。#3436・#3474）ので、EOF を期限つきで確かめてから送る。試験プロセスは `SIGPIPE` を無視しているため、
     /// `SIGPIPE` が出ないことそのものは下の `repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl` で照合する。
     #[test]
     fn repair5_send_to_closed_peer_returns_epipe() {
-        let (a, b) = UnixStream::pair().unwrap();
-        drop(b);
+        let a = crate::spawn_gate::unix_pair_with_closed_peer();
         let e = write_nonblocking(&a, b"x\n").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }

@@ -110,6 +110,43 @@ pub(crate) fn spawn(deadline: Instant, cmd: &mut Command) -> io::Result<Child> {
     cmd.spawn()
 }
 
+/// 相手を `drop` し、その close が自分側へ届いたこと（EOF）を期限つきで確かめた対の片側を返す（試験用）。
+///
+/// 並行する試験の fork から exec までの間は、子が相手 fd の複製を持ち、`drop(peer)` だけでは
+/// socket が閉じきらない。その状態の 1 回の write は成功してしまう（#3436・#3474）。`shutdown` を
+/// 誰も呼ばないので、自分側の EOF は相手 socket の最後の参照が閉じたときにだけ起きる。Linux は
+/// 閉鎖の際に相手を dead 化するため、EOF が見えれば以後の write は EPIPE になる。macOS も切断が
+/// 両端にかかり同様。待ちは 10 秒で打ち切る（REPAIR-5）。transport と sys の試験が共有する。
+#[cfg(test)]
+pub(crate) fn unix_pair_with_closed_peer() -> std::os::unix::net::UnixStream {
+    use std::io::Read as _;
+    let (ours, peer) = create_fds(
+        Instant::now() + GATE_WAIT_DEFAULT,
+        std::os::unix::net::UnixStream::pair,
+    )
+    .unwrap();
+    drop(peer);
+    ours.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut probe = [0u8; 1];
+    loop {
+        match (&ours).read(&mut probe) {
+            Ok(0) => break,
+            Ok(n) => panic!("unexpected {n} byte(s) from closed peer"),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "peer close was not observed within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("probe read failed: {e:?}"),
+        }
+    }
+    ours.set_nonblocking(false).unwrap();
+    ours
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

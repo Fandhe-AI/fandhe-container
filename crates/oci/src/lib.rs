@@ -82,3 +82,9 @@ pub mod registry;
 mod sys;
 mod tls;
 mod whiteout;
+
+// 先に消してから作る試験補助を排他作成へ揃えるための共有部品（自 crate の結合試験の補助を取り込む。
+// REPAIR-12・#3506）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../tests/support/test_root.rs"]
+mod test_root;

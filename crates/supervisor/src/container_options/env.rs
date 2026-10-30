@@ -409,16 +409,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// 試験用の一時ディレクトリ。pid だけの名前は PID 再利用や異常終了の残骸と衝突するため、
-    /// 作る前に残骸を消し、drop で消す（#3374・#3298・REPAIR-12。oci の `TestRoot` と同じ形）。
+    /// 試験用の一時ディレクトリ。pid だけの名前は PID 再利用や異常終了の残骸と衝突するため、既存の名前は
+    /// 消さず・辿らず別名で排他作成し（unix は 0700）、drop で自分が作ったパスだけを消す
+    /// （共有部品 `test_root`。#3374・#3298・#3506・REPAIR-12）。
     /// 3 OS で動く試験で使うため、Linux 限定の `ScratchDir` ではなくこの形にしている。
-    struct TestDir(PathBuf);
+    struct TestDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TestDir {
+        /// `p` を第 1 候補に排他作成する。既にあれば別名になるため、`path()` は `p` と異なることがある。
         fn at(p: PathBuf) -> Self {
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
 
         fn new(tag: &str) -> Self {
@@ -427,12 +428,6 @@ mod tests {
 
         fn path(&self) -> &Path {
             &self.0
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -673,13 +668,14 @@ mod tests {
         assert!(!f.metadata().unwrap().is_file());
     }
 
-    /// SUP-12・REPAIR-12・#3374: 前回の残骸（FIFO・通常ファイル・サブディレクトリ）があっても、
-    /// 試験用ディレクトリは空で作り直され、同じ名前の `mkfifo` が成功し、drop で消える。
+    /// SUP-12・REPAIR-12・#3506: 前回の残骸（FIFO・通常ファイル・サブディレクトリ）があっても消さず、
+    /// 別名の空のディレクトリを作る。残骸の FIFO は無傷で残り、新しいディレクトリで同名の `mkfifo` が成功し、
+    /// drop で新しい方だけが消える。
     #[cfg(unix)]
     #[test]
-    fn sup12_repair12_3374_test_dir_clears_stale_residue() {
-        let p = std::env::temp_dir().join(format!("fc-envfifo-residue-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+    fn sup12_repair12_3506_test_dir_leaves_stale_residue_untouched() {
+        let parent = TestDir::new("envfifo-residue-parent");
+        let p = parent.path().join("stale");
         std::fs::create_dir_all(p.join("d")).unwrap();
         std::fs::write(p.join("stale"), "stale").unwrap();
         std::fs::write(p.join("d").join("x"), "x").unwrap();
@@ -691,44 +687,88 @@ mod tests {
         assert!(ok, "mkfifo must be available on unix test hosts");
 
         let guard = TestDir::at(p.clone());
+        assert_ne!(guard.path(), p.as_path());
+        assert_eq!(guard.path().parent(), Some(parent.path()));
         assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
         let again = std::process::Command::new("mkfifo")
             .arg(guard.path().join("f.env"))
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(again, "mkfifo must succeed in a cleaned directory");
+        assert!(again, "mkfifo must succeed in a fresh directory");
         assert_eq!(
             EnvFile::read(&guard.path().join("f.env"))
                 .unwrap_err()
                 .code(),
             ErrorCode::InvalidArgument
         );
+        let new_path = guard.path().to_path_buf();
         drop(guard);
         assert_eq!(
-            std::fs::symlink_metadata(&p).unwrap_err().kind(),
+            std::fs::symlink_metadata(&new_path).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+        // 残骸は無傷。
+        assert!(p.join("d").join("x").is_file());
+        assert_eq!(std::fs::read_to_string(p.join("stale")).unwrap(), "stale");
+        assert!(!std::fs::metadata(p.join("f.env")).unwrap().is_file());
     }
 
-    /// SUP-12・REPAIR-12・#3374: 3 OS 共通。通常ファイルとサブディレクトリの残骸が消え、書き込みと読み込みが通り、drop で消える。
+    /// SUP-12・REPAIR-12・#3506: 3 OS 共通。通常ファイルとサブディレクトリの残骸を消さず、別名の空のディレクトリで
+    /// 書き込みと読み込みが通り、drop で新しい方だけが消える。
     #[test]
-    fn sup12_repair12_3374_test_dir_clears_stale_file_and_dir() {
-        let p = std::env::temp_dir().join(format!("fc-envfile-residue-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+    fn sup12_repair12_3506_test_dir_leaves_stale_file_and_dir_untouched() {
+        let parent = TestDir::new("envfile-residue-parent");
+        let p = parent.path().join("stale");
         std::fs::create_dir_all(p.join("d")).unwrap();
         std::fs::write(p.join("stale"), "stale").unwrap();
         std::fs::write(p.join("d").join("x"), "x").unwrap();
 
         let guard = TestDir::at(p.clone());
+        assert_ne!(guard.path(), p.as_path());
         assert_eq!(std::fs::read_dir(guard.path()).unwrap().count(), 0);
         let f = guard.path().join("a.env");
         std::fs::write(&f, "A=1\n").unwrap();
         assert_eq!(EnvFile::read(&f).unwrap().vars().len(), 1);
+        let new_path = guard.path().to_path_buf();
         drop(guard);
         assert_eq!(
-            std::fs::symlink_metadata(&p).unwrap_err().kind(),
+            std::fs::symlink_metadata(&new_path).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+        assert!(p.join("d").join("x").is_file());
+        assert_eq!(std::fs::read_to_string(p.join("stale")).unwrap(), "stale");
+    }
+
+    /// SUP-12・REPAIR-12・#3506: 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn sup12_repair12_3506_test_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = TestDir::new("envsym-parent");
+        let victim = parent.path().join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .unwrap();
+        std::fs::write(victim.join("keep"), b"keep").unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let target = parent.path().join("nowhere");
+        let dangling = parent.path().join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).unwrap();
+
+        let g1 = TestDir::at(link.clone());
+        let g2 = TestDir::at(dangling.clone());
+        assert_ne!(g1.path(), link.as_path());
+        assert_ne!(g2.path(), dangling.as_path());
+        assert_eq!(std::fs::read_dir(g1.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 }

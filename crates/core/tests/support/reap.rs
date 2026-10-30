@@ -183,10 +183,10 @@ pub(crate) fn kill_group_with(
 }
 
 /// プロセスグループ `pgid` の全員へ SIGKILL を送る。この補助は `unsafe` を持たないため、`kill(2)` の直接
-/// 呼び出しの代わりに OS 同梱の `kill` を環境空・絶対パス・期限つき（10 秒）で起動する。引数形式は GNU
-/// （Linux）の `-s KILL -- -<pgid>` を先に、BSD（macOS）の kill が `--` を pid として拒否するため
-/// `-s KILL -<pgid>` を次に試す（`crates/plugin/tests/rss_comparison.rs` の `kill_process_group` と同じ）。
-/// 存在しない実行ファイル（NotFound）は試行から外す。成功・`No such process`（ESRCH）は `Ok`。EPERM は
+/// 呼び出しの代わりに OS 同梱の `kill` を環境空・絶対パス・期限つき（10 秒）で起動する。引数形式は
+/// `group_kill_arg_forms` が OS ごとに決める（Linux は `--` つきの 1 形式だけ。#3505）。
+/// 存在しない実行ファイル（NotFound）は試行から外す。成功・`No such process`（ESRCH）は `Ok`（ESRCH を
+/// 受けたら別の形式・別の実行ファイルを試さない）。EPERM は
 /// `kill_group_with` の契約（直接の子を回収済みなら 20 ms 間隔・合計 2 秒の有界な再試行、続けば `Err`）。
 /// それ以外は全試行の実行ファイル・引数・終了ステータス・stderr を連ねた `Err`。`pgid` が 0 や 1 のときは
 /// 自分のグループや全体を撃たないよう何もしない。Unix 以外では何もしない（REPAIR-5）。
@@ -212,14 +212,34 @@ fn kill_group(pgid: u32, child_reaped: bool) -> Result<(), String> {
     }
 }
 
+/// プロセスグループ `pgid` へ SIGKILL を送る `kill(1)` の引数形式（試す順。REPAIR-5・#3505）。
+///
+/// - Linux: `-s KILL -- -<pgid>` の 1 形式だけ。`--` なしの `-s KILL -<pgid>` は使わない。ubuntu-24.04 の
+///   procps-ng（`2:4.0.4-4ubuntu3.3`）の `kill` は `--` なしの負の数の先頭 1 桁だけを pid として扱い、
+///   `-s KILL -12706` を `kill(-1, SIGKILL)` として発行する（同じ uid の全プロセスを止め、GitHub Actions の
+///   ランナーでは hosted-compute-agent ごと消えて VM が回収される。#3505 で auditd の記録と展開した同版の
+///   `kill` で確認）。
+/// - それ以外の Unix（macOS 等の BSD 系）: `--` つきを先に、BSD の kill が `--` を pid として拒否するため
+///   `--` なしを次に試す。
+#[cfg(unix)]
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
+pub(crate) fn group_kill_arg_forms(pgid: u32) -> Vec<Vec<String>> {
+    let target = format!("-{pgid}");
+    let dashed = ["-s", "KILL", "--", &target].map(String::from).to_vec();
+    if cfg!(target_os = "linux") {
+        vec![dashed]
+    } else {
+        vec![dashed, ["-s", "KILL", &target].map(String::from).to_vec()]
+    }
+}
+
 #[cfg(unix)]
 fn kill_once(pgid: u32) -> KillOnce {
-    let target = format!("-{pgid}");
-    let forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
+    let forms = group_kill_arg_forms(pgid);
     let mut attempts: Vec<String> = Vec::new();
-    let (mut gone, mut eperm) = (false, false);
+    let mut eperm = false;
     for bin in ["/bin/kill", "/usr/bin/kill"] {
-        for args in forms {
+        for args in &forms {
             let mut cmd = Command::new(bin);
             cmd.args(args)
                 .env_clear()
@@ -243,7 +263,10 @@ fn kill_once(pgid: u32) -> KillOnce {
                     if let Some(mut e) = child.stderr.take() {
                         let _ = e.by_ref().take(4096).read_to_string(&mut msg);
                     }
-                    gone |= msg.contains("No such process");
+                    // グループが空（ESRCH）なら、ほかの形式・実行ファイルで撃ち直さない（#3505）。
+                    if msg.contains("No such process") {
+                        return KillOnce::Gone;
+                    }
                     eperm |= msg.contains("Operation not permitted");
                     attempts.push(format!("{bin} {args:?} exited with {st}: {}", msg.trim()));
                 }
@@ -258,9 +281,7 @@ fn kill_once(pgid: u32) -> KillOnce {
         attempts.push("no kill binary found".to_string());
     }
     let rec = attempts.join(" | ");
-    if gone {
-        KillOnce::Gone
-    } else if eperm {
+    if eperm {
         KillOnce::Eperm(rec)
     } else {
         KillOnce::Failed(rec)

@@ -358,7 +358,7 @@ fn repair5_repair12_captured_wait_cuts_endless_output_before_deadline() {
     assert!(!out_path.exists());
 }
 
-/// kill の引数形式（GNU の `--` つき / BSD の `--` なし）のどちらでも、すでに空のグループは成功扱いで、
+/// kill の引数形式（`group_kill_arg_forms`。Linux は `--` つきだけ、BSD 系は `--` なしも試す）で、すでに空のグループは成功扱いで、
 /// 生きているグループは実際に止まる。macOS でも同じ試験が通ること（`--` を pid と誤解する kill への対応）を見る。
 #[cfg(unix)]
 #[test]
@@ -376,6 +376,28 @@ fn repair5_repair12_group_kill_succeeds_for_live_and_empty_groups() {
     let st = reap::wait_within(&mut child, Duration::from_secs(30)).expect("exit");
     let out = captured.finish(st).expect("empty group is not an error");
     assert!(out.status.success());
+}
+
+/// #3505・REPAIR-5・REPAIR-12: グループ kill の引数形式。Linux では `--` つきの 1 形式だけを使い、`--` なしの
+/// `-s KILL -<pgid>` を使わない（ubuntu-24.04 の procps `2:4.0.4-4ubuntu3.3` は `-s KILL -12706` を
+/// `kill(-1, SIGKILL)`、`-s KILL -2706` を `kill(-2, SIGKILL)` として発行する）。BSD 系だけ `--` なしを次に試す。
+/// 先頭の桁が 1 の pgid（`kill(-1)` になる値）と、それ以外の桁の値で具体的な引数列を照合する。
+#[cfg(unix)]
+#[test]
+fn repair5_3505_group_kill_arg_forms_keep_double_dash_on_linux() {
+    for pgid in [12_706_u32, 17_898, 2_706, 99_999, 1_048_576] {
+        let target = format!("-{pgid}");
+        let dashed: Vec<String> = ["-s", "KILL", "--", target.as_str()]
+            .map(String::from)
+            .to_vec();
+        let forms = reap::group_kill_arg_forms(pgid);
+        if cfg!(target_os = "linux") {
+            assert_eq!(forms, vec![dashed], "pgid={pgid}");
+        } else {
+            let plain: Vec<String> = ["-s", "KILL", target.as_str()].map(String::from).to_vec();
+            assert_eq!(forms, vec![dashed, plain], "pgid={pgid}");
+        }
+    }
 }
 
 /// Windows の既定方式（pipe と読み手スレッド）。Unix でも明示指定で同じ経路を試す（REPAIR-5・REPAIR-12）。

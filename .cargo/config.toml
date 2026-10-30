@@ -1,0 +1,10 @@
+# cargo の runner 設定（#3504・REPAIR-5・REPAIR-7）。
+# reusable の rust-ci（Fandhe-AI/actions の rust-base-ci）の `cargo test` は間欠的にジョブ上限まで止まりログが残らない。
+# reusable にはステップも env も差し込めないため、試験バイナリごとに期限つきの wrapper で包み、期限切れ時に
+# 診断（プロセス木・スレッド名）を出して子孫を回収する。期限を使う条件・既定 300 秒の根拠は scripts/test-bin-watchdog.sh と
+# .claude/rules/ci.md。CI 外・cargo bench は素通しのため、手元の cargo run / cargo test は変わらない。
+# x86_64 Linux に限る理由: 止まる症状は ubuntu の rust-ci でしか観測されておらず、wrapper は /proc と procps に依存し、
+# Windows は .sh を直接起動できず、macOS・Windows の cargo test は main の platform-ci のステップ期限で既に有界。
+# aarch64 Linux はネイティブ CI ができたら triple を足す。
+[target.x86_64-unknown-linux-gnu]
+runner = "scripts/test-bin-watchdog.sh"

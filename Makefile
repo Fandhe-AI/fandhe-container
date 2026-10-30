@@ -35,7 +35,7 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest run-in-user-scope-selftest check-success-lines-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest run-in-user-scope-selftest test-bin-watchdog-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing net-throughput-rtt net-throughput-rtt-compare small-files-compare mac-small-files-docker mac-small-files-report dns-helper-measure idle-memory \
@@ -250,6 +250,9 @@ repeat-test-selftest: ## repeat-test スクリプトの自己テスト（REPAIR-
 
 run-in-user-scope-selftest: ## 委譲スコープ実行補助の自己テスト（#3486・REPAIR-5・REPAIR-12。スタブの systemd-run / systemctl のみ）
 	@scripts/run-in-user-scope-selftest.sh
+
+test-bin-watchdog-selftest: ## 試験バイナリ watchdog（cargo の runner）の自己テスト（#3504・REPAIR-5・REPAIR-12。Linux のみ）
+	@scripts/test-bin-watchdog-selftest.sh
 
 check-success-lines-selftest: ## 実機前提テストの成功行照合スクリプトの自己テスト（REPAIR-12・#2768。fixture のみ）
 	@scripts/check-success-lines-selftest.sh

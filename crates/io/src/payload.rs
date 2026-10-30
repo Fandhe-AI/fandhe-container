@@ -70,7 +70,7 @@
 //! - [`crate::client::PipelineClient::recv_ack`]（TASK-12.2・#74）が
 //!   [`decode_ack`] で受信 ACK を検証する
 //! - v2 の [`encode_create`] 等は `PipelineClient` の型つき API（#3162。実装済み）と
-//!   ファイル操作モードのサーバー（#3163。未実装。REPAIR-3）が使い、本モジュールは
+//!   ファイル操作モードのサーバー（`file_serve`。#3163。実装済み）が使い、本モジュールは
 //!   符号化と復号だけを提供する
 //! - バッチ write-back サーバー本体（TASK-13.2・#77・#820）が [`decode_request`]・
 //!   [`encode_ack`] で同じ形式を読み書きする想定（本モジュールはクライアント・
@@ -451,7 +451,7 @@ impl<'a> CreateEnvelope<'a> {
     }
 }
 
-/// [`FrameKind::Create`] フレームを復元する（サーバー側。#3163 が使う予定）。
+/// [`FrameKind::Create`] フレームを復元する（サーバー側。`file_serve` が使う。#3163）。
 ///
 /// 検証順: (1) 固定部 [`CREATE_FIXED_LEN`] バイト以上、(2) `path_len` が
 /// 1〜[`MAX_GUEST_PATH_BYTES`]、(3) 残りがちょうど `path_len` バイト（短くても
@@ -635,7 +635,7 @@ impl TryFrom<u8> for NackCode {
     }
 }
 
-/// [`FrameKind::Nack`] フレームを組み立てる（サーバー側。#3163 が使う予定）。
+/// [`FrameKind::Nack`] フレームを組み立てる（サーバー側。`file_serve` が使う。#3163）。
 /// 自由文字列を持たない（パス等をワイヤーへ返さない。F10）。
 pub fn encode_nack(
     id: WireRequestId,

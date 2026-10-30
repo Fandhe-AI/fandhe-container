@@ -419,8 +419,12 @@ impl BatchBuffer {
 
     /// フレームを 1 件バッファへ追加する。
     ///
-    /// `frame` が [`FrameKind::Write`] 以外の場合は
-    /// [`IoErrorCode::InvalidArgument`] を返し、バッファの内容は変更しない。
+    /// `frame` がクライアント要求の種別（[`FrameKind::Write`]、およびファイル操作モードの
+    /// [`FrameKind::Create`]・[`FrameKind::WriteFile`]・[`FrameKind::Close`]。#3163）以外の
+    /// 場合は [`IoErrorCode::InvalidArgument`] を返し、バッファの内容は変更しない。
+    /// どの種別を受理するかのモード判定は呼び出し側（`serve_connection` /
+    /// `serve_file_connection`）が受信ループで行い、本バッファは集約だけを担う。
+    /// 累積バイト数は種別を問わずペイロード長で数える（メモリ保持量の上限が目的）。
     ///
     /// `frame` 単体のペイロード長が設定上限（[`BatchConfig::max_bytes`]）を
     /// 超える場合も同様に [`IoErrorCode::InvalidArgument`] を返し、バッファの
@@ -458,10 +462,13 @@ impl BatchBuffer {
     /// バッファは空の状態（次バッチぶんの容量を確保済み）に戻る。
     /// どの上限にも到達しなければ [`PushOutcome::Buffered`] を返す。
     pub fn push(&mut self, frame: Frame) -> Result<PushOutcome, IoError> {
-        if frame.kind() != FrameKind::Write {
+        if !matches!(
+            frame.kind(),
+            FrameKind::Write | FrameKind::Create | FrameKind::WriteFile | FrameKind::Close
+        ) {
             return Err(IoError::new(
                 IoErrorCode::InvalidArgument,
-                "batch buffer accepts only Write frames",
+                "batch buffer accepts only client request frames (Write/Create/WriteFile/Close)",
             ));
         }
 
@@ -710,16 +717,21 @@ mod tests {
         assert!(buffer.take_pending().is_none());
     }
 
-    /// IO-1・REPAIR-2: `Write` 以外のフレームは拒否され、バッファの内容は
-    /// 変化しない。
+    /// IO-1・REPAIR-2: クライアント要求以外の種別（Ack・Flush・FlushAck・Nack）は拒否され、
+    /// バッファの内容は変化しない。
     #[test]
-    fn io1_push_rejects_non_write_frames() {
+    fn io1_push_rejects_non_request_frames() {
         let mut buffer = BatchBuffer::new(BatchConfig::default());
         let outcome = buffer.push(write_frame(0)).expect("push must succeed");
         assert!(matches!(outcome, PushOutcome::Buffered { .. }));
         assert_eq!(buffer.len(), 1);
 
-        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+        for kind in [
+            FrameKind::Ack,
+            FrameKind::Flush,
+            FrameKind::FlushAck,
+            FrameKind::Nack,
+        ] {
             let frame = Frame::new(kind, Vec::new()).expect("Frame::new must succeed");
             let err = buffer
                 .push(frame)
@@ -727,6 +739,29 @@ mod tests {
             assert_eq!(err.code(), IoErrorCode::InvalidArgument);
             assert_eq!(buffer.len(), 1, "buffer must be unchanged after rejection");
         }
+    }
+
+    /// IO-1・#3163: ファイル操作モードの要求（Create・WriteFile・Close）も Write と同じく
+    /// 受理して到着順に集約する。
+    #[test]
+    fn io1_push_accepts_file_operation_frames() {
+        let mut buffer = BatchBuffer::new(BatchConfig::new(3).expect("batch size 3"));
+        for kind in [FrameKind::Create, FrameKind::WriteFile] {
+            let frame = Frame::new(kind, vec![0u8; 18]).expect("Frame::new must succeed");
+            let outcome = buffer
+                .push(frame)
+                .expect("file operation frame must be accepted");
+            assert!(matches!(outcome, PushOutcome::Buffered { .. }));
+        }
+        let close = Frame::new(FrameKind::Close, vec![0u8; 16]).expect("Frame::new must succeed");
+        let PushOutcome::Ready(batch) = buffer.push(close).expect("close must be accepted") else {
+            panic!("third frame must fire the batch");
+        };
+        let kinds: Vec<FrameKind> = batch.frames().iter().map(Frame::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![FrameKind::Create, FrameKind::WriteFile, FrameKind::Close]
+        );
     }
 
     /// IO-1: `BatchBuffer` はスレッド境界を越えて受け渡せる

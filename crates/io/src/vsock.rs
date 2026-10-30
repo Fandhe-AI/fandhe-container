@@ -280,9 +280,11 @@ fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoErro
 }
 
 /// クライアント側が受信してはならない要求系種別（`Write`・`Flush`・`Create`・
-/// `WriteFile`・`Close`）を拒否する。`Nack` は受理するが、型つきの処理は #3162 まで
-/// 未実装で、`recv_ack` の `decode_ack` が `InvalidArgument` で失効させる（fail-closed）。
-fn reject_server_originated_request_frame(kind: FrameKind) -> Result<(), IoError> {
+/// `WriteFile`・`Close`）を拒否する。`Nack` は受理する（#3161）。型つきの処理は
+/// `PipelineClient` 側（#3162）の担当で、それまでは `recv_ack` の `decode_ack` が
+/// `InvalidArgument` で失効させる（fail-closed）。UDS クライアント（`crate::uds_client`）も
+/// この判定を共有する（#3165）。
+pub(crate) fn reject_server_originated_request_frame(kind: FrameKind) -> Result<(), IoError> {
     match kind {
         FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Ok(()),
         FrameKind::Write

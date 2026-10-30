@@ -802,6 +802,9 @@ pub enum ServerOp {
     Recv,
     /// [`crate::server::UdsConnection`] の [`crate::transport::FrameSender::send_frame`]。
     Send,
+    /// [`crate::uds_client::UdsClientConnection::connect`]（クライアント側の接続。接続先の
+    /// uid の照合失敗を `RejectedPeerCredential` で通知する。IO-1・PLUG-12・SEC-4。#3165）。
+    Connect,
 }
 
 /// [`ServerEvent::outcome`]（TASK-13.2.1・#820。P1-3 の poison 契約を
@@ -1411,6 +1414,7 @@ fn server_op_str(op: ServerOp) -> &'static str {
         ServerOp::Accept => "accept",
         ServerOp::Recv => "recv",
         ServerOp::Send => "send",
+        ServerOp::Connect => "connect",
     }
 }
 

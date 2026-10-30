@@ -197,8 +197,9 @@
 //!   で、受信時点の「排出済みだが未書き込み」のキューは常に空になるため、
 //!   この `0` は現行の呼び出し方（1 バッチ完結の同期処理）の下で構造上正確
 //!   （`crates/io/src/writeback.rs` モジュール doc「受信上限」節参照）
-//! - クライアント側の UDS 接続（`connect`）・[`crate::client::PipelineClient`]
-//!   との本番結合
+//! - クライアント側の UDS 接続（`connect`）は [`crate::uds_client::UdsClientConnection`]
+//!   （#3165）に実装済み。[`crate::client::PipelineClient`] の型つき API（Create / Close /
+//!   Nack の処理）との本番結合の残りは #3162
 //! - vsock（microVM）トランスポートは [`crate::vsock`]（#1119）に実装済み（本ファイルの範囲外）
 //! - `path` の直近の親ディレクトリ以外（祖先のパス要素）の symlink 検査は
 //!   行わない（`imp::validate_parent_dir`（Linux / macOS 限定の非公開関数）
@@ -531,6 +532,45 @@ pub struct UdsConnection<C: ServerObserver> {
     poisoned: bool,
     observer: C,
     limits: ReceiveLimits,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<C: ServerObserver> UdsConnection<C> {
+    /// 接続済み（blocking・peer 照合済み）の `stream` から、クライアント側の
+    /// [`UdsConnection`] を作る（[`crate::uds_client::UdsClientConnection::connect`] 専用。
+    /// IO-1・#3165）。受信してよい種別は応答系（`Ack`・`FlushAck`・`Nack`）のみ。
+    pub(crate) fn from_client_stream(
+        stream: std::os::unix::net::UnixStream,
+        observer: C,
+        limits: ReceiveLimits,
+    ) -> Self {
+        Self {
+            inner: imp::ConnectionInner::for_client(
+                stream,
+                crate::vsock::reject_server_originated_request_frame,
+            ),
+            poisoned: false,
+            observer,
+            limits,
+        }
+    }
+
+    /// 観測フックへの参照（[`crate::uds_client::UdsClientConnection::observer`] 用）。
+    pub(crate) fn observer_ref(&self) -> &C {
+        &self.observer
+    }
+
+    /// 観測フックへの可変参照。
+    pub(crate) fn observer_mut_ref(&mut self) -> &mut C {
+        &mut self.observer
+    }
+}
+
+/// bind 前の親ディレクトリ検査（symlink でない・ディレクトリ・`0o077` なし・所有者一致）を
+/// クライアントの接続前検査へ共有する（サーバーの bind と同じ基準。IO-1・PLUG-12・#3165）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn validate_socket_parent_dir(path: &Path, effective_uid: u32) -> Result<(), IoError> {
+    imp::validate_parent_dir(path, effective_uid)
 }
 
 impl<C: ServerObserver> core::fmt::Debug for UdsConnection<C> {
@@ -1398,7 +1438,7 @@ mod imp {
 
     use crate::error::{IoError, IoErrorCode};
     use crate::observe::{SendEventError, ServerEvent, ServerOp, ServerOutcome};
-    use crate::protocol::Frame;
+    use crate::protocol::{Frame, FrameKind};
     use crate::recv_limits::ReceiveLimits;
     use crate::stream_io::*;
     use crate::transport::IoTimeout;
@@ -1606,7 +1646,10 @@ mod imp {
                         }
 
                         return super::AcceptAttempt {
-                            result: Ok(ConnectionInner { stream }),
+                            result: Ok(ConnectionInner {
+                                stream,
+                                accept_kind: reject_client_originated_response_frame,
+                            }),
                             aborted_retries: abort_retries,
                             peer_credential_rejections: credential_rejections,
                         };
@@ -1929,7 +1972,7 @@ mod imp {
     /// `/tmp` が `/private/tmp` への symlink であるように、canonicalize 結果を
     /// 素朴に比較する方式は環境依存の誤判定を生みやすく採らない。範囲外として
     /// `server.rs` モジュール doc に明記する）。
-    fn validate_parent_dir(path: &Path, effective_uid: u32) -> Result<(), IoError> {
+    pub(super) fn validate_parent_dir(path: &Path, effective_uid: u32) -> Result<(), IoError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -2002,15 +2045,35 @@ mod imp {
 
     pub(super) struct ConnectionInner {
         stream: UnixStream,
+        /// この側が受信してよいフレーム種別の判定（確保前に方向違いを拒否する。IO-1・
+        /// REPAIR-2）。サーバー側は [`reject_client_originated_response_frame`]、クライアント側
+        /// （[`crate::uds_client::UdsClientConnection`]。#3165）は
+        /// `crate::vsock::reject_server_originated_request_frame`。
+        accept_kind: fn(FrameKind) -> Result<(), IoError>,
     }
 
     impl ConnectionInner {
+        /// 接続済みの `stream`（blocking）からクライアント側の接続を作る（#3165）。
+        pub(super) fn for_client(
+            stream: UnixStream,
+            accept_kind: fn(FrameKind) -> Result<(), IoError>,
+        ) -> Self {
+            Self {
+                stream,
+                accept_kind,
+            }
+        }
+
         /// fd を複製して分割後の受信側用の `ConnectionInner` を作る（#1118）。
         /// `O_NONBLOCK` は複製間で共有される点は上位モジュール doc「分割」節参照。
         pub(super) fn try_clone(&self) -> Result<Self, IoError> {
+            let accept_kind = self.accept_kind;
             self.stream
                 .try_clone()
-                .map(|stream| Self { stream })
+                .map(|stream| Self {
+                    stream,
+                    accept_kind,
+                })
                 .map_err(map_io_error)
         }
 
@@ -2085,12 +2148,7 @@ mod imp {
             timeout: IoTimeout,
             limits: ReceiveLimits,
         ) -> super::RecvAttempt {
-            recv_frame_on(
-                &mut self.stream,
-                timeout,
-                limits,
-                reject_client_originated_response_frame,
-            )
+            recv_frame_on(&mut self.stream, timeout, limits, self.accept_kind)
         }
     }
 

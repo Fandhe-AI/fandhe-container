@@ -268,6 +268,12 @@ pub(crate) fn socket_type(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
 /// 接続時の相手（`socketpair` では作成者自身）の pid（`SO_PEERCRED`）。pid は読み手の PID namespace へ
 /// 変換された値。holder が「親 = ソケット対の作成者」を確かめるために使う（12.2・REPAIR-5）。
 pub(crate) fn peer_pid(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+    peer_cred(fd).map(|(pid, _)| pid)
+}
+
+/// 接続時の相手の (pid, uid)（`SO_PEERCRED`）。pid は読み手の PID namespace へ変換された値。
+/// DNS ヘルパーの制御 UDS が、接続してきた相手の uid を照合する（PLUG-12・#3071）のにも使う。
+pub(crate) fn peer_cred(fd: BorrowedFd<'_>) -> Result<(u32, u32), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
@@ -294,7 +300,8 @@ pub(crate) fn peer_pid(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
     if len as usize != core::mem::size_of::<Ucred>() {
         return Err(SysError::Os(super::EINVAL));
     }
-    u32::try_from(cred.pid).map_err(|_| SysError::Os(super::EINVAL))
+    let pid = u32::try_from(cred.pid).map_err(|_| SysError::Os(super::EINVAL))?;
+    Ok((pid, cred.uid))
 }
 
 /// 1 通の受信結果。
@@ -689,6 +696,10 @@ mod tests {
             SysError::Os(super::super::EAGAIN)
         );
         assert_eq!(peer_pid(b.as_fd()).expect("peer"), std::process::id());
+        assert_eq!(
+            peer_cred(b.as_fd()).expect("peer cred"),
+            (std::process::id(), super::super::effective_uid())
+        );
     }
 }
 

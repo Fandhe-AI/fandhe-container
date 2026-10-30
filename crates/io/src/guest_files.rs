@@ -251,8 +251,19 @@ impl CreateFailure {
         }
     }
 
-    /// 要求単位に分類できない失敗（接続全体の失敗側）。
-    fn unclassified(error: IoError) -> Self {
+    /// 1 接続が持てる番兵 fd のデバイス数の上限に達した拒否（F9・F11。reason `DeviceLimit`、
+    /// code は `ResourceExhausted`）。`pre_mutation` コールバックが何も作る前に返す（#3164）。
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "番兵 fd は Linux だけ")
+    )]
+    pub(crate) fn device_limit(error: IoError) -> Self {
+        Self::with(error, NackReason::DeviceLimit)
+    }
+
+    /// 要求単位に分類できない失敗（接続全体の失敗側）。`pre_mutation` コールバックが
+    /// 内部の失敗を返すためにも使う（#3164）。
+    pub(crate) fn unclassified(error: IoError) -> Self {
         Self {
             error,
             reason: None,
@@ -364,17 +375,23 @@ impl GuestFileCreator {
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
         // ホストパス長の警告は公開 API では捨てる（観測への配線は file_serve が行う。#3163）。
-        self.create_file_inner(guest_path)
+        self.create_file_inner(guest_path, &mut |_| Ok(()))
             .map(|created| created.sink)
             .map_err(|failure| failure.error)
     }
 
     /// [`Self::create_file`] の本体。警告と拒否理由 reason を保って返す（F5・F10・
-    /// #3160）。#3163 の `serve_file_connection` が呼ぶ。#3164 が番兵 fd 用の
-    /// `pre_mutation` コールバック（と `mode`）を引数へ足す。
+    /// #3160）。`serve_file_connection` が呼ぶ。
+    ///
+    /// `pre_mutation` は、構文検証・ホストパス長・衝突検査を通り、最初の `mkdir` またはファイル
+    /// 作成を行う直前に 1 回だけ呼ぶ。引数は「存在する最も深い祖先」（新設が要らなければ葉の親）の
+    /// ハンドルで、`serve_file_connection` が FLUSH 用の番兵 fd（F9。IO-2）をここで開く。
+    /// 失敗したら何も作らずにその失敗を返す。設計の `mode` 引数は、ワイヤーの Create に mode が
+    /// 無いため足していない（#3164）。
     pub(crate) fn create_file_inner(
         &self,
         guest_path: &str,
+        pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
     ) -> Result<CreatedGuestFile, CreateFailure> {
         // ロックと走査の前に構文検証を済ませる（OS 非依存の規則は GuestPath に集約。
         // F5・#3159。受理した各コンポーネントはどの OS でもホスト上でちょうど 1 個の
@@ -429,37 +446,44 @@ impl GuestFileCreator {
 
         #[cfg(test)]
         fault::run_hook(fault::Hook::BeforeCreate);
-        let created = match create_beneath(&self.root_dir, &self.base, ancestors, leaf) {
-            Ok(created) => created,
-            Err(CreateError::Exists) => {
-                return Err(CreateFailure::with(
-                    IoError::new(
-                        IoErrorCode::AlreadyExists,
-                        format!(
-                            "guest file already exists: {}",
-                            quote_for_message(guest_path)
+        let created =
+            match create_beneath(&self.root_dir, &self.base, ancestors, leaf, pre_mutation) {
+                Ok(created) => created,
+                Err(CreateError::Exists) => {
+                    return Err(CreateFailure::with(
+                        IoError::new(
+                            IoErrorCode::AlreadyExists,
+                            format!(
+                                "guest file already exists: {}",
+                                quote_for_message(guest_path)
+                            ),
                         ),
-                    ),
-                    NackReason::Exists,
-                ));
-            }
-            Err(CreateError::ExistsAs(existing)) => {
-                // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
-                // ホストが既存として拒否した。衝突として返す。
-                let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
-                return Err(CreateFailure::collision(
-                    collision_kind(leaf, &existing),
-                    collision_error(guest_path, &format!("{prefix}{existing}"), leaf, &existing),
-                ));
-            }
-            Err(CreateError::NotADirectory(err)) => {
-                return Err(CreateFailure::with(err, NackReason::NotADirectory));
-            }
-            Err(CreateError::EscapesRoot(err)) => {
-                return Err(CreateFailure::with(err, NackReason::EscapesRoot));
-            }
-            Err(CreateError::Other(err)) => return Err(CreateFailure::from_io(err)),
-        };
+                        NackReason::Exists,
+                    ));
+                }
+                Err(CreateError::ExistsAs(existing)) => {
+                    // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
+                    // ホストが既存として拒否した。衝突として返す。
+                    let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
+                    return Err(CreateFailure::collision(
+                        collision_kind(leaf, &existing),
+                        collision_error(
+                            guest_path,
+                            &format!("{prefix}{existing}"),
+                            leaf,
+                            &existing,
+                        ),
+                    ));
+                }
+                Err(CreateError::NotADirectory(err)) => {
+                    return Err(CreateFailure::with(err, NackReason::NotADirectory));
+                }
+                Err(CreateError::EscapesRoot(err)) => {
+                    return Err(CreateFailure::with(err, NackReason::EscapesRoot));
+                }
+                Err(CreateError::Other(err)) => return Err(CreateFailure::from_io(err)),
+                Err(CreateError::Callback(failure)) => return Err(failure),
+            };
         #[cfg(test)]
         fault::run_hook(fault::Hook::AfterCreate);
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
@@ -822,6 +846,8 @@ enum CreateError {
     NotADirectory(IoError),
     /// 構造化済みのその他のエラー。
     Other(IoError),
+    /// `pre_mutation` コールバックの失敗（何も作っていない。そのまま返す。#3164）。
+    Callback(CreateFailure),
 }
 
 /// 末端の作成が既存として失敗したとき、親ディレクトリ `parent` で実在する表記を
@@ -895,6 +921,7 @@ fn create_beneath(
     _root: &Path,
     ancestors: &[&str],
     leaf: &str,
+    pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
 ) -> Result<Created, CreateError> {
     use crate::sys::{BeneathError, DirMode, create_leaf_beneath, mkdir_beneath, open_dir_beneath};
 
@@ -920,7 +947,40 @@ fn create_beneath(
     let mut dirs = Vec::with_capacity(ancestors.len().saturating_add(1));
     dirs.push(root);
     let mut made = Vec::with_capacity(ancestors.len());
+
+    // 第 1 段（作成を伴わない）: 存在する最も深い祖先まで symlink 非追従で辿る。symlink や
+    // 非ディレクトリの祖先はここで（何も作る前に）拒否する。
     for name in ancestors {
+        let Some(parent) = dirs.last() else {
+            return Err(CreateError::Other(internal(
+                "failed to create guest file",
+                ErrorKind::Other,
+            )));
+        };
+        match open_dir_beneath(parent, name) {
+            Ok(dir) => {
+                made.push(false);
+                dirs.push(dir);
+            }
+            Err(BeneathError::Io(ErrorKind::NotFound)) => break,
+            Err(err) => return Err(map(err)),
+        }
+    }
+
+    // 最初の mkdir またはファイル作成の直前に 1 回だけ、存在する最も深い祖先を渡す
+    // （F9: 番兵 fd は書き込みより前に新しく開く）。失敗したら何も作っていない。
+    {
+        let Some(deepest) = dirs.last() else {
+            return Err(CreateError::Other(internal(
+                "failed to create guest file",
+                ErrorKind::Other,
+            )));
+        };
+        pre_mutation(deepest).map_err(CreateError::Callback)?;
+    }
+
+    // 第 2 段: 残りの祖先を作って開く。
+    for name in ancestors.iter().skip(made.len()) {
         let Some(parent) = dirs.last() else {
             return Err(CreateError::Other(internal(
                 "failed to create guest file",
@@ -1444,11 +1504,14 @@ fn restore_moved(
 /// ルート相対ハンドル作成への置き換えは後続。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(
-    _root_dir: &File,
+    root_dir: &File,
     root: &Path,
     ancestors: &[&str],
     leaf: &str,
+    pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
 ) -> Result<Created, CreateError> {
+    // 最初の作成の前に 1 回だけ呼ぶ（Windows のコールバックは番兵を持たず何もしない）。
+    pre_mutation(root_dir).map_err(CreateError::Callback)?;
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
@@ -2491,7 +2554,10 @@ mod tests {
     /// 失敗を (code, 分類した reason) に落とす。reason は発生源で付けた値で、
     /// エラー文言を照合しない（F10・#3160）。
     fn classified(c: &GuestFileCreator, path: &str) -> (IoErrorCode, Option<NackReason>) {
-        let failure = c.create_file_inner(path).err().expect("must fail");
+        let failure = c
+            .create_file_inner(path, &mut |_| Ok(()))
+            .err()
+            .expect("must fail");
         (failure.error.code(), classify_create_failure(&failure))
     }
 
@@ -2523,7 +2589,10 @@ mod tests {
         let t = Tmp::new();
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
         let guest = guest_path_for_host_length(c.root(), 260);
-        let created = c.create_file_inner(&guest).ok().expect("260 is allowed");
+        let created = c
+            .create_file_inner(&guest, &mut |_| Ok(()))
+            .ok()
+            .expect("260 is allowed");
         assert_eq!(created.host_path_warning, None);
     }
 
@@ -2534,7 +2603,10 @@ mod tests {
         let t = Tmp::new();
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
         let guest = guest_path_for_host_length(c.root(), 261);
-        let created = c.create_file_inner(&guest).ok().expect("warning only");
+        let created = c
+            .create_file_inner(&guest, &mut |_| Ok(()))
+            .ok()
+            .expect("warning only");
         let warning = created.host_path_warning.expect("warning");
         assert_eq!(warning.units(), 261);
         assert_eq!(warning.limit(), 260);
@@ -2696,5 +2768,97 @@ mod tests {
         let failure =
             CreateFailure::with(IoError::new(IoErrorCode::Internal, "x"), NackReason::Exists);
         assert_eq!(classify_create_failure(&failure), None);
+    }
+
+    /// F9: `pre_mutation` は最初の `mkdir` の前に、存在する最も深い祖先（ここではルート）で
+    /// 呼ばれる。コールバックの時点で新設する祖先はまだ存在しない。
+    #[cfg(unix)]
+    #[test]
+    fn io2_pre_mutation_runs_before_any_mkdir_with_deepest_existing_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        let mut calls = 0u32;
+        let mut seen_ino = 0u64;
+        let created = c
+            .create_file_inner("a/b/f", &mut |dir| {
+                calls += 1;
+                assert!(!root.join("a").exists(), "no directory may exist yet");
+                seen_ino = dir.metadata().expect("stat").ino();
+                Ok(())
+            })
+            .ok()
+            .expect("create");
+        drop(created);
+        assert_eq!(calls, 1);
+        assert_eq!(seen_ino, std::fs::metadata(&t.0).expect("root").ino());
+        assert!(t.0.join("a/b/f").is_file());
+
+        // 祖先 `a` が既にあるときは `a` が渡される。
+        std::fs::create_dir(t.0.join("x")).expect("x");
+        let mut seen_ino = 0u64;
+        c.create_file_inner("x/y/g", &mut |dir| {
+            seen_ino = dir.metadata().expect("stat").ino();
+            assert!(!root.join("x/y").exists());
+            Ok(())
+        })
+        .ok()
+        .expect("create");
+        assert_eq!(seen_ino, std::fs::metadata(t.0.join("x")).expect("x").ino());
+
+        // 新設が要らない（葉の親が既にある）ときは葉の親が渡される。
+        let mut seen_ino = 0u64;
+        c.create_file_inner("x/h", &mut |dir| {
+            seen_ino = dir.metadata().expect("stat").ino();
+            Ok(())
+        })
+        .ok()
+        .expect("create");
+        assert_eq!(seen_ino, std::fs::metadata(t.0.join("x")).expect("x").ino());
+    }
+
+    /// コールバックが失敗したら何も作らず、その失敗（reason `DeviceLimit`）をそのまま返す。
+    #[test]
+    fn io2_pre_mutation_failure_creates_nothing_and_keeps_reason() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let failure = c
+            .create_file_inner("a/b/f", &mut |_| {
+                Err(CreateFailure::device_limit(IoError::new(
+                    IoErrorCode::ResourceExhausted,
+                    "too many devices",
+                )))
+            })
+            .err()
+            .expect("must fail");
+        assert_eq!(
+            classify_create_failure(&failure),
+            Some(NackReason::DeviceLimit)
+        );
+        assert!(!t.0.join("a").exists());
+    }
+
+    /// symlink の祖先は、コールバックの前に（何も作らず）拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn io2_pre_mutation_is_not_called_for_symlink_ancestor() {
+        let t = Tmp::new();
+        let outside = Tmp::new();
+        std::os::unix::fs::symlink(&outside.0, t.0.join("link")).expect("symlink");
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let mut calls = 0u32;
+        let failure = c
+            .create_file_inner("link/x", &mut |_| {
+                calls += 1;
+                Ok(())
+            })
+            .err()
+            .expect("must fail");
+        assert_eq!(calls, 0);
+        assert_eq!(
+            classify_create_failure(&failure),
+            Some(NackReason::EscapesRoot)
+        );
     }
 }

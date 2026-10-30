@@ -10,8 +10,10 @@
 //! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
-//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
-//! [`client::PipelineClient`] との本番結合・named pipe はまだない
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` は
+//! [`uds_client::UdsClientConnection`]（#3165。期限つき connect と接続先 uid の照合）で実装済み。
+//! [`client::PipelineClient`] の型つき API との UDS 越しの結合は整合性スイート
+//! （`tests/consistency/uds_file_ops.rs`。#3166）で確認済み。named pipe はまだない
 //! （REPAIR-3。スタブの明示）。vsock は Linux（x86_64 / aarch64）のサーバー側・クライアント側を
 //! [`vsock`] が実装済み（#1119。macOS の Virtualization.framework・Windows の hvsock は
 //! 未実装で `Unimplemented`）。1 本の接続を送信側・受信側へ分けて並行に使う API は
@@ -56,7 +58,7 @@
 //! ワイヤー形式は変えないサーバー側 API。ワイヤー上の作成要求は v2 の符号化と復号
 //! [`payload::encode_create`] 等が #3161 で、クライアント API
 //! 〔[`client::PipelineClient::create`]〕が #3162 で、サーバーの処理
-//! [`file_serve::serve_file_connection`] が #3163 で実装済み。永続化〔#3164〕は未実装〔REPAIR-3〕）
+//! [`file_serve::serve_file_connection`] が #3163 で、FLUSH の多ファイル化と IO-10 の自動フラッシュが #3164 で実装済み）
 //! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
 //! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
 //! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
@@ -99,6 +101,7 @@ mod sys;
 #[path = "sys/windows.rs"]
 mod sys_windows;
 pub mod transport;
+pub mod uds_client;
 pub mod vsock;
 pub mod writeback;
 
@@ -118,9 +121,10 @@ pub use client::{
 };
 pub use error::{IoError, IoErrorCode, MAX_IO_ERROR_MESSAGE_BYTES};
 pub use file_serve::{
-    DEFAULT_MAX_OPEN_FILES, FileServeLimits, FileServeReport, FileServeStats, MAX_MAX_OPEN_FILES,
-    MaxOpenFiles, NackReasonCounts, serve_file_connection, serve_file_connection_with_limit,
-    serve_file_connection_with_recorder,
+    DEFAULT_MAX_OPEN_FILES, DEFAULT_MAX_RETAINED_DIRTY_FILES, FileServeLimits, FileServeReport,
+    FileServeStats, MAX_MAX_OPEN_FILES, MAX_MAX_RETAINED_DIRTY_FILES, MaxOpenFiles,
+    MaxRetainedDirtyFiles, NackReasonCounts, serve_file_connection,
+    serve_file_connection_with_limit, serve_file_connection_with_recorder,
 };
 pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
@@ -155,7 +159,8 @@ pub use protocol::{
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
 pub use recv_limits::{
-    AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
+    AdmittedHeader, MAX_CLIENT_RESPONSE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD_LEN,
+    MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
 pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
@@ -168,6 +173,7 @@ pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
     WireFrame,
 };
+pub use uds_client::{UdsClientConnection, UdsServerPolicy};
 pub use vsock::{
     VsockAddr, VsockConnection, VsockPeerPolicy, VsockRecvHalf, VsockSendHalf, VsockServer,
 };

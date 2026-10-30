@@ -10,10 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use fandhe_container_net::dns_helper::control::frame::{
+    ControlFrame, ControlMessage, ReloadGeneration,
+};
+use fandhe_container_net::dns_helper::control::{
+    ControlStopRequest, ReloadOutcome, reload_dns_helper,
+};
 use fandhe_container_net::dns_helper::detach::{
-    ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DnsHelperStopRequest,
-    IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome, StopOutcome,
-    recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
+    ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
+    DnsHelperStopRequest, IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome,
+    StopOutcome, recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
 };
 use fandhe_container_net::dns_helper::identity::read_identity;
 use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
@@ -22,8 +28,11 @@ use fandhe_container_net::error::NetErrorCode;
 use fandhe_container_net::instrument::{
     NetOpKind, NetOpOutcome, NetOpRecorder, NetOpSample, NoopNetOpRecorder,
 };
-use fandhe_container_net::network::NetworkName;
-use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+use fandhe_container_net::netlink_route::IpPrefix;
+use fandhe_container_net::network::{EndpointId, NetworkName};
+use fandhe_container_net::network_store::{
+    MemberId, MemberRecord, NetworkDefinition, NetworkStore,
+};
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -69,21 +78,50 @@ fn gone(pid: u32) -> bool {
     false
 }
 
-fn notimp(target: std::net::SocketAddrV4) -> bool {
+/// 切り離し起動のヘルパーが DNS クエリに応答するか（名前の経路を持つので、未登録の名前には REFUSED を返す。#3071）。
+fn answers(target: std::net::SocketAddrV4) -> bool {
+    matches!(
+        query_a(target, "example.com").map(|r| r.get(..4).map(<[u8]>::to_vec)),
+        Some(Some(h)) if h == [0xAB, 0xCD, 0x81, 0x05]
+    )
+}
+
+/// 制御 UDS へ期限つきで接続する（REPAIR-5）。`UnixStream::connect` は listener の backlog が満杯だと
+/// 無期限にブロックし、直後の `set_read_timeout` は効かないため、別スレッドで接続して受け取りを待つ。
+/// 期限切れのときは Err を返す（接続スレッドは置き去りになるが、呼び出し側が相手を回収して試験を落とす）。
+fn connect_within(path: &Path, within: Duration) -> Result<std::os::unix::net::UnixStream, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(&path));
+    });
+    match rx.recv_timeout(within) {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("connect failed: {e}")),
+        Err(e) => Err(format!("connect did not complete within {within:?}: {e}")),
+    }
+}
+
+/// `name` の A クエリ（ID 0xABCD）を送り、最初に届いた応答のバイト列を返す（届かなければ None）。
+fn query_a(target: std::net::SocketAddrV4, name: &str) -> Option<Vec<u8>> {
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
     client
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("timeout");
     let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-    q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+    for label in name.split('.') {
+        q.push(u8::try_from(label.len()).expect("label len"));
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.extend_from_slice(&[0, 0, 1, 0, 1]);
     let mut buf = [0u8; 600];
     for _ in 0..20 {
         client.send_to(&q, target).expect("send");
         if let Ok((n, _)) = client.recv_from(&mut buf) {
-            return buf.get(..n) == Some(&[0xAB, 0xCD, 0x81, 0x04, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+            return buf.get(..n).map(<[u8]>::to_vec);
         }
     }
-    false
+    None
 }
 
 /// 試験用の停止要求: SIGTERM（既定動作で終了する）を `kill` コマンドで送り、要求を送ったことにする。
@@ -134,6 +172,7 @@ pub fn run(exe: &Path) {
     stopped_stage2_is_reaped(exe);
     spawn_write_count(exe);
     launcher_killed_after_spawn_line(exe);
+    control_reload(exe);
 }
 
 /// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
@@ -158,7 +197,7 @@ fn lifecycle(exe: &Path) {
     assert_eq!(rec.identity(), &h.identity);
     assert_eq!(&read_identity(pid).expect("identity"), rec.identity());
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
-    assert!(notimp(h.listen), "detached helper must answer");
+    assert!(answers(h.listen), "detached helper must answer");
 
     // 二重起動はしない。
     let e = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
@@ -176,7 +215,7 @@ fn lifecycle(exe: &Path) {
         StopOutcome::StaleRecord
     );
     assert_eq!(n.read_dns_helper().expect("read"), None);
-    assert!(notimp(h.listen), "a stale record must not stop the helper");
+    assert!(answers(h.listen), "a stale record must not stop the helper");
 
     // 正しい記録で停止（制御 UDS が無いので SIGKILL の段）。
     n.write_dns_helper(&rec).expect("write");
@@ -229,6 +268,10 @@ fn ack_timeout(exe: &Path) {
             "127.0.0.1:0",
             ARG_NONCE,
             nonce.as_str(),
+            ARG_STATE_ROOT,
+            "/nonexistent-fandhe-state-root",
+            ARG_NETWORK,
+            "dnsh",
         ])
         .env_clear()
         .stdin(Stdio::piped())
@@ -307,7 +350,7 @@ fn recover_intent(exe: &Path) {
         IntentRecovery::IntentDiscarded
     );
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
-    assert!(notimp(h.listen), "a confirmed record must keep the helper");
+    assert!(answers(h.listen), "a confirmed record must keep the helper");
 
     // 確定記録を外す（起動窓で記録が無い状態）。
     n.remove_dns_helper().expect("rm");
@@ -321,7 +364,7 @@ fn recover_intent(exe: &Path) {
         IntentRecovery::Recovered { stopped: 0 }
     );
     assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
-    assert!(notimp(h.listen), "a different nonce must not be stopped");
+    assert!(answers(h.listen), "a different nonce must not be stopped");
 
     // 候補の上限を超えたら走査を終えていないので意図記録を保持する。
     n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
@@ -331,7 +374,7 @@ fn recover_intent(exe: &Path) {
     assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
     assert!(n.read_dns_helper_intent().expect("intent").is_some());
     assert!(
-        notimp(h.listen),
+        answers(h.listen),
         "an incomplete scan must not stop anything"
     );
 
@@ -350,7 +393,7 @@ fn recover_intent(exe: &Path) {
             .expect("recover"),
         IntentRecovery::Recovered { stopped: 0 }
     );
-    assert!(notimp(h.listen), "a reused pid must not be stopped");
+    assert!(answers(h.listen), "a reused pid must not be stopped");
     n.write_dns_helper_intent(
         &intent_of(rec.nonce().clone())
             .with_identity(h.identity.clone())
@@ -769,4 +812,356 @@ fn launcher_killed_after_spawn_line(exe: &Path) {
     eprintln!(
         "dns_helper_process: launcher_killed_after_spawn_line ok launcher_signal=9 stage2_state=T recovered_stopped=1 intent_after=none record_after=none"
     );
+}
+
+/// ネットワーク `dnsh` のメンバー記録（ID = コンテナ ID が DNS 名になる。10.89.0.`last`/24）。
+fn member(id: &str, last: u8) -> MemberRecord {
+    let token = format!("fandhe-net:dnsh:1:0:0/ep/{id}/g/00000000000000000000000000000001");
+    MemberRecord::new(
+        MemberId::new(id).expect("member id"),
+        EndpointId::new(id).expect("endpoint"),
+        IpPrefix::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), 24).expect("prefix"),
+        &token,
+        Path::new("/run/fc-test-ns"),
+        (8, 9),
+        &[],
+    )
+    .expect("member record")
+}
+
+/// A 応答の RCODE。
+fn rcode(resp: &[u8]) -> Option<u8> {
+    resp.get(3).map(|b| b & 0x0f)
+}
+
+/// 名前の A 応答のアドレス（NOERROR で answer 1 件のときだけ）。
+fn a_record(target: std::net::SocketAddrV4, name: &str) -> Option<Ipv4Addr> {
+    let r = query_a(target, name)?;
+    if rcode(&r) != Some(0) || r.get(7) != Some(&1) {
+        return None;
+    }
+    let tail: [u8; 4] = r.get(r.len().checked_sub(4)?..)?.try_into().ok()?;
+    Some(Ipv4Addr::from(tail))
+}
+
+/// 制御 UDS: 起動時の読み込み・`Reload` の ack・壊れた記録でも前の状態を保つ・メンバー削除の反映・
+/// `Stop` による停止と socket の後始末・残った socket の起動時の除去（NET-5・PLUG-12・REPAIR-5・#3071）。
+fn control_reload(exe: &Path) {
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+    let tmp = Tmp::new("ctl");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+
+    // ヘルパーが居なければ送るものがない。
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::NotRunning
+    );
+
+    // 起動前に書いたメンバーは、起動時の初回読み込みで答える。`_` を含む ID は DNS 名にできず登録されない。
+    n.commit_member(&member("web", 2)).expect("web");
+    n.commit_member(&member("my_app", 9)).expect("my_app");
+    // 前回の残りの制御 socket（listener は無い）は起動時に消される。
+    drop(std::os::unix::net::UnixListener::bind(&ctl).expect("stale socket"));
+    assert!(ctl.exists());
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let meta = std::fs::symlink_metadata(&ctl).expect("ctl");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(a_record(h.listen, "web"), Some(Ipv4Addr::new(10, 89, 0, 2)));
+    assert_eq!(rcode(&query_a(h.listen, "my_app").expect("resp")), Some(5));
+
+    // Reload: 追加したメンバーが引けるようになる（ack の後に答える）。
+    n.commit_member(&member("db", 3)).expect("db");
+    let t = Instant::now();
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+    assert_eq!(a_record(h.listen, "web"), Some(Ipv4Addr::new(10, 89, 0, 2)));
+
+    // 壊れた記録があれば Reload は失敗し、前のレジストリは保たれる。
+    let junk = tmp.0.join("@networks/dnsh/members/zz");
+    std::fs::write(&junk, b"junk").expect("junk");
+    std::fs::set_permissions(&junk, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let e = reload_dns_helper(&n, &NoopNetOpRecorder).expect_err("corrupt");
+    assert_eq!(e.code(), NetErrorCode::DataLoss);
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+    std::fs::remove_file(&junk).expect("rm junk");
+
+    // メンバーを消して Reload すると、その名前は引けなくなる（REFUSED）。
+    assert!(
+        n.remove_member(&MemberId::new("web").expect("id"))
+            .expect("rm")
+    );
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    assert_eq!(rcode(&query_a(h.listen, "web").expect("resp")), Some(5));
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+
+    // 実在しない世代の Loaded を返さない相手（生のフレームで Reload を直接送る）への応答は同じ世代。
+    let raw = connect_within(&ctl, Duration::from_secs(10)).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("t");
+    let gen_ = ReloadGeneration::new(0xFEED).expect("gen");
+    let mut w = &raw;
+    ControlFrame::encode(ControlMessage::Reload(gen_))
+        .write_to(&mut w)
+        .expect("write");
+    let mut r = &raw;
+    assert_eq!(
+        ControlFrame::read_from(&mut r).expect("loaded"),
+        ControlMessage::Loaded(gen_)
+    );
+    drop(raw);
+
+    // Stop: 猶予内に自分で終了し、socket と記録が消える。
+    let t = Instant::now();
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &ControlStopRequest::new(&n), &NoopNetOpRecorder)
+            .expect("stop"),
+        StopOutcome::StoppedOnRequest
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "must finish within the grace"
+    );
+    assert!(gone(h.identity.pid));
+    assert!(!ctl.exists(), "the control socket must be removed");
+    assert_eq!(n.read_dns_helper().expect("read"), None);
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::NotRunning
+    );
+    drop(n);
+    drop(g);
+    println!("dns_helper_process: control_reload ok registered=db refused=web stop=on_request");
+}
+
+/// 実機前提（`--ignored`・root と util-linux の `setpriv`）: 別 uid の接続は、フレームを読まれずに切断される
+/// （PLUG-12・NET-5・#3071）。
+///
+/// 非 root（uid 65534）の子にストアとヘルパーを作らせ、root の親が DAC を越えて `dns.ctl` へ接続して `Reload` を送る。
+/// `Loaded` も `Error` も返らず切断され、その後も同じ uid からの `Reload` は成功し、`Stop` で止まる。
+/// root でない・`setpriv` が無い場合は fail-closed に panic（非ゼロ終了）する。明示実行（`--ignored`）で前提未達を
+/// 成功として通さない（AGENTS.md に実行方法・REPAIR-12）。
+pub fn foreign_uid(exe: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let uid_line = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .unwrap_or_default();
+    let is_root = uid_line.split_whitespace().nth(2) == Some("0");
+    let have_setpriv = crate::reap::run_within(
+        Command::new("setpriv")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        crate::reap::reap_within(),
+    )
+    .is_ok_and(|s| s.success());
+    assert!(
+        is_root && have_setpriv,
+        "dns_helper_process: control_foreign_uid precondition failed (needs root and setpriv: root={is_root} setpriv={have_setpriv})"
+    );
+    let tmp = Tmp::new("foreign");
+    let nobody = 65534u32;
+    std::os::unix::fs::chown(&tmp.0, Some(nobody), Some(nobody)).expect("chown tmp");
+    // 子（uid 65534）が実行できるよう、試験バイナリを複製する。複製先は root 所有で他 uid が変更できない別ディレクトリにし、
+    // uid 65534 に渡した状態ディレクトリとは分ける（同 uid による symlink 差し替えで root のファイル操作を
+    // 誘導されない。他 uid へ渡したディレクトリ内で root はファイル操作をしない）。
+    let bindir = Tmp::new("foreign-bin");
+    std::fs::set_permissions(&bindir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let bin = bindir.0.join("test-bin");
+    std::fs::copy(exe, &bin).expect("copy exe");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut child = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(&bin)
+        .arg(ARG_FOREIGN_UID_CHILD)
+        .arg(&tmp.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn child");
+    let mut stdin = child.stdin.take().expect("stdin");
+    // 子の標準出力は読み手スレッド経由で受け、待ちには期限を付ける（REPAIR-5）。期限切れは子とヘルパーを回収して失敗。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let child_out = child.stdout.take().expect("stdout");
+    std::thread::spawn(move || {
+        let mut out = BufReader::new(child_out);
+        loop {
+            let mut l = String::new();
+            match out.read_line(&mut l) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if tx.send(l).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let within = crate::reap::reap_within();
+    let helper = std::cell::Cell::new(None::<(u32, u64)>);
+    let recv_line = |child: &mut std::process::Child, what: &str| -> String {
+        match rx.recv_timeout(within) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(id) = helper.get() {
+                    kill_helper_if_same(id);
+                }
+                crate::reap::reap_or_report(child, within);
+                panic!("no {what} line from the foreign-uid child within {within:?}: {e}");
+            }
+        }
+    };
+    let line = recv_line(&mut child, "CHILD-READY");
+    // 子がヘルパーの同一性（pid・開始時刻）を知らせる。後始末の帰属確認に使う。
+    let helper_id = {
+        let mut it = line.split_whitespace();
+        assert_eq!(
+            it.next(),
+            Some("CHILD-READY"),
+            "child did not start the helper"
+        );
+        let pid = it
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("helper pid");
+        let start = it
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("helper start");
+        (pid, start)
+    };
+    helper.set(Some(helper_id));
+
+    // root は DAC を越えて接続できるが、ヘルパーは uid 不一致として読まずに切断する。
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+    let raw = match connect_within(&ctl, within) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("root connect to the helper control socket: {e}");
+        }
+    };
+    raw.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("t");
+    let mut w = &raw;
+    let _ = ControlFrame::encode(ControlMessage::Reload(
+        ReloadGeneration::new(1).expect("gen"),
+    ))
+    .write_to(&mut w);
+    let mut r = &raw;
+    let mut one = [0u8; 1];
+    // 許すのは EOF と接続の切断だけ。WouldBlock / TimedOut（読み取り期限切れ）は切断されなかった証拠なので失敗（PLUG-12）。
+    match r.read(&mut one) {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Ok(_) => panic!("a foreign uid must not receive any frame"),
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign uid read was not a disconnect: {e:?}");
+        }
+    }
+    drop(raw);
+
+    // 同じ uid（子）からの Reload は成功し、Stop で止まる。
+    std::io::Write::write_all(&mut stdin, b"go\n").expect("go");
+    drop(stdin);
+    for want in ["CHILD-RELOADED", "CHILD-STOPPED"] {
+        let line = recv_line(&mut child, want);
+        assert_eq!(line.trim(), want);
+    }
+    let status = match crate::reap::wait_within(&mut child, within) {
+        Ok(st) => st,
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign-uid child did not exit: {e}");
+        }
+    };
+    assert!(status.success(), "child failed: {status:?}");
+    println!("dns_helper_process: control_foreign_uid ok peer_uid=65534 foreign=dropped");
+}
+
+/// 期限切れ時の回収。子が知らせたヘルパーの同一性（pid・開始時刻）と、実 uid が 65534 であることを確かめてから
+/// `kill -KILL` する（cmdline の部分文字列では選ばない。別プロセスや root のプロセスを止めない）。確認から kill までの
+/// pid 再利用の窓は残るが、開始時刻と uid の両方が一致する必要がある。外部 `kill` は期限つき実行。
+fn kill_helper_if_same((pid, start): (u32, u64)) {
+    let same_start = read_identity(pid).is_ok_and(|id| id.start_time_ticks == start);
+    let nobody_owned = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .is_some_and(|l| l.split_whitespace().nth(1) == Some("65534"));
+    if same_start && nobody_owned {
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", &pid.to_string()]);
+        let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+    } else {
+        eprintln!("kill helper: pid {pid} not attributed; not killing");
+    }
+}
+
+/// `foreign_uid` の子の引数。
+pub const ARG_FOREIGN_UID_CHILD: &str = "--foreign-uid-child";
+
+/// `foreign_uid` の子（uid 65534）。ストアとヘルパーを作り、親の合図の後に Reload と Stop を行う。
+pub fn foreign_uid_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let Some(root) = args.get(2) else {
+        eprintln!("foreign_uid_child: usage: --foreign-uid-child <state_root>");
+        return std::process::ExitCode::from(2);
+    };
+    let exe = std::env::current_exe().expect("exe");
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    store
+        .create(&NetworkDefinition::pasta("dnsh").expect("def"))
+        .expect("create");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    n.commit_member(&member("web", 2)).expect("web");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, &exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    println!(
+        "CHILD-READY {} {}",
+        h.identity.pid, h.identity.start_time_ticks
+    );
+    let mut go = String::new();
+    std::io::stdin().read_line(&mut go).expect("go");
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    println!("CHILD-RELOADED");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &ControlStopRequest::new(&n), &NoopNetOpRecorder)
+            .expect("stop"),
+        StopOutcome::StoppedOnRequest
+    );
+    println!("CHILD-STOPPED");
+    std::process::ExitCode::SUCCESS
 }

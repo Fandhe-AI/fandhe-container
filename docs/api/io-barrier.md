@@ -66,13 +66,14 @@
 
 クライアント側では、`recv_ack` が送信順（FIFO）で照合するため、FLUSH ACK はそれ以前の書き込みの通常 ACK をすべて受け取った後に届く。`PipelineClient::flush` が返す `FlushBarrier` と `FlushAck::barrier()` を突き合わせ、待っていたバリアの ACK かを確認する。
 
-### ファイル操作接続での ACK・Nack・FLUSH ACK（設計確定・クライアント側は実装済み・サーバー側は未実装）
+### ファイル操作接続での ACK・Nack・FLUSH ACK（実装済み）
 
-ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`）を受けるファイル操作接続は設計が確定している。クライアント側（`PipelineClient::create`・`write_file`・`close` と、`recv_ack` による Nack の `AckReceipt::Rejected` としての受信）は #3162 で実装済みで、サーバー側（#3163）・UDS `connect`（#3165）・FLUSH の多ファイル化（#3164）は未実装である（#1886・実装は #3158 配下。REPAIR-3）。設計の詳細は [io-protocol.md](../design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節を参照。この接続での契約は次のとおり。
+ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`）を受けるファイル操作接続は設計が確定している。クライアント側（`PipelineClient::create`・`write_file`・`close` と、`recv_ack` による Nack の `AckReceipt::Rejected` としての受信）は #3162 で実装済みで、サーバー側（#3163）と FLUSH の多ファイル化・IO-10 の自動フラッシュ（#3164）は実装済みで、UDS `connect`（#3165）も実装済みである。UDS 越しの結合は整合性スイート（`crates/io/tests/consistency/uds_file_ops.rs`。#3166・IO-4）で確かめている（#1886・実装は #3158 配下）。設計の詳細は [io-protocol.md](../design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節を参照。この接続での契約は次のとおり。
 
 - 通常 ACK は従来と同じ「バッファリング時点」の保証で、永続化は保証しない。Create の ACK はファイルが名前空間に存在することまでを表す
 - 失敗した要求には `Nack`（code と reason の数値のみ。ホストのパスは返さない）が返り、接続は続く。Nack された要求は効果を持たない
 - FLUSH ACK の範囲は、**同じ接続で `Flush` より前に受信して `Ack` を返した要求のすべて**で、複数ファイルのデータ・メタデータと、作成したファイルおよび新設ディレクトリのディレクトリエントリを含む。別の接続・Nack された要求・`Flush` より後の要求は対象外
+- 未フラッシュ滞留量が IO-10 の上限に達したとき、または `Close` 済みで未永続化のファイルの保持数が `MaxRetainedDirtyFiles`（既定 1024・範囲 1〜4096）に達したときは、サーバーが自動フラッシュ（`FlushAck` を送らない永続化）を行って接続を続ける。クライアントは `FlushAck` の有無で永続化を判断し、自動フラッシュを永続化の確認として使わない
 - 接続全体の失敗（I/O エラー・persist の失敗・構造違反）では、応答を返さず接続を終える。クライアントには `Unavailable` に見え、未 ACK の要求の結果は不定になる
 
 ## 検証済みの範囲と未検証の範囲
@@ -111,7 +112,7 @@
 
 ## 利用例
 
-トランスポートは呼び出し側が用意する。送信（`send`・`flush`）には `FrameSender<Frame = Frame>` の実装があれば足りるが、ACK の受信（`recv_ack`）を使うには同じトランスポートが `FrameReceiver<Frame = Frame>` も実装している必要がある（両方を満たす型は `FrameTransport` として扱われる）。クライアント側の UDS `connect` は未実装である（REPAIR-3）。
+トランスポートは呼び出し側が用意する。送信（`send`・`flush`）には `FrameSender<Frame = Frame>` の実装があれば足りるが、ACK の受信（`recv_ack`）を使うには同じトランスポートが `FrameReceiver<Frame = Frame>` も実装している必要がある（両方を満たす型は `FrameTransport` として扱われる）。UDS では `UdsClientConnection::connect`（#3165）が `FrameSender` と `FrameReceiver` の両方を実装する。
 
 ```rust,ignore
 use fandhe_container_io::barrier::{AckReceipt, FlushAck};
@@ -141,8 +142,7 @@ loop {
 
 - クライアント側での滞留量計測・自動 Flush 送出、`--unflushed-max-*` の CLI / TOML 配線（TASK-79・TASK-82）
 - クラッシュ安全性テスト（TASK-18）
-- クライアント側の UDS `connect` と `PipelineClient` の本番結合（設計確定済み。実装は #3165。型つき API は #3162 で実装済み）
-- ファイル操作接続のサーバー側と FLUSH の多ファイル化（設計確定済み。実装は #3163・#3164。ワイヤー形式は #3161、クライアント側は #3162 で実装済み）
+- ファイル操作モードの crash_safety・break_detection（#3167）
 - named pipe のトランスポート（範囲外。設計節 F12）
 - 電源断への耐性の検証（方式の判断記録: [io-power-loss-verification.md](../design/io-power-loss-verification.md)。オーナー承認待ち）
 

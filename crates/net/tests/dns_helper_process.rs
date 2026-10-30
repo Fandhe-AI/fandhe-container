@@ -106,7 +106,20 @@ fn main() -> std::process::ExitCode {
     {
         return detached::launcher_child(args);
     }
+    // root と `setpriv` が要る別 uid の場面（PLUG-12・#3071）は `--ignored` のときだけ実行する。
+    #[cfg(target_os = "linux")]
+    if args
+        .get(1)
+        .is_some_and(|a| a == detached::ARG_FOREIGN_UID_CHILD)
+    {
+        return detached::foreign_uid_child(args);
+    }
     let exe = std::env::current_exe().expect("current_exe");
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == "--ignored") {
+        detached::foreign_uid(&exe);
+        return std::process::ExitCode::SUCCESS;
+    }
     let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen addr");
 
     // 起動 -> READY 受理 -> 不正は無応答・正常は応答 -> 回収。

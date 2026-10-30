@@ -33,8 +33,9 @@
 //! `Write`・`Flush` 以外を [`SendOutcome::RejectedInvalidFrameKind`] で拒否する（F12）。
 //! [`PipelineClient::recv_ack`] は Create・WriteFile・Close への `Nack` を
 //! [`AckReceipt::Rejected`] として返し、接続は失効させない。`Write`・`Flush` への
-//! `Nack` と未知の code はプロトコル違反として失効させる。サーバー側（#3163）・UDS
-//! connect（#3165）・FLUSH の多ファイル化（#3164）は別 issue で未実装（REPAIR-3）。
+//! `Nack` と未知の code はプロトコル違反として失効させる。サーバー側（#3163）・FLUSH の多ファイル化（#3164）・UDS
+//! connect（`crate::uds_client::UdsClientConnection`。#3165）は実装済みで、本 API との UDS 越しの結合は
+//! 整合性スイート（`tests/consistency/uds_file_ops.rs`。#3166・IO-4）で確かめている。
 //!
 //! # #74（TASK-12.2）以降に残る範囲
 //!

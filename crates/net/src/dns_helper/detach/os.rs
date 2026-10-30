@@ -17,10 +17,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::{
-    ACK, ARG_DETACH, ARG_NONCE, ARG_STAGE2, DNS_HELPER_ACK_TIMEOUT, DNS_HELPER_KILL_REAP_TIMEOUT,
-    DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT, DNS_HELPER_STOP_GRACE,
-    DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX, MAX_RECOVERY_CANDIDATES,
-    RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage, run_stop_sequence,
+    ACK, ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
+    DNS_HELPER_KILL_REAP_TIMEOUT, DNS_HELPER_RECOVER_TIMEOUT, DNS_HELPER_STAGE1_EXIT_TIMEOUT,
+    DNS_HELPER_STOP_GRACE, DnsHelperStopRequest, HelperProcessOps, IDENT_LINE_MAX, IDENT_PREFIX,
+    MAX_RECOVERY_CANDIDATES, RequestOutcome, SPAWN_PREFIX, StopOutcome, StopStage,
+    run_stop_sequence,
 };
 use crate::dns_helper::identity::{
     self, BootId, ProcessIdentity, Verify, read_boot_id, read_identity, read_limited,
@@ -33,6 +34,7 @@ use crate::dns_helper::{
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, record_net_op};
+use crate::network::NetworkName;
 use crate::network_store::NetworkLockGuard;
 use crate::sys::{self, Deadline, Readiness, SysError, process};
 
@@ -134,7 +136,7 @@ impl HelperProcessOps for PidfdOps<'_> {
 /// 記録のヘルパーを停止する（ネットワークの排他ロックを持って呼ぶ）。
 ///
 /// 記録の pid から pidfd を先に取り、開始時刻と boot id を照合する。別のプロセスなら何も送らず記録を古いものとして
-/// 消す（[`StopOutcome::StaleRecord`]）。同一なら停止要求 → 猶予 → pidfd へ SIGKILL の順に進める。SIGKILL の後も
+/// 消す（制御 socket は終了を確認できないので保持する。[`StopOutcome::StaleRecord`]）。同一なら停止要求 → 猶予 → pidfd へ SIGKILL の順に進める。SIGKILL の後も
 /// 終了しなければ `Timeout` を返して記録を残す（次の操作で再試行できる）。`pidfd_open` が使えないカーネルでは
 /// 記録を残して `Unimplemented`。
 pub fn stop_recorded_dns_helper(
@@ -160,6 +162,8 @@ fn stop_inner(
     let pidfd = match open_pidfd(record.identity().pid) {
         Ok(fd) => fd,
         Err(e) if e.code() == NetErrorCode::NotFound => {
+            // 死んだヘルパーの制御ソケットは、記録を消す前に片付ける（記録が先に消えると socket だけが残る）。
+            guard.remove_dns_control_socket()?;
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::AlreadyGone);
         }
@@ -168,12 +172,16 @@ fn stop_inner(
     match verify_pidfd_target(pidfd.as_fd(), record.identity())? {
         Verify::Same => {}
         Verify::Different => {
+            // pid が別のプロセスに再利用されている。ただし同一性の不一致は記録の古さしか示さず、元のヘルパーの
+            // listener が死んだ根拠にならない（開始時刻の違う記録を渡されただけで生きたヘルパーの socket を
+            // 消すと Reload / Stop が届かなくなる）。終了を確認できないので制御 socket は消さず保持する。
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::StaleRecord);
         }
         Verify::Gone => {
             // subreaper の下では終了済みでもゾンビとして pidfd が開ける。記録を消す前に pidfd 経由で回収する。
             let _ = process::reap_pidfd_nohang(pidfd.as_fd());
+            guard.remove_dns_control_socket()?;
             guard.remove_dns_helper()?;
             return Ok(StopOutcome::AlreadyGone);
         }
@@ -189,6 +197,8 @@ fn stop_inner(
         DNS_HELPER_KILL_REAP_TIMEOUT,
     )?;
     let _ = process::reap_pidfd_nohang(ops.pidfd.as_fd());
+    // 終了を確認できた後で、制御ソケットと記録を消す（`Timeout` で上の `?` が返ったときは両方残す）。
+    guard.remove_dns_control_socket()?;
     guard.remove_dns_helper()?;
     Ok(match stage {
         StopStage::StoppedOnRequest => StopOutcome::StoppedOnRequest,
@@ -284,6 +294,11 @@ fn spawn_inner(
             "dns helper record already exists",
         ));
     }
+    // 記録も意図記録も無くても、`StaleRecord` の停止は記録だけを消して生きたヘルパーの socket を残す。listener の
+    // 不在を確認できたときだけ残骸として消す（生存・判定不能なら起動を拒否。socket でない・他の所有者のものも
+    // 消さずに失敗にする）。
+    guard.remove_dns_control_socket_if_no_listener()?;
+    let state_root = guard.state_root()?;
     let nonce = HelperNonce::generate()?;
     guard.write_dns_helper_intent(&DnsHelperIntent::new(
         guard.network().clone(),
@@ -297,6 +312,10 @@ fn spawn_inner(
         .arg(listen.to_string())
         .arg(ARG_NONCE)
         .arg(nonce.as_str())
+        .arg(ARG_STATE_ROOT)
+        .arg(state_root)
+        .arg(ARG_NETWORK)
+        .arg(guard.network().as_str())
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -759,7 +778,9 @@ fn fail_after_record(guard: &NetworkLockGuard<'_>, pidfd: BorrowedFd<'_>, e: Net
         return with_note(e, "dns helper could not be confirmed stopped; records kept");
     }
     let removed = guard
-        .remove_dns_helper()
+        .remove_dns_control_socket()
+        .map(|_| ())
+        .and_then(|()| guard.remove_dns_helper())
         .and_then(|()| guard.remove_dns_helper_intent());
     match removed {
         Ok(()) => e,
@@ -865,6 +886,13 @@ fn recover_inner(
             NetErrorCode::ResourceExhausted,
             "too many recovery candidates; intent record kept",
         ));
+    }
+    // 起動途中で止めたヘルパー（`stopped > 0`）が bind していた制御ソケットを片付ける。何も止めていないとき
+    // （子は ack の期限で bind せずに終了済み、または nonce が合わない別のプロセス）は触れない。`dns-helper` の
+    // 記録が別にあるときの socket はその生きたヘルパーのものなので消さない。bind 前に死んだ子の socket が
+    // 残っても、次の起動と `network rm` が消す。
+    if stopped > 0 && guard.read_dns_helper()?.is_none() {
+        guard.remove_dns_control_socket()?;
     }
     guard.remove_dns_helper_intent()?;
     Ok(IntentRecovery::Recovered { stopped })
@@ -985,7 +1013,12 @@ fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> Result<bool, NetError> {
 /// 段 1（`--dns-helper-detach`）の本体: 新しいセッションを作り、段 2 を起動して待たずに戻る。
 /// `setsid` に失敗したら（切り離せない）起動を続けず失敗にする（fail-closed）。段 2 は stdin・stdout を継承し、
 /// stderr を捨てる。
-pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(), NetError> {
+pub(crate) fn run_stage1(
+    listen: DnsListenAddr,
+    nonce: &HelperNonce,
+    state_root: &Path,
+    network: &NetworkName,
+) -> Result<(), NetError> {
     process::setsid().map_err(|_| err(NetErrorCode::Internal, "setsid failed"))?;
     let child = Command::new("/proc/self/exe")
         .arg(ARG_STAGE2)
@@ -993,6 +1026,10 @@ pub(crate) fn run_stage1(listen: DnsListenAddr, nonce: &HelperNonce) -> Result<(
         .arg(listen.to_string())
         .arg(ARG_NONCE)
         .arg(nonce.as_str())
+        .arg(ARG_STATE_ROOT)
+        .arg(state_root)
+        .arg(ARG_NETWORK)
+        .arg(network.as_str())
         .env_clear()
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

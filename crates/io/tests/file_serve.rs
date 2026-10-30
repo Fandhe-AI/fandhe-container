@@ -18,9 +18,10 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
-        BatchConfig, Frame, FrameHeader, FrameKind, GuestFileCreator, IoErrorCode, IoTimeout,
-        NackCode, NackReason, NoopServerObserver, ReceiveLimits, UdsServer, WritebackTimeouts,
-        decode_ack, decode_nack, serve_file_connection,
+        BatchConfig, FileServeLimits, Frame, FrameHeader, FrameKind, GuestFileCreator, IoErrorCode,
+        IoTimeout, MaxOpenFiles, NackCode, NackReason, NoopServerObserver, ReceiveLimits,
+        UdsServer, UnflushedLimit, WritebackTimeouts, decode_ack, decode_nack,
+        serve_file_connection, serve_file_connection_with_limit,
     };
 
     struct TempDir {
@@ -204,10 +205,12 @@ mod unix {
         assert_eq!(end, IoErrorCode::Unavailable);
     }
 
-    /// IO-2・REPAIR-3: この時点の Flush は Unimplemented で終わり、FlushAck は届かない（EOF になる）。
-    /// 滞留分の Ack は先に届く。
+    /// IO-2・F9: Flush は滞留分の Ack の後に永続化し、FlushAck を返して接続を続ける。同じ接続で
+    /// 次の Create と Flush も処理される。永続化に対応しない環境（5.8 未満の Linux 等）では
+    /// FlushAck を偽装せず Unimplemented で終える。
     #[test]
-    fn io2_uds_file_mode_flush_closes_without_flush_ack() {
+    fn io2_uds_file_mode_flush_returns_flush_ack() {
+        let supported = fandhe_container_io::persist_support().is_supported();
         let dir = TempDir::new();
         let (outcome, end) = run_session(&dir, 8, |mut stream| {
             send_create(&mut stream, 1, "f");
@@ -215,14 +218,108 @@ mod unix {
             send_flush(&mut stream, 3);
             let first = ack_id(&recv_frame(&mut stream));
             let second = ack_id(&recv_frame(&mut stream));
-            let next = try_recv_frame(&mut stream);
-            (first, second, next.map(|f| f.kind()))
+            let flush_ack = try_recv_frame(&mut stream).map(|f| {
+                let ack = decode_ack(&f).expect("flush ack");
+                (ack.kind(), ack.id().get())
+            });
+            if flush_ack.is_none() {
+                return (first, second, None, None);
+            }
+            send_create(&mut stream, 4, "g");
+            send_flush(&mut stream, 5);
+            let third = ack_id(&recv_frame(&mut stream));
+            let second_flush = try_recv_frame(&mut stream).map(|f| {
+                let ack = decode_ack(&f).expect("flush ack");
+                (ack.kind(), ack.id().get())
+            });
+            (first, second, flush_ack, Some((third, second_flush)))
         });
-        assert_eq!(outcome, (1, 2, None));
-        assert_eq!(end, IoErrorCode::Unimplemented);
+        if supported {
+            assert_eq!(
+                outcome,
+                (
+                    1,
+                    2,
+                    Some((FrameKind::FlushAck, 3)),
+                    Some((4, Some((FrameKind::FlushAck, 5))))
+                )
+            );
+            assert_eq!(end, IoErrorCode::Unavailable);
+        } else {
+            assert_eq!(outcome, (1, 2, None, None));
+            assert_eq!(end, IoErrorCode::Unimplemented);
+        }
         assert_eq!(
             std::fs::read(dir.share_root().join("f")).expect("read"),
             b"data"
+        );
+    }
+
+    /// IO-10: 未フラッシュ滞留量の上限に達すると自動フラッシュ（FlushAck なし）して接続を続ける。
+    #[test]
+    fn io10_uds_file_mode_auto_flush_keeps_connection() {
+        let supported = fandhe_container_io::persist_support().is_supported();
+        let dir = TempDir::new();
+        let mut server = UdsServer::bind(
+            &dir.socket_path(),
+            ReceiveLimits::default(),
+            NoopServerObserver,
+        )
+        .expect("bind must succeed on a private, empty path");
+        std::fs::create_dir(dir.share_root()).expect("share root");
+        let creator = GuestFileCreator::new(dir.share_root()).expect("creator");
+        let socket = dir.socket_path();
+        let client = std::thread::spawn(move || {
+            let mut stream = connect(&socket);
+            send_create(&mut stream, 1, "a");
+            send_write_file(&mut stream, 2, 1, b"x");
+            send_write_file(&mut stream, 3, 1, b"y");
+            send_write_file(&mut stream, 4, 1, b"z");
+            send_flush(&mut stream, 5);
+            let mut kinds = Vec::new();
+            for _ in 0..5 {
+                match try_recv_frame(&mut stream) {
+                    Some(frame) => kinds.push(frame.kind()),
+                    None => break,
+                }
+            }
+            kinds
+        });
+        let mut connection = server
+            .accept(test_timeout(), NoopServerObserver)
+            .expect("accept");
+        let limits = FileServeLimits::new(
+            MaxOpenFiles::default(),
+            UnflushedLimit::new(3, 1024).expect("limit"),
+        );
+        let server_thread = std::thread::spawn(move || {
+            serve_file_connection_with_limit(
+                &mut connection,
+                BatchConfig::new(64).expect("batch size"),
+                limits,
+                &creator,
+                timeouts(),
+            )
+        });
+        let kinds = client.join().expect("client");
+        let report = server_thread.join().expect("server");
+        if supported {
+            // 3 件目で自動フラッシュ（FlushAck なし）し、続く 4 件目と明示 Flush も処理される。
+            let mut expected = vec![FrameKind::Ack; 4];
+            expected.push(FrameKind::FlushAck);
+            assert_eq!(kinds, expected);
+            assert_eq!(report.stats.auto_flushes, 1);
+            assert_eq!(report.stats.flush_acks_sent, 1);
+            assert_eq!(report.end.code(), IoErrorCode::Unavailable);
+        } else {
+            assert_eq!(report.end.code(), IoErrorCode::Unimplemented);
+        }
+        // 未対応環境では 3 件目の自動フラッシュが Unimplemented で接続を終えるため、4 件目は
+        // 実行されない。
+        let expected_content: &[u8] = if supported { b"xyz" } else { b"xy" };
+        assert_eq!(
+            std::fs::read(dir.share_root().join("a")).expect("read"),
+            expected_content
         );
     }
 

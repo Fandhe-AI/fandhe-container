@@ -137,7 +137,6 @@ unsafe extern "C" {
     fn bind(fd: i32, addr: *const SockaddrVm, addrlen: u32) -> i32;
     fn listen(fd: i32, backlog: i32) -> i32;
     fn accept4(fd: i32, addr: *mut SockaddrVm, addrlen: *mut u32, flags: i32) -> i32;
-    fn connect(fd: i32, addr: *const SockaddrVm, addrlen: u32) -> i32;
     fn getsockname(fd: i32, addr: *mut SockaddrVm, addrlen: *mut u32) -> i32;
     fn getpeername(fd: i32, addr: *mut SockaddrVm, addrlen: *mut u32) -> i32;
     fn poll(fds: *mut PollFd, nfds: core::ffi::c_ulong, timeout: i32) -> i32;
@@ -387,7 +386,9 @@ pub(crate) fn connect_nonblocking_until(
     let fd = open_socket(consts::SOCK_NONBLOCK)?;
     let sa = new_addr(addr);
     // SAFETY: `sa` は有効な `sockaddr_vm`（16 バイト）で長さは `SOCKADDR_VM_LEN`。`fd` は有効。
-    let rc = unsafe { connect(fd.as_raw_fd(), &raw const sa, SOCKADDR_VM_LEN) };
+    let rc = unsafe {
+        super::sock_raw::connect(fd.as_raw_fd(), (&raw const sa).cast(), SOCKADDR_VM_LEN)
+    };
     if rc < 0 {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
@@ -519,8 +520,12 @@ mod libc_abi {
         *const libc::sockaddr,
         libc::socklen_t,
     ) -> libc::c_int = libc::bind;
-    const _: unsafe extern "C" fn(libc::c_int, *const SockaddrVm, libc::socklen_t) -> libc::c_int =
-        super::connect;
+    // `connect` は共通宣言（`sys::sock_raw`）で、アドレスは `*const c_void`。
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_void,
+        libc::socklen_t,
+    ) -> libc::c_int = super::super::sock_raw::connect;
     const _: unsafe extern "C" fn(
         libc::c_int,
         *const libc::sockaddr,

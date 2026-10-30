@@ -383,7 +383,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
-- `PipelineClient` の型つき API と Nack の受信は #3162 で実装済み。クライアント側の UDS `connect` は #3165 で実装済み（`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`）。両者の本番結合（[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)）は未実装
+- `PipelineClient` の型つき API と Nack の受信は #3162 で実装済み。クライアント側の UDS `connect` は #3165 で実装済み（`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`）。両者の本番結合（[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)）は #3167 の crash_safety（複数ファイル・新設ディレクトリの FLUSH 後の SIGKILL）と break_detection（UDS クライアント経路の BREAK-1 / BREAK-2）で確かめている。UDS クライアント経路の BREAK-2 は、`header_crc` を再計算しない長さの破壊を受信経路の `header_crc` 検査が `DataLoss` で拒否し、自己整合的な長さの偽りは応答系の固定長検査（F12）が本体を読む前に `InvalidArgument` で拒否する
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み
@@ -588,7 +588,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163（実装済み） |
 | #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5）。実装済み | #3161 |
 | #3166 | 整合性スイート（IO-4・TASK-14） | #3162・#3164・#3165 |
-| #3167 | crash_safety・break_detection（IO-3・REPAIR-7） | #3164・#3165 |
+| #3167 | crash_safety・break_detection（IO-3・REPAIR-7）。実装済み（別ユーザーの実サーバーでの uid 照合は人間担当。手順は `docs/verification/io-uds-client-peer-uid.md`） | #3164・#3165 |
 
 下流の #2074（TASK-189 のワイヤー経路への切り替え）は #3162・#3164・#3165 に依存する。各 issue の受け入れ条件に、該当モジュールの REPAIR-3 の記述の更新を含める（`lib.rs`・`guest_files.rs`・`writeback.rs`・`client.rs`・`vsock.rs`）。
 

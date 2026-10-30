@@ -496,7 +496,7 @@ mod unix {
         let mut found = Vec::new();
         let mut unexpected = Vec::new();
         let mut trailing = 0usize;
-        for path in FILE_PATHS {
+        for (index, path) in FILE_PATHS.into_iter().enumerate() {
             let mut cur = root.to_path_buf();
             let mut components = path.split('/').peekable();
             let mut lost = false;
@@ -541,7 +541,17 @@ mod unix {
                 Err(e) => return DiskObservation::ReadFailed(format!("{:?}", e.kind())),
             }
             let one = check_disk_records(&bytes, FILE_RECORDS);
-            found.extend(one.found);
+            // ファイル i が持つべき範囲は i*K..(i+1)*K。範囲外の seq（他ファイルへの誤配送）は
+            // found に入れず unexpected にする。全件が 1 ファイルに偏っても完全一致にならない。
+            let first = (index as u64).saturating_mul(WRITES_PER_FILE);
+            let range = first..first.saturating_add(WRITES_PER_FILE);
+            for seq in one.found {
+                if range.contains(&seq) {
+                    found.push(seq);
+                } else if !one.unexpected.contains(&seq) {
+                    unexpected.push(seq);
+                }
+            }
             unexpected.extend(one.unexpected);
             trailing += one.trailing_partial_bytes;
         }
@@ -1163,6 +1173,25 @@ mod unix {
             }
             other => panic!("must be checked, got {other:?}"),
         }
+        // 全レコードが 1 ファイルに偏り、他ファイルは空（誤配送）は完全一致にならない
+        let all: Vec<u8> = (0..FILE_RECORDS).flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(root.join("f0.bin"), all).expect("write");
+        for rel in ["n0/f1.bin", "n0/d/f2.bin", "n1/f3.bin"] {
+            std::fs::write(root.join(rel), b"").expect("write");
+        }
+        match observe_files_disk(&root) {
+            DiskObservation::Checked(c) => {
+                assert!(!c.is_exact(), "misdelivery must not be exact: {c:?}");
+                assert_eq!(c.found, (0..5).collect::<Vec<u64>>());
+                assert_eq!(c.missing, (5..20).collect::<Vec<u64>>());
+                assert_eq!(c.unexpected, (5..20).collect::<Vec<u64>>());
+            }
+            other => panic!("must be checked, got {other:?}"),
+        }
+        write("f0.bin", 0);
+        write("n0/f1.bin", 5);
+        write("n0/d/f2.bin", 10);
+        write("n1/f3.bin", 15);
         // ファイルが無い
         std::fs::remove_file(root.join("n0/f1.bin")).expect("rm");
         match observe_files_disk(&root) {

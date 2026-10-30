@@ -134,7 +134,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -1861,8 +1861,8 @@ fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
     Ok(())
 }
 
-/// 一時名の衝突回避用カウンタ（Unix の所有者検査とテストだけが使う）。
-#[cfg(any(unix, test))]
+/// 一時名の衝突回避用カウンタ（Unix の所有者検査だけが使う）。
+#[cfg(unix)]
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 展開の作業領域の名前（`staging/<id>/unpack`。中に `entry/{rootfs,unpack-record}`）。
@@ -2181,12 +2181,7 @@ mod tests {
     /// OCI-1・#2534: 書き込み側は上限を超える記録を、ファイルを作る前に `ResourceExhausted` で拒否する。
     #[test]
     fn oci1_write_unpack_record_rejects_oversized_record_before_creating_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-cri-record-size-{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_fresh_dir(&dir);
+        let dir = fresh_dir("fandhe-cri-record-size", "t");
         let path = dir.join(RECORD_FILE);
         let record = UnpackRecord {
             settings: "s".repeat(MAX_RECORD_BYTES as usize),
@@ -2204,36 +2199,72 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 前回の残骸（古い record・blob 等）があれば消してから空のディレクトリを作る（REPAIR-12・#3375）。
-    pub(crate) fn create_fresh_dir(dir: &std::path::Path) {
-        let _ = fs::remove_dir_all(dir);
-        fs::create_dir_all(dir).expect("mkdir");
+    /// 試験用ディレクトリを排他作成する（REPAIR-12・#3375・#3506）。既存の名前（前回の残骸・symlink）は消さず・辿らず、
+    /// 別名で作る。Drop で自分が作ったパスだけを消す。呼び出し側は返り値のパスを使う。
+    pub(crate) fn fresh_dir(prefix: &str, tag: &str) -> crate::test_root::TestRoot {
+        crate::test_root::test_root(prefix, tag)
     }
 
-    /// OCI-1・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと古いファイル）があっても `create_fresh_dir` が
-    /// 空のディレクトリへ作り直す。
+    /// OCI-1・REPAIR-12(#3506): 前回の残骸（同名のディレクトリと古いファイル）があっても消さず、
+    /// 別名の空のディレクトリを作る。残骸は無傷で残り、drop で新しい方だけが消える。
     #[test]
-    fn oci1_repair12_create_fresh_dir_clears_stale_residue() {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-cri-stale-residue-{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(dir.join("old")).expect("stale dir");
-        fs::write(dir.join(RECORD_FILE), b"stale").expect("stale file");
-        create_fresh_dir(&dir);
+    fn oci1_repair12_3506_fresh_dir_leaves_stale_residue_untouched() {
+        let parent = fresh_dir("fandhe-cri-stale-parent", "t");
+        let stale = parent.join("stale");
+        fs::create_dir_all(stale.join("old")).expect("stale dir");
+        fs::write(stale.join(RECORD_FILE), b"stale").expect("stale file");
+        let dir = crate::test_root::test_root_at(stale.clone());
+        assert_ne!(&*dir, stale.as_path());
+        assert_eq!(dir.parent(), Some(&*parent));
         assert_eq!(fs::read_dir(&dir).expect("read_dir").count(), 0);
-        let _ = fs::remove_dir_all(&dir);
+        assert!(stale.join("old").is_dir());
+        assert_eq!(fs::read(stale.join(RECORD_FILE)).expect("read"), b"stale");
+        let new_path = dir.to_path_buf();
+        drop(dir);
+        assert!(!new_path.exists());
+        assert!(stale.join("old").is_dir());
     }
 
-    fn record_test_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-cri-record-{tag}-{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_fresh_dir(&dir);
-        dir
+    /// OCI-1・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_repair12_3506_fresh_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = fresh_dir("fandhe-cri-symlink-parent", "t");
+        let victim = parent.join("victim");
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let d1 = crate::test_root::test_root_at(link.clone());
+        let d2 = crate::test_root::test_root_at(dangling.clone());
+        assert_ne!(&*d1, link.as_path());
+        assert_ne!(&*d2, dangling.as_path());
+        assert!(
+            !fs::symlink_metadata(&d1)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&d1).expect("read_dir").count(), 0);
+        assert_eq!(fs::read_dir(&victim).expect("victim dir").count(), 1);
+        assert_eq!(fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            fs::metadata(&victim).expect("meta").permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
+    }
+
+    fn record_test_dir(tag: &str) -> crate::test_root::TestRoot {
+        fresh_dir("fandhe-cri-record", tag)
     }
 
     /// OCI-1・REPAIR-5・#2796: 本文の書き込みが途中で失敗（ENOSPC 相当）したら作ったファイルを消す。
@@ -2313,23 +2344,13 @@ mod blob_trust_fs_tests {
     /// `abc` の sha256。
     const ABC: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-    struct TempDir(PathBuf);
+    /// 排他作成した試験用ディレクトリ（`.0` はそのパス、`.1` は Drop で消す所有者。REPAIR-12・#3506）。
+    struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "fandhe-cri-blob-trust-{tag}-{}-{}",
-                std::process::id(),
-                STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            crate::image_pull::tests::create_fresh_dir(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let root = crate::image_pull::tests::fresh_dir("fandhe-cri-blob-trust", tag);
+            Self(root.to_path_buf(), root)
         }
     }
 
@@ -2664,8 +2685,7 @@ mod non_unix_tests {
     /// SEC・OCI-1: 非 Unix では blob の所有者・権限を確認できないため、既存 blob を再利用せず、公開もしない。
     #[test]
     fn sec_blobs_are_neither_reused_nor_published_without_metadata() {
-        let dir = std::env::temp_dir().join(format!("fandhe-cri-blob-{}", std::process::id()));
-        crate::image_pull::tests::create_fresh_dir(&dir);
+        let dir = crate::image_pull::tests::fresh_dir("fandhe-cri-blob", "t");
         let path = dir.join("blob");
         fs::write(&path, b"abc").expect("write");
         let digest = Digest::parse(

@@ -2753,19 +2753,23 @@ fn build_vz_configuration_limited(
 mod tests {
     use super::*;
 
-    /// テスト専用の一時ディレクトリ（終了時に削除）。
-    struct TempDir(PathBuf);
+    /// テスト専用の一時ディレクトリ。既存の名前は消さず・辿らず排他作成（unix は 0700）し、Drop で自分が作った
+    /// パスだけを消す（共有部品 `test_root`。REPAIR-12・#3375・#3506）。`.0` は正規化済みのパス。
+    struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
-            // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self::at(
+                std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id())),
+            )
+        }
+
+        /// `p` を第 1 候補に排他作成する。既にあれば別名になるため、`.0` は `p` と異なることがある。
+        fn at(p: PathBuf) -> Self {
+            let root = crate::test_root::test_root_at(p);
             // macOS の一時ディレクトリ（/var/folders/...）は /private/var への symlink を含み、共有ディレクトリの
             // symlink 拒否検証（SharedDirSymlink）に掛かるため、正規化済みパスを使う。
-            let dir = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
+            let dir = std::fs::canonicalize(&*root).expect("canonicalize temp dir");
             // umask に依らず親ディレクトリ検査（他者書き込み可能かつ sticky なしは拒否）を通る 0700 にする。
             #[cfg(unix)]
             {
@@ -2773,7 +2777,7 @@ mod tests {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod temp dir");
             }
-            Self(dir)
+            Self(dir, root)
         }
 
         fn file(&self, name: &str) -> PathBuf {
@@ -2790,28 +2794,60 @@ mod tests {
         }
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// MAC-1・REPAIR-12(#3375): 同じ tag の前回の残骸（古いファイル）が残っていても `TempDir::new` が
-    /// 空のディレクトリを返し、drop で消える。
+    /// MAC-1・REPAIR-12(#3506): 同じ位置の前回の残骸（古いファイル・ディレクトリ）を消さず、別名の空の
+    /// ディレクトリを返す。残骸は無傷で残り、drop で新しい方だけが消える。
     #[test]
-    fn mac1_repair12_temp_dir_clears_stale_residue() {
-        let stale = std::env::temp_dir().join(format!(
-            "fandhe-macos-cfg-stale-residue-{}",
-            std::process::id()
-        ));
+    fn mac1_repair12_3506_temp_dir_leaves_stale_residue_untouched() {
+        let parent = TempDir::new("stale-parent");
+        let stale = parent.0.join("stale");
         std::fs::create_dir_all(stale.join("old")).expect("stale dir");
         std::fs::write(stale.join("old.txt"), b"x").expect("stale file");
         let path = {
-            let t = TempDir::new("stale-residue");
+            let t = TempDir::at(stale.clone());
+            assert_ne!(t.0, stale);
+            assert_eq!(t.0.parent(), Some(parent.0.as_path()));
             assert_eq!(std::fs::read_dir(&t.0).expect("read_dir").count(), 0);
             t.0.clone()
         };
         assert!(!path.exists());
+        assert!(stale.join("old").is_dir());
+        assert_eq!(std::fs::read(stale.join("old.txt")).expect("read"), b"x");
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_repair12_3506_temp_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = TempDir::new("symlink-parent");
+        let victim = parent.0.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.0.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.0.join("nowhere");
+        let dangling = parent.0.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let t1 = TempDir::at(link.clone());
+        let t2 = TempDir::at(dangling.clone());
+        assert_ne!(t1.0, link);
+        assert_ne!(t2.0, dangling);
+        assert_eq!(std::fs::read_dir(&t1.0).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     /// MAC-1・TASK-64.2: 正常な 3 入力で仕様が組み立てられ、既定の CPU・メモリが入る。

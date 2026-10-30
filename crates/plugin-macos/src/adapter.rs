@@ -1099,25 +1099,100 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id()));
-        // 前回の残骸（古い kernel / initrd 等）があれば消してから作る（REPAIR-12・#3375）。
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("mkdir");
-        d.canonicalize().expect("canon")
+    /// 試験用ディレクトリ。既存の名前は消さず・辿らず排他作成（unix は 0700）し、Drop で自分が作った
+    /// パスだけを消す（共有部品 `test_root`。REPAIR-12・#3375・#3506）。Deref 先は正規化済みのパス。
+    struct TmpDir {
+        canon: PathBuf,
+        #[allow(dead_code)] // Drop で消す所有者。`raw` は unix の試験だけが使う
+        root: crate::test_root::TestRoot,
     }
 
-    /// MAC-1・REPAIR-12(#3375): 前回の残骸（同名のディレクトリと古い kernel）があっても `tmp_dir` が
-    /// 空のディレクトリを返す。
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.canon
+        }
+    }
+
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.canon
+        }
+    }
+
+    impl TmpDir {
+        /// 正規化していない綴り(macOS では祖先に symlink を含む)。排他作成した実体と同じ場所。
+        #[cfg(unix)]
+        fn raw(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    /// `p` を第 1 候補に排他作成する。既にあれば別名になるため、返り値のパスを使う。
+    fn tmp_dir_at(p: PathBuf) -> TmpDir {
+        let root = crate::test_root::test_root_at(p);
+        let canon = root.canonicalize().expect("canon");
+        TmpDir { canon, root }
+    }
+
+    fn tmp_dir(name: &str) -> TmpDir {
+        tmp_dir_at(std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id())))
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 前回の残骸（同名のディレクトリと古い kernel）があっても `tmp_dir_at` は
+    /// 消さず、別名の空のディレクトリを返す。残骸は無傷で残り、drop で新しい方だけが消える。
     #[test]
-    fn mac1_repair12_tmp_dir_clears_stale_residue() {
-        let stale =
-            std::env::temp_dir().join(format!("fc-adapter-{}-stale-residue", std::process::id()));
+    fn mac1_repair12_3506_tmp_dir_leaves_stale_residue_untouched() {
+        let parent = tmp_dir("stale-parent");
+        let stale = parent.join("stale");
         std::fs::create_dir_all(stale.join("old")).expect("stale dir");
         std::fs::write(stale.join("vmlinuz"), b"old").expect("stale file");
-        let d = tmp_dir("stale-residue");
-        assert_eq!(std::fs::read_dir(&d).expect("read_dir").count(), 0);
-        let _ = std::fs::remove_dir_all(&d);
+        let new_path = {
+            let d = tmp_dir_at(stale.clone());
+            assert_ne!(&*d, stale.as_path());
+            assert_eq!(d.parent(), Some(&*parent));
+            assert_eq!(std::fs::read_dir(&d).expect("read_dir").count(), 0);
+            d.to_path_buf()
+        };
+        assert!(!new_path.exists());
+        assert!(stale.join("old").is_dir());
+        assert_eq!(std::fs::read(stale.join("vmlinuz")).expect("read"), b"old");
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_repair12_3506_tmp_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = tmp_dir("symlink-parent");
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let d1 = tmp_dir_at(link.clone());
+        let d2 = tmp_dir_at(dangling.clone());
+        assert_ne!(&*d1, link.as_path());
+        assert_ne!(&*d2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&d1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     fn kernel(dir: &Path) -> String {
@@ -1624,10 +1699,8 @@ mod tests {
         let dir = tmp_dir("share-temp");
         let k = kernel(&dir);
         // 正規化していない綴り（macOS では祖先に symlink を含む）。
-        let raw = std::env::temp_dir()
-            .join(format!("fc-adapter-{}-share-temp", std::process::id()))
-            .join("share");
-        // 親は `tmp_dir` が作成前に消して作り直した同じ場所（kernel を置いている）。ここでは消さない。
+        let raw = dir.raw().join("share");
+        // 親は `tmp_dir` が排他作成した同じ場所（kernel を置いている）。ここでは消さない。
         std::fs::create_dir_all(&raw).expect("mkdir");
         let (mut a, f) = adapter();
         assert_eq!(
@@ -2569,7 +2642,7 @@ mod tests {
 
     /// マウント先つきで create し、backend の launch が `err` を返すようにして start の結果を返す。
     /// `name` は試験ごとに異なる一時ディレクトリ名にする（並行実行する試験が同じ
-    /// ディレクトリを `tmp_dir` の削除で壊し合わないため。MAC-1・REPAIR-12）。
+    /// ディレクトリを取り合わないため。MAC-1・REPAIR-12）。
     #[cfg(unix)]
     fn gm_started(
         name: &str,

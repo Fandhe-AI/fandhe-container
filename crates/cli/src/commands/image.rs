@@ -747,7 +747,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// 試験用の一時ディレクトリ（drop で削除）。
-    /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+    /// 第 2 要素は排他作成した実体（Drop で後始末する。REPAIR-12・#3475）。
     struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
@@ -757,8 +757,9 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
-            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
-            let root = crate::test_root::test_root_at(p.clone());
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
+            let root = crate::test_root::test_root_at(p);
+            let p = root.to_path_buf();
             std::fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
             Tmp(p, root)
         }

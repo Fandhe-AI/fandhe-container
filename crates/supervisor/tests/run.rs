@@ -119,15 +119,19 @@ fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
     assert_eq!(exit, ProcessExit::Exited(3));
 }
 
-/// SUP-1・REPAIR-12・#3435: 前回の残骸（古い `go` マーカー）があっても作り直しで消える。
+/// SUP-1・REPAIR-12・#3475: 前回の残骸（古い `go` マーカー）があっても消さず別名の空ディレクトリを使い、
+/// 残骸は無傷で残る。
 #[test]
-fn sup1_repair12_smoke_marker_residue_is_cleared() {
-    let stale = unique_path("residue");
+fn sup1_repair12_smoke_marker_residue_is_left_untouched() {
+    let parent = test_root::test_root("fandhe-sup-run-residue", "parent");
+    let stale = parent.join("stale");
     std::fs::create_dir_all(&stale).unwrap();
     std::fs::write(stale.join("go"), b"").unwrap();
     let root = test_root::test_root_at(stale.clone());
+    assert_ne!(&*root, stale.as_path());
     assert!(!root.join("go").exists());
     assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+    assert!(stale.join("go").exists());
 }
 
 #[cfg(target_os = "linux")]

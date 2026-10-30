@@ -81,15 +81,22 @@ fn oci1_public_api_records_samples() {
 /// OCI-7・REPAIR-12（#3298）: 前回の残骸（ファイルと入れ子のディレクトリ）があっても空で作り直され、
 /// 同名ファイルを排他作成でき、drop で消える。
 #[test]
-fn oci7_repair12_test_root_clears_stale_residue() {
-    let p = std::env::temp_dir().join(format!("fc-oci-digest-it-residue-{}", std::process::id()));
+fn oci7_repair12_test_root_leaves_stale_residue_untouched() {
+    let parent = test_root("fc-oci-digest-it-residue", "parent");
+    let p = parent.join("stale");
     std::fs::create_dir_all(p.join("sub").join("inner")).expect("mkdir residue");
     std::fs::write(p.join("blob"), b"stale").expect("stale blob");
     std::fs::write(p.join("sub").join("inner").join("x"), b"stale").expect("stale inner");
 
     let root = test_root_at(p.clone());
-    assert_eq!(std::fs::read_dir(&p).expect("read_dir").count(), 0);
-    std::fs::File::create_new(root.join("blob")).expect("exclusive create over stale name");
+    assert_ne!(&*root, p.as_path());
+    assert_eq!(std::fs::read_dir(&*root).expect("read_dir").count(), 0);
+    std::fs::File::create_new(root.join("blob")).expect("exclusive create beside stale name");
+    let rp = root.to_path_buf();
     drop(root);
-    assert!(!p.exists());
+    assert!(!rp.exists());
+    assert_eq!(
+        std::fs::read(p.join("blob")).expect("stale blob kept"),
+        b"stale"
+    );
 }

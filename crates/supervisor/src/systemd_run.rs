@@ -160,9 +160,9 @@ mod tests {
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
             let p = std::env::temp_dir().join(format!("fc-usc-{tag}-{}-{n}", std::process::id()));
-            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（0700。REPAIR-12・#3435）。
-            let root = crate::test_root::test_root_at(p.clone());
-            Self(std::fs::canonicalize(&p).expect("canon"), root)
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+            let root = crate::test_root::test_root_at(p);
+            Self(std::fs::canonicalize(&*root).expect("canon"), root)
         }
     }
 

@@ -51,7 +51,8 @@ fn oci7_lock_excludes_other_process() {
 /// `Timeout` になる本来の流れが通る（残骸で `wait_for` が即通って親が先に lock しない）。
 #[test]
 fn oci7_repair12_lock_flow_passes_over_stale_ready_release() {
-    let p = std::env::temp_dir().join(format!("fc-oci-store-it-residue-{}", std::process::id()));
+    let parent = test_root("fc-oci-store-it-residue", "parent");
+    let p = parent.join("stale");
     std::fs::create_dir_all(&p).expect("mkdir residue");
     std::fs::write(p.join("ready"), b"").expect("stale ready");
     std::fs::write(p.join("release"), b"").expect("stale release");

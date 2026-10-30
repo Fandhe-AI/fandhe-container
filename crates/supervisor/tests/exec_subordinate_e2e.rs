@@ -11,9 +11,19 @@
 //!   どれかが記録に無いと `FailedPrecondition` で拒否するため
 //! - supervisor の本番 exec 入口 `run_command_with_pidfd`（起動時に保持した pidfd で pid1 を固定する）
 //!
-//! `harness = false` の単一スレッド独自 `main` で、同じ実行ファイルが 3 つの役を持つ。
-//! - 親（既定）: `-- --ignored` のときだけ実機シナリオを動かす（それ以外は案内を出して成功。既定のテスト集合に実機前提を
-//!   混ぜないため）
+//! `harness = false` の単一スレッド独自 `main` で、同じ実行ファイルが 5 つの役を持つ。
+//! - watchdog（`-- --ignored`）: 同じ実行ファイルを `--ignored-worker` で別プロセス（専用の pgid）として起動して全体の
+//!   期限（`clamp(timeout × 16, 120, 480)` 秒）を見張る。試験は fork の前提で単一スレッドを要求するため、同一プロセスの
+//!   スレッドでは見張れない。期限を過ぎたら診断（`ps --forest`・部分木の `wchan`・`syscall`）を stderr に出し、子孫を回収して
+//!   `exec_subordinate_e2e: WATCHDOG EXPIRED ...` と終了コード 124 で終わる。worker が終わっても scope に自分以外の pid が
+//!   残れば `LEFTOVER PROCESSES` で失敗にする。部分木の回収は、起動時に scope に自分だけが居たときに限る（端末から直接
+//!   実行した利用者のセッションを撃たない）。watchdog 自身が kill された場合の回収（ステップ側）は #3486 の範囲で、
+//!   worker は段の境界で親の消失を検出して止まるだけ（REPAIR-5・REPAIR-7。#3485）
+//! - worker（`--ignored-worker`）: 実機シナリオを動かす。段ごとに `exec_subordinate_e2e: stage=<名前> begin` と
+//!   `... end elapsed_ms=<n>` を出し、止まったときは最後の begin 行が場面を示す（成功行の照合の select には当たらない
+//!   `stage=` の接頭辞）。親の watchdog を cgroup の同伴として宣言する（`with_companions`）。試験専用の注入
+//!   `FANDHE_CONTAINER_ESE_TEST_HANG=<段名>` でその段の開始直後に止まり、watchdog の動作を実証できる
+//! - 引数なし: 案内を出して成功（既定のテスト集合に実機前提を混ぜないため）。期限の計算の具体値だけ自己照合する
 //! - コンテナ内の pid1（`--container-probe`）: `/data/ready` へ `READY` を書き、親が terminate するまで待つ
 //!   （寿命の上限 60 秒を超えたら終了コード 8。取り残さない。REPAIR-5）
 //! - exec されるコマンド（`--exec-probe <出力先名>`）: コンテナ内の `/proc/self/status` から `Uid:`・`Gid:`・`Groups:`・
@@ -101,13 +111,17 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--container-probe") {
         linux::container_probe();
+    } else if args.iter().any(|a| a == "--ignored-worker") {
+        precondition::self_check();
+        linux::run_worker();
     } else if let Some(pos) = args.iter().position(|a| a == "--exec-probe") {
         linux::exec_probe(args.get(pos + 1).map(String::as_str));
     } else if args.iter().any(|a| a == "--ignored") {
         precondition::self_check();
-        linux::run();
+        linux::supervise();
     } else {
         precondition::self_check();
+        linux::self_check_watchdog();
         println!(
             "exec_subordinate_e2e: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
         );
@@ -220,6 +234,448 @@ mod linux {
         StartTimeouts::new(t, t, t).expect("start timeouts")
     }
 
+    // ----- 試験全体の watchdog（別プロセス。#3485・REPAIR-5・REPAIR-7）----------------------------------------
+
+    /// worker が親（watchdog）の pid を確かめるための環境変数。watchdog 無しでは worker を走らせない（fail-closed）。
+    const WATCHDOG_PID_ENV: &str = "FANDHE_CONTAINER_ESE_WATCHDOG_PID";
+    /// 試験専用の停止の注入。値は `STAGES` の段名に限る。指定した段の開始行の直後で worker が止まり、watchdog の
+    /// 期限切れ・回収・固定の失敗行を実証できる。未設定では何もしない。
+    const HANG_ENV: &str = "FANDHE_CONTAINER_ESE_TEST_HANG";
+    /// 段の名前の固定一覧（注入の許可リストを兼ねる）。
+    const STAGES: [&str; 15] = [
+        "preconditions",
+        "scratch-and-bundle",
+        "create",
+        "cgroup-chain",
+        "start",
+        "wait-ready",
+        "record-readback",
+        "exec-a",
+        "exec-b",
+        "overmount",
+        "exec-c",
+        "terminate",
+        "wait-proc-gone",
+        "wait-no-children",
+        "remove-cgroup",
+    ];
+    /// 期限切れで終わるときの終了コード（`timeout(1)` と同じ値）。
+    const EXIT_WATCHDOG_EXPIRED: i32 = 124;
+    /// 診断・走査の上限（無制限の確保を避ける。REPAIR-5）。
+    const MAX_DIRS: usize = 256;
+    const MAX_PIDS: usize = 4096;
+    const MAX_DIAG_PIDS: usize = 256;
+    const MAX_DIAG_TASKS: usize = 64;
+    const KILL: &str = "/usr/bin/kill";
+    const PS: &str = "/usr/bin/ps";
+
+    /// 試験全体の期限。`timeout()` の 16 倍を 120..=480 秒に収める。CI のステップ上限 600 秒と繰り返しの
+    /// `repeat-run-timeout`（600）より短く、期限後の診断と回収（最大約 60 秒）を足しても収まる。下限は
+    /// timeout を小さく与えても rootfs の準備などの正常な所要時間で誤って発火しないため。
+    pub fn deadline_for(timeout_secs: u64) -> Duration {
+        Duration::from_secs(timeout_secs.saturating_mul(16).clamp(120, 480))
+    }
+
+    fn deadline() -> Duration {
+        deadline_for(timeout().as_secs())
+    }
+
+    fn hang_is_valid(v: &str) -> bool {
+        STAGES.contains(&v)
+    }
+
+    /// 既定の経路（引数なし）で回す、期限の計算と注入の許可リストの具体値の自己照合（REPAIR-12）。
+    pub fn self_check_watchdog() {
+        for (secs, want) in [
+            (0, 120),
+            (1, 120),
+            (7, 120),
+            (8, 128),
+            (30, 480),
+            (295, 480),
+        ] {
+            assert_eq!(deadline_for(secs), Duration::from_secs(want), "secs={secs}");
+        }
+        assert!(hang_is_valid("exec-a"));
+        assert!(!hang_is_valid("bogus"));
+        assert!(!hang_is_valid(""));
+        assert!(
+            STAGES.iter().all(|s| !s.is_empty() && !s.contains(' ')),
+            "stage names must be single tokens"
+        );
+    }
+
+    fn watchdog_pid() -> u32 {
+        std::env::var(WATCHDOG_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .expect("the watchdog pid must be passed by the watchdog")
+    }
+
+    static STAGE: std::sync::Mutex<Option<(&'static str, Instant)>> = std::sync::Mutex::new(None);
+    static PARENT_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// 段の開始行を出す（直前の段の終了行も出す）。止まったときは最後の `begin` 行が止まった段を示す。
+    /// 親（watchdog）が消えていたら一度だけ panic して後始末の経路に乗せる（孤児のまま走り続けない）。
+    /// 注入（`HANG_ENV`）が当たる段はここで止まる。
+    fn begin(name: &'static str) {
+        {
+            let mut g = STAGE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((prev, t0)) = g.take() {
+                println!(
+                    "exec_subordinate_e2e: stage={prev} end elapsed_ms={}",
+                    t0.elapsed().as_millis()
+                );
+            }
+            println!("exec_subordinate_e2e: stage={name} begin");
+            *g = Some((name, Instant::now()));
+        }
+        if std::os::unix::process::parent_id() != watchdog_pid()
+            && !PARENT_LOST.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the watchdog parent process is gone");
+        }
+        if std::env::var(HANG_ENV).as_deref() == Ok(name) {
+            eprintln!("exec_subordinate_e2e: injected hang at stage {name}");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// 最後の段の終了行を出す。
+    fn finish() {
+        let mut g = STAGE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((prev, t0)) = g.take() {
+            println!(
+                "exec_subordinate_e2e: stage={prev} end elapsed_ms={}",
+                t0.elapsed().as_millis()
+            );
+        }
+    }
+
+    /// worker の役。watchdog の子として起動された場合だけ実機シナリオを動かす。
+    pub fn run_worker() {
+        let parent = std::os::unix::process::parent_id();
+        let ok = std::env::var(WATCHDOG_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            == Some(parent);
+        if !ok {
+            println!(
+                "exec_subordinate_e2e: the worker must be started by the watchdog (run with `-- --ignored`)"
+            );
+            std::process::exit(1);
+        }
+        run();
+    }
+
+    /// watchdog が見ている scope（自分の cgroup）。
+    struct Scope {
+        path: PathBuf,
+        /// 起動時に自分だけが居て、子 cgroup が無く、euid 所有であるときだけ真。真のときに限り、期限切れ・残置で
+        /// scope の部分木を回収する（端末から直接実行したときに利用者のセッションを撃たないため）。
+        reapable: bool,
+    }
+
+    fn own_cgroup_dir() -> Option<PathBuf> {
+        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+        let rel = Path::new(rel.trim()).strip_prefix("/").ok()?;
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(Path::new("/sys/fs/cgroup").join(rel))
+    }
+
+    fn read_procs(dir: &Path) -> Vec<u32> {
+        std::fs::read_to_string(dir.join("cgroup.procs"))
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| l.trim().parse().ok())
+                    .take(MAX_PIDS)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn child_dirs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .take(MAX_DIRS)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `root` 配下の全 cgroup ディレクトリ（root を含む。深さと件数に上限）。
+    fn subtree_dirs(root: &Path) -> Vec<PathBuf> {
+        let mut out = vec![root.to_path_buf()];
+        let mut i = 0;
+        while let Some(d) = out.get(i).cloned() {
+            i += 1;
+            if d.strip_prefix(root).map_or(0, |r| r.components().count()) >= 6 {
+                continue;
+            }
+            for c in child_dirs(&d) {
+                if out.len() < MAX_DIRS {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    impl Scope {
+        fn probe(me: u32) -> Option<Scope> {
+            let path = own_cgroup_dir()?;
+            let (euid, _) = own_ids();
+            let owned = std::fs::metadata(&path).is_ok_and(|m| m.uid() == euid && m.is_dir());
+            let alone = read_procs(&path) == [me];
+            let reapable = owned && alone && child_dirs(&path).is_empty();
+            Some(Scope { path, reapable })
+        }
+
+        /// 部分木にいる自分以外の pid（重複なし）。
+        fn others(&self, me: u32) -> Vec<u32> {
+            let mut pids: Vec<u32> = subtree_dirs(&self.path)
+                .iter()
+                .flat_map(|d| read_procs(d))
+                .filter(|p| *p != me)
+                .collect();
+            pids.sort_unstable();
+            pids.dedup();
+            pids.truncate(MAX_PIDS);
+            pids
+        }
+
+        fn wait_empty(&self, me: u32, within: Duration) -> Vec<u32> {
+            let until = Instant::now() + within;
+            loop {
+                let left = self.others(me);
+                if left.is_empty() || Instant::now() >= until {
+                    return left;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// 自分の現在の cgroup（退避リーフ）の祖先でも自分自身でもない、部分木の cgroup。
+        fn disposable_dirs(&self) -> Vec<PathBuf> {
+            let mine = own_cgroup_dir();
+            subtree_dirs(&self.path)
+                .into_iter()
+                .filter(|d| d != &self.path)
+                .filter(|d| mine.as_ref().is_none_or(|m| !m.starts_with(d)))
+                .collect()
+        }
+
+        /// 部分木を回収する（コンテナの cgroup は `cgroup.kill`、退避リーフ側の自分以外の pid は個別の kill）。
+        fn reap_subtree(&self, me: u32) {
+            for d in self.disposable_dirs() {
+                if let Err(e) = std::fs::write(d.join("cgroup.kill"), "1") {
+                    eprintln!(
+                        "exec_subordinate_e2e: cgroup.kill on {} failed: {e}",
+                        d.display()
+                    );
+                }
+            }
+            let mut targets: Vec<u32> = read_procs(&self.path);
+            if let Some(m) = own_cgroup_dir() {
+                targets.extend(read_procs(&m));
+            }
+            targets.retain(|p| *p != me);
+            targets.sort_unstable();
+            targets.dedup();
+            kill_pids(&targets);
+        }
+
+        fn remove_disposable_dirs(&self) {
+            let mut dirs = self.disposable_dirs();
+            dirs.sort_by_key(|d| std::cmp::Reverse(d.as_os_str().len()));
+            for d in dirs {
+                let _ = std::fs::remove_dir(d);
+            }
+        }
+    }
+
+    fn run_kill(args: &[String]) {
+        let mut cmd = std::process::Command::new(KILL);
+        cmd.args(["-s", "KILL", "--"])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(e) = crate::reap::run_within(&mut cmd, Duration::from_secs(10)) {
+            eprintln!("exec_subordinate_e2e: {KILL} failed: {e}");
+        }
+    }
+
+    fn kill_pids(pids: &[u32]) {
+        // 数値だけを引数に渡す（pid 0・1 は撃たない）。
+        let args: Vec<String> = pids
+            .iter()
+            .filter(|p| **p > 1)
+            .map(u32::to_string)
+            .collect();
+        if !args.is_empty() {
+            run_kill(&args);
+        }
+    }
+
+    fn kill_group(pgid: u32) {
+        if pgid > 1 {
+            run_kill(&[format!("-{pgid}")]);
+        }
+    }
+
+    /// 止まった場面の診断（stderr）。環境変数は読まない・出さない。
+    fn dump_diag(scope: Option<&Scope>, me: u32) {
+        let mut ps = std::process::Command::new(PS);
+        ps.args([
+            "-eo",
+            "pid,ppid,pgid,sid,stat,wchan:32,etime,cmd",
+            "--forest",
+        ])
+        .stdin(std::process::Stdio::null());
+        match crate::reap::output_within(&mut ps, Duration::from_secs(10)) {
+            Ok(o) => eprintln!(
+                "exec_subordinate_e2e: ps --forest\n{}",
+                // 全プロセスの木は大きいので行数に上限をつける。
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .take(400)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            Err(e) => eprintln!("exec_subordinate_e2e: ps failed: {e}"),
+        }
+        let Some(scope) = scope else { return };
+        for pid in scope.others(me).into_iter().take(MAX_DIAG_PIDS) {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            let pick = |k: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(k))
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default()
+            };
+            eprintln!(
+                "exec_subordinate_e2e: diag pid={pid} name={} state={} threads={}",
+                pick("Name:"),
+                pick("State:"),
+                pick("Threads:")
+            );
+            let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .take(MAX_DIAG_TASKS)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for t in tasks {
+                let base = t.path();
+                let wchan = std::fs::read_to_string(base.join("wchan")).unwrap_or_default();
+                let syscall = std::fs::read_to_string(base.join("syscall")).unwrap_or_default();
+                eprintln!(
+                    "exec_subordinate_e2e: diag task={} wchan={} syscall={}",
+                    t.file_name().to_string_lossy(),
+                    wchan.trim(),
+                    syscall.trim()
+                );
+            }
+        }
+    }
+
+    /// watchdog の役（`-- --ignored` の入口）。同じ実行ファイルを worker として別プロセスで起動し、試験全体の期限を
+    /// 過ぎたら診断を出して子孫を回収し、固定の失敗行と終了コード 124 で終わる。worker が期限内に終わっても
+    /// scope に自分以外の pid が残っていたら失敗にする（子孫が stdout を持ち続けて `tee` が止まる形を失敗として見せる）。
+    pub fn supervise() {
+        use std::os::unix::process::CommandExt as _;
+        let me = std::process::id();
+        println!(
+            "exec_subordinate_e2e: stage=entry begin pid={me} ppid={}",
+            std::os::unix::process::parent_id()
+        );
+        if let Ok(h) = std::env::var(HANG_ENV)
+            && !hang_is_valid(&h)
+        {
+            println!("exec_subordinate_e2e: {HANG_ENV} must be one of the fixed stage names");
+            std::process::exit(1);
+        }
+        let scope = Scope::probe(me);
+        let reaping = scope.as_ref().filter(|s| s.reapable);
+        let exe = std::env::current_exe().expect("current exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--ignored-worker")
+            .process_group(0)
+            .env(WATCHDOG_PID_ENV, me.to_string());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("exec_subordinate_e2e: spawn worker failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let pgid = child.id();
+        let limit = deadline();
+        match crate::reap::wait_within(&mut child, limit) {
+            Ok(status) => {
+                if let Some(s) = reaping {
+                    let left = s.wait_empty(me, crate::reap::reap_within());
+                    if !left.is_empty() {
+                        println!(
+                            "exec_subordinate_e2e: LEFTOVER PROCESSES after the worker exited: pids={left:?}"
+                        );
+                        dump_diag(reaping, me);
+                        kill_group(pgid);
+                        s.reap_subtree(me);
+                        let _ = s.wait_empty(me, crate::reap::reap_within());
+                        s.remove_disposable_dirs();
+                        std::process::exit(1);
+                    }
+                }
+                match status.code() {
+                    Some(c) => std::process::exit(c),
+                    None => {
+                        println!("exec_subordinate_e2e: worker terminated by a signal: {status}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                println!(
+                    "exec_subordinate_e2e: WATCHDOG EXPIRED (the test did not finish within the deadline; descendants were killed)"
+                );
+                println!(
+                    "exec_subordinate_e2e: watchdog deadline_secs={} reason={e}",
+                    limit.as_secs()
+                );
+                dump_diag(reaping, me);
+                kill_group(pgid);
+                if let Some(s) = reaping {
+                    s.reap_subtree(me);
+                }
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                if let Some(s) = reaping {
+                    let left = s.wait_empty(me, crate::reap::reap_within());
+                    if !left.is_empty() {
+                        eprintln!(
+                            "exec_subordinate_e2e: processes remain after the kill: {left:?}"
+                        );
+                    }
+                    s.remove_disposable_dirs();
+                }
+                std::process::exit(EXIT_WATCHDOG_EXPIRED);
+            }
+        }
+    }
     // ----- コンテナ内の役 ----------------------------------------------------------------------------------
 
     /// pid1 の役。`/data/ready` へ準備完了を書き、親が terminate するまで待つ（寿命の上限つき）。
@@ -419,7 +875,8 @@ mod linux {
         }
     }
 
-    pub fn run() {
+    fn run() {
+        begin("preconditions");
         // 前提の確認（副作用の前に fail-closed。#2788）。
         if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() != Ok("1") {
             println!(
@@ -471,8 +928,11 @@ mod linux {
                 "exec_subordinate_e2e: util-linux nsenter and mount are required ({tool} is missing)"
             );
         }
-        let delegated = crate::precondition::delegated_cgroup();
+        // 親の watchdog を同伴として宣言する（`systemd-run --scope` では親と同じ cgroup にいて、退避の拒否〔他者の pid〕を
+        // 避けるため。親も退避リーフへ一緒に移る）。
+        let delegated = crate::precondition::delegated_cgroup().with_companions(&[watchdog_pid()]);
 
+        begin("scratch-and-bundle");
         // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
         let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
         let tag = std::process::id();
@@ -499,7 +959,9 @@ mod linux {
         let recorder = OpRecorder::new();
         let create_req =
             CreateRequest::new(id.clone(), bundle_dir.clone()).expect("absolute bundle");
+        begin("create");
         create(&store, &recorder, &create_req).expect("create");
+        begin("cgroup-chain");
 
         // 本番と同じ cgroup の連鎖（record_scope → create_cgroup → apply_limits → into_join）。配置が状態記録へ
         // 載らないと exec が拒否する。
@@ -532,12 +994,15 @@ mod linux {
                 (&ld, &config_a),
             );
         }));
+        begin("remove-cgroup");
         let removed = delegated.remove_child(&container_cgroup);
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
         removed.expect("remove container cgroup");
+        begin("cleanup");
         drop(work);
+        finish();
 
         println!(
             "exec_subordinate_e2e: create, start and exec under subordinate id mapping verified (root=false)"
@@ -621,6 +1086,7 @@ mod linux {
         let launcher: Arc<dyn ProcessLauncher> =
             Arc::new(build_launcher(Some(Arc::clone(container_cgroup))).expect("build launcher"));
 
+        begin("start");
         wait_single_thread();
         let started = start(
             store,
@@ -633,7 +1099,9 @@ mod linux {
         let pid = started.process().pid();
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_eq!(started.record().status().state(), ContainerState::Running);
+            begin("wait-ready");
             wait_ready(hostdata);
+            begin("record-readback");
             // exec の前に、Running の記録を入力として読み戻す（本番の supervisor と同じ）。exec が前提とする
             // 3 つ（cgroup の配置・launch_isolation・rlimits）が載っていることを明示的に確かめる。
             let record: StateRecord = store
@@ -659,6 +1127,7 @@ mod linux {
                 .expect("the launch pidfd must be held");
 
             // シナリオ A: 成功経路。
+            begin("exec-a");
             let sink = MemSink(std::sync::Mutex::new(Vec::new()));
             wait_single_thread();
             let request = ExecRequest::new("/probe", ["/probe", "--exec-probe", STATUS_FILE_A])
@@ -712,6 +1181,7 @@ mod linux {
                 "exec_subordinate_e2e: scenario=exec-user-applied uid=1000 gid=1000 groups=2000,3000 via ProductionLauncher create, start and run_command_with_pidfd"
             );
 
+            begin("exec-b");
             // シナリオ B: 写像の外の uid は exec が拒否し、コマンドは起動しない。uid の範囲の合計 + 1 は写像の外。
             let owner = SubIdOwner::new(own_ids().0, std::env::var("USER").ok()).expect("owner");
             let outside = range_total("/etc/subuid", &owner) + 1;
@@ -741,6 +1211,7 @@ mod linux {
             // シナリオ C: bind 先 `/data` に別のマウント（tmpfs）を重ねた後の exec は、launch 時のマウント識別子との
             // 照合（`MountCheck::Recorded`）で拒否され、コマンドは起動しない（SEC-1・SEC-4・CORE-5・#3201・#3291）。
             // 重ねたマウントは pid1 の mount namespace に残り戻せないので最後に置く（terminate で namespace ごと消える）。
+            begin("overmount");
             let recorded_mnt_id = record
                 .launch_isolation()
                 .and_then(|l| {
@@ -799,6 +1270,7 @@ mod linux {
                 "the overmounted tmpfs must hide the bind"
             );
 
+            begin("exec-c");
             let sink_c = MemSink(std::sync::Mutex::new(Vec::new()));
             wait_single_thread();
             let request_c = ExecRequest::new("/probe", ["/probe", "--exec-probe", STATUS_FILE_C])
@@ -842,6 +1314,7 @@ mod linux {
             );
         }));
         let (_record, process) = started.into_parts();
+        begin("terminate");
         let terminated = process.terminate(timeout());
         if let Err(p) = verified {
             if let Err(e) = &terminated {
@@ -852,10 +1325,12 @@ mod linux {
             std::panic::resume_unwind(p);
         }
         terminated.expect("terminate");
+        begin("wait-proc-gone");
         assert!(
             eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
             "/proc/{pid} must disappear after terminate"
         );
+        begin("wait-no-children");
         assert!(
             eventually(|| children_of_self().is_empty()),
             "no child may remain after terminate"

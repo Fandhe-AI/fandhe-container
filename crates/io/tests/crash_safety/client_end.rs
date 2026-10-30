@@ -1,8 +1,10 @@
 //! 結合試験用の UDS クライアント端点（`crash_safety.rs` と `power_loss.rs` が `#[path]` で共有する）。
 //!
-//! `src/` には UDS のクライアント側具象実装がないため、std の `UnixStream` を
-//! `FrameSender` / `FrameReceiver` として包み、`PipelineClient` から使えるようにする
-//! （IO-1・IO-2・IO-3。TASK-18）。
+//! 本番の UDS クライアント `UdsClientConnection`（#3165）は接続前のパス検査と接続先 uid の照合を
+//! 伴う。単一 sink モードのケースと `power_loss.rs` は生の `UnixStream` で接続したいため、std の
+//! `UnixStream` を `FrameSender` / `FrameReceiver` として包み、`PipelineClient` から使えるようにする
+//! この試験用の端点を残している（IO-1・IO-2・IO-3。TASK-18）。ファイル操作モードのケース
+//! （#3167）は本番の `UdsClientConnection` を使う。
 
 use std::io::{Read, Write as _};
 use std::os::unix::net::UnixStream;
@@ -14,8 +16,8 @@ use fandhe_container_io::{
 
 /// テスト用の UDS クライアント端点（`FrameSender` + `FrameReceiver`）。
 ///
-/// `src/` には UDS のクライアント側具象実装がないため（`client.rs` の doc 参照）、
-/// 本テストで `PipelineClient` を使えるよう std の `UnixStream` を包む。ACK の順序・種別の
+/// 本番の `UdsClientConnection`（#3165）の接続前検査を通さずに生の `UnixStream` で接続する
+/// 試験のために、`PipelineClient` から使えるよう std の `UnixStream` を包む。ACK の順序・種別の
 /// 検証は `PipelineClient::recv_ack` に任せ、ここでは観測数を水増ししない。
 /// 一度でも `Err` を返したら以後は `Unavailable` を返す（transport の poison 契約と同じ）。
 pub struct UnixClientEnd {

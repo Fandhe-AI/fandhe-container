@@ -15,7 +15,9 @@
 //! # 構築経路（偽造できないことの根拠）
 //!
 //! [`WriteAck`]・[`FlushAck`]・[`AckReceipt`] のフィールドはすべて非公開で、
-//! 生成できるのは本 crate 内の `AckReceipt::from_matched`（`pub(crate)`）
+//! 生成できるのは本 crate 内の `AckReceipt::from_matched` と
+//! `AckReceipt::from_nack`（いずれも `pub(crate)`。`from_nack` は v2 の
+//! ファイル操作要求への Nack 用で、[`RejectedRequest`] を作る。#3162・F12）
 //! だけである。これは [`crate::client::PipelineClient::recv_ack`] が、送信順・
 //! 種別対応を検証済みの [`crate::client::InFlightRequest`] とワイヤーから
 //! 復号した [`FrameKind`] からのみ呼び出す。相互変換（`WriteAck` ↔ `FlushAck`）
@@ -74,6 +76,8 @@ use std::time::{Duration, Instant};
 
 use crate::client::{InFlightRequest, RequestId};
 use crate::error::{IoError, IoErrorCode};
+use crate::nack_reason::NackReason;
+use crate::payload::NackCode;
 use crate::protocol::FrameKind;
 use crate::transport::IoTimeout;
 
@@ -204,6 +208,41 @@ pub enum AckReceipt {
     Write(WriteAck),
     /// [`FrameKind::FlushAck`]（IO-2）。
     Flush(FlushAck),
+    /// v2 のファイル操作要求（Create・WriteFile・Close）へのサーバーの Nack
+    /// （F8・F12。#3162）。要求単位の拒否で、接続は失効しない。
+    Rejected(RejectedRequest),
+}
+
+/// サーバーが要求単位で拒否したことを表す受領記録（`FrameKind::Nack`。F8・F10・F12。
+/// IO-1・REPAIR-4・#3162）。
+///
+/// Nack はその要求が効果を持たないことを表す（新設した空の祖先ディレクトリは
+/// 残りうる）。対象は Create・WriteFile・Close の要求だけで、Write・Flush への
+/// Nack はプロトコル違反として `recv_ack` が接続を失効させる。フィールドは非公開で、
+/// 生成できるのは `AckReceipt::from_nack`（`pub(crate)`）だけ。永続化の保証
+/// （[`FlushAck`]）へは変換できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedRequest {
+    request: InFlightRequest,
+    code: NackCode,
+    reason: NackReason,
+}
+
+impl RejectedRequest {
+    /// 拒否された、送信済みだった元のリクエストを返す。
+    pub fn request(&self) -> InFlightRequest {
+        self.request
+    }
+
+    /// 拒否の大分類（F10）。
+    pub fn code(&self) -> NackCode {
+        self.code
+    }
+
+    /// 拒否の理由（未知の値は [`NackReason::Other`]）。
+    pub fn reason(&self) -> NackReason {
+        self.reason
+    }
 }
 
 impl AckReceipt {
@@ -212,7 +251,9 @@ impl AckReceipt {
     ///
     /// [`crate::client::PipelineClient::recv_ack`] だけが呼び出す想定で、
     /// `request` は送信順・`ack_kind` はペイロード検証済みのワイヤー値を渡す。
-    /// `(Write, Ack)` → [`AckReceipt::Write`]、`(Flush, FlushAck)` →
+    /// `(Write, Ack)` と `(Create | WriteFile | Close, Ack)` → [`AckReceipt::Write`]
+    /// （IO-1 のバッファリング時点の保証。Create の Ack は名前空間に存在するまで、
+    /// Close の Ack はハンドルの解放だけを意味する。F8）、`(Flush, FlushAck)` →
     /// [`AckReceipt::Flush`] 以外の組み合わせは、呼び出し元がすでに
     /// `expected_ack_kind` で種別対応を検証しているため到達しないはずだが、
     /// `unwrap`・`expect` を使わず [`IoErrorCode::Internal`] を返して安全側
@@ -222,7 +263,10 @@ impl AckReceipt {
         ack_kind: FrameKind,
     ) -> Result<Self, IoError> {
         match (request.kind(), ack_kind) {
-            (FrameKind::Write, FrameKind::Ack) => Ok(AckReceipt::Write(WriteAck { request })),
+            (
+                FrameKind::Write | FrameKind::Create | FrameKind::WriteFile | FrameKind::Close,
+                FrameKind::Ack,
+            ) => Ok(AckReceipt::Write(WriteAck { request })),
             (FrameKind::Flush, FrameKind::FlushAck) => Ok(AckReceipt::Flush(FlushAck { request })),
             _ => Err(IoError::new(
                 IoErrorCode::Internal,
@@ -231,13 +275,38 @@ impl AckReceipt {
         }
     }
 
-    /// この ACK が対応付けた、送信済みだった元のリクエストを返す
-    /// （[`WriteAck::request`] / [`FlushAck::request`] の共通アクセサ。
-    /// TASK-12.2 時点の `AckReceipt::request` との互換のため残す）。
+    /// Create・WriteFile・Close への Nack から [`AckReceipt::Rejected`] を構築する
+    /// （`pub(crate)`。[`crate::client::PipelineClient::recv_ack`] だけが、送信順を
+    /// 検証した後に呼ぶ）。`request` がこれら 3 種別以外なら、到達しないはずだが
+    /// [`IoErrorCode::Internal`] で拒否する（fail-closed）。
+    pub(crate) fn from_nack(
+        request: InFlightRequest,
+        code: NackCode,
+        reason: NackReason,
+    ) -> Result<Self, IoError> {
+        match request.kind() {
+            FrameKind::Create | FrameKind::WriteFile | FrameKind::Close => {
+                Ok(AckReceipt::Rejected(RejectedRequest {
+                    request,
+                    code,
+                    reason,
+                }))
+            }
+            _ => Err(IoError::new(
+                IoErrorCode::Internal,
+                "nack received for a request kind that cannot be rejected; this must not happen",
+            )),
+        }
+    }
+
+    /// この応答が対応付けた、送信済みだった元のリクエストを返す
+    /// （[`WriteAck::request`] / [`FlushAck::request`] / [`RejectedRequest::request`]
+    /// の共通アクセサ。TASK-12.2 時点の `AckReceipt::request` との互換のため残す）。
     pub fn request(&self) -> InFlightRequest {
         match self {
             AckReceipt::Write(ack) => ack.request(),
             AckReceipt::Flush(ack) => ack.request(),
+            AckReceipt::Rejected(rejected) => rejected.request(),
         }
     }
 }
@@ -254,6 +323,10 @@ impl TryFrom<AckReceipt> for WriteAck {
                 IoErrorCode::InvalidArgument,
                 "AckReceipt is a Flush ack, not a Write ack",
             )),
+            AckReceipt::Rejected(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is a rejection, not a Write ack",
+            )),
         }
     }
 }
@@ -269,6 +342,26 @@ impl TryFrom<AckReceipt> for FlushAck {
             AckReceipt::Write(_) => Err(IoError::new(
                 IoErrorCode::InvalidArgument,
                 "AckReceipt is a Write ack, not a Flush ack",
+            )),
+            AckReceipt::Rejected(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is a rejection, not a Flush ack",
+            )),
+        }
+    }
+}
+
+impl TryFrom<AckReceipt> for RejectedRequest {
+    type Error = IoError;
+
+    /// `receipt` が [`AckReceipt::Rejected`] でなければ
+    /// [`IoErrorCode::InvalidArgument`] で拒否する。
+    fn try_from(receipt: AckReceipt) -> Result<Self, Self::Error> {
+        match receipt {
+            AckReceipt::Rejected(rejected) => Ok(rejected),
+            AckReceipt::Write(_) | AckReceipt::Flush(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is an ack, not a rejection",
             )),
         }
     }
@@ -1541,7 +1634,7 @@ mod tests {
             AckReceipt::from_matched(request, FrameKind::Ack).expect("must accept (Write, Ack)");
         match receipt {
             AckReceipt::Write(ack) => assert_eq!(ack.request().id().get(), request.id().get()),
-            AckReceipt::Flush(_) => panic!("expected Write variant"),
+            _ => panic!("expected Write variant"),
         }
     }
 
@@ -1553,7 +1646,7 @@ mod tests {
             .expect("must accept (Flush, FlushAck)");
         match receipt {
             AckReceipt::Flush(ack) => assert_eq!(ack.request().id().get(), request.id().get()),
-            AckReceipt::Write(_) => panic!("expected Flush variant"),
+            _ => panic!("expected Flush variant"),
         }
     }
 

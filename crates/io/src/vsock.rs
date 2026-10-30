@@ -280,8 +280,9 @@ fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoErro
 }
 
 /// クライアント側が受信してはならない要求系種別（`Write`・`Flush`・`Create`・
-/// `WriteFile`・`Close`）を拒否する。`Nack` は受理するが、型つきの処理は #3162 まで
-/// 未実装で、`recv_ack` の `decode_ack` が `InvalidArgument` で失効させる（fail-closed）。
+/// `WriteFile`・`Close`）を拒否する。`Nack` は受理する。型つきの処理は
+/// `PipelineClient::recv_ack`（#3162）が行い、Create・WriteFile・Close への Nack だけを
+/// `AckReceipt::Rejected` として返し、それ以外はプロトコル違反として失効させる（fail-closed）。
 fn reject_server_originated_request_frame(kind: FrameKind) -> Result<(), IoError> {
     match kind {
         FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Ok(()),

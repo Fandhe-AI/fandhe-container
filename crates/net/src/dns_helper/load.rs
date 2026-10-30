@@ -86,7 +86,7 @@ pub struct LoadedUpstreams {
 
 /// メンバー記録の `--dns`（FCMEM1 の `dns` 項目）から、コンテナのアドレスごとの上流を導く（純関数。NET-12・D11・#3072）。
 ///
-/// 記録は untrusted として扱い、decode 時の検証に加えて [`DnsUpstreamMap::set`](super::DnsUpstreamMap::set) と同じ
+/// 記録は untrusted として扱い、decode 時の検証に加えて `DnsUpstreamMap::set` と同じ
 /// 検証（`validated_list`）を通す。`gateway` はヘルパー自身の待ち受けアドレスで、上流に指定されたメンバーは飛ばす。
 /// `dns` が空のメンバーは結果に入れない（転送しない）。同じアドレスのメンバーが複数あれば、他コンテナの上流を
 /// 奪えないよう**どれも登録しない**（名前の衝突の扱いと同じ fail-closed）。衝突は `dns` の検証より先に数え、

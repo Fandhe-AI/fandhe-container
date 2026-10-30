@@ -945,7 +945,7 @@ mod tests {
         );
     }
 
-    /// NET-12・REPAIR-3・#3072: 上限超過で読み込みが失敗したとき、名前も上流も前の状態を保つ（半端に更新しない）。
+    /// NET-12・REPAIR-3・#3072: 記録ファイルの破損（DataLoss）で読み込みが失敗したとき、名前も上流も前の状態を保つ（半端に更新しない）。
     #[test]
     fn net12_3072_load_failure_keeps_previous_state() {
         let root = Root::new("keep");

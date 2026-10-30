@@ -89,10 +89,12 @@ pub struct LoadedUpstreams {
 /// 記録は untrusted として扱い、decode 時の検証に加えて [`DnsUpstreamMap::set`](super::DnsUpstreamMap::set) と同じ
 /// 検証（`validated_list`）を通す。`gateway` はヘルパー自身の待ち受けアドレスで、上流に指定されたメンバーは飛ばす。
 /// `dns` が空のメンバーは結果に入れない（転送しない）。同じアドレスのメンバーが複数あれば、他コンテナの上流を
-/// 奪えないよう**どれも登録しない**（名前の衝突の扱いと同じ fail-closed）。
+/// 奪えないよう**どれも登録しない**（名前の衝突の扱いと同じ fail-closed）。衝突は `dns` の検証より先に数え、
+/// 片方の `dns` が無効でも衝突に含める（無効な側だけが落ちて他方が登録される状況を作らない）。
 pub fn upstreams_from_members(members: &[MemberRecord], gateway: Ipv4Addr) -> LoadedUpstreams {
     let mut out = LoadedUpstreams::default();
-    let mut by_addr: HashMap<Ipv4Addr, (Option<UpstreamList>, usize)> = HashMap::new();
+    // 値は (上流リスト, 上流の指定が無効だったか, 件数)。無効なメンバーもアドレスの衝突には数える。
+    let mut by_addr: HashMap<Ipv4Addr, (Option<UpstreamList>, bool, usize)> = HashMap::new();
     let mut order: Vec<Ipv4Addr> = Vec::new();
     for m in members {
         let IpAddr::V4(addr) = m.address().addr() else {
@@ -100,31 +102,32 @@ pub fn upstreams_from_members(members: &[MemberRecord], gateway: Ipv4Addr) -> Lo
             continue;
         };
         let servers = m.dns();
-        let list = if servers.is_empty() {
-            None
+        let (list, invalid) = if servers.is_empty() {
+            (None, false)
         } else {
             match validated_list(gateway, servers) {
-                Ok(l) => Some(l),
-                Err(_) => {
-                    out.skipped_invalid += 1;
-                    continue;
-                }
+                Ok(l) => (Some(l), false),
+                Err(_) => (None, true),
             }
         };
         match by_addr.get_mut(&addr) {
-            Some((_, n)) => *n += 1,
+            Some((_, _, n)) => *n += 1,
             None => {
                 order.push(addr);
-                by_addr.insert(addr, (list, 1));
+                by_addr.insert(addr, (list, invalid, 1));
             }
         }
     }
     for addr in order {
-        let Some((list, n)) = by_addr.remove(&addr) else {
+        let Some((list, invalid, n)) = by_addr.remove(&addr) else {
             continue;
         };
         if n > 1 {
             out.dropped_collisions += n;
+            continue;
+        }
+        if invalid {
+            out.skipped_invalid += 1;
             continue;
         }
         if let Some(list) = list {
@@ -261,5 +264,16 @@ mod tests {
         assert_eq!(l.dropped_collisions, 2);
         assert_eq!(l.entries.len(), 1);
         assert_eq!(l.entries[0].0, Ipv4Addr::new(10, 89, 0, 3));
+    }
+
+    /// NET-12・SEC-1・#3072: 同じアドレスの片方の `dns` が無効でも衝突として両方を落とす（有効な側だけが登録されない）。
+    #[test]
+    fn net12_3072_duplicate_address_with_invalid_dns_drops_both() {
+        let bad = member_dns("bad", 2, &[IpAddr::V4(GW)]);
+        let good = member_dns("good", 2, &[ip(192, 0, 2, 53)]);
+        let l = upstreams_from_members(&[bad, good], GW);
+        assert_eq!(l.dropped_collisions, 2);
+        assert_eq!(l.skipped_invalid, 0);
+        assert!(l.entries.is_empty());
     }
 }

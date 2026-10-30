@@ -10,6 +10,9 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+/// `flood_forever` が 4 KiB を書くごとに挟む休み（書き込み速度の上限。1 秒で最大 500 回 = 約 2 MiB）。
+const FLOOD_PAUSE: Duration = Duration::from_millis(2);
+
 const CHILD_ENV: &str = "FANDHE_CONTAINER_REAP_SUPPORT_CHILD";
 
 /// 子の役。環境変数があるときだけ上限つきで眠る（通常実行では即座に返る no-op）。
@@ -51,11 +54,14 @@ fn reap_support_child_floods() {
         out.flush().expect("flush");
     } else if role == "flood_forever" {
         // 親に kill されるまで書き続ける（上限で打ち切られることの確認用。念のため 60 秒で自分も止まる）。
+        // 後始末が漏れても出力先のディスクを埋めないよう、書き込みに速度上限をつける（4 KiB / 2 ms 以下
+        // = 毎秒 2 MiB 程度。60 秒でも百数十 MiB。REPAIR-5・REPAIR-12・#3504）。
         let until = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < until {
             if out.write_all(&chunk).is_err() {
                 break;
             }
+            std::thread::sleep(FLOOD_PAUSE);
         }
     }
 }
@@ -621,4 +627,61 @@ fn repair5_repair12_kill_eperm_unreaped_and_other_failures_are_immediate_errors(
         &mut || reap::KillOnce::Failed("boom".into()),
     );
     assert_eq!(r, Err("kill process group 7 failed: boom".to_string()));
+}
+
+/// `flood_forever` の書き込み速度の上限（REPAIR-5・REPAIR-12・#3504）: 約 1 秒で書く量は 4 KiB 以上
+/// 4 MiB 以下（理論上限は 1 秒 500 回 x 4 KiB = 約 2 MiB）。上限を外すと数百 MiB に達する。
+#[cfg(unix)]
+#[test]
+fn repair5_repair12_flood_forever_write_rate_is_bounded() {
+    let mut cmd = self_cmd(FLOOD_TEST, "flood_forever");
+    let (mut child, captured) =
+        reap::spawn_captured_capped(&mut cmd, 1 << 30).expect("spawn captured");
+    std::thread::sleep(Duration::from_secs(1));
+    let size = std::fs::metadata(&captured.out_path).map(|m| m.len());
+    // 先に後始末して、書き続ける子を残さない。
+    // 期限つきで kill・回収する（REPAIR-5）。失敗しても discard を先に済ませてから表に出す。
+    let reaped = reap::reap(&mut child, reap::reap_within());
+    let discarded = captured.discard();
+    reaped.expect("reap flooding child");
+    discarded.expect("discard");
+    let size = size.expect("metadata");
+    assert!(
+        (4096..=4 << 20).contains(&size),
+        "write rate out of bounds: {size} bytes in about 1s"
+    );
+}
+
+/// `finish` / `discard` を経ずに drop された `Captured` は、書き続ける孫のグループを kill し、一時ファイルを
+/// 残さない（REPAIR-5・REPAIR-12・#3504）。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_repair12_captured_drop_without_finish_kills_group_and_removes_files() {
+    let mut cmd = self_cmd("reap_support_child_leaves_flooder", "holder_flood");
+    let (mut child, captured) =
+        reap::spawn_captured_capped(&mut cmd, 1 << 30).expect("spawn captured");
+    let pgid = child.id();
+    let (out_path, err_path) = (captured.out_path.clone(), captured.err_path.clone());
+    let st = reap::wait_within(&mut child, Duration::from_secs(30)).expect("child exit");
+    assert!(st.success(), "child status: {st:?}");
+    assert!(
+        group_members(pgid) >= 1,
+        "no flooding grandchild in group {pgid}"
+    );
+    drop(captured);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while group_members(pgid) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(group_members(pgid), 0, "grandchild survived drop");
+    assert!(
+        !out_path.exists(),
+        "stdout file left: {}",
+        out_path.display()
+    );
+    assert!(
+        !err_path.exists(),
+        "stderr file left: {}",
+        err_path.display()
+    );
 }

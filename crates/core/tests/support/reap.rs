@@ -499,7 +499,7 @@ impl Pipes {
 /// `spawn_captured` が作った出力の受け皿（一時ファイルの組）。`finish` で読んで消すか、`discard` で消す。
 pub struct Captured {
     pub(crate) out_path: std::path::PathBuf,
-    err_path: std::path::PathBuf,
+    pub(crate) err_path: std::path::PathBuf,
     cap: u64,
     /// 子を先頭にしたプロセスグループ ID（0 は「グループなし」で kill しない。Unix 以外は常に 0）。
     pgid: u32,
@@ -507,6 +507,30 @@ pub struct Captured {
     pub(crate) pipes: Option<Pipes>,
     /// 直接の子を回収済み（`finish` に渡された status か `wait_within` が回収した）。`kill_group` の EPERM 判断に使う。
     reaped: std::sync::atomic::AtomicBool,
+    /// `finish` / `discard` が後始末（グループの kill と一時ファイルの回収）を引き受けた印。立っていれば
+    /// `Drop` は何もしない（回収済みの pgid が再利用された無関係のグループを撃たないため）。
+    settled: std::sync::atomic::AtomicBool,
+}
+
+/// `finish` / `discard` を経ずに drop された（試験の panic・早期 return 等）ときの後始末（REPAIR-5・
+/// REPAIR-12・#3504）。子孫のグループを kill し、出力ファイルを 0 へ切り詰めて消す。これが無いと、出力先を
+/// 継承した書き続ける孫が居残って一時ファイルを増やし続け、ランナーのディスクを埋めうる。kill の失敗は
+/// stderr に出すだけで panic しない（drop 中の二重 panic を避ける）。Unix 以外は pgid 0 のため kill しない。
+impl Drop for Captured {
+    fn drop(&mut self) {
+        if self.settled.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = kill_group(self.pgid, self.reaped.load(Ordering::Relaxed)) {
+            eprintln!("{e}");
+        }
+        self.truncate();
+        if self.pipes.is_none() {
+            for p in [&self.out_path, &self.err_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
 }
 
 impl Captured {
@@ -514,6 +538,7 @@ impl Captured {
     /// 読み取りに失敗した場合は `Err`（途中までの出力は返さない）。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn finish(self, status: ExitStatus) -> Result<Output, String> {
+        self.settled.store(true, Ordering::Relaxed);
         // 出力先を継承した子孫が居残って書き続けないよう、読む前にグループの残りを止める。
         // 失敗しても一時ファイルの回収は進め、止められなかったことを `Err` で表に出す。
         // status を受け取っているので直接の子は回収済み。
@@ -634,6 +659,7 @@ impl Captured {
     /// 子孫が後で書いても、すでに溜まった分の領域を残さない。
     #[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
     pub fn discard(self) -> Result<(), String> {
+        self.settled.store(true, Ordering::Relaxed);
         let killed = kill_group(self.pgid, self.reaped.load(Ordering::Relaxed));
         self.truncate();
         if self.pipes.is_none() {
@@ -677,6 +703,7 @@ pub(crate) fn spawn_captured_mode(
         pgid: 0,
         pipes: None,
         reaped: std::sync::atomic::AtomicBool::new(false),
+        settled: std::sync::atomic::AtomicBool::new(false),
     };
     cmd.stdin(Stdio::null());
     match mode {

@@ -33,7 +33,8 @@
 //! 「種別(rootful・非 Linux は `UNIMPLEMENTED`)→ pasta のフラグの有無 → 定義の照合(無ければ `NOT_FOUND`)→ pasta の
 //! 解決(子プロセスの起動)」で、存在しないネットワークのために子プロセスを起動しない。いずれも状態ルート・`@networks`・
 //! イメージストアの作成と `--env-file` の読み取りより前(D2)。その後の [`reject_unwired_network`] が残す拒否は
-//! `container:` と非 Linux の network 系の指定だけ。start でも同じ照合をやり直す(supervisor の手順 2c。D10)。
+//! `container:` と非 Linux の network 系の指定だけ。start でも同じ照合をやり直す(supervisor の手順 2c。D10)。さらに状態記録の作成の直前に、全体の共有ロックを保持した 2 回目の
+//! 照合を行い、core の create が戻るまで放さない([`with_named_definition_held`]。`network rm` の窓を閉じる。#3550)。
 //!
 //! # 未実装の将来仕様(REPAIR-3)
 //!
@@ -47,7 +48,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError};
 use fandhe_container_core::state_store::StateRoot;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 use fandhe_container_net::add_host_dns::resolv_conf::ResolvConfPlan;
@@ -55,12 +58,12 @@ use fandhe_container_net::add_host_dns::{parse_add_hosts, parse_ip_addr};
 use fandhe_container_net::instrument::NetOpRecorder;
 use fandhe_container_net::network::NetworkName;
 use fandhe_container_net::network_mode::{NetworkChoice, NetworkMode};
-use fandhe_container_net::network_store::DEFAULT_LOCK_TIMEOUT;
+use fandhe_container_net::network_store::{DEFAULT_LOCK_TIMEOUT, NetworkStore};
 use fandhe_container_net::pasta::PastaPortForwards;
 
 use fandhe_container_supervisor::container_options::network::{NetworkOptions, net_error_to_trait};
 use fandhe_container_supervisor::container_options::network_definition::{
-    DefinitionCheck, check_pasta_definition,
+    DefinitionCheck, check_pasta_definition, check_pasta_definition_locked,
 };
 
 use super::args::{CreateNetworkArgs, GlobalArgs};
@@ -235,7 +238,12 @@ fn require_named_definition_at(
     name: &NetworkName,
     recorder: Option<Arc<dyn NetOpRecorder>>,
 ) -> Result<(), TraitError> {
-    check_pasta_definition(root, name, DEFAULT_LOCK_TIMEOUT, recorder).map_err(|c| match c {
+    check_pasta_definition(root, name, DEFAULT_LOCK_TIMEOUT, recorder).map_err(definition_failure)
+}
+
+/// 照合の分類を create の契約(コードと固定文言)へ写す。早い段と保持区間の 2 回の照合で共有する(REPAIR-1)。
+fn definition_failure(c: DefinitionCheck) -> TraitError {
+    match c {
         DefinitionCheck::Missing => TraitError::new(ErrorCode::NotFound, MSG_NOT_FOUND),
         DefinitionCheck::NotPasta => {
             TraitError::new(ErrorCode::FailedPrecondition, MSG_NOT_ROOTLESS)
@@ -244,7 +252,42 @@ fn require_named_definition_at(
         DefinitionCheck::Store(e) => {
             fandhe_container_supervisor::net_error::net_error_to_trait_keeping_code(&e)
         }
-    })
+    }
+}
+
+/// 定義を照合し、全体の共有ロックを保持したまま `body`(FCOPT1 の書き込みと core の create)を実行する
+/// (NET-6・NET-9・CLI-1・REPAIR-5・#3550。設計は `network-wiring.md` D10)。
+///
+/// `run_create` が `reclaim_stale_container_log` の後・`create_with_options` の直前に呼ぶ。早い段の読み取りだけの
+/// 照合(D2)は残し、これは 2 回目の照合になる。ロックは `body` が戻るまで(成功・失敗とも)放さないので、
+/// `network rm`(全体の排他ロックの下で参照を走査して削除)は create の状態記録が見えるまで待たされ、
+/// 待ちは期限(`lock_timeout`)で `TIMEOUT` になる。照合の失敗では `body` を呼ばず何も作らない。
+/// ロック順は「net の全体 → 状態ストアの `@lock`・FCOPT1 の ID ロック」で、逆順の経路は無い。
+/// `body` の中で pasta の解決などの子プロセス起動をしないこと(ロックを長く持たない)。
+pub(super) fn with_named_definition_held<T>(
+    root: &Path,
+    name: &NetworkName,
+    lock_timeout: Duration,
+    recorder: Option<Arc<dyn NetOpRecorder>>,
+    body: impl FnOnce() -> Result<T, OciRuntimeError>,
+) -> Result<T, OciRuntimeError> {
+    let fail = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Create, e);
+    let opened = match recorder {
+        Some(r) => NetworkStore::open_existing_with_recorder(root, r),
+        None => NetworkStore::open_existing(root),
+    };
+    let store = match opened {
+        Ok(Some(s)) => s.with_lock_timeout(lock_timeout),
+        Ok(None) => return Err(fail(definition_failure(DefinitionCheck::Missing))),
+        Err(e) => return Err(fail(definition_failure(DefinitionCheck::Store(e)))),
+    };
+    let guard = store
+        .lock_global_shared()
+        .map_err(|e| fail(definition_failure(DefinitionCheck::Store(e))))?;
+    check_pasta_definition_locked(&guard, name).map_err(|c| fail(definition_failure(c)))?;
+    let result = body();
+    drop(guard);
+    result
 }
 
 /// 起動経路に結線されていない指定を `Unimplemented` で拒否する(D3・#1873。形式の検証は済んでいる前提)。

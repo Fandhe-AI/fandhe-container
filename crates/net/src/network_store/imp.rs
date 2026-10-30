@@ -314,6 +314,8 @@ impl std::fmt::Debug for NetworkStore {
 pub struct GlobalLockGuard<'a> {
     store: &'a NetworkStore,
     file: File,
+    /// 共有ロックか。定義の削除は排他ロックでだけ許す（#3550）。
+    shared: bool,
 }
 
 /// ネットワークのロックのガード。[`GlobalLockGuard`] を借用してしか作れない（順序「全体 → ネットワーク」の強制）。
@@ -520,7 +522,11 @@ impl NetworkStore {
                 "network store lock file was replaced",
             ));
         }
-        Ok(GlobalLockGuard { store: self, file })
+        Ok(GlobalLockGuard {
+            store: self,
+            file,
+            shared,
+        })
     }
 
     /// 全体の共有ロックを取る（期限つき）。
@@ -743,6 +749,18 @@ impl NetworkStore {
     ) -> Result<(), NetError> {
         record_net_op(&*self.recorder, NetOpKind::NetworkStoreRemove, || {
             let g = self.lock_global_exclusive()?;
+            self.remove_locked(&g, name, sync)
+        })
+    }
+
+    /// [`remove`](Self::remove) の本体。全体の排他ロックを保持している呼び出し元が使う（ロックを取り直さない）。
+    fn remove_locked(
+        &self,
+        g: &GlobalLockGuard<'_>,
+        name: &NetworkName,
+        sync: &dyn Fn(&Dir) -> Result<(), NetError>,
+    ) -> Result<(), NetError> {
+        {
             let n = g.lock_network(name)?;
             n.discard_stale_temps()?;
             // 排他ロックの下で、realized / realized.intent の書き込み残骸（`@tmp-*`）を先に掃除する。
@@ -784,7 +802,7 @@ impl NetworkStore {
             // 名前は原子的に消えた。中身の後始末の失敗は残骸として残り、次の create が掃除する。
             remove_tree(&self.dir, &gone);
             Ok(())
-        })
+        }
     }
 }
 
@@ -840,6 +858,30 @@ impl GlobalLockGuard<'_> {
     pub fn list(&self) -> Result<NetworkListing, NetError> {
         record_net_op(&*self.store.recorder, NetOpKind::NetworkStoreList, || {
             self.store.list_locked()
+        })
+    }
+
+    /// 定義を 1 件読む（[`NetworkStore::get`] と同じ結果）。すでに全体のロックを持つ呼び出し元用で、ロックを
+    /// 取り直さない（排他ロックの下で `NetworkStore::get` を呼ぶと自分のロックを待って `Timeout` になる）。
+    /// 無ければ `NotFound`。`network rm` の「判定から削除までを排他ロックの下で行う」順序が使う
+    /// （NET-6・NET-9・CLI-1・REPAIR-5・#3550）。
+    pub fn get(&self, name: &NetworkName) -> Result<NetworkDefinition, NetError> {
+        record_net_op(&*self.store.recorder, NetOpKind::NetworkStoreGet, || {
+            self.store.read_one(name.as_str())
+        })
+    }
+
+    /// 定義を消す（[`NetworkStore::remove`] と同じ検査）。すでに全体の**排他**ロックを持つ呼び出し元用で、
+    /// ロックを取り直さない。共有ロックのガードからの呼び出しは `FailedPrecondition` で拒否する（#3550）。
+    pub fn remove(&self, name: &NetworkName) -> Result<(), NetError> {
+        record_net_op(&*self.store.recorder, NetOpKind::NetworkStoreRemove, || {
+            if self.shared {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "network removal requires the exclusive store lock",
+                ));
+            }
+            self.store.remove_locked(self, name, &Dir::sync)
         })
     }
 
@@ -988,6 +1030,31 @@ mod tests {
             NetErrorCode::ResourceExhausted
         );
         assert_eq!(fs::read_dir(t.nets()).unwrap().count(), before);
+    }
+
+    /// NET-6・NET-9・REPAIR-5（#3550）: 排他ガードの下で get → remove が自己デッドロックせず成功し、
+    /// 共有ガードからの remove は定義を消さずに `FailedPrecondition` で拒否する。
+    #[test]
+    fn net6_3550_guard_get_and_remove_under_held_lock() {
+        let t = Tmp::new("guardrm");
+        let s = NetworkStore::open(&t.0)
+            .unwrap()
+            .with_lock_timeout(Duration::from_millis(300));
+        s.create(&pasta("a")).unwrap();
+        {
+            let g = s.lock_global_shared().unwrap();
+            assert_eq!(g.get(&nn("a")).unwrap(), pasta("a"));
+            assert_eq!(code(g.remove(&nn("a"))), NetErrorCode::FailedPrecondition);
+            assert_eq!(code(g.get(&nn("zz"))), NetErrorCode::NotFound);
+        }
+        assert_eq!(s.get(&nn("a")).unwrap(), pasta("a"));
+        {
+            let g = s.lock_global_exclusive().unwrap();
+            assert_eq!(g.get(&nn("a")).unwrap(), pasta("a"));
+            g.remove(&nn("a")).unwrap();
+            assert_eq!(code(g.get(&nn("a"))), NetErrorCode::NotFound);
+        }
+        assert_eq!(code(s.get(&nn("a"))), NetErrorCode::NotFound);
     }
 
     #[test]

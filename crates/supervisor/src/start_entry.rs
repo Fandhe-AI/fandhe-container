@@ -3137,7 +3137,7 @@ mod linux {
         if let Some(crate::container_options::network::NetworkSelection::Named(name)) =
             options.network().selection()
         {
-            recheck_named_definition(state_root, name)?;
+            recheck_named_definition(state_root, name, id, logs)?;
         }
         let started = Instant::now();
         if doc.pasta().is_some() {
@@ -3199,14 +3199,22 @@ mod linux {
     fn recheck_named_definition(
         state_root: &std::path::Path,
         name: &fandhe_container_net::network::NetworkName,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
     ) -> Result<(), TraitError> {
-        crate::container_options::network_definition::check_pasta_definition(
-            state_root,
-            name,
-            NETWORK_DEFINITION_LOCK_TIMEOUT,
-            None,
-        )
-        .map_err(map_definition_check)
+        // 定義ストアの open / get の成否と所要時間を、照合の後に遅延ログへ積む(REPAIR-4)。
+        let collector = Arc::new(crate::pasta_attach::CollectNetOps::default());
+        let result =
+            crate::container_options::network_definition::check_pasta_definition(
+                state_root,
+                name,
+                NETWORK_DEFINITION_LOCK_TIMEOUT,
+                Some(Arc::clone(&collector)
+                    as Arc<dyn fandhe_container_net::instrument::NetOpRecorder>),
+            )
+            .map_err(map_definition_check);
+        crate::pasta_attach::log_network_store_ops(logs, id.as_str(), &collector.take());
+        result
     }
 
     /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
@@ -4410,7 +4418,13 @@ mod linux {
             store
                 .create(&NetworkDefinition::pasta("web").expect("def"))
                 .expect("create");
+            let _ = logs.take();
             options_with_verified_pasta(&named, &id, &logs, &root).expect("present");
+            // 定義ストアの open / get の成否と所要時間が遅延ログに積まれる(REPAIR-4)。
+            let lines = logs.take().join("");
+            assert!(lines.contains("\"event\":\"network_store_op\""), "{lines}");
+            assert!(lines.contains("\"op\":\"network.store.get\""), "{lines}");
+            assert!(lines.contains("\"result\":\"ok\""), "{lines}");
             // 消されると再び拒否する。
             store
                 .remove(&fandhe_container_net::network::NetworkName::new("web").expect("n"))

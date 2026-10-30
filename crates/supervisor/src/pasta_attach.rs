@@ -255,6 +255,57 @@ pub(crate) fn log_pasta_verify(
     buffer.push(json_line("pasta_verify", container, &f));
 }
 
+/// 定義照合が使う定義ストアの操作の計測を集める `NetOpRecorder`(start の手順 2c の作業スレッド用。REPAIR-4・NET-6・#3329)。
+///
+/// 作業スレッドは構造化ログを直接出せない(単一スレッドの区間)ため、サンプルを溜め、照合の後に
+/// [`log_network_store_ops`] が遅延バッファへ `network_store_op` の行として積む。件数は上限つき(無制限確保を避ける)。
+#[derive(Debug, Default)]
+pub(crate) struct CollectNetOps {
+    samples: Mutex<Vec<fandhe_container_net::instrument::NetOpSample>>,
+}
+
+impl CollectNetOps {
+    /// 溜めたサンプルを取り出す。
+    pub(crate) fn take(&self) -> Vec<fandhe_container_net::instrument::NetOpSample> {
+        std::mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl fandhe_container_net::instrument::NetOpRecorder for CollectNetOps {
+    fn record_net_op(&self, sample: &fandhe_container_net::instrument::NetOpSample) {
+        let mut g = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.len() < 16 {
+            g.push(*sample);
+        }
+    }
+}
+
+/// 溜めた定義ストアの操作(`network.store.open` / `network.store.get`)を `network_store_op` として遅延バッファへ積む
+/// (成否とロック待ちを含む所要時間。REPAIR-4)。名前・パスは載せない(ERR-1)。
+pub(crate) fn log_network_store_ops(
+    buffer: &PastaLogBuffer,
+    container: &str,
+    samples: &[fandhe_container_net::instrument::NetOpSample],
+) {
+    use fandhe_container_net::instrument::NetOpOutcome;
+    for s in samples {
+        let result = if s.outcome() == NetOpOutcome::Success {
+            "ok"
+        } else {
+            "error"
+        };
+        buffer.push(json_line(
+            "network_store_op",
+            container,
+            &[
+                ("op", Val::S(s.kind().as_str())),
+                ("result", Val::S(result)),
+                ("elapsed_ms", Val::U(millis(s.latency()))),
+            ],
+        ));
+    }
+}
+
 /// 手順 2c の作業スレッドが期限内に戻らなかったことを `pasta_verify`(`result:"timeout"`)として遅延バッファへ積む
 /// (REPAIR-4・REPAIR-5・NET-9・#3431)。
 ///

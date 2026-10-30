@@ -30,7 +30,8 @@
 //! 再検証や取り消しの失敗・送受信の失敗・プロトコル違反）は接続全体の失敗で、**そのバッチの
 //! 応答を 1 件も送らず**に終える。実行相と送信相を分けているのはこのためで、実行済みの
 //! `Create` / `WriteFile` の結果は「不定」になりうる（`write_batch` の D6 と同じ意味論）。
-//! 同じハンドル id の `Create` が表に既にあるのはプロトコル違反（接続全体の `InvalidArgument`）。
+//! request id は接続内で単調増加（F6）。重複・逆戻り（Close 後の同じ id の `Create` を含む）は
+//! 副作用の前にプロトコル違反（接続全体の `InvalidArgument`）で終える。Nack になった要求の id も消費する。
 //!
 //! # 受信上限（`pending_frames = 0` の不変条件）
 //! 実行は同期で、`Ready` になったバッチをその場で実行・応答してから次を受信する。受信層の
@@ -51,8 +52,8 @@ use crate::error::{IoError, IoErrorCode};
 use crate::guest_files::{GuestFileCreator, classify_create_failure};
 use crate::instrument::{IoOpKind, IoOpRecorder, IoOpTimer, NoopIoOpRecorder};
 use crate::payload::{
-    NackCode, NackReason, decode_close, decode_create, decode_request, decode_write_file,
-    encode_ack, encode_nack,
+    NackCode, NackReason, decode_close, decode_create, decode_nack, decode_request,
+    decode_write_file, encode_ack, encode_nack,
 };
 use crate::protocol::{Frame, FrameKind};
 use crate::transport::{FrameReceiver, FrameSender, IoTimeout};
@@ -255,6 +256,7 @@ where
         creator,
         recorder,
         max_open: limits.max_open_files().get(),
+        last_request_id: None,
         stats: FileServeStats::default(),
     };
     let mut buffer = BatchBuffer::new(config);
@@ -271,6 +273,8 @@ struct FileServer<'a> {
     creator: &'a GuestFileCreator,
     recorder: &'a dyn IoOpRecorder,
     max_open: usize,
+    /// 受理した最後の request id。単調増加の検査用（接続内で再利用させない）。
+    last_request_id: Option<u64>,
     stats: FileServeStats,
 }
 
@@ -405,6 +409,13 @@ impl FileServer<'_> {
             conn.send_frame(response, send)?;
             if response.kind() == FrameKind::Nack {
                 self.stats.nacks_sent = self.stats.nacks_sent.saturating_add(1);
+                let envelope = decode_nack(response).map_err(|_| {
+                    IoError::new(
+                        IoErrorCode::Internal,
+                        "failed to decode a Nack built by this server",
+                    )
+                })?;
+                self.stats.nacks_by_reason.record(envelope.reason());
             } else {
                 self.stats.acks_sent = self.stats.acks_sent.saturating_add(1);
             }
@@ -414,6 +425,7 @@ impl FileServer<'_> {
 
     /// 要求 1 件を実行して応答フレームを返す。再復号の失敗は構造上起きないが `Internal` に写す。
     fn execute(&mut self, frame: &Frame) -> Result<Frame, IoError> {
+        self.admit_request_id(frame)?;
         let redecode = |_: IoError| {
             IoError::new(
                 IoErrorCode::Internal,
@@ -440,14 +452,39 @@ impl FileServer<'_> {
         }
     }
 
+    /// request id が接続内で単調増加であることを副作用の前に確かめて消費する（F6）。重複・
+    /// 逆戻りはプロトコル違反（接続全体の `InvalidArgument`）。失敗した要求の id も消費するので、
+    /// Close 後や Nack 後の id 再利用でハンドルが使い回されない。
+    fn admit_request_id(&mut self, frame: &Frame) -> Result<(), IoError> {
+        let id = match frame.kind() {
+            FrameKind::Create => decode_create(frame).map(|e| e.id().get()),
+            FrameKind::WriteFile => decode_write_file(frame).map(|e| e.id().get()),
+            FrameKind::Close => decode_close(frame).map(|e| e.id().get()),
+            _ => return Ok(()),
+        }
+        .map_err(|_| {
+            IoError::new(
+                IoErrorCode::Internal,
+                "failed to re-decode a frame already accepted by BatchBuffer::push",
+            )
+        })?;
+        if self.last_request_id.is_some_and(|last| id <= last) {
+            return Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "request id is not strictly increasing in the connection",
+            ));
+        }
+        self.last_request_id = Some(id);
+        Ok(())
+    }
+
     fn nack(
         &mut self,
         id: crate::payload::WireRequestId,
         reason: NackReason,
     ) -> Result<Frame, IoError> {
-        let frame = encode_nack(id, nack_code_for(reason)?, reason)?;
-        self.stats.nacks_by_reason.record(reason);
-        Ok(frame)
+        // 理由別の件数は送信に成功した後に `run_batch` が数える（`nacks_sent` と食い違わせない）。
+        encode_nack(id, nack_code_for(reason)?, reason)
     }
 
     fn execute_create(
@@ -456,12 +493,6 @@ impl FileServer<'_> {
         path: &str,
     ) -> Result<Frame, IoError> {
         let handle = id.get();
-        if self.table.contains_key(&handle) {
-            return Err(IoError::new(
-                IoErrorCode::InvalidArgument,
-                "duplicate file handle in Create request",
-            ));
-        }
         // 副作用（FS への作成）の前に容量を確かめる。
         if self.table.len() >= self.max_open {
             return self.nack(id, NackReason::OpenFilesLimit);
@@ -878,6 +909,32 @@ mod tests {
         let (_d, conn, report) = run(vec![create(1, "a"), create(1, "b")], 2);
         assert!(conn.sent.is_empty());
         assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn io1_request_id_reuse_after_close_is_protocol_violation() {
+        let (d, conn, report) = run(vec![create(1, "a"), close(2, 1), create(1, "b")], 3);
+        assert!(conn.sent.is_empty());
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+        assert!(!d.0.join("b").exists());
+    }
+
+    #[test]
+    fn io1_request_id_reuse_after_failed_create_is_protocol_violation() {
+        let (_d, conn, report) = run(vec![create(1, "a"), create(2, "A"), create(2, "c")], 3);
+        assert!(conn.sent.is_empty());
+        assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn repair4_nack_reason_counts_exclude_unsent_batch() {
+        let (_d, conn, report) = run(vec![write_file(1, 9, b"x"), create(1, "z")], 2);
+        assert!(conn.sent.is_empty());
+        assert_eq!(report.stats.nacks_sent, 0);
+        assert_eq!(
+            report.stats.nacks_by_reason.get(NackReason::UnknownHandle),
+            0
+        );
     }
 
     #[test]

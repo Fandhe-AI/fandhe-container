@@ -1601,11 +1601,10 @@ mod tests {
     fn io2_full_fsync_on_file_and_dir_succeeds() {
         use std::io::Write as _;
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("fcio-full-fsync-{}", std::process::id()));
-        let mut file = std::fs::File::create(&path).expect("create");
+        let (_guard, mut file) =
+            crate::test_temp_file::create_in(&dir, "fcio-full-fsync").expect("create");
         file.write_all(b"x").expect("write");
         let result = full_fsync(&file);
-        let _ = std::fs::remove_file(&path);
         result.expect("F_FULLFSYNC on a regular file must succeed");
         let dir_handle = std::fs::File::open(&dir).expect("open dir");
         full_fsync(&dir_handle).expect("F_FULLFSYNC on a directory must succeed");

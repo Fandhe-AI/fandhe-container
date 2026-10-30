@@ -1004,6 +1004,80 @@ mod tests {
         }
     }
 
+    /// 試験用の一時ディレクトリ。予測できる名前を消さずに排他作成し、drop で自分の分だけ消す
+    /// （REPAIR-12・#3479。pid だけの名前の先行削除を避ける）。
+    #[cfg(target_os = "linux")]
+    struct Scratch(std::path::PathBuf);
+    #[cfg(target_os = "linux")]
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl AsRef<std::path::Path> for Scratch {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn scratch_in(parent: &std::path::Path, prefix: &str) -> Scratch {
+        Scratch(crate::exclusive_dir::create_in(parent, prefix).unwrap())
+    }
+    #[cfg(target_os = "linux")]
+    fn scratch(prefix: &str) -> Scratch {
+        scratch_in(&std::env::temp_dir(), prefix)
+    }
+
+    /// 残骸（同名のディレクトリ・symlink）を先に置いても消さず・辿らず連番を進めること
+    /// （GPU-2・REPAIR-12・#3479）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu2_repair12_device_nodes_scratch_skips_stale_residue() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let parent = scratch("fc-gpu-ut-residue");
+        let canary = parent.join("canary");
+        std::fs::create_dir(&canary).unwrap();
+        std::fs::write(canary.join("keep"), b"canary").unwrap();
+        std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = std::process::id();
+        let stale0 = parent.join(format!("fc-gpu-ut-obs-{pid}-0"));
+        std::fs::create_dir(&stale0).unwrap();
+        std::fs::write(stale0.join("stale"), b"stale").unwrap();
+        let link1 = parent.join(format!("fc-gpu-ut-obs-{pid}-1"));
+        symlink(&canary, &link1).unwrap();
+        let new_path = {
+            let d = scratch_in(&parent, "fc-gpu-ut-obs");
+            assert_eq!(&*d, parent.join(format!("fc-gpu-ut-obs-{pid}-2")).as_path());
+            assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::metadata(&*d).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            d.0.clone()
+        };
+        assert!(!new_path.exists(), "own dir must be removed on drop");
+        assert_eq!(std::fs::read(stale0.join("stale")).unwrap(), b"stale");
+        assert_eq!(std::fs::read(canary.join("keep")).unwrap(), b"canary");
+        assert_eq!(
+            std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            std::fs::symlink_metadata(&link1)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     fn node(path: &str) -> DeviceNode {
         DeviceNode {
             path: path.to_owned(),
@@ -1253,9 +1327,7 @@ mod tests {
     fn rollback_after_observe_failure_removes_created_node_and_dir() {
         use std::os::fd::AsFd as _;
         use std::os::unix::fs::FileTypeExt as _;
-        let d = std::env::temp_dir().join(format!("fc-gpu-ut-obs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = scratch("fc-gpu-ut-obs");
         let root = std::fs::File::open(&d).unwrap();
         let mut n = node("/dev/sub/q");
         n.r#type = Some("p".into());
@@ -1276,7 +1348,6 @@ mod tests {
                 .file_type()
                 .is_fifo()
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-1・SEC-1: uid / gid の `u32::MAX`（chown の -1）を lookup より前に拒否する。
@@ -1309,10 +1380,8 @@ mod tests {
         use std::os::fd::OwnedFd;
         use std::os::unix::fs::MetadataExt as _;
         for replace in [false, true] {
-            let d = std::env::temp_dir()
-                .join(format!("fc-gpu-ut-repl-{}-{replace}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(d.join("sub")).unwrap();
+            let d = scratch(&format!("fc-gpu-ut-repl-{replace}"));
+            std::fs::create_dir(d.join("sub")).unwrap();
             let md = std::fs::metadata(d.join("sub")).unwrap();
             let parent = OwnedFd::from(std::fs::File::open(&d).unwrap());
             let created = Created {
@@ -1335,7 +1404,6 @@ mod tests {
             } else {
                 assert!(!d.join("sub").exists(), "same dir must be removed");
             }
-            let _ = std::fs::remove_dir_all(&d);
         }
     }
 
@@ -1345,9 +1413,7 @@ mod tests {
     fn rollback_leaves_dir_with_unknown_identity() {
         use std::os::fd::AsFd as _;
         use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
-        let d = std::env::temp_dir().join(format!("fc-gpu-ut-unk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = scratch("fc-gpu-ut-unk");
         let root = std::fs::File::open(&d).unwrap();
         let mut n = node("/dev/sub/q");
         n.r#type = Some("p".into());
@@ -1391,7 +1457,6 @@ mod tests {
                 .file_type()
                 .is_fifo()
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2: umask 077 でも、この呼び出しが作った中間ディレクトリは 0755 に補正される。
@@ -1432,9 +1497,7 @@ mod tests {
             assert!(st.success());
             return;
         }
-        let d = std::env::temp_dir().join(format!("fc-gpu-ut-umask-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = scratch("fc-gpu-ut-umask");
         let root = std::fs::File::open(&d).unwrap();
         let mut n = node("/dev/dri/q1");
         n.r#type = Some("p".into());
@@ -1448,7 +1511,6 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o7777, 0o755);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2・REPAIR-5: 公開の作成入口も件数上限を作成前に検証する。
@@ -1456,9 +1518,7 @@ mod tests {
     #[test]
     fn create_rejects_too_many_nodes_before_touching_dev() {
         use std::os::fd::AsFd as _;
-        let d = std::env::temp_dir().join(format!("fc-gpu-ut-max-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = scratch("fc-gpu-ut-max");
         let root = std::fs::File::open(&d).unwrap();
         let mut n = node("/dev/q0");
         n.r#type = Some("p".into());
@@ -1467,7 +1527,6 @@ mod tests {
         let e = create_device_nodes(root.as_fd(), &many).unwrap_err();
         assert_eq!(e.code(), Code::ResourceExhausted);
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2・REPAIR-4: 成功と失敗の両経路で結果と所要時間を 1 回ずつ記録する。
@@ -1482,9 +1541,7 @@ mod tests {
                 self.0.borrow_mut().push(s);
             }
         }
-        let d = std::env::temp_dir().join(format!("fc-gpu-ut-rec-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = scratch("fc-gpu-ut-rec");
         let root = std::fs::File::open(&d).unwrap();
         let mut n = node("/dev/q1");
         n.r#type = Some("p".into());
@@ -1499,7 +1556,6 @@ mod tests {
         assert_eq!((v[0].requested(), v[0].created()), (1, 1));
         assert_eq!(v[1].error_code(), Some(Code::ResourceExhausted));
         assert_eq!(v[1].requested(), CDI_APPLY_MAX_DEVICE_NODES + 1);
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// GPU-2 受け入れ条件 1 の純粋版: 本物の lookup で /dev/null を補完し、rdev がホストと一致する。ノードは作らない。

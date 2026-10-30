@@ -317,7 +317,7 @@ D13-1 の補足（選択肢ごとの影響）:
 | ---- | ---- |
 | ストアのロック待ち | 5 秒 |
 | create の 2 回目の照合の共有ロック待ち（#3550） | 5 秒（超えたら `TIMEOUT`。状態を作る前に失敗） |
-| create が共有ロックを保持している間の待ち（#3550） | 区間内の待ちはすべて既存の期限つき（FCOPT1 の I/O 10 秒・状態ストアの `@lock`・イメージの create ゲート）。新しい無期限の待ちを足さない |
+| create が共有ロックを保持している間の待ち（#3550） | 区間内の待ちはすべて既存の期限つき（FCOPT1 の I/O 10 秒・状態ストアの `@lock`・イメージの create ゲート）。新しい無期限の待ちを足さない。イメージ指定の create では core の create にイメージ rootfs の展開も含まれるため、展開が 5 秒を超えると、その間は無関係な `network create` / `network rm`（排他ロック）が `TIMEOUT` になりうる（fail-closed で有界。展開をロックの外へ出す案は未実施） |
 | `network rm` の排他ロック待ち（#3550） | 5 秒（保持中の create が超えれば `TIMEOUT`、`network store lock timed out`。構造化エラーで fail-closed） |
 | `network rm` の排他ロック保持中の走査（#3550） | 10 秒（走査が 5 秒を超えると、並行する create の 2 回目の照合・`network create` が `TIMEOUT` になりうる。有界で再試行で解消） |
 | DNS の ack | 2 秒 |

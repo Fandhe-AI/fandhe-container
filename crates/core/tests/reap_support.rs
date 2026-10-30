@@ -618,9 +618,11 @@ fn repair5_repair12_flood_forever_write_rate_is_bounded() {
     std::thread::sleep(Duration::from_secs(1));
     let size = std::fs::metadata(&captured.out_path).map(|m| m.len());
     // 先に後始末して、書き続ける子を残さない。
-    let _ = child.kill();
-    let _ = child.wait();
-    captured.discard().expect("discard");
+    // 期限つきで kill・回収する（REPAIR-5）。失敗しても discard を先に済ませてから表に出す。
+    let reaped = reap::reap(&mut child, reap::reap_within());
+    let discarded = captured.discard();
+    reaped.expect("reap flooding child");
+    discarded.expect("discard");
     let size = size.expect("metadata");
     assert!(
         (4096..=4 << 20).contains(&size),

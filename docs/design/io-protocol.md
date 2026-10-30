@@ -313,7 +313,7 @@ BREAK-2 検出経路の整理:
 
 ### 書き込み先（ワイヤーにパスがない）
 
-`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式は、別モード（ファイル操作モード）として設計確定済み・ワイヤー形式は #3161 で実装済み、サーバーは未実装である（[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・REPAIR-3）。本節の単一 sink モードの意味論は変わらない。
+`Write` ペイロードは `[request_id][body]` のみでパス・オフセットを持たない。`serve_connection` はファイル命名規則を独自に作らず、書き込み先を `BatchSink` トレイトへ抽象化する。既定実装 `AppendFileSink` は、呼び出し側が開いた `File` へ各 `Write` の body を到着順に `write_all` で追記するだけで、パス解決・ファイル作成・rename・truncate は行わない。パストラバーサル・symlink 経由の書き込み経路は構造上生まれない（security.md）。`body` を不透明なバイト列として追記するのはスタブの意味論であり（REPAIR-3）、ファイル操作をペイロードで表す形式は、別モード（ファイル操作モード）として設計確定済み・ワイヤー形式は #3161 で実装済み、サーバーは #3163・#3164 で実装済みである（[新しい節](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・REPAIR-3）。本節の単一 sink モードの意味論は変わらない。
 
 ### ACK を返す時点（IO-1 の「バッファリング時点」との対応）
 
@@ -394,7 +394,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信、#3163 のサーバー `serve_file_connection`、#3164 の FLUSH の永続化〔Linux の番兵 fd と `syncfs`・macOS / Windows のファイルとディレクトリの同期・保持表・IO-10 の自動フラッシュ〕。UDS `connect` などは未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -585,7 +585,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3161 | v2 の符号化と復号（IO-1・REPAIR-2。BREAKING CHANGE） | #3159 |
 | #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4）。実装済み | #3161 |
 | #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |
-| #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163 |
+| #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163（実装済み） |
 | #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5） | #3161 |
 | #3166 | 整合性スイート（IO-4・TASK-14） | #3162・#3164・#3165 |
 | #3167 | crash_safety・break_detection（IO-3・REPAIR-7） | #3164・#3165 |

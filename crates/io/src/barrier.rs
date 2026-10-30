@@ -812,6 +812,99 @@ pub(crate) fn persist_file_system(
     }
 }
 
+/// 接続単位の永続化（F9）の対象。呼び出し側が複製したハンドルの束で、helper スレッドへ
+/// 所有権ごと渡す（パスは再解決しない）。
+#[derive(Default)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code, reason = "対応 OS の永続化経路だけが読む")
+)]
+pub(crate) struct PersistTargets {
+    /// Linux: デバイスごとの番兵 fd の複製。それぞれに `syncfs(2)` を 1 回ずつ発行する。
+    pub(crate) sentinels: Vec<File>,
+    /// macOS / Windows: 汚れたファイルの複製。`F_FULLFSYNC` / `FlushFileBuffers` を発行する。
+    pub(crate) files: Vec<File>,
+    /// macOS / Windows: 汚れた（エントリが未同期の）ディレクトリの複製。
+    pub(crate) dirs: Vec<File>,
+}
+
+impl PersistTargets {
+    /// 同期する対象が 1 つも無いか。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sentinels.is_empty() && self.files.is_empty() && self.dirs.is_empty()
+    }
+}
+
+/// 1 接続ぶんの FLUSH 全体（全デバイスの `syncfs`、または全ファイルとディレクトリの
+/// 同期）を、`limiter` の 1 枠と `timeout` の 1 つの期限の中で 1 本の helper スレッドが
+/// 順に実行する（IO-2・REPAIR-5・F9）。最初の失敗で止める（fail-closed）。
+///
+/// 判定 `support` が非対応（旧カーネル・非対応 OS・実行 OS と食い違う値）なら何も発行せず
+/// [`IoErrorCode::Unimplemented`]（`issued == false`）。発行後の失敗・期限切れは接続全体の
+/// 失敗として呼び出し側が扱う（状態を破棄し FlushAck を返さない）。
+pub(crate) fn persist_connection(
+    support: PersistSupport,
+    limiter: &'static PersistLimiter,
+    targets: PersistTargets,
+    timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
+    match support {
+        PersistSupport::Supported => {
+            #[cfg(target_os = "linux")]
+            {
+                let mut dispatched = false;
+                run_with_deadline_tracked(
+                    limiter,
+                    timeout,
+                    move || targets.sentinels.iter().try_for_each(crate::sys::syncfs),
+                    &mut dispatched,
+                )
+                .map_err(|error| PersistFailure {
+                    error,
+                    issued: dispatched,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (limiter, targets, timeout);
+                Err(mismatched_support())
+            }
+        }
+        PersistSupport::SupportedFileSync => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                let mut dispatched = false;
+                run_with_deadline_tracked(
+                    limiter,
+                    timeout,
+                    move || {
+                        targets.files.iter().try_for_each(sync_file)?;
+                        targets.dirs.iter().try_for_each(sync_dir)
+                    },
+                    &mut dispatched,
+                )
+                .map_err(|error| PersistFailure {
+                    error,
+                    issued: dispatched,
+                })
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                let _ = (limiter, targets, timeout);
+                Err(mismatched_support())
+            }
+        }
+        PersistSupport::KernelTooOld => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
+        ))),
+        PersistSupport::UnsupportedOs => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "persist is not implemented on this OS",
+        ))),
+    }
+}
+
 /// 判定値が実行 OS と食い違う（他 OS 用の値が注入された）場合の拒否。syscall は
 /// 発行しない（`issued == false`）。
 fn mismatched_support() -> PersistFailure {
@@ -1770,5 +1863,62 @@ mod tests {
         assert!(!l.would_exceed_bytes(&backlog(1, 7), 3));
         assert!(l.would_exceed_bytes(&backlog(1, 7), 4));
         assert!(l.would_exceed_bytes(&backlog(1, u64::MAX), usize::MAX));
+    }
+
+    /// F9・IO-2: 旧カーネルの判定では接続単位の永続化も発行せず `Unimplemented`。
+    #[test]
+    fn io2_persist_connection_kernel_too_old_is_not_issued() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let failure = persist_connection(
+            PersistSupport::KernelTooOld,
+            &L,
+            PersistTargets::default(),
+            IoTimeout::new(Duration::from_millis(100)).expect("valid timeout"),
+        )
+        .expect_err("kernel too old must be refused");
+        assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
+        assert!(!failure.issued);
+    }
+
+    /// F9・REPAIR-5: 枠が取れなければ期限で `Timeout`（未発行）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_persist_connection_slot_timeout_is_not_issued() {
+        static L: PersistLimiter = PersistLimiter::new(0);
+        let failure = persist_connection(
+            PersistSupport::Supported,
+            &L,
+            PersistTargets::default(),
+            IoTimeout::new(Duration::from_millis(50)).expect("valid timeout"),
+        )
+        .expect_err("no slot must time out");
+        assert_eq!(failure.error.code(), IoErrorCode::Timeout);
+        assert!(!failure.issued);
+    }
+
+    /// F9: 番兵が `syncfs` に失敗する（`O_PATH` の fd は EBADF）と、発行済みの失敗として返る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_persist_connection_real_syncfs_failure_is_issued() {
+        use std::os::unix::fs::OpenOptionsExt;
+        static L: PersistLimiter = PersistLimiter::new(1);
+        // O_PATH（x86_64・aarch64 とも 0o10000000）。
+        let broken = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o10_000_000)
+            .open(std::env::temp_dir())
+            .expect("open temp dir with O_PATH");
+        let targets = PersistTargets {
+            sentinels: vec![broken],
+            ..PersistTargets::default()
+        };
+        let failure = persist_connection(
+            PersistSupport::Supported,
+            &L,
+            targets,
+            IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
+        )
+        .expect_err("syncfs on an O_PATH fd must fail");
+        assert!(failure.issued);
     }
 }

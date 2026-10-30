@@ -36,7 +36,7 @@
 //! `pasta` は #3199(NET-9・CLI-1・PLUG-11・SUP-12・rootless-network.md 12.4)で足した kind で、版は上げない(同じ理由)。
 //! 作成時に検証した pasta の実体の記録(net の `PastaRecord` の本文。4096 バイト以下・重複は拒否)で、`network` が
 //! ユーザー定義名のときだけ置ける(違えば `InvalidArgument`)。復号では本文の形だけを検証し(副作用なし)、バイナリの
-//! 再検証は [`super::pasta::reverify_recorded_pasta`] が起動の直前に行う(start 経路への結線は #1940 で実装済み。監査の記録は #3330)。
+//! 再検証は [`super::pasta::reverify_recorded_pasta`] が起動の直前に行う(start 経路への結線は #1940 で実装済み。監査の記録は start の入口が行う。#3330 で実装済み)。
 //! CLI が書く処理は `--network` のユーザー定義名の解除(#3329)後に有効になる(現状は `UNIMPLEMENTED` で書かれない)。
 //! `publish` は #3200(NET-9・NET-3)で足した kind で、版は上げない(同じ理由)。`-p` / `--publish` の生の文字列
 //! (`[<ipv4>:]<host>:<container>[/tcp|udp]`)を 1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下で持ち、復号のたびに

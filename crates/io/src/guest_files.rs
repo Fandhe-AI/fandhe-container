@@ -26,8 +26,9 @@
 //! 受けて本モジュールを呼ぶサーバーは [`crate::file_serve::serve_file_connection`]
 //! （#3163）で、内部入口 `create_file_inner` を呼ぶ。パスの構文検証は
 //! [`crate::guest_path::GuestPath`]（F5・#3159）に集約済みで、#3161 の復号は長さと
-//! UTF-8 だけを見るため、ワイヤー上の作成の構文検証は `create_file_inner` が行う
-//! （構文違反は reason `PathSyntax` の Nack になる）。
+//! UTF-8 だけを見る。ワイヤー上の作成の構文検証は、送信側（#3162 の
+//! `PipelineClient::create`。実装済み）が `GuestPath` で行い、サーバー側は
+//! `create_file_inner` が行う（構文違反は reason `PathSyntax` の Nack になる。#3163）。
 //!
 //! ホストパス長（260 UTF-16 単位。F5・IO-5・#3160）は構文検証の直後、ロックと走査の
 //! 前に純計算で検査する。Windows ホストは何も作らずに `InvalidArgument`（reason

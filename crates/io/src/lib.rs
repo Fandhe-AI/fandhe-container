@@ -54,8 +54,9 @@
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
 //! ワイヤー形式は変えないサーバー側 API。ワイヤー上の作成要求は v2 の符号化と復号
-//! [`payload::encode_create`] 等が #3161 で、サーバーの処理 [`file_serve::serve_file_connection`]
-//! が #3163 で実装済み。クライアント API〔#3162〕と永続化〔#3164〕は未実装〔REPAIR-3〕）
+//! [`payload::encode_create`] 等が #3161 で、クライアント API
+//! 〔[`client::PipelineClient::create`]〕が #3162 で、サーバーの処理
+//! [`file_serve::serve_file_connection`] が #3163 で実装済み。永続化〔#3164〕は未実装〔REPAIR-3〕）
 //! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
 //! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
 //! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
@@ -104,14 +105,14 @@ pub mod writeback;
 pub use barrier::{
     AckReceipt, DEFAULT_UNFLUSHED_MAX_BYTES, DEFAULT_UNFLUSHED_MAX_FRAMES, FlushAck, FlushBarrier,
     MAX_UNFLUSHED_MAX_BYTES, MAX_UNFLUSHED_MAX_FRAMES, MaxConcurrentPersist, PersistSupport,
-    UnflushedBacklog, UnflushedLimit, WriteAck, max_concurrent_persist, persist_support,
-    set_max_concurrent_persist,
+    RejectedRequest, UnflushedBacklog, UnflushedLimit, WriteAck, max_concurrent_persist,
+    persist_support, set_max_concurrent_persist,
 };
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, FileHandle, InFlightLimit, InFlightRequest,
     LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
     SendMetrics, SendOutcome, SendQueue,
 };

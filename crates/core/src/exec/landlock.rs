@@ -794,14 +794,8 @@ mod tests {
     /// 拒否・許可は結合試験 `tests/landlock_implicit_dev.rs`（実機前提）が照合する。
     #[test]
     fn core5_sec1_mknod_and_noctty_probes_report_errno() {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-landlock-probe-kinds-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let (_scratch, dir) =
+            crate::test_support::scratch_child("fandhe-landlock-probe-kinds", "d");
         let file = dir.join("file");
         std::fs::write(&file, b"x").expect("file");
         let probe = |kind, path: PathBuf| LandlockAccessProbe {
@@ -832,7 +826,6 @@ mod tests {
             run_probe(&probe(LandlockAccessKind::OpenNoCtty, dir.join("missing"))),
             enoent
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-5・TASK-39.4: 適用失敗は code を保ち stage を Landlock にする。

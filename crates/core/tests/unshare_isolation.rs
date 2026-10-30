@@ -30,6 +30,11 @@
 #[path = "support/reap.rs"]
 mod reap;
 
+// 予測できる名前の作成を避けるための排他作成の一時領域（#3478・#3434・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("unshare_isolation: Linux only, not applicable on this OS");
@@ -226,11 +231,18 @@ mod linux {
     /// 親: 子を `--subordinate-non-dumpable` で起動し、実行中の `/proc/<子>` の所有者 uid を標本する。
     fn subordinate_non_dumpable_dispatch() {
         use std::io::Write as _;
-        let log = std::env::temp_dir().join(format!(
-            "fandhe-subordinate-non-dumpable-{}.log",
-            std::process::id()
-        ));
-        let file = std::fs::File::create(&log).expect("create log");
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // 共有 /tmp の予測できる名前へ create せず、排他作成の ScratchDir の子へ create_new する。
+        // 先置きの symlink は辿らず EEXIST で失敗し、panic の unwind でも drop で消える（#3478・REPAIR-12）。
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-subordinate-non-dumpable", timeout());
+        let log = scratch.path().join("child.log");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&log)
+            .expect("create log");
         let mut child = Command::new(std::env::current_exe().expect("current_exe"))
             .arg("--subordinate-non-dumpable")
             .stdin(Stdio::piped())
@@ -243,7 +255,6 @@ mod linux {
         let fail = |child: &mut std::process::Child, msg: &str| -> ! {
             crate::reap::reap_or_report(child, crate::reap::reap_within());
             let out = std::fs::read_to_string(&log).unwrap_or_default();
-            let _ = std::fs::remove_file(&log);
             panic!("{msg}\n{out}");
         };
         // 子が non-dumpable にし終えるまで待つ(この前の標本は意味がない)。
@@ -253,7 +264,6 @@ mod linux {
                 break;
             }
             if let Some(st) = child.try_wait().expect("try_wait") {
-                let _ = std::fs::remove_file(&log);
                 panic!("subordinate child exited early: {st:?}\n{out}");
             }
             if Instant::now() >= overall {
@@ -284,7 +294,6 @@ mod linux {
             std::thread::sleep(Duration::from_micros(200));
         };
         let out = std::fs::read_to_string(&log).unwrap_or_default();
-        let _ = std::fs::remove_file(&log);
         assert_eq!(status.code(), Some(0), "subordinate child failed\n{out}");
         if !out.lines().any(|l| l == "owner sampling supported") {
             println!(

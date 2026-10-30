@@ -383,7 +383,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 ### 範囲外（後続タスク。要起票）
 
 - UDS 接続受付ループ（accept → `serve_connection` → 次の accept）・同時接続数の上限
-- クライアント側の UDS `connect` と `PipelineClient` との本番結合（設計は確定済み・未実装。[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)・実装は #3165。`PipelineClient` の型つき API と Nack の受信は #3162 で実装済み）
+- `PipelineClient` の型つき API と Nack の受信は #3162 で実装済み。クライアント側の UDS `connect` は #3165 で実装済み（`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`）。両者の本番結合（[ワイヤー上のファイル操作要求と UDS クライアント](#ワイヤー上のファイル操作要求と-uds-クライアントio-1-追補1886)）は未実装
 - 永続的な監査ログへの配線（`JsonLinesServerObserver` の peer credential 拒否行）
 - FLUSH の頻度（間隔）の制限
 - 件数未達分を時間ベースで追い出す仕組み
@@ -394,7 +394,7 @@ CLI オプション名（`BATCH_SIZE_OPTION = "--batch-size"`）・宣言的設�
 
 ## ワイヤー上のファイル操作要求と UDS クライアント（IO-1 追補・#1886）
 
-ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
+ステータス: 設計確定・一部実装済み（#3159 の `GuestPath` と 3 定数、#3160 のホストパス長の検査と reason の値表・分類関数、#3161 の v2 の符号化と復号〔`PROTOCOL_VERSION` 2・種別 5〜8・Nack の型〕、#3162 の `PipelineClient` の `create`・`write_file`・`close` と Nack の受信、#3165 の UDS クライアント `UdsClientConnection::connect`〔`crates/io/src/uds_client.rs`・`crates/io/src/sys/uds.rs`。接続前のパス検査はサーバーの bind 検査に揃え、親ディレクトリは `0o077` なし・所有者一致を要求する〕のみ。他は未実装。REPAIR-3）。本節は #1886 の決定で、実装は親 #3158 の子 issue（下記「実装 issue 一覧」）が行う。数値の上限は暫定で、校正は TASK-88 に従う。本節の判断を実装 issue が変える場合は、実装側で決めず本書を先に直す。
 
 ### 背景
 
@@ -586,7 +586,7 @@ spec（`api-io-share.md`「プロトコルメッセージ一覧」）は書き�
 | #3162 | `PipelineClient` の create・write_file・close と Nack（IO-1・REPAIR-4）。実装済み | #3161 |
 | #3163 | `serve_file_connection`（IO-1・IO-5。この時点の persist は `Unimplemented`） | #3159・#3160・#3161 |
 | #3164 | FLUSH と IO-10 の自動フラッシュ（IO-2・IO-10） | #3163 |
-| #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5） | #3161 |
+| #3165 | `UdsClientConnection::connect`（IO-1・PLUG-12・REPAIR-5）。実装済み | #3161 |
 | #3166 | 整合性スイート（IO-4・TASK-14） | #3162・#3164・#3165 |
 | #3167 | crash_safety・break_detection（IO-3・REPAIR-7） | #3164・#3165 |
 

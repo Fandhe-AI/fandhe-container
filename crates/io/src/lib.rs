@@ -10,8 +10,9 @@
 //! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
-//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
-//! [`client::PipelineClient`] との本番結合・named pipe はまだない
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` は
+//! [`uds_client::UdsClientConnection`]（#3165。期限つき connect と接続先 uid の照合）で実装済み。
+//! [`client::PipelineClient`] の型つき API との本番結合の残り（#3162）・named pipe はまだない
 //! （REPAIR-3。スタブの明示）。vsock は Linux（x86_64 / aarch64）のサーバー側・クライアント側を
 //! [`vsock`] が実装済み（#1119。macOS の Virtualization.framework・Windows の hvsock は
 //! 未実装で `Unimplemented`）。1 本の接続を送信側・受信側へ分けて並行に使う API は
@@ -99,6 +100,7 @@ mod sys;
 #[path = "sys/windows.rs"]
 mod sys_windows;
 pub mod transport;
+pub mod uds_client;
 pub mod vsock;
 pub mod writeback;
 
@@ -156,7 +158,8 @@ pub use protocol::{
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
 pub use recv_limits::{
-    AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
+    AdmittedHeader, MAX_CLIENT_RESPONSE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD_LEN,
+    MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
 pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
@@ -169,6 +172,7 @@ pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
     WireFrame,
 };
+pub use uds_client::{UdsClientConnection, UdsServerPolicy};
 pub use vsock::{
     VsockAddr, VsockConnection, VsockPeerPolicy, VsockRecvHalf, VsockSendHalf, VsockServer,
 };

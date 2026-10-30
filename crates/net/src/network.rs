@@ -176,6 +176,7 @@ pub use publish::{MAX_PORT_PUBLISHES, PortProtocol, PortPublish, PortRegistry};
 pub use unpublish::unpublish_container_port;
 pub use unpublish::{PublishedPort, UnpublishPortError, UnpublishRules};
 
+use crate::dns_helper::DnsName;
 use crate::error::{NetError, NetErrorCode};
 use crate::etc_hosts::NameResolution;
 #[cfg(target_os = "linux")]
@@ -1306,6 +1307,8 @@ pub struct ContainerAttachSpec {
     gateway: IpPrefix,
     table: NftName,
     ports: Vec<PortPublish>,
+    /// DNS ヘルパーが ID に加えて引く名前（コンテナ名。記録つき attach だけが確定記録へ載せる。NET-5・#3531）。
+    dns_name: Option<DnsName>,
 }
 
 impl ContainerAttachSpec {
@@ -1330,7 +1333,24 @@ impl ContainerAttachSpec {
             gateway: network.gateway,
             table: network.table.clone(),
             ports: Vec::new(),
+            dns_name: None,
         })
+    }
+
+    /// DNS ヘルパーが ID に加えて引く名前（コンテナ名）を指定する（NET-5・#3531）。
+    ///
+    /// 検証は [`DnsName`] が済ませている。名前はカーネル操作には使わず、記録つき attach
+    /// （`attach_container_recorded`）が確定記録 `members/<id>` の `dns-name` として残す。記録なし版の
+    /// `attach_container` は使わない。他のメンバーの ID・名前と衝突する名前は、記録つき attach が
+    /// カーネル操作の前に `AlreadyExists` で断る（SEC-1）。コンテナ名から [`DnsName`] への変換は呼び出し側の責務。
+    pub fn with_dns_name(mut self, name: DnsName) -> Self {
+        self.dns_name = Some(name);
+        self
+    }
+
+    /// 指定された DNS 名（無ければ `None`）。
+    pub fn dns_name(&self) -> Option<&DnsName> {
+        self.dns_name.as_ref()
     }
 
     /// ポート公開の指定を加える（既定は公開なし）。件数が [`MAX_PORT_PUBLISHES`] を超える、または

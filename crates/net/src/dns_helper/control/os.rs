@@ -903,6 +903,41 @@ mod tests {
             .map(|l| l.iter().map(|x| x.to_string()).collect())
     }
 
+    /// NET-5・#3531: 記録の `dns-name`（コンテナ名）でも、メンバー ID と同じアドレスが引ける。
+    #[test]
+    fn net5_3531_load_into_resolves_container_name() {
+        let root = Root::new("cname");
+        let store = NetworkStore::open(&root.0).expect("store");
+        store
+            .create(&NetworkDefinition::bridge("web", prefix(0, 24)).expect("def"))
+            .expect("create");
+        let net = NetworkName::new("web").expect("name");
+        {
+            let g = store.lock_global_exclusive().expect("global");
+            let n = g.lock_network(&net).expect("network");
+            let token = "fandhe-net:web:1:0:0/ep/c1/g/00000000000000000000000000000001";
+            let rec = MemberRecord::new(
+                MemberId::new("c1").expect("id"),
+                EndpointId::new("c1").expect("ep"),
+                prefix(2, 24),
+                token,
+                Path::new("/run/ns"),
+                (8, 9),
+                &[],
+            )
+            .expect("member")
+            .with_dns_name(crate::dns_helper::DnsName::new("web").expect("name"));
+            n.commit_member(&rec).expect("commit");
+        }
+        let dir = store.open_network_dir(&net).expect("dir");
+        let reg = DnsRegistry::new();
+        let ups = DnsUpstreamMap::new();
+        load_into(&dir, &reg, &ups, GW).expect("load");
+        let a = Ipv4Addr::new(10, 89, 0, 2);
+        assert_eq!(reg.lookup("web"), Some(a));
+        assert_eq!(reg.lookup("c1"), Some(a));
+    }
+
     /// NET-12・NET-5・#3072: 記録の `--dns` がコンテナのアドレスごとの上流として組まれ、名前も同時に登録される。
     /// 次の読み込みで記録が増えれば反映される（具体値）。
     #[test]

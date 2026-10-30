@@ -15,6 +15,8 @@
 //!     ├── definition             0600。FCNET1
 //!     ├── dns-helper             0600。起動済み DNS ヘルパーの記録 FCDNSH1（pid・開始時刻・boot id。#3070）
 //!     ├── dns-helper.intent      0600。起動窓の意図記録 FCDNSI1（起動の前に書き、記録の確定後に消す。#3070）
+//!     ├── dns.ctl                0600 の UNIX ドメインソケット。DNS ヘルパーの制御 UDS（Reload / Stop。ヘルパーが bind し、
+//!     │                          排他ロックを持つ側が消す。#3071）
 //!     ├── @lock                  0600。ネットワークのロック
 //!     ├── realized               0600。FCREA1（作成済みのカーネル資源。#3067）
 //!     ├── realized.intent        0600。FCRIN1（作成・削除の操作中。残っていれば未完了）
@@ -175,8 +177,46 @@ pub fn check_file_meta(
     Ok(())
 }
 
+/// ソケットファイルの lstat 結果を検査する（純関数。DNS ヘルパーの制御 UDS `dns.ctl` を connect する前の検査。
+/// socket であること・所有者が実効 uid・権限 0600・ハードリンク 1。NET-5・PLUG-12・#3071）。
+pub fn check_socket_meta(
+    is_socket: bool,
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+    expected_uid: u32,
+) -> Result<(), NetError> {
+    if !is_socket {
+        return Err(err(
+            NetErrorCode::FailedPrecondition,
+            "dns control socket path is not a socket",
+        ));
+    }
+    if nlink != 1 {
+        return Err(err(
+            NetErrorCode::FailedPrecondition,
+            "dns control socket has extra hard links",
+        ));
+    }
+    if uid != expected_uid {
+        return Err(err(
+            NetErrorCode::PermissionDenied,
+            "dns control socket owner mismatch",
+        ));
+    }
+    if mode & 0o7777 != FILE_MODE {
+        return Err(err(
+            NetErrorCode::PermissionDenied,
+            "dns control socket mode must be 0600",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 mod imp;
+#[cfg(target_os = "linux")]
+pub(crate) use imp::NetworkDir;
 #[cfg(target_os = "linux")]
 pub use imp::{GlobalLockGuard, NetworkLockGuard, NetworkStore};
 
@@ -212,6 +252,36 @@ mod tests {
         );
         assert_eq!(
             check_dir_meta(false, 1000, 0o700, 1000).unwrap_err().code(),
+            NetErrorCode::FailedPrecondition
+        );
+    }
+
+    /// NET-5・PLUG-12・#3071: socket・所有者・0600・nlink 1 だけを通す。
+    #[test]
+    fn net5_3071_check_socket_meta() {
+        assert!(check_socket_meta(true, 1000, 0o140600, 1, 1000).is_ok());
+        assert_eq!(
+            check_socket_meta(false, 1000, 0o100600, 1, 1000)
+                .unwrap_err()
+                .code(),
+            NetErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            check_socket_meta(true, 1001, 0o140600, 1, 1000)
+                .unwrap_err()
+                .code(),
+            NetErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            check_socket_meta(true, 1000, 0o140644, 1, 1000)
+                .unwrap_err()
+                .code(),
+            NetErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            check_socket_meta(true, 1000, 0o140600, 2, 1000)
+                .unwrap_err()
+                .code(),
             NetErrorCode::FailedPrecondition
         );
     }

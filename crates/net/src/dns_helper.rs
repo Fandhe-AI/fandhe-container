@@ -22,16 +22,17 @@
 //! コンテナ接続（`network::attach_container` の `AttachedContainer.address` が IPv4 のとき）で
 //! [`DnsRegistry::register`]、切断・停止で [`DnsRegistry::unregister`] を呼ぶ。
 //!
-//! # 未実装（REPAIR-3）
-//! プロセス外（ヘルパープロセス）へ名前の登録・削除を伝える経路はまだ無い（CORE-1 により起動・停止は別プロセスで
-//! 起きるため、経路の設計は後続タスクで決める）。経路ができるまで [`run_dns_helper_main`] は
-//! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
-//! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
-//! 登録側（テスト・将来の組み込み）から使える。TCP・AAAA・EDNS0 も未対応（上流転送は次に記す）。
+//! # 名前の経路と未実装（REPAIR-3）
+//! 切り離し起動（[`detach`]）したヘルパーは、制御 UDS（[`control`]。`Reload` の ack と `Stop`。#3071・D11）を持ち、
+//! `Reload` のたびにメンバー記録（`members/<id>`）を読み直して [`DnsRegistry`] を一括に差し替える
+//! （[`load`] が記録から名前を導く）。[`run_dns_helper_main`] はこの経路では [`RegistryHandler`] で答える。
+//! 単独の `--listen`（試験専用）は名前の経路を持たないので、従来どおり全クエリに NOTIMP を返す
+//! [`NotImplementedHandler`] を使う（空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
+//! 登録側（テスト・将来の組み込み）からも使える。TCP・AAAA・EDNS0 も未対応（上流転送は次に記す）。
 //! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す。ただし [`upstream::ForwardingHandler`]
 //! （NET-12・TASK-185.3・#346）を組み立てた場合に限り、上流マッピング登録済みのコンテナからの管理外名は
-//! そのコンテナの `--dns` 上流へ転送する。この転送機構も同じ理由で製品の入口には未接続で、同一プロセス内の
-//! 登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
+//! そのコンテナの `--dns` 上流へ転送する。この転送機構は製品の入口にはまだ未接続（`--dns` の上流の記録からの組み立ては #3072）で、
+//! 同一プロセス内の登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
 //! [`MAX_INFLIGHT_DEFERRED`] 件のワーカー（[`HandlerOutcome::Defer`]）で行い、上流の応答待ちで他のクエリを
 //! 待たせない。TCP 再試行（TC=1 応答）は未対応。
 //! DNS ヘルパーは plugin 側（`NetworkPlugin` の実装）が起動し、`crates/net` は core 側のライブラリである
@@ -67,8 +68,10 @@ use crate::network::CreatedNetwork;
 
 use self::record::HelperNonce;
 
+pub mod control;
 pub mod detach;
 pub mod identity;
+pub mod load;
 pub mod record;
 pub mod refcount;
 pub mod upstream;
@@ -554,6 +557,31 @@ impl DnsRegistry {
         }
         map.insert(name.as_str().to_owned(), addr);
         Ok(RegisterOutcome::Inserted)
+    }
+
+    /// 登録を `entries` で一括に差し替える（制御 UDS の `Reload` が使う。NET-5・#3071）。
+    ///
+    /// 書き込みロックの下で map ごと入れ替えるため、読み手は古い内容か新しい内容のどちらかだけを見る
+    /// （半端な状態を見せない）。件数が [`MAX_REGISTRY_ENTRIES`] を超えるときは何も変えず
+    /// `ResourceExhausted`。`entries` の名前が重複していれば、後の方が前を上書きする
+    /// （呼び出し側の `load::names_from_members` が重複を作らない）。
+    pub fn replace_all(&self, entries: &[(DnsName, Ipv4Addr)]) -> Result<(), NetError> {
+        if entries.len() > MAX_REGISTRY_ENTRIES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "DNS registry is full",
+            ));
+        }
+        let fresh: HashMap<String, Ipv4Addr> = entries
+            .iter()
+            .map(|(n, a)| (n.as_str().to_owned(), *a))
+            .collect();
+        let mut map = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *map = fresh;
+        Ok(())
     }
 
     /// 登録を削除する。未登録でもエラーにしない。
@@ -1094,8 +1122,11 @@ enum HelperMode {
 /// - `--listen <ipv4:port>` のみ: 従来の起動（試験専用。D11）。bind 後に stdout へ `READY <ip:port>` を 1 行だけ
 ///   出し、以後 stdout には書かない（親が pipe を閉じても EPIPE で落ちないため）
 /// - `--dns-helper-detach --listen A --nonce N`: 切り離し起動の段 1（Linux のみ。`detach` の doc）
-/// - `--dns-helper-stage2 --listen A --nonce N`: 段 2。識別行を stdout へ送り、stdin の ack を 2 秒まで待ち、
-///   受けたら従来どおり bind → `READY`。受けられなければ bind せずに終了する
+/// - `--dns-helper-stage2 --listen A --nonce N --state-root P --network NAME`: 段 2。識別行を stdout へ送り、stdin の
+///   ack を 2 秒まで待ち、受けたらストアを開き直して制御 UDS を bind し、メンバー記録から名前を読み込み、
+///   UDP を bind して `READY`。以後 `Reload` で読み直し、`Stop` で終了する（`control`。#3071）。
+///   受けられなければ bind せずに終了する
+/// - 段 1 の `--state-root`（絶対パス）と `--network` は、切り離し起動の 2 段でだけ受ける（単独の `--listen` では受けない）
 ///
 /// 失敗は stderr に英語 1 行（code / message。ERR-1）を出して非ゼロで終了する。
 pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
@@ -1104,6 +1135,8 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     let mut listen: Option<DnsListenAddr> = None;
     let mut nonce: Option<HelperNonce> = None;
+    let mut state_root: Option<std::path::PathBuf> = None;
+    let mut network: Option<crate::network::NetworkName> = None;
     let mut mode = HelperMode::Plain;
     let mut args = args;
     while let Some(arg) = args.next() {
@@ -1132,6 +1165,30 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+        } else if arg == detach::ARG_STATE_ROOT && state_root.is_none() {
+            let parsed = args
+                .next()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute());
+            match parsed {
+                Some(p) => state_root = Some(p),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid state root");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if arg == detach::ARG_NETWORK && network.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| crate::network::NetworkName::new(&s).ok());
+            match parsed {
+                Some(n) => network = Some(n),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid network name");
+                    return ExitCode::from(2);
+                }
+            }
         } else if mode == HelperMode::Plain && arg == detach::ARG_DETACH {
             mode = HelperMode::Detach;
         } else if mode == HelperMode::Plain && arg == detach::ARG_STAGE2 {
@@ -1153,10 +1210,27 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    // 状態ルートとネットワーク名も、切り離し起動の 2 段でだけ受け、2 つそろって渡されなければならない。
+    if (mode == HelperMode::Plain) == (state_root.is_some() || network.is_some())
+        || state_root.is_some() != network.is_some()
+    {
+        fail_line(
+            "INVALID_ARGUMENT",
+            "--state-root and --network are required with, and only with, a detach mode",
+        );
+        return ExitCode::from(2);
+    }
     #[cfg(target_os = "linux")]
-    match (mode, nonce.as_ref()) {
-        (HelperMode::Detach, Some(n)) => {
-            return match detach::run_stage1(listen, n) {
+    let mut control: Option<control::HelperControl> = None;
+    #[cfg(target_os = "linux")]
+    match (
+        mode,
+        nonce.as_ref(),
+        state_root.as_deref(),
+        network.as_ref(),
+    ) {
+        (HelperMode::Detach, Some(n), Some(root), Some(net)) => {
+            return match detach::run_stage1(listen, n, root, net) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     fail_line(e.code().as_str(), e.message());
@@ -1164,11 +1238,19 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
                 }
             };
         }
-        (HelperMode::Stage2, Some(n)) => {
+        (HelperMode::Stage2, Some(n), Some(root), Some(net)) => {
             // ack を受けるまで bind しない（D14 (ii)。起動元が記録の前に死んでも孤児が残らない）。
             if let Err(e) = detach::run_stage2_handshake(n) {
                 fail_line(e.code().as_str(), e.message());
                 return ExitCode::from(1);
+            }
+            // 制御 UDS の bind と最初の名前の読み込みも UDP の bind の前に済ませる（失敗したら READY を出さない）。
+            match control::prepare_helper_control(root, net) {
+                Ok(c) => control = Some(c),
+                Err(e) => {
+                    fail_line(e.code().as_str(), e.message());
+                    return ExitCode::from(1);
+                }
             }
         }
         _ => {}
@@ -1189,9 +1271,20 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
         fail_line("INTERNAL", "cannot write readiness line");
         return ExitCode::from(1);
     }
-    // 親が kill するまで動き続ける。正常終了（SIGTERM）は未実装（REPAIR-3）。
-    // プロセス外からの登録経路が未実装（REPAIR-3）の間は RegistryHandler に切り替えず NOTIMP を返す
-    // （空レジストリで名前解決を妨げない）。経路の接続は後続タスク（NET-5）。
+    // 切り離し起動（段 2）は制御 UDS と並行して動かし、`Reload` で読み直した名前を `RegistryHandler` で答える。
+    // `Stop` で正常終了する（#3071）。SIGTERM による正常終了は未実装（REPAIR-3）。
+    #[cfg(target_os = "linux")]
+    if let Some(c) = control {
+        return match c.serve(&mut server) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                fail_line(e.code().as_str(), e.message());
+                ExitCode::from(1)
+            }
+        };
+    }
+    // 単独の `--listen`（試験専用）は名前の経路を持たないので、従来どおり全クエリに NOTIMP を返す
+    // （空レジストリで名前解決を妨げない）。親が kill するまで動き続ける。
     let stop = AtomicBool::new(false);
     match server.serve(&NotImplementedHandler, &stop) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1950,6 +2043,27 @@ mod tests {
         assert_eq!(answer(&h, &pkt).get(3), Some(&0));
         reg.unregister(&DnsName::new("web").expect("name"));
         assert_eq!(answer(&h, &pkt).get(3), Some(&5));
+    }
+
+    /// NET-5・#3071: `replace_all` は一括で差し替え、消えた名前は引けなくなる。上限超過は何も変えず拒否する。
+    #[test]
+    fn net5_3071_replace_all_swaps_and_bounds() {
+        let reg = DnsRegistry::new();
+        let web = DnsName::new("web").expect("web");
+        let db = DnsName::new("db").expect("db");
+        reg.replace_all(&[(web.clone(), Ipv4Addr::new(10, 1, 0, 2))])
+            .expect("first");
+        assert_eq!(reg.lookup("web"), Some(Ipv4Addr::new(10, 1, 0, 2)));
+        reg.replace_all(&[(db, Ipv4Addr::new(10, 1, 0, 3))])
+            .expect("second");
+        assert_eq!(reg.lookup("web"), None);
+        assert_eq!(reg.lookup("db"), Some(Ipv4Addr::new(10, 1, 0, 3)));
+        let too_many: Vec<(DnsName, Ipv4Addr)> = (0..=MAX_REGISTRY_ENTRIES)
+            .map(|i| (web.clone(), Ipv4Addr::from(u32::try_from(i).unwrap_or(0))))
+            .collect();
+        let e = reg.replace_all(&too_many).expect_err("full");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(reg.len(), 1, "unchanged after a rejected replace");
     }
 
     /// 固定長の応答を返すハンドラ（`serve` の増幅ガード境界の検証用）。

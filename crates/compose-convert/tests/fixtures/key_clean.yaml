@@ -11,6 +11,8 @@ services:
     image: example.invalid/web:1
     container_name: clean-web
     working_dir: /srv/app
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
     command: ["serve"]
     environment:
       ENVMARKER_NAME: dummy

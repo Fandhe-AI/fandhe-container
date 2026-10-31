@@ -136,6 +136,9 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     // TASK-153.1（#609・STACK-6）: PoC-16 で出現の多かった 2 キーを対象キーへ加えた。
     ("services.*.container_name", KeyClass::Convert),
     ("services.*.working_dir", KeyClass::Convert),
+    // TASK-153.2（#610・STACK-6）: cap_drop は CLI の --cap-drop へ、security_opt は未検証の文字列で持つ。
+    ("services.*.cap_drop", KeyClass::Convert),
+    ("services.*.security_opt", KeyClass::Convert),
     ("services.*.deploy", KeyClass::Convert),
     ("services.*.deploy.resources", KeyClass::Convert),
     ("services.*.deploy.resources.limits", KeyClass::Convert),
@@ -175,9 +178,9 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("services.*.extends", KeyClass::ErrorUnsupportedYet),
     ("services.*.network_mode", KeyClass::ErrorUnsupportedYet),
     ("services.*.user", KeyClass::ErrorUnsupportedYet),
+    // cap_add は CRI の add_capabilities の受け入れのオーナー判断待ち（cri-config-acceptance.md・#2666）。
+    // 判断が出るまで変換しない（TASK-153.2・#610・SEC-1）。
     ("services.*.cap_add", KeyClass::ErrorUnsupportedYet),
-    ("services.*.cap_drop", KeyClass::ErrorUnsupportedYet),
-    ("services.*.security_opt", KeyClass::ErrorUnsupportedYet),
     ("services.*.read_only", KeyClass::ErrorUnsupportedYet),
     ("services.*.logging", KeyClass::ErrorUnsupportedYet),
     ("services.*.dns", KeyClass::ErrorUnsupportedYet),
@@ -388,6 +391,28 @@ mod tests {
         }
     }
 
+    /// STACK-6・TASK-153.2（#610）: cap_drop・security_opt は表にちょうど 1 行の convert。
+    #[test]
+    fn stack6_cap_drop_and_security_opt_are_convert() {
+        for p in ["services.*.cap_drop", "services.*.security_opt"] {
+            assert_eq!(
+                KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(),
+                1,
+                "{p}"
+            );
+            assert_eq!(classify_key_path(p), KeyClass::Convert, "{p}");
+            assert!(!classify_key_path(p).is_error(), "{p}");
+        }
+    }
+
+    /// STACK-6・TASK-153.2（#610・SEC-1）: cap_add はオーナー判断待ちで error-unsupported-yet のまま。
+    #[test]
+    fn stack6_cap_add_stays_unsupported_yet() {
+        let p = "services.*.cap_add";
+        assert_eq!(KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(), 1);
+        assert_eq!(classify_key_path(p), KeyClass::ErrorUnsupportedYet);
+    }
+
     /// STACK-10・TASK-188 (5): サービス間参照のキーは error-unsupported-yet。
     #[test]
     fn stack10_service_reference_keys_are_unsupported_yet() {
@@ -494,6 +519,8 @@ mod tests {
             "deploy",
             "container_name",
             "working_dir",
+            "cap_drop",
+            "security_opt",
         ];
         want.sort_unstable();
         assert_eq!(svc, want);

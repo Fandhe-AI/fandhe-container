@@ -1217,8 +1217,11 @@ pub(crate) mod process {
                     bytes,
                 )
             };
-            if rc < 0 {
-                return Err(SysError::Os(last_errno()));
+            // Darwin の `proc_pidinfo` は失敗時に 0 を返す。開いている fd は少なくとも結果 pipe があるため、
+            // 0 も失敗として扱う（空の一覧と見なすと継承 fd を閉じないまま主経路が走る。SEC-4・REPAIR-5）。
+            if rc <= 0 {
+                let errno = last_errno();
+                return Err(SysError::Os(if errno == 0 { EINVAL } else { errno }));
             }
             if rc < bytes {
                 let n = usize::try_from(rc).map_err(|_| SysError::Os(EINVAL))? / entry;
@@ -1339,7 +1342,8 @@ pub(crate) mod process {
         }
     }
 
-    /// 自プロセスの `SIGCHLD` が子の自動回収になっているか（`SIG_IGN`、または `SA_NOCLDWAIT`）を返す。
+    /// 自プロセスの `SIGCHLD` が子の回収を奪い得る設定か（`SIG_IGN`、`SA_NOCLDWAIT`、または `SIG_DFL` 以外の
+    /// 独自ハンドラ）を返す。独自ハンドラは `waitpid` で子を回収し得るため、自動回収と同様に拒否する。
     ///
     /// 自動回収のプロセスでは子が終了と同時に回収され、pid が再利用され得る。pidfd が無い macOS では、
     /// `file_sink` が fork の前にこれを確かめ、`true` や失敗なら主経路を試さない（pid の再利用で別プロセスへ
@@ -1358,7 +1362,7 @@ pub(crate) mod process {
         if rc != 0 {
             return Err(SysError::Os(last_errno()));
         }
-        Ok(old.sa_sigaction == SIG_IGN || old.sa_flags & SA_NOCLDWAIT != 0)
+        Ok(old.sa_sigaction != SIG_DFL || old.sa_flags & SA_NOCLDWAIT != 0)
     }
 
     /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする

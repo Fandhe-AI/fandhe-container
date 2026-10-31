@@ -464,7 +464,7 @@ fn run_isolated_until(
     if pending::reap_and_count() >= MAX_UNREAPED {
         return Isolated::not_run(IsolatedOutcome::TooManyUnreaped);
     }
-    // macOS には pidfd が無い。SIGCHLD が自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）だと子が終了と同時に回収されて pid が
+    // macOS には pidfd が無い。SIGCHLD が自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）か独自ハンドラ（`waitpid` で回収し得る）だと子が終了と同時に回収されて pid が
     // 再利用され得るため、fork の前に拒否して主経路を試さない（代替経路へ進む）。自動回収が無ければ子は回収されるまで
     // ゾンビとして pid を保持し、「`Ok(None)` を確かめてから `kill`」に窓が無い。検査から fork までに disposition を
     // 変えられるのは fork が通る（単一スレッドの）呼び出しスレッドだけ（CORE-1）。

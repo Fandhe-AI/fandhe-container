@@ -113,6 +113,16 @@ impl TaskService {
         };
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        // Exec 後に停止したコンテナへ起動役を呼ばないよう、起動の直前にも Running を再確認する。
+        let status = self
+            .adapter
+            .state(container.as_str())
+            .map_err(|e| to_status(&e))?;
+        if status.lifecycle != RuntimeLifecycle::Running {
+            return Err(to_status(&CriError::failed_precondition(
+                "container is not running",
+            )));
+        }
         let spec = self
             .execs
             .begin_start(&container, &exec_id)

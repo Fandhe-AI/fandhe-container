@@ -106,6 +106,10 @@ impl ExecProcessSpec {
 /// - プロセスはコンテナの namespace・cgroup・seccomp・capability を継承する（SEC-1）。広げない。
 /// - `spec.user()` が `None` のときはコンテナの init と同じユーザーで動かす。
 /// - 戻り値は PID（不明なら `None`）。
+/// - shim は `Start` の直前にコンテナが Running かを再確認するが、確認から起動までの間に停止しうる。
+///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`。#675・#803）。
+/// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残る（除去は #870 で `Delete(exec_id)`
+///   とあわせて扱う。コンテナ削除・exec 終了時の登録の除去も #870 の必須事項）。
 ///
 /// 本番の実装は無い（REPAIR-3。#675・#803）。
 pub trait TaskExecLauncher: Send + Sync {

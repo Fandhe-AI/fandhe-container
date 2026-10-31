@@ -302,6 +302,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-compose-convert"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-stack",
+]
 
 [[package]]
 name = "fandhe-container-core"

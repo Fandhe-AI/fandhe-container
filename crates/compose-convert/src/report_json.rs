@@ -18,6 +18,7 @@
 use std::fmt::Write as _;
 
 use crate::classify::KeyClass;
+use crate::conversion_rate::{ConversionRate, STACK4_THRESHOLD_PERCENT, format_basis_points};
 use crate::report::{ErrorFreeBlocker, ErrorFreeVerdict, FileConversionReport};
 
 /// レポートに出す分類の順序（STACK-3 の 4 分類と unrecognized）。
@@ -213,16 +214,50 @@ fn write_blockers(s: &mut String, verdict: &ErrorFreeVerdict) {
 
 /// 最後の集計行（末尾改行つき）。`toml_output` は TOML の書き出しが未実装であることの明示（REPAIR-3）。
 /// `error_free_with_downgrade_files` は `--downgrade` 指定時のみ `Some`（別集計。なければ `null`）。
+/// `rate` は STACK-4 の出現数ベース変換可率（TASK-152.2・#606）で、`conversion_rate` に固定順で載る。
 pub fn summary_line(
     files: u64,
     error_free_files: u64,
     error_free_with_downgrade_files: Option<u64>,
     parse_failed_files: u64,
+    rate: &ConversionRate,
 ) -> String {
     let dg = error_free_with_downgrade_files.map_or("null".to_string(), |n| n.to_string());
     format!(
-        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"error_free_with_downgrade_files\":{dg},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"unimplemented\"}}\n"
+        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"error_free_with_downgrade_files\":{dg},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"unimplemented\",\"conversion_rate\":{}}}\n",
+        conversion_rate_json(rate)
     )
+}
+
+fn percent_or_null(bp: Option<u64>) -> String {
+    bp.map_or("null".to_string(), |b| quoted(&format_basis_points(b)))
+}
+
+/// `conversion_rate` オブジェクト。固定語彙と件数だけで、入力由来の文字列は含まない。
+fn conversion_rate_json(r: &ConversionRate) -> String {
+    let mut s = format!(
+        "{{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":{},\"warning_occurrences\":{},\"error_incompatible_occurrences\":{},\"error_unsupported_yet_occurrences\":{},\"unrecognized_occurrences\":{},\"total_occurrences\":{},\"rate_percent\":{},\"threshold_percent\":{},\"verdict\":{},\"lower_bound_convert_occurrences\":{},\"lower_bound_rate_percent\":{},\"lower_bound_verdict\":{},\"indeterminate_reasons\":[",
+        r.convert,
+        r.warning,
+        r.error_incompatible,
+        r.error_unsupported_yet,
+        r.unrecognized,
+        r.total,
+        percent_or_null(r.rate_basis_points),
+        STACK4_THRESHOLD_PERCENT,
+        quoted(r.verdict.as_str()),
+        r.lower_bound_convert,
+        percent_or_null(r.lower_bound_basis_points),
+        quoted(r.lower_bound_verdict.as_str()),
+    );
+    for (i, reason) in r.indeterminate_reasons.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&quoted(reason.as_str()));
+    }
+    s.push_str("]}");
+    s
 }
 
 #[cfg(test)]
@@ -302,16 +337,46 @@ mod tests {
         assert_eq!(l.matches("guidance").count(), 1);
     }
 
-    /// STACK-3: 集計行の形。
+    fn rate_of(entries: &[(&str, KeyClass, u64)], failed: bool) -> ConversionRate {
+        let mut occ = KeyOccurrences::new();
+        for (p, c, n) in entries {
+            for _ in 0..*n {
+                occ.record(p, *c);
+            }
+        }
+        let mut t = crate::conversion_rate::ConversionRateTally::new();
+        t.add(&FileConversionReport::from_parsed(occ, ValueDrops::new()));
+        if failed {
+            t.add(&FileConversionReport::parse_failed(
+                ComposeParseErrorCode::InvalidArgument,
+            ));
+        }
+        t.finish()
+    }
+
+    /// STACK-3・STACK-4: 集計行の形（変換可率つき）。
     #[test]
     fn summary_line_exact() {
-        assert_eq!(
-            summary_line(3, 1, None, 1),
-            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}\n"
+        let r = rate_of(
+            &[("a", KeyClass::Convert, 4), ("b", KeyClass::Warning, 1)],
+            false,
         );
         assert_eq!(
-            summary_line(3, 1, Some(2), 1),
-            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":2,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}\n"
+            summary_line(3, 1, None, 1, &r),
+            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":1,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"meets\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"meets\",\"indeterminate_reasons\":[]}}\n"
+        );
+        assert!(
+            summary_line(3, 1, Some(2), 1, &r).contains("\"error_free_with_downgrade_files\":2,")
+        );
+    }
+
+    /// STACK-4: 判定不能と率 null の形。
+    #[test]
+    fn summary_line_indeterminate_exact() {
+        let r = rate_of(&[], true);
+        assert_eq!(
+            summary_line(1, 0, None, 1, &r),
+            "{\"kind\":\"summary\",\"files\":1,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\",\"no-key-occurrences\"]}}\n"
         );
     }
 }

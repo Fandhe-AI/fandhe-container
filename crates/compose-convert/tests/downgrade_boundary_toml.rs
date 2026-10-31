@@ -12,6 +12,7 @@ use fandhe_container_compose_convert::classify::{KEY_CLASS_TABLE, KeyClass, clas
 use fandhe_container_compose_convert::compose_convert::{
     ComposeParseErrorCode, parse_compose_yaml,
 };
+use fandhe_container_compose_convert::conversion_rate::ConversionRateTally;
 use fandhe_container_compose_convert::convert::{ValueDrops, convert_top_level};
 use fandhe_container_compose_convert::downgrade::{
     DowngradeArgError, DowngradeSet, MAX_DOWNGRADE_KEY_BYTES, MAX_DOWNGRADE_KEYS,
@@ -335,8 +336,8 @@ fn stack3_629_file_line_downgraded_json_exact() {
     );
 
     assert_eq!(
-        summary_line(2, 0, Some(1), 0),
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\"}\n"
+        summary_line(2, 0, Some(1), 0, &ConversionRateTally::new().finish()),
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":0,\"warning_occurrences\":0,\"error_incompatible_occurrences\":0,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":0,\"rate_percent\":null,\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":0,\"lower_bound_rate_percent\":null,\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"no-key-occurrences\"]}}\n"
     );
     for l in [&l1, &l2] {
         assert!(!l.contains("secretsvc-629") && !l.contains("leak-sentinel"));

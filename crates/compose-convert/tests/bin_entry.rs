@@ -105,7 +105,7 @@ fn report_lines_for_mixed_directory() {
     );
     assert_eq!(
         lines[2],
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}"
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":4,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":0,\"unrecognized_occurrences\":0,\"total_occurrences\":5,\"rate_percent\":\"80.00\",\"threshold_percent\":80,\"verdict\":\"indeterminate\",\"lower_bound_convert_occurrences\":4,\"lower_bound_rate_percent\":\"80.00\",\"lower_bound_verdict\":\"indeterminate\",\"indeterminate_reasons\":[\"parse-failed-files\"]}}"
     );
     for marker in ["value-marker-9c1d", "SECRET", "web"] {
         assert!(!err.contains(marker), "{marker} leaked: {err}");
@@ -296,7 +296,7 @@ fn downgrade_of_unsupported_key_is_reported() {
     assert!(lines[1].contains("\"downgraded\":{\"services.*.hostname\":1}"));
     assert_eq!(
         lines[2],
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\"}"
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\",\"conversion_rate\":{\"basis\":\"occurrences-excluding-warning\",\"convert_occurrences\":6,\"warning_occurrences\":0,\"error_incompatible_occurrences\":1,\"error_unsupported_yet_occurrences\":2,\"unrecognized_occurrences\":0,\"total_occurrences\":9,\"rate_percent\":\"66.66\",\"threshold_percent\":80,\"verdict\":\"below\",\"lower_bound_convert_occurrences\":6,\"lower_bound_rate_percent\":\"66.66\",\"lower_bound_verdict\":\"below\",\"indeterminate_reasons\":[]}}"
     );
 }
 

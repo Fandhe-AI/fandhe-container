@@ -113,6 +113,28 @@ fn report_lines_for_mixed_directory() {
     assert!(err.is_ascii());
 }
 
+/// STACK-7: build: を含むファイルは終了コード 0 のまま、案内つきの blocker が出る。値は漏れない。
+#[test]
+fn build_key_reports_guidance() {
+    let s = Scratch::new();
+    s.write(
+        "a.yaml",
+        "services:\n  svcmarker:\n    build: ./ctx-marker\n",
+    );
+    let (code, out, err) = run_dir(s.path());
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "");
+    assert!(err.contains("\"error_free\":false"), "{err}");
+    assert!(
+        err.contains("\"guidance\":{\"code\":\"external-build\",\"message\":\""),
+        "{err}"
+    );
+    for marker in ["ctx-marker", "svcmarker"] {
+        assert!(!err.contains(marker), "{marker} leaked: {err}");
+    }
+    assert!(err.is_ascii());
+}
+
 /// STACK-3: 問題のないファイルは error_free: true で blocker が空。
 #[test]
 fn clean_file_is_error_free() {

@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::classify::KeyClass;
+use crate::classify::{IncompatibleGuidance, KeyClass, incompatible_guidance};
 use crate::compose_convert::ComposeParseErrorCode;
 use crate::convert::ValueDrops;
 
@@ -130,10 +130,16 @@ impl FileConversionReport {
         }
         for (path, e) in self.key_occurrences.iter() {
             if e.class.is_error() {
+                let guidance = if e.class == KeyClass::ErrorIncompatible {
+                    incompatible_guidance(path)
+                } else {
+                    None
+                };
                 blockers.push(ErrorFreeBlocker::ErrorClassKey {
                     key_path: path.to_string(),
                     class: e.class,
                     occurrences: e.occurrences,
+                    guidance,
                 });
             }
         }
@@ -163,6 +169,9 @@ pub enum ErrorFreeBlocker {
         class: KeyClass,
         /// 出現数。
         occurrences: u64,
+        /// 外部手順の案内（TASK-154.1・STACK-7）。`ErrorIncompatible` で
+        /// [`incompatible_guidance`] が返したときだけ `Some`。
+        guidance: Option<IncompatibleGuidance>,
     },
     /// 捨てた値がある（`value_drops` が空でない）。
     ValueDrops {
@@ -242,10 +251,36 @@ mod tests {
                 &[ErrorFreeBlocker::ErrorClassKey {
                     key_path: "services.*.x".to_string(),
                     class,
-                    occurrences: 2
+                    occurrences: 2,
+                    guidance: None
                 }]
             );
         }
+    }
+
+    /// STACK-7・D-16: 実 YAML の build は案内つきの blocker になり、privileged は案内なし。
+    #[test]
+    fn stack7_build_blocker_carries_guidance() {
+        use crate::key_scan::collect_key_occurrences;
+        let doc = parse_compose_yaml(
+            "services:\n  a:\n    image: x\n    build: .\n    privileged: true\n",
+        )
+        .unwrap();
+        let v = FileConversionReport::from_parsed(collect_key_occurrences(&doc), ValueDrops::new())
+            .error_free();
+        assert!(!v.is_error_free());
+        assert!(v.blockers().contains(&ErrorFreeBlocker::ErrorClassKey {
+            key_path: "services.*.build".to_string(),
+            class: KeyClass::ErrorIncompatible,
+            occurrences: 1,
+            guidance: Some(IncompatibleGuidance::ExternalBuild),
+        }));
+        assert!(v.blockers().contains(&ErrorFreeBlocker::ErrorClassKey {
+            key_path: "services.*.privileged".to_string(),
+            class: KeyClass::ErrorIncompatible,
+            occurrences: 1,
+            guidance: None,
+        }));
     }
 
     /// STACK-3: パース失敗は error_free にならない。

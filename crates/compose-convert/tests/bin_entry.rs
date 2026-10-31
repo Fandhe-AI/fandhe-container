@@ -188,19 +188,19 @@ fn downgrade_of_unsupported_key_is_reported() {
     let s = Scratch::new();
     s.write(
         "a.yaml",
-        "services:\n  web:\n    image: busybox\n    container_name: c\n",
+        "services:\n  web:\n    image: busybox\n    hostname: c\n",
     );
     s.write(
         "b.yaml",
-        "services:\n  web:\n    image: busybox\n    container_name: c\n    privileged: true\n",
+        "services:\n  web:\n    image: busybox\n    hostname: c\n    privileged: true\n",
     );
     let dir = s.path().to_string_lossy().into_owned();
-    let (code, out, err) = run_strs(&["--downgrade=services.*.container_name", &dir]);
+    let (code, out, err) = run_strs(&["--downgrade=services.*.hostname", &dir]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(out, "");
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines.len(), 3, "{err}");
-    assert!(lines[0].contains("\"downgraded\":{\"services.*.container_name\":1}"));
+    assert!(lines[0].contains("\"downgraded\":{\"services.*.hostname\":1}"));
     assert!(lines[0].contains("\"error_free\":false"));
     assert!(
         lines[0].contains(
@@ -208,7 +208,7 @@ fn downgrade_of_unsupported_key_is_reported() {
         )
     );
     assert!(lines[1].contains("\"error_free_with_downgrade\":false"));
-    assert!(lines[1].contains("\"downgraded\":{\"services.*.container_name\":1}"));
+    assert!(lines[1].contains("\"downgraded\":{\"services.*.hostname\":1}"));
     assert_eq!(
         lines[2],
         "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\"}"

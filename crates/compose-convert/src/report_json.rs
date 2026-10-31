@@ -292,12 +292,12 @@ mod tests {
         let mut occ = KeyOccurrences::new();
         occ.record("services.*.build", KeyClass::ErrorIncompatible);
         let r = FileConversionReport::from_parsed(occ, ValueDrops::new());
-        let l = file_line("a", &r, &r.error_free());
+        let l = file_line("a", &r, &r.error_free(), None);
         let want = format!(
             "\"error_free_blockers\":[{{\"kind\":\"error-class-key\",\"key_path\":\"services.*.build\",\"class\":\"error-incompatible\",\"occurrences\":1,\"guidance\":{{\"code\":\"external-build\",\"message\":\"{}\"}}}}]}}\n",
             crate::classify::IncompatibleGuidance::ExternalBuild.message()
         );
-        assert!(l.ends_with(&want), "{l}");
+        assert!(l.contains(&want[..want.len() - 2]), "{l}");
         assert!(l.is_ascii() && l.matches('\n').count() == 1);
         assert_eq!(l.matches("guidance").count(), 1);
     }

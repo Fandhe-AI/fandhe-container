@@ -70,7 +70,7 @@ fn stack3_key_paths_spot_check() {
         ("services.*", KeyClass::Convert, 2),
         ("services.*.image", KeyClass::Convert, 2),
         ("services.*.network_mode", KeyClass::ErrorIncompatible, 2),
-        ("services.*.volumes", KeyClass::ErrorIncompatible, 2),
+        ("services.*.volumes", KeyClass::ErrorIncompatible, 1),
         ("x-common", KeyClass::Warning, 1),
         ("version", KeyClass::Warning, 1),
         ("profiles", KeyClass::ErrorUnsupportedYet, 1),

@@ -19,7 +19,7 @@
 //! 4. シーケンスとスカラーには降りない（要素の変換は `convert` の担当）。型が想定と違っても panic しない。
 //! 5. `services.*.network_mode` は値で分類を重くする（`host`・`container:` は error-incompatible）。
 //! 6. `services.*.volumes` の short syntax の要素が Docker ソケットの bind なら、`services.*.volumes` を
-//!    error-incompatible として追加記録する（D-16。long syntax のソケット検出は未対応。REPAIR-3）。
+//!    error-incompatible として重く記録する（記録は 1 回）（D-16。long syntax のソケット検出は未対応。REPAIR-3）。
 //!
 //! 再帰の深さはパーサーの深さ予算に、異なるパスの数は [`crate::report::MAX_KEY_PATHS`] に縛られる。
 
@@ -53,15 +53,31 @@ fn table_has_row(path: &str) -> bool {
     KEY_CLASS_TABLE.iter().any(|(p, _)| *p == path)
 }
 
+/// 入力キー 1 個分をパスの 1 セグメントにする。`.`・`*`・`%` を符号化し、キー内の区切り文字や
+/// ワイルドカードが分類表の階層として解釈されて fail-closed を回避されるのを防ぐ（STACK-3）。
+/// 符号化後のセグメントは表のどの行にも一致せず、末尾セグメントの `x-` 判定にも `.` で割れない。
+fn escape_segment(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for c in key.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '.' => out.push_str("%2E"),
+            '*' => out.push_str("%2A"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `parent`（正規形。トップレベルは `None`）の子キーを記録し、降りてよい値へ再帰する。
 fn scan_mapping(map: &ComposeMapping, parent: Option<&str>, occ: &mut KeyOccurrences) {
     // 親に `<parent>.*` の行があれば、子キーはユーザー定義名として `*` に潰す。
     let wildcard = parent.is_some_and(|p| table_has_row(&format!("{p}.*")));
     for (key, value) in map.iter() {
         let path = match (parent, wildcard) {
-            (None, _) => key.to_string(),
+            (None, _) => escape_segment(key),
             (Some(p), true) => format!("{p}.*"),
-            (Some(p), false) => format!("{p}.{key}"),
+            (Some(p), false) => format!("{p}.{}", escape_segment(key)),
         };
         record_entry(&path, value, occ);
         if let ComposeValue::Mapping(child) = value
@@ -78,7 +94,6 @@ fn record_entry(path: &str, value: &ComposeValue, occ: &mut KeyOccurrences) {
     if path == NETWORK_MODE {
         class = class.heavier(classify_network_mode_value(value.as_str()));
     }
-    occ.record(path, class);
     if path == SERVICE_VOLUMES {
         let has_socket = value.as_sequence().is_some_and(|items| {
             items
@@ -86,9 +101,11 @@ fn record_entry(path: &str, value: &ComposeValue, occ: &mut KeyOccurrences) {
                 .any(|v| v.as_str().is_some_and(is_docker_socket_bind))
         });
         if has_socket {
-            occ.record(path, KeyClass::ErrorIncompatible);
+            class = class.heavier(KeyClass::ErrorIncompatible);
         }
     }
+    // 出現数を正確に保つため、キーごとに 1 回だけ記録する。
+    occ.record(path, class);
 }
 
 #[cfg(test)]
@@ -133,6 +150,23 @@ mod tests {
         assert_eq!(o.unrecognized_count(), 0);
         let o = scan("services:\n  a:\n    deploy:\n      resources:\n        foo: 1\n");
         assert_eq!(o.unrecognized_count(), 1);
+    }
+
+    /// STACK-3: キー内の `.`・`*` を階層として解釈させて fail-closed を回避できない。
+    #[test]
+    fn dotted_or_star_keys_stay_unrecognized() {
+        let o = scan("\"services.*.image\": x\nservices:\n  a:\n    \"unknown.x-note\": 1\n");
+        assert_eq!(o.unrecognized_count(), 2);
+        assert!(o.get("services.*.image").is_none());
+        assert!(o.get("services").is_some());
+    }
+
+    /// STACK-3・D-16: ソケット bind があっても volumes の出現数は 1 回につき 1。
+    #[test]
+    fn socket_volumes_counted_once() {
+        let o = scan("services:\n  a:\n    volumes:\n      - /var/run/docker.sock:/s\n");
+        let e = o.get(SERVICE_VOLUMES).expect("recorded");
+        assert_eq!((e.class, e.occurrences), (KeyClass::ErrorIncompatible, 1));
     }
 
     /// STACK-3・D-16: network_mode の値で分類が重くなる。文字列でない値は unsupported-yet。

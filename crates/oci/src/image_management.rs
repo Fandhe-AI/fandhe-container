@@ -114,6 +114,19 @@ pub use store::{
     IMAGE_STORE_LOCK_FILE_NAME, IMAGE_STORE_LOCK_TIMEOUT, ImageStore, ImageStoreGuard,
 };
 
+/// イメージストア root 配下の blob 置き場の相対パス要素（`<root>/blobs/sha256`）。
+///
+/// oci の fd 起点の検査（`root_handle`）・在庫走査（`usage`）・pull と、cri のキャッシュ配置が
+/// 共有する配置の契約。直書きを散らさないための単一定義（OCI-7・REPAIR-1・#2223）。
+pub const IMAGE_STORE_BLOB_DIR: [&str; 2] = ["blobs", "sha256"];
+
+/// OCI-7・REPAIR-1（#2223）: 配置の契約値を具体値で固定する（cri のキャッシュ配置も同じ値に従う）。
+#[cfg(test)]
+#[test]
+fn oci7_repair1_image_store_blob_dir_is_blobs_sha256() {
+    assert_eq!(IMAGE_STORE_BLOB_DIR, ["blobs", "sha256"]);
+}
+
 /// `ContainerRefId` の最大バイト数（core の `ContainerId` と同じ）。
 pub const CONTAINER_REF_ID_MAX_BYTES: usize = 255;
 /// `PullId` の最大バイト数。

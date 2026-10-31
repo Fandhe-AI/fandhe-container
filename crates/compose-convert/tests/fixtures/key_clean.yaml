@@ -13,6 +13,8 @@ services:
     working_dir: /srv/app
     cap_drop: [NET_RAW]
     security_opt: ["no-new-privileges:true"]
+    stdin_open: true
+    tty: true
     command: ["serve"]
     environment:
       ENVMARKER_NAME: dummy

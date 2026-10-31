@@ -8,6 +8,8 @@ container_name = "roundtrip-web"
 working_dir = "/app"
 cap_drop = ["NET_RAW", "ALL"]
 security_opt = ["no-new-privileges:true"]
+stdin_open = true
+tty = true
 command = ["serve", "--port=8080"]
 entrypoint = ["/entry"]
 env_files = [".env", "./extra.env"]

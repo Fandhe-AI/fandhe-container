@@ -275,13 +275,16 @@ mod tests {
     /// STACK-3・TASK-182.1: --downgrade の受理・拒否・繰り返しの拒否。
     #[test]
     fn parse_args_downgrade() {
-        match parse_args(&os(&["--downgrade=services.*.tty, services.*.user", "d"])) {
+        match parse_args(&os(&[
+            "--downgrade=services.*.platform, services.*.user",
+            "d",
+        ])) {
             Parsed::Run { dir, downgrade } => {
                 assert_eq!(dir, PathBuf::from("d"));
                 let set = downgrade.expect("set");
                 assert_eq!(
                     set.iter().collect::<Vec<_>>(),
-                    vec!["services.*.tty", "services.*.user"]
+                    vec!["services.*.platform", "services.*.user"]
                 );
             }
             other => panic!("{other:?}"),
@@ -295,7 +298,7 @@ mod tests {
             Parsed::DowngradeRejected(DowngradeArgError::Empty)
         );
         let twice = [
-            "--downgrade=services.*.tty",
+            "--downgrade=services.*.platform",
             "--downgrade=services.*.user",
             "d",
         ];
@@ -323,7 +326,7 @@ mod tests {
     #[test]
     fn downgrade_rejection_output() {
         let o = run_args(&os(&[
-            "--downgrade=services.*.tty,services.*.privileged",
+            "--downgrade=services.*.platform,services.*.privileged",
             "/nonexistent-dir-secret-marker",
         ]));
         assert_eq!(o.exit_code, 2);

@@ -5,6 +5,7 @@
 //! キー分類表（`classify`。TASK-151.2・#596・STACK-3）も実装済み。
 //! `container_name`・`working_dir` の変換（TASK-153.1・#609・STACK-6）も実装済み。
 //! `security_opt`・`cap_drop` の変換（TASK-153.2・#610・STACK-6）も実装済み。`cap_add` はオーナー判断待ちで error-unsupported-yet。
+//! `stdin_open`・`tty` の変換（TASK-153.3・#611・STACK-6）も実装済み。`create` への写しは未実装（REPAIR-3）。
 //! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み。
 //! スカラーと short syntax キーの TOML 変換（`convert`・`shell_split`。TASK-151.3.1・#864・STACK-3・MS-12）も実装済み。
 //! マッピング配列キー（long syntax）の short syntax への変換（`long_syntax`。TASK-151.3.2・#865・STACK-3）も実装済みで、`convert` へ結線済み（#599）。

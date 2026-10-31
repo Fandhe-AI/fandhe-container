@@ -109,6 +109,19 @@ pub struct Service {
     /// シェル文字列へ連結しない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_opt: Vec<String>,
+    /// stdin を開いたままにするか（compose の `stdin_open`。TASK-153.3・#611・STACK-6）。
+    ///
+    /// 真偽値だけを受け、変換器は文字列（`"true"`・`yes`）を真偽値へ読み替えない。`false` と「キー無し」は
+    /// 同じ意味だが、明示した値を往復で保つため `Option` にする。`create` への写しは未実装（CLI に `-i` が無く、
+    /// CRI も tty / stdin を `UNIMPLEMENTED` で拒否する。REPAIR-3）。`up`（TASK-155）は `true` を黙って
+    /// 無視せず、stdin をつなぐ経路ができるまでエラーで拒否する前提（fail-closed）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_open: Option<bool>,
+    /// 疑似端末（TTY）を割り当てるか（compose の `tty`。TASK-153.3・#611・STACK-6）。
+    ///
+    /// 扱いは `stdin_open` と同じ（真偽値のみ・`create` への写しは未実装・`up` は `true` を黙って無視しない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
     /// 環境変数（compose の `environment` に当たる）。
     ///
     /// 値を持たない compose の `KEY` だけの形は表せない（変換器が空文字列に読み替える）。
@@ -271,7 +284,7 @@ impl Service {
     /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
     /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
     /// `ulimits`・`tmpfs`・`shm_size` はスキーマにあるが(#862)、`--ulimit`・`--tmpfs`・`--shm-size` への写しは
-    /// 未実装で含めない。`container_name`・`working_dir`(#609)・`security_opt`(#610)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// 未実装で含めない。`container_name`・`working_dir`(#609)・`security_opt`(#610)・`stdin_open`・`tty`(#611)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
     /// `cap_drop`(#610)は `--cap-drop <name>` へ入力順のまま写す(正規化は CLI ⇒ core)。`cap_add` はスキーマに無い(オーナー判断待ち。#2666)。
     ///
     /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
@@ -374,6 +387,8 @@ mod tests {
             labels: BTreeMap::from([("tier".into(), "web".into())]),
             cap_drop: vec!["ALL".into(), "chown".into()],
             security_opt: vec!["no-new-privileges:true".into()],
+            tty: Some(true),
+            stdin_open: Some(true),
             ..Service::default()
         };
         let args: Vec<String> = service
@@ -425,6 +440,8 @@ container_name = "fixed-web"
 working_dir = "/app"
 cap_drop = ["NET_RAW"]
 security_opt = ["no-new-privileges:true"]
+stdin_open = true
+tty = false
 command = ["serve", "--port", "8080"]
 entrypoint = []
 env_files = [".env"]
@@ -461,6 +478,8 @@ file = "./app.conf"
             working_dir: Some("/app".into()),
             cap_drop: vec!["NET_RAW".into()],
             security_opt: vec!["no-new-privileges:true".into()],
+            stdin_open: Some(true),
+            tty: Some(false),
             command: Some(vec!["serve".into(), "--port".into(), "8080".into()]),
             entrypoint: Some(vec![]),
             env: BTreeMap::from([("MODE".into(), "dummy".into())]),
@@ -873,6 +892,8 @@ nproc = "-1"
             working_dir: Some("/app".into()),
             cap_drop: strs(&["NET_RAW", "ALL"]),
             security_opt: strs(&["no-new-privileges:true"]),
+            stdin_open: Some(true),
+            tty: Some(true),
             command: Some(strs(&["serve", "--port=8080"])),
             entrypoint: Some(strs(&["/entry"])),
             env: map(&[("MODE", "dummy"), ("LEVEL", "debug")]),
@@ -919,6 +940,8 @@ nproc = "-1"
             working_dir: None,
             cap_drop: vec![],
             security_opt: vec![],
+            stdin_open: None,
+            tty: None,
             command: Some(vec![]),
             entrypoint: Some(vec![]),
             env: BTreeMap::new(),

@@ -48,6 +48,21 @@ fn stack6_container_name_and_working_dir_roundtrip_through_toml() {
     assert!(drops.is_empty());
 }
 
+/// STACK-6・TASK-153.3（#611）: stdin_open・tty が TOML へ往復し、明示した false も保たれる。
+#[test]
+fn stack6_stdin_open_and_tty_roundtrip_through_toml() {
+    let doc =
+        parse_compose_yaml("services:\n  a:\n    image: x\n    stdin_open: true\n    tty: false\n")
+            .unwrap();
+    let mut drops = ValueDrops::new();
+    let t = convert_top_level(&doc, &mut drops);
+    let back: ComposeToml = toml::from_str(&toml::to_string(&t).unwrap()).unwrap();
+    assert_eq!(back, t);
+    assert_eq!(back.services["a"].stdin_open, Some(true));
+    assert_eq!(back.services["a"].tty, Some(false));
+    assert!(drops.is_empty());
+}
+
 /// STACK-6・TASK-153.2（#610）: cap_drop・security_opt が TOML へ往復する。
 #[test]
 fn stack6_cap_drop_and_security_opt_roundtrip_through_toml() {

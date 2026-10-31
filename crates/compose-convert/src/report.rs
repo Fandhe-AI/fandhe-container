@@ -241,7 +241,7 @@ mod tests {
         let mut k = KeyOccurrences::new();
         k.record("services.*", KeyClass::Convert);
         k.record("services.*.image", KeyClass::Convert);
-        k.record("services.*.stdin_open", KeyClass::Warning);
+        k.record("services.*.x-custom", KeyClass::Warning);
         k
     }
 
@@ -391,8 +391,8 @@ mod tests {
     #[test]
     fn downgrade_verdict_and_downgraded() {
         use crate::downgrade::parse_downgrade_value;
-        let set =
-            parse_downgrade_value("services.*.hostname,services.*.tty").expect("downgrade set");
+        let set = parse_downgrade_value("services.*.hostname,services.*.platform")
+            .expect("downgrade set");
         let mut occ = KeyOccurrences::new();
         occ.record("services.*.hostname", KeyClass::ErrorUnsupportedYet);
         occ.record("services.*.hostname", KeyClass::ErrorUnsupportedYet);
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(r.error_free().blockers().len(), 2);
 
         let mut occ2 = KeyOccurrences::new();
-        occ2.record("services.*.tty", KeyClass::ErrorUnsupportedYet);
+        occ2.record("services.*.platform", KeyClass::ErrorUnsupportedYet);
         let ok = FileConversionReport::from_parsed(occ2.clone(), ValueDrops::new());
         assert!(ok.error_free_with_downgrade(&set).is_error_free());
         assert!(!ok.error_free().is_error_free());

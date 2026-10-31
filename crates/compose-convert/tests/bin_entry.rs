@@ -232,14 +232,14 @@ fn downgrade_mixed_accepted_and_rejected_exit_2() {
     s.write("a.yaml", "services:\n  web:\n    image: busybox\n");
     let dir = s.path().to_string_lossy().into_owned();
     let image_tail = ",\"class\":\"convert\",\"key_path\":\"services.*.image\"";
-    let (code, out, err) = run_strs(&["--downgrade=services.*.tty,services.*.image", &dir]);
+    let (code, out, err) = run_strs(&["--downgrade=services.*.platform,services.*.image", &dir]);
     assert_eq!(code, Some(2), "{err}");
     assert_eq!(out, "");
     assert_eq!(
         err,
         format!("{REJECT_HEAD}{image_tail},\"index\":\"1\"}}\n")
     );
-    let (code, _, err) = run_strs(&["--downgrade=services.*.image,services.*.tty", &dir]);
+    let (code, _, err) = run_strs(&["--downgrade=services.*.image,services.*.platform", &dir]);
     assert_eq!(code, Some(2));
     assert_eq!(
         err,
@@ -247,7 +247,7 @@ fn downgrade_mixed_accepted_and_rejected_exit_2() {
     );
     // 拒否が複数: 最初のものだけ。
     let (code, _, err) = run_strs(&[
-        "--downgrade=services.*.tty,services.*.image,services.*.privileged",
+        "--downgrade=services.*.platform,services.*.image,services.*.privileged",
         &dir,
     ]);
     assert_eq!(code, Some(2));
@@ -258,7 +258,7 @@ fn downgrade_mixed_accepted_and_rejected_exit_2() {
     assert!(!err.contains("privileged"));
     // unrecognized が混ざっても入力の目印は出ない。
     let (code, _, err) = run_strs(&[
-        "--downgrade=services.*.tty,services.*.secret-marker-628",
+        "--downgrade=services.*.platform,services.*.secret-marker-628",
         &dir,
     ]);
     assert_eq!(code, Some(2));

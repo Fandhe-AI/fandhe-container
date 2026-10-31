@@ -306,6 +306,7 @@ dependencies = [
  "fandhe-container-stack",
  "serde",
  "serde-saphyr",
+ "toml",
 ]
 
 [[package]]

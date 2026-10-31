@@ -107,6 +107,8 @@ cat <<'EOF'
                                         ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
   deny-license-fail-closed-selftest   scripts/targets/deny-license-fail-closed-selftest.sh
                                         deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）
+  deny-bans-fail-closed-selftest      scripts/targets/deny-bans-fail-closed-selftest.sh
+                                        deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（TASK-73.2・MVM-4・REPAIR-9）
   bench-check-selftest                scripts/with-tools.sh jq scripts/check-bench-regression-selftest.sh
                                         ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
   bench-baseline-selftest             scripts/with-tools.sh jq scripts/bench/generate_baseline_selftest.sh

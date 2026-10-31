@@ -253,8 +253,9 @@ jobs:
   # deny ジョブ（REPAIR-7 ステージ 5: セキュリティチェック・依存監査。TASK-86.4・#38）は
   # 次の 4 種を `make deny` と同一集合で実行する。
   #   - advisories: RUSTSEC アドバイザリ（脆弱・unmaintained・unsound・yanked。REPAIR-9）
-  #   - bans: wildcards 等の禁止設定（rust-vmm 系クレートの禁止リストは MVM-4・
-  #     TASK-73 で deny.toml の [bans] へ追記予定。本 PR では追記しない）
+  #   - bans: wildcards・ring/cc/aws-lc-rs（#1779）に加え、rust-vmm 系の禁止 10 種（MVM-4・TASK-73.2）を
+  #     deny.toml の [bans] で検出する。一覧の正は check-microvm-deps.sh --list で、一致と検出力は
+  #     platform-ci の bans fail-closed 自己テストが照合する
   #   - licenses: 許可ライセンス外の依存を検出（OSS-4・OSS-5）
   #   - sources: crates.io 以外のレジストリ / git 依存を拒否
   # 「禁止 API リント」（REPAIR-7 ステージ 5 のもう一方の観点）は対応する TASK が
@@ -746,6 +747,14 @@ jobs:
         shell: bash
         timeout-minutes: 5
         run: make deny-license-fail-closed-selftest
+
+      # bans の判定も OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
+      # 既存ジョブへのステップ追加のため check-run 名は増えない。
+      - name: deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（MVM-4・REPAIR-9・TASK-73.2。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 5
+        run: make deny-bans-fail-closed-selftest
 
       # サードパーティのライセンス表記の生成（TASK-103.2・OSS-5）。about.toml が 5 ターゲットを固定する
       # ため生成結果は実行 OS に依らず、cargo-about の導入ビルドを 3 回払わないよう ubuntu のみで実行する。

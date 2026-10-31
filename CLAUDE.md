@@ -114,6 +114,7 @@ fandhe-container/
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）
 │   │   ├── audit-seccomp-reader.md  # AUDIT_SECCOMP の読み手と CAP_AUDIT_READ の付与の判断記録（v6.12 の原文での確認結果を含む。#2237・SEC-4・SUP-14。オーナー承認待ち）
 │   │   ├── plugin-backend-wiring.md  # バックエンド plugin の検証後の起動と RPC の配線の設計案（#1869・TASK-115・TASK-79 追補・PLUG-1・PLUG-7。承認待ち）
+│   │   ├── mcp-2026-07-28-migration.md  # MCP 2025-06-18 から 2026-07-28 への差分と plugin-mcp の対応方針のドラフト（TASK-119.1・#715・MCP-3。オーナー承認待ち #720）
 │   │   ├── rootless-id-map-holder.md  # 範囲写像の書き込み先を専用の holder プロセスへ分け、中間プロセスが dumpable になる窓をなくす設計（#2374・CORE-6・SEC-5・SEC-1）
 │   │   ├── cri-cgroup-parent.md   # CRI の cgroup_parent の受け入れ方針の判断記録（#2672・CRI-2・CORE-4。オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）
 │   │   ├── cdi-non-gpu-generalization.md  # 非 GPU デバイスの CDI spec 一般化の机上検証・GPU 固有前提の洗い出し・#571 向け PoC 手順（TASK-132・GPU-9〔検討中〕。判断は #571）

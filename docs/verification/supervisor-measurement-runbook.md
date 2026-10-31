@@ -10,7 +10,7 @@
 
 | 項目 | 内容 |
 | ---- | ---- |
-| restart の再 launch（#491） | supervisor の再 launch は本番 launcher の単一スレッド要求で拒否される（#2043）。#2043 が入るまで `make restart-latency` は再起動未観測（終了コード 1）になり数値は出ない。`make supervisor-independence` の `--check-restart` も同じ |
+| restart の再 launch（#491） | supervisor の再 launch は #2043 で本番 launcher でも成立する（常駐スレッドを止めて監視スレッドで直接 launch。設計は `docs/design/restart-relaunch-single-thread.md`）。実機での数値は未取得（人間担当）。制御チャネルの accept の poll 間隔（100ms）が再 launch の待ちに載り得る |
 | 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。両立のため #2090 のオーナー決定（案 A）に従い、**計測（`/proc` の読み取りとシグナル送信）だけを root で行い、create・`systemd-run`・supervisor の起動は対象の利用者（`RUN_AS`）へ降格する**。#485 は「root が計測し、supervisor は対象の利用者が起動する」2 つのシェルで行う（これが案 A そのもの）。#219 の own は 1 つのスクリプトが root で動き、起動だけを `setpriv` で降格する（実装は #2099。自己テストはスタブのみで、**実機〔root〕での実行・検証は #485・#219 の人間担当が行う。結果は未取得**）。製品の `dumpable=0`・rootful 拒否は変えない |
 | supervisor の停止 | CLI の `stop` は Linux で制御チャネル経由に結線済み（#2059・#2142）だが、SIGTERM を渡すだけで猶予後の SIGKILL は無く（#1545）、restart ポリシーの下では終了が再起動の対象になる（SUP-9 は #2162・#2440 で実装済みだが、本手順の stop 経由への切り替えは未実施）。コンテナの PID 1 の init はハンドラが無いと SIGTERM を捨てる。このため restart ポリシー `no` の後始末（#499 の既定・#485 の手順 1）だけ `stop` を第 1 段にし、記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送る既存の回収を fallback として残す。#491 と #499 の `--check-restart` は `stop` を使わない。`stop` は supervisor と同じ利用者のシェルから呼ぶ（制御チャネルは別 uid の接続元を拒否する）。CLI の `delete` は委譲スコープの外では cgroup の検出に失敗するため呼ばず（#2133）、状態ルートごと削除する |
 | バックオフ（#491） | supervisor の bin にバックオフを指定する引数は無く、既定 100ms 固定（`crates/supervisor/src/restart.rs` の `DEFAULT_BACKOFF`）。計測値はバックオフを含むため、スクリプトは差し引いた値も出す |
@@ -60,7 +60,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 - 非 root で実行する。N 個の supervisor を同時に起動し、1 個へ SIGKILL を送って次を判定する: (a) 対象の消滅・(b) 残り N-1 個の監視プロセスの生存・(c) 残りのコンテナ側プロセスの継続・(d) 対象のコンテナ側プロセスの稼働継続
 - 出力の読み方: JSON の `result` が `pass` なら全判定成立。`supervisors_alive_after_kill`・`monitored_containers_alive` は期待値 N-1。`target_container_reparented_to` は孤児化後の親 pid（参考値）
 - 終了コード: 0 = 全判定成立、1 = 判定不成立・起動数不足・期限切れ、2 = 引数・入力エラー、3 = 前提欠如（root 実行を含む）、4 = 後始末失敗
-- `--check-restart` は #2043 の後に有効（既定 off）
+- `--check-restart` は #2043 で前提が満たされた（既定 off。実機での確認は未実施）
 - 後始末: 既定では残り N-1 個を CLI の `stop`（期限つき）で止めてから、記録した pid・起動時刻での回収を fallback として行う。対象の個体は SIGKILL 済みで `stop` が届かないため、記録した pid で回収する。`--check-restart` では `stop` を使わない（SUP-9 は実装済みだが、stop 経由への切り替えは未実施）。stderr の `info: cli-stop: <成功>/<対象> supervisors exited after stop` は stop 後に監視プロセスが終了した数で、計測値ではない（0 でも fallback で回収され、判定は変わらない）
 - 実機でだけ確認できること: `systemd-run --scope` が pid・親子関係を変えずに supervisor を exec すること。実行後に `systemctl --user list-units --type=scope` へ残骸が無いこと
 
@@ -204,7 +204,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
 ## #491 restart レイテンシ（SUP-3・TASK-160）
 
-前提: #2043 が入っていること。入っていなければ再起動未観測で終了コード 1 になる。
+前提: #2043（再 launch の成立）は実装済み。実機（Linux 6.12 以上）で再起動が観測できない場合は `supervisor_bin_real` のシナリオ C で切り分ける。
 
 後始末で CLI の `stop` は使わない（`--restart` の下では SIGTERM の終了が restart の対象になる〔SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施〕ため）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、`stop` 経由にはしない。後始末の正常系は下記のとおり CLI の `delete`。
 

@@ -135,6 +135,7 @@ fandhe-container/
 │   │   ├── cri-status-rpc.md      # CRI の Status・Version・UpdateRuntimeConfig RPC（#2896 を併記。RuntimeReady・NetworkReady の判定材料と待ちが無い設計・runtime_handlers・features・verbose で info を出さない方針・kubelet / containerd の一次情報・本番で NetworkReady=false になる帰結・死活確認を足さない判断と再評価条件。#2830・#2897・CRI-1・CRI-2・PLUG-1・PLUG-4・REPAIR-3・REPAIR-5）
 │   │   ├── fdinfo-mnt-id-parsing.md  # core・net・gpu の fdinfo `mnt_id` 解析を共有せず、共有 fixture `crates/core/testdata/fdinfo_mnt_id_cases.txt` の照合試験で一致を担保する判断記録（共有下位 crate の案 B はオーナー承認待ち。#3140・GPU-2・SEC-1・REPAIR-1）
 │   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（#2838・CRI-2・CORE-3・SEC-5・NET-3）
+│   │   ├── restart-relaunch-single-thread.md  # restart の再 launch を単一スレッドを要求する本番 launcher で成り立たせる設計記録（常駐スレッドの停止と監視スレッドでの直接 launch・比較した方式・制御チャネルの扱い・残余。#2043・SUP-3・CORE-1）
 │   │   ├── cri-record-readoption.md  # plugin-cri の再起動をまたぐ sandbox・コンテナ記録の再採用の設計と実装単位（#2902・CRI-1・CRI-2・OCI-7・CORE-1）
 │   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）

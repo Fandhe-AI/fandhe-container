@@ -510,3 +510,71 @@ fn sup1_socket_is_removed_when_the_channel_is_dropped() {
     rig.finish();
     assert!(std::fs::symlink_metadata(rig.socket()).is_err());
 }
+
+/// SUP-1・SUP-3・CORE-1・#2043: 再 launch の間だけ accept スレッドを止められる。止めている間は listener（ソケットの
+/// 実体）を保ったまま接続が backlog に積まれ、再開の後に同じ検証で処理される。
+#[test]
+fn sup3_2043_pause_keeps_the_socket_and_resume_serves_queued_requests() {
+    use fandhe_container_supervisor::control::server::PausableServer;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = TempRoot::new("pause");
+    let dir = root.0.join("pause");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let id = ContainerId::new("pause").unwrap();
+    let listener = ControlListener::bind(&root.0, &id).unwrap();
+    let slot = SignalSlot::new();
+    let signals = Arc::new(Mutex::new(Vec::new()));
+    let exited = Arc::new(AtomicBool::new(false));
+    let process = ControlledProcess::new(
+        Box::new(Fake {
+            signals: Arc::clone(&signals),
+            exited: Arc::clone(&exited),
+        }),
+        slot.clone(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_monitor = Arc::clone(&stop);
+    let monitor = std::thread::spawn(move || {
+        while !stop_monitor.load(Ordering::SeqCst) {
+            let _ = process.wait(Duration::from_millis(50));
+        }
+    });
+    let server = PausableServer::spawn(
+        listener.try_clone_listener().unwrap(),
+        slot,
+        effective_uid().unwrap(),
+        ServeConfig::default(),
+        Arc::new(ControlObserver::new(None, None)),
+    )
+    .unwrap();
+    let socket = root.0.join(id.as_str()).join(CONTROL_SOCKET_NAME);
+    let before = std::fs::metadata(&socket).unwrap().ino();
+    let signaler = ControlSignaler::new(root.0.clone());
+
+    server.pause(Duration::from_secs(2)).unwrap();
+    // 止めたままでもソケットは同じ実体で残る(unlink も rebind もしない)。
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), before);
+    let signal_id = id.clone();
+    let client = std::thread::spawn(move || {
+        signaler.signal(
+            &signal_id,
+            NonZeroU32::new(PID).unwrap(),
+            Signal::new(15).unwrap(),
+            Instant::now() + Duration::from_secs(5),
+        )
+    });
+    // 止めている間は処理されない。
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(signals.lock().unwrap().is_empty());
+    server.resume().unwrap();
+    client.join().unwrap().unwrap();
+    assert_eq!(*signals.lock().unwrap(), vec![15]);
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), before);
+
+    stop.store(true, Ordering::SeqCst);
+    monitor.join().unwrap();
+    server.shutdown();
+    drop(listener);
+}

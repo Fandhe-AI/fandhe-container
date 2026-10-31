@@ -64,11 +64,14 @@
 //!   （`delete` と再作成を促す）を報告する。回復に失敗したらそのエラーを報告し、予約は残る（再試行できる）。
 //!
 //! # 未実装・残余（REPAIR-3）
-//! - **restart の再 launch**: 本番 launcher の結線は済んでいる（start と同じ launcher と `LaunchSpec` を使う）が、
-//!   再 launch は `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれるため、本番 launcher が
-//!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
-//!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
-//!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
+//! - **restart の再 launch**（#2043・SUP-3・CORE-1）: start と同じ launcher と `LaunchSpec` を使い、`SelfBounded` の launcher は
+//!   監視ループのスレッド（入口スレッド）で直接呼ぶ（`fandhe-relaunch` スレッドを作らない）。再 launch の直前に、
+//!   制御チャネルの accept スレッド（`PausableServer::pause`）・捕捉と seccomp 通知のスレッド・`stderr_sink` の専用スレッドを
+//!   止め、スレッド数が 1 に落ち着くのを有界に待ってから launch し、成否に関わらず再開する。止められなければ launch せず
+//!   `RelaunchFailed`（fail-closed。core の `Threads: 1` の検査は弱めない）。
+//!   残余: healthcheck の定期実行スレッドは本番未結線のため参加者に含めない（結線時に同じ口へ足す。#2441・#2953）。
+//!   pasta・netns holder 構成での restart の確認は #341・#3331。`legacy_tiocsti` の警告は supervisor からは再出力しない
+//!   （core が launch のたびに出す）。設計記録は `docs/design/restart-relaunch-single-thread.md`。
 //! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線も済み（#1902。
 //!   意図は立てない）。明示的な stop の意図の伝達（SUP-9）は実装済み
 //!   （#2162・#2440。制御チャネルの StopRequest が意図を立て、restart ループは再起動を取りやめて `Stopped` と「明示 stop 済み」を記録する）。
@@ -172,6 +175,14 @@ pub trait StartDeps {
     /// 構築し、入口が起動・再起動のたびに listener を受け取ってハブへ渡す。既定は `None`（従来の ERRNO 版。通知なし）。
     fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
         None
+    }
+
+    /// restart の再 launch を単一スレッドで成り立たせるか（本番 launcher の `Threads: 1` の要求のため。#2043・SUP-3・CORE-1）。
+    ///
+    /// `true` を返す実装（本番）は、再 launch の直前に共有の stderr の専用スレッドを止め、スレッド数が 1 に落ち着くのを
+    /// 待ってから launch する。既定は `false`（フェイクの [`StartDeps`] は共有の出口を止めない）。
+    fn single_thread_relaunch(&self) -> bool {
+        false
     }
 
     /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
@@ -986,6 +997,8 @@ struct Prepared {
     logs: Option<Arc<CaptureHub>>,
     /// seccomp の通知への応答ハブ。
     seccomp: Option<Arc<SeccompNotifyHub>>,
+    /// 再 launch を単一スレッドで成り立たせる（本番のみ。#2043）。
+    single_thread_relaunch: bool,
     /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
     claimed: Box<ClaimedStart>,
 }
@@ -1404,6 +1417,7 @@ fn prepare_start(
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     let seccomp = deps.seccomp_hub();
+    let single_thread_relaunch = deps.single_thread_relaunch();
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -1461,6 +1475,7 @@ fn prepare_start(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     })
 }
@@ -1479,6 +1494,7 @@ fn launch_prepared(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     } = prepared;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
@@ -1506,6 +1522,9 @@ fn launch_prepared(
                     }
                     if let Some(hub) = &seccomp {
                         relauncher = relauncher.with_seccomp(Arc::clone(hub));
+                    }
+                    if single_thread_relaunch {
+                        relauncher = relauncher.with_single_thread_launch();
                     }
                     Arc::new(relauncher)
                 }
@@ -2617,6 +2636,11 @@ mod linux {
     impl StartDeps for ProductionStartDeps {
         fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
             self.seccomp.clone()
+        }
+
+        /// 本番の core launcher は `Threads: 1` を要求するため、再 launch の直前に stderr の専用スレッドを止める（#2043）。
+        fn single_thread_relaunch(&self) -> bool {
+            true
         }
 
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を

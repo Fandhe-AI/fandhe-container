@@ -15,11 +15,13 @@
 //!
 //! # 未実装の将来仕様（REPAIR-3）
 //! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で、
-//!   bin 入口（[`crate::start_entry`]）は core の本番 `ProcessLauncher` を結線済み（#1819）。ただし再 launch は
-//!   `relaunch_bounded` の `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれ、本番 launcher の
-//!   単一スレッドの要求を満たせないため、`FailedPrecondition` で拒否されて [`SuperviseOutcome::RelaunchFailed`] になる
-//!   （fail-closed。新しい子は作られない）。実機で成立させる再構成は #2043（SUP-3・CORE-1）で、レイテンシ実測・合否判定
-//!   （#490・#491。TASK-160）はその後になる。
+//!   bin 入口（[`crate::start_entry`]）は core の本番 `ProcessLauncher` を結線済み（#1819）。単一スレッド（`Threads: 1`）を
+//!   要求する本番 launcher（[`LaunchMode::SelfBounded`]）の再 launch は、[`Relauncher::launch_mode`] を見て監視ループの
+//!   スレッドで直接呼ぶ（`fandhe-relaunch` スレッドを作らない）。直前に常駐スレッド（制御チャネル・捕捉・seccomp 通知・
+//!   stderr の専用スレッド）を止める（#2043・SUP-3・CORE-1）。止められなければ launch せず
+//!   [`SuperviseOutcome::RelaunchFailed`]（fail-closed。core の `Threads: 1` の検査は弱めない）。レイテンシ実測・合否判定
+//!   （#490・#491。TASK-160）は人間担当で、制御チャネルの accept の poll 間隔（100ms）が停止の待ちに載り得る
+//!   （短縮は #491 の実測の後に判断）。
 //! - 明示的な stop の意図は制御チャネルの StopRequest（稼働中）か CancelRestartRequest（バックオフ・再 launch 中）が
 //!   [`StopToken::mark_explicit_stop`] で立て（#2162・#2440・SUP-9）、本モジュールは [`StopToken`] を [`StopIntent`] へ写す。
 //!   supervisor の寿命の中では、`always`・`unless-stopped` を含む全ポリシーで明示 stop の後は再起動しない。
@@ -47,7 +49,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{
-    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
+    LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, ErrorCode, ExplicitStop, Signal, StateRecord, SupervisionState,
@@ -297,7 +299,7 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 /// 同じコンテナのプロセスを再 launch する拡張点（SUP-3・TASK-159.3）。
 ///
 /// [`supervise_with_restart`] へ呼び出し側から注入する。本番のアダプタは [`LauncherRelauncher`]（#1717）で、
-/// 中身の core の本番 `ProcessLauncher` は結線済み（#1819）だが、再 launch は単一スレッドの要求を満たせず拒否される（#2043。REPAIR-3）。
+/// 中身の core の本番 `ProcessLauncher` は結線済み（#1819）で、単一スレッドの要求は [`Self::launch_mode`] による直接呼び出しで満たす（#2043）。
 ///
 /// 期限は実装への依頼だけに頼らず、[`supervise_with_restart`] が別スレッド上の呼び出し境界で強制する
 /// （上限＋[`RELAUNCH_REPLY_GRACE`] で待ちをやめる。REPAIR-5）。そのため `Send + Sync` を要求する。
@@ -313,6 +315,16 @@ pub trait Relauncher: Send + Sync {
     /// 再回収できるようにする（CORE-1・REPAIR-5。`LaunchedProcess` は `Drop` で回収しない）。
     fn take_stranded(&self) -> Vec<LateOrphan> {
         Vec::new()
+    }
+
+    /// 再 launch の呼び出し方（[`ProcessLauncher::launch_mode`] と同じ意味。#2043・SUP-3・CORE-1）。
+    ///
+    /// 既定は [`LaunchMode::CallerBounded`]（[`supervise_with_restart`] が別スレッド `fandhe-relaunch` で呼び、期限を境界で
+    /// 強制する）。[`LaunchMode::SelfBounded`] を宣言した実装は、**監視ループのスレッドで直接**呼ばれ、期限を自分で守る
+    /// （単一スレッドを要求する本番 launcher はこの経路でしか呼べない）。内側へ委譲する実装は必ず転送すること
+    /// （転送しないと黙って既定へ降格する。#1816）。
+    fn launch_mode(&self) -> LaunchMode {
+        LaunchMode::CallerBounded
     }
 }
 
@@ -835,7 +847,10 @@ fn terminate_bounded(
         match &r {
             Err(e) => worker_late.push(proc, e.clone()),
             // 呼び出し側が期限で待ちをやめた後に成功しても、回収済みの pid を受け皿に残す。
-            Ok(()) => worker_late.push_reaped(pid),
+            // 占位（[`UnconfirmedLaunch`]）の pid は実在しないため、回収済み pid として記録しない
+            // （記録すると後続の `Stopped` 照合に init の pid が渡る。#2043）。
+            Ok(()) if pid != UNCONFIRMED_LAUNCH_PID => worker_late.push_reaped(pid),
+            Ok(()) => {}
         }
         let (lock, cvar) = &*worker_result;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -933,6 +948,22 @@ fn relaunch_bounded(
             .unwrap_or_else(PoisonError::into_inner)
             .0;
     }
+}
+
+/// `relauncher.relaunch` を呼び出しスレッドで直接実行する（[`LaunchMode::SelfBounded`] 用。#2043・SUP-3・CORE-1）。
+///
+/// 別スレッドを作らない（単一スレッドを要求する本番 launcher のため）。期限は relauncher 自身が守る。
+/// `relaunch` が `Err` のときに引き渡される未回収のハンドルは、[`relaunch_bounded`] と同じく `late` へ積む。
+fn relaunch_direct(
+    relauncher: &Arc<dyn Relauncher>,
+    timeout: Duration,
+    late: &LateOrphans,
+) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+    let value = relauncher.relaunch(timeout);
+    for (proc, error) in relauncher.take_stranded() {
+        late.push(proc, error);
+    }
+    value
 }
 
 /// `monitor` を周回させ、ポリシーに従って再起動する（SUP-3・TASK-159.3）。
@@ -1091,13 +1122,20 @@ pub fn supervise_with_restart(
             });
         };
         let late = LateOrphans::default();
-        let new_process = match relaunch_bounded(
-            relauncher,
-            restart_config.relaunch_timeout,
-            restart_config.terminate_timeout,
-            &late,
-            spawn_os_thread,
-        ) {
+        // `SelfBounded` の relauncher（単一スレッドを要求する本番 launcher）は監視ループのスレッドで直接呼ぶ。
+        // それ以外は別スレッドで呼び、期限を境界で強制する（#2043）。
+        let relaunched = if relauncher.launch_mode() == LaunchMode::SelfBounded {
+            relaunch_direct(relauncher, restart_config.relaunch_timeout, &late)
+        } else {
+            relaunch_bounded(
+                relauncher,
+                restart_config.relaunch_timeout,
+                restart_config.terminate_timeout,
+                &late,
+                spawn_os_thread,
+            )
+        };
+        let new_process = match relaunched {
             Ok(p) => p,
             Err(error) => {
                 observe(Some(error.code()));
@@ -1397,6 +1435,35 @@ impl ProcessLauncher for SpecCapturingLauncher {
     }
 }
 
+/// 再 launch の区間で止めた stderr の専用スレッドを、ガードの破棄で再開する（早期 return を含む全経路で再開する。#2043）。
+struct StderrResume {
+    done: bool,
+}
+
+/// 再開に失敗した新プロセスの回収に最低限与える待ち（期限を使い切っていても回収を試みる。REPAIR-5）。
+const MIN_TERMINATE_WAIT: Duration = Duration::from_secs(1);
+
+impl StderrResume {
+    fn new() -> Self {
+        Self { done: false }
+    }
+
+    /// 通常経路で再開し、結果を返す（失敗を呼び出し側が扱う。REPAIR-4）。
+    fn finish(mut self) -> Result<(), TraitError> {
+        self.done = true;
+        crate::stderr_sink::resume_stderr()
+    }
+}
+
+impl Drop for StderrResume {
+    /// 早期 return 経路の後ろ盾。通常経路は [`Self::finish`] で結果を確認する。
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = crate::stderr_sink::resume_stderr();
+        }
+    }
+}
+
 /// start で使った launcher と [`LaunchSpec`] をそのまま使う [`Relauncher`] の本番アダプタ（SUP-3・#1717）。
 ///
 /// `relaunch(timeout)` は `launcher.launch(&spec, timeout)` を呼ぶだけで、launcher の中身（フェイクか core の本番
@@ -1414,6 +1481,9 @@ pub struct LauncherRelauncher {
     capture: Option<Arc<CaptureHub>>,
     /// seccomp の通知への応答ハブ（`with_seccomp`。再 launch のたびに listener を差し替える。SEC-4・#2025）。
     seccomp: Option<Arc<SeccompNotifyHub>>,
+    /// 再 launch を単一スレッドで行う（`with_single_thread_launch`。stderr の専用スレッドの停止と、スレッド数が 1 に
+    /// 落ち着くまでの有界の待ちを行う。#2043）。
+    single_thread: bool,
     /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
     stranded: Mutex<Vec<LateOrphan>>,
 }
@@ -1426,6 +1496,7 @@ impl LauncherRelauncher {
             spec,
             capture: None,
             seccomp: None,
+            single_thread: false,
             stranded: Mutex::new(Vec::new()),
         }
     }
@@ -1435,10 +1506,24 @@ impl LauncherRelauncher {
     /// 再 launch の直前に [`SeccompNotifyHub::quiesce`] でスレッドを 0 本にし（core の launch は `Threads: 1` を要する）、
     /// 直後に新プロセスの listener を取り出して `attach` する。受け取れない・スレッドを作れないときは新プロセスを
     /// terminate して `Err`（応答者のいない USER_NOTIF は拒否対象の syscall を止めるため動かさない。fail-closed）。
-    /// 注意: 本番 launcher の再 launch が成り立つかは #2043 で、差し替えは偽の launcher でだけ試している。
+    /// 本番 launcher での成立は `supervisor_bin_real` のシナリオ C が照合する（#2043）。
     #[must_use]
     pub fn with_seccomp(mut self, hub: Arc<SeccompNotifyHub>) -> Self {
         self.seccomp = Some(hub);
+        self
+    }
+
+    /// 再 launch を単一スレッドの呼び出しスレッドで成り立たせる（#2043・SUP-3・CORE-1）。
+    ///
+    /// 内側の launcher が [`LaunchMode::SelfBounded`] のとき、[`supervise_with_restart`] は別スレッドを作らずに監視ループの
+    /// スレッドで直接 [`Relauncher::relaunch`] を呼ぶ。本オプションはさらに、launch の直前に共有の stderr の専用スレッドを
+    /// 止め（[`crate::stderr_sink::quiesce_stderr`]）、スレッド数が 1 に落ち着くまでを有界に待つ。落ち着かなければ launch
+    /// せずに `FailedPrecondition` で失敗にする（fail-closed。core の `Threads: 1` の検査は弱めない）。launch の成否に
+    /// 関わらず stderr を再開する。本番の入口だけが指定する（試験は共有の出口を止めないよう指定しない）。
+    /// 制御チャネルの accept スレッドの停止は外側の [`crate::control::target::ControlledRelauncher`] が行う。
+    #[must_use]
+    pub fn with_single_thread_launch(mut self) -> Self {
+        self.single_thread = true;
         self
     }
 
@@ -1450,16 +1535,154 @@ impl LauncherRelauncher {
     }
 }
 
+/// 失敗した launch が回収を確認できていない子を残していないかを確かめる（CORE-2・SUP-3・#2043）。
+///
+/// 本番 launcher は launch の失敗で terminate できなかった子を内部の台帳に保持し
+/// [`ProcessLauncher::last_launch_may_have_left_process`] を `true` にする（ハンドルは返らないため
+/// [`Relauncher::take_stranded`] は空になる）。`true` のとき [`ProcessLauncher::confirm_no_process`] を期限つきで呼び、
+/// 消滅を確かめられたら `error` をそのまま返す。確かめられなければ [`UnconfirmedLaunch`] を `stranded` へ積み、
+/// 呼び出し側の `dispose` が同じ確認を再試行できるようにする（積まれたままなら回収失敗として扱われる）。
+fn settle_failed_launch(
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &fandhe_container_core::traits::ContainerId,
+    error: TraitError,
+    wait: Duration,
+    stranded: &Mutex<Vec<LateOrphan>>,
+) -> TraitError {
+    if !launcher.last_launch_may_have_left_process() {
+        return error;
+    }
+    match launcher.confirm_no_process(id, wait) {
+        Ok(()) => error,
+        Err(confirm) => {
+            stranded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((
+                    Box::new(UnconfirmedLaunch {
+                        launcher: Arc::clone(launcher),
+                        id: id.clone(),
+                    }),
+                    confirm,
+                ));
+            error
+        }
+    }
+}
+
+/// [`UnconfirmedLaunch`] が返す占位 pid（ホストの init。コンテナのプロセスの pid にはならない）。
+const UNCONFIRMED_LAUNCH_PID: NonZeroU32 = NonZeroU32::MIN;
+
+/// 失敗した launch の残存を確認できなかったことを表す、`dispose` へ引き渡すための代理ハンドル（CORE-2・#2043）。
+///
+/// 実プロセスのハンドルではない。`terminate` は launcher の [`ProcessLauncher::confirm_no_process`] への委譲で、
+/// `Ok` なら残存なしを確かめられたことを意味する。`pid` は実在しない占位（[`UNCONFIRMED_LAUNCH_PID`] = 1。
+/// ホストの init であり起動したコンテナのプロセスにはなり得ない）で、回収済み pid の記録
+/// （[`LateOrphans::take_reaped`]）や `Stopped` の照合には使わせない（[`terminate_bounded`] が除外する）。
+struct UnconfirmedLaunch {
+    launcher: Arc<dyn ProcessLauncher>,
+    id: fandhe_container_core::traits::ContainerId,
+}
+
+impl LaunchedProcess for UnconfirmedLaunch {
+    fn pid(&self) -> NonZeroU32 {
+        UNCONFIRMED_LAUNCH_PID
+    }
+
+    fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        Ok(None)
+    }
+
+    fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
+        self.launcher.confirm_no_process(&self.id, timeout)
+    }
+}
+
 impl Relauncher for LauncherRelauncher {
+    /// 内側の launcher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ降格し、
+    /// 単一スレッドを要求する本番 launcher が別スレッドから呼ばれて拒否される。#1816・#2043）。
+    fn launch_mode(&self) -> LaunchMode {
+        self.launcher.launch_mode()
+    }
+
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let remaining_now =
+            || deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
         if let Some(hub) = &self.capture {
-            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
-            hub.quiesce();
+            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。待ちは再 launch の期限の残りまで。
+            hub.quiesce_within(remaining_now());
         }
         if let Some(hub) = &self.seccomp {
-            hub.quiesce();
+            hub.quiesce_within(remaining_now());
         }
-        let process = self.launcher.launch(&self.spec, timeout)?;
+        // 畳む間に期限を使い切ったら、以降の停止処理も launch も行わない（REPAIR-5）。
+        if remaining_now().is_zero() {
+            return Err(TraitError::new(ErrorCode::Timeout, "relaunch timed out"));
+        }
+        // 単一スレッドで launch する区間。stderr の専用スレッドは最後に止める（上の quiesce の報告が stderr へ出るため）。
+        // ガードは launch の戻りで（成否・早期 return を問わず）stderr を再開する。
+        let _resume = if self.single_thread {
+            let remaining =
+                deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+            crate::stderr_sink::quiesce_stderr(remaining.min(crate::thread_settle::SETTLE_LIMIT))
+                .inspect_err(|_| {
+                let _ = crate::stderr_sink::resume_stderr();
+            })?;
+            let guard = StderrResume::new();
+            if !crate::thread_settle::wait_single_threaded(
+                deadline
+                    .map_or(timeout, |d| d.saturating_duration_since(Instant::now()))
+                    .min(crate::thread_settle::SETTLE_LIMIT),
+            ) {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "supervisor threads did not settle before relaunch",
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        // 単一スレッドの区間では、止めるのに使った時間を差し引いた残りを渡す。残りが無ければ launch しない。
+        let launch_timeout = if self.single_thread {
+            let remaining =
+                deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+            if remaining.is_zero() {
+                return Err(TraitError::new(ErrorCode::Timeout, "relaunch timed out"));
+            }
+            remaining
+        } else {
+            timeout
+        };
+        let launched = self.launcher.launch(&self.spec, launch_timeout);
+        // launch の戻り（成否を問わず）で stderr を再開する。以降の attach の報告は通常どおり出る。
+        // 再開に失敗すると以降の報告が恒久的に記録されなくなる（REPAIR-4）ため、成功した新プロセスは回収して Err にする。
+        let resumed = _resume.map(StderrResume::finish);
+        let process = match launched {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(settle_failed_launch(
+                    &self.launcher,
+                    self.spec.container_id(),
+                    e,
+                    remaining_now().max(MIN_TERMINATE_WAIT),
+                    &self.stranded,
+                ));
+            }
+        };
+        if let Some(Err(e)) = resumed {
+            return match process.terminate(remaining_now().max(MIN_TERMINATE_WAIT)) {
+                Ok(()) => Err(e),
+                Err(t) => {
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((process, t.clone()));
+                    Err(t)
+                }
+            };
+        }
         #[cfg(target_os = "linux")]
         if let Some(hub) = &self.seccomp {
             let attached = match process.take_seccomp_listener() {
@@ -1470,7 +1693,9 @@ impl Relauncher for LauncherRelauncher {
                 )),
             };
             if let Err(e) = attached {
-                return match process.terminate(timeout) {
+                return match process.terminate(
+                    deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now())),
+                ) {
                     Ok(()) => Err(e),
                     Err(t) => {
                         self.stranded
@@ -1489,7 +1714,9 @@ impl Relauncher for LauncherRelauncher {
         {
             // 新プロセスを動かしたままにしない。回収できなければハンドルを保持し、
             // `take_stranded` 経由で呼び出し側が再回収できるようにする（CORE-1・REPAIR-5）。
-            return match process.terminate(timeout) {
+            return match process.terminate(
+                deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now())),
+            ) {
                 Ok(()) => Err(e),
                 Err(t) => {
                     self.stranded
@@ -1545,6 +1772,121 @@ mod tests {
         ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
+    }
+
+    /// 残存の可能性を答え、確認の成否を操作できる launcher(#2043)。
+    struct MayLeave {
+        leave: bool,
+        confirm_ok: bool,
+        confirmed: AtomicU32,
+    }
+
+    impl ProcessLauncher for MayLeave {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn last_launch_may_have_left_process(&self) -> bool {
+            self.leave
+        }
+
+        fn confirm_no_process(&self, _: &ContainerId, _: Duration) -> Result<(), TraitError> {
+            self.confirmed.fetch_add(1, Ordering::SeqCst);
+            if self.confirm_ok {
+                Ok(())
+            } else {
+                Err(TraitError::new(ErrorCode::Timeout, "still alive"))
+            }
+        }
+    }
+
+    fn settle(l: &Arc<MayLeave>) -> (TraitError, Vec<LateOrphan>) {
+        let launcher: Arc<dyn ProcessLauncher> = l.clone();
+        let stranded = Mutex::new(Vec::new());
+        let id = ContainerId::new("c1").expect("id");
+        let e = settle_failed_launch(
+            &launcher,
+            &id,
+            TraitError::new(ErrorCode::Internal, "launch failed"),
+            Duration::from_secs(1),
+            &stranded,
+        );
+        (e, stranded.into_inner().unwrap())
+    }
+
+    /// CORE-2・SUP-3・#2043: 残存の疑いが無ければ確認も引き渡しもしない。
+    #[test]
+    fn core2_failed_relaunch_without_leftover_skips_confirmation() {
+        let l = Arc::new(MayLeave {
+            leave: false,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(stranded.is_empty());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 0);
+    }
+
+    /// CORE-2・SUP-3・#2043: 残存の疑いがあり確認できれば、元のエラーのまま何も引き渡さない。
+    #[test]
+    fn core2_failed_relaunch_with_confirmed_leftover_is_clean() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: true,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(stranded.is_empty());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 1);
+    }
+
+    /// CORE-2・SUP-3・#2043: 確認できない残存は代理ハンドルとして引き渡され、dispose の terminate が確認を再試行する。
+    #[test]
+    fn core2_failed_relaunch_with_unconfirmed_leftover_is_handed_over() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].1.code(), ErrorCode::Timeout);
+        assert!(stranded[0].0.terminate(Duration::from_millis(1)).is_err());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 2);
+    }
+
+    /// CORE-2・SUP-3・#2043: 占位ハンドルの terminate が成功しても、pid 1 を回収済みとして記録しない。
+    #[test]
+    fn core2_unconfirmed_launch_confirm_success_does_not_record_reaped_pid() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (_, mut stranded) = settle(&l);
+        let (proc, _) = stranded.pop().expect("stranded");
+        assert_eq!(proc.pid().get(), 1);
+        let ok: Arc<dyn ProcessLauncher> = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: true,
+            confirmed: AtomicU32::new(0),
+        });
+        let placeholder = Box::new(UnconfirmedLaunch {
+            launcher: ok,
+            id: ContainerId::new("c1").expect("id"),
+        });
+        let late = LateOrphans::default();
+        terminate_bounded(placeholder, Duration::from_secs(1), &late, spawn_os_thread).unwrap();
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        assert_eq!(late.take_reaped(), Vec::<NonZeroU32>::new());
     }
 
     /// REPAIR-5・#1816: `SpecCapturingLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。

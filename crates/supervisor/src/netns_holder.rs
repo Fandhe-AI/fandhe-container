@@ -11,7 +11,7 @@
 //! `crate::pasta_attach` の `PastaAttachHook` が、core の exec 直前の同期点（#1939）から呼ぶ（#1940）。起動途中の失敗での
 //! 逆順の停止・PID 1 の回収後の pasta → holder の停止・途中死の検知もそちらが行う。pidfd による監視は採らず、本モジュールの
 //! 生存確認は未回収の `Child` の `try_wait` で行う（std の `create_pidfd` は unstable で、`sys` に `pidfd_open` も無い。
-//! unsafe を足さない）。restart で作り直す経路は、本番 launcher の再 launch が #2043 まで拒否されるため未確認。
+//! unsafe を足さない）。restart で作り直す経路は、再 launch 自体は #2043 で成立したが、holder を含む構成での restart は未確認（#341・#3331）。
 
 //! # 起動の制約（12.10・fail-closed）
 //! - **main スレッドから呼ぶ**: holder の `PR_SET_PDEATHSIG` は spawn したスレッドの終了でも届く。start の手順 8

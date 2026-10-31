@@ -108,7 +108,7 @@
 //! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
-//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
+//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043 で入った（supervisor が常駐スレッドを止めてから呼ぶ）
 //! - **pod の namespace への join(CRI-2・CORE-3・SEC-1・SEC-5。#2674)**: `LaunchSpec::namespace_join`(config の
 //!   `linux.namespaces[].path` の user と ipc の組。start が fd に固定し、親子関係・作成者 uid・種別を検証済み)があると、
 //!   中間プロセスは user namespace と ipc namespace を作らずに `setns` で参加し(`exec::isolate_join`)、参加先の

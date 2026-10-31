@@ -104,5 +104,5 @@ scope 取得だけを測る。本計測と同じ包み込み（`scope_wrap::scop
 
 - `user_manager_env` の判定の CLI との共通化（`start_contract` 等）
 - 委譲スコープの検出が失敗したときに記録の経路へ回すか（core の `delete` の契約の変更。オーナー判断待ち。#2133）
-- restart の再 launch（#2043）は対象外
+- restart の再 launch（#2043 で成立済み）は対象外（restart のレイテンシは #491）
 - CI の回帰ゲートへの接続は、オーナー判断（[bench-calibration.md](bench-calibration.md) の選択肢 (c)/(d)/(e)。#230）待ち。#1901 は暫定の実機前提として登録した

@@ -272,7 +272,7 @@
 //! - launch 時の分離の記録の書き込みは、本番 launcher が `StagePipeline::with_landlock` へ渡す ruleset そのものから作り
 //!   （`LaunchedProcess::launch_isolation`）、start の Running 更新と restart の Running(新 pid) 更新で書く結線済み
 //!   （#2007）。記録を持たない launcher（偽の実装）では exec が記録なしで拒否する。本番 launcher による restart の
-//!   再 launch は #2043 まで拒否される。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
+//!   再 launch は #2043 で成立する。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 

@@ -164,7 +164,7 @@ fn is_valid_cdi_device_name(s: &str) -> bool {
 ///
 /// `Unspecified` と `count: "all"` は `nvidia.com/gpu=all`。`count` のそれ以外は
 /// [`GpuDropReason::CountNotAll`]。`device_ids` は全要素を検証してから入力の順に変換し、
-/// 1 件でも不正なら予約ごと `Err`。件数・長さは検出（TASK-156.1）の上限で検証済み。
+/// 1 件でも不正なら予約ごと `Err`。件数・長さ・総バイト数の上限は直接呼ばれても守るよう確保の前に検証する。
 pub fn cdi_names_for<N: ComposeNode>(
     request: &GpuRequest<'_, N>,
 ) -> Result<Vec<String>, GpuDropReason> {
@@ -178,6 +178,23 @@ pub fn cdi_names_for<N: ComposeNode>(
             }
         }
         GpuRequest::DeviceIds(ids) => {
+            // 公開 API のため検出段の検証済みを前提にせず、確保の前に上限を検証する（STACK-9）。
+            if ids.is_empty() {
+                return Err(GpuDropReason::DeviceIdsEmpty);
+            }
+            if ids.len() > MAX_DEVICE_IDS {
+                return Err(GpuDropReason::TooManyDeviceIds);
+            }
+            let mut total = 0usize;
+            for id in ids {
+                if id.len() > MAX_DEVICE_ID_BYTES {
+                    return Err(GpuDropReason::DeviceIdTooLong);
+                }
+                total = total.saturating_add(id.len());
+                if total > MAX_DEVICE_IDS_TOTAL_BYTES {
+                    return Err(GpuDropReason::DeviceIdTooLong);
+                }
+            }
             let mut seen = std::collections::BTreeSet::new();
             for id in ids {
                 if id == ALL_DEVICE_NAME {
@@ -739,5 +756,29 @@ mod tests {
             conv_drops(many),
             vec![(None, GpuDropReason::TooManyDevices)]
         );
+    }
+
+    /// 公開変換 API へ直接渡された上限超過の入力を確保前に拒否する（STACK-9・TASK-156.2）。
+    #[test]
+    fn cdi_names_for_rejects_oversize_device_ids_directly() {
+        let empty: GpuRequest<'_, T> = GpuRequest::DeviceIds(vec![]);
+        assert_eq!(cdi_names_for(&empty), Err(GpuDropReason::DeviceIdsEmpty));
+
+        let many: GpuRequest<'_, T> =
+            GpuRequest::DeviceIds((0..=MAX_DEVICE_IDS).map(|i| format!("d{i}")).collect());
+        assert_eq!(cdi_names_for(&many), Err(GpuDropReason::TooManyDeviceIds));
+
+        let long: GpuRequest<'_, T> =
+            GpuRequest::DeviceIds(vec!["a".repeat(MAX_DEVICE_ID_BYTES + 1)]);
+        assert_eq!(cdi_names_for(&long), Err(GpuDropReason::DeviceIdTooLong));
+
+        let per = MAX_DEVICE_ID_BYTES;
+        let n = MAX_DEVICE_IDS_TOTAL_BYTES / per + 1;
+        let total: GpuRequest<'_, T> = GpuRequest::DeviceIds(
+            (0..n)
+                .map(|i| format!("{i:03}{}", "a".repeat(per - 3)))
+                .collect(),
+        );
+        assert_eq!(cdi_names_for(&total), Err(GpuDropReason::DeviceIdTooLong));
     }
 }

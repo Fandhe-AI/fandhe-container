@@ -14,6 +14,13 @@
 //! `=` のない `--downgrade`・繰り返し・UTF-8 でない値も 2。位置引数が 1 個でない・未知のフラグも 2。
 //! 引数の値は出力に入れない（拒否の詳細は分類名・表の固定のキーパス・番号だけ）。
 //!
+//! 拒否時の出力（TASK-182.2・#628・STACK-3。実バイナリの試験 `tests/bin_entry.rs` で全文一致を固定）は
+//! 1 行の JSON で、順に `code`（`INVALID_ARGUMENT`）・`message`（`--downgrade key is not error-unsupported-yet`）・
+//! `class`（`convert` / `warning` / `error-incompatible` / `unrecognized`）・`key_path`（表の行と完全一致したときだけ。
+//! `x-*` の warning と unrecognized では出さない）・`index`（0 起算の要素番号。文字列）。拒否が複数あるときは
+//! 最初の 1 件だけを出す。優先順位は `-h` / `--help`（0）、未知のフラグ・位置引数の誤り（2）、`--downgrade` の値の検査（2）、
+//! ディレクトリの走査（3・6・10 など）の順。空の値・空の要素・上限超過も 2 で `class` / `key_path` は持たない。
+//!
 //! # 終了コード
 //!
 //! レポートを出し終えたら 0。`error_free` でないファイルがあっても 0 とする（PoC-16 と同じ）。分類の結果は
@@ -329,6 +336,31 @@ mod tests {
         assert!(!o.stderr.contains("secret-marker"));
         assert!(o.stderr.contains("\"class\":\"unrecognized\""));
         assert!(!o.stderr.contains("key_path"));
+    }
+
+    /// STACK-3・TASK-182.2: 4 分類すべてが 2 で、`key_path` は表の行と完全一致のときだけ出る。`--help` が優先。
+    #[test]
+    fn downgrade_rejection_all_classes() {
+        let head = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"--downgrade key is not error-unsupported-yet\"";
+        for (key, tail) in [
+            (
+                "services.*.image",
+                ",\"class\":\"convert\",\"key_path\":\"services.*.image\",\"index\":\"0\"}\n",
+            ),
+            (
+                "version",
+                ",\"class\":\"warning\",\"key_path\":\"version\",\"index\":\"0\"}\n",
+            ),
+            ("x-common", ",\"class\":\"warning\",\"index\":\"0\"}\n"),
+        ] {
+            let o = run_args(&os(&[&format!("--downgrade={key}"), "d"]));
+            assert_eq!(o.exit_code, 2, "{key}");
+            assert_eq!(o.stderr, format!("{head}{tail}"), "{key}");
+        }
+        // -h / --help は不可キーの検査より先（usage で 0）。
+        let o = run_args(&os(&["--downgrade=services.*.privileged", "--help"]));
+        assert_eq!(o.exit_code, 0);
+        assert_eq!(o.stderr, format!("{USAGE}\n"));
     }
 
     /// STACK-3: file_id の導出とフォールバック。

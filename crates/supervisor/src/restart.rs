@@ -847,7 +847,10 @@ fn terminate_bounded(
         match &r {
             Err(e) => worker_late.push(proc, e.clone()),
             // 呼び出し側が期限で待ちをやめた後に成功しても、回収済みの pid を受け皿に残す。
-            Ok(()) => worker_late.push_reaped(pid),
+            // 占位（[`UnconfirmedLaunch`]）の pid は実在しないため、回収済み pid として記録しない
+            // （記録すると後続の `Stopped` 照合に init の pid が渡る。#2043）。
+            Ok(()) if pid != UNCONFIRMED_LAUNCH_PID => worker_late.push_reaped(pid),
+            Ok(()) => {}
         }
         let (lock, cvar) = &*worker_result;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -1567,10 +1570,15 @@ fn settle_failed_launch(
     }
 }
 
+/// [`UnconfirmedLaunch`] が返す占位 pid（ホストの init。コンテナのプロセスの pid にはならない）。
+const UNCONFIRMED_LAUNCH_PID: NonZeroU32 = NonZeroU32::MIN;
+
 /// 失敗した launch の残存を確認できなかったことを表す、`dispose` へ引き渡すための代理ハンドル（CORE-2・#2043）。
 ///
 /// 実プロセスのハンドルではない。`terminate` は launcher の [`ProcessLauncher::confirm_no_process`] への委譲で、
-/// `Ok` なら残存なしを確かめられたことを意味する。`pid` は実在しない占位（1）で、照合には使われない。
+/// `Ok` なら残存なしを確かめられたことを意味する。`pid` は実在しない占位（[`UNCONFIRMED_LAUNCH_PID`] = 1。
+/// ホストの init であり起動したコンテナのプロセスにはなり得ない）で、回収済み pid の記録
+/// （[`LateOrphans::take_reaped`]）や `Stopped` の照合には使わせない（[`terminate_bounded`] が除外する）。
 struct UnconfirmedLaunch {
     launcher: Arc<dyn ProcessLauncher>,
     id: fandhe_container_core::traits::ContainerId,
@@ -1578,7 +1586,7 @@ struct UnconfirmedLaunch {
 
 impl LaunchedProcess for UnconfirmedLaunch {
     fn pid(&self) -> NonZeroU32 {
-        NonZeroU32::MIN
+        UNCONFIRMED_LAUNCH_PID
     }
 
     fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -1852,6 +1860,33 @@ mod tests {
         assert_eq!(stranded[0].1.code(), ErrorCode::Timeout);
         assert!(stranded[0].0.terminate(Duration::from_millis(1)).is_err());
         assert_eq!(l.confirmed.load(Ordering::SeqCst), 2);
+    }
+
+    /// CORE-2・SUP-3・#2043: 占位ハンドルの terminate が成功しても、pid 1 を回収済みとして記録しない。
+    #[test]
+    fn core2_unconfirmed_launch_confirm_success_does_not_record_reaped_pid() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (_, mut stranded) = settle(&l);
+        let (proc, _) = stranded.pop().expect("stranded");
+        assert_eq!(proc.pid().get(), 1);
+        let ok: Arc<dyn ProcessLauncher> = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: true,
+            confirmed: AtomicU32::new(0),
+        });
+        let placeholder = Box::new(UnconfirmedLaunch {
+            launcher: ok,
+            id: ContainerId::new("c1").expect("id"),
+        });
+        let late = LateOrphans::default();
+        terminate_bounded(placeholder, Duration::from_secs(1), &late, spawn_os_thread).unwrap();
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        assert_eq!(late.take_reaped(), Vec::<NonZeroU32>::new());
     }
 
     /// REPAIR-5・#1816: `SpecCapturingLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。

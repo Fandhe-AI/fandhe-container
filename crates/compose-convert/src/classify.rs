@@ -249,7 +249,7 @@ pub fn classify_network_mode_value(value: Option<&str>) -> KeyClass {
     }
 }
 
-/// Docker ソケットの bind mount か（D-16 の影響指標）。値は保持しない。結線は #598。
+/// Docker ソケットの bind mount か（D-16 の影響指標）。値は保持しない。結線は `crate::key_scan`（#601）。
 ///
 /// short syntax（`source:target[:mode]`）のマウント元（最初の `:` より前）がソケットのパス全体と
 /// 一致するときだけ true。マウント先だけの一致や `docker.sock.backup` のような接頭辞一致は false。

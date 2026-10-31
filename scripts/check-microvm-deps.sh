@@ -102,9 +102,11 @@ for m in "${manifests[@]}"; do
     continue
   fi
   # 1 行 = `name vX.Y.Z[ (path)][ (proc-macro)][ (*)]|repository`。名前・版・repository を取り出して判定する。
-  hits="$(printf '%s\n' "${tree}" | awk -F'|' -v banned="${BANNED}" '
+  # macOS の BSD awk は改行を含む -v の値を拒む（`awk: newline in string`）ため、空白区切りへ直して渡す。
+  # クレート名は空白を含まない。
+  hits="$(printf '%s\n' "${tree}" | awk -F'|' -v banned="$(printf '%s' "${BANNED}" | tr '\n' ' ')" '
     BEGIN {
-      n = split(banned, b, "\n")
+      n = split(banned, b, " ")
       for (i = 1; i <= n; i++) { k = b[i]; gsub(/_/, "-", k); ban[k] = 1 }
     }
     NF >= 1 && $1 != "" {

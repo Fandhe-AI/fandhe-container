@@ -1,4 +1,4 @@
-//! ttrpc のフレームヘッダ（10 バイト。CRI-5・TASK-62.1・REPAIR-2）。
+//! ttrpc のフレームヘッダ（10 バイト。CRI-5・TASK-62.1・MS-7・REPAIR-2）。
 //!
 //! `length: u32`（ペイロードのみの長さ）・`stream_id: u32`・`type: u8`・`flags: u8`、整数はビッグエンディアン。
 //! [`FrameHeader::from_bytes`] が長さの上限・type・type ごとのフラグを検証してから値を返すため、

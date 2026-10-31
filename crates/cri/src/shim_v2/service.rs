@@ -1,4 +1,4 @@
-//! ttrpc サービスの登録口と dispatch（CRI-5・TASK-62.1）。
+//! ttrpc サービスの登録口と dispatch（CRI-5・TASK-62.1・MS-7）。
 //!
 //! `server` が復号した [`TtrpcRequest`] を [`ServiceRegistry::dispatch`] へ渡し、
 //! サービス名で [`TtrpcService`] を引いて呼ぶ。未知のサービス・メソッドは `Unimplemented`。

@@ -1,4 +1,4 @@
-//! shim v2 の ttrpc サーバーの UDS 結合試験（CRI-5・TASK-62.1）。
+//! shim v2 の ttrpc サーバーの UDS 結合試験（CRI-5・TASK-62.1・MS-7）。
 #![cfg(unix)]
 
 #[path = "../../oci/tests/support/test_root.rs"]
@@ -19,6 +19,9 @@ use prost::Message;
 const UNIMPL: i32 = 12;
 const INVALID: i32 = 3;
 const EXHAUSTED: i32 = 8;
+
+/// 設定を 1 項目だけ壊す関数（範囲外設定の試験用）。
+type Mutate = fn(&mut ServerConfig);
 
 fn start(
     tag: &str,
@@ -269,4 +272,30 @@ fn cri5_operations_are_recorded() {
     assert!(got.contains(&("cri.shim_v2.frame".into(), INVALID)));
     // DeadlineExceeded = 4
     assert!(got.contains(&("cri.shim_v2.io".into(), 4)));
+}
+/// CRI-5・REPAIR-5: 範囲外の期限設定（`Duration::MAX`・ゼロの間隔）は
+/// panic せず構造化エラーで起動を拒否する。
+#[test]
+fn out_of_range_config_is_rejected_without_panic() {
+    let cases: [(&str, Mutate); 5] = [
+        ("shutdown_timeout", |c| c.shutdown_timeout = Duration::MAX),
+        ("write_timeout", |c| c.write_timeout = Duration::MAX),
+        ("frame_read_timeout", |c| {
+            c.frame_read_timeout = Duration::MAX
+        }),
+        ("poll_interval", |c| c.poll_interval = Duration::MAX),
+        ("poll_interval", |c| c.poll_interval = Duration::ZERO),
+    ];
+    for (i, (field, mutate)) in cases.iter().enumerate() {
+        let root = test_root::test_root("ttrpc", &format!("badcfg{i}"));
+        let path = root.join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut cfg = ServerConfig::default();
+        mutate(&mut cfg);
+        let err = match TtrpcServer::new(ServiceRegistry::new(), cfg).serve(listener) {
+            Ok(_) => panic!("must reject {field}"),
+            Err(e) => e,
+        };
+        assert_eq!(err.to_string(), format!("invalid config: {field}"));
+    }
 }

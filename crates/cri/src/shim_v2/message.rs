@@ -1,4 +1,4 @@
-//! ttrpc の封筒メッセージ（CRI-5・TASK-62.1）。
+//! ttrpc の封筒メッセージ（CRI-5・TASK-62.1・MS-7）。
 //!
 //! containerd/ttrpc の `request.proto` のフィールド番号を prost の derive で手書きする
 //! （`.proto` は持ち込まない。#670）。`google.rpc.Status.details` は定義せず、受信時は

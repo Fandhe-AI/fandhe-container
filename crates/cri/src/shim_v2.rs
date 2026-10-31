@@ -1,4 +1,4 @@
-//! containerd shim v2 の ttrpc サーバーの骨格（CRI-5・TASK-62.1）。
+//! containerd shim v2 の ttrpc サーバーの骨格（CRI-5・TASK-62.1・MS-7）。
 //!
 //! containerd の shim v2 Task API は ttrpc（unary のみ）の上で動く。#670（TASK-62.hdep1）の
 //! オーナー判断で `ttrpc` クレートと `containerd-shim-protos` は導入しないと決まったため、

@@ -1,4 +1,4 @@
-//! UDS 上の ttrpc サーバー（unix のみ。CRI-5・TASK-62.1）。
+//! UDS 上の ttrpc サーバー（unix のみ。CRI-5・TASK-62.1・MS-7）。
 //!
 //! 呼び出し元（将来は shim の起動経路。#803）が bind 済みの `UnixListener` を渡し、
 //! [`TtrpcServer::serve`] が accept スレッドを起こして [`ServerHandle`] を返す。
@@ -47,6 +47,37 @@ pub struct ServerConfig {
     pub poll_interval: Duration,
 }
 
+/// 期限系の設定値の上限（1 日）。`Instant` への加算・`poll_interval` の乗算を安全に保つ。
+const MAX_CONFIG_DURATION: Duration = Duration::from_secs(86_400);
+
+impl ServerConfig {
+    /// 設定値の範囲を検証する（REPAIR-5。`Duration::MAX` 等での panic を防ぐ）。
+    fn validate(&self) -> Result<(), ShimV2Error> {
+        let checks = [
+            ("frame_read_timeout", self.frame_read_timeout),
+            ("write_timeout", self.write_timeout),
+            ("shutdown_timeout", self.shutdown_timeout),
+            ("poll_interval", self.poll_interval),
+        ];
+        for (name, d) in checks {
+            if d > MAX_CONFIG_DURATION {
+                return Err(ShimV2Error::InvalidConfig(name));
+            }
+        }
+        if self.poll_interval.is_zero() {
+            return Err(ShimV2Error::InvalidConfig("poll_interval"));
+        }
+        Ok(())
+    }
+}
+
+/// `now` から `d` 後の時刻。オーバーフローしても panic せず 1 日後に丸める。
+fn deadline_after(now: Instant, d: Duration) -> Instant {
+    now.checked_add(d)
+        .or_else(|| now.checked_add(MAX_CONFIG_DURATION))
+        .unwrap_or(now)
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -66,6 +97,8 @@ pub enum ShimV2Error {
     Listener(io::ErrorKind),
     /// 停止の期限内にスレッドが終わらなかった。
     ShutdownTimeout,
+    /// 設定値が範囲外（期限の演算がオーバーフローしうる値・ゼロの間隔）。
+    InvalidConfig(&'static str),
 }
 
 impl std::fmt::Display for ShimV2Error {
@@ -73,6 +106,7 @@ impl std::fmt::Display for ShimV2Error {
         match self {
             Self::Listener(k) => write!(f, "listener setup failed: {k}"),
             Self::ShutdownTimeout => write!(f, "shutdown timed out"),
+            Self::InvalidConfig(field) => write!(f, "invalid config: {field}"),
         }
     }
 }
@@ -107,6 +141,7 @@ impl TtrpcServer {
 
     /// bind 済みの listener で accept スレッドを起動する。
     pub fn serve(&self, listener: UnixListener) -> Result<ServerHandle, ShimV2Error> {
+        self.config.validate()?;
         listener
             .set_nonblocking(true)
             .map_err(|e| ShimV2Error::Listener(e.kind()))?;
@@ -144,7 +179,7 @@ impl ServerHandle {
         let Some(h) = self.accept.take() else {
             return Ok(());
         };
-        let deadline = Instant::now() + self.shutdown_timeout;
+        let deadline = deadline_after(Instant::now(), self.shutdown_timeout);
         while !h.is_finished() {
             if Instant::now() >= deadline {
                 return Err(ShimV2Error::ShutdownTimeout);
@@ -323,7 +358,7 @@ fn drain_then_close(stream: &mut UnixStream, ctx: &Ctx) {
     {
         return;
     }
-    let deadline = Instant::now() + ctx.config.poll_interval * 4;
+    let deadline = deadline_after(Instant::now(), ctx.config.poll_interval.saturating_mul(4));
     let mut sink = [0u8; 4096];
     while Instant::now() < deadline && !ctx.stop.load(Ordering::SeqCst) {
         match stream.read(&mut sink) {
@@ -360,7 +395,7 @@ fn write_response(
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&header.to_bytes());
     out.extend_from_slice(&body);
-    let deadline = Instant::now() + ctx.config.write_timeout;
+    let deadline = deadline_after(Instant::now(), ctx.config.write_timeout);
     let mut off = 0;
     while off < out.len() {
         if ctx.stop.load(Ordering::SeqCst) {
@@ -419,7 +454,7 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
             return;
         };
         let started = Instant::now();
-        let deadline = started + ctx.config.frame_read_timeout;
+        let deadline = deadline_after(started, ctx.config.frame_read_timeout);
         let mut raw = [0u8; HEADER_LEN];
         if let Some((head, rest)) = raw.split_first_mut() {
             *head = first;

@@ -1532,6 +1532,64 @@ impl LauncherRelauncher {
     }
 }
 
+/// 失敗した launch が回収を確認できていない子を残していないかを確かめる（CORE-2・SUP-3・#2043）。
+///
+/// 本番 launcher は launch の失敗で terminate できなかった子を内部の台帳に保持し
+/// [`ProcessLauncher::last_launch_may_have_left_process`] を `true` にする（ハンドルは返らないため
+/// [`Relauncher::take_stranded`] は空になる）。`true` のとき [`ProcessLauncher::confirm_no_process`] を期限つきで呼び、
+/// 消滅を確かめられたら `error` をそのまま返す。確かめられなければ [`UnconfirmedLaunch`] を `stranded` へ積み、
+/// 呼び出し側の `dispose` が同じ確認を再試行できるようにする（積まれたままなら回収失敗として扱われる）。
+fn settle_failed_launch(
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &fandhe_container_core::traits::ContainerId,
+    error: TraitError,
+    wait: Duration,
+    stranded: &Mutex<Vec<LateOrphan>>,
+) -> TraitError {
+    if !launcher.last_launch_may_have_left_process() {
+        return error;
+    }
+    match launcher.confirm_no_process(id, wait) {
+        Ok(()) => error,
+        Err(confirm) => {
+            stranded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((
+                    Box::new(UnconfirmedLaunch {
+                        launcher: Arc::clone(launcher),
+                        id: id.clone(),
+                    }),
+                    confirm,
+                ));
+            error
+        }
+    }
+}
+
+/// 失敗した launch の残存を確認できなかったことを表す、`dispose` へ引き渡すための代理ハンドル（CORE-2・#2043）。
+///
+/// 実プロセスのハンドルではない。`terminate` は launcher の [`ProcessLauncher::confirm_no_process`] への委譲で、
+/// `Ok` なら残存なしを確かめられたことを意味する。`pid` は実在しない占位（1）で、照合には使われない。
+struct UnconfirmedLaunch {
+    launcher: Arc<dyn ProcessLauncher>,
+    id: fandhe_container_core::traits::ContainerId,
+}
+
+impl LaunchedProcess for UnconfirmedLaunch {
+    fn pid(&self) -> NonZeroU32 {
+        NonZeroU32::MIN
+    }
+
+    fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        Ok(None)
+    }
+
+    fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
+        self.launcher.confirm_no_process(&self.id, timeout)
+    }
+}
+
 impl Relauncher for LauncherRelauncher {
     /// 内側の launcher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ降格し、
     /// 単一スレッドを要求する本番 launcher が別スレッドから呼ばれて拒否される。#1816・#2043）。
@@ -1593,7 +1651,18 @@ impl Relauncher for LauncherRelauncher {
         // launch の戻り（成否を問わず）で stderr を再開する。以降の attach の報告は通常どおり出る。
         // 再開に失敗すると以降の報告が恒久的に記録されなくなる（REPAIR-4）ため、成功した新プロセスは回収して Err にする。
         let resumed = _resume.map(StderrResume::finish);
-        let process = launched?;
+        let process = match launched {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(settle_failed_launch(
+                    &self.launcher,
+                    self.spec.container_id(),
+                    e,
+                    remaining_now().max(MIN_TERMINATE_WAIT),
+                    &self.stranded,
+                ));
+            }
+        };
         if let Some(Err(e)) = resumed {
             return match process.terminate(remaining_now().max(MIN_TERMINATE_WAIT)) {
                 Ok(()) => Err(e),
@@ -1695,6 +1764,94 @@ mod tests {
         ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
+    }
+
+    /// 残存の可能性を答え、確認の成否を操作できる launcher(#2043)。
+    struct MayLeave {
+        leave: bool,
+        confirm_ok: bool,
+        confirmed: AtomicU32,
+    }
+
+    impl ProcessLauncher for MayLeave {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn last_launch_may_have_left_process(&self) -> bool {
+            self.leave
+        }
+
+        fn confirm_no_process(&self, _: &ContainerId, _: Duration) -> Result<(), TraitError> {
+            self.confirmed.fetch_add(1, Ordering::SeqCst);
+            if self.confirm_ok {
+                Ok(())
+            } else {
+                Err(TraitError::new(ErrorCode::Timeout, "still alive"))
+            }
+        }
+    }
+
+    fn settle(l: &Arc<MayLeave>) -> (TraitError, Vec<LateOrphan>) {
+        let launcher: Arc<dyn ProcessLauncher> = l.clone();
+        let stranded = Mutex::new(Vec::new());
+        let id = ContainerId::new("c1").expect("id");
+        let e = settle_failed_launch(
+            &launcher,
+            &id,
+            TraitError::new(ErrorCode::Internal, "launch failed"),
+            Duration::from_secs(1),
+            &stranded,
+        );
+        (e, stranded.into_inner().unwrap())
+    }
+
+    /// CORE-2・SUP-3・#2043: 残存の疑いが無ければ確認も引き渡しもしない。
+    #[test]
+    fn core2_failed_relaunch_without_leftover_skips_confirmation() {
+        let l = Arc::new(MayLeave {
+            leave: false,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(stranded.is_empty());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 0);
+    }
+
+    /// CORE-2・SUP-3・#2043: 残存の疑いがあり確認できれば、元のエラーのまま何も引き渡さない。
+    #[test]
+    fn core2_failed_relaunch_with_confirmed_leftover_is_clean() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: true,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(stranded.is_empty());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 1);
+    }
+
+    /// CORE-2・SUP-3・#2043: 確認できない残存は代理ハンドルとして引き渡され、dispose の terminate が確認を再試行する。
+    #[test]
+    fn core2_failed_relaunch_with_unconfirmed_leftover_is_handed_over() {
+        let l = Arc::new(MayLeave {
+            leave: true,
+            confirm_ok: false,
+            confirmed: AtomicU32::new(0),
+        });
+        let (e, stranded) = settle(&l);
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].1.code(), ErrorCode::Timeout);
+        assert!(stranded[0].0.terminate(Duration::from_millis(1)).is_err());
+        assert_eq!(l.confirmed.load(Ordering::SeqCst), 2);
     }
 
     /// REPAIR-5・#1816: `SpecCapturingLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。

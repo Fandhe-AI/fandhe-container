@@ -7,6 +7,57 @@
 
 use crate::error::CriErrorCode;
 
+/// 受け付ける `metadata` の最大件数。prost は空の `KeyValue`（2 バイト）を件数分確保するため、
+/// フレーム上限だけでは展開量を抑えられない（件数を確保前に検証する規約）。
+pub const MAX_METADATA_ENTRIES: usize = 64;
+
+/// 復号前にワイヤー形式を走査し、`metadata`（フィールド 5）の件数が上限以内かを返す。
+/// 走査できない（切れた・未知のワイヤー型）場合も `false`（確保しない側に倒す）。
+pub fn metadata_within_limit(buf: &[u8]) -> bool {
+    fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut v: u64 = 0;
+        for i in 0..10u32 {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            v |= u64::from(b & 0x7f).checked_shl(7 * i)?;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < buf.len() {
+        let Some(tag) = varint(buf, &mut pos) else {
+            return false;
+        };
+        let skip = match tag & 7 {
+            0 => varint(buf, &mut pos).map(|_| 0usize),
+            1 => Some(8),
+            5 => Some(4),
+            2 => {
+                if tag >> 3 == 5 {
+                    count += 1;
+                    if count > MAX_METADATA_ENTRIES {
+                        return false;
+                    }
+                }
+                varint(buf, &mut pos).and_then(|l| usize::try_from(l).ok())
+            }
+            _ => None,
+        };
+        let Some(n) = skip else {
+            return false;
+        };
+        match pos.checked_add(n) {
+            Some(end) if end <= buf.len() => pos = end,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// `KeyValue { string key = 1; string value = 2; }`。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct KeyValue {
@@ -89,6 +140,25 @@ mod tests {
             [0x0a, 1, b'a', 0x12, 1, b'b', 0x1a, 1, 9]
         );
         assert_eq!(TtrpcRequest::decode(&r.encode_to_vec()[..]).unwrap(), r);
+    }
+
+    /// CRI-5: metadata の件数は復号前に数えて上限で拒否する（0x2a 0x00 の繰り返しを含む）。
+    #[test]
+    fn cri5_metadata_count_limit_before_decode() {
+        let ok = TtrpcRequest {
+            service: "a".into(),
+            metadata: vec![KeyValue::default(); MAX_METADATA_ENTRIES],
+            ..Default::default()
+        };
+        assert!(metadata_within_limit(&ok.encode_to_vec()));
+        let bad = [0x2a, 0x00].repeat(MAX_METADATA_ENTRIES + 1);
+        assert!(!metadata_within_limit(&bad));
+        let huge = [0x2a, 0x00].repeat(100_000);
+        assert!(!metadata_within_limit(&huge));
+        // 切れた長さ・未知のワイヤー型は拒否。
+        assert!(!metadata_within_limit(&[0x0a, 5, 1]));
+        assert!(!metadata_within_limit(&[0x0b]));
+        assert!(metadata_within_limit(&[]));
     }
 
     /// CRI-5: Response の往復と gRPC コード値（Unimplemented = 12）。

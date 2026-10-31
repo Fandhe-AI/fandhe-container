@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::shim_v2::{
-    EmptyTaskService, FrameHeader, HEADER_LEN, MessageType, ServerConfig, ServerHandle,
-    ServiceRegistry, TaskApiVersion, TtrpcRequest, TtrpcResponse, TtrpcServer,
+    EmptyTaskService, FrameHeader, HEADER_LEN, MAX_PAYLOAD_LEN, MessageType, RpcStatus,
+    ServerConfig, ServerHandle, ServiceRegistry, TaskApiVersion, TtrpcRequest, TtrpcResponse,
+    TtrpcServer, TtrpcService,
 };
 use prost::Message;
 
@@ -298,4 +299,105 @@ fn out_of_range_config_is_rejected_without_panic() {
         };
         assert_eq!(err.to_string(), format!("invalid config: {field}"));
     }
+}
+
+/// 上限超過の成功ペイロードを返すサービス（試験用）。
+struct BigService;
+
+impl TtrpcService for BigService {
+    fn name(&self) -> &str {
+        "test.Big"
+    }
+    fn handle(&self, _method: &str, _payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        Ok(vec![0u8; MAX_PAYLOAD_LEN as usize + 1])
+    }
+}
+
+fn start_with_rec(
+    tag: &str,
+    svc: Arc<dyn TtrpcService>,
+    rec: Arc<Rec>,
+) -> (test_root::TestRoot, std::path::PathBuf, ServerHandle) {
+    let root = test_root::test_root("ttrpc", tag);
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut reg = ServiceRegistry::new();
+    reg.register(svc).unwrap();
+    let h = TtrpcServer::with_recorder(reg, ServerConfig::default(), rec)
+        .serve(listener)
+        .unwrap();
+    (root, path, h)
+}
+
+/// CRI-5・REPAIR-4: 応答サイズ超過で置換された応答の結果コード（ResourceExhausted）が記録される。
+#[test]
+fn cri5_oversize_response_is_recorded_as_resource_exhausted() {
+    let rec = Arc::new(Rec::default());
+    let (_root, path, h) = start_with_rec("big", Arc::new(BigService), rec.clone());
+    let mut s = connect(&path);
+    send_req(&mut s, 1, "test.Big", "M");
+    let (_, r) = read_resp(&mut s).unwrap();
+    assert_eq!(code(&r), EXHAUSTED);
+    h.shutdown().unwrap();
+    let got = rec.0.lock().unwrap().clone();
+    assert!(got.contains(&("cri.shim_v2.dispatch".into(), EXHAUSTED)));
+    assert!(!got.contains(&("cri.shim_v2.dispatch".into(), 0)));
+}
+
+/// CRI-5・REPAIR-5: metadata が件数上限を超える要求は復号されず InvalidArgument になる。
+#[test]
+fn cri5_metadata_flood_is_rejected() {
+    let (_root, path, h) = start("mdflood", TaskApiVersion::V2, ServerConfig::default());
+    let mut s = connect(&path);
+    let mut body = TtrpcRequest {
+        service: "containerd.task.v2.Task".into(),
+        method: "State".into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    // 空の KeyValue（0x2a 0x00）を大量に並べる。
+    for _ in 0..100_000 {
+        body.extend_from_slice(&[0x2a, 0x00]);
+    }
+    let hd = FrameHeader::new(body.len() as u32, 1, MessageType::Request, 0).unwrap();
+    s.write_all(&hd.to_bytes()).unwrap();
+    s.write_all(&body).unwrap();
+    let (_, r) = read_resp(&mut s).unwrap();
+    assert_eq!(code(&r), INVALID);
+    h.shutdown().unwrap();
+}
+
+/// CRI-5・REPAIR-4: 不正ヘッダへの応答の書き込み失敗（相手が切断済み）も io として記録される。
+#[test]
+fn cri5_invalid_header_write_failure_is_recorded() {
+    let rec = Arc::new(Rec::default());
+    let (_root, path, h) = start_with_rec(
+        "badhdrwrite",
+        Arc::new(EmptyTaskService::new(TaskApiVersion::V2)),
+        rec.clone(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = false;
+    while !seen && std::time::Instant::now() < deadline {
+        let mut s = connect(&path);
+        // 長さが上限超過の不正ヘッダを送って、応答を読まずに即切断する。
+        let mut raw = [0u8; HEADER_LEN];
+        raw[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_be_bytes());
+        raw[8] = 1;
+        s.write_all(&raw).unwrap();
+        drop(s);
+        std::thread::sleep(Duration::from_millis(100));
+        // Unavailable = 14
+        seen = rec
+            .0
+            .lock()
+            .unwrap()
+            .contains(&("cri.shim_v2.io".into(), 14));
+    }
+    h.shutdown().unwrap();
+    assert!(
+        seen,
+        "write failure on invalid-header path must be recorded"
+    );
 }

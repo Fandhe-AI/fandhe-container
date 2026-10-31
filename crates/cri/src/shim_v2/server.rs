@@ -26,7 +26,7 @@ use prost::Message;
 use tonic::Code;
 
 use super::frame::{FrameError, FrameHeader, HEADER_LEN, MAX_PAYLOAD_LEN, MessageType};
-use super::message::{RpcStatus, TtrpcRequest, TtrpcResponse};
+use super::message::{RpcStatus, TtrpcRequest, TtrpcResponse, metadata_within_limit};
 use super::service::ServiceRegistry;
 use crate::error::CriErrorCode;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
@@ -375,6 +375,16 @@ fn status_response(code: CriErrorCode, msg: &str) -> TtrpcResponse {
     }
 }
 
+/// 応答が上限を超えるなら `ResourceExhausted` の応答に置き換える（符号化前に `encoded_len()` で判定）。
+/// 計測は実際に送る応答のコードを記録するため、計測より前に呼ぶ（REPAIR-4）。
+fn bound_response(resp: TtrpcResponse) -> TtrpcResponse {
+    if resp.encoded_len() > MAX_PAYLOAD_LEN as usize {
+        status_response(CriErrorCode::ResourceExhausted, "response too large")
+    } else {
+        resp
+    }
+}
+
 /// 応答を書く。符号化の前に `encoded_len()` で上限を検証する（巨大な応答の追加確保を避ける）。
 /// 書き込み全体に絶対期限を持ち、`poll_interval` ごとに停止要求を確かめる（REPAIR-5）。
 fn write_response(
@@ -383,12 +393,11 @@ fn write_response(
     resp: &TtrpcResponse,
     ctx: &Ctx,
 ) -> io::Result<()> {
-    let too_large = resp.encoded_len() > MAX_PAYLOAD_LEN as usize;
-    let body = if too_large {
-        status_response(CriErrorCode::ResourceExhausted, "response too large").encode_to_vec()
-    } else {
-        resp.encode_to_vec()
-    };
+    // 上限超過の応答は呼び出し側の `bound_response` で置換済み。超えていれば下の header 生成で拒否する。
+    if resp.encoded_len() > MAX_PAYLOAD_LEN as usize {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let body = resp.encode_to_vec();
     let len = u32::try_from(body.len()).map_err(|_| io::ErrorKind::InvalidData)?;
     let header = FrameHeader::new(len, stream_id, MessageType::Response, 0)
         .map_err(|_| io::ErrorKind::InvalidData)?;
@@ -483,7 +492,9 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                 };
                 let resp = status_response(code, msg);
                 record_op(ctx, CriOpKind::ShimV2Frame, resp_code(&resp), started);
-                let _ = write_response(&mut stream, raw_stream_id, &resp, ctx);
+                if let Err(e) = write_response(&mut stream, raw_stream_id, &resp, ctx) {
+                    record_write_failure(ctx, &e, started);
+                }
                 drain_then_close(&mut stream, ctx);
                 return;
             }
@@ -519,9 +530,15 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                             ),
                         )
                     } else {
-                        match TtrpcRequest::decode(payload.as_slice()) {
-                            Ok(req) => (CriOpKind::ShimV2Dispatch, ctx.registry.dispatch(&req)),
-                            Err(_) => (
+                        // 復号前に metadata の件数を数えて上限を検証する（復号後では過大確保を防げない）。
+                        let decoded = if metadata_within_limit(&payload) {
+                            TtrpcRequest::decode(payload.as_slice()).ok()
+                        } else {
+                            None
+                        };
+                        match decoded {
+                            Some(req) => (CriOpKind::ShimV2Dispatch, ctx.registry.dispatch(&req)),
+                            None => (
                                 CriOpKind::ShimV2Frame,
                                 status_response(CriErrorCode::InvalidArgument, "malformed request"),
                             ),
@@ -530,6 +547,7 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                 }
             }
         };
+        let resp = bound_response(resp);
         record_op(ctx, kind, resp_code(&resp), started);
         if let Err(e) = write_response(&mut stream, sid, &resp, ctx) {
             record_write_failure(ctx, &e, started);

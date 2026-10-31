@@ -250,8 +250,16 @@ pub fn classify_network_mode_value(value: Option<&str>) -> KeyClass {
 }
 
 /// Docker ソケットの bind mount か（D-16 の影響指標）。値は保持しない。結線は #598。
+///
+/// short syntax（`source:target[:mode]`）のマウント元（最初の `:` より前）がソケットのパス全体と
+/// 一致するときだけ true。マウント先だけの一致や `docker.sock.backup` のような接頭辞一致は false。
+/// `:` を含まない項目は匿名ボリュームのため false。
 pub fn is_docker_socket_bind(volume_entry: &str) -> bool {
-    volume_entry.contains("/var/run/docker.sock") || volume_entry.contains("//./pipe/docker_engine")
+    const SOCKET_SOURCES: [&str; 2] = ["/var/run/docker.sock", "//./pipe/docker_engine"];
+    match volume_entry.split_once(':') {
+        Some((source, _)) => SOCKET_SOURCES.contains(&source),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -474,5 +482,10 @@ mod tests {
             "//./pipe/docker_engine://./pipe/docker_engine"
         ));
         assert!(!is_docker_socket_bind("./data:/data"));
+        assert!(!is_docker_socket_bind(
+            "/var/run/docker.sock.backup:/backup"
+        ));
+        assert!(!is_docker_socket_bind("./dummy:/var/run/docker.sock"));
+        assert!(!is_docker_socket_bind("/var/run/docker.sock"));
     }
 }

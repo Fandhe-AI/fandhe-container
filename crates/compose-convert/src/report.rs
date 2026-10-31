@@ -8,7 +8,7 @@
 //!
 //! 未実装の範囲（REPAIR-3）: 文書を走査して [`KeyOccurrences`] を埋める走査器は `crate::key_scan`（#601）で、
 //! 本モジュールは集計の型と判定だけを持つ。`deploy` の変換と GPU 予約の実加算
-//! の結線も未実装。`--downgrade` と `error_free_with_downgrade` は TASK-182 で別集計として足し、
+//! の結線も未実装。`--downgrade` の格下げ集計（`downgraded`・`error_free_with_downgrade`。TASK-182.1・#627）は別集計で、
 //! 本型の `error_free` の定義は変えない。
 //!
 //! 判定結果・blocker には値・環境変数名・サービス名を載せない（`environment` に資格情報が入りうるため）。
@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use crate::classify::{IncompatibleGuidance, KeyClass, incompatible_guidance};
 use crate::compose_convert::ComposeParseErrorCode;
 use crate::convert::ValueDrops;
+use crate::downgrade::DowngradeSet;
 
 /// 異なるキーパスの記録数の上限。超えた記録は捨てずに溢れの印を立て、判定を不可にする（DoS 対策・fail-closed）。
 pub const MAX_KEY_PATHS: usize = 4096;
@@ -151,6 +152,33 @@ impl FileConversionReport {
         if self.key_occurrences.overflowed() {
             blockers.push(ErrorFreeBlocker::KeyOccurrencesOverflow);
         }
+        ErrorFreeVerdict { blockers }
+    }
+
+    /// `--downgrade` で格下げされたキーと出現数（パス順）。そのファイルで実際に
+    /// `error-unsupported-yet` と記録されたものだけが載る（STACK-3・TASK-182.1）。
+    pub fn downgraded(&self, set: &DowngradeSet) -> Vec<(String, u64)> {
+        self.key_occurrences
+            .iter()
+            .filter(|(p, e)| set.permits(p, e.class))
+            .map(|(p, e)| (p.to_string(), e.occurrences))
+            .collect()
+    }
+
+    /// 格下げを許した場合の `error_free`（既定の [`Self::error_free`] とは別集計。STACK-3）。
+    /// 許可済みのキーだけを blocker から除き、パース失敗・`value_drops`・溢れは残す。
+    pub fn error_free_with_downgrade(&self, set: &DowngradeSet) -> ErrorFreeVerdict {
+        let blockers = self
+            .error_free()
+            .blockers
+            .into_iter()
+            .filter(|b| match b {
+                ErrorFreeBlocker::ErrorClassKey {
+                    key_path, class, ..
+                } => !set.permits(key_path, *class),
+                _ => true,
+            })
+            .collect();
         ErrorFreeVerdict { blockers }
     }
 }
@@ -357,5 +385,42 @@ mod tests {
         let dbg = format!("{:?}", r.error_free());
         assert!(!dbg.contains("secretsvc") && !dbg.contains("TOKEN_NAME"));
         assert!(!r.error_free().is_error_free());
+    }
+
+    /// STACK-3・TASK-182.1: 格下げは指定かつ unsupported-yet のキーだけ。value_drops・incompatible は残り、既定の error_free は変わらない。
+    #[test]
+    fn downgrade_verdict_and_downgraded() {
+        use crate::downgrade::parse_downgrade_value;
+        let set = parse_downgrade_value("services.*.container_name,services.*.tty")
+            .expect("downgrade set");
+        let mut occ = KeyOccurrences::new();
+        occ.record("services.*.container_name", KeyClass::ErrorUnsupportedYet);
+        occ.record("services.*.container_name", KeyClass::ErrorUnsupportedYet);
+        occ.record("services.*.user", KeyClass::ErrorUnsupportedYet);
+        let r = FileConversionReport::from_parsed(occ.clone(), ValueDrops::new());
+        assert_eq!(
+            r.downgraded(&set),
+            vec![("services.*.container_name".to_string(), 2)]
+        );
+        assert_eq!(r.error_free_with_downgrade(&set).blockers().len(), 1);
+        assert_eq!(r.error_free().blockers().len(), 2);
+
+        let mut occ2 = KeyOccurrences::new();
+        occ2.record("services.*.tty", KeyClass::ErrorUnsupportedYet);
+        let ok = FileConversionReport::from_parsed(occ2.clone(), ValueDrops::new());
+        assert!(ok.error_free_with_downgrade(&set).is_error_free());
+        assert!(!ok.error_free().is_error_free());
+
+        let mut drops = ValueDrops::new();
+        drops.note("services.*.ports");
+        let d = FileConversionReport::from_parsed(occ2, drops);
+        assert_eq!(d.error_free_with_downgrade(&set).blockers().len(), 1);
+
+        let mut occ3 = KeyOccurrences::new();
+        occ3.record("services.*.network_mode", KeyClass::ErrorIncompatible);
+        let set2 = parse_downgrade_value("services.*.network_mode").expect("set");
+        let n = FileConversionReport::from_parsed(occ3, ValueDrops::new());
+        assert!(n.downgraded(&set2).is_empty());
+        assert!(!n.error_free_with_downgrade(&set2).is_error_free());
     }
 }

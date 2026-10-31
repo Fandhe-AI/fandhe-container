@@ -3,67 +3,93 @@
 //! YAML の読み込みとアンカー / マージキーの展開は [`compose_convert`] で実装済み（TASK-151.1・#595）。
 //! GPU 予約の検出（`gpu_reservation`。TASK-156.1・STACK-9）も実装済み。
 //! キー分類表（`classify`。TASK-151.2・#596・STACK-3）も実装済み。
-//! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み（bin への結線は #602）。
+//! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み。
 //! スカラーと short syntax キーの TOML 変換（`convert`・`shell_split`。TASK-151.3.1・#864・STACK-3・MS-12）も実装済み。
 //! マッピング配列キー（long syntax）の short syntax への変換（`long_syntax`。TASK-151.3.2・#865・STACK-3）も実装済みで、`convert` へ結線済み（#599）。
 //! ファイル単位のレポートと `error_free` 判定（`report`。TASK-151.4・#599・STACK-3）も実装済み。
-//! キーパスの走査器（`KeyOccurrences` を埋める処理）は未実装、bin の結線は #602、
+//! キーパスの走査器（`key_walk`）、引数解析とレポート出力（`entry`・`report_json`）、bin の結線は TASK-151.7（#602・STACK-3）で実装済み。
+//! bin は入力ディレクトリを受け取り、キー単位の変換レポート（4 分類・unrecognized の件数・`value_drops`・`downgraded`）を
+//! stderr へ 1 行 JSON で出す。stdout は将来 TOML を出す経路として空けてあり、TOML の書き出しは未実装（REPAIR-3）。
+//! `--downgrade` は TASK-182（#627）で実装するまで `UNIMPLEMENTED` で拒否する。
 //! depends_on・ulimits・healthcheck・deploy の変換は未実装（`ServiceConversion::unhandled` に載る。REPAIR-3）。
-//! bin は未実装を構造化して返す雛形（TASK-151.0・#1070・STACK-3）。
-//! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.3.1（#864）から。
+//! `fandhe-container-stack` への一方向の path 依存は配線済み。YAML パーサーの依存は本 crate に限り、
+//! `fandhe-container-cli`・`fandhe-container-stack` の依存木には現れない（TASK-155 の経路へリンクしない）。
 //! 本体は G11（TASK-151 が変換器本体、TASK-152・153・154・156・182）で実装する。
 //! plugin ではない独立ツールで、PLUG-1 区分の対象外（crate-naming.md 決定 5）。
 
 pub mod classify;
 pub mod compose_convert;
 pub mod convert;
+pub mod entry;
 pub mod gpu_reservation;
 pub mod input_scan;
+pub mod key_walk;
 pub mod long_syntax;
 pub mod report;
+pub mod report_json;
 pub mod shell_split;
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// stderr への書き込み完了を待つ上限（REPAIR-5）。読み手が止まった pipe / socket でも終了コードを返すため。
-const STDERR_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// stderr への書き込み完了を待つ基準時間（REPAIR-5）。出力量に応じて [`write_timeout_for`] が加算する。
+const STDERR_WRITE_BASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 出力 1 MiB ごとに加える待ち時間。
+const STDERR_WRITE_PER_MIB: Duration = Duration::from_secs(1);
+
+/// 待ち時間の上限。
+const STDERR_WRITE_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 未実装時の終了コード。CLI の ERR-2 の慣行（8 = 未実装）に合わせる。core へ依存しないため値を直接書く。
-pub const UNIMPLEMENTED_EXIT_CODE: u8 = 8;
+pub use entry::UNIMPLEMENTED_EXIT_CODE;
 
-/// 未実装を表す固定の 1 行 JSON（stderr へ出す）。argv・環境変数の値は埋め込まない。
-pub const UNIMPLEMENTED_JSON: &str =
-    "{\"code\":\"UNIMPLEMENTED\",\"message\":\"compose-convert is not implemented yet\"}";
-
-/// bin の入口から呼ばれる stub。引数は解釈せず、stderr へ固定文言を出して終了コード 8 を返す。
-/// stdout は将来 TOML を出す経路のため何も書かない。書き込み失敗でも panic しない（REPAIR-3）。
-/// stderr が満杯で読み手が止まっていても、書き込みは別スレッドで行い有限の期限で待つため戻れる（REPAIR-5）。
-pub fn run() -> ExitCode {
-    run_with(STDERR_WRITE_TIMEOUT, || {
-        let _ = writeln!(std::io::stderr(), "{UNIMPLEMENTED_JSON}");
-    })
+/// 出力量に比例した書き込みの待ち時間（基準 2 秒 + 1 MiB ごとに 1 秒、上限 30 秒）。
+fn write_timeout_for(len: usize) -> Duration {
+    let mib = u32::try_from(len / (1024 * 1024)).unwrap_or(u32::MAX);
+    STDERR_WRITE_BASE_TIMEOUT
+        .saturating_add(STDERR_WRITE_PER_MIB.saturating_mul(mib))
+        .min(STDERR_WRITE_MAX_TIMEOUT)
 }
 
-/// `write` を別スレッドで実行し、`timeout` までだけ完了を待って終了コード 8 を返す。
-/// 期限切れ・スレッド起動失敗でも書き込みスレッドの完了は待たない（プロセス終了時に破棄される）。
-fn run_with<F>(timeout: Duration, write: F) -> ExitCode
+/// bin の入口から呼ばれる。引数を [`entry::run_args`] で処理し、レポートを stderr へ書いて終了コードを返す。
+/// stdout は将来 TOML を出す経路のため何も書かない。書き込みが失敗・期限切れのときは、レポートが届いていないため
+/// 成功を返さず終了コード 1（INTERNAL）にする。stderr が満杯で読み手が止まっていても、書き込みは別スレッドで行い
+/// 有限の期限で待つため戻れる（REPAIR-5）。
+pub fn run() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let outcome = entry::run_args(&args);
+    let timeout = write_timeout_for(outcome.stderr.len());
+    let text = outcome.stderr;
+    let delivered = write_with_deadline(timeout, move || {
+        let mut err = std::io::stderr().lock();
+        err.write_all(text.as_bytes())?;
+        err.flush()
+    });
+    if delivered {
+        ExitCode::from(outcome.exit_code)
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// `write` を別スレッドで実行し、`timeout` までだけ完了を待つ。成功（`Ok`）で完了したときだけ true。
+/// 期限切れ・スレッド起動失敗・書き込み失敗は false。期限切れでも書き込みスレッドの完了は待たない
+/// （プロセス終了時に破棄される）。
+fn write_with_deadline<F>(timeout: Duration, write: F) -> bool
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> std::io::Result<()> + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<bool>();
     let spawned = std::thread::Builder::new()
         .name("compose-convert-stderr".to_string())
         .spawn(move || {
-            write();
-            let _ = tx.send(());
+            let _ = tx.send(write().is_ok());
         });
-    if spawned.is_ok() {
-        let _ = rx.recv_timeout(timeout);
-    }
-    ExitCode::from(UNIMPLEMENTED_EXIT_CODE)
+    spawned.is_ok() && rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -76,28 +102,37 @@ mod tests {
         assert_eq!(UNIMPLEMENTED_EXIT_CODE, 8);
     }
 
-    /// STACK-3・REPAIR-3: 固定 JSON は ASCII の 1 行で code と message を持つ。
+    /// REPAIR-5: 待ち時間は出力量に比例し、上限を超えない。
     #[test]
-    fn unimplemented_json_is_single_ascii_line() {
-        assert!(!UNIMPLEMENTED_JSON.contains('\n'));
-        assert!(UNIMPLEMENTED_JSON.is_ascii());
-        assert!(UNIMPLEMENTED_JSON.contains("\"code\":\"UNIMPLEMENTED\""));
-        assert!(UNIMPLEMENTED_JSON.contains("\"message\":"));
+    fn write_timeout_scales_with_output() {
+        assert_eq!(write_timeout_for(0), Duration::from_secs(2));
+        assert_eq!(write_timeout_for(3 * 1024 * 1024), Duration::from_secs(5));
+        assert_eq!(write_timeout_for(usize::MAX), Duration::from_secs(30));
     }
 
-    /// REPAIR-5・REPAIR-12: 書き込みが戻らなくても期限内に終了コード 8 で戻る。
+    /// REPAIR-5・REPAIR-12: 書き込みが戻らなくても期限内に false で戻る。
     #[test]
-    fn blocked_writer_returns_exit_code_after_timeout() {
+    fn blocked_writer_returns_false_after_timeout() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let timeout = Duration::from_millis(200);
         let start = std::time::Instant::now();
-        let code = run_with(timeout, move || {
+        let ok = write_with_deadline(timeout, move || {
             let _ = release_rx.recv();
+            Ok(())
         });
         let elapsed = start.elapsed();
+        assert!(!ok);
         assert!(elapsed >= timeout, "returned early: {elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "too slow: {elapsed:?}");
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(8)));
         let _ = release_tx.send(());
+    }
+
+    /// REPAIR-5: 書き込み成功は true、失敗は false。
+    #[test]
+    fn writer_result_is_reported() {
+        assert!(write_with_deadline(Duration::from_secs(5), || Ok(())));
+        assert!(!write_with_deadline(Duration::from_secs(5), || Err(
+            std::io::Error::other("x")
+        )));
     }
 }

@@ -1,0 +1,180 @@
+//! 実バイナリの結合試験（TASK-151.7・#602・STACK-3・REPAIR-12）。
+//! 子プロセスの待ちには期限を付ける（REPAIR-5）。一時ディレクトリは pid と連番で作り、成否にかかわらず消す。
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-compose-convert");
+
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// drop で消える一時ディレクトリ。
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("fc-compose-convert-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("create scratch");
+        Self(p)
+    }
+
+    fn write(&self, name: &str, text: &str) {
+        std::fs::write(self.0.join(name), text).expect("write fixture");
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run(args: &[&std::ffi::OsStr]) -> (Option<i32>, String, String) {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("compose-convert did not exit within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read stdout");
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    (status.code(), out, err)
+}
+
+fn run_strs(args: &[&str]) -> (Option<i32>, String, String) {
+    let os: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+    run(&os)
+}
+
+fn run_dir(dir: &Path) -> (Option<i32>, String, String) {
+    run(&[dir.as_os_str()])
+}
+
+/// STACK-3: 正常系。file 2 行 + 集計 1 行、stdout は空、値・名前は出力に出ない。
+#[test]
+fn report_lines_for_mixed_directory() {
+    let s = Scratch::new();
+    s.write(
+        "a.yaml",
+        "services:\n  web:\n    image: busybox\n    privileged: true\n    environment:\n      SECRET: value-marker-9c1d\n",
+    );
+    s.write("b.yml", "services: [unclosed\n");
+    let (code, out, err) = run_dir(s.path());
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(lines[0].starts_with("{\"kind\":\"file\",\"file_id\":\"a\","));
+    assert!(lines[0].contains("\"error-incompatible\":{\"keys\":1,\"occurrences\":1}"));
+    assert!(lines[0].contains("\"error_free\":false"));
+    assert!(
+        lines[1].starts_with(
+            "{\"kind\":\"file\",\"file_id\":\"b\",\"parse_error\":\"INVALID_ARGUMENT\""
+        )
+    );
+    assert_eq!(
+        lines[2],
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}"
+    );
+    for marker in ["value-marker-9c1d", "SECRET", "web"] {
+        assert!(!err.contains(marker), "{marker} leaked: {err}");
+    }
+    assert!(err.is_ascii());
+}
+
+/// STACK-3: 問題のないファイルは error_free: true で blocker が空。
+#[test]
+fn clean_file_is_error_free() {
+    let s = Scratch::new();
+    s.write("compose.yaml", "services:\n  web:\n    image: busybox\n");
+    let (code, out, err) = run_dir(s.path());
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "");
+    let first = err.lines().next().expect("file line");
+    assert!(
+        first.contains("\"error_free\":true,\"error_free_blockers\":[]}"),
+        "{first}"
+    );
+    assert!(first.contains("\"value_drops\":{},\"value_drops_total\":0,\"downgraded\":{}"));
+    assert!(err.contains("\"error_free_files\":1"));
+}
+
+/// STACK-3: 引数の誤りは 2。引数の値は出力に入らない。
+#[test]
+fn invalid_arguments_exit_2() {
+    let (code, out, err) = run_strs(&[]);
+    assert_eq!(code, Some(2));
+    assert_eq!(out, "");
+    assert!(err.contains("\"code\":\"INVALID_ARGUMENT\""));
+    let (code, _, err) = run_strs(&["--bogus=secret-marker"]);
+    assert_eq!(code, Some(2));
+    assert!(!err.contains("secret-marker"));
+}
+
+/// REPAIR-3: --downgrade は未実装として 8 で拒否し、何も変換しない。
+#[test]
+fn downgrade_is_rejected_without_conversion() {
+    let s = Scratch::new();
+    s.write("a.yaml", "services: {}\n");
+    let dir = s.path().to_string_lossy().into_owned();
+    let (code, out, err) = run_strs(&["--downgrade=services.*.tty", &dir]);
+    assert_eq!(code, Some(8));
+    assert_eq!(out, "");
+    assert!(err.contains("\"code\":\"UNIMPLEMENTED\""));
+    assert!(!err.contains("\"kind\":\"file\""));
+}
+
+/// STACK-3: 存在しないディレクトリは 3 と NOT_FOUND。
+#[test]
+fn missing_directory_exits_3() {
+    let s = Scratch::new();
+    let missing = s.path().join("absent");
+    let (code, out, err) = run_dir(&missing);
+    assert_eq!(code, Some(3));
+    assert_eq!(out, "");
+    assert!(err.contains("\"code\":\"NOT_FOUND\""));
+}
+
+/// STACK-3: compose.yml と compose.yaml の共存は変換せず 2。
+#[test]
+fn duplicate_file_id_exits_2() {
+    let s = Scratch::new();
+    s.write("compose.yml", "services: {}\n");
+    s.write("compose.yaml", "services: {}\n");
+    let (code, out, err) = run_dir(s.path());
+    assert_eq!(code, Some(2));
+    assert_eq!(out, "");
+    assert!(err.contains("duplicate file_id"));
+    assert!(!err.contains("\"kind\":\"file\""));
+}

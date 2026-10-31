@@ -4,10 +4,10 @@
 //! 変換できずに捨てた値の件数（[`ValueDrops`]）、パース失敗の有無を 1 か所に集め、
 //! 「エラー 0 件」かを [`FileConversionReport::error_free`] で判定する。判定は PoC-16 と同じ 3 条件の論理積
 //! （パース成功・エラー分類キー 0 件・`value_drops` 空）で、`value_drops` が 1 件でもあれば `error_free` にしない。
-//! 呼び出し元は #601（unrecognized 0 件の確認）と #602（bin のレポート出力）を想定する。
+//! 呼び出し元は #601（unrecognized 0 件の確認）と、bin の `entry`（#602。出力は `report_json`）。
 //!
-//! 未実装の範囲（REPAIR-3）: 文書を走査して [`KeyOccurrences`] を埋める走査器は本モジュールに無く、
-//! 呼び出し側が正規形のキーパスで [`KeyOccurrences::record`] する。`deploy` の変換と GPU 予約の実加算
+//! 未実装の範囲（REPAIR-3）: 文書を走査して [`KeyOccurrences`] を埋める走査器は `key_walk`（#602）にあり、
+//! 本モジュールは正規形のキーパスを [`KeyOccurrences::record`] で受けるだけである。`deploy` の変換と GPU 予約の実加算
 //! の結線も未実装。`--downgrade` と `error_free_with_downgrade` は TASK-182 で別集計として足し、
 //! 本型の `error_free` の定義は変えない。
 //!

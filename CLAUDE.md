@@ -68,6 +68,7 @@ fandhe-container/
 │   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）
 │   │   ├── resource-efficiency-target.md  # リソース効率目標値（TASK-48・CORE-8）
 │   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
+│   │   ├── build-migration.md     # build:・Docker ソケット bind の外部ビルド手順の概要と CI ランナー等の移行方針の判断記録（TASK-154.2・#615・STACK-7。移行方針はオーナー承認待ち）
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
 │   │   ├── cgroups.md             # cgroups v2 単独対応・v1 / systemd cgroup driver 非対応（TASK-34・CORE-4）
 │   │   ├── ffi-libc-check.md      # 自前 FFI 宣言と libc の機械照合の方式（dev-dependencies のみ・const 評価。適用状況・CI での評価箇所。#1838・#1837・MVM-4・REPAIR-7・REPAIR-12）

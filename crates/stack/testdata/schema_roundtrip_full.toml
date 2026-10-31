@@ -1,0 +1,74 @@
+# STACK-1・TASK-149.5（#587）の往復用の合成フィクスチャ。全型の全フィールドを埋める。値はすべてダミー。
+[project]
+name = "roundtrip"
+
+[services.web]
+image = "example/web:1"
+command = ["serve", "--port=8080"]
+entrypoint = ["/entry"]
+env_files = [".env", "./extra.env"]
+ports = ["8080:80"]
+networks = ["backend"]
+volumes = ["models:/models:ro"]
+restart = "on-failure:3"
+secrets = ["api_key"]
+configs = ["app"]
+shm_size = "64m"
+tmpfs = ["/run:size=64m"]
+devices = ["nvidia.com/gpu=all"]
+profiles = ["dev", "gpu"]
+
+[services.web.env]
+MODE = "dummy"
+LEVEL = "debug"
+
+[services.web.depends_on]
+db = "started"
+cache = "healthy"
+migrate = "completed"
+
+[services.web.labels]
+tier = "front"
+
+[services.web.ulimits]
+nofile = "65536:65536"
+nproc = "-1"
+
+[services.web.healthcheck]
+test = ["CMD", "true"]
+interval = "30s"
+timeout = "5s"
+retries = 3
+start_period = "10s"
+
+[services.web.deploy.resources.limits]
+cpus = "2.5"
+memory = "512M"
+
+[services.web.deploy.resources.reservations]
+devices = ["nvidia.com/gpu=0"]
+
+[services.worker]
+command = []
+entrypoint = []
+
+[services.worker.healthcheck]
+test = []
+
+[services.worker.deploy]
+
+[networks.backend]
+driver = "bridge"
+external = false
+
+[volumes.models]
+driver = "io-share"
+external = true
+
+[secrets.api_key]
+file = "./secrets/api_key"
+external = false
+
+[configs.app]
+file = "./app.conf"
+external = true

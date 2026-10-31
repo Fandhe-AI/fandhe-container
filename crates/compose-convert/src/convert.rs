@@ -266,6 +266,8 @@ fn string_items(
             }
             out
         }
+        // 値なしのキー（YAML null）は「項目なし」。convert_argv・convert_kv と同じく drop に数えない。
+        ComposeValue::Null => Vec::new(),
         _ => {
             drops.note(path);
             Vec::new()
@@ -615,6 +617,18 @@ mod tests {
         let (s, d, _) = svc("    command: '\"\"'\n    entrypoint: ['']\n");
         assert_eq!(s.command, Some(strs(&[""])));
         assert_eq!(s.entrypoint, Some(strs(&[""])));
+        assert!(d.is_empty());
+    }
+
+    /// STACK-3: 値なしのキー（null）は項目なしで、drop に数えない。
+    #[test]
+    fn stack3_null_lists_are_empty_without_drops() {
+        let (s, d, _) = svc("    ports:\n    volumes:\n    env_file:\n    tmpfs:\n    profiles:\n");
+        assert!(s.ports.is_empty());
+        assert!(s.volumes.is_empty());
+        assert!(s.env_files.is_empty());
+        assert!(s.tmpfs.is_empty());
+        assert!(s.profiles.is_empty());
         assert!(d.is_empty());
     }
 

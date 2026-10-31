@@ -200,3 +200,23 @@ devices = ["nvidia.com/gpu=all"]
         parsed
     );
 }
+
+/// STACK-6・TASK-153.1（#609）: container_name・working_dir を公開パスから読み、往復し、型違いを拒否する。
+#[test]
+fn stack_6_public_api_container_name_and_working_dir() {
+    let doc = "[services.s]\ncontainer_name = \"fixed\"\nworking_dir = \"/srv/app\"\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.container_name.as_deref(), Some("fixed"));
+    assert_eq!(s.working_dir.as_deref(), Some("/srv/app"));
+    let out = toml::to_string(&t).unwrap();
+    assert!(out.contains("container_name = \"fixed\""), "{out}");
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ncontainer_name = 1\n",
+        "[services.s]\nworking_dir = [\"/a\"]\n",
+        "[services.s]\nworkdir = \"/a\"\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
+}

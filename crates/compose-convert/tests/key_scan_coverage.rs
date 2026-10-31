@@ -66,7 +66,7 @@ fn stack3_synthetic_fixtures_cover_four_classes() {
 #[test]
 fn stack3_key_paths_spot_check() {
     let o = scan(COVERAGE);
-    let cases: [(&str, KeyClass, u64); 9] = [
+    let cases: [(&str, KeyClass, u64); 10] = [
         ("services.*", KeyClass::Convert, 2),
         ("services.*.image", KeyClass::Convert, 2),
         ("services.*.network_mode", KeyClass::ErrorIncompatible, 2),
@@ -74,6 +74,7 @@ fn stack3_key_paths_spot_check() {
         ("x-common", KeyClass::Warning, 1),
         ("version", KeyClass::Warning, 1),
         ("profiles", KeyClass::ErrorUnsupportedYet, 1),
+        ("services.*.container_name", KeyClass::Convert, 1),
         (
             "services.*.deploy.resources.reservations.devices",
             KeyClass::Convert,

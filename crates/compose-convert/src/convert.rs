@@ -27,6 +27,8 @@ pub const MAX_LIST_ITEMS: usize = 4096;
 const P_NAME: &str = "name";
 const P_SERVICE: &str = "services.*";
 const P_IMAGE: &str = "services.*.image";
+const P_CONTAINER_NAME: &str = "services.*.container_name";
+const P_WORKING_DIR: &str = "services.*.working_dir";
 const P_COMMAND: &str = "services.*.command";
 const P_ENTRYPOINT: &str = "services.*.entrypoint";
 const P_ENVIRONMENT: &str = "services.*.environment";
@@ -60,6 +62,8 @@ pub const DROP_KEY_PATHS: &[&str] = &[
     P_NAME,
     P_SERVICE,
     P_IMAGE,
+    P_CONTAINER_NAME,
+    P_WORKING_DIR,
     P_COMMAND,
     P_ENTRYPOINT,
     P_ENVIRONMENT,
@@ -460,6 +464,10 @@ pub fn convert_service(service: &ComposeValue, drops: &mut ValueDrops) -> Servic
     for (key, v) in map.iter() {
         match key {
             "image" => out.image = convert_nonempty_string(v, P_IMAGE, drops),
+            "container_name" => {
+                out.container_name = convert_nonempty_string(v, P_CONTAINER_NAME, drops)
+            }
+            "working_dir" => out.working_dir = convert_nonempty_string(v, P_WORKING_DIR, drops),
             "command" => out.command = convert_argv(v, P_COMMAND, drops),
             "entrypoint" => out.entrypoint = convert_argv(v, P_ENTRYPOINT, drops),
             "environment" => out.env = convert_kv(v, P_ENVIRONMENT, drops),
@@ -830,6 +838,46 @@ mod tests {
         assert_eq!(d.get(P_RESTART), 1);
         assert_eq!(d.get(P_SHM_SIZE), 1);
         assert_eq!(d.get(P_NETWORKS), 1);
+    }
+
+    /// STACK-6・TASK-153.1（#609）: container_name・working_dir は空でない文字列だけを受ける。
+    #[test]
+    fn stack6_container_name_and_working_dir_are_converted() {
+        let (s, d, _) = svc("    container_name: web-1\n    working_dir: /srv/app\n");
+        assert_eq!(s.container_name.as_deref(), Some("web-1"));
+        assert_eq!(s.working_dir.as_deref(), Some("/srv/app"));
+        assert!(d.is_empty());
+        let t = toml_of(&s);
+        assert!(t.contains("container_name = \"web-1\""), "{t}");
+        assert!(t.contains("working_dir = \"/srv/app\""), "{t}");
+    }
+
+    /// STACK-6・TASK-153.1（#609）: 不正な型・空文字列は出力せず drop を 1 件記録し、値は記録に載せない。
+    #[test]
+    fn stack6_invalid_container_name_and_working_dir_are_recorded() {
+        for line in [
+            "    container_name: \"\"\n",
+            "    container_name: 123\n",
+            "    container_name: [a]\n",
+        ] {
+            let (s, d, _) = svc(line);
+            assert_eq!(s.container_name, None, "{line}");
+            assert_eq!(d.get(P_CONTAINER_NAME), 1, "{line}");
+            assert_eq!(d.total(), 1, "{line}");
+        }
+        for line in [
+            "    working_dir: \"\"\n",
+            "    working_dir: {x: y}\n",
+            "    working_dir: 1.5\n",
+            "    working_dir:\n",
+        ] {
+            let (s, d, _) = svc(line);
+            assert_eq!(s.working_dir, None, "{line}");
+            assert_eq!(d.get(P_WORKING_DIR), 1, "{line}");
+            assert_eq!(d.total(), 1, "{line}");
+        }
+        let (_, d, _) = svc("    container_name: [dummy-name-marker]\n");
+        assert!(!format!("{d:?}").contains("dummy-name-marker"));
     }
 
     /// STACK-3: short syntax の 6 キーと、マッピング要素の記録（long syntax は #599 で結線済み）。

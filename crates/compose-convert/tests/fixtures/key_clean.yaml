@@ -9,6 +9,8 @@ x-meta:
 services:
   web:
     image: example.invalid/web:1
+    container_name: clean-web
+    working_dir: /srv/app
     command: ["serve"]
     environment:
       ENVMARKER_NAME: dummy

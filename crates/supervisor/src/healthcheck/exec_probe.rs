@@ -25,8 +25,9 @@
 //! # タイムアウトの層（REPAIR-5）
 //! `probe(T)` に対し helper へ渡す exec の期限は `T - min(T/5, 2s)`（[`exec_budget`]）。通常は core が期限切れの
 //! コマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる。`T` を過ぎても helper が終わらなければ
-//! SIGKILL して [`REAP_TIMEOUT`] 以内に回収し `Timeout` を返す（worker とコマンドは core の親死亡シグナルの連鎖で止まる）。
-//! 残った `exec-*` の子 cgroup は次の exec 開始時の掃除と delete 前の掃除で消える（残余）。回収できなければ zombie
+//! SIGKILL し、supervisor 側から exec 子 cgroup（`exec-<helper pid>-0`）を `cgroup.kill` して子孫ごと止めてから
+//! [`REAP_TIMEOUT`] 以内に回収し `Timeout` を返す（cancel も同じ）。1 回の読み取りは [`PUMP_BYTES_MAX`] で打ち切り、
+//! 大量出力でも期限・cancel の確認へ戻る。残った `exec-*` の子 cgroup は次の exec 開始時の掃除と delete 前の掃除で消える（残余）。回収できなければ zombie
 //! として残し `helper_reaped = false` で報告する。`cancel` はフラグを立てるだけで、probe のループが自分で止める。
 
 use std::io::Read as _;
@@ -40,8 +41,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::exec::{ExecCgroupName, remove_exec_child_cgroup};
 use fandhe_container_core::oci_runtime::LaunchedProcess;
-use fandhe_container_core::traits::{ContainerId, ErrorCode, HealthStatus, TraitError};
+use fandhe_container_core::traits::{
+    ContainerId, ErrorCode, GetStateRequest, HealthStatus, TraitError,
+};
 
 use super::HealthcheckDefinition;
 use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
@@ -61,6 +65,8 @@ pub const DIAG_LINES_MAX: u32 = 16;
 pub const DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// SIGKILL した helper の回収を待つ上限。
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(1);
+/// 強制終了した helper の exec 子 cgroup を `cgroup.kill` して空になるまで待つ上限。
+const CGROUP_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 /// probe ループの刻み（cancel・期限・終了の確認間隔）。
 const POLL_STEP: Duration = Duration::from_millis(5);
 
@@ -388,13 +394,25 @@ struct ResultSink {
     overflow: bool,
 }
 
-/// 非ブロッキングの読み取りを EOF か `WouldBlock` まで行う。EOF なら `true`。
+/// 1 回の `pump` で読む最大バイト数。コマンドが並列に大量出力しても `WouldBlock` に届かず期限・cancel の
+/// 確認へ戻れなくなることを防ぐ（REPAIR-5）。
+pub const PUMP_BYTES_MAX: usize = 64 * 1024;
+
+/// 非ブロッキングの読み取りを EOF・`WouldBlock`・[`PUMP_BYTES_MAX`] のいずれかまで行う。EOF なら `true`。
+/// 上限で打ち切った場合は `false` で戻り、呼び出し側のループが期限・cancel を確認してから再度呼ぶ。
 fn pump(stream: &mut UnixStream, mut sink: impl FnMut(&[u8])) -> bool {
     let mut buf = [0u8; 2048];
+    let mut total = 0usize;
     loop {
+        if total >= PUMP_BYTES_MAX {
+            return false;
+        }
         match stream.read(&mut buf) {
             Ok(0) => return true,
-            Ok(n) => sink(buf.get(..n).unwrap_or(&[])),
+            Ok(n) => {
+                total = total.saturating_add(n);
+                sink(buf.get(..n).unwrap_or(&[]));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
             // 読み取りの失敗は EOF 相当（これ以上読めない）。
@@ -548,6 +566,26 @@ impl ExecHealthProbe {
             .stderr(Stdio::from(stderr));
         // `Command` を drop して、子側の端の複製をこちらに残さない（EOF を受け取るため）。
         command.spawn()
+    }
+
+    /// 強制終了した helper が作った exec 子 cgroup（`exec-<helper pid>-0`。fresh な単一プロセスの最初の
+    /// `ExecCgroupName::unique()`）を、記録から導いたコンテナ cgroup 直下で `cgroup.kill` して削除する。
+    /// 失敗は無視する（残った cgroup は次回の掃除と delete 前の掃除が回収する）。待機は `CGROUP_KILL_TIMEOUT` まで。
+    fn kill_exec_cgroup(&self, helper_pid: u32) {
+        let Ok(name) = ExecCgroupName::new(&format!("exec-{helper_pid}-0")) else {
+            return;
+        };
+        let Ok(store) = crate::state::open_default_store(Some(self.target.state_root.clone()))
+        else {
+            return;
+        };
+        let Ok(record) = store.get(&GetStateRequest::new(self.target.id.clone())) else {
+            return;
+        };
+        let Some(placement) = record.cgroup() else {
+            return;
+        };
+        let _ = remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT);
     }
 
     fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
@@ -706,6 +744,10 @@ impl ExecHealthProbe {
         if !reaped {
             // 回収前の `Child` でだけ kill する（pid 再利用を避ける）。
             let _ = child.kill();
+            // helper だけの SIGKILL では worker とコマンドの子孫が残り得る（親死亡シグナルはコマンドが解除でき、
+            // fork した子孫へ継承されない）ため、supervisor 側から exec 子 cgroup を `cgroup.kill` する
+            // （SUP-4・SUP-6・REPAIR-5）。名前は helper の pid から導く。回収前の `Child` を持つ間は pid が再利用されない。
+            self.kill_exec_cgroup(child.id());
             let reap_deadline = Instant::now() + REAP_TIMEOUT;
             while Instant::now() < reap_deadline {
                 if matches!(child.try_wait(), Ok(Some(_))) {
@@ -1114,6 +1156,22 @@ mod tests {
     }
 
     /// `as_fd` が使えること（未使用 import の警告を避ける最小の確認ではなく、target が pidfd を所有していること）。
+    #[test]
+    fn repair5_2441_pump_stops_at_byte_cap_without_eof() {
+        use std::io::Write as _;
+        let (mut tx, mut rx) = UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        tx.set_nonblocking(true).unwrap();
+        // 読み手が追い付かない大量出力を作る（送信側が詰まるまで書く）。
+        let chunk = [b'x'; 4096];
+        while tx.write(&chunk).is_ok() {}
+        let mut got = 0usize;
+        let eof = pump(&mut rx, |c| got += c.len());
+        assert!(!eof);
+        assert!(got >= PUMP_BYTES_MAX, "got {got}");
+        assert!(got < PUMP_BYTES_MAX + 2048 + 1, "got {got}");
+    }
+
     #[test]
     fn sup4_2441_target_owns_its_pidfd() {
         let t = target();

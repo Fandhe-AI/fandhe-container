@@ -10,7 +10,7 @@
 //!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）・
 //!   retries / start_period の集約 [`HealthAggregator`] と `health` の反映（TASK-161.3・#496。遷移の規則は
 //!   `aggregate` サブモジュールの doc）。
-//! - 判定の本番アダプタ [`ExecHealthProbe`]（Linux。exec 専用 helper で healthcheck コマンドを実行する。#2441・SUP-4・SUP-6。
+//! - 判定の本番アダプタ `ExecHealthProbe`（Linux。exec 専用 helper で healthcheck コマンドを実行する。#2441・SUP-4・SUP-6。
 //!   方式と残余は `docs/design/healthcheck-exec-helper.md`）。
 //! - **未実装**: `monitor` / supervisor 入口への組み込み（#2953。親は #492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
 //!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。

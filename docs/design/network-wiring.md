@@ -223,7 +223,8 @@
 | FCOPT1 の ID ロック | CLI create の `prepare_options_file`、CLI delete の後始末、supervisor の `pasta_attach` の置き場所の準備、plugin-cri の `remove_stale_bounded` | create のみ net 全体（共有）。ほかはなし | 状態ストアの `@lock`（`id_is_still_deleted`）。net のロックは取らない |
 | 状態ストアの `@lock` | `FileStateStore` の各操作 | 呼び出し側による（葉） | なし |
 
- 取得箇所は `grep -rn 'lock_global_shared\|lock_global_exclusive\|lock_network\|check_pasta_definition\|acquire_lock\|BundleLock::acquire' crates` で列挙する（`crates/net` 内部と試験領域を除く）。取得箇所を増やす PR は、この表と上記の試験を更新する。依存の向きにより、葉のロックの保持中に net のロックを取れる経路は構造的に無い（net は core・supervisor に依存しない）。逆順が見つかった場合は、本表に「既知の逆順（追跡 issue）」として足し、修正は別の PR で行う。許可リストを機械判定するスクリプトは後続の課題（infra）。
+取得箇所は `grep -rn 'lock_global_shared\|lock_global_exclusive\|lock_network\|check_pasta_definition\|acquire_lock\|BundleLock::acquire' crates` で列挙する（`crates/net` 内部と試験領域を除く）。取得箇所を増やす PR は、この表と上記の試験を更新する。依存の向きにより、葉のロックの保持中に net のロックを取れる経路は構造的に無い（net は core・supervisor に依存しない）。逆順が見つかった場合は、本表に「既知の逆順（追跡 issue）」として足し、修正は別の PR で行う。許可リストを機械判定するスクリプトは後続の課題（infra）。
+
 - **理由**: CLI に特権が無くても動き、CORE-1・D-19 と整合する。
 - **却下した案**: 常駐デーモン。core の StateStore への同梱（core の型が変わり、net の状態は plugin 側も使う）。serde / toml（依存の承認が要る）。
 

@@ -803,4 +803,149 @@ nproc = "-1"
             );
         }
     }
+
+    /// 全型の全フィールドを埋めた合成フィクスチャ（STACK-1・TASK-149.5・#587）。
+    const ROUNDTRIP_FULL: &str = include_str!("../testdata/schema_roundtrip_full.toml");
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn map(v: &[(&str, &str)]) -> BTreeMap<String, String> {
+        v.iter()
+            .map(|(k, x)| ((*k).to_string(), (*x).to_string()))
+            .collect()
+    }
+
+    /// `ROUNDTRIP_FULL` の期待値。`..` を使わず全フィールドを書く。フィールドが増えたときに
+    /// コンパイルを失敗させ、フィクスチャと期待値の更新を強いるため（REPAIR-1・REPAIR-12）。
+    fn roundtrip_full_value() -> ComposeToml {
+        let web = Service {
+            image: Some("example/web:1".into()),
+            command: Some(strs(&["serve", "--port=8080"])),
+            entrypoint: Some(strs(&["/entry"])),
+            env: map(&[("MODE", "dummy"), ("LEVEL", "debug")]),
+            env_files: strs(&[".env", "./extra.env"]),
+            ports: strs(&["8080:80"]),
+            networks: strs(&["backend"]),
+            volumes: strs(&["models:/models:ro"]),
+            depends_on: BTreeMap::from([
+                ("db".into(), DependsOnCondition::Started),
+                ("cache".into(), DependsOnCondition::Healthy),
+                ("migrate".into(), DependsOnCondition::Completed),
+            ]),
+            labels: map(&[("tier", "front")]),
+            restart: Some("on-failure:3".into()),
+            secrets: strs(&["api_key"]),
+            configs: strs(&["app"]),
+            ulimits: map(&[("nofile", "65536:65536"), ("nproc", "-1")]),
+            shm_size: Some("64m".into()),
+            tmpfs: strs(&["/run:size=64m"]),
+            devices: strs(&["nvidia.com/gpu=all"]),
+            profiles: strs(&["dev", "gpu"]),
+            healthcheck: Some(Healthcheck {
+                test: Some(strs(&["CMD", "true"])),
+                interval: Some("30s".into()),
+                timeout: Some("5s".into()),
+                retries: Some(3),
+                start_period: Some("10s".into()),
+            }),
+            deploy: Some(Deploy {
+                resources: Some(DeployResources {
+                    limits: Some(ResourceLimits {
+                        cpus: Some("2.5".into()),
+                        memory: Some("512M".into()),
+                    }),
+                    reservations: Some(ResourceReservations {
+                        devices: strs(&["nvidia.com/gpu=0"]),
+                    }),
+                }),
+            }),
+        };
+        let worker = Service {
+            image: None,
+            command: Some(vec![]),
+            entrypoint: Some(vec![]),
+            env: BTreeMap::new(),
+            env_files: vec![],
+            ports: vec![],
+            networks: vec![],
+            volumes: vec![],
+            depends_on: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            restart: None,
+            secrets: vec![],
+            configs: vec![],
+            ulimits: BTreeMap::new(),
+            shm_size: None,
+            tmpfs: vec![],
+            devices: vec![],
+            profiles: vec![],
+            healthcheck: Some(Healthcheck {
+                test: Some(vec![]),
+                interval: None,
+                timeout: None,
+                retries: None,
+                start_period: None,
+            }),
+            deploy: Some(Deploy { resources: None }),
+        };
+        ComposeToml {
+            project: Some(Project {
+                name: Some("roundtrip".into()),
+            }),
+            services: BTreeMap::from([("web".into(), web), ("worker".into(), worker)]),
+            networks: BTreeMap::from([(
+                "backend".into(),
+                Network {
+                    driver: Some("bridge".into()),
+                    external: Some(false),
+                },
+            )]),
+            volumes: BTreeMap::from([(
+                "models".into(),
+                Volume {
+                    driver: Some("io-share".into()),
+                    external: Some(true),
+                },
+            )]),
+            secrets: BTreeMap::from([(
+                "api_key".into(),
+                Secret {
+                    file: Some("./secrets/api_key".into()),
+                    external: Some(false),
+                },
+            )]),
+            configs: BTreeMap::from([(
+                "app".into(),
+                Config {
+                    file: Some("./app.conf".into()),
+                    external: Some(true),
+                },
+            )]),
+        }
+    }
+
+    /// STACK-1・CLI-4・TASK-149.5（#587）: 全フィールドの合成フィクスチャで、TOML → ComposeToml → TOML の
+    /// 往復が構造体と TOML の値の両方で一致する（STACK-5 の往復検証の土台）。
+    #[test]
+    fn stack_1_full_fixture_roundtrip_matches_toml_value() {
+        let parsed: ComposeToml = toml::from_str(ROUNDTRIP_FULL).expect("fixture parses");
+        assert_eq!(parsed, roundtrip_full_value());
+
+        let text = toml::to_string(&parsed).expect("serialize");
+        let reparsed: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(reparsed, parsed, "struct mismatch; written:\n{text}");
+
+        // 出力が決定的であること。
+        assert_eq!(toml::to_string(&reparsed).expect("serialize again"), text);
+
+        // 書き出した文書が入力の文書と TOML の値として一致すること。
+        let input_value: toml::Table = toml::from_str(ROUNDTRIP_FULL).expect("table");
+        let output_value: toml::Table = toml::from_str(&text).expect("table");
+        assert_eq!(
+            output_value, input_value,
+            "toml value mismatch; written:\n{text}"
+        );
+    }
 }

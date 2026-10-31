@@ -17,8 +17,10 @@
 //!
 //! # 残余(REPAIR-3)
 //!
-//! start の手順 2c では、照合の後、pasta の起動までの間の `network rm` は防げない。pasta の定義はカーネル資源を持たないラベルのため、
-//! 分離は弱まらない(`network-wiring.md` D10)。
+//! start の手順 2c の照合から pasta の起動までの間の `network rm` は、#3529 の参照走査で閉じている(#3575)。start の最中は
+//! コンテナの状態記録と世代の一致する FCOPT1 が必ずあり、`network rm` は参照があれば(判定不能も含め)拒否する。2c の再照合は
+//! 状態ストアや文書の外部要因による消失・手作業の削除に対する多層防御である。2c は BundleLock・ID ロック・状態ストアの
+//! `@lock` のどれも持たずに net の全体の共有ロックを取る(`network-wiring.md` D10「ロックの取得箇所の棚卸し」)。
 
 use std::path::Path;
 use std::sync::Arc;

@@ -673,6 +673,55 @@ mod tests {
             }
         }
 
+        /// NET-6・NET-9・CLI-1(#3575・D10): start の予約中(Running で pid なし。手順 2c から launch の間の状態)の記録と
+        /// 世代の一致する文書がある間も、`network rm` は FAILED_PRECONDITION で拒否する。2c から pasta 起動までの窓は
+        /// #3529 の参照走査で閉じていることの照合。
+        #[test]
+        fn net6_net9_cli1_3575_rm_refused_during_start_reservation() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            add_record(&base, "c1", Some("g1"), ContainerState::Created);
+            write_doc(&base, "c1", "n1", "g1");
+            let store = open_state(&base);
+            let id = ContainerId::new("c1").expect("id");
+            let rev = store
+                .get(&GetStateRequest::new(id.clone()))
+                .expect("get")
+                .revision();
+            store
+                .update(&UpdateStateRequest::new(
+                    ContainerStatus::running(id, None),
+                    rev,
+                ))
+                .expect("reserve");
+            let (code, err) = rm_exit(&g, "n1");
+            assert_eq!(err, json("FAILED_PRECONDITION", IN_USE));
+            assert_eq!(code, 5);
+            assert_eq!(ok(&g, NetworkArgs::Ls), LS_N1);
+        }
+
+        /// NET-6・CLI-1・REPAIR-5(#3575・D10 のロック順): `network rm` は net の排他ロックの下で FCOPT1 の ID ロックを
+        /// 取らない。別の処理が ID ロックを握っていても待たずに、拒否の判定(FAILED_PRECONDITION)まで進む。
+        #[test]
+        fn net6_cli1_3575_rm_does_not_wait_on_id_lock() {
+            let base = Base::new();
+            let g = base.global();
+            ok(&g, NetworkArgs::Create("n1".into()));
+            add_record(&base, "c1", Some("g1"), ContainerState::Created);
+            write_doc(&base, "c1", "n1", "g1");
+            let store = open_state(&base);
+            let root = store.host_state_root().expect("root").to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let _id_lock =
+                options_store::acquire_lock(&root, &id, Duration::from_secs(2)).expect("id lock");
+            let started = std::time::Instant::now();
+            let (code, err) = rm_exit(&g, "n1");
+            assert_eq!(err, json("FAILED_PRECONDITION", IN_USE));
+            assert_eq!(code, 5);
+            assert!(started.elapsed() < Duration::from_secs(4));
+        }
+
         /// NET-6・NET-9・CLI-1(#3529): 参照するコンテナを delete(記録と文書を消す)すれば、rm は成功する。
         #[test]
         fn net6_net9_cli1_3529_rm_succeeds_after_referencing_container_deleted() {

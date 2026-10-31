@@ -25,8 +25,8 @@
 //! # 残余(REPAIR-3)
 //!
 //! create の定義照合から状態記録の作成までの間の窓は、create の共有ロックの保持(`create_network::with_named_definition_held`)
-//! と rm の排他ロックで閉じた(#3550。`network-wiring.md` D10)。start の手順 2c の照合から pasta の起動までの間は防げない
-//! (定義はラベルで、分離は弱まらない)。
+//! と rm の排他ロックで閉じた(#3550。`network-wiring.md` D10)。start の手順 2c の照合から pasta の起動までの間も、start の最中は状態記録と
+//! 世代の一致する文書が必ずあるため、本モジュールの走査が拒否して閉じている(#3575。判定不能は fail-closed)。
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;

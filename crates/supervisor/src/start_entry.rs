@@ -4456,6 +4456,53 @@ mod linux {
             assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         }
 
+        /// NET-6・NET-9・CLI-1・REPAIR-5(#3575・D10 のロック順): 手順 2c は net の全体ロックを待つ間、FCOPT1 の ID ロックを
+        /// 持たない(ID ロックを持ったまま net のロックを待つ逆順の経路が無いことの照合)。排他ロックを握る試験の間、
+        /// 同じ ID の ID ロックが即座に取れ、2c は期限(1 秒)で net のコードを保った `Timeout` になる。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn net6_net9_cli1_3575_step_2c_waits_on_net_lock_without_id_lock() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use crate::container_options::store as options_store;
+            use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-3575",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let id = ContainerId::new("c1").expect("id");
+            let named = ContainerOptionsDocument::default()
+                .with_network(Some("web".into()), vec![], vec![])
+                .expect("doc");
+            let net = NetworkStore::open(&root).expect("open");
+            net.create(&NetworkDefinition::pasta("web").expect("def"))
+                .expect("create");
+            // network rm の代役として全体の排他ロックを握る。
+            let _excl = net.lock_global_exclusive().expect("exclusive");
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|sc| {
+                let step = sc.spawn(|| {
+                    let logs = crate::pasta_attach::PastaLogBuffer::new();
+                    started_tx.send(()).expect("started");
+                    options_with_verified_pasta(&named, &id, &logs, &root)
+                });
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("2c started");
+                // 2c が net の待ちに入っている間も、同じ ID の ID ロックは取れる。
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let lock =
+                    options_store::acquire_lock(&root, &id, std::time::Duration::from_millis(500))
+                        .expect("2c must not hold the id lock while waiting on the net lock");
+                drop(lock);
+                let err = step.join().expect("2c thread").unwrap_err();
+                assert_eq!(err.code(), ErrorCode::Timeout);
+            });
+        }
+
         /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。
         #[test]
         fn sec4_2027_deps_without_seccomp_hub_refuse_at_step_4() {

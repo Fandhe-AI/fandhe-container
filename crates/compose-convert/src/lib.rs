@@ -5,8 +5,9 @@
 //! キー分類表（`classify`。TASK-151.2・#596・STACK-3）も実装済み。
 //! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み（bin への結線は #602）。
 //! スカラーと short syntax キーの TOML 変換（`convert`・`shell_split`。TASK-151.3.1・#864・STACK-3・MS-12）も実装済み。
-//! マッピング配列キー（long syntax）の short syntax への変換（`long_syntax`。TASK-151.3.2・#865・STACK-3）も実装済み（`convert` への結線は #864 / #598 / #599）。
-//! レポート・`error_free` は #599、bin の結線は #602、
+//! マッピング配列キー（long syntax）の short syntax への変換（`long_syntax`。TASK-151.3.2・#865・STACK-3）も実装済みで、`convert` へ結線済み（#599）。
+//! ファイル単位のレポートと `error_free` 判定（`report`。TASK-151.4・#599・STACK-3）も実装済み。
+//! キーパスの走査器（`KeyOccurrences` を埋める処理）は未実装、bin の結線は #602、
 //! depends_on・ulimits・healthcheck・deploy の変換は未実装（`ServiceConversion::unhandled` に載る。REPAIR-3）。
 //! bin は未実装を構造化して返す雛形（TASK-151.0・#1070・STACK-3）。
 //! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.3.1（#864）から。
@@ -19,6 +20,7 @@ pub mod convert;
 pub mod gpu_reservation;
 pub mod input_scan;
 pub mod long_syntax;
+pub mod report;
 pub mod shell_split;
 
 use std::io::Write;

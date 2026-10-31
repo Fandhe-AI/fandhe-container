@@ -1,0 +1,21 @@
+# STACK-6・TASK-153.4（#612）の合成 fixture。追加 6 キーだけを持つ（資格情報・実在ホスト名なし）。
+services:
+  web:
+    image: example.invalid/web:1
+    container_name: fixed-web
+    working_dir: /app
+    cap_drop: [ALL, NET_RAW]
+    security_opt:
+      - "no-new-privileges:true"
+    stdin_open: true
+    tty: false
+  worker:
+    image: example.invalid/worker:1
+    container_name: fixed-worker
+    working_dir: /srv
+    cap_drop:
+      - CHOWN
+    security_opt:
+      - "no-new-privileges:true"
+    stdin_open: false
+    tty: true

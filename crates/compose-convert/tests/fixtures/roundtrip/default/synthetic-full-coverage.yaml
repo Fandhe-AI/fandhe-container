@@ -1,0 +1,71 @@
+# STACK-5・TASK-152.1・#605 の既定モード用の合成フィクスチャ（PoC-16 の合成フィクスチャが元）。
+# 今の変換器で convert / warning になるキーだけで組む（error_free になる）。depends_on・ulimits・
+# healthcheck・deploy（GPU 予約を含む）・トップレベル profiles・ホストパス形の devices・マッピング形の
+# restart は value_drops または error になるため除く（REPAIR-3。変換器へ結線されたら足す）。値はダミーのみ。
+version: "3.9"
+name: roundtrip-sample
+
+x-meta:
+  owner: nobody
+
+services:
+  web:
+    image: example.invalid/web:1
+    container_name: rt-web
+    working_dir: /srv/app
+    command: ["serve", "--port", "80"]
+    entrypoint: /bin/sh -c "exec app"
+    environment:
+      ROLE: frontend
+      MODE: dummy
+    labels:
+      - "tier=front"
+      - "replicas=2"
+    env_file:
+      - ./web.env
+    ports:
+      - "8080:80"
+      - target: 443
+        published: 8443
+        protocol: tcp
+    volumes:
+      - "data:/var/data"
+      - type: bind
+        source: ./conf
+        target: /etc/app
+        read_only: true
+    secrets: [token]
+    configs: [appconf]
+    tmpfs: ["/run/cache"]
+    devices: ["nvidia.com/gpu=0"]
+    profiles: [dev]
+    networks: [front]
+    restart: unless-stopped
+    shm_size: 64m
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    x-foo: ignored
+  worker:
+    image: example.invalid/worker:2
+    command: ""
+    networks:
+      front:
+    restart: "no"
+
+networks:
+  front:
+    driver: bridge
+
+volumes:
+  data:
+    driver: local
+  shared:
+    external: true
+
+secrets:
+  token:
+    file: ./token.txt
+
+configs:
+  appconf:
+    file: ./app.conf

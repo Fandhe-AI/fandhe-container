@@ -1,0 +1,14 @@
+# STACK-5・TASK-152.1・#605 の格下げモード用。extra_hosts・platform・domainname を許す。
+name: rt-downgrade
+services:
+  api:
+    image: example.invalid/api:1
+    extra_hosts: ["db.invalid:192.0.2.1"]
+    platform: linux/amd64
+    domainname: example.invalid
+    environment:
+      LEVEL: dummy
+    networks: [back]
+networks:
+  back:
+    driver: bridge

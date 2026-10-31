@@ -1,11 +1,12 @@
-//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・TASK-149.4.1・#862・REPAIR-12）。
+//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・TASK-149.4.1・#862・TASK-149.4.2・#863・REPAIR-12）。
 //!
 //! 6 テーブル（project・services・networks・volumes・secrets・configs）の読み込みと、
 //! 書き出し・再読み込みの往復を具体値で照合する。parse / serialize の公開入口は
 //! 後続のため、`toml` を直接使う。
 
 use fandhe_container_stack::schema::{
-    ComposeToml, Config, DependsOnCondition, Network, Project, Secret, Service, Volume,
+    ComposeToml, Config, DependsOnCondition, Deploy, DeployResources, Healthcheck, Network,
+    Project, ResourceLimits, ResourceReservations, Secret, Service, Volume,
 };
 
 const DOC: &str = r#"
@@ -148,4 +149,54 @@ nofile = "1024:2048"
     let text = toml::to_string(&parsed).expect("serialize");
     let again: ComposeToml = toml::from_str(&text).expect("reparse");
     assert_eq!(again, parsed);
+}
+
+/// STACK-1・TASK-149.4.2(#863): 公開パスから healthcheck と入れ子の deploy.resources を読み、往復が一致する。
+#[test]
+fn stack_1_public_api_healthcheck_and_deploy_resources() {
+    let doc = r#"
+[services.gpu]
+image = "example/gpu:1"
+
+[services.gpu.healthcheck]
+test = ["/bin/check"]
+interval = "10s"
+retries = 5
+
+[services.gpu.deploy.resources.limits]
+memory = "1G"
+
+[services.gpu.deploy.resources.reservations]
+devices = ["nvidia.com/gpu=all"]
+"#;
+    let parsed: ComposeToml = toml::from_str(doc).expect("parse");
+    let svc = parsed.services.get("gpu").expect("gpu");
+    assert_eq!(
+        svc.healthcheck,
+        Some(Healthcheck {
+            test: Some(vec!["/bin/check".into()]),
+            interval: Some("10s".into()),
+            retries: Some(5),
+            ..Healthcheck::default()
+        })
+    );
+    assert_eq!(
+        svc.deploy,
+        Some(Deploy {
+            resources: Some(DeployResources {
+                limits: Some(ResourceLimits {
+                    cpus: None,
+                    memory: Some("1G".into()),
+                }),
+                reservations: Some(ResourceReservations {
+                    devices: vec!["nvidia.com/gpu=all".into()],
+                }),
+            }),
+        })
+    );
+    let text = toml::to_string(&parsed).expect("serialize");
+    assert_eq!(
+        toml::from_str::<ComposeToml>(&text).expect("reparse"),
+        parsed
+    );
 }

@@ -55,14 +55,16 @@ pub struct Project {
 
 /// `[services.<name>]` テーブル（STACK-1・TASK-149.3・#585）。
 ///
-/// 基本フィールド 10 個（TASK-149.3・#585）と拡張フィールド 8 個（restart・secrets・configs・
-/// ulimits・shm_size・tmpfs・devices・profiles。TASK-149.4.1・#862）を持つ。healthcheck・
-/// deploy.resources は TASK-149.4.2（#863）で足す。`deny_unknown_fields` のため、
-/// 未定義のキー（未追加の拡張フィールドと typo）は今も拒否する（fail-closed）。
+/// 基本フィールド 10 個（TASK-149.3・#585）、拡張フィールド 8 個（restart・secrets・configs・
+/// ulimits・shm_size・tmpfs・devices・profiles。TASK-149.4.1・#862）、`healthcheck` と
+/// `deploy.resources`（TASK-149.4.2・#863）を持つ。`deny_unknown_fields` のため、
+/// 未定義のキー（typo を含む）は今も拒否する（fail-closed）。
 ///
 /// 値は検証しない。`env_files`・`volumes` のホスト側パス（`..`・symlink を含む範囲外参照）、
 /// `ports`、`image` の参照形式の検証と、`command` / `entrypoint` をシェルへ連結せず配列のまま
 /// exec へ渡すことは、読み込み側（parse の入口・`up`〔TASK-155〕・supervisor）の責務である。
+/// `healthcheck` の時間文字列・`retries` の検証は supervisor の `HealthcheckDefinition::parse`（SUP-4）、
+/// `deploy.resources` の `cpus`・`memory`・CDI 名の検証は `up`（TASK-155）と gpu 側の責務である。
 /// 空のコレクションは「キーが無い」と同じ意味のため出力から省く。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +148,91 @@ pub struct Service {
     /// 空は「常に対象」を意味する。トップレベルの `profiles` は置かない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
+    /// ヘルスチェック定義（STACK-1・TASK-149.4.2・#863）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
+    /// `[services.<name>.deploy]`（STACK-1・TASK-149.4.2・#863。`resources` のみ）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<Deploy>,
+}
+
+/// `[services.<name>.healthcheck]`（STACK-1・CLI-4・TASK-149.4.2・#863）。
+///
+/// supervisor の healthcheck 定義（SUP-4。`crates/supervisor/src/healthcheck.rs`）へ写す前段の
+/// 未検証の型で、`up`（TASK-155）が結線する。時間は文字列のまま持ち、解釈と範囲検査は
+/// supervisor の `HealthcheckDefinition::parse` が行う。`retries` は supervisor に合わせて
+/// 符号付き整数で受け、負値の拒否も supervisor の構造化エラーに任せる。
+/// `test` は argv の配列のみ（compose の文字列形・`CMD` / `CMD-SHELL` / `NONE` の正規化は変換器
+/// 〔TASK-151〕の責務）で、シェルへ連結しない。`disable`・`start_interval` は表現先が無く拒否する。
+/// `test` に資格情報が入りうるため `{:?}` をログ・エラーに出さない。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Healthcheck {
+    /// 実行する argv。`command` と同じく `Option` にして `[]` とキー無しの違いを往復で保つ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<Vec<String>>,
+    /// 実行間隔（時間文字列。例: `30s`。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// 1 回の実行の期限（時間文字列。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// unhealthy と判定する連続失敗回数（未検証。負値も型の段階では受ける）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<i64>,
+    /// 起動直後に失敗を数えない猶予（時間文字列。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_period: Option<String>,
+}
+
+/// `[services.<name>.deploy]`。STACK-1 の範囲は `resources` だけで、`placement`・`replicas` 等は
+/// 足さず拒否する（TASK-149.4.2・#863）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deploy {
+    /// リソースの上限と予約。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<DeployResources>,
+}
+
+/// `[services.<name>.deploy.resources]`（STACK-1・TASK-149.4.2・#863）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployResources {
+    /// 上限（`limits`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ResourceLimits>,
+    /// 予約（`reservations`。STACK-1 の範囲は GPU の `devices` だけ）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservations: Option<ResourceReservations>,
+}
+
+/// `deploy.resources.limits`。`pids` 等は範囲外で拒否する。値は未検証（検証は `up`・TASK-155）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLimits {
+    /// CPU 上限（文字列のまま。例: `2.5`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
+    /// メモリ上限（文字列のまま。例: `512M`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+}
+
+/// `deploy.resources.reservations`（STACK-1・STACK-9）。
+///
+/// TASK-156（`crates/compose-convert` の GPU 予約変換）が変換結果を書く先である。
+/// `cpus`・`memory`・`generic_resources` は範囲外で拒否する。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceReservations {
+    /// 予約する GPU 等の CDI 完全修飾名（例: `nvidia.com/gpu=0`）。
+    ///
+    /// compose の構造（driver・count・device_ids・capabilities）は持たず、`count: N` 等を一意な
+    /// CDI 名へ決める規則は変換側（STACK-9・TASK-156）にある。stack は文字列を解釈・検証しない。
+    /// `Service.devices`（#862）とは別のフィールドで、GPU 予約の出力先はこちらである。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 impl Service {
@@ -337,6 +424,131 @@ file = "./app.conf"
             depends_on: BTreeMap::from([("db".into(), DependsOnCondition::Healthy)]),
             labels: BTreeMap::from([("tier".into(), "front".into())]),
             ..Service::default()
+        }
+    }
+
+    const HC_DEPLOY: &str = r#"
+[services.web]
+image = "example/web:1"
+
+[services.web.healthcheck]
+test = ["/bin/check", "--quick"]
+interval = "30s"
+timeout = "5s"
+retries = 3
+start_period = "10s"
+
+[services.web.deploy.resources.limits]
+cpus = "2.5"
+memory = "512M"
+
+[services.web.deploy.resources.reservations]
+devices = ["nvidia.com/gpu=0", "nvidia.com/gpu=all"]
+"#;
+
+    /// STACK-1・TASK-149.4.2(#863): healthcheck の 5 フィールドが具体値で読める。
+    #[test]
+    fn stack_1_healthcheck_fields_parse() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let svc = doc.services.get("web").expect("web");
+        assert_eq!(
+            svc.healthcheck,
+            Some(Healthcheck {
+                test: Some(vec!["/bin/check".into(), "--quick".into()]),
+                interval: Some("30s".into()),
+                timeout: Some("5s".into()),
+                retries: Some(3),
+                start_period: Some("10s".into()),
+            })
+        );
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): deploy.resources の入れ子と reservations.devices に届く。
+    #[test]
+    fn stack_1_deploy_resources_nested_parse() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let svc = doc.services.get("web").expect("web");
+        assert_eq!(
+            svc.deploy,
+            Some(Deploy {
+                resources: Some(DeployResources {
+                    limits: Some(ResourceLimits {
+                        cpus: Some("2.5".into()),
+                        memory: Some("512M".into()),
+                    }),
+                    reservations: Some(ResourceReservations {
+                        devices: vec!["nvidia.com/gpu=0".into(), "nvidia.com/gpu=all".into()],
+                    }),
+                }),
+            })
+        );
+        let devices = &svc
+            .deploy
+            .as_ref()
+            .and_then(|d| d.resources.as_ref())
+            .and_then(|r| r.reservations.as_ref())
+            .expect("reservations")
+            .devices;
+        assert_eq!(devices.len(), 2);
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): 往復が一致し決定的で、空テーブルの Some も保たれる。
+    #[test]
+    fn stack_1_healthcheck_deploy_roundtrip() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let text = toml::to_string(&doc).expect("serialize");
+        let again: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(again, doc);
+        assert_eq!(toml::to_string(&again).expect("serialize"), text);
+
+        let empty = Service {
+            healthcheck: Some(Healthcheck::default()),
+            deploy: Some(Deploy::default()),
+            ..Service::default()
+        };
+        let text = toml::to_string(&empty).expect("serialize");
+        let back: Service = toml::from_str(&text).expect("reparse");
+        assert_eq!(back, empty);
+        assert_eq!(toml::to_string(&Service::default()).expect("serialize"), "");
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): `test = []` は Some(空)、キー無しは None。
+    #[test]
+    fn stack_1_healthcheck_test_empty_list_preserved() {
+        let hc: Healthcheck = toml::from_str("test = []").expect("parse");
+        assert_eq!(hc.test, Some(vec![]));
+        assert!(
+            toml::to_string(&hc)
+                .expect("serialize")
+                .contains("test = []")
+        );
+        let none: Healthcheck = toml::from_str("").expect("parse");
+        assert_eq!(none.test, None);
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): retries は符号付きで受ける(拒否は supervisor の parse の責務)。
+    #[test]
+    fn stack_1_healthcheck_retries_signed() {
+        let hc: Healthcheck = toml::from_str("retries = -1").expect("parse");
+        assert_eq!(hc.retries, Some(-1));
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): 範囲外のキー・typo・形の違う値は拒否する(fail-closed)。
+    #[test]
+    fn stack_1_healthcheck_deploy_reject_unknown_keys() {
+        let bad = [
+            "[healthcheck]\nintreval = \"1s\"\n",
+            "[healthcheck]\ndisable = true\n",
+            "[healthcheck]\nstart_interval = \"1s\"\n",
+            "[deploy]\nplacement = {}\n",
+            "[deploy]\nreplicas = 2\n",
+            "[deploy.resources.limits]\npids = 10\n",
+            "[deploy.resources.reservations]\ncpus = \"1\"\n",
+            "[deploy.resources.reservations]\ndevices = \"nvidia.com/gpu=all\"\n",
+            "[deploy.resources.reservations]\ndevices = [{ driver = \"nvidia\" }]\n",
+        ];
+        for doc in bad {
+            assert!(toml::from_str::<Service>(doc).is_err(), "accepted: {doc}");
         }
     }
 

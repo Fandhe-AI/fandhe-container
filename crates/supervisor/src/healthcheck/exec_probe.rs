@@ -1,0 +1,1122 @@
+//! healthcheck コマンドを exec 専用 helper で実行する `HealthProbe` の本番アダプタ（SUP-4・SUP-6・SEC-1・SEC-4・REPAIR-5・#2441）。
+//!
+//! # 役割と呼び出し文脈
+//! 周期実行エンジン [`run_periodic`](super::run_periodic) の `HealthProbe::probe` として、probe のたびに
+//! `/proc/self/exe healthcheck-exec ...`（本体は [`super::exec_helper`]）を単一スレッドの別プロセスとして起動する。
+//! helper は exec 共通関数（`exec::run_command_with_pidfd_output`。TASK-163・SUP-6）で healthcheck コマンドを
+//! 稼働中コンテナの中で実行し、結果を 1 行（[`super::exec_wire`]）で返す。本アダプタは結果を `Healthy` / `Unhealthy` に
+//! 写す（`health_from_exec_exit`）。`probe` は `ProbeRunner` が作る一時スレッドの上で呼ばれるため、supervisor 本体は
+//! 多スレッドのまま、setns を伴う exec だけが `Threads: 1` の helper で動く（判断記録は
+//! `docs/design/healthcheck-exec-helper.md`）。
+//!
+//! # 結線の範囲（REPAIR-3）
+//! 本モジュールは判定の実装まで。monitor / supervisor 入口への `run_periodic` の結線、restart の quiesce の参加者への
+//! 登録、restart での付け替え（アダプタは 1 起動世代につき 1 つ作り、restart で作り直す前提）は #2953 が担う。
+//! argv[0] の PATH 解決と timeout 上限の見直しは #2439（オーナー判断待ち）で、それまでは argv[0] を絶対パスに限り、
+//! 60 秒超の timeout は既存の拒否のまま。
+//!
+//! # 出力の扱い（stdout / stderr）
+//! コマンドの stdout / stderr は結合した 1 本で、先頭 [`OUTPUT_CAP`] バイトだけを [`HealthExecReport::output`] に保持し、
+//! 超えた分は読み捨てて合計バイト数と `truncated` を数える。`state.json`（`health` は列挙のまま）にも構造化ログ
+//! （`healthcheck_exec`）にも **本文は載せない**（秘密情報・ログ注入・command の中身を出さない方針）。ログに出すのは
+//! バイト数と `truncated` だけ。本文は [`ExecHealthProbe::last_report`] 経由で後続（inspect・#2953）が読み、
+//! 表示する場合は [`HealthExecReport::output_escaped`] を使う。`TraitError` のメッセージには本文を入れない。
+//!
+//! # タイムアウトの層（REPAIR-5）
+//! `probe(T)` に対し helper へ渡す exec の期限は `T - min(T/5, 2s)`（[`exec_budget`]）。通常は core が期限切れの
+//! コマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる。`T` を過ぎても helper が終わらなければ
+//! SIGKILL して [`REAP_TIMEOUT`] 以内に回収し `Timeout` を返す（worker とコマンドは core の親死亡シグナルの連鎖で止まる）。
+//! 残った `exec-*` の子 cgroup は次の exec 開始時の掃除と delete 前の掃除で消える（残余）。回収できなければ zombie
+//! として残し `helper_reaped = false` で報告する。`cancel` はフラグを立てるだけで、probe のループが自分で止める。
+
+use std::io::Read as _;
+use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt as _;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use fandhe_container_core::oci_runtime::LaunchedProcess;
+use fandhe_container_core::traits::{ContainerId, ErrorCode, HealthStatus, TraitError};
+
+use super::HealthcheckDefinition;
+use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
+use super::exec_wire::{HealthExecLine, LINE_MAX};
+use crate::health::HealthProbe;
+use crate::run::MAX_POLL_INTERVAL;
+
+/// 保持するコマンド出力の上限（Docker の Output の上限に倣った本実装の判断）。
+pub const OUTPUT_CAP: usize = 4096;
+/// 結果ストリームの読み取りの上限。超えたら helper の異常として扱う。
+pub const RESULT_STREAM_CAP: usize = 32 * 1024;
+/// helper の診断行として転送する 1 行の最大バイト数。
+pub const DIAG_LINE_MAX: usize = 1024;
+/// 転送する診断行の最大本数。
+pub const DIAG_LINES_MAX: u32 = 16;
+/// helper の終了後に出力・結果の EOF を待つ猶予（子孫が書き込み端を持ち続けても待ち続けない）。
+pub const DRAIN_GRACE: Duration = Duration::from_millis(100);
+/// SIGKILL した helper の回収を待つ上限。
+pub const REAP_TIMEOUT: Duration = Duration::from_secs(1);
+/// probe ループの刻み（cancel・期限・終了の確認間隔）。
+const POLL_STEP: Duration = Duration::from_millis(5);
+
+/// healthcheck の exec 先（対象コンテナの識別と、起動時の pidfd の複製）。
+///
+/// restart で pid1 が変わるたびに作り直す（旧世代の pidfd は旧 pid1 を指す）。helper は記録 pid と pidfd の一致を
+/// core が照合し、不一致は違反として拒否する（SEC-1）。
+#[derive(Debug)]
+pub struct HealthExecTarget {
+    state_root: PathBuf,
+    id: ContainerId,
+    pid: NonZeroU32,
+    pidfd: OwnedFd,
+}
+
+impl HealthExecTarget {
+    /// 明示の値から作る。
+    pub fn new(state_root: PathBuf, id: ContainerId, pid: NonZeroU32, pidfd: OwnedFd) -> Self {
+        Self {
+            state_root,
+            id,
+            pid,
+            pidfd,
+        }
+    }
+
+    /// 起動ハンドルから作る。pidfd を持たない実装（未対応カーネル・seccomp・起動ハンドルなし）は
+    /// `FailedPrecondition` で拒否する（記録 pid への縮退はしない。fail-closed）。
+    pub fn from_launched(
+        state_root: PathBuf,
+        id: ContainerId,
+        process: &dyn LaunchedProcess,
+    ) -> Result<Self, TraitError> {
+        let pidfd = process
+            .launch_pidfd()
+            .ok_or_else(|| {
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the launched process has no pidfd; cannot run healthcheck exec",
+                )
+            })?
+            .try_clone_to_owned()
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to duplicate the launch pidfd for healthcheck exec",
+                )
+            })?;
+        Ok(Self::new(state_root, id, process.pid(), pidfd))
+    }
+}
+
+/// 1 回の probe の分類（構造化ログの `result`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HealthExecOutcome {
+    /// 終了コード 0。
+    Healthy,
+    /// 終了コード非 0 またはシグナル終了。
+    Unhealthy,
+    /// コマンドが起動しなかった（`SetupFailed`）。
+    NotStarted,
+    /// exec の通しが拒否・失敗した。
+    Failed,
+    /// helper の前提検査の不一致。
+    Stale,
+    /// 期限切れ（exec の期限または supervisor 側の絶対期限）。
+    Timeout,
+    /// `cancel` により打ち切った。
+    Cancelled,
+    /// helper の起動失敗・結果行の欠落や不正・異常終了。
+    HelperError,
+}
+
+impl HealthExecOutcome {
+    /// 構造化ログの固定語彙。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+            Self::NotStarted => "not_started",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::HelperError => "helper_error",
+        }
+    }
+}
+
+/// 1 回の probe の報告（`ExecHealthProbe::last_report` と observer が読む）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HealthExecReport {
+    /// 分類。
+    pub outcome: HealthExecOutcome,
+    /// helper の結果行（復号できたとき）。
+    pub line: Option<HealthExecLine>,
+    /// コマンド出力の先頭 [`OUTPUT_CAP`] バイトまで。**untrusted**（表示は [`Self::output_escaped`]）。
+    pub output: Vec<u8>,
+    /// コマンド出力の合計バイト数（読み捨てた分を含む）。
+    pub output_total_bytes: u64,
+    /// 出力が上限を超えて読み捨てられたか。
+    pub output_truncated: bool,
+    /// probe の所要時間。
+    pub elapsed: Duration,
+    /// helper を回収できたか（`false` は zombie が残っている）。
+    pub helper_reaped: bool,
+    /// stderr sink へ転送した helper の診断行数。
+    pub diag_forwarded: u32,
+    /// 捨てた診断行・不正な行の数。
+    pub diag_dropped: u32,
+}
+
+impl HealthExecReport {
+    /// 制御文字と非 ASCII をエスケープした表示用の文字列（ログ注入を防ぐ。バイト単位で `\xNN`）。
+    pub fn output_escaped(&self) -> String {
+        let mut out = String::with_capacity(self.output.len());
+        for &b in &self.output {
+            match b {
+                b'\n' => out.push_str("\\n"),
+                b'\t' => out.push_str("\\t"),
+                b'\\' => out.push_str("\\\\"),
+                0x20..=0x7e => out.push(char::from(b)),
+                _ => out.push_str(&format!("\\x{b:02x}")),
+            }
+        }
+        out
+    }
+}
+
+/// probe の報告の通知先（構造化ログ。REPAIR-4）。
+pub trait HealthExecObserver: Send + Sync {
+    /// probe ごとに 1 回、結果を返す直前に呼ばれる。
+    fn observe(&self, container: &ContainerId, report: &HealthExecReport);
+}
+
+/// 既定の observer: `healthcheck_exec` の JSON 1 行を stderr sink へ待たずに出す。固定キーだけで、コマンド・
+/// 出力の本文・パスは載せない（バイト数と `truncated` のみ）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StderrHealthExecObserver;
+
+impl HealthExecObserver for StderrHealthExecObserver {
+    fn observe(&self, container: &ContainerId, report: &HealthExecReport) {
+        let _ = crate::stderr_sink::stderr().emit(log_line(container, report).into_bytes());
+    }
+}
+
+/// `healthcheck_exec` の JSON 1 行（改行つき）。
+pub fn log_line(container: &ContainerId, report: &HealthExecReport) -> String {
+    let mut line = format!(
+        "{{\"component\":\"supervisor.healthcheck\",\"operation\":\"healthcheck_exec\",\"container\":\"{}\",\"result\":\"{}\"",
+        escape_json(container.as_str()),
+        report.outcome.as_str()
+    );
+    match report.line {
+        Some(HealthExecLine::Exited {
+            code,
+            audit,
+            exit_audit,
+            ..
+        }) => {
+            line.push_str(&format!(
+                ",\"exit_code\":{code},\"audit\":\"{}\",\"exit_audit\":\"{}\"",
+                audit.as_str(),
+                exit_audit.as_str()
+            ));
+        }
+        Some(HealthExecLine::Signaled {
+            signal,
+            audit,
+            exit_audit,
+        }) => {
+            line.push_str(&format!(
+                ",\"signal\":{signal},\"audit\":\"{}\",\"exit_audit\":\"{}\"",
+                audit.as_str(),
+                exit_audit.as_str()
+            ));
+        }
+        Some(HealthExecLine::NotStarted {
+            step, code, audit, ..
+        }) => {
+            line.push_str(&format!(
+                ",\"step\":\"{}\",\"code\":\"{}\",\"audit\":\"{}\"",
+                step.map_or("-", fandhe_container_core::exec::ExecChildStep::as_str),
+                code.as_str(),
+                audit.as_str()
+            ));
+        }
+        Some(HealthExecLine::Failed { code, audit }) => {
+            line.push_str(&format!(
+                ",\"code\":\"{}\",\"audit\":\"{}\"",
+                code.as_str(),
+                audit.as_str()
+            ));
+        }
+        Some(HealthExecLine::Stale) | Some(HealthExecLine::Invalid) | None => {}
+    }
+    line.push_str(&format!(
+        ",\"output_bytes\":{},\"output_truncated\":{},\"elapsed_ms\":{},\"helper_reaped\":{},\"diag_forwarded\":{},\"diag_dropped\":{}}}\n",
+        report.output_total_bytes,
+        report.output_truncated,
+        report.elapsed.as_millis(),
+        report.helper_reaped,
+        report.diag_forwarded,
+        report.diag_dropped
+    ));
+    line
+}
+
+fn escape_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// helper へ渡す exec の期限: `T - min(T/5, 2s)`（下限 1ms、上限 [`MAX_POLL_INTERVAL`]。ミリ秒に丸める）。
+///
+/// 通常の期限切れは core が `T` より前に `Timeout` で返せるよう、supervisor 側の絶対期限 `T` より早く設定する
+/// （本実装の判断。REPAIR-5）。
+pub fn exec_budget(timeout: Duration) -> Duration {
+    let margin = (timeout / 5).min(Duration::from_secs(2));
+    let budget = timeout.saturating_sub(margin);
+    let ms = budget.as_millis().clamp(1, MAX_POLL_INTERVAL.as_millis());
+    Duration::from_millis(u64::try_from(ms).unwrap_or(1))
+}
+
+/// 結果行を `HealthProbe::probe` の戻り値と分類へ写す（純関数。写像表は `docs/design/healthcheck-exec-helper.md`）。
+///
+/// コマンドの失敗に `FailedPrecondition` を使わない（`periodic` はそれをループの停止条件として扱う）。例外は
+/// `stale`（記録が `Running` でない・所有者の不一致）で、SUP-1 の意味どおり loop を正しく止める。
+pub fn map_line(line: HealthExecLine) -> (Result<HealthStatus, TraitError>, HealthExecOutcome) {
+    match line {
+        HealthExecLine::Exited { healthy: true, .. } => {
+            (Ok(HealthStatus::Healthy), HealthExecOutcome::Healthy)
+        }
+        HealthExecLine::Exited { .. } | HealthExecLine::Signaled { .. } => {
+            (Ok(HealthStatus::Unhealthy), HealthExecOutcome::Unhealthy)
+        }
+        HealthExecLine::NotStarted { step, .. } => {
+            let message = match step {
+                Some(step) => format!("healthcheck command did not start: {}", step.message()),
+                None => "healthcheck command did not start".to_string(),
+            };
+            (
+                Err(TraitError::new(ErrorCode::Internal, message)),
+                HealthExecOutcome::NotStarted,
+            )
+        }
+        HealthExecLine::Failed {
+            code: ErrorCode::Timeout,
+            ..
+        } => (
+            Err(TraitError::new(
+                ErrorCode::Timeout,
+                "healthcheck exec timed out",
+            )),
+            HealthExecOutcome::Timeout,
+        ),
+        HealthExecLine::Failed { code, .. } => {
+            // 実行基盤の前提不成立（rlimit・分離の記録なし・多スレッド等）は、コマンドの失敗ではなく Internal。
+            let mapped = if code == ErrorCode::FailedPrecondition {
+                ErrorCode::Internal
+            } else {
+                code
+            };
+            (
+                Err(TraitError::new(
+                    mapped,
+                    format!("healthcheck exec failed ({})", code.as_str()),
+                )),
+                HealthExecOutcome::Failed,
+            )
+        }
+        HealthExecLine::Stale => (
+            Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the healthcheck target is stale",
+            )),
+            HealthExecOutcome::Stale,
+        ),
+        HealthExecLine::Invalid => (
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "the healthcheck exec helper rejected its arguments",
+            )),
+            HealthExecOutcome::HelperError,
+        ),
+    }
+}
+
+/// 出力の保持（先頭 [`OUTPUT_CAP`] バイトと合計・切り捨ての記録）。
+#[derive(Debug, Default)]
+struct OutputSink {
+    kept: Vec<u8>,
+    total: u64,
+    truncated: bool,
+}
+
+impl OutputSink {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        let room = OUTPUT_CAP.saturating_sub(self.kept.len());
+        let take = room.min(chunk.len());
+        if let Some(head) = chunk.get(..take) {
+            self.kept.extend_from_slice(head);
+        }
+        if take < chunk.len() {
+            self.truncated = true;
+        }
+    }
+}
+
+/// 結果ストリームの保持（上限つき）。
+#[derive(Debug, Default)]
+struct ResultSink {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+/// 非ブロッキングの読み取りを EOF か `WouldBlock` まで行う。EOF なら `true`。
+fn pump(stream: &mut UnixStream, mut sink: impl FnMut(&[u8])) -> bool {
+    let mut buf = [0u8; 2048];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(n) => sink(buf.get(..n).unwrap_or(&[])),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            // 読み取りの失敗は EOF 相当（これ以上読めない）。
+            Err(_) => return true,
+        }
+    }
+}
+
+/// 結果ストリームを行に分け、結果行と診断行を仕分ける。
+struct ParsedStream {
+    result: Result<HealthExecLine, ()>,
+    forwarded: u32,
+    dropped: u32,
+}
+
+fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
+    let mut forwarded = 0u32;
+    let mut dropped = 0u32;
+    let mut results: Vec<&[u8]> = Vec::new();
+    let mut rest: &[u8] = &sink.bytes;
+    while !rest.is_empty() {
+        let (line, next, complete) = match rest.iter().position(|&b| b == b'\n') {
+            Some(i) => (
+                rest.get(..i).unwrap_or(&[]),
+                rest.get(i + 1..).unwrap_or(&[]),
+                true,
+            ),
+            None => (rest, &[][..], false),
+        };
+        rest = next;
+        if !complete {
+            // 改行で終わらない末尾は、途中で切れた行として捨てる。
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        if line.starts_with(super::exec_wire::WIRE_TAG.as_bytes()) {
+            results.push(line);
+        } else if line.starts_with(b"{\"") && line.len() <= DIAG_LINE_MAX {
+            if forwarded < DIAG_LINES_MAX {
+                let mut bytes = line.to_vec();
+                bytes.push(b'\n');
+                let _ = crate::stderr_sink::stderr().emit(bytes);
+                forwarded += 1;
+            } else {
+                dropped = dropped.saturating_add(1);
+            }
+        } else {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    let result = match results.as_slice() {
+        [one] if one.len() <= LINE_MAX && !sink.overflow => {
+            HealthExecLine::decode(one).map_err(|_| ())
+        }
+        _ => Err(()),
+    };
+    ParsedStream {
+        result,
+        forwarded,
+        dropped,
+    }
+}
+
+/// healthcheck コマンドを exec 専用 helper で実行する `HealthProbe` の本番アダプタ。
+///
+/// 1 起動世代につき 1 つ作り、restart で作り直す（pidfd・記録 pid が世代に紐づく）。同時に走る probe は 1 本で、
+/// 2 本目は `Unavailable`（`ProbeRunner` の排他に加えた多層防御）。
+pub struct ExecHealthProbe {
+    target: HealthExecTarget,
+    command: Vec<String>,
+    observer: Arc<dyn HealthExecObserver>,
+    last: Mutex<Option<HealthExecReport>>,
+    cancelled: AtomicBool,
+    busy: AtomicBool,
+}
+
+impl std::fmt::Debug for ExecHealthProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // コマンドの中身は出さない（秘密情報の漏えい防止）。
+        f.debug_struct("ExecHealthProbe")
+            .field("id", &self.target.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `busy` を必ず下ろす。
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+impl ExecHealthProbe {
+    /// 検証済みの定義と対象から作る。argv[0] が絶対パスでなければ `InvalidArgument`（PATH 探索はしない。#2439 の
+    /// 判断まで現行の拒否を保つ）。メッセージは固定で、コマンドの中身を出さない。
+    pub fn new(
+        definition: &HealthcheckDefinition,
+        target: HealthExecTarget,
+    ) -> Result<Self, TraitError> {
+        let command = definition.command().to_vec();
+        // helper と同じ規則で事前に確かめる（絶対パス・件数・サイズ・NUL）。
+        HealthExecArgs::new(
+            target.state_root.clone(),
+            target.id.clone(),
+            target.pid,
+            Duration::from_secs(1),
+            command.clone(),
+        )?;
+        Ok(Self {
+            target,
+            command,
+            observer: Arc::new(StderrHealthExecObserver),
+            last: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+        })
+    }
+
+    /// 結果の通知先を差し替える（既定は [`StderrHealthExecObserver`]）。
+    pub fn with_observer(mut self, observer: Arc<dyn HealthExecObserver>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// 直近の probe の報告（コマンド出力の上限つきの本文を含む）。
+    pub fn last_report(&self) -> Option<HealthExecReport> {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn spawn_helper(
+        &self,
+        args: &HealthExecArgs,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    ) -> std::io::Result<Child> {
+        let mut command = Command::new("/proc/self/exe");
+        command
+            .arg0(HEALTH_EXEC_ARG0)
+            .arg(HEALTH_EXEC_SUBCOMMAND)
+            .args(args.to_args())
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        // `Command` を drop して、子側の端の複製をこちらに残さない（EOF を受け取るため）。
+        command.spawn()
+    }
+
+    fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut report = HealthExecReport {
+            outcome: HealthExecOutcome::HelperError,
+            line: None,
+            output: Vec::new(),
+            output_total_bytes: 0,
+            output_truncated: false,
+            elapsed: Duration::ZERO,
+            helper_reaped: true,
+            diag_forwarded: 0,
+            diag_dropped: 0,
+        };
+        let finish = |mut report: HealthExecReport,
+                      result: Result<HealthStatus, TraitError>|
+         -> Result<HealthStatus, TraitError> {
+            report.elapsed = start.elapsed();
+            self.observer.observe(&self.target.id, &report);
+            *self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+            result
+        };
+        let helper_args = HealthExecArgs::new(
+            self.target.state_root.clone(),
+            self.target.id.clone(),
+            self.target.pid,
+            exec_budget(timeout),
+            self.command.clone(),
+        );
+        let helper_args = match helper_args {
+            Ok(args) => args,
+            Err(e) => return finish(report, Err(e)),
+        };
+        let pair = |what: &'static str| {
+            UnixStream::pair().map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    format!("failed to create the healthcheck {what} channel"),
+                )
+            })
+        };
+        let (mut out_parent, out_child) = match pair("output") {
+            Ok(p) => p,
+            Err(e) => return finish(report, Err(e)),
+        };
+        let (mut res_parent, res_child) = match pair("result") {
+            Ok(p) => p,
+            Err(e) => return finish(report, Err(e)),
+        };
+        if out_parent.set_nonblocking(true).is_err() || res_parent.set_nonblocking(true).is_err() {
+            return finish(
+                report,
+                Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to configure the healthcheck channels",
+                )),
+            );
+        }
+        let pidfd = match self.target.pidfd.try_clone() {
+            Ok(fd) => fd,
+            Err(_) => {
+                return finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to duplicate the launch pidfd",
+                    )),
+                );
+            }
+        };
+        let mut child = match self.spawn_helper(
+            &helper_args,
+            pidfd,
+            OwnedFd::from(out_child),
+            OwnedFd::from(res_child),
+        ) {
+            Ok(child) => child,
+            Err(e) => {
+                let code = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    ErrorCode::PermissionDenied
+                } else {
+                    ErrorCode::Internal
+                };
+                return finish(
+                    report,
+                    Err(TraitError::new(
+                        code,
+                        "failed to start the healthcheck exec helper",
+                    )),
+                );
+            }
+        };
+
+        let mut output = OutputSink::default();
+        let mut results = ResultSink::default();
+        let mut out_eof = false;
+        let mut res_eof = false;
+        let read_all = |out_eof: &mut bool,
+                        res_eof: &mut bool,
+                        output: &mut OutputSink,
+                        results: &mut ResultSink,
+                        out_parent: &mut UnixStream,
+                        res_parent: &mut UnixStream| {
+            if !*out_eof {
+                *out_eof = pump(out_parent, |c| output.push(c));
+            }
+            if !*res_eof && !results.overflow {
+                *res_eof = pump(res_parent, |c| {
+                    let room = RESULT_STREAM_CAP.saturating_sub(results.bytes.len());
+                    let take = room.min(c.len());
+                    if let Some(head) = c.get(..take) {
+                        results.bytes.extend_from_slice(head);
+                    }
+                    if take < c.len() {
+                        results.overflow = true;
+                    }
+                });
+            }
+        };
+
+        enum Ended {
+            Exited,
+            Timeout,
+            Cancelled,
+            WaitFailed,
+        }
+        let ended = loop {
+            read_all(
+                &mut out_eof,
+                &mut res_eof,
+                &mut output,
+                &mut results,
+                &mut out_parent,
+                &mut res_parent,
+            );
+            match child.try_wait() {
+                Ok(Some(_)) => break Ended::Exited,
+                Ok(None) => {}
+                Err(_) => break Ended::WaitFailed,
+            }
+            if self.cancelled.load(Ordering::SeqCst) {
+                break Ended::Cancelled;
+            }
+            if Instant::now() >= deadline {
+                break Ended::Timeout;
+            }
+            std::thread::sleep(POLL_STEP);
+        };
+
+        let mut reaped = matches!(ended, Ended::Exited);
+        if !reaped {
+            // 回収前の `Child` でだけ kill する（pid 再利用を避ける）。
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + REAP_TIMEOUT;
+            while Instant::now() < reap_deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(POLL_STEP);
+            }
+        }
+        // helper が終わった後、出力と結果の EOF を短い猶予だけ待つ（孤児の子孫が端を持ち続けても待たない）。
+        let drain_until = Instant::now() + DRAIN_GRACE;
+        loop {
+            read_all(
+                &mut out_eof,
+                &mut res_eof,
+                &mut output,
+                &mut results,
+                &mut out_parent,
+                &mut res_parent,
+            );
+            if (out_eof && res_eof) || Instant::now() >= drain_until {
+                break;
+            }
+            std::thread::sleep(POLL_STEP);
+        }
+
+        report.helper_reaped = reaped;
+        report.output = output.kept;
+        report.output_total_bytes = output.total;
+        report.output_truncated = output.truncated;
+
+        match ended {
+            Ended::Timeout => {
+                report.outcome = HealthExecOutcome::Timeout;
+                finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "healthcheck probe timed out",
+                    )),
+                )
+            }
+            Ended::Cancelled => {
+                report.outcome = HealthExecOutcome::Cancelled;
+                finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "healthcheck probe was cancelled",
+                    )),
+                )
+            }
+            Ended::WaitFailed => {
+                report.outcome = HealthExecOutcome::HelperError;
+                finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to wait for the healthcheck exec helper",
+                    )),
+                )
+            }
+            Ended::Exited => {
+                let parsed = parse_result_stream(&results);
+                report.diag_forwarded = parsed.forwarded;
+                report.diag_dropped = parsed.dropped;
+                match parsed.result {
+                    Ok(line) => {
+                        let (result, outcome) = map_line(line);
+                        report.line = Some(line);
+                        report.outcome = outcome;
+                        finish(report, result)
+                    }
+                    Err(()) => {
+                        report.outcome = HealthExecOutcome::HelperError;
+                        finish(
+                            report,
+                            Err(TraitError::new(
+                                ErrorCode::Internal,
+                                "the healthcheck exec helper returned no valid result",
+                            )),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl HealthProbe for ExecHealthProbe {
+    fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "a healthcheck probe is already running",
+            ));
+        }
+        let _guard = BusyGuard(&self.busy);
+        // 前回の cancel の残りで即座に打ち切らない。
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.run(timeout)
+    }
+
+    fn cancel(&self) {
+        // フラグを立てるだけ（すぐ戻る）。kill と回収は probe のループが自分で行う。
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fandhe_container_core::exec::ExecChildStep;
+    use std::os::fd::AsFd as _;
+
+    /// REPAIR-5（#2441）: exec の期限は `T - min(T/5, 2s)`。
+    #[test]
+    fn sup4_2441_exec_budget_table() {
+        assert_eq!(
+            exec_budget(Duration::from_secs(30)),
+            Duration::from_millis(28_000)
+        );
+        assert_eq!(
+            exec_budget(Duration::from_secs(5)),
+            Duration::from_millis(4_000)
+        );
+        assert_eq!(
+            exec_budget(Duration::from_secs(1)),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            exec_budget(Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(exec_budget(Duration::ZERO), Duration::from_millis(1));
+        assert_eq!(exec_budget(Duration::from_secs(600)), MAX_POLL_INTERVAL);
+    }
+
+    fn mapped(
+        line: HealthExecLine,
+    ) -> (Result<HealthStatus, (ErrorCode, String)>, HealthExecOutcome) {
+        let (result, outcome) = map_line(line);
+        (
+            result.map_err(|e| (e.code(), e.message().to_string())),
+            outcome,
+        )
+    }
+
+    /// SUP-4（#2441）: 結果行から戻り値への写像表の全行。
+    #[test]
+    fn sup4_2441_map_line_table() {
+        use super::super::exec_wire::AuditToken::Na;
+        assert_eq!(
+            mapped(HealthExecLine::Exited {
+                code: 0,
+                healthy: true,
+                audit: Na,
+                exit_audit: Na
+            }),
+            (Ok(HealthStatus::Healthy), HealthExecOutcome::Healthy)
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Exited {
+                code: 3,
+                healthy: false,
+                audit: Na,
+                exit_audit: Na
+            }),
+            (Ok(HealthStatus::Unhealthy), HealthExecOutcome::Unhealthy)
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Signaled {
+                signal: 9,
+                audit: Na,
+                exit_audit: Na
+            }),
+            (Ok(HealthStatus::Unhealthy), HealthExecOutcome::Unhealthy)
+        );
+        assert_eq!(
+            mapped(HealthExecLine::NotStarted {
+                step: Some(ExecChildStep::OpenEntrypoint),
+                code: ErrorCode::NotFound,
+                violation: false,
+                audit: Na
+            }),
+            (
+                Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "healthcheck command did not start: {}",
+                        ExecChildStep::OpenEntrypoint.message()
+                    )
+                )),
+                HealthExecOutcome::NotStarted
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::NotStarted {
+                step: None,
+                code: ErrorCode::Internal,
+                violation: false,
+                audit: Na
+            }),
+            (
+                Err((
+                    ErrorCode::Internal,
+                    "healthcheck command did not start".into()
+                )),
+                HealthExecOutcome::NotStarted
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Failed {
+                code: ErrorCode::Timeout,
+                audit: Na
+            }),
+            (
+                Err((ErrorCode::Timeout, "healthcheck exec timed out".into())),
+                HealthExecOutcome::Timeout
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Failed {
+                code: ErrorCode::FailedPrecondition,
+                audit: Na
+            }),
+            (
+                Err((
+                    ErrorCode::Internal,
+                    "healthcheck exec failed (FAILED_PRECONDITION)".into()
+                )),
+                HealthExecOutcome::Failed
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Failed {
+                code: ErrorCode::PermissionDenied,
+                audit: Na
+            }),
+            (
+                Err((
+                    ErrorCode::PermissionDenied,
+                    "healthcheck exec failed (PERMISSION_DENIED)".into()
+                )),
+                HealthExecOutcome::Failed
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Stale),
+            (
+                Err((
+                    ErrorCode::FailedPrecondition,
+                    "the healthcheck target is stale".into()
+                )),
+                HealthExecOutcome::Stale
+            )
+        );
+        assert_eq!(
+            mapped(HealthExecLine::Invalid),
+            (
+                Err((
+                    ErrorCode::Internal,
+                    "the healthcheck exec helper rejected its arguments".into()
+                )),
+                HealthExecOutcome::HelperError
+            )
+        );
+    }
+
+    fn report(output: &[u8]) -> HealthExecReport {
+        HealthExecReport {
+            outcome: HealthExecOutcome::Healthy,
+            line: Some(HealthExecLine::Exited {
+                code: 0,
+                healthy: true,
+                audit: super::super::exec_wire::AuditToken::Na,
+                exit_audit: super::super::exec_wire::AuditToken::Na,
+            }),
+            output: output.to_vec(),
+            output_total_bytes: 12_345,
+            output_truncated: true,
+            elapsed: Duration::from_millis(42),
+            helper_reaped: true,
+            diag_forwarded: 1,
+            diag_dropped: 2,
+        }
+    }
+
+    /// REPAIR-4・SEC-1（#2441）: 構造化ログは固定キーだけで、コマンド出力の本文を含まない。
+    #[test]
+    fn sup4_2441_log_line_has_fixed_keys_and_never_the_output_body() {
+        let id = ContainerId::new("web1").unwrap();
+        let secret = b"SECRET-TOKEN\n\"quote\"";
+        let line = log_line(&id, &report(secret));
+        assert_eq!(
+            line,
+            "{\"component\":\"supervisor.healthcheck\",\"operation\":\"healthcheck_exec\",\"container\":\"web1\",\"result\":\"healthy\",\"exit_code\":0,\"audit\":\"na\",\"exit_audit\":\"na\",\"output_bytes\":12345,\"output_truncated\":true,\"elapsed_ms\":42,\"helper_reaped\":true,\"diag_forwarded\":1,\"diag_dropped\":2}\n"
+        );
+        assert!(!line.contains("SECRET"));
+    }
+
+    /// REPAIR-4（#2441）: 表示用の本文は制御文字・引用符・非 ASCII をエスケープする。
+    #[test]
+    fn sup4_2441_output_escaped_neutralizes_control_bytes() {
+        assert_eq!(
+            report(b"ok\n\x1b[31m\\\xff").output_escaped(),
+            "ok\\n\\x1b[31m\\\\\\xff"
+        );
+    }
+
+    /// REPAIR-5（#2441）: 出力は先頭 4096 バイトだけを保持し、合計と切り捨てを数える。
+    #[test]
+    fn sup4_2441_output_sink_caps_and_counts() {
+        let mut sink = OutputSink::default();
+        sink.push(&[b'a'; 3000]);
+        assert!(!sink.truncated);
+        sink.push(&[b'b'; 3000]);
+        assert_eq!(sink.kept.len(), OUTPUT_CAP);
+        assert_eq!(sink.total, 6000);
+        assert!(sink.truncated);
+        assert_eq!(sink.kept.get(2999), Some(&b'a'));
+        assert_eq!(sink.kept.get(3000), Some(&b'b'));
+    }
+
+    fn sink_of(text: &str) -> ResultSink {
+        ResultSink {
+            bytes: text.as_bytes().to_vec(),
+            overflow: false,
+        }
+    }
+
+    /// SEC-1（#2441）: 結果行がちょうど 1 本で復号できるときだけ採用し、0 本・2 本・不正・上限超過は拒否する。
+    /// 診断行は JSON 形のものだけを転送し、それ以外は捨てて数える。
+    #[test]
+    fn sup4_2441_result_stream_parsing() {
+        let ok = parse_result_stream(&sink_of(
+            "{\"component\":\"x\"}\nnoise\nFCHX1 exited 0 healthy na na\n",
+        ));
+        assert!(matches!(
+            ok.result,
+            Ok(HealthExecLine::Exited { code: 0, .. })
+        ));
+        assert_eq!((ok.forwarded, ok.dropped), (1, 1));
+        let none = parse_result_stream(&sink_of("{\"a\":1}\n"));
+        assert!(none.result.is_err());
+        let two = parse_result_stream(&sink_of(
+            "FCHX1 exited 0 healthy na na\nFCHX1 exited 0 healthy na na\n",
+        ));
+        assert!(two.result.is_err());
+        let bad = parse_result_stream(&sink_of("FCHX1 exited 0 unhealthy na na\n"));
+        assert!(bad.result.is_err());
+        let partial = parse_result_stream(&sink_of("FCHX1 exited 0 healthy na na"));
+        assert!(partial.result.is_err());
+        let mut overflow = sink_of("FCHX1 exited 0 healthy na na\n");
+        overflow.overflow = true;
+        assert!(parse_result_stream(&overflow).result.is_err());
+        let many: String =
+            (0..20).map(|_| "{\"k\":1}\n").collect::<String>() + "FCHX1 exited 0 healthy na na\n";
+        let noisy = parse_result_stream(&sink_of(&many));
+        assert!(noisy.result.is_ok());
+        assert_eq!((noisy.forwarded, noisy.dropped), (16, 4));
+    }
+
+    fn definition(command: &[&str]) -> HealthcheckDefinition {
+        HealthcheckDefinition::parse(&super::super::RawHealthcheck {
+            command: command.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn target() -> HealthExecTarget {
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        HealthExecTarget::new(
+            PathBuf::from("/run/fandhe-test"),
+            ContainerId::new("web1").unwrap(),
+            NonZeroU32::new(4242).unwrap(),
+            OwnedFd::from(devnull),
+        )
+    }
+
+    /// SEC-1（#2441）: 相対の argv[0] は固定メッセージで拒否し、コマンドの中身を含めない。
+    #[test]
+    fn sup4_2441_relative_argv0_is_rejected_without_leaking_the_command() {
+        let err = ExecHealthProbe::new(
+            &definition(&["relative-secret-cmd", "--token=abc"]),
+            target(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(!err.message().contains("secret"));
+        assert!(!err.message().contains("abc"));
+        assert!(ExecHealthProbe::new(&definition(&["/bin/true"]), target()).is_ok());
+    }
+
+    /// REPAIR-5（#2441）: 同時実行の 2 本目は `Unavailable`、`cancel` は即座に戻る。
+    #[test]
+    fn sup4_2441_second_concurrent_probe_is_unavailable_and_cancel_returns() {
+        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        probe.busy.store(true, Ordering::SeqCst);
+        let err = probe.probe(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        probe.busy.store(false, Ordering::SeqCst);
+        probe.cancel();
+        assert!(probe.cancelled.load(Ordering::SeqCst));
+    }
+
+    /// `as_fd` が使えること（未使用 import の警告を避ける最小の確認ではなく、target が pidfd を所有していること）。
+    #[test]
+    fn sup4_2441_target_owns_its_pidfd() {
+        let t = target();
+        assert!(t.pidfd.as_fd().try_clone_to_owned().is_ok());
+    }
+}

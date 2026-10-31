@@ -9,7 +9,8 @@
 //! - 周期実行は [`probe_aggregate_and_record`]（retries・start_period の集約を通して書く。TASK-161.3・#496）と
 //!   [`record_starting`]（開始時の `Starting`）を使う。[`probe_and_record`] は 1 回分の素の判定と記録で、
 //!   Err で即降格・同じ値でも毎回書く従来の挙動を保つ。集約の経路は Err でも `Healthy` を retries まで保つ。
-//! - **未実装**: healthcheck コマンドの実行、`monitor` ループからの呼び出し（周期実行は `crate::healthcheck::run_periodic`・#495 で実装済み。コマンドの実行は #2441）。
+//! - **未実装**: `monitor` ループからの呼び出し（#2953）。周期実行は `crate::healthcheck::run_periodic`（#495）、コマンドの実行の本番アダプタ
+//!   `crate::healthcheck::ExecHealthProbe`（#2441。Linux）で実装済み。
 //!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
 //!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
 //!   healthcheck 定義の検証・シェル連結の禁止は [`crate::healthcheck`]（TASK-161.1）で決定済み。

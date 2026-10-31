@@ -15,6 +15,13 @@ fn main() -> std::process::ExitCode {
     if fandhe_container_supervisor::netns_holder::is_holder_invocation(first.as_deref()) {
         return fandhe_container_net::netns_holder::run_netns_holder_main(args);
     }
+    // 第 1 引数が `healthcheck-exec` なら healthcheck の exec 専用 helper へ振り分ける（SUP-4・SUP-6・#2441）。
+    // `netns-holder` と同じ位置・同じ理由（結果の返し方が違うため `run_main` の fd 検証・結果チャネルを通さない）。
+    if fandhe_container_supervisor::healthcheck::exec_helper::is_health_exec_invocation(
+        first.as_deref(),
+    ) {
+        return fandhe_container_supervisor::healthcheck::exec_helper::run_health_exec_main(args);
+    }
     fandhe_container_supervisor::start_entry::run_main(first.into_iter().chain(args))
 }
 

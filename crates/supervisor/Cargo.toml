@@ -290,3 +290,11 @@ harness = false
 name = "netns_holder_launch_userns"
 path = "tests/netns_holder_launch_userns.rs"
 harness = false
+
+# healthcheck の本番アダプタ `ExecHealthProbe` の結合試験（SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441）。
+# 同じ実行ファイルが helper の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
+# root・namespace 不要で既定のテスト集合で実行する（実コンテナへの exec は行わない。依存は不変）。
+[[test]]
+name = "healthcheck_exec_probe"
+path = "tests/healthcheck_exec_probe.rs"
+harness = false

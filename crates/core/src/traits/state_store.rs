@@ -72,12 +72,15 @@
 //! 12. [`StateRecord::launch_isolation`]（launch 時の分離の記録。コンテナの `/` の同一性と、適用した Landlock の
 //!     handled access・ルール。SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468）は、`create` で
 //!     [`CreateStateRequest::with_launch_isolation`] の指定があればその値、なければ `None` で記録する。`update` は
-//!     [`UpdateStateRequest::with_launch_isolation`] の指定があれば置き換え、なければ既存の値を引き継ぐ
-//!     （supervisor の status 更新で記録を消さないため）。**restart の再 launch は mount namespace を作り直す
-//!     （overlay なら `/` の inode も変わる）ため、再 launch の担当は必ず指定付きの `update` で記録し直す**
-//!     （しないと restart 後の exec は `/` の照合で拒否される。fail-closed）。`get` / `list` で返す。plugin 実装も
-//!     同じく往復させる。ストアは中身の正しさを判定しない（型が検証済みの値しか作らせない）。記録が無い場合の
-//!     拒否は exec 側の責務
+//!     [`UpdateStateRequest::launch_isolation_update`]（[`LaunchIsolationUpdate`] の 3 値）に従う。`Replace` は
+//!     置き換え、`Clear` は消し（`None` にする）、`Inherit`（未指定）は既存の値を引き継ぐ（supervisor の status
+//!     更新で記録を消さないため）。**restart の再 launch は mount namespace を作り直す（overlay なら `/` の inode
+//!     も変わる）ため、再 launch の担当は必ず `Replace`（記録を持つ launch）か `Clear`（記録を持たない launch。
+//!     前回の記録を残さない。#2238・CORE-2）で `update` する**（`Inherit` にすると古い記録が残り、実際の分離と
+//!     食い違う）。ストアは status や restart_count から再 launch かを推測せず、要求の指定だけに従う。
+//!     `Clear` 後の exec は記録が無いため拒否される（偽の launcher での restart に対する意図した fail-closed）。
+//!     `get` / `list` で返す。plugin 実装も同じく 3 値を往復させる。ストアは中身の正しさを判定しない
+//!     （型が検証済みの値しか作らせない）。記録が無い場合の拒否は exec 側の責務
 //! 13. [`StateRecord::image_rootfs`]（core が `create_with_image` で作って公開した rootfs の記録。bundle 相対の
 //!     経路と作成時の実体の (dev, ino)。OCI-7・OCI-5・#2378）は、`create` で
 //!     [`CreateStateRequest::with_image_rootfs`] の指定があればその値、なければ `None` で記録する。`update` は
@@ -976,6 +979,36 @@ impl CreateStateRequest {
     }
 }
 
+/// 契約 12 の `update` での launch 時の分離の記録の扱い（CORE-2・SUP-3・SUP-6・#2238）。
+///
+/// supervisor の restart の再 launch が「記録を持つ」「持たない」のどちらでも、前回の記録を残さずに
+/// 状態へ反映できるよう 3 値にしている。`Option` では「消す」を表現できなかった。
+/// ストア実装は [`Self::apply`] で更新後の値を決める。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LaunchIsolationUpdate {
+    /// 既存の値を引き継ぐ（status・health 等の更新。既定）。
+    #[default]
+    Inherit,
+    /// 指定の記録で置き換える（記録を持つ launch）。
+    Replace(LaunchIsolationRecord),
+    /// 記録を消す（記録を持たない再 launch。以後の exec は記録が無いため拒否される）。
+    Clear,
+}
+
+impl LaunchIsolationUpdate {
+    /// 更新後の記録を返す（`Replace` は指定値、`Clear` は `None`、`Inherit` は `current`）。
+    pub fn apply<'a>(
+        &'a self,
+        current: Option<&'a LaunchIsolationRecord>,
+    ) -> Option<&'a LaunchIsolationRecord> {
+        match self {
+            Self::Inherit => current,
+            Self::Replace(r) => Some(r),
+            Self::Clear => None,
+        }
+    }
+}
+
 /// [`StateStore::update`] の要求。
 ///
 /// bundle は作成後に変わらない前提のため含めない。
@@ -987,7 +1020,7 @@ pub struct UpdateStateRequest {
     supervision: Option<SupervisionState>,
     cgroup_scope: Option<CgroupScope>,
     rlimits: Option<Rlimits>,
-    launch_isolation: Option<LaunchIsolationRecord>,
+    launch_isolation: LaunchIsolationUpdate,
     explicit_stop: Option<ExplicitStop>,
 }
 
@@ -1000,7 +1033,7 @@ impl UpdateStateRequest {
             supervision: None,
             cgroup_scope: None,
             rlimits: None,
-            launch_isolation: None,
+            launch_isolation: LaunchIsolationUpdate::Inherit,
             explicit_stop: None,
         }
     }
@@ -1020,16 +1053,24 @@ impl UpdateStateRequest {
     }
 
     /// 更新後の launch 時の分離の記録を指定する（契約 12。SUP-6・TASK-163 追補・#1468）。restart の再 launch は
-    /// mount namespace を作り直すため、再 launch の担当は必ず指定して記録し直す。未指定の update は既存の値を引き継ぐ。
+    /// mount namespace を作り直すため、再 launch の担当は必ず指定して記録し直す（[`LaunchIsolationUpdate::Replace`]）。
+    /// 記録を持たない再 launch は [`Self::clear_launch_isolation`] で前の記録を消す。未指定の update は既存の値を引き継ぐ。
     #[must_use]
     pub fn with_launch_isolation(mut self, launch_isolation: LaunchIsolationRecord) -> Self {
-        self.launch_isolation = Some(launch_isolation);
+        self.launch_isolation = LaunchIsolationUpdate::Replace(launch_isolation);
         self
     }
 
-    /// 指定された launch 時の分離の記録を返す（未指定なら `None`。その場合は既存の値を引き継ぐ）。
-    pub fn launch_isolation(&self) -> Option<&LaunchIsolationRecord> {
-        self.launch_isolation.as_ref()
+    /// 既存の launch 時の分離の記録を消す（契約 12。記録を持たない再 launch 用。CORE-2・#2238）。
+    #[must_use]
+    pub fn clear_launch_isolation(mut self) -> Self {
+        self.launch_isolation = LaunchIsolationUpdate::Clear;
+        self
+    }
+
+    /// launch 時の分離の記録の扱い（引き継ぎ・置き換え・消去）を返す。ストアは [`LaunchIsolationUpdate::apply`] で解決する。
+    pub fn launch_isolation_update(&self) -> &LaunchIsolationUpdate {
+        &self.launch_isolation
     }
 
     /// 更新後の rlimit の記録を指定する（契約 11。SUP-12・TASK-169 追補・#1467）。
@@ -1421,7 +1462,10 @@ mod tests {
                 updated = updated.with_rlimits(r.clone());
             }
             // 契約 12: launch 時の分離の記録は指定があれば置き換え、なければ引き継ぐ。
-            if let Some(l) = req.launch_isolation().or(current.launch_isolation()) {
+            if let Some(l) = req
+                .launch_isolation_update()
+                .apply(current.launch_isolation())
+            {
                 updated = updated.with_launch_isolation(l.clone());
             }
             // 契約 13: core が作った rootfs の記録は update で変えずに引き継ぐ。
@@ -2013,11 +2057,32 @@ mod tests {
         assert_eq!(kept.launch_isolation(), Some(&mk(10)));
         let replaced = store
             .update(
-                &UpdateStateRequest::new(ContainerStatus::stopped(id2, Some(0)), kept.revision())
-                    .with_launch_isolation(mk(11)),
+                &UpdateStateRequest::new(
+                    ContainerStatus::stopped(id2.clone(), Some(0)),
+                    kept.revision(),
+                )
+                .with_launch_isolation(mk(11)),
             )
             .unwrap();
         assert_eq!(replaced.launch_isolation(), Some(&mk(11)));
+        // #2238: Clear は記録を消し、続く Inherit でも None のまま。
+        let cleared = store
+            .update(
+                &UpdateStateRequest::new(
+                    ContainerStatus::stopped(id2.clone(), Some(0)),
+                    replaced.revision(),
+                )
+                .clear_launch_isolation(),
+            )
+            .unwrap();
+        assert_eq!(cleared.launch_isolation(), None);
+        let still = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::stopped(id2, Some(0)),
+                cleared.revision(),
+            ))
+            .unwrap();
+        assert_eq!(still.launch_isolation(), None);
     }
 
     /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・

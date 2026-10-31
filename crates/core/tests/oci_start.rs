@@ -1031,8 +1031,7 @@ fn core2_oci5_sup6_launch_isolation_survives_and_is_replaced_across_restart_writ
         RecordedLandlockAudit::KernelAuditRequested,
     );
 
-    // 段 2: 記録を持たない再 launch のモデル（Running(8)・記録の指定なし）。現行の契約 12 は引き継ぎ。
-    // #2238 で契約が変わると、このアサーションは `None` へ反転する。
+    // 段 2: 記録を持たない再 launch のモデル（Running(8)・`clear_launch_isolation`）。契約 12（#2238）は前の記録を消す。
     let sup1 = SupervisionState::new(None, None, 1);
     let rev = got.revision();
     store
@@ -1041,12 +1040,17 @@ fn core2_oci5_sup6_launch_isolation_survives_and_is_replaced_across_restart_writ
                 ContainerStatus::running(id.clone(), NonZeroU32::new(8)),
                 rev,
             )
-            .with_supervision(sup1),
+            .with_supervision(sup1)
+            .clear_launch_isolation(),
         )
         .expect("relaunch without record");
     let got = get_record(&sd.open_store(), "it-riso");
     assert_eq!(got.status().pid(), NonZeroU32::new(8));
-    assert_eq!(got.launch_isolation(), Some(&rec1));
+    assert_eq!(got.launch_isolation(), None);
+    assert_eq!(
+        get_record(&sd.open_store(), "it-riso").launch_isolation(),
+        None
+    );
 
     // 段 3: 記録を持つ再 launch（本番 launcher のモデル）は置き換える。
     let audit2 = RecordedLandlockAudit::Unavailable { detected_abi: 5 };

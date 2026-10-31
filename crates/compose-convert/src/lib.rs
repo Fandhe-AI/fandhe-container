@@ -8,6 +8,11 @@
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// stderr への書き込み完了を待つ上限（REPAIR-5）。読み手が止まった pipe / socket でも終了コードを返すため。
+const STDERR_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 未実装時の終了コード。CLI の ERR-2 の慣行（8 = 未実装）に合わせる。core へ依存しないため値を直接書く。
 pub const UNIMPLEMENTED_EXIT_CODE: u8 = 8;
@@ -18,8 +23,29 @@ pub const UNIMPLEMENTED_JSON: &str =
 
 /// bin の入口から呼ばれる stub。引数は解釈せず、stderr へ固定文言を出して終了コード 8 を返す。
 /// stdout は将来 TOML を出す経路のため何も書かない。書き込み失敗でも panic しない（REPAIR-3）。
+/// stderr が満杯で読み手が止まっていても、書き込みは別スレッドで行い有限の期限で待つため戻れる（REPAIR-5）。
 pub fn run() -> ExitCode {
-    let _ = writeln!(std::io::stderr(), "{UNIMPLEMENTED_JSON}");
+    run_with(STDERR_WRITE_TIMEOUT, || {
+        let _ = writeln!(std::io::stderr(), "{UNIMPLEMENTED_JSON}");
+    })
+}
+
+/// `write` を別スレッドで実行し、`timeout` までだけ完了を待って終了コード 8 を返す。
+/// 期限切れ・スレッド起動失敗でも書き込みスレッドの完了は待たない（プロセス終了時に破棄される）。
+fn run_with<F>(timeout: Duration, write: F) -> ExitCode
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("compose-convert-stderr".to_string())
+        .spawn(move || {
+            write();
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(timeout);
+    }
     ExitCode::from(UNIMPLEMENTED_EXIT_CODE)
 }
 
@@ -40,5 +66,21 @@ mod tests {
         assert!(UNIMPLEMENTED_JSON.is_ascii());
         assert!(UNIMPLEMENTED_JSON.contains("\"code\":\"UNIMPLEMENTED\""));
         assert!(UNIMPLEMENTED_JSON.contains("\"message\":"));
+    }
+
+    /// REPAIR-5・REPAIR-12: 書き込みが戻らなくても期限内に終了コード 8 で戻る。
+    #[test]
+    fn blocked_writer_returns_exit_code_after_timeout() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let timeout = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let code = run_with(timeout, move || {
+            let _ = release_rx.recv();
+        });
+        let elapsed = start.elapsed();
+        assert!(elapsed >= timeout, "returned early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "too slow: {elapsed:?}");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(8)));
+        let _ = release_tx.send(());
     }
 }

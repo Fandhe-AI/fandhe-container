@@ -1,0 +1,90 @@
+# STACK-3・TASK-151.6・#601 の合成フィクスチャ（PoC-16 の synthetic-full-coverage.yml を参考にした）。
+# 4 分類（convert / warning / error-incompatible / error-unsupported-yet）のキーをすべて含み、
+# 分類表に無いキーは含まない。識別子はダミー値だけ。
+version: "3.9"
+name: coverage-sample
+
+x-common: &common
+  restart: always
+  labels:
+    tier: base
+
+services:
+  svcmarker:
+    <<: *common
+    image: example.invalid/app:1
+    command: ["run", "--flag"]
+    entrypoint: /entry.sh
+    environment:
+      ENVMARKER_NAME: dummy
+    env_file: ./app.env
+    ports: ["8080:80"]
+    networks: [front]
+    volumes:
+      - data:/var/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on: [db]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 10s
+    secrets: [token]
+    configs: [conf]
+    ulimits:
+      nofile: 1024
+    shm_size: 64m
+    tmpfs: [/run]
+    devices: ["/dev/null:/dev/null"]
+    profiles: [dev]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+      placement:
+        constraints: ["node.role==worker"]
+      replicas: 2
+    x-foo: ignored
+    build: .
+    privileged: true
+    container_name: fixed
+    hostname: host1
+    tty: true
+    network_mode: host
+    links: [db]
+    volumes_from: [db]
+  db:
+    image: example.invalid/db:1
+    network_mode: "service:svcmarker"
+
+networks:
+  front:
+    driver: bridge
+  ext:
+    external: true
+
+volumes:
+  data:
+    driver: local
+  extdata:
+    external: true
+
+secrets:
+  token:
+    file: ./token.txt
+  exttoken:
+    external: true
+
+configs:
+  conf:
+    file: ./conf.txt
+  extconf:
+    external: true
+
+profiles:
+  - dev
+include:
+  - other.yaml

@@ -7,7 +7,7 @@
 //!
 //! # 呼び出し側との契約
 //!
-//! 呼び出し側の走査器は `key_walk`（TASK-151.7・#602）。降下規則はそちらの `//!` を参照。
+//! 呼び出し側の走査器は `key_scan`（TASK-151.6・#601）。降下規則はそちらの `//!` を参照。
 //!
 //! - 引数のパスは、ユーザー定義名（サービス名・ネットワーク名・環境変数名等）を `*` にした正規形
 //!   （例 `services.*.privileged`）。この関数は正規化しない。識別子を集計に混ぜないための走査側の責務。
@@ -251,7 +251,7 @@ pub fn classify_network_mode_value(value: Option<&str>) -> KeyClass {
     }
 }
 
-/// Docker ソケットの bind mount か（D-16 の影響指標）。値は保持しない。結線は #598。
+/// Docker ソケットの bind mount か（D-16 の影響指標）。値は保持しない。結線は `crate::key_scan`（#601）。
 ///
 /// short syntax（`source:target[:mode]`）のマウント元（最初の `:` より前）がソケットのパス全体と
 /// 一致するときだけ true。マウント先だけの一致や `docker.sock.backup` のような接頭辞一致は false。

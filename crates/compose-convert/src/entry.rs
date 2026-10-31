@@ -2,7 +2,7 @@
 //!
 //! 役割: `main.rs` → [`crate::run`] から呼ばれ、入力ディレクトリの全ファイルを
 //! [`crate::input_scan::load_input_dir`] → [`crate::compose_convert::parse_compose_yaml`] →
-//! [`crate::key_walk::scan_key_occurrences`] ＋ [`crate::convert::convert_top_level`] →
+//! [`crate::key_scan::collect_key_occurrences`] ＋ [`crate::convert::convert_top_level`] →
 //! [`crate::report::FileConversionReport`] の順に処理し、[`crate::report_json`] で 1 行 JSON にして
 //! stderr 用の文字列として返す。純粋に文字列を組み立てるだけで、書き込みは [`crate::run`] が期限つきで行う。
 //!
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::compose_convert::parse_compose_yaml;
 use crate::convert::{ValueDrops, convert_top_level};
 use crate::input_scan::load_input_dir;
-use crate::key_walk::scan_key_occurrences;
+use crate::key_scan::collect_key_occurrences;
 use crate::report::FileConversionReport;
 use crate::report_json::{error_line, file_line, summary_line};
 
@@ -152,7 +152,7 @@ fn run_dir(dir: &Path) -> Outcome {
         let report = match parse_compose_yaml(input.text()) {
             Err(e) => FileConversionReport::parse_failed(e.code),
             Ok(doc) => {
-                let occ = scan_key_occurrences(&doc);
+                let occ = collect_key_occurrences(&doc);
                 let mut drops = ValueDrops::new();
                 // TOML の書き出しは未実装（REPAIR-3）。value_drops を集めるために変換だけ行う。
                 let _toml = convert_top_level(&doc, &mut drops);

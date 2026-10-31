@@ -7,7 +7,8 @@
 //! スカラーと short syntax キーの TOML 変換（`convert`・`shell_split`。TASK-151.3.1・#864・STACK-3・MS-12）も実装済み。
 //! マッピング配列キー（long syntax）の short syntax への変換（`long_syntax`。TASK-151.3.2・#865・STACK-3）も実装済みで、`convert` へ結線済み（#599）。
 //! ファイル単位のレポートと `error_free` 判定（`report`。TASK-151.4・#599・STACK-3）も実装済み。
-//! キーパスの走査器（`key_walk`）、引数解析とレポート出力（`entry`・`report_json`）、bin の結線は TASK-151.7（#602・STACK-3）で実装済み。
+//! キーパスの走査器（`key_scan`。TASK-151.6・#601・STACK-3）も実装済み。
+//! 引数解析とレポート出力（`entry`・`report_json`）、bin の結線は TASK-151.7（#602・STACK-3）で実装済み。
 //! bin は入力ディレクトリを受け取り、キー単位の変換レポート（4 分類・unrecognized の件数・`value_drops`・`downgraded`）を
 //! stderr へ 1 行 JSON で出す。stdout は将来 TOML を出す経路として空けてあり、TOML の書き出しは未実装（REPAIR-3）。
 //! `--downgrade` は TASK-182（#627）で実装するまで `UNIMPLEMENTED` で拒否する。
@@ -23,7 +24,7 @@ pub mod convert;
 pub mod entry;
 pub mod gpu_reservation;
 pub mod input_scan;
-pub mod key_walk;
+pub mod key_scan;
 pub mod long_syntax;
 pub mod report;
 pub mod report_json;

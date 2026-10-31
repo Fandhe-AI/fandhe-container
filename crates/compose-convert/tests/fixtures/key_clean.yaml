@@ -1,0 +1,27 @@
+# STACK-3・TASK-151.6・#601 の合成フィクスチャ。convert と warning のキーだけで、
+# 現状 value_drops に載る depends_on・ulimits・healthcheck・deploy を含まない（error_free になる）。
+version: "3.9"
+name: clean-sample
+
+x-meta:
+  owner: nobody
+
+services:
+  web:
+    image: example.invalid/web:1
+    command: ["serve"]
+    environment:
+      ENVMARKER_NAME: dummy
+    ports: ["8080:80"]
+    networks: [front]
+    volumes: ["data:/var/data"]
+    restart: unless-stopped
+    x-foo: ignored
+
+networks:
+  front:
+    driver: bridge
+
+volumes:
+  data:
+    driver: local

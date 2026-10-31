@@ -1018,7 +1018,8 @@ pub(crate) mod process {
     /// `SIG_DFL`（`sys/signal.h`）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     const SIG_DFL: usize = 0;
-    /// `SIG_IGN`（`sys/signal.h`）。
+    /// `SIG_IGN`（`sys/signal.h`）。使用側（試験専用の関数と libc 照合）と同じ cfg に合わせる。
+    #[cfg(any(feature = "exec-test-support", test))]
     const SIG_IGN: usize = 1;
     /// `SIG_ERR`（`sys/signal.h`。`(void (*)(int))-1`）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
@@ -1504,19 +1505,33 @@ pub(crate) mod process {
             assert_eq!(child_signal_auto_reaps(), Ok(false));
         }
 
-        /// スレッド数は 1 以上で、スレッドを足すと増える。
+        /// スレッド数は 1 以上で、自分で足したスレッド数以上になる。
+        ///
+        /// 別の試験スレッドの終了で前後比較が崩れるのを避け、自分が生成して保持しているスレッド数
+        /// （他の試験スレッドの増減に依らない下限）で判定する（REPAIR-12）。
         #[test]
         fn sec4_2429_thread_count_counts_new_thread() {
+            const HELD: u64 = 16;
             let before = current_thread_count().expect("count");
             assert!(before >= 1);
             let (tx, rx) = std::sync::mpsc::channel::<()>();
-            let h = std::thread::spawn(move || {
-                let _ = rx.recv();
-            });
+            let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+            let handles: Vec<_> = (0..HELD)
+                .map(|_| {
+                    let rx = std::sync::Arc::clone(&rx);
+                    std::thread::spawn(move || {
+                        if let Ok(g) = rx.lock() {
+                            let _ = g.recv();
+                        }
+                    })
+                })
+                .collect();
             let during = current_thread_count().expect("count");
-            assert!(during > before, "during={during} before={before}");
+            assert!(during >= HELD, "during={during} held={HELD}");
             drop(tx);
-            h.join().expect("join");
+            for h in handles {
+                h.join().expect("join");
+            }
         }
 
         /// libtest は複数スレッドのため、fork は `MultiThreaded` で拒否される（fork しない）。

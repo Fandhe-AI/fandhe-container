@@ -135,19 +135,43 @@ pub fn format_basis_points(bp: u64) -> String {
 /// ファイルごとのレポートを足していく集計器。
 #[derive(Debug, Clone, Default)]
 pub struct ConversionRateTally {
-    counts: [u64; 5],
+    counts: ClassCounts,
     value_drop_convert: u64,
     overflowed: bool,
     parse_failed: bool,
 }
 
-fn class_index(c: KeyClass) -> usize {
-    match c {
-        KeyClass::Convert => 0,
-        KeyClass::Warning => 1,
-        KeyClass::ErrorIncompatible => 2,
-        KeyClass::ErrorUnsupportedYet => 3,
-        _ => 4,
+/// 分類別の出現件数（添字を使わない名前付きフィールド）。
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassCounts {
+    convert: u64,
+    warning: u64,
+    error_incompatible: u64,
+    error_unsupported_yet: u64,
+    unrecognized: u64,
+}
+
+impl ClassCounts {
+    fn slot(&mut self, c: KeyClass) -> &mut u64 {
+        match c {
+            KeyClass::Convert => &mut self.convert,
+            KeyClass::Warning => &mut self.warning,
+            KeyClass::ErrorIncompatible => &mut self.error_incompatible,
+            KeyClass::ErrorUnsupportedYet => &mut self.error_unsupported_yet,
+            _ => &mut self.unrecognized,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        [
+            self.convert,
+            self.warning,
+            self.error_incompatible,
+            self.error_unsupported_yet,
+            self.unrecognized,
+        ]
+        .iter()
+        .fold(0u64, |a, n| a.saturating_add(*n))
     }
 }
 
@@ -166,8 +190,8 @@ impl ConversionRateTally {
             self.overflowed = true;
         }
         for (_, e) in report.key_occurrences.iter() {
-            let i = class_index(e.class);
-            self.counts[i] = self.counts[i].saturating_add(e.occurrences);
+            let slot = self.counts.slot(e.class);
+            *slot = slot.saturating_add(e.occurrences);
         }
         for (path, _) in report.value_drops.iter() {
             if let Some(e) = report.key_occurrences.get(path)
@@ -180,8 +204,8 @@ impl ConversionRateTally {
 
     /// 集計を確定する。
     pub fn finish(&self) -> ConversionRate {
-        let total = self.counts.iter().fold(0u64, |a, n| a.saturating_add(*n));
-        let convert = self.counts[0];
+        let total = self.counts.total();
+        let convert = self.counts.convert;
         let lower = convert.saturating_sub(self.value_drop_convert);
         let mut reasons = Vec::new();
         if self.overflowed {
@@ -196,10 +220,10 @@ impl ConversionRateTally {
         let incomplete = self.overflowed || self.parse_failed;
         ConversionRate {
             convert,
-            warning: self.counts[1],
-            error_incompatible: self.counts[2],
-            error_unsupported_yet: self.counts[3],
-            unrecognized: self.counts[4],
+            warning: self.counts.warning,
+            error_incompatible: self.counts.error_incompatible,
+            error_unsupported_yet: self.counts.error_unsupported_yet,
+            unrecognized: self.counts.unrecognized,
             total,
             rate_basis_points: basis_points(convert, total),
             verdict: verdict_of(convert, total, incomplete),
@@ -383,7 +407,13 @@ mod tests {
         assert!(meets(u64::MAX, u64::MAX));
         assert_eq!(basis_points(u64::MAX, u64::MAX), Some(10_000));
         let mut t = ConversionRateTally::new();
-        t.counts = [u64::MAX; 5];
+        t.counts = ClassCounts {
+            convert: u64::MAX,
+            warning: u64::MAX,
+            error_incompatible: u64::MAX,
+            error_unsupported_yet: u64::MAX,
+            unrecognized: u64::MAX,
+        };
         let out = t.finish();
         assert_eq!(out.total, u64::MAX);
     }

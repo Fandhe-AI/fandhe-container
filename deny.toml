@@ -88,4 +88,21 @@ deny = [
   { crate = "ring", reason = "C/assembly native build; TLS crypto must be rustls-graviola (#399, #1779)" },
   { crate = "cc", reason = "C/C++ native build helper; dependencies must stay pure Rust (#399, #1779)" },
   { crate = "aws-lc-rs", reason = "C/C++ native build (aws-lc-sys); TLS crypto must be rustls-graviola (#399, #1779)" },
+  # rust-vmm 系クレートの禁止（MVM-4・TASK-73.2・#686。dependency-policy.md の禁止クレート）。
+  # 一覧の正は `scripts/check-microvm-deps.sh --list` で、ここはその写し。一致と検出力は
+  # `make deny-bans-fail-closed-selftest` が機械照合する。cargo-deny は名前の完全一致で見るため、
+  # `_` 表記の path crate・repository の偽装・vendoring は check-microvm-deps.sh の照合 A（名前の正規化）と
+  # 照合 B（repository URL）が補う補完関係にある。youki・Firecracker・Cloud Hypervisor 由来は範囲外
+  # （AGENTS.md の P0 観点が担う）。範囲を広げるときは両方を同時に更新する。
+  # 解除・例外の追加は依存追加のユーザー承認とセットで行う。
+  { crate = "vm-memory", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "kvm-ioctls", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "kvm-bindings", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "vhost", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "vhost-user-backend", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "virtio-queue", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "vmm-sys-util", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "linux-loader", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "event-manager", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
+  { crate = "vm-superio", reason = "rust-vmm crate; microVM must be from scratch (MVM-4, TASK-73.2, #686)" },
 ]

@@ -149,7 +149,8 @@ on:
       repeat-user-scope:
         description: >-
           true にすると repeat-test-bin を委譲スコープ（systemd-run --user --scope -p Delegate=yes）の中で直接
-          実行する（Linux 限定。cargo を cgroup に入れると失敗する production_launcher 等用。#2886）
+          実行する（Linux 限定。cargo を cgroup に入れると失敗する production_launcher 等用。#2886）。繰り返しのステップは
+          Linux の leg だけで実行し、macOS・Windows の leg は通常どおり 3 OS で回る（#3571）
         type: boolean
         default: false
       repeat-env:

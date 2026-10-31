@@ -4,7 +4,7 @@
 //! Linux 向けの `sys.rs` とは別ファイルで、`lib.rs` が `#[cfg(target_os = "macos")]` と
 //! `#[path = "sys/macos.rs"]` で排他的に `mod sys` として取り込む。Linux の宣言（glibc / musl の
 //! 型幅・syscall 番号）は macOS に漏らさない。呼び出し元は `crate::state_store`（OCI-5・SEC-4・CLI-1。
-//! #2247）だけで、状態ルートの信頼境界の検査に必要な次の 3 点を安全な API で提供する。
+//! #2247）・`plugin_trust`・`audit_log`（追補を参照）で、状態ルートの信頼境界の検査に必要な次の 3 点を安全な API で提供する。
 //! - 実効 UID（`geteuid(2)`）
 //! - `O_NOFOLLOW | O_NONBLOCK` の値（`open_nowait` が使う）
 //! - 拡張 ACL の有無（`acl_get_link_np(3)`。symlink を辿らない）
@@ -12,6 +12,10 @@
 //! - 追補（#1864・TASK-122 追補・PLUG-11）: plugin の信頼性検証の macOS 実装（#1865）向けに、
 //!   サブモジュール `plugin_fs`（呼び出し元は `plugin_trust`〔#1865〕）が symlink 非追従の fd 相対 open・fd の実体パス取得・fd の拡張 ACL 検出を提供する
 //! - 追補（#3096・PLUG-11・SEC-1）: `plugin_fs` に `fstatat(2)` の安全なラッパーを足し、open の前に種別を確かめる
+//! - 追補（#2429・SEC-4・OCI-5）: 監査ファイルの主経路の macOS 版向けに、サブモジュール `audit_fs`
+//!   （呼び出し元は `audit_log::file_writer`。mode つきの `openat(2)`）と `process`（呼び出し元は
+//!   `audit_log::file_sink`。単一スレッド確認つき `fork(2)`・fd の列挙閉鎖・`waitpid`・`kill`・`poll`・
+//!   SIGCHLD の自動回収の検出）を足す。`process` の関数は本モジュール直下へ再公開し、Linux の `sys` と同名で呼べる
 //!
 //! # 契約
 //! - `unsafe fn` は外へ公開しない。すべての `unsafe` に `// SAFETY:` を付ける
@@ -41,7 +45,17 @@ pub(crate) enum SysError {
     // 対応アーキテクチャでは構築されないため dead_code になる。
     #[allow(dead_code)]
     Unsupported,
+    /// 呼び出しプロセスが複数スレッドである（またはスレッド数を数えられない）ため fork しなかった
+    /// （[`process::fork_single_threaded_no_flush`]。Linux の `sys::SysError::MultiThreaded` と同名・同義。fail-closed）。
+    MultiThreaded,
 }
+
+#[cfg(feature = "exec-test-support")]
+pub(crate) use process::set_child_signal_ignored_for_test;
+pub(crate) use process::{
+    ECHILD, EINTR, Signal, child_signal_auto_reaps, close_fds_from_except, current_thread_count,
+    dup_fd_at_least, fork_single_threaded_no_flush, kill_pid, poll_readable, wait_pid_nohang,
+};
 
 /// 直前の失敗の errno（取れなければ `EINVAL` に写し、成功側へは倒さない）。
 fn last_errno() -> i32 {
@@ -232,15 +246,15 @@ pub(crate) mod plugin_fs {
     /// `O_RDONLY`（`sys/fcntl.h`）。
     const O_RDONLY: c_int = 0x0000;
     /// `O_NONBLOCK`（`sys/fcntl.h`）。
-    const O_NONBLOCK: c_int = 0x0004;
+    pub(super) const O_NONBLOCK: c_int = 0x0004;
     /// `O_NOFOLLOW`（`sys/fcntl.h`）。
-    const O_NOFOLLOW: c_int = 0x0100;
+    pub(super) const O_NOFOLLOW: c_int = 0x0100;
     /// `O_NOCTTY`（`sys/fcntl.h`）。
-    const O_NOCTTY: c_int = 0x0002_0000;
+    pub(super) const O_NOCTTY: c_int = 0x0002_0000;
     /// `O_DIRECTORY`（`sys/fcntl.h`）。
     const O_DIRECTORY: c_int = 0x0010_0000;
     /// `O_CLOEXEC`（`sys/fcntl.h`）。
-    const O_CLOEXEC: c_int = 0x0100_0000;
+    pub(super) const O_CLOEXEC: c_int = 0x0100_0000;
     /// `AT_FDCWD`（`sys/fcntl.h`。Linux の -100 とは異なる）。
     const AT_FDCWD: c_int = -2;
     /// `F_GETPATH`（`sys/fcntl.h`。ファームリンクは利用者視点のパスで返す。`F_GETPATH_NOFIRMLINK` は使わない）。
@@ -352,6 +366,28 @@ pub(crate) mod plugin_fs {
         // SAFETY: `name` は NUL 終端で呼び出しの間生存する。`flags` は本モジュールの定数の組で `O_CREAT` を
         // 含まないため mode は不要。`dirfd` が無効でも `EBADF` が返るだけでメモリ安全性に影響しない。
         let fd = unsafe { openat(dirfd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        // SAFETY: `openat` が返した新しい fd で、他に所有者がいない。`OwnedFd` が唯一の所有者になる。
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `openat` の薄い包み（`O_CREAT` つき）。`mode` は新規作成時の権限で、可変長引数へ `unsigned int` として
+    /// 渡す（Darwin の `mode_t` は `u16` だが、C の可変長引数の既定昇格で `int` として積まれる。`audit_fs`
+    /// だけが使う。#2429）。
+    pub(super) fn openat_create_raw(
+        dirfd: c_int,
+        name: &CStr,
+        flags: c_int,
+        mode: u32,
+    ) -> Result<OwnedFd, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        // SAFETY: `name` は NUL 終端で呼び出しの間生存する。`flags` に `O_CREAT` を含む呼び出し側のため、可変長部に
+        // mode（`c_uint`）を 1 つ渡す。`dirfd` が無効でも `EBADF` が返るだけでメモリ安全性に影響しない。
+        let fd = unsafe { openat(dirfd, name.as_ptr(), flags, mode as std::ffi::c_uint) };
         if fd < 0 {
             return Err(SysError::Os(last_errno()));
         }
@@ -848,6 +884,664 @@ pub(crate) mod plugin_fs {
                 openat_raw(bad, &c("x"), O_RDONLY).err(),
                 Some(SysError::Os(EBADF))
             );
+        }
+    }
+}
+/// 監査ファイルの主経路（`audit_log::file_writer::open_checked` の macOS 版。SEC-4・OCI-5・#2429）向けの
+/// fd 相対 open。
+///
+/// 親ディレクトリは呼び出し側が `plugin_fs::open_dir_nofollow_at` で固定した fd を渡す。最終要素は
+/// `O_NOFOLLOW`（symlink は `Os(ELOOP)`）・`O_NONBLOCK`（FIFO で止まらない）・`O_NOCTTY` で開き、無ければ
+/// 0600 で作る。open の前の種別確認（`plugin_fs::lstat_at`）と open 後の fstat 検査は呼び出し側の責務。
+pub(crate) mod audit_fs {
+    use super::SysError;
+    use super::plugin_fs::{O_CLOEXEC, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, openat_create_raw};
+    use std::ffi::{CStr, c_int};
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+
+    /// `O_RDWR`（`sys/fcntl.h`）。
+    const O_RDWR: c_int = 0x0002;
+    /// `O_APPEND`（`sys/fcntl.h`）。
+    const O_APPEND: c_int = 0x0008;
+    /// `O_CREAT`（`sys/fcntl.h`）。
+    const O_CREAT: c_int = 0x0200;
+    /// 新規作成時の権限（所有者のみ）。
+    const CREATE_MODE: u32 = 0o600;
+
+    /// `parent` の下の `name` を読み書き・追記で開く（無ければ 0600 で作成。最終要素の symlink は辿らない）。
+    ///
+    /// `name` が単一要素であることの検証は呼び出し側の責務（`Path::file_name` 由来）。
+    pub(crate) fn open_append_create_nofollow_at(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Result<OwnedFd, SysError> {
+        openat_create_raw(
+            parent.as_raw_fd(),
+            name,
+            O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC,
+            CREATE_MODE,
+        )
+    }
+
+    /// 本モジュールの定数を `libc` の apple ターゲットと `const` 評価で照合する（#1848・#2429）。
+    #[cfg(test)]
+    mod libc_abi {
+        use libc::c_int;
+
+        const _: () = {
+            libc_const_eq!(O_RDWR, c_int, c_int);
+            libc_const_eq!(O_APPEND, c_int, c_int);
+            libc_const_eq!(O_CREAT, c_int, c_int);
+        };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::sys::SysError;
+        use crate::sys::plugin_fs::{ELOOP, open_dir_nofollow_at};
+        use std::io::Write as _;
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::{MetadataExt, symlink};
+        use std::time::Duration;
+
+        fn dir_fd(p: &std::path::Path) -> OwnedFd {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).expect("cstring");
+            open_dir_nofollow_at(None, &c).expect("open dir")
+        }
+
+        /// SEC-4: 新規作成は 0600、既存は追記でき、symlink は `ELOOP`。
+        #[test]
+        fn sec4_2429_open_append_create_nofollow() {
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-2429-auditfs", Duration::from_secs(10));
+            let base = std::fs::canonicalize(scratch.path()).expect("canonicalize");
+            let dir = dir_fd(&base);
+            let name = std::ffi::CString::new("a.log").expect("cstring");
+            let fd = open_append_create_nofollow_at(dir.as_fd(), &name).expect("create");
+            let mut f = std::fs::File::from(fd);
+            f.write_all(b"one\n").expect("write");
+            assert_eq!(f.metadata().expect("md").mode() & 0o777, 0o600);
+            let fd2 = open_append_create_nofollow_at(dir.as_fd(), &name).expect("reopen");
+            let mut f2 = std::fs::File::from(fd2);
+            f2.write_all(b"two\n").expect("append");
+            assert_eq!(
+                std::fs::read(base.join("a.log")).expect("read"),
+                b"one\ntwo\n"
+            );
+            symlink("a.log", base.join("l")).expect("symlink");
+            let l = std::ffi::CString::new("l").expect("cstring");
+            assert_eq!(
+                open_append_create_nofollow_at(dir.as_fd(), &l).err(),
+                Some(SysError::Os(ELOOP))
+            );
+        }
+    }
+}
+
+/// 監査の主経路の隔離（`audit_log::file_sink::run_isolated` の macOS 版。SEC-4・REPAIR-5・CORE-1・#2429）向けの
+/// プロセス操作。Linux の `sys` と同名・同シグネチャで、`file_sink` の本体を OS 共通にする。
+///
+/// Linux との違い:
+/// - `pidfd` が無い。pid の再利用の窓は、`file_sink` が fork の前に [`child_signal_auto_reaps`] で SIGCHLD の
+///   自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）を拒否して閉じる（子は回収されるまでゾンビとして pid を保持する）
+/// - `close_range(2)` が無い。[`close_fds_from_except`] が `proc_pidinfo(PROC_PIDLISTFDS)` で開いている fd を
+///   列挙して閉じ、閉じた後に再列挙して残りが無いことを確かめる（確かめられなければ `Err`。fail-closed）。
+///   却下案は `getdtablesize()` までの総当たり（soft limit を後から下げられると、上限より上の番号を見逃す）
+/// - スレッド数は `proc_pidinfo(PROC_PIDTASKINFO)` の `pti_threadnum`（`/proc` が無い）
+///
+/// 値・構造体の配置は Apple の SDK（`sys/fcntl.h`・`sys/signal.h`・`sys/errno.h`・`sys/wait.h`・`poll.h`・
+/// `sys/proc_info.h`）に合わせ、`libc_abi` で `libc` の apple と照合する。`nfds_t` は Darwin では `unsigned int`
+/// （Linux は `unsigned long`）、`SIGCHLD` は 20（Linux は 17）で、Linux の値は流用しない。
+pub(crate) mod process {
+    use super::{EINVAL, SysError, last_errno};
+    use std::ffi::{c_int, c_short, c_uint, c_void};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+
+    /// `EINTR`（`sys/errno.h`）。
+    pub(crate) const EINTR: i32 = 4;
+    /// `ECHILD`（`sys/errno.h`）。
+    pub(crate) const ECHILD: i32 = 10;
+    /// `EMFILE`（`sys/errno.h`）。fd の列挙が上限を超えたときの取り決めに使う。
+    const EMFILE: i32 = 24;
+    /// `EBADF`（`sys/errno.h`）。fd を閉じ切れなかったときの取り決めに使う。
+    const EBADF: i32 = 9;
+    /// `F_DUPFD_CLOEXEC`（`sys/fcntl.h`）。
+    const F_DUPFD_CLOEXEC: c_int = 67;
+    /// `WNOHANG`（`sys/wait.h`）。
+    const WNOHANG: c_int = 0x0000_0001;
+    /// `SIGKILL`（`sys/signal.h`）。
+    const SIGKILL: c_int = 9;
+    /// `SIGCHLD`（`sys/signal.h`。Linux の 17 とは異なる）。
+    const SIGCHLD: c_int = 20;
+    /// `SIG_DFL`（`sys/signal.h`）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    const SIG_DFL: usize = 0;
+    /// `SIG_IGN`（`sys/signal.h`）。
+    const SIG_IGN: usize = 1;
+    /// `SIG_ERR`（`sys/signal.h`。`(void (*)(int))-1`）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    const SIG_ERR: usize = usize::MAX;
+    /// `SA_NOCLDWAIT`（`sys/signal.h`）。
+    const SA_NOCLDWAIT: c_int = 0x0020;
+    /// `POLLIN`（`poll.h`）。
+    const POLLIN: c_short = 0x0001;
+    /// `PROC_PIDTASKINFO`（`sys/proc_info.h`）。
+    const PROC_PIDTASKINFO: c_int = 4;
+    /// `PROC_PIDLISTFDS`（`sys/proc_info.h`）。
+    const PROC_PIDLISTFDS: c_int = 1;
+    /// fd の列挙で確保する件数の上限（これを超える数の fd を持つ子は閉じ切れないとして失敗にする。
+    /// 件数を検証してから確保する。`OPEN_MAX` の既定 10240 を十分に超える値）。
+    const MAX_FD_ENTRIES: usize = 1 << 16;
+
+    /// 定数を確認済みのアーキテクチャか。それ以外の関数は `Unsupported` で拒否する。
+    const SUPPORTED_ARCH: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+    /// `struct pollfd`（`poll.h`）。
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    /// `struct sigaction`（`sys/signal.h`）。`__sigaction_u` はポインタ幅の共用体で、ハンドラのアドレスとして読む。
+    #[repr(C)]
+    struct SigAction {
+        sa_sigaction: usize,
+        sa_mask: u32,
+        sa_flags: c_int,
+    }
+
+    /// `struct proc_taskinfo`（`sys/proc_info.h`）。読むのは `pti_threadnum` だけで、他は配置のために宣言する。
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct ProcTaskInfo {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    }
+
+    /// `struct proc_fdinfo`（`sys/proc_info.h`）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+
+    // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`pid_t` は `int`、`nfds_t` は `unsigned int`、
+    // `proc_pidinfo` は `int proc_pidinfo(int, int, uint64_t, void *, int)`、`sigaction` は
+    // `int sigaction(int, const struct sigaction *, struct sigaction *)`、`fcntl` は可変長（Apple arm64 ABI は
+    // 可変長部をスタックに積むため `...` 付きで宣言する）、`signal` は `sig_t signal(int, sig_t)`（ポインタ幅）。
+    unsafe extern "C" {
+        fn fork() -> i32;
+        fn _exit(status: c_int) -> !;
+        fn getpid() -> i32;
+        fn waitpid(pid: i32, status: *mut c_int, options: c_int) -> i32;
+        fn kill(pid: i32, sig: c_int) -> c_int;
+        fn poll(fds: *mut PollFd, nfds: c_uint, timeout: c_int) -> c_int;
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        fn close(fd: c_int) -> c_int;
+        fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
+        #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+        fn signal(sig: c_int, handler: usize) -> usize;
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    /// [`kill_pid`] が送るシグナル（生の番号を crate 外へ出さない）。macOS では `Kill` だけ。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Signal {
+        /// `SIGKILL`。
+        Kill,
+    }
+
+    /// `pid` を `waitpid` / `kill` に渡せる正の `i32` に変換する。0（自プロセスグループ）と `i32` を超える値
+    /// （負の pid はプロセスグループ・全プロセス宛てを意味し得る）は `EINVAL` で拒否する（`kill(-1, SIGKILL)` の事故防止）。
+    fn positive_pid(pid: u32) -> Result<i32, SysError> {
+        match i32::try_from(pid) {
+            Ok(p) if p > 0 => Ok(p),
+            _ => Err(SysError::Os(EINVAL)),
+        }
+    }
+
+    /// 呼び出しプロセスの現在のスレッド数（`proc_pidinfo(PROC_PIDTASKINFO)` の `pti_threadnum`）。
+    /// 取得できない・戻りの大きさが合わない・0 以下なら `None`（fail-closed）。
+    pub(crate) fn current_thread_count() -> Option<u64> {
+        if !SUPPORTED_ARCH {
+            return None;
+        }
+        let mut info = ProcTaskInfo::default();
+        let size = c_int::try_from(std::mem::size_of::<ProcTaskInfo>()).ok()?;
+        // SAFETY: `getpid` は引数なし・常に成功する。
+        let pid = unsafe { getpid() };
+        // SAFETY: `info` は `size` バイト分の有効な書き込み先で、カーネルは `buffersize` を超えて書かない。
+        let rc = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTASKINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast::<c_void>(),
+                size,
+            )
+        };
+        if rc != size {
+            return None;
+        }
+        u64::try_from(info.pti_threadnum).ok().filter(|n| *n > 0)
+    }
+
+    /// `child` をシングルスレッドの呼び出し元から `fork(2)` した子で実行し、親には子の PID を返す。
+    ///
+    /// Linux の `fork_single_threaded_no_flush` と同じ強制を関数の内側で行う。fork 直前に [`current_thread_count`] が
+    /// 1 であることを確かめ、満たさない・数えられないときは fork せず [`SysError::MultiThreaded`]（確認から fork
+    /// までに新しいスレッドを作れる主体は自身以外に無い）。fork 前に親で stdio を flush しない（出力先が詰まると
+    /// 呼び出し側の期限の前に止まるため）。子は `child` を `catch_unwind` で実行し、結果（panic なら `panic_exit`）で
+    /// `_exit` する。呼び出し元のフレームへ戻らず、atexit・デストラクタを実行しない。
+    pub(crate) fn fork_single_threaded_no_flush<F: FnOnce() -> i32>(
+        child: F,
+        panic_exit: i32,
+    ) -> Result<u32, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        if current_thread_count() != Some(1) {
+            return Err(SysError::MultiThreaded);
+        }
+        // SAFETY: 直前に `Threads == 1` を確認済みで、fork した子には呼び出しスレッドだけが複製されるため、
+        // 他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で `child` を実行して
+        // `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        if pid == 0 {
+            let code =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(panic_exit);
+            // SAFETY: 引数は値渡しの整数のみ。noreturn で、子プロセスをここで終了させる（atexit・デストラクタを
+            // 実行せず、親と共有している状態を触らない）。
+            unsafe { _exit(code) }
+        }
+        u32::try_from(pid).map_err(|_| SysError::Os(EINVAL))
+    }
+
+    /// 自プロセスの開いている fd の番号を列挙する（`proc_pidinfo(PROC_PIDLISTFDS)`）。
+    ///
+    /// バッファが満杯で返ったときは切り詰められた可能性があるため倍にして取り直し、[`MAX_FD_ENTRIES`] を超える
+    /// なら `EMFILE`（件数を検証してから確保する）。fork 後の子でも呼ぶ（親が単一スレッドと確認済みのため、
+    /// 子でのヒープ確保は安全）。
+    fn list_open_fds() -> Result<Vec<i32>, SysError> {
+        // SAFETY: `getpid` は引数なし・常に成功する。
+        let pid = unsafe { getpid() };
+        let entry = std::mem::size_of::<ProcFdInfo>();
+        let mut cap = 256usize;
+        loop {
+            let mut buf = vec![
+                ProcFdInfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0
+                };
+                cap
+            ];
+            let bytes = c_int::try_from(cap * entry).map_err(|_| SysError::Os(EMFILE))?;
+            // SAFETY: `buf` は `bytes` バイト分の有効な書き込み先で、カーネルは `buffersize` を超えて書かない。
+            let rc = unsafe {
+                proc_pidinfo(
+                    pid,
+                    PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    bytes,
+                )
+            };
+            if rc < 0 {
+                return Err(SysError::Os(last_errno()));
+            }
+            if rc < bytes {
+                let n = usize::try_from(rc).map_err(|_| SysError::Os(EINVAL))? / entry;
+                return Ok(buf.iter().take(n).map(|e| e.proc_fd).collect());
+            }
+            cap = cap.saturating_mul(2);
+            if cap > MAX_FD_ENTRIES {
+                return Err(SysError::Os(EMFILE));
+            }
+        }
+    }
+
+    /// fd `first` 以上のうち、`keep` の 1 本だけを残してすべて閉じる（fork 後の子でだけ呼ぶ）。
+    ///
+    /// 開いている fd を [`list_open_fds`] で列挙して閉じ、**もう一度列挙して**残りが無いことを確かめる。列挙に
+    /// 失敗した・残っていた場合は `Err`（呼び出し側は `child` を実行しない。fail-closed）。`close(2)` 自体の失敗は
+    /// 見ず、再列挙の結果で判定する。
+    pub(crate) fn close_fds_from_except(first: u32, keep: BorrowedFd<'_>) -> Result<(), SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let first = i32::try_from(first).map_err(|_| SysError::Os(EINVAL))?;
+        let keep = keep.as_raw_fd();
+        let targets = |fds: Vec<i32>| -> Vec<i32> {
+            fds.into_iter()
+                .filter(|fd| *fd >= first && *fd != keep)
+                .collect()
+        };
+        for fd in targets(list_open_fds()?) {
+            // SAFETY: 整数の fd だけを渡す。無効な番号でも `EBADF` が返るだけでメモリ安全性に影響しない。呼び出し元は
+            // fork 後の子で、閉じる対象は子が継承した複製のみ（親の fd は閉じない）。
+            let _ = unsafe { close(fd) };
+        }
+        if targets(list_open_fds()?).is_empty() {
+            Ok(())
+        } else {
+            Err(SysError::Os(EBADF))
+        }
+    }
+
+    /// `fd` を `min` 以上の最小の空き番号へ複製する（`fcntl(F_DUPFD_CLOEXEC, min)`。複製は close-on-exec）。
+    /// `min` が負なら `EINVAL`。
+    pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        if min < 0 {
+            return Err(SysError::Os(EINVAL));
+        }
+        // SAFETY: `fd` は生存中の `BorrowedFd`。`F_DUPFD_CLOEXEC` は整数引数（下限）のみを取りポインタを渡さない。
+        // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+        let new = unsafe { fcntl(fd.as_raw_fd(), F_DUPFD_CLOEXEC, min) };
+        if new < 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        // SAFETY: `new` は上で成功した fcntl が返した、他に所有者のいない有効な fd。
+        Ok(unsafe { OwnedFd::from_raw_fd(new) })
+    }
+
+    /// `fd` が読み取り可能になるまで最大 `timeout_ms` ミリ秒待つ。可能なら `true`、時間切れなら `false`。
+    /// シグナルによる中断は `Os(EINTR)` で返す（呼び出し側が再試行する）。
+    pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let mut pfd = PollFd {
+            fd: fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ
+        // `revents` を書く。
+        let r = unsafe { poll(&raw mut pfd, 1, timeout_ms) };
+        if r < 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        Ok(r > 0)
+    }
+
+    /// 子 `pid` を `waitpid(WNOHANG)` で回収する。まだ生きていれば `Ok(None)`、回収できれば wait status を返す。
+    /// 子が無い・自動回収されていれば `Err(Os(ECHILD))`。
+    pub(crate) fn wait_pid_nohang(pid: u32) -> Result<Option<i32>, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let raw = positive_pid(pid)?;
+        let mut status: c_int = 0;
+        // SAFETY: `status` は呼び出しの間生存するスタック上の `c_int` への有効な書き込み先。`raw` は正であることを
+        // 確認済みで、特定の子 1 つだけが対象になる（-1 や 0 を渡さない）。
+        let rc = unsafe { waitpid(raw, &raw mut status, WNOHANG) };
+        match rc {
+            -1 => Err(SysError::Os(last_errno())),
+            0 => Ok(None),
+            r if r == raw => Ok(Some(status)),
+            _ => Err(SysError::Os(EINVAL)),
+        }
+    }
+
+    /// 子 `pid` へシグナルを送る。`pid` は正であることを確認してから渡す。
+    ///
+    /// 回収済みの pid は別プロセスへ再利用され得るため、呼び出し側は `pid` が未回収の自分の子であることを保証する
+    /// （`file_sink` は fork の前に [`child_signal_auto_reaps`] で自動回収を拒否し、直前の `waitpid(WNOHANG)` が
+    /// `Ok(None)` を返したときだけ呼ぶ。CORE-1）。
+    pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let raw = positive_pid(pid)?;
+        let signo = match sig {
+            Signal::Kill => SIGKILL,
+        };
+        // SAFETY: `raw` は正（0 や負で process group・全プロセス宛てにならない）で、`signo` は本モジュールの定数。
+        let rc = unsafe { kill(raw, signo) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(SysError::Os(last_errno()))
+        }
+    }
+
+    /// 自プロセスの `SIGCHLD` が子の自動回収になっているか（`SIG_IGN`、または `SA_NOCLDWAIT`）を返す。
+    ///
+    /// 自動回収のプロセスでは子が終了と同時に回収され、pid が再利用され得る。pidfd が無い macOS では、
+    /// `file_sink` が fork の前にこれを確かめ、`true` や失敗なら主経路を試さない（pid の再利用で別プロセスへ
+    /// `kill` を送る窓を閉じる。CORE-1）。
+    pub(crate) fn child_signal_auto_reaps() -> Result<bool, SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let mut old = SigAction {
+            sa_sigaction: 0,
+            sa_mask: 0,
+            sa_flags: 0,
+        };
+        // SAFETY: 第 2 引数は NULL（変更しない）、第 3 引数はスタック上の有効な書き込み先。
+        let rc = unsafe { sigaction(SIGCHLD, std::ptr::null(), &raw mut old) };
+        if rc != 0 {
+            return Err(SysError::Os(last_errno()));
+        }
+        Ok(old.sa_sigaction == SIG_IGN || old.sa_flags & SA_NOCLDWAIT != 0)
+    }
+
+    /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする
+    /// （Linux の同名関数と同じ。子が自動回収されるプロセスでの照合用）。単一スレッドの `main` からだけ呼ぶ。
+    #[cfg(feature = "exec-test-support")]
+    pub(crate) fn set_child_signal_ignored_for_test(ignored: bool) -> Result<(), SysError> {
+        if !SUPPORTED_ARCH {
+            return Err(SysError::Unsupported);
+        }
+        let handler = if ignored { SIG_IGN } else { SIG_DFL };
+        // SAFETY: 引数は整数（`SIG_IGN` / `SIG_DFL`）のみ。ハンドラ関数を登録しないため、シグナルハンドラの再入・
+        // 非同期安全性の問題は生じない。対象は `SIGCHLD` の定数だけ。
+        let prev = unsafe { signal(SIGCHLD, handler) };
+        if prev == SIG_ERR {
+            Err(SysError::Os(last_errno()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 本モジュールの定数・構造体・関数の型を `libc` の apple ターゲットと `const` 評価で照合する（#1848・#2429）。
+    /// 対象外: `SIG_ERR`（`libc` に定義が無い）。
+    #[cfg(test)]
+    mod libc_abi {
+        use libc::c_int;
+
+        const _: () = {
+            libc_const_eq!(EINTR, i32, c_int);
+            libc_const_eq!(ECHILD, i32, c_int);
+            libc_const_eq!(EMFILE, i32, c_int);
+            libc_const_eq!(EBADF, i32, c_int);
+            libc_const_eq!(F_DUPFD_CLOEXEC, c_int, c_int);
+            libc_const_eq!(WNOHANG, c_int, c_int);
+            libc_const_eq!(SIGKILL, c_int, c_int);
+            libc_const_eq!(SIGCHLD, c_int, c_int);
+            libc_const_eq!(super::SIG_DFL, usize, libc::SIG_DFL, libc::sighandler_t);
+            libc_const_eq!(super::SIG_IGN, usize, libc::SIG_IGN, libc::sighandler_t);
+            libc_const_eq!(SA_NOCLDWAIT, c_int, c_int);
+            libc_const_eq!(POLLIN, i16, libc::c_short);
+            libc_const_eq!(PROC_PIDTASKINFO, c_int, c_int);
+            libc_const_eq!(PROC_PIDLISTFDS, c_int, c_int);
+        };
+
+        const _: () = {
+            use core::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<super::PollFd>() == size_of::<libc::pollfd>());
+            assert!(align_of::<super::PollFd>() == align_of::<libc::pollfd>());
+            assert!(offset_of!(super::PollFd, fd) == offset_of!(libc::pollfd, fd));
+            assert!(offset_of!(super::PollFd, events) == offset_of!(libc::pollfd, events));
+            assert!(offset_of!(super::PollFd, revents) == offset_of!(libc::pollfd, revents));
+
+            assert!(size_of::<super::SigAction>() == size_of::<libc::sigaction>());
+            assert!(align_of::<super::SigAction>() == align_of::<libc::sigaction>());
+            assert!(
+                offset_of!(super::SigAction, sa_sigaction)
+                    == offset_of!(libc::sigaction, sa_sigaction)
+            );
+            assert!(offset_of!(super::SigAction, sa_mask) == offset_of!(libc::sigaction, sa_mask));
+            assert!(
+                offset_of!(super::SigAction, sa_flags) == offset_of!(libc::sigaction, sa_flags)
+            );
+
+            assert!(size_of::<super::ProcTaskInfo>() == size_of::<libc::proc_taskinfo>());
+            assert!(align_of::<super::ProcTaskInfo>() == align_of::<libc::proc_taskinfo>());
+            assert!(
+                offset_of!(super::ProcTaskInfo, pti_threadnum)
+                    == offset_of!(libc::proc_taskinfo, pti_threadnum)
+            );
+            assert!(
+                offset_of!(super::ProcTaskInfo, pti_priority)
+                    == offset_of!(libc::proc_taskinfo, pti_priority)
+            );
+
+            assert!(size_of::<super::ProcFdInfo>() == size_of::<libc::proc_fdinfo>());
+            assert!(align_of::<super::ProcFdInfo>() == align_of::<libc::proc_fdinfo>());
+            assert!(
+                offset_of!(super::ProcFdInfo, proc_fd) == offset_of!(libc::proc_fdinfo, proc_fd)
+            );
+            assert!(
+                offset_of!(super::ProcFdInfo, proc_fdtype)
+                    == offset_of!(libc::proc_fdinfo, proc_fdtype)
+            );
+        };
+
+        // `extern "C"` 関数の型の照合（#1849・#1837）。ポインタ先の構造体は上の `offset_of!` が担う。
+        const _: unsafe extern "C" fn() -> i32 = super::fork;
+        const _: unsafe extern "C" fn() -> libc::pid_t = libc::fork;
+        const _: unsafe extern "C" fn(c_int) -> ! = super::_exit;
+        const _: unsafe extern "C" fn(c_int) -> ! = libc::_exit;
+        const _: unsafe extern "C" fn() -> i32 = super::getpid;
+        const _: unsafe extern "C" fn() -> libc::pid_t = libc::getpid;
+        const _: unsafe extern "C" fn(i32, *mut c_int, c_int) -> i32 = super::waitpid;
+        const _: unsafe extern "C" fn(libc::pid_t, *mut c_int, c_int) -> libc::pid_t =
+            libc::waitpid;
+        const _: unsafe extern "C" fn(i32, c_int) -> c_int = super::kill;
+        const _: unsafe extern "C" fn(libc::pid_t, c_int) -> c_int = libc::kill;
+        const _: unsafe extern "C" fn(*mut super::PollFd, libc::c_uint, c_int) -> c_int =
+            super::poll;
+        const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int = libc::poll;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = super::fcntl;
+        const _: unsafe extern "C" fn(c_int, c_int, ...) -> c_int = libc::fcntl;
+        const _: unsafe extern "C" fn(c_int) -> c_int = super::close;
+        const _: unsafe extern "C" fn(c_int) -> c_int = libc::close;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const super::SigAction,
+            *mut super::SigAction,
+        ) -> c_int = super::sigaction;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const libc::sigaction,
+            *mut libc::sigaction,
+        ) -> c_int = libc::sigaction;
+        const _: unsafe extern "C" fn(c_int, usize) -> usize = super::signal;
+        const _: unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t =
+            libc::signal;
+        const _: unsafe extern "C" fn(c_int, c_int, u64, *mut core::ffi::c_void, c_int) -> c_int =
+            super::proc_pidinfo;
+        const _: unsafe extern "C" fn(c_int, c_int, u64, *mut core::ffi::c_void, c_int) -> c_int =
+            libc::proc_pidinfo;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::AsFd;
+
+        /// SEC-4・REPAIR-5: `positive_pid` の境界（0 と `i32` 超は `EINVAL`）。
+        #[test]
+        fn sec4_2429_pid_zero_and_overflow_are_rejected() {
+            assert_eq!(wait_pid_nohang(0), Err(SysError::Os(EINVAL)));
+            assert_eq!(kill_pid(0, Signal::Kill), Err(SysError::Os(EINVAL)));
+            assert_eq!(kill_pid(u32::MAX, Signal::Kill), Err(SysError::Os(EINVAL)));
+        }
+
+        /// 既定の `SIGCHLD` は自動回収ではない（libtest は SIGCHLD を変えない）。
+        #[test]
+        fn sec4_2429_default_sigchld_is_not_auto_reaping() {
+            assert_eq!(child_signal_auto_reaps(), Ok(false));
+        }
+
+        /// スレッド数は 1 以上で、スレッドを足すと増える。
+        #[test]
+        fn sec4_2429_thread_count_counts_new_thread() {
+            let before = current_thread_count().expect("count");
+            assert!(before >= 1);
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let h = std::thread::spawn(move || {
+                let _ = rx.recv();
+            });
+            let during = current_thread_count().expect("count");
+            assert!(during > before, "during={during} before={before}");
+            drop(tx);
+            h.join().expect("join");
+        }
+
+        /// libtest は複数スレッドのため、fork は `MultiThreaded` で拒否される（fork しない）。
+        #[test]
+        fn sec4_2429_fork_is_refused_when_multithreaded() {
+            // 試験ランナーのスレッド + 本スレッドで 2 以上。
+            assert!(current_thread_count().is_some_and(|n| n >= 2));
+            assert_eq!(
+                fork_single_threaded_no_flush(|| 0, 2),
+                Err(SysError::MultiThreaded)
+            );
+        }
+
+        /// `dup_fd_at_least` は下限以上の fd を返し、負の下限は `EINVAL`。`poll_readable` は空の pipe で
+        /// `false`、書いた後で `true`。
+        #[test]
+        fn sec4_2429_dup_and_poll() {
+            use std::io::Write as _;
+            let (rx, tx) = std::io::pipe().expect("pipe");
+            let rx = OwnedFd::from(rx);
+            let dup = dup_fd_at_least(rx.as_fd(), 10).expect("dup");
+            assert!(dup.as_raw_fd() >= 10);
+            assert_eq!(
+                dup_fd_at_least(rx.as_fd(), -1).err(),
+                Some(SysError::Os(EINVAL))
+            );
+            assert_eq!(poll_readable(dup.as_fd(), 0), Ok(false));
+            (&tx).write_all(b"x").expect("write");
+            assert_eq!(poll_readable(dup.as_fd(), 0), Ok(true));
         }
     }
 }

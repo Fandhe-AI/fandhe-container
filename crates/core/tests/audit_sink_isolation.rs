@@ -23,38 +23,55 @@
 //!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、`harness = false` の単一スレッド `main` で動かす。
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
-    println!("audit_sink_isolation: Linux only, not applicable on this OS");
+    println!("audit_sink_isolation: Linux and macOS only, not applicable on this OS");
 }
 
 /// feature なしのビルドでは差し込み入口が無い。検証せずに成功しない（fail-closed）。
-#[cfg(all(target_os = "linux", not(feature = "exec-test-support")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "exec-test-support")
+))]
 fn main() {
     eprintln!("audit_sink_isolation: not verified; the exec-test-support feature is not enabled");
     std::process::exit(2);
 }
 
-#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "exec-test-support"
+))]
 fn main() {
-    linux::run();
+    imp::run();
 }
 
-#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "exec-test-support"
+))]
 #[path = "support/scratch_root.rs"]
 mod scratch_root;
 
-#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
-mod linux {
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "exec-test-support"
+))]
+mod imp {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AuditEvent, AuditFallback, AuditFileWriter, AuditPath, AuditPid, AuditRecord, AuditSignal,
-        AuditSink, AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError,
-        AuditWriteErrorKind, ControlAuditRelay, ControlPeerRejection, FileAuditSink,
+        AuditEvent, AuditFallback, AuditFileWriter, AuditPid, AuditRecord, AuditSink,
+        AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError, AuditWriteErrorKind,
+        FileAuditSink,
+    };
+    // 制御チャネルの中継（`control_relay`）は Linux 専用。
+    #[cfg(target_os = "linux")]
+    use fandhe_container_core::audit_log::{
+        AuditPath, AuditSignal, ControlAuditRelay, ControlPeerRejection,
     };
     use fandhe_container_core::traits::ErrorCode;
 
@@ -111,6 +128,13 @@ mod linux {
         }
     }
 
+    /// 自プロセスのスレッド数（macOS は `proc_pidinfo` を使う試験用フック）。
+    #[cfg(target_os = "macos")]
+    fn threads() -> u64 {
+        FileAuditSink::current_thread_count_for_test().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
     fn threads() -> u64 {
         std::fs::read_to_string("/proc/self/status")
             .unwrap()
@@ -312,13 +336,22 @@ mod linux {
         notify_child_timed_out_before_writing_is_retried();
         notify_child_failing_mid_line_is_retried_after_a_newline();
         multi_threaded_process_skips_the_primary();
-        control_relay_persists_from_a_multi_threaded_process();
-        control_relay_keeps_exit_signal_records_from_many_threads();
-        control_relay_exit_signal_times_out_then_is_unavailable();
-        control_relay_stop_signal_disposition_of_the_helper();
+        #[cfg(target_os = "linux")]
+        {
+            control_relay_persists_from_a_multi_threaded_process();
+            control_relay_keeps_exit_signal_records_from_many_threads();
+            control_relay_exit_signal_times_out_then_is_unavailable();
+            control_relay_stop_signal_disposition_of_the_helper();
+        }
+        // macOS の主経路は fork 後に子が SIGKILL で止まっても、子が残らないこと（受け入れ条件 2。#2429）。
+        #[cfg(target_os = "macos")]
+        stuck_primary_leaves_no_child_process();
         // `SIGCHLD` の disposition を変えるため最後に実行する。
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
+        #[cfg(target_os = "linux")]
         sigchld_ignored_keeps_results_and_records_once();
+        #[cfg(target_os = "macos")]
+        sigchld_ignored_skips_the_primary_on_macos();
         assert!(FileAuditSink::set_child_signal_ignored_for_test(false));
         drop(scratch);
         println!("audit_sink_isolation: ok");
@@ -391,6 +424,17 @@ mod linux {
         assert_eq!(threads(), 1);
     }
 
+    /// 番号 `fd` が開いているか。Linux は `/proc/self/fd/N`、macOS は `/dev/fd/N`（fdescfs。閉じていれば参照に
+    /// 失敗する）の有無で調べ、列挙用の fd を開かない。
+    fn fd_is_open(fd: i32) -> bool {
+        let base = if cfg!(target_os = "macos") {
+            "/dev/fd"
+        } else {
+            "/proc/self/fd"
+        };
+        Path::new(&format!("{base}/{fd}")).exists()
+    }
+
     /// SEC-4・REPAIR-5・CORE-2・#1594: 子は `child` の前に fd 3 以上を閉じる（結果 pipe の書き込み側 1 本だけ残る）。
     /// 呼び出し側が開いている fd（`BundleLock` 等の `flock` の代わり）は子から見えない。
     fn child_does_not_inherit_caller_fds() {
@@ -404,7 +448,7 @@ mod linux {
             // 開いている fd（3 以上）の一覧。`/proc/self/fd/N` の有無で調べ、列挙用の fd を開かない。
             let mut before: Vec<i32> = Vec::new();
             for fd in 3..1024 {
-                if Path::new(&format!("/proc/self/fd/{fd}")).exists() {
+                if fd_is_open(fd) {
                     before.push(fd);
                 }
             }
@@ -476,6 +520,7 @@ mod linux {
     /// 呼び出し（制御チャネルのサーバスレッド相当）の記録を主経路へ永続化する。複数スレッドでは主経路が試行されない
     /// （直接の `FileAuditSink` は `isolation_unavailable`）ことと対にして、中継の効果を具体値で確かめる。
     /// スレッドを作った後の `spawn` は `FailedPrecondition` で拒否される。
+    #[cfg(target_os = "linux")]
     fn control_relay_persists_from_a_multi_threaded_process() {
         let marker = tmp_marker("relay");
         let primary: Primary = Arc::new(|path, _| {
@@ -544,6 +589,7 @@ mod linux {
         let _ = std::fs::remove_file(&marker);
     }
 
+    #[cfg(target_os = "linux")]
     fn exit_signal_record(target: i32) -> AuditRecord {
         AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
@@ -557,6 +603,7 @@ mod linux {
 
     /// SEC-4・ESC-06・REPAIR-5・#2236: 複数スレッドから並行に `exit_signal` を記録しても、主経路にちょうど全件が欠落・
     /// 重複なく残り、スレッドごとの送信順が保たれる（スレッド間の全体順は非決定的なので照合しない）。
+    #[cfg(target_os = "linux")]
     fn control_relay_keeps_exit_signal_records_from_many_threads() {
         const THREADS: i32 = 4;
         const PER_THREAD: i32 = 8;
@@ -606,6 +653,7 @@ mod linux {
 
     /// REPAIR-5・SEC-4・#2236: 主経路が止まった helper への `exit_signal` は、期限 + 許容差以内に `Timeout` で戻り、
     /// 以後の記録は `Unavailable`（ずれた応答を取り違えない）。スレッドも子も残らない。
+    #[cfg(target_os = "linux")]
     fn control_relay_exit_signal_times_out_then_is_unavailable() {
         // helper を SIGKILL すると主経路を実行している孫は孤児になる。止まったままだと `cargo test` の標準出力の
         // パイプを握り続けるため、親（helper）が消えたら自分で終了する。
@@ -638,8 +686,10 @@ mod linux {
     }
 
     /// SIGTERM・SIGINT の `SigIgn` のビット（シグナル番号 n はビット n-1）。
+    #[cfg(target_os = "linux")]
     const STOP_MASK: u64 = (1 << (2 - 1)) | (1 << (15 - 1));
 
+    #[cfg(target_os = "linux")]
     fn sig_ign(pid: u32) -> u64 {
         let text = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let line = text.lines().find(|l| l.starts_with("SigIgn:")).unwrap();
@@ -648,6 +698,7 @@ mod linux {
 
     /// SEC-4・REPAIR-5・#3300: `spawn_ignoring_stop_signals` の helper は SIGTERM・SIGINT を無視し、従来の `spawn`
     /// の helper は無視しない（挙動不変の固定）。どちらも drop で SIGKILL され回収される。
+    #[cfg(target_os = "linux")]
     fn control_relay_stop_signal_disposition_of_the_helper() {
         // fork の直後は子がまだ closure を実行していない可能性があるため、probe の往復（結果は問わない）の後に読む。
         let healthy = |tag: &str| {
@@ -667,6 +718,7 @@ mod linux {
         wait_single_threaded();
     }
 
+    #[cfg(target_os = "linux")]
     fn sink_for_late(marker: &Path) -> FileAuditSink {
         let primary: Primary = Arc::new(|_, _| Err(unreachable_err()));
         sink(primary, false, Notify::Discard, marker.to_path_buf()).0
@@ -782,6 +834,7 @@ mod linux {
     /// REPAIR-5・SEC-4・CORE-1・#1594: `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）でも、
     /// 子の結果を結果 pipe で受けるため取り違えない。主経路の成功は代替経路へ回らず（二重記録なし）、失敗種別・
     /// 時間切れ・通知 1 行も届く。時間切れの子は回収済みとして追跡に残らない。
+    #[cfg(target_os = "linux")]
     fn sigchld_ignored_keeps_results_and_records_once() {
         // 前の試験の影響（子の未回収・スレッド）が残っていないことを明示してから始める（#1729）。
         wait_single_threaded();
@@ -847,6 +900,101 @@ mod linux {
         assert_eq!(e.code(), ErrorCode::Internal);
         assert_eq!(std::fs::read_to_string(&notice).unwrap(), RELATIVE_NOTICE);
         assert_eq!(threads(), 1);
+        let _ = std::fs::remove_file(&notice);
+    }
+
+    /// 自プロセスに子プロセスが残っているか（`pgrep -P <自 pid>`。終了コード 0 が有り、1 が無し）。期限つきで待つ。
+    /// `pgrep` 自身は対象から除かれる。
+    #[cfg(target_os = "macos")]
+    fn has_child_process() -> bool {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("pgrep")
+            .arg("-P")
+            .arg(std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pgrep");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return match status.code() {
+                    Some(0) => true,
+                    Some(1) => false,
+                    other => panic!("unexpected pgrep status: {other:?}"),
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pgrep timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// REPAIR-5・SEC-4・CORE-1・#2429: macOS で主経路が無期限に止まっても、期限内に代替経路へ進み、時間切れの子は
+    /// SIGKILL で止められて回収され、追跡にも子プロセスにも残らない（pidfd が無い macOS の `waitpid` + `kill`）。
+    #[cfg(target_os = "macos")]
+    fn stuck_primary_leaves_no_child_process() {
+        let primary: Primary = Arc::new(|_, _| hang());
+        let (sink, seen) = sink_with_limit(
+            primary,
+            true,
+            Notify::Discard,
+            tmp_marker("mac-stuck"),
+            SHORT_LIMIT,
+        );
+        let start = Instant::now();
+        sink.record(&record()).unwrap();
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![AuditWriteErrorKind::IsolationTimeout]
+        );
+        assert_eq!(FileAuditSink::unreaped_children_for_test(), 0);
+        assert!(!has_child_process(), "a timed-out child was left behind");
+        assert_eq!(threads(), 1);
+    }
+
+    /// SEC-4・CORE-1・#2429: macOS では `SIGCHLD` が `SIG_IGN`（子が自動回収されて pid が再利用され得る）のプロセスで
+    /// 主経路を試さず（`kill` の誤送を避ける）、`isolation_unavailable` で代替経路へ 1 回だけ進む。通知 1 行も
+    /// スレッドでの出し直しで 1 行だけ出る。
+    #[cfg(target_os = "macos")]
+    fn sigchld_ignored_skips_the_primary_on_macos() {
+        wait_single_threaded();
+        wait_unreaped_cleared();
+        let marker = tmp_marker("mac-ign");
+        let primary: Primary = Arc::new(|path, _| {
+            std::fs::write(path, b"must-not-run").map_err(|_| unreachable_err())
+        });
+        let (sink_ok, seen) = sink(primary, true, Notify::Discard, marker.clone());
+        sink_ok.record(&record()).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![AuditWriteErrorKind::IsolationUnavailable]
+        );
+        assert!(!marker.exists());
+        assert!(!has_child_process());
+        assert_eq!(threads(), 1);
+
+        let notice = tmp_marker("mac-ign-notice");
+        let (sink_fail, _) = sink(
+            relative_primary(),
+            false,
+            Notify::File(notice.clone()),
+            tmp_marker("mac-ign-f"),
+        );
+        let e = sink_fail.record(&record()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert_eq!(
+            std::fs::read_to_string(&notice).unwrap(),
+            UNAVAILABLE_NOTICE
+        );
+        wait_single_threaded();
         let _ = std::fs::remove_file(&notice);
     }
 

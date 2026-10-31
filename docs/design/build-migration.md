@@ -21,7 +21,7 @@
 
 ## 移行手順の概要
 
-1. 変換レポートの blocker で、`guidance.code` が `external-build` / `docker-socket` のサービスを特定する
+1. 変換レポートの blocker で、対象ファイルと非互換の種類（`guidance.code` が `external-build` / `docker-socket`）を確認する。blocker はサービス名を持たず正規形キーパス（`services.*.build`・`services.*.volumes`）と件数だけを出すため、変換元 compose の `build:` または Docker ソケットの bind mount を調べて対象サービスを特定する
 2. `build:` のサービスは、イメージを外部ツール（例: `docker build`・`podman build`・`buildah`。特定ツールは推奨しない）で別工程としてビルドする
 3. ビルドしたイメージをレジストリへ push する（例: `registry.example.com/app:1.0`。完全性の担保には digest 指定の参照が望ましい）
 4. 変換元の compose の `build:` を `image:` の参照に置き換え、変換し直す

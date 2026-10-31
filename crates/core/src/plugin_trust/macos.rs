@@ -72,7 +72,8 @@ pub(super) fn map_sys(e: SysError, dir_open: bool) -> PluginTrustErrorKind {
                 PluginTrustErrorKind::NotRegularFile
             }
         }
-        SysError::Os(_) => PluginTrustErrorKind::Io,
+        // fork を行わない経路では構築されない（来たら判定不能として拒否する。fail-closed）。
+        SysError::Os(_) | SysError::MultiThreaded => PluginTrustErrorKind::Io,
     }
 }
 
@@ -82,7 +83,8 @@ pub(super) fn map_sys_open_after_probe(e: SysError) -> PluginTrustErrorKind {
     match e {
         SysError::Unsupported => PluginTrustErrorKind::Unsupported,
         SysError::InvalidInput => PluginTrustErrorKind::InvalidPath,
-        SysError::Os(_) => PluginTrustErrorKind::Io,
+        // fork を行わない経路では構築されない（来たら判定不能として拒否する。fail-closed）。
+        SysError::Os(_) | SysError::MultiThreaded => PluginTrustErrorKind::Io,
     }
 }
 
@@ -93,7 +95,8 @@ pub(super) fn map_sys_follow(e: SysError) -> PluginTrustErrorKind {
         SysError::InvalidInput => PluginTrustErrorKind::InvalidPath,
         SysError::Os(n) if n == ELOOP => PluginTrustErrorKind::SymlinkLoop,
         SysError::Os(n) if n == ENOTDIR => PluginTrustErrorKind::NotRegularFile,
-        SysError::Os(_) => PluginTrustErrorKind::Io,
+        // fork を行わない経路では構築されない（来たら判定不能として拒否する。fail-closed）。
+        SysError::Os(_) | SysError::MultiThreaded => PluginTrustErrorKind::Io,
     }
 }
 

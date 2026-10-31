@@ -68,8 +68,10 @@
 //!   launch 経路（launcher）への配線は supervisor の start 経路から結線済み（#1819。`default_audit_sink` の sink を本番 launcher へ渡す）で、
 //!   healthcheck への配線は #2441、CLI の exec への配線は #2626 が追う（いずれも未実装）。plugin 信頼検証は
 //!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
-//!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、非 Linux では `FileStateStore` が未実装のため
-//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕
+//!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、macOS では主経路（`file_writer` の fd 相対 open と
+//!   拡張 ACL の拒否、`file_sink` の `run_isolated` の macOS 版。#2429）が成功すれば `Recorded` になる（代替経路は
+//!   未実装で、主経路が失敗すれば `SinkFailed`。#2430）。Windows では `FileStateStore` が未実装のため記録先を作れず
+//!   `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する

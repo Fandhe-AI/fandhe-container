@@ -31,8 +31,16 @@ use crate::report::KeyOccurrences;
 const NAME_TABLES: [&str; 5] = ["services", "networks", "volumes", "secrets", "configs"];
 
 /// キー 1 件のセグメントを正規形にする。`x-` で始まる拡張キーは `x-*` にする。
+/// キーパスの区切り `.` と名前の印 `*` を含むリテラルキーは、パスとして解釈されて既知の行に
+/// 一致しないよう `?` に置き換える（表に無いので Unrecognized になり error_free が false になる。STACK-3）。
 fn segment(key: &str) -> &str {
-    if key.starts_with("x-") { "x-*" } else { key }
+    if key.starts_with("x-") {
+        "x-*"
+    } else if key.contains('.') || key.contains('*') {
+        "?"
+    } else {
+        key
+    }
 }
 
 fn record_path(occ: &mut KeyOccurrences, path: &str) {
@@ -294,6 +302,25 @@ networks:
         let occ = scan("services:\n  a: {image: x}\n  b: {image: y}\n");
         assert_eq!(occ.get("services.*.image").map(|e| e.occurrences), Some(2));
         assert_eq!(occ.get("services.*").map(|e| e.occurrences), Some(2));
+    }
+
+    /// STACK-3: 区切り文字を含むリテラルキーは既知の行に化けず Unrecognized になる。
+    #[test]
+    fn literal_keys_with_path_separators_are_unrecognized() {
+        let occ = scan(
+            "services.*.image: busybox\nservices:\n  web:\n    deploy.resources.limits: {}\n    image: x\n",
+        );
+        assert_eq!(
+            occ.get("services.*.image").map(|e| e.class.as_str()),
+            Some("convert")
+        );
+        assert_eq!(occ.get("?").map(|e| e.class.as_str()), Some("unrecognized"));
+        assert_eq!(
+            occ.get("services.*.?").map(|e| e.class.as_str()),
+            Some("unrecognized")
+        );
+        assert!(occ.get("services.*.deploy.resources.limits").is_none());
+        assert_eq!(occ.get("services.*.image").map(|e| e.occurrences), Some(1));
     }
 
     /// STACK-3: 未知のキーは Unrecognized（fail-closed）。

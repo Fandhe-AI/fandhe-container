@@ -145,9 +145,38 @@ fn stack3_unknown_key_is_detected() {
     assert!(!verdict.is_error_free());
     assert!(verdict.blockers().iter().any(|b| matches!(
         b,
-        ErrorFreeBlocker::ErrorClassKey { key_path, class: KeyClass::Unrecognized, occurrences: 1 }
+        ErrorFreeBlocker::ErrorClassKey { key_path, class: KeyClass::Unrecognized, occurrences: 1, .. }
             if key_path == "services.*.no_such_key"
     )));
+}
+
+/// STACK-7・D-16: 網羅フィクスチャの build とソケット bind は案内つき、privileged は案内なし。
+#[test]
+fn stack7_coverage_fixture_guidance() {
+    use fandhe_container_compose_convert::classify::IncompatibleGuidance;
+    let report = FileConversionReport::from_parsed(scan(COVERAGE), ValueDrops::new());
+    let verdict = report.error_free();
+    let guidance_of = |path: &str| {
+        verdict
+            .blockers()
+            .iter()
+            .find_map(|b| match b {
+                ErrorFreeBlocker::ErrorClassKey {
+                    key_path, guidance, ..
+                } if key_path == path => Some(*guidance),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no blocker for {path}"))
+    };
+    assert_eq!(
+        guidance_of("services.*.build"),
+        Some(IncompatibleGuidance::ExternalBuild)
+    );
+    assert_eq!(
+        guidance_of("services.*.volumes"),
+        Some(IncompatibleGuidance::DockerSocket)
+    );
+    assert_eq!(guidance_of("services.*.privileged"), None);
 }
 
 /// SEC: 記録したパスと判定にユーザー定義名・環境変数名が混ざらない。

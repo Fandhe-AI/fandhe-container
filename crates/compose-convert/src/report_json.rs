@@ -10,6 +10,9 @@
 //!   （`environment` に資格情報が入りうる。キーパスはユーザー定義名を `*` にした正規形で渡される）。
 //! - 文字列はすべて [`json_escape`] を通す。`"`・`\`・制御文字・非 ASCII を `\uXXXX` にするため、
 //!   端末のエスケープシーケンスの注入と JSON の破損を防ぐ。
+//! - error-class-key の blocker は、外部手順の案内があるときだけ末尾に `guidance`（`code`・`message`）を持つ
+//!   （TASK-154.1・STACK-7）。案内は固定語彙と固定文言で入力由来の文字列を含まず、`key_occurrences` には載せない
+//!   （理由と次の手順は blocker に一本化して二重管理を避ける）。
 //! - フィールドの順序は固定（機械照合と AI の読み取りのため。REPAIR-12）。
 
 use std::fmt::Write as _;
@@ -146,13 +149,23 @@ pub fn file_line(
                 key_path,
                 class,
                 occurrences,
+                guidance,
             } => {
                 let _ = write!(
                     s,
-                    "{{\"kind\":\"error-class-key\",\"key_path\":{},\"class\":{},\"occurrences\":{occurrences}}}",
+                    "{{\"kind\":\"error-class-key\",\"key_path\":{},\"class\":{},\"occurrences\":{occurrences}",
                     quoted(key_path),
                     quoted(class.as_str())
                 );
+                if let Some(g) = guidance {
+                    let _ = write!(
+                        s,
+                        ",\"guidance\":{{\"code\":{},\"message\":{}}}",
+                        quoted(g.code()),
+                        quoted(g.message())
+                    );
+                }
+                s.push('}');
             }
             ErrorFreeBlocker::ValueDrops { total } => {
                 let _ = write!(s, "{{\"kind\":\"value-drops\",\"total\":{total}}}");
@@ -232,6 +245,22 @@ mod tests {
             l,
             "{\"kind\":\"file\",\"file_id\":\"a\\\"\",\"parse_error\":null,\"counts\":{\"convert\":{\"keys\":1,\"occurrences\":2},\"warning\":{\"keys\":0,\"occurrences\":0},\"error-incompatible\":{\"keys\":1,\"occurrences\":1},\"error-unsupported-yet\":{\"keys\":0,\"occurrences\":0},\"unrecognized\":{\"keys\":0,\"occurrences\":0}},\"key_occurrences\":[{\"key_path\":\"services.*.image\",\"class\":\"convert\",\"occurrences\":2},{\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1}],\"key_occurrences_overflowed\":false,\"value_drops\":{\"services.*.ports\":1},\"value_drops_total\":1,\"downgraded\":{},\"error_free\":false,\"error_free_blockers\":[{\"kind\":\"error-class-key\",\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1},{\"kind\":\"value-drops\",\"total\":1}]}\n"
         );
+    }
+
+    /// STACK-7: build の blocker は固定の案内を `guidance` に持つ（厳密一致）。
+    #[test]
+    fn stack7_build_guidance_line_exact() {
+        let mut occ = KeyOccurrences::new();
+        occ.record("services.*.build", KeyClass::ErrorIncompatible);
+        let r = FileConversionReport::from_parsed(occ, ValueDrops::new());
+        let l = file_line("a", &r, &r.error_free());
+        let want = format!(
+            "\"error_free_blockers\":[{{\"kind\":\"error-class-key\",\"key_path\":\"services.*.build\",\"class\":\"error-incompatible\",\"occurrences\":1,\"guidance\":{{\"code\":\"external-build\",\"message\":\"{}\"}}}}]}}\n",
+            crate::classify::IncompatibleGuidance::ExternalBuild.message()
+        );
+        assert!(l.ends_with(&want), "{l}");
+        assert!(l.is_ascii() && l.matches('\n').count() == 1);
+        assert_eq!(l.matches("guidance").count(), 1);
     }
 
     /// STACK-3: 集計行の形。

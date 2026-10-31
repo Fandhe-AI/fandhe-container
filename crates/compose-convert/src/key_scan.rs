@@ -18,14 +18,15 @@
 //!    表に無い子（例 `deploy.resources.foo`）は記録して Unrecognized になる（fail-closed）。
 //! 4. シーケンスとスカラーには降りない（要素の変換は `convert` の担当）。型が想定と違っても panic しない。
 //! 5. `services.*.network_mode` は値で分類を重くする（`host`・`container:` は error-incompatible）。
-//! 6. `services.*.volumes` の short syntax の要素が Docker ソケットの bind なら、`services.*.volumes` を
-//!    error-incompatible として重く記録する（記録は 1 回）（D-16。long syntax のソケット検出は未対応。REPAIR-3）。
+//! 6. `services.*.volumes` の要素が Docker ソケットの bind なら、`services.*.volumes` を
+//!    error-incompatible として重く記録する（記録は 1 回）（D-16・STACK-7）。short syntax は文字列のマウント元、
+//!    long syntax はマッピングの `source` で判定し、`type` は問わない（bind・npipe のどちらも対象。fail-closed）。
 //!
 //! 再帰の深さはパーサーの深さ予算に、異なるパスの数は [`crate::report::MAX_KEY_PATHS`] に縛られる。
 
 use crate::classify::{
     KEY_CLASS_TABLE, KeyClass, classify_key_path, classify_network_mode_value,
-    is_docker_socket_bind,
+    is_docker_socket_bind, is_docker_socket_source,
 };
 use crate::compose_convert::{ComposeDocument, ComposeMapping, ComposeValue};
 use crate::report::KeyOccurrences;
@@ -88,6 +89,17 @@ fn scan_mapping(map: &ComposeMapping, parent: Option<&str>, occ: &mut KeyOccurre
     }
 }
 
+/// volumes の要素 1 個が Docker ソケットの bind か。short は文字列、long はマッピングの `source`。
+fn is_socket_volume_entry(v: &ComposeValue) -> bool {
+    match v {
+        ComposeValue::Mapping(m) => m
+            .get("source")
+            .and_then(ComposeValue::as_str)
+            .is_some_and(is_docker_socket_source),
+        other => other.as_str().is_some_and(is_docker_socket_bind),
+    }
+}
+
 /// 1 キーを分類して記録する。値で分類が決まる 2 つのキーだけ値を引く。
 fn record_entry(path: &str, value: &ComposeValue, occ: &mut KeyOccurrences) {
     let mut class = classify_key_path(path);
@@ -95,11 +107,9 @@ fn record_entry(path: &str, value: &ComposeValue, occ: &mut KeyOccurrences) {
         class = class.heavier(classify_network_mode_value(value.as_str()));
     }
     if path == SERVICE_VOLUMES {
-        let has_socket = value.as_sequence().is_some_and(|items| {
-            items
-                .iter()
-                .any(|v| v.as_str().is_some_and(is_docker_socket_bind))
-        });
+        let has_socket = value
+            .as_sequence()
+            .is_some_and(|items| items.iter().any(is_socket_volume_entry));
         if has_socket {
             class = class.heavier(KeyClass::ErrorIncompatible);
         }
@@ -167,6 +177,23 @@ mod tests {
         let o = scan("services:\n  a:\n    volumes:\n      - /var/run/docker.sock:/s\n");
         let e = o.get(SERVICE_VOLUMES).expect("recorded");
         assert_eq!((e.class, e.occurrences), (KeyClass::ErrorIncompatible, 1));
+    }
+
+    /// STACK-7・D-16: long syntax のソケット bind も error-incompatible。混在しても出現数は 1。
+    #[test]
+    fn stack7_long_syntax_socket_bind_is_incompatible() {
+        let o = scan(
+            "services:\n  a:\n    volumes:\n      - {type: bind, source: /var/run/docker.sock, target: /s}\n      - /var/run/docker.sock:/t\n",
+        );
+        let e = o.get(SERVICE_VOLUMES).expect("recorded");
+        assert_eq!((e.class, e.occurrences), (KeyClass::ErrorIncompatible, 1));
+        let o = scan(
+            "services:\n  a:\n    volumes:\n      - {type: bind, source: ./data, target: /d}\n",
+        );
+        assert_eq!(
+            o.get(SERVICE_VOLUMES).map(|e| e.class),
+            Some(KeyClass::Convert)
+        );
     }
 
     /// STACK-3・D-16: network_mode の値で分類が重くなる。文字列でない値は unsupported-yet。

@@ -259,10 +259,73 @@ pub fn classify_network_mode_value(value: Option<&str>) -> KeyClass {
 /// 一致するときだけ true。マウント先だけの一致や `docker.sock.backup` のような接頭辞一致は false。
 /// `:` を含まない項目は匿名ボリュームのため false。
 pub fn is_docker_socket_bind(volume_entry: &str) -> bool {
-    const SOCKET_SOURCES: [&str; 2] = ["/var/run/docker.sock", "//./pipe/docker_engine"];
     match volume_entry.split_once(':') {
-        Some((source, _)) => SOCKET_SOURCES.contains(&source),
+        Some((source, _)) => is_docker_socket_source(source),
         None => false,
+    }
+}
+
+/// Docker ソケットのマウント元として扱うパス（D-16）。末尾の名前だけの一致は誤検出の範囲判断が要るため含めない。
+const SOCKET_SOURCES: [&str; 4] = [
+    "/var/run/docker.sock",
+    // `/var/run` は `/run` への symlink が通例で、実体の表記も同じソケットを指す。
+    "/run/docker.sock",
+    "//./pipe/docker_engine",
+    // long syntax の npipe の表記。
+    r"\\.\pipe\docker_engine",
+];
+
+/// マウント元の文字列が Docker ソケットのパス全体と一致するか（D-16）。`docker.sock.backup` のような接頭辞一致は false。
+/// short syntax は [`is_docker_socket_bind`] 経由、long syntax の `source` は `crate::key_scan` が直接呼ぶ。
+pub fn is_docker_socket_source(source: &str) -> bool {
+    SOCKET_SOURCES.contains(&source)
+}
+
+/// `ErrorIncompatible` のエラーに付ける外部手順の案内（TASK-154.1・#614・STACK-7・D-16）。
+///
+/// 変換器は `build:` と Docker ソケットの bind mount を変換せず、案内つきのエラーにする。案内は
+/// 固定の語彙（[`Self::code`]）と固定の英語文（[`Self::message`]）だけで、入力の値・名前・パスは含まない。
+/// `crate::report` が blocker に載せ、`crate::report_json` が 1 行 JSON の `guidance` へ出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IncompatibleGuidance {
+    /// `services.*.build`。イメージのビルドは外部ツールで行う。
+    ExternalBuild,
+    /// Docker ソケットの bind mount（`services.*.volumes`）。
+    DockerSocket,
+}
+
+impl IncompatibleGuidance {
+    /// 機械可読な固定語彙。
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ExternalBuild => "external-build",
+            Self::DockerSocket => "docker-socket",
+        }
+    }
+
+    /// 固定の英語文（ASCII）。
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ExternalBuild => {
+                "build is not supported because the Docker Engine build API is not provided (D-16); build the image with an external tool (for example docker build, podman build or buildah) as a separate step, push it to a registry or load it locally, and reference it with image"
+            }
+            Self::DockerSocket => {
+                "bind-mounting the Docker Engine socket is not supported because the Docker Engine API is not provided (D-16); run jobs that need the Docker API (for example CI runners or docker-in-docker builds) on a host with Docker Engine, or build images externally and reference them with image"
+            }
+        }
+    }
+}
+
+/// `ErrorIncompatible` のキーパスに付ける案内を引く。呼び出し側は分類が `ErrorIncompatible` のときだけ呼ぶ。
+///
+/// `services.*.volumes` が `ErrorIncompatible` になるのはソケット bind の検出時だけなので、パスだけで判別できる。
+/// `privileged`・`deploy.placement`・`network_mode` は STACK-7 の範囲外で `None`。
+pub fn incompatible_guidance(key_path: &str) -> Option<IncompatibleGuidance> {
+    match key_path {
+        "services.*.build" => Some(IncompatibleGuidance::ExternalBuild),
+        "services.*.volumes" => Some(IncompatibleGuidance::DockerSocket),
+        _ => None,
     }
 }
 
@@ -513,5 +576,61 @@ mod tests {
         ));
         assert!(!is_docker_socket_bind("./dummy:/var/run/docker.sock"));
         assert!(!is_docker_socket_bind("/var/run/docker.sock"));
+    }
+
+    /// STACK-7・D-16: 案内は build とソケット bind のパスだけ。
+    #[test]
+    fn stack7_guidance_for_build_and_socket() {
+        let b = incompatible_guidance("services.*.build").expect("build");
+        assert_eq!(b.code(), "external-build");
+        assert!(b.message().contains("external tool"));
+        assert!(b.message().contains("reference it with image"));
+        let d = incompatible_guidance("services.*.volumes").expect("socket");
+        assert_eq!(d.code(), "docker-socket");
+        for p in [
+            "services.*.privileged",
+            "services.*.deploy.placement",
+            "services.*.network_mode",
+            "services.*.image",
+            "",
+        ] {
+            assert_eq!(incompatible_guidance(p), None, "{p:?}");
+        }
+    }
+
+    /// STACK-7: 文言は ASCII・非空で、code は一意。
+    #[test]
+    fn stack7_guidance_text_is_fixed_ascii() {
+        let all = [
+            IncompatibleGuidance::ExternalBuild,
+            IncompatibleGuidance::DockerSocket,
+        ];
+        for g in all {
+            assert!(g.message().is_ascii() && !g.message().is_empty());
+            assert!(g.code().is_ascii() && !g.code().is_empty());
+        }
+        assert_ne!(all[0].code(), all[1].code());
+    }
+
+    /// D-16・STACK-7: ソケットのマウント元の判定。
+    #[test]
+    fn stack7_docker_socket_source() {
+        for s in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "//./pipe/docker_engine",
+            r"\\.\pipe\docker_engine",
+        ] {
+            assert!(is_docker_socket_source(s), "{s}");
+        }
+        for s in [
+            "/var/run/docker.sock.backup",
+            "./docker.sock",
+            "docker.sock",
+            "",
+        ] {
+            assert!(!is_docker_socket_source(s), "{s}");
+        }
+        assert!(is_docker_socket_bind("/run/docker.sock:/s"));
     }
 }

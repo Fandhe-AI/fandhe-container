@@ -33,7 +33,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// 最初の 1 バイトの後、フレームの残りを読み切る期限。
     pub frame_read_timeout: Duration,
-    /// 書き込みの期限。
+    /// 書き込みの期限。接続スレッドは書き込み中に停止要求を見ないため、`shutdown_timeout` より長いと
+    /// `shutdown()` が `ShutdownTimeout` を返しうる（REPAIR-5）。`shutdown_timeout` 以下の値にする。
     pub write_timeout: Duration,
     /// 停止時に各スレッドの終了を待つ期限。
     pub shutdown_timeout: Duration,
@@ -46,7 +47,7 @@ impl Default for ServerConfig {
         Self {
             max_connections: 16,
             frame_read_timeout: Duration::from_secs(10),
-            write_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(50),
         }

@@ -44,7 +44,7 @@ pub struct RpcStatus {
     /// gRPC のコード値。
     #[prost(int32, tag = "1")]
     pub code: i32,
-    /// 説明（英語の固定文言。要求の中身は含めない）。
+    /// 説明（英語。要求のサービス名・メソッド名を長さ上限つきでエコーすることがある）。
     #[prost(string, tag = "2")]
     pub message: String,
 }

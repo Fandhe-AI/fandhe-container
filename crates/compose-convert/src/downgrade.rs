@@ -194,7 +194,7 @@ mod tests {
         assert!(rows.len() >= 13);
         let set = parse_downgrade_value(&rows.join(", ")).expect("accepted");
         assert_eq!(set.len(), rows.len());
-        assert!(set.contains("services.*.container_name"));
+        assert!(set.contains("services.*.user"));
     }
 
     /// STACK-3: warning（x-*）と unrecognized は拒否し、unrecognized の入力は運ばない。
@@ -209,7 +209,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_downgrade_value("services.*.container_name,services.*.totally_unknown"),
+            parse_downgrade_value("services.*.user,services.*.totally_unknown"),
             Err(DowngradeArgError::NotDowngradable {
                 index: 1,
                 class: KeyClass::Unrecognized,

@@ -391,16 +391,16 @@ mod tests {
     #[test]
     fn downgrade_verdict_and_downgraded() {
         use crate::downgrade::parse_downgrade_value;
-        let set = parse_downgrade_value("services.*.container_name,services.*.tty")
-            .expect("downgrade set");
+        let set =
+            parse_downgrade_value("services.*.hostname,services.*.tty").expect("downgrade set");
         let mut occ = KeyOccurrences::new();
-        occ.record("services.*.container_name", KeyClass::ErrorUnsupportedYet);
-        occ.record("services.*.container_name", KeyClass::ErrorUnsupportedYet);
+        occ.record("services.*.hostname", KeyClass::ErrorUnsupportedYet);
+        occ.record("services.*.hostname", KeyClass::ErrorUnsupportedYet);
         occ.record("services.*.user", KeyClass::ErrorUnsupportedYet);
         let r = FileConversionReport::from_parsed(occ.clone(), ValueDrops::new());
         assert_eq!(
             r.downgraded(&set),
-            vec![("services.*.container_name".to_string(), 2)]
+            vec![("services.*.hostname".to_string(), 2)]
         );
         assert_eq!(r.error_free_with_downgrade(&set).blockers().len(), 1);
         assert_eq!(r.error_free().blockers().len(), 2);

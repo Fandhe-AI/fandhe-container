@@ -12,8 +12,10 @@
 //!   インデックスではなく一意な CDI 名にできないため、変換せず drop に記録する（spec の P1-9 訂正）。
 //!   `device_ids` の各要素は CDI デバイス名の規則で検証し、不正・`"all"`・重複が 1 つでもあれば
 //!   予約ごと drop にする（GPU の数を黙って減らさない）。
-//! - 範囲外: 合成フィクスチャでの往復検証は #626（TASK-156.3）。変換結果の stack への書き込みと
-//!   `value_drops` への加算は #598・#599。`deploy` / `resources` / `reservations` が
+//! - 検証（TASK-156.3・#626）: `mod tests` の合成フィクスチャで、`count` 数値指定の drop 記録と
+//!   TOML 往復（stack の型へ載せて書き出し・再パース）を照合する。実運用コーパス（PoC-16）に GPU 予約を含む
+//!   実ファイルが 0 件のため、検証は合成フィクスチャに限る。
+//! - 範囲外: 変換結果の stack への書き込みの本体と `value_drops` への加算は #598・#599。`deploy` / `resources` / `reservations` が
 //!   マッピングでない場合の記録は変換器本体（#598・#599）が担う。
 //! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は #595 の結線で行う（依存を増やさない）。
 //! - 入力の大きさ: 再帰しない一段の走査。確保・複製の前に [`MAX_DEVICES`]・[`MAX_DEVICE_IDS`]・
@@ -780,5 +782,121 @@ mod tests {
                 .collect(),
         );
         assert_eq!(cdi_names_for(&total), Err(GpuDropReason::DeviceIdTooLong));
+    }
+
+    /// STACK-9・TASK-156.3（#626）: `count` の数値指定は変換されず、#599 が `value_drops` の
+    /// [`DEVICES_KEY_PATH`] へ加算する件数（`drop_count()`）に現れる。value_drops の本体は #599 で、
+    /// ここではその加算元を具体値で照合する。
+    #[test]
+    fn stack_9_count_number_records_value_drop() {
+        assert_eq!(
+            DEVICES_KEY_PATH,
+            "services.*.deploy.resources.reservations.devices"
+        );
+        let single = convert_gpu_reservations(&seq(vec![gpu(vec![("count", T::Int(2))])]));
+        assert_eq!(single.drop_count(), 1);
+        assert_eq!(single.drops.len(), 1);
+        assert_eq!(single.drops[0].index, Some(0));
+        assert_eq!(single.drops[0].reason, GpuDropReason::CountNotAll);
+        assert!(single.reservations.is_empty());
+        assert!(single.devices().is_empty());
+
+        // count の数値が個数として水増しされず、他の予約も巻き込まない。
+        let mixed = convert_gpu_reservations(&seq(vec![
+            gpu(vec![]),
+            gpu(vec![("count", T::Int(1))]),
+            gpu(vec![("count", s("2"))]),
+        ]));
+        assert_eq!(mixed.drop_count(), 2);
+        let idx: Vec<_> = mixed.drops.iter().map(|d| d.index).collect();
+        assert_eq!(idx, vec![Some(1), Some(2)]);
+        assert_eq!(mixed.devices(), vec!["nvidia.com/gpu=all".to_owned()]);
+    }
+
+    /// STACK-9・TASK-156.3（#626）: 変換結果を stack の型へ載せ、TOML へ書き出して再パースした値が
+    /// 元と等しい。実運用コーパス（PoC-16）に GPU 予約を含む実ファイルが 0 件のため、入力は合成
+    /// フィクスチャに限る（実ファイルでの確認は対象外）。parse / serialize の公開入口と変換器本体は
+    /// 後続（#598）のため、ここでは stack の型を直接組み立てて `toml` で往復する。
+    #[test]
+    fn stack_9_conversion_roundtrips_through_toml() {
+        use fandhe_container_stack::schema::{
+            ComposeToml, Deploy, DeployResources, ResourceReservations, Service,
+        };
+
+        let uuid = "GPU-8f2a1c3e-0000-4b5d-9e11-aaaaaaaaaaaa";
+        let devices = seq(vec![
+            gpu(vec![]),
+            gpu(vec![("count", s("all"))]),
+            gpu(vec![(
+                "device_ids",
+                seq(vec![s(uuid), T::Int(1), s("0:1")]),
+            )]),
+            gpu(vec![("count", T::Int(2))]),
+            gpu(vec![("device_ids", seq(vec![s("a/b")]))]),
+            gpu(vec![(
+                "device_ids",
+                seq(vec![s(&"x".repeat(MAX_DEVICE_ID_BYTES + 1))]),
+            )]),
+            map(vec![
+                ("driver", s("amd")),
+                ("capabilities", seq(vec![s("gpu")])),
+            ]),
+        ]);
+        let conv = convert_gpu_reservations(&devices);
+        assert_eq!(conv.drop_count(), 4);
+        let reasons: Vec<_> = conv.drops.iter().map(|d| (d.index, d.reason)).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (Some(3), GpuDropReason::CountNotAll),
+                (Some(4), GpuDropReason::DeviceIdNotCdiName),
+                (Some(5), GpuDropReason::DeviceIdTooLong),
+                (Some(6), GpuDropReason::DriverNotNvidia),
+            ]
+        );
+
+        let doc = ComposeToml {
+            services: [(
+                "gpu".to_owned(),
+                Service {
+                    deploy: Some(Deploy {
+                        resources: Some(DeployResources {
+                            reservations: Some(ResourceReservations {
+                                devices: conv.devices(),
+                            }),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let text = toml::to_string(&doc).expect("serialize");
+        let back: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(back, doc);
+
+        let got = back.services["gpu"]
+            .deploy
+            .as_ref()
+            .and_then(|d| d.resources.as_ref())
+            .and_then(|r| r.reservations.as_ref())
+            .map(|r| r.devices.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            got,
+            vec![
+                "nvidia.com/gpu=all".to_owned(),
+                "nvidia.com/gpu=all".to_owned(),
+                format!("nvidia.com/gpu={uuid}"),
+                "nvidia.com/gpu=1".to_owned(),
+                "nvidia.com/gpu=0:1".to_owned(),
+            ]
+        );
+        // drop した予約の痕跡が出力に漏れない（補助の照合）。
+        for leaked in ["amd", "a/b", "count", "xxxx"] {
+            assert!(!text.contains(leaked), "leaked {leaked}: {text}");
+        }
     }
 }

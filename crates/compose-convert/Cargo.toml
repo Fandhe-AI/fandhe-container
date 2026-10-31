@@ -30,3 +30,9 @@ fandhe-container-stack = { path = "../stack" }
 # 汎用 Value 型を持たないため、serde の Deserialize を手で書いて単一モデル ComposeValue へ読む。
 serde.workspace = true
 serde-saphyr.workspace = true
+
+# STACK-9 の GPU 予約変換結果の TOML 往復検証（TASK-156.3・#626）にだけ使う。dev-dependencies のみで製品には入らない。
+# 版は workspace の =1.1.8 固定を継承する（承認は #582。判断資料と許容依存リストに compose-convert からの参照の
+# 記載がある。本変更での新規承認は得ていない）。
+[dev-dependencies]
+toml.workspace = true

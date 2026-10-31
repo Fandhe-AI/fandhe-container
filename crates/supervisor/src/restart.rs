@@ -1433,11 +1433,31 @@ impl ProcessLauncher for SpecCapturingLauncher {
 }
 
 /// 再 launch の区間で止めた stderr の専用スレッドを、ガードの破棄で再開する（早期 return を含む全経路で再開する。#2043）。
-struct StderrResume;
+struct StderrResume {
+    done: bool,
+}
+
+/// 再開に失敗した新プロセスの回収に最低限与える待ち（期限を使い切っていても回収を試みる。REPAIR-5）。
+const MIN_TERMINATE_WAIT: Duration = Duration::from_secs(1);
+
+impl StderrResume {
+    fn new() -> Self {
+        Self { done: false }
+    }
+
+    /// 通常経路で再開し、結果を返す（失敗を呼び出し側が扱う。REPAIR-4）。
+    fn finish(mut self) -> Result<(), TraitError> {
+        self.done = true;
+        crate::stderr_sink::resume_stderr()
+    }
+}
 
 impl Drop for StderrResume {
+    /// 早期 return 経路の後ろ盾。通常経路は [`Self::finish`] で結果を確認する。
     fn drop(&mut self) {
-        let _ = crate::stderr_sink::resume_stderr();
+        if !self.done {
+            let _ = crate::stderr_sink::resume_stderr();
+        }
     }
 }
 
@@ -1521,12 +1541,18 @@ impl Relauncher for LauncherRelauncher {
 
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         let deadline = Instant::now().checked_add(timeout);
+        let remaining_now =
+            || deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
         if let Some(hub) = &self.capture {
-            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
-            hub.quiesce();
+            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。待ちは再 launch の期限の残りまで。
+            hub.quiesce_within(remaining_now());
         }
         if let Some(hub) = &self.seccomp {
-            hub.quiesce();
+            hub.quiesce_within(remaining_now());
+        }
+        // 畳む間に期限を使い切ったら、以降の停止処理も launch も行わない（REPAIR-5）。
+        if remaining_now().is_zero() {
+            return Err(TraitError::new(ErrorCode::Timeout, "relaunch timed out"));
         }
         // 単一スレッドで launch する区間。stderr の専用スレッドは最後に止める（上の quiesce の報告が stderr へ出るため）。
         // ガードは launch の戻りで（成否・早期 return を問わず）stderr を再開する。
@@ -1537,7 +1563,7 @@ impl Relauncher for LauncherRelauncher {
                 .inspect_err(|_| {
                 let _ = crate::stderr_sink::resume_stderr();
             })?;
-            let guard = StderrResume;
+            let guard = StderrResume::new();
             if !crate::thread_settle::wait_single_threaded(
                 deadline
                     .map_or(timeout, |d| d.saturating_duration_since(Instant::now()))
@@ -1565,8 +1591,21 @@ impl Relauncher for LauncherRelauncher {
         };
         let launched = self.launcher.launch(&self.spec, launch_timeout);
         // launch の戻り（成否を問わず）で stderr を再開する。以降の attach の報告は通常どおり出る。
-        drop(_resume);
+        // 再開に失敗すると以降の報告が恒久的に記録されなくなる（REPAIR-4）ため、成功した新プロセスは回収して Err にする。
+        let resumed = _resume.map(StderrResume::finish);
         let process = launched?;
+        if let Some(Err(e)) = resumed {
+            return match process.terminate(remaining_now().max(MIN_TERMINATE_WAIT)) {
+                Ok(()) => Err(e),
+                Err(t) => {
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((process, t.clone()));
+                    Err(t)
+                }
+            };
+        }
         #[cfg(target_os = "linux")]
         if let Some(hub) = &self.seccomp {
             let attached = match process.take_seccomp_listener() {

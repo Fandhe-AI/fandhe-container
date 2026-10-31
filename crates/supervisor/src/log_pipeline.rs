@@ -117,6 +117,12 @@ impl CaptureHub {
     /// 捕捉スレッドが生きたまま launch すると `MultiThreaded` で拒否される。旧プロセスは回収済みで EOF が即座に届くはず。
     /// 期限切れの場合は `drain` が自動で取り消す（孫がパイプを保持している場合のスレッド残存は予算が上限管理する）。
     pub fn quiesce(&self) {
+        self.quiesce_within(PREVIOUS_DRAIN_TIMEOUT);
+    }
+
+    /// [`Self::quiesce`] の待ちを `limit`（と `PREVIOUS_DRAIN_TIMEOUT` の小さい方）に切り詰める版。
+    /// 再 launch の全体期限の残りを渡すために使う（`limit` が 0 なら EOF を待たず即座に取り消す。REPAIR-5・SUP-3）。
+    pub fn quiesce_within(&self, limit: Duration) {
         let previous = self
             .live
             .lock()
@@ -125,7 +131,7 @@ impl CaptureHub {
         if let Some(previous) = previous {
             report_drain(
                 "log_capture_previous_drain_failed",
-                &previous.drain(PREVIOUS_DRAIN_TIMEOUT),
+                &previous.drain(limit.min(PREVIOUS_DRAIN_TIMEOUT)),
             );
         }
     }

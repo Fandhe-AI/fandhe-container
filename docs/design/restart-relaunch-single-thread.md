@@ -53,8 +53,10 @@ core の本番 launcher（`ProductionLauncher`、`LaunchMode::SelfBounded`）は
 
 ## 判断: `legacy_tiocsti` の警告を再出力しない
 
-core は launch のたびに 1 行出す（`exec/launch_intermediate.rs`）。restart の再 launch もこの入口を通るため、host 値の観測は
-launch ごとに残る。supervisor 側は初回 start の要約 1 回だけにする。
+core は launch のたびに 1 行出す（`exec/launch_intermediate.rs`）。restart の再 launch もこの入口を通るため、core 側では
+launch ごとに出る。ただし CLI の通常経路では `start_client` が supervisor の stderr を `Stdio::null()` にし、core の警告は
+AF_UNIX socket 以外へ書かれないため、再 launch ごとの警告は保存先に**残らない**（未記録範囲。REPAIR-3・REPAIR-4）。
+supervisor 側は初回 start の要約 1 回だけにし、再 launch ごとの警告の保存は行わない（必要になったら別 issue で扱う）。
 
 ## 残余・再評価の条件
 

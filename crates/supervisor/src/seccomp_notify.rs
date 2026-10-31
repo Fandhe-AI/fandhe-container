@@ -763,13 +763,19 @@ impl SeccompNotifyHub {
     /// 旧プロセスは回収済みで listener は `Closed` になり、通常は即座に終わる。間に合わなければ放置して先へ進む
     /// （スレッドが残ると再 launch が `MultiThreaded` で拒否され、restart が失敗として表に出る）。
     pub fn quiesce(&self) {
+        self.quiesce_within(QUIESCE_TIMEOUT);
+    }
+
+    /// [`Self::quiesce`] の待ちを `limit`（と `QUIESCE_TIMEOUT` の小さい方）に切り詰める版。
+    /// 再 launch の全体期限の残りを渡すために使う（REPAIR-5・SUP-3）。
+    pub fn quiesce_within(&self, limit: Duration) {
         let live = self
             .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(live) = live {
-            stop_and_join(live, QUIESCE_TIMEOUT);
+            stop_and_join(live, limit.min(QUIESCE_TIMEOUT));
         }
     }
 

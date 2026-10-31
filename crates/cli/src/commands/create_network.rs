@@ -684,8 +684,8 @@ mod tests {
     }
 
     /// REPAIR-4・NET-6・CLI-1(#3558): 保持区間の 2 回目の照合(`with_named_definition_held`)も、定義ストアの操作を
-    /// `network.store.open` / `network.store.get` として記録する。実バイナリの成功経路は pasta の信頼検証が環境依存の
-    /// ため、保持区間の記録はここで固定する。失敗時は `body` を呼ばない。
+    /// `network.store.open` / `network.store.get` として記録する。実バイナリの成功経路と保持区間内の失敗は
+    /// `binary_entry` の #3577 の試験が照合する。ここは `body` を呼ばない失敗の場面を含めて関数単位で固定する。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair4_net6_3558_with_named_definition_held_records_store_ops() {

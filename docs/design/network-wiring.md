@@ -352,7 +352,14 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 - 全ライフサイクルコマンドの入口に触れるため、計測の issue としては波及が大きい（REPAIR-1）。64 種の上限（`MAX_TRACKED_OPS`）も統合の動機にならない
 - 再評価条件: op ログの読み手が 1 プロセス 1 組を要するようになったとき
 
-照合: 実バイナリの `repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group`（`crates/cli/tests/binary_entry.rs`。状態ルート無し・名前違い・pasta 無し・pasta 指定なしの 4 場面）。保持区間の記録は `create_network.rs` の関数単位の試験が固定する。成功経路（core の create まで到達）の実バイナリ照合は、信頼検証を通る pasta の配置が環境依存のため扱わない。
+照合: 実バイナリの `repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group`（`crates/cli/tests/binary_entry.rs`。状態ルート無し・名前違い・pasta 無し・pasta 指定なしの 4 場面）。保持区間の記録は `create_network.rs` の関数単位の試験も固定する。
+
+成功経路（core の create まで到達）と保持区間内の失敗は、#3577 で実バイナリの `repair4_net6_cli1_3577_create_named_network_success_records_two_groups` が照合する（足せると評価した）。
+
+- 方式: create は pasta を起動せず、信頼検証（`verify_pasta_binary`。`--version` の出力と、`/` からの全祖先の所有者・権限）だけを通ればよい。非 root の試験が自前で用意できる信頼できる経路は `$XDG_RUNTIME_DIR` だけなので、そこへ排他作成した 0700 のディレクトリに `--version` にだけ答える偽の pasta を置き、製品の検証器をそのまま通す（試験用 feature で anchor を緩める案は、本物の検証を通すことが価値のため採らない）。
+- 照合する 2 場面: (e) 成功は終了コード 0・出力なしで、1 組目 `create`（成功 1）、2 組目は `network.store.get` 成功 2・`network.store.open` 成功 2（早い段の `require_named_definition` と保持区間の `with_named_definition_held` で各 1 回）。続く `network rm` が `FAILED_PRECONDITION`（使用中）になることで、保持区間が状態記録まで届いたことも見る。(f) rootfs の無い bundle で core の create が失敗しても、1 組目は `create`（失敗 1）、2 組目は (e) と同じ。
+- 環境要件: `XDG_RUNTIME_DIR` が絶対パスで、全祖先が root か実効 UID の所有かつ group / other 書き込み不可（CI の ubuntu は前提確認ステップが保証する）。満たさなければ skip せず `PRECONDITION FAILED` で失敗する。
+- 残余: `XDG_RUNTIME_DIR` を持たない環境（`make docker-ci` の開発コンテナ）ではこの 1 試験が前提エラーになる。
 
 ## 未実装範囲の棚卸し
 

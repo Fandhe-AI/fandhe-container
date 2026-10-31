@@ -3815,8 +3815,8 @@ fn assert_op_log_groups(log: &std::path::Path, expected: &[&[(&str, u32, u32)]])
 /// REPAIR-4・NET-6・CLI-1（#3558）: 実バイナリで `FANDHE_CONTAINER_OP_LOG` を設定した `create --network <名前>` が、
 /// 本体の記録器の組（`create`）と定義照合の記録器の組（`network.store.open` / `network.store.get`）をこの順で
 /// 別々の組（メタ行つき）として追記し、定義照合が走らない失敗では 2 組目を出さないこと。
-/// 記録器を統合しない判断は `docs/design/network-wiring.md`。成功経路（core の create まで到達）は信頼検証を通る
-/// pasta の配置が環境依存のため扱わず、保持区間の記録は `create_network` の関数単位の試験が固定する。
+/// 記録器を統合しない判断は `docs/design/network-wiring.md`。成功経路（core の create まで到達）は
+/// `repair4_net6_cli1_3577_create_named_network_success_records_two_groups` が照合する。
 /// root の実行は rootful 扱いで名前つきネットワークが `UNIMPLEMENTED` のため、4 場面は照合せず明示の拒否を照合する。
 #[cfg(all(
     target_os = "linux",
@@ -3920,5 +3920,177 @@ fn repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group
     assert_eq!(out.status.code(), Some(5), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("pasta path is not configured"));
     assert_op_log_groups(&log, &[&[("create", 0, 1)]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// `$XDG_RUNTIME_DIR` 配下に排他作成した 0700 のディレクトリへ置く偽の pasta（`--version` にだけ答える）。
+///
+/// 製品の `verify_pasta_binary`（anchor なし）は `/` から全祖先までの所有者・権限を検査するため、`/tmp` や
+/// umask 002 で作られる `CARGO_TARGET_TMPDIR` では通らない。非 root の試験が自前で用意できる信頼できる経路は
+/// `$XDG_RUNTIME_DIR`（`/run/user/<uid>`）だけで、検証器は差し替えずに本物を通す（#3577・NET-9）。Drop で削除する。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+struct FakePasta {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl FakePasta {
+    /// 信頼できる `$XDG_RUNTIME_DIR` が無ければ、skip せず名前つきの前提エラーで失敗する（fail-closed）。
+    fn install() -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        let base = xdg
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.canonicalize().ok().filter(|c| *c == p).map(|_| p))
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRECONDITION FAILED: XDG_RUNTIME_DIR must be an absolute directory without symlinked ancestors for the fake pasta (NET-9, #3577)"
+                )
+            });
+        // 製品の検証が後で MSG_UNTRUSTED を返したときの原因切り分けのため、試験側でも全祖先を確かめる。
+        let euid = std::fs::metadata("/proc/self").expect("proc self").uid();
+        let mut cur = std::path::PathBuf::new();
+        for comp in base.components() {
+            cur.push(comp);
+            let m = std::fs::symlink_metadata(&cur).expect("stat ancestor");
+            assert!(
+                m.is_dir() && (m.uid() == 0 || m.uid() == euid) && m.mode() & 0o022 == 0,
+                "PRECONDITION FAILED: XDG_RUNTIME_DIR ancestor {} must be a root/euid-owned directory not writable by group/other (NET-9, #3577)",
+                cur.display()
+            );
+        }
+        let dir = exclusive_dir(&base, "fc-cli-pasta-3577");
+        let this = Self { dir };
+        install_fake_exe(
+            &this.dir,
+            "pasta",
+            "printf 'pasta 0.0~git20260120.386b5f5-1\\nCopyright Red Hat\\n'",
+        );
+        let m = std::fs::symlink_metadata(this.path()).expect("stat fake pasta");
+        assert!(m.is_file() && m.mode() & 0o7777 == 0o755, "{:o}", m.mode());
+        this
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.dir.join("pasta")
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl Drop for FakePasta {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// REPAIR-4・NET-6・CLI-1（#3577）: 実バイナリの `create --network <名前>` の成功経路と、保持区間（core の create）の
+/// 中での失敗で、op ログの 2 組目が `network.store.open` 2 回・`network.store.get` 2 回（早い段の
+/// `require_named_definition` と保持区間の `with_named_definition_held` の各 1 回）になること。
+/// pasta は create では起動されず信頼検証（`--version` のみ）を通ればよいため、本物の検証器を通す偽の pasta
+/// （[`FakePasta`]）で足りる。1 組目は本体の記録器の組。root は rootful 扱いで名前つきネットワークが
+/// `UNIMPLEMENTED` のため、照合せず明示の拒否を照合する。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[test]
+fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TmpDir::new("net6-3577");
+    let dir = isolated_cli_dir("net6-3577");
+    let cli = dir.join("fandhe-container");
+    let state = tmp.0.join("state");
+    let state_s = state.to_str().expect("utf8");
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+    let pasta = FakePasta::install();
+    let pasta_path = pasta.path();
+    let pasta_s = pasta_path.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    let config = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#;
+    let ok_bundle = tmp.0.join("bundle-ok");
+    std::fs::create_dir(&ok_bundle).expect("bundle");
+    std::fs::create_dir(ok_bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(ok_bundle.join("config.json"), config).expect("config");
+    // rootfs の無い bundle: core の create が失敗する（保持区間の中での失敗）。
+    let ng_bundle = tmp.0.join("bundle-norootfs");
+    std::fs::create_dir(&ng_bundle).expect("bundle");
+    std::fs::write(ng_bundle.join("config.json"), config).expect("config");
+
+    let create = |log: &std::path::Path, bundle: &std::path::Path, id: &str| {
+        run_exe_env(
+            &cli,
+            &[
+                "--root",
+                state_s,
+                "--pasta-path",
+                pasta_s,
+                "create",
+                "--bundle",
+                bundle.to_str().expect("utf8"),
+                "--network",
+                "web",
+                id,
+            ],
+            &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())],
+        )
+    };
+    let store_group: &[(&str, u32, u32)] =
+        &[("network.store.get", 2, 0), ("network.store.open", 2, 0)];
+
+    // (e) 成功: 終了コード 0・出力なし。1 組目は本体の create、2 組目は照合 2 回ぶん。
+    let log = tmp.0.join("e.jsonl");
+    let out = create(&log, &ok_bundle, "c1");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert_op_log_groups(&log, &[&[("create", 1, 0)], store_group]);
+    // 保持区間が状態記録まで届いた証拠: 参照中の定義は削除できない。
+    let out = run_isolated(&cli, &["--root", state_s, "network", "rm", "web"]);
+    assert_failure(
+        &out,
+        5,
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+    );
+
+    // (f) 保持区間の中での失敗: core の create が失敗しても 2 回目の照合は走り、2 組目に入る。
+    let log = tmp.0.join("f.jsonl");
+    let out = create(&log, &ng_bundle, "c2");
+    assert_failure(
+        &out,
+        3,
+        "{\"op\":\"create\",\"code\":\"NOT_FOUND\",\"message\":\"rootfs directory not found\"}\n",
+    );
+    assert_op_log_groups(&log, &[&[("create", 0, 1)], store_group]);
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -2314,7 +2314,8 @@ jobs:
           sel+='|SIGTERM delivered)'
           check --select "${sel}" \
             --subst PROBE_EXIT=7 --subst TERM_HANDLER_EXIT=43 --subst label=mount \
-            --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst-re pid='[1-9][0-9]*' --subst-re first_pid='[1-9][0-9]*' \
+            --subst-re relaunched_pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
             --subst-pos-re '[A-Z_]+' --min 9 --summary
           # model は subordinate に固定する（FANDHE_CONTAINER_TEST_ID_HELPER=1。single は期待行にも forbid にも掛かって失敗する）
           check --select '^supervisor_bin_real: id mapping verified ' \

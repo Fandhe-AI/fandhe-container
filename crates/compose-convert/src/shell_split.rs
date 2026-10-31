@@ -31,7 +31,7 @@ pub enum ShellSplitError {
     UnquotedParen,
     /// NUL を含む（argv に渡せない）。
     NulByte,
-    /// 語が無い（空・空白だけ・空の引用だけ）。
+    /// 語が無い（空・空白だけ）。
     Empty,
     /// 語の数が [`MAX_SHELL_ARGS`] を超えた。
     TooManyArgs,
@@ -116,7 +116,6 @@ pub fn split_command(input: &str) -> Result<Vec<String>, ShellSplitError> {
     }
     match args.as_slice() {
         [] => Err(ShellSplitError::Empty),
-        [only] if only.is_empty() => Err(ShellSplitError::Empty),
         _ => Ok(args),
     }
 }
@@ -198,7 +197,9 @@ mod tests {
         assert_eq!(split_command("x\0y"), Err(ShellSplitError::NulByte));
         assert_eq!(split_command(""), Err(ShellSplitError::Empty));
         assert_eq!(split_command("   "), Err(ShellSplitError::Empty));
-        assert_eq!(split_command("\"\""), Err(ShellSplitError::Empty));
+        // 引用だけの空の 1 語は argv [""]（go-shellwords 互換。配列形 [''] と揃える）。
+        assert_eq!(ok("\"\""), [""]);
+        assert_eq!(ok("''"), [""]);
     }
 
     /// STACK-3: 語の数の上限境界。

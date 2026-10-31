@@ -151,7 +151,7 @@ pub const ALL_DEVICE_NAME: &str = "all";
 /// （crate-naming.md 決定 5）ため共有しない。`up`（TASK-155）では gpu crate が改めて名前を解析する。
 /// 両者の規則がずれる危険は残るため、gpu 側の規則を変えたらここも見直す。
 /// `/`・`=`・空白・NUL・制御文字・非 ASCII は通らず、kind や区切りの差し込みを防ぐ。
-fn is_valid_cdi_device_name(s: &str) -> bool {
+pub(crate) fn is_valid_cdi_device_name(s: &str) -> bool {
     let b = s.as_bytes();
     let (Some(first), Some(last)) = (b.first(), b.last()) else {
         return false;

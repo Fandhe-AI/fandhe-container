@@ -159,6 +159,8 @@ pub fn convert_argv(
     drops: &mut ValueDrops,
 ) -> Option<Vec<String>> {
     let out = match v {
+        // null は「指定なし」を表す有効な値で、変換先では None で表せる（drop に数えない）。
+        ComposeValue::Null => return None,
         ComposeValue::String(s) => match split_command(s) {
             Ok(v) => Some(v),
             // 空文字列は「イメージの既定を打ち消す」意味なので、None（キー無し）と区別して `[]` にする。
@@ -301,9 +303,37 @@ pub fn convert_tmpfs(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
     string_items(v, P_TMPFS, true, false, drops)
 }
 
-/// `devices` の short syntax。マッピング要素は #865 で変換する（現状は drop）。
+/// `devices` の short syntax。`Service.devices` は CDI 完全修飾名専用のため、ホストパス形
+/// （`/dev/dri:/dev/dri` 等）は出力せず drop に記録する。マッピング要素は #865 で変換する（現状は drop）。
 pub fn convert_devices(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
     string_items(v, P_DEVICES, false, false, drops)
+        .into_iter()
+        .filter(|s| {
+            let ok = is_cdi_qualified_name(s);
+            if !ok {
+                drops.note(P_DEVICES);
+            }
+            ok
+        })
+        .collect()
+}
+
+/// CDI 完全修飾名 `vendor/class=name` か。ホストパス形（`/dev/x:/dev/x`）を区別するための判定。
+fn is_cdi_qualified_name(s: &str) -> bool {
+    let Some((kind, name)) = s.split_once('=') else {
+        return false;
+    };
+    let Some((vendor, class)) = kind.split_once('/') else {
+        return false;
+    };
+    let part_ok = |p: &str| {
+        let b = p.as_bytes();
+        matches!((b.first(), b.last()), (Some(f), Some(l))
+            if f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric())
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+    };
+    part_ok(vendor) && part_ok(class) && crate::gpu_reservation::is_valid_cdi_device_name(name)
 }
 
 /// `profiles`。文字列のリスト（単独の文字列も 1 要素）。
@@ -573,6 +603,27 @@ mod tests {
         let (s, d, _) = svc("    command: npm run dev\n");
         assert_eq!(s.command, Some(strs(&["npm", "run", "dev"])));
         assert!(d.is_empty());
+    }
+
+    /// STACK-3: command / entrypoint の null は None で drop に数えない。引用だけの空語は [""]。
+    #[test]
+    fn stack3_argv_null_and_quoted_empty() {
+        let (s, d, _) = svc("    command: null\n    entrypoint: null\n");
+        assert_eq!(s.command, None);
+        assert_eq!(s.entrypoint, None);
+        assert!(d.is_empty());
+        let (s, d, _) = svc("    command: '\"\"'\n    entrypoint: ['']\n");
+        assert_eq!(s.command, Some(strs(&[""])));
+        assert_eq!(s.entrypoint, Some(strs(&[""])));
+        assert!(d.is_empty());
+    }
+
+    /// STACK-3・GPU-1: devices のホストパス形は出力せず drop に記録する。
+    #[test]
+    fn stack3_devices_host_path_is_dropped() {
+        let (s, d, _) = svc("    devices: ['/dev/dri:/dev/dri', 'nvidia.com/gpu=0']\n");
+        assert_eq!(s.devices, strs(&["nvidia.com/gpu=0"]));
+        assert_eq!(d.get(P_DEVICES), 1);
     }
 
     /// STACK-3: 引用つきの分割。

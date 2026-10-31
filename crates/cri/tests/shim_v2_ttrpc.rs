@@ -193,3 +193,23 @@ fn cri5_shutdown_closes_idle_connections() {
     h.shutdown().unwrap();
     assert_closed(&mut s);
 }
+
+/// CRI-5: フレーム途中（ヘッダ 1 バイトのみ）で止まった接続があっても、
+/// shutdown は frame_read_timeout を待たず shutdown_timeout 内に成功する。
+#[test]
+fn cri5_shutdown_with_mid_frame_stalled_connection() {
+    let cfg = ServerConfig {
+        frame_read_timeout: Duration::from_secs(30),
+        shutdown_timeout: Duration::from_secs(3),
+        ..ServerConfig::default()
+    };
+    let (_r, path, h) = start("stall", TaskApiVersion::V2, cfg);
+    let mut s = connect(&path);
+    s.write_all(&[0u8]).unwrap();
+    // サーバーが 1 バイトを読んでフレーム読み取りに入るのを待つ。
+    std::thread::sleep(Duration::from_millis(200));
+    let t = std::time::Instant::now();
+    h.shutdown().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(3));
+    assert_closed(&mut s);
+}

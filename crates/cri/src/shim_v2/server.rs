@@ -206,14 +206,19 @@ enum ReadOutcome {
 }
 
 /// `buf` を `deadline` までに満たす。
-fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> ReadOutcome {
+/// `poll_interval` ごとに停止フラグを確かめ、停止要求でも戻る（shutdown の期限を守る）。
+fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &Ctx) -> ReadOutcome {
     let mut filled = 0;
     while filled < buf.len() {
+        if ctx.stop.load(Ordering::SeqCst) {
+            return ReadOutcome::Closed;
+        }
         let now = Instant::now();
         if now >= deadline {
             return ReadOutcome::Closed;
         }
-        if stream.set_read_timeout(Some(deadline - now)).is_err() {
+        let slice = (deadline - now).min(ctx.config.poll_interval);
+        if stream.set_read_timeout(Some(slice)).is_err() {
             return ReadOutcome::Closed;
         }
         let Some(rest) = buf.get_mut(filled..) else {
@@ -222,7 +227,13 @@ fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> Read
         match stream.read(rest) {
             Ok(0) => return ReadOutcome::Closed,
             Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
             Err(_) => return ReadOutcome::Closed,
         }
     }
@@ -253,6 +264,27 @@ fn wait_first_byte(stream: &mut UnixStream, ctx: &Ctx) -> Option<u8> {
                         | io::ErrorKind::Interrupted
                 ) => {}
             Err(_) => return None,
+        }
+    }
+}
+
+/// 応答後に書き側を閉じ、相手が送りかけのデータを短時間だけ読み捨てる。
+/// 未読データを残したまま close すると RST になり、応答が読まれる前に切れうるため。
+/// ペイロードは確保せず捨てるだけで、時間は `poll_interval` の数回分に限る。
+fn drain_then_close(stream: &mut UnixStream, ctx: &Ctx) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    if stream
+        .set_read_timeout(Some(ctx.config.poll_interval))
+        .is_err()
+    {
+        return;
+    }
+    let deadline = Instant::now() + ctx.config.poll_interval * 4;
+    let mut sink = [0u8; 4096];
+    while Instant::now() < deadline && !ctx.stop.load(Ordering::SeqCst) {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
     }
 }
@@ -297,7 +329,10 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
         let mut raw = [0u8; HEADER_LEN];
         raw[0] = first;
         if let Some(rest) = raw.get_mut(1..)
-            && matches!(read_full(&mut stream, rest, deadline), ReadOutcome::Closed)
+            && matches!(
+                read_full(&mut stream, rest, deadline, ctx),
+                ReadOutcome::Closed
+            )
         {
             return;
         }
@@ -316,13 +351,14 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                     }
                 };
                 let _ = write_response(&mut stream, raw_stream_id, &status_response(code, msg));
+                drain_then_close(&mut stream, ctx);
                 return;
             }
         };
         // 長さは検証済み（<= MAX_PAYLOAD_LEN）なのでここで初めて確保する。
         let mut payload = vec![0u8; header.length() as usize];
         if matches!(
-            read_full(&mut stream, &mut payload, deadline),
+            read_full(&mut stream, &mut payload, deadline, ctx),
             ReadOutcome::Closed
         ) {
             return;

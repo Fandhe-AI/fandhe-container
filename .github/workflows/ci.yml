@@ -681,6 +681,12 @@ jobs:
         if: env.HANG_PROBE != 'true'
         shell: bash
         run: make check-cli-backend-deps
+      # rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）。既存ジョブへのステップ追加（check-run 件数は不変）
+      - name: rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        shell: bash
+        run: make check-microvm-deps
       # plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけであることの
       # 機械判定（PLUG-11・#1857）。cargo を使わないソースの走査。既存ジョブへのステップ追加（check-run 件数は不変）
       - name: plugin 起動対象の構築箇所の検証（PLUG-11・#1857）
@@ -1133,6 +1139,12 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make check-standalone-clippy-selftest
+
+      # 禁止クレート判定の自己テスト（MVM-4・TASK-73.1・REPAIR-12）。スタブの cargo のみ。既存ジョブのステップ
+      - name: 禁止クレート判定の自己テスト（MVM-4・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-microvm-deps-selftest
 
       # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）

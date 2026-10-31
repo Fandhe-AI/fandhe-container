@@ -9,7 +9,7 @@
 
 ## 禁止クレート
 
-- rust-vmm organization のクレート群（`vm-memory`・`kvm-ioctls`・`kvm-bindings`・`vhost`・`vhost-user-backend`・`virtio-queue`・`vmm-sys-util`・`linux-loader`・`event-manager`・`vm-superio` 等）は依存ツリーに含めない（MVM-4）。機械判定は TASK-73（`scripts/check-microvm-deps.sh`・`deny.toml` の `[bans]`）で導入する
+- rust-vmm organization のクレート群（`vm-memory`・`kvm-ioctls`・`kvm-bindings`・`vhost`・`vhost-user-backend`・`virtio-queue`・`vmm-sys-util`・`linux-loader`・`event-manager`・`vm-superio` 等）は依存ツリーに含めない（MVM-4）。機械判定は `scripts/check-microvm-deps.sh`（`make check-microvm-deps`。導入済み・TASK-73.1）と、`deny.toml` の `[bans]`（TASK-73.2・#686 で導入予定）
 - youki（`libcontainer` 等）・Cloud Hypervisor・Firecracker 由来のクレートも同様に採用しない
 
 ## 承認を求める際に提示する情報

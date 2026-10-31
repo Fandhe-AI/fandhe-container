@@ -25,7 +25,7 @@ SHELL := /bin/bash
 
 .PHONY: help setup rustup submodule hooks lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
-	check-launch-target check-launch-target-selftest \
+	check-launch-target check-launch-target-selftest check-microvm-deps check-microvm-deps-selftest \
 	check-standalone-clippy check-standalone-clippy-selftest \
 	test-core-no-plugin check-cli-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
@@ -111,6 +111,12 @@ poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-che
 
 check-cli-backend-deps: ## cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
 	@scripts/targets/check-cli-backend-deps.sh
+
+check-microvm-deps: ## 依存ツリー（ルート workspace と venus 試験治具。normal/build/dev・全ターゲット・全 feature）に rust-vmm 系の禁止クレートが含まれないことを検証する（MVM-4・TASK-73.1）
+	@scripts/with-workspace.sh check-microvm-deps scripts/check-microvm-deps.sh
+
+check-microvm-deps-selftest: ## check-microvm-deps の自己テスト（MVM-4・REPAIR-12。スタブの cargo のみ）
+	@scripts/check-microvm-deps-selftest.sh
 
 check-launch-target: ## plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
 	@scripts/targets/check-launch-target.sh

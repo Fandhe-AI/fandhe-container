@@ -11,13 +11,23 @@
 //!   合成フィクスチャでの往復検証は #626（TASK-156.3）。`deploy` / `resources` / `reservations` が
 //!   マッピングでない場合の記録は変換器本体（#598・#599）が担う。
 //! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は #595 の結線で行う（依存を増やさない）。
-//! - 入力の大きさ: 再帰しない一段の走査で、確保は要素数に比例するだけ。要素数・深さの上限は
-//!   パーサーの `Budget`（#595）が担う。
+//! - 入力の大きさ: 再帰しない一段の走査。確保・複製の前に [`MAX_DEVICES`]・[`MAX_DEVICE_IDS`]・
+//!   [`MAX_DEVICE_ID_BYTES`]・[`MAX_DEVICE_IDS_TOTAL_BYTES`] を検証し、超過は構造化された
+//!   [`GpuDropReason`] で対象外にする（パーサーの `Budget`〔#595〕に依存しない）。
 //! - PoC-16 との差: PoC は不正な device_id を飛ばして残りを変換し、`capabilities` の文字列でない要素を
 //!   無視するが、本実装は GPU の数が黙って減らないよう予約ごと対象外にして記録する（fail-closed）。
 
 /// `value_drops` に使うキーパス。識別子を含まない。
 pub const DEVICES_KEY_PATH: &str = "services.*.deploy.resources.reservations.devices";
+
+/// `devices` の要素数の上限。超えたら全体を対象外にする（STACK-9・REPAIR-5。無制限確保の防止）。
+pub const MAX_DEVICES: usize = 256;
+/// 1 予約の `device_ids` の件数の上限。
+pub const MAX_DEVICE_IDS: usize = 256;
+/// `device_ids` の 1 要素の最大バイト数。
+pub const MAX_DEVICE_ID_BYTES: usize = 256;
+/// 1 予約の `device_ids` の総バイト数の上限。
+pub const MAX_DEVICE_IDS_TOTAL_BYTES: usize = 16 * 1024;
 
 /// 検出が入力の YAML ノードに求める最小の読み取り口。
 pub trait ComposeNode: Sized {
@@ -104,6 +114,12 @@ pub enum GpuDropReason {
     DeviceIdsEmpty,
     /// `device_ids` に文字列でも非負整数でもない要素がある。
     DeviceIdInvalid,
+    /// `devices` の要素数が [`MAX_DEVICES`] を超える（全体を対象外にする）。
+    TooManyDevices,
+    /// `device_ids` の件数が [`MAX_DEVICE_IDS`] を超える。
+    TooManyDeviceIds,
+    /// `device_ids` の要素が [`MAX_DEVICE_ID_BYTES`] を超える、または総バイト数が上限を超える。
+    DeviceIdTooLong,
 }
 
 /// `devices` ノードから GPU 予約を検出する（STACK-9）。
@@ -119,6 +135,13 @@ pub fn detect_gpu_reservations<N: ComposeNode>(devices: &N) -> GpuReservationDet
         });
         return out;
     };
+    if items.len() > MAX_DEVICES {
+        out.drops.push(GpuReservationDrop {
+            index: None,
+            reason: GpuDropReason::TooManyDevices,
+        });
+        return out;
+    }
     for (index, item) in items.iter().enumerate() {
         match classify(item) {
             Ok(request) => out
@@ -169,15 +192,27 @@ fn classify<N: ComposeNode>(item: &N) -> Result<GpuRequest<'_, N>, GpuDropReason
             if ids.is_empty() {
                 return Err(GpuDropReason::DeviceIdsEmpty);
             }
+            if ids.len() > MAX_DEVICE_IDS {
+                return Err(GpuDropReason::TooManyDeviceIds);
+            }
             let mut out = Vec::with_capacity(ids.len());
+            let mut total = 0usize;
             for id in ids {
-                if let Some(s) = id.as_str() {
-                    out.push(s.to_owned());
+                let v = if let Some(s) = id.as_str() {
+                    if s.len() > MAX_DEVICE_ID_BYTES {
+                        return Err(GpuDropReason::DeviceIdTooLong);
+                    }
+                    s.to_owned()
                 } else if let Some(n) = id.as_u64() {
-                    out.push(n.to_string());
+                    n.to_string()
                 } else {
                     return Err(GpuDropReason::DeviceIdInvalid);
+                };
+                total = total.saturating_add(v.len());
+                if total > MAX_DEVICE_IDS_TOTAL_BYTES {
+                    return Err(GpuDropReason::DeviceIdTooLong);
                 }
+                out.push(v);
             }
             Ok(GpuRequest::DeviceIds(out))
         }
@@ -341,6 +376,49 @@ mod tests {
                 (Some(7), GpuDropReason::DeviceIdInvalid),
             ]
         );
+    }
+
+    /// STACK-9・REPAIR-5: 件数・長さの上限超過は確保前に構造化された理由で対象外になる。
+    #[test]
+    fn size_limits_are_enforced() {
+        let many = seq((0..=MAX_DEVICES).map(|_| gpu(vec![])).collect());
+        assert_eq!(drop_of(many), vec![(None, GpuDropReason::TooManyDevices)]);
+        let at_limit = seq((0..MAX_DEVICES).map(|_| gpu(vec![])).collect());
+        assert_eq!(
+            detect_gpu_reservations(&at_limit).reservations.len(),
+            MAX_DEVICES
+        );
+
+        let many_ids = gpu(vec![(
+            "device_ids",
+            seq((0..=MAX_DEVICE_IDS).map(|_| s("0")).collect()),
+        )]);
+        let long_id = gpu(vec![(
+            "device_ids",
+            seq(vec![s(&"a".repeat(MAX_DEVICE_ID_BYTES + 1))]),
+        )]);
+        let total = gpu(vec![(
+            "device_ids",
+            seq((0..MAX_DEVICE_IDS)
+                .map(|_| s(&"a".repeat(MAX_DEVICE_ID_BYTES)))
+                .collect()),
+        )]);
+        let ok_id = gpu(vec![(
+            "device_ids",
+            seq(vec![s(&"a".repeat(MAX_DEVICE_ID_BYTES))]),
+        )]);
+        let devices = seq(vec![many_ids, long_id, total, ok_id]);
+        let d = detect_gpu_reservations(&devices);
+        let drops: Vec<_> = d.drops.iter().map(|x| (x.index, x.reason)).collect();
+        assert_eq!(
+            drops,
+            vec![
+                (Some(0), GpuDropReason::TooManyDeviceIds),
+                (Some(1), GpuDropReason::DeviceIdTooLong),
+                (Some(2), GpuDropReason::DeviceIdTooLong),
+            ]
+        );
+        assert_eq!(d.reservations.len(), 1);
     }
 
     #[test]

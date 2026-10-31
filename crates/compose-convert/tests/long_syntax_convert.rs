@@ -37,7 +37,7 @@ fn run(
     let mut drops = Vec::new();
     for e in web.get(name).unwrap().as_sequence().unwrap() {
         match convert_long_syntax_element(key, e.as_mapping().unwrap()) {
-            Ok(s) => out.push(s),
+            Ok(c) => out.push(c.short_syntax),
             Err(d) => drops.push(d.reason),
         }
     }

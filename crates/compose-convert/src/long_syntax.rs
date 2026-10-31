@@ -130,17 +130,28 @@ fn drop_of(key: LongSyntaxKey, reason: LongSyntaxDropReason) -> LongSyntaxDrop {
     LongSyntaxDrop { key, reason }
 }
 
-/// マッピング 1 件を short syntax の文字列へ変換する。表せなければ要素ごと `Err`（部分変換しない）。
-pub fn convert_long_syntax_element(key: LongSyntaxKey, element: &ComposeMapping) -> R<String> {
-    match key {
-        LongSyntaxKey::Ports => convert_port(element),
-        LongSyntaxKey::Volumes => convert_volume(element),
-        LongSyntaxKey::Secrets => convert_source_only(LongSyntaxKey::Secrets, element),
-        LongSyntaxKey::Configs => convert_source_only(LongSyntaxKey::Configs, element),
+/// 変換に成功した要素 1 件。将来フィールドを足せるよう文字列ではなく構造体で返す（REPAIR-3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertedElement {
+    /// 変換後の short syntax 文字列（secrets / configs は名前）。
+    pub short_syntax: String,
+}
+
+/// マッピング 1 件を short syntax へ変換する。表せなければ要素ごと `Err`（部分変換しない）。
+pub fn convert_long_syntax_element(
+    key: LongSyntaxKey,
+    element: &ComposeMapping,
+) -> R<ConvertedElement> {
+    let short_syntax = match key {
+        LongSyntaxKey::Ports => convert_port(element)?,
+        LongSyntaxKey::Volumes => convert_volume(element)?,
+        LongSyntaxKey::Secrets => convert_source_only(LongSyntaxKey::Secrets, element)?,
+        LongSyntaxKey::Configs => convert_source_only(LongSyntaxKey::Configs, element)?,
         LongSyntaxKey::Tmpfs | LongSyntaxKey::Devices => {
-            Err(drop_of(key, LongSyntaxDropReason::NoLongSyntax))
+            return Err(drop_of(key, LongSyntaxDropReason::NoLongSyntax));
         }
-    }
+    };
+    Ok(ConvertedElement { short_syntax })
 }
 
 fn check_keys(key: LongSyntaxKey, m: &ComposeMapping, allowed: &[&str]) -> R<()> {
@@ -266,8 +277,10 @@ fn is_volume_name(s: &str) -> bool {
         && it.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+/// short syntax で名前付きボリュームと区別できるホストパスの形。
+/// compose の規則に合わせ、`/` `.` `~` で始まるもの（`.` `..` `.env` を含む）を受ける。
 fn is_host_path(s: &str) -> bool {
-    s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with('~')
+    s.starts_with(['/', '.', '~'])
 }
 
 fn convert_volume(m: &ComposeMapping) -> R<String> {
@@ -381,7 +394,9 @@ mod tests {
     }
 
     fn ok(key: LongSyntaxKey, yaml: &str) -> String {
-        convert_long_syntax_element(key, &el(yaml)).unwrap()
+        convert_long_syntax_element(key, &el(yaml))
+            .unwrap()
+            .short_syntax
     }
 
     fn err(key: LongSyntaxKey, yaml: &str) -> D {
@@ -467,6 +482,23 @@ mod tests {
                 "{type: bind, source: /h, target: /d, read_only: true, bind: {create_host_path: true}}"
             ),
             "/h:/d:ro"
+        );
+    }
+
+    /// STACK-3・REPAIR-12: bind の source が `.` `..` と dotted 名でも host path として受理する。
+    #[test]
+    fn bind_dot_sources_accepted() {
+        assert_eq!(ok(Volumes, "{type: bind, source: ., target: /d}"), ".:/d");
+        assert_eq!(
+            ok(
+                Volumes,
+                "{type: bind, source: .., target: /d, read_only: true}"
+            ),
+            "..:/d:ro"
+        );
+        assert_eq!(
+            ok(Volumes, "{type: bind, source: .env, target: /d}"),
+            ".env:/d"
         );
     }
 

@@ -71,8 +71,9 @@ struct Line {
     ack: Option<SyncSender<EmitOutcome>>,
 }
 
-/// 専用スレッドが終了時に返す書き手の受け口。
-type WriterReturn = Receiver<Box<dyn Write + Send>>;
+/// 専用スレッドが終了時に返す受け口。書き手と、まだ待つ依頼で通知していない書き込み失敗の行数を渡す
+/// （一時停止・再開をまたいでも「前回の待つ依頼以降の失敗」を失わないため。REPAIR-4）。
+type WriterReturn = Receiver<(Box<dyn Write + Send>, u64)>;
 
 /// 専用スレッドの状態。
 enum Phase {
@@ -90,6 +91,8 @@ struct Inner {
     done: Option<WriterReturn>,
     /// 一時停止で取り戻した書き手（再開で専用スレッドへ戻す）。
     writer: Option<Box<dyn Write + Send>>,
+    /// 取り戻した書き手に紐づく、未通知の書き込み失敗の行数（再開した専用スレッドへ引き継ぐ）。
+    carried_failed: u64,
     /// 一時停止中に溜めた行（`capacity` まで。超えた分は `QueueFull` で捨てる）。
     buffer: VecDeque<Vec<u8>>,
 }
@@ -107,7 +110,8 @@ pub struct StderrSink {
 impl StderrSink {
     /// `writer` へ書く専用スレッドを作り、`capacity` 行までのキューで包む（試験では任意の書き手を渡す）。
     pub fn spawn<W: Write + Send + 'static>(writer: W, capacity: usize) -> Self {
-        let (phase, done) = match Self::start_worker(Box::new(writer), capacity, VecDeque::new()) {
+        let (phase, done) = match Self::start_worker(Box::new(writer), capacity, VecDeque::new(), 0)
+        {
             Some((tx, done)) => (Phase::Running(tx), Some(done)),
             None => (Phase::Unavailable, None),
         };
@@ -117,6 +121,7 @@ impl StderrSink {
                 phase,
                 done,
                 writer: None,
+                carried_failed: 0,
                 buffer: VecDeque::new(),
             }),
         }
@@ -127,6 +132,7 @@ impl StderrSink {
         writer: Box<dyn Write + Send>,
         capacity: usize,
         backlog: VecDeque<Vec<u8>>,
+        carried_failed: u64,
     ) -> Option<(SyncSender<Line>, WriterReturn)> {
         // 再開時の溜め分の分だけ余裕を足す(溜め分で満杯にしない。上限は容量の 2 倍まで)。
         let (tx, rx) = sync_channel(capacity.saturating_add(backlog.len()));
@@ -138,8 +144,8 @@ impl StderrSink {
         std::thread::Builder::new()
             .name("supervisor-stderr".into())
             .spawn(move || {
-                let writer = drain(writer, rx);
-                let _ = done_tx.try_send(writer);
+                let returned = drain(writer, rx, carried_failed);
+                let _ = done_tx.try_send(returned);
             })
             .ok()?;
         Some((tx, done_rx))
@@ -231,11 +237,10 @@ impl StderrSink {
             return Ok(());
         };
         match done.recv_timeout(deadline) {
-            Ok(writer) => {
-                self.inner
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .writer = Some(writer);
+            Ok((writer, failed)) => {
+                let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                inner.writer = Some(writer);
+                inner.carried_failed = inner.carried_failed.saturating_add(failed);
                 Ok(())
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -273,9 +278,10 @@ impl StderrSink {
         }
         if inner.writer.is_none()
             && let Some(rx) = inner.done.as_ref()
-            && let Ok(w) = rx.try_recv()
+            && let Ok((w, failed)) = rx.try_recv()
         {
             inner.writer = Some(w);
+            inner.carried_failed = inner.carried_failed.saturating_add(failed);
             inner.done = None;
         }
         let Some(writer) = inner.writer.take() else {
@@ -285,7 +291,8 @@ impl StderrSink {
             ));
         };
         let backlog = std::mem::take(&mut inner.buffer);
-        match Self::start_worker(writer, self.capacity, backlog) {
+        let carried = std::mem::take(&mut inner.carried_failed);
+        match Self::start_worker(writer, self.capacity, backlog, carried) {
             Some((tx, done)) => {
                 inner.phase = Phase::Running(tx);
                 inner.done = Some(done);
@@ -303,8 +310,13 @@ impl StderrSink {
 }
 
 /// 専用スレッドの本体。全送り手が無くなるまで 1 行ずつ書き、待つ依頼には前回以降の結果を返す。終了時に書き手を返す。
-fn drain(mut writer: Box<dyn Write + Send>, rx: Receiver<Line>) -> Box<dyn Write + Send> {
-    let mut failed_lines: u64 = 0;
+/// 終了時は書き手と、通知しなかった失敗の行数を返す（再開した専用スレッドが `failed_lines` の初期値にする）。
+fn drain(
+    mut writer: Box<dyn Write + Send>,
+    rx: Receiver<Line>,
+    carried_failed: u64,
+) -> (Box<dyn Write + Send>, u64) {
+    let mut failed_lines: u64 = carried_failed;
     for line in rx {
         let written = line.bytes.is_empty()
             || writer
@@ -324,7 +336,7 @@ fn drain(mut writer: Box<dyn Write + Send>, rx: Receiver<Line>) -> Box<dyn Write
             let _ = ack.try_send(outcome);
         }
     }
-    writer
+    (writer, failed_lines)
 }
 static STDERR: OnceLock<StderrSink> = OnceLock::new();
 
@@ -588,6 +600,22 @@ mod tests {
         // 書き手がまだ戻っていないので再開できない。
         assert!(sink.resume().is_err());
         drop(release);
+    }
+
+    /// REPAIR-4・SUP-3（#2043）: 一時停止の前に失敗した行は、再開後の最初の待つ依頼で `WriteFailed` として返る。
+    #[test]
+    fn repair4_failures_survive_quiesce_and_resume() {
+        let sink = StderrSink::spawn(BrokenWriter, 4);
+        assert_eq!(sink.emit(b"x\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(sink.emit(b"y\n".to_vec()), EmitOutcome::Queued);
+        sink.quiesce(Duration::from_secs(5)).expect("quiesce");
+        sink.resume().expect("resume");
+        assert_eq!(
+            sink.flush(Duration::from_secs(5)),
+            EmitOutcome::WriteFailed { failed_lines: 2 }
+        );
+        // 通知した後は数え直す。
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
     }
 
     /// 結果の区別: 届いた（または届ける行が無い）ものだけが `is_delivered`。

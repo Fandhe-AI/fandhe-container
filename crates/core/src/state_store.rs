@@ -1027,9 +1027,12 @@ impl StateStore for FileStateStore {
         if let Some(r) = req.rlimits().or(existing.rlimits()) {
             record = record.with_rlimits(r.clone());
         }
-        // launch 時の分離の記録は指定があれば置き換え（restart の再 launch で記録し直す）、なければ引き継ぐ
-        // （トレイト契約 12。#1468）。
-        if let Some(l) = req.launch_isolation().or(existing.launch_isolation()) {
+        // launch 時の分離の記録は Replace なら置き換え（restart の再 launch で記録し直す）、Clear なら消し、
+        // Inherit なら引き継ぐ（トレイト契約 12。#1468・#2238）。
+        if let Some(l) = req
+            .launch_isolation_update()
+            .apply(existing.launch_isolation())
+        {
             record = record.with_launch_isolation(l.clone());
         }
         // core が作った rootfs の記録は update で変えずに引き継ぐ（トレイト契約 13。supervisor の status 更新で
@@ -3839,6 +3842,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replaced.launch_isolation(), Some(&iso(200)));
+        // #2238: Clear は記録を消し、state.json にキーを残さず、続く Inherit でも None のまま（再オープン後も）。
+        let cleared = store
+            .update(
+                &UpdateStateRequest::new(
+                    ContainerStatus::running(cid("web"), NonZeroU32::new(101)),
+                    replaced.revision(),
+                )
+                .clear_launch_isolation(),
+            )
+            .unwrap();
+        assert_eq!(cleared.launch_isolation(), None);
+        assert!(
+            read_json(&t, "web")
+                .get("launchIsolation")
+                .is_none_or(|v| v.is_null())
+        );
+        let after = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(cid("web"), NonZeroU32::new(101)),
+                cleared.revision(),
+            ))
+            .unwrap();
+        assert_eq!(after.launch_isolation(), None);
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.launch_isolation(), None);
     }
 
     fn image_rootfs_rec(path: &str, dev: u64, ino: u64) -> ImageRootfsRecord {

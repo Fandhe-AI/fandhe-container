@@ -602,12 +602,7 @@ impl PullSession<'_> {
         // （ls / df / prune / rm と同じ fail-closed）。リース登録の前に判定し、拒否時は何も残さない。
         let blob_dir = self.store.handle().open_blob_dir()?;
         let hex = hex_of(digest)?;
-        let path = self
-            .store
-            .root()
-            .join("blobs")
-            .join("sha256")
-            .join(hex_of(digest)?);
+        let path = super::usage::blob_dir(self.store.root()).join(hex_of(digest)?);
         {
             let mut guard = self.store.lock()?;
             let before = guard.inventory_portion();

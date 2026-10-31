@@ -72,6 +72,13 @@ pub struct Service {
     /// イメージ参照（未検証）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// 固定のコンテナ名（compose の `container_name`。TASK-153.1・#609・STACK-6。未検証）。
+    ///
+    /// 名前の形式・長さ・プロジェクト内の重複の検査は `up`（TASK-155）が CLI へ渡す時点で行う。
+    /// CLI の `create` には名前を指定する引数が無いため `create_option_args` へは写さない
+    /// （結線は未実装。REPAIR-3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     /// 起動コマンド（配列のみ。compose の文字列形は変換器〔TASK-151〕が配列へ正規化する）。
     ///
     /// PoC-16 の `Vec<String>` と違い `Option` とする。キー無し（イメージの既定を使う）と
@@ -81,6 +88,12 @@ pub struct Service {
     /// エントリポイント。`command` と同じく `Option` で `[]` を保つ。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
+    /// コンテナ内の作業ディレクトリ（compose の `working_dir`。OCI の `process.cwd`。TASK-153.1・#609・STACK-6）。
+    ///
+    /// 絶対パスであること・`..` を含まないことの検査は core の `ContainerWorkingDir` に任せ、
+    /// シェル文字列へ連結しない。`create` への結線は未実装（REPAIR-3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     /// 環境変数（compose の `environment` に当たる）。
     ///
     /// 値を持たない compose の `KEY` だけの形は表せない（変換器が空文字列に読み替える）。
@@ -243,7 +256,7 @@ impl Service {
     /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
     /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
     /// `ulimits`・`tmpfs`・`shm_size` はスキーマにあるが(#862)、`--ulimit`・`--tmpfs`・`--shm-size` への写しは
-    /// 未実装で含めない。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// 未実装で含めない。`container_name`・`working_dir`(#609)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
     ///
     /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
     /// パスは検証しない(読むのは CLI が利用者の権限で行う。範囲外参照の扱いは `up` の責務)。
@@ -382,6 +395,8 @@ name = "demo"
 
 [services.web]
 image = "example/web:1"
+container_name = "fixed-web"
+working_dir = "/app"
 command = ["serve", "--port", "8080"]
 entrypoint = []
 env_files = [".env"]
@@ -414,6 +429,8 @@ file = "./app.conf"
     fn web_service() -> Service {
         Service {
             image: Some("example/web:1".into()),
+            container_name: Some("fixed-web".into()),
+            working_dir: Some("/app".into()),
             command: Some(vec!["serve".into(), "--port".into(), "8080".into()]),
             entrypoint: Some(vec![]),
             env: BTreeMap::from([("MODE".into(), "dummy".into())]),
@@ -822,6 +839,8 @@ nproc = "-1"
     fn roundtrip_full_value() -> ComposeToml {
         let web = Service {
             image: Some("example/web:1".into()),
+            container_name: Some("roundtrip-web".into()),
+            working_dir: Some("/app".into()),
             command: Some(strs(&["serve", "--port=8080"])),
             entrypoint: Some(strs(&["/entry"])),
             env: map(&[("MODE", "dummy"), ("LEVEL", "debug")]),
@@ -864,6 +883,8 @@ nproc = "-1"
         };
         let worker = Service {
             image: None,
+            container_name: None,
+            working_dir: None,
             command: Some(vec![]),
             entrypoint: Some(vec![]),
             env: BTreeMap::new(),

@@ -27,3 +27,23 @@ fn stack3_scalar_convert_roundtrips_through_toml() {
     assert_eq!(web.ports, vec!["8080:80".to_string()]);
     assert!(drops.is_empty());
 }
+
+/// STACK-6・TASK-153.1（#609）: container_name・working_dir が TOML へ往復する。
+#[test]
+fn stack6_container_name_and_working_dir_roundtrip_through_toml() {
+    let doc = parse_compose_yaml(
+        "services:\n  a:\n    image: x\n    container_name: fixed-a\n    working_dir: /app\n  b:\n    working_dir: /srv\n",
+    )
+    .unwrap();
+    let mut drops = ValueDrops::new();
+    let t = convert_top_level(&doc, &mut drops);
+    let back: ComposeToml = toml::from_str(&toml::to_string(&t).unwrap()).unwrap();
+    assert_eq!(back, t);
+    assert_eq!(
+        back.services["a"].container_name.as_deref(),
+        Some("fixed-a")
+    );
+    assert_eq!(back.services["a"].working_dir.as_deref(), Some("/app"));
+    assert_eq!(back.services["b"].working_dir.as_deref(), Some("/srv"));
+    assert!(drops.is_empty());
+}

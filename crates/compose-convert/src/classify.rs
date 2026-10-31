@@ -133,6 +133,9 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("services.*.tmpfs", KeyClass::Convert),
     ("services.*.devices", KeyClass::Convert),
     ("services.*.profiles", KeyClass::Convert),
+    // TASK-153.1（#609・STACK-6）: PoC-16 で出現の多かった 2 キーを対象キーへ加えた。
+    ("services.*.container_name", KeyClass::Convert),
+    ("services.*.working_dir", KeyClass::Convert),
     ("services.*.deploy", KeyClass::Convert),
     ("services.*.deploy.resources", KeyClass::Convert),
     ("services.*.deploy.resources.limits", KeyClass::Convert),
@@ -154,8 +157,8 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("include", KeyClass::ErrorUnsupportedYet),
     ("extends", KeyClass::ErrorUnsupportedYet),
     ("profiles", KeyClass::ErrorUnsupportedYet),
-    // PR #337 の指摘で Warning から再分類した 13 キー（STACK-3）。
-    ("services.*.container_name", KeyClass::ErrorUnsupportedYet),
+    // PR #337 の指摘で Warning から再分類した 13 キー（STACK-3）のうち container_name は
+    // TASK-153.1（#609・STACK-6）で convert へ移した。残り 12 キーが error-unsupported-yet。
     ("services.*.hostname", KeyClass::ErrorUnsupportedYet),
     ("services.*.domainname", KeyClass::ErrorUnsupportedYet),
     ("services.*.mac_address", KeyClass::ErrorUnsupportedYet),
@@ -172,7 +175,6 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("services.*.extends", KeyClass::ErrorUnsupportedYet),
     ("services.*.network_mode", KeyClass::ErrorUnsupportedYet),
     ("services.*.user", KeyClass::ErrorUnsupportedYet),
-    ("services.*.working_dir", KeyClass::ErrorUnsupportedYet),
     ("services.*.cap_add", KeyClass::ErrorUnsupportedYet),
     ("services.*.cap_drop", KeyClass::ErrorUnsupportedYet),
     ("services.*.security_opt", KeyClass::ErrorUnsupportedYet),
@@ -292,14 +294,34 @@ mod tests {
             .collect()
     }
 
-    /// STACK-3: 再分類した 13 キーは表の行として error-unsupported-yet。
+    /// STACK-3・STACK-6: 再分類した 13 キーのうち container_name（#609 で convert へ移動）以外は
+    /// 表の行として error-unsupported-yet。
     #[test]
-    fn stack3_reclassified_13_keys_are_unsupported_yet() {
+    fn stack3_reclassified_keys_unsupported_yet_except_container_name() {
         assert_eq!(RECLASSIFIED_13.len(), 13);
         for k in RECLASSIFIED_13 {
             let p = format!("services.*.{k}");
             assert!(KEY_CLASS_TABLE.iter().any(|(t, _)| *t == p), "{p}");
-            assert_eq!(classify_key_path(&p), KeyClass::ErrorUnsupportedYet, "{p}");
+            let want = if k == "container_name" {
+                KeyClass::Convert
+            } else {
+                KeyClass::ErrorUnsupportedYet
+            };
+            assert_eq!(classify_key_path(&p), want, "{p}");
+        }
+    }
+
+    /// STACK-6・TASK-153.1（#609）: container_name・working_dir は表にちょうど 1 行の convert。
+    #[test]
+    fn stack6_container_name_and_working_dir_are_convert() {
+        for p in ["services.*.container_name", "services.*.working_dir"] {
+            assert_eq!(
+                KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(),
+                1,
+                "{p}"
+            );
+            assert_eq!(classify_key_path(p), KeyClass::Convert, "{p}");
+            assert!(!classify_key_path(p).is_error(), "{p}");
         }
     }
 
@@ -407,6 +429,8 @@ mod tests {
             "devices",
             "profiles",
             "deploy",
+            "container_name",
+            "working_dir",
         ];
         want.sort_unstable();
         assert_eq!(svc, want);

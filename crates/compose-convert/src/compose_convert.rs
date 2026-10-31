@@ -1,6 +1,6 @@
 //! compose.yaml の YAML 読み込みと、アンカー / エイリアス / マージキー（`<<`）の展開（TASK-151.1・#595・STACK-3・MS-12）。
 //!
-//! 変換器の最初の段。後続の段（キー分類 [`crate::classify`]（#596）・TOML 変換 #598・value_drops #599・走査 #600・bin #602）は、
+//! 変換器の最初の段。後続の段（キー分類 [`crate::classify`]（#596）・TOML 変換 #598・value_drops #599・走査 #600〔`input_scan`〕・bin #602）は、
 //! ここが返すパーサー非依存の単一モデル [`ComposeValue`] だけを読む。`serde-saphyr` の型は公開しない。
 //!
 //! # 契約

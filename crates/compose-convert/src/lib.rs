@@ -3,6 +3,7 @@
 //! YAML の読み込みとアンカー / マージキーの展開は [`compose_convert`] で実装済み（TASK-151.1・#595）。
 //! GPU 予約の検出（`gpu_reservation`。TASK-156.1・STACK-9）も実装済み。
 //! キー分類表（`classify`。TASK-151.2・#596・STACK-3）も実装済み。
+//! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み（bin への結線は #602）。
 //! TOML 変換以降の変換器の本体は未実装（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
 //! bin は未実装を構造化して返す雛形（TASK-151.0・#1070・STACK-3）。
 //! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.7（#602）以降。
@@ -12,6 +13,7 @@
 pub mod classify;
 pub mod compose_convert;
 pub mod gpu_reservation;
+pub mod input_scan;
 
 use std::io::Write;
 use std::process::ExitCode;

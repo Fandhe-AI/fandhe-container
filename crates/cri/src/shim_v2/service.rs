@@ -2,8 +2,8 @@
 //!
 //! `server` が復号した [`TtrpcRequest`] を [`ServiceRegistry::dispatch`] へ渡し、
 //! サービス名で [`TtrpcService`] を引いて呼ぶ。未知のサービス・メソッドは `Unimplemented`。
-//! [`EmptyTaskService`] はどのメソッドにも `Unimplemented` を返す空の Task サービスで、
-//! #672 以降で実メソッドを持つ実装に置き換える（REPAIR-3）。
+//! [`EmptyTaskService`] はどのメソッドにも `Unimplemented` を返す空の Task サービスで、ランタイム未注入の起動経路用。
+//! Create / Start を持つ実装は `task_service::TaskService`（TASK-62.2）。Delete 等は後続 issue（REPAIR-3）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ impl TtrpcService for EmptyTaskService {
     }
 }
 
-fn unimplemented_status(kind: &str, name: &str) -> RpcStatus {
+pub(super) fn unimplemented_status(kind: &str, name: &str) -> RpcStatus {
     let mut end = name.len().min(NAME_ECHO_MAX);
     while !name.is_char_boundary(end) {
         end -= 1;

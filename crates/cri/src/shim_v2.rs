@@ -9,13 +9,16 @@
 //! - [`frame`]: 10 バイトのヘッダ（壊れた値を表現できない型。REPAIR-2）
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
+//! - [`task_api`]・[`task_service`]: Task API の Create / Start のメッセージ型と実装（TASK-62.2）
 //! - `server`（unix のみ）: UDS 上のサーバー
 //!
 //! 出典: containerd/ttrpc の `PROTOCOL.md`・`request.proto`・`channel.go`・`server.go`・`services.go`
 //! （commit `232612d3cc492aa0c5c83aedac5d13a31a90b0cd`）。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）:
-//! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669・#672 以降）。本骨格はサービス名だけを持つ
+//! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669）。メッセージ型は手書きでサービス名だけで版を分ける
+//! - Delete / Wait（#673・#870・#871）、Exec（#674）、State / Kill / Shutdown（#873）。`Unimplemented`
+//! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Start の `exec_id`。黙って捨てず `UNIMPLEMENTED`
 //! - UDS の置き場所・権限・peer UID の照合（SO_PEERCRED）。呼び出し元が bind 済みの listener を渡す。#803（TASK-62.7）で扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata`・`timeout_nano` は復号するだけで使わない
 //! - Windows（named pipe）。listener と転送は unix のみ。ヘッダと封筒の型は全 OS で使える
@@ -26,9 +29,13 @@ pub mod message;
 #[cfg(unix)]
 pub mod server;
 pub mod service;
+pub mod task_api;
+pub mod task_service;
 
 pub use frame::{FrameError, FrameHeader, HEADER_LEN, MAX_PAYLOAD_LEN, MessageType};
 pub use message::{KeyValue, RpcStatus, TtrpcRequest, TtrpcResponse};
 #[cfg(unix)]
 pub use server::{ServerConfig, ServerHandle, ShimV2Error, TtrpcServer};
 pub use service::{EmptyTaskService, ServiceRegistry, TaskApiVersion, TtrpcService};
+pub use task_api::{CreateTaskRequest, CreateTaskResponse, Mount, StartRequest, StartResponse};
+pub use task_service::TaskService;

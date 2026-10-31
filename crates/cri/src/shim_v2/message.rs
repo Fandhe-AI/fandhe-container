@@ -14,6 +14,13 @@ pub const MAX_METADATA_ENTRIES: usize = 64;
 /// 復号前にワイヤー形式を走査し、`metadata`（フィールド 5）の件数が上限以内かを返す。
 /// 走査できない（切れた・未知のワイヤー型）場合も `false`（確保しない側に倒す）。
 pub fn metadata_within_limit(buf: &[u8]) -> bool {
+    count_top_level_field(buf, 5, MAX_METADATA_ENTRIES).is_some_and(|n| n <= MAX_METADATA_ENTRIES)
+}
+
+/// 復号前にワイヤー形式を走査し、最上位の長さ区切りフィールド `field` の出現数を数える。
+/// `limit` を超えた時点で打ち切り `Some(limit + 1)` を返す。切れた入力・未知のワイヤー型は `None`
+/// （呼び出し側は確保しない側に倒す）。metadata と shim の `rootfs`・`options` の件数検査で共有する。
+pub(crate) fn count_top_level_field(buf: &[u8], field: u64, limit: usize) -> Option<usize> {
     fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
         let mut v: u64 = 0;
         for i in 0..10u32 {
@@ -29,33 +36,29 @@ pub fn metadata_within_limit(buf: &[u8]) -> bool {
     let mut pos = 0usize;
     let mut count = 0usize;
     while pos < buf.len() {
-        let Some(tag) = varint(buf, &mut pos) else {
-            return false;
-        };
+        let tag = varint(buf, &mut pos)?;
         let skip = match tag & 7 {
             0 => varint(buf, &mut pos).map(|_| 0usize),
             1 => Some(8),
             5 => Some(4),
             2 => {
-                if tag >> 3 == 5 {
+                if tag >> 3 == field {
                     count += 1;
-                    if count > MAX_METADATA_ENTRIES {
-                        return false;
-                    }
                 }
                 varint(buf, &mut pos).and_then(|l| usize::try_from(l).ok())
             }
             _ => None,
         };
-        let Some(n) = skip else {
-            return false;
-        };
+        let n = skip?;
         match pos.checked_add(n) {
             Some(end) if end <= buf.len() => pos = end,
-            _ => return false,
+            _ => return None,
+        }
+        if count > limit {
+            return Some(count);
         }
     }
-    true
+    Some(count)
 }
 
 /// `KeyValue { string key = 1; string value = 2; }`。

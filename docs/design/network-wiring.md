@@ -333,6 +333,27 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 
 下の「実装 issue」を正とする。2h 以下の粒度で、親 #3056 の配下に起票した。
 
+### D17 create の定義照合の計測（op ログの 2 組。#3558・REPAIR-4・NET-6）
+
+`create --network <名前>` の定義照合は、本体の `OpRecorder`（`production_runtime` が `Runtime.recorder` として所有）とは別の記録器 `net_recorder` に `network.store.open` / `network.store.get` を記録する。#3558 で次を契約として決めた（記録器は統合しない）。
+
+契約:
+
+- `create` は `FANDHE_CONTAINER_OP_LOG` へ最大 2 組を、この順で追記する。1 組目は本体の記録器（`create` ほか）、2 組目は定義照合の記録器（`network.store.open` / `network.store.get`）
+- 各組は自分の `op_stats_meta` 行で終わり、1 回の write で追記される（他プロセスの行と混ざらない。2 組の間に別プロセスの組が挟まりうる）
+- 照合が走らないとき（`none` / `host` / 既定、`--pasta-path` も `--pasta-path-search` も無く `decide` の段で失敗する場合）は 2 組目を出さない
+- 操作名は固定文字列でネットワーク名・パスを含まない（start の再照合と同じ）
+- 読み手は「1 プロセス 1 メタ行」を仮定しない（plugin-cri の `pull-inventory-wiring.md` と同じ形）
+
+統合案（`Runtime.recorder` を `Arc<OpRecorder>` にして 1 つへ寄せる）の波及評価と、採らない理由:
+
+- 波及: `production_runtime` の引数と `Runtime`、呼び出し 9 か所（create_start 2・list_logs 4・stop_delete 3）、試験の `Runtime` 構築 2 か所、`run_start` の分解。`&rt.recorder` の約 35 か所は deref で通る見込み（未確認）
+- 得るもの: `op_stats_meta` 行が 1 行減ることだけ。集計値は変わらない
+- 全ライフサイクルコマンドの入口に触れるため、計測の issue としては波及が大きい（REPAIR-1）。64 種の上限（`MAX_TRACKED_OPS`）も統合の動機にならない
+- 再評価条件: op ログの読み手が 1 プロセス 1 組を要するようになったとき
+
+照合: 実バイナリの `repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group`（`crates/cli/tests/binary_entry.rs`。状態ルート無し・名前違い・pasta 無し・pasta 指定なしの 4 場面）。保持区間の記録は `create_network.rs` の関数単位の試験が固定する。成功経路（core の create まで到達）の実バイナリ照合は、信頼検証を通る pasta の配置が環境依存のため扱わない。
+
 ## 未実装範囲の棚卸し
 
 | 項目 | 該当ファイル | 待っている人間担当の条件 | 完了させる issue |

@@ -222,7 +222,9 @@ pub(super) fn check_network_options(
 /// 開くため、状態ルート・`@networks` を作らない。start も同じ照合をやり直す(supervisor の手順 2c)。
 ///
 /// `recorder` は本番では `run_create` が `CliNetRecorder` を渡し、定義ストアの `network.store.open` / `get` が
-/// `FANDHE_CONTAINER_OP_LOG` へ出る(start の再照合と同じ操作名。REPAIR-4・#3530)。
+/// `FANDHE_CONTAINER_OP_LOG` へ出る(start の再照合と同じ操作名。REPAIR-4・#3530)。この記録器は本体の記録器と別の
+/// 2 組目として出力される(契約は `docs/design/network-wiring.md`。#3558)。保持区間の 2 回目
+/// ([`with_named_definition_held`])も同じ記録器へ入る。
 pub(super) fn require_named_definition(
     global: &GlobalArgs,
     name: &NetworkName,
@@ -678,6 +680,76 @@ mod tests {
             ]
         );
         assert_eq!(code, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REPAIR-4・NET-6・CLI-1(#3558): 保持区間の 2 回目の照合(`with_named_definition_held`)も、定義ストアの操作を
+    /// `network.store.open` / `network.store.get` として記録する。実バイナリの成功経路は pasta の信頼検証が環境依存の
+    /// ため、保持区間の記録はここで固定する。失敗時は `body` を呼ばない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_net6_3558_with_named_definition_held_records_store_ops() {
+        use super::super::net_recorder::CliNetRecorder;
+        use fandhe_container_core::observability::OpRecorder;
+        use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+
+        // (結果コード, body の呼び出し回数, 記録(操作名, 成功数, 失敗数))を返す。
+        fn held(root: &Path, name: &str) -> (Option<ErrorCode>, u32, Vec<(String, u64, u64)>) {
+            let rec = Arc::new(OpRecorder::new());
+            let r: Arc<dyn NetOpRecorder> = Arc::new(CliNetRecorder::new(Arc::clone(&rec)));
+            let mut calls = 0;
+            let res = with_named_definition_held(
+                root,
+                &NetworkName::new(name).expect("n"),
+                DEFAULT_LOCK_TIMEOUT,
+                Some(r),
+                || {
+                    calls += 1;
+                    Ok(())
+                },
+            );
+            let ops = rec
+                .snapshot()
+                .iter()
+                .map(|s| (s.name().as_str().to_string(), s.success(), s.failure()))
+                .collect();
+            (res.err().map(|e| e.code()), calls, ops)
+        }
+        let row = |n: &str, s: u64, f: u64| (n.to_string(), s, f);
+
+        let root = tmp_root("held");
+        // @networks が無い: open は Ok(None) で成功として数え、get は呼ばれない。
+        let (code, calls, ops) = held(&root, "web");
+        assert_eq!(code, Some(ErrorCode::NotFound));
+        assert_eq!(calls, 0);
+        assert_eq!(ops, vec![row("network.store.open", 1, 0)]);
+
+        let store = NetworkStore::open(&root).expect("open");
+        store
+            .create(&NetworkDefinition::pasta("web").expect("def"))
+            .expect("create");
+        // 名前が無い: get が失敗として記録され、body は呼ばれない。
+        let (code, calls, ops) = held(&root, "other");
+        assert_eq!(code, Some(ErrorCode::NotFound));
+        assert_eq!(calls, 0);
+        assert_eq!(
+            ops,
+            vec![
+                row("network.store.get", 0, 1),
+                row("network.store.open", 1, 0)
+            ]
+        );
+        // 定義がある: 成功し body が 1 回呼ばれる。ロック取得は記録しない。
+        let (code, calls, ops) = held(&root, "web");
+        assert_eq!(code, None);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            ops,
+            vec![
+                row("network.store.get", 1, 0),
+                row("network.store.open", 1, 0)
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

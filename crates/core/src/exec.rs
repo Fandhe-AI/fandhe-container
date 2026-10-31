@@ -188,8 +188,8 @@ pub use diagnostic::{
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
-    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
-    spawn_exec_worker_with_listener,
+    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_command_with_stdio,
+    spawn_exec_worker, spawn_exec_worker_with_listener,
 };
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;

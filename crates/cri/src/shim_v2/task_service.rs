@@ -1,4 +1,4 @@
-//! containerd Task API の Create / Start を `ContainerRuntime` へつなぐサービス（CRI-5・TASK-62.2・MS-7）。
+//! containerd Task API の Create / Start / Delete を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・MS-7）。
 //!
 //! [`ServiceRegistry::dispatch`](super::service::ServiceRegistry::dispatch) から呼ばれる同期ハンドラで、
 //! 接続ごとのスレッド上で動く。コンテナの作成・起動は [`RuntimeAdapter`] 経由で行い、core の具象型には
@@ -6,10 +6,17 @@
 //! ttrpc の `Response.status` に載せる。
 //!
 //! 未対応の欄は黙って無視せず `UNIMPLEMENTED` で拒否する（fail-closed。REPAIR-3）:
-//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`・`exec_id`。
+//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`・`exec_id`（Start・Delete）。
 //! `rootfs` と `options`（型に持たない）は repeated / 入れ子の確保を避けるため、復号前に走査して拒否する。
 //!
 //! 検査の順序: 復号前の走査（rootfs → options）→ 復号 → id → bundle → terminal → stdio → checkpoint。
+//!
+//! Delete の検査の順序: 復号（repeated / `Any` の欄が無いので走査は不要）→ exec_id → id（アダプタ）。
+//! 手順は state（削除前の pid・終了コードを採る）→ `remove(force=false)`。containerd の Delete に force は
+//! 無く、実行中のコンテナは core の `FailedPrecondition`（9）で拒否される。応答の `exit_status` は
+//! 終了コード（不明は 255）、`exited_at` は core が終了時刻を持たないため常に未設定（REPAIR-3。Wait は #871）。
+//! 既知の制約: state と remove の間に状態が変わりうる（その場合の `exit_status` は不正確）。pid のある
+//! `Created` は core の契約で force=false では削除できない。plugin 越しでは最悪 2 回分の待ちになる。
 //!
 //! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
 //! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
@@ -20,8 +27,11 @@ use prost::Message;
 
 use super::message::{RpcStatus, count_top_level_field};
 use super::service::{TaskApiVersion, TtrpcService, unimplemented_status};
-use super::task_api::{CreateTaskRequest, CreateTaskResponse, StartRequest, StartResponse};
-use crate::adapter::RuntimeAdapter;
+use super::task_api::{
+    CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, StartRequest,
+    StartResponse,
+};
+use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
 
 /// `bundle` の最大バイト数（PATH_MAX 相当）。
@@ -31,7 +41,10 @@ const FIELD_ROOTFS: u64 = 3;
 /// `CreateTaskRequest.options`（`Any`）のフィールド番号。型には持たない。
 const FIELD_OPTIONS: u64 = 10;
 
-/// Create / Start を処理する Task サービス。他のメソッドは `Unimplemented`。
+/// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
+const UNKNOWN_EXIT_STATUS: u32 = 255;
+
+/// Create / Start / Delete を処理する Task サービス。他のメソッドは `Unimplemented`。
 pub struct TaskService {
     version: TaskApiVersion,
     adapter: RuntimeAdapter,
@@ -85,6 +98,33 @@ impl TaskService {
         }
         .encode_to_vec())
     }
+
+    fn delete(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let req = DeleteRequest::decode(payload).map_err(|_| decode_failure())?;
+        if !req.exec_id.is_empty() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        // 状態を採れなければ削除しない（fail-closed。NotFound はそのまま 5）。
+        let before = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
+        self.adapter
+            .remove(&req.id, false)
+            .map_err(|e| to_status(&e))?;
+        Ok(DeleteResponse {
+            pid: before.pid.unwrap_or(0),
+            exit_status: exit_status_of(&before),
+            exited_at: None,
+        }
+        .encode_to_vec())
+    }
+}
+
+/// 削除前の状態から `exit_status` を決める。未起動の Created は 0、終了コード不明・負値は 255。
+fn exit_status_of(status: &RuntimeContainerStatus) -> u32 {
+    match (status.lifecycle, status.exit_code) {
+        (RuntimeLifecycle::Stopped, Some(c)) => u32::try_from(c).unwrap_or(UNKNOWN_EXIT_STATUS),
+        (RuntimeLifecycle::Created, _) if status.pid.is_none() => 0,
+        _ => UNKNOWN_EXIT_STATUS,
+    }
 }
 
 impl TtrpcService for TaskService {
@@ -96,6 +136,7 @@ impl TtrpcService for TaskService {
         match method {
             "Create" => self.create(payload),
             "Start" => self.start(payload),
+            "Delete" => self.delete(payload),
             _ => Err(unimplemented_status("method", method)),
         }
     }
@@ -156,9 +197,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use fandhe_container_core::traits::{
-        ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-        DeleteResponse, ErrorCode, KillRequest, StartRequest as RtStart, StateRequest, StopRequest,
-        TraitError,
+        ContainerId as RtId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
+        DeleteRequest as RtDelete, DeleteResponse as RtDeleteResponse, ErrorCode, KillRequest,
+        StartRequest as RtStart, StateRequest, StopRequest, TraitError,
     };
 
     use super::super::task_api::Mount;
@@ -171,6 +212,8 @@ mod tests {
         states: Mutex<HashMap<String, ContainerState>>,
         create_pid: Option<u32>,
         wrong_id: bool,
+        /// state が返す状態の上書き（終了コード等を差し込む）。
+        preset: Mutex<HashMap<String, ContainerStatus>>,
     }
 
     struct Shared(Arc<Fake>);
@@ -220,11 +263,39 @@ mod tests {
         fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
-        fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        fn delete(&self, r: &RtDelete) -> Result<RtDeleteResponse, TraitError> {
+            let id = r.id().as_str().to_owned();
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("delete {id} force={}", r.force()));
+            let mut st = self.0.states.lock().unwrap();
+            match st.get(&id) {
+                None => Err(TraitError::new(ErrorCode::NotFound, "none")),
+                Some(ContainerState::Running) => {
+                    Err(TraitError::new(ErrorCode::FailedPrecondition, "running"))
+                }
+                Some(_) => {
+                    st.remove(&id);
+                    Ok(RtDeleteResponse::new())
+                }
+            }
         }
-        fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            let id = r.id().as_str().to_owned();
+            self.0.calls.lock().unwrap().push(format!("state {id}"));
+            if let Some(p) = self.0.preset.lock().unwrap().get(&id) {
+                return Ok(p.clone());
+            }
+            match self.0.states.lock().unwrap().get(&id) {
+                None => Err(TraitError::new(ErrorCode::NotFound, "none")),
+                Some(ContainerState::Running) => Ok(ContainerStatus::running(
+                    r.id().clone(),
+                    NonZeroU32::new(4242),
+                )),
+                Some(_) => Ok(ContainerStatus::created(r.id().clone(), None)),
+            }
         }
     }
 
@@ -249,6 +320,25 @@ mod tests {
             exec_id: String::new(),
         }
         .encode_to_vec()
+    }
+
+    fn delete_req(id: &str, exec_id: &str) -> Vec<u8> {
+        DeleteRequest {
+            id: id.into(),
+            exec_id: exec_id.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn stopped(f: &Fake, id: &str, code: Option<i32>) {
+        f.preset.lock().unwrap().insert(
+            id.into(),
+            ContainerStatus::stopped(RtId::new(id).unwrap(), code),
+        );
+        f.states
+            .lock()
+            .unwrap()
+            .insert(id.into(), ContainerState::Stopped);
     }
 
     fn err_code(r: Result<Vec<u8>, RpcStatus>) -> (i32, String) {
@@ -415,7 +505,91 @@ mod tests {
     fn cri5_other_methods_unimplemented() {
         let (s, _) = svc(TaskApiVersion::V3, Fake::default());
         assert_eq!(s.name(), "containerd.task.v3.Task");
-        let (code, msg) = err_code(s.handle("Delete", &[]));
-        assert_eq!((code, msg.as_str()), (UNIMPL, "method Delete"));
+        let (code, msg) = err_code(s.handle("Wait", &[]));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "method Wait"));
+    }
+
+    /// CRI-5: V2 / V3 で Delete が通り、pid・exit_status が具体値で返る。再度の Delete は NOT_FOUND。
+    #[test]
+    fn cri5_delete_both_versions() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f) = svc(v, Fake::default());
+            s.handle("Create", &create_req("c1", "/b")).unwrap();
+            stopped(&f, "c1", Some(137));
+            let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
+            let r = DeleteResponse::decode(&out[..]).unwrap();
+            assert_eq!((r.pid, r.exit_status, r.exited_at), (0, 137, None));
+            let calls = f.calls.lock().unwrap().clone();
+            assert_eq!(
+                calls[calls.len() - 2..],
+                ["state c1".to_string(), "delete c1 force=false".to_string()]
+            );
+            assert_eq!(
+                err_code(s.handle("Delete", &delete_req("c1", ""))).0,
+                NOT_FOUND
+            );
+        }
+    }
+
+    /// CRI-5: 一度も起動していない Created の Delete は exit_status 0。
+    #[test]
+    fn cri5_delete_created_never_started() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
+        let r = DeleteResponse::decode(&out[..]).unwrap();
+        assert_eq!((r.pid, r.exit_status), (0, 0));
+    }
+
+    /// ERR-3: 存在しない ID は NOT_FOUND で、delete は呼ばれない。
+    #[test]
+    fn cri5_delete_not_found_err3() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        assert_eq!(
+            err_code(s.handle("Delete", &delete_req("nope", ""))).0,
+            NOT_FOUND
+        );
+        assert_eq!(*f.calls.lock().unwrap(), vec!["state nope".to_string()]);
+    }
+
+    /// 実行中は FAILED_PRECONDITION で、コンテナは残る。
+    #[test]
+    fn cri5_delete_running_is_failed_precondition() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        assert_eq!(
+            err_code(s.handle("Delete", &delete_req("c1", ""))).0,
+            PRECOND
+        );
+        assert!(s.adapter.state("c1").is_ok());
+    }
+
+    /// 不正な入力はランタイムを呼ばずに拒否する。
+    #[test]
+    fn cri5_delete_invalid_inputs() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        assert_eq!(err_code(s.handle("Delete", &delete_req("", ""))).0, INVALID);
+        assert_eq!(
+            err_code(s.handle("Delete", &delete_req("bad id!", ""))).0,
+            INVALID
+        );
+        let (code, msg) = err_code(s.handle("Delete", &[0x0a, 5, 1]));
+        assert_eq!((code, msg.as_str()), (INVALID, "malformed request payload"));
+        let (code, msg) = err_code(s.handle("Delete", &delete_req("c1", "e")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    /// exit_status の写像。
+    #[test]
+    fn cri5_exit_status_mapping() {
+        let id = || RtId::new("c1").unwrap();
+        let m = |s: ContainerStatus| exit_status_of(&RuntimeContainerStatus::from(&s));
+        assert_eq!(m(ContainerStatus::stopped(id(), Some(0))), 0);
+        assert_eq!(m(ContainerStatus::stopped(id(), Some(137))), 137);
+        assert_eq!(m(ContainerStatus::stopped(id(), None)), 255);
+        assert_eq!(m(ContainerStatus::stopped(id(), Some(-1))), 255);
+        assert_eq!(m(ContainerStatus::created(id(), None)), 0);
     }
 }

@@ -11,7 +11,10 @@
 //! [`IsolateError::Busy`] で拒否する（fail-closed）。残ったスレッドは plugin プロセスの終了で消える。
 //! 計数は [`Workers`] の実体ごとで、create の検証用（アダプタ）と launch 用（`PlatformBackend`）は別の実体を
 //! 持つ。プロセス全体で残り得る作業スレッドは最大 `2 * MAX_WORKERS`（8）。
-//! 期限後に作業スレッドが返した値は受け手が無いため drop される（`Vm` なら drop の停止要求が走る）。
+//! 期限後に作業スレッドが返した値は受け手が無いため、常に作業スレッド側で drop される（`Vm` なら drop の
+//! 停止要求が走る）。チャネルは容量 0（rendezvous）で、期限切れ直後の窓に送られた値が呼び出し元の
+//! スレッドで drop されることは無い（容量 1 では `rx` の drop が呼び出し元でバッファの値を捨てた。#3574）。
+//! 採らなかった案: `Timeout` 後の `try_recv`（`rx` の drop までの窓が残る）、`Mutex` の諦めフラグ（状態が増える）。
 //! 枠は結果と一緒に送り、受け手が受け取った直後に返す。[`run`] が `Ok` で戻った時点で、その作業の枠は
 //! 返却済みである（スレッド自体の終了は保証しない。#3453・#3507 と同じ「send の後の資源保持」の是正。
 //! #3549・PLUG-2・REPAIR-5）。
@@ -79,13 +82,31 @@ pub enum IsolateError {
 /// `f` は開始されないか（[`IsolateError::Busy`]・[`IsolateError::SpawnFailed`]）、ちょうど 1 回
 /// 実行される（[`IsolateError::Timeout`]・[`IsolateError::Died`] は開始後の失敗）。期限超過後も `f` は走り続け得るため、`f` の副作用は「期限超過でも完了し得る」前提で
 /// 呼び出し側が扱う（VM 起動なら停止未確認として記録する等）。
+/// [`IsolateError::Timeout`] を返した場合、`f` の戻り値は呼び出し元のスレッドでは drop されない
+/// （作業スレッド側で捨てる。#3574）。
 pub fn run<T, F>(workers: &Workers, timeout: Duration, f: F) -> Result<T, IsolateError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_inner(workers, timeout, f, || {})
+}
+
+/// [`run`] の本体。`after_timeout` は `recv_timeout` が期限切れで戻った直後、`rx` の drop 前に呼ぶ
+/// 試験用の差し込み口（期限切れ直後の窓を決定的に作る。製品では空のクロージャ。#3574）。
+fn run_inner<T, F, H>(
+    workers: &Workers,
+    timeout: Duration,
+    f: F,
+    after_timeout: H,
+) -> Result<T, IsolateError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    H: FnOnce(),
+{
     let slot = workers.acquire().ok_or(IsolateError::Busy)?;
-    let (tx, rx) = sync_channel::<(T, Slot)>(1);
+    let (tx, rx) = sync_channel::<(T, Slot)>(0);
     let spawned = std::thread::Builder::new()
         .name("fc-plugin-macos-isolated".to_string())
         .spawn(move || {
@@ -95,8 +116,9 @@ where
             let slot = slot;
             let v = f();
             // 枠は結果と一緒に送り、受け手が受け取った直後に返す（send の後に枠を持ち続けない）。
-            // 受け手が期限超過で去っていれば (値, 枠) の順にここで drop される。値（`Vm` なら停止要求）の
-            // 片づけの間も枠を数え続け、残り得る作業スレッドの上限を保つ。
+            // 容量 0 のため、受け手が待っている間しか成立しない。期限超過で受け手が去れば `SendError` が
+            // 中身を返し、(値, 枠) の順にこのスレッドで drop される（呼び出し元では drop しない。#3574）。
+            // 値（`Vm` なら停止要求）の片づけの間も枠を数え続け、残り得る作業スレッドの上限を保つ。
             let _ = tx.send((v, slot));
         });
     if spawned.is_err() {
@@ -107,7 +129,10 @@ where
             drop(slot);
             Ok(v)
         }
-        Err(RecvTimeoutError::Timeout) => Err(IsolateError::Timeout { after: timeout }),
+        Err(RecvTimeoutError::Timeout) => {
+            after_timeout();
+            Err(IsolateError::Timeout { after: timeout })
+        }
         Err(RecvTimeoutError::Disconnected) => Err(IsolateError::Died),
     }
 }
@@ -198,6 +223,56 @@ mod tests {
             assert_eq!(w.live(), MAX_WORKERS - 1, "round {i}");
         }
         drop(releases);
+        assert_eq!(wait_live(&w, 0), 0);
+    }
+
+    /// drop したスレッドの id を記録する値（期限切れ直後の送信値をどのスレッドが捨てるかの観測用）。
+    struct DropProbe(Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Ok(mut g) = self.0.lock() {
+                *g = Some(std::thread::current().id());
+            }
+        }
+    }
+
+    /// PLUG-2・REPAIR-5・#3574: 期限切れ直後に作業スレッドが返した値は、呼び出し元ではなく
+    /// 作業スレッド側で drop される。
+    #[test]
+    fn plug2_3574_repair5_value_sent_right_after_deadline_is_dropped_on_worker() {
+        let w = Workers::default();
+        let dropped = Arc::new(std::sync::Mutex::new(None));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (gate_tx, gate_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let after = Duration::from_millis(20);
+        let r = run_inner(
+            &w,
+            after,
+            move || {
+                let _ = gate_rx.recv();
+                let _ = done_tx.send(());
+                probe
+            },
+            || {
+                let _ = gate_tx.send(());
+                let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                // 作業スレッドが send に入るまで待つ（容量 1 ならここでバッファへ入る）。
+                std::thread::sleep(Duration::from_millis(50));
+            },
+        );
+        assert!(matches!(r, Err(IsolateError::Timeout { after: a }) if a == after));
+        let mut got = None;
+        for _ in 0..500 {
+            got = dropped.lock().ok().and_then(|g| *g);
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = got.expect("value must be dropped");
+        assert_ne!(id, std::thread::current().id());
         assert_eq!(wait_live(&w, 0), 0);
     }
 

@@ -28,7 +28,7 @@ Issue #3507・#3549・PLUG-2・REPAIR-5・SUP-1・SUP-7。#3453（`BoundedWriter
 | supervisor `supervisor_log.rs` run_bounded_with_slot | InflightSlot | 無害（受け手が join で確認） |
 | supervisor `control/target.rs`・`seccomp_notify.rs`・`stderr_sink.rs` の try_send | 常駐スレッドの所有物のみ | 無害 |
 | plugin `lifecycle.rs` plugin-stderr | `shared`・`stop`（Arc） | 無害（source は値で消費。Arc は収集器も持つ） |
-| plugin-macos `isolate.rs` run の作業スレッド | 作業枠 `Slot` | 該当。結果と一緒に枠を送り、受け手が受け取った直後に返すよう修正（#3549）。試験 `plug2_3549_repair5_slot_is_returned_before_result_is_received`。残余: 期限切れ直後に送信された値は rx の drop まで残る（既存の挙動で別事象） |
+| plugin-macos `isolate.rs` run の作業スレッド | 作業枠 `Slot` | 該当。結果と一緒に枠を送り、受け手が受け取った直後に返すよう修正（#3549）。試験 `plug2_3549_repair5_slot_is_returned_before_result_is_received`。期限切れ直後の送信値はチャネルを容量 0 にして作業スレッド側で drop する（#3574）。試験 `plug2_3574_repair5_value_sent_right_after_deadline_is_dropped_on_worker` |
 | plugin-cri `adapter.rs` run_startup_pull_recovery | なし | 無害（`f` が消費され、戻り値は集計値のみ） |
 | plugin-cri `orphan_bundles.rs` with_deadline | なし | 無害（`f` が取り込みごと消費。期限切れでロックを持ち続けるのは意図した動作） |
 | plugin-cri `telemetry.rs` の try_send | 常駐スレッドの所有物のみ | 無害 |

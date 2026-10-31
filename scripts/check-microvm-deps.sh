@@ -8,8 +8,8 @@
 #             混入の危険が最も高い）を検査する。既定の対象が無ければ NG（fail-closed）。
 #             治具を移動・削除するときは、ここの既定の対象もレビューつきで更新すること。
 #   --manifest-path: 指定した Cargo.toml だけを検査する（複数可）。
-#   --list: 禁止クレート名を 1 行 1 件で出す（cargo は呼ばない。#686 の deny.toml [bans] との機械照合用で、
-#           リストの二重管理を防ぐ）。
+#   --list: 禁止クレート名を 1 行 1 件で出す（cargo は呼ばない。deny.toml [bans] との機械照合用で、
+#           リストの二重管理を防ぐ。照合は `make deny-bans-fail-closed-selftest`。TASK-73.2・#686）。
 # 終了コード: 0 = 混入なし、1 = 混入または fail-closed、2 = usage。
 #
 # 判定:
@@ -25,7 +25,7 @@
 # - 照合できるのは package 名と repository URL まで。コードの写し（vendoring）や repository を書き換えた
 #   改名 fork は検出できない。
 # - youki・Firecracker・Cloud Hypervisor 由来のクレートは本スクリプトの範囲外（AGENTS.md の P0 観点が担う）。
-#   範囲を広げるときは #686 の deny.toml [bans] と同時に行う。
+#   範囲を広げるときは deny.toml [bans]（TASK-73.2）と同時に行う。
 # - ライセンスの確認は `make deny`（licenses）が担い、ここでは重複して検査しない。
 # - 禁止リストは spec TASK-73 の 10 種。それ以外の rust-vmm クレート（vm-fdt 等）は crates.io での実在と
 #   所属を一次情報で確認できたものだけを足す方針で、確認までは照合 B が補う。
@@ -102,9 +102,11 @@ for m in "${manifests[@]}"; do
     continue
   fi
   # 1 行 = `name vX.Y.Z[ (path)][ (proc-macro)][ (*)]|repository`。名前・版・repository を取り出して判定する。
-  hits="$(printf '%s\n' "${tree}" | awk -F'|' -v banned="${BANNED}" '
+  # macOS の BSD awk は改行を含む -v の値を拒む（`awk: newline in string`）ため、空白区切りへ直して渡す。
+  # クレート名は空白を含まない。
+  hits="$(printf '%s\n' "${tree}" | awk -F'|' -v banned="$(printf '%s' "${BANNED}" | tr '\n' ' ')" '
     BEGIN {
-      n = split(banned, b, "\n")
+      n = split(banned, b, " ")
       for (i = 1; i <= n; i++) { k = b[i]; gsub(/_/, "-", k); ban[k] = 1 }
     }
     NF >= 1 && $1 != "" {

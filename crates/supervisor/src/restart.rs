@@ -1577,7 +1577,9 @@ impl Relauncher for LauncherRelauncher {
                 )),
             };
             if let Err(e) = attached {
-                return match process.terminate(timeout) {
+                return match process.terminate(
+                    deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now())),
+                ) {
                     Ok(()) => Err(e),
                     Err(t) => {
                         self.stranded
@@ -1596,7 +1598,9 @@ impl Relauncher for LauncherRelauncher {
         {
             // 新プロセスを動かしたままにしない。回収できなければハンドルを保持し、
             // `take_stranded` 経由で呼び出し側が再回収できるようにする（CORE-1・REPAIR-5）。
-            return match process.terminate(timeout) {
+            return match process.terminate(
+                deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now())),
+            ) {
                 Ok(()) => Err(e),
                 Err(t) => {
                     self.stranded

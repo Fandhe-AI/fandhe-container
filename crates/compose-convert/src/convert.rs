@@ -31,6 +31,8 @@ const P_CONTAINER_NAME: &str = "services.*.container_name";
 const P_WORKING_DIR: &str = "services.*.working_dir";
 const P_CAP_DROP: &str = "services.*.cap_drop";
 const P_SECURITY_OPT: &str = "services.*.security_opt";
+const P_STDIN_OPEN: &str = "services.*.stdin_open";
+const P_TTY: &str = "services.*.tty";
 const P_COMMAND: &str = "services.*.command";
 const P_ENTRYPOINT: &str = "services.*.entrypoint";
 const P_ENVIRONMENT: &str = "services.*.environment";
@@ -68,6 +70,8 @@ pub const DROP_KEY_PATHS: &[&str] = &[
     P_WORKING_DIR,
     P_CAP_DROP,
     P_SECURITY_OPT,
+    P_STDIN_OPEN,
+    P_TTY,
     P_COMMAND,
     P_ENTRYPOINT,
     P_ENVIRONMENT,
@@ -320,6 +324,20 @@ pub fn convert_security_opt(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<Str
     string_items(v, P_SECURITY_OPT, false, false, None, drops)
 }
 
+/// `stdin_open`・`tty`（TASK-153.3・#611・STACK-6）。真偽値のみ受ける。
+///
+/// 文字列（`"true"`・`yes`）・数値・配列・マッピング・null は値の意味を変えないよう読み替えず、`None` にして
+/// drop を記録する（fail-closed。null は `working_dir:` などスカラーの前例に合わせる）。
+fn convert_bool(v: &ComposeValue, path: &'static str, drops: &mut ValueDrops) -> Option<bool> {
+    match v {
+        ComposeValue::Bool(b) => Some(*b),
+        _ => {
+            drops.note(path);
+            None
+        }
+    }
+}
+
 /// `env_file`。文字列・文字列のリスト。マッピング要素（long syntax）は表せないため drop（long syntax の変換は回さない）。
 pub fn convert_env_file(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
     string_items(v, P_ENV_FILE, true, false, None, drops)
@@ -488,6 +506,8 @@ pub fn convert_service(service: &ComposeValue, drops: &mut ValueDrops) -> Servic
             "working_dir" => out.working_dir = convert_nonempty_string(v, P_WORKING_DIR, drops),
             "cap_drop" => out.cap_drop = convert_cap_drop(v, drops),
             "security_opt" => out.security_opt = convert_security_opt(v, drops),
+            "stdin_open" => out.stdin_open = convert_bool(v, P_STDIN_OPEN, drops),
+            "tty" => out.tty = convert_bool(v, P_TTY, drops),
             "command" => out.command = convert_argv(v, P_COMMAND, drops),
             "entrypoint" => out.entrypoint = convert_argv(v, P_ENTRYPOINT, drops),
             "environment" => out.env = convert_kv(v, P_ENVIRONMENT, drops),
@@ -898,6 +918,39 @@ mod tests {
         }
         let (_, d, _) = svc("    container_name: [dummy-name-marker]\n");
         assert!(!format!("{d:?}").contains("dummy-name-marker"));
+    }
+
+    /// STACK-6・TASK-153.3（#611）: stdin_open・tty は真偽値のまま受け、TOML へ出す。
+    #[test]
+    fn stack6_stdin_open_and_tty_are_converted() {
+        let (s, d, _) = svc("    stdin_open: true\n    tty: false\n");
+        assert_eq!(s.stdin_open, Some(true));
+        assert_eq!(s.tty, Some(false));
+        assert!(d.is_empty());
+        let t = toml_of(&s);
+        assert!(t.contains("stdin_open = true"), "{t}");
+        assert!(t.contains("tty = false"), "{t}");
+    }
+
+    /// STACK-6・TASK-153.3（#611）: 真偽値以外は読み替えず drop を記録し、値を載せない。
+    #[test]
+    fn stack6_invalid_stdin_open_and_tty_are_recorded() {
+        for (key, path) in [("stdin_open", P_STDIN_OPEN), ("tty", P_TTY)] {
+            for body in [
+                "\"true\"",
+                "yes",
+                "1",
+                "[true]",
+                "{k: dummy-bool-marker}",
+                "",
+            ] {
+                let (s, d, _) = svc(&format!("    {key}: {body}\n"));
+                assert!(s.stdin_open.is_none() && s.tty.is_none(), "{key} {body}");
+                assert_eq!(d.get(path), 1, "{key} {body}");
+                assert_eq!(d.total(), 1, "{key} {body}");
+                assert!(!format!("{d:?}").contains("dummy-bool-marker"));
+            }
+        }
     }
 
     /// STACK-6・TASK-153.2（#610）: cap_drop・security_opt は文字列の配列を綴りのまま受ける。

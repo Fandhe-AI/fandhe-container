@@ -240,3 +240,22 @@ fn stack_6_public_api_cap_drop_and_security_opt() {
         assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
     }
 }
+
+/// STACK-6・TASK-153.3（#611）: stdin_open・tty を公開パスから読み、往復し、型違いを拒否する。
+#[test]
+fn stack_6_public_api_stdin_open_and_tty() {
+    let doc = "[services.s]\nstdin_open = true\ntty = false\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.stdin_open, Some(true));
+    assert_eq!(s.tty, Some(false));
+    let out = toml::to_string(&t).unwrap();
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ntty = \"true\"\n",
+        "[services.s]\nstdin_open = 1\n",
+        "[services.s]\ntty = [true]\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
+}

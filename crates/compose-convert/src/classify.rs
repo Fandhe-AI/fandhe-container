@@ -139,6 +139,9 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     // TASK-153.2（#610・STACK-6）: cap_drop は CLI の --cap-drop へ、security_opt は未検証の文字列で持つ。
     ("services.*.cap_drop", KeyClass::Convert),
     ("services.*.security_opt", KeyClass::Convert),
+    // TASK-153.3（#611・STACK-6）: 真偽値のみ。create への写しは未実装（REPAIR-3）。
+    ("services.*.stdin_open", KeyClass::Convert),
+    ("services.*.tty", KeyClass::Convert),
     ("services.*.deploy", KeyClass::Convert),
     ("services.*.deploy.resources", KeyClass::Convert),
     ("services.*.deploy.resources.limits", KeyClass::Convert),
@@ -161,7 +164,7 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("extends", KeyClass::ErrorUnsupportedYet),
     ("profiles", KeyClass::ErrorUnsupportedYet),
     // PR #337 の指摘で Warning から再分類した 13 キー（STACK-3）のうち container_name は
-    // TASK-153.1（#609・STACK-6）で convert へ移した。残り 12 キーが error-unsupported-yet。
+    // TASK-153.1（#609）で、stdin_open・tty は TASK-153.3（#611）で convert へ移した（STACK-6）。残り 10 キーが error-unsupported-yet。
     ("services.*.hostname", KeyClass::ErrorUnsupportedYet),
     ("services.*.domainname", KeyClass::ErrorUnsupportedYet),
     ("services.*.mac_address", KeyClass::ErrorUnsupportedYet),
@@ -171,8 +174,6 @@ pub const KEY_CLASS_TABLE: &[(&str, KeyClass)] = &[
     ("services.*.oom_kill_disable", KeyClass::ErrorUnsupportedYet),
     ("services.*.oom_score_adj", KeyClass::ErrorUnsupportedYet),
     ("services.*.cgroup_parent", KeyClass::ErrorUnsupportedYet),
-    ("services.*.stdin_open", KeyClass::ErrorUnsupportedYet),
-    ("services.*.tty", KeyClass::ErrorUnsupportedYet),
     ("services.*.platform", KeyClass::ErrorUnsupportedYet),
     // その他の未対応キー。
     ("services.*.extends", KeyClass::ErrorUnsupportedYet),
@@ -360,15 +361,15 @@ mod tests {
             .collect()
     }
 
-    /// STACK-3・STACK-6: 再分類した 13 キーのうち container_name（#609 で convert へ移動）以外は
-    /// 表の行として error-unsupported-yet。
+    /// STACK-3・STACK-6: 再分類した 13 キーのうち container_name（#609）・stdin_open・tty（#611）で
+    /// convert へ移動したもの以外は表の行として error-unsupported-yet。
     #[test]
-    fn stack3_reclassified_keys_unsupported_yet_except_container_name() {
+    fn stack3_reclassified_keys_unsupported_yet_except_converted() {
         assert_eq!(RECLASSIFIED_13.len(), 13);
         for k in RECLASSIFIED_13 {
             let p = format!("services.*.{k}");
             assert!(KEY_CLASS_TABLE.iter().any(|(t, _)| *t == p), "{p}");
-            let want = if k == "container_name" {
+            let want = if matches!(k, "container_name" | "stdin_open" | "tty") {
                 KeyClass::Convert
             } else {
                 KeyClass::ErrorUnsupportedYet
@@ -395,6 +396,20 @@ mod tests {
     #[test]
     fn stack6_cap_drop_and_security_opt_are_convert() {
         for p in ["services.*.cap_drop", "services.*.security_opt"] {
+            assert_eq!(
+                KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(),
+                1,
+                "{p}"
+            );
+            assert_eq!(classify_key_path(p), KeyClass::Convert, "{p}");
+            assert!(!classify_key_path(p).is_error(), "{p}");
+        }
+    }
+
+    /// STACK-6・TASK-153.3（#611）: stdin_open・tty は表にちょうど 1 行の convert。
+    #[test]
+    fn stack6_stdin_open_and_tty_are_convert() {
+        for p in ["services.*.stdin_open", "services.*.tty"] {
             assert_eq!(
                 KEY_CLASS_TABLE.iter().filter(|(t, _)| *t == p).count(),
                 1,
@@ -521,6 +536,8 @@ mod tests {
             "working_dir",
             "cap_drop",
             "security_opt",
+            "stdin_open",
+            "tty",
         ];
         want.sort_unstable();
         assert_eq!(svc, want);

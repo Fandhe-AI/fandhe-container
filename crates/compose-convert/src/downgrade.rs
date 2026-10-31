@@ -197,6 +197,25 @@ mod tests {
         assert!(set.contains("services.*.user"));
     }
 
+    /// STACK-6・TASK-153.3（#611）: stdin_open・tty は convert へ移ったため格下げの対象にならない。
+    #[test]
+    fn converted_stdin_open_and_tty_are_not_downgradable() {
+        for (i, k) in ["services.*.tty", "services.*.stdin_open"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                parse_downgrade_value(k),
+                Err(DowngradeArgError::NotDowngradable {
+                    index: 0,
+                    class: KeyClass::Convert,
+                    key_path: Some(k),
+                }),
+                "{i} {k}"
+            );
+        }
+    }
+
     /// STACK-3: warning（x-*）と unrecognized は拒否し、unrecognized の入力は運ばない。
     #[test]
     fn rejects_warning_and_unrecognized() {
@@ -223,11 +242,11 @@ mod tests {
     fn rejects_empty_values_and_items() {
         assert_eq!(parse_downgrade_value(""), Err(DowngradeArgError::Empty));
         assert_eq!(
-            parse_downgrade_value("services.*.tty,,services.*.user"),
+            parse_downgrade_value("services.*.platform,,services.*.user"),
             Err(DowngradeArgError::EmptyItem { index: 1 })
         );
         assert_eq!(
-            parse_downgrade_value("services.*.tty,"),
+            parse_downgrade_value("services.*.platform,"),
             Err(DowngradeArgError::EmptyItem { index: 1 })
         );
         assert_eq!(
@@ -249,9 +268,9 @@ mod tests {
             parse_downgrade_value(&over),
             Err(DowngradeArgError::KeyTooLong { index: 0 })
         );
-        let exact = vec!["services.*.tty"; MAX_DOWNGRADE_KEYS].join(",");
+        let exact = vec!["services.*.platform"; MAX_DOWNGRADE_KEYS].join(",");
         assert_eq!(parse_downgrade_value(&exact).expect("ok").len(), 1);
-        let one_over = vec!["services.*.tty"; MAX_DOWNGRADE_KEYS + 1].join(",");
+        let one_over = vec!["services.*.platform"; MAX_DOWNGRADE_KEYS + 1].join(",");
         assert_eq!(
             parse_downgrade_value(&one_over),
             Err(DowngradeArgError::TooManyKeys)
@@ -263,7 +282,7 @@ mod tests {
     /// STACK-3: 重複は 1 つにまとめる。
     #[test]
     fn duplicates_collapse() {
-        let s = parse_downgrade_value("services.*.tty,services.*.tty").expect("ok");
+        let s = parse_downgrade_value("services.*.platform,services.*.platform").expect("ok");
         assert_eq!(s.len(), 1);
         assert!(!s.is_empty());
     }
@@ -271,11 +290,11 @@ mod tests {
     /// STACK-3: ファイルごとの判定。network_mode が host 等で上がった場合は許可しない。
     #[test]
     fn permits_uses_recorded_class() {
-        let s = parse_downgrade_value("services.*.network_mode,services.*.tty").expect("ok");
-        assert!(s.permits("services.*.tty", KeyClass::ErrorUnsupportedYet));
+        let s = parse_downgrade_value("services.*.network_mode,services.*.platform").expect("ok");
+        assert!(s.permits("services.*.platform", KeyClass::ErrorUnsupportedYet));
         assert!(!s.permits("services.*.network_mode", KeyClass::ErrorIncompatible));
         assert!(!s.permits("services.*.user", KeyClass::ErrorUnsupportedYet));
-        assert!(!s.permits("services.*.tty", KeyClass::Convert));
+        assert!(!s.permits("services.*.platform", KeyClass::Convert));
     }
 
     /// STACK-3: エラーに入力の目印が出ない。

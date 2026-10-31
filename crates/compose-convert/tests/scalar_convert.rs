@@ -47,3 +47,19 @@ fn stack6_container_name_and_working_dir_roundtrip_through_toml() {
     assert_eq!(back.services["b"].working_dir.as_deref(), Some("/srv"));
     assert!(drops.is_empty());
 }
+
+/// STACK-6・TASK-153.2（#610）: cap_drop・security_opt が TOML へ往復する。
+#[test]
+fn stack6_cap_drop_and_security_opt_roundtrip_through_toml() {
+    let doc = parse_compose_yaml(
+        "services:\n  a:\n    image: x\n    cap_drop: [ALL, NET_RAW]\n    security_opt: [\"no-new-privileges:true\"]\n",
+    )
+    .unwrap();
+    let mut drops = ValueDrops::new();
+    let t = convert_top_level(&doc, &mut drops);
+    let back: ComposeToml = toml::from_str(&toml::to_string(&t).unwrap()).unwrap();
+    assert_eq!(back, t);
+    assert_eq!(back.services["a"].cap_drop, ["ALL", "NET_RAW"]);
+    assert_eq!(back.services["a"].security_opt, ["no-new-privileges:true"]);
+    assert!(drops.is_empty());
+}

@@ -29,6 +29,8 @@ const P_SERVICE: &str = "services.*";
 const P_IMAGE: &str = "services.*.image";
 const P_CONTAINER_NAME: &str = "services.*.container_name";
 const P_WORKING_DIR: &str = "services.*.working_dir";
+const P_CAP_DROP: &str = "services.*.cap_drop";
+const P_SECURITY_OPT: &str = "services.*.security_opt";
 const P_COMMAND: &str = "services.*.command";
 const P_ENTRYPOINT: &str = "services.*.entrypoint";
 const P_ENVIRONMENT: &str = "services.*.environment";
@@ -64,6 +66,8 @@ pub const DROP_KEY_PATHS: &[&str] = &[
     P_IMAGE,
     P_CONTAINER_NAME,
     P_WORKING_DIR,
+    P_CAP_DROP,
+    P_SECURITY_OPT,
     P_COMMAND,
     P_ENTRYPOINT,
     P_ENVIRONMENT,
@@ -302,6 +306,20 @@ fn string_items(
     }
 }
 
+/// `cap_drop`（TASK-153.2・#610・STACK-6・SEC-1）。文字列の配列のみ（単独の文字列は綴りの解釈が曖昧なため drop）。
+///
+/// 名前は正規化も検証もせず綴りのまま持つ。正規化は CLI の `--cap-drop` ⇒ core の `parse_drop_list` の 1 か所に限る。
+pub fn convert_cap_drop(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
+    string_items(v, P_CAP_DROP, false, false, None, drops)
+}
+
+/// `security_opt`（TASK-153.2・#610・STACK-6・SEC-1）。文字列の配列のみで、項目は未検証のまま持つ。
+///
+/// 受理の判定（分離を弱める指定の拒否）は `up`（TASK-155）が行う。
+pub fn convert_security_opt(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
+    string_items(v, P_SECURITY_OPT, false, false, None, drops)
+}
+
 /// `env_file`。文字列・文字列のリスト。マッピング要素（long syntax）は表せないため drop（long syntax の変換は回さない）。
 pub fn convert_env_file(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
     string_items(v, P_ENV_FILE, true, false, None, drops)
@@ -468,6 +486,8 @@ pub fn convert_service(service: &ComposeValue, drops: &mut ValueDrops) -> Servic
                 out.container_name = convert_nonempty_string(v, P_CONTAINER_NAME, drops)
             }
             "working_dir" => out.working_dir = convert_nonempty_string(v, P_WORKING_DIR, drops),
+            "cap_drop" => out.cap_drop = convert_cap_drop(v, drops),
+            "security_opt" => out.security_opt = convert_security_opt(v, drops),
             "command" => out.command = convert_argv(v, P_COMMAND, drops),
             "entrypoint" => out.entrypoint = convert_argv(v, P_ENTRYPOINT, drops),
             "environment" => out.env = convert_kv(v, P_ENVIRONMENT, drops),
@@ -878,6 +898,57 @@ mod tests {
         }
         let (_, d, _) = svc("    container_name: [dummy-name-marker]\n");
         assert!(!format!("{d:?}").contains("dummy-name-marker"));
+    }
+
+    /// STACK-6・TASK-153.2（#610）: cap_drop・security_opt は文字列の配列を綴りのまま受ける。
+    #[test]
+    fn stack6_cap_drop_and_security_opt_are_converted() {
+        let (s, d, _) = svc("    cap_drop: [NET_RAW, cap_chown]
+    security_opt: [\"no-new-privileges:true\", \"seccomp=unconfined\"]\n");
+        assert_eq!(s.cap_drop, strs(&["NET_RAW", "cap_chown"]));
+        assert_eq!(
+            s.security_opt,
+            strs(&["no-new-privileges:true", "seccomp=unconfined"])
+        );
+        assert!(d.is_empty());
+        let t = toml_of(&s);
+        assert!(t.contains("cap_drop = [\"NET_RAW\", \"cap_chown\"]"), "{t}");
+        let (s, _, _) = svc("    cap_drop: [ALL]\n");
+        assert_eq!(s.cap_drop, strs(&["ALL"]));
+    }
+
+    /// STACK-6・TASK-153.2（#610）: スカラー・空文字列・数値・マッピングは出力せず drop を記録し、値を載せない。
+    #[test]
+    fn stack6_invalid_cap_drop_and_security_opt_are_recorded() {
+        for (key, path) in [("cap_drop", P_CAP_DROP), ("security_opt", P_SECURITY_OPT)] {
+            for body in [
+                "dummy-opt-marker".to_string(),
+                "[\"\"]".to_string(),
+                "[1]".to_string(),
+                "[{k: dummy-opt-marker}]".to_string(),
+                "{k: dummy-opt-marker}".to_string(),
+            ] {
+                let (s, d, _) = svc(&format!("    {key}: {body}\n"));
+                assert!(
+                    s.cap_drop.is_empty() && s.security_opt.is_empty(),
+                    "{key} {body}"
+                );
+                assert_eq!(d.get(path), 1, "{key} {body}");
+                assert_eq!(d.total(), 1, "{key} {body}");
+                assert!(!format!("{d:?}").contains("dummy-opt-marker"));
+            }
+            let (_, d, _) = svc(&format!("    {key}:\n"));
+            assert!(d.is_empty(), "{key}");
+        }
+    }
+
+    /// STACK-6・TASK-153.2（#610・SEC-1）: cap_add は変換せず、Service にも drop にも載せない（オーナー判断待ち）。
+    #[test]
+    fn stack6_cap_add_is_not_converted() {
+        let (s, d, unhandled) = svc("    cap_add: [NET_ADMIN]\n");
+        assert_eq!(s, Service::default());
+        assert!(d.is_empty());
+        assert!(unhandled.is_empty());
     }
 
     /// STACK-3: short syntax の 6 キーと、マッピング要素の記録（long syntax は #599 で結線済み）。

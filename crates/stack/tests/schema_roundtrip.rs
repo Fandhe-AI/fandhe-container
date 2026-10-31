@@ -220,3 +220,23 @@ fn stack_6_public_api_container_name_and_working_dir() {
         assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
     }
 }
+
+/// STACK-6・TASK-153.2（#610）: cap_drop・security_opt を公開パスから読み、往復し、型違いを拒否する。
+/// cap_add はオーナー判断待ちでスキーマに無く、`deny_unknown_fields` で拒否される（SEC-1）。
+#[test]
+fn stack_6_public_api_cap_drop_and_security_opt() {
+    let doc = "[services.s]\ncap_drop = [\"ALL\"]\nsecurity_opt = [\"no-new-privileges:true\"]\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.cap_drop, ["ALL"]);
+    assert_eq!(s.security_opt, ["no-new-privileges:true"]);
+    let out = toml::to_string(&t).unwrap();
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ncap_drop = \"ALL\"\n",
+        "[services.s]\nsecurity_opt = [1]\n",
+        "[services.s]\ncap_add = [\"NET_ADMIN\"]\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
+}

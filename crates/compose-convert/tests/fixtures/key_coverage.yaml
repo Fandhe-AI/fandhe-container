@@ -13,6 +13,8 @@ services:
   svcmarker:
     <<: *common
     image: example.invalid/app:1
+    cap_add: [NET_ADMIN]
+    cap_drop: [ALL]
     command: ["run", "--flag"]
     entrypoint: /entry.sh
     environment:

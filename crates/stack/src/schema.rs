@@ -94,6 +94,21 @@ pub struct Service {
     /// シェル文字列へ連結しない。`create` への結線は未実装（REPAIR-3）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// 落とす capability の名前（compose の `cap_drop`。TASK-153.2・#610・STACK-6・SEC-1）。
+    ///
+    /// 値は compose の綴りのまま持つ。正規化（`CAP_` 接頭辞・大文字小文字・`ALL`）と件数・長さの検査は
+    /// CLI の `create --cap-drop` が core の `parse_drop_list` で行う（CRI と共有の唯一の正規化）。
+    /// stack では検証しない。drop しか表せず、capability を足す経路（`cap_add`）は無い。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// セキュリティオプション（compose の `security_opt`。TASK-153.2・#610・STACK-6・SEC-1。未検証の文字列）。
+    ///
+    /// `create` への写しは未実装（CLI に `--security-opt` が無い。REPAIR-3）。`up`（TASK-155）は
+    /// 解釈できない項目と分離を弱める項目（seccomp / apparmor / label の unconfined・disable 等）を
+    /// 黙って捨てず、従わずにエラーで拒否する。`no-new-privileges` は常に有効な固定段と同じ意味になる。
+    /// シェル文字列へ連結しない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_opt: Vec<String>,
     /// 環境変数（compose の `environment` に当たる）。
     ///
     /// 値を持たない compose の `KEY` だけの形は表せない（変換器が空文字列に読み替える）。
@@ -256,7 +271,8 @@ impl Service {
     /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
     /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
     /// `ulimits`・`tmpfs`・`shm_size` はスキーマにあるが(#862)、`--ulimit`・`--tmpfs`・`--shm-size` への写しは
-    /// 未実装で含めない。`container_name`・`working_dir`(#609)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// 未実装で含めない。`container_name`・`working_dir`(#609)・`security_opt`(#610)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// `cap_drop`(#610)は `--cap-drop <name>` へ入力順のまま写す(正規化は CLI ⇒ core)。`cap_add` はスキーマに無い(オーナー判断待ち。#2666)。
     ///
     /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
     /// パスは検証しない(読むのは CLI が利用者の権限で行う。範囲外参照の扱いは `up` の責務)。
@@ -273,6 +289,10 @@ impl Service {
         for (key, value) in &self.labels {
             args.push(OsString::from("--label"));
             args.push(OsString::from(format!("{key}={value}")));
+        }
+        for name in &self.cap_drop {
+            args.push(OsString::from("--cap-drop"));
+            args.push(OsString::from(name));
         }
         args
     }
@@ -352,6 +372,8 @@ mod tests {
             env: BTreeMap::from([("B".into(), "2".into()), ("A".into(), "x=y".into())]),
             env_files: vec![".env".into(), "/abs/other.env".into()],
             labels: BTreeMap::from([("tier".into(), "web".into())]),
+            cap_drop: vec!["ALL".into(), "chown".into()],
+            security_opt: vec!["no-new-privileges:true".into()],
             ..Service::default()
         };
         let args: Vec<String> = service
@@ -380,6 +402,10 @@ mod tests {
                 "B=2",
                 "--label",
                 "tier=web",
+                "--cap-drop",
+                "ALL",
+                "--cap-drop",
+                "chown",
             ]
         );
         assert!(
@@ -397,6 +423,8 @@ name = "demo"
 image = "example/web:1"
 container_name = "fixed-web"
 working_dir = "/app"
+cap_drop = ["NET_RAW"]
+security_opt = ["no-new-privileges:true"]
 command = ["serve", "--port", "8080"]
 entrypoint = []
 env_files = [".env"]
@@ -431,6 +459,8 @@ file = "./app.conf"
             image: Some("example/web:1".into()),
             container_name: Some("fixed-web".into()),
             working_dir: Some("/app".into()),
+            cap_drop: vec!["NET_RAW".into()],
+            security_opt: vec!["no-new-privileges:true".into()],
             command: Some(vec!["serve".into(), "--port".into(), "8080".into()]),
             entrypoint: Some(vec![]),
             env: BTreeMap::from([("MODE".into(), "dummy".into())]),
@@ -841,6 +871,8 @@ nproc = "-1"
             image: Some("example/web:1".into()),
             container_name: Some("roundtrip-web".into()),
             working_dir: Some("/app".into()),
+            cap_drop: strs(&["NET_RAW", "ALL"]),
+            security_opt: strs(&["no-new-privileges:true"]),
             command: Some(strs(&["serve", "--port=8080"])),
             entrypoint: Some(strs(&["/entry"])),
             env: map(&[("MODE", "dummy"), ("LEVEL", "debug")]),
@@ -885,6 +917,8 @@ nproc = "-1"
             image: None,
             container_name: None,
             working_dir: None,
+            cap_drop: vec![],
+            security_opt: vec![],
             command: Some(vec![]),
             entrypoint: Some(vec![]),
             env: BTreeMap::new(),

@@ -1932,6 +1932,37 @@ jobs:
             --select '^capabilities: SEC-1 ' --subst-pos false --min 2 \
             --forbid 'root=true' --forbid 'capabilities: ignored' --forbid 'not applicable' --summary
 
+      # escape_suite（`crates/core/tests/escape_suite.rs`。SEC-2・SEC-4・SEC-5・CORE-5・TASK-43 追補・#2016）: ESC-01〜10 の
+      # 攻撃ケース（制御・否定対照を含む 18 件）を制限ステージ通過後のコンテナプロセスで実行し、拒否を判定する実機前提テスト
+      # （harness = false）。前提の AppArmor の緩和と「範囲写像と委譲 cgroup の前提確認」（非 root と Landlock ABI 6 以上を
+      # fail-closed で確認）は上のステップを再利用する。非 root の 1 回だけ実行し、root の分岐（ESC-09 が対象外になる）は
+      # CI では回さない（#1621・#206）。カーネル監査の opt-in の段は CI 外（#2483）のため、ESC-01・07・10 は監査未検証として
+      # 一覧をちょうどこの 3 件に固定する（合格に数えない。SEC-4）。件数（15 / 18）は具体値で固定しており、ケースを足すと
+      # 照合が落ちる。件数を上げるときは AGENTS.md「実機前提テスト」も同じ PR で直す。
+      # `--forbid 'not applicable'` は成功行の `not applicable []` に当たるため使わず、`verdict=not-applicable` と
+      # `not applicable on this`（非 Linux・非対応アーキテクチャの行）で禁じる。sudo・permissions・check-run は追加しない。
+      - name: escape_suite のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test escape_suite --no-run
+
+      - name: escape_suite の実行（実機前提テスト・--ignored。SEC-2・SEC-4・SEC-5・CORE-5・#2016）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/escape_suite.log"
+          scripts/run-with-deadline.sh --name escape_suite --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test escape_suite -- --ignored
+          scripts/check-success-lines.sh --name escape_suite \
+            --src crates/core/tests/escape_suite.rs --log "${log}" \
+            --select '^escape_suite: SEC-2 harness verified ' \
+            --subst verified=15 --subst-pos 18 --subst-pos '[]' \
+            --subst-pos '["esc-10-landlock-outside", "esc-01-host-fs-write", "esc-07-runtime-binary-landlock"]' \
+            --subst-pos false --subst-pos false \
+            --forbid 'verdict=fail' --forbid 'verdict=not-applicable' --forbid 'escape_suite: ignored' \
+            --forbid 'not applicable on this' --forbid 'root=true' --forbid 'kernel_audit=true' --summary
+
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10

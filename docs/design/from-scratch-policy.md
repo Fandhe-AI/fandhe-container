@@ -17,7 +17,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 禁止クレート一覧（rust-vmm organization）: `vm-memory`・`kvm-ioctls`・`kvm-bindings`・`vhost`・`vhost-user-backend`・`virtio-queue`・`vmm-sys-util`・`linux-loader`・`event-manager`・`vm-superio`
 
-機械判定（TASK-73・MVM-4）: `scripts/check-microvm-deps.sh` と `deny.toml` の `[bans]` で自動検出
+機械判定（TASK-73・MVM-4）: `scripts/check-microvm-deps.sh`（導入済み・TASK-73.1。禁止リストの正は同スクリプトの `--list`）と `deny.toml` の `[bans]`（TASK-73.2・#686 で導入予定）で自動検出
 
 ## 依存の判断基準
 

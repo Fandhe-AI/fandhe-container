@@ -68,6 +68,7 @@ use fandhe_container_oci::config::{
     ImageProcessConfig, MAX_CONFIG_BYTES, parse_verified_image_config,
 };
 use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::image_management::IMAGE_STORE_BLOB_DIR;
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractBudget, ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_bounded,
@@ -742,7 +743,7 @@ impl RootfsSource for ImageRootfsSource {
         let id = Digest::parse(resolved.id_str())
             .map_err(|_| CriError::internal("resolved image id is invalid"))?;
         let opts = &self.config.extract_options;
-        let blobs = prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])?;
+        let blobs = prepare_private_dir(&self.config.cache_dir, &IMAGE_STORE_BLOB_DIR)?;
         let entries = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
         let root_owner = expected_root_owner_for(opts, entries.owner)?;
         let entry = entries.path.join(digest_hex(&id));

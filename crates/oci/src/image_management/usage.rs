@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::root_handle::{BlobDir, RootHandle};
-use super::{ReferenceTable, TagKey};
+use super::{IMAGE_STORE_BLOB_DIR, ReferenceTable, TagKey};
 
 mod expanded;
 mod staging;
@@ -186,7 +186,8 @@ fn err(code: OciErrorCode, msg: &str) -> OciError {
 
 /// blob の置き場 `<root>/blobs/sha256`。
 pub(super) fn blob_dir(root: &Path) -> PathBuf {
-    root.join("blobs").join("sha256")
+    root.join(IMAGE_STORE_BLOB_DIR[0])
+        .join(IMAGE_STORE_BLOB_DIR[1])
 }
 
 /// 検証済み `Digest` の hex 部だけからパスを組み立てる。
@@ -429,7 +430,7 @@ fn checked_dir(path: &Path) -> Result<bool, OciError> {
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 pub(super) fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
-    Ok(checked_dir(&root.join("blobs"))? && checked_dir(&blob_dir(root))?)
+    Ok(checked_dir(&root.join(IMAGE_STORE_BLOB_DIR[0]))? && checked_dir(&blob_dir(root))?)
 }
 
 fn scan_cache(dir: &BlobDir, registered: &BTreeSet<&Digest>) -> Result<CacheUsage, OciError> {

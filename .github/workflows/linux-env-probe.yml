@@ -497,7 +497,9 @@ jobs:
   # ジョブを落とさず、結果を表にして記録する）
   # #2483: 加えて opt-in のカーネル監査の段（FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1。
   # ESC-01・07・10 の LANDLOCK_ACCESS）と landlock_audit_exec を回せるかを計測する
-  # （SEC-4・REPAIR-7）。計測のみで platform-ci へは組み込まない（組み込みは人間の判断）。
+  # （SEC-4・REPAIR-7）。この opt-in の段は計測のみで platform-ci へは組み込まない（組み込みは
+  # 人間の判断）。既定の非 root の段は #2016 で platform-ci（ubuntu）へ組み込み済みで、
+  # 本ジョブは root と opt-in のカーネル監査の段の計測用として残す。
   # sudo の用途は AppArmor 緩和・auditd の導入・audit ログの ACL 付与・root での
   # テストバイナリ実行に限る（エフェメラルな runner のみ。全ユーザーへの許可はしない）
   # --------------------------------------------------

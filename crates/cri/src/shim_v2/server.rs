@@ -281,6 +281,27 @@ fn record_op(ctx: &Ctx, kind: CriOpKind, code: Code, started: Instant) {
         .record_cri_op(&CriOpSample::new(kind, code, started.elapsed()));
 }
 
+/// 読み取りの 1 区間の期限を設定する。macOS（XNU）の `setsockopt` は、相手が close 済みで
+/// 両方向の shutdown 状態の AF_UNIX stream に `EINVAL` を返す（`sosetoptlock` の
+/// `SS_CANTRCVMORE | SS_CANTSENDMORE` 判定。xnu bsd/kern/uipc_socket.c）。この状態の読み取りは
+/// 受信済みデータ→EOF を即座に返し、ブロックしないため、期限なしで続けてよい。
+/// 無視しないと、相手が先に切断した接続の未読ヘッダが読まれず、後続の処理と計測が欠ける（CRI-5・REPAIR-4）。
+fn set_read_slice(stream: &UnixStream, d: Duration) -> io::Result<()> {
+    match stream.set_read_timeout(Some(d)) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        r => r,
+    }
+}
+
+/// 書き込みの 1 区間の期限を設定する。`EINVAL` の扱いは [`set_read_slice`] と同じで、
+/// 切断済みなら実際の `write` が `ENOTCONN` / `EPIPE` で失敗し、`record_write_failure` が記録する。
+fn set_write_slice(stream: &UnixStream, d: Duration) -> io::Result<()> {
+    match stream.set_write_timeout(Some(d)) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        r => r,
+    }
+}
+
 /// `buf` を `deadline` までに満たす。
 /// `poll_interval` ごとに停止フラグを確かめ、停止要求でも戻る（shutdown の期限を守る）。
 fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &Ctx) -> ReadOutcome {
@@ -294,7 +315,7 @@ fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &C
             return ReadOutcome::TimedOut;
         }
         let slice = (deadline - now).min(ctx.config.poll_interval);
-        if stream.set_read_timeout(Some(slice)).is_err() {
+        if set_read_slice(stream, slice).is_err() {
             return ReadOutcome::Failed;
         }
         let Some(rest) = buf.get_mut(filled..) else {
@@ -318,10 +339,7 @@ fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &C
 
 /// アイドルで 1 バイト待つ。停止フラグを `poll_interval` ごとに確かめる。
 fn wait_first_byte(stream: &mut UnixStream, ctx: &Ctx) -> Option<u8> {
-    if stream
-        .set_read_timeout(Some(ctx.config.poll_interval))
-        .is_err()
-    {
+    if set_read_slice(stream, ctx.config.poll_interval).is_err() {
         return None;
     }
     let mut b = [0u8; 1];
@@ -352,10 +370,7 @@ fn wait_first_byte(stream: &mut UnixStream, ctx: &Ctx) -> Option<u8> {
 /// ペイロードは確保せず捨てるだけで、時間は `poll_interval` の数回分に限る。
 fn drain_then_close(stream: &mut UnixStream, ctx: &Ctx) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    if stream
-        .set_read_timeout(Some(ctx.config.poll_interval))
-        .is_err()
-    {
+    if set_read_slice(stream, ctx.config.poll_interval).is_err() {
         return;
     }
     let deadline = deadline_after(Instant::now(), ctx.config.poll_interval.saturating_mul(4));
@@ -415,7 +430,7 @@ fn write_response(
             return Err(io::ErrorKind::TimedOut.into());
         }
         let slice = (deadline - now).min(ctx.config.poll_interval);
-        stream.set_write_timeout(Some(slice))?;
+        set_write_slice(stream, slice)?;
         let Some(rest) = out.get(off..) else {
             return Err(io::ErrorKind::InvalidData.into());
         };

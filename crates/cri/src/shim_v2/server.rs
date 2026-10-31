@@ -8,7 +8,10 @@
 //! 無期限の待ちを作らない（REPAIR-5）:
 //! - 同時接続数に上限があり、超えた接続はすぐ閉じる
 //! - フレームの最初の 1 バイトはアイドルで待つが、その後の残りは `frame_read_timeout` 以内に読み切る
-//! - 書き込みにも期限を付ける。停止は期限つきの join
+//! - 書き込みには全体の絶対期限を付け、停止要求も確かめる。停止は期限つきの join
+//!
+//! 計測（REPAIR-4）: [`TtrpcServer::with_recorder`] で渡した [`CriOpRecorder`] へ、要求ごとに固定の
+//! 操作種別・結果コード・所要時間だけを渡す（要求の中身・文言は渡さない）。
 //!
 //! peer UID の照合・socket の配置と権限は扱わない（#803。REPAIR-3）。
 
@@ -20,11 +23,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use prost::Message;
+use tonic::Code;
 
 use super::frame::{FrameError, FrameHeader, HEADER_LEN, MAX_PAYLOAD_LEN, MessageType};
 use super::message::{RpcStatus, TtrpcRequest, TtrpcResponse};
 use super::service::ServiceRegistry;
 use crate::error::CriErrorCode;
+use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 
 /// サーバーの設定。
 #[derive(Debug, Clone)]
@@ -33,8 +38,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// 最初の 1 バイトの後、フレームの残りを読み切る期限。
     pub frame_read_timeout: Duration,
-    /// 書き込みの期限。接続スレッドは書き込み中に停止要求を見ないため、`shutdown_timeout` より長いと
-    /// `shutdown()` が `ShutdownTimeout` を返しうる（REPAIR-5）。`shutdown_timeout` 以下の値にする。
+    /// 1 回の応答の書き込み全体の絶対期限。`poll_interval` ごとに停止要求も確かめるため、
+    /// 相手が少しずつ読む場合も期限で打ち切る（REPAIR-5）。
     pub write_timeout: Duration,
     /// 停止時に各スレッドの終了を待つ期限。
     pub shutdown_timeout: Duration,
@@ -78,14 +83,25 @@ impl std::error::Error for ShimV2Error {}
 pub struct TtrpcServer {
     registry: Arc<ServiceRegistry>,
     config: ServerConfig,
+    recorder: Arc<dyn CriOpRecorder>,
 }
 
 impl TtrpcServer {
-    /// 登録簿と設定から作る。
+    /// 登録簿と設定から作る（計測しない）。
     pub fn new(registry: ServiceRegistry, config: ServerConfig) -> Self {
+        Self::with_recorder(registry, config, Arc::new(NoopCriOpRecorder))
+    }
+
+    /// 計測の記録先を指定して作る（REPAIR-4）。
+    pub fn with_recorder(
+        registry: ServiceRegistry,
+        config: ServerConfig,
+        recorder: Arc<dyn CriOpRecorder>,
+    ) -> Self {
         Self {
             registry: Arc::new(registry),
             config,
+            recorder,
         }
     }
 
@@ -97,6 +113,7 @@ impl TtrpcServer {
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(Ctx {
             registry: Arc::clone(&self.registry),
+            recorder: Arc::clone(&self.recorder),
             config: self.config.clone(),
             stop: Arc::clone(&stop),
             active: AtomicUsize::new(0),
@@ -147,6 +164,7 @@ impl Drop for ServerHandle {
 
 struct Ctx {
     registry: Arc<ServiceRegistry>,
+    recorder: Arc<dyn CriOpRecorder>,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     active: AtomicUsize,
@@ -202,8 +220,30 @@ fn accept_loop(listener: UnixListener, ctx: Arc<Ctx>) {
 /// 読み取りの結果。
 enum ReadOutcome {
     Done,
-    /// 相手が閉じた、期限切れ、または停止要求。
+    /// 相手が閉じた、または停止要求。
     Closed,
+    /// 期限切れ。
+    TimedOut,
+    /// 読み取りの I/O 失敗。
+    Failed,
+}
+
+impl ReadOutcome {
+    /// 失敗の計測（REPAIR-4）。期限切れと I/O 失敗だけを記録する（相手の正常切断・停止は記録しない）。
+    fn record(&self, ctx: &Ctx, started: Instant) {
+        let code = match self {
+            Self::TimedOut => Code::DeadlineExceeded,
+            Self::Failed => Code::Unavailable,
+            Self::Done | Self::Closed => return,
+        };
+        record_op(ctx, CriOpKind::ShimV2Io, code, started);
+    }
+}
+
+/// 計測を 1 件渡す。記録先は有界時間で戻る契約（`CriOpRecorder`）。
+fn record_op(ctx: &Ctx, kind: CriOpKind, code: Code, started: Instant) {
+    ctx.recorder
+        .record_cri_op(&CriOpSample::new(kind, code, started.elapsed()));
 }
 
 /// `buf` を `deadline` までに満たす。
@@ -216,14 +256,14 @@ fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &C
         }
         let now = Instant::now();
         if now >= deadline {
-            return ReadOutcome::Closed;
+            return ReadOutcome::TimedOut;
         }
         let slice = (deadline - now).min(ctx.config.poll_interval);
         if stream.set_read_timeout(Some(slice)).is_err() {
-            return ReadOutcome::Closed;
+            return ReadOutcome::Failed;
         }
         let Some(rest) = buf.get_mut(filled..) else {
-            return ReadOutcome::Closed;
+            return ReadOutcome::Failed;
         };
         match stream.read(rest) {
             Ok(0) => return ReadOutcome::Closed,
@@ -235,7 +275,7 @@ fn read_full(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, ctx: &C
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return ReadOutcome::Closed,
+            Err(_) => return ReadOutcome::Failed,
         }
     }
     ReadOutcome::Done
@@ -256,7 +296,10 @@ fn wait_first_byte(stream: &mut UnixStream, ctx: &Ctx) -> Option<u8> {
         }
         match stream.read(&mut b) {
             Ok(0) => return None,
-            Ok(_) => return Some(b[0]),
+            Ok(_) => {
+                let [first] = b;
+                return Some(first);
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -297,28 +340,77 @@ fn status_response(code: CriErrorCode, msg: &str) -> TtrpcResponse {
     }
 }
 
-fn write_response(stream: &mut UnixStream, stream_id: u32, resp: &TtrpcResponse) -> io::Result<()> {
-    let mut body = resp.encode_to_vec();
-    if body.len() > MAX_PAYLOAD_LEN as usize {
-        body =
-            status_response(CriErrorCode::ResourceExhausted, "response too large").encode_to_vec();
-    }
+/// 応答を書く。符号化の前に `encoded_len()` で上限を検証する（巨大な応答の追加確保を避ける）。
+/// 書き込み全体に絶対期限を持ち、`poll_interval` ごとに停止要求を確かめる（REPAIR-5）。
+fn write_response(
+    stream: &mut UnixStream,
+    stream_id: u32,
+    resp: &TtrpcResponse,
+    ctx: &Ctx,
+) -> io::Result<()> {
+    let too_large = resp.encoded_len() > MAX_PAYLOAD_LEN as usize;
+    let body = if too_large {
+        status_response(CriErrorCode::ResourceExhausted, "response too large").encode_to_vec()
+    } else {
+        resp.encode_to_vec()
+    };
     let len = u32::try_from(body.len()).map_err(|_| io::ErrorKind::InvalidData)?;
     let header = FrameHeader::new(len, stream_id, MessageType::Response, 0)
         .map_err(|_| io::ErrorKind::InvalidData)?;
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&header.to_bytes());
     out.extend_from_slice(&body);
-    stream.write_all(&out)
+    let deadline = Instant::now() + ctx.config.write_timeout;
+    let mut off = 0;
+    while off < out.len() {
+        if ctx.stop.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let slice = (deadline - now).min(ctx.config.poll_interval);
+        stream.set_write_timeout(Some(slice))?;
+        let Some(rest) = out.get(off..) else {
+            return Err(io::ErrorKind::InvalidData.into());
+        };
+        match stream.write(rest) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => off += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// 書き込み失敗の計測。停止要求による中断は記録しない。
+fn record_write_failure(ctx: &Ctx, e: &io::Error, started: Instant) {
+    let code = match e.kind() {
+        io::ErrorKind::Interrupted => return,
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Code::DeadlineExceeded,
+        _ => Code::Unavailable,
+    };
+    record_op(ctx, CriOpKind::ShimV2Io, code, started);
+}
+
+/// 応答の status から計測用のコードを導く（status なしは `Ok`）。
+fn resp_code(resp: &TtrpcResponse) -> Code {
+    resp.status
+        .as_ref()
+        .map_or(Code::Ok, |st| Code::from(st.code))
 }
 
 fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
     // 継承された non-blocking を解く（BSD 系の accept は listener の設定を引き継ぐ）。
-    if stream.set_nonblocking(false).is_err()
-        || stream
-            .set_write_timeout(Some(ctx.config.write_timeout))
-            .is_err()
-    {
+    if stream.set_nonblocking(false).is_err() {
         return;
     }
     let mut last_stream_id: u32 = 0;
@@ -326,19 +418,22 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
         let Some(first) = wait_first_byte(&mut stream, ctx) else {
             return;
         };
-        let deadline = Instant::now() + ctx.config.frame_read_timeout;
+        let started = Instant::now();
+        let deadline = started + ctx.config.frame_read_timeout;
         let mut raw = [0u8; HEADER_LEN];
-        raw[0] = first;
-        if let Some(rest) = raw.get_mut(1..)
-            && matches!(
-                read_full(&mut stream, rest, deadline, ctx),
-                ReadOutcome::Closed
-            )
-        {
-            return;
+        if let Some((head, rest)) = raw.split_first_mut() {
+            *head = first;
+            let outcome = read_full(&mut stream, rest, deadline, ctx);
+            if !matches!(outcome, ReadOutcome::Done) {
+                outcome.record(ctx, started);
+                return;
+            }
         }
         // 検証に失敗したヘッダの応答に使うため、stream id は生のバイトから取る。
-        let raw_stream_id = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let raw_stream_id = raw
+            .get(4..8)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map_or(0, u32::from_be_bytes);
         let header = match FrameHeader::from_bytes(&raw) {
             Ok(h) => h,
             Err(e) => {
@@ -351,42 +446,58 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                         (CriErrorCode::InvalidArgument, "invalid frame header")
                     }
                 };
-                let _ = write_response(&mut stream, raw_stream_id, &status_response(code, msg));
+                let resp = status_response(code, msg);
+                record_op(ctx, CriOpKind::ShimV2Frame, resp_code(&resp), started);
+                let _ = write_response(&mut stream, raw_stream_id, &resp, ctx);
                 drain_then_close(&mut stream, ctx);
                 return;
             }
         };
         // 長さは検証済み（<= MAX_PAYLOAD_LEN）なのでここで初めて確保する。
         let mut payload = vec![0u8; header.length() as usize];
-        if matches!(
-            read_full(&mut stream, &mut payload, deadline, ctx),
-            ReadOutcome::Closed
-        ) {
+        let outcome = read_full(&mut stream, &mut payload, deadline, ctx);
+        if !matches!(outcome, ReadOutcome::Done) {
+            outcome.record(ctx, started);
             return;
         }
         let sid = header.stream_id();
-        let resp = match header.message_type() {
+        let (kind, resp) = match header.message_type() {
             MessageType::Response => return,
-            MessageType::Data => status_response(CriErrorCode::InvalidArgument, "unknown stream"),
+            MessageType::Data => (
+                CriOpKind::ShimV2Frame,
+                status_response(CriErrorCode::InvalidArgument, "unknown stream"),
+            ),
             MessageType::Request => {
                 if sid % 2 == 0 || sid <= last_stream_id {
-                    status_response(CriErrorCode::InvalidArgument, "invalid stream id")
+                    (
+                        CriOpKind::ShimV2Frame,
+                        status_response(CriErrorCode::InvalidArgument, "invalid stream id"),
+                    )
                 } else {
                     last_stream_id = sid;
                     if header.flags() != 0 {
-                        status_response(CriErrorCode::Unimplemented, "streaming is not supported")
+                        (
+                            CriOpKind::ShimV2Frame,
+                            status_response(
+                                CriErrorCode::Unimplemented,
+                                "streaming is not supported",
+                            ),
+                        )
                     } else {
-                        match TtrpcRequest::decode(&payload[..]) {
-                            Ok(req) => ctx.registry.dispatch(&req),
-                            Err(_) => {
-                                status_response(CriErrorCode::InvalidArgument, "malformed request")
-                            }
+                        match TtrpcRequest::decode(payload.as_slice()) {
+                            Ok(req) => (CriOpKind::ShimV2Dispatch, ctx.registry.dispatch(&req)),
+                            Err(_) => (
+                                CriOpKind::ShimV2Frame,
+                                status_response(CriErrorCode::InvalidArgument, "malformed request"),
+                            ),
                         }
                     }
                 }
             }
         };
-        if write_response(&mut stream, sid, &resp).is_err() {
+        record_op(ctx, kind, resp_code(&resp), started);
+        if let Err(e) = write_response(&mut stream, sid, &resp, ctx) {
+            record_write_failure(ctx, &e, started);
             return;
         }
     }

@@ -71,7 +71,18 @@ fn code(r: &TtrpcResponse) -> i32 {
 
 fn assert_closed(s: &mut UnixStream) {
     let mut b = [0u8; 1];
-    assert_eq!(s.read(&mut b).unwrap_or(0), 0);
+    match s.read(&mut b) {
+        Ok(0) => {}
+        // 相手側の close が RST として届く場合のみ切断として受理する。タイムアウトは失敗。
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("expected disconnect, got {other:?}"),
+    }
 }
 
 /// CRI-5: v2 / v3 の空の Task サービスは Create に Unimplemented を返す。
@@ -212,4 +223,50 @@ fn cri5_shutdown_with_mid_frame_stalled_connection() {
     h.shutdown().unwrap();
     assert!(t.elapsed() < Duration::from_secs(3));
     assert_closed(&mut s);
+}
+
+/// 計測の記録先（試験用）。
+#[derive(Default)]
+struct Rec(std::sync::Mutex<Vec<(String, i32)>>);
+
+impl fandhe_container_cri::instrument::CriOpRecorder for Rec {
+    fn record_cri_op(&self, s: &fandhe_container_cri::instrument::CriOpSample) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((s.kind().as_str().to_string(), s.code() as i32));
+    }
+}
+
+/// CRI-5・REPAIR-4: dispatch・不正フレーム・期限切れが固定の種別と結果コードで記録される。
+#[test]
+fn cri5_operations_are_recorded() {
+    let rec = Arc::new(Rec::default());
+    let cfg = ServerConfig {
+        frame_read_timeout: Duration::from_millis(200),
+        ..ServerConfig::default()
+    };
+    let root = test_root::test_root("ttrpc", "rec");
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut reg = ServiceRegistry::new();
+    reg.register(Arc::new(EmptyTaskService::new(TaskApiVersion::V2)))
+        .unwrap();
+    let h = TtrpcServer::with_recorder(reg, cfg, rec.clone())
+        .serve(listener)
+        .unwrap();
+    let mut s = connect(&path);
+    send_req(&mut s, 1, "containerd.task.v2.Task", "State");
+    read_resp(&mut s).unwrap();
+    send_req(&mut s, 1, "containerd.task.v2.Task", "State");
+    read_resp(&mut s).unwrap();
+    let mut t = connect(&path);
+    t.write_all(&[0, 0, 0]).unwrap();
+    assert_closed(&mut t);
+    h.shutdown().unwrap();
+    let got = rec.0.lock().unwrap().clone();
+    assert!(got.contains(&("cri.shim_v2.dispatch".into(), UNIMPL)));
+    assert!(got.contains(&("cri.shim_v2.frame".into(), INVALID)));
+    // DeadlineExceeded = 4
+    assert!(got.contains(&("cri.shim_v2.io".into(), 4)));
 }

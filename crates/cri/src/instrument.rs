@@ -72,6 +72,12 @@ pub enum CriOpKind {
     PullImage,
     /// 起動時の記録の再採用の 1 件（記録ストアからの読み込みと復号。CRI-2・REPAIR-4・#2935）。
     RecordStoreLoad,
+    /// shim v2 の ttrpc 要求の dispatch 1 回（サービス呼び出しの結果。CRI-5・TASK-62.1・REPAIR-4）。
+    ShimV2Dispatch,
+    /// shim v2 の ttrpc の不正フレーム・不正な要求の拒否 1 回（CRI-5・TASK-62.1・REPAIR-4）。
+    ShimV2Frame,
+    /// shim v2 の ttrpc の読み書き失敗・期限切れ 1 回（CRI-5・TASK-62.1・REPAIR-4・REPAIR-5）。
+    ShimV2Io,
 }
 
 impl CriOpKind {
@@ -96,6 +102,9 @@ impl CriOpKind {
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
             CriOpKind::RecordStoreLoad => "cri.record_store_load",
+            CriOpKind::ShimV2Dispatch => "cri.shim_v2.dispatch",
+            CriOpKind::ShimV2Frame => "cri.shim_v2.frame",
+            CriOpKind::ShimV2Io => "cri.shim_v2.io",
         }
     }
 }

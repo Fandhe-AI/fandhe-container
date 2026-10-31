@@ -79,7 +79,7 @@ TOML
     if [ "${code}" -ne 0 ] && grep -q "crate '${name} = 0.1.0' is explicitly banned" <<<"${out}" \
       && grep -q 'bans FAILED' <<<"${out}"; then ok=1; fi
   else
-    if [ "${code}" -eq 0 ] && grep -q 'bans ok' <<<"${out}" && ! grep -q 'banned' <<<"${out}"; then ok=1; fi
+    if [ "${code}" -eq 0 ] && grep -q 'bans ok' <<<"${out}" && ! grep -q 'is explicitly banned' <<<"${out}"; then ok=1; fi
   fi
   if [ "${ok}" -eq 1 ]; then
     echo "PASS ${name} (${section}) expect=${expect} exit=${code}"

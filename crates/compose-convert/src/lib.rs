@@ -4,16 +4,20 @@
 //! GPU 予約の検出（`gpu_reservation`。TASK-156.1・STACK-9）も実装済み。
 //! キー分類表（`classify`。TASK-151.2・#596・STACK-3）も実装済み。
 //! 入力ディレクトリの走査・読み込みとエラーの終了コード対応（`input_scan`。TASK-151.5・#600・STACK-3）も実装済み（bin への結線は #602）。
-//! TOML 変換以降の変換器の本体は未実装（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
+//! スカラーと short syntax キーの TOML 変換（`convert`・`shell_split`。TASK-151.3.1・#864・STACK-3）も実装済み。
+//! long syntax のマッピング要素は #865、レポート・`error_free` は #599、bin の結線は #602、
+//! depends_on・ulimits・healthcheck・deploy の変換は未実装（`ServiceConversion::unhandled` に載る。REPAIR-3）。
 //! bin は未実装を構造化して返す雛形（TASK-151.0・#1070・STACK-3）。
-//! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.7（#602）以降。
+//! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.3.1（#864）から。
 //! 本体は G11（TASK-151 が変換器本体、TASK-152・153・154・156・182）で実装する。
 //! plugin ではない独立ツールで、PLUG-1 区分の対象外（crate-naming.md 決定 5）。
 
 pub mod classify;
 pub mod compose_convert;
+pub mod convert;
 pub mod gpu_reservation;
 pub mod input_scan;
+pub mod shell_split;
 
 use std::io::Write;
 use std::process::ExitCode;

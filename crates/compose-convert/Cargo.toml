@@ -23,7 +23,7 @@ name = "fandhe-container-compose-convert"
 path = "src/main.rs"
 
 # workspace 内の path 依存で、外部クレートの追加ではない（決定 5。compose-convert -> stack の一方向で、
-# stack からこの crate へは依存しない）。型の参照は TASK-151.7（#602）以降で始まり、現状は宣言だけ。
+# stack からこの crate へは依存しない）。型の参照は TASK-151.3.1（#864）の convert モジュールから始まった。
 [dependencies]
 fandhe-container-stack = { path = "../stack" }
 # YAML の読み込みに使う workspace 依存（承認は #540 の 2026-10-10 のオーナー判断。TASK-151.1・#595 で参照を開始）。

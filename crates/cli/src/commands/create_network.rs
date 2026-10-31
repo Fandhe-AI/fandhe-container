@@ -264,7 +264,8 @@ fn definition_failure(c: DefinitionCheck) -> TraitError {
 /// 照合(D2)は残し、これは 2 回目の照合になる。ロックは `body` が戻るまで(成功・失敗とも)放さないので、
 /// `network rm`(全体の排他ロックの下で参照を走査して削除)は create の状態記録が見えるまで待たされ、
 /// 待ちは期限(`lock_timeout`)で `TIMEOUT` になる。照合の失敗では `body` を呼ばず何も作らない。
-/// ロック順は「net の全体 → 状態ストアの `@lock`・FCOPT1 の ID ロック」で、逆順の経路は無い。
+/// ロック順は「net の全体 → FCOPT1 の ID ロック → 状態ストアの `@lock`(葉。1 操作ごとに取って放す)」で、逆順の経路は無い(#3575。
+/// 棚卸しは `network-wiring.md` D10)。
 /// `body` の中で pasta の解決などの子プロセス起動をしないこと(ロックを長く持たない)。
 /// 注意: イメージ指定の create では `body` の core の create にイメージ rootfs の展開も含まれる。展開が長引くと、
 /// その間は無関係な `network create` / `network rm`(排他ロック)が `TIMEOUT` になりうる(fail-closed で有界)。

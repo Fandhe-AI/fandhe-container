@@ -1,4 +1,4 @@
-//! スカラーと short syntax キーの変換を公開 API で通す結合試験（STACK-3・TASK-151.3.1・#864）。
+//! スカラーと short syntax キーの変換を公開 API で通す結合試験（STACK-3・TASK-151.3.1・#864・MS-12）。
 //! YAML → `convert_top_level` → TOML 書き出し → 再パースで、stack の `deny_unknown_fields` を通ることを照合する。
 
 use fandhe_container_compose_convert::compose_convert::parse_compose_yaml;

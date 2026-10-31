@@ -1,4 +1,4 @@
-//! compose の `command` / `entrypoint` の文字列形（short syntax）を引数配列へ分割する（STACK-3・TASK-151.3.1）。
+//! compose の `command` / `entrypoint` の文字列形（short syntax）を引数配列へ分割する（STACK-3・TASK-151.3.1・MS-12）。
 //!
 //! 呼び出し元は [`crate::convert`] の command / entrypoint 変換。分割できない入力は部分的に出さず
 //! [`ShellSplitError`] を返し、呼び出し側が `value_drops` へ記録する（fail-closed）。

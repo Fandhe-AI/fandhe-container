@@ -1,5 +1,5 @@
 //! パース済みの compose モデル（[`ComposeValue`]）から、スカラーと short syntax のキーを
-//! `fandhe-container-stack` の TOML 型へ変換する（STACK-3・TASK-151.3.1・#864）。
+//! `fandhe-container-stack` の TOML 型へ変換する（STACK-3・TASK-151.3.1・#864・MS-12）。
 //!
 //! 呼び出し元は #599（変換レポート）と #602（bin の結線）。型が合わない値・分割できない値・TOML に
 //! 表せない属性は黙って捨てず、[`ValueDrops`] へ分類表のキーパスで件数を記録する（fail-closed）。
@@ -18,7 +18,7 @@ use fandhe_container_stack::schema::{
 };
 
 use crate::compose_convert::{ComposeDocument, ComposeMapping, ComposeNumber, ComposeValue};
-use crate::shell_split::split_command;
+use crate::shell_split::{ShellSplitError, split_command};
 
 /// リスト・マッピングの要素数の上限。確保の前に確かめる（DoS 対策）。
 pub const MAX_LIST_ITEMS: usize = 4096;
@@ -159,7 +159,12 @@ pub fn convert_argv(
     drops: &mut ValueDrops,
 ) -> Option<Vec<String>> {
     let out = match v {
-        ComposeValue::String(s) => split_command(s).ok(),
+        ComposeValue::String(s) => match split_command(s) {
+            Ok(v) => Some(v),
+            // 空文字列は「イメージの既定を打ち消す」意味なので、None（キー無し）と区別して `[]` にする。
+            Err(ShellSplitError::Empty) => Some(Vec::new()),
+            Err(_) => None,
+        },
         ComposeValue::Sequence(items) if items.len() <= MAX_LIST_ITEMS => items
             .iter()
             .map(scalar_for_argv)
@@ -449,7 +454,7 @@ fn opt_bool(
 }
 
 /// トップレベルの `name`・`networks`・`volumes`・`secrets`・`configs`・`services` を変換する。
-/// `services` の `unhandled` は捨てず、呼び出し側が必要なら [`convert_service`] を直接使う。
+/// `services` の `unhandled`（本 issue で見送った convert キー）は黙って捨てず、`drops` へ分類表のパスで記録する。
 pub fn convert_top_level(doc: &ComposeDocument, drops: &mut ValueDrops) -> ComposeToml {
     let mut toml = ComposeToml::default();
     if let Some(v) = doc.get("name") {
@@ -463,7 +468,11 @@ pub fn convert_top_level(doc: &ComposeDocument, drops: &mut ValueDrops) -> Compo
         }
     }
     for_each_entry(doc.get("services"), P_SERVICE, drops, |name, v, drops| {
-        if let Some(s) = convert_service(v, drops).service {
+        let conv = convert_service(v, drops);
+        for path in conv.unhandled {
+            drops.note(path);
+        }
+        if let Some(s) = conv.service {
             toml.services.insert(name.to_string(), s);
         }
     });
@@ -797,5 +806,32 @@ mod tests {
         let _ = convert_top_level(&doc, &mut d);
         assert_eq!(d.get(P_NAME), 1);
         assert_eq!(d.get(P_TOP_NETWORK_DRIVER), 1);
+    }
+
+    /// STACK-3: 見送った convert キーはトップレベル変換でも drops に残る。
+    #[test]
+    fn stack3_top_level_records_unhandled() {
+        let doc = parse_compose_yaml(
+            "services:\n  a:\n    image: x\n    depends_on: [b]\n    deploy:\n      resources:\n        limits: {cpus: '1'}\n",
+        )
+        .unwrap();
+        let mut d = ValueDrops::new();
+        let t = convert_top_level(&doc, &mut d);
+        assert_eq!(t.services["a"].image.as_deref(), Some("x"));
+        assert_eq!(d.get("services.*.depends_on"), 1);
+        assert_eq!(d.get("services.*.deploy"), 1);
+        assert_eq!(d.total(), 2);
+    }
+
+    /// STACK-3: 空文字列の command / entrypoint は `Some([])`（既定の打ち消し）で、drop ではない。
+    #[test]
+    fn stack3_empty_command_clears_default() {
+        let (s, d, _) = svc("    command: \"\"\n    entrypoint: ''\n");
+        assert_eq!(s.command, Some(Vec::new()));
+        assert_eq!(s.entrypoint, Some(Vec::new()));
+        assert!(d.is_empty());
+        let (s, d, _) = svc("    command: 'a \"b'\n");
+        assert_eq!(s.command, None);
+        assert_eq!(d.get(P_COMMAND), 1);
     }
 }

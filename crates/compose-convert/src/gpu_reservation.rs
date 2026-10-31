@@ -1,4 +1,4 @@
-//! GPU 予約の検出（TASK-156.1・STACK-9）。
+//! GPU 予約の検出と CDI 完全修飾名への変換（TASK-156.1・TASK-156.2・STACK-9）。
 //!
 //! compose の `services.*.deploy.resources.reservations.devices` の各要素のうち、
 //! `driver: nvidia` かつ `capabilities` に `gpu` を含むものを「変換の対象」として見分け、
@@ -7,14 +7,19 @@
 //! - 呼び出し元: TASK-151（#595・#598）の変換器が `devices` のノードを [`detect_gpu_reservations`] へ渡す。
 //!   [`GpuReservationDetection::drops`] の件数は、#599 が `value_drops` の [`DEVICES_KEY_PATH`] へ
 //!   加算する統合点になる。
-//! - 範囲外: CDI 完全修飾名の組み立て・`count: N` の扱い・device_id の文字種検証は #625（TASK-156.2）、
-//!   合成フィクスチャでの往復検証は #626（TASK-156.3）。`deploy` / `resources` / `reservations` が
+//! - 変換規則（TASK-156.2）: [`convert_gpu_reservations`] が検出結果を `nvidia.com/gpu=<id>|all` へ変換する。
+//!   `count`・`device_ids` が無いか `count: "all"` のときだけ `all` にする。`count: N` は GPU の個数であり
+//!   インデックスではなく一意な CDI 名にできないため、変換せず drop に記録する（spec の P1-9 訂正）。
+//!   `device_ids` の各要素は CDI デバイス名の規則で検証し、不正・`"all"`・重複が 1 つでもあれば
+//!   予約ごと drop にする（GPU の数を黙って減らさない）。
+//! - 範囲外: 合成フィクスチャでの往復検証は #626（TASK-156.3）。変換結果の stack への書き込みと
+//!   `value_drops` への加算は #598・#599。`deploy` / `resources` / `reservations` が
 //!   マッピングでない場合の記録は変換器本体（#598・#599）が担う。
 //! - パーサーに依存しない: YAML 値への [`ComposeNode`] の実装は #595 の結線で行う（依存を増やさない）。
 //! - 入力の大きさ: 再帰しない一段の走査。確保・複製の前に [`MAX_DEVICES`]・[`MAX_DEVICE_IDS`]・
 //!   [`MAX_DEVICE_ID_BYTES`]・[`MAX_DEVICE_IDS_TOTAL_BYTES`] を検証し、超過は構造化された
 //!   [`GpuDropReason`] で対象外にする（パーサーの `Budget`〔#595〕に依存しない）。
-//! - PoC-16 との差: PoC は不正な device_id を飛ばして残りを変換し、`capabilities` の文字列でない要素を
+//! - PoC-16 との差: PoC は不正な device_id を飛ばして残りを変換し、重複と `"all"` もそのまま通すが、`capabilities` の文字列でない要素を
 //!   無視するが、本実装は GPU の数が黙って減らないよう予約ごと対象外にして記録する（fail-closed）。
 
 /// `value_drops` に使うキーパス。識別子を含まない。
@@ -64,11 +69,11 @@ impl<N> GpuReservationDetection<'_, N> {
 pub struct DetectedGpuReservation<'a, N> {
     /// `devices` 内での添字。
     pub index: usize,
-    /// 要求の指定形（解釈は #625）。
+    /// 要求の指定形（解釈は [`cdi_names_for`]）。
     pub request: GpuRequest<'a, N>,
 }
 
-/// GPU 要求の指定形。`count` の値は解釈しない（`"all"` か表現できない値かの判定は #625）。
+/// GPU 要求の指定形。`count` の値は検出では解釈しない（判定は [`cdi_names_for`]）。
 #[derive(Debug)]
 pub enum GpuRequest<'a, N> {
     /// `count`・`device_ids` のどちらも無い。
@@ -120,6 +125,137 @@ pub enum GpuDropReason {
     TooManyDeviceIds,
     /// `device_ids` の要素が [`MAX_DEVICE_ID_BYTES`] を超える、または総バイト数が上限を超える。
     DeviceIdTooLong,
+    /// `count` が `"all"`（大文字小文字を区別した完全一致）でない（STACK-9・TASK-156.2）。
+    /// 整数・他の文字列・スカラーでない値・null を含む。個数であり一意な CDI 名にできないため変換しない。
+    CountNotAll,
+    /// `device_ids` の要素が CDI デバイス名の規則に合わない（空文字を含む。TASK-156.2）。
+    DeviceIdNotCdiName,
+    /// `device_ids` の要素が `"all"`。`all` は未指定または `count: "all"` のときだけ作る（TASK-156.2）。
+    DeviceIdReservedAll,
+    /// `device_ids` に同じ要素が重なる。同名の二重出力か暗黙の重複除去かで意味が変わるため、
+    /// 予約ごと対象外にする安全側の判断（TASK-156.2）。
+    DeviceIdDuplicate,
+}
+
+/// CDI の kind（vendor/class）。利用者の入力から組み立てず固定する。
+pub const NVIDIA_GPU_KIND: &str = "nvidia.com/gpu";
+/// 全 GPU を表すデバイス名。
+pub const ALL_DEVICE_NAME: &str = "all";
+
+/// CDI デバイス名の規則。先頭と末尾が ASCII 英数字、中は英数字と `_` `-` `.` `:`。
+///
+/// 規則は `crates/gpu` の `is_valid_device_name`（private）と上流 container-device-interface の
+/// `ValidateDeviceName` に合わせた再実装。compose-convert から gpu への依存を足さない
+/// （crate-naming.md 決定 5）ため共有しない。`up`（TASK-155）では gpu crate が改めて名前を解析する。
+/// 両者の規則がずれる危険は残るため、gpu 側の規則を変えたらここも見直す。
+/// `/`・`=`・空白・NUL・制御文字・非 ASCII は通らず、kind や区切りの差し込みを防ぐ。
+fn is_valid_cdi_device_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (Some(first), Some(last)) = (b.first(), b.last()) else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':'))
+}
+
+/// 1 件の GPU 要求を CDI 完全修飾名へ変換する（STACK-9）。
+///
+/// `Unspecified` と `count: "all"` は `nvidia.com/gpu=all`。`count` のそれ以外は
+/// [`GpuDropReason::CountNotAll`]。`device_ids` は全要素を検証してから入力の順に変換し、
+/// 1 件でも不正なら予約ごと `Err`。件数・長さは検出（TASK-156.1）の上限で検証済み。
+pub fn cdi_names_for<N: ComposeNode>(
+    request: &GpuRequest<'_, N>,
+) -> Result<Vec<String>, GpuDropReason> {
+    match request {
+        GpuRequest::Unspecified => Ok(vec![format!("{NVIDIA_GPU_KIND}={ALL_DEVICE_NAME}")]),
+        GpuRequest::Count(node) => {
+            if node.as_str() == Some(ALL_DEVICE_NAME) {
+                Ok(vec![format!("{NVIDIA_GPU_KIND}={ALL_DEVICE_NAME}")])
+            } else {
+                Err(GpuDropReason::CountNotAll)
+            }
+        }
+        GpuRequest::DeviceIds(ids) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for id in ids {
+                if id == ALL_DEVICE_NAME {
+                    return Err(GpuDropReason::DeviceIdReservedAll);
+                }
+                if !is_valid_cdi_device_name(id) {
+                    return Err(GpuDropReason::DeviceIdNotCdiName);
+                }
+                if !seen.insert(id.as_str()) {
+                    return Err(GpuDropReason::DeviceIdDuplicate);
+                }
+            }
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                out.push(format!("{NVIDIA_GPU_KIND}={id}"));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// 変換できた 1 件の GPU 予約。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertedGpuReservation {
+    /// `devices` 内での添字。
+    pub index: usize,
+    /// CDI 完全修飾名（`device_ids` の順）。
+    pub devices: Vec<String>,
+}
+
+/// 検出と変換をあわせた結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuReservationConversion {
+    /// 変換できた予約（入力の順）。
+    pub reservations: Vec<ConvertedGpuReservation>,
+    /// 検出段・変換段の対象外の記録（添字の順。値は持たない）。
+    pub drops: Vec<GpuReservationDrop>,
+}
+
+impl GpuReservationConversion {
+    /// `value_drops[DEVICES_KEY_PATH]` へ加算する件数（検出段と変換段の合計。#599 の統合点）。
+    pub fn drop_count(&self) -> u64 {
+        u64::try_from(self.drops.len()).unwrap_or(u64::MAX)
+    }
+
+    /// 全予約の名前を入力の順につないだもの（stack の `ResourceReservations.devices` へ渡す形）。
+    /// 予約をまたぐ重複は除かない。別々の予約の合成は変換器本体の判断に任せる。
+    pub fn devices(&self) -> Vec<String> {
+        self.reservations
+            .iter()
+            .flat_map(|r| r.devices.iter().cloned())
+            .collect()
+    }
+}
+
+/// `devices` ノードを検出し、CDI 完全修飾名へ変換する（STACK-9・TASK-156.2）。
+pub fn convert_gpu_reservations<N: ComposeNode>(devices: &N) -> GpuReservationConversion {
+    let detection = detect_gpu_reservations(devices);
+    let mut drops = detection.drops;
+    let mut reservations = Vec::with_capacity(detection.reservations.len());
+    for r in &detection.reservations {
+        match cdi_names_for(&r.request) {
+            Ok(names) => reservations.push(ConvertedGpuReservation {
+                index: r.index,
+                devices: names,
+            }),
+            Err(reason) => drops.push(GpuReservationDrop {
+                index: Some(r.index),
+                reason,
+            }),
+        }
+    }
+    // `None`（devices 全体の問題）は先頭、以降は添字順。安定ソートで同一添字の順を保つ。
+    drops.sort_by_key(|d| d.index);
+    GpuReservationConversion {
+        reservations,
+        drops,
+    }
 }
 
 /// `devices` ノードから GPU 予約を検出する（STACK-9）。
@@ -462,5 +598,146 @@ mod tests {
             ]
         );
         assert_eq!(d.drop_count(), 3);
+    }
+
+    fn ids(v: Vec<T>) -> T {
+        gpu(vec![("device_ids", seq(v))])
+    }
+    fn names(devices: &T) -> Vec<String> {
+        let c = convert_gpu_reservations(devices);
+        assert!(c.drops.is_empty(), "{:?}", c.drops);
+        c.devices()
+    }
+    fn conv_drops(devices: T) -> Vec<(Option<usize>, GpuDropReason)> {
+        let c = convert_gpu_reservations(&devices);
+        assert!(c.reservations.is_empty());
+        c.drops.iter().map(|x| (x.index, x.reason)).collect()
+    }
+
+    #[test]
+    fn stack_9_unspecified_and_count_all_become_all() {
+        let d = seq(vec![gpu(vec![]), gpu(vec![("count", s("all"))])]);
+        assert_eq!(names(&d), vec!["nvidia.com/gpu=all", "nvidia.com/gpu=all"]);
+    }
+
+    #[test]
+    fn stack_9_device_ids_become_qualified_names() {
+        let d = seq(vec![ids(vec![
+            s("GPU-abc"),
+            s("1"),
+            T::Int(7),
+            s("0:1"),
+            s("GPU-8f2a1c3e-0000-4b5d-9e11-aaaaaaaaaaaa"),
+        ])]);
+        assert_eq!(
+            names(&d),
+            vec![
+                "nvidia.com/gpu=GPU-abc",
+                "nvidia.com/gpu=1",
+                "nvidia.com/gpu=7",
+                "nvidia.com/gpu=0:1",
+                "nvidia.com/gpu=GPU-8f2a1c3e-0000-4b5d-9e11-aaaaaaaaaaaa",
+            ]
+        );
+    }
+
+    #[test]
+    fn stack_9_count_number_is_dropped_not_converted() {
+        let cases = vec![
+            T::Int(1),
+            T::Int(0),
+            s("2"),
+            s("ALL"),
+            T::Bool,
+            T::Null,
+            seq(vec![]),
+            map(vec![]),
+        ];
+        for c in cases {
+            let d = seq(vec![gpu(vec![("count", c)])]);
+            assert_eq!(conv_drops(d), vec![(Some(0), GpuDropReason::CountNotAll)]);
+        }
+    }
+
+    #[test]
+    fn stack_9_invalid_device_id_drops_whole_reservation() {
+        for bad in ["", "-a", "a-", "a/b", "a=b", "x y", "a\0b", "ＧＰＵ"] {
+            let d = seq(vec![ids(vec![s("0"), s(bad)])]);
+            assert_eq!(
+                conv_drops(d),
+                vec![(Some(0), GpuDropReason::DeviceIdNotCdiName)],
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stack_9_device_id_all_and_duplicates_are_dropped() {
+        assert_eq!(
+            conv_drops(seq(vec![ids(vec![s("all")])])),
+            vec![(Some(0), GpuDropReason::DeviceIdReservedAll)]
+        );
+        assert_eq!(
+            conv_drops(seq(vec![ids(vec![s("0"), s("0")])])),
+            vec![(Some(0), GpuDropReason::DeviceIdDuplicate)]
+        );
+        assert_eq!(
+            conv_drops(seq(vec![ids(vec![T::Int(0), s("0")])])),
+            vec![(Some(0), GpuDropReason::DeviceIdDuplicate)]
+        );
+    }
+
+    #[test]
+    fn stack_9_conversion_merges_detection_and_conversion_drops_in_order() {
+        let devices = seq(vec![
+            gpu(vec![]),
+            gpu(vec![("count", T::Int(2))]),
+            T::Null,
+            ids(vec![s("a"), s("b")]),
+            ids(vec![s("a/b")]),
+            map(vec![("driver", s("amd"))]),
+        ]);
+        let c = convert_gpu_reservations(&devices);
+        assert_eq!(
+            c.reservations,
+            vec![
+                ConvertedGpuReservation {
+                    index: 0,
+                    devices: vec!["nvidia.com/gpu=all".into()]
+                },
+                ConvertedGpuReservation {
+                    index: 3,
+                    devices: vec!["nvidia.com/gpu=a".into(), "nvidia.com/gpu=b".into()]
+                },
+            ]
+        );
+        let got: Vec<_> = c.drops.iter().map(|d| (d.index, d.reason)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(1), GpuDropReason::CountNotAll),
+                (Some(2), GpuDropReason::NotMapping),
+                (Some(4), GpuDropReason::DeviceIdNotCdiName),
+                (Some(5), GpuDropReason::DriverNotNvidia),
+            ]
+        );
+        assert_eq!(c.drop_count(), 4);
+        assert_eq!(
+            c.devices(),
+            vec!["nvidia.com/gpu=all", "nvidia.com/gpu=a", "nvidia.com/gpu=b"]
+        );
+    }
+
+    #[test]
+    fn stack_9_conversion_whole_devices_problems_yield_no_devices() {
+        assert_eq!(
+            conv_drops(s("x")),
+            vec![(None, GpuDropReason::DevicesNotSequence)]
+        );
+        let many = seq((0..=MAX_DEVICES).map(|_| gpu(vec![])).collect());
+        assert_eq!(
+            conv_drops(many),
+            vec![(None, GpuDropReason::TooManyDevices)]
+        );
     }
 }

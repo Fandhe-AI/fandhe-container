@@ -651,7 +651,7 @@ fn merge_additional_gids(
 }
 
 /// 文字列 1 要素の長さと NUL を検証する。
-fn check_string(field: &'static str, s: &str) -> Result<(), CriError> {
+pub(crate) fn check_string(field: &'static str, s: &str) -> Result<(), CriError> {
     if s.len() > MAX_STRING_BYTES || s.contains('\0') {
         return Err(invalid(field));
     }
@@ -659,7 +659,7 @@ fn check_string(field: &'static str, s: &str) -> Result<(), CriError> {
 }
 
 /// 絶対パス（`/` 始まり・NUL 無し・`..` 無し・空要素無し・長さ上限以下）を検証する。
-fn check_abs_path(field: &'static str, p: &str) -> Result<(), CriError> {
+pub(crate) fn check_abs_path(field: &'static str, p: &str) -> Result<(), CriError> {
     if p.len() > MAX_PATH_BYTES || !p.starts_with('/') || p.contains('\0') {
         return Err(invalid(field));
     }

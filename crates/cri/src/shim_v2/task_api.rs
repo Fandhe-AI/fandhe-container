@@ -1,4 +1,4 @@
-//! containerd Task API のメッセージ型（Create / Start 分。CRI-5・TASK-62.2・MS-7）。
+//! containerd Task API のメッセージ型（Create / Start / Exec 分。CRI-5・TASK-62.2・TASK-62.4・MS-7）。
 //!
 //! containerd の `api/runtime/task/v2/shim.proto`（commit `aefce4e7cdbf9a8ce754cd4edb1de5d44f0c704d`）と
 //! `api/types/mount.proto` のフィールド番号を prost の derive で手書きする。`.proto` は持ち込まない
@@ -72,7 +72,7 @@ pub struct StartRequest {
     /// コンテナ ID。
     #[prost(string, tag = "1")]
     pub id: String,
-    /// exec の ID。空でなければ exec の開始（#674、未対応）。
+    /// exec の ID。空でなければ、`Exec` で登録済みの exec プロセスの開始（TASK-62.4）。
     #[prost(string, tag = "2")]
     pub exec_id: String,
 }
@@ -83,6 +83,45 @@ pub struct StartResponse {
     /// init プロセスの PID。0 は「不明」。
     #[prost(uint32, tag = "1")]
     pub pid: u32,
+}
+
+/// `google.protobuf.Any`（`type_url` と `value` のみ。`Exec` の `spec` の運搬用）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Any {
+    /// 型 URL。
+    #[prost(string, tag = "1")]
+    pub type_url: String,
+    /// 符号化済みの値。
+    #[prost(bytes = "vec", tag = "2")]
+    pub value: Vec<u8>,
+}
+
+/// `ExecProcessRequest`（TASK-62.4）。containerd の `shim.proto`（上記 commit）の番号 1〜7。
+///
+/// `Exec` は exec プロセスを登録するだけで、起動は続く `Start`（`exec_id` つき）が行う。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecProcessRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// exec の ID。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+    /// pty の要否。未対応。
+    #[prost(bool, tag = "3")]
+    pub terminal: bool,
+    /// stdin の FIFO。未対応。
+    #[prost(string, tag = "4")]
+    pub stdin: String,
+    /// stdout の FIFO。未対応。
+    #[prost(string, tag = "5")]
+    pub stdout: String,
+    /// stderr の FIFO。未対応。
+    #[prost(string, tag = "6")]
+    pub stderr: String,
+    /// OCI runtime-spec の `Process`（JSON）を包んだ `Any`。
+    #[prost(message, optional, tag = "7")]
+    pub spec: Option<Any>,
 }
 
 #[cfg(test)]
@@ -132,5 +171,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(r.encode_to_vec(), [0x1a, 0, 0x20, 1, 0x2a, 1, b'i']);
+    }
+
+    /// CRI-5: ExecProcessRequest と Any の番号。
+    #[test]
+    fn cri5_exec_request_wire_bytes() {
+        let r = ExecProcessRequest {
+            id: "a".into(),
+            exec_id: "e".into(),
+            terminal: true,
+            stdin: "i".into(),
+            stdout: "o".into(),
+            stderr: "r".into(),
+            spec: Some(Any {
+                type_url: "u".into(),
+                value: vec![9],
+            }),
+        };
+        assert_eq!(
+            r.encode_to_vec(),
+            [
+                0x0a, 1, b'a', 0x12, 1, b'e', 0x18, 1, 0x22, 1, b'i', 0x2a, 1, b'o', 0x32, 1, b'r',
+                0x3a, 6, 0x0a, 1, b'u', 0x12, 1, 9
+            ]
+        );
+        assert_eq!(
+            ExecProcessRequest::decode(&r.encode_to_vec()[..]).unwrap(),
+            r
+        );
     }
 }

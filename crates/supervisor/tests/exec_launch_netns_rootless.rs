@@ -24,7 +24,7 @@
 //! # 範囲外（REPAIR-3）
 //! - pasta を含めた起動からの通し確認（`PastaAttachHook`）は `pasta_launch_rootless`（#3331）。ホステッド runner に pasta が無いため、本試験の
 //!   フックは holder の起動だけを行う試験用実装
-//! - restart の再 launch は #2043 まで拒否される。rootful の Attachable は未実装（#3069）
+//! - restart の再 launch は #2043 で成立したが、この構成での restart は未確認。rootful の Attachable は未実装（#3069）
 //!
 //! # 必要環境
 //! 非 root・非特権 user namespace（AppArmor 緩和）・委譲 cgroup v2・Landlock ABI 6 以上。範囲写像の 2 シナリオは

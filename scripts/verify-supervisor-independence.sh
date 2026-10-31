@@ -13,7 +13,7 @@
 #       「同名のプロセスが居る」ではなく同一プロセスの照合）。再親化後の親 pid は参考値として出力する
 # 「監視継続」は既定では (b)+(c) の生存照合で定義する。残り N-1 個のコンテナを kill して再起動を確認する
 # PoC-17 相当の往復は --check-restart（opt-in・既定 off）で、SUP-3（restart ポリシー）の実装が前提のため
-# supervisor の再 launch が本番 launcher で拒否される間（#2043）は成立しない（#2043 の後に有効）。
+# supervisor の再 launch は #2043 で本番 launcher でも成立する（実機での実証は #499）。
 # 孤児コンテナの re-adopt・終了ポリシーは SUP-8・TASK-165 の課題で本スクリプトの範囲外。
 #
 # 呼び出し元: Makefile の `supervisor-independence`（操作者が明示実行。make ci には含めない）。
@@ -789,7 +789,7 @@ for desc in ${DESC[$target_index]}; do
   if [ "$cppid" = "$tpid" ] && [ "$reparented_to" = "null" ] && [ -n "${SP[$cpid]:-}" ]; then reparented_to="${SP[$cpid]}"; fi
 done
 
-# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装と再 launch〔#2043〕が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
+# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装と再 launch〔#2043 で成立〕が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
 # 再起動の成立条件: kill した旧プロセス（pid・起動時刻）がすべて消滅していること、かつ各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
 # kill した子とシグネチャ（comm＋完全な cmdline）が一致するものが、シグネチャごとに kill した直接の子の数以上、生存していること。
 # 同名・別コマンドの補助プロセスが増えただけでは成立しない。待機中と settle 中も子孫を追跡し続け（環境変数を

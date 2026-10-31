@@ -70,7 +70,7 @@
 //!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
 //!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher` が `LaunchedProcess::take_output` で返す読み取り側を、
 //!   supervisor の bin の入口（`start_entry::run_supervised`）が捕捉ハブへ渡す（#1819）。実プロセスでの確認は
-//!   実機前提の `tests/supervisor_bin_real.rs`。再起動をまたぐ捕捉は、再 launch の実機での成立（#2043）を待つ。
+//!   実機前提の `tests/supervisor_bin_real.rs`。再起動をまたぐ捕捉の実機での照合は `supervisor_bin_real` のシナリオ C（#2043）。
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 

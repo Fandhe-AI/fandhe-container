@@ -33,7 +33,7 @@
 //! - **pidfd での監視は採らない**: `pidfd_open` は `sys` の新しい `unsafe` になるため、生存確認は未回収の `Child` の
 //!   `try_wait`（`wait` の周期ごと。pasta の stderr を読む責務も兼ねる）で行う。検出の遅れは `POLL_INTERVAL` 程度
 //! - **restart の再 launch**: 同じ launcher とフックを通る形（起動の経路を 1 つ）だが、本番 launcher の再 launch は
-//!   #2043 まで `FailedPrecondition` で拒否される。restart で動くことは本モジュールの時点では保証しない
+//!   #2043 で再 launch 自体は成立したが、pasta 構成での restart は未確認（#341・#3331）。本モジュールの時点では保証しない
 //! - CLI の `--network` の受け口と start での D10 の再照合は #3329 で実装済み(手順 2c で `network_definition::check_pasta_definition`)、実機の通し確認は
 //!   `tests/pasta_launch_rootless.rs`（#3331。実行と結果の記録は #341）
 //!   （SEC-4 の監査への記録は #3330 で実装済み。入口が `PastaLogBuffer::take_tamper` を配送する）

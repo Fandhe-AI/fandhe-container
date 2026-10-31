@@ -9,8 +9,8 @@
 //! - 本ファイルの [`monitor`] は起動ハンドル（`LaunchedProcess`）を呼び出し側から注入する。supervisor のバイナリ入口は
 //!   `src/main.rs`（処理順は [`crate::start_entry`]、CLI との契約は [`crate::start_contract`]。#1717）で、core の本番
 //!   `ProcessLauncher`（`oci_runtime::ProductionLauncher`）で起動したハンドルを渡す（#1819）。restart の再 launch は
-//!   同じ launcher を使うが、単一スレッドの要求を満たせず拒否される（`FailedPrecondition`・fail-closed）。実機で成立する
-//!   再構成は #2043（SUP-3・CORE-1）。
+//!   同じ launcher を使い、単一スレッドの要求は常駐スレッドを止めて監視スレッドで直接呼ぶことで満たす（#2043・SUP-3・
+//!   CORE-1。止められなければ fail-closed）。
 //!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
 //! - restart ポリシーの配線と `restart_count` の加算は [`crate::restart`]（TASK-159.3・#489）。次節に未実装の範囲を記す。
 //!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは `RotatingFileSink`（SUP-7・TASK-164.2）で
@@ -44,7 +44,7 @@
 //! （TASK-157.5 の土台だった「異常終了の検知回数」の加算は廃止し、`restart_count` を実施済み再起動回数に統一した）。
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
-//! - 本番 `ProcessLauncher` による再 launch の実機での成立（結線は済み〔[`crate::restart::LauncherRelauncher`]〕だが、単一スレッドの要求を満たせず拒否される。#2043・SUP-3）。
+//! - 本番 `ProcessLauncher` による再 launch の実機での成立は #2043 で実装済み（[`crate::restart::LauncherRelauncher`]。実機確認は `supervisor_bin_real` のシナリオ C）。
 //! - 停止シグナルの猶予時間（#517）。
 //! - 再 launch・re-adopt 時の `unless-stopped` と `always` の差: 「明示 stop 済み」は state.json に記録済み（#2440。トレイト契約 14）で、
 //!   判定の入口は `crate::restart::evaluate_resume`。それを呼ぶ re-adopt 本体は未実装（#514・SUP-8）。明示 stop の意図は

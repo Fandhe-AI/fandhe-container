@@ -178,8 +178,8 @@
 //!   `mnt_id` は `setns` の後に `/proc/thread-self` が使えないため `TargetBinding.proc_dir` の `fdinfo/N` から読む。
 //!   識別子の無い旧記録（Mount 由来のルールがあるもの）は、`setns` と補助グループの消去より前に `FailedPrecondition`
 //!   （段 `Landlock`）で拒否する（作り直しの手順は `docs/setup/exec-mount-identity-recovery.md`）。
-//!   restart の再 launch は Running(新 pid) の更新で識別子を置き換える（契約 12）が、本番 launcher の再 launch は #2043 まで
-//!   拒否される。記録を持たない偽の launcher が前の記録を引き継ぐと識別子が古くなり、照合で拒否される（fail-closed）
+//!   restart の再 launch は Running(新 pid) の更新で識別子を置き換える（契約 12）が、本番 launcher の再 launch は #2043 で
+//!   成立する（supervisor が単一スレッドにして呼ぶ）。記録を持たない偽の launcher が前の記録を引き継ぐと識別子が古くなり、照合で拒否される（fail-closed）
 //! - 同じ user namespace（`Shared`。rootful 相当で本番では到達しない）での root 以外の `process.user` と
 //!   `additionalGids`（`Unimplemented` で拒否。`RootfulHostRoot` の判断待ち。#2241）。別の user namespace
 //!   （既定の rootless）では写像と照合して適用する（#2770）

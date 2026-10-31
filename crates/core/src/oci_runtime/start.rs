@@ -120,7 +120,7 @@
 //! pid で Running へ遷移するところまでが本関数の責務である。本番の [`ProcessLauncher`]
 //! （`ProductionLauncher`。Linux。#1816）は実装済みで、制限ステージ（TASK-37〜39）を通した実プロセスの
 //! 起動は `tests/production_launcher.rs`（#1818。実機前提）で通している。supervisor の start 経路は呼び出しスレッドでの
-//! 直接 launch へ再構成済み（#1819）。restart の再 launch は未対応（#2043。REPAIR-3）。
+//! 直接 launch へ再構成済み（#1819）。restart の再 launch は supervisor が呼び出しスレッドで直接行う（#2043）。
 //!
 //! エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や OS 依存の I/O エラー
 //! 文字列を含めない。

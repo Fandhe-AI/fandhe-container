@@ -123,6 +123,8 @@ enum WaitMode {
     Pending,
     Error(ErrorCode),
     ExitedOk,
+    /// 終了コード 7 で終わる(restart の `on-failure` の試験用。#2043)。
+    ExitedFailure,
 }
 
 /// 模擬プロセス（terminate の回数を数える）。
@@ -146,6 +148,7 @@ impl LaunchedProcess for FakeProcess {
             }
             WaitMode::Error(code) => Err(TraitError::new(code, "wait failed")),
             WaitMode::ExitedOk => Ok(Some(ProcessExit::Exited(0))),
+            WaitMode::ExitedFailure => Ok(Some(ProcessExit::Exited(7))),
         }
     }
 
@@ -177,6 +180,9 @@ struct FakeLauncher {
     /// `Some(n)` なら n 回目（1 始まり）以降の launch を、単一スレッドの要求を満たさない呼び出しの拒否
     /// （`FailedPrecondition`）として失敗させる。
     reject_from: Option<usize>,
+    /// `true` なら `fandhe-relaunch` スレッド（別スレッドでの再 launch）から呼ばれた launch を、単一スレッドの要求を
+    /// 満たさない呼び出しとして拒否する（本番 launcher の `Threads: 1` の代わり。#2043）。
+    reject_on_relaunch_thread: bool,
     /// launch を呼んだスレッドの ID と名前。
     launch_threads: Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
 }
@@ -197,6 +203,7 @@ impl FakeLauncher {
             self_bounded: false,
             left_process: false,
             reject_from: None,
+            reject_on_relaunch_thread: false,
             launch_threads: Mutex::new(Vec::new()),
         }
     }
@@ -245,7 +252,10 @@ impl ProcessLauncher for FakeLauncher {
             .unwrap_or_else(|e| e.into_inner())
             .push(timeout);
         std::thread::sleep(self.delay);
-        if self.reject_from.is_some_and(|n| nth >= n) {
+        let on_relaunch_thread = std::thread::current().name() == Some("fandhe-relaunch");
+        if self.reject_from.is_some_and(|n| nth >= n)
+            || (self.reject_on_relaunch_thread && on_relaunch_thread)
+        {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
                 "launch requires a single-threaded process",
@@ -1355,7 +1365,7 @@ fn core2_unconfirmed_left_process_keeps_reservation_and_cgroup() {
 /// SUP-3・CORE-1・#1819・#2043: restart の再 launch が単一スレッドの要求で拒否される間は fail-closed に止まる。
 /// 初回の起動は成功し、2 回目の launch が拒否されると、新しい子は作られず、restart ポリシー `always` でも
 /// 再起動せず、状態は Stopped で、終了コードは FAILED_PRECONDITION の写像になる。
-/// 再 launch が実機で成立する再構成（#2043）が入ったらこの試験を置き換える。
+/// 再 launch が拒否される場合の fail-closed の保証として残す（#2043 の再構成後も、拒否は同じ結末になる）。
 #[test]
 fn sup3_core1_single_thread_launcher_rejection_fails_closed() {
     let env = Env::new("relrej");
@@ -1383,6 +1393,52 @@ fn sup3_core1_single_thread_launcher_rejection_fails_closed() {
     let rec = env.record(&env.id);
     assert_eq!(rec.status().state(), ContainerState::Stopped);
     assert!(rec.status().pid().is_none());
+}
+
+/// SUP-3・CORE-1・REPAIR-5・#2043: `SelfBounded` の launcher の再 launch は、監視ループを回すスレッド（入口スレッド）で
+/// 直接呼ばれ、別スレッド `fandhe-relaunch` では呼ばれない。別スレッドでの launch を拒否する launcher でも
+/// restart が成り立ち、`restart_count` が 1 進んで 2 回目の起動が記録される。
+#[test]
+fn sup3_core1_2043_relaunch_runs_on_the_calling_thread() {
+    let env = Env::new("relthread");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    fl.reject_on_relaunch_thread = true;
+    fl.wait_mode = WaitMode::ExitedFailure;
+    let (d, l) = deps(&calls, fl);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let code = run_supervised(
+        env.store.clone(),
+        cid(&env.id),
+        running,
+        RestartPolicy::OnFailure {
+            max_retries: std::num::NonZeroU32::new(1),
+        },
+        &short_timeouts(),
+        &StopToken::new(),
+    );
+    // 上限(1 回)まで再起動して終わる(supervisor 自身の終了コードは 0)。再 launch は 1 回で、拒否されていない。
+    assert_eq!(code, 0);
+    assert_eq!(l.launches(), 2);
+    let threads = l
+        .launch_threads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let me = std::thread::current();
+    assert_eq!(
+        threads,
+        [
+            (me.id(), me.name().map(str::to_owned)),
+            (me.id(), me.name().map(str::to_owned)),
+        ]
+    );
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Stopped);
+    assert_eq!(rec.restart_count(), 1);
 }
 
 /// REPAIR-4: 起動の計測結果は英語のキーの 1 行 JSON で、操作ごとの成功・失敗数とレイテンシを載せる。

@@ -18,6 +18,7 @@
 //! 呼び出し元: `start_entry` の `log_event` と終了前の報告・`run::StderrLogObserver`・`main.rs`（Linux 以外）。
 //! core 側の stderr 出力（監査ログのフォールバック等）は本モジュールを通らない。
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -52,6 +53,9 @@ pub enum EmitOutcome {
     TimedOut,
     /// 共有の出口を一度も使っていないため、待つ行が無い（[`flush_stderr`] のみ）。
     NothingQueued,
+    /// 専用スレッドを一時停止中（[`StderrSink::quiesce`]）のため、待たずに戻った。行は再開（[`StderrSink::resume`]）の
+    /// 後に順に書かれる（restart の再 launch の区間。#2043）。
+    Quiesced,
 }
 
 impl EmitOutcome {
@@ -67,22 +71,78 @@ struct Line {
     ack: Option<SyncSender<EmitOutcome>>,
 }
 
+/// 専用スレッドが終了時に返す書き手の受け口。
+type WriterReturn = Receiver<Box<dyn Write + Send>>;
+
+/// 専用スレッドの状態。
+enum Phase {
+    /// 専用スレッドが動いている。
+    Running(SyncSender<Line>),
+    /// 一時停止中（[`StderrSink::quiesce`] 済み）。行は `Inner::buffer` へ溜める。
+    Quiesced,
+    /// 専用スレッドを作れなかった（以後の出力は捨てる）。
+    Unavailable,
+}
+
+struct Inner {
+    phase: Phase,
+    /// 動いている専用スレッドが終了時に書き手を返す受け口。
+    done: Option<WriterReturn>,
+    /// 一時停止で取り戻した書き手（再開で専用スレッドへ戻す）。
+    writer: Option<Box<dyn Write + Send>>,
+    /// 一時停止中に溜めた行（`capacity` まで。超えた分は `QueueFull` で捨てる）。
+    buffer: VecDeque<Vec<u8>>,
+}
+
 /// 専用スレッド 1 本で書き手へ書く、待たない出口。
+///
+/// restart の再 launch は core の本番 launcher が単一スレッド（`Threads: 1`）を要求するため、専用スレッドを
+/// [`Self::quiesce`] で止めて launch し、[`Self::resume`] で再開する（#2043・SUP-3・CORE-1）。止めている間の
+/// `emit` はスレッドを作らず、上限つきのバッファへ溜める。
 pub struct StderrSink {
-    /// 専用スレッドを作れなかったときは `None`（以後の出力は捨てる）。
-    tx: Option<SyncSender<Line>>,
+    capacity: usize,
+    inner: Mutex<Inner>,
 }
 
 impl StderrSink {
     /// `writer` へ書く専用スレッドを作り、`capacity` 行までのキューで包む（試験では任意の書き手を渡す）。
     pub fn spawn<W: Write + Send + 'static>(writer: W, capacity: usize) -> Self {
-        let (tx, rx) = sync_channel(capacity);
-        let spawned = std::thread::Builder::new()
-            .name("supervisor-stderr".into())
-            .spawn(move || drain(writer, rx));
+        let (phase, done) = match Self::start_worker(Box::new(writer), capacity, VecDeque::new()) {
+            Some((tx, done)) => (Phase::Running(tx), Some(done)),
+            None => (Phase::Unavailable, None),
+        };
         Self {
-            tx: spawned.ok().map(|_| tx),
+            capacity,
+            inner: Mutex::new(Inner {
+                phase,
+                done,
+                writer: None,
+                buffer: VecDeque::new(),
+            }),
         }
+    }
+
+    /// 専用スレッドを作る。`backlog` の行を先頭に書く。書き手は終了時に返す受け口へ渡す。作れなければ `None`。
+    fn start_worker(
+        writer: Box<dyn Write + Send>,
+        capacity: usize,
+        backlog: VecDeque<Vec<u8>>,
+    ) -> Option<(SyncSender<Line>, WriterReturn)> {
+        // 再開時の溜め分の分だけ余裕を足す(溜め分で満杯にしない。上限は容量の 2 倍まで)。
+        let (tx, rx) = sync_channel(capacity.saturating_add(backlog.len()));
+        for bytes in backlog {
+            // 容量は backlog 以上にしてあるため入る。
+            tx.try_send(Line { bytes, ack: None }).ok()?;
+        }
+        let (done_tx, done_rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("supervisor-stderr".into())
+            .spawn(move || {
+                let writer = drain(writer, rx);
+                let _ = done_tx.try_send(writer);
+            })
+            .ok()?;
+        Some((tx, done_rx))
     }
 
     /// 1 行を待たずにキューへ入れる。入れられたら [`EmitOutcome::Queued`]。
@@ -96,6 +156,7 @@ impl StderrSink {
     /// 1 行をキューへ入れ、書けたことを `deadline` まで待つ。
     ///
     /// 先に入れた行はこの行より前に書かれる（キューは FIFO）。結果は前回の待つ依頼以降の行をまとめたもの。
+    /// 一時停止中は行をバッファへ溜めて待たずに [`EmitOutcome::Quiesced`] を返す。
     pub fn emit_and_wait(&self, bytes: Vec<u8>, deadline: Duration) -> EmitOutcome {
         let (ack, done) = sync_channel(1);
         if let Err(rejected) = self.enqueue(Line {
@@ -118,18 +179,131 @@ impl StderrSink {
     }
 
     fn enqueue(&self, line: Line) -> Result<(), EmitOutcome> {
-        let Some(tx) = self.tx.as_ref() else {
-            return Err(EmitOutcome::WorkerUnavailable);
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let capacity = self.capacity;
+        match &inner.phase {
+            Phase::Unavailable => Err(EmitOutcome::WorkerUnavailable),
+            Phase::Running(tx) => tx.try_send(line).map_err(|e| match e {
+                TrySendError::Full(_) => EmitOutcome::QueueFull,
+                TrySendError::Disconnected(_) => EmitOutcome::WorkerUnavailable,
+            }),
+            Phase::Quiesced => {
+                // 空の行（`flush`）は溜めない。
+                if !line.bytes.is_empty() {
+                    if inner.buffer.len() >= capacity {
+                        return Err(EmitOutcome::QueueFull);
+                    }
+                    inner.buffer.push_back(line.bytes);
+                }
+                // 待つ依頼は待たずに返す（専用スレッドが無いため ack は来ない）。
+                if line.ack.is_some() {
+                    return Err(EmitOutcome::Quiesced);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 専用スレッドを止めて書き手を取り戻す（restart の再 launch の直前。#2043・SUP-3・CORE-1）。
+    ///
+    /// 溜まっている行を書き切らせてから送り手を閉じ、専用スレッドの終了を `deadline` まで待つ。期限内に書き手が
+    /// 戻らなければ `Err`（書き込みで止まっている書き手のまま fork させない。呼び出し側は launch しない）。その場合も
+    /// 以後の行はバッファへ溜め、書き手が戻っていれば [`Self::resume`] で再開できる。止めた後の `emit` はスレッドを
+    /// 作らない。専用スレッドの tid が `/proc/self/task` から消えるまでの待ちは呼び出し側（`thread_settle`）が行う。
+    pub fn quiesce(&self, deadline: Duration) -> Result<(), TraitError> {
+        let done = {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            match std::mem::replace(&mut inner.phase, Phase::Quiesced) {
+                // 送り手を閉じると、専用スレッドは溜まった行を書き切って終わる。
+                Phase::Running(tx) => drop(tx),
+                Phase::Quiesced => {}
+                Phase::Unavailable => {
+                    inner.phase = Phase::Unavailable;
+                    return Ok(());
+                }
+            }
+            if inner.writer.is_some() {
+                return Ok(());
+            }
+            inner.done.take()
         };
-        tx.try_send(line).map_err(|e| match e {
-            TrySendError::Full(_) => EmitOutcome::QueueFull,
-            TrySendError::Disconnected(_) => EmitOutcome::WorkerUnavailable,
-        })
+        let Some(done) = done else {
+            return Ok(());
+        };
+        match done.recv_timeout(deadline) {
+            Ok(writer) => {
+                self.inner
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .writer = Some(writer);
+                Ok(())
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.inner
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .done = Some(done);
+                Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "stderr writer thread did not stop in time",
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // 書き手を返さずに専用スレッドが終わった（panic 等）。以後の出力は捨てる。
+                self.inner
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .phase = Phase::Unavailable;
+                Err(TraitError::new(
+                    ErrorCode::Unavailable,
+                    "stderr writer thread ended without returning the writer",
+                ))
+            }
+        }
+    }
+
+    /// [`Self::quiesce`] で止めた専用スレッドを、同じ書き手で作り直す。止めている間に溜めた行を先頭から書く。
+    ///
+    /// 動いていれば何もしない。書き手がまだ戻っていない（`quiesce` が期限切れだった）場合は、戻っていれば取り直し、
+    /// 戻っていなければ止めたまま `Err`（行は上限までバッファに残る）。
+    pub fn resume(&self) -> Result<(), TraitError> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(inner.phase, Phase::Quiesced) {
+            return Ok(());
+        }
+        if inner.writer.is_none()
+            && let Some(rx) = inner.done.as_ref()
+            && let Ok(w) = rx.try_recv()
+        {
+            inner.writer = Some(w);
+            inner.done = None;
+        }
+        let Some(writer) = inner.writer.take() else {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "stderr writer is not available to resume",
+            ));
+        };
+        let backlog = std::mem::take(&mut inner.buffer);
+        match Self::start_worker(writer, self.capacity, backlog) {
+            Some((tx, done)) => {
+                inner.phase = Phase::Running(tx);
+                inner.done = Some(done);
+                Ok(())
+            }
+            None => {
+                inner.phase = Phase::Unavailable;
+                Err(TraitError::new(
+                    ErrorCode::Unavailable,
+                    "failed to resume the stderr writer thread",
+                ))
+            }
+        }
     }
 }
 
-/// 専用スレッドの本体。全送り手が無くなるまで 1 行ずつ書き、待つ依頼には前回以降の結果を返す。
-fn drain<W: Write>(mut writer: W, rx: Receiver<Line>) {
+/// 専用スレッドの本体。全送り手が無くなるまで 1 行ずつ書き、待つ依頼には前回以降の結果を返す。終了時に書き手を返す。
+fn drain(mut writer: Box<dyn Write + Send>, rx: Receiver<Line>) -> Box<dyn Write + Send> {
     let mut failed_lines: u64 = 0;
     for line in rx {
         let written = line.bytes.is_empty()
@@ -150,8 +324,8 @@ fn drain<W: Write>(mut writer: W, rx: Receiver<Line>) {
             let _ = ack.try_send(outcome);
         }
     }
+    writer
 }
-
 static STDERR: OnceLock<StderrSink> = OnceLock::new();
 
 /// 差し替える書き手の置き場。`consumed` は共有の出口の初期化が置き場を見た後を表し、以後の差し込みを拒否する
@@ -204,6 +378,18 @@ pub fn flush_stderr(deadline: Duration) -> EmitOutcome {
     STDERR
         .get()
         .map_or(EmitOutcome::NothingQueued, |sink| sink.flush(deadline))
+}
+
+/// 共有の出口の専用スレッドを止める（restart の再 launch の直前。#2043・SUP-3・CORE-1）。
+///
+/// 一度も使っていなければ何もしない（止めるためだけにスレッドを作らない）。期限内に止まらなければ `Err`。
+pub fn quiesce_stderr(deadline: Duration) -> Result<(), TraitError> {
+    STDERR.get().map_or(Ok(()), |sink| sink.quiesce(deadline))
+}
+
+/// [`quiesce_stderr`] で止めた共有の出口を再開する（launch の成否に関わらず呼ぶ）。
+pub fn resume_stderr() -> Result<(), TraitError> {
+    STDERR.get().map_or(Ok(()), StderrSink::resume)
 }
 
 /// 試験用の書き手の共有部品（stderr_sink と、これを使う他モジュールの試験で使う）。
@@ -362,6 +548,48 @@ mod tests {
         assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
     }
 
+    /// SUP-3・CORE-1（#2043）: 止めている間の `emit` はスレッドを作らず溜め、再開後に順に書かれる。
+    /// 上限を超えた分は `QueueFull`、待つ依頼は待たずに `Quiesced`。
+    #[test]
+    fn sup3_2043_quiesce_buffers_and_resume_writes_in_order() {
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 2);
+        assert_eq!(sink.emit(b"a\n".to_vec()), EmitOutcome::Queued);
+        sink.quiesce(Duration::from_secs(5)).expect("quiesce");
+        // 止める前の行は書き切られている。
+        assert_eq!(buf.0.lock().unwrap().as_slice(), b"a\n");
+        assert_eq!(sink.emit(b"b\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(
+            sink.emit_and_wait(b"c\n".to_vec(), Duration::from_secs(30)),
+            EmitOutcome::Quiesced
+        );
+        assert_eq!(sink.emit(b"d\n".to_vec()), EmitOutcome::QueueFull);
+        assert_eq!(sink.flush(Duration::from_secs(30)), EmitOutcome::Quiesced);
+        sink.resume().expect("resume");
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(buf.0.lock().unwrap().as_slice(), b"a\nb\nc\n");
+    }
+
+    /// SUP-3・REPAIR-5（#2043）: 書き手が止まっていれば `quiesce` は期限で `Err`。書き手が戻れば `resume` で再開できる。
+    #[test]
+    fn sup3_2043_quiesce_times_out_on_stuck_writer_and_resumes_later() {
+        let (release, arrived, writer) = stuck();
+        let sink = StderrSink::spawn(writer, 4);
+        assert_eq!(sink.emit(b"x\n".to_vec()), EmitOutcome::Queued);
+        arrived
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker thread did not reach the writer");
+        let started = Instant::now();
+        let err = sink
+            .quiesce(Duration::from_millis(100))
+            .expect_err("a stuck writer must not be quiesced");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // 書き手がまだ戻っていないので再開できない。
+        assert!(sink.resume().is_err());
+        drop(release);
+    }
+
     /// 結果の区別: 届いた（または届ける行が無い）ものだけが `is_delivered`。
     #[test]
     fn repair4_is_delivered_distinguishes_outcomes() {
@@ -373,6 +601,7 @@ mod tests {
             EmitOutcome::QueueFull,
             EmitOutcome::WorkerUnavailable,
             EmitOutcome::TimedOut,
+            EmitOutcome::Quiesced,
         ] {
             assert!(!o.is_delivered(), "{o:?}");
         }

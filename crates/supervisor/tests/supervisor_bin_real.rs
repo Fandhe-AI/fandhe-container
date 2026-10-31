@@ -24,9 +24,10 @@
 //!   届く。成功行の前に `seccomp denial returned EPERM and left exactly 1 record in @audit.log` を出す
 //! - シナリオ B（起動失敗で何も残らない。A6）: rootfs から `proc/` を除いて pre-pivot 段で失敗させ、報告が ERR・bin の
 //!   終了コードが非 0・状態が Created（pid なし）・作った cgroup が消え・プローブのプロセスが残らないことを照合する
-//! - シナリオ C（restart の fail-closed。SUP-3・#2043）: `--restart always` でプローブが終了した後、再 launch は
-//!   単一スレッドの要求を満たせず本番 launcher が拒否する。新しい子は作られず、状態は Stopped で、bin の終了コードは
-//!   FAILED_PRECONDITION の写像になる。再 launch が実機で成立する再構成（#2043）が入ったら、この項目を置き換える
+//! - シナリオ C（restart の再 launch。SUP-3・CORE-1・SUP-7・SEC-4・#2043）: `--restart on-failure:1` でプローブが終了した後、
+//!   常駐スレッドを止めて監視ループのスレッドで直接再 launch する。`restart_count` が 1 に進んで新しい pid で Running に戻り、
+//!   2 回目の終了で Stopped（終了コード 7）・bin の終了コード 0 で終わる。ログ sink に `READY` が 2 回、`@audit.log` に seccomp の
+//!   行がちょうど 2 行届く
 //! - シナリオ D（SIGTERM の配送 → Stopped → 停止後の delete。SUP-4・SUP-1・CORE-2・OCI-6・#2392）: Running の間の delete は
 //!   FAILED_PRECONDITION で拒否され記録が残る。プローブの SIGTERM ハンドラ登録を待ってから、CLI `stop` と同じ
 //!   `ControlSignaler::for_stop` 経由で core の `kill`（SIGTERM）を送る。monitor が Stopped を記録し、終了コードは
@@ -60,7 +61,7 @@
 //! ```
 //!
 //! 成功時の最終行: `supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs
-//! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM
+//! captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM
 //! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
 //! SeccompNotifyHub and recorded once`。
 //! CI（ubuntu-latest）以外の環境・root の分岐の実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
@@ -560,11 +561,11 @@ mod linux {
         }
         scenario_a_start_monitor_record();
         scenario_b_failed_start_leaves_nothing();
-        scenario_c_restart_fails_closed();
+        scenario_c_restart_relaunch_succeeds();
         scenario_d_sigterm_stop_delete();
         scenario_e_esc03_mount_via_hub();
         println!(
-            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
+            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
         );
     }
 
@@ -781,27 +782,82 @@ mod linux {
         println!("supervisor_bin_real: scenario=B ok code={}", code.as_str());
     }
 
-    /// シナリオ C: restart の再 launch は fail-closed（#2043 まで）。
-    fn scenario_c_restart_fails_closed() {
+    /// シナリオ C: restart の再 launch が本番 launcher で成り立つ(SUP-3・CORE-1・SUP-7・SEC-4・#2043)。
+    ///
+    /// `--restart on-failure:1` でプローブが終了コード 7 で終わると、supervisor は stderr・制御チャネル・捕捉・seccomp 通知の
+    /// 常駐スレッドを止めて監視ループのスレッドで直接再 launch する。`restart_count` が 1 に進み、新しい pid で Running に戻り、
+    /// 2 回目の終了(上限)で Stopped(7)・bin の終了コード 0 で終わる。ログ sink に READY が 2 回、`@audit.log` に seccomp の
+    /// 行がちょうど 2 行(各起動の listener がハブへ渡り直っている)届く。
+    fn scenario_c_restart_relaunch_succeeds() {
         let env = Env::new("c", true, Probe::Exit7);
         let id = format!("sbc{}", std::process::id());
         env.create(&id);
-        let mut sup = spawn_supervisor(&env, &id, Some("always"));
-        let pid = match sup.report() {
+        let mut sup = spawn_supervisor(&env, &id, Some("on-failure:1"));
+        let first_pid = match sup.report() {
             StartReport::Started { pid } => pid,
             other => panic!("expected OK, got {other:?}"),
         };
-        let bin_exit = sup.exit_code();
+        // 再 launch の後の Running(restart_count = 1・別の pid)を期限つきで待つ。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let relaunched_pid = loop {
+            let rec = env.record(&id);
+            if rec.restart_count() == 1
+                && rec.status().state() == ContainerState::Running
+                && let Some(pid) = rec.status().pid()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the restart did not reach Running with restart_count 1: {:?}",
+                rec.status()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_ne!(
+            relaunched_pid, first_pid,
+            "the relaunch must create a new process"
+        );
+        // 上限(1 回)に達しているので、2 回目の終了で再起動せずに終わる。
         assert_eq!(
-            bin_exit,
-            i32::from(exit_code_for(ErrorCode::FailedPrecondition).get()),
-            "the relaunch must be refused by the single-thread requirement"
+            sup.exit_code(),
+            0,
+            "the supervisor must finish cleanly after the restart limit"
         );
         let rec = env.record(&id);
         assert_eq!(rec.status().state(), ContainerState::Stopped);
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(rec.status().exit_code(), Some(PROBE_EXIT));
+        assert_eq!(rec.restart_count(), 1);
+        for pid in [first_pid, relaunched_pid] {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "pid {pid} must be reaped"
+            );
+        }
         assert!(no_probe_remains(), "no probe process may remain");
-        println!("supervisor_bin_real: scenario=C ok first_pid={pid}");
+        // 再起動をまたいで、両方の起動の出力が同じログ sink に残る(SUP-7)。
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
+        let ready_lines: usize = std::fs::read_dir(&logs)
+            .expect("log directory")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&id))
+            .map(|e| {
+                std::fs::read_to_string(e.path())
+                    .map(|t| t.lines().filter(|l| l.contains("READY")).count())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(ready_lines, 2, "READY must be captured once per launch");
+        // seccomp の通知は各起動の listener で応答され、拒否が 2 行届く(SEC-4)。
+        let audit = std::fs::read_to_string(env.root().join("@audit.log")).unwrap_or_default();
+        let seccomp_lines = audit
+            .lines()
+            .filter(|l| l.contains("\"layer\":\"seccomp\""))
+            .count();
+        assert_eq!(seccomp_lines, 2, "one seccomp record per launch: {audit:?}");
+        println!(
+            "supervisor_bin_real: scenario=C ok first_pid={first_pid} relaunched_pid={relaunched_pid}"
+        );
     }
 
     /// delete の補助役の結果。

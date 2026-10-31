@@ -185,7 +185,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
   | `Mount`（閉じた表の理由つき。rootfs の固定の 2 理由） | 運ぶ（#2623。理由は表の添字で運び、復号側が表の静的トークンへ戻す） | start の作業スレッド（`rejection_audit_sink`） | relay |
   | `Mount`（それ以外の理由つき） | 運ばない（理由の静的トークンは開いた語彙で、復号側で閉じた表へ戻せない） | launch・create・exec の拒否（単一スレッド） | `FileAuditSink` |
   | `Landlock`・`PluginTrust`・`ExecTarget`・`Entrypoint` | 運ばない | 単一スレッドの段（launch の pre-pivot・exec の親・plugin 検証） | `FileAuditSink` またはカーネル監査 |
-  | `AuditCoverageDegraded` | 運ばない | launcher の launch（入口スレッド。単一スレッド）。`start_entry_audit_record_failed.rs` が照合済み。restart の再 launch は複数スレッドでは本番 launcher が拒否する（#2043） | `FileAuditSink`（`audit_sink`） |
+  | `AuditCoverageDegraded` | 運ばない | launcher の launch（入口スレッド。単一スレッド）。`start_entry_audit_record_failed.rs` が照合済み。restart の再 launch は supervisor が常駐スレッドを止めて監視スレッドで直接呼ぶ（#2043。止められなければ launch しない） | `FileAuditSink`（`audit_sink`） |
 
 - **supervisor の exec コマンド（#2236 で実装）**: exec worker が回収したコマンドの終了状態を pipe の 1 行で返す際に、コマンドの PID も載せる（`ExecOutcome::command_pid`。worker は `pid_for_children` だけをコンテナの PID namespace へ移すため、worker・親と同じ PID namespace の値）。親（単一スレッドの exec 専用プロセス）が、コマンドが SIGSYS で終了した（`Signaled(31)`）ときだけ層 `exit_signal` を 1 件記録し、結果は `AuditedOutcome::exit_audit` で返す（違反の記録の `audit` とは別の欄）
 - **残余（未実装。REPAIR-3）: PID 1 以外の子孫と、exec コマンドの子孫の SIGSYS 終了は親から観測できない**。コンテナ内の子孫は同じ PID namespace の中の親が回収し、孤児は namespace 内の init（PID 1）に再親付けされる（`find_new_reaper` は同じ namespace の中で探すため、外にいる supervisor の child subreaper には届かない）。承認済みの最小権限集合（`privilege-separation.md`）の範囲に親が得る手段が無い（proc connector は `CAP_NET_ADMIN`、`PIDFD_INFO_EXIT` は Linux 6.15 以上かつ短命なプロセスの取りこぼしがあり「確実に」を満たせない、コンテナ内の init shim は PID 1 の契約を変える設計変更）。この範囲の正の記録はカーネルの `AUDIT_SECCOMP` が担う（読み手は #2237）。追跡 issue の起票と、spec 側（ESC-06・SEC-4 の受け入れ範囲）の見直しの要否はオーナー判断

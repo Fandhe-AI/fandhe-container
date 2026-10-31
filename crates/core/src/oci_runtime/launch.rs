@@ -20,7 +20,7 @@
 //! `ProductionLauncher` は [`LaunchMode::SelfBounded`] を宣言し、start は別スレッドを作らず呼び出しスレッドで
 //! 直接 `launch` を呼ぶ。起動済みの子の終了・回収は `ContainerChildProcess`(Linux。`exec::ContainerChild` の
 //! 回収状態の排他を再利用する)が担う。実機前提の結合試験は `tests/production_launcher.rs`(#1818。実行は
-//! `-- --ignored`)。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み(#1819)。restart の再 launch は未対応(#2043。REPAIR-3)。
+//! `-- --ignored`)。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み(#1819)。restart の再 launch は supervisor が呼び出しスレッドで直接行う(#2043)。
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;

@@ -31,7 +31,7 @@
 //! - 本番の CLI からの到達（`--network` の受け口と start での D10 の再照合・resolv.conf）は #3329。supervisor の bin を通す
 //!   シナリオは #3329 の後に足す（本番の CLI が pasta を FCOPT1 に書けるまで、文書の手書きは壊れても CI で気づけないため採らない）。
 //!   create から start までの pasta の記録の往復は、本試験内で `PastaRecord` の `to_body` → `parse_body` → `reverify` で代替する
-//! - SEC-4 の監査は #3330、restart の再 launch は #2043、IPv6・常駐 PSS・rootful 比のスループット・実機での結果の記録は #341
+//! - SEC-4 の監査は #3330、pasta 構成での restart の確認は #3331、IPv6・常駐 PSS・rootful 比のスループット・実機での結果の記録は #341
 //! - core の `delete` 本体（状態記録の Stopped が前提）は通さない。監視ループが Stopped を書く経路を持たないため、delete のうち
 //!   pasta に関わる部分（`remove_pasta_leftovers`）と cgroup の削除だけを照合する
 //!

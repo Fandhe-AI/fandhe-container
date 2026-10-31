@@ -1246,6 +1246,41 @@ mod tests {
         assert_eq!(get("oci.store.lock"), Some((2, 0)));
     }
 
+    /// REPAIR-4・OCI-7（#2223）: 記録付きストアの `image rm` が実行段の成功を `oci.image.rm` に記録する。
+    #[test]
+    fn repair4_image_rm_records_oci_image_rm() {
+        let tmp = Tmp::new();
+        let rec = Arc::new(OpRecorder::new());
+        let bridge = CliOciRecorder::new(Arc::clone(&rec));
+        let store = tag_store(&tmp, &[("latest", '1'), ("v1", '1')])
+            .with_recorder(Arc::new(CliOciRecorder::new(Arc::clone(&rec))));
+        let get = || {
+            let name =
+                fandhe_container_core::observability::OpName::new("oci.image.rm").expect("name");
+            rec.snapshot_op(&name).map(|s| (s.success(), s.failure()))
+        };
+        let run = |reference: &str| {
+            out_of(|o| {
+                run_image_rm_recorded(
+                    &store,
+                    &bridge,
+                    &target(reference),
+                    false,
+                    &no_snapshot,
+                    &|_| {},
+                    o,
+                )
+            })
+        };
+        let (e, out) = run("busybox:v1");
+        assert_eq!(e.exit_code(), 0, "{out}");
+        assert_eq!(get(), Some((1, 0)));
+        // 計画段階（plan）で NotFound になった参照は execute に届かないため、`oci.image.rm` は増えない。
+        let (e, _) = run("busybox:nope");
+        assert_ne!(e.exit_code(), 0);
+        assert_eq!(get(), Some((1, 0)));
+    }
+
     /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。
     #[cfg(unix)]
     #[test]
